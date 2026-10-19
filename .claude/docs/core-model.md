@@ -188,7 +188,8 @@
   that the fit never binds, so nothing that never picked a frame moved. A `Track`
   carries a `duck` flag (sidechain-ducked under the rest of the mix on export).
   `Fit` and `Delivery` live here (the domain owns the delivery shape; `engine::cli`
-  re-exports `Fit`), and `Timeline.format` is the frame the project is cut for.
+  re-exports `Fit`: `Contain`, `Cover`, and `Blur` — Contain over a blurred copy of the picture,
+  `engine-cli.md`), and `Timeline.format` is the frame the project is cut for.
   **Smart crop** is here too and pure + unit-tested: `SalienceMap::crop_for` slides a
   window of the delivery aspect across the sampled map and returns the `CropFrame`
   (per-edge fractions, plus how far off centre it landed) that keeps the content —
@@ -585,6 +586,28 @@
   drawing of each preset are written to `frontend/src/lib/fixtures/svg-presets.json` for the browser harness
   (`svg_preset_fixture_is_what_this_engine_does`; after an intended preset change run
   `KERF_BLESS_SVG_PRESETS=1 cargo test -p kerf-core --no-default-features -- svg_preset_fixture`).
+- **Generated clips** (`model/generator.rs`, pure + unit-tested): `Clip.generator: Option<Generator>` (absent from the
+  JSON when `None`, so a clip of footage writes the bytes it always did) makes a clip whose picture is *made*: today one kind,
+  `Generator::Title(TitleClip {name, svg, template?})`, tagged `"kind": "title"` — an animated SVG title on a **video track**,
+  so it takes `transition_in` (a dip to white from the shot before it), fades, transform / channel keys (an **animated
+  placement**), colour, grade and effects, and is trimmed, split, rolled, slipped, slid, rippled and moved like any clip. Its
+  `asset_id` is `GENERATED_ASSET` (the nil UUID, which no asset has: whatever looks a generated clip up in the library by
+  mistake finds nothing rather than the wrong file), **its source is the document's own clock** (`source_in` is what a head
+  trim or a slice cut off the front, as `SvgOverlay::offset` is; `Clip::generator_time(local)`), it has no sound, and past the
+  end of its animations the document holds its last state, so extending the clip holds the end of the title. `svg` is
+  sanitised and `template` behaves exactly as on a floating title (`core-project.md`). **Invariants** (`check.rs`,
+  `Rule::ClipGenerated`): a generated clip is on a video track, names no asset, plays at speed 1 (no reverse), is not linked,
+  and its window lies within `0..=MAX_SVG_SECONDS`; and (`Rule::TitleClipCount`) a timeline holds at most `MAX_TITLE_CLIPS`
+  (50) of them, each title past the cap a violation of its own, so any op that adds one (a split copies the document) is
+  refused — so `set_speed`, a reverse or a link is refused by the invariant net for
+  every op at once. `Timeline::title_clip(id)` / `title_clips()` / `title_sources()` (every title's source, floating and on
+  tracks: what the font collection reads). The diff says `Added title “Card” to V1 at …`, `Removed title “Card” …` and, for
+  the content, `name “A” → “B”`, `Tagline “A” → “B”` or `artwork changed` (`generator_changes`). A generated clip's footage
+  reaches `MAX_SVG_SECONDS` in `Project::source_limits` (one entry keyed `GENERATED_ASSET`), and `transition_fx` gives it an
+  unbounded handle (a dissolve out of a title draws its document on) and `alpha` (its pictures are transparent). **Presets
+  are not title clips yet**: a preset is laid out for its length and would have to be re-made by every op that changes a
+  clip's length; a template or custom artwork holds its end instead. `frontend/src/lib/title-clips.ts` mirrors placement,
+  naming and lookup.
 - `timecode.rs` — SMPTE timecode at the timeline's `f64` rate: `TimecodeRate` (nominal base, frames
   dropped per minute — drop-frame at 29.97 / 59.94, told by closeness to `30000/1001` / `60000/1001`),
   `fields` / `frames` / `format` and `parse` (Premiere-style entry, relative `+` / `-`, a dropped label

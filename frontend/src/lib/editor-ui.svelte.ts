@@ -151,8 +151,8 @@ class EditorUi {
 	 *  file is laid out in. Not derived from the captions
 	 *  already on the timeline: a caption's style is not recoverable from the
 	 *  text it carries, and guessing from the word count would flip the choice
-	 *  every time a sentence happened to be short. Shared by every place that
-	 *  offers the button (the Inspector and the library's Titles tab). */
+	 *  every time a sentence happened to be short. Set in the library's Titles tab;
+	 *  the titles lane's menu and Edit › Generate captions generate in it too. */
 	captionStyle = $state<CaptionStyle>('lines');
 	/** The animated SVG title whose source the Inspector should open and focus: set when *Custom SVG…* makes
 	 *  one (or a lane menu asks to edit it), cleared by the Inspector once it has taken the focus. */
@@ -691,9 +691,9 @@ class EditorUi {
 		const step = () => {
 			if (!this.playing) return;
 			const now = performance.now();
-			// Follow the audio clock when it runs, so picture chases sound rather
-			// than the other way around; wall-clock otherwise (reverse shuttle,
-			// browser demo).
+			// Follow the audio clock when it runs (either way: a reverse shuttle's counts
+			// down), so picture chases sound rather than the other way around; wall-clock
+			// otherwise (the browser demo).
 			const ac = audio.clock();
 			this.time = ac !== null ? ac : this.time + ((now - last) / 1000) * this.rate;
 			last = now;
@@ -727,14 +727,8 @@ class EditorUi {
 	}
 
 	#startAudio() {
-		if (this.rate > 0) {
-			const withAudio = new Set(
-				editor.assets.filter((a) => a.streams.some((s) => s.kind === 'audio')).map((a) => a.id)
-			);
-			audio.start(editor.timeline, withAudio, this.time, this.rate);
-		} else {
-			audio.stop();
-		}
+		const withAudio = new Set(editor.assets.filter((a) => a.streams.some((s) => s.kind === 'audio')).map((a) => a.id));
+		audio.start(editor.timeline, withAudio, this.time, this.rate);
 	}
 }
 

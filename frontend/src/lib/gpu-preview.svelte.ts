@@ -31,7 +31,8 @@ class GpuPreviewStore {
 
 	/** Record what `getPreviewFrame` answered. */
 	note(result: PreviewFrameResult) {
-		if (result.renderer === 'superseded') return;
+		// A ready answer draws nothing: what is on show is what it was.
+		if (result.renderer === 'superseded' || result.renderer === 'ready') return;
 		const before = this.renderer;
 		// A session the stream plays is FFmpeg's, with the reasons the GPU gave.
 		this.renderer = result.renderer === 'stream' ? 'ffmpeg' : result.renderer;

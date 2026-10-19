@@ -38,12 +38,12 @@
 		trimSelection,
 		unlinkSelection
 	} from '#lib/ops';
-	import { addAnimatedTitle, addCustomSvgTitle, importCaptionFile } from '#lib/title-actions';
+	import { addAnimatedTitle, addCustomSvgTitle, addTitleHere, dropCaptions, importCaptionFile, makeCaptions } from '#lib/title-actions';
 	import { keyframeOffer } from '#lib/keyframe-copy';
 	import type { ActionId } from '#lib/keymap';
-	import { DELIVERY_PRESETS, fitLabel, presetFor } from '#lib/delivery-formats';
-	import { setDeliveryPreset } from '#lib/menu-commands';
-	import { importMenuEntries, importableAssets } from '#lib/caption-import-ui';
+	import { DELIVERY_PRESETS, deliveryTip, fitChoices, presetFor } from '#lib/delivery-formats';
+	import { setDeliveryFit, setDeliveryPreset } from '#lib/menu-commands';
+	import { generatedCount, importMenuEntries, importableAssets } from '#lib/caption-import-ui';
 	import type { Clip, Marker, PreviewDraft, StreamKind, SvgOverlay, TextOverlay, Track } from '#lib/types';
 	import { moveDraft, trimDraft } from '#lib/preview-draft';
 	import { GENERATED_TITLE_FILL, SVG_TITLE_FILL, packRows, snapSpanStart, snapTime, trimSpan } from '#lib/titles';
@@ -95,6 +95,7 @@
 	import { clipDuration } from '#lib/types';
 	import { barGrid, beatGrid, beatPeriod, gridMagnets, sourceToTimeline } from '#lib/beats';
 	import { NAME_CHIP_PCT, showsLabel } from '#lib/clip-label';
+	import { titleName, titleOf } from '#lib/title-clips';
 	import { fitOffer } from '#lib/music-ui';
 	import { stemsOffer } from '#lib/stems';
 	import { composeOffer } from '#lib/compose-form';
@@ -731,11 +732,24 @@
 		const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
 		contextMenu.show(
 			new MouseEvent('contextmenu', { clientX: r.right, clientY: r.bottom + 2 }),
-			DELIVERY_PRESETS.map((p) => ({
-				label: p.label === 'Source' ? 'Source shape' : `${p.label} — ${p.hint}`,
-				icon: p.id === delivery.id ? 'check' : undefined,
-				action: () => void setDeliveryPreset(p.id)
-			})),
+			[
+				...DELIVERY_PRESETS.map((p) => ({
+					label: p.label === 'Source' ? 'Source shape' : `${p.label} — ${p.hint}`,
+					icon: p.id === delivery.id ? 'check' : undefined,
+					action: () => void setDeliveryPreset(p.id)
+				})),
+				// With a frame set: how footage of another shape meets it (the project's fit ticked).
+				...(editor.timeline.format
+					? [
+							{ type: 'separator' as const },
+							...fitChoices(editor.timeline.format).map((c) => ({
+								label: c.label,
+								icon: c.checked ? 'check' : undefined,
+								action: () => void setDeliveryFit(c.fit)
+							}))
+						]
+					: [])
+			],
 			e.currentTarget as Node
 		);
 	}
@@ -2380,8 +2394,6 @@
 		else void editor.retimeOverlay(d.id, d.start, d.end).catch(err);
 	}
 
-	const addTitleHere = () => void editor.addTitle('Title', ui.time, ui.time + settings.editing.title_seconds).catch(err);
-
 	function onTitleContextMenu(e: MouseEvent, o: TextOverlay) {
 		e.stopPropagation();
 		editor.selectOverlay(o.id);
@@ -2434,9 +2446,10 @@
 		// Importing captions: timed to the cut, or to one of the clips it shows. The
 		// controls in Titles carry the same import with every clip to choose from.
 		const { entries, more } = importMenuEntries(importableAssets(editor.timeline, editor.assets));
+		const captions = generatedCount(editor.liveTimeline.overlays);
 		contextMenu.show(e, [
 			...held([
-				{ label: 'Add title at playhead', icon: 'captions', action: addTitleHere },
+				{ label: 'Add title at playhead', icon: 'captions', shortcut: settings.shortcut('title.add'), action: () => void addTitleHere() },
 				...SVG_PRESETS.map(
 					(p): MenuItem => ({
 						label: `Add animated ${p.label.toLowerCase()}`,
@@ -2447,6 +2460,16 @@
 				),
 				{ label: 'Add custom SVG title…', icon: 'code-xml', disabled: editor.busy, action: () => void addCustomSvgTitle() },
 				{ type: 'separator' },
+				{
+					label: captions > 0 ? 'Regenerate captions' : 'Generate captions',
+					icon: 'captions',
+					disabled: editor.busy,
+					shortcut: settings.shortcut('title.generateCaptions'),
+					action: () => void makeCaptions()
+				},
+				...(captions > 0
+					? [{ label: 'Clear captions', icon: 'trash', danger: true, disabled: editor.busy, action: () => void dropCaptions() } satisfies MenuItem]
+					: []),
 				...entries.map(
 					(m): MenuItem => ({
 						label: m.label,
@@ -2865,9 +2888,7 @@
 				<ToolbarToggle
 					title={editor.previewingStaged
 						? PREVIEW_READ_ONLY_REASON
-						: delivery.format
-						? `Delivering ${delivery.format.width}\u00d7${delivery.format.height} — ${fitLabel(delivery.format.fit)}. Click to change.`
-						: 'The frame follows the footage. Click to cut for a delivery shape.'}
+						: deliveryTip(editor.timeline.format)}
 					icon="crop"
 					iconSize={12}
 					on={!!delivery.format}
@@ -2970,7 +2991,7 @@
 				<!-- Nothing on the titles lane: a strip, and the whole of its header adds a title. -->
 				<button
 					data-title-add
-					use:tip={'Add a title at the playhead'}
+					use:tip={settings.tip('Add a title at the playhead', 'title.add')}
 					aria-label="Add a title"
 					disabled={editor.busy}
 					onclick={addTitleHere}
@@ -2989,7 +3010,7 @@
 					>Titles · {titleCount}</span
 				>
 				<button
-					use:tip={'Add a title at the playhead'}
+					use:tip={settings.tip('Add a title at the playhead', 'title.add')}
 					aria-label="Add a title"
 					disabled={editor.busy}
 					onclick={addTitleHere}
@@ -3482,7 +3503,8 @@
 						{@const off = c.enabled === false || !renders(t)}
 						{@const badge = badges.get(c.id)}
 						{@const lit = hoverPartners.has(c.id)}
-						{@const name = editor.assetName(c.asset_id)}
+						{@const title = titleOf(c)}
+						{@const name = title ? titleName(title) : editor.assetName(c.asset_id)}
 						<button
 							class="kclip"
 							data-clip-id={c.id}
@@ -3492,6 +3514,7 @@
 							use:tip={showsLabel(width) ? undefined : name}
 							data-linked={badge && badge.partners.length > 0 ? '' : undefined}
 							data-sound-detached={c.source_audio === false ? '' : undefined}
+							data-title-clip={title ? '' : undefined}
 							onpointerdown={(e) => onClipPointerDown(e, c, t)}
 							onkeydown={(e) => onClipKey(e, c, t)}
 							onblur={() => {
@@ -3543,6 +3566,13 @@
 										style="position:absolute;left:{r.left - left}px;top:3px;bottom:3px;width:{Math.max(2, r.width)}px;background:var(--silence-region);border:var(--line-width) solid color-mix(in srgb,var(--red-500) 30%,transparent);border-radius:2px"
 									></span>
 								{/each}
+							{:else if title}
+								<!-- A title draws no footage: its mark at the head, where a filmstrip's first frame would be. -->
+								<span
+									data-title-mark
+									style="position:absolute;left:4px;top:4px;display:inline-flex;color:color-mix(in srgb,var(--text-on-video) 75%,transparent);pointer-events:none"
+									><Icon n="layout-template" s={11} /></span
+								>
 							{:else}
 								<ClipFilmstrip
 									clip={shown}

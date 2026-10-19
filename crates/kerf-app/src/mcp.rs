@@ -20,7 +20,7 @@ use kerf_core::{
     CurvePoint, Curves, Delivery, EditSource, ExportOptions, Fit, Keyframe, Mask, MaskShape, Project, Projection, Property,
     PropertyKey, PropertyTrack, ReframeKeyframe, Region, SplitSide, StreamKind, SvgCheck, SvgDoc, SvgLayout, SvgOverlay,
     SvgOverlayPatch, SvgOverlayResult, SvgPreset, SvgPresetKind, SvgPresetParams, SvgSource, TextKeyframe, TimeRange, Timeline,
-    Transition, TransitionKind, VideoEffect, Wheel, Wheels,
+    TitleClipPatch, TitleClipPlacement, TitleClipResult, Transition, TransitionKind, VideoEffect, Wheel, Wheels,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
@@ -30,6 +30,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 use uuid::Uuid;
 
+mod activity;
 mod args;
 mod hints;
 mod jobs;
@@ -71,6 +72,8 @@ pub struct KerfMcp {
     /// proposal its edits open, and no other session may touch it. `None` for a client that
     /// keeps no session.
     session: Arc<Mutex<Option<String>>>,
+    /// The resources this session subscribed to, and the task that tells it when they change.
+    listener: activity::Listener,
 }
 
 // ---- tool parameter schemas ------------------------------------------------
@@ -132,7 +135,7 @@ struct ImportParams {
     #[schemars(description = "Absolute path to the media file to import")]
     path: String,
     #[schemars(
-        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result, stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
+        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result (or subscribe to kerf://jobs/{job_id}), stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
     )]
     background: Option<bool>,
 }
@@ -158,7 +161,7 @@ struct AnalyzeParams {
     )]
     steps: Option<Vec<String>>,
     #[schemars(
-        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result, stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
+        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result (or subscribe to kerf://jobs/{job_id}), stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
     )]
     background: Option<bool>,
 }
@@ -208,7 +211,7 @@ struct VoiceoverParams {
     #[schemars(description = "With caption_style: font height as a fraction of frame height (lines: 0.05, word_punch: 0.11)")]
     caption_size: Option<f64>,
     #[schemars(
-        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result, stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
+        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result (or subscribe to kerf://jobs/{job_id}), stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
     )]
     background: Option<bool>,
 }
@@ -255,7 +258,7 @@ struct ComposeMusicParams {
     )]
     ripple: Option<bool>,
     #[schemars(
-        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result, stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
+        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result (or subscribe to kerf://jobs/{job_id}), stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
     )]
     background: Option<bool>,
 }
@@ -329,7 +332,7 @@ struct DownloadModelParams {
     )]
     name: Option<String>,
     #[schemars(
-        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result, stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
+        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result (or subscribe to kerf://jobs/{job_id}), stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
     )]
     background: Option<bool>,
 }
@@ -548,7 +551,7 @@ struct SmartCropParams {
     #[schemars(description = "UUID of the clip to reframe; every clip on an unlocked video track when omitted")]
     clip_id: Option<String>,
     #[schemars(
-        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result, stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
+        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result (or subscribe to kerf://jobs/{job_id}), stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
     )]
     background: Option<bool>,
 }
@@ -572,7 +575,7 @@ struct SeparateStemsParams {
     )]
     clip_id: Option<String>,
     #[schemars(
-        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result, stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
+        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result (or subscribe to kerf://jobs/{job_id}), stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
     )]
     background: Option<bool>,
 }
@@ -804,7 +807,7 @@ struct SyncByAudioParams {
     )]
     force: Option<bool>,
     #[schemars(
-        description = "Run as a background job: the call answers {job_id} at once; poll job_status for progress and the result, stop it with cancel_job. Default false: the call stays open until the sync is done (send a progressToken for progress)."
+        description = "Run as a background job: the call answers {job_id} at once; poll job_status for progress and the result (or subscribe to kerf://jobs/{job_id}), stop it with cancel_job. Default false: the call stays open until the sync is done (send a progressToken for progress)."
     )]
     background: Option<bool>,
 }
@@ -814,7 +817,7 @@ struct RefineTranscriptParams {
     #[schemars(description = "UUID of the asset whose cached transcript to re-time")]
     asset_id: String,
     #[schemars(
-        description = "Run as a background job: the call answers {job_id} at once; poll job_status for the result, stop it with cancel_job. Default false: the call stays open until it is done (send a progressToken for progress)."
+        description = "Run as a background job: the call answers {job_id} at once; poll job_status for the result (or subscribe to kerf://jobs/{job_id}), stop it with cancel_job. Default false: the call stays open until it is done (send a progressToken for progress)."
     )]
     background: Option<bool>,
 }
@@ -869,7 +872,9 @@ struct SetDeliveryFormatParams {
     #[schemars(description = "Delivery frame height in pixels, e.g. 1920 for a 9:16 vertical cut")]
     height: Option<u32>,
     #[schemars(description = "How footage of a different shape meets the frame: \"cover\" (the default) \
-                              fills and crops, \"contain\" scales the whole picture in and letterboxes")]
+                              fills and crops, \"contain\" scales the whole picture in and letterboxes, \
+                              \"blur\" scales the whole picture in over a blurred, enlarged copy of itself \
+                              that fills the bars")]
     fit: Option<Fit>,
 }
 
@@ -1479,6 +1484,38 @@ struct AddSvgOverlayParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct AddTitleClipParams {
+    #[schemars(
+        description = "Your own SVG document, animated with SMIL as for add_svg_overlay (times are seconds from the clip's start). Drawn over the whole frame: give it a viewBox of the delivery frame's shape"
+    )]
+    svg: String,
+    #[schemars(description = "Where the clip starts, in timeline seconds")]
+    start: f64,
+    #[schemars(
+        description = "How long it runs, in seconds. Omit it to run as long as its animations (clamped to 2-30 s), else 4 s. Past the end of its animations it holds their last state"
+    )]
+    duration: Option<f64>,
+    #[schemars(
+        description = "UUID of the video track to put it on. Omit it for the lowest video track with nothing in the way over its span (an end card after the last shot lands beside it, ready for a transition), else a new video track on top"
+    )]
+    track_id: Option<String>,
+    #[schemars(description = "A label for the title (shown on the clip)")]
+    name: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct UpdateTitleClipParams {
+    #[schemars(description = "UUID of the title clip (timeline_summary's `title_clips`)")]
+    clip_id: String,
+    #[schemars(description = "New label; omit to leave unchanged")]
+    name: Option<String>,
+    #[schemars(
+        description = "Replace the artwork with your own SVG; a title from a template stops being one. Omit to leave unchanged"
+    )]
+    svg: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct UpdateSvgOverlayParams {
     #[schemars(description = "UUID of the SVG overlay (see timeline_summary)")]
     overlay_id: String,
@@ -1521,7 +1558,7 @@ struct ValidateSvgParams {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct PreviewSvgOverlayParams {
     #[schemars(
-        description = "UUID of an SVG title already on the timeline (see timeline_summary's `svg_overlays`). Give this OR `svg`, not both"
+        description = "UUID of an SVG title already on the timeline (see timeline_summary's `svg_overlays`, or a title clip from its `title_clips`). Give this OR `svg`, not both"
     )]
     overlay_id: Option<String>,
     #[schemars(
@@ -1726,7 +1763,7 @@ struct ExportParams {
     )]
     overwrite: Option<bool>,
     #[schemars(
-        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result, stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
+        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result (or subscribe to kerf://jobs/{job_id}), stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
     )]
     background: Option<bool>,
 }
@@ -1770,7 +1807,7 @@ struct ExportVariantsParams {
     )]
     single_pass: Option<bool>,
     #[schemars(
-        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result, stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
+        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result (or subscribe to kerf://jobs/{job_id}), stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
     )]
     background: Option<bool>,
 }
@@ -2055,6 +2092,64 @@ struct SvgOverlaySummary {
     svg_bytes: usize,
 }
 
+/// A title on a track as an agent reads it: the clip's place and its document's clock, never the source.
+/// Its transitions, fades, transform and keys are the clip's, read like any clip's.
+#[derive(Serialize)]
+pub(crate) struct TitleClipSummary {
+    id: Uuid,
+    track_id: Uuid,
+    name: String,
+    start: f64,
+    end: f64,
+    /// Seconds of the title's own animation cut off its front (0 for one that plays from its start).
+    source_in: f64,
+    /// The template it came from, with the controls and their values; absent on custom artwork.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    template: Option<TemplateSummary>,
+    svg_bytes: usize,
+}
+
+impl TitleClipSummary {
+    fn of(clip: &kerf_core::Clip, track_id: Uuid) -> Option<Self> {
+        let title = clip.title_clip()?;
+        Some(Self {
+            id: clip.id,
+            track_id,
+            name: title.display_name(),
+            start: clip.timeline_start,
+            end: clip.timeline_end(),
+            source_in: clip.source_in,
+            template: title.template.as_ref().map(TemplateSummary::from),
+            svg_bytes: title.svg.len(),
+        })
+    }
+
+    fn all(timeline: &Timeline) -> Vec<Self> {
+        timeline
+            .tracks
+            .iter()
+            .flat_map(|t| t.clips.iter().filter_map(|c| Self::of(c, t.id)))
+            .collect()
+    }
+}
+
+/// What the title-clip tools answer.
+#[derive(Serialize)]
+pub(crate) struct TitleClipOutcome {
+    title_clip: Option<TitleClipSummary>,
+    /// What the sanitiser, the SMIL reader or the machine could not honour.
+    warnings: Vec<String>,
+}
+
+impl From<TitleClipResult> for TitleClipOutcome {
+    fn from(r: TitleClipResult) -> Self {
+        Self {
+            title_clip: TitleClipSummary::of(&r.clip, r.track_id),
+            warnings: r.warnings,
+        }
+    }
+}
+
 /// What a title remembers of its template, as an agent needs it to call `set_template_values`: the
 /// controls without the elements they point at.
 #[derive(Serialize)]
@@ -2267,12 +2362,20 @@ fn svg_preview(
 /// Leave the sources of large SVG titles out of a timeline read: a title can carry 128 KiB and a
 /// timeline 50 of them. The note says how to get the source.
 fn elide_large_svg(timeline: &mut Timeline) {
-    for o in &mut timeline.svg_overlays {
-        if o.svg.len() > SVG_INLINE_LIMIT {
-            o.svg = format!(
+    let elide = |svg: &mut String| {
+        if svg.len() > SVG_INLINE_LIMIT {
+            *svg = format!(
                 "[{} bytes of SVG left out; call get_timeline_state with full_svg=true to read it]",
-                o.svg.len()
+                svg.len()
             );
+        }
+    };
+    for o in &mut timeline.svg_overlays {
+        elide(&mut o.svg);
+    }
+    for clip in timeline.tracks.iter_mut().flat_map(|t| t.clips.iter_mut()) {
+        if let Some(title) = clip.title_clip_mut() {
+            elide(&mut title.svg);
         }
     }
 }
@@ -2286,6 +2389,10 @@ struct TimelineSummary {
     /// The animated SVG titles, in draw order, without their source. Absent when there are none.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     svg_overlays: Vec<SvgOverlaySummary>,
+    /// The animated titles that are clips on video tracks (counted in their tracks too), without their
+    /// source. Absent when there are none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    title_clips: Vec<TitleClipSummary>,
     /// The frame this cut is being made for, e.g. "1080x1920 (cover)". Absent
     /// when the project follows its footage's shape. Worth reading before
     /// framing anything: under a cover delivery the crop decides what survives.
@@ -3098,7 +3205,9 @@ impl KerfMcp {
                        it, so what you look at while cutting is what ships. With \"cover\" (the default) \
                        a 16:9 shot is filled and cropped to the frame, which means the crop decides what \
                        survives: check preview_timeline and use set_transform's position to slide the \
-                       important part of a shot back into frame. Omit width and height to clear it."
+                       important part of a shot back into frame. With \"blur\" the whole shot shows, the \
+                       bars filled with a blurred copy of it (a clip moved or scaled by its transform gets \
+                       plain bars). Omit width and height to clear it."
     )]
     fn set_delivery_format(&self, Parameters(p): Parameters<SetDeliveryFormatParams>) -> Result<String, McpError> {
         let format = match (p.width, p.height) {
@@ -3808,6 +3917,58 @@ impl KerfMcp {
         })
     }
 
+    #[tool(
+        description = "Put your own animated SVG title on a VIDEO TRACK as a clip (a title clip), instead of floating it over \
+                       the cut as add_svg_overlay does. As a clip it is part of the cut: it takes a transition_in \
+                       (set_transition: dip_to_white, crossfade, slide ... from the shot before it on the same track), \
+                       fades, transform and keyframes (an animated placement), colour and effects; trim, move, split, \
+                       ripple and remove it with the ordinary clip tools; extending it past its animations holds their \
+                       last state, so an end card can run as long as the cut needs. Its document is drawn over the \
+                       whole frame (give it a viewBox of the delivery frame's shape; transparent where it draws \
+                       nothing, so a title on a track above footage overlays it) and its SMIL times are seconds from \
+                       the clip's start. It has no sound and plays at its own speed. Same SVG rules and limits as \
+                       add_svg_overlay. Returns the title clip (its id, track and timing; no source) and `warnings`. \
+                       To put a library template on a track, use apply_template with on_track=true."
+    )]
+    async fn add_title_clip(&self, Parameters(p): Parameters<AddTitleClipParams>) -> Result<String, McpError> {
+        let placement = TitleClipPlacement {
+            track_id: p.track_id.as_deref().map(|t| parse_arg("track_id", t)).transpose()?,
+            name: p.name,
+        };
+        let svg = p.svg;
+        // Read before the project lock, which then only places the clip.
+        let doc = blocking(move || SvgDoc::parse(&svg).map_err(core_err)).await?;
+        self.edit(|project| {
+            let out = project
+                .add_title_clip_parsed(doc, p.start, p.duration, placement)
+                .map_err(core_err)?;
+            json(&TitleClipOutcome::from(out))
+        })
+    }
+
+    #[tool(
+        description = "Rename a title clip or replace its artwork with your own `svg` (a title from a template then stops \
+                       being one; to change a template's values use set_template_values). Its timing, track, \
+                       transitions, fades and transform are the clip's: change them with the clip tools. Returns the \
+                       title clip and `warnings`."
+    )]
+    async fn update_title_clip(&self, Parameters(p): Parameters<UpdateTitleClipParams>) -> Result<String, McpError> {
+        let clip_id = parse_arg("clip_id", &p.clip_id)?;
+        let patch = TitleClipPatch {
+            name: p.name,
+            svg: p.svg,
+        };
+        let (patch, doc) = blocking(move || {
+            let doc = patch.svg.as_deref().map(SvgDoc::parse).transpose().map_err(core_err)?;
+            Ok((patch, doc))
+        })
+        .await?;
+        self.edit(|project| {
+            let out = project.update_title_clip_parsed(clip_id, patch, doc).map_err(core_err)?;
+            json(&TitleClipOutcome::from(out))
+        })
+    }
+
     #[tool(description = "Remove an animated SVG title (its id is in timeline_summary's `svg_overlays`)")]
     fn remove_svg_overlay(&self, Parameters(p): Parameters<OverlayIdParams>) -> Result<String, McpError> {
         let overlay_id = parse_arg("overlay_id", &p.overlay_id)?;
@@ -3875,6 +4036,16 @@ impl KerfMcp {
                 let timeline = project.working_timeline().map_err(core_err)?;
                 let frame = timeline.preset_frame();
                 let title = match (overlay_id, draft) {
+                    (Some(id), _) if timeline.title_clip(id).is_some() => {
+                        let (clip, t) = timeline.title_clip(id).expect("just found");
+                        SvgPreviewTitle {
+                            svg: t.svg.clone(),
+                            label: format!("title clip \"{}\" ({id})", t.display_name()),
+                            span: Some(clip.duration()),
+                            offset: clip.source_in,
+                            report_warnings: false,
+                        }
+                    }
                     (Some(id), _) => {
                         let o = timeline
                             .svg_overlay(id)
@@ -5428,22 +5599,7 @@ impl KerfMcp {
                        skipping `offset` of the newest; `next_offset` pages back through older ones."
     )]
     fn list_tasks(&self, Parameters(p): Parameters<PageParams>) -> Result<String, McpError> {
-        let (offset, limit) = reads::page_of(p.offset, p.limit, 50, 500);
-        let (tasks, total) = self
-            .lock()
-            .list_tasks_page(kerf_core::Page {
-                limit: Some(limit),
-                offset,
-            })
-            .map_err(core_err)?;
-        let end = offset + tasks.len();
-        json(&serde_json::json!({
-            "total": total,
-            "offset": offset,
-            "returned": tasks.len(),
-            "next_offset": (end < total).then_some(end),
-            "tasks": tasks,
-        }))
+        tasks_page(&self.lock(), p)
     }
 
     #[tool(description = "Enqueue a new task (status: queued) for an agent to claim")]
@@ -5877,6 +6033,7 @@ impl KerfMcp {
                 total_clip_count,
                 tracks,
                 svg_overlays: timeline.svg_overlays.iter().map(SvgOverlaySummary::from).collect(),
+                title_clips: TitleClipSummary::all(&timeline),
                 delivery_format: timeline
                     .format
                     .map(|d| format!("{}x{} ({})", d.width, d.height, format!("{:?}", d.fit).to_lowercase())),
@@ -5895,6 +6052,7 @@ impl KerfMcp {
             project,
             app,
             session: Arc::new(Mutex::new(None)),
+            listener: activity::Listener::default(),
         }
     }
 
@@ -6069,6 +6227,57 @@ fn lock_agent(project: &Mutex<Project>) -> MutexGuard<'_, Project> {
         tracing::warn!(error = %e, "could not look at who owns the staged proposal");
     }
     guard
+}
+
+/// A page of the task queue, as `list_tasks` answers it.
+fn tasks_page(project: &Project, page: PageParams) -> Result<String, McpError> {
+    let (offset, limit) = reads::page_of(page.offset, page.limit, 50, 500);
+    let (tasks, total) = project
+        .list_tasks_page(kerf_core::Page {
+            limit: Some(limit),
+            offset,
+        })
+        .map_err(core_err)?;
+    let end = offset + tasks.len();
+    json(&serde_json::json!({
+        "total": total,
+        "offset": offset,
+        "returned": tasks.len(),
+        "next_offset": (end < total).then_some(end),
+        "tasks": tasks,
+    }))
+}
+
+/// What `kerf://project` reads: which project is open (`generation` moves when another one is), the
+/// cut the session works on in brief, and the proposal staged on it, if any.
+fn project_brief(project: &Project) -> Result<String, McpError> {
+    let timeline = project.working_timeline().map_err(core_err)?;
+    let staged = project.staged().map_err(core_err)?;
+    json(&serde_json::json!({
+        "generation": project.generation(),
+        "timeline": reads::timeline_brief(&timeline),
+        "proposal": staged.map(|s| serde_json::json!({
+            "owned_by_agent": s.owned_by_agent,
+            "edits": s.edits.len(),
+            "stale": s.stale,
+        })),
+    }))
+}
+
+/// The text of the resource `uri` (`activity`): the polling tools' answers — `kerf://jobs` is
+/// `list_jobs`, a job its `job_status`, `kerf://tasks` the first page of `list_tasks`,
+/// `kerf://project` [`project_brief`]. The project is read under its lock as the session `owner`;
+/// the jobs need none.
+fn resource_text(project: &Mutex<Project>, owner: Option<&str>, uri: &str) -> Result<String, McpError> {
+    match uri {
+        activity::PROJECT_URI => project_brief(&lock_agent_as(project, owner)),
+        activity::TASKS_URI => tasks_page(&lock_agent_as(project, owner), PageParams::default()),
+        activity::JOBS_URI => json(&jobs::jobs().list()),
+        other => match activity::job_of(other).and_then(|id| jobs::jobs().view(id)) {
+            Some(view) => json(&view),
+            None => Err(activity::unknown_resource(other)),
+        },
+    }
 }
 
 /// [`lock_agent`] for a particular agent session (`owner`, its rmcp session id) — what the
@@ -6311,7 +6520,11 @@ const INSTRUCTIONS: &str = "Kerf MCP server. The user queues editing tasks in th
              and set_template_values changes them later; a title made from a \
              template lists its controls and current values under `template` in \
              timeline_summary. update_svg_overlay with `svg` replaces the artwork \
-             and ends the template. save_template, import_template and \
+             and ends the template. A title can also be a clip on a video track \
+             (add_title_clip, or apply_template with on_track=true): it then takes \
+             a transition from the shot before it (a dip to white into an end \
+             card), fades and keyframes, and extends like any clip; \
+             timeline_summary lists those under `title_clips`. save_template, import_template and \
              export_template change the user's library or a file, not your \
              proposal, and delete_template is refused while the user reviews your \
              edits. \
@@ -6358,7 +6571,13 @@ const INSTRUCTIONS: &str = "Kerf MCP server. The user queues editing tasks in th
              `job_id` at once and keep working, and job_status reports progress \
              and, at the end, the result (cancel_job stops one, list_jobs lists \
              them). Without it the call stays open — send a progressToken for \
-             progress. Results are kept small: get_asset_metadata and analyze_asset \
+             progress. Rather than polling, subscribe to the resources: \
+             kerf://jobs/{job_id} (one job), kerf://jobs, kerf://tasks and \
+             kerf://project are announced with notifications/resources/updated when \
+             they change, whoever changed them (the user editing the cut included); \
+             read one for the details, and read it once right after subscribing — what \
+             changed before is not replayed. A subscribed client that sends no request \
+             (a ping is enough) for five minutes loses its subscriptions. Results are kept small: get_asset_metadata and analyze_asset \
              summarise an analysis (counts, durations, the head of the transcript), \
              and get_transcript (lines with their speakers; words=true adds each \
              line's timed words, best over a from/to window) / get_analysis_detail \
@@ -6422,6 +6641,7 @@ impl ServerHandler for KerfMcp {
     ) -> Result<rmcp::model::CallToolResponse, McpError> {
         let tool = request.name.to_string();
         self.note_session(&context);
+        self.listener.touch();
         let result = match reject_unknown_arguments(&request) {
             Ok(()) => {
                 let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
@@ -6441,9 +6661,101 @@ impl ServerHandler for KerfMcp {
         note_agent_activity();
         let mut info = ServerConfig::default();
         info.server_info = server_identity();
-        info.capabilities = ServerCapabilities::builder().enable_tools().build();
+        info.capabilities = ServerCapabilities::builder()
+            .enable_resources()
+            .enable_resources_subscribe()
+            .enable_tools()
+            .build();
         info.instructions = Some(INSTRUCTIONS.to_string());
         info
+    }
+
+    async fn ping(&self, _context: RequestContext<RoleServer>) -> Result<(), McpError> {
+        self.listener.touch();
+        Ok(())
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::ListResourcesResult, McpError> {
+        self.listener.touch();
+        Ok(rmcp::model::ListResourcesResult::with_all_items(activity::resources()))
+    }
+
+    async fn list_resource_templates(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::ListResourceTemplatesResult, McpError> {
+        self.listener.touch();
+        Ok(rmcp::model::ListResourceTemplatesResult::with_all_items(
+            activity::resource_templates(),
+        ))
+    }
+
+    /// The resources are the polling tools' answers: `kerf://jobs` is `list_jobs`, a job is its
+    /// `job_status`, `kerf://tasks` the first page of `list_tasks`, `kerf://project` a brief of the
+    /// open project.
+    async fn read_resource(
+        &self,
+        request: rmcp::model::ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::ReadResourceResponse, McpError> {
+        self.listener.touch();
+        let uri = request.uri;
+        let text = resource_text(&self.project, self.owner().as_deref(), &uri)?;
+        Ok(rmcp::model::ReadResourceResult::new(vec![
+            rmcp::model::ResourceContents::text(text, uri).with_mime_type("application/json")
+        ])
+        .into())
+    }
+
+    #[allow(deprecated)]
+    async fn subscribe(
+        &self,
+        request: rmcp::model::SubscribeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        // A job is subscribed to while the registry knows it: one that never was, or ended over an
+        // hour ago, would never be told about.
+        if let Some(id) = activity::job_of(&request.uri) {
+            if jobs::jobs().view(id).is_none() {
+                return Err(activity::unknown_resource(&request.uri));
+            }
+        }
+        self.listener.subscribe(&request.uri, context.peer)
+    }
+
+    #[allow(deprecated)]
+    async fn unsubscribe(
+        &self,
+        request: rmcp::model::UnsubscribeRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        self.listener.unsubscribe(&request.uri);
+        Ok(())
+    }
+
+    /// `subscriptions/listen`: the resources of this server a client asked for, nothing else.
+    fn accepted_subscription_filter(
+        &self,
+        requested: &rmcp::model::SubscriptionFilter,
+    ) -> Option<rmcp::model::SubscriptionFilter> {
+        let mut accepted = rmcp::model::SubscriptionFilter::default();
+        accepted.resource_subscriptions = requested
+            .resource_subscriptions
+            .as_ref()
+            .map(|uris| uris.iter().filter(|uri| activity::known(uri)).cloned().collect());
+        Some(accepted)
+    }
+
+    async fn listen(&self, context: rmcp::service::SubscriptionContext) -> Result<(), McpError> {
+        let subscribed = context.accepted().resource_subscriptions.clone().unwrap_or_default();
+        let ended = context.request_context().ct.clone();
+        activity::listen(subscribed, context.sink().clone(), ended).await;
+        Ok(())
     }
 }
 
@@ -6745,6 +7057,45 @@ mod tests {
         svg_sheet_caption, svg_sheet_times, svg_source, track_gaps, variant_output, ClipMoveParams, SvgMoments,
         SvgOverlaySummary, SvgPreviewTitle, SvgValidation,
     };
+
+    /// The resources read what the polling tools answer: the project's brief, the queue's first
+    /// page, the jobs, one job; a job the registry does not know is not found.
+    #[test]
+    fn a_resource_reads_what_its_polling_tool_answers() {
+        use super::{activity, jobs, resource_text};
+        let project = std::sync::Mutex::new(kerf_core::Project::sample().unwrap());
+        let read =
+            |uri: &str| -> serde_json::Value { serde_json::from_str(&resource_text(&project, None, uri).unwrap()).unwrap() };
+        let brief = read(activity::PROJECT_URI);
+        let generation = project.lock().unwrap().generation();
+        assert_eq!(brief["generation"], generation);
+        assert!(brief["timeline"].is_object(), "{brief}");
+        assert!(brief["proposal"].is_null(), "no proposal staged: {brief}");
+
+        project.lock().unwrap().add_task("tighten the intro").unwrap();
+        let tasks = read(activity::TASKS_URI);
+        assert!(tasks["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["prompt"] == "tighten the intro"));
+        assert!(tasks["total"].as_u64().unwrap() >= 1);
+
+        let (id, _run) = jobs::jobs().begin("export").unwrap();
+        let job = read(&format!("{}{id}", activity::JOB_URI_PREFIX));
+        assert_eq!(job["job_id"], id.as_str());
+        assert!(read(activity::JOBS_URI)
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|j| j["job_id"] == id.as_str()));
+        jobs::jobs().finish(&id, Ok("{}".to_string()));
+
+        for missing in ["kerf://jobs/job-00000000", "kerf://jobs/nope", "kerf://timeline"] {
+            let err = resource_text(&project, None, missing).unwrap_err();
+            assert_eq!(err.code, rmcp::model::ErrorCode::RESOURCE_NOT_FOUND, "{missing}");
+        }
+    }
 
     #[test]
     fn set_grade_refuses_a_misspelt_key_inside_the_curves_or_wheels() {
@@ -8503,6 +8854,14 @@ mod tests {
         }
         assert!(property("update_svg_overlay", "preset_kind").is_some());
         assert!(property("get_timeline_state", "full_svg").is_some());
+        // A title on a track: its own tools, and a template put on one.
+        let mut needs = required("add_title_clip");
+        needs.sort();
+        assert_eq!(needs, ["start", "svg"]);
+        assert_eq!(required("update_title_clip"), ["clip_id"]);
+        assert!(property("apply_template", "on_track").is_some() && property("apply_template", "track_id").is_some());
+        assert!(description("add_title_clip").contains("dip_to_white"));
+        assert!(description("apply_template").contains("on_track"));
         assert!(description("update_svg_overlay").contains("preset_kind"));
         assert!(
             description("preview_svg_overlay").contains("PNG") && description("preview_svg_overlay").contains("preview_timeline")

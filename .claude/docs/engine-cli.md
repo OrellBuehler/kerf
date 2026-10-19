@@ -424,7 +424,34 @@ so the feature is **only** activated through these forwards — which is what ma
   fit and pads, `Cover` scales with `force_original_aspect_ratio=increase` and crops
   — which is what makes the vertical / square presets produce a usable shot rather
   than a strip of picture in a black field. It sets the *base* fit only; a clip with
-  its own transform still composes on top.
+  its own transform still composes on top. **`Blur`** is Contain over a blurred copy of the
+  same picture that covers the frame (`blur_fill`, pure): `split`, the copy scaled to *cover* a
+  thumbnail an eighth of the frame on each side (`2*floor(w/16)` x `2*floor(h/16)`, at least 4x4,
+  bilinear) and cropped to it, `boxblur=r:2` (r = a sixteenth of the thumbnail's smaller side, whole
+  pixels, at least 1 — under half the chroma plane, which `boxblur` requires — so the strength is
+  only roughly the same from one frame size to another), scaled back up bilinear, and the picture's
+  own Contain `scale` (the delivery's flags, `force_divisible_by=2` ahead of a tone-map) `overlay`'d
+  centred on it — a full-frame picture, so it takes the place of `pad`. A blur of a few dozen pixels
+  at the cost of one on a thumbnail. The inner pads are named per clip (`bf<instance>` in the export,
+  `bf<layer>` in the still); the string joins the chain like one filter
+  (`...,split[..];...;[..][..]overlay=...,setsar=1,...`). **Which clips take it** is
+  `takes_blur_fill`'s (pure), the same answer for the export and the still: a picture placed by the
+  plain fit that leaves bars. Not one moved, scaled, rotated, cropped or keyframed by its transform
+  (a picture-in-picture on its own fill is not what anyone asked for; the still asks of the clip,
+  not of its sampled pose), not a 360 reframe (it draws the frame itself), not a see-through one —
+  an alpha source (`Asset::has_alpha`, which the still is given as the export is), a chroma key, a
+  mask: the fill would show through its clear part as a blurred halo — and not one of the frame's
+  own shape or of an unprobed one (nothing to fill; it would cost ~7 ms a frame for nothing). Those
+  are given a Contain format by the caller, so their argv is Contain's byte for byte (`pad`
+  included in the still). The still's thumbnail is an eighth of the *still's* canvas. The
+  `overlay` composes in 8-bit 4:2:0 (its default) except for an HDR clip, fitted ahead of its
+  tone-map, which takes `format=yuv420p10` (FFmpeg 4.4 has it) so the fill does not band it; the
+  still tone-maps first, so it keeps the default. The GPU compositor refuses the whole frame (`Unsupported::BlurFill`, still and motion),
+  so the preview is FFmpeg's. Rendered in `cli/blur_rendered.rs` (`#[ignore]`d, 6.1 and 9.0): a
+  white / black source in a vertical frame keeps the picture, its bars are the picture blurred
+  across the edge (Contain's are black), the still draws the export's frame (3 levels at worst),
+  and a half-transparent FFV1 source renders under Blur exactly as under Contain; a 10-bit HLG ramp's
+  picture is Contain's to 2 levels (the tone-map's error diffusion), 5 with an 8-bit overlay.
   **The shape itself is a property of the project**, not of one render:
   `Timeline.format: Option<Delivery>` (`{width, height, fit}`) is the frame the cut
   is being made *for*. `export_format` applies it between the footage-derived
@@ -1067,6 +1094,29 @@ so the feature is **only** activated through these forwards — which is what ma
     elsewhere reading the one directory, and the stream (from the playhead mid-title the
     box is already across). A 10 s text-heavy lower third at 960 px: 301 frames in 3.0 s on 4 shared cores (10 ms a frame).
     **Not drawn**: `animateMotion`, CSS animation, an `<image>` whose `href` is not a `data:` URL of PNG / JPEG / GIF / WebP.
+  **Titles on tracks** (generated clips, `svg_layer::clip_sequences`, tests in `engine/cli/title_clips.rs`). A title clip's
+  input is the same rasteriser's pictures a floating title reads, drawn **over the whole frame** (`fmt` size, opaque, the clip's
+  chain fits and places it), one per output frame the clip is on — from the first at or after its start to the last **before** its
+  end, tail included (a decoded clip has no frame at its end either) — picture `j` the document at the slot start of frame
+  `first + j` on the clip's clock (`doc_t0 = source_in + exact_time(first) - timeline_start`). A clip on no frame still has one
+  picture, so every clip has its input. A document that cannot move is the held picture, looped. `push_inputs` pushes the
+  sequence (never shared by `plan_inputs`) and records `InputPlan::stamps`, and `video_clip_chain_stamped` starts the chain with
+  `settb=expr=den/num,setpts=N+k` (`,trim=end_frame=n` for a held picture) in place of `trim` / `reverse` / `setpts`; everything
+  after (crop, fit, zoom, colour, grade, effects, `format=yuva420p` for its alpha, fades, dips) is the clip's own chain, so a dip
+  to white fades the title's pixels and a dissolve its alpha (a transparent title over nothing dips only its artwork; give an
+  end card a background to dip the whole frame). **Drawn before the spawn** like the floating titles: `prepare_export` and the
+  stream (`PreviewCut::pictures`) prepare them with the overlays' sequences; the stream's are named for the slice (a stream from
+  another playhead draws the rest of the title again; the floating titles' grid-named reuse is not done for clips yet). **A still**
+  reads one picture of the document at the layer's source time over the canvas (`still_clip_picture`, `-f image2 -pattern_type
+  none`, drawn by `still_titles`), through the image path of the still chain; `active_video_clips` does not clamp a title's source
+  time to an asset. **A graph that draws no picture names no title**: `export_timeline` drops title clips for an audio-only
+  container (`drop_titles`), as the levels and mix passes and a scrub window do (a window's frames are never under a title: a
+  title clip has no asset, so `Snapshot::plain` is false over it and the one-shot still draws it). Interchange: OTIO writes a
+  `GeneratorReference.1` (`generator_kind` `KerfTitle`, the artwork in `metadata.kerf`), the EDL leaves titles out with a warning.
+  Golden: the `title-clip*` family (`core-golden.md`). Measured (`#[ignore]`d, 6.1.1): every export frame of a sliding title on
+  a track equals its still within 2 levels at 24 / 25 / 29.97 / 30 fps and the frames off it are the plain cut; a dip to white
+  from the shot into an end card is white at the cut and the card holds its last state when extended; a head-trimmed title starts
+  part-way; a held one ends with its clip; the stream from mid-title shows it part-way across.
   **360 footage** is reprojected by `v360`: `StreamInfo.projection` is detected at
   probe time (`detect_projection` — a `Spherical Mapping` side-data entry, or an
   Insta360 `.insv` whose frame is two squares side by side; deliberately *no*

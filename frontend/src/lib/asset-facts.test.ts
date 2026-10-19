@@ -72,16 +72,18 @@ describe('the facts of an asset', () => {
 });
 
 describe('the analysis and the proxy', () => {
-	test('how much has run, then the failures with their reasons, then what was found', () => {
+	test('how much has run is the summary; the rows are the failures with their reasons, then what was found', () => {
 		const found = { silence_segments: [{ start: 1, end: 3 }], scene_changes: [], transcript: [], onsets: [], tempo: null, loudness: null, audio_class: null } as unknown as AssetAnalysis;
-		const { analysis } = run(asset(), { status: status({ silence: 'done', loudness: 'failed' }), analysis: found });
-		expect(analysis[0]).toEqual({ label: 'Analyzed', value: '1 of 5', title: 'silence' });
-		expect(analysis[1]).toEqual({ label: 'Loudness', value: 'failed', title: 'ffmpeg exited with 1' });
+		const { analyzed, analysis } = run(asset(), { status: status({ silence: 'done', loudness: 'failed' }), analysis: found });
+		expect(analyzed).toBe('1 of 5');
+		expect(analysis[0]).toEqual({ label: 'Loudness', value: 'failed', title: 'ffmpeg exited with 1' });
 		expect(analysis.map((f) => f.label)).toContain('Silence');
+		expect(analysis.map((f) => f.label)).not.toContain('Analyzed');
 	});
 
 	test('a pass that is running reads running', () => {
-		expect(run(asset(), { analyzing: true }).analysis[0].value).toBe('running…');
+		expect(run(asset(), { analyzing: true }).analyzed).toBe('running…');
+		expect(run(asset()).analyzed).toBe('none');
 	});
 
 	test('the proxy rows are the bin menu’s own', () => {

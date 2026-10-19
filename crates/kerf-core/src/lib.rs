@@ -29,6 +29,7 @@ pub mod planner;
 pub mod platform;
 pub mod play_plan;
 pub mod project;
+pub mod project_activity;
 pub mod proxy;
 pub mod recovery;
 pub mod render_bar;
@@ -89,16 +90,16 @@ pub use model::{
     plan_score_to_picture, AlignOptions, AlignReport, AnalysisKind, Asset, AssetAnalysis, AudioEffect, AutoIncluded, BeatReading,
     CaptionLayout, CaptionOptions, CaptionPlacement, CaptionStyle, CaptionTimeBase, Clip, ClipCut, ClipLut, ClipMove, Color,
     CropFrame, CurvePoint, Curves, CutAlignment, Delivery, DeltaRange, Detached, DetachedMany, DiffEntry, DiffKind, Easing,
-    EditOutcome, EditSource, Framing, Grade, HitKind, InstrumentOverrides, Keyframe, LevelReading, Levels, Marker, MarkerKind,
-    MarkerPatch, Mask, MaskShape, MasterBus, MusicScore, MusicStyle, Projection, Property, PropertyKey, PropertyTrack, Reframe,
-    ReframeKeyframe, ResolvedReframe, Revision, Rhythm, SalienceMap, ScoreHit, ScoreSection, SectionKind, SectionSpan,
-    SkippedChange, SkippedDetach, SourceLimits, SplitSide, StagedAssetChange, StagedEdit, StreamInfo, StreamKind, Subsampling,
-    SubsetMerge, SvgOverlay, SvgOverlayPatch, SvgPreset, SvgPresetKind, SvgPresetParams, Task, TaskStatus, TextKeyframe,
-    TextOverlay, TimeRange, Timeline, TimelineDiff, Track, TrackLevels, TranscriptSegment, Transform, TransformPatch, Transition,
-    TransitionKind, VideoEffect, Voiceover, Wheel, Wheels, Word, ADJACENT_EPS, DEFAULT_MAX_TEMPO_CHANGE, LEVELS_TARGET_LUFS,
-    LEVELS_TRUE_PEAK_CEILING_DBTP, MASTER_DEFAULT_CEILING_DB, MASTER_MAX_VOLUME, MASTER_MIN_CEILING_DB, MAX_BPM,
-    MAX_CHANNEL_VOLUME, MAX_SEED, MAX_SPEED, MAX_SVG_OVERLAYS, MAX_SVG_SECONDS, MIN_BPM, MIN_EDIT_CLIP, MIN_SPEED,
-    RELEASE_TAIL_S,
+    EditOutcome, EditSource, Framing, Generator, Grade, HitKind, InstrumentOverrides, Keyframe, LevelReading, Levels, Marker,
+    MarkerKind, MarkerPatch, Mask, MaskShape, MasterBus, MusicScore, MusicStyle, Projection, Property, PropertyKey,
+    PropertyTrack, Reframe, ReframeKeyframe, ResolvedReframe, Revision, Rhythm, SalienceMap, ScoreHit, ScoreSection, SectionKind,
+    SectionSpan, SkippedChange, SkippedDetach, SourceLimits, SplitSide, StagedAssetChange, StagedEdit, StreamInfo, StreamKind,
+    Subsampling, SubsetMerge, SvgOverlay, SvgOverlayPatch, SvgPreset, SvgPresetKind, SvgPresetParams, Task, TaskStatus,
+    TextKeyframe, TextOverlay, TimeRange, Timeline, TimelineDiff, TitleClip, Track, TrackLevels, TranscriptSegment, Transform,
+    TransformPatch, Transition, TransitionKind, VideoEffect, Voiceover, Wheel, Wheels, Word, ADJACENT_EPS,
+    DEFAULT_MAX_TEMPO_CHANGE, GENERATED_ASSET, LEVELS_TARGET_LUFS, LEVELS_TRUE_PEAK_CEILING_DBTP, MASTER_DEFAULT_CEILING_DB,
+    MASTER_MAX_VOLUME, MASTER_MIN_CEILING_DB, MAX_BPM, MAX_CHANNEL_VOLUME, MAX_SEED, MAX_SPEED, MAX_SVG_OVERLAYS,
+    MAX_SVG_SECONDS, MAX_TITLE_CLIPS, MIN_BPM, MIN_EDIT_CLIP, MIN_SPEED, RELEASE_TAIL_S,
 };
 pub use plan_caps::{DipWhy, EffectKinds, GpuCaps, LayerRef, Unsupported};
 pub use plan_epoch::{bump_plan_epoch, plan_epoch};
@@ -112,8 +113,8 @@ pub use project::{
     AlignTo, AudioSync, AudioSyncMeasure, AudioSyncPlan, BandBalance, BandBalanceRequest, BandPlan, BandSource, ComposePlan,
     ComposeRequest, Composed, DeliveryInputs, ExportedFile, FramingPlan, MissingAsset, Page, Project, RelinkCheck, Relinked,
     RemovedAsset, ScoreAlign, SmartCropJob, SmartCropPlan, StemsPlaced, SubsetApplied, SvgChecked, SvgLayout, SvgOverlayResult,
-    SvgSource, SyncSide, DEFAULT_HISTORY_LIMIT, MAX_CHANNEL_KEYS, MAX_SYNC_SECONDS, MUSIC_TRACK, SCHEMA_VERSION,
-    STAGED_UNDO_DEPTH, SYNC_SAMPLE_RATE, VOICEOVER_TRACK,
+    SvgSource, SyncSide, TitleClipPatch, TitleClipPlacement, TitleClipResult, TitleEdited, DEFAULT_HISTORY_LIMIT,
+    MAX_CHANNEL_KEYS, MAX_SYNC_SECONDS, MUSIC_TRACK, SCHEMA_VERSION, STAGED_UNDO_DEPTH, SYNC_SAMPLE_RATE, VOICEOVER_TRACK,
 };
 pub use proxy::{PreviewSource, ProxyInput, ProxyPhase, ProxySize, ProxyStatus, ProxyWait};
 pub use recovery::{Recoverable, RecoveryInfo};

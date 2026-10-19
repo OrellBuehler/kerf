@@ -166,6 +166,8 @@ again; `context.ct` cancels it, a slot wait goes out as a progress notification)
 `AudioSync` (offset, confidence, distinct — `null` for no rival peak —, reliable, inverted, applied);
 `project-changed` only when it moved. Its description says only each clip's used source window is
 compared. `export_variants` progress says `measuring the mix's loudness` while a static normalization meters. `export`'s `options.loudness_static` is in its description.
+`set_delivery_format`'s `fit` takes `cover` (the default), `contain` or `blur` (the whole
+picture over a blurred, enlarged copy of itself; a clip placed by its transform gets plain bars).
 `smart_crop` frames each shot for the delivery frame (the server `instructions`
 pair it with `set_delivery_format`, since reshaping to 9:16 otherwise keeps
 whatever was in the middle). `export_variants` is the one-call multi-format
@@ -272,6 +274,15 @@ is refused while `agent_review` is on** (a template is the user's own work and t
 like `export_template`; `save_template` and `apply_template` are annotated as edits, `set_template_values` / `import_template` as
 idempotent sets. The instructions place the loop after the SVG one: author with `id`s → `validate_svg` → `add_svg_overlay` →
 preview → `save_template` with `controls` → `apply_template`; tests pin that order and the schemas.
+**Titles on tracks over MCP.** `add_title_clip { svg, start, duration?, track_id?, name? }` (Edit) and `update_title_clip {
+clip_id, name?, svg? }` (Set) read the SVG on `blocking` before the lock and `edit()` runs `add_title_clip_parsed` /
+`update_title_clip_parsed`; `apply_template` takes **`on_track: true`** (and `track_id?`) to put the template on a video track
+instead (`apply_template_clip_parsed`; `end` becomes the duration; x / y / width / height / opacity are refused with it — the clip's
+transform places it). These answer `TitleClipOutcome {title_clip: TitleClipSummary {id, track_id, name, start, end, source_in,
+template?, svg_bytes}, warnings}`; `set_template_values` dispatches on the id (`set_title_values_parsed`) and answers the overlay or
+the title clip; `save_template` and `preview_svg_overlay` take a title clip's id too. `timeline_summary` lists `title_clips`
+(the clips are also counted in their tracks); `get_timeline_state` elides a large title clip's source like a floating one's. The
+instructions say a title can be a clip on a track that takes a transition (a dip to white into an end card).
 `import_asset` refuses a UNC / device-namespace `path` before any filesystem call (`require_local_input_path`), then a URL,
 protocol, relative path or missing file (`validate_import_path`). It is the one write that does **not** stage — a file on disk is not
 an edit to the user's cut, so imported media (and its background proxy) lands for
@@ -450,7 +461,7 @@ Agent edits **stage** (`core-project.md`). The adapter's part:
 
 `analyze_asset`, `export`, `export_variants`, `generate_voiceover`, `compose_music`, `separate_stems`, `download_speech_model`,
 `import_asset`, `smart_crop`, `refine_transcript` and `sync_clips_by_audio` take `background: true` and answer `{job_id}` at once; `job_status`, `cancel_job` and
-`list_jobs` read and stop them. Each is written once against `jobs::Run` (`cancelled()` + `progress(fraction, message)`):
+`list_jobs` read and stop them (or subscribe to `kerf://jobs/{job_id}`, below). Each is written once against `jobs::Run` (`cancelled()` + `progress(fraction, message)`):
 a foreground call builds it from the request (`foreground`: the `ct` cancellation token and the `progressToken`, with a relay
 task that keeps progress monotonic), a background one from its record in `Jobs` (bounded: 8 running, 48 records, a finished
 job forgotten after an hour). `KerfMcp::long_tool` does the branching, so **argument validation stays in the tool body,
@@ -467,6 +478,47 @@ opened since (`require_generation`) — a Save As does not count as one (`replac
 that decode (`get_waveform`, `get_waveform_range`, `get_energy`, `skim_asset`, `preview_timeline`, `get_frame`) take the
 request's cancellation token, so a dropped request kills its ffmpeg; `export_cover` reports `reading the cut` →
 `rendering the cover frame` → `cover written` on the `progressToken`.
+
+## Live activity stream (`mcp/activity.rs`)
+
+What an agent is told without polling: **resource-updated notifications** (MCP's own mechanism; logging
+notifications are deprecated by SEP-2577 and not used). `get_info` advertises `resources` with `subscribe`;
+`list_resources` / `list_resource_templates` / `read_resource` serve `kerf://project` (`project_brief`:
+`generation`, the working timeline's `timeline_brief`, the proposal's `owned_by_agent` / `edits` / `stale`),
+`kerf://tasks` (the first page of `list_tasks`), `kerf://jobs` (`list_jobs`) and `kerf://jobs/{job_id}`
+(`job_status`) — the polling tools' answers, which stay (`resource_text`: the project read under its lock
+as the session, the jobs with none). Subscribing: `resources/subscribe` / `unsubscribe` (legacy protocols;
+an unknown URI is `resource_not_found`, and so is a job URI whose id is not `job-` and eight lowercase hex
+digits or that the registry does not know; at most 64 per session), the notification riding the
+session's standalone SSE stream (`GET /mcp`, behind the same bearer and origin checks: a stream without
+the token is a 401), or at `2026-07-28` `subscriptions/listen` (`accepted_subscription_filter` keeps only
+this server's URIs; `listen` sends through the subscription's sink until the request ends).
+**Producers never wait**: one `tokio::sync::broadcast` channel (capacity 256) takes `Event::Job(id)` from
+the `Jobs` registry (begin, every report, finish — published after its lock is released) and
+`Event::Project(areas)` from `kerf_core::project_activity` (core-project.md): its listener runs under the
+project lock and only wakes `pump_project` (started by `mcp::start`), which takes the marks 200 ms later and
+publishes with no lock held; a listener set while marks are pending (the project opened at launch, before
+`mcp::start`) is woken at once, or an area marked then would never be newly marked again. **Per session**,
+`Listener` (a field of `KerfMcp`, so cloned into every handle) holds the subscribed URIs; the first
+subscribe starts its task (and its channel receiver), which gathers what arrives in a 200 ms
+window into a `Batch` (a job's ticks are one, areas OR together) and sends one notification per subscribed
+resource it changed (`kerf://project` for timeline / proposal / assets / project areas, `kerf://tasks` for
+tasks, `kerf://jobs` for any job, the job's own URI for it). A send that takes over 10 s or fails is given
+up and the next batch tells everything; a reader that fell behind the channel (`Lagged`) is told every
+resource it subscribed changed — so a slow client holds no backlog and blocks nothing upstream. The task
+holds only a `Weak` of the listener and a token the listener cancels on drop: it ends with the session's
+last `KerfMcp` handle (session closed, expired, or the listener restarted). **Liveness follows the client,
+not our sends**: rmcp's idle expiry (5 min) counts any message the handler sends, so a task that kept
+sending would keep a crashed client's session — and the proposal it owns (`release_orphaned_staging`) —
+alive for ever. Every client request (`call_tool`, the `resources/*` requests, `ping`) `touch`es the
+listener, and once the client has asked nothing for 5 minutes the task drops the subscriptions and stops
+(at its next batch); rmcp then expires the session 5 minutes after the last send. The instructions say
+so: a subscriber pings at least every five minutes, and reads a resource once right after subscribing,
+since nothing before the subscription is replayed (also in `long_tool`'s `next` hint). `listen` gives up a
+send after the same 10 s. Tests: `Batch` and the gather /
+lag / end / quiet rules, the subscription cap and the job-id shape, the pump publishing a write made to an
+area marked before it started (`activity.rs`), `a_resource_reads_what_its_polling_tool_answers` (`mcp.rs`), and `a_subscribed_session_hears_a_job_move_on_its_stream` (`server.rs`:
+the real listener, middleware and session, over a socket).
 
 ## Small answers, paged reads (`mcp/reads.rs`)
 
@@ -524,7 +576,7 @@ Every tool, by purpose (a test pins that this list names each registered tool, a
   `set_track_locked`, `set_master_volume`, `set_master_limiter`, `set_master_true_peak`, `set_master_duck`, `plan_music_fit`, `fit_music`,
   `compose_music`, `music_status`, `separate_stems`, `stems_status`.
 - **Titles, captions, markers, frame**: `add_overlay`, `update_overlay`, `remove_overlay`, `set_overlay_keyframes`,
-  `add_svg_overlay`, `update_svg_overlay`, `remove_svg_overlay`, `list_svg_presets`, `validate_svg`, `preview_svg_overlay`,
+  `add_svg_overlay`, `update_svg_overlay`, `remove_svg_overlay`, `add_title_clip`, `update_title_clip`, `list_svg_presets`, `validate_svg`, `preview_svg_overlay`,
   `preview_svg_preset`, `list_templates`, `save_template`, `apply_template`, `set_template_values`, `import_template`,
   `export_template`, `delete_template`, `generate_captions`, `import_captions`, `clear_captions`, `export_srt`, `export_captions`, `add_marker`,
   `update_marker`, `remove_marker`, `set_delivery_format`.

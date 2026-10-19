@@ -4178,7 +4178,8 @@ pub struct ExportOptions {
     /// Output WxH, baked into the filtergraph. Even-clamped.
     pub resolution: Option<(u32, u32)>,
     /// How footage of a different shape is fitted to that frame — letterboxed
-    /// (the default) or filled and cropped. Only matters when the two differ.
+    /// (the default), filled and cropped, or letterboxed over a blurred copy of
+    /// itself. Only matters when the two differ.
     pub fit: Fit,
     /// Output fps, baked into the filtergraph; never emits `-r`.
     pub fps: Option<f64>,
@@ -4820,6 +4821,9 @@ struct InputPlan {
     representatives: Vec<usize>,
     /// Per clip flat-index → its unique input index (position in `representatives`).
     clip_input: Vec<usize>,
+    /// Per clip flat-index, how a title clip's pictures are stamped onto the canvas' grid (its chain's
+    /// first filters); `None` for a clip of footage. Filled by [`push_inputs`], which names the pictures.
+    stamps: Vec<Option<svg_layer::ClipStamp>>,
 }
 
 fn plan_inputs(timeline: &Timeline, assets: &[Asset], fx: &[ClipFx]) -> InputPlan {
@@ -4828,7 +4832,7 @@ fn plan_inputs(timeline: &Timeline, assets: &[Asset], fx: &[ClipFx]) -> InputPla
     let mut clip_input: Vec<usize> = Vec::new();
     let mut seen: std::collections::HashMap<(uuid::Uuid, String), usize> = std::collections::HashMap::new();
     for (flat, clip) in timeline.tracks.iter().flat_map(|t| t.clips.iter()).enumerate() {
-        let input = if image_of(clip.asset_id) {
+        let input = if image_of(clip.asset_id) || clip.is_generated() {
             let i = representatives.len();
             representatives.push(flat);
             i
@@ -4845,9 +4849,11 @@ fn plan_inputs(timeline: &Timeline, assets: &[Asset], fx: &[ClipFx]) -> InputPla
         };
         clip_input.push(input);
     }
+    let stamps = vec![None; clip_input.len()];
     InputPlan {
         representatives,
         clip_input,
+        stamps,
     }
 }
 
@@ -4870,10 +4876,20 @@ fn push_inputs(
     let fx = transition_fx(timeline, assets);
     // Deduplicate inputs: clips whose `-i` args are identical (same asset, same
     // fast-seek) share one decoded input, fanned out in the graph with `split`.
-    let plan = plan_inputs(timeline, assets, &fx);
+    let mut plan = plan_inputs(timeline, assets, &fx);
+    // A title clip's input is its pictures, drawn before ffmpeg is spawned (`svg_layer::prepare`).
+    let titles = svg_layer::clip_sequences(timeline, fmt, &fx);
     let clips: Vec<&crate::model::Clip> = timeline.tracks.iter().flat_map(|t| t.clips.iter()).collect();
     for &rep in &plan.representatives {
         let clip = clips[rep];
+        if clip.is_generated() {
+            let pictures = titles[rep]
+                .as_ref()
+                .ok_or_else(|| Error::Engine(format!("frame rate {} cannot draw a title on a track", fmt.fps)))?;
+            svg_layer::push_inputs(std::slice::from_ref(&pictures.seq), fmt, args);
+            plan.stamps[rep] = Some(pictures.stamp());
+            continue;
+        }
         let path = path_of(clip.asset_id).ok_or(Error::AssetNotFound(clip.asset_id))?;
         let (start, end) = clip_source_window(clip, &fx[rep]);
         if image_of(clip.asset_id) {
@@ -4919,9 +4935,21 @@ fn push_inputs(
 /// what the builder will ask for before it is spawned (the titles' pictures) both start here.
 fn export_timeline(timeline: &Timeline, opts: &ExportOptions) -> Timeline {
     let rendered = timeline.for_render();
-    match effective_range(&rendered, opts) {
+    let mut cut = match effective_range(&rendered, opts) {
         Some((s, e)) => rendered.slice(s, e),
         None => rendered,
+    };
+    if opts.container.is_audio_only() {
+        drop_titles(&mut cut);
+    }
+    cut
+}
+
+/// Take the title clips out of a cut whose graph draws no picture (an audio-only export, the levels
+/// and the mix passes): their input is pictures nobody drew, and they have no sound.
+fn drop_titles(timeline: &mut Timeline) {
+    for track in &mut timeline.tracks {
+        track.clips.retain(|c| !c.is_generated());
     }
 }
 
@@ -5452,6 +5480,15 @@ impl PreviewCut {
     fn svg(&self) -> Vec<svg_layer::SvgSeq<'_>> {
         svg_layer::stream_sequences(&self.titles, self.total, &self.sliced, self.start, &self.fmt)
     }
+
+    /// Every picture the stream reads: the floating titles' and the title clips' (whose input is
+    /// named for the slice, so a stream from another playhead draws the rest of the title again).
+    fn pictures(&self, assets: &[Asset]) -> Vec<svg_layer::SvgSeq<'_>> {
+        let mut all = self.svg();
+        let fx = transition_fx(&self.sliced, assets);
+        all.extend(svg_layer::clip_seqs(&svg_layer::clip_sequences(&self.sliced, &self.fmt, &fx)));
+        all
+    }
 }
 
 fn preview_cut(
@@ -5665,7 +5702,7 @@ fn stream_preview_once(
     let cut = preview_cut(timeline, assets, start, fps, max_width, decode_hwaccel())?;
     // Animated titles are pictures on disk by now (a few seconds' work at most); held until the
     // stream is over so the cache cannot take them away mid-play.
-    let _titles = svg_layer::prepare_preview(&cut.svg(), cancel)?;
+    let _titles = svg_layer::prepare_preview(&cut.pictures(assets), cancel)?;
     let mut args = preview_args(&cut, assets, PREVIEW_STREAM_QUALITY)?;
     // The composited graph outgrows argv just as the export's does.
     let _script = externalize_filter_complex(&mut args, "preview")?;
@@ -6984,6 +7021,7 @@ fn build_filter_complex_with(
 ) -> FilterGraph {
     let has_audio = |clip: &crate::model::Clip| clip_sounds(clip, assets);
     let is_image = |clip: &crate::model::Clip| assets.iter().find(|a| a.id == clip.asset_id).is_some_and(|a| a.is_image());
+    let picture_of = |clip: &crate::model::Clip| picture_size(assets.iter().find(|a| a.id == clip.asset_id));
     let layout = fmt.channel_layout();
 
     // Assign each clip its ffmpeg input index (track-then-storage order, matching
@@ -7120,9 +7158,28 @@ fn build_filter_complex_with(
             } else {
                 format!("{input}:v")
             };
+            // A clip the blurred fill does not suit is placed with Contain's chain.
+            let contained;
+            let clip_fmt =
+                if fmt.fit == Fit::Blur && !takes_blur_fill(clip, picture_of(clip), (fmt.width, fmt.height), fx[*flat].alpha) {
+                    contained = ExportFormat {
+                        fit: Fit::Contain,
+                        ..fmt.clone()
+                    };
+                    &contained
+                } else {
+                    fmt
+                };
             chains.push(format!(
                 "[{src}]{chain}[v{flat}]",
-                chain = video_clip_chain(clip, fmt, &fx[*flat], is_image(clip), &format!("{instances}c{flat}"))
+                chain = video_clip_chain_stamped(
+                    clip,
+                    clip_fmt,
+                    &fx[*flat],
+                    is_image(clip),
+                    plan.stamps.get(*flat).copied().flatten(),
+                    &format!("{instances}c{flat}")
+                )
             ));
             let out = if n == last {
                 composite_pad.to_string()
@@ -8341,6 +8398,57 @@ fn fade_filter(step: &FadeStep) -> String {
     format!("fade=t={edge}:st={}:d={}{tint}", step.st, step.d)
 }
 
+/// The [`Fit::Blur`] fit of a picture into a `w`x`h` frame (pure): split in two, the
+/// picture scaled to fit (`decrease`, with `even` and the delivery's scaler flags `sf`, as
+/// the Contain fit) over a copy scaled to cover a thumbnail an eighth of the frame on each
+/// side (even, at least 4x4), cropped to it, box-blurred twice and scaled back up — a blur of
+/// a few dozen pixels, at the cost of one on a thumbnail. `label` names the chain's inner pads,
+/// unique within its graph. Its text joins a chain like a filter:
+/// `...,split[..];...;[..][..]overlay=...,...`. Which clips take it is [`takes_blur_fill`]'s.
+///
+/// The `overlay` composes in 8-bit 4:2:0 (its default) unless `deep`: an HDR picture, fitted ahead
+/// of its tone-map, composes in 10 bits (`format=yuv420p10`, FFmpeg 4.4 on) so the fill does not
+/// band it; an SDR one keeps the default.
+fn blur_fill(w: u32, h: u32, even: &str, sf: &str, deep: bool, label: &str) -> String {
+    let (bw, bh) = ((w / 16 * 2).max(4), (h / 16 * 2).max(4));
+    // A radius above half the chroma plane is refused; a sixteenth of the thumbnail's smaller
+    // side, whole pixels (so the strength is only roughly the same from one frame size to another).
+    let radius = (bw.min(bh) / 16).max(1);
+    format!(
+        "split[{label}b][{label}f];\
+         [{label}b]scale={bw}:{bh}:force_original_aspect_ratio=increase:flags=bilinear,crop={bw}:{bh},\
+         boxblur={radius}:2,scale={w}:{h}:flags=bilinear[{label}bb];\
+         [{label}f]scale={w}:{h}:force_original_aspect_ratio=decrease{even}{sf}[{label}ff];\
+         [{label}bb][{label}ff]overlay=(W-w)/2:(H-h)/2{format}",
+        format = if deep { ":format=yuv420p10" } else { "" }
+    )
+}
+
+/// Whether `clip` takes the [`Fit::Blur`] fill in a `frame`-sized delivery (pure), its picture
+/// `picture` (the probed, displayed size) and `alpha` whether it carries an alpha channel. Only a
+/// picture placed by the plain fit that leaves bars: not one moved, scaled, rotated, cropped or
+/// animated by its transform, not a 360 reframe (which draws the frame itself), not one that is
+/// see-through (an alpha source, a chroma key, a mask: the fill would show through it as a
+/// blurred halo) and not one of the frame's own shape or of an unknown one (nothing to fill).
+/// Anything else is placed with Contain's own chain, byte for byte.
+fn takes_blur_fill(clip: &Clip, picture: Option<(u32, u32)>, frame: (u32, u32), alpha: bool) -> bool {
+    let other_shape =
+        picture.is_some_and(|(w, h)| w > 0 && h > 0 && u64::from(w) * u64::from(frame.1) != u64::from(h) * u64::from(frame.0));
+    clip.transform.is_identity()
+        && !clip.is_animated()
+        && clip.reframe.is_none()
+        && clip.mask.is_none()
+        && !alpha
+        && !clip.effects.iter().any(|e| e.produces_alpha())
+        && other_shape
+}
+
+/// The displayed size of `asset`'s picture, when it was probed.
+fn picture_size(asset: Option<&Asset>) -> Option<(u32, u32)> {
+    let stream = asset?.streams.iter().find(|s| s.kind == StreamKind::Video)?;
+    Some((stream.width?, stream.height?))
+}
+
 /// The video filter chain for one clip (everything between its `[i:v]` input
 /// and its `[v{i}]` output): trim, optional reverse / crop / retime, 360
 /// reprojection, fit or transform geometry, color correction, per-clip video
@@ -8363,8 +8471,25 @@ fn fade_filter(step: &FadeStep) -> String {
 /// between them. Every other clip keeps the chain it always had.
 ///
 /// `instance` is the clip's unique flat index, used to name its `v360` so
-/// `sendcmd` can address it; it is unused for clips that do not reframe.
+/// `sendcmd` can address it and the inner pads of a [`Fit::Blur`] fill; it is unused
+/// for clips that do neither. A `fmt` whose fit is `Blur` gives the clip the fill: the caller
+/// passes Contain for a clip that does not take it ([`takes_blur_fill`]).
+#[cfg(test)]
 fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool, instance: &str) -> String {
+    video_clip_chain_stamped(clip, fmt, fx, is_image, None, instance)
+}
+
+/// [`video_clip_chain`] for a clip whose input may be a title's pictures: `stamp` puts them on the
+/// canvas' grid in place of the `trim` and `setpts` a decoded clip starts with (they are drawn for
+/// exactly the frames the clip is on, tail included); everything after is the same chain.
+fn video_clip_chain_stamped(
+    clip: &Clip,
+    fmt: &ExportFormat,
+    fx: &ClipFx,
+    is_image: bool,
+    stamp: Option<svg_layer::ClipStamp>,
+    instance: &str,
+) -> String {
     let s = clip.speed_mag();
     let t = &clip.transform;
     let anim = clip.is_animated();
@@ -8430,12 +8555,16 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
     // source plays the frames the export renders instead of `lead` seconds of the
     // first frame held. Only a padded proxy gets the filter; every other input's
     // chain is exactly what it was.
-    if fx.head_pad && !is_image && seek == 0.0 {
-        p.push("trim=start_frame=1".to_string());
-    }
-    p.push(format!("trim=start={}:end={}", trim_start - seek, trim_end - seek));
-    if clip.is_reversed() {
-        p.push("reverse".to_string());
+    if let Some(stamp) = stamp {
+        p.push(stamp.filters());
+    } else {
+        if fx.head_pad && !is_image && seek == 0.0 {
+            p.push("trim=start_frame=1".to_string());
+        }
+        p.push(format!("trim=start={}:end={}", trim_start - seek, trim_end - seek));
+        if clip.is_reversed() {
+            p.push("reverse".to_string());
+        }
     }
     // A reframed clip crops *after* reprojection instead: edge fractions of a raw
     // dual-fisheye frame mean nothing, and the user set them against the flat
@@ -8444,19 +8573,21 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
     if reframe.is_none() {
         p.extend(crop.clone());
     }
-    // `setpts` puts the first frame kept at the clip's start; a window that starts inside a
-    // late-starting source's lead keeps no frame until the source's first picture, which
-    // plays `picture_delay` into the clip, in sync with the sound beside it.
-    let start = match timing.picture_delay() {
-        d if d > 0.0 => format!("({}+{d})", clip.timeline_start),
-        _ => clip.timeline_start.to_string(),
-    };
     // A keyed crop's `fps` pins its first frame where `setpts` puts it (see `keyed_crop_fps`).
     let (crop_fps, crop_rate, crop_first) = keyed_crop_fps(fmt.fps, clip.timeline_start + timing.picture_delay());
-    if (s - 1.0).abs() < 1e-9 {
-        p.push(format!("setpts=PTS-STARTPTS+{start}/TB"));
-    } else {
-        p.push(format!("setpts=(PTS-STARTPTS)/{s}+{start}/TB"));
+    if stamp.is_none() {
+        // `setpts` puts the first frame kept at the clip's start; a window that starts inside a
+        // late-starting source's lead keeps no frame until the source's first picture, which
+        // plays `picture_delay` into the clip, in sync with the sound beside it.
+        let start = match timing.picture_delay() {
+            d if d > 0.0 => format!("({}+{d})", clip.timeline_start),
+            _ => clip.timeline_start.to_string(),
+        };
+        if (s - 1.0).abs() < 1e-9 {
+            p.push(format!("setpts=PTS-STARTPTS+{start}/TB"));
+        } else {
+            p.push(format!("setpts=(PTS-STARTPTS)/{s}+{start}/TB"));
+        }
     }
     if let Some(rf) = reframe {
         // Hoisted above `v360` so a 50 fps source exporting at 30 reprojects 30
@@ -8500,9 +8631,19 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
     // the overlay (not padded full-frame), and its zoom is re-evaluated per frame.
     let geom_identity = t.is_identity() && !anim;
     match fmt.fit {
+        // The whole picture over a blurred copy of itself that covers the frame: a
+        // full-size canvas, as the padded identity case is.
+        Fit::Blur if geom_identity => p.push(blur_fill(
+            fmt.width,
+            fmt.height,
+            if tone_mapped { ":force_divisible_by=2" } else { "" },
+            &sf,
+            tone_mapped,
+            &format!("bf{instance}"),
+        )),
         // Fit inside the frame; the identity case then pads out to full size so
         // the overlay lands on a complete canvas.
-        Fit::Contain => {
+        Fit::Contain | Fit::Blur => {
             p.push(format!(
                 "scale={w}:{h}:force_original_aspect_ratio=decrease{even}{sf}",
                 w = fmt.width,
@@ -9189,12 +9330,33 @@ fn still_titles(
     max_width: u32,
     region: Option<Region>,
 ) -> Result<Vec<crate::svg::raster::Pin>> {
-    if timeline.svg_overlays.is_empty() {
+    if timeline.svg_overlays.is_empty() && timeline.title_clips().next().is_none() {
         return Ok(Vec::new());
     }
     let rendered = timeline.for_render();
-    let (_, _, ow, oh) = still_canvas(&rendered, assets, opts, max_width, region);
-    svg_layer::ensure_stills(&svg_layer::still_svgs(&rendered, ow, oh, t.max(0.0)))
+    let (fmt, _, ow, oh) = still_canvas(&rendered, assets, opts, max_width, region);
+    let t = t.max(0.0);
+    let mut pictures = svg_layer::still_svgs(&rendered, ow, oh, t);
+    pictures.extend(
+        still_clip_pictures(&still_layers(&rendered, assets, fmt.fps, t), ow, oh)
+            .into_iter()
+            .flatten(),
+    );
+    svg_layer::ensure_stills(&pictures)
+}
+
+/// The picture of each title clip among a still's `layers` (`None` for a layer of footage), drawn over
+/// the whole `ow` x `oh` canvas at the clip's own clock: its input, as a still image's file is.
+fn still_clip_pictures<'a>(layers: &[still_fx::StillLayer<'a>], ow: u32, oh: u32) -> Vec<Option<svg_layer::StillSvg<'a>>> {
+    layers
+        .iter()
+        .map(|layer| {
+            let clip = layer.active.clip;
+            clip.generator
+                .as_ref()
+                .map(|g| svg_layer::still_clip_picture(g.svg(), ow, oh, layer.active.source_time))
+        })
+        .collect()
 }
 
 /// [`build_still_args`] over a timeline that has already been through [`Timeline::for_render`]:
@@ -9220,9 +9382,14 @@ fn build_still_args_rendered(
     // transition keeps on screen past their end included. The `RenderPlan` a compositor
     // draws from is built from the same list.
     let active = still_layers(timeline, assets, fmt.fps, t);
+    let drawn = still_clip_pictures(&active, ow, oh);
 
     let mut args: Vec<String> = vec!["-hide_banner".to_string(), "-loglevel".to_string(), "error".to_string()];
-    for layer in &active {
+    for (layer, picture) in active.iter().zip(&drawn) {
+        if let Some(picture) = picture {
+            svg_layer::push_still_inputs(std::slice::from_ref(picture), &mut args);
+            continue;
+        }
         let (clip, src) = (layer.active.clip, layer.active.source_time);
         let asset = asset_of(clip.asset_id).ok_or(Error::AssetNotFound(clip.asset_id))?;
         // A still has a single frame at t=0 (`trim=end_frame=1` in the chain picks
@@ -9291,7 +9458,16 @@ fn build_still_args_rendered(
                 }),
                 clip.zoom_animated(),
                 &layer.fades,
-                layer.label_bt709
+                layer.label_bt709,
+                (fmt.fit == Fit::Blur
+                    && takes_blur_fill(
+                        clip,
+                        picture_size(asset_of(clip.asset_id)),
+                        (fmt.width, fmt.height),
+                        asset_of(clip.asset_id).is_some_and(Asset::has_alpha)
+                    ))
+                .then(|| format!("bf{n}"))
+                .as_deref()
             )
         ));
         let out = format!("ov{n}");
@@ -9361,6 +9537,11 @@ struct StillCanvas {
 /// it over the layers on screen, and puts it where [`video_clip_chain`] does, ahead of everything.
 ///
 /// `grade` is the clip's curves, wheels and LUT, right after the `eq`, as `video_clip_chain` places them.
+///
+/// `blur_label` names the inner pads of a [`Fit::Blur`] fill ([`blur_fill`]), unique in the graph,
+/// and is `None` for a clip the export gives none ([`takes_blur_fill`]: an animated one, whose pose
+/// is not the plain fit even where it samples to it, a see-through one, a reframe, one of the
+/// frame's own shape), which is then placed as under Contain.
 #[allow(clippy::too_many_arguments)]
 fn still_clip_chain_graded(
     tf: &Transform,
@@ -9375,6 +9556,7 @@ fn still_clip_chain_graded(
     zoom_last: bool,
     fades: &StillFades,
     label_bt709: bool,
+    blur_label: Option<&str>,
 ) -> String {
     let StillCanvas { w: ow, h: oh, fit, sf } = canvas;
     let (ow, oh, fit) = (*ow, *oh, *fit);
@@ -9413,7 +9595,11 @@ fn still_clip_chain_graded(
     // the export cropped meant the one frame you look at while cutting was the
     // one shape you were never going to ship.
     match fit {
-        Fit::Contain => p.push(format!("scale={ow}:{oh}:force_original_aspect_ratio=decrease{sf}")),
+        Fit::Blur if tf.is_identity() && blur_label.is_some() => {
+            // The still tone-maps ahead of the chain: its picture is 8-bit SDR here.
+            p.push(blur_fill(ow, oh, "", sf, false, blur_label.unwrap_or_default()));
+        }
+        Fit::Contain | Fit::Blur => p.push(format!("scale={ow}:{oh}:force_original_aspect_ratio=decrease{sf}")),
         Fit::Cover => {
             p.push(format!("scale={ow}:{oh}:force_original_aspect_ratio=increase{sf}"));
             p.push(format!("crop={ow}:{oh}"));
@@ -9422,8 +9608,9 @@ fn still_clip_chain_graded(
     let mut late_zoom: Option<String> = None;
     if tf.is_identity() {
         // Cover already fills the frame; padding it would be a no-op that still
-        // costs a filter, so only the letterboxed path needs it.
-        if fit == Fit::Contain {
+        // costs a filter, so only the letterboxed path needs it (a blurred fill is the
+        // frame; a clip that does not take one is letterboxed as under Contain).
+        if fit == Fit::Contain || (fit == Fit::Blur && blur_label.is_none()) {
             p.push(format!("pad={ow}:{oh}:(ow-iw)/2:(oh-ih)/2"));
         }
     } else if (tf.scale - 1.0).abs() > 1e-9 {
@@ -9497,6 +9684,7 @@ fn still_clip_chain(
         zoom_last,
         fades,
         label_bt709,
+        Some("bf0"),
     )
 }
 
@@ -9718,6 +9906,10 @@ mod together_rendered;
 #[cfg(test)]
 mod svg_rendered;
 
+/// Titles on tracks: the argv, and through the real ffmpeg (`#[ignore]`d).
+#[cfg(test)]
+mod title_clips;
+
 /// Which slot a job takes, the cores' or the hardware's.
 #[cfg(test)]
 mod lane_tests;
@@ -9765,6 +9957,10 @@ mod sweep;
 /// The `fps` pick against the frames the export renders (`#[ignore]`d).
 #[cfg(test)]
 mod picked;
+
+/// The blurred fill through the real `ffmpeg` (`#[ignore]`d).
+#[cfg(test)]
+mod blur_rendered;
 
 /// A source whose video starts late keeps its sync in the export (`#[ignore]`d).
 #[cfg(test)]
@@ -17016,6 +17212,125 @@ mod tests {
         // The window is off-centre — a plain Cover would have taken the middle.
         assert!(chain.contains(&format!("x=iw*{}", crop.left)), "{chain}");
         assert!(crop.left < 0.3, "the subject is left of centre: {crop:?}");
+    }
+
+    #[test]
+    fn a_blurred_fill_puts_the_fitted_picture_over_a_blurred_cover_copy() {
+        assert_eq!(
+            blur_fill(1080, 1920, "", ":flags=bicubic", false, "bf0"),
+            "split[bf0b][bf0f];\
+             [bf0b]scale=134:240:force_original_aspect_ratio=increase:flags=bilinear,crop=134:240,\
+             boxblur=8:2,scale=1080:1920:flags=bilinear[bf0bb];\
+             [bf0f]scale=1080:1920:force_original_aspect_ratio=decrease:flags=bicubic[bf0ff];\
+             [bf0bb][bf0ff]overlay=(W-w)/2:(H-h)/2"
+        );
+        // A tiny frame keeps a thumbnail whose chroma plane takes a radius of 1.
+        assert!(blur_fill(40, 24, ":force_divisible_by=2", "", false, "x")
+            .contains("scale=4:4:force_original_aspect_ratio=increase:flags=bilinear,crop=4:4,boxblur=1:2"));
+        // An HDR picture composes in 10 bits ahead of its tone-map, on even sizes.
+        let fmt = ExportFormat {
+            width: 1080,
+            height: 1920,
+            fit: Fit::Blur,
+            ..ExportFormat::default()
+        };
+        let hlg = ClipFx {
+            hdr: Some(Hdr::Hlg),
+            ..ClipFx::default()
+        };
+        let deep = video_clip_chain(&make_clip(Uuid::new_v4(), 0.0, 5.0, 0.0), &fmt, &hlg, false, "c0");
+        assert!(
+            deep.contains("decrease:force_divisible_by=2[bfc0ff];[bfc0bb][bfc0ff]overlay=(W-w)/2:(H-h)/2:format=yuv420p10,"),
+            "{deep}"
+        );
+        assert!(
+            deep.find(":format=yuv420p10").unwrap() < deep.find("zscale").unwrap(),
+            "{deep}"
+        );
+        let asset = av_asset(Uuid::new_v4(), 30.0);
+        let graph = |clip: Clip, fit: Fit| {
+            let mut tl = single(vec![clip]);
+            tl.format = Some(Delivery::new(1080, 1920, fit));
+            let args = build_export_args(&tl, std::slice::from_ref(&asset), "out.mp4", &ExportOptions::default()).unwrap();
+            let at = args.iter().position(|a| a == "-filter_complex").unwrap() + 1;
+            args[at].clone()
+        };
+        let plain = make_clip(asset.id, 0.0, 5.0, 0.0);
+        let g = graph(plain.clone(), Fit::Blur);
+        assert!(
+            g.contains("[0:v]trim=start=0:end=5,setpts=PTS-STARTPTS+0/TB,split[bfc0b][bfc0f];"),
+            "{g}"
+        );
+        assert!(g.contains("[bfc0bb][bfc0ff]overlay=(W-w)/2:(H-h)/2,setsar=1,"), "{g}");
+        assert!(!g.contains("pad="), "the fill is the frame: {g}");
+        // Contain is what it was, and a clip placed by its transform gets Contain's chain.
+        let contain = graph(plain.clone(), Fit::Contain);
+        assert!(contain.contains("force_original_aspect_ratio=decrease,pad=1080:1920") && !contain.contains("boxblur"));
+        let mut pip = plain.clone();
+        pip.transform.scale = 0.5;
+        let (blurred, contained) = (graph(pip.clone(), Fit::Blur), graph(pip, Fit::Contain));
+        assert_eq!(blurred, contained);
+        // Nor does a see-through picture (the fill would show through it as a halo), a 360
+        // reframe, or a picture of the frame's own shape: Contain's graph, byte for byte.
+        let mut keyed = plain.clone();
+        keyed.effects.push(VideoEffect::ChromaKey {
+            color: "green".into(),
+            similarity: 0.1,
+            blend: 0.0,
+        });
+        let mut masked = plain.clone();
+        masked.mask = Some(crate::model::Mask::default());
+        let mut reframed = plain.clone();
+        reframed.reframe = Some(crate::model::Reframe::new(crate::model::Projection::Flat));
+        for clip in [keyed, masked, reframed] {
+            assert_eq!(graph(clip.clone(), Fit::Blur), graph(clip, Fit::Contain));
+        }
+        let fill_of = |picture, alpha| takes_blur_fill(&plain, picture, (1080, 1920), alpha);
+        assert!(fill_of(Some((1920, 1080)), false));
+        assert!(!fill_of(Some((1920, 1080)), true), "an alpha source");
+        assert!(!fill_of(Some((540, 960)), false), "the frame's own shape");
+        assert!(!fill_of(None, false) && !fill_of(Some((0, 0)), false), "an unknown shape");
+        let wide = |fit| {
+            let mut tl = single(vec![plain.clone()]);
+            tl.format = Some(Delivery::new(1920, 1080, fit));
+            build_export_args(&tl, std::slice::from_ref(&asset), "out.mp4", &ExportOptions::default()).unwrap()
+        };
+        assert_eq!(wide(Fit::Blur), wide(Fit::Contain), "nothing to fill");
+        // The scrubbed still: the same fill, labelled per layer.
+        let mut tl = single(vec![make_clip(asset.id, 0.0, 5.0, 0.0)]);
+        tl.tracks.push(video_track(vec![make_clip(asset.id, 0.0, 5.0, 0.0)]));
+        tl.format = Some(Delivery::new(1080, 1920, Fit::Blur));
+        let out = StillOutput::JpegPipe { quality: 2 };
+        let args = build_still_args(
+            &tl,
+            std::slice::from_ref(&asset),
+            &ExportOptions::default(),
+            1.0,
+            540,
+            None,
+            &out,
+        )
+        .unwrap();
+        let g = &args[args.iter().position(|a| a == "-filter_complex").unwrap() + 1];
+        assert!(g.contains("split[bf0b][bf0f]") && g.contains("split[bf1b][bf1f]"), "{g}");
+        assert!(
+            g.contains("scale=66:120:force_original_aspect_ratio=increase:flags=bilinear,crop=66:120,boxblur=4:2,scale=540:960"),
+            "{g}"
+        );
+        // An alpha source takes no fill, in the export or the still: Contain's graphs.
+        let mut sticker = asset.clone();
+        sticker.streams[0].pix_fmt = Some("yuva420p".into());
+        let both = |fit| {
+            let mut tl = single(vec![make_clip(sticker.id, 0.0, 5.0, 0.0)]);
+            tl.format = Some(Delivery::new(1080, 1920, fit));
+            let assets = std::slice::from_ref(&sticker);
+            let opts = ExportOptions::default();
+            (
+                build_export_args(&tl, assets, "out.mp4", &opts).unwrap(),
+                build_still_args(&tl, assets, &opts, 1.0, 540, None, &out).unwrap(),
+            )
+        };
+        assert_eq!(both(Fit::Blur), both(Fit::Contain));
     }
 
     #[test]

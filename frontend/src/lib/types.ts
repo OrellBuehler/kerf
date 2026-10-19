@@ -681,12 +681,15 @@ export interface ImportOutcome {
 	warnings: string[];
 }
 
-/** What applying a template or setting a template title's values hands back: the refreshed cut, the title
- *  that was made or changed (the one to select), and what the sanitiser or the machine could not honour
- *  (e.g. a font that is not installed). */
+/** What applying a template, adding or changing a title clip or setting a template title's values hands back: the
+ *  refreshed cut, the title that was made or changed (the one to select: `overlay_id` for a floating one, `clip_id` for
+ *  one on a track), and what the sanitiser or the machine could not honour (e.g. a font that is not installed). */
 export interface TemplateEdit {
 	timeline: Timeline;
-	overlay_id: string;
+	/** The floating title made or changed; absent for a title on a track. */
+	overlay_id?: string;
+	/** The title clip made or changed, for a title on a track. */
+	clip_id?: string;
 	warnings: string[];
 }
 
@@ -805,6 +808,30 @@ export interface Clip {
 	 *  detached onto an audio track (the picture is then silent). Absent means it does
 	 *  (the backend omits it when true). */
 	source_audio?: boolean;
+	/** What the clip draws when its picture is generated rather than cut from an asset: a title on a track
+	 *  (`asset_id` is then `GENERATED_ASSET` and the source is the title's own clock). Absent for footage. */
+	generator?: Generator | null;
+}
+
+/** The `asset_id` of every generated clip: the nil UUID, which no asset has. */
+export const GENERATED_ASSET = '00000000-0000-0000-0000-000000000000';
+
+/** An animated SVG title on a video track (`Clip.generator`): drawn over the whole frame, then placed, faded and keyed
+ *  as its clip is. `svg` is the sanitised source; `template` as on a floating title. */
+export interface TitleClip {
+	name: string;
+	svg: string;
+	template?: TemplateInstance | null;
+}
+
+/** What a generated clip draws, tagged by `kind`. */
+export type Generator = { kind: 'title' } & TitleClip;
+
+/** A title clip's content to change (`update_title_clip`); its timing and look are the clip's own edits. */
+export interface TitleClipPatch {
+	name?: string;
+	/** New custom artwork; it ends a template. */
+	svg?: string;
 }
 
 /** A crop for one delivery shape (`aspect_w:aspect_h` in lowest terms). */
@@ -1292,8 +1319,9 @@ export interface ExportOptions {
 	hwaccel?: string | null;
 	resolution?: [number, number] | null;
 	/** How footage of a different shape is fitted to `resolution`: letterboxed
-	 *  (`contain`, the default) or filled and cropped (`cover`). Only matters
-	 *  when the delivery aspect differs from the footage. */
+	 *  (`contain`, the default), filled and cropped (`cover`), or letterboxed over a
+	 *  blurred copy of itself (`blur`). Only matters when the delivery aspect differs
+	 *  from the footage. */
 	fit?: Fit;
 	fps?: number | null;
 	scaler?: string | null;
@@ -1355,8 +1383,9 @@ export interface SyncedByAudio {
  *  Apple -16, EBU R128 broadcast -23, all with a -1 dBTP true-peak ceiling. */
 export type LoudnessPreset = 'youtube' | 'spotify' | 'apple' | 'broadcast';
 
-/** How a clip's picture is fitted to an output frame of a different shape. */
-export type Fit = 'contain' | 'cover';
+/** How a clip's picture is fitted to an output frame of a different shape: `blur` is `contain`
+ *  over a blurred, enlarged copy of the picture (a clip placed by its transform gets plain bars). */
+export type Fit = 'contain' | 'cover' | 'blur';
 
 /** A place a finished cut gets published, mirroring `kerf_core::platform`. */
 export interface PlatformTarget {
@@ -2053,6 +2082,9 @@ export interface PlayInfo {
 	/** The request fell in the frame already on the screen: nothing was drawn. */
 	repeat: boolean;
 	ahead: PlayAhead | null;
+	/** To a `ready` request: the time from which the GPU takes the play back from the stream (its play is made
+	 *  ready there), or null while no such time is within reach (`play.ahead` says what is in the way). */
+	resume?: number | null;
 }
 
 /** The answer of `get_preview_frame` (`PreviewFrameResult`): which renderer made the
@@ -2064,7 +2096,7 @@ export interface PreviewFrameResult {
 	 *  drawn and the answer is ignored. `stream` (to a forward request only): the GPU does
 	 *  not play this session, or no longer, and the page plays the stream, from
 	 *  `play.ahead.handover` when there is one. */
-	renderer: 'gpu' | 'ffmpeg' | 'superseded' | 'stream';
+	renderer: 'gpu' | 'ffmpeg' | 'superseded' | 'stream' | 'ready';
 	frame: string | null;
 	/** Why the GPU did not draw it (empty when it did). */
 	reasons: string[];
@@ -2090,6 +2122,8 @@ export interface PreviewDraft {
 /** How the page asks for a frame of GPU playback: the session it belongs to. */
 export interface PlayAsk {
 	session: number;
+	/** Not a frame: where, from the time asked, the GPU can take the play back from the stream (`hint: ready`). */
+	ready?: boolean;
 }
 
 /** The answer of `fit_music` (`MusicFitted` in `crates/kerf-app/src/lib.rs`): the refreshed

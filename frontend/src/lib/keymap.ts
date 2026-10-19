@@ -522,6 +522,24 @@ const ACTION_LIST = [
 		hint: 'Takes the selected clips out of their link groups; each then edits on its own.'
 	},
 	{
+		id: 'title.add',
+		repeat: false,
+		label: 'Add title at playhead',
+		group: 'edit',
+		context: 'global',
+		defaults: ['Mod+T'],
+		hint: 'Puts a title on the titles lane at the playhead; the library’s Titles tab has the styled and animated ones.'
+	},
+	{
+		id: 'title.generateCaptions',
+		repeat: false,
+		label: 'Generate captions',
+		group: 'edit',
+		context: 'global',
+		defaults: [],
+		hint: 'Captions the cut from the transcripts of the clips on it, in the look picked in the Titles tab; asks first when captions are already there.'
+	},
+	{
 		id: 'edit.clearSelection',
 		label: 'Clear selection',
 		group: 'edit',

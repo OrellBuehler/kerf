@@ -3250,6 +3250,11 @@ pub struct Clip {
     /// existed is byte-identical.
     #[serde(default = "yes", skip_serializing_if = "is_yes")]
     pub source_audio: bool,
+    /// What the clip draws when its picture is generated rather than cut from an asset (an animated
+    /// title on a track, [`Generator`]); `None`, and absent from the file, for every clip of footage.
+    /// A generated clip's `asset_id` is [`GENERATED_ASSET`] and its source is the generator's clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generator: Option<Generator>,
 }
 
 fn yes() -> bool {
@@ -3295,6 +3300,7 @@ impl Clip {
             enabled: true,
             link_id: None,
             source_audio: true,
+            generator: None,
         }
     }
 
@@ -4027,7 +4033,8 @@ impl Marker {
 /// which is right when the delivery matches the footage and wrong the moment it
 /// doesn't: a 16:9 shot rendered at 1080x1920 becomes a 1080x608 strip in a
 /// mostly-black frame — technically the whole picture, and not something anyone
-/// would post. `Cover` fills the frame and throws away the overflow instead.
+/// would post. `Cover` fills the frame and throws away the overflow instead; `Blur`
+/// keeps the whole picture and fills the bars with a blurred, enlarged copy of it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum Fit {
@@ -4037,6 +4044,11 @@ pub enum Fit {
     Contain,
     /// Scale to cover the frame and crop what hangs over the edges.
     Cover,
+    /// `Contain` over a blurred copy of the same picture scaled to cover the frame: the
+    /// whole shot, with the bars filled by its own colours (the vertical-video habit for
+    /// landscape footage). A clip whose geometry is not the plain fit (scaled, moved,
+    /// rotated, cropped or animated) is placed as under `Contain`, with no fill.
+    Blur,
 }
 
 impl Fit {
@@ -4044,6 +4056,7 @@ impl Fit {
         match self {
             Fit::Contain => "contain",
             Fit::Cover => "cover",
+            Fit::Blur => "blur",
         }
     }
 }
@@ -4063,7 +4076,8 @@ pub struct Delivery {
     pub width: u32,
     pub height: u32,
     /// How footage of a different shape meets that frame. `Cover` is the useful
-    /// default for a reframed delivery; `Contain` keeps the whole picture.
+    /// default for a reframed delivery; `Contain` keeps the whole picture, and `Blur`
+    /// keeps it over a blurred copy of itself.
     #[serde(default)]
     pub fit: Fit,
 }
@@ -4911,7 +4925,10 @@ pub use grade::{
     frame_matrix, normalize_curve, ClipLut, CurvePoint, CurveSegment, CurveShape, Curves, Grade, Wheel, Wheels, MAX_CURVE_POINTS,
 };
 mod check;
+mod generator;
 mod values;
+pub(crate) use generator::too_many_titles;
+pub use generator::{Generator, TitleClip, GENERATED_ASSET, MAX_TITLE_CLIPS};
 
 mod score;
 pub use score::{
@@ -6431,6 +6448,7 @@ fn clip_changes(before: &Clip, after: &Clip) -> Option<String> {
             .to_string(),
         );
     }
+    parts.extend(generator::generator_changes(before, after));
     parts.extend(transform_changes(&before.transform, &after.transform));
     parts.extend(color_changes(&before.color, &after.color));
     parts.extend(Grade::changes(&before.grade, &after.grade));
@@ -6792,7 +6810,8 @@ impl Timeline {
                     DiffEntry::new(
                         DiffKind::ClipRemoved,
                         format!(
-                            "Removed clip from {} at {} ({:.1}s)",
+                            "Removed {} from {} at {} ({:.1}s)",
+                            generator::title_label(clip).unwrap_or_else(|| "clip".to_string()),
                             track.name,
                             fmt_time(clip.timeline_start),
                             clip.duration()
@@ -6811,12 +6830,14 @@ impl Timeline {
                     clips.push(
                         DiffEntry::new(
                             DiffKind::ClipAdded,
-                            format!(
-                                "Added clip to {} at {} ({:.1}s)",
-                                track.name,
-                                fmt_time(clip.timeline_start),
-                                clip.duration()
-                            ),
+                            generator::added_line(clip, &track.name).unwrap_or_else(|| {
+                                format!(
+                                    "Added clip to {} at {} ({:.1}s)",
+                                    track.name,
+                                    fmt_time(clip.timeline_start),
+                                    clip.duration()
+                                )
+                            }),
                         )
                         .on_track(track.id)
                         .on_clip(clip.id)

@@ -138,7 +138,8 @@ racing writes could leave the older on disk; bun-tested). `workspace.svelte.ts`
 is the runes singleton: `switchTo` keeps the arrangement being left, swaps the
 layout and shows the library tab that workspace last had (each remembers its own;
 until one is picked it is the workspace's tool: Color → Effects, Audio → Audio,
-Motion → Transitions, Edit and Deliver → Media), and **touches no project state**
+Motion → Titles — titles are added there, not in the Inspector —, Edit and Deliver → Media; a tab the user picked
+in a workspace is stored and kept, only the unpicked default moved), and **touches no project state**
 — cut, selection, playhead and playback are `editor` / `ui` and survive (dockview
 rebuilds the panels, so a panel's own scroll starts over). **A layout is written
 only if it was rearranged**: dockview reports layout changes for a great deal
@@ -214,9 +215,22 @@ equal `Btn sm` (`+ Title` / `+ Lower third` / `+ Caption` / `+ Text`; `Generate 
 Audio act on the selected clip and say why they are off when none is; they own no
 value (a look is a `Color`, an effect an entry in the clip's chain), so the
 Inspector stays where you tune — the presets are `effect-presets.ts`, shared with
-its pickers. Titles is the same component as the Inspector's *Titles lane*
-section, which stays (a folded library must not make titles unreachable), over
-`title-actions.ts`; the caption look they share is `ui.captionStyle`. Clicking the
+its pickers. Titles (`TitlesControls`, over `title-actions.ts`) is the one panel of
+title controls; the caption look it shares with the lane's menu is `ui.captionStyle`.
+**One place per action.** The Inspector is about the selection and creates nothing:
+the Library adds (titles, looks, effects, transitions, audio), the timeline places and
+trims, the Inspector tunes what is selected, and the menu bar (entries from the keymap
+registry, so each carries the user's key) keeps the common adds reachable when the library is
+folded or closed — *Edit › Add title at playhead* (`title.add`, ⌘T / Ctrl+T, also the
+titles lane's +), *Generate captions* (`title.generateCaptions`, also the lane's
+right-click, with *Clear captions*) and *File › Import captions…*; animated titles are also the
+lane's right-click. The styled titles (lower third, caption, text), the caption look and the
+templates are the Titles tab's alone (the rail and *Window › Library* bring it back). The Inspector used to
+carry the whole Titles controls as a *Titles lane* section under every selection, the
+look chips in its Color section and *Add text overlay / Generate captions* in its
+right-click; each duplicated the Titles tab, the Effects tab or the lane and is gone
+(`panels-polish.test.ts` holds it). Context menus stay: they are the selection's own
+actions where the pointer is. Clicking the
 active icon **folds** the content to the rail (`library.collapsed`, persisted and
 shared by every workspace — the rail is a tool, not part of an arrangement) and
 the panel gives its width back: the registry minimum is the rail's 40 px, an open
@@ -305,8 +319,8 @@ there is a marker (`MenuState.hasMarkers`) —, Settings, Quit — Save is
 `save_project_as` is the only save there is), *Edit* (Undo / Redo, Cut / Copy / Paste /
 Duplicate, **Split at playhead**, Delete / Ripple delete / Select all, **Tool**, **Clip** and
 **Roll, slip, slide** submenus — the five tools as radios, trim / detach / link, and the
-one-frame roll / slip / slide keys — Ripple mode and Snapping as ticks,
-Customize keyboard shortcuts…), *View* (zoom, **Track height**, Overview strip, Safe-area guides,
+one-frame roll / slip / slide keys — **Add title at playhead** and **Generate captions** (off until the cut has a clip),
+Ripple mode and Snapping as ticks, Customize keyboard shortcuts…), *View* (zoom, **Track height**, Overview strip, Safe-area guides,
 **Delivery frame**, **Workspace**), *Window* (every panel as a tick, Reset <workspace>
 workspace, Reset all workspaces — which asks first when any arrangement is stored),
 *Playback* (Play / pause, Go to start / end, Go to timecode, back and forward a frame and a second,
@@ -387,13 +401,12 @@ them, and the button never says "Export N files", for a cut with no video clip
 (`ui.openExport()`); the panel shows its progress and Stop while one runs.
 A picture and its linked sound are **one selection**: the Inspector's "N clips selected" notice counts
 link groups (`selectionUnits`, `link-ui.ts`) and a linked clip carries a quiet "Linked to A1" chip beside
-its track badge instead. The `Inspector` is **mounted whether or not a clip is selected**:
-its Text overlays section belongs to the timeline rather than to any one clip, so
-gating the panel on a selection made titles and captions unreachable until you
-clicked a clip. Its sections are `InspectorSection`s — native `<details>`
+its track badge instead. The `Inspector` is **mounted whether or not a clip is selected** and shows the
+selection: a title, an animated title, a clip, else the library asset selected in the bin,
+else an empty state that says where titles are added. Its sections are `InspectorSection`s — native `<details>`
 disclosures, so they are keyboard-operable for free — each with a one-line
 **summary** on the right (`1.00×`, `Cropped`, `2 keyframes`) so a collapsed
-section still says what it holds; Timing, Volume and Titles open by default,
+section still says what it holds; Timing and Volume open by default,
 everything else is folded. It edits the selected clip —
 trim, volume, fades, speed, transform, color, **curves / color wheels / LUT** (`GradeSections.svelte`: a canvas
 curve editor per channel — click adds a point, drag moves it, double-click or right-click removes it, one `set_grade` on
@@ -487,17 +500,20 @@ section. A title's Color and Box are a **swatch (native colour input) plus the f
 spelling — a name, `#rrggbb[aa]`, `@alpha` — read for the swatch, and a pick written back keeping the alpha; a box with none starts at
 `@0.55`). Reverse, Bold and Invert are `CheckRow`s, box first. The destructive pair is one row of two small buttons (`Remove clip`,
 `Ripple delete`; Remove is red ink on the neutral edge — `data-quiet` on a destructive `Btn` — not an outline in alarm colour). **With no clip or title selected, a library asset selected in the bin is the Inspector's subject**
-(`AssetInspector`, `asset-facts.ts`): name and kind, the proxy and analysis chips and Analyze, Add at playhead / Append, and
-Media / Analysis / Proxy sections with what the bin's right-click menu used to list as twenty rows (it was 960 px tall; it is the
-actions now, with Analyze as one entry that opens its own menu).
+(`AssetInspector`, `asset-facts.ts`): name and kind, *Add at playhead* / *Append* as one row of two, then one section per
+subject with its own actions — **Media** (the facts; the bin row keeps the spec line), **Analysis** (summary `2 of 5` /
+`running…`, the analysis chips without the proxy one, failures and findings, *Analyze* and *Export .srt*), **Proxy** (its
+facts, *Rebuild* / *Delete*) — and *Relink…* / *Remove…* last, the row a clip keeps its Remove in (Relink is the missing
+callout's alone while the file is gone). The rows are what the bin's right-click menu used to list as twenty (it was 960 px
+tall; it is the actions now, with Analyze as one entry that opens its own menu).
 **Polish presets** (`src/lib/style-presets.ts`, pure data over the existing
-surfaces): the Color section leads with one-click **looks** —
-Punchy / Warm / Cool / Faded / B&W chips (the active one highlights; the sliders
-show exactly what a chip applied) built on `Color.temperature`, a warm-cool
+surfaces): one-click **looks** — the library Effects tab's
+Punchy / Warm / Cool / Faded / B&W chips (the active one highlights; the Inspector's Color
+sliders show exactly what a chip applied, its summary names the look, and *Reset color* under them goes back to none) built on `Color.temperature`, a warm-cool
 channel in -1..1 rendered as opposing `eq` per-channel gammas (`eq_filter` —
 omitted at 0 so old graphs stay byte-identical; plain saturation/gamma can't
-tint) — and the Text overlays section leads with **Title / Lower third /
-Caption** style chips that create a styled overlay at the playhead with
+tint) — and the Titles tab leads with **Title / Lower third /
+Caption** style buttons that create a styled overlay at the playhead with
 fade-in/out opacity keyframes; the caption style matches what
 `generate_captions` writes in its `lines` style, so manual and generated
 captions look alike (`CAPTION_LOOKS` in the same file is only the two
@@ -539,8 +555,8 @@ drags in time, the 6px edges trim, with the clip drag's snapping (0 / playhead /
 beats / every clip edge / other titles), Delete removes it, and one
 `update_overlay` is written per gesture. A selected title makes the Inspector show
 **that title's editor** (text, timing, position, size, colour, box, font, bold,
-keyframes) *instead of* the clip sections; the add / caption controls live in a
-"Titles lane" section below. The **Preview** draws an interactive box over each
+keyframes) *instead of* the clip sections; adding and captioning are the Titles tab's,
+the lane's + and right-click menu's and the Edit menu's. The **Preview** draws an interactive box over each
 title visible at the playhead (hidden while playing): drag to move, corner
 handles to resize (scales `size` by the pointer's distance from the box centre),
 Escape / pointercancel / blur abandon it, pointer capture holds it, local state
@@ -591,7 +607,9 @@ needs a model, export-graph and GPU change), a live GPU picture during the drag 
 
 
 The timeline toolbar carries a **delivery frame picker** (also View › Delivery frame; Source / 16:9 / 9:16 / 1:1 / 4:5,
-from `src/lib/delivery-formats.ts`, bun-tested) that sets `Timeline.format` — the
+from `src/lib/delivery-formats.ts`, bun-tested; with a frame set the toolbar's menu adds *Footage: fill & crop / fit &
+letterbox / fit & blurred fill*, `DELIVERY_FITS` through `setDeliveryFit` in `menu-commands.ts`, which keeps the frame and
+changes `fit`; the export dialog's fit select offers the same three, `FITS`) that sets `Timeline.format` — the
 preview pane then *is* that frame (sized with `100cqh` container units so a 1:1
 frame is height-bound in a wide pane, not squashed), and for a vertical or square
 delivery it draws **safe-area guides** (the platform's top strip / caption rail /
@@ -672,8 +690,8 @@ tests had not) — and `caption-import.ts` carries the subtitle parsers and
 `captions.ts` `placeCues` the same way, which is how `importCaptionsText` (the
 variant the harness and a file input use; `importCaptions(path)` needs the desktop
 app) imports for real under `bun run dev`, with `describeImport` the toast line.
-**Import captions…** is a button in `TitlesControls` (so in the Inspector's Titles
-lane and the library's Titles tab) and an entry in the titles-lane context menu
+**Import captions…** is a button in `TitlesControls` (the library's Titles tab),
+*File › Import captions…* and an entry in the titles-lane context menu
 (plus one per clip the cut shows, up to three). The button opens an inline options
 row — not a dialog, the controls live in a narrow column — and *Choose file…* runs
 `importCaptionFile` (`title-actions.ts`): `pickCaptionFile` (desktop: the dialog
@@ -693,8 +711,8 @@ falls back to the cut when nothing is offered. An imported set and a generated o
 are both `generated` and cannot be told apart, so Recaption's and Clear's tooltips
 say they replace / remove *either* instead of guessing — and so does the confirm:
 `confirmReplaceCaptions` (`title-actions.ts`) asks "Replace the 12 captions already on
-the cut?" before **Captions / Recaption** (and the Inspector's menu entry, which calls
-the same `makeCaptions`) and the **AgentPanel's "Caption the cut" chip** (asked before
+the cut?" before **Captions / Recaption** (and the lane's menu entry and *Edit › Generate captions*,
+which call the same `makeCaptions`) and the **AgentPanel's "Caption the cut" chip** (asked before
 the task is queued, so declining leaves nothing behind) write over a set, counted on
 `editor.liveTimeline` like the import's — the same count the options row and the
 button label show (`#liveTimeline` is `$state.raw` so they follow a parked update).
@@ -878,8 +896,8 @@ edits folds from a chevron in it, and its one legend line says what the two icon
 `+page.svelte` brings it forward once when a proposal lands (`editor.staged`
 going null → set) — a review nobody can see is not a review. Under **Quick
 edits**, four preset chips run an edit now (`quick-edits.ts`: `Remove silences` / `Frame for the delivery`
-/ `Caption the cut` (analyzes whatever is in the cut but not yet transcribed,
-then captions it) / `Cut to the beat` — which
+/ `Caption the cut` (analyzes whatever is in the cut but not yet transcribed — `cutAssets`, which
+leaves out titles on tracks: they have no asset — then captions it) / `Cut to the beat` — which
 analyzes whatever is on the audio tracks first, then calls `snap_to_beats`, and says
 "No cuts were near a beat" instead of claiming an alignment when the grid never reached
 them); **the task is recorded only after the edit has run** (`record`: add, then resolve), so a connected agent never sees a task it could claim and redo (short of a window of two IPC round trips: `add_task` has no already-done form, so the task is `queued` until the `resolve_task` that follows — closing it needs a backend command that creates it done), and a failed edit leaves nothing in the queue. The rest enqueue for the agent — `Assemble rough cut` is one of them now: it used to run the same silence removal as `Remove silences` under a bigger name. Remove silences acts on `quickTarget`: the footage of the selected clip, else the selected library asset, else the first picture on the cut, and says which (a line under the chips, the toast naming it, "Nothing to remove" when the cut did not change); the local chips are off while a proposal is previewed. In the browser there is no agent, so
@@ -1041,12 +1059,37 @@ effect ran again without a seek, `playSession`) the session starts at the audibl
 than the playhead the play began at, so a rebuild within the latency of Play or a seek does not rewind the picture. A hand-over starts the stream through the same ladder (`takeover`): the stream is *not* `streaming` (so the route stays `gpu` and the
 surface stays up) until its first frame **at or past where the GPU stops** is shown, and only then does the GPU's session end and the surface go. A
 session that was given up on is **barred** for the rest of that play (`gpuBarred`: until a deliberate seek or an edit, not for a stream restart for
-lag), so the renderers never flip back and forth. Under Proxy only the first request is rejected as the stream is (`playWaiting` →
+lag), so a GPU that failed or cannot keep up never flips back and forth with the stream. **A play the stream took over at a refusal is taken back**
+(`TakeBack`, `gpu-playback.ts`): when the session stopped where the engine said (`GpuPlayback.resumable`: a planned hand-over, or a decline at Play
+whose answer names the refused frame; not `failed`: a frame that failed, `session`, an overload, or a request that was rejected or never answered,
+`giveUp`), the stream, once it has been on show for `READY_SETTLE` (1 s), asks `frames.ready(at, ..)` (`hint: 'ready'`, with the pump's `client` and
+next `seq`, so a ready request that reaches the backend after a newer request of the page, the paused frame once the play stops, is superseded and
+primes nothing over it) for `lead` past what is heard and no earlier than the refused frame: `READY_LEAD` (0.6 s), twice what the last answer
+took, or room for the GPU's session to begin its first frame early after the route is back (first frame + `SHOW_AHEAD` + 0.1 s), whichever is
+most, capped at `READY_MAX_LEAD` (2.5 s) so what is made ready is played well inside the backend's 10 s. Only `stream` with no `play` ends the
+take-back for the play (`never`: the setting, no surface, no plan from there); `stream` with `play.ahead` (nothing within the backend's 4 s yet), a
+superseded answer and a request that failed (logged) are `later`, asked again `READY_EVERY` (1 s) after the answer came, doubling with each `later`
+in a row up to `READY_MAX_WAIT` (8 s), so a cut the GPU draws none of costs the one worker that draws a scan every 8 s at most. A `ready` answer's
+`play.resume` is where the play from there is made ready. The GPU's session begins a first frame's cost before it (`firstFrameLead`: what the last
+take-back's first frame cost, `learnedLead`, kept apart from the steady round trip of the session the stream took over, `handoverTrip`, which is the
+estimate until a take-back has been measured; never less than a frame), and `SHOW_AHEAD` (0.3 s) before the session begins the route is the
+surface's again (`returning`: `streaming && !returning` in the route, so the bounds go out visible; the surface is not shown before a frame is drawn on
+it, and the pump, `streaming && gpuPlay === null`, asks nothing). The `GpuPlayback(fps, resume, true)` holds its picture at `resume`, and once its
+first frame is on the screen (`gpuShown`) the stream stops, the bar is lifted and the play is the GPU's again (and may hand over again later). A
+session that declines before it drew (a refused frame, the bounds not delivered yet, something over the frame on a surface above the page) leaves
+the stream playing; one that failed ends the take-back (`abandonTakeBack`). A declined session and a time made ready that went by (`MISSED_AFTER`)
+are asked about again after a wait of their own count (`TakeBack.retry`: 1, 2, 4, 8 s, which a `ready` answer does not reset and only a play taken
+back does, the next hand-over's `TakeBack` starting from nothing), so a take-back that keeps failing at the switch costs a primed play every 8 s at
+most, and pausing, a seek or an edit ends it. **What is left at the switch:** the first frame is begun by an estimate of what it
+costs, so it can land a frame early (the picture holds a frame ahead of the sound) or late (the stream already showed a frame or two past `resume`,
+and they are shown again); and the take-back is in the audible time, so from a stream that never was the GPU's (declined at Play, read from the
+plain clock) the picture steps back by the output latency. Under Proxy only the first request is rejected as the stream is (`playWaiting` →
 `playbackWaiting`). The status bar names the renderer of each drawn frame (`GPU 960×540 · 14 ms · adapter`; a repeat is not a new frame and
 changes nothing). Pausing ends the session (the effect's cleanup), and the settled frame comes back through the ordinary GPU route. In the
 browser harness `getPreviewFrame` answers a forward request `stream` (no GPU), so playback is the synthesised stream as ever; `?gpusurface=1` pretends
 a surface and has the GPU play, `&gpuplay=stream` has it decline every session and `&gpuplay=ahead` has it draw for two seconds and announce a
-refusal (the hand-over). Tests: `gpu-playback.test.ts` (the request arithmetic, the decision, the hand-over, the overload),
+refusal (the hand-over), and take the play back at once when asked (`ready`), so a play cycles GPU, stream, GPU. Tests: `gpu-playback.test.ts`
+(the request arithmetic, the decision, the hand-over, the overload, `resumable` and `TakeBack`), the Preview's wiring pinned in `playback-sync.test.ts`,
 `output-latency.test.ts`, the `GPU playback` cases of `frame-pump.test.ts` (the pump over the real Svelte runtime), and the ladder's `startup`.
 
 **Shared components** (`components/editor/`; `shared-components.test.ts` keeps the dialogs, the Inspector's rows and the toolbar on them).
@@ -1220,7 +1263,7 @@ modifiers — the old handler ignored extra Shift/Alt and took ⌘ or Ctrl every
 `keymap.test.ts` holds the defaults against a copy of it (the differences: ⌘⇧S
 stays Save as a second default, ⇧J-style accidents and Ctrl-on-Mac are gone), plus the
 bare keys added since (`ADDED`: N / Y / U / Q / W / S) and the modified chords added for linked A/V
-(`ADDED_SHIFT` ⇧D detach, `ADDED_MOD` ⌘L link and ⌘K split, `ADDED_MOD_SHIFT` ⇧⌘D reattach / ⇧⌘L unlink). **Split at playhead** is `edit.split` (⌘K; Edit menu and the clip menu, which says why when it is off): the selected clips the playhead is inside, or — nothing selected — every clip under it, cut on the frame it is on, a link group as one cut (`planPlayheadSplit`, `key-edits.ts`; one Undo per cut made). **Roll, slip and slide have keys**, a frame a press (`repeat: false`, since each press is a revision): `<` / `>` roll the cut nearest the playhead (the playhead follows it), `Alt+,` / `Alt+.` slip the selected clip's footage, `Mod+Alt+,` / `Mod+Alt+.` slide it — each tried first on a scratch copy through `previewEdit` (the drags' own port), so a limit or a locked track is a sentence, not a refusal from the backend. **`?` opens the shortcut cheat sheet** (`ShortcutSheet`, `shortcut-sheet.ts`: every key in force, grouped as the settings list is, read-only; Help › Keyboard shortcuts…) and *Customize keyboard shortcuts…* is the rebinding editor (`app.keyboard`) — the two used to be one dialog. The registry's *Save project…* is one label for one command; the File menu says *Save project as…* once the project has a file.
+(`ADDED_SHIFT` ⇧D detach, `ADDED_MOD` ⌘L link, ⌘K split, ⌘G go to timecode and ⌘T add title, `ADDED_MOD_SHIFT` ⇧⌘D reattach / ⇧⌘L unlink). **Split at playhead** is `edit.split` (⌘K; Edit menu and the clip menu, which says why when it is off): the selected clips the playhead is inside, or — nothing selected — every clip under it, cut on the frame it is on, a link group as one cut (`planPlayheadSplit`, `key-edits.ts`; one Undo per cut made). **Roll, slip and slide have keys**, a frame a press (`repeat: false`, since each press is a revision): `<` / `>` roll the cut nearest the playhead (the playhead follows it), `Alt+,` / `Alt+.` slip the selected clip's footage, `Mod+Alt+,` / `Mod+Alt+.` slide it — each tried first on a scratch copy through `previewEdit` (the drags' own port), so a limit or a locked track is a sentence, not a refusal from the backend. **`?` opens the shortcut cheat sheet** (`ShortcutSheet`, `shortcut-sheet.ts`: every key in force, grouped as the settings list is, read-only; Help › Keyboard shortcuts…) and *Customize keyboard shortcuts…* is the rebinding editor (`app.keyboard`) — the two used to be one dialog. The registry's *Save project…* is one label for one command; the File menu says *Save project as…* once the project has a file.
 **Only what the user changed is stored** (`Settings.keybindings`, opaque to Rust
 like `theme`: `{ version, bindings: { id: [chord…] } }`, patch-written, `null` when
 nothing is customised), so an untouched action follows the running build's defaults
@@ -1272,7 +1315,7 @@ Export… (their own row, so they no longer wrap), then the shape sliders and ev
 *Snapping on at launch* (sets `ui.snap` once on load and again when changed; the toolbar toggle stays the session's), *Length of a still
 image* (`placementOut(asset, still_seconds)` is the source end of every single placement — the bin's *Add at playhead* / *Append*, the
 Inspector's, the empty Preview's and a bin drag — *Append all* is the backend's `concatenate` and keeps its default) and *Length of a new
-title* (the Titles lane's + and *Add text*). **Preview & playback** — proxy size and preview source (`ChoiceChips`, the one radio-chip
+title* (`addTitleHere` — the titles lane's +, *Edit › Add title at playhead* — and *Add text*). **Preview & playback** — proxy size and preview source (`ChoiceChips`, the one radio-chip
 component: one tab stop, arrows move; proxy size only moves focus because choosing one rebuilds every proxy), safe areas, the GPU preview
 and its status line. **Performance** — the CPU limit as three named budgets over a slider, read back as "9 of 12 cores for Kerf · 3 left".
 **Analysis** — a master "analyze on import" and one switch per kind (`auto_analysis`; the same set decides what an agent's `analyze_asset`
@@ -1615,14 +1658,14 @@ them (`addTemplateHere`, `importTemplateFile`, `exportTemplateFile`, `deleteTemp
 `saveTitleAsTemplate`, `setTemplateValue`, `setTemplateImage`; `posterOf` caches a poster per id) and says outcomes through
 `notifications` (the engine's warnings are the toast's description); `editor.applyTemplate` / `setTemplateValues` take
 the `TemplateEdit`'s timeline like any edit and the first selects the new title. **Library**: `TemplatesSection` is part
-of `TitlesControls`, so the Titles tab and the Inspector's Titles lane both have it: an `Import…` ghost button on the
+of `TitlesControls`, the Titles tab: an `Import…` ghost button on the
 `TEMPLATES` heading, one `TemplateCard` each (poster in the delivery frame's shape, the duration as a chip over it, name,
 `N controls`, font families; a click adds it at the playhead; the `⋯` button (named "More actions for <name>") and a right-click offer *Add at the
 playhead*, *Export…* — a save dialog for `.kerftemplate`, the harness answers `/harness/<name>` and keeps the "file" for
 `importTemplate` — and *Delete…* — confirmed, titles made from it keep working). The grid reads the library when it opens
 and on `templates-changed` (`onTemplatesChanged`), which fires for the backend's event (an agent's change: the Tauri
 commands emit none) **and** for the page's own save, import and delete — `api.ts` announces them once the call has
-resolved, in the app and in the harness alike — so every mounted grid (the Titles tab, the Inspector's lane) refreshes; `problems` are a collapsed one-line `<details>`; an empty library explains how to make one. There is no drag to
+resolved, in the app and in the harness alike — so the Titles tab refreshes wherever it is mounted; `problems` are a collapsed one-line `<details>`; an empty library explains how to make one. There is no drag to
 the timeline: the preset tiles have none either. **Save as template…** (`SaveTemplateDialog` over `Modal`; `ui.saveTemplateDialog`,
 mounted by the page and counted in `modalOpen`): name (blank = the title's own name, as the engine has it; it is the field's placeholder), description, and
 a list of controls (`TemplateControlEditor`; every field of a row is named by its control's label, or `control N` before it has
@@ -1647,6 +1690,21 @@ browser's canvas (`css-color.ts`). Harness: `?empty=1` has no templates, `?templ
 description / label, a blank name falling back to the title's, Rust's `f64` grammar for numbers, 128 KiB after the
 splice). Tests: `template-ui`, `template-actions`, `template-wiring`, `css-color`, `api-templates`, `api-templates-changed` (the desktop half of `templates-changed`).
 
+**Titles on tracks in the editor.** A title clip is a `Clip` with `generator: {kind: 'title', name, svg, template?}` and
+`asset_id` `GENERATED_ASSET` (`types.ts`); `title-clips.ts` (bun-tested) is the pure side — `isTitleClip` / `titleOf` /
+`titleName`, `findTitle(timeline, id)` (a `TitleRef` for a floating title or a title clip: what `TemplateSection`, the save
+dialog and `setTemplateValue` read through `editor.titleById`), `titleClip` and `placeTitleClip` (kerf-core's placement: the named
+video track, else the lowest unlocked one free over the span, else a new `V{n}` on top). `api.ts`: `applyTemplateClip(templateId,
+values, start, duration?, trackId?, name?)`, `addTitleClip(svg, start, duration?, trackId?, name?)`, `updateTitleClip(clipId,
+patch)` → `TemplateEdit` with `clip_id`; `setTemplateValues` takes either id (the harness's `setTemplateValuesIn` answers
+`overlay` or `clip`, `applyTemplateClipTo` places one, and `setSpeed` refuses a title as the engine's invariant does).
+`editor.applyTemplateClip` / `addTitleClip` / `updateTitleClip` select the clip they made; `editor.select` of the generated asset
+looks nothing up. **Template card**: *Add to a track at the playhead* beside *Add at the playhead*. **Inspector**: a selected
+title clip shows its name with the template mark, a **Title** section (the name field, through `FieldEdits` like every plain
+field: `renameTitle` writes to the clip it took focus on) and the **Template** section of a floating title (`TemplateSection`
+takes `{id, svg, template}`), and has no Speed section; Timing, Fades, Transform (keyframes: an animated placement), Color, Mask
+and Transition are the clip's. Tests: `title-clips.test.ts`.
+
 **Animated SVG titles in the editor.** The engine draws the artwork (resvg, into every preview and export frame), so the
 page **never inlines the SVG** — `svg-titles.test.ts` fails on any `{@html}` / `innerHTML` in `src/` — and shows it only as an
 `<img>` data URL (`svgDataUrl`; the CSP's `img-src` has `data:`) for a preset's thumbnail. `svg-titles.ts` is the pure side
@@ -1656,7 +1714,7 @@ and the placement box maths (`dragRect` / `roundRect` / `rectPatch`). **State**:
 `timeline.svg_overlays`, so it is live under the bun runes stand-in), `selectedSvgOverlayId` — exclusive with the clip and text-title
 selections (`selectSvgOverlay` / `selectOverlay` / `selectClip` … each clear the others), pruned in `#setTimeline` when an undo or
 agent edit removes it — and `addSvgOverlay` / `addSvgTitle` (selects what it made) / `updateSvgOverlay` / `removeSvgOverlay`. **Add**:
-the Titles controls' `ANIMATED` section (also the Inspector's *Titles lane*) is a `+ Animated` button that opens tiles of the four
+the Titles controls' `ANIMATED` section is a `+ Animated` button that opens tiles of the four
 presets with thumbnails (`presetThumbnail`: `svg_preset_preview` drawn for 600 s so the browser's own SMIL player plays the entrance
 and holds it, replayed on hover; cached per frame shape; the thumbnail span is `pointer-events:none` — replacing the `<img>` under a
 pressed pointer swallowed the click) and `Custom SVG…` (`addCustomSvgTitle`: the sample, selected, and `ui.svgSourceFocus` makes the

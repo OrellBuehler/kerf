@@ -3,7 +3,7 @@
 	// of the artwork are controls: a tagline, a brand color, a logo. The engine does the saving (fonts, the
 	// poster, the checks against the artwork); this asks for what it needs and says what is wrong before it is
 	// asked. A title that is itself from a template starts with that template's controls.
-	import { tick } from 'svelte';
+	import { tick, untrack } from 'svelte';
 	import Modal from './Modal.svelte';
 	import Btn from './Btn.svelte';
 	import TemplateControlEditor from './TemplateControlEditor.svelte';
@@ -11,7 +11,6 @@
 	import { svgElementIds } from '#lib/api';
 	import { errorMessage } from '#lib/ops';
 	import { tidyReason } from '#lib/failure-copy';
-	import { svgDisplayName } from '#lib/svg-titles';
 	import { saveTitleAsTemplate } from '#lib/template-actions';
 	import {
 		MAX_CONTROLS,
@@ -26,10 +25,10 @@
 
 	let { overlayId, onClose }: { overlayId: string; onClose: () => void } = $props();
 
-	const title = $derived(editor.svgOverlays.find((o) => o.id === overlayId));
+	const title = $derived(editor.titleById(overlayId));
 	// The fields start from the title as it is when the dialog opens.
-	const start = editor.svgOverlays.find((o) => o.id === overlayId);
-	let name = $state(start ? svgDisplayName(start) : '');
+	const start = untrack(() => editor.titleById(overlayId));
+	let name = $state(start ? start.name : '');
 	let description = $state('');
 	let drafts = $state<DraftControl[]>([]);
 	let elements = $state<SvgElementId[] | null>(null);
@@ -122,7 +121,7 @@
 				data-name
 				type="text"
 				bind:value={name}
-				placeholder={start ? svgDisplayName(start) : ''}
+				placeholder={start ? start.name : ''}
 				autocomplete="off"
 				style="{field};height:var(--control-sm);padding:0 8px"
 			/>

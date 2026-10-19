@@ -10,7 +10,6 @@
 	import CheckRow from './CheckRow.svelte';
 	import SliderRow from './SliderRow.svelte';
 	import GradeSections from './GradeSections.svelte';
-	import TitlesControls from './TitlesControls.svelte';
 	import TemplateSection from './TemplateSection.svelte';
 	import MediaChips from './MediaChips.svelte';
 	import AnalysisRun from './AnalysisRun.svelte';
@@ -23,18 +22,9 @@
 	import { GENERATED_TITLE_FILL, MIN_TITLE, SVG_TITLE_FILL, TITLE_SIZE_MAX, TITLE_SIZE_MIN, sampleOverlay } from '#lib/titles';
 	import type { SvgOverlay, SvgOverlayPatch, SvgPresetInfo, SvgPresetParams, TextOverlay } from '#lib/types';
 	import { clipDuration, DEFAULT_COLOR, DEFAULT_MASK, DEFAULT_REFRAME, DEFAULT_TRANSFORM } from '#lib/types';
-	import { COLOR_LOOKS, activeLook } from '#lib/style-presets';
 	import { MAX_GAIN } from '#lib/mixer';
 	import { AUDIO_FX, VIDEO_FX } from '#lib/effect-presets';
-	import {
-		addTextHere,
-		applySvgSource,
-		changePreset,
-		convertToCustom,
-		dropCaptions,
-		makeCaptions,
-		svgPresetInfos
-	} from '#lib/title-actions';
+	import { applySvgSource, changePreset, convertToCustom, svgPresetInfos } from '#lib/title-actions';
 	import { copyKeyframesOf, pasteKeyframesOnto, report } from '#lib/ops';
 	import { keyframeOffer } from '#lib/keyframe-copy';
 	import { SVG_PRESETS, svgDisplayName, takesParam } from '#lib/svg-titles';
@@ -82,8 +72,16 @@
 	import { tip } from '#lib/tip';
 	import ComposedMusic from './ComposedMusic.svelte';
 	import { scoreTitle } from '#lib/music-score';
+	import { titleName, titleOf } from '#lib/title-clips';
 
 	const clip = $derived(editor.selectedClip);
+	/** Rename the title clip the name field took focus on (one edit; an unchanged name writes nothing). */
+	function renameTitle({ scope: at, text }: { scope: Edit; text: string }) {
+		const c = clipOf(at);
+		const title = c ? titleOf(c) : null;
+		if (!c || !title || title.name === text.trim()) return;
+		void run(() => editor.updateTitleClip(c.id, { name: text }));
+	}
 	/** What a number row is editing: the clip or title and the playhead, as they are when an edit
 	 *  *begins* (`SliderRow` hands this back with the value). A typed entry is written by the click that
 	 *  selects another clip, and a run of arrow keys when focus leaves, so what is selected then is not
@@ -188,7 +186,9 @@
 		void run(() => editor.updateOverlay(ov.id, patch(text)));
 	}
 	const asset = $derived(clip ? editor.assets.find((a) => a.id === clip.asset_id) : undefined);
-	const kind = $derived(asset?.streams.some((s) => s.kind === 'video') ? 'video' : 'audio');
+	/** The title a title clip draws (a generated clip on a video track): a picture with no asset. */
+	const titleClip = $derived(clip ? titleOf(clip) : null);
+	const kind = $derived(titleClip || asset?.streams.some((s) => s.kind === 'video') ? 'video' : 'audio');
 	const hasAudio = $derived(asset?.streams.some((s) => s.kind === 'audio') ?? false);
 	/** The rate the clip's footage counts frames at — the In and Out are positions in *it*, not in the cut. */
 	const sourceFps = $derived(asset?.streams.find((s) => s.kind === 'video')?.fps || editor.fps);
@@ -391,7 +391,6 @@
 	const effects = $derived(clip?.effects ?? []);
 	const audioFx = $derived(clip?.audio ?? []);
 	const keyframes = $derived(clip?.keyframes ?? []);
-	const overlays = $derived(editor.overlays);
 	const overlay = $derived(editor.selectedOverlay);
 	const svgTitle = $derived(editor.selectedSvgOverlay);
 
@@ -560,7 +559,6 @@
 		const left = (o.keyframes ?? []).filter((_, j) => j !== i).map((k) => ({ ...k }));
 		void run(() => editor.setOverlayKeyframes(o.id, left));
 	}
-	const hasCaptions = $derived(overlays.some((o) => o.generated));
 
 	// Smart crop only has a decision to make when the shot and the delivery frame
 	// are different shapes — a 16:9 interview headed for a 9:16 Reel loses most
@@ -607,29 +605,22 @@
 	function onInspectorContextMenu(e: MouseEvent) {
 		const t = e.target as Element | null;
 		if (t?.closest('input, textarea, select, [contenteditable="true"], [data-selectable]')) return;
+		// What is selected is what this menu acts on; adding a title or captioning the cut is the Titles tab's,
+		// the titles lane's and the Edit menu's.
 		const c = clip;
+		if (!c) return;
 		const items: MenuItem[] = [];
-		if (c) {
-			if (picture) {
-				items.push(
-					{ label: 'Reset transform', icon: 'rotate-ccw', action: () => run(() => editor.setTransform(c.id, DEFAULT_TRANSFORM)) },
-					{ label: 'Reset color', icon: 'rotate-ccw', action: () => run(() => editor.setColor(c.id, DEFAULT_COLOR)) },
-					{ type: 'separator' }
-				);
-			}
+		if (picture) {
 			items.push(
-				{ label: 'Remove clip', icon: 'trash', danger: true, action: () => runUndoable('Clip removed', () => editor.remove(c.id)) },
-				{ label: 'Ripple delete', icon: 'trash', danger: true, action: () => runUndoable('Clip ripple-deleted', () => editor.rippleDelete(c.id)) },
+				{ label: 'Reset transform', icon: 'rotate-ccw', action: () => run(() => editor.setTransform(c.id, DEFAULT_TRANSFORM)) },
+				{ label: 'Reset color', icon: 'rotate-ccw', action: () => run(() => editor.setColor(c.id, DEFAULT_COLOR)) },
 				{ type: 'separator' }
 			);
 		}
 		items.push(
-			{ label: 'Add text overlay', icon: 'captions', action: addTextHere },
-			{ label: hasCaptions ? 'Regenerate captions' : 'Generate captions', icon: 'captions', action: makeCaptions }
+			{ label: 'Remove clip', icon: 'trash', danger: true, action: () => runUndoable('Clip removed', () => editor.remove(c.id)) },
+			{ label: 'Ripple delete', icon: 'trash', danger: true, action: () => runUndoable('Clip ripple-deleted', () => editor.rippleDelete(c.id)) }
 		);
-		if (hasCaptions) {
-			items.push({ label: 'Clear captions', icon: 'trash', action: dropCaptions });
-		}
 		contextMenu.show(e, items);
 	}
 
@@ -1286,12 +1277,6 @@
 	</div>
 {/snippet}
 
-{#snippet overlaysSection()}
-	<InspectorSection title="Titles lane" summary={count((editor.timeline.overlays ?? []).length + editor.svgOverlays.length, 'item')} open>
-		<TitlesControls />
-	</InspectorSection>
-{/snippet}
-
 <div
 	role="presentation"
 	oncontextmenu={onInspectorContextMenu}
@@ -1333,14 +1318,14 @@
 						? VIDEO_THUMB_BG
 						: 'var(--track-audio)'};display:grid;place-items:center;color:color-mix(in srgb,var(--text-on-video) 80%,transparent)"
 				>
-					<Icon n={picture ? 'video' : 'audio-waveform'} s={14} />
+					<Icon n={titleClip ? 'layout-template' : picture ? 'video' : 'audio-waveform'} s={14} />
 				</div>
 				<div style="flex:1;min-width:0">
 					<div
 						style="font-size:13px;font-weight:500;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
-						use:tip={asset?.name ?? 'clip'}
+						use:tip={titleClip ? titleName(titleClip) : (asset?.name ?? 'clip')}
 					>
-						{asset?.name ?? 'clip'}
+						{titleClip ? titleName(titleClip) : (asset?.name ?? 'clip')}
 					</div>
 					<div style="margin-top:3px;display:flex;align-items:center;gap:5px;flex-wrap:wrap">
 						<Badge tone="neutral">{track?.name ?? (picture ? 'video' : 'audio')}</Badge>
@@ -1441,6 +1426,30 @@
 			{@render rangeRow('Fade out', clip.fade_out, fadeSpec(clip), (v, at) => setFade(at, { fade_out: v }), undefined, liveFade((v) => ({ fade_out: v })))}
 			</InspectorSection>
 
+			{#if titleClip}
+				<!-- A title on a track: its name, then its template's controls (or, for custom artwork, a way to keep it as a
+				     template). Its timing, fades, transition and transform are the clip's own sections. -->
+				<InspectorSection title="Title" summary={titleClip.template ? 'Template' : 'Custom SVG'} open>
+					<div style="display:flex;align-items:center;gap:8px">
+						<span style="font-size:12px;color:var(--text-muted);width:44px">Name</span>
+						<input
+							type="text"
+							value={titleClip.name}
+							aria-label="Title name"
+							readonly={editor.locked}
+							onfocus={noteFocus}
+							oninput={noteTyped}
+							oncompositionend={noteTyped}
+							onchange={(e) => renameTitle(endEdit(e.currentTarget))}
+							style="flex:1;min-width:0;box-sizing:border-box;height:var(--control-sm);background:var(--surface-inset);border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);color:var(--text-primary);font-size:var(--text-sm);padding:0 8px"
+						/>
+					</div>
+					<div style="font-size:12px;line-height:1.4;color:var(--text-muted);margin-top:6px">
+						A title on a track takes transitions and fades, and holds its last frame when you extend it.
+					</div>
+				</InspectorSection>
+				<TemplateSection o={{ id: clip.id, svg: titleClip.svg, template: titleClip.template }} />
+			{:else}
 			<InspectorSection title="Speed" summary={`${Math.abs(speed).toFixed(2)}×${speed < 0 ? ' · reverse' : ''}`}>
 			{@render rangeRow('Rate', Math.abs(speed), { min: 0.25, max: 4, step: 0.25, neutral: 1, ...TIMES }, (v, at) => {
 				const c = clipOf(at);
@@ -1450,6 +1459,7 @@
 				Reverse
 			</CheckRow>
 			</InspectorSection>
+			{/if}
 
 			{#if picture && (reframe || sourceProjection)}
 				<InspectorSection title="360 reframe" summary={reframe ? (reframeKeys.length ? `Animated · ${count(reframeKeys.length, 'key')}` : 'On') : 'Off'}>
@@ -1587,20 +1597,14 @@
 				</InspectorSection>
 
 				<InspectorSection title="Color" summary={colorSummary(clip, col)}>
-				<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
-					<span class="k-overline" style="flex:1">Looks</span>
-					<Btn variant="ghost" size="sm" pending={editor.locked} title={'Back to the ungraded picture'} onclick={() => setCol(DEFAULT_COLOR)}>Reset</Btn>
-				</div>
-				<div style="display:flex;gap:5px;flex-wrap:wrap;margin-bottom:8px">
-					{#each COLOR_LOOKS as look (look.id)}
-						<Chip pressed={activeLook(col)?.id === look.id} pending={editor.locked} onclick={() => setCol(look.color)}>{look.label}</Chip>
-					{/each}
-				</div>
 				{@render rangeRow('Brightness', col.brightness, { min: -1, max: 1, step: 0.05, neutral: DEFAULT_COLOR.brightness }, (v, at) => setCol({ brightness: v }, at), 'brightness', liveCol((v) => ({ brightness: v })))}
 				{@render rangeRow('Contrast', col.contrast, { min: 0, max: 4, step: 0.05, neutral: DEFAULT_COLOR.contrast }, (v, at) => setCol({ contrast: v }, at), 'contrast', liveCol((v) => ({ contrast: v })))}
 				{@render rangeRow('Saturation', col.saturation, { min: 0, max: 3, step: 0.05, neutral: DEFAULT_COLOR.saturation }, (v, at) => setCol({ saturation: v }, at), 'saturation', liveCol((v) => ({ saturation: v })))}
 				{@render rangeRow('Warmth', col.temperature ?? 0, { min: -1, max: 1, step: 0.05, neutral: DEFAULT_COLOR.temperature ?? 0 }, (v, at) => setCol({ temperature: v }, at), 'temperature', liveCol((v) => ({ temperature: v })))}
 				{@render rangeRow('Gamma', col.gamma, { min: 0.1, max: 3, step: 0.05, neutral: DEFAULT_COLOR.gamma }, (v, at) => setCol({ gamma: v }, at), 'gamma', liveCol((v) => ({ gamma: v })))}
+				<div style="display:flex;justify-content:flex-end;margin-top:4px">
+					<Btn size="sm" pending={editor.locked} title={'Back to the ungraded picture'} onclick={() => setCol(DEFAULT_COLOR)}>Reset color</Btn>
+				</div>
 				</InspectorSection>
 
 				<GradeSections {clip} />
@@ -1838,9 +1842,12 @@
 			     bin's right-click menu. -->
 			<AssetInspector asset={editor.selectedAsset} />
 		{:else}
-			<EmptyState icon="sliders-horizontal" pad={40} title="Select a clip or a title to inspect it" />
+			<EmptyState
+				icon="sliders-horizontal"
+				pad={40}
+				title="Select a clip, a title or a file to inspect it"
+				hint="Titles are added from the library’s Titles tab or the timeline’s titles lane."
+			/>
 		{/if}
-
-		{@render overlaysSection()}
 	</div>
 </div>

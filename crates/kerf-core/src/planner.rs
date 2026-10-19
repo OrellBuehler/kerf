@@ -551,6 +551,7 @@ impl Planner {
         let mut layers = Vec::new();
         let mut originals: Vec<Option<&StreamInfo>> = Vec::new();
         let mut pictureless = Vec::new();
+        let mut titles: Vec<Uuid> = Vec::new();
         // A still's tail window is judged at the slot's start, which can be before `eval` (the `t`
         // it was asked for, inside the frame): look from there.
         let from = if motion { eval } else { eval.min(tail_at) };
@@ -567,6 +568,11 @@ impl Planner {
                     eval < clip.timeline_end() || (planned.tail && tail_at < clip.timeline_end() + planned.fx.tail)
                 };
                 if !on {
+                    continue;
+                }
+                // A title on a track is resvg's pictures in FFmpeg's graph, as a floating one is.
+                if clip.is_generated() {
+                    titles.push(clip.id);
                     continue;
                 }
                 let asset = planned.asset.as_ref().ok_or(Error::AssetNotFound(clip.asset_id))?;
@@ -684,6 +690,7 @@ impl Planner {
             .iter()
             .filter(|(_, start, end)| eval >= *start && if motion { eval <= *end } else { eval < *end })
             .map(|(id, ..)| *id)
+            .chain(titles)
             .collect();
         Ok(RenderPlan {
             time: slot,
@@ -1572,6 +1579,16 @@ mod tests {
             ..opts(30.0)
         };
         assert!(has(&at(PlanMode::Motion, &gif), |u| matches!(u, Unsupported::Gif)));
+        // A blurred fill is FFmpeg's, in a still as in an export frame.
+        let blur = ExportOptions {
+            resolution: Some((1080, 1920)),
+            fit: Fit::Blur,
+            ..opts(30.0)
+        };
+        for mode in [PlanMode::Still, PlanMode::Motion] {
+            assert!(has(&at(mode, &blur), |u| matches!(u, Unsupported::BlurFill)));
+            assert!(!has(&at(mode, &opts(30.0)), |u| matches!(u, Unsupported::BlurFill)));
+        }
         // A zoom that moves is the last stage of the export's chain (`keyed_zoom.rs`), which
         // the compositor does not order that way yet.
         let mut zoom = make_clip(assets[0].id, 0.0, 4.0, 0.0);
