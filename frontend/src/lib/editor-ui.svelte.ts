@@ -151,8 +151,8 @@ class EditorUi {
 	 *  file is laid out in. Not derived from the captions
 	 *  already on the timeline: a caption's style is not recoverable from the
 	 *  text it carries, and guessing from the word count would flip the choice
-	 *  every time a sentence happened to be short. Shared by every place that
-	 *  offers the button (the Inspector and the library's Titles tab). */
+	 *  every time a sentence happened to be short. Set in the library's Titles tab;
+	 *  the titles lane's menu and Edit › Generate captions generate in it too. */
 	captionStyle = $state<CaptionStyle>('lines');
 	/** The animated SVG title whose source the Inspector should open and focus: set when *Custom SVG…* makes
 	 *  one (or a lane menu asks to edit it), cleared by the Inspector once it has taken the focus. */

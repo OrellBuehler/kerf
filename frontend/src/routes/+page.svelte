@@ -52,7 +52,7 @@
 	import { runMenuCommand } from '#lib/menu-commands';
 	import type { MenuCommand } from '#lib/menus';
 	import { exportCaptionFile, exportInterchangeFile, exportMarkerList, saveCoverFrame, saveProject } from '#lib/file-actions';
-	import { importCaptionFile } from '#lib/title-actions';
+	import { addTitleHere, importCaptionFile, makeCaptions } from '#lib/title-actions';
 	import { checkMissingOnOpen } from '#lib/library-actions';
 	import {
 		askRecovery,
@@ -617,6 +617,8 @@
 		'edit.reattachAudio': () => void reattachSelection(),
 		'edit.link': () => void linkSelection(),
 		'edit.unlink': () => void unlinkSelection(),
+		'title.add': () => void addTitleHere(),
+		'title.generateCaptions': () => void makeCaptions(),
 		'edit.clearSelection': () => {
 			// Whatever else Escape is for gets it first: a menu or the notification
 			// panel closing, a drag being abandoned (those stop the event; a dialog

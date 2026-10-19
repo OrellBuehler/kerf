@@ -3,9 +3,8 @@
 	// animated SVG titles (a picker of the presets, thumbnails drawn by the engine and shown as
 	// images, and a custom one whose source is written in the Inspector), the library of motion
 	// templates (`TemplatesSection`), the caption button (and which look it generates in), importing captions from
-	// a subtitle file, and the lane's list of what is there. The content of the
-	// Inspector's "Titles lane" section and of the library's Titles tab — one
-	// component, so the two cannot drift.
+	// a subtitle file, and the lane's list of what is there. The library's Titles tab; the Inspector edits the
+	// title that is selected and adds none.
 	import Btn from './Btn.svelte';
 	import IconBtn from './IconBtn.svelte';
 	import Chip from './Chip.svelte';
@@ -111,7 +110,7 @@
 	const frame = $derived(editor.liveTimeline.format);
 	const keepLines = $derived(keepLinesOn(ui.captionImportKeepLines, ui.captionStyle, frame));
 
-	// The Inspector scrolls: keep the options (and the Choose file button under them)
+	// The tab scrolls: keep the options (and the Choose file button under them)
 	// in view when they open, and when picking a clip makes them taller.
 	$effect(() => {
 		if (!importOpen) return;

@@ -344,7 +344,7 @@ const ADDED: Record<string, string> = {
  *  A/V), by what the key is and which modifiers it carries. `Mod` is ⌘ / Ctrl as everywhere.
  *  Like `ADDED`, writing a new one here is how the decision is recorded. */
 const ADDED_SHIFT: Record<string, string> = { d: 'edit.detachAudio' };
-const ADDED_MOD: Record<string, string> = { l: 'edit.link', k: 'edit.split', g: 'playback.goToTimecode' };
+const ADDED_MOD: Record<string, string> = { l: 'edit.link', k: 'edit.split', g: 'playback.goToTimecode', t: 'title.add' };
 const ADDED_MOD_SHIFT: Record<string, string> = { d: 'edit.reattachAudio', l: 'edit.unlink' };
 
 /** What a keypress should do now: the keys and chords added since take their own answer (a
@@ -385,7 +385,8 @@ describe('the default keys are the ones the editor always had', () => {
 			['k', {}, 'edit.split'], // ⌘K: Split at playhead
 			[',', { alt: true }, 'edit.slideBack'], // ⌥⌘, / Ctrl+Alt+,
 			['.', { alt: true }, 'edit.slideForward'],
-			['g', {}, 'playback.goToTimecode']
+			['g', {}, 'playback.goToTimecode'],
+			['t', {}, 'title.add'] // ⌘T: Add title at playhead
 		];
 		const bare: [string, Mods, string][] = [
 			['v', {}, 'tool.pointer'],
@@ -994,6 +995,8 @@ describe('keys that act once per press', () => {
 			'edit.reattachAudio',
 			'edit.link',
 			'edit.unlink',
+			'title.add',
+			'title.generateCaptions',
 			'edit.rollBack',
 			'edit.rollForward',
 			'edit.slipBack',

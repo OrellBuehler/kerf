@@ -52,7 +52,8 @@ afterAll(() => {
 
 const { editor } = await import('./state.svelte');
 const { ui } = await import('./editor-ui.svelte');
-const { importCaptionFile, makeCaptions } = await import('./title-actions');
+const { addTitleHere, importCaptionFile, makeCaptions } = await import('./title-actions');
+const { settings } = await import('./settings.svelte');
 const { revertTo } = real;
 
 const text = (srt: string, name = 'subs.srt'): CaptionFilePick => ({ kind: 'text', text: srt, name, format: 'srt' });
@@ -298,5 +299,45 @@ describe('captioning from transcripts', () => {
 		expect(live.overlays?.filter((o) => o.generated)).toHaveLength(2);
 		await makeCaptions();
 		expect(asked[0].message).toContain('Replace the 2 captions');
+	});
+});
+
+describe('addTitleHere', () => {
+	const titles = () => editor.liveTimeline.overlays?.filter((o) => !o.generated) ?? [];
+
+	test('puts a plain title at the playhead, as long as a new title is set to be', async () => {
+		ui.time = 2;
+		await addTitleHere();
+		const t = titles().at(-1);
+		expect(t?.text).toBe('Title');
+		expect(t?.start).toBe(2);
+		expect(t?.end).toBeCloseTo(2 + settings.editing.title_seconds, 6);
+	});
+
+	test('a playhead before the start puts it at zero', async () => {
+		ui.time = -1;
+		await addTitleHere();
+		expect(titles().at(-1)?.start).toBe(0);
+	});
+
+	test('adds nothing while the proposal is previewed, and says why', async () => {
+		ui.time = 2;
+		const before = titles().length;
+		const add = editor.addTitle;
+		let calls = 0;
+		editor.addTitle = (...args) => {
+			calls++;
+			return add.apply(editor, args);
+		};
+		editor.previewingStaged = true;
+		try {
+			await addTitleHere();
+		} finally {
+			editor.previewingStaged = false;
+			editor.addTitle = add;
+		}
+		expect(calls).toBe(0);
+		expect(titles()).toHaveLength(before);
+		expect(shown.map((n) => n.kind)).toEqual(['info']);
 	});
 });
