@@ -193,8 +193,9 @@
 	// reasons, in which case the stream below starts as it always did. Once the GPU has the session it
 	// keeps it until the engine says where it will stop drawing (`ahead`), and the stream is started
 	// just early enough to carry on from there; the GPU's last frame stays on the surface until the
-	// stream's first one is shown. No flipping back: a session given up on stays the stream's until
-	// the playhead is moved on purpose or the cut is edited.
+	// stream's first one is shown. A session given up on (a frame failed, the GPU fell behind or went silent)
+	// stays the stream's until the playhead is moved on purpose or the cut is edited; one that stopped where the
+	// engine said is taken back by the GPU once the play is past what was in its way (`TakeBack`, below).
 	let streaming = $state(false);
 	let stopStream: (() => void) | null = null;
 	let canvasEl = $state<HTMLCanvasElement | null>(null);
@@ -491,7 +492,7 @@
 		const heard = playStart(clock, audio.outputLatency(), true);
 		if (tb.missed(heard)) {
 			returning = false;
-			tb.retry();
+			tb.retry(heard);
 		}
 		const at = tb.ask(heard);
 		if (at !== null) {
@@ -499,20 +500,25 @@
 			return;
 		}
 		if (tb.showing(heard)) returning = true;
-		if (returning && tb.resume !== null && tb.due(heard, Math.max(takeBackLead, 1 / playFps))) {
+		if (returning && tb.resume !== null && tb.due(heard, takeBackLead)) {
 			gpuPlay = new GpuPlayback(playFps, tb.resume, true);
 		}
 	}
 
-	/** Ask the backend where, from `at` on, the GPU takes the play back (it makes the play from there ready). */
+	/** Ask the backend where, from `at` on, the GPU takes the play back (it makes the play from there ready). A request
+	 *  that fails is "not yet", as one a newer request replaced is: only the backend saying so ends the take-back. */
 	async function askTakeBack(tb: TakeBack, at: number) {
 		let result: PreviewFrameResult | null = null;
+		const asked = performance.now();
 		try {
-			result = await getPreviewFrame(at, frameWidth ?? 960, route.overlays, undefined, { session: nextSession(), ready: true });
-		} catch {
-			/* not this play */
+			result = await frames.ready(at, route.overlays, frameWidth ?? 960, nextSession());
+		} catch (error) {
+			logFrontend('warn', `asking where the GPU takes the play back failed: ${error instanceof Error ? error.message : String(error)}`, 'playback');
 		}
-		if (tb.answer(result) === 'never' && takeBack === tb) takeBack = null;
+		if (tb.answer(result, (performance.now() - asked) / 1000) === 'never' && takeBack === tb) {
+			logFrontend('info', `GPU playback will not take this play back: ${result?.reasons.join('; ') ?? ''}`, 'playback');
+			takeBack = null;
+		}
 	}
 
 	/** The GPU's session drew its first frame: the play is the GPU's again, and the stream under it stops. */
@@ -520,6 +526,8 @@
 		const pb = gpuPlay;
 		if (!pb || pb.drawn === 0) return;
 		logFrontend('info', `GPU playback took the play back from the stream at ${pb.from.toFixed(2)} s`, 'playback');
+		// What this first frame cost is how early the next take-back begins its session.
+		if (pb.roundTrip > 0) takeBackLead = pb.roundTrip;
 		takeBack?.end();
 		takeBack = null;
 		returning = false;
@@ -527,14 +535,15 @@
 		endStreamForGpu?.();
 	}
 
-	/** The session that was to take the play back declined or failed before it drew: the stream plays on, and the
-	 *  play is asked for again past what was in the way, unless the GPU failed. */
+	/** The session that was to take the play back declined or failed before it drew: the stream plays on. A decline
+	 *  (a refused frame ahead, bounds not delivered yet, something over the frame) is asked about again after the
+	 *  take-back's wait; a failure (the request, a frame, the rate, a silent backend) ends it for the play. */
 	function abandonTakeBack(pb: GpuPlayback, why: string) {
 		logFrontend('info', `GPU playback did not take the play back from the stream: ${why}`, 'playback');
 		pb.end();
 		gpuPlay = null;
 		returning = false;
-		if (takeBack && pb.resumable) takeBack.retry();
+		if (takeBack && !pb.failed) takeBack.retry(playStart(ui.time, audio.outputLatency(), true));
 		else {
 			takeBack?.end();
 			takeBack = null;

@@ -192,6 +192,7 @@ export function createFramePump(deps: FramePumpDeps) {
 				deps.playWaiting?.(playback, error instanceof Error ? error.message : String(error));
 				return;
 			}
+			playback.giveUp();
 			// The command itself failed: the stream plays on from the playhead, and the surface must not stay over it.
 			deps.gpuFailed(error);
 			deps.playHandover?.(playback, null, true, error instanceof Error ? error.message : String(error));
@@ -286,6 +287,15 @@ export function createFramePump(deps: FramePumpDeps) {
 		surfaceGone() {
 			gpuShown = false;
 			drawnDraft = null;
+		},
+		/**
+		 * Ask where, from `time` on, the GPU can take the play back from the stream (`hint: 'ready'`): nothing is
+		 * drawn. It is a request of this pump's like any other (its `client` and the next `seq`), so one that reaches
+		 * the backend after a newer request of the page (the paused frame once the play stops) is answered
+		 * `superseded` and does nothing.
+		 */
+		ready(time: number, overlays: boolean, width: number, session: number): Promise<PreviewFrameResult> {
+			return deps.previewFrame(time, overlays, width, { client, seq: ++asked }, { session, ready: true });
 		},
 		/** The `<img>` loaded: the aspect it has. */
 		pictureAspect(aspect: number) {

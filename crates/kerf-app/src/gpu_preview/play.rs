@@ -11,12 +11,13 @@
 //! **A session** is a [`PlayCut`](kerf_core::PlayCut) — the Motion plan of the slice the stream
 //! would play from the playhead, so what is drawn is what `stream_preview` would show — over one
 //! forward-only cursor per clip ([`MotionFrames`]). The first request of a page's session decides
-//! whether the GPU plays it at all, **for the whole session** (no flipping between renderers while
-//! it plays): the next five seconds are scanned ([`PlayCut::ahead`](kerf_core::PlayCut::ahead)) and
-//! a frame the compositor does not draw exactly, or would not draw in time, in that span, a surface
-//! that cannot show what the page puts over the picture, a self-test that has not passed, a clip no
-//! run is trusted for: the answer is `renderer: "stream"` with the reasons, and the page plays the
-//! stream as it always did.
+//! whether the GPU plays it at all, **for the whole session** (a session never switches renderer; a
+//! later session may take the play back from the stream, below): the next five seconds are scanned
+//! ([`PlayCut::ahead`](kerf_core::PlayCut::ahead)) and a frame the compositor does not draw exactly, or
+//! would not draw in time, in that span, a surface that cannot show what the page puts over the
+//! picture, a self-test that has not passed, a clip no run is trusted for: the answer is
+//! `renderer: "stream"` with the reasons (and `play.ahead` when a frame was the reason), and the page
+//! plays the stream as it always did.
 //!
 //! **A refusal that comes into view later** (the scan goes on half a second at a time, five
 //! seconds ahead, and a clip the prefetch finds untrusted counts too) is reported in the answers as

@@ -3437,28 +3437,7 @@ async fn get_preview_frame(
         max_width.unwrap_or(960),
         overlays.unwrap_or(false),
     );
-    match hint.as_deref() {
-        None => {}
-        Some("forward") => {
-            let (Some(client), Some(session)) = (client.clone(), session) else {
-                return Err("a forward frame names its client and session".to_string());
-            };
-            if draft.is_some() {
-                return Err("a forward frame takes no draft".to_string());
-            }
-            request = request.forward(client, session);
-        }
-        Some("ready") => {
-            let (Some(client), Some(session)) = (client.clone(), session) else {
-                return Err("a ready request names its client and session".to_string());
-            };
-            if draft.is_some() {
-                return Err("a ready request takes no draft".to_string());
-            }
-            request = request.ready(client, session);
-        }
-        Some(other) => return Err(format!("unknown preview frame hint {other:?}")),
-    }
+    request = request.with_hint(hint.as_deref(), client.as_deref(), session, draft.is_some())?;
     if let Some(draft) = draft {
         request = request.drafted(draft);
     }

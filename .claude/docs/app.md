@@ -627,7 +627,9 @@ is primed exactly as a paused playhead's is (`make_primed`: its cut, its scan, e
 `PRIME_TTL` by the primer's `expire_after`), and the answer is `renderer: "ready"` with `play.resume`, nothing drawn and the surface untouched; the
 page's next session, begun there, adopts it like a Play from a rested playhead. Nothing within reach is `stream` with `play.ahead` (ask again later);
 a clip there that cannot be opened is `stream` with an `ahead` of kind `cursor`; anything else (the setting off, no surface, no plan from there) is
-`stream` with no `play`, and the page does not ask again in that play.
+`stream` with no `play`, and the page does not ask again in that play. The request is ordered like the page's frames (`client`, `seq`), so
+one that reaches the backend after a newer request of the page (the paused frame once the play stops) is superseded and drops nothing that frame
+primes. The page backs off while the answers are `stream` (`frontend.md`), so a cut the GPU draws none of costs a scan every few seconds at most.
 Cursor timeouts of a session are `play_config()` (first frame 10 s, next 3 s), shorter than the export's so a hung decode ends in the stream's hands.
 The diagnostics' `play` counts `{sessions, declined, handed_over, frames, skipped, repeats}`; the log has a line per session
 (`GPU playback session begun` / `ended`, with the mean decode, composite and present time of its frames and the worst).

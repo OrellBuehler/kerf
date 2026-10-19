@@ -9,6 +9,8 @@ import {
 	NO_PLAY,
 	READY_EVERY,
 	READY_LEAD,
+	READY_MAX_WAIT,
+	READY_SETTLE,
 	SHOW_AHEAD,
 	TakeBack,
 	frameIndex,
@@ -424,19 +426,55 @@ describe('a play the stream took over is given back', () => {
 		expect(slow.resumable).toBe(false);
 	});
 
-	test('asks ahead of what is heard, no earlier than where the GPU stopped, and once a second while nothing is ready', () => {
+	test('waits a second once the stream shows, then asks ahead of what is heard, no earlier than where the GPU stopped', () => {
 		const tb = new TakeBack(5);
-		expect(tb.ask(1)).toBe(5);
-		expect(tb.ask(1.5)).toBeNull();
-		expect(tb.answer(stream(ahead(5)))).toBe('later');
-		expect(tb.ask(1.5)).toBeNull();
-		expect(tb.ask(1 + READY_EVERY)).toBe(5);
-		tb.answer(stream(ahead(6)));
-		expect(tb.ask(6)).toBe(6 + READY_LEAD);
+		expect(tb.ask(1)).toBeNull();
+		expect(tb.ask(1 + READY_SETTLE - 0.01)).toBeNull();
+		expect(tb.ask(1 + READY_SETTLE)).toBe(5);
+		// One in flight.
+		expect(tb.ask(2.5)).toBeNull();
+		const late = new TakeBack(0);
+		late.ask(10);
+		expect(late.ask(10 + READY_SETTLE)).toBe(10 + READY_SETTLE + READY_LEAD);
+	});
+
+	test('asks less often for each answer in a row that is not ready, up to a limit', () => {
+		const tb = new TakeBack(0);
+		tb.ask(0);
+		let at = READY_SETTLE;
+		expect(tb.ask(at)).not.toBeNull();
+		const waits: number[] = [];
+		for (let n = 0; n < 6; n++) {
+			tb.answer(stream(ahead(99)));
+			let next = at;
+			while (tb.ask(next) === null) next += 0.05;
+			waits.push(Math.round((next - at) * 10) / 10);
+			at = next;
+		}
+		expect(waits).toEqual([READY_EVERY, 2, 4, READY_MAX_WAIT, READY_MAX_WAIT, READY_MAX_WAIT]);
+		// A ready answer starts the count again.
+		tb.answer(ready(at + 1));
+		tb.retry(at + 2);
+		expect(tb.ask(at + 2 + READY_EVERY)).not.toBeNull();
+	});
+
+	test('asks further ahead when the answers are slow', () => {
+		const tb = new TakeBack(0);
+		tb.ask(0);
+		tb.ask(READY_SETTLE);
+		tb.answer(stream(ahead(9)), 0.9);
+		expect(tb.lead).toBeCloseTo(1.8);
+		let at = READY_SETTLE;
+		let asked: number | null = null;
+		while (asked === null) asked = tb.ask((at += 0.05));
+		expect(asked).toBeCloseTo(at + 1.8);
+		tb.answer(ready(at + 1.8), 0.1);
+		expect(tb.lead).toBe(READY_LEAD);
 	});
 
 	test('brings the surface back, then begins the session a first frame ahead of the time made ready', () => {
 		const tb = new TakeBack(2);
+		tb.ask(1.5);
 		expect(tb.ask(2.5)).toBe(2.5 + READY_LEAD);
 		expect(tb.answer(ready(3.2))).toBe('ready');
 		expect(tb.resume).toBe(3.2);
@@ -446,29 +484,48 @@ describe('a play the stream took over is given back', () => {
 		expect(tb.showing(3.2 - SHOW_AHEAD)).toBe(true);
 		expect(tb.due(3.1, 0.05)).toBe(false);
 		expect(tb.due(3.16, 0.05)).toBe(true);
-		// Missed: the play got past it before a session began there; it is asked for again.
+		// Missed: the play got past it before a session began there; it is asked for again after the wait.
 		expect(tb.due(3.2 + MISSED_AFTER + 0.01, 0.05)).toBe(false);
 		expect(tb.missed(3.2 + MISSED_AFTER + 0.01)).toBe(true);
-		tb.retry();
+		tb.retry(3.4);
 		expect(tb.resume).toBeNull();
-		expect(tb.ask(3.5)).toBe(3.5 + READY_LEAD);
+		expect(tb.ask(3.4 + READY_EVERY - 0.01)).toBeNull();
+		expect(tb.ask(3.4 + READY_EVERY)).toBe(3.4 + READY_EVERY + READY_LEAD);
 	});
 
-	test('gives up on a play that is not one to take back, and asks nothing once over', () => {
-		const tb = new TakeBack(1);
-		tb.ask(0);
-		expect(tb.answer(stream(null))).toBe('never');
-		expect(tb.over).toBe(true);
-		expect(tb.ask(10)).toBeNull();
-		const errored = new TakeBack(1);
-		errored.ask(0);
-		expect(errored.answer(null)).toBe('never');
+	test('only the backend saying so ends it: a failed or replaced request is not yet', () => {
+		const settled = (from: number) => {
+			const tb = new TakeBack(from);
+			tb.ask(0);
+			tb.ask(READY_SETTLE);
+			return tb;
+		};
+		const errored = settled(1);
+		expect(errored.answer(null)).toBe('later');
+		expect(errored.over).toBe(false);
+		const replaced = settled(1);
+		expect(replaced.answer(superseded)).toBe('later');
+		const refused = settled(1);
+		expect(refused.answer(stream(null))).toBe('never');
+		expect(refused.over).toBe(true);
+		expect(refused.ask(10)).toBeNull();
 		// An answer after the play was taken back, paused or sought changes nothing.
-		const ended = new TakeBack(1);
-		ended.ask(0);
+		const ended = settled(1);
 		ended.end();
 		expect(ended.answer(ready(2))).toBe('never');
 		expect(ended.resume).toBeNull();
+	});
+
+	test('a session that failed is not one to retry, one that declined is', () => {
+		const declined = new GpuPlayback(30);
+		declined.answer(stream(null), 0.02, 0);
+		expect(declined.failed).toBe(false);
+		const rejected = new GpuPlayback(30);
+		rejected.giveUp();
+		expect(rejected.failed).toBe(true);
+		const broken = new GpuPlayback(30);
+		broken.answer(stream({ ...ahead(1), kind: 'session' }), 0.02, 0);
+		expect(broken.failed).toBe(true);
 	});
 
 	test('session numbers are never shared between sessions and ready requests', () => {
