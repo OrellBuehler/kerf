@@ -2,7 +2,9 @@ import { describe, expect, test } from 'bun:test';
 import type { SourceLimits } from './edit-modes';
 import { linkedTrimBounds, linkedTrimPreview, type LinkedTrimOptions } from './linked-trim';
 import { rippleTrimPreview, trimBounds } from './ripple-trim';
+import { MAX_TITLE_SECONDS } from './title-clips';
 import type { Clip, StreamKind, Timeline, Track } from './types';
+import { GENERATED_ASSET } from './types';
 
 const clip = (id: string, asset: string, sin: number, sout: number, at: number, link?: string): Clip => ({
 	id,
@@ -51,6 +53,17 @@ describe('linkedTrimBounds', () => {
 	test('with ripple the neighbours are pushed, not a limit — only the footage is', () => {
 		const t = cut();
 		expect(tail(t, true).max).toBe(100); // the 100 s of footage: a's window is 0..10
+	});
+
+	test('a title clip’s tail runs to the end of its document, its head to its start', () => {
+		const title: Clip = {
+			...clip('t', GENERATED_ASSET, 1, 4, 20),
+			generator: { kind: 'title', name: 'End card', svg: '<svg/>' }
+		};
+		const t: Timeline = { tracks: [lane('video', 'V1', [clip('a', 'x', 0, 10, 0), title])] };
+		expect(linkedTrimBounds(t, title, 'r', undefined, false, false).max).toBe(23 + MAX_TITLE_SECONDS - 4);
+		expect(linkedTrimBounds(t, title, 'r', undefined, false, true).max).toBe(23 + MAX_TITLE_SECONDS - 4);
+		expect(linkedTrimBounds(t, title, 'l', undefined, false, false).min).toBe(19);
 	});
 
 	test('a partner that does not share the edge is untouched', () => {

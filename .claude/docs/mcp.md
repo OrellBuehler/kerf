@@ -272,6 +272,15 @@ is refused while `agent_review` is on** (a template is the user's own work and t
 like `export_template`; `save_template` and `apply_template` are annotated as edits, `set_template_values` / `import_template` as
 idempotent sets. The instructions place the loop after the SVG one: author with `id`s → `validate_svg` → `add_svg_overlay` →
 preview → `save_template` with `controls` → `apply_template`; tests pin that order and the schemas.
+**Titles on tracks over MCP.** `add_title_clip { svg, start, duration?, track_id?, name? }` (Edit) and `update_title_clip {
+clip_id, name?, svg? }` (Set) read the SVG on `blocking` before the lock and `edit()` runs `add_title_clip_parsed` /
+`update_title_clip_parsed`; `apply_template` takes **`on_track: true`** (and `track_id?`) to put the template on a video track
+instead (`apply_template_clip_parsed`; `end` becomes the duration; x / y / width / height / opacity are refused with it — the clip's
+transform places it). These answer `TitleClipOutcome {title_clip: TitleClipSummary {id, track_id, name, start, end, source_in,
+template?, svg_bytes}, warnings}`; `set_template_values` dispatches on the id (`set_title_values_parsed`) and answers the overlay or
+the title clip; `save_template` and `preview_svg_overlay` take a title clip's id too. `timeline_summary` lists `title_clips`
+(the clips are also counted in their tracks); `get_timeline_state` elides a large title clip's source like a floating one's. The
+instructions say a title can be a clip on a track that takes a transition (a dip to white into an end card).
 `import_asset` refuses a UNC / device-namespace `path` before any filesystem call (`require_local_input_path`), then a URL,
 protocol, relative path or missing file (`validate_import_path`). It is the one write that does **not** stage — a file on disk is not
 an edit to the user's cut, so imported media (and its background proxy) lands for
@@ -524,7 +533,7 @@ Every tool, by purpose (a test pins that this list names each registered tool, a
   `set_track_locked`, `set_master_volume`, `set_master_limiter`, `set_master_true_peak`, `set_master_duck`, `plan_music_fit`, `fit_music`,
   `compose_music`, `music_status`, `separate_stems`, `stems_status`.
 - **Titles, captions, markers, frame**: `add_overlay`, `update_overlay`, `remove_overlay`, `set_overlay_keyframes`,
-  `add_svg_overlay`, `update_svg_overlay`, `remove_svg_overlay`, `list_svg_presets`, `validate_svg`, `preview_svg_overlay`,
+  `add_svg_overlay`, `update_svg_overlay`, `remove_svg_overlay`, `add_title_clip`, `update_title_clip`, `list_svg_presets`, `validate_svg`, `preview_svg_overlay`,
   `preview_svg_preset`, `list_templates`, `save_template`, `apply_template`, `set_template_values`, `import_template`,
   `export_template`, `delete_template`, `generate_captions`, `import_captions`, `clear_captions`, `export_srt`, `export_captions`, `add_marker`,
   `update_marker`, `remove_marker`, `set_delivery_format`.

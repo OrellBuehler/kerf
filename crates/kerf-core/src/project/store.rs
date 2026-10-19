@@ -66,6 +66,12 @@ const MIGRATIONS: &[Migration] = &[
         destructive: false,
         needed_to_read: false,
     },
+    Migration {
+        run: v5_to_v6,
+        needed: v5_to_v6_needed,
+        destructive: false,
+        needed_to_read: false,
+    },
 ];
 
 /// The schema this build writes and the newest it opens.
@@ -146,16 +152,28 @@ fn v3_to_v4_needed(conn: &Connection) -> bool {
     !has_column(conn, "assets", "music_score")
 }
 
-/// v5: a delivery frame may fit footage over a blurred copy of itself (`Fit::Blur`, `"fit":"blur"`
+/// v5: a clip on a video track may be a generated title (`Clip.generator`, in the timeline's JSON).
+/// Nothing in the file's tables changes, so the step writes nothing but the number; the number is what
+/// keeps an older build, which would read such a clip as one of missing media and drop its title on the
+/// next save, from opening the file. Needed always, so the file is copied aside before that happens.
+fn v4_to_v5(_conn: &Connection) -> rusqlite::Result<()> {
+    Ok(())
+}
+
+fn v4_to_v5_needed(_conn: &Connection) -> bool {
+    true
+}
+
+/// v6: a delivery frame may fit footage over a blurred copy of itself (`Fit::Blur`, `"fit":"blur"`
 /// in the timeline JSON), a variant an older build fails to read; and an asset's streams may carry
 /// `StreamInfo.lead` (a late-starting stream's offset), a field an older build drops at its next
 /// write. Nothing in the file's tables changes; the step is the version that keeps an older build
 /// out, after the file is copied aside.
-fn v4_to_v5(_: &Connection) -> rusqlite::Result<()> {
+fn v5_to_v6(_: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-fn v4_to_v5_needed(_: &Connection) -> bool {
+fn v5_to_v6_needed(_: &Connection) -> bool {
     true
 }
 

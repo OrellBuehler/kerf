@@ -31,8 +31,8 @@ use kerf_core::{
     Keyframe, Levels, Mask, MissingAsset, Page, Project, Projection, Property, PropertyKey, PropertyTrack, ReframeKeyframe,
     RelinkCheck, Relinked, RemovedAsset, Revision, SplitSide, StagedEdit, StreamKind, SubsetApplied, SvgCheck, SvgLayout,
     SvgOverlayPatch, SvgPresetInfo, SvgPresetKind, SvgPresetParams, SvgSource, Task, TemplateControl, TemplateLibrary,
-    TemplateList, TemplateSaveRequest, TemplateSaved, TextKeyframe, TimeRange, Timeline, TimelineDiff, Transition,
-    TransitionKind, VideoEffect, WaveformRange,
+    TemplateList, TemplateSaveRequest, TemplateSaved, TextKeyframe, TimeRange, Timeline, TimelineDiff, TitleClipPatch,
+    TitleClipPlacement, TitleClipResult, TitleEdited, Transition, TransitionKind, VideoEffect, WaveformRange,
 };
 
 use serde::Serialize;
@@ -2736,8 +2736,33 @@ fn require_template_path(path: &str) -> CmdResult<()> {
 #[derive(Serialize)]
 struct TemplateEdit {
     timeline: Timeline,
-    overlay_id: Uuid,
+    /// The floating title made or changed; absent when it is a title on a track (`clip_id`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    overlay_id: Option<Uuid>,
+    /// The title clip made or changed, when the title is on a track.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    clip_id: Option<Uuid>,
     warnings: Vec<String>,
+}
+
+impl TemplateEdit {
+    fn of_clip(timeline: Timeline, done: TitleClipResult) -> Self {
+        Self {
+            timeline,
+            overlay_id: None,
+            clip_id: Some(done.clip.id),
+            warnings: done.warnings,
+        }
+    }
+}
+
+/// Where a new title clip goes: a video track (by default the lowest one free over its span, else a
+/// new one on top) and its name.
+fn title_placement(track_id: Option<String>, name: Option<String>) -> CmdResult<TitleClipPlacement> {
+    Ok(TitleClipPlacement {
+        track_id: track_id.as_deref().map(|t| id(t, "track_id")).transpose()?,
+        name,
+    })
 }
 
 /// An element of a title that has an `id`, and the tag it is: what a control can aim at.
@@ -2833,16 +2858,92 @@ async fn apply_template(
             .map_err(|e| e.to_string())?;
         Ok(TemplateEdit {
             timeline: project.timeline().map_err(|e| e.to_string())?,
-            overlay_id: done.overlay.id,
+            overlay_id: Some(done.overlay.id),
+            clip_id: None,
             warnings: done.warnings,
         })
     })
     .await
 }
 
-/// Change control values of a template title (partial: only the named controls). The title is read
-/// under the lock, the splice and the sanitiser run with it released, and the result is stored only if
-/// the title is still the one it was made from; one that changed meanwhile is an error saying to try again.
+/// Add a library template as a title clip on a video track, so it takes transitions, fades and keys
+/// like any clip: prepared before the lock, as `apply_template`. It runs from `start` for `duration`
+/// seconds (the template's own length by default) on `track_id` (by default the lowest video track
+/// free over its span, else a new one on top).
+#[tauri::command]
+async fn apply_template_clip(
+    state: State<'_, AppState>,
+    template_id: String,
+    values: std::collections::BTreeMap<String, String>,
+    start: f64,
+    duration: Option<f64>,
+    track_id: Option<String>,
+    name: Option<String>,
+) -> CmdResult<TemplateEdit> {
+    let placement = title_placement(track_id, name)?;
+    let shared = state.project.clone();
+    blocking(move || {
+        let prepared = template_library()?
+            .get(&template_id)
+            .and_then(|t| t.prepare(&values))
+            .map_err(|e| e.to_string())?;
+        let project = lock_user(&shared);
+        let done = project
+            .apply_template_clip_parsed(prepared, start, duration, placement)
+            .map_err(|e| e.to_string())?;
+        Ok(TemplateEdit::of_clip(project.timeline().map_err(|e| e.to_string())?, done))
+    })
+    .await
+}
+
+/// Add custom SVG artwork as a title clip on a video track (read before the lock). `duration` defaults
+/// to how long its animations run (2–30 s, else 4).
+#[tauri::command]
+async fn add_title_clip(
+    state: State<'_, AppState>,
+    svg: String,
+    start: f64,
+    duration: Option<f64>,
+    track_id: Option<String>,
+    name: Option<String>,
+) -> CmdResult<TemplateEdit> {
+    let placement = title_placement(track_id, name)?;
+    let shared = state.project.clone();
+    blocking(move || {
+        let doc = kerf_core::SvgDoc::parse(&svg).map_err(|e| e.to_string())?;
+        let project = lock_user(&shared);
+        let done = project
+            .add_title_clip_parsed(doc, start, duration, placement)
+            .map_err(|e| e.to_string())?;
+        Ok(TemplateEdit::of_clip(project.timeline().map_err(|e| e.to_string())?, done))
+    })
+    .await
+}
+
+/// Rename a title clip or replace its artwork (`svg`, read before the lock; it ends a template). Its
+/// timing, place and look are the clip's own edits.
+#[tauri::command]
+async fn update_title_clip(state: State<'_, AppState>, clip_id: String, patch: TitleClipPatch) -> CmdResult<TemplateEdit> {
+    let cid = id(&clip_id, "clip_id")?;
+    let shared = state.project.clone();
+    blocking(move || {
+        let doc = patch
+            .svg
+            .as_deref()
+            .map(kerf_core::SvgDoc::parse)
+            .transpose()
+            .map_err(|e| e.to_string())?;
+        let project = lock_user(&shared);
+        let done = project.update_title_clip_parsed(cid, patch, doc).map_err(|e| e.to_string())?;
+        Ok(TemplateEdit::of_clip(project.timeline().map_err(|e| e.to_string())?, done))
+    })
+    .await
+}
+
+/// Change control values of a template title, floating or on a track (partial: only the named
+/// controls; `overlay_id` is either's id). The title is read under the lock, the splice and the
+/// sanitiser run with it released, and the result is stored only if the title is still the one it was
+/// made from; one that changed meanwhile is an error saying to try again.
 #[tauri::command]
 async fn set_template_values(
     state: State<'_, AppState>,
@@ -2855,11 +2956,16 @@ async fn set_template_values(
         let inputs = lock_user(&shared).template_edit_inputs(oid).map_err(|e| e.to_string())?;
         let prepared = inputs.prepare(&values).map_err(|e| e.to_string())?;
         let project = lock_user(&shared);
-        let done = project.set_template_values_parsed(oid, prepared).map_err(|e| e.to_string())?;
-        Ok(TemplateEdit {
-            timeline: project.timeline().map_err(|e| e.to_string())?,
-            overlay_id: done.overlay.id,
-            warnings: done.warnings,
+        let done = project.set_title_values_parsed(oid, prepared).map_err(|e| e.to_string())?;
+        let timeline = project.timeline().map_err(|e| e.to_string())?;
+        Ok(match done {
+            TitleEdited::Overlay(o) => TemplateEdit {
+                timeline,
+                overlay_id: Some(o.overlay.id),
+                clip_id: None,
+                warnings: o.warnings,
+            },
+            TitleEdited::Clip(c) => TemplateEdit::of_clip(timeline, *c),
         })
     })
     .await
@@ -5293,6 +5399,9 @@ pub fn run() {
             template_image_value,
             save_template,
             apply_template,
+            apply_template_clip,
+            add_title_clip,
+            update_title_clip,
             set_template_values,
             import_template,
             export_template,

@@ -95,6 +95,7 @@
 	import { clipDuration } from '#lib/types';
 	import { barGrid, beatGrid, beatPeriod, gridMagnets, sourceToTimeline } from '#lib/beats';
 	import { NAME_CHIP_PCT, showsLabel } from '#lib/clip-label';
+	import { titleName, titleOf } from '#lib/title-clips';
 	import { fitOffer } from '#lib/music-ui';
 	import { stemsOffer } from '#lib/stems';
 	import { composeOffer } from '#lib/compose-form';
@@ -3493,7 +3494,8 @@
 						{@const off = c.enabled === false || !renders(t)}
 						{@const badge = badges.get(c.id)}
 						{@const lit = hoverPartners.has(c.id)}
-						{@const name = editor.assetName(c.asset_id)}
+						{@const title = titleOf(c)}
+						{@const name = title ? titleName(title) : editor.assetName(c.asset_id)}
 						<button
 							class="kclip"
 							data-clip-id={c.id}
@@ -3503,6 +3505,7 @@
 							use:tip={showsLabel(width) ? undefined : name}
 							data-linked={badge && badge.partners.length > 0 ? '' : undefined}
 							data-sound-detached={c.source_audio === false ? '' : undefined}
+							data-title-clip={title ? '' : undefined}
 							onpointerdown={(e) => onClipPointerDown(e, c, t)}
 							onkeydown={(e) => onClipKey(e, c, t)}
 							onblur={() => {
@@ -3554,6 +3557,13 @@
 										style="position:absolute;left:{r.left - left}px;top:3px;bottom:3px;width:{Math.max(2, r.width)}px;background:var(--silence-region);border:var(--line-width) solid color-mix(in srgb,var(--red-500) 30%,transparent);border-radius:2px"
 									></span>
 								{/each}
+							{:else if title}
+								<!-- A title draws no footage: its mark at the head, where a filmstrip's first frame would be. -->
+								<span
+									data-title-mark
+									style="position:absolute;left:4px;top:4px;display:inline-flex;color:color-mix(in srgb,var(--text-on-video) 75%,transparent);pointer-events:none"
+									><Icon n="layout-template" s={11} /></span
+								>
 							{:else}
 								<ClipFilmstrip
 									clip={shown}

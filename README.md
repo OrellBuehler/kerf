@@ -143,7 +143,7 @@ Now ask the agent to work on the project you have open — _"skim the interview 
 the dead air, and drop in captions."_ It will claim a task, use the tools below, and hand
 back a reviewable result.
 
-### The tools (170)
+### The tools (172)
 
 <details>
 <summary><b>See / analyze</b></summary>
@@ -186,7 +186,7 @@ score, fitted to the cuts) ·
 `set_reframe_keyframes` · `add_reframe_keyframe` · `set_track_volume` · `set_track_pan` ·
 `set_master_volume` · `set_master_limiter` · `set_master_true_peak` · `set_master_duck` ·
 `add_overlay` · `update_overlay` · `remove_overlay` · `set_overlay_keyframes` ·
-`add_svg_overlay` · `update_svg_overlay` · `remove_svg_overlay` · `list_svg_presets` ·
+`add_svg_overlay` · `update_svg_overlay` · `remove_svg_overlay` · `list_svg_presets` · `add_title_clip` · `update_title_clip` ·
 `list_templates` · `save_template` · `apply_template` · `set_template_values` · `import_template` · `export_template` · `delete_template` ·
 `generate_captions` · `import_captions` · `clear_captions` · `export_srt` · `export_captions` · `list_fonts` ·
 `set_delivery_format` · `set_asset_projection`

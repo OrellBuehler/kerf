@@ -125,10 +125,10 @@ impl Project {
         if stored.is_empty() {
             return Ok(0);
         }
-        let mut titles: Vec<String> = self.timeline()?.svg_overlays.iter().map(|o| o.svg.to_lowercase()).collect();
+        let mut titles: Vec<String> = self.timeline()?.title_sources().map(str::to_lowercase).collect();
         if let Some(row) = self.staged_row()? {
             let proposed: crate::model::Timeline = serde_json::from_str(&row.timeline)?;
-            titles.extend(proposed.svg_overlays.iter().map(|o| o.svg.to_lowercase()));
+            titles.extend(proposed.title_sources().map(str::to_lowercase));
         }
         let mut gone = 0;
         let mut delete = self.conn.prepare("DELETE FROM fonts WHERE sha256 = ?1")?;
@@ -157,7 +157,7 @@ impl Project {
 
     /// The fonts of `incoming` the project would add, refused if they would take it past
     /// [`MAX_PROJECT_FONT_BYTES`].
-    fn check_font_room(&self, incoming: &[EmbeddedFont]) -> Result<()> {
+    pub(super) fn check_font_room(&self, incoming: &[EmbeddedFont]) -> Result<()> {
         let have: HashSet<String> = if self.has_fonts_table() {
             let mut stmt = self.conn.prepare("SELECT sha256 FROM fonts")?;
             let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
@@ -182,10 +182,18 @@ impl Project {
     }
 
     /// What making a template from the title `overlay_id` needs, read from the working timeline (an
-    /// agent's proposal while it has one): the artwork, its name and how long it runs. Cheap, for under
+    /// agent's proposal while it has one): the artwork, its name and how long it runs. The id may name a
+    /// floating title or a title clip (whose length is its document's, `source_out`). Cheap, for under
     /// the lock; `Library::save` does the rest without it.
     pub fn template_source(&self, overlay_id: Uuid) -> Result<TemplateSource> {
         let timeline = self.working_timeline()?;
+        if let Some((clip, title)) = timeline.title_clip(overlay_id) {
+            return Ok(TemplateSource {
+                svg: title.svg.clone(),
+                name: title.display_name(),
+                duration: clip.source_out,
+            });
+        }
         let o = timeline
             .svg_overlay(overlay_id)
             .ok_or(Error::SvgOverlayNotFound(overlay_id))?;
@@ -196,18 +204,24 @@ impl Project {
         })
     }
 
-    /// What changing the values of the template title `overlay_id` needs: the artwork as it is now and
-    /// its controls (checked: a project file can hold anything). `InvalidArgument` for a title that did
-    /// not come from a template.
+    /// What changing the values of the template title `overlay_id` (floating or a title clip) needs: the
+    /// artwork as it is now and its controls (checked: a project file can hold anything). `InvalidArgument`
+    /// for a title that did not come from a template.
     pub fn template_edit_inputs(&self, overlay_id: Uuid) -> Result<TemplateEditInputs> {
         let timeline = self.working_timeline()?;
-        let o = timeline
-            .svg_overlay(overlay_id)
-            .ok_or(Error::SvgOverlayNotFound(overlay_id))?;
-        let instance = o.template.clone().ok_or_else(|| not_a_template(o))?;
+        let (name, svg, instance) = match timeline.title_clip(overlay_id) {
+            Some((_, title)) => (title.display_name(), &title.svg, &title.template),
+            None => {
+                let o = timeline
+                    .svg_overlay(overlay_id)
+                    .ok_or(Error::SvgOverlayNotFound(overlay_id))?;
+                (o.display_name(), &o.svg, &o.template)
+            }
+        };
+        let instance = instance.clone().ok_or_else(|| not_a_template_named(&name))?;
         // Stored with the title, not written by this build: checked before they are trusted.
         crate::template::validate_controls_shape(&instance.controls)?;
-        Ok(TemplateEditInputs::new(overlay_id, o.svg.clone(), instance))
+        Ok(TemplateEditInputs::new(overlay_id, svg.clone(), instance))
     }
 
     /// Add a template as an animated title: `prepared` is [`crate::Template::prepare`]'s answer, already
@@ -274,19 +288,24 @@ impl Project {
             timeline.svg_overlays.push(overlay.clone());
             Ok(SvgOverlayResult { overlay, warnings })
         })?;
-        // After the edit is stored: the pictures drawn from here on are keyed by the new set.
+        self.hold_fonts(&carried);
+        Ok(result)
+    }
+
+    /// Keep the fonts a template carried, once its edit is stored: in what the project holds and in the
+    /// set titles are drawn with (the pictures drawn from here on are keyed by the new set).
+    pub(super) fn hold_fonts(&self, carried: &[EmbeddedFont]) {
         {
             let mut held = self.embedded.borrow_mut();
-            for font in &carried {
+            for font in carried {
                 if !held.iter().any(|f| f.sha256 == font.sha256) {
                     held.push(font.clone());
                 }
             }
         }
-        if fonts::register_embedded(&carried) {
+        if fonts::register_embedded(carried) {
             crate::plan_epoch::bump_plan_epoch();
         }
-        Ok(result)
     }
 
     /// Change the values of a template title: `prepared` is [`TemplateEditInputs::prepare`]'s answer
@@ -348,10 +367,11 @@ impl Project {
 }
 
 fn not_a_template(o: &SvgOverlay) -> Error {
-    Error::InvalidArgument(format!(
-        "“{}” is not a template title, so it has no values to set",
-        o.display_name()
-    ))
+    not_a_template_named(&o.display_name())
+}
+
+fn not_a_template_named(name: &str) -> Error {
+    Error::InvalidArgument(format!("“{name}” is not a template title, so it has no values to set"))
 }
 
 #[cfg(test)]

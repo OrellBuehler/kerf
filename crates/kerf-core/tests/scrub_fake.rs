@@ -137,6 +137,7 @@ impl Rig {
                 color_primaries: None,
                 pix_fmt: Some("yuv420p".into()),
                 color_space: None,
+                lead: 0.0,
             }],
             imported_at: chrono::Utc::now(),
             source_paths: Vec::new(),

@@ -23,8 +23,9 @@
 //!    exact quantity (the slot boundary the source-frame pick works from) is
 //!    [`Rational::exact_time`];
 //! 2. an outgoing clip plays on its `tail`: its window and source reach past its end;
-//! 3. fades, dips and the dissolve ramp are timed from the clip's start, over a
-//!    duration that includes the tail; slide and push offsets join the position;
+//! 3. fades, dips and the dissolve ramp are timed from the clip's start (a fade-in from its
+//!    first picture, `picture_delay` later on a late-starting source), over a duration that
+//!    includes the tail; slide and push offsets join the position;
 //! 4. a keyframed clip is never padded and always runs `scale eval=frame`
 //!    ([`Placement`](crate::layer_geometry::Placement));
 //! 5. keyframed opacity is a `geq` alpha rather than the RGB round trip, and a keyframed
@@ -485,7 +486,10 @@ impl Planner {
     ///   restarts from the cut, and with the outgoing clip gone the incoming one fades up from
     ///   black instead of crossing it.
     ///
-    /// So a clip that fades in is in the way from its start to the end of the fade, and one that
+    /// So a clip that fades in is in the way from its start to the end of the fade — from its
+    /// start, not the fade's: a late-starting source's fade begins on its first picture
+    /// (`picture_delay` in), and a stream started in the gap before it would lose the fade
+    /// too — and one that
     /// transitions out is in the way from `lead` before its end (the transition's length on its
     /// side) to its end — closed at the end, since a stream starting *on* the cut has lost the
     /// outgoing clip altogether.
@@ -497,7 +501,7 @@ impl Planner {
                 clip.fades
                     .iter()
                     .filter(|f| f.edge == FadeEdge::In)
-                    .map(|f| (f.st, f.st + f.d)),
+                    .map(|f| (start, f.st + f.d)),
             );
             windows.extend(clip.fx.move_in.map(|(_, _, secs)| (start, start + secs)));
             let lead = clip.fx.tail.max(clip.fx.black_out).max(clip.fx.white_out);
@@ -543,6 +547,7 @@ impl Planner {
         let mut layers = Vec::new();
         let mut originals: Vec<Option<&StreamInfo>> = Vec::new();
         let mut pictureless = Vec::new();
+        let mut titles: Vec<Uuid> = Vec::new();
         // A still's tail window is judged at the slot's start, which can be before `eval` (the `t`
         // it was asked for, inside the frame): look from there.
         let from = if motion { eval } else { eval.min(tail_at) };
@@ -559,6 +564,11 @@ impl Planner {
                     eval < clip.timeline_end() || (planned.tail && tail_at < clip.timeline_end() + planned.fx.tail)
                 };
                 if !on {
+                    continue;
+                }
+                // A title on a track is resvg's pictures in FFmpeg's graph, as a floating one is.
+                if clip.is_generated() {
+                    titles.push(clip.id);
                     continue;
                 }
                 let asset = planned.asset.as_ref().ok_or(Error::AssetNotFound(clip.asset_id))?;
@@ -591,7 +601,10 @@ impl Planner {
                         start: clip.timeline_start,
                         frame: u64::try_from(frame).unwrap_or(0),
                         fps: self.canvas.pick_fps,
-                        drop_first: !asset.is_image && planned.fx.head_pad && clip_seek(planned.source_window.0) == 0.0,
+                        drop_first: !asset.is_image
+                            && planned.fx.head_pad
+                            && clip_seek(planned.source_window.0, planned.fx.lead) == 0.0,
+                        lead: planned.fx.lead,
                         image: asset.is_image.then_some(self.canvas.fps),
                     })
                 } else if asset.is_image {
@@ -673,6 +686,7 @@ impl Planner {
             .iter()
             .filter(|(_, start, end)| eval >= *start && if motion { eval <= *end } else { eval < *end })
             .map(|(id, ..)| *id)
+            .chain(titles)
             .collect();
         Ok(RenderPlan {
             time: slot,
@@ -2106,6 +2120,7 @@ mod tests {
             frame: 45,
             fps: Rational::new(30, 1).unwrap(),
             drop_first: false,
+            lead: 0.0,
             image: None,
         };
         assert_eq!(export.layers[0].pick, Pick::Fps(want));
@@ -2166,6 +2181,38 @@ mod tests {
                 video: Some(video),
             }
         }
+    }
+
+    #[test]
+    fn a_late_starting_sources_lead_reaches_the_pick_of_the_original_and_of_its_padded_proxy() {
+        let mut a = asset();
+        a.streams[0].lead = 0.5;
+        let fps_of = |clip: Clip, request: PlanRequest| {
+            let tl = single(vec![clip]);
+            let plan = Planner::new(&tl, std::slice::from_ref(&a), &opts(30.0), request)
+                .unwrap()
+                .at_frame(3)
+                .unwrap();
+            match plan.layers[0].pick {
+                Pick::Fps(f) => f,
+                other => panic!("{other:?}"),
+            }
+        };
+        // From inside the lead: the lead rides along, the window is not seeked, and a padded
+        // proxy (which keeps the original's times) drops its clone as for a head clip.
+        let head = fps_of(make_clip(a.id, 0.2, 4.0, 0.0), PlanRequest::motion(FIXED));
+        assert_eq!((head.lead, head.seek(), head.drop_first), (0.5, Some(0.0), false));
+        let proxied = fps_of(
+            make_clip(a.id, 0.2, 4.0, 0.0),
+            PlanRequest::motion(FIXED).with_media(&Proxied),
+        );
+        assert_eq!((proxied.lead, proxied.seek(), proxied.drop_first), (0.5, Some(0.0), true));
+        // Past it: seeked as ever, so the seek skips the clone.
+        let past = fps_of(
+            make_clip(a.id, 1.0, 4.0, 0.0),
+            PlanRequest::motion(FIXED).with_media(&Proxied),
+        );
+        assert_eq!((past.lead, past.seek(), past.drop_first), (0.5, Some(1.0), false));
     }
 
     #[test]
@@ -2355,6 +2402,23 @@ mod tests {
         tl.tracks.push(video_track(vec![over]));
         let span = planner(&tl, &assets, PlanMode::Motion, &opts(30.0)).span(0.0, 6.0, (1920, 1080), &GpuCaps::A0);
         assert_eq!(span.handover(4.2).stream_start, 2.5);
+        // A late-starting source's fade-in starts on its first picture, half a second in; the gap
+        // before it is in the way as well, or the slice would drop the fade.
+        let mut late = asset();
+        late.streams[0].lead = 0.5;
+        let mut faded = make_clip(late.id, 0.0, 3.0, 10.0);
+        faded.fade_in = 0.4;
+        let tl = single(vec![faded]);
+        let assets = [late];
+        let span = planner(&tl, &assets, PlanMode::Motion, &opts(30.0)).span(10.0, 13.0, (1920, 1080), &GpuCaps::A0);
+        assert_eq!(
+            (
+                span.handover(10.3).stream_start,
+                span.handover(10.8).stream_start,
+                span.handover(11.0).stream_start
+            ),
+            (10.0, 10.0, 11.0)
+        );
     }
 
     #[test]

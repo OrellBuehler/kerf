@@ -114,16 +114,16 @@ fn a_legacy_file_is_backed_up_once_then_upgraded() {
 }
 
 /// The columns are there, so their steps change nothing; the file is still copied aside, once,
-/// for v5 (a JSON step: `needed` always, so an older build's file is kept before it is locked out).
+/// for v5 and v6 (JSON steps: `needed` always, so an older build's file is kept before it is locked out).
 #[test]
 fn a_legacy_file_that_already_has_the_columns_is_backed_up_only_for_the_json_step() {
     let dir = scratch();
     let path = dir.join("cut.kerf");
     edited(1).0.save_as(&path).unwrap();
     make_legacy(&path, true);
-    // Every step that adds a table or a column finds it there; only v5 (a JSON step) is pending.
+    // Every step that adds a table or a column finds it there; only v5 and v6 (JSON steps) are pending.
     let pending: Vec<u32> = store::pending_steps(&Connection::open(&path).unwrap(), 0);
-    assert_eq!(pending, vec![4], "only the v4 -> v5 step");
+    assert_eq!(pending, vec![4, 5], "only the v4 -> v5 and v5 -> v6 steps");
     drop(Project::open(&path).unwrap());
     assert_eq!(version_of(&path), SCHEMA_VERSION);
     let mut names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
@@ -251,7 +251,7 @@ fn a_v2_file_is_backed_up_once_then_gets_the_fonts_table() {
     let path = dir.join("cut.kerf");
     edited(2).0.save_as(&path).unwrap();
     make_v2(&path);
-    assert_eq!(SCHEMA_VERSION, 5);
+    assert_eq!(SCHEMA_VERSION, 6);
     assert!(!has_fonts_table(&path));
 
     let project = Project::open(&path).unwrap();
@@ -281,7 +281,7 @@ fn a_v2_file_is_backed_up_once_then_gets_the_fonts_table() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// The fonts table is there, so v3 changes nothing; the one backup is v5's (a JSON step).
+/// The fonts table is there, so v3 changes nothing; the one backup is for v5 and v6 (JSON steps).
 #[test]
 fn a_v2_file_that_already_has_the_fonts_table_is_backed_up_only_for_the_json_step() {
     let dir = scratch();
@@ -291,7 +291,7 @@ fn a_v2_file_that_already_has_the_fonts_table_is_backed_up_only_for_the_json_ste
         .unwrap()
         .pragma_update(None, "user_version", 2)
         .unwrap();
-    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 2), vec![4]);
+    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 2), vec![4, 5]);
     drop(Project::open(&path).unwrap());
     assert_eq!(version_of(&path), SCHEMA_VERSION);
     assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2, "the file and its backup");
@@ -508,6 +508,36 @@ fn the_history_limit_never_drops_the_head() {
     assert!(project.history().unwrap()[0].current);
 }
 
+#[test]
+fn a_v4_file_is_backed_up_stamped_v5_and_keeps_its_title_clips() {
+    let dir = scratch();
+    let path = dir.join("cut.kerf");
+    let project = Project::open_in_memory().unwrap();
+    let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 9"><rect width="8" height="4"/></svg>"#;
+    let title = project
+        .add_title_clip(svg, 1.0, Some(3.0), crate::project::TitleClipPlacement::default())
+        .unwrap()
+        .clip;
+    project.save_as(&path).unwrap();
+    drop(project);
+    Connection::open(&path)
+        .unwrap()
+        .pragma_update(None, "user_version", 4)
+        .unwrap();
+
+    let project = Project::open(&path).unwrap();
+    assert_eq!(version_of(&path), SCHEMA_VERSION);
+    let clip = project.timeline().unwrap().clip(title.id).cloned().unwrap();
+    assert_eq!(clip.title_clip().unwrap().svg, title.title_clip().unwrap().svg);
+    drop(project);
+    assert_eq!(
+        version_of(&schema_backup_path(&path, 4)),
+        4,
+        "an older build is locked out of the upgraded file, so the file as it was is kept"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// The timelines a file holds, `persisted/timelines-v<N>.json`, frozen at each schema version that moved
 /// the stored shape (the sample's and a few of the golden oracle's). Every one must still read; the newest
 /// must come back as it was stored, so a change to the shape is a decision (a new version, see
@@ -515,6 +545,7 @@ fn the_history_limit_never_drops_the_head() {
 const PERSISTED: &[(u32, &str)] = &[
     (3, include_str!("persisted/timelines-v3.json")),
     (5, include_str!("persisted/timelines-v5.json")),
+    (6, include_str!("persisted/timelines-v6.json")),
 ];
 
 fn persisted_path(version: u32) -> PathBuf {

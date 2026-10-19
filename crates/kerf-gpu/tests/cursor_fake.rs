@@ -84,6 +84,7 @@ fn pick(frame: u64) -> FpsPick {
         frame,
         fps: Rational::new(30, 1).unwrap(),
         drop_first: false,
+        lead: 0.0,
         image: None,
     }
 }

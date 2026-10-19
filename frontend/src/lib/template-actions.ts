@@ -72,6 +72,17 @@ export function addTemplateHere(info: TemplateInfo): Promise<void> {
 	});
 }
 
+/** A library template as a title clip on a video track at the playhead (the lowest track free there, else a new one on
+ *  top), as long as the template runs, selected: it then takes a transition, fades and keys like any clip. */
+export function addTemplateClipHere(info: TemplateInfo): Promise<void> {
+	const at = Math.max(0, ui.time);
+	return attempt(async () => {
+		const edit = await editor.applyTemplateClip(info.id, {}, at);
+		const line = appliedLine(info.name, edit.warnings);
+		if (line) say(line);
+	});
+}
+
 /** Pick a `.kerftemplate` and bring it into the library. Never throws; resolves `true` when a file was read. */
 export async function importTemplateFile(): Promise<boolean> {
 	let path: string | null;
@@ -142,7 +153,7 @@ export async function setTemplateValue(overlayId: string, control: TemplateContr
 	const why = valueRefusal(control, raw);
 	if (why) throw new Error(`${control.label}: ${why}`);
 	const edit = await editor.setTemplateValues(overlayId, { [control.id]: normalizeValue(control, raw) });
-	const title = editor.svgOverlays.find((o) => o.id === overlayId);
+	const title = editor.titleById(overlayId);
 	const line = appliedLine(title?.template?.name ?? control.label, edit.warnings);
 	if (line) say(line);
 }

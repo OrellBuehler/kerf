@@ -144,3 +144,56 @@ turns a PNG / JPEG / GIF / WebP file's bytes into the `data:` URL an `image` val
 - `import` never overwrites: the same id with other content is kept under a new id (`added_as_copy`).
 - A library file is listed only when its name is `<manifest id>.kerftemplate`.
 - Attribution: `THIRD-PARTY-NOTICES.md` (there is no `NOTICE` file).
+
+## Phase 1b as built
+
+A template (or custom SVG) can be a **title clip**: a generated clip on a video track, so it takes a `transition_in` (a dip to
+white from the shot before it), fades, transform / channel keys (the **animated placement**: a title on a track is placed and
+keyed by its clip's transform, not by a rectangle), colour and effects, and extends the cut like any clip. Details:
+`core-model.md` ("Generated clips"), `core-project.md` ("Titles on tracks"), `engine-cli.md` ("Titles on tracks").
+
+### Shapes
+
+- `Clip.generator: Option<Generator>` (absent when `None`); `Generator::Title(TitleClip {name, svg, template?})`, JSON
+  `{"kind": "title", "name", "svg", "template"?}`. `asset_id` is `GENERATED_ASSET` (nil UUID). The clip's source is the
+  document's clock (`source_in` = the head cut off, `Clip::generator_time`); speed 1, not reversed, not linked, on a video
+  track, within `MAX_SVG_SECONDS` (`check.rs` invariants, so every op is covered). Schema **v5** (a marker step, no table change).
+- `TitleClipPlacement {track_id?, name?}`, `TitleClipResult {clip, track_id, warnings}`, `TitleClipPatch {name?, svg?}`,
+  `TitleEdited::{Overlay(SvgOverlayResult), Clip(TitleClipResult)}`.
+
+### Calls
+
+| Surface | Core | Lock |
+| --- | --- | --- |
+| `add_title_clip` (Tauri, MCP) | `SvgDoc::parse` → `project.add_title_clip_parsed(doc, start, duration?, placement)` | place only |
+| `apply_template_clip` (Tauri); `apply_template` `on_track: true` (MCP) | `lib.get(id)?.prepare(&values)?` → `project.apply_template_clip_parsed(prepared, start, duration?, placement)` | place only |
+| `update_title_clip` (Tauri, MCP) | `SvgDoc::parse` (if `svg`) → `project.update_title_clip_parsed(id, patch, doc)` | edit only |
+| `set_template_values` (either id) | `template_edit_inputs(id)` → `prepare` → `set_title_values_parsed(id, prepared)` | first and last |
+| `save_template` (either id) | `template_source(id)` (a clip's length is `source_out`) | source only |
+
+### Left for later, deliberately
+
+- **Presets are not title clips**: a preset is laid out for its length, and a clip's length changes under many ops (trim, roll,
+  split, ripple); regenerating it on each would re-time the animation behind the user's back. A template or custom artwork holds its
+  end instead. A preset could become a clip once it has a "made for length" rule (or by converting it to custom art first).
+- No conversion between a floating title and a title clip yet (the overlay's rectangle maps onto a clip transform exactly only
+  given the document's aspect; straightforward to add in `title_clips.rs` when the UI wants it).
+- The stream names a title clip's pictures for the slice it plays (a stream from another playhead redraws the rest of the title);
+  the floating titles' grid-named reuse (`stream_sequences`) could be extended to clips.
+- A dip or fade acts on the title's own pixels (its chain is the clip's): a transparent title over nothing dips only its artwork.
+
+### Notes for phase 2 (text engine) and later
+
+- **Everything a title draws goes through one string, `svg`**, on a floating title (`SvgOverlay.svg`) or a title clip
+  (`TitleClip.svg`); read both through `Timeline::title_sources()` (fonts) or `Generator::svg()`. If phase 2 bakes glyph outlines into
+  the SVG at apply / set-values time, do it in `Template::prepare` / `TemplateEditInputs::prepare` and both kinds follow; if it
+  changes how a document is *drawn*, `svg/raster.rs` and `svg_layer.rs` serve both (title clips reuse `seq_of` / `still_of` through
+  `Art`). Bump `RASTER_VERSION` if the pictures change.
+- The embedded-font rules are unchanged for clips: a title clip's source names its families like a floating title's
+  (`collect_unused_fonts` reads `title_sources`, the drawing takes `fonts::snapshot().named_by([svg])`). Once outlines replace text,
+  `fonts::names_family` stops seeing a family in the source, so revisit `collect_unused_fonts` (keep the font while the template's
+  controls can still re-shape text).
+- A new kind of generated picture (Lottie in phase 5) is a new `Generator` variant: `Generator::svg()` would become a "how to draw"
+  dispatch, and `svg_layer::clip_sequences` the place that asks for pictures. The graph only needs a sequence of PNGs on the output
+  grid (`ClipStamp`), so any CPU renderer fits.
+- The golden family is `title_clip_for` (cases 6400..6800); append another family rather than changing its dice.

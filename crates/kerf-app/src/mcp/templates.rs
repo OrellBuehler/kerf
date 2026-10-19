@@ -13,7 +13,7 @@ use std::sync::Mutex;
 
 use kerf_core::{
     PreparedTemplate, PreparedValues, Project, SvgLayout, TemplateControl, TemplateKind, TemplateLibrary, TemplateSaveRequest,
-    TemplateSaved, TemplateTarget,
+    TemplateSaved, TemplateTarget, TitleClipPlacement, TitleEdited,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{schemars, tool, tool_router, ErrorData as McpError};
@@ -21,6 +21,7 @@ use uuid::Uuid;
 
 use super::{
     blocking, check_outputs_now, core_err, json, lock_agent_as, parse_arg, refuse_overwrite, KerfMcp, SvgOverlayOutcome,
+    TitleClipOutcome,
 };
 
 /// The event the window listens to for a change of the library made behind its back.
@@ -89,7 +90,7 @@ impl From<TemplateControlArg> for TemplateControl {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub(super) struct SaveTemplateParams {
     #[schemars(
-        description = "UUID of the animated SVG title to keep as a template (see timeline_summary's `svg_overlays`; a title you staged counts)"
+        description = "UUID of the animated SVG title to keep as a template (see timeline_summary's `svg_overlays`, or a title clip from its `title_clips`; a title you staged counts)"
     )]
     overlay_id: String,
     #[schemars(description = "The template's name in the library (120 characters at most)")]
@@ -130,12 +131,20 @@ pub(super) struct ApplyTemplateParams {
     opacity: Option<f64>,
     #[schemars(description = "A label for the title (shown in the timeline); default is the template's name")]
     name: Option<String>,
+    #[schemars(
+        description = "Put the title on a video track as a clip (a title clip) instead of floating it over the cut: it then takes a transition_in such as dip_to_white from the shot before it, fades, transform and keyframes, and is trimmed, moved and extended like any clip (past its animations it holds their last state). It is drawn over the whole frame, so x / y / width / height / opacity are refused with it: place it with set_transform. Default false"
+    )]
+    on_track: Option<bool>,
+    #[schemars(
+        description = "With on_track: UUID of the video track. Omit it for the lowest video track with nothing in the way over the title's span (an end card after the last shot lands beside it), else a new video track on top"
+    )]
+    track_id: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub(super) struct SetTemplateValuesParams {
     #[schemars(
-        description = "UUID of an animated title that came from a template (its entry in timeline_summary's `svg_overlays` has a `template`)"
+        description = "UUID of an animated title that came from a template: a floating one (its entry in timeline_summary's `svg_overlays` has a `template`) or a title clip (in `title_clips`)"
     )]
     overlay_id: String,
     #[schemars(
@@ -367,9 +376,17 @@ impl KerfMcp {
                        the overlay (its id, timing, and `template` with the controls and their current values; no \
                        source) and `warnings` (a font that is not installed, anything the sanitiser dropped). Change \
                        the values later with set_template_values; look at it with preview_svg_overlay (`overlay_id`) or \
-                       preview_timeline. A staged edit like any other."
+                       preview_timeline. A staged edit like any other. With `on_track` true it is a title clip on a \
+                       video track instead (see add_title_clip): it takes a transition_in such as dip_to_white from \
+                       the shot before it, fades and keyframes, extends like any clip, and the answer is `title_clip`."
     )]
     async fn apply_template(&self, Parameters(p): Parameters<ApplyTemplateParams>) -> Result<String, McpError> {
+        if p.on_track.unwrap_or(false) {
+            return self.apply_template_on_track(p).await;
+        }
+        if p.track_id.is_some() {
+            return Err(bad("`track_id` places a title clip: pass on_track=true with it"));
+        }
         let layout = SvgLayout {
             name: p.name,
             x: p.x,
@@ -402,10 +419,12 @@ impl KerfMcp {
         let overlay_id = parse_arg("overlay_id", &p.overlay_id)?;
         let (project, owner) = (self.project.clone(), self.owner());
         let prepared = blocking(move || prepare_values(&project, owner.as_deref(), overlay_id, p.values, p.image_files)).await?;
-        self.edit(|project| {
-            let out = project.set_template_values_parsed(overlay_id, prepared).map_err(core_err)?;
-            json(&SvgOverlayOutcome::from(out))
-        })
+        self.edit(
+            |project| match project.set_title_values_parsed(overlay_id, prepared).map_err(core_err)? {
+                TitleEdited::Overlay(out) => json(&SvgOverlayOutcome::from(*out)),
+                TitleEdited::Clip(out) => json(&TitleClipOutcome::from(*out)),
+            },
+        )
     }
 
     #[tool(
@@ -460,6 +479,30 @@ impl KerfMcp {
         .await?;
         self.notify(LIBRARY_CHANGED);
         json(&serde_json::json!({ "deleted": template_id }))
+    }
+}
+
+impl KerfMcp {
+    /// `apply_template` with `on_track`: the template as a title clip.
+    async fn apply_template_on_track(&self, p: ApplyTemplateParams) -> Result<String, McpError> {
+        if [p.x, p.y, p.width, p.height, p.opacity].iter().any(Option::is_some) {
+            return Err(bad(
+                "a title on a track is drawn over the whole frame: leave out x / y / width / height / opacity and place it with set_transform",
+            ));
+        }
+        let placement = TitleClipPlacement {
+            track_id: p.track_id.as_deref().map(|t| parse_arg("track_id", t)).transpose()?,
+            name: p.name,
+        };
+        let duration = p.end.map(|end| end - p.start);
+        let (template_id, values, image_files) = (p.template_id, p.values, p.image_files);
+        let prepared = blocking(move || prepare_template(&library()?, &template_id, values, image_files)).await?;
+        self.edit(|project| {
+            let out = project
+                .apply_template_clip_parsed(prepared, p.start, duration, placement)
+                .map_err(core_err)?;
+            json(&TitleClipOutcome::from(out))
+        })
     }
 }
 
@@ -611,6 +654,41 @@ mod tests {
         };
         let e = invalid(prepare_values(&shared, Some("session-a"), plain, values(&[("tagline", "x")]), None).unwrap_err());
         assert!(e.contains("not a template"), "{e}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_template_on_a_track_is_a_staged_title_clip_whose_values_change_by_its_clip_id() {
+        let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = scratch("on-track");
+        let (shared, library, done, _) = saved(&dir);
+        let prepared = prepare_template(&library, &done.info.id, values(&[("tagline", "End")]), None).unwrap();
+        let out = {
+            let agent = super::super::lock_agent_edit(&shared, Some("session-a")).unwrap();
+            let out = agent
+                .apply_template_clip_parsed(prepared, 5.0, Some(3.0), TitleClipPlacement::default())
+                .unwrap();
+            assert_eq!(agent.timeline().unwrap().title_clips().count(), 0, "staged, not applied");
+            out
+        };
+        let clip = out.clip.id;
+        let summary = serde_json::to_value(TitleClipOutcome::from(out)).unwrap();
+        assert_eq!(summary["title_clip"]["name"], "End card");
+        assert_eq!(
+            (summary["title_clip"]["start"].as_f64(), summary["title_clip"]["end"].as_f64()),
+            (Some(5.0), Some(8.0))
+        );
+        assert_eq!(summary["title_clip"]["template"]["values"]["tagline"], "End");
+        assert!(summary["title_clip"].get("svg").is_none(), "{summary}");
+
+        let prepared = prepare_values(&shared, Some("session-a"), clip, values(&[("tagline", "Bye")]), None).unwrap();
+        let agent = super::super::lock_agent_edit(&shared, Some("session-a")).unwrap();
+        let TitleEdited::Clip(changed) = agent.set_title_values_parsed(clip, prepared).unwrap() else {
+            panic!("the title clip was changed");
+        };
+        let title = changed.clip.title_clip().unwrap();
+        assert_eq!(title.template.as_ref().unwrap().values["tagline"], "Bye");
+        drop(agent);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

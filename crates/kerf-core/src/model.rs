@@ -138,6 +138,16 @@ pub struct StreamInfo {
     /// its saturation to the RGB gamut clip.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color_space: Option<String>,
+    /// Seconds between the start of the file's picture and sound and this video stream's
+    /// first frame, when the video starts after the sound: the stream's `start_time` less the
+    /// earliest video or audio stream's (not the container's, which a text track can pull
+    /// earlier), above a millisecond and below the duration (a start at or past the end is a
+    /// broken one and reads 0). The export seeks and places the picture by it, so a clip cut
+    /// from inside the lead keeps the source's sync (see `clip_timing::picture_delay`).
+    /// Defaulted (and omitted at 0) so older `.kerf` JSON still deserializes, as an
+    /// ordinary start.
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
+    pub lead: f64,
 }
 
 fn is_zero_rotation(r: &i16) -> bool {
@@ -3234,6 +3244,11 @@ pub struct Clip {
     /// existed is byte-identical.
     #[serde(default = "yes", skip_serializing_if = "is_yes")]
     pub source_audio: bool,
+    /// What the clip draws when its picture is generated rather than cut from an asset (an animated
+    /// title on a track, [`Generator`]); `None`, and absent from the file, for every clip of footage.
+    /// A generated clip's `asset_id` is [`GENERATED_ASSET`] and its source is the generator's clock.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generator: Option<Generator>,
 }
 
 fn yes() -> bool {
@@ -3279,6 +3294,7 @@ impl Clip {
             enabled: true,
             link_id: None,
             source_audio: true,
+            generator: None,
         }
     }
 
@@ -4903,7 +4919,10 @@ pub use grade::{
     frame_matrix, normalize_curve, ClipLut, CurvePoint, CurveSegment, CurveShape, Curves, Grade, Wheel, Wheels, MAX_CURVE_POINTS,
 };
 mod check;
+mod generator;
 mod values;
+pub(crate) use generator::too_many_titles;
+pub use generator::{Generator, TitleClip, GENERATED_ASSET, MAX_TITLE_CLIPS};
 
 mod score;
 pub use score::{
@@ -6423,6 +6442,7 @@ fn clip_changes(before: &Clip, after: &Clip) -> Option<String> {
             .to_string(),
         );
     }
+    parts.extend(generator::generator_changes(before, after));
     parts.extend(transform_changes(&before.transform, &after.transform));
     parts.extend(color_changes(&before.color, &after.color));
     parts.extend(Grade::changes(&before.grade, &after.grade));
@@ -6784,7 +6804,8 @@ impl Timeline {
                     DiffEntry::new(
                         DiffKind::ClipRemoved,
                         format!(
-                            "Removed clip from {} at {} ({:.1}s)",
+                            "Removed {} from {} at {} ({:.1}s)",
+                            generator::title_label(clip).unwrap_or_else(|| "clip".to_string()),
                             track.name,
                             fmt_time(clip.timeline_start),
                             clip.duration()
@@ -6803,12 +6824,14 @@ impl Timeline {
                     clips.push(
                         DiffEntry::new(
                             DiffKind::ClipAdded,
-                            format!(
-                                "Added clip to {} at {} ({:.1}s)",
-                                track.name,
-                                fmt_time(clip.timeline_start),
-                                clip.duration()
-                            ),
+                            generator::added_line(clip, &track.name).unwrap_or_else(|| {
+                                format!(
+                                    "Added clip to {} at {} ({:.1}s)",
+                                    track.name,
+                                    fmt_time(clip.timeline_start),
+                                    clip.duration()
+                                )
+                            }),
                         )
                         .on_track(track.id)
                         .on_clip(clip.id)
@@ -7090,6 +7113,7 @@ mod tests {
             color_primaries: None,
             pix_fmt: Some(pix_fmt.into()),
             color_space: tag.map(Into::into),
+            lead: 0.0,
         }
     }
 
@@ -7443,6 +7467,7 @@ mod tests {
             color_primaries: None,
             pix_fmt: None,
             color_space: None,
+            lead: 0.0,
         };
         assert_eq!(s.has_alpha(), None);
         s.pix_fmt = Some("yuv420p".into());

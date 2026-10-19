@@ -20,7 +20,7 @@ use kerf_core::{
     CurvePoint, Curves, Delivery, EditSource, ExportOptions, Fit, Keyframe, Mask, MaskShape, Project, Projection, Property,
     PropertyKey, PropertyTrack, ReframeKeyframe, Region, SplitSide, StreamKind, SvgCheck, SvgDoc, SvgLayout, SvgOverlay,
     SvgOverlayPatch, SvgOverlayResult, SvgPreset, SvgPresetKind, SvgPresetParams, SvgSource, TextKeyframe, TimeRange, Timeline,
-    Transition, TransitionKind, VideoEffect, Wheel, Wheels,
+    TitleClipPatch, TitleClipPlacement, TitleClipResult, Transition, TransitionKind, VideoEffect, Wheel, Wheels,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
@@ -1475,6 +1475,38 @@ struct AddSvgOverlayParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct AddTitleClipParams {
+    #[schemars(
+        description = "Your own SVG document, animated with SMIL as for add_svg_overlay (times are seconds from the clip's start). Drawn over the whole frame: give it a viewBox of the delivery frame's shape"
+    )]
+    svg: String,
+    #[schemars(description = "Where the clip starts, in timeline seconds")]
+    start: f64,
+    #[schemars(
+        description = "How long it runs, in seconds. Omit it to run as long as its animations (clamped to 2-30 s), else 4 s. Past the end of its animations it holds their last state"
+    )]
+    duration: Option<f64>,
+    #[schemars(
+        description = "UUID of the video track to put it on. Omit it for the lowest video track with nothing in the way over its span (an end card after the last shot lands beside it, ready for a transition), else a new video track on top"
+    )]
+    track_id: Option<String>,
+    #[schemars(description = "A label for the title (shown on the clip)")]
+    name: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct UpdateTitleClipParams {
+    #[schemars(description = "UUID of the title clip (timeline_summary's `title_clips`)")]
+    clip_id: String,
+    #[schemars(description = "New label; omit to leave unchanged")]
+    name: Option<String>,
+    #[schemars(
+        description = "Replace the artwork with your own SVG; a title from a template stops being one. Omit to leave unchanged"
+    )]
+    svg: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct UpdateSvgOverlayParams {
     #[schemars(description = "UUID of the SVG overlay (see timeline_summary)")]
     overlay_id: String,
@@ -1517,7 +1549,7 @@ struct ValidateSvgParams {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct PreviewSvgOverlayParams {
     #[schemars(
-        description = "UUID of an SVG title already on the timeline (see timeline_summary's `svg_overlays`). Give this OR `svg`, not both"
+        description = "UUID of an SVG title already on the timeline (see timeline_summary's `svg_overlays`, or a title clip from its `title_clips`). Give this OR `svg`, not both"
     )]
     overlay_id: Option<String>,
     #[schemars(
@@ -2051,6 +2083,64 @@ struct SvgOverlaySummary {
     svg_bytes: usize,
 }
 
+/// A title on a track as an agent reads it: the clip's place and its document's clock, never the source.
+/// Its transitions, fades, transform and keys are the clip's, read like any clip's.
+#[derive(Serialize)]
+pub(crate) struct TitleClipSummary {
+    id: Uuid,
+    track_id: Uuid,
+    name: String,
+    start: f64,
+    end: f64,
+    /// Seconds of the title's own animation cut off its front (0 for one that plays from its start).
+    source_in: f64,
+    /// The template it came from, with the controls and their values; absent on custom artwork.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    template: Option<TemplateSummary>,
+    svg_bytes: usize,
+}
+
+impl TitleClipSummary {
+    fn of(clip: &kerf_core::Clip, track_id: Uuid) -> Option<Self> {
+        let title = clip.title_clip()?;
+        Some(Self {
+            id: clip.id,
+            track_id,
+            name: title.display_name(),
+            start: clip.timeline_start,
+            end: clip.timeline_end(),
+            source_in: clip.source_in,
+            template: title.template.as_ref().map(TemplateSummary::from),
+            svg_bytes: title.svg.len(),
+        })
+    }
+
+    fn all(timeline: &Timeline) -> Vec<Self> {
+        timeline
+            .tracks
+            .iter()
+            .flat_map(|t| t.clips.iter().filter_map(|c| Self::of(c, t.id)))
+            .collect()
+    }
+}
+
+/// What the title-clip tools answer.
+#[derive(Serialize)]
+pub(crate) struct TitleClipOutcome {
+    title_clip: Option<TitleClipSummary>,
+    /// What the sanitiser, the SMIL reader or the machine could not honour.
+    warnings: Vec<String>,
+}
+
+impl From<TitleClipResult> for TitleClipOutcome {
+    fn from(r: TitleClipResult) -> Self {
+        Self {
+            title_clip: TitleClipSummary::of(&r.clip, r.track_id),
+            warnings: r.warnings,
+        }
+    }
+}
+
 /// What a title remembers of its template, as an agent needs it to call `set_template_values`: the
 /// controls without the elements they point at.
 #[derive(Serialize)]
@@ -2263,12 +2353,20 @@ fn svg_preview(
 /// Leave the sources of large SVG titles out of a timeline read: a title can carry 128 KiB and a
 /// timeline 50 of them. The note says how to get the source.
 fn elide_large_svg(timeline: &mut Timeline) {
-    for o in &mut timeline.svg_overlays {
-        if o.svg.len() > SVG_INLINE_LIMIT {
-            o.svg = format!(
+    let elide = |svg: &mut String| {
+        if svg.len() > SVG_INLINE_LIMIT {
+            *svg = format!(
                 "[{} bytes of SVG left out; call get_timeline_state with full_svg=true to read it]",
-                o.svg.len()
+                svg.len()
             );
+        }
+    };
+    for o in &mut timeline.svg_overlays {
+        elide(&mut o.svg);
+    }
+    for clip in timeline.tracks.iter_mut().flat_map(|t| t.clips.iter_mut()) {
+        if let Some(title) = clip.title_clip_mut() {
+            elide(&mut title.svg);
         }
     }
 }
@@ -2282,6 +2380,10 @@ struct TimelineSummary {
     /// The animated SVG titles, in draw order, without their source. Absent when there are none.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     svg_overlays: Vec<SvgOverlaySummary>,
+    /// The animated titles that are clips on video tracks (counted in their tracks too), without their
+    /// source. Absent when there are none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    title_clips: Vec<TitleClipSummary>,
     /// The frame this cut is being made for, e.g. "1080x1920 (cover)". Absent
     /// when the project follows its footage's shape. Worth reading before
     /// framing anything: under a cover delivery the crop decides what survives.
@@ -3801,6 +3903,58 @@ impl KerfMcp {
         })
     }
 
+    #[tool(
+        description = "Put your own animated SVG title on a VIDEO TRACK as a clip (a title clip), instead of floating it over \
+                       the cut as add_svg_overlay does. As a clip it is part of the cut: it takes a transition_in \
+                       (set_transition: dip_to_white, crossfade, slide ... from the shot before it on the same track), \
+                       fades, transform and keyframes (an animated placement), colour and effects; trim, move, split, \
+                       ripple and remove it with the ordinary clip tools; extending it past its animations holds their \
+                       last state, so an end card can run as long as the cut needs. Its document is drawn over the \
+                       whole frame (give it a viewBox of the delivery frame's shape; transparent where it draws \
+                       nothing, so a title on a track above footage overlays it) and its SMIL times are seconds from \
+                       the clip's start. It has no sound and plays at its own speed. Same SVG rules and limits as \
+                       add_svg_overlay. Returns the title clip (its id, track and timing; no source) and `warnings`. \
+                       To put a library template on a track, use apply_template with on_track=true."
+    )]
+    async fn add_title_clip(&self, Parameters(p): Parameters<AddTitleClipParams>) -> Result<String, McpError> {
+        let placement = TitleClipPlacement {
+            track_id: p.track_id.as_deref().map(|t| parse_arg("track_id", t)).transpose()?,
+            name: p.name,
+        };
+        let svg = p.svg;
+        // Read before the project lock, which then only places the clip.
+        let doc = blocking(move || SvgDoc::parse(&svg).map_err(core_err)).await?;
+        self.edit(|project| {
+            let out = project
+                .add_title_clip_parsed(doc, p.start, p.duration, placement)
+                .map_err(core_err)?;
+            json(&TitleClipOutcome::from(out))
+        })
+    }
+
+    #[tool(
+        description = "Rename a title clip or replace its artwork with your own `svg` (a title from a template then stops \
+                       being one; to change a template's values use set_template_values). Its timing, track, \
+                       transitions, fades and transform are the clip's: change them with the clip tools. Returns the \
+                       title clip and `warnings`."
+    )]
+    async fn update_title_clip(&self, Parameters(p): Parameters<UpdateTitleClipParams>) -> Result<String, McpError> {
+        let clip_id = parse_arg("clip_id", &p.clip_id)?;
+        let patch = TitleClipPatch {
+            name: p.name,
+            svg: p.svg,
+        };
+        let (patch, doc) = blocking(move || {
+            let doc = patch.svg.as_deref().map(SvgDoc::parse).transpose().map_err(core_err)?;
+            Ok((patch, doc))
+        })
+        .await?;
+        self.edit(|project| {
+            let out = project.update_title_clip_parsed(clip_id, patch, doc).map_err(core_err)?;
+            json(&TitleClipOutcome::from(out))
+        })
+    }
+
     #[tool(description = "Remove an animated SVG title (its id is in timeline_summary's `svg_overlays`)")]
     fn remove_svg_overlay(&self, Parameters(p): Parameters<OverlayIdParams>) -> Result<String, McpError> {
         let overlay_id = parse_arg("overlay_id", &p.overlay_id)?;
@@ -3868,6 +4022,16 @@ impl KerfMcp {
                 let timeline = project.working_timeline().map_err(core_err)?;
                 let frame = timeline.preset_frame();
                 let title = match (overlay_id, draft) {
+                    (Some(id), _) if timeline.title_clip(id).is_some() => {
+                        let (clip, t) = timeline.title_clip(id).expect("just found");
+                        SvgPreviewTitle {
+                            svg: t.svg.clone(),
+                            label: format!("title clip \"{}\" ({id})", t.display_name()),
+                            span: Some(clip.duration()),
+                            offset: clip.source_in,
+                            report_warnings: false,
+                        }
+                    }
                     (Some(id), _) => {
                         let o = timeline
                             .svg_overlay(id)
@@ -5870,6 +6034,7 @@ impl KerfMcp {
                 total_clip_count,
                 tracks,
                 svg_overlays: timeline.svg_overlays.iter().map(SvgOverlaySummary::from).collect(),
+                title_clips: TitleClipSummary::all(&timeline),
                 delivery_format: timeline
                     .format
                     .map(|d| format!("{}x{} ({})", d.width, d.height, format!("{:?}", d.fit).to_lowercase())),
@@ -6303,7 +6468,11 @@ const INSTRUCTIONS: &str = "Kerf MCP server. The user queues editing tasks in th
              and set_template_values changes them later; a title made from a \
              template lists its controls and current values under `template` in \
              timeline_summary. update_svg_overlay with `svg` replaces the artwork \
-             and ends the template. save_template, import_template and \
+             and ends the template. A title can also be a clip on a video track \
+             (add_title_clip, or apply_template with on_track=true): it then takes \
+             a transition from the shot before it (a dip to white into an end \
+             card), fades and keyframes, and extends like any clip; \
+             timeline_summary lists those under `title_clips`. save_template, import_template and \
              export_template change the user's library or a file, not your \
              proposal, and delete_template is refused while the user reviews your \
              edits. \
@@ -8495,6 +8664,14 @@ mod tests {
         }
         assert!(property("update_svg_overlay", "preset_kind").is_some());
         assert!(property("get_timeline_state", "full_svg").is_some());
+        // A title on a track: its own tools, and a template put on one.
+        let mut needs = required("add_title_clip");
+        needs.sort();
+        assert_eq!(needs, ["start", "svg"]);
+        assert_eq!(required("update_title_clip"), ["clip_id"]);
+        assert!(property("apply_template", "on_track").is_some() && property("apply_template", "track_id").is_some());
+        assert!(description("add_title_clip").contains("dip_to_white"));
+        assert!(description("apply_template").contains("on_track"));
         assert!(description("update_svg_overlay").contains("preset_kind"));
         assert!(
             description("preview_svg_overlay").contains("PNG") && description("preview_svg_overlay").contains("preview_timeline")

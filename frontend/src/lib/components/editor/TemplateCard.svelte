@@ -7,7 +7,7 @@
 	import Tile from './Tile.svelte';
 	import { contextMenu, type MenuItem } from '#lib/context-menu.svelte';
 	import { editor } from '#lib/state.svelte';
-	import { addTemplateHere, deleteTemplateFile, exportTemplateFile, posterOf } from '#lib/template-actions';
+	import { addTemplateClipHere, addTemplateHere, deleteTemplateFile, exportTemplateFile, posterOf } from '#lib/template-actions';
 	import { controlCount, fontsLine, templateTooltip } from '#lib/template-ui';
 	import { timeDisplay } from '#lib/time-display.svelte';
 	import type { TemplateInfo } from '#lib/types';
@@ -35,6 +35,12 @@
 	const fonts = $derived(fontsLine(info.fonts));
 	const items = $derived<MenuItem[]>([
 		{ label: 'Add at the playhead', icon: 'plus', disabled: editor.locked, action: () => void addTemplateHere(info) },
+		{
+			label: 'Add to a track at the playhead',
+			icon: 'between-horizontal-start',
+			disabled: editor.locked,
+			action: () => void addTemplateClipHere(info)
+		},
 		{ type: 'separator' },
 		{ label: 'Export…', icon: 'upload', action: () => void exportTemplateFile(info) },
 		{ label: 'Delete…', icon: 'trash', danger: true, action: () => void deleteTemplateFile(info) }

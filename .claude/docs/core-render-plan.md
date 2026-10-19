@@ -64,6 +64,8 @@
   clock), `pick_fps` (the `fps=` filter's parse, `av_d2q` with `INT_MAX` — the grid clips
   are placed on; the same for every rate with small terms, different for `29.970029`),
   `pix_fmt`, gif and composite colour policy.
+  **A title clip** (a generated clip, `core-model.md`) is no layer: a frame it is on names it in `RenderPlan::svg` after the
+  floating titles, by clip id, so the compositor refuses the frame (`Unsupported::Svg`) and FFmpeg draws it from resvg's pictures.
   **Two modes.** `Still` is the contract the GPU path started with (`build_still_args`:
   one sampled transform, half-open spans, text drawn statically) **and the FFmpeg still's own frame
   inside a transition** (`engine/cli/still_fx.rs`): the fades still changing the picture, counted at the
@@ -138,6 +140,10 @@
   tail, and **`proxy/late-video-start`** (the pick over a head-padded proxy's own frames is
   what the preview graph renders from it, at the head — the clone dropped — and deeper in).
   `drop_first`'s removal makes the head case fail; so does rounding in `setpts`.
+  **A late-starting source** (`FpsPick::lead`, from `ClipFx::lead`): a window inside the lead
+  is not seeked (`clip_seek(start, lead)`) and the run's `setpts` start is
+  `start + picture_delay(...)`, added in the graph's order (`+(start+delay)/TB`), so the frames
+  before the source's first picture are `Early` (nothing drawn), as in the export.
   A rate whose canvas and `fps=` parses differ (`29.970029`) is refused in Motion
   (`Unsupported::PickRate`): the pick assumes one grid.
   A blurred-fill delivery (`Fit::Blur`) is refused whenever a layer is on screen, still and motion
