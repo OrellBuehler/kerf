@@ -40,7 +40,9 @@ offset it was grabbed at. A razor cut keeps half a frame
 either side (`splitPoint`; a clip with no interior frame says so), the context menu's
 split quantizes the playhead (and shows no key: `C` is the Razor *tool*, and nothing splits at
 the playhead from the keyboard yet), and Escape / pointercancel / blur abandon a clip, edge or
-title drag.
+title drag. The click that still follows an abandoned press when the button comes up lands on the lane
+once the pointer has left the clip, so it is swallowed as a marquee's is (`resetDragState`, and the
+roll / slip / slide tools' abandon): it would otherwise seek or clear the selection.
 **Ripple, the selection set, group moves and zoom** are the timeline's editing layer, each
 a pure bun-tested module under the component. *Ripple*: `editor.rippleMode` mirrors the
 project flag — read in `load()` (so launch, New and Open) and again on the
@@ -115,7 +117,44 @@ bars came and went forever. The ceiling comes down for a very long cut so the la
 scales to any px/s (bottoming out at the engine's 2 ms
 bucket, 4 px at the ceiling) and frame snapping works in seconds. `ruler.ts` makes the
 label step follow the zoom and renders only the ticks in the visible window (hundreds,
-not an hour's worth). **The ruler is timecode.** Its steps are timecode steps (`rulerGrid(px/s, fps)`:
+not an hour's worth).
+
+**Long lanes are virtualised** (`timeline-cull.ts`, bun-tested; `LaneBlocks.svelte`). A lane of 48 clips or
+more draws only the clips whose box (at least 6 px) meets the quantized, overscanned window the waveforms
+already draw from (`visibleLaneRange`, so a scroll tick inside a quantum changes nothing). **Whether a clip is
+a block is its width**: one narrower than 12 px of footage (nothing to read on it) is a block on **one canvas
+per lane**, the visible window wide (clamped to the lane, so it never adds scroll range); a wider one is a
+button however many are in view, so a readable clip is never flattened by its neighbours. The canvas draws
+what the button would show (`blockMark`): the track's colours resolved from the theme, the selection ring
+(`--kerf-400`), a staged proposal's add / shift (`--diff-add` / `--diff-shift`), what it touches
+(`--agent-400`), a hovered clip's partners (`--kerf-300`) as the block's edge, faded while disabled or moved by
+a gesture, grey when off, and the lane's own filter (a locked lane's desaturation, a silent track's grey).
+**Only what the pointer or the keyboard holds is a button wherever it is** (`pinnedClips`): the pressed clip
+(a drag's or a trim's, both sides of a rolled cut), the focused and the nudged one. What a
+gesture only moves — a dragged selection, the clips a ripple trim shifts — is drawn from the model (the
+ghosts, and of those only the ones in view: `ghostsInView`), so a select-all or a ripple trim over a long cut
+mounts nothing more (`?long=1000`: Ctrl+A 9.7 s → 0.26 s, with `selectionUnits` made one pass — it was O(n²)
+in the Inspector; a 20-step ripple trim 3.8 s → 2.1–2.5 s, 59 ghosts drawn instead of 1000). The canvas
+promotes the block under the pointer to a button on pointer move (not while a button is down or a gesture
+runs: `mayPromote`). **Hover is not an input of the drawing**: the promoted button is inserted beside it,
+at its place in lane order (`laneButtons`) — where the drawing puts it once a press pins it, because a
+keyed `{#each}` that moves a node (`.before()`) drops the pointer capture the press just took, and a
+roll or slide on a promoted block then never got a move — so a hover change leaves every lane's `blocks` array, and its canvas, as it was; and
+`hoverPartners` is one shared empty set for every clip without partners, so the draw effect, which reads
+it for the `lit` mark, runs again only when partners light (`?long=3000` at fit: 121 → 17 ms a hover change),
+and the promoted clip clears the hover when the pointer leaves it — the canvas does only when the pointer
+leaves for something that is not a clip, or the two would swap for ever; a narrow clip's button has no
+padding (`clipPadding`), so it is the block's 6 px and not 16. A press or right-click on a block without a
+hover first (a pen, a touch) goes to the lane's own clip handlers with the block's clip; a press where no
+block is (a gap, past the end of the cut) is the lane's (`pressOnEmpty`): a marquee or a seek. A shorter lane
+is drawn whole, as before. The browser harness seeds a long cut with `?long=N` (N one-second pieces on V1 and
+A1). Measured there (headless Chromium, 1600x1000): 3000 clips a lane went from 104 s to the first frame to
+6 s, and a zoom step from 3 s to 0.6 s; 400 from 10 s to 4–7 s. **Caveats**: blocks are not in the tab order
+(a clip reached by keyboard has to be in view first, and focus moving to a clip outside the window finds no
+button); the hover outline, focus ring and tooltip of a block appear only once it is promoted; a block's
+proposal mark is its edge colour, not the dashed or dotted frame.
+
+**The ruler is timecode.** Its steps are timecode steps (`rulerGrid(px/s, fps)`:
 a second is `nominal` frames, 30 at 29.97, and a step under a second is 1 / 2 / 5 / 10 / half-second
 frames), so a label is the project's `HH:MM:SS` (a whole-second step) or `HH:MM:SS:FF` (below it) of
 a tick that stands on that frame, at any rate. Ruler rows: what the analysis found hangs from the

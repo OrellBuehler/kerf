@@ -1561,8 +1561,14 @@ pub struct Mask {
     pub inverted: bool,
 }
 
+/// The feather a new mask gets.
+pub const DEFAULT_MASK_FEATHER: f64 = 0.15;
+/// The smallest and largest a mask's side may be, as a fraction of the frame.
+pub const MIN_MASK_SIZE: f64 = 0.01;
+pub const MAX_MASK_SIZE: f64 = 2.0;
+
 fn default_feather() -> f64 {
-    0.15
+    DEFAULT_MASK_FEATHER
 }
 
 impl Default for Mask {
@@ -1588,8 +1594,8 @@ impl Mask {
             shape: self.shape,
             x: clamp01(self.x),
             y: clamp01(self.y),
-            width: finite_or(self.width, 0.5).clamp(0.01, 2.0),
-            height: finite_or(self.height, 0.5).clamp(0.01, 2.0),
+            width: finite_or(self.width, 0.5).clamp(MIN_MASK_SIZE, MAX_MASK_SIZE),
+            height: finite_or(self.height, 0.5).clamp(MIN_MASK_SIZE, MAX_MASK_SIZE),
             feather: clamp01(self.feather),
             inverted: self.inverted,
         }

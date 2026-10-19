@@ -423,6 +423,14 @@ pub struct Animated {
     /// colour like a static one; an export frame is refused until the compositor says it draws
     /// one (`GpuCaps::keyed_color`).
     pub color: bool,
+    /// Some number of the mask is keyed: the export's mask `geq` reads it per frame. A still plan
+    /// draws the mask sampled at its instant ([`Clip::mask_at`]) as a static one; an export frame
+    /// is refused (no compositor pass draws a moving mask yet).
+    pub mask: bool,
+    /// The crop is keyed ([`Clip::crop_animated`]): the export and the FFmpeg still read the
+    /// picture through its window with a `perspective` (bilinear, fixed-point), which no
+    /// compositor pass draws, so every frame of it is refused.
+    pub crop: bool,
 }
 
 /// What a clip's transitions and fades do to one layer at this frame, **per layer
@@ -1120,6 +1128,12 @@ impl RenderPlan {
             }
             if self.mode == PlanMode::Motion && layer.animated.is_some_and(|a| a.color) && !caps.keyed_color {
                 out.push(Unsupported::KeyedColor(at()));
+            }
+            if self.mode == PlanMode::Motion && layer.animated.is_some_and(|a| a.mask) {
+                out.push(Unsupported::KeyedMask(at()));
+            }
+            if layer.animated.is_some_and(|a| a.crop) {
+                out.push(Unsupported::KeyedCrop(at()));
             }
             if layer.animated.is_some_and(|a| a.zooms) {
                 if caps.keyed_zoom {

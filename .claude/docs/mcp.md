@@ -117,7 +117,9 @@ lock is taken; the clip comes back. The nested curves / wheels are MCP-only mirr
 `deny_unknown_fields`, so `mastre` is refused; the persisted model stays lenient.
 **Per-property animation over MCP**: `set_property_keyframes` (`clip_id`, `prop`, `keys:
 [{time, value, easing?}]`; `[]` makes the number static again; the clip comes back) animates one number —
-a transform number, a colour number or the clip's volume — independently of the rest,
+a transform number, a colour number, the clip's volume, a number of its mask (`mask_x` ... `mask_feather`; refused on a
+clip with no mask, and `set_mask` with no shape clears them) or the animated crop (`crop_zoom`, `crop_x`, `crop_y`) —
+independently of the rest,
 `set_property_tracks` (`clip_id`, `tracks: [{prop, keys}]`) re-keys several numbers in one edit (the dope
 sheet's gestures; a number twice or none at all is refused; each track is `PropertyTrackArg` with `keys` required and
 `deny_unknown_fields`, since the model's `PropertyTrack` reads a misspelt `keys` as none and would make the number static), `copy_keyframes` (`from_clip_id`, `to_clip_id`,
@@ -257,7 +259,9 @@ sanitiser, poster); `controls` are `TemplateControlArg`s (`deny_unknown_fields`,
 stage like any agent edit (`set_template_values` reads the title it splices from `working_timeline()` and the core refuses a
 title that changed in between: "try again"). Both answer `SvgOverlayOutcome` — the title as an `SvgOverlaySummary`, whose new
 `template` (`template_id`, `name`, `controls` without their targets, `values`) is how an agent learns the control ids to set,
-and `warnings`; `timeline_summary` lists it the same way. `values` are strings by control id (partial; an unknown id is
+and `warnings`; `timeline_summary` lists it the same way. (A template title's `svg` holds its text as glyph outlines, a
+`<g data-kerf-text="">` with the text still inside it; `get_timeline_state` shows it in its text form (`svg::restore_text`,
+before the 4 KiB elision, its description says so), and an agent sets the text through `set_template_values`.) `values` are strings by control id (partial; an unknown id is
 `invalid_params`); an `image` control takes a picture **file** through `image_files` (control id → absolute path, at most 8,
 `require_local_input_path` then `crate::template_image_data_url`: the file is opened, looked at through the handle and read at most
 one byte past `template::MAX_IMAGE_BYTES` — 94 KiB, what fits in a title, the limit the engine judges by — and then

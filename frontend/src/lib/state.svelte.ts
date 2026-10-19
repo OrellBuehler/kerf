@@ -349,8 +349,11 @@ class EditorState {
 		return out.sort((a, b) => a.timeline_start - b.timeline_start);
 	}
 
+	/** The selection as a set: the timeline asks of every clip it draws. */
+	selectedSet = $derived(new Set(this.selectedClipIds));
+
 	isSelected(clipId: string): boolean {
-		return this.selectedClipIds.includes(clipId);
+		return this.selectedSet.has(clipId);
 	}
 
 	#selection() {

@@ -890,6 +890,34 @@ so the feature is **only** activated through these forwards — which is what ma
   under a moving zoom, beside a static grade and in a range export
   (`engine/cli/keyed_channels.rs`, `#[ignore]`d; without `eval=frame` it fails at the second frame). A test
   picture's luma must sit away from 128 or a `contrast` ramp does nothing visible (it pivots there).
+  **A keyed mask** is the mask's own alpha `geq` (`keyed_mask_alpha`): the same distance and feather ramp as
+  `mask_keep_expr`, but each keyed number's curve (over `geq`'s `T`) is evaluated **once a row** — at `X` 0 it is
+  stored with `st(slot,…)` (slots 0–4 in `Property::MASK` order, a keyed opacity beside it in 5) and every other
+  pixel reads `ld(slot)`; a slice thread has its own expression copy and walks its rows from `X` 0. A keyed
+  feather is guarded `if(lte(F,0.000001),lte(d,1),clip((1-d)/F,0,1))` so a feather keyed to nothing is the
+  static hard edge; a static mask's argv is untouched. **A keyed crop** is `perspective` (`crop_remap_filter`,
+  `crop_corners`; `sense=source`, `interpolation=linear`, `eval=frame`) reading the picture through the window of
+  `Clip::crop_window_at`: `S = 1/zoom`, top-left corner `((1+pan)*W/2-0.5)*(1-S)`, bottom-right
+  `W-((1-pan)*W/2+0.5)*(1-S)` (pixel centres; each corner holds one copy of each curve). It is placed after the
+  static `crop` and `setpts`, before the fit `scale` (source resolution, the picture keeps its size).
+  `perspective` has no clock, only its frame count `in` (from 1), so the `fps` ahead of it is hoisted there
+  **with `start_time` pinned** to the chain's first timeline time (`keyed_crop_fps`): `fps` rounds it (whole
+  microseconds) to its own ticks half away from zero (`frame_pick::rescale_near`), so frame `in` is output frame
+  `k0 + in - 1` at time `(k0 + in - 1) * den / num`. The FFmpeg still runs the same `crop_corners` text with the
+  numbers of that moment. A crop whose zoom never leaves 1 is not animated (`crop_animated`) and writes nothing.
+  **Cost, measured on FFmpeg 6.1** (12 frames of 4K `testsrc2` scaled to 1080p for the crop, 1080p for the mask,
+  three eased keys per number): a keyed crop as a per-pixel `geq` took 241.6 s, as `perspective` 1.9 s (a fixed
+  lookup table per frame); a keyed mask with its curves per pixel 43.2 s, once a row 7.7 s, against 6.45 s for
+  the static mask. The graph grows with the keys: each curve is a balanced `if` tree, written 8 times (once per
+  corner coordinate) for the crop's zoom and 4 times for each pan — about 2.2 MB of graph (spilled to a file
+  like any long graph) with 100 eased keys on all three.
+  **Parity, measured on FFmpeg 6.1** (`engine/cli/keyed_mask_crop.rs`, `#[ignore]`d; 4.4 and 9.0 were not
+  available where it was written): a keyed mask's every fifth output frame is within 4 levels (mean ≤ 0.4) of the
+  still of the same moment, which draws `mask_at` through the static `geq` (centre, size, feather to a hard edge
+  and back, an inverted ellipse, beside a keyed opacity, speed 2, reversed, late, a range export); a keyed crop
+  puts a box within 1 px of where the window of that moment says on **every** output frame, and on detailed
+  content (`testsrc2`) every fifth frame is ≥ 50 dB PSNR and within 8 levels of the still (zoom, pan at a held
+  zoom, on top of a static crop, speed 2, reversed, late and off the frame grid, a range export).
   **A keyed volume** is `asetnsamples=n=128:p=0,volume='…':eval=frame` placed *after* `atempo`, so its `t`
   is the clip's own playing time (checked at speed 0.5 / 2, reversed, late on the timeline, range
   export). `volume` holds one gain for a whole frame and decoders hand over 1024 samples (21 ms) — a fade
@@ -950,7 +978,10 @@ so the feature is **only** activated through these forwards — which is what ma
   sans-serif and for the family nothing has, so text never vanishes; an embedded face is loaded first so it beats an installed one of
   the same family — a template's typeface wins on the machine that also has another build of it; `fonts::replace_embedded` /
   `register_embedded` change the registered set, a `FontSet` is immutable and builds its database once, on first use, outside the
-  registry's lock (the one built for the process when no embedded font is named); an `<image>` `href` that is not `data:` is
+  registry's lock (the one built for the process when no embedded font is named); a template title's text is already glyph
+  paths (`svg/outline.rs`, `core-project.md` "Text as glyph outlines"), so it draws the same whatever is installed — its source
+  still names its families, so its `FontSet` and key are what they were, and nothing in the raster path or the graph changed
+  (`RASTER_VERSION` and the golden stand); an `<image>` `href` that is not `data:` is
   nothing (no file read, no network), `resources_dir` is `None`, and a `data:` image is decoded only after its **header** says it
   is within 16 Mpx (`svg/images.rs`: `imagesize`, the crate usvg sizes with; the decoders allocate what the header claims, so
   60,000 x 60,000 bytes-of-header aborted the process) — the resolver answers "nothing" for one that is not, whatever the

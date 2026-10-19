@@ -1325,7 +1325,10 @@ struct PropertyKeyframesParams {
     clip_id: String,
     #[schemars(
         description = "The number to animate: scale, pos_x, pos_y, rotation, opacity (the transform), brightness, \
-                       contrast, saturation, gamma, temperature (the colour grade) or volume (the clip's own gain)"
+                       contrast, saturation, gamma, temperature (the colour grade), volume (the clip's own gain), \
+                       mask_x, mask_y, mask_width, mask_height, mask_feather (the clip's mask — it must have one, \
+                       set_mask) or crop_zoom, crop_x, crop_y (the animated crop: a zoom into the picture and where \
+                       its window sits)"
     )]
     prop: Property,
     #[schemars(
@@ -1333,7 +1336,10 @@ struct PropertyKeyframesParams {
                        {\"time\":seconds_from_clip_start, \"value\":number, \"easing\":optional, same values as \
                        set_keyframe_easing}. A key's easing shapes the segment that leaves it. Ranges are the static \
                        setters': opacity 0–1, brightness and temperature -1–1, contrast 0–4, saturation 0–3, gamma \
-                       0.1–10, volume 0–4 (linear gain), scale > 0. At most 1000 keys."
+                       0.1–10, volume 0–4 (linear gain), scale > 0, mask_x / mask_y / mask_feather 0–1, mask_width / \
+                       mask_height 0.01–2 (fractions of the frame), crop_zoom 1–10 (1 = the whole picture, 2 = half \
+                       of each side), crop_x / crop_y -1–1 (-1 = the window against the left / top edge, 0 = centred, \
+                       1 = right / bottom). At most 1000 keys."
     )]
     keys: Vec<PropertyKey>,
 }
@@ -1376,8 +1382,8 @@ struct CopyKeyframesParams {
     #[schemars(description = "UUID of the clip to give it to (its own keys for the copied numbers are replaced)")]
     to_clip_id: String,
     #[schemars(
-        description = "The numbers to copy (scale, pos_x, pos_y, rotation, opacity, brightness, contrast, saturation, \
-                       gamma, temperature, volume); omit or [] for every number the source animates"
+        description = "The numbers to copy (any set_property_keyframes takes: scale, pos_x, ..., volume, mask_x, ..., \
+                       crop_zoom, crop_x, crop_y); omit or [] for every number the source animates"
     )]
     props: Option<Vec<Property>>,
     #[schemars(
@@ -2353,25 +2359,39 @@ fn svg_preview(
     Ok((png, svg_sheet_caption(&title.label, &times, title.offset, warnings)))
 }
 
+/// `f` on the source of every animated title of `timeline`: the floating ones and the title clips.
+fn each_title_svg(timeline: &mut Timeline, mut f: impl FnMut(&mut String)) {
+    for o in &mut timeline.svg_overlays {
+        f(&mut o.svg);
+    }
+    for clip in timeline.tracks.iter_mut().flat_map(|t| t.clips.iter_mut()) {
+        if let Some(title) = clip.title_clip_mut() {
+            f(&mut title.svg);
+        }
+    }
+}
+
+/// A template title's text is stored as glyph outlines, which are the engine's business: an agent
+/// reads the text form (`svg::restore_text`), the `<text>` it can see and set through the controls.
+fn restore_title_text(timeline: &mut Timeline) {
+    each_title_svg(timeline, |svg| {
+        if let Ok(text) = kerf_core::svg::restore_text(svg) {
+            *svg = text;
+        }
+    });
+}
+
 /// Leave the sources of large SVG titles out of a timeline read: a title can carry 128 KiB and a
 /// timeline 50 of them. The note says how to get the source.
 fn elide_large_svg(timeline: &mut Timeline) {
-    let elide = |svg: &mut String| {
+    each_title_svg(timeline, |svg| {
         if svg.len() > SVG_INLINE_LIMIT {
             *svg = format!(
                 "[{} bytes of SVG left out; call get_timeline_state with full_svg=true to read it]",
                 svg.len()
             );
         }
-    };
-    for o in &mut timeline.svg_overlays {
-        elide(&mut o.svg);
-    }
-    for clip in timeline.tracks.iter_mut().flat_map(|t| t.clips.iter_mut()) {
-        if let Some(title) = clip.title_clip_mut() {
-            elide(&mut title.svg);
-        }
-    }
+    });
 }
 
 #[derive(Serialize)]
@@ -2564,10 +2584,12 @@ impl KerfMcp {
                        captions_offset / captions_limit, or pass `full: true` for everything inline. Animated SVG titles \
                        (`svg_overlays`) carry their SVG source here, but a source over 4 KiB is replaced by a note with \
                        its size (a title can be 128 KiB): pass `full_svg: true` (or `full`) to get every source whole. \
-                       timeline_summary is much smaller (durations, gaps, proxies); preview_svg_overlay shows how a title looks."
+                       A template title's source is shown with its text as `<text>` (it is drawn as glyph outlines, \
+                       which are left out); set its text with set_template_values. timeline_summary is much smaller (durations, gaps, proxies); preview_svg_overlay shows how a title looks."
     )]
     fn get_timeline_state(&self, Parameters(p): Parameters<TimelineStateParams>) -> Result<String, McpError> {
         let mut timeline = self.lock().working_timeline().map_err(core_err)?;
+        restore_title_text(&mut timeline);
         let full = p.full.unwrap_or(false);
         if !(full || p.full_svg.unwrap_or(false)) {
             elide_large_svg(&mut timeline);
@@ -3061,7 +3083,10 @@ impl KerfMcp {
                        with set_video_effects, then mask the copy to an ellipse over the face; to grade \
                        one region, do the same with set_color. Check the result with preview_timeline: \
                        positions are fractions of the frame, so you have to look to know you covered \
-                       the right thing.")]
+                       the right thing. To make it follow something, key its numbers with \
+                       set_property_keyframes (mask_x, mask_y, mask_width, mask_height, mask_feather): a \
+                       keyed number is read from its keys, not from this static value, and clearing the \
+                       mask clears its keys.")]
     fn set_mask(&self, Parameters(p): Parameters<SetMaskParams>) -> Result<String, McpError> {
         let clip_id = parse_arg("clip_id", &p.clip_id)?;
         self.edit(|project| {
@@ -3652,9 +3677,11 @@ impl KerfMcp {
 
     #[tool(
         description = "Animate ONE number of a clip with keys of its own: a transform number (scale, pos_x, pos_y, \
-                       rotation, opacity), a colour number (brightness, contrast, saturation, gamma, temperature) or \
-                       the clip's volume (a linear gain — a swell, a duck, an audio fade that is not at the clip's ends). \
-                       Numbers are independent: key the opacity at other moments than the zoom, grade a shot that \
+                       rotation, opacity), a colour number (brightness, contrast, saturation, gamma, temperature), \
+                       the clip's volume (a linear gain — a swell, a duck, an audio fade that is not at the clip's ends), \
+                       a number of its mask (a mask that follows a face, grows or softens; the clip needs a mask first) \
+                       or the animated crop (crop_zoom / crop_x / crop_y: a punch-in or a pan across the shot that \
+                       stays inside the picture; on top of any static crop edges). Numbers are independent: key the opacity at other moments than the zoom, grade a shot that \
                        warms over its length, ride the dialogue's level. Replaces that number's keys (pass [] to make \
                        it static); the clip's other numbers are untouched, and a number that set_keyframes was \
                        animating is taken over by its own keys while the rest of the transform keeps them. Each key: \
@@ -6446,7 +6473,8 @@ const INSTRUCTIONS: &str = "Kerf MCP server. The user queues editing tasks in th
              makes motion read as deliberate rather than mechanical. Any one number \
              can have keys of its own with set_property_keyframes — a colour that warms \
              over a shot, an opacity ramp that starts later than the zoom, the clip's \
-             volume swelling or ducking mid-clip — and copy_keyframes gives another \
+             volume swelling or ducking mid-clip, a mask that moves, a crop that pushes \
+             in or pans (crop_zoom / crop_x / crop_y) — and copy_keyframes gives another \
              clip the same animation. 360 footage (Insta360 \
              .insv, equirect exports) is detected on import and clips cut from it \
              are reframed to an ordinary rectilinear shot automatically: aim the \

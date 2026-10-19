@@ -72,6 +72,18 @@ const MIGRATIONS: &[Migration] = &[
         destructive: false,
         needed_to_read: false,
     },
+    Migration {
+        run: v6_to_v7,
+        needed: v6_to_v7_needed,
+        destructive: false,
+        needed_to_read: false,
+    },
+    Migration {
+        run: v7_to_v8,
+        needed: v7_to_v8_needed,
+        destructive: false,
+        needed_to_read: false,
+    },
 ];
 
 /// The schema this build writes and the newest it opens.
@@ -174,6 +186,32 @@ fn v5_to_v6(_: &Connection) -> rusqlite::Result<()> {
 }
 
 fn v5_to_v6_needed(_: &Connection) -> bool {
+    true
+}
+
+/// v7: a clip's mask and crop numbers may be keyed (`Property` `mask_x`, `mask_y`, `mask_width`,
+/// `mask_height`, `mask_feather`, `crop_zoom`, `crop_x`, `crop_y` in the timeline JSON's channels),
+/// variants an older build fails to read, the whole timeline with them. Nothing in the file's tables
+/// changes; the step is the version that keeps an older build out, after the file is copied aside.
+fn v6_to_v7(_: &Connection) -> rusqlite::Result<()> {
+    Ok(())
+}
+
+fn v6_to_v7_needed(_: &Connection) -> bool {
+    true
+}
+
+/// v8: a template title's `svg` (an overlay's, or a title clip's) may hold its text as glyph outlines,
+/// a `<g data-kerf-text="">` around the hidden text and its paths (`svg/outline.rs`). The JSON's shape
+/// is the same, its meaning is not: an older build draws such a title but splices new values into the
+/// hidden text (its set_template_values says it worked and nothing visible changes), and saves the
+/// outlined form as a template. Nothing in the file's tables changes; the step is the version that keeps
+/// an older build out, after the file is copied aside.
+fn v7_to_v8(_: &Connection) -> rusqlite::Result<()> {
+    Ok(())
+}
+
+fn v7_to_v8_needed(_: &Connection) -> bool {
     true
 }
 
