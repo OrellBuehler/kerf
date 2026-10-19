@@ -649,6 +649,20 @@ fn plan_at_grid(planner: &Planner, t: f64) -> kerf_core::Result<RenderPlan> {
     planner.at_frame(planner.canvas().fps.frame_containing(t))
 }
 
+/// How a still plan's layers are decoded: a drag that walks forward (`forward`, `pace::Trend`) reads
+/// ahead like playback, unless a layer plays its footage backward. Its frames go the other way through
+/// the file, so a run that reads ahead would restart at every frame and the frame source's thrash guard
+/// would refuse it (`Busy`): that drag is decoded as a scrub, as it was before reading ahead.
+fn decode_hint(plan: &RenderPlan, forward: bool) -> Hint {
+    if forward && !plan.layers.iter().any(|l| l.timing.reversed && !l.is_image) {
+        Hint::Forward {
+            fps: f64::from(plan.canvas.fps.num) / f64::from(plan.canvas.fps.den.max(1)),
+        }
+    } else {
+        Hint::Scrub
+    }
+}
+
 /// Clears a flag when dropped, a panic included.
 struct ClearOnDrop(Arc<AtomicBool>);
 
@@ -1418,7 +1432,7 @@ impl GpuPreview {
         }
         let cut = match &request.draft {
             None => Cut::Held,
-            Some(draft) => match draft.apply(&inputs.timeline) {
+            Some(draft) => match draft.apply(&inputs.timeline, &inputs.assets) {
                 Ok(timeline) => match inputs.proxy_wait_in(&timeline, request.t)? {
                     Some(wait) => Cut::Refused(wait),
                     None => Cut::Drafted(timeline),
@@ -1785,16 +1799,17 @@ impl GpuPreview {
         if let Some(stall) = lock(&self.before_decode).clone() {
             stall();
         }
-        let hint = if want.forward {
-            Hint::Forward {
-                fps: f64::from(plan.canvas.fps.num) / f64::from(plan.canvas.fps.den.max(1)),
-            }
+        let hint = decode_hint(&plan, want.forward);
+        // A drag's frame keeps the poses of its titles apart from the cut's.
+        let rendered = if drafted {
+            drawing
+                .compositor
+                .render_draft_texture_with(&plan, size, &drawing.source, hint)
         } else {
-            Hint::Scrub
+            drawing
+                .compositor
+                .render_plan_texture_with(&plan, size, &drawing.source, hint)
         };
-        let rendered = drawing
-            .compositor
-            .render_plan_texture_with(&plan, size, &drawing.source, hint);
 
         match self.conclude(
             &drawing,
@@ -2334,6 +2349,47 @@ mod tests {
             plan_at_grid(&planner, -1.0).unwrap().frame,
             0,
             "before the start is its first frame"
+        );
+    }
+
+    #[test]
+    fn a_forward_drag_reads_ahead_unless_a_layer_plays_backward() {
+        let asset: kerf_core::Asset = serde_json::from_value(serde_json::json!({
+            "id": uuid::Uuid::new_v4(), "path": "/x.mp4", "name": "x.mp4", "duration": 100.0,
+            "streams": [{
+                "index": 0, "kind": StreamKind::Video, "codec": "h264",
+                "width": 1920, "height": 1080, "fps": 30.0
+            }],
+            "imported_at": "2026-01-01T00:00:00Z", "source_paths": [], "voiceover": null, "music_score": null
+        }))
+        .expect("an asset");
+        let hint_at = |speed: f64| {
+            let mut tl = cut(vec![(StreamKind::Video, "V1", vec![0.0])]);
+            let clip = &mut tl.tracks[0].clips[0];
+            clip.asset_id = asset.id;
+            clip.source_out = 10.0;
+            clip.speed = speed;
+            let planner = Planner::new(
+                &tl,
+                std::slice::from_ref(&asset),
+                &ExportOptions::default(),
+                PlanRequest::still(CompositeColorPolicy::FixedBt601),
+            )
+            .unwrap();
+            let plan = plan_at_grid(&planner, 1.0).unwrap();
+            assert_eq!(plan.layers.len(), 1);
+            (decode_hint(&plan, true), decode_hint(&plan, false))
+        };
+        let (forward, still) = hint_at(1.0);
+        assert!(
+            matches!(forward, Hint::Forward { fps } if (fps - 30.0).abs() < 1e-9),
+            "{forward:?}"
+        );
+        assert_eq!(still, Hint::Scrub, "a drag that does not walk forward is a scrub");
+        assert_eq!(
+            hint_at(-1.0),
+            (Hint::Scrub, Hint::Scrub),
+            "a reversed clip under the playhead is scrubbed, walking forward or not"
         );
     }
 
