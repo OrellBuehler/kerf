@@ -3,9 +3,10 @@
 
 use std::collections::HashSet;
 
+use serde_json::{Map, Value};
 use uuid::Uuid;
 
-use super::model::{TemplateControl, TemplateKind, TemplateManifest, FORMAT, VERSION};
+use super::model::{TemplateControl, TemplateKind, TemplateManifest, Upgrade, FORMAT, VERSION};
 use super::{MAX_CONTROLS, MAX_FONTS, MAX_TARGETS};
 use crate::error::{Error, Result};
 use crate::model::MAX_SVG_SECONDS;
@@ -99,15 +100,63 @@ pub(super) fn validate_manifest(m: &TemplateManifest) -> Result<()> {
     Ok(())
 }
 
-/// A manifest `version` this build can read.
+/// The manifest `version` this build writes: what a manifest in memory must say.
 pub(super) fn check_version(version: u32) -> Result<()> {
     match version.cmp(&VERSION) {
         std::cmp::Ordering::Equal => Ok(()),
-        std::cmp::Ordering::Greater => Err(invalid(format!(
-            "this template is format version {version}, made by a newer Kerf (this one reads version {VERSION}) — update Kerf to use it"
-        ))),
-        std::cmp::Ordering::Less => Err(invalid(format!("template format version {version} is not supported"))),
+        std::cmp::Ordering::Greater => Err(newer(version, VERSION)),
+        std::cmp::Ordering::Less => Err(unsupported(version)),
     }
+}
+
+fn newer(version: u32, latest: u32) -> Error {
+    invalid(format!(
+        "this template is format version {version}, made by a newer Kerf (this one reads up to version {latest}) — update Kerf to use it"
+    ))
+}
+
+fn unsupported(version: u32) -> Error {
+    invalid(format!("template format version {version} is not supported"))
+}
+
+/// Bring `manifest`, the JSON of a file at `version`, up to the newest version `steps` reach (a build
+/// passes [`super::model::UPGRADES`]), refusing a newer one by name.
+pub(super) fn upgrade_manifest(manifest: &mut Map<String, Value>, version: u32, steps: &[Upgrade]) -> Result<()> {
+    let latest = 1 + steps.len() as u32;
+    if version > latest {
+        return Err(newer(version, latest));
+    }
+    let Some(from) = version.checked_sub(1) else {
+        return Err(unsupported(version));
+    };
+    for step in &steps[from as usize..] {
+        step(manifest)?;
+    }
+    manifest.insert("version".into(), latest.into());
+    Ok(())
+}
+
+/// The first field of `read` (a manifest as its file has it) that `parsed` (the same, read and written
+/// back) lacks: one this build does not know and would drop. A `null` counts as no field.
+pub(super) fn unknown_field(read: &Value, parsed: &Value) -> Option<String> {
+    fn walk(read: &Value, parsed: &Value, at: &str) -> Option<String> {
+        match (read, parsed) {
+            (Value::Object(read), Value::Object(parsed)) => read.iter().filter(|(_, v)| !v.is_null()).find_map(|(k, v)| {
+                let path = if at.is_empty() { k.clone() } else { format!("{at}.{k}") };
+                match parsed.get(k) {
+                    Some(p) => walk(v, p, &path),
+                    None => Some(path),
+                }
+            }),
+            (Value::Array(read), Value::Array(parsed)) => read
+                .iter()
+                .zip(parsed)
+                .enumerate()
+                .find_map(|(i, (r, p))| walk(r, p, &format!("{at}[{i}]"))),
+            _ => None,
+        }
+    }
+    walk(read, parsed, "")
 }
 
 /// The template id as a file name: a UUID in its canonical (lower-case, hyphenated) spelling.
@@ -304,6 +353,64 @@ pub fn validate_controls(controls: &[TemplateControl], svg: &str) -> Result<()> 
 mod tests {
     use super::*;
     use crate::template::model::TemplateTarget;
+
+    fn rename_name_to_title(m: &mut Map<String, Value>) -> Result<()> {
+        let name = m.remove("name").ok_or_else(|| invalid("no name"))?;
+        m.insert("title".into(), name);
+        Ok(())
+    }
+
+    fn add_tags(m: &mut Map<String, Value>) -> Result<()> {
+        m.insert("tags".into(), Value::Array(Vec::new()));
+        Ok(())
+    }
+
+    #[test]
+    fn an_older_manifest_is_upgraded_a_step_at_a_time_and_a_newer_one_refused() {
+        let steps: &[Upgrade] = &[rename_name_to_title, add_tags];
+        let v1 = || serde_json::json!({"format": FORMAT, "version": 1, "name": "Card"});
+        let mut m = v1().as_object().unwrap().clone();
+        upgrade_manifest(&mut m, 1, steps).unwrap();
+        assert_eq!(
+            Value::Object(m),
+            serde_json::json!({"format": FORMAT, "version": 3, "title": "Card", "tags": []})
+        );
+        let mut m = serde_json::json!({"version": 2, "title": "Card"})
+            .as_object()
+            .unwrap()
+            .clone();
+        upgrade_manifest(&mut m, 2, steps).unwrap();
+        assert_eq!(
+            Value::Object(m),
+            serde_json::json!({"version": 3, "title": "Card", "tags": []})
+        );
+
+        let mut m = v1().as_object().unwrap().clone();
+        let message = upgrade_manifest(&mut m, 4, steps).unwrap_err().to_string();
+        assert!(
+            message.contains("version 4") && message.contains("up to version 3"),
+            "{message}"
+        );
+        assert!(upgrade_manifest(&mut m, 0, steps)
+            .unwrap_err()
+            .to_string()
+            .contains("not supported"));
+        assert_eq!(Value::Object(m), v1(), "a refused manifest is left as it was");
+
+        let mut m = v1().as_object().unwrap().clone();
+        upgrade_manifest(&mut m, 1, &[]).unwrap();
+        assert_eq!(Value::Object(m), v1(), "this build's version runs no step");
+    }
+
+    #[test]
+    fn an_unknown_field_is_named_by_its_path() {
+        let parsed = serde_json::json!({"a": 1, "list": [{"b": 2}, {"b": 3}]});
+        assert_eq!(unknown_field(&parsed, &parsed), None);
+        let read = serde_json::json!({"a": 1, "z": null, "list": [{"b": 2}, {"b": 3, "c": 4}]});
+        assert_eq!(unknown_field(&read, &parsed).as_deref(), Some("list[1].c"));
+        let read = serde_json::json!({"a": 1, "new": {}, "list": []});
+        assert_eq!(unknown_field(&read, &parsed).as_deref(), Some("new"));
+    }
 
     fn control(id: &str, kind: TemplateKind, element: &str, attribute: Option<&str>) -> TemplateControl {
         TemplateControl {

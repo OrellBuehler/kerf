@@ -492,3 +492,70 @@ fn the_history_limit_never_drops_the_head() {
     assert_eq!(seqs(&project), vec![1]);
     assert!(project.history().unwrap()[0].current);
 }
+
+/// The timelines a file holds, `persisted/timelines-v<N>.json`, frozen at each schema version that moved
+/// the stored shape (the sample's and a few of the golden oracle's). Every one must still read; the newest
+/// must come back as it was stored, so a change to the shape is a decision (a new version, see
+/// `store::MIGRATIONS`) and not a slip. A version that only changes the tables needs no file.
+const PERSISTED: &[(u32, &str)] = &[(3, include_str!("persisted/timelines-v3.json"))];
+
+fn persisted_path(version: u32) -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("src/project/persisted/timelines-v{version}.json"))
+}
+
+#[test]
+fn the_timelines_of_every_schema_version_still_read() {
+    for (version, json) in PERSISTED {
+        serde_json::from_str::<Vec<Timeline>>(json)
+            .unwrap_or_else(|e| panic!("a schema v{version} timeline no longer reads: {e}"));
+    }
+}
+
+/// Bless with `KERF_BLESS_PERSISTED=1`: it writes the current version's file (add it to `PERSISTED`).
+/// Re-blessing a shipped version is only right when an older build reads the new shape as it is.
+#[test]
+fn the_stored_timeline_shape_moves_only_with_the_schema_version() {
+    if std::env::var_os("KERF_BLESS_PERSISTED").is_some() {
+        let mut timelines = vec![Project::sample().unwrap().timeline().unwrap()];
+        timelines.extend(crate::engine::sample_timelines());
+        let lines: Vec<String> = timelines.iter().map(|t| serde_json::to_string(t).unwrap()).collect();
+        std::fs::write(persisted_path(SCHEMA_VERSION), format!("[\n{}\n]\n", lines.join(",\n"))).unwrap();
+        return;
+    }
+    let (_, json) = PERSISTED
+        .iter()
+        .filter(|(v, _)| *v <= SCHEMA_VERSION)
+        .max_by_key(|(v, _)| *v)
+        .expect("a stored shape at or below this schema version");
+    let stored: Vec<serde_json::Value> = serde_json::from_str(json).unwrap();
+    for (i, stored) in stored.into_iter().enumerate() {
+        let timeline: Timeline = serde_json::from_value(stored.clone()).unwrap();
+        let written: serde_json::Value = serde_json::from_str(&timeline_to_json(&timeline).unwrap()).unwrap();
+        assert!(
+            written == stored,
+            "stored timeline {i}: its shape changed without a schema version. If an older Kerf would drop or \
+             misread it, append a step to store::MIGRATIONS; then bless with KERF_BLESS_PERSISTED=1 and add the \
+             new file to PERSISTED"
+        );
+    }
+}
+#[test]
+fn opening_to_write_records_the_build_and_keeps_the_maker() {
+    let dir = scratch();
+    let path = dir.join("cut.kerf");
+    drop(Project::create(&path).unwrap());
+    let conn = Connection::open(&path).unwrap();
+    conn.execute(
+        "UPDATE meta SET value = '0.1.0' WHERE key IN ('kerf_version', 'last_kerf_version')",
+        [],
+    )
+    .unwrap();
+    drop(conn);
+    let project = Project::open(&path).unwrap();
+    assert_eq!(project.meta("kerf_version").unwrap().as_deref(), Some("0.1.0"));
+    assert_eq!(
+        project.meta("last_kerf_version").unwrap().as_deref(),
+        Some(env!("CARGO_PKG_VERSION"))
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
