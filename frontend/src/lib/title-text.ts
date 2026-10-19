@@ -5,7 +5,8 @@
  * `data-kerf-fit="shrink"`) is read off the start tag, which an outlined text keeps. The browser harness cannot set
  * text as outlines: it writes the box and says so. */
 import { findTitle, titleOf } from './title-clips';
-import type { Clip, SvgOverlay, TextBox, TextFit, Timeline, TitleTextForm } from './types';
+import { ANIMATE_MARK, animationJson, checkAnimation, parseAnimation } from './text-animation';
+import type { Clip, SvgOverlay, TextAnimation, TextBox, TextFit, Timeline, TitleTextForm } from './types';
 
 export const TEXT_MARK = 'data-kerf-text';
 export const GLYPHS_MARK = 'data-kerf-glyphs';
@@ -106,12 +107,14 @@ export function textForm(svg: string): string {
 	return out + svg.slice(at);
 }
 
-/** A text of a title that has an `id`: what can be given a box. */
+/** A text of a title that has an `id`: what can be given a box or an animation. */
 export interface TitleText {
 	id: string;
 	/** Drawn as outlines now. */
 	outlined: boolean;
 	box: TextBox;
+	/** The animation on it (`text_animation_of`); `null` for none, or one that does not read. */
+	animation: TextAnimation | null;
 }
 
 /** The box written on a start tag's attributes (`inline-size`, or one in its `style`; the fit mark). */
@@ -193,7 +196,9 @@ export function titleTexts(svg: string): TitleText[] {
 		seen.set(id, (seen.get(id) ?? 0) + 1);
 		const local = m[2].split(':').pop();
 		const outlined = local === 'g' && attrs.has(TEXT_MARK);
-		if (local === 'text' || outlined) out.push({ id, outlined, box: boxOf(attrs) });
+		if (local === 'text' || outlined) {
+			out.push({ id, outlined, box: boxOf(attrs), animation: parseAnimation(attrs.get(ANIMATE_MARK)) });
+		}
 	}
 	return out.filter((t) => seen.get(t.id) === 1);
 }
@@ -254,6 +259,29 @@ export function withTextBox(svg: string, element: string, box: TextBox): string 
 	return svg.slice(0, at) + rebuilt + svg.slice(at + tag[0].length);
 }
 
+/** `svg` with the `<text>` `element` given `animation`, or none (`set_text_animation`): its `data-kerf-animate` attribute
+ *  replaced (or taken away) at the end of its start tag, as single-quoted JSON. A title in its text form; the engine's
+ *  words for what it refuses, replayed from `text-animation-corpus.json`. The harness's. */
+export function withTextAnimation(svg: string, element: string, animation: TextAnimation | null): string {
+	if (animation) {
+		const why = checkAnimation(animation);
+		if (why) throw invalid(why);
+	}
+	if (svg.includes(TEXT_MARK)) throw invalid('set_text_animation takes a title in its text form (restore_text first)');
+	const tags = [...svg.matchAll(TOKEN)].filter((m) => m[2] !== undefined && attributes(m[3]).get('id') === element);
+	if (tags.length === 0) throw invalid(`the title has no element with the id “${element}”`);
+	if (tags.length > 1) throw invalid(`more than one element has the id “${element}”`);
+	const tag = tags[0];
+	if (tag[2].split(':').pop() !== 'text') throw invalid(`“${element}” is a <${tag[2]}>; an animation is given to a <text>`);
+	let raw = tag[3].replace(
+		/\s+([^\s=>/]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g,
+		(whole: string, name: string) => (name === ANIMATE_MARK ? '' : whole)
+	);
+	if (animation) raw += ` ${ANIMATE_MARK}='${escapeAttr(animationJson(animation), "'")}'`;
+	const at = tag.index ?? 0;
+	return svg.slice(0, at) + `<${tag[2]}${raw}${tag[4]}>` + svg.slice(at + tag[0].length);
+}
+
 /** The harness's note: it has no text engine. */
 export const HARNESS_NOTE = 'The browser harness draws text with its fonts: the app sets it as outlines, where a box wraps or shrinks.';
 
@@ -298,6 +326,27 @@ export function setTitleTextBoxIn(
 	if (control) throw invalid(`the template's control “${control.label}” sets the box width of “${element}”: change it there`);
 	return { ...editTitle(timeline, id, (svg) => withTextBox(textForm(svg), element, box)), warnings: [HARNESS_NOTE] };
 }
+
+/** `set_title_text_animation` in the harness: the animation is written on the text; nothing is outlined or played. */
+export function setTitleTextAnimationIn(
+	timeline: Timeline,
+	id: string,
+	element: string,
+	animation: TextAnimation | null
+): { overlay?: SvgOverlay; clip?: Clip; warnings: string[] } {
+	const control = findTitle(timeline, id)?.template?.controls.find((c) =>
+		c.targets.some((t) => t.element === element && t.attribute === ANIMATE_MARK)
+	);
+	if (control) throw invalid(`the template's control “${control.label}” sets the animation of “${element}”: change it there`);
+	return {
+		...editTitle(timeline, id, (svg) => withTextAnimation(textForm(svg), element, animation)),
+		warnings: animation ? [HARNESS_ANIMATION_NOTE] : []
+	};
+}
+
+/** The harness's note for an animation: it writes the attribute and plays nothing. */
+export const HARNESS_ANIMATION_NOTE =
+	'The browser harness cannot compile a text animation: the app sets the text as outlines and plays it per glyph.';
 
 /** `convert_title_text` in the harness: back to text works; outlines it cannot make, and says so. */
 export function convertTitleTextIn(

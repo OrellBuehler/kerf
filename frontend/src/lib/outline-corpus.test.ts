@@ -30,7 +30,22 @@ describe('the outline corpus', () => {
 
 	test('an outlined text keeps its id and its box on its start tag', () => {
 		const boxed = cases.find((c) => c.name === 'a box that shrinks')!;
-		expect(titleTexts(boxed.outlined)).toEqual([{ id: 'n', outlined: true, box: { width: 80, fit: 'shrink' } }]);
-		expect(titleTexts(boxed.text)).toEqual([{ id: 'n', outlined: false, box: { width: 80, fit: 'shrink' } }]);
+		expect(titleTexts(boxed.outlined)).toEqual([
+			{ id: 'n', outlined: true, box: { width: 80, fit: 'shrink' }, animation: null }
+		]);
+		expect(titleTexts(boxed.text)).toEqual([
+			{ id: 'n', outlined: false, box: { width: 80, fit: 'shrink' }, animation: null }
+		]);
+	});
+
+	test('an outlined text keeps its animation, which the compiled glyph animations do not hide', () => {
+		const animated = cases.find((c) => c.name === 'an animation')!;
+		expect(animated.outlined).toContain('<animate');
+		const [outlined] = titleTexts(animated.outlined);
+		const [text] = titleTexts(animated.text);
+		expect(outlined.outlined && !text.outlined).toBe(true);
+		expect(outlined.animation).toEqual(text.animation);
+		expect(outlined.animation?.by).toBe('word');
+		expect(outlined.animation?.properties.blur).toBe(0.25);
 	});
 });

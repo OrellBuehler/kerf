@@ -114,6 +114,8 @@ import type {
 	Task,
 	TemplateControl,
 	TemplateEdit,
+	TextAnimation,
+	TextAnimationPreset,
 	TextBox,
 	TitleTextForm,
 	TemplateList,
@@ -236,7 +238,8 @@ import {
 	templatePosterDev
 } from './template-dev';
 import { checkTitleSpan, isTitleClip, placeTitleClip, titleClip, titleOf } from './title-clips';
-import { convertTitleTextIn, setTitleTextBoxIn } from './title-text';
+import { TEXT_ANIMATION_PRESETS } from './text-animation';
+import { convertTitleTextIn, setTitleTextAnimationIn, setTitleTextBoxIn } from './title-text';
 import { VOICE_IDS, DEFAULT_SPEED, DEFAULT_VOICE, clampSpeed, estimateSeconds, scriptSegments, voiceInfo } from './voiceover';
 
 export type { AudioDetached };
@@ -3521,6 +3524,29 @@ export async function setTitleTextBox(titleId: string, element: string, textBox:
 		return { timeline: snapshot(), overlay_id: overlay?.id, clip_id: clip?.id, warnings };
 	}
 	return invoke<TemplateEdit>('set_title_text_box', { titleId, element, textBox });
+}
+
+/** Give the `<text>` `element` of a title (floating or on a track, not a preset) an animation, or none (`null`): a window
+ *  that slides over its characters, words or lines and what each does as it reaches them. It is compiled to per-glyph
+ *  SMIL when the text is glyph outlines, so the title's text is set as outlines again; a text that cannot be one rejects
+ *  with why, and so does an animation that changes nothing or is out of bounds. One edit. */
+export async function setTitleTextAnimation(
+	titleId: string,
+	element: string,
+	animation: TextAnimation | null
+): Promise<TemplateEdit> {
+	if (!inTauri()) {
+		const { overlay, clip, warnings } = setTitleTextAnimationIn(devTimeline, titleId, element, animation);
+		recordDev('Set text animation');
+		return { timeline: snapshot(), overlay_id: overlay?.id, clip_id: clip?.id, warnings };
+	}
+	return invoke<TemplateEdit>('set_title_text_animation', { titleId, element, animation });
+}
+
+/** The ready-made text animations (`rise`, `typewriter`, ...): each a whole `TextAnimation` to copy onto a text. */
+export async function listTextAnimationPresets(): Promise<TextAnimationPreset[]> {
+	if (!inTauri()) return structuredClone([...TEXT_ANIMATION_PRESETS]);
+	return invoke<TextAnimationPreset[]>('list_text_animation_presets');
 }
 
 /** Draw a title's text as glyph outlines (the same on every machine, and what a box needs) or with its fonts again.
