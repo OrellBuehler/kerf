@@ -7,9 +7,14 @@ use serde::{Deserialize, Serialize};
 
 /// The `format` field of `manifest.json`.
 pub const FORMAT: &str = "kerf-template";
-/// The manifest version this build reads and writes. A file with another version is refused by name
-/// (a newer one says "made by a newer Kerf").
-pub const VERSION: u32 = 1;
+/// One step of the manifest format: rewrites a version `n` manifest, as JSON, into version `n + 1`.
+pub(super) type Upgrade = fn(&mut serde_json::Map<String, serde_json::Value>) -> crate::error::Result<()>;
+/// `UPGRADES[i]` brings a version `i + 1` manifest to `i + 2`. Append one per format change (a field, a
+/// kind, a new meaning); never edit a shipped one. A file is upgraded as it is read, never rewritten.
+pub(super) const UPGRADES: &[Upgrade] = &[];
+/// The manifest version this build writes and the newest it reads. An older file is upgraded as it is
+/// read; a newer one is refused by name ("made by a newer Kerf").
+pub const VERSION: u32 = 1 + UPGRADES.len() as u32;
 
 /// What a control changes, and so what its value must look like.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]

@@ -18,12 +18,13 @@ use std::io::{Cursor, Read, Seek};
 use std::path::Path;
 use std::sync::Arc;
 
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, DateTime, ZipArchive, ZipWriter};
 
-use super::model::{TemplateManifest, FORMAT};
-use super::validate::{check_version, invalid, validate_controls, validate_manifest};
+use super::model::{TemplateManifest, FORMAT, UPGRADES};
+use super::validate::{invalid, unknown_field, upgrade_manifest, validate_controls, validate_manifest};
 use super::{EXTENSION, MAX_ENTRIES, MAX_FONT_BYTES, MAX_MANIFEST_BYTES, MAX_POSTER_BYTES, MAX_TOTAL_BYTES, POSTER_SIZE};
 use crate::error::{Error, Result};
 use crate::fonts::{self, EmbeddedFont};
@@ -145,10 +146,11 @@ impl<R: Read + Seek> Opened<R> {
     }
 
     /// `manifest.json`, with the format and the version looked at before the rest is parsed so that a
-    /// file from a newer Kerf is told apart from one that is broken.
+    /// file from a newer Kerf is told apart from one that is broken. An older version is upgraded first;
+    /// a field this build does not know is refused rather than dropped.
     fn manifest(&mut self) -> Result<TemplateManifest> {
         let bytes = self.required(MANIFEST, MAX_MANIFEST_BYTES)?;
-        let value: serde_json::Value =
+        let mut value: serde_json::Value =
             serde_json::from_slice(&bytes).map_err(|e| invalid(format!("the template's manifest is not valid JSON: {e}")))?;
         if value.get("format").and_then(|f| f.as_str()) != Some(FORMAT) {
             return Err(invalid("not a Kerf template (its manifest has no kerf-template format)"));
@@ -157,9 +159,16 @@ impl<R: Read + Seek> Opened<R> {
             .get("version")
             .and_then(serde_json::Value::as_u64)
             .ok_or_else(|| invalid("the template's manifest has no version"))?;
-        check_version(u32::try_from(version).unwrap_or(u32::MAX))?;
-        let manifest: TemplateManifest =
-            serde_json::from_value(value).map_err(|e| invalid(format!("the template's manifest is not valid: {e}")))?;
+        if let Some(object) = value.as_object_mut() {
+            upgrade_manifest(object, u32::try_from(version).unwrap_or(u32::MAX), UPGRADES)?;
+        }
+        let manifest =
+            TemplateManifest::deserialize(&value).map_err(|e| invalid(format!("the template's manifest is not valid: {e}")))?;
+        if let Some(field) = unknown_field(&value, &serde_json::to_value(&manifest)?) {
+            return Err(invalid(format!(
+                "the template's manifest has a field this Kerf does not know (“{field}”) — it may be from a newer Kerf; update Kerf to use it"
+            )));
+        }
         validate_manifest(&manifest)?;
         Ok(manifest)
     }
@@ -554,6 +563,26 @@ pub(crate) mod tests {
         value["version"] = serde_json::json!("1");
         entries[0].1 = serde_json::to_vec(&value).unwrap();
         assert!(err(&zip_with(&entries)).contains("no version"));
+    }
+
+    #[test]
+    fn a_field_this_kerf_does_not_know_is_refused_not_dropped() {
+        let m = manifest();
+        let mut value = serde_json::to_value(&m).unwrap();
+        value["author"] = serde_json::json!("someone");
+        let mut entries = good_entries(&m);
+        entries[0].1 = serde_json::to_vec(&value).unwrap();
+        let message = err(&zip_with(&entries));
+        assert!(message.contains("“author”") && message.contains("newer Kerf"), "{message}");
+        let mut value = serde_json::to_value(&m).unwrap();
+        value["controls"][1]["targets"][0]["unit"] = serde_json::json!("px");
+        entries[0].1 = serde_json::to_vec(&value).unwrap();
+        assert!(err(&zip_with(&entries)).contains("“controls[1].targets[0].unit”"));
+        // An optional field spelled `null` is no field.
+        let mut value = serde_json::to_value(&m).unwrap();
+        value["controls"][0]["min"] = serde_json::Value::Null;
+        entries[0].1 = serde_json::to_vec(&value).unwrap();
+        assert_eq!(Template::read(&zip_with(&entries)).unwrap().manifest, m);
     }
 
     #[test]

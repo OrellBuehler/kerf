@@ -746,6 +746,12 @@ impl Project {
             "INSERT OR IGNORE INTO meta (key, value) VALUES ('created_at', ?1)",
             params![Utc::now().to_rfc3339()],
         )?;
+        // `kerf_version` is the build that made the file; this is the last one that opened it to write.
+        self.conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('last_kerf_version', ?1)
+             ON CONFLICT (key) DO UPDATE SET value = excluded.value WHERE value <> excluded.value",
+            params![env!("CARGO_PKG_VERSION")],
+        )?;
         // Fonts no title names any more are dropped now (the file, not the process's fonts: this project
         // is not the open one until it is swapped in).
         if let Err(e) = self.collect_unused_fonts() {
