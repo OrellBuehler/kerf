@@ -62,6 +62,10 @@ struct AppState {
     last_sync: Arc<Mutex<Option<(kerf_core::AudioSyncPlan, kerf_core::AudioSyncMeasure)>>>,
     /// Same, for a voiceover being synthesized (or its model downloading).
     voiceover_cancel: StopEpoch,
+    /// Same, for music being composed (or its SoundFont downloading).
+    music_cancel: StopEpoch,
+    /// Same, for a band-balance measurement (`cancel_band_balance`).
+    bands_cancel: StopEpoch,
     stems_cancel: StopEpoch,
     /// Same, for a speech model being downloaded (`cancel_model_download`).
     model_cancel: StopEpoch,
@@ -188,6 +192,8 @@ impl AppState {
             sync_cancel: StopEpoch::default(),
             last_sync: Arc::new(Mutex::new(None)),
             voiceover_cancel: StopEpoch::default(),
+            music_cancel: StopEpoch::default(),
+            bands_cancel: StopEpoch::default(),
             stems_cancel: StopEpoch::default(),
             model_cancel: StopEpoch::default(),
             cover_cancel: StopEpoch::default(),
@@ -232,6 +238,12 @@ impl AppState {
     /// since. The GUI's voiceover dialog and an agent's `generate_voiceover` take one alike.
     pub(crate) fn begin_voiceover(&self) -> impl Fn() -> bool + Send + Sync + 'static {
         self.voiceover_cancel.begin()
+    }
+
+    /// Music is being composed; the closure says whether `cancel_music` has been pressed since. The
+    /// GUI's Compose dialog and an agent's `compose_music` take one alike.
+    pub(crate) fn begin_music(&self) -> impl Fn() -> bool + Send + Sync + 'static {
+        self.music_cancel.begin()
     }
 
     /// A stem separation is starting; the closure says whether `cancel_stems` has been pressed since.
@@ -1414,6 +1426,155 @@ async fn generate_voiceover(
 #[tauri::command(async)]
 fn cancel_voiceover(state: State<'_, AppState>) {
     state.voiceover_cancel.stop();
+}
+
+// ---- music -------------------------------------------------------------------
+
+/// Whether music can be composed here: the SoundFont's state, compositions in flight and the styles.
+#[tauri::command(async)]
+fn music_status() -> CmdResult<kerf_core::MusicStatus> {
+    Ok(kerf_core::music_status())
+}
+
+/// The error an abandoned composition returns, for the webview to stay quiet on.
+const MUSIC_CANCELLED: &str = "music cancelled";
+
+fn music_err(e: kerf_core::Error) -> String {
+    match e {
+        kerf_core::Error::Cancelled => MUSIC_CANCELLED.to_string(),
+        other => other.to_string(),
+    }
+}
+
+/// Download the SoundFont ahead of time, streaming `music-progress` (`download_soundfont`), so the
+/// first composition starts rendering at once.
+#[tauri::command]
+async fn prepare_music(app: AppHandle, state: State<'_, AppState>) -> CmdResult<kerf_core::MusicStatus> {
+    let cancel = state.music_cancel.begin();
+    blocking(move || {
+        let mut on_progress = |stage: &str, fraction: Option<f64>, detail: Option<String>| {
+            let _ = app.emit(
+                "music-progress",
+                VoiceoverProgressEvent {
+                    stage: stage.to_string(),
+                    fraction,
+                    detail,
+                },
+            );
+        };
+        kerf_core::prepare_soundfont(&mut on_progress, &|| cancel()).map_err(music_err)?;
+        Ok(kerf_core::music_status())
+    })
+    .await
+}
+
+/// A composition landed: what [`kerf_core::Composed`] says, and the refreshed timeline.
+#[derive(Serialize)]
+struct ComposeResult {
+    #[serde(flatten)]
+    composed: kerf_core::Composed,
+    timeline: Timeline,
+}
+
+/// Compose music from a score and put it on the timeline: on the `M` track unless `request.track_id`
+/// names another audio track, at `request.at` or after what is already there — or, with
+/// `request.replace_clip_id`, swapped into that composed clip. With `request.align` the score is
+/// first fitted to the cut's picture (tempo nudged, hits added).
+///
+/// The request is checked and aligned under the project lock, rendering (and a first-use SoundFont
+/// download) runs with it released, streaming `music-progress` (`download_soundfont`, `waiting`,
+/// `render`); only landing the result takes it again.
+#[tauri::command]
+async fn compose_music(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    request: kerf_core::ComposeRequest,
+) -> CmdResult<ComposeResult> {
+    let shared = state.project.clone();
+    let cancel = state.music_cancel.begin();
+    blocking(move || {
+        let (plan, generation) = {
+            let project = lock_user(&shared);
+            (
+                project.compose_music_inputs(&request).map_err(music_err)?,
+                project.generation(),
+            )
+        };
+        let mut on_progress = |stage: &str, fraction: Option<f64>, detail: Option<String>| {
+            let _ = app.emit(
+                "music-progress",
+                VoiceoverProgressEvent {
+                    stage: stage.to_string(),
+                    fraction,
+                    detail,
+                },
+            );
+        };
+        let stop = stop_or_replaced(cancel, &shared, generation);
+        let asset = Project::synthesize_music(&plan.score, &mut on_progress, &stop).map_err(music_err)?;
+        let project = lock_user(&shared);
+        // Composed for a project that is no longer open: the quiet stop of a cancel, not a failure.
+        if project.generation() != generation {
+            return Err(MUSIC_CANCELLED.to_string());
+        }
+        let (asset, clip) = project
+            .place_music(&asset, plan.track_id, plan.at, plan.replace_clip_id)
+            .map_err(|e| e.to_string())?;
+        let timeline = project.timeline().map_err(|e| e.to_string())?;
+        Ok(ComposeResult {
+            composed: kerf_core::Composed {
+                asset,
+                clip,
+                score: plan.score,
+                align: plan.align,
+                replaced: plan.replaces,
+            },
+            timeline,
+        })
+    })
+    .await
+}
+
+/// Request cancellation of the music being composed (or its SoundFont download).
+#[tauri::command(async)]
+fn cancel_music(state: State<'_, AppState>) {
+    state.music_cancel.stop();
+}
+
+/// The error a stopped band-balance measurement returns, for the webview to stay quiet on.
+const BAND_BALANCE_CANCELLED: &str = "band balance cancelled";
+
+/// Where a stretch of sound keeps its energy — six bands per window, with RMS and loudness — for one
+/// asset, one clip's source range or a range of the mix. The target and windows are resolved under
+/// the project lock; the decode runs with it released and `cancel_band_balance` stops it.
+#[tauri::command]
+async fn get_band_balance(
+    state: State<'_, AppState>,
+    request: kerf_core::BandBalanceRequest,
+) -> CmdResult<kerf_core::BandBalance> {
+    let shared = state.project.clone();
+    let cancel = state.bands_cancel.begin();
+    blocking(move || {
+        let (plan, generation) = {
+            let project = lock_user(&shared);
+            (
+                project.band_balance_inputs(&request).map_err(|e| e.to_string())?,
+                project.generation(),
+            )
+        };
+        let stop = stop_or_replaced(cancel, &shared, generation);
+        Project::measure_band_balance(&plan, &stop).map_err(|e| match e {
+            kerf_core::Error::Cancelled => BAND_BALANCE_CANCELLED.to_string(),
+            other => other.to_string(),
+        })
+    })
+    .await
+}
+
+/// Request cancellation of the band-balance measurement in flight (if any).
+#[tauri::command(async)]
+fn cancel_band_balance(state: State<'_, AppState>) {
+    state.bands_cancel.stop();
 }
 
 /// Whether stem separation would still download its runtime or model.
@@ -4970,6 +5131,12 @@ pub fn run() {
             prepare_voiceover,
             generate_voiceover,
             cancel_voiceover,
+            music_status,
+            prepare_music,
+            compose_music,
+            cancel_music,
+            get_band_balance,
+            cancel_band_balance,
             get_ripple_mode,
             set_ripple_mode,
             cut_clip,
@@ -5895,8 +6062,9 @@ mod tests {
             Arc::new(kerf_core::ScrubFrames::new(kerf_core::ScrubConfig::default())),
         );
         type Running = Box<dyn Fn() -> bool>;
-        let jobs: [(&str, Running, &StopEpoch); 7] = [
+        let jobs: [(&str, Running, &StopEpoch); 8] = [
             ("voiceover", Box::new(state.begin_voiceover()), &state.voiceover_cancel),
+            ("music", Box::new(state.begin_music()), &state.music_cancel),
             ("stems", Box::new(state.begin_stems()), &state.stems_cancel),
             ("smart crop", Box::new(state.begin_smart_crop()), &state.smart_crop_cancel),
             ("export", Box::new(state.begin_export()), &state.export_cancel),

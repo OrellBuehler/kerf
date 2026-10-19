@@ -1501,6 +1501,7 @@ fn probe_composite_red(ffmpeg: &str, ffprobe: &str, tag_bt709: bool, deadline: I
         imported_at: chrono::Utc::now(),
         source_paths: Vec::new(),
         voiceover: None,
+        music_score: None,
     };
     let timeline = Timeline {
         tracks: vec![crate::model::Track {
@@ -9368,7 +9369,7 @@ fn atempo_chain(speed: f64) -> String {
 /// Measuring the mix (`ebur128` meters on the export's own audio graph): a child
 /// module so it reaches the private graph builders.
 mod levels;
-pub use levels::mix_levels;
+pub use levels::{mix_levels, stream_mix_pcm};
 
 /// The golden argv oracle (see its docs): a child module so it reaches the
 /// private builders.
@@ -13226,6 +13227,7 @@ mod tests {
             imported_at: Utc::now(),
             source_paths: Vec::new(),
             voiceover: None,
+            music_score: None,
         };
         let timeline = single(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]);
         let assets = vec![asset];
@@ -13268,6 +13270,7 @@ mod tests {
             imported_at: Utc::now(),
             source_paths: Vec::new(),
             voiceover: None,
+            music_score: None,
         };
         let a2 = Asset {
             id: Uuid::new_v4(),
@@ -13278,6 +13281,7 @@ mod tests {
             imported_at: Utc::now(),
             source_paths: Vec::new(),
             voiceover: None,
+            music_score: None,
         };
         let timeline = single(vec![make_clip(a1.id, 0.0, 20.0, 0.0), make_clip(a2.id, 0.0, 10.0, 20.0)]);
         let assets = vec![a1, a2];
@@ -13307,6 +13311,7 @@ mod tests {
             imported_at: Utc::now(),
             source_paths: Vec::new(),
             voiceover: None,
+            music_score: None,
         };
         let timeline = single(vec![make_clip(video_only.id, 0.0, 5.0, 0.0)]);
         let assets = vec![video_only];
@@ -13335,6 +13340,7 @@ mod tests {
             imported_at: Utc::now(),
             source_paths: Vec::new(),
             voiceover: None,
+            music_score: None,
         };
         let timeline = single(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]);
         let assets = vec![asset];
@@ -13366,6 +13372,7 @@ mod tests {
             imported_at: Utc::now(),
             source_paths: Vec::new(),
             voiceover: None,
+            music_score: None,
         };
         let timeline = single(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]);
         let assets = vec![asset];
@@ -13405,6 +13412,7 @@ mod tests {
             imported_at: Utc::now(),
             source_paths: Vec::new(),
             voiceover: None,
+            music_score: None,
         }
     }
 
@@ -18054,6 +18062,7 @@ mod tests {
                 imported_at: chrono::Utc::now(),
                 source_paths: Vec::new(),
                 voiceover: None,
+                music_score: None,
             };
             let timeline = Timeline {
                 tracks: vec![crate::model::Track {

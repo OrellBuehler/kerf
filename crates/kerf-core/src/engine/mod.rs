@@ -102,6 +102,12 @@ mod download;
 // Voiceover: Kokoro text-to-speech on a downloaded ONNX Runtime.
 pub mod tts;
 
+// Composing music: a score rendered through a SoundFont synthesizer (rustysynth), mixed in Rust.
+pub mod compose;
+
+// Band balance: where a stretch of sound keeps its energy (six bands per window).
+pub mod bands;
+
 #[cfg(feature = "ffmpeg")]
 mod ffmpeg;
 
@@ -114,11 +120,11 @@ pub use cli::{
     frame_jpeg_cancellable, frame_jpeg_region, frame_jpeg_region_cancellable, generate_proxy, generate_proxy_with, hw_encoders,
     insta360_pair, mix_levels, playback_params, proxy_base_width, proxy_path, proxy_width, proxy_width_for, ready_proxy,
     remove_proxy_files, salience_map_cancellable, seek_arg, set_proxy_base_width, source_identity, stitch_insta360,
-    stitch_insta360_with, stitched_path, stream_preview, stream_preview_until, stream_preview_with, timeline_frame_cancellable,
-    timeline_frame_region_cancellable, timeline_frame_yuv_cancellable, validate_export, waveform, waveform_cancellable,
-    Container, ExportOptions, ExportProgress, ExportVariant, Fit, ImageFormat, LoudnessPreset, PlaybackParams, PlaybackRequest,
-    PreviewFrame, ProxyRun, RateControl, Region, RenderStatus, ScrubConfig, ScrubFrames, ScrubStats, VariantProgress,
-    MAX_STREAM_FPS, MAX_STREAM_WIDTH, MIN_STREAM_FPS, MIN_STREAM_WIDTH,
+    stitch_insta360_with, stitched_path, stream_mix_pcm, stream_preview, stream_preview_until, stream_preview_with,
+    timeline_frame_cancellable, timeline_frame_region_cancellable, timeline_frame_yuv_cancellable, validate_export, waveform,
+    waveform_cancellable, Container, ExportOptions, ExportProgress, ExportVariant, Fit, ImageFormat, LoudnessPreset,
+    PlaybackParams, PlaybackRequest, PreviewFrame, ProxyRun, RateControl, Region, RenderStatus, ScrubConfig, ScrubFrames,
+    ScrubStats, VariantProgress, MAX_STREAM_FPS, MAX_STREAM_WIDTH, MIN_STREAM_FPS, MIN_STREAM_WIDTH,
 };
 
 #[cfg(test)]
@@ -147,6 +153,9 @@ pub use tts::{
     prepare as prepare_voiceover, status as voiceover_status, VoiceInfo, VoiceoverStatus, DEFAULT_VOICE,
     MAX_SPEED as MAX_VOICE_SPEED, MIN_SPEED as MIN_VOICE_SPEED,
 };
+
+pub use bands::{band_balance, BandLevel, BandWindow, WindowBalance};
+pub use compose::{prepare as prepare_soundfont, status as music_status, MusicStatus, StyleInfo};
 
 /// The names of every speech model Kerf can download, smallest first.
 pub fn speech_model_names() -> Vec<&'static str> {

@@ -7,7 +7,7 @@ effort: xhigh
 color: blue
 ---
 
-You work on `frontend/` — SvelteKit 2, Svelte 5 **runes**, static SPA hosted by
+You work on `frontend/` — SvelteKit 3, Svelte 5 **runes**, static SPA hosted by
 Tauri. Read `.claude/docs/frontend.md` (and `.claude/docs/frontend-timeline.md` for the
 timeline) first.
 

@@ -143,7 +143,7 @@ Now ask the agent to work on the project you have open — _"skim the interview 
 the dead air, and drop in captions."_ It will claim a task, use the tools below, and hand
 back a reviewable result.
 
-### The tools (165)
+### The tools (168)
 
 <details>
 <summary><b>See / analyze</b></summary>
@@ -158,7 +158,8 @@ frame) · `get_waveform` · `get_energy` ·
 as a contact sheet of moments) · `preview_svg_preset` · `validate_svg` — the bold ones return images the model
 can see, and `get_frame` / `preview_timeline` take a `region` to **zoom** into a quarter of
 the frame at full source detail. Also `get_waveform_range` · `analysis_status` · `missing_assets` ·
-`get_music_structure` · `get_ripple_mode` · `voiceover_status` · `stems_status`.
+`get_music_structure` · `get_band_balance` (where music keeps its energy, in six bands per section) ·
+`get_ripple_mode` · `voiceover_status` · `stems_status` · `music_status`.
 </details>
 
 <details>
@@ -170,7 +171,8 @@ the frame at full source detail. Also `get_waveform_range` · `analysis_status` 
 `add_track` · `remove_track` · `set_track_duck` · `set_track_muted` · `set_track_solo` ·
 `set_track_locked` · `add_marker` · `update_marker` · `remove_marker` · `remove_silence` ·
 `snap_to_beats` · `sync_clips_by_audio` · `smart_crop` · `extract_audio` · `concatenate` · `move_clips` · `remove_clips` ·
-`add_asset_audio` · `set_ripple_mode` · `plan_music_fit` · `fit_music` ·
+`add_asset_audio` · `set_ripple_mode` · `plan_music_fit` · `fit_music` · `compose_music` (original music from a
+score, fitted to the cuts) ·
 `detach_audio` · `detach_audio_clips` · `reattach_audio` · `reattach_audio_clips` ·
 `link_clips` · `unlink_clips`
 </details>
@@ -207,7 +209,7 @@ the frame at full source detail. Also `get_waveform_range` · `analysis_status` 
 `get_settings` · `set_settings` · `undo_staged_edit` · `restore_discarded_edits` ·
 `apply_staged_subset` · `proxy_status` · `rebuild_proxy` · `delete_proxy` ·
 `job_status` · `cancel_job` · `list_jobs` — the long tools
-(`export`, `export_variants`, `analyze_asset`, `generate_voiceover`, `separate_stems`,
+(`export`, `export_variants`, `analyze_asset`, `generate_voiceover`, `compose_music`, `separate_stems`,
 `download_speech_model`, `import_asset`, `smart_crop`, `refine_transcript`, `sync_clips_by_audio`) take
 `background: true` and answer a
 `job_id` at once. Applying a proposal is refused to an agent while you have review on;
@@ -287,8 +289,8 @@ built `--enable-whisper`; a build from source falls back to that filter unless y
 
 ## Architecture
 
-Kerf is a Cargo workspace of **two Rust crates** plus a Tauri-embedded SvelteKit frontend.
-`kerf-core` is the UI-agnostic engine; `kerf-app` is a thin adapter that exposes that one
+Kerf is a Cargo workspace of **three Rust crates** plus a Tauri-embedded SvelteKit frontend.
+`kerf-core` is the UI-agnostic engine, `kerf-gpu` an opt-in wgpu preview compositor, and `kerf-app` a thin adapter that exposes that one
 `Project` API **twice** — as Tauri commands to the webview and as MCP tools to a connected
 LLM — over one shared, locked project.
 
@@ -300,17 +302,18 @@ kerf/
 │   │   ├── project.rs        #   SQLite .kerf project + all timeline operations + task queue
 │   │   ├── analysis.rs       #   pluggable Transcriber / SceneDetector / SilenceDetector
 │   │   └── engine/           #   cli.rs (binaries, always on) + ffmpeg.rs (in-process libav)
+│   ├── kerf-gpu/             # wgpu compositor for the opt-in GPU preview
 │   └── kerf-app/             # Tauri v2 shell
 │       ├── lib.rs            #   one Arc<Mutex<Project>> shared by both surfaces
 │       └── mcp.rs (+ mcp/)   #   embedded rmcp streamable-HTTP MCP server, auth, jobs
-├── frontend/                 # SvelteKit 2 / Svelte 5 (runes) / Tailwind 4 / shadcn-svelte
+├── frontend/                 # SvelteKit 3 / Svelte 5 (runes) / Tailwind 4 / shadcn-svelte
 └── site/                     # Hugo landing site (deployed to GitHub Pages)
 ```
 
 | Layer       | Choice                                          |
 | ----------- | ----------------------------------------------- |
 | Shell       | Rust + Tauri **2**                              |
-| Frontend    | SvelteKit **2** / Svelte **5** (runes), Bun     |
+| Frontend    | SvelteKit **3** / Svelte **5** (runes), Bun     |
 | Styling     | Tailwind CSS **4** (CSS config) + design tokens |
 | Media       | FFmpeg binaries (always) · `ffmpeg-next` **8.1** (optional libav) |
 | Persistence | `rusqlite` (bundled SQLite) — one `.kerf` file  |

@@ -161,6 +161,7 @@ export function buildMenus(s: MenuState): MenuDef[] {
 			sep,
 			act('file.import'),
 			act('file.importCaptions', hold({})),
+			act('file.composeMusic', hold({})),
 			sep,
 			act('file.export', { disabled: exportOff.disabled, reason: exportOff.reason }),
 			act('file.saveCover', { ...clips }),

@@ -4,6 +4,7 @@
 
 import type { Asset, AssetAnalysis, StreamInfo, Timeline } from './types';
 import { fmtSpeed, voiceName } from './voiceover';
+import { scoreTitle } from './music-score';
 
 export interface MediaInfo {
 	/** `video` / `audio` / `image` — what the thumbnail and badge lead with. */
@@ -28,6 +29,8 @@ export interface MediaInfo {
 	stitched: boolean;
 	/** `Heart · 1.00×` for a synthesized voiceover, else `null`. */
 	voiceover: string | null;
+	/** `Lo-fi · Am · 82 BPM` for composed music (the score it was rendered from), else `null`. */
+	composed: string | null;
 }
 
 export function videoStream(a: Pick<Asset, 'streams'>): StreamInfo | undefined {
@@ -103,7 +106,8 @@ export function mediaInfo(a: Asset, timeline: Pick<Timeline, 'tracks'>): MediaIn
 		uses: usesOf(a.id, timeline),
 		duration: fmtDuration(a.duration),
 		stitched: (a.source_paths?.length ?? 0) > 0,
-		voiceover: a.voiceover ? `${voiceName(a.voiceover.voice)} · ${fmtSpeed(a.voiceover.speed)}` : null
+		voiceover: a.voiceover ? `${voiceName(a.voiceover.voice)} · ${fmtSpeed(a.voiceover.speed)}` : null,
+		composed: a.music_score ? scoreTitle(a.music_score) : null
 	};
 }
 

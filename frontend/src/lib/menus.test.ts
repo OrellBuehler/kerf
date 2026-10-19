@@ -82,6 +82,7 @@ describe('File', () => {
 			'Save project…',
 			'Import media…',
 			'Import captions…',
+			'Compose music…',
 			'Export…',
 			'Save cover frame…',
 			'Export as',
@@ -204,8 +205,11 @@ describe('Edit', () => {
 		}
 		const frames = (find(menu('view', { previewing: true }).items, 'Delivery frame') as Extract<MenuEntry, { kind: 'submenu' }>).items;
 		for (const e of frames) expect(e.kind !== 'separator' && e.disabled, 'delivery frame').toBe(true);
-		const captions = find(menu('file', { previewing: true }).items, 'Import captions…');
-		expect('disabled' in captions && captions.disabled).toBe(true);
+		for (const label of ['Import captions…', 'Compose music…']) {
+			const e = find(menu('file', { previewing: true }).items, label);
+			expect('disabled' in e && e.disabled, label).toBe(true);
+			expect('reason' in e && e.reason, label).toBe(REASON);
+		}
 	});
 
 	test('what only looks stays on while the proposal is previewed: copy, select all, the tools, ripple and snapping', () => {

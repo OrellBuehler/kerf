@@ -397,6 +397,54 @@
   a full window makes the export's tail and fade-in cover the same samples (offset windows
   played both copies at full gain — +65 % peak in the Python prototype). An overrun with
   `fade_out` is cut at the target and faded over `FIT_FADE_S`.
+- **Music scores** (`model/score.rs` + `score/{chord,arrange,align}.rs`, pure + unit-tested): a `MusicScore`
+  (`bpm` 40–240, `key` `G` / `F#m` / `Bb` / `Ebm`, a `MusicStyle` — `tropical_house`, `pop`, `lofi`,
+  `cinematic`, `ambient`, `rock` —, `sections: [{kind: intro|verse|build|drop|breakdown|outro, bars, chords,
+  energy?}]`, `hits: [{at_s, kind: impact|riser|dropout|whoosh}]`, `seed` (0 to `MAX_SEED` = 2^53 − 1, the largest integer a JS number keeps through JSON; a bigger one is refused), `instruments?` GM-program overrides)
+  is 4/4 only, rides on `Asset.music_score` and renders through `engine::compose` (`engine-media.md`). **Chords**
+  are names (`C`, `Em`, `F#m7`, `Gsus4`, `D/F#`, `Bbmaj7`, `E5`, `Cadd9`, `Am7b5`) or **roman numerals in the key's own
+  scale** (in A minor `VI` is F, `VII` is G, `i` is Am; case is quality, a leading `b` / `#` moves the root), one per
+  bar, a shorter list cycling; `resolve()` checks everything and the error names `sections[i] (kind)` and the
+  chord (`InvalidArgument`) — and its `chords` are **as played**: the last bar of an outro that ends the piece is
+  already the tonic chord, so the notes, the bar before's approach note and the analysis chroma agree; the score
+  types refuse an unknown field (`deny_unknown_fields`); limits keep a render in memory (100 sections, 128 bars each, 400 bars, 600 s, 256
+  hits). `duration_s` = bars + a **release tail** (`RELEASE_TAIL_S` 1.5 s, at most 0.9 of a bar so the tail is never
+  a whole extra bar); `beat_grid()` is exact (beat 0 at 0 s, bar every 4), `music_analysis(duration)` writes the
+  asset's **bar structure from the chords** (per-bar chroma from the chord tones, then the same `phrase_matches` the
+  audio analysis uses, so `fit_music` finds the repeating phrases) and `rhythm(duration)` the whole rhythm result
+  (full-confidence `Tempo::from_grid`, kicks, hits and downbeats as onsets, class music) — `analysis::ScoreRhythm`
+  serves it when a composed asset is analysed, so a re-analysis never replaces it with a detector's guess.
+  **`expand(score) -> Arrangement`** is deterministic: per role (`Drums`, `Top` = hats / shakers / cymbals, `Bass`,
+  `Pad`, `Keys`, `Lead`, `Fx`) `NoteEvent {channel, program, key, velocity, start_s, dur_s}`, the kick times the
+  sidechain follows, the dropout windows, the per-section make-up gain and the preset's mix. Each style is a
+  `Preset` of data (GM programs, 16-step drum lanes written as digit strings — `7` is velocity 100 — bass /
+  comping / hook patterns, swing, humanization, role gains and shares, sidechain, impact strength). **Section
+  logic** (`drum_tier`, `bass_mode`, `keys_mode`, `lead_mode`, from the kind and the energy: < 0.4 light, < 0.75
+  mid, else full): an intro is a pad, a sparse chord and a hook teaser late; a verse the groove; a **build** pulses
+  the bass in eighths, rolls the snare a hit a beat → two → four → eight with the velocity climbing, brings the kick
+  in a fifth of the way and drops it from the last beat, cuts the harmony a sixteenth-and-a-half short of a drop, and
+  ends in a riser into whatever follows; a **drop** is every layer plus a crash and an impact (not when one drop
+  follows another); a **breakdown** has no kick and no bass; an **outro** thins and its **last bar resolves on the
+  tonic chord** held into the tail. A fill closes a section (and every eighth bar of a long one). **Harmony is
+  voice-led** (`chord::voice`: every chord tone once inside a range and a spread, the voicing nearest the last by
+  total nearest-tone movement; a ninth chord drops its fifth); the bass plays the root (or a slash chord's bass) in
+  G1–F#2 and approaches the next root by **a step of the key's scale from the side it comes from**; the hook is
+  a motif over the **chord-tone ladder** (index 0 = the chord's root in the lead's range, so one motif fits every
+  chord), `a a' b b'` over four bars with the last bar's final note resolved to the root, the same two motifs for
+  every section of a kind. Style colour extends plain triads (`lofi` to sevenths, `ambient` to add9). All
+  variation comes from a small seeded generator (xorshift64\*, pinned by a test) keyed by seed, role, **section and
+  bar** — editing a section never re-rolls the ones before it. **Score to picture**
+  (`plan_score_to_picture(score, cut_times_s, music_start_s, &AlignOptions) -> (MusicScore, AlignReport)`): the cuts
+  are moved into music time; the tempo is searched in 0.05 % steps within ±`max_tempo_change` (default 6 %) for the
+  most cuts within 40 ms of a beat, a downbeat counting double, and **changes only when that beats the score's own
+  tempo**, taking from the nearest run of equally good tempos the one that centres the cuts (so a nudge lands the
+  cuts within a few ms, not at the edge of the tolerance); then an `impact` on every cut on a downbeat (on the
+  grid, not on the cut) and, before a `drop` a cut lands within one beat of, a `dropout` (one beat) and a `riser`
+  (not after a build, which has its own). Hits already there are not added twice. The score's **own hits stay at their
+  absolute seconds**, so a tempo whose piece would end before the last of them is never a candidate (a fit to 127 BPM
+  that would cut the piece short of an impact at 80 s settles on the slower tempo that keeps it); the hits added stop at
+  `MAX_HITS` (a note in the report says how many were left out) and the score returned is `validate()`d. The report lists every cut's
+  `before` / `after` reading (on beat, on downbeat, offset) and the counts.
 - **Limits that keep a project loadable.** A clip's speed is `MIN_SPEED..=MAX_SPEED`
   (0.01×..100×, either sign) — `set_speed` and the ratio `set_speed_linked` hands each partner
   both hold it (the audio tempo is one `atempo` step per doubling). `Mask::normalized` maps a

@@ -500,6 +500,11 @@ pub struct Asset {
     /// it rather than the user importing it. `None` for ordinary media.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub voiceover: Option<Voiceover>,
+    /// The score this audio was composed from, when Kerf rendered it (`compose_music`) rather
+    /// than the user importing it. `None` for ordinary media. Editing the score and composing
+    /// again replaces the clip's audio; the asset's bar and tempo analysis is written from it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub music_score: Option<MusicScore>,
 }
 
 /// What a generated voiceover was made from — enough to regenerate it, and the
@@ -4841,6 +4846,18 @@ pub use grade::{
 };
 mod check;
 
+mod score;
+pub use score::{
+    bar_seconds, duration_s as score_duration_s, expand as expand_score, plan_score_to_picture, AlignOptions, AlignReport,
+    Arrangement, BeatReading, Chord, Colour, CutAlignment, HitKind, InstrumentOverrides, Key, Makeup, Mix, Mode, MusicScore,
+    MusicStyle, NoteEvent, Quality, Resolved, Role, ScoreHit, ScoreSection, SectionKind, SectionSpan, Sidechain,
+    DEFAULT_MAX_TEMPO_CHANGE, MAX_BPM, MAX_HITS, MAX_SCORE_BARS, MAX_SCORE_SECONDS, MAX_SECTIONS, MAX_SECTION_BARS, MAX_SEED,
+    MIN_BPM, RELEASE_TAIL_S, ROLES,
+};
+
+#[cfg(test)]
+pub(crate) use score::{sample_song, style_shares};
+
 mod music_fit;
 pub use music_fit::{
     music_fit_clips, plan_music_fit, to_samples, MusicFit, MusicFitReport, MusicSegment, FIT_FADE_S, MAX_FIT_BARS,
@@ -7418,6 +7435,7 @@ mod tests {
             imported_at: Utc::now(),
             source_paths: Vec::new(),
             voiceover: None,
+            music_score: None,
         };
         assert_eq!(asset.hdr(), Some(Hdr::Hlg));
         let proxied = asset.as_sdr_proxy();

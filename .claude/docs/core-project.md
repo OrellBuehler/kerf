@@ -101,8 +101,8 @@
   `MIGRATIONS` (one step each, each in its own transaction stamping the version it reached; never edit
   a shipped step, append one). Version 0 is every file written before versions existed (the legacy
   baseline; v0→v1 is the old probe-then-`ALTER` columns); v1→v2 adds `staged.owner` / `staged.assets`
-  (below); v2→v3 adds the `fonts` table (below). A step's `needed_to_read` says whether a build that
-  cannot write must still refuse a file lacking what it adds: true for the v1 and v2 columns (the reads
+  (below); v2→v3 adds the `fonts` table (below); v3→v4 adds `assets.music_score`. A step's `needed_to_read` says whether a build that
+  cannot write must still refuse a file lacking what it adds: true for the v1, v2 and v4 columns (the reads
   name them), false for the `fonts` table (reads tolerate its absence), so a write-protected v2 project
   opens as it is. A new file is stamped `SCHEMA_VERSION`; a
   file newer than that is refused before anything is written (`Error::NewerProject`, "made by a newer
@@ -133,7 +133,9 @@
   **Crash recovery** (`recovery.rs`): an untitled project can live in `<root>/<session>/untitled.kerf`
   (`Project::create_recovery`), its directory held under an OS lock (`File::try_lock` on
   `<session>/lock`, a separate file because Windows byte-range locks would block SQLite) for as long
-  as it is open; `path()` stays `None`, so it still reads as unsaved. `recovery::scan(root, skip)`
+  as it is open, and **unlocked explicitly** on drop (`SessionLock`): the lock belongs to the open
+  file, which a child forked by another thread (`pre_exec` spawns fork) shares until it execs, so
+  closing alone could leave a let-go session locked; `path()` stays `None`, so it still reads as unsaved. `recovery::scan(root, skip)`
   offers the directories whose lock it can take and that hold work (assets, a revision past 0, a task
   or a proposal — the `summarize` read opens read-write so SQLite can roll back a crash's hot
   journal; a table the file lacks counts as empty, so a 0-byte or half-created file is cleaned up),
@@ -312,6 +314,57 @@
   or, by default, the picture's end minus the clip's start; `fit_music` replaces the clip
   with `music_fit_clips` in one `edit_timeline_exact` revision ("Fit music to length") and
   refuses a result that would run into the next clip on the track.
+  **Composed music** (`project/music.rs`, tests in `music_tests.rs`; the voiceover's shape again): an asset carries
+  **`Asset.music_score`** (`MusicScore`, a `music_score` JSON column — schema step v3 → v4 in `store.rs`, a
+  probe-and-`ALTER` like the others, so a v2 file is copied aside once as `(schema v2 backup)`), which is what lets a
+  piece be edited and composed again and what its analysis is written from. **The request types refuse a misspelled
+  field** (`#[serde(deny_unknown_fields)]` on `MusicScore`, `ScoreSection`, `ScoreHit`, `InstrumentOverrides`,
+  `ComposeRequest`, `ScoreAlign`, `BandBalanceRequest`, `BandWindow`): `enrgy` is an error naming it, not a section
+  with the default energy. The split: `compose_music_inputs(&ComposeRequest {score, track_id?, at?, align?,
+  replace_clip_id?}) -> ComposePlan` under the lock — **everything that can be said wrong is said here, before the
+  render**: the score resolves, the target track exists, is audio and is **not locked**, a replaced clip is on an
+  audio track, of a **composed** asset, with no clip of the bed linked to a picture — then the music's start (the
+  **earliest clip of the replaced bed**, else `at`, else the end of the track) and, with `align`, the **working
+  timeline's** cuts (the boundaries *between* the clips of a video track, the picture's first start and last end being
+  its edges) or markers go to `plan_score_to_picture`. **Last, the placement is rehearsed** (`check_music_fits`): a
+  stand-in asset of the fitted score's length goes through the same `put_music` and then `ripple_lanes` (when
+  `ripple_active()` — the project's flag or a `with_ripple` override around the call) and `check_own_lanes`, exactly
+  what `edit_timeline` does, so a start (`at`) that lands on another clip of the track, or a longer recomposed piece
+  that would run into the next clip, is refused **before the render** with edit_timeline's own words ("the clip would
+  overlap another clip on M at …"); with ripple on a piece that only *pushes* what is there passes (a start *inside* a
+  clip still fails: ripple never splits one). The render is never shorter than the score (`ceil` frames), so the
+  rehearsal can pass what placing refuses by a frame, never the reverse. The plan holds the fitted score, the `AlignReport`, the
+  request's own `track_id` / `at` / `replace_clip_id` **as given** (a `None` start is resolved when the music is
+  placed, after what the track holds *then*), `replaces` (the clip ids of the bed, in time order; empty when a clip is
+  added) and `music_start` (what the alignment used; informational) → static `synthesize_music(score, progress,
+  cancel) -> Asset` (renders with the lock released, probes, names it `Music: <title>`) → `place_music(asset,
+  track_id?, timeline_start?, replace_clip_id?)` under the lock: the score is resolved first (`rhythm`), then **the
+  asset, its analysis and the edit are one transaction** — the store and the analysis run *inside* the `edit_timeline`
+  closure, so a refused placement (a locked or bad target, a clip in the way, a bed linked to a picture) rolls back
+  and stores no asset and no analysis, a staged agent edit included (an asset that was already in the library stays);
+  the asset is stored (the same score is the same file, so the same asset), **its analysis is written from the score**
+  (`Rhythm` kind: the exact grid as a full-confidence `Tempo`, the bars and phrases as `MusicAnalysis`, onsets, class
+  music — nothing is analysed, so `get_music_structure`, `fit_music` and the beat snap work at once; other kinds an
+  earlier pass cached stay), and **one `Add music` edit** puts the clip on the audio track named **`M`** (`MUSIC_TRACK`,
+  made on first use like `VO`) after what it holds. An agent's edit stages through `edit_timeline` (the asset and its
+  analysis land at once, the placement waits). **`replace_clip_id` replaces the whole bed**: every clip of the named
+  clip's asset on its track — the segments `fit_music` made of one piece — is removed and **one** clip of the new
+  render takes the place of the first, as one `Recompose music` revision: the named clip's id, the earliest start,
+  the first clip's gain / fade-in / effects / keys and the last one's fade-out, `source_in` 0, `source_out` the new
+  length, speed 1. It is registered with `edit_lanes` and goes through `edit_timeline`, so **ripple applies as to any
+  edit** (the clips after the bed move by the difference in length) and without it a longer render that would run into
+  the next clip is refused with nothing changed. `Composed.replaced` is the list of the clip ids that were replaced.
+  **Band balance**
+  (`band_balance_inputs(&BandBalanceRequest {asset_id? | clip_id? | range?, sections?}) -> BandPlan` under the lock →
+  static `measure_band_balance(&plan, cancel) -> BandBalance` → `band_balance(&req)` for a caller with `&self`): exactly one
+  target; times are the **target's own clock** (an asset's seconds, a clip's *source* seconds with its `volume` applied
+  — its speed is not, a timeline's seconds for a `range` of the working timeline's mix); windows are the explicit
+  `sections` (cut to the sound, each with ≥ 0.25 s), else a composed asset's **score sections** (named, numbered when a
+  kind repeats), else the analysed bar grid in four-bar phrases (eight, sixteen … while there would be more than 16),
+  else eight equal windows; `windows_from` says which. `BandBalance` carries the windows, the whole stretch as
+  `overall` and `notes` (a heavy low end, a thin mid range, a dull top, a loudness swing, a window that is bassier than the
+  whole). `analysis.rs` serves a composed asset's rhythm from `ScoreRhythm` (below the providers) instead of
+  `FfmpegRhythmAnalyzer`.
   `separate_stems_media(asset, progress, cancel)` (static, lock released) separates and
   probes the four stems; `place_stems(source, stems, clip?)` stores them (reusing
   imported ones) and, with a clip, lays each on a new audio track named after it at the

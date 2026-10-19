@@ -35,6 +35,7 @@ pub(super) fn asset(path: &str, duration: f64, streams: Vec<StreamInfo>) -> Asse
         imported_at: Utc::now(),
         source_paths: Vec::new(),
         voiceover: None,
+        music_score: None,
     }
 }
 

@@ -3,9 +3,9 @@
 Tauri v2 shell. **CSP is on** (`app.security.csp` in `tauri.conf.json`, an object so Tauri can add its hashes): `default-src 'self'`, scripts `'self'` only (Tauri hashes SvelteKit's inline bootstrap in the fallback `index.html`), styles allow `'unsafe-inline'` because the UI is styled with inline `style` attributes, fonts are `'self' data:` (Geist, Geist Mono and Space Grotesk are self-hosted through `@fontsource-variable/*` and bundled by Vite, so the app never reaches a font host — there is no `fonts.googleapis.com` / `fonts.gstatic.com` entry to restore), images `data:` (frames are data URLs), `connect-src ipc: http://ipc.localhost`, no objects or `<base>`. Anything new that loads from the network or a `blob:` has to be added there deliberately. **Panics log a backtrace** (`install_panic_hook` forces capture; the release profile strips only `debuginfo`, keeping the symbol table so frames carry function names at a modest size cost). **One instance per identity**: `tauri-plugin-single-instance` is the first plugin in `run()`. A second launch focuses the running window (unminimizing it) and, when its argv carries a `.kerf` path (resolved against the second launch's cwd by `project_arg`), emits `open-project-file` to the webview, which asks about unsaved work like any other open and calls `open_project`. **The first launch's own argv is honoured too**: `run()` resolves it through the same `project_arg` (`launch_project`, pure — the `exists` check is a parameter) against the process cwd into `AppState.launch` (a `LaunchSlot`), and the webview **pulls** it once with `take_launch_project` after its listeners and first `editor.load()` are in place — a command, not an event, because an event emitted before the page has a listener is lost. It returns `{open: path}` once (a reloaded webview must not reopen it over the user's edits) and goes through the same `openProjectAt` as `open-project-file`, unsaved-work question included. With nothing named on the command line and `reopen_last_project` on, a thread of its own — never the main thread: the file may sit on a share that is offline — asks the disk whether `last_open_project` still exists (`settings::reopen_target`) and offers it to the same slot (`LaunchSlot::offer_reopen`: held for the page's pull, or an `open-project-file` event when the page is already listening), so the page opens it exactly like a named one; a project named on the command line or by a second launch always wins, early or late. `last_open_project` is the project that was open when the last session ended, not the newest recent entry: `note_open` (every way a project becomes the open one, the MCP server's included) sets it on open / save-as and clears it for `new_project` (an unsaved project reopens nothing). **A second launch that arrives while the webview is still booting** would hit the same lost event, so until the webview has asked the slot *holds* its request instead (newest wins; one lock covers both halves, so a request is delivered exactly one way) and only afterwards is it emitted. A `.kerf` argument naming nothing on disk is never opened — `Project::open` would *create* it — and comes back as `{missing: path}` (second launch: the `launch-project-missing` event), which the page toasts as `File not found: …`. (A macOS Finder open arrives as `RunEvent::Opened`, not argv, and no `fileAssociations` are configured; neither is handled.) **The main window starts hidden** (`visible: false`, with `backgroundColor` = Kerf Dark's `surface-app`, which a bun test pins equal to `app.html`'s paint): the webview calls `show_main_window` once the settings are in (theme applied, dock built) and a frame has painted (`reveal.ts`: first the bundled interface fonts, `fontsReady` over `document.fonts.load`, *or* 400 ms, so the first frame is not the system fallback re-flowing; then two animation frames *or* a 150 ms timer, since a hidden page may never get a frame), and a 3 s `REVEAL_FAILSAFE` thread shows it anyway so a crashed bundle cannot leave an invisible app. `reveal_once` over `AppState.main_window_shown` makes the first asker win and the rest no-ops (a timer firing after the user minimized the window must not pop it back up) — but only a `show` that *worked* (a window existed and `show()` succeeded) keeps the claim, so a request that finds no window gives it back and the failsafe retries every 500 ms. A second launch always brings the window forward (`unminimize` + `show` + `set_focus`) and marks the reveal done only if that worked — it can run before the config windows exist, and then the failsafe is still armed. It is a command rather than the window API so the capability needs no `core:window:allow-show` (a Rust test pins its absence), and the debug identity cannot diverge: `tauri.dev.conf.json` merges only `identifier` (also pinned). **Jobs land in the project they started for.** Every job that resolves its inputs under the lock, releases it and
 applies a result later notes `Project::generation()` with the inputs and checks it when it comes back
 (`require_generation`): import (and the stitch), analysis (each finished step and the final merge — `run_analysis`
-is shared with the MCP tool), voiceover, stems, levels, smart crop and the export's framing pass, captions import,
+is shared with the MCP tool), voiceover, music, stems, levels, band balance, smart crop and the export's framing pass, captions import,
 relink and the proxy rebuild's un-decline, and `respawn_proxies` (stops queueing a replaced project's assets).
-Where the webview has a quiet "cancelled" string (analysis, voiceover, stems, levels) a replaced project returns
+Where the webview has a quiet "cancelled" string (analysis, voiceover, music, stems, levels, band balance) a replaced project returns
 that; elsewhere the error says `the project was replaced while …; the result was dropped`.
 `save_project_as` asks the same of its reopen and swaps it in only if `Project::change_count()` (every row the
 connection wrote: analysis merged by a background job, the ripple flag, meta, a declined proxy — not only edits) is
@@ -13,17 +13,18 @@ what it was; otherwise it saves again under one held lock. The swap is `Project:
 **keeps the generation**: the copy is the same project in another file, so an analysis, import, voiceover or proxy in
 flight still lands (`replace_with` — open / new — is the one that moves it). Onto the file already open it does nothing,
 and the target is checked like an export's output (`check_output`: sources, proxies, Kerf's settings and logs). **Cancel flags** are all `StopEpoch`s on `AppState` (readable from `mcp.rs` as `app.state::<AppState>()`):
-`export_cancel`, `analysis_cancel`, `levels_cancel`, `voiceover_cancel`, `stems_cancel`, `model_cancel`
+`export_cancel`, `analysis_cancel`, `levels_cancel`, `voiceover_cancel`, `music_cancel` (`cancel_music` → `music cancelled`),
+`bands_cancel` (`cancel_band_balance` → `band balance cancelled`), `stems_cancel`, `model_cancel`
 (`cancel_model_download`), `cover_cancel` (`cancel_cover_export` → `cover export cancelled`), `smart_crop_cancel`
 (`cancel_smart_crop` → `smart crop cancelled`, progress as `smart-crop-progress { fraction }`) and `import_stop`
 (`cancel_import` → `import cancelled`). A run calls `.begin()` and polls the closure it gets; `.stop()` ends every run
 begun before it and none begun after, so there is no flag to reset under a run about to start (a Stop pressed just
 before another run began used to be wiped by it) and a GUI Stop reaches the agent's run of the same job:
-`begin_analysis`, `begin_model_download`, `begin_import`, `begin_cover_export`, `begin_voiceover`, `begin_stems`,
+`begin_analysis`, `begin_model_download`, `begin_import`, `begin_cover_export`, `begin_voiceover`, `begin_music`, `begin_stems`,
 `begin_smart_crop` and `begin_export` are what `mcp.rs` takes for `analyze_asset`, `download_speech_model`,
-`import_asset`, `export_cover`, `generate_voiceover`, `separate_stems`, `smart_crop` and `export` / `export_variants`
+`import_asset`, `export_cover`, `generate_voiceover`, `compose_music`, `separate_stems`, `smart_crop` and `export` / `export_variants`
 (one `export_cancel` for both; a test pins that each `begin_*` listens to its own button and no other). **A replaced project stops its jobs**:
-`run_analysis`, voiceover, stems, smart crop and the export's framing pass fold "the generation moved" into their
+`run_analysis`, voiceover, music, band balance, stems, smart crop and the export's framing pass fold "the generation moved" into their
 cancel (`stop_or_replaced` / `Throttled`: the generation is read under the lock at most twice a second), so the ffmpeg
 working towards a result that would be dropped is killed instead of finishing.
 
@@ -77,7 +78,16 @@ refuse under Proxy only while a clip's proxy is building, `get_frame` does not),
 (`get_ripple_mode` / `set_ripple_mode { on }` — both answer the bool, a setting
 that records no revision and returns no timeline), voiceover
 (`voiceover_status`, `prepare_voiceover` / `generate_voiceover` → emit
-`voiceover-progress`, `cancel_voiceover`), every editing
+`voiceover-progress`, `cancel_voiceover`), composed music (`music_status`; `prepare_music` downloads the SoundFont;
+`compose_music { request }` takes a core `ComposeRequest` — `{score, track_id?, at?, align?, replace_clip_id?}` — checks
+and aligns it under the lock (rehearsing the placement too, so a start on another clip of the track is refused before
+the render, as the project's ripple flag decides), renders with the lock released and lands it through `place_music`
+with the request's own `track_id` / `at` / `replace_clip_id` as given (a refused placement stores nothing), answering the
+`Composed` fields flattened (`asset`, `clip`, `score` as rendered, `align`, `replaced`: the ids of the clips replaced —
+the whole bed of `replace_clip_id`, empty when a clip was added) plus the refreshed `timeline`; both emit `music-progress` — the voiceover's payload, stages `download_soundfont`,
+`waiting`, `render` — and `cancel_music` rejects `music cancelled`), band balance (`get_band_balance { request }`, a core
+`BandBalanceRequest`, answering `BandBalance`; the decode runs with the lock released and `cancel_band_balance` rejects
+`band balance cancelled`), every editing
 op (`cut_clip`, `add_clip`, `split_clip`, `trim_clip` (optional `timeline_start` so a
 left-edge trim keeps the right edge put, atomically), `reorder_clip`, `move_clip`,
 `move_clips { moves }` (a group, one revision, all or nothing), `roll_edit { clipA, clipB,
@@ -337,8 +347,9 @@ comes back `ForbiddenUrl` and the "Release notes" button silently does nothing.
 `list_fonts`, `import_asset`, `cancel_import`, `remove_asset`, `relink_asset`, `check_relink`, `missing_assets`, `paths_exist`,
 `set_asset_projection`; *analysis, proxies, transcription* `analyze_asset`, `cancel_analysis`, `analysis_statuses`,
 `proxy_statuses`, `rebuild_proxy`, `delete_proxy`, `transcription_status`, `set_speech_model`, `download_speech_model`,
-`cancel_model_download`; *voiceover, stems, mixing* `voiceover_status`, `prepare_voiceover`, `generate_voiceover`,
-`cancel_voiceover`, `stems_status`, `separate_stems`, `cancel_stems`, `get_levels`, `cancel_levels`, `plan_music_fit`,
+`cancel_model_download`; *voiceover, music, stems, mixing* `voiceover_status`, `prepare_voiceover`, `generate_voiceover`,
+`cancel_voiceover`, `music_status`, `prepare_music`, `compose_music`, `cancel_music`, `get_band_balance`,
+`cancel_band_balance`, `stems_status`, `separate_stems`, `cancel_stems`, `get_levels`, `cancel_levels`, `plan_music_fit`,
 `fit_music`, `set_track_volume`, `set_track_pan`, `set_master_volume`, `set_master_limiter`, `set_master_true_peak`,
 `set_master_duck`, `sync_clips_by_audio`, `cancel_audio_sync`;
 *timeline* `get_timeline`, `get_ripple_mode`, `set_ripple_mode`, `cut_clip`, `add_clip`, `split_clip`, `trim_clip`,
@@ -367,7 +378,7 @@ comes back `ForbiddenUrl` and the "Release notes" button silently does nothing.
 `read_text_file`, `write_text_file`, `reveal_logs`, `log_frontend`; *detached panels* `popout_expect`,
 `popout_cancel`, `close_popout`, `popout_focus`, `popout_move`.
 **Events**: `project-changed`, `analysis-progress`, `analysis-status`, `proxy-progress`, `proxy-ready`,
-`export-progress`, `import-progress`, `audio-sync-progress`, `model-progress`, `smart-crop-progress`, `voiceover-progress`, `stems-progress`,
+`export-progress`, `import-progress`, `audio-sync-progress`, `model-progress`, `smart-crop-progress`, `voiceover-progress`, `music-progress`, `stems-progress`,
 `gpu-preview-checked`, `popout-closed`, `open-project-file`, `launch-project-missing`; from the MCP server also
 `project-replaced` (another project is open: reload everything), `settings-changed` (**payload: the full
 `SettingsView`**, as `get_settings` answers it, after an agent's `set_settings`), `ripple-mode-changed`,

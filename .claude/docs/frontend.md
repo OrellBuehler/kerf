@@ -1,6 +1,6 @@
 # Frontend (`frontend/`)
 
-SvelteKit 2 / Svelte 5 **runes** (forced on in `vite.config.ts`). Two layout quirks:
+SvelteKit 3 / Svelte 5 **runes** (forced on in `vite.config.ts`). Two layout quirks:
 - **No `svelte.config.js`** — adapter and compiler options live inline in
   `vite.config.ts` via the `sveltekit()` plugin (new-style config). Static SPA via
   `adapter-static` (fallback `index.html`); `+layout.ts` sets `ssr = false` +
@@ -197,8 +197,8 @@ remounts it on every tab switch, unfold and workspace switch, and each remount
 used to decode every asset again; it keeps answers, including "no frame", but not
 a failed decode, which is retried on the next mount), Titles (`TitlesControls`), Effects (color looks +
 video effects), Transitions (the grouped picker), Audio (audio effects + the
-voiceover entry point), Transcript (`TranscriptPanel`). **The Media tab's header is the one place for the count and the
-ways in**: `MEDIA · 3` with the voiceover and import buttons (`importMedia`, `import-media.ts`; the import tooltip carries
+voiceover and music entry points), Transcript (`TranscriptPanel`). **The Media tab's header is the one place for the count and the
+ways in**: `MEDIA · 3` with the music, voiceover and import buttons (`importMedia`, `import-media.ts`; the import tooltip carries
 `file.import`'s key from the keymap) — the bin used to stack the dock tab, `MEDIA` and `3 ASSETS`. **A bin row is
 compact**: name and duration on one line, the spec in 11 px under it, then the proxy badge, one **analysis pill**
 (`3 of 5 analyzed`, the kinds one per line in its tooltip: `analysisMeter`, `analysis-steps.ts`) and the `×2` (its tooltip
@@ -298,7 +298,7 @@ still turns amber when an update is waiting, which is why it stayed out of Help;
 has *Check for updates…*. The OS window's title is `• interview.kerf — Kerf` (`window-title.ts`; the dot leads while there is
 unsaved work), set through `setWindowTitle` and the `core:window:allow-set-title` capability. The project's path moved to the status bar. **The menus**
 (`MenuBar.svelte` over the pure, bun-tested `menus.ts`): *File* (New, Open…, Save…,
-Import media…, Import captions…, Export…, Save cover frame…, an **Export as** submenu — Export captions…,
+Import media…, Import captions…, Compose music…, Export…, Save cover frame…, an **Export as** submenu — Export captions…,
 Export OTIO…, Export EDL…, Export markers as CSV…, Export YouTube chapters…, the last two off until
 there is a marker (`MenuState.hasMarkers`) —, Settings, Quit — Save is
 "as…" once the project has a file, since a saved project is its own SQLite file and
@@ -977,7 +977,7 @@ close button are off, and the button is gone), `dismissOnScrim` (off for a dialo
 `mayClose(via, {busy, dismissOnScrim})` and `scrimClick` in `modal.ts`: a click closes only if the *press* began on the scrim
 too, so selecting text in a field and letting go over the dark no longer closes the dialog. Policy per dialog: Export
 `dismissOnScrim={false}` and never `busy` (closing mid-render leaves it running); Voiceover `busy={generating}`,
-`dismissOnScrim={scrimCloses(text, generating)}`, `initial="textarea"`; Fit / Stems / Update `busy` while they run; Settings none.
+`dismissOnScrim={scrimCloses(text, generating)}`, `initial="textarea"`; Compose music `busy={generating}`, `dismissOnScrim={false}`, `initial="[data-initial]"`; Fit / Stems / Update `busy` while they run; Settings none.
 **`SliderRow`** is one numeric property: label, slider, number field, and a 24 px slot for the keyframe button, on one grid
 (`72px 1fr 60px 24px` — `NUMBER_COL`, room for `100.00s` in the 12 px mono type — the slot kept when empty so every slider in the panel is the same length; `reserve={false}` in
 a dialog; `minmax(0, 1fr)` so the row shrinks to the Inspector's 260 px minimum without clipping a value). The slider is
@@ -1051,7 +1051,7 @@ arrows only move focus and Space / Enter choose); a chip that is on or off carri
 (`a11y-guard.test.ts` scans the markup for each, and that the one focus rule lists `textarea`).
 **Progress bars say what they know** (`ProgressBar.svelte`, `.k-progress` in `controls.css`): a `progressbar` with an accessible name that fills to its
 value, or — with none (a download of unknown size, a stage that reports nothing, an export waiting on its proxy) — sweeps a segment along the track
-rather than parking it at 30 %; under `prefers-reduced-motion` the whole track is tinted instead (`progress-guard.test.ts`).
+rather than parking it at 30 %; under `prefers-reduced-motion` the whole track is tinted instead (`progress-guard.test.ts`). Its `flex` is `1 1 auto`: with `flex: 1` (basis 0) a bar under a label in a column — every run dialog — was drawn 0 px tall.
 **About Kerf** is a dialog (`AboutDialog`, `ui.aboutDialog`; `about.ts`): version, platform, build, licence, and *Copy version info* — the text a bug
 report needs, the same lines that are on screen.
 
@@ -1330,6 +1330,67 @@ reject as the backend does and leave nothing behind. `api-ripple.test.ts` drives
 `music-fit.ts` is the same arrangement for fit-to-length (`plan_music_fit`, `music_fit_clips` and
 `Project::fit_music`'s checks, messages included; `music-fit.test.ts` replays the Rust cases), behind
 `planMusicFit` / `fitMusic`.
+**Composed music and band balance.** `api.ts`: `musicStatus` / `prepareMusic` (the SoundFont, ~32 MB) / `composeMusic(ComposeRequest)` →
+`ComposeResult` (`Composed` + the refreshed `timeline`) / `cancelMusic` / `onMusicProgress` (`music-progress`:
+`download_soundfont`, `waiting`, `render`, an agent's runs included), `getBandBalance(BandBalanceRequest)` →
+`BandBalance` / `cancelBandBalance`; a stopped run rejects `music cancelled` (`MUSIC_CANCELLED`) /
+`band balance cancelled` (`BAND_BALANCE_CANCELLED`), which a dialog stays quiet on. The ids are snake_case
+inside the request (`track_id`, `replace_clip_id`), unlike the camelCase arguments of the older commands.
+`music-score.ts` is the faithful mirror of the score's pure half — `scoreDuration`, `sectionSpans`,
+`validateScore` (the engine's refusals, word for word, naming the section or chord; a seed over 2^53 - 1 is refused
+too, `MAX_SEED`), `chordError` / `keyError` (the grammar only), `resolvedChords` (the chords **as played**: the last bar
+of an outro that ends the piece is the tonic, as `resolve()` has it) and `planScoreToPicture` (validates the score
+going in and the one coming out; never picks a tempo that ends the piece before a hit it already has; stops adding
+hits at `MAX_HITS` and says how many it left out) — replayed from the Rust cases in `music-score.test.ts`, for the
+dialog's live length and errors and for the harness. `music-place.ts` mirrors the placement in `project/music.rs`
+(`musicBed`, `musicStart`, `putMusic`, `rehearseMusic`; `music-place.test.ts`) and `music-wire.ts` the structs' `deny_unknown_fields` (serde's "unknown field `x`, expected one of …" in Tauri's "invalid
+args for command" frame, nested structs included). Under `bun run dev` `composeMusic` fakes the SoundFont download and render ticks and
+lands an audio-only asset as long as the score on the `M` track (the same score is the same asset by path; its tempo
+and bar analysis written from the score, from the chords as played), aligns to the first video track's cuts or the
+markers, and refuses what the engine refuses. A placement is rehearsed on a copy of the cut with the render's length
+**before** the render (a piece over another clip of its track — `{at: 0}` and then `{at: 2}` on `M` — is refused with
+`the clip would overlap another clip on M at … — move or trim that one first`, unless ripple is on and only pushes it)
+and checked again when it lands, as one edit that ripples like any other (`runEdit` with the clip as a lane); the asset
+and its analysis are stored only after that, so a refusal leaves neither. `replace_clip_id` replaces the **whole music
+bed** — every clip of that asset on the track — with one clip at the earliest start, the named clip's id, the first
+clip's level / fade-in / effects / keys and the last one's fade-out (`Composed.replaced` is the ids, in time order,
+`[]` for an added clip); a locked track, a bed linked to a picture and a clip that is not composed music are refused in
+the core's words. `getBandBalance` picks its windows as `project/music.rs` does and words its
+`notes` as `balance_notes` (`band-balance.ts`) but the measurement itself is made up (in a browser it takes
+~0.6 s and honours Stop; under bun it is at once). `api-compose.test.ts` drives the bridge.
+**The Compose music dialog** (`ComposeMusicDialog`, `ui.composeDialog`, `ui.openCompose(prefill?)`, inert-behind like
+the voiceover's) is the voiceover's arrangement: `musicStatus` first, saying what the first piece downloads
+(`soundfontNote`), then `music-progress` stages (`musicStageLabel`) under a **Cancel** (`cancelMusic`; `music cancelled`
+stays quiet and returns to the form); failures are `Composing failed — …` toasts, `PreviewReadOnly` a notice. It cannot
+be dismissed mid-run (`busy`) and holds what was typed (`dismissOnScrim={false}`, like Export). The form is
+`compose-form.ts` (pure, bun-tested): style chips (a style moves the tempo only while it is still the old style's
+default: `setStyle`), tempo, key, **Variation** (the score's `seed`, with a reroll button), and a **section list** —
+kind, bars, a **chords line** (`I V vi IV`, `C | G | Am | F`; an arrow or dash between chords is not a chord:
+`parseChords`), optional energy (the placeholder is the kind's default), up / down / remove and a start time. Faults are
+shown per field as typed (`formIssues`: chord and key messages are the engine's, from `chordError` / `keyError`;
+`general` is what only the whole score can say — no section, over 400 bars / 600 s, a kept hit past the end — and
+`validateScore` is the oracle: a bun test holds `formIssues().any` to `validateScore() !== null` over a table), with the
+live total (`24 bars · 54 s`); Compose's tooltip names the first (`firstIssue`). **Fit to the picture** lands on a video
+track's *cuts* (a picker when several have any) or the *markers*, with a *Tempo change* slider (0–25 %, 6 %); it is off,
+with the reason, until there is a cut or a marker (`alignChoices` / `alignProblem`, the cut count of `cut_times`). Hits an
+earlier alignment wrote are kept (*Clear hits*): they sit at fixed times in the score. *Place*: after the music on `M`
+(default) or at the playhead. With an alignment the dialog stays on a **result** (cuts on a beat / downbeat before →
+after, the tempo change, hits added, the engine's notes: `alignRows`) and Done; without one it closes on a toast with
+Undo. Either way the new clip is selected (`editor.composeMusic`, which also refreshes the assets and loads the analysis
+the core wrote) and the playhead goes to its start unless it is already inside (`revealAt`). `Composed.replaced` is read
+through `wasReplaced` (the ids of the clips replaced). Re-composing replaces the **whole music bed** — every
+clip of that asset on the track, the segments Fit to video made of one piece (`musicBed`, `replaceNote`) — and is off,
+with the core's reason, on a locked track or a bed linked to a picture (`composeOffer`). Reached from **File › Compose
+music…** (`file.composeMusic`, unbound, held while a proposal is previewed), the Media tab's header (a music icon beside
+the microphone) and empty bin, the Audio tab's *Music* block, the bin's **Edit & compose again…** (an asset's score, no
+clip to replace) and a clip's right-click and Inspector **Edit & re-compose…** (`replaceClipId`; the button reads
+*Re-compose*). The Titles tab does not offer it. An asset with a `music_score` — in the Inspector for a clip, and for a
+library asset — has a **Composed music** section (`ComposedMusic`): the score's facts, its sections as a contour (width
+by bars, height by energy: `sectionContour`), the edit button and **Band balance**: *Measure* calls
+`getBandBalance({ clip_id })` (`{ asset_id }` without a clip), *Stop* `cancelBandBalance`; the answer is a row per window,
+the whole stretch first, with a bar per band (sub, bass, L-M, mid, H-M, air: its share of the window's energy, the
+dominant one lit, one scale for every row; `band-view.ts`) and the loudness, then the engine's notes. It is dropped when
+the clip, its asset, trim or level changes, and cancelled when the section goes away.
 This browser sample is a **dev harness only** — the desktop app always
 uses the real backend and starts empty. State is two runes singletons: `src/lib/state.svelte.ts`
 (`export const editor` — assets, timeline, analyses, selection, and the editing actions that
