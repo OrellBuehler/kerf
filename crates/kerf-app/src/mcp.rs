@@ -18,9 +18,9 @@ use base64::Engine as _;
 use kerf_core::{
     AudioEffect, CaptionFormat, CaptionImportRequest, CaptionOptions, CaptionStyle, CaptionTimeBase, ClipCut, ClipLut, ClipMove,
     CurvePoint, Curves, Delivery, EditSource, ExportOptions, Fit, Keyframe, Mask, MaskShape, Project, Projection, Property,
-    PropertyKey, ReframeKeyframe, Region, SplitSide, StreamKind, SvgCheck, SvgDoc, SvgLayout, SvgOverlay, SvgOverlayPatch,
-    SvgOverlayResult, SvgPreset, SvgPresetKind, SvgPresetParams, SvgSource, TextKeyframe, TimeRange, Timeline, Transition,
-    TransitionKind, VideoEffect, Wheel, Wheels,
+    PropertyKey, PropertyTrack, ReframeKeyframe, Region, SplitSide, StreamKind, SvgCheck, SvgDoc, SvgLayout, SvgOverlay,
+    SvgOverlayPatch, SvgOverlayResult, SvgPreset, SvgPresetKind, SvgPresetParams, SvgSource, TextKeyframe, TimeRange, Timeline,
+    Transition, TransitionKind, VideoEffect, Wheel, Wheels,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
@@ -1305,6 +1305,18 @@ struct PropertyKeyframesParams {
                        0.1–10, volume 0–4 (linear gain), scale > 0. At most 1000 keys."
     )]
     keys: Vec<PropertyKey>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct PropertyTracksParams {
+    #[schemars(description = "UUID of the clip")]
+    clip_id: String,
+    #[schemars(
+        description = "The numbers to re-key, each {\"prop\":name, \"keys\":[...]} exactly as set_property_keyframes \
+                       takes its prop and keys (pass [] keys to make that number static). Each number at most once; \
+                       numbers not listed are untouched."
+    )]
+    tracks: Vec<PropertyTrack>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -3470,6 +3482,19 @@ impl KerfMcp {
         let clip_id = parse_arg("clip_id", &p.clip_id)?;
         self.edit(|project| {
             let out = project.set_property_keyframes(clip_id, p.prop, p.keys).map_err(core_err)?;
+            json(&out)
+        })
+    }
+
+    #[tool(
+        description = "Re-key SEVERAL numbers of one clip in a single edit — the same keys set_property_keyframes \
+                       takes, for each number listed: retime a move and its fade together, or set a whole look's \
+                       colour keys at once, as one undo step. Numbers not listed are untouched. Returns the clip."
+    )]
+    fn set_property_tracks(&self, Parameters(p): Parameters<PropertyTracksParams>) -> Result<String, McpError> {
+        let clip_id = parse_arg("clip_id", &p.clip_id)?;
+        self.edit(|project| {
+            let out = project.set_property_tracks(clip_id, p.tracks).map_err(core_err)?;
             json(&out)
         })
     }

@@ -114,7 +114,8 @@ width/height to clear it), `remove_clip`, `remove_clips { clipIds, ripple? }`
 `set_audio_effects`, `set_keyframes` / `add_keyframe` / `clear_keyframes`,
 `set_keyframe_easing { clipId, time, easing, prop? }` (the key within a millisecond of `time`; with
 `prop`, that one number's), `set_property_keyframes { clipId, prop, keys }` (one number's own keys; none =
-static) / `copy_keyframes { fromClipId, toClipId, props?, offset? }`,
+static) / `set_property_tracks { clipId, tracks }` (several numbers' keys in one edit — the dope sheet) /
+`copy_keyframes { fromClipId, toClipId, props?, offset? }`,
 `set_reframe` / `clear_reframe` / `set_reframe_keyframes` / `add_reframe_keyframe`,
 `set_asset_projection` (asset-level 360 mark; returns the `Asset`),
 `add_overlay` / `update_overlay` / `remove_overlay` / `set_overlay_keyframes`,
@@ -360,7 +361,7 @@ comes back `ForbiddenUrl` and the "Release notes" button silently does nothing.
 *linked A/V* `extract_audio`, `add_asset_audio`, `detach_audio`, `detach_audio_clips`, `reattach_audio`,
 `reattach_audio_clips`, `link_clips`, `unlink_clips`; *clip properties* `set_volume`, `set_fade`, `set_speed`,
 `set_transform`, `set_color`, `set_grade`, `inspect_lut`, `set_transition`, `set_mask`, `set_video_effects`, `set_audio_effects`, `set_keyframes`,
-`add_keyframe`, `set_keyframe_easing`, `set_property_keyframes`, `copy_keyframes`, `clear_keyframes`, `set_reframe`,
+`add_keyframe`, `set_keyframe_easing`, `set_property_keyframes`, `set_property_tracks`, `copy_keyframes`, `clear_keyframes`, `set_reframe`,
 `clear_reframe`, `set_reframe_keyframes`, `add_reframe_keyframe`; *markers, text, titles, captions* `add_marker`,
 `update_marker`, `remove_marker`, `add_overlay`, `update_overlay`, `remove_overlay`, `set_overlay_keyframes`,
 `add_svg_overlay`, `update_svg_overlay`, `remove_svg_overlay`, `validate_svg`, `list_svg_presets`,

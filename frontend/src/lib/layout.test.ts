@@ -88,6 +88,12 @@ describe('presets', () => {
 		expect(PANELS.scopes.title).toBe('Scopes');
 	});
 
+	test('Motion docks the dope sheet beside the preview', () => {
+		const row = (PRESET_LAYOUTS.motion.grid.root as any).data[0].data.map((n: any) => n.data.views[0]);
+		expect(row).toEqual(['library', 'preview', 'keyframes', 'inspector']);
+		expect(PANELS.keyframes.title).toBe('Keyframes');
+	});
+
 	test('the agent is one tab away in every workspace', () => {
 		for (const id of WORKSPACE_IDS) expect(viewsOf(PRESET_LAYOUTS[id])).toContain('agent');
 	});
@@ -571,9 +577,9 @@ describe('what a preset offers', () => {
 		for (const id of WORKSPACE_IDS.filter((w) => w !== 'audio')) expect(presetPanelIds(id)).not.toContain('mixer');
 	});
 
-	test('a layout stored before the record is taken to have been offered every panel but the mixer and the scopes', () => {
+	test('a layout stored before the record is taken to have been offered every panel but the mixer, the scopes and the dope sheet', () => {
 		for (const id of WORKSPACE_IDS) {
-			expect(UNSTAMPED_OFFERED[id]).toEqual(presetPanelIds(id).filter((p) => p !== 'mixer' && p !== 'scopes'));
+			expect(UNSTAMPED_OFFERED[id]).toEqual(presetPanelIds(id).filter((p) => p !== 'mixer' && p !== 'scopes' && p !== 'keyframes'));
 		}
 	});
 
@@ -581,6 +587,18 @@ describe('what a preset offers', () => {
 		expect(openPanelIds(EARLIER_PRESETS.color!)).not.toContain('scopes');
 		expect(presetPanelIds('color')).toContain('scopes');
 		for (const id of WORKSPACE_IDS.filter((w) => w !== 'color')) expect(presetPanelIds(id)).not.toContain('scopes');
+	});
+
+	test('the earlier Motion preset has no dope sheet, and the dope sheet is Motion’s alone', () => {
+		expect(openPanelIds(EARLIER_PRESETS.motion!)).not.toContain('keyframes');
+		expect(presetPanelIds('motion')).toContain('keyframes');
+		for (const id of WORKSPACE_IDS.filter((w) => w !== 'motion')) expect(presetPanelIds(id)).not.toContain('keyframes');
+	});
+
+	test('the dope sheet comes back between the preview and the inspector', () => {
+		const back = insertPanel(closed(PRESET_LAYOUTS.motion, 'keyframes'), 'keyframes', PRESET_LAYOUTS.motion)!;
+		const row = (back.grid.root as any).data[0].data.map((n: any) => n.data.views[0]);
+		expect(row).toEqual(['library', 'preview', 'keyframes', 'inspector']);
 	});
 
 	test('the scopes come back between the preview and the inspector', () => {
