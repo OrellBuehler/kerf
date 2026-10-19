@@ -65,6 +65,34 @@ describe('the library', () => {
 	});
 });
 
+describe('the Inspector', () => {
+	const inspector = read(`${EDITOR}Inspector.svelte`);
+	const asset = read(`${EDITOR}AssetInspector.svelte`);
+
+	test('is about what is selected: it adds no titles and applies no looks — the library, the lane and the menu do', () => {
+		expect(inspector).not.toContain('TitlesControls');
+		expect(inspector).not.toContain('COLOR_LOOKS');
+		expect(inspector).not.toMatch(/addTextHere|makeCaptions|dropCaptions/);
+		expect(read('lib/menus.ts')).toContain("act('title.add'");
+		expect(read(`${EDITOR}Timeline.svelte`)).toContain("settings.shortcut('title.generateCaptions')");
+	});
+
+	test('an asset reads name, the ways onto the timeline, then a section per subject, with Relink / Remove last', () => {
+		const add = asset.indexOf('>Add at playhead<');
+		const media = asset.indexOf('title="Media"');
+		const analysis = asset.indexOf('title="Analysis"');
+		const remove = asset.indexOf('>Remove…<');
+		expect(add).toBeGreaterThan(-1);
+		expect(add).toBeLessThan(media);
+		expect(media).toBeLessThan(analysis);
+		expect(analysis).toBeLessThan(remove);
+		expect(asset).toContain('<MediaChips assetId={asset.id} proxy={false} />');
+		expect(asset.slice(analysis, remove)).toContain('>Analyze<');
+		expect((asset.match(/>Relink…</g) ?? []).length).toBe(2);
+		expect(asset).toContain('{#if !gone}');
+	});
+});
+
 describe('the agent panel', () => {
 	const agent = read(`${EDITOR}AgentPanel.svelte`);
 

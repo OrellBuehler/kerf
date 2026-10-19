@@ -1,7 +1,6 @@
-// What the Titles controls do, shared by the Inspector's "Titles lane" section
-// and the library's Titles tab so the two cannot drift: add a title at the
-// playhead, add one in a preset style, add an animated SVG title, caption the cut, caption it from a
-// subtitle file, pick a title to edit.
+// What the Titles controls do, shared by the library's Titles tab, the timeline's titles lane and the
+// menu bar so they cannot drift: add a title at the playhead, add one in a preset style, add an animated
+// SVG title, caption the cut, caption it from a subtitle file, pick a title to edit.
 
 import { editor } from './state.svelte';
 import { ui } from './editor-ui.svelte';
@@ -24,7 +23,14 @@ import type { TextStyle } from './style-presets';
 import { sampleSvg, svgDataUrl, svgFrame, svgPresetChoice } from './svg-titles';
 import type { SvgCheck, SvgOverlay, SvgPresetInfo, SvgPresetKind, TextOverlay } from './types';
 
-/** A plain title at the playhead. */
+/** A plain title at the playhead: the lane's +, its menu and Edit › Add title at playhead. */
+export async function addTitleHere(): Promise<void> {
+	if (holdForPreview()) return;
+	const at = Math.max(0, ui.time);
+	return attempt(() => editor.addTitle('Title', at, at + settings.editing.title_seconds));
+}
+
+/** A plain text overlay at the playhead. */
 export function addTextHere(): Promise<void> {
 	const at = Math.max(0, ui.time);
 	return attempt(() => editor.addTitle('Text', at, at + settings.editing.title_seconds));

@@ -138,7 +138,8 @@ racing writes could leave the older on disk; bun-tested). `workspace.svelte.ts`
 is the runes singleton: `switchTo` keeps the arrangement being left, swaps the
 layout and shows the library tab that workspace last had (each remembers its own;
 until one is picked it is the workspace's tool: Color → Effects, Audio → Audio,
-Motion → Transitions, Edit and Deliver → Media), and **touches no project state**
+Motion → Titles — titles are added there, not in the Inspector —, Edit and Deliver → Media; a tab the user picked
+in a workspace is stored and kept, only the unpicked default moved), and **touches no project state**
 — cut, selection, playhead and playback are `editor` / `ui` and survive (dockview
 rebuilds the panels, so a panel's own scroll starts over). **A layout is written
 only if it was rearranged**: dockview reports layout changes for a great deal
@@ -214,9 +215,22 @@ equal `Btn sm` (`+ Title` / `+ Lower third` / `+ Caption` / `+ Text`; `Generate 
 Audio act on the selected clip and say why they are off when none is; they own no
 value (a look is a `Color`, an effect an entry in the clip's chain), so the
 Inspector stays where you tune — the presets are `effect-presets.ts`, shared with
-its pickers. Titles is the same component as the Inspector's *Titles lane*
-section, which stays (a folded library must not make titles unreachable), over
-`title-actions.ts`; the caption look they share is `ui.captionStyle`. Clicking the
+its pickers. Titles (`TitlesControls`, over `title-actions.ts`) is the one panel of
+title controls; the caption look it shares with the lane's menu is `ui.captionStyle`.
+**One place per action.** The Inspector is about the selection and creates nothing:
+the Library adds (titles, looks, effects, transitions, audio), the timeline places and
+trims, the Inspector tunes what is selected, and the menu bar (entries from the keymap
+registry, so each carries the user's key) keeps the common adds reachable when the library is
+folded or closed — *Edit › Add title at playhead* (`title.add`, ⌘T / Ctrl+T, also the
+titles lane's +), *Generate captions* (`title.generateCaptions`, also the lane's
+right-click, with *Clear captions*) and *File › Import captions…*; animated titles are also the
+lane's right-click. The styled titles (lower third, caption, text), the caption look and the
+templates are the Titles tab's alone (the rail and *Window › Library* bring it back). The Inspector used to
+carry the whole Titles controls as a *Titles lane* section under every selection, the
+look chips in its Color section and *Add text overlay / Generate captions* in its
+right-click; each duplicated the Titles tab, the Effects tab or the lane and is gone
+(`panels-polish.test.ts` holds it). Context menus stay: they are the selection's own
+actions where the pointer is. Clicking the
 active icon **folds** the content to the rail (`library.collapsed`, persisted and
 shared by every workspace — the rail is a tool, not part of an arrangement) and
 the panel gives its width back: the registry minimum is the rail's 40 px, an open
@@ -305,8 +319,8 @@ there is a marker (`MenuState.hasMarkers`) —, Settings, Quit — Save is
 `save_project_as` is the only save there is), *Edit* (Undo / Redo, Cut / Copy / Paste /
 Duplicate, **Split at playhead**, Delete / Ripple delete / Select all, **Tool**, **Clip** and
 **Roll, slip, slide** submenus — the five tools as radios, trim / detach / link, and the
-one-frame roll / slip / slide keys — Ripple mode and Snapping as ticks,
-Customize keyboard shortcuts…), *View* (zoom, **Track height**, Overview strip, Safe-area guides,
+one-frame roll / slip / slide keys — **Add title at playhead** and **Generate captions** (off until the cut has a clip),
+Ripple mode and Snapping as ticks, Customize keyboard shortcuts…), *View* (zoom, **Track height**, Overview strip, Safe-area guides,
 **Delivery frame**, **Workspace**), *Window* (every panel as a tick, Reset <workspace>
 workspace, Reset all workspaces — which asks first when any arrangement is stored),
 *Playback* (Play / pause, Go to start / end, Go to timecode, back and forward a frame and a second,
@@ -387,13 +401,12 @@ them, and the button never says "Export N files", for a cut with no video clip
 (`ui.openExport()`); the panel shows its progress and Stop while one runs.
 A picture and its linked sound are **one selection**: the Inspector's "N clips selected" notice counts
 link groups (`selectionUnits`, `link-ui.ts`) and a linked clip carries a quiet "Linked to A1" chip beside
-its track badge instead. The `Inspector` is **mounted whether or not a clip is selected**:
-its Text overlays section belongs to the timeline rather than to any one clip, so
-gating the panel on a selection made titles and captions unreachable until you
-clicked a clip. Its sections are `InspectorSection`s — native `<details>`
+its track badge instead. The `Inspector` is **mounted whether or not a clip is selected** and shows the
+selection: a title, an animated title, a clip, else the library asset selected in the bin,
+else an empty state that says where titles are added. Its sections are `InspectorSection`s — native `<details>`
 disclosures, so they are keyboard-operable for free — each with a one-line
 **summary** on the right (`1.00×`, `Cropped`, `2 keyframes`) so a collapsed
-section still says what it holds; Timing, Volume and Titles open by default,
+section still says what it holds; Timing and Volume open by default,
 everything else is folded. It edits the selected clip —
 trim, volume, fades, speed, transform, color, **curves / color wheels / LUT** (`GradeSections.svelte`: a canvas
 curve editor per channel — click adds a point, drag moves it, double-click or right-click removes it, one `set_grade` on
@@ -483,17 +496,20 @@ section. A title's Color and Box are a **swatch (native colour input) plus the f
 spelling — a name, `#rrggbb[aa]`, `@alpha` — read for the swatch, and a pick written back keeping the alpha; a box with none starts at
 `@0.55`). Reverse, Bold and Invert are `CheckRow`s, box first. The destructive pair is one row of two small buttons (`Remove clip`,
 `Ripple delete`; Remove is red ink on the neutral edge — `data-quiet` on a destructive `Btn` — not an outline in alarm colour). **With no clip or title selected, a library asset selected in the bin is the Inspector's subject**
-(`AssetInspector`, `asset-facts.ts`): name and kind, the proxy and analysis chips and Analyze, Add at playhead / Append, and
-Media / Analysis / Proxy sections with what the bin's right-click menu used to list as twenty rows (it was 960 px tall; it is the
-actions now, with Analyze as one entry that opens its own menu).
+(`AssetInspector`, `asset-facts.ts`): name and kind, *Add at playhead* / *Append* as one row of two, then one section per
+subject with its own actions — **Media** (the facts; the bin row keeps the spec line), **Analysis** (summary `2 of 5` /
+`running…`, the analysis chips without the proxy one, failures and findings, *Analyze* and *Export .srt*), **Proxy** (its
+facts, *Rebuild* / *Delete*) — and *Relink…* / *Remove…* last, the row a clip keeps its Remove in (Relink is the missing
+callout's alone while the file is gone). The rows are what the bin's right-click menu used to list as twenty (it was 960 px
+tall; it is the actions now, with Analyze as one entry that opens its own menu).
 **Polish presets** (`src/lib/style-presets.ts`, pure data over the existing
-surfaces): the Color section leads with one-click **looks** —
-Punchy / Warm / Cool / Faded / B&W chips (the active one highlights; the sliders
-show exactly what a chip applied) built on `Color.temperature`, a warm-cool
+surfaces): one-click **looks** — the library Effects tab's
+Punchy / Warm / Cool / Faded / B&W chips (the active one highlights; the Inspector's Color
+sliders show exactly what a chip applied, its summary names the look, and *Reset color* under them goes back to none) built on `Color.temperature`, a warm-cool
 channel in -1..1 rendered as opposing `eq` per-channel gammas (`eq_filter` —
 omitted at 0 so old graphs stay byte-identical; plain saturation/gamma can't
-tint) — and the Text overlays section leads with **Title / Lower third /
-Caption** style chips that create a styled overlay at the playhead with
+tint) — and the Titles tab leads with **Title / Lower third /
+Caption** style buttons that create a styled overlay at the playhead with
 fade-in/out opacity keyframes; the caption style matches what
 `generate_captions` writes in its `lines` style, so manual and generated
 captions look alike (`CAPTION_LOOKS` in the same file is only the two
@@ -535,8 +551,8 @@ drags in time, the 6px edges trim, with the clip drag's snapping (0 / playhead /
 beats / every clip edge / other titles), Delete removes it, and one
 `update_overlay` is written per gesture. A selected title makes the Inspector show
 **that title's editor** (text, timing, position, size, colour, box, font, bold,
-keyframes) *instead of* the clip sections; the add / caption controls live in a
-"Titles lane" section below. The **Preview** draws an interactive box over each
+keyframes) *instead of* the clip sections; adding and captioning are the Titles tab's,
+the lane's + and right-click menu's and the Edit menu's. The **Preview** draws an interactive box over each
 title visible at the playhead (hidden while playing): drag to move, corner
 handles to resize (scales `size` by the pointer's distance from the box centre),
 Escape / pointercancel / blur abandon it, pointer capture holds it, local state
@@ -670,8 +686,8 @@ tests had not) — and `caption-import.ts` carries the subtitle parsers and
 `captions.ts` `placeCues` the same way, which is how `importCaptionsText` (the
 variant the harness and a file input use; `importCaptions(path)` needs the desktop
 app) imports for real under `bun run dev`, with `describeImport` the toast line.
-**Import captions…** is a button in `TitlesControls` (so in the Inspector's Titles
-lane and the library's Titles tab) and an entry in the titles-lane context menu
+**Import captions…** is a button in `TitlesControls` (the library's Titles tab),
+*File › Import captions…* and an entry in the titles-lane context menu
 (plus one per clip the cut shows, up to three). The button opens an inline options
 row — not a dialog, the controls live in a narrow column — and *Choose file…* runs
 `importCaptionFile` (`title-actions.ts`): `pickCaptionFile` (desktop: the dialog
@@ -691,8 +707,8 @@ falls back to the cut when nothing is offered. An imported set and a generated o
 are both `generated` and cannot be told apart, so Recaption's and Clear's tooltips
 say they replace / remove *either* instead of guessing — and so does the confirm:
 `confirmReplaceCaptions` (`title-actions.ts`) asks "Replace the 12 captions already on
-the cut?" before **Captions / Recaption** (and the Inspector's menu entry, which calls
-the same `makeCaptions`) and the **AgentPanel's "Caption the cut" chip** (asked before
+the cut?" before **Captions / Recaption** (and the lane's menu entry and *Edit › Generate captions*,
+which call the same `makeCaptions`) and the **AgentPanel's "Caption the cut" chip** (asked before
 the task is queued, so declining leaves nothing behind) write over a set, counted on
 `editor.liveTimeline` like the import's — the same count the options row and the
 button label show (`#liveTimeline` is `$state.raw` so they follow a parked update).
@@ -1243,7 +1259,7 @@ modifiers — the old handler ignored extra Shift/Alt and took ⌘ or Ctrl every
 `keymap.test.ts` holds the defaults against a copy of it (the differences: ⌘⇧S
 stays Save as a second default, ⇧J-style accidents and Ctrl-on-Mac are gone), plus the
 bare keys added since (`ADDED`: N / Y / U / Q / W / S) and the modified chords added for linked A/V
-(`ADDED_SHIFT` ⇧D detach, `ADDED_MOD` ⌘L link and ⌘K split, `ADDED_MOD_SHIFT` ⇧⌘D reattach / ⇧⌘L unlink). **Split at playhead** is `edit.split` (⌘K; Edit menu and the clip menu, which says why when it is off): the selected clips the playhead is inside, or — nothing selected — every clip under it, cut on the frame it is on, a link group as one cut (`planPlayheadSplit`, `key-edits.ts`; one Undo per cut made). **Roll, slip and slide have keys**, a frame a press (`repeat: false`, since each press is a revision): `<` / `>` roll the cut nearest the playhead (the playhead follows it), `Alt+,` / `Alt+.` slip the selected clip's footage, `Mod+Alt+,` / `Mod+Alt+.` slide it — each tried first on a scratch copy through `previewEdit` (the drags' own port), so a limit or a locked track is a sentence, not a refusal from the backend. **`?` opens the shortcut cheat sheet** (`ShortcutSheet`, `shortcut-sheet.ts`: every key in force, grouped as the settings list is, read-only; Help › Keyboard shortcuts…) and *Customize keyboard shortcuts…* is the rebinding editor (`app.keyboard`) — the two used to be one dialog. The registry's *Save project…* is one label for one command; the File menu says *Save project as…* once the project has a file.
+(`ADDED_SHIFT` ⇧D detach, `ADDED_MOD` ⌘L link, ⌘K split, ⌘G go to timecode and ⌘T add title, `ADDED_MOD_SHIFT` ⇧⌘D reattach / ⇧⌘L unlink). **Split at playhead** is `edit.split` (⌘K; Edit menu and the clip menu, which says why when it is off): the selected clips the playhead is inside, or — nothing selected — every clip under it, cut on the frame it is on, a link group as one cut (`planPlayheadSplit`, `key-edits.ts`; one Undo per cut made). **Roll, slip and slide have keys**, a frame a press (`repeat: false`, since each press is a revision): `<` / `>` roll the cut nearest the playhead (the playhead follows it), `Alt+,` / `Alt+.` slip the selected clip's footage, `Mod+Alt+,` / `Mod+Alt+.` slide it — each tried first on a scratch copy through `previewEdit` (the drags' own port), so a limit or a locked track is a sentence, not a refusal from the backend. **`?` opens the shortcut cheat sheet** (`ShortcutSheet`, `shortcut-sheet.ts`: every key in force, grouped as the settings list is, read-only; Help › Keyboard shortcuts…) and *Customize keyboard shortcuts…* is the rebinding editor (`app.keyboard`) — the two used to be one dialog. The registry's *Save project…* is one label for one command; the File menu says *Save project as…* once the project has a file.
 **Only what the user changed is stored** (`Settings.keybindings`, opaque to Rust
 like `theme`: `{ version, bindings: { id: [chord…] } }`, patch-written, `null` when
 nothing is customised), so an untouched action follows the running build's defaults
@@ -1295,7 +1311,7 @@ Export… (their own row, so they no longer wrap), then the shape sliders and ev
 *Snapping on at launch* (sets `ui.snap` once on load and again when changed; the toolbar toggle stays the session's), *Length of a still
 image* (`placementOut(asset, still_seconds)` is the source end of every single placement — the bin's *Add at playhead* / *Append*, the
 Inspector's, the empty Preview's and a bin drag — *Append all* is the backend's `concatenate` and keeps its default) and *Length of a new
-title* (the Titles lane's + and *Add text*). **Preview & playback** — proxy size and preview source (`ChoiceChips`, the one radio-chip
+title* (`addTitleHere` — the titles lane's +, *Edit › Add title at playhead* — and *Add text*). **Preview & playback** — proxy size and preview source (`ChoiceChips`, the one radio-chip
 component: one tab stop, arrows move; proxy size only moves focus because choosing one rebuilds every proxy), safe areas, the GPU preview
 and its status line. **Performance** — the CPU limit as three named budgets over a slider, read back as "9 of 12 cores for Kerf · 3 left".
 **Analysis** — a master "analyze on import" and one switch per kind (`auto_analysis`; the same set decides what an agent's `analyze_asset`
@@ -1638,14 +1654,14 @@ them (`addTemplateHere`, `importTemplateFile`, `exportTemplateFile`, `deleteTemp
 `saveTitleAsTemplate`, `setTemplateValue`, `setTemplateImage`; `posterOf` caches a poster per id) and says outcomes through
 `notifications` (the engine's warnings are the toast's description); `editor.applyTemplate` / `setTemplateValues` take
 the `TemplateEdit`'s timeline like any edit and the first selects the new title. **Library**: `TemplatesSection` is part
-of `TitlesControls`, so the Titles tab and the Inspector's Titles lane both have it: an `Import…` ghost button on the
+of `TitlesControls`, the Titles tab: an `Import…` ghost button on the
 `TEMPLATES` heading, one `TemplateCard` each (poster in the delivery frame's shape, the duration as a chip over it, name,
 `N controls`, font families; a click adds it at the playhead; the `⋯` button (named "More actions for <name>") and a right-click offer *Add at the
 playhead*, *Export…* — a save dialog for `.kerftemplate`, the harness answers `/harness/<name>` and keeps the "file" for
 `importTemplate` — and *Delete…* — confirmed, titles made from it keep working). The grid reads the library when it opens
 and on `templates-changed` (`onTemplatesChanged`), which fires for the backend's event (an agent's change: the Tauri
 commands emit none) **and** for the page's own save, import and delete — `api.ts` announces them once the call has
-resolved, in the app and in the harness alike — so every mounted grid (the Titles tab, the Inspector's lane) refreshes; `problems` are a collapsed one-line `<details>`; an empty library explains how to make one. There is no drag to
+resolved, in the app and in the harness alike — so the Titles tab refreshes wherever it is mounted; `problems` are a collapsed one-line `<details>`; an empty library explains how to make one. There is no drag to
 the timeline: the preset tiles have none either. **Save as template…** (`SaveTemplateDialog` over `Modal`; `ui.saveTemplateDialog`,
 mounted by the page and counted in `modalOpen`): name (blank = the title's own name, as the engine has it; it is the field's placeholder), description, and
 a list of controls (`TemplateControlEditor`; every field of a row is named by its control's label, or `control N` before it has
@@ -1694,7 +1710,7 @@ and the placement box maths (`dragRect` / `roundRect` / `rectPatch`). **State**:
 `timeline.svg_overlays`, so it is live under the bun runes stand-in), `selectedSvgOverlayId` — exclusive with the clip and text-title
 selections (`selectSvgOverlay` / `selectOverlay` / `selectClip` … each clear the others), pruned in `#setTimeline` when an undo or
 agent edit removes it — and `addSvgOverlay` / `addSvgTitle` (selects what it made) / `updateSvgOverlay` / `removeSvgOverlay`. **Add**:
-the Titles controls' `ANIMATED` section (also the Inspector's *Titles lane*) is a `+ Animated` button that opens tiles of the four
+the Titles controls' `ANIMATED` section is a `+ Animated` button that opens tiles of the four
 presets with thumbnails (`presetThumbnail`: `svg_preset_preview` drawn for 600 s so the browser's own SMIL player plays the entrance
 and holds it, replayed on hover; cached per frame shape; the thumbnail span is `pointer-events:none` — replacing the `<img>` under a
 pressed pointer swallowed the click) and `Custom SVG…` (`addCustomSvgTitle`: the sample, selected, and `ui.svgSourceFocus` makes the
