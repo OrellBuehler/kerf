@@ -536,9 +536,24 @@ undoing the edit before it.
 
 The meters are **measured**. `audio.ts` routes each track through a bus gain and its
 pan legs, then a stereo pair of `AnalyserNode`s, into a master gain. That feeds the
-limiter, which is a `DynamicsCompressorNode` approximation (`limiterParams` in
-`audio-mix.ts` trims its automatic makeup gain; the tooltip says it is an
-approximation of the export's `alimiter`), then a master analyser. The fader moved
+limiter, then a master analyser. Where the webview can run it, the limiter is the **export's own**:
+`alimiter.ts` ports FFmpeg's `alimiter` sample for sample as `limiter_filter` spells it (replayed to the bit
+against an ffmpeg corpus, see `engine-cli.md`), run in an AudioWorklet (`limiter-worklet.ts`, registered as
+`kerf-alimiter`). It limits the *preview's* mix, which is not the export's — a mono 32 kHz decode, no ducking —
+so even then it can limit a little differently; the tooltips say which limiter plays (`limiterNote` of
+`audio.limiterKind()`: `pending`, `exact`, `approximate`, followed with `onLimiterKind`). The main thread
+posts the limit only when it changes, and `{reset: true}` on every `start()` and whenever the worklet goes
+back in the path (on → off → on, the module loading mid-play), so no lookahead or gain reduction of before
+carries over. Vite bundles the worklet as a file of its own (`limiter-worklet-url.ts`,
+`?worker&url`, imported on demand because bun cannot resolve the suffix), served from the app's origin, so
+the CSP's `script-src 'self'` admits it with no `blob:`. A stream cannot trim `latency=1`'s lookahead, so
+the sound is 5 ms late (`alimiterDelay`: 239 frames at 48 kHz) and `AudioEngine.outputLatency()` adds that
+while the worklet is in the path, so the GPU picture waits for it. The module loads once per context; until
+it has, and for good where it cannot (no AudioWorklet, a module refused: `AudioEnv.createLimiter`; said with
+the reason by `AudioEnv.warn`, to the console and the app's log), or after the processor throws
+(`onprocessorerror`: the compressor takes the master back rather than leaving it silent), the
+limiter is the old `DynamicsCompressorNode` approximation (`limiterParams` in `audio-mix.ts`, which trims
+its automatic makeup gain). True peak's oversampling is export-only. The fader moved
 from the clip envelope (`clipGainAt`) onto the bus, which is the same product, so what
 plays is unchanged. `meter.ts` holds the ballistics: peak with fall-off, smoothed RMS
 and a held peak. The meters animate only while playing. Ducking is **export-only**:

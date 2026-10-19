@@ -8,10 +8,10 @@
 	// only while playback does; stopped, the bars drop to nothing and what the run
 	// reached (the held peak, a clip lamp) stays to be read.
 	//
-	// Two things are *not* the preview's: ducking happens on export (Web Audio's
-	// compressor has no sidechain input without an AudioWorklet), and the limiter is an
-	// approximation — each says so where you switch it on, and the peak readout says the meters
-	// are the preview's sample peak. The Measure button reads the real mix.
+	// Ducking is *not* the preview's: it happens on export (Web Audio's compressor has no
+	// sidechain input), and the toggle says so. The limiter is the export's own (`audio.ts`).
+	// The peak readout says the meters are the preview's sample peak; the Measure button reads
+	// the real mix.
 	import { untrack } from 'svelte';
 	import { intersectionObserverFor } from '#lib/realm';
 	import { windows, type FrameHandle } from '#lib/windows.svelte';

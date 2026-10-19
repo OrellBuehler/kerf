@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, mock, test } from 'bun:test';
 import { dbToGain, panGains } from './mixer';
 import { limiterParams } from './audio-mix';
+import { alimiterDelay, limiterLimit, type LimiterMessage } from './alimiter';
 import type { Clip, Timeline, Track } from './types';
 
 // The preview's audio graph, driven over a fake `AudioContext` that records what is
@@ -16,9 +17,13 @@ mock.module('./notifications.svelte', () => ({
 }));
 const { AudioEngine } = await import('./audio');
 
+/** The engine's fallback warning (no AudioWorklet in bun), kept out of the test output: the tests that
+ *  are about it pass their own `warn`. */
+const quiet = () => {};
+
 // ---- a fake Web Audio ------------------------------------------------------
 
-type Kind = 'gain' | 'merger' | 'splitter' | 'analyser' | 'compressor' | 'source' | 'destination';
+type Kind = 'gain' | 'merger' | 'splitter' | 'analyser' | 'compressor' | 'worklet' | 'source' | 'destination';
 interface Edge {
 	to: FakeNode;
 	output: number;
@@ -79,6 +84,14 @@ class FakeCompressor extends FakeNode {
 		super('compressor', ctx);
 	}
 }
+class FakeWorklet extends FakeNode {
+	posted: LimiterMessage[] = [];
+	onprocessorerror: ((e: ErrorEvent) => void) | null = null;
+	port = { postMessage: (m: LimiterMessage) => void this.posted.push(m) };
+	constructor(ctx: FakeContext) {
+		super('worklet', ctx);
+	}
+}
 class FakeAnalyser extends FakeNode {
 	fftSize = 2048;
 	/** What the next read returns; the block is padded with silence. */
@@ -126,6 +139,7 @@ class FakeBuffer {
 class FakeContext {
 	nodes: FakeNode[] = [];
 	currentTime = 0;
+	sampleRate = 48000;
 	state = 'running';
 	destination = new FakeNode('destination', this);
 	createGain = () => new FakeGain(this);
@@ -201,6 +215,7 @@ beforeEach(() => {
 	ctx = new FakeContext();
 	reported = [];
 	engine = new AudioEngine({
+		warn: quiet,
 		createContext: () => ctx as unknown as AudioContext,
 		fetchPcm: pcm as never,
 		report: (m) => reported.push(m)
@@ -285,6 +300,7 @@ describe('reverse shuttle', () => {
 	const ramped = (kept = 1) => {
 		const asked: [string, number, number][] = [];
 		const e = new AudioEngine({
+			warn: quiet,
 			createContext: () => ctx as unknown as AudioContext,
 			fetchPcm: (async (asset: string, start: number, dur: number) => {
 				asked.push([asset, start, dur]);
@@ -395,6 +411,7 @@ describe('reverse shuttle', () => {
 	test('past 600 s of source the window is held at the end the playhead enters by', async () => {
 		const asked: [string, number, number][] = [];
 		const e = new AudioEngine({
+			warn: quiet,
 			createContext: () => ctx as unknown as AudioContext,
 			fetchPcm: (async (asset: string, start: number, dur: number) => {
 				asked.push([asset, start, dur]);
@@ -522,7 +539,7 @@ describe('the mix at the speakers', () => {
 		];
 		for (const c of cases) {
 			ctx = new FakeContext();
-			engine = new AudioEngine({ createContext: () => ctx as unknown as AudioContext, fetchPcm: pcm as never });
+			engine = new AudioEngine({ warn: quiet, createContext: () => ctx as unknown as AudioContext, fetchPcm: pcm as never });
 			await play({ tracks: [track('a1', 'audio', [clip('c', 'voice', { volume: c.volume })], { volume: c.fader, pan: c.pan })] });
 			const [gl, gr] = panGains(c.pan);
 			const [l, r] = heard(ctx);
@@ -612,6 +629,7 @@ describe('scheduling is what it was', () => {
 
 	test('a window that cannot be decoded is reported once and does not stop the rest', async () => {
 		const failing = new AudioEngine({
+			warn: quiet,
 			createContext: () => ctx as unknown as AudioContext,
 			fetchPcm: (async (asset: string) => {
 				if (asset === 'voice') throw new Error('no such file');
@@ -693,6 +711,144 @@ describe('the master limiter', () => {
 	test('the master fader is clamped to the engine’s +12 dB', async () => {
 		await play(withMaster({ volume: 9, limiter: false, ceiling_db: -1 }));
 		expect(master().input.gain.value).toBe(4);
+	});
+});
+
+describe('the export’s limiter in a worklet', () => {
+	const on = (ceiling_db: number, volume = 1): Timeline => ({
+		tracks: [track('a1', 'audio', [clip('c', 'voice')])],
+		master: { volume, limiter: true, ceiling_db }
+	});
+	let asked: number[];
+	let warned: string[];
+	let kinds: string[];
+	let load: (node: FakeWorklet | null) => void;
+	let fail: (e: Error) => void;
+	beforeEach(() => {
+		asked = [];
+		warned = [];
+		kinds = [];
+		engine = new AudioEngine({
+			createContext: () => ctx as unknown as AudioContext,
+			fetchPcm: pcm as never,
+			report: (m) => reported.push(m),
+			warn: (m) => warned.push(m),
+			createLimiter: (_ctx, limit) => {
+				asked.push(limit);
+				return new Promise((resolve, reject) => {
+					load = (n) => resolve(n as never);
+					fail = reject;
+				});
+			}
+		});
+		engine.onLimiterKind((k) => kinds.push(k));
+	});
+	const input = () => ctx.of<FakeGain>('gain')[0];
+	const out = () => ctx.of<FakeGain>('gain')[2];
+
+	test('the compressor stands in until the module has loaded, then the worklet takes its place, fresh', async () => {
+		await play(on(-3));
+		const [comp] = ctx.of<FakeCompressor>('compressor');
+		expect(input().outs.map((e) => e.to)).toEqual([comp]);
+		expect(engine.outputLatency()).toBe(0);
+		expect(engine.limiterKind()).toBe('pending');
+		const node = new FakeWorklet(ctx);
+		load(node);
+		await settle();
+		expect(input().outs.map((e) => e.to)).toEqual([node]);
+		expect(node.outs.map((e) => e.to)).toEqual([out()]);
+		expect(reach(input()).has(comp)).toBe(false);
+		expect(node.posted).toEqual([{ limit: limiterLimit(-3), reset: true }]);
+		expect(engine.limiterKind()).toBe('exact');
+		expect(kinds).toEqual(['exact']);
+		expect(warned).toEqual([]);
+	});
+
+	test('its lookahead is added to the latency while it is in the path, and only then', async () => {
+		await play(on(-1.5));
+		load(new FakeWorklet(ctx));
+		await settle();
+		expect(engine.outputLatency()).toBe(239 / 48000);
+		expect(engine.outputLatency()).toBe(alimiterDelay(48000));
+		engine.liveMaster({ volume: 1, limiter: false, ceiling_db: -1.5 });
+		expect(engine.outputLatency()).toBe(0);
+		expect(input().outs.map((e) => e.to)).toEqual([out()]);
+	});
+
+	test('the limit is posted when it changes, not on every move, and the module loads once per context', async () => {
+		await play(on(-1.5));
+		const node = new FakeWorklet(ctx);
+		load(node);
+		await settle();
+		node.posted = [];
+		engine.liveMaster({ volume: 1, limiter: true, ceiling_db: -9 });
+		engine.liveMaster({ volume: 0.5, limiter: true, ceiling_db: -9 });
+		engine.liveMaster({ volume: 0.7, limiter: true, ceiling_db: -9 });
+		expect(node.posted).toEqual([{ limit: limiterLimit(-9) }]);
+		expect(asked).toHaveLength(1);
+		expect(ctx.of('worklet')).toHaveLength(1);
+	});
+
+	test('it starts over on every start and whenever it goes back in the path, so nothing of before carries over', async () => {
+		await play(on(-1.5));
+		const node = new FakeWorklet(ctx);
+		load(node);
+		await settle();
+		node.posted = [];
+		// A restart (a seek, a resync): the lookahead and any gain reduction are dropped.
+		await play(on(-1.5), 4);
+		expect(node.posted).toEqual([{ reset: true }]);
+		// Off and on again while playing.
+		node.posted = [];
+		engine.liveMaster({ volume: 1, limiter: false, ceiling_db: -1.5 });
+		engine.liveMaster({ volume: 1, limiter: true, ceiling_db: -1.5 });
+		expect(node.posted).toEqual([{ limit: limiterLimit(-1.5), reset: true }]);
+		// A restart with a new ceiling: the limit, then the reset (which keeps it).
+		node.posted = [];
+		await play(on(-6), 2);
+		expect(node.posted).toEqual([{ limit: limiterLimit(-6) }, { reset: true }]);
+	});
+
+	test('a worklet that throws hands the master back to the compressor rather than silencing it', async () => {
+		await play(on(-3));
+		const node = new FakeWorklet(ctx);
+		load(node);
+		await settle();
+		node.onprocessorerror?.(new Event('processorerror') as ErrorEvent);
+		const [comp] = ctx.of<FakeCompressor>('compressor');
+		expect(input().outs.map((e) => e.to)).toEqual([comp]);
+		expect(reach(input()).has(node)).toBe(false);
+		expect(engine.outputLatency()).toBe(0);
+		expect(engine.limiterKind()).toBe('approximate');
+		expect(warned).toEqual(["The preview's limiter is an approximation from now on: its worklet stopped with an error."]);
+		// And it stays the compressor: a restart does not wire the dead node back in.
+		await play(on(-3));
+		expect(input().outs.map((e) => e.to)).toEqual([comp]);
+	});
+
+	test('a module that will not load keeps the compressor, says why, and adds no lookahead', async () => {
+		await play(on(-3));
+		fail(new Error('refused by the CSP'));
+		await settle();
+		const [comp] = ctx.of<FakeCompressor>('compressor');
+		expect(input().outs.map((e) => e.to)).toEqual([comp]);
+		expect(engine.outputLatency()).toBe(0);
+		expect(reported).toEqual([]);
+		expect(warned).toEqual(["The preview's limiter is an approximation: its worklet did not load (refused by the CSP)."]);
+		expect(engine.limiterKind()).toBe('approximate');
+	});
+
+	test('nor without an AudioWorklet, by default — and it says so', async () => {
+		engine = new AudioEngine({
+			createContext: () => ctx as unknown as AudioContext,
+			fetchPcm: pcm as never,
+			warn: (m) => warned.push(m)
+		});
+		await play(on(-3));
+		await settle();
+		expect(input().outs.map((e) => e.to)).toEqual(ctx.of('compressor'));
+		expect(warned).toEqual(["The preview's limiter is an approximation: this webview has no AudioWorklet."]);
+		expect(engine.limiterKind()).toBe('approximate');
 	});
 });
 
