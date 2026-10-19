@@ -17,6 +17,7 @@ interface Asset {
 	id: string;
 	duration: number;
 	audio: boolean;
+	video: boolean;
 }
 
 interface Case {
@@ -38,7 +39,13 @@ const env = (c: Case): ops.EditEnv => ({
 	ripple: c.ripple,
 	links: c.links,
 	footage: new Map(assets.map((a) => [a.id, a.duration])),
-	hasAudio: (id) => assets.find((a) => a.id === id)?.audio ?? false
+	hasAudio: (id) => assets.find((a) => a.id === id)?.audio ?? false,
+	asset: (id) => {
+		const a = assets.find((x) => x.id === id);
+		if (!a) return undefined;
+		const streams = [...(a.video ? [{ kind: 'video' }] : []), ...(a.audio ? [{ kind: 'audio' }] : [])];
+		return { name: id, duration: a.duration, streams };
+	}
 });
 
 /** What the op returned beyond the timeline, in the shape the corpus records it. */

@@ -62,3 +62,12 @@ export function pastePlacements(
 	}
 	return { placements };
 }
+
+/** `effective_lock` as a forced accept lands it (`apply_staged`): a track of the proposal `landing` is locked when
+ *  it is locked on the `live` cut now, or the proposal locked it where its `base` had not — a lock it only
+ *  inherited, which the user has since lifted, is not put back. In place. */
+export function landingLocks(landing: Timeline, base: Timeline, live: Timeline): void {
+	const liveLocks = new Set(live.tracks.filter((t) => t.locked).map((t) => t.id));
+	const baseLocks = new Set(base.tracks.filter((t) => t.locked).map((t) => t.id));
+	for (const t of landing.tracks) t.locked = liveLocks.has(t.id) || (!!t.locked && !baseLocks.has(t.id));
+}

@@ -39,9 +39,13 @@
   `get_timeline_state` shows the lock it is refused by), and `run_edit`'s staged path does the same for the edit
   and takes it off again, so the stored proposal never records the user's lock as its own. A forced accept
   (`apply_staged(force)`) of a stale proposal lands its timeline with the same locks, so the user's current
-  locks survive it and an inherited lock they lifted is not put back. A paste (`insert_clips`) also refuses a
-  clip on a track it cannot play on — no picture on a video track, no sound on an audio track (a title is a
-  picture; footage with both may go on either, as a detached sound does).
+  locks survive it and an inherited lock they lifted is not put back (the harness's forced accept, `landingLocks`,
+  too). An agent's `set_track_locked` answers with the track as it then holds for the agent: re-locking in a
+  proposal a track the user unlocked since it branched does not hold (that lock is the inherited one, and follows
+  the user), and the answer says `locked: false` rather than claim it. A paste (`insert_clips`) and an add to a
+  named track (`add_clip_to_timeline`) refuse a clip on a track it cannot play on (`check_track_kind`) — no
+  picture on a video track, no sound on an audio track (a title is a picture; footage with both may go on
+  either, as a detached sound does); a duplicate keeps a clip on the track it is already on and does not ask.
   `link-ops.ts` mirrors all of it for the harness (`link-ops.test.ts`, `api-locks.test.ts`).
   `roll_edit` / `slip_clip` / `slide_clip` (`Roll edit` / `Slip clip` / `Slide
   clip`, one revision each, `source_limits()` read before the edit) are

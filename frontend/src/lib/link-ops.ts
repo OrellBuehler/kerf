@@ -161,6 +161,13 @@ export function ensureTrackEditable(tl: Timeline, trackId: string) {
 	if (track.locked) throw invalid(`track ${track.name} is locked`);
 }
 
+/** `check_track_kind`: a clip only on a track it can play on — a picture on video (a title is one), sound on
+ *  audio; `hint` ends the sentence. */
+function checkTrackKind(track: Track, picture: boolean, sound: boolean, hint: string) {
+	const [fits, kind, has] = track.kind === 'audio' ? [sound, 'audio', 'sound'] : [picture, 'video', 'picture'];
+	if (!fits) throw invalid(`a clip with no ${has} cannot go on ${kind} track ${track.name} — ${hint}`);
+}
+
 /** `default_track`: where a clip of `kind` goes when the edit names no track — the first unlocked one. */
 export function defaultTrack(tl: Timeline, kind: Track['kind']): Track {
 	const track = tl.tracks.find((x) => x.kind === kind && !x.locked);
@@ -209,6 +216,13 @@ export function addClip(
 		runEdit(tl, { ...env, lanes: [id] }, (t) => {
 			if (trackId) ensureTrackEditable(t, trackId);
 			const track = trackId ? t.tracks.find((x) => x.id === trackId)! : defaultTrack(t, kind as Track['kind']);
+			if (trackId)
+				checkTrackKind(
+					track,
+					asset.streams.some((s) => s.kind === 'video'),
+					asset.streams.some((s) => s.kind === 'audio'),
+					'add it to a track of its kind'
+				);
 			const start = timelineStart ?? track.clips.reduce((m, c) => Math.max(m, c.timeline_start + clipDuration(c)), 0);
 			const clip: Clip = { id, asset_id: asset.id, source_in: sourceIn, source_out: sourceOut, timeline_start: start, volume: 1, fade_in: 0, fade_out: 0 };
 			track.clips.push(clip);
@@ -493,7 +507,13 @@ export interface PastePlacement {
  *  id; all or nothing — a copy that would overlap what is there or another copy refuses the lot.
  *  A copy of a linked *group* is linked to its fellow copies under a fresh id, and a picture
  *  copy left without its sound gets its own back (see `pasteLinks`). Never rippled. */
-export function insertClips(tl: Timeline, env: EditEnv, placements: readonly PastePlacement[], at: number): Edited<Clip[]> {
+export function insertClips(
+	tl: Timeline,
+	env: EditEnv,
+	placements: readonly PastePlacement[],
+	at: number,
+	checkKind = true
+): Edited<Clip[]> {
 	if (placements.length === 0) throw invalid('no clips to insert');
 	const where = Math.max(at, 0);
 	const base = Math.min(...placements.map((p) => p.clip.timeline_start));
@@ -510,14 +530,12 @@ export function insertClips(tl: Timeline, env: EditEnv, placements: readonly Pas
 				ensureTrackEditable(t, p.track_id);
 				const ti = t.tracks.findIndex((x) => x.id === p.track_id);
 				// A clip only on a track it can play on: a picture (a title is one) on video, sound on audio — judged
-				// where the asset's streams are known, as `Project::insert_clips` does.
-				const streams = p.clip.generator ? undefined : env.asset?.(p.clip.asset_id)?.streams;
-				const picture = p.clip.generator ? true : streams ? streams.some((x) => x.kind === 'video') : true;
-				const sound = p.clip.generator ? false : streams ? streams.some((x) => x.kind === 'audio') : true;
-				const track = t.tracks[ti];
-				if (!(track.kind === 'audio' ? sound : picture)) {
-					const [kind, has] = track.kind === 'audio' ? ['audio', 'sound'] : ['video', 'picture'];
-					throw invalid(`a clip with no ${has} cannot go on ${kind} track ${track.name} — paste it on a track of its kind`);
+				// where the asset's streams are known, as `Project::insert_clips` does (a duplicate does not ask).
+				if (checkKind) {
+					const streams = p.clip.generator ? undefined : env.asset?.(p.clip.asset_id)?.streams;
+					const picture = p.clip.generator ? true : streams ? streams.some((x) => x.kind === 'video') : true;
+					const sound = p.clip.generator ? false : streams ? streams.some((x) => x.kind === 'audio') : true;
+					checkTrackKind(t.tracks[ti], picture, sound, 'paste it on a track of its kind');
 				}
 				const copy: Clip = JSON.parse(JSON.stringify(p.clip));
 				copy.id = newId();
@@ -550,7 +568,7 @@ export function duplicateClips(tl: Timeline, env: EditEnv, ids: readonly string[
 		if (!found) throw clipNotFound(id);
 		return { track_id: found[0].id, clip: structuredClone(found[0].clips[found[1]]) };
 	});
-	return insertClips(tl, env, placements, at);
+	return insertClips(tl, env, placements, at, false);
 }
 
 /** What pasting does to link ids and to a detached picture's sound (`Project::insert_clips`).

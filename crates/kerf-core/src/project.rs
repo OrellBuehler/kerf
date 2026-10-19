@@ -286,6 +286,22 @@ fn owned_by_other(owner: Option<&str>, caller: Option<&str>) -> bool {
     matches!(owner, Some(o) if caller != Some(o))
 }
 
+/// Refuse a clip on a track it cannot play on: a picture on a video track (a title is one), sound on an audio
+/// track. `hint` ends the sentence with what to do instead.
+fn check_track_kind(track: &Track, picture: bool, sound: bool, hint: &str) -> Result<()> {
+    let (fits, kind, has) = match track.kind {
+        StreamKind::Audio => (sound, "audio", "sound"),
+        _ => (picture, "video", "picture"),
+    };
+    if fits {
+        return Ok(());
+    }
+    Err(Error::InvalidArgument(format!(
+        "a clip with no {has} cannot go on {kind} track {} — {hint}",
+        track.name
+    )))
+}
+
 /// The ids of the locked tracks of `timeline`.
 fn locked_ids(timeline: &Timeline) -> HashSet<Uuid> {
     timeline.tracks.iter().filter(|t| t.locked).map(|t| t.id).collect()
@@ -3475,6 +3491,9 @@ impl Project {
             let tid = match track_id {
                 Some(t) => {
                     timeline.ensure_track_editable(t)?;
+                    let track = timeline.track(t).ok_or(Error::TrackNotFound(t))?;
+                    let picture = asset.streams.iter().any(|s| s.kind == StreamKind::Video);
+                    check_track_kind(track, picture, asset.has_audio(), "add it to a track of its kind")?;
                     t
                 }
                 None => default_track(timeline, primary)?,
@@ -3925,6 +3944,12 @@ impl Project {
     /// so a partial paste can never land. Clips pasted alongside each other are
     /// checked against one another too, not just against what is already there.
     pub fn insert_clips(&self, placements: &[(Uuid, Clip)], at: f64) -> Result<Vec<Clip>> {
+        self.insert_clips_into(placements, at, true)
+    }
+
+    /// [`Project::insert_clips`], judging each clip's track kind or not: a duplicate keeps a clip on the
+    /// track it is already on, which is not the duplicate's to question.
+    fn insert_clips_into(&self, placements: &[(Uuid, Clip)], at: f64, check_kind: bool) -> Result<Vec<Clip>> {
         finite("the paste position", at)?;
         if placements.is_empty() {
             return Err(Error::InvalidArgument("no clips to insert".to_string()));
@@ -3969,26 +3994,13 @@ impl Project {
                     .iter()
                     .position(|t| t.id == *track_id)
                     .ok_or(Error::TrackNotFound(*track_id))?;
-                let track = &timeline.tracks[ti];
-                let (picture, sound) = if clip.is_generated() {
-                    (true, false)
-                } else {
-                    streams.get(&clip.asset_id).copied().unwrap_or((true, true))
-                };
-                let fits = match track.kind {
-                    StreamKind::Audio => sound,
-                    _ => picture,
-                };
-                if !fits {
-                    let (kind, has) = if track.kind == StreamKind::Audio {
-                        ("audio", "sound")
+                if check_kind {
+                    let (picture, sound) = if clip.is_generated() {
+                        (true, false)
                     } else {
-                        ("video", "picture")
+                        streams.get(&clip.asset_id).copied().unwrap_or((true, true))
                     };
-                    return Err(Error::InvalidArgument(format!(
-                        "a clip with no {has} cannot go on {kind} track {} — paste it on a track of its kind",
-                        track.name
-                    )));
+                    check_track_kind(&timeline.tracks[ti], picture, sound, "paste it on a track of its kind")?;
                 }
                 let mut copy = clip.clone();
                 copy.id = Uuid::new_v4();
@@ -4055,7 +4067,7 @@ impl Project {
                     .ok_or(Error::ClipNotFound(*id))
             })
             .collect::<Result<Vec<_>>>()?;
-        self.insert_clips(&placements, at)
+        self.insert_clips_into(&placements, at, false)
     }
 
     /// Remove a clip and close the gap it leaves: every later clip on the **same
@@ -4277,6 +4289,17 @@ impl Project {
             }
             track.locked = locked;
             Ok(track.clone())
+        })
+        .and_then(|track| {
+            // In a proposal the agent sees a track as `working_timeline` lays it: a lock it sets on a track
+            // the user unlocked since the proposal branched is the inherited one and follows the user, so
+            // the answer says so rather than claim a lock that will not hold.
+            if agent {
+                if let Some(seen) = self.working_timeline()?.track(track_id) {
+                    return Ok(seen.clone());
+                }
+            }
+            Ok(track)
         })
     }
 
@@ -10347,6 +10370,15 @@ mod tests {
         ));
     }
 
+    /// [`project_with_video_asset`] whose footage has sound too, for a test that puts it on an audio track.
+    fn project_with_av_asset() -> (Project, Uuid) {
+        let project = Project::open_in_memory().unwrap();
+        let mut asset = asset_with("/av.mp4", vec![vid_stream(false), aud_stream()]);
+        asset.duration = 60.0;
+        let id = project.insert_or_get_asset(&asset).unwrap().id;
+        (project, id)
+    }
+
     fn project_with_video_asset() -> (Project, Uuid) {
         let project = Project::open_in_memory().unwrap();
         let asset = Asset {
@@ -12727,6 +12759,75 @@ mod tests {
     }
 
     #[test]
+    fn an_agent_relocking_a_track_the_user_unlocked_is_told_what_holds() {
+        let (mut project, _, [a, ..]) = abutting_project();
+        let v1 = project.timeline().unwrap().tracks[0].id;
+        project.set_track_locked(v1, true).unwrap();
+        project.set_actor(EditSource::Agent);
+        project.set_volume(a.id, 0.5).unwrap();
+        project.set_actor(EditSource::User);
+        project.set_track_locked(v1, false).unwrap();
+
+        project.set_actor(EditSource::Agent);
+        // The lock it inherited follows the user, so its own "lock" does not hold — and the answer says so.
+        let answered = project.set_track_locked(v1, true).unwrap();
+        assert!(!answered.locked);
+        assert!(!project.working_timeline().unwrap().track(v1).unwrap().locked);
+        // A track the base did not lock does take its lock.
+        let v2 = project.add_track(StreamKind::Video, None).unwrap().id;
+        assert!(project.set_track_locked(v2, true).unwrap().locked);
+    }
+
+    #[test]
+    fn a_clip_is_added_only_to_a_track_it_can_play_on() {
+        let project = Project::open_in_memory().unwrap();
+        let music = project
+            .insert_or_get_asset(&asset_with("/kind/music.wav", vec![aud_stream()]))
+            .unwrap();
+        let silent = project
+            .insert_or_get_asset(&asset_with("/kind/silent.mp4", vec![vid_stream(false)]))
+            .unwrap();
+        let both = project
+            .insert_or_get_asset(&asset_with("/kind/both.mp4", vec![vid_stream(false), aud_stream()]))
+            .unwrap();
+        let v1 = project.timeline().unwrap().first_track_of(StreamKind::Video).unwrap();
+        let a1 = project.add_track(StreamKind::Audio, None).unwrap().id;
+        let on_video = project.add_clip_to_timeline(music.id, Some(v1), 0.0, 1.0, Some(0.0));
+        assert!(
+            matches!(&on_video, Err(Error::InvalidArgument(why)) if why == "a clip with no picture cannot go on video track V1 — add it to a track of its kind"),
+            "sound alone is refused on a video track"
+        );
+        let on_audio = project.add_clip_to_timeline(silent.id, Some(a1), 0.0, 1.0, Some(0.0));
+        assert!(
+            matches!(&on_audio, Err(Error::InvalidArgument(why)) if why.starts_with("a clip with no sound cannot go on audio track")),
+            "a picture with no sound is refused on an audio track"
+        );
+        project.add_clip_to_timeline(both.id, Some(a1), 0.0, 1.0, Some(0.0)).unwrap();
+        project.add_clip_to_timeline(both.id, Some(v1), 0.0, 1.0, Some(0.0)).unwrap();
+    }
+
+    #[test]
+    fn a_duplicate_stays_on_its_own_track_whatever_its_kind() {
+        let project = Project::open_in_memory().unwrap();
+        let music = project
+            .insert_or_get_asset(&asset_with("/kind/music.wav", vec![aud_stream()]))
+            .unwrap();
+        // A sound on a video track, as an older project may hold one.
+        let mut stray = Clip::for_asset(&music, 0.0, 1.0, 0.0);
+        stray.id = Uuid::new_v4();
+        let id = stray.id;
+        project
+            .edit_timeline("plant", |t| {
+                t.tracks[0].clips.push(stray);
+                Ok(())
+            })
+            .unwrap();
+        let copies = project.duplicate_clips(&[id], 5.0).unwrap();
+        let v1 = &project.timeline().unwrap().tracks[0];
+        assert!(v1.clips.iter().any(|c| c.id == copies[0].id));
+    }
+
+    #[test]
     fn an_agent_may_not_remove_a_locked_track_and_the_user_may() {
         let (mut project, _, _) = abutting_project();
         project.set_agent_review(false);
@@ -12980,7 +13081,7 @@ mod tests {
 
     #[test]
     fn a_group_split_remove_is_one_revision_and_undoes_in_one_step() {
-        let (project, asset) = project_with_video_asset();
+        let (project, asset) = project_with_av_asset();
         let tracks = project.timeline().unwrap().tracks;
         let (v1, a1) = (tracks[0].id, tracks[1].id);
         let v = project.add_clip_to_timeline(asset, Some(v1), 10.0, 16.0, Some(0.0)).unwrap();
@@ -13015,7 +13116,7 @@ mod tests {
 
     #[test]
     fn a_refused_group_split_remove_records_nothing_and_ripple_is_per_track() {
-        let (project, asset) = project_with_video_asset();
+        let (project, asset) = project_with_av_asset();
         let tracks = project.timeline().unwrap().tracks;
         let (v1, a1) = (tracks[0].id, tracks[1].id);
         let v = project.add_clip_to_timeline(asset, Some(v1), 10.0, 16.0, Some(0.0)).unwrap();
@@ -13050,7 +13151,7 @@ mod tests {
 
     #[test]
     fn an_agents_group_split_remove_is_staged() {
-        let (mut project, asset) = project_with_video_asset();
+        let (mut project, asset) = project_with_av_asset();
         let tracks = project.timeline().unwrap().tracks;
         let v = project
             .add_clip_to_timeline(asset, Some(tracks[0].id), 10.0, 16.0, Some(0.0))
