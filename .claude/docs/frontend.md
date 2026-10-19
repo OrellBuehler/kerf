@@ -1590,7 +1590,9 @@ and `import_template` never overwriting; there is no file system, so an exported
 `importTemplate` to read back, and any image path answers one fixed picture. `api-templates.test.ts` drives it.
 
 **Motion templates in the editor.** The library, the saving, the splicing and the sanitiser are the engine's; the page
-asks well and shows the result through `<img>` data URLs only. `template-ui.ts` is the pure side (bun-tested): `slugId`
+asks well and shows the result through `<img>` data URLs only. A template title's `svg` holds its text as glyph outlines
+(`<g data-kerf-text="">` keeps the element's id, attributes and text): the save dialog's tags come from `svg_element_ids`, which
+reports such an element as the `text` it was, and its attribute reads (`elementAttributes`, `holds`) see the same attributes. `template-ui.ts` is the pure side (bun-tested): `slugId`
 (a control id from its label: lower case, accents dropped, `-2` past a taken one), `defaultAttribute` (a color's `stop-color`
 on a `stop`, else `fill`; an image's `href`; a font's `font-family`; a number's usual size), `elementsFor` (text at
 `text` / `tspan`, an image at `<image>`; an id that two or more elements carry is **not targetable** — the engine refuses it

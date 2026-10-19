@@ -247,8 +247,10 @@ pub fn build_template(source: &TemplateSource, request: TemplateSaveRequest, id:
     if !source.duration.is_finite() || source.duration <= 0.0 || source.duration > MAX_SVG_SECONDS {
         return Err(invalid("the title has no length to make a template of"));
     }
-    let (w, h) = crate::svg::intrinsic_size(&source.svg)
-        .ok_or_else(|| invalid("the title has no size (a viewBox, or a width and height)"))?;
+    // A template keeps its text as text: an outlined title is set again from it whenever it is applied.
+    let svg = crate::svg::restore_text(&source.svg)?;
+    let (w, h) =
+        crate::svg::intrinsic_size(&svg).ok_or_else(|| invalid("the title has no size (a viewBox, or a width and height)"))?;
     let size = |v: f64| (v.round() as u32).clamp(1, 16_384);
     let name = if request.name.trim().is_empty() {
         source.name.clone()
@@ -256,7 +258,7 @@ pub fn build_template(source: &TemplateSource, request: TemplateSaveRequest, id:
         request.name.trim().to_string()
     };
     let mut warnings = Vec::new();
-    let used = font_use(&source.svg)?;
+    let used = font_use(&svg)?;
     let fonts = collect_fonts(&used, MAX_TOTAL_BYTES / 2, &mut warnings);
     let manifest = TemplateManifest {
         format: FORMAT.to_string(),
@@ -278,7 +280,7 @@ pub fn build_template(source: &TemplateSource, request: TemplateSaveRequest, id:
     };
     let mut template = Template {
         manifest,
-        svg: source.svg.clone(),
+        svg,
         fonts,
         poster: None,
     };
@@ -297,11 +299,12 @@ pub fn build_template(source: &TemplateSource, request: TemplateSaveRequest, id:
 }
 
 /// The `id`s of the title's elements, for a surface that offers to make controls out of them: every
-/// element with an `id` and the tag it is. A document over the size a title may be (128 KiB), nested
-/// deeper than one may be, or not XML is refused before anything is listed: the text may come straight
-/// from a webview.
+/// element with an `id` and the tag it is (an outlined text's is `text`, what a template made of it holds).
+/// A document over the size a title may be (128 KiB), nested deeper than one may be, or not XML is
+/// refused before anything is listed: the text may come straight from a webview.
 pub fn element_ids(svg: &str) -> Result<Vec<(String, String)>> {
-    Ok(Elements::parse(svg)?.ids())
+    Elements::parse(svg)?;
+    Ok(Elements::parse(&crate::svg::restore_text(svg)?)?.ids())
 }
 
 #[cfg(test)]
@@ -478,6 +481,24 @@ mod tests {
                 ("tag".to_string(), "text".to_string())
             ]
         );
+    }
+
+    #[test]
+    fn a_template_saved_from_outlines_keeps_its_text() {
+        let outlined = crate::svg::SvgDoc::parse(TITLE)
+            .unwrap()
+            .outlined(&fonts::svg_fontdb())
+            .unwrap();
+        let svg = outlined.sanitized().to_string();
+        assert!(svg.contains("data-kerf-text") && !svg.contains("<text"), "{svg}");
+        assert_eq!(element_ids(&svg).unwrap(), element_ids(TITLE).unwrap());
+        let source = TemplateSource {
+            svg,
+            name: "t".into(),
+            duration: 2.0,
+        };
+        let built = build_template(&source, request(vec![text_control()]), Uuid::new_v4()).unwrap();
+        assert!(built.template.svg.contains("<text") && !built.template.svg.contains("data-kerf"));
     }
 
     #[test]

@@ -459,6 +459,33 @@
     its end tag, `<x/>` is opened). `read_values` reads those same direct runs, so the value shown is the value
     a set writes (a word inside a `<tspan>` is its own control's). **The result then goes through
     `SvgDoc::parse`** (the sanitiser has the last word). An animation that animates the same attribute keeps its own values: a control sets the base.
+  * **Text as glyph outlines** (`svg/outline.rs` on the text engine `text/`; plan phase 2). `Template::prepare` and
+    `TemplateEditInputs::prepare` splice the values into the title's **text form** (`svg::restore_text`), sanitise, then
+    `SvgDoc::outlined(db)` sets each `<text>` it can as glyph paths with the fonts the title would be drawn with
+    (`fonts::svg_fontdb_with(template fonts)` on apply, `fonts::snapshot_for([svg]).db()` on a values change) and reads the
+    result again. **The form is reversible**: the element is renamed `<g data-kerf-text="">` with every attribute, text run,
+    `<tspan>` and animation still in it (none draws inside a `<g>`), plus one generated last child `<g data-kerf-glyphs="">`
+    (an invisible `fill="none" stroke="none"` path of usvg's metric bounding box, so a filter / mask region measured on the
+    group does not move, then a `<path>` per glyph; a span with its own paint gets a `<g>` with that paint around its
+    glyphs). `restore_text` renames it back and drops the generated child, byte for byte. So `read_values` / `apply_values`
+    work unchanged, `build_template` and `element_ids` restore first (a template and the save dialog see `<text>`), and the
+    kept `font-family` keeps the fonts in the project while the controls can set the text again (`collect_unused_fonts`
+    unchanged). A title draws the same with or without its fonts installed. **It draws what resvg drew** — the engine lays
+    one chunk out as usvg does (font query plus `serif` fallback, per-character fallback faces, kerning on unless CSS
+    `font-kerning: none` or `kerning="0"`, letter spacing after every cluster but the last and not in cursive scripts, word
+    spacing, `wght` / `wdth` / `ital` / `slnt` and auto `opsz` variations, `dominant-baseline`, usvg's white-space
+    trimming, its cascade through `simplecss`), pinned against usvg's glyph origins and bounding box and against the
+    picture (`svg::outline` tests). **What only outlines honour**: SVG 2 `inline-size` wraps (UAX #14, greedy, lines on the
+    anchor) and `white-space: pre-line` breaks at a newline, one `line-height` apart (`normal`: the face's ascent, descent
+    and gap). **Anything else stays text**, drawn with its font as before: positioned or nested `<tspan>`s, `textPath`,
+    `dx` / `dy` / `rotate` / `textLength` / an `x` list, a text inside `<clipPath>`, right-to-left or vertical text,
+    decorations, small caps and other font features, `font-variation-settings`, a `url()` or `context-*` paint (every glyph
+    would be its own bounding box), dashes, an animation of a layout property on it or an ancestor (or of anything but
+    paint / opacity / visibility / display / transform on itself, or of a span), a `<style>` rule that would match
+    differently once it is a `<g>` (or match a generated element), a character no installed face has, a colour glyph, or
+    outlines that would take the title over 128 KiB (nothing is outlined then). A text kept as text that uses `inline-size`
+    or `pre-line` is a warning (its lines do not wrap). An older build draws an outlined title correctly but cannot set its
+    text again (it splices into the hidden runs). No schema step: the stored shape is unchanged.
   * **Lock-free shape.** The zip, the fonts, the sanitiser and the poster are all outside the project lock.
     Apply: `TemplateLibrary::get(id)` (or any `Template`) → `Template::prepare(&values)` →
     `PreparedTemplate` → under the lock `Project::apply_template_parsed(prepared, start, end?, SvgLayout)`.

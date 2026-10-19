@@ -923,7 +923,10 @@ so the feature is **only** activated through these forwards — which is what ma
   sans-serif and for the family nothing has, so text never vanishes; an embedded face is loaded first so it beats an installed one of
   the same family — a template's typeface wins on the machine that also has another build of it; `fonts::replace_embedded` /
   `register_embedded` change the registered set, a `FontSet` is immutable and builds its database once, on first use, outside the
-  registry's lock (the one built for the process when no embedded font is named); an `<image>` `href` that is not `data:` is
+  registry's lock (the one built for the process when no embedded font is named); a template title's text is already glyph
+  paths (`svg/outline.rs`, `core-project.md` "Text as glyph outlines"), so it draws the same whatever is installed — its source
+  still names its families, so its `FontSet` and key are what they were, and nothing in the raster path or the graph changed
+  (`RASTER_VERSION` and the golden stand); an `<image>` `href` that is not `data:` is
   nothing (no file read, no network), `resources_dir` is `None`, and a `data:` image is decoded only after its **header** says it
   is within 16 Mpx (`svg/images.rs`: `imagesize`, the crate usvg sizes with; the decoders allocate what the header claims, so
   60,000 x 60,000 bytes-of-header aborted the process) — the resolver answers "nothing" for one that is not, whatever the
