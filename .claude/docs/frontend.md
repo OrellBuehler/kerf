@@ -533,6 +533,28 @@ force), because the static `pos_x/pos_y` is not what an animated render reads;
 resizing always writes the static `size`. Pure logic (box math, keyframe upsert,
 row packing, snapping, span trim) is `src/lib/titles.ts`, bun-tested.
 
+**Transform handles in the Preview** (`TransformHandles.svelte`, pure math in `transform-handles.ts`). The selected clip's
+picture at the playhead (paused, not streaming, no proposal previewed, no trim monitor; not on a locked track, not a 360
+reframe) gets a box drawn **where the export puts it**: the canvas is `renderCanvas` (`export_format` without options — the
+delivery frame, else the first picture of the rendered cut, even sides, the delivery's fit), the box is
+`layer-geometry.ts`, a faithful port of kerf-core's `layer_geometry.rs` (crop / fit / second scale / rotate / overlay
+rounding, chroma grids, `pix_fmt_subsampling`) replayed against a Rust-written corpus (`core-render-plan.md`), at the
+clip's pose at the playhead (`transformAt`). A click on a picture selects the topmost clip under it (later video tracks
+on top) and can carry straight into a move. Body = move, corners = scale about the centre, the knob = rotate, edges =
+crop — only under a Contain fit with position / scale / rotation unkeyed, and it moves the scale and position so the rest
+of the picture stays put (the export re-fits and re-centres a cropped window). Snapping (on with the timeline's snap
+toggle, **Alt** inverts it, 6 px) puts an edge or the centre of the bounds on the frame's edges and centre lines, the
+title-safe box and the platform chrome when the safe-area guides are drawn, and the other pictures' edges and centres;
+scale also stops at 100 %; rotation lands on a right angle within 5°, **Shift** turns in 15° steps and keeps a move to one
+axis — the tooltip names both with `settings.modLabel`. While held, the box is an exact ghost of the pose (D9: the picture
+under it settles on release) with a readout (`· key` when a keyed number is moving). **One `setTransformAt` on release**
+(`set_transform_at`: a keyed number keyed at the playhead, the rest static — one revision even when position x is keyed
+and y is not); a gesture that changes nothing writes nothing; Escape / pointercancel / lost capture / blur abandon it.
+The handles count as page overlays for `routePreview` (`handles`), so on an X11 child-window surface the frame falls back
+to the JPEG while they show (a click on the surface itself never reaches the page there: select the clip in the timeline);
+under a transparent webview they draw over the surface. Not done: separate X / Y scale (the model has one `scale`; it
+needs a model, export-graph and GPU change), a live GPU picture during the drag (A3).
+
 
 The timeline toolbar carries a **delivery frame picker** (also View › Delivery frame; Source / 16:9 / 9:16 / 1:1 / 4:5,
 from `src/lib/delivery-formats.ts`, bun-tested) that sets `Timeline.format` — the
