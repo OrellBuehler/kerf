@@ -1567,7 +1567,7 @@ mod tests {
             Property::CropX,
             vec![key(0.0, -0.5, Easing::Linear), key(2.0, 0.5, Easing::Linear)],
         );
-        let sampled: Vec<(f64, f64, (f64, f64, f64, f64))> = [0.7, 1.3]
+        let sampled: Vec<_> = [0.7, 1.3]
             .iter()
             .map(|&t| {
                 let mask = m.mask_at(t).unwrap();
