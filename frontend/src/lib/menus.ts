@@ -242,6 +242,9 @@ export function buildMenus(s: MenuState): MenuDef[] {
 				]
 			},
 			sep,
+			act('title.add', hold({})),
+			act('title.generateCaptions', hold({ ...clips })),
+			sep,
 			act('tool.rippleMode', { role: 'check', checked: s.rippleMode, label: 'Ripple mode' }),
 			act('tool.snap', { role: 'check', checked: s.snap, label: 'Snapping' }),
 			sep,

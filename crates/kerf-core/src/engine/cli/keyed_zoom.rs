@@ -416,12 +416,12 @@ fn expected(clip: &Clip, local: f64, fit: Fit, clear_left: bool) -> Expected {
     ];
     let (kw, kh) = (kept[2] - kept[0], kept[3] - kept[1]);
     let fit_k = match fit {
-        Fit::Contain => (cw / kw).min(ch / kh),
+        Fit::Contain | Fit::Blur => (cw / kw).min(ch / kh),
         Fit::Cover => (cw / kw).max(ch / kh),
     };
     // `Cover` cuts the overshoot before the zoom, so the picture is the frame, zoomed.
     let (pw, ph) = match fit {
-        Fit::Contain => (kw * fit_k * tf.scale, kh * fit_k * tf.scale),
+        Fit::Contain | Fit::Blur => (kw * fit_k * tf.scale, kh * fit_k * tf.scale),
         Fit::Cover => (cw * tf.scale, ch * tf.scale),
     };
     let k = fit_k * tf.scale;

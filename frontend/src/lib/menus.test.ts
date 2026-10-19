@@ -138,7 +138,7 @@ describe('File', () => {
 });
 
 describe('Edit', () => {
-	test('holds undo and redo, the clipboard, deletion, ripple and snapping', () => {
+	test('holds undo and redo, the clipboard, deletion, titles, ripple and snapping', () => {
 		const ids = flatten(menu('edit').items).flatMap((e) => (e.kind === 'action' ? [e.id] : []));
 		for (const id of [
 			'edit.undo',
@@ -150,6 +150,8 @@ describe('Edit', () => {
 			'edit.delete',
 			'edit.rippleDelete',
 			'edit.selectAll',
+			'title.add',
+			'title.generateCaptions',
 			'tool.rippleMode',
 			'tool.snap',
 			'app.keyboard'
@@ -177,6 +179,16 @@ describe('Edit', () => {
 		}
 	});
 
+	test('a title can always be added; captions wait for a clip on the cut', () => {
+		const empty = menu('edit', { hasClips: false });
+		const title = find(empty.items, 'Add title at playhead');
+		expect('disabled' in title && title.disabled).toBeFalsy();
+		const captions = find(empty.items, 'Generate captions');
+		expect('disabled' in captions && captions.disabled).toBe(true);
+		const live = find(menu('edit', { hasClips: true }).items, 'Generate captions');
+		expect('disabled' in live && live.disabled).toBe(false);
+	});
+
 	test('every entry that edits the cut is off, with the one reason, while the proposal is previewed', () => {
 		const REASON = 'Exit the proposal preview to edit';
 		const m = menu('edit', { previewing: true });
@@ -188,7 +200,9 @@ describe('Edit', () => {
 			'Duplicate',
 			'Split at playhead',
 			'Delete selection',
-			'Ripple delete selection'
+			'Ripple delete selection',
+			'Add title at playhead',
+			'Generate captions'
 		];
 		for (const label of edits) {
 			const e = find(m.items, label);

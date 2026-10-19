@@ -1,7 +1,8 @@
 <script lang="ts">
-	// The Inspector's view of a library asset when one is selected and no clip is: its name and kind, what
-	// has been done to it (the proxy and analysis chips, the same ones the bin draws) and the facts the bin's
-	// right-click menu used to list as twenty rows. Read-only; the actions are the buttons here and the menu.
+	// The Inspector's view of a library asset when one is selected and no clip is: its name and kind, the two
+	// ways onto the timeline, then one section per subject — the file, its analysis (the chips the bin draws, and
+	// Analyze), its proxy — each with its own actions, and the file's Relink / Remove at the end, where a clip
+	// keeps its Remove. The facts are the ones the bin's right-click menu used to list as twenty rows.
 	import Icon from './Icon.svelte';
 	import Badge from './Badge.svelte';
 	import Btn from './Btn.svelte';
@@ -19,8 +20,7 @@
 	import { contextMenu } from '#lib/context-menu.svelte';
 	import { analyzeMenuItems } from '#lib/analyze-menu';
 	import { assetFacts, type Fact } from '#lib/asset-facts';
-	import { doneCount } from '#lib/analysis-steps';
-	import { mediaInfo, specLine } from '#lib/media-info';
+	import { mediaInfo } from '#lib/media-info';
 	import { proxyActions } from '#lib/proxy-info';
 	import { deleteProxy, rebuildProxy } from '#lib/api';
 	import { toast } from '#lib/notifications.svelte';
@@ -44,11 +44,14 @@
 			proxy: mediaStatus.proxy(asset.id)
 		})
 	);
-	const spec = $derived(specLine(info));
 	/** Music with a fitted bar grid: its structure is shown under Analysis. */
 	const music = $derived(editor.analysisFor(asset.id)?.music ?? null);
 	const proxy = $derived(mediaStatus.proxy(asset.id));
 	const act = $derived(proxyActions(proxy));
+	const gone = $derived(mediaStatus.isMissing(asset.id));
+	/** A pass is running on this asset: its progress takes Analyze's place. */
+	const running = $derived(ui.analyzing && ui.analyzingId === asset.id);
+	const ROW_ITEM = 'flex:1 1 0;min-width:max-content';
 	const KIND: Record<string, string> = { video: 'Video', audio: 'Audio', image: 'Still' };
 
 	const err = report;
@@ -90,7 +93,7 @@
 			</div>
 		</div>
 	</div>
-	{#if mediaStatus.isMissing(asset.id)}
+	{#if gone}
 		<div
 			role="alert"
 			data-testid="asset-missing"
@@ -101,33 +104,15 @@
 			<div style="margin-top:6px"><Btn size="sm" variant="secondary" icon="link" onclick={() => void relinkMediaFlow(asset)}>Relink…</Btn></div>
 		</div>
 	{/if}
-	{#if spec}
-		<div style="margin-top:8px;font-size:12px;color:var(--text-muted);line-height:1.4">{spec}</div>
-	{/if}
-
-	<div style="margin-top:8px;display:flex;align-items:center;gap:8px;flex-wrap:wrap">
-		<MediaChips assetId={asset.id} />
-		{#if ui.analyzing && ui.analyzingId === asset.id}
-			<div style="flex-basis:100%"><AnalysisRun /></div>
-		{:else}
-			<Btn
-				size="sm"
-				variant="secondary"
-				icon="scan-line"
-				onclick={(e: MouseEvent) => {
-					const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
-					contextMenu.show(new MouseEvent('contextmenu', { clientX: r.left, clientY: r.bottom + 2 }), analyzeMenuItems(asset));
-				}}>Analyze</Btn
-			>
-		{/if}
-	</div>
-
-	<div style="margin-top:10px;display:flex;gap:6px;flex-wrap:wrap">
+	<!-- Two equal buttons that wrap to one per line before either is cut short (the Inspector can be 250 px). -->
+	<div style="margin-top:10px;display:flex;flex-wrap:wrap;gap:6px">
 		<Btn
 			size="sm"
+			style={ROW_ITEM}
 			icon="plus"
 			iconSize={12}
 			pending={editor.locked}
+			title="Put it on the timeline at the playhead"
 			onclick={() =>
 				void editor
 					.add(asset.id, 0, placementOut(asset, settings.editing.still_seconds), undefined, ui.time)
@@ -136,36 +121,16 @@
 		>
 		<Btn
 			size="sm"
+			style={ROW_ITEM}
 			icon="list-plus"
 			iconSize={12}
 			pending={editor.locked}
+			title="Put it at the end of the cut"
 			onclick={() =>
 				void editor
 					.add(asset.id, 0, placementOut(asset, settings.editing.still_seconds), undefined, editor.duration)
 					.then(() => toast.success(`Appended ${asset.name}`))
 					.catch(err)}>Append</Btn
-		>
-		{#if mediaStatus.done(asset.id, 'transcript')}
-			<Btn
-				size="sm"
-				icon="file-text"
-				iconSize={12}
-				title="Write the transcript as a subtitle file, in this media's own time"
-				onclick={() => void exportTranscriptSrt(asset.id)}>Export .srt</Btn
-			>
-		{/if}
-	</div>
-
-	<div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap">
-		<Btn size="sm" variant="ghost" icon="link" iconSize={12} title="Point this media at another file" onclick={() => void relinkMediaFlow(asset)}>Relink…</Btn>
-		<Btn
-			size="sm"
-			variant="ghost"
-			icon="trash"
-			iconSize={12}
-			pending={editor.locked}
-			title="Take this media out of the project"
-			onclick={() => void removeMediaFlow(asset)}>Remove…</Btn
 		>
 	</div>
 
@@ -179,8 +144,34 @@
 		{#each facts.media as f (f.label)}{@render row(f)}{/each}
 	</InspectorSection>
 
-	<InspectorSection title="Analysis" summary={doneCount(mediaStatus.analysis(asset.id))} open>
+	<InspectorSection title="Analysis" summary={facts.analyzed} open>
+		<div style="margin-bottom:6px"><MediaChips assetId={asset.id} proxy={false} /></div>
 		{#each facts.analysis as f (f.label)}{@render row(f)}{/each}
+		{#if running}
+			<div style="margin-top:6px"><AnalysisRun /></div>
+		{/if}
+		<div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap">
+			{#if !running}
+				<Btn
+					size="sm"
+					icon="scan-line"
+					iconSize={12}
+					onclick={(e: MouseEvent) => {
+						const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+						contextMenu.show(new MouseEvent('contextmenu', { clientX: r.left, clientY: r.bottom + 2 }), analyzeMenuItems(asset));
+					}}>Analyze</Btn
+				>
+			{/if}
+			{#if mediaStatus.done(asset.id, 'transcript')}
+				<Btn
+					size="sm"
+					icon="file-text"
+					iconSize={12}
+					title="Write the transcript as a subtitle file, in this media's own time"
+					onclick={() => void exportTranscriptSrt(asset.id)}>Export .srt</Btn
+				>
+			{/if}
+		</div>
 	</InspectorSection>
 
 	{#if music}
@@ -210,6 +201,7 @@
 				<Btn
 					size="sm"
 					variant="destructive"
+					data-quiet
 					icon="trash"
 					iconSize={12}
 					disabled={act.remove.disabled}
@@ -226,4 +218,21 @@
 			</div>
 		</InspectorSection>
 	{/if}
+
+	<div style="margin-top:18px;display:flex;flex-wrap:wrap;gap:6px">
+		{#if !gone}
+			<Btn size="sm" style={ROW_ITEM} icon="link" iconSize={12} title="Point this media at another file" onclick={() => void relinkMediaFlow(asset)}>Relink…</Btn>
+		{/if}
+		<Btn
+			size="sm"
+			style={ROW_ITEM}
+			variant="destructive"
+			data-quiet
+			icon="trash"
+			iconSize={12}
+			pending={editor.locked}
+			title="Take this media out of the project"
+			onclick={() => void removeMediaFlow(asset)}>Remove…</Btn
+		>
+	</div>
 </div>

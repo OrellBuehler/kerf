@@ -20,6 +20,10 @@ const CORPUS_PATH: &str = concat!(
 
 const RANDOM_CASES: usize = 400;
 
+/// Every this many random cases is replayed again with a blurred fill, which places the picture
+/// as Contain does (only what is behind it differs), appended so the earlier cases keep their place.
+const BLUR_EVERY: usize = 8;
+
 /// xorshift64*: the corpus must not move between runs.
 struct Rng(u64);
 
@@ -184,6 +188,42 @@ fn hand_made() -> Vec<Case> {
                 offset: (0.25, -0.1),
             },
         },
+        c((640, 360), (360, 640), Fit::Blur, t(), s420),
+        c((1000, 1650), (1080, 1080), Fit::Blur, t(), s420),
+        c(
+            (640, 360),
+            (360, 640),
+            Fit::Blur,
+            Transform {
+                scale: 0.5,
+                pos_x: 0.1,
+                ..t()
+            },
+            s420,
+        ),
+        c((640, 360), (360, 640), Fit::Blur, Transform { rotation: 30.0, ..t() }, s420),
+        c(
+            (640, 360),
+            (360, 640),
+            Fit::Blur,
+            Transform {
+                crop_left: 11.0 / 640.0,
+                crop_top: 7.0 / 360.0,
+                ..t()
+            },
+            Subsampling::NONE,
+        ),
+        Case {
+            src: (640, 360),
+            canvas: (360, 640),
+            fit: Fit::Blur,
+            tf: t(),
+            sub: Some(s420),
+            placement: Placement {
+                keyframed: Some(Keyed::all(true)),
+                offset: (0.25, -0.1),
+            },
+        },
     ]
 }
 
@@ -288,7 +328,14 @@ const PIX_FMTS: [&str; 22] = [
 fn corpus() -> Value {
     let mut rng = Rng(0x6b65_7266_6236);
     let mut cases = hand_made();
-    cases.extend((0..RANDOM_CASES).map(|_| random(&mut rng)));
+    let random: Vec<Case> = (0..RANDOM_CASES).map(|_| random(&mut rng)).collect();
+    let blurred: Vec<Case> = random
+        .iter()
+        .step_by(BLUR_EVERY)
+        .map(|c| Case { fit: Fit::Blur, ..*c })
+        .collect();
+    cases.extend(random);
+    cases.extend(blurred);
     json!({
         "about": "Written by kerf-core (layer_geometry/corpus.rs); replayed by layer-geometry.test.ts. Regenerate: KERF_BLESS_CORPUS=1 cargo test -p kerf-core --no-default-features -- layer_geometry_corpus",
         "cases": cases.iter().map(|c| json!({
@@ -333,4 +380,6 @@ fn the_corpus_has_answers_of_every_kind() {
     assert!(count(&|x| !x["expect"]["ok"]["rotation"].is_null() && x["expect"].get("ok").is_some()) >= 40);
     assert!(count(&|x| x["expect"]["ok"]["translucent"] == true) >= 10);
     assert!(count(&|x| !x["keyed"].is_null() && x["expect"].get("ok").is_some()) >= 40);
+    assert!(count(&|x| x["fit"] == "blur" && x["expect"]["ok"]["matte"] == true) >= 2);
+    assert!(count(&|x| x["fit"] == "blur" && x["expect"].get("ok").is_some()) >= 40);
 }

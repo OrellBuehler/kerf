@@ -30,6 +30,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 use uuid::Uuid;
 
+mod activity;
 mod args;
 mod hints;
 mod jobs;
@@ -71,6 +72,8 @@ pub struct KerfMcp {
     /// proposal its edits open, and no other session may touch it. `None` for a client that
     /// keeps no session.
     session: Arc<Mutex<Option<String>>>,
+    /// The resources this session subscribed to, and the task that tells it when they change.
+    listener: activity::Listener,
 }
 
 // ---- tool parameter schemas ------------------------------------------------
@@ -132,7 +135,7 @@ struct ImportParams {
     #[schemars(description = "Absolute path to the media file to import")]
     path: String,
     #[schemars(
-        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result, stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
+        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result (or subscribe to kerf://jobs/{job_id}), stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
     )]
     background: Option<bool>,
 }
@@ -158,7 +161,7 @@ struct AnalyzeParams {
     )]
     steps: Option<Vec<String>>,
     #[schemars(
-        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result, stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
+        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result (or subscribe to kerf://jobs/{job_id}), stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
     )]
     background: Option<bool>,
 }
@@ -208,7 +211,7 @@ struct VoiceoverParams {
     #[schemars(description = "With caption_style: font height as a fraction of frame height (lines: 0.05, word_punch: 0.11)")]
     caption_size: Option<f64>,
     #[schemars(
-        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result, stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
+        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result (or subscribe to kerf://jobs/{job_id}), stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
     )]
     background: Option<bool>,
 }
@@ -255,7 +258,7 @@ struct ComposeMusicParams {
     )]
     ripple: Option<bool>,
     #[schemars(
-        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result, stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
+        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result (or subscribe to kerf://jobs/{job_id}), stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
     )]
     background: Option<bool>,
 }
@@ -329,7 +332,7 @@ struct DownloadModelParams {
     )]
     name: Option<String>,
     #[schemars(
-        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result, stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
+        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result (or subscribe to kerf://jobs/{job_id}), stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
     )]
     background: Option<bool>,
 }
@@ -548,7 +551,7 @@ struct SmartCropParams {
     #[schemars(description = "UUID of the clip to reframe; every clip on an unlocked video track when omitted")]
     clip_id: Option<String>,
     #[schemars(
-        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result, stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
+        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result (or subscribe to kerf://jobs/{job_id}), stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
     )]
     background: Option<bool>,
 }
@@ -572,7 +575,7 @@ struct SeparateStemsParams {
     )]
     clip_id: Option<String>,
     #[schemars(
-        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result, stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
+        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result (or subscribe to kerf://jobs/{job_id}), stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
     )]
     background: Option<bool>,
 }
@@ -804,7 +807,7 @@ struct SyncByAudioParams {
     )]
     force: Option<bool>,
     #[schemars(
-        description = "Run as a background job: the call answers {job_id} at once; poll job_status for progress and the result, stop it with cancel_job. Default false: the call stays open until the sync is done (send a progressToken for progress)."
+        description = "Run as a background job: the call answers {job_id} at once; poll job_status for progress and the result (or subscribe to kerf://jobs/{job_id}), stop it with cancel_job. Default false: the call stays open until the sync is done (send a progressToken for progress)."
     )]
     background: Option<bool>,
 }
@@ -814,7 +817,7 @@ struct RefineTranscriptParams {
     #[schemars(description = "UUID of the asset whose cached transcript to re-time")]
     asset_id: String,
     #[schemars(
-        description = "Run as a background job: the call answers {job_id} at once; poll job_status for the result, stop it with cancel_job. Default false: the call stays open until it is done (send a progressToken for progress)."
+        description = "Run as a background job: the call answers {job_id} at once; poll job_status for the result (or subscribe to kerf://jobs/{job_id}), stop it with cancel_job. Default false: the call stays open until it is done (send a progressToken for progress)."
     )]
     background: Option<bool>,
 }
@@ -869,7 +872,9 @@ struct SetDeliveryFormatParams {
     #[schemars(description = "Delivery frame height in pixels, e.g. 1920 for a 9:16 vertical cut")]
     height: Option<u32>,
     #[schemars(description = "How footage of a different shape meets the frame: \"cover\" (the default) \
-                              fills and crops, \"contain\" scales the whole picture in and letterboxes")]
+                              fills and crops, \"contain\" scales the whole picture in and letterboxes, \
+                              \"blur\" scales the whole picture in over a blurred, enlarged copy of itself \
+                              that fills the bars")]
     fit: Option<Fit>,
 }
 
@@ -1752,7 +1757,7 @@ struct ExportParams {
     )]
     overwrite: Option<bool>,
     #[schemars(
-        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result, stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
+        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result (or subscribe to kerf://jobs/{job_id}), stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
     )]
     background: Option<bool>,
 }
@@ -1796,7 +1801,7 @@ struct ExportVariantsParams {
     )]
     single_pass: Option<bool>,
     #[schemars(
-        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result, stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
+        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result (or subscribe to kerf://jobs/{job_id}), stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
     )]
     background: Option<bool>,
 }
@@ -3191,7 +3196,9 @@ impl KerfMcp {
                        it, so what you look at while cutting is what ships. With \"cover\" (the default) \
                        a 16:9 shot is filled and cropped to the frame, which means the crop decides what \
                        survives: check preview_timeline and use set_transform's position to slide the \
-                       important part of a shot back into frame. Omit width and height to clear it."
+                       important part of a shot back into frame. With \"blur\" the whole shot shows, the \
+                       bars filled with a blurred copy of it (a clip moved or scaled by its transform gets \
+                       plain bars). Omit width and height to clear it."
     )]
     fn set_delivery_format(&self, Parameters(p): Parameters<SetDeliveryFormatParams>) -> Result<String, McpError> {
         let format = match (p.width, p.height) {
@@ -5581,22 +5588,7 @@ impl KerfMcp {
                        skipping `offset` of the newest; `next_offset` pages back through older ones."
     )]
     fn list_tasks(&self, Parameters(p): Parameters<PageParams>) -> Result<String, McpError> {
-        let (offset, limit) = reads::page_of(p.offset, p.limit, 50, 500);
-        let (tasks, total) = self
-            .lock()
-            .list_tasks_page(kerf_core::Page {
-                limit: Some(limit),
-                offset,
-            })
-            .map_err(core_err)?;
-        let end = offset + tasks.len();
-        json(&serde_json::json!({
-            "total": total,
-            "offset": offset,
-            "returned": tasks.len(),
-            "next_offset": (end < total).then_some(end),
-            "tasks": tasks,
-        }))
+        tasks_page(&self.lock(), p)
     }
 
     #[tool(description = "Enqueue a new task (status: queued) for an agent to claim")]
@@ -6049,6 +6041,7 @@ impl KerfMcp {
             project,
             app,
             session: Arc::new(Mutex::new(None)),
+            listener: activity::Listener::default(),
         }
     }
 
@@ -6223,6 +6216,57 @@ fn lock_agent(project: &Mutex<Project>) -> MutexGuard<'_, Project> {
         tracing::warn!(error = %e, "could not look at who owns the staged proposal");
     }
     guard
+}
+
+/// A page of the task queue, as `list_tasks` answers it.
+fn tasks_page(project: &Project, page: PageParams) -> Result<String, McpError> {
+    let (offset, limit) = reads::page_of(page.offset, page.limit, 50, 500);
+    let (tasks, total) = project
+        .list_tasks_page(kerf_core::Page {
+            limit: Some(limit),
+            offset,
+        })
+        .map_err(core_err)?;
+    let end = offset + tasks.len();
+    json(&serde_json::json!({
+        "total": total,
+        "offset": offset,
+        "returned": tasks.len(),
+        "next_offset": (end < total).then_some(end),
+        "tasks": tasks,
+    }))
+}
+
+/// What `kerf://project` reads: which project is open (`generation` moves when another one is), the
+/// cut the session works on in brief, and the proposal staged on it, if any.
+fn project_brief(project: &Project) -> Result<String, McpError> {
+    let timeline = project.working_timeline().map_err(core_err)?;
+    let staged = project.staged().map_err(core_err)?;
+    json(&serde_json::json!({
+        "generation": project.generation(),
+        "timeline": reads::timeline_brief(&timeline),
+        "proposal": staged.map(|s| serde_json::json!({
+            "owned_by_agent": s.owned_by_agent,
+            "edits": s.edits.len(),
+            "stale": s.stale,
+        })),
+    }))
+}
+
+/// The text of the resource `uri` (`activity`): the polling tools' answers — `kerf://jobs` is
+/// `list_jobs`, a job its `job_status`, `kerf://tasks` the first page of `list_tasks`,
+/// `kerf://project` [`project_brief`]. The project is read under its lock as the session `owner`;
+/// the jobs need none.
+fn resource_text(project: &Mutex<Project>, owner: Option<&str>, uri: &str) -> Result<String, McpError> {
+    match uri {
+        activity::PROJECT_URI => project_brief(&lock_agent_as(project, owner)),
+        activity::TASKS_URI => tasks_page(&lock_agent_as(project, owner), PageParams::default()),
+        activity::JOBS_URI => json(&jobs::jobs().list()),
+        other => match activity::job_of(other).and_then(|id| jobs::jobs().view(id)) {
+            Some(view) => json(&view),
+            None => Err(activity::unknown_resource(other)),
+        },
+    }
 }
 
 /// [`lock_agent`] for a particular agent session (`owner`, its rmcp session id) — what the
@@ -6515,7 +6559,13 @@ const INSTRUCTIONS: &str = "Kerf MCP server. The user queues editing tasks in th
              `job_id` at once and keep working, and job_status reports progress \
              and, at the end, the result (cancel_job stops one, list_jobs lists \
              them). Without it the call stays open — send a progressToken for \
-             progress. Results are kept small: get_asset_metadata and analyze_asset \
+             progress. Rather than polling, subscribe to the resources: \
+             kerf://jobs/{job_id} (one job), kerf://jobs, kerf://tasks and \
+             kerf://project are announced with notifications/resources/updated when \
+             they change, whoever changed them (the user editing the cut included); \
+             read one for the details, and read it once right after subscribing — what \
+             changed before is not replayed. A subscribed client that sends no request \
+             (a ping is enough) for five minutes loses its subscriptions. Results are kept small: get_asset_metadata and analyze_asset \
              summarise an analysis (counts, durations, the head of the transcript), \
              and get_transcript (lines with their speakers; words=true adds each \
              line's timed words, best over a from/to window) / get_analysis_detail \
@@ -6579,6 +6629,7 @@ impl ServerHandler for KerfMcp {
     ) -> Result<rmcp::model::CallToolResponse, McpError> {
         let tool = request.name.to_string();
         self.note_session(&context);
+        self.listener.touch();
         let result = match reject_unknown_arguments(&request) {
             Ok(()) => {
                 let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
@@ -6598,9 +6649,101 @@ impl ServerHandler for KerfMcp {
         note_agent_activity();
         let mut info = ServerConfig::default();
         info.server_info = server_identity();
-        info.capabilities = ServerCapabilities::builder().enable_tools().build();
+        info.capabilities = ServerCapabilities::builder()
+            .enable_resources()
+            .enable_resources_subscribe()
+            .enable_tools()
+            .build();
         info.instructions = Some(INSTRUCTIONS.to_string());
         info
+    }
+
+    async fn ping(&self, _context: RequestContext<RoleServer>) -> Result<(), McpError> {
+        self.listener.touch();
+        Ok(())
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::ListResourcesResult, McpError> {
+        self.listener.touch();
+        Ok(rmcp::model::ListResourcesResult::with_all_items(activity::resources()))
+    }
+
+    async fn list_resource_templates(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::ListResourceTemplatesResult, McpError> {
+        self.listener.touch();
+        Ok(rmcp::model::ListResourceTemplatesResult::with_all_items(
+            activity::resource_templates(),
+        ))
+    }
+
+    /// The resources are the polling tools' answers: `kerf://jobs` is `list_jobs`, a job is its
+    /// `job_status`, `kerf://tasks` the first page of `list_tasks`, `kerf://project` a brief of the
+    /// open project.
+    async fn read_resource(
+        &self,
+        request: rmcp::model::ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::ReadResourceResponse, McpError> {
+        self.listener.touch();
+        let uri = request.uri;
+        let text = resource_text(&self.project, self.owner().as_deref(), &uri)?;
+        Ok(rmcp::model::ReadResourceResult::new(vec![
+            rmcp::model::ResourceContents::text(text, uri).with_mime_type("application/json")
+        ])
+        .into())
+    }
+
+    #[allow(deprecated)]
+    async fn subscribe(
+        &self,
+        request: rmcp::model::SubscribeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        // A job is subscribed to while the registry knows it: one that never was, or ended over an
+        // hour ago, would never be told about.
+        if let Some(id) = activity::job_of(&request.uri) {
+            if jobs::jobs().view(id).is_none() {
+                return Err(activity::unknown_resource(&request.uri));
+            }
+        }
+        self.listener.subscribe(&request.uri, context.peer)
+    }
+
+    #[allow(deprecated)]
+    async fn unsubscribe(
+        &self,
+        request: rmcp::model::UnsubscribeRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        self.listener.unsubscribe(&request.uri);
+        Ok(())
+    }
+
+    /// `subscriptions/listen`: the resources of this server a client asked for, nothing else.
+    fn accepted_subscription_filter(
+        &self,
+        requested: &rmcp::model::SubscriptionFilter,
+    ) -> Option<rmcp::model::SubscriptionFilter> {
+        let mut accepted = rmcp::model::SubscriptionFilter::default();
+        accepted.resource_subscriptions = requested
+            .resource_subscriptions
+            .as_ref()
+            .map(|uris| uris.iter().filter(|uri| activity::known(uri)).cloned().collect());
+        Some(accepted)
+    }
+
+    async fn listen(&self, context: rmcp::service::SubscriptionContext) -> Result<(), McpError> {
+        let subscribed = context.accepted().resource_subscriptions.clone().unwrap_or_default();
+        let ended = context.request_context().ct.clone();
+        activity::listen(subscribed, context.sink().clone(), ended).await;
+        Ok(())
     }
 }
 
@@ -6902,6 +7045,45 @@ mod tests {
         svg_sheet_caption, svg_sheet_times, svg_source, track_gaps, variant_output, ClipMoveParams, SvgMoments,
         SvgOverlaySummary, SvgPreviewTitle, SvgValidation,
     };
+
+    /// The resources read what the polling tools answer: the project's brief, the queue's first
+    /// page, the jobs, one job; a job the registry does not know is not found.
+    #[test]
+    fn a_resource_reads_what_its_polling_tool_answers() {
+        use super::{activity, jobs, resource_text};
+        let project = std::sync::Mutex::new(kerf_core::Project::sample().unwrap());
+        let read =
+            |uri: &str| -> serde_json::Value { serde_json::from_str(&resource_text(&project, None, uri).unwrap()).unwrap() };
+        let brief = read(activity::PROJECT_URI);
+        let generation = project.lock().unwrap().generation();
+        assert_eq!(brief["generation"], generation);
+        assert!(brief["timeline"].is_object(), "{brief}");
+        assert!(brief["proposal"].is_null(), "no proposal staged: {brief}");
+
+        project.lock().unwrap().add_task("tighten the intro").unwrap();
+        let tasks = read(activity::TASKS_URI);
+        assert!(tasks["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t["prompt"] == "tighten the intro"));
+        assert!(tasks["total"].as_u64().unwrap() >= 1);
+
+        let (id, _run) = jobs::jobs().begin("export").unwrap();
+        let job = read(&format!("{}{id}", activity::JOB_URI_PREFIX));
+        assert_eq!(job["job_id"], id.as_str());
+        assert!(read(activity::JOBS_URI)
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|j| j["job_id"] == id.as_str()));
+        jobs::jobs().finish(&id, Ok("{}".to_string()));
+
+        for missing in ["kerf://jobs/job-00000000", "kerf://jobs/nope", "kerf://timeline"] {
+            let err = resource_text(&project, None, missing).unwrap_err();
+            assert_eq!(err.code, rmcp::model::ErrorCode::RESOURCE_NOT_FOUND, "{missing}");
+        }
+    }
 
     #[test]
     fn set_grade_refuses_a_misspelt_key_inside_the_curves_or_wheels() {
