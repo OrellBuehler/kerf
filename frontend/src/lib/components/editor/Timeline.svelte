@@ -6,6 +6,7 @@
 	import ClipOverlays from './ClipOverlays.svelte';
 	import ClipFilmstrip from './ClipFilmstrip.svelte';
 	import ClipWaveform from './ClipWaveform.svelte';
+	import LaneBlocks from './LaneBlocks.svelte';
 	import HeightGlyph from './HeightGlyph.svelte';
 	import ToolbarToggle from './ToolbarToggle.svelte';
 	import Minimap from './Minimap.svelte';
@@ -79,7 +80,7 @@
 		type Readout,
 		type TrimTool
 	} from '#lib/trim-tools';
-	import { readPalette } from '#lib/waveform-draw';
+	import { readPalette, resolveColor } from '#lib/waveform-draw';
 	import { filmstrips } from '#lib/filmstrips';
 	import {
 		HEIGHT_PRESETS,
@@ -92,6 +93,7 @@
 	} from '#lib/track-heights';
 	import { viewCoversCut, type Target } from '#lib/minimap';
 	import { visibleLaneRange } from '#lib/waveform-view';
+	import { laneDrawing, type LaneDrawing } from '#lib/timeline-cull';
 	import { clipDuration } from '#lib/types';
 	import { barGrid, beatGrid, beatPeriod, gridMagnets, sourceToTimeline } from '#lib/beats';
 	import { NAME_CHIP_PCT, showsLabel } from '#lib/clip-label';
@@ -181,6 +183,8 @@
 	const hasLinkedClips = $derived(editor.timeline.tracks.some((t) => t.clips.some((c) => c.link_id)));
 	/** The clip under the pointer, so its partners can light up. */
 	let hoverId = $state<string | null>(null);
+	/** The clip with keyboard focus: a lane that draws only what is in view keeps it in the page. */
+	let focusId = $state<string | null>(null);
 
 	/** The project timecode: what the transport, the status bar and the ruler read in. */
 	const tc = (s: number): string => timeDisplay.fmt(s);
@@ -944,6 +948,32 @@
 	);
 	/** Whether the gesture can go between tracks, and so scrolls vertically too. */
 	const gestureTall = $derived.by(() => !!(drag?.moved || marquee?.moved));
+
+	// A long lane draws the clips in (or near) view, and past a hundred-odd of them in view the rest as
+	// blocks on one canvas (`timeline-cull.ts`, `LaneBlocks.svelte`). What something holds is a clip
+	// wherever it is: selected (every drag, trim and nudge starts from the selection), under the
+	// pointer, focused, or moved by the gesture under way — nothing leaves the page under it.
+	const keptInPage = (id: string) =>
+		editor.isSelected(id) ||
+		id === hoverId ||
+		id === focusId ||
+		id === nudge?.clipId ||
+		dragIds.has(id) ||
+		!!trimView?.shifted.has(id) ||
+		slidPartners.has(id);
+	const laneDrawings = $derived.by(() => {
+		const m = new Map<string, LaneDrawing<Clip>>();
+		for (const t of drawn) m.set(t.id, laneDrawing(t.clips, clipDuration, pxPerSec, viewLo, viewHi, keptInPage));
+		return m;
+	});
+	/** A track's clip colours as a canvas takes them, once per theme change. */
+	const blockColors = $derived.by(() => {
+		void settings.theme;
+		return {
+			video: { fill: resolveColor('--track-video'), edge: resolveColor('--track-video-edge') },
+			audio: { fill: resolveColor('--track-audio'), edge: resolveColor('--track-audio-edge') }
+		};
+	});
 
 	/** How far right the gesture has reached, seconds — what widens the lane. */
 	const gestureEnd = $derived.by((): number | null => {
@@ -3462,7 +3492,26 @@
 							><Icon n="lock" s={10} /></span
 						>
 					{/if}
-					{#each t.clips as c (c.id)}
+					{#if (laneDrawings.get(t.id)?.blocks.length ?? 0) > 0}
+						<LaneBlocks
+							blocks={laneDrawings.get(t.id)?.blocks ?? []}
+							duration={clipDuration}
+							{pxPerSec}
+							lo={viewLo}
+							hi={Math.min(viewHi, laneW)}
+							{dpr}
+							fill={blockColors[t.kind === 'audio' ? 'audio' : 'video'].fill}
+							edge={blockColors[t.kind === 'audio' ? 'audio' : 'video'].edge}
+							dim={(c) => c.enabled === false || !renders(t)}
+							onhover={(id) => (hoverId = id)}
+							onpress={(e, c) => {
+								hoverId = c.id;
+								onClipPointerDown(e, c, t);
+							}}
+							oncontext={(e, c) => onClipContextMenu(e, c, t)}
+						/>
+					{/if}
+					{#each laneDrawings.get(t.id)?.buttons ?? t.clips as c (c.id)}
 						{@const left = c.timeline_start * pxPerSec}
 						{@const width = Math.max(6, clipDuration(c) * pxPerSec)}
 						{@const selected = editor.isSelected(c.id)}
@@ -3494,7 +3543,9 @@
 							data-sound-detached={c.source_audio === false ? '' : undefined}
 							onpointerdown={(e) => onClipPointerDown(e, c, t)}
 							onkeydown={(e) => onClipKey(e, c, t)}
+							onfocus={() => (focusId = c.id)}
 							onblur={() => {
+								focusId = focusId === c.id ? null : focusId;
 								// Focus moving on writes the run; the window losing it (alt-tab) gives it up, as every gesture does.
 								if (nudge?.clipId === c.id) documentOf(scroller).hasFocus() ? commitNudge() : abandonNudge();
 							}}
