@@ -35,11 +35,11 @@
 	import { singleFlight } from '#lib/single-flight';
 	import { measuredWidth, transportParts } from '#lib/transport-bar';
 	import { RESIZE_SETTLE_MS, capToSource, dprQuery, requestWidth } from '#lib/preview-size';
-	import type { PlayAhead, PreviewBoundsReport } from '#lib/types';
+	import type { PlayAhead, PreviewBoundsReport, PreviewFrameResult } from '#lib/types';
 	import { toast } from '#lib/notifications.svelte';
 	import { report } from '#lib/ops';
 	import { createFrameGate, createLadder, playbackFps, takeoverAhead } from '#lib/playback-sync';
-	import { GpuPlayback, NO_PLAY, playSession, type PlayRun } from '#lib/gpu-playback';
+	import { GpuPlayback, NO_PLAY, TakeBack, nextSession, playSession, playStart, type PlayRun } from '#lib/gpu-playback';
 	import { audio } from '#lib/audio';
 	import { CANVAS_PAINTER, createStreamPainter, jpegDataUrl } from '#lib/frame-transport';
 	import { decodeJpeg, paintPicture } from '#lib/frame-canvas';
@@ -131,7 +131,8 @@
 		routeOverlays: () => routeOverlays,
 		boundsEpoch: () => boundsEpoch,
 		hasClips: () => hasClips,
-		streaming: () => streaming,
+		// While the GPU takes the play back from the stream, the stream still paints the pane and the pump asks the GPU.
+		streaming: () => streaming && gpuPlay === null,
 		width: () => frameWidth,
 		timelineFrame: (t, width) => getTimelineFrame(t, width),
 		previewFrame: (t, overlays, width, order, play, draft) => getPreviewFrame(t, width, overlays, order, play, draft),
@@ -193,8 +194,9 @@
 	// reasons, in which case the stream below starts as it always did. Once the GPU has the session it
 	// keeps it until the engine says where it will stop drawing (`ahead`), and the stream is started
 	// just early enough to carry on from there; the GPU's last frame stays on the surface until the
-	// stream's first one is shown. No flipping back: a session given up on stays the stream's until
-	// the playhead is moved on purpose or the cut is edited.
+	// stream's first one is shown. A session given up on (a frame failed, the GPU fell behind or went silent)
+	// stays the stream's until the playhead is moved on purpose or the cut is edited; one that stopped where the
+	// engine said is taken back by the GPU once the play is past what was in its way (`TakeBack`, below).
 	let streaming = $state(false);
 	let stopStream: (() => void) | null = null;
 	let canvasEl = $state<HTMLCanvasElement | null>(null);
@@ -217,6 +219,23 @@
 	/** The output latency the stream that took a GPU session over reads the clock less (the audible time the GPU
 	 *  drew in), for the restarts of that stream in the same play; 0 for a stream that never was one. */
 	let takeoverLatency = 0;
+	/** The GPU taking the play back from the stream that took it over (`TakeBack`): null when it does not (the play
+	 *  is the GPU's, the GPU gave up, or nothing said where it stopped). Not reactive: the clock drives it. */
+	let takeBack: TakeBack | null = null;
+	/** The GPU's session that takes the play back is about to begin or has begun: the route is the surface's again
+	 *  while the stream still paints the pane under it, until the GPU's first frame is on the screen. */
+	let returning = $state(false);
+	/** Stops the stream once the GPU has taken the play back; set by the playback effect while it runs. */
+	let endStreamForGpu: (() => void) | null = null;
+	/** What the first frame of a session that took a play back cost, as the last one measured it (null before any):
+	 *  the next take-back's session begins this long before the time made ready, so its first frame is on the screen
+	 *  when the play gets there. */
+	let learnedLead: number | null = null;
+	/** The steady round trip of the session the stream took over: the estimate before any take-back was measured. */
+	let handoverTrip = 0;
+	/** How long before the time made ready the GPU's session begins: the learned first frame, else the steady round
+	 *  trip, else 50 ms, and never less than a frame. */
+	const firstFrameLead = () => Math.max(learnedLead ?? (handoverTrip > 0 ? handoverTrip : 0.05), 1 / playFps);
 	/** What the playback effect last saw of the play: an edit or a resize re-runs it mid-play (its GPU session is
 	 *  rebuilt from the audible picture, no earlier than the playhead the play began at), a seek or a Play from rest
 	 *  does not (`playSession`). */
@@ -249,6 +268,11 @@
 	/** The GPU's session goes to the stream: at once (`now`), or when the playhead has got to where the GPU stops. */
 	function handOverToStream(pb: GpuPlayback, ahead: PlayAhead | null, now: boolean, why: string) {
 		if (gpuPlay !== pb || !beginStream || pb.handingOver) return;
+		// The session that was to take the play back from the stream did not draw: the stream, which never stopped, plays on.
+		if (returning) {
+			abandonTakeBack(pb, why);
+			return;
+		}
 		logFrontend(
 			'info',
 			`GPU playback hands over to the stream${now ? ' at once' : ` at ${ahead?.handover.toFixed(2)} s`}: ${why}` +
@@ -256,6 +280,9 @@
 			'playback'
 		);
 		gpuBarred = { seek: ui.seekEpoch, timeline: editor.timeline };
+		// Past where the GPU stops it may take the play back, unless it failed, fell behind or stopped answering.
+		takeBack = pb.resumable && ahead ? new TakeBack(ahead.at) : null;
+		if (pb.roundTrip > 0) handoverTrip = pb.roundTrip;
 		// What the stream is told about where the GPU stops: an at-once hand-over has no use for a refusal that
 		// is still ahead (the pane would hold the GPU's last picture until the stream got there).
 		const stops = takeoverAhead(ahead, now, ui.time - pb.offsetAt(ui.time), pb.roundTrip, playFps);
@@ -281,6 +308,8 @@
 			endStream();
 			takeoverLatency = 0;
 			playRun = NO_PLAY;
+			takeBack = null;
+			returning = false;
 			return;
 		}
 		const session = untrack(() => playSession(playRun, ui.time, ui.seekEpoch, audio.outputLatency()));
@@ -289,8 +318,13 @@
 		// surface, nothing over the frame that the surface cannot show) and no earlier give-up of this play.
 		const gpu = untrack(() => {
 			const barred = gpuBarred !== null && gpuBarred.seek === ui.seekEpoch && gpuBarred.timeline === timeline;
-			// A stream that is not the continuation of a takeover of this play reads the clock as it always did.
-			if (!barred) takeoverLatency = 0;
+			// A stream that is not the continuation of a takeover of this play reads the clock as it always did, and
+			// a take-back belongs to the play it was for.
+			if (!barred) {
+				takeoverLatency = 0;
+				takeBack = null;
+			}
+			returning = false;
 			return settings.gpuPreview && route.via === 'gpu' && !barred;
 		});
 		let active = true;
@@ -417,6 +451,10 @@
 			if (!active || stopped) return;
 			stopped = startStream(handover, takeover);
 		};
+		endStreamForGpu = () => {
+			stopped?.();
+			stopped = null;
+		};
 		if (gpu) {
 			// The pump takes it from here: its first request decides, and a `stream` answer comes back as `handOverToStream`.
 			playFps = untrack(() => playbackFps(renderedFps(editor.timeline, editor.assets)));
@@ -427,6 +465,7 @@
 		return () => {
 			active = false;
 			beginStream = null;
+			endStreamForGpu = null;
 			const pb = gpuPlay;
 			gpuPlay = null;
 			pb?.end();
@@ -441,6 +480,83 @@
 			}
 		};
 	});
+
+	// The GPU takes the play back from the stream (`TakeBack`): the clock asks the backend where, brings the surface's
+	// route back a moment before, begins the GPU's session from the time made ready, and stops the stream once the
+	// session's first frame is on the screen.
+	$effect(() => {
+		const clock = ui.time;
+		if (!streaming || !ui.playing || !takeBack) return;
+		untrack(() => tickTakeBack(clock));
+	});
+	$effect(() => {
+		if (returning && frames.gpuShown) untrack(finishTakeBack);
+	});
+
+	function tickTakeBack(clock: number) {
+		const tb = takeBack;
+		if (!tb || tb.over || gpuPlay) return;
+		const heard = playStart(clock, audio.outputLatency(), true);
+		if (tb.missed(heard)) {
+			returning = false;
+			tb.retry(heard);
+		}
+		const lead = firstFrameLead();
+		const at = tb.ask(heard, lead);
+		if (at !== null) {
+			void askTakeBack(tb, at);
+			return;
+		}
+		if (tb.showing(heard, lead)) returning = true;
+		if (returning && tb.resume !== null && tb.due(heard, lead)) {
+			gpuPlay = new GpuPlayback(playFps, tb.resume, true);
+		}
+	}
+
+	/** Ask the backend where, from `at` on, the GPU takes the play back (it makes the play from there ready). A request
+	 *  that fails is "not yet", as one a newer request replaced is: only the backend saying so ends the take-back. */
+	async function askTakeBack(tb: TakeBack, at: number) {
+		let result: PreviewFrameResult | null = null;
+		const asked = performance.now();
+		try {
+			result = await frames.ready(at, route.overlays, frameWidth ?? 960, nextSession());
+		} catch (error) {
+			logFrontend('warn', `asking where the GPU takes the play back failed: ${error instanceof Error ? error.message : String(error)}`, 'playback');
+		}
+		if (tb.answer(result, (performance.now() - asked) / 1000) === 'never' && takeBack === tb) {
+			logFrontend('info', `GPU playback will not take this play back: ${result?.reasons.join('; ') ?? ''}`, 'playback');
+			takeBack = null;
+		}
+	}
+
+	/** The GPU's session drew its first frame: the play is the GPU's again, and the stream under it stops. */
+	function finishTakeBack() {
+		const pb = gpuPlay;
+		if (!pb || pb.drawn === 0) return;
+		logFrontend('info', `GPU playback took the play back from the stream at ${pb.from.toFixed(2)} s`, 'playback');
+		// What this first frame cost is how early the next take-back begins its session.
+		if (pb.roundTrip > 0) learnedLead = pb.roundTrip;
+		takeBack?.end();
+		takeBack = null;
+		returning = false;
+		gpuBarred = null;
+		endStreamForGpu?.();
+	}
+
+	/** The session that was to take the play back declined or failed before it drew: the stream plays on. A decline
+	 *  (a refused frame ahead, bounds not delivered yet, something over the frame) is asked about again after the
+	 *  take-back's wait; a failure (the request, a frame, the rate, a silent backend) ends it for the play. */
+	function abandonTakeBack(pb: GpuPlayback, why: string) {
+		logFrontend('info', `GPU playback did not take the play back from the stream: ${why}`, 'playback');
+		pb.end();
+		gpuPlay = null;
+		returning = false;
+		if (takeBack && !pb.failed) takeBack.retry(playStart(ui.time, audio.outputLatency(), true));
+		else {
+			takeBack?.end();
+			takeBack = null;
+		}
+	}
 
 	// Keep the preview in step with the playhead *and* the edit state: re-render on every playhead
 	// move, on every timeline change (an Inspector edit reassigns `editor.timeline`), when a proxy
@@ -548,7 +664,7 @@
 			supported: gpuPreview.status?.supported ?? false,
 			detached,
 			overlaysCapable: gpuPreview.status?.overlays ?? false,
-			streaming,
+			streaming: streaming && !returning,
 			empty,
 			titlesShown: titlesHere.length > 0 || svgBox !== null,
 			handles: handlesShown,

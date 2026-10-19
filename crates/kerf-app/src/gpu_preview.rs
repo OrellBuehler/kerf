@@ -885,7 +885,9 @@ pub struct PreviewFrameResult {
     /// `"ffmpeg"` (the `frame` data URL), `"superseded"` (a newer request replaced this one before
     /// it was drawn: nothing was, and the page ignores the answer) or, to a forward request, `"stream"`
     /// (the GPU does not play this session, or no longer: the page plays the stream from
-    /// `play.ahead.handover`, or from the playhead when there is none).
+    /// `play.ahead.handover`, or from the playhead when there is none). To a ready request: `"ready"`
+    /// (the play from `play.resume` is made ready; nothing was drawn), `"stream"` with `play.ahead`
+    /// (nothing within reach yet) or `"stream"` with no `play` (not a play the GPU takes back).
     pub renderer: &'static str,
     pub frame: Option<String>,
     /// Why the GPU did not draw it (empty when it did).
@@ -935,6 +937,8 @@ pub struct FrameRequest {
     order: Option<Order>,
     /// The play session this is a frame of (`hint = forward`), when it is.
     play: Option<PlayKey>,
+    /// Not a frame: the page asks where the GPU can take the play back from the stream (`hint = ready`).
+    ready: bool,
 }
 
 impl FrameRequest {
@@ -950,6 +954,7 @@ impl FrameRequest {
             draft: None,
             order: None,
             play: None,
+            ready: false,
         }
     }
 
@@ -967,6 +972,37 @@ impl FrameRequest {
             client: client.into(),
             session,
         });
+        self
+    }
+
+    /// What `get_preview_frame`'s `hint` makes of the request: none is a frame (paused, scrubbed, or a gesture's
+    /// with a draft), `forward` a frame of play session `session` of `client`, `ready` the question where the GPU
+    /// takes that play back from the stream. Both of the latter name their page and session and take no draft.
+    pub fn with_hint(
+        self,
+        hint: Option<&str>,
+        client: Option<&str>,
+        session: Option<u64>,
+        drafted: bool,
+    ) -> Result<Self, String> {
+        let named = |what: &str| match (client, session) {
+            (Some(client), Some(session)) if !drafted => Ok((client.to_string(), session)),
+            (Some(_), Some(_)) => Err(format!("a {what} takes no draft")),
+            _ => Err(format!("a {what} names its client and session")),
+        };
+        match hint {
+            None => Ok(self),
+            Some("forward") => named("forward frame").map(|(client, session)| self.forward(client, session)),
+            Some("ready") => named("ready request").map(|(client, session)| self.ready(client, session)),
+            Some(other) => Err(format!("unknown preview frame hint {other:?}")),
+        }
+    }
+
+    /// Not a frame: where, from this request's time on, the GPU can take session `session` of `client` back
+    /// from the stream ([`play`]'s `ready_play`). Nothing is drawn.
+    pub fn ready(mut self, client: impl Into<String>, session: u64) -> Self {
+        self = self.forward(client, session);
+        self.ready = true;
         self
     }
 
@@ -1422,6 +1458,9 @@ impl GpuPreview {
     fn serve(&self, request: &FrameRequest) -> Result<PreviewFrameResult, String> {
         let inputs = self.inputs(&request.take)?;
         if let Some(key) = &request.play {
+            if request.ready {
+                return self.ready_play(&inputs, key, request.t, request.overlays);
+            }
             return self.play(&inputs, key, request.t, request.overlays);
         }
         self.end_play();
@@ -3026,6 +3065,77 @@ mod tests {
             panic!("the worker did not run");
         };
         assert_eq!(answer.unwrap_err(), "no project in this test");
+    }
+
+    #[test]
+    fn a_hint_is_a_frame_a_play_frame_or_a_ready_request_each_named_as_the_command_requires() {
+        let req = || FrameRequest::new(no_inputs(), 1.0, 320, false);
+        let ready = req()
+            .with_hint(Some("ready"), Some("page"), Some(3), false)
+            .expect("a ready request");
+        assert!(ready.ready);
+        assert_eq!(
+            ready.play,
+            Some(PlayKey {
+                client: "page".into(),
+                session: 3
+            })
+        );
+        let forward = req()
+            .with_hint(Some("forward"), Some("page"), Some(3), false)
+            .expect("a play frame");
+        assert!(forward.play.is_some() && !forward.ready);
+        let plain = req().with_hint(None, None, None, true).expect("a frame, drafted or not");
+        assert!(plain.play.is_none() && !plain.ready);
+        let err = |hint, client, session, drafted| req().with_hint(hint, client, session, drafted).err().unwrap();
+        assert_eq!(
+            err(Some("ready"), None, Some(3), false),
+            "a ready request names its client and session"
+        );
+        assert_eq!(
+            err(Some("ready"), Some("page"), None, false),
+            "a ready request names its client and session"
+        );
+        assert_eq!(
+            err(Some("ready"), Some("page"), Some(3), true),
+            "a ready request takes no draft"
+        );
+        assert_eq!(
+            err(Some("forward"), None, None, false),
+            "a forward frame names its client and session"
+        );
+        assert_eq!(
+            err(Some("sideways"), None, None, false),
+            "unknown preview frame hint \"sideways\""
+        );
+    }
+
+    #[test]
+    fn a_ready_request_goes_through_the_mailbox_to_the_play_and_a_stale_one_does_nothing() {
+        let (take, _shared) = drive_tests::taker(Project::sample().expect("the sample project"));
+        let preview = Arc::new(failing(Arc::new(std::sync::atomic::AtomicUsize::new(0)), "no adapter"));
+        preview.set_enabled(true);
+        let ready = |seq| {
+            FrameRequest::new(Arc::clone(&take), 1.0, 320, false)
+                .with_hint(Some("ready"), Some("page"), Some(3), false)
+                .expect("a ready request")
+                .ordered("page", seq)
+        };
+        // No surface placed yet: not a play the GPU takes back, which the page reads as `stream` with no `play`.
+        let Ok(Delivery::Done(Ok(answer))) = preview.post(ready(5), |job| job()).try_recv() else {
+            panic!("the worker did not answer");
+        };
+        assert_eq!(answer.renderer, "stream");
+        assert!(answer.play.is_none());
+        assert!(answer.reasons[0].contains("not reported where it is"), "{:?}", answer.reasons);
+        // The paused frame the page asked for once the play stopped is newer: a ready request that arrives after it
+        // is not served, so it cannot drop what that frame primes.
+        let paused = FrameRequest::new(Arc::clone(&take), 1.0, 320, false).ordered("page", 7);
+        assert!(matches!(preview.post(paused, |job| job()).try_recv(), Ok(Delivery::Done(_))));
+        let stale = preview
+            .post(ready(6), |_job| panic!("no worker for a stale ready request"))
+            .try_recv();
+        assert!(matches!(stale, Ok(Delivery::Superseded)));
     }
 
     #[test]

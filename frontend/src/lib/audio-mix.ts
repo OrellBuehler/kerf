@@ -107,7 +107,7 @@ export interface GainPoint {
 /** How far either side of a step the gain is read for the value it leaves and the one it lands
  *  on (seconds). Reading the step's own time is not safe: `(start + t) - start` can land an ulp
  *  before `t`, on the wrong side of it. */
-const STEP_LEAD = 1e-9;
+export const STEP_LEAD = 1e-9;
 
 /**
  * What the preview does to a **keyed** clip's gain after `from`, in order: a linear ramp to
@@ -143,6 +143,40 @@ export function gainAutomation(clip: GainClip, start: number, end: number, from:
 		}
 		out.push({ time, value: clipGainAt(clip, time - STEP_LEAD, start, end) });
 		out.push({ time, value: clipGainAt(clip, time + STEP_LEAD, start, end), jump: true });
+	}
+	return out;
+}
+
+/**
+ * The same for a playhead running **backwards** (reverse shuttle) from `from` down to `start`, for
+ * any clip, keyed or not: a linear ramp to every point the forward pass ramps through — the curve's
+ * points, the fade edges, the clip's start — in the order they are met, so each straight segment is
+ * the forward one played the other way round. The gain starts at the value just below `from`
+ * (`clipGainAt(from - STEP_LEAD)`). A step is met from above: the ramp arrives at the value it lands
+ * on going forwards, and a `jump` sets the value it leaves. A step at `start` is not jumped (the clip
+ * is over), and one at `from` is already in the starting value.
+ */
+export function gainAutomationBack(clip: GainClip, start: number, end: number, from: number): GainPoint[] {
+	const times = new Set<number>([start]);
+	const steps = new Set<number>();
+	if (volumeAnimated(clip)) {
+		const polyline = propertyCurve(clip, 'volume');
+		polyline.forEach(([t, v], i) => {
+			times.add(start + t);
+			if (i > 0 && polyline[i - 1][0] === t && polyline[i - 1][1] !== v) steps.add(start + t);
+		});
+	}
+	const fo = fadeOutOf(clip);
+	for (const t of fadeInTimes(clip, start)) times.add(t);
+	if (fo > 0) times.add(end - fo);
+	const out: GainPoint[] = [];
+	for (const time of [...times].filter((t) => t < from && t >= start).sort((a, b) => b - a)) {
+		if (!steps.has(time) || time <= start) {
+			out.push({ time, value: clipGainAt(clip, time, start, end) });
+			continue;
+		}
+		out.push({ time, value: clipGainAt(clip, time + STEP_LEAD, start, end) });
+		out.push({ time, value: clipGainAt(clip, time - STEP_LEAD, start, end), jump: true });
 	}
 	return out;
 }

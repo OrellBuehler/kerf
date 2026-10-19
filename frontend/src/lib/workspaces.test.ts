@@ -81,7 +81,7 @@ describe('the workspace and tab lists', () => {
 			['edit', 'media'],
 			['color', 'effects'],
 			['audio', 'audio'],
-			['motion', 'transitions'],
+			['motion', 'titles'],
 			['deliver', 'media']
 		]);
 	});
@@ -259,7 +259,7 @@ describe('the library tab per workspace', () => {
 		const state = defaultWorkspaces();
 		expect(libraryTabFor(state, 'edit')).toBe('media');
 		expect(libraryTabFor(state, 'color')).toBe('effects');
-		expect(libraryTabFor(state, 'motion')).toBe('transitions');
+		expect(libraryTabFor(state, 'motion')).toBe('titles');
 	});
 
 	test('a pick sticks to its workspace and moves no other', () => {

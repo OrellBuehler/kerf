@@ -424,7 +424,34 @@ so the feature is **only** activated through these forwards — which is what ma
   fit and pads, `Cover` scales with `force_original_aspect_ratio=increase` and crops
   — which is what makes the vertical / square presets produce a usable shot rather
   than a strip of picture in a black field. It sets the *base* fit only; a clip with
-  its own transform still composes on top.
+  its own transform still composes on top. **`Blur`** is Contain over a blurred copy of the
+  same picture that covers the frame (`blur_fill`, pure): `split`, the copy scaled to *cover* a
+  thumbnail an eighth of the frame on each side (`2*floor(w/16)` x `2*floor(h/16)`, at least 4x4,
+  bilinear) and cropped to it, `boxblur=r:2` (r = a sixteenth of the thumbnail's smaller side, whole
+  pixels, at least 1 — under half the chroma plane, which `boxblur` requires — so the strength is
+  only roughly the same from one frame size to another), scaled back up bilinear, and the picture's
+  own Contain `scale` (the delivery's flags, `force_divisible_by=2` ahead of a tone-map) `overlay`'d
+  centred on it — a full-frame picture, so it takes the place of `pad`. A blur of a few dozen pixels
+  at the cost of one on a thumbnail. The inner pads are named per clip (`bf<instance>` in the export,
+  `bf<layer>` in the still); the string joins the chain like one filter
+  (`...,split[..];...;[..][..]overlay=...,setsar=1,...`). **Which clips take it** is
+  `takes_blur_fill`'s (pure), the same answer for the export and the still: a picture placed by the
+  plain fit that leaves bars. Not one moved, scaled, rotated, cropped or keyframed by its transform
+  (a picture-in-picture on its own fill is not what anyone asked for; the still asks of the clip,
+  not of its sampled pose), not a 360 reframe (it draws the frame itself), not a see-through one —
+  an alpha source (`Asset::has_alpha`, which the still is given as the export is), a chroma key, a
+  mask: the fill would show through its clear part as a blurred halo — and not one of the frame's
+  own shape or of an unprobed one (nothing to fill; it would cost ~7 ms a frame for nothing). Those
+  are given a Contain format by the caller, so their argv is Contain's byte for byte (`pad`
+  included in the still). The still's thumbnail is an eighth of the *still's* canvas. The
+  `overlay` composes in 8-bit 4:2:0 (its default) except for an HDR clip, fitted ahead of its
+  tone-map, which takes `format=yuv420p10` (FFmpeg 4.4 has it) so the fill does not band it; the
+  still tone-maps first, so it keeps the default. The GPU compositor refuses the whole frame (`Unsupported::BlurFill`, still and motion),
+  so the preview is FFmpeg's. Rendered in `cli/blur_rendered.rs` (`#[ignore]`d, 6.1 and 9.0): a
+  white / black source in a vertical frame keeps the picture, its bars are the picture blurred
+  across the edge (Contain's are black), the still draws the export's frame (3 levels at worst),
+  and a half-transparent FFV1 source renders under Blur exactly as under Contain; a 10-bit HLG ramp's
+  picture is Contain's to 2 levels (the tone-map's error diffusion), 5 with an 8-bit overlay.
   **The shape itself is a property of the project**, not of one render:
   `Timeline.format: Option<Delivery>` (`{width, height, fit}`) is the frame the cut
   is being made *for*. `export_format` applies it between the footage-derived

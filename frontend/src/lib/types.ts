@@ -1310,8 +1310,9 @@ export interface ExportOptions {
 	hwaccel?: string | null;
 	resolution?: [number, number] | null;
 	/** How footage of a different shape is fitted to `resolution`: letterboxed
-	 *  (`contain`, the default) or filled and cropped (`cover`). Only matters
-	 *  when the delivery aspect differs from the footage. */
+	 *  (`contain`, the default), filled and cropped (`cover`), or letterboxed over a
+	 *  blurred copy of itself (`blur`). Only matters when the delivery aspect differs
+	 *  from the footage. */
 	fit?: Fit;
 	fps?: number | null;
 	scaler?: string | null;
@@ -1373,8 +1374,9 @@ export interface SyncedByAudio {
  *  Apple -16, EBU R128 broadcast -23, all with a -1 dBTP true-peak ceiling. */
 export type LoudnessPreset = 'youtube' | 'spotify' | 'apple' | 'broadcast';
 
-/** How a clip's picture is fitted to an output frame of a different shape. */
-export type Fit = 'contain' | 'cover';
+/** How a clip's picture is fitted to an output frame of a different shape: `blur` is `contain`
+ *  over a blurred, enlarged copy of the picture (a clip placed by its transform gets plain bars). */
+export type Fit = 'contain' | 'cover' | 'blur';
 
 /** A place a finished cut gets published, mirroring `kerf_core::platform`. */
 export interface PlatformTarget {
@@ -2071,6 +2073,9 @@ export interface PlayInfo {
 	/** The request fell in the frame already on the screen: nothing was drawn. */
 	repeat: boolean;
 	ahead: PlayAhead | null;
+	/** To a `ready` request: the time from which the GPU takes the play back from the stream (its play is made
+	 *  ready there), or null while no such time is within reach (`play.ahead` says what is in the way). */
+	resume?: number | null;
 }
 
 /** The answer of `get_preview_frame` (`PreviewFrameResult`): which renderer made the
@@ -2082,7 +2087,7 @@ export interface PreviewFrameResult {
 	 *  drawn and the answer is ignored. `stream` (to a forward request only): the GPU does
 	 *  not play this session, or no longer, and the page plays the stream, from
 	 *  `play.ahead.handover` when there is one. */
-	renderer: 'gpu' | 'ffmpeg' | 'superseded' | 'stream';
+	renderer: 'gpu' | 'ffmpeg' | 'superseded' | 'stream' | 'ready';
 	frame: string | null;
 	/** Why the GPU did not draw it (empty when it did). */
 	reasons: string[];
@@ -2108,6 +2113,8 @@ export interface PreviewDraft {
 /** How the page asks for a frame of GPU playback: the session it belongs to. */
 export interface PlayAsk {
 	session: number;
+	/** Not a frame: where, from the time asked, the GPU can take the play back from the stream (`hint: ready`). */
+	ready?: boolean;
 }
 
 /** The answer of `fit_music` (`MusicFitted` in `crates/kerf-app/src/lib.rs`): the refreshed

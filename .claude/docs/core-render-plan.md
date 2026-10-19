@@ -146,6 +146,10 @@
   before the source's first picture are `Early` (nothing drawn), as in the export.
   A rate whose canvas and `fps=` parses differ (`29.970029`) is refused in Motion
   (`Unsupported::PickRate`): the pick assumes one grid.
+  A blurred-fill delivery (`Fit::Blur`) is refused whenever a layer is on screen, still and motion
+  alike (`Unsupported::BlurFill`, `size_free_reasons`): the fill is FFmpeg's `boxblur` on a thumbnail
+  with no compositor pass or parity case. `LayerGeometry` places the picture as under `Contain`, and so
+  does its port (`layer-geometry.ts`, `croppable`: the corpus replays blurred cases).
   **Traps for the `FrameSource` that will feed it** (A1b): `showinfo` pts under `-copyts
   -start_at_zero -ss` are already start-relative, so pass `start_us = 0`; use the decoder's
   best-effort timestamps (AVI has no frame pts); a streaming cursor needs `STARTPTS`, one
@@ -220,7 +224,9 @@
   not draw — `PlayRefusal::Plan(Unsupported)` — or draws exactly but **not in time** (`Reversed`: the cursor
   reads the clip's whole window before its first frame; `MovingText`: a title whose position is keyed
   is a new `drawtext` rasterisation per frame), with `handover`, the time a stream that carries on must
-  start at (`SpanPlan::handover` of the slice's windows, in the cut's time).
+  start at (`SpanPlan::handover` of the slice's windows, in the cut's time). `PlayCut::resume(from, reach,
+  horizon, size, caps)` is its converse: the first frame within `reach` from which every frame for `horizon` is
+  drawn (frames planned in order, each once), where a play the stream took over can be handed back to the compositor.
   `engine/cli/sweep.rs` holds
   the Motion plan against the **evaluated** graph (a ~50-line evaluator for
   `keyframe_expr`'s grammar: zoom / rotate / opacity, the overlay's x/y against the

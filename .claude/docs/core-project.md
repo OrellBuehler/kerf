@@ -104,7 +104,11 @@
   (below); v2→v3 adds the `fonts` table (below); v3→v4 adds `assets.music_score`; v4→v5 changes no table — a clip may be a
   generated title (`Clip.generator`, in the timeline JSON), and the number alone keeps an older build, which would read such a clip
   as one of missing media and drop its title on the next save, from opening the file (a JSON step: `needed` always, so the file is
-  copied aside first; `persisted/timelines-v5.json` holds a title clip). A step's `needed_to_read` says whether a build that
+  copied aside first; `persisted/timelines-v5.json` holds a title clip); v5→v6 is a JSON step for `Fit::Blur` (`"fit":"blur"`
+  in a delivery frame, a variant an older build fails on) and `StreamInfo.lead` (an asset stream's late-start offset, a field
+  an older build drops on its next write): `run` a no-op, `needed` always, `needed_to_read` false;
+  `persisted/timelines-v6.json` holds a blurred-fill cut. `persist_tests` pins which steps a file has pending with
+  `store::pending_steps` (a legacy file that has every column: `[4, 5]`). A step's `needed_to_read` says whether a build that
   cannot write must still refuse a file lacking what it adds: true for the v1, v2 and v4 columns (the reads
   name them), false for the `fonts` table (reads tolerate its absence), so a write-protected v2 project
   opens as it is. A new file is stamped `SCHEMA_VERSION`; a
@@ -119,8 +123,8 @@
   JSON in the tables too** (timeline, history, proposal, analysis, asset streams): a change an older build
   would drop (an unknown field, at its next write) or misread (an unknown variant) is a step of its own —
   `run` a no-op (or a JSON rewrite), `needed` always (so the file is copied aside first), `needed_to_read`
-  false. `persist_tests` keeps `persisted/timelines-v<N>.json` (the sample's timeline and one of each golden
-  oracle family) for each version that moved the stored shape: every one must still read, and the newest must
+  false. `persist_tests` keeps `persisted/timelines-v<N>.json` (the sample's timeline and seven of the golden
+  oracle's) for each version that moved the stored shape: every one must still read, and the newest must
   round-trip unchanged, so moving the shape fails until a step is appended and `KERF_BLESS_PERSISTED=1`
   writes the new version's file (add it to `PERSISTED`); a tables-only step needs no file. `meta.kerf_version` is the build that made the file, `meta.last_kerf_version`
   the last one that opened it to write. **Save As is atomic** (`vacuum_into_atomic`):
@@ -235,6 +239,13 @@
   added when the first is later, fewer than three or shorter than 10 s reported, not
   enforced) and `ffmetadata_chapters` (chapter markers only, each to the next or its own
   duration, `= ; # \` and newlines escaped; `None` with none).
+  **What changed, without the lock** (`project_activity.rs`): the update hook that moves the plan epoch
+  also marks the written table's area (`TIMELINE` timeline / history, `PROPOSAL` staged / staged_undo,
+  `TASKS`, `ASSETS` assets / analysis, `PROJECT` the rest), and `swap_in` marks them all. Marks gather in
+  one process-wide set until `take()`; the `set_listener` callback runs (under the lock, on the writing
+  thread) only when an area goes from clean to marked, and once as it is set if marks are pending (the
+  project opened at launch marked them before anyone listened), so it must only wake something — the MCP
+  activity stream (mcp.md) is its one listener. Same blind spots as the epoch; a rolled-back write still marks.
   The **agent task queue** is a real `tasks` table (one row per `Task`,
   columns not JSON): `add_task` / `list_tasks` / `claim_next_task` / `complete_task`
   / `fail_task` / `resolve_task` / `remove_task` drive the `queued → working →
