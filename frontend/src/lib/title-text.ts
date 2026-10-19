@@ -31,6 +31,10 @@ export function decodeEntities(raw: string): string {
 	});
 }
 
+/** An attribute value as XML reads it: a literal line end or tab is a space (a character reference to one is kept),
+ *  then the entities decoded. */
+export const attributeValue = (raw: string): string => decodeEntities(raw.replace(/\r\n?/g, '\n').replace(/[\t\n]/g, ' '));
+
 /** A value written inside `quote`, as kerf-core's `escape_attr` writes it. */
 function escapeAttr(value: string, quote: '"' | "'"): string {
 	let out = '';
@@ -47,7 +51,7 @@ function escapeAttr(value: string, quote: '"' | "'"): string {
 /** A start tag's attributes, name to value as XML reads it (entities decoded); the first of a repeated name. */
 function attributes(raw: string): Map<string, string> {
 	const attrs = new Map<string, string>();
-	for (const a of raw.matchAll(ATTRIBUTE)) if (!attrs.has(a[1])) attrs.set(a[1], decodeEntities(a[2] ?? a[3] ?? ''));
+	for (const a of raw.matchAll(ATTRIBUTE)) if (!attrs.has(a[1])) attrs.set(a[1], attributeValue(a[2] ?? a[3] ?? ''));
 	return attrs;
 }
 
@@ -234,7 +238,7 @@ export function withTextBox(svg: string, element: string, box: TextBox): string 
 			if (name !== 'style') return whole;
 			styled = true;
 			const raw = dq ?? sq ?? '';
-			const value = decodeEntities(raw);
+			const value = attributeValue(raw);
 			const q = dq !== undefined ? '"' : "'";
 			const kept = [...(decl ? [decl] : []), ...declarations(value).filter((d) => !isProperty(d, 'inline-size'))];
 			const next = kept.join(';');
