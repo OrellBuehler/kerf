@@ -951,6 +951,7 @@
 		if (trimDrag?.moved) return trimDrag.edge === 'r' ? trimDrag.pos : trimDrag.origEnd;
 		if (titleDrag?.moved) return titleDrag.end;
 		if (tg?.moved && tgPreview) return Math.max(...tgPreview.ghosts.map((g) => g.start + g.dur));
+		if (dropGhost) return dropGhost.start + dropGhost.dur;
 		return null;
 	});
 
@@ -2915,7 +2916,11 @@
 	     `align-items:flex-start` + `min-height:100%` rather than the default
 	     stretch: stretch would size each column to the scroller's *client*
 	     height, cutting the playhead and grid lines off at the fold while the
-	     tracks kept going. -->
+	     tracks kept going. The vertical scrollbar's gutter is always kept, and the
+	     lanes clip what is drawn past their end: the lane is sized from the
+	     scroller's width, so a scrollbar that came and went with it (a tick a
+	     pixel past the edge, a horizontal bar pushing the tracks past the fold)
+	     would resize the lane, and the lane the scrollbar, every frame. -->
 	<div
 		bind:this={scroller}
 		onwheel={onWheel}
@@ -2924,7 +2929,7 @@
 			// A scroll moves the lanes under a pointer that has not moved.
 			if (marquee) onMarqueeMove(marquee.cx, marquee.cy);
 		}}
-		style="flex:1;min-height:0;overflow:auto;position:relative;display:flex;align-items:flex-start"
+		style="flex:1;min-height:0;overflow:auto;scrollbar-gutter:stable;position:relative;display:flex;align-items:flex-start"
 	>
 		<!-- track headers -->
 		<div
@@ -3125,7 +3130,7 @@
 			role="presentation"
 			oncontextmenu={onTimelineContextMenu}
 			onpointerdown={(e) => onCanvasPointerDown(e, 'canvas')}
-			style="width:{contentW}px;min-width:calc(100% - var(--track-header-w));flex:none;min-height:100%;position:relative"
+			style="width:{contentW}px;min-width:calc(100% - var(--track-header-w));flex:none;min-height:100%;position:relative;overflow-x:clip"
 		>
 			<!-- Past the end of the cut: the lane runs to the window's edge, and what lies beyond the last
 			     clip is dimmed behind a line, so a short cut is not mistaken for a short timeline. -->
