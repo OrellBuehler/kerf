@@ -1,5 +1,5 @@
 // `vignette` (vf_vignette.c, its defaults) on one plane of a `yuv420p` picture: the integer arithmetic of
-// `effects.rs` (`vignette_luma`, `vignette_chroma`, `lcg_at`), sample for sample. Luma is
+// `effects.rs` (`vignette_luma`, `vignette_chroma`, `vignette_steps`), sample for sample. Luma is
 // `(int)(f * s + dither)`, chroma `(int)(f * (s - 127) + 127 + dither)`, the product and the `+ 127` rounded to
 // `float` here exactly (as integers: no backend may fuse them into one rounding), the dither the LCG's state at
 // this sample's step over 2^32, added as the filter adds a `double`.
@@ -11,42 +11,14 @@ struct V {
     map_w: u32,
     // 1 for U and V: the factor of the block's top-left luma sample.
     chroma: u32,
-    // The LCG step of this plane's first sample: `(n * samples_per_frame + plane offset) mod 2^32`.
-    base: u32,
-    pad0: u32,
-    pad1: u32,
-    pad2: u32,
 }
 
 @group(0) @binding(0) var<uniform> v: V;
 @group(0) @binding(1) var src: texture_2d<f32>;
 // The factors (`float` bits), one per luma sample, row by row.
 @group(0) @binding(2) var<storage, read> fmap: array<u32>;
-
-const LCG_A: u32 = 1664525u;
-const LCG_C: u32 = 1013904223u;
-
-// The LCG's state after `i` steps from 0, by halving.
-fn lcg_at(i0: u32) -> u32 {
-    var acc_a = 1u;
-    var acc_c = 0u;
-    var a = LCG_A;
-    var c = LCG_C;
-    var i = i0;
-    loop {
-        if (i == 0u) {
-            break;
-        }
-        if ((i & 1u) == 1u) {
-            acc_a = acc_a * a;
-            acc_c = acc_c * a + c;
-        }
-        c = c * (a + 1u);
-        a = a * a;
-        i = i >> 1u;
-    }
-    return acc_c;
-}
+// The plane's dither (`vignette_steps`): `A^x` and `G_x` per column, then each row's first LCG state.
+@group(0) @binding(3) var<storage, read> steps: array<u32>;
 
 // `m` (non-zero) rounded to 24 significant bits, half to even: the mantissa and its shift.
 fn round24(m: u32) -> vec2<u32> {
@@ -134,7 +106,8 @@ fn vs(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {
 fn fs_vignette(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let o = vec2<u32>(frag.xy);
     let s = u32(round(textureLoad(src, vec2<i32>(o), 0).r * 255.0));
-    let state = lcg_at(v.base + o.y * v.size.x + o.x);
+    let w = v.size.x;
+    let state = steps[o.x] * steps[2u * w + o.y] + steps[w + o.x];
     var out: u32;
     if (v.chroma == 1u) {
         out = chroma(fmap[(o.y * 2u) * v.map_w + o.x * 2u], s, state);

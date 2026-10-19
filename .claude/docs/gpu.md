@@ -657,12 +657,17 @@ before the zoom acts at the **fit size** and the zoom magnifies it (a blur grows
   factor a `float` step high on some samples, a level where the sum sits a few millionths over an integer: 7 samples in 3.5 million, found by the
   Motion harness); luma `(int)(f * s + dither)`, chroma `(int)(f * (s - 127) + 127 + dither)` with its block's top-left factor. The `float` products and
   sum are done in integers (no backend's FMA contraction can move a level), the map is a storage buffer made once per size. The **dither is an LCG that
-  runs on across frames** (one step per sample, Y then U then V): sample `i` of the chain's `n`th frame is state `n * (w*h + 2*cw*ch) + i`, jumped to
-  per sample (`lcg_at`). A still plan's `n` is 0 (the still graph runs one frame through the chain); an export frame's is its clip's
+  runs on across frames** (one step per sample, Y then U then V): sample `i` of the chain's `n`th frame is state `n * (w*h + 2*cw*ch) + i`, reached
+  through tables (`vignette_steps`: `A^x` and `G_x` per column, each row's first state, so a sample is one multiply-add). A still plan's `n` is 0 (the still graph runs one frame through the chain); an export frame's is its clip's
   (`Pick::output_index`, counted by its `FrameCursor`: `FrameCursor::count`, `MotionFrames::counts`, passed by `render_motion_texture` and
   `composite_counted` / `composite_yuv_counted`; without it the frame is `Unsupported`). Byte for byte, still and export, every frame (the late start,
-  speed, reverse and dissolve cases included).
-* Refused (`Effects`): a chroma key (a float colour distance), a vignette on a picture that is not limited-range `yuv420p` (FFmpeg vignettes it in its
+  speed, reverse and dissolve cases included), on 6.1.1 and 9.0.2. The count is the **full cut's**: a range export (`rendered.slice`) and the
+  preview's hand-over stream start their graph at the slice, so their dither restarts there, a phase the GPU does not follow (a level on a
+  dithered sample, never more). **Gap:** a full-range picture is refused only when its format says so (`yuvj*`, `maybe_full_range`); a VP9
+  (likely HEVC / AV1) file probes as `yuv420p` with `color_range=pc`, which `StreamInfo` does not record, so FFmpeg vignettes its raw values
+  while the GPU vignettes the converted ones (estimated 8 levels off at the corners). The invert, blur and sharpen have the same gap; recording
+  the range is a follow-up (a schema step).
+* Refused (`Effects`): a chroma key (a float colour distance), a vignette on a picture that is not `yuv420p` or whose format says full range (FFmpeg vignettes it in its
   own format: other planes, another dither course), a vignette map over the device's storage-buffer limit, a sigma outside 0 to 1024
   or an amount outside -2 to 5 (FFmpeg's options refuse them too), a blur over the device's storage-buffer limit, and a **sharpen that amplifies a difference upstream of it** (judged with the geometry, so by render size): FFmpeg's scale or blur is a level from ours, and `unsharp` carries it through at worst `1 + 2|amount|` at an edge sample and rounds up a level more with each further sharpen (its `>> 16` floors). From the first source (a scale before the effects: every stage, or the fit scale when a zoom comes last; or a blur with sigma > 0) the worst case starts at 1 and each later sharpen that is not zero at `unsharp`'s 16 bits adds `ceil(2 * err * |amount|)`; the frame is refused when it passes 2. So one sharpen of at most 0.5 is drawn (0.6 is not), and any second one is refused, however small. With no source upstream a sharpen is exact at any amount, chained or not, and a blur after it counts for nothing. `Matte`: a blur, a sharpen or a vignette on a
   letterbox (they would see the bars as picture; tables and a grade carry the bars through). By the picture (`effect_on_picture_refusal`): an invert,
@@ -703,7 +708,7 @@ a dissolve, dip, slide or push into a zooming clip and out of one) hold the boun
 | --- | --- | --- |
 | 0 | a mask at the picture's size (20 of 27 mask rows), grayscale, invert, sharpen, a vignette at the picture's size (every frame of the run) | integer arithmetic, reproduced |
 | 1 (`SCALED`) | a layer the compositor scales, a mask or a vignette on it, a one-stage zoom | swscale's x86 scaler is not bit-exact with the C arithmetic the shader follows |
-| 1 (`EFFECT`) | a blur at the picture's size | `gblur`'s SIMD summation order (above) |
+| 1 (`EFFECT`) | a blur at the picture's size, and a blur then a vignette (measured 0: the vignette's factor is at most 1) | `gblur`'s SIMD summation order (above) |
 | 2 | a layer the compositor scales *and* makes translucent, no effect (`tests/playback.rs`, `play/pip/translucent and scaled`, measured Y 2 / UV 2 on both FFmpegs); `EFFECT_SCALED`: a blur, grayscale or invert on a scaled or translucent layer; a blur then a sharpen of at most 0.5 even unscaled and opaque (the blur's level times the gain); a sharpen of at most 0.5 after a scale. `CASCADED`: a zoom (the fit scale, then the zoom's). `ZOOMED_MASK`: a soft mask edge on a zoomed picture. Rotated, graded and scaled, dip to white (Y three on BT.709, `WHITE_709`) | two of the causes above on one sample; the RGB kernel for white |
 
 A **sharpen after a scale or a blur has no row beyond that: it is refused past a worst-case error of 2.** `unsharp` is exact, but it carries the one-level difference upstream (the scaler's, or `gblur`'s SIMD order) through at worst `1 + 2|amount|` levels of luma at an edge sample (measured after a scale: 3 at 1.5, 7 at 3, 11 at 5; after a blur on 6.1.1: 2 at 1, 3 at 1.5, 5-6 at 5), and its `>> 16` floors, so each further sharpen adds at least a level (measured on 6.1.1: two of 0.2 reach 3, three of 0.1 reach 4), and the GPU refuses rather than approximates. One sharpen of 0.5 is the two levels of a scaled blur. (A grade between a scale and a sharpen amplifies too: `GRADED_SCALED` already accepts two.)
@@ -756,8 +761,8 @@ above), **a moving zoom last, masks and effects** (`zoom/`, `zoom+mask/`, `mask/
 caption styles, positions and edges, boxes, colours, sizes, keyframed and overlapping overlays, escapes, installed fonts,
 over every kind of picture, with no layer, and the text it must refuse, each held to the same picture without the text; see
 "Text" above). The table
-holds 709 rows on FFmpeg 6.1.1 and 662 on the pinned 9.0.2 the Windows and macOS bundles ship (where the mixed-tag stacks are asserted refused instead of compared; 152 rows are `text/`, its
-controls included, 161 the transitions and fades and 143 the zoom, mask and effect cases) plus the plane-level scaler (75) and effect (99) runs, all passing strictly. A failing case writes the reference, GPU and diff images to `target/parity/`
+holds 729 rows on FFmpeg 6.1.1 and, before the vignette's 12, 662 on the pinned 9.0.2 the Windows and macOS bundles ship (where the mixed-tag stacks are asserted refused instead of compared; on 6.1.1 152 rows are `text/`, its
+controls included, 191 the transitions, fades and dips and 158 the zoom, mask and effect cases) plus the plane-level scaler (75) and effect (108) runs, all passing strictly. A failing case writes the reference, GPU and diff images to `target/parity/`
 (`KERF_PARITY_KEEP=1` keeps them for passing ones; `KERF_PARITY_EXPLORE=1` prints
 everything and fails nothing); every run writes `target/parity/report.txt`.
 `tests/bench.rs` times a still on the GPU against FFmpeg at 1080p / 4K and 1 / 3 / 6

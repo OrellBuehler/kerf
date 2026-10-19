@@ -239,15 +239,13 @@ struct BlurParams {
     pad: [f32; 3],
 }
 
-/// `vignette.wgsl`'s uniform: one plane, and where its dither starts in the filter's run.
+/// `vignette.wgsl`'s uniform: one plane (its dither is in [`effects::vignette_steps`]).
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct VignetteParams {
     size: [u32; 2],
     map_w: u32,
     chroma: u32,
-    base: u32,
-    pad: [u32; 3],
 }
 
 /// One plane on the GPU. A handle: cloning shares the texture.
@@ -323,14 +321,12 @@ struct PlaneOps {
     vignette: wgpu::RenderPipeline,
 }
 
-/// `vignette`'s factor map for one picture size ([`effects::vignette_map`], as `float` bits), made
-/// once because it does not change (the filter's `eval=init`) and uploaded by the first frame that
-/// draws it.
+/// `vignette`'s factor map for one picture size ([`effects::vignette_map`], as `float` bits) on the GPU,
+/// made once because it does not change (the filter's `eval=init`).
 struct VignetteMap {
     w: u32,
     h: u32,
-    bits: Vec<u32>,
-    gpu: OnceLock<wgpu::Buffer>,
+    gpu: wgpu::Buffer,
 }
 
 /// The vignette maps in use, newest first: a few sizes at once (a cut's clips at their fit sizes).
@@ -341,19 +337,30 @@ struct VignetteMaps(Mutex<Vec<Arc<VignetteMap>>>);
 const VIGNETTE_MAPS: usize = 4;
 
 impl VignetteMaps {
-    fn get(&self, w: u32, h: u32) -> Arc<VignetteMap> {
+    fn held(&self, w: u32, h: u32) -> Option<Arc<VignetteMap>> {
         let mut maps = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(at) = maps.iter().position(|m| (m.w, m.h) == (w, h)) {
-            let map = maps.remove(at);
-            maps.insert(0, Arc::clone(&map));
+        let at = maps.iter().position(|m| (m.w, m.h) == (w, h))?;
+        let map = maps.remove(at);
+        maps.insert(0, Arc::clone(&map));
+        Some(map)
+    }
+
+    /// The map for `w` x `h`, made (tens of milliseconds at 1080p) outside the lock when it is not held.
+    fn get(&self, device: &wgpu::Device, w: u32, h: u32) -> Arc<VignetteMap> {
+        if let Some(map) = self.held(w, h) {
             return map;
         }
-        let map = Arc::new(VignetteMap {
-            w,
-            h,
-            bits: effects::vignette_map(w, h).into_iter().map(f32::to_bits).collect(),
-            gpu: OnceLock::new(),
+        let bits: Vec<u32> = effects::vignette_map(w, h).into_iter().map(f32::to_bits).collect();
+        let gpu = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("vignette map"),
+            contents: bytemuck::cast_slice(&bits),
+            usage: wgpu::BufferUsages::STORAGE,
         });
+        if let Some(map) = self.held(w, h) {
+            return map;
+        }
+        let map = Arc::new(VignetteMap { w, h, gpu });
+        let mut maps = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         maps.insert(0, Arc::clone(&map));
         maps.truncate(VIGNETTE_MAPS);
         map
@@ -1125,6 +1132,7 @@ impl Compositor {
                 entry(0, uniform, wgpu::ShaderStages::FRAGMENT),
                 entry(1, texture, wgpu::ShaderStages::FRAGMENT),
                 entry(2, storage(true), wgpu::ShaderStages::FRAGMENT),
+                entry(3, storage(true), wgpu::ShaderStages::FRAGMENT),
             ],
         });
         let vignette_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -1555,14 +1563,8 @@ impl Compositor {
     fn vignette_planes(&self, enc: &mut wgpu::CommandEncoder, input: &[Plane; 3], count: u64) -> [Plane; 3] {
         let device = &self.gpu.device;
         let (w, h) = (input[0].w, input[0].h);
-        let map = self.vignettes.get(w, h);
-        let buffer = map.gpu.get_or_init(|| {
-            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("vignette map"),
-                contents: bytemuck::cast_slice(&map.bits),
-                usage: wgpu::BufferUsages::STORAGE,
-            })
-        });
+        let map = self.vignettes.get(device, w, h);
+        let buffer = &map.gpu;
         // The run's step at this frame's first sample, then each plane's: Y, U, V in turn.
         let start = count.wrapping_mul(effects::vignette_samples(w, h));
         let luma = u64::from(w) * u64::from(h);
@@ -1574,9 +1576,16 @@ impl Compositor {
                 size: [plane.w, plane.h],
                 map_w: w,
                 chroma: u32::from(pi > 0),
-                base: start.wrapping_add(offsets[pi]) as u32,
-                pad: [0; 3],
             };
+            let steps = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("vignette steps"),
+                contents: bytemuck::cast_slice(&effects::vignette_steps(
+                    start.wrapping_add(offsets[pi]) as u32,
+                    plane.w,
+                    plane.h,
+                )),
+                usage: wgpu::BufferUsages::STORAGE,
+            });
             let ubuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some("vignette params"),
                 contents: bytemuck::bytes_of(&params),
@@ -1597,6 +1606,10 @@ impl Compositor {
                     wgpu::BindGroupEntry {
                         binding: 2,
                         resource: buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: steps.as_entire_binding(),
                     },
                 ],
             });

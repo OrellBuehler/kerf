@@ -161,7 +161,7 @@ pub const LCG_A: u32 = 1_664_525;
 pub const LCG_C: u32 = 1_013_904_223;
 
 /// The LCG's state after `i` steps from 0: the dither of sample `i` of the filter's run is this over 2^32.
-/// By halving (`O(log i)`), as the shader does for each sample.
+/// By halving (`O(log i)`): a row's first state in [`vignette_steps`].
 pub fn lcg_at(i: u32) -> u32 {
     let (mut acc_a, mut acc_c) = (1u32, 0u32);
     let (mut a, mut c) = (LCG_A, LCG_C);
@@ -176,6 +176,24 @@ pub fn lcg_at(i: u32) -> u32 {
         i >>= 1;
     }
     acc_c
+}
+
+/// The LCG's states over a `w` x `h` plane whose first sample is step `base` of the run, as the shader
+/// reads them: `A^x` and `G_x` for each column (`state(i + x) = A^x * state(i) + G_x`), then each row's
+/// first state. A sample is then one multiply-add, where jumping to it is 32 steps.
+pub fn vignette_steps(base: u32, w: u32, h: u32) -> Vec<u32> {
+    let mut steps = Vec::with_capacity(2 * w as usize + h as usize);
+    let (mut a, mut g) = (1u32, 0u32);
+    let mut adds = Vec::with_capacity(w as usize);
+    for _ in 0..w {
+        steps.push(a);
+        adds.push(g);
+        a = a.wrapping_mul(LCG_A);
+        g = g.wrapping_mul(LCG_A).wrapping_add(LCG_C);
+    }
+    steps.extend(adds);
+    steps.extend((0..h).map(|r| lcg_at(base.wrapping_add(r.wrapping_mul(w)))));
+    steps
 }
 
 /// The samples `vignette` steps its dither through for a `w` x `h` `yuv420p` frame.
@@ -319,6 +337,24 @@ pub fn vignette_planes(y: &[u8], u: &[u8], v: &[u8], w: u32, h: u32, n: u64) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_plane_s_steps_are_the_lcg_at_every_sample() {
+        for (base, w, h) in [(0u32, 7u32, 5u32), (123_456_789, 13, 4), (u32::MAX - 20, 9, 6)] {
+            let steps = vignette_steps(base, w, h);
+            let (pow, add, rows) = (
+                &steps[..w as usize],
+                &steps[w as usize..2 * w as usize],
+                &steps[2 * w as usize..],
+            );
+            for y in 0..h {
+                for x in 0..w {
+                    let at = pow[x as usize].wrapping_mul(rows[y as usize]).wrapping_add(add[x as usize]);
+                    assert_eq!(at, lcg_at(base.wrapping_add(y * w + x)), "{base} {x},{y}");
+                }
+            }
+        }
+    }
 
     #[test]
     fn the_lcg_is_jumped_to_where_stepping_gets() {

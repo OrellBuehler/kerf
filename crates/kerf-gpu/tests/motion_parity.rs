@@ -2997,8 +2997,27 @@ fn what_the_compositor_does_not_draw_of_an_effect_or_a_mask_is_refused() {
     let m = media();
     let opts = at_fps(30.0);
     use kerf_core::VideoEffect as E;
-    let (tl, assets) = over_bars(m, &|c| c.effects = vec![E::Vignette]);
-    refused("effect/vignette", &tl, &assets, &opts, upto(1.0, 30.0), "vignette");
+    // A vignette on what FFmpeg vignettes in another form: a letterbox's padded frame, an RGB picture.
+    let mut boxed = clip(&m.testsrc, 0.5, 1.5, 0.0);
+    boxed.effects = vec![E::Vignette];
+    refused(
+        "effect/vignette on a letterbox",
+        &timeline(vec![vec![boxed]], Some(Delivery::new(360, 640, Fit::Contain))),
+        std::slice::from_ref(&m.testsrc),
+        &opts,
+        upto(1.0, 30.0),
+        "letterboxed",
+    );
+    let mut still = clip(&m.image, 0.0, 1.0, 0.0);
+    still.effects = vec![E::Vignette];
+    refused(
+        "effect/vignette on an rgb picture",
+        &timeline(vec![vec![still]], None),
+        std::slice::from_ref(&m.image),
+        &opts,
+        upto(1.0, 30.0),
+        "yuv420p",
+    );
     let (tl, assets) = over_bars(m, &|c| {
         c.effects = vec![E::ChromaKey {
             color: "green".into(),
