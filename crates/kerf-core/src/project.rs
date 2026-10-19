@@ -5529,6 +5529,7 @@ impl Project {
                     color_primaries: None,
                     pix_fmt: None,
                     color_space: None,
+                    lead: 0.0,
                 },
                 StreamInfo {
                     index: 1,
@@ -5546,6 +5547,7 @@ impl Project {
                     color_primaries: None,
                     pix_fmt: None,
                     color_space: None,
+                    lead: 0.0,
                 },
             ],
             imported_at: Utc::now(),
@@ -5575,6 +5577,7 @@ impl Project {
                 color_primaries: None,
                 pix_fmt: None,
                 color_space: None,
+                lead: 0.0,
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
@@ -7810,6 +7813,7 @@ mod tests {
             color_primaries: None,
             pix_fmt: None,
             color_space: None,
+            lead: 0.0,
         }
     }
 
@@ -7830,6 +7834,7 @@ mod tests {
             color_primaries: None,
             pix_fmt: None,
             color_space: None,
+            lead: 0.0,
         }
     }
 
@@ -8600,6 +8605,7 @@ mod tests {
                 color_primaries: None,
                 pix_fmt: None,
                 color_space: None,
+                lead: 0.0,
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
@@ -9973,6 +9979,7 @@ mod tests {
                 color_primaries: None,
                 pix_fmt: None,
                 color_space: None,
+                lead: 0.0,
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
@@ -10020,6 +10027,7 @@ mod tests {
                 color_primaries: None,
                 pix_fmt: None,
                 color_space: None,
+                lead: 0.0,
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
@@ -10074,6 +10082,7 @@ mod tests {
                 color_primaries: None,
                 pix_fmt: None,
                 color_space: None,
+                lead: 0.0,
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
@@ -10183,6 +10192,7 @@ mod tests {
                 color_primaries: None,
                 pix_fmt: None,
                 color_space: None,
+                lead: 0.0,
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
@@ -10247,6 +10257,7 @@ mod tests {
                 color_primaries: None,
                 pix_fmt: None,
                 color_space: None,
+                lead: 0.0,
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),

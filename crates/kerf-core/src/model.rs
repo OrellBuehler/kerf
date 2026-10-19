@@ -138,6 +138,14 @@ pub struct StreamInfo {
     /// its saturation to the RGB gamut clip.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color_space: Option<String>,
+    /// Seconds between the file's start and this video stream's first frame, when the
+    /// video starts after the sound (above a millisecond; ffprobe's stream `start_time`
+    /// less the format's). The export seeks and places the picture by it, so a clip cut
+    /// from inside the lead keeps the source's sync (see `clip_timing::picture_delay`).
+    /// Defaulted (and omitted at 0) so older `.kerf` JSON still deserializes, as an
+    /// ordinary start.
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
+    pub lead: f64,
 }
 
 fn is_zero_rotation(r: &i16) -> bool {
@@ -7031,6 +7039,7 @@ mod tests {
             color_primaries: None,
             pix_fmt: Some(pix_fmt.into()),
             color_space: tag.map(Into::into),
+            lead: 0.0,
         }
     }
 
@@ -7384,6 +7393,7 @@ mod tests {
             color_primaries: None,
             pix_fmt: None,
             color_space: None,
+            lead: 0.0,
         };
         assert_eq!(s.has_alpha(), None);
         s.pix_fmt = Some("yuv420p".into());

@@ -51,10 +51,13 @@ impl SourceMedia {
         decoded.path.clone_from(&self.path);
         if let (Some(video), Some(slot)) = (&self.video, decoded.streams.iter_mut().find(|s| s.kind == StreamKind::Video)) {
             // A proxy file has no spherical metadata of its own (the CLI writes no `sv3d` box), but
-            // it holds the same projection, only smaller: that is the original's to say.
-            let projection = slot.projection;
+            // it holds the same projection, only smaller: that is the original's to say. So is
+            // the lead: a padded proxy starts at zero with its clone, and its footage keeps the
+            // original's times, which the graph seeks and places by (`ClipFx::lead`).
+            let (projection, lead) = (slot.projection, slot.lead);
             *slot = video.clone();
             slot.projection = slot.projection.or(projection);
+            slot.lead = lead;
         }
         decoded
     }
@@ -141,6 +144,10 @@ mod tests {
         assert_eq!(kept.projection(), Some(crate::model::Projection::Equirect));
         assert_eq!((kept.streams[0].width, kept.streams[0].height), (Some(1280), Some(720)));
         assert_eq!((decoded.id, decoded.duration), (asset.id, asset.duration));
+        // A padded proxy starts at zero; the footage's lead is the original's.
+        let mut late = asset;
+        late.streams[0].lead = 0.5;
+        assert_eq!(proxy.decoded(&late).streams[0].lead, 0.5);
     }
 
     #[test]

@@ -104,6 +104,11 @@
   a fraction of at least one half, from draws already made so no other case moves) are `"one\rtwo\r\nthree\u{2028}four\u{2029}five"`, which every kind of break turns
   into one space. New families `overlay-linebreak` (`one two three four five`) and its `still-` / `preview-` forms: 152 / 23 / 85 cases moved
   (180 of 5600), exactly the cases hitting them.
+- **Late-starting sources** (`export.txt` / `still.txt` / `preview.txt`): the pool gained `-late` twins of `interview` (lead 80 ms) and
+  `phone` (0.5 s) and an `interview-late-padded` proxy that keeps the original's lead, reached only by `retarget_late` (`i % 19 == 6`, no dice:
+  the clip's id picks the twin and moves half of them to the head of the file, length kept). The extended pool alone moved nothing; the
+  retarget moved 248 of 6400 cases (235 export / 89 still / 151 preview), all of them `i % 19 == 6` (`KERF_GOLDEN_CASES` before / after). New
+  families `late-start-delay` / `preview-late-start-delay` (`)/TB`, the `+(start+delay)/TB` spelling): 110 / 74 cases.
 - **Sample-exact `adelay`** (a clip starting between milliseconds is delayed by samples)
   re-blessed `export.txt` alone: 2718 of 4800 cases moved, exactly the new
   `audio-delay-samples` family (`S:all=1`); still and preview carry no sound.

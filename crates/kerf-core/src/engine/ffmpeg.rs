@@ -32,6 +32,17 @@ pub fn probe(path: &Path) -> Result<ProbeResult> {
     let ictx = ff::format::input(&path)?;
     let duration = (ictx.duration() as f64 / f64::from(ff::ffi::AV_TIME_BASE)).max(0.0);
 
+    // The container's start is the earliest of its streams' (what libavformat makes
+    // `start_time` of), in seconds; a video stream's lead is how far after it the video starts.
+    let start_of = |stream: &ff::format::stream::Stream| {
+        let t = stream.start_time();
+        (t != ff::ffi::AV_NOPTS_VALUE).then(|| t as f64 * f64::from(stream.time_base()))
+    };
+    let format_start = ictx
+        .streams()
+        .filter(|s| matches!(s.parameters().medium(), ff::media::Type::Video | ff::media::Type::Audio))
+        .filter_map(|s| start_of(&s))
+        .reduce(f64::min);
     let mut streams = Vec::new();
     for stream in ictx.streams() {
         let codec = ff::codec::context::Context::from_parameters(stream.parameters())?;
@@ -59,6 +70,7 @@ pub fn probe(path: &Path) -> Result<ProbeResult> {
             color_primaries: None,
             pix_fmt: None,
             color_space: None,
+            lead: 0.0,
         };
 
         match medium {
@@ -83,6 +95,7 @@ pub fn probe(path: &Path) -> Result<ProbeResult> {
                 // is a landscape frame with a display matrix, and every decode
                 // autorotates it.
                 info.rotation = display_rotation(&stream);
+                info.lead = super::cli::video_lead(start_of(&stream), format_start);
                 (info.width, info.height) = super::cli::displayed_size(info.width, info.height, info.rotation);
                 let fps = |r: ff::Rational| (r.denominator() != 0).then(|| r.numerator() as f64 / r.denominator() as f64);
                 info.fps = super::cli::nominal_fps(fps(stream.rate()), fps(stream.avg_frame_rate()));
@@ -112,6 +125,7 @@ pub fn probe(path: &Path) -> Result<ProbeResult> {
     {
         for s in streams.iter_mut().filter(|s| s.kind == StreamKind::Video) {
             s.image = true;
+            s.lead = 0.0;
         }
     }
 

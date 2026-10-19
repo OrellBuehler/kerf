@@ -117,6 +117,11 @@ pub struct ClipFx {
     /// from the start with no seek, such an input opens with the pad's clone of the
     /// first frame, which the original it stands for has no frame for.
     pub head_pad: bool,
+    /// Seconds between the start of the clip's file and its first picture, for a source whose
+    /// video starts after its sound ([`StreamInfo::lead`] of the asset's video stream; `0.0`
+    /// for an ordinary file, a still and a sound). A window that starts inside it is read
+    /// without a seek ([`clip_seek`]) and its picture placed by [`picture_delay`].
+    pub lead: f64,
     /// The clip's picture is untagged HD YCbCr and shares the graph with an input that names a
     /// matrix, so the chain labels it BT.709 (`setparams=colorspace=bt709`, the first filter of its chain):
     /// FFmpeg 9 would otherwise read it as BT.601 and convert it into its neighbour's matrix.
@@ -165,6 +170,7 @@ pub fn transition_fx(timeline: &Timeline, assets: &[Asset]) -> Vec<ClipFx> {
         fx[flat].alpha = asset.is_some_and(|a| a.has_alpha());
         fx[flat].head_pad = asset.is_some_and(|a| is_head_padded_proxy(&a.path));
         let stream = asset.and_then(|a| a.streams.iter().find(|s| s.kind == StreamKind::Video));
+        fx[flat].lead = stream.filter(|s| !s.image).map_or(0.0, |s| s.lead);
         fx[flat].frame_matrix = crate::model::frame_matrix(stream, fx[flat].hdr.is_some());
     }
     for (fx, label) in fx.iter_mut().zip(graph_bt709_labels(timeline, assets)) {
@@ -326,12 +332,36 @@ pub fn clip_source_window(clip: &Clip, fx: &ClipFx) -> (f64, f64) {
 /// for no seek — head clips keep byte-identical args. `SEEK_EPS` skips a
 /// pointless sub-millisecond seek. Callers must express the in-graph trim
 /// relative to this value.
-pub fn clip_seek(window_start: f64) -> f64 {
+///
+/// `lead` is [`ClipFx::lead`]: a window that starts before a late-starting source's
+/// first picture is not seeked either. A demuxer has no video there to seek to, and
+/// the MOV one then lands every stream on the first picture, so the sound before it
+/// was lost and the clip's audio played early by the rest of the lead; decoding from
+/// the head costs at most the lead.
+pub fn clip_seek(window_start: f64, lead: f64) -> f64 {
     const SEEK_EPS: f64 = 1e-3;
-    if window_start > SEEK_EPS {
+    if window_start > SEEK_EPS && window_start >= lead {
         window_start
     } else {
         0.0
+    }
+}
+
+/// How long into its clip a late-starting source's first picture plays, in timeline
+/// seconds: `(lead - window start) / speed` for a forward clip whose window starts
+/// before it, else `0.0`. The chain's `setpts` puts the first frame it keeps at the
+/// clip's start, which for such a window is the source's first picture — `lead`
+/// seconds into the file, where the window's sound is still playing — so the picture
+/// was early by this much against its own sound; the chain adds it back
+/// (`video_clip_chain`) and the `fps` pick with it (`frame_pick`). Nothing of the clip
+/// is drawn before it, as the source has no picture there. A reversed clip plays its
+/// window's end first, so its stream already starts on time and the lead is the end
+/// of the clip it leaves without a picture.
+pub fn picture_delay(window_start: f64, lead: f64, speed: f64, reversed: bool) -> f64 {
+    if reversed || window_start >= lead {
+        0.0
+    } else {
+        (lead - window_start) / speed
     }
 }
 
@@ -1060,10 +1090,26 @@ mod tests {
 
     #[test]
     fn a_seek_is_only_made_past_the_head() {
-        assert_eq!(clip_seek(0.0), 0.0);
-        assert_eq!(clip_seek(0.0005), 0.0);
-        assert_eq!(clip_seek(0.002), 0.002);
-        assert_eq!(clip_seek(12.5), 12.5);
+        assert_eq!(clip_seek(0.0, 0.0), 0.0);
+        assert_eq!(clip_seek(0.0005, 0.0), 0.0);
+        assert_eq!(clip_seek(0.002, 0.0), 0.002);
+        assert_eq!(clip_seek(12.5, 0.0), 12.5);
+    }
+
+    #[test]
+    fn a_window_inside_a_late_starting_sources_lead_is_read_from_the_head_and_its_picture_waits() {
+        // Video 0.5 s after the sound: a window from 0.25 s is not seeked, and its first
+        // picture (the file's 0.5 s) plays a quarter second into the clip — half that at speed 2.
+        assert_eq!(clip_seek(0.25, 0.5), 0.0);
+        assert_eq!(clip_seek(0.5, 0.5), 0.5);
+        assert_eq!(clip_seek(3.0, 0.5), 3.0);
+        assert_eq!(picture_delay(0.25, 0.5, 1.0, false), 0.25);
+        assert_eq!(picture_delay(0.0, 0.5, 2.0, false), 0.25);
+        assert_eq!(picture_delay(0.0, 0.5, 0.5, false), 1.0);
+        // Past the lead, on an ordinary file and played backwards: no delay.
+        assert_eq!(picture_delay(0.5, 0.5, 1.0, false), 0.0);
+        assert_eq!(picture_delay(0.0, 0.0, 1.0, false), 0.0);
+        assert_eq!(picture_delay(0.0, 0.5, 1.0, true), 0.0);
     }
 
     #[test]

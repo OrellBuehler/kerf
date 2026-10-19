@@ -12,13 +12,16 @@
 //! 1. `-ss S` shifts the file's timestamps by `S` (plus the container's start), in
 //!    microseconds rescaled to the stream's ticks, **rounded to nearest**; the frames left
 //!    of the shift are dropped. A head-padded proxy opened without a seek then drops its
-//!    clone of the first frame (`trim=start_frame=1`).
+//!    clone of the first frame (`trim=start_frame=1`). A window that starts inside a
+//!    late-starting source's lead is not seeked at all (`clip_seek`).
 //! 2. `trim=start:end` keeps the window, both ends truncated to whole microseconds as
 //!    `av_parse_time` reads the printed number, then rescaled to ticks and rounded.
 //! 3. `reverse` outputs the kept frames last first **with the timestamps in forward order**
 //!    (so a constant rate is mirrored over the window, and a variable one is not).
 //! 4. `setpts=(PTS-STARTPTS)/speed+start/TB` evaluates in doubles over ticks of the stream's
 //!    time base and **truncates** to a tick (`D2TS` is an `(int64_t)` cast, not a rounding).
+//!    For a window inside a late-starting source's lead `start` is `(start+delay)`, the
+//!    clip's start plus its `picture_delay`.
 //! 5. `fps` rescales that to its own ticks, `1/fps`, rounded half away from zero: the
 //!    **slot** of a frame. Output frame `k` is the last frame whose slot is `<= k`. There is
 //!    none before the first frame's slot, and none from the **end** on: the stream ends where
@@ -52,7 +55,7 @@
 //!
 //! Pure: no I/O.
 
-use crate::clip_timing::{clip_seek, parse_micros, parse_micros_text, Rational};
+use crate::clip_timing::{clip_seek, parse_micros, parse_micros_text, picture_delay, Rational};
 use crate::engine::{export_seek_arg, seek_arg};
 
 /// The frames of one decoded file as ffprobe or `showinfo` state them.
@@ -115,6 +118,10 @@ pub struct FpsPick {
     /// The input is a head-padded proxy read without a seek: its first frame is the pad's
     /// clone, which the chain drops.
     pub drop_first: bool,
+    /// Seconds between the start of the file and its first picture (`ClipFx::lead`): a window
+    /// that starts inside it is not seeked, and its first frame plays `picture_delay` into
+    /// the clip.
+    pub lead: f64,
     /// A still image, read as `-loop 1 -framerate <this>`: the frames are made up (see the
     /// [module](self)) and the chain does not seek. This is the `color=r=` parse of the
     /// delivery rate (`PlanCanvas::fps`), which `-framerate` shares.
@@ -283,7 +290,11 @@ struct Window {
 fn window(pick: &FpsPick, frames: &Frames) -> Window {
     let tb = frames.time_base();
     // A still image is never seeked (its trim is absolute).
-    let seek = if pick.image.is_some() { 0.0 } else { clip_seek(pick.window.0) };
+    let seek = if pick.image.is_some() {
+        0.0
+    } else {
+        clip_seek(pick.window.0, pick.lead)
+    };
     let shift = seek_shift(
         if seek > 0.0 {
             parse_micros_text(&export_seek_arg(seek))
@@ -328,7 +339,7 @@ fn run(pick: &FpsPick, frames: &Frames) -> Option<Run> {
         kept: from..to,
         shift,
         first: frames.pts(from) - shift,
-        offset: pick.start / (f64::from(tb.num) / f64::from(tb.den)),
+        offset: start(pick) / (f64::from(tb.num) / f64::from(tb.den)),
         speed: pick.speed,
         unit: (pick.speed - 1.0).abs() < 1e-9,
         time_base: tb,
@@ -337,6 +348,16 @@ fn run(pick: &FpsPick, frames: &Frames) -> Option<Run> {
     };
     run.end = run.slot(beyond);
     Some(run)
+}
+
+/// The `start` of `setpts=...+start/TB`: the clip's, or that plus the [`picture_delay`] of a
+/// window that starts inside a late-starting source's lead, added in the same order the graph
+/// spells it (`(start+delay)`).
+fn start(pick: &FpsPick) -> f64 {
+    match picture_delay(pick.window.0, pick.lead, pick.speed, pick.reverse) {
+        d if d > 0.0 => pick.start + d,
+        _ => pick.start,
+    }
 }
 
 /// How many of `n` frames have a slot at or before `k` (slots never decrease): the last of
@@ -526,7 +547,7 @@ impl FpsPick {
     /// The `-ss` the clip's input is opened with, in seconds: where a run that serves this pick
     /// must begin (`None` for a still image, which is never seeked).
     pub fn seek(&self) -> Option<f64> {
-        self.image.is_none().then(|| clip_seek(self.window.0))
+        self.image.is_none().then(|| clip_seek(self.window.0, self.lead))
     }
 
     /// The text of that `-ss` as the export spells it ([`export_seek_arg`], which FFmpeg
@@ -557,6 +578,7 @@ mod tests {
             frame: k,
             fps: Rational::new(fps.0, fps.1).unwrap(),
             drop_first: false,
+            lead: 0.0,
             image: None,
         }
     }
@@ -1077,6 +1099,7 @@ mod tests {
                 frame: rnd(70),
                 fps: Rational::new(fps.0, fps.1).unwrap(),
                 drop_first: rnd(6) == 0,
+                lead: 0.0,
                 image: None,
             };
             let full = SourceFrames {

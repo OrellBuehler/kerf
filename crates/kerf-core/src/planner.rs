@@ -591,7 +591,10 @@ impl Planner {
                         start: clip.timeline_start,
                         frame: u64::try_from(frame).unwrap_or(0),
                         fps: self.canvas.pick_fps,
-                        drop_first: !asset.is_image && planned.fx.head_pad && clip_seek(planned.source_window.0) == 0.0,
+                        drop_first: !asset.is_image
+                            && planned.fx.head_pad
+                            && clip_seek(planned.source_window.0, planned.fx.lead) == 0.0,
+                        lead: planned.fx.lead,
                         image: asset.is_image.then_some(self.canvas.fps),
                     })
                 } else if asset.is_image {
@@ -2096,6 +2099,7 @@ mod tests {
             frame: 45,
             fps: Rational::new(30, 1).unwrap(),
             drop_first: false,
+            lead: 0.0,
             image: None,
         };
         assert_eq!(export.layers[0].pick, Pick::Fps(want));
