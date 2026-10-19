@@ -242,7 +242,9 @@ pub enum Unsupported {
     DipToWhite(LayerRef, DipWhy),
     /// A full-range picture inside a fade, a dip or a dissolve where FFmpeg 9 works on its raw values
     /// and converts the range afterwards (the composite colour policy is not the one that matches the
-    /// compositor's order, range first). A still's refusal; an export frame's is [`Unsupported::FullRangeCut`].
+    /// compositor's order, range first), or a `yuv420p` flagged full range, whose raw values reach the fade
+    /// on every FFmpeg. A still's refusal; an export frame's is [`Unsupported::FullRangeCut`], except under
+    /// FFmpeg 6, which has no such cut and refuses only the flagged `yuv420p` here, in the frames of the fade.
     FullRangeNegotiated(LayerRef),
     /// The cut holds a full-range picture where FFmpeg 9 works on raw values: the export as a whole is
     /// flagged full range, every limited-range frame of it converted, and the full-range clip's own
@@ -402,7 +404,7 @@ impl fmt::Display for Unsupported {
             Self::DipToWhite(l, why) => write!(f, "{l}: a dip to white {why}"),
             Self::FullRangeNegotiated(l) => write!(
                 f,
-                "{l}: a full-range picture inside a fade, a dip or a dissolve, where FFmpeg 9 works on its raw values and converts the range afterwards"
+                "{l}: a full-range picture inside a fade, a dip or a dissolve, where FFmpeg works on its raw values and converts the range afterwards (FFmpeg 9 for any full-range picture, FFmpeg 6 too for a yuv420p flagged full range)"
             ),
             Self::FullRangeCut => write!(
                 f,

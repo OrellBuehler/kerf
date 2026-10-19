@@ -29,6 +29,8 @@ export interface StreamInfo {
 	pix_fmt?: string | null;
 	/** The YCbCr matrix the stream declares, as ffprobe names it (`bt709`, `smpte170m`, `bt2020nc`, …); absent when it declares none. */
 	color_space?: string | null;
+	/** The sample range the stream declares: `pc` (full) or `tv` (limited); absent when it declares none and for an asset probed before it was recorded. */
+	color_range?: string | null;
 	/** Seconds the video starts after the file's sound (a late-starting source); absent when 0. */
 	lead?: number;
 }

@@ -143,8 +143,13 @@
   outlines" below) and a `<text>` may carry a box only outlines draw ("A text's box" below); an older build draws such a
   title but splices new values into the hidden text (its `set_template_values` reports success and nothing visible
   changes), saves it as a template and draws a box unwrapped; `persisted/timelines-v8.json` holds an outlined template
-  title. The schema is at **v8** (`SCHEMA_VERSION`). `persist_tests` pins which steps a file has pending with
-  `store::pending_steps` (a legacy file that has every column: `[4, 5, 6, 7]`). A step's `needed_to_read` says whether a build that
+  title; v8→v9 is a JSON step for a **new field**, `StreamInfo.color_range` (`"pc"` / `"tv"`) in an asset's `streams` JSON column
+  (the range the file declares, which a `yuv420p` VP9 / HEVC / AV1 file flags where its format name says nothing: the GPU plan refuses such a
+  picture on it, `core-render-plan.md`): an older build drops it at its next write of the asset and would draw the picture as limited range; an asset stored before has none
+  and reads "not known" (omitted when `None`, so a stored stream stays byte-identical), judged by its name as it always was, until a
+  relink or a fresh import probes it again; no timeline JSON moves, so there is no `persisted/` file for v9.
+  The schema is at **v9** (`SCHEMA_VERSION`). `persist_tests` pins which steps a file has pending with
+  `store::pending_steps` (a legacy file that has every column: `[4, 5, 6, 7, 8]`). A step's `needed_to_read` says whether a build that
   cannot write must still refuse a file lacking what it adds: true for the v1, v2 and v4 columns (the reads
   name them), false for the `fonts` table (reads tolerate its absence), so a write-protected v2 project
   opens as it is. A new file is stamped `SCHEMA_VERSION`; a

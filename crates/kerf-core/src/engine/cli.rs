@@ -590,6 +590,7 @@ struct ProbeStream {
     color_transfer: Option<String>,
     color_primaries: Option<String>,
     color_space: Option<String>,
+    color_range: Option<String>,
     pix_fmt: Option<String>,
     /// Container-level stream tags. Only `rotate` matters: FFmpeg before 6.0
     /// reported a phone's turn as this tag (clockwise) as well as in the
@@ -754,6 +755,7 @@ fn probe_from_json(parsed: ProbeJson, path: Option<&Path>) -> ProbeResult {
             } else {
                 None
             },
+            color_range: if is_video { range_tag(s.color_range.as_deref()) } else { None },
             lead: if is_video && !still {
                 video_lead(secs(s.start_time.as_ref()), av_start)
             } else {
@@ -824,6 +826,17 @@ pub(crate) fn displayed_size(width: Option<u32>, height: Option<u32>, rotation: 
 pub(crate) fn known_color(tag: Option<&str>) -> Option<String> {
     tag.filter(|t| !t.is_empty() && !matches!(*t, "unknown" | "unspecified" | "reserved"))
         .map(str::to_string)
+}
+
+/// A range tag as the engine stores it: `"pc"` (full) or `"tv"` (limited), `None` when the file does
+/// not say (ffprobe prints `unknown`, or nothing). ffprobe's own spellings are `tv` / `pc`; the
+/// libav names (`mpeg` / `jpeg`) and the plain words are folded into them.
+pub(crate) fn range_tag(tag: Option<&str>) -> Option<String> {
+    match tag?.trim().to_ascii_lowercase().as_str() {
+        "pc" | "jpeg" | "full" => Some("pc".to_string()),
+        "tv" | "mpeg" | "limited" => Some("tv".to_string()),
+        _ => None,
+    }
 }
 
 /// The frame rate to build a project around. `r_frame_rate` is "the lowest rate
@@ -1517,6 +1530,7 @@ fn probe_composite_red(ffmpeg: &str, ffprobe: &str, tag_bt709: bool, deadline: I
             color_primaries: None,
             pix_fmt: Some("yuv420p".to_string()),
             color_space: tag_bt709.then(|| "bt709".to_string()),
+            color_range: None,
             lead: 0.0,
         }],
         imported_at: chrono::Utc::now(),
@@ -18860,6 +18874,7 @@ mod tests {
                     color_primaries: None,
                     pix_fmt: Some("yuv420p".to_string()),
                     color_space: color_space.map(str::to_string),
+                    color_range: None,
                     lead: 0.0,
                 }],
                 imported_at: chrono::Utc::now(),
@@ -18902,6 +18917,43 @@ mod tests {
             let probed = probe_json(&format!(r#""width":1280,"height":720,"color_space":"{none}""#));
             assert_eq!(probed.streams[0].color_space, None, "{none:?}");
         }
+    }
+
+    #[test]
+    fn the_declared_sample_range_is_recorded_when_there_is_one() {
+        // A VP9 / HEVC / AV1 file flagged full range probes as plain `yuv420p` with `color_range=pc`.
+        let full = probe_json(r#""width":1280,"height":720,"pix_fmt":"yuv420p","color_range":"pc""#);
+        assert_eq!(full.streams[0].pix_fmt.as_deref(), Some("yuv420p"));
+        assert_eq!(full.streams[0].color_range.as_deref(), Some("pc"));
+        let limited = probe_json(r#""width":1280,"height":720,"color_range":"tv""#);
+        assert_eq!(limited.streams[0].color_range.as_deref(), Some("tv"));
+        // ffprobe 9 prints `unknown` for none and 6 prints nothing: no flag, not a flag named unknown.
+        for none in ["unknown", "unspecified", ""] {
+            let probed = probe_json(&format!(r#""width":1280,"height":720,"color_range":"{none}""#));
+            assert_eq!(probed.streams[0].color_range, None, "{none:?}");
+        }
+        assert_eq!(probe_json(r#""width":1280,"height":720"#).streams[0].color_range, None);
+        // libav's names and plain words are folded into ffprobe's two.
+        for (said, kept) in [
+            ("jpeg", "pc"),
+            ("full", "pc"),
+            ("PC", "pc"),
+            ("mpeg", "tv"),
+            ("limited", "tv"),
+        ] {
+            let probed = probe_json(&format!(r#""width":1280,"height":720,"color_range":"{said}""#));
+            assert_eq!(probed.streams[0].color_range.as_deref(), Some(kept), "{said:?}");
+        }
+        // A picture has a range; sound and subtitles do not.
+        let parsed: ProbeJson = serde_json::from_str(
+            r#"{"format":{"duration":"2.0"},"streams":[
+                {"index":0,"codec_type":"video","codec_name":"vp9","width":640,"height":360,"pix_fmt":"yuv420p","color_range":"pc"},
+                {"index":1,"codec_type":"audio","codec_name":"opus","sample_rate":"48000","channels":2,"color_range":"pc"}]}"#,
+        )
+        .unwrap();
+        let probed = probe_from_json(parsed, None);
+        assert_eq!(probed.streams[0].color_range.as_deref(), Some("pc"));
+        assert_eq!(probed.streams[1].color_range, None);
     }
 
     #[test]
@@ -19337,6 +19389,41 @@ mod tests {
         let (w, h, rgb) = rgb_frame(&still, None);
         assert_eq!((w, h), (360, 640));
         assert_eq!(red_bar_edge(w, h, &rgb), want_edge);
+    }
+
+    /// A file flagged full range probes as plain `yuv420p` where its codec's decoder does not call the
+    /// format `yuvj420p` (FFV1 here, VP9 and AV1 as well): the format cannot tell it from a limited one,
+    /// the range flag can. Real ffprobe, so the spelling `range_tag` reads is the one it prints.
+    ///
+    /// `cargo test -p kerf-core --no-default-features -- --ignored flagged_full_range`
+    #[test]
+    #[ignore = "needs the ffmpeg binary"]
+    fn a_file_flagged_full_range_probes_its_range_beside_a_plain_format() {
+        let dir = Scratch::new("range-flag");
+        // (An unflagged FFV1 file reads `tv` from FFmpeg 9's muxer and nothing from 6.1.1's.)
+        for (name, codec, pix_fmt, flag, want) in [
+            ("pc.mkv", "ffv1", "yuv420p", Some("pc"), vec![Some("pc")]),
+            ("tv.mkv", "ffv1", "yuv420p", Some("tv"), vec![Some("tv")]),
+            ("unflagged.mkv", "ffv1", "yuv420p", None, vec![None, Some("tv")]),
+            ("jpeg.mkv", "mjpeg", "yuvj420p", None, vec![Some("pc")]),
+        ] {
+            let file = dir.join(name);
+            let mut args = vec!["-f", "lavfi", "-i", "testsrc2=size=64x64:rate=5:duration=0.4", "-c:v", codec];
+            args.extend(["-pix_fmt", pix_fmt]);
+            if let Some(flag) = flag {
+                args.extend(["-color_range", flag]);
+            }
+            args.push(file.to_str().unwrap());
+            run_ffmpeg(&args);
+            let probed = probe(&file).expect("probe");
+            let video = &probed.streams[0];
+            assert_eq!(video.pix_fmt.as_deref(), Some(pix_fmt), "{name}");
+            assert!(
+                want.contains(&video.color_range.as_deref()),
+                "{name}: {:?}",
+                video.color_range
+            );
+        }
     }
 
     /// The proxy is what the preview actually decodes; it must come out upright

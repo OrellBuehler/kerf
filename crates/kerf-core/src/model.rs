@@ -138,6 +138,17 @@ pub struct StreamInfo {
     /// its saturation to the RGB gamut clip.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color_space: Option<String>,
+    /// The sample range the stream declares, as ffprobe names it: `"pc"` (full range) or `"tv"`
+    /// (limited); `None` when it declares none, **and for an asset probed before the tag was
+    /// recorded** (schema v9), which a renderer must read as "not known" and not as limited. The
+    /// tag is the truth about the range: ffprobe's `yuvj…` names only the 8-bit formats FFmpeg
+    /// itself calls full range, while a VP9 (or HEVC, AV1) file flagged `pc` probes as plain
+    /// `yuv420p` and FFmpeg runs its raw samples through a graph. Stored as ffprobe says it, so an
+    /// RGB or gray picture reads `pc` too (nothing limited to tell it from); only a YCbCr format's
+    /// word is a flag. Defaulted (and omitted when unset) so older `.kerf` JSON still deserializes;
+    /// this rides in the `streams` JSON column.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color_range: Option<String>,
     /// Seconds between the start of the file's picture and sound and this video stream's
     /// first frame, when the video starts after the sound: the stream's `start_time` less the
     /// earliest video or audio stream's (not the container's, which a text track can pull
@@ -7142,6 +7153,7 @@ mod tests {
             color_primaries: None,
             pix_fmt: Some(pix_fmt.into()),
             color_space: tag.map(Into::into),
+            color_range: None,
             lead: 0.0,
         }
     }
@@ -7496,6 +7508,7 @@ mod tests {
             color_primaries: None,
             pix_fmt: None,
             color_space: None,
+            color_range: None,
             lead: 0.0,
         };
         assert_eq!(s.has_alpha(), None);
