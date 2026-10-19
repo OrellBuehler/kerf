@@ -134,12 +134,14 @@
 //!   and over each 2x2 block's average (chroma) like `overlay`; grayscale, invert, sharpen and vignette are
 //!   exact; a blur is `gblur`'s float recursion in the portable order, one level off on a few samples in a
 //!   hundred thousand (FFmpeg's own SIMD orders the same sums otherwise). A mask on a letterbox is cut from
-//!   the whole padded frame, as `geq` is. A chroma key, a mask on a rotated or translucent layer, a blur, a
-//!   sharpen or a vignette on a letterbox, a vignette on a picture that is not `yuv420p`, an invert / blur /
-//!   sharpen on a full-range picture (FFmpeg runs it on the raw values and converts the range afterwards: an
-//!   invert 8 levels off, a sharpen's overshoot 26) and an invert of a gray picture (its chroma stays 128 in
-//!   FFmpeg) are refused. On a 10-bit, 4:2:2, 4:4:4, RGB or gray picture the other effects and masks are
-//!   drawn at the plain source's own figures.
+//!   the whole padded frame, as `geq` is. A chroma key is `chromakey`'s alpha to the sample
+//!   (`the_chroma_key_alpha_is_the_filters_plane_by_plane`, `chroma_keys_are_drawn_as_the_filter_draws_them`), and refused
+//!   after a scale or a blur, on another format, under a mask or turned. A mask on a rotated or translucent layer, a
+//!   blur, a sharpen, a vignette or a chroma key on a letterbox, a vignette on a picture that is not `yuv420p`, an
+//!   invert / blur / sharpen on a full-range picture (FFmpeg runs it on the raw values and converts the range
+//!   afterwards: an invert 8 levels off, a sharpen's overshoot 26) and an invert of a gray picture (its chroma
+//!   stays 128 in FFmpeg) are refused. On a 10-bit, 4:2:2, 4:4:4, RGB or gray picture the other effects and masks
+//!   are drawn at the plain source's own figures.
 //! * **`geq` on FFmpeg 6.1 copies a plane's last column and row from the ones before them** (its bilinear
 //!   read clamps to `w - 2` / `h - 2`; 9.0 copies them), so a masked picture's right-most column and bottom
 //!   row differ between the two FFmpegs (up to 224 levels of chroma at the bottom row of a frame whose picture
@@ -2175,9 +2177,10 @@ fn frames_the_gpu_would_draw_wrong_are_refused() {
         1.25,
         Refusal::Plan("moving zoom"),
     );
-    // What the compositor does not draw of an effect or a mask: a chroma key (an alpha from a float colour
-    // distance), a mask on a turned layer or one below full opacity, a blur, a sharpen or a vignette on the
-    // padded frame of a letterbox, a vignette on a picture that is not yuv420p, a value the filters refuse.
+    // What the compositor does not draw of an effect or a mask: a chroma key on chroma that is not FFmpeg's to the
+    // level (after a scale or a blur: its alpha moves by up to 1/blend levels a level of chroma), on another pixel
+    // format or under a mask, a mask on a turned layer or one below full opacity, a blur, a sharpen or a vignette on
+    // the padded frame of a letterbox, a vignette on a picture that is not yuv420p, a value the filters refuse.
     let effect = |e: kerf_core::VideoEffect| {
         let mut c = clip(&m.testsrc, 0.0, 2.0, 0.0);
         c.effects = vec![e];
@@ -2192,17 +2195,47 @@ fn frames_the_gpu_would_draw_wrong_are_refused() {
         0.5,
         Refusal::Plan("yuv420p"),
     );
-    check_refused(
-        "refused/chroma-key",
-        &effect(kerf_core::VideoEffect::ChromaKey {
-            color: "green".into(),
-            similarity: 0.1,
-            blend: 0.1,
-        }),
-        std::slice::from_ref(&m.testsrc),
-        0.5,
-        Refusal::Plan("chroma key"),
-    );
+    let keyed = |asset: &Asset, edit: &dyn Fn(&mut Clip)| {
+        let mut c = clip(asset, 0.0, 2.0, 0.0);
+        c.effects = vec![a_key("green", 0.15, 0.1)];
+        edit(&mut c);
+        timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![c]], None)
+    };
+    for (name, asset, edit, reason) in [
+        (
+            "on-a-pip",
+            &m.testsrc,
+            Box::new(|c: &mut Clip| c.transform.scale = 0.6) as Box<dyn Fn(&mut Clip)>,
+            "chroma key after a scale or a blur",
+        ),
+        (
+            "after-a-blur",
+            &m.testsrc,
+            Box::new(|c: &mut Clip| c.effects.insert(0, kerf_core::VideoEffect::Blur { sigma: 2.0 })),
+            "chroma key after a scale or a blur",
+        ),
+        ("on-a-444-picture", &m.yuv444, Box::new(|_: &mut Clip| {}), "yuv420p"),
+        (
+            "under-a-mask",
+            &m.testsrc,
+            Box::new(|c: &mut Clip| c.mask = Some(a_mask(kerf_core::MaskShape::Rect, 0.1, false))),
+            "over a chroma key",
+        ),
+        (
+            "on-a-rotated-layer",
+            &m.testsrc,
+            Box::new(|c: &mut Clip| c.transform.rotation = 10.0),
+            "chroma key on a rotated layer",
+        ),
+    ] {
+        check_refused(
+            &format!("refused/chroma-key-{name}"),
+            &keyed(asset, &*edit),
+            &[m.bars.clone(), asset.clone()],
+            0.5,
+            Refusal::Plan(reason),
+        );
+    }
     // (A value the filter's own option refuses fails in FFmpeg too: the plan refuses the frame so that FFmpeg
     // reports it, which is all there is to check.)
     for (name, e, reason) in [
@@ -4735,6 +4768,167 @@ fn effects_are_drawn_as_their_filters_draw_them() {
             BUSY,
         );
     }
+}
+
+fn a_key(color: &str, similarity: f64, blend: f64) -> kerf_core::VideoEffect {
+    kerf_core::VideoEffect::ChromaKey {
+        color: color.into(),
+        similarity,
+        blend,
+    }
+}
+
+/// A chroma key in a still: the keyed layer over the bars, against FFmpeg's still.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn chroma_keys_are_drawn_as_the_filter_draws_them() {
+    let m = media();
+    for (name, effects) in [
+        ("green", vec![a_key("green", 0.15, 0.1)]),
+        ("green-wide", vec![a_key("green", 0.3, 0.3)]),
+        ("hard", vec![a_key("0x2050a0", 0.2, 0.0)]),
+        ("magenta", vec![a_key("magenta", 0.25, 0.05)]),
+        (
+            "after-tables",
+            vec![
+                kerf_core::VideoEffect::Invert,
+                a_key("magenta", 0.25, 0.05),
+                kerf_core::VideoEffect::Sharpen { amount: 1.0 },
+            ],
+        ),
+        ("twice", vec![a_key("green", 0.1, 0.1), a_key("0x2050a0", 0.2, 0.2)]),
+    ] {
+        for (asset, label) in [(&m.testsrc, "testsrc2"), (&m.gradient, "gradient")] {
+            let mut c = clip(asset, 0.0, 2.0, 0.0);
+            c.effects = effects.clone();
+            let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![c]], None);
+            check(
+                &format!("chroma-key/{name}-{label}"),
+                &tl,
+                &[m.bars.clone(), asset.clone()],
+                &[0.5, 1.5],
+                STRICT,
+            );
+        }
+    }
+    // Graded first (`eq` runs ahead of the key), and in a frame the picture is the canvas of.
+    let mut c = clip(&m.testsrc, 0.0, 2.0, 0.0);
+    c.color.saturation = 1.4;
+    c.effects = vec![a_key("green", 0.2, 0.15)];
+    let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![c]], None);
+    check("chroma-key/graded", &tl, &[m.bars.clone(), m.testsrc.clone()], &[0.5], STRICT);
+    // Cut without a scale: a Cover crop of a 640x360 picture into 640x300, and a crop on top of it (the
+    // cropped 640x324 covers the frame as it is); and a vignette ahead of the key (exact, so the key is).
+    let cover = Some(Delivery::new(640, 300, Fit::Cover));
+    for (name, edit, format) in [
+        ("cover", Box::new(|_: &mut Clip| {}) as Box<dyn Fn(&mut Clip)>, cover),
+        ("cropped-cover", Box::new(|c: &mut Clip| c.transform.crop_top = 0.1), cover),
+        (
+            "after-a-vignette",
+            Box::new(|c: &mut Clip| c.effects.insert(0, kerf_core::VideoEffect::Vignette)),
+            None,
+        ),
+    ] {
+        let mut c = clip(&m.testsrc, 0.0, 2.0, 0.0);
+        c.effects = vec![a_key("green", 0.2, 0.15)];
+        edit(&mut c);
+        let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![c]], format);
+        check(
+            &format!("chroma-key/{name}"),
+            &tl,
+            &[m.bars.clone(), m.testsrc.clone()],
+            &[0.5],
+            STRICT,
+        );
+    }
+    // Every sample its own colour: the window's edges and every grade of alpha.
+    let mut c = clip(&m.noise, 0.0, m.noise.duration, 0.0);
+    c.effects = vec![a_key("0x808080", 0.05, 0.3)];
+    let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![c]], None);
+    check("chroma-key/noise", &tl, &[m.bars.clone(), m.noise.clone()], &[0.1], BUSY);
+}
+
+/// The key's alpha plane against `chromakey`'s, sample for sample, at FFmpeg's own thread count (the
+/// compositor's default is what an export on this machine runs).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn the_chroma_key_alpha_is_the_filters_plane_by_plane() {
+    use kerf_gpu::effects::{chroma_key_uv, ChromaKeyOptions};
+    let m = media();
+    let opts = ExportOptions::default();
+    let mut failures = Vec::new();
+    for (asset, label, t) in [
+        (&m.noise, "noise", 0.1),
+        (&m.testsrc, "testsrc2", 0.5),
+        (&m.gradient, "gradient", 0.5),
+    ] {
+        for (color, similarity, blend) in [
+            ("green", 0.15, 0.1),
+            ("0x808080", 0.05, 0.3),
+            ("0x2050a0", 0.2, 0.0),
+            ("magenta", 0.01, 1.0),
+        ] {
+            let mut c = clip(asset, 0.0, asset.duration, 0.0);
+            c.effects = vec![a_key(color, similarity, blend)];
+            let tl = timeline(vec![vec![c]], None);
+            let plan = RenderPlan::at(&tl, std::slice::from_ref(asset), &opts, t, policy()).expect("plan");
+            let frames = kerf_gpu::decode_layers(&plan.layers).expect("decode");
+            let frame = frames[0].as_ref().expect("a frame");
+            let key = ChromaKeyOptions {
+                uv: chroma_key_uv(kerf_core::color_rgb(color).expect("colour")),
+                similarity: similarity as f32,
+                blend: blend as f32,
+            };
+            let got = compositor().chroma_key_alpha(frame, &key).expect("alpha");
+            let filter = format!("format=yuva420p,chromakey={color}:{similarity}:{blend}");
+            let seek = format!("{}", plan.layers[0].source_time);
+            let threads = kerf_core::cpu_graph_threads().to_string();
+            let raw = ffmpeg(&[
+                "-filter_threads",
+                &threads,
+                "-ss",
+                &seek,
+                "-i",
+                &plan.layers[0].path,
+                "-frames:v",
+                "1",
+                "-vf",
+                &filter,
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuva420p",
+                "pipe:1",
+            ]);
+            let (w, h) = (frame.width as usize, frame.height as usize);
+            let chroma = w.div_ceil(2) * h.div_ceil(2);
+            let want = &raw[w * h + 2 * chroma..];
+            assert_eq!(want.len(), w * h);
+            let differing = got.iter().zip(want).filter(|(a, b)| a != b).count();
+            let line = format!(
+                "chroma-key-planes/{label:<8} {color:<9} {similarity} {blend}: differing {differing} of {}",
+                w * h
+            );
+            eprintln!("{line}");
+            report()
+                .lock()
+                .unwrap()
+                .insert(format!("chroma-key-planes {label} {color} {similarity} {blend}"), line);
+            if differing > 0 {
+                let at: Vec<(usize, usize)> = got
+                    .iter()
+                    .zip(want)
+                    .enumerate()
+                    .filter(|(_, (a, b))| a != b)
+                    .map(|(i, _)| (i % w, i / w))
+                    .take(8)
+                    .collect();
+                failures.push(format!("{label} {color} {similarity} {blend}: {differing} differ, at {at:?}"));
+            }
+        }
+    }
+    write_report();
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 /// Each effect's shader against its filter, **plane by plane**: the picture at its own size, so

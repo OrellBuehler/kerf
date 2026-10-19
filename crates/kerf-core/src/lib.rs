@@ -59,9 +59,10 @@ pub use captions_import::{
     MAX_CAPTION_OFFSET, MAX_CAPTION_WORDS, MAX_CUE_CHARS, MAX_IMPORTED_CAPTIONS, MAX_LINE_CHARS,
 };
 pub use clip_timing::{fade_alpha, fade_chroma, fade_luma, FadeEdge, FadeStep, FadeTint, MotionKeys, Rational, FADE_FULL};
+pub use engine::color_rgb;
 pub use engine::cpu::{
-    budget_threads as cpu_threads, cores as cpu_cores, cpu_percent, gpu_lane, high_pending as proxy_jobs_pending,
-    set_cpu_percent, set_gpu_lane, DEFAULT_CPU_PERCENT, MAX_GPU_JOBS, MIN_CPU_PERCENT,
+    budget_threads as cpu_threads, cores as cpu_cores, cpu_percent, gpu_lane, graph_threads as cpu_graph_threads,
+    high_pending as proxy_jobs_pending, set_cpu_percent, set_gpu_lane, DEFAULT_CPU_PERCENT, MAX_GPU_JOBS, MIN_CPU_PERCENT,
 };
 pub use engine::{
     band_balance, check_caption_sidecars, composite_color_policy, contact_sheet_times, decode_audio, decode_hwaccel,
