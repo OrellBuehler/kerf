@@ -133,6 +133,18 @@ export interface AudioEnv {
 	report: (message: string) => void;
 }
 
+/** A decoded window, and which way round it is stored. */
+interface Oriented {
+	buf: AudioBuffer;
+	rev: boolean;
+}
+
+/** A held window's samples in source order. */
+function inSourceOrder(held: Oriented): Float32Array {
+	const data = held.buf.getChannelData(0);
+	return held.rev ? Float32Array.from(data).reverse() : data;
+}
+
 function speedMag(clip: Clip): number {
 	return Math.max(Math.abs(clip.speed ?? 1), 0.01);
 }
@@ -140,7 +152,7 @@ function speedMag(clip: Clip): number {
 export class AudioEngine {
 	#ctx: AudioContext | null = null;
 	#master: Master | null = null;
-	#cache = new Map<string, AudioBuffer | Promise<AudioBuffer | null>>();
+	#cache = new Map<string, Oriented | Promise<Oriented | null>>();
 	#session: Session | null = null;
 	#env: AudioEnv;
 	/** Cache keys that already reported a decode failure this session — a
@@ -198,6 +210,8 @@ export class AudioEngine {
 			if (playing.length === 0) continue;
 			const bus = this.#makeBus(ctx, track.volume ?? 1, track.pan ?? 0);
 			session.buses.set(track.id, bus);
+			// Asked for in the order the playhead meets them: backwards, the nearest is the latest.
+			if (back) playing.sort((a, b) => b.timeline_start - a.timeline_start);
 			for (const clip of playing) {
 				void this.#buffer(clip, back)
 					.then((buf) => {
@@ -432,7 +446,8 @@ export class AudioEngine {
 	/** Fetch + decode the clip's source window, cached, stored in the order the playhead meets it:
 	 *  `backwards` (reverse shuttle) from the clip's end. A reversed clip's samples are stored
 	 *  back-to-front, and played backwards they are front-to-back again, so scheduling stays
-	 *  forward-only either way. */
+	 *  forward-only either way. One window is held one way round at a time: asked for the other,
+	 *  the cached copy is turned in memory and replaces it, rather than fetched and held twice. */
 	async #buffer(clip: Clip, backwards = false): Promise<AudioBuffer | null> {
 		const rev = ((clip.speed ?? 1) < 0) !== backwards;
 		// Cap the window at MAX_WINDOW source seconds where the playhead enters the clip: a
@@ -441,36 +456,38 @@ export class AudioEngine {
 		const sin = rev ? Math.max(clip.source_in, clip.source_out - MAX_WINDOW) : clip.source_in;
 		const sout = rev ? clip.source_out : Math.min(clip.source_out, clip.source_in + MAX_WINDOW);
 		if (sout - sin <= 0) return null;
+		const samples = Math.round((sout - sin) * RATE);
 		// The effect chain is baked into the decode, so it is part of the identity
 		// of the cached buffer: retuning an EQ has to re-fetch rather than keep
 		// playing the previous sound.
 		const fx = clip.audio?.length ? JSON.stringify(clip.audio) : '';
-		const key = `${clip.asset_id}:${sin.toFixed(3)}:${sout.toFixed(3)}:${rev ? 'r' : 'f'}:${fx}`;
+		const key = `${clip.asset_id}:${sin.toFixed(3)}:${sout.toFixed(3)}:${fx}`;
 		const hit = this.#cache.get(key);
-		if (hit) return hit;
+		if (hit) {
+			const held = await hit;
+			if (!held) return null;
+			if (held.rev === rev) return held.buf;
+			const turned = this.#oriented(inSourceOrder(held), rev, samples);
+			if (turned) this.#cache.set(key, turned);
+			return turned?.buf ?? null;
+		}
 
-		const pending = (async (): Promise<AudioBuffer | null> => {
+		const pending = (async (): Promise<Oriented | null> => {
 			const bytes = await this.#env.fetchPcm(clip.asset_id, sin, sout - sin, RATE, clip.id);
 			if (!bytes || bytes.byteLength < 2) return null;
-			const ctx = this.#ctx;
-			if (!ctx) return null;
 			const i16 = new Int16Array(bytes, 0, Math.floor(bytes.byteLength / 2));
-			const buf = ctx.createBuffer(1, i16.length, RATE);
-			const ch = buf.getChannelData(0);
-			if (rev) for (let i = 0; i < i16.length; i++) ch[i] = i16[i16.length - 1 - i] / 32768;
-			else for (let i = 0; i < i16.length; i++) ch[i] = i16[i] / 32768;
-			return buf;
+			return this.#oriented(Float32Array.from(i16, (x) => x / 32768), rev, samples);
 		})();
 		this.#cache.set(key, pending);
 		try {
-			const buf = await pending;
-			if (buf) {
-				this.#cache.set(key, buf);
+			const held = await pending;
+			if (held) {
+				this.#cache.set(key, held);
 				this.#evict();
 			} else {
 				this.#cache.delete(key);
 			}
-			return buf;
+			return held?.buf ?? null;
 		} catch (e) {
 			// A rejected decode must not squat on the cache forever — a moved
 			// file or a transient ffmpeg error would otherwise leave this clip
@@ -486,14 +503,30 @@ export class AudioEngine {
 		}
 	}
 
+	/** A window's samples (`data`, in source order) as a buffer the given way round. Back-to-front it
+	 *  is first padded to the window's own length (`samples`): the decode ends early when the source's
+	 *  sound does, and the buffer's first sample has to be the window's end or everything after it
+	 *  plays late. */
+	#oriented(data: Float32Array, rev: boolean, samples: number): Oriented | null {
+		const ctx = this.#ctx;
+		if (!ctx) return null;
+		const length = rev ? samples : data.length;
+		if (length <= 0) return null;
+		const buf = ctx.createBuffer(1, length, RATE);
+		const ch = buf.getChannelData(0);
+		if (rev) for (let i = 0; i < Math.min(data.length, length); i++) ch[length - 1 - i] = data[i];
+		else ch.set(data);
+		return { buf, rev };
+	}
+
 	#evict() {
 		let total = 0;
-		for (const v of this.#cache.values()) if (!(v instanceof Promise)) total += v.duration;
+		for (const v of this.#cache.values()) if (!(v instanceof Promise)) total += v.buf.duration;
 		for (const [k, v] of this.#cache) {
 			if (total <= CACHE_CAP) break;
 			if (!(v instanceof Promise)) {
 				this.#cache.delete(k);
-				total -= v.duration;
+				total -= v.buf.duration;
 			}
 		}
 	}
