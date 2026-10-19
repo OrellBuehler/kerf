@@ -1331,7 +1331,10 @@ struct PropertyTrackArg {
 
 impl From<PropertyTrackArg> for PropertyTrack {
     fn from(a: PropertyTrackArg) -> Self {
-        Self { prop: a.prop, keys: a.keys }
+        Self {
+            prop: a.prop,
+            keys: a.keys,
+        }
     }
 }
 
