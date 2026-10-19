@@ -957,3 +957,325 @@ fn a_play_session_through_the_frame_path() {
     let _ = std::fs::remove_dir_all(&dir);
     report_to("bench-play.txt", &out);
 }
+
+// ---- A3: scrubbing and gestures at 1080p ------------------------------------------------------------
+
+/// Two 1920x1080 all-intra clips, 6 s each.
+fn hd_clips(dir: &Path) -> [PathBuf; 2] {
+    let make = |name: &str, lavfi: &str| -> PathBuf {
+        let path = dir.join(name);
+        let out = kerf_core::ffmpeg_command()
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-y",
+                "-f",
+                "lavfi",
+                "-i",
+                lavfi,
+            ])
+            .args([
+                "-c:v", "libx264", "-g", "1", "-crf", "20", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+            ])
+            .arg(&path)
+            .output()
+            .expect("run ffmpeg");
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        path
+    };
+    [
+        make("hd1.mp4", "testsrc2=size=1920x1080:rate=30:duration=6"),
+        make("hd2.mp4", "gradients=size=1920x1080:rate=30:duration=6:speed=0.00001"),
+    ]
+}
+
+/// A panel 1920 device pixels wide: the frame is rendered at 1920x1080.
+fn hd_bounds(preview: &GpuPreview) {
+    preview
+        .set_bounds(&BoundsReport {
+            x: 0.0,
+            y: 0.0,
+            width: 1920.0,
+            height: 1080.0,
+            viewport_width: 2560.0,
+            viewport_height: 1440.0,
+            visible: true,
+            matte: None,
+            backdrop: None,
+            seq: 0,
+        })
+        .expect("bounds");
+}
+
+struct Walk {
+    name: String,
+    /// Request to presented (the screen waits for the GPU to finish the frame), ms.
+    latency: Vec<f64>,
+    parts: Vec<GpuTimings>,
+}
+
+impl Walk {
+    fn line(&mut self) -> String {
+        let part = |f: fn(&GpuTimings) -> f64| median(&mut self.parts.iter().map(f).collect::<Vec<_>>());
+        let (decode, record, present) = (part(|t| t.decode_ms), part(|t| t.composite_ms), part(|t| t.present_ms));
+        let size = self.parts.first().map_or((0, 0), |t| (t.width, t.height));
+        format!(
+            "{:<58} {}x{} request to screen p50 {:>6.1} p95 {:>6.1} max {:>6.1} ms; decode {decode:.1} record {record:.1} present+completion {present:.1} ms",
+            self.name,
+            size.0,
+            size.1,
+            median(&mut self.latency.clone()),
+            percentile(&mut self.latency.clone(), 0.95),
+            self.latency.iter().copied().fold(0.0, f64::max),
+        )
+    }
+}
+
+/// `times` drawn one after the other through the frame path (`forward`: decoded reading ahead, as a
+/// drag that walks forward is; `gap` between frames, the pointer's pace), each with the draft `draft`
+/// gives it, if any.
+fn hd_walk(
+    name: &str,
+    preview: &GpuPreview,
+    take: &TakeInputs,
+    times: &[f64],
+    forward: bool,
+    gap: Duration,
+    draft: impl Fn(usize) -> Option<PreviewDraft>,
+) -> Walk {
+    let (mut latency, mut parts) = (Vec::new(), Vec::new());
+    for (n, &t) in times.iter().enumerate() {
+        let asked = Instant::now();
+        let inputs = preview.inputs(take).expect("inputs");
+        let want = Want {
+            scrubbing: true,
+            forward,
+            ..Want::at(t)
+        };
+        let cut = match draft(n) {
+            Some(d) => Cut::Drafted(d.apply(&inputs.timeline, &inputs.assets).expect("a draft")),
+            None => Cut::Held,
+        };
+        let answer = preview.frame_in(&inputs, cut, want, 1920).expect("a frame");
+        assert_eq!(answer.renderer, "gpu", "{:?}", answer.reasons);
+        parts.extend(answer.timings);
+        latency.push(ms(asked.elapsed()));
+        std::thread::sleep(gap);
+    }
+    Walk {
+        name: name.to_string(),
+        latency,
+        parts,
+    }
+}
+
+#[test]
+#[ignore = "timings; KERF_BENCH=1; needs ffmpeg and a GPU adapter"]
+fn a_scrub_and_a_gesture_at_1080p() {
+    let _turn = drive_tests::exclusive();
+    if !bench_on() {
+        return;
+    }
+    let dir = std::env::temp_dir().join(format!("kerf-app-bench-hd-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let gpu = Gpu::new(GpuOptions::for_tests()).expect("a GPU adapter");
+    let clips = hd_clips(&dir);
+    let mut out = format!(
+        "# A3: the frame path at a 1920x1080 canvas, 1920x1080 all-intra x264 clips, on {}
+# request to screen = the frame's inputs, plan, decode wait, composite and present, the screen waiting for
+# the GPU to finish the frame (a software adapter's raster is most of it); 60 frames each, 16 ms apart
+# (a pointer at 60 Hz), every frame drawn (no newer request replaces one)
+",
+        gpu.adapter_info().name
+    );
+    let step = 1.0 / 30.0;
+    let forward: Vec<f64> = (0..60).map(|n| 0.5 + f64::from(n) * step).collect();
+    let fast: Vec<f64> = (0..60).map(|n| 0.5 + f64::from(n) * 2.0 * step).collect();
+    let backward: Vec<f64> = forward.iter().rev().copied().collect();
+    let jumps: Vec<f64> = (0..60u32)
+        .map(|n| [0.4, 3.1, 1.7, 4.6, 2.2, 0.9][(n % 6) as usize] + f64::from(n / 6) * step)
+        .collect();
+    let pace = Duration::from_millis(16);
+    for wait in [true, false] {
+        let _ = writeln!(
+            out,
+            "\n## {}",
+            if wait {
+                "the screen waits for the GPU to finish each frame (lavapipe's raster is the frame)"
+            } else {
+                "CPU side only: the GPU's work is not waited for, as a real present does not"
+            }
+        );
+        let fresh = || {
+            let log = Arc::new(Mutex::new(ScreenLog::default()));
+            lock(&log).complete_with = wait.then(|| Arc::clone(&gpu));
+            let preview = drive_tests::preview_on(&log, Arc::clone(&gpu));
+            hd_bounds(&preview);
+            let (take, project) = drive_tests::taker(proxy_project(&clips));
+            let inputs = preview.inputs(&take).expect("inputs");
+            let _ = preview.frame(&inputs, Want::at(0.1), 1920);
+            drive_tests::wait_open(&preview);
+            for n in 0..4 {
+                let _ = preview.frame(&inputs, Want::at(0.2 + f64::from(n) * step), 1920);
+            }
+            (preview, take, project)
+        };
+        let none = |_: usize| None;
+        let mut rows = Vec::new();
+        {
+            let (preview, take, _p) = fresh();
+            rows.push(hd_walk(
+                "scrub forward, a frame a step, as before (Scrub)",
+                &preview,
+                &take,
+                &forward,
+                false,
+                pace,
+                none,
+            ));
+        }
+        {
+            let (preview, take, _p) = fresh();
+            rows.push(hd_walk(
+                "scrub forward, a frame a step, read ahead (Forward)",
+                &preview,
+                &take,
+                &forward,
+                true,
+                pace,
+                none,
+            ));
+        }
+        {
+            let (preview, take, _p) = fresh();
+            rows.push(hd_walk(
+                "scrub forward, two frames a step, as before (Scrub)",
+                &preview,
+                &take,
+                &fast,
+                false,
+                pace,
+                none,
+            ));
+        }
+        {
+            let (preview, take, _p) = fresh();
+            rows.push(hd_walk(
+                "scrub forward, two frames a step, read ahead (Forward)",
+                &preview,
+                &take,
+                &fast,
+                true,
+                pace,
+                none,
+            ));
+        }
+        {
+            let (preview, take, _p) = fresh();
+            rows.push(hd_walk(
+                "scrub backward, a frame a step (Scrub)",
+                &preview,
+                &take,
+                &backward,
+                false,
+                pace,
+                none,
+            ));
+        }
+        {
+            let (preview, take, _p) = fresh();
+            rows.push(hd_walk(
+                "jumps across both clips (Scrub)",
+                &preview,
+                &take,
+                &jumps,
+                false,
+                pace,
+                none,
+            ));
+        }
+        {
+            let (preview, take, project) = fresh();
+            let timeline = lock(&project).working_timeline().expect("a timeline");
+            let track = timeline.tracks[0].id;
+            let clip = timeline.tracks[0].clips[0].clone();
+            let at = vec![1.0; 60];
+            let scale = |n: usize| {
+                let mut c = clip.clone();
+                c.transform.scale = 0.5 + 0.5 * n as f64 / 59.0;
+                c.color.brightness = 0.2 * n as f64 / 59.0;
+                Some(PreviewDraft {
+                    clips: vec![draft::DraftClip {
+                        track_id: track,
+                        clip: c,
+                    }],
+                    overlays: Vec::new(),
+                })
+            };
+            rows.push(hd_walk(
+                "Inspector drag: scale and brightness at a resting playhead",
+                &preview,
+                &take,
+                &at,
+                false,
+                pace,
+                scale,
+            ));
+            let held = |_: usize| {
+                let mut c = clip.clone();
+                c.transform.scale = 0.75;
+                c.color.brightness = 0.1;
+                Some(PreviewDraft {
+                    clips: vec![draft::DraftClip {
+                        track_id: track,
+                        clip: c,
+                    }],
+                    overlays: Vec::new(),
+                })
+            };
+            rows.push(hd_walk(
+                "the same frame held: scale 0.75 and brightness 0.1 each time",
+                &preview,
+                &take,
+                &at,
+                false,
+                pace,
+                held,
+            ));
+        }
+        {
+            let (preview, take, project) = fresh();
+            let timeline = lock(&project).working_timeline().expect("a timeline");
+            let track = timeline.tracks[0].id;
+            let second = timeline.tracks[0].clips[1].clone();
+            let at = vec![5.5; 60];
+            let slide = |n: usize| {
+                let mut c = second.clone();
+                c.timeline_start = 5.0 + 0.4 * n as f64 / 59.0;
+                Some(PreviewDraft {
+                    clips: vec![draft::DraftClip {
+                        track_id: track,
+                        clip: c,
+                    }],
+                    overlays: Vec::new(),
+                })
+            };
+            rows.push(hd_walk(
+                "timeline drag: the clip under the playhead moved later",
+                &preview,
+                &take,
+                &at,
+                false,
+                pace,
+                slide,
+            ));
+        }
+        for row in &mut rows {
+            let _ = writeln!(out, "{}", row.line());
+        }
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+    report_to("bench-scrub-1080p.txt", &out);
+}

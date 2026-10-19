@@ -49,6 +49,7 @@ import type {
 	Keyframe,
 	Property,
 	PropertyKey,
+	PropertyTrack,
 	LaunchRequest,
 	RecoveryInfo,
 	Levels,
@@ -71,6 +72,7 @@ import type {
 	PreviewBoundsReport,
 	PlatformTarget,
 	PlayAsk,
+	PreviewDraft,
 	PreviewFrameResult,
 	PreviewOrder,
 	Projection,
@@ -148,6 +150,7 @@ import {
 	pruneChannels,
 	propertyKeysProblem,
 	propertyKeysShifted,
+	propertyLabel,
 	setPropertyEasing,
 	setPropertyKeys,
 	transformAt
@@ -3035,6 +3038,25 @@ export async function setPropertyKeyframes(clipId: string, prop: Property, keys:
 	return invoke<Timeline>('set_property_keyframes', { clipId, prop, keys });
 }
 
+/** Replace the keys of several animatable numbers of a clip in one edit (`set_property_tracks`):
+ *  what one dope-sheet gesture writes. */
+export async function setPropertyTracks(clipId: string, tracks: PropertyTrack[]): Promise<Timeline> {
+	if (!inTauri()) {
+		if (tracks.length === 0) throw new Error("give at least one property's keys");
+		for (const [i, t] of tracks.entries()) {
+			if (tracks.slice(0, i).some((o) => o.prop === t.prop)) throw new Error(`${propertyLabel(t.prop)} is given more than once`);
+			const problem = propertyKeysProblem(t.prop, t.keys);
+			if (problem) throw new Error(problem);
+		}
+		const found = locate(devTimeline, clipId);
+		if (!found) throw new Error(`clip ${clipId} not found`);
+		for (const t of tracks) setPropertyKeys(found[0].clips[found[1]], t.prop, t.keys);
+		recordDev('Edit keyframes');
+		return snapshot();
+	}
+	return invoke<Timeline>('set_property_tracks', { clipId, tracks });
+}
+
 /** Copy the animation of `props` (every keyed number when empty) from one clip to another,
  *  `offset` seconds later (`copy_keyframes`). */
 export async function copyKeyframes(
@@ -4446,16 +4468,19 @@ export async function getRenderBar(width = 960): Promise<RenderBar> {
  * of the same `client` instead of drawing it last. `play` makes it a frame of **GPU playback**
  * (`hint: 'forward'`): the time is the one the picture should show, asked once per animation
  * frame while the cut plays, and the first request of a `session` decides whether the GPU plays
- * it or the stream does (`renderer: 'stream'`). In the browser harness there is no backend: the
- * answer is "FFmpeg, no frame" (to a forward request, "the stream"), as `getTimelineFrame` is
- * `null`, and `order` is unused.
+ * it or the stream does (`renderer: 'stream'`). `draft` is what a gesture under way would write
+ * (`preview-draft.ts`): the frame is drawn as the cut would be with it written, and nothing is; a frame
+ * of it the GPU does not draw is the JPEG of the cut as it is. In the browser harness there is no
+ * backend: the answer is "FFmpeg, no frame" (to a forward request, "the stream"), as `getTimelineFrame`
+ * is `null`, and `order` is unused.
  */
 export async function getPreviewFrame(
 	timeSecs: number,
 	maxWidth = 960,
 	overlays = false,
 	order?: PreviewOrder,
-	play?: PlayAsk
+	play?: PlayAsk,
+	draft?: PreviewDraft | null
 ): Promise<PreviewFrameResult> {
 	if (!inTauri()) {
 		// `?gpusurface=1` pretends a surface under a transparent webview drew the frame, so the
@@ -4526,7 +4551,8 @@ export async function getPreviewFrame(
 		client: order?.client,
 		seq: order?.seq,
 		hint: play ? 'forward' : undefined,
-		session: play?.session
+		session: play?.session,
+		draft: play ? undefined : (draft ?? undefined)
 	});
 }
 

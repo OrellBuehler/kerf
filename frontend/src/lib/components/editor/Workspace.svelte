@@ -14,6 +14,7 @@
 	import DeliverPanel from './DeliverPanel.svelte';
 	import Mixer from './Mixer.svelte';
 	import Scopes from './Scopes.svelte';
+	import DopeSheet from './DopeSheet.svelte';
 	import DockEmpty from './DockEmpty.svelte';
 	import ContextMenu from './ContextMenu.svelte';
 	import { POPOUT_URL, isPanelId, type PanelId } from '#lib/layout';
@@ -31,7 +32,8 @@
 		agent: AgentPanel,
 		deliver: DeliverPanel,
 		mixer: Mixer,
-		scopes: Scopes
+		scopes: Scopes,
+		keyframes: DopeSheet
 	};
 
 	let el = $state<HTMLDivElement | null>(null);

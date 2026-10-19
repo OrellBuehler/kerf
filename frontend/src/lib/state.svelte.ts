@@ -54,6 +54,7 @@ import {
 	setAudioEffects,
 	setKeyframes,
 	setPropertyKeyframes,
+	setPropertyTracks,
 	copyKeyframes,
 	setAssetProjection,
 	setReframe,
@@ -156,6 +157,7 @@ import type {
 	Projection,
 	Property,
 	PropertyKey,
+	PropertyTrack,
 	Reframe,
 	ReframeKeyframe,
 	Revision,
@@ -1221,6 +1223,10 @@ class EditorState {
 	/** Replace the keys of one number — a transform number, a colour number or the volume. */
 	setPropertyKeyframes(clipId: string, prop: Property, keys: PropertyKey[]) {
 		return this.#apply(() => setPropertyKeyframes(clipId, prop, keys));
+	}
+	/** Replace the keys of several numbers in one edit (one dope-sheet gesture). */
+	setPropertyTracks(clipId: string, tracks: PropertyTrack[]) {
+		return this.#apply(() => setPropertyTracks(clipId, tracks));
 	}
 	/** Copy the animation of `props` (all keyed ones when empty) to another clip, `offset` later. */
 	copyKeyframes(fromClipId: string, toClipId: string, props: Property[] = [], offset = 0) {

@@ -118,7 +118,10 @@ lock is taken; the clip comes back. The nested curves / wheels are MCP-only mirr
 **Per-property animation over MCP**: `set_property_keyframes` (`clip_id`, `prop`, `keys:
 [{time, value, easing?}]`; `[]` makes the number static again; the clip comes back) animates one number —
 a transform number, a colour number or the clip's volume — independently of the rest,
-`copy_keyframes` (`from_clip_id`, `to_clip_id`, `props?`, `offset?`) gives another clip the same
+`set_property_tracks` (`clip_id`, `tracks: [{prop, keys}]`) re-keys several numbers in one edit (the dope
+sheet's gestures; a number twice or none at all is refused; each track is `PropertyTrackArg` with `keys` required and
+`deny_unknown_fields`, since the model's `PropertyTrack` reads a misspelt `keys` as none and would make the number static), `copy_keyframes` (`from_clip_id`, `to_clip_id`,
+`props?`, `offset?`) gives another clip the same
 animation, and `set_keyframe_easing` takes an optional `prop`; the server `instructions` mention them.
 `set_transform_at` (`clip_id`, `time`, any transform field) poses a clip at a moment of it in one edit without the
 agent first working out what is animated: a keyed number gets a key at `time` (bundle or own track, whichever drives
@@ -509,7 +512,8 @@ Every tool, by purpose (a test pins that this list names each registered tool, a
   `reattach_audio_clips`, `link_clips`, `unlink_clips`.
 - **Clip look and sound**: `set_volume`, `set_fade`, `set_speed`, `set_transform`, `set_transform_at`, `set_color`, `set_transition`,
   `set_grade`, `set_video_effects`, `set_audio_effects`, `set_mask`, `set_clip_enabled`.
-- **Keyframes and 360**: `set_keyframes`, `add_keyframe`, `set_keyframe_easing`, `set_property_keyframes`, `copy_keyframes`,
+- **Keyframes and 360**: `set_keyframes`, `add_keyframe`, `set_keyframe_easing`, `set_property_keyframes`,
+  `set_property_tracks`, `copy_keyframes`,
   `clear_keyframes`, `set_reframe`, `clear_reframe`, `set_reframe_keyframes`, `add_reframe_keyframe`.
 - **Mix and music**: `set_track_volume`, `set_track_pan`, `set_track_duck`, `set_track_muted`, `set_track_solo`,
   `set_track_locked`, `set_master_volume`, `set_master_limiter`, `set_master_true_peak`, `set_master_duck`, `plan_music_fit`, `fit_music`,

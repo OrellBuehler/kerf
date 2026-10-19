@@ -4895,6 +4895,7 @@ pub use grade::{
     frame_matrix, normalize_curve, ClipLut, CurvePoint, CurveSegment, CurveShape, Curves, Grade, Wheel, Wheels, MAX_CURVE_POINTS,
 };
 mod check;
+mod values;
 
 mod score;
 pub use score::{

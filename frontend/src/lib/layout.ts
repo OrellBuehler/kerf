@@ -13,9 +13,9 @@ import type { GroupviewPanelState, Orientation, SerializedDockview, SerializedPo
 export const POPOUT_URL = '/popout.html';
 /** How many windows a stored layout may hold: one per panel there is, none of them
  *  a reason to trust a hand-edited file to be reasonable. */
-export const MAX_POPOUTS = 8;
+export const MAX_POPOUTS = 9;
 
-export const PANEL_IDS = ['library', 'preview', 'timeline', 'inspector', 'agent', 'deliver', 'mixer', 'scopes'] as const;
+export const PANEL_IDS = ['library', 'preview', 'timeline', 'inspector', 'agent', 'deliver', 'mixer', 'scopes', 'keyframes'] as const;
 export type PanelId = (typeof PANEL_IDS)[number];
 
 /** The width of the library's icon rail. The panel's registry minimum, so a
@@ -48,7 +48,9 @@ export const PANELS: Record<PanelId, PanelSpec> = {
 	// fit in 340 px, and a third scrolls. Tall enough for a fader to have travel.
 	mixer: { title: 'Mixer', minimumWidth: 340, minimumHeight: 230, defaultWidth: 460 },
 	// A scope reads at a couple of hundred pixels; the readout under it needs the width.
-	scopes: { title: 'Scopes', minimumWidth: 240, minimumHeight: 200, defaultWidth: 340 }
+	scopes: { title: 'Scopes', minimumWidth: 240, minimumHeight: 200, defaultWidth: 340 },
+	// The dope sheet: a label column and enough of a time axis to drag a key along.
+	keyframes: { title: 'Keyframes', minimumWidth: 300, minimumHeight: 160, defaultWidth: 400 }
 };
 
 export function isPanelId(id: unknown): id is PanelId {
@@ -152,13 +154,14 @@ export const PRESET_LAYOUTS: Record<WorkspaceId, SerializedDockview> = {
 		],
 		344
 	),
-	// Animating: preview, a wide inspector for keyframes, the timeline under it.
+	// Animating: preview, the dope sheet and the inspector beside it, the timeline under them.
 	motion: preset(
 		480,
 		[
-			leaf('library', ['library'], 240),
-			leaf('preview', ['preview'], 780),
-			leaf('inspector', ['inspector', 'agent'], 420)
+			leaf('library', ['library'], 220),
+			leaf('preview', ['preview'], 520),
+			leaf('keyframes', ['keyframes'], 400),
+			leaf('inspector', ['inspector', 'agent'], 300)
 		],
 		314
 	),
@@ -581,9 +584,10 @@ export function presetPanelIds(id: WorkspaceId): PanelId[] {
 
 /** What a layout stored before layouts recorded it was offered: the panels of
  *  each preset as they stood when that was the only kind there was — every
- *  preset as it is now, bar the mixer Audio gained and the scopes Color did. */
+ *  preset as it is now, bar the mixer Audio gained, the scopes Color did and the
+ *  dope sheet Motion did. */
 export const UNSTAMPED_OFFERED: Record<WorkspaceId, PanelId[]> = Object.fromEntries(
-	WORKSPACE_IDS.map((id) => [id, presetPanelIds(id).filter((p) => p !== 'mixer' && p !== 'scopes')])
+	WORKSPACE_IDS.map((id) => [id, presetPanelIds(id).filter((p) => p !== 'mixer' && p !== 'scopes' && p !== 'keyframes')])
 ) as Record<WorkspaceId, PanelId[]>;
 
 /** Presets as an earlier build shipped them, for the ones that changed shape
@@ -611,6 +615,16 @@ export const EARLIER_PRESETS: Partial<Record<WorkspaceId, SerializedDockview>> =
 			leaf('inspector', ['inspector', 'agent'], 380)
 		],
 		234
+	),
+	// Before the dope sheet: a wide inspector for keyframes.
+	motion: preset(
+		480,
+		[
+			leaf('library', ['library'], 240),
+			leaf('preview', ['preview'], 780),
+			leaf('inspector', ['inspector', 'agent'], 420)
+		],
+		314
 	)
 };
 

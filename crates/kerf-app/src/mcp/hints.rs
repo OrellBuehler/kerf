@@ -121,6 +121,7 @@ pub(super) const TOOLS: &[(&str, &str, Effect)] = &[
     ("add_keyframe", "Add keyframe", Set),
     ("set_keyframe_easing", "Keyframe easing", Set),
     ("set_property_keyframes", "Property keyframes", Set),
+    ("set_property_tracks", "Property tracks", Set),
     ("copy_keyframes", "Copy keyframes", Set),
     ("clear_keyframes", "Clear keyframes", Set),
     ("set_reframe", "Aim 360 camera", Set),

@@ -101,8 +101,8 @@ editor-grade workspace under `src/lib/components/editor/` — bespoke atoms (`Bt
 and `StatusBar` as fixed chrome around a **dockable workspace** (`Workspace.svelte`, composed by
 `routes/+page.svelte`). The workspace is `dockview` (the vanilla package; its
 `--dv-*` variables are mapped onto Kerf tokens in `styles/dockview-kerf.css` so
-it follows the theme) hosting eight panels — `LibraryPanel`, `Preview`, `Timeline`,
-`Inspector`, `AgentPanel`, `DeliverPanel`, `Mixer`, `Scopes` — each a Svelte component
+it follows the theme) hosting nine panels — `LibraryPanel`, `Preview`, `Timeline`,
+`Inspector`, `AgentPanel`, `DeliverPanel`, `Mixer`, `Scopes`, `DopeSheet` (*Keyframes*) — each a Svelte component
 `mount`ed into a dockview content element, so every panel is resizable by its
 sash, movable by its tab (drop zones on any group edge, or tabbed into a group)
 and closable; the **Window** menu reopens one (the library left of the
@@ -414,8 +414,33 @@ the value it has there (◆ when a key sits there, and clicking it takes the key
 the number static), and once a number is keyed its slider shows the curve at the playhead and an edit
 writes a key there — `setCol` / `setGain` / `keyAtPlayhead` over `set_property_keyframes` with the
 mirror's `upsertKey`, so a drag is one edit (every number row is a `SliderRow`, below). The Transform sliders do the same for numbers keyed on
-their own; the Animation list is still the legacy bundle's, and the per-number rows, dope sheet and easing
-popover are the next slice. The preview's Web Audio gain follows a keyed volume — `gainAutomation`
+their own; the Animation list is still the legacy bundle's. **The dope sheet** (`DopeSheet.svelte`, panel id
+`keyframes`, titled *Keyframes*; in the Motion preset between the preview and the inspector, `EARLIER_PRESETS.motion`
+is the arrangement before it) shows the selected clip: one row per keyed number (`dopeRows`, the resolver's keys, so a
+bundle-driven transform number has a row too), its keys as diamonds on one axis over the clip's span (and past it, shaded,
+when a key lies beyond the end), labelled in the cut's time with the timeline ruler's steps (`rulerGrid` / `tickLabel`);
+a diamond is round when its segment is eased and square when it holds. Click selects a key and seeks to it (exactly),
+Shift / Ctrl add or toggle, a drag on empty lane space is a marquee, the ruler seeks and scrubs (Escape puts the playhead
+back). Dragging a key retimes the selection across rows: the grabbed key lands on a magnet within 6 px (the playhead, the
+clip's ends, a key that is not moving, `dragMagnets` / `snapShift`) or else on a frame of the cut's grid (not the clip's,
+which is off it when the clip starts between frames), and nothing goes before 0; **Alt at
+the release** (the ghost follows Alt live) leaves the originals and drops copies; a key landed on gives way. While the
+panel has focus the editor's own Copy / Cut / Paste / Delete / Select all bindings (`settings.actionFor`, so a rebound
+key follows; `dopeKey` routes them, a held key repeating only where the registry allows) copy the selected keys (spacing
+kept, the clipboard outlives the panel and works on another clip), cut them, paste them with the earliest at the
+playhead, delete them (a row left empty is static) and select every key, and ripple delete / duplicate / split are
+swallowed rather than reaching the clip behind the panel; Escape clears the selection. **The easing popover** (`EasingPopover.svelte`, from the bar's *Easing* button — which toggles it — or a diamond's
+*Easing…*; drawn in the document's body because a dock group is a containing block, and so listening for its keys and
+clicks on the box itself: Svelte delegates a detached panel's events from the panel's mount root, which the body is not) shows
+the twelve presets of `EASING_CHOICES` (eight before, now also Glide / Settle / Lift / Whip — the Inspector's picker
+lists the same) as curves drawn from the renderers' polyline (`easingPath`), lights the one the selected segments share,
+and shapes the segment each selected key starts (`easingTargets`: a row's last key starts none); arrows move between
+presets, Escape / a press outside / blur / scroll close it without writing. **Every gesture is one
+`set_property_tracks` edit** of only the rows it touched (`retimeKeys`, `deleteKeys`, `pasteKeys`, `easeKeys` in the pure,
+bun-tested `dope-sheet.ts`; a gesture that changes nothing writes nothing), shown as its ghost until the edit settles,
+and Escape / pointercancel / blur abandon a drag (`beginDrag`). Keys are named by number and time, not index, so the
+selection that comes back is where the gesture put them. The preview of a proposal is read-only here too
+(`holdForPreview`). The preview's Web Audio gain follows a keyed volume — `gainAutomation`
 ramps linearly through the curve's points and the fade edges, and **steps where the curve does** (a hold
 or two keys at one time: the ramp arrives at the value the step leaves and a `setValueAtTime` lands the
 next, read `1e-9 s` either side of the step because `(start + t) - start` can fall an ulp short of `t`),
@@ -945,6 +970,30 @@ surface (there is no GPU there), and a headless-Chrome screenshot with a transpa
 background shows the hole. The status bar names the renderer of the frame on screen (`GPU
 430×240 · 23 ms · llvmpipe`, or `FFmpeg · <why>`), only while the setting is on, and the
 Settings dialog's Preview section carries the toggle and the machine's status line.
+
+**Drag frames (A3, `preview-draft.ts`).** A gesture under way puts what it would write in the one draft slot (`ui.setDraft(owner,
+draft)`, read as `ui.previewDraft`; `PreviewDraft`: the clips and titles it changes, whole) and clears it once its edit has landed or
+it was abandoned, so the picture does not step back to the cut before it in between. The slot has an **owner** (`putDraft`): each
+writer (a `SliderRow`, the timeline, the Preview's title box) passes its own symbol, its `null` clears only its own draft, and a draft
+equal by value to the one held leaves the slot as it was (`sameDraft`), so pointer events that change nothing ask for no frame. A
+`SliderRow` that unmounts mid-gesture clears its draft, and the Preview drops any draft naming a clip, track or title the cut no
+longer holds (`draftHolds`: an undo mid-gesture), which the backend would refuse. The Preview sends the draft only while it changes
+the frame at the playhead (`draftTouches`: a clip on a video track at the playhead where it is or where it goes, give or take a frame
+and the transitions of its tracks, or a title on screen there); otherwise the frame is the cut's. The frame pump reads it **on the GPU
+route only** and sends it with the frame (`getPreviewFrame(.., draft)`), so the surface shows the frame the release will write; on the
+JPEG route (the setting off, a title box or the trim monitor over a surface above the page) it is not read and asks for nothing — the
+edit's frame once written, as before. While a proposal is previewed none is sent. The pump's `drawnDraft` is the draft of the frame on
+show (`null` for any other picture). The builders mirror the edits and say `null` where the outcome is not known
+exactly: `transformDraft` / `colorDraft` (`setTf` / `setCol`; a keyed number is written as a key the backend places, so it is not
+drafted), `maskDraft`, `fadeDraft` (held to the clip's length), `titleMoveDraft` (`moveOverlay`: a key at the playhead for an
+animated title, `withKeyframeAt`) and `titleSizeDraft`, `moveDraft` (every ghost of `planMove`'s plan, partners included; nothing
+while the drop is refused or a no-op) and `trimDraft` (`trimEdit`'s fields). Sources: `SliderRow`'s `onLive` (the value of a drag or
+a run of keys, then `null`; `Pending.scope` is the clip it began on) for the Inspector's transform, crop, colour, mask, fade and
+title rows; the Preview's title box drags (the ghost text is hidden once the GPU has presented a frame of this drag's draft,
+`drawnDraft`, not before); the timeline's moves and nudges and a trim of a clip alone (`gestureDraft`; a move or trim is held through
+its write by `landWith`, a nudge by `nudge.writing`, which keeps its plan until the edit lands). A trim that ripples or carries partners, roll /
+slip / slide, animated SVG titles, speed and the grade sections draw the cut as it is until released. Tests: `preview-draft.test.ts`,
+the draft cases of `frame-pump.test.ts` (`drawnDraft` included), `Pending.scope` in `slider-row.test.ts`.
 
 **GPU playback in the page** (`gpu-playback.ts`, `output-latency.ts`, `frame-pump.svelte.ts`, `Preview.svelte`; the backend's half is in
 `app.md`). With the GPU preview on and the route `gpu` at the moment Play starts (the setting, a surface, nothing over the frame that a surface above
