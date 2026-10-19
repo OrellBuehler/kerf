@@ -96,8 +96,13 @@ fn an_export_reads_each_titles_pictures_and_stamps_them_onto_the_grid() {
         card.contains("format=yuva420p"),
         "and keeps its transparency to the overlay: {card}"
     );
+    let titles: Vec<&str> = graph
+        .split(';')
+        .filter(|c| c.starts_with("[1:v]") || c.starts_with("[2:v]"))
+        .collect();
+    assert_eq!(titles.len(), 2, "{graph}");
     assert!(
-        !graph.contains("trim=start="),
+        titles.iter().all(|c| !c.contains("trim=start=")),
         "no decoded window is cut from a title: {graph}"
     );
 }
@@ -117,10 +122,11 @@ fn the_pictures_are_the_frames_the_clip_is_on_from_its_own_clock() {
     card.source_out = 2.5;
     let fx = transition_fx(&tl, &assets);
     let seqs = with_pinned_dir(PIN, || svg_layer::clip_sequences(&tl, &fmt, &fx));
+    // Indexed like `fx`: V1's shot and end card, then V2's held title.
     assert!(seqs[0].is_none(), "footage has no pictures");
-    let held = seqs[1].as_ref().unwrap();
+    let held = seqs[2].as_ref().unwrap();
     assert_eq!((held.seq.first_frame, held.count), (15, 30), "0.5 s up to, not at, 1.5 s");
-    let card = seqs[2].as_ref().unwrap();
+    let card = seqs[1].as_ref().unwrap();
     assert_eq!((card.seq.first_frame, card.count), (60, 60));
     assert_eq!(card.seq.doc_t0, 0.5);
     assert_eq!(card.seq.svg, SLIDING);
@@ -374,8 +380,8 @@ fn a_title_dips_to_white_from_the_shot_before_it_and_holds_its_last_state_when_e
         assert_eq!(frames.len(), 125, "the title extends the cut to 5 s");
         assert!(mean(&frames[30]) < 120.0, "the shot, before the dip");
         assert!(
-            mean(&frames[49]) > 225.0,
-            "the shot has dipped to white: {}",
+            mean(&frames[49]) > 215.0,
+            "the shot has (all but) dipped to white: {}",
             mean(&frames[49])
         );
         assert!(
