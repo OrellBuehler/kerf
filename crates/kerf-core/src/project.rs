@@ -3980,7 +3980,11 @@ impl Project {
                     _ => picture,
                 };
                 if !fits {
-                    let (kind, has) = if track.kind == StreamKind::Audio { ("audio", "sound") } else { ("video", "picture") };
+                    let (kind, has) = if track.kind == StreamKind::Audio {
+                        ("audio", "sound")
+                    } else {
+                        ("video", "picture")
+                    };
                     return Err(Error::InvalidArgument(format!(
                         "a clip with no {has} cannot go on {kind} track {} — paste it on a track of its kind",
                         track.name
@@ -12646,7 +12650,10 @@ mod tests {
         assert!(!seen.track(v1).unwrap().locked, "the inherited lock follows the user");
         assert!(seen.track(v2).unwrap().locked, "the lock the agent made itself stays");
         project.split_at(b.id, b.timeline_start + 1.0).unwrap();
-        assert!(project.set_track_locked(v2, false).is_err(), "and an agent still cannot lift it");
+        assert!(
+            project.set_track_locked(v2, false).is_err(),
+            "and an agent still cannot lift it"
+        );
 
         // Forced in over the user's newer work, the user's unlock is not undone.
         project.set_actor(EditSource::User);
@@ -12686,8 +12693,12 @@ mod tests {
     #[test]
     fn a_paste_does_not_put_a_clip_on_a_track_it_cannot_play_on() {
         let project = Project::open_in_memory().unwrap();
-        let music = project.insert_or_get_asset(&asset_with("/kind/music.wav", vec![aud_stream()])).unwrap();
-        let silent = project.insert_or_get_asset(&asset_with("/kind/silent.mp4", vec![vid_stream(false)])).unwrap();
+        let music = project
+            .insert_or_get_asset(&asset_with("/kind/music.wav", vec![aud_stream()]))
+            .unwrap();
+        let silent = project
+            .insert_or_get_asset(&asset_with("/kind/silent.mp4", vec![vid_stream(false)]))
+            .unwrap();
         let both = project
             .insert_or_get_asset(&asset_with("/kind/both.mp4", vec![vid_stream(false), aud_stream()]))
             .unwrap();

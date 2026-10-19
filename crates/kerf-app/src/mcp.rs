@@ -9372,12 +9372,18 @@ mod tests {
             );
             let refused = agent.split_at(clip.id, 1.0).map_err(super::core_err).unwrap_err();
             assert_eq!(refused.code, rmcp::model::ErrorCode::INVALID_PARAMS);
-            assert!(refused.message.contains("track V1 is locked"), "the refusal names the locked track");
+            assert!(
+                refused.message.contains("track V1 is locked"),
+                "the refusal names the locked track"
+            );
             assert!(agent.staged().unwrap().is_none(), "a refused edit opens no proposal");
         }
         let agent = super::lock_agent_edit(&shared, Some("session-a")).unwrap();
         let refused = agent.set_track_locked(v1, false).map_err(super::core_err).unwrap_err();
-        assert!(refused.message.contains("an agent cannot unlock a track"), "the refusal says an agent cannot unlock");
+        assert!(
+            refused.message.contains("an agent cannot unlock a track"),
+            "the refusal says an agent cannot unlock"
+        );
         assert!(agent.timeline().unwrap().track(v1).unwrap().locked);
     }
 
