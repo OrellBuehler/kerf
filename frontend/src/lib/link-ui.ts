@@ -88,16 +88,21 @@ export function marqueeSelectLinked(
 }
 
 /** How many things `ids` selects, a link group counting once: a picture and its sound are one
- *  selection, not two. The Inspector's "N clips selected" notice is for more than one. */
+ *  selection, not two. The Inspector's "N clips selected" notice is for more than one. One pass over
+ *  the cut (a select-all over a long one asks it of thousands). */
 export function selectionUnits(timeline: Timeline, ids: readonly string[]): number {
 	const chosen = new Set(ids);
-	const counted = new Set<string>();
+	const linkOf = new Map<string, string>();
+	for (const t of timeline.tracks) for (const c of t.clips) if (c.link_id && chosen.has(c.id)) linkOf.set(c.id, c.link_id);
+	const groups = new Set<string>();
 	let units = 0;
 	for (const id of chosen) {
-		if (counted.has(id)) continue;
-		units += 1;
-		counted.add(id);
-		for (const partner of linkPartners(timeline, id)) if (chosen.has(partner)) counted.add(partner);
+		const link = linkOf.get(id);
+		if (link === undefined) units += 1;
+		else if (!groups.has(link)) {
+			groups.add(link);
+			units += 1;
+		}
 	}
 	return units;
 }

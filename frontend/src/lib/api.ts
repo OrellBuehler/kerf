@@ -482,6 +482,36 @@ if (wantsEmpty()) {
 	devHistory = [{ seq: 0, label: 'Initial state', source: 'system', snapshot: structuredClone(devTimeline), created_at: now() }];
 }
 
+/** `?long=N` in the browser harness: a cut of N one-second pieces of the interview on V1, their sound
+ *  on A1 — the length at which a lane draws only the clips in view (`timeline-cull.ts`). */
+function wantsLongCut(): number {
+	if (typeof window === 'undefined') return 0;
+	const n = Number(new URLSearchParams(window.location.search).get('long'));
+	return Number.isFinite(n) ? Math.min(Math.max(0, Math.floor(n)), 5000) : 0;
+}
+
+const longCut = wantsLongCut();
+if (longCut > 0 && sampleAssets.length > 0) {
+	const piece = (kind: 'v' | 'a', i: number) => ({
+		id: `${kind}${i}`,
+		asset_id: sampleAssets[0].id,
+		source_in: i % 110,
+		source_out: (i % 110) + 1,
+		timeline_start: i,
+		volume: 1,
+		fade_in: 0,
+		fade_out: 0
+	});
+	const pieces = (kind: 'v' | 'a') => Array.from({ length: longCut }, (_, i) => piece(kind, i));
+	devTimeline = {
+		tracks: [
+			{ id: 'v1', kind: 'video', name: 'V1', clips: pieces('v') },
+			{ id: 'a1', kind: 'audio', name: 'A1', clips: pieces('a') }
+		]
+	};
+	devHistory = [{ seq: 0, label: 'Initial state', source: 'system', snapshot: structuredClone(devTimeline), created_at: now() }];
+}
+
 /** Append a snapshot of the current dev timeline, dropping any redo branch. */
 function recordDev(label: string) {
 	devHistory = devHistory.slice(0, devHead + 1);

@@ -6,6 +6,7 @@
 	import ClipOverlays from './ClipOverlays.svelte';
 	import ClipFilmstrip from './ClipFilmstrip.svelte';
 	import ClipWaveform from './ClipWaveform.svelte';
+	import LaneBlocks from './LaneBlocks.svelte';
 	import HeightGlyph from './HeightGlyph.svelte';
 	import ToolbarToggle from './ToolbarToggle.svelte';
 	import Minimap from './Minimap.svelte';
@@ -79,7 +80,7 @@
 		type Readout,
 		type TrimTool
 	} from '#lib/trim-tools';
-	import { readPalette } from '#lib/waveform-draw';
+	import { readPalette, resolveColor } from '#lib/waveform-draw';
 	import { filmstrips } from '#lib/filmstrips';
 	import {
 		HEIGHT_PRESETS,
@@ -92,6 +93,16 @@
 	} from '#lib/track-heights';
 	import { viewCoversCut, type Target } from '#lib/minimap';
 	import { visibleLaneRange } from '#lib/waveform-view';
+	import {
+		blockAt,
+		blockMark,
+		clipPadding,
+		laneDrawing,
+		mayPromote,
+		pinnedClips,
+		pressOnEmpty,
+		type LaneDrawing
+	} from '#lib/timeline-cull';
 	import { clipDuration } from '#lib/types';
 	import { barGrid, beatGrid, beatPeriod, gridMagnets, sourceToTimeline } from '#lib/beats';
 	import { NAME_CHIP_PCT, showsLabel } from '#lib/clip-label';
@@ -182,6 +193,8 @@
 	const hasLinkedClips = $derived(editor.timeline.tracks.some((t) => t.clips.some((c) => c.link_id)));
 	/** The clip under the pointer, so its partners can light up. */
 	let hoverId = $state<string | null>(null);
+	/** The clip with keyboard focus: a lane that draws only what is in view keeps it in the page. */
+	let focusId = $state<string | null>(null);
 
 	/** The project timecode: what the transport, the status bar and the ruler read in. */
 	const tc = (s: number): string => timeDisplay.fmt(s);
@@ -959,6 +972,50 @@
 	/** Whether the gesture can go between tracks, and so scrolls vertically too. */
 	const gestureTall = $derived.by(() => !!(drag?.moved || marquee?.moved));
 
+	// A long lane draws the clips in (or near) view, and the narrow ones among them as blocks on one
+	// canvas (`timeline-cull.ts`, `LaneBlocks.svelte`). What the pointer or the keyboard holds is a clip
+	// wherever it is — the pressed clip, the one under the pointer, the focused and the nudged one;
+	// what a gesture only moves is drawn from the model (the ghosts), so it is not kept.
+	const pinned = $derived.by(() =>
+		pinnedClips({
+			pressed: [
+				drag?.clipId,
+				trimDrag?.clipId,
+				tg?.edit?.tool === 'roll' ? tg.edit.a : tg?.edit?.clipId,
+				tg?.edit?.tool === 'roll' ? tg.edit.b : null
+			],
+			hovered: hoverId,
+			focused: focusId,
+			nudged: nudge?.clipId
+		})
+	);
+	const laneDrawings = $derived.by(() => {
+		const m = new Map<string, LaneDrawing<Clip>>();
+		for (const t of drawn) m.set(t.id, laneDrawing(t.clips, clipDuration, pxPerSec, viewLo, viewHi, pinned));
+		return m;
+	});
+	/** What a block shows of its clip: the selection, a proposal's marks, a hovered clip's partners. */
+	const markOf = (c: Clip) =>
+		blockMark(c.id, { selected: editor.selectedSet, diff: diff?.clips, touched: touched?.clips, lit: hoverPartners });
+	/** A block moved by the gesture under way, faded as its button would be. */
+	const movedBlock = (id: string) =>
+		((drag?.moved || !!nudge) && dragIds.has(id)) || !!trimView?.shifted.has(id) || (!!tg?.moved && slidPartners.has(id));
+	/** A track's clip colours as a canvas takes them, once per theme change. */
+	const blockColors = $derived.by(() => {
+		void settings.theme;
+		return {
+			video: { fill: resolveColor('--track-video'), edge: resolveColor('--track-video-edge') },
+			audio: { fill: resolveColor('--track-audio'), edge: resolveColor('--track-audio-edge') },
+			marks: {
+				selected: resolveColor('--kerf-400'),
+				added: resolveColor('--diff-add'),
+				shifted: resolveColor('--diff-shift'),
+				touched: resolveColor('--agent-400'),
+				lit: resolveColor('--kerf-300')
+			}
+		};
+	});
+
 	/** How far right the gesture has reached, seconds — what widens the lane. */
 	const gestureEnd = $derived.by((): number | null => {
 		if ((drag?.moved || nudge) && dragPlan) return Math.max(...dragPlan.ghosts.map((g) => g.start + g.dur));
@@ -1636,11 +1693,13 @@
 		);
 	}
 
-	function onCanvasPointerDown(e: PointerEvent, from: 'lane' | 'canvas') {
+	function onCanvasPointerDown(e: PointerEvent, from: 'lane' | 'canvas', blocks: readonly Clip[] = []) {
 		swallowClick = false;
 		// Only a press on the empty surface itself: a clip, a title, the ruler, a
-		// marker all have their own gestures and are children of what this is on.
-		if (e.button !== 0 || ui.tool !== 'pointer' || e.target !== e.currentTarget) return;
+		// marker all have their own gestures and are children of what this is on. A lane's block
+		// canvas is empty surface where it draws no block.
+		const empty = pressOnEmpty(e.target, e.currentTarget, () => !!blockAt(blocks, clipDuration, pxPerSec, viewLo + e.offsetX));
+		if (e.button !== 0 || ui.tool !== 'pointer' || !empty) return;
 		const box = lanesEl?.getBoundingClientRect();
 		if (!box) return;
 		const x = e.clientX - box.left;
@@ -3425,7 +3484,7 @@
 					data-kind={t.kind}
 					data-locked={t.locked ? '' : undefined}
 					onclick={onLaneSeek}
-					onpointerdown={(e) => onCanvasPointerDown(e, 'lane')}
+					onpointerdown={(e) => onCanvasPointerDown(e, 'lane', laneDrawings.get(t.id)?.blocks)}
 					onpointermove={(e) => onLaneHover(e, t)}
 					onpointerleave={() => {
 						rollHover = null;
@@ -3483,7 +3542,33 @@
 							><Icon n="lock" s={10} /></span
 						>
 					{/if}
-					{#each t.clips as c (c.id)}
+					{#if (laneDrawings.get(t.id)?.blocks.length ?? 0) > 0}
+						<LaneBlocks
+							blocks={laneDrawings.get(t.id)?.blocks ?? []}
+							duration={clipDuration}
+							{pxPerSec}
+							lo={viewLo}
+							hi={Math.min(viewHi, laneW)}
+							{dpr}
+							fill={blockColors[t.kind === 'audio' ? 'audio' : 'video'].fill}
+							edge={blockColors[t.kind === 'audio' ? 'audio' : 'video'].edge}
+							marks={blockColors.marks}
+							mark={markOf}
+							faded={(c) => c.enabled === false || !renders(t) || movedBlock(c.id)}
+							off={(c) => c.enabled === false}
+							filter={!renders(t) ? 'grayscale(1)' : t.locked ? 'saturate(0.45)' : 'none'}
+							cursor={clipCursor(t)}
+							onhover={(e, id) => {
+								if (mayPromote(e.buttons, !!(drag || trimDrag || tg || marquee))) hoverId = id;
+							}}
+							onpress={(e, c) => {
+								hoverId = c.id;
+								onClipPointerDown(e, c, t);
+							}}
+							oncontext={(e, c) => onClipContextMenu(e, c, t)}
+						/>
+					{/if}
+					{#each laneDrawings.get(t.id)?.buttons ?? t.clips as c (c.id)}
 						{@const left = c.timeline_start * pxPerSec}
 						{@const width = Math.max(6, clipDuration(c) * pxPerSec)}
 						{@const selected = editor.isSelected(c.id)}
@@ -3517,7 +3602,9 @@
 							data-title-clip={title ? '' : undefined}
 							onpointerdown={(e) => onClipPointerDown(e, c, t)}
 							onkeydown={(e) => onClipKey(e, c, t)}
+							onfocus={() => (focusId = c.id)}
 							onblur={() => {
+								focusId = focusId === c.id ? null : focusId;
 								// Focus moving on writes the run; the window losing it (alt-tab) gives it up, as every gesture does.
 								if (nudge?.clipId === c.id) documentOf(scroller).hasFocus() ? commitNudge() : abandonNudge();
 							}}
@@ -3537,7 +3624,7 @@
 									void editor.select(c.asset_id);
 								}
 							}}
-							style="--bw:{selected ? 'var(--line-emphasis)' : 'var(--line-width)'};position:absolute;left:{left}px;top:5px;height:calc(100% - 10px);width:{width}px;border-radius:2px;overflow:clip;display:flex;align-items:center;padding:0 7px;touch-action:none;filter:{off
+							style="--bw:{selected ? 'var(--line-emphasis)' : 'var(--line-width)'};position:absolute;left:{left}px;top:5px;height:calc(100% - 10px);width:{width}px;border-radius:2px;overflow:clip;display:flex;align-items:center;padding:0 {clipPadding(width)}px;touch-action:none;filter:{off
 								? 'grayscale(1)'
 								: t.locked
 									? 'saturate(0.45)'
