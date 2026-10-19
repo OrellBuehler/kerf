@@ -11,7 +11,7 @@ Windows) and nothing may depend on an optional wgpu feature. **A GPU failure is 
 error, not a panic**: every unit of wgpu work runs in out-of-memory / validation /
 internal error scopes (`Gpu::guarded`), anything uncaptured is logged and remembered,
 `Compositor::new` and `composite` return `Result` (and `Compositor::caps()` says what it
-draws, `GpuCaps::A0` plus `text`, `motion`, `fades`, `transitions`, `dip_white`, `keyed_zoom`, `mask` and the blur / sharpen / grayscale / invert `effects` today, which `composite` / `render_plan` judge the plan by), and a lost device is tracked — every
+draws, `GpuCaps::A0` plus `text`, `motion`, `fades`, `transitions`, `dip_white`, `keyed_zoom`, `mask` and the blur / sharpen / grayscale / invert / vignette `effects` today, which `composite` / `render_plan` judge the plan by), and a lost device is tracked — every
 later call is `GpuError::DeviceLost` and the **owner builds a new `Gpu` and
 `Compositor`** (the device is not recreated behind the caller's back).
 
@@ -652,8 +652,19 @@ before the zoom acts at the **fit size** and the zoom magnifies it (a blur grows
   then `postscale`, clip and `lrintf`, each plane at its own size. It is **not bit-exact and cannot be**: FFmpeg's x86 build runs the horizontal pass
   in AVX2 / AVX-512 with another association of the same sums and an FMA, so its answer depends on the CPU by the last bits of a `float`, which `lrintf`
   turns into a level where a value sits on a half. Measured on 9.0.2: 0 to 59 samples in 3.2 million a level off, none more.
-* Refused (`Effects`): a vignette (its dither is an LCG counter that runs on across frames), a chroma key (a float colour distance), a sigma outside 0 to 1024
-  or an amount outside -2 to 5 (FFmpeg's options refuse them too), a blur over the device's storage-buffer limit, and a **sharpen that amplifies a difference upstream of it** (judged with the geometry, so by render size): FFmpeg's scale or blur is a level from ours, and `unsharp` carries it through at worst `1 + 2|amount|` at an edge sample and rounds up a level more with each further sharpen (its `>> 16` floors). From the first source (a scale before the effects: every stage, or the fit scale when a zoom comes last; or a blur with sigma > 0) the worst case starts at 1 and each later sharpen that is not zero at `unsharp`'s 16 bits adds `ceil(2 * err * |amount|)`; the frame is refused when it passes 2. So one sharpen of at most 0.5 is drawn (0.6 is not), and any second one is refused, however small. With no source upstream a sharpen is exact at any amount, chained or not, and a blur after it counts for nothing. `Matte`: a blur or a sharpen on a
+* **Vignette** is `vignette` with its defaults (`vignette.wgsl`, `effects.rs`): a factor per luma sample, `cos(angle * d / dmax)^4` in `double` stored
+  as `float` (each axis offset truncated to an integer; the angle is `PI/5` **as a `float`**: `av_clipf` clips it, and the `double` angle puts the
+  factor a `float` step high on some samples, a level where the sum sits a few millionths over an integer: 7 samples in 3.5 million, found by the
+  Motion harness); luma `(int)(f * s + dither)`, chroma `(int)(f * (s - 127) + 127 + dither)` with its block's top-left factor. The `float` products and
+  sum are done in integers (no backend's FMA contraction can move a level), the map is a storage buffer made once per size. The **dither is an LCG that
+  runs on across frames** (one step per sample, Y then U then V): sample `i` of the chain's `n`th frame is state `n * (w*h + 2*cw*ch) + i`, jumped to
+  per sample (`lcg_at`). A still plan's `n` is 0 (the still graph runs one frame through the chain); an export frame's is its clip's
+  (`Pick::output_index`, counted by its `FrameCursor`: `FrameCursor::count`, `MotionFrames::counts`, passed by `render_motion_texture` and
+  `composite_counted` / `composite_yuv_counted`; without it the frame is `Unsupported`). Byte for byte, still and export, every frame (the late start,
+  speed, reverse and dissolve cases included).
+* Refused (`Effects`): a chroma key (a float colour distance), a vignette on a picture that is not limited-range `yuv420p` (FFmpeg vignettes it in its
+  own format: other planes, another dither course), a vignette map over the device's storage-buffer limit, a sigma outside 0 to 1024
+  or an amount outside -2 to 5 (FFmpeg's options refuse them too), a blur over the device's storage-buffer limit, and a **sharpen that amplifies a difference upstream of it** (judged with the geometry, so by render size): FFmpeg's scale or blur is a level from ours, and `unsharp` carries it through at worst `1 + 2|amount|` at an edge sample and rounds up a level more with each further sharpen (its `>> 16` floors). From the first source (a scale before the effects: every stage, or the fit scale when a zoom comes last; or a blur with sigma > 0) the worst case starts at 1 and each later sharpen that is not zero at `unsharp`'s 16 bits adds `ceil(2 * err * |amount|)`; the frame is refused when it passes 2. So one sharpen of at most 0.5 is drawn (0.6 is not), and any second one is refused, however small. With no source upstream a sharpen is exact at any amount, chained or not, and a blur after it counts for nothing. `Matte`: a blur, a sharpen or a vignette on a
   letterbox (they would see the bars as picture; tables and a grade carry the bars through). By the picture (`effect_on_picture_refusal`): an invert,
   blur or sharpen on a **full-range** picture or one whose format was never recorded (`maybe_full_range_in(policy)`: where FFmpeg 9 negotiates the range this
   holds a deeper-than-8-bit one too, which may carry a `pc` tag; FFmpeg runs the filter on the raw values and converts the range afterwards: an invert is 8
@@ -690,8 +701,8 @@ a dissolve, dip, slide or push into a zooming clip and out of one) hold the boun
 
 | Bound (Y / UV) | Cases | Why |
 | --- | --- | --- |
-| 0 | a mask at the picture's size (20 of 27 mask rows), grayscale, invert, sharpen at the picture's size | integer arithmetic, reproduced |
-| 1 (`SCALED`) | a layer the compositor scales, a mask on it, a one-stage zoom | swscale's x86 scaler is not bit-exact with the C arithmetic the shader follows |
+| 0 | a mask at the picture's size (20 of 27 mask rows), grayscale, invert, sharpen, a vignette at the picture's size (every frame of the run) | integer arithmetic, reproduced |
+| 1 (`SCALED`) | a layer the compositor scales, a mask or a vignette on it, a one-stage zoom | swscale's x86 scaler is not bit-exact with the C arithmetic the shader follows |
 | 1 (`EFFECT`) | a blur at the picture's size | `gblur`'s SIMD summation order (above) |
 | 2 | a layer the compositor scales *and* makes translucent, no effect (`tests/playback.rs`, `play/pip/translucent and scaled`, measured Y 2 / UV 2 on both FFmpegs); `EFFECT_SCALED`: a blur, grayscale or invert on a scaled or translucent layer; a blur then a sharpen of at most 0.5 even unscaled and opaque (the blur's level times the gain); a sharpen of at most 0.5 after a scale. `CASCADED`: a zoom (the fit scale, then the zoom's). `ZOOMED_MASK`: a soft mask edge on a zoomed picture. Rotated, graded and scaled, dip to white (Y three on BT.709, `WHITE_709`) | two of the causes above on one sample; the RGB kernel for white |
 
@@ -739,9 +750,9 @@ the **unmeasured-policy** case (`Unknown`: BT.601 stacks drawn, BT.709 / BT.2020
 the **full-range grading** cases (a graded `yuvj` clip, and a graded layer in a stack with
 one, refused; ungraded and limited-range controls drawn),
 and **refusals** (an EXIF-oriented JPEG, FFV1 `yuva420p`, the same with the pixel
-format unrecorded, a translucent odd layer, a moving zoom behind a rotation, an opacity below 1 or a dip to white, a vignette, a chroma key, a mask on a rotated or a translucent layer, a blur on a letterbox, an invert / blur / sharpen on a full-range picture, an invert on a gray one) —
+format unrecorded, a translucent odd layer, a moving zoom behind a rotation, an opacity below 1 or a dip to white, a vignette on a 4:4:4 picture or a letterbox, a chroma key, a mask on a rotated or a translucent layer, a blur on a letterbox, an invert / blur / sharpen on a full-range picture, an invert on a gray one) —
 each of which FFmpeg still renders (and a fade to black or white on a translucent layer, a dip to white on a rotated, letterboxed, odd, resized or non-`yuv420p` layer or beside a black fade, a fade on a full-range picture under FFmpeg 9), **transitions** (`transition/`, `transition-kind/`, `fade/`: every kind and a clip's own fades in a still, see
-above), **a moving zoom last, masks and effects** (`zoom/`, `zoom+mask/`, `mask/`, `effect/`, and `effect-planes/`: the blur, sharpen and tables plane by plane against the real filters, all sizes), and **text** (the `text/` family: the app's title and
+above), **a moving zoom last, masks and effects** (`zoom/`, `zoom+mask/`, `mask/`, `effect/`, and `effect-planes/`: the blur, sharpen, tables and vignette plane by plane against the real filters, all sizes), and **text** (the `text/` family: the app's title and
 caption styles, positions and edges, boxes, colours, sizes, keyframed and overlapping overlays, escapes, installed fonts,
 over every kind of picture, with no layer, and the text it must refuse, each held to the same picture without the text; see
 "Text" above). The table

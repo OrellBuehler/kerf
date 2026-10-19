@@ -382,26 +382,45 @@ fn slots_through(n: usize, k: i64, slot: impl Fn(usize) -> i64) -> usize {
 ///
 /// Binary searches only: `O(log n)` in the frames of the file, whatever the window.
 pub fn fps_pick(pick: &FpsPick, src: &SourceFrames) -> Option<usize> {
-    // A still's loop: `-t` keeps the frames before `end` (at least one), and the next one is
-    // the frame that ended the input.
-    let still = pick.image.map(|rate| {
-        let time_base = Rational {
-            num: rate.den,
-            den: rate.num,
-        };
-        let secs = pick.window.1.max(f64::from(rate.den) / f64::from(rate.num));
-        Frames::Still {
-            len: usize::try_from(ticks(parse_micros(secs), time_base)).unwrap_or(0) + 1,
-            time_base,
-        }
-    });
-    let frames = still.unwrap_or(Frames::File(src));
+    let frames = frames_of(pick, src);
     let run = run(pick, &frames)?;
     match place(pick, &frames, &run) {
         // A still has one picture, whichever of its copies it is.
         Placed::At(i) => Some(if pick.image.is_some() { 0 } else { i }),
         Placed::Early | Placed::Late => None,
     }
+}
+
+/// The frames a pick is made over: `src`, or, for a still image, its loop: `-t` keeps the frames
+/// before `end` (at least one), and the next one is the frame that ended the input.
+fn frames_of<'a>(pick: &FpsPick, src: &'a SourceFrames<'a>) -> Frames<'a> {
+    match pick.image {
+        Some(rate) => {
+            let time_base = Rational {
+                num: rate.den,
+                den: rate.num,
+            };
+            let secs = pick.window.1.max(f64::from(rate.den) / f64::from(rate.num));
+            Frames::Still {
+                len: usize::try_from(ticks(parse_micros(secs), time_base)).unwrap_or(0) + 1,
+                time_base,
+            }
+        }
+        None => Frames::File(src),
+    }
+}
+
+/// How many frames the clip's chain has passed on from its `fps` filter before output frame
+/// `pick.frame`: the frame's index in the clip's own output, counted from the first frame's slot
+/// (`fps` puts out a frame for every slot from there on). What a filter after `fps` that keeps a
+/// count across frames (`vignette`'s dither) has seen of the clip. `None` before the first frame's
+/// slot, and where the pick has no stream (a speed that is not a positive number).
+fn fps_output_index(pick: &FpsPick, src: &SourceFrames) -> Option<u64> {
+    let frames = frames_of(pick, src);
+    let run = run(pick, &frames)?;
+    let first = run.slot(frames.pts(run.kept.start) - run.shift);
+    let k = i64::try_from(pick.frame).ok()?;
+    u64::try_from(k.checked_sub(first)?).ok()
 }
 
 /// Where an output frame falls in a run's stream.
@@ -504,6 +523,19 @@ impl Pick {
                 }
             }
             Pick::Fps(p) => fps_progress(&p, read, eof),
+        }
+    }
+
+    /// How many frames of the clip the layer's chain has passed on before the one this pick shows,
+    /// over the frames `read` (a cursor's, or the file's): for an export frame ([`Pick::Fps`]) its
+    /// index in the clip's `fps` output, counted from the slot of the window's first frame, which
+    /// `read` must hold (a cursor reads it before anything is decided, `STARTPTS`); for a still's
+    /// pick 0, as the still graph runs the one frame it shows through the chain. `None` where the
+    /// clip has put out nothing by then (no frame is shown).
+    pub fn output_index(&self, read: &SourceFrames) -> Option<u64> {
+        match self {
+            Pick::AtOrAfter(_) | Pick::Before(_) => Some(0),
+            Pick::Fps(p) => fps_output_index(p, read),
         }
     }
 }
@@ -678,6 +710,58 @@ mod tests {
         assert_eq!(&drawn[..4], &[None; 4]);
         assert_eq!(&drawn[4..10], &[Some(2), Some(3), Some(4), Some(5), Some(6), Some(7)]);
         assert_eq!(&drawn[10..], &[None; 6]);
+    }
+
+    #[test]
+    fn a_clips_output_is_counted_from_its_first_frames_slot_whatever_the_speed_and_direction() {
+        let pts = frames(12, 1024);
+        let src = SourceFrames {
+            pts: &pts,
+            time_base: TB10,
+            start_us: 0,
+            last_duration: 0,
+        };
+        let index = |p: &FpsPick| -> Vec<Option<u64>> {
+            (0..16)
+                .map(|k| Pick::Fps(FpsPick { frame: k, ..*p }).output_index(&src))
+                .collect()
+        };
+        // Placed at 0.4 s: slots 4..=9 are its frames 0..=5, and nothing before its first slot.
+        let placed = index(&pick((0.2, 0.8), 0.4, 1.0, false, (10, 1), 0));
+        assert_eq!(&placed[..4], &[None; 4]);
+        assert_eq!(placed[4..10], [0, 1, 2, 3, 4, 5].map(Some));
+        // Every slot from the first is a frame of the clip's output, held, dropped or reversed alike
+        // (`fps` repeats or skips source frames to fill them).
+        for p in [
+            pick((0.2, 0.8), 0.0, 0.5, false, (10, 1), 0),
+            pick((0.2, 0.8), 0.0, 2.0, false, (10, 1), 0),
+            pick((0.2, 0.8), 0.0, 1.0, true, (10, 1), 0),
+        ] {
+            let got = index(&p);
+            assert_eq!(&got[..4], [0, 1, 2, 3].map(Some), "{p:?}");
+        }
+        // A still image's loop is counted the same way, from the first slot it draws (0.3 s / tick is
+        // truncated to 2 by `setpts`).
+        let mut image = pick((0.0, 1.0), 0.3, 1.0, false, (10, 1), 0);
+        image.image = Some(Rational::new(10, 1).unwrap());
+        let first = (0..16)
+            .find(|&k| fps_pick(&FpsPick { frame: k, ..image }, &src).is_some())
+            .expect("drawn");
+        let still = index(&image);
+        assert!(still[..first as usize].iter().all(Option::is_none));
+        assert_eq!(still[first as usize..first as usize + 3], [0, 1, 2].map(Some));
+        // What a cursor has read is enough once it holds the window's first frame.
+        let read = SourceFrames {
+            pts: &pts[..5],
+            time_base: TB10,
+            start_us: 0,
+            last_duration: 0,
+        };
+        let p = Pick::Fps(pick((0.2, 0.8), 0.4, 1.0, false, (10, 1), 6));
+        assert_eq!(p.output_index(&read), p.output_index(&src));
+        assert_eq!(p.output_index(&src), Some(2));
+        // A still's pick runs one frame through its graph.
+        assert_eq!(Pick::AtOrAfter(1.5).output_index(&src), Some(0));
     }
 
     #[test]

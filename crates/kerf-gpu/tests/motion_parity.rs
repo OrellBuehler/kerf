@@ -492,11 +492,18 @@ fn planes_of(f: &YuvFrame) -> [&[u8]; 3] {
 }
 
 /// A `FFmpeg | GPU | diff x8` strip of one frame.
-fn montage(case: &str, k: u64, played: &Played, plan: &kerf_core::RenderPlan, frames: &[Option<Arc<YuvFrame>>]) {
+fn montage(
+    case: &str,
+    k: u64,
+    played: &Played,
+    plan: &kerf_core::RenderPlan,
+    frames: &[Option<Arc<YuvFrame>>],
+    counts: &[Option<u64>],
+) {
     let (w, h) = (played.w, played.h);
     let reference = played.rgb(k as usize);
     let gpu = compositor()
-        .composite_shared(plan, frames, (w as u32, h as u32))
+        .composite_counted(plan, frames, counts, (w as u32, h as u32))
         .expect("the GPU's RGB");
     let gpu_rgb: Vec<u8> = gpu.data.as_chunks::<4>().0.iter().flat_map(|p| [p[0], p[1], p[2]]).collect();
     let mut strip = Vec::with_capacity(w * h * 9);
@@ -647,7 +654,7 @@ fn check_motion(check: Check) -> (i32, i32) {
         layers_seen = layers_seen.max(plan.layers.len());
         let picture = motion.frames(&plan).unwrap_or_else(|e| panic!("{case}: frame {k}: {e}"));
         let drawn = compositor()
-            .composite_yuv_shared(&plan, &picture, size)
+            .composite_yuv_counted(&plan, &picture, motion.counts(), size)
             .unwrap_or_else(|e| panic!("{case}: frame {k}: {e}"));
         let want = played.planes(k as usize);
         let got = planes_of(&drawn);
@@ -691,7 +698,7 @@ fn check_motion(check: Check) -> (i32, i32) {
             || !worst.is_empty() && worst.last().is_some_and(|w| w.0 == k)
             || std::env::var_os("KERF_PARITY_KEEP").is_some()
         {
-            montage(case, k, &played, &plan, &picture);
+            montage(case, k, &played, &plan, &picture, motion.counts());
         }
     }
     let uv = {
@@ -2293,6 +2300,7 @@ fn what_is_ahead_of_a_moving_zoom_is_drawn_at_the_fit_size_and_magnified() {
         ("sharpen", kerf_core::VideoEffect::Sharpen { amount: 1.5 }, SCALED),
         ("grayscale", kerf_core::VideoEffect::Grayscale, SCALED),
         ("invert", kerf_core::VideoEffect::Invert, SCALED),
+        ("vignette", kerf_core::VideoEffect::Vignette, SCALED),
     ] {
         let tl = with(&|c| c.effects = vec![effect.clone()]);
         run_zoom(&format!("zoom+{name}"), &tl, &assets, limits);
@@ -2723,6 +2731,10 @@ fn effects_are_drawn_as_their_filters_draw_them() {
             vec![E::Sharpen { amount: 1.0 }, E::Grayscale, E::Blur { sigma: 2.0 }, E::Invert],
             EFFECT,
         ),
+        // A vignette is exact: its dither runs on from the clip's first frame, which the cursor counts.
+        ("vignette", vec![E::Vignette], EXACT),
+        ("gray, vignette, invert", vec![E::Grayscale, E::Vignette, E::Invert], EXACT),
+        ("blur then vignette", vec![E::Blur { sigma: 2.0 }, E::Vignette], EFFECT),
     ] {
         let (tl, assets) = over_bars(m, &|c| c.effects = effects.clone());
         run(&format!("effect/{name}"), &tl, &assets, 30.0, 0.5, limits);
@@ -2778,6 +2790,72 @@ fn effects_are_drawn_as_their_filters_draw_them() {
         c.effects = vec![E::Blur { sigma: 2.0 }, E::Sharpen { amount: 0.5 }];
     });
     run("effect/odd 211x118", &tl, &assets, 30.0, 0.5, EFFECT_SCALED);
+    // A vignette's dither is the clip's own run: counted from its first output frame, whatever the clip's
+    // place on the timeline, its speed or direction, and with the frames of a transition counted in it.
+    let vignetted = |edit: &dyn Fn(&mut Clip)| {
+        let mut c = clip(&m.testsrc, 0.5, 1.5, 0.0);
+        c.effects = vec![E::Vignette];
+        edit(&mut c);
+        c
+    };
+    let (tl, assets) = over_bars(m, &|c| {
+        c.transform.scale = 0.6;
+        c.transform.pos_x = 0.15;
+        c.effects = vec![E::Vignette];
+    });
+    run("effect/vignette on a pip", &tl, &assets, 30.0, 0.5, SCALED);
+    let (tl, assets) = over_bars(m, &|c| {
+        c.transform.scale = 0.33;
+        c.effects = vec![E::Vignette];
+    });
+    run("effect/vignette odd 211x118", &tl, &assets, 30.0, 0.5, SCALED);
+    let late = vignetted(&|c| c.timeline_start = 0.5);
+    check_motion(Check {
+        case: "effect/vignette late start",
+        tl: &timeline(vec![vec![late]], None),
+        assets: std::slice::from_ref(&m.testsrc),
+        opts: at_fps(30.0),
+        frames: 15..44,
+        limits: EXACT,
+        look: &[],
+        rotated: false,
+        refusing: None,
+    });
+    for (name, speed) in [("speed 2", 2.0), ("speed 0.5", 0.5), ("reversed", -1.0)] {
+        let c = vignetted(&|c| {
+            c.source_out = 2.5;
+            c.speed = speed;
+        });
+        check_motion(Check {
+            case: &format!("effect/vignette {name}"),
+            tl: &timeline(vec![vec![c]], None),
+            assets: std::slice::from_ref(&m.testsrc),
+            opts: at_fps(30.0),
+            frames: 0..20,
+            limits: EXACT,
+            look: &[],
+            rotated: false,
+            refusing: None,
+        });
+    }
+    let out = vignetted(&|_| {});
+    let inc = {
+        let mut c = clip(&m.bars, 0.5, 1.5, 1.0);
+        c.effects = vec![E::Vignette];
+        c.transition_in = Some(Transition {
+            kind: TransitionKind::Crossfade,
+            duration: 0.5,
+        });
+        c
+    };
+    run(
+        "effect/vignette dissolve",
+        &timeline(vec![vec![out, inc]], None),
+        &[m.testsrc.clone(), m.bars.clone()],
+        30.0,
+        2.0,
+        EXACT,
+    );
     // A sharpen after a scale, up to half strength: the scaler's level through the filter's gain (2).
     for (name, effects) in [
         ("sharpen 0.5", vec![E::Sharpen { amount: 0.5 }]),

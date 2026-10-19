@@ -712,7 +712,7 @@ fn effect_refusal(effect: &VideoEffect, caps: &GpuCaps) -> Option<&'static str> 
             VideoEffect::Sharpen { .. } => "a sharpen",
             VideoEffect::Grayscale => "grayscale",
             VideoEffect::Invert => "invert",
-            VideoEffect::Vignette => "a vignette, whose dither is a counter that runs on from one frame to the next",
+            VideoEffect::Vignette => "a vignette",
             VideoEffect::ChromaKey { .. } => "a chroma key, whose alpha is a float colour distance",
         });
     }
@@ -747,6 +747,13 @@ fn effect_on_picture_refusal(effect: &VideoEffect, stream: &PlanStream, policy: 
         }
         VideoEffect::Invert if stream.layout() == Some(PixLayout::Gray) => {
             Some("an invert on a gray picture (FFmpeg negates its luma only)")
+        }
+        // `vignette` works on the picture in its own format: another layout has other planes (and its dither,
+        // one step per sample, runs another course), RGB another arithmetic, a deeper one another range.
+        VideoEffect::Vignette
+            if stream.pix_fmt.as_deref() != Some("yuv420p") || stream.maybe_full_range_in(policy) =>
+        {
+            Some("a vignette on a picture that is not 8-bit 4:2:0 yuv420p (FFmpeg vignettes it in its own format)")
         }
         _ => None,
     }
@@ -794,6 +801,7 @@ impl RenderPlan {
                 if let Some(what) = layer.effects.iter().find_map(|e| match e {
                     VideoEffect::Blur { .. } => Some("a blur"),
                     VideoEffect::Sharpen { .. } => Some("a sharpen"),
+                    VideoEffect::Vignette => Some("a vignette"),
                     _ => None,
                 }) {
                     reasons.push(Unsupported::Matte(self.layer_ref(n, layer), what));
@@ -2518,6 +2526,64 @@ mod tests {
             "{why:?}"
         );
         assert!(letterboxed(&|c| c.effects = vec![VideoEffect::Invert, VideoEffect::Grayscale]).is_empty());
+    }
+
+    #[test]
+    fn a_vignette_is_drawn_on_a_yuv420p_picture_and_refused_on_a_letterbox_or_any_other_format() {
+        let caps = GpuCaps {
+            effects: EffectKinds::ALL,
+            ..GpuCaps::A0
+        };
+        let vignette = |c: &mut Clip| c.effects = vec![VideoEffect::Grayscale, VideoEffect::Vignette];
+        let of = |pix_fmt: Option<&str>| {
+            let mut stream = video(640, 360);
+            stream.pix_fmt = pix_fmt.map(str::to_string);
+            let plan = fading_plan_of(stream, None, CompositeColorPolicy::FixedBt601, vignette, 0.5);
+            plan.reasons(&caps, plan.size(u32::MAX))
+        };
+        assert_eq!(of(Some("yuv420p")), vec![]);
+        for other in [
+            Some("yuvj420p"),
+            Some("yuv422p"),
+            Some("yuv420p10le"),
+            Some("gray"),
+            Some("rgb24"),
+            None,
+        ] {
+            let why = of(other);
+            assert!(
+                why.iter()
+                    .any(|u| matches!(u, Unsupported::Effects(_, w) if w.contains("vignette"))),
+                "{other:?}: {why:?}"
+            );
+        }
+        // On a letterbox `vignette` sees the padded frame, bars included.
+        let a = asset("a", 20.0, vec![video(640, 360)]);
+        let mut clip = Clip::new(a.id, 0.0, 10.0, 0.0);
+        vignette(&mut clip);
+        let mut tl = timeline(vec![vec![clip]]);
+        tl.format = Some(crate::model::Delivery::new(360, 640, Fit::Contain));
+        let planned = plan(&tl, std::slice::from_ref(&a), 0.5);
+        let why = planned.reasons(&caps, planned.size(u32::MAX));
+        assert!(
+            matches!(why.as_slice(), [Unsupported::Matte(_, w)] if w.contains("vignette")),
+            "{why:?}"
+        );
+        // Without the kind, it is refused as before.
+        let without = GpuCaps {
+            effects: EffectKinds::BLUR
+                .union(EffectKinds::SHARPEN)
+                .union(EffectKinds::GRAYSCALE)
+                .union(EffectKinds::INVERT),
+            ..GpuCaps::A0
+        };
+        let plan = fading_plan(vignette, 0.5);
+        let why = plan.reasons(&without, plan.size(u32::MAX));
+        assert!(
+            why.iter()
+                .any(|u| matches!(u, Unsupported::Effects(_, w) if w.contains("vignette"))),
+            "{why:?}"
+        );
     }
 
     #[test]

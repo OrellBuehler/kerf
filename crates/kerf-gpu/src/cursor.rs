@@ -112,6 +112,8 @@ pub struct FrameCursor {
     frame_bytes: usize,
     eof: bool,
     config: CursorConfig,
+    /// The last pick's [`Pick::output_index`].
+    count: Option<u64>,
 }
 
 impl FrameCursor {
@@ -198,6 +200,7 @@ impl FrameCursor {
             frame_bytes: yuv420p_len(w, h).unwrap_or(0),
             eof: false,
             config,
+            count: None,
         })
     }
 
@@ -209,6 +212,13 @@ impl FrameCursor {
     /// Frames whose pixels are held.
     pub fn frames_held(&self) -> usize {
         self.pixels.len()
+    }
+
+    /// How many frames the clip's chain had passed on before the last pick's ([`Pick::output_index`]):
+    /// where a filter that counts frames (`vignette`'s dither) is in its run. `None` before a pick, or
+    /// where the clip has put out nothing.
+    pub fn count(&self) -> Option<u64> {
+        self.count
     }
 
     /// The frame `pick` shows (`None`: nothing is drawn). Picks come in output order.
@@ -230,6 +240,14 @@ impl FrameCursor {
             };
             match progress {
                 PickProgress::Ready { shown, keep_from } => {
+                    self.count = self.time_base.and_then(|time_base| {
+                        pick.output_index(&SourceFrames {
+                            pts: &self.pts,
+                            time_base,
+                            start_us: 0,
+                            last_duration: if self.eof { self.last_duration } else { 0 },
+                        })
+                    });
                     let frame = match shown {
                         None => None,
                         Some(i) => Some(self.held(i)?),
