@@ -4597,6 +4597,18 @@ export async function getPreviewFrame(
 					play: null
 				};
 			}
+			// A play the stream took over is taken back at once under `?gpuplay=ahead` (and draws two more seconds).
+			if (play?.ready) {
+				return mode === 'ahead'
+					? {
+							renderer: 'ready',
+							frame: null,
+							reasons: [],
+							timings: null,
+							play: { session: play.session, start: timeSecs, frame: 0, repeat: false, ahead: null, resume: timeSecs }
+						}
+					: { renderer: 'stream', frame: null, reasons: ['the browser harness does not take a play back'], timings: null, play: null };
+			}
 			if (play) harnessPlayStart.set(play.session, harnessPlayStart.get(play.session) ?? timeSecs);
 			const began = play ? (harnessPlayStart.get(play.session) ?? timeSecs) : 0;
 			const stops = began + 2;
@@ -4648,7 +4660,7 @@ export async function getPreviewFrame(
 		overlays,
 		client: order?.client,
 		seq: order?.seq,
-		hint: play ? 'forward' : undefined,
+		hint: play ? (play.ready ? 'ready' : 'forward') : undefined,
 		session: play?.session,
 		draft: play ? undefined : (draft ?? undefined)
 	});

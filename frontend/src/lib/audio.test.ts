@@ -270,10 +270,243 @@ describe('a bus per track that plays sound', () => {
 		// track is another kind and plays.
 		expect([...engine.meters()!.tracks.keys()]).toEqual(['v1', 'a1']);
 	});
+});
 
-	test('a reverse shuttle plays nothing', async () => {
-		await play({ tracks: [track('a1', 'audio', [clip('c', 'voice')])] }, 0, -1);
+// ---- reverse shuttle ---------------------------------------------------------
+
+describe('reverse shuttle', () => {
+	/** The preview's decode rate (`audio.ts`). */
+	const RATE = 32000;
+
+	/** An engine whose fetch answers each window with a ramp that names its samples — the `i`-th of
+	 *  the window is `i + 1` — so what plays can be read back as the source time it came from; `kept`
+	 *  of the window is answered, the way a decode ends early when the source's sound does. Records
+	 *  each window asked for. */
+	const ramped = (kept = 1) => {
+		const asked: [string, number, number][] = [];
+		const e = new AudioEngine({
+			createContext: () => ctx as unknown as AudioContext,
+			fetchPcm: (async (asset: string, start: number, dur: number) => {
+				asked.push([asset, start, dur]);
+				const n = Math.round(dur * RATE * kept);
+				return Int16Array.from({ length: n }, (_, i) => i + 1).buffer;
+			}) as never,
+			report: (m) => reported.push(m)
+		});
+		return { e, asked };
+	};
+
+	/** The source time `src` plays at offset `offset` into its buffer, read off the ramp. */
+	const heardAt = (src: FakeSource, windowStart: number, offset: number) => {
+		const data = src.buffer!.data;
+		const index = Math.min(data.length - 1, Math.round(offset * RATE));
+		return windowStart + (Math.round(data[index] * 32768) - 1) / RATE;
+	};
+
+	/** The clip gain node a source feeds. */
+	const clipGain = (src: FakeSource) => src.outs[0].to as FakeGain;
+
+	test('plays the clips behind the playhead, nearest first, each from its end at the shuttle speed', async () => {
+		const { e, asked } = ramped();
+		ctx.currentTime = 10;
+		e.start(
+			{
+				tracks: [
+					track('a1', 'audio', [
+						clip('first', 'voice', { timeline_start: 0, source_out: 0.5 }),
+						clip('second', 'music', { timeline_start: 1, source_out: 0.5 }),
+						clip('ahead', 'voice', { timeline_start: 6, source_out: 0.5 })
+					])
+				]
+			},
+			SOUND,
+			5,
+			-2
+		);
+		await settle();
+		// Only what is behind the playhead is asked for, the one it meets first first.
+		expect(asked.map(([asset]) => asset)).toEqual(['music', 'voice']);
+		const sources = ctx.of<FakeSource>('source');
+		expect(sources).toHaveLength(2);
+		// The second clip ends at 1.5 s, which a 2× backwards shuttle from 5 s reaches 1.75 s later.
+		const second = sources.find((s) => s.started[0][0] === 11.75)!;
+		expect(second.started[0][1]).toBe(0);
+		expect(second.started[0][2]).toBeCloseTo(0.5, 9);
+		expect(second.playbackRate.value).toBe(2);
+		ctx.currentTime = 10.5;
+		expect(e.clock()).toBe(4);
+	});
+
+	test('each clip is heard at the source time its timeline time maps to (offset oracle)', async () => {
+		for (const speed of [1, 2, 0.5, -1, -2])
+			for (const source_in of [0, 0.25])
+				for (const rate of [-1, -3])
+					for (const fraction of [0.1, 0.5, 0.9])
+						for (const kept of [1, 0.85]) {
+							ctx = new FakeContext();
+							const { e, asked } = ramped(kept);
+							const start = 1.5;
+							const source_out = source_in + 0.8;
+							const mag = Math.abs(speed);
+							const t = start + (0.8 / mag) * fraction;
+							const c = clip('c', 'voice', { timeline_start: start, source_in, source_out, speed });
+							e.start({ tracks: [track('a1', 'audio', [c])] }, SOUND, t, rate);
+							await settle();
+							const expected = speed > 0 ? source_in + (t - start) * mag : source_out - (t - start) * mag;
+							// A stream that ended early has nothing to say about the source past its end.
+							if (expected - asked[0][1] >= 0.8 * kept - 2 / RATE) continue;
+							const [src] = ctx.of<FakeSource>('source');
+							const label = `speed ${speed}, in ${source_in}, rate ${rate}, at ${fraction}, kept ${kept}`;
+							expect(src.started, label).toHaveLength(1);
+							expect(Math.abs(heardAt(src, asked[0][1], src.started[0][1]) - expected), label).toBeLessThan(2 / RATE);
+							expect(src.playbackRate.value, label).toBeCloseTo(mag * Math.abs(rate), 9);
+						}
+	});
+
+	test('one window is fetched once, and turned rather than held twice when the shuttle turns', async () => {
+		const { e, asked } = ramped();
+		const tl = { tracks: [track('a1', 'audio', [clip('c', 'voice', { source_out: 0.5 })])] };
+		e.start(tl, SOUND, 0.25, 1);
+		await settle();
+		e.start(tl, SOUND, 0.25, -1);
+		await settle();
+		e.start(tl, SOUND, 0.25, 1);
+		await settle();
+		expect(asked).toHaveLength(1);
+		const [forward, backward, again] = ctx.of<FakeSource>('source');
+		// The same source moment from all three: forwards from the start, backwards from the end.
+		expect(heardAt(forward, 0, forward.started[0][1])).toBeCloseTo(0.25, 4);
+		expect(heardAt(backward, 0, backward.started[0][1])).toBeCloseTo(0.25, 4);
+		expect(heardAt(again, 0, again.started[0][1])).toBeCloseTo(0.25, 4);
+	});
+
+	test('a window asked for the way round it is held is the very buffer held, not converted again', async () => {
+		const tl = { tracks: [track('a1', 'audio', [clip('c', 'voice', { source_out: 0.5 })])] };
+		for (const rate of [1, -1]) {
+			engine.start(tl, SOUND, 0.25, rate);
+			await settle();
+			engine.start(tl, SOUND, 0.25, rate);
+			await settle();
+			const [first, second] = ctx.of<FakeSource>('source').slice(-2);
+			expect(second.buffer).toBe(first.buffer);
+		}
+	});
+
+	test('past 600 s of source the window is held at the end the playhead enters by', async () => {
+		const asked: [string, number, number][] = [];
+		const e = new AudioEngine({
+			createContext: () => ctx as unknown as AudioContext,
+			fetchPcm: (async (asset: string, start: number, dur: number) => {
+				asked.push([asset, start, dur]);
+				return new Int16Array(3200).buffer;
+			}) as never,
+			report: (m) => reported.push(m)
+		});
+		const long = { tracks: [track('a1', 'audio', [clip('fwd', 'voice', { source_out: 1000 })])] };
+		const reversed = { tracks: [track('a1', 'audio', [clip('rev', 'music', { source_out: 1000, speed: -1 })])] };
+		// Forwards a clip is entered at its start: its source's start, or a reversed clip's source end.
+		e.start(long, SOUND, 1, 1);
+		await settle();
+		e.start(reversed, SOUND, 1, 1);
+		await settle();
+		// Backwards at its end: its source's end, or a reversed clip's source start.
+		e.start(long, SOUND, 999, -1);
+		await settle();
+		e.start(reversed, SOUND, 999, -1);
+		await settle();
+		expect(asked).toEqual([
+			['voice', 0, 600],
+			['music', 400, 600],
+			['voice', 400, 600],
+			['music', 0, 600]
+		]);
+	});
+
+	test('a keyed volume is met the other way round, a hold stepped from above', async () => {
+		// 0.2 held for 1 s, then 1.0.
+		const keyed = clip('c', 'voice', {
+			source_out: 2,
+			channels: [
+				{
+					prop: 'volume',
+					keys: [
+						{ time: 0, value: 0.2, easing: 'hold' },
+						{ time: 1, value: 1 }
+					]
+				}
+			]
+		});
+		await play({ tracks: [track('a1', 'audio', [keyed])] }, 2, -1);
+		const calls = clipGain(ctx.of<FakeSource>('source')[0]).gain.calls;
+		// From 2 s on the context's 0: at 1 s the ramp arrives on 1.0, steps down to the hold's
+		// 0.2, and holds it to the clip's start.
+		expect(calls.map(([kind, , at]) => [kind, at])).toEqual([
+			['set', 0],
+			['ramp', 1],
+			['set', 1],
+			['ramp', 2]
+		]);
+		expect(calls[0][1]).toBeCloseTo(1, 6);
+		expect(calls[1][1]).toBeCloseTo(1, 6);
+		expect(calls[2][1]).toBeCloseTo(0.2, 6);
+		expect(calls[3][1]).toBeCloseTo(0.2, 6);
+	});
+
+	test('a fade is met the other way round: silent at the clip’s end, up to its level at the fade’s start', async () => {
+		await play(
+			{ tracks: [track('a1', 'audio', [clip('c', 'voice', { timeline_start: 0, source_out: 4, volume: 0.5, fade_out: 1 })])] },
+			4,
+			-1
+		);
+		const [first, ...rest] = clipGain(ctx.of<FakeSource>('source')[0]).gain.calls;
+		expect(first[0]).toBe('set');
+		expect(first[1]).toBeCloseTo(0, 6);
+		expect(rest[0]).toEqual(['ramp', 0.5, 1]);
+		expect(rest.at(-1)).toEqual(['ramp', 0.5, 4]);
+	});
+
+	test('turning J into L re-anchors where the clock stands, and the backwards session is torn down', async () => {
+		const { e } = ramped();
+		const tl = { tracks: [track('a1', 'audio', [clip('c', 'voice', { source_out: 1 })])] };
+		e.start(tl, SOUND, 0.9, -1);
+		await settle();
+		const [back] = ctx.of<FakeSource>('source');
+		ctx.currentTime = 0.5;
+		const at = e.clock()!;
+		expect(at).toBeCloseTo(0.4, 9);
+		e.start(tl, SOUND, at, 1);
+		await settle();
+		expect(back.stopped).toBe(1);
+		expect(back.outs).toHaveLength(0);
+		const forward = ctx.of<FakeSource>('source').at(-1)!;
+		expect(forward.started[0][0]).toBe(0.5);
+		expect(forward.started[0][1]).toBeCloseTo(0.4, 9);
+		expect(heardAt(forward, 0, forward.started[0][1])).toBeCloseTo(0.4, 4);
+		ctx.currentTime = 1;
+		expect(e.clock()).toBeCloseTo(0.9, 9);
+	});
+
+	test('stopping a backwards session stops and unhooks everything it built', async () => {
+		await play(
+			{ tracks: [track('a1', 'audio', [clip('a', 'voice', { source_out: 2 })]), track('a2', 'audio', [clip('b', 'music', { source_out: 2 })])] },
+			2,
+			-1
+		);
+		const sources = ctx.of<FakeSource>('source');
+		expect(sources).toHaveLength(2);
+		const gains = sources.map(clipGain);
+		engine.stop();
+		for (const s of sources) {
+			expect(s.stopped).toBe(1);
+			expect(s.outs).toHaveLength(0);
+		}
+		for (const g of gains) expect(g.outs).toHaveLength(0);
+		expect(engine.clock()).toBeNull();
 		expect(engine.meters()).toBeNull();
+	});
+
+	test('a playhead at the very start has nothing behind it to play', async () => {
+		await play({ tracks: [track('a1', 'audio', [clip('c', 'voice')])] }, 0, -1);
 		expect(ctx.of('source')).toHaveLength(0);
 	});
 });

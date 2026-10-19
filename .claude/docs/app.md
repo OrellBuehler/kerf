@@ -180,7 +180,7 @@ returns the refreshed `Timeline`; every edit that carries linked clips takes an 
 JPEG added as a base64 `data:` URL (`FilmstripPayload` — the CSP admits `data:` images
 and no `blob:`; core serializes the geometry without pixels) and **no MCP tool**, since
 `skim_asset` is how an agent looks at footage,
-`get_preview_frame` (`hint: "forward"` is a frame of GPU playback, `draft` a gesture's frame) / `set_preview_bounds` / `gpu_preview_status` (the GPU preview, below; GUI-only; its tallies are kept for tests and logs, no command serves them),
+`get_preview_frame` (`hint: "forward"` is a frame of GPU playback, `hint: "ready"` asks where the GPU takes a play back from the stream, `draft` a gesture's frame) / `set_preview_bounds` / `gpu_preview_status` (the GPU preview, below; GUI-only; its tallies are kept for tests and logs, no command serves them),
 `get_timeline_frame` (the composited still at a time; see Scrubbed frames below),
 `get_scopes` (`kerf_core::scopes` of the export's still at a time, from the originals: the summary and the grids asked
 for; the MCP tool of the same name) / `get_render_bar` (`kerf_core::render_bar` over the working cut, for the GPU
@@ -590,7 +590,8 @@ reasons (the page then plays the stream as it always did). It is the stream's wh
 page has something to draw over a surface that sits above it, the plan cannot be made, the backend is not up or the self-test has not
 passed, or **anything in the next 5 s (`HORIZON`) is a frame the compositor does not draw or would not draw in time** (`PlayCut::ahead`:
 the plan's refusals, a reversed clip, a title whose position moves). Under Proxy only it is rejected as the stream is
-(`PlanInputs::proxy_wait_from`, the whole cut from the start). The scan goes on half a second at a time, and a clip the prefetch finds no
+(`PlanInputs::proxy_wait_from`, the whole cut from the start). A decline for a frame the GPU does not draw says which (`play.ahead`, with `play:
+{session, start: t, frame: 0, ahead}`), so the page may take the play back past it (below). The scan goes on half a second at a time, and a clip the prefetch finds no
 run trusted for counts as a refusal too, so each `gpu` answer carries `play: {session, start, frame, repeat, ahead?}` and `ahead` is
 `{at, handover, kind, why}`: the first frame the GPU will not draw and the time a stream that carries on must start at (`SpanPlan::handover`,
 in the cut's time), so the page hands over before it gets there. A request in the frame already on the screen is `repeat` (nothing drawn;
@@ -620,17 +621,33 @@ lavapipe shader compiler crashed such an exit about one drive-test run in ten; t
 **Priming** (`gpu_preview/prime.rs`): the start of a session is mostly `ffmpeg` starting (50 to 70 ms for one clip, more for several), and the playhead
 it will play from is known long before Play, so when a **paused** GPU frame has been the last request for 300 ms (`PRIME_AFTER`) the thread
 `kerf-gpu-prime` makes the `PlayCut` from it and opens the cursors of the frame on screen (each `ffmpeg` decodes its first frames into the pipe and
-waits). The Play that follows adopts it (`take_primed`) if it asks from within `[start - 0.3, start + 0.15]` of the same plan epoch and backend; the
+waits). The Play that follows adopts it (`take_primed`) if it asks from within `[at - 0.3, at + 0.15]` of the time it was made for (`Primed::at`) and the
+same plan epoch and backend; the
 scan, the surface, the self-test and the plan are asked at adoption as at any start, so priming decides nothing. A cut the stream will play
 (anything refused in the 5 s, a check that has not passed, a clip no run is trusted for) is not primed, and a primed session is dropped (its
 `ffmpeg`s killed) by anything that is not a play from that playhead, a project change, the backend or the setting going, and 10 s (`PRIME_TTL`)
 unplayed. The cost is one `ffmpeg` per layer of the frame on screen, idle, while the playhead rests: it is opened once per rest, not per frame.
+**Taking a play back from the stream** (`ready_play`, `get_preview_frame { …, hint: "ready", client, session }`): while the stream plays (it took a
+session over before a frame the GPU does not draw, or the session was declined at Play for one), the page asks where, from `t` on, the GPU can play
+again. The request ends any session still held and anything primed, asks what a session asks (the setting, a surface — its bounds may be hidden while
+the stream is on show —, the overlays, the self-test) and makes a `PlayCut` from `t`: `PlayCut::resume(t, REACH, HORIZON + 0.5)` is the first frame
+within 4 s (`REACH`) from which the GPU draws a session's horizon and a little more (its first request comes a frame or two late). The play from there
+is primed exactly as a paused playhead's is (`make_primed`: its cut, its scan, each layer's `check` and its cursor opened; `keep_primed`, dropped after
+`PRIME_TTL` by the primer's `expire_after`), and the answer is `renderer: "ready"` with `play.resume`, nothing drawn and the surface untouched; the
+page's next session, begun there, adopts it like a Play from a rested playhead. Nothing within reach is `stream` with `play.ahead` (ask again later);
+a clip there that cannot be opened is `stream` with an `ahead` of kind `cursor`; anything else (the setting off, no surface, no plan from there) is
+`stream` with no `play`, and the page does not ask again in that play. The request is ordered like the page's frames (`client`, `seq`), so
+one that reaches the backend after a newer request of the page (the paused frame once the play stops) is superseded and drops nothing that frame
+primes. The page backs off while the answers are `stream` (1, 2, 4, then every 8 s), and so does a take-back whose time made ready was missed
+or whose session declined before it drew, on a count of its own that a `ready` answer does not reset (`frontend.md`): a cut the GPU draws none of
+costs a scan every 8 s at most, and a take-back that keeps failing at the switch a primed play every 8 s at most.
 Cursor timeouts of a session are `play_config()` (first frame 10 s, next 3 s), shorter than the export's so a hung decode ends in the stream's hands.
 The diagnostics' `play` counts `{sessions, declined, handed_over, frames, skipped, repeats}`; the log has a line per session
 (`GPU playback session begun` / `ended`, with the mean decode, composite and present time of its frames and the worst).
 `gpu_preview/play_tests.rs` (`#[ignore]`d, a device and an FFmpeg) drives it without a window: the check pending, a cut crossed with its
 cursor opened ahead, skipped and repeated frames, a title that moves, a transport stream found ahead, a change / a seek / another session /
-the setting off.
+the setting off, and a play taken back past a moving title from cursors made ready (the frame equal to a cold session's there; not yet within reach;
+the setting off).
 
 **Two surface techniques, picked per platform** (`resolve_technique`;
 `KERF_GPU_SURFACE=off|window|child` overrides). *`window`*: wgpu draws to the **main
