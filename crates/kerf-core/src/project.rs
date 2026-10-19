@@ -26,6 +26,7 @@ use crate::model::{
     MAX_SVG_SECONDS, MIN_FOV, MIN_SPEED,
 };
 use crate::model::{AutoIncluded, SkippedChange, StagedAssetChange};
+use crate::model::{Color, Transform};
 use crate::model::{Detached, DetachedMany};
 use crate::model::{Property, PropertyKey};
 use crate::model::{SvgOverlay, SvgOverlayPatch, SvgPreset};
@@ -3380,12 +3381,7 @@ impl Project {
                 "source_out must be greater than source_in".to_string(),
             ));
         }
-        if source_out > asset.source_limit() + SOURCE_EPS {
-            return Err(Error::InvalidArgument(format!(
-                "source_out {source_out:.3} s is past the end of \"{}\" ({:.3} s long)",
-                asset.name, asset.duration
-            )));
-        }
+        asset.check_source_out(source_out)?;
         if timeline_start.is_some_and(|t| !t.is_finite() || t < 0.0) {
             return Err(Error::InvalidArgument("timeline_start must be >= 0".to_string()));
         }
@@ -3473,18 +3469,7 @@ impl Project {
         // links nothing never loads its assets for this.
         let links = self.links_active() && self.working_has_links()?;
         let footage = if links { self.source_limits()? } else { SourceLimits::new() };
-        if [source_in, source_out, timeline_start]
-            .into_iter()
-            .flatten()
-            .any(|v| !v.is_finite())
-        {
-            return Err(Error::InvalidArgument(
-                "source_in, source_out and timeline_start must be finite numbers".to_string(),
-            ));
-        }
-        if source_in.is_some_and(|v| v < 0.0) {
-            return Err(Error::InvalidArgument("source_in must be >= 0".to_string()));
-        }
+        Clip::check_trim(source_in, source_out, timeline_start)?;
         self.edit_lanes.borrow_mut().push(clip_id);
         let clip = self.edit_named(
             &[clip_id],
@@ -3495,12 +3480,7 @@ impl Project {
                 if let Some(value) = source_out {
                     // Footage can only be asked for as far as it goes (a still has no end).
                     if let Some(asset) = self.get_asset(was.asset_id)? {
-                        if value > asset.source_limit() + SOURCE_EPS {
-                            return Err(Error::InvalidArgument(format!(
-                                "source_out {value:.3} s is past the end of \"{}\" ({:.3} s long)",
-                                asset.name, asset.duration
-                            )));
-                        }
+                        asset.check_source_out(value)?;
                     }
                 }
                 let clip = &mut timeline.tracks[ti].clips[ci];
@@ -4266,9 +4246,7 @@ impl Project {
     /// value unchanged; pass `Some(0.0)` to clear a fade. Negative values are
     /// rejected. The fade is realized at export (see the engine render path).
     pub fn set_fade(&self, clip_id: Uuid, fade_in: Option<f64>, fade_out: Option<f64>) -> Result<Clip> {
-        if [fade_in, fade_out].into_iter().flatten().any(|v| !v.is_finite() || v < 0.0) {
-            return Err(Error::InvalidArgument("fade duration must be a number >= 0".to_string()));
-        }
+        Clip::check_fades(fade_in, fade_out)?;
         self.edit_timeline("Set fade", |timeline| {
             let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
             let clip = &mut timeline.tracks[ti].clips[ci];
@@ -4330,24 +4308,17 @@ impl Project {
         crop_top: Option<f64>,
         crop_bottom: Option<f64>,
     ) -> Result<Clip> {
-        if scale.is_some_and(|v| !v.is_finite() || v <= 0.0) {
-            return Err(Error::InvalidArgument("scale must be a finite value > 0".to_string()));
-        }
-        if [pos_x, pos_y, rotation].into_iter().flatten().any(|v| !v.is_finite()) {
-            return Err(Error::InvalidArgument(
-                "position and rotation must be finite numbers".to_string(),
-            ));
-        }
-        if opacity.is_some_and(|v| !(0.0..=1.0).contains(&v)) {
-            return Err(Error::InvalidArgument("opacity must be within 0.0..=1.0".to_string()));
-        }
-        if [crop_left, crop_right, crop_top, crop_bottom]
-            .into_iter()
-            .flatten()
-            .any(|c| !(0.0..1.0).contains(&c))
-        {
-            return Err(Error::InvalidArgument("crop fractions must be within 0.0..1.0".to_string()));
-        }
+        Transform::check_values(
+            scale,
+            pos_x,
+            pos_y,
+            rotation,
+            opacity,
+            crop_left,
+            crop_right,
+            crop_top,
+            crop_bottom,
+        )?;
         self.edit_timeline("Set transform", |timeline| {
             let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
             let t = &mut timeline.tracks[ti].clips[ci].transform;
@@ -4378,9 +4349,7 @@ impl Project {
             if let Some(v) = crop_bottom {
                 t.crop_bottom = v;
             }
-            if t.crop_left + t.crop_right >= 1.0 || t.crop_top + t.crop_bottom >= 1.0 {
-                return Err(Error::InvalidArgument("crop removes the entire frame".to_string()));
-            }
+            t.check_crop()?;
             Ok(timeline.tracks[ti].clips[ci].clone())
         })
     }
@@ -4746,21 +4715,7 @@ impl Project {
         gamma: Option<f64>,
         temperature: Option<f64>,
     ) -> Result<Clip> {
-        if brightness.is_some_and(|v| !(-1.0..=1.0).contains(&v)) {
-            return Err(Error::InvalidArgument("brightness must be within -1.0..=1.0".to_string()));
-        }
-        if contrast.is_some_and(|v| !(0.0..=4.0).contains(&v)) {
-            return Err(Error::InvalidArgument("contrast must be within 0.0..=4.0".to_string()));
-        }
-        if saturation.is_some_and(|v| !(0.0..=3.0).contains(&v)) {
-            return Err(Error::InvalidArgument("saturation must be within 0.0..=3.0".to_string()));
-        }
-        if gamma.is_some_and(|v| !(0.1..=10.0).contains(&v)) {
-            return Err(Error::InvalidArgument("gamma must be within 0.1..=10.0".to_string()));
-        }
-        if temperature.is_some_and(|v| !(-1.0..=1.0).contains(&v)) {
-            return Err(Error::InvalidArgument("temperature must be within -1.0..=1.0".to_string()));
-        }
+        Color::check_values(brightness, contrast, saturation, gamma, temperature)?;
         self.edit_timeline("Set color", |timeline| {
             let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
             let c = &mut timeline.tracks[ti].clips[ci].color;
@@ -6236,14 +6191,7 @@ impl Project {
         font: Option<String>,
         bold: Option<bool>,
     ) -> Result<TextOverlay> {
-        if size.is_some_and(|v| !v.is_finite() || v <= 0.0) {
-            return Err(Error::InvalidArgument("size must be a finite value > 0".to_string()));
-        }
-        if [start, end, pos_x, pos_y].into_iter().flatten().any(|v| !v.is_finite()) {
-            return Err(Error::InvalidArgument(
-                "start, end and position must be finite numbers".to_string(),
-            ));
-        }
+        TextOverlay::check_values(start, end, pos_x, pos_y, size)?;
         // Both colours are spliced into a filter graph and an inline style: a colour spec only.
         if let Some(c) = &color {
             check_color("text color", c)?;
@@ -6287,9 +6235,7 @@ impl Project {
             if let Some(v) = bold {
                 o.bold = v;
             }
-            if o.end <= o.start {
-                return Err(Error::InvalidArgument("overlay end must be after start".to_string()));
-            }
+            o.check_span()?;
             Ok(o.clone())
         })
     }
@@ -6491,15 +6437,7 @@ impl Project {
     /// Set (or clear, with an empty list) an overlay's position/opacity keyframes.
     pub fn set_overlay_keyframes(&self, overlay_id: Uuid, mut keyframes: Vec<TextKeyframe>) -> Result<TextOverlay> {
         for k in &keyframes {
-            if !k.time.is_finite() || k.time < 0.0 {
-                return Err(Error::InvalidArgument("keyframe time must be >= 0".to_string()));
-            }
-            if !(0.0..=1.0).contains(&k.opacity) {
-                return Err(Error::InvalidArgument("opacity must be within 0.0..=1.0".to_string()));
-            }
-            if !k.pos_x.is_finite() || !k.pos_y.is_finite() {
-                return Err(Error::InvalidArgument("keyframe position must be finite".to_string()));
-            }
+            k.check()?;
         }
         keyframes.sort_by(|a, b| a.time.total_cmp(&b.time));
         self.edit_timeline("Set overlay keyframes", move |timeline| {
@@ -7328,10 +7266,6 @@ impl Page {
         self.limit.map_or(-1, |l| l.min(i64::MAX as usize) as i64)
     }
 }
-
-/// How far the footage of a clip may be asked past the asset's length (seconds): the float noise
-/// of a duration that went through a probe and a JSON round trip.
-const SOURCE_EPS: f64 = 1e-3;
 
 /// The most a relinked file's length may differ from the asset it replaces (seconds), or 1 % of it
 /// if that is more.

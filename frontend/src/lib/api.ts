@@ -71,6 +71,7 @@ import type {
 	PreviewBoundsReport,
 	PlatformTarget,
 	PlayAsk,
+	PreviewDraft,
 	PreviewFrameResult,
 	PreviewOrder,
 	Projection,
@@ -4412,16 +4413,19 @@ export async function getRenderBar(width = 960): Promise<RenderBar> {
  * of the same `client` instead of drawing it last. `play` makes it a frame of **GPU playback**
  * (`hint: 'forward'`): the time is the one the picture should show, asked once per animation
  * frame while the cut plays, and the first request of a `session` decides whether the GPU plays
- * it or the stream does (`renderer: 'stream'`). In the browser harness there is no backend: the
- * answer is "FFmpeg, no frame" (to a forward request, "the stream"), as `getTimelineFrame` is
- * `null`, and `order` is unused.
+ * it or the stream does (`renderer: 'stream'`). `draft` is what a gesture under way would write
+ * (`preview-draft.ts`): the frame is drawn as the cut would be with it written, and nothing is; a frame
+ * of it the GPU does not draw is the JPEG of the cut as it is. In the browser harness there is no
+ * backend: the answer is "FFmpeg, no frame" (to a forward request, "the stream"), as `getTimelineFrame`
+ * is `null`, and `order` is unused.
  */
 export async function getPreviewFrame(
 	timeSecs: number,
 	maxWidth = 960,
 	overlays = false,
 	order?: PreviewOrder,
-	play?: PlayAsk
+	play?: PlayAsk,
+	draft?: PreviewDraft | null
 ): Promise<PreviewFrameResult> {
 	if (!inTauri()) {
 		// `?gpusurface=1` pretends a surface under a transparent webview drew the frame, so the
@@ -4492,7 +4496,8 @@ export async function getPreviewFrame(
 		client: order?.client,
 		seq: order?.seq,
 		hint: play ? 'forward' : undefined,
-		session: play?.session
+		session: play?.session,
+		draft: play ? undefined : (draft ?? undefined)
 	});
 }
 

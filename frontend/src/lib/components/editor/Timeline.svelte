@@ -44,7 +44,8 @@
 	import { DELIVERY_PRESETS, fitLabel, presetFor } from '#lib/delivery-formats';
 	import { setDeliveryPreset } from '#lib/menu-commands';
 	import { importMenuEntries, importableAssets } from '#lib/caption-import-ui';
-	import type { Clip, Marker, StreamKind, SvgOverlay, TextOverlay, Track } from '#lib/types';
+	import type { Clip, Marker, PreviewDraft, StreamKind, SvgOverlay, TextOverlay, Track } from '#lib/types';
+	import { moveDraft, trimDraft } from '#lib/preview-draft';
 	import { GENERATED_TITLE_FILL, SVG_TITLE_FILL, packRows, snapSpanStart, snapTime, trimSpan } from '#lib/titles';
 	import { SVG_PRESETS, svgDisplayName, svgTooltip } from '#lib/svg-titles';
 	import { faderToGain, gainLabel, gainToFader, panLabel } from '#lib/mixer';
@@ -540,6 +541,35 @@
 		});
 	});
 
+	/** The cut as the gesture under way would leave it, for the GPU preview to draw while it runs
+	 *  (`preview-draft.ts`): where the ghosts of a move or a nudge are, or the clip of a trim that moves
+	 *  nothing else. A trim that ripples or takes partners along, and the roll / slip / slide tools (whose
+	 *  trim monitor stands in for the frame), leave the frame as the cut is until they are let go. */
+	const gestureDraft = $derived.by((): PreviewDraft | null => {
+		if (dragPlan) return moveDraft(editor.timeline, dragPlan);
+		const d = trimDrag;
+		if (!d?.moved || trimView) return null;
+		const clip = editor.timeline.tracks.find((t) => t.id === d.trackId)?.clips.find((c) => c.id === d.clipId);
+		if (!clip) return null;
+		const limits = trimLimits(d);
+		return trimDraft(editor.timeline, d.clipId, trimEdit(clip, d.edge, clampEdge(d.pos, limits.min, limits.max)));
+	});
+	/** The draft of a gesture that was let go, kept until its edit has landed: the picture does not step
+	 *  back to the cut before it in between. */
+	let landing = $state.raw<PreviewDraft | null>(null);
+	function landWith(draft: PreviewDraft | null, edit: Promise<unknown>) {
+		landing = draft;
+		void edit.finally(() => {
+			if (landing === draft) landing = null;
+		});
+	}
+	/** The timeline's drafts are its own: another gesture's (an Inspector row's) is never cleared by it. */
+	const draftOwner = Symbol('timeline');
+	$effect(() => {
+		ui.setDraft(draftOwner, gestureDraft ?? landing);
+	});
+	$effect(() => () => ui.setDraft(draftOwner, null));
+
 	function onEdgePointerDown(e: PointerEvent, c: Clip, t: Track, edge: 'l' | 'r') {
 		if (e.button !== 0 || ui.tool !== 'pointer') return; // the other tools own the clip body
 		if (t.locked) return;
@@ -634,7 +664,11 @@
 		// `pos` is the gesture's one rounded position (the ghost drew it too); every
 		// field the trim writes comes from it. Alt trims the clip alone (`link: false`).
 		const e = trimEdit(clip, d.edge, pos);
-		void editor.trim(d.clipId, e.source_in, e.source_out, e.timeline_start, alt ? false : undefined).catch(err);
+		const alone = !editor.rippleMode && (alt || linkPartners(editor.timeline, d.clipId).length === 0);
+		landWith(
+			alone ? trimDraft(editor.timeline, d.clipId, e) : null,
+			editor.trim(d.clipId, e.source_in, e.source_out, e.timeline_start, alt ? false : undefined).catch(err)
+		);
 	}
 
 	/** The frame rate gestures are quantized to — the cut's own (`export_format`'s). */
@@ -1297,7 +1331,7 @@
 		if (!plan.ok || plan.noop) return;
 		// The group lands as ONE edit: one revision, one undo. Its linked partners are the
 		// backend's to carry (the same Δt on their own tracks), unless Alt left them out.
-		void editor.moveClips(plan.moves, plan.link ? undefined : false).catch(err);
+		landWith(moveDraft(editor.timeline, plan), editor.moveClips(plan.moves, plan.link ? undefined : false).catch(err));
 	}
 
 	// ---- roll / slip / slide: the tools that move a boundary ------------------------

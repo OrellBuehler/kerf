@@ -45,10 +45,11 @@
 	import { renderedDuration, renderedFps, timecodeRate } from '#lib/timecode';
 	import { logFrontend } from '#lib/log';
 	import { clipDuration } from '#lib/types';
-	import type { SvgOverlay, TextOverlay } from '#lib/types';
+	import type { PreviewDraft, SvgOverlay, TextOverlay } from '#lib/types';
 	import { dragRect, rectOf, rectPatch, roundRect, svgDisplayName, type Rect, type RectHandle } from '#lib/svg-titles';
 	import { boxPadding, containRect, dragPosition, inkBox, isVisibleAt, sampleOverlay, scaledSize, titleFamily } from '#lib/titles';
 	import { tip } from '#lib/tip';
+	import { draftHolds, draftTouches, titleMoveDraft, titleSizeDraft } from '#lib/preview-draft';
 
 	const duration = $derived(Math.max(editor.duration, 0.001));
 	/** The transport bar's own width, or undefined until it has been measured (and while it
@@ -132,7 +133,8 @@
 		streaming: () => streaming,
 		width: () => frameWidth,
 		timelineFrame: (t, width) => getTimelineFrame(t, width),
-		previewFrame: (t, overlays, width, order, play) => getPreviewFrame(t, width, overlays, order, play),
+		previewFrame: (t, overlays, width, order, play, draft) => getPreviewFrame(t, width, overlays, order, play, draft),
+		draft: () => sentDraft,
 		answered: (result) => gpuPreview.note(result),
 		gpuFailed: (error) => {
 			gpuPreview.noteJpeg(`the GPU preview failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -148,6 +150,21 @@
 			gpuPlay = null;
 			playbackWaiting = message;
 		}
+	});
+	/** The draft the frame is asked with: the gesture's, while the cut still holds what it names and it changes
+	 *  the frame at the playhead (a clip moved on an audio track, or far from the playhead, draws the frame the
+	 *  cut already draws). The same draft object while it says the same, so the pump asks once for it. A proposal
+	 *  being previewed is read-only: no gesture runs, and the backend draws the user's cut. */
+	const sentDraft = $derived.by((): PreviewDraft | null => {
+		const draft = ui.previewDraft;
+		if (!draft || editor.previewingStaged) return null;
+		if (!draftHolds(draft, editor.timeline, editor.overlays)) return null;
+		return draftTouches(draft, editor.timeline, editor.overlays, ui.time) ? draft : null;
+	});
+	// A draft that names a clip or a title the cut no longer holds (an undo mid-gesture) is dropped, whoever wrote it.
+	$effect(() => {
+		const draft = ui.previewDraft;
+		if (draft && !draftHolds(draft, editor.timeline, editor.overlays)) ui.dropDraft();
 	});
 	const frameUrl = $derived(frames.frameUrl);
 	const gpuShown = $derived(frames.gpuShown);
@@ -824,8 +841,28 @@
 	function cancelTitleDrag() {
 		if (!tdrag || tdrag.committing) return;
 		tdrag = null;
+		ui.setDraft(titleOwner, null);
 		releaseTitleCapture();
 	}
+
+	/** The title box's drafts are its own (`ui.setDraft`). */
+	const titleOwner = Symbol('title-box');
+	/** The drafts of the title drag under way: a frame drawn from one of them shows the title where the drag is. */
+	let titleDrafts = $state.raw(new WeakSet<PreviewDraft>());
+	/** The title as the drag would write it, for the GPU preview to draw while the drag runs. */
+	function draftTitle(d: TitleDrag) {
+		if (!d.moved) return;
+		ui.setDraft(
+			titleOwner,
+			d.mode === 'move'
+				? titleMoveDraft(editor.overlays, d.id, round4(d.x), round4(d.y), d.at)
+				: titleSizeDraft(editor.overlays, d.id, round4(d.size))
+		);
+		if (ui.previewDraft) titleDrafts.add(ui.previewDraft);
+	}
+	/** The GPU has presented a frame of this drag's draft: the title is in the picture where it is going, and
+	 *  the box carries no ghost of it. Until then (a round trip) the ghost shows where the title goes. */
+	const draftDrawn = $derived(gpuShown && frames.drawnDraft !== null && titleDrafts.has(frames.drawnDraft));
 
 	/** Abandon an animated title's box gesture without writing anything. */
 	function cancelSvgDrag() {
@@ -902,6 +939,7 @@
 		const cx = box.left + box.width / 2;
 		const cy = box.top + box.height / 2;
 		const pose = sampleOverlay(o, ui.time);
+		titleDrafts = new WeakSet();
 		tdrag = {
 			id: o.id,
 			mode,
@@ -943,6 +981,7 @@
 			const dist = Math.hypot(e.clientX - d.cx, e.clientY - d.cy);
 			tdrag = { ...d, size: scaledSize(d.startSize, d.startDist, dist), moved: d.moved || Math.abs(dist - d.startDist) >= 2 };
 		}
+		draftTitle(tdrag);
 	}
 
 	const round4 = (v: number) => Math.round(v * 10000) / 10000;
@@ -965,6 +1004,7 @@
 			report(err);
 		} finally {
 			tdrag = null;
+			ui.setDraft(titleOwner, null);
 		}
 	}
 
@@ -1158,7 +1198,7 @@
 								onpointerup={onTitleUp}
 								onpointercancel={cancelTitleDrag}
 								onlostpointercapture={onTitleLostCapture}
-								style="position:absolute;left:{(live?.x ?? pose.x) * 100}%;top:{(live?.y ?? pose.y) * 100}%;transform:translate(-50%,-50%);padding:{pad}cqh;font-size:{(live?.size ?? o.size) * 100}cqh;line-height:{ink.height};font-weight:{o.bold ? 700 : 400};font-family:{titleFamily(o)};white-space:nowrap;color:{live?.moved ? ghostColor(o.color) : 'transparent'};pointer-events:auto;touch-action:none;cursor:{live ? 'grabbing' : 'move'};user-select:none;outline:{selected ? '1.5px solid var(--kerf-400)' : '1px dashed color-mix(in srgb,var(--text-on-video) 35%,transparent)'};outline-offset:0;background:{live?.moved ? 'color-mix(in srgb,var(--scrim) 25%,transparent)' : 'transparent'}"
+								style="position:absolute;left:{(live?.x ?? pose.x) * 100}%;top:{(live?.y ?? pose.y) * 100}%;transform:translate(-50%,-50%);padding:{pad}cqh;font-size:{(live?.size ?? o.size) * 100}cqh;line-height:{ink.height};font-weight:{o.bold ? 700 : 400};font-family:{titleFamily(o)};white-space:nowrap;color:{live?.moved && !draftDrawn ? ghostColor(o.color) : 'transparent'};pointer-events:auto;touch-action:none;cursor:{live ? 'grabbing' : 'move'};user-select:none;outline:{selected ? '1.5px solid var(--kerf-400)' : '1px dashed color-mix(in srgb,var(--text-on-video) 35%,transparent)'};outline-offset:0;background:{live?.moved ? 'color-mix(in srgb,var(--scrim) 25%,transparent)' : 'transparent'}"
 							>
 								<span style="position:relative;top:{ink.shift}em">{o.text}</span>
 								{#if selected}

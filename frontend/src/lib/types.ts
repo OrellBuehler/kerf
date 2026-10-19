@@ -2060,6 +2060,20 @@ export interface PreviewFrameResult {
 	play?: PlayInfo | null;
 }
 
+/** A clip as a gesture under way would leave it, on the track it would be on (`DraftClip` in
+ *  `crates/kerf-app/src/gpu_preview/draft.rs`). */
+export interface DraftClip {
+	track_id: string;
+	clip: Clip;
+}
+
+/** What a gesture under way would write, sent with its frames (`PreviewDraft`): the clips and titles it
+ *  changes, each whole. The GPU preview draws the frame as the cut would be with it written; nothing is. */
+export interface PreviewDraft {
+	clips: DraftClip[];
+	overlays: TextOverlay[];
+}
+
 /** How the page asks for a frame of GPU playback: the session it belongs to. */
 export interface PlayAsk {
 	session: number;
