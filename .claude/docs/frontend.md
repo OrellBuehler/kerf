@@ -101,8 +101,8 @@ editor-grade workspace under `src/lib/components/editor/` — bespoke atoms (`Bt
 and `StatusBar` as fixed chrome around a **dockable workspace** (`Workspace.svelte`, composed by
 `routes/+page.svelte`). The workspace is `dockview` (the vanilla package; its
 `--dv-*` variables are mapped onto Kerf tokens in `styles/dockview-kerf.css` so
-it follows the theme) hosting eight panels — `LibraryPanel`, `Preview`, `Timeline`,
-`Inspector`, `AgentPanel`, `DeliverPanel`, `Mixer`, `Scopes` — each a Svelte component
+it follows the theme) hosting nine panels — `LibraryPanel`, `Preview`, `Timeline`,
+`Inspector`, `AgentPanel`, `DeliverPanel`, `Mixer`, `Scopes`, `DopeSheet` (*Keyframes*) — each a Svelte component
 `mount`ed into a dockview content element, so every panel is resizable by its
 sash, movable by its tab (drop zones on any group edge, or tabbed into a group)
 and closable; the **Window** menu reopens one (the library left of the
@@ -414,8 +414,29 @@ the value it has there (◆ when a key sits there, and clicking it takes the key
 the number static), and once a number is keyed its slider shows the curve at the playhead and an edit
 writes a key there — `setCol` / `setGain` / `keyAtPlayhead` over `set_property_keyframes` with the
 mirror's `upsertKey`, so a drag is one edit (every number row is a `SliderRow`, below). The Transform sliders do the same for numbers keyed on
-their own; the Animation list is still the legacy bundle's, and the per-number rows, dope sheet and easing
-popover are the next slice. The preview's Web Audio gain follows a keyed volume — `gainAutomation`
+their own; the Animation list is still the legacy bundle's. **The dope sheet** (`DopeSheet.svelte`, panel id
+`keyframes`, titled *Keyframes*; in the Motion preset between the preview and the inspector, `EARLIER_PRESETS.motion`
+is the arrangement before it) shows the selected clip: one row per keyed number (`dopeRows`, the resolver's keys, so a
+bundle-driven transform number has a row too), its keys as diamonds on one axis over the clip's span (and past it, shaded,
+when a key lies beyond the end), labelled in the cut's time with the timeline ruler's steps (`rulerGrid` / `tickLabel`);
+a diamond is round when its segment is eased and square when it holds. Click selects a key and seeks to it (exactly),
+Shift / Ctrl add or toggle, a drag on empty lane space is a marquee, the ruler seeks and scrubs (Escape puts the playhead
+back). Dragging a key retimes the selection across rows: the grabbed key lands on a magnet within 6 px (the playhead, the
+clip's ends, a key that is not moving, `dragMagnets` / `snapShift`) or else on a frame, and nothing goes before 0; **Alt at
+the release** (the ghost follows Alt live) leaves the originals and drops copies; a key landed on gives way. While the
+panel has focus the editor's own Copy / Paste / Delete / Select all bindings (`settings.actionFor`, so a rebound key
+follows) copy the selected keys (spacing kept, the clipboard outlives the panel and works on another clip), paste them
+with the earliest at the playhead, delete them (a row left empty is static) and select every key; Escape clears the
+selection. **The easing popover** (`EasingPopover.svelte`, from the bar's *Easing* button or a diamond's *Easing…*) shows
+the twelve presets of `EASING_CHOICES` (eight before, now also Glide / Settle / Lift / Whip — the Inspector's picker
+lists the same) as curves drawn from the renderers' polyline (`easingPath`), lights the one the selected segments share,
+and shapes the segment each selected key starts (`easingTargets`: a row's last key starts none); arrows move between
+presets, Escape / a press outside / blur / scroll close it without writing. **Every gesture is one
+`set_property_tracks` edit** of only the rows it touched (`retimeKeys`, `deleteKeys`, `pasteKeys`, `easeKeys` in the pure,
+bun-tested `dope-sheet.ts`; a gesture that changes nothing writes nothing), shown as its ghost until the edit settles,
+and Escape / pointercancel / blur abandon a drag (`beginDrag`). Keys are named by number and time, not index, so the
+selection that comes back is where the gesture put them. The preview of a proposal is read-only here too
+(`holdForPreview`). The preview's Web Audio gain follows a keyed volume — `gainAutomation`
 ramps linearly through the curve's points and the fade edges, and **steps where the curve does** (a hold
 or two keys at one time: the ramp arrives at the value the step leaves and a `setValueAtTime` lands the
 next, read `1e-9 s` either side of the step because `(start + t) - start` can fall an ulp short of `t`),

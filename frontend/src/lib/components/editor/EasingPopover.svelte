@@ -83,40 +83,53 @@
 		e.stopPropagation();
 	}
 
+	/** Drawn in the document's body: a panel's dock group is a containing block (`contain`,
+	 *  `transform`), which would clip a fixed box and place it from the group's corner. */
+	const toBody = (node: HTMLElement) => {
+		node.ownerDocument.body.appendChild(node);
+		return () => node.remove();
+	};
+
 	const outside = (e: Event) => {
 		if (el && e.target instanceof Node && el.contains(e.target)) return;
 		onclose();
 	};
 </script>
 
-<div
-	bind:this={el}
-	class="pop"
-	role="dialog"
-	aria-label="Easing"
-	tabindex="-1"
-	style="left:{pos.x}px;top:{pos.y}px"
-	{onkeydown}
-	{@attach onWindow({ pointerdowncapture: outside, blur: () => onclose(), resize: () => onclose(), scrollcapture: outside })}
->
-	<div class="head">Easing of the segment after each selected key</div>
-	<div class="grid" style="grid-template-columns:repeat({COLS}, 1fr)">
-		{#each EASING_CHOICES as c (c.id)}
-			<button type="button" class="opt" aria-pressed={lit === c.id} onclick={() => pick(c.easing)}>
-				<svg width={W} height={H} viewBox="0 0 {W} {H}" aria-hidden="true">
-					<rect x="0.5" y="0.5" width={W - 1} height={H - 1} rx="2" class="frame" />
-					<path d={easingPath(c.easing, W, H, 3)} class="curve" />
-				</svg>
-				<span>{c.label}</span>
-			</button>
-		{/each}
+<div class="anchor">
+	<div
+		bind:this={el}
+		{@attach toBody}
+		class="pop"
+		role="dialog"
+		aria-label="Easing"
+		tabindex="-1"
+		style="left:{pos.x}px;top:{pos.y}px"
+		{onkeydown}
+		{@attach onWindow({ pointerdowncapture: outside, blur: () => onclose(), resize: () => onclose(), scrollcapture: outside })}
+	>
+		<div class="head">Easing of the segment after each selected key</div>
+		<div class="grid" style="grid-template-columns:repeat({COLS}, 1fr)">
+			{#each EASING_CHOICES as c (c.id)}
+				<button type="button" class="opt" aria-pressed={lit === c.id} onclick={() => pick(c.easing)}>
+					<svg width={W} height={H} viewBox="0 0 {W} {H}" aria-hidden="true">
+						<rect x="0.5" y="0.5" width={W - 1} height={H - 1} rx="2" class="frame" />
+						<path d={easingPath(c.easing, W, H, 3)} class="curve" />
+					</svg>
+					<span>{c.label}</span>
+				</button>
+			{/each}
+		</div>
+		{#if current !== undefined && lit === 'custom'}
+			<div class="note">The selection has a curve of its own; a preset replaces it.</div>
+		{/if}
 	</div>
-	{#if current !== undefined && lit === 'custom'}
-		<div class="note">The selection has a curve of its own; a preset replaces it.</div>
-	{/if}
 </div>
 
 <style>
+	.anchor {
+		display: none;
+	}
 	.pop {
 		position: fixed;
 		z-index: 60;

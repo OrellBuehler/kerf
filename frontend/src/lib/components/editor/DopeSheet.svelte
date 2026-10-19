@@ -30,6 +30,7 @@
 	import { holdForPreview, report } from '#lib/ops';
 	import { tip } from '#lib/tip';
 	import { rulerGrid, ticksIn, tickLabel } from '#lib/ruler';
+	import { PROPERTIES } from '#lib/channels';
 	import { clipDuration } from '#lib/types';
 	import type { Clip, Easing, Property } from '#lib/types';
 	import {
@@ -47,6 +48,7 @@
 		mergeSelection,
 		pasteKeys,
 		retimeKeys,
+		rowLabel,
 		sharedEasing,
 		snapShift,
 		timeAt,
@@ -54,6 +56,7 @@
 		xOf,
 		type Axis,
 		type DopeEdit,
+		type DopeRow,
 		type KeyRef
 	} from '#lib/dope-sheet';
 
@@ -96,9 +99,15 @@
 		if (clip && writing?.clipId === clip.id) return writing.edit;
 		return null;
 	});
-	const shown = $derived(
-		ghost ? rows.map((r) => ({ ...r, keys: ghost.tracks.find((t) => t.prop === r.prop)?.keys ?? r.keys })) : rows
-	);
+	const shown = $derived.by((): DopeRow[] => {
+		if (!ghost) return rows;
+		const has = (p: Property) => rows.some((r) => r.prop === p) || ghost.tracks.some((t) => t.prop === p && t.keys.length > 0);
+		return PROPERTIES.filter(has).map((prop) => ({
+			prop,
+			label: rowLabel(prop),
+			keys: ghost.tracks.find((t) => t.prop === prop)?.keys ?? rows.find((r) => r.prop === prop)?.keys ?? []
+		}));
+	});
 	const marqueeRect = $derived(
 		gesture?.kind === 'marquee' && gesture.moved
 			? {
