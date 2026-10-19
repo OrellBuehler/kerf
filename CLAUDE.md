@@ -123,6 +123,9 @@ touch an installed Kerf's settings — see `.claude/docs/build-and-ci.md`.
 - **All timeline edits go through `edit_timeline` / `run_edit`**, which apply ripple and
   the linked-A/V sync lock; layout-deciding ops use `edit_timeline_exact`. Timeline math
   lives in `model.rs` (and `model/links.rs`), pure and unit-tested.
+- **The stored shape is versioned.** A change to what a `.kerf` file holds — a table, or a field or
+  variant in its JSON — appends a step to `store::MIGRATIONS`; a `.kerftemplate` manifest change appends
+  to `template::model::UPGRADES`. `persist_tests` fails when the stored timeline moves without one.
 - **Existing graphs stay byte-identical.** A new option is omitted from the argv at its
   neutral value. The golden oracle (`engine/cli/golden.rs`) fails on any argv change;
   bless only intended changes, one at a time, and tie the moved cases to a family.
