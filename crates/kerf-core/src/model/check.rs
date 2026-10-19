@@ -27,6 +27,7 @@ enum Rule {
     ClipFade,
     ClipTransition,
     ClipKeyframe,
+    ClipGenerated,
     OverlayTwice,
     OverlaySpan,
     OverlayKeyframe,
@@ -99,6 +100,9 @@ impl Timeline {
                 }
                 for (rule, why) in clip_violations(clip) {
                     push(rule, clip.id, format!("{name} {why}"));
+                }
+                for why in super::generator::generated_violations(clip, track.kind) {
+                    push(Rule::ClipGenerated, clip.id, format!("{name} {why}"));
                 }
             }
         }

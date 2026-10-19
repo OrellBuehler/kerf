@@ -28,7 +28,7 @@ use crate::model::{
 use crate::model::{AutoIncluded, SkippedChange, StagedAssetChange};
 use crate::model::{Detached, DetachedMany};
 use crate::model::{Property, PropertyKey};
-use crate::model::{SvgOverlay, SvgOverlayPatch, SvgPreset};
+use crate::model::{SvgOverlay, SvgOverlayPatch, SvgPreset, GENERATED_ASSET};
 use crate::svg::{check_params, SvgDoc};
 
 /// Where an animated title's artwork comes from.
@@ -1754,7 +1754,7 @@ impl Project {
         for track in timeline.tracks.iter().filter(|t| t.kind == StreamKind::Video) {
             for clip in &track.clips {
                 let reaches = clip.timeline_end() > from && to.is_none_or(|to| clip.timeline_start <= to);
-                if reaches && !wanted.contains(&clip.asset_id) {
+                if reaches && !clip.is_generated() && !wanted.contains(&clip.asset_id) {
                     wanted.push(clip.asset_id);
                 }
             }
@@ -3184,7 +3184,7 @@ impl Project {
     fn refuse_removed_media(&self, timeline: &Timeline) -> Result<()> {
         let mut wanted: Vec<Uuid> = Vec::new();
         for clip in timeline.tracks.iter().flat_map(|t| t.clips.iter()) {
-            if !wanted.contains(&clip.asset_id) {
+            if !clip.is_generated() && !wanted.contains(&clip.asset_id) {
                 wanted.push(clip.asset_id);
             }
         }
@@ -3697,12 +3697,13 @@ impl Project {
 
     /// How far each asset's footage reaches — what roll, slip and slide clamp a
     /// clip's source window to ([`crate::model::Asset::source_limit`]: the
-    /// duration, infinite for a still).
+    /// duration, infinite for a still), and a generated title's document its first 24 hours.
     pub fn source_limits(&self) -> Result<SourceLimits> {
         Ok(self
             .list_assets()?
             .into_iter()
             .map(|asset| (asset.id, asset.source_limit()))
+            .chain([(GENERATED_ASSET, MAX_SVG_SECONDS)])
             .collect())
     }
 
@@ -7296,6 +7297,8 @@ pub use store::{backup_path as schema_backup_path, SCHEMA_VERSION};
 mod exports;
 pub use exports::{DeliveryInputs, ExportedFile};
 mod templates;
+mod title_clips;
+pub use title_clips::{TitleClipPatch, TitleClipPlacement, TitleClipResult, TitleEdited};
 
 /// A window onto a long, ordered list (the edit history, the task queue): `offset` of the
 /// **newest** entries are skipped and up to `limit` of the ones before them returned, kept in
