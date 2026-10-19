@@ -162,6 +162,30 @@ pub(super) struct SetTitleTextBoxParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub(super) struct SetTitleTextAnimationParams {
+    #[schemars(
+        description = "UUID of an animated title: a floating one (timeline_summary's `svg_overlays`) or a title clip (`title_clips`). Not a preset title, which is drawn from its parameters"
+    )]
+    title_id: String,
+    #[schemars(
+        description = "The `id` of the <text> element to animate; get_timeline_state shows the title's source (a template's text controls name theirs)"
+    )]
+    element: String,
+    #[schemars(
+        description = "The id of a ready-made animation (list_text_animation_presets): rise, fade_in, typewriter, pop, blur_in, spin_in, drop_in, wiggle. Exclusive with `animation`; omit both to take the animation away"
+    )]
+    preset: Option<String>,
+    #[schemars(description = "Seconds the animation waits before it begins (0 to 30); changes a `preset`'s own")]
+    delay: Option<f64>,
+    #[schemars(description = "Seconds the animation takes (0.05 to 30); changes a `preset`'s own")]
+    duration: Option<f64>,
+    #[schemars(
+        description = "A whole animation of your own instead of a `preset`: `by` (character | word | line), `delay`, `duration`, `easing` (linear | ease_in | ease_out | ease_in_out), `range` {start, end, offset {from, to}, shape} (a window over the text, as fractions of it, slid from offset.from to offset.to; shape square | ramp_up | ramp_down | triangle | round | smooth: the amount each unit gets, 0 to 1), `wiggle` {rate, min, max, correlation, seed} (noise that multiplies the amount, or null) and `properties` {x, y, scale, rotation, opacity, blur} (what a unit does at an amount of 1: x and y in em, rotation in degrees, blur in em; scale 1, opacity 1 and the rest 0 change nothing, and at least one must). Every field has a default"
+    )]
+    animation: Option<kerf_core::svg::TextAnimation>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub(super) struct ConvertTitleTextParams {
     #[schemars(description = "UUID of an animated title: a floating one or a title clip, not a preset title")]
     title_id: String,
@@ -219,6 +243,32 @@ pub(super) struct TemplateIdParams {
 
 fn bad(message: impl Into<String>) -> McpError {
     McpError::invalid_params(message.into(), None)
+}
+
+/// The animation a `set_title_text_animation` call asks for: a preset or a whole animation (not both), `delay` and
+/// `duration` overriding either's own, or none (the animation taken away).
+fn resolve_animation(
+    preset: Option<&str>,
+    animation: Option<kerf_core::svg::TextAnimation>,
+    delay: Option<f64>,
+    duration: Option<f64>,
+) -> Result<Option<kerf_core::svg::TextAnimation>, McpError> {
+    let timed = |mut a: kerf_core::svg::TextAnimation| {
+        a.delay = delay.unwrap_or(a.delay);
+        a.duration = duration.unwrap_or(a.duration);
+        Some(a)
+    };
+    match (preset, animation) {
+        (Some(_), Some(_)) => Err(bad("give a `preset` or an `animation`, not both")),
+        (Some(id), None) => match kerf_core::svg::text_animation_preset(id) {
+            Some(found) => Ok(timed(found.animation)),
+            None => Err(bad(format!(
+                "no text animation preset \u{201c}{id}\u{201d}; see list_text_animation_presets"
+            ))),
+        },
+        (None, Some(a)) => Ok(timed(a)),
+        (None, None) => Ok(None),
+    }
 }
 
 fn library() -> Result<TemplateLibrary, McpError> {
@@ -489,6 +539,54 @@ impl KerfMcp {
             title_text_outcome(
                 project
                     .set_title_text_parsed(title_id, prepared, "Set text box")
+                    .map_err(core_err)?,
+            )
+        })
+    }
+
+    #[tool(
+        description = "List the text animations set_title_text_animation can start from by `preset` id, each with the \
+                       complete `animation` it stands for (read them to write your own): rise (characters fade in \
+                       one after another, rising into place), fade_in (words fade in), typewriter (characters appear \
+                       one at a time), pop (characters grow from nothing), blur_in (characters come into focus), \
+                       spin_in (characters turn and grow into place), drop_in (words drop in from above) and wiggle \
+                       (every character jitters on its own, then settles)."
+    )]
+    fn list_text_animation_presets(&self) -> Result<String, McpError> {
+        json(&kerf_core::svg::text_animation_presets())
+    }
+
+    #[tool(
+        description = "Animate a <text> of an animated title (custom or a template, floating or a title clip; not a \
+                       preset) letter by letter: pick a ready-made `preset` (list_text_animation_presets) or write an \
+                       `animation` of your own, a window that slides over the characters, words or lines of the text \
+                       (a typewriter, a stagger) and/or seeded noise (a wiggle), driving each unit's position, scale, \
+                       rotation, opacity and blur in em. It runs from `delay` for `duration` seconds on the title's \
+                       own clock; the title's default length follows it. Omit `preset` and `animation` to take the \
+                       animation away. It is compiled to per-glyph SMIL when the text is glyph outlines, so the \
+                       title's text is set as outlines (see convert_title_text); a text that cannot be one (a \
+                       textPath, positioned tspans, ...) is an error saying why, and so is an animation with nothing \
+                       to change or a number out of bounds. update_svg_overlay / update_title_clip with new `svg` draw \
+                       the text with its fonts again (the animation does not play until convert_title_text). \
+                       get_timeline_state shows it as data-kerf-animate on the <text>. One edit; the title keeps its \
+                       id, timing, placement and template values. If the title changed while this ran, it says so: \
+                       call again."
+    )]
+    async fn set_title_text_animation(&self, Parameters(p): Parameters<SetTitleTextAnimationParams>) -> Result<String, McpError> {
+        let title_id = parse_arg("title_id", &p.title_id)?;
+        let animation = resolve_animation(p.preset.as_deref(), p.animation, p.delay, p.duration)?;
+        let (project, owner, element) = (self.project.clone(), self.owner(), p.element);
+        let prepared = blocking(move || {
+            let inputs = lock_agent_as(&project, owner.as_deref())
+                .title_text_inputs(title_id)
+                .map_err(core_err)?;
+            inputs.text_animation(&element, animation.as_ref()).map_err(core_err)
+        })
+        .await?;
+        self.edit(|project| {
+            title_text_outcome(
+                project
+                    .set_title_text_parsed(title_id, prepared, "Set text animation")
                     .map_err(core_err)?,
             )
         })
@@ -976,5 +1074,39 @@ mod tests {
         assert!(listed.templates.is_empty() && listed.problems.is_empty());
         assert_eq!(located.unwrap(), dir.join("mine"));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_preset_or_an_animation_of_ones_own_with_its_timing_changed_or_none_at_all() {
+        let rise = kerf_core::svg::text_animation_preset("rise").unwrap().animation;
+        assert_eq!(resolve_animation(Some("rise"), None, None, None).unwrap(), Some(rise.clone()));
+        let slower = resolve_animation(Some("rise"), None, Some(0.5), Some(3.0)).unwrap().unwrap();
+        assert_eq!((slower.delay, slower.duration), (0.5, 3.0));
+        assert_eq!(slower.properties, rise.properties, "only the timing changed");
+        let own = kerf_core::svg::TextAnimation {
+            duration: 2.0,
+            ..rise.clone()
+        };
+        assert_eq!(
+            resolve_animation(None, Some(own.clone()), None, None).unwrap(),
+            Some(own.clone())
+        );
+        assert_eq!(
+            resolve_animation(None, Some(own), None, Some(4.0)).unwrap().unwrap().duration,
+            4.0
+        );
+        assert_eq!(
+            resolve_animation(None, None, Some(1.0), Some(1.0)).unwrap(),
+            None,
+            "neither takes it away"
+        );
+        let both = resolve_animation(Some("rise"), Some(rise), None, None).unwrap_err();
+        assert!(both.message.contains("not both"), "{}", both.message);
+        let unknown = resolve_animation(Some("spin"), None, None, None).unwrap_err();
+        assert!(
+            unknown.message.contains("spin") && unknown.message.contains("list_text_animation_presets"),
+            "{}",
+            unknown.message
+        );
     }
 }

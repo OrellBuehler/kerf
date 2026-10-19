@@ -2983,6 +2983,34 @@ async fn set_title_text_box(
     blocking(move || title_text_edit(&shared, tid, "Set text box", |i| i.text_box(&element, &text_box))).await
 }
 
+/// Give the `<text>` whose id is `element` in the title `title_id` (floating or on a track, not a preset) an
+/// animation: which units of it (characters, words, lines) a window slides over, and what each does as the window
+/// reaches it (`animation` `null` takes it away). The animation is compiled into per-glyph SMIL when the text is
+/// set as outlines, so the title's text is set as outlines again; a text that cannot be one is an error saying why.
+#[tauri::command]
+async fn set_title_text_animation(
+    state: State<'_, AppState>,
+    title_id: String,
+    element: String,
+    animation: Option<kerf_core::svg::TextAnimation>,
+) -> CmdResult<TemplateEdit> {
+    let tid = id(&title_id, "title_id")?;
+    let shared = state.project.clone();
+    blocking(move || {
+        title_text_edit(&shared, tid, "Set text animation", |i| {
+            i.text_animation(&element, animation.as_ref())
+        })
+    })
+    .await
+}
+
+/// The text animations a user can start from (`rise`, `typewriter`, ...): each a complete `TextAnimation` to copy
+/// onto a text with `set_title_text_animation`. Needs no project.
+#[tauri::command(async)]
+fn list_text_animation_presets() -> Vec<kerf_core::svg::TextAnimationPreset> {
+    kerf_core::svg::text_animation_presets()
+}
+
 /// Draw the text of the title `title_id` as glyph outlines (the same on every machine, whatever fonts it
 /// has) or with its fonts again. Each text that cannot be an outline says why in the warnings.
 #[tauri::command]
@@ -5452,6 +5480,8 @@ pub fn run() {
             update_title_clip,
             set_template_values,
             set_title_text_box,
+            set_title_text_animation,
+            list_text_animation_presets,
             convert_title_text,
             import_template,
             export_template,
