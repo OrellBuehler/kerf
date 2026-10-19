@@ -578,6 +578,7 @@ impl Project {
         // between this one being opened and being swapped in.
         self.activate_fonts();
         crate::plan_epoch::bump_plan_epoch();
+        crate::project_activity::mark(crate::project_activity::ALL);
         old
     }
 
@@ -689,11 +690,13 @@ impl Project {
 
     fn init(&self) -> Result<()> {
         // Every row written through this connection moves the plan epoch (but for the background
-        // tables), so a caller holding the inputs of a frame can tell they are stale without the lock.
+        // tables), so a caller holding the inputs of a frame can tell they are stale without the lock,
+        // and marks its area for the activity stream (`project_activity`).
         self.conn.update_hook(Some(|_action, _db: &str, table: &str, _row| {
             if crate::plan_epoch::table_moves_plan(table) {
                 crate::plan_epoch::bump_plan_epoch();
             }
+            crate::project_activity::mark(crate::project_activity::table_area(table));
         }))?;
         crate::plan_epoch::bump_plan_epoch();
 
