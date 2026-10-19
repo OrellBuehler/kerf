@@ -127,6 +127,8 @@ pub use cli::{
     ScrubStats, VariantProgress, MAX_STREAM_FPS, MAX_STREAM_WIDTH, MIN_STREAM_FPS, MIN_STREAM_WIDTH,
 };
 
+#[cfg(test)]
+pub(crate) use cli::golden::sample_timelines;
 pub(crate) use cli::insta360_pair_name;
 #[cfg(test)]
 pub(crate) use cli::proxy_sidecar_path;
