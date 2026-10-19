@@ -143,7 +143,7 @@ Now ask the agent to work on the project you have open — _"skim the interview 
 the dead air, and drop in captions."_ It will claim a task, use the tools below, and hand
 back a reviewable result.
 
-### The tools (168)
+### The tools (169)
 
 <details>
 <summary><b>See / analyze</b></summary>
