@@ -9,6 +9,8 @@
 	// What a write goes to is what the edit *began* on (`scope`, read when a drag, a run of keys or a typed
 	// entry starts), not what is selected when it ends: the click that selects another clip also
 	// blurs the field, and the entry is written on that blur. The numbers are `slider-row.ts`'s, which has the tests.
+	// `onLive` hears the value while a drag or a run of keys goes on, and `null` once its write has landed or it
+	// was abandoned: the Inspector draws the frame of the gesture with it (the GPU preview's draft).
 	import type { Snippet } from 'svelte';
 	import MixSlider from './MixSlider.svelte';
 	import {
@@ -37,7 +39,8 @@
 		reserve = true,
 		keyframe = undefined,
 		scope = undefined,
-		onCommit
+		onCommit,
+		onLive = undefined
 	}: {
 		label: string;
 		/** The committed value, in the property's own units. */
@@ -54,6 +57,8 @@
 		scope?: S;
 		/** The value a gesture ended on, or a typed entry, or the rest value: write it, to `scope`. One call per gesture. */
 		onCommit: (v: number, scope: S) => unknown;
+		/** The value a gesture is at, for `scope` as it began; `null` when it is over (written or abandoned). */
+		onLive?: (v: number | null, scope: S) => void;
 	} = $props();
 
 	let preview = $state<number | null>(null);
@@ -64,6 +69,7 @@
 	function move(v: number) {
 		pending.begin(scope as S, value, spec);
 		preview = v;
+		onLive?.(v, pending.scope as S);
 	}
 	/** The slider keeps showing where it was let go until the write has landed, so it does not
 	 *  jump back to the old value for the length of a round trip. */
@@ -73,12 +79,15 @@
 			await onCommit(v, at);
 		} finally {
 			preview = null;
+			onLive?.(null, at);
 		}
 	}
 	const commit = (v: number) => write(v, pending.end(now()).scope);
 	function cancel() {
+		const at = pending.scope ?? (scope as S);
 		pending.drop();
 		preview = null;
+		onLive?.(null, at);
 	}
 	function reset() {
 		pending.drop();

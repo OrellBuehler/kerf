@@ -3409,6 +3409,10 @@ async fn get_timeline_frame(state: State<'_, AppState>, time_secs: f64, max_widt
 /// and the first request of a session decides whether the GPU plays it (`renderer: "gpu"`) or the
 /// stream does (`renderer: "stream"`, with the reasons); every answer says in `play.ahead` where the
 /// GPU will stop drawing, if it will. See [`gpu_preview::play`]'s module docs; no other hint is known.
+///
+/// `draft` is what a gesture under way would write (the clips and titles it changes, whole): the frame
+/// is drawn as the cut would be with it written, and nothing is written (`gpu_preview::draft`). A drag's
+/// frame the GPU does not draw is FFmpeg's JPEG of the cut as it is.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 async fn get_preview_frame(
@@ -3421,6 +3425,7 @@ async fn get_preview_frame(
     seq: Option<u64>,
     hint: Option<String>,
     session: Option<u64>,
+    draft: Option<gpu_preview::PreviewDraft>,
 ) -> CmdResult<gpu_preview::PreviewFrameResult> {
     let shared = state.project.clone();
     let mut request = gpu_preview::FrameRequest::new(
@@ -3438,9 +3443,15 @@ async fn get_preview_frame(
             let (Some(client), Some(session)) = (client.clone(), session) else {
                 return Err("a forward frame names its client and session".to_string());
             };
+            if draft.is_some() {
+                return Err("a forward frame takes no draft".to_string());
+            }
             request = request.forward(client, session);
         }
         Some(other) => return Err(format!("unknown preview frame hint {other:?}")),
+    }
+    if let Some(draft) = draft {
+        request = request.drafted(draft);
     }
     if let (Some(client), Some(seq)) = (client, seq) {
         request = request.ordered(client, seq);

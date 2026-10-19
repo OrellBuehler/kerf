@@ -25,6 +25,7 @@ import type {
 	CaptionTimeBase,
 	Levels,
 	ModelProgress,
+	PreviewDraft,
 	TranscriptionStatus
 } from './types';
 import { autoSteps, counterKind, kindInfo, kindOfStage, missingSteps, stepCounter, stepWords, type StepCounter } from './analysis-steps';
@@ -69,6 +70,9 @@ class EditorUi {
 	 *  the timeline writes it, the Preview shows it in place of the playhead's frame,
 	 *  and it is `null` the moment the gesture ends however it ends. */
 	trimMonitor = $state<TrimMonitor | null>(null);
+	/** What the gesture under way would write (`preview-draft.ts`), for the GPU preview to draw before it
+	 *  is written; `null` once the gesture's edit has landed or the gesture was abandoned. */
+	previewDraft = $state.raw<PreviewDraft | null>(null);
 	playing = $state(false);
 	/** The asset being dragged from the media bin, while a drag is in flight. */
 	dndAsset = $state<{ id: string; kind: 'video' | 'audio'; duration: number } | null>(null);

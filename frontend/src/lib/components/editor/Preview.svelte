@@ -49,6 +49,7 @@
 	import { dragRect, rectOf, rectPatch, roundRect, svgDisplayName, type Rect, type RectHandle } from '#lib/svg-titles';
 	import { boxPadding, containRect, dragPosition, inkBox, isVisibleAt, sampleOverlay, scaledSize, titleFamily } from '#lib/titles';
 	import { tip } from '#lib/tip';
+	import { titleMoveDraft, titleSizeDraft } from '#lib/preview-draft';
 
 	const duration = $derived(Math.max(editor.duration, 0.001));
 	/** The transport bar's own width, or undefined until it has been measured (and while it
@@ -132,7 +133,9 @@
 		streaming: () => streaming,
 		width: () => frameWidth,
 		timelineFrame: (t, width) => getTimelineFrame(t, width),
-		previewFrame: (t, overlays, width, order, play) => getPreviewFrame(t, width, overlays, order, play),
+		previewFrame: (t, overlays, width, order, play, draft) => getPreviewFrame(t, width, overlays, order, play, draft),
+		// A proposal being previewed is read-only: no gesture runs, and the backend draws the user's cut.
+		draft: () => (editor.previewingStaged ? null : ui.previewDraft),
 		answered: (result) => gpuPreview.note(result),
 		gpuFailed: (error) => {
 			gpuPreview.noteJpeg(`the GPU preview failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -824,8 +827,20 @@
 	function cancelTitleDrag() {
 		if (!tdrag || tdrag.committing) return;
 		tdrag = null;
+		ui.previewDraft = null;
 		releaseTitleCapture();
 	}
+
+	/** The title as the drag would write it, for the GPU preview to draw while the drag runs. */
+	function draftTitle(d: TitleDrag) {
+		if (!d.moved) return;
+		ui.previewDraft =
+			d.mode === 'move'
+				? titleMoveDraft(editor.overlays, d.id, round4(d.x), round4(d.y), d.at)
+				: titleSizeDraft(editor.overlays, d.id, round4(d.size));
+	}
+	/** The GPU drew the drag's frame: the title is in the picture where it is going, and the box carries no ghost of it. */
+	const draftDrawn = $derived(gpuShown && ui.previewDraft !== null);
 
 	/** Abandon an animated title's box gesture without writing anything. */
 	function cancelSvgDrag() {
@@ -943,6 +958,7 @@
 			const dist = Math.hypot(e.clientX - d.cx, e.clientY - d.cy);
 			tdrag = { ...d, size: scaledSize(d.startSize, d.startDist, dist), moved: d.moved || Math.abs(dist - d.startDist) >= 2 };
 		}
+		draftTitle(tdrag);
 	}
 
 	const round4 = (v: number) => Math.round(v * 10000) / 10000;
@@ -965,6 +981,7 @@
 			report(err);
 		} finally {
 			tdrag = null;
+			ui.previewDraft = null;
 		}
 	}
 
@@ -1158,7 +1175,7 @@
 								onpointerup={onTitleUp}
 								onpointercancel={cancelTitleDrag}
 								onlostpointercapture={onTitleLostCapture}
-								style="position:absolute;left:{(live?.x ?? pose.x) * 100}%;top:{(live?.y ?? pose.y) * 100}%;transform:translate(-50%,-50%);padding:{pad}cqh;font-size:{(live?.size ?? o.size) * 100}cqh;line-height:{ink.height};font-weight:{o.bold ? 700 : 400};font-family:{titleFamily(o)};white-space:nowrap;color:{live?.moved ? ghostColor(o.color) : 'transparent'};pointer-events:auto;touch-action:none;cursor:{live ? 'grabbing' : 'move'};user-select:none;outline:{selected ? '1.5px solid var(--kerf-400)' : '1px dashed color-mix(in srgb,var(--text-on-video) 35%,transparent)'};outline-offset:0;background:{live?.moved ? 'color-mix(in srgb,var(--scrim) 25%,transparent)' : 'transparent'}"
+								style="position:absolute;left:{(live?.x ?? pose.x) * 100}%;top:{(live?.y ?? pose.y) * 100}%;transform:translate(-50%,-50%);padding:{pad}cqh;font-size:{(live?.size ?? o.size) * 100}cqh;line-height:{ink.height};font-weight:{o.bold ? 700 : 400};font-family:{titleFamily(o)};white-space:nowrap;color:{live?.moved && !draftDrawn ? ghostColor(o.color) : 'transparent'};pointer-events:auto;touch-action:none;cursor:{live ? 'grabbing' : 'move'};user-select:none;outline:{selected ? '1.5px solid var(--kerf-400)' : '1px dashed color-mix(in srgb,var(--text-on-video) 35%,transparent)'};outline-offset:0;background:{live?.moved ? 'color-mix(in srgb,var(--scrim) 25%,transparent)' : 'transparent'}"
 							>
 								<span style="position:relative;top:{ink.shift}em">{o.text}</span>
 								{#if selected}

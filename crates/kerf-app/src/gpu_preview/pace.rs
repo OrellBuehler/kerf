@@ -9,6 +9,9 @@
 //! drag that pauses for a moment, or a click and then a drag, does not reconfigure the surface at
 //! every start and stop. The page's own cadence is a request per animation frame (16 ms) while a
 //! playhead moves, and one per click otherwise.
+//!
+//! [`Trend`] reads the same requests for their direction: a drag that walks forward is decoded like
+//! playback, reading ahead.
 
 use std::time::{Duration, Instant};
 
@@ -48,6 +51,34 @@ impl Pace {
     }
 }
 
+/// A frame this far after the one before it (seconds of the cut) is the next step of a forward walk.
+pub const FORWARD_STEP_MAX: f64 = 0.5;
+/// Steps forward in a row before a drag is read as walking forward.
+pub const FORWARD_RUN: u8 = 3;
+
+/// Whether the frames of a drag walk forward through the cut (a slow drag to the right, shuttle,
+/// a held arrow key): each a little later than the one before. Such a drag is decoded like playback
+/// (`Hint::Forward`: the run reads ahead of the frame asked for, so the next one is in the cache
+/// when it is asked for); any other is a scrub. Frames of play sessions are not observed.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Trend {
+    last: Option<f64>,
+    run: u8,
+}
+
+impl Trend {
+    /// A frame at `t` was asked for, in a drag or not; whether it is read forward.
+    pub fn observe(&mut self, t: f64, dragging: bool) -> bool {
+        let step = self.last.replace(t).map(|last| t - last);
+        if step.is_some_and(|d| d > 0.0 && d <= FORWARD_STEP_MAX) {
+            self.run = self.run.saturating_add(1);
+        } else {
+            self.run = 0;
+        }
+        dragging && self.run >= FORWARD_RUN
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -65,6 +96,34 @@ mod tests {
         assert!(pace.observe(t0 + ms(2016)), "the next request 16 ms on is a drag");
         assert!(pace.observe(t0 + ms(2032)));
         assert!(pace.dragging());
+    }
+
+    #[test]
+    fn a_drag_that_steps_forward_a_few_times_in_a_row_is_read_forward() {
+        let mut trend = Trend::default();
+        let frame = 1.0 / 30.0;
+        assert!(!trend.observe(1.0, true), "a first frame has no direction");
+        assert!(!trend.observe(1.0 + frame, true));
+        assert!(!trend.observe(1.0 + 2.0 * frame, true));
+        assert!(trend.observe(1.0 + 3.0 * frame, true), "the third step forward in a row");
+        assert!(trend.observe(1.4, true), "a longer step is still a step");
+        assert!(
+            !trend.observe(1.4, true),
+            "the same time again (a slider dragged at a resting playhead)"
+        );
+        assert!(!trend.observe(1.5, true));
+        assert!(!trend.observe(1.6, true));
+        assert!(trend.observe(1.7, true));
+        assert!(!trend.observe(1.6, true), "a step back ends it");
+        for t in [1.7, 1.8, 1.9] {
+            trend.observe(t, true);
+        }
+        assert!(!trend.observe(3.0, true), "a jump is not a step");
+        for t in [3.1, 3.2] {
+            trend.observe(t, true);
+        }
+        assert!(!trend.observe(3.3, false), "clicks a frame apart are not a drag");
+        assert!(trend.observe(3.4, true));
     }
 
     #[test]

@@ -3,7 +3,7 @@ import { compileModule } from 'svelte/compiler';
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { GpuPlayback } from './gpu-playback';
-import type { PlayAhead, PlayAsk, PlayInfo, PreviewFrameResult, PreviewOrder } from './types';
+import type { PlayAhead, PlayAsk, PlayInfo, PreviewDraft, PreviewFrameResult, PreviewOrder } from './types';
 
 // The Preview's frame fetching is the one place a stray reactive read costs an FFmpeg composite,
 // so its reactivity is tested for real: the module is compiled with Svelte's own compiler and run
@@ -34,6 +34,7 @@ export function harness(env) {
 	let covered = $state(false);
 	let width = $state(env.width === undefined ? 960 : env.width);
 	let playback = $state.raw(null);
+	let draft = $state.raw(null);
 	let status = $state.raw({ supported: true, overlays: env.overlaysCapable ?? false });
 	const route = $derived(
 		routePreview({
@@ -70,6 +71,7 @@ export function harness(env) {
 		},
 		gpuFailed: (error) => env.gpuFailed?.(error),
 		playback: () => playback,
+		draft: () => draft,
 		playClock: () => ({ clock: time, latency: env.latency ?? 0, fps: 30 }),
 		startup: () => env.startup,
 		playHandover: (pb, ahead, now, why) => env.playHandover?.(pb, ahead, now, why),
@@ -92,7 +94,8 @@ export function harness(env) {
 		set covered(v) { covered = v; },
 		set width(v) { width = v; },
 		set status(v) { status = v; },
-		set playback(v) { playback = v; }
+		set playback(v) { playback = v; },
+		set draft(v) { draft = v; }
 	};
 }
 `;
@@ -104,7 +107,14 @@ interface Env {
 	overlaysCapable?: boolean;
 	width?: number | null;
 	timelineFrame: (t: number, width: number) => Promise<string | null>;
-	previewFrame: (t: number, overlays: boolean, width: number, order: PreviewOrder, play?: PlayAsk) => Promise<PreviewFrameResult>;
+	previewFrame: (
+		t: number,
+		overlays: boolean,
+		width: number,
+		order: PreviewOrder,
+		play?: PlayAsk,
+		draft?: PreviewDraft | null
+	) => Promise<PreviewFrameResult>;
 	answered?: (r: PreviewFrameResult) => void;
 	gpuFailed?: (e: unknown) => void;
 	latency?: number;
@@ -135,6 +145,7 @@ interface Harness {
 	width: number | null;
 	status: unknown;
 	playback: GpuPlayback | null;
+	draft: PreviewDraft | null;
 }
 
 beforeAll(async () => {
@@ -173,8 +184,8 @@ function recorder(
 			widths.push(width);
 			return opts.jpeg ? opts.jpeg(t) : `data:jpeg-${t}`;
 		},
-		previewFrame: async (t: number, overlays: boolean, width: number, order: PreviewOrder, play?: PlayAsk) => {
-			asked.push(`${play ? 'play' : 'gpu'}@${t}${overlays ? '+overlays' : ''}`);
+		previewFrame: async (t: number, overlays: boolean, width: number, order: PreviewOrder, play?: PlayAsk, draft?: PreviewDraft | null) => {
+			asked.push(`${play ? 'play' : 'gpu'}@${t}${overlays ? '+overlays' : ''}${draft ? `+draft:${draft.clips.map((c) => c.clip.id).join(',')}` : ''}`);
 			widths.push(width);
 			orders.push(order);
 			plays.push(play);
@@ -220,6 +231,50 @@ describe('with the GPU preview off the frame effect is today\'s', () => {
 		expect(h.frames.frameUrl).toBe('data:jpeg-1.5');
 		expect(h.frames.gpuShown).toBe(false);
 		h.stop();
+	});
+});
+
+describe("a gesture's draft", () => {
+	const drafted = (id: string): PreviewDraft => ({
+		clips: [{ track_id: 'v1', clip: { id, asset_id: 'a', source_in: 0, source_out: 1, timeline_start: 0, volume: 1, fade_in: 0, fade_out: 0 } }],
+		overlays: []
+	});
+
+	test('goes with every frame of the gesture on the GPU route, and its end asks for the cut as it is', async () => {
+		const r = recorder();
+		const h = harness({ enabled: true, overlaysCapable: true, ...r });
+		await settle();
+		h.draft = drafted('c1');
+		await settle();
+		h.draft = drafted('c2');
+		await settle();
+		h.draft = null;
+		await settle();
+		expect(r.asked).toEqual(['gpu@0', 'gpu@0+draft:c1', 'gpu@0+draft:c2', 'gpu@0']);
+		h.stop();
+	});
+
+	test('changes nothing on the JPEG route: no frame is asked for, and none is asked with it', async () => {
+		const r = recorder();
+		const h = harness({ enabled: false, ...r });
+		await settle();
+		h.draft = drafted('c1');
+		await settle();
+		h.draft = drafted('c2');
+		await settle();
+		h.draft = null;
+		await settle();
+		expect(r.asked).toEqual(['jpeg@0']);
+		// A frame the page draws over on a surface above it goes the JPEG route, draft or not.
+		const g = recorder();
+		const over = harness({ enabled: true, overlaysCapable: false, ...g });
+		over.titles = [{ id: 'a' }];
+		await settle();
+		over.draft = drafted('c1');
+		await settle();
+		expect(g.asked).toEqual(['jpeg@0']);
+		h.stop();
+		over.stop();
 	});
 });
 
