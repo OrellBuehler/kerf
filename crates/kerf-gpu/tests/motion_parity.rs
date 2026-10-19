@@ -1076,8 +1076,30 @@ fn a_late_starting_source_is_drawn_as_the_export_draws_it() {
     run("late/speed-0.5", &tl, &assets, 30.0, 1.5, EXACT);
     let (tl, assets) = over(&|c| c.speed = -1.0);
     run("late/reversed", &tl, &assets, 30.0, 1.5, EXACT);
-    let (tl, assets) = over(&|c| c.fade_in = 0.4);
-    run("late/fade-in", &tl, &assets, 30.0, 1.5, EXACT);
+    // A fade-in from the first picture, at 30 fps and at 25, where the 0.3 s lead is half a frame.
+    for fps in [30.0, 25.0] {
+        let (tl, assets) = over(&|c| c.fade_in = 0.4);
+        run(&format!("late/fade-in @{fps}"), &tl, &assets, fps, 1.5, EXACT);
+    }
+    // Entering through a dissolve (the ramp from the first picture to the end of the outgoing
+    // tail), one no longer than the lead (no ramp: the picture comes in whole once the tail is
+    // gone) and a dip to black (up from black on the first picture).
+    let enter = |kind, secs: f64| {
+        let out = clip(&m.bars, 0.5, 1.5, 0.0);
+        let mut inc = clip(&m.late, 0.0, 1.0, 1.0);
+        inc.transition_in = Some(Transition { kind, duration: secs });
+        (timeline(vec![vec![out, inc]], None), vec![m.bars.clone(), m.late.clone()])
+    };
+    for (name, kind, secs) in [
+        ("dissolve", TransitionKind::Crossfade, 0.6),
+        ("dissolve-inside-the-lead", TransitionKind::Crossfade, 0.2),
+        ("dip", TransitionKind::DipToBlack, 0.6),
+    ] {
+        for fps in [30.0, 25.0] {
+            let (tl, assets) = enter(kind, secs);
+            run(&format!("late/{name} @{fps}"), &tl, &assets, fps, 2.0, EXACT);
+        }
+    }
 }
 
 #[test]

@@ -88,10 +88,19 @@ so the feature is **only** activated through these forwards — which is what ma
   time; the lead is the end it leaves bare). Before, `setpts=PTS-STARTPTS` put the first picture at
   the clip's start, `lead − source_in` early against its sound. Nothing of the clip is drawn before
   the delay (the source has no picture there). **A fade-in starts on the first picture**
-  (`ClipTiming::fades`: the clip's fade, a dip's and a dissolve's alpha ramp get `st` = `start +
-  picture_delay`, length kept within the clip): anchored at the clip's start it was spent on the gap,
-  and a fade or a dissolve no longer than the delay was never seen. A dissolve's outgoing tail still
-  ends where it did, so a delay inside it shows the background under the incoming ramp. The
+  (`ClipTiming::fades`: the clip's fade and a dip's fade up get `st` = `start + picture_delay`,
+  length kept within the clip): anchored at the clip's start it was spent on the gap, and a fade
+  no longer than the delay was never seen. **A dissolve's ramp ends with the outgoing tail**
+  (`st` = `start + delay`, `d` = `len − delay`), so the incoming picture is whole when the outgoing
+  one goes; a dissolve no longer than the delay has no ramp (the picture comes in whole after the
+  tail, over the background). A fade step of no length is never emitted (FFmpeg reads `d=0` as 25
+  frames). The playback hand-over (`Planner::open_windows`) keeps a fade-in's window from the
+  clip's start, so a stream started in the gap does not slice the fade away. **Known limits:** a
+  reversed clip's bare end (the last `delay` of it, after its picture ran out) still takes its
+  fade-out there, so that much of the fade is spent on nothing; and a file whose text track starts
+  before its sound and picture, cut from before the sound's start, rebases the sound to the clip's
+  start (early by the part of the gap before it) while the picture's delay is measured from the
+  sound — rare enough (a subtitle track leading by up to a second, a cut inside it) to leave. The
   scrubbed still (`-ss` at or after) shows the first picture in the gap — not made to agree, as the
   export's first drawn frame is the `fps` slot of `start + delay`, which no still-side rule gives
   exactly. `frame_pick` takes `FpsPick::lead` for the same seek and start. A `.lead` padded proxy

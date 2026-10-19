@@ -409,7 +409,8 @@ pub fn fade_alpha(a: u8, factor: u32) -> u8 {
 
 /// One `fade` of a clip's picture. `st` is on the **timeline** (`setpts` has
 /// already moved the frames there), `d` is clamped to the clip's length with its
-/// tail.
+/// tail and is never 0. A fade-in starts on the clip's first picture, which on a
+/// late-starting source is [`picture_delay`] after its start ([`ClipTiming::fades`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct FadeStep {
     pub edge: FadeEdge,
@@ -721,14 +722,24 @@ impl<'a> ClipTiming<'a> {
     /// start on a late-starting source (nothing of the clip is drawn before it), where a ramp
     /// from the clip's start would be spent on the gap — a fade-in or a dissolve no longer than
     /// the delay was never seen, the picture cutting in at full strength after the background.
-    /// Its length is kept, within what is left of the clip.
+    /// A fade keeps its length, within what is left of the clip. A dissolve's ramp instead ends
+    /// where the outgoing clip's tail does (`len - delay` long), so the incoming picture is
+    /// whole when the outgoing one goes; one no longer than the delay is over before the picture
+    /// comes, and has no step. A step of no length is left out: FFmpeg reads `d=0` as its
+    /// default of 25 frames.
     pub fn fades(&self) -> Vec<FadeStep> {
         let (clip, fx) = (self.clip, self.fx);
         let dur = self.duration();
         let t0 = clip.timeline_start;
         let delay = self.picture_delay();
-        let step = |edge, tint, len: f64| match edge {
-            FadeEdge::In if delay > 0.0 => FadeStep {
+        let step = |edge, tint, len: f64| match (edge, tint) {
+            (FadeEdge::In, FadeTint::Alpha) if delay > 0.0 => FadeStep {
+                edge,
+                tint,
+                st: t0 + delay,
+                d: (len - delay).clamp(0.0, (dur - delay).max(0.0)),
+            },
+            (FadeEdge::In, _) if delay > 0.0 => FadeStep {
                 edge,
                 tint,
                 st: t0 + delay,
@@ -755,7 +766,10 @@ impl<'a> ClipTiming<'a> {
             (fx.xfade_in, FadeEdge::In, FadeTint::Alpha),
         ] {
             if len > 0.0 {
-                steps.push(step(edge, tint, len));
+                let s = step(edge, tint, len);
+                if s.d > 0.0 {
+                    steps.push(s);
+                }
             }
         }
         steps
@@ -1148,6 +1162,44 @@ mod tests {
         let still = img_asset(Uuid::new_v4());
         let tl = single(vec![make_clip(still.id, 0.0, 3.0, 0.0)]);
         assert_eq!(transition_fx(&tl, std::slice::from_ref(&still))[0].lead, 0.0);
+    }
+
+    #[test]
+    fn a_late_starting_clips_dissolve_ends_with_the_tail_and_a_dip_starts_on_its_first_picture() {
+        let mut stream = video_stream(1920, 1080, 30.0);
+        stream.lead = 0.5;
+        let late = test_asset(vec![stream]);
+        let plain = asset();
+        let cut = |kind, secs: f64| {
+            let out = make_clip(plain.id, 0.0, 10.0, 0.0);
+            let mut inc = make_clip(late.id, 0.0, 5.0, 10.0);
+            inc.transition_in = Some(Transition { kind, duration: secs });
+            let tl = single(vec![out, inc]);
+            let fx = transition_fx(&tl, &[plain.clone(), late.clone()]);
+            (tl, fx)
+        };
+        // A dissolve of 0.8 s: the outgoing tail ends at 10.8, and the incoming ramp runs from its
+        // first picture (10.5) to there.
+        let (tl, fx) = cut(TransitionKind::Crossfade, 0.8);
+        assert_eq!(fx[0].tail, 0.8);
+        let ramp: Vec<_> = timing(&tl, &fx, 1)
+            .fades()
+            .into_iter()
+            .filter(|s| s.tint == FadeTint::Alpha)
+            .collect();
+        assert_eq!(ramp.len(), 1);
+        assert_eq!((ramp[0].st, ramp[0].d), (10.5, 0.8 - 0.5));
+        // One no longer than the delay is over before the picture comes: no step (a `d=0` fade
+        // would be FFmpeg's 25 frames).
+        let (tl, fx) = cut(TransitionKind::Crossfade, 0.4);
+        assert!(timing(&tl, &fx, 1).fades().iter().all(|s| s.tint != FadeTint::Alpha));
+        // A dip's fade up from black starts on the first picture and keeps its length.
+        let (tl, fx) = cut(TransitionKind::DipToBlack, 0.8);
+        let up = timing(&tl, &fx, 1).fades()[0];
+        assert_eq!(
+            (up.edge, up.tint, up.st, up.d),
+            (FadeEdge::In, FadeTint::Black, 10.5, fx[1].black_in)
+        );
     }
 
     #[test]

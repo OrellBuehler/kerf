@@ -138,9 +138,11 @@ pub struct StreamInfo {
     /// its saturation to the RGB gamut clip.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color_space: Option<String>,
-    /// Seconds between the file's start and this video stream's first frame, when the
-    /// video starts after the sound (above a millisecond; ffprobe's stream `start_time`
-    /// less the format's). The export seeks and places the picture by it, so a clip cut
+    /// Seconds between the start of the file's picture and sound and this video stream's
+    /// first frame, when the video starts after the sound: the stream's `start_time` less the
+    /// earliest video or audio stream's (not the container's, which a text track can pull
+    /// earlier), above a millisecond and below the duration (a start at or past the end is a
+    /// broken one and reads 0). The export seeks and places the picture by it, so a clip cut
     /// from inside the lead keeps the source's sync (see `clip_timing::picture_delay`).
     /// Defaulted (and omitted at 0) so older `.kerf` JSON still deserializes, as an
     /// ordinary start.

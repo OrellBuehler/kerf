@@ -32,8 +32,9 @@ pub fn probe(path: &Path) -> Result<ProbeResult> {
     let ictx = ff::format::input(&path)?;
     let duration = (ictx.duration() as f64 / f64::from(ff::ffi::AV_TIME_BASE)).max(0.0);
 
-    // The container's start is the earliest of its streams' (what libavformat makes
-    // `start_time` of), in seconds; a video stream's lead is how far after it the video starts.
+    // The earliest start of the file's picture and sound streams, in seconds (not the
+    // container's, which a text track can pull earlier): a video stream's lead is how far
+    // after it the video starts, as the ffprobe path measures it.
     let start_of = |stream: &ff::format::stream::Stream| {
         let t = stream.start_time();
         (t != ff::ffi::AV_NOPTS_VALUE).then(|| t as f64 * f64::from(stream.time_base()))

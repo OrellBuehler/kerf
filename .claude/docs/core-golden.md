@@ -110,7 +110,9 @@
   retarget moved 248 of 6400 cases (235 export / 89 still / 151 preview), all of them `i % 19 == 6` (`KERF_GOLDEN_CASES` before / after). New
   families `late-start-delay` / `preview-late-start-delay` (`)/TB`, the `+(start+delay)/TB` spelling): 110 / 74 cases. Starting a
   fade-in on the first picture then moved 77 cases (65 export / 8 still / 36 preview), all `i % 19 == 6` and all but three of them
-  with a fade, dip or dissolve family (with the fade change compiled out the committed digests held).
+  with a fade, dip or dissolve family (with the fade change compiled out the committed digests held). Ending a late
+  clip's dissolve ramp with the outgoing tail (and never emitting a fade of no length) moved 2 export cases, both
+  `i % 19 == 6` dissolves; still and preview stayed.
 - **Sample-exact `adelay`** (a clip starting between milliseconds is delayed by samples)
   re-blessed `export.txt` alone: 2718 of 4800 cases moved, exactly the new
   `audio-delay-samples` family (`S:all=1`); still and preview carry no sound.

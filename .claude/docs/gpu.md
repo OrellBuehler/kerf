@@ -338,7 +338,8 @@ in `tests/cursor.rs`'s microsecond mp4 differ between the two spellings; it hold
 a window that starts inside it is opened with no seek (`FpsPick::seek` is `0`), and its first frame's
 slot is the clip's start plus `picture_delay`, so the output frames before it pick nothing — the
 layer is not drawn, as in the export (`tests/motion_parity.rs`, `late/*`: head, inside the lead,
-past it, speed 2 / 0.5, reversed, a fade-in, over another track, exact). `cursor.pick(&Pick)` reads until `Pick::progress`
+past it, speed 2 / 0.5, reversed, a fade-in at 30 and 25 fps — where the 0.3 s lead is half a
+frame —, entering through a dissolve, one inside the lead and a dip, over another track, exact). `cursor.pick(&Pick)` reads until `Pick::progress`
 decides and returns the shown frame, so its answer is `Pick::select`'s over the whole file — which
 `picked.rs` holds to the export's rendered frames — **where `-ss` lands on the frame the timestamps
 say**: a seek that lands on a later keyframe (a seek into the frames an open GOP's keyframe leads;

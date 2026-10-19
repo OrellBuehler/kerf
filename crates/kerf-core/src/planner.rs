@@ -23,8 +23,9 @@
 //!    exact quantity (the slot boundary the source-frame pick works from) is
 //!    [`Rational::exact_time`];
 //! 2. an outgoing clip plays on its `tail`: its window and source reach past its end;
-//! 3. fades, dips and the dissolve ramp are timed from the clip's start, over a
-//!    duration that includes the tail; slide and push offsets join the position;
+//! 3. fades, dips and the dissolve ramp are timed from the clip's start (a fade-in from its
+//!    first picture, `picture_delay` later on a late-starting source), over a duration that
+//!    includes the tail; slide and push offsets join the position;
 //! 4. a keyframed clip is never padded and always runs `scale eval=frame`
 //!    ([`Placement`](crate::layer_geometry::Placement));
 //! 5. keyframed opacity is a `geq` alpha rather than the RGB round trip, and a keyframed
@@ -485,7 +486,10 @@ impl Planner {
     ///   restarts from the cut, and with the outgoing clip gone the incoming one fades up from
     ///   black instead of crossing it.
     ///
-    /// So a clip that fades in is in the way from its start to the end of the fade, and one that
+    /// So a clip that fades in is in the way from its start to the end of the fade — from its
+    /// start, not the fade's: a late-starting source's fade begins on its first picture
+    /// (`picture_delay` in), and a stream started in the gap before it would lose the fade
+    /// too — and one that
     /// transitions out is in the way from `lead` before its end (the transition's length on its
     /// side) to its end — closed at the end, since a stream starting *on* the cut has lost the
     /// outgoing clip altogether.
@@ -497,7 +501,7 @@ impl Planner {
                 clip.fades
                     .iter()
                     .filter(|f| f.edge == FadeEdge::In)
-                    .map(|f| (f.st, f.st + f.d)),
+                    .map(|f| (start, f.st + f.d)),
             );
             windows.extend(clip.fx.move_in.map(|(_, _, secs)| (start, start + secs)));
             let lead = clip.fx.tail.max(clip.fx.black_out).max(clip.fx.white_out);
@@ -2381,6 +2385,23 @@ mod tests {
         tl.tracks.push(video_track(vec![over]));
         let span = planner(&tl, &assets, PlanMode::Motion, &opts(30.0)).span(0.0, 6.0, (1920, 1080), &GpuCaps::A0);
         assert_eq!(span.handover(4.2).stream_start, 2.5);
+        // A late-starting source's fade-in starts on its first picture, half a second in; the gap
+        // before it is in the way as well, or the slice would drop the fade.
+        let mut late = asset();
+        late.streams[0].lead = 0.5;
+        let mut faded = make_clip(late.id, 0.0, 3.0, 10.0);
+        faded.fade_in = 0.4;
+        let tl = single(vec![faded]);
+        let assets = [late];
+        let span = planner(&tl, &assets, PlanMode::Motion, &opts(30.0)).span(10.0, 13.0, (1920, 1080), &GpuCaps::A0);
+        assert_eq!(
+            (
+                span.handover(10.3).stream_start,
+                span.handover(10.8).stream_start,
+                span.handover(11.0).stream_start
+            ),
+            (10.0, 10.0, 11.0)
+        );
     }
 
     #[test]
