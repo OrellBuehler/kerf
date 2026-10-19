@@ -67,6 +67,8 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # kerf-app's tauri-build embeds the frontend at compile time, so it must exist.
       - name: Build frontend
         working-directory: frontend
@@ -101,6 +103,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: msrv-${{ env.MSRV }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Build frontend
         working-directory: frontend
         run: |
@@ -246,6 +249,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: engine-${{ matrix.os }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run the ffmpeg-binary tests
         shell: bash
         run: |
@@ -348,6 +352,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: parity-${{ matrix.ffmpeg }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Run the parity harness
         run: cargo test -p kerf-gpu --no-default-features --locked -- --ignored
       # A failing case leaves its reference / GPU / diff images behind.
