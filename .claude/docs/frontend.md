@@ -427,7 +427,11 @@ the value it has there (◆ when a key sits there, and clicking it takes the key
 the number static), and once a number is keyed its slider shows the curve at the playhead and an edit
 writes a key there — `setCol` / `setGain` / `keyAtPlayhead` over `set_property_keyframes` with the
 mirror's `upsertKey`, so a drag is one edit (every number row is a `SliderRow`, below). The Transform sliders do the same for numbers keyed on
-their own; the Animation list is still the legacy bundle's. **The dope sheet** (`DopeSheet.svelte`, panel id
+their own, and so do the **mask's** five numbers (`maskAt`, `setMaskNumber`: a key at the playhead while keyed, else the
+static mask; a live drag of a keyed one is not drafted, `maskDraft` returns null as `colorDraft` does). The Framing section's
+**Crop motion** rows (Zoom, Pan X, Pan Y — the animated crop, a window of the picture inside the static edges above) have no
+static value: an edit there is always a key at the playhead (`setCropNumber`), and the group's *Clear* takes every crop key out
+in one edit (*Reset crop* is the static edges'); the section's summary names both (`Cropped · Crop motion`); the Animation list is still the legacy bundle's. **The dope sheet** (`DopeSheet.svelte`, panel id
 `keyframes`, titled *Keyframes*; in the Motion preset between the preview and the inspector, `EARLIER_PRESETS.motion`
 is the arrangement before it) shows the selected clip: one row per keyed number (`dopeRows`, the resolver's keys, so a
 bundle-driven transform number has a row too), its keys as diamonds on one axis over the clip's span (and past it, shaded,
@@ -1260,6 +1264,7 @@ modifiers — the old handler ignored extra Shift/Alt and took ⌘ or Ctrl every
 stays Save as a second default, ⇧J-style accidents and Ctrl-on-Mac are gone), plus the
 bare keys added since (`ADDED`: N / Y / U / Q / W / S) and the modified chords added for linked A/V
 (`ADDED_SHIFT` ⇧D detach, `ADDED_MOD` ⌘L link, ⌘K split, ⌘G go to timecode and ⌘T add title, `ADDED_MOD_SHIFT` ⇧⌘D reattach / ⇧⌘L unlink). **Split at playhead** is `edit.split` (⌘K; Edit menu and the clip menu, which says why when it is off): the selected clips the playhead is inside, or — nothing selected — every clip under it, cut on the frame it is on, a link group as one cut (`planPlayheadSplit`, `key-edits.ts`; one Undo per cut made). **Roll, slip and slide have keys**, a frame a press (`repeat: false`, since each press is a revision): `<` / `>` roll the cut nearest the playhead (the playhead follows it), `Alt+,` / `Alt+.` slip the selected clip's footage, `Mod+Alt+,` / `Mod+Alt+.` slide it — each tried first on a scratch copy through `previewEdit` (the drags' own port), so a limit or a locked track is a sentence, not a refusal from the backend. **`?` opens the shortcut cheat sheet** (`ShortcutSheet`, `shortcut-sheet.ts`: every key in force, grouped as the settings list is, read-only; Help › Keyboard shortcuts…) and *Customize keyboard shortcuts…* is the rebinding editor (`app.keyboard`) — the two used to be one dialog. The registry's *Save project…* is one label for one command; the File menu says *Save project as…* once the project has a file.
+**A long timeline lane culls its clips** (`frontend-timeline.md`): a clip outside the visible window, or a narrow one drawn on the lane's canvas, has no button, so Tab and the clip keys reach only the clips in view; scroll or zoom to one first.
 **Only what the user changed is stored** (`Settings.keybindings`, opaque to Rust
 like `theme`: `{ version, bindings: { id: [chord…] } }`, patch-written, `null` when
 nothing is customised), so an untouched action follows the running build's defaults
