@@ -3,7 +3,7 @@
 // proxy), which made the menu 960 px tall and left the Inspector saying "Select a clip" with an asset
 // selected. Pure, so the lines are tested and the menu can be the actions only.
 
-import { doneCount, doneSummary, kindInfo } from './analysis-steps';
+import { doneCount, kindInfo } from './analysis-steps';
 import { analysisFacts, shortPath, type MediaInfo } from './media-info';
 import { proxyFacts } from './proxy-info';
 import type { Asset, AnalysisStatus, AssetAnalysis, ProxyStatus } from './types';
@@ -18,7 +18,9 @@ export interface Fact {
 export interface AssetFacts {
 	/** The file: its length, frame, codec, projection, where it is used. */
 	media: Fact[];
-	/** What analysis has found, kind by kind. */
+	/** How much analysis has run, for the section's summary: `2 of 5`, `running…`. The chips say which. */
+	analyzed: string;
+	/** The kinds that failed, with their reasons, then what analysis has found. */
 	analysis: Fact[];
 	/** The preview proxy. Empty for a file that never gets one. */
 	proxy: Fact[];
@@ -53,13 +55,11 @@ export function assetFacts(o: {
 	if (!Number.isNaN(imported.getTime())) media.push({ label: 'Imported', value: imported.toLocaleDateString() });
 	media.push({ label: 'Path', value: shortPath(asset.path), title: asset.path });
 
-	const analysis: Fact[] = [
-		{ label: 'Analyzed', value: o.analyzing ? 'running…' : doneCount(o.status), title: doneSummary(o.status) }
-	];
+	const analysis: Fact[] = [];
 	for (const k of o.status?.kinds ?? []) {
 		if (k.state === 'failed') analysis.push({ label: kindInfo(k.kind).label, value: 'failed', title: k.reason ?? undefined });
 	}
 	for (const f of analysisFacts(o.analysis, asset.duration)) analysis.push(f);
 
-	return { media, analysis, proxy: proxyFacts(o.proxy) };
+	return { media, analyzed: o.analyzing ? 'running…' : doneCount(o.status), analysis, proxy: proxyFacts(o.proxy) };
 }

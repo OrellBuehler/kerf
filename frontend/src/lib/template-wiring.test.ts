@@ -12,12 +12,12 @@ const read = (path: string) => readFileSync(join(SRC, path), 'utf8');
 const EDITOR = 'lib/components/editor/';
 
 describe('the Templates section', () => {
-	test('is part of the Titles controls, so the library tab and the Inspector’s Titles lane both have it', () => {
+	test('is part of the Titles controls, the library’s Titles tab — the Inspector edits a selection and adds nothing', () => {
 		const titles = read(`${EDITOR}TitlesControls.svelte`);
 		expect(titles).toContain("import TemplatesSection from './TemplatesSection.svelte'");
 		expect(titles).toContain('<TemplatesSection />');
 		expect(read(`${EDITOR}LibraryPanel.svelte`)).toContain('<TitlesControls />');
-		expect(read(`${EDITOR}Inspector.svelte`)).toContain('<TitlesControls />');
+		expect(read(`${EDITOR}Inspector.svelte`)).not.toContain('TitlesControls');
 	});
 
 	test('reads the library when it opens and again on `templates-changed`, and lets go of the listener', () => {
