@@ -139,6 +139,7 @@ pub use cli::{
     source_is_indexed_container, text_raster_graph, text_still_filter, TextPart, TextRasterGraph,
 };
 pub(crate) use cli::{keyframe_value, proxy_fidelity, ProxyFidelity};
+pub use colors::color_rgb;
 pub(crate) use colors::{safe_color, valid_color};
 
 // Speech models: the download itself, plus what can be downloaded. Re-exported

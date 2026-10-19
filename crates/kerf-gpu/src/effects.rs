@@ -29,8 +29,17 @@
 //!   made exactly, so no backend's contraction into a fused multiply-add can change a level), which is
 //!   what `vignette.wgsl` does; [`vignette_planes`] is the filter on a frame. Exact, held to FFmpeg's
 //!   output byte for byte.
+//! * **chroma key** is `chromakey` (8-bit, after `format=yuva420p`): an alpha for each luma sample from
+//!   the 3x3 window of chroma samples around it, the mean of nine `sqrt((du² + dv²) / (255² * 2))` from the
+//!   key's U, V ([`chroma_key_uv`]) summed in `double`, then `(mean - similarity) / blend` clipped and
+//!   scaled to 255 (or a hard 0 / 255 at a blend of 0.0001 or less). Outside the picture a window entry
+//!   keeps what the filter last wrote there in the same slice, the key colour at a slice's start, so a
+//!   slice's first sample depends on the graph's thread count ([`chroma_key_source`]). The shader sums the
+//!   terms in integers ([`chroma_key_add`]) and counts the thresholds the sum reaches
+//!   ([`chroma_key_thresholds`]), which hold the rest of the `double` arithmetic; [`chroma_key_plane`] is
+//!   the filter as written. Exact.
 //!
-//! None of it is on the alpha plane (FFmpeg runs these ahead of `format=yuva420p`).
+//! Only the chroma key reaches the alpha plane (it follows `format=yuva420p`); FFmpeg runs the rest ahead of it.
 
 /// `gblur`'s numbers for one sigma (the same in both directions: Kerf never sets `sigmaV`).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -334,9 +343,447 @@ pub fn vignette_planes(y: &[u8], u: &[u8], v: &[u8], w: u32, h: u32, n: u64) -> 
     [out_y, out_u, out_v]
 }
 
+/// A chroma key as the filter holds it: the key colour's U and V ([`chroma_key_uv`]) and its two
+/// options, `float`s.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ChromaKeyOptions {
+    pub uv: [u8; 2],
+    pub similarity: f32,
+    pub blend: f32,
+}
+
+/// `chromakey`'s key colour in the picture's chroma (`RGB_TO_U` / `RGB_TO_V`: BT.601 in 10-bit fixed
+/// point, `lrint` coefficients, the `>> 10` flooring).
+pub fn chroma_key_uv(rgb: [u8; 3]) -> [u8; 2] {
+    let [r, g, b] = rgb.map(i32::from);
+    let u = ((-173 * r - 339 * g + 512 * b + 511) >> 10) + 128;
+    let v = ((512 * r - 429 * g - 83 * b + 511) >> 10) + 128;
+    [u as u8, v as u8]
+}
+
+/// How many distances squared a chroma sample can be from the key: `du² + dv²` for `du`, `dv` in
+/// `-255..=255`, at most `2 * 255²`.
+pub const CHROMA_KEY_TERMS: usize = 2 * 255 * 255 + 1;
+
+/// One sample's term of the key's distance sum: `sqrt(d2 / (255 * 255 * 2))` in `double`.
+pub fn chroma_key_term(d2: u32) -> f64 {
+    (f64::from(d2) / (255.0 * 255.0 * 2.0)).sqrt()
+}
+
+/// Every [`chroma_key_term`] as `double` bits, `d2` from 0: the table the shader sums from.
+pub fn chroma_key_terms() -> Vec<u64> {
+    (0..CHROMA_KEY_TERMS as u32).map(|d2| chroma_key_term(d2).to_bits()).collect()
+}
+
+/// The alpha `chromakey` makes of a sample's distance sum (nine terms, added in `double` in their
+/// order): the mean, then `(mean - similarity) / blend` clipped to 0..1 and scaled to 255 (truncated),
+/// or with a blend of 0.0001 or less 255 past the similarity and 0 within it. The option values are
+/// `float`s.
+pub fn chroma_key_alpha(sum: f64, similarity: f32, blend: f32) -> u8 {
+    let diff = sum / 9.0;
+    let (similarity, blend) = (f64::from(similarity), f64::from(blend));
+    if blend > 0.0001 {
+        (((diff - similarity) / blend).clamp(0.0, 1.0) * 255.0) as u8
+    } else if diff > similarity {
+        255
+    } else {
+        0
+    }
+}
+
+/// For each alpha level 1..=255 the least distance sum (`double` bits) that reaches it, `u64::MAX` for
+/// one no sum reaches. Every step of [`chroma_key_alpha`] is monotone in the sum and a non-negative
+/// `double`'s bits are in its order, so a sample's alpha is the number of thresholds its sum's bits
+/// reach: the shader adds the nine terms exactly and counts, and never divides.
+pub fn chroma_key_thresholds(similarity: f32, blend: f32) -> Vec<u64> {
+    let top = 9.0f64.to_bits();
+    let alpha = |bits: u64| u32::from(chroma_key_alpha(f64::from_bits(bits), similarity, blend));
+    (1..=255u32)
+        .map(|k| {
+            if alpha(top) < k {
+                return u64::MAX;
+            }
+            let (mut lo, mut hi) = (0u64, top);
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if alpha(mid) >= k {
+                    hi = mid;
+                } else {
+                    lo = mid + 1;
+                }
+            }
+            lo
+        })
+        .collect()
+}
+
+/// The sum of two non-negative `double`s (`[hi, lo]` bits, normal or zero), rounded to nearest even, in
+/// 32-bit integers: what `chromakey.wgsl` does, step for step (WGSL has no `f64`).
+pub fn chroma_key_add(a: [u32; 2], b: [u32; 2]) -> [u32; 2] {
+    if a == [0, 0] {
+        return b;
+    }
+    if b == [0, 0] {
+        return a;
+    }
+    let (a, b) = if (a[0] >> 20) >= (b[0] >> 20) { (a, b) } else { (b, a) };
+    let mut e = a[0] >> 20;
+    let d = e - (b[0] >> 20);
+    // Each mantissa with its implicit bit, shifted up so its top is bit 62: ten bits below to round in.
+    let wide = |x: [u32; 2]| -> [u32; 2] {
+        let h = (x[0] & 0xf_ffff) | 0x10_0000;
+        [(h << 10) | (x[1] >> 22), x[1] << 10]
+    };
+    let ma = wide(a);
+    let mut mb = wide(b);
+    // `b` down to `a`'s exponent, what falls off kept as a sticky bit.
+    if d >= 64 {
+        mb = [0, 1];
+    } else if d >= 32 {
+        let s = d - 32;
+        let lost = mb[1] != 0 || (s > 0 && (mb[0] & ((1u32 << s) - 1)) != 0);
+        mb = [0, (if s == 0 { mb[0] } else { mb[0] >> s }) | u32::from(lost)];
+    } else if d > 0 {
+        let lost = (mb[1] & ((1u32 << d) - 1)) != 0;
+        mb = [mb[0] >> d, (mb[1] >> d) | (mb[0] << (32 - d)) | u32::from(lost)];
+    }
+    let lo = ma[1].wrapping_add(mb[1]);
+    let carry = u32::from(lo < ma[1]);
+    let mut sum = [ma[0] + mb[0] + carry, lo];
+    if sum[0] & 0x8000_0000 != 0 {
+        let lost = sum[1] & 1;
+        sum = [sum[0] >> 1, (sum[1] >> 1) | (sum[0] << 31) | lost];
+        e += 1;
+    }
+    let rest = sum[1] & 0x3ff;
+    let mut keep = [sum[0] >> 10, (sum[1] >> 10) | (sum[0] << 22)];
+    if rest > 0x200 || (rest == 0x200 && keep[1] & 1 == 1) {
+        keep[1] = keep[1].wrapping_add(1);
+        if keep[1] == 0 {
+            keep[0] += 1;
+        }
+        if keep[0] == 0x20_0000 {
+            keep = [0x10_0000, 0];
+            e += 1;
+        }
+    }
+    [(e << 20) | (keep[0] & 0xf_ffff), keep[1]]
+}
+
+/// Where entry `(xo, yo)` of `chromakey`'s 3x3 window holds its value from at luma sample `(x, y)` of a
+/// `w` x `h` picture in the slice that starts at row `s0`: the neighbour itself when it is in the
+/// picture; else what the entry kept from the last sample of the slice that wrote it (the filter skips
+/// the write and the array runs on): the same row's column `w - 1` on the right edge, else the previous
+/// row's last write (column `w - 2` for the left entry, `w - 1` otherwise, one row up from the
+/// neighbour); `None` where nothing in the slice wrote it, the key colour the slice began with.
+/// For `w`, `h` of 2 or more.
+pub fn chroma_key_source(x: u32, y: u32, xo: u32, yo: u32, w: u32, h: u32, s0: u32) -> Option<(u32, u32)> {
+    let (cx, cy) = (i64::from(x) + i64::from(xo) - 1, i64::from(y) + i64::from(yo) - 1);
+    let (w, h) = (i64::from(w), i64::from(h));
+    if (0..w).contains(&cx) && (0..h).contains(&cy) {
+        return Some((cx as u32, cy as u32));
+    }
+    if (0..h).contains(&cy) && cx >= w {
+        return Some(((w - 1) as u32, cy as u32));
+    }
+    let col = if xo == 0 { w - 2 } else { w - 1 };
+    let row = i64::from(y) + i64::from(yo) - 2;
+    (i64::from(y) > i64::from(s0) && row >= 0).then_some((col as u32, row as u32))
+}
+
+/// The row slice `j` of `n` starts at (`ff_slice_pos`).
+pub fn chroma_key_slice_start(h: u32, j: u32, n: u32) -> u32 {
+    (u64::from(h) * u64::from(j) / u64::from(n)) as u32
+}
+
+/// `chromakey`'s alpha plane for a `w` x `h` `yuva420p` picture's chroma `u`, `v` (each `ceil(w/2)` x
+/// `ceil(h/2)`): `vf_chromakey.c` as written, slice by slice (`slices` threads: the slice count is
+/// `min(h, threads)`, and each slice starts its window over at the key colour).
+pub fn chroma_key_plane(u: &[u8], v: &[u8], w: u32, h: u32, key: &ChromaKeyOptions, slices: u32) -> Vec<u8> {
+    let ChromaKeyOptions {
+        uv: key,
+        similarity,
+        blend,
+    } = *key;
+    let cw = w.div_ceil(2) as usize;
+    let mut alpha = vec![0u8; w as usize * h as usize];
+    let n = slices.clamp(1, h.max(1));
+    for j in 0..n {
+        let (s0, s1) = (chroma_key_slice_start(h, j, n), chroma_key_slice_start(h, j + 1, n));
+        let (mut wu, mut wv) = ([key[0]; 9], [key[1]; 9]);
+        for y in s0..s1 {
+            for x in 0..w {
+                for yo in 0..3u32 {
+                    for xo in 0..3u32 {
+                        let (cx, cy) = (i64::from(x) + i64::from(xo) - 1, i64::from(y) + i64::from(yo) - 1);
+                        if (0..i64::from(w)).contains(&cx) && (0..i64::from(h)).contains(&cy) {
+                            let at = (cy as usize >> 1) * cw + (cx as usize >> 1);
+                            wu[(yo * 3 + xo) as usize] = u[at];
+                            wv[(yo * 3 + xo) as usize] = v[at];
+                        }
+                    }
+                }
+                let mut sum = 0.0f64;
+                for i in 0..9 {
+                    let du = i32::from(wu[i]) - i32::from(key[0]);
+                    let dv = i32::from(wv[i]) - i32::from(key[1]);
+                    sum += chroma_key_term((du * du + dv * dv) as u32);
+                }
+                alpha[(y * w + x) as usize] = chroma_key_alpha(sum, similarity, blend);
+            }
+        }
+    }
+    alpha
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn bits(x: [u32; 2]) -> u64 {
+        (u64::from(x[0]) << 32) | u64::from(x[1])
+    }
+
+    fn halves(x: u64) -> [u32; 2] {
+        [(x >> 32) as u32, x as u32]
+    }
+
+    /// A deterministic stream of numbers for the tests below.
+    fn stream(seed: u64) -> impl FnMut() -> u64 {
+        let mut state = seed;
+        move || {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            state >> 11
+        }
+    }
+
+    #[test]
+    fn the_key_colour_is_ffmpegs_fixed_point_bt601() {
+        assert_eq!(chroma_key_uv([0, 128, 0]), [86, 74]);
+        assert_eq!(chroma_key_uv([0, 0, 0]), [128, 128]);
+        assert_eq!(chroma_key_uv([255, 255, 255]), [128, 128]);
+        assert_eq!(chroma_key_uv([0, 0, 255]), [255, 107]);
+        assert_eq!(chroma_key_uv([255, 0, 0]), [85, 255]);
+    }
+
+    #[test]
+    fn the_integer_sum_is_the_double_sum() {
+        let terms = chroma_key_terms();
+        let mut next = stream(3);
+        // Nine terms at a time, as the filter adds them.
+        for _ in 0..200_000 {
+            let (mut sum, mut emulated) = (0.0f64, [0u32; 2]);
+            for _ in 0..9 {
+                let t = terms[next() as usize % CHROMA_KEY_TERMS];
+                sum += f64::from_bits(t);
+                emulated = chroma_key_add(emulated, halves(t));
+                assert_eq!(bits(emulated), sum.to_bits(), "{sum:e}");
+            }
+        }
+        // Any two positive doubles, exponents near and far apart, ties included.
+        for _ in 0..2_000_000 {
+            let draw = |n: u64| ((900 + n % 200) << 52) | (n >> 8 & 0xf_ffff_ffff_ffff);
+            let (a, b) = (draw(next()), draw(next()));
+            let b = if next().is_multiple_of(4) {
+                (a & !0xff) | (b & 0xff)
+            } else {
+                b
+            };
+            let want = (f64::from_bits(a) + f64::from_bits(b)).to_bits();
+            assert_eq!(bits(chroma_key_add(halves(a), halves(b))), want, "{a:x} + {b:x}");
+        }
+        assert_eq!(bits(chroma_key_add([0, 0], halves(1.5f64.to_bits()))), 1.5f64.to_bits());
+    }
+
+    #[test]
+    fn the_thresholds_count_the_filters_alpha() {
+        let mut next = stream(5);
+        for (similarity, blend) in [
+            (0.15f32, 0.1f32),
+            (0.01, 0.5),
+            (0.3, 0.0),
+            (0.2, 0.000_05),
+            (1.0, 1.0),
+            (0.000_01, 0.0001),
+            (0.4, 0.25),
+        ] {
+            let th = chroma_key_thresholds(similarity, blend);
+            assert_eq!(th.len(), 255);
+            assert!(th.windows(2).all(|w| w[0] <= w[1]));
+            let alpha = |sum: u64| th.iter().filter(|t| sum >= **t).count();
+            let mut sums: Vec<u64> = (0..100_000).map(|_| next() % 9.0f64.to_bits()).collect();
+            sums.extend(th.iter().filter(|t| **t != u64::MAX).flat_map(|t| [t - 1, *t, t + 1]));
+            for sum in sums {
+                assert_eq!(
+                    alpha(sum),
+                    usize::from(chroma_key_alpha(f64::from_bits(sum), similarity, blend)),
+                    "{similarity} {blend} {:e}",
+                    f64::from_bits(sum)
+                );
+            }
+        }
+    }
+
+    /// The plane the shader's way: each entry where [`chroma_key_source`] says, the integer sum, the count of
+    /// thresholds reached.
+    fn by_rule(u: &[u8], v: &[u8], w: u32, h: u32, options: &ChromaKeyOptions, slices: u32) -> Vec<u8> {
+        let ChromaKeyOptions {
+            uv: key,
+            similarity,
+            blend,
+        } = *options;
+        let terms = chroma_key_terms();
+        let th = chroma_key_thresholds(similarity, blend);
+        let cw = w.div_ceil(2);
+        let n = slices.clamp(1, h);
+        let mut out = Vec::new();
+        for y in 0..h {
+            let j = (0..n).rev().find(|&j| chroma_key_slice_start(h, j, n) <= y).unwrap();
+            let s0 = chroma_key_slice_start(h, j, n);
+            for x in 0..w {
+                let mut sum = [0u32; 2];
+                for yo in 0..3 {
+                    for xo in 0..3 {
+                        let (cu, cv) = match chroma_key_source(x, y, xo, yo, w, h, s0) {
+                            Some((sx, sy)) => {
+                                let at = ((sy >> 1) * cw + (sx >> 1)) as usize;
+                                (u[at], v[at])
+                            }
+                            None => (key[0], key[1]),
+                        };
+                        let (du, dv) = (i32::from(cu) - i32::from(key[0]), i32::from(cv) - i32::from(key[1]));
+                        sum = chroma_key_add(sum, halves(terms[(du * du + dv * dv) as usize]));
+                    }
+                }
+                out.push(th.iter().filter(|t| bits(sum) >= **t).count() as u8);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn the_window_rule_and_the_thresholds_are_the_filter_as_written() {
+        let mut next = stream(9);
+        for w in 2..=13u32 {
+            for h in 2..=11u32 {
+                let (cw, ch) = (w.div_ceil(2) as usize, h.div_ceil(2) as usize);
+                // Chroma near the key, so the alpha is graded and every window entry counts.
+                let key = [86u8, 74u8];
+                let near = |c: u8, n: u64| (i32::from(c) + (n % 61) as i32 - 30) as u8;
+                let u: Vec<u8> = (0..cw * ch).map(|_| near(key[0], next())).collect();
+                let v: Vec<u8> = (0..cw * ch).map(|_| near(key[1], next())).collect();
+                for slices in [1, 2, 3, 5, 7, 16] {
+                    for (similarity, blend) in [(0.02f32, 0.2f32), (0.05, 0.0)] {
+                        let options = ChromaKeyOptions {
+                            uv: key,
+                            similarity,
+                            blend,
+                        };
+                        assert_eq!(
+                            by_rule(&u, &v, w, h, &options, slices),
+                            chroma_key_plane(&u, &v, w, h, &options, slices),
+                            "{w}x{h} {slices} slices {options:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "needs ffmpeg"]
+    fn the_reference_is_ffmpegs_chromakey_at_any_thread_count() {
+        let run = |args: &[&str], input: Option<Vec<u8>>| -> Vec<u8> {
+            let mut cmd = kerf_core::ffmpeg_command();
+            cmd.args(["-v", "error"]).args(args);
+            cmd.stdin(if input.is_some() {
+                std::process::Stdio::piped()
+            } else {
+                std::process::Stdio::null()
+            })
+            .stdout(std::process::Stdio::piped());
+            let mut child = cmd.spawn().expect("ffmpeg");
+            let feed = input.map(|data| {
+                let mut stdin = child.stdin.take().expect("stdin");
+                std::thread::spawn(move || std::io::Write::write_all(&mut stdin, &data))
+            });
+            let out = child.wait_with_output().expect("ffmpeg");
+            if let Some(feed) = feed {
+                feed.join().unwrap().expect("fed");
+            }
+            assert!(out.status.success());
+            out.stdout
+        };
+        for (w, h) in [(96u32, 54u32), (97, 55)] {
+            let size = format!("{w}x{h}");
+            for source in [
+                format!("testsrc2=size=128x72:rate=30:duration=1,scale={w}:{h}"),
+                format!(
+                    "color=c=green:size=128x72:rate=30:duration=1,noise=all_strength=60:all_flags=t,scale={w}:{h}:flags=neighbor"
+                ),
+            ] {
+                let src = run(
+                    &[
+                        "-f",
+                        "lavfi",
+                        "-i",
+                        &source,
+                        "-frames:v",
+                        "1",
+                        "-pix_fmt",
+                        "yuv420p",
+                        "-f",
+                        "rawvideo",
+                        "-",
+                    ],
+                    None,
+                );
+                let (luma, chroma) = ((w * h) as usize, (w.div_ceil(2) * h.div_ceil(2)) as usize);
+                let (u, v) = (&src[luma..luma + chroma], &src[luma + chroma..luma + 2 * chroma]);
+                for (color, similarity, blend) in [("green", 0.15, 0.1), ("green", 0.01, 0.5), ("0x20c040", 0.2, 0.0)] {
+                    let rgb = kerf_core::color_rgb(color).expect("colour");
+                    for threads in [1u32, 3, 5] {
+                        let filter = format!("format=yuva420p,chromakey={color}:{similarity}:{blend}");
+                        let out = run(
+                            &[
+                                "-filter_threads",
+                                &threads.to_string(),
+                                "-f",
+                                "rawvideo",
+                                "-pix_fmt",
+                                "yuv420p",
+                                "-s",
+                                &size,
+                                "-i",
+                                "-",
+                                "-vf",
+                                &filter,
+                                "-f",
+                                "rawvideo",
+                                "-pix_fmt",
+                                "yuva420p",
+                                "-",
+                            ],
+                            Some(src.clone()),
+                        );
+                        let alpha = &out[luma + 2 * chroma..2 * luma + 2 * chroma];
+                        let options = ChromaKeyOptions {
+                            uv: chroma_key_uv(rgb),
+                            similarity: similarity as f32,
+                            blend: blend as f32,
+                        };
+                        let want = chroma_key_plane(u, v, w, h, &options, threads);
+                        assert!(
+                            alpha == want.as_slice(),
+                            "{w}x{h} {source} {color} {similarity} {blend} {threads} threads"
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn a_plane_s_steps_are_the_lcg_at_every_sample() {

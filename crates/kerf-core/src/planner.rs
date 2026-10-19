@@ -1486,14 +1486,7 @@ mod tests {
     fn what_the_compositor_may_not_draw_is_a_function_of_the_plan_and_its_caps() {
         let a = asset();
         let mut clip = make_clip(a.id, 0.0, 4.0, 0.0);
-        clip.effects = vec![
-            VideoEffect::Blur { sigma: 2.0 },
-            VideoEffect::ChromaKey {
-                color: "green".into(),
-                similarity: 0.1,
-                blend: 0.1,
-            },
-        ];
+        clip.effects = vec![VideoEffect::Blur { sigma: 2.0 }, VideoEffect::Grayscale];
         clip.mask = Some(Mask::default());
         clip.fade_in = 2.0;
         let mut tl = single(vec![clip]);
@@ -1518,7 +1511,7 @@ mod tests {
             ..GpuCaps::A0
         };
         assert!(has(&plan.reasons(&blur, size), |u| matches!(u, Unsupported::Effects(..))));
-        let both = EffectKinds::BLUR.union(EffectKinds::CHROMA_KEY);
+        let both = EffectKinds::BLUR.union(EffectKinds::GRAYSCALE);
         let flips: [(GpuCaps, Gone); 3] = [
             (
                 GpuCaps {

@@ -272,7 +272,7 @@
   **What the compositor may draw is data**: `GpuCaps` (`Compositor::caps()`: the bits `motion`, `fades`,
   `transitions`, `dip_white`, `keyed_opacity`, `keyed_zoom`, `keyed_color`, `mask`, `text`, `reframe`, `hdr` and an
   `EffectKinds` bitset; today `GpuCaps::A0` plus every one of them but `keyed_color`, `reframe`, `hdr`
-  and the chroma-key kind), and **`RenderPlan::reasons(&caps,
+  with every effect kind), and **`RenderPlan::reasons(&caps,
   size)` is a pure function of the plan's fields** returning `Unsupported` values whose
   `Display` is the message the plan has always given — nothing is decided while planning,
   so one plan answers for any caps and an A5 pass is a flip beside the pass and its parity
@@ -320,10 +320,10 @@
   The policy condition is a **proxy measured only on FFmpeg 6.1.1 and 9.0.2** (5.x, 7.x, 8.x and distro builds are unmeasured).
   **`gpu_supported_at(size)` is the per-frame fallback switch** (`gpu_supported()` is
   its size-free half; `unsupported_reasons_at(size)` says *no, with reasons*) for
-  anything the compositor does not render exactly: video effects (`Effects(layer, what)`: names the effect and
-  why — a chroma key's alpha is a float colour distance — or the value
-  `gblur` / `unsharp` refuse itself: a sigma outside 0 to 1024, an amount outside -2 to 5; or what the picture changes: an invert, blur or sharpen on a full-range or never-recorded picture, an invert on a gray one, a vignette on anything but a limited-range `yuv420p` one (`vignette` works in the picture's own format); and in `reasons`, by render size, a sharpen after a scale or a blur: from the first scale or blur with sigma > 0, the worst case starts at 1 and each later non-zero sharpen adds `ceil(2 * err * |amount|)`, so the frame is refused past 2: one sharpen above 0.5, or a second one), masks (`Mask` without `caps.mask`;
-  `MaskWith(layer, what)` with it, on a rotated layer or one below full opacity; `Matte(layer, what)` for a blur, a sharpen or a vignette on a
+  anything the compositor does not render exactly: video effects (`Effects(layer, what)`: names the effect without its kind
+  in the caps, or the value
+  `gblur` / `unsharp` refuse itself: a sigma outside 0 to 1024, an amount outside -2 to 5; or what the picture changes: an invert, blur or sharpen on a full-range or never-recorded picture, an invert on a gray one, a vignette on anything but a limited-range `yuv420p` one (`vignette` works in the picture's own format), a chroma key on anything but a `yuv420p` one, or on a rotated or translucent layer; in `reasons` a chroma key after a scale ahead of the effects or a blur (its alpha moves by up to 1/blend levels for a level of chroma) or on a picture under two samples a side; a similarity or blend `chromakey` refuses itself (0.00001 to 1, 0 to 1); and in `reasons`, by render size, a sharpen after a scale or a blur: from the first scale or blur with sigma > 0, the worst case starts at 1 and each later non-zero sharpen adds `ceil(2 * err * |amount|)`, so the frame is refused past 2: one sharpen above 0.5, or a second one), masks (`Mask` without `caps.mask`;
+  `MaskWith(layer, what)` with it, on a rotated layer or one below full opacity, or over a chroma key; `Matte(layer, what)` for a blur, a sharpen, a vignette or a chroma key on a
   letterboxed picture, judged with the geometry in `reasons`: FFmpeg's `pad` hands them the padded frame, bars included — a mask is cut
   from that frame too and is drawn at the layer's size), 360 reframe,
   HDR, a text overlay it cannot reproduce (below), a fade or transition in progress, a non-bicubic scaler, a

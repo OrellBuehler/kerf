@@ -111,6 +111,26 @@ fn limited() -> bool {
     cpu_percent() < 100
 }
 
+/// The slice threads an export's filter graph runs: the budget's where [`limit_args`] caps them, else
+/// FFmpeg's own default (`avpriv_slicethread_create`: one more than the cores, at most 16; one on a single
+/// core). A filter that slices a frame can depend on it (`chromakey` starts its window over at each
+/// slice). FFmpeg counts the cores it may run on, `cores` also a cgroup's quota: where the two differ, so
+/// can this.
+pub fn graph_threads() -> usize {
+    graph_threads_for(cores(), budget_threads(), limited())
+}
+
+/// [`graph_threads`] for `cores`, a `budget` and whether it caps: pure, for the tests.
+pub fn graph_threads_for(cores: usize, budget: usize, limited: bool) -> usize {
+    if limited && budget > 0 && budget < cores {
+        budget
+    } else if cores > 1 {
+        (cores + 1).min(16)
+    } else {
+        1
+    }
+}
+
 // ---- the heavy-job gate -----------------------------------------------------
 
 /// Which of the machine's resources a heavy job spends, and so which slot it takes. The cores
@@ -811,6 +831,16 @@ mod tests {
     /// other test that takes the slot (see [`test_lock`]).
     fn exclusive() -> std::sync::MutexGuard<'static, ()> {
         test_lock()
+    }
+
+    #[test]
+    fn a_graph_runs_the_budgets_threads_where_they_are_capped_and_ffmpegs_default_else() {
+        assert_eq!(graph_threads_for(8, 4, true), 4);
+        assert_eq!(graph_threads_for(8, 8, true), 9);
+        assert_eq!(graph_threads_for(8, 4, false), 9);
+        assert_eq!(graph_threads_for(4, 4, false), 5);
+        assert_eq!(graph_threads_for(32, 32, false), 16);
+        assert_eq!(graph_threads_for(1, 1, true), 1);
     }
 
     #[test]

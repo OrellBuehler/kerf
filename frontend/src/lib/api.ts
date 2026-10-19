@@ -114,6 +114,8 @@ import type {
 	Task,
 	TemplateControl,
 	TemplateEdit,
+	TextBox,
+	TitleTextForm,
 	TemplateList,
 	TemplateSaved,
 	TextKeyframe,
@@ -170,6 +172,7 @@ import {
 } from './edit-modes';
 import { dissolveAllOrphans, linkPartners, withLinkPartners } from './link-groups';
 import * as ops from './link-ops';
+import { landingLocks } from './track-locks';
 import { runEdit } from './link-ops';
 import { sourceLimits } from './trim-tools';
 import { clampCeiling, clampDuckDepth, clampMasterVolume, DEFAULT_MASTER, estimateLevels, masterOf } from './levels';
@@ -233,6 +236,7 @@ import {
 	templatePosterDev
 } from './template-dev';
 import { checkTitleSpan, isTitleClip, placeTitleClip, titleClip, titleOf } from './title-clips';
+import { convertTitleTextIn, setTitleTextBoxIn } from './title-text';
 import { VOICE_IDS, DEFAULT_SPEED, DEFAULT_VOICE, clampSpeed, estimateSeconds, scriptSegments, voiceInfo } from './voiceover';
 
 export type { AudioDetached };
@@ -3507,6 +3511,29 @@ export async function setTemplateValues(overlayId: string, values: Record<string
 	return invoke<TemplateEdit>('set_template_values', { overlayId, values });
 }
 
+/** Give the `<text>` `element` of a title (floating or on a track, not a preset) a box: a width its lines wrap to, or
+ *  that it shrinks to fit on one line (`width: null` takes it away). A box is drawn only by glyph outlines, so the
+ *  title's text is set as outlines again; a box for a text that cannot be one rejects with why. One edit. */
+export async function setTitleTextBox(titleId: string, element: string, textBox: TextBox): Promise<TemplateEdit> {
+	if (!inTauri()) {
+		const { overlay, clip, warnings } = setTitleTextBoxIn(devTimeline, titleId, element, textBox);
+		recordDev('Set text box');
+		return { timeline: snapshot(), overlay_id: overlay?.id, clip_id: clip?.id, warnings };
+	}
+	return invoke<TemplateEdit>('set_title_text_box', { titleId, element, textBox });
+}
+
+/** Draw a title's text as glyph outlines (the same on every machine, and what a box needs) or with its fonts again.
+ *  Each text that cannot be an outline says why in the warnings; a title none of whose text can rejects. One edit. */
+export async function convertTitleText(titleId: string, form: TitleTextForm): Promise<TemplateEdit> {
+	if (!inTauri()) {
+		const { overlay, clip, warnings } = convertTitleTextIn(devTimeline, titleId, form);
+		recordDev(form === 'outlines' ? 'Draw text as outlines' : 'Draw text with its fonts');
+		return { timeline: snapshot(), overlay_id: overlay?.id, clip_id: clip?.id, warnings };
+	}
+	return invoke<TemplateEdit>('convert_title_text', { titleId, form });
+}
+
 /** Add a library template as a title clip on a video track, so it takes transitions (a dip to white from the shot
  *  before it), fades and keys and extends like any clip. It runs from `start` for `duration` seconds (default: its own
  *  length) on `trackId` (default: the lowest video track free over its span, else a new one on top). Resolves to the
@@ -4389,8 +4416,14 @@ export async function getStagedTimeline(): Promise<Timeline | null> {
 export async function applyStagedEdit(force = false): Promise<Timeline> {
 	if (!inTauri()) {
 		if (!devStaged) throw new Error('no staged edit is pending');
-		if (devStagedStale() && !force) throw new Error(STALE_MESSAGE);
-		devTimeline = structuredClone(devStaged.timeline);
+		const stale = devStagedStale();
+		if (stale && !force) throw new Error(STALE_MESSAGE);
+		const landing = structuredClone(devStaged.timeline);
+		if (stale) {
+			// Forced over newer work, the locks are the user's as they are now (`apply_staged`).
+			landingLocks(landing, devStaged.base, devTimeline);
+		}
+		devTimeline = landing;
 		recordDev(devStaged.edit.note ?? 'Agent edit');
 		devHistory[devHead].source = 'agent';
 		// Accepting the edits finishes the task they were staged under, as `apply_staged` does.

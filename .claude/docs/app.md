@@ -153,7 +153,11 @@ floating one, `clip_id` for one on a track), and what the sanitiser or the machi
 `apply_template_clip { templateId, values, start, duration?, trackId?, name? }` (prepared before the lock, then
 `apply_template_clip_parsed`), `add_title_clip { svg, start, duration?, trackId?, name? }` (`SvgDoc::parse` before the lock) and
 `update_title_clip { clipId, patch: TitleClipPatch }` answer a `TemplateEdit` with `clip_id`; `set_template_values` takes a title
-clip's id as `overlayId` (`set_title_values_parsed`). The library is app-level (not undone, not staged);
+clip's id as `overlayId` (`set_title_values_parsed`). **A title's text** (any title but a preset, floating or on a track):
+`set_title_text_box { titleId, element, textBox: {width, fit} }` and `convert_title_text { titleId, form: "outlines" | "text" }`
+take `title_text_inputs` under the lock, prepare with it released (`TitleTextInputs::text_box` / `convert`: the sanitiser and the
+text engine) and store with `set_title_text_parsed` (same "try again" rule) through one helper, `title_text_edit`, answering a
+`TemplateEdit`. The library is app-level (not undone, not staged);
 `generate_captions` / `clear_captions` (caption the whole cut, in timeline
 time), `import_captions` / `import_captions_text` (a subtitle file by path / by text —
 the text variant is what an `<input type=file>` or a paste uses; both return
@@ -374,7 +378,7 @@ comes back `ForbiddenUrl` and the "Release notes" button silently does nothing.
 `update_marker`, `remove_marker`, `add_overlay`, `update_overlay`, `remove_overlay`, `set_overlay_keyframes`,
 `add_svg_overlay`, `update_svg_overlay`, `remove_svg_overlay`, `validate_svg`, `list_svg_presets`,
 `svg_preset_preview`, `list_templates`, `template_poster`, `svg_element_ids`, `template_image_value`, `save_template`,
-`apply_template`, `apply_template_clip`, `add_title_clip`, `update_title_clip`, `set_template_values`, `import_template`, `export_template`, `delete_template`, `generate_captions`, `clear_captions`, `import_captions`, `import_captions_text`, `export_srt`, `export_captions`, `export_interchange`, `export_markers`,
+`apply_template`, `apply_template_clip`, `add_title_clip`, `update_title_clip`, `set_template_values`, `set_title_text_box`, `convert_title_text`, `import_template`, `export_template`, `delete_template`, `generate_captions`, `clear_captions`, `import_captions`, `import_captions_text`, `export_srt`, `export_captions`, `export_interchange`, `export_markers`,
 `refine_transcript`;
 *history and review* `get_history`, `revision_diff`, `undo`, `redo`, `revert_to`, `get_staged_edit`,
 `get_staged_timeline`, `apply_staged_edit`, `apply_staged_subset`, `discard_staged_edit`, `undo_staged_edit`,
@@ -444,7 +448,7 @@ measured colour policy, at the start of the output frame whose slot holds the ti
 timings?}`: the GPU when `RenderPlan::reasons(caps, size)` is empty and everything works,
 else FFmpeg's JPEG **of that frame, in the same call**, with the plan's reasons (a refusal
 is not an error). Titles and captions are part of what the compositor draws (`caps.text`: FFmpeg rasterises each distinct
-overlay once and the GPU blends it, `gpu.md`); a frame is refused for text only under 12 px or in a named font with no bold face. A paused frame inside a fade, dip, dissolve, slide or push is drawn too (a still plan holds the running fades, the travel and the outgoing clip's tail: `caps.fades` / `transitions` / `dip_white`, `gpu.md`; refused: a black or white fade on a layer below full opacity, a dip to white on an alpha plane, a letterboxed, odd or resized layer or a picture that is not 8-bit `yuv420p`, and a full-range picture inside a fade under FFmpeg 9). A moving zoom, masks and the blur / sharpen / grayscale / invert / vignette effects are drawn as well (`caps.keyed_zoom` / `mask` / `effects`, `gpu.md`; refused: a vignette on a letterbox or a picture that is not limited-range `yuv420p`, a chroma key, a rotation, an opacity below 1 or a dip to white in front of a moving zoom, a mask on a rotated or translucent layer, a blur or a sharpen on a letterbox, an invert / blur / sharpen on a full-range picture, an invert on a gray one, a sharpen after a scale or a blur that carries its difference past two levels: one above 0.5, or a second). The device, compositor, `FrameSource` and presenter are built lazily by
+overlay once and the GPU blends it, `gpu.md`); a frame is refused for text only under 12 px or in a named font with no bold face. A paused frame inside a fade, dip, dissolve, slide or push is drawn too (a still plan holds the running fades, the travel and the outgoing clip's tail: `caps.fades` / `transitions` / `dip_white`, `gpu.md`; refused: a black or white fade on a layer below full opacity, a dip to white on an alpha plane, a letterboxed, odd or resized layer or a picture that is not 8-bit `yuv420p`, and a full-range picture inside a fade under FFmpeg 9). A moving zoom, masks and the blur / sharpen / grayscale / invert / vignette / chroma key effects are drawn as well (`caps.keyed_zoom` / `mask` / `effects`, `gpu.md`; refused: a vignette on a letterbox or a picture that is not limited-range `yuv420p`, a chroma key after a scale or a blur, on a letterbox, another pixel format, a rotated or translucent layer or under a mask, a rotation, an opacity below 1 or a dip to white in front of a moving zoom, a mask on a rotated or translucent layer, a blur or a sharpen on a letterbox, an invert / blur / sharpen on a full-range picture, an invert on a gray one, a sharpen after a scale or a blur that carries its difference past two levels: one above 0.5, or a second). The device, compositor, `FrameSource` and presenter are built lazily by
 the first frame that wants them and dropped together (`Backend`); a build failure is
 remembered with a backoff (5 s doubling to 5 min, `Backoff`), a `DeviceLost` or any error
 that says the device or surface is gone (`react`) drops the backend and rebuilds it on the

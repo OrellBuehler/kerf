@@ -693,6 +693,19 @@ export interface TemplateEdit {
 	warnings: string[];
 }
 
+/** How a text fits its box (`TextFit`): its lines wrap at the width, or it stays on one line made smaller to fit. */
+export type TextFit = 'wrap' | 'shrink';
+
+/** A text's box (`TextBox`): a width in the title's own units from the text's anchor; `null` is no box. Drawn only when
+ *  the title's text is glyph outlines. */
+export interface TextBox {
+	width: number | null;
+	fit: TextFit;
+}
+
+/** How a title's text is drawn (`TitleTextForm`): as glyph outlines, or with its fonts. */
+export type TitleTextForm = 'outlines' | 'text';
+
 /** An element of a title that has an `id` and its tag name: what a control can aim at (`svg_element_ids`). */
 export interface SvgElementId {
 	id: string;

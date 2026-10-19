@@ -484,6 +484,32 @@ mod tests {
     }
 
     #[test]
+    fn the_poster_draws_a_text_in_its_box() {
+        // Without its box the line runs off the right of the artwork; wrapped at 60 units it stays left of 80.
+        let boxed = |extra: &str| TemplateSource {
+            svg: format!(
+                r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 160 90"><rect width="160" height="90" fill="#000"/><text id="tag" x="10" y="30" font-size="16" fill="#fff" font-family="Geist"{extra}>A long line of words that wraps</text></svg>"##
+            ),
+            name: "t".into(),
+            duration: 2.0,
+        };
+        let rightmost_lit = |source: TemplateSource| {
+            let built = build_template(&source, request(vec![text_control()]), Uuid::new_v4()).unwrap();
+            let poster = tiny_skia::Pixmap::decode_png(built.template.poster.as_ref().unwrap()).unwrap();
+            let w = poster.width() as usize;
+            let lit = poster
+                .data()
+                .chunks(4)
+                .enumerate()
+                .filter(|(_, p)| p[0] > 128)
+                .map(|(i, _)| i % w);
+            lit.max().unwrap() as f64 / w as f64
+        };
+        assert!(rightmost_lit(boxed("")) > 0.95);
+        assert!(rightmost_lit(boxed(r#" inline-size="60""#)) < 0.5);
+    }
+
+    #[test]
     fn a_template_saved_from_outlines_keeps_its_text() {
         let outlined = crate::svg::SvgDoc::parse(TITLE)
             .unwrap()

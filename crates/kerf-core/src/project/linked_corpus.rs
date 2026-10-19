@@ -1024,6 +1024,7 @@ fn corpus() -> Value {
             "id": a.id,
             "duration": a.duration,
             "audio": a.has_audio(),
+            "video": a.streams.iter().any(|s| s.kind == StreamKind::Video),
         })).collect::<Vec<_>>(),
         "cases": results,
     })
