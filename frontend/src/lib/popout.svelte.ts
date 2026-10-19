@@ -41,6 +41,7 @@ import {
 	type PopoutRequest
 } from './api';
 import { installSliderFill } from './slider-fill';
+import { watchCspViolations } from './log';
 import { toast } from './notifications.svelte';
 
 /** How long a window destroyed from outside may stay listed before it is told to close. */
@@ -308,6 +309,11 @@ class PopoutState {
 			entry.stops.push(installSliderFill(win.document));
 		} catch (e) {
 			console.error('slider fill in a detached window', e);
+		}
+		try {
+			entry.stops.push(watchCspViolations(win));
+		} catch (e) {
+			console.error('CSP logging in a detached window', e);
 		}
 		if (this.#hooks.window) {
 			try {

@@ -28,6 +28,29 @@ export function logFrontend(level: LogLevel, message: string, context?: string) 
 		.catch(() => {});
 }
 
+/** What a CSP violation is, as the log says it. */
+export type CspViolation = Pick<SecurityPolicyViolationEvent, 'effectiveDirective' | 'blockedURI' | 'disposition'> &
+	Partial<Pick<SecurityPolicyViolationEvent, 'sourceFile' | 'lineNumber'>>;
+
+/** One log line for a CSP violation: what the policy blocked (or only reported), under which directive, from
+ *  where. A `data:` or long URL is cut short — the log needs the kind, not the payload. */
+export function cspViolationLine(v: CspViolation): string {
+	const raw = v.blockedURI || 'an inline resource';
+	const what = raw.startsWith('data:') ? `${raw.slice(0, raw.indexOf(',') + 1 || 40)}…` : raw.length > 200 ? `${raw.slice(0, 200)}…` : raw;
+	const verb = v.disposition === 'report' ? 'reported' : 'blocked';
+	const where = v.sourceFile ? ` at ${v.sourceFile}:${v.lineNumber ?? 0}` : '';
+	return `CSP ${verb} ${what} (${v.effectiveDirective})${where}`;
+}
+
+/** Log every CSP violation in `win` — the editor window, and each detached panel's window, whose document is
+ *  its own — so a packaged build says what its policy blocked in the log file, on every platform. Returns the
+ *  way to stop. */
+export function watchCspViolations(win: Window): () => void {
+	const on = (ev: SecurityPolicyViolationEvent) => logFrontend('warn', cspViolationLine(ev), 'csp');
+	win.addEventListener('securitypolicyviolation', on);
+	return () => win.removeEventListener('securitypolicyviolation', on);
+}
+
 let installed = false;
 
 export function installErrorLogging() {
@@ -40,4 +63,5 @@ export function installErrorLogging() {
 	window.addEventListener('unhandledrejection', (ev) => {
 		logFrontend('error', describeError(ev.reason), 'unhandledrejection');
 	});
+	watchCspViolations(window);
 }
