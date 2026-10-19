@@ -670,12 +670,15 @@ export interface ImportOutcome {
 	warnings: string[];
 }
 
-/** What applying a template or setting a template title's values hands back: the refreshed cut, the title
- *  that was made or changed (the one to select), and what the sanitiser or the machine could not honour
- *  (e.g. a font that is not installed). */
+/** What applying a template, adding or changing a title clip or setting a template title's values hands back: the
+ *  refreshed cut, the title that was made or changed (the one to select: `overlay_id` for a floating one, `clip_id` for
+ *  one on a track), and what the sanitiser or the machine could not honour (e.g. a font that is not installed). */
 export interface TemplateEdit {
 	timeline: Timeline;
-	overlay_id: string;
+	/** The floating title made or changed; absent for a title on a track. */
+	overlay_id?: string;
+	/** The title clip made or changed, for a title on a track. */
+	clip_id?: string;
 	warnings: string[];
 }
 
@@ -794,6 +797,30 @@ export interface Clip {
 	 *  detached onto an audio track (the picture is then silent). Absent means it does
 	 *  (the backend omits it when true). */
 	source_audio?: boolean;
+	/** What the clip draws when its picture is generated rather than cut from an asset: a title on a track
+	 *  (`asset_id` is then `GENERATED_ASSET` and the source is the title's own clock). Absent for footage. */
+	generator?: Generator | null;
+}
+
+/** The `asset_id` of every generated clip: the nil UUID, which no asset has. */
+export const GENERATED_ASSET = '00000000-0000-0000-0000-000000000000';
+
+/** An animated SVG title on a video track (`Clip.generator`): drawn over the whole frame, then placed, faded and keyed
+ *  as its clip is. `svg` is the sanitised source; `template` as on a floating title. */
+export interface TitleClip {
+	name: string;
+	svg: string;
+	template?: TemplateInstance | null;
+}
+
+/** What a generated clip draws, tagged by `kind`. */
+export type Generator = { kind: 'title' } & TitleClip;
+
+/** A title clip's content to change (`update_title_clip`); its timing and look are the clip's own edits. */
+export interface TitleClipPatch {
+	name?: string;
+	/** New custom artwork; it ends a template. */
+	svg?: string;
 }
 
 /** A crop for one delivery shape (`aspect_w:aspect_h` in lowest terms). */

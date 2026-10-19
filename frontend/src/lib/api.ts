@@ -115,6 +115,7 @@ import type {
 	TemplateList,
 	TemplateSaved,
 	TextKeyframe,
+	TitleClipPatch,
 	TextOverlay,
 	Timeline,
 	TimelineDiff,
@@ -212,6 +213,7 @@ import {
 	validateSvgSource
 } from './svg-dev';
 import {
+	applyTemplateClipTo,
 	applyTemplateTo,
 	deleteTemplateDev,
 	exportTemplateDev,
@@ -224,6 +226,7 @@ import {
 	templateImageValueOf,
 	templatePosterDev
 } from './template-dev';
+import { checkTitleSpan, placeTitleClip, titleClip, titleOf } from './title-clips';
 import { VOICE_IDS, DEFAULT_SPEED, DEFAULT_VOICE, clampSpeed, estimateSeconds, scriptSegments, voiceInfo } from './voiceover';
 
 export type { AudioDetached };
@@ -2784,6 +2787,10 @@ export async function setSpeed(clipId: string, speed: number, link?: boolean): P
 	if (!inTauri()) {
 		// Linked clips are retimed by the same ratio (`setSpeedLinked`) and re-placed about the
 		// named clip, so a picture and its sound keep step; `link: false` retimes the named clip alone.
+		const found = locate(devTimeline, clipId);
+		if (found && titleOf(found[0].clips[found[1]]) && speed !== 1) {
+			throw new Error('that edit would leave the timeline invalid: the clip is a title, which plays at its own speed');
+		}
 		devRun((tl) => ops.setSpeed(tl, devEnv(undefined, link), clipId, speed));
 		return snapshot();
 	}
@@ -3383,11 +3390,88 @@ export async function applyTemplate(
  *  and a title that changed while the values were being applied ("try again"). */
 export async function setTemplateValues(overlayId: string, values: Record<string, string>): Promise<TemplateEdit> {
 	if (!inTauri()) {
-		const { overlay, warnings } = setTemplateValuesIn(devTimeline, overlayId, values);
+		const { overlay, clip, warnings } = setTemplateValuesIn(devTimeline, overlayId, values);
 		recordDev('Set template values');
-		return { timeline: snapshot(), overlay_id: overlay.id, warnings };
+		return { timeline: snapshot(), overlay_id: overlay?.id, clip_id: clip?.id, warnings };
 	}
 	return invoke<TemplateEdit>('set_template_values', { overlayId, values });
+}
+
+/** Add a library template as a title clip on a video track, so it takes transitions (a dip to white from the shot
+ *  before it), fades and keys and extends like any clip. It runs from `start` for `duration` seconds (default: its own
+ *  length) on `trackId` (default: the lowest video track free over its span, else a new one on top). Resolves to the
+ *  refreshed timeline, the new clip's id (`clip_id`, to select it) and the warnings. */
+export async function applyTemplateClip(
+	templateId: string,
+	values: Record<string, string>,
+	start: number,
+	duration?: number | null,
+	trackId?: string | null,
+	name?: string | null
+): Promise<TemplateEdit> {
+	if (!inTauri()) {
+		const { clip, warnings } = applyTemplateClipTo(devTimeline, templateId, values, start, duration, trackId, name);
+		recordDev(`Add template title “${titleOf(clip)?.name ?? ''}”`);
+		return { timeline: snapshot(), clip_id: clip.id, warnings };
+	}
+	return invoke<TemplateEdit>('apply_template_clip', {
+		templateId,
+		values,
+		start,
+		duration: duration ?? null,
+		trackId: trackId ?? null,
+		name: name ?? null
+	});
+}
+
+/** Add custom SVG artwork as a title clip on a video track (placed as `applyTemplateClip` places one). `duration`
+ *  defaults to how long its animations run. */
+export async function addTitleClip(
+	svg: string,
+	start: number,
+	duration?: number | null,
+	trackId?: string | null,
+	name?: string | null
+): Promise<TemplateEdit> {
+	if (!inTauri()) {
+		const checked = validateSvgSource(svg);
+		const length = duration ?? 4;
+		checkTitleSpan(start, length);
+		const clip = titleClip({ name: name?.trim() ?? '', svg: checked.svg }, Math.max(0, start), length);
+		placeTitleClip(devTimeline, clip, trackId);
+		recordDev('Add title clip');
+		return { timeline: snapshot(), clip_id: clip.id, warnings: checked.warnings };
+	}
+	return invoke<TemplateEdit>('add_title_clip', {
+		svg,
+		start,
+		duration: duration ?? null,
+		trackId: trackId ?? null,
+		name: name ?? null
+	});
+}
+
+/** Rename a title clip or replace its artwork (`svg`, which ends a template). One edit; the clip keeps its place. */
+export async function updateTitleClip(clipId: string, patch: TitleClipPatch): Promise<TemplateEdit> {
+	if (!inTauri()) {
+		const clip = devTimeline.tracks.flatMap((t) => t.clips).find((c) => c.id === clipId);
+		const title = clip && titleOf(clip);
+		if (!clip || !title) throw new Error(`the clip ${clipId} is not a title`);
+		if (patch.name === undefined && patch.svg === undefined) throw new Error('nothing to change: give a name or svg');
+		let warnings: string[] = [];
+		const next = { ...title };
+		if (patch.name !== undefined) next.name = patch.name.trim();
+		if (patch.svg !== undefined) {
+			const checked = validateSvgSource(patch.svg);
+			next.svg = checked.svg;
+			next.template = undefined;
+			warnings = checked.warnings;
+		}
+		clip.generator = { ...next, kind: 'title' };
+		recordDev('Update title clip');
+		return { timeline: snapshot(), clip_id: clipId, warnings };
+	}
+	return invoke<TemplateEdit>('update_title_clip', { clipId, patch });
 }
 
 /** Bring a `.kerftemplate` file into the library. Never overwrites: the same template is `already_present`,

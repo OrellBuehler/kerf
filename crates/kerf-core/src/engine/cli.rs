@@ -8140,6 +8140,7 @@ fn fade_filter(step: &FadeStep) -> String {
 ///
 /// `instance` is the clip's unique flat index, used to name its `v360` so
 /// `sendcmd` can address it; it is unused for clips that do not reframe.
+#[cfg(test)]
 fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool, instance: &str) -> String {
     video_clip_chain_stamped(clip, fmt, fx, is_image, None, instance)
 }

@@ -18,7 +18,8 @@ use super::svg_layer;
 use super::*;
 use crate::clip_timing::Rational;
 use crate::engine::test_support::{av_asset, make_clip, single, test_asset, video_stream, StatusBounded};
-use crate::model::{Asset, Track, Transition, TransitionKind};
+use crate::model::{Asset, TitleClip, Track, Transition, TransitionKind};
+use crate::render_plan::RenderPlan;
 use crate::svg::raster::with_pinned_dir;
 
 const PIN: &str = "/kerf-test/svg";
@@ -185,13 +186,13 @@ fn a_graph_that_draws_no_picture_names_no_title() {
 #[test]
 fn the_plan_names_a_title_clip_and_a_compositor_refuses_its_frame() {
     let (tl, assets) = cut();
-    let plan = RenderPlan::at(&tl, &assets, &opts(30.0), 3.0, CompositeColorPolicy::default()).unwrap();
+    let plan = RenderPlan::at(&tl, &assets, &opts(30.0), 3.0, CompositeColorPolicy::FixedBt601).unwrap();
     let card = tl.tracks[0].clips[1].id;
     assert_eq!(plan.svg, vec![card]);
     assert!(plan.layers.is_empty(), "a title is no decoded layer");
     let why = plan.reasons(&crate::plan_caps::GpuCaps::A0, (192, 108));
     assert!(why.contains(&crate::plan_caps::Unsupported::Svg), "{why:?}");
-    let shot = RenderPlan::at(&tl, &assets, &opts(30.0), 0.2, CompositeColorPolicy::default()).unwrap();
+    let shot = RenderPlan::at(&tl, &assets, &opts(30.0), 0.2, CompositeColorPolicy::FixedBt601).unwrap();
     assert!(shot.svg.is_empty());
 }
 

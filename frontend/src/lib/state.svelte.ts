@@ -48,6 +48,9 @@ import {
 	removeOverlay,
 	addSvgOverlay as apiAddSvgOverlay,
 	applyTemplate as apiApplyTemplate,
+	applyTemplateClip as apiApplyTemplateClip,
+	addTitleClip as apiAddTitleClip,
+	updateTitleClip as apiUpdateTitleClip,
 	removeSvgOverlay as apiRemoveSvgOverlay,
 	setTemplateValues as apiSetTemplateValues,
 	updateSvgOverlay as apiUpdateSvgOverlay,
@@ -169,6 +172,7 @@ import type {
 	SvgOverlayPatch,
 	SvgSource,
 	TemplateEdit,
+	TitleClipPatch,
 	TextKeyframe,
 	Marker,
 	MarkerPatch,
@@ -181,7 +185,8 @@ import type {
 	ComposeRequest,
 	ComposeResult
 } from './types';
-import { clipDuration } from './types';
+import { clipDuration, GENERATED_ASSET } from './types';
+import { findTitle, type TitleRef } from './title-clips';
 import { timelineFps } from './timecode';
 import { trimRefusal } from './trim-tools';
 import { HISTORY_PAGE, redoable, undoable } from './paging';
@@ -470,6 +475,11 @@ class EditorState {
 		return this.timeline.svg_overlays ?? [];
 	}
 
+	/** A title by id, floating or on a track (`findTitle`): what the template controls and the save dialog read. */
+	titleById(id: string): TitleRef | undefined {
+		return findTitle(this.timeline, id);
+	}
+
 	get selectedSvgOverlay(): SvgOverlay | undefined {
 		return this.svgOverlays.find((o) => o.id === this.selectedSvgOverlayId);
 	}
@@ -656,6 +666,13 @@ class EditorState {
 	}
 
 	async select(assetId: string) {
+		// A title on a track is no asset: nothing to look up.
+		if (assetId === GENERATED_ASSET) {
+			this.#selectGen.advance();
+			this.selectedAssetId = null;
+			this.selectedMetadata = null;
+			return;
+		}
 		this.selectedAssetId = assetId;
 		const seq = this.#selectGen.advance();
 		try {
@@ -1317,7 +1334,29 @@ class EditorState {
 			edit = await apiApplyTemplate(templateId, values, start, end, layout);
 			return edit.timeline;
 		});
-		this.selectSvgOverlay(edit.overlay_id);
+		if (edit.overlay_id) this.selectSvgOverlay(edit.overlay_id);
+		return edit;
+	}
+	/** Add a library template as a title clip on a video track at `start` (as long as the template runs unless
+	 *  `duration`), with `values` in its artwork, and select it. One edit; the warnings are the caller's. */
+	async applyTemplateClip(templateId: string, values: Record<string, string>, start: number, duration?: number | null, trackId?: string | null) {
+		return this.#titleClipEdit(() => apiApplyTemplateClip(templateId, values, start, duration, trackId));
+	}
+	/** Add custom SVG artwork as a title clip on a video track at `start`, and select it. */
+	async addTitleClip(svg: string, start: number, duration?: number | null, trackId?: string | null, name?: string | null) {
+		return this.#titleClipEdit(() => apiAddTitleClip(svg, start, duration, trackId, name));
+	}
+	/** Rename a title clip or replace its artwork (which ends a template). */
+	async updateTitleClip(clipId: string, patch: TitleClipPatch) {
+		return this.#titleClipEdit(() => apiUpdateTitleClip(clipId, patch));
+	}
+	async #titleClipEdit(call: () => Promise<TemplateEdit>) {
+		let edit!: TemplateEdit;
+		await this.#apply(async () => {
+			edit = await call();
+			return edit.timeline;
+		});
+		if (edit.clip_id) this.selectClip(edit.clip_id);
 		return edit;
 	}
 	/** Change some control values of a template title: one edit, the title keeps its id, timing and placement. */
