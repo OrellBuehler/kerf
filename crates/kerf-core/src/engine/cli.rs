@@ -4778,6 +4778,9 @@ struct InputPlan {
     representatives: Vec<usize>,
     /// Per clip flat-index → its unique input index (position in `representatives`).
     clip_input: Vec<usize>,
+    /// Per clip flat-index, how a title clip's pictures are stamped onto the canvas' grid (its chain's
+    /// first filters); `None` for a clip of footage. Filled by [`push_inputs`], which names the pictures.
+    stamps: Vec<Option<svg_layer::ClipStamp>>,
 }
 
 fn plan_inputs(timeline: &Timeline, assets: &[Asset], fx: &[ClipFx]) -> InputPlan {
@@ -4786,7 +4789,7 @@ fn plan_inputs(timeline: &Timeline, assets: &[Asset], fx: &[ClipFx]) -> InputPla
     let mut clip_input: Vec<usize> = Vec::new();
     let mut seen: std::collections::HashMap<(uuid::Uuid, String), usize> = std::collections::HashMap::new();
     for (flat, clip) in timeline.tracks.iter().flat_map(|t| t.clips.iter()).enumerate() {
-        let input = if image_of(clip.asset_id) {
+        let input = if image_of(clip.asset_id) || clip.is_generated() {
             let i = representatives.len();
             representatives.push(flat);
             i
@@ -4803,9 +4806,11 @@ fn plan_inputs(timeline: &Timeline, assets: &[Asset], fx: &[ClipFx]) -> InputPla
         };
         clip_input.push(input);
     }
+    let stamps = vec![None; clip_input.len()];
     InputPlan {
         representatives,
         clip_input,
+        stamps,
     }
 }
 
@@ -4828,10 +4833,20 @@ fn push_inputs(
     let fx = transition_fx(timeline, assets);
     // Deduplicate inputs: clips whose `-i` args are identical (same asset, same
     // fast-seek) share one decoded input, fanned out in the graph with `split`.
-    let plan = plan_inputs(timeline, assets, &fx);
+    let mut plan = plan_inputs(timeline, assets, &fx);
+    // A title clip's input is its pictures, drawn before ffmpeg is spawned (`svg_layer::prepare`).
+    let titles = svg_layer::clip_sequences(timeline, fmt, &fx);
     let clips: Vec<&crate::model::Clip> = timeline.tracks.iter().flat_map(|t| t.clips.iter()).collect();
     for &rep in &plan.representatives {
         let clip = clips[rep];
+        if clip.is_generated() {
+            let pictures = titles[rep]
+                .as_ref()
+                .ok_or_else(|| Error::Engine(format!("frame rate {} cannot draw a title on a track", fmt.fps)))?;
+            svg_layer::push_inputs(std::slice::from_ref(&pictures.seq), fmt, args);
+            plan.stamps[rep] = Some(pictures.stamp());
+            continue;
+        }
         let path = path_of(clip.asset_id).ok_or(Error::AssetNotFound(clip.asset_id))?;
         let (start, end) = clip_source_window(clip, &fx[rep]);
         if image_of(clip.asset_id) {
@@ -4877,9 +4892,21 @@ fn push_inputs(
 /// what the builder will ask for before it is spawned (the titles' pictures) both start here.
 fn export_timeline(timeline: &Timeline, opts: &ExportOptions) -> Timeline {
     let rendered = timeline.for_render();
-    match effective_range(&rendered, opts) {
+    let mut cut = match effective_range(&rendered, opts) {
         Some((s, e)) => rendered.slice(s, e),
         None => rendered,
+    };
+    if opts.container.is_audio_only() {
+        drop_titles(&mut cut);
+    }
+    cut
+}
+
+/// Take the title clips out of a cut whose graph draws no picture (an audio-only export, the levels
+/// and the mix passes): their input is pictures nobody drew, and they have no sound.
+fn drop_titles(timeline: &mut Timeline) {
+    for track in &mut timeline.tracks {
+        track.clips.retain(|c| !c.is_generated());
     }
 }
 
@@ -5386,6 +5413,15 @@ impl PreviewCut {
     fn svg(&self) -> Vec<svg_layer::SvgSeq<'_>> {
         svg_layer::stream_sequences(&self.titles, self.total, &self.sliced, self.start, &self.fmt)
     }
+
+    /// Every picture the stream reads: the floating titles' and the title clips' (whose input is
+    /// named for the slice, so a stream from another playhead draws the rest of the title again).
+    fn pictures(&self, assets: &[Asset]) -> Vec<svg_layer::SvgSeq<'_>> {
+        let mut all = self.svg();
+        let fx = transition_fx(&self.sliced, assets);
+        all.extend(svg_layer::clip_seqs(&svg_layer::clip_sequences(&self.sliced, &self.fmt, &fx)));
+        all
+    }
 }
 
 fn preview_cut(
@@ -5598,7 +5634,7 @@ fn stream_preview_once(
     let cut = preview_cut(timeline, assets, start, fps, max_width, decode_hwaccel())?;
     // Animated titles are pictures on disk by now (a few seconds' work at most); held until the
     // stream is over so the cache cannot take them away mid-play.
-    let _titles = svg_layer::prepare_preview(&cut.svg(), cancel)?;
+    let _titles = svg_layer::prepare_preview(&cut.pictures(assets), cancel)?;
     let mut args = preview_args(&cut, assets, PREVIEW_STREAM_QUALITY)?;
     // The composited graph outgrows argv just as the export's does.
     let _script = externalize_filter_complex(&mut args, "preview")?;
@@ -6992,7 +7028,14 @@ fn build_filter_complex_with(
             };
             chains.push(format!(
                 "[{src}]{chain}[v{flat}]",
-                chain = video_clip_chain(clip, fmt, &fx[*flat], is_image(clip), &format!("c{flat}"))
+                chain = video_clip_chain_stamped(
+                    clip,
+                    fmt,
+                    &fx[*flat],
+                    is_image(clip),
+                    plan.stamps.get(*flat).copied().flatten(),
+                    &format!("c{flat}")
+                )
             ));
             let out = if n == last {
                 composite_pad.to_string()
@@ -8098,6 +8141,20 @@ fn fade_filter(step: &FadeStep) -> String {
 /// `instance` is the clip's unique flat index, used to name its `v360` so
 /// `sendcmd` can address it; it is unused for clips that do not reframe.
 fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool, instance: &str) -> String {
+    video_clip_chain_stamped(clip, fmt, fx, is_image, None, instance)
+}
+
+/// [`video_clip_chain`] for a clip whose input may be a title's pictures: `stamp` puts them on the
+/// canvas' grid in place of the `trim` and `setpts` a decoded clip starts with (they are drawn for
+/// exactly the frames the clip is on, tail included); everything after is the same chain.
+fn video_clip_chain_stamped(
+    clip: &Clip,
+    fmt: &ExportFormat,
+    fx: &ClipFx,
+    is_image: bool,
+    stamp: Option<svg_layer::ClipStamp>,
+    instance: &str,
+) -> String {
     let s = clip.speed_mag();
     let t = &clip.transform;
     let anim = clip.is_animated();
@@ -8160,12 +8217,16 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
     // source plays the frames the export renders instead of `lead` seconds of the
     // first frame held. Only a padded proxy gets the filter; every other input's
     // chain is exactly what it was.
-    if fx.head_pad && !is_image && seek == 0.0 {
-        p.push("trim=start_frame=1".to_string());
-    }
-    p.push(format!("trim=start={}:end={}", trim_start - seek, trim_end - seek));
-    if clip.is_reversed() {
-        p.push("reverse".to_string());
+    if let Some(stamp) = stamp {
+        p.push(stamp.filters());
+    } else {
+        if fx.head_pad && !is_image && seek == 0.0 {
+            p.push("trim=start_frame=1".to_string());
+        }
+        p.push(format!("trim=start={}:end={}", trim_start - seek, trim_end - seek));
+        if clip.is_reversed() {
+            p.push("reverse".to_string());
+        }
     }
     // A reframed clip crops *after* reprojection instead: edge fractions of a raw
     // dual-fisheye frame mean nothing, and the user set them against the flat
@@ -8174,10 +8235,12 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
     if reframe.is_none() {
         p.extend(crop.clone());
     }
-    if (s - 1.0).abs() < 1e-9 {
-        p.push(format!("setpts=PTS-STARTPTS+{}/TB", clip.timeline_start));
-    } else {
-        p.push(format!("setpts=(PTS-STARTPTS)/{}+{}/TB", s, clip.timeline_start));
+    if stamp.is_none() {
+        if (s - 1.0).abs() < 1e-9 {
+            p.push(format!("setpts=PTS-STARTPTS+{}/TB", clip.timeline_start));
+        } else {
+            p.push(format!("setpts=(PTS-STARTPTS)/{}+{}/TB", s, clip.timeline_start));
+        }
     }
     if let Some(rf) = reframe {
         // Hoisted above `v360` so a 50 fps source exporting at 30 reprojects 30
@@ -8899,12 +8962,29 @@ fn still_titles(
     max_width: u32,
     region: Option<Region>,
 ) -> Result<Vec<crate::svg::raster::Pin>> {
-    if timeline.svg_overlays.is_empty() {
+    if timeline.svg_overlays.is_empty() && timeline.title_clips().next().is_none() {
         return Ok(Vec::new());
     }
     let rendered = timeline.for_render();
-    let (_, _, ow, oh) = still_canvas(&rendered, assets, opts, max_width, region);
-    svg_layer::ensure_stills(&svg_layer::still_svgs(&rendered, ow, oh, t.max(0.0)))
+    let (fmt, _, ow, oh) = still_canvas(&rendered, assets, opts, max_width, region);
+    let t = t.max(0.0);
+    let mut pictures = svg_layer::still_svgs(&rendered, ow, oh, t);
+    pictures.extend(still_clip_pictures(&still_layers(&rendered, assets, fmt.fps, t), ow, oh).into_iter().flatten());
+    svg_layer::ensure_stills(&pictures)
+}
+
+/// The picture of each title clip among a still's `layers` (`None` for a layer of footage), drawn over
+/// the whole `ow` x `oh` canvas at the clip's own clock: its input, as a still image's file is.
+fn still_clip_pictures<'a>(layers: &[still_fx::StillLayer<'a>], ow: u32, oh: u32) -> Vec<Option<svg_layer::StillSvg<'a>>> {
+    layers
+        .iter()
+        .map(|layer| {
+            let clip = layer.active.clip;
+            clip.generator
+                .as_ref()
+                .map(|g| svg_layer::still_clip_picture(g.svg(), ow, oh, layer.active.source_time))
+        })
+        .collect()
 }
 
 /// [`build_still_args`] over a timeline that has already been through [`Timeline::for_render`]:
@@ -8930,9 +9010,14 @@ fn build_still_args_rendered(
     // transition keeps on screen past their end included. The `RenderPlan` a compositor
     // draws from is built from the same list.
     let active = still_layers(timeline, assets, fmt.fps, t);
+    let drawn = still_clip_pictures(&active, ow, oh);
 
     let mut args: Vec<String> = vec!["-hide_banner".to_string(), "-loglevel".to_string(), "error".to_string()];
-    for layer in &active {
+    for (layer, picture) in active.iter().zip(&drawn) {
+        if let Some(picture) = picture {
+            svg_layer::push_still_inputs(std::slice::from_ref(picture), &mut args);
+            continue;
+        }
         let (clip, src) = (layer.active.clip, layer.active.source_time);
         let asset = asset_of(clip.asset_id).ok_or(Error::AssetNotFound(clip.asset_id))?;
         // A still has a single frame at t=0 (`trim=end_frame=1` in the chain picks
@@ -9402,6 +9487,10 @@ mod side_files;
 /// Titles through the real ffmpeg (`#[ignore]`d).
 #[cfg(test)]
 mod svg_rendered;
+
+/// Titles on tracks: the argv, and through the real ffmpeg (`#[ignore]`d).
+#[cfg(test)]
+mod title_clips;
 
 /// Which slot a job takes, the cores' or the hardware's.
 #[cfg(test)]

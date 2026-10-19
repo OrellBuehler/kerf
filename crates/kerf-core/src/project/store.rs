@@ -52,6 +52,12 @@ const MIGRATIONS: &[Migration] = &[
         destructive: false,
         needed_to_read: true,
     },
+    Migration {
+        run: v4_to_v5,
+        needed: v4_to_v5_needed,
+        destructive: false,
+        needed_to_read: false,
+    },
 ];
 
 /// The schema this build writes and the newest it opens.
@@ -130,6 +136,18 @@ fn v3_to_v4(conn: &Connection) -> rusqlite::Result<()> {
 
 fn v3_to_v4_needed(conn: &Connection) -> bool {
     !has_column(conn, "assets", "music_score")
+}
+
+/// v5: a clip on a video track may be a generated title (`Clip.generator`, in the timeline's JSON).
+/// Nothing in the file's tables changes, so the step writes nothing but the number; the number is what
+/// keeps an older build, which would read such a clip as one of missing media and drop its title on the
+/// next save, from opening the file.
+fn v4_to_v5(_conn: &Connection) -> rusqlite::Result<()> {
+    Ok(())
+}
+
+fn v4_to_v5_needed(_conn: &Connection) -> bool {
+    false
 }
 
 /// The steps from `found` on that would change this file.

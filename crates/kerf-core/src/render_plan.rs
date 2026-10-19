@@ -123,7 +123,12 @@ pub(crate) fn active_video_clips_with_tails<'a>(
             if !on {
                 continue;
             }
-            let dur = asset_of(clip.asset_id).map(|a| a.duration).unwrap_or(clip.source_out);
+            // A title's document runs on past its out-point (a transition's tail draws it there).
+            let dur = if clip.is_generated() {
+                crate::model::MAX_SVG_SECONDS
+            } else {
+                asset_of(clip.asset_id).map(|a| a.duration).unwrap_or(clip.source_out)
+            };
             active.push(ActiveClip {
                 clip,
                 flat: first + ci,
@@ -617,7 +622,9 @@ pub struct RenderPlan {
     pub overlays: Vec<PlanText>,
     /// The animated SVG titles on screen at this frame, in the order they are laid (under the
     /// text). Only named: a compositor does not draw them, so a frame holding one is refused
-    /// ([`Unsupported::Svg`]) and FFmpeg draws it from the pictures resvg made.
+    /// ([`Unsupported::Svg`]) and FFmpeg draws it from the pictures resvg made. A title clip on screen
+    /// (a generated clip on a video track) is named here too, by its clip id, after the floating ones,
+    /// and is not a layer.
     pub svg: Vec<Uuid>,
     /// Clips that are on screen but whose source has no picture to draw. `index` is the
     /// number of drawn layers below it: the slot in `layers` it would have taken.

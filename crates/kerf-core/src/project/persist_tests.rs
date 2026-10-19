@@ -239,7 +239,7 @@ fn a_v2_file_is_backed_up_once_then_gets_the_fonts_table() {
     let path = dir.join("cut.kerf");
     edited(2).0.save_as(&path).unwrap();
     make_v2(&path);
-    assert_eq!(SCHEMA_VERSION, 4);
+    assert_eq!(SCHEMA_VERSION, 5);
     assert!(!has_fonts_table(&path));
 
     let project = Project::open(&path).unwrap();
@@ -491,4 +491,31 @@ fn the_history_limit_never_drops_the_head() {
     project.cut_clip(asset, 0.0, 1.0).unwrap();
     assert_eq!(seqs(&project), vec![1]);
     assert!(project.history().unwrap()[0].current);
+}
+
+#[test]
+fn a_v4_file_is_stamped_v5_without_a_backup_and_keeps_its_title_clips() {
+    let dir = scratch();
+    let path = dir.join("cut.kerf");
+    let project = Project::open_in_memory().unwrap();
+    let svg = r#"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 9"><rect width="8" height="4"/></svg>"#;
+    let title = project
+        .add_title_clip(svg, 1.0, Some(3.0), crate::project::TitleClipPlacement::default())
+        .unwrap()
+        .clip;
+    project.save_as(&path).unwrap();
+    drop(project);
+    Connection::open(&path)
+        .unwrap()
+        .pragma_update(None, "user_version", 4)
+        .unwrap();
+
+    let project = Project::open(&path).unwrap();
+    assert_eq!(version_of(&path), SCHEMA_VERSION);
+    let clip = project.timeline().unwrap().clip(title.id).cloned().unwrap();
+    assert_eq!(clip.title_clip().unwrap().svg, title.title_clip().unwrap().svg);
+    drop(project);
+    let names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+    assert_eq!(names, vec![std::ffi::OsString::from("cut.kerf")], "nothing in the file changed, so no backup");
+    std::fs::remove_dir_all(&dir).ok();
 }
