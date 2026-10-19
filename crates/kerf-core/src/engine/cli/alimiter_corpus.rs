@@ -179,9 +179,7 @@ fn through_ffmpeg(samples: &[f64], rate: u32, filter: &str, tag: &str) -> Vec<f6
     assert!(run.status.success(), "{filter}: {}", String::from_utf8_lossy(&run.stderr));
     let raw = std::fs::read(&output).unwrap();
     let _ = std::fs::remove_dir_all(&dir);
-    raw.chunks_exact(8)
-        .map(|b| f64::from_le_bytes(b.try_into().unwrap()))
-        .collect()
+    raw.as_chunks::<8>().0.iter().map(|b| f64::from_le_bytes(*b)).collect()
 }
 
 fn corpus() -> Value {
