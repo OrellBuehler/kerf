@@ -113,16 +113,25 @@ fn a_legacy_file_is_backed_up_once_then_upgraded() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// The columns are there, so their steps change nothing; the file is still copied aside, once,
+/// for v5 (a JSON step: `needed` always, so an older build's file is kept before it is locked out).
 #[test]
-fn a_legacy_file_that_already_has_the_columns_is_stamped_without_a_backup() {
+fn a_legacy_file_that_already_has_the_columns_is_stamped_and_copied_aside_for_the_json_step() {
     let dir = scratch();
     let path = dir.join("cut.kerf");
     edited(1).0.save_as(&path).unwrap();
     make_legacy(&path, true);
     drop(Project::open(&path).unwrap());
     assert_eq!(version_of(&path), SCHEMA_VERSION);
-    let names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
-    assert_eq!(names, vec![std::ffi::OsString::from("cut.kerf")]);
+    let mut names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec![
+            std::ffi::OsString::from("cut (schema v0 backup).kerf"),
+            std::ffi::OsString::from("cut.kerf")
+        ]
+    );
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -239,7 +248,7 @@ fn a_v2_file_is_backed_up_once_then_gets_the_fonts_table() {
     let path = dir.join("cut.kerf");
     edited(2).0.save_as(&path).unwrap();
     make_v2(&path);
-    assert_eq!(SCHEMA_VERSION, 4);
+    assert_eq!(SCHEMA_VERSION, 5);
     assert!(!has_fonts_table(&path));
 
     let project = Project::open(&path).unwrap();
@@ -269,8 +278,9 @@ fn a_v2_file_is_backed_up_once_then_gets_the_fonts_table() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// The fonts table is there, so v3 changes nothing; the one backup is v5's (a JSON step).
 #[test]
-fn a_v2_file_that_already_has_the_fonts_table_is_stamped_without_a_backup() {
+fn a_v2_file_that_already_has_the_fonts_table_is_stamped_and_copied_aside_for_the_json_step() {
     let dir = scratch();
     let path = dir.join("cut.kerf");
     edited(1).0.save_as(&path).unwrap();
@@ -280,7 +290,7 @@ fn a_v2_file_that_already_has_the_fonts_table_is_stamped_without_a_backup() {
         .unwrap();
     drop(Project::open(&path).unwrap());
     assert_eq!(version_of(&path), SCHEMA_VERSION);
-    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "no backup");
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2, "the file and its one backup");
     std::fs::remove_dir_all(&dir).ok();
 }
 
@@ -497,7 +507,10 @@ fn the_history_limit_never_drops_the_head() {
 /// the stored shape (the sample's and a few of the golden oracle's). Every one must still read; the newest
 /// must come back as it was stored, so a change to the shape is a decision (a new version, see
 /// `store::MIGRATIONS`) and not a slip. A version that only changes the tables needs no file.
-const PERSISTED: &[(u32, &str)] = &[(3, include_str!("persisted/timelines-v3.json"))];
+const PERSISTED: &[(u32, &str)] = &[
+    (3, include_str!("persisted/timelines-v3.json")),
+    (5, include_str!("persisted/timelines-v5.json")),
+];
 
 fn persisted_path(version: u32) -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(format!("src/project/persisted/timelines-v{version}.json"))

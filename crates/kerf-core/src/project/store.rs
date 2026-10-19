@@ -60,6 +60,12 @@ const MIGRATIONS: &[Migration] = &[
         destructive: false,
         needed_to_read: true,
     },
+    Migration {
+        run: v4_to_v5,
+        needed: v4_to_v5_needed,
+        destructive: false,
+        needed_to_read: false,
+    },
 ];
 
 /// The schema this build writes and the newest it opens.
@@ -138,6 +144,17 @@ fn v3_to_v4(conn: &Connection) -> rusqlite::Result<()> {
 
 fn v3_to_v4_needed(conn: &Connection) -> bool {
     !has_column(conn, "assets", "music_score")
+}
+
+/// v5: a delivery frame may fit footage over a blurred copy of itself (`Fit::Blur`, `"fit":"blur"`
+/// in the timeline JSON), a variant an older build fails to read. Nothing in the file changes; the
+/// step is the version that keeps an older build out, after the file is copied aside.
+fn v4_to_v5(_: &Connection) -> rusqlite::Result<()> {
+    Ok(())
+}
+
+fn v4_to_v5_needed(_: &Connection) -> bool {
+    true
 }
 
 /// The steps from `found` on that would change this file.

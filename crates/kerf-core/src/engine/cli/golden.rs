@@ -940,10 +940,15 @@ fn hw_encoder_for(n: usize) -> &'static str {
     ["h264_amf", "hevc_amf", "av1_amf", "h264_vaapi", "hevc_vaapi", "av1_vaapi"][n % 6]
 }
 
-/// One timeline of each family: what `project::persist_tests` freezes as the shape a file stores.
+/// One timeline of each family: what `project::persist_tests` freezes as the shape a file stores
+/// (the blurred-fill one is the first of its family whose cut has a delivery frame, which is where
+/// the timeline stores the fit).
 pub(crate) fn sample_timelines() -> Vec<Timeline> {
     let assets = pool();
-    [0, 4, CASES + MASTER_CASES, CASES + MASTER_CASES + 1, SVG_FIRST]
+    let blur = (BLUR_FIRST..TOTAL)
+        .find(|&i| case(i, &assets).timeline.format.is_some())
+        .expect("a blurred-fill case with a delivery frame");
+    [0, 4, CASES + MASTER_CASES, CASES + MASTER_CASES + 1, SVG_FIRST, blur]
         .into_iter()
         .map(|i| case(i, &assets).timeline)
         .collect()
