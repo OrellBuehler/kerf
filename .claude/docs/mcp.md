@@ -110,6 +110,10 @@ detached (`source_audio: false`) carries none — its linked audio clip is the o
 `link` on exactly the edits that carry linked clips (`link_is_an_optional_argument_on_exactly_the_edits_that_carry_linked_clips`
 pins it against the generated schemas, the way `ripple` is pinned); `timeline_summary` gives each
 track `linked_clips` / `detached_sound_clips`, and the server `instructions` carry one paragraph.
+**Locked tracks hold over MCP**: the core refuses every layout edit on a locked track, the agent's
+staged ones included, even for a lock the user set while the proposal was open (`core-project.md`);
+the `instructions` say what a lock refuses and leaves, in the refusal's own words
+(`the_server_instructions_say_what_a_locked_track_refuses`).
 **Grading over MCP**: `set_grade` (`clip_id`, `curves?` `{master, red, green, blue: [{x, y}]}`, `wheels?`
 `{shadows, midtones, highlights: {x, y, lightness}}`, `lut_path?` (`""` removes), `lut_intensity?`): omitted parts are
 kept, the same `lut_path` without an intensity keeps the current one; a new LUT file is read and checked before the

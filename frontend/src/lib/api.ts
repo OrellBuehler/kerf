@@ -2371,6 +2371,8 @@ export async function moveClip(clipId: string, timelineStart: number, trackId?: 
 			// A clip with partners is moved as the group it is, through the group move.
 			return moveClips([{ clip_id: clipId, timeline_start: start, track_id: trackId }], link);
 		}
+		ops.ensureEditable(devTimeline, clipId);
+		if (trackId) ops.ensureTrackEditable(devTimeline, trackId);
 		const found = locate(devTimeline, clipId);
 		if (found) {
 			const [srcTrack, ci] = found;
@@ -2753,6 +2755,7 @@ export async function setTrackLocked(trackId: string, locked: boolean): Promise<
 
 export async function setClipEnabled(clipId: string, enabled: boolean): Promise<Timeline> {
 	if (!inTauri()) {
+		ops.ensureEditable(devTimeline, clipId);
 		const found = locate(devTimeline, clipId);
 		if (found) found[0].clips[found[1]].enabled = enabled;
 		recordDev(enabled ? 'Enable clip' : 'Disable clip');

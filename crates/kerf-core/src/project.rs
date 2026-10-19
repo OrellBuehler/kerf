@@ -290,6 +290,20 @@ fn owned_by_other(owner: Option<&str>, caller: Option<&str>) -> bool {
 /// `serde_json` writes `NaN` and `inf` as `null`, which a plain number field then fails to read
 /// back — the whole project would stop opening — so this is checked on every write, whatever
 /// the setter that produced the number did or did not validate.
+/// Where a clip of `kind` goes when the edit names no track: the first unlocked track of that kind.
+/// Every one of them locked refuses (a locked track is never written to); none at all is the old
+/// "no suitable track".
+fn default_track(timeline: &Timeline, kind: StreamKind) -> Result<Uuid> {
+    timeline.first_unlocked_track_of(kind).ok_or_else(|| {
+        if timeline.first_track_of(kind).is_some() {
+            let word = if kind == StreamKind::Audio { "audio" } else { "video" };
+            Error::InvalidArgument(format!("every {word} track is locked — unlock one, or name a track"))
+        } else {
+            Error::Other("no suitable track for asset".to_string())
+        }
+    })
+}
+
 fn timeline_to_json(timeline: &Timeline) -> Result<String> {
     if let Some(at) = crate::finite::first_non_finite(timeline) {
         return Err(Error::InvalidArgument(format!(
@@ -2410,6 +2424,26 @@ impl Project {
                 if declared.is_some() && owned_by_other(row.owner.as_deref(), declared.as_deref()) {
                     return Err(Error::StagedEditOwnedByOther);
                 }
+                // A lock is the user's, and the user can set one while a proposal is open: the
+                // proposal's edits honour the live cut's locks as they are now, laid over it for the
+                // edit and taken off again, so the proposal does not record the user's lock as a
+                // change of its own (one the agent made itself stays).
+                let live_locks: HashSet<Uuid> = self.timeline()?.tracks.iter().filter(|t| t.locked).map(|t| t.id).collect();
+                let f = move |timeline: &mut Timeline| -> Result<R> {
+                    let own: HashMap<Uuid, bool> = timeline.tracks.iter().map(|t| (t.id, t.locked)).collect();
+                    for track in &mut timeline.tracks {
+                        track.locked |= live_locks.contains(&track.id);
+                    }
+                    let out = f(timeline);
+                    for track in &mut timeline.tracks {
+                        if let Some(&was) = own.get(&track.id) {
+                            if track.locked == (was || live_locks.contains(&track.id)) {
+                                track.locked = was;
+                            }
+                        }
+                    }
+                    out
+                };
                 let tx = self.conn.unchecked_transaction()?;
                 self.adopt_staged(row.owner.as_deref())?;
                 let out = self.edit_staged(row, label, f)?;
@@ -3400,14 +3434,10 @@ impl Project {
         self.edit_timeline("Add clip", |timeline| {
             let tid = match track_id {
                 Some(t) => {
-                    if timeline.track(t).is_none() {
-                        return Err(Error::TrackNotFound(t));
-                    }
+                    timeline.ensure_track_editable(t)?;
                     t
                 }
-                None => timeline
-                    .first_track_of(primary)
-                    .ok_or_else(|| Error::Other("no suitable track for asset".to_string()))?,
+                None => default_track(timeline, primary)?,
             };
             let start = timeline_start.unwrap_or_else(|| timeline.track(tid).map(Track::end).unwrap_or(0.0));
             let mut clip = Clip::for_asset(&asset, source_in, source_out, start);
@@ -3436,6 +3466,7 @@ impl Project {
         finite("the split point", at)?;
         let links = self.links_active();
         self.edit_timeline("Split clip", |timeline| {
+            timeline.ensure_editable(clip_id)?;
             if links {
                 timeline.split_clip_linked(clip_id, at)
             } else {
@@ -3482,6 +3513,7 @@ impl Project {
             &[clip_id],
             |_| "Trim clip".to_string(),
             |timeline| {
+                timeline.ensure_editable(clip_id)?;
                 let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
                 let was = timeline.tracks[ti].clips[ci].clone();
                 if let Some(value) = source_out {
@@ -3550,6 +3582,7 @@ impl Project {
             &[clip_id],
             |_| "Cut range".to_string(),
             |timeline| {
+                timeline.ensure_editable(clip_id)?;
                 if links {
                     let mut trimmed = Vec::new();
                     let kept = timeline.cut_clip_range_linked_noted(clip_id, from, to, &mut trimmed);
@@ -3568,6 +3601,7 @@ impl Project {
             &[clip_id],
             |_| "Reorder clip".to_string(),
             |timeline| {
+                timeline.ensure_track_editable(track_id)?;
                 let track = timeline.track_mut(track_id).ok_or(Error::TrackNotFound(track_id))?;
                 let current = track
                     .clips
@@ -3608,6 +3642,10 @@ impl Project {
             return Ok(moved.into_iter().next().expect("the named clip was moved"));
         }
         self.edit_timeline_exact("Move clip", |timeline| {
+            timeline.ensure_editable(clip_id)?;
+            if let Some(tid) = track_id {
+                timeline.ensure_track_editable(tid)?;
+            }
             let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
             let src_kind = timeline.tracks[ti].kind;
             let dest_ti = match track_id {
@@ -3870,10 +3908,11 @@ impl Project {
                 .filter(|(_, n)| *n >= 2)
                 .map(|(link, _)| (link, Uuid::new_v4()))
                 .collect();
-            // Resolve every destination first, so an unknown track fails before
+            // Resolve every destination first, so an unknown or locked track fails before
             // any edit lands.
             let mut staged: Vec<(usize, Clip)> = Vec::with_capacity(placements.len());
             for (track_id, clip) in placements {
+                timeline.ensure_track_editable(*track_id)?;
                 let ti = timeline
                     .tracks
                     .iter()
@@ -3960,6 +3999,7 @@ impl Project {
             &[clip_id],
             |_| "Ripple delete".to_string(),
             |timeline| {
+                timeline.ensure_editable(clip_id)?;
                 if links {
                     let mut trimmed = Vec::new();
                     let done = timeline.ripple_delete_linked_noted(clip_id, &mut trimmed);
@@ -4162,6 +4202,7 @@ impl Project {
     /// trims, effects and keyframes but drops out of the render.
     pub fn set_clip_enabled(&self, clip_id: Uuid, enabled: bool) -> Result<Clip> {
         self.edit_timeline(if enabled { "Enable clip" } else { "Disable clip" }, |timeline| {
+            timeline.ensure_editable(clip_id)?;
             let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
             timeline.tracks[ti].clips[ci].enabled = enabled;
             Ok(timeline.tracks[ti].clips[ci].clone())
@@ -4198,6 +4239,7 @@ impl Project {
             &[clip_id],
             |_| "Remove clip".to_string(),
             |timeline| {
+                timeline.ensure_editable(clip_id)?;
                 let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
                 timeline.tracks[ti].clips.remove(ci);
                 Ok(())
@@ -4290,6 +4332,7 @@ impl Project {
             &[clip_id],
             |_| "Set speed".to_string(),
             |timeline| {
+                timeline.ensure_editable(clip_id)?;
                 if links {
                     return timeline.set_speed_linked(clip_id, speed);
                 }
@@ -4807,9 +4850,7 @@ impl Project {
 
         let primary = asset.primary_kind();
         self.edit_timeline("Remove silence", |timeline| {
-            let tid = timeline
-                .first_track_of(primary)
-                .ok_or_else(|| Error::Other("no suitable track for asset".to_string()))?;
+            let tid = default_track(timeline, primary)?;
             let mut start = timeline.track(tid).map(Track::end).unwrap_or(0.0);
             let mut clips = Vec::new();
             for (src_in, src_out) in keep {
@@ -5051,10 +5092,13 @@ impl Project {
             return Err(Error::InvalidArgument("asset has no audio stream".to_string()));
         }
         self.edit_timeline_exact("Add audio", |timeline| {
-            let tid = match timeline.first_track_of(StreamKind::Audio) {
+            // Every audio track locked is no reason to refuse: the sound gets a track of its own, as a
+            // detach does.
+            let tid = match timeline.first_unlocked_track_of(StreamKind::Audio) {
                 Some(tid) => tid,
                 None => {
-                    let track = Track::new(StreamKind::Audio, "A1");
+                    let n = timeline.tracks.iter().filter(|t| t.kind == StreamKind::Audio).count();
+                    let track = Track::new(StreamKind::Audio, format!("A{}", n + 1));
                     let tid = track.id;
                     timeline.tracks.push(track);
                     tid
@@ -5167,9 +5211,7 @@ impl Project {
         self.edit_timeline("Concatenate", |timeline| {
             let mut clips = Vec::with_capacity(plan.len());
             for (primary, asset) in &plan {
-                let tid = timeline
-                    .first_track_of(*primary)
-                    .ok_or_else(|| Error::Other("no suitable track for asset".to_string()))?;
+                let tid = default_track(timeline, *primary)?;
                 let start = timeline.track(tid).map(Track::end).unwrap_or(0.0);
                 let clip = Clip::for_asset(asset, 0.0, asset.duration, start);
                 timeline.track_mut(tid).unwrap().clips.push(clip.clone());
@@ -8438,7 +8480,10 @@ mod tests {
         let saved = project.timeline().unwrap();
         assert_eq!(saved.for_render().track(vid).unwrap().clips.len(), 1);
 
-        // Disabling the clip drops it while leaving it on the timeline.
+        // Disabling the clip drops it while leaving it on the timeline — once its track is
+        // unlocked: whether a clip plays is the lock's to guard.
+        assert!(project.set_clip_enabled(clip.id, false).is_err());
+        project.set_track_locked(vid, false).unwrap();
         assert!(!project.set_clip_enabled(clip.id, false).unwrap().enabled);
         let saved = project.timeline().unwrap();
         assert_eq!(saved.track(vid).unwrap().clips.len(), 1, "still on the timeline");
@@ -12072,7 +12117,8 @@ mod tests {
         let v1 = project.timeline().unwrap().tracks[0].id;
         project.set_track_locked(v1, true).unwrap();
         project.set_ripple_mode(true).unwrap();
-        project.trim(a.id, None, Some(3.0), None).unwrap();
+        // A trim on it is refused outright, so nothing on it moves.
+        assert!(matches!(project.trim(a.id, None, Some(3.0), None), Err(Error::InvalidArgument(why)) if why.contains("locked")));
         assert_eq!(v1_starts(&project), vec![0.0, 6.0, 12.0]);
     }
 
@@ -12231,6 +12277,157 @@ mod tests {
             Err(Error::InvalidArgument(why)) if why.contains("locked")
         ));
         assert_eq!(project.history().unwrap().len(), revisions);
+    }
+
+    /// Every single-clip op that changes what is on a track, where, how long or whether it plays,
+    /// as `(name, op)`, each given the middle clip `b`, the last `c` and V1's id.
+    #[allow(clippy::type_complexity)]
+    fn layout_ops() -> Vec<(&'static str, Box<dyn Fn(&Project, &Clip, &Clip, Uuid) -> Result<()>>)> {
+        vec![
+            (
+                "split",
+                Box::new(|p, b, _, _| p.split_at(b.id, b.timeline_start + 1.0).map(drop)),
+            ),
+            (
+                "trim",
+                Box::new(|p, b, _, _| p.trim(b.id, None, Some(b.source_out - 0.5), None).map(drop)),
+            ),
+            (
+                "trim and move",
+                Box::new(|p, _, c, _| p.trim(c.id, None, None, Some(c.timeline_start + 0.25)).map(drop)),
+            ),
+            (
+                "cut range",
+                Box::new(|p, b, _, _| p.cut_clip_range(b.id, b.source_in + 1.0, b.source_in + 2.0).map(drop)),
+            ),
+            (
+                "move",
+                Box::new(|p, _, c, _| p.move_clip(c.id, c.timeline_start + 0.25, None).map(drop)),
+            ),
+            ("reorder", Box::new(|p, b, _, v1| p.reorder(v1, b.id, 2))),
+            (
+                "split and remove",
+                Box::new(|p, b, _, _| p.split_remove(b.id, b.timeline_start + 1.0, SplitSide::Left).map(drop)),
+            ),
+            ("slip", Box::new(|p, b, _, _| p.slip_clip(b.id, 0.5).map(drop))),
+            ("ripple delete", Box::new(|p, b, _, _| p.ripple_delete(b.id))),
+            ("remove", Box::new(|p, b, _, _| p.remove(b.id))),
+            ("speed", Box::new(|p, b, _, _| p.set_speed(b.id, 2.0).map(drop))),
+            ("disable", Box::new(|p, b, _, _| p.set_clip_enabled(b.id, false).map(drop))),
+            ("duplicate", Box::new(|p, b, _, _| p.duplicate_clips(&[b.id], 30.0).map(drop))),
+        ]
+    }
+
+    #[test]
+    fn single_clip_layout_edits_refuse_a_locked_track_as_the_group_edits_do() {
+        for (name, op) in layout_ops() {
+            let (project, _, [_, b, c]) = abutting_project();
+            let v1 = project.timeline().unwrap().tracks[0].id;
+            project.set_track_locked(v1, true).unwrap();
+            let before = serde_json::to_value(project.timeline().unwrap()).unwrap();
+            let revisions = project.history().unwrap().len();
+            let refused = op(&project, &b, &c, v1);
+            assert!(
+                matches!(&refused, Err(Error::InvalidArgument(why)) if why == "track V1 is locked"),
+                "{name}: {refused:?}"
+            );
+            assert_eq!(
+                serde_json::to_value(project.timeline().unwrap()).unwrap(),
+                before,
+                "{name} changed the cut"
+            );
+            assert_eq!(project.history().unwrap().len(), revisions, "{name} wrote a revision");
+
+            // Unlocked, the same op goes through: the refusal was the lock.
+            project.set_track_locked(v1, false).unwrap();
+            op(&project, &b, &c, v1).unwrap_or_else(|e| panic!("{name} unlocked: {e}"));
+        }
+    }
+
+    #[test]
+    fn a_locked_clip_keeps_its_look_and_sound_editable() {
+        let (project, _, [_, b, _]) = abutting_project();
+        let v1 = project.timeline().unwrap().tracks[0].id;
+        project.set_track_locked(v1, true).unwrap();
+        project.set_volume(b.id, 0.5).unwrap();
+        project.set_fade(b.id, Some(0.5), None).unwrap();
+        project.set_mask(b.id, None).unwrap();
+        project.set_audio_effects(b.id, Vec::new()).unwrap();
+        let after = project.timeline().unwrap().clip(b.id).unwrap().clone();
+        assert_eq!(
+            (after.volume, after.fade_in, after.timeline_start),
+            (0.5, 0.5, b.timeline_start)
+        );
+    }
+
+    #[test]
+    fn nothing_is_put_on_a_locked_track() {
+        let (project, asset, [a, _, c]) = abutting_project();
+        let v1 = project.timeline().unwrap().tracks[0].id;
+        let v2 = project.add_track(StreamKind::Video, None).unwrap().id;
+        project.set_track_locked(v2, true).unwrap();
+        // Moved onto it, or added to it by name.
+        let moved = project.move_clip(c.id, 40.0, Some(v2));
+        assert!(
+            matches!(&moved, Err(Error::InvalidArgument(why)) if why == "track V2 is locked"),
+            "{moved:?}"
+        );
+        let added = project.add_clip_to_timeline(asset, Some(v2), 0.0, 1.0, Some(50.0));
+        assert!(
+            matches!(&added, Err(Error::InvalidArgument(why)) if why == "track V2 is locked"),
+            "{added:?}"
+        );
+        let pasted = project.insert_clips(&[(v2, a)], 50.0);
+        assert!(
+            matches!(&pasted, Err(Error::InvalidArgument(why)) if why == "track V2 is locked"),
+            "{pasted:?}"
+        );
+
+        // Named no track, a clip goes to the first unlocked one of its kind — and with every one of
+        // them locked, nowhere.
+        project.set_track_locked(v2, false).unwrap();
+        project.set_track_locked(v1, true).unwrap();
+        let placed = project.add_clip_to_timeline(asset, None, 0.0, 1.0, Some(50.0)).unwrap();
+        assert!(project
+            .timeline()
+            .unwrap()
+            .track(v2)
+            .unwrap()
+            .clips
+            .iter()
+            .any(|x| x.id == placed.id));
+        project.set_track_locked(v2, true).unwrap();
+        let nowhere = project.add_clip_to_timeline(asset, None, 0.0, 1.0, Some(60.0));
+        assert!(
+            matches!(&nowhere, Err(Error::InvalidArgument(why)) if why.contains("every video track is locked")),
+            "{nowhere:?}"
+        );
+        assert!(matches!(project.concatenate(&[asset]), Err(Error::InvalidArgument(_))));
+    }
+
+    #[test]
+    fn an_agent_proposal_honours_a_lock_the_user_set_while_it_was_open() {
+        let (mut project, _, [a, b, c]) = abutting_project();
+        let v1 = project.timeline().unwrap().tracks[0].id;
+        project.set_actor(EditSource::Agent);
+        project.set_volume(a.id, 0.5).unwrap();
+        assert!(project.staged().unwrap().is_some());
+
+        project.set_actor(EditSource::User);
+        project.set_track_locked(v1, true).unwrap();
+
+        project.set_actor(EditSource::Agent);
+        for (name, op) in layout_ops() {
+            let refused = op(&project, &b, &c, v1);
+            assert!(
+                matches!(&refused, Err(Error::InvalidArgument(why)) if why.contains("locked")),
+                "{name}: {refused:?}"
+            );
+        }
+        // A look is still the agent's to propose, and the user's lock is not recorded as part of
+        // the proposal.
+        project.set_volume(b.id, 0.25).unwrap();
+        assert!(!project.staged_timeline().unwrap().unwrap().track(v1).unwrap().locked);
     }
 
     // ---- edit modes: roll, slip, slide, split-and-remove -------------------------

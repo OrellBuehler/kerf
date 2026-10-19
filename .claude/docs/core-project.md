@@ -17,8 +17,19 @@
   `cut_clip_range`, the beat snap, `reorder`, `move_clip(s)`, `insert_clips`.
   `trim` re-reads its clip afterwards because a ripple can move it. A forced-on
   `remove_clips` is the multi-select ripple delete. `move_clips` / `remove_clips`
-  are single revisions (`Move N clips` / `Remove N clips`), and — unlike the
-  single-clip ops, which leave locks to the GUI — refuse clips on a locked track.
+  are single revisions (`Move N clips` / `Remove N clips`), and refuse clips on a locked track.
+  **A lock is the core's to enforce, not only the GUI's**: every single-clip op that changes what is
+  on a track, where, how long or whether it plays — split, trim, cut range, move (source and
+  destination), reorder, ripple delete, remove, speed, enable / disable, add, paste / duplicate —
+  refuses a locked track (`Timeline::ensure_editable` / `ensure_track_editable`, inside the edit, so
+  on the timeline the edit lands on: `track V1 is locked`, nothing written), as the group ops, roll /
+  slip / slide, detach / reattach and link / unlink already did. A clip's look and sound (volume, fades,
+  effects, grade, transform, keyframes) stay editable, as the Inspector leaves them. A clip added with
+  no track named goes to the first **unlocked** track of its kind (`default_track`; all of them locked
+  refuses, `add_asset_audio` makes a new audio track as a detach does). **A lock set while an agent's
+  proposal is open holds for it**: `run_edit`'s staged path lays the live cut's locks over the proposal
+  for the edit and takes them off again, so the proposal does not record the user's lock as its own.
+  `link-ops.ts` mirrors all of it for the harness (`link-ops.test.ts`).
   `roll_edit` / `slip_clip` / `slide_clip` (`Roll edit` / `Slip clip` / `Slide
   clip`, one revision each, `source_limits()` read before the edit) are
   `edit_timeline_exact` — they move no length, only where footage changes hands;

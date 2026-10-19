@@ -6423,7 +6423,15 @@ const INSTRUCTIONS: &str = "Kerf MCP server. The user queues editing tasks in th
              same amount, so a sound that leads or trails its picture stays that far \
              off; add_asset_audio puts an asset's whole audio on an audio track. Layer footage with add_track / \
              remove_track — e.g. add a video track and move_clip B-roll onto it \
-             over the interview (later video tracks composite on top). Polish \
+             over the interview (later video tracks composite on top). A LOCKED \
+             track (`locked` in get_timeline_state; the user can lock one while \
+             your edits are under review, and the lock holds for them too) is the \
+             user's: a clip on it is not moved, trimmed, split, cut, removed, \
+             retimed, disabled or reordered, and nothing is added or pasted onto \
+             it — the call fails with `track V1 is locked` and changes nothing; \
+             its clips' volume, fades, effects, grade, transform and keyframes can \
+             still be set. Ask the user to unlock it rather than working around \
+             it; a clip added without a track goes to the first unlocked one. Polish \
              with set_volume / set_fade (fade-in/out, e.g. to smooth hard cuts), \
              set_speed, set_transform (scale / position / rotation / opacity / \
              crop — picture-in-picture; set_transform_at for an animated clip, which keys \
@@ -7912,6 +7920,15 @@ mod tests {
         let text = super::INSTRUCTIONS;
         assert!(text.contains("get_editor_context"), "{text}");
         assert!(text.contains("\"this clip\""), "{text}");
+    }
+
+    /// The agent is told what a lock refuses and what it leaves, in the words the refusal uses.
+    #[test]
+    fn the_server_instructions_say_what_a_locked_track_refuses() {
+        let text = super::INSTRUCTIONS;
+        assert!(text.contains("A LOCKED track"), "{text}");
+        assert!(text.contains("`track V1 is locked`"), "{text}");
+        assert!(text.contains("first unlocked one"), "{text}");
     }
 
     fn call(name: &'static str, args: serde_json::Value) -> rmcp::model::CallToolRequestParams {
