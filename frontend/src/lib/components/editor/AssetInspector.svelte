@@ -49,6 +49,9 @@
 	const proxy = $derived(mediaStatus.proxy(asset.id));
 	const act = $derived(proxyActions(proxy));
 	const gone = $derived(mediaStatus.isMissing(asset.id));
+	/** A pass is running on this asset: its progress takes Analyze's place. */
+	const running = $derived(ui.analyzing && ui.analyzingId === asset.id);
+	const ROW_ITEM = 'flex:1 1 0;min-width:max-content';
 	const KIND: Record<string, string> = { video: 'Video', audio: 'Audio', image: 'Still' };
 
 	const err = report;
@@ -101,9 +104,11 @@
 			<div style="margin-top:6px"><Btn size="sm" variant="secondary" icon="link" onclick={() => void relinkMediaFlow(asset)}>Relink…</Btn></div>
 		</div>
 	{/if}
-	<div style="margin-top:10px;display:grid;grid-template-columns:1fr 1fr;gap:6px">
+	<!-- Two equal buttons that wrap to one per line before either is cut short (the Inspector can be 250 px). -->
+	<div style="margin-top:10px;display:flex;flex-wrap:wrap;gap:6px">
 		<Btn
 			size="sm"
+			style={ROW_ITEM}
 			icon="plus"
 			iconSize={12}
 			pending={editor.locked}
@@ -116,6 +121,7 @@
 		>
 		<Btn
 			size="sm"
+			style={ROW_ITEM}
 			icon="list-plus"
 			iconSize={12}
 			pending={editor.locked}
@@ -141,10 +147,11 @@
 	<InspectorSection title="Analysis" summary={facts.analyzed} open>
 		<div style="margin-bottom:6px"><MediaChips assetId={asset.id} proxy={false} /></div>
 		{#each facts.analysis as f (f.label)}{@render row(f)}{/each}
-		{#if ui.analyzing && ui.analyzingId === asset.id}
+		{#if running}
 			<div style="margin-top:6px"><AnalysisRun /></div>
-		{:else}
-			<div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap">
+		{/if}
+		<div style="margin-top:6px;display:flex;gap:6px;flex-wrap:wrap">
+			{#if !running}
 				<Btn
 					size="sm"
 					icon="scan-line"
@@ -154,17 +161,17 @@
 						contextMenu.show(new MouseEvent('contextmenu', { clientX: r.left, clientY: r.bottom + 2 }), analyzeMenuItems(asset));
 					}}>Analyze</Btn
 				>
-				{#if mediaStatus.done(asset.id, 'transcript')}
-					<Btn
-						size="sm"
-						icon="file-text"
-						iconSize={12}
-						title="Write the transcript as a subtitle file, in this media's own time"
-						onclick={() => void exportTranscriptSrt(asset.id)}>Export .srt</Btn
-					>
-				{/if}
-			</div>
-		{/if}
+			{/if}
+			{#if mediaStatus.done(asset.id, 'transcript')}
+				<Btn
+					size="sm"
+					icon="file-text"
+					iconSize={12}
+					title="Write the transcript as a subtitle file, in this media's own time"
+					onclick={() => void exportTranscriptSrt(asset.id)}>Export .srt</Btn
+				>
+			{/if}
+		</div>
 	</InspectorSection>
 
 	{#if music}
@@ -212,12 +219,13 @@
 		</InspectorSection>
 	{/if}
 
-	<div style="margin-top:18px;display:grid;grid-template-columns:1fr 1fr;gap:6px">
+	<div style="margin-top:18px;display:flex;flex-wrap:wrap;gap:6px">
 		{#if !gone}
-			<Btn size="sm" icon="link" iconSize={12} title="Point this media at another file" onclick={() => void relinkMediaFlow(asset)}>Relink…</Btn>
+			<Btn size="sm" style={ROW_ITEM} icon="link" iconSize={12} title="Point this media at another file" onclick={() => void relinkMediaFlow(asset)}>Relink…</Btn>
 		{/if}
 		<Btn
 			size="sm"
+			style={ROW_ITEM}
 			variant="destructive"
 			data-quiet
 			icon="trash"

@@ -138,7 +138,8 @@ racing writes could leave the older on disk; bun-tested). `workspace.svelte.ts`
 is the runes singleton: `switchTo` keeps the arrangement being left, swaps the
 layout and shows the library tab that workspace last had (each remembers its own;
 until one is picked it is the workspace's tool: Color → Effects, Audio → Audio,
-Motion → Transitions, Edit and Deliver → Media), and **touches no project state**
+Motion → Titles — titles are added there, not in the Inspector —, Edit and Deliver → Media; a tab the user picked
+in a workspace is stored and kept, only the unpicked default moved), and **touches no project state**
 — cut, selection, playhead and playback are `editor` / `ui` and survive (dockview
 rebuilds the panels, so a panel's own scroll starts over). **A layout is written
 only if it was rearranged**: dockview reports layout changes for a great deal
@@ -219,10 +220,12 @@ title controls; the caption look it shares with the lane's menu is `ui.captionSt
 **One place per action.** The Inspector is about the selection and creates nothing:
 the Library adds (titles, looks, effects, transitions, audio), the timeline places and
 trims, the Inspector tunes what is selected, and the menu bar (entries from the keymap
-registry, so each carries the user's key) keeps every adding action reachable when a panel
-is folded or closed — *Edit › Add title at playhead* (`title.add`, ⌘T / Ctrl+T, also the
-titles lane's +) and *Generate captions* (`title.generateCaptions`, also the lane's
-right-click, with *Clear captions*), *File › Import captions…*. The Inspector used to
+registry, so each carries the user's key) keeps the common adds reachable when the library is
+folded or closed — *Edit › Add title at playhead* (`title.add`, ⌘T / Ctrl+T, also the
+titles lane's +), *Generate captions* (`title.generateCaptions`, also the lane's
+right-click, with *Clear captions*) and *File › Import captions…*; animated titles are also the
+lane's right-click. The styled titles (lower third, caption, text), the caption look and the
+templates are the Titles tab's alone (the rail and *Window › Library* bring it back). The Inspector used to
 carry the whole Titles controls as a *Titles lane* section under every selection, the
 look chips in its Color section and *Add text overlay / Generate captions* in its
 right-click; each duplicated the Titles tab, the Effects tab or the lane and is gone
@@ -1150,7 +1153,7 @@ modifiers — the old handler ignored extra Shift/Alt and took ⌘ or Ctrl every
 `keymap.test.ts` holds the defaults against a copy of it (the differences: ⌘⇧S
 stays Save as a second default, ⇧J-style accidents and Ctrl-on-Mac are gone), plus the
 bare keys added since (`ADDED`: N / Y / U / Q / W / S) and the modified chords added for linked A/V
-(`ADDED_SHIFT` ⇧D detach, `ADDED_MOD` ⌘L link and ⌘K split, `ADDED_MOD_SHIFT` ⇧⌘D reattach / ⇧⌘L unlink). **Split at playhead** is `edit.split` (⌘K; Edit menu and the clip menu, which says why when it is off): the selected clips the playhead is inside, or — nothing selected — every clip under it, cut on the frame it is on, a link group as one cut (`planPlayheadSplit`, `key-edits.ts`; one Undo per cut made). **Roll, slip and slide have keys**, a frame a press (`repeat: false`, since each press is a revision): `<` / `>` roll the cut nearest the playhead (the playhead follows it), `Alt+,` / `Alt+.` slip the selected clip's footage, `Mod+Alt+,` / `Mod+Alt+.` slide it — each tried first on a scratch copy through `previewEdit` (the drags' own port), so a limit or a locked track is a sentence, not a refusal from the backend. **`?` opens the shortcut cheat sheet** (`ShortcutSheet`, `shortcut-sheet.ts`: every key in force, grouped as the settings list is, read-only; Help › Keyboard shortcuts…) and *Customize keyboard shortcuts…* is the rebinding editor (`app.keyboard`) — the two used to be one dialog. The registry's *Save project…* is one label for one command; the File menu says *Save project as…* once the project has a file.
+(`ADDED_SHIFT` ⇧D detach, `ADDED_MOD` ⌘L link, ⌘K split, ⌘G go to timecode and ⌘T add title, `ADDED_MOD_SHIFT` ⇧⌘D reattach / ⇧⌘L unlink). **Split at playhead** is `edit.split` (⌘K; Edit menu and the clip menu, which says why when it is off): the selected clips the playhead is inside, or — nothing selected — every clip under it, cut on the frame it is on, a link group as one cut (`planPlayheadSplit`, `key-edits.ts`; one Undo per cut made). **Roll, slip and slide have keys**, a frame a press (`repeat: false`, since each press is a revision): `<` / `>` roll the cut nearest the playhead (the playhead follows it), `Alt+,` / `Alt+.` slip the selected clip's footage, `Mod+Alt+,` / `Mod+Alt+.` slide it — each tried first on a scratch copy through `previewEdit` (the drags' own port), so a limit or a locked track is a sentence, not a refusal from the backend. **`?` opens the shortcut cheat sheet** (`ShortcutSheet`, `shortcut-sheet.ts`: every key in force, grouped as the settings list is, read-only; Help › Keyboard shortcuts…) and *Customize keyboard shortcuts…* is the rebinding editor (`app.keyboard`) — the two used to be one dialog. The registry's *Save project…* is one label for one command; the File menu says *Save project as…* once the project has a file.
 **Only what the user changed is stored** (`Settings.keybindings`, opaque to Rust
 like `theme`: `{ version, bindings: { id: [chord…] } }`, patch-written, `null` when
 nothing is customised), so an untouched action follows the running build's defaults

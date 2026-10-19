@@ -333,7 +333,6 @@
 	const effects = $derived(clip?.effects ?? []);
 	const audioFx = $derived(clip?.audio ?? []);
 	const keyframes = $derived(clip?.keyframes ?? []);
-	const overlays = $derived(editor.overlays);
 	const overlay = $derived(editor.selectedOverlay);
 	const svgTitle = $derived(editor.selectedSvgOverlay);
 
