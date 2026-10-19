@@ -13,6 +13,7 @@
 		x,
 		y,
 		current,
+		opener = null,
 		onpick,
 		onclose
 	}: {
@@ -21,6 +22,8 @@
 		y: number;
 		/** The easing every selected segment has, or undefined when they differ. */
 		current: Easing | undefined;
+		/** The button that opened it: a press there toggles it shut, not closes and reopens it. */
+		opener?: Element | null;
 		onpick: (e: Easing) => void;
 		onclose: () => void;
 	} = $props();
@@ -83,15 +86,29 @@
 		e.stopPropagation();
 	}
 
+	function onclick(e: MouseEvent) {
+		const id = e.target instanceof Element ? e.target.closest<HTMLElement>('[data-easing]')?.dataset.easing : undefined;
+		const choice = EASING_CHOICES.find((c) => c.id === id);
+		if (choice) pick(choice.easing);
+	}
+
 	/** Drawn in the document's body: a panel's dock group is a containing block (`contain`,
-	 *  `transform`), which would clip a fixed box and place it from the group's corner. */
+	 *  `transform`), which would clip a fixed box and place it from the group's corner. Out
+	 *  there it is outside the root Svelte delegates a detached panel's events from, so its
+	 *  keys and clicks are listened for on the box itself. */
 	const toBody = (node: HTMLElement) => {
 		node.ownerDocument.body.appendChild(node);
-		return () => node.remove();
+		node.addEventListener('keydown', onkeydown);
+		node.addEventListener('click', onclick);
+		return () => {
+			node.removeEventListener('keydown', onkeydown);
+			node.removeEventListener('click', onclick);
+			node.remove();
+		};
 	};
 
 	const outside = (e: Event) => {
-		if (el && e.target instanceof Node && el.contains(e.target)) return;
+		if (e.target instanceof Node && (el?.contains(e.target) || opener?.contains(e.target))) return;
 		onclose();
 	};
 </script>
@@ -105,13 +122,12 @@
 		aria-label="Easing"
 		tabindex="-1"
 		style="left:{pos.x}px;top:{pos.y}px"
-		{onkeydown}
 		{@attach onWindow({ pointerdowncapture: outside, blur: () => onclose(), resize: () => onclose(), scrollcapture: outside })}
 	>
 		<div class="head">Easing of the segment after each selected key</div>
 		<div class="grid" style="grid-template-columns:repeat({COLS}, 1fr)">
 			{#each EASING_CHOICES as c (c.id)}
-				<button type="button" class="opt" aria-pressed={lit === c.id} onclick={() => pick(c.easing)}>
+				<button type="button" class="opt" aria-pressed={lit === c.id} data-easing={c.id}>
 					<svg width={W} height={H} viewBox="0 0 {W} {H}" aria-hidden="true">
 						<rect x="0.5" y="0.5" width={W - 1} height={H - 1} rx="2" class="frame" />
 						<path d={easingPath(c.easing, W, H, 3)} class="curve" />
@@ -135,9 +151,10 @@
 		z-index: 60;
 		padding: 8px;
 		border-radius: var(--radius-md);
-		background: var(--surface-overlay);
-		border: var(--line-width) solid var(--border-default);
-		box-shadow: var(--shadow-pop);
+		background: var(--surface-raised);
+		border: var(--line-width) solid var(--border-strong);
+		box-shadow: var(--shadow-lg);
+		font-family: var(--font-sans);
 		width: max-content;
 	}
 	.pop:focus {

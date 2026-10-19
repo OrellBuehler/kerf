@@ -422,12 +422,16 @@ when a key lies beyond the end), labelled in the cut's time with the timeline ru
 a diamond is round when its segment is eased and square when it holds. Click selects a key and seeks to it (exactly),
 Shift / Ctrl add or toggle, a drag on empty lane space is a marquee, the ruler seeks and scrubs (Escape puts the playhead
 back). Dragging a key retimes the selection across rows: the grabbed key lands on a magnet within 6 px (the playhead, the
-clip's ends, a key that is not moving, `dragMagnets` / `snapShift`) or else on a frame, and nothing goes before 0; **Alt at
+clip's ends, a key that is not moving, `dragMagnets` / `snapShift`) or else on a frame of the cut's grid (not the clip's,
+which is off it when the clip starts between frames), and nothing goes before 0; **Alt at
 the release** (the ghost follows Alt live) leaves the originals and drops copies; a key landed on gives way. While the
-panel has focus the editor's own Copy / Paste / Delete / Select all bindings (`settings.actionFor`, so a rebound key
-follows) copy the selected keys (spacing kept, the clipboard outlives the panel and works on another clip), paste them
-with the earliest at the playhead, delete them (a row left empty is static) and select every key; Escape clears the
-selection. **The easing popover** (`EasingPopover.svelte`, from the bar's *Easing* button or a diamond's *Easing…*) shows
+panel has focus the editor's own Copy / Cut / Paste / Delete / Select all bindings (`settings.actionFor`, so a rebound
+key follows; `dopeKey` routes them, a held key repeating only where the registry allows) copy the selected keys (spacing
+kept, the clipboard outlives the panel and works on another clip), cut them, paste them with the earliest at the
+playhead, delete them (a row left empty is static) and select every key, and ripple delete / duplicate / split are
+swallowed rather than reaching the clip behind the panel; Escape clears the selection. **The easing popover** (`EasingPopover.svelte`, from the bar's *Easing* button — which toggles it — or a diamond's
+*Easing…*; drawn in the document's body because a dock group is a containing block, and so listening for its keys and
+clicks on the box itself: Svelte delegates a detached panel's events from the panel's mount root, which the body is not) shows
 the twelve presets of `EASING_CHOICES` (eight before, now also Glide / Settle / Lift / Whip — the Inspector's picker
 lists the same) as curves drawn from the renderers' polyline (`easingPath`), lights the one the selected segments share,
 and shapes the segment each selected key starts (`easingTargets`: a row's last key starts none); arrows move between

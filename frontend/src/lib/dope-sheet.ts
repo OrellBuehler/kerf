@@ -40,9 +40,12 @@ export interface DopeEdit {
 
 const byTime = (a: { time: number }, b: { time: number }) => a.time - b.time;
 const isSame = (a: number, b: number) => Math.abs(a - b) <= SAME_TIME;
+/** An easing of our own: a curve read off the editor's (reactive) timeline is a proxy, which the
+ *  harness's history cannot clone. */
+const own = (e: Easing): Easing => (typeof e === 'string' ? e : { bezier: { ...e.bezier } });
 const plain = (k: PropertyKey): PropertyKey => {
 	const out: PropertyKey = { time: k.time, value: k.value };
-	if (k.easing && k.easing !== 'linear') out.easing = k.easing;
+	if (k.easing && k.easing !== 'linear') out.easing = own(k.easing);
 	return out;
 };
 
@@ -100,21 +103,22 @@ export function clampShift(sel: readonly KeyRef[], dt: number): number {
 
 /**
  * The shift a drag lands on: the grabbed key on a magnet within `reach` seconds (the playhead,
- * the clip's ends, another key that is not moving), else the grabbed key on a frame. The result is
+ * the clip's ends, another key that is not moving), else the grabbed key on a frame of the cut —
+ * the timeline's grid, so a clip that starts between two frames still keys on one. The result is
  * held so that no selected key goes before 0.
  */
 export function snapShift(
 	sel: readonly KeyRef[],
 	grabbed: number,
 	raw: number,
-	opts: { magnets: readonly number[]; reach: number; fps: number }
+	opts: { magnets: readonly number[]; reach: number; fps: number; clipStart: number }
 ): number {
 	const target = grabbed + raw;
 	let best: number | null = null;
 	for (const m of opts.magnets) {
 		if (Math.abs(m - target) <= opts.reach && (best === null || Math.abs(m - target) < Math.abs(best - target))) best = m;
 	}
-	const landed = best ?? snapToFrame(target, opts.fps);
+	const landed = best ?? snapToFrame(opts.clipStart + target, opts.fps) - opts.clipStart;
 	return clampShift(sel, landed - grabbed);
 }
 
@@ -181,7 +185,7 @@ export function copyKeys(clip: Animatable, sel: readonly KeyRef[]): KeyClipboard
 	return {
 		keys: keys.map(({ prop, k }) => {
 			const out: KeyClipboard['keys'][number] = { prop, offset: k.time - first, value: k.value };
-			if (k.easing && k.easing !== 'linear') out.easing = k.easing;
+			if (k.easing && k.easing !== 'linear') out.easing = own(k.easing);
 			return out;
 		})
 	};
@@ -198,7 +202,7 @@ export function pasteKeys(clip: Animatable, board: KeyClipboard, at: number): Do
 		if (mine.length === 0) continue;
 		const placed = mine.map((k) => {
 			const out: PropertyKey = { time: start + k.offset, value: clampProperty(prop, k.value) };
-			if (k.easing) out.easing = k.easing;
+			if (k.easing) out.easing = own(k.easing);
 			return out;
 		});
 		tracks.push({ prop, keys: landInto(propertyKeys(clip, prop), placed) });
@@ -217,8 +221,9 @@ export function easingTargets(clip: Animatable, sel: readonly KeyRef[]): KeyRef[
 	});
 }
 
-/** `easing` on the segment leaving each of `targets`. The selection is kept. */
-export function easeKeys(clip: Animatable, targets: readonly KeyRef[], easing: Easing): DopeEdit {
+/** `easing` on the segment each selected key starts (`easingTargets`). The selection is kept. */
+export function easeKeys(clip: Animatable, sel: readonly KeyRef[], easing: Easing): DopeEdit {
+	const targets = easingTargets(clip, sel);
 	return {
 		tracks: touched(targets).map((prop) => ({
 			prop,
@@ -226,11 +231,11 @@ export function easeKeys(clip: Animatable, targets: readonly KeyRef[], easing: E
 				const out = plain(k);
 				if (!isSelected(targets, prop, k.time)) return out;
 				if (easing === 'linear') delete out.easing;
-				else out.easing = easing;
+				else out.easing = own(easing);
 				return out;
 			})
 		})),
-		selected: [...targets]
+		selected: [...sel]
 	};
 }
 
@@ -239,7 +244,8 @@ export function sharedEasing(clip: Animatable, targets: readonly KeyRef[]): Easi
 	let found: Easing | undefined;
 	let first = true;
 	for (const r of targets) {
-		const k = propertyKeys(clip, r.prop).find((k) => isSame(k.time, r.time));
+		// The last key at that moment: of a step's two keys, the one that starts a segment.
+		const k = propertyKeys(clip, r.prop).findLast((k) => isSame(k.time, r.time));
 		const e = k?.easing ?? 'linear';
 		if (first) found = e;
 		else if (JSON.stringify(e) !== JSON.stringify(found)) return undefined;
@@ -283,4 +289,26 @@ export function easingPath(e: Easing, w: number, h: number, inset = 2): string {
 	const x = (u: number) => inset + u * (w - 2 * inset);
 	const y = (v: number) => h - inset - v * (h - 2 * inset);
 	return pts.map(([u, v], i) => `${i === 0 ? 'M' : 'L'}${+x(u).toFixed(2)} ${+y(v).toFixed(2)}`).join(' ');
+}
+
+/** What a key the editor binds does while the dope sheet has focus: the keys' own copy, cut,
+ *  paste, delete and select all, or nothing (`swallow`) for an editing shortcut that would
+ *  otherwise reach the clip behind the panel — a ripple delete, a duplicate, a split. A held key
+ *  repeats only where its action allows it. `null` leaves the key to the editor. */
+export type DopeKey = 'copy' | 'cut' | 'paste' | 'delete' | 'selectAll' | 'swallow';
+
+export function dopeKey(action: string | null, repeat: boolean, allowsRepeat: (id: string) => boolean): DopeKey | null {
+	const own: Record<string, DopeKey> = {
+		'edit.copy': 'copy',
+		'edit.cut': 'cut',
+		'edit.paste': 'paste',
+		'edit.delete': 'delete',
+		'edit.selectAll': 'selectAll',
+		'edit.rippleDelete': 'swallow',
+		'edit.duplicate': 'swallow',
+		'edit.split': 'swallow'
+	};
+	const what = action ? own[action] : undefined;
+	if (!what) return null;
+	return repeat && !allowsRepeat(action!) ? 'swallow' : what;
 }

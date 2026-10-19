@@ -29,6 +29,7 @@
 	import { resizeObserverFor } from '#lib/realm';
 	import { holdForPreview, report } from '#lib/ops';
 	import { tip } from '#lib/tip';
+	import { allowsRepeat } from '#lib/keymap';
 	import { rulerGrid, ticksIn, tickLabel } from '#lib/ruler';
 	import { PROPERTIES } from '#lib/channels';
 	import { clipDuration } from '#lib/types';
@@ -38,6 +39,7 @@
 		changes,
 		copyKeys,
 		deleteKeys,
+		dopeKey,
 		dopeRows,
 		dragMagnets,
 		easeKeys,
@@ -92,7 +94,7 @@
 	type Marquee = { kind: 'marquee'; base: KeyRef[]; x0: number; y0: number; x1: number; y1: number; moved: boolean };
 	let gesture = $state<Move | Marquee | null>(null);
 	/** A gesture's edit while it is being written: shown until it settles. */
-	let writing = $state<{ clipId: string; edit: DopeEdit } | null>(null);
+	let writing = $state.raw<{ clipId: string; edit: DopeEdit } | null>(null);
 
 	const ghost = $derived.by((): DopeEdit | null => {
 		if (clip && gesture?.kind === 'move' && gesture.moved) return retimeKeys(clip, gesture.base, gesture.dt, gesture.alt);
@@ -160,14 +162,15 @@
 	async function write(c: Clip, edit: DopeEdit) {
 		if (edit.tracks.length === 0 || !changes(c, edit)) return;
 		if (holdForPreview()) return;
-		writing = { clipId: c.id, edit };
+		const mine = { clipId: c.id, edit };
+		writing = mine;
 		try {
 			await editor.setPropertyTracks(c.id, edit.tracks);
-			selection = edit.selected;
+			if (writing === mine) selection = edit.selected;
 		} catch (e) {
 			report(e);
 		} finally {
-			writing = null;
+			if (writing === mine) writing = null;
 		}
 	}
 
@@ -186,16 +189,21 @@
 		if (!c || live.length === 0) return;
 		void write(c, deleteKeys(c, live));
 	}
+	function cut() {
+		copy();
+		remove();
+	}
 	function ease(e: Easing) {
 		const c = clip;
 		popover = null;
 		if (!c || targets.length === 0) return;
-		void write(c, easeKeys(c, targets, e));
+		void write(c, easeKeys(c, live, e));
 	}
 
 	// ---- the easing popover ------------------------------------------------------
 
 	let popover = $state<{ x: number; y: number } | null>(null);
+	let easingButton = $state<HTMLElement | null>(null);
 	function openEasing(at: { x: number; y: number }) {
 		if (targets.length === 0) return;
 		popover = at;
@@ -222,7 +230,8 @@
 				const dt = snapShift(base, time, raw, {
 					magnets: dragMagnets(rows, base, duration, playhead),
 					reach: REACH_PX / pxPerSec,
-					fps: editor.fps
+					fps: editor.fps,
+					clipStart: c.timeline_start
 				});
 				g = { ...g, moved: true, dt, alt: ev.altKey };
 				gesture = g;
@@ -333,12 +342,13 @@
 			if (selection.length === 0) return;
 			selection = [];
 		} else {
-			const act = settings.actionFor(e);
-			if (act === 'edit.copy') copy();
-			else if (act === 'edit.paste') paste();
-			else if (act === 'edit.delete') remove();
-			else if (act === 'edit.selectAll') selection = allKeys(rows);
-			else return;
+			const what = dopeKey(settings.actionFor(e), e.repeat, allowsRepeat);
+			if (what === 'copy') copy();
+			else if (what === 'cut') cut();
+			else if (what === 'paste') paste();
+			else if (what === 'delete') remove();
+			else if (what === 'selectAll') selection = allKeys(rows);
+			else if (what !== 'swallow') return;
 		}
 		e.preventDefault();
 		e.stopPropagation();
@@ -365,7 +375,12 @@
 				aria-haspopup="dialog"
 				aria-expanded={popover !== null}
 				onclick={(e: MouseEvent) => {
-					const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
+					easingButton = e.currentTarget as HTMLElement;
+					if (popover) {
+						popover = null;
+						return;
+					}
+					const r = easingButton.getBoundingClientRect();
 					openEasing({ x: r.left, y: r.bottom + 4 });
 				}}>Easing</Btn
 			>
@@ -447,7 +462,7 @@
 		{/if}
 	{/if}
 	{#if popover && clip}
-		<EasingPopover x={popover.x} y={popover.y} current={sharedEasing(clip, targets)} onpick={ease} onclose={() => (popover = null)} />
+		<EasingPopover x={popover.x} y={popover.y} current={sharedEasing(clip, targets)} opener={easingButton} onpick={ease} onclose={() => (popover = null)} />
 	{/if}
 </div>
 

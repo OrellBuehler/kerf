@@ -119,7 +119,8 @@ lock is taken; the clip comes back. The nested curves / wheels are MCP-only mirr
 [{time, value, easing?}]`; `[]` makes the number static again; the clip comes back) animates one number —
 a transform number, a colour number or the clip's volume — independently of the rest,
 `set_property_tracks` (`clip_id`, `tracks: [{prop, keys}]`) re-keys several numbers in one edit (the dope
-sheet's gestures; a number twice or none at all is refused), `copy_keyframes` (`from_clip_id`, `to_clip_id`,
+sheet's gestures; a number twice or none at all is refused; each track is `PropertyTrackArg` with `keys` required and
+`deny_unknown_fields`, since the model's `PropertyTrack` reads a misspelt `keys` as none and would make the number static), `copy_keyframes` (`from_clip_id`, `to_clip_id`,
 `props?`, `offset?`) gives another clip the same
 animation, and `set_keyframe_easing` takes an optional `prop`; the server `instructions` mention them.
 **Edit modes over MCP**: `roll_edit` (`clip_a`

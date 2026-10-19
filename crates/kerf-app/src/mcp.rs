@@ -1316,7 +1316,23 @@ struct PropertyTracksParams {
                        takes its prop and keys (pass [] keys to make that number static). Each number at most once; \
                        numbers not listed are untouched."
     )]
-    tracks: Vec<PropertyTrack>,
+    tracks: Vec<PropertyTrackArg>,
+}
+
+/// One number's keys for `set_property_tracks`: the model's [`PropertyTrack`] with `keys` required
+/// and a key it does not name (`key`) refused — the persisted type reads either as no keys, which
+/// would silently make the number static.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PropertyTrackArg {
+    prop: Property,
+    keys: Vec<PropertyKey>,
+}
+
+impl From<PropertyTrackArg> for PropertyTrack {
+    fn from(a: PropertyTrackArg) -> Self {
+        Self { prop: a.prop, keys: a.keys }
+    }
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -3494,7 +3510,8 @@ impl KerfMcp {
     fn set_property_tracks(&self, Parameters(p): Parameters<PropertyTracksParams>) -> Result<String, McpError> {
         let clip_id = parse_arg("clip_id", &p.clip_id)?;
         self.edit(|project| {
-            let out = project.set_property_tracks(clip_id, p.tracks).map_err(core_err)?;
+            let tracks = p.tracks.into_iter().map(PropertyTrack::from).collect();
+            let out = project.set_property_tracks(clip_id, tracks).map_err(core_err)?;
             json(&out)
         })
     }
@@ -6654,6 +6671,25 @@ mod tests {
             serde_json::json!({"clip_id": "c", "curves": {"master": [{"x": 0, "y": 1, "z": 2}]}}),
             serde_json::json!({"clip_id": "c", "wheels": {"midtone": {}}}),
             serde_json::json!({"clip_id": "c", "wheels": {"shadows": {"lightnes": 0.1}}}),
+        ] {
+            assert!(parse(bad.clone()).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn set_property_tracks_refuses_a_track_without_its_keys() {
+        let parse = |v: serde_json::Value| serde_json::from_value::<super::PropertyTracksParams>(v);
+        let ok = parse(serde_json::json!({
+            "clip_id": "c",
+            "tracks": [{"prop": "opacity", "keys": []}, {"prop": "volume", "keys": [{"time": 0, "value": 1}]}]
+        }))
+        .unwrap();
+        let tracks: Vec<kerf_core::PropertyTrack> = ok.tracks.into_iter().map(Into::into).collect();
+        assert_eq!(tracks[1].keys.len(), 1);
+        for bad in [
+            serde_json::json!({"clip_id": "c", "tracks": [{"prop": "opacity"}]}),
+            serde_json::json!({"clip_id": "c", "tracks": [{"prop": "opacity", "key": [{"time": 0, "value": 1}]}]}),
+            serde_json::json!({"clip_id": "c", "tracks": [{"prop": "opacity", "keys": [], "easing": "hold"}]}),
         ] {
             assert!(parse(bad.clone()).is_err(), "{bad}");
         }

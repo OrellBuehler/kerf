@@ -5,6 +5,7 @@ import {
 	clampShift,
 	copyKeys,
 	deleteKeys,
+	dopeKey,
 	dopeRows,
 	dragMagnets,
 	easeKeys,
@@ -133,11 +134,20 @@ describe('retime', () => {
 		expect(magnets).toContain(2.7);
 		expect(magnets).not.toContain(2);
 		// 2 + 0.98 = 2.98 is within 0.05 of volume's 3.
-		expect(snapShift(sel, 2, 0.98, { magnets, reach: 0.05, fps: 30 })).toBeCloseTo(1, 12);
+		expect(snapShift(sel, 2, 0.98, { magnets, reach: 0.05, fps: 30, clipStart: 0 })).toBeCloseTo(1, 12);
 		// 2 + 0.31 = 2.31: no magnet, frame 69 at 30 fps.
-		expect(snapShift(sel, 2, 0.31, { magnets, reach: 0.05, fps: 30 })).toBe(69 / 30 - 2);
+		expect(snapShift(sel, 2, 0.31, { magnets, reach: 0.05, fps: 30, clipStart: 0 })).toBe(69 / 30 - 2);
 		// Held at the clip's start.
-		expect(snapShift(sel, 2, -9, { magnets, reach: 0.05, fps: 30 })).toBe(-2);
+		expect(snapShift(sel, 2, -9, { magnets, reach: 0.05, fps: 30, clipStart: 0 })).toBe(-2);
+	});
+
+	test('the frame is the cut’s, so a clip that starts between two frames keys on one', () => {
+		const sel = [{ prop: 'opacity' as const, time: 2 }];
+		const clipStart = 1.01;
+		const dt = snapShift(sel, 2, 0.31, { magnets: [], reach: 0.05, fps: 30, clipStart });
+		const onTimeline = clipStart + 2 + dt;
+		expect(Math.abs(onTimeline * 30 - Math.round(onTimeline * 30))).toBeLessThan(1e-9);
+		expect(Math.round(onTimeline * 30)).toBe(100);
 	});
 });
 
@@ -202,12 +212,34 @@ describe('easing', () => {
 		]);
 		expect(sharedEasing(c, targets)).toBe('linear');
 		expect(sharedEasing(c, [{ prop: 'opacity', time: 0 }, { prop: 'volume', time: 3 }])).toBeUndefined();
-		const edit = easeKeys(c, targets, 'hold');
+		const edit = easeKeys(c, [...sel], 'hold');
+		expect(edit.selected).toEqual([...sel]);
 		for (const t of edit.tracks) setPropertyKeys(c, t.prop, t.keys);
 		expect(propertyKeys(c, 'opacity').map((x) => x.easing ?? 'linear')).toEqual(['ease_in_out', 'hold', 'linear']);
 		expect(sharedEasing(c, targets)).toBe('hold');
-		const back = easeKeys(c, targets, 'linear');
+		const back = easeKeys(c, [...sel], 'linear');
 		expect(back.tracks[0].keys[1]).toEqual(k(2, 0.5));
+	});
+
+	test('of a step’s two keys, the one that starts the segment is read and shaped', () => {
+		const c = clip();
+		setPropertyKeys(c, 'opacity', [k(0, 0, 'hold'), k(2, 0.2, 'hold'), k(2, 0.8), k(4, 1)]);
+		const sel = [{ prop: 'opacity' as const, time: 2 }];
+		expect(easingTargets(c, sel)).toEqual(sel);
+		expect(sharedEasing(c, sel)).toBe('linear');
+		const edit = easeKeys(c, sel, 'ease_out');
+		expect(edit.tracks[0].keys[2].easing).toBe('ease_out');
+	});
+
+	test('a curve is copied, not shared with the clip it was read from', () => {
+		const c = clip();
+		const curve = { bezier: { x1: 0.1, y1: 0.2, x2: 0.3, y2: 0.4 } };
+		setPropertyKeys(c, 'opacity', [k(0, 0, curve), k(2, 1)]);
+		const read = propertyKeys(c, 'opacity')[0].easing;
+		const moved = retimeKeys(c, [{ prop: 'opacity', time: 2 }], 1).tracks[0].keys[0].easing;
+		expect(moved).toEqual(curve);
+		expect(moved).not.toBe(read);
+		expect(structuredClone(moved)).toEqual(curve);
 	});
 
 	test('twelve presets, each drawn as the curve it plays', () => {
@@ -225,5 +257,26 @@ describe('axis', () => {
 		expect(xOf(axis, 0)).toBe(8);
 		expect(xOf(axis, 4)).toBe(208);
 		expect(timeAt(axis, xOf(axis, 1.25))).toBeCloseTo(1.25, 12);
+	});
+});
+
+describe('keys while the panel has focus', () => {
+	const repeats = (id: string) => !['edit.copy', 'edit.cut', 'edit.paste', 'edit.delete', 'edit.duplicate', 'edit.split', 'edit.rippleDelete'].includes(id);
+	test('the keys’ own copy, cut, paste, delete and select all', () => {
+		expect(dopeKey('edit.copy', false, repeats)).toBe('copy');
+		expect(dopeKey('edit.cut', false, repeats)).toBe('cut');
+		expect(dopeKey('edit.paste', false, repeats)).toBe('paste');
+		expect(dopeKey('edit.delete', false, repeats)).toBe('delete');
+		expect(dopeKey('edit.selectAll', false, repeats)).toBe('selectAll');
+	});
+	test('an edit that would reach the clip behind the panel does nothing', () => {
+		for (const id of ['edit.rippleDelete', 'edit.duplicate', 'edit.split']) expect(dopeKey(id, false, repeats)).toBe('swallow');
+	});
+	test('a held key repeats only where its action allows it', () => {
+		expect(dopeKey('edit.paste', true, repeats)).toBe('swallow');
+		expect(dopeKey('edit.selectAll', true, repeats)).toBe('selectAll');
+	});
+	test('everything else is the editor’s', () => {
+		for (const id of [null, 'edit.undo', 'transport.play', 'tool.razor']) expect(dopeKey(id, false, repeats)).toBeNull();
 	});
 });
