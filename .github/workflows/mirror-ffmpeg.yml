@@ -1,0 +1,55 @@
+name: Mirror FFmpeg
+
+# Keeps the pinned FFmpeg archives that are not already on GitHub (evermeet's
+# macOS zips) as assets of the `ffmpeg-mirror` prerelease, which
+# `scripts/fetch-ffmpeg.mjs` tries first: evermeet rate-limits CI runners hard
+# enough to fail a job. The fetch restores main's archive cache, so evermeet is
+# asked only for a pin no run has kept yet.
+on:
+  push:
+    branches: [main]
+    paths:
+      - "scripts/fetch-ffmpeg.mjs"
+      - ".github/workflows/mirror-ffmpeg.yml"
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: mirror-ffmpeg
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    runs-on: macos-15-intel
+    timeout-minutes: 20
+    # Creates the prerelease and uploads its assets. A prerelease marked not
+    # latest stays out of `releases/latest`, which the updater reads.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+      - name: Restore the pinned FFmpeg archives
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: .ffmpeg-archives
+          key: ffmpeg-archives-x86_64-apple-darwin-${{ hashFiles('scripts/fetch-ffmpeg.mjs') }}-complete
+          restore-keys: |
+            ffmpeg-archives-x86_64-apple-darwin-${{ hashFiles('scripts/fetch-ffmpeg.mjs') }}-
+            ffmpeg-archives-x86_64-apple-darwin-
+      - name: Fetch FFmpeg (pinned)
+        env:
+          KERF_FFMPEG_ARCHIVES: .ffmpeg-archives
+        run: bun scripts/fetch-ffmpeg.mjs x86_64-apple-darwin
+      - name: Upload the archives
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release view ffmpeg-mirror > /dev/null 2>&1 ||
+            gh release create ffmpeg-mirror --prerelease --latest=false \
+              --title "FFmpeg mirror" --notes "Pinned FFmpeg archives for CI, named <sha256>-<file>. See scripts/fetch-ffmpeg.mjs."
+          gh release upload ffmpeg-mirror .ffmpeg-archives/* --clobber
