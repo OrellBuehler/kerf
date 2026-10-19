@@ -452,7 +452,23 @@ clicks on the box itself: Svelte delegates a detached panel's events from the pa
 the twelve presets of `EASING_CHOICES` (eight before, now also Glide / Settle / Lift / Whip — the Inspector's picker
 lists the same) as curves drawn from the renderers' polyline (`easingPath`), lights the one the selected segments share,
 and shapes the segment each selected key starts (`easingTargets`: a row's last key starts none); arrows move between
-presets, Escape / a press outside / blur / scroll close it without writing. **Every gesture is one
+presets, Escape / a press outside / blur / scroll close it without writing. **The graph view** (the bar's *Keys* / *Graph*
+chips, kept while the panel moves; `DopeGraph.svelte`, pure half `graph-editor.ts`) draws the same rows as curves on the
+same time axis and ruler — the renderers' polyline (`curvePath` over `easedPoints`), held out before the first key and after
+the last. The active row (picked by its label, else the last selected key's row, else the first: `activeProp`) is drawn on
+its own value axis (`valueRange`: the finite key values' span, an eased segment never leaves it; gridlines on round steps,
+`valueTicks`, labelled with the decimals of their step) with a handle at each control point of every segment that is neither
+a hold nor flat (a line's are its thirds, `handlesOf`; `isFlat`: a segment between two equal values draws a flat line
+whatever its easing); the other rows are faint, each on its own range. Handles are painted above keys, so a handle sitting on
+its key (an ease-in's arrival, one pushed into a corner) is still the one a press takes. Dragging a handle puts that control
+point at the pointer inside the segment's box (`dragHandle`: held to `0..=1` on both axes, so no overshoot) and writes one
+`easeKeys` edit of a bezier on the key that starts it (`handleEdit`, on the clip as it is at the release — none if the clip or
+the key is gone), ghosted until then, keeping the selection; Escape / pointercancel / blur abandon it. A focused handle's
+plain arrows nudge it a twentieth of its box (`nudgeHandle`; up is up on the screen), one edit a press and none for a held
+key; a modified arrow is not taken (though the page's dispatcher takes no arrow from a focused button either). A handle that ends on the curve it started from
+(`sameEasing`: the same control points, so a preset stays a preset) writes nothing. Clicking a key selects it and seeks
+there, Shift / Ctrl toggles it. Select all, Delete and Cut act on the selection across every row, as in the lanes, not only
+on the row drawn with handles. **Every gesture is one
 `set_property_tracks` edit** of only the rows it touched (`retimeKeys`, `deleteKeys`, `pasteKeys`, `easeKeys` in the pure,
 bun-tested `dope-sheet.ts`; a gesture that changes nothing writes nothing), shown as its ghost until the edit settles,
 and Escape / pointercancel / blur abandon a drag (`beginDrag`). Keys are named by number and time, not index, so the
