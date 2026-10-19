@@ -133,7 +133,7 @@ mod tests {
         let mut c = tl.tracks[0].clips[1].clone();
         c.transform.scale = 0.5;
         c.color.brightness = 0.2;
-        let out = draft(&tl.tracks[0], c.clone()).apply(&tl).expect("a draft");
+        let out = draft(&tl.tracks[0], c).apply(&tl).expect("a draft");
         assert_eq!(out.tracks[0].clips[1].transform.scale, 0.5);
         assert_eq!(out.tracks[0].clips[1].color.brightness, 0.2);
         assert_eq!(out.tracks[0].clips[0].id, tl.tracks[0].clips[0].id);

@@ -47,7 +47,11 @@ impl Screen for NullScreen {
         let complete = lock(&self.log).complete_with.clone();
         let keep = lock(&self.log).keep;
         let picture = match complete {
-            Some(gpu) => Some(frame.read_back(&gpu)?.data).filter(|_| keep),
+            Some(gpu) if keep => Some(frame.read_back(&gpu)?.data),
+            Some(gpu) => {
+                frame.read_back(&gpu)?;
+                None
+            }
             None => None,
         };
         let mut log = lock(&self.log);

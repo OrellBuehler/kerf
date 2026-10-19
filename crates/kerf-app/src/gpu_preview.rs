@@ -6,7 +6,7 @@
 //! the setting off nothing here runs, and with it on every failure — no adapter, no surface, a
 //! lost device, a frame the plan refuses, a decode that is busy — ends in the JPEG that was
 //! always there, for that frame, with the reason in the result. The webview asks for a frame
-//! ([`GpuPreview::frame`]) and is told which renderer made it.
+//! ([`GpuPreview::post`]) and is told which renderer made it.
 //!
 //! # Pieces
 //!
@@ -1466,11 +1466,6 @@ impl GpuPreview {
     /// The project lock is not taken here at all. A panic in the GPU path (wgpu, the X connection) is
     /// caught here: the backend is dropped and rebuilt behind the backoff, the surface hidden, and the
     /// frame is FFmpeg's like any other fallback.
-    fn frame(&self, inputs: &PlanInputs, want: Want, ffmpeg_width: u32) -> Result<PreviewFrameResult, String> {
-        self.frame_in(inputs, Cut::Held, want, ffmpeg_width)
-    }
-
-    /// [`GpuPreview::frame`] of `cut`.
     fn frame_in(&self, inputs: &PlanInputs, cut: Cut, want: Want, ffmpeg_width: u32) -> Result<PreviewFrameResult, String> {
         // Whatever else is asked for (the paused frame, a scrub) is not part of a play session.
         self.end_play();
@@ -1692,6 +1687,11 @@ impl GpuPreview {
                 lock(&info).reason = Some(reason);
             }
         }
+    }
+
+    #[cfg(test)]
+    fn frame(&self, inputs: &PlanInputs, want: Want, ffmpeg_width: u32) -> Result<PreviewFrameResult, String> {
+        self.frame_in(inputs, Cut::Held, want, ffmpeg_width)
     }
 
     #[cfg(test)]
