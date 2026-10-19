@@ -4,8 +4,10 @@ import { Alimiter, alimiterDelay, LIMITER_ATTACK_MS, LIMITER_RELEASE_MS, limiter
 
 // The differential test for the port of FFmpeg's `alimiter`: kerf-core put each signal through the
 // real ffmpeg with the export's own limiter text (`engine/cli/alimiter_corpus.rs` →
-// `fixtures/alimiter-corpus.json`) and every case is replayed here, to the bit. Regenerate with
-// `KERF_BLESS_CORPUS=1 cargo test -p kerf-core --no-default-features -- --ignored alimiter_corpus`.
+// `fixtures/alimiter-corpus.json`) and every case is replayed here, to the bit — a long case by the
+// FNV-1a of its output's bytes (`out_fnv1a`), the rest sample by sample. Regenerate with
+// `KERF_BLESS_CORPUS=1 cargo test -p kerf-core --no-default-features -- --ignored alimiter_corpus`
+// (the variable is shared: it re-blesses the links corpus too when that test runs).
 
 type Shape = { kind: 'dc' } | { kind: 'tri'; period: number } | { kind: 'noise'; seed: number };
 
@@ -22,7 +24,33 @@ interface Case {
 	ceiling_db: number;
 	filter: string;
 	segments: Segment[];
-	out: [number[], number[]];
+	/** The output, left and right — or, for a long case, its length and hash. */
+	out?: [number[], number[]];
+	frames?: number;
+	out_fnv1a?: string;
+}
+
+/** `fnv1a` in `alimiter_corpus.rs`: FNV-1a (32-bit) over interleaved little-endian doubles. */
+function fnv1a(l: Float64Array, r: Float64Array): string {
+	const both = new Float64Array(l.length * 2);
+	for (let i = 0; i < l.length; i++) {
+		both[2 * i] = l[i];
+		both[2 * i + 1] = r[i];
+	}
+	const view = new DataView(both.buffer);
+	let hash = 0x811c9dc5;
+	for (let i = 0; i < both.length; i++) {
+		const at = i * 8;
+		// The bytes of each double, little-endian, whatever the machine's own order.
+		const lo = view.getUint32(at, true);
+		const hi = view.getUint32(at + 4, true);
+		for (const word of [lo, hi])
+			for (let b = 0; b < 4; b++) {
+				hash ^= (word >>> (8 * b)) & 0xff;
+				hash = Math.imul(hash, 0x01000193) >>> 0;
+			}
+	}
+	return hash.toString(16).padStart(8, '0');
 }
 
 const cases = corpus.cases as unknown as Case[];
@@ -55,9 +83,8 @@ function signal(segments: Segment[]): [number[], number[]] {
 
 /** What `latency=1` makes of the stream: the input followed by `delay` frames of silence, its first
  *  `delay` frames of output dropped. */
-function limitedAligned(c: Case): [Float64Array, Float64Array] {
+function limitedAligned(c: Case, lim = new Alimiter(c.rate, 2, limiterLimit(c.ceiling_db))): [Float64Array, Float64Array] {
 	const [l, r] = signal(c.segments);
-	const lim = new Alimiter(c.rate, 2, limiterLimit(c.ceiling_db));
 	const frames = l.length + lim.delay;
 	const inL = Float64Array.from({ length: frames }, (_, i) => l[i] ?? 0);
 	const inR = Float64Array.from({ length: frames }, (_, i) => r[i] ?? 0);
@@ -72,16 +99,32 @@ function limitedAligned(c: Case): [Float64Array, Float64Array] {
 }
 
 describe('alimiter corpus', () => {
-	test('has cases at three rates', () => {
-		expect(new Set(cases.map((c) => c.rate))).toEqual(new Set([8000, 44100, 48000]));
+	test('has cases at four rates, a 0 dB ceiling and long ones kept as hashes', () => {
+		expect(new Set(cases.map((c) => c.rate))).toEqual(new Set([8000, 44100, 48000, 96000]));
+		expect(cases.some((c) => c.ceiling_db === 0)).toBe(true);
+		expect(cases.filter((c) => c.out_fnv1a).length).toBeGreaterThanOrEqual(2);
 	});
+
+	test('the long 48 kHz case takes the gain back past unity many times (the `att > 1` reset)', () => {
+		const c = cases.find((x) => x.name.startsWith('at 48 kHz, long'))!;
+		const lim = new Alimiter(c.rate, 2, limiterLimit(c.ceiling_db));
+		limitedAligned(c, lim);
+		expect(lim.resets).toBeGreaterThanOrEqual(12);
+	});
+
 	for (const c of cases) {
 		test(c.name, () => {
 			expect(c.filter).toBe(`alimiter=limit=${limiterLimit(c.ceiling_db)}:attack=${LIMITER_ATTACK_MS}:release=${LIMITER_RELEASE_MS}:level=0:latency=1`);
 			const [l, r] = limitedAligned(c);
+			if (c.out_fnv1a) {
+				expect(l.length).toBe(c.frames!);
+				expect(fnv1a(l, r)).toBe(c.out_fnv1a);
+				return;
+			}
+			const out = c.out!;
 			for (const [side, got, want] of [
-				['left', l, c.out[0]],
-				['right', r, c.out[1]]
+				['left', l, out[0]],
+				['right', r, out[1]]
 			] as const) {
 				expect(got.length).toBe(want.length);
 				const first = got.findIndex((v, i) => !Object.is(v, want[i]));

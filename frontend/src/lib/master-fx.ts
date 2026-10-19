@@ -21,6 +21,21 @@ export function fxSummary(master: Pick<MasterBus, 'limiter' | 'ceiling_db' | 'du
 	return { text: 'Off', active: false };
 }
 
+/** Which limiter the preview plays when the master's is on (`AudioEngine.limiterKind`): `pending` until
+ *  playback has loaded the export's own in a worklet, `exact` once it has, `approximate` where it cannot. */
+export type LimiterKind = 'pending' | 'exact' | 'approximate';
+
+/** What the Limiter and Ceiling tooltips say about the preview's limiter. Even the exact one limits the
+ *  preview's mix, which is not the export's: its sound is a mono 32 kHz decode and ducking is export-only. */
+export function limiterNote(kind: LimiterKind): string {
+	const measure = 'Measure reads the exported mix.';
+	if (kind === 'exact')
+		return `The preview runs the export’s limiter (FFmpeg’s alimiter, sample for sample) on the preview’s mix — a mono 32 kHz decode with no ducking, so it can limit a little differently from the export. True peak’s oversampling is export-only. ${measure}`;
+	if (kind === 'approximate')
+		return `This preview cannot run the export’s limiter, so it plays an approximation — a compressor with a hard knee at the ceiling — and a very hot mix can read a little over it. ${measure}`;
+	return `The preview runs the export’s limiter (FFmpeg’s alimiter) on its own mix once playback has loaded it, and an approximation until then or where it cannot. ${measure}`;
+}
+
 /** Whether the block is open: a viewer's choice, remembered (not part of the project). Folded by default. */
 export const MASTER_FX_KEY = 'kerf.mixer.masterFx';
 

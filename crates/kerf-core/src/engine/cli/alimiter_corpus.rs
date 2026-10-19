@@ -8,8 +8,13 @@
 //! The signals are written as segments the two sides build the same way, with nothing but
 //! `+ - * /` and an LCG on `u32` (no `sin`, whose last digit differs between libms).
 //!
+//! A case longer than [`HASHED_FRAMES`] is stored as the FNV-1a (32-bit) of its output's bytes and
+//! its length instead of the samples, so the file stays small; the replay hashes what it made the same
+//! way.
+//!
 //! `#[ignore]`d (it needs the ffmpeg binary). Regenerate after an intended change:
 //! `KERF_BLESS_CORPUS=1 cargo test -p kerf-core --no-default-features -- --ignored alimiter_corpus`
+//! (`KERF_BLESS_CORPUS` is shared: the same variable re-blesses the links corpus when its test runs too).
 
 use std::process::Stdio;
 
@@ -18,6 +23,9 @@ use serde_json::{json, Value};
 use super::rendered::scratch;
 use super::*;
 use crate::model::MasterBus;
+
+/// Longer than this many frames, a case's output is stored as its hash.
+const HASHED_FRAMES: u32 = 2000;
 
 const CORPUS_PATH: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -148,7 +156,69 @@ fn cases() -> Vec<(&'static str, u32, f64, Vec<Segment>)> {
             -24.0,
             vec![flat(700, Shape::Noise(8), (0.3, 0.2))],
         ),
+        (
+            "a 0 dB ceiling: nothing over full scale",
+            8000,
+            0.0,
+            vec![
+                seg(600, Shape::Noise(9), (0.6, 0.6), (2.0, 1.4)),
+                flat(400, Shape::Tri(13), (0.9, 1.05)),
+            ],
+        ),
+        (
+            "at 48 kHz, long: bursts released back past unity again and again",
+            48_000,
+            -3.0,
+            released(),
+        ),
+        (
+            "at 96 kHz: a swell over the ceiling and noise after it",
+            96_000,
+            -1.5,
+            vec![
+                seg(3000, Shape::Tri(211), (0.4, 0.5), (1.7, 1.3)),
+                flat(1500, Shape::Noise(10), (0.5, 0.3)),
+            ],
+        ),
     ]
+}
+
+/// Bursts over the ceiling with quiet gaps longer than the 100 ms release between them, so the gain
+/// climbs back past unity after each (the `att > 1` reset) — five seconds of it at 48 kHz.
+fn released() -> Vec<Segment> {
+    let mut out = Vec::new();
+    for k in 0..12u32 {
+        out.push(flat(6000 + k * 700, Shape::Noise(20 + k), (0.15, 0.1)));
+        out.push(seg(
+            1500 + k * 90,
+            Shape::Tri(37 + k * 6),
+            (0.9, 0.8),
+            (1.2 + f64::from(k) * 0.2, 1.6),
+        ));
+        out.push(flat(2 + k % 3, Shape::Dc, (2.4, -1.9)));
+    }
+    out.push(flat(9000, Shape::Noise(40), (0.1, 0.1)));
+    out
+}
+
+/// FNV-1a, 32-bit, over the output's interleaved samples as little-endian doubles
+/// (`fnv1a` in `alimiter.test.ts`).
+fn fnv1a(samples: &[f64]) -> String {
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in samples.iter().flat_map(|v| v.to_le_bytes()) {
+        hash ^= u32::from(byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    format!("{hash:08x}")
+}
+
+/// A scratch directory that goes when it does, whether the run passed or not.
+struct Scratch(std::path::PathBuf);
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 fn segment_json(s: &Segment) -> Value {
@@ -162,9 +232,9 @@ fn segment_json(s: &Segment) -> Value {
 
 /// `samples` (interleaved stereo at `rate`) through `filter` in the real ffmpeg, as doubles.
 fn through_ffmpeg(samples: &[f64], rate: u32, filter: &str, tag: &str) -> Vec<f64> {
-    let dir = scratch(&format!("alimiter-{tag}"));
-    let input = dir.join("in.f64");
-    let output = dir.join("out.f64");
+    let dir = Scratch(scratch(&format!("alimiter-{tag}")));
+    let input = dir.0.join("in.f64");
+    let output = dir.0.join("out.f64");
     std::fs::write(&input, samples.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>()).unwrap();
     let run = command(&ffmpeg_bin())
         .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "f64le", "-ar"])
@@ -178,7 +248,6 @@ fn through_ffmpeg(samples: &[f64], rate: u32, filter: &str, tag: &str) -> Vec<f6
         .unwrap();
     assert!(run.status.success(), "{filter}: {}", String::from_utf8_lossy(&run.stderr));
     let raw = std::fs::read(&output).unwrap();
-    let _ = std::fs::remove_dir_all(&dir);
     raw.as_chunks::<8>().0.iter().map(|b| f64::from_le_bytes(*b)).collect()
 }
 
@@ -197,14 +266,21 @@ fn corpus() -> Value {
             let out = through_ffmpeg(&input, *rate, &filter, &i.to_string());
             assert_eq!(out.len(), input.len(), "{name}: latency=1 keeps the length");
             let side = |c: usize| out.iter().skip(c).step_by(2).copied().collect::<Vec<f64>>();
-            json!({
+            let frames = out.len() / 2;
+            let mut case = json!({
                 "name": name,
                 "rate": rate,
                 "ceiling_db": ceiling_db,
                 "filter": filter,
                 "segments": segments.iter().map(segment_json).collect::<Vec<_>>(),
-                "out": [side(0), side(1)],
-            })
+            });
+            if frames > HASHED_FRAMES as usize {
+                case["frames"] = json!(frames);
+                case["out_fnv1a"] = json!(fnv1a(&out));
+            } else {
+                case["out"] = json!([side(0), side(1)]);
+            }
+            case
         })
         .collect();
     json!({

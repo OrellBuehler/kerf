@@ -1,5 +1,5 @@
-/* The master limiter of the preview: FFmpeg's `alimiter` (`libavfilter/af_alimiter.c`, the same
- * from 4.4 to 9.0 but for `latency`) ported sample for sample, as the export spells it
+/* The master limiter of the preview: FFmpeg's `alimiter` (`libavfilter/af_alimiter.c` as 7.0 to 9.0
+ * have it) ported sample for sample, as the export spells it
  * (`limiter_filter` in kerf-core: `alimiter=limit=…:attack=5:release=100:level=0[:latency=1]`, so
  * no auto-level, no auto-release, unity in and out). It runs in an AudioWorklet
  * (`limiter-worklet.ts`), and it is pure, so `alimiter.test.ts` replays what the real filter
@@ -10,7 +10,13 @@
  * integer, so the output is the filter's bit for bit. The one thing a stream cannot do is the
  * export's `latency=1`, which drops the first `delay` frames of the output and pads the end: live,
  * the output trails the input by `delay` frames (5 ms), which the picture is told about
- * (`AudioEngine.outputLatency`). */
+ * (`AudioEngine.outputLatency`).
+ *
+ * Older FFmpeg is not quite this filter. 4.4 has no `latency` (the export probes for it). And before
+ * 7.0 a lookahead slot that is empty (`nextpos[j] == -1`) was still read, `buffer[-1]` — out of
+ * bounds, so its "peak" is whatever lies before the buffer; 7.0 skips the read and counts the peak as
+ * 0, and so does this port. A pre-7.0 ffmpeg can therefore differ where that slot is reached; the
+ * corpus is written on 9.0.2 and 6.1.1 writes the same one. */
 
 import { MASTER_DEFAULT_CEILING_DB, clampCeiling } from './levels';
 
@@ -24,7 +30,10 @@ export const LIMITER_PROCESSOR = 'kerf-alimiter';
 
 /** What the main thread posts to the worklet (and builds it with): the linear limit. */
 export interface LimiterMessage {
-	limit: number;
+	limit?: number;
+	/** Start over: an empty lookahead and no gain reduction (playback restarted, or the limiter was
+	 *  put back in the path), so nothing of what played before carries over. */
+	reset?: boolean;
 }
 
 /** `MasterBus::limit_linear` rounded as `limiter_filter` writes it (six decimals), which is
@@ -60,6 +69,9 @@ export class Alimiter {
 	/** Frames the output trails the input (`latency=1` trims as many). */
 	readonly delay: number;
 	limit: number;
+	/** How many times the gain came back past unity and the lookahead was cleared (`att > 1`): what the
+	 *  corpus is asked to reach, counted where it costs nothing. */
+	resets = 0;
 	readonly #release: number;
 	readonly #buffer: Float64Array;
 	readonly #nextpos: Int32Array;
@@ -163,6 +175,7 @@ export class Alimiter {
 			}
 
 			if (this.#att > 1) {
+				this.resets++;
 				this.#att = 1;
 				this.#delta = 0;
 				this.#nextiter = 0;

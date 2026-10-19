@@ -5,7 +5,8 @@
 	// are held the preview follows them (`audio.liveMaster`).
 	//
 	// The preview's limiter is the export's own (`alimiter`, ported sample for sample and run
-	// in an AudioWorklet by `audio.ts`); only true peak's oversampling is export-only.
+	// in an AudioWorklet by `audio.ts`) on the preview's mix — or, where the worklet cannot run, an
+	// approximation; the tooltips say which (`limiterNote`, from `audio.limiterKind()`).
 	//
 	// The limiter, its ceiling and the duck mode are the strip's FX block: folded by default and remembered
 	// (`master-fx.ts`), so the fader gets the strip's height and a limiter that is on still says so.
@@ -41,7 +42,7 @@
 	import { timeDisplay } from '#lib/time-display.svelte';
 	import type { MasterBus } from '#lib/types';
 	import type { MeasureResult } from '#lib/editor-ui.svelte';
-	import { fxSummary, loadMasterFxOpen, saveMasterFxOpen } from '#lib/master-fx';
+	import { fxSummary, limiterNote, loadMasterFxOpen, saveMasterFxOpen } from '#lib/master-fx';
 	import { settings } from '#lib/settings.svelte';
 	import { tip } from '#lib/tip';
 
@@ -93,8 +94,10 @@
 
 	const err = report;
 
-	const LIMITER_NOTE =
-		'The preview plays the export’s own limiter (FFmpeg’s alimiter, sample for sample), so a hot mix sounds and meters here as it will export, short of True peak’s oversampling.';
+	/** Which limiter the preview plays, kept as the engine learns it. */
+	let limiterKind = $state(audio.limiterKind());
+	$effect(() => audio.onLimiterKind((kind) => (limiterKind = kind)));
+	const LIMITER_NOTE = $derived(limiterNote(limiterKind));
 
 	// ---- the fader ----------------------------------------------------------
 	function fadePreview(v: number) {

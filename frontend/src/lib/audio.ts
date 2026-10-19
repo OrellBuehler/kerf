@@ -63,6 +63,8 @@ import { clampMasterVolume, masterOf, trackRenders } from './levels';
 import { readBlock, type Reading } from './meter';
 import { toast } from './notifications.svelte';
 import { outputLatency } from './output-latency';
+import { describeError, logFrontend } from './log';
+import type { LimiterKind } from './master-fx';
 import { alimiterDelay, LIMITER_PROCESSOR, limiterLimit, type LimiterMessage } from './alimiter';
 
 /** Preview decode rate: mono 32 kHz keeps a minute of PCM under 4 MB on the
@@ -113,7 +115,10 @@ interface Bus {
 }
 
 /** The limiter worklet's node, as far as the engine uses it. */
-export type LimiterNode = AudioNode & { port: { postMessage(message: LimiterMessage): void } };
+export type LimiterNode = AudioNode & {
+	port: { postMessage(message: LimiterMessage): void };
+	onprocessorerror?: ((e: ErrorEvent) => void) | null;
+};
 
 /** Which limiter is in the master's path. */
 type Limiting = 'worklet' | 'compressor' | null;
@@ -126,6 +131,8 @@ interface Master {
 	trim: GainNode;
 	/** The export's limiter, once its worklet has loaded. */
 	worklet: LimiterNode | null;
+	/** The limit last posted to the worklet, so a fader move that does not change it posts nothing. */
+	posted: number | null;
 	out: GainNode;
 	split: ChannelSplitterNode;
 	tap: Tap;
@@ -151,6 +158,8 @@ export interface AudioEnv {
 	report: (message: string) => void;
 	/** The limiter worklet's node in `ctx`, or `null` where it cannot run. */
 	createLimiter: (ctx: AudioContext, limit: number) => Promise<LimiterNode | null>;
+	/** Say why the preview fell back to the limiter's approximation (the console and the app's log). */
+	warn: (message: string) => void;
 }
 
 /** The limiter worklet: its module (bundled, served from the app's own origin) and a stereo node. */
@@ -189,14 +198,41 @@ export class AudioEngine {
 	 *  clip's window is retried on every resync, and nobody needs to hear about
 	 *  the same broken clip twice. */
 	#warned = new Set<string>();
+	/** Which limiter the preview plays when the master's is on (`limiterNote` words it). */
+	#kind: LimiterKind = 'pending';
+	#kindListeners = new Set<(kind: LimiterKind) => void>();
 
 	constructor(env: Partial<AudioEnv> = {}) {
 		this.#env = {
 			createContext: env.createContext ?? (() => new AudioContext()),
 			fetchPcm: env.fetchPcm ?? getAudio,
 			report: env.report ?? ((m) => void toast.error(m)),
-			createLimiter: env.createLimiter ?? createLimiter
+			createLimiter: env.createLimiter ?? createLimiter,
+			warn:
+				env.warn ??
+				((m) => {
+					console.warn(m);
+					logFrontend('warn', m, 'preview limiter');
+				})
 		};
+	}
+
+	/** Which limiter plays when the master's is on: `pending` until playback has loaded the worklet,
+	 *  `exact` (the export's own) once it has, `approximate` (the compressor) where it cannot run. */
+	limiterKind(): LimiterKind {
+		return this.#kind;
+	}
+
+	/** Be told when `limiterKind()` changes. Returns the way to stop. */
+	onLimiterKind(listener: (kind: LimiterKind) => void): () => void {
+		this.#kindListeners.add(listener);
+		return () => void this.#kindListeners.delete(listener);
+	}
+
+	#setKind(kind: LimiterKind) {
+		if (kind === this.#kind) return;
+		this.#kind = kind;
+		for (const listener of this.#kindListeners) listener(kind);
 	}
 
 	/** Seconds between the audio clock and the sound coming out of the speakers
@@ -226,7 +262,9 @@ export class AudioEngine {
 		if (ctx.state === 'suspended') void ctx.resume();
 		const session: Session = { anchorTime: t, anchorCtx: ctx.currentTime, rate, nodes: [], buses: new Map() };
 		this.#session = session;
-		this.#applyMaster(this.#masterBus(ctx), masterOf(timeline));
+		const m = this.#masterBus(ctx);
+		// What the limiter held from before (its lookahead, a gain reduction) is not this run's.
+		if (!this.#applyMaster(m, masterOf(timeline)) && m.limiting === 'worklet') m.worklet!.port.postMessage({ reset: true });
 		for (const track of timeline.tracks) {
 			// `Timeline::track_renders` in kerf-core, so what is heard matches what would
 			// export: a muted track is silent, and while any track of a kind is soloed only
@@ -333,7 +371,7 @@ export class AudioEngine {
 		out.connect(ctx.destination);
 		input.connect(out);
 		const { split, tap } = this.#tap(ctx, out);
-		const m: Master = { input, comp, trim, worklet: null, out, split, tap, limiting: null, applied: null };
+		const m: Master = { input, comp, trim, worklet: null, posted: null, out, split, tap, limiting: null, applied: null };
 		void this.#loadLimiter(ctx, m);
 		return (this.#master = m);
 	}
@@ -341,26 +379,53 @@ export class AudioEngine {
 	/** Load the limiter worklet and put it in the compressor's place, wired at once when the limiter
 	 *  is on. A webview that cannot (no AudioWorklet, a module refused) keeps the compressor. */
 	async #loadLimiter(ctx: AudioContext, m: Master) {
+		let node: LimiterNode | null;
 		try {
-			const node = await this.#env.createLimiter(ctx, limiterLimit(m.applied?.ceiling_db ?? Number.NaN));
-			if (!node || this.#master !== m) return;
-			m.worklet = node;
-			if (m.applied) this.#applyMaster(m, m.applied);
-		} catch {
-			// the approximation stays
+			node = await this.#env.createLimiter(ctx, limiterLimit(m.applied?.ceiling_db ?? Number.NaN));
+		} catch (e) {
+			this.#env.warn(`The preview's limiter is an approximation: its worklet did not load (${describeError(e)}).`);
+			this.#setKind('approximate');
+			return;
 		}
+		if (this.#master !== m) return;
+		if (!node) {
+			this.#env.warn("The preview's limiter is an approximation: this webview has no AudioWorklet.");
+			this.#setKind('approximate');
+			return;
+		}
+		// A processor that throws stops making sound for good: the compressor takes over rather than
+		// leaving the master silent.
+		node.onprocessorerror = () => this.#limiterFailed(m, node);
+		m.worklet = node;
+		this.#setKind('exact');
+		if (m.applied) this.#applyMaster(m, m.applied);
+	}
+
+	#limiterFailed(m: Master, node: LimiterNode) {
+		if (m.worklet !== node) return;
+		this.#env.warn("The preview's limiter is an approximation from now on: its worklet stopped with an error.");
+		node.disconnect();
+		m.worklet = null;
+		m.posted = null;
+		this.#setKind('approximate');
+		if (m.applied) this.#applyMaster(m, m.applied);
 	}
 
 	/** Set the master from the timeline's: its fader, and the limiter — wired in only while it is
-	 *  on, set to its ceiling: the worklet once it has loaded, the compressor until then. */
-	#applyMaster(m: Master, master: MasterBus, live = false) {
+	 *  on, set to its ceiling: the worklet once it has loaded, the compressor until then. Returns whether
+	 *  the limiter was rewired (a worklet put in the path starts over: `reset`). */
+	#applyMaster(m: Master, master: MasterBus, live = false): boolean {
 		const ctx = this.#ctx!;
 		m.applied = master;
 		const volume = clampMasterVolume(master.volume);
 		if (live) m.input.gain.setTargetAtTime(volume, ctx.currentTime, LIVE_TAU);
 		else m.input.gain.value = volume;
 		const limiting: Limiting = !master.limiter ? null : m.worklet ? 'worklet' : 'compressor';
-		if (limiting === 'worklet') m.worklet!.port.postMessage({ limit: limiterLimit(master.ceiling_db) });
+		const limit = limiterLimit(master.ceiling_db);
+		if (limiting === 'worklet' && m.limiting === 'worklet' && limit !== m.posted) {
+			m.worklet!.port.postMessage({ limit });
+			m.posted = limit;
+		}
 		if (limiting === 'compressor') {
 			const p = limiterParams(master.ceiling_db);
 			m.comp.threshold.value = p.threshold;
@@ -370,12 +435,14 @@ export class AudioEngine {
 			m.comp.release.value = p.release;
 			m.trim.gain.value = p.trim;
 		}
-		if (m.limiting === limiting) return;
+		if (m.limiting === limiting) return false;
 		m.input.disconnect();
 		m.comp.disconnect();
 		m.trim.disconnect();
 		m.worklet?.disconnect();
 		if (limiting === 'worklet') {
+			m.worklet!.port.postMessage({ limit, reset: true });
+			m.posted = limit;
 			m.input.connect(m.worklet!);
 			m.worklet!.connect(m.out);
 		} else if (limiting === 'compressor') {
@@ -386,6 +453,7 @@ export class AudioEngine {
 			m.input.connect(m.out);
 		}
 		m.limiting = limiting;
+		return true;
 	}
 
 	/** Move a track's fader and / or pan *now*, while a gesture is still in progress and
