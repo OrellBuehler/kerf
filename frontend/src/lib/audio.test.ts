@@ -380,6 +380,48 @@ describe('reverse shuttle', () => {
 		expect(heardAt(again, 0, again.started[0][1])).toBeCloseTo(0.25, 4);
 	});
 
+	test('a window asked for the way round it is held is the very buffer held, not converted again', async () => {
+		const tl = { tracks: [track('a1', 'audio', [clip('c', 'voice', { source_out: 0.5 })])] };
+		for (const rate of [1, -1]) {
+			engine.start(tl, SOUND, 0.25, rate);
+			await settle();
+			engine.start(tl, SOUND, 0.25, rate);
+			await settle();
+			const [first, second] = ctx.of<FakeSource>('source').slice(-2);
+			expect(second.buffer).toBe(first.buffer);
+		}
+	});
+
+	test('past 600 s of source the window is held at the end the playhead enters by', async () => {
+		const asked: [string, number, number][] = [];
+		const e = new AudioEngine({
+			createContext: () => ctx as unknown as AudioContext,
+			fetchPcm: (async (asset: string, start: number, dur: number) => {
+				asked.push([asset, start, dur]);
+				return new Int16Array(3200).buffer;
+			}) as never,
+			report: (m) => reported.push(m)
+		});
+		const long = { tracks: [track('a1', 'audio', [clip('fwd', 'voice', { source_out: 1000 })])] };
+		const reversed = { tracks: [track('a1', 'audio', [clip('rev', 'music', { source_out: 1000, speed: -1 })])] };
+		// Forwards a clip is entered at its start: its source's start, or a reversed clip's source end.
+		e.start(long, SOUND, 1, 1);
+		await settle();
+		e.start(reversed, SOUND, 1, 1);
+		await settle();
+		// Backwards at its end: its source's end, or a reversed clip's source start.
+		e.start(long, SOUND, 999, -1);
+		await settle();
+		e.start(reversed, SOUND, 999, -1);
+		await settle();
+		expect(asked).toEqual([
+			['voice', 0, 600],
+			['music', 400, 600],
+			['voice', 400, 600],
+			['music', 0, 600]
+		]);
+	});
+
 	test('a keyed volume is met the other way round, a hold stepped from above', async () => {
 		// 0.2 held for 1 s, then 1.0.
 		const keyed = clip('c', 'voice', {

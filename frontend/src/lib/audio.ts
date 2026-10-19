@@ -139,12 +139,6 @@ interface Oriented {
 	rev: boolean;
 }
 
-/** A held window's samples in source order. */
-function inSourceOrder(held: Oriented): Float32Array {
-	const data = held.buf.getChannelData(0);
-	return held.rev ? Float32Array.from(data).reverse() : data;
-}
-
 function speedMag(clip: Clip): number {
 	return Math.max(Math.abs(clip.speed ?? 1), 0.01);
 }
@@ -467,7 +461,7 @@ export class AudioEngine {
 			const held = await hit;
 			if (!held) return null;
 			if (held.rev === rev) return held.buf;
-			const turned = this.#oriented(inSourceOrder(held), rev, samples);
+			const turned = this.#turned(held, samples);
 			if (turned) this.#cache.set(key, turned);
 			return turned?.buf ?? null;
 		}
@@ -476,7 +470,7 @@ export class AudioEngine {
 			const bytes = await this.#env.fetchPcm(clip.asset_id, sin, sout - sin, RATE, clip.id);
 			if (!bytes || bytes.byteLength < 2) return null;
 			const i16 = new Int16Array(bytes, 0, Math.floor(bytes.byteLength / 2));
-			return this.#oriented(Float32Array.from(i16, (x) => x / 32768), rev, samples);
+			return this.#decoded(i16, rev, samples);
 		})();
 		this.#cache.set(key, pending);
 		try {
@@ -503,20 +497,39 @@ export class AudioEngine {
 		}
 	}
 
-	/** A window's samples (`data`, in source order) as a buffer the given way round. Back-to-front it
-	 *  is first padded to the window's own length (`samples`): the decode ends early when the source's
-	 *  sound does, and the buffer's first sample has to be the window's end or everything after it
-	 *  plays late. */
-	#oriented(data: Float32Array, rev: boolean, samples: number): Oriented | null {
-		const ctx = this.#ctx;
-		if (!ctx) return null;
-		const length = rev ? samples : data.length;
-		if (length <= 0) return null;
-		const buf = ctx.createBuffer(1, length, RATE);
+	/** A decoded window (`pcm`, in source order) as a buffer the given way round, written straight
+	 *  into the buffer. Back-to-front it is laid out over the window's own length (`samples`): the
+	 *  decode ends early when the source's sound does, and the buffer's first sample has to be the
+	 *  window's end or everything after it plays late. */
+	#decoded(pcm: Int16Array, rev: boolean, samples: number): Oriented | null {
+		const length = rev ? samples : pcm.length;
+		const buf = this.#createBuffer(length);
+		if (!buf) return null;
 		const ch = buf.getChannelData(0);
-		if (rev) for (let i = 0; i < Math.min(data.length, length); i++) ch[length - 1 - i] = data[i];
-		else ch.set(data);
+		const n = Math.min(pcm.length, length);
+		if (rev) for (let i = 0; i < n; i++) ch[length - 1 - i] = pcm[i] / 32768;
+		else for (let i = 0; i < n; i++) ch[i] = pcm[i] / 32768;
 		return { buf, rev };
+	}
+
+	/** A held window the other way round, written straight from its samples. Back-to-front it is laid
+	 *  out over the window's own length, as `#decoded` does; front-to-back it is the held one's whole
+	 *  length, its padding (silence at the window's end) included. */
+	#turned(held: Oriented, samples: number): Oriented | null {
+		const from = held.buf.getChannelData(0);
+		const rev = !held.rev;
+		const length = rev ? samples : from.length;
+		const buf = this.#createBuffer(length);
+		if (!buf) return null;
+		const ch = buf.getChannelData(0);
+		if (rev) for (let i = 0, n = Math.min(from.length, length); i < n; i++) ch[length - 1 - i] = from[i];
+		else for (let i = 0, last = from.length - 1; i < length; i++) ch[i] = from[last - i];
+		return { buf, rev };
+	}
+
+	#createBuffer(length: number): AudioBuffer | null {
+		const ctx = this.#ctx;
+		return ctx && length > 0 ? ctx.createBuffer(1, length, RATE) : null;
 	}
 
 	#evict() {

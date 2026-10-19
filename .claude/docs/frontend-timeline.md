@@ -452,7 +452,9 @@ keyed step met from above); the clock counts down and the clips are asked for ne
 `MAX_WINDOW` (600 s of source) window is held at the end the playhead enters by, so — the mirror of
 forward — reverse is silent while the playhead is more than 600 s of source from a clip's end. A window
 is cached one way round at a time: asked for the other, the cached copy is turned in memory and
-replaces it (no second fetch, no second copy counted against `CACHE_CAP`). `audio.test.ts` pins it with
+replaces it (no second fetch, no second copy counted against `CACHE_CAP`). Decoding and turning both
+write straight into the new buffer with an indexed loop: a per-sample callback (`Float32Array.from` with
+a map) made a 600 s decode ~17× slower on the main thread. `audio.test.ts` pins it with
 an offset oracle (speeds ±0.5..2, a `source_in`, an early-ending decode: each source heard at the time its
 timeline time maps to), keyed volume, J→L re-anchoring and the teardown on stop. The
 playhead follows the audio clock — edits mid-playback re-anchor via
