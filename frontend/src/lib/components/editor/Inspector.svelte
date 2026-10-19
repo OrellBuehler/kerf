@@ -56,6 +56,8 @@
 	import { DEFAULT_TRANSITION_SECONDS, TRANSITION_GROUPS } from '#lib/transitions';
 	import type { Clip, Color, Mask, Projection, Property, Reframe, Transform, TransitionKind } from '#lib/types';
 	import { toast } from '#lib/notifications.svelte';
+	import { colorDraft, fadeDraft, maskDraft, titleMoveDraft, titleSizeDraft, transformDraft } from '#lib/preview-draft';
+	import type { PreviewDraft } from '#lib/types';
 	import { settings } from '#lib/settings.svelte';
 	import { linkBadge, selectionUnits } from '#lib/link-ui';
 	import { timeDisplay } from '#lib/time-display.svelte';
@@ -114,6 +116,40 @@
 			)
 		);
 	}
+	/** What a slider drag would write, for the GPU preview to draw while it runs (`preview-draft.ts`); each
+	 *  says nothing where the edit's outcome is not known exactly (a keyed number). */
+	type Live = (v: number, at: Edit) => PreviewDraft | null;
+	const liveTf =
+		(patch: (v: number) => Partial<Transform>): Live =>
+		(v, at) =>
+			at.clipId ? transformDraft(editor.timeline, at.clipId, patch(v)) : null;
+	const liveCol =
+		(patch: (v: number) => Partial<Color>): Live =>
+		(v, at) =>
+			at.clipId ? colorDraft(editor.timeline, at.clipId, patch(v)) : null;
+	const liveMask =
+		(patch: (v: number) => Partial<Mask>): Live =>
+		(v, at) =>
+			at.clipId ? maskDraft(editor.timeline, at.clipId, patch(v)) : null;
+	const liveFade =
+		(to: (v: number) => { fade_in?: number; fade_out?: number }): Live =>
+		(v, at) =>
+			at.clipId ? fadeDraft(editor.timeline, at.clipId, to(v)) : null;
+	const liveTitle =
+		(to: (v: number) => { x?: number; y?: number }): Live =>
+		(v, at) => {
+			const ov = overlayOf(at);
+			if (!ov) return null;
+			const pose = sampleOverlay(ov, at.time);
+			const { x, y } = to(v);
+			return titleMoveDraft(editor.overlays, ov.id, x ?? pose.x, y ?? pose.y, at.time);
+		};
+	const liveTitleSize: Live = (v, at) => (at.overlayId ? titleSizeDraft(editor.overlays, at.overlayId, v) : null);
+	/** The row's live value as the preview's draft, as that row's; cleared when its gesture is over. */
+	const toPreview = (live: Live) => (v: number | null, at: Edit, owner: symbol) => {
+		ui.setDraft(owner, v === null ? null : live(v, at));
+	};
+
 	/** Move a title to `x` / `y`, the other coordinate as it was sampled when the edit began. */
 	function moveTitle(at: Edit, to: { x?: number; y?: number }) {
 		const ov = overlayOf(at);
@@ -738,9 +774,10 @@
 	value: number,
 	spec: RowSpec,
 	onCommit: (v: number, at: Edit) => unknown,
-	animate?: Property
+	animate?: Property,
+	live?: Live
 )}
-	<SliderRow {label} {value} {spec} {scope} disabled={editor.locked} {onCommit}>
+	<SliderRow {label} {value} {spec} {scope} disabled={editor.locked} {onCommit} onLive={live ? toPreview(live) : undefined}>
 		{#snippet keyframe()}
 			{#if animate}{@render keyToggle(animate)}{/if}
 		{/snippet}
@@ -913,12 +950,12 @@
 			const ov = overlayOf(at);
 			if (ov) void run(() => editor.retimeOverlay(ov.id, ov.start, Math.max(v, ov.start + MIN_TITLE)));
 		})}
-		{@render rangeRow('Position X', pose.x, { min: 0, max: 1, step: 0.01 }, (v, at) => moveTitle(at, { x: v }))}
-		{@render rangeRow('Position Y', pose.y, { min: 0, max: 1, step: 0.01 }, (v, at) => moveTitle(at, { y: v }))}
+		{@render rangeRow('Position X', pose.x, { min: 0, max: 1, step: 0.01 }, (v, at) => moveTitle(at, { x: v }), undefined, liveTitle((v) => ({ x: v })))}
+		{@render rangeRow('Position Y', pose.y, { min: 0, max: 1, step: 0.01 }, (v, at) => moveTitle(at, { y: v }), undefined, liveTitle((v) => ({ y: v })))}
 		{@render rangeRow('Size', o.size, { min: TITLE_SIZE_MIN, max: Math.max(0.2, TITLE_SIZE_MAX, o.size), step: 0.005, ...PERCENT, digits: 1 }, (v, at) => {
 			const ov = overlayOf(at);
 			if (ov) return run(() => editor.updateOverlay(ov.id, { size: v }));
-		})}
+		}, undefined, liveTitleSize)}
 		{@render colorField('Color', o.color, 'white', 'Title color', (typed) => ({ color: typed }), null)}
 		{@render colorField('Box', o.bg ?? '', 'none', 'Box behind the title', (typed) => ({ bg: typed }), 0.55)}
 		<label style={ROW_GRID}>
@@ -1399,8 +1436,8 @@
 			{/if}
 
 			<InspectorSection title="Fades" summary={`${readout(clip.fade_in, SECONDS_SPEC)} in · ${readout(clip.fade_out, SECONDS_SPEC)} out`}>
-			{@render rangeRow('Fade in', clip.fade_in, fadeSpec(clip), (v, at) => setFade(at, { fade_in: v }))}
-			{@render rangeRow('Fade out', clip.fade_out, fadeSpec(clip), (v, at) => setFade(at, { fade_out: v }))}
+			{@render rangeRow('Fade in', clip.fade_in, fadeSpec(clip), (v, at) => setFade(at, { fade_in: v }), undefined, liveFade((v) => ({ fade_in: v })))}
+			{@render rangeRow('Fade out', clip.fade_out, fadeSpec(clip), (v, at) => setFade(at, { fade_out: v }), undefined, liveFade((v) => ({ fade_out: v })))}
 			</InspectorSection>
 
 			{#if titleClip}
@@ -1503,15 +1540,15 @@
 			{#if picture}
 				<InspectorSection title="Transform" summary={keyframes.length ? `Animated · ${count(keyframes.length, 'key')}` : `${Math.round(tf.scale * 100)}% · ${Math.round(tf.rotation)}°`}>
 				{@render rangeRow('Scale', tf.scale, { min: 0.1, max: 2, step: 0.05, neutral: DEFAULT_TRANSFORM.scale, ...PERCENT }, (v, at) =>
-					setTf({ scale: v }, at))}
+					setTf({ scale: v }, at), undefined, liveTf((v) => ({ scale: v })))}
 				{@render rangeRow('Position X', tf.pos_x, { min: -0.5, max: 0.5, step: 0.01, neutral: DEFAULT_TRANSFORM.pos_x }, (v, at) =>
-					setTf({ pos_x: v }, at))}
+					setTf({ pos_x: v }, at), undefined, liveTf((v) => ({ pos_x: v })))}
 				{@render rangeRow('Position Y', tf.pos_y, { min: -0.5, max: 0.5, step: 0.01, neutral: DEFAULT_TRANSFORM.pos_y }, (v, at) =>
-					setTf({ pos_y: v }, at))}
+					setTf({ pos_y: v }, at), undefined, liveTf((v) => ({ pos_y: v })))}
 				{@render rangeRow('Rotation', tf.rotation, { min: -180, max: 180, step: 1, neutral: DEFAULT_TRANSFORM.rotation, ...DEGREES }, (v, at) =>
-					setTf({ rotation: v }, at))}
+					setTf({ rotation: v }, at), undefined, liveTf((v) => ({ rotation: v })))}
 				{@render rangeRow('Opacity', tf.opacity, { min: 0, max: 1, step: 0.05, neutral: DEFAULT_TRANSFORM.opacity, ...PERCENT }, (v, at) =>
-					setTf({ opacity: v }, at))}
+					setTf({ opacity: v }, at), undefined, liveTf((v) => ({ opacity: v })))}
 				</InspectorSection>
 
 				<InspectorSection title="Framing" summary={hasCrop ? 'Cropped' : 'Full frame'}>
@@ -1548,10 +1585,10 @@
 							: 'This shot already matches the delivery frame.'}
 					</div>
 				{/if}
-				{@render rangeRow('Left', tf.crop_left, { min: 0, max: 0.9, step: 0.01, neutral: DEFAULT_TRANSFORM.crop_left }, (v, at) => setTf({ crop_left: v }, at))}
-				{@render rangeRow('Right', tf.crop_right, { min: 0, max: 0.9, step: 0.01, neutral: DEFAULT_TRANSFORM.crop_right }, (v, at) => setTf({ crop_right: v }, at))}
-				{@render rangeRow('Top', tf.crop_top, { min: 0, max: 0.9, step: 0.01, neutral: DEFAULT_TRANSFORM.crop_top }, (v, at) => setTf({ crop_top: v }, at))}
-				{@render rangeRow('Bottom', tf.crop_bottom, { min: 0, max: 0.9, step: 0.01, neutral: DEFAULT_TRANSFORM.crop_bottom }, (v, at) => setTf({ crop_bottom: v }, at))}
+				{@render rangeRow('Left', tf.crop_left, { min: 0, max: 0.9, step: 0.01, neutral: DEFAULT_TRANSFORM.crop_left }, (v, at) => setTf({ crop_left: v }, at), undefined, liveTf((v) => ({ crop_left: v })))}
+				{@render rangeRow('Right', tf.crop_right, { min: 0, max: 0.9, step: 0.01, neutral: DEFAULT_TRANSFORM.crop_right }, (v, at) => setTf({ crop_right: v }, at), undefined, liveTf((v) => ({ crop_right: v })))}
+				{@render rangeRow('Top', tf.crop_top, { min: 0, max: 0.9, step: 0.01, neutral: DEFAULT_TRANSFORM.crop_top }, (v, at) => setTf({ crop_top: v }, at), undefined, liveTf((v) => ({ crop_top: v })))}
+				{@render rangeRow('Bottom', tf.crop_bottom, { min: 0, max: 0.9, step: 0.01, neutral: DEFAULT_TRANSFORM.crop_bottom }, (v, at) => setTf({ crop_bottom: v }, at), undefined, liveTf((v) => ({ crop_bottom: v })))}
 				</InspectorSection>
 
 				<InspectorSection title="Color" summary={colorSummary(clip, col)}>
@@ -1564,11 +1601,11 @@
 						<Chip pressed={activeLook(col)?.id === look.id} pending={editor.locked} onclick={() => setCol(look.color)}>{look.label}</Chip>
 					{/each}
 				</div>
-				{@render rangeRow('Brightness', col.brightness, { min: -1, max: 1, step: 0.05, neutral: DEFAULT_COLOR.brightness }, (v, at) => setCol({ brightness: v }, at), 'brightness')}
-				{@render rangeRow('Contrast', col.contrast, { min: 0, max: 4, step: 0.05, neutral: DEFAULT_COLOR.contrast }, (v, at) => setCol({ contrast: v }, at), 'contrast')}
-				{@render rangeRow('Saturation', col.saturation, { min: 0, max: 3, step: 0.05, neutral: DEFAULT_COLOR.saturation }, (v, at) => setCol({ saturation: v }, at), 'saturation')}
-				{@render rangeRow('Warmth', col.temperature ?? 0, { min: -1, max: 1, step: 0.05, neutral: DEFAULT_COLOR.temperature ?? 0 }, (v, at) => setCol({ temperature: v }, at), 'temperature')}
-				{@render rangeRow('Gamma', col.gamma, { min: 0.1, max: 3, step: 0.05, neutral: DEFAULT_COLOR.gamma }, (v, at) => setCol({ gamma: v }, at), 'gamma')}
+				{@render rangeRow('Brightness', col.brightness, { min: -1, max: 1, step: 0.05, neutral: DEFAULT_COLOR.brightness }, (v, at) => setCol({ brightness: v }, at), 'brightness', liveCol((v) => ({ brightness: v })))}
+				{@render rangeRow('Contrast', col.contrast, { min: 0, max: 4, step: 0.05, neutral: DEFAULT_COLOR.contrast }, (v, at) => setCol({ contrast: v }, at), 'contrast', liveCol((v) => ({ contrast: v })))}
+				{@render rangeRow('Saturation', col.saturation, { min: 0, max: 3, step: 0.05, neutral: DEFAULT_COLOR.saturation }, (v, at) => setCol({ saturation: v }, at), 'saturation', liveCol((v) => ({ saturation: v })))}
+				{@render rangeRow('Warmth', col.temperature ?? 0, { min: -1, max: 1, step: 0.05, neutral: DEFAULT_COLOR.temperature ?? 0 }, (v, at) => setCol({ temperature: v }, at), 'temperature', liveCol((v) => ({ temperature: v })))}
+				{@render rangeRow('Gamma', col.gamma, { min: 0.1, max: 3, step: 0.05, neutral: DEFAULT_COLOR.gamma }, (v, at) => setCol({ gamma: v }, at), 'gamma', liveCol((v) => ({ gamma: v })))}
 				</InspectorSection>
 
 				<GradeSections {clip} />
@@ -1595,14 +1632,14 @@
 				>
 			</div>
 			{#if mask}
-				{@render rangeRow('Center X', mask.x, { min: 0, max: 1, step: 0.01, neutral: DEFAULT_MASK.x, bipolar: true }, (v, at) => patchMask({ x: v }, at))}
-				{@render rangeRow('Center Y', mask.y, { min: 0, max: 1, step: 0.01, neutral: DEFAULT_MASK.y, bipolar: true }, (v, at) => patchMask({ y: v }, at))}
+				{@render rangeRow('Center X', mask.x, { min: 0, max: 1, step: 0.01, neutral: DEFAULT_MASK.x, bipolar: true }, (v, at) => patchMask({ x: v }, at), undefined, liveMask((v) => ({ x: v })))}
+				{@render rangeRow('Center Y', mask.y, { min: 0, max: 1, step: 0.01, neutral: DEFAULT_MASK.y, bipolar: true }, (v, at) => patchMask({ y: v }, at), undefined, liveMask((v) => ({ y: v })))}
 				{@render rangeRow('Width', mask.width, { min: 0.02, max: 1.5, step: 0.01, neutral: DEFAULT_MASK.width }, (v, at) =>
-					patchMask({ width: v }, at))}
+					patchMask({ width: v }, at), undefined, liveMask((v) => ({ width: v })))}
 				{@render rangeRow('Height', mask.height, { min: 0.02, max: 1.5, step: 0.01, neutral: DEFAULT_MASK.height }, (v, at) =>
-					patchMask({ height: v }, at))}
+					patchMask({ height: v }, at), undefined, liveMask((v) => ({ height: v })))}
 				{@render rangeRow('Feather', mask.feather, { min: 0, max: 1, step: 0.01, neutral: DEFAULT_MASK.feather }, (v, at) =>
-					patchMask({ feather: v }, at))}
+					patchMask({ feather: v }, at), undefined, liveMask((v) => ({ feather: v })))}
 				<CheckRow checked={!!mask.inverted} pending={editor.locked} onchange={(e) => patchMask({ inverted: e.currentTarget.checked })}>
 					Invert
 				</CheckRow>

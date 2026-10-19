@@ -75,7 +75,9 @@
   `set_property_easing(clip, prop, time, easing)` and `copy_keyframes(from, to, props, offset)` (every
   keyed number when `props` is empty; a negative offset cuts the head off with `rebase_head`, so the
   destination opens on the pose; replaces the destination's tracks for those numbers; refuses a number
-  the source has no keys for and the same clip twice) are the surface ops. **Edits keep channels where
+  the source has no keys for and the same clip twice) are the surface ops, with
+  `set_property_tracks(clip, tracks)` — several numbers' keys in one edit ("Edit keyframes"; each track checked as
+  `set_property_keyframes` checks it, a number twice or none at all refused), what one dope-sheet gesture writes. **Edits keep channels where
   they were** with the B5a rules: `rebase_animation` (every head move — `Timeline::slice`, split-and-remove
   left, roll / slide of the next clip, a linked partner's trim) runs the bundle *and* `rebase_channels`
   (`rebase_head`: pose pinned at 0, a cut inside an eased segment bakes the rest into plain keys, a hold
@@ -380,6 +382,13 @@
   **Overlaps are not checked**: Kerf allows them (an explicit `add_clip`, a trim into the next clip, old
   files), and the ripple already treats an overlap the edit did not make as old news. Nothing is indexed
   by position in the stored timeline (everything is by id), so there is no index range to check.
+- **Edit values** (`model/values.rs`, pure + a table test pinning ranges and messages): the ranges a
+  setter holds what it is handed to, before it changes anything — `Transform::check_values` /
+  `check_crop` (`set_transform`), `Color::check_values` (`set_color`), `Clip::check_fades` (`set_fade`),
+  `Clip::check_trim` + `Asset::check_source_out` (`trim`; the latter `add_clip_to_timeline` too), `TextOverlay::check_values` /
+  `check_span` (`update_overlay`), `TextKeyframe::check` (`set_overlay_keyframes`). They are shared with
+  the GPU preview's drag frames (`PreviewDraft::apply`, `app.md`), so a preview never shows a value the
+  edit would refuse: change a range here, not in a setter.
 - **Fit music to length** (`model/music_fit.rs`, pure + unit-tested): `plan_music_fit(music,
   target, rate)` keeps the intro (before the first downbeat) and the ending (after the last
   whole bar) and walks the bars between, **jumping only between repeating phrases**

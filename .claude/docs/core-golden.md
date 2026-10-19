@@ -21,14 +21,18 @@
   in the middle of its first title, `svg_playhead`, no dice, because the drawn playhead is between frames and a stream from one never reads
   `-start_number`); families `svg-input`, `svg-held`, `svg-overlay`, `svg-two`, `svg-partly-off`, `svg-restamp`, `still-svg`,
   `still-svg-one-file`, `preview-svg-*` (`input`, `held`, `seek`, `overlay`) and
-  the structural `svg-under-text`, `svg-gif`, `svg-offset`, which gave 28 to hundreds of cases each) and **400 more** with titles on
-  tracks (`title_clip_for`, on dice seeded by the case, the same four artworks: after the last clip of the lowest video track —
-  touching it under a transition of any kind or across a gap — or over the cut on a video track of their own, some head-trimmed,
-  faded or placed; the title cases get neither SVG overlays nor the gif and playhead tweaks of the family before; families
-  `title-clip-held`, `preview-title-clip-held` and the structural `title-clip`, `title-clip-dip`, `title-clip-under-transition`,
-  `still-title-clip`, `preview-title-clip`; appending them moved none of the first 6400 cases), have their
+  the structural `svg-under-text`, `svg-gif`, `svg-offset`, which gave 28 to hundreds of cases each), **400 more**
+  exported at two or three delivery frames by one run (`together_for`, on dice of its own: framings on the clips,
+  titles on every other case, captions and chapters to mux on a quarter, the encode made one the run takes, every
+  tenth an audio-only container that none does; their export text is `together::build_together_args` plus its
+  `sinks_from_end`; families `together-*`) and **400 more** with titles on tracks (`title_clip_for`, on dice seeded by
+  the case, the same four artworks: after the last clip of the lowest video track — touching it under a transition of any
+  kind or across a gap — or over the cut on a video track of their own, some head-trimmed, faded or placed; the title
+  cases get none of the SVG, gif, playhead or multi-delivery tweaks of the families before; families `title-clip-held`,
+  `preview-title-clip-held` and the structural `title-clip`, `title-clip-dip`, `title-clip-under-transition`,
+  `still-title-clip`, `preview-title-clip`; appending them moved none of the first 6800 cases), have their
   `build_export_args_phase`, `build_still_args` and `build_preview_args_with` argv reduced to
-  FNV-1a digests, committed as 64 block digests each in
+  FNV-1a digests, committed as 72 block digests each in
   `engine/cli/golden/{export,still,preview}.txt` (LF: `.gitattributes`, and the comparison
   ignores `\r`). A refactor of the graph builders must leave all three untouched; an
   intended argv change moves the files of the builders it touched. (`build_proxy_args` and
@@ -142,7 +146,7 @@
   MJPEG and SpeedHQ at `yuv422p`, JPEG-LS grey, a decode-only `thp`, AMV, an `rgb24` with `bt470bg` from FFV1) and the label must be in no argv, and by explicitly tagged H.264
   clips (`bt709`, `smpte170m`, full-range `yuvj420p` `bt709`) and must then be exactly where the HDR clip's was. It moves no digest.
   The 400 animated-title cases (`6000..6400`) were blessed with the label in (blocks `60`..`63`; the first 6000 are the digests the label gave);
-  with the label text stripped from every argv all 64 block digests equal the ones committed before it.
+  with the label text stripped from every argv all 64 block digests of the time equal the ones committed before it.
 - **Constant-power crossfades** (`afade …:curve=qsin` only on a fade that is wholly one half of a real
   pair: a dissolve or motion transition from an adjacent clip whose overlap plays different sound — not a
   fade up from black, not a dip, not a cut inside one take) re-blessed `export.txt` alone: 1304 of 6400

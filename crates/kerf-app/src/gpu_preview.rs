@@ -6,7 +6,7 @@
 //! the setting off nothing here runs, and with it on every failure — no adapter, no surface, a
 //! lost device, a frame the plan refuses, a decode that is busy — ends in the JPEG that was
 //! always there, for that frame, with the reason in the result. The webview asks for a frame
-//! ([`GpuPreview::frame`]) and is told which renderer made it.
+//! ([`GpuPreview::post`]) and is told which renderer made it.
 //!
 //! # Pieces
 //!
@@ -19,6 +19,9 @@
 //!   before anything is decoded, planned from files or rendered; a scrubbed frame takes none.
 //! * **Latest wins** ([`mailbox`]): a request replaces the one waiting, so a drag draws the frames
 //!   it ends on and not every one it passed.
+//! * **Gestures and forward scrubs (A3)**: a request may carry what a gesture under way would write
+//!   ([`draft`]); the frame is drawn as the cut will be once it is let go, and nothing is written. A
+//!   drag that walks forward is decoded reading ahead ([`pace::Trend`]).
 //! * **Checked, counted, paced**: the first frame the GPU would draw waits for the parity self-test
 //!   ([`check`]), every refusal is counted by kind ([`diagnostics`]), and frames of a drag are
 //!   presented without waiting for the refresh ([`pace`]).
@@ -45,6 +48,7 @@
 mod busy;
 mod check;
 mod diagnostics;
+mod draft;
 mod mailbox;
 mod pace;
 mod play;
@@ -75,9 +79,10 @@ use tokio::sync::oneshot;
 
 use check::{AdapterKey, Check, Gate, Verdict};
 use diagnostics::{Counters, Reason};
+pub use draft::PreviewDraft;
 pub use mailbox::Delivery;
 use mailbox::{Mailbox, Order, Worker};
-use pace::Pace;
+use pace::{Pace, Trend};
 use play::PlaySession;
 pub use play::{PlayInfo, PlayKey, PlayTally};
 use prime::{Primed, Primer};
@@ -644,6 +649,20 @@ fn plan_at_grid(planner: &Planner, t: f64) -> kerf_core::Result<RenderPlan> {
     planner.at_frame(planner.canvas().fps.frame_containing(t))
 }
 
+/// How a still plan's layers are decoded: a drag that walks forward (`forward`, `pace::Trend`) reads
+/// ahead like playback, unless a layer plays its footage backward. Its frames go the other way through
+/// the file, so a run that reads ahead would restart at every frame and the frame source's thrash guard
+/// would refuse it (`Busy`): that drag is decoded as a scrub, as it was before reading ahead.
+fn decode_hint(plan: &RenderPlan, forward: bool) -> Hint {
+    if forward && !plan.layers.iter().any(|l| l.timing.reversed && !l.is_image) {
+        Hint::Forward {
+            fps: f64::from(plan.canvas.fps.num) / f64::from(plan.canvas.fps.den.max(1)),
+        }
+    } else {
+        Hint::Scrub
+    }
+}
+
 /// Clears a flag when dropped, a panic included.
 struct ClearOnDrop(Arc<AtomicBool>);
 
@@ -908,6 +927,10 @@ pub struct FrameRequest {
     arrived: Instant,
     /// Frames are being dragged (how fast requests arrive): set by [`GpuPreview::post`].
     scrubbing: bool,
+    /// The drag walks forward through the cut: set by [`GpuPreview::post`].
+    forward: bool,
+    /// What the gesture under way would write: the frame is drawn as the cut would be ([`draft`]).
+    draft: Option<PreviewDraft>,
     /// Which of the page's requests this is, when it says.
     order: Option<Order>,
     /// The play session this is a frame of (`hint = forward`), when it is.
@@ -923,9 +946,18 @@ impl FrameRequest {
             overlays,
             arrived: Instant::now(),
             scrubbing: false,
+            forward: false,
+            draft: None,
             order: None,
             play: None,
         }
+    }
+
+    /// This frame is drawn as the cut would be with `draft` written ([`draft`]): the frame of a gesture
+    /// under way. An empty draft is no draft.
+    pub fn drafted(mut self, draft: PreviewDraft) -> Self {
+        self.draft = (!draft.is_empty()).then_some(draft);
+        self
     }
 
     /// This is a frame of play session `session` of the page `client`: the GPU plays the cut forward
@@ -976,6 +1008,8 @@ struct Want {
     /// The page must draw over the picture (a title box, the trim monitor, safe-area guides).
     overlays: bool,
     scrubbing: bool,
+    /// Decode it like playback, reading ahead ([`Trend`]).
+    forward: bool,
 }
 
 #[cfg(test)]
@@ -985,9 +1019,23 @@ impl Want {
             t,
             overlays: false,
             scrubbing: false,
+            forward: false,
         }
     }
 }
+
+/// The cut a frame is drawn from.
+enum Cut {
+    /// The snapshot's.
+    Held,
+    /// The snapshot's with a gesture's draft in it.
+    Drafted(Timeline),
+    /// A draft that could not be drawn, and why: the frame is the snapshot's, through FFmpeg.
+    Refused(String),
+}
+
+/// The last reason of a drag's frame that FFmpeg drew.
+const DRAFT_NOTE: &str = "the picture is the cut as it was before the drag; the drag shows once it is let go";
 
 /// How a `get_preview_frame` ended, for the command: the frame, or "a newer request took its place".
 type Answer = Delivery<Result<PreviewFrameResult, String>>;
@@ -1092,8 +1140,8 @@ pub struct GpuPreview {
     me: OnceLock<Weak<GpuPreview>>,
     /// Frame requests: only the newest is drawn.
     mail: Mailbox<FrameRequest, Result<PreviewFrameResult, String>>,
-    /// Whether requests are arriving like a drag.
-    pace: Mutex<Pace>,
+    /// Whether requests are arriving like a drag, and which way it goes.
+    pace: Mutex<(Pace, Trend)>,
     counters: Mutex<Counters>,
     /// The parity self-test's standing, and what runs it.
     check: Arc<Check>,
@@ -1167,7 +1215,7 @@ impl GpuPreview {
             primer: Primer::new(),
             me: OnceLock::new(),
             mail: Mailbox::default(),
-            pace: Mutex::new(Pace::default()),
+            pace: Mutex::new((Pace::default(), Trend::default())),
             counters: Mutex::new(Counters::default()),
             check: Arc::new(Check::default()),
             checker: Arc::new(|gpu| kerf_gpu::parity_self_test(&gpu)),
@@ -1342,7 +1390,9 @@ impl GpuPreview {
         // Frames of a play session are not a drag: they are shown with the refresh, and do not
         // teach the pace what a click after them is.
         if request.play.is_none() {
-            request.scrubbing = lock(&self.pace).observe(request.arrived);
+            let mut pace = lock(&self.pace);
+            request.scrubbing = pace.0.observe(request.arrived);
+            request.forward = pace.1.observe(request.t, request.scrubbing);
         }
         let order = request.order.take();
         let (answer, start) = self.mail.post(request, order);
@@ -1380,17 +1430,31 @@ impl GpuPreview {
         if let Some(wait) = inputs.proxy_wait(request.t)? {
             return Err(wait);
         }
-        let result = self.frame(
+        let cut = match &request.draft {
+            None => Cut::Held,
+            Some(draft) => match draft.apply(&inputs.timeline, &inputs.assets) {
+                Ok(timeline) => match inputs.proxy_wait_in(&timeline, request.t)? {
+                    Some(wait) => Cut::Refused(wait),
+                    None => Cut::Drafted(timeline),
+                },
+                Err(why) => Cut::Refused(why),
+            },
+        };
+        let drafted = !matches!(cut, Cut::Held);
+        let result = self.frame_in(
             &inputs,
+            cut,
             Want {
                 t: request.t,
                 overlays: request.overlays,
                 scrubbing: request.scrubbing,
+                forward: request.forward,
             },
             request.ffmpeg_width,
         )?;
-        // The playhead rests on a frame the GPU drew: the cut from here is made ready for Play.
-        if result.renderer == "gpu" && !request.overlays {
+        // The playhead rests on a frame the GPU drew: the cut from here is made ready for Play. Not a
+        // drag's frame: that cut is not the one Play would play.
+        if result.renderer == "gpu" && !request.overlays && !drafted {
             self.prime_soon(&inputs, request.t);
         }
         Ok(result)
@@ -1409,15 +1473,29 @@ impl GpuPreview {
 
     /// A frame for `want.t`: drawn by the GPU when the plan allows it and everything works, else
     /// FFmpeg's JPEG of `ffmpeg_width`. `want.overlays` is the page saying it must draw over the
-    /// picture (a title box, the trim monitor, safe-area guides).
+    /// picture (a title box, the trim monitor, safe-area guides). A drag's frame (`cut` drafted) the
+    /// GPU does not draw is FFmpeg's JPEG of the cut as it is: the drag shows once it is written, as it
+    /// does with the GPU preview off.
     ///
     /// The project lock is not taken here at all. A panic in the GPU path (wgpu, the X connection) is
     /// caught here: the backend is dropped and rebuilt behind the backoff, the surface hidden, and the
     /// frame is FFmpeg's like any other fallback.
-    fn frame(&self, inputs: &PlanInputs, want: Want, ffmpeg_width: u32) -> Result<PreviewFrameResult, String> {
+    fn frame_in(&self, inputs: &PlanInputs, cut: Cut, want: Want, ffmpeg_width: u32) -> Result<PreviewFrameResult, String> {
         // Whatever else is asked for (the paused frame, a scrub) is not part of a play session.
         self.end_play();
-        let attempt = catch_unwind(AssertUnwindSafe(|| self.attempt(inputs, want, Instant::now())));
+        let drafted = !matches!(cut, Cut::Held);
+        let attempt = match &cut {
+            Cut::Held => catch_unwind(AssertUnwindSafe(|| {
+                self.attempt_in(inputs, &inputs.timeline, false, want, Instant::now())
+            })),
+            Cut::Drafted(timeline) => catch_unwind(AssertUnwindSafe(|| {
+                self.attempt_in(inputs, timeline, true, want, Instant::now())
+            })),
+            Cut::Refused(why) => {
+                self.hide();
+                Ok(Attempt::Fallback(vec![Reason::new("draft", why.clone())]))
+            }
+        };
         let reasons = match attempt {
             Ok(Attempt::Presented(timings)) => {
                 lock(&self.counters).presented();
@@ -1444,7 +1522,10 @@ impl GpuPreview {
                 "a preview frame went through FFmpeg for a reason not seen this session"
             );
         }
-        let texts: Vec<String> = reasons.into_iter().map(|r| r.text).collect();
+        let mut texts: Vec<String> = reasons.into_iter().map(|r| r.text).collect();
+        if drafted {
+            texts.push(DRAFT_NOTE.into());
+        }
         tracing::debug!(reasons = ?texts, t = want.t, "preview frame through FFmpeg");
         let jpeg = self
             .scrub
@@ -1622,7 +1703,19 @@ impl GpuPreview {
         }
     }
 
+    #[cfg(test)]
+    fn frame(&self, inputs: &PlanInputs, want: Want, ffmpeg_width: u32) -> Result<PreviewFrameResult, String> {
+        self.frame_in(inputs, Cut::Held, want, ffmpeg_width)
+    }
+
+    #[cfg(test)]
     fn attempt(&self, inputs: &PlanInputs, want: Want, now: Instant) -> Attempt {
+        self.attempt_in(inputs, &inputs.timeline, false, want, now)
+    }
+
+    /// Draw `timeline` at `want.t` (the snapshot's, or a drag's draft of it: `drafted`, which is not
+    /// prefetched around, since the next frame of a drag is the same time in another cut).
+    fn attempt_in(&self, inputs: &PlanInputs, timeline: &Timeline, drafted: bool, want: Want, now: Instant) -> Attempt {
         let t = want.t;
         let fallback = |kind: &'static str, why: String| {
             self.hide();
@@ -1655,7 +1748,7 @@ impl GpuPreview {
 
         // The plan, off the project lock.
         let planner = match Planner::new(
-            &inputs.timeline,
+            timeline,
             &inputs.assets,
             &ExportOptions::default(),
             PlanRequest::still((self.policy)()).with_media(&ProxyMedia),
@@ -1706,9 +1799,17 @@ impl GpuPreview {
         if let Some(stall) = lock(&self.before_decode).clone() {
             stall();
         }
-        let rendered = drawing
-            .compositor
-            .render_plan_texture_with(&plan, size, &drawing.source, Hint::Scrub);
+        let hint = decode_hint(&plan, want.forward);
+        // A drag's frame keeps the poses of its titles apart from the cut's.
+        let rendered = if drafted {
+            drawing
+                .compositor
+                .render_draft_texture_with(&plan, size, &drawing.source, hint)
+        } else {
+            drawing
+                .compositor
+                .render_plan_texture_with(&plan, size, &drawing.source, hint)
+        };
 
         match self.conclude(
             &drawing,
@@ -1721,8 +1822,10 @@ impl GpuPreview {
             true,
         ) {
             Concluded::Shown(timings, _) => {
-                tracing::debug!(?timings, t, "GPU preview frame presented");
-                self.prefetch_ahead(&planner, &inputs.timeline, t, size, &caps, Arc::clone(&drawing.source));
+                tracing::debug!(?timings, t, drafted, "GPU preview frame presented");
+                if !drafted {
+                    self.prefetch_ahead(&planner, timeline, t, size, &caps, Arc::clone(&drawing.source));
+                }
                 Attempt::Presented(timings)
             }
             Concluded::Restarted => fallback("backend", "the GPU preview was restarted while the frame was drawn".into()),
@@ -2246,6 +2349,47 @@ mod tests {
             plan_at_grid(&planner, -1.0).unwrap().frame,
             0,
             "before the start is its first frame"
+        );
+    }
+
+    #[test]
+    fn a_forward_drag_reads_ahead_unless_a_layer_plays_backward() {
+        let asset: kerf_core::Asset = serde_json::from_value(serde_json::json!({
+            "id": uuid::Uuid::new_v4(), "path": "/x.mp4", "name": "x.mp4", "duration": 100.0,
+            "streams": [{
+                "index": 0, "kind": StreamKind::Video, "codec": "h264",
+                "width": 1920, "height": 1080, "fps": 30.0
+            }],
+            "imported_at": "2026-01-01T00:00:00Z", "source_paths": [], "voiceover": null, "music_score": null
+        }))
+        .expect("an asset");
+        let hint_at = |speed: f64| {
+            let mut tl = cut(vec![(StreamKind::Video, "V1", vec![0.0])]);
+            let clip = &mut tl.tracks[0].clips[0];
+            clip.asset_id = asset.id;
+            clip.source_out = 10.0;
+            clip.speed = speed;
+            let planner = Planner::new(
+                &tl,
+                std::slice::from_ref(&asset),
+                &ExportOptions::default(),
+                PlanRequest::still(CompositeColorPolicy::FixedBt601),
+            )
+            .unwrap();
+            let plan = plan_at_grid(&planner, 1.0).unwrap();
+            assert_eq!(plan.layers.len(), 1);
+            (decode_hint(&plan, true), decode_hint(&plan, false))
+        };
+        let (forward, still) = hint_at(1.0);
+        assert!(
+            matches!(forward, Hint::Forward { fps } if (fps - 30.0).abs() < 1e-9),
+            "{forward:?}"
+        );
+        assert_eq!(still, Hint::Scrub, "a drag that does not walk forward is a scrub");
+        assert_eq!(
+            hint_at(-1.0),
+            (Hint::Scrub, Hint::Scrub),
+            "a reversed clip under the playhead is scrubbed, walking forward or not"
         );
     }
 

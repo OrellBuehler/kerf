@@ -29,7 +29,7 @@ use std::sync::{Mutex, OnceLock};
 
 use sha2::{Digest, Sha256};
 
-use super::download::{fetch, Download, DownloadProgress};
+use super::download::{fetch, partial_progress, take_turn, Download, DownloadProgress};
 use crate::error::{Error, Result};
 use crate::model::TranscriptSegment;
 
@@ -315,27 +315,44 @@ pub(super) fn ensure_runtime(progress: &mut dyn FnMut(DownloadProgress), cancel:
     );
     let sha256 = spec.sha256;
     let verify = move |path: &Path| verify_sha256(path, sha256);
-    fetch(
-        &Download {
-            url: &url,
-            dst: &archive,
-            what: "voice runtime",
-            mirror_env: "ORT_DYLIB_PATH",
-            verify: &verify,
-        },
-        progress,
-        cancel,
-    )?;
+    let download = Download {
+        url: &url,
+        dst: &archive,
+        what: "voice runtime",
+        mirror_env: "ORT_DYLIB_PATH",
+        verify: &verify,
+    };
+    install_runtime(&download, spec.member, &lib, progress, cancel)?;
+    Ok(lib)
+}
+
+/// Fetch the runtime archive and unpack `member` from it to `lib`, unless `lib` is there.
+fn install_runtime(
+    download: &Download,
+    member: &str,
+    lib: &Path,
+    progress: &mut dyn FnMut(DownloadProgress),
+    cancel: &dyn Fn() -> bool,
+) -> Result<()> {
+    // Voiceover and stems both install it, and the extract goes through a `.part` named by the
+    // process: a second caller unpacking beside the first would have its rename fail and delete
+    // the archive under it. The whole install takes turns, and the second finds the library.
+    let _turn = take_turn(lib, cancel, &mut || progress(partial_progress(download.dst)))?;
+    if lib.is_file() {
+        return Ok(());
+    }
+    let archive = fetch(download, progress, cancel)?;
+    let dir = lib.parent().expect("runtime path has a parent");
     std::fs::create_dir_all(dir).map_err(|e| Error::Engine(format!("could not create voice runtime dir: {e}")))?;
     let tmp = lib.with_extension(format!("{}.part", std::process::id()));
-    extract_member(&archive, spec.member, &tmp).inspect_err(|_| {
+    extract_member(&archive, member, &tmp).inspect_err(|_| {
         let _ = std::fs::remove_file(&tmp);
     })?;
-    std::fs::rename(&tmp, &lib).map_err(|e| Error::Engine(format!("could not install voice runtime: {e}")))?;
+    std::fs::rename(&tmp, lib).map_err(|e| Error::Engine(format!("could not install voice runtime: {e}")))?;
     // The archive also carries headers, debug symbols and licences Kerf has no
     // use for; only the library is kept.
     let _ = std::fs::remove_file(&archive);
-    Ok(lib)
+    Ok(())
 }
 
 fn unsupported_platform() -> Error {
@@ -1078,6 +1095,51 @@ fn infer(runtime: &Path, model: &Path, threads: usize, tokens: &[i64], style: Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Voiceover and stems installing the runtime at once used to unpack into one `.part`: one
+    /// rename failed, and a caller that came late downloaded the whole archive again.
+    #[test]
+    fn two_runtime_installs_take_turns() {
+        use super::super::download::tests::{spawn_server, temp_dir};
+
+        let library = (0..256 * 1024).map(|i| (i % 251) as u8).collect::<Vec<u8>>();
+        let mut tgz = tar::Builder::new(flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast()));
+        let mut header = tar::Header::new_gnu();
+        header.set_size(library.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tgz.append_data(&mut header, "onnxruntime/lib/libonnxruntime.so", &library[..])
+            .expect("append");
+        let tgz = tgz.into_inner().expect("tar").finish().expect("gzip");
+        let (url, requests) = spawn_server(tgz);
+        let dir = temp_dir("runtime");
+        let archive = dir.0.join("onnxruntime.tgz");
+        let lib = dir.0.join("onnxruntime-1").join("libonnxruntime.so");
+
+        std::thread::scope(|s| {
+            let installs: Vec<_> = (0..2)
+                .map(|_| {
+                    s.spawn(|| {
+                        let download = Download {
+                            url: &url,
+                            dst: &archive,
+                            what: "voice runtime",
+                            mirror_env: "ORT_DYLIB_PATH",
+                            verify: &|_| Ok(()),
+                        };
+                        install_runtime(&download, "lib/libonnxruntime.so", &lib, &mut |_| {}, &|| false)
+                    })
+                })
+                .collect();
+            for install in installs {
+                install.join().expect("join").expect("install");
+            }
+        });
+
+        assert_eq!(std::fs::read(&lib).expect("library"), library);
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1, "one download");
+        assert!(!archive.exists(), "the archive is not kept");
+    }
 
     #[test]
     fn sentences_split_at_terminators_but_not_abbreviations_or_decimals() {

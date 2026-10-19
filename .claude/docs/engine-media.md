@@ -242,10 +242,14 @@ instead), the model (`onnx-community/Kokoro-82M-v1.0-ONNX`'s `model_quantized.on
 ~88 MB; `KERF_KOKORO_MODEL_URL` a mirror) and each voice pack (~0.5 MB) are fetched
 on first use through **`engine/download.rs`** — the resumable, cancellable `.part` +
 verify + rename fetch lifted out of whisper, which both now share. The `.part` is
-named by pid, so fetches of one destination **within a process** take turns on a
-per-path lock (polling cancel while they wait; the second finds the file in place),
-and a resume answered 416 drops the partial and restarts once — CI once had two tests
-interleaving one SoundFont's `.part` and failing on the 416. Static linking
+named by pid, so threads of one process fetching the same destination take turns
+(`download::take_turn`, a per-path claim; other processes are not excluded and rely on
+the pid-named `.part` and the final rename). A waiter polls cancel, reports one
+progress event (its `.part` size, no total) and, once in, finds the file in place. The
+runtime install (`tts::install_runtime`, shared by voiceover and stems) holds a turn on
+the library path for the fetch **and** the extract, which also goes through a pid-named
+`.part`. A resume answered 416 drops the partial and restarts once — CI once had two
+tests interleaving one SoundFont's `.part` and failing on the 416. Static linking
 was ruled out: pyke's prebuilt runtime needs glibc 2.38 and the Linux bundles build
 on Ubuntu 22.04. Phonemes come from **`misaki-rs` without its espeak-ng fallback**
 (espeak-ng is GPL-3), so unknown words are spelled out and only the English (`a*` /

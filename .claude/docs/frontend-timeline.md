@@ -102,9 +102,17 @@ the cut shrinks or a clip is trimmed, which would rescale the lane under every e
 under 160 px (a hidden dock tab) is nothing to fit to. **The lane box is at least the window wide**
 (`min-width: calc(100% - var(--track-header-w))`, `laneW`): the ruler, the row borders and the grid
 run to the edge, and what lies past the end of the cut (`cutEndX`) is dimmed behind a line, so a
-short cut is not taken for a short timeline. The ceiling comes down for a very long cut so the
-lane stays under 8 M px — the one thing a browser cannot lay out. Nothing else assumed a
-range: the waveform rung choice scales to any px/s (bottoming out at the engine's 2 ms
+short cut is not taken for a short timeline. Because the lane is sized from the scroller's width, **no
+scrollbar may change that width**: the scroller keeps its vertical gutter (`scrollbar-gutter: stable`),
+the lane clips what is drawn past its end (`overflow-x: clip`; a gesture or a library drop ghost widens
+the lane instead, `gestureEnd`), and `laneWidth` does not round float dust up (a 30 s cut fitted to
+1010 px has 962 px of room, `962 / 30 * 30` is `962.0000000000001`: a 1011 px lane). Without them,
+with classic scrollbars (Windows) and tracks within a scrollbar of the panel's height, a 1 px overflow
+brought the horizontal bar, that pushed the tracks past the fold, the vertical bar narrowed the view,
+and the narrower view (ticks culled at the old edge, or the follow's refit) removed the overflow: the
+bars came and went forever. The ceiling comes down for a very long cut so the lane stays under 8 M px
+— the one thing a browser cannot lay out. Nothing else assumed a range: the waveform rung choice
+scales to any px/s (bottoming out at the engine's 2 ms
 bucket, 4 px at the ceiling) and frame snapping works in seconds. `ruler.ts` makes the
 label step follow the zoom and renders only the ticks in the visible window (hundreds,
 not an hour's worth). **The ruler is timecode.** Its steps are timecode steps (`rulerGrid(px/s, fps)`:

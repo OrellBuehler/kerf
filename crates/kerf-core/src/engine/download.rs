@@ -9,10 +9,10 @@
 //! rename it into place — so a truncated or interrupted fetch can never be
 //! loaded later as if it were complete.
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock, TryLockError};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
@@ -74,19 +74,7 @@ pub fn fetch(download: &Download, progress: &mut dyn FnMut(DownloadProgress), ca
     // process (the Compose dialog's prepare and an agent's compose) would share it: their
     // writes interleave, and one that resumes the other's finished file is refused with a 416.
     // They take turns instead, and the second finds the file the first put in place.
-    let turn = destination_lock(dst);
-    let _turn = loop {
-        match turn.try_lock() {
-            Ok(guard) => break guard,
-            Err(TryLockError::Poisoned(e)) => break e.into_inner(),
-            Err(TryLockError::WouldBlock) => {
-                if cancel() {
-                    return Err(Error::Cancelled);
-                }
-                std::thread::sleep(POLL);
-            }
-        }
-    };
+    let _turn = take_turn(dst, cancel, &mut || progress(partial_progress(dst)))?;
     if dst.is_file() {
         return Ok(dst.to_path_buf());
     }
@@ -119,11 +107,48 @@ pub fn fetch(download: &Download, progress: &mut dyn FnMut(DownloadProgress), ca
     Ok(dst.to_path_buf())
 }
 
-/// The lock one destination's fetches take turns on.
-fn destination_lock(dst: &Path) -> Arc<Mutex<()>> {
-    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
-    let mut locks = LOCKS.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
-    locks.entry(dst.to_path_buf()).or_default().clone()
+/// This process's claim on a path: while it is held, no other thread here works on that path.
+/// Dropping it hands the path on.
+pub(super) struct Turn(PathBuf);
+
+impl Drop for Turn {
+    fn drop(&mut self) {
+        busy().remove(&self.0);
+    }
+}
+
+fn busy() -> std::sync::MutexGuard<'static, HashSet<PathBuf>> {
+    static BUSY: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+    BUSY.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Wait until no other thread in this process holds `path`, then hold it. `waiting` is called
+/// once if there is a wait, and `cancel` is polled throughout it.
+pub(super) fn take_turn(path: &Path, cancel: &dyn Fn() -> bool, waiting: &mut dyn FnMut()) -> Result<Turn> {
+    let mut told = false;
+    loop {
+        if busy().insert(path.to_path_buf()) {
+            return Ok(Turn(path.to_path_buf()));
+        }
+        if !told {
+            told = true;
+            waiting();
+        }
+        if cancel() {
+            return Err(Error::Cancelled);
+        }
+        std::thread::sleep(POLL);
+    }
+}
+
+/// How far this process has got with `dst`, for a caller waiting its turn: what its `.part`
+/// holds, the total unknown.
+pub(super) fn partial_progress(dst: &Path) -> DownloadProgress {
+    let tmp = dst.with_extension(format!("{}.part", std::process::id()));
+    DownloadProgress {
+        downloaded: std::fs::metadata(tmp).map_or(0, |m| m.len()),
+        total: None,
+    }
 }
 
 /// Whether a failed transfer leaves a `.part` file worth resuming: a cancel, or a stall.
@@ -396,9 +421,10 @@ fn get(url: &str, from: u64) -> std::result::Result<ureq::http::Response<ureq::B
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::net::IpAddr;
+    use std::sync::Arc;
 
     #[test]
     fn urls_split_into_host_and_port() {
@@ -438,7 +464,7 @@ mod tests {
 
     /// An HTTP/1.1 server over `body` that serves each connection on a thread of its own,
     /// honours `Range`, answers 416 to one that starts at or past the end, and counts requests.
-    fn spawn_server(body: Vec<u8>) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    pub(in crate::engine) fn spawn_server(body: Vec<u8>) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
         use std::io::{BufRead, BufReader};
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
@@ -489,14 +515,14 @@ mod tests {
         (url, requests)
     }
 
-    struct TempDir(PathBuf);
+    pub(in crate::engine) struct TempDir(pub PathBuf);
     impl Drop for TempDir {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
-    fn temp_dir(tag: &str) -> TempDir {
+    pub(in crate::engine) fn temp_dir(tag: &str) -> TempDir {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
@@ -602,12 +628,18 @@ mod tests {
             mirror_env: "KERF_TEST_URL",
             verify: &verify,
         };
-        let turn = destination_lock(&dst);
-        let _held = turn.lock().expect("lock");
+        let _held = take_turn(&dst, &|| false, &mut || {}).expect("turn");
 
         let started = Instant::now();
-        let err = fetch(&download, &mut |_| {}, &|| started.elapsed() > Duration::from_millis(300)).expect_err("cancelled");
+        let mut seen = Vec::new();
+        let err = fetch(&download, &mut |p| seen.push(p), &|| {
+            started.elapsed() > Duration::from_millis(300)
+        })
+        .expect_err("cancelled");
         assert!(matches!(err, Error::Cancelled), "{err:?}");
         assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        // One event says it is waiting, so the UI is not left blank meanwhile.
+        assert_eq!(seen.len(), 1, "{seen:?}");
+        assert_eq!(seen[0].total, None);
     }
 }

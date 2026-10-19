@@ -288,6 +288,19 @@ describe('Pending', () => {
 		expect(edit.end(B)).toEqual(A);
 	});
 
+	test('what a live value is for is the scope the edit began on, and nothing once it is over', () => {
+		const edit = new Pending<string>();
+		expect(edit.scope).toBeUndefined();
+		edit.begin(A.scope, A.value, A.spec);
+		edit.begin(B.scope, B.value, B.spec);
+		expect(edit.scope).toBe('clip A');
+		edit.end(B);
+		expect(edit.scope).toBeUndefined();
+		edit.begin(B.scope, B.value, B.spec);
+		edit.drop();
+		expect(edit.scope).toBeUndefined();
+	});
+
 	test('it ends once: the next edit begins afresh', () => {
 		const edit = new Pending<string>();
 		edit.begin(A.scope, A.value, A.spec);

@@ -9,6 +9,9 @@
 	// What a write goes to is what the edit *began* on (`scope`, read when a drag, a run of keys or a typed
 	// entry starts), not what is selected when it ends: the click that selects another clip also
 	// blurs the field, and the entry is written on that blur. The numbers are `slider-row.ts`'s, which has the tests.
+	// `onLive` hears the value while a drag or a run of keys goes on, and `null` once its write has landed, it
+	// was abandoned or the row went away mid-gesture (an undo took its clip): the Inspector draws the frame of
+	// the gesture with it (the GPU preview's draft), as this row's (`owner`), so one row never clears another's.
 	import type { Snippet } from 'svelte';
 	import MixSlider from './MixSlider.svelte';
 	import {
@@ -37,7 +40,8 @@
 		reserve = true,
 		keyframe = undefined,
 		scope = undefined,
-		onCommit
+		onCommit,
+		onLive = undefined
 	}: {
 		label: string;
 		/** The committed value, in the property's own units. */
@@ -54,31 +58,48 @@
 		scope?: S;
 		/** The value a gesture ended on, or a typed entry, or the rest value: write it, to `scope`. One call per gesture. */
 		onCommit: (v: number, scope: S) => unknown;
+		/** The value a gesture is at, for `scope` as it began; `null` when it is over (written, abandoned, or the
+		 *  row unmounted). `owner` is this row's, the same for every call. */
+		onLive?: (v: number | null, scope: S, owner: symbol) => void;
 	} = $props();
 
 	let preview = $state<number | null>(null);
 	const shown = $derived(preview ?? value);
 	const pending = new Pending<S>();
 	const now = () => ({ scope: scope as S, value, spec });
+	const owner = Symbol('slider-row');
 
 	function move(v: number) {
 		pending.begin(scope as S, value, spec);
 		preview = v;
+		onLive?.(v, pending.scope as S, owner);
 	}
+	/** Writes let go of and not landed yet: each ends its draft itself once its edit has landed. */
+	let writing = 0;
+	// A row that goes away mid-gesture (its clip undone, the panel switched) ends its draft with it, unless a
+	// write is in flight: that one ends it when it lands, so the picture does not step back in between.
+	$effect(() => () => {
+		if (writing === 0) onLive?.(null, (pending.scope ?? scope) as S, owner);
+	});
 	/** The slider keeps showing where it was let go until the write has landed, so it does not
 	 *  jump back to the old value for the length of a round trip. */
 	async function write(v: number, at: S) {
 		preview = v;
+		writing += 1;
 		try {
 			await onCommit(v, at);
 		} finally {
+			writing -= 1;
 			preview = null;
+			onLive?.(null, at, owner);
 		}
 	}
 	const commit = (v: number) => write(v, pending.end(now()).scope);
 	function cancel() {
+		const at = pending.scope ?? (scope as S);
 		pending.drop();
 		preview = null;
+		onLive?.(null, at, owner);
 	}
 	function reset() {
 		pending.drop();
