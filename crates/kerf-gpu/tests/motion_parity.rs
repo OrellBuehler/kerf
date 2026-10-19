@@ -164,6 +164,9 @@ struct Media {
     /// cases with a rotated layer.
     smooth: Asset,
     black: Asset,
+    /// `testsrc` whose picture starts 0.3 s after its sound (`StreamInfo::lead`), muxed into MP4
+    /// with an edit list as a phone writes it.
+    late: Asset,
 }
 
 fn media() -> &'static Media {
@@ -214,6 +217,26 @@ fn media() -> &'static Media {
             &format!("gradients=size=640x360:rate=30:duration=4:c0=0xd03020:c1=0x2040e0:c2=0x30c060:nb_colors=3:seed=11:x0=0:y0=0:x1=640:y1=360:speed=0.00001,format=yuv420p,{untagged}"),
         );
         let black = video("black.mp4", "color=c=black:s=640x360:r=30:d=4");
+        let late = dir.join("late.mp4");
+        ffmpeg(&[
+            "-itsoffset",
+            "0.3",
+            "-i",
+            testsrc.to_str().unwrap(),
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:sample_rate=48000:duration=4.5",
+            "-map",
+            "0:v",
+            "-map",
+            "1:a",
+            "-c:v",
+            "copy",
+            "-c:a",
+            "aac",
+            late.to_str().unwrap(),
+        ]);
         let image = dir.join("image.png");
         ffmpeg(&[
             "-f",
@@ -235,6 +258,7 @@ fn media() -> &'static Media {
             noise: probed(&noise),
             smooth: probed(&smooth),
             black: probed(&black),
+            late: probed(&late),
         }
     })
 }
@@ -1011,6 +1035,71 @@ fn export_frames_are_drawn_without_a_transition() {
     let tl = timeline(vec![vec![graded], vec![pip]], None);
     let assets = [m.bars.clone(), m.testsrc.clone()];
     run("plain/pip-over-graded", &tl, &assets, 30.0, 1.2, SCALED);
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_late_starting_source_is_drawn_as_the_export_draws_it() {
+    let m = media();
+    assert!(
+        (m.late.streams[0].lead - 0.3).abs() < 0.002,
+        "the probe saw {}",
+        m.late.streams[0].lead
+    );
+    // Over bars, so the gap before the first picture shows the layer below, not black alone.
+    let over = |edit: &dyn Fn(&mut Clip)| {
+        let mut c = clip(&m.late, 0.0, 1.5, 0.0);
+        edit(&mut c);
+        let tl = timeline(vec![vec![clip(&m.bars, 0.5, 2.5, 0.0)], vec![c]], None);
+        (tl, vec![m.bars.clone(), m.late.clone()])
+    };
+    // From the head (the picture 0.3 s in), from inside the lead (unseeked, 0.15 s in), past it
+    // (seeked as ever), at speed 2 and 0.5, reversed, and with a fade-in that starts on the first
+    // picture.
+    for fps in [30.0, 25.0] {
+        let (tl, assets) = over(&|_| {});
+        run(&format!("late/head @{fps}"), &tl, &assets, fps, 1.5, EXACT);
+    }
+    let (tl, assets) = over(&|c| c.source_in = 0.15);
+    run("late/inside-the-lead", &tl, &assets, 30.0, 1.5, EXACT);
+    let (tl, assets) = over(&|c| c.source_in = 0.6);
+    run("late/past-the-lead", &tl, &assets, 30.0, 0.9, EXACT);
+    let (tl, assets) = over(&|c| {
+        c.source_out = 3.0;
+        c.speed = 2.0;
+    });
+    run("late/speed-2", &tl, &assets, 30.0, 1.5, EXACT);
+    let (tl, assets) = over(&|c| {
+        c.source_out = 0.75;
+        c.speed = 0.5;
+    });
+    run("late/speed-0.5", &tl, &assets, 30.0, 1.5, EXACT);
+    let (tl, assets) = over(&|c| c.speed = -1.0);
+    run("late/reversed", &tl, &assets, 30.0, 1.5, EXACT);
+    // A fade-in from the first picture, at 30 fps and at 25, where the 0.3 s lead is half a frame.
+    for fps in [30.0, 25.0] {
+        let (tl, assets) = over(&|c| c.fade_in = 0.4);
+        run(&format!("late/fade-in @{fps}"), &tl, &assets, fps, 1.5, EXACT);
+    }
+    // Entering through a dissolve (the ramp from the first picture to the end of the outgoing
+    // tail), one no longer than the lead (no ramp: the picture comes in whole once the tail is
+    // gone) and a dip to black (up from black on the first picture).
+    let enter = |kind, secs: f64| {
+        let out = clip(&m.bars, 0.5, 1.5, 0.0);
+        let mut inc = clip(&m.late, 0.0, 1.0, 1.0);
+        inc.transition_in = Some(Transition { kind, duration: secs });
+        (timeline(vec![vec![out, inc]], None), vec![m.bars.clone(), m.late.clone()])
+    };
+    for (name, kind, secs) in [
+        ("dissolve", TransitionKind::Crossfade, 0.6),
+        ("dissolve-inside-the-lead", TransitionKind::Crossfade, 0.2),
+        ("dip", TransitionKind::DipToBlack, 0.6),
+    ] {
+        for fps in [30.0, 25.0] {
+            let (tl, assets) = enter(kind, secs);
+            run(&format!("late/{name} @{fps}"), &tl, &assets, fps, 2.0, EXACT);
+        }
+    }
 }
 
 #[test]

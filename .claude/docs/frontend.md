@@ -558,6 +558,33 @@ force), because the static `pos_x/pos_y` is not what an animated render reads;
 resizing always writes the static `size`. Pure logic (box math, keyframe upsert,
 row packing, snapping, span trim) is `src/lib/titles.ts`, bun-tested.
 
+**Transform handles in the Preview** (`TransformHandles.svelte`, pure math in `transform-handles.ts`). The selected clip's
+picture at the playhead (paused, not streaming, no proposal previewed, no trim monitor; not on a locked track, not a 360
+reframe) gets a box drawn **where the export puts it**: the canvas is `renderCanvas` (`export_format` without options — the
+delivery frame, else the first picture of the rendered cut, even sides, the delivery's fit), the box is
+`layer-geometry.ts`, a faithful port of kerf-core's `layer_geometry.rs` (crop / fit / second scale / rotate / overlay
+rounding, chroma grids, `pix_fmt_subsampling`) replayed against a Rust-written corpus (`core-render-plan.md`), at the
+clip's pose at the playhead (`transformAt`). A translucent picture of odd size, which the engine's geometry refuses for its
+pixels (FFmpeg's RGB round trip), is boxed as if opaque: opacity moves nothing; only a picture nothing draws (an empty
+crop) has no box. A click on a picture selects the topmost clip under it (later video tracks
+on top) and can carry straight into a move. Body = move, corners = scale about the centre, the knob = rotate, edges =
+crop — only under a Contain fit with position / scale / rotation unkeyed, and it moves the scale and position so the rest
+of the picture stays put (the export re-fits and re-centres a cropped window). Snapping (on with the timeline's snap
+toggle, **Alt** inverts it, 6 px) puts an edge or the centre of the bounds on the frame's edges and centre lines, the
+title-safe box and the platform chrome when the safe-area guides are drawn, and the other pictures' edges and centres;
+scale also stops at 100 %; rotation lands on a right angle within 5°, **Shift** turns in 15° steps and keeps a move to one
+axis — the tooltip names both with `settings.modLabel`. While held, the box is an exact ghost of the pose (D9: the picture
+under it settles on release) with a readout (`· key` when a keyed number is moving). **One `setTransformAt` on release**
+(`set_transform_at`: a keyed number keyed at the playhead, the rest static — one revision even when position x is keyed
+and y is not) at `keyTime` — the unrounded clip-local playhead, the moment the pose is sampled at (a 1 ms grid can land
+after it, where a hold still reads the old value); the Inspector's keyed writes use it too, so both hit one key. Only a
+number whose value, rounded as the gesture writes it, differs from the start is sent, so the other axis of a Shift move
+gets no key and a drag back to the start writes nothing; Escape / pointercancel / lost capture / blur abandon it.
+The handles count as page overlays for `routePreview` (`handles`), so on an X11 child-window surface the frame falls back
+to the JPEG while they show (a click on the surface itself never reaches the page there: select the clip in the timeline);
+under a transparent webview they draw over the surface. Not done: separate X / Y scale (the model has one `scale`; it
+needs a model, export-graph and GPU change), a live GPU picture during the drag (A3).
+
 
 The timeline toolbar carries a **delivery frame picker** (also View › Delivery frame; Source / 16:9 / 9:16 / 1:1 / 4:5,
 from `src/lib/delivery-formats.ts`, bun-tested) that sets `Timeline.format` — the
@@ -847,8 +874,8 @@ edits folds from a chevron in it, and its one legend line says what the two icon
 `+page.svelte` brings it forward once when a proposal lands (`editor.staged`
 going null → set) — a review nobody can see is not a review. Under **Quick
 edits**, four preset chips run an edit now (`quick-edits.ts`: `Remove silences` / `Frame for the delivery`
-/ `Caption the cut` (analyzes whatever is in the cut but not yet transcribed,
-then captions it) / `Cut to the beat` — which
+/ `Caption the cut` (analyzes whatever is in the cut but not yet transcribed — `cutAssets`, which
+leaves out titles on tracks: they have no asset — then captions it) / `Cut to the beat` — which
 analyzes whatever is on the audio tracks first, then calls `snap_to_beats`, and says
 "No cuts were near a beat" instead of claiming an alignment when the grid never reached
 them); **the task is recorded only after the edit has run** (`record`: add, then resolve), so a connected agent never sees a task it could claim and redo (short of a window of two IPC round trips: `add_task` has no already-done form, so the task is `queued` until the `resolve_task` that follows — closing it needs a backend command that creates it done), and a failed edit leaves nothing in the queue. The rest enqueue for the agent — `Assemble rough cut` is one of them now: it used to run the same silence removal as `Remove silences` under a bigger name. Remove silences acts on `quickTarget`: the footage of the selected clip, else the selected library asset, else the first picture on the cut, and says which (a line under the chips, the toast naming it, "Nothing to remove" when the cut did not change); the local chips are off while a proposal is previewed. In the browser there is no agent, so
@@ -1615,6 +1642,21 @@ browser's canvas (`css-color.ts`). Harness: `?empty=1` has no templates, `?templ
 `template-dev.ts` now refuses what core does (nested text controls, `attribute_name_ok`, control characters in name /
 description / label, a blank name falling back to the title's, Rust's `f64` grammar for numbers, 128 KiB after the
 splice). Tests: `template-ui`, `template-actions`, `template-wiring`, `css-color`, `api-templates`, `api-templates-changed` (the desktop half of `templates-changed`).
+
+**Titles on tracks in the editor.** A title clip is a `Clip` with `generator: {kind: 'title', name, svg, template?}` and
+`asset_id` `GENERATED_ASSET` (`types.ts`); `title-clips.ts` (bun-tested) is the pure side — `isTitleClip` / `titleOf` /
+`titleName`, `findTitle(timeline, id)` (a `TitleRef` for a floating title or a title clip: what `TemplateSection`, the save
+dialog and `setTemplateValue` read through `editor.titleById`), `titleClip` and `placeTitleClip` (kerf-core's placement: the named
+video track, else the lowest unlocked one free over the span, else a new `V{n}` on top). `api.ts`: `applyTemplateClip(templateId,
+values, start, duration?, trackId?, name?)`, `addTitleClip(svg, start, duration?, trackId?, name?)`, `updateTitleClip(clipId,
+patch)` → `TemplateEdit` with `clip_id`; `setTemplateValues` takes either id (the harness's `setTemplateValuesIn` answers
+`overlay` or `clip`, `applyTemplateClipTo` places one, and `setSpeed` refuses a title as the engine's invariant does).
+`editor.applyTemplateClip` / `addTitleClip` / `updateTitleClip` select the clip they made; `editor.select` of the generated asset
+looks nothing up. **Template card**: *Add to a track at the playhead* beside *Add at the playhead*. **Inspector**: a selected
+title clip shows its name with the template mark, a **Title** section (the name field, through `FieldEdits` like every plain
+field: `renameTitle` writes to the clip it took focus on) and the **Template** section of a floating title (`TemplateSection`
+takes `{id, svg, template}`), and has no Speed section; Timing, Fades, Transform (keyframes: an animated placement), Color, Mask
+and Transition are the clip's. Tests: `title-clips.test.ts`.
 
 **Animated SVG titles in the editor.** The engine draws the artwork (resvg, into every preview and export frame), so the
 page **never inlines the SVG** — `svg-titles.test.ts` fails on any `{@html}` / `innerHTML` in `src/` — and shows it only as an

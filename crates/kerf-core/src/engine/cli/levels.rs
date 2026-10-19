@@ -51,8 +51,8 @@ const LEVELS_POLL: Duration = Duration::from_millis(250);
 /// What the metering build of an export is run with: the argv, the meters it
 /// asks for and how long the measured span is.
 #[derive(Debug)]
-struct LevelsRun {
-    args: Vec<String>,
+pub(super) struct LevelsRun {
+    pub(super) args: Vec<String>,
     meters: Vec<Meter>,
     duration: f64,
 }
@@ -64,8 +64,9 @@ struct LevelsRun {
 ///
 /// `opts` is what the pass is *as if* exported with — `range` and `loudnorm`
 /// are the ones that matter here.
-fn build_levels_args(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions) -> Result<Option<LevelsRun>> {
-    let rendered = timeline.for_render();
+pub(super) fn build_levels_args(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions) -> Result<Option<LevelsRun>> {
+    let mut rendered = timeline.for_render();
+    drop_titles(&mut rendered);
     let sliced;
     let timeline = match effective_range(&rendered, opts) {
         Some((s, e)) => {
@@ -132,7 +133,8 @@ fn build_mix_pcm_args(
         range,
         ..ExportOptions::default()
     };
-    let rendered = timeline.for_render();
+    let mut rendered = timeline.for_render();
+    drop_titles(&mut rendered);
     let sliced;
     let timeline = match effective_range(&rendered, &opts) {
         Some((s, e)) => {

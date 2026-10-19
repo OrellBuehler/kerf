@@ -145,6 +145,8 @@ export interface RouteInputs {
 	empty: boolean;
 	/** A title box is over the picture. */
 	titlesShown: boolean;
+	/** A clip's transform handles are over the picture. */
+	handles: boolean;
 	/** The trim monitor stands in for the playhead's frame. */
 	trimMonitor: boolean;
 	/** Safe-area guides are drawn over the picture. */
@@ -173,7 +175,7 @@ export interface Route {
  * menu). Everything else is the JPEG path, unchanged.
  */
 export function routePreview(i: RouteInputs): Route {
-	const overlays = i.titlesShown || i.trimMonitor || i.guides;
+	const overlays = i.titlesShown || i.handles || i.trimMonitor || i.guides;
 	if (!i.enabled) return { via: 'jpeg', overlays, why: 'off' };
 	if (!i.supported) return { via: 'jpeg', overlays, why: 'unsupported' };
 	if (i.detached) return { via: 'jpeg', overlays, why: 'detached' };

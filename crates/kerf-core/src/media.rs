@@ -52,11 +52,25 @@ impl SourceMedia {
         if let (Some(video), Some(slot)) = (&self.video, decoded.streams.iter_mut().find(|s| s.kind == StreamKind::Video)) {
             // A proxy file has no spherical metadata of its own (the CLI writes no `sv3d` box), but
             // it holds the same projection, only smaller: that is the original's to say.
-            let projection = slot.projection;
+            let (projection, lead) = (slot.projection, slot.lead);
             *slot = video.clone();
             slot.projection = slot.projection.or(projection);
+            slot.lead = decoded_lead(&self.path, self.proxy, lead, video.lead);
         }
         decoded
+    }
+}
+
+/// The [`StreamInfo::lead`] of the picture decoded from `path` (pure): a head-padded proxy
+/// (`.lead.mp4`) starts at zero with its clone of the first frame and keeps the original's
+/// times after it, so the graph seeks and places it by the original's lead; any other proxy
+/// (of an ordinary file, of a transport stream, or one made while the source could not be
+/// probed) starts its picture where its own container does, and has its own (`proxy_lead`).
+pub(crate) fn decoded_lead(path: &str, proxy: bool, original_lead: f64, proxy_lead: f64) -> f64 {
+    if !proxy || crate::clip_timing::is_head_padded_proxy(path) {
+        original_lead
+    } else {
+        proxy_lead
     }
 }
 
@@ -141,6 +155,17 @@ mod tests {
         assert_eq!(kept.projection(), Some(crate::model::Projection::Equirect));
         assert_eq!((kept.streams[0].width, kept.streams[0].height), (Some(1280), Some(720)));
         assert_eq!((decoded.id, decoded.duration), (asset.id, asset.duration));
+        // A padded proxy starts at zero and keeps the original's times: the original's lead.
+        // Any other proxy's picture starts where its file does: its own.
+        let mut late = asset;
+        late.streams[0].lead = 0.5;
+        assert_eq!(proxy.decoded(&late).streams[0].lead, 0.0);
+        let padded = SourceMedia {
+            path: "/cache/kerf/proxies/0000000000000abc.lead.mp4".into(),
+            ..proxy
+        };
+        assert_eq!(padded.decoded(&late).streams[0].lead, 0.5);
+        assert_eq!(OriginalMedia.resolve(&late).decoded(&late).streams[0].lead, 0.5);
     }
 
     #[test]

@@ -46,6 +46,7 @@
 		colorAnimated,
 		colorAt,
 		isKeyed,
+		keyTime,
 		propertyAt,
 		propertyKeys,
 		transformAnimated,
@@ -77,8 +78,16 @@
 	import { tip } from '#lib/tip';
 	import ComposedMusic from './ComposedMusic.svelte';
 	import { scoreTitle } from '#lib/music-score';
+	import { titleName, titleOf } from '#lib/title-clips';
 
 	const clip = $derived(editor.selectedClip);
+	/** Rename the title clip the name field took focus on (one edit; an unchanged name writes nothing). */
+	function renameTitle({ scope: at, text }: { scope: Edit; text: string }) {
+		const c = clipOf(at);
+		const title = c ? titleOf(c) : null;
+		if (!c || !title || title.name === text.trim()) return;
+		void run(() => editor.updateTitleClip(c.id, { name: text }));
+	}
 	/** What a number row is editing: the clip or title and the playhead, as they are when an edit
 	 *  *begins* (`SliderRow` hands this back with the value). A typed entry is written by the click that
 	 *  selects another clip, and a run of arrow keys when focus leaves, so what is selected then is not
@@ -183,7 +192,9 @@
 		void run(() => editor.updateOverlay(ov.id, patch(text)));
 	}
 	const asset = $derived(clip ? editor.assets.find((a) => a.id === clip.asset_id) : undefined);
-	const kind = $derived(asset?.streams.some((s) => s.kind === 'video') ? 'video' : 'audio');
+	/** The title a title clip draws (a generated clip on a video track): a picture with no asset. */
+	const titleClip = $derived(clip ? titleOf(clip) : null);
+	const kind = $derived(titleClip || asset?.streams.some((s) => s.kind === 'video') ? 'video' : 'audio');
 	const hasAudio = $derived(asset?.streams.some((s) => s.kind === 'audio') ?? false);
 	/** The rate the clip's footage counts frames at — the In and Out are positions in *it*, not in the cut. */
 	const sourceFps = $derived(asset?.streams.find((s) => s.kind === 'video')?.fps || editor.fps);
@@ -221,7 +232,7 @@
 		return points[points.length - 1][1];
 	}
 	/** Seconds into the selected clip at the playhead (clip-local, what keys are in). */
-	const localTime = $derived(clip ? Math.max(0, ui.time - clip.timeline_start) : 0);
+	const localTime = $derived(clip ? keyTime(clip, ui.time) : 0);
 	// Every keyed number as the eased polyline the export draws, whichever of the legacy bundle and
 	// the numbers' own tracks drives it (`transformAt`).
 	const tf = $derived(clip ? transformAt(clip, localTime) : { ...DEFAULT_TRANSFORM });
@@ -233,8 +244,7 @@
 		if (!c) return;
 		const animatable = Object.keys(patch).every((k) => ANIM_KEYS.has(k));
 		if (c.keyframes?.length && animatable) {
-			const time = Math.max(0, at.time - c.timeline_start);
-			return run(() => editor.addKeyframe(c.id, Math.round(time * 1000) / 1000, patch as Record<string, number>));
+			return run(() => editor.addKeyframe(c.id, keyTime(c, at.time), patch as Record<string, number>));
 		} else if (animatable && transformAnimated(c)) {
 			// Numbers keyed on their own (no whole-transform keys): a key at the playhead for each
 			// of those, the static transform for the rest.
@@ -248,21 +258,19 @@
 			return run(() => editor.setTransform(c.id, patch));
 		}
 	}
-	/** A key for `prop` at the playhead (clip-local, to the millisecond), put in as the backend does:
+	/** A key for `prop` at the playhead ([`keyTime`]), put in as the backend does:
 	 *  re-keying a moment keeps how it leaves, a key inside a segment splits it. */
 	function keyAtPlayhead(c: Clip, prop: Property, value: number, playhead: number = ui.time) {
-		const time = Math.round(Math.max(0, playhead - c.timeline_start) * 1000) / 1000;
-		return editor.setPropertyKeyframes(c.id, prop, upsertKey(propertyKeys(c, prop), { time, value }));
+		return editor.setPropertyKeyframes(c.id, prop, upsertKey(propertyKeys(c, prop), { time: keyTime(c, playhead), value }));
 	}
 	/** The ◆ beside a number: key it at the playhead at the value it has there, or — a key already
 	 *  sits there — take that key out (the last one makes the number static again). */
 	function toggleKey(prop: Property) {
 		const c = clip;
 		if (!c) return;
-		const time = Math.round(localTime * 1000) / 1000;
 		const keys = propertyKeys(c, prop);
-		if (keys.some((k) => Math.abs(k.time - time) <= 0.02)) {
-			void run(() => editor.setPropertyKeyframes(c.id, prop, keys.filter((k) => Math.abs(k.time - time) > 0.02)));
+		if (keys.some((k) => Math.abs(k.time - localTime) <= 0.02)) {
+			void run(() => editor.setPropertyKeyframes(c.id, prop, keys.filter((k) => Math.abs(k.time - localTime) > 0.02)));
 		} else {
 			void run(() => keyAtPlayhead(c, prop, propertyAt(c, prop, localTime)));
 		}
@@ -357,10 +365,7 @@
 		if (!c) return;
 		const animatable = Object.keys(patch).every((k) => CAM_KEYS.has(k));
 		if (c.reframe?.keyframes?.length && animatable) {
-			const time = Math.max(0, at.time - c.timeline_start);
-			return run(() =>
-				editor.addReframeKeyframe(c.id, Math.round(time * 1000) / 1000, patch as Record<string, number>)
-			);
+			return run(() => editor.addReframeKeyframe(c.id, keyTime(c, at.time), patch as Record<string, number>));
 		} else {
 			return run(() => editor.setReframe(c.id, patch));
 		}
@@ -526,8 +531,7 @@
 	function addKeyframeHere() {
 		const c = clip;
 		if (!c) return;
-		const time = Math.max(0, ui.time - c.timeline_start);
-		void run(() => editor.addKeyframe(c.id, Math.round(time * 1000) / 1000));
+		void run(() => editor.addKeyframe(c.id, keyTime(c, ui.time)));
 	}
 	function setEasing(el: HTMLSelectElement, k: { time: number }, was: string) {
 		// Pending, not disabled, so the keys still reach the select: nothing is written, and it goes back.
@@ -1322,14 +1326,14 @@
 						? VIDEO_THUMB_BG
 						: 'var(--track-audio)'};display:grid;place-items:center;color:color-mix(in srgb,var(--text-on-video) 80%,transparent)"
 				>
-					<Icon n={picture ? 'video' : 'audio-waveform'} s={14} />
+					<Icon n={titleClip ? 'layout-template' : picture ? 'video' : 'audio-waveform'} s={14} />
 				</div>
 				<div style="flex:1;min-width:0">
 					<div
 						style="font-size:13px;font-weight:500;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
-						use:tip={asset?.name ?? 'clip'}
+						use:tip={titleClip ? titleName(titleClip) : (asset?.name ?? 'clip')}
 					>
-						{asset?.name ?? 'clip'}
+						{titleClip ? titleName(titleClip) : (asset?.name ?? 'clip')}
 					</div>
 					<div style="margin-top:3px;display:flex;align-items:center;gap:5px;flex-wrap:wrap">
 						<Badge tone="neutral">{track?.name ?? (picture ? 'video' : 'audio')}</Badge>
@@ -1430,6 +1434,30 @@
 			{@render rangeRow('Fade out', clip.fade_out, fadeSpec(clip), (v, at) => setFade(at, { fade_out: v }), undefined, liveFade((v) => ({ fade_out: v })))}
 			</InspectorSection>
 
+			{#if titleClip}
+				<!-- A title on a track: its name, then its template's controls (or, for custom artwork, a way to keep it as a
+				     template). Its timing, fades, transition and transform are the clip's own sections. -->
+				<InspectorSection title="Title" summary={titleClip.template ? 'Template' : 'Custom SVG'} open>
+					<div style="display:flex;align-items:center;gap:8px">
+						<span style="font-size:12px;color:var(--text-muted);width:44px">Name</span>
+						<input
+							type="text"
+							value={titleClip.name}
+							aria-label="Title name"
+							readonly={editor.locked}
+							onfocus={noteFocus}
+							oninput={noteTyped}
+							oncompositionend={noteTyped}
+							onchange={(e) => renameTitle(endEdit(e.currentTarget))}
+							style="flex:1;min-width:0;box-sizing:border-box;height:var(--control-sm);background:var(--surface-inset);border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);color:var(--text-primary);font-size:var(--text-sm);padding:0 8px"
+						/>
+					</div>
+					<div style="font-size:12px;line-height:1.4;color:var(--text-muted);margin-top:6px">
+						A title on a track takes transitions and fades, and holds its last frame when you extend it.
+					</div>
+				</InspectorSection>
+				<TemplateSection o={{ id: clip.id, svg: titleClip.svg, template: titleClip.template }} />
+			{:else}
 			<InspectorSection title="Speed" summary={`${Math.abs(speed).toFixed(2)}×${speed < 0 ? ' · reverse' : ''}`}>
 			{@render rangeRow('Rate', Math.abs(speed), { min: 0.25, max: 4, step: 0.25, neutral: 1, ...TIMES }, (v, at) => {
 				const c = clipOf(at);
@@ -1439,6 +1467,7 @@
 				Reverse
 			</CheckRow>
 			</InspectorSection>
+			{/if}
 
 			{#if picture && (reframe || sourceProjection)}
 				<InspectorSection title="360 reframe" summary={reframe ? (reframeKeys.length ? `Animated · ${count(reframeKeys.length, 'key')}` : 'On') : 'Off'}>
@@ -1472,7 +1501,7 @@
 								run(() =>
 									editor.addReframeKeyframe(
 										clip.id,
-										Math.round(Math.max(0, ui.time - clip.timeline_start) * 1000) / 1000
+										keyTime(clip, ui.time)
 									)
 								)}>Camera key</Btn
 						>

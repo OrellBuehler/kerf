@@ -9,7 +9,9 @@
 import { checkRect, MAX_SVG_OVERLAYS } from './svg-dev';
 import { svgDisplayName } from './svg-titles';
 import { plainDecimal, validSvgColor } from './template-ui';
+import { checkTitleSpan, findTitle, placeTitleClip, titleClip, titleName, titleOf } from './title-clips';
 import type {
+	Clip,
 	ImportOutcome,
 	SvgElementId,
 	SvgLayout,
@@ -481,14 +483,14 @@ export function saveTemplateFrom(
 	description: string | null | undefined,
 	controls: TemplateControl[]
 ): TemplateSaved {
-	const o = timeline.svg_overlays?.find((t) => t.id === overlayId);
+	const o = findTitle(timeline, overlayId);
 	if (!o) throw invalid(`animated title not found: ${overlayId}`);
-	const duration = Math.max(o.end - o.start, 0) + (o.offset ?? 0);
+	const duration = o.duration;
 	if (!Number.isFinite(duration) || duration <= 0 || duration > MAX_SVG_SECONDS) {
 		throw invalid('the title has no length to make a template of');
 	}
 	// A blank name is the title's own display name, as `build_template` has it.
-	const title = name.trim() || svgDisplayName(o);
+	const title = name.trim() || o.name;
 	const about = (description ?? '').trim();
 	checkText('the name', title, MAX_NAME_CHARS, true);
 	checkText('the description', about, MAX_DESCRIPTION_CHARS, false);
@@ -556,12 +558,67 @@ export function applyTemplateTo(
 	return { overlay: structuredClone(overlay), warnings: [] };
 }
 
-/** `set_template_values` over a timeline object: re-splice the title's own artwork; the id, timing and placement stay. */
+/** `apply_template` with `on_track` (`apply_template_clip`) over a timeline object: the template's artwork with `values`
+ *  spliced in, as a title clip from `start` for `duration` seconds (the template's own length by default), placed as
+ *  kerf-core places one (`placeTitleClip`). */
+export function applyTemplateClipTo(
+	timeline: Timeline,
+	templateId: string,
+	values: Record<string, string>,
+	start: number,
+	duration: number | null | undefined,
+	trackId?: string | null,
+	name?: string | null
+): { clip: Clip; warnings: string[] } {
+	checkId(templateId);
+	const entry = library.get(templateId);
+	if (!entry) throw missing(templateId);
+	const { info } = entry;
+	const svg = applyValues(entry.svg, info.controls, values);
+	const length = duration ?? info.duration;
+	checkTitleSpan(start, length);
+	const clip = titleClip(
+		{
+			name: name?.trim() || info.name,
+			svg,
+			template: {
+				template_id: info.id,
+				name: info.name,
+				controls: structuredClone(info.controls),
+				values: readValues(svg, info.controls)
+			}
+		},
+		Math.max(0, start),
+		length
+	);
+	placeTitleClip(timeline, clip, trackId);
+	return { clip: structuredClone(clip), warnings: [] };
+}
+
+/** `set_template_values` over a timeline object: re-splice the title's own artwork; the id, timing and placement stay.
+ *  The id may name a floating title or a title clip. */
 export function setTemplateValuesIn(
 	timeline: Timeline,
 	overlayId: string,
 	values: Record<string, string>
-): { overlay: SvgOverlay; warnings: string[] } {
+): { overlay?: SvgOverlay; clip?: Clip; warnings: string[] } {
+	for (const track of timeline.tracks) {
+		const at = track.clips.findIndex((c) => c.id === overlayId);
+		const title = at >= 0 ? titleOf(track.clips[at]) : null;
+		if (at < 0) continue;
+		if (!title) throw invalid(`the clip ${overlayId} is not a title`);
+		if (!title.template) throw invalid(`“${titleName(title)}” is not a template title, so it has no values to set`);
+		const svg = applyValues(title.svg, title.template.controls, values);
+		const next = structuredClone(track.clips[at]);
+		next.generator = {
+			kind: 'title',
+			...title,
+			svg,
+			template: { ...structuredClone(title.template), values: readValues(svg, title.template.controls) }
+		};
+		track.clips[at] = next;
+		return { clip: structuredClone(next), warnings: [] };
+	}
 	const at = timeline.svg_overlays?.findIndex((o) => o.id === overlayId) ?? -1;
 	if (at < 0) throw invalid(`animated title not found: ${overlayId}`);
 	const o = timeline.svg_overlays![at];

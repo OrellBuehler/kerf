@@ -17,6 +17,7 @@
 
 import { trimEdit } from './frames';
 import { DIFF_EPS, rippleFrom } from './ripple';
+import { isTitleClip, MAX_TITLE_SECONDS } from './title-clips';
 import type { Clip, Track } from './types';
 import { clipDuration } from './types';
 
@@ -32,7 +33,9 @@ export interface TrimBounds {
 /**
  * Where the `edge` of `clip` may be dragged. `clips` is its track, sorted by start
  * (the clip among them); `assetDuration` is the source's length, `still` a looping
- * still (no source limit). With `ripple` the neighbours are not a limit.
+ * still (no source limit). A title on a track has no asset: its document runs 24 h, so its
+ * right edge extends that far and its left edge back to the document's start. With `ripple`
+ * the neighbours are not a limit.
  *
  * Unused source on the side being extended: a forward clip's left edge draws on
  * the handle below `source_in`, its right edge on the handle past `source_out`; a
@@ -48,6 +51,7 @@ export function trimBounds(
 ): TrimBounds {
 	const sp = clip.speed ?? 1;
 	const mag = Math.max(Math.abs(sp), 0.01);
+	if (isTitleClip(clip)) assetDuration = MAX_TITLE_SECONDS;
 	const start = clip.timeline_start;
 	const end = start + clipDuration(clip);
 	const i = clips.findIndex((x) => x.id === clip.id);

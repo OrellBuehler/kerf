@@ -13,6 +13,7 @@ use uuid::Uuid;
 use crate::captions_import::{CaptionFile, CaptionImportRequest, ImportSummary, MAX_CAPTION_OFFSET, MAX_IMPORTED_CAPTIONS};
 use crate::engine::{self, ExportProgress};
 use crate::error::{Error, Result};
+use crate::model::Color;
 use crate::model::Grade;
 use crate::model::MarkerPatch;
 use crate::model::{default_beat_tolerance, fmt_time};
@@ -26,10 +27,9 @@ use crate::model::{
     MAX_SVG_SECONDS, MIN_FOV, MIN_SPEED,
 };
 use crate::model::{AutoIncluded, SkippedChange, StagedAssetChange};
-use crate::model::{Color, Transform};
 use crate::model::{Detached, DetachedMany};
-use crate::model::{Property, PropertyKey, PropertyTrack};
-use crate::model::{SvgOverlay, SvgOverlayPatch, SvgPreset};
+use crate::model::{Property, PropertyKey, PropertyTrack, TransformPatch};
+use crate::model::{SvgOverlay, SvgOverlayPatch, SvgPreset, GENERATED_ASSET};
 use crate::svg::{check_params, SvgDoc};
 
 /// Where an animated title's artwork comes from.
@@ -1764,7 +1764,7 @@ impl Project {
         for track in timeline.tracks.iter().filter(|t| t.kind == StreamKind::Video) {
             for clip in &track.clips {
                 let reaches = clip.timeline_end() > from && to.is_none_or(|to| clip.timeline_start <= to);
-                if reaches && !wanted.contains(&clip.asset_id) {
+                if reaches && !clip.is_generated() && !wanted.contains(&clip.asset_id) {
                     wanted.push(clip.asset_id);
                 }
             }
@@ -2020,12 +2020,12 @@ impl Project {
         // A span entirely past the end would fall back to measuring the whole cut
         // (that is what a range export does with one) — and answer a question that
         // was not asked. Say so instead.
-        let cut = timeline.for_render().duration();
-        if let Some(r) = range.filter(|r| cut > 0.0 && r.start >= cut) {
-            return Err(Error::InvalidArgument(format!(
-                "range starts at {:.1}s but the cut is only {cut:.1}s long",
-                r.start
-            )));
+        // An empty cut is measured as one (nothing to hear), not refused.
+        if let Some(why) = range
+            .filter(|_| timeline.untitled_duration() > 0.0)
+            .and_then(|r| timeline.range_past_the_sound(r.start))
+        {
+            return Err(Error::InvalidArgument(why));
         }
         let measured = engine::mix_levels(timeline, assets, range, loudnorm, cancel)?;
         let tracks = timeline
@@ -2139,6 +2139,10 @@ impl Project {
                 // must not convert it again.
                 *asset = asset.as_sdr_proxy();
                 asset.path = source.to_string_lossy().into_owned();
+                // Only a padded proxy keeps the original's lead (`media::decoded_lead`).
+                for s in asset.streams.iter_mut().filter(|s| s.kind == StreamKind::Video) {
+                    s.lead = crate::media::decoded_lead(&asset.path, true, s.lead, 0.0);
+                }
             }
         }
         assets
@@ -3194,7 +3198,7 @@ impl Project {
     fn refuse_removed_media(&self, timeline: &Timeline) -> Result<()> {
         let mut wanted: Vec<Uuid> = Vec::new();
         for clip in timeline.tracks.iter().flat_map(|t| t.clips.iter()) {
-            if !wanted.contains(&clip.asset_id) {
+            if !clip.is_generated() && !wanted.contains(&clip.asset_id) {
                 wanted.push(clip.asset_id);
             }
         }
@@ -3686,12 +3690,13 @@ impl Project {
 
     /// How far each asset's footage reaches — what roll, slip and slide clamp a
     /// clip's source window to ([`crate::model::Asset::source_limit`]: the
-    /// duration, infinite for a still).
+    /// duration, infinite for a still), and a generated title's document its first 24 hours.
     pub fn source_limits(&self) -> Result<SourceLimits> {
         Ok(self
             .list_assets()?
             .into_iter()
             .map(|asset| (asset.id, asset.source_limit()))
+            .chain([(GENERATED_ASSET, MAX_SVG_SECONDS)])
             .collect())
     }
 
@@ -4311,7 +4316,7 @@ impl Project {
         crop_top: Option<f64>,
         crop_bottom: Option<f64>,
     ) -> Result<Clip> {
-        Transform::check_values(
+        let patch = TransformPatch {
             scale,
             pos_x,
             pos_y,
@@ -4321,39 +4326,32 @@ impl Project {
             crop_right,
             crop_top,
             crop_bottom,
-        )?;
-        self.edit_timeline("Set transform", |timeline| {
+        };
+        patch.check_values()?;
+        self.edit_timeline("Set transform", move |timeline| {
             let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
             let t = &mut timeline.tracks[ti].clips[ci].transform;
-            if let Some(v) = scale {
-                t.scale = v;
-            }
-            if let Some(v) = pos_x {
-                t.pos_x = v;
-            }
-            if let Some(v) = pos_y {
-                t.pos_y = v;
-            }
-            if let Some(v) = rotation {
-                t.rotation = v;
-            }
-            if let Some(v) = opacity {
-                t.opacity = v;
-            }
-            if let Some(v) = crop_left {
-                t.crop_left = v;
-            }
-            if let Some(v) = crop_right {
-                t.crop_right = v;
-            }
-            if let Some(v) = crop_top {
-                t.crop_top = v;
-            }
-            if let Some(v) = crop_bottom {
-                t.crop_bottom = v;
-            }
+            patch.apply(t);
             t.check_crop()?;
             Ok(timeline.tracks[ti].clips[ci].clone())
+        })
+    }
+
+    /// Set a clip's transform as it should look `time` seconds into the clip, as one revision:
+    /// a number that is animated gets a key there (in the whole-transform keyframes or in its own
+    /// track, whichever drives it) and every other number — the crop edges always — its static
+    /// value. What dragging a clip in the Preview writes.
+    pub fn set_transform_at(&self, clip_id: Uuid, time: f64, patch: TransformPatch) -> Result<Clip> {
+        if !time.is_finite() || time < 0.0 {
+            return Err(Error::InvalidArgument("time must be >= 0".to_string()));
+        }
+        patch.check_values()?;
+        self.edit_timeline("Set transform", move |timeline| {
+            let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
+            let clip = &mut timeline.tracks[ti].clips[ci];
+            clip.pose_transform(time, &patch);
+            clip.transform.check_crop()?;
+            Ok(clip.clone())
         })
     }
 
@@ -5085,7 +5083,8 @@ impl Project {
     pub fn detach_audio(&self, clip_id: Uuid) -> Result<Detached> {
         let timeline = self.working_timeline()?;
         let clip = timeline.clip(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
-        let has_audio = self.require_asset(clip.asset_id)?.has_audio();
+        // A title has no asset; the timeline says why it has nothing to detach.
+        let has_audio = !clip.is_generated() && self.require_asset(clip.asset_id)?.has_audio();
         self.edit_timeline_exact("Detach audio", |timeline| timeline.detach_audio(clip_id, has_audio))
     }
 
@@ -5098,7 +5097,7 @@ impl Project {
         let timeline = self.working_timeline()?;
         let mut has_audio: HashMap<Uuid, bool> = HashMap::new();
         for id in clip_ids {
-            if let Some(clip) = timeline.clip(*id) {
+            if let Some(clip) = timeline.clip(*id).filter(|c| !c.is_generated()) {
                 if let std::collections::hash_map::Entry::Vacant(slot) = has_audio.entry(clip.asset_id) {
                     slot.insert(self.require_asset(clip.asset_id)?.has_audio());
                 }
@@ -5487,6 +5486,7 @@ impl Project {
                     color_primaries: None,
                     pix_fmt: None,
                     color_space: None,
+                    lead: 0.0,
                 },
                 StreamInfo {
                     index: 1,
@@ -5504,6 +5504,7 @@ impl Project {
                     color_primaries: None,
                     pix_fmt: None,
                     color_space: None,
+                    lead: 0.0,
                 },
             ],
             imported_at: Utc::now(),
@@ -5533,6 +5534,7 @@ impl Project {
                 color_primaries: None,
                 pix_fmt: None,
                 color_space: None,
+                lead: 0.0,
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
@@ -7267,6 +7269,8 @@ pub use store::{backup_path as schema_backup_path, SCHEMA_VERSION};
 mod exports;
 pub use exports::{DeliveryInputs, ExportedFile};
 mod templates;
+mod title_clips;
+pub use title_clips::{TitleClipPatch, TitleClipPlacement, TitleClipResult, TitleEdited};
 
 /// A window onto a long, ordered list (the edit history, the task queue): `offset` of the
 /// **newest** entries are skipped and up to `limit` of the ones before them returned, kept in
@@ -7771,6 +7775,7 @@ mod tests {
             color_primaries: None,
             pix_fmt: None,
             color_space: None,
+            lead: 0.0,
         }
     }
 
@@ -7791,6 +7796,7 @@ mod tests {
             color_primaries: None,
             pix_fmt: None,
             color_space: None,
+            lead: 0.0,
         }
     }
 
@@ -8561,6 +8567,7 @@ mod tests {
                 color_primaries: None,
                 pix_fmt: None,
                 color_space: None,
+                lead: 0.0,
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
@@ -9467,6 +9474,54 @@ mod tests {
     }
 
     #[test]
+    fn a_pose_keys_what_is_keyed_and_sets_the_rest_in_one_revision() {
+        let (project, clip) = channel_project();
+        project
+            .set_property_keyframes(clip.id, Property::PosX, vec![pk(0.0, 0.0), pk(4.0, 0.4)])
+            .unwrap();
+        let before = project.history().unwrap().len();
+        let patch = TransformPatch {
+            pos_x: Some(-0.25),
+            pos_y: Some(0.1),
+            crop_right: Some(0.2),
+            ..TransformPatch::default()
+        };
+        let posed = project.set_transform_at(clip.id, 2.0, patch).unwrap();
+        assert_eq!(
+            project.history().unwrap().len(),
+            before + 1,
+            "one revision for the whole pose"
+        );
+        assert_eq!(project.history().unwrap().last().unwrap().label, "Set transform");
+        assert_eq!(posed.property_at(Property::PosX, 2.0), -0.25);
+        assert_eq!((posed.transform.pos_y, posed.transform.crop_right), (0.1, 0.2));
+        assert!(posed.keyframes.is_empty());
+
+        // Refused before anything is written: a bad time, a bad number, a crop of everything.
+        for (time, patch) in [
+            (-1.0, TransformPatch::default()),
+            (f64::NAN, TransformPatch::default()),
+            (
+                0.0,
+                TransformPatch {
+                    scale: Some(0.0),
+                    ..TransformPatch::default()
+                },
+            ),
+            (
+                0.0,
+                TransformPatch {
+                    crop_left: Some(0.9),
+                    ..TransformPatch::default()
+                },
+            ),
+        ] {
+            assert!(project.set_transform_at(clip.id, time, patch).is_err(), "{time} {patch:?}");
+        }
+        assert_eq!(project.history().unwrap().len(), before + 1);
+    }
+
+    #[test]
     fn a_property_gets_keys_of_its_own_and_loses_them_by_setting_none() {
         let (project, clip) = channel_project();
         let edited = project
@@ -9991,6 +10046,7 @@ mod tests {
                 color_primaries: None,
                 pix_fmt: None,
                 color_space: None,
+                lead: 0.0,
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
@@ -10038,6 +10094,7 @@ mod tests {
                 color_primaries: None,
                 pix_fmt: None,
                 color_space: None,
+                lead: 0.0,
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
@@ -10092,6 +10149,7 @@ mod tests {
                 color_primaries: None,
                 pix_fmt: None,
                 color_space: None,
+                lead: 0.0,
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
@@ -10201,6 +10259,7 @@ mod tests {
                 color_primaries: None,
                 pix_fmt: None,
                 color_space: None,
+                lead: 0.0,
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),
@@ -10265,6 +10324,7 @@ mod tests {
                 color_primaries: None,
                 pix_fmt: None,
                 color_space: None,
+                lead: 0.0,
             }],
             imported_at: Utc::now(),
             source_paths: Vec::new(),

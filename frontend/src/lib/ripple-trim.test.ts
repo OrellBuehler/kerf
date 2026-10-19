@@ -3,7 +3,8 @@ import { MIN_CLIP, rippleTrimPreview, trimBounds } from './ripple-trim';
 import { addClip, getTimeline, listAssets, revertTo, setRippleMode, trimClip } from './api';
 import { trimEdit } from './frames';
 import type { Clip, Track } from './types';
-import { clipDuration } from './types';
+import { clipDuration, GENERATED_ASSET } from './types';
+import { MAX_TITLE_SECONDS } from './title-clips';
 
 /** A forward clip of `dur` seconds at `start`, cut from `[sourceIn, sourceIn + dur)`. */
 function clip(id: string, start: number, dur: number, sourceIn = 0, extra: Partial<Clip> = {}): Clip {
@@ -68,6 +69,29 @@ describe('trimBounds without ripple', () => {
 	test('speed stretches how far a handle reaches on the timeline', () => {
 		const fast = clip('f', 20, 5, 3, { speed: 2, source_out: 13 }); // 10 source s at 2x = 5 s
 		expect(trimBounds(fast, 'l', [fast], 100, false, false).min).toBe(20 - 3 / 2);
+	});
+});
+
+describe('trimBounds on a title clip', () => {
+	// A title on a track: no asset, its document runs 24 h. Its source [2, 7) has 2 s of head.
+	const title = clip('t', 20, 5, 2, {
+		asset_id: GENERATED_ASSET,
+		generator: { kind: 'title', name: 'End card', svg: '<svg/>' }
+	});
+
+	test('its right edge extends to the end of its document, whatever the caller knows of an asset', () => {
+		const end = 25 + MAX_TITLE_SECONDS - 7;
+		expect(trimBounds(title, 'r', [title], undefined, false, false)).toEqual({ min: 20 + MIN_CLIP, max: end });
+		expect(trimBounds(title, 'r', [title], undefined, false, true).max).toBe(end);
+		// A neighbour still stops it without ripple.
+		const next = clip('n', 40, 5);
+		expect(trimBounds(title, 'r', [title, next], undefined, false, false).max).toBe(40);
+	});
+
+	test('its left edge reaches back only to the start of its document', () => {
+		expect(trimBounds(title, 'l', [title], undefined, false, false)).toEqual({ min: 18, max: 25 - MIN_CLIP });
+		const fresh = { ...title, source_in: 0, source_out: 5 };
+		expect(trimBounds(fresh, 'l', [fresh], undefined, false, true).min).toBe(20);
 	});
 });
 

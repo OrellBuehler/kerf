@@ -106,7 +106,8 @@ ripple closed — the transcript-editing primitive), `add_track`, `remove_track`
 width/height to clear it), `remove_clip`, `remove_clips { clipIds, ripple? }`
 (one revision; `ripple: true` is the multi-select ripple delete, via
 `with_ripple`; omitted follows the project's mode), `set_volume`, `set_fade`,
-`set_speed`, `set_transform`, `set_color`, `set_transition`, `set_mask`,
+`set_speed`, `set_transform`, `set_transform_at { clipId, time, …transform fields }` (one revision: a keyed number keyed at
+`time`, the rest and the crop static — what a Preview handle drag writes), `set_color`, `set_transition`, `set_mask`,
 `set_grade { clipId, grade }` (curves / wheels / LUT; a LUT path the clip did not have is checked off the lock,
 `blocking`, so a curve edit on a clip whose LUT went missing still applies),
 `inspect_lut { path }` (→ `LutInfo {path, size, title}`, or why it is not a usable `.cube`),
@@ -147,8 +148,12 @@ released → `TemplateSaved {info, warnings}`. **`apply_template { templateId, v
 sanitiser) *before* `lock_user`, which then only runs `apply_template_parsed`; **`set_template_values { overlayId, values }`**
 takes the title under the lock (`template_edit_inputs`), prepares with it released and stores with
 `set_template_values_parsed`, which refuses a title that changed meanwhile ("try again"). Both resolve to
-`TemplateEdit {timeline, overlay_id, warnings}` — the refreshed cut, the title made or changed, and what the sanitiser or the
-machine could not honour. The library is app-level (not undone, not staged);
+`TemplateEdit {timeline, overlay_id?, clip_id?, warnings}` — the refreshed cut, the title made or changed (`overlay_id` for a
+floating one, `clip_id` for one on a track), and what the sanitiser or the machine could not honour. **Titles on tracks**:
+`apply_template_clip { templateId, values, start, duration?, trackId?, name? }` (prepared before the lock, then
+`apply_template_clip_parsed`), `add_title_clip { svg, start, duration?, trackId?, name? }` (`SvgDoc::parse` before the lock) and
+`update_title_clip { clipId, patch: TitleClipPatch }` answer a `TemplateEdit` with `clip_id`; `set_template_values` takes a title
+clip's id as `overlayId` (`set_title_values_parsed`). The library is app-level (not undone, not staged);
 `generate_captions` / `clear_captions` (caption the whole cut, in timeline
 time), `import_captions` / `import_captions_text` (a subtitle file by path / by text —
 the text variant is what an `<input type=file>` or a paste uses; both return
@@ -363,13 +368,13 @@ comes back `ForbiddenUrl` and the "Release notes" button silently does nothing.
 `set_delivery_format`, `concatenate`, `remove_silence`, `snap_to_beats`, `smart_crop`, `cancel_smart_crop`;
 *linked A/V* `extract_audio`, `add_asset_audio`, `detach_audio`, `detach_audio_clips`, `reattach_audio`,
 `reattach_audio_clips`, `link_clips`, `unlink_clips`; *clip properties* `set_volume`, `set_fade`, `set_speed`,
-`set_transform`, `set_color`, `set_grade`, `inspect_lut`, `set_transition`, `set_mask`, `set_video_effects`, `set_audio_effects`, `set_keyframes`,
+`set_transform`, `set_transform_at`, `set_color`, `set_grade`, `inspect_lut`, `set_transition`, `set_mask`, `set_video_effects`, `set_audio_effects`, `set_keyframes`,
 `add_keyframe`, `set_keyframe_easing`, `set_property_keyframes`, `set_property_tracks`, `copy_keyframes`, `clear_keyframes`, `set_reframe`,
 `clear_reframe`, `set_reframe_keyframes`, `add_reframe_keyframe`; *markers, text, titles, captions* `add_marker`,
 `update_marker`, `remove_marker`, `add_overlay`, `update_overlay`, `remove_overlay`, `set_overlay_keyframes`,
 `add_svg_overlay`, `update_svg_overlay`, `remove_svg_overlay`, `validate_svg`, `list_svg_presets`,
 `svg_preset_preview`, `list_templates`, `template_poster`, `svg_element_ids`, `template_image_value`, `save_template`,
-`apply_template`, `set_template_values`, `import_template`, `export_template`, `delete_template`, `generate_captions`, `clear_captions`, `import_captions`, `import_captions_text`, `export_srt`, `export_captions`, `export_interchange`, `export_markers`,
+`apply_template`, `apply_template_clip`, `add_title_clip`, `update_title_clip`, `set_template_values`, `import_template`, `export_template`, `delete_template`, `generate_captions`, `clear_captions`, `import_captions`, `import_captions_text`, `export_srt`, `export_captions`, `export_interchange`, `export_markers`,
 `refine_transcript`;
 *history and review* `get_history`, `revision_diff`, `undo`, `redo`, `revert_to`, `get_staged_edit`,
 `get_staged_timeline`, `apply_staged_edit`, `apply_staged_subset`, `discard_staged_edit`, `undo_staged_edit`,

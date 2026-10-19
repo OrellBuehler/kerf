@@ -1481,6 +1481,7 @@ mod tests {
             color_primaries: None,
             color_space: None,
             pix_fmt: None,
+            lead: 0.0,
         }
     }
 
