@@ -8,6 +8,9 @@ import type { Clip, TemplateInstance, Timeline, TitleClip } from './types';
 /** The most seconds a title runs (`MAX_SVG_SECONDS`, 24 h). */
 export const MAX_TITLE_SECONDS = 24 * 3600;
 
+/** Most titles a timeline holds on its tracks (`MAX_TITLE_CLIPS`). */
+export const MAX_TITLE_CLIPS = 50;
+
 /** Whether `c` is a title on a track. */
 export const isTitleClip = (c: Pick<Clip, 'generator'>): boolean => c.generator?.kind === 'title';
 
@@ -81,6 +84,9 @@ const clipEnd = (c: Clip): number => c.timeline_start + (c.source_out - c.source
  *  way over its span, or a new video track on top named after the count (`V3`). Returns the track's id. Mutates
  *  `timeline`. An explicit track that already holds a clip over the span refuses, as the engine's lane check does. */
 export function placeTitleClip(timeline: Timeline, clip: Clip, trackId?: string | null): string {
+	if (timeline.tracks.flatMap((t) => t.clips).filter(isTitleClip).length >= MAX_TITLE_CLIPS) {
+		throw new Error(`a timeline holds at most ${MAX_TITLE_CLIPS} titles on its tracks; remove one first`);
+	}
 	const start = clip.timeline_start;
 	const end = clipEnd(clip);
 	const free = (t: Timeline['tracks'][number]) =>

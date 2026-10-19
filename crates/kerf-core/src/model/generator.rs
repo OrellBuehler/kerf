@@ -23,6 +23,15 @@ use super::{fmt_time, Clip, StreamKind, Timeline, MAX_SVG_SECONDS};
 /// The `asset_id` of every generated clip: the nil id, which no imported asset has.
 pub const GENERATED_ASSET: Uuid = Uuid::nil();
 
+/// Most titles one timeline holds on its tracks, as [`super::MAX_SVG_OVERLAYS`] bounds the floating ones: each
+/// carries its whole document, which a split copies, and each is drawn picture by picture.
+pub const MAX_TITLE_CLIPS: usize = 50;
+
+/// The message a title past [`MAX_TITLE_CLIPS`] is refused with.
+pub(crate) fn too_many_titles() -> String {
+    format!("a timeline holds at most {MAX_TITLE_CLIPS} titles on its tracks; remove one first")
+}
+
 /// What a generated clip draws. Tagged by `kind` in the JSON.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -121,6 +130,31 @@ impl Timeline {
             .filter(|t| t.kind == StreamKind::Video)
             .flat_map(|t| t.clips.iter())
             .filter_map(|c| c.title_clip().map(|t| (c, t)))
+    }
+
+    /// How long the cut runs without its titles on tracks, which have no sound: what a pass over the mix (levels,
+    /// band balance) renders, so the span a range on it is checked against.
+    pub fn untitled_duration(&self) -> f64 {
+        let mut cut = self.for_render();
+        for track in &mut cut.tracks {
+            track.clips.retain(|c| !c.is_generated());
+        }
+        cut.duration()
+    }
+
+    /// Why a range starting at `start` measures nothing of the mix, when it does not (see
+    /// [`Self::untitled_duration`]).
+    pub(crate) fn range_past_the_sound(&self, start: f64) -> Option<String> {
+        let cut = self.untitled_duration();
+        if cut > 0.0 && start < cut {
+            return None;
+        }
+        let whole = self.for_render().duration();
+        Some(if whole > cut + 1e-9 {
+            format!("range starts at {start:.1}s, but the cut ends at {cut:.1}s before its titles, which have no sound")
+        } else {
+            format!("range starts at {start:.1}s but the cut is only {cut:.1}s long")
+        })
     }
 
     /// The sources of every animated title the cut draws: the floating ones and the ones on tracks.

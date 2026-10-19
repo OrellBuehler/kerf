@@ -21,7 +21,7 @@
 	import { entryId } from '#lib/staged-subset';
 	import { applyLabel, comingAlong, groupState, keepPresent, pickLine, pickRows, toggled, toggledGroup } from '#lib/review-picks';
 	import { changeWord } from '#lib/proposal-ui';
-	import { QUICK_EDIT_HELD, cutSignature, heldWhilePreviewing, isLocalPreset, quickTarget, silenceOutcome, targetNote } from '#lib/quick-edits';
+	import { QUICK_EDIT_HELD, cutAssets, cutSignature, heldWhilePreviewing, isLocalPreset, quickTarget, silenceOutcome, targetNote } from '#lib/quick-edits';
 	import { holdForPreview, report } from '#lib/ops';
 	import { STATUS_MAP, PRESETS } from './data';
 	import { agentLine, showComposerHint } from '#lib/agent-status';
@@ -288,11 +288,7 @@
 				if (out.kind === 'success') await record(p);
 			} else if (p === 'Cut to the beat') {
 				// The grid comes from the music, so analyze whatever is on the audio tracks.
-				const music = [
-					...new Set(
-						editor.timeline.tracks.filter((t) => t.kind === 'audio').flatMap((t) => t.clips.map((c) => c.asset_id))
-					)
-				];
+				const music = cutAssets(editor.timeline, 'audio');
 				if (music.length === 0) throw new Error('Put music on an audio track first');
 				for (const id of music) await ui.ensureAnalysis(id, QUICK_EDIT_STEPS.beat);
 				const before = cutSignature(editor.timeline);
@@ -307,7 +303,7 @@
 			} else if (p === 'Caption the cut') {
 				// Captions read from the clips' transcripts, so analyze whatever is
 				// in the cut but has not been transcribed yet.
-				const sources = [...new Set(editor.timeline.tracks.flatMap((t) => t.clips.map((c) => c.asset_id)))];
+				const sources = cutAssets(editor.timeline);
 				if (sources.length === 0) throw new Error('Put a clip on the timeline first');
 				for (const id of sources) await ui.ensureAnalysis(id, QUICK_EDIT_STEPS.captions);
 				await editor.generateCaptions();

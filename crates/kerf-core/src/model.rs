@@ -4852,7 +4852,8 @@ pub use grade::{
 };
 mod check;
 mod generator;
-pub use generator::{Generator, TitleClip, GENERATED_ASSET};
+pub(crate) use generator::too_many_titles;
+pub use generator::{Generator, TitleClip, GENERATED_ASSET, MAX_TITLE_CLIPS};
 
 mod score;
 pub use score::{

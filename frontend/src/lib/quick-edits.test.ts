@@ -1,7 +1,8 @@
 import { describe, expect, test } from 'bun:test';
-import { QUICK_EDIT_HELD, cutSignature, heldWhilePreviewing, isLocalPreset, quickTarget, silenceOutcome, targetNote } from './quick-edits';
+import { QUICK_EDIT_HELD, cutAssets, cutSignature, heldWhilePreviewing, isLocalPreset, quickTarget, silenceOutcome, targetNote } from './quick-edits';
 import { PRESETS } from './components/editor/data';
 import type { Timeline } from './types';
+import { GENERATED_ASSET } from './types';
 
 const assets = [
 	{ id: 'a', name: 'interview.mp4' },
@@ -67,5 +68,26 @@ describe('while the proposal is previewed', () => {
 
 	test('and the reason says what to do', () => {
 		expect(QUICK_EDIT_HELD).toContain('Exit the preview');
+	});
+});
+
+describe('cutAssets', () => {
+	test('each asset on the cut once, and never a title on a track — it has no asset to analyze', () => {
+		const t = cut('a', 'b', 'a');
+		t.tracks[0].clips.push({
+			id: 't',
+			asset_id: GENERATED_ASSET,
+			source_in: 0,
+			source_out: 5,
+			timeline_start: 15,
+			volume: 1,
+			fade_in: 0,
+			fade_out: 0,
+			generator: { kind: 'title', name: 'End card', svg: '<svg/>' }
+		});
+		t.tracks.push({ id: 'a1', kind: 'audio', name: 'A1', clips: [{ ...t.tracks[0].clips[0], id: 'm1', asset_id: 'm' }] });
+		expect(cutAssets(t)).toEqual(['a', 'b', 'm']);
+		expect(cutAssets(t, 'audio')).toEqual(['m']);
+		expect(cutAssets(cut())).toEqual([]);
 	});
 });

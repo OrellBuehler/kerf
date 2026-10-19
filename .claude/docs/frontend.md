@@ -819,8 +819,8 @@ edits folds from a chevron in it, and its one legend line says what the two icon
 `+page.svelte` brings it forward once when a proposal lands (`editor.staged`
 going null → set) — a review nobody can see is not a review. Under **Quick
 edits**, four preset chips run an edit now (`quick-edits.ts`: `Remove silences` / `Frame for the delivery`
-/ `Caption the cut` (analyzes whatever is in the cut but not yet transcribed,
-then captions it) / `Cut to the beat` — which
+/ `Caption the cut` (analyzes whatever is in the cut but not yet transcribed — `cutAssets`, which
+leaves out titles on tracks: they have no asset — then captions it) / `Cut to the beat` — which
 analyzes whatever is on the audio tracks first, then calls `snap_to_beats`, and says
 "No cuts were near a beat" instead of claiming an alignment when the grid never reached
 them); **the task is recorded only after the edit has run** (`record`: add, then resolve), so a connected agent never sees a task it could claim and redo (short of a window of two IPC round trips: `add_task` has no already-done form, so the task is `queued` until the `resolve_task` that follows — closing it needs a backend command that creates it done), and a failed edit leaves nothing in the queue. The rest enqueue for the agent — `Assemble rough cut` is one of them now: it used to run the same silence removal as `Remove silences` under a bigger name. Remove silences acts on `quickTarget`: the footage of the selected clip, else the selected library asset, else the first picture on the cut, and says which (a line under the chips, the toast naming it, "Nothing to remove" when the cut did not change); the local chips are off while a proposal is previewed. In the browser there is no agent, so

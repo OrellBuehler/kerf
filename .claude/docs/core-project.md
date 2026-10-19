@@ -541,7 +541,12 @@
   `template_source(id)` take a floating title's id or a title clip's (whose length for a save is `source_out`), and
   `set_title_values_parsed(id, prepared) -> TitleEdited::{Overlay, Clip}` dispatches (`set_template_values_parsed` stays the
   floating-only call). `collect_unused_fonts` keeps a font a title clip names (`title_sources`). Ops that look an asset up for every
-  clip skip generated ones (`proxy_waits`, `refuse_removed_media`).
+  clip skip generated ones (`proxy_waits`, `refuse_removed_media`); ones about a clip's sound say a title has none
+  (`detach_audio`, skipped and reported by `detach_audio_clips`; `audio_sync_inputs`; a band balance of a clip). A range for
+  `measure_levels` or a mix band balance is checked against `Timeline::untitled_duration` (the cut the pass renders, its titles
+  dropped), so a span inside a silent title tail is refused (`range_past_the_sound`) rather than widened to the whole cut. At
+  most `MAX_TITLE_CLIPS` (50) titles on tracks: `put_title` refuses the 51st, and the invariant net refuses an op (a split)
+  that would make one.
 - `analysis.rs` — transcription / scene / silence / rhythm are **pluggable traits**
   (`Transcriber`, `SceneDetector`, `SilenceDetector`, `RhythmAnalyzer`). Real impls
   now exist:

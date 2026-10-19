@@ -563,7 +563,9 @@
   end of its animations the document holds its last state, so extending the clip holds the end of the title. `svg` is
   sanitised and `template` behaves exactly as on a floating title (`core-project.md`). **Invariants** (`check.rs`,
   `Rule::ClipGenerated`): a generated clip is on a video track, names no asset, plays at speed 1 (no reverse), is not linked,
-  and its window lies within `0..=MAX_SVG_SECONDS` — so `set_speed`, a reverse or a link is refused by the invariant net for
+  and its window lies within `0..=MAX_SVG_SECONDS`; and (`Rule::TitleClipCount`) a timeline holds at most `MAX_TITLE_CLIPS`
+  (50) of them, each title past the cap a violation of its own, so any op that adds one (a split copies the document) is
+  refused — so `set_speed`, a reverse or a link is refused by the invariant net for
   every op at once. `Timeline::title_clip(id)` / `title_clips()` / `title_sources()` (every title's source, floating and on
   tracks: what the font collection reads). The diff says `Added title “Card” to V1 at …`, `Removed title “Card” …` and, for
   the content, `name “A” → “B”`, `Tagline “A” → “B”` or `artwork changed` (`generator_changes`). A generated clip's footage

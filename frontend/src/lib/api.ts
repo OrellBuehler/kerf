@@ -226,7 +226,7 @@ import {
 	templateImageValueOf,
 	templatePosterDev
 } from './template-dev';
-import { checkTitleSpan, placeTitleClip, titleClip, titleOf } from './title-clips';
+import { checkTitleSpan, isTitleClip, placeTitleClip, titleClip, titleOf } from './title-clips';
 import { VOICE_IDS, DEFAULT_SPEED, DEFAULT_VOICE, clampSpeed, estimateSeconds, scriptSegments, voiceInfo } from './voiceover';
 
 export type { AudioDetached };
@@ -2036,8 +2036,9 @@ export async function getBandBalance(request: BandBalanceRequest): Promise<BandB
 			if (!Number.isFinite(r.start) || !Number.isFinite(r.end) || r.start < 0 || r.end <= r.start) {
 				throw invalid('range needs 0 <= start < end, in seconds');
 			}
-			const cut = timelineDuration(devTimeline);
-			if (cut <= 0 || r.start >= cut) throw invalid(`range starts at ${r.start.toFixed(1)}s but the cut is ${cut.toFixed(1)}s long`);
+			const why = rangePastTheSound(devTimeline, r.start);
+			if (why) throw invalid(why);
+			const cut = untitledDuration(devTimeline);
 			target = 'mix';
 			name = 'mix';
 			origin = r.start;
@@ -2692,10 +2693,8 @@ export async function getLevels(range?: { start: number; end: number } | null, l
 	if (!inTauri()) {
 		// The backend refuses a span that starts past the end rather than widening it
 		// to the whole cut, which would answer a question nobody asked.
-		const cut = timelineDuration(devTimeline);
-		if (range && cut > 0 && range.start >= cut) {
-			throw new Error(`range starts at ${range.start.toFixed(1)}s but the cut is only ${cut.toFixed(1)}s long`);
-		}
+		const why = range && untitledDuration(devTimeline) > 0 ? rangePastTheSound(devTimeline, range.start) : null;
+		if (why) throw new Error(why);
 		return estimateLevels(devTimeline, sampleAssets, (id) => sampleAnalysis[id]?.loudness ?? undefined, {
 			range,
 			loudnorm
@@ -4087,6 +4086,21 @@ export async function revisionDiff(seq: number): Promise<TimelineDiff | null> {
 
 function timelineDuration(tl: Timeline): number {
 	return tl.tracks.reduce((m, t) => Math.max(m, trackEnd(t)), 0);
+}
+
+/** How long the cut runs without its titles on tracks, which have no sound (`Timeline::untitled_duration`): what a
+ *  pass over the mix measures. */
+function untitledDuration(tl: Timeline): number {
+	return timelineDuration({ ...tl, tracks: tl.tracks.map((t) => ({ ...t, clips: t.clips.filter((c) => !isTitleClip(c)) })) });
+}
+
+/** Why a range starting at `start` measures nothing of the mix (`Timeline::range_past_the_sound`). */
+function rangePastTheSound(tl: Timeline, start: number): string | null {
+	const cut = untitledDuration(tl);
+	if (cut > 0 && start < cut) return null;
+	return timelineDuration(tl) > cut + 1e-9
+		? `range starts at ${start.toFixed(1)}s, but the cut ends at ${cut.toFixed(1)}s before its titles, which have no sound`
+		: `range starts at ${start.toFixed(1)}s but the cut is only ${cut.toFixed(1)}s long`;
 }
 
 /** The `true` in the browser harness: `?staged=1` seeds a fake agent proposal. */

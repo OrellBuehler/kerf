@@ -6,7 +6,8 @@
 // Which footage a quick edit acts on used to be whatever happened to be selected in the library, or the
 // first asset, without saying. `quickTarget` makes that one rule and `targetNote` says it.
 
-import type { Asset, Timeline } from './types';
+import { isTitleClip } from './title-clips';
+import type { Asset, StreamKind, Timeline } from './types';
 
 /** The presets Kerf runs itself; anything else is queued for the connected agent. */
 export const LOCAL_PRESETS: ReadonlySet<string> = new Set(['Remove silences', 'Cut to the beat', 'Caption the cut', 'Frame for the delivery']);
@@ -42,6 +43,13 @@ export function quickTarget(o: {
 	const onCut = o.timeline.tracks.flatMap((t) => t.clips.map((c) => c.asset_id)).map(byId).find(Boolean);
 	const a = byId(o.clipAssetId) ?? byId(o.assetId) ?? onCut ?? o.assets[0];
 	return a ? { id: a.id, name: a.name } : null;
+}
+
+/** Every asset the cut plays, once each (on the tracks of `kind`, when given): what a preset analyzes before it
+ *  runs. A title on a track has no asset to analyze, so it is not one. */
+export function cutAssets(timeline: Timeline, kind?: StreamKind): string[] {
+	const tracks = timeline.tracks.filter((t) => !kind || t.kind === kind);
+	return [...new Set(tracks.flatMap((t) => t.clips.filter((c) => !isTitleClip(c)).map((c) => c.asset_id)))];
 }
 
 /** The line a preset's tooltip and the panel carry about what it acts on. */

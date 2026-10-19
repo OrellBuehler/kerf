@@ -2016,12 +2016,12 @@ impl Project {
         // A span entirely past the end would fall back to measuring the whole cut
         // (that is what a range export does with one) — and answer a question that
         // was not asked. Say so instead.
-        let cut = timeline.for_render().duration();
-        if let Some(r) = range.filter(|r| cut > 0.0 && r.start >= cut) {
-            return Err(Error::InvalidArgument(format!(
-                "range starts at {:.1}s but the cut is only {cut:.1}s long",
-                r.start
-            )));
+        // An empty cut is measured as one (nothing to hear), not refused.
+        if let Some(why) = range
+            .filter(|_| timeline.untitled_duration() > 0.0)
+            .and_then(|r| timeline.range_past_the_sound(r.start))
+        {
+            return Err(Error::InvalidArgument(why));
         }
         let measured = engine::mix_levels(timeline, assets, range, loudnorm, cancel)?;
         let tracks = timeline
@@ -5128,7 +5128,8 @@ impl Project {
     pub fn detach_audio(&self, clip_id: Uuid) -> Result<Detached> {
         let timeline = self.working_timeline()?;
         let clip = timeline.clip(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
-        let has_audio = self.require_asset(clip.asset_id)?.has_audio();
+        // A title has no asset; the timeline says why it has nothing to detach.
+        let has_audio = !clip.is_generated() && self.require_asset(clip.asset_id)?.has_audio();
         self.edit_timeline_exact("Detach audio", |timeline| timeline.detach_audio(clip_id, has_audio))
     }
 
@@ -5141,7 +5142,7 @@ impl Project {
         let timeline = self.working_timeline()?;
         let mut has_audio: HashMap<Uuid, bool> = HashMap::new();
         for id in clip_ids {
-            if let Some(clip) = timeline.clip(*id) {
+            if let Some(clip) = timeline.clip(*id).filter(|c| !c.is_generated()) {
                 if let std::collections::hash_map::Entry::Vacant(slot) = has_audio.entry(clip.asset_id) {
                     slot.insert(self.require_asset(clip.asset_id)?.has_audio());
                 }

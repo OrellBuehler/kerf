@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use super::{Project, SvgOverlayResult, MAX_SVG_SECONDS};
 use crate::error::{Error, Result};
-use crate::model::{Clip, StreamKind, Timeline, TitleClip, Track};
+use crate::model::{too_many_titles, Clip, StreamKind, Timeline, TitleClip, Track, MAX_TITLE_CLIPS};
 use crate::svg::SvgDoc;
 use crate::template::{PreparedTemplate, PreparedValues};
 
@@ -201,6 +201,15 @@ impl Project {
         // The new clip may not land on another clip of its track (checked after the ripple).
         self.edit_lanes.borrow_mut().push(clip_id);
         self.edit_timeline(&label, |timeline| {
+            let titles = timeline
+                .tracks
+                .iter()
+                .flat_map(|t| &t.clips)
+                .filter(|c| c.is_generated())
+                .count();
+            if titles >= MAX_TITLE_CLIPS {
+                return Err(Error::InvalidArgument(too_many_titles()));
+            }
             also(self)?;
             let track_id = place(timeline, track_id, clip)?;
             let clip = timeline.clip(clip_id).cloned().ok_or(Error::ClipNotFound(clip_id))?;
@@ -377,6 +386,32 @@ mod tests {
     }
 
     #[test]
+    fn a_timeline_holds_at_most_fifty_titles_on_its_tracks_and_a_split_past_that_is_refused() {
+        let p = Project::open_in_memory().unwrap();
+        let ids: Vec<Uuid> = (0..MAX_TITLE_CLIPS)
+            .map(|i| {
+                p.add_title_clip(ART, i as f64 * 2.0, Some(1.0), TitleClipPlacement::default())
+                    .unwrap()
+                    .clip
+                    .id
+            })
+            .collect();
+        let err = p
+            .add_title_clip(ART, 200.0, Some(1.0), TitleClipPlacement::default())
+            .unwrap_err();
+        assert!(err.to_string().contains("at most 50 titles"), "{err}");
+        let err = p.split_at(ids[0], 0.5).unwrap_err();
+        assert!(err.to_string().contains("at most 50 titles"), "{err}");
+        assert_eq!(
+            p.timeline().unwrap().title_clips().count(),
+            MAX_TITLE_CLIPS,
+            "nothing was added"
+        );
+        p.remove(ids[0]).unwrap();
+        p.split_at(ids[1], 2.5).unwrap();
+    }
+
+    #[test]
     fn a_title_clip_trims_extends_and_takes_a_dip_to_white_like_any_clip() {
         let p = Project::open_in_memory().unwrap();
         let a = p
@@ -490,5 +525,135 @@ mod tests {
         assert!(p.staged().unwrap().is_some());
         assert_eq!(p.timeline().unwrap().title_clips().count(), 0, "the live cut is untouched");
         assert_eq!(p.working_timeline().unwrap().title_clips().count(), 1);
+    }
+
+    /// Three titles abutting on V1: [0, 2), [2, 4), [4, 6), each from the start of its document.
+    fn three(p: &Project) -> [Uuid; 3] {
+        [0.0, 2.0, 4.0].map(|at| {
+            p.add_title_clip(ART, at, Some(2.0), TitleClipPlacement::default())
+                .unwrap()
+                .clip
+                .id
+        })
+    }
+
+    fn span(p: &Project, id: Uuid) -> (f64, f64, f64) {
+        let tl = p.timeline().unwrap();
+        let c = tl.clip(id).unwrap();
+        (c.timeline_start, c.source_in, c.source_out)
+    }
+
+    #[test]
+    fn a_title_slips_within_its_document() {
+        let p = Project::open_in_memory().unwrap();
+        let [_, b, _] = three(&p);
+        let out = p.slip_clip(b, 1.5).unwrap();
+        assert!(!out.clamped);
+        assert_eq!(span(&p, b), (2.0, 1.5, 3.5), "later in the animation, same place on the cut");
+        let out = p.slip_clip(b, -3.0).unwrap();
+        assert!(out.clamped, "no earlier than the document's start");
+        assert_eq!(out.applied, -1.5);
+        assert_eq!(span(&p, b), (2.0, 0.0, 2.0));
+    }
+
+    #[test]
+    fn a_title_slides_between_titles_and_its_neighbours_follow() {
+        let p = Project::open_in_memory().unwrap();
+        let [a, b, c] = three(&p);
+        let out = p.slide_clip(b, 0.5).unwrap();
+        assert!(!out.clamped);
+        assert_eq!(span(&p, a), (0.0, 0.0, 2.5), "the title before holds its last state longer");
+        assert_eq!(span(&p, b), (2.5, 0.0, 2.0));
+        assert_eq!(
+            span(&p, c),
+            (4.5, 0.5, 2.0),
+            "the title after starts later into its animation"
+        );
+        let out = p.slide_clip(b, -1.0).unwrap();
+        assert!(out.clamped, "the title after has only half a second of document before it");
+        assert_eq!(out.applied, -0.5);
+        assert_eq!(span(&p, c), (4.0, 0.0, 2.0));
+    }
+
+    #[test]
+    fn the_cut_between_two_titles_rolls_as_far_as_the_later_ones_document_reaches() {
+        let p = Project::open_in_memory().unwrap();
+        let [a, b, _] = three(&p);
+        let out = p.roll_edit(a, b, 1.0).unwrap();
+        assert!(!out.clamped);
+        assert_eq!(span(&p, a), (0.0, 0.0, 3.0));
+        assert_eq!(span(&p, b), (3.0, 1.0, 2.0));
+        let out = p.roll_edit(a, b, -2.0).unwrap();
+        assert!(out.clamped, "the later title cannot start before its document does");
+        assert_eq!(out.applied, -1.0);
+        assert_eq!((span(&p, a), span(&p, b)), ((0.0, 0.0, 2.0), (2.0, 0.0, 2.0)));
+    }
+
+    #[test]
+    fn a_title_has_no_sound_to_detach_sync_or_measure() {
+        let p = Project::open_in_memory().unwrap();
+        let first = p
+            .add_title_clip(ART, 0.0, Some(4.0), TitleClipPlacement::default())
+            .unwrap()
+            .clip
+            .id;
+        let over = p
+            .add_title_clip(ART, 1.0, Some(2.0), TitleClipPlacement::default())
+            .unwrap()
+            .clip
+            .id;
+        let err = p.detach_audio(first).unwrap_err().to_string();
+        assert!(err.contains("a title has no sound to detach"), "{err}");
+        let err = p.detach_audio_clips(&[first, over]).unwrap_err().to_string();
+        assert!(err.contains("a title has no sound to detach"), "{err}");
+        let err = p.audio_sync_inputs(first, over).unwrap_err().to_string();
+        assert!(err.contains("is a title, which has no sound to sync by"), "{err}");
+        let req = crate::BandBalanceRequest {
+            clip_id: Some(first),
+            ..Default::default()
+        };
+        let err = p.band_balance_inputs(&req).map(|_| ()).unwrap_err().to_string();
+        assert!(err.contains("a title, which has no sound"), "{err}");
+    }
+
+    /// V1: footage [0, 4), then a title [4, 10).
+    fn footage_then_title() -> (Timeline, Uuid, Uuid) {
+        let mut tl = Timeline::new();
+        let v = tl.first_track_of(StreamKind::Video).unwrap();
+        let footage = Clip::new(Uuid::new_v4(), 0.0, 4.0, 0.0);
+        let title = Clip::title(
+            TitleClip {
+                name: "End card".into(),
+                svg: ART.into(),
+                template: None,
+            },
+            4.0,
+            6.0,
+        );
+        let ids = (footage.id, title.id);
+        tl.track_mut(v).unwrap().clips.extend([footage, title]);
+        (tl, ids.0, ids.1)
+    }
+
+    #[test]
+    fn a_batch_detach_skips_a_title_and_says_why() {
+        let (mut tl, footage, title) = footage_then_title();
+        let done = tl.detach_audio_many(&[title, footage], &|_| true).unwrap();
+        assert_eq!(done.detached.len(), 1);
+        assert_eq!(done.skipped.len(), 1);
+        assert_eq!(done.skipped[0].clip_id, title);
+        assert!(done.skipped[0].reason.contains("a title has no sound"), "{:?}", done.skipped);
+    }
+
+    #[test]
+    fn a_levels_range_past_the_sound_is_refused_though_a_title_runs_on() {
+        let (tl, _, _) = footage_then_title();
+        assert_eq!((tl.for_render().duration(), tl.untitled_duration()), (10.0, 4.0));
+        let range = crate::model::TimeRange { start: 5.0, end: 6.0 };
+        let err = Project::measure_levels(&tl, &[], Some(range), false, &|| false)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("the cut ends at 4.0s before its titles"), "{err}");
+        assert!(tl.range_past_the_sound(3.0).is_none());
     }
 }

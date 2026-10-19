@@ -28,6 +28,7 @@ enum Rule {
     ClipTransition,
     ClipKeyframe,
     ClipGenerated,
+    TitleClipCount,
     OverlayTwice,
     OverlaySpan,
     OverlayKeyframe,
@@ -105,6 +106,12 @@ impl Timeline {
                     push(Rule::ClipGenerated, clip.id, format!("{name} {why}"));
                 }
             }
+        }
+        // Past the cap, every further title is one too many: a title an edit adds (or a split makes) is a new
+        // one of those, whichever clip it lands among.
+        let titles = self.tracks.iter().flat_map(|t| &t.clips).filter(|c| c.is_generated());
+        for clip in titles.skip(super::MAX_TITLE_CLIPS) {
+            push(Rule::TitleClipCount, clip.id, super::generator::too_many_titles());
         }
         let mut overlays = HashSet::new();
         for o in &self.overlays {
@@ -193,7 +200,7 @@ fn clip_violations(c: &Clip) -> Vec<(Rule, &'static str)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{StreamKind, TextOverlay, Track, Transition, TransitionKind};
+    use crate::model::{StreamKind, TextOverlay, TitleClip, Track, Transition, TransitionKind, MAX_TITLE_CLIPS};
     use uuid::Uuid;
 
     fn timeline() -> Timeline {
@@ -294,6 +301,28 @@ mod tests {
             err.contains("the text \u{201c}hi\u{201d} at 0:01.0 must end after it starts"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn a_title_past_the_cap_is_refused() {
+        let mut t = timeline();
+        let title = |at: f64| {
+            let doc = TitleClip {
+                name: "T".into(),
+                svg: "<svg xmlns=\"http://www.w3.org/2000/svg\"/>".into(),
+                template: None,
+            };
+            Clip::title(doc, at, 1.0)
+        };
+        let mut v2 = Track::new(StreamKind::Video, "V2");
+        v2.clips = (0..MAX_TITLE_CLIPS).map(|i| title(i as f64)).collect();
+        t.tracks.insert(1, v2);
+        t.check().unwrap();
+        let known = t.known_violations();
+        // One more, wherever it goes, is one too many.
+        t.tracks[0].clips.insert(0, title(100.0));
+        let err = t.check_new(&known).unwrap_err().to_string();
+        assert!(err.contains(&format!("at most {MAX_TITLE_CLIPS} titles")), "{err}");
     }
 
     #[test]
