@@ -140,6 +140,10 @@
   tail, and **`proxy/late-video-start`** (the pick over a head-padded proxy's own frames is
   what the preview graph renders from it, at the head — the clone dropped — and deeper in).
   `drop_first`'s removal makes the head case fail; so does rounding in `setpts`.
+  **A late-starting source** (`FpsPick::lead`, from `ClipFx::lead`): a window inside the lead
+  is not seeked (`clip_seek(start, lead)`) and the run's `setpts` start is
+  `start + picture_delay(...)`, added in the graph's order (`+(start+delay)/TB`), so the frames
+  before the source's first picture are `Early` (nothing drawn), as in the export.
   A rate whose canvas and `fps=` parses differ (`29.970029`) is refused in Motion
   (`Unsupported::PickRate`): the pick assumes one grid.
   **Traps for the `FrameSource` that will feed it** (A1b): `showinfo` pts under `-copyts

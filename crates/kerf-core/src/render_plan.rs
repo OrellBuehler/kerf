@@ -1386,6 +1386,7 @@ mod tests {
             color_primaries: None,
             pix_fmt: Some("yuv420p".into()),
             color_space: None,
+            lead: 0.0,
         }
     }
 

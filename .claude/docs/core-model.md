@@ -1,7 +1,13 @@
 # kerf-core: `model.rs` — domain types and timeline math
 
 - `model.rs` — the domain types and the only place timeline math lives: `Asset`,
-  `StreamInfo`, `Timeline`→`Track`→`Clip` (the EDL), `AssetAnalysis`. A `Clip`
+  `StreamInfo`, `Timeline`→`Track`→`Clip` (the EDL), `AssetAnalysis`. A video `StreamInfo`
+  carries **`lead`**: seconds its first picture starts after the earliest picture or sound of the
+  file (the probe's stream `start_time`s, not the container's, which a text track can pull earlier),
+  above 1 ms and below the duration (a start at or past the end is broken and reads 0); omitted at 0,
+  so old JSON reads an ordinary start. The export seeks and places the clip's picture by it
+  (`ClipFx::lead`, `engine-cli.md`); a proxy-decoded asset keeps the original's only for a `.lead`
+  padded proxy (`media::decoded_lead`, `Project::preview_assets_of`). A `Clip`
   references a source range (`source_in`/`source_out`) of an asset at a
   `timeline_start` — non-destructive. Besides the geometry (`Transform`) / color
   (`Color`) / `Transition` fields, a clip carries a `Vec<VideoEffect>` and
