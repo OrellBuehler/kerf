@@ -6047,6 +6047,29 @@ mod tests {
         assert!(REVEAL_FAILSAFE <= std::time::Duration::from_secs(10));
     }
 
+    /// The packaged build's CSP: what the app loads, and nothing more. A packaged run logged
+    /// `connect-src` blocking `_app/version.json` — SvelteKit fetches it from the app's own origin
+    /// (`tauri://localhost`, `http://tauri.localhost`) whenever the window becomes visible or regains
+    /// focus — so `connect-src` has `'self'`; scripts (the limiter worklet included) stay `'self'` only.
+    #[test]
+    fn the_packaged_csp_admits_what_the_app_loads_and_nothing_more() {
+        let conf: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        let csp = &conf["app"]["security"]["csp"];
+        let sources = |directive: &str| -> Vec<String> {
+            csp[directive]
+                .as_str()
+                .unwrap_or_else(|| panic!("{directive} is set"))
+                .split_whitespace()
+                .map(str::to_string)
+                .collect()
+        };
+        assert_eq!(sources("script-src"), ["'self'"]);
+        assert_eq!(sources("connect-src"), ["'self'", "ipc:", "http://ipc.localhost"]);
+        assert_eq!(sources("default-src"), ["'self'"]);
+        assert_eq!(sources("object-src"), ["'none'"]);
+        assert_eq!(sources("base-uri"), ["'none'"]);
+    }
+
     #[test]
     fn the_main_window_starts_hidden_in_every_build() {
         let conf: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
