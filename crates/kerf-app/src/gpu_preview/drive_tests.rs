@@ -554,11 +554,16 @@ fn a_drag_frame_is_the_picture_the_edit_draws_once_it_is_written() {
         project
             .set_transform(clip.id, Some(0.5), Some(0.1), None, None, None, None, None, None, None)
             .expect("the edit");
-        project.set_color(clip.id, Some(0.1), None, None, None, None).expect("the edit");
+        project
+            .set_color(clip.id, Some(0.1), None, None, None, None)
+            .expect("the edit");
     }
     let written = ask(&preview, &take, 0.5, None);
     assert_eq!(written.renderer, "gpu", "{:?}", written.reasons);
-    assert!(picture(&log) == drag_picture, "the drag frame is the frame of the edit, once written");
+    assert!(
+        picture(&log) == drag_picture,
+        "the drag frame is the frame of the edit, once written"
+    );
 
     // A clip moved on the timeline: the second clip dragged from 1 s to 3 s, drawn at 3.5 s.
     let timeline = lock(&shared).working_timeline().expect("a timeline");
@@ -585,7 +590,12 @@ fn a_drag_frame_is_the_picture_the_edit_draws_once_it_is_written() {
     let refused = ask(&preview, &take, 0.5, Some(one_clip(track, vignetted)));
     assert_eq!(refused.renderer, "ffmpeg");
     assert!(refused.frame.is_some());
-    assert_eq!(refused.reasons.last().map(String::as_str), Some(DRAFT_NOTE), "{:?}", refused.reasons);
+    assert_eq!(
+        refused.reasons.last().map(String::as_str),
+        Some(DRAFT_NOTE),
+        "{:?}",
+        refused.reasons
+    );
 
     // A draft that is not of this cut is the cut as it is, and says why.
     let stranger = kerf_core::Clip::new(uuid::Uuid::new_v4(), 0.0, 1.0, 0.0);

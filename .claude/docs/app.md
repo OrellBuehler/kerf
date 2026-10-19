@@ -174,7 +174,7 @@ returns the refreshed `Timeline`; every edit that carries linked clips takes an 
 JPEG added as a base64 `data:` URL (`FilmstripPayload` — the CSP admits `data:` images
 and no `blob:`; core serializes the geometry without pixels) and **no MCP tool**, since
 `skim_asset` is how an agent looks at footage,
-`get_preview_frame` (`hint: "forward"` is a frame of GPU playback) / `set_preview_bounds` / `gpu_preview_status` (the GPU preview, below; GUI-only; its tallies are kept for tests and logs, no command serves them),
+`get_preview_frame` (`hint: "forward"` is a frame of GPU playback, `draft` a gesture's frame) / `set_preview_bounds` / `gpu_preview_status` (the GPU preview, below; GUI-only; its tallies are kept for tests and logs, no command serves them),
 `get_timeline_frame` (the composited still at a time; see Scrubbed frames below),
 `get_scopes` (`kerf_core::scopes` of the export's still at a time, from the originals: the summary and the grids asked
 for; the MCP tool of the same name) / `get_render_bar` (`kerf_core::render_bar` over the working cut, for the GPU
@@ -540,6 +540,27 @@ logged once per new kind (`info`) and as a one-line session summary at teardown;
 software}`. Local and in memory; no MCP tool (nothing here is an edit). `gpu_preview/drive_tests.rs` drives the whole frame path
 without a window (a real device, compositor and frame source over real clips, a screen that records; `#[ignore]`d), and
 `bench_tests.rs` times it (`KERF_BENCH=1`).
+
+**Drag frames and forward scrubs (A3, `gpu_preview/draft.rs`, `pace.rs`).** `get_preview_frame { …, draft }` is the frame of a
+gesture under way: `draft` (`PreviewDraft { clips: [{track_id, clip}], overlays }`) is what the gesture would write on release, each
+clip and title whole, and the frame is planned from the snapshot's timeline with those in place of its own (`PreviewDraft::apply`: a
+clip may move in time and to a track of its kind, the tracks it lands on sorted by start as `move_clips` does; it may not change the
+footage it reads, name a clip or title the cut does not hold, or leave the cut breaking an invariant it did not already break,
+`Timeline::check_new`). Nothing is written and the epoch does not move, so the gesture still writes one edit on release. A draft
+frame is planned, refused and drawn like any other (the plan's reasons, the self-test gate, the surface); one the GPU does not draw,
+a draft that is refused, or one whose clips wait on a proxy under Proxy only, is **FFmpeg's JPEG of the cut as it is**, with the
+reason and a last one saying the drag shows once it is let go (with the GPU preview off the preview is that too: no draft is ever
+sent on the JPEG route). Draft frames prime nothing and prefetch nothing (the next frame of a drag is the same time in another
+cut). A `forward` request takes no draft. `Trend` (`pace.rs`, beside `Pace`) reads the requests' times as they arrive: a drag whose
+last three requests each stepped forward by at most 0.5 s is decoded with `Hint::Forward { fps }` (the canvas's rate) instead of
+`Hint::Scrub`, so the run reads ahead and the next frame is in the cache when it is asked for; frames are the same either way
+(the run is the router's, proved equal to the one-shot), and a refusal by the thrash guard is that frame's FFmpeg fallback. Tests:
+`draft.rs` (apply), `pace.rs` (trend), and the ignored `drive_tests.rs` cases `a_drag_frame_is_the_picture_the_edit_draws_once_it_is_written`
+(an Inspector drag and a timeline move drawn as a draft are, pixel for pixel, the frames drawn after the edit is written; a vignette
+draft and a stranger's clip go through FFmpeg) and `a_drag_that_walks_forward_reads_ahead_and_draws_the_frames_a_scrub_draws`.
+`bench_tests.rs`' `a_scrub_and_a_gesture_at_1080p` (`KERF_BENCH=1`) times a 1920x1080 canvas of 1080p all-intra clips: on lavapipe
+(debug build, a loaded 4-core box) the decode wait of a forward scrub goes from 5 to 0.1 ms with the read-ahead, and the frame is
+lavapipe's raster (50 to 100 ms for one layer, about 600 ms for a scaled and graded one); the < 33 ms target is for a real GPU and is unmeasured.
 
 **GPU playback (A4, `gpu_preview/play.rs`; the page's half is in `frontend.md`).** `get_preview_frame { …, hint: "forward", client,
 session }` is a frame of a **play session**: the webview stays the clock (the audio clock, less the output latency, plus the request's own

@@ -232,6 +232,9 @@ timestamp on a coarse time base can hide a late landing of exactly one rounded t
   (`FrameCache::conflicts_with`; the cache refuses and counts it, never a panic) ends the run and
   marks the file, so a file whose runs always die is not spawned and killed once a request.
 
+**`Hint::Forward`** is also what the app's preview asks with for a drag that walks forward through the cut (A3, `app.md`): the run
+reads ahead and the next frame of the drag is a cache hit; the frames are the router's either way.
+
 **`Hint::Prefetch`** is a request for a frame that will be wanted soon (the first of the clip a cut is about
 to bring): it returns `Ok(None)` for every layer, **waits for nothing and draws nothing**, and has a run
 waiting at the frame when it can. It opens the file's two probes (container, seek points: 50 ms between

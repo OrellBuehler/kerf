@@ -19,6 +19,9 @@
 //!   before anything is decoded, planned from files or rendered; a scrubbed frame takes none.
 //! * **Latest wins** ([`mailbox`]): a request replaces the one waiting, so a drag draws the frames
 //!   it ends on and not every one it passed.
+//! * **Gestures and forward scrubs (A3)**: a request may carry what a gesture under way would write
+//!   ([`draft`]); the frame is drawn as the cut will be once it is let go, and nothing is written. A
+//!   drag that walks forward is decoded reading ahead ([`pace::Trend`]).
 //! * **Checked, counted, paced**: the first frame the GPU would draw waits for the parity self-test
 //!   ([`check`]), every refusal is counted by kind ([`diagnostics`]), and frames of a drag are
 //!   presented without waiting for the refresh ([`pace`]).
