@@ -21,7 +21,7 @@
 	import type { Container, ExportOptions, Fit, RateControl, SubtitleFormat } from '#lib/types';
 	import { exportedLine, failure } from '#lib/failure-copy';
 	import {
-		PRESETS,
+		initialExport,
 		presetsByGroup,
 		CONTAINERS,
 		VIDEO_CODECS,
@@ -74,20 +74,11 @@
 	// preset renders exactly the project frame, start from it; otherwise start
 	// from the default preset with its resolution cleared, so "Project frame" is
 	// what renders.
-	function initialExport(): { id: string; opts: ExportOptions } {
-		const d = editor.timeline.format;
-		if (!d) return { id: 'web_1080p', opts: applyPreset('web_1080p') };
-		const hit = PRESETS.find(
-			(p) => p.opts.resolution?.[0] === d.width && p.opts.resolution?.[1] === d.height
-		);
-		if (hit) return { id: hit.id, opts: applyPreset(hit.id) };
-		return { id: 'custom', opts: { ...applyPreset('web_1080p'), resolution: null, fit: d.fit } };
-	}
 	// What the dialog was last closed on comes back, unless the project has been re-cut for another
 	// frame since: the options are not lost to a Cancel, an Escape or a stray click.
 	const frame = frameKey(editor.timeline.format);
 	const remembered = restoreDraft(ui.exportDraft, frame);
-	const initial = remembered ? { id: remembered.preset, opts: remembered.opts } : initialExport();
+	const initial = remembered ? { id: remembered.preset, opts: remembered.opts } : initialExport(editor.timeline.format);
 
 	let opts = $state<ExportOptions>(initial.opts);
 	let outputPath = $state('');

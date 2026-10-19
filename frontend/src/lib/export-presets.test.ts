@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import {
+	initialExport,
 	carriesChapters,
 	carriesSubtitles,
 	CONTAINERS,
@@ -290,5 +291,19 @@ describe('the preset select', () => {
 		expect(groups.map((g) => g.group)).toEqual(['Video', 'Social', 'Master', 'Audio']);
 		expect(groups.flatMap((g) => g.presets.map((p) => p.id)).sort()).toEqual(PRESETS.map((p) => p.id).sort());
 		expect(groups.find((g) => g.group === 'Audio')!.presets.map((p) => p.id)).toEqual(['audio_mp3', 'audio_wav']);
+	});
+});
+
+describe('initialExport', () => {
+	test('opens on the project frame with the project fit, whatever the matching preset fills with', () => {
+		const vertical = initialExport({ width: 1080, height: 1920, fit: 'blur' });
+		expect(vertical.opts.resolution).toEqual([1080, 1920]);
+		expect(vertical.opts.fit).toBe('blur');
+		expect(vertical.id).not.toBe('custom');
+		expect(initialExport({ width: 1080, height: 1920, fit: 'contain' }).opts.fit).toBe('contain');
+		// A frame no preset renders: the default with the project frame.
+		const odd = initialExport({ width: 1000, height: 1000, fit: 'blur' });
+		expect([odd.id, odd.opts.resolution, odd.opts.fit]).toEqual(['custom', null, 'blur']);
+		expect(initialExport(null).id).toBe('web_1080p');
 	});
 });

@@ -2,7 +2,7 @@
 // mirrors kerf_core::engine (validate_export, build_export_args) so the UI
 // reflects exactly what the backend will do.
 
-import type { Container, ExportOptions, Fit, LoudnessPreset, RateControl } from './types';
+import type { Container, Delivery, ExportOptions, Fit, LoudnessPreset, RateControl } from './types';
 import { DEFAULT_EXPORT_OPTIONS } from './types';
 
 export interface ContainerInfo {
@@ -411,6 +411,17 @@ export function presetsByGroup(presets: readonly Preset[] = PRESETS): { group: P
 export function applyPreset(id: string, hw: readonly string[] = []): ExportOptions {
 	const p = presetsFor(hw).find((x) => x.id === id);
 	return { ...DEFAULT_EXPORT_OPTIONS, ...(p?.opts ?? {}) };
+}
+
+/** The export the dialog opens on for a project cut for `format`: a preset that renders exactly
+ *  that frame, else the default with its resolution cleared (so the project frame is what renders),
+ *  and the project's own fit either way — a 9:16 project fitted over a blurred fill must not export
+ *  cropped because the 9:16 preset fills. */
+export function initialExport(format: Delivery | null | undefined): { id: string; opts: ExportOptions } {
+	if (!format) return { id: 'web_1080p', opts: applyPreset('web_1080p') };
+	const hit = PRESETS.find((p) => p.opts.resolution?.[0] === format.width && p.opts.resolution?.[1] === format.height);
+	if (hit) return { id: hit.id, opts: { ...applyPreset(hit.id), fit: format.fit } };
+	return { id: 'custom', opts: { ...applyPreset('web_1080p'), resolution: null, fit: format.fit } };
 }
 
 export function containerInfo(c: Container): ContainerInfo {

@@ -41,7 +41,7 @@
 	import { addAnimatedTitle, addCustomSvgTitle, importCaptionFile } from '#lib/title-actions';
 	import { keyframeOffer } from '#lib/keyframe-copy';
 	import type { ActionId } from '#lib/keymap';
-	import { DELIVERY_FITS, DELIVERY_PRESETS, fitLabel, presetFor } from '#lib/delivery-formats';
+	import { DELIVERY_PRESETS, deliveryTip, fitChoices, presetFor } from '#lib/delivery-formats';
 	import { setDeliveryFit, setDeliveryPreset } from '#lib/menu-commands';
 	import { importMenuEntries, importableAssets } from '#lib/caption-import-ui';
 	import type { Clip, Marker, PreviewDraft, StreamKind, SvgOverlay, TextOverlay, Track } from '#lib/types';
@@ -737,14 +737,14 @@
 					icon: p.id === delivery.id ? 'check' : undefined,
 					action: () => void setDeliveryPreset(p.id)
 				})),
-				// With a frame set: how footage of another shape meets it.
-				...(delivery.format
+				// With a frame set: how footage of another shape meets it (the project's fit ticked).
+				...(editor.timeline.format
 					? [
 							{ type: 'separator' as const },
-							...DELIVERY_FITS.map((fit) => ({
-								label: `Footage: ${fitLabel(fit)}`,
-								icon: fit === delivery.format?.fit ? 'check' : undefined,
-								action: () => void setDeliveryFit(fit)
+							...fitChoices(editor.timeline.format).map((c) => ({
+								label: c.label,
+								icon: c.checked ? 'check' : undefined,
+								action: () => void setDeliveryFit(c.fit)
 							}))
 						]
 					: [])
@@ -2878,9 +2878,7 @@
 				<ToolbarToggle
 					title={editor.previewingStaged
 						? PREVIEW_READ_ONLY_REASON
-						: delivery.format
-						? `Delivering ${delivery.format.width}\u00d7${delivery.format.height} — ${fitLabel(delivery.format.fit)}. Click to change.`
-						: 'The frame follows the footage. Click to cut for a delivery shape.'}
+						: deliveryTip(editor.timeline.format)}
 					icon="crop"
 					iconSize={12}
 					on={!!delivery.format}
