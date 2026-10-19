@@ -28,11 +28,11 @@ use base64::Engine as _;
 use kerf_core::{
     Asset, AssetAnalysis, AudioEffect, CaptionFile, CaptionFormat, CaptionImportRequest, CaptionOptions, CaptionTimeBase,
     ClipCut, ClipMove, Delivery, EditSource, ExportOptions, Filmstrip, FilmstripSheet, Fit, Grade, ImportOutcome, ImportSummary,
-    Keyframe, Levels, Mask, MissingAsset, Page, Project, Projection, Property, PropertyKey, ReframeKeyframe, RelinkCheck,
-    Relinked, RemovedAsset, Revision, SplitSide, StagedEdit, StreamKind, SubsetApplied, SvgCheck, SvgLayout, SvgOverlayPatch,
-    SvgPresetInfo, SvgPresetKind, SvgPresetParams, SvgSource, Task, TemplateControl, TemplateLibrary, TemplateList,
-    TemplateSaveRequest, TemplateSaved, TextKeyframe, TimeRange, Timeline, TimelineDiff, Transition, TransitionKind, VideoEffect,
-    WaveformRange,
+    Keyframe, Levels, Mask, MissingAsset, Page, Project, Projection, Property, PropertyKey, PropertyTrack, ReframeKeyframe,
+    RelinkCheck, Relinked, RemovedAsset, Revision, SplitSide, StagedEdit, StreamKind, SubsetApplied, SvgCheck, SvgLayout,
+    SvgOverlayPatch, SvgPresetInfo, SvgPresetKind, SvgPresetParams, SvgSource, Task, TemplateControl, TemplateLibrary,
+    TemplateList, TemplateSaveRequest, TemplateSaved, TextKeyframe, TimeRange, Timeline, TimelineDiff, Transition,
+    TransitionKind, VideoEffect, WaveformRange,
 };
 
 use serde::Serialize;
@@ -2353,6 +2353,16 @@ fn set_property_keyframes(
     project.timeline().map_err(|e| e.to_string())
 }
 
+/// Replace the keys of several animatable numbers of a clip in one edit (the dope sheet's
+/// gestures).
+#[tauri::command(async)]
+fn set_property_tracks(state: State<'_, AppState>, clip_id: String, tracks: Vec<PropertyTrack>) -> CmdResult<Timeline> {
+    let id = id(&clip_id, "clip_id")?;
+    let project = state.project();
+    project.set_property_tracks(id, tracks).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
 /// Copy the animation of `props` (every keyed number when empty) from one clip to another,
 /// `offset` seconds later.
 #[tauri::command(async)]
@@ -3409,6 +3419,10 @@ async fn get_timeline_frame(state: State<'_, AppState>, time_secs: f64, max_widt
 /// and the first request of a session decides whether the GPU plays it (`renderer: "gpu"`) or the
 /// stream does (`renderer: "stream"`, with the reasons); every answer says in `play.ahead` where the
 /// GPU will stop drawing, if it will. See [`gpu_preview::play`]'s module docs; no other hint is known.
+///
+/// `draft` is what a gesture under way would write (the clips and titles it changes, whole): the frame
+/// is drawn as the cut would be with it written, and nothing is written (`gpu_preview::draft`). A drag's
+/// frame the GPU does not draw is FFmpeg's JPEG of the cut as it is.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 async fn get_preview_frame(
@@ -3421,6 +3435,7 @@ async fn get_preview_frame(
     seq: Option<u64>,
     hint: Option<String>,
     session: Option<u64>,
+    draft: Option<gpu_preview::PreviewDraft>,
 ) -> CmdResult<gpu_preview::PreviewFrameResult> {
     let shared = state.project.clone();
     let mut request = gpu_preview::FrameRequest::new(
@@ -3438,9 +3453,15 @@ async fn get_preview_frame(
             let (Some(client), Some(session)) = (client.clone(), session) else {
                 return Err("a forward frame names its client and session".to_string());
             };
+            if draft.is_some() {
+                return Err("a forward frame takes no draft".to_string());
+            }
             request = request.forward(client, session);
         }
         Some(other) => return Err(format!("unknown preview frame hint {other:?}")),
+    }
+    if let Some(draft) = draft {
+        request = request.drafted(draft);
     }
     if let (Some(client), Some(seq)) = (client, seq) {
         request = request.ordered(client, seq);
@@ -5193,6 +5214,7 @@ pub fn run() {
             add_keyframe,
             set_keyframe_easing,
             set_property_keyframes,
+            set_property_tracks,
             copy_keyframes,
             clear_keyframes,
             set_reframe,

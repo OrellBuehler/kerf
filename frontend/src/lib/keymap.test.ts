@@ -1121,6 +1121,8 @@ describe('no key is hard-coded outside the registry', () => {
 		expect(handlers).toEqual([
 			'lib/components/editor/AgentPanel.svelte',
 			'lib/components/editor/ContextMenu.svelte',
+			'lib/components/editor/DopeSheet.svelte',
+			'lib/components/editor/EasingPopover.svelte',
 			'lib/components/editor/FitMusicDialog.svelte',
 			'lib/components/editor/KeyboardSettings.svelte',
 			'lib/components/editor/LibraryPanel.svelte',
