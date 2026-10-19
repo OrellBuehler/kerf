@@ -1,7 +1,8 @@
 # Third-party notices
 
-Parts of Kerf are adapted from [FilmCraft](https://github.com/storytold/filmcraft),
-used under the MIT License below. The adapted code is listed here.
+Parts of Kerf are adapted from [FilmCraft](https://github.com/storytold/filmcraft) and
+[EffectCraft](https://github.com/storytold/effectcraft), used under the MIT License below. The adapted code
+is listed here.
 
 ## Adapted from FilmCraft
 
@@ -27,9 +28,19 @@ used under the MIT License below. The adapted code is listed here.
 
 The `.kerftemplate` format (`crates/kerf-core/src/template/`) is modelled on the `.ectemplate` manifest and
 controls model of [EffectCraft](https://github.com/storytold/effectcraft) (`crates/project/src/essential.rs`,
-`engine/templates.rs`), which is licensed MIT OR Apache-2.0. No EffectCraft code is copied; the shape of a
+`engine/templates.rs`), which is licensed MIT OR Apache-2.0. No EffectCraft code is copied into `template/`; the shape of a
 template (a manifest with named controls bound to elements of the artwork, a poster and embedded fonts) is.
 Its brand marks are not used.
+
+## Adapted from EffectCraft
+
+From EffectCraft 0.12.0 (`crates/text`, revision `ef74d82`), licensed MIT OR Apache-2.0 and used here under
+the MIT License:
+
+- `crates/kerf-core/src/text/layout.rs` (paragraph layout: per-character face fallback, bidi items, shaping with
+  harfrust, UAX #14 greedy line breaking, visual reordering of a line, alignment) — from `crates/text/src/layout.rs`
+- `crates/kerf-core/src/text/face.rs` (a face's shaper data and metrics through skrifa) — from `crates/text/src/fonts.rs`
+- `crates/kerf-core/src/text/path.rs` (glyph outlines through skrifa's `OutlinePen`) — from `crates/text/src/lib.rs`
 
 ## FilmCraft license
 
@@ -37,6 +48,32 @@ Its brand marks are not used.
 MIT License
 
 Copyright (c) 2026 ArtCraft Team and the FilmCraft contributors
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+## EffectCraft license
+
+```text
+MIT License
+
+Copyright (c) 2026 ArtCraft Team and the EffectCraft contributors
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
 of this software and associated documentation files (the "Software"), to deal
