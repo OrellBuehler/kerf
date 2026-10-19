@@ -235,6 +235,7 @@ impl Jobs {
             error: None,
         });
         drop(jobs);
+        super::activity::publish(super::activity::Event::Job(id.clone()));
         let registry = self.clone();
         let reporting = id.clone();
         let run = Run {
@@ -245,16 +246,28 @@ impl Jobs {
     }
 
     fn report(&self, id: &str, fraction: Option<f64>, message: String) {
-        if let Some(job) = self.lock().iter_mut().find(|j| j.id == id) {
-            if let Some(f) = fraction {
-                job.progress = Some(f);
+        let found = match self.lock().iter_mut().find(|j| j.id == id) {
+            Some(job) => {
+                if let Some(f) = fraction {
+                    job.progress = Some(f);
+                }
+                job.message = Some(message);
+                true
             }
-            job.message = Some(message);
+            None => false,
+        };
+        if found {
+            super::activity::publish(super::activity::Event::Job(id.to_string()));
         }
     }
 
     /// Record how the job ended. A job that was asked to stop and did not succeed is `cancelled`.
     pub fn finish(&self, id: &str, outcome: Result<String, McpError>) {
+        self.record_end(id, outcome);
+        super::activity::publish(super::activity::Event::Job(id.to_string()));
+    }
+
+    fn record_end(&self, id: &str, outcome: Result<String, McpError>) {
         let mut jobs = self.lock();
         let Some(job) = jobs.iter_mut().find(|j| j.id == id) else {
             return;
@@ -367,7 +380,11 @@ impl KerfMcp {
                 "job_id": id,
                 "tool": tool,
                 "state": JobState::Running,
-                "next": "poll job_status with this job_id (cancel_job stops it); the result arrives there",
+                "next": format!(
+                    "poll job_status with this job_id (cancel_job stops it), or subscribe to the resource \
+                     kerf://jobs/{id} to be told when it moves and read it once right after subscribing \
+                     (nothing before the subscription is replayed); the result arrives there"
+                ),
             }));
         }
         let (run, relay) = foreground(context);

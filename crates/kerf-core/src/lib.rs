@@ -29,6 +29,7 @@ pub mod planner;
 pub mod platform;
 pub mod play_plan;
 pub mod project;
+pub mod project_activity;
 pub mod proxy;
 pub mod recovery;
 pub mod render_bar;

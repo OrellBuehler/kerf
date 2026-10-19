@@ -76,5 +76,23 @@ export function variantPath(base: string, format: Delivery): string {
 }
 
 export function fitLabel(fit: Fit): string {
-	return fit === 'cover' ? 'fill & crop' : 'fit & letterbox';
+	return fit === 'cover' ? 'fill & crop' : fit === 'blur' ? 'fit & blurred fill' : 'fit & letterbox';
+}
+
+/** The fits a delivery frame can take, in picker order. */
+export const DELIVERY_FITS: Fit[] = ['cover', 'contain', 'blur'];
+
+/** What the delivery-frame button says of a project cut for `format`: its size and the project's
+ *  own fit — not the matching preset's, which only shares the size. */
+export function deliveryTip(format: Delivery | null | undefined): string {
+	return format
+		? `Delivering ${format.width}\u00d7${format.height} — ${fitLabel(format.fit)}. Click to change.`
+		: 'The frame follows the footage. Click to cut for a delivery shape.';
+}
+
+/** The fits the delivery-frame menu offers for `format`, the project's own one ticked; none
+ *  without a frame. */
+export function fitChoices(format: Delivery | null | undefined): { fit: Fit; label: string; checked: boolean }[] {
+	if (!format) return [];
+	return DELIVERY_FITS.map((fit) => ({ fit, label: `Footage: ${fitLabel(fit)}`, checked: fit === format.fit }));
 }

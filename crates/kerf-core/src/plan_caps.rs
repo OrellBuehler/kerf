@@ -196,6 +196,9 @@ pub enum Unsupported {
     Delivery(String),
     /// The delivery is a gif, which goes through a palette the compositor does not build.
     Gif,
+    /// The delivery fits footage over a blurred copy of itself ([`crate::model::Fit::Blur`]): FFmpeg's
+    /// `boxblur` on a thumbnail scaled back up, with no compositor pass or parity case yet.
+    BlurFill,
     /// The canvas and each clip's `fps` filter parse the delivery rate to different rationals
     /// (`canvas`, `clips`), so a clip's frame slots are not the canvas's frames: the pick
     /// assumes one grid.
@@ -301,6 +304,7 @@ impl Unsupported {
             Self::Motion => "motion",
             Self::Delivery(_) => "delivery",
             Self::Gif => "gif",
+            Self::BlurFill => "blur_fill",
             Self::PickRate { .. } => "pick_rate",
             Self::Hdr(_) => "hdr",
             Self::AlphaPicture(..) => "alpha_picture",
@@ -356,6 +360,7 @@ impl fmt::Display for Unsupported {
             Self::Motion => f.write_str("the plan is of an export frame (motion mode), which the compositor does not draw yet"),
             Self::Delivery(pf) => write!(f, "the delivery is {pf}, and the compositor draws 8-bit 4:2:0 only"),
             Self::Gif => f.write_str("a gif delivery goes through a palette the compositor does not build"),
+            Self::BlurFill => f.write_str("the delivery fills the frame with a blurred copy of the footage, which the compositor does not draw"),
             Self::PickRate { canvas, clips } => write!(
                 f,
                 "the delivery rate is {}/{} on the canvas and {}/{} on a clip's fps filter, which are different frame grids",
@@ -488,6 +493,7 @@ mod tests {
         let kinds = [
             Unsupported::Motion.kind(),
             Unsupported::Gif.kind(),
+            Unsupported::BlurFill.kind(),
             Unsupported::Text.kind(),
             Unsupported::TextWithoutFont.kind(),
             Unsupported::TextBorder.kind(),

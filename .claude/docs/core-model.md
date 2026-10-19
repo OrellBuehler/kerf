@@ -174,7 +174,8 @@
   that the fit never binds, so nothing that never picked a frame moved. A `Track`
   carries a `duck` flag (sidechain-ducked under the rest of the mix on export).
   `Fit` and `Delivery` live here (the domain owns the delivery shape; `engine::cli`
-  re-exports `Fit`), and `Timeline.format` is the frame the project is cut for.
+  re-exports `Fit`: `Contain`, `Cover`, and `Blur` — Contain over a blurred copy of the picture,
+  `engine-cli.md`), and `Timeline.format` is the frame the project is cut for.
   **Smart crop** is here too and pure + unit-tested: `SalienceMap::crop_for` slides a
   window of the delivery aspect across the sampled map and returns the `CropFrame`
   (per-edge fractions, plus how far off centre it landed) that keeps the content —

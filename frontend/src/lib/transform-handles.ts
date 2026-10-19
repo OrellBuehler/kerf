@@ -309,12 +309,12 @@ export type Edge = 'left' | 'right' | 'top' | 'bottom';
 /** The smallest share of the source a crop leaves on an axis. */
 export const MIN_CROP_LEFT = 0.02;
 
-/** Whether the edges of this layer can be cropped where it is drawn: a Contain fit (a Cover fit
- *  shows a frame-shaped window of the picture whatever the crop, so its edges are not the crop's),
+/** Whether the edges of this layer can be cropped where it is drawn: a Contain or blurred fit (a
+ *  Cover fit shows a frame-shaped window of the picture whatever the crop, so its edges are not the crop's),
  *  and a position, scale and rotation that are not keyed (the crop is one number for the whole
  *  clip, and keeping the picture still while it changes moves those). */
 export function croppable(clip: Clip, canvas: Canvas): boolean {
-	return canvas.fit === 'contain' && !(['scale', 'pos_x', 'pos_y', 'rotation'] as const).some((p) => isKeyed(clip, p));
+	return canvas.fit !== 'cover' && !(['scale', 'pos_x', 'pos_y', 'rotation'] as const).some((p) => isKeyed(clip, p));
 }
 
 /** The contain fit's ideal factor for a `w`×`h` window: canvas px per source px. */
