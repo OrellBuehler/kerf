@@ -2524,4 +2524,31 @@ three</text>"##,
         slow.by = AnimateBy::Word;
         assert_eq!(outline(&animated_with(&text, &slow)).count, 1);
     }
+
+    #[test]
+    fn a_span_in_an_animated_text_keeps_its_paint_and_its_words_animate_as_units() {
+        let a = TextAnimation {
+            by: AnimateBy::Word,
+            ..text_animation_preset("fade_in").unwrap().animation
+        };
+        let src = doc(&format!(
+            r##"<rect width="400" height="200" fill="#123"/><text id="t" x="20" y="110" font-family="Geist" font-size="60" text-anchor="middle" fill="#fe8" data-kerf-animate='{}'>Kite <tspan fill="#0cf" font-weight="bold">fun</tspan> lab</text>"##,
+            a.to_attribute()
+        ));
+        let out = outline(&src);
+        assert_eq!(out.count, 1, "{:?}", out.kept);
+        assert_eq!(out.svg.matches("attributeName=\"opacity\"").count(), 3, "a unit a word");
+        assert!(out.svg.contains("<g fill=\"#0cf\">"), "the span's paint is round its glyphs");
+        let parsed = SvgDoc::parse(&out.svg).unwrap();
+        assert!(parsed.warnings().is_empty(), "{:?}", parsed.warnings());
+        let rest = pixels(&SvgDoc::parse(&outline(&at_rest(&src)).svg).unwrap().at(0.0));
+        assert_eq!(
+            ink(&parsed, parsed.natural_duration().unwrap() + 1.0),
+            rest,
+            "ends as the text is"
+        );
+        // The middle word has not come in while the first has.
+        let early = ink(&parsed, 0.35);
+        assert_ne!(early, rest);
+    }
 }
