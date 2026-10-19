@@ -598,7 +598,13 @@ mod tests {
                 .apply_template_parsed(prepared, 10.0, None, SvgLayout::default())
                 .unwrap();
             assert!(agent.timeline().unwrap().svg_overlays.is_empty(), "staged, not applied");
-            assert_eq!(agent.working_timeline().unwrap().svg_overlays.len(), 2);
+            let mut working = agent.working_timeline().unwrap();
+            assert_eq!(working.svg_overlays.len(), 2);
+            // Stored as outlines; an agent's read shows the text it can set.
+            assert!(working.svg_overlays.iter().any(|o| o.svg.contains("data-kerf-text")));
+            super::super::restore_title_text(&mut working);
+            assert!(working.svg_overlays.iter().all(|o| !o.svg.contains("data-kerf")));
+            assert!(working.svg_overlays.iter().any(|o| o.svg.contains(">See you soon</text>")));
             out
         };
         let summary = serde_json::to_value(SvgOverlayOutcome::from(out)).unwrap();

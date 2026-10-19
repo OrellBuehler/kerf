@@ -34,8 +34,8 @@ use fontdb::{Database, Family, Query, Stretch, Style, Weight, ID};
 use roxmltree::{Document, Node, NodeId, NodeType};
 use skrifa::MetadataProvider;
 
-use super::sanitize::{apply, escape_attr, SVG_NS, XLINK_NS};
-use super::{invalid, xml_options, MAX_BYTES};
+use super::sanitize::{apply, escape_attr, nesting_exceeds, SVG_NS, XLINK_NS};
+use super::{invalid, xml_options, MAX_BYTES, MAX_DEPTH};
 use crate::error::Result;
 use crate::fonts;
 use crate::text::{self, Align, Baseline, Face, Paragraph, Run, Variation};
@@ -58,6 +58,8 @@ const MAX_SEARCHES: usize = 16;
 const MAX_TEXTS: usize = 256;
 /// How far from the origin a glyph may be set, in user units.
 const MAX_COORD: f32 = 1e6;
+/// The fewest bytes a glyph's path takes (`<path d="M0 0h1v1h-1z"/>`).
+const MIN_GLYPH_BYTES: usize = 24;
 
 /// What setting a document's text as outlines did.
 #[derive(Debug, Clone, PartialEq)]
@@ -156,9 +158,17 @@ const SPAN_REFUSED: &[&str] = &[
 // ---- restoring ------------------------------------------------------------------------------------
 
 /// `src` with every outlined text back as the `<text>` it was. A document with none comes back as it is.
-pub(crate) fn restore_text(src: &str) -> Result<String> {
+/// The source may be a stored file's, not yet sanitised: one over the size or nesting cap is refused
+/// before it is parsed (roxmltree recurses once per open element).
+pub fn restore_text(src: &str) -> Result<String> {
     if !src.contains(TEXT_MARK) {
         return Ok(src.to_string());
+    }
+    if src.len() > MAX_BYTES {
+        return Err(invalid(format!("the SVG is larger than {} KiB", MAX_BYTES / 1024)));
+    }
+    if nesting_exceeds(src, MAX_DEPTH) {
+        return Err(invalid(format!("the SVG is nested deeper than {MAX_DEPTH} elements")));
     }
     let doc = Document::parse_with_options(src, xml_options()).map_err(|e| invalid(format!("not valid XML: {e}")))?;
     let head = format!("<g {TEXT_MARK}=\"\"");
@@ -460,13 +470,33 @@ struct Animation {
     url: bool,
 }
 
-fn animations(doc: &Document) -> Vec<Animation> {
-    let by_id: HashMap<&str, NodeId> = doc
-        .descendants()
+/// Every element by `id`, the first of a repeated one (as usvg resolves a reference).
+fn by_id<'a>(doc: &'a Document) -> HashMap<&'a str, NodeId> {
+    doc.descendants()
         .filter(Node::is_element)
         .filter_map(|n| Some((n.attribute("id")?, n.id())))
         .rev()
-        .collect();
+        .collect()
+}
+
+/// The element `n`'s `href` (or `xlink:href`) names in the document.
+fn href_target(n: &Node, by_id: &HashMap<&str, NodeId>) -> Option<NodeId> {
+    let href = n.attribute("href").or_else(|| n.attribute((XLINK_NS, "href")))?;
+    by_id.get(href.trim().strip_prefix('#')?).copied()
+}
+
+/// What each `<use>` instances. A text there, or inside it, stays text: an instance takes its inherited
+/// properties from the `<use>`, and a `<g>` instanced in a `<clipPath>` clips nothing.
+fn use_targets(doc: &Document) -> Vec<NodeId> {
+    let by_id = by_id(doc);
+    doc.descendants()
+        .filter(|n| n.is_element() && n.tag_name().name() == "use")
+        .filter_map(|n| href_target(&n, &by_id))
+        .collect()
+}
+
+fn animations(doc: &Document) -> Vec<Animation> {
+    let by_id = by_id(doc);
     doc.descendants()
         .filter(|n| {
             n.is_element()
@@ -476,10 +506,10 @@ fn animations(doc: &Document) -> Vec<Animation> {
                 )
         })
         .filter_map(|n| {
-            let href = n.attribute("href").or_else(|| n.attribute((XLINK_NS, "href")));
-            let target = match href {
-                Some(h) => *by_id.get(h.trim().strip_prefix('#')?)?,
-                None => n.parent_element()?.id(),
+            let linked = n.attribute("href").is_some() || n.attribute((XLINK_NS, "href")).is_some();
+            let target = match linked {
+                true => href_target(&n, &by_id)?,
+                false => n.parent_element()?.id(),
             };
             let attr = match n.tag_name().name() {
                 "animateTransform" => "transform".to_string(),
@@ -633,6 +663,12 @@ fn spec(css: &Cascade, owner: Node) -> std::result::Result<Spec, String> {
     refuse("alignment-baseline", &["auto", "baseline"], false)?;
     refuse("baseline-shift", &["baseline", "0"], false)?;
     refuse("stroke-dasharray", &["none"], true)?;
+    // The glyphs are paths: a text ignores these, a path does not (aliased edges, a marker at every
+    // glyph's vertices).
+    refuse("shape-rendering", &["auto", "geometricPrecision"], true)?;
+    for p in ["marker", "marker-start", "marker-mid", "marker-end"] {
+        refuse(p, &["none"], true)?;
+    }
     if css.get(owner, "font", true).is_some() {
         return Err("the font shorthand".into());
     }
@@ -695,13 +731,19 @@ fn spec(css: &Cascade, owner: Node) -> std::result::Result<Spec, String> {
     if !(size.is_finite() && size > 0.0) {
         return Err("a font size that is not positive".into());
     }
+    let letter_spacing = css.length(owner, "letter-spacing", true)?.unwrap_or(0.0);
+    // Glyphs pulled into each other: a text fills all of them and then strokes them, a path per glyph
+    // fills over the stroke of the one before it where they overlap.
+    if letter_spacing < 0.0 && css.get(owner, "stroke", true).is_some_and(|v| v != "none") {
+        return Err("a stroke with negative letter-spacing".into());
+    }
     Ok(Spec {
         families,
         weight: css.font_weight(owner),
         style,
         stretch,
         size,
-        letter_spacing: css.length(owner, "letter-spacing", true)?.unwrap_or(0.0),
+        letter_spacing,
         word_spacing: css.length(owner, "word-spacing", true)?.unwrap_or(0.0),
         kerning,
         opsz: css.get(owner, "font-optical-sizing", true).as_deref() != Some("none"),
@@ -842,7 +884,11 @@ struct Ctx<'a, 'd> {
     src: &'a str,
     css: &'a Cascade<'a>,
     anims: &'a [Animation],
+    /// What the document's `<use>` elements instance.
+    uses: &'a [NodeId],
     faces: Faces<'d>,
+    /// The bytes the outlines may still add before the title is over its size cap.
+    room: usize,
 }
 
 /// `node` set by the text engine, `Ok(None)` when it has nothing to draw, or why it stays text.
@@ -872,6 +918,9 @@ fn set(cx: &mut Ctx, node: Node) -> std::result::Result<Option<Set>, String> {
         ) {
             return Err(format!("inside <{name}>"));
         }
+    }
+    if node.ancestors().any(|a| cx.uses.contains(&a.id())) {
+        return Err("instanced by a <use>".into());
     }
     for attr in ["dx", "dy", "rotate", "textLength", "lengthAdjust"] {
         if node.attribute(attr).is_some() {
@@ -973,6 +1022,12 @@ fn set(cx: &mut Ctx, node: Node) -> std::result::Result<Option<Set>, String> {
     };
     if chars.iter().all(|(c, _)| c.is_whitespace()) {
         return Ok(None);
+    }
+    // Each character that is not a space is a path of at least this much: a text that cannot fit is not
+    // laid out to find that out.
+    let visible = chars.iter().filter(|(c, _)| !c.is_whitespace()).count();
+    if visible.saturating_mul(MIN_GLYPH_BYTES) > cx.room {
+        return Err(format!("outlines that would take the title over {} KiB", MAX_BYTES / 1024));
     }
     let specs: Vec<Spec> = owners
         .iter()
@@ -1216,15 +1271,18 @@ pub(crate) fn outline_text(src: &str, db: &Database) -> Result<Outlined> {
     let doc = Document::parse_with_options(src, xml_options()).map_err(|e| invalid(format!("not valid XML: {e}")))?;
     let css = Cascade::new(&doc);
     let anims = animations(&doc);
+    let uses = use_targets(&doc);
     let mut cx = Ctx {
         src,
         css: &css,
         anims: &anims,
+        uses: &uses,
         faces: Faces {
             db,
             read: HashMap::new(),
             fallbacks: HashMap::new(),
         },
+        room: MAX_BYTES.saturating_sub(src.len()),
     };
     let mut cuts = Vec::new();
     let mut count = 0;
@@ -1244,6 +1302,8 @@ pub(crate) fn outline_text(src: &str, db: &Database) -> Result<Outlined> {
             || css.get(node, "white-space", true).as_deref() == Some("pre-line");
         match plan(&mut cx, node) {
             Ok(Some(mut c)) => {
+                let grown = c.iter().map(|(r, s)| s.len().saturating_sub(r.len())).sum::<usize>();
+                cx.room = cx.room.saturating_sub(grown);
                 cuts.append(&mut c);
                 count += 1;
                 if wraps {
@@ -1325,11 +1385,13 @@ mod tests {
             src,
             css: &css,
             anims: &anims,
+            uses: &[],
             faces: Faces {
                 db: &db,
                 read: HashMap::new(),
                 fallbacks: HashMap::new(),
             },
+            room: MAX_BYTES,
         };
         let mut out = Vec::new();
         for node in doc.descendants().filter(|n| n.is_element() && n.tag_name().name() == "text") {
@@ -1422,11 +1484,13 @@ mod tests {
                 src: &src,
                 css: &css,
                 anims: &[],
+                uses: &[],
                 faces: Faces {
                     db: &db,
                     read: HashMap::new(),
                     fallbacks: HashMap::new(),
                 },
+                room: MAX_BYTES,
             };
             let node = doc_.descendants().find(|n| n.has_tag_name((SVG_NS, "text"))).unwrap();
             let [x0, y0, x1, y1] = set(&mut cx, node).unwrap().unwrap().lay.bounds.unwrap();
@@ -1481,12 +1545,67 @@ mod tests {
             r#"<text id="t" x="20" y="100" font-family="Geist" font-size="40">Hello</text>"#,
             "<text x=\"5\" y=\"50\" font-family=\"Geist\">\n  a <tspan id=\"s\" font-weight=\"bold\">b</tspan>\n  <animate attributeName=\"opacity\" from=\"0\" to=\"1\" dur=\"1s\"/>\n</text><text x=\"5\" y=\"90\">c</text>",
             r#"<rect width="1" height="1"/>"#,
+            r#"<text x="5" y="50" font-family="Geist"><![CDATA[a < b </text>]]></text>"#,
+            r#"<text x="5" y="50" font-family="Geist">fish &amp; chips &#x41;&lt;/text&gt;</text>"#,
+            r#"<text x="5" y="50" font-family="Geist">a<!-- </text> -->b</text>"#,
+            r#"<text x="5" y="50" font-family="Geist">a<?pi </text> ?>b</text>"#,
+            r#"<text x="5" y="50" font-family="Geist">spaced</text >"#,
+            r#"<text x="5" y="50" font-family="Geist" data-x="&lt;/text&gt;">attr</text>"#,
+            r#"<text x="5" y="50" font-family="Geist"/><text x="5" y="90" font-family="Geist">after</text>"#,
+            r#"<s:text xmlns:s="http://www.w3.org/2000/svg" x="5" y="50" font-family="Geist">prefixed</s:text>"#,
         ] {
             let src = doc(body);
             let out = outline(&src);
-            assert_eq!(restore_text(&out.svg).unwrap(), src);
+            assert_eq!(restore_text(&out.svg).unwrap(), src, "{body}");
             assert_eq!(restore_text(&src).unwrap(), src);
         }
+    }
+
+    #[test]
+    fn restoring_refuses_a_document_nested_past_the_cap_before_reading_it() {
+        let deep = 100_000;
+        let src = doc(&format!(
+            r#"<g {TEXT_MARK}="">{}{}</g>"#,
+            "<g>".repeat(deep),
+            "</g>".repeat(deep)
+        ));
+        assert!(restore_text(&src).is_err());
+        let big = doc(&format!(r#"<g {TEXT_MARK}="">{}</g>"#, " ".repeat(MAX_BYTES)));
+        assert!(restore_text(&big).is_err());
+    }
+
+    #[test]
+    fn a_text_that_cannot_fit_the_cap_is_not_laid_out() {
+        let src = doc(&format!(
+            r#"<text x="5" y="50" font-family="Geist" style="inline-size:390px">{}</text>"#,
+            "ab ".repeat(30_000)
+        ));
+        let started = std::time::Instant::now();
+        let out = outline(&src);
+        assert_eq!(out.count, 0);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(out.warnings.iter().any(|w| w.contains("KiB")), "{:?}", out.warnings);
+    }
+
+    #[test]
+    fn a_text_a_use_instances_stays_text_and_still_clips() {
+        let src = doc(concat!(
+            r##"<defs><clipPath id="c"><use href="#t"/></clipPath></defs>"##,
+            r##"<text id="t" x="20" y="120" font-family="Geist" font-size="90">CLIP</text>"##,
+            r##"<rect width="400" height="200" fill="#0af" clip-path="url(#c)"/>"##,
+        ));
+        let out = outline(&src);
+        assert_eq!(out.count, 0, "{}", out.svg);
+        let drawn = pixels(&out.svg);
+        assert!(
+            drawn.chunks(4).filter(|p| p[3] != 0).count() > 1000,
+            "the clipped rect is drawn"
+        );
+        assert_eq!(drawn, pixels(&src));
     }
 
     #[test]
@@ -1525,6 +1644,14 @@ mod tests {
             r##"<text x="5" y="50" font-family="Geist" stroke="#000" stroke-dasharray="2 2">dashed</text>"##,
             r#"<clipPath id="c"><text x="5" y="50" font-family="Geist">clip</text></clipPath>"#,
             "<text x=\"5\" y=\"50\" font-family=\"Geist\">\u{10FFFD}</text>",
+            // An instance takes its inherited properties from the `<use>`.
+            r##"<defs><text id="t" x="5" y="50" font-family="Geist">used</text></defs><use href="#t" font-size="30" text-anchor="middle"/>"##,
+            r##"<g id="w"><text x="5" y="50" font-family="Geist">in a used group</text></g><use xmlns:xlink="http://www.w3.org/1999/xlink" xlink:href="#w" y="40"/>"##,
+            r#"<text x="5" y="50" font-family="Geist" shape-rendering="crispEdges">crisp</text>"#,
+            r#"<g shape-rendering="optimizeSpeed"><text x="5" y="50" font-family="Geist">fast</text></g>"#,
+            r##"<marker id="m"><circle r="1"/></marker><g marker-start="url(#m)"><text x="5" y="50" font-family="Geist">marked</text></g>"##,
+            r##"<marker id="m"><circle r="1"/></marker><text x="5" y="50" font-family="Geist" style="marker-mid:url(#m)">marked</text>"##,
+            r##"<text x="5" y="50" font-family="Geist" stroke="#000" letter-spacing="-4">tight</text>"##,
         ] {
             let src = doc(body);
             let out = outline(&src);

@@ -10,6 +10,7 @@
 //! Coordinates are user units, y down. The origin is the anchor of the first line's baseline;
 //! lines follow one line height apart.
 
+use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -240,12 +241,8 @@ fn shape(chars: &[(usize, char, usize, usize)], rtl: bool, runs: &[Run], faces: 
         vec![Feature::new(Tag::new(b"kern"), 0, ..)]
     };
     let out = shaper.shape(buf, ShapeOptions::new().features(&features));
-    let run_of = |cluster: usize| {
-        chars
-            .iter()
-            .find(|c| c.0 == cluster)
-            .map_or((first, first_face), |c| (c.2, c.3))
-    };
+    let by_byte: HashMap<usize, (usize, usize)> = chars.iter().rev().map(|c| (c.0, (c.2, c.3))).collect();
+    let run_of = |cluster: usize| by_byte.get(&cluster).copied().unwrap_or((first, first_face));
     out.glyph_infos()
         .iter()
         .zip(out.glyph_positions())
@@ -266,8 +263,13 @@ fn shape(chars: &[(usize, char, usize, usize)], rtl: bool, runs: &[Run], faces: 
         .collect()
 }
 
-/// The run covering byte `b` (the last one starting before it past the end).
+/// The run covering byte `b` (the last one starting before it past the end). The runs are in text
+/// order, so the one that starts last at or before `b` is the one, unless it is empty.
 fn run_at(runs: &[Run], b: usize) -> usize {
+    let last = runs.partition_point(|r| r.range.start <= b).saturating_sub(1);
+    if runs.get(last).is_some_and(|r| r.range.contains(&b)) {
+        return last;
+    }
     runs.iter()
         .position(|r| r.range.contains(&b))
         .unwrap_or_else(|| runs.iter().rposition(|r| r.range.start <= b).unwrap_or(0))
@@ -365,7 +367,13 @@ fn paragraph(
             cluster_adv[cl] += it.glyphs[k].adv;
         }
     }
-    let range_w = |r: Range<usize>| -> f32 { cluster_adv[r].iter().sum() };
+    // Sums from the start, so a line's width is one subtraction however often a break is tried (and,
+    // for a line from the start, the very sum the pen makes).
+    let mut sums = vec![0.0f32; cluster_adv.len() + 1];
+    for (i, a) in cluster_adv.iter().enumerate() {
+        sums[i + 1] = sums[i] + a;
+    }
+    let range_w = |r: Range<usize>| -> f32 { sums[r.end] - sums[r.start] };
     let trailing_ws = |r: &Range<usize>| -> usize {
         let mut end = r.end;
         for (b, c) in text[r.clone()].char_indices().rev() {

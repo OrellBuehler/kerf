@@ -44,7 +44,7 @@ use anim::{Calc, Resolver, Restart, Sample, Spec, TimeItem, Timing, INF};
 use sanitize::{escape_attr, is_attribute_name, plain_attribute, value_range, SVG_NS, XLINK_NS};
 use values::{TransformType, Value};
 
-pub(crate) use outline::restore_text;
+pub use outline::restore_text;
 pub use presets::{check_params, preset_infos, render_preset, SvgPresetInfo, SvgPresetParamInfo, DEFAULT_FRAME};
 
 /// Whether sanitised source could move at all: whether it holds an animation element (`animate`,

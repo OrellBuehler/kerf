@@ -260,8 +260,8 @@ stage like any agent edit (`set_template_values` reads the title it splices from
 title that changed in between: "try again"). Both answer `SvgOverlayOutcome` — the title as an `SvgOverlaySummary`, whose new
 `template` (`template_id`, `name`, `controls` without their targets, `values`) is how an agent learns the control ids to set,
 and `warnings`; `timeline_summary` lists it the same way. (A template title's `svg` holds its text as glyph outlines, a
-`<g data-kerf-text="">` with the text still inside it: an agent reads and sets the text through `values` /
-`set_template_values`, never by editing those paths.) `values` are strings by control id (partial; an unknown id is
+`<g data-kerf-text="">` with the text still inside it; `get_timeline_state` shows it in its text form (`svg::restore_text`,
+before the 4 KiB elision, its description says so), and an agent sets the text through `set_template_values`.) `values` are strings by control id (partial; an unknown id is
 `invalid_params`); an `image` control takes a picture **file** through `image_files` (control id → absolute path, at most 8,
 `require_local_input_path` then `crate::template_image_data_url`: the file is opened, looked at through the handle and read at most
 one byte past `template::MAX_IMAGE_BYTES` — 94 KiB, what fits in a title, the limit the engine judges by — and then

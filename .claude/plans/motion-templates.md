@@ -208,8 +208,8 @@ binding is `svg/outline.rs`. Details: `core-project.md` ("Text as glyph outlines
   suggested. Values always go into the **text form** (`svg::restore_text`), then `SvgDoc::outlined(db)` sets it again.
 - **Stored form**: the `<text>` renamed `<g data-kerf-text="">`, everything it had still inside, plus a generated
   `<g data-kerf-glyphs="">` (bounding-box path, one path per glyph). Reversible byte for byte; `read_values`, `apply_values`, the
-  controls and the save dialog work unchanged. **No schema step** (the stored shape is the same string); an older build draws
-  the title but cannot set its text again.
+  controls and the save dialog work unchanged. **Schema step v8**, a JSON step with no table change: the shape is the same
+  string, but an older build draws the title and cannot set its text again (it splices into the hidden runs).
 - **Fonts**: the `font-family` stays in the source, so `collect_unused_fonts` keeps a template's fonts while its controls can
   set the text again, and the `FontSet` / cache key are unchanged. A missing font no longer changes the picture.
 - **Fidelity**: glyph origins and the bounding box match usvg's to 0.02 units, the picture to anti-aliasing. Whatever the engine
