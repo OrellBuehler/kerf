@@ -516,6 +516,10 @@ fn a_v4_file_is_stamped_v5_without_a_backup_and_keeps_its_title_clips() {
     assert_eq!(clip.title_clip().unwrap().svg, title.title_clip().unwrap().svg);
     drop(project);
     let names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
-    assert_eq!(names, vec![std::ffi::OsString::from("cut.kerf")], "nothing in the file changed, so no backup");
+    assert_eq!(
+        names,
+        vec![std::ffi::OsString::from("cut.kerf")],
+        "nothing in the file changed, so no backup"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }

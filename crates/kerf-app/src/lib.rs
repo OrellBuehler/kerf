@@ -2882,7 +2882,12 @@ async fn update_title_clip(state: State<'_, AppState>, clip_id: String, patch: T
     let cid = id(&clip_id, "clip_id")?;
     let shared = state.project.clone();
     blocking(move || {
-        let doc = patch.svg.as_deref().map(kerf_core::SvgDoc::parse).transpose().map_err(|e| e.to_string())?;
+        let doc = patch
+            .svg
+            .as_deref()
+            .map(kerf_core::SvgDoc::parse)
+            .transpose()
+            .map_err(|e| e.to_string())?;
         let project = lock_user(&shared);
         let done = project.update_title_clip_parsed(cid, patch, doc).map_err(|e| e.to_string())?;
         Ok(TemplateEdit::of_clip(project.timeline().map_err(|e| e.to_string())?, done))

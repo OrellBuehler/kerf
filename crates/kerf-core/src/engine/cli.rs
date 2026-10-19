@@ -8970,7 +8970,11 @@ fn still_titles(
     let (fmt, _, ow, oh) = still_canvas(&rendered, assets, opts, max_width, region);
     let t = t.max(0.0);
     let mut pictures = svg_layer::still_svgs(&rendered, ow, oh, t);
-    pictures.extend(still_clip_pictures(&still_layers(&rendered, assets, fmt.fps, t), ow, oh).into_iter().flatten());
+    pictures.extend(
+        still_clip_pictures(&still_layers(&rendered, assets, fmt.fps, t), ow, oh)
+            .into_iter()
+            .flatten(),
+    );
     svg_layer::ensure_stills(&pictures)
 }
 

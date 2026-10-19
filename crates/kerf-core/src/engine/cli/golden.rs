@@ -985,7 +985,11 @@ fn title_clip_for(tl: &mut Timeline, j: usize) {
             let mut track = Track::new(StreamKind::Video, "TT");
             track.id = r.id();
             track.clips.push(clip);
-            let at = tl.tracks.iter().rposition(|t| t.kind == StreamKind::Video).map_or(0, |i| i + 1);
+            let at = tl
+                .tracks
+                .iter()
+                .rposition(|t| t.kind == StreamKind::Video)
+                .map_or(0, |i| i + 1);
             tl.tracks.insert(at, track);
         }
     }
@@ -1513,7 +1517,9 @@ fn families(c: &Case, assets: &[Asset], text: &[String; 3], table: &[(&str, &str
             "title-clip-under-transition",
         ),
         (
-            c.stills.iter().any(|(t, _)| layers(*t).iter().any(|l| l.active.clip.is_generated())),
+            c.stills
+                .iter()
+                .any(|(t, _)| layers(*t).iter().any(|l| l.active.clip.is_generated())),
             "still-title-clip",
         ),
         (stamped_chain(&flat[2]), "preview-title-clip"),
