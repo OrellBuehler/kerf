@@ -1703,6 +1703,34 @@ fn a_keyed_opacity_is_the_geq_alpha_of_each_frame() {
         upto(1.0, 30.0),
         "below full opacity",
     );
+    // ... and drawn while the curve holds 1 (its `geq` writes the mask), refused once it falls.
+    let mut masked = fading(&m.testsrc, vec![key(0.0, 1.0), key(0.5, 1.0), key(1.0, 0.3)]);
+    masked.mask = Some(mask_of(kerf_core::MaskShape::Ellipse, 0.1, false));
+    run_refusing(
+        "keyed opacity/under a mask, 1 then falling",
+        &over_the_bars(masked),
+        &assets,
+        30.0,
+        1.0,
+        EXACT,
+        &refusing("MaskWith", |u| matches!(u, Unsupported::MaskWith(..))),
+    );
+    // Under a chroma key the same `geq` reads the key's alpha plane (`alpha(X,Y)`), and on a build whose `geq` reads a
+    // plane's last column and row one in (6.1) that is the key's alpha one in: measured 21 levels of luma at the
+    // edge, on the frames where the curve holds 1. Refused for the clip, on those frames too (3 is at 255).
+    let mut keyed_out = fading(&m.testsrc, vec![key(0.0, 1.0), key(0.5, 1.0), key(1.0, 0.3)]);
+    keyed_out.effects = vec![crate::key("green", 0.2, 0.2)];
+    let tl = over_the_bars(keyed_out);
+    for frames in [3..4, upto(1.0, 30.0)] {
+        refused(
+            "keyed opacity/under a chroma key",
+            &tl,
+            &assets,
+            &at_fps(30.0),
+            frames,
+            "under a keyed opacity",
+        );
+    }
     // Turned: the `rotate` that follows the `geq` turns its alpha plane with the picture.
     let mut turned = fading(&m.smooth, vec![key(0.0, 0.3), key(1.0, 0.9)]);
     turned.transform.rotation = 12.0;

@@ -285,7 +285,10 @@
   curve evaluated by `engine::keyframe_value`, which is `keyframe_expr`'s arithmetic in its own order (the same segment by the same
   comparisons, the constants the `f64`s `av_expr` parses back; `sweep.rs` holds it to the evaluated text to the bit), at `T` =
   `ffmpeg_frame_time(k)` on the clip's `fps` grid, as `geq` reads `pts * av_q2d(tb)`; `None` in a still (which samples the opacity
-  and draws it like a static one) and for a curve that never leaves 1 (no `geq`). **With `keyed_zoom` the plan still refuses a rotation, an opacity below 1 and a dip to white in front of a moving
+  and draws it like a static one) and for a curve that never leaves 1 (no `geq`). That `geq` is the mask's too, so the opacity a
+  mask, a chroma key or a moving zoom is judged by is the layer's `keyed_alpha < 255` as well as the sampled opacity (`mask_refusal`,
+  `zoom_order_refusal`), and **a chroma key under a keyed opacity is refused for the clip** (`Effects`, every frame of it: `geq` reads the
+  key's alpha plane, one in at the edge on 6.1). **With `keyed_zoom` the plan still refuses a rotation, an opacity below 1 and a dip to white in front of a moving
   zoom** (`ZoomBehind(layer, what)`, Still and Motion alike: the rotated alpha plane and the RGB round trip would have to be scaled
   with the zoom), and without it a Still refuses a grade, rotation, opacity, mask or effect in front of one. The old API stays: `gpu_supported()` / `unsupported_reasons()` (an owned
   `Vec<String>`) / `unsupported_reasons_at(size)` / `gpu_supported_at(size)` are

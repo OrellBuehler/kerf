@@ -650,8 +650,14 @@ clip's `fps` grid) where a constant opacity takes `colorchannelmixer` and the RG
 no round trip; the clip's fades and a dissolve's ramp act on it as on any alpha plane. The `geq` also copies Y, U and V through
 `lum` / `cb` / `cr`, so on a build whose `geq` reads a plane's last column and row one in (6.1) the blend reads them so too
 (`mask_edge`, as for a mask). Byte for byte at the picture's size (linear, eased, held, bezier off the frame grid, a tree of many
-keys, 29.97, with fades, in a dissolve); the scaler's level on a pip or an odd size; `ROTATED` turned. A mask with it is refused
-on the frames below 1 (`MaskWith`: one `geq` multiplies both).
+keys, 29.97, with fades, in a dissolve); the scaler's level on a pip or an odd size; `ROTATED` turned. A mask with it is drawn
+while the curve holds 1 (the `geq` writes the mask, byte for byte) and refused on the frames below it (`MaskWith`: one `geq`
+multiplies both); **the alpha judged is the `geq`'s own (`keyed_alpha < 255`), not the sampled opacity**, which can sit on the
+other side of 1 by the last bit. A **chroma key under it is refused for the clip** (`Effects`, on the frames at 255 too, so a clip is
+not drawn by two renderers in turn): that `geq` reads the key's plane (`alpha(X,Y)`), and on a build that reads a plane's last
+column and row one in (6.1) it reads the key's alpha there one in, which the compositor's key does not (measured on the frames at
+255: luma 21 off at the edge, 2636 samples over 14 frames; 9.0.2 is exact, so shifting the key's alpha under `mask_edge` is the
+follow-up, with its zoom-last variant). The compositor refuses the combination itself too.
 
 **Effects.**
 
@@ -695,7 +701,7 @@ on the frames below 1 (`MaskWith`: one `geq` multiplies both).
   format: other planes, another dither course), a vignette map over the device's storage-buffer limit; a chroma key after a scale or a
   blur (its alpha moves by up to 1/blend levels for a level of chroma, and a blend of 0 flips it 0 to 255: drawn only on chroma that is
   FFmpeg's to the level), on a picture that is not `yuv420p` or whose format says full range, on a rotated layer or one below full
-  opacity, on one narrower or shorter than 2, or with a similarity or a blend `chromakey` refuses (0.00001 to 1, 0 to 1); `MaskWith`: a mask over a chroma key (`geq` multiplies the key's alpha). A sigma outside 0 to 1024
+  opacity, on one narrower or shorter than 2, or with a similarity or a blend `chromakey` refuses (0.00001 to 1, 0 to 1), or under a keyed opacity (see above); `MaskWith`: a mask over a chroma key (`geq` multiplies the key's alpha). A sigma outside 0 to 1024
   or an amount outside -2 to 5 (FFmpeg's options refuse them too), a blur over the device's storage-buffer limit, and a **sharpen that amplifies a difference upstream of it** (judged with the geometry, so by render size): FFmpeg's scale or blur is a level from ours, and `unsharp` carries it through at worst `1 + 2|amount|` at an edge sample and rounds up a level more with each further sharpen (its `>> 16` floors). From the first source (a scale before the effects: every stage, or the fit scale when a zoom comes last; or a blur with sigma > 0) the worst case starts at 1 and each later sharpen that is not zero at `unsharp`'s 16 bits adds `ceil(2 * err * |amount|)`; the frame is refused when it passes 2. So one sharpen of at most 0.5 is drawn (0.6 is not), and any second one is refused, however small. With no source upstream a sharpen is exact at any amount, chained or not, and a blur after it counts for nothing. `Matte`: a blur, a sharpen, a vignette or a chroma key on a
   letterbox (they would see the bars as picture; tables and a grade carry the bars through). By the picture (`effect_on_picture_refusal`): an invert,
   blur or sharpen on a **full-range** picture or one whose format was never recorded (`maybe_full_range_in(policy)`: where FFmpeg 9 negotiates the range this
@@ -782,7 +788,7 @@ the **unmeasured-policy** case (`Unknown`: BT.601 stacks drawn, BT.709 / BT.2020
 the **full-range grading** cases (a graded `yuvj` clip, and a graded layer in a stack with
 one, refused; ungraded and limited-range controls drawn),
 and **refusals** (an EXIF-oriented JPEG, FFV1 `yuva420p`, the same with the pixel
-format unrecorded, a translucent odd layer, a moving zoom behind a rotation, an opacity below 1 or a dip to white, a vignette on a 4:4:4 picture or a letterbox, a chroma key on a pip, after a blur, on a 4:4:4 picture, under a mask or on a rotated layer, a mask on a rotated or a translucent layer, a blur on a letterbox, an invert / blur / sharpen on a full-range picture, an invert on a gray one) —
+format unrecorded, a translucent odd layer, a moving zoom behind a rotation, an opacity below 1 or a dip to white, a vignette on a 4:4:4 picture or a letterbox, a chroma key on a pip, after a blur, on a 4:4:4 picture, under a mask or a keyed opacity or on a rotated layer, a mask on a rotated or a translucent layer, a blur on a letterbox, an invert / blur / sharpen on a full-range picture, an invert on a gray one) —
 each of which FFmpeg still renders (and a fade to black or white on a translucent layer, a dip to white on a rotated, letterboxed, odd, resized or non-`yuv420p` layer or beside a black fade, a fade on a full-range picture under FFmpeg 9), **transitions** (`transition/`, `transition-kind/`, `fade/`: every kind and a clip's own fades in a still, see
 above), **a moving zoom last, masks and effects** (`zoom/`, `zoom+mask/`, `mask/`, `effect/`, and `effect-planes/`: the blur, sharpen, tables and vignette plane by plane against the real filters, all sizes), and **text** (the `text/` family: the app's title and
 caption styles, positions and edges, boxes, colours, sizes, keyframed and overlapping overlays, escapes, installed fonts,

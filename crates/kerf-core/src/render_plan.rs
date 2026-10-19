@@ -1114,6 +1114,16 @@ impl RenderPlan {
                     "a chroma key on a rotated layer or one below full opacity",
                 ));
             }
+            // A keyed opacity is a `geq` that reads the key's alpha plane (`alpha(X,Y)`), which a build whose
+            // `geq` reads a plane's last column and row one in (6.1) does at the key's alpha as well; the
+            // compositor's key is the whole plane. Judged by the clip, not by this frame's alpha (255 on the
+            // frames the curve holds 1), so a clip is not drawn by one renderer and then the other.
+            if chroma_keyed && caps.effects.contains(EffectKinds::CHROMA_KEY) && layer.keyed_alpha.is_some() {
+                out.push(Unsupported::Effects(
+                    at(),
+                    "a chroma key under a keyed opacity (the geq that writes the opacity reads the key's alpha plane)",
+                ));
+            }
             if (layer.reframe.is_some() || layer.projection.is_some()) && !caps.reframe {
                 out.push(Unsupported::Reframe(at()));
             }
@@ -1266,13 +1276,15 @@ impl RenderPlan {
     /// takes, which is arithmetic on that alpha) and `rotate` (which turns the alpha plane with
     /// the picture, a partly transparent edge included). The opacity judged is the sampled one, the
     /// frame's own: a clip whose keys hold 1 here has no alpha to round-trip (a keyed opacity as such
-    /// is `KeyedOpacity`'s).
+    /// is `KeyedOpacity`'s). In an export frame the `geq` that writes a keyed opacity is the mask's
+    /// own (it multiplies the two, and a chroma key's alpha), so the alpha it writes counts too: below
+    /// 255 the layer is below full opacity, whatever the sample says.
     fn mask_refusal(&self, layer: &PlanLayer) -> Option<&'static str> {
         let rotated =
             layer.transform.rotation != 0.0 || (self.mode == PlanMode::Motion && layer.animated.is_some_and(|a| a.rotates));
         if rotated {
             Some("on a rotated layer")
-        } else if layer.transform.opacity < 1.0 {
+        } else if layer.transform.opacity < 1.0 || layer.keyed_alpha.is_some_and(|a| a < 255) {
             Some("on a layer below full opacity")
         } else {
             None
@@ -1289,7 +1301,7 @@ impl RenderPlan {
             layer.transform.rotation != 0.0 || (self.mode == PlanMode::Motion && layer.animated.is_some_and(|a| a.rotates));
         if rotated {
             Some("a rotation")
-        } else if layer.transform.opacity < 1.0 {
+        } else if layer.transform.opacity < 1.0 || layer.keyed_alpha.is_some_and(|a| a < 255) {
             Some("an opacity below 1")
         } else if ops
             .iter()

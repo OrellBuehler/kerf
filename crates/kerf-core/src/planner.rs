@@ -1483,6 +1483,100 @@ mod tests {
     }
 
     #[test]
+    fn a_keyed_opacity_shares_its_geq_with_a_mask_and_is_never_drawn_under_a_chroma_key() {
+        use crate::model::{PropertyKey, VideoEffect};
+        let a = asset();
+        let assets = [a.clone()];
+        let caps = GpuCaps {
+            motion: true,
+            fades: true,
+            transitions: true,
+            dip_white: true,
+            keyed_opacity: true,
+            keyed_zoom: true,
+            keyed_color: true,
+            mask: true,
+            text: true,
+            reframe: true,
+            hdr: true,
+            effects: EffectKinds::ALL,
+        };
+        let holding = |edit: &dyn Fn(&mut Clip)| {
+            let mut clip = make_clip(a.id, 0.0, 4.0, 0.0);
+            clip.set_property_keys(
+                Property::Opacity,
+                vec![
+                    PropertyKey::new(0.0, 1.0),
+                    PropertyKey::new(1.0, 1.0),
+                    PropertyKey::new(2.0, 0.3),
+                ],
+            );
+            edit(&mut clip);
+            planner(&single(vec![clip]), &assets, PlanMode::Motion, &opts(30.0))
+        };
+        let why = |p: &Planner, frame: u64| {
+            let plan = p.at_frame(frame).unwrap();
+            (plan.layers[0].keyed_alpha, plan.reasons(&caps, plan.size(u32::MAX)))
+        };
+        // Alone, on every frame.
+        let bare = holding(&|_| {});
+        for frame in [15, 45, 70] {
+            assert!(why(&bare, frame).1.is_empty(), "frame {frame}");
+        }
+        // Under a mask one `geq` multiplies both: drawn where the curve holds 1, refused once it falls.
+        let masked = holding(&|c| c.mask = Some(Mask::default()));
+        assert_eq!(why(&masked, 15), (Some(255), vec![]));
+        let (alpha, below) = why(&masked, 45);
+        assert_eq!(alpha, Some(165));
+        assert!(
+            matches!(below.as_slice(), [Unsupported::MaskWith(_, w)] if w.contains("below full opacity")),
+            "{below:?}"
+        );
+        // Under a chroma key `alpha(X,Y)` reads the key's plane (a plane's last column and row one in on some
+        // builds): refused for the clip, on the frames where the curve holds 1 as on the others.
+        let keyed = holding(&|c| {
+            c.effects = vec![VideoEffect::ChromaKey {
+                color: "green".into(),
+                similarity: 0.15,
+                blend: 0.1,
+            }];
+        });
+        for frame in [15, 45] {
+            let (alpha, why) = why(&keyed, frame);
+            assert!(alpha.is_some(), "frame {frame}");
+            assert!(
+                why.iter()
+                    .any(|u| matches!(u, Unsupported::Effects(_, w) if w.contains("under a keyed opacity"))),
+                "frame {frame}: {why:?}"
+            );
+        }
+        // A still samples the opacity (no `geq`), so a chroma key is judged by the sampled value as before.
+        let mut sampled = make_clip(a.id, 0.0, 4.0, 0.0);
+        sampled.effects = vec![VideoEffect::ChromaKey {
+            color: "green".into(),
+            similarity: 0.15,
+            blend: 0.1,
+        }];
+        sampled.set_property_keys(
+            Property::Opacity,
+            vec![
+                PropertyKey::new(0.0, 1.0),
+                PropertyKey::new(1.0, 1.0),
+                PropertyKey::new(2.0, 0.3),
+            ],
+        );
+        let still = planner(&single(vec![sampled]), &assets, PlanMode::Still, &opts(30.0));
+        let held = still.at(0.5).unwrap();
+        assert_eq!(held.layers[0].keyed_alpha, None);
+        assert!(held.reasons(&caps, held.size(u32::MAX)).is_empty());
+        let falling = still.at(1.5).unwrap();
+        assert!(falling
+            .reasons(&caps, falling.size(u32::MAX))
+            .iter()
+            .any(|u| matches!(u, Unsupported::Effects(_, w) if w.contains("below full opacity"))));
+    }
+
+    #[test]
     fn what_the_compositor_may_not_draw_is_a_function_of_the_plan_and_its_caps() {
         let a = asset();
         let mut clip = make_clip(a.id, 0.0, 4.0, 0.0);

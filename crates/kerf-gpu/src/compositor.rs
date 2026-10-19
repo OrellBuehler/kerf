@@ -1985,6 +1985,14 @@ impl Compositor {
         if let Some(table) = pending {
             steps.push(Step::Table(Box::new(table)));
         }
+        // One `geq` writes a keyed opacity and multiplies it into a mask's alpha or reads a key's
+        // (`alpha(X,Y)`, a plane's last column and row one in on some builds): neither is drawn below 1.
+        if layer.keyed_alpha.is_some() && key.is_some() {
+            return Err(unsupported("a chroma key under a keyed opacity".into()));
+        }
+        if layer.keyed_alpha.is_some_and(|a| a < 255) && layer.mask.is_some() {
+            return Err(unsupported("a mask under a keyed opacity below 1".into()));
+        }
         // `geq` runs on the frame `pad` made of a letterboxed picture, bars included: the mask is the
         // size of the whole layer there, the canvas.
         let mask = match &layer.mask {
