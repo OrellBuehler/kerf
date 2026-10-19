@@ -422,7 +422,7 @@ impl KerfMcp {
         self.edit(
             |project| match project.set_title_values_parsed(overlay_id, prepared).map_err(core_err)? {
                 TitleEdited::Overlay(out) => json(&SvgOverlayOutcome::from(out)),
-                TitleEdited::Clip(out) => json(&TitleClipOutcome::from(out)),
+                TitleEdited::Clip(out) => json(&TitleClipOutcome::from(*out)),
             },
         )
     }

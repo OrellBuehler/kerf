@@ -2920,7 +2920,7 @@ async fn set_template_values(
                 clip_id: None,
                 warnings: o.warnings,
             },
-            TitleEdited::Clip(c) => TemplateEdit::of_clip(timeline, c),
+            TitleEdited::Clip(c) => TemplateEdit::of_clip(timeline, *c),
         })
     })
     .await

@@ -52,7 +52,7 @@ pub struct TitleClipPatch {
 #[derive(Debug, Clone)]
 pub enum TitleEdited {
     Overlay(SvgOverlayResult),
-    Clip(TitleClipResult),
+    Clip(Box<TitleClipResult>),
 }
 
 impl TitleEdited {
@@ -274,11 +274,11 @@ impl Project {
             if let Some(instance) = title.template.as_mut() {
                 instance.values = prepared.values;
             }
-            Ok(TitleEdited::Clip(TitleClipResult {
+            Ok(TitleEdited::Clip(Box::new(TitleClipResult {
                 clip: clip.clone(),
                 track_id,
                 warnings: prepared.warnings,
-            }))
+            })))
         })
     }
 
