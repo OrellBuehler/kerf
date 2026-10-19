@@ -1055,7 +1055,7 @@ fn hd_walk(
             ..Want::at(t)
         };
         let cut = match draft(n) {
-            Some(d) => Cut::Drafted(d.apply(&inputs.timeline).expect("a draft")),
+            Some(d) => Cut::Drafted(d.apply(&inputs.timeline, &inputs.assets).expect("a draft")),
             None => Cut::Held,
         };
         let answer = preview.frame_in(&inputs, cut, want, 1920).expect("a frame");
