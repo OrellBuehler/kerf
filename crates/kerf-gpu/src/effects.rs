@@ -529,7 +529,9 @@ mod tests {
             let size = format!("{w}x{h}");
             for source in [
                 format!("testsrc2=size=128x72:rate=30:duration=1,scale={w}:{h}"),
-                format!("color=c=green:size=128x72:rate=30:duration=1,noise=alls=60:allf=t,scale={w}:{h}:flags=neighbor"),
+                format!(
+                    "color=c=green:size=128x72:rate=30:duration=1,noise=all_strength=60:all_flags=t,scale={w}:{h}:flags=neighbor"
+                ),
             ] {
                 let src = run(
                     &[
