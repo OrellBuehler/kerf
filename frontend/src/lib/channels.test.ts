@@ -6,6 +6,7 @@ import {
 	colorAt,
 	insertPropertyKey,
 	isKeyed,
+	keyTime,
 	propertyAt,
 	propertyKeys,
 	propertyKeysProblem,
@@ -430,5 +431,19 @@ describe('poseTransform mirrors Clip::pose_transform', () => {
 		expect(c.transform!.opacity).toBe(0.7);
 		expect(c.keyframes.length).toBe(3);
 		expect(transformAt(c, 1).pos_x).toBe(0.1);
+	});
+
+	test('a key at the playhead reads at the playhead after a hold', () => {
+		const c = clip();
+		c.timeline_start = 0.3;
+		setPropertyKeys(c, 'pos_x', [key(0, 0, 'hold'), key(4, 1)]);
+		const playhead = 1.2345678;
+		poseTransform(c, keyTime(c, playhead), { pos_x: 0.5 });
+		expect(propertyAt(c, 'pos_x', keyTime(c, playhead))).toBe(0.5);
+		const rounded = clip();
+		rounded.timeline_start = 0.3;
+		setPropertyKeys(rounded, 'pos_x', [key(0, 0, 'hold'), key(4, 1)]);
+		poseTransform(rounded, Math.round(keyTime(c, playhead) * 1000) / 1000, { pos_x: 0.5 });
+		expect(propertyAt(rounded, 'pos_x', keyTime(c, playhead))).toBe(0);
 	});
 });

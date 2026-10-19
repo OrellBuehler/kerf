@@ -5,7 +5,7 @@
  * snapping, the 90° detent and the Shift constraints are here, the pointer plumbing is
  * `TransformHandles.svelte`'s. One edit is written per gesture, on release (`set_transform_at`). */
 
-import { isKeyed, transformAt } from './channels';
+import { isKeyed, keyTime, transformAt } from './channels';
 import { pixFmtSubsampling, resolveLayer, resolveLayerAnyGrid, YUV420, type LayerGeometry, type Resolved } from './layer-geometry';
 import { trackRenders } from './levels';
 import { clipDuration, DEFAULT_TRANSFORM, type Asset, type Clip, type Fit, type Timeline, type Transform } from './types';
@@ -73,12 +73,15 @@ export function pictureBox(g: LayerGeometry): Box {
 }
 
 /** The geometry of `src` posed `pose`, as the still places it: on the picture's own chroma grid,
- *  else the one every grid agrees on, else (a crop that rounds differently per grid) 4:2:0's. */
+ *  else the one every grid agrees on, else (a crop that rounds differently per grid) 4:2:0's. A
+ *  translucent picture of odd size is refused for its pixels, not its place (opacity moves nothing),
+ *  so it is placed as if opaque and keeps its box. Null only when nothing is drawn (an empty crop). */
 export function geometryOf(src: [number, number], grid: [number, number] | null, canvas: Canvas, pose: Transform): LayerGeometry | null {
 	const size: [number, number] = [canvas.width, canvas.height];
 	let got: Resolved = grid ? resolveLayer(src, size, canvas.fit, pose, grid) : resolveLayerAnyGrid(src, size, canvas.fit, pose);
 	if ('err' in got && !grid) got = resolveLayer(src, size, canvas.fit, pose, YUV420);
-	return 'ok' in got ? got.ok : null;
+	if ('ok' in got) return got.ok;
+	return pose.opacity < 1 ? geometryOf(src, grid, canvas, { ...pose, opacity: 1 }) : null;
 }
 
 /** The pictures on screen at `time`, bottom to top (a later video track composites over an
@@ -93,7 +96,7 @@ export function layersAt(timeline: Timeline, assets: readonly Asset[], canvas: C
 		if (!v?.width || !v.height) continue;
 		const src: [number, number] = [v.width, v.height];
 		const grid = v.pix_fmt ? pixFmtSubsampling(v.pix_fmt) : null;
-		const local = Math.max(0, time - clip.timeline_start);
+		const local = keyTime(clip, time);
 		const pose = { ...DEFAULT_TRANSFORM, ...transformAt(clip, local) };
 		const geometry = geometryOf(src, grid, canvas, pose);
 		if (!geometry) continue;
@@ -200,6 +203,19 @@ const round = (v: number, places: number) => {
 	return Math.round(v * k) / k + 0;
 };
 
+/** The decimals a gesture writes each number to. */
+const PLACES: Partial<Record<keyof Transform, number>> = {
+	scale: 4,
+	pos_x: 4,
+	pos_y: 4,
+	rotation: 2,
+	crop_left: 4,
+	crop_right: 4,
+	crop_top: 4,
+	crop_bottom: 4
+};
+const fix = (k: keyof Transform, v: number) => round(v, PLACES[k] ?? 4);
+
 /** Drag the picture by `(dx, dy)` canvas px. Shift (`axis`) keeps it on the axis it moved most
  *  along; snapping brings an edge or the centre of its bounds onto a target. The position is a
  *  fraction of the frame, so a delta in pixels is a delta in `pos` exactly. */
@@ -224,7 +240,7 @@ export function movePose(start: Transform, box: Box, dx: number, dy: number, can
 			guides.push({ axis: 'y', at: sy.at });
 		}
 	}
-	return { patch: { pos_x: round(start.pos_x + dx / canvas.width, 4), pos_y: round(start.pos_y + dy / canvas.height, 4) }, guides };
+	return { patch: { pos_x: fix('pos_x', start.pos_x + dx / canvas.width), pos_y: fix('pos_y', start.pos_y + dy / canvas.height) }, guides };
 }
 
 export const MIN_SCALE = 0.01;
@@ -260,7 +276,7 @@ export function scalePose(start: Transform, box: Box, from: [number, number], to
 			if (b.guide) guides.push(b.guide);
 		}
 	}
-	return { patch: { scale: round(Math.min(Math.max(scale, MIN_SCALE), MAX_SCALE), 4) }, guides };
+	return { patch: { scale: fix('scale', Math.min(Math.max(scale, MIN_SCALE), MAX_SCALE)) }, guides };
 }
 
 /** How near a right angle a turn snaps onto it, and the step Shift turns in. */
@@ -285,7 +301,7 @@ export function rotatePose(start: Transform, swept: number, snap: boolean, steps
 		const right = Math.round(rotation / 90) * 90;
 		if (Math.abs(rotation - right) <= RIGHT_ANGLE_DETENT) rotation = right;
 	}
-	return { patch: { rotation: round(rotation, 2) }, guides: [] };
+	return { patch: { rotation: fix('rotation', rotation) }, guides: [] };
 }
 
 export type Edge = 'left' | 'right' | 'top' | 'bottom';
@@ -356,24 +372,25 @@ export function cropPose(start: Transform, layer: Pick<Layer, 'src' | 'box' | 'g
 	const dx = (dsx * c - dsy * s) * k;
 	const dy = (dsx * s + dsy * c) * k;
 	const patch: Partial<Transform> = {
-		scale: round(Math.min(Math.max(scale, MIN_SCALE), MAX_SCALE), 4),
-		pos_x: round(start.pos_x + dx / canvas.width, 4),
-		pos_y: round(start.pos_y + dy / canvas.height, 4)
+		scale: fix('scale', Math.min(Math.max(scale, MIN_SCALE), MAX_SCALE)),
+		pos_x: fix('pos_x', start.pos_x + dx / canvas.width),
+		pos_y: fix('pos_y', start.pos_y + dy / canvas.height)
 	};
-	if (edge === 'left') patch.crop_left = round(crop.left, 4);
-	if (edge === 'right') patch.crop_right = round(crop.right, 4);
-	if (edge === 'top') patch.crop_top = round(crop.top, 4);
-	if (edge === 'bottom') patch.crop_bottom = round(crop.bottom, 4);
+	if (edge === 'left') patch.crop_left = fix('crop_left', crop.left);
+	if (edge === 'right') patch.crop_right = fix('crop_right', crop.right);
+	if (edge === 'top') patch.crop_top = fix('crop_top', crop.top);
+	if (edge === 'bottom') patch.crop_bottom = fix('crop_bottom', crop.bottom);
 	return { patch, guides };
 }
 
-/** Only what the gesture changed, against the pose it started from: an edit that changes
- *  nothing writes nothing. */
+/** Only what the gesture changed, against the pose it started from rounded as the gesture writes
+ *  it: a number left alone (the other axis of a Shift move, a drag back to the start) is not
+ *  re-written, so it gets no key and an edit that changes nothing writes nothing. */
 export function changed(start: Transform, patch: Partial<Transform>): Partial<Transform> {
 	const out: Partial<Transform> = {};
 	for (const k of Object.keys(patch) as (keyof Transform)[]) {
 		const v = patch[k];
-		if (v !== undefined && Math.abs(v - start[k]) > 1e-9) out[k] = v;
+		if (v !== undefined && v !== fix(k, start[k])) out[k] = v;
 	}
 	return out;
 }

@@ -539,7 +539,9 @@ reframe) gets a box drawn **where the export puts it**: the canvas is `renderCan
 delivery frame, else the first picture of the rendered cut, even sides, the delivery's fit), the box is
 `layer-geometry.ts`, a faithful port of kerf-core's `layer_geometry.rs` (crop / fit / second scale / rotate / overlay
 rounding, chroma grids, `pix_fmt_subsampling`) replayed against a Rust-written corpus (`core-render-plan.md`), at the
-clip's pose at the playhead (`transformAt`). A click on a picture selects the topmost clip under it (later video tracks
+clip's pose at the playhead (`transformAt`). A translucent picture of odd size, which the engine's geometry refuses for its
+pixels (FFmpeg's RGB round trip), is boxed as if opaque: opacity moves nothing; only a picture nothing draws (an empty
+crop) has no box. A click on a picture selects the topmost clip under it (later video tracks
 on top) and can carry straight into a move. Body = move, corners = scale about the centre, the knob = rotate, edges =
 crop — only under a Contain fit with position / scale / rotation unkeyed, and it moves the scale and position so the rest
 of the picture stays put (the export re-fits and re-centres a cropped window). Snapping (on with the timeline's snap
@@ -549,7 +551,10 @@ scale also stops at 100 %; rotation lands on a right angle within 5°, **Shift**
 axis — the tooltip names both with `settings.modLabel`. While held, the box is an exact ghost of the pose (D9: the picture
 under it settles on release) with a readout (`· key` when a keyed number is moving). **One `setTransformAt` on release**
 (`set_transform_at`: a keyed number keyed at the playhead, the rest static — one revision even when position x is keyed
-and y is not); a gesture that changes nothing writes nothing; Escape / pointercancel / lost capture / blur abandon it.
+and y is not) at `keyTime` — the unrounded clip-local playhead, the moment the pose is sampled at (a 1 ms grid can land
+after it, where a hold still reads the old value); the Inspector's keyed writes use it too, so both hit one key. Only a
+number whose value, rounded as the gesture writes it, differs from the start is sent, so the other axis of a Shift move
+gets no key and a drag back to the start writes nothing; Escape / pointercancel / lost capture / blur abandon it.
 The handles count as page overlays for `routePreview` (`handles`), so on an X11 child-window surface the frame falls back
 to the JPEG while they show (a click on the surface itself never reaches the page there: select the clip in the timeline);
 under a transparent webview they draw over the surface. Not done: separate X / Y scale (the model has one `scale`; it

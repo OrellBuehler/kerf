@@ -230,6 +230,11 @@ export const colorAnimated = (clip: Animatable) => COLOR_PROPERTIES.some((p) => 
 /** Whether the clip's volume is keyed (`Clip::volume_animated`). */
 export const volumeAnimated = (clip: Animatable) => isKeyed(clip, 'volume');
 
+/** Where a key written at the playhead goes, clip-local: the very moment the pose is sampled at,
+ *  unrounded. A rounded time can land just after the playhead, where a hold before it still reads
+ *  the old value; every keyed write uses this, so the Inspector and the handles hit the same key. */
+export const keyTime = (clip: { timeline_start: number }, playhead: number) => Math.max(0, playhead - clip.timeline_start);
+
 /** The clip's static transform with every keyed number sampled at `local` (`Clip::transform_at`). */
 export function transformAt(clip: Animatable, local: number): Transform {
 	const t: Transform = { ...DEFAULT_TRANSFORM, ...(clip.transform ?? {}) };

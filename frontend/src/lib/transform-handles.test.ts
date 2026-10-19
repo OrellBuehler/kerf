@@ -72,6 +72,15 @@ describe('the picture box is where the geometry puts it', () => {
 		expect(pictureBox(g)).toEqual({ cx: 384, cy: 180, w: 320, h: 180, angle: 0 });
 	});
 
+	test('a translucent picture of odd size keeps the box it has opaque', () => {
+		const canvas = { width: 1279, height: 721, fit: 'contain' as const };
+		const opaque = geometryOf([720, 1280], [1, 1], canvas, tf({ scale: 0.5 }))!;
+		const translucent = geometryOf([720, 1280], [1, 1], canvas, tf({ scale: 0.5, opacity: 0.5 }));
+		expect(translucent).not.toBeNull();
+		expect(pictureBox(translucent!)).toEqual(pictureBox(opaque));
+		expect(geometryOf([720, 1280], [1, 1], canvas, tf({ crop_left: 0.6, crop_right: 0.6, opacity: 0.5 }))).toBeNull();
+	});
+
 	test('a turned picture keeps its own size and turns about its centre', () => {
 		const g = geometryOf([640, 360], [1, 1], { width: 640, height: 360, fit: 'contain' }, tf({ rotation: 90 }))!;
 		const b = pictureBox(g);
@@ -230,6 +239,15 @@ describe('crop keeps the rest of the picture where it was', () => {
 test('a gesture that changes nothing writes nothing', () => {
 	expect(changed(tf({ pos_x: 0.1 }), { pos_x: 0.1, pos_y: 0 })).toEqual({});
 	expect(changed(tf(), { pos_x: 0.1, pos_y: 0 })).toEqual({ pos_x: 0.1 });
+});
+
+test('a number the gesture left alone is not written, though the start had more decimals', () => {
+	const start = tf({ pos_x: 0.123456, pos_y: -0.0987654, rotation: 12.3456 });
+	const box = { cx: 960, cy: 540, w: 480, h: 270, angle: 0 };
+	const shifted = movePose(start, box, 192, 30, W169, off, true).patch;
+	expect(changed(start, shifted)).toEqual({ pos_x: 0.2235 });
+	expect(changed(start, movePose(start, box, 0, 0, W169, off).patch)).toEqual({});
+	expect(changed(start, { rotation: 12.35 })).toEqual({});
 });
 
 test('cursors turn with the box', () => {

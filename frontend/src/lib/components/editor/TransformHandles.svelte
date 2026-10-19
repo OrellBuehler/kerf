@@ -195,7 +195,7 @@
 		}
 		drag = { ...d, committing: true };
 		try {
-			await editor.setTransformAt(d.layer.clip.id, Math.round(d.layer.local * 1000) / 1000, patch);
+			await editor.setTransformAt(d.layer.clip.id, d.layer.local, patch);
 		} catch (err) {
 			report(err);
 		} finally {
