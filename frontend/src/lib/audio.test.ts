@@ -17,6 +17,10 @@ mock.module('./notifications.svelte', () => ({
 }));
 const { AudioEngine } = await import('./audio');
 
+/** The engine's fallback warning (no AudioWorklet in bun), kept out of the test output: the tests that
+ *  are about it pass their own `warn`. */
+const quiet = () => {};
+
 // ---- a fake Web Audio ------------------------------------------------------
 
 type Kind = 'gain' | 'merger' | 'splitter' | 'analyser' | 'compressor' | 'worklet' | 'source' | 'destination';
@@ -211,6 +215,7 @@ beforeEach(() => {
 	ctx = new FakeContext();
 	reported = [];
 	engine = new AudioEngine({
+		warn: quiet,
 		createContext: () => ctx as unknown as AudioContext,
 		fetchPcm: pcm as never,
 		report: (m) => reported.push(m)
@@ -295,6 +300,7 @@ describe('reverse shuttle', () => {
 	const ramped = (kept = 1) => {
 		const asked: [string, number, number][] = [];
 		const e = new AudioEngine({
+			warn: quiet,
 			createContext: () => ctx as unknown as AudioContext,
 			fetchPcm: (async (asset: string, start: number, dur: number) => {
 				asked.push([asset, start, dur]);
@@ -405,6 +411,7 @@ describe('reverse shuttle', () => {
 	test('past 600 s of source the window is held at the end the playhead enters by', async () => {
 		const asked: [string, number, number][] = [];
 		const e = new AudioEngine({
+			warn: quiet,
 			createContext: () => ctx as unknown as AudioContext,
 			fetchPcm: (async (asset: string, start: number, dur: number) => {
 				asked.push([asset, start, dur]);
@@ -532,7 +539,7 @@ describe('the mix at the speakers', () => {
 		];
 		for (const c of cases) {
 			ctx = new FakeContext();
-			engine = new AudioEngine({ createContext: () => ctx as unknown as AudioContext, fetchPcm: pcm as never });
+			engine = new AudioEngine({ warn: quiet, createContext: () => ctx as unknown as AudioContext, fetchPcm: pcm as never });
 			await play({ tracks: [track('a1', 'audio', [clip('c', 'voice', { volume: c.volume })], { volume: c.fader, pan: c.pan })] });
 			const [gl, gr] = panGains(c.pan);
 			const [l, r] = heard(ctx);
@@ -622,6 +629,7 @@ describe('scheduling is what it was', () => {
 
 	test('a window that cannot be decoded is reported once and does not stop the rest', async () => {
 		const failing = new AudioEngine({
+			warn: quiet,
 			createContext: () => ctx as unknown as AudioContext,
 			fetchPcm: (async (asset: string) => {
 				if (asset === 'voice') throw new Error('no such file');

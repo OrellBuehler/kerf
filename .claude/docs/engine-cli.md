@@ -517,8 +517,10 @@ so the feature is **only** activated through these forwards — which is what ma
   `safe_volume` / `safe_ceiling_db` re-clamp in the builder (a `.kerf` never passes
   the clamping ops), and `DiffKind::MasterChanged` stops a master-only agent
   proposal diffing as empty and being discarded by `apply_staged`.
-  **The preview plays the same filter**: `frontend/src/lib/alimiter.ts` ports `alimiter` (7.0–9.0) sample
-  for sample, and the ignored `alimiter_corpus` test (`engine/cli/alimiter_corpus.rs`) runs seeded signals at
+  **The preview plays the same filter**: `frontend/src/lib/alimiter.ts` ports `alimiter` sample for sample as
+  current releases have it (4.4–4.4.4, 5.1–5.1.4, 6.0, 6.0.1 and plain 6.1 read an empty lookahead slot,
+  `buffer[-1]`, where every other release, and the port, counts it as 0 — the guard is in 7.0 and was
+  backported to 4.4.5, 5.1.5 and 6.1.1), and the ignored `alimiter_corpus` test (`engine/cli/alimiter_corpus.rs`) runs seeded signals at
   8 / 44.1 / 48 / 96 kHz — a 0 dB ceiling among them, and a five-second 48 kHz case whose gain comes back past
   unity a dozen times — through the real ffmpeg with `limiter_filter`'s own text into
   `fixtures/alimiter-corpus.json`, which `alimiter.test.ts` replays to the bit (a case over 2000 frames is kept as

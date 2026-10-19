@@ -18,7 +18,7 @@ declare class AudioWorkletProcessor {
 declare function registerProcessor(name: string, ctor: new (options: AudioWorkletNodeOptions) => AudioWorkletProcessor): void;
 
 class LimiterProcessor extends AudioWorkletProcessor {
-	#lim: Alimiter;
+	readonly #lim: Alimiter;
 
 	constructor(options: AudioWorkletNodeOptions) {
 		super();
@@ -27,7 +27,8 @@ class LimiterProcessor extends AudioWorkletProcessor {
 		this.port.onmessage = (e: MessageEvent<LimiterMessage>) => {
 			const next = e.data?.limit;
 			const limit = typeof next === 'number' && Number.isFinite(next) && next > 0 ? next : this.#lim.limit;
-			if (e.data?.reset) this.#lim = new Alimiter(sampleRate, 2, limit);
+			// In place: a reset comes on every restart while playing, and the audio thread allocates nothing.
+			if (e.data?.reset) this.#lim.reset(limit);
 			else this.#lim.limit = limit;
 		};
 	}

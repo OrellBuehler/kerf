@@ -1,5 +1,5 @@
-/* The master limiter of the preview: FFmpeg's `alimiter` (`libavfilter/af_alimiter.c` as 7.0 to 9.0
- * have it) ported sample for sample, as the export spells it
+/* The master limiter of the preview: FFmpeg's `alimiter` (`libavfilter/af_alimiter.c` as current
+ * releases have it) ported sample for sample, as the export spells it
  * (`limiter_filter` in kerf-core: `alimiter=limit=…:attack=5:release=100:level=0[:latency=1]`, so
  * no auto-level, no auto-release, unity in and out). It runs in an AudioWorklet
  * (`limiter-worklet.ts`), and it is pure, so `alimiter.test.ts` replays what the real filter
@@ -12,11 +12,12 @@
  * the output trails the input by `delay` frames (5 ms), which the picture is told about
  * (`AudioEngine.outputLatency`).
  *
- * Older FFmpeg is not quite this filter. 4.4 has no `latency` (the export probes for it). And before
- * 7.0 a lookahead slot that is empty (`nextpos[j] == -1`) was still read, `buffer[-1]` — out of
- * bounds, so its "peak" is whatever lies before the buffer; 7.0 skips the read and counts the peak as
- * 0, and so does this port. A pre-7.0 ffmpeg can therefore differ where that slot is reached; the
- * corpus is written on 9.0.2 and 6.1.1 writes the same one. */
+ * Some releases are not quite this filter. 4.4 has no `latency` (the export probes for it). And
+ * 4.4–4.4.4, 5.1–5.1.4, 6.0, 6.0.1 and plain 6.1 still read a lookahead slot that is empty
+ * (`nextpos[j] == -1`): `buffer[-1]`, out of bounds, so its "peak" is whatever lies before the
+ * buffer. Every other release skips the read and counts the peak as 0, and so does this port: 7.0
+ * on, and the guard backported to 4.4.5, 5.1.5 and 6.1.1. Only those few releases can differ where
+ * that slot is reached; the corpus is written on 9.0.2, and 6.1.1 writes the same one. */
 
 import { MASTER_DEFAULT_CEILING_DB, clampCeiling } from './levels';
 
@@ -99,6 +100,22 @@ export class Alimiter {
 		this.#nextdelta = new Float64Array(room);
 		this.#nextpos = new Int32Array(room).fill(-1);
 		this.#dst = new Float64Array(channels);
+	}
+
+	/** Start over at `limit`, exactly as a new instance would — an empty lookahead, no gain reduction —
+	 *  in the arrays it already has, so a reset on the audio thread allocates nothing. */
+	reset(limit = this.limit): void {
+		this.limit = limit;
+		this.resets = 0;
+		this.#buffer.fill(0);
+		this.#nextdelta.fill(0);
+		this.#nextpos.fill(-1);
+		this.#dst.fill(0);
+		this.#pos = 0;
+		this.#att = 1;
+		this.#delta = 0;
+		this.#nextiter = 0;
+		this.#nextlen = 0;
 	}
 
 	/** Limit `frames` frames of `input` (one array per channel; a missing channel is silence) into

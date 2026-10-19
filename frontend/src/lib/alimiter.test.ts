@@ -160,6 +160,23 @@ describe('Alimiter', () => {
 		expect(out[1].every((v) => v === 0)).toBe(true);
 	});
 
+	test('a reset is a new instance, bit for bit, made in the arrays it has — even mid-limit', () => {
+		const loud = cases.find((x) => x.name.startsWith('noise pushed far'))!;
+		const next = cases.find((x) => x.name.startsWith('a burst rides up'))!;
+		const reused = new Alimiter(next.rate, 2, limiterLimit(-12));
+		// Stop halfway through limiting something hot, so every part of the state is in use.
+		const [l, r] = signal(loud.segments);
+		const half = Math.floor(l.length / 2);
+		reused.process([Float64Array.from(l), Float64Array.from(r)], [new Float64Array(half), new Float64Array(half)], half);
+		reused.reset(limiterLimit(next.ceiling_db));
+		const fresh = new Alimiter(next.rate, 2, limiterLimit(next.ceiling_db));
+		const [al, ar] = limitedAligned(next, reused);
+		const [bl, br] = limitedAligned(next, fresh);
+		expect(Array.from(al)).toEqual(Array.from(bl));
+		expect(Array.from(ar)).toEqual(Array.from(br));
+		expect(reused.resets).toBe(fresh.resets);
+	});
+
 	test('the limit is the ceiling as the export writes it', () => {
 		expect(limiterLimit(-1.5)).toBe(0.841395);
 		expect(limiterLimit(Number.NaN)).toBe(0.841395);
