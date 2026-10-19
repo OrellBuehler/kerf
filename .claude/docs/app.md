@@ -560,7 +560,7 @@ last three requests each stepped forward by at most 0.5 s is decoded with `Hint:
 draft and a stranger's clip go through FFmpeg) and `a_drag_that_walks_forward_reads_ahead_and_draws_the_frames_a_scrub_draws`.
 `bench_tests.rs`' `a_scrub_and_a_gesture_at_1080p` (`KERF_BENCH=1`) times a 1920x1080 canvas of 1080p all-intra clips: on lavapipe
 (debug build, a loaded 4-core box) the decode wait of a forward scrub goes from 5 to 0.1 ms with the read-ahead, and the frame is
-lavapipe's raster (50 to 100 ms for one layer, about 600 ms for a scaled and graded one); the < 33 ms target is for a real GPU and is unmeasured.
+lavapipe's raster (50 to 150 ms for one layer, 600 to 750 ms for a scaled and graded one, whether its numbers change or not); the < 33 ms target is for a real GPU and is unmeasured.
 
 **GPU playback (A4, `gpu_preview/play.rs`; the page's half is in `frontend.md`).** `get_preview_frame { …, hint: "forward", client,
 session }` is a frame of a **play session**: the webview stays the clock (the audio clock, less the output latency, plus the request's own
