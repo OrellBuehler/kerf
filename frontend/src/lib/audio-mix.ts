@@ -3,9 +3,9 @@
  *
  *  - a clip's own gain over time (`clipGainAt`) — the same envelope the preview has
  *    always played, now *without* the track fader, which moved onto the track's bus;
- *  - the master limiter's approximation on a `DynamicsCompressorNode`
- *    (`limiterParams`), including the trim that cancels the node's automatic makeup
- *    gain. */
+ *  - the master limiter's fallback on a `DynamicsCompressorNode` (`limiterParams`), including
+ *    the trim that cancels the node's automatic makeup gain, for a webview that cannot run the
+ *    export's own limiter in an AudioWorklet (`alimiter.ts`). */
 
 import { propertyCurve, volumeAnimated, volumeAt } from './channels';
 import { clipDuration, type Clip } from './types';
@@ -218,7 +218,8 @@ export function gainAtFullScale(thresholdDb: number, ratio: number = LIMITER_RAT
  * The preview's stand-in for the master limiter: a compressor with a hard knee at
  * the ceiling and the steepest ratio the node allows, followed by a trim.
  *
- * It is an **approximation** and the Mixer says so: at ratio 20 the output rises
+ * It is an **approximation**, played only until the limiter worklet has loaded or where it cannot
+ * run (`audio.ts`): at ratio 20 the output rises
  * 1 dB for every 20 dB the input is over the ceiling (a brick-wall limiter would
  * not rise at all), so a very hot mix reads a little over the ceiling; and the
  * export's `alimiter` is a different algorithm with a different release. What it

@@ -506,7 +506,12 @@ so the feature is **only** activated through these forwards — which is what ma
   thread-local (`with_alimiter_latency`) pins the answer for the unit tests and the
   golden oracle; an ignored test checks the probe against a real `alimiter=…:latency=1`
   run, and the levels tests run on 4.4 as well as 6.1 and 9.0 (their delay check is
-  skipped where the option is absent). The ceiling is a **sample**-peak ceiling (no
+  skipped where the option is absent). **The preview plays the same filter**: `frontend/src/lib/alimiter.ts`
+  ports `alimiter` sample for sample, and the ignored `alimiter_corpus` test (`engine/cli/alimiter_corpus.rs`,
+  bless with `KERF_BLESS_CORPUS=1`) runs seeded signals at 8 / 44.1 / 48 kHz through the real ffmpeg with
+  `limiter_filter`'s own text into `fixtures/alimiter-corpus.json`, which `alimiter.test.ts` replays to the bit
+  (6.1.1 and 9.0.2 write the same corpus). A change to the limiter text moves that corpus too.
+  The ceiling is a **sample**-peak ceiling (no
   oversampling), rounded to six decimals so the text never rides on a libm `pow`'s
   last digit; `get_levels` reports the true peak, which runs *above* the sample
   ceiling (measured on 9.0.2 at a -1 dBFS ceiling: an 11 kHz tone read -0.2 dBTP,

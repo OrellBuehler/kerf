@@ -8,7 +8,7 @@
 
      clip source -> clip gain (volume, fades) -> track bus
      track bus: fader -> left / right pan legs -> merger -> [split -> 2 analysers]
-     every bus -> master gain -> [limiter approximation] -> master out
+     every bus -> master gain -> [limiter] -> master out
      master out -> speakers, and -> [split -> 2 analysers]
 
    The track fader and the pan sit on the bus, not folded into each clip's gain:
@@ -21,8 +21,14 @@
    Ducking is **not** here. The export ducks a track with a sidechain compressor
    keyed off the rest of the mix; Web Audio's compressor has no sidechain input
    without an AudioWorklet, so the preview plays a ducked track at its fader and the
-   Mixer says so on the toggle. The master limiter is an approximation too
-   (`limiterParams`), and the Mixer says that as well.
+   Mixer says so on the toggle.
+
+   The master limiter is the export's own: `alimiter`, ported sample for sample
+   (`alimiter.ts`) and run in an AudioWorklet (`limiter-worklet.ts`). Its 5 ms
+   lookahead makes what is heard that much later, which `outputLatency()` adds while
+   it is in the path. The module loads once per context; until it has (and for good
+   where a webview cannot run it) the limiter is the compressor approximation
+   (`limiterParams`).
 
    Per-clip effect chains *are* auralized: the backend decodes each window
    through the clip's own ffmpeg chain, so an EQ or compressor is heard rather
@@ -57,6 +63,7 @@ import { clampMasterVolume, masterOf, trackRenders } from './levels';
 import { readBlock, type Reading } from './meter';
 import { toast } from './notifications.svelte';
 import { outputLatency } from './output-latency';
+import { alimiterDelay, LIMITER_PROCESSOR, limiterLimit, type LimiterMessage } from './alimiter';
 
 /** Preview decode rate: mono 32 kHz keeps a minute of PCM under 4 MB on the
  *  wire while staying honest enough to judge a cut. */
@@ -105,16 +112,27 @@ interface Bus {
 	tap: Tap;
 }
 
-/** The master bus: gain, the limiter approximation, a final unity stage and the meter. */
+/** The limiter worklet's node, as far as the engine uses it. */
+export type LimiterNode = AudioNode & { port: { postMessage(message: LimiterMessage): void } };
+
+/** Which limiter is in the master's path. */
+type Limiting = 'worklet' | 'compressor' | null;
+
+/** The master bus: gain, the limiter, a final unity stage and the meter. */
 interface Master {
 	input: GainNode;
+	/** The approximation: a compressor and the trim cancelling its makeup. */
 	comp: DynamicsCompressorNode;
 	trim: GainNode;
+	/** The export's limiter, once its worklet has loaded. */
+	worklet: LimiterNode | null;
 	out: GainNode;
 	split: ChannelSplitterNode;
 	tap: Tap;
 	/** How the nodes are wired now, so a toggle only reconnects when it changes. */
-	limiting: boolean;
+	limiting: Limiting;
+	/** The master last applied, which a worklet loading mid-play takes over with. */
+	applied: MasterBus | null;
 }
 
 type Session = {
@@ -131,6 +149,24 @@ export interface AudioEnv {
 	fetchPcm: typeof getAudio;
 	/** Tell the user a clip's preview audio could not be decoded. */
 	report: (message: string) => void;
+	/** The limiter worklet's node in `ctx`, or `null` where it cannot run. */
+	createLimiter: (ctx: AudioContext, limit: number) => Promise<LimiterNode | null>;
+}
+
+/** The limiter worklet: its module (bundled, served from the app's own origin) and a stereo node. */
+async function createLimiter(ctx: AudioContext, limit: number): Promise<LimiterNode | null> {
+	if (!ctx.audioWorklet || typeof AudioWorkletNode === 'undefined') return null;
+	const { default: url } = await import('./limiter-worklet-url');
+	await ctx.audioWorklet.addModule(url);
+	return new AudioWorkletNode(ctx, LIMITER_PROCESSOR, {
+		numberOfInputs: 1,
+		numberOfOutputs: 1,
+		outputChannelCount: [2],
+		channelCount: 2,
+		channelCountMode: 'explicit',
+		channelInterpretation: 'speakers',
+		processorOptions: { limit } satisfies LimiterMessage
+	});
 }
 
 /** A decoded window, and which way round it is stored. */
@@ -158,15 +194,19 @@ export class AudioEngine {
 		this.#env = {
 			createContext: env.createContext ?? (() => new AudioContext()),
 			fetchPcm: env.fetchPcm ?? getAudio,
-			report: env.report ?? ((m) => void toast.error(m))
+			report: env.report ?? ((m) => void toast.error(m)),
+			createLimiter: env.createLimiter ?? createLimiter
 		};
 	}
 
 	/** Seconds between the audio clock and the sound coming out of the speakers
-	 *  ([`outputLatency`](./output-latency.ts)): the picture of GPU playback is asked for the clock
-	 *  *less* this, so it is not ahead of what is heard. 0 until a context exists. */
+	 *  ([`outputLatency`](./output-latency.ts)), plus the limiter's lookahead while the worklet is in
+	 *  the path: the picture of GPU playback is asked for the clock *less* this, so it is not ahead
+	 *  of what is heard. 0 until a context exists. */
 	outputLatency(): number {
-		return outputLatency(this.#ctx);
+		const ctx = this.#ctx;
+		const device = outputLatency(ctx);
+		return ctx && this.#master?.limiting === 'worklet' ? device + alimiterDelay(ctx.sampleRate) : device;
 	}
 
 	/** Current timeline time by the audio clock, or `null` when not playing. */
@@ -293,17 +333,35 @@ export class AudioEngine {
 		out.connect(ctx.destination);
 		input.connect(out);
 		const { split, tap } = this.#tap(ctx, out);
-		return (this.#master = { input, comp, trim, out, split, tap, limiting: false });
+		const m: Master = { input, comp, trim, worklet: null, out, split, tap, limiting: null, applied: null };
+		void this.#loadLimiter(ctx, m);
+		return (this.#master = m);
 	}
 
-	/** Set the master from the timeline's: its fader, and the limiter approximation —
-	 *  wired in only while the limiter is on, tuned to its ceiling. */
+	/** Load the limiter worklet and put it in the compressor's place, wired at once when the limiter
+	 *  is on. A webview that cannot (no AudioWorklet, a module refused) keeps the compressor. */
+	async #loadLimiter(ctx: AudioContext, m: Master) {
+		try {
+			const node = await this.#env.createLimiter(ctx, limiterLimit(m.applied?.ceiling_db ?? Number.NaN));
+			if (!node || this.#master !== m) return;
+			m.worklet = node;
+			if (m.applied) this.#applyMaster(m, m.applied);
+		} catch {
+			// the approximation stays
+		}
+	}
+
+	/** Set the master from the timeline's: its fader, and the limiter — wired in only while it is
+	 *  on, set to its ceiling: the worklet once it has loaded, the compressor until then. */
 	#applyMaster(m: Master, master: MasterBus, live = false) {
 		const ctx = this.#ctx!;
+		m.applied = master;
 		const volume = clampMasterVolume(master.volume);
 		if (live) m.input.gain.setTargetAtTime(volume, ctx.currentTime, LIVE_TAU);
 		else m.input.gain.value = volume;
-		if (master.limiter) {
+		const limiting: Limiting = !master.limiter ? null : m.worklet ? 'worklet' : 'compressor';
+		if (limiting === 'worklet') m.worklet!.port.postMessage({ limit: limiterLimit(master.ceiling_db) });
+		if (limiting === 'compressor') {
 			const p = limiterParams(master.ceiling_db);
 			m.comp.threshold.value = p.threshold;
 			m.comp.knee.value = p.knee;
@@ -312,18 +370,22 @@ export class AudioEngine {
 			m.comp.release.value = p.release;
 			m.trim.gain.value = p.trim;
 		}
-		if (m.limiting === master.limiter) return;
+		if (m.limiting === limiting) return;
 		m.input.disconnect();
 		m.comp.disconnect();
 		m.trim.disconnect();
-		if (master.limiter) {
+		m.worklet?.disconnect();
+		if (limiting === 'worklet') {
+			m.input.connect(m.worklet!);
+			m.worklet!.connect(m.out);
+		} else if (limiting === 'compressor') {
 			m.input.connect(m.comp);
 			m.comp.connect(m.trim);
 			m.trim.connect(m.out);
 		} else {
 			m.input.connect(m.out);
 		}
-		m.limiting = master.limiter;
+		m.limiting = limiting;
 	}
 
 	/** Move a track's fader and / or pan *now*, while a gesture is still in progress and

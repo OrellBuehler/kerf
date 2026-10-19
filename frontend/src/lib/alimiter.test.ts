@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import corpus from './fixtures/alimiter-corpus.json';
-import { Alimiter, LIMITER_ATTACK_MS, LIMITER_RELEASE_MS, limiterLimit } from './alimiter';
+import { Alimiter, alimiterDelay, LIMITER_ATTACK_MS, LIMITER_RELEASE_MS, limiterLimit } from './alimiter';
 
 // The differential test for the port of FFmpeg's `alimiter`: kerf-core put each signal through the
 // real ffmpeg with the export's own limiter text (`engine/cli/alimiter_corpus.rs` →
@@ -96,6 +96,7 @@ describe('Alimiter', () => {
 		expect(new Alimiter(48000, 2, 1).delay).toBe(239);
 		expect(new Alimiter(44100, 2, 1).bufferSize).toBe(440);
 		expect(new Alimiter(8000, 2, 1).bufferSize).toBe(80);
+		for (const rate of [8000, 44100, 48000, 96000]) expect(alimiterDelay(rate)).toBe(new Alimiter(rate, 2, 1).delay / rate);
 	});
 
 	test('a signal under the ceiling comes out as it went in, late by the lookahead', () => {

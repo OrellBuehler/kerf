@@ -19,12 +19,32 @@ export const LIMITER_ATTACK_MS = 5;
 /** The export's `release`, milliseconds. */
 export const LIMITER_RELEASE_MS = 100;
 
+/** The name the worklet registers its processor under (`limiter-worklet.ts`). */
+export const LIMITER_PROCESSOR = 'kerf-alimiter';
+
+/** What the main thread posts to the worklet (and builds it with): the linear limit. */
+export interface LimiterMessage {
+	limit: number;
+}
+
 /** `MasterBus::limit_linear` rounded as `limiter_filter` writes it (six decimals), which is
  *  the number `alimiter` parses. A ceiling that is not a number is the default one. */
 export function limiterLimit(ceilingDb: number): number {
 	const db = Number.isFinite(ceilingDb) ? clampCeiling(ceilingDb) : MASTER_DEFAULT_CEILING_DB;
 	const limit = 10 ** (db / 20);
 	return Math.round(limit * 1e6) / 1e6;
+}
+
+/** The lookahead in interleaved samples, a whole number of frames, as the C rounds it (`buffer_size`). */
+export function alimiterBufferSize(sampleRate: number, channels: number, attackMs = LIMITER_ATTACK_MS): number {
+	const size = Math.trunc(sampleRate * (attackMs / 1000) * channels);
+	return size - (size % channels);
+}
+
+/** Seconds the limiter's output trails its input live: the frames `latency=1` trims. */
+export function alimiterDelay(sampleRate: number, channels = 2): number {
+	const size = alimiterBufferSize(sampleRate, channels);
+	return size > 0 ? (size / channels - 1) / sampleRate : 0;
 }
 
 const fmax = (a: number, b: number) => (a > b ? a : b);
@@ -56,10 +76,8 @@ export class Alimiter {
 		this.sampleRate = sampleRate;
 		this.channels = channels;
 		this.limit = limit;
-		const attack = attackMs / 1000;
 		this.#release = releaseMs / 1000;
-		let size = trunc(sampleRate * attack * channels);
-		size -= size % channels;
+		const size = alimiterBufferSize(sampleRate, channels, attackMs);
 		if (size <= 0) throw new Error('Attack is too small.');
 		this.bufferSize = size;
 		this.delay = size / channels - 1;

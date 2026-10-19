@@ -4,8 +4,8 @@
 	// limiter are edits like any other (one per gesture, in the history); while they
 	// are held the preview follows them (`audio.liveMaster`).
 	//
-	// The preview's limiter is an approximation — a compressor with a hard knee at the
-	// ceiling — and the toggle's tooltip says so; Measure reads the real thing.
+	// The preview's limiter is the export's own (`alimiter`, ported sample for sample and run
+	// in an AudioWorklet by `audio.ts`); only true peak's oversampling is export-only.
 	//
 	// The limiter, its ceiling and the duck mode are the strip's FX block: folded by default and remembered
 	// (`master-fx.ts`), so the fader gets the strip's height and a limiter that is on still says so.
@@ -93,8 +93,8 @@
 
 	const err = report;
 
-	const APPROX =
-		'The export runs a lookahead limiter (alimiter). The preview plays an approximation — a compressor with a hard knee at the ceiling — so a very hot mix can read a little over it. Measure reads the real thing.';
+	const LIMITER_NOTE =
+		'The preview plays the export’s own limiter (FFmpeg’s alimiter, sample for sample), so a hot mix sounds and meters here as it will export, short of True peak’s oversampling.';
 
 	// ---- the fader ----------------------------------------------------------
 	function fadePreview(v: number) {
@@ -213,8 +213,8 @@
 				class:on={master.limiter}
 				aria-pressed={master.limiter}
 				use:tip={master.limiter
-					? `Limiter on — holds the finished mix under ${ceilingLabel(master.ceiling_db)}. ${APPROX}`
-					: `Limiter off — turn it on to hold the finished mix under the ceiling. ${APPROX}`}
+					? `Limiter on — holds the finished mix under ${ceilingLabel(master.ceiling_db)}. ${LIMITER_NOTE}`
+					: `Limiter off — turn it on to hold the finished mix under the ceiling. ${LIMITER_NOTE}`}
 				onclick={toggleLimiter}>Limiter</button
 			>
 			<div class="ceiling" class:dim={!master.limiter}>
@@ -230,7 +230,7 @@
 						valueText={ceilingLabel}
 						tip="Limiter ceiling {ceilingLabel(ceiling)} — the level the finished mix is held under. Drag, or ← → to nudge {CEILING_STEP.normal} dB ({settings.modLabel('shift')} {CEILING_STEP.coarse}, {settings.modLabel('alt')} {CEILING_STEP.fine}); double-click for {ceilingLabel(
 							MASTER_DEFAULT_CEILING_DB
-						)}. {APPROX}"
+						)}. {LIMITER_NOTE}"
 						detent={ceilingToPos(MASTER_DEFAULT_CEILING_DB)}
 						accent="var(--text-muted)"
 						onpreview={ceilingMove}

@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, mock, test } from 'bun:test';
 import { dbToGain, panGains } from './mixer';
 import { limiterParams } from './audio-mix';
+import { alimiterDelay, limiterLimit, type LimiterMessage } from './alimiter';
 import type { Clip, Timeline, Track } from './types';
 
 // The preview's audio graph, driven over a fake `AudioContext` that records what is
@@ -18,7 +19,7 @@ const { AudioEngine } = await import('./audio');
 
 // ---- a fake Web Audio ------------------------------------------------------
 
-type Kind = 'gain' | 'merger' | 'splitter' | 'analyser' | 'compressor' | 'source' | 'destination';
+type Kind = 'gain' | 'merger' | 'splitter' | 'analyser' | 'compressor' | 'worklet' | 'source' | 'destination';
 interface Edge {
 	to: FakeNode;
 	output: number;
@@ -79,6 +80,13 @@ class FakeCompressor extends FakeNode {
 		super('compressor', ctx);
 	}
 }
+class FakeWorklet extends FakeNode {
+	posted: LimiterMessage[] = [];
+	port = { postMessage: (m: LimiterMessage) => void this.posted.push(m) };
+	constructor(ctx: FakeContext) {
+		super('worklet', ctx);
+	}
+}
 class FakeAnalyser extends FakeNode {
 	fftSize = 2048;
 	/** What the next read returns; the block is padded with silence. */
@@ -126,6 +134,7 @@ class FakeBuffer {
 class FakeContext {
 	nodes: FakeNode[] = [];
 	currentTime = 0;
+	sampleRate = 48000;
 	state = 'running';
 	destination = new FakeNode('destination', this);
 	createGain = () => new FakeGain(this);
@@ -693,6 +702,88 @@ describe('the master limiter', () => {
 	test('the master fader is clamped to the engine’s +12 dB', async () => {
 		await play(withMaster({ volume: 9, limiter: false, ceiling_db: -1 }));
 		expect(master().input.gain.value).toBe(4);
+	});
+});
+
+describe('the export’s limiter in a worklet', () => {
+	const on = (ceiling_db: number): Timeline => ({
+		tracks: [track('a1', 'audio', [clip('c', 'voice')])],
+		master: { volume: 1, limiter: true, ceiling_db }
+	});
+	let asked: number[];
+	let load: (node: FakeWorklet | null) => void;
+	let fail: (e: Error) => void;
+	beforeEach(() => {
+		asked = [];
+		engine = new AudioEngine({
+			createContext: () => ctx as unknown as AudioContext,
+			fetchPcm: pcm as never,
+			report: (m) => reported.push(m),
+			createLimiter: (_ctx, limit) => {
+				asked.push(limit);
+				return new Promise((resolve, reject) => {
+					load = (n) => resolve(n as never);
+					fail = reject;
+				});
+			}
+		});
+	});
+	const input = () => ctx.of<FakeGain>('gain')[0];
+	const out = () => ctx.of<FakeGain>('gain')[2];
+
+	test('the compressor stands in until the module has loaded, then the worklet takes its place', async () => {
+		await play(on(-3));
+		const [comp] = ctx.of<FakeCompressor>('compressor');
+		expect(input().outs.map((e) => e.to)).toEqual([comp]);
+		expect(engine.outputLatency()).toBe(0);
+		const node = new FakeWorklet(ctx);
+		load(node);
+		await settle();
+		expect(input().outs.map((e) => e.to)).toEqual([node]);
+		expect(node.outs.map((e) => e.to)).toEqual([out()]);
+		expect(reach(input()).has(comp)).toBe(false);
+		expect(node.posted.at(-1)).toEqual({ limit: limiterLimit(-3) });
+	});
+
+	test('its lookahead is added to the latency while it is in the path, and only then', async () => {
+		await play(on(-1.5));
+		load(new FakeWorklet(ctx));
+		await settle();
+		expect(engine.outputLatency()).toBe(239 / 48000);
+		expect(engine.outputLatency()).toBe(alimiterDelay(48000));
+		engine.liveMaster({ volume: 1, limiter: false, ceiling_db: -1.5 });
+		expect(engine.outputLatency()).toBe(0);
+		expect(input().outs.map((e) => e.to)).toEqual([out()]);
+	});
+
+	test('a ceiling moved live is posted to it, and the module is loaded once per context', async () => {
+		await play(on(-1.5));
+		const node = new FakeWorklet(ctx);
+		load(node);
+		await settle();
+		engine.liveMaster({ volume: 1, limiter: true, ceiling_db: -9 });
+		expect(node.posted.at(-1)).toEqual({ limit: limiterLimit(-9) });
+		await play(on(-6));
+		expect(node.posted.at(-1)).toEqual({ limit: limiterLimit(-6) });
+		expect(asked).toHaveLength(1);
+		expect(ctx.of('worklet')).toHaveLength(1);
+	});
+
+	test('a webview that cannot run it keeps the compressor, with no lookahead to add', async () => {
+		await play(on(-3));
+		fail(new Error('refused'));
+		await settle();
+		const [comp] = ctx.of<FakeCompressor>('compressor');
+		expect(input().outs.map((e) => e.to)).toEqual([comp]);
+		expect(engine.outputLatency()).toBe(0);
+		expect(reported).toEqual([]);
+	});
+
+	test('nor without an AudioWorklet, by default', async () => {
+		engine = new AudioEngine({ createContext: () => ctx as unknown as AudioContext, fetchPcm: pcm as never });
+		await play(on(-3));
+		await settle();
+		expect(input().outs.map((e) => e.to)).toEqual(ctx.of('compressor'));
 	});
 });
 
