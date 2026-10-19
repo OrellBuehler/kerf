@@ -1,6 +1,6 @@
-//! The golden argv oracle: 6400 seeded timelines (4000, then 800 with a master bus, then 800
+//! The golden argv oracle: 6800 seeded timelines (4000, then 800 with a master bus, then 800
 //! with per-property channels, then 400 with an AMF or VAAPI encoder, then 400 with animated SVG
-//! titles) whose ffmpeg argv must not move.
+//! titles, then 400 with a keyed mask or crop) whose ffmpeg argv must not move.
 //!
 //! `build_export_args_phase`, `build_still_args` and `build_preview_args_with` are
 //! built for every case and their argv reduced to a digest, checked against three
@@ -37,6 +37,12 @@
 //! appended to each file. Changing how a title is read (a document that cannot move is one looped
 //! picture, a stream reads the title's own sequence from `-start_number`, a still is `-f image2
 //! -pattern_type none`) moved those four lines (blocks 60..63) and nothing else.
+//!
+//! **The keyed mask and crop family is appended the same way**: the [`MASK_CROP_CASES`] after the
+//! titles draw from the same generator (and get the channel family's channels, but no titles) and
+//! then have numbers of their mask and the animated crop keyed ([`mask_crop_for`], on dice of its
+//! own seeded by the case and the clip). The first 6400 per-case digests are the ones the commit
+//! before those numbers could be keyed gave; only 4 block lines were appended to each file.
 //!
 //! **Machine-independent by construction.** The builders read the machine in five
 //! places, each pinned: the preview's decode acceleration (the
@@ -93,7 +99,10 @@ const HW_CASES: usize = 400;
 /// The animated-title cases appended after the hardware-encoder ones (see the module docs).
 const SVG_CASES: usize = 400;
 const SVG_FIRST: usize = CASES + MASTER_CASES + CHANNEL_CASES + HW_CASES;
-const TOTAL: usize = SVG_FIRST + SVG_CASES;
+/// The keyed mask and crop cases appended after the title ones (see the module docs).
+const MASK_CROP_CASES: usize = 400;
+const MASK_CROP_FIRST: usize = SVG_FIRST + SVG_CASES;
+const TOTAL: usize = MASK_CROP_FIRST + MASK_CROP_CASES;
 const BLOCK: usize = 100;
 const MIN_PER_FAMILY: usize = 20;
 const KINDS: [&str; 3] = ["export", "still", "preview"];
@@ -153,6 +162,11 @@ colour-keyed-gamma :gamma='if(lt((t-
 colour-keyed-temperature :gamma_r='1+0.3*(
 volume-keyed volume='if(lt((t-
 volume-keyed-frames asetnsamples=n=128:p=0,volume=
+mask-keyed )/2*W)
+mask-keyed-feather if(lte((
+preview-mask-keyed )/2*W)
+crop-keyed :a='alpha(((1-(1/
+preview-crop-keyed :a='alpha(((1-(1/
 hdr-zscale zscale=tin=
 hdr-colorspace colorspace=all=bt709:iall=bt2020
 hdr-pq tin=smpte2084
@@ -552,6 +566,7 @@ fn channels_for(tl: &mut Timeline, j: usize) {
         Property::Gamma => (0.4, 2.5),
         Property::Temperature => (-1.0, 1.0),
         Property::Volume => (0.0, 2.0),
+        _ => (0.0, 1.0),
     };
     for (n, clip) in tl.tracks.iter_mut().flat_map(|t| &mut t.clips).enumerate() {
         let mut r = Rng::new((1 << 40) + (j as u64) * 64 + n as u64);
@@ -589,6 +604,57 @@ fn channels_for(tl: &mut Timeline, j: usize) {
             let p = r.pick(&Property::TRANSFORM);
             let held = if r.chance(0.5) { Vec::new() } else { keys(&mut r, p) };
             clip.set_property_keys(p, held);
+        }
+    }
+}
+
+/// The keyed mask and crop of the `j`-th mask-and-crop case: on dice of their own (seeded by the
+/// case and the clip's place in it), so the family never rolls the generator's. About half the
+/// clips get a mask (the one they had, or a new one) with some of its numbers keyed — a feather
+/// keyed to nothing in places — and about half get the animated crop keyed: a zoom alone, a pan
+/// alone, or both, each with its own chance, so one and all of the three are covered.
+fn mask_crop_for(tl: &mut Timeline, j: usize) {
+    const EASINGS: [Easing; 4] = [Easing::Linear, Easing::Hold, Easing::EaseInOut, Easing::EaseOut];
+    let range = |p: Property| match p {
+        Property::MaskX | Property::MaskY => (0.1, 0.9),
+        Property::MaskWidth | Property::MaskHeight => (0.05, 1.4),
+        Property::MaskFeather => (0.0, 0.6),
+        Property::CropZoom => (1.0, 3.5),
+        _ => (-1.0, 1.0),
+    };
+    for (n, clip) in tl.tracks.iter_mut().flat_map(|t| &mut t.clips).enumerate() {
+        let mut r = Rng::new((2 << 40) + (j as u64) * 64 + n as u64);
+        let span = clip.duration() * 1.1 + 0.2;
+        let keys = |r: &mut Rng, p: Property| {
+            let (lo, hi) = range(p);
+            let mut keys: Vec<PropertyKey> = (0..1 + r.below(4))
+                .map(|_| PropertyKey {
+                    time: r.real(0.0, span),
+                    value: if p == Property::MaskFeather && r.chance(0.2) {
+                        0.0
+                    } else {
+                        r.real(lo, hi)
+                    },
+                    easing: r.pick(&EASINGS),
+                })
+                .collect();
+            keys.sort_by(|a, b| a.time.total_cmp(&b.time));
+            keys
+        };
+        if r.chance(0.5) {
+            clip.mask.get_or_insert_with(Mask::default);
+            for p in Property::MASK {
+                if r.chance(0.5) {
+                    clip.set_property_keys(p, keys(&mut r, p));
+                }
+            }
+        }
+        if r.chance(0.5) {
+            for p in Property::CROP {
+                if r.chance(0.6) {
+                    clip.set_property_keys(p, keys(&mut r, p));
+                }
+            }
         }
     }
 }
@@ -965,8 +1031,11 @@ fn case(i: usize, assets: &[Asset]) -> Case {
     if i >= CASES + MASTER_CASES {
         channels_for(&mut timeline, i - CASES - MASTER_CASES);
     }
-    if i >= SVG_FIRST {
+    if (SVG_FIRST..MASK_CROP_FIRST).contains(&i) {
         svg_for(&mut timeline, i - SVG_FIRST);
+    }
+    if i >= MASK_CROP_FIRST {
+        mask_crop_for(&mut timeline, i - MASK_CROP_FIRST);
     }
     let dur = timeline.duration();
     let edges: Vec<f64> = (timeline.tracks.iter().flat_map(|t| &t.clips))
@@ -993,7 +1062,7 @@ fn case(i: usize, assets: &[Asset]) -> Case {
     if (CASES + MASTER_CASES + CHANNEL_CASES..SVG_FIRST).contains(&i) {
         opts.video_codec = Some(hw_encoder_for(i - CASES - MASTER_CASES - CHANNEL_CASES).into());
     }
-    if i >= SVG_FIRST {
+    if (SVG_FIRST..MASK_CROP_FIRST).contains(&i) {
         opts.container = svg_container_for(i - SVG_FIRST).unwrap_or(opts.container);
     }
     let pass = match r.below(20) { 0..=11 => PassPhase::Single, 12..=15 => PassPhase::First, _ => PassPhase::Second };
@@ -1007,7 +1076,7 @@ fn case(i: usize, assets: &[Asset]) -> Case {
         timeline,
         opts,
     };
-    if i >= SVG_FIRST {
+    if (SVG_FIRST..MASK_CROP_FIRST).contains(&i) {
         svg_playhead(&mut c, i - SVG_FIRST);
     }
     c

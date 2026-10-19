@@ -791,6 +791,21 @@ so the feature is **only** activated through these forwards — which is what ma
   under a moving zoom, beside a static grade and in a range export
   (`engine/cli/keyed_channels.rs`, `#[ignore]`d; without `eval=frame` it fails at the second frame). A test
   picture's luma must sit away from 128 or a `contrast` ramp does nothing visible (it pivots there).
+  **A keyed mask** is the mask's own alpha `geq` with each keyed number a quoted expression of `geq`'s `T`
+  (`mask_keep_expr_keyed`, `channel_number`): the same distance and feather ramp as `mask_keep_expr`, a keyed
+  feather guarded `if(lte(F,0.000001),lte(d,1),clip((1-d)/F,0,1))` so a feather keyed to nothing is the static
+  hard edge; a static mask's argv is untouched. **A keyed crop** is a `geq` that reads every plane (alpha too)
+  through the window of `Clip::crop_window_at` (`crop_remap_filter`: `lum(L*W+(X+0.5)*S-0.5, …)` with `S = 1/zoom`,
+  `L = (1-S)*(1+pan)/2`, sampling at pixel centres, bilinear) — placed after the static `crop` and after `setpts`
+  (on the timeline clock), with `fps` hoisted ahead of it (as the reframe path does) so it draws only the frames
+  the export keeps, and before the fit `scale`, at source resolution; the picture keeps its size. **Measured on
+  FFmpeg 6.1** (`engine/cli/keyed_mask_crop.rs`, `#[ignore]`d; 4.4 and 9.0 were not available where it was
+  written): a keyed mask's every fifth output frame is within 4 levels (mean ≤ 0.4) of the still of the same
+  moment, which draws `mask_at` through the static `geq` (centre, size, feather to a hard edge and back, an
+  inverted ellipse, beside a keyed opacity, speed 2, reversed, late, a range export); a keyed crop puts a box
+  within 1 px of where the window of that moment says on **every** output frame (zoom, pan at a held zoom, on top
+  of a static crop, speed 2, a range export), and within `1 + 3/w` px of the still, whose static `crop` rounds its
+  corner and size down to even source pixels in 4:2:0 as a static crop always did.
   **A keyed volume** is `asetnsamples=n=128:p=0,volume='…':eval=frame` placed *after* `atempo`, so its `t`
   is the clip's own playing time (checked at speed 0.5 / 2, reversed, late on the timeline, range
   export). `volume` holds one gain for a whole frame and decoders hand over 1024 samples (21 ms) — a fade

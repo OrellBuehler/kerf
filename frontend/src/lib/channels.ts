@@ -1,19 +1,21 @@
 /**
  * Per-property keyframe channels: the faithful TS mirror of kerf-core's `model/channels.rs`
  * (`Property`, `PropertyTrack`, `Clip::property_keys` / `property_curve` / `property_at`,
- * `color_at`, `volume_at`, `upsert`, `rebase_head`). Any one number of a clip — a transform
- * number, a colour number or the clip's volume — can have keys of its own; a number with a track is
+ * `color_at`, `volume_at`, `mask_at`, `crop_window_at`, `framing_at`, `upsert`, `rebase_head`).
+ * Any one number of a clip — a transform number, a colour number, the clip's volume, a number of
+ * its mask or the animated crop (a zoom and a pan, see `cropWindowAt`) — can have keys of its own;
+ * a number with a track is
  * driven by it, a transform number without one reads the legacy whole-transform bundle
  * (`clip.keyframes`), anything else is its static value. One resolver (`propertyKeys`), so the
  * editor's sampled pose, the harness's edits and the export read one curve. Its numbers are pinned
  * against the Rust tests (`channels.test.ts`).
  */
 import { easedPoints, splitEasing, EASE_STEPS, curve } from './easing';
-import type { Clip, Color, Easing, Keyframe, Property, PropertyKey, PropertyTrack, Transform } from './types';
-import { DEFAULT_COLOR, DEFAULT_TRANSFORM } from './types';
+import type { Clip, Color, Easing, Keyframe, Mask, Property, PropertyKey, PropertyTrack, Transform } from './types';
+import { DEFAULT_COLOR, DEFAULT_MASK, DEFAULT_TRANSFORM } from './types';
 
 /** What the samplers read of a clip: a gain clip (`audio-mix.ts`) carries no transform. */
-export type Animatable = Pick<Clip, 'volume' | 'channels' | 'keyframes' | 'transform' | 'color'>;
+export type Animatable = Pick<Clip, 'volume' | 'channels' | 'keyframes' | 'transform' | 'color'> & Partial<Pick<Clip, 'mask'>>;
 
 export const PROPERTIES: readonly Property[] = [
 	'scale',
@@ -26,26 +28,45 @@ export const PROPERTIES: readonly Property[] = [
 	'saturation',
 	'gamma',
 	'temperature',
-	'volume'
+	'volume',
+	'mask_x',
+	'mask_y',
+	'mask_width',
+	'mask_height',
+	'mask_feather',
+	'crop_zoom',
+	'crop_x',
+	'crop_y'
 ];
 export const TRANSFORM_PROPERTIES: readonly Property[] = ['scale', 'pos_x', 'pos_y', 'rotation', 'opacity'];
 export const COLOR_PROPERTIES: readonly Property[] = ['brightness', 'contrast', 'saturation', 'gamma', 'temperature'];
+export const MASK_PROPERTIES: readonly Property[] = ['mask_x', 'mask_y', 'mask_width', 'mask_height', 'mask_feather'];
+export const CROP_PROPERTIES: readonly Property[] = ['crop_zoom', 'crop_x', 'crop_y'];
 
 /** The most a clip's volume channel may reach (the master bus's own ceiling, +12 dB). */
 export const MAX_CHANNEL_VOLUME = 4;
 /** The longest track of keys a property may be given (`MAX_CHANNEL_KEYS` in project.rs). */
 export const MAX_CHANNEL_KEYS = 1000;
+/** The deepest the animated crop zooms (`MAX_CROP_ZOOM`). */
+export const MAX_CROP_ZOOM = 10;
+/** The smallest and largest a mask's side may be (`MIN_MASK_SIZE` / `MAX_MASK_SIZE`). */
+export const MIN_MASK_SIZE = 0.01;
+export const MAX_MASK_SIZE = 2;
+/** The feather a new mask gets (`DEFAULT_MASK_FEATHER`). */
+const DEFAULT_MASK_FEATHER = 0.15;
 /** A scale smaller than this is read as this (a scale of 0 is "unset" to FFmpeg's `scale`). */
 const MIN_CHANNEL_SCALE = 1e-6;
 
 export const isTransformProperty = (p: Property) => TRANSFORM_PROPERTIES.includes(p);
 export const isColorProperty = (p: Property) => COLOR_PROPERTIES.includes(p);
+export const isMaskProperty = (p: Property) => MASK_PROPERTIES.includes(p);
+export const isCropProperty = (p: Property) => CROP_PROPERTIES.includes(p);
 
-/** A short name for a sentence ("opacity keyframes 2 → 3"). */
+/** A short name for a sentence ("opacity keyframes 2 → 3", "mask x keyframes changed"). */
 export function propertyLabel(p: Property): string {
 	if (p === 'pos_x') return 'position x';
 	if (p === 'pos_y') return 'position y';
-	return p;
+	return p.replace('_', ' ');
 }
 
 /** The range the static setter accepts (`undefined` is unbounded on that side). */
@@ -70,12 +91,26 @@ export function propertyRange(p: Property): [number | undefined, number | undefi
 			return [0.1, 10];
 		case 'volume':
 			return [0, MAX_CHANNEL_VOLUME];
+		case 'mask_x':
+		case 'mask_y':
+		case 'mask_feather':
+			return [0, 1];
+		case 'mask_width':
+		case 'mask_height':
+			return [MIN_MASK_SIZE, MAX_MASK_SIZE];
+		case 'crop_zoom':
+			return [1, MAX_CROP_ZOOM];
+		case 'crop_x':
+		case 'crop_y':
+			return [-1, 1];
 	}
 }
 
 /** The value that changes nothing. */
 export function neutral(p: Property): number {
-	return ['scale', 'opacity', 'contrast', 'saturation', 'gamma', 'volume'].includes(p) ? 1 : 0;
+	if (['mask_x', 'mask_y', 'mask_width', 'mask_height'].includes(p)) return 0.5;
+	if (p === 'mask_feather') return DEFAULT_MASK_FEATHER;
+	return ['scale', 'opacity', 'contrast', 'saturation', 'gamma', 'volume', 'crop_zoom'].includes(p) ? 1 : 0;
 }
 
 /** `value` brought into range; a number that is not one becomes the neutral value
@@ -98,6 +133,15 @@ export function propertyProblem(p: Property, value: number): string | undefined 
 	const range =
 		lo !== undefined && hi !== undefined ? `within ${lo}..=${hi}` : lo !== undefined ? 'a finite value > 0' : 'finite';
 	return `${p} keyframe values must be ${range} (got ${value})`;
+}
+
+/** The refusal keying `prop` on `clip` gets (`check_keyable` in project.rs): a mask's numbers
+ *  need a mask. No keys is always fine. */
+export function keyableProblem(clip: Animatable, prop: Property, keys: PropertyKey[]): string | undefined {
+	if (isMaskProperty(prop) && !clip.mask && keys.length > 0) {
+		return `the clip has no mask to key the ${propertyLabel(prop)} of: give it one first (set_mask)`;
+	}
+	return undefined;
 }
 
 /** What `Project::set_property_keyframes` refuses a list of keys for, or `undefined`. */
@@ -215,7 +259,36 @@ export function staticValue(clip: Animatable, prop: Property): number {
 			return c.temperature ?? 0;
 		case 'volume':
 			return clip.volume ?? 1;
+		case 'mask_x':
+		case 'mask_y':
+		case 'mask_width':
+		case 'mask_height':
+		case 'mask_feather': {
+			if (!clip.mask) return neutral(prop);
+			const m = normalizedMask(clip.mask);
+			return { mask_x: m.x, mask_y: m.y, mask_width: m.width, mask_height: m.height, mask_feather: m.feather }[prop];
+		}
+		case 'crop_zoom':
+			return 1;
+		case 'crop_x':
+		case 'crop_y':
+			return 0;
 	}
+}
+
+const unitOr = (v: number) => (Number.isFinite(v) ? Math.min(Math.max(v, 0), 1) : 0.5);
+
+/** The mask with every field held to range (`Mask::normalized`). */
+export function normalizedMask(m: Mask): Mask {
+	const side = (v: number) => Math.min(Math.max(Number.isFinite(v) ? v : 0.5, MIN_MASK_SIZE), MAX_MASK_SIZE);
+	return {
+		...m,
+		x: unitOr(m.x),
+		y: unitOr(m.y),
+		width: side(m.width),
+		height: side(m.height),
+		feather: unitOr(m.feather)
+	};
 }
 
 /** `prop` at `local` seconds from the clip's start: its curve, else its static value. */
@@ -258,11 +331,56 @@ export function colorAt(clip: Animatable, local: number): Color {
 /** The clip's gain (linear) at `local`, fades and the track fader not included. */
 export const volumeAt = (clip: Animatable, local: number) => propertyAt(clip, 'volume', local);
 
+/** Whether a number of the clip's mask is keyed and it has a mask to key (`Clip::mask_animated`). */
+export const maskAnimated = (clip: Animatable) => !!clip.mask && MASK_PROPERTIES.some((p) => isKeyed(clip, p));
+/** Whether the animated crop is keyed (`Clip::crop_animated`). */
+export const cropAnimated = (clip: Animatable) => CROP_PROPERTIES.some((p) => isKeyed(clip, p));
+
+/** The clip's mask at `local`, normalized (`Clip::mask_at`). */
+export function maskAt(clip: Animatable, local: number): Mask | undefined {
+	if (!clip.mask) return undefined;
+	const m = normalizedMask(clip.mask);
+	if (!maskAnimated(clip)) return m;
+	return normalizedMask({
+		...m,
+		x: propertyAt(clip, 'mask_x', local),
+		y: propertyAt(clip, 'mask_y', local),
+		width: propertyAt(clip, 'mask_width', local),
+		height: propertyAt(clip, 'mask_height', local),
+		feather: propertyAt(clip, 'mask_feather', local)
+	});
+}
+
+/** The window of the (statically cropped) picture the animated crop shows at `local`:
+ *  `[left, top, width, height]` fractions of it (`Clip::crop_window_at`). */
+export function cropWindowAt(clip: Animatable, local: number): [number, number, number, number] {
+	if (!cropAnimated(clip)) return [0, 0, 1, 1];
+	const side = 1 / propertyAt(clip, 'crop_zoom', local);
+	const at = (pan: number) => ((1 - side) * (1 + pan)) / 2;
+	return [at(propertyAt(clip, 'crop_x', local)), at(propertyAt(clip, 'crop_y', local)), side, side];
+}
+
+/** `transformAt` with the animated crop folded into the crop edges (`Clip::framing_at`). */
+export function framingAt(clip: Animatable, local: number): Transform {
+	const t = transformAt(clip, local);
+	if (!cropAnimated(clip)) return t;
+	const [l, top, w, h] = cropWindowAt(clip, local);
+	const cw = Math.max(1 - t.crop_left - t.crop_right, 0);
+	const ch = Math.max(1 - t.crop_top - t.crop_bottom, 0);
+	const left = t.crop_left + cw * l;
+	const up = t.crop_top + ch * top;
+	return { ...t, crop_left: left, crop_top: up, crop_right: 1 - left - cw * w, crop_bottom: 1 - up - ch * h };
+}
+
 // ---- edits (mutate `clip`: the harness works on a scratch copy) ------------------------
+
+/** An easing of our own: a curve read off the editor's (reactive) timeline is a proxy, which the
+ *  harness's history cannot clone (`structuredClone` refuses it). */
+export const ownEasing = (e: Easing): Easing => (typeof e === 'string' ? e : { bezier: { ...e.bezier } });
 
 const plain = (k: PropertyKey): PropertyKey => {
 	const out: PropertyKey = { time: k.time, value: k.value };
-	if (k.easing && k.easing !== 'linear') out.easing = k.easing;
+	if (k.easing && k.easing !== 'linear') out.easing = ownEasing(k.easing);
 	return out;
 };
 

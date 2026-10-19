@@ -400,7 +400,8 @@ export interface Keyframe {
 }
 
 /** One animatable number of a clip (kerf-core's `Property`): a transform number, a colour
- *  number, or the clip's own gain (linear). */
+ *  number, the clip's own gain (linear), a number of its mask or the animated crop (a zoom into
+ *  the picture and where its window sits). */
 export type Property =
 	| 'scale'
 	| 'pos_x'
@@ -412,7 +413,15 @@ export type Property =
 	| 'saturation'
 	| 'gamma'
 	| 'temperature'
-	| 'volume';
+	| 'volume'
+	| 'mask_x'
+	| 'mask_y'
+	| 'mask_width'
+	| 'mask_height'
+	| 'mask_feather'
+	| 'crop_zoom'
+	| 'crop_x'
+	| 'crop_y';
 
 /** One key of a property's own animation. `time` is seconds from the clip's start. */
 export interface PropertyKey {

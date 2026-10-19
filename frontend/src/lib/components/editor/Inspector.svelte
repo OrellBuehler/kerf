@@ -44,8 +44,11 @@
 	import {
 		channelOf,
 		colorAnimated,
+		cropAnimated,
 		colorAt,
 		isKeyed,
+		maskAt,
+		MAX_CROP_ZOOM,
 		propertyAt,
 		propertyKeys,
 		transformAnimated,
@@ -371,11 +374,24 @@
 	const speed = $derived(clip?.speed ?? 1);
 	const transition = $derived(clip?.transition_in ?? null);
 	const mask = $derived(clip?.mask ?? null);
+	/** The mask the sliders show: every keyed number its curve at the playhead. */
+	const maskNow = $derived(clip ? maskAt(clip, localTime) : undefined);
 	/** Patch the clip's mask, starting from the default when there is none. */
 	const patchMask = (patch: Partial<Mask>, at: Edit = scope) => {
 		const c = clipOf(at);
 		if (c) return run(() => editor.setMask(c.id, { ...DEFAULT_MASK, ...(c.mask ?? {}), ...patch }));
 	};
+	/** A mask number: a key at the playhead while it is keyed, else the static mask. */
+	function setMaskNumber(prop: Property, patch: Partial<Mask>, v: number, at: Edit) {
+		const c = clipOf(at);
+		if (!c) return;
+		return isKeyed(c, prop) ? run(() => keyAtPlayhead(c, prop, v, at.time)) : patchMask(patch, at);
+	}
+	/** The animated crop has no static value: an edit is a key at the playhead. */
+	function setCropNumber(prop: Property, v: number, at: Edit) {
+		const c = clipOf(at);
+		if (c) return run(() => keyAtPlayhead(c, prop, v, at.time));
+	}
 	const effects = $derived(clip?.effects ?? []);
 	const audioFx = $derived(clip?.audio ?? []);
 	const keyframes = $derived(clip?.keyframes ?? []);
@@ -1516,7 +1532,7 @@
 					setTf({ opacity: v }, at), undefined, liveTf((v) => ({ opacity: v })))}
 				</InspectorSection>
 
-				<InspectorSection title="Framing" summary={hasCrop ? 'Cropped' : 'Full frame'}>
+				<InspectorSection title="Framing" summary={hasCrop ? 'Cropped' : cropAnimated(clip) ? 'Crop motion' : 'Full frame'}>
 				<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:6px">
 					<Btn
 						size="sm"
@@ -1554,6 +1570,13 @@
 				{@render rangeRow('Right', tf.crop_right, { min: 0, max: 0.9, step: 0.01, neutral: DEFAULT_TRANSFORM.crop_right }, (v, at) => setTf({ crop_right: v }, at), undefined, liveTf((v) => ({ crop_right: v })))}
 				{@render rangeRow('Top', tf.crop_top, { min: 0, max: 0.9, step: 0.01, neutral: DEFAULT_TRANSFORM.crop_top }, (v, at) => setTf({ crop_top: v }, at), undefined, liveTf((v) => ({ crop_top: v })))}
 				{@render rangeRow('Bottom', tf.crop_bottom, { min: 0, max: 0.9, step: 0.01, neutral: DEFAULT_TRANSFORM.crop_bottom }, (v, at) => setTf({ crop_bottom: v }, at), undefined, liveTf((v) => ({ crop_bottom: v })))}
+				<div class="k-overline" style="margin:8px 0 2px">Crop motion</div>
+				<div style="font:var(--type-caption);color:var(--text-muted);margin:0 0 4px">
+					A push-in or a pan inside the picture (and inside the crop above). It is always keyed: a change keys it at the playhead.
+				</div>
+				{@render rangeRow('Zoom', propertyAt(clip, 'crop_zoom', localTime), { min: 1, max: MAX_CROP_ZOOM, step: 0.05, neutral: 1, ...TIMES }, (v, at) => setCropNumber('crop_zoom', v, at), 'crop_zoom')}
+				{@render rangeRow('Pan X', propertyAt(clip, 'crop_x', localTime), { min: -1, max: 1, step: 0.01, neutral: 0, bipolar: true }, (v, at) => setCropNumber('crop_x', v, at), 'crop_x')}
+				{@render rangeRow('Pan Y', propertyAt(clip, 'crop_y', localTime), { min: -1, max: 1, step: 0.01, neutral: 0, bipolar: true }, (v, at) => setCropNumber('crop_y', v, at), 'crop_y')}
 				</InspectorSection>
 
 				<InspectorSection title="Color" summary={colorSummary(clip, col)}>
@@ -1596,15 +1619,15 @@
 					onclick={() => patchMask({ shape: 'ellipse' })}>Ellipse</Chip
 				>
 			</div>
-			{#if mask}
-				{@render rangeRow('Center X', mask.x, { min: 0, max: 1, step: 0.01, neutral: DEFAULT_MASK.x, bipolar: true }, (v, at) => patchMask({ x: v }, at), undefined, liveMask((v) => ({ x: v })))}
-				{@render rangeRow('Center Y', mask.y, { min: 0, max: 1, step: 0.01, neutral: DEFAULT_MASK.y, bipolar: true }, (v, at) => patchMask({ y: v }, at), undefined, liveMask((v) => ({ y: v })))}
-				{@render rangeRow('Width', mask.width, { min: 0.02, max: 1.5, step: 0.01, neutral: DEFAULT_MASK.width }, (v, at) =>
-					patchMask({ width: v }, at), undefined, liveMask((v) => ({ width: v })))}
-				{@render rangeRow('Height', mask.height, { min: 0.02, max: 1.5, step: 0.01, neutral: DEFAULT_MASK.height }, (v, at) =>
-					patchMask({ height: v }, at), undefined, liveMask((v) => ({ height: v })))}
-				{@render rangeRow('Feather', mask.feather, { min: 0, max: 1, step: 0.01, neutral: DEFAULT_MASK.feather }, (v, at) =>
-					patchMask({ feather: v }, at), undefined, liveMask((v) => ({ feather: v })))}
+			{#if mask && maskNow}
+				{@render rangeRow('Center X', maskNow.x, { min: 0, max: 1, step: 0.01, neutral: DEFAULT_MASK.x, bipolar: true }, (v, at) => setMaskNumber('mask_x', { x: v }, v, at), 'mask_x', liveMask((v) => ({ x: v })))}
+				{@render rangeRow('Center Y', maskNow.y, { min: 0, max: 1, step: 0.01, neutral: DEFAULT_MASK.y, bipolar: true }, (v, at) => setMaskNumber('mask_y', { y: v }, v, at), 'mask_y', liveMask((v) => ({ y: v })))}
+				{@render rangeRow('Width', maskNow.width, { min: 0.02, max: 1.5, step: 0.01, neutral: DEFAULT_MASK.width }, (v, at) =>
+					setMaskNumber('mask_width', { width: v }, v, at), 'mask_width', liveMask((v) => ({ width: v })))}
+				{@render rangeRow('Height', maskNow.height, { min: 0.02, max: 1.5, step: 0.01, neutral: DEFAULT_MASK.height }, (v, at) =>
+					setMaskNumber('mask_height', { height: v }, v, at), 'mask_height', liveMask((v) => ({ height: v })))}
+				{@render rangeRow('Feather', maskNow.feather, { min: 0, max: 1, step: 0.01, neutral: DEFAULT_MASK.feather }, (v, at) =>
+					setMaskNumber('mask_feather', { feather: v }, v, at), 'mask_feather', liveMask((v) => ({ feather: v })))}
 				<CheckRow checked={!!mask.inverted} pending={editor.locked} onchange={(e) => patchMask({ inverted: e.currentTarget.checked })}>
 					Invert
 				</CheckRow>

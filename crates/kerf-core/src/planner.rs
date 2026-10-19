@@ -303,18 +303,22 @@ impl Planner {
                 fades: timing.fades(),
                 keys: timing.motion_keys(),
                 tail: fx.tail > 0.0,
-                animated: (clip.is_animated() || clip.color_animated()).then(|| Animated {
-                    keys: clip.is_animated().then(|| Keyed {
-                        scale: clip.is_keyed(Property::Scale),
-                        rotation: clip.is_keyed(Property::Rotation),
+                animated: (clip.is_animated() || clip.color_animated() || clip.mask_animated() || clip.crop_animated()).then(
+                    || Animated {
+                        keys: clip.is_animated().then(|| Keyed {
+                            scale: clip.is_keyed(Property::Scale),
+                            rotation: clip.is_keyed(Property::Rotation),
+                            rotates: clip.property_keys(Property::Rotation).iter().any(|k| k.value != 0.0),
+                            opacity: clip.is_keyed(Property::Opacity),
+                        }),
                         rotates: clip.property_keys(Property::Rotation).iter().any(|k| k.value != 0.0),
-                        opacity: clip.is_keyed(Property::Opacity),
-                    }),
-                    rotates: clip.property_keys(Property::Rotation).iter().any(|k| k.value != 0.0),
-                    opacity: clip.property_keys(Property::Opacity).iter().any(|k| k.value < 1.0),
-                    zooms: clip.zoom_animated(),
-                    color: clip.color_animated(),
-                }),
+                        opacity: clip.property_keys(Property::Opacity).iter().any(|k| k.value < 1.0),
+                        zooms: clip.zoom_animated(),
+                        color: clip.color_animated(),
+                        mask: clip.mask_animated(),
+                        crop: clip.crop_animated(),
+                    },
+                ),
                 effects,
             });
         }
@@ -610,14 +614,14 @@ impl Planner {
                     source_time,
                     clip_time: local,
                     stream,
-                    transform: clip.transform_at(local),
+                    transform: clip.framing_at(local),
                     color: clip.color_at(local),
                     grade: clip.grade.clone(),
                     name: asset.name.clone(),
                     projection: asset.projection,
                     hdr: planned.hdr,
                     effects: planned.effects.clone(),
-                    mask: clip.mask.map(|m| m.normalized()),
+                    mask: clip.mask_at(local),
                     reframe,
                     fx: LayerFx {
                         fades: planned.fades.clone(),
@@ -1751,6 +1755,54 @@ mod tests {
             .at_frame(60)
             .unwrap();
         assert!(plan.layers[0].animated.is_none());
+    }
+
+    #[test]
+    fn a_keyed_mask_and_crop_are_sampled_per_frame_and_only_an_export_frame_is_refused_them() {
+        use crate::model::{Mask, Property, PropertyKey};
+        let a = asset();
+        let assets = [a.clone()];
+        let mut clip = make_clip(a.id, 0.0, 4.0, 1.0);
+        clip.mask = Some(Mask::default());
+        clip.transform.crop_left = 0.2;
+        clip.set_property_keys(Property::MaskX, vec![PropertyKey::new(0.0, 0.2), PropertyKey::new(2.0, 0.8)]);
+        clip.set_property_keys(
+            Property::CropZoom,
+            vec![PropertyKey::new(0.0, 1.0), PropertyKey::new(2.0, 3.0)],
+        );
+        let tl = single(vec![clip.clone()]);
+        // Frame 60 of 30 fps is t = 2.0, a second into the clip: halfway along both ramps.
+        let still = planner(&tl, &assets, PlanMode::Still, &opts(30.0)).at_frame(60).unwrap();
+        let motion = planner(&tl, &assets, PlanMode::Motion, &opts(30.0)).at_frame(60).unwrap();
+        for plan in [&still, &motion] {
+            let layer = &plan.layers[0];
+            assert!((layer.mask.unwrap().x - 0.5).abs() < 1e-9, "{:?}", layer.mask);
+            // Zoom 2 into the 0.8-wide picture the static crop leaves, centred: 0.4 of it.
+            let t = layer.transform;
+            assert!((t.crop_left - 0.4).abs() < 1e-9 && (t.crop_right - 0.2).abs() < 1e-9, "{t:?}");
+            assert!(
+                (t.crop_top - 0.25).abs() < 1e-9 && (t.crop_bottom - 0.25).abs() < 1e-9,
+                "{t:?}"
+            );
+            let animated = layer.animated.unwrap();
+            assert!(animated.mask && animated.crop && animated.keys.is_none() && !animated.color);
+        }
+        let why = |plan: &RenderPlan| plan.reasons(&GpuCaps::A0, plan.size(u32::MAX));
+        let still_why = why(&still);
+        assert!(!has(&still_why, |u| matches!(
+            u,
+            Unsupported::KeyedMask(_) | Unsupported::KeyedCrop(_)
+        )));
+        let motion_why = why(&motion);
+        assert!(has(&motion_why, |u| matches!(u, Unsupported::KeyedMask(_))));
+        assert!(has(&motion_why, |u| matches!(u, Unsupported::KeyedCrop(_))));
+        // A mask's keys without a mask key nothing, and a static mask is no keyed one.
+        let mut bare = make_clip(a.id, 0.0, 4.0, 1.0);
+        bare.set_property_keys(Property::MaskX, vec![PropertyKey::new(0.0, 0.2), PropertyKey::new(2.0, 0.8)]);
+        let plan = planner(&single(vec![bare]), &assets, PlanMode::Motion, &opts(30.0))
+            .at_frame(60)
+            .unwrap();
+        assert!(plan.layers[0].animated.is_none() && plan.layers[0].mask.is_none());
     }
 
     #[test]

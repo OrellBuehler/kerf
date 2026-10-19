@@ -117,7 +117,9 @@ lock is taken; the clip comes back. The nested curves / wheels are MCP-only mirr
 `deny_unknown_fields`, so `mastre` is refused; the persisted model stays lenient.
 **Per-property animation over MCP**: `set_property_keyframes` (`clip_id`, `prop`, `keys:
 [{time, value, easing?}]`; `[]` makes the number static again; the clip comes back) animates one number —
-a transform number, a colour number or the clip's volume — independently of the rest,
+a transform number, a colour number, the clip's volume, a number of its mask (`mask_x` ... `mask_feather`; refused on a
+clip with no mask, and `set_mask` with no shape clears them) or the animated crop (`crop_zoom`, `crop_x`, `crop_y`) —
+independently of the rest,
 `set_property_tracks` (`clip_id`, `tracks: [{prop, keys}]`) re-keys several numbers in one edit (the dope
 sheet's gestures; a number twice or none at all is refused; each track is `PropertyTrackArg` with `keys` required and
 `deny_unknown_fields`, since the model's `PropertyTrack` reads a misspelt `keys` as none and would make the number static), `copy_keyframes` (`from_clip_id`, `to_clip_id`,

@@ -4,8 +4,14 @@ import {
 	clampProperty,
 	clearTransformAnimation,
 	colorAt,
+	cropWindowAt,
+	framingAt,
 	insertPropertyKey,
 	isKeyed,
+	keyableProblem,
+	maskAt,
+	MAX_MASK_SIZE,
+	propertyLabel,
 	propertyAt,
 	propertyKeys,
 	propertyKeysProblem,
@@ -381,5 +387,49 @@ describe('edits keep channels where they were', () => {
 		const eased = structuredClone(after);
 		eased.channels![0].keys[0].easing = 'hold';
 		expect(channelChanges(after, eased)).toEqual(['easing changed on 1 volume keyframe']);
+	});
+});
+
+describe('mask and crop channels (the same numbers as channels.rs)', () => {
+	test('a keyed mask is sampled over the static one, and a mask taken away draws nothing', () => {
+		const c = clip();
+		expect(maskAt(c, 1)).toBeUndefined();
+		setPropertyKeys(c, 'mask_x', [key(0, 0.2), key(2, 0.6)]);
+		expect(maskAt(c, 1)).toBeUndefined();
+		expect(keyableProblem(c, 'mask_x', [key(0, 0.2)])).toContain('no mask');
+		expect(keyableProblem(c, 'mask_x', [])).toBeUndefined();
+		expect(keyableProblem(c, 'crop_zoom', [key(0, 2)])).toBeUndefined();
+		c.mask = { shape: 'rect', x: 0.5, y: 0.3, width: 0.5, height: 0.5, feather: 0.4 };
+		const m = maskAt(c, 1)!;
+		expect(Math.abs(m.x - 0.4)).toBeLessThan(1e-12);
+		expect([m.y, m.feather]).toEqual([0.3, 0.4]);
+		setPropertyKeys(c, 'mask_width', [key(0, 7)]);
+		expect(maskAt(c, 0)!.width).toBe(MAX_MASK_SIZE);
+		expect(propertyProblem('mask_feather', 1.5)).toBeDefined();
+		expect(propertyLabel('mask_feather')).toBe('mask feather');
+	});
+
+	test('a keyed crop is a window of the picture’s own shape inside the static crop', () => {
+		const c = clip();
+		expect(cropWindowAt(c, 0)).toEqual([0, 0, 1, 1]);
+		expect(framingAt(c, 0)).toEqual(transformAt(c, 0));
+		setPropertyKeys(c, 'crop_zoom', [key(0, 1), key(2, 4)]);
+		let [l, t, w, h] = cropWindowAt(c, 1);
+		expect(Math.abs(w - 0.4)).toBeLessThan(1e-12);
+		expect(w).toBe(h);
+		expect(Math.abs(l - 0.3)).toBeLessThan(1e-12);
+		expect(Math.abs(t - 0.3)).toBeLessThan(1e-12);
+		setPropertyKeys(c, 'crop_x', [key(0, -1)]);
+		setPropertyKeys(c, 'crop_y', [key(0, 1)]);
+		[l, t, w, h] = cropWindowAt(c, 1);
+		expect(Math.abs(l)).toBeLessThan(1e-12);
+		expect(Math.abs(t + h - 1)).toBeLessThan(1e-12);
+		c.transform = { ...c.transform!, crop_left: 0.1, crop_right: 0.3 };
+		const f = framingAt(c, 1);
+		expect(Math.abs(f.crop_left - 0.1)).toBeLessThan(1e-12);
+		expect(Math.abs(1 - f.crop_left - f.crop_right - 0.6 * 0.4)).toBeLessThan(1e-12);
+		expect(Math.abs(f.crop_bottom)).toBeLessThan(1e-12);
+		expect(propertyProblem('crop_zoom', 0.5)).toBeDefined();
+		expect(clampProperty('crop_zoom', 0.5)).toBe(1);
 	});
 });

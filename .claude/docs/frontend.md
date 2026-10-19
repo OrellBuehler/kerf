@@ -414,7 +414,9 @@ the value it has there (◆ when a key sits there, and clicking it takes the key
 the number static), and once a number is keyed its slider shows the curve at the playhead and an edit
 writes a key there — `setCol` / `setGain` / `keyAtPlayhead` over `set_property_keyframes` with the
 mirror's `upsertKey`, so a drag is one edit (every number row is a `SliderRow`, below). The Transform sliders do the same for numbers keyed on
-their own; the Animation list is still the legacy bundle's. **The dope sheet** (`DopeSheet.svelte`, panel id
+their own, and so do the **mask's** five numbers (`maskAt`, `setMaskNumber`: a key at the playhead while keyed, else the
+static mask). The Framing section's **Crop motion** rows (Zoom, Pan X, Pan Y — the animated crop, a window of the picture
+inside the static edges above) have no static value: an edit there is always a key at the playhead (`setCropNumber`); the Animation list is still the legacy bundle's. **The dope sheet** (`DopeSheet.svelte`, panel id
 `keyframes`, titled *Keyframes*; in the Motion preset between the preview and the inspector, `EARLIER_PRESETS.motion`
 is the arrangement before it) shows the selected clip: one row per keyed number (`dopeRows`, the resolver's keys, so a
 bundle-driven transform number has a row too), its keys as diamonds on one axis over the clip's span (and past it, shaded,

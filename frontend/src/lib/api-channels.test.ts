@@ -10,11 +10,12 @@ import {
 	setKeyframes,
 	getHistory,
 	setPropertyKeyframes,
+	setMask,
 	setPropertyTracks,
 	splitClip
 } from './api';
-import { colorAt, propertyKeys, transformAt, volumeAt } from './channels';
-import type { Clip, Keyframe, PropertyKey, Timeline } from './types';
+import { colorAt, isKeyed, propertyKeys, transformAt, upsertKey, volumeAt } from './channels';
+import type { Clip, Easing, Keyframe, PropertyKey, Timeline } from './types';
 
 // The browser harness's answers must hold the contract the backend does (`set_property_keyframes`,
 // `copy_keyframes`, `set_keyframe_easing` with a property in project.rs), or the editor would be
@@ -190,5 +191,32 @@ describe('property keyframes (browser harness)', () => {
 			await expect(setPropertyTracks('c1', tracks as never)).rejects.toThrow(why);
 		}
 		expect(await getHistory()).toHaveLength(before + 1);
+	});
+
+	test('a key edit off the editor’s reactive timeline carries no proxy into the history', async () => {
+		const curve: Easing = { bezier: { x1: 0.1, y1: 0.2, x2: 0.3, y2: 0.4 } };
+		const t = await setPropertyKeyframes('c1', 'opacity', [k(0, 1, curve), k(4, 0)]);
+		// What the Inspector reads: the clip as the editor holds it, its curves behind a proxy
+		// (Svelte's `$state`), which `structuredClone` refuses.
+		const shown = structuredClone(clipOf(t, 'c1'));
+		const track = shown.channels!.find((c) => c.prop === 'opacity')!;
+		track.keys[0].easing = new Proxy(track.keys[0].easing as object, {}) as Easing;
+		const keys = upsertKey(propertyKeys(shown, 'opacity'), { time: 6, value: 0.5 });
+		const after = await setPropertyKeyframes('c1', 'opacity', keys);
+		expect(propertyKeys(clipOf(after, 'c1'), 'opacity')).toHaveLength(3);
+	});
+
+	test('a mask is keyed only on a clip with one, and clearing it clears its keys', async () => {
+		await setMask('c1', null);
+		await expect(setPropertyKeyframes('c1', 'mask_x', [k(0, 0.2), k(2, 0.8)])).rejects.toThrow('no mask');
+		await expect(setPropertyTracks('c1', [{ prop: 'mask_width', keys: [k(0, 0.3)] }])).rejects.toThrow('no mask');
+		await setPropertyKeyframes('c1', 'crop_zoom', [k(0, 1), k(1, 2)]);
+		await setMask('c1', { shape: 'rect', x: 0.5, y: 0.5, width: 0.5, height: 0.5, feather: 0.15 });
+		let c = clipOf(await setPropertyKeyframes('c1', 'mask_x', [k(0, 0.2), k(2, 0.8)]), 'c1');
+		expect(isKeyed(c, 'mask_x') && isKeyed(c, 'crop_zoom')).toBe(true);
+		c = clipOf(await setMask('c1', null), 'c1');
+		expect(isKeyed(c, 'mask_x')).toBe(false);
+		expect(isKeyed(c, 'crop_zoom')).toBe(true);
+		await setPropertyKeyframes('c1', 'crop_zoom', []);
 	});
 });

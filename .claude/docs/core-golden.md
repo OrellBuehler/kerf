@@ -21,7 +21,11 @@
   in the middle of its first title, `svg_playhead`, no dice, because the drawn playhead is between frames and a stream from one never reads
   `-start_number`); families `svg-input`, `svg-held`, `svg-overlay`, `svg-two`, `svg-partly-off`, `svg-restamp`, `still-svg`,
   `still-svg-one-file`, `preview-svg-*` (`input`, `held`, `seek`, `overlay`) and
-  the structural `svg-under-text`, `svg-gif`, `svg-offset`, which gave 28 to hundreds of cases each), have their
+  the structural `svg-under-text`, `svg-gif`, `svg-offset`, which gave 28 to hundreds of cases each) and **400 more**
+  with a keyed mask or crop (`mask_crop_for`, on dice seeded by case and clip, after the titles and without them:
+  some mask numbers keyed on a mask the clip had or was given, a feather keyed to nothing in places, the crop's zoom
+  and pan each with its own chance; families `mask-keyed`, `mask-keyed-feather`, `preview-mask-keyed`, `crop-keyed`,
+  `preview-crop-keyed`; the first 6400 digests did not move, 4 block lines appended to each file), have their
   `build_export_args_phase`, `build_still_args` and `build_preview_args_with` argv reduced to
   FNV-1a digests, committed as 64 block digests each in
   `engine/cli/golden/{export,still,preview}.txt` (LF: `.gitattributes`, and the comparison

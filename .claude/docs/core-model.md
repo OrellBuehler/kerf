@@ -101,11 +101,23 @@
   edge** (the left keeps `fade_in`, the right `fade_out`, each clamped to its half as for any clip that
   shrank; `transition_in` stays on the left): both halves used to keep both, so a clip with a fade-out
   dipped to black at every split. The links corpus did not move (no case splits a faded clip), and the
-  unit tests are mirrored by name in `links.test.ts`. **Not animatable yet**: the crop edges (`crop`'s output size is fixed
-  when the graph is configured — `w` / `h` are evaluated once — so an animated crop needs the
-  zoom-and-pan reformulation, not a number per frame) and the mask's centre / size / feather (a `geq`
-  expression could carry them; left for when the dope sheet can edit them). `frontend/src/lib/channels.ts`
-  is the faithful TS mirror (resolver, `upsertKey`, `rebaseHead`, `propertyKeysShifted`, ranges; both
+  unit tests are mirrored by name in `links.test.ts`. **The mask's numbers and the crop are animatable too**
+  (B5b-2): `mask_x`, `mask_y`, `mask_width`, `mask_height`, `mask_feather` (held to `Mask::normalized`'s ranges,
+  `MIN_MASK_SIZE` / `MAX_MASK_SIZE`; the static value is the clip's mask's, `Clip::mask_at`) and **the crop as a
+  zoom and a pan, not four edges** — `crop_zoom` (1..=`MAX_CROP_ZOOM` = 10: 1 is the whole picture, 2 half of each
+  side), `crop_x` / `crop_y` (-1..=1: the window against the left / top edge, centred, against the right / bottom).
+  An edge that moved per frame would need a picture whose size changes per frame, which almost nothing downstream
+  can follow (`crop`'s `w` / `h` are evaluated once); the keyed crop is a window of the *statically cropped*
+  picture with its own aspect, `1 / zoom` of each side, placed by the pan in the room left over
+  (`Clip::crop_window_at`), so it never shows anything outside the picture and its size never changes. It has no
+  static value (neutral 1, 0, 0) and sits on top of the four static edges; `Clip::framing_at` is `transform_at`
+  with the window folded into the crop edges — what the still and the GPU plan draw at one instant.
+  `mask_animated` is "a mask number is keyed **and** the clip has a mask": keying one on a clip without a mask is
+  refused (`check_keyable` in `set_property_keyframes` / `set_property_tracks` / `copy_keyframes`; no keys is
+  always fine), and `set_mask(None)` drops the mask's keys. `frontend/src/lib/channels.ts`
+  is the faithful TS mirror (resolver, `upsertKey`, `rebaseHead`, `propertyKeysShifted`, ranges, `maskAt`,
+  `cropWindowAt`, `framingAt`, `keyableProblem`; its key copies own their bezier easing (`ownEasing`), since a
+  curve read off the editor's reactive timeline is a proxy the harness's `structuredClone` refuses; both
   suites pin the same samples, head-cut keys and split beziers bit for bit), used by the harness, the
   Inspector's sampled pose and the preview's gain (`gainAutomation`).
   **`TransitionKind` is three families, and the family decides the render**: a

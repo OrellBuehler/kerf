@@ -7374,10 +7374,88 @@ fn motion_expr(clip: &Clip, fx: &ClipFx) -> Option<(String, String)> {
 /// `geq` is per-pixel and therefore slow, the same cost keyframed opacity
 /// already pays; a mask is worth it and a full-frame one is simply not written.
 fn mask_filter(mask: &Mask) -> String {
-    format!(
-        "geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':a='({keep})*alpha(X,Y)'",
-        keep = mask_keep_expr(mask)
-    )
+    mask_geq(&mask_keep_expr(mask))
+}
+
+/// The mask's alpha `geq` around a "keep" expression.
+fn mask_geq(keep: &str) -> String {
+    format!("geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':a='({keep})*alpha(X,Y)'")
+}
+
+/// The "keep" expression of a clip's mask: [`mask_keep_expr`] for a mask that holds still, and
+/// [`mask_keep_expr_keyed`] when a number of it is keyed.
+fn clip_mask_keep(clip: &Clip, mask: &Mask) -> String {
+    if clip.mask_animated() {
+        mask_keep_expr_keyed(clip, mask)
+    } else {
+        mask_keep_expr(mask)
+    }
+}
+
+/// A number of a per-frame expression: its curve over `tvar` while it is keyed, else `value`.
+fn channel_number(clip: &Clip, prop: Property, value: f64, tvar: &str) -> String {
+    if clip.is_keyed(prop) {
+        format!("({})", keyframe_expr(&clip.property_curve(prop), tvar, clip.timeline_start))
+    } else {
+        fnum(value)
+    }
+}
+
+/// [`mask_keep_expr`] with every keyed number of the mask its curve over `geq`'s `T` (read at
+/// each frame's own time): the same distance and the same feather ramp, so a frame of it is
+/// [`mask_keep_expr`] of [`Clip::mask_at`] that moment. A feather keyed to nothing is the hard
+/// edge a static mask with no feather gets.
+fn mask_keep_expr_keyed(clip: &Clip, mask: &Mask) -> String {
+    let m = mask.normalized();
+    let n = |p: Property, v: f64| channel_number(clip, p, v, "T");
+    let half = |p: Property, v: f64| {
+        if clip.is_keyed(p) {
+            format!("{}/2", n(p, v))
+        } else {
+            fnum(v / 2.0)
+        }
+    };
+    let dx = format!(
+        "(X-{cx}*W)/({rw}*W)",
+        cx = n(Property::MaskX, m.x),
+        rw = half(Property::MaskWidth, m.width)
+    );
+    let dy = format!(
+        "(Y-{cy}*H)/({rh}*H)",
+        cy = n(Property::MaskY, m.y),
+        rh = half(Property::MaskHeight, m.height)
+    );
+    let d = match m.shape {
+        MaskShape::Rect => format!("max(abs({dx})\\,abs({dy}))"),
+        MaskShape::Ellipse => format!("hypot({dx}\\,{dy})"),
+    };
+    let inside = if clip.is_keyed(Property::MaskFeather) {
+        let f = n(Property::MaskFeather, m.feather);
+        format!("if(lte({f}\\,0.000001)\\,lte({d}\\,1)\\,clip((1-{d})/{f}\\,0\\,1))")
+    } else if m.feather <= 1e-6 {
+        format!("lte({d}\\,1)")
+    } else {
+        format!("clip((1-{d})/{f}\\,0\\,1)", f = fnum(m.feather))
+    };
+    if m.inverted {
+        format!("(1-{inside})")
+    } else {
+        inside
+    }
+}
+
+/// The `geq` that draws a keyed crop ([`Clip::crop_window_at`]): every plane read through a
+/// window `1 / zoom` of the picture on each side, placed by the pan in the room left over, at
+/// each frame's own time (`T`). The picture keeps its size — that is why the crop is keyed as a
+/// zoom and a pan — and is magnified with `geq`'s bilinear read, sampling at pixel centres so
+/// the neutral window (zoom 1) reads every pixel where it is.
+fn crop_remap_filter(clip: &Clip) -> String {
+    let n = |p: Property| channel_number(clip, p, p.neutral(), "T");
+    let side = format!("(1/{})", n(Property::CropZoom));
+    let at = |pan: String| format!("((1-{side})*(1+{pan})/2)");
+    let sx = format!("{l}*W+(X+0.5)*{side}-0.5", l = at(n(Property::CropX)));
+    let sy = format!("{t}*H+(Y+0.5)*{side}-0.5", t = at(n(Property::CropY)));
+    format!("geq=lum='lum({sx},{sy})':cb='cb({sx},{sy})':cr='cr({sx},{sy})':a='alpha({sx},{sy})'")
 }
 
 /// The 0..1 "keep" expression at the heart of [`mask_filter`], separated out so
@@ -8143,6 +8221,9 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
             ct = t.crop_top
         )
     });
+    // A keyed crop is a per-frame `geq` after the static one, on the timeline clock (after
+    // `setpts`), and after `fps` so it draws only the frames the export keeps.
+    let crop_keyed = clip.crop_animated();
 
     let mut p: Vec<String> = Vec::new();
     // The label is the first filter of the chain, so that all of it reads what a file tagged BT.709
@@ -8201,6 +8282,12 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
             Some(instance),
         ));
         p.extend(crop);
+    }
+    if crop_keyed {
+        if reframe.is_none() {
+            p.push(format!("fps={}", fmt.fps));
+        }
+        p.push(crop_remap_filter(clip));
     }
     let sf = fmt.scale_flags();
     // `zscale` (the tone-map, which follows the geometry) refuses a picture whose size is
@@ -8262,7 +8349,7 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
         }
     }
     p.push("setsar=1".to_string());
-    if reframe.is_none() {
+    if reframe.is_none() && !crop_keyed {
         p.push(format!("fps={}", fmt.fps));
     }
     // HDR → SDR, once per clip, as late as the geometry allows: after the fit
@@ -8314,9 +8401,9 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
     match (&clip.mask, opacity_expr) {
         (Some(mask), Some(expr)) => p.push(format!(
             "geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':a='({keep})*({expr})*alpha(X,Y)'",
-            keep = mask_keep_expr(mask)
+            keep = clip_mask_keep(clip, mask)
         )),
-        (Some(mask), None) => p.push(mask_filter(mask)),
+        (Some(mask), None) => p.push(mask_geq(&clip_mask_keep(clip, mask))),
         (None, Some(expr)) => p.push(format!(
             "geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':a='({expr})*alpha(X,Y)'"
         )),
@@ -8990,7 +9077,7 @@ fn build_still_args_rendered(
                 &clip.effects,
                 rf.as_ref(),
                 &canvas,
-                clip.mask.as_ref(),
+                clip.mask_at(ac.local_time).as_ref(),
                 clip.zoom_animated(),
                 &layer.fades,
                 layer.label_bt709
@@ -9460,6 +9547,10 @@ mod keyed_zoom;
 /// the export renders (`#[ignore]`d).
 #[cfg(test)]
 mod keyed_channels;
+
+/// A keyed mask and a keyed crop against the pictures the export and the still render (`#[ignore]`d).
+#[cfg(test)]
+mod keyed_mask_crop;
 
 /// Curves, wheels and a LUT against the pictures the export and the still render (`#[ignore]`d).
 #[cfg(test)]
@@ -13771,6 +13862,51 @@ mod tests {
         assert!(g.contains("overlay=x=(W-w)/2+(0.25)*W:y=(H-h)/2+(0)*H"), "{g}");
         // A transformed clip is positioned by overlay, not letterbox-padded.
         assert!(!g.contains("pad=1920:1080"), "{g}");
+    }
+
+    #[test]
+    fn a_keyed_mask_reads_its_numbers_per_frame_and_a_static_one_is_as_it_was() {
+        use crate::model::{Property, PropertyKey};
+        let asset = av_asset(Uuid::new_v4(), 20.0);
+        let mut clip = make_clip(asset.id, 0.0, 10.0, 2.0);
+        clip.mask = Some(Mask::default());
+        let still_graph = graph_of(&single(vec![clip.clone()]), std::slice::from_ref(&asset));
+        assert!(still_graph.contains(&mask_filter(&Mask::default())), "{still_graph}");
+        clip.set_property_keys(Property::MaskX, vec![PropertyKey::new(0.0, 0.2), PropertyKey::new(4.0, 0.8)]);
+        clip.set_property_keys(Property::MaskFeather, vec![PropertyKey::new(1.0, 0.0)]);
+        let g = graph_of(&single(vec![clip.clone()]), &[asset]);
+        // The centre over the frame's own time (from the clip's start), the width still static,
+        // the feather keyed (to a hard edge here) behind a guard against dividing by nothing.
+        assert!(g.contains("(X-(if(lt((T-2),0),0.2,"), "{g}");
+        assert!(g.contains(")*W)/(0.25*W)"), "{g}");
+        assert!(g.contains("if(lte((0)\\,0.000001)\\,lte("), "{g}");
+        assert!(!g.contains(&mask_filter(&Mask::default())), "{g}");
+    }
+
+    #[test]
+    fn a_keyed_crop_reads_the_picture_through_its_window_after_fps_and_the_static_crop() {
+        use crate::model::{Property, PropertyKey};
+        let asset = av_asset(Uuid::new_v4(), 20.0);
+        let mut clip = make_clip(asset.id, 0.0, 10.0, 1.0);
+        clip.transform.crop_left = 0.1;
+        clip.set_property_keys(
+            Property::CropZoom,
+            vec![PropertyKey::new(0.0, 1.0), PropertyKey::new(2.0, 2.0)],
+        );
+        let g = graph_of(&single(vec![clip.clone()]), &[asset]);
+        let crop = g.find("crop=w=iw*0.9").expect("the static crop");
+        let setpts = g.find("setpts=").unwrap();
+        let fps = g.find("fps=").unwrap();
+        let geq = g.find("geq=lum='lum(((1-(1/(if(lt((T-1),0),1,").expect("the window");
+        assert!(crop < setpts && setpts < fps && fps < geq, "{g}");
+        assert_eq!(g.matches("fps=").count(), 1, "{g}");
+        // Every plane, the alpha too, through the same window; a pan unkeyed is centred.
+        assert!(g.contains("*(1+0)/2)*W+(X+0.5)*(1/("), "{g}");
+        assert!(g.contains(":a='alpha(((1-(1/("), "{g}");
+        assert!(
+            g.find("geq=").unwrap() < g.find("scale=").unwrap(),
+            "the window is cut before the fit: {g}"
+        );
     }
 
     #[test]
