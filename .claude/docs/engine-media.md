@@ -241,7 +241,11 @@ on 1.20, the last build Microsoft made for them; `ORT_DYLIB_PATH` supplies one
 instead), the model (`onnx-community/Kokoro-82M-v1.0-ONNX`'s `model_quantized.onnx`,
 ~88 MB; `KERF_KOKORO_MODEL_URL` a mirror) and each voice pack (~0.5 MB) are fetched
 on first use through **`engine/download.rs`** — the resumable, cancellable `.part` +
-verify + rename fetch lifted out of whisper, which both now share. Static linking
+verify + rename fetch lifted out of whisper, which both now share. The `.part` is
+named by pid, so fetches of one destination **within a process** take turns on a
+per-path lock (polling cancel while they wait; the second finds the file in place),
+and a resume answered 416 drops the partial and restarts once — CI once had two tests
+interleaving one SoundFont's `.part` and failing on the 416. Static linking
 was ruled out: pyke's prebuilt runtime needs glibc 2.38 and the Linux bundles build
 on Ubuntu 22.04. Phonemes come from **`misaki-rs` without its espeak-ng fallback**
 (espeak-ng is GPL-3), so unknown words are spelled out and only the English (`a*` /
