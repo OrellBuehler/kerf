@@ -513,6 +513,7 @@ pub fn start(app: &AppHandle, project: Arc<Mutex<Project>>) {
         tracing::warn!("the MCP server was started twice");
         return;
     }
+    super::activity::pump_project();
     let app = app.clone();
     tauri::async_runtime::spawn(supervise(move || KerfMcp::new(project.clone(), app.clone()), rx));
 }
@@ -1384,5 +1385,143 @@ mod tests {
             "a rebinding page names its own Host"
         );
         up.stop().await;
+    }
+
+    /// The activity stream and nothing else: what `KerfMcp` does with its listener.
+    #[derive(Clone, Default)]
+    struct Streaming(super::super::activity::Listener);
+
+    impl rmcp::ServerHandler for Streaming {
+        fn get_info(&self) -> rmcp::model::ServerConfig {
+            let mut info = rmcp::model::ServerConfig::default();
+            info.capabilities = rmcp::model::ServerCapabilities::builder()
+                .enable_resources()
+                .enable_resources_subscribe()
+                .build();
+            info
+        }
+
+        async fn on_initialized(&self, context: rmcp::service::NotificationContext<rmcp::service::RoleServer>) {
+            self.0.start(context.peer);
+        }
+
+        #[allow(deprecated)]
+        async fn subscribe(
+            &self,
+            request: rmcp::model::SubscribeRequestParams,
+            _context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+        ) -> Result<(), rmcp::ErrorData> {
+            self.0.subscribe(&request.uri)
+        }
+    }
+
+    /// Open the session's standalone stream (`GET /mcp`) and read it until a line holds every one of
+    /// `needles` or `wait` runs out: the line, or the status when the stream was refused (200 when it
+    /// was opened but nothing matched).
+    fn stream_until(
+        addr: std::net::SocketAddr,
+        headers: &[(&str, &str)],
+        needles: &[&str],
+        wait: std::time::Duration,
+    ) -> Result<String, u16> {
+        use std::io::{BufRead, BufReader, Write};
+        let mut request = format!("GET /mcp HTTP/1.1\r\nHost: {addr}\r\nAccept: text/event-stream\r\n");
+        for (name, value) in headers {
+            request.push_str(&format!("{name}: {value}\r\n"));
+        }
+        request.push_str("\r\n");
+        let mut stream = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2)).map_err(|_| 0u16)?;
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_millis(500)))
+            .map_err(|_| 0u16)?;
+        stream.write_all(request.as_bytes()).map_err(|_| 0u16)?;
+        let mut reader = BufReader::new(stream);
+        let mut status = String::new();
+        reader.read_line(&mut status).map_err(|_| 0u16)?;
+        let code: u16 = status.split_whitespace().nth(1).and_then(|c| c.parse().ok()).unwrap_or(0);
+        if code != 200 {
+            return Err(code);
+        }
+        let deadline = std::time::Instant::now() + wait;
+        let mut line = String::new();
+        while std::time::Instant::now() < deadline {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) if needles.iter().all(|n| line.contains(n)) => return Ok(line.trim().to_string()),
+                _ => {}
+            }
+        }
+        Err(200)
+    }
+
+    /// One JSON-RPC message on a session: the status it is answered with.
+    async fn send_on(addr: std::net::SocketAddr, token: String, session: String, body: &'static str) -> Option<u16> {
+        tokio::task::spawn_blocking(move || {
+            let auth = format!("Bearer {token}");
+            exchange(
+                addr,
+                &[("Authorization", auth.as_str()), ("Mcp-Session-Id", session.as_str())],
+                body,
+            )
+            .map(|r| r.0)
+        })
+        .await
+        .unwrap()
+    }
+
+    /// The real listener, middleware and session: a session that subscribed to `kerf://jobs` is told on
+    /// its standalone stream when a job moves, and a stream opened without the token is refused.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_subscribed_session_hears_a_job_move_on_its_stream() {
+        use super::super::activity::{publish, Event};
+        let text = format!("127.0.0.1:{}", free_port());
+        let addr: std::net::SocketAddr = text.parse().unwrap();
+        let token = "s".repeat(48);
+        let (tx, rx) = tokio::sync::watch::channel(config_for(&text, &token, true));
+        let task = tokio::spawn(supervise(Streaming::default, rx));
+        until("the server to come up", || listening(&text)).await;
+
+        let session = open_session(addr, token.clone()).await.expect("a session");
+        assert_eq!(send_on(addr, token.clone(), session.clone(), INITIALIZED).await, Some(202));
+        const SUBSCRIBE: &str = r#"{"jsonrpc":"2.0","id":2,"method":"resources/subscribe","params":{"uri":"kerf://jobs"}}"#;
+        assert_eq!(send_on(addr, token.clone(), session.clone(), SUBSCRIBE).await, Some(200));
+
+        let refused = {
+            let session = session.clone();
+            tokio::task::spawn_blocking(move || {
+                stream_until(
+                    addr,
+                    &[("Mcp-Session-Id", session.as_str())],
+                    &["kerf://jobs"],
+                    std::time::Duration::from_secs(1),
+                )
+            })
+            .await
+            .unwrap()
+        };
+        assert_eq!(refused, Err(401), "the stream asks for the token like every request");
+
+        let reading = {
+            let (session, auth) = (session.clone(), format!("Bearer {token}"));
+            tokio::task::spawn_blocking(move || {
+                stream_until(
+                    addr,
+                    &[("Authorization", auth.as_str()), ("Mcp-Session-Id", session.as_str())],
+                    &["notifications/resources/updated", "\"kerf://jobs\""],
+                    std::time::Duration::from_secs(20),
+                )
+            })
+        };
+        // The stream opens on its own thread: keep the job moving until it has been heard.
+        while !reading.is_finished() {
+            publish(Event::Job("job-stream".to_string()));
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        let heard = reading.await.unwrap().expect("the update reached the stream");
+        assert!(heard.starts_with("data:"), "{heard}");
+
+        drop(tx);
+        task.await.unwrap();
     }
 }

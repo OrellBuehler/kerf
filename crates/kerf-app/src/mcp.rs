@@ -30,6 +30,7 @@ use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager};
 use uuid::Uuid;
 
+mod activity;
 mod args;
 mod hints;
 mod jobs;
@@ -71,6 +72,8 @@ pub struct KerfMcp {
     /// proposal its edits open, and no other session may touch it. `None` for a client that
     /// keeps no session.
     session: Arc<Mutex<Option<String>>>,
+    /// The resources this session subscribed to, and the task that tells it when they change.
+    listener: activity::Listener,
 }
 
 // ---- tool parameter schemas ------------------------------------------------
@@ -132,7 +135,7 @@ struct ImportParams {
     #[schemars(description = "Absolute path to the media file to import")]
     path: String,
     #[schemars(
-        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result, stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
+        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result (or subscribe to kerf://jobs/{job_id}), stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
     )]
     background: Option<bool>,
 }
@@ -158,7 +161,7 @@ struct AnalyzeParams {
     )]
     steps: Option<Vec<String>>,
     #[schemars(
-        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result, stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
+        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result (or subscribe to kerf://jobs/{job_id}), stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
     )]
     background: Option<bool>,
 }
@@ -208,7 +211,7 @@ struct VoiceoverParams {
     #[schemars(description = "With caption_style: font height as a fraction of frame height (lines: 0.05, word_punch: 0.11)")]
     caption_size: Option<f64>,
     #[schemars(
-        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result, stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
+        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result (or subscribe to kerf://jobs/{job_id}), stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
     )]
     background: Option<bool>,
 }
@@ -255,7 +258,7 @@ struct ComposeMusicParams {
     )]
     ripple: Option<bool>,
     #[schemars(
-        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result, stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
+        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result (or subscribe to kerf://jobs/{job_id}), stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
     )]
     background: Option<bool>,
 }
@@ -329,7 +332,7 @@ struct DownloadModelParams {
     )]
     name: Option<String>,
     #[schemars(
-        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result, stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
+        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result (or subscribe to kerf://jobs/{job_id}), stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
     )]
     background: Option<bool>,
 }
@@ -548,7 +551,7 @@ struct SmartCropParams {
     #[schemars(description = "UUID of the clip to reframe; every clip on an unlocked video track when omitted")]
     clip_id: Option<String>,
     #[schemars(
-        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result, stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
+        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result (or subscribe to kerf://jobs/{job_id}), stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
     )]
     background: Option<bool>,
 }
@@ -572,7 +575,7 @@ struct SeparateStemsParams {
     )]
     clip_id: Option<String>,
     #[schemars(
-        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result, stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
+        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result (or subscribe to kerf://jobs/{job_id}), stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
     )]
     background: Option<bool>,
 }
@@ -804,7 +807,7 @@ struct SyncByAudioParams {
     )]
     force: Option<bool>,
     #[schemars(
-        description = "Run as a background job: the call answers {job_id} at once; poll job_status for progress and the result, stop it with cancel_job. Default false: the call stays open until the sync is done (send a progressToken for progress)."
+        description = "Run as a background job: the call answers {job_id} at once; poll job_status for progress and the result (or subscribe to kerf://jobs/{job_id}), stop it with cancel_job. Default false: the call stays open until the sync is done (send a progressToken for progress)."
     )]
     background: Option<bool>,
 }
@@ -814,7 +817,7 @@ struct RefineTranscriptParams {
     #[schemars(description = "UUID of the asset whose cached transcript to re-time")]
     asset_id: String,
     #[schemars(
-        description = "Run as a background job: the call answers {job_id} at once; poll job_status for the result, stop it with cancel_job. Default false: the call stays open until it is done (send a progressToken for progress)."
+        description = "Run as a background job: the call answers {job_id} at once; poll job_status for the result (or subscribe to kerf://jobs/{job_id}), stop it with cancel_job. Default false: the call stays open until it is done (send a progressToken for progress)."
     )]
     background: Option<bool>,
 }
@@ -1663,7 +1666,7 @@ struct ExportParams {
     )]
     overwrite: Option<bool>,
     #[schemars(
-        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result, stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
+        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result (or subscribe to kerf://jobs/{job_id}), stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
     )]
     background: Option<bool>,
 }
@@ -1699,7 +1702,7 @@ struct ExportVariantsParams {
     )]
     overwrite: Option<bool>,
     #[schemars(
-        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result, stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
+        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result (or subscribe to kerf://jobs/{job_id}), stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
     )]
     background: Option<bool>,
 }
@@ -5763,6 +5766,7 @@ impl KerfMcp {
             project,
             app,
             session: Arc::new(Mutex::new(None)),
+            listener: activity::Listener::default(),
         }
     }
 
@@ -5816,6 +5820,26 @@ impl KerfMcp {
         let out = op(&self.lock())?;
         self.changed();
         Ok(out)
+    }
+
+    /// What `kerf://project` reads: which project is open (`generation` moves when another one is),
+    /// the cut this session works on in brief, and the proposal staged on it, if any.
+    fn project_brief(&self) -> Result<String, McpError> {
+        let brief = {
+            let project = self.lock();
+            let timeline = project.working_timeline().map_err(core_err)?;
+            let staged = project.staged().map_err(core_err)?;
+            serde_json::json!({
+                "generation": project.generation(),
+                "timeline": reads::timeline_brief(&timeline),
+                "proposal": staged.map(|s| serde_json::json!({
+                    "owned_by_agent": s.owned_by_agent,
+                    "edits": s.edits.len(),
+                    "stale": s.stale,
+                })),
+            })
+        };
+        json(&brief)
     }
 
     /// Tell the webview the project changed so it re-fetches and renders live.
@@ -6224,7 +6248,11 @@ const INSTRUCTIONS: &str = "Kerf MCP server. The user queues editing tasks in th
              `job_id` at once and keep working, and job_status reports progress \
              and, at the end, the result (cancel_job stops one, list_jobs lists \
              them). Without it the call stays open — send a progressToken for \
-             progress. Results are kept small: get_asset_metadata and analyze_asset \
+             progress. Rather than polling, subscribe to the resources: \
+             kerf://jobs/{job_id} (one job), kerf://jobs, kerf://tasks and \
+             kerf://project are announced with notifications/resources/updated when \
+             they change, whoever changed them (the user editing the cut included); \
+             read one for the details. Results are kept small: get_asset_metadata and analyze_asset \
              summarise an analysis (counts, durations, the head of the transcript), \
              and get_transcript (lines with their speakers; words=true adds each \
              line's timed words, best over a from/to window) / get_analysis_detail \
@@ -6307,9 +6335,99 @@ impl ServerHandler for KerfMcp {
         note_agent_activity();
         let mut info = ServerConfig::default();
         info.server_info = server_identity();
-        info.capabilities = ServerCapabilities::builder().enable_tools().build();
+        info.capabilities = ServerCapabilities::builder()
+            .enable_resources()
+            .enable_resources_subscribe()
+            .enable_tools()
+            .build();
         info.instructions = Some(INSTRUCTIONS.to_string());
         info
+    }
+
+    /// The session is up: start telling it about the resources it subscribes to (`activity`).
+    async fn on_initialized(&self, context: rmcp::service::NotificationContext<RoleServer>) {
+        self.listener.start(context.peer);
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::ListResourcesResult, McpError> {
+        Ok(rmcp::model::ListResourcesResult::with_all_items(activity::resources()))
+    }
+
+    async fn list_resource_templates(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::ListResourceTemplatesResult, McpError> {
+        Ok(rmcp::model::ListResourceTemplatesResult::with_all_items(
+            activity::resource_templates(),
+        ))
+    }
+
+    /// The resources are the polling tools' answers: `kerf://jobs` is `list_jobs`, a job is its
+    /// `job_status`, `kerf://tasks` the first page of `list_tasks`, `kerf://project` a brief of the
+    /// open project.
+    async fn read_resource(
+        &self,
+        request: rmcp::model::ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::ReadResourceResponse, McpError> {
+        let uri = request.uri;
+        let text = match uri.as_str() {
+            activity::PROJECT_URI => self.project_brief()?,
+            activity::TASKS_URI => self.list_tasks(Parameters(PageParams::default()))?,
+            activity::JOBS_URI => json(&jobs::jobs().list())?,
+            other => match activity::job_of(other).and_then(|id| jobs::jobs().view(id)) {
+                Some(view) => json(&view)?,
+                None => return Err(activity::unknown_resource(other)),
+            },
+        };
+        Ok(rmcp::model::ReadResourceResult::new(vec![
+            rmcp::model::ResourceContents::text(text, uri).with_mime_type("application/json")
+        ])
+        .into())
+    }
+
+    #[allow(deprecated)]
+    async fn subscribe(
+        &self,
+        request: rmcp::model::SubscribeRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        self.listener.subscribe(&request.uri)
+    }
+
+    #[allow(deprecated)]
+    async fn unsubscribe(
+        &self,
+        request: rmcp::model::UnsubscribeRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<(), McpError> {
+        self.listener.unsubscribe(&request.uri);
+        Ok(())
+    }
+
+    /// `subscriptions/listen`: the resources of this server a client asked for, nothing else.
+    fn accepted_subscription_filter(
+        &self,
+        requested: &rmcp::model::SubscriptionFilter,
+    ) -> Option<rmcp::model::SubscriptionFilter> {
+        let mut accepted = rmcp::model::SubscriptionFilter::default();
+        accepted.resource_subscriptions = requested
+            .resource_subscriptions
+            .as_ref()
+            .map(|uris| uris.iter().filter(|uri| activity::known(uri)).cloned().collect());
+        Some(accepted)
+    }
+
+    async fn listen(&self, context: rmcp::service::SubscriptionContext) -> Result<(), McpError> {
+        let subscribed = context.accepted().resource_subscriptions.clone().unwrap_or_default();
+        let ended = context.request_context().ct.clone();
+        activity::listen(subscribed, context.sink().clone(), ended).await;
+        Ok(())
     }
 }
 

@@ -439,7 +439,7 @@ Agent edits **stage** (`core-project.md`). The adapter's part:
 
 `analyze_asset`, `export`, `export_variants`, `generate_voiceover`, `compose_music`, `separate_stems`, `download_speech_model`,
 `import_asset`, `smart_crop`, `refine_transcript` and `sync_clips_by_audio` take `background: true` and answer `{job_id}` at once; `job_status`, `cancel_job` and
-`list_jobs` read and stop them. Each is written once against `jobs::Run` (`cancelled()` + `progress(fraction, message)`):
+`list_jobs` read and stop them (or subscribe to `kerf://jobs/{job_id}`, below). Each is written once against `jobs::Run` (`cancelled()` + `progress(fraction, message)`):
 a foreground call builds it from the request (`foreground`: the `ct` cancellation token and the `progressToken`, with a relay
 task that keeps progress monotonic), a background one from its record in `Jobs` (bounded: 8 running, 48 records, a finished
 job forgotten after an hour). `KerfMcp::long_tool` does the branching, so **argument validation stays in the tool body,
@@ -456,6 +456,34 @@ opened since (`require_generation`) — a Save As does not count as one (`replac
 that decode (`get_waveform`, `get_waveform_range`, `get_energy`, `skim_asset`, `preview_timeline`, `get_frame`) take the
 request's cancellation token, so a dropped request kills its ffmpeg; `export_cover` reports `reading the cut` →
 `rendering the cover frame` → `cover written` on the `progressToken`.
+
+## Live activity stream (`mcp/activity.rs`)
+
+What an agent is told without polling: **resource-updated notifications** (MCP's own mechanism; logging
+notifications are deprecated by SEP-2577 and not used). `get_info` advertises `resources` with `subscribe`;
+`list_resources` / `list_resource_templates` / `read_resource` serve `kerf://project` (`project_brief`:
+`generation`, the working timeline's `timeline_brief`, the proposal's `owned_by_agent` / `edits` / `stale`),
+`kerf://tasks` (the first page of `list_tasks`), `kerf://jobs` (`list_jobs`) and `kerf://jobs/{job_id}`
+(`job_status`) — the polling tools' answers, which stay. Subscribing: `resources/subscribe` /
+`unsubscribe` (legacy protocols; unknown URIs are `resource_not_found`), the notification riding the
+session's standalone SSE stream (`GET /mcp`, behind the same bearer and origin checks: a stream without
+the token is a 401), or at `2026-07-28` `subscriptions/listen` (`accepted_subscription_filter` keeps only
+this server's URIs; `listen` sends through the subscription's sink until the request ends).
+**Producers never wait**: one `tokio::sync::broadcast` channel (capacity 256) takes `Event::Job(id)` from
+the `Jobs` registry (begin, every report, finish — published after its lock is released) and
+`Event::Project(areas)` from `kerf_core::project_activity` (core-project.md): its listener runs under the
+project lock and only wakes `pump_project` (started by `mcp::start`), which takes the marks 200 ms later and
+publishes with no lock held. **Per session**, `Listener` (a field of `KerfMcp`, so cloned into every handle)
+holds the subscribed URIs; `on_initialized` starts its task once, which gathers what arrives in a 200 ms
+window into a `Batch` (a job's ticks are one, areas OR together) and sends one notification per subscribed
+resource it changed (`kerf://project` for timeline / proposal / assets / project areas, `kerf://tasks` for
+tasks, `kerf://jobs` for any job, the job's own URI for it). A send that takes over 10 s or fails is given
+up and the next batch tells everything; a reader that fell behind the channel (`Lagged`) is told every
+resource it subscribed changed — so a slow client holds no backlog and blocks nothing upstream. The task
+holds only a `Weak` of the listener and a token the listener cancels on drop: it ends with the session's
+last `KerfMcp` handle (session closed, expired, or the listener restarted). Tests: `Batch` and the gather /
+lag / end rules (`activity.rs`), and `a_subscribed_session_hears_a_job_move_on_its_stream` (`server.rs`:
+the real listener, middleware and session, over a socket).
 
 ## Small answers, paged reads (`mcp/reads.rs`)
 

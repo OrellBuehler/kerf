@@ -212,7 +212,9 @@ score, fitted to the cuts) ·
 (`export`, `export_variants`, `analyze_asset`, `generate_voiceover`, `compose_music`, `separate_stems`,
 `download_speech_model`, `import_asset`, `smart_crop`, `refine_transcript`, `sync_clips_by_audio`) take
 `background: true` and answer a
-`job_id` at once. Applying a proposal is refused to an agent while you have review on;
+`job_id` at once. Instead of polling, an agent can subscribe to the resources `kerf://jobs/{job_id}`,
+`kerf://jobs`, `kerf://tasks` and `kerf://project`: the server pushes a resource-updated notification
+when one changes (a job moving or ending, a task queued, you editing the cut). Applying a proposal is refused to an agent while you have review on;
 `undo`, `redo` and `revert_to` are too, since they would rewrite your live cut.
 </details>
 
@@ -331,8 +333,8 @@ Kerf is a working editor under active development — not a scaffold. The timeli
 preview, transcript, analysis, effects, keyframes, captions, playback and export are all
 wired to real backend state, and the MCP surface is exercised end-to-end.
 
-**Roadmap:** exporting one cut at every delivery frame in a single pass, a live activity
-stream pushed from the MCP server (the queue is polled today), and audible reverse shuttle.
+**Roadmap:** exporting one cut at every delivery frame in a single pass, and audible reverse
+shuttle.
 
 Contributions welcome — see [`CONTRIBUTING.md`](./CONTRIBUTING.md).
 
