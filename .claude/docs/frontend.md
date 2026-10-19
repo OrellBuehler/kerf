@@ -1673,7 +1673,18 @@ width first in the `style`, `!important`; the value's entities decoded before `d
 kept whole, and written back as `escape_attr` writes it; the engine's `<style>` check; a box a template control sets refused),
 replayed against kerf-core by `text-box-corpus.test.ts` (`fixtures/text-box-corpus.json`, `KERF_BLESS_CORPUS=1 … --
 text_box_corpus`), and
-draws text with its fonts, saying so (`HARNESS_NOTE`). `template-ui.ts` is the pure side (bun-tested): `slugId`
+draws text with its fonts, saying so (`HARNESS_NOTE`). **Text animations** (`text-animation.ts`, pure, bun-tested): the
+bounds (`checkAnimation`, `TextAnimation::check`'s words), `animationJson` (the JSON an attribute holds, byte for byte what
+`to_attribute` writes: fields in the engine's order, a whole number as `1.0`), `parseAnimation` (defaults laid under what is
+there, an unknown field, a wrong type or a number out of bounds is `null`), `TEXT_ANIMATION_PRESETS` (the picker's list and what
+`presetOf` matches a text's animation against) and, in `title-text.ts`, `withTextAnimation` (`set_text_animation`'s splice:
+the attribute replaced or taken away at the end of the start tag, single-quoted) and the `animation` each `titleTexts` entry
+carries — all replayed against kerf-core by `text-animation-corpus.test.ts` (`fixtures/text-animation-corpus.json`,
+`KERF_BLESS_CORPUS=1 … -- text_animation_corpus`; the presets too). `TextSection` gives each text a **preset picker** (*No
+animation*, the eight presets from `list_text_animation_presets` with the page's copy standing in until it answers, *Custom*
+when a text's animation matches none) with a delay and a duration field once there is one: each commit one
+`setTitleTextAnimation` edit (nothing while locked, busy or previewing; `checkAnimation` before the round trip). The harness
+writes the attribute and says it plays nothing (`HARNESS_ANIMATION_NOTE`). `template-ui.ts` is the pure side (bun-tested): `slugId`
 (a control id from its label: lower case, accents dropped, `-2` past a taken one), `defaultAttribute` (a color's `stop-color`
 on a `stop`, else `fill`; an image's `href`; a font's `font-family`; a number's usual size), `elementsFor` (text at
 `text` / `tspan`, an image at `<image>`; an id that two or more elements carry is **not targetable** — the engine refuses it

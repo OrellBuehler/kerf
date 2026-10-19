@@ -143,8 +143,12 @@
   outlines" below) and a `<text>` may carry a box only outlines draw ("A text's box" below); an older build draws such a
   title but splices new values into the hidden text (its `set_template_values` reports success and nothing visible
   changes), saves it as a template and draws a box unwrapped; `persisted/timelines-v8.json` holds an outlined template
-  title. The schema is at **v8** (`SCHEMA_VERSION`). `persist_tests` pins which steps a file has pending with
-  `store::pending_steps` (a legacy file that has every column: `[4, 5, 6, 7]`). A step's `needed_to_read` says whether a build that
+  title; v8→v9 is the same kind of JSON step for a text animation (`data-kerf-animate` on a `<text>`, compiled into per-glyph
+  SMIL inside its glyph group; "Text animations" below): an older build draws the compiled animation it finds but does not know
+  the attribute, so setting that title's text again (a template value, a box, Draw as outlines) drops the animation while the
+  attribute stays; `persisted/timelines-v9.json` holds an animated template title. The schema is at **v9** (`SCHEMA_VERSION`).
+  `persist_tests` pins which steps a file has pending with
+  `store::pending_steps` (a legacy file that has every column: `[4, 5, 6, 7, 8]`). A step's `needed_to_read` says whether a build that
   cannot write must still refuse a file lacking what it adds: true for the v1, v2 and v4 columns (the reads
   name them), false for the `fonts` table (reads tolerate its absence), so a write-protected v2 project
   opens as it is. A new file is stamped `SCHEMA_VERSION`; a
@@ -572,6 +576,43 @@
     `Template::validate` drops (a template is outlined whenever it is applied). A **template's poster** is drawn from the
     outlined title (`render_poster` outlines with the template's fonts), so a box shows on it, on save and on import alike.
     `user_space_paint` follows an `href` only within its family (gradient to gradient, pattern to pattern), as usvg does.
+  * **Text animations** (`svg/text_animation.rs`, `svg/glyph_smil.rs`, compiled in `svg/outline.rs`; plan phase 3a). A `<text>`
+    carries its animation as JSON in **`data-kerf-animate`** (single-quoted; `TextAnimation::to_attribute`, `from_attribute`
+    refuses an unknown field, a wrong type, a number out of bounds or an animation that changes nothing). It is **data, not
+    SMIL**: the outline pass (`Template::prepare`, `TitleTextInputs`, `SvgDoc::outlined`) compiles it, so the attribute stays on
+    the `<g data-kerf-text>` and `restore_text` drops the generated animation with the rest of the glyph group (the text form is
+    unchanged byte for byte), a template saved from an animated title carries the attribute, and applying it plays it. The
+    model is an After Effects text animator: a **range selector** (a window `start..end` as fractions of the text, slid from
+    `offset.from` to `offset.to` over the animation with an `easing`, and a `shape`: `square`, `ramp_up` / `ramp_down` — which
+    hold 1 / 0 beyond the window, so a unit the window has passed is fully animated —, `triangle`, `round`, `smooth`) gives
+    each **unit** (`by`: character, word, line; spaces are not units; a unit sits at `(i + 0.5) / n`) an amount 0..1 that moves
+    with time; a **wiggly selector** (`rate` a second, `min`..`max` in -1..1, `correlation` 0..1 between units, `seed`; seeded
+    smooth value noise from a splitmix64 hash, so it is the same on every machine and export; faded in and out over
+    `min(0.25, duration / 4)` s so the text comes to rest) multiplies it; **properties in em** (`x`, `y`, `rotation` degrees,
+    `scale`, `opacity`, `blur`, each the value at an amount of 1; the neutral ones leave the text as it is and at least one must
+    differ) are applied at that amount. `delay` / `duration` (0..30 / 0.05..30 s) place it on the title's own clock; the title's
+    default length follows `SvgDoc::natural_duration`. **Compiled** (`glyph_smil::wrap`, per unit): the amount is sampled every
+    1/120 s, reduced by Ramer-Douglas-Peucker to the points a straight line stays within 0.4 % of an em of movement or blur, 0.2°
+    and 0.4 % of scale or opacity (one 8-bit level) of (a hard `square` edge stays a step one cell wide; at most 96 points; all of a unit's
+    properties share the points and one `keyTimes`), and written as a `<g>` round the unit's paths holding `animateTransform`
+    (translate, rotate, scale, `additive="sum"`, in that order), `animate` on `opacity` and, for blur, a `<filter
+    filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">` with its `feGaussianBlur` and an `animate` of
+    `stdDeviation` (the region is the unit's ink and 2.5σ and a tenth of an em around it, in the group's own coordinates, so it
+    moves with the unit; ids `kf-blur-N` skip any the document has). **Rotation and scale turn about the unit's centre** (the
+    middle of its ink, 0.35 em above its baseline), so when either is in use the unit's paths are written relative to it under
+    `translate(cx cy)`. A property that does not change over the animation is an attribute (`transform`, `opacity`), not an
+    animation; a unit the amount never reaches gets no group. A text with an animation and a `<style>` rule that could match
+    what it generates (`El::Anim` in the cascade), an unreadable attribute, more than 600 units, more than the document's 2,000
+    animations or more bytes than the 128 KiB cap leaves, **stays text** with a warning saying its animation does not play
+    (`Outlined::kept`, like a box); custom artwork with the attribute and no outlines says `svg::ANIMATE_NOTE`, which
+    `outlined_counted` and `Template::validate` drop. **`TitleTextInputs::text_animation(element, Option<&TextAnimation>)`**
+    (`svg::set_text_animation` on the text form, then outline; refused when a template control targets the attribute; a text
+    that stays text is an error saying why; taking an animation off a title that was never outlined leaves it so) → `set_title_text_parsed`,
+    the box's lock-free shape; `svg::text_animation_presets()` lists the **eight presets** (rise, fade in, typewriter, pop, blur
+    in, spin in, drop in, wiggle: plain `TextAnimation`s, copied onto the text and referred to by nothing). `fixtures/text-animation-corpus.json`
+    (`KERF_BLESS_CORPUS=1 … -- text_animation_corpus`) is what the frontend's `withTextAnimation`, `animationJson`, `parseAnimation`
+    and presets replay. `#[ignore]`d `svg_rendered` tests export a typed and a wiggling blurred text through the real ffmpeg
+    (each frame is its still, letters arrive in order, a seeded wiggle is the same twice). No graph change, no golden family.
   * **Lock-free shape.** The zip, the fonts, the sanitiser and the poster are all outside the project lock.
     Apply: `TemplateLibrary::get(id)` (or any `Template`) → `Template::prepare(&values)` →
     `PreparedTemplate` → under the lock `Project::apply_template_parsed(prepared, start, end?, SvgLayout)`.
