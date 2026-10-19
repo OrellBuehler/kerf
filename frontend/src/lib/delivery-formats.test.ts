@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { DELIVERY_PRESETS, VARIANT_PRESETS, fitLabel, formatsFor, hasPicture, presetFor, ratioLabel, variantPath } from './delivery-formats';
+import { DELIVERY_FITS, DELIVERY_PRESETS, VARIANT_PRESETS, fitLabel, formatsFor, hasPicture, presetFor, ratioLabel, variantPath } from './delivery-formats';
 
 describe('variantPath', () => {
 	test('splices the shape into the file name beside the base', () => {
@@ -57,6 +57,11 @@ describe('fitLabel', () => {
 	test('says what the fit does, not what it is called', () => {
 		expect(fitLabel('cover')).toBe('fill & crop');
 		expect(fitLabel('contain')).toBe('fit & letterbox');
+		expect(fitLabel('blur')).toBe('fit & blurred fill');
+	});
+
+	test('every fit a frame can take is offered once', () => {
+		expect([...DELIVERY_FITS].sort()).toEqual(['blur', 'contain', 'cover']);
 	});
 });
 

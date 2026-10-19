@@ -319,7 +319,7 @@ impl LayerGeometry {
             av_rescale(i64::from(ow), i64::from(win.h), i64::from(win.w)),
         );
         let (fw, fh) = match fit {
-            Fit::Contain => (tmp_w.min(i64::from(ow)), tmp_h.min(i64::from(oh))),
+            Fit::Contain | Fit::Blur => (tmp_w.min(i64::from(ow)), tmp_h.min(i64::from(oh))),
             Fit::Cover => (tmp_w.max(i64::from(ow)), tmp_h.max(i64::from(oh))),
         };
         if fw <= 0 || fh <= 0 {
@@ -336,7 +336,7 @@ impl LayerGeometry {
         let second_scale = zoom_keyed || (!tf.is_identity() && (tf.scale - 1.0).abs() > 1e-9);
         let cover_grid = if second_scale { sub } else { Subsampling::YUV420 };
         let keep = match fit {
-            Fit::Contain => Rect::whole(fw, fh),
+            Fit::Contain | Fit::Blur => Rect::whole(fw, fh),
             Fit::Cover => Rect {
                 x: cover_grid.round_w(lrint(f64::from(fw - ow) / 2.0)) as u32,
                 y: cover_grid.round_h(lrint(f64::from(fh - oh) / 2.0)) as u32,
@@ -355,7 +355,7 @@ impl LayerGeometry {
         // is never identity (see [`Placement`]).
         if keyed.is_none() && tf.is_identity() {
             let origin = match fit {
-                Fit::Contain => (
+                Fit::Contain | Fit::Blur => (
                     even(((i64::from(ow) - i64::from(fw)) as f64 / 2.0) as i64) as i32,
                     even(((i64::from(oh) - i64::from(fh)) as f64 / 2.0) as i64) as i32,
                 ),
@@ -368,7 +368,7 @@ impl LayerGeometry {
             // is 202 rows in FFmpeg's still, for 4:4:4 and RGB sources too — and
             // what it emits is the whole canvas, bars included.
             let (layer, picture_at, picture_shows, matte) = match fit {
-                Fit::Contain => {
+                Fit::Contain | Fit::Blur => {
                     let shows = (picture.0 & !1, picture.1 & !1);
                     (
                         (ow, oh),

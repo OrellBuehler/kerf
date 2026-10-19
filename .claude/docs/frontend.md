@@ -560,7 +560,9 @@ row packing, snapping, span trim) is `src/lib/titles.ts`, bun-tested.
 
 
 The timeline toolbar carries a **delivery frame picker** (also View › Delivery frame; Source / 16:9 / 9:16 / 1:1 / 4:5,
-from `src/lib/delivery-formats.ts`, bun-tested) that sets `Timeline.format` — the
+from `src/lib/delivery-formats.ts`, bun-tested; with a frame set the toolbar's menu adds *Footage: fill & crop / fit &
+letterbox / fit & blurred fill*, `DELIVERY_FITS` through `setDeliveryFit` in `menu-commands.ts`, which keeps the frame and
+changes `fit`; the export dialog's fit select offers the same three, `FITS`) that sets `Timeline.format` — the
 preview pane then *is* that frame (sized with `100cqh` container units so a 1:1
 frame is height-bound in a wide pane, not squashed), and for a vertical or square
 delivery it draws **safe-area guides** (the platform's top strip / caption rail /

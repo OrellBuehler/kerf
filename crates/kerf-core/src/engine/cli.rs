@@ -4136,7 +4136,8 @@ pub struct ExportOptions {
     /// Output WxH, baked into the filtergraph. Even-clamped.
     pub resolution: Option<(u32, u32)>,
     /// How footage of a different shape is fitted to that frame — letterboxed
-    /// (the default) or filled and cropped. Only matters when the two differ.
+    /// (the default), filled and cropped, or letterboxed over a blurred copy of
+    /// itself. Only matters when the two differ.
     pub fit: Fit,
     /// Output fps, baked into the filtergraph; never emits `-r`.
     pub fps: Option<f64>,
@@ -8074,6 +8075,25 @@ fn fade_filter(step: &FadeStep) -> String {
     format!("fade=t={edge}:st={}:d={}{tint}", step.st, step.d)
 }
 
+/// The [`Fit::Blur`] fit of a picture into a `w`x`h` frame (pure): split in two, the
+/// picture scaled to fit (`decrease`, with `even` and the delivery's scaler flags `sf`, as
+/// the Contain fit) over a copy scaled to cover a sixteenth-size frame, cropped to it,
+/// box-blurred twice and scaled back up — a blur of a few dozen pixels, at the cost of one
+/// on a thumbnail. `label` names the chain's inner pads, unique within its graph. Its text
+/// joins a chain like a filter: `...,split[..];...;[..][..]overlay=...,...`.
+fn blur_fill(w: u32, h: u32, even: &str, sf: &str, label: &str) -> String {
+    let (bw, bh) = ((w / 16 * 2).max(4), (h / 16 * 2).max(4));
+    // A radius above half the chroma plane is refused; the smaller side, a sixteenth.
+    let radius = (bw.min(bh) / 16).max(1);
+    format!(
+        "split[{label}b][{label}f];\
+         [{label}b]scale={bw}:{bh}:force_original_aspect_ratio=increase:flags=bilinear,crop={bw}:{bh},\
+         boxblur={radius}:2,scale={w}:{h}:flags=bilinear[{label}bb];\
+         [{label}f]scale={w}:{h}:force_original_aspect_ratio=decrease{even}{sf}[{label}ff];\
+         [{label}bb][{label}ff]overlay=(W-w)/2:(H-h)/2"
+    )
+}
+
 /// The video filter chain for one clip (everything between its `[i:v]` input
 /// and its `[v{i}]` output): trim, optional reverse / crop / retime, 360
 /// reprojection, fit or transform geometry, color correction, per-clip video
@@ -8211,9 +8231,18 @@ fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool
     // the overlay (not padded full-frame), and its zoom is re-evaluated per frame.
     let geom_identity = t.is_identity() && !anim;
     match fmt.fit {
+        // The whole picture over a blurred copy of itself that covers the frame: a
+        // full-size canvas, as the padded identity case is.
+        Fit::Blur if geom_identity => p.push(blur_fill(
+            fmt.width,
+            fmt.height,
+            if tone_mapped { ":force_divisible_by=2" } else { "" },
+            &sf,
+            &format!("bf{instance}"),
+        )),
         // Fit inside the frame; the identity case then pads out to full size so
         // the overlay lands on a complete canvas.
-        Fit::Contain => {
+        Fit::Contain | Fit::Blur => {
             p.push(format!(
                 "scale={w}:{h}:force_original_aspect_ratio=decrease{even}{sf}",
                 w = fmt.width,
@@ -8993,7 +9022,8 @@ fn build_still_args_rendered(
                 clip.mask.as_ref(),
                 clip.zoom_animated(),
                 &layer.fades,
-                layer.label_bt709
+                layer.label_bt709,
+                (!clip.is_animated()).then(|| format!("bf{n}")).as_deref()
             )
         ));
         let out = format!("ov{n}");
@@ -9063,6 +9093,10 @@ struct StillCanvas {
 /// it over the layers on screen, and puts it where [`video_clip_chain`] does, ahead of everything.
 ///
 /// `grade` is the clip's curves, wheels and LUT, right after the `eq`, as `video_clip_chain` places them.
+///
+/// `blur_label` names the inner pads of a [`Fit::Blur`] fill ([`blur_fill`]), unique in the graph,
+/// and is `None` for a clip the export gives none (an animated one: its pose is not the plain fit
+/// even where it samples to it).
 #[allow(clippy::too_many_arguments)]
 fn still_clip_chain_graded(
     tf: &Transform,
@@ -9076,6 +9110,7 @@ fn still_clip_chain_graded(
     zoom_last: bool,
     fades: &StillFades,
     label_bt709: bool,
+    blur_label: Option<&str>,
 ) -> String {
     let StillCanvas { w: ow, h: oh, fit, sf } = canvas;
     let (ow, oh, fit) = (*ow, *oh, *fit);
@@ -9106,7 +9141,10 @@ fn still_clip_chain_graded(
     // the export cropped meant the one frame you look at while cutting was the
     // one shape you were never going to ship.
     match fit {
-        Fit::Contain => p.push(format!("scale={ow}:{oh}:force_original_aspect_ratio=decrease{sf}")),
+        Fit::Blur if tf.is_identity() && blur_label.is_some() => {
+            p.push(blur_fill(ow, oh, "", sf, blur_label.unwrap_or_default()));
+        }
+        Fit::Contain | Fit::Blur => p.push(format!("scale={ow}:{oh}:force_original_aspect_ratio=decrease{sf}")),
         Fit::Cover => {
             p.push(format!("scale={ow}:{oh}:force_original_aspect_ratio=increase{sf}"));
             p.push(format!("crop={ow}:{oh}"));
@@ -9189,6 +9227,7 @@ fn still_clip_chain(
         zoom_last,
         fades,
         label_bt709,
+        Some("bf0"),
     )
 }
 
@@ -9450,6 +9489,10 @@ mod sweep;
 /// The `fps` pick against the frames the export renders (`#[ignore]`d).
 #[cfg(test)]
 mod picked;
+
+/// The blurred fill through the real `ffmpeg` (`#[ignore]`d).
+#[cfg(test)]
+mod blur_rendered;
 
 /// A keyframed zoom with every other feature of a clip, measured per output frame
 /// against `transform_at` and the scrubbed still (`#[ignore]`d).
@@ -16536,6 +16579,65 @@ mod tests {
         // The window is off-centre — a plain Cover would have taken the middle.
         assert!(chain.contains(&format!("x=iw*{}", crop.left)), "{chain}");
         assert!(crop.left < 0.3, "the subject is left of centre: {crop:?}");
+    }
+
+    #[test]
+    fn a_blurred_fill_puts_the_fitted_picture_over_a_blurred_cover_copy() {
+        assert_eq!(
+            blur_fill(1080, 1920, "", ":flags=bicubic", "bf0"),
+            "split[bf0b][bf0f];\
+             [bf0b]scale=134:240:force_original_aspect_ratio=increase:flags=bilinear,crop=134:240,\
+             boxblur=8:2,scale=1080:1920:flags=bilinear[bf0bb];\
+             [bf0f]scale=1080:1920:force_original_aspect_ratio=decrease:flags=bicubic[bf0ff];\
+             [bf0bb][bf0ff]overlay=(W-w)/2:(H-h)/2"
+        );
+        // A tiny frame keeps a thumbnail whose chroma plane takes a radius of 1.
+        assert!(blur_fill(40, 24, ":force_divisible_by=2", "", "x")
+            .contains("scale=4:4:force_original_aspect_ratio=increase:flags=bilinear,crop=4:4,boxblur=1:2"));
+        let asset = av_asset(Uuid::new_v4(), 30.0);
+        let graph = |clip: Clip, fit: Fit| {
+            let mut tl = single(vec![clip]);
+            tl.format = Some(Delivery::new(1080, 1920, fit));
+            let args = build_export_args(&tl, std::slice::from_ref(&asset), "out.mp4", &ExportOptions::default()).unwrap();
+            let at = args.iter().position(|a| a == "-filter_complex").unwrap() + 1;
+            args[at].clone()
+        };
+        let plain = make_clip(asset.id, 0.0, 5.0, 0.0);
+        let g = graph(plain.clone(), Fit::Blur);
+        assert!(
+            g.contains("[0:v]trim=start=0:end=5,setpts=PTS-STARTPTS+0/TB,split[bfc0b][bfc0f];"),
+            "{g}"
+        );
+        assert!(g.contains("[bfc0bb][bfc0ff]overlay=(W-w)/2:(H-h)/2,setsar=1,"), "{g}");
+        assert!(!g.contains("pad="), "the fill is the frame: {g}");
+        // Contain is what it was, and a clip placed by its transform gets Contain's chain.
+        let contain = graph(plain.clone(), Fit::Contain);
+        assert!(contain.contains("force_original_aspect_ratio=decrease,pad=1080:1920") && !contain.contains("boxblur"));
+        let mut pip = plain;
+        pip.transform.scale = 0.5;
+        let (blurred, contained) = (graph(pip.clone(), Fit::Blur), graph(pip, Fit::Contain));
+        assert_eq!(blurred, contained);
+        // The scrubbed still: the same fill, labelled per layer.
+        let mut tl = single(vec![make_clip(asset.id, 0.0, 5.0, 0.0)]);
+        tl.tracks.push(video_track(vec![make_clip(asset.id, 0.0, 5.0, 0.0)]));
+        tl.format = Some(Delivery::new(1080, 1920, Fit::Blur));
+        let out = StillOutput::JpegPipe { quality: 2 };
+        let args = build_still_args(
+            &tl,
+            std::slice::from_ref(&asset),
+            &ExportOptions::default(),
+            1.0,
+            540,
+            None,
+            &out,
+        )
+        .unwrap();
+        let g = &args[args.iter().position(|a| a == "-filter_complex").unwrap() + 1];
+        assert!(g.contains("split[bf0b][bf0f]") && g.contains("split[bf1b][bf1f]"), "{g}");
+        assert!(
+            g.contains("scale=66:120:force_original_aspect_ratio=increase:flags=bilinear,crop=66:120,boxblur=4:2,scale=540:960"),
+            "{g}"
+        );
     }
 
     #[test]

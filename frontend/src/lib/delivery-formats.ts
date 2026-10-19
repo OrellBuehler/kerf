@@ -76,5 +76,8 @@ export function variantPath(base: string, format: Delivery): string {
 }
 
 export function fitLabel(fit: Fit): string {
-	return fit === 'cover' ? 'fill & crop' : 'fit & letterbox';
+	return fit === 'cover' ? 'fill & crop' : fit === 'blur' ? 'fit & blurred fill' : 'fit & letterbox';
 }
+
+/** The fits a delivery frame can take, in picker order. */
+export const DELIVERY_FITS: Fit[] = ['cover', 'contain', 'blur'];

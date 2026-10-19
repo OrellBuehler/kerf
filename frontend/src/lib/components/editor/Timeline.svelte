@@ -41,8 +41,8 @@
 	import { addAnimatedTitle, addCustomSvgTitle, importCaptionFile } from '#lib/title-actions';
 	import { keyframeOffer } from '#lib/keyframe-copy';
 	import type { ActionId } from '#lib/keymap';
-	import { DELIVERY_PRESETS, fitLabel, presetFor } from '#lib/delivery-formats';
-	import { setDeliveryPreset } from '#lib/menu-commands';
+	import { DELIVERY_FITS, DELIVERY_PRESETS, fitLabel, presetFor } from '#lib/delivery-formats';
+	import { setDeliveryFit, setDeliveryPreset } from '#lib/menu-commands';
 	import { importMenuEntries, importableAssets } from '#lib/caption-import-ui';
 	import type { Clip, Marker, PreviewDraft, StreamKind, SvgOverlay, TextOverlay, Track } from '#lib/types';
 	import { moveDraft, trimDraft } from '#lib/preview-draft';
@@ -731,11 +731,24 @@
 		const r = (e.currentTarget as HTMLElement).getBoundingClientRect();
 		contextMenu.show(
 			new MouseEvent('contextmenu', { clientX: r.right, clientY: r.bottom + 2 }),
-			DELIVERY_PRESETS.map((p) => ({
-				label: p.label === 'Source' ? 'Source shape' : `${p.label} — ${p.hint}`,
-				icon: p.id === delivery.id ? 'check' : undefined,
-				action: () => void setDeliveryPreset(p.id)
-			})),
+			[
+				...DELIVERY_PRESETS.map((p) => ({
+					label: p.label === 'Source' ? 'Source shape' : `${p.label} — ${p.hint}`,
+					icon: p.id === delivery.id ? 'check' : undefined,
+					action: () => void setDeliveryPreset(p.id)
+				})),
+				// With a frame set: how footage of another shape meets it.
+				...(delivery.format
+					? [
+							{ type: 'separator' as const },
+							...DELIVERY_FITS.map((fit) => ({
+								label: `Footage: ${fitLabel(fit)}`,
+								icon: fit === delivery.format?.fit ? 'check' : undefined,
+								action: () => void setDeliveryFit(fit)
+							}))
+						]
+					: [])
+			],
 			e.currentTarget as Node
 		);
 	}

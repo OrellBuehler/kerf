@@ -140,6 +140,9 @@
   `drop_first`'s removal makes the head case fail; so does rounding in `setpts`.
   A rate whose canvas and `fps=` parses differ (`29.970029`) is refused in Motion
   (`Unsupported::PickRate`): the pick assumes one grid.
+  A blurred-fill delivery (`Fit::Blur`) is refused whenever a layer is on screen, still and motion
+  alike (`Unsupported::BlurFill`, `size_free_reasons`): the fill is FFmpeg's `boxblur` on a thumbnail
+  with no compositor pass or parity case. `LayerGeometry` places the picture as under `Contain`.
   **Traps for the `FrameSource` that will feed it** (A1b): `showinfo` pts under `-copyts
   -start_at_zero -ss` are already start-relative, so pass `start_us = 0`; use the decoder's
   best-effort timestamps (AVI has no frame pts); a streaming cursor needs `STARTPTS`, one

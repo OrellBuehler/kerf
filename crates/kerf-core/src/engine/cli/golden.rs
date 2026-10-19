@@ -1,6 +1,6 @@
-//! The golden argv oracle: 6400 seeded timelines (4000, then 800 with a master bus, then 800
+//! The golden argv oracle: 6800 seeded timelines (4000, then 800 with a master bus, then 800
 //! with per-property channels, then 400 with an AMF or VAAPI encoder, then 400 with animated SVG
-//! titles) whose ffmpeg argv must not move.
+//! titles, then 400 with a blurred fill) whose ffmpeg argv must not move.
 //!
 //! `build_export_args_phase`, `build_still_args` and `build_preview_args_with` are
 //! built for every case and their argv reduced to a digest, checked against three
@@ -37,6 +37,11 @@
 //! appended to each file. Changing how a title is read (a document that cannot move is one looped
 //! picture, a stream reads the title's own sequence from `-start_number`, a still is `-f image2
 //! -pattern_type none`) moved those four lines (blocks 60..63) and nothing else.
+//!
+//! **The blurred-fill family is appended the same way**: the [`BLUR_CASES`] after those draw from
+//! the same generator and then fit to the frame over a blurred copy of the picture ([`Fit::Blur`],
+//! on the export's options and on the delivery frame when the cut has one; no dice, no titles). The
+//! first 6400 per-case digests are the ones the commit before it gave.
 //!
 //! **Machine-independent by construction.** The builders read the machine in five
 //! places, each pinned: the preview's decode acceleration (the
@@ -93,7 +98,10 @@ const HW_CASES: usize = 400;
 /// The animated-title cases appended after the hardware-encoder ones (see the module docs).
 const SVG_CASES: usize = 400;
 const SVG_FIRST: usize = CASES + MASTER_CASES + CHANNEL_CASES + HW_CASES;
-const TOTAL: usize = SVG_FIRST + SVG_CASES;
+/// The blurred-fill cases appended after the animated-title ones (see the module docs).
+const BLUR_CASES: usize = 400;
+const BLUR_FIRST: usize = SVG_FIRST + SVG_CASES;
+const TOTAL: usize = BLUR_FIRST + BLUR_CASES;
 const BLOCK: usize = 100;
 const MIN_PER_FAMILY: usize = 20;
 const KINDS: [&str; 3] = ["export", "still", "preview"];
@@ -206,6 +214,9 @@ preview-svg-held -f image2 -pattern_type none -loop 1 -framerate
 preview-svg-seek -start_number
 preview-svg-overlay ][svg0]overlay=x=
 cover-fit force_original_aspect_ratio=increase
+blur-fill boxblur=
+still-blur-fill boxblur=
+preview-blur-fill boxblur=
 scaler-flag :flags=lanczos
 pix-fmt format=yuv422p10le
 gif paletteuse=dither=
@@ -965,8 +976,13 @@ fn case(i: usize, assets: &[Asset]) -> Case {
     if i >= CASES + MASTER_CASES {
         channels_for(&mut timeline, i - CASES - MASTER_CASES);
     }
-    if i >= SVG_FIRST {
+    if (SVG_FIRST..BLUR_FIRST).contains(&i) {
         svg_for(&mut timeline, i - SVG_FIRST);
+    }
+    if i >= BLUR_FIRST {
+        if let Some(format) = timeline.format.as_mut() {
+            format.fit = Fit::Blur;
+        }
     }
     let dur = timeline.duration();
     let edges: Vec<f64> = (timeline.tracks.iter().flat_map(|t| &t.clips))
@@ -993,8 +1009,11 @@ fn case(i: usize, assets: &[Asset]) -> Case {
     if (CASES + MASTER_CASES + CHANNEL_CASES..SVG_FIRST).contains(&i) {
         opts.video_codec = Some(hw_encoder_for(i - CASES - MASTER_CASES - CHANNEL_CASES).into());
     }
-    if i >= SVG_FIRST {
+    if (SVG_FIRST..BLUR_FIRST).contains(&i) {
         opts.container = svg_container_for(i - SVG_FIRST).unwrap_or(opts.container);
+    }
+    if i >= BLUR_FIRST {
+        opts.fit = Fit::Blur;
     }
     let pass = match r.below(20) { 0..=11 => PassPhase::Single, 12..=15 => PassPhase::First, _ => PassPhase::Second };
     let mut c = Case {
@@ -1007,7 +1026,7 @@ fn case(i: usize, assets: &[Asset]) -> Case {
         timeline,
         opts,
     };
-    if i >= SVG_FIRST {
+    if (SVG_FIRST..BLUR_FIRST).contains(&i) {
         svg_playhead(&mut c, i - SVG_FIRST);
     }
     c

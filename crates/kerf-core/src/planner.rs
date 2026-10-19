@@ -1561,6 +1561,16 @@ mod tests {
             ..opts(30.0)
         };
         assert!(has(&at(PlanMode::Motion, &gif), |u| matches!(u, Unsupported::Gif)));
+        // A blurred fill is FFmpeg's, in a still as in an export frame.
+        let blur = ExportOptions {
+            resolution: Some((1080, 1920)),
+            fit: Fit::Blur,
+            ..opts(30.0)
+        };
+        for mode in [PlanMode::Still, PlanMode::Motion] {
+            assert!(has(&at(mode, &blur), |u| matches!(u, Unsupported::BlurFill)));
+            assert!(!has(&at(mode, &opts(30.0)), |u| matches!(u, Unsupported::BlurFill)));
+        }
         // A zoom that moves is the last stage of the export's chain (`keyed_zoom.rs`), which
         // the compositor does not order that way yet.
         let mut zoom = make_clip(assets[0].id, 0.0, 4.0, 0.0);

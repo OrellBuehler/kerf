@@ -21,7 +21,10 @@
   in the middle of its first title, `svg_playhead`, no dice, because the drawn playhead is between frames and a stream from one never reads
   `-start_number`); families `svg-input`, `svg-held`, `svg-overlay`, `svg-two`, `svg-partly-off`, `svg-restamp`, `still-svg`,
   `still-svg-one-file`, `preview-svg-*` (`input`, `held`, `seek`, `overlay`) and
-  the structural `svg-under-text`, `svg-gif`, `svg-offset`, which gave 28 to hundreds of cases each), have their
+  the structural `svg-under-text`, `svg-gif`, `svg-offset`, which gave 28 to hundreds of cases each) and **400 more** with a
+  blurred fill (`Fit::Blur` on the export options and on the delivery frame when the cut has one, no dice, no titles; families
+  `blur-fill`, `still-blur-fill`, `preview-blur-fill`, needle `boxblur=`: appending it added four block lines a file and moved
+  none of the first 6400), have their
   `build_export_args_phase`, `build_still_args` and `build_preview_args_with` argv reduced to
   FNV-1a digests, committed as 64 block digests each in
   `engine/cli/golden/{export,still,preview}.txt` (LF: `.gitattributes`, and the comparison

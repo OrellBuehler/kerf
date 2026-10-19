@@ -200,7 +200,8 @@ export const AUDIO_BITRATES = ['96k', '128k', '160k', '192k', '256k', '320k', '3
 export const SAMPLE_RATES = [44100, 48000];
 export const FITS: { id: Fit; label: string; hint: string }[] = [
 	{ id: 'contain', label: 'Fit (letterbox)', hint: 'Whole frame, black bars where the shapes differ.' },
-	{ id: 'cover', label: 'Fill (crop)', hint: 'Fills the frame; the overflow is cropped off.' }
+	{ id: 'cover', label: 'Fill (crop)', hint: 'Fills the frame; the overflow is cropped off.' },
+	{ id: 'blur', label: 'Fit (blurred fill)', hint: 'Whole frame, the bars filled with a blurred copy of the shot.' }
 ];
 
 /** The loudness targets an export can normalize to — `kerf_core::LoudnessPreset`, in the order the
@@ -522,8 +523,9 @@ export function buildSummary(opts: ExportOptions, hasVideo: boolean, hasAudio: b
 		}
 		parts.push(opts.resolution ? `${opts.resolution[0]}×${opts.resolution[1]}` : 'source');
 		// Worth surfacing: at a delivery aspect that differs from the footage it
-		// decides between a cropped shot and a letterboxed one.
+		// decides between a cropped shot, a letterboxed one and one over a blurred fill.
 		if (opts.resolution && opts.fit === 'cover') parts.push('filled');
+		if (opts.resolution && opts.fit === 'blur') parts.push('blurred fill');
 		if (opts.fps) parts.push(`${opts.fps}fps`);
 	}
 	if (wantAudio && opts.audio_codec) {

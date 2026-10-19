@@ -388,7 +388,26 @@ so the feature is **only** activated through these forwards — which is what ma
   fit and pads, `Cover` scales with `force_original_aspect_ratio=increase` and crops
   — which is what makes the vertical / square presets produce a usable shot rather
   than a strip of picture in a black field. It sets the *base* fit only; a clip with
-  its own transform still composes on top.
+  its own transform still composes on top. **`Blur`** is Contain over a blurred copy of the
+  same picture that covers the frame (`blur_fill`, pure): `split`, the copy scaled to *cover* a
+  sixteenth-size frame (`2*floor(w/16)` x `2*floor(h/16)`, at least 4x4, bilinear) and cropped
+  to it, `boxblur=r:2` (r = the thumbnail's smaller side / 16, at least 1 — under half the
+  chroma plane, which `boxblur` requires), scaled back up bilinear, and the picture's own
+  Contain `scale` (the delivery's flags, `force_divisible_by=2` ahead of a tone-map) `overlay`'d
+  centred on it — a full-frame picture, so it takes the place of `pad`. A blur of a few dozen
+  pixels at the cost of one on a thumbnail. The inner pads are named per clip (`bf<instance>`
+  in the export, `bf<layer>` in the still); the string joins the chain like one filter
+  (`...,split[..];...;[..][..]overlay=...,setsar=1,...`). Only the plain fit gets it: a clip
+  whose geometry is not the identity (scaled, moved, rotated, cropped, keyframed) is placed as
+  under Contain, with no fill (a picture-in-picture on its own fill is not what anyone asked
+  for); the scrubbed still gives the fill to the same clips (`blur_label` is `None` for an
+  animated one even where its pose samples to the identity). The still's thumbnail is a
+  sixteenth of the *still's* canvas, so a preview-width still blurs at the same relative
+  strength. An alpha source's transparency is lost in the fill (the `overlay` is opaque). The
+  GPU compositor refuses the whole frame (`Unsupported::BlurFill`, still and motion), so the
+  preview is FFmpeg's. Rendered in `cli/blur_rendered.rs` (`#[ignore]`d): a white / black
+  source in a vertical frame keeps the picture, its bars are the picture blurred across the
+  edge (Contain's are black), and the still draws the export's frame (3 levels at worst).
   **The shape itself is a property of the project**, not of one render:
   `Timeline.format: Option<Delivery>` (`{width, height, fit}`) is the frame the cut
   is being made *for*. `export_format` applies it between the footage-derived
