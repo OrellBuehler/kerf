@@ -9,8 +9,10 @@
 //! rename it into place — so a truncated or interrupted fetch can never be
 //! loaded later as if it were complete.
 
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, TryLockError};
 use std::time::{Duration, Instant};
 
 use crate::error::{Error, Result};
@@ -68,6 +70,26 @@ pub fn fetch(download: &Download, progress: &mut dyn FnMut(DownloadProgress), ca
     if dst.is_file() {
         return Ok(dst.to_path_buf());
     }
+    // The `.part` file is named by the process, so two fetches of one destination in this
+    // process (the Compose dialog's prepare and an agent's compose) would share it: their
+    // writes interleave, and one that resumes the other's finished file is refused with a 416.
+    // They take turns instead, and the second finds the file the first put in place.
+    let turn = destination_lock(dst);
+    let _turn = loop {
+        match turn.try_lock() {
+            Ok(guard) => break guard,
+            Err(TryLockError::Poisoned(e)) => break e.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                if cancel() {
+                    return Err(Error::Cancelled);
+                }
+                std::thread::sleep(POLL);
+            }
+        }
+    };
+    if dst.is_file() {
+        return Ok(dst.to_path_buf());
+    }
     let parent = dst
         .parent()
         .ok_or_else(|| Error::Engine(format!("{what} cache path has no parent")))?;
@@ -95,6 +117,13 @@ pub fn fetch(download: &Download, progress: &mut dyn FnMut(DownloadProgress), ca
     std::fs::rename(&tmp, dst).map_err(|e| Error::Engine(format!("could not finalize {what} download: {e}")))?;
     tracing::info!(what, path = %dst.display(), "download ready");
     Ok(dst.to_path_buf())
+}
+
+/// The lock one destination's fetches take turns on.
+fn destination_lock(dst: &Path) -> Arc<Mutex<()>> {
+    static LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+    let mut locks = LOCKS.get_or_init(Default::default).lock().unwrap_or_else(|e| e.into_inner());
+    locks.entry(dst.to_path_buf()).or_default().clone()
 }
 
 /// Whether a failed transfer leaves a `.part` file worth resuming: a cancel, or a stall.
@@ -220,28 +249,21 @@ pub(super) fn stream_to_file_within(
     let Download {
         url, what, mirror_env, ..
     } = *download;
-    let have = std::fs::metadata(tmp).map(|m| m.len()).unwrap_or(0);
-    // A connect timeout but no global one: reaching the host should fail fast
-    // (a firewalled or DNS-blackholed mirror otherwise stalls for minutes before
-    // admitting it), while the transfer itself is legitimately allowed to run for
-    // as long as a gigabyte takes.
-    let mut request = ureq::get(url)
-        .config()
-        .timeout_connect(Some(std::time::Duration::from_secs(15)))
-        .timeout_resolve(Some(std::time::Duration::from_secs(15)))
-        .timeout_send_request(Some(std::time::Duration::from_secs(30)))
-        .timeout_recv_response(Some(std::time::Duration::from_secs(60)))
-        // A backstop for the reader thread below, which cannot be interrupted: it ends when its
-        // read returns. Hours, not minutes: this is the whole body of a gigabyte on a slow line.
-        .timeout_recv_body(Some(std::time::Duration::from_secs(6 * 60 * 60)))
-        .build();
-    if have > 0 {
-        request = request.header("Range", &format!("bytes={have}-"));
-    }
+    let mut have = std::fs::metadata(tmp).map(|m| m.len()).unwrap_or(0);
+    // A partial the server will not resume (it is already the whole file, or longer than the
+    // file is now) is unusable: start over from the first byte rather than fail.
+    let response = match get(url, have) {
+        Err(ureq::Error::StatusCode(416)) if have > 0 => {
+            tracing::warn!(what, have, "the server refused to resume the partial download; restarting it");
+            have = 0;
+            get(url, 0)
+        }
+        response => response,
+    };
     // Name the URL: the fetch is redirected to a CDN host, so which lookup or
     // connect failed is otherwise invisible — and a resolver that works for the
     // browser (DNS-over-HTTPS, the system proxy) is not the one this uses.
-    let response = request.call().map_err(|e| {
+    let response = response.map_err(|e| {
         if let Some((host, answer)) = blocked_host(url) {
             return Error::Engine(format!(
                 "could not download {what}: {host} {answer}, which is how a DNS filter (Pi-hole, \
@@ -350,6 +372,29 @@ pub(super) fn stream_to_file_within(
     Ok(())
 }
 
+/// Request `url` from byte `from` on.
+fn get(url: &str, from: u64) -> std::result::Result<ureq::http::Response<ureq::Body>, ureq::Error> {
+    // A connect timeout but no global one: reaching the host should fail fast
+    // (a firewalled or DNS-blackholed mirror otherwise stalls for minutes before
+    // admitting it), while the transfer itself is legitimately allowed to run for
+    // as long as a gigabyte takes.
+    let mut request = ureq::get(url)
+        .config()
+        .timeout_connect(Some(std::time::Duration::from_secs(15)))
+        .timeout_resolve(Some(std::time::Duration::from_secs(15)))
+        .timeout_send_request(Some(std::time::Duration::from_secs(30)))
+        .timeout_recv_response(Some(std::time::Duration::from_secs(60)))
+        // A backstop for [`stream_to_file_within`]'s reader thread, which cannot be interrupted:
+        // it ends when its read returns. Hours, not minutes: this is the whole body of a gigabyte
+        // on a slow line.
+        .timeout_recv_body(Some(std::time::Duration::from_secs(6 * 60 * 60)))
+        .build();
+    if from > 0 {
+        request = request.header("Range", &format!("bytes={from}-"));
+    }
+    request.call()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,5 +434,180 @@ mod tests {
     #[test]
     fn a_name_with_no_address_fails_the_lookup() {
         assert_eq!(lookup("kerf.invalid", 443), Lookup::Failed);
+    }
+
+    /// An HTTP/1.1 server over `body` that serves each connection on a thread of its own,
+    /// honours `Range`, answers 416 to one that starts at or past the end, and counts requests.
+    fn spawn_server(body: Vec<u8>) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+        use std::io::{BufRead, BufReader};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+        let url = format!("http://{}/file.bin", listener.local_addr().expect("addr"));
+        let body = Arc::new(body);
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = requests.clone();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { break };
+                let body = body.clone();
+                counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::thread::spawn(move || {
+                    let Ok(peek) = stream.try_clone() else { return };
+                    let mut reader = BufReader::new(peek);
+                    let mut start = None;
+                    loop {
+                        let mut line = String::new();
+                        match reader.read_line(&mut line) {
+                            Ok(0) | Err(_) => break,
+                            Ok(_) if line.trim().is_empty() => break,
+                            Ok(_) => {}
+                        }
+                        if let Some(v) = line.to_ascii_lowercase().strip_prefix("range: bytes=") {
+                            start = v.trim().trim_end_matches('-').parse::<usize>().ok();
+                        }
+                    }
+                    let (status, slice) = match start {
+                        Some(s) if s >= body.len() => ("416 Range Not Satisfiable", &body[..0]),
+                        Some(s) => ("206 Partial Content", &body[s..]),
+                        None => ("200 OK", &body[..]),
+                    };
+                    let header = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        slice.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes());
+                    for chunk in slice.chunks(64 * 1024) {
+                        if stream.write_all(chunk).is_err() {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
+                    let _ = stream.flush();
+                });
+            }
+        });
+        (url, requests)
+    }
+
+    struct TempDir(PathBuf);
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn temp_dir(tag: &str) -> TempDir {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let dir = std::env::temp_dir().join(format!("kerf-download-{tag}-{}-{nanos:x}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        TempDir(dir)
+    }
+
+    fn body(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 251) as u8).collect()
+    }
+
+    fn length_is(len: usize) -> impl Fn(&Path) -> Result<()> {
+        move |p| match std::fs::metadata(p).map(|m| m.len()) {
+            Ok(n) if n == len as u64 => Ok(()),
+            n => Err(Error::Engine(format!("expected {len} bytes, got {n:?}"))),
+        }
+    }
+
+    fn parts_in(dir: &Path) -> Vec<PathBuf> {
+        std::fs::read_dir(dir)
+            .expect("read dir")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|e| e == "part"))
+            .collect()
+    }
+
+    /// Two fetches of one file in one process (two tests downloading the same SoundFont) used to
+    /// share the pid-named `.part`: their writes interleaved and the later one's resume got a 416.
+    #[test]
+    fn two_fetches_of_one_destination_take_turns() {
+        let body = body(2 * 1024 * 1024);
+        let (url, requests) = spawn_server(body.clone());
+        let dir = temp_dir("together");
+        let dst = dir.0.join("file.bin");
+        let verify = length_is(body.len());
+
+        std::thread::scope(|s| {
+            let fetches: Vec<_> = (0..2)
+                .map(|_| {
+                    s.spawn(|| {
+                        let download = Download {
+                            url: &url,
+                            dst: &dst,
+                            what: "test file",
+                            mirror_env: "KERF_TEST_URL",
+                            verify: &verify,
+                        };
+                        fetch(&download, &mut |_| {}, &|| false)
+                    })
+                })
+                .collect();
+            for fetch in fetches {
+                assert_eq!(fetch.join().expect("join").expect("fetch"), dst);
+            }
+        });
+
+        assert_eq!(std::fs::read(&dst).expect("read"), body);
+        assert_eq!(
+            requests.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the second found the first's file"
+        );
+        assert!(parts_in(&dir.0).is_empty(), "{:?}", parts_in(&dir.0));
+    }
+
+    #[test]
+    fn a_partial_the_server_will_not_resume_is_downloaded_again() {
+        let body = body(512 * 1024);
+        let (url, requests) = spawn_server(body.clone());
+        let dir = temp_dir("refused");
+        let dst = dir.0.join("file.bin");
+        // A partial as long as the whole file: the resume asks for `bytes=<len>-`.
+        std::fs::write(
+            dst.with_extension(format!("{}.part", std::process::id())),
+            vec![0xffu8; body.len()],
+        )
+        .expect("seed");
+        let verify = length_is(body.len());
+        let download = Download {
+            url: &url,
+            dst: &dst,
+            what: "test file",
+            mirror_env: "KERF_TEST_URL",
+            verify: &verify,
+        };
+
+        fetch(&download, &mut |_| {}, &|| false).expect("restarted");
+        assert_eq!(std::fs::read(&dst).expect("read"), body);
+        assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 2);
+        assert!(parts_in(&dir.0).is_empty());
+    }
+
+    #[test]
+    fn a_fetch_waiting_its_turn_hears_its_cancel() {
+        let dir = temp_dir("waiting");
+        let dst = dir.0.join("file.bin");
+        let verify = length_is(1);
+        let download = Download {
+            url: "http://127.0.0.1:9/never",
+            dst: &dst,
+            what: "test file",
+            mirror_env: "KERF_TEST_URL",
+            verify: &verify,
+        };
+        let turn = destination_lock(&dst);
+        let _held = turn.lock().expect("lock");
+
+        let started = Instant::now();
+        let err = fetch(&download, &mut |_| {}, &|| started.elapsed() > Duration::from_millis(300)).expect_err("cancelled");
+        assert!(matches!(err, Error::Cancelled), "{err:?}");
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
     }
 }
