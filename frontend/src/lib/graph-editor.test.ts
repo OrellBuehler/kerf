@@ -1,11 +1,14 @@
 import { describe, expect, test } from 'bun:test';
 import {
-	activeRow,
+	activeProp,
 	curvePath,
 	dragHandle,
 	handleEdit,
 	handlePoint,
 	handlesOf,
+	isFlat,
+	nudgeHandle,
+	sameEasing,
 	segments,
 	tickText,
 	valueAt,
@@ -41,6 +44,8 @@ describe('the value axis', () => {
 		expect(valueRange(propertyKeys(clip(), 'volume'))).toEqual([0.5, 1.5]);
 		expect(valueRange([k(0, 20), k(1, 20)])).toEqual([18, 22]);
 		expect(valueRange([])).toEqual([0, 1]);
+		expect(valueRange([k(0, Number.NaN), k(1, 2), k(2, Number.POSITIVE_INFINITY), k(3, 3)])).toEqual([2, 3]);
+		expect(valueRange([k(0, Number.NaN)])).toEqual([0, 1]);
 	});
 
 	test('maps a value to a height and back, value up', () => {
@@ -51,13 +56,18 @@ describe('the value axis', () => {
 	});
 
 	test('gridlines fall on round steps with as many decimals as the step needs', () => {
-		expect(valueTicks(0, 1, 4)).toEqual([0, 0.5, 1]);
+		expect(valueTicks(0, 1, 4)).toEqual({ step: 0.5, values: [0, 0.5, 1] });
 		const t = valueTicks(0, 1, 5);
-		expect(t).toEqual([0, 0.2, 0.4, 0.6, 0.8, 1]);
-		expect(tickText(t[3], t)).toBe('0.6');
-		expect(valueTicks(-30, 90, 6)).toEqual([-20, 0, 20, 40, 60, 80]);
-		expect(tickText(40, [0, 20])).toBe('40');
-		expect(valueTicks(1, 1)).toEqual([]);
+		expect(t.values).toEqual([0, 0.2, 0.4, 0.6, 0.8, 1]);
+		expect(tickText(t.values[3], t.step)).toBe('0.6');
+		expect(valueTicks(-30, 90, 6).values).toEqual([-20, 0, 20, 40, 60, 80]);
+		expect(tickText(40, 20)).toBe('40');
+		expect(valueTicks(1, 1)).toEqual({ step: 0, values: [] });
+		// One tick in sight still reads with its step's decimals, not as a whole number.
+		const one = valueTicks(0.58, 0.63, 1);
+		expect(one.values).toEqual([0.6]);
+		expect(tickText(one.values[0], one.step)).toBe('0.6');
+		expect(tickText(0.125, 0.005)).toBe('0.125');
 	});
 });
 
@@ -92,9 +102,33 @@ describe('segments and handles', () => {
 		expect(back).toEqual({ bezier: { x1: 0.42, y1: 0, x2: 0, y2: 0 } });
 	});
 
-	test('a flat segment’s handles move in time only', () => {
+	test('a flat segment has nothing to shape (and a handle on it would move in time only)', () => {
 		const [flat] = segments('volume', propertyKeys(clip(), 'volume'));
+		expect(isFlat(flat)).toBe(true);
+		expect(isFlat(segments('opacity', propertyKeys(clip(), 'opacity'))[0])).toBe(false);
 		expect(dragHandle(flat, 1, 1.5, 9)).toEqual({ bezier: { x1: 0.25, y1: 1 / 3, x2: 2 / 3, y2: 2 / 3 } });
+	});
+
+	test('an arrow nudges a handle a twentieth of its box, up on the screen whichever way the segment goes', () => {
+		const [eased] = segments('opacity', propertyKeys(clip(), 'opacity'));
+		// Falling from 1 to 0.5: up raises the value, so the handle's share of the drop shrinks.
+		const up = nudgeHandle(eased, 2, 0, 1) as { bezier: Record<string, number> };
+		expect(up.bezier.x2).toBeCloseTo(0.58, 12);
+		expect(up.bezier.y2).toBeCloseTo(0.95, 12);
+		const right = nudgeHandle(eased, 1, 1, 0) as { bezier: Record<string, number> };
+		expect(right.bezier.x1).toBeCloseTo(0.47, 12);
+		// Against its box it goes nowhere: the same curve as before.
+		const ease_in = segments('opacity', [k(0, 0, 'ease_in'), k(1, 1)])[0];
+		expect(sameEasing(nudgeHandle(ease_in, 2, 1, 0), 'ease_in')).toBe(true);
+		expect(nudgeHandle(segments('opacity', [k(0, 0, 'hold'), k(1, 1)])[0], 1, 1, 0)).toBe('hold');
+	});
+
+	test('easings are the same when their control points are', () => {
+		expect(sameEasing('ease_in', { bezier: { x1: 0.42, y1: 0, x2: 1, y2: 1 } })).toBe(true);
+		expect(sameEasing('linear', { bezier: { x1: 1 / 3, y1: 1 / 3, x2: 2 / 3, y2: 2 / 3 } })).toBe(true);
+		expect(sameEasing('hold', 'hold')).toBe(true);
+		expect(sameEasing('hold', 'linear')).toBe(false);
+		expect(sameEasing('ease_in', 'ease_out')).toBe(false);
 	});
 
 	test('a line given a handle that stays on it is still the same line', () => {
@@ -109,11 +143,24 @@ describe('the edit', () => {
 		const c = clip();
 		const [eased] = segments('opacity', propertyKeys(c, 'opacity'));
 		const e = dragHandle(eased, 1, 0.5, 0.6);
-		const edit = handleEdit(c, eased, e);
+		const keep = [
+			{ prop: 'opacity' as const, time: 2 },
+			{ prop: 'volume' as const, time: 1 }
+		];
+		const edit = handleEdit(c, eased, e, keep)!;
 		expect(edit.tracks).toEqual([{ prop: 'opacity', keys: [k(0, 1, e), k(2, 0.5), k(4, 0, 'hold'), k(6, 1)] }]);
-		expect(edit.selected).toEqual([{ prop: 'opacity', time: 0 }]);
+		expect(edit.selected).toEqual(keep);
 		expect(changes(c, edit)).toBe(true);
-		expect(changes(c, handleEdit(c, eased, 'ease_in_out'))).toBe(false);
+	});
+
+	test('a handle that ends where the curve already is writes nothing, nor does one whose key is gone', () => {
+		const c = clip();
+		const [eased] = segments('opacity', propertyKeys(c, 'opacity'));
+		expect(handleEdit(c, eased, 'ease_in_out')).toBeNull();
+		expect(handleEdit(c, eased, { bezier: { x1: 0.42, y1: 0, x2: 0.58, y2: 1 } })).toBeNull();
+		const line = segments('opacity', propertyKeys(c, 'opacity'))[1];
+		expect(handleEdit(c, line, { bezier: { x1: 1 / 3, y1: 1 / 3, x2: 2 / 3, y2: 2 / 3 } })).toBeNull();
+		expect(handleEdit(c, { ...eased, t0: 0.5 }, 'ease_in')).toBeNull();
 	});
 });
 
@@ -128,10 +175,10 @@ describe('the curve', () => {
 
 	test('the active row: picked by its label, else the last selected key’s, else the first', () => {
 		const rows = dopeRows(clip());
-		expect(activeRow(rows, [], null)).toBe('opacity');
-		expect(activeRow(rows, [{ prop: 'opacity', time: 0 }, { prop: 'volume', time: 1 }], null)).toBe('volume');
-		expect(activeRow(rows, [{ prop: 'volume', time: 1 }], 'opacity')).toBe('opacity');
-		expect(activeRow(rows, [], 'scale')).toBe('opacity');
-		expect(activeRow([], [], null)).toBeNull();
+		expect(activeProp(rows, [], null)).toBe('opacity');
+		expect(activeProp(rows, [{ prop: 'opacity', time: 0 }, { prop: 'volume', time: 1 }], null)).toBe('volume');
+		expect(activeProp(rows, [{ prop: 'volume', time: 1 }], 'opacity')).toBe('opacity');
+		expect(activeProp(rows, [], 'scale')).toBe('opacity');
+		expect(activeProp([], [], null)).toBeNull();
 	});
 });

@@ -3,8 +3,10 @@
 	// in full on its own value axis with a handle at each control point of the segments it eases, the
 	// others faint, each on its own range. Dragging a handle reshapes that segment's bezier (held inside
 	// the segment's box: no overshoot) and writes one edit on release, shown as its ghost until then;
-	// Escape, pointercancel or the window losing focus abandon it. Keys select (and seek) as in the
-	// sheet. The pure half is `graph-editor.ts`.
+	// Escape, pointercancel or the window losing focus abandon it; a focused handle's arrows nudge it.
+	// Handles are painted above keys, so one sitting on its key (an ease-in's arrival, a handle pushed
+	// into a corner) is still the one a press takes. A flat segment has none. Keys select (and seek) as
+	// in the sheet. The pure half is `graph-editor.ts`.
 	import { beginDrag } from '#lib/drag';
 	import { resizeObserverFor } from '#lib/realm';
 	import { tip } from '#lib/tip';
@@ -15,6 +17,8 @@
 		dragHandle,
 		handleEdit,
 		handlePoint,
+		isFlat,
+		nudgeHandle,
 		segments,
 		tickText,
 		valueAt,
@@ -54,8 +58,9 @@
 		onpick: (prop: Property, time: number, additive: boolean) => void;
 		/** A press on empty space. */
 		onclear: (additive: boolean) => void;
-		/** A gesture's edit, on release. */
-		onwrite: (c: Clip, edit: DopeEdit) => void;
+		/** A gesture's edit, on release: `make` is given the clip as it is then (and is not called when
+		 *  the clip is gone); null writes nothing. */
+		onwrite: (clipId: string, make: (now: Clip) => DopeEdit | null) => void;
 	} = $props();
 
 	const PAD = 12;
@@ -81,12 +86,13 @@
 		const d = drag;
 		if (!d?.moved) return rows;
 		const edit = handleEdit(clip, d.seg, d.easing);
+		if (!edit) return rows;
 		return rows.map((r) => {
 			const t = edit.tracks.find((x) => x.prop === r.prop);
 			return t ? { ...r, keys: t.keys } : r;
 		});
 	});
-	const activeRow = $derived(drawn.find((r) => r.prop === active) ?? null);
+	const shaped = $derived(drawn.find((r) => r.prop === active) ?? null);
 	const vaOf = (r: DopeRow): ValueAxis => {
 		const [lo, hi] = valueRange(r.keys);
 		return { lo, hi, height, pad: PAD };
@@ -96,8 +102,8 @@
 		const r = rows.find((x) => x.prop === active);
 		return r ? vaOf(r) : null;
 	});
-	const ticks = $derived(va && height > 0 ? valueTicks(va.lo, va.hi, Math.max(2, Math.floor(height / 40))) : []);
-	const segs = $derived(activeRow ? segments(activeRow.prop, activeRow.keys) : []);
+	const ticks = $derived(va && height > 0 ? valueTicks(va.lo, va.hi, Math.max(2, Math.floor(height / 40))) : { step: 0, values: [] });
+	const segs = $derived(shaped ? segments(shaped.prop, shaped.keys) : []);
 	const end = $derived(axis.duration);
 	const x = (t: number) => xOf(axis, t);
 
@@ -107,7 +113,8 @@
 	function handleDown(e: PointerEvent, seg: Segment, which: Handle) {
 		if (!va) return;
 		const v = va;
-		const c = clip;
+		const clipId = clip.id;
+		const keep = [...selection];
 		const x0 = e.clientX;
 		const y0 = e.clientY;
 		let d: Drag = { seg, which, easing: seg.easing, moved: false };
@@ -120,7 +127,7 @@
 			},
 			commit() {
 				drag = null;
-				if (d.moved) onwrite(c, handleEdit(c, seg, d.easing));
+				if (d.moved) onwrite(clipId, (now) => handleEdit(now, seg, d.easing, keep));
 			},
 			abandon() {
 				drag = null;
@@ -128,18 +135,17 @@
 		});
 	}
 
-	/** A focused handle's arrows: a twentieth of the segment's box a press, one edit each (a held key
-	 *  does not repeat). Up is up on the screen, whichever way the segment goes. */
+	/** A focused handle's plain arrows (`nudgeHandle`), one edit a press; a held key does not repeat.
+	 *  A modified arrow is not taken here. */
 	function handleKey(e: KeyboardEvent, seg: Segment, which: Handle) {
 		const step = { ArrowLeft: [-1, 0], ArrowRight: [1, 0], ArrowUp: [0, 1], ArrowDown: [0, -1] }[e.key];
-		if (!step) return;
+		if (!step || e.shiftKey || e.ctrlKey || e.metaKey || e.altKey) return;
 		e.preventDefault();
 		e.stopPropagation();
-		const p = handlePoint(seg, which);
-		if (!p || e.repeat) return;
-		const t = p[0] + (step[0] * (seg.t1 - seg.t0)) / 20;
-		const v = p[1] + (step[1] * Math.abs(seg.v1 - seg.v0)) / 20;
-		onwrite(clip, handleEdit(clip, seg, dragHandle(seg, which, t, v)));
+		if (e.repeat) return;
+		const keep = [...selection];
+		const easing = nudgeHandle(seg, which, step[0], step[1]);
+		onwrite(clip.id, (now) => handleEdit(now, seg, easing, keep));
 	}
 
 	function plotDown(e: PointerEvent) {
@@ -165,6 +171,7 @@
 	const keyName = (label: string, t: number) => `${label} key at ${timeDisplay.fmt(clip.timeline_start + t)}`;
 	const handleName = (seg: Segment, which: Handle) =>
 		`${rowLabel(seg.prop)}: ${which === 1 ? 'leaving' : 'arriving'} handle of the segment from ${timeDisplay.fmt(clip.timeline_start + seg.t0)}`;
+	const NUDGE_HINT = 'Drag to shape the segment, or nudge it with the arrow keys';
 </script>
 
 <!-- svelte-ignore a11y_no_static_element_interactions -->
@@ -174,7 +181,7 @@
 			<span class="past" style="left:{x(duration)}px" aria-hidden="true"></span>
 		{/if}
 		<svg class="lines" aria-hidden="true">
-			{#each ticks as v (v)}
+			{#each ticks.values as v (v)}
 				<line class="grid" x1="0" x2="100%" y1={yOf(va, v)} y2={yOf(va, v)} />
 			{/each}
 			{#each drawn as r (r.prop)}
@@ -183,33 +190,50 @@
 					<path class="curve other" d={curvePath(r.keys, x, (v) => yOf(rva, v), 0, end)} />
 				{/if}
 			{/each}
-			{#if activeRow}
+			{#if shaped}
 				{#each segs as seg, i (i)}
 					{#each HANDLES as which (which)}
-						{@const p = handlePoint(seg, which, seg.easing)}
+						{@const p = isFlat(seg) ? undefined : handlePoint(seg, which, seg.easing)}
 						{#if p}
 							{@const from = which === 1 ? [seg.t0, seg.v0] : [seg.t1, seg.v1]}
 							<line class="arm" x1={x(from[0])} y1={yOf(va, from[1])} x2={x(p[0])} y2={yOf(va, p[1])} />
 						{/if}
 					{/each}
 				{/each}
-				<path class="curve" d={curvePath(activeRow.keys, x, (v) => yOf(va, v), 0, end)} />
+				<path class="curve" d={curvePath(shaped.keys, x, (v) => yOf(va, v), 0, end)} />
 			{/if}
 		</svg>
-		{#each ticks as v (v)}
-			<span class="vlabel" style="top:{yOf(va, v)}px" aria-hidden="true">{tickText(v, ticks)}</span>
+		{#each ticks.values as v (v)}
+			<span class="vlabel" style="top:{yOf(va, v)}px" aria-hidden="true">{tickText(v, ticks.step)}</span>
 		{/each}
-		{#if activeRow}
+		{#if shaped}
+			{#each shaped.keys as k, j (j)}
+				{@const on = isSelected(selection, shaped.prop, k.time)}
+				<button
+					type="button"
+					class="key"
+					class:on
+					style="left:{x(k.time) - 6}px;top:{yOf(va, k.value) - 6}px"
+					aria-label={keyName(shaped.label, k.time)}
+					aria-pressed={on}
+					use:tip={keyName(shaped.label, k.time)}
+					data-prop={shaped.prop}
+					data-time={String(k.time)}
+					onclick={(e) => {
+						if (e.detail === 0) onpick(shaped.prop, k.time, true);
+					}}
+				></button>
+			{/each}
 			{#each segs as seg, i (i)}
 				{#each HANDLES as which (which)}
-					{@const p = handlePoint(seg, which, seg.easing)}
+					{@const p = isFlat(seg) ? undefined : handlePoint(seg, which, seg.easing)}
 					{#if p}
 						<button
 							type="button"
 							class="handle"
 							class:on={drag?.seg.t0 === seg.t0 && drag.which === which}
 							style="left:{x(p[0]) - 6}px;top:{yOf(va, p[1]) - 6}px"
-							aria-label={handleName(seg, which)}
+							aria-label={`${handleName(seg, which)}. ${NUDGE_HINT}`}
 							use:tip={handleName(seg, which)}
 							data-seg={i}
 							data-handle={which}
@@ -217,23 +241,6 @@
 						></button>
 					{/if}
 				{/each}
-			{/each}
-			{#each activeRow.keys as k, j (j)}
-				{@const on = isSelected(selection, activeRow.prop, k.time)}
-				<button
-					type="button"
-					class="key"
-					class:on
-					style="left:{x(k.time) - 6}px;top:{yOf(va, k.value) - 6}px"
-					aria-label={keyName(activeRow.label, k.time)}
-					aria-pressed={on}
-					use:tip={keyName(activeRow.label, k.time)}
-					data-prop={activeRow.prop}
-					data-time={String(k.time)}
-					onclick={(e) => {
-						if (e.detail === 0) onpick(activeRow.prop, k.time, true);
-					}}
-				></button>
 			{/each}
 		{/if}
 	{/if}
@@ -312,6 +319,7 @@
 		box-sizing: border-box;
 	}
 	.key {
+		z-index: 1;
 		cursor: pointer;
 	}
 	.key::before {
@@ -327,6 +335,7 @@
 		border-color: var(--kerf-400);
 	}
 	.handle {
+		z-index: 2;
 		cursor: move;
 	}
 	.handle::before {

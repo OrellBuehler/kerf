@@ -7,7 +7,7 @@
 
 import { SAME_TIME, easeKeys, type DopeEdit, type DopeRow, type KeyRef } from './dope-sheet';
 import { controlPoints, easedPoints } from './easing';
-import type { Animatable } from './channels';
+import { propertyKeys, type Animatable } from './channels';
 import type { Easing, Property, PropertyKey } from './types';
 
 /** The value axis: `lo..=hi` over `height` px, `pad` px inside either end, value up. */
@@ -21,8 +21,8 @@ export interface ValueAxis {
 /** The values a row's curve spans (an eased segment stays between its keys), widened when they are
  *  all one value so the line sits in the middle. */
 export function valueRange(keys: readonly PropertyKey[]): [number, number] {
-	if (keys.length === 0) return [0, 1];
-	const vs = keys.map((k) => k.value);
+	const vs = keys.map((k) => k.value).filter(Number.isFinite);
+	if (vs.length === 0) return [0, 1];
 	const lo = Math.min(...vs);
 	const hi = Math.max(...vs);
 	if (hi - lo > 1e-9) return [lo, hi];
@@ -40,22 +40,26 @@ export function valueAt(va: ValueAxis, y: number): number {
 	return va.lo + (1 - (y - va.pad) / span) * (va.hi - va.lo);
 }
 
-/** Round steps (1, 2 or 5 times a power of ten) for gridlines in `lo..=hi`, about `want` of them. */
-export function valueTicks(lo: number, hi: number, want = 4): number[] {
+/** Gridlines in `lo..=hi`: round steps (1, 2 or 5 times a power of ten), about `want` of them. */
+export interface Ticks {
+	step: number;
+	values: number[];
+}
+
+export function valueTicks(lo: number, hi: number, want = 4): Ticks {
 	const span = hi - lo;
-	if (!(span > 0) || !Number.isFinite(span)) return [];
+	if (!(span > 0) || !Number.isFinite(span)) return { step: 0, values: [] };
 	const raw = span / Math.max(1, want);
 	const mag = 10 ** Math.floor(Math.log10(raw));
 	const step = [1, 2, 5, 10].map((m) => m * mag).find((s) => s >= raw) ?? 10 * mag;
-	const out: number[] = [];
-	for (let i = Math.ceil(lo / step - 1e-9); i * step <= hi + step * 1e-9; i++) out.push(i === 0 ? 0 : Number((i * step).toPrecision(12)));
-	return out;
+	const values: number[] = [];
+	for (let i = Math.ceil(lo / step - 1e-9); i * step <= hi + step * 1e-9; i++) values.push(i === 0 ? 0 : Number((i * step).toPrecision(12)));
+	return { step, values };
 }
 
-/** A tick's label: as many decimals as its step needs. */
-export function tickText(v: number, ticks: readonly number[]): string {
-	const step = ticks.length > 1 ? Math.abs(ticks[1] - ticks[0]) : 1;
-	const places = Math.max(0, Math.min(4, -Math.floor(Math.log10(step) + 1e-9)));
+/** A tick's label: as many decimals as the step between ticks needs (however few of them fit). */
+export function tickText(v: number, step: number): string {
+	const places = step > 0 ? Math.max(0, Math.min(6, -Math.floor(Math.log10(step) + 1e-9))) : 0;
 	return v.toFixed(places);
 }
 
@@ -78,6 +82,12 @@ export function segments(prop: Property, keys: readonly PropertyKey[]): Segment[
 		out.push({ prop, t0: k.time, v0: k.value, t1: next.time, v1: next.value, easing: k.easing ?? 'linear' });
 	});
 	return out;
+}
+
+/** A segment whose keys are one value: its curve is a flat line whatever the easing, so it has no
+ *  handles to drag. */
+export function isFlat(seg: Segment): boolean {
+	return Math.abs(seg.v1 - seg.v0) <= 1e-9 * Math.max(1, Math.abs(seg.v0));
 }
 
 /** The control points a segment's handles stand for: the easing's own, a straight line's thirds (a
@@ -117,14 +127,36 @@ export function dragHandle(seg: Segment, which: Handle, t: number, v: number): E
 	return { bezier: { x1: next[0], y1: next[1], x2: next[2], y2: next[3] } };
 }
 
-/** The one edit a handle drag writes: `easing` on the key that starts the segment. */
-export function handleEdit(clip: Animatable, seg: Segment, easing: Easing): DopeEdit {
-	return easeKeys(clip, [{ prop: seg.prop, time: seg.t0 }], easing);
+/** Whether two easings draw the same segment: the same control points (a preset and the bezier spelled
+ *  with its numbers, a line and a bezier along it at its thirds), or both holds. */
+export function sameEasing(a: Easing, b: Easing): boolean {
+	const [p, q] = [handlesOf(a), handlesOf(b)];
+	if (!p || !q) return !p && !q;
+	return p.every((v, i) => Math.abs(v - q[i]) <= 1e-12);
 }
 
-/** The row the graph draws with handles: the one picked by its label while it is still keyed, else the
- *  row of the last selected key, else the first. */
-export function activeRow(rows: readonly DopeRow[], selection: readonly KeyRef[], picked: Property | null): Property | null {
+/** The easing a focused handle's arrow makes: `dx` / `dy` twentieths of the segment's box, up on the
+ *  screen whichever way the segment goes. */
+export function nudgeHandle(seg: Segment, which: Handle, dx: number, dy: number): Easing {
+	const p = handlePoint(seg, which);
+	if (!p) return seg.easing;
+	return dragHandle(seg, which, p[0] + (dx * (seg.t1 - seg.t0)) / 20, p[1] + (dy * Math.abs(seg.v1 - seg.v0)) / 20);
+}
+
+/**
+ * The one edit a handle writes: `easing` on the key that starts the segment, as `clip` has it now,
+ * with the selection `keep` kept (a handle shapes a segment, it moves no key). Null when that key is
+ * gone or already eases that way — a drag back to where it started, a handle pushed against its box.
+ */
+export function handleEdit(clip: Animatable, seg: Segment, easing: Easing, keep: readonly KeyRef[] = []): DopeEdit | null {
+	const key = propertyKeys(clip, seg.prop).findLast((k) => Math.abs(k.time - seg.t0) <= SAME_TIME);
+	if (!key || sameEasing(key.easing ?? 'linear', easing)) return null;
+	return { ...easeKeys(clip, [{ prop: seg.prop, time: seg.t0 }], easing), selected: [...keep] };
+}
+
+/** The number the graph draws with handles: the one picked by its label while it is still keyed, else
+ *  the number of the last selected key, else the first row's. */
+export function activeProp(rows: readonly DopeRow[], selection: readonly KeyRef[], picked: Property | null): Property | null {
 	if (picked && rows.some((r) => r.prop === picked)) return picked;
 	const last = selection.findLast((s) => rows.some((r) => r.prop === s.prop));
 	return last?.prop ?? rows[0]?.prop ?? null;

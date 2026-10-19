@@ -25,7 +25,7 @@
 	import EasingPopover from './EasingPopover.svelte';
 	import DopeGraph from './DopeGraph.svelte';
 	import ChoiceChips from './ChoiceChips.svelte';
-	import { activeRow } from '#lib/graph-editor';
+	import { activeProp } from '#lib/graph-editor';
 	import { editor } from '#lib/state.svelte';
 	import { ui } from '#lib/editor-ui.svelte';
 	import { settings } from '#lib/settings.svelte';
@@ -98,7 +98,7 @@
 	const live = $derived(liveSelection(rows, selection));
 	/** The row the graph draws with handles, when one was picked by its label. */
 	let picked = $state<Property | null>(null);
-	const active = $derived(activeRow(rows, live, picked));
+	const active = $derived(activeProp(rows, live, picked));
 
 	type Move = { kind: 'move'; clipId: string; base: KeyRef[]; grabbed: number; x0: number; moved: boolean; dt: number; alt: boolean };
 	type Marquee = { kind: 'marquee'; base: KeyRef[]; x0: number; y0: number; x1: number; y1: number; moved: boolean };
@@ -478,7 +478,11 @@
 							onpress={() => root?.focus({ preventScroll: true })}
 							onpick={graphPick}
 							onclear={graphClear}
-							onwrite={(c, edit) => void write(c, edit)}
+							onwrite={(id, make) => {
+								const now = clipById(id);
+								const edit = now ? make(now) : null;
+								if (now && edit) void write(now, edit);
+							}}
 						/>
 					{:else}
 						<!-- svelte-ignore a11y_no_static_element_interactions -->
