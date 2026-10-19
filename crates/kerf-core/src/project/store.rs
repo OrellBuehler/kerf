@@ -147,14 +147,24 @@ fn v3_to_v4_needed(conn: &Connection) -> bool {
 }
 
 /// v5: a delivery frame may fit footage over a blurred copy of itself (`Fit::Blur`, `"fit":"blur"`
-/// in the timeline JSON), a variant an older build fails to read. Nothing in the file changes; the
-/// step is the version that keeps an older build out, after the file is copied aside.
+/// in the timeline JSON), a variant an older build fails to read; and an asset's streams may carry
+/// `StreamInfo.lead` (a late-starting stream's offset), a field an older build drops at its next
+/// write. Nothing in the file's tables changes; the step is the version that keeps an older build
+/// out, after the file is copied aside.
 fn v4_to_v5(_: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
 fn v4_to_v5_needed(_: &Connection) -> bool {
     true
+}
+
+/// The index (the version each upgrades from) of every step from `found` on that would change this file.
+#[cfg(test)]
+pub(crate) fn pending_steps(conn: &Connection, found: u32) -> Vec<u32> {
+    (found..SCHEMA_VERSION)
+        .filter(|v| (MIGRATIONS[*v as usize].needed)(conn))
+        .collect()
 }
 
 /// The steps from `found` on that would change this file.

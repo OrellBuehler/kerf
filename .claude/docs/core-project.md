@@ -102,9 +102,10 @@
   a shipped step, append one). Version 0 is every file written before versions existed (the legacy
   baseline; v0→v1 is the old probe-then-`ALTER` columns); v1→v2 adds `staged.owner` / `staged.assets`
   (below); v2→v3 adds the `fonts` table (below); v3→v4 adds `assets.music_score`; v4→v5 is a JSON step for
-  `Fit::Blur` (`"fit":"blur"` in a delivery frame, a variant an older build fails on: `run` a no-op, `needed` always, so every
-  older file is copied aside once — the no-op probes of the earlier steps still decide nothing on their own — and
-  `needed_to_read` false; `persisted/timelines-v5.json` holds a blurred-fill cut). A step's `needed_to_read` says whether a build that
+  `Fit::Blur` (`"fit":"blur"` in a delivery frame, a variant an older build fails on) and `StreamInfo.lead` (an asset
+  stream's late-start offset, a field an older build drops on its next write): `run` a no-op, `needed` always (every
+  older file is copied aside once; `persist_tests` pins the earlier steps' probes with `store::pending_steps`),
+  `needed_to_read` false; `persisted/timelines-v5.json` holds a blurred-fill cut. A step's `needed_to_read` says whether a build that
   cannot write must still refuse a file lacking what it adds: true for the v1, v2 and v4 columns (the reads
   name them), false for the `fonts` table (reads tolerate its absence), so a write-protected v2 project
   opens as it is. A new file is stamped `SCHEMA_VERSION`; a
@@ -119,7 +120,7 @@
   JSON in the tables too** (timeline, history, proposal, analysis, asset streams): a change an older build
   would drop (an unknown field, at its next write) or misread (an unknown variant) is a step of its own —
   `run` a no-op (or a JSON rewrite), `needed` always (so the file is copied aside first), `needed_to_read`
-  false. `persist_tests` keeps `persisted/timelines-v<N>.json` (the sample's timeline and five of the golden
+  false. `persist_tests` keeps `persisted/timelines-v<N>.json` (the sample's timeline and six of the golden
   oracle's) for each version that moved the stored shape: every one must still read, and the newest must
   round-trip unchanged, so moving the shape fails until a step is appended and `KERF_BLESS_PERSISTED=1`
   writes the new version's file (add it to `PERSISTED`); a tables-only step needs no file. `meta.kerf_version` is the build that made the file, `meta.last_kerf_version`

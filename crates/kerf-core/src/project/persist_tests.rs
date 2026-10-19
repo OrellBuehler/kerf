@@ -116,11 +116,14 @@ fn a_legacy_file_is_backed_up_once_then_upgraded() {
 /// The columns are there, so their steps change nothing; the file is still copied aside, once,
 /// for v5 (a JSON step: `needed` always, so an older build's file is kept before it is locked out).
 #[test]
-fn a_legacy_file_that_already_has_the_columns_is_stamped_and_copied_aside_for_the_json_step() {
+fn a_legacy_file_that_already_has_the_columns_is_backed_up_only_for_the_json_step() {
     let dir = scratch();
     let path = dir.join("cut.kerf");
     edited(1).0.save_as(&path).unwrap();
     make_legacy(&path, true);
+    // Every step that adds a table or a column finds it there; only v5 (a JSON step) is pending.
+    let pending: Vec<u32> = store::pending_steps(&Connection::open(&path).unwrap(), 0);
+    assert_eq!(pending, vec![4], "only the v4 -> v5 step");
     drop(Project::open(&path).unwrap());
     assert_eq!(version_of(&path), SCHEMA_VERSION);
     let mut names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
@@ -280,7 +283,7 @@ fn a_v2_file_is_backed_up_once_then_gets_the_fonts_table() {
 
 /// The fonts table is there, so v3 changes nothing; the one backup is v5's (a JSON step).
 #[test]
-fn a_v2_file_that_already_has_the_fonts_table_is_stamped_and_copied_aside_for_the_json_step() {
+fn a_v2_file_that_already_has_the_fonts_table_is_backed_up_only_for_the_json_step() {
     let dir = scratch();
     let path = dir.join("cut.kerf");
     edited(1).0.save_as(&path).unwrap();
@@ -288,9 +291,11 @@ fn a_v2_file_that_already_has_the_fonts_table_is_stamped_and_copied_aside_for_th
         .unwrap()
         .pragma_update(None, "user_version", 2)
         .unwrap();
+    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 2), vec![4]);
     drop(Project::open(&path).unwrap());
     assert_eq!(version_of(&path), SCHEMA_VERSION);
-    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2, "the file and its one backup");
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2, "the file and its backup");
+    assert_eq!(version_of(&schema_backup_path(&path, 2)), 2);
     std::fs::remove_dir_all(&dir).ok();
 }
 
