@@ -231,6 +231,7 @@ describe('crop keeps the rest of the picture where it was', () => {
 		const c = clip('c', 'a');
 		expect(croppable(c, W169)).toBe(true);
 		expect(croppable(c, { ...W169, fit: 'cover' })).toBe(false);
+		expect(croppable(c, { ...W169, fit: 'blur' })).toBe(true);
 		expect(croppable({ ...c, channels: [{ prop: 'pos_x', keys: [{ time: 0, value: 0 }] }] }, W169)).toBe(false);
 		expect(croppable({ ...c, channels: [{ prop: 'opacity', keys: [{ time: 0, value: 1 }] }] }, W169)).toBe(true);
 	});

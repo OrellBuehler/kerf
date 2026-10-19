@@ -148,32 +148,32 @@ export function resolveLayer(
 	if (typeof win === 'string') return { err: win };
 	const tmpW = avRescale(oh, win.w, win.h);
 	const tmpH = avRescale(ow, win.h, win.w);
-	const fw = fit === 'contain' ? Math.min(tmpW, ow) : Math.max(tmpW, ow);
-	const fh = fit === 'contain' ? Math.min(tmpH, oh) : Math.max(tmpH, oh);
+	// A blurred fill places the picture as Contain does; only what is behind it differs.
+	const contain = fit !== 'cover';
+	const fw = contain ? Math.min(tmpW, ow) : Math.max(tmpW, ow);
+	const fh = contain ? Math.min(tmpH, oh) : Math.max(tmpH, oh);
 	if (fw <= 0 || fh <= 0) return { err: `the fit scale leaves ${fw}x${fh}` };
 	const zoomKeyed = !!keyed?.scale;
 	const secondScale = zoomKeyed || (!isIdentity(tf) && Math.abs(tf.scale - 1) > 1e-9);
 	const coverGrid = secondScale ? sub : YUV420;
-	const keep: Rect =
-		fit === 'contain'
-			? { x: 0, y: 0, w: fw, h: fh }
-			: {
-					x: roundW(coverGrid, lrint((fw - ow) / 2)),
-					y: roundH(coverGrid, lrint((fh - oh) / 2)),
-					w: roundW(coverGrid, ow),
-					h: roundH(coverGrid, oh)
-				};
+	const keep: Rect = contain
+		? { x: 0, y: 0, w: fw, h: fh }
+		: {
+				x: roundW(coverGrid, lrint((fw - ow) / 2)),
+				y: roundH(coverGrid, lrint((fh - oh) / 2)),
+				w: roundW(coverGrid, ow),
+				h: roundH(coverGrid, oh)
+			};
 	const stages: ScaleStage[] = [{ src: win, scaled: [fw, fh], keep }];
 	let picture: [number, number] = [keep.w, keep.h];
 
 	if (!keyed && isIdentity(tf)) {
-		let origin: [number, number] =
-			fit === 'contain' ? [even(Math.trunc((ow - fw) / 2)), even(Math.trunc((oh - fh) / 2))] : [0, 0];
+		let origin: [number, number] = contain ? [even(Math.trunc((ow - fw) / 2)), even(Math.trunc((oh - fh) / 2))] : [0, 0];
 		let layer: [number, number];
 		let pictureAt: [number, number];
 		let shows: [number, number];
 		let matte: boolean;
-		if (fit === 'contain') {
+		if (contain) {
 			shows = [picture[0] & ~1, picture[1] & ~1];
 			layer = [ow, oh];
 			pictureAt = [Math.max(origin[0], 0), Math.max(origin[1], 0)];
