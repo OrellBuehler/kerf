@@ -9374,7 +9374,7 @@ pub use levels::{mix_levels, stream_mix_pcm};
 /// The golden argv oracle (see its docs): a child module so it reaches the
 /// private builders.
 #[cfg(test)]
-mod golden;
+pub(crate) mod golden;
 
 /// The BT.709 label on the four builders, and the plan's mirror of it.
 #[cfg(test)]
