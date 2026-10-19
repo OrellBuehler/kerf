@@ -543,19 +543,26 @@ without a window (a real device, compositor and frame source over real clips, a 
 
 **Drag frames and forward scrubs (A3, `gpu_preview/draft.rs`, `pace.rs`).** `get_preview_frame { …, draft }` is the frame of a
 gesture under way: `draft` (`PreviewDraft { clips: [{track_id, clip}], overlays }`) is what the gesture would write on release, each
-clip and title whole, and the frame is planned from the snapshot's timeline with those in place of its own (`PreviewDraft::apply`: a
-clip may move in time and to a track of its kind, the tracks it lands on sorted by start as `move_clips` does; it may not change the
-footage it reads, name a clip or title the cut does not hold, or leave the cut breaking an invariant it did not already break,
-`Timeline::check_new`). Nothing is written and the epoch does not move, so the gesture still writes one edit on release. A draft
+clip and title whole, and the frame is planned from the snapshot's timeline with those in place of its own (`PreviewDraft::apply`).
+A draft changes only what a drafted gesture writes, each change through its edit's own checks, so the preview never shows a state
+the edit would refuse: a clip's transform / colour / fades (`Transform::check_values` + `check_crop`, `Color::check_values`,
+`Clip::check_fades`, kerf-core's `model/values.rs`, which `set_transform` / `set_color` / `set_fade` call too), its mask
+(`Mask::normalized`, as `set_mask` stores it), a trim alone (`Clip::check_trim`, `Asset::check_source_out`, `check_own_lanes`) and
+a move (`Timeline::move_clips` itself: a track of its kind, none locked, never onto a clip that stays, never before 0); a title's
+position and size (`TextOverlay::check_values` / `check_span`) or keys (`TextKeyframe::check`, sorted). Anything else (the footage
+above all), a clip or title the cut does not hold, or a cut breaking an invariant it did not already break (`Timeline::check_new`) is
+refused. Nothing is written and the epoch does not move, so the gesture still writes one edit on release. A draft
 frame is planned, refused and drawn like any other (the plan's reasons, the self-test gate, the surface); one the GPU does not draw,
 a draft that is refused, or one whose clips wait on a proxy under Proxy only, is **FFmpeg's JPEG of the cut as it is**, with the
 reason and a last one saying the drag shows once it is let go (with the GPU preview off the preview is that too: no draft is ever
 sent on the JPEG route). Draft frames prime nothing and prefetch nothing (the next frame of a drag is the same time in another
-cut). A `forward` request takes no draft. `Trend` (`pace.rs`, beside `Pace`) reads the requests' times as they arrive: a drag whose
-last three requests each stepped forward by at most 0.5 s is decoded with `Hint::Forward { fps }` (the canvas's rate) instead of
-`Hint::Scrub`, so the run reads ahead and the next frame is in the cache when it is asked for; frames are the same either way
+cut), and their titles' poses go to a small atlas of their own (`render_draft_texture_with`, `gpu.md`). A `forward` request takes no
+draft. `Trend` (`pace.rs`, beside `Pace`) reads the requests' times as they arrive: a drag whose last three requests each stepped
+forward by at most 0.5 s is decoded with `Hint::Forward { fps }` (the canvas's rate) instead of `Hint::Scrub` (`decode_hint`) —
+unless a layer of the plan plays backward, whose frames go the other way through the file: reading ahead would restart its run every
+frame and trip the thrash guard (`Busy`), so that drag stays a scrub. The run reads ahead and the next frame is in the cache when it is asked for; frames are the same either way
 (the run is the router's, proved equal to the one-shot), and a refusal by the thrash guard is that frame's FFmpeg fallback. Tests:
-`draft.rs` (apply), `pace.rs` (trend), and the ignored `drive_tests.rs` cases `a_drag_frame_is_the_picture_the_edit_draws_once_it_is_written`
+`draft.rs` (apply and its refusals), `pace.rs` (trend), `a_forward_drag_reads_ahead_unless_a_layer_plays_backward`, and the ignored `drive_tests.rs` cases `a_drag_frame_is_the_picture_the_edit_draws_once_it_is_written`
 (an Inspector drag and a timeline move drawn as a draft are, pixel for pixel, the frames drawn after the edit is written; a vignette
 draft and a stranger's clip go through FFmpeg) and `a_drag_that_walks_forward_reads_ahead_and_draws_the_frames_a_scrub_draws`.
 `bench_tests.rs`' `a_scrub_and_a_gesture_at_1080p` (`KERF_BENCH=1`) times a 1920x1080 canvas of 1080p all-intra clips: on lavapipe

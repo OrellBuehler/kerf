@@ -919,21 +919,29 @@ background shows the hole. The status bar names the renderer of the frame on scr
 430×240 · 23 ms · llvmpipe`, or `FFmpeg · <why>`), only while the setting is on, and the
 Settings dialog's Preview section carries the toggle and the machine's status line.
 
-**Drag frames (A3, `preview-draft.ts`).** A gesture under way puts what it would write in `ui.previewDraft` (`PreviewDraft`:
-the clips and titles it changes, whole) and clears it once its edit has landed or it was abandoned, so the picture does not step
-back to the cut before it in between. The frame pump reads it **on the GPU route only** and sends it with the frame
-(`getPreviewFrame(.., draft)`), so the surface shows the frame the release will write; on the JPEG route (the setting off, a title
-box or the trim monitor over a surface above the page) it is not read and asks for nothing — the edit's frame once written, as
-before. While a proposal is previewed none is sent. The builders mirror the edits and say `null` where the outcome is not known
+**Drag frames (A3, `preview-draft.ts`).** A gesture under way puts what it would write in the one draft slot (`ui.setDraft(owner,
+draft)`, read as `ui.previewDraft`; `PreviewDraft`: the clips and titles it changes, whole) and clears it once its edit has landed or
+it was abandoned, so the picture does not step back to the cut before it in between. The slot has an **owner** (`putDraft`): each
+writer (a `SliderRow`, the timeline, the Preview's title box) passes its own symbol, its `null` clears only its own draft, and a draft
+equal by value to the one held leaves the slot as it was (`sameDraft`), so pointer events that change nothing ask for no frame. A
+`SliderRow` that unmounts mid-gesture clears its draft, and the Preview drops any draft naming a clip, track or title the cut no
+longer holds (`draftHolds`: an undo mid-gesture), which the backend would refuse. The Preview sends the draft only while it changes
+the frame at the playhead (`draftTouches`: a clip on a video track at the playhead where it is or where it goes, give or take a frame
+and the transitions of its tracks, or a title on screen there); otherwise the frame is the cut's. The frame pump reads it **on the GPU
+route only** and sends it with the frame (`getPreviewFrame(.., draft)`), so the surface shows the frame the release will write; on the
+JPEG route (the setting off, a title box or the trim monitor over a surface above the page) it is not read and asks for nothing — the
+edit's frame once written, as before. While a proposal is previewed none is sent. The pump's `drawnDraft` is the draft of the frame on
+show (`null` for any other picture). The builders mirror the edits and say `null` where the outcome is not known
 exactly: `transformDraft` / `colorDraft` (`setTf` / `setCol`; a keyed number is written as a key the backend places, so it is not
 drafted), `maskDraft`, `fadeDraft` (held to the clip's length), `titleMoveDraft` (`moveOverlay`: a key at the playhead for an
 animated title, `withKeyframeAt`) and `titleSizeDraft`, `moveDraft` (every ghost of `planMove`'s plan, partners included; nothing
 while the drop is refused or a no-op) and `trimDraft` (`trimEdit`'s fields). Sources: `SliderRow`'s `onLive` (the value of a drag or
 a run of keys, then `null`; `Pending.scope` is the clip it began on) for the Inspector's transform, crop, colour, mask, fade and
-title rows; the Preview's title box drags (the ghost text is hidden while the GPU drew the draft); the timeline's moves and nudges
-and a trim of a clip alone (`gestureDraft`, held through the write by `landWith`). A trim that ripples or carries partners, roll /
+title rows; the Preview's title box drags (the ghost text is hidden once the GPU has presented a frame of this drag's draft,
+`drawnDraft`, not before); the timeline's moves and nudges and a trim of a clip alone (`gestureDraft`; a move or trim is held through
+its write by `landWith`, a nudge by `nudge.writing`, which keeps its plan until the edit lands). A trim that ripples or carries partners, roll /
 slip / slide, animated SVG titles, speed and the grade sections draw the cut as it is until released. Tests: `preview-draft.test.ts`,
-the draft cases of `frame-pump.test.ts`, `Pending.scope` in `slider-row.test.ts`.
+the draft cases of `frame-pump.test.ts` (`drawnDraft` included), `Pending.scope` in `slider-row.test.ts`.
 
 **GPU playback in the page** (`gpu-playback.ts`, `output-latency.ts`, `frame-pump.svelte.ts`, `Preview.svelte`; the backend's half is in
 `app.md`). With the GPU preview on and the route `gpu` at the moment Play starts (the setting, a surface, nothing over the frame that a surface above
