@@ -11,8 +11,8 @@ export const EASE_STEPS = 12;
 
 const unit = (v: number) => (Number.isFinite(v) ? Math.min(Math.max(v, 0), 1) : 0);
 
-/** The control points of a curved easing (`undefined` for linear and hold). */
-function bezier(e: Easing): [number, number, number, number] | undefined {
+/** The control points of a curved easing (`undefined` for linear and hold): `Easing::bezier`. */
+export function controlPoints(e: Easing): [number, number, number, number] | undefined {
 	if (e === 'linear' || e === 'hold') return undefined;
 	if (e === 'ease_in') return [0.42, 0, 1, 1];
 	if (e === 'ease_out') return [0, 0, 0.58, 1];
@@ -42,7 +42,7 @@ function bezierParam(x1: number, x2: number, u: number): number {
 /** The true curve's progress at `u` in [0, 1] (a hold is 0 until the end). */
 export function curve(e: Easing, u: number): number {
 	const x = Math.min(Math.max(u, 0), 1);
-	const b = bezier(e);
+	const b = controlPoints(e);
 	if (!b) return e === 'hold' && x < 1 ? 0 : x;
 	const [x1, y1, x2, y2] = b;
 	return bezierAxis(bezierParam(x1, x2, x), y1, y2);
@@ -56,7 +56,7 @@ type Point = [number, number];
  *  rise; one whose half would need a control point outside the square has it clamped there
  *  (`Easing::split` in model.rs). */
 export function splitEasing(e: Easing, u: number): [Easing, Easing] {
-	const b = bezier(e);
+	const b = controlPoints(e);
 	if (!b) return [e, e];
 	const [x1, y1, x2, y2] = b;
 	const lerp = (a: Point, c: Point, s: number): Point => [a[0] + (c[0] - a[0]) * s, a[1] + (c[1] - a[1]) * s];

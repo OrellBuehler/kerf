@@ -3,6 +3,8 @@
 
 	/** The copied keys: one for the editor, so a paste works on another clip and after the panel moved. */
 	let board = $state<KeyClipboard | undefined>(undefined);
+	/** Keys on lanes, or the curves: kept while the panel moves between docks. */
+	let view = $state<'keys' | 'graph'>('keys');
 </script>
 
 <script lang="ts">
@@ -14,12 +16,16 @@
 	// all take the editor's own keys while the panel has focus; the easing popover shapes the segments
 	// the selected keys start. Each gesture writes one `set_property_tracks` edit on release, holding what
 	// it shows until that edit settles; Escape, pointercancel or the window losing focus abandon it.
-	// The pure half is `dope-sheet.ts`.
+	// The Graph view (`DopeGraph`) draws the same rows as curves on the same axis, with bezier handles.
+	// The pure half is `dope-sheet.ts` (and `graph-editor.ts`).
 	import Icon from './Icon.svelte';
 	import IconBtn from './IconBtn.svelte';
 	import Btn from './Btn.svelte';
 	import EmptyState from './EmptyState.svelte';
 	import EasingPopover from './EasingPopover.svelte';
+	import DopeGraph from './DopeGraph.svelte';
+	import ChoiceChips from './ChoiceChips.svelte';
+	import { activeRow } from '#lib/graph-editor';
 	import { editor } from '#lib/state.svelte';
 	import { ui } from '#lib/editor-ui.svelte';
 	import { settings } from '#lib/settings.svelte';
@@ -86,9 +92,13 @@
 		if (id !== selectedFor) {
 			selectedFor = id;
 			selection = [];
+			picked = null;
 		}
 	});
 	const live = $derived(liveSelection(rows, selection));
+	/** The row the graph draws with handles, when one was picked by its label. */
+	let picked = $state<Property | null>(null);
+	const active = $derived(activeRow(rows, live, picked));
 
 	type Move = { kind: 'move'; clipId: string; base: KeyRef[]; grabbed: number; x0: number; moved: boolean; dt: number; alt: boolean };
 	type Marquee = { kind: 'marquee'; base: KeyRef[]; x0: number; y0: number; x1: number; y1: number; moved: boolean };
@@ -288,6 +298,21 @@
 		});
 	}
 
+	/** A key clicked in the graph: as a click on a diamond. */
+	function graphPick(prop: Property, time: number, additive: boolean) {
+		picked = prop;
+		if (additive) {
+			selection = toggleKey(live, { prop, time });
+			return;
+		}
+		selection = [{ prop, time }];
+		if (clip) ui.seek(clip.timeline_start + time, { snap: 'exact' });
+	}
+
+	function graphClear(additive: boolean) {
+		if (!additive) selection = [];
+	}
+
 	function rulerDown(e: PointerEvent) {
 		if (e.button !== 0 || !clip) return;
 		const start = clip.timeline_start;
@@ -365,6 +390,18 @@
 		<div class="bar">
 			<span class="name">{rows.length === 0 ? 'No keyframes' : `${rows.length} animated ${rows.length === 1 ? 'number' : 'numbers'}`}</span>
 			<span class="sel">{live.length > 0 ? `${live.length} selected` : ''}</span>
+			<span class="view">
+				<ChoiceChips
+					label="Keyframes view"
+					options={[
+						{ value: 'keys', label: 'Keys', hint: 'Keys on one lane per number' },
+						{ value: 'graph', label: 'Graph', hint: 'Curves, with bezier handles to shape each segment' }
+					]}
+					value={view}
+					onpick={(v) => (view = v)}
+					testid="dope-view"
+				/>
+			</span>
 			<Btn
 				size="sm"
 				variant="ghost"
@@ -404,11 +441,24 @@
 		{:else}
 			<div class="sheet">
 				<div class="labels" style="padding-top:{RULER_H}px">
-					{#each shown as r (r.prop)}
-						<div class="label" style="height:{ROW_H}px">{r.label}</div>
-					{/each}
+					{#if view === 'graph'}
+						{#each shown as r (r.prop)}
+							<button
+								type="button"
+								class="label pick"
+								class:active={r.prop === active}
+								style="height:{ROW_H}px"
+								aria-pressed={r.prop === active}
+								onclick={() => (picked = r.prop)}>{r.label}</button
+							>
+						{/each}
+					{:else}
+						{#each shown as r (r.prop)}
+							<div class="label" style="height:{ROW_H}px">{r.label}</div>
+						{/each}
+					{/if}
 				</div>
-				<div class="lanes" bind:this={lanes}>
+				<div class="lanes" class:graph={view === 'graph'} bind:this={lanes}>
 					<!-- svelte-ignore a11y_no_static_element_interactions -->
 					<div class="ruler" style="height:{RULER_H}px" onpointerdown={rulerDown} aria-hidden="true">
 						{#each ticks as t (t.k)}
@@ -417,43 +467,58 @@
 							<span class="tlabel" style="left:{x + 3}px">{tickLabel(t.k, grid, editor.fps, timeDisplay.mode)}</span>
 						{/each}
 					</div>
-					<!-- svelte-ignore a11y_no_static_element_interactions -->
-					<div class="body" bind:this={body} style="height:{shown.length * ROW_H}px" onpointerdown={laneDown}>
-						{#if axis.duration > duration}
-							<span class="past" style="left:{xOf(axis, duration)}px" aria-hidden="true"></span>
-						{/if}
-						{#each shown as r, i (r.prop)}
-							<div class="row" style="top:{i * ROW_H}px;height:{ROW_H}px" role="group" aria-label={r.label}>
-								{#each r.keys as k, j (j)}
-									{@const on = isSelected(shownSel, r.prop, k.time)}
-									<button
-										type="button"
-										class="key"
-										class:on
-										class:held={k.easing === 'hold'}
-										class:eased={!!k.easing && k.easing !== 'hold'}
-										style="left:{xOf(axis, k.time) - 7}px"
-										aria-label={keyName(r.label, k.time)}
-										aria-pressed={on}
-										use:tip={keyName(r.label, k.time)}
-										data-prop={r.prop}
-										data-time={String(k.time)}
-										onclick={(e) => {
-											if (e.detail === 0) selection = toggleKey(live, { prop: r.prop, time: k.time });
-										}}
-										oncontextmenu={(e) => keyMenu(e, r.prop, k.time)}
-									><span class="diamond"></span></button>
-								{/each}
-							</div>
-						{/each}
-						{#if marqueeRect}
-							<span
-								class="marquee"
-								style="left:{marqueeRect.x}px;top:{marqueeRect.y}px;width:{marqueeRect.w}px;height:{marqueeRect.h}px"
-								aria-hidden="true"
-							></span>
-						{/if}
-					</div>
+					{#if view === 'graph'}
+						<DopeGraph
+							{clip}
+							rows={shown}
+							{axis}
+							{active}
+							selection={shownSel}
+							{duration}
+							onpress={() => root?.focus({ preventScroll: true })}
+							onpick={graphPick}
+							onclear={graphClear}
+							onwrite={(c, edit) => void write(c, edit)}
+						/>
+					{:else}
+						<!-- svelte-ignore a11y_no_static_element_interactions -->
+						<div class="body" bind:this={body} style="height:{shown.length * ROW_H}px" onpointerdown={laneDown}>
+							{#if axis.duration > duration}
+								<span class="past" style="left:{xOf(axis, duration)}px" aria-hidden="true"></span>
+							{/if}
+							{#each shown as r, i (r.prop)}
+								<div class="row" style="top:{i * ROW_H}px;height:{ROW_H}px" role="group" aria-label={r.label}>
+									{#each r.keys as k, j (j)}
+										{@const on = isSelected(shownSel, r.prop, k.time)}
+										<button
+											type="button"
+											class="key"
+											class:on
+											class:held={k.easing === 'hold'}
+											class:eased={!!k.easing && k.easing !== 'hold'}
+											style="left:{xOf(axis, k.time) - 7}px"
+											aria-label={keyName(r.label, k.time)}
+											aria-pressed={on}
+											use:tip={keyName(r.label, k.time)}
+											data-prop={r.prop}
+											data-time={String(k.time)}
+											onclick={(e) => {
+												if (e.detail === 0) selection = toggleKey(live, { prop: r.prop, time: k.time });
+											}}
+											oncontextmenu={(e) => keyMenu(e, r.prop, k.time)}
+										><span class="diamond"></span></button>
+									{/each}
+								</div>
+							{/each}
+							{#if marqueeRect}
+								<span
+									class="marquee"
+									style="left:{marqueeRect.x}px;top:{marqueeRect.y}px;width:{marqueeRect.w}px;height:{marqueeRect.h}px"
+									aria-hidden="true"
+								></span>
+							{/if}
+						</div>
+					{/if}
 					{#if playhead !== null && playhead >= 0 && playhead <= axis.duration}
 						<span class="playhead" style="left:{xOf(axis, playhead)}px" aria-hidden="true"></span>
 					{/if}
@@ -494,6 +559,9 @@
 		overflow: hidden;
 		text-overflow: ellipsis;
 	}
+	.view {
+		flex: none;
+	}
 	.sel {
 		flex: 1;
 		color: var(--text-muted);
@@ -527,6 +595,29 @@
 		position: relative;
 		flex: 1;
 		min-width: 0;
+	}
+	.lanes.graph {
+		display: flex;
+		flex-direction: column;
+	}
+	.lanes.graph .ruler {
+		flex: none;
+	}
+	.label.pick {
+		width: 100%;
+		border: none;
+		border-bottom: var(--line-width) solid var(--border-subtle);
+		background: none;
+		text-align: left;
+		cursor: pointer;
+	}
+	.label.pick:hover {
+		color: var(--text-primary);
+		background: var(--hover-fill);
+	}
+	.label.pick.active {
+		color: var(--text-primary);
+		box-shadow: inset 2px 0 0 var(--clip-accent);
 	}
 	.ruler {
 		position: relative;

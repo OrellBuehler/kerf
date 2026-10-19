@@ -448,7 +448,17 @@ clicks on the box itself: Svelte delegates a detached panel's events from the pa
 the twelve presets of `EASING_CHOICES` (eight before, now also Glide / Settle / Lift / Whip — the Inspector's picker
 lists the same) as curves drawn from the renderers' polyline (`easingPath`), lights the one the selected segments share,
 and shapes the segment each selected key starts (`easingTargets`: a row's last key starts none); arrows move between
-presets, Escape / a press outside / blur / scroll close it without writing. **Every gesture is one
+presets, Escape / a press outside / blur / scroll close it without writing. **The graph view** (the bar's *Keys* / *Graph*
+chips, kept while the panel moves; `DopeGraph.svelte`, pure half `graph-editor.ts`) draws the same rows as curves on the
+same time axis and ruler — the renderers' polyline (`curvePath` over `easedPoints`), held out before the first key and after
+the last. The active row (picked by its label, else the last selected key's row, else the first: `activeRow`) is drawn on its
+own value axis (`valueRange`: the keys' span, an eased segment never leaves it; gridlines on round steps, `valueTicks`) with a
+handle at each control point of every segment that is not a hold (a line's are its thirds, `handlesOf`); the other rows are
+faint, each on its own range. Dragging a handle puts that control point at the pointer inside the segment's box
+(`dragHandle`: held to `0..=1` on both axes, so no overshoot; a flat segment's handle moves in time only) and writes one
+`easeKeys` edit of a bezier on the key that starts it (`handleEdit`), ghosted until then; Escape / pointercancel / blur
+abandon it. A focused handle's arrows nudge it a twentieth of its box (up is up on the screen), one edit a press and none
+for a held key. Clicking a key selects it and seeks there, Shift / Ctrl toggles it. **Every gesture is one
 `set_property_tracks` edit** of only the rows it touched (`retimeKeys`, `deleteKeys`, `pasteKeys`, `easeKeys` in the pure,
 bun-tested `dope-sheet.ts`; a gesture that changes nothing writes nothing), shown as its ghost until the edit settles,
 and Escape / pointercancel / blur abandon a drag (`beginDrag`). Keys are named by number and time, not index, so the
