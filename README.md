@@ -331,8 +331,8 @@ Kerf is a working editor under active development — not a scaffold. The timeli
 preview, transcript, analysis, effects, keyframes, captions, playback and export are all
 wired to real backend state, and the MCP surface is exercised end-to-end.
 
-**Roadmap:** exporting one cut at every delivery frame in a single pass, a live activity
-stream pushed from the MCP server (the queue is polled today), and audible reverse shuttle.
+**Roadmap:** a live activity stream pushed from the MCP server (the queue is polled today), and
+audible reverse shuttle.
 
 Contributions welcome — see [`CONTRIBUTING.md`](./CONTRIBUTING.md).
 

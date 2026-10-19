@@ -274,8 +274,11 @@ settings page's commands — the settings file holds `agent_review`, `mcp_enable
 so a cancel lands before the handler's future can be dropped): only if this run touched the file
 (mtime differs from before), so a failure or a cancel before ffmpeg opened the output cannot delete the
 earlier export sitting at that path, and the commands neither remove nor compare anything themselves.
-`export_variants` is one `render_variants` call over every file: the one in flight is removed, the finished
-ones stay, and its `VariantProgress` is the `export-progress` event as it is. With `smart_crop` the shots are
+`export_variants` is one `render_variants` call over every file, in one ffmpeg run unless `single_pass` is
+false (or the encode cannot share one): a stopped single pass removes every file (rejecting with `export cancelled;
+all N files were removed`), one after another the one in
+flight is removed and the finished ones stay; its `VariantProgress` (`together` for a single pass) is the
+`export-progress` event as it is. With `smart_crop` the shots are
 framed first (`sample_framings_with`, `export_cancel` stops it), streaming the same event with `waiting:
 "framing the shots"` so the bar does not sit at 0%. Every output path is checked against the project's own
 files (`Project::output_path_inputs` read under the lock, `check_output_path_with` — which canonicalises and stats — run
