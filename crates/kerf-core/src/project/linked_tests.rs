@@ -22,6 +22,7 @@ pub(super) fn stream(kind: StreamKind) -> StreamInfo {
         color_primaries: None,
         pix_fmt: None,
         color_space: None,
+        lead: 0.0,
     }
 }
 

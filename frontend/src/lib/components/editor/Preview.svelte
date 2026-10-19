@@ -6,6 +6,7 @@
 	import { timeDisplay } from '#lib/time-display.svelte';
 	import ScrubBar from './ScrubBar.svelte';
 	import TrimMonitor from './TrimMonitor.svelte';
+	import TransformHandles from './TransformHandles.svelte';
 	import { ui } from '#lib/editor-ui.svelte';
 	import { settings } from '#lib/settings.svelte';
 	import { editor } from '#lib/state.svelte';
@@ -636,6 +637,11 @@
 		return o && !ui.playing && !empty && !editor.previewingStaged && isVisibleAt(o, ui.time) ? o : null;
 	});
 
+	// The selected clip's transform handles (`TransformHandles.svelte`): out of the way like the title boxes while
+	// playing, while a proposal is previewed and while the trim monitor stands in for the picture.
+	const handlesActive = $derived(!empty && !ui.playing && !streaming && !editor.previewingStaged && !ui.trimMonitor);
+	let handlesShown = $state(false);
+
 	// ---- the GPU preview: how the frame is produced, and where the surface is ------------
 	//
 	// With the setting off none of this runs: the route is the JPEG path, nothing is observed and
@@ -661,6 +667,7 @@
 			streaming: streaming && !returning,
 			empty,
 			titlesShown: titlesHere.length > 0 || svgBox !== null,
+			handles: handlesShown,
 			trimMonitor: !!ui.trimMonitor,
 			guides: showGuides,
 			covered
@@ -1262,6 +1269,7 @@
 						></div>
 					</div>
 				{/if}
+				<TransformHandles active={handlesActive} frameAspect={aspect} chrome={showGuides ? CHROME : null} bind:shown={handlesShown} />
 				<!-- Titles under the playhead, as boxes over where the engine draws them.
 				     The text is transparent (the picture already has it) except while
 				     it is being dragged, when the box carries a ghost of it. -->

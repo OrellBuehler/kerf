@@ -1,6 +1,6 @@
-//! The golden argv oracle: 6400 seeded timelines (4000, then 800 with a master bus, then 800
+//! The golden argv oracle: 6800 seeded timelines (4000, then 800 with a master bus, then 800
 //! with per-property channels, then 400 with an AMF or VAAPI encoder, then 400 with animated SVG
-//! titles) whose ffmpeg argv must not move.
+//! titles, then 400 exported at several delivery frames in one run) whose ffmpeg argv must not move.
 //!
 //! `build_export_args_phase`, `build_still_args` and `build_preview_args_with` are
 //! built for every case and their argv reduced to a digest, checked against three
@@ -37,6 +37,19 @@
 //! appended to each file. Changing how a title is read (a document that cannot move is one looped
 //! picture, a stream reads the title's own sequence from `-start_number`, a still is `-f image2
 //! -pattern_type none`) moved those four lines (blocks 60..63) and nothing else.
+//!
+//! **Late-starting twins.** `retarget_late` (every nineteenth case, no dice) cuts the clips of
+//! `interview` and `phone` from twins whose video starts after their sound (`StreamInfo::lead`),
+//! half of them from the head of the file: the window read without a seek and the picture's
+//! `+(start+delay)/TB` (`late-start-delay`). Only those 248 cases moved.
+//!
+//! **The multi-delivery family is appended the same way**: the [`TOGETHER_CASES`] after those draw
+//! from the same generator and are then exported at two or three delivery frames by one run
+//! ([`together_for`], on dice of its own): their export text is `together::build_together_args`
+//! (its argv and where its outputs sit) instead of `build_export_args_phase`'s, half carry titles,
+//! clips carry framings, a quarter mux captions and chapters, and the encode is made one the run
+//! takes (no two-pass, a software encoder); a tenth keep an audio-only container, which no run
+//! writes together. Only 4 block lines were appended to each file.
 //!
 //! **Machine-independent by construction.** The builders read the machine in five
 //! places, each pinned: the preview's decode acceleration (the
@@ -93,7 +106,10 @@ const HW_CASES: usize = 400;
 /// The animated-title cases appended after the hardware-encoder ones (see the module docs).
 const SVG_CASES: usize = 400;
 const SVG_FIRST: usize = CASES + MASTER_CASES + CHANNEL_CASES + HW_CASES;
-const TOTAL: usize = SVG_FIRST + SVG_CASES;
+/// The multi-delivery cases appended after the animated-title ones (see the module docs).
+const TOGETHER_CASES: usize = 400;
+const TOGETHER_FIRST: usize = SVG_FIRST + SVG_CASES;
+const TOTAL: usize = TOGETHER_FIRST + TOGETHER_CASES;
 const BLOCK: usize = 100;
 const MIN_PER_FAMILY: usize = 20;
 const KINDS: [&str; 3] = ["export", "still", "preview"];
@@ -167,6 +183,8 @@ reframe-fisheye ih_fov=
 still-reframe v360=input=
 shared-input [vsp
 head-padded-proxy trim=start_frame=1
+late-start-delay )/TB
+preview-late-start-delay )/TB
 image-input -loop 1 -framerate
 image-under-a-frame -t 0.0
 overlay drawtext=
@@ -305,6 +323,15 @@ prores-4444-pix -pix_fmt yuva444p10le
 hevc-tag -tag:v hvc1
 faststart -movflags +faststart
 title -metadata title=
+together-split-two :v]split=2[in
+together-split-three :v]split=3[in
+together-mix [d0_outa]asplit=
+together-titles [d1_svg0]
+together-second-frame [d1_vbase]
+together-chapters -map_chapters
+together-subtitles -disposition:s:0 0
+together-refused NOT-TOGETHER
+together-reframe-named v360@d1c
 ";
 
 // ---- a seeded generator --------------------------------------------------------
@@ -367,7 +394,7 @@ fn stream(kind: StreamKind, codec: &str, size: (u32, u32), fps: f64) -> StreamIn
     StreamInfo {
         index: 0, kind, codec: codec.into(), width: video.then_some(size.0), height: video.then_some(size.1), fps: video.then_some(fps),
         sample_rate: None, channels: None, image: false, projection: None, rotation: 0, color_transfer: None, color_primaries: None,
-        pix_fmt: video.then(|| "yuv420p".into()), color_space: None,
+        pix_fmt: video.then(|| "yuv420p".into()), color_space: None, lead: 0.0,
     }
 }
 
@@ -443,6 +470,25 @@ fn pool() -> Vec<Asset> {
         .map(|s| if s.kind == StreamKind::Video { StreamInfo { width: Some(1440), height: Some(1080), ..s } } else { s })
         .collect();
     pool.push(Asset { id: Uuid::from_u128(300), path: "/golden/hdr-hlg-43.mp4".into(), name: "hdr-hlg-43".into(), streams, ..hlg });
+    // Footage whose video starts after its sound (`StreamInfo::lead`): the twins of `interview`
+    // (80 ms, a phone's) and `phone` (half a second), and the head-padded proxy of the first,
+    // which carries its original's lead — reached only by [`retarget_late`].
+    let late = |name: &str, lead: f64, path: String, twin: &str| {
+        let original = pool.iter().find(|a| a.name == name).unwrap().clone();
+        let streams = original
+            .streams
+            .iter()
+            .cloned()
+            .map(|s| if s.kind == StreamKind::Video { StreamInfo { lead, ..s } } else { s })
+            .collect();
+        Asset { id: Uuid::from_u128(400 + original.id.as_u128() + 50 * u128::from(path.contains("proxies"))), path, name: format!("{name}{twin}"), streams, ..original }
+    };
+    let late_twins = [
+        late("interview", 0.08, "/golden/interview-late.mov".into(), "-late"),
+        late("phone", 0.5, "/golden/phone-late.mp4".into(), "-late"),
+        late("interview", 0.08, format!("/golden/kerf/proxies/{:016x}.lead.mp4", 0x5eed_1000), "-late-padded"),
+    ];
+    pool.extend(late_twins);
     pool
 }
 
@@ -500,6 +546,37 @@ fn retarget_hdr43(tl: &mut Timeline, i: usize, assets: &[Asset]) {
     for clip in tl.tracks.iter_mut().flat_map(|t| &mut t.clips) {
         if assets[..LIBRARY].iter().any(|a| a.id == clip.asset_id && a.hdr().is_some()) && clip.id.as_u128() % 3 == 0 {
             clip.asset_id = twin;
+        }
+    }
+}
+
+/// Every nineteenth case, the clips of `interview` and `phone` are cut from their late-starting
+/// twins (about a third of `interview`'s from its padded proxy), and half of those from the head
+/// of the file, their length kept: what puts `ClipFx::lead` — the window read without a seek and
+/// the picture's `picture_delay` — in the oracle. No dice of its own: the clip's id decides.
+fn retarget_late(tl: &mut Timeline, i: usize, assets: &[Asset]) {
+    if i % 19 != 6 {
+        return;
+    }
+    for clip in tl.tracks.iter_mut().flat_map(|t| &mut t.clips) {
+        let Some(original) = assets[..LIBRARY].iter().find(|a| a.id == clip.asset_id) else {
+            continue;
+        };
+        let twin = if original.name == "interview" && clip.id.as_u128() % 3 == 0 {
+            "-late-padded"
+        } else {
+            "-late"
+        };
+        let Some(twin) = assets[LIBRARY..]
+            .iter()
+            .find(|a| a.name.strip_suffix(twin) == Some(&original.name))
+        else {
+            continue;
+        };
+        clip.asset_id = twin.id;
+        if (clip.id.as_u128() >> 2) % 2 == 0 {
+            clip.source_out -= clip.source_in;
+            clip.source_in = 0.0;
         }
     }
 }
@@ -949,6 +1026,8 @@ struct Case {
     preview: (f64, f64, u32, u8, Option<String>),
     /// The export's pass, null sink and passlog file.
     pass: (PassPhase, &'static str, &'static str),
+    /// The delivery frames one run exports the cut at; none for an ordinary export.
+    variants: Vec<ExportVariant>,
 }
 
 #[rustfmt::skip]
@@ -959,13 +1038,14 @@ fn case(i: usize, assets: &[Asset]) -> Case {
     retarget_alpha(&mut timeline, i, assets);
     retarget_hdr43(&mut timeline, i, assets);
     retarget_tiny(&mut timeline, i);
+    retarget_late(&mut timeline, i, assets);
     if (CASES..CASES + MASTER_CASES).contains(&i) {
         timeline.master = master_for(i - CASES);
     }
     if i >= CASES + MASTER_CASES {
         channels_for(&mut timeline, i - CASES - MASTER_CASES);
     }
-    if i >= SVG_FIRST {
+    if (SVG_FIRST..TOGETHER_FIRST).contains(&i) {
         svg_for(&mut timeline, i - SVG_FIRST);
     }
     let dur = timeline.duration();
@@ -993,7 +1073,7 @@ fn case(i: usize, assets: &[Asset]) -> Case {
     if (CASES + MASTER_CASES + CHANNEL_CASES..SVG_FIRST).contains(&i) {
         opts.video_codec = Some(hw_encoder_for(i - CASES - MASTER_CASES - CHANNEL_CASES).into());
     }
-    if i >= SVG_FIRST {
+    if (SVG_FIRST..TOGETHER_FIRST).contains(&i) {
         opts.container = svg_container_for(i - SVG_FIRST).unwrap_or(opts.container);
     }
     let pass = match r.below(20) { 0..=11 => PassPhase::Single, 12..=15 => PassPhase::First, _ => PassPhase::Second };
@@ -1006,11 +1086,79 @@ fn case(i: usize, assets: &[Asset]) -> Case {
         pass: (pass, r.pick(&["/dev/null", "NUL"]), r.pick(&["", "/golden/pass"])),
         timeline,
         opts,
+        variants: Vec::new(),
     };
-    if i >= SVG_FIRST {
+    if (SVG_FIRST..TOGETHER_FIRST).contains(&i) {
         svg_playhead(&mut c, i - SVG_FIRST);
     }
+    if i >= TOGETHER_FIRST {
+        together_for(&mut c, i - TOGETHER_FIRST);
+    }
     c
+}
+
+/// A variant of `/golden/out.mp4`, named as `ExportVariant::beside` names it but spelled out:
+/// `beside` joins with the platform's separator, and the digests must hold on every OS.
+fn together_variant(delivery: Delivery) -> ExportVariant {
+    let (w, h) = delivery.ratio();
+    ExportVariant {
+        delivery,
+        output: format!("/golden/out-{w}x{h}.mp4").into(),
+    }
+}
+
+/// The `j`-th multi-delivery case, on dice of its own: two or three delivery frames, titles on every
+/// other case, framings on the clips, captions and chapters to mux on a quarter, and an encode one
+/// run takes — every tenth case keeps an audio-only container, which none does.
+fn together_for(c: &mut Case, j: usize) {
+    const FRAMES: [(u32, u32, Fit); 5] = [
+        (1080, 1920, Fit::Cover),
+        (1080, 1080, Fit::Cover),
+        (1080, 1350, Fit::Cover),
+        (1920, 1080, Fit::Contain),
+        (640, 360, Fit::Cover),
+    ];
+    let mut r = Rng::new(0x4445_4c56_0000 + j as u64);
+    if j.is_multiple_of(2) {
+        svg_for(&mut c.timeline, SVG_CASES + j);
+    }
+    for clip in c.timeline.tracks.iter_mut().flat_map(|t| &mut t.clips) {
+        for ratio in [(9, 16), (1, 1), (4, 5)] {
+            if r.chance(0.6) {
+                let (l, t) = (r.real(0.0, 0.4), r.real(0.0, 0.2));
+                clip.framings.push(crate::model::Framing {
+                    aspect_w: ratio.0,
+                    aspect_h: ratio.1,
+                    crop_left: l,
+                    crop_right: r.real(0.0, 0.4),
+                    crop_top: t,
+                    crop_bottom: r.real(0.0, 0.2),
+                });
+            }
+        }
+    }
+    let mut frames = FRAMES.to_vec();
+    for _ in 0..r.pick(&[2, 2, 3]) {
+        let (w, h, fit) = frames.remove(r.below(frames.len()));
+        c.variants.push(together_variant(Delivery::new(w, h, fit)));
+    }
+    let o = &mut c.opts;
+    if matches!(o.rate_control, RateControl::TwoPass) {
+        o.rate_control = RateControl::Bitrate;
+    }
+    if o.video_codec
+        .as_deref()
+        .is_some_and(|vc| enc_family(vc) != EncFamily::Software)
+    {
+        o.video_codec = Some("libx264".into());
+    }
+    if o.container.is_audio_only() && j % 10 != 7 {
+        o.container = Container::Mp4;
+    }
+    if j % 4 == 1 {
+        o.subtitle_input = Some("/golden/captions.srt".into());
+        o.chapters_input = Some("/golden/chapters.txt".into());
+    }
 }
 
 /// Every third animated-title case plays from a frame of the stream's own grid in the middle of its
@@ -1062,6 +1210,15 @@ fn repr(args: &Result<Vec<String>>) -> String {
     }
 }
 
+/// [`repr`] of the one run that exports every variant: its argv and where its outputs sit.
+fn repr_together(built: Result<Option<together::TogetherArgs>>) -> String {
+    match built {
+        Ok(Some(t)) => format!("{}\0sinks\0{:?}", repr(&Ok(t.args)), t.sinks_from_end),
+        Ok(None) => "NOT-TOGETHER".to_string(),
+        Err(e) => repr(&Err(e)),
+    }
+}
+
 /// What one case builds: the argv text of each builder (a case holding HDR footage
 /// built with `zscale` present *and* absent; a case with the master limiter on has its
 /// export built once more for an ffmpeg whose `alimiter` has no `latency`, the one
@@ -1073,6 +1230,9 @@ fn build(c: &Case, assets: &[Asset]) -> ([String; 3], Vec<String>) {
     let mut text = [String::new(), String::new(), String::new()];
     let (pass, null_sink, passlog) = c.pass;
     let export = || {
+        if !c.variants.is_empty() {
+            return repr_together(together::build_together_args(&c.timeline, assets, &c.variants, &c.opts));
+        }
         repr(&build_export_args_phase(
             &c.timeline,
             assets,
@@ -1300,8 +1460,9 @@ fn families(c: &Case, assets: &[Asset], text: &[String; 3], table: &[(&str, &str
     // read the facts the builders decide from. The export's graph is the range's slice, the
     // preview's the cut from the playhead, a still's the layers on screen.
     let untagged_hd = |name: &str| {
+        let name = name.strip_suffix("-padded").unwrap_or(name);
         matches!(
-            name.strip_suffix("-padded").unwrap_or(name),
+            name.strip_suffix("-late").unwrap_or(name),
             "interview" | "broll" | "phone" | "wide" | "sphere" | "lenses"
         )
     };
@@ -1482,6 +1643,33 @@ fn round_libm_keeps_the_mapping_and_drops_the_last_digits() {
         round_libm("acompressor=threshold=0.001:ratio=4:makeup=1.2589254117941673 agate=threshold=0.01")
     );
     assert!(round_libm("a=threshold=0.5:b=1").contains("5.000000000e-1:b=1"));
+}
+
+/// Every export graph of the corpus reads back through `together::relabel` unchanged, and every
+/// label it finds is one the builders write: no `[` inside a filter's arguments is taken for one.
+#[test]
+fn the_labels_one_run_renames_are_the_graphs_own() {
+    let assets = pool();
+    for i in (0..TOGETHER_FIRST).step_by(3) {
+        let c = case(i, &assets);
+        let built = pinned(true, true, || {
+            build_export_args(&c.timeline, &assets, "/golden/out.mp4", &c.opts)
+        });
+        let Ok(args) = built else { continue };
+        let Some(at) = args.iter().position(|a| a == "-filter_complex") else {
+            continue;
+        };
+        let graph = &args[at + 1];
+        let mut odd = Vec::new();
+        let same = together::relabel(graph, |label| {
+            if !label.chars().all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == ':') {
+                odd.push(label.to_string());
+            }
+            label.to_string()
+        });
+        assert_eq!(&same, graph, "case {i}");
+        assert!(odd.is_empty(), "case {i}: {odd:?}");
+    }
 }
 
 #[test]

@@ -21,9 +21,13 @@
   in the middle of its first title, `svg_playhead`, no dice, because the drawn playhead is between frames and a stream from one never reads
   `-start_number`); families `svg-input`, `svg-held`, `svg-overlay`, `svg-two`, `svg-partly-off`, `svg-restamp`, `still-svg`,
   `still-svg-one-file`, `preview-svg-*` (`input`, `held`, `seek`, `overlay`) and
-  the structural `svg-under-text`, `svg-gif`, `svg-offset`, which gave 28 to hundreds of cases each), have their
+  the structural `svg-under-text`, `svg-gif`, `svg-offset`, which gave 28 to hundreds of cases each) and **400 more**
+  exported at two or three delivery frames by one run (`together_for`, on dice of its own: framings on the clips,
+  titles on every other case, captions and chapters to mux on a quarter, the encode made one the run takes, every
+  tenth an audio-only container that none does; their export text is `together::build_together_args` plus its
+  `sinks_from_end`; families `together-*`), have their
   `build_export_args_phase`, `build_still_args` and `build_preview_args_with` argv reduced to
-  FNV-1a digests, committed as 64 block digests each in
+  FNV-1a digests, committed as 68 block digests each in
   `engine/cli/golden/{export,still,preview}.txt` (LF: `.gitattributes`, and the comparison
   ignores `\r`). A refactor of the graph builders must leave all three untouched; an
   intended argv change moves the files of the builders it touched. (`build_proxy_args` and
@@ -104,6 +108,15 @@
   a fraction of at least one half, from draws already made so no other case moves) are `"one\rtwo\r\nthree\u{2028}four\u{2029}five"`, which every kind of break turns
   into one space. New families `overlay-linebreak` (`one two three four five`) and its `still-` / `preview-` forms: 152 / 23 / 85 cases moved
   (180 of 5600), exactly the cases hitting them.
+- **Late-starting sources** (`export.txt` / `still.txt` / `preview.txt`): the pool gained `-late` twins of `interview` (lead 80 ms) and
+  `phone` (0.5 s) and an `interview-late-padded` proxy that keeps the original's lead, reached only by `retarget_late` (`i % 19 == 6`, no dice:
+  the clip's id picks the twin and moves half of them to the head of the file, length kept). The extended pool alone moved nothing; the
+  retarget moved 248 of 6400 cases (235 export / 89 still / 151 preview), all of them `i % 19 == 6` (`KERF_GOLDEN_CASES` before / after). New
+  families `late-start-delay` / `preview-late-start-delay` (`)/TB`, the `+(start+delay)/TB` spelling): 110 / 74 cases. Starting a
+  fade-in on the first picture then moved 77 cases (65 export / 8 still / 36 preview), all `i % 19 == 6` and all but three of them
+  with a fade, dip or dissolve family (with the fade change compiled out the committed digests held). Ending a late
+  clip's dissolve ramp with the outgoing tail (and never emitting a fade of no length) moved 2 export cases, both
+  `i % 19 == 6` dissolves; still and preview stayed.
 - **Sample-exact `adelay`** (a clip starting between milliseconds is delayed by samples)
   re-blessed `export.txt` alone: 2718 of 4800 cases moved, exactly the new
   `audio-delay-samples` family (`S:all=1`); still and preview carry no sound.
@@ -137,7 +150,7 @@
   MJPEG and SpeedHQ at `yuv422p`, JPEG-LS grey, a decode-only `thp`, AMV, an `rgb24` with `bt470bg` from FFV1) and the label must be in no argv, and by explicitly tagged H.264
   clips (`bt709`, `smpte170m`, full-range `yuvj420p` `bt709`) and must then be exactly where the HDR clip's was. It moves no digest.
   The 400 animated-title cases (`6000..6400`) were blessed with the label in (blocks `60`..`63`; the first 6000 are the digests the label gave);
-  with the label text stripped from every argv all 64 block digests equal the ones committed before it.
+  with the label text stripped from every argv all 64 block digests of the time equal the ones committed before it.
 - **Constant-power crossfades** (`afade …:curve=qsin` only on a fade that is wholly one half of a real
   pair: a dissolve or motion transition from an adjacent clip whose overlap plays different sound — not a
   fade up from black, not a dip, not a cut inside one take) re-blessed `export.txt` alone: 1304 of 6400

@@ -138,6 +138,10 @@
   tail, and **`proxy/late-video-start`** (the pick over a head-padded proxy's own frames is
   what the preview graph renders from it, at the head — the clone dropped — and deeper in).
   `drop_first`'s removal makes the head case fail; so does rounding in `setpts`.
+  **A late-starting source** (`FpsPick::lead`, from `ClipFx::lead`): a window inside the lead
+  is not seeked (`clip_seek(start, lead)`) and the run's `setpts` start is
+  `start + picture_delay(...)`, added in the graph's order (`+(start+delay)/TB`), so the frames
+  before the source's first picture are `Early` (nothing drawn), as in the export.
   A rate whose canvas and `fps=` parses differ (`29.970029`) is refused in Motion
   (`Unsupported::PickRate`): the pick assumes one grid.
   **Traps for the `FrameSource` that will feed it** (A1b): `showinfo` pts under `-copyts
@@ -387,7 +391,10 @@
     stack on FFmpeg 6.1.1 (33.0 dB / 15 levels into the HD clip, 32.5 / 15 out of it, over all frames of the export; method in
     `engine-cli.md`); it equals the file tagged BT.709, which the plan draws (`a_labelled_hd_clip_dips_through_white_with_the_bt709_round_trip`). Opaque pictures are identical.
   - **What depends on the render size** is decided in the plan, before any decode
-    (`LayerGeometry` lives in kerf-core as `layer_geometry.rs` for this reason): a
+    (`LayerGeometry` lives in kerf-core as `layer_geometry.rs` for this reason; the frontend's port,
+    `layer-geometry.ts`, places the Preview's transform handles and replays `layer_geometry/corpus.rs`'s
+    `fixtures/layer-geometry-corpus.json` — regenerate with `KERF_BLESS_CORPUS=1 cargo test -p kerf-core
+    --no-default-features -- layer_geometry_corpus` after an intended rounding change): a
     translucent layer of odd size, **resizing a picture that is not 8/10-bit
     4:2:0 or gray** (any scale stage that changes its size, in either direction) —
     FFmpeg scales in the format the picture has, the decode reduces it to 8-bit 4:2:0

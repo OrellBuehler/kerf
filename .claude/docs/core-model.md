@@ -1,7 +1,13 @@
 # kerf-core: `model.rs` — domain types and timeline math
 
 - `model.rs` — the domain types and the only place timeline math lives: `Asset`,
-  `StreamInfo`, `Timeline`→`Track`→`Clip` (the EDL), `AssetAnalysis`. A `Clip`
+  `StreamInfo`, `Timeline`→`Track`→`Clip` (the EDL), `AssetAnalysis`. A video `StreamInfo`
+  carries **`lead`**: seconds its first picture starts after the earliest picture or sound of the
+  file (the probe's stream `start_time`s, not the container's, which a text track can pull earlier),
+  above 1 ms and below the duration (a start at or past the end is broken and reads 0); omitted at 0,
+  so old JSON reads an ordinary start. The export seeks and places the clip's picture by it
+  (`ClipFx::lead`, `engine-cli.md`); a proxy-decoded asset keeps the original's only for a `.lead`
+  padded proxy (`media::decoded_lead`, `Project::preview_assets_of`). A `Clip`
   references a source range (`source_in`/`source_out`) of an asset at a
   `timeline_start` — non-destructive. Besides the geometry (`Transform`) / color
   (`Color`) / `Transition` fields, a clip carries a `Vec<VideoEffect>` and
@@ -72,10 +78,16 @@
   keyed would otherwise change nothing and not know why).
   `Project::set_property_keyframes(clip, prop, keys)` replaces one number's keys (each checked against
   `Property::check`, at most `MAX_CHANNEL_KEYS` = 1000, bezier range; no keys = static),
-  `set_property_easing(clip, prop, time, easing)` and `copy_keyframes(from, to, props, offset)` (every
+  `set_transform_at(clip, time, TransformPatch)` is one revision that poses a clip at a moment (`Clip::pose_transform`:
+  a keyed number gets a key at `time` — in its own track if it has one, else in the bundle with the other bundle numbers
+  at their sampled values, as `add_keyframe` puts one in — and every other number, a track held empty against the
+  bundle included, and the crop edges always, its static value; `channels.ts` `poseTransform` mirrors it, tests by
+  name). `set_property_easing(clip, prop, time, easing)` and `copy_keyframes(from, to, props, offset)` (every
   keyed number when `props` is empty; a negative offset cuts the head off with `rebase_head`, so the
   destination opens on the pose; replaces the destination's tracks for those numbers; refuses a number
-  the source has no keys for and the same clip twice) are the surface ops. **Edits keep channels where
+  the source has no keys for and the same clip twice) are the surface ops, with
+  `set_property_tracks(clip, tracks)` — several numbers' keys in one edit ("Edit keyframes"; each track checked as
+  `set_property_keyframes` checks it, a number twice or none at all refused), what one dope-sheet gesture writes. **Edits keep channels where
   they were** with the B5a rules: `rebase_animation` (every head move — `Timeline::slice`, split-and-remove
   left, roll / slide of the next clip, a linked partner's trim) runs the bundle *and* `rebase_channels`
   (`rebase_head`: pose pinned at 0, a cut inside an eased segment bakes the rest into plain keys, a hold

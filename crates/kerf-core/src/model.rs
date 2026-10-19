@@ -138,6 +138,16 @@ pub struct StreamInfo {
     /// its saturation to the RGB gamut clip.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub color_space: Option<String>,
+    /// Seconds between the start of the file's picture and sound and this video stream's
+    /// first frame, when the video starts after the sound: the stream's `start_time` less the
+    /// earliest video or audio stream's (not the container's, which a text track can pull
+    /// earlier), above a millisecond and below the duration (a start at or past the end is a
+    /// broken one and reads 0). The export seeks and places the picture by it, so a clip cut
+    /// from inside the lead keeps the source's sync (see `clip_timing::picture_delay`).
+    /// Defaulted (and omitted at 0) so older `.kerf` JSON still deserializes, as an
+    /// ordinary start.
+    #[serde(default, skip_serializing_if = "is_zero_f64")]
+    pub lead: f64,
 }
 
 fn is_zero_rotation(r: &i16) -> bool {
@@ -1210,6 +1220,56 @@ impl Transform {
     /// True when any edge crop is requested.
     pub fn has_crop(&self) -> bool {
         self.crop_left > 0.0 || self.crop_right > 0.0 || self.crop_top > 0.0 || self.crop_bottom > 0.0
+    }
+}
+
+/// Some numbers of a [`Transform`], as a partial edit names them: `None` leaves a number alone.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TransformPatch {
+    pub scale: Option<f64>,
+    pub pos_x: Option<f64>,
+    pub pos_y: Option<f64>,
+    pub rotation: Option<f64>,
+    pub opacity: Option<f64>,
+    pub crop_left: Option<f64>,
+    pub crop_right: Option<f64>,
+    pub crop_top: Option<f64>,
+    pub crop_bottom: Option<f64>,
+}
+
+impl TransformPatch {
+    /// The animatable numbers it names, with their values.
+    pub fn animatable(&self) -> Vec<(Property, f64)> {
+        [
+            (Property::Scale, self.scale),
+            (Property::PosX, self.pos_x),
+            (Property::PosY, self.pos_y),
+            (Property::Rotation, self.rotation),
+            (Property::Opacity, self.opacity),
+        ]
+        .into_iter()
+        .filter_map(|(p, v)| v.map(|v| (p, v)))
+        .collect()
+    }
+
+    /// Write the numbers it names into `t`.
+    pub fn apply(&self, t: &mut Transform) {
+        let fields = [
+            (&mut t.scale, self.scale),
+            (&mut t.pos_x, self.pos_x),
+            (&mut t.pos_y, self.pos_y),
+            (&mut t.rotation, self.rotation),
+            (&mut t.opacity, self.opacity),
+            (&mut t.crop_left, self.crop_left),
+            (&mut t.crop_right, self.crop_right),
+            (&mut t.crop_top, self.crop_top),
+            (&mut t.crop_bottom, self.crop_bottom),
+        ];
+        for (field, value) in fields {
+            if let Some(v) = value {
+                *field = v;
+            }
+        }
     }
 }
 
@@ -7032,6 +7092,7 @@ mod tests {
             color_primaries: None,
             pix_fmt: Some(pix_fmt.into()),
             color_space: tag.map(Into::into),
+            lead: 0.0,
         }
     }
 
@@ -7385,6 +7446,7 @@ mod tests {
             color_primaries: None,
             pix_fmt: None,
             color_space: None,
+            lead: 0.0,
         };
         assert_eq!(s.has_alpha(), None);
         s.pix_fmt = Some("yuv420p".into());

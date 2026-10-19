@@ -48,8 +48,9 @@ describe('Modal', () => {
 			.filter((f) => f.endsWith('.svelte') && /aria-modal|role="dialog"/.test(readFileSync(f, 'utf8')))
 			.map(posix)
 			.sort();
-		// The notification log is a popover over the title bar, not a modal.
-		expect(modals).toEqual([`${EDITOR}Modal.svelte`, `${EDITOR}NotificationCenter.svelte`]);
+		// The notification log is a popover over the title bar, and the easing popover one over the
+		// dope sheet: neither is a modal.
+		expect(modals).toEqual([`${EDITOR}EasingPopover.svelte`, `${EDITOR}Modal.svelte`, `${EDITOR}NotificationCenter.svelte`]);
 	});
 
 	test('the close button is named, an icon, and gone while a run cannot be left', () => {

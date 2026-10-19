@@ -54,6 +54,7 @@ import {
 	setAudioEffects,
 	setKeyframes,
 	setPropertyKeyframes,
+	setPropertyTracks,
 	copyKeyframes,
 	setAssetProjection,
 	setReframe,
@@ -118,6 +119,7 @@ import {
 	setRippleMode,
 	setSpeed,
 	setTransform,
+	setTransformAt,
 	setTransition,
 	setVolume,
 	splitClip,
@@ -155,6 +157,7 @@ import type {
 	Projection,
 	Property,
 	PropertyKey,
+	PropertyTrack,
 	Reframe,
 	ReframeKeyframe,
 	Revision,
@@ -1189,6 +1192,9 @@ class EditorState {
 	setSpeed(clipId: string, speed: number) {
 		return this.#apply(() => setSpeed(clipId, speed));
 	}
+	setTransformAt(clipId: string, time: number, patch: Partial<Transform>) {
+		return this.#apply(() => setTransformAt(clipId, time, patch));
+	}
 	setTransform(clipId: string, patch: Partial<Transform>) {
 		return this.#apply(() => setTransform(clipId, patch));
 	}
@@ -1217,6 +1223,10 @@ class EditorState {
 	/** Replace the keys of one number — a transform number, a colour number or the volume. */
 	setPropertyKeyframes(clipId: string, prop: Property, keys: PropertyKey[]) {
 		return this.#apply(() => setPropertyKeyframes(clipId, prop, keys));
+	}
+	/** Replace the keys of several numbers in one edit (one dope-sheet gesture). */
+	setPropertyTracks(clipId: string, tracks: PropertyTrack[]) {
+		return this.#apply(() => setPropertyTracks(clipId, tracks));
 	}
 	/** Copy the animation of `props` (all keyed ones when empty) to another clip, `offset` later. */
 	copyKeyframes(fromClipId: string, toClipId: string, props: Property[] = [], offset = 0) {
@@ -1636,10 +1646,11 @@ class EditorState {
 		outputPath: string,
 		formats: Delivery[],
 		smartCrop: boolean,
-		options: ExportOptions
+		options: ExportOptions,
+		singlePass = true
 	): Promise<string[]> {
 		try {
-			return await this.#render(() => exportVariants(outputPath, formats, smartCrop, options), smartCrop);
+			return await this.#render(() => exportVariants(outputPath, formats, smartCrop, options, singlePass), smartCrop);
 		} finally {
 			// The framing pass wrote onto the clips; the history has a revision
 			// the panel has not seen.

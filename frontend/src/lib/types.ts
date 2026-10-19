@@ -29,6 +29,8 @@ export interface StreamInfo {
 	pix_fmt?: string | null;
 	/** The YCbCr matrix the stream declares, as ffprobe names it (`bt709`, `smpte170m`, `bt2020nc`, …); absent when it declares none. */
 	color_space?: string | null;
+	/** Seconds the video starts after the file's sound (a late-starting source); absent when 0. */
+	lead?: number;
 }
 
 /**
@@ -1412,6 +1414,8 @@ export interface ExportProgress {
 	 *  `fraction` then spans all of them. */
 	variant?: number;
 	total?: number;
+	/** A multi-format export rendering every file in one pass: `variant` is then 0. */
+	together?: boolean;
 }
 
 /** Payload of the `import-progress` event, emitted while a 360 pair is stitched. */

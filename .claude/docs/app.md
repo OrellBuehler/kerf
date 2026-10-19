@@ -106,7 +106,8 @@ ripple closed — the transcript-editing primitive), `add_track`, `remove_track`
 width/height to clear it), `remove_clip`, `remove_clips { clipIds, ripple? }`
 (one revision; `ripple: true` is the multi-select ripple delete, via
 `with_ripple`; omitted follows the project's mode), `set_volume`, `set_fade`,
-`set_speed`, `set_transform`, `set_color`, `set_transition`, `set_mask`,
+`set_speed`, `set_transform`, `set_transform_at { clipId, time, …transform fields }` (one revision: a keyed number keyed at
+`time`, the rest and the crop static — what a Preview handle drag writes), `set_color`, `set_transition`, `set_mask`,
 `set_grade { clipId, grade }` (curves / wheels / LUT; a LUT path the clip did not have is checked off the lock,
 `blocking`, so a curve edit on a clip whose LUT went missing still applies),
 `inspect_lut { path }` (→ `LutInfo {path, size, title}`, or why it is not a usable `.cube`),
@@ -114,7 +115,8 @@ width/height to clear it), `remove_clip`, `remove_clips { clipIds, ripple? }`
 `set_audio_effects`, `set_keyframes` / `add_keyframe` / `clear_keyframes`,
 `set_keyframe_easing { clipId, time, easing, prop? }` (the key within a millisecond of `time`; with
 `prop`, that one number's), `set_property_keyframes { clipId, prop, keys }` (one number's own keys; none =
-static) / `copy_keyframes { fromClipId, toClipId, props?, offset? }`,
+static) / `set_property_tracks { clipId, tracks }` (several numbers' keys in one edit — the dope sheet) /
+`copy_keyframes { fromClipId, toClipId, props?, offset? }`,
 `set_reframe` / `clear_reframe` / `set_reframe_keyframes` / `add_reframe_keyframe`,
 `set_asset_projection` (asset-level 360 mark; returns the `Asset`),
 `add_overlay` / `update_overlay` / `remove_overlay` / `set_overlay_keyframes`,
@@ -273,8 +275,11 @@ settings page's commands — the settings file holds `agent_review`, `mcp_enable
 so a cancel lands before the handler's future can be dropped): only if this run touched the file
 (mtime differs from before), so a failure or a cancel before ffmpeg opened the output cannot delete the
 earlier export sitting at that path, and the commands neither remove nor compare anything themselves.
-`export_variants` is one `render_variants` call over every file: the one in flight is removed, the finished
-ones stay, and its `VariantProgress` is the `export-progress` event as it is. With `smart_crop` the shots are
+`export_variants` is one `render_variants` call over every file, in one ffmpeg run unless `single_pass` is
+false (or the encode cannot share one): a stopped single pass removes every file (rejecting with `export cancelled;
+all N files were removed`), one after another the one in
+flight is removed and the finished ones stay; its `VariantProgress` (`together` for a single pass) is the
+`export-progress` event as it is. With `smart_crop` the shots are
 framed first (`sample_framings_with`, `export_cancel` stops it), streaming the same event with `waiting:
 "framing the shots"` so the bar does not sit at 0%. Every output path is checked against the project's own
 files (`Project::output_path_inputs` read under the lock, `check_output_path_with` — which canonicalises and stats — run
@@ -359,8 +364,8 @@ comes back `ForbiddenUrl` and the "Release notes" button silently does nothing.
 `set_delivery_format`, `concatenate`, `remove_silence`, `snap_to_beats`, `smart_crop`, `cancel_smart_crop`;
 *linked A/V* `extract_audio`, `add_asset_audio`, `detach_audio`, `detach_audio_clips`, `reattach_audio`,
 `reattach_audio_clips`, `link_clips`, `unlink_clips`; *clip properties* `set_volume`, `set_fade`, `set_speed`,
-`set_transform`, `set_color`, `set_grade`, `inspect_lut`, `set_transition`, `set_mask`, `set_video_effects`, `set_audio_effects`, `set_keyframes`,
-`add_keyframe`, `set_keyframe_easing`, `set_property_keyframes`, `copy_keyframes`, `clear_keyframes`, `set_reframe`,
+`set_transform`, `set_transform_at`, `set_color`, `set_grade`, `inspect_lut`, `set_transition`, `set_mask`, `set_video_effects`, `set_audio_effects`, `set_keyframes`,
+`add_keyframe`, `set_keyframe_easing`, `set_property_keyframes`, `set_property_tracks`, `copy_keyframes`, `clear_keyframes`, `set_reframe`,
 `clear_reframe`, `set_reframe_keyframes`, `add_reframe_keyframe`; *markers, text, titles, captions* `add_marker`,
 `update_marker`, `remove_marker`, `add_overlay`, `update_overlay`, `remove_overlay`, `set_overlay_keyframes`,
 `add_svg_overlay`, `update_svg_overlay`, `remove_svg_overlay`, `validate_svg`, `list_svg_presets`,
