@@ -10,6 +10,7 @@ import {
 	propertyKeys,
 	propertyKeysProblem,
 	propertyKeysShifted,
+	poseTransform,
 	propertyProblem,
 	rebaseChannels,
 	rebaseHead,
@@ -381,5 +382,53 @@ describe('edits keep channels where they were', () => {
 		const eased = structuredClone(after);
 		eased.channels![0].keys[0].easing = 'hold';
 		expect(channelChanges(after, eased)).toEqual(['easing changed on 1 volume keyframe']);
+	});
+});
+
+describe('poseTransform mirrors Clip::pose_transform', () => {
+	test('posing an unkeyed clip writes its static transform', () => {
+		const c = clip();
+		poseTransform(c, 1, { scale: 0.5, pos_x: 0.2, pos_y: -0.1, crop_left: 0.1 });
+		expect(c.keyframes ?? []).toEqual([]);
+		expect(c.channels ?? []).toEqual([]);
+		expect([c.transform!.scale, c.transform!.pos_x, c.transform!.pos_y, c.transform!.crop_left]).toEqual([0.5, 0.2, -0.1, 0.1]);
+	});
+
+	test('posing a bundle keyed clip keys the bundle at the time', () => {
+		const c = clip();
+		c.keyframes = [bundle(0, 1, 1), bundle(2, 2, 0)];
+		poseTransform(c, 1, { pos_x: 0.3, pos_y: 0.1, crop_top: 0.2 });
+		expect(c.keyframes.length).toBe(3);
+		const k = c.keyframes[1];
+		expect([k.time, k.pos_x, k.pos_y, k.scale, k.opacity]).toEqual([1, 0.3, 0.1, 1.5, 0.5]);
+		expect([c.transform!.pos_x, c.transform!.crop_top]).toEqual([0, 0.2]);
+		expect(c.channels ?? []).toEqual([]);
+		expect(transformAt(c, 1).pos_x).toBe(0.3);
+	});
+
+	test('posing keys the numbers with tracks and sets the rest static', () => {
+		const c = clip();
+		setPropertyKeys(c, 'pos_x', [key(0, 0), key(2, 0.4)]);
+		poseTransform(c, 1, { pos_x: -0.2, pos_y: 0.25 });
+		expect(c.keyframes ?? []).toEqual([]);
+		expect(propertyKeys(c, 'pos_x').length).toBe(3);
+		expect(propertyAt(c, 'pos_x', 1)).toBe(-0.2);
+		expect(isKeyed(c, 'pos_y')).toBe(false);
+		expect(c.transform!.pos_y).toBe(0.25);
+		expect(c.transform!.pos_x).toBe(0);
+	});
+
+	test('posing beside a bundle keeps each number where it is driven from', () => {
+		const c = clip();
+		c.keyframes = [bundle(0, 1, 1), bundle(2, 2, 0)];
+		setPropertyKeys(c, 'scale', [key(0, 1), key(2, 1)]);
+		setPropertyKeys(c, 'opacity', []);
+		poseTransform(c, 1, { scale: 3, opacity: 0.7, pos_x: 0.1 });
+		expect(propertyAt(c, 'scale', 1)).toBe(3);
+		expect(propertyKeys(c, 'scale').length).toBe(3);
+		expect(isKeyed(c, 'opacity')).toBe(false);
+		expect(c.transform!.opacity).toBe(0.7);
+		expect(c.keyframes.length).toBe(3);
+		expect(transformAt(c, 1).pos_x).toBe(0.1);
 	});
 });

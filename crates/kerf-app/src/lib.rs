@@ -2203,6 +2203,41 @@ fn set_transform(
     project.timeline().map_err(|e| e.to_string())
 }
 
+/// The transform as it should look `time` seconds into the clip, one revision: keyed numbers
+/// get a key there, the rest (the crop always) their static value. A Preview drag writes it.
+#[tauri::command(async)]
+#[allow(clippy::too_many_arguments)]
+fn set_transform_at(
+    state: State<'_, AppState>,
+    clip_id: String,
+    time: f64,
+    scale: Option<f64>,
+    pos_x: Option<f64>,
+    pos_y: Option<f64>,
+    rotation: Option<f64>,
+    opacity: Option<f64>,
+    crop_left: Option<f64>,
+    crop_right: Option<f64>,
+    crop_top: Option<f64>,
+    crop_bottom: Option<f64>,
+) -> CmdResult<Timeline> {
+    let id = id(&clip_id, "clip_id")?;
+    let project = state.project();
+    let patch = kerf_core::TransformPatch {
+        scale,
+        pos_x,
+        pos_y,
+        rotation,
+        opacity,
+        crop_left,
+        crop_right,
+        crop_top,
+        crop_bottom,
+    };
+    project.set_transform_at(id, time, patch).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
 #[tauri::command(async)]
 fn set_color(
     state: State<'_, AppState>,
@@ -5182,6 +5217,7 @@ pub fn run() {
             set_fade,
             set_speed,
             set_transform,
+            set_transform_at,
             set_color,
             set_transition,
             set_mask,

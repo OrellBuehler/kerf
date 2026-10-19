@@ -27,7 +27,7 @@ use crate::model::{
 };
 use crate::model::{AutoIncluded, SkippedChange, StagedAssetChange};
 use crate::model::{Detached, DetachedMany};
-use crate::model::{Property, PropertyKey};
+use crate::model::{Property, PropertyKey, TransformPatch};
 use crate::model::{SvgOverlay, SvgOverlayPatch, SvgPreset};
 use crate::svg::{check_params, SvgDoc};
 
@@ -4324,58 +4324,42 @@ impl Project {
         crop_top: Option<f64>,
         crop_bottom: Option<f64>,
     ) -> Result<Clip> {
-        if scale.is_some_and(|v| !v.is_finite() || v <= 0.0) {
-            return Err(Error::InvalidArgument("scale must be a finite value > 0".to_string()));
-        }
-        if [pos_x, pos_y, rotation].into_iter().flatten().any(|v| !v.is_finite()) {
-            return Err(Error::InvalidArgument(
-                "position and rotation must be finite numbers".to_string(),
-            ));
-        }
-        if opacity.is_some_and(|v| !(0.0..=1.0).contains(&v)) {
-            return Err(Error::InvalidArgument("opacity must be within 0.0..=1.0".to_string()));
-        }
-        if [crop_left, crop_right, crop_top, crop_bottom]
-            .into_iter()
-            .flatten()
-            .any(|c| !(0.0..1.0).contains(&c))
-        {
-            return Err(Error::InvalidArgument("crop fractions must be within 0.0..1.0".to_string()));
-        }
-        self.edit_timeline("Set transform", |timeline| {
+        let patch = TransformPatch {
+            scale,
+            pos_x,
+            pos_y,
+            rotation,
+            opacity,
+            crop_left,
+            crop_right,
+            crop_top,
+            crop_bottom,
+        };
+        validate_transform_patch(&patch)?;
+        self.edit_timeline("Set transform", move |timeline| {
             let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
             let t = &mut timeline.tracks[ti].clips[ci].transform;
-            if let Some(v) = scale {
-                t.scale = v;
-            }
-            if let Some(v) = pos_x {
-                t.pos_x = v;
-            }
-            if let Some(v) = pos_y {
-                t.pos_y = v;
-            }
-            if let Some(v) = rotation {
-                t.rotation = v;
-            }
-            if let Some(v) = opacity {
-                t.opacity = v;
-            }
-            if let Some(v) = crop_left {
-                t.crop_left = v;
-            }
-            if let Some(v) = crop_right {
-                t.crop_right = v;
-            }
-            if let Some(v) = crop_top {
-                t.crop_top = v;
-            }
-            if let Some(v) = crop_bottom {
-                t.crop_bottom = v;
-            }
-            if t.crop_left + t.crop_right >= 1.0 || t.crop_top + t.crop_bottom >= 1.0 {
-                return Err(Error::InvalidArgument("crop removes the entire frame".to_string()));
-            }
+            patch.apply(t);
+            check_crop(t)?;
             Ok(timeline.tracks[ti].clips[ci].clone())
+        })
+    }
+
+    /// Set a clip's transform as it should look `time` seconds into the clip, as one revision:
+    /// a number that is animated gets a key there (in the whole-transform keyframes or in its own
+    /// track, whichever drives it) and every other number — the crop edges always — its static
+    /// value. What dragging a clip in the Preview writes.
+    pub fn set_transform_at(&self, clip_id: Uuid, time: f64, patch: TransformPatch) -> Result<Clip> {
+        if !time.is_finite() || time < 0.0 {
+            return Err(Error::InvalidArgument("time must be >= 0".to_string()));
+        }
+        validate_transform_patch(&patch)?;
+        self.edit_timeline("Set transform", move |timeline| {
+            let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
+            let clip = &mut timeline.tracks[ti].clips[ci];
+            clip.pose_transform(time, &patch);
+            check_crop(&clip.transform)?;
+            Ok(clip.clone())
         })
     }
 
@@ -7101,6 +7085,35 @@ fn validate_reframe_keyframe(k: &ReframeKeyframe) -> Result<()> {
     validate_fov(Some(k.fov))
 }
 
+fn validate_transform_patch(p: &TransformPatch) -> Result<()> {
+    if p.scale.is_some_and(|v| !v.is_finite() || v <= 0.0) {
+        return Err(Error::InvalidArgument("scale must be a finite value > 0".to_string()));
+    }
+    if [p.pos_x, p.pos_y, p.rotation].into_iter().flatten().any(|v| !v.is_finite()) {
+        return Err(Error::InvalidArgument(
+            "position and rotation must be finite numbers".to_string(),
+        ));
+    }
+    if p.opacity.is_some_and(|v| !(0.0..=1.0).contains(&v)) {
+        return Err(Error::InvalidArgument("opacity must be within 0.0..=1.0".to_string()));
+    }
+    if [p.crop_left, p.crop_right, p.crop_top, p.crop_bottom]
+        .into_iter()
+        .flatten()
+        .any(|c| !(0.0..1.0).contains(&c))
+    {
+        return Err(Error::InvalidArgument("crop fractions must be within 0.0..1.0".to_string()));
+    }
+    Ok(())
+}
+
+fn check_crop(t: &crate::model::Transform) -> Result<()> {
+    if t.crop_left + t.crop_right >= 1.0 || t.crop_top + t.crop_bottom >= 1.0 {
+        return Err(Error::InvalidArgument("crop removes the entire frame".to_string()));
+    }
+    Ok(())
+}
+
 fn validate_keyframe(k: &Keyframe) -> Result<()> {
     if !k.time.is_finite() || k.time < 0.0 {
         return Err(Error::InvalidArgument("keyframe time must be >= 0".to_string()));
@@ -9497,6 +9510,54 @@ mod tests {
 
     fn pk(time: f64, value: f64) -> PropertyKey {
         PropertyKey::new(time, value)
+    }
+
+    #[test]
+    fn a_pose_keys_what_is_keyed_and_sets_the_rest_in_one_revision() {
+        let (project, clip) = channel_project();
+        project
+            .set_property_keyframes(clip.id, Property::PosX, vec![pk(0.0, 0.0), pk(4.0, 0.4)])
+            .unwrap();
+        let before = project.history().unwrap().len();
+        let patch = TransformPatch {
+            pos_x: Some(-0.25),
+            pos_y: Some(0.1),
+            crop_right: Some(0.2),
+            ..TransformPatch::default()
+        };
+        let posed = project.set_transform_at(clip.id, 2.0, patch).unwrap();
+        assert_eq!(
+            project.history().unwrap().len(),
+            before + 1,
+            "one revision for the whole pose"
+        );
+        assert_eq!(project.history().unwrap().last().unwrap().label, "Set transform");
+        assert_eq!(posed.property_at(Property::PosX, 2.0), -0.25);
+        assert_eq!((posed.transform.pos_y, posed.transform.crop_right), (0.1, 0.2));
+        assert!(posed.keyframes.is_empty());
+
+        // Refused before anything is written: a bad time, a bad number, a crop of everything.
+        for (time, patch) in [
+            (-1.0, TransformPatch::default()),
+            (f64::NAN, TransformPatch::default()),
+            (
+                0.0,
+                TransformPatch {
+                    scale: Some(0.0),
+                    ..TransformPatch::default()
+                },
+            ),
+            (
+                0.0,
+                TransformPatch {
+                    crop_left: Some(0.9),
+                    ..TransformPatch::default()
+                },
+            ),
+        ] {
+            assert!(project.set_transform_at(clip.id, time, patch).is_err(), "{time} {patch:?}");
+        }
+        assert_eq!(project.history().unwrap().len(), before + 1);
     }
 
     #[test]

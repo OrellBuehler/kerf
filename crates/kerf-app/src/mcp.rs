@@ -1028,6 +1028,32 @@ struct TransformParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct TransformAtParams {
+    #[schemars(description = "UUID of the clip")]
+    clip_id: String,
+    #[schemars(description = "Seconds from the clip's start: where an animated number gets its key")]
+    time: f64,
+    #[schemars(description = "Uniform scale after fitting to the frame (1.0 = fit); omit to leave unchanged")]
+    scale: Option<f64>,
+    #[schemars(description = "Horizontal offset as a fraction of frame width (0.0 = centered); omit to leave unchanged")]
+    pos_x: Option<f64>,
+    #[schemars(description = "Vertical offset as a fraction of frame height (0.0 = centered); omit to leave unchanged")]
+    pos_y: Option<f64>,
+    #[schemars(description = "Clockwise rotation in degrees; omit to leave unchanged")]
+    rotation: Option<f64>,
+    #[schemars(description = "Opacity 0.0–1.0 (1.0 = opaque); omit to leave unchanged")]
+    opacity: Option<f64>,
+    #[schemars(description = "Fraction cropped from the left edge (0.0–1.0, never animated); omit to leave unchanged")]
+    crop_left: Option<f64>,
+    #[schemars(description = "Fraction cropped from the right edge (0.0–1.0, never animated); omit to leave unchanged")]
+    crop_right: Option<f64>,
+    #[schemars(description = "Fraction cropped from the top edge (0.0–1.0, never animated); omit to leave unchanged")]
+    crop_top: Option<f64>,
+    #[schemars(description = "Fraction cropped from the bottom edge (0.0–1.0, never animated); omit to leave unchanged")]
+    crop_bottom: Option<f64>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct ColorParams {
     #[schemars(description = "UUID of the clip")]
     clip_id: String,
@@ -3314,6 +3340,28 @@ impl KerfMcp {
                     p.crop_bottom,
                 )
                 .map_err(core_err)?;
+            json(&out)
+        })
+    }
+
+    #[tool(
+        description = "Set how a clip looks at one moment of it (`time`, seconds from the clip's start), in one edit, whether or not it is animated: each named number that has keyframes (set_keyframes / add_keyframe, or set_property_keyframes) gets a key at that time — the rest of the animation is kept — and every other named number, the crop edges always, is set as set_transform sets it. Use it to change a pose without first finding out which numbers are animated. Returns the clip."
+    )]
+    fn set_transform_at(&self, Parameters(p): Parameters<TransformAtParams>) -> Result<String, McpError> {
+        let clip_id = parse_arg("clip_id", &p.clip_id)?;
+        let patch = kerf_core::TransformPatch {
+            scale: p.scale,
+            pos_x: p.pos_x,
+            pos_y: p.pos_y,
+            rotation: p.rotation,
+            opacity: p.opacity,
+            crop_left: p.crop_left,
+            crop_right: p.crop_right,
+            crop_top: p.crop_top,
+            crop_bottom: p.crop_bottom,
+        };
+        self.edit(|project| {
+            let out = project.set_transform_at(clip_id, p.time, patch).map_err(core_err)?;
             json(&out)
         })
     }
@@ -6096,7 +6144,8 @@ const INSTRUCTIONS: &str = "Kerf MCP server. The user queues editing tasks in th
              over the interview (later video tracks composite on top). Polish \
              with set_volume / set_fade (fade-in/out, e.g. to smooth hard cuts), \
              set_speed, set_transform (scale / position / rotation / opacity / \
-             crop — picture-in-picture), set_color and set_transition (a fade \
+             crop — picture-in-picture; set_transform_at for an animated clip, which keys \
+             what is animated at a moment), set_color and set_transition (a fade \
              between scenes, a slide or push between the shots of a montage). \
              Go further: set_video_effects (blur / sharpen / \
              grayscale / invert / vignette / chroma_key — green-screen so a lower \
