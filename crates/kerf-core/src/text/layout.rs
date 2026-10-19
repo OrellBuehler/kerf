@@ -470,7 +470,7 @@ fn paragraph(
     }
     let widths = Widths::new(text, &cluster_adv, &spacing);
     let ranges = match width {
-        None => vec![0..text.len()],
+        None => std::iter::once(0..text.len()).collect(),
         Some(avail) => wrap(&widths, avail),
     };
     let nlines = ranges.len();

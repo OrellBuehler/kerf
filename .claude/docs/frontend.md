@@ -1662,11 +1662,14 @@ the marked `<g …>` back to `<text`, its direct `data-kerf-glyphs` child cut, i
 kerf-core's own outlines by `outline-corpus.test.ts` (`fixtures/outline-corpus.json`, blessed with `KERF_BLESS_CORPUS=1 …
 -- outline_corpus`). The Inspector's **SVG source** box shows and compares the text form (`shownSource`), noting that applying
 a change to an outlined custom title draws it with its fonts until it is outlined again. **`TextSection.svelte`** (after the
-Template section, for every title but a preset, floating or on a track) lists each `<text>` with an id (`titleTexts`: the
-box read off its start tag, which an outlined text keeps) under its template control's label or `#id`: a width (empty is no
+Template section, for every title but a preset, floating or on a track) lists each `<text>` with an id no other element
+has (`titleTexts`, so the `{#each}` key is unique and the engine would take it: the box read off its start tag, which an
+outlined text keeps, its `style`'s `inline-size` first as `text_box_of` reads it) under its template control's label or
+`#id`: a width (empty is no
 box; `boxWidthRefusal` before the round trip) and *Wrap lines* / *Shrink to fit*, each commit one `setTitleTextBox` edit
 (nothing while locked, busy or previewing a proposal; the engine's notes said as a toast), and for a custom title *Draw as
-outlines* / *Draw with fonts* (`convertTitleText`). The harness writes the box (`withTextBox`, `set_text_box`'s splice) and
+outlines* / *Draw with fonts* (`convertTitleText`). The harness writes the box (`withTextBox`, `set_text_box`'s splice: the
+width last in the `style`, `!important`, its declarations split as `declarations` splits them, quotes and comments kept whole) and
 draws text with its fonts, saying so (`HARNESS_NOTE`). `template-ui.ts` is the pure side (bun-tested): `slugId`
 (a control id from its label: lower case, accents dropped, `-2` past a taken one), `defaultAttribute` (a color's `stop-color`
 on a `stop`, else `fill`; an image's `href`; a font's `font-family`; a number's usual size), `elementsFor` (text at

@@ -88,29 +88,72 @@ export interface TitleText {
 
 /** The box written on a start tag's attributes (`inline-size`, or one in its `style`; the fit mark). */
 function boxOf(attrs: Map<string, string>): TextBox {
-	const fromStyle = (attrs.get('style') ?? '')
-		.split(';')
-		.map((d) => d.split(':'))
-		.find(([p]) => p?.trim().toLowerCase() === 'inline-size')?.[1];
-	const raw = (attrs.get('inline-size') ?? fromStyle ?? '').trim().replace(/px$/, '').trim();
+	// As the renderer weighs it: the `style` first (its last `inline-size`), else the attribute.
+	const inStyle = declarations(attrs.get('style') ?? '')
+		.reverse()
+		.find((d) => isProperty(d, 'inline-size'));
+	const fromStyle = inStyle?.slice(inStyle.indexOf(':') + 1).replace(/!important\s*$/, '');
+	const raw = (fromStyle ?? attrs.get('inline-size') ?? '').trim().replace(/px$/, '').trim();
 	const n = raw === '' ? NaN : Number(raw);
 	const fit: TextFit = attrs.get(FIT_MARK)?.trim() === 'shrink' ? 'shrink' : 'wrap';
 	return { width: Number.isFinite(n) && n > 0 ? n : null, fit };
 }
 
-/** Every text of the title with an `id`, in document order, with its box (`text_box_of`). */
+/** Whether the declaration `d` (`prop: value`) sets `prop`. */
+const isProperty = (d: string, prop: string): boolean =>
+	d.includes(':') && d.slice(0, d.indexOf(':')).trim().toLowerCase() === prop;
+
+/** A declaration list's declarations as written, split at the `;` outside strings, comments and parentheses; empty
+ *  ones left out (`text_box.rs`'s `declarations`). */
+export function declarations(body: string): string[] {
+	const out: string[] = [];
+	let start = 0;
+	let paren = 0;
+	let i = 0;
+	while (i < body.length) {
+		const c = body[i];
+		if (c === '"' || c === "'") {
+			let j = i + 1;
+			while (j < body.length && body[j] !== c) j += body[j] === '\\' ? 2 : 1;
+			i = j + 1;
+			continue;
+		}
+		if (c === '/' && body[i + 1] === '*') {
+			const end = body.indexOf('*/', i + 2);
+			i = end < 0 ? body.length : end + 2;
+			continue;
+		}
+		if (c === '(') paren++;
+		else if (c === ')') paren = Math.max(0, paren - 1);
+		else if (c === ';' && paren === 0) {
+			out.push(body.slice(start, i));
+			start = i + 1;
+		}
+		i++;
+	}
+	out.push(body.slice(Math.min(start, body.length)));
+	return out.filter((d) => d.trim() !== '');
+}
+
+/** Whether a `<style>` sheet of the title mentions `inline-size` (a rule could give a text a box). */
+const sheetNamesInlineSize = (svg: string): boolean => /<style[\s>][\s\S]*?inline-size[\s\S]*?<\/style\s*>/i.test(svg);
+
+/** Every text of the title with an `id` no other element has (a box goes on one element, by its id), in document
+ *  order, with its box (`text_box_of`). */
 export function titleTexts(svg: string): TitleText[] {
 	const out: TitleText[] = [];
+	const seen = new Map<string, number>();
 	for (const m of svg.matchAll(TOKEN)) {
 		if (m[2] === undefined) continue;
-		const local = m[2].split(':').pop();
 		const attrs = attributes(m[3]);
-		const outlined = local === 'g' && attrs.has(TEXT_MARK);
-		if (local !== 'text' && !outlined) continue;
 		const id = attrs.get('id');
-		if (id) out.push({ id, outlined, box: boxOf(attrs) });
+		if (!id) continue;
+		seen.set(id, (seen.get(id) ?? 0) + 1);
+		const local = m[2].split(':').pop();
+		const outlined = local === 'g' && attrs.has(TEXT_MARK);
+		if (local === 'text' || outlined) out.push({ id, outlined, box: boxOf(attrs) });
 	}
-	return out;
+	return out.filter((t) => seen.get(t.id) === 1);
 }
 
 /** Why a typed box width cannot be one, or `null` (empty is no box). */
@@ -125,8 +168,10 @@ export function boxWidthRefusal(raw: string): string | null {
 /** A width to a thousandth, without trailing zeros (as kerf-core writes it). */
 const number = (v: number): string => v.toFixed(3).replace(/\.?0+$/, '');
 
-/** `svg` with the `<text>` `element` given `box` (`set_text_box`): its old `inline-size` and fit mark (and an
- *  `inline-size` in its `style`) taken out, the new ones written at the end of its start tag. The harness's. */
+/** `svg` with the `<text>` `element` given `box` (`set_text_box`): its old `inline-size` attribute, fit mark and any
+ *  `inline-size` in its `style` taken out, the width written last in its `style` and important (it beats a `<style>`
+ *  rule; `auto` where a rule may give one and there is no box), the fit mark at the end of its start tag. The
+ *  harness's. */
 export function withTextBox(svg: string, element: string, box: TextBox): string {
 	if (box.width !== null && boxWidthRefusal(String(box.width))) throw invalid(boxWidthRefusal(String(box.width))!);
 	const tags = [...svg.matchAll(TOKEN)].filter((m) => m[2] !== undefined && attributes(m[3]).get('id') === element);
@@ -134,16 +179,30 @@ export function withTextBox(svg: string, element: string, box: TextBox): string 
 	if (tags.length > 1) throw invalid(`more than one element has the id “${element}”`);
 	const tag = tags[0];
 	if (tag[2].split(':').pop() !== 'text') throw invalid(`“${element}” is a <${tag[2]}>; a box is given to a <text>`);
-	let raw = tag[3]
-		.replace(/\s+(?:inline-size|data-kerf-fit)\s*=\s*(?:"[^"]*"|'[^']*')/g, '')
-		.replace(/(\sstyle\s*=\s*)(["'])([^"']*)\2/, (_, pre: string, q: string, body: string) => {
-			const kept = body.split(';').filter((d) => d.split(':')[0]?.trim().toLowerCase() !== 'inline-size' && d.trim() !== '');
-			return `${pre}${q}${kept.join(';')}${q}`;
-		});
-	if (box.width !== null) {
-		raw += ` inline-size="${number(box.width)}"`;
-		if (box.fit === 'shrink') raw += ` ${FIT_MARK}="shrink"`;
-	}
+	const decl =
+		box.width !== null
+			? `inline-size:${number(box.width)}px !important`
+			: sheetNamesInlineSize(svg)
+				? 'inline-size:auto !important'
+				: null;
+	let styled = false;
+	let raw = tag[3].replace(
+		/\s+([^\s=>/]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g,
+		(whole: string, name: string, dq: string | undefined, sq: string | undefined) => {
+			if (name === 'inline-size' || name === FIT_MARK) return '';
+			if (name !== 'style') return whole;
+			styled = true;
+			const value = dq ?? sq ?? '';
+			const q = dq !== undefined ? '"' : "'";
+			const kept = declarations(value).filter((d) => !isProperty(d, 'inline-size'));
+			if (decl) kept.push(decl);
+			const next = kept.join(';');
+			if (next.trim() === '') return '';
+			return `${whole.slice(0, whole.length - value.length - 2)}${q}${next}${q}`;
+		}
+	);
+	if (!styled && decl) raw += ` style="${decl}"`;
+	if (box.width !== null && box.fit === 'shrink') raw += ` ${FIT_MARK}="shrink"`;
 	const at = tag.index ?? 0;
 	const rebuilt = `<${tag[2]}${raw}${tag[4]}>`;
 	return svg.slice(0, at) + rebuilt + svg.slice(at + tag[0].length);

@@ -465,8 +465,10 @@ impl KerfMcp {
                        preset) a box: a `width` its lines wrap to, or with fit=\"shrink\" a width it stays on one line \
                        within, made smaller until it fits (a name of any length on a lower third). Omit `width` to take \
                        the box away. A box is drawn only when the text is glyph outlines, so the title's text is set as \
-                       outlines (see convert_title_text); a text that cannot be one is drawn with its font and runs on, \
-                       which `warnings` says. One edit; the title keeps its id, timing, placement and template values. \
+                       outlines (see convert_title_text); a text that cannot be one (a textPath, positioned tspans, ...) \
+                       is an error saying why. update_svg_overlay / update_title_clip with new `svg` draw the text with \
+                       its fonts again (a box written there is not drawn until convert_title_text). One edit; the title \
+                       keeps its id, timing, placement and template values. \
                        If the title changed while this ran, it says so: call again."
     )]
     async fn set_title_text_box(&self, Parameters(p): Parameters<SetTitleTextBoxParams>) -> Result<String, McpError> {

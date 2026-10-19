@@ -7,6 +7,8 @@
 //! sanitiser, the text engine), and [`Project::set_title_text_parsed`] stores it if the title is still the
 //! one it was made from.
 
+use std::collections::BTreeMap;
+
 use uuid::Uuid;
 
 use super::title_clips::TitleClipResult;
@@ -14,7 +16,7 @@ use super::{Project, SvgOverlayResult, TitleEdited};
 use crate::error::{Error, Result};
 use crate::fonts;
 use crate::svg::{restore_text, set_text_box, SvgDoc, TextBox};
-use crate::template::{read_values, TemplateControl};
+use crate::template::{read_values, validate_controls_shape, TemplateControl};
 
 /// How a title's text is drawn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
@@ -43,6 +45,8 @@ pub struct TitleTextInputs {
 pub struct PreparedText {
     base_svg: String,
     doc: SvgDoc,
+    /// A template title's values, read back from the new artwork.
+    values: Option<BTreeMap<String, String>>,
     warnings: Vec<String>,
 }
 
@@ -54,17 +58,35 @@ impl PreparedText {
 
 impl TitleTextInputs {
     /// Give the `<text>` whose id is `element` the box `text_box` (or none) and set the title's text as
-    /// outlines again: a box is drawn only by outlines. A text that stays text says so in a warning. Slow
-    /// (the sanitiser, the text engine): not for under the project lock.
+    /// outlines again: a box is drawn only by outlines, so a box for a text that would stay text is an error
+    /// saying why (taking one away is not). Slow (the sanitiser, the text engine): not for under the project
+    /// lock.
     pub fn text_box(&self, element: &str, text_box: &TextBox) -> Result<PreparedText> {
         let boxed = set_text_box(&restore_text(&self.svg)?, element, text_box)?;
-        let (doc, _, _) = self.read(&boxed)?;
-        let warnings = doc.warnings().to_vec();
-        Ok(PreparedText {
+        let (doc, _, kept) = self.read(&boxed)?;
+        if text_box.width.is_some() {
+            if let Some(why) = kept
+                .iter()
+                .find(|k| k.starts_with(&format!("the text \u{201c}{element}\u{201d} ")))
+            {
+                return Err(Error::InvalidArgument(format!(
+                    "{why} cannot be drawn as outlines, so a box would not be drawn"
+                )));
+            }
+        }
+        Ok(self.prepared(doc, Vec::new()))
+    }
+
+    /// The new artwork as stored: the title's values read back from it, its warnings and `more`.
+    fn prepared(&self, doc: SvgDoc, more: Vec<String>) -> PreparedText {
+        let mut warnings = doc.warnings().to_vec();
+        warnings.extend(more);
+        PreparedText {
             base_svg: self.svg.clone(),
+            values: self.controls.as_ref().map(|c| read_values(doc.sanitized(), c)),
             doc,
             warnings,
-        })
+        }
     }
 
     /// Draw the title's text in `form`. As outlines, each text that cannot be one says why in a warning,
@@ -85,13 +107,7 @@ impl TitleTextInputs {
                         "the title's text is drawn with its fonts already".to_string(),
                     ));
                 }
-                let doc = SvgDoc::parse(&text)?;
-                let warnings = doc.warnings().to_vec();
-                Ok(PreparedText {
-                    base_svg: self.svg.clone(),
-                    doc,
-                    warnings,
-                })
+                Ok(self.prepared(SvgDoc::parse(&text)?, Vec::new()))
             }
             TitleTextForm::Outlines => {
                 let (doc, count, kept) = self.read(&text)?;
@@ -102,13 +118,7 @@ impl TitleTextInputs {
                         format!("no text in the title can be set as outlines: {}", kept.join("; "))
                     }));
                 }
-                let mut warnings = doc.warnings().to_vec();
-                warnings.extend(kept.into_iter().map(|k| format!("{k} stays text")));
-                Ok(PreparedText {
-                    base_svg: self.svg.clone(),
-                    doc,
-                    warnings,
-                })
+                Ok(self.prepared(doc, kept.into_iter().map(|k| format!("{k} stays text")).collect()))
             }
         }
     }
@@ -142,10 +152,15 @@ impl Project {
                 (&o.svg, &o.template)
             }
         };
+        let controls = template.as_ref().map(|t| t.controls.clone());
+        if let Some(controls) = &controls {
+            // Stored with the title, not written by this build: checked before they are read with.
+            validate_controls_shape(controls)?;
+        }
         Ok(TitleTextInputs {
             title_id,
             svg: svg.clone(),
-            controls: template.as_ref().map(|t| t.controls.clone()),
+            controls,
         })
     }
 
@@ -164,8 +179,8 @@ impl Project {
                 if o.svg != prepared.base_svg {
                     return Err(changed());
                 }
-                if let Some(instance) = o.template.as_mut() {
-                    instance.values = read_values(&svg, &instance.controls);
+                if let (Some(instance), Some(values)) = (o.template.as_mut(), prepared.values) {
+                    instance.values = values;
                 }
                 o.svg = svg;
                 return Ok(TitleEdited::Overlay(Box::new(SvgOverlayResult {
@@ -182,8 +197,8 @@ impl Project {
             if title.svg != prepared.base_svg {
                 return Err(changed());
             }
-            if let Some(instance) = title.template.as_mut() {
-                instance.values = read_values(&svg, &instance.controls);
+            if let (Some(instance), Some(values)) = (title.template.as_mut(), prepared.values) {
+                instance.values = values;
             }
             title.svg = svg;
             Ok(TitleEdited::Clip(Box::new(TitleClipResult {
@@ -250,19 +265,57 @@ mod tests {
         assert!(svg.contains("data-kerf-text"), "{svg}");
         let text = restore_text(svg).unwrap();
         assert_eq!(text_box_of(&text, "name"), Some(shrink(300.0)));
-        // The text that cannot be an outline says so.
         assert!(edited.warnings().is_empty(), "{:?}", edited.warnings());
         assert!(project.history().unwrap().iter().any(|r| r.label == "Set text box"));
-        // Taken away again, the text form is the artwork as it was, outlined.
+        // Taken away again, the text form is the artwork as it was.
         let none = project.set_title_text_box(id, "name", TextBox::default()).unwrap();
-        assert_eq!(
-            restore_text(svg_of(&none)).unwrap(),
-            restore_text(svg)
-                .unwrap()
-                .replace(r#" inline-size="300" data-kerf-fit="shrink""#, "")
-        );
+        assert_eq!(restore_text(svg_of(&none)).unwrap(), ART);
         // Not a text: refused with nothing written.
+        let revisions = project.history().unwrap().len();
         assert!(project.set_title_text_box(id, "nope", shrink(10.0)).is_err());
+        // A text that would stay text cannot draw a box: refused, saying why; taking none away is fine.
+        let err = project
+            .set_title_text_box(id, "moved", shrink(100.0))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("“moved”") && err.contains("dx") && err.contains("box"), "{err}");
+        assert_eq!(project.history().unwrap().len(), revisions);
+        project.set_title_text_box(id, "moved", TextBox::default()).unwrap();
+    }
+
+    #[test]
+    fn custom_artwork_with_a_box_says_it_is_drawn_with_its_fonts_until_converted() {
+        let project = Project::open_in_memory().unwrap();
+        let boxed = ART.replace(r#"<text id="name""#, r#"<text id="name" inline-size="200""#);
+        let clip = project
+            .add_title_clip(ART, 0.0, Some(4.0), TitleClipPlacement::default())
+            .unwrap()
+            .clip;
+        let patch = crate::project::TitleClipPatch {
+            svg: Some(boxed.clone()),
+            ..Default::default()
+        };
+        let updated = project.update_title_clip_parsed(clip.id, patch, None).unwrap();
+        assert!(
+            updated.warnings.iter().any(|w| w == crate::svg::BOX_NOTE),
+            "{:?}",
+            updated.warnings
+        );
+        let added = project
+            .add_svg_overlay(SvgSource::Custom(boxed), 0.0, Some(4.0), SvgLayout::default())
+            .unwrap();
+        assert!(added.warnings.iter().any(|w| w == crate::svg::BOX_NOTE));
+        let out = project.convert_title_text(clip.id, TitleTextForm::Outlines).unwrap();
+        assert!(
+            !out.warnings().iter().any(|w| w == crate::svg::BOX_NOTE),
+            "{:?}",
+            out.warnings()
+        );
+        // Plain artwork says nothing of boxes.
+        let plain = project
+            .add_svg_overlay(SvgSource::Custom(ART.to_string()), 0.0, Some(4.0), SvgLayout::default())
+            .unwrap();
+        assert!(!plain.warnings.iter().any(|w| w == crate::svg::BOX_NOTE));
     }
 
     #[test]

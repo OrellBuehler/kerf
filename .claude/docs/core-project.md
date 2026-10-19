@@ -110,10 +110,12 @@
   `persisted/timelines-v6.json` holds a blurred-fill cut; v6→v7 is the same kind of JSON step for keyed mask and crop numbers
   (`Property` `mask_x`, `mask_y`, `mask_width`, `mask_height`, `mask_feather`, `crop_zoom`, `crop_x`, `crop_y` in a clip's
   channels: variants an older build fails on, and with them the whole timeline); `persisted/timelines-v7.json` holds a cut
-  keying both; v7→v8 is a JSON step for a **new meaning** in the same shape: a template title's `svg` may hold its text as
-  glyph outlines (`<g data-kerf-text="">`, "Text as glyph outlines" below), which an older build draws but splices new values
-  into the hidden text of (its `set_template_values` reports success and nothing visible changes) and saves as a template;
-  `persisted/timelines-v8.json` holds an outlined template title. `persist_tests` pins which steps a file has pending with
+  keying both; v7→v8 is a JSON step for a **new meaning** in the same shape: a title's `svg` (a template's, or custom artwork
+  converted with `convert_title_text`) may hold its text as glyph outlines (`<g data-kerf-text="">`, "Text as glyph
+  outlines" below) and a `<text>` may carry a box only outlines draw ("A text's box" below); an older build draws such a
+  title but splices new values into the hidden text (its `set_template_values` reports success and nothing visible
+  changes), saves it as a template and draws a box unwrapped; `persisted/timelines-v8.json` holds an outlined template
+  title. The schema is at **v8** (`SCHEMA_VERSION`). `persist_tests` pins which steps a file has pending with
   `store::pending_steps` (a legacy file that has every column: `[4, 5, 6, 7]`). A step's `needed_to_read` says whether a build that
   cannot write must still refuse a file lacking what it adds: true for the v1, v2 and v4 columns (the reads
   name them), false for the `fonts` table (reads tolerate its absence), so a write-protected v2 project
@@ -518,15 +520,25 @@
     scaled by `width / widest` (up to four passes: the optical size moves with the size), never up. A text kept as text with a
     box says it does not wrap / shrink. `svg::set_text_box(svg, element, &TextBox {width, fit})` writes it on the `<text>`
     with that id (unique; a `<tspan>` or anything else is refused; a width finite, positive, at most `MAX_BOX_WIDTH`): its old
-    `inline-size` / fit attributes and an `inline-size` in its `style` (which would win) are cut, the new ones written at the
-    end of its start tag, nothing else moves; `text_box_of` reads one back. `Project::title_text_inputs(id)` (floating or a
-    title clip, any title but a **preset**, which is drawn again from its parameters) → `TitleTextInputs::text_box(element,
-    &box)` (text form → `set_text_box` → sanitise → outline with `snapshot_for` the new title) or `::convert(TitleTextForm)`
-    (`outlines`: each text that stays text is a warning, `SvgDoc::outlined_counted` / `Outlined::kept` saying why, and none
-    at all an error; `text`: the text form, refused for a template title, whose values re-outline it, and for one with no
-    outlines) → `Project::set_title_text_parsed(id, prepared, label)`, the "try again" rule of template values, a template's
-    `values` read back. The ops are the user's to make on custom titles and templates alike; a box survives a values change
-    (it is in the text form the values are spliced into) and a save as a template (`build_template` restores, keeping it).
+    `inline-size` / fit attributes and any `inline-size` in its `style` are cut, the width written **last in its `style`,
+    `!important`** (`inline-size:Wpx !important`: it beats the attribute and any `<style>` rule; no box where a sheet mentions
+    `inline-size` is `auto !important`), the fit mark at the end of its start tag, nothing else moves; `text_box_of` reads it
+    back as the cascade weighs it (the `style`'s last `inline-size` first, `auto` none, else the attribute; a sheet is not
+    read). `Project::title_text_inputs(id)` (floating or a title clip, any title but a **preset**, which is drawn again from its
+    parameters; a template's stored controls checked with `validate_controls_shape`) → `TitleTextInputs::text_box(element,
+    &box)` (text form → `set_text_box` → sanitise → outline with `snapshot_for` the new title; a box for a text that stays
+    text — in `Outlined::kept` — is an error saying why, taking one away is not) or `::convert(TitleTextForm)` (`outlines`:
+    each text that stays text is a warning, `SvgDoc::outlined_counted` / `Outlined::kept` saying why, and none at all an
+    error; `text`: the text form, refused for a template title, whose values re-outline it, and for one with no outlines),
+    which read a template's `values` back off the new artwork there, outside the lock → `Project::set_title_text_parsed(id,
+    prepared, label)`, the "try again" rule of template values. The ops are the user's to make on custom titles and templates
+    alike; a box survives a values change (it is in the text form the values are spliced into) and a save as a template
+    (`build_template` restores, keeping it). **Custom artwork with a box and no outlines** (`update_svg_overlay` /
+    `update_title_clip` / `add_*` with new `svg`) is drawn with its fonts: `SvgDoc::parse` adds `svg::BOX_NOTE` to its warnings,
+    which `outlined_counted` drops (what it outlines draws its box; a kept boxed text has its own warning) and
+    `Template::validate` drops (a template is outlined whenever it is applied). A **template's poster** is drawn from the
+    outlined title (`render_poster` outlines with the template's fonts), so a box shows on it, on save and on import alike.
+    `user_space_paint` follows an `href` only within its family (gradient to gradient, pattern to pattern), as usvg does.
   * **Lock-free shape.** The zip, the fonts, the sanitiser and the poster are all outside the project lock.
     Apply: `TemplateLibrary::get(id)` (or any `Template`) → `Template::prepare(&values)` →
     `PreparedTemplate` → under the lock `Project::apply_template_parsed(prepared, start, end?, SvgLayout)`.

@@ -17,15 +17,33 @@ describe('a text box', () => {
 			'<text id="t" x="5" y="50" inline-size="80" data-kerf-fit="shrink" style="fill:red; inline-size: 9px;opacity:.5">Hi</text>'
 		);
 		const wrapped = withTextBox(src, 't', { width: 120.5, fit: 'wrap' });
-		expect(wrapped).toBe(doc('<text id="t" x="5" y="50" style="fill:red;opacity:.5" inline-size="120.5">Hi</text>'));
+		expect(wrapped).toBe(
+			doc('<text id="t" x="5" y="50" style="fill:red;opacity:.5;inline-size:120.5px !important">Hi</text>')
+		);
 		const shrunk = withTextBox(wrapped, 't', { width: 300, fit: 'shrink' });
-		expect(shrunk).toContain('inline-size="300" data-kerf-fit="shrink">Hi');
+		expect(shrunk).toContain('style="fill:red;opacity:.5;inline-size:300px !important" data-kerf-fit="shrink">Hi');
 		expect(titleTexts(shrunk)).toEqual([{ id: 't', outlined: false, box: { width: 300, fit: 'shrink' } }]);
 		const none = withTextBox(shrunk, 't', { width: null, fit: 'shrink' });
 		expect(none).toBe(doc('<text id="t" x="5" y="50" style="fill:red;opacity:.5">Hi</text>'));
-		expect(withTextBox(doc('<text id="t" x="5" y="50"/>'), 't', { width: 10, fit: 'wrap' })).toBe(
-			doc('<text id="t" x="5" y="50" inline-size="10"/>')
+		const empty = withTextBox(doc('<text id="t" x="5" y="50"/>'), 't', { width: 10, fit: 'wrap' });
+		expect(empty).toBe(doc('<text id="t" x="5" y="50" style="inline-size:10px !important"/>'));
+		expect(withTextBox(empty, 't', { width: null, fit: 'wrap' })).toBe(doc('<text id="t" x="5" y="50"/>'));
+	});
+
+	test('lists no text whose id another element has', () => {
+		const src = doc('<text id="a">a</text><text id="d">b</text><rect id="d"/><text id="c">c</text>');
+		expect(titleTexts(src).map((t) => t.id)).toEqual(['a', 'c']);
+	});
+
+	test('reads the style first, keeps a quoted semicolon or quote whole, and beats a sheet', () => {
+		expect(titleTexts(doc('<text id="t" inline-size="80" style="inline-size: 30px">a</text>'))[0].box.width).toBe(30);
+		expect(titleTexts(doc('<text id="t" inline-size="80" style="inline-size:auto">a</text>'))[0].box.width).toBeNull();
+		const quoted = doc(`<text id="t" style="font-family:'A;B'; inline-size:9px">a</text>`);
+		expect(withTextBox(quoted, 't', { width: 20, fit: 'wrap' })).toBe(
+			doc(`<text id="t" style="font-family:'A;B';inline-size:20px !important">a</text>`)
 		);
+		const sheet = doc('<style>.n{inline-size:60px}</style><text id="t" class="n">a</text>');
+		expect(withTextBox(sheet, 't', { width: null, fit: 'wrap' })).toContain('style="inline-size:auto !important"');
 	});
 
 	test('goes on one text, by its id, of a sane width', () => {
@@ -60,7 +78,7 @@ describe('the harness', () => {
 	test('writes a box and says it cannot set outlines', () => {
 		const tl = timeline(overlay(doc('<text id="t">Hi</text>')));
 		const { overlay: o, warnings } = setTitleTextBoxIn(tl, 'o', 't', { width: 90, fit: 'shrink' });
-		expect(o?.svg).toContain('inline-size="90" data-kerf-fit="shrink"');
+		expect(o?.svg).toContain('style="inline-size:90px !important" data-kerf-fit="shrink"');
 		expect(warnings).toEqual([HARNESS_NOTE]);
 		expect(convertTitleTextIn(tl, 'o', 'outlines').warnings).toEqual([HARNESS_NOTE]);
 	});

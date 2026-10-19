@@ -286,7 +286,9 @@ the title clip; `save_template` and `preview_svg_overlay` take a title clip's id
 (the clips are also counted in their tracks); `get_timeline_state` elides a large title clip's source like a floating one's. The
 instructions say a title can be a clip on a track that takes a transition (a dip to white into an end card).
 **A title's text over MCP** (`mcp/templates.rs`). **`set_title_text_box { title_id, element, width?, fit? }`** gives a `<text>`
-of any title but a preset a box (`width` in the title's units, omitted to take it away; `fit` `wrap` | `shrink`) and
+of any title but a preset a box (`width` in the title's units, omitted to take it away; `fit` `wrap` | `shrink`; a box for a
+text that cannot be an outline is an error saying why, and its description says new `svg` through `update_svg_overlay` /
+`update_title_clip` draws text with its fonts again, which `svg::BOX_NOTE` in their warnings repeats) and
 **`convert_title_text { title_id, to: "outlines" | "text" }`** draws its text as glyph outlines or with its fonts (a template
 title cannot go back to text). Both take `title_text_inputs` and prepare on `blocking` before the lock, then `edit()` runs
 `set_title_text_parsed`, answering the overlay or the title clip (`title_text_outcome`, which `set_template_values` shares);

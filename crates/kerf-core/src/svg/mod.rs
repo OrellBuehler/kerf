@@ -49,6 +49,17 @@ pub use outline::restore_text;
 pub use presets::{check_params, preset_infos, render_preset, SvgPresetInfo, SvgPresetParamInfo, DEFAULT_FRAME};
 pub use text_box::{set_text_box, text_box_of, TextBox, TextFit, MAX_BOX_WIDTH};
 
+/// What [`SvgDoc::parse`] says of artwork with a text box (`inline-size`, `data-kerf-fit`) and no outlines:
+/// custom artwork is drawn as written, so its box is not honoured until its text is converted.
+pub const BOX_NOTE: &str = "a text box (inline-size, data-kerf-fit) is drawn only when the title's text is glyph outlines: \
+                            this artwork draws its text with its fonts, running on, until its text is converted to outlines \
+                            (convert_title_text, or Draw as outlines in the Inspector)";
+
+/// Whether sanitised `src` gives a text a box but holds no outlines.
+fn has_unoutlined_box(src: &str) -> bool {
+    (src.contains("inline-size") || src.contains(outline::FIT_MARK)) && !src.contains(outline::GLYPHS_MARK)
+}
+
 /// Whether sanitised source could move at all: whether it holds an animation element (`animate`,
 /// `animateColor`, `animateTransform`, `animateMotion` or `set`, with or without a prefix). A cheap
 /// text test that needs no parse, and that errs on the side of "yes" (a comment that says
@@ -207,6 +218,9 @@ impl SvgDoc {
         let clean = sanitize::sanitize(src)?;
         let mut warnings = clean.warnings;
         let text = clean.text;
+        if has_unoutlined_box(&text) {
+            warnings.push(BOX_NOTE.to_string());
+        }
         let doc = Document::parse_with_options(&text, xml_options()).map_err(|e| invalid(format!("not valid XML: {e}")))?;
         if !has_size(&doc.root_element()) {
             return Err(invalid(
@@ -308,8 +322,10 @@ impl SvgDoc {
         Ok(self.outlined_counted(db)?.0)
     }
 
-    /// [`SvgDoc::outlined`], with how many texts are outlines now and each that stays text and why.
-    pub(crate) fn outlined_counted(self, db: &fontdb::Database) -> Result<(SvgDoc, usize, Vec<String>)> {
+    /// [`SvgDoc::outlined`], with how many texts are outlines now and each that stays text and why. The
+    /// generic [`BOX_NOTE`] goes: what is outlined draws its box, and a boxed text that is not says so itself.
+    pub(crate) fn outlined_counted(mut self, db: &fontdb::Database) -> Result<(SvgDoc, usize, Vec<String>)> {
+        self.warnings.retain(|w| w != BOX_NOTE);
         let out = outline::outline_text(&self.src, db)?;
         let (mut doc, count) = match out.count {
             0 => (self, 0),

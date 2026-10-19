@@ -38,8 +38,8 @@ pub struct TextBox {
 pub const MAX_BOX_WIDTH: f64 = 100_000.0;
 
 /// `svg` (a title in its text form) with the `<text>` whose `id` is `element` given `text_box`: its
-/// `inline-size` (an attribute; one in its `style` is taken out, as it would win) and its fit, or neither.
-/// Nothing else of the document moves.
+/// `inline-size`, written last in its `style` and important (an `inline-size` attribute, and one already in
+/// its `style`, are taken out), and its fit mark, or neither. Nothing else of the document moves.
 pub fn set_text_box(svg: &str, element: &str, text_box: &TextBox) -> Result<String> {
     if let Some(w) = text_box.width {
         if !(w.is_finite() && w > 0.0 && w <= MAX_BOX_WIDTH) {
@@ -69,45 +69,75 @@ pub fn set_text_box(svg: &str, element: &str, text_box: &TextBox) -> Result<Stri
             node.tag_name().name()
         )));
     }
+    // The width goes in the `style` attribute, marked important: it beats a presentation attribute and any
+    // `<style>` rule, as the box the user set should. No box where a rule may still give one is `auto`.
+    let declaration = match text_box.width {
+        Some(w) => Some(format!("inline-size:{}px !important", number(w))),
+        None if sheet_names_inline_size(&doc) => Some("inline-size:auto !important".to_string()),
+        None => None,
+    };
+    let cut_whole = |range: std::ops::Range<usize>| {
+        let start = svg[..range.start]
+            .rfind(|c: char| !c.is_ascii_whitespace())
+            .map_or(range.start, |i| i + 1);
+        (start..range.end, String::new())
+    };
     let mut cuts = Vec::new();
+    let mut styled = false;
     for attr in node.attributes().filter(|a| a.namespace().is_none()) {
         let range = attr.range();
         match attr.name() {
-            "inline-size" | FIT_MARK => {
-                let start = svg[..range.start]
-                    .rfind(|c: char| !c.is_ascii_whitespace())
-                    .map_or(range.start, |i| i + 1);
-                cuts.push((start..range.end, String::new()));
-            }
+            "inline-size" | FIT_MARK => cuts.push(cut_whole(range)),
             "style" => {
-                let kept = without_declaration(attr.value(), "inline-size");
-                if kept != attr.value() {
+                styled = true;
+                let mut kept: Vec<&str> = declarations(attr.value())
+                    .into_iter()
+                    .filter(|d| !is_property(d, "inline-size"))
+                    .collect();
+                kept.extend(declaration.as_deref());
+                let value = kept.join(";");
+                if value.trim().is_empty() {
+                    cuts.push(cut_whole(range));
+                } else if value != attr.value() {
                     if let Some((vr, q)) = value_range(svg, range) {
-                        cuts.push((vr, escape_attr(&kept, q)));
+                        cuts.push((vr, escape_attr(&value, q)));
                     }
                 }
             }
             _ => {}
         }
     }
-    if let Some(w) = text_box.width {
+    let mut add = String::new();
+    if let (false, Some(d)) = (styled, &declaration) {
+        add.push_str(&format!(" style=\"{}\"", escape_attr(d, '"')));
+    }
+    if text_box.width.is_some() && text_box.fit == TextFit::Shrink {
+        add.push_str(&format!(" {FIT_MARK}=\"shrink\""));
+    }
+    if !add.is_empty() {
         let open_end = start_tag_end(svg, node.range().start).ok_or_else(|| invalid("the text cannot be read"))?;
         let at = if svg[..open_end].ends_with("/>") {
             open_end - 2
         } else {
             open_end - 1
         };
-        let mut add = format!(" inline-size=\"{}\"", number(w));
-        if text_box.fit == TextFit::Shrink {
-            add.push_str(&format!(" {FIT_MARK}=\"shrink\""));
-        }
         cuts.push((at..at, add));
     }
     Ok(apply(svg, cuts))
 }
 
-/// The box `svg`'s `<text>` named `element` has, as [`set_text_box`] writes it (an `inline-size` attribute,
-/// else one in its `style`). `None` for no such text.
+/// Whether a `<style>` sheet of the document mentions `inline-size` (a rule could give a text a box).
+fn sheet_names_inline_size(doc: &Document) -> bool {
+    doc.descendants().filter(|n| n.has_tag_name((SVG_NS, "style"))).any(|n| {
+        n.descendants()
+            .filter_map(|t| t.text())
+            .any(|t| t.to_ascii_lowercase().contains("inline-size"))
+    })
+}
+
+/// The box `svg`'s `<text>` named `element` has, read as the renderer weighs it: an `inline-size` in its
+/// `style` first (the last one, `auto` being none), else the attribute. A `<style>` rule is not read. `None`
+/// for no such text.
 pub fn text_box_of(svg: &str, element: &str) -> Option<TextBox> {
     if svg.len() > MAX_BYTES || nesting_exceeds(svg, MAX_DEPTH) {
         return None;
@@ -116,15 +146,16 @@ pub fn text_box_of(svg: &str, element: &str) -> Option<TextBox> {
     let node: Node = doc
         .descendants()
         .find(|n| n.is_element() && n.has_tag_name((SVG_NS, "text")) && plain_attribute(n, "id") == Some(element))?;
-    let from_style = || {
-        plain_attribute(&node, "style")?
-            .split(';')
-            .filter_map(|d| d.split_once(':'))
-            .find(|(p, _)| p.trim().eq_ignore_ascii_case("inline-size"))
-            .map(|(_, v)| v.trim())
-    };
-    let width = plain_attribute(&node, "inline-size")
-        .or_else(from_style)
+    let from_style = plain_attribute(&node, "style").and_then(|style| {
+        declarations(style)
+            .into_iter()
+            .rev()
+            .find(|d| is_property(d, "inline-size"))
+            .and_then(|d| d.split_once(':'))
+            .map(|(_, v)| v.trim().trim_end_matches("!important").trim())
+    });
+    let width = from_style
+        .or_else(|| plain_attribute(&node, "inline-size"))
         .and_then(|v| v.trim().trim_end_matches("px").trim().parse::<f64>().ok())
         .filter(|w| w.is_finite() && *w > 0.0);
     let fit = match plain_attribute(&node, FIT_MARK).map(str::trim) {
@@ -140,12 +171,17 @@ fn number(v: f64) -> String {
     s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
-/// A declaration list with every declaration of `prop` left out; the rest as written.
-fn without_declaration(body: &str, prop: &str) -> String {
+/// Whether the declaration `d` (`prop: value`) sets `prop`.
+fn is_property(d: &str, prop: &str) -> bool {
+    d.split_once(':').is_some_and(|(p, _)| p.trim().eq_ignore_ascii_case(prop))
+}
+
+/// A declaration list's declarations as written, split at the `;` outside quotes, comments and
+/// parentheses; empty ones left out.
+fn declarations(body: &str) -> Vec<&str> {
     let b = body.as_bytes();
-    let mut kept: Vec<&str> = Vec::new();
+    let mut out: Vec<&str> = Vec::new();
     let (mut start, mut i, mut paren) = (0, 0, 0usize);
-    let keep = |d: &str| d.split_once(':').is_none_or(|(p, _)| !p.trim().eq_ignore_ascii_case(prop));
     while i < b.len() {
         if starts_quoted(b, i) {
             i = skip_quoted(b, i);
@@ -155,20 +191,16 @@ fn without_declaration(body: &str, prop: &str) -> String {
             b'(' => paren += 1,
             b')' => paren = paren.saturating_sub(1),
             b';' if paren == 0 => {
-                if keep(&body[start..i]) {
-                    kept.push(&body[start..i]);
-                }
+                out.push(&body[start..i]);
                 start = i + 1;
             }
             _ => {}
         }
         i += 1;
     }
-    let tail = &body[start.min(body.len())..];
-    if !tail.trim().is_empty() && keep(tail) {
-        kept.push(tail);
-    }
-    kept.join(";")
+    out.push(&body[start.min(body.len())..]);
+    out.retain(|d| !d.trim().is_empty());
+    out
 }
 
 #[cfg(test)]
@@ -191,11 +223,14 @@ mod tests {
         let out = set_text_box(&src, "t", &boxed(120.5, TextFit::Wrap)).unwrap();
         assert_eq!(
             out,
-            doc(r#"<text id="t" x="5" y="50" style="fill:red;opacity:.5" inline-size="120.5">Hi</text>"#)
+            doc(r#"<text id="t" x="5" y="50" style="fill:red;opacity:.5;inline-size:120.5px !important">Hi</text>"#)
         );
         assert_eq!(text_box_of(&out, "t"), Some(boxed(120.5, TextFit::Wrap)));
         let shrunk = set_text_box(&out, "t", &boxed(300.0, TextFit::Shrink)).unwrap();
-        assert!(shrunk.contains(r#"inline-size="300" data-kerf-fit="shrink">Hi"#), "{shrunk}");
+        assert!(
+            shrunk.contains(r#"style="fill:red;opacity:.5;inline-size:300px !important" data-kerf-fit="shrink">Hi"#),
+            "{shrunk}"
+        );
         assert_eq!(text_box_of(&shrunk, "t"), Some(boxed(300.0, TextFit::Shrink)));
         let none = set_text_box(&shrunk, "t", &TextBox::default()).unwrap();
         assert_eq!(
@@ -204,7 +239,35 @@ mod tests {
         );
         assert_eq!(text_box_of(&none, "t"), Some(TextBox::default()));
         let empty = set_text_box(&doc(r#"<text id="t" x="5" y="50"/>"#), "t", &boxed(10.0, TextFit::Wrap)).unwrap();
-        assert_eq!(empty, doc(r#"<text id="t" x="5" y="50" inline-size="10"/>"#));
+        assert_eq!(
+            empty,
+            doc(r#"<text id="t" x="5" y="50" style="inline-size:10px !important"/>"#)
+        );
+        let bare = set_text_box(&empty, "t", &TextBox::default()).unwrap();
+        assert_eq!(bare, doc(r#"<text id="t" x="5" y="50"/>"#));
+        // The style is read first, as the renderer weighs it.
+        let both = doc(r#"<text id="t" inline-size="80" style="inline-size: 30px">a</text>"#);
+        assert_eq!(text_box_of(&both, "t"), Some(boxed(30.0, TextFit::Wrap)));
+        let auto = doc(r#"<text id="t" inline-size="80" style="inline-size:auto">a</text>"#);
+        assert_eq!(text_box_of(&auto, "t"), Some(TextBox::default()));
+    }
+
+    #[test]
+    fn the_box_written_beats_a_style_rule() {
+        let sheet = r#"<style>.n{inline-size:60px}</style>"#;
+        let text = r#"<text id="t" class="n" x="5" y="50" font-family="Geist" font-size="20">one two three four five six</text>"#;
+        let glyphs = |svg: &str| {
+            let out = super::super::outline::outline_text(svg, &crate::fonts::svg_fontdb()).unwrap();
+            let at = out.svg.find("<g data-kerf-glyphs").expect("outlined");
+            out.svg[at..].to_string()
+        };
+        let set = set_text_box(&doc(&format!("{sheet}{text}")), "t", &boxed(300.0, TextFit::Wrap)).unwrap();
+        let want = doc(&text.replace(r#" class="n""#, r#" inline-size="300""#));
+        assert_eq!(glyphs(&set), glyphs(&want));
+        // No box, with a rule that would give it one: `auto`.
+        let none = set_text_box(&doc(&format!("{sheet}{text}")), "t", &TextBox::default()).unwrap();
+        assert!(none.contains("inline-size:auto !important"), "{none}");
+        assert_eq!(glyphs(&none), glyphs(&doc(&text.replace(r#" class="n""#, ""))));
     }
 
     #[test]
@@ -222,8 +285,8 @@ mod tests {
     #[test]
     fn a_declaration_with_a_quoted_semicolon_stays_whole() {
         assert_eq!(
-            without_declaration(r#"font-family:"a;b"; inline-size:3px ;fill:url(#g)"#, "inline-size"),
-            r#"font-family:"a;b";fill:url(#g)"#
+            declarations(r#"font-family:"a;b"; inline-size:3px ;fill:url(#g;x);/* ; */"#),
+            [r#"font-family:"a;b""#, " inline-size:3px ", "fill:url(#g;x)", "/* ; */"]
         );
     }
 }

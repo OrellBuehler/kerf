@@ -666,8 +666,14 @@ fn user_space_paint(node: Node, value: &str) -> bool {
             units[i] = units[i].or_else(|| at.attribute(*name).map(str::trim));
         }
         let href = at.attribute("href").or_else(|| at.attribute((XLINK_NS, "href")));
+        // usvg follows a gradient's link to another gradient only, a pattern's to a pattern only.
+        let family = |n: &Node| match n.tag_name().name() {
+            "linearGradient" | "radialGradient" => Some(true),
+            "pattern" => Some(false),
+            _ => None,
+        };
         match href.and_then(|h| h.trim().strip_prefix('#')).and_then(find) {
-            Some(next) if next != at => at = next,
+            Some(next) if next != at && family(&next) == family(&at) => at = next,
             _ => break,
         }
     }
@@ -1943,6 +1949,8 @@ mod tests {
             r##"<linearGradient id="g"><stop offset="0" stop-color="red"/></linearGradient><text x="5" y="50" fill="url(#g)">a</text>"##,
             r##"<linearGradient id="b" gradientUnits="objectBoundingBox"/><linearGradient id="g" href="#b"/><text x="5" y="50" fill="url(#g)">a</text>"##,
             r##"<pattern id="p" width="1" height="1"/><text x="5" y="50" fill="url(#p)">a</text>"##,
+            // A link across families is not followed: the gradient's own default (the bounding box) holds.
+            r##"<pattern id="u" gradientUnits="userSpaceOnUse"/><linearGradient id="g" href="#u"/><text x="5" y="50" fill="url(#g)">a</text>"##,
             r##"<pattern id="p" patternUnits="userSpaceOnUse" patternContentUnits="objectBoundingBox" width="9" height="9"/><text x="5" y="50" fill="url(#p)">a</text>"##,
             r##"<filter id="f"/><text x="5" y="50" fill="url(#f)">a</text>"##,
         ] {

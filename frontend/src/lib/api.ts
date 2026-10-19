@@ -3508,7 +3508,7 @@ export async function setTemplateValues(overlayId: string, values: Record<string
 
 /** Give the `<text>` `element` of a title (floating or on a track, not a preset) a box: a width its lines wrap to, or
  *  that it shrinks to fit on one line (`width: null` takes it away). A box is drawn only by glyph outlines, so the
- *  title's text is set as outlines again; a text that stays text says so in the warnings. One edit. */
+ *  title's text is set as outlines again; a box for a text that cannot be one rejects with why. One edit. */
 export async function setTitleTextBox(titleId: string, element: string, textBox: TextBox): Promise<TemplateEdit> {
 	if (!inTauri()) {
 		const { overlay, clip, warnings } = setTitleTextBoxIn(devTimeline, titleId, element, textBox);

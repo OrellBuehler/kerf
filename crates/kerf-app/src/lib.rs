@@ -2969,8 +2969,8 @@ fn title_text_edit(
 
 /// Give the `<text>` whose id is `element` in the title `title_id` (floating or on a track, not a preset)
 /// a box: a width its lines wrap to or it shrinks to fit (`text_box.width` `null` takes it away). A box is
-/// drawn only by glyph outlines, so the title's text is set as outlines again; a text that stays text
-/// says so in the warnings.
+/// drawn only by glyph outlines, so the title's text is set as outlines again; a box for a text that
+/// cannot be one is an error saying why.
 #[tauri::command]
 async fn set_title_text_box(
     state: State<'_, AppState>,
