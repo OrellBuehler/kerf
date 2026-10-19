@@ -95,10 +95,10 @@ pub use model::{
     SectionSpan, SkippedChange, SkippedDetach, SourceLimits, SplitSide, StagedAssetChange, StagedEdit, StreamInfo, StreamKind,
     Subsampling, SubsetMerge, SvgOverlay, SvgOverlayPatch, SvgPreset, SvgPresetKind, SvgPresetParams, Task, TaskStatus,
     TextKeyframe, TextOverlay, TimeRange, Timeline, TimelineDiff, TitleClip, Track, TrackLevels, TranscriptSegment, Transform,
-    Transition, TransitionKind, VideoEffect, Voiceover, Wheel, Wheels, Word, ADJACENT_EPS, DEFAULT_MAX_TEMPO_CHANGE,
-    GENERATED_ASSET, LEVELS_TARGET_LUFS, LEVELS_TRUE_PEAK_CEILING_DBTP, MASTER_DEFAULT_CEILING_DB, MASTER_MAX_VOLUME,
-    MASTER_MIN_CEILING_DB, MAX_BPM, MAX_CHANNEL_VOLUME, MAX_SEED, MAX_SPEED, MAX_SVG_OVERLAYS, MAX_SVG_SECONDS, MAX_TITLE_CLIPS,
-    MIN_BPM, MIN_EDIT_CLIP, MIN_SPEED, RELEASE_TAIL_S,
+    TransformPatch, Transition, TransitionKind, VideoEffect, Voiceover, Wheel, Wheels, Word, ADJACENT_EPS,
+    DEFAULT_MAX_TEMPO_CHANGE, GENERATED_ASSET, LEVELS_TARGET_LUFS, LEVELS_TRUE_PEAK_CEILING_DBTP, MASTER_DEFAULT_CEILING_DB,
+    MASTER_MAX_VOLUME, MASTER_MIN_CEILING_DB, MAX_BPM, MAX_CHANNEL_VOLUME, MAX_SEED, MAX_SPEED, MAX_SVG_OVERLAYS,
+    MAX_SVG_SECONDS, MAX_TITLE_CLIPS, MIN_BPM, MIN_EDIT_CLIP, MIN_SPEED, RELEASE_TAIL_S,
 };
 pub use plan_caps::{DipWhy, EffectKinds, GpuCaps, LayerRef, Unsupported};
 pub use plan_epoch::{bump_plan_epoch, plan_epoch};

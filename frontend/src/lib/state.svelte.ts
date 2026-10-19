@@ -122,6 +122,7 @@ import {
 	setRippleMode,
 	setSpeed,
 	setTransform,
+	setTransformAt,
 	setTransition,
 	setVolume,
 	splitClip,
@@ -1207,6 +1208,9 @@ class EditorState {
 	}
 	setSpeed(clipId: string, speed: number) {
 		return this.#apply(() => setSpeed(clipId, speed));
+	}
+	setTransformAt(clipId: string, time: number, patch: Partial<Transform>) {
+		return this.#apply(() => setTransformAt(clipId, time, patch));
 	}
 	setTransform(clipId: string, patch: Partial<Transform>) {
 		return this.#apply(() => setTransform(clipId, patch));

@@ -123,6 +123,9 @@ sheet's gestures; a number twice or none at all is refused; each track is `Prope
 `deny_unknown_fields`, since the model's `PropertyTrack` reads a misspelt `keys` as none and would make the number static), `copy_keyframes` (`from_clip_id`, `to_clip_id`,
 `props?`, `offset?`) gives another clip the same
 animation, and `set_keyframe_easing` takes an optional `prop`; the server `instructions` mention them.
+`set_transform_at` (`clip_id`, `time`, any transform field) poses a clip at a moment of it in one edit without the
+agent first working out what is animated: a keyed number gets a key at `time` (bundle or own track, whichever drives
+it), the rest and the crop are static (`Clip::pose_transform`); it is what the Preview's handles write.
 **Edit modes over MCP**: `roll_edit` (`clip_a`
 the earlier clip, `clip_b`, `delta` seconds), `slip_clip` (`delta` in *source*
 seconds, positive = later in its own footage) and `slide_clip` answer the
@@ -519,7 +522,7 @@ Every tool, by purpose (a test pins that this list names each registered tool, a
   `remove_track`, `get_ripple_mode`, `set_ripple_mode`.
 - **Linked picture and sound**: `extract_audio`, `add_asset_audio`, `detach_audio`, `detach_audio_clips`, `reattach_audio`,
   `reattach_audio_clips`, `link_clips`, `unlink_clips`.
-- **Clip look and sound**: `set_volume`, `set_fade`, `set_speed`, `set_transform`, `set_color`, `set_transition`,
+- **Clip look and sound**: `set_volume`, `set_fade`, `set_speed`, `set_transform`, `set_transform_at`, `set_color`, `set_transition`,
   `set_grade`, `set_video_effects`, `set_audio_effects`, `set_mask`, `set_clip_enabled`.
 - **Keyframes and 360**: `set_keyframes`, `add_keyframe`, `set_keyframe_easing`, `set_property_keyframes`,
   `set_property_tracks`, `copy_keyframes`,

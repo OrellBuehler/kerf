@@ -147,6 +147,7 @@ import {
 	channelOf,
 	clearTransformAnimation,
 	insertPropertyKey,
+	poseTransform,
 	pruneChannels,
 	propertyKeysProblem,
 	propertyKeysShifted,
@@ -2817,6 +2818,39 @@ export async function setTransform(clipId: string, patch: Partial<Transform>): P
 	}
 	return invoke<Timeline>('set_transform', {
 		clipId,
+		scale: patch.scale,
+		posX: patch.pos_x,
+		posY: patch.pos_y,
+		rotation: patch.rotation,
+		opacity: patch.opacity,
+		cropLeft: patch.crop_left,
+		cropRight: patch.crop_right,
+		cropTop: patch.crop_top,
+		cropBottom: patch.crop_bottom
+	});
+}
+
+/** Set a clip's transform as it should look `time` seconds into the clip, as one revision: a keyed
+ *  number gets a key there, every other number (the crop always) its static value. */
+export async function setTransformAt(clipId: string, time: number, patch: Partial<Transform>): Promise<Timeline> {
+	if (!inTauri()) {
+		if (!Number.isFinite(time) || time < 0) throw new Error('time must be >= 0');
+		const found = locate(devTimeline, clipId);
+		if (!found) throw new Error(`clip ${clipId} not found`);
+		const clip = found[0].clips[found[1]];
+		const before = structuredClone(clip);
+		poseTransform(clip, time, patch);
+		const t = clip.transform!;
+		if (t.crop_left + t.crop_right >= 1 || t.crop_top + t.crop_bottom >= 1) {
+			found[0].clips[found[1]] = before;
+			throw new Error('crop removes the entire frame');
+		}
+		recordDev('Set transform');
+		return snapshot();
+	}
+	return invoke<Timeline>('set_transform_at', {
+		clipId,
+		time,
 		scale: patch.scale,
 		posX: patch.pos_x,
 		posY: patch.pos_y,
