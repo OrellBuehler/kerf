@@ -661,6 +661,25 @@ fn splice_caps(args: &mut Vec<String>, threads: usize, capped: bool) {
     args.splice(0..0, head);
 }
 
+/// [`limit_args`] for one run that writes several files (`sinks`: the argv index of each
+/// output path). The decode is capped once at the front, as ever; the encoders run side by
+/// side in the one process, so each output's `-threads` is its share of the budget
+/// ([`shared_threads`]), written just before its sink. A no-op at 100%, like [`limit_args`].
+pub fn limit_outputs_args(args: &mut Vec<String>, threads: usize, sinks: &[usize]) {
+    let head = head_flags(threads);
+    if head.is_empty() {
+        return;
+    }
+    let each = shared_threads(threads, sinks.len()).to_string();
+    let mut sinks = sinks.to_vec();
+    sinks.sort_unstable();
+    let len = args.len();
+    for &sink in sinks.iter().rev().filter(|&&s| s < len) {
+        args.splice(sink..sink, ["-threads".to_string(), each.clone()]);
+    }
+    args.splice(0..0, head);
+}
+
 /// The threads one of `share` processes running side by side may use: the
 /// budget's threads divided among them, at least one each.
 pub fn shared_threads(budget: usize, share: usize) -> usize {
@@ -879,6 +898,39 @@ mod tests {
         // The encoder cap sits in the output group: after the last input,
         // immediately before the sink.
         assert_eq!(&args[args.len() - 3..], &["-threads", "1", "out.mp4"]);
+        set_cpu_percent(restore);
+    }
+
+    #[test]
+    fn a_run_writing_several_files_shares_the_encoders_threads() {
+        let _serial = exclusive();
+        let restore = cpu_percent();
+        set_cpu_percent(100);
+        let original: Vec<String> = ["-i", "in.mp4", "-map", "[a]", "a.mp4", "-map", "[b]", "b.mp4"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let mut full = original.clone();
+        limit_outputs_args(&mut full, 1, &[4, 7]);
+        assert_eq!(full, original, "a 100% budget leaves the command line alone");
+        set_cpu_percent(MIN_CPU_PERCENT);
+        let threads = budget_threads();
+        let mut args = original;
+        limit_outputs_args(&mut args, threads, &[4, 7]);
+        if threads < cores() {
+            let n = threads.to_string();
+            let each = shared_threads(threads, 2).to_string();
+            let mut want: Vec<String> = ["-threads", &n, "-filter_threads", &n, "-filter_complex_threads", &n]
+                .map(String::from)
+                .to_vec();
+            want.extend(
+                [
+                    "-i", "in.mp4", "-map", "[a]", "-threads", &each, "a.mp4", "-map", "[b]", "-threads", &each, "b.mp4",
+                ]
+                .map(String::from),
+            );
+            assert_eq!(args, want);
+        }
         set_cpu_percent(restore);
     }
 

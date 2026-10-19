@@ -106,7 +106,8 @@ ripple closed — the transcript-editing primitive), `add_track`, `remove_track`
 width/height to clear it), `remove_clip`, `remove_clips { clipIds, ripple? }`
 (one revision; `ripple: true` is the multi-select ripple delete, via
 `with_ripple`; omitted follows the project's mode), `set_volume`, `set_fade`,
-`set_speed`, `set_transform`, `set_color`, `set_transition`, `set_mask`,
+`set_speed`, `set_transform`, `set_transform_at { clipId, time, …transform fields }` (one revision: a keyed number keyed at
+`time`, the rest and the crop static — what a Preview handle drag writes), `set_color`, `set_transition`, `set_mask`,
 `set_grade { clipId, grade }` (curves / wheels / LUT; a LUT path the clip did not have is checked off the lock,
 `blocking`, so a curve edit on a clip whose LUT went missing still applies),
 `inspect_lut { path }` (→ `LutInfo {path, size, title}`, or why it is not a usable `.cube`),
@@ -114,7 +115,8 @@ width/height to clear it), `remove_clip`, `remove_clips { clipIds, ripple? }`
 `set_audio_effects`, `set_keyframes` / `add_keyframe` / `clear_keyframes`,
 `set_keyframe_easing { clipId, time, easing, prop? }` (the key within a millisecond of `time`; with
 `prop`, that one number's), `set_property_keyframes { clipId, prop, keys }` (one number's own keys; none =
-static) / `copy_keyframes { fromClipId, toClipId, props?, offset? }`,
+static) / `set_property_tracks { clipId, tracks }` (several numbers' keys in one edit — the dope sheet) /
+`copy_keyframes { fromClipId, toClipId, props?, offset? }`,
 `set_reframe` / `clear_reframe` / `set_reframe_keyframes` / `add_reframe_keyframe`,
 `set_asset_projection` (asset-level 360 mark; returns the `Asset`),
 `add_overlay` / `update_overlay` / `remove_overlay` / `set_overlay_keyframes`,
@@ -174,7 +176,7 @@ returns the refreshed `Timeline`; every edit that carries linked clips takes an 
 JPEG added as a base64 `data:` URL (`FilmstripPayload` — the CSP admits `data:` images
 and no `blob:`; core serializes the geometry without pixels) and **no MCP tool**, since
 `skim_asset` is how an agent looks at footage,
-`get_preview_frame` (`hint: "forward"` is a frame of GPU playback) / `set_preview_bounds` / `gpu_preview_status` (the GPU preview, below; GUI-only; its tallies are kept for tests and logs, no command serves them),
+`get_preview_frame` (`hint: "forward"` is a frame of GPU playback, `draft` a gesture's frame) / `set_preview_bounds` / `gpu_preview_status` (the GPU preview, below; GUI-only; its tallies are kept for tests and logs, no command serves them),
 `get_timeline_frame` (the composited still at a time; see Scrubbed frames below),
 `get_scopes` (`kerf_core::scopes` of the export's still at a time, from the originals: the summary and the grids asked
 for; the MCP tool of the same name) / `get_render_bar` (`kerf_core::render_bar` over the working cut, for the GPU
@@ -273,8 +275,11 @@ settings page's commands — the settings file holds `agent_review`, `mcp_enable
 so a cancel lands before the handler's future can be dropped): only if this run touched the file
 (mtime differs from before), so a failure or a cancel before ffmpeg opened the output cannot delete the
 earlier export sitting at that path, and the commands neither remove nor compare anything themselves.
-`export_variants` is one `render_variants` call over every file: the one in flight is removed, the finished
-ones stay, and its `VariantProgress` is the `export-progress` event as it is. With `smart_crop` the shots are
+`export_variants` is one `render_variants` call over every file, in one ffmpeg run unless `single_pass` is
+false (or the encode cannot share one): a stopped single pass removes every file (rejecting with `export cancelled;
+all N files were removed`), one after another the one in
+flight is removed and the finished ones stay; its `VariantProgress` (`together` for a single pass) is the
+`export-progress` event as it is. With `smart_crop` the shots are
 framed first (`sample_framings_with`, `export_cancel` stops it), streaming the same event with `waiting:
 "framing the shots"` so the bar does not sit at 0%. Every output path is checked against the project's own
 files (`Project::output_path_inputs` read under the lock, `check_output_path_with` — which canonicalises and stats — run
@@ -359,8 +364,8 @@ comes back `ForbiddenUrl` and the "Release notes" button silently does nothing.
 `set_delivery_format`, `concatenate`, `remove_silence`, `snap_to_beats`, `smart_crop`, `cancel_smart_crop`;
 *linked A/V* `extract_audio`, `add_asset_audio`, `detach_audio`, `detach_audio_clips`, `reattach_audio`,
 `reattach_audio_clips`, `link_clips`, `unlink_clips`; *clip properties* `set_volume`, `set_fade`, `set_speed`,
-`set_transform`, `set_color`, `set_grade`, `inspect_lut`, `set_transition`, `set_mask`, `set_video_effects`, `set_audio_effects`, `set_keyframes`,
-`add_keyframe`, `set_keyframe_easing`, `set_property_keyframes`, `copy_keyframes`, `clear_keyframes`, `set_reframe`,
+`set_transform`, `set_transform_at`, `set_color`, `set_grade`, `inspect_lut`, `set_transition`, `set_mask`, `set_video_effects`, `set_audio_effects`, `set_keyframes`,
+`add_keyframe`, `set_keyframe_easing`, `set_property_keyframes`, `set_property_tracks`, `copy_keyframes`, `clear_keyframes`, `set_reframe`,
 `clear_reframe`, `set_reframe_keyframes`, `add_reframe_keyframe`; *markers, text, titles, captions* `add_marker`,
 `update_marker`, `remove_marker`, `add_overlay`, `update_overlay`, `remove_overlay`, `set_overlay_keyframes`,
 `add_svg_overlay`, `update_svg_overlay`, `remove_svg_overlay`, `validate_svg`, `list_svg_presets`,
@@ -540,6 +545,34 @@ logged once per new kind (`info`) and as a one-line session summary at teardown;
 software}`. Local and in memory; no MCP tool (nothing here is an edit). `gpu_preview/drive_tests.rs` drives the whole frame path
 without a window (a real device, compositor and frame source over real clips, a screen that records; `#[ignore]`d), and
 `bench_tests.rs` times it (`KERF_BENCH=1`).
+
+**Drag frames and forward scrubs (A3, `gpu_preview/draft.rs`, `pace.rs`).** `get_preview_frame { …, draft }` is the frame of a
+gesture under way: `draft` (`PreviewDraft { clips: [{track_id, clip}], overlays }`) is what the gesture would write on release, each
+clip and title whole, and the frame is planned from the snapshot's timeline with those in place of its own (`PreviewDraft::apply`).
+A draft changes only what a drafted gesture writes, each change through its edit's own checks, so the preview never shows a state
+the edit would refuse: a clip's transform / colour / fades (`Transform::check_values` + `check_crop`, `Color::check_values`,
+`Clip::check_fades`, kerf-core's `model/values.rs`, which `set_transform` / `set_color` / `set_fade` call too), its mask
+(`Mask::normalized`, as `set_mask` stores it), a trim alone (`Clip::check_trim`, `Asset::check_source_out`, `check_own_lanes`) and
+a move (`Timeline::move_clips` itself: a track of its kind, none locked, never onto a clip that stays, never before 0); a title's
+position and size (`TextOverlay::check_values` / `check_span`) or keys (`TextKeyframe::check`, sorted). Anything else (the footage
+above all), a clip or title the cut does not hold, or a cut breaking an invariant it did not already break (`Timeline::check_new`) is
+refused. Nothing is written and the epoch does not move, so the gesture still writes one edit on release. A draft
+frame is planned, refused and drawn like any other (the plan's reasons, the self-test gate, the surface); one the GPU does not draw,
+a draft that is refused, or one whose clips wait on a proxy under Proxy only, is **FFmpeg's JPEG of the cut as it is**, with the
+reason and a last one saying the drag shows once it is let go (with the GPU preview off the preview is that too: no draft is ever
+sent on the JPEG route). Draft frames prime nothing and prefetch nothing (the next frame of a drag is the same time in another
+cut), and their titles' poses go to a small atlas of their own (`render_draft_texture_with`, `gpu.md`). A `forward` request takes no
+draft. `Trend` (`pace.rs`, beside `Pace`) reads the requests' times as they arrive: a drag whose last three requests each stepped
+forward by at most 0.5 s is decoded with `Hint::Forward { fps }` (the canvas's rate) instead of `Hint::Scrub` (`decode_hint`) —
+unless a layer of the plan plays backward, whose frames go the other way through the file: reading ahead would restart its run every
+frame and trip the thrash guard (`Busy`), so that drag stays a scrub. The run reads ahead and the next frame is in the cache when it is asked for; frames are the same either way
+(the run is the router's, proved equal to the one-shot), and a refusal by the thrash guard is that frame's FFmpeg fallback. Tests:
+`draft.rs` (apply and its refusals), `pace.rs` (trend), `a_forward_drag_reads_ahead_unless_a_layer_plays_backward`, and the ignored `drive_tests.rs` cases `a_drag_frame_is_the_picture_the_edit_draws_once_it_is_written`
+(an Inspector drag and a timeline move drawn as a draft are, pixel for pixel, the frames drawn after the edit is written; a vignette
+draft and a stranger's clip go through FFmpeg) and `a_drag_that_walks_forward_reads_ahead_and_draws_the_frames_a_scrub_draws`.
+`bench_tests.rs`' `a_scrub_and_a_gesture_at_1080p` (`KERF_BENCH=1`) times a 1920x1080 canvas of 1080p all-intra clips: on lavapipe
+(debug build, a loaded 4-core box) the decode wait of a forward scrub goes from 5 to 0.1 ms with the read-ahead, and the frame is
+lavapipe's raster (50 to 150 ms for one layer, 600 to 750 ms for a scaled and graded one, whether its numbers change or not); the < 33 ms target is for a real GPU and is unmeasured.
 
 **GPU playback (A4, `gpu_preview/play.rs`; the page's half is in `frontend.md`).** `get_preview_frame { …, hint: "forward", client,
 session }` is a frame of a **play session**: the webview stays the clock (the audio clock, less the output latency, plus the request's own

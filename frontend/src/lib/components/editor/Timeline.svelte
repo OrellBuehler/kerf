@@ -44,7 +44,8 @@
 	import { DELIVERY_PRESETS, fitLabel, presetFor } from '#lib/delivery-formats';
 	import { setDeliveryPreset } from '#lib/menu-commands';
 	import { generatedCount, importMenuEntries, importableAssets } from '#lib/caption-import-ui';
-	import type { Clip, Marker, StreamKind, SvgOverlay, TextOverlay, Track } from '#lib/types';
+	import type { Clip, Marker, PreviewDraft, StreamKind, SvgOverlay, TextOverlay, Track } from '#lib/types';
+	import { moveDraft, trimDraft } from '#lib/preview-draft';
 	import { GENERATED_TITLE_FILL, SVG_TITLE_FILL, packRows, snapSpanStart, snapTime, trimSpan } from '#lib/titles';
 	import { SVG_PRESETS, svgDisplayName, svgTooltip } from '#lib/svg-titles';
 	import { faderToGain, gainLabel, gainToFader, panLabel } from '#lib/mixer';
@@ -540,6 +541,35 @@
 		});
 	});
 
+	/** The cut as the gesture under way would leave it, for the GPU preview to draw while it runs
+	 *  (`preview-draft.ts`): where the ghosts of a move or a nudge are, or the clip of a trim that moves
+	 *  nothing else. A trim that ripples or takes partners along, and the roll / slip / slide tools (whose
+	 *  trim monitor stands in for the frame), leave the frame as the cut is until they are let go. */
+	const gestureDraft = $derived.by((): PreviewDraft | null => {
+		if (dragPlan) return moveDraft(editor.timeline, dragPlan);
+		const d = trimDrag;
+		if (!d?.moved || trimView) return null;
+		const clip = editor.timeline.tracks.find((t) => t.id === d.trackId)?.clips.find((c) => c.id === d.clipId);
+		if (!clip) return null;
+		const limits = trimLimits(d);
+		return trimDraft(editor.timeline, d.clipId, trimEdit(clip, d.edge, clampEdge(d.pos, limits.min, limits.max)));
+	});
+	/** The draft of a gesture that was let go, kept until its edit has landed: the picture does not step
+	 *  back to the cut before it in between. */
+	let landing = $state.raw<PreviewDraft | null>(null);
+	function landWith(draft: PreviewDraft | null, edit: Promise<unknown>) {
+		landing = draft;
+		void edit.finally(() => {
+			if (landing === draft) landing = null;
+		});
+	}
+	/** The timeline's drafts are its own: another gesture's (an Inspector row's) is never cleared by it. */
+	const draftOwner = Symbol('timeline');
+	$effect(() => {
+		ui.setDraft(draftOwner, gestureDraft ?? landing);
+	});
+	$effect(() => () => ui.setDraft(draftOwner, null));
+
 	function onEdgePointerDown(e: PointerEvent, c: Clip, t: Track, edge: 'l' | 'r') {
 		if (e.button !== 0 || ui.tool !== 'pointer') return; // the other tools own the clip body
 		if (t.locked) return;
@@ -634,7 +664,11 @@
 		// `pos` is the gesture's one rounded position (the ghost drew it too); every
 		// field the trim writes comes from it. Alt trims the clip alone (`link: false`).
 		const e = trimEdit(clip, d.edge, pos);
-		void editor.trim(d.clipId, e.source_in, e.source_out, e.timeline_start, alt ? false : undefined).catch(err);
+		const alone = !editor.rippleMode && (alt || linkPartners(editor.timeline, d.clipId).length === 0);
+		landWith(
+			alone ? trimDraft(editor.timeline, d.clipId, e) : null,
+			editor.trim(d.clipId, e.source_in, e.source_out, e.timeline_start, alt ? false : undefined).catch(err)
+		);
 	}
 
 	/** The frame rate gestures are quantized to — the cut's own (`export_format`'s). */
@@ -917,6 +951,7 @@
 		if (trimDrag?.moved) return trimDrag.edge === 'r' ? trimDrag.pos : trimDrag.origEnd;
 		if (titleDrag?.moved) return titleDrag.end;
 		if (tg?.moved && tgPreview) return Math.max(...tgPreview.ghosts.map((g) => g.start + g.dur));
+		if (dropGhost) return dropGhost.start + dropGhost.dur;
 		return null;
 	});
 
@@ -1297,7 +1332,7 @@
 		if (!plan.ok || plan.noop) return;
 		// The group lands as ONE edit: one revision, one undo. Its linked partners are the
 		// backend's to carry (the same Δt on their own tracks), unless Alt left them out.
-		void editor.moveClips(plan.moves, plan.link ? undefined : false).catch(err);
+		landWith(moveDraft(editor.timeline, plan), editor.moveClips(plan.moves, plan.link ? undefined : false).catch(err));
 	}
 
 	// ---- roll / slip / slide: the tools that move a boundary ------------------------
@@ -2890,7 +2925,11 @@
 	     `align-items:flex-start` + `min-height:100%` rather than the default
 	     stretch: stretch would size each column to the scroller's *client*
 	     height, cutting the playhead and grid lines off at the fold while the
-	     tracks kept going. -->
+	     tracks kept going. The vertical scrollbar's gutter is always kept, and the
+	     lanes clip what is drawn past their end: the lane is sized from the
+	     scroller's width, so a scrollbar that came and went with it (a tick a
+	     pixel past the edge, a horizontal bar pushing the tracks past the fold)
+	     would resize the lane, and the lane the scrollbar, every frame. -->
 	<div
 		bind:this={scroller}
 		onwheel={onWheel}
@@ -2899,7 +2938,7 @@
 			// A scroll moves the lanes under a pointer that has not moved.
 			if (marquee) onMarqueeMove(marquee.cx, marquee.cy);
 		}}
-		style="flex:1;min-height:0;overflow:auto;position:relative;display:flex;align-items:flex-start"
+		style="flex:1;min-height:0;overflow:auto;scrollbar-gutter:stable;position:relative;display:flex;align-items:flex-start"
 	>
 		<!-- track headers -->
 		<div
@@ -3100,7 +3139,7 @@
 			role="presentation"
 			oncontextmenu={onTimelineContextMenu}
 			onpointerdown={(e) => onCanvasPointerDown(e, 'canvas')}
-			style="width:{contentW}px;min-width:calc(100% - var(--track-header-w));flex:none;min-height:100%;position:relative"
+			style="width:{contentW}px;min-width:calc(100% - var(--track-header-w));flex:none;min-height:100%;position:relative;overflow-x:clip"
 		>
 			<!-- Past the end of the cut: the lane runs to the window's edge, and what lies beyond the last
 			     clip is dimmed behind a line, so a short cut is not mistaken for a short timeline. -->

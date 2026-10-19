@@ -124,7 +124,7 @@ pub use cli::{
     timeline_frame_cancellable, timeline_frame_region_cancellable, timeline_frame_yuv_cancellable, validate_export, waveform,
     waveform_cancellable, Container, ExportOptions, ExportProgress, ExportVariant, Fit, ImageFormat, LoudnessPreset,
     PlaybackParams, PlaybackRequest, PreviewFrame, ProxyRun, RateControl, Region, RenderStatus, ScrubConfig, ScrubFrames,
-    ScrubStats, VariantProgress, MAX_STREAM_FPS, MAX_STREAM_WIDTH, MIN_STREAM_FPS, MIN_STREAM_WIDTH,
+    ScrubStats, VariantProgress, VariantsRun, MAX_STREAM_FPS, MAX_STREAM_WIDTH, MIN_STREAM_FPS, MIN_STREAM_WIDTH,
 };
 
 #[cfg(test)]
@@ -284,10 +284,11 @@ pub fn render_variants(
     assets: &[crate::model::Asset],
     variants: &[ExportVariant],
     opts: &ExportOptions,
+    together: bool,
     progress: &mut dyn FnMut(VariantProgress),
     cancel: &dyn Fn() -> bool,
-) -> Result<(RenderStatus, usize)> {
-    cli::render_variants(timeline, assets, variants, opts, progress, cancel)
+) -> Result<VariantsRun> {
+    cli::render_variants(timeline, assets, variants, opts, together, progress, cancel)
 }
 
 #[cfg(test)]

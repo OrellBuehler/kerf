@@ -118,8 +118,14 @@ lock is taken; the clip comes back. The nested curves / wheels are MCP-only mirr
 **Per-property animation over MCP**: `set_property_keyframes` (`clip_id`, `prop`, `keys:
 [{time, value, easing?}]`; `[]` makes the number static again; the clip comes back) animates one number —
 a transform number, a colour number or the clip's volume — independently of the rest,
-`copy_keyframes` (`from_clip_id`, `to_clip_id`, `props?`, `offset?`) gives another clip the same
+`set_property_tracks` (`clip_id`, `tracks: [{prop, keys}]`) re-keys several numbers in one edit (the dope
+sheet's gestures; a number twice or none at all is refused; each track is `PropertyTrackArg` with `keys` required and
+`deny_unknown_fields`, since the model's `PropertyTrack` reads a misspelt `keys` as none and would make the number static), `copy_keyframes` (`from_clip_id`, `to_clip_id`,
+`props?`, `offset?`) gives another clip the same
 animation, and `set_keyframe_easing` takes an optional `prop`; the server `instructions` mention them.
+`set_transform_at` (`clip_id`, `time`, any transform field) poses a clip at a moment of it in one edit without the
+agent first working out what is animated: a keyed number gets a key at `time` (bundle or own track, whichever drives
+it), the rest and the crop are static (`Clip::pose_transform`); it is what the Preview's handles write.
 **Edit modes over MCP**: `roll_edit` (`clip_a`
 the earlier clip, `clip_b`, `delta` seconds), `slip_clip` (`delta` in *source*
 seconds, positive = later in its own footage) and `slide_clip` answer the
@@ -165,11 +171,14 @@ delivery: `formats` are shape names (`9:16` / `1:1` / `4:5` / `16:9`, or
 `WxH` — `Delivery::parse`), it runs the framing pass first unless
 `smart_crop` is false (the one write it makes, `project-changed` only when a
 clip actually changed), renders through `render_variants` with progress on
-the client's token naming the file in flight, and reports each file with the
+the client's token naming the file in flight (`rendering 3 together (9:16, 1:1, 16:9)` for a
+single pass), and reports each file with the
 platforms it is `ready_for` and its non-tip issues — judged at *that* file's
 frame and over the span of the export's `range` (`variant_output` →
 `cut_summary_in(Some(frame), range)`), so the agent does not run
-`platform_check` per variant afterwards. `generate_captions` / `clear_captions` caption the
+`platform_check` per variant afterwards. `single_pass` (default true) is `render_variants`'
+`together`; the result says whether the run was one (`single_pass`, from `VariantsRun.together`), and a cancelled one removed
+every file (`export cancelled; the N files rendering together were removed`). `generate_captions` / `clear_captions` caption the
 cut; its `style` picks `lines` or `word_punch` and the `instructions` say to
 prefer the latter for a vertical cut, since nothing in a tool list tells an
 agent that the subtitle shape is not what social captions look like. They also
@@ -504,9 +513,10 @@ Every tool, by purpose (a test pins that this list names each registered tool, a
   `remove_track`, `get_ripple_mode`, `set_ripple_mode`.
 - **Linked picture and sound**: `extract_audio`, `add_asset_audio`, `detach_audio`, `detach_audio_clips`, `reattach_audio`,
   `reattach_audio_clips`, `link_clips`, `unlink_clips`.
-- **Clip look and sound**: `set_volume`, `set_fade`, `set_speed`, `set_transform`, `set_color`, `set_transition`,
+- **Clip look and sound**: `set_volume`, `set_fade`, `set_speed`, `set_transform`, `set_transform_at`, `set_color`, `set_transition`,
   `set_grade`, `set_video_effects`, `set_audio_effects`, `set_mask`, `set_clip_enabled`.
-- **Keyframes and 360**: `set_keyframes`, `add_keyframe`, `set_keyframe_easing`, `set_property_keyframes`, `copy_keyframes`,
+- **Keyframes and 360**: `set_keyframes`, `add_keyframe`, `set_keyframe_easing`, `set_property_keyframes`,
+  `set_property_tracks`, `copy_keyframes`,
   `clear_keyframes`, `set_reframe`, `clear_reframe`, `set_reframe_keyframes`, `add_reframe_keyframe`.
 - **Mix and music**: `set_track_volume`, `set_track_pan`, `set_track_duck`, `set_track_muted`, `set_track_solo`,
   `set_track_locked`, `set_master_volume`, `set_master_limiter`, `set_master_true_peak`, `set_master_duck`, `plan_music_fit`, `fit_music`,

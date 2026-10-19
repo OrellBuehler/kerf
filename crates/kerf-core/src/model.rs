@@ -1213,6 +1213,56 @@ impl Transform {
     }
 }
 
+/// Some numbers of a [`Transform`], as a partial edit names them: `None` leaves a number alone.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TransformPatch {
+    pub scale: Option<f64>,
+    pub pos_x: Option<f64>,
+    pub pos_y: Option<f64>,
+    pub rotation: Option<f64>,
+    pub opacity: Option<f64>,
+    pub crop_left: Option<f64>,
+    pub crop_right: Option<f64>,
+    pub crop_top: Option<f64>,
+    pub crop_bottom: Option<f64>,
+}
+
+impl TransformPatch {
+    /// The animatable numbers it names, with their values.
+    pub fn animatable(&self) -> Vec<(Property, f64)> {
+        [
+            (Property::Scale, self.scale),
+            (Property::PosX, self.pos_x),
+            (Property::PosY, self.pos_y),
+            (Property::Rotation, self.rotation),
+            (Property::Opacity, self.opacity),
+        ]
+        .into_iter()
+        .filter_map(|(p, v)| v.map(|v| (p, v)))
+        .collect()
+    }
+
+    /// Write the numbers it names into `t`.
+    pub fn apply(&self, t: &mut Transform) {
+        let fields = [
+            (&mut t.scale, self.scale),
+            (&mut t.pos_x, self.pos_x),
+            (&mut t.pos_y, self.pos_y),
+            (&mut t.rotation, self.rotation),
+            (&mut t.opacity, self.opacity),
+            (&mut t.crop_left, self.crop_left),
+            (&mut t.crop_right, self.crop_right),
+            (&mut t.crop_top, self.crop_top),
+            (&mut t.crop_bottom, self.crop_bottom),
+        ];
+        for (field, value) in fields {
+            if let Some(v) = value {
+                *field = v;
+            }
+        }
+    }
+}
+
 /// Per-clip color correction applied at export via the `eq` filter. A default
 /// is the identity (no change).
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -4845,6 +4895,7 @@ pub use grade::{
     frame_matrix, normalize_curve, ClipLut, CurvePoint, CurveSegment, CurveShape, Curves, Grade, Wheel, Wheels, MAX_CURVE_POINTS,
 };
 mod check;
+mod values;
 
 mod score;
 pub use score::{

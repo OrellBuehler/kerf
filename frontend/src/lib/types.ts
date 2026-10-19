@@ -1412,6 +1412,8 @@ export interface ExportProgress {
 	 *  `fraction` then spans all of them. */
 	variant?: number;
 	total?: number;
+	/** A multi-format export rendering every file in one pass: `variant` is then 0. */
+	together?: boolean;
 }
 
 /** Payload of the `import-progress` event, emitted while a 360 pair is stitched. */
@@ -2058,6 +2060,20 @@ export interface PreviewFrameResult {
 	timings: GpuTimings | null;
 	/** To a forward request: the session's state. */
 	play?: PlayInfo | null;
+}
+
+/** A clip as a gesture under way would leave it, on the track it would be on (`DraftClip` in
+ *  `crates/kerf-app/src/gpu_preview/draft.rs`). */
+export interface DraftClip {
+	track_id: string;
+	clip: Clip;
+}
+
+/** What a gesture under way would write, sent with its frames (`PreviewDraft`): the clips and titles it
+ *  changes, each whole. The GPU preview draws the frame as the cut would be with it written; nothing is. */
+export interface PreviewDraft {
+	clips: DraftClip[];
+	overlays: TextOverlay[];
 }
 
 /** How the page asks for a frame of GPU playback: the session it belongs to. */

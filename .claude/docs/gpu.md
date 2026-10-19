@@ -232,6 +232,10 @@ timestamp on a coarse time base can hide a late landing of exactly one rounded t
   (`FrameCache::conflicts_with`; the cache refuses and counts it, never a panic) ends the run and
   marks the file, so a file whose runs always die is not spawned and killed once a request.
 
+**`Hint::Forward`** is also what the app's preview asks with for a drag that walks forward through the cut (A3, `app.md`): the run
+reads ahead and the next frame of the drag is a cache hit; the frames are the router's either way. Not for a plan with a reversed
+layer: its frames walk backward through the file, so a forward run would restart every frame and trip the thrash guard.
+
 **`Hint::Prefetch`** is a request for a frame that will be wanted soon (the first of the clip a cut is about
 to bring): it returns `Ok(None)` for every layer, **waits for nothing and draws nothing**, and has a run
 waiting at the frame when it can. It opens the file's two probes (container, seek points: 50 ms between
@@ -498,7 +502,9 @@ is rendered at the quarter-pixel phase of a fractional position. It draws white 
 exactly `m`; a gray or YUV canvas writes 235 on 6.1), once for the glyphs and once, fontcolor `@0`, for the box, and reads the red
 planes. A mask is trimmed and cached in `TextAtlas` (key: graph text, font file length + mtime, `ffmpeg` path; 256 states /
 48 MiB, LRU; a state wanted by several frames runs once; a failure is not remembered; textures are made by the first frame that
-draws one). `prepare_text` blocks on that process for a first-seen state, so the caller must hold no lock the UI needs while it renders
+draws one). A drag's frame (`render_draft_texture_with`, the app's draft frames) is drawn exactly as any other, but a title state the
+atlas does not hold is a pose of the drag (a new one per pointer move, never drawn again): it is made into a second atlas of 4 states /
+16 MiB (`TextAtlas::get_drafted`, `peek`), so a drag never pushes the cut's own titles out. `prepare_text` blocks on that process for a first-seen state, so the caller must hold no lock the UI needs while it renders
 (the app's frame holds neither the project lock nor its render lock then, `app.md`). The pass is `drawutils.c`'s integer arithmetic (the same in 6.1.1 and 9.0.2), in u32:
 `((K - a) * d + a * s) >> 24` (`K = 0x1010101`), `a` = coverage x `(0x10307 * alpha + 3) >> 8` for luma and the 2x2 coverage sum
 `>> 2` for 4:2:0 chroma (a block sticking out of the mask counts only what is in it), `0x10203 * alpha + 2` for the box (half per

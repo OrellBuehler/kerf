@@ -764,6 +764,7 @@ impl GpuPreview {
             t,
             overlays,
             scrubbing: false,
+            forward: false,
         };
         match self.conclude(
             &drawing,

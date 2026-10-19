@@ -65,6 +65,11 @@ const MAX_GRAPH_CHARS: usize = 16 << 10;
 pub const ATLAS_MAX_ENTRIES: usize = 256;
 pub const ATLAS_MAX_BYTES: usize = 48 << 20;
 
+/// What the atlas of a drag's titles holds at most ([`TextAtlas::get_drafted`]): a pose or two of the
+/// title being dragged, which the next pointer move replaces.
+pub const DRAFT_ATLAS_MAX_ENTRIES: usize = 4;
+pub const DRAFT_ATLAS_MAX_BYTES: usize = 16 << 20;
+
 /// `0x1010101`: the blend's unit. `alpha * value` is in `0..=0xFFFF_FFFF` below it, and `>> 24`
 /// rounds down to the plane's 8 bits.
 pub const UNIT: u32 = 0x0101_0101;
@@ -835,6 +840,36 @@ impl TextAtlas {
         Ok(made)
     }
 
+    /// The raster for `key` if this atlas holds it, counted as a use; nothing is made or kept.
+    pub fn peek(&self, key: &Key) -> Option<Arc<Raster>> {
+        let slot = {
+            let mut inner = locked(&self.inner);
+            inner.clock += 1;
+            let clock = inner.clock;
+            let slot = Arc::clone(inner.slots.get(key)?);
+            slot.used.store(clock, Ordering::Relaxed);
+            slot
+        };
+        let held = locked(&slot.raster).clone();
+        held
+    }
+
+    /// [`TextAtlas::get`] for a drag's frame (a title moved or resized: a pose per pointer move, drawn
+    /// once and never again): what this atlas holds is served from it, and anything it does not is
+    /// made into `drafts`, a small atlas of its own, so the poses of a drag never push the cut's own
+    /// titles out of this one.
+    pub fn get_drafted(
+        &self,
+        drafts: &TextAtlas,
+        key: Key,
+        make: impl FnOnce() -> Result<Raster, GpuError>,
+    ) -> Result<Arc<Raster>, GpuError> {
+        match self.peek(&key) {
+            Some(raster) => Ok(raster),
+            None => drafts.get(key, make),
+        }
+    }
+
     /// Drop the least recently used filled slots until the limits hold (never `keep`, never one
     /// somebody is still filling).
     fn evict(&self, inner: &mut AtlasInner, keep: &Key) {
@@ -1227,6 +1262,28 @@ mod tests {
         let big = TextAtlas::with_limits(usize::MAX, 10);
         big.get(key(1), || made(100)).unwrap();
         assert_eq!(big.held().0, 1);
+    }
+
+    #[test]
+    fn a_drags_poses_are_made_into_their_own_atlas_and_never_push_the_cuts_out() {
+        let cut = TextAtlas::with_limits(2, usize::MAX);
+        let drafts = TextAtlas::with_limits(DRAFT_ATLAS_MAX_ENTRIES, DRAFT_ATLAS_MAX_BYTES);
+        let a = cut.get(key(1), || made(100)).unwrap();
+        cut.get(key(2), || made(100)).unwrap();
+        assert!(cut.peek(&key(3)).is_none(), "a peek makes nothing");
+        assert_eq!(cut.held().0, 2, "and keeps nothing");
+        // A title of the cut that is not dragged is served from the cut's atlas.
+        let served = cut.get_drafted(&drafts, key(1), || panic!("held by the cut")).unwrap();
+        assert!(Arc::ptr_eq(&a, &served));
+        // A pose per pointer move.
+        for n in 10..30 {
+            cut.get_drafted(&drafts, key(n), || made(100)).unwrap();
+        }
+        assert_eq!(drafts.held().0, DRAFT_ATLAS_MAX_ENTRIES, "the drag's atlas is bounded");
+        cut.get(key(1), || panic!("the cut's titles are all still held")).unwrap();
+        cut.get(key(2), || panic!("the cut's titles are all still held")).unwrap();
+        assert_eq!(cut.held().0, 2);
+        assert_eq!(cut.runs(), 2);
     }
 
     #[test]

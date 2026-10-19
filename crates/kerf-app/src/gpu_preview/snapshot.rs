@@ -93,17 +93,23 @@ impl PlanInputs {
     /// yet (`None`: nothing to wait for, and always `None` under any other source). Answered from
     /// the snapshot: the status is read from the proxy queue now, the project not at all.
     pub fn proxy_wait(&self, t: f64) -> Result<Option<String>, String> {
-        self.waits(t, Some(t))
+        self.waits(&self.timeline, t, Some(t))
+    }
+
+    /// [`PlanInputs::proxy_wait`] for `timeline` in place of the snapshot's (a drag's draft of it, which
+    /// reads the same assets).
+    pub fn proxy_wait_in(&self, timeline: &Timeline, t: f64) -> Result<Option<String>, String> {
+        self.waits(timeline, t, Some(t))
     }
 
     /// [`PlanInputs::proxy_wait`] for playing from `t` to the end of the cut: the stream refuses
     /// the same way, since a clip without a proxy would be read from its original.
     pub fn proxy_wait_from(&self, t: f64) -> Result<Option<String>, String> {
-        self.waits(t, None)
+        self.waits(&self.timeline, t, None)
     }
 
-    fn waits(&self, from: f64, to: Option<f64>) -> Result<Option<String>, String> {
-        let waits = Project::proxy_waits_in(&self.timeline, kerf_core::proxy::effective_preview_source(), from, to, |id| {
+    fn waits(&self, timeline: &Timeline, from: f64, to: Option<f64>) -> Result<Option<String>, String> {
+        let waits = Project::proxy_waits_in(timeline, kerf_core::proxy::effective_preview_source(), from, to, |id| {
             self.proxy_inputs.get(&id).cloned().ok_or(Error::AssetNotFound(id))
         })
         .map_err(|e| e.to_string())?;

@@ -13,6 +13,11 @@
 // hold the rate) hands it to the stream through `playHandover`, and so does the hand-over the answers
 // announce (`ahead`) when the playhead gets to it.
 //
+// **A gesture's frames** (`draft` set: an Inspector slider, a title or clips being dragged) go the GPU
+// route with what the gesture would write (`preview-draft.ts`), so the backend draws the frame as the cut
+// will be once it is let go. The draft is read only on the GPU route: on the JPEG route it changes
+// nothing and asks for nothing, which is today's behaviour (the frame of the edit once it is written).
+//
 // The one rule that matters: **what the effect depends on is what it reads in `run`**, and `pump`
 // reads nothing reactive before its first await. A frame fetch is expensive (an FFmpeg composite),
 // so an effect that re-ran because something unrelated changed (the trim monitor, the GPU status
@@ -22,7 +27,7 @@
 
 import { isProxyWaitMessage } from './proxy-wait';
 import type { GpuPlayback } from './gpu-playback';
-import type { PlayAhead, PlayAsk, PreviewFrameResult, PreviewOrder } from './types';
+import type { PlayAhead, PlayAsk, PreviewDraft, PreviewFrameResult, PreviewOrder } from './types';
 
 export interface FramePumpDeps {
 	/** The playhead. */
@@ -53,8 +58,11 @@ export interface FramePumpDeps {
 		overlays: boolean,
 		width: number,
 		order: PreviewOrder,
-		play?: PlayAsk
+		play?: PlayAsk,
+		draft?: PreviewDraft | null
 	): Promise<PreviewFrameResult>;
+	/** What a gesture under way would write, or null: read on the GPU route only. */
+	draft?(): PreviewDraft | null;
 	/** What the backend answered (the status bar names the renderer). */
 	answered(result: PreviewFrameResult): void;
 	/** The GPU path failed outright (the command rejected): the frame is the JPEG and the surface goes. */
@@ -81,13 +89,17 @@ export function createFramePump(deps: FramePumpDeps) {
 	let frameUrl = $state<string | null>(null);
 	/** The frame on show was drawn in the native surface: nothing is painted over it. */
 	let gpuShown = $state(false);
+	/** The draft of the gesture the frame on show was drawn from (the GPU route's answer to a request
+	 *  that carried one), `null` for any other picture: what the page draws over the frame of a drag goes
+	 *  by what is in it. */
+	let drawnDraft = $state.raw<PreviewDraft | null>(null);
 	/** The frame on show is the playback stream's, drawn on the canvas: the picture until a fetched
 	 *  frame lands on top of it. */
 	let streamShown = $state(false);
 	/** The aspect of the picture on show (the canvas the compositor drew, or the JPEG). */
 	let imgAspect = $state<number | null>(null);
 	let inFlight = false;
-	let queued: { time: number; via: 'gpu' | 'jpeg'; overlays: boolean; width: number } | null = null;
+	let queued: { time: number; via: 'gpu' | 'jpeg'; overlays: boolean; width: number; draft: PreviewDraft | null } | null = null;
 	/** Requests made so far, and the newest one whose answer is on show: an answer older than that is
 	 *  dropped (the GPU route has several in flight, and the JPEG route may have one beside them). */
 	let asked = 0;
@@ -102,6 +114,7 @@ export function createFramePump(deps: FramePumpDeps) {
 		shown = seq;
 		frameUrl = url;
 		gpuShown = false;
+		drawnDraft = null;
 		streamShown = false;
 	}
 
@@ -109,10 +122,10 @@ export function createFramePump(deps: FramePumpDeps) {
 	// replaced (`superseded`), so a drag asks for every position the playhead passes and the renderer
 	// never waits for a round trip between two frames. The backend draws in the native surface when the
 	// plan allows it (and says so), else it hands back FFmpeg's JPEG for the frame.
-	async function askGpu(want: { time: number; overlays: boolean; width: number }, seq: number) {
+	async function askGpu(want: { time: number; overlays: boolean; width: number; draft: PreviewDraft | null }, seq: number) {
 		let result: PreviewFrameResult | null = null;
 		try {
-			result = await deps.previewFrame(want.time, want.overlays, want.width, { client, seq });
+			result = await deps.previewFrame(want.time, want.overlays, want.width, { client, seq }, undefined, want.draft);
 		} catch (error) {
 			// Under "Proxy only" the backend refuses a frame whose proxy is still building. That is
 			// the preview waiting, not the GPU path failing: the picture on show (and the surface,
@@ -137,11 +150,13 @@ export function createFramePump(deps: FramePumpDeps) {
 		deps.answered(result);
 		if (result.renderer === 'gpu') {
 			gpuShown = true;
+			drawnDraft = want.draft;
 			streamShown = false;
 			// The canvas the compositor drew has the delivery's shape.
 			if (result.timings?.width && result.timings.height) imgAspect = result.timings.width / result.timings.height;
 		} else if (result.frame) {
 			gpuShown = false;
+			drawnDraft = null;
 			streamShown = false;
 			frameUrl = result.frame;
 		}
@@ -196,6 +211,7 @@ export function createFramePump(deps: FramePumpDeps) {
 		shown = seq;
 		deps.answered(result);
 		gpuShown = true;
+		drawnDraft = null;
 		streamShown = false;
 		if (result.timings?.width && result.timings.height) imgAspect = result.timings.width / result.timings.height;
 	}
@@ -206,10 +222,10 @@ export function createFramePump(deps: FramePumpDeps) {
 	async function pump() {
 		if (queued === null) return;
 		if (queued.via === 'gpu') {
-			const { time, overlays, width } = queued;
+			const { time, overlays, width, draft } = queued;
 			queued = null;
 			try {
-				await askGpu({ time, overlays, width }, ++asked);
+				await askGpu({ time, overlays, width, draft }, ++asked);
 			} catch {
 				/* ignore decode errors — keep the last good frame */
 			}
@@ -240,6 +256,9 @@ export function createFramePump(deps: FramePumpDeps) {
 		get gpuShown() {
 			return gpuShown;
 		},
+		get drawnDraft() {
+			return drawnDraft;
+		},
 		get imgAspect() {
 			return imgAspect;
 		},
@@ -250,6 +269,7 @@ export function createFramePump(deps: FramePumpDeps) {
 		 *  never the surface, in the element the settled still then replaces it in. */
 		showStreamed(url: string) {
 			gpuShown = false;
+			drawnDraft = null;
 			streamShown = false;
 			frameUrl = url;
 		},
@@ -257,12 +277,14 @@ export function createFramePump(deps: FramePumpDeps) {
 		 *  the picture, never the surface, and stays so until a fetched frame replaces it. */
 		streamDrawn(aspect: number) {
 			gpuShown = false;
+			drawnDraft = null;
 			streamShown = true;
 			imgAspect = aspect;
 		},
 		/** The picture on screen is not the surface's any more (the setting went off). */
 		surfaceGone() {
 			gpuShown = false;
+			drawnDraft = null;
 		},
 		/** The `<img>` loaded: the aspect it has. */
 		pictureAspect(aspect: number) {
@@ -282,6 +304,8 @@ export function createFramePump(deps: FramePumpDeps) {
 			// Whether the page draws over the picture only matters to the backend: on the JPEG path (the
 			// setting off, a dialog over the frame) it is not read, so it cannot bring a frame back.
 			const overlays = via === 'gpu' && deps.routeOverlays();
+			// The same for a gesture's draft: the JPEG route draws the cut as it is written.
+			const draft = via === 'gpu' ? (deps.draft?.() ?? null) : null;
 			void deps.boundsEpoch();
 			// A picture of a different size is a different frame: a wider box (a panel dragged, a
 			// window moved to another screen) asks again, at the new width.
@@ -289,6 +313,7 @@ export function createFramePump(deps: FramePumpDeps) {
 			if (!deps.hasClips()) {
 				frameUrl = null;
 				gpuShown = false;
+				drawnDraft = null;
 				streamShown = false;
 				queued = null;
 				return;
@@ -299,7 +324,7 @@ export function createFramePump(deps: FramePumpDeps) {
 				void forward(playback, overlays, width);
 				return;
 			}
-			queued = { time, via, overlays, width };
+			queued = { time, via, overlays, width, draft };
 			void pump();
 		}
 	};

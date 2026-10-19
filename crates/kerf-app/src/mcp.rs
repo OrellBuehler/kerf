@@ -18,9 +18,9 @@ use base64::Engine as _;
 use kerf_core::{
     AudioEffect, CaptionFormat, CaptionImportRequest, CaptionOptions, CaptionStyle, CaptionTimeBase, ClipCut, ClipLut, ClipMove,
     CurvePoint, Curves, Delivery, EditSource, ExportOptions, Fit, Keyframe, Mask, MaskShape, Project, Projection, Property,
-    PropertyKey, ReframeKeyframe, Region, SplitSide, StreamKind, SvgCheck, SvgDoc, SvgLayout, SvgOverlay, SvgOverlayPatch,
-    SvgOverlayResult, SvgPreset, SvgPresetKind, SvgPresetParams, SvgSource, TextKeyframe, TimeRange, Timeline, Transition,
-    TransitionKind, VideoEffect, Wheel, Wheels,
+    PropertyKey, PropertyTrack, ReframeKeyframe, Region, SplitSide, StreamKind, SvgCheck, SvgDoc, SvgLayout, SvgOverlay,
+    SvgOverlayPatch, SvgOverlayResult, SvgPreset, SvgPresetKind, SvgPresetParams, SvgSource, TextKeyframe, TimeRange, Timeline,
+    Transition, TransitionKind, VideoEffect, Wheel, Wheels,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
@@ -1028,6 +1028,32 @@ struct TransformParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct TransformAtParams {
+    #[schemars(description = "UUID of the clip")]
+    clip_id: String,
+    #[schemars(description = "Seconds from the clip's start: where an animated number gets its key")]
+    time: f64,
+    #[schemars(description = "Uniform scale after fitting to the frame (1.0 = fit); omit to leave unchanged")]
+    scale: Option<f64>,
+    #[schemars(description = "Horizontal offset as a fraction of frame width (0.0 = centered); omit to leave unchanged")]
+    pos_x: Option<f64>,
+    #[schemars(description = "Vertical offset as a fraction of frame height (0.0 = centered); omit to leave unchanged")]
+    pos_y: Option<f64>,
+    #[schemars(description = "Clockwise rotation in degrees; omit to leave unchanged")]
+    rotation: Option<f64>,
+    #[schemars(description = "Opacity 0.0–1.0 (1.0 = opaque); omit to leave unchanged")]
+    opacity: Option<f64>,
+    #[schemars(description = "Fraction cropped from the left edge (0.0–1.0, never animated); omit to leave unchanged")]
+    crop_left: Option<f64>,
+    #[schemars(description = "Fraction cropped from the right edge (0.0–1.0, never animated); omit to leave unchanged")]
+    crop_right: Option<f64>,
+    #[schemars(description = "Fraction cropped from the top edge (0.0–1.0, never animated); omit to leave unchanged")]
+    crop_top: Option<f64>,
+    #[schemars(description = "Fraction cropped from the bottom edge (0.0–1.0, never animated); omit to leave unchanged")]
+    crop_bottom: Option<f64>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct ColorParams {
     #[schemars(description = "UUID of the clip")]
     clip_id: String,
@@ -1305,6 +1331,37 @@ struct PropertyKeyframesParams {
                        0.1–10, volume 0–4 (linear gain), scale > 0. At most 1000 keys."
     )]
     keys: Vec<PropertyKey>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct PropertyTracksParams {
+    #[schemars(description = "UUID of the clip")]
+    clip_id: String,
+    #[schemars(
+        description = "The numbers to re-key, each {\"prop\":name, \"keys\":[...]} exactly as set_property_keyframes \
+                       takes its prop and keys (pass [] keys to make that number static). Each number at most once; \
+                       numbers not listed are untouched."
+    )]
+    tracks: Vec<PropertyTrackArg>,
+}
+
+/// One number's keys for `set_property_tracks`: the model's [`PropertyTrack`] with `keys` required
+/// and a key it does not name (`key`) refused — the persisted type reads either as no keys, which
+/// would silently make the number static.
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PropertyTrackArg {
+    prop: Property,
+    keys: Vec<PropertyKey>,
+}
+
+impl From<PropertyTrackArg> for PropertyTrack {
+    fn from(a: PropertyTrackArg) -> Self {
+        Self {
+            prop: a.prop,
+            keys: a.keys,
+        }
+    }
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -1698,6 +1755,14 @@ struct ExportVariantsParams {
                               first existing path so you can pick a new base path or opt in)"
     )]
     overwrite: Option<bool>,
+    #[schemars(
+        description = "Render every file in one pass (default true): the sources are decoded and the mix is built \
+                              once, then split into each frame — about one export's decode for all of them. Falls back \
+                              to one file after another where one pass cannot (two-pass or hardware encoders, an \
+                              audio-only container). A cancelled or failed single pass removes every file. false \
+                              renders the files one after another, keeping the finished ones if a later one is cancelled."
+    )]
+    single_pass: Option<bool>,
     #[schemars(
         description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result, stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
     )]
@@ -3319,6 +3384,28 @@ impl KerfMcp {
     }
 
     #[tool(
+        description = "Set how a clip looks at one moment of it (`time`, seconds from the clip's start), in one edit, whether or not it is animated: each named number that has keyframes (set_keyframes / add_keyframe, or set_property_keyframes) gets a key at that time — the rest of the animation is kept — and every other named number, the crop edges always, is set as set_transform sets it. Use it to change a pose without first finding out which numbers are animated. Returns the clip."
+    )]
+    fn set_transform_at(&self, Parameters(p): Parameters<TransformAtParams>) -> Result<String, McpError> {
+        let clip_id = parse_arg("clip_id", &p.clip_id)?;
+        let patch = kerf_core::TransformPatch {
+            scale: p.scale,
+            pos_x: p.pos_x,
+            pos_y: p.pos_y,
+            rotation: p.rotation,
+            opacity: p.opacity,
+            crop_left: p.crop_left,
+            crop_right: p.crop_right,
+            crop_top: p.crop_top,
+            crop_bottom: p.crop_bottom,
+        };
+        self.edit(|project| {
+            let out = project.set_transform_at(clip_id, p.time, patch).map_err(core_err)?;
+            json(&out)
+        })
+    }
+
+    #[tool(
         description = "Set a clip's color correction — brightness / contrast / saturation / gamma / temperature (warm-cool). Omit a field to leave it unchanged. A number that is animated (set_property_keyframes) is read from its keys, not from this static value, which only applies once its keys are cleared (pass [])."
     )]
     fn set_color(&self, Parameters(p): Parameters<ColorParams>) -> Result<String, McpError> {
@@ -3470,6 +3557,20 @@ impl KerfMcp {
         let clip_id = parse_arg("clip_id", &p.clip_id)?;
         self.edit(|project| {
             let out = project.set_property_keyframes(clip_id, p.prop, p.keys).map_err(core_err)?;
+            json(&out)
+        })
+    }
+
+    #[tool(
+        description = "Re-key SEVERAL numbers of one clip in a single edit — the same keys set_property_keyframes \
+                       takes, for each number listed: retime a move and its fade together, or set a whole look's \
+                       colour keys at once, as one undo step. Numbers not listed are untouched. Returns the clip."
+    )]
+    fn set_property_tracks(&self, Parameters(p): Parameters<PropertyTracksParams>) -> Result<String, McpError> {
+        let clip_id = parse_arg("clip_id", &p.clip_id)?;
+        self.edit(|project| {
+            let tracks = p.tracks.into_iter().map(PropertyTrack::from).collect();
+            let out = project.set_property_tracks(clip_id, tracks).map_err(core_err)?;
             json(&out)
         })
     }
@@ -5043,8 +5144,10 @@ impl KerfMcp {
                        project's own frame is untouched. Files land beside output_path named by shape \
                        (`cut-9x16.mp4`). Reports each file with the platforms it is ready for and any issue, so \
                        there is no need to run platform_check per variant afterwards. Progress and cancellation \
-                       work as in `export` (and `background: true` returns a job_id); cancelling keeps the files already \
-                       finished and deletes the one in flight. Refuses to overwrite any existing variant file unless overwrite is true."
+                       work as in `export` (and `background: true` returns a job_id). The files render in one pass by \
+                       default (single_pass): one decode of the sources split into every frame, so cancelling removes \
+                       them all; with single_pass false they render one after another and cancelling keeps the files \
+                       already finished and deletes the one in flight. Refuses to overwrite any existing variant file unless overwrite is true."
     )]
     async fn export_variants(
         &self,
@@ -5088,6 +5191,7 @@ impl KerfMcp {
         self.check_outputs(&variants.iter().map(|v| v.output.clone()).collect::<Vec<_>>())
             .await?;
         let smart_crop = p.smart_crop.unwrap_or(true);
+        let single_pass = p.single_pass.unwrap_or(true);
         let (me, owner) = (self.clone(), self.owner());
         let generation = self.lock().generation();
         // The GUI's Stop on an export ends the framing pass and every file of this one too.
@@ -5131,6 +5235,7 @@ impl KerfMcp {
                 let mut on_progress = |progress: kerf_core::VariantProgress| {
                     let mut message = match progress.waiting {
                         Some(why) => why.to_string(),
+                        None if progress.together => format!("rendering {} together ({})", progress.total, labels.join(", ")),
                         None => format!(
                             "rendering {} of {} ({})",
                             progress.variant + 1,
@@ -5144,28 +5249,44 @@ impl KerfMcp {
                     run.progress(Some(progress.fraction), message);
                 };
                 // Core removes the file of a variant that failed or was cancelled in flight.
-                let (status, done) =
-                    kerf_core::render_variants(&timeline, &assets, &render_variants, &opts, &mut on_progress, &|| {
-                        run.cancelled()
-                    })
-                    .map_err(core_err)?;
+                let ended = kerf_core::render_variants(
+                    &timeline,
+                    &assets,
+                    &render_variants,
+                    &opts,
+                    single_pass,
+                    &mut on_progress,
+                    &|| run.cancelled(),
+                )
+                .map_err(core_err)?;
                 // Judged per file, at the frame that file actually is and over the span it writes.
                 let range = opts.range.map(|r| (r.start, r.end));
                 let mut outputs = Vec::new();
                 let project = lock_agent_as(&project, owner.as_deref());
-                for v in render_variants.iter().take(done) {
+                for v in render_variants.iter().take(ended.completed) {
                     outputs.push(variant_output(&project, v, range)?);
                 }
-                Ok((status, outputs))
+                Ok((ended.status, outputs, ended.together))
             })
             .await;
             let framed = framed.load(Ordering::SeqCst);
             if framed > 0 {
                 me.changed();
             }
-            let (status, outputs) = result?;
+            let (status, outputs, together) = result?;
             match status {
-                kerf_core::RenderStatus::Completed => json(&serde_json::json!({ "clips_framed": framed, "outputs": outputs })),
+                kerf_core::RenderStatus::Completed => json(&serde_json::json!({
+                    "clips_framed": framed,
+                    "single_pass": together,
+                    "outputs": outputs,
+                })),
+                kerf_core::RenderStatus::Cancelled if together => Err(McpError::internal_error(
+                    format!(
+                        "export cancelled; the {} files rendering together were removed",
+                        variants.len()
+                    ),
+                    None,
+                )),
                 kerf_core::RenderStatus::Cancelled => Err(McpError::internal_error(
                     format!(
                         "export cancelled after {} of {} files; the one in flight was removed",
@@ -6096,7 +6217,8 @@ const INSTRUCTIONS: &str = "Kerf MCP server. The user queues editing tasks in th
              over the interview (later video tracks composite on top). Polish \
              with set_volume / set_fade (fade-in/out, e.g. to smooth hard cuts), \
              set_speed, set_transform (scale / position / rotation / opacity / \
-             crop — picture-in-picture), set_color and set_transition (a fade \
+             crop — picture-in-picture; set_transform_at for an animated clip, which keys \
+             what is animated at a moment), set_color and set_transition (a fade \
              between scenes, a slide or push between the shots of a montage). \
              Go further: set_video_effects (blur / sharpen / \
              grayscale / invert / vignette / chroma_key — green-screen so a lower \
@@ -6190,8 +6312,8 @@ const INSTRUCTIONS: &str = "Kerf MCP server. The user queues editing tasks in th
              width, and without this the middle is what survives, subject or \
              not. Look at the result with preview_timeline; the crop is an \
              ordinary transform the user can adjust. When the same cut is \
-             going to several places, export_variants renders it once per \
-             shape (9:16, 1:1, 4:5, 16:9) in one call, framing each shot for \
+             going to several places, export_variants renders it at every \
+             shape (9:16, 1:1, 4:5, 16:9) in one call and one pass, framing each shot for \
              each shape and reporting what each file is ready for — prefer it \
              to exporting three times by hand. \
              Your edits are STAGED, not applied. While the user has review switched \
@@ -6629,6 +6751,25 @@ mod tests {
             serde_json::json!({"clip_id": "c", "curves": {"master": [{"x": 0, "y": 1, "z": 2}]}}),
             serde_json::json!({"clip_id": "c", "wheels": {"midtone": {}}}),
             serde_json::json!({"clip_id": "c", "wheels": {"shadows": {"lightnes": 0.1}}}),
+        ] {
+            assert!(parse(bad.clone()).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn set_property_tracks_refuses_a_track_without_its_keys() {
+        let parse = |v: serde_json::Value| serde_json::from_value::<super::PropertyTracksParams>(v);
+        let ok = parse(serde_json::json!({
+            "clip_id": "c",
+            "tracks": [{"prop": "opacity", "keys": []}, {"prop": "volume", "keys": [{"time": 0, "value": 1}]}]
+        }))
+        .unwrap();
+        let tracks: Vec<kerf_core::PropertyTrack> = ok.tracks.into_iter().map(Into::into).collect();
+        assert_eq!(tracks[1].keys.len(), 1);
+        for bad in [
+            serde_json::json!({"clip_id": "c", "tracks": [{"prop": "opacity"}]}),
+            serde_json::json!({"clip_id": "c", "tracks": [{"prop": "opacity", "key": [{"time": 0, "value": 1}]}]}),
+            serde_json::json!({"clip_id": "c", "tracks": [{"prop": "opacity", "keys": [], "easing": "hold"}]}),
         ] {
             assert!(parse(bad.clone()).is_err(), "{bad}");
         }

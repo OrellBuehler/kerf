@@ -28,11 +28,11 @@ use base64::Engine as _;
 use kerf_core::{
     Asset, AssetAnalysis, AudioEffect, CaptionFile, CaptionFormat, CaptionImportRequest, CaptionOptions, CaptionTimeBase,
     ClipCut, ClipMove, Delivery, EditSource, ExportOptions, Filmstrip, FilmstripSheet, Fit, Grade, ImportOutcome, ImportSummary,
-    Keyframe, Levels, Mask, MissingAsset, Page, Project, Projection, Property, PropertyKey, ReframeKeyframe, RelinkCheck,
-    Relinked, RemovedAsset, Revision, SplitSide, StagedEdit, StreamKind, SubsetApplied, SvgCheck, SvgLayout, SvgOverlayPatch,
-    SvgPresetInfo, SvgPresetKind, SvgPresetParams, SvgSource, Task, TemplateControl, TemplateLibrary, TemplateList,
-    TemplateSaveRequest, TemplateSaved, TextKeyframe, TimeRange, Timeline, TimelineDiff, Transition, TransitionKind, VideoEffect,
-    WaveformRange,
+    Keyframe, Levels, Mask, MissingAsset, Page, Project, Projection, Property, PropertyKey, PropertyTrack, ReframeKeyframe,
+    RelinkCheck, Relinked, RemovedAsset, Revision, SplitSide, StagedEdit, StreamKind, SubsetApplied, SvgCheck, SvgLayout,
+    SvgOverlayPatch, SvgPresetInfo, SvgPresetKind, SvgPresetParams, SvgSource, Task, TemplateControl, TemplateLibrary,
+    TemplateList, TemplateSaveRequest, TemplateSaved, TextKeyframe, TimeRange, Timeline, TimelineDiff, Transition,
+    TransitionKind, VideoEffect, WaveformRange,
 };
 
 use serde::Serialize;
@@ -2203,6 +2203,41 @@ fn set_transform(
     project.timeline().map_err(|e| e.to_string())
 }
 
+/// The transform as it should look `time` seconds into the clip, one revision: keyed numbers
+/// get a key there, the rest (the crop always) their static value. A Preview drag writes it.
+#[tauri::command(async)]
+#[allow(clippy::too_many_arguments)]
+fn set_transform_at(
+    state: State<'_, AppState>,
+    clip_id: String,
+    time: f64,
+    scale: Option<f64>,
+    pos_x: Option<f64>,
+    pos_y: Option<f64>,
+    rotation: Option<f64>,
+    opacity: Option<f64>,
+    crop_left: Option<f64>,
+    crop_right: Option<f64>,
+    crop_top: Option<f64>,
+    crop_bottom: Option<f64>,
+) -> CmdResult<Timeline> {
+    let id = id(&clip_id, "clip_id")?;
+    let project = state.project();
+    let patch = kerf_core::TransformPatch {
+        scale,
+        pos_x,
+        pos_y,
+        rotation,
+        opacity,
+        crop_left,
+        crop_right,
+        crop_top,
+        crop_bottom,
+    };
+    project.set_transform_at(id, time, patch).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
 #[tauri::command(async)]
 fn set_color(
     state: State<'_, AppState>,
@@ -2350,6 +2385,16 @@ fn set_property_keyframes(
     let id = id(&clip_id, "clip_id")?;
     let project = state.project();
     project.set_property_keyframes(id, prop, keys).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+/// Replace the keys of several animatable numbers of a clip in one edit (the dope sheet's
+/// gestures).
+#[tauri::command(async)]
+fn set_property_tracks(state: State<'_, AppState>, clip_id: String, tracks: Vec<PropertyTrack>) -> CmdResult<Timeline> {
+    let id = id(&clip_id, "clip_id")?;
+    let project = state.project();
+    project.set_property_tracks(id, tracks).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
@@ -3409,6 +3454,10 @@ async fn get_timeline_frame(state: State<'_, AppState>, time_secs: f64, max_widt
 /// and the first request of a session decides whether the GPU plays it (`renderer: "gpu"`) or the
 /// stream does (`renderer: "stream"`, with the reasons); every answer says in `play.ahead` where the
 /// GPU will stop drawing, if it will. See [`gpu_preview::play`]'s module docs; no other hint is known.
+///
+/// `draft` is what a gesture under way would write (the clips and titles it changes, whole): the frame
+/// is drawn as the cut would be with it written, and nothing is written (`gpu_preview::draft`). A drag's
+/// frame the GPU does not draw is FFmpeg's JPEG of the cut as it is.
 #[tauri::command]
 #[allow(clippy::too_many_arguments)]
 async fn get_preview_frame(
@@ -3421,6 +3470,7 @@ async fn get_preview_frame(
     seq: Option<u64>,
     hint: Option<String>,
     session: Option<u64>,
+    draft: Option<gpu_preview::PreviewDraft>,
 ) -> CmdResult<gpu_preview::PreviewFrameResult> {
     let shared = state.project.clone();
     let mut request = gpu_preview::FrameRequest::new(
@@ -3438,9 +3488,15 @@ async fn get_preview_frame(
             let (Some(client), Some(session)) = (client.clone(), session) else {
                 return Err("a forward frame names its client and session".to_string());
             };
+            if draft.is_some() {
+                return Err("a forward frame takes no draft".to_string());
+            }
             request = request.forward(client, session);
         }
         Some(other) => return Err(format!("unknown preview frame hint {other:?}")),
+    }
+    if let Some(draft) = draft {
+        request = request.drafted(draft);
     }
     if let (Some(client), Some(seq)) = (client, seq) {
         request = request.ordered(client, seq);
@@ -3934,8 +3990,11 @@ struct FramingProgress {
 /// Render the cut once per delivery frame — one file per shape beside
 /// `output_path`, named by shape (`cut-9x16.mp4`). With `smart_crop`, every
 /// shot is framed for every shape first (one revision, reused by later
-/// exports); the project frame's own crop is never touched. Streams the same
-/// `export-progress` event as a single export, with `variant` / `total` added.
+/// exports); the project frame's own crop is never touched. `single_pass`
+/// (default true) writes every file from one decode of the cut where the encode
+/// allows; false renders them one after another. Streams the same
+/// `export-progress` event as a single export, with `variant` / `total` (and
+/// `together` for a single pass) added.
 #[tauri::command]
 async fn export_variants(
     app: AppHandle,
@@ -3943,8 +4002,10 @@ async fn export_variants(
     output_path: String,
     formats: Vec<Delivery>,
     smart_crop: bool,
+    single_pass: Option<bool>,
     options: ExportOptions,
 ) -> CmdResult<Vec<String>> {
+    let single_pass = single_pass.unwrap_or(true);
     if formats.is_empty() {
         return Err("pick at least one delivery frame".to_string());
     }
@@ -4021,15 +4082,26 @@ async fn export_variants(
                 project.list_assets().map_err(|e| e.to_string())?,
             )
         };
-        // `render_variants` writes the files one after another and removes the one that failed
-        // or was cancelled (only if this run touched it); the finished ones stay. Its progress
-        // is the event the webview already reads: which file, of how many, and the whole.
+        // `render_variants` writes the files in one run (or one after another) and removes what
+        // failed or was cancelled (only if this run touched it); one after another, the finished
+        // ones stay. Its progress is the event the webview already reads: which file, of how
+        // many (or all of them together), and the whole.
         let mut on_progress = |p: kerf_core::VariantProgress| {
             let _ = app.emit("export-progress", p);
         };
-        match kerf_core::render_variants(&timeline, &assets, &variants, &options, &mut on_progress, &|| cancel()) {
-            Ok((kerf_core::RenderStatus::Completed, _)) => {}
-            Ok((kerf_core::RenderStatus::Cancelled, _)) => return Err("export cancelled".to_string()),
+        match kerf_core::render_variants(
+            &timeline,
+            &assets,
+            &variants,
+            &options,
+            single_pass,
+            &mut on_progress,
+            &|| cancel(),
+        ) {
+            Ok(run) if run.status == kerf_core::RenderStatus::Completed => {}
+            // A stopped single pass took every file with it; the dialog says so.
+            Ok(run) if run.together => return Err(format!("export cancelled; all {} files were removed", variants.len())),
+            Ok(_) => return Err("export cancelled".to_string()),
             Err(e) => return Err(e.to_string()),
         }
         Ok(variants.iter().map(|v| v.output.to_string_lossy().into_owned()).collect())
@@ -5182,6 +5254,7 @@ pub fn run() {
             set_fade,
             set_speed,
             set_transform,
+            set_transform_at,
             set_color,
             set_transition,
             set_mask,
@@ -5193,6 +5266,7 @@ pub fn run() {
             add_keyframe,
             set_keyframe_easing,
             set_property_keyframes,
+            set_property_tracks,
             copy_keyframes,
             clear_keyframes,
             set_reframe,
