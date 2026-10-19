@@ -136,8 +136,10 @@ ghosts, and of those only the ones in view: `ghostsInView`), so a select-all or 
 mounts nothing more (`?long=1000`: Ctrl+A 9.7 s → 0.26 s, with `selectionUnits` made one pass — it was O(n²)
 in the Inspector; a 20-step ripple trim 3.8 s → 2.1–2.5 s, 59 ghosts drawn instead of 1000). The canvas
 promotes the block under the pointer to a button on pointer move (not while a button is down or a gesture
-runs: `mayPromote`). **Hover is not an input of the drawing**: the promoted button is added on top of it
-(`laneButtons`), so a hover change leaves every lane's `blocks` array, and its canvas, as it was; and
+runs: `mayPromote`). **Hover is not an input of the drawing**: the promoted button is inserted beside it,
+at its place in lane order (`laneButtons`) — where the drawing puts it once a press pins it, because a
+keyed `{#each}` that moves a node (`.before()`) drops the pointer capture the press just took, and a
+roll or slide on a promoted block then never got a move — so a hover change leaves every lane's `blocks` array, and its canvas, as it was; and
 `hoverPartners` is one shared empty set for every clip without partners, so the draw effect, which reads
 it for the `lit` mark, runs again only when partners light (`?long=3000` at fit: 121 → 17 ms a hover change),
 and the promoted clip clears the hover when the pointer leaves it — the canvas does only when the pointer

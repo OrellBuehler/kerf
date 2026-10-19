@@ -85,12 +85,34 @@ describe('laneButtons', () => {
 	const long = lane(3000);
 	const drawing = laneDrawing(long, dur, 0.5, 0, 1600, none);
 
-	test('the hovered block is promoted on top, and the drawing is not touched', () => {
+	test('the hovered block is promoted, and the drawing is not touched', () => {
 		const blocks = drawing.blocks;
 		const buttons = laneButtons(drawing, 'c40');
-		expect(buttons.map((c) => c.id)).toEqual([...drawing.buttons.map((c) => c.id), 'c40']);
+		expect(buttons.map((c) => c.id)).toEqual(['c40']);
 		expect(drawing.blocks).toBe(blocks);
 		expect(drawing.blocks.some((c) => c.id === 'c40')).toBe(true);
+	});
+
+	/** 60 clips: c10 and c50…c59 wide (50 s: buttons at 5 px/s), the rest narrow (1 s: blocks). */
+	function mixed() {
+		let at = 0;
+		return Array.from({ length: 60 }, (_, i) => {
+			const d = i === 10 || i >= 50 ? 50 : 1;
+			const c = { id: `c${i}`, timeline_start: at, dur: d };
+			at += d;
+			return c;
+		});
+	}
+
+	test('the promoted block sits in lane order, where pinning it puts it: a press does not move its node', () => {
+		const clips = mixed();
+		const hovered = laneDrawing(clips, dur, 5, 0, 5000, none);
+		expect(hovered.buttons.map((c) => c.id)).toEqual(['c10', ...Array.from({ length: 10 }, (_, i) => `c${50 + i}`)]);
+		for (const id of ['c3', 'c40', 'c49']) {
+			const pressed = laneDrawing(clips, dur, 5, 0, 5000, new Set([id]));
+			expect(laneButtons(hovered, id).map((c) => c.id)).toEqual(pressed.buttons.map((c) => c.id));
+		}
+		expect(laneButtons(hovered, 'c40').map((c) => c.id).slice(0, 3)).toEqual(['c10', 'c40', 'c50']);
 	});
 
 	test('with nothing hovered, or a hovered clip that is no block, the drawing’s own buttons', () => {
@@ -121,6 +143,10 @@ describe('ghostsInView', () => {
 		expect(ghostsInView(thin, 40, 401, 500, 2)).toHaveLength(1);
 		expect(ghostsInView(thin, 40, 402, 500, 2)).toHaveLength(0);
 		expect(ghostsInView(thin, 40, 402, 500, 6)).toHaveLength(1);
+	});
+
+	test('a ghost wider than the window is in it', () => {
+		expect(ghostsInView([{ start: 0, dur: 1000 }], 40, 20000, 21600, 2)).toHaveLength(1);
 	});
 
 	test('a window edge touching a box is not a meeting', () => {

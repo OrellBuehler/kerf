@@ -992,8 +992,9 @@
 	// A long lane draws the clips in (or near) view, and the narrow ones among them as blocks on one
 	// canvas (`timeline-cull.ts`, `LaneBlocks.svelte`). What the pointer or the keyboard holds is a clip
 	// wherever it is — the pressed clip, the focused and the nudged one; what a gesture only moves is
-	// drawn from the model (the ghosts), so it is not kept. The block under the pointer is promoted on
-	// top of the drawing (`buttonsOf`), so a hover change leaves the drawing, and every canvas, as it is.
+	// drawn from the model (the ghosts), so it is not kept. The block under the pointer is promoted
+	// outside the drawing, at its place in lane order (`buttonsOf`), so a hover change leaves the drawing,
+	// and every canvas, as it is, and the press that pins it does not move its node.
 	const pinned = $derived.by(() =>
 		pinnedClips({
 			pressed: [
@@ -1011,7 +1012,8 @@
 		for (const t of drawn) m.set(t.id, laneDrawing(t.clips, clipDuration, pxPerSec, viewLo, viewHi, pinned));
 		return m;
 	});
-	/** A lane's clips drawn as buttons: its drawing's, and the hovered block promoted. */
+	/** A lane's clips drawn as buttons: its drawing's, and the hovered block promoted at its place in lane
+	 *  order (`laneButtons`). */
 	const buttonsOf = (t: Track): readonly Clip[] => {
 		const d = laneDrawings.get(t.id);
 		return d ? laneButtons(d, hoverId) : t.clips;

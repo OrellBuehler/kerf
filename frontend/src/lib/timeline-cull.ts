@@ -12,8 +12,8 @@
  *
  * What the pointer or the keyboard holds is a button wherever it is (`pinnedClips`): the pressed
  * clip (whose button holds the pointer capture), the one with focus and the one being nudged. The
- * block under the pointer is promoted to a button too (so a press lands on a real clip), but on top
- * of the drawing (`laneButtons`), not in it: a hover change leaves every lane's blocks as they were,
+ * block under the pointer is promoted to a button too (so a press lands on a real clip), outside the
+ * drawing (`laneButtons`, at its place in lane order), not in it: a hover change leaves every lane's blocks as they were,
  * and no canvas redraws for it. What a gesture only *moves* — a selection dragged along, the clips
  * a ripple trim shifts — is drawn from the model (the ghosts, `ghostsInView`: only those in view),
  * so it is not kept off screen: a select-all over a long cut mounts nothing more. A shorter lane is
@@ -57,12 +57,19 @@ export function pinnedClips(held: {
 	return out;
 }
 
-/** A lane's buttons: its drawing's, and the block under the pointer promoted to one, on top. The
- *  drawing's own arrays are returned as they are when no block is hovered. */
+/** A lane's buttons: its drawing's, and the block under the pointer promoted to one **at its place in
+ *  lane order** — where the drawing puts it once a press pins it, so the press never moves its node (a
+ *  keyed each moving a node drops the pointer capture the press just took). Clips in a lane do not
+ *  overlap, so their starts are that order. The drawing's own array is returned as it is when no
+ *  block is hovered. */
 export function laneButtons<T extends CullClip>(drawing: LaneDrawing<T>, hovered: string | null): readonly T[] {
 	if (!hovered || drawing.blocks.length === 0) return drawing.buttons;
 	const block = drawing.blocks.find((c) => c.id === hovered);
-	return block ? [...drawing.buttons, block] : drawing.buttons;
+	if (!block) return drawing.buttons;
+	const at = drawing.buttons.findIndex((c) => c.timeline_start > block.timeline_start);
+	const out = [...drawing.buttons];
+	out.splice(at < 0 ? out.length : at, 0, block);
+	return out;
 }
 
 /** The ghosts of a gesture whose box (from `start`, at least `minPx` wide) meets the visible window
