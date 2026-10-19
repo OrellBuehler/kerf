@@ -2940,6 +2940,66 @@ async fn update_title_clip(state: State<'_, AppState>, clip_id: String, patch: T
     .await
 }
 
+/// A change to a title's text made the way template values are: the title read under the lock, the new
+/// artwork made with it released (`prepare`: the sanitiser, the text engine), stored if the title is still
+/// the one it was made from. One edit called `label`.
+fn title_text_edit(
+    shared: &Mutex<Project>,
+    title_id: Uuid,
+    label: &str,
+    prepare: impl FnOnce(&kerf_core::TitleTextInputs) -> kerf_core::Result<kerf_core::PreparedText>,
+) -> CmdResult<TemplateEdit> {
+    let inputs = lock_user(shared).title_text_inputs(title_id).map_err(|e| e.to_string())?;
+    let prepared = prepare(&inputs).map_err(|e| e.to_string())?;
+    let project = lock_user(shared);
+    let done = project
+        .set_title_text_parsed(title_id, prepared, label)
+        .map_err(|e| e.to_string())?;
+    let timeline = project.timeline().map_err(|e| e.to_string())?;
+    Ok(match done {
+        TitleEdited::Overlay(o) => TemplateEdit {
+            timeline,
+            overlay_id: Some(o.overlay.id),
+            clip_id: None,
+            warnings: o.warnings,
+        },
+        TitleEdited::Clip(c) => TemplateEdit::of_clip(timeline, *c),
+    })
+}
+
+/// Give the `<text>` whose id is `element` in the title `title_id` (floating or on a track, not a preset)
+/// a box: a width its lines wrap to or it shrinks to fit (`text_box.width` `null` takes it away). A box is
+/// drawn only by glyph outlines, so the title's text is set as outlines again; a box for a text that
+/// cannot be one is an error saying why.
+#[tauri::command]
+async fn set_title_text_box(
+    state: State<'_, AppState>,
+    title_id: String,
+    element: String,
+    text_box: kerf_core::svg::TextBox,
+) -> CmdResult<TemplateEdit> {
+    let tid = id(&title_id, "title_id")?;
+    let shared = state.project.clone();
+    blocking(move || title_text_edit(&shared, tid, "Set text box", |i| i.text_box(&element, &text_box))).await
+}
+
+/// Draw the text of the title `title_id` as glyph outlines (the same on every machine, whatever fonts it
+/// has) or with its fonts again. Each text that cannot be an outline says why in the warnings.
+#[tauri::command]
+async fn convert_title_text(
+    state: State<'_, AppState>,
+    title_id: String,
+    form: kerf_core::TitleTextForm,
+) -> CmdResult<TemplateEdit> {
+    let tid = id(&title_id, "title_id")?;
+    let shared = state.project.clone();
+    let label = match form {
+        kerf_core::TitleTextForm::Outlines => "Draw text as outlines",
+        kerf_core::TitleTextForm::Text => "Draw text with its fonts",
+    };
+    blocking(move || title_text_edit(&shared, tid, label, |i| i.convert(form))).await
+}
+
 /// Change control values of a template title, floating or on a track (partial: only the named
 /// controls; `overlay_id` is either's id). The title is read under the lock, the splice and the
 /// sanitiser run with it released, and the result is stored only if the title is still the one it was
@@ -5391,6 +5451,8 @@ pub fn run() {
             add_title_clip,
             update_title_clip,
             set_template_values,
+            set_title_text_box,
+            convert_title_text,
             import_template,
             export_template,
             delete_template,

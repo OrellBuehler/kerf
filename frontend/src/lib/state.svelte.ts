@@ -54,6 +54,8 @@ import {
 	updateTitleClip as apiUpdateTitleClip,
 	removeSvgOverlay as apiRemoveSvgOverlay,
 	setTemplateValues as apiSetTemplateValues,
+	setTitleTextBox as apiSetTitleTextBox,
+	convertTitleText as apiConvertTitleText,
 	updateSvgOverlay as apiUpdateSvgOverlay,
 	setAudioEffects,
 	setKeyframes,
@@ -176,6 +178,8 @@ import type {
 	SvgOverlayPatch,
 	SvgSource,
 	TemplateEdit,
+	TextBox,
+	TitleTextForm,
 	TitleClipPatch,
 	TextKeyframe,
 	Marker,
@@ -1383,6 +1387,24 @@ class EditorState {
 		let edit!: TemplateEdit;
 		await this.#apply(async () => {
 			edit = await apiSetTemplateValues(overlayId, values);
+			return edit.timeline;
+		});
+		return edit;
+	}
+	/** Give a title's `<text>` a box (or none); its text is set as outlines again. */
+	async setTitleTextBox(titleId: string, element: string, textBox: TextBox) {
+		let edit!: TemplateEdit;
+		await this.#apply(async () => {
+			edit = await apiSetTitleTextBox(titleId, element, textBox);
+			return edit.timeline;
+		});
+		return edit;
+	}
+	/** Draw a title's text as glyph outlines or with its fonts. */
+	async convertTitleText(titleId: string, form: TitleTextForm) {
+		let edit!: TemplateEdit;
+		await this.#apply(async () => {
+			edit = await apiConvertTitleText(titleId, form);
 			return edit.timeline;
 		});
 		return edit;

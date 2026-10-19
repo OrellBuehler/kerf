@@ -2089,6 +2089,7 @@ struct SvgOverlaySummary {
     /// preset or a custom title.
     #[serde(skip_serializing_if = "Option::is_none")]
     template: Option<TemplateSummary>,
+    /// The size of the source as get_timeline_state shows it (its text form: outlines left out).
     svg_bytes: usize,
 }
 
@@ -2106,6 +2107,7 @@ pub(crate) struct TitleClipSummary {
     /// The template it came from, with the controls and their values; absent on custom artwork.
     #[serde(skip_serializing_if = "Option::is_none")]
     template: Option<TemplateSummary>,
+    /// The size of the source as get_timeline_state shows it (its text form: outlines left out).
     svg_bytes: usize,
 }
 
@@ -2120,7 +2122,7 @@ impl TitleClipSummary {
             end: clip.timeline_end(),
             source_in: clip.source_in,
             template: title.template.as_ref().map(TemplateSummary::from),
-            svg_bytes: title.svg.len(),
+            svg_bytes: text_form_bytes(&title.svg),
         })
     }
 
@@ -2208,7 +2210,7 @@ impl From<&SvgOverlay> for SvgOverlaySummary {
             opacity: o.opacity,
             params: o.preset.as_ref().map(|p| p.params.clone()),
             template: o.template.as_ref().map(TemplateSummary::from),
-            svg_bytes: o.svg.len(),
+            svg_bytes: text_form_bytes(&o.svg),
         }
     }
 }
@@ -2371,14 +2373,20 @@ fn each_title_svg(timeline: &mut Timeline, mut f: impl FnMut(&mut String)) {
     }
 }
 
-/// A template title's text is stored as glyph outlines, which are the engine's business: an agent
-/// reads the text form (`svg::restore_text`), the `<text>` it can see and set through the controls.
+/// A title's text may be stored as glyph outlines, which are the engine's business: an agent reads the
+/// text form (`svg::restore_text`), the `<text>` it can see and set (through the controls, a text box).
 fn restore_title_text(timeline: &mut Timeline) {
     each_title_svg(timeline, |svg| {
         if let Ok(text) = kerf_core::svg::restore_text(svg) {
             *svg = text;
         }
     });
+}
+
+/// The size of a title's source in its text form, the one an agent reads. Only a source with outlines is
+/// read to find it.
+fn text_form_bytes(svg: &str) -> usize {
+    kerf_core::svg::restore_text(svg).map_or(svg.len(), |text| text.len())
 }
 
 /// Leave the sources of large SVG titles out of a timeline read: a title can carry 128 KiB and a
@@ -6553,7 +6561,10 @@ const INSTRUCTIONS: &str = "Kerf MCP server. The user queues editing tasks in th
              (add_title_clip, or apply_template with on_track=true): it then takes \
              a transition from the shot before it (a dip to white into an end \
              card), fades and keyframes, and extends like any clip; \
-             timeline_summary lists those under `title_clips`. save_template, import_template and \
+             timeline_summary lists those under `title_clips`. For text of any \
+             length (a name on a lower third), give its <text> a box with \
+             set_title_text_box: it wraps, or with fit=\"shrink\" stays on one line \
+             made smaller to fit. save_template, import_template and \
              export_template change the user's library or a file, not your \
              proposal, and delete_template is refused while the user reviews your \
              edits. \
@@ -8472,6 +8483,8 @@ mod tests {
         assert_eq!(required("save_template"), ["name", "overlay_id"]);
         assert_eq!(required("apply_template"), ["start", "template_id"]);
         assert_eq!(required("set_template_values"), ["overlay_id"]);
+        assert_eq!(required("set_title_text_box"), ["element", "title_id"]);
+        assert_eq!(required("convert_title_text"), ["title_id", "to"]);
         assert_eq!(required("import_template"), ["path"]);
         assert_eq!(required("export_template"), ["output_path", "template_id"]);
         assert_eq!(required("delete_template"), ["template_id"]);

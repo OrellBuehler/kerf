@@ -226,3 +226,25 @@ binding is `svg/outline.rs`. Details: `core-project.md` ("Text as glyph outlines
   text), decorations, right-to-left paragraphs, small caps and font features, `font-variation-settings`.
 - Phase 3 builds on the per-glyph paths: `Glyph.cluster` and `Glyph.line` give the character, word and line indices the
   selectors need (the paths are in visual order).
+
+## Phase 2 as built (part 2: the box, and the title's text form)
+
+Details: `core-project.md` ("A text's box and the title's text form").
+
+- **The box is in the artwork**, not the template: `inline-size` plus `data-kerf-fit="shrink"` on the `<text>`. So it works for
+  any title (custom or a template, floating or a title clip; not a preset), survives a values change and a save as a template
+  (both work on the text form, which carries it), and needs no schema step (v8 already covers outlined titles). Set from the
+  **Inspector's Text section**, not the save dialog: a box belongs to the title, and saving it as a template keeps it.
+- **Fit** is shrink-only and one line per paragraph: everything that follows the font size scales together until the widest
+  line fits. Wrap stays SVG 2's. A box drawn with fonts (a text that stays text) runs on, with a warning.
+- **`set_title_text_box` / `convert_title_text`**: Tauri commands and MCP tools (idempotent sets), on `title_text_inputs` →
+  `TitleTextInputs` → `set_title_text_parsed`, the template-values shape. A template title cannot go back to text.
+- **Text form on every surface**: MCP's `svg_bytes` and `get_timeline_state` count and show it; the Inspector's source box
+  shows it through `textForm`, a port of `restore_text` replayed against a blessed corpus.
+- **Coverage**: a `userSpaceOnUse` gradient or pattern paint is outlined (pixel-identical). The wrap's f32 running sums are
+  checked directly near the limit, so breaks match the direct sums.
+
+### Left for later
+
+- A box height (and shrink to a box of lines), a minimum size for shrink, and drawing the box in the preview while it is edited.
+- Positioned `<tspan>` lines, decorations, right-to-left paragraphs, small caps and font features, `font-variation-settings`.

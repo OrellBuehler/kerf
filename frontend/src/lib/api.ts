@@ -114,6 +114,8 @@ import type {
 	Task,
 	TemplateControl,
 	TemplateEdit,
+	TextBox,
+	TitleTextForm,
 	TemplateList,
 	TemplateSaved,
 	TextKeyframe,
@@ -233,6 +235,7 @@ import {
 	templatePosterDev
 } from './template-dev';
 import { checkTitleSpan, isTitleClip, placeTitleClip, titleClip, titleOf } from './title-clips';
+import { convertTitleTextIn, setTitleTextBoxIn } from './title-text';
 import { VOICE_IDS, DEFAULT_SPEED, DEFAULT_VOICE, clampSpeed, estimateSeconds, scriptSegments, voiceInfo } from './voiceover';
 
 export type { AudioDetached };
@@ -3505,6 +3508,29 @@ export async function setTemplateValues(overlayId: string, values: Record<string
 		return { timeline: snapshot(), overlay_id: overlay?.id, clip_id: clip?.id, warnings };
 	}
 	return invoke<TemplateEdit>('set_template_values', { overlayId, values });
+}
+
+/** Give the `<text>` `element` of a title (floating or on a track, not a preset) a box: a width its lines wrap to, or
+ *  that it shrinks to fit on one line (`width: null` takes it away). A box is drawn only by glyph outlines, so the
+ *  title's text is set as outlines again; a box for a text that cannot be one rejects with why. One edit. */
+export async function setTitleTextBox(titleId: string, element: string, textBox: TextBox): Promise<TemplateEdit> {
+	if (!inTauri()) {
+		const { overlay, clip, warnings } = setTitleTextBoxIn(devTimeline, titleId, element, textBox);
+		recordDev('Set text box');
+		return { timeline: snapshot(), overlay_id: overlay?.id, clip_id: clip?.id, warnings };
+	}
+	return invoke<TemplateEdit>('set_title_text_box', { titleId, element, textBox });
+}
+
+/** Draw a title's text as glyph outlines (the same on every machine, and what a box needs) or with its fonts again.
+ *  Each text that cannot be an outline says why in the warnings; a title none of whose text can rejects. One edit. */
+export async function convertTitleText(titleId: string, form: TitleTextForm): Promise<TemplateEdit> {
+	if (!inTauri()) {
+		const { overlay, clip, warnings } = convertTitleTextIn(devTimeline, titleId, form);
+		recordDev(form === 'outlines' ? 'Draw text as outlines' : 'Draw text with its fonts');
+		return { timeline: snapshot(), overlay_id: overlay?.id, clip_id: clip?.id, warnings };
+	}
+	return invoke<TemplateEdit>('convert_title_text', { titleId, form });
 }
 
 /** Add a library template as a title clip on a video track, so it takes transitions (a dip to white from the shot

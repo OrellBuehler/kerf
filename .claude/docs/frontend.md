@@ -1656,7 +1656,24 @@ and `import_template` never overwriting; there is no file system, so an exported
 **Motion templates in the editor.** The library, the saving, the splicing and the sanitiser are the engine's; the page
 asks well and shows the result through `<img>` data URLs only. A template title's `svg` holds its text as glyph outlines
 (`<g data-kerf-text="">` keeps the element's id, attributes and text): the save dialog's tags come from `svg_element_ids`, which
-reports such an element as the `text` it was, and its attribute reads (`elementAttributes`, `holds`) see the same attributes. `template-ui.ts` is the pure side (bun-tested): `slugId`
+reports such an element as the `text` it was, and its attribute reads (`elementAttributes`, `holds`) see the same attributes.
+**A title's text** (`title-text.ts`, pure, bun-tested): `textForm` is a port of kerf-core's `restore_text` (a token walk:
+the marked `<g …>` back to `<text`, its direct `data-kerf-glyphs` child cut, its `</g>` back to `</text>`), replayed against
+kerf-core's own outlines by `outline-corpus.test.ts` (`fixtures/outline-corpus.json`, blessed with `KERF_BLESS_CORPUS=1 …
+-- outline_corpus`). The Inspector's **SVG source** box shows and compares the text form (`shownSource`), noting that applying
+a change to an outlined custom title draws it with its fonts until it is outlined again. **`TextSection.svelte`** (after the
+Template section, for every title but a preset, floating or on a track) lists each `<text>` with an id no other element
+has (`titleTexts`, so the `{#each}` key is unique and the engine would take it: the box read off its start tag, which an
+outlined text keeps, its `style`'s `inline-size` first as `text_box_of` reads it) under its template control's label or
+`#id`: a width (empty is no
+box; `boxWidthRefusal` before the round trip) and *Wrap lines* / *Shrink to fit*, each commit one `setTitleTextBox` edit
+(nothing while locked, busy or previewing a proposal; the engine's notes said as a toast), and for a custom title *Draw as
+outlines* / *Draw with fonts* (`convertTitleText`). The harness writes the box (`withTextBox`, `set_text_box`'s splice: the
+width first in the `style`, `!important`; the value's entities decoded before `declarations` splits it, quotes and comments
+kept whole, and written back as `escape_attr` writes it; the engine's `<style>` check; a box a template control sets refused),
+replayed against kerf-core by `text-box-corpus.test.ts` (`fixtures/text-box-corpus.json`, `KERF_BLESS_CORPUS=1 … --
+text_box_corpus`), and
+draws text with its fonts, saying so (`HARNESS_NOTE`). `template-ui.ts` is the pure side (bun-tested): `slugId`
 (a control id from its label: lower case, accents dropped, `-2` past a taken one), `defaultAttribute` (a color's `stop-color`
 on a `stop`, else `fill`; an image's `href`; a font's `font-family`; a number's usual size), `elementsFor` (text at
 `text` / `tspan`, an image at `<image>`; an id that two or more elements carry is **not targetable** — the engine refuses it

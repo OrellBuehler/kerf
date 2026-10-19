@@ -269,18 +269,26 @@ impl Template {
         let doc = SvgDoc::parse(&self.svg)?;
         self.svg = doc.sanitized().to_string();
         validate_controls(&self.manifest.controls, &self.svg)?;
-        let warnings = doc.warnings().to_vec();
+        // A template's text is set as outlines whenever it is applied: its boxes are drawn.
+        let warnings = doc
+            .warnings()
+            .iter()
+            .filter(|w| *w != crate::svg::BOX_NOTE)
+            .cloned()
+            .collect();
         Ok(Checked { doc, warnings })
     }
 
     /// The title drawn at half the template's duration, as a PNG, with this template's own fonts
-    /// (`doc` is [`Template::validate`]'s answer). At most [`POSTER_SIZE`] pixels on the long side.
+    /// (`doc` is [`Template::validate`]'s answer). Its text is set as outlines first, as an applied title's
+    /// is, so a text box wraps or shrinks on the poster too. At most [`POSTER_SIZE`] pixels on the long side.
     pub fn render_poster(&self, doc: &SvgDoc) -> Result<Vec<u8>> {
         let m = &self.manifest;
         let scale = f64::from(POSTER_SIZE) / f64::from(m.width.max(m.height));
         let side = |v: u32| ((f64::from(v) * scale).round() as u32).clamp(1, POSTER_SIZE);
-        let svg = doc.at(m.duration / 2.0);
-        let pixmap = raster::render_with(&svg, side(m.width), side(m.height), 1.0, fonts::svg_fontdb_with(&self.fonts))?;
+        let db = fonts::svg_fontdb_with(&self.fonts);
+        let svg = doc.clone().outlined(&db)?.at(m.duration / 2.0);
+        let pixmap = raster::render_with(&svg, side(m.width), side(m.height), 1.0, db)?;
         raster::encode_png(&pixmap)
     }
 
