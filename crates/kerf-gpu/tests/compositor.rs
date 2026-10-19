@@ -6,8 +6,8 @@
 
 use chrono::Utc;
 use kerf_core::{
-    Asset, Clip, CompositeColorPolicy, Delivery, ExportOptions, Fit, RenderPlan, StreamInfo, StreamKind, Timeline, Track,
-    Transform, VideoEffect,
+    Asset, Clip, CompositeColorPolicy, Delivery, ExportOptions, Fit, PlanMode, PlanRequest, Planner, RenderPlan, StreamInfo,
+    StreamKind, Timeline, Track, Transform, VideoEffect,
 };
 use kerf_gpu::{Compositor, Gpu, GpuError, GpuOptions, YuvFrame};
 use uuid::Uuid;
@@ -176,7 +176,8 @@ fn a_layer_with_no_frame_draws_nothing() {
 fn a_plan_the_gpu_cannot_draw_is_refused_not_drawn_wrong() {
     let a = asset(64, 36);
     let mut c = Clip::new(a.id, 0.0, 1.0, 0.0);
-    c.effects.push(VideoEffect::Vignette);
+    // Every kind of effect is drawn now; a sigma `gblur` refuses is FFmpeg's to fail.
+    c.effects.push(VideoEffect::Blur { sigma: 5000.0 });
     let plan = plan_for(&a, c);
     assert!(!plan.gpu_supported());
     let err = compositor()
@@ -350,6 +351,49 @@ fn a_sharpen_and_the_tables_are_the_references_byte_for_byte() {
         assert_eq!(got.y, frame.y.iter().map(|v| f.0(*v)).collect::<Vec<_>>(), "{effects:?} Y");
         assert_eq!(got.u, frame.u.iter().map(|v| f.1(*v)).collect::<Vec<_>>(), "{effects:?} U");
         assert_eq!(got.v, frame.v.iter().map(|v| f.1(*v)).collect::<Vec<_>>(), "{effects:?} V");
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU adapter (lavapipe is enough)"]
+fn a_vignette_is_the_references_frame_after_frame() {
+    use kerf_gpu::effects;
+    for (w, h) in [(64u32, 36u32), (98, 62)] {
+        let a = asset(w, h);
+        let frame = noise(w, h, 5);
+        let mut c = Clip::new(a.id, 0.0, 1.0, 0.0);
+        c.effects = vec![VideoEffect::Vignette];
+        let want = |n: u64| effects::vignette_planes(&frame.y, &frame.u, &frame.v, w, h, n);
+        // A still graph runs its one frame through the filter: the first of the run.
+        let got = drawn_planes(&a, c.clone(), &frame, (w, h));
+        assert_eq!([got.y, got.u, got.v], want(0), "{w}x{h} still");
+        // An export frame is dithered where the clip's run is: the count the cursor gives, past 2^32 samples too.
+        let tl = timeline_of(vec![c]);
+        let planner = Planner::new(
+            &tl,
+            std::slice::from_ref(&a),
+            &ExportOptions::default(),
+            PlanRequest::motion(POLICY),
+        )
+        .unwrap();
+        let plan = planner.at_frame(3).unwrap();
+        assert_eq!(plan.mode, PlanMode::Motion);
+        let shared = [Some(std::sync::Arc::new(frame.clone()))];
+        for n in [0u64, 1, 2, 29, 1_000_003] {
+            let got = compositor()
+                .composite_yuv_counted(&plan, &shared, &[Some(n)], (w, h))
+                .unwrap();
+            assert_eq!([got.y, got.u, got.v], want(n), "{w}x{h} frame {n}");
+        }
+        // Without its count an export frame's vignette is not drawn.
+        for err in [
+            compositor().composite_yuv_shared(&plan, &shared, (w, h)).unwrap_err(),
+            compositor()
+                .composite_yuv_counted(&plan, &shared, &[None], (w, h))
+                .unwrap_err(),
+        ] {
+            assert!(matches!(err, GpuError::Unsupported(_)), "{err}");
+        }
     }
 }
 

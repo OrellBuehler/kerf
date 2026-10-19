@@ -175,12 +175,16 @@ impl CursorFeed {
     }
 }
 
+/// A layer's picture and its frame count ([`MotionFrames::counts`]).
+type Counted = (Option<Arc<YuvFrame>>, Option<u64>);
+
 /// See the [module](self).
 pub struct MotionFrames {
     source: Arc<FrameSource>,
     config: CursorConfig,
     open: HashMap<Uuid, Open>,
     feed: CursorFeed,
+    counts: Vec<Option<u64>>,
 }
 
 impl MotionFrames {
@@ -201,6 +205,7 @@ impl MotionFrames {
             config,
             open: HashMap::new(),
             feed,
+            counts: Vec::new(),
         }
     }
 
@@ -215,6 +220,21 @@ impl MotionFrames {
     /// renders it through FFmpeg. A clip that is not on this plan has its cursor dropped (its
     /// `ffmpeg` killed). The layers are read side by side.
     pub fn frames(&mut self, plan: &RenderPlan) -> Result<Vec<Option<Arc<YuvFrame>>>, GpuError> {
+        self.counts.clear();
+        let read = self.read_all(plan)?;
+        let (frames, counts) = read.into_iter().unzip();
+        self.counts = counts;
+        Ok(frames)
+    }
+
+    /// For each layer of the last [`MotionFrames::frames`], how many frames its clip's chain had passed
+    /// on before the one read ([`kerf_core::Pick::output_index`]): what an export frame's `vignette`
+    /// needs ([`crate::Compositor::composite_yuv_counted`]).
+    pub fn counts(&self) -> &[Option<u64>] {
+        &self.counts
+    }
+
+    fn read_all(&mut self, plan: &RenderPlan) -> Result<Vec<Counted>, GpuError> {
         let live: Vec<Uuid> = plan.layers.iter().map(|l| l.clip_id).collect();
         self.open.retain(|id, _| live.contains(id));
         {
@@ -293,8 +313,8 @@ impl MotionFrames {
     }
 }
 
-fn read(open: &mut Open, layer: &PlanLayer, frame: u64) -> Result<Option<Arc<YuvFrame>>, GpuError> {
+fn read(open: &mut Open, layer: &PlanLayer, frame: u64) -> Result<Counted, GpuError> {
     let shown = open.cursor.pick(&layer.pick)?;
     open.at = frame;
-    Ok(shown)
+    Ok((shown, open.cursor.count()))
 }

@@ -195,7 +195,7 @@ struct VoiceoverParams {
     )]
     caption_style: Option<CaptionStyle>,
     #[schemars(
-        description = "Ripple override for placing the narration. Omitted, the project's ripple mode applies (get_ripple_mode). With ripple on, narration placed over footage already on the track pushes that footage and everything after it later by its length; appending, or filling free space, moves nothing either way. false places it without moving anything. Tracks ripple independently. Ripple is an attempt, not a guarantee: it is skipped on a locked track, and a lane it would leave overlapping (or before 0) is kept as the edit made it — check get_timeline_state afterwards rather than assuming the later clips moved."
+        description = "Ripple override for placing the narration. Omitted, the project's ripple mode applies (get_ripple_mode). With ripple on, narration placed over footage already on the track pushes that footage and everything after it later by its length; appending, or filling free space, moves nothing either way. false places it without moving anything. Tracks ripple independently. Ripple is an attempt, not a guarantee: it never moves a locked track (and an edit to a clip ON a locked track is refused outright), and a lane it would leave overlapping (or before 0) is kept as the edit made it — check get_timeline_state afterwards rather than assuming the later clips moved."
     )]
     ripple: Option<bool>,
     #[schemars(
@@ -254,7 +254,7 @@ struct ComposeMusicParams {
     )]
     replace_clip_id: Option<String>,
     #[schemars(
-        description = "Ripple override for placing the music, and for the check made before it renders. Omitted, the project's ripple mode applies (get_ripple_mode). It matters when the music lands on or runs into other clips of its track: with ripple on they are pushed later (a start inside a clip is still refused, ripple never splits a clip); with it off the request is refused before anything renders. Appending to the track moves nothing either way. Ripple is an attempt: it is skipped on a locked track, and a lane it would leave overlapping is refused."
+        description = "Ripple override for placing the music, and for the check made before it renders. Omitted, the project's ripple mode applies (get_ripple_mode). It matters when the music lands on or runs into other clips of its track: with ripple on they are pushed later (a start inside a clip is still refused, ripple never splits a clip); with it off the request is refused before anything renders. Appending to the track moves nothing either way. Ripple is an attempt: it never moves a locked track (placing ON one is refused), and a lane it would leave overlapping is refused."
     )]
     ripple: Option<bool>,
     #[schemars(
@@ -360,7 +360,7 @@ struct AddClipParams {
     #[schemars(description = "Timeline position (seconds); omit to append")]
     timeline_start: Option<f64>,
     #[schemars(
-        description = "Ripple override for this call. Omitted, the project's ripple mode applies (get_ripple_mode). With ripple on, a clip dropped onto footage that is already there pushes that footage and everything after it later by the clip's length; appending, or filling a gap it fits in, moves nothing either way. false places the clip exactly as asked. Tracks ripple independently. A clip dropped INSIDE an existing clip would need that clip split, so ripple cannot make room: it leaves the two overlapping — place clips on the boundary between two, or split first, and check get_timeline_state. More generally ripple is an attempt, not a guarantee: it is skipped on a locked track, and a lane it would leave overlapping (or before 0) is kept as the edit made it — check get_timeline_state afterwards rather than assuming the later clips moved."
+        description = "Ripple override for this call. Omitted, the project's ripple mode applies (get_ripple_mode). With ripple on, a clip dropped onto footage that is already there pushes that footage and everything after it later by the clip's length; appending, or filling a gap it fits in, moves nothing either way. false places the clip exactly as asked. Tracks ripple independently. A clip dropped INSIDE an existing clip would need that clip split, so ripple cannot make room: it leaves the two overlapping — place clips on the boundary between two, or split first, and check get_timeline_state. More generally ripple is an attempt, not a guarantee: it never moves a locked track (and placing ON one is refused), and a lane it would leave overlapping (or before 0) is kept as the edit made it — check get_timeline_state afterwards rather than assuming the later clips moved."
     )]
     ripple: Option<bool>,
 }
@@ -395,7 +395,7 @@ struct TrimParams {
     )]
     timeline_start: Option<f64>,
     #[schemars(
-        description = "Ripple override for this call. Omitted, the project's ripple mode applies (get_ripple_mode). With ripple on, the later clips on the same track follow the change in this clip's length, keeping their gaps, and a left-edge trim keeps the clip's start (so timeline_start is not needed). false trims in place and leaves later clips where they are. Tracks ripple independently (trimming on V1 never moves A1). Ripple is an attempt, not a guarantee: it is skipped on a locked track, and a lane it would leave overlapping (or before 0) is kept as the edit made it — check get_timeline_state afterwards rather than assuming the later clips moved."
+        description = "Ripple override for this call. Omitted, the project's ripple mode applies (get_ripple_mode). With ripple on, the later clips on the same track follow the change in this clip's length, keeping their gaps, and a left-edge trim keeps the clip's start (so timeline_start is not needed). false trims in place and leaves later clips where they are. Tracks ripple independently (trimming on V1 never moves A1). Ripple is an attempt, not a guarantee: it never moves a locked track (and an edit to a clip ON a locked track is refused outright), and a lane it would leave overlapping (or before 0) is kept as the edit made it — check get_timeline_state afterwards rather than assuming the later clips moved."
     )]
     ripple: Option<bool>,
     #[schemars(
@@ -435,7 +435,7 @@ struct RemoveClipParams {
     #[schemars(description = "UUID of the clip to remove")]
     clip_id: String,
     #[schemars(
-        description = "Ripple override for this call. Omitted, the project's ripple mode applies (get_ripple_mode). true closes the gap the clip leaves: the later clips on its track shift left by its length, gaps kept (ripple_delete is the same thing as a tool of its own). false leaves the gap. Tracks ripple independently. Ripple is an attempt, not a guarantee: it is skipped on a locked track, and a lane it would leave overlapping (or before 0) is kept as the edit made it — check get_timeline_state afterwards rather than assuming the later clips moved."
+        description = "Ripple override for this call. Omitted, the project's ripple mode applies (get_ripple_mode). true closes the gap the clip leaves: the later clips on its track shift left by its length, gaps kept (ripple_delete is the same thing as a tool of its own). false leaves the gap. Tracks ripple independently. Ripple is an attempt, not a guarantee: it never moves a locked track (and an edit to a clip ON a locked track is refused outright), and a lane it would leave overlapping (or before 0) is kept as the edit made it — check get_timeline_state afterwards rather than assuming the later clips moved."
     )]
     ripple: Option<bool>,
     #[schemars(
@@ -683,7 +683,7 @@ struct SplitRemoveParams {
     #[schemars(description = "Which half to REMOVE: \"left\" (everything before `at`) or \"right\" (everything after it)")]
     side: SplitSide,
     #[schemars(
-        description = "Ripple override for this call. Omitted, the project's ripple mode applies (get_ripple_mode). With ripple on, the later clips on the track close the gap the removed half leaves (a left removal keeps the clip's own start and pulls the rest in); false leaves the gap, as after a plain split and delete. Ripple is an attempt, not a guarantee: it is skipped on a locked track, and a lane it would leave overlapping is kept as the edit made it."
+        description = "Ripple override for this call. Omitted, the project's ripple mode applies (get_ripple_mode). With ripple on, the later clips on the track close the gap the removed half leaves (a left removal keeps the clip's own start and pulls the rest in); false leaves the gap, as after a plain split and delete. Ripple is an attempt, not a guarantee: it never moves a locked track (and an edit to a clip ON a locked track is refused outright), and a lane it would leave overlapping is kept as the edit made it."
     )]
     ripple: Option<bool>,
     #[schemars(
@@ -997,7 +997,7 @@ struct SpeedParams {
     #[schemars(description = "Playback rate: 1.0 = normal, 2.0 = 2x faster, 0.5 = half speed, negative = reverse")]
     speed: f64,
     #[schemars(
-        description = "Ripple override for this call. Omitted, the project's ripple mode applies (get_ripple_mode). With ripple on, the later clips on the same track follow the change in this clip's duration, keeping their gaps; false retimes the clip and leaves later clips where they are (a slowed clip then runs into its neighbour). Tracks ripple independently. Ripple is an attempt, not a guarantee: it is skipped on a locked track, and a lane it would leave overlapping (or before 0) is kept as the edit made it — check get_timeline_state afterwards rather than assuming the later clips moved."
+        description = "Ripple override for this call. Omitted, the project's ripple mode applies (get_ripple_mode). With ripple on, the later clips on the same track follow the change in this clip's duration, keeping their gaps; false retimes the clip and leaves later clips where they are (a slowed clip then runs into its neighbour). Tracks ripple independently. Ripple is an attempt, not a guarantee: it never moves a locked track (and an edit to a clip ON a locked track is refused outright), and a lane it would leave overlapping (or before 0) is kept as the edit made it — check get_timeline_state afterwards rather than assuming the later clips moved."
     )]
     ripple: Option<bool>,
     #[schemars(
@@ -2781,7 +2781,7 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Cut [start, end) of an asset (SOURCE seconds) and append it to the first track of the asset's main kind — the first video track for footage, the first audio track for audio-only media — after the last clip already there. It does not take a track or a position: add_clip_to_timeline does. Returns the clip."
+        description = "Cut [start, end) of an asset (SOURCE seconds) and append it to the first UNLOCKED track of the asset's main kind — the first unlocked video track for footage, the first unlocked audio track for audio-only media — after the last clip already there (every one of them locked refuses). It does not take a track or a position: add_clip_to_timeline does. Returns the clip."
     )]
     fn cut_clip(&self, Parameters(p): Parameters<CutClipParams>) -> Result<String, McpError> {
         let id = parse_arg("asset_id", &p.asset_id)?;
@@ -3310,8 +3310,11 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Lock (or unlock) a track against editing. A locked track still renders; the GUI \
-                       refuses to drag, trim or split its clips."
+        description = "Lock a track against editing. A locked track still renders, but no clip on it is moved, \
+                       trimmed, split, cut, removed, retimed, disabled or reordered and nothing is added or pasted \
+                       onto it (its clips' volume, fades, effects, grade, transform and keyframes stay editable). You \
+                       may lock a track; only the user can unlock one — `locked: false` on a locked track is refused, \
+                       so ask them."
     )]
     fn set_track_locked(&self, Parameters(p): Parameters<SetTrackLockedParams>) -> Result<String, McpError> {
         let track_id = parse_arg("track_id", &p.track_id)?;
@@ -4684,7 +4687,7 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Append the non-silent spans of an asset as clips, end to end after what the first track of the asset's main kind already holds (the first video track for footage, the first audio track for audio-only media), as one revision. It needs the asset's `silence` analysis (analyze_asset with steps [\"silence\"]): with no analysis at all it fails, and if the silence step was never run it keeps the whole file. The silent spans are dropped, not rippled: nothing already on the track moves. Returns the clips."
+        description = "Append the non-silent spans of an asset as clips, end to end after what the first UNLOCKED track of the asset's main kind already holds (the first unlocked video track for footage, the first unlocked audio track for audio-only media; every one of them locked refuses), as one revision. It needs the asset's `silence` analysis (analyze_asset with steps [\"silence\"]): with no analysis at all it fails, and if the silence step was never run it keeps the whole file. The silent spans are dropped, not rippled: nothing already on the track moves. Returns the clips."
     )]
     fn remove_silence(&self, Parameters(p): Parameters<AssetIdParams>) -> Result<String, McpError> {
         let id = parse_arg("asset_id", &p.asset_id)?;
@@ -4889,8 +4892,8 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Add an asset's WHOLE audio, from its start, as a new clip at the end of the first audio track \
-                       (created when there is none). It touches no picture clip, so footage that is also on a video \
+        description = "Add an asset's WHOLE audio, from its start, as a new clip at the end of the first UNLOCKED audio \
+                       track (a new one is made when there is none, or every one is locked). It touches no picture clip, so footage that is also on a video \
                        track playing its own sound is heard twice where the two overlap — to give a clip already cut its \
                        sound as an audio clip use extract_audio / detach_audio, which mute the picture. For music and \
                        other audio-only assets this is how they reach the timeline. One revision. Returns the clip."
@@ -5027,7 +5030,7 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Append the FULL length of each asset in `asset_ids`, in order, to the end of the first track of its kind (footage on the first video track, audio-only media on the first audio track), as one revision — so a video clip and an audio-only clip do not play in sequence with each other, each kind has its own run. For part of an asset use cut_clip or add_clip_to_timeline. Returns the clips."
+        description = "Append the FULL length of each asset in `asset_ids`, in order, to the end of the first UNLOCKED track of its kind (footage on the first unlocked video track, audio-only media on the first unlocked audio track; every one of a kind locked refuses), as one revision — so a video clip and an audio-only clip do not play in sequence with each other, each kind has its own run. For part of an asset use cut_clip or add_clip_to_timeline. Returns the clips."
     )]
     fn concatenate(&self, Parameters(p): Parameters<ConcatParams>) -> Result<String, McpError> {
         let ids = p
@@ -6450,7 +6453,17 @@ const INSTRUCTIONS: &str = "Kerf MCP server. The user queues editing tasks in th
              same amount, so a sound that leads or trails its picture stays that far \
              off; add_asset_audio puts an asset's whole audio on an audio track. Layer footage with add_track / \
              remove_track — e.g. add a video track and move_clip B-roll onto it \
-             over the interview (later video tracks composite on top). Polish \
+             over the interview (later video tracks composite on top). A LOCKED \
+             track (`locked` in get_timeline_state; the user can lock one while \
+             your edits are under review, and the lock holds for them too) is the \
+             user's: a clip on it is not moved, trimmed, split, cut, removed, \
+             retimed, disabled or reordered, and nothing is added or pasted onto \
+             it — the call fails with `track V1 is locked` and changes nothing; \
+             its clips' volume, fades, effects, grade, transform and keyframes can \
+             still be set. You may lock a track but not unlock one (set_track_locked \
+             false is refused) nor remove a locked one: ask the user to unlock it \
+             rather than working around it; a clip added without a track goes to \
+             the first unlocked one. Polish \
              with set_volume / set_fade (fade-in/out, e.g. to smooth hard cuts), \
              set_speed, set_transform (scale / position / rotation / opacity / \
              crop — picture-in-picture; set_transform_at for an animated clip, which keys \
@@ -7942,6 +7955,16 @@ mod tests {
         assert!(text.contains("\"this clip\""), "{text}");
     }
 
+    /// The agent is told what a lock refuses and what it leaves, in the words the refusal uses.
+    #[test]
+    fn the_server_instructions_say_what_a_locked_track_refuses() {
+        let text = super::INSTRUCTIONS;
+        assert!(text.contains("A LOCKED track"), "{text}");
+        assert!(text.contains("`track V1 is locked`"), "{text}");
+        assert!(text.contains("first unlocked one"), "{text}");
+        assert!(text.contains("You may lock a track but not unlock one"), "{text}");
+    }
+
     fn call(name: &'static str, args: serde_json::Value) -> rmcp::model::CallToolRequestParams {
         rmcp::model::CallToolRequestParams::new(name).with_arguments(args.as_object().unwrap().clone())
     }
@@ -9104,12 +9127,12 @@ mod tests {
         };
         let silence = description("remove_silence");
         assert!(
-            silence.contains("analyze_asset") && silence.contains("silence") && silence.contains("first video track"),
+            silence.contains("analyze_asset") && silence.contains("silence") && silence.contains("first unlocked video track"),
             "{silence}"
         );
         let cut = description("cut_clip");
         assert!(
-            cut.contains("SOURCE") && cut.contains("add_clip_to_timeline") && cut.contains("first"),
+            cut.contains("SOURCE") && cut.contains("add_clip_to_timeline") && cut.contains("first UNLOCKED"),
             "{cut}"
         );
         let concat = description("concatenate");
@@ -9318,6 +9341,50 @@ mod tests {
         assert!(matches!(e, kerf_core::Error::StagedEditOwnedByOther), "{e}");
         let e = stranger.undo_staged().map(|_| ()).unwrap_err();
         assert!(matches!(e, kerf_core::Error::StagedEditOwnedByOther), "{e}");
+    }
+
+    /// Through the door every edit tool takes, an agent's edit to a clip on a track the user locked is
+    /// refused in the words the instructions promise — and leaves no proposal behind — and the agent
+    /// cannot unlock the track either.
+    #[test]
+    fn an_agent_session_is_refused_a_locked_track_and_cannot_unlock_it() {
+        let project = kerf_core::Project::open_in_memory().unwrap();
+        let asset: kerf_core::Asset = serde_json::from_value(serde_json::json!({
+            "id": uuid::Uuid::new_v4(),
+            "path": "/footage/a.mp4",
+            "name": "a.mp4",
+            "duration": 10.0,
+            "streams": [{ "index": 0, "kind": "video", "codec": "h264", "width": 1920, "height": 1080, "fps": 30.0 }],
+            "imported_at": "2025-01-01T00:00:00Z",
+        }))
+        .unwrap();
+        project.insert_or_get_asset(&asset).unwrap();
+        let clip = project.add_clip_to_timeline(asset.id, None, 0.0, 4.0, Some(0.0)).unwrap();
+        let v1 = project.timeline().unwrap().tracks[0].id;
+        project.set_track_locked(v1, true).unwrap();
+        let shared = std::sync::Mutex::new(project);
+
+        {
+            let agent = super::lock_agent_edit(&shared, Some("session-a")).unwrap();
+            assert!(
+                agent.working_timeline().unwrap().track(v1).unwrap().locked,
+                "the agent sees the lock"
+            );
+            let refused = agent.split_at(clip.id, 1.0).map_err(super::core_err).unwrap_err();
+            assert_eq!(refused.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+            assert!(
+                refused.message.contains("track V1 is locked"),
+                "the refusal names the locked track"
+            );
+            assert!(agent.staged().unwrap().is_none(), "a refused edit opens no proposal");
+        }
+        let agent = super::lock_agent_edit(&shared, Some("session-a")).unwrap();
+        let refused = agent.set_track_locked(v1, false).map_err(super::core_err).unwrap_err();
+        assert!(
+            refused.message.contains("an agent cannot unlock a track"),
+            "the refusal says an agent cannot unlock"
+        );
+        assert!(agent.timeline().unwrap().track(v1).unwrap().locked);
     }
 
     /// A task removed by an agent that does not own the proposal under it stays in the queue; the

@@ -87,7 +87,12 @@ nothing), and a valid drop is ONE `editor.moveClips` — one revision, one undo.
 `removeClips(ids)` (one revision; ripple follows the project's mode) and Shift+Delete
 forces ripple; a clip on a locked track is left alone and stays selected, and Cut
 (⌘/Ctrl+X) copies only what it can remove and says so when that is nothing (`ops.ts`
-`deleteSelection` / `cutSelection`). *Zoom*
+`deleteSelection` / `cutSelection`). Paste puts each clip back on the track it came from unless that track is
+locked, then on the first unlocked one of its kind, or gone, then on one of the clip's own kind (`clipKind`: a
+title or a picture alone is video, sound alone audio; footage with both, or not in the bin, refuses rather than
+guesses), and says why when it cannot; Duplicate (which stays on
+each clip's own track) is off with the lock named; the Inspector's Rate, Reverse, Remove and Ripple delete are off
+on a locked track's clip (`track-locks.ts`; the core refuses all of them). *Zoom*
 (`zoom.ts`): 0.05–2000 px/s, `ui.zoom` still px/s but stepped by ratio (+/-, buttons ×1.25)
 and a logarithmic slider; ⌘/Ctrl + wheel is exponential in the delta (a pinch is smooth) and
 holds the time under the pointer (`zoomAround`; the scroll is applied after the lane has

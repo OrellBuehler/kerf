@@ -160,7 +160,10 @@
   the first frame read: nothing there if the run began at the file's start, else restart
   earlier — only the cursor knows which) or `Ready { shown, keep_from }`, answers exactly as the
   whole file would, and answers as early as it can (one frame past the shown one, or at the
-  window's end); `FpsPick::seek()` is where the run must begin; reverse needs every pts of
+  window's end); **`Pick::output_index(&read)`** is how many frames the clip's chain has passed on
+  before the shown one (a still's pick 0: the still graph runs one frame through it; an `Fps` pick its
+  slot counted from the window's first frame's, any speed or direction), which a filter that counts
+  frames needs (`vignette`'s dither, `gpu.md`); `FpsPick::seek()` is where the run must begin; reverse needs every pts of
   the window; a non-all-intra transport stream
   may not deliver the picked frame after an `-ss` (**both** builds — the design note's "6.1
   only" was wrong; an all-intra one is exact). **A fade on a layer with an alpha plane goes to
@@ -269,7 +272,7 @@
   **What the compositor may draw is data**: `GpuCaps` (`Compositor::caps()`: the bits `motion`, `fades`,
   `transitions`, `dip_white`, `keyed_opacity`, `keyed_zoom`, `keyed_color`, `mask`, `text`, `reframe`, `hdr` and an
   `EffectKinds` bitset; today `GpuCaps::A0` plus every one of them but `keyed_opacity`, `keyed_color`, `reframe`, `hdr`
-  and the vignette kind), and **`RenderPlan::reasons(&caps,
+  with every effect kind), and **`RenderPlan::reasons(&caps,
   size)` is a pure function of the plan's fields** returning `Unsupported` values whose
   `Display` is the message the plan has always given — nothing is decided while planning,
   so one plan answers for any caps and an A5 pass is a flip beside the pass and its parity
@@ -313,10 +316,10 @@
   The policy condition is a **proxy measured only on FFmpeg 6.1.1 and 9.0.2** (5.x, 7.x, 8.x and distro builds are unmeasured).
   **`gpu_supported_at(size)` is the per-frame fallback switch** (`gpu_supported()` is
   its size-free half; `unsupported_reasons_at(size)` says *no, with reasons*) for
-  anything the compositor does not render exactly: video effects (`Effects(layer, what)`: names the effect and
-  why — a vignette's dither is a counter that runs on across frames — or the value
-  `gblur` / `unsharp` refuse itself: a sigma outside 0 to 1024, an amount outside -2 to 5; or what the picture changes: an invert, blur or sharpen on a full-range or never-recorded picture, an invert on a gray one, a chroma key on anything but a `yuv420p` one, or on a rotated or translucent layer; in `reasons` a chroma key after a scale ahead of the effects or a blur (its alpha moves by up to 1/blend levels for a level of chroma); and in `reasons`, by render size, a sharpen after a scale or a blur: from the first scale or blur with sigma > 0, the worst case starts at 1 and each later non-zero sharpen adds `ceil(2 * err * |amount|)`, so the frame is refused past 2: one sharpen above 0.5, or a second one), masks (`Mask` without `caps.mask`;
-  `MaskWith(layer, what)` with it, on a rotated layer or one below full opacity, or over a chroma key; `Matte(layer, what)` for a blur, a sharpen or a chroma key on a
+  anything the compositor does not render exactly: video effects (`Effects(layer, what)`: names the effect without its kind
+  in the caps, or the value
+  `gblur` / `unsharp` refuse itself: a sigma outside 0 to 1024, an amount outside -2 to 5; or what the picture changes: an invert, blur or sharpen on a full-range or never-recorded picture, an invert on a gray one, a vignette on anything but a limited-range `yuv420p` one (`vignette` works in the picture's own format), a chroma key on anything but a `yuv420p` one, or on a rotated or translucent layer; in `reasons` a chroma key after a scale ahead of the effects or a blur (its alpha moves by up to 1/blend levels for a level of chroma); and in `reasons`, by render size, a sharpen after a scale or a blur: from the first scale or blur with sigma > 0, the worst case starts at 1 and each later non-zero sharpen adds `ceil(2 * err * |amount|)`, so the frame is refused past 2: one sharpen above 0.5, or a second one), masks (`Mask` without `caps.mask`;
+  `MaskWith(layer, what)` with it, on a rotated layer or one below full opacity, or over a chroma key; `Matte(layer, what)` for a blur, a sharpen, a vignette or a chroma key on a
   letterboxed picture, judged with the geometry in `reasons`: FFmpeg's `pad` hands them the padded frame, bars included — a mask is cut
   from that frame too and is drawn at the layer's size), 360 reframe,
   HDR, a text overlay it cannot reproduce (below), a fade or transition in progress, a non-bicubic scaler, a
