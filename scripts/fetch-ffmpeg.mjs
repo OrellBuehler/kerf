@@ -140,7 +140,7 @@ const MIRROR = "https://github.com/OrellBuehler/kerf/releases/download/ffmpeg-mi
 
 async function fromMirror(name, sha256) {
   try {
-    const res = await fetch(`${MIRROR}/${name}`);
+    const res = await fetch(`${MIRROR}/${name}`, { signal: AbortSignal.timeout(120_000) });
     if (!res.ok) return null;
     const bytes = new Uint8Array(await res.arrayBuffer());
     const digest = new Bun.CryptoHasher("sha256").update(bytes).digest("hex");

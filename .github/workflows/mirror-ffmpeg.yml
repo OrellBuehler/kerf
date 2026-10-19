@@ -21,6 +21,7 @@ concurrency:
 
 jobs:
   mirror:
+    if: github.ref == 'refs/heads/main'
     runs-on: macos-15-intel
     timeout-minutes: 20
     # Creates the prerelease and uploads its assets. A prerelease marked not
@@ -52,4 +53,9 @@ jobs:
           gh release view ffmpeg-mirror > /dev/null 2>&1 ||
             gh release create ffmpeg-mirror --prerelease --latest=false \
               --title "FFmpeg mirror" --notes "Pinned FFmpeg archives for CI, named <sha256>-<file>. See scripts/fetch-ffmpeg.mjs."
-          gh release upload ffmpeg-mirror .ffmpeg-archives/* --clobber
+          for f in .ffmpeg-archives/*; do
+            sha="$(basename "$f" | cut -d- -f1)"
+            if grep -q "$sha" scripts/fetch-ffmpeg.mjs && [ "$(shasum -a 256 "$f" | cut -d' ' -f1)" = "$sha" ]; then
+              gh release upload ffmpeg-mirror "$f" --clobber
+            fi
+          done
