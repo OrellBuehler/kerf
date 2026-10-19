@@ -3,8 +3,11 @@
 //! [`apply_values`] is **pure**: the title's text in, the title's text out, each value checked for its
 //! kind, escaped, and spliced in by byte range at the element its control points to. What comes out is
 //! not trusted any more than what went in: [`Template::prepare`] and [`TemplateEditInputs::prepare`]
-//! hand it to the sanitiser (`SvgDoc::parse`) like any custom SVG, and that — the up to a second and a
-//! half of parsing — is why they are separate steps from the ones under the project lock.
+//! hand it to the sanitiser (`SvgDoc::parse`) like any custom SVG, then set its text as glyph outlines
+//! (`SvgDoc::outlined`), so the title draws without its fonts; that — the up to a second and a half of
+//! parsing, and the text engine — is why they are separate steps from the ones under the project lock.
+//! The values are always spliced into the title's text form (`svg::restore_text`): the outlines are made
+//! again from it after every change.
 
 use std::collections::BTreeMap;
 
@@ -16,7 +19,7 @@ use super::validate::{has_control_chars, invalid, validate_controls_shape, MAX_F
 use crate::error::Result;
 use crate::fonts::{self, EmbeddedFont};
 use crate::svg::splice::{self, Elements, Part};
-use crate::svg::{images, SvgDoc};
+use crate::svg::{images, restore_text, SvgDoc};
 
 fn part(target: &super::model::TemplateTarget) -> Part<'_> {
     match target.attribute.as_deref() {
@@ -234,12 +237,13 @@ pub struct PreparedTemplate {
 }
 
 impl Template {
-    /// Apply `values` (partial: control id to value) to this template's title and read the result. Pure
-    /// and slow (the sanitiser): not for under the project lock.
+    /// Apply `values` (partial: control id to value) to this template's title, read the result and set
+    /// its text as outlines with the fonts the template carries. Pure and slow (the sanitiser, the text
+    /// engine): not for under the project lock.
     pub fn prepare(&self, values: &BTreeMap<String, String>) -> Result<PreparedTemplate> {
         let m = &self.manifest;
-        let spliced = apply_values(&self.svg, &m.controls, values)?;
-        let doc = SvgDoc::parse(&spliced)?;
+        let spliced = apply_values(&restore_text(&self.svg)?, &m.controls, values)?;
+        let doc = SvgDoc::parse(&spliced)?.outlined(&fonts::svg_fontdb_with(&self.fonts))?;
         let now = read_values(doc.sanitized(), &m.controls);
         let carried: Vec<&str> = m.fonts.iter().map(|f| f.family.as_str()).collect();
         let mut warnings = doc.warnings().to_vec();
@@ -285,10 +289,11 @@ impl TemplateEditInputs {
         &self.instance.controls
     }
 
-    /// Apply `values` (partial) to the title as it is now and read the result. Pure and slow: not for
-    /// under the project lock. **No values is an error**, not an edit that changes nothing: it would
-    /// record a revision that did nothing. The controls were stored with the title, so they are checked
-    /// again before they are trusted to say where a value goes.
+    /// Apply `values` (partial) to the title as it is now, read the result and set its text as outlines
+    /// with the fonts the project embeds that the new title names (a font control may name one the old
+    /// one did not). Pure and slow: not for under the project lock. **No values is an error**, not an
+    /// edit that changes nothing: it would record a revision that did nothing. The controls were stored
+    /// with the title, so they are checked again before they are trusted to say where a value goes.
     pub fn prepare(&self, values: &BTreeMap<String, String>) -> Result<PreparedValues> {
         if values.is_empty() {
             return Err(invalid(
@@ -296,8 +301,10 @@ impl TemplateEditInputs {
             ));
         }
         validate_controls_shape(&self.instance.controls)?;
-        let spliced = apply_values(&self.svg, &self.instance.controls, values)?;
+        let spliced = apply_values(&restore_text(&self.svg)?, &self.instance.controls, values)?;
         let doc = SvgDoc::parse(&spliced)?;
+        let db = fonts::snapshot_for([doc.sanitized()]).db();
+        let doc = doc.outlined(&db)?;
         let now = read_values(doc.sanitized(), &self.instance.controls);
         let mut warnings = doc.warnings().to_vec();
         warnings.extend(font_warnings(&self.instance.controls, &now, &[]));
@@ -716,5 +723,59 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("two controls"));
+    }
+
+    #[test]
+    fn a_title_is_set_as_outlines_and_set_again_from_its_text_on_every_change() {
+        let t = crate::template::fixtures::template();
+        let applied = t.prepare(&values(&[("tagline", "Kite fun")])).unwrap();
+        let svg = applied.doc.sanitized().to_string();
+        assert!(svg.contains("data-kerf-text=\"\"") && !svg.contains("<text"), "{svg}");
+        assert_eq!(applied.instance.values["tagline"], "Kite fun");
+        let glyphs = |svg: &str| svg.matches("<path d=").count();
+        assert_eq!(glyphs(&svg), 7);
+        let again = TemplateEditInputs::new(uuid::Uuid::new_v4(), svg.clone(), applied.instance)
+            .prepare(&values(&[("tagline", "Kite")]))
+            .unwrap();
+        assert_eq!(again.values["tagline"], "Kite");
+        assert_eq!(glyphs(again.doc.sanitized()), 4);
+        assert_eq!(again.base_svg, svg);
+        let text = restore_text(again.doc.sanitized()).unwrap();
+        assert!(text.contains(">Kite</text>") && !text.contains("data-kerf"), "{text}");
+    }
+
+    #[test]
+    fn a_font_control_set_to_a_family_the_project_embeds_outlines_in_it() {
+        use crate::fonts::shipped_font_renamed;
+        let outlined = |svg: &str| {
+            SvgDoc::parse(svg)
+                .unwrap()
+                .outlined(&fonts::svg_fontdb())
+                .unwrap()
+                .sanitized()
+                .to_string()
+        };
+        let svg = outlined(SVG);
+        assert!(svg.contains("data-kerf-text"), "{svg}");
+        let set = apply_values(SVG, &controls(), &values(&[("face", "Zeist")])).unwrap();
+        let in_geist = outlined(&set);
+        assert!(fonts::register_embedded(&[EmbeddedFont::new(
+            "Zeist",
+            shipped_font_renamed(true, "Zeist")
+        )]));
+        let in_zeist = outlined(&set);
+        assert_ne!(in_zeist, in_geist, "the embedded face is another one");
+        let instance = TemplateInstance {
+            template_id: "t".into(),
+            name: "t".into(),
+            controls: controls(),
+            values: read_values(&svg, &controls()),
+        };
+        // Only the new value names the family: the title as it was does not.
+        let got = TemplateEditInputs::new(uuid::Uuid::new_v4(), svg, instance)
+            .prepare(&values(&[("face", "Zeist")]))
+            .unwrap();
+        fonts::replace_embedded(Vec::new());
+        assert_eq!(got.doc.sanitized(), in_zeist);
     }
 }

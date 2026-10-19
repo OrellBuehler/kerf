@@ -25,6 +25,7 @@
 mod anim;
 mod cost;
 pub(crate) mod images;
+mod outline;
 mod presets;
 pub mod raster;
 mod rules;
@@ -43,6 +44,7 @@ use anim::{Calc, Resolver, Restart, Sample, Spec, TimeItem, Timing, INF};
 use sanitize::{escape_attr, is_attribute_name, plain_attribute, value_range, SVG_NS, XLINK_NS};
 use values::{TransformType, Value};
 
+pub use outline::restore_text;
 pub use presets::{check_params, preset_infos, render_preset, SvgPresetInfo, SvgPresetParamInfo, DEFAULT_FRAME};
 
 /// Whether sanitised source could move at all: whether it holds an animation element (`animate`,
@@ -293,6 +295,30 @@ impl SvgDoc {
             natural,
             widest_image,
         })
+    }
+
+    /// The document with its text set as glyph outlines where it can be, with the faces of `db` (see
+    /// `outline.rs`), and read again; what only outlines honour and could not be is added to the
+    /// warnings. A document whose outlines do not read (over a cap the text was under) stays as it was.
+    /// Slow (the text engine, and the sanitiser once more when anything was outlined): not for under the
+    /// project lock.
+    pub(crate) fn outlined(self, db: &fontdb::Database) -> Result<SvgDoc> {
+        let out = outline::outline_text(&self.src, db)?;
+        let mut doc = match out.count {
+            0 => self,
+            _ => match SvgDoc::parse(&out.svg) {
+                Ok(mut doc) => {
+                    doc.warnings = self.warnings;
+                    doc
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "a title's outlines did not read; its text is drawn with its fonts");
+                    self
+                }
+            },
+        };
+        doc.warnings.extend(out.warnings);
+        Ok(doc)
     }
 
     /// The sanitised source.

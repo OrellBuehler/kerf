@@ -114,16 +114,16 @@ fn a_legacy_file_is_backed_up_once_then_upgraded() {
 }
 
 /// The columns are there, so their steps change nothing; the file is still copied aside, once,
-/// for v5, v6 and v7 (JSON steps: `needed` always, so an older build's file is kept before it is locked out).
+/// for v5, v6, v7 and v8 (JSON steps: `needed` always, so an older build's file is kept before it is locked out).
 #[test]
 fn a_legacy_file_that_already_has_the_columns_is_backed_up_only_for_the_json_step() {
     let dir = scratch();
     let path = dir.join("cut.kerf");
     edited(1).0.save_as(&path).unwrap();
     make_legacy(&path, true);
-    // Every step that adds a table or a column finds it there; only v5, v6 and v7 (JSON steps) are pending.
+    // Every step that adds a table or a column finds it there; only v5 to v8 (JSON steps) are pending.
     let pending: Vec<u32> = store::pending_steps(&Connection::open(&path).unwrap(), 0);
-    assert_eq!(pending, vec![4, 5, 6], "only the v4 -> v5, v5 -> v6 and v6 -> v7 steps");
+    assert_eq!(pending, vec![4, 5, 6, 7], "only the v4 -> v5 to v7 -> v8 steps");
     drop(Project::open(&path).unwrap());
     assert_eq!(version_of(&path), SCHEMA_VERSION);
     let mut names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
@@ -251,7 +251,7 @@ fn a_v2_file_is_backed_up_once_then_gets_the_fonts_table() {
     let path = dir.join("cut.kerf");
     edited(2).0.save_as(&path).unwrap();
     make_v2(&path);
-    assert_eq!(SCHEMA_VERSION, 7);
+    assert_eq!(SCHEMA_VERSION, 8);
     assert!(!has_fonts_table(&path));
 
     let project = Project::open(&path).unwrap();
@@ -281,7 +281,7 @@ fn a_v2_file_is_backed_up_once_then_gets_the_fonts_table() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// The fonts table is there, so v3 changes nothing; the one backup is for v5, v6 and v7 (JSON steps).
+/// The fonts table is there, so v3 changes nothing; the one backup is for v5 to v8 (JSON steps).
 #[test]
 fn a_v2_file_that_already_has_the_fonts_table_is_backed_up_only_for_the_json_step() {
     let dir = scratch();
@@ -291,7 +291,7 @@ fn a_v2_file_that_already_has_the_fonts_table_is_backed_up_only_for_the_json_ste
         .unwrap()
         .pragma_update(None, "user_version", 2)
         .unwrap();
-    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 2), vec![4, 5, 6]);
+    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 2), vec![4, 5, 6, 7]);
     drop(Project::open(&path).unwrap());
     assert_eq!(version_of(&path), SCHEMA_VERSION);
     assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2, "the file and its backup");
@@ -508,6 +508,47 @@ fn the_history_limit_never_drops_the_head() {
     assert!(project.history().unwrap()[0].current);
 }
 
+/// A template title as applied: its text stored as glyph outlines.
+fn outlined_title(project: &Project) -> SvgOverlay {
+    let applied = project
+        .apply_template(
+            &crate::template::fixtures::template(),
+            &Default::default(),
+            0.0,
+            None,
+            SvgLayout::default(),
+        )
+        .unwrap();
+    assert!(applied.overlay.svg.contains("data-kerf-text"), "{}", applied.overlay.svg);
+    applied.overlay
+}
+
+#[test]
+fn a_v7_file_is_backed_up_stamped_v8_and_keeps_its_outlined_title() {
+    let dir = scratch();
+    let path = dir.join("cut.kerf");
+    let (project, _) = edited(0);
+    let title = outlined_title(&project);
+    project.save_as(&path).unwrap();
+    drop(project);
+    Connection::open(&path)
+        .unwrap()
+        .pragma_update(None, "user_version", 7)
+        .unwrap();
+    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 7), vec![7]);
+
+    let project = Project::open(&path).unwrap();
+    assert_eq!(version_of(&path), SCHEMA_VERSION);
+    let kept = project.timeline().unwrap().svg_overlays;
+    assert_eq!(
+        kept.iter().find(|o| o.id == title.id).map(|o| o.svg.as_str()),
+        Some(title.svg.as_str())
+    );
+    drop(project);
+    assert_eq!(version_of(&schema_backup_path(&path, 7)), 7);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn a_v6_file_is_backed_up_stamped_v7_and_keeps_its_keyed_mask_and_crop() {
     let dir = scratch();
@@ -529,7 +570,7 @@ fn a_v6_file_is_backed_up_stamped_v7_and_keeps_its_keyed_mask_and_crop() {
         .unwrap()
         .pragma_update(None, "user_version", 6)
         .unwrap();
-    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 6), vec![6]);
+    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 6), vec![6, 7]);
 
     let project = Project::open(&path).unwrap();
     assert_eq!(version_of(&path), SCHEMA_VERSION);
@@ -580,6 +621,7 @@ const PERSISTED: &[(u32, &str)] = &[
     (5, include_str!("persisted/timelines-v5.json")),
     (6, include_str!("persisted/timelines-v6.json")),
     (7, include_str!("persisted/timelines-v7.json")),
+    (8, include_str!("persisted/timelines-v8.json")),
 ];
 
 fn persisted_path(version: u32) -> PathBuf {
@@ -601,6 +643,10 @@ fn the_stored_timeline_shape_moves_only_with_the_schema_version() {
     if std::env::var_os("KERF_BLESS_PERSISTED").is_some() {
         let mut timelines = vec![Project::sample().unwrap().timeline().unwrap()];
         timelines.extend(crate::engine::sample_timelines());
+        // A template title, its text as outlines (v8).
+        let titled = Project::sample().unwrap();
+        outlined_title(&titled);
+        timelines.push(titled.timeline().unwrap());
         let lines: Vec<String> = timelines.iter().map(|t| serde_json::to_string(t).unwrap()).collect();
         std::fs::write(persisted_path(SCHEMA_VERSION), format!("[\n{}\n]\n", lines.join(",\n"))).unwrap();
         return;

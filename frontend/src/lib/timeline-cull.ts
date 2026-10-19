@@ -11,11 +11,13 @@
  * to read stays a button however many are in view.
  *
  * What the pointer or the keyboard holds is a button wherever it is (`pinnedClips`): the pressed
- * clip (whose button holds the pointer capture), the one under the pointer (so a press lands on a
- * real clip: the canvas promotes it on hover), the one with focus and the one being nudged. What
- * a gesture only *moves* — a selection dragged along, the clips a ripple trim shifts — is drawn
- * from the model (the ghosts), so it is not kept off screen: a select-all over a long cut mounts
- * nothing more. A shorter lane is drawn whole, as it always was. */
+ * clip (whose button holds the pointer capture), the one with focus and the one being nudged. The
+ * block under the pointer is promoted to a button too (so a press lands on a real clip), outside the
+ * drawing (`laneButtons`, at its place in lane order), not in it: a hover change leaves every lane's blocks as they were,
+ * and no canvas redraws for it. What a gesture only *moves* — a selection dragged along, the clips
+ * a ripple trim shifts — is drawn from the model (the ghosts, `ghostsInView`: only those in view),
+ * so it is not kept off screen: a select-all over a long cut mounts nothing more. A shorter lane is
+ * drawn whole, as it always was. */
 
 /** Below this many clips a lane is drawn whole. */
 export const CULL_MIN_CLIPS = 48;
@@ -44,17 +46,46 @@ export function clipBox(c: CullClip, duration: number, pxPerSec: number): { left
 }
 
 /** The clips the pointer or the keyboard holds, which are buttons wherever they are: the pressed
- *  ones (a drag's or a trim's clip, both sides of a rolled cut), the hovered, the focused and the
- *  nudged one. */
+ *  ones (a drag's or a trim's clip, both sides of a rolled cut), the focused and the nudged one. */
 export function pinnedClips(held: {
 	pressed?: readonly (string | null | undefined)[];
-	hovered?: string | null;
 	focused?: string | null;
 	nudged?: string | null;
 }): ReadonlySet<string> {
 	const out = new Set<string>();
-	for (const id of [...(held.pressed ?? []), held.hovered, held.focused, held.nudged]) if (id) out.add(id);
+	for (const id of [...(held.pressed ?? []), held.focused, held.nudged]) if (id) out.add(id);
 	return out;
+}
+
+/** A lane's buttons: its drawing's, and the block under the pointer promoted to one **at its place in
+ *  lane order** — where the drawing puts it once a press pins it, so the press never moves its node (a
+ *  keyed each moving a node drops the pointer capture the press just took). Clips in a lane do not
+ *  overlap, so their starts are that order. The drawing's own array is returned as it is when no
+ *  block is hovered. */
+export function laneButtons<T extends CullClip>(drawing: LaneDrawing<T>, hovered: string | null): readonly T[] {
+	if (!hovered || drawing.blocks.length === 0) return drawing.buttons;
+	const block = drawing.blocks.find((c) => c.id === hovered);
+	if (!block) return drawing.buttons;
+	const at = drawing.buttons.findIndex((c) => c.timeline_start > block.timeline_start);
+	const out = [...drawing.buttons];
+	out.splice(at < 0 ? out.length : at, 0, block);
+	return out;
+}
+
+/** The ghosts of a gesture whose box (from `start`, at least `minPx` wide) meets the visible window
+ *  `[lo, hi)` px: a ripple trim or a select-all drag on a long lane moves every clip after it, and only
+ *  those in view are drawn. */
+export function ghostsInView<T extends { start: number; dur: number }>(
+	ghosts: readonly T[],
+	pxPerSec: number,
+	lo: number,
+	hi: number,
+	minPx: number
+): T[] {
+	return ghosts.filter((g) => {
+		const left = g.start * pxPerSec;
+		return left < hi && left + Math.max(minPx, g.dur * pxPerSec) > lo;
+	});
 }
 
 /** How a lane draws `clips` with `[lo, hi)` px of it in view: everything as buttons when there are

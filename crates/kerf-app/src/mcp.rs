@@ -2359,25 +2359,39 @@ fn svg_preview(
     Ok((png, svg_sheet_caption(&title.label, &times, title.offset, warnings)))
 }
 
+/// `f` on the source of every animated title of `timeline`: the floating ones and the title clips.
+fn each_title_svg(timeline: &mut Timeline, mut f: impl FnMut(&mut String)) {
+    for o in &mut timeline.svg_overlays {
+        f(&mut o.svg);
+    }
+    for clip in timeline.tracks.iter_mut().flat_map(|t| t.clips.iter_mut()) {
+        if let Some(title) = clip.title_clip_mut() {
+            f(&mut title.svg);
+        }
+    }
+}
+
+/// A template title's text is stored as glyph outlines, which are the engine's business: an agent
+/// reads the text form (`svg::restore_text`), the `<text>` it can see and set through the controls.
+fn restore_title_text(timeline: &mut Timeline) {
+    each_title_svg(timeline, |svg| {
+        if let Ok(text) = kerf_core::svg::restore_text(svg) {
+            *svg = text;
+        }
+    });
+}
+
 /// Leave the sources of large SVG titles out of a timeline read: a title can carry 128 KiB and a
 /// timeline 50 of them. The note says how to get the source.
 fn elide_large_svg(timeline: &mut Timeline) {
-    let elide = |svg: &mut String| {
+    each_title_svg(timeline, |svg| {
         if svg.len() > SVG_INLINE_LIMIT {
             *svg = format!(
                 "[{} bytes of SVG left out; call get_timeline_state with full_svg=true to read it]",
                 svg.len()
             );
         }
-    };
-    for o in &mut timeline.svg_overlays {
-        elide(&mut o.svg);
-    }
-    for clip in timeline.tracks.iter_mut().flat_map(|t| t.clips.iter_mut()) {
-        if let Some(title) = clip.title_clip_mut() {
-            elide(&mut title.svg);
-        }
-    }
+    });
 }
 
 #[derive(Serialize)]
@@ -2570,10 +2584,12 @@ impl KerfMcp {
                        captions_offset / captions_limit, or pass `full: true` for everything inline. Animated SVG titles \
                        (`svg_overlays`) carry their SVG source here, but a source over 4 KiB is replaced by a note with \
                        its size (a title can be 128 KiB): pass `full_svg: true` (or `full`) to get every source whole. \
-                       timeline_summary is much smaller (durations, gaps, proxies); preview_svg_overlay shows how a title looks."
+                       A template title's source is shown with its text as `<text>` (it is drawn as glyph outlines, \
+                       which are left out); set its text with set_template_values. timeline_summary is much smaller (durations, gaps, proxies); preview_svg_overlay shows how a title looks."
     )]
     fn get_timeline_state(&self, Parameters(p): Parameters<TimelineStateParams>) -> Result<String, McpError> {
         let mut timeline = self.lock().working_timeline().map_err(core_err)?;
+        restore_title_text(&mut timeline);
         let full = p.full.unwrap_or(false);
         if !(full || p.full_svg.unwrap_or(false)) {
             elide_large_svg(&mut timeline);
