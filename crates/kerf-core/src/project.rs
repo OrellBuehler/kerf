@@ -4808,8 +4808,13 @@ impl Project {
         let mask = mask.map(Mask::normalized);
         self.edit_timeline(if mask.is_some() { "Mask clip" } else { "Clear mask" }, |timeline| {
             let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
-            timeline.tracks[ti].clips[ci].mask = mask;
-            Ok(timeline.tracks[ti].clips[ci].clone())
+            let clip = &mut timeline.tracks[ti].clips[ci];
+            clip.mask = mask;
+            // Clearing the mask clears its keys: there is nothing left for them to move.
+            if clip.mask.is_none() {
+                clip.channels.retain(|c| !c.prop.is_mask());
+            }
+            Ok(clip.clone())
         })
     }
 
@@ -5837,6 +5842,7 @@ impl Project {
         self.edit_timeline(&format!("Set {} keyframes", prop.label()), move |timeline| {
             let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
             let clip = &mut timeline.tracks[ti].clips[ci];
+            check_keyable(clip, prop, &keys)?;
             clip.set_property_keys(prop, keys);
             Ok(clip.clone())
         })
@@ -5859,6 +5865,9 @@ impl Project {
         self.edit_timeline("Edit keyframes", move |timeline| {
             let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
             let clip = &mut timeline.tracks[ti].clips[ci];
+            for t in &tracks {
+                check_keyable(clip, t.prop, &t.keys)?;
+            }
             for t in tracks {
                 clip.set_property_keys(t.prop, t.keys);
             }
@@ -5916,7 +5925,14 @@ impl Project {
                     )));
                 }
             }
-            let tracks = source.property_keys_shifted(&props, offset);
+            // Every keyed number, when none is named: a mask's numbers only onto a clip that has a
+            // mask (they would be refused, and the rest would not be copied).
+            let maskless = props.is_empty() && timeline.clip(to_clip).is_some_and(|c| c.mask.is_none());
+            let tracks: Vec<PropertyTrack> = source
+                .property_keys_shifted(&props, offset)
+                .into_iter()
+                .filter(|t| !(maskless && t.prop.is_mask()))
+                .collect();
             if tracks.is_empty() {
                 return Err(Error::InvalidArgument("the source clip has no keyframes to copy".to_string()));
             }
@@ -5929,6 +5945,7 @@ impl Project {
                         track.prop.label()
                     )));
                 }
+                check_keyable(clip, track.prop, &track.keys)?;
                 clip.set_property_keys(track.prop, track.keys);
             }
             Ok(clip.clone())
@@ -7142,6 +7159,18 @@ pub const MAX_CHANNEL_KEYS: usize = 1_000;
 
 /// The furthest [`Project::copy_keyframes`] may shift keys (seconds): 100 hours.
 const MAX_KEY_OFFSET: f64 = 360_000.0;
+
+/// A mask number is keyed only on a clip that has a mask: its keys would draw nothing, and the
+/// caller would not know why (an empty list, which clears them, is always fine).
+fn check_keyable(clip: &Clip, prop: Property, keys: &[PropertyKey]) -> Result<()> {
+    if prop.is_mask() && clip.mask.is_none() && !keys.is_empty() {
+        return Err(Error::InvalidArgument(format!(
+            "the clip has no mask to key the {} of: give it one first (set_mask)",
+            prop.label()
+        )));
+    }
+    Ok(())
+}
 
 fn validate_property_keys(prop: Property, keys: &[PropertyKey]) -> Result<()> {
     if keys.len() > MAX_CHANNEL_KEYS {
@@ -9686,6 +9715,44 @@ mod tests {
             ));
         }
         assert_eq!(project.history().unwrap().len(), before + 1, "a refused edit records nothing");
+    }
+
+    #[test]
+    fn a_mask_is_keyed_only_on_a_clip_with_one_and_clearing_it_clears_its_keys() {
+        let (project, clip) = channel_project();
+        let keys = vec![pk(0.0, 0.2), pk(2.0, 0.8)];
+        let before = project.history().unwrap().len();
+        for refused in [
+            project.set_property_keyframes(clip.id, Property::MaskX, keys.clone()),
+            project.set_property_tracks(
+                clip.id,
+                vec![PropertyTrack {
+                    prop: Property::MaskWidth,
+                    keys: keys.clone(),
+                }],
+            ),
+        ] {
+            assert!(
+                matches!(&refused, Err(Error::InvalidArgument(m)) if m.contains("no mask")),
+                "{refused:?}"
+            );
+        }
+        assert_eq!(project.history().unwrap().len(), before, "a refused edit records nothing");
+        // The crop needs nothing of the clip.
+        project
+            .set_property_keyframes(clip.id, Property::CropZoom, vec![pk(0.0, 1.0), pk(1.0, 2.0)])
+            .unwrap();
+        project.set_mask(clip.id, Some(Mask::default())).unwrap();
+        let keyed = project.set_property_keyframes(clip.id, Property::MaskX, keys).unwrap();
+        assert!(keyed.mask_animated() && keyed.crop_animated());
+        // Copying every keyed number onto a clip with no mask leaves the mask's behind; naming
+        // one is still refused.
+        let other = project.cut_clip(clip.asset_id, 0.0, 5.0).unwrap();
+        let copied = project.copy_keyframes(clip.id, other.id, &[], 0.0).unwrap();
+        assert!(copied.crop_animated() && !copied.is_keyed(Property::MaskX));
+        assert!(project.copy_keyframes(clip.id, other.id, &[Property::MaskX], 0.0).is_err());
+        let cleared = project.set_mask(clip.id, None).unwrap();
+        assert!(!cleared.is_keyed(Property::MaskX) && cleared.crop_animated());
     }
 
     /// A proposal that only holds a bundle-driven number static changes the render, so it is a

@@ -147,6 +147,8 @@ import {
 	channelOf,
 	clearTransformAnimation,
 	insertPropertyKey,
+	isMaskProperty,
+	keyableProblem,
 	poseTransform,
 	pruneChannels,
 	propertyKeysProblem,
@@ -479,6 +481,36 @@ let devHead = 0;
 if (wantsEmpty()) {
 	sampleAssets.length = 0;
 	devTimeline = { tracks: [{ id: 'v1', kind: 'video', name: 'V1', clips: [] }, { id: 'a1', kind: 'audio', name: 'A1', clips: [] }] };
+	devHistory = [{ seq: 0, label: 'Initial state', source: 'system', snapshot: structuredClone(devTimeline), created_at: now() }];
+}
+
+/** `?long=N` in the browser harness: a cut of N one-second pieces of the interview on V1, their sound
+ *  on A1 — the length at which a lane draws only the clips in view (`timeline-cull.ts`). */
+function wantsLongCut(): number {
+	if (typeof window === 'undefined') return 0;
+	const n = Number(new URLSearchParams(window.location.search).get('long'));
+	return Number.isFinite(n) ? Math.min(Math.max(0, Math.floor(n)), 5000) : 0;
+}
+
+const longCut = wantsLongCut();
+if (longCut > 0 && sampleAssets.length > 0) {
+	const piece = (kind: 'v' | 'a', i: number) => ({
+		id: `${kind}${i}`,
+		asset_id: sampleAssets[0].id,
+		source_in: i % 110,
+		source_out: (i % 110) + 1,
+		timeline_start: i,
+		volume: 1,
+		fade_in: 0,
+		fade_out: 0
+	});
+	const pieces = (kind: 'v' | 'a') => Array.from({ length: longCut }, (_, i) => piece(kind, i));
+	devTimeline = {
+		tracks: [
+			{ id: 'v1', kind: 'video', name: 'V1', clips: pieces('v') },
+			{ id: 'a1', kind: 'audio', name: 'A1', clips: pieces('a') }
+		]
+	};
 	devHistory = [{ seq: 0, label: 'Initial state', source: 'system', snapshot: structuredClone(devTimeline), created_at: now() }];
 }
 
@@ -2545,7 +2577,15 @@ export async function setTrackDuck(trackId: string, duck: boolean): Promise<Time
 export async function setMask(clipId: string, mask: Mask | null): Promise<Timeline> {
 	if (!inTauri()) {
 		const found = locate(devTimeline, clipId);
-		if (found) found[0].clips[found[1]].mask = mask;
+		if (found) {
+			const clip = found[0].clips[found[1]];
+			clip.mask = mask;
+			// Clearing the mask clears its keys (`Project::set_mask`).
+			if (!mask && clip.channels) {
+				clip.channels = clip.channels.filter((c) => !isMaskProperty(c.prop));
+				if (clip.channels.length === 0) delete clip.channels;
+			}
+		}
 		recordDev(mask ? 'Mask clip' : 'Clear mask');
 		return snapshot();
 	}
@@ -3040,6 +3080,8 @@ export async function setPropertyKeyframes(clipId: string, prop: Property, keys:
 		if (problem) throw new Error(problem);
 		const found = locate(devTimeline, clipId);
 		if (!found) throw new Error(`clip ${clipId} not found`);
+		const keyable = keyableProblem(found[0].clips[found[1]], prop, keys);
+		if (keyable) throw new Error(keyable);
 		setPropertyKeys(found[0].clips[found[1]], prop, keys);
 		recordDev(`Set ${prop === 'pos_x' ? 'position x' : prop === 'pos_y' ? 'position y' : prop} keyframes`);
 		return snapshot();
@@ -3059,6 +3101,10 @@ export async function setPropertyTracks(clipId: string, tracks: PropertyTrack[])
 		}
 		const found = locate(devTimeline, clipId);
 		if (!found) throw new Error(`clip ${clipId} not found`);
+		for (const t of tracks) {
+			const keyable = keyableProblem(found[0].clips[found[1]], t.prop, t.keys);
+			if (keyable) throw new Error(keyable);
+		}
 		for (const t of tracks) setPropertyKeys(found[0].clips[found[1]], t.prop, t.keys);
 		recordDev('Edit keyframes');
 		return snapshot();
@@ -3084,12 +3130,17 @@ export async function copyKeyframes(
 		if (!from) throw new Error(`clip ${fromClipId} not found`);
 		if (!to) throw new Error(`clip ${toClipId} not found`);
 		const source = from[0].clips[from[1]];
-		const tracks = propertyKeysShifted(source, props, offset);
+		const maskless = props.length === 0 && !to[0].clips[to[1]].mask;
+		const tracks = propertyKeysShifted(source, props, offset).filter((t) => !(maskless && isMaskProperty(t.prop)));
 		if (tracks.length === 0) throw new Error('the source clip has no keyframes to copy');
 		for (const t of tracks) {
 			if (t.keys.length === 0) throw new Error(`the source clip has no ${t.prop} keyframes`);
 		}
 		const dest = to[0].clips[to[1]];
+		for (const t of tracks) {
+			const keyable = keyableProblem(dest, t.prop, t.keys);
+			if (keyable) throw new Error(keyable);
+		}
 		for (const t of tracks) setPropertyKeys(dest, t.prop, t.keys);
 		recordDev('Copy keyframes');
 		return snapshot();

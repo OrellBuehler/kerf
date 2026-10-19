@@ -114,16 +114,16 @@ fn a_legacy_file_is_backed_up_once_then_upgraded() {
 }
 
 /// The columns are there, so their steps change nothing; the file is still copied aside, once,
-/// for v5 and v6 (JSON steps: `needed` always, so an older build's file is kept before it is locked out).
+/// for v5, v6 and v7 (JSON steps: `needed` always, so an older build's file is kept before it is locked out).
 #[test]
 fn a_legacy_file_that_already_has_the_columns_is_backed_up_only_for_the_json_step() {
     let dir = scratch();
     let path = dir.join("cut.kerf");
     edited(1).0.save_as(&path).unwrap();
     make_legacy(&path, true);
-    // Every step that adds a table or a column finds it there; only v5 and v6 (JSON steps) are pending.
+    // Every step that adds a table or a column finds it there; only v5, v6 and v7 (JSON steps) are pending.
     let pending: Vec<u32> = store::pending_steps(&Connection::open(&path).unwrap(), 0);
-    assert_eq!(pending, vec![4, 5], "only the v4 -> v5 and v5 -> v6 steps");
+    assert_eq!(pending, vec![4, 5, 6], "only the v4 -> v5, v5 -> v6 and v6 -> v7 steps");
     drop(Project::open(&path).unwrap());
     assert_eq!(version_of(&path), SCHEMA_VERSION);
     let mut names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
@@ -251,7 +251,7 @@ fn a_v2_file_is_backed_up_once_then_gets_the_fonts_table() {
     let path = dir.join("cut.kerf");
     edited(2).0.save_as(&path).unwrap();
     make_v2(&path);
-    assert_eq!(SCHEMA_VERSION, 6);
+    assert_eq!(SCHEMA_VERSION, 7);
     assert!(!has_fonts_table(&path));
 
     let project = Project::open(&path).unwrap();
@@ -281,7 +281,7 @@ fn a_v2_file_is_backed_up_once_then_gets_the_fonts_table() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// The fonts table is there, so v3 changes nothing; the one backup is for v5 and v6 (JSON steps).
+/// The fonts table is there, so v3 changes nothing; the one backup is for v5, v6 and v7 (JSON steps).
 #[test]
 fn a_v2_file_that_already_has_the_fonts_table_is_backed_up_only_for_the_json_step() {
     let dir = scratch();
@@ -291,7 +291,7 @@ fn a_v2_file_that_already_has_the_fonts_table_is_backed_up_only_for_the_json_ste
         .unwrap()
         .pragma_update(None, "user_version", 2)
         .unwrap();
-    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 2), vec![4, 5]);
+    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 2), vec![4, 5, 6]);
     drop(Project::open(&path).unwrap());
     assert_eq!(version_of(&path), SCHEMA_VERSION);
     assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2, "the file and its backup");
@@ -509,6 +509,39 @@ fn the_history_limit_never_drops_the_head() {
 }
 
 #[test]
+fn a_v6_file_is_backed_up_stamped_v7_and_keeps_its_keyed_mask_and_crop() {
+    let dir = scratch();
+    let path = dir.join("cut.kerf");
+    let (project, asset) = edited(0);
+    let clip = project.cut_clip(asset, 0.0, 4.0).unwrap();
+    project.set_mask(clip.id, Some(Mask::default())).unwrap();
+    let keys = vec![PropertyKey::new(0.0, 0.2), PropertyKey::new(2.0, 0.8)];
+    project
+        .set_property_keyframes(clip.id, Property::MaskX, keys.clone())
+        .unwrap();
+    let zoom = vec![PropertyKey::new(0.0, 1.0), PropertyKey::new(2.0, 2.0)];
+    project
+        .set_property_keyframes(clip.id, Property::CropZoom, zoom.clone())
+        .unwrap();
+    project.save_as(&path).unwrap();
+    drop(project);
+    Connection::open(&path)
+        .unwrap()
+        .pragma_update(None, "user_version", 6)
+        .unwrap();
+    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 6), vec![6]);
+
+    let project = Project::open(&path).unwrap();
+    assert_eq!(version_of(&path), SCHEMA_VERSION);
+    let clip = project.timeline().unwrap().clip(clip.id).cloned().unwrap();
+    assert_eq!(clip.property_keys(Property::MaskX), keys);
+    assert_eq!(clip.property_keys(Property::CropZoom), zoom);
+    drop(project);
+    assert_eq!(version_of(&schema_backup_path(&path, 6)), 6);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn a_v4_file_is_backed_up_stamped_v5_and_keeps_its_title_clips() {
     let dir = scratch();
     let path = dir.join("cut.kerf");
@@ -546,6 +579,7 @@ const PERSISTED: &[(u32, &str)] = &[
     (3, include_str!("persisted/timelines-v3.json")),
     (5, include_str!("persisted/timelines-v5.json")),
     (6, include_str!("persisted/timelines-v6.json")),
+    (7, include_str!("persisted/timelines-v7.json")),
 ];
 
 fn persisted_path(version: u32) -> PathBuf {

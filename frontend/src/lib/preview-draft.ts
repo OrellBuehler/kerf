@@ -49,9 +49,22 @@ export function colorDraft(timeline: Timeline, clipId: string, patch: Partial<Co
 	});
 }
 
-/** `patchMask`: the clip's mask (the default where it has none) with `patch`. */
+/** The mask number each mask field is keyed as. */
+const MASK_PROPS: Partial<Record<keyof Mask, Property>> = {
+	x: 'mask_x',
+	y: 'mask_y',
+	width: 'mask_width',
+	height: 'mask_height',
+	feather: 'mask_feather'
+};
+
+/** `patchMask`: the clip's mask (the default where it has none) with `patch`, unless a patched
+ *  number is keyed (its keys, not the static mask, are what is drawn). */
 export function maskDraft(timeline: Timeline, clipId: string, patch: Partial<Mask>): PreviewDraft | null {
-	return clipDraft(timeline, clipId, (c) => ({ ...c, mask: { ...DEFAULT_MASK, ...(c.mask ?? {}), ...patch } }));
+	return clipDraft(timeline, clipId, (c) => {
+		if ((Object.keys(patch) as (keyof Mask)[]).some((k) => MASK_PROPS[k] && isKeyed(c, MASK_PROPS[k]!))) return null;
+		return { ...c, mask: { ...DEFAULT_MASK, ...(c.mask ?? {}), ...patch } };
+	});
 }
 
 /** `setFade`: a fade held to the clip's length. */
