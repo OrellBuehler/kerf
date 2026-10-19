@@ -421,7 +421,7 @@ impl KerfMcp {
         let prepared = blocking(move || prepare_values(&project, owner.as_deref(), overlay_id, p.values, p.image_files)).await?;
         self.edit(
             |project| match project.set_title_values_parsed(overlay_id, prepared).map_err(core_err)? {
-                TitleEdited::Overlay(out) => json(&SvgOverlayOutcome::from(out)),
+                TitleEdited::Overlay(out) => json(&SvgOverlayOutcome::from(*out)),
                 TitleEdited::Clip(out) => json(&TitleClipOutcome::from(*out)),
             },
         )

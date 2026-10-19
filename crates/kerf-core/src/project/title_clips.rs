@@ -51,7 +51,7 @@ pub struct TitleClipPatch {
 /// The title a template-values edit changed: a floating one or one on a track.
 #[derive(Debug, Clone)]
 pub enum TitleEdited {
-    Overlay(SvgOverlayResult),
+    Overlay(Box<SvgOverlayResult>),
     Clip(Box<TitleClipResult>),
 }
 
@@ -252,7 +252,9 @@ impl Project {
     /// Stored only if the title is still the one it was made from. One `Set template values` edit.
     pub fn set_title_values_parsed(&self, title_id: Uuid, prepared: PreparedValues) -> Result<TitleEdited> {
         if self.working_timeline()?.svg_overlay(title_id).is_some() {
-            return self.set_template_values_parsed(title_id, prepared).map(TitleEdited::Overlay);
+            return self
+                .set_template_values_parsed(title_id, prepared)
+                .map(|o| TitleEdited::Overlay(Box::new(o)));
         }
         self.edit_timeline("Set template values", move |timeline| {
             let (ti, ci) = timeline.locate(title_id).ok_or(Error::SvgOverlayNotFound(title_id))?;
