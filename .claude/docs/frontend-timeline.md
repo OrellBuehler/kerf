@@ -337,6 +337,9 @@ a canvas cannot read `var()`, so `readPalette` resolves `--waveform` / `--danger
 `STEREO_MIN_HEIGHT` (48) px tall (`laneCount`, a function of pixels so the track-height
 presets drive it) and folds to one below that; the default 64 px track is stereo.
 `get_waveform` is no longer used by the timeline (the MCP tool keeps it).
+**A title clip** (a generated clip, `title-clips.ts`) has no filmstrip — it decodes no asset — and shows the template mark at
+its head and its title's name (`titleName`) as its label (`data-title-clip`); every gesture, trim, roll, slip, slide and
+transition handle is the clip's as for footage (its source limit is the engine's 24 h).
 **Filmstrips** are the video twin: one `<canvas>` per video clip over its on-screen part
 (`ClipFilmstrip.svelte`; the waveform's windowing, DPR cap and size discipline), blitted from
 the asset's `get_filmstrip` sheets. `filmstrip-view.ts` is the pure layout: a clip is a row of

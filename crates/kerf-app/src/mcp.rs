@@ -6339,7 +6339,11 @@ const INSTRUCTIONS: &str = "Kerf MCP server. The user queues editing tasks in th
              and set_template_values changes them later; a title made from a \
              template lists its controls and current values under `template` in \
              timeline_summary. update_svg_overlay with `svg` replaces the artwork \
-             and ends the template. save_template, import_template and \
+             and ends the template. A title can also be a clip on a video track \
+             (add_title_clip, or apply_template with on_track=true): it then takes \
+             a transition from the shot before it (a dip to white into an end \
+             card), fades and keyframes, and extends like any clip; \
+             timeline_summary lists those under `title_clips`. save_template, import_template and \
              export_template change the user's library or a file, not your \
              proposal, and delete_template is refused while the user reviews your \
              edits. \

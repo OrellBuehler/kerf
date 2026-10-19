@@ -1564,6 +1564,21 @@ browser's canvas (`css-color.ts`). Harness: `?empty=1` has no templates, `?templ
 description / label, a blank name falling back to the title's, Rust's `f64` grammar for numbers, 128 KiB after the
 splice). Tests: `template-ui`, `template-actions`, `template-wiring`, `css-color`, `api-templates`, `api-templates-changed` (the desktop half of `templates-changed`).
 
+**Titles on tracks in the editor.** A title clip is a `Clip` with `generator: {kind: 'title', name, svg, template?}` and
+`asset_id` `GENERATED_ASSET` (`types.ts`); `title-clips.ts` (bun-tested) is the pure side — `isTitleClip` / `titleOf` /
+`titleName`, `findTitle(timeline, id)` (a `TitleRef` for a floating title or a title clip: what `TemplateSection`, the save
+dialog and `setTemplateValue` read through `editor.titleById`), `titleClip` and `placeTitleClip` (kerf-core's placement: the named
+video track, else the lowest unlocked one free over the span, else a new `V{n}` on top). `api.ts`: `applyTemplateClip(templateId,
+values, start, duration?, trackId?, name?)`, `addTitleClip(svg, start, duration?, trackId?, name?)`, `updateTitleClip(clipId,
+patch)` → `TemplateEdit` with `clip_id`; `setTemplateValues` takes either id (the harness's `setTemplateValuesIn` answers
+`overlay` or `clip`, `applyTemplateClipTo` places one, and `setSpeed` refuses a title as the engine's invariant does).
+`editor.applyTemplateClip` / `addTitleClip` / `updateTitleClip` select the clip they made; `editor.select` of the generated asset
+looks nothing up. **Template card**: *Add to a track at the playhead* beside *Add at the playhead*. **Inspector**: a selected
+title clip shows its name with the template mark, a **Title** section (the name field, through `FieldEdits` like every plain
+field: `renameTitle` writes to the clip it took focus on) and the **Template** section of a floating title (`TemplateSection`
+takes `{id, svg, template}`), and has no Speed section; Timing, Fades, Transform (keyframes: an animated placement), Color, Mask
+and Transition are the clip's. Tests: `title-clips.test.ts`.
+
 **Animated SVG titles in the editor.** The engine draws the artwork (resvg, into every preview and export frame), so the
 page **never inlines the SVG** — `svg-titles.test.ts` fails on any `{@html}` / `innerHTML` in `src/` — and shows it only as an
 `<img>` data URL (`svgDataUrl`; the CSP's `img-src` has `data:`) for a preset's thumbnail. `svg-titles.ts` is the pure side

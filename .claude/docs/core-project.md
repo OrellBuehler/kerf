@@ -101,7 +101,10 @@
   `MIGRATIONS` (one step each, each in its own transaction stamping the version it reached; never edit
   a shipped step, append one). Version 0 is every file written before versions existed (the legacy
   baseline; v0→v1 is the old probe-then-`ALTER` columns); v1→v2 adds `staged.owner` / `staged.assets`
-  (below); v2→v3 adds the `fonts` table (below); v3→v4 adds `assets.music_score`. A step's `needed_to_read` says whether a build that
+  (below); v2→v3 adds the `fonts` table (below); v3→v4 adds `assets.music_score`; v4→v5 changes no table — a clip may be a
+generated title (`Clip.generator`, in the timeline JSON), and the number alone keeps an older build, which would read such a clip
+as one of missing media and drop its title on the next save, from opening the file (`needed` is false, so it is stamped without a
+backup). A step's `needed_to_read` says whether a build that
   cannot write must still refuse a file lacking what it adds: true for the v1, v2 and v4 columns (the reads
   name them), false for the `fonts` table (reads tolerate its absence), so a write-protected v2 project
   opens as it is. A new file is stamped `SCHEMA_VERSION`; a
@@ -513,6 +516,21 @@
     only to swap an `Arc`, never across a build of the font database (a system scan and every face parsed:
     seconds), so `replace_embedded` / `embedded_digest` and the swap under the project lock never wait on
     one. See `engine-cli.md` for how the SVG font database and the picture cache keys follow.
+- **Titles on tracks** (`project/title_clips.rs`; the model is `core-model.md` "Generated clips"). The floating titles' lock-free
+  shape: the artwork is read before the lock and only placed under it, one `edit_timeline` revision each (ripple, the lane
+  check and an agent's staging apply as for any added clip). `add_title_clip_parsed(SvgDoc, start, duration?,
+  TitleClipPlacement {track_id?, name?})` (`Add title clip`; the length defaults to `SvgDoc::default_span`),
+  `apply_template_clip_parsed(PreparedTemplate, start, duration?, placement)` (`Add template title “Name”`; the template's
+  length; its fonts stored in the edit's transaction and held as `apply_template_parsed` does, `hold_fonts`), both answering
+  `TitleClipResult {clip, track_id, warnings}`. **Placement**: the named track (must exist and be video; a clip there over the span
+  is refused by the lane check unless ripple makes room), else the **lowest** unlocked video track with nothing over the span — an
+  end card after the last shot lands beside it on V1, ready for a transition — else a new video track on top named `V{n}`.
+  `update_title_clip_parsed(clip_id, TitleClipPatch {name?, svg?}, doc?)` (`Update title clip`) renames or replaces the artwork
+  (which ends a template; nothing to change is refused). **Template values on either kind**: `template_edit_inputs(id)` and
+  `template_source(id)` take a floating title's id or a title clip's (whose length for a save is `source_out`), and
+  `set_title_values_parsed(id, prepared) -> TitleEdited::{Overlay, Clip}` dispatches (`set_template_values_parsed` stays the
+  floating-only call). `collect_unused_fonts` keeps a font a title clip names (`title_sources`). Ops that look an asset up for every
+  clip skip generated ones (`proxy_waits`, `refuse_removed_media`).
 - `analysis.rs` — transcription / scene / silence / rhythm are **pluggable traits**
   (`Transcriber`, `SceneDetector`, `SilenceDetector`, `RhythmAnalyzer`). Real impls
   now exist:

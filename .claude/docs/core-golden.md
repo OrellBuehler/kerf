@@ -21,7 +21,12 @@
   in the middle of its first title, `svg_playhead`, no dice, because the drawn playhead is between frames and a stream from one never reads
   `-start_number`); families `svg-input`, `svg-held`, `svg-overlay`, `svg-two`, `svg-partly-off`, `svg-restamp`, `still-svg`,
   `still-svg-one-file`, `preview-svg-*` (`input`, `held`, `seek`, `overlay`) and
-  the structural `svg-under-text`, `svg-gif`, `svg-offset`, which gave 28 to hundreds of cases each), have their
+  the structural `svg-under-text`, `svg-gif`, `svg-offset`, which gave 28 to hundreds of cases each) and **400 more** with titles on
+  tracks (`title_clip_for`, on dice seeded by the case, the same four artworks: after the last clip of the lowest video track —
+  touching it under a transition of any kind or across a gap — or over the cut on a video track of their own, some head-trimmed,
+  faded or placed; the title cases get neither SVG overlays nor the gif and playhead tweaks of the family before; families
+  `title-clip-held`, `preview-title-clip-held` and the structural `title-clip`, `title-clip-dip`, `title-clip-under-transition`,
+  `still-title-clip`, `preview-title-clip`; appending them moved none of the first 6400 cases), have their
   `build_export_args_phase`, `build_still_args` and `build_preview_args_with` argv reduced to
   FNV-1a digests, committed as 64 block digests each in
   `engine/cli/golden/{export,still,preview}.txt` (LF: `.gitattributes`, and the comparison
