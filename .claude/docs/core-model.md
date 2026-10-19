@@ -75,7 +75,9 @@
   `set_property_easing(clip, prop, time, easing)` and `copy_keyframes(from, to, props, offset)` (every
   keyed number when `props` is empty; a negative offset cuts the head off with `rebase_head`, so the
   destination opens on the pose; replaces the destination's tracks for those numbers; refuses a number
-  the source has no keys for and the same clip twice) are the surface ops. **Edits keep channels where
+  the source has no keys for and the same clip twice) are the surface ops, with
+  `set_property_tracks(clip, tracks)` — several numbers' keys in one edit ("Edit keyframes"; each track checked as
+  `set_property_keyframes` checks it, a number twice or none at all refused), what one dope-sheet gesture writes. **Edits keep channels where
   they were** with the B5a rules: `rebase_animation` (every head move — `Timeline::slice`, split-and-remove
   left, roll / slide of the next clip, a linked partner's trim) runs the bundle *and* `rebase_channels`
   (`rebase_head`: pose pinned at 0, a cut inside an eased segment bakes the rest into plain keys, a hold

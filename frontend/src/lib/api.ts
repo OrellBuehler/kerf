@@ -49,6 +49,7 @@ import type {
 	Keyframe,
 	Property,
 	PropertyKey,
+	PropertyTrack,
 	LaunchRequest,
 	RecoveryInfo,
 	Levels,
@@ -148,6 +149,7 @@ import {
 	pruneChannels,
 	propertyKeysProblem,
 	propertyKeysShifted,
+	propertyLabel,
 	setPropertyEasing,
 	setPropertyKeys,
 	transformAt
@@ -3000,6 +3002,25 @@ export async function setPropertyKeyframes(clipId: string, prop: Property, keys:
 		return snapshot();
 	}
 	return invoke<Timeline>('set_property_keyframes', { clipId, prop, keys });
+}
+
+/** Replace the keys of several animatable numbers of a clip in one edit (`set_property_tracks`):
+ *  what one dope-sheet gesture writes. */
+export async function setPropertyTracks(clipId: string, tracks: PropertyTrack[]): Promise<Timeline> {
+	if (!inTauri()) {
+		if (tracks.length === 0) throw new Error("give at least one property's keys");
+		for (const [i, t] of tracks.entries()) {
+			if (tracks.slice(0, i).some((o) => o.prop === t.prop)) throw new Error(`${propertyLabel(t.prop)} is given more than once`);
+			const problem = propertyKeysProblem(t.prop, t.keys);
+			if (problem) throw new Error(problem);
+		}
+		const found = locate(devTimeline, clipId);
+		if (!found) throw new Error(`clip ${clipId} not found`);
+		for (const t of tracks) setPropertyKeys(found[0].clips[found[1]], t.prop, t.keys);
+		recordDev('Edit keyframes');
+		return snapshot();
+	}
+	return invoke<Timeline>('set_property_tracks', { clipId, tracks });
 }
 
 /** Copy the animation of `props` (every keyed number when empty) from one clip to another,

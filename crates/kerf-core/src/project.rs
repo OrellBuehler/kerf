@@ -28,7 +28,7 @@ use crate::model::{
 use crate::model::{AutoIncluded, SkippedChange, StagedAssetChange};
 use crate::model::{Color, Transform};
 use crate::model::{Detached, DetachedMany};
-use crate::model::{Property, PropertyKey};
+use crate::model::{Property, PropertyKey, PropertyTrack};
 use crate::model::{SvgOverlay, SvgOverlayPatch, SvgPreset};
 use crate::svg::{check_params, SvgDoc};
 
@@ -5795,6 +5795,30 @@ impl Project {
         })
     }
 
+    /// Replace the keys of several numbers of a clip in one edit — what one gesture on the dope
+    /// sheet writes (a retime across rows, a paste, a delete). Each track is what
+    /// [`Project::set_property_keyframes`] would take for its number; a number given twice is
+    /// refused, and so is no number at all.
+    pub fn set_property_tracks(&self, clip_id: Uuid, tracks: Vec<PropertyTrack>) -> Result<Clip> {
+        if tracks.is_empty() {
+            return Err(Error::InvalidArgument("give at least one property's keys".to_string()));
+        }
+        for (i, t) in tracks.iter().enumerate() {
+            if tracks[..i].iter().any(|o| o.prop == t.prop) {
+                return Err(Error::InvalidArgument(format!("{} is given more than once", t.prop.label())));
+            }
+            validate_property_keys(t.prop, &t.keys)?;
+        }
+        self.edit_timeline("Edit keyframes", move |timeline| {
+            let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
+            let clip = &mut timeline.tracks[ti].clips[ci];
+            for t in tracks {
+                clip.set_property_keys(t.prop, t.keys);
+            }
+            Ok(clip.clone())
+        })
+    }
+
     /// Set the easing of the segment that leaves one number's key at `time` seconds from the
     /// clip's start (the key nearest it within a millisecond). The number may be one the
     /// whole-transform keyframes drive: it is taken over by its own track and the others keep
@@ -9502,6 +9526,63 @@ mod tests {
             Err(Error::ClipNotFound(_))
         ));
         assert_eq!(project.history().unwrap().len(), before, "a refused edit records nothing");
+    }
+
+    #[test]
+    fn several_numbers_are_rekeyed_in_one_edit() {
+        let (project, clip) = channel_project();
+        project
+            .add_keyframe(clip.id, 0.0, Some(1.0), None, None, None, Some(1.0))
+            .unwrap();
+        project
+            .add_keyframe(clip.id, 4.0, Some(2.0), None, None, None, Some(0.0))
+            .unwrap();
+        let before = project.history().unwrap().len();
+        let edited = project
+            .set_property_tracks(
+                clip.id,
+                vec![
+                    PropertyTrack {
+                        prop: Property::Scale,
+                        keys: vec![pk(1.0, 1.0), pk(5.0, 2.0)],
+                    },
+                    PropertyTrack {
+                        prop: Property::Volume,
+                        keys: vec![pk(0.0, 1.0), pk(2.0, 0.5)],
+                    },
+                ],
+            )
+            .unwrap();
+        let history = project.history().unwrap();
+        assert_eq!(history.len(), before + 1);
+        assert_eq!(history.last().unwrap().label, "Edit keyframes");
+        assert_eq!(edited.property_keys(Property::Scale)[0].time, 1.0);
+        assert_eq!(edited.property_keys(Property::Opacity).len(), 2, "the rest keep the bundle");
+        assert!(edited.volume_animated());
+
+        for tracks in [
+            vec![],
+            vec![
+                PropertyTrack {
+                    prop: Property::Gamma,
+                    keys: vec![],
+                },
+                PropertyTrack {
+                    prop: Property::Gamma,
+                    keys: vec![pk(0.0, 1.0)],
+                },
+            ],
+            vec![PropertyTrack {
+                prop: Property::Opacity,
+                keys: vec![pk(0.0, 2.0)],
+            }],
+        ] {
+            assert!(matches!(
+                project.set_property_tracks(clip.id, tracks),
+                Err(Error::InvalidArgument(_))
+            ));
+        }
+        assert_eq!(project.history().unwrap().len(), before + 1, "a refused edit records nothing");
     }
 
     /// A proposal that only holds a bundle-driven number static changes the render, so it is a
