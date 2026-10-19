@@ -117,9 +117,9 @@
   would drop (an unknown field, at its next write) or misread (an unknown variant) is a step of its own —
   `run` a no-op (or a JSON rewrite), `needed` always (so the file is copied aside first), `needed_to_read`
   false. `persist_tests` keeps `persisted/timelines-v<N>.json` (the sample's timeline and five of the golden
-  oracle's): every version's must still read, and the current one must round-trip unchanged, so moving the
-  stored shape fails until a step is appended and `KERF_BLESS_PERSISTED=1` writes the new version's file
-  (add it to `PERSISTED`). `meta.kerf_version` is the build that made the file, `meta.last_kerf_version`
+  oracle's) for each version that moved the stored shape: every one must still read, and the newest must
+  round-trip unchanged, so moving the shape fails until a step is appended and `KERF_BLESS_PERSISTED=1`
+  writes the new version's file (add it to `PERSISTED`); a tables-only step needs no file. `meta.kerf_version` is the build that made the file, `meta.last_kerf_version`
   the last one that opened it to write. **Save As is atomic** (`vacuum_into_atomic`):
   `VACUUM INTO` a hidden temp file in the target's directory, fsync it, rename it over the target,
   fsync the directory on unix; any failure removes the temp file and leaves the old target as it was.

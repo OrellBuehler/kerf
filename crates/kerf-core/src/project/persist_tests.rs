@@ -493,10 +493,10 @@ fn the_history_limit_never_drops_the_head() {
     assert!(project.history().unwrap()[0].current);
 }
 
-/// The timelines a file at each schema version holds, `persisted/timelines-v<N>.json`, frozen when that
-/// version was current (the sample's and a few of the golden oracle's). Every one must still read; the
-/// current ones must come back as they were stored, so a change to the stored shape is a decision (a new
-/// version, see `store::MIGRATIONS`) and not a slip.
+/// The timelines a file holds, `persisted/timelines-v<N>.json`, frozen at each schema version that moved
+/// the stored shape (the sample's and a few of the golden oracle's). Every one must still read; the newest
+/// must come back as it was stored, so a change to the shape is a decision (a new version, see
+/// `store::MIGRATIONS`) and not a slip. A version that only changes the tables needs no file.
 const PERSISTED: &[(u32, &str)] = &[(3, include_str!("persisted/timelines-v3.json"))];
 
 fn persisted_path(version: u32) -> PathBuf {
@@ -511,8 +511,8 @@ fn the_timelines_of_every_schema_version_still_read() {
     }
 }
 
-/// Bless with `KERF_BLESS_PERSISTED=1`: it writes the current version's file. Re-blessing a shipped
-/// version is only right when an older build reads the new shape as it is.
+/// Bless with `KERF_BLESS_PERSISTED=1`: it writes the current version's file (add it to `PERSISTED`).
+/// Re-blessing a shipped version is only right when an older build reads the new shape as it is.
 #[test]
 fn the_stored_timeline_shape_moves_only_with_the_schema_version() {
     if std::env::var_os("KERF_BLESS_PERSISTED").is_some() {
@@ -522,11 +522,11 @@ fn the_stored_timeline_shape_moves_only_with_the_schema_version() {
         std::fs::write(persisted_path(SCHEMA_VERSION), format!("[\n{}\n]\n", lines.join(",\n"))).unwrap();
         return;
     }
-    let Some((_, json)) = PERSISTED.iter().find(|(v, _)| *v == SCHEMA_VERSION) else {
-        panic!(
-            "no stored timelines for schema v{SCHEMA_VERSION}: bless them with KERF_BLESS_PERSISTED=1 and add the file to PERSISTED"
-        );
-    };
+    let (_, json) = PERSISTED
+        .iter()
+        .filter(|(v, _)| *v <= SCHEMA_VERSION)
+        .max_by_key(|(v, _)| *v)
+        .expect("a stored shape at or below this schema version");
     let stored: Vec<serde_json::Value> = serde_json::from_str(json).unwrap();
     for (i, stored) in stored.into_iter().enumerate() {
         let timeline: Timeline = serde_json::from_value(stored.clone()).unwrap();
