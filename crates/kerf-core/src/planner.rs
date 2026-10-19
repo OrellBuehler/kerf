@@ -2163,6 +2163,38 @@ mod tests {
     }
 
     #[test]
+    fn a_late_starting_sources_lead_reaches_the_pick_of_the_original_and_of_its_padded_proxy() {
+        let mut a = asset();
+        a.streams[0].lead = 0.5;
+        let fps_of = |clip: Clip, request: PlanRequest| {
+            let tl = single(vec![clip]);
+            let plan = Planner::new(&tl, std::slice::from_ref(&a), &opts(30.0), request)
+                .unwrap()
+                .at_frame(3)
+                .unwrap();
+            match plan.layers[0].pick {
+                Pick::Fps(f) => f,
+                other => panic!("{other:?}"),
+            }
+        };
+        // From inside the lead: the lead rides along, the window is not seeked, and a padded
+        // proxy (which keeps the original's times) drops its clone as for a head clip.
+        let head = fps_of(make_clip(a.id, 0.2, 4.0, 0.0), PlanRequest::motion(FIXED));
+        assert_eq!((head.lead, head.seek(), head.drop_first), (0.5, Some(0.0), false));
+        let proxied = fps_of(
+            make_clip(a.id, 0.2, 4.0, 0.0),
+            PlanRequest::motion(FIXED).with_media(&Proxied),
+        );
+        assert_eq!((proxied.lead, proxied.seek(), proxied.drop_first), (0.5, Some(0.0), true));
+        // Past it: seeked as ever, so the seek skips the clone.
+        let past = fps_of(
+            make_clip(a.id, 1.0, 4.0, 0.0),
+            PlanRequest::motion(FIXED).with_media(&Proxied),
+        );
+        assert_eq!((past.lead, past.seek(), past.drop_first), (0.5, Some(1.0), false));
+    }
+
+    #[test]
     fn a_plan_over_a_proxy_describes_the_proxy_and_keeps_the_originals_canvas() {
         let mut a = asset();
         a.streams[0].pix_fmt = Some("yuv422p10le".into());

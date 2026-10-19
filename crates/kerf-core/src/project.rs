@@ -2135,6 +2135,10 @@ impl Project {
                 // must not convert it again.
                 *asset = asset.as_sdr_proxy();
                 asset.path = source.to_string_lossy().into_owned();
+                // Only a padded proxy keeps the original's lead (`media::decoded_lead`).
+                for s in asset.streams.iter_mut().filter(|s| s.kind == StreamKind::Video) {
+                    s.lead = crate::media::decoded_lead(&asset.path, true, s.lead, 0.0);
+                }
             }
         }
         assets

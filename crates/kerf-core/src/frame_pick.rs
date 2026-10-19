@@ -594,6 +594,36 @@ mod tests {
     }
 
     #[test]
+    fn a_window_inside_a_late_starting_sources_lead_waits_for_its_first_picture() {
+        // 10 fps from 0.5 s (tick 5120): the file's sound starts at 0, its picture half a second on.
+        let late: Vec<i64> = (0..30).map(|i| 5120 + 1024 * i).collect();
+        let p = FpsPick {
+            lead: 0.5,
+            ..pick((0.0, 3.0), 0.0, 1.0, false, (10, 1), 0)
+        };
+        // The first picture plays half a second into the clip; nothing is drawn before it.
+        let mut want = vec![None; 5];
+        want.extend((0..11).map(Some));
+        assert_eq!(shown(&late, &p), want);
+        // Without the lead the picture is put at the clip's start: what the export used to do.
+        assert_eq!(shown(&late, &FpsPick { lead: 0.0, ..p })[0], Some(0));
+        // A window from 0.2 s is read without a seek; its picture plays 0.3 s in, and at speed 2
+        // the gap is half as long (0.25 s: the first two frames share slot 3, the later one shows).
+        let inside = FpsPick { window: (0.2, 3.0), ..p };
+        assert_eq!((inside.seek(), inside.seek_arg()), (Some(0.0), None));
+        assert_eq!(&shown(&late, &inside)[..5], &[None, None, None, Some(0), Some(1)]);
+        let fast = FpsPick { speed: 2.0, ..p };
+        assert_eq!(&shown(&late, &fast)[..4], &[None, None, None, Some(1)]);
+        // Past the lead the window is seeked as ever and starts on the clip's start.
+        let past = FpsPick { window: (1.0, 3.0), ..p };
+        assert_eq!(past.seek(), Some(1.0));
+        assert_eq!(shown(&late, &past)[0], Some(5));
+        // Reversed, the window's end plays first and on time: the gap is at the clip's end.
+        let back = FpsPick { reverse: true, ..p };
+        assert_eq!(shown(&late, &back)[0], Some(24));
+    }
+
+    #[test]
     fn seek_ticks_is_the_tick_at_or_after_which_the_still_pick_lands() {
         // 30000/1001 frames on 1/30000: frame k at 1001 * k.
         let tb = Rational { num: 1, den: 30_000 };

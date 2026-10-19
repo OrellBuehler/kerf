@@ -706,21 +706,43 @@ impl<'a> ClipTiming<'a> {
         t >= start && t <= end
     }
 
+    /// How long into the clip its first picture plays: the [`picture_delay`] of its source
+    /// window on a late-starting source, else `0.0`.
+    pub fn picture_delay(&self) -> f64 {
+        let (start, _) = clip_source_window(self.clip, self.fx);
+        picture_delay(start, self.fx.lead, self.clip.speed_mag(), self.clip.is_reversed())
+    }
+
     /// The fades of the clip's picture, in the order the chain applies them: its
     /// own fade-in and out merged with a dip to black's, then a dip to white's,
     /// then a dissolve's alpha ramp. A step is only present when it has length.
+    ///
+    /// A fade-in starts on the clip's first picture: [`ClipTiming::picture_delay`] after its
+    /// start on a late-starting source (nothing of the clip is drawn before it), where a ramp
+    /// from the clip's start would be spent on the gap — a fade-in or a dissolve no longer than
+    /// the delay was never seen, the picture cutting in at full strength after the background.
+    /// Its length is kept, within what is left of the clip.
     pub fn fades(&self) -> Vec<FadeStep> {
         let (clip, fx) = (self.clip, self.fx);
         let dur = self.duration();
         let t0 = clip.timeline_start;
-        let step = |edge, tint, len: f64| FadeStep {
-            edge,
-            tint,
-            st: match edge {
-                FadeEdge::In => t0,
-                FadeEdge::Out => t0 + (dur - len).max(0.0),
+        let delay = self.picture_delay();
+        let step = |edge, tint, len: f64| match edge {
+            FadeEdge::In if delay > 0.0 => FadeStep {
+                edge,
+                tint,
+                st: t0 + delay,
+                d: len.clamp(0.0, (dur - delay).max(0.0)),
             },
-            d: len.clamp(0.0, dur),
+            _ => FadeStep {
+                edge,
+                tint,
+                st: match edge {
+                    FadeEdge::In => t0,
+                    FadeEdge::Out => t0 + (dur - len).max(0.0),
+                },
+                d: len.clamp(0.0, dur),
+            },
         };
         let fi = clip.fade_in + fx.black_in;
         let fo = clip.fade_out + fx.black_out;
@@ -1094,6 +1116,38 @@ mod tests {
         assert_eq!(clip_seek(0.0005, 0.0), 0.0);
         assert_eq!(clip_seek(0.002, 0.0), 0.002);
         assert_eq!(clip_seek(12.5, 0.0), 12.5);
+    }
+
+    #[test]
+    fn a_late_starting_sources_lead_rides_along_and_its_fade_in_starts_on_the_first_picture() {
+        let mut stream = video_stream(1920, 1080, 30.0);
+        stream.lead = 0.5;
+        let late = test_asset(vec![stream]);
+        let mut head = make_clip(late.id, 0.0, 3.0, 2.0);
+        head.fade_in = 0.4;
+        head.fade_out = 0.3;
+        let tl = single(vec![head]);
+        let fx = transition_fx(&tl, std::slice::from_ref(&late));
+        assert_eq!(fx[0].lead, 0.5);
+        let t = timing(&tl, &fx, 0);
+        assert_eq!(t.picture_delay(), 0.5);
+        let fades = t.fades();
+        // The fade-in keeps its length and starts on the first picture; the fade-out is unmoved.
+        assert_eq!((fades[0].edge, fades[0].st, fades[0].d), (FadeEdge::In, 2.5, 0.4));
+        assert_eq!((fades[1].edge, fades[1].st, fades[1].d), (FadeEdge::Out, 4.7, 0.3));
+        // An ordinary source, a still image and a clip past the lead are what they were.
+        let plain = test_asset(vec![video_stream(1920, 1080, 30.0)]);
+        let mut same = tl.clone();
+        same.tracks[0].clips[0].asset_id = plain.id;
+        let fx = transition_fx(&same, std::slice::from_ref(&plain));
+        assert_eq!((fx[0].lead, timing(&same, &fx, 0).fades()[0].st), (0.0, 2.0));
+        let mut past = tl.clone();
+        past.tracks[0].clips[0].source_in = 0.5;
+        let fx = transition_fx(&past, std::slice::from_ref(&late));
+        assert_eq!((fx[0].lead, timing(&past, &fx, 0).picture_delay()), (0.5, 0.0));
+        let still = img_asset(Uuid::new_v4());
+        let tl = single(vec![make_clip(still.id, 0.0, 3.0, 0.0)]);
+        assert_eq!(transition_fx(&tl, std::slice::from_ref(&still))[0].lead, 0.0);
     }
 
     #[test]

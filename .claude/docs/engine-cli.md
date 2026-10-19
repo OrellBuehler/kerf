@@ -74,27 +74,37 @@ so the feature is **only** activated through these forwards — which is what ma
   reads, so the audio-less read rebases the video to zero and no pad can restore
   the original's offset — a late-starting transport stream still previews its
   seeks `lead` off. **The export keeps a late-start source's sync.** The probe records
-  the lead on the video stream (`StreamInfo::lead`, `video_lead`: above 1 ms, transport
-  streams included — the export reads their sound too; libav takes the earliest stream's
-  start as the container's), and `transition_fx` carries it as `ClipFx::lead`. A window that
-  starts inside the lead is **not seeked** (`clip_seek(start, lead)`; the MOV demuxer, given
-  a time before the first picture, lands every stream on that picture, so the sound before
-  it was lost and the clip's audio played early too), and `setpts` adds
-  `picture_delay` = `(lead − window start) / speed` to the clip's start, spelled
-  `+(start+delay)/TB` (forward clips only: a reversed one plays its window's end first and
-  is on time; the lead is the end it leaves bare). Before, `setpts=PTS-STARTPTS` put the
-  first picture at the clip's start, `lead − source_in` early against its sound. Nothing of
-  the clip is drawn before the delay (the source has no picture there); the scrubbed still
-  (`-ss` at or after) shows the first picture in that gap. `frame_pick` takes `FpsPick::lead`
-  for the same seek and start, and the preview from a `.lead` proxy (which keeps the
-  original's streams) gets the same delay after dropping the clone. Every other argv is
-  byte-identical; the golden `late-start-delay` family pins the new one. Assets imported
-  before the lead was recorded read 0 (the old placement) until they are relinked or
-  re-imported. Measured on a render (`cli/late_start.rs`, `#[ignore]`d; 6.1 and 9.0): a
-  flash and a click at one moment of an MOV / Matroska source 70 ms and 0.5 s late land
-  together, head, inside the lead, past it, speed 0.5 / 2 and reversed. Found there, not
-  fixed: a seek into Matroska lands the sound up to a block late on any file (14 ms on 6.1,
-  57 ms on 9.0 with PCM), and `atempo` spreads an onset tens of ms early.
+  the lead on the video stream (`StreamInfo::lead`, `video_lead`), measured from the earliest
+  picture or sound stream's start — not ffprobe's `format.start_time`, which a subtitle or data
+  track can pull earlier while the export rebases picture and sound to their own first frames
+  alike (picture and sound both at 40 ms behind a text track at 0: no lead); above 1 ms; at or past
+  the duration it is a broken start and reads 0 (`lead_within`); transport streams included, as the
+  export reads their sound too; libav measures the same. `transition_fx` carries it as
+  `ClipFx::lead`. A window that starts inside the lead is **not seeked** (`clip_seek(start,
+  lead)`; the MOV demuxer, given a time before the first picture, lands every stream on that
+  picture, so the sound before it was lost and the clip's audio played early too), and `setpts`
+  adds `picture_delay` = `(lead − window start) / speed` to the clip's start, spelled
+  `+(start+delay)/TB` (forward clips only: a reversed one plays its window's end first and is on
+  time; the lead is the end it leaves bare). Before, `setpts=PTS-STARTPTS` put the first picture at
+  the clip's start, `lead − source_in` early against its sound. Nothing of the clip is drawn before
+  the delay (the source has no picture there). **A fade-in starts on the first picture**
+  (`ClipTiming::fades`: the clip's fade, a dip's and a dissolve's alpha ramp get `st` = `start +
+  picture_delay`, length kept within the clip): anchored at the clip's start it was spent on the gap,
+  and a fade or a dissolve no longer than the delay was never seen. A dissolve's outgoing tail still
+  ends where it did, so a delay inside it shows the background under the incoming ramp. The
+  scrubbed still (`-ss` at or after) shows the first picture in the gap — not made to agree, as the
+  export's first drawn frame is the `fps` slot of `start + delay`, which no still-side rule gives
+  exactly. `frame_pick` takes `FpsPick::lead` for the same seek and start. A `.lead` padded proxy
+  keeps the original's lead (its footage keeps the original's times after the clone) and gets the
+  same delay after dropping the clone; any other proxy's picture starts where its own file does, so
+  it has its own lead (`media::decoded_lead`, `Project::preview_assets_of`). Every other argv is
+  byte-identical; the golden `late-start-delay` family pins the new one. Assets imported before the
+  lead was recorded read 0 (the old placement) until they are relinked or re-imported. Measured on
+  a render (`cli/late_start.rs`, `#[ignore]`d; 6.1 and 9.0): a flash and a click at one moment of an
+  MOV / Matroska source 70 ms and 0.5 s late land together, head, inside the lead, past it, speed
+  0.5 / 2 and reversed; a fade-in on a white source 0.5 s late ramps after its first picture. Found
+  there, not fixed: a seek into Matroska lands the sound up to a block late on any file (14 ms on
+  6.1, 57 ms on 9.0 with PCM), and `atempo` spreads an onset tens of ms early.
   **A proxy describes itself.** `generate_proxy` writes `<hash>.json` beside the proxy
   (`<hash>.lead.json` for a padded one) *before* it renames the proxy into place, so a
   reader that finds the file finds its description: a `ProxySidecar` (version, the proxy's

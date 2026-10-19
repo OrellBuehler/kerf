@@ -129,6 +129,9 @@ pub fn probe(path: &Path) -> Result<ProbeResult> {
         }
     }
 
+    for s in &mut streams {
+        s.lead = super::cli::lead_within(s.lead, duration);
+    }
     Ok(ProbeResult { duration, streams })
 }
 

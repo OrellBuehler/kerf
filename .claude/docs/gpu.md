@@ -333,7 +333,12 @@ shared with `push_inputs`, so the two cannot drift), which FFmpeg truncates to w
 and no `-ss` at the head of the file — not the still's `{:.6}`, which rounds: for a window start
 like 2/30 s on a one-microsecond time base (frame at 66666) the rounded text (66667) starts the run
 a frame after the one the export keeps and every pick is a frame late (20 of the 59 window starts
-in `tests/cursor.rs`'s microsecond mp4 differ between the two spellings; it holds the export's). `cursor.pick(&Pick)` reads until `Pick::progress`
+in `tests/cursor.rs`'s microsecond mp4 differ between the two spellings; it holds the export's).
+**`FpsPick::lead`** (`ClipFx::lead`, the source's `StreamInfo::lead`) is a late-starting source's:
+a window that starts inside it is opened with no seek (`FpsPick::seek` is `0`), and its first frame's
+slot is the clip's start plus `picture_delay`, so the output frames before it pick nothing — the
+layer is not drawn, as in the export (`tests/motion_parity.rs`, `late/*`: head, inside the lead,
+past it, speed 2 / 0.5, reversed, a fade-in, over another track, exact). `cursor.pick(&Pick)` reads until `Pick::progress`
 decides and returns the shown frame, so its answer is `Pick::select`'s over the whole file — which
 `picked.rs` holds to the export's rendered frames — **where `-ss` lands on the frame the timestamps
 say**: a seek that lands on a later keyframe (a seek into the frames an open GOP's keyframe leads;

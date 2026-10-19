@@ -1,6 +1,6 @@
 # still argv digests (engine/cli/golden.rs): block, then FNV-1a of its 100 cases.
 # Regenerate after an intended change: KERF_GOLDEN_BLESS=1 cargo test -p kerf-core --no-default-features golden
-0 3b98e9fa85821607
+0 ffffce624cecc029
 1 56765a14d29e2a08
 2 3ba0abe09655a08a
 3 06ffb17dcf87b07d
@@ -13,10 +13,10 @@
 10 5e39eb37ab151f2f
 11 35aa0c77474d4b8a
 12 3246bbda99d0c05d
-13 e4150a1994a672cc
-14 df58e7ae984ea145
+13 a218916e41f9f84d
+14 59bacf42883e97d1
 15 9d562371a342dc30
-16 16f354248ee6ac72
+16 262139e5aaa50afa
 17 ca8a036b48c782ba
 18 5b333a154c8d12ec
 19 78c99d438a05c42b
@@ -26,10 +26,10 @@
 23 18ae28d97de78ed2
 24 e9351c29a4091dfb
 25 ffa8fafc6ab1e054
-26 2435928f9e876390
+26 9138ab20ec819cb0
 27 2f01689f8c11a23b
 28 49cd428a613061fc
-29 cfd792c9d29aa6cb
+29 16f925f6aaf2b820
 30 3c4d2ff8b634036b
 31 578f094c73ed1a30
 32 ec9587f7d6d4e187
@@ -43,8 +43,8 @@
 40 afde6d4cb2d99e1a
 41 c940e56a6f99614e
 42 dae86903882a281a
-43 6ef6d6dbc62e5e94
-44 6025f1eba50fdec4
+43 fbdbc896ed65f155
+44 9cefa066477ce6eb
 45 3276135969a6c028
 46 fdd513b27ff76a3a
 47 633ad859e66fc580

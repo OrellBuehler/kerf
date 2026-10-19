@@ -108,7 +108,9 @@
   `phone` (0.5 s) and an `interview-late-padded` proxy that keeps the original's lead, reached only by `retarget_late` (`i % 19 == 6`, no dice:
   the clip's id picks the twin and moves half of them to the head of the file, length kept). The extended pool alone moved nothing; the
   retarget moved 248 of 6400 cases (235 export / 89 still / 151 preview), all of them `i % 19 == 6` (`KERF_GOLDEN_CASES` before / after). New
-  families `late-start-delay` / `preview-late-start-delay` (`)/TB`, the `+(start+delay)/TB` spelling): 110 / 74 cases.
+  families `late-start-delay` / `preview-late-start-delay` (`)/TB`, the `+(start+delay)/TB` spelling): 110 / 74 cases. Starting a
+  fade-in on the first picture then moved 77 cases (65 export / 8 still / 36 preview), all `i % 19 == 6` and all but three of them
+  with a fade, dip or dissolve family (with the fade change compiled out the committed digests held).
 - **Sample-exact `adelay`** (a clip starting between milliseconds is delayed by samples)
   re-blessed `export.txt` alone: 2718 of 4800 cases moved, exactly the new
   `audio-delay-samples` family (`S:all=1`); still and preview carry no sound.

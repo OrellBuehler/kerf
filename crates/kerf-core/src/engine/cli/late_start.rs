@@ -7,6 +7,9 @@
 //! timeline: they must land together, where the clip puts that moment of the source. Before the
 //! fix a clip cut from inside the lead showed its picture `lead - source_in` early.
 //!
+//! A fade-in on such a clip starts on its first picture: anchored at the clip's start it was
+//! spent on the gap, and the picture cut in at full strength.
+//!
 //! `cargo test -p kerf-core --no-default-features -- --ignored late_start`
 //! (and again with `KERF_FFMPEG` / `KERF_FFPROBE` at the pinned build.)
 
@@ -92,6 +95,93 @@ fn late_source(dir: &Path, lead: f64, ext: &str) -> Asset {
         s(&out),
     ]));
     Project::probe_asset(&out).expect("probe the late source")
+}
+
+/// A white picture starting `lead` seconds after a silent sound, muxed as [`late_source`] is
+/// (an encode first: FFmpeg 6 would pad a late start it encodes). Probed like an import.
+fn late_white(dir: &Path, lead: f64) -> Asset {
+    let (video, audio, out) = (
+        dir.join("white.mkv"),
+        dir.join("silence.wav"),
+        dir.join(format!("white-{lead}.mov")),
+    );
+    let s = |p: &Path| p.to_string_lossy().into_owned();
+    for (lavfi, codec, file) in [
+        (format!("color=white:s={W}x{H}:r={FPS}:d=4"), "libx264", &video),
+        (format!("anullsrc=r={RATE}:cl=mono:d=5"), "pcm_s16le", &audio),
+    ] {
+        assert!(run_ffmpeg(&[
+            "-f".into(),
+            "lavfi".into(),
+            "-i".into(),
+            lavfi,
+            "-c".into(),
+            codec.into(),
+            s(file)
+        ]));
+    }
+    assert!(run_ffmpeg(&[
+        "-itsoffset".into(),
+        lead.to_string(),
+        "-i".into(),
+        s(&video),
+        "-i".into(),
+        s(&audio),
+        "-map".into(),
+        "0:v".into(),
+        "-map".into(),
+        "1:a".into(),
+        "-c".into(),
+        "copy".into(),
+        s(&out),
+    ]));
+    Project::probe_asset(&out).expect("probe the late source")
+}
+
+/// The export of `timeline`'s picture: each frame's mean luma.
+fn lumas(timeline: &Timeline, assets: &[Asset], dir: &Path, tag: &str) -> Vec<f64> {
+    let opts = ExportOptions {
+        resolution: Some((W, H)),
+        fps: Some(FPS),
+        ..ExportOptions::default()
+    };
+    let v = dir.join(format!("{tag}.gray"));
+    let mut args = build_export_args(timeline, assets, "unused.mkv", &opts).unwrap();
+    let graph = args.iter().position(|a| a == "-filter_complex").unwrap() + 1;
+    args.truncate(graph + 1);
+    args.extend(
+        [
+            "-map",
+            "[outv]",
+            "-fps_mode",
+            "passthrough",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "gray",
+        ]
+        .map(String::from),
+    );
+    args.push(v.to_string_lossy().into_owned());
+    args.extend(["-map", "[outa]", "-f", "null", "-"].map(String::from));
+    let run = command(&ffmpeg_bin())
+        .arg("-y")
+        .args(&args)
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}\n{}",
+        args.join(" "),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let frames = std::fs::read(&v).unwrap();
+    let _ = std::fs::remove_file(&v);
+    frames
+        .chunks((W * H) as usize)
+        .map(|f| f.iter().map(|p| f64::from(*p)).sum::<f64>() / f64::from(W * H))
+        .collect()
 }
 
 /// The export of `timeline` as grey frames at [`FPS`] and mono samples at [`RATE`]: the time of
@@ -204,4 +294,33 @@ fn a_late_starting_source_keeps_its_sync_in_the_export() {
     }
     let _ = std::fs::remove_dir_all(&dir);
     assert!(failures.is_empty(), "out of sync:\n{}", failures.join("\n"));
+}
+
+#[test]
+#[ignore = "needs the ffmpeg and ffprobe binaries"]
+fn a_fade_in_on_a_late_starting_source_starts_on_its_first_picture() {
+    let dir = scratch("late-fade");
+    let asset = late_white(&dir, 0.5);
+    assert!(
+        (asset.streams[0].lead - 0.5).abs() < 0.002,
+        "the probe saw {}",
+        asset.streams[0].lead
+    );
+    let mut clip = make_clip(asset.id, 0.0, 2.0, 0.0);
+    clip.fade_in = 0.4;
+    let y = lumas(&single(vec![clip]), std::slice::from_ref(&asset), &dir, "fade");
+    let _ = std::fs::remove_dir_all(&dir);
+    let at = |t: f64| y[(t * FPS).round() as usize];
+    eprintln!(
+        "luma at 0.4 / 0.56 / 0.72 / 1.0 s: {} {} {} {}",
+        at(0.4),
+        at(0.56),
+        at(0.72),
+        at(1.0)
+    );
+    // Nothing before the first picture, the ramp after it, full white once it is over.
+    assert!(at(0.4) < 20.0, "{y:?}");
+    assert!(at(0.56) < 80.0, "the fade had run out before the first picture: {y:?}");
+    assert!((80.0..180.0).contains(&at(0.72)), "{y:?}");
+    assert!(at(1.0) > 220.0, "{y:?}");
 }
