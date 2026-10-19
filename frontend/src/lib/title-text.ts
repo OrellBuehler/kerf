@@ -21,9 +21,33 @@ const TOKEN =
 	/<!--[\s\S]*?-->|<!\[CDATA\[[\s\S]*?\]\]>|<\?[\s\S]*?\?>|<![^>]*>|<\/([A-Za-z_][\w:.-]*)\s*>|<([A-Za-z_][\w:.-]*)((?:"[^"]*"|'[^']*'|[^'">])*?)(\/?)>/g;
 const ATTRIBUTE = /([^\s=>/]+)\s*=\s*(?:"([^"]*)"|'([^']*)')/g;
 
+/** An attribute value or text as XML reads it: the five named entities and character references decoded. */
+export function decodeEntities(raw: string): string {
+	return raw.replace(/&(#x[0-9a-fA-F]+|#[0-9]+|amp|lt|gt|quot|apos);/g, (whole, e: string) => {
+		const named: Record<string, string> = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'" };
+		if (e in named) return named[e];
+		const code = e.startsWith('#x') ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10);
+		return Number.isFinite(code) && code <= 0x10ffff ? String.fromCodePoint(code) : whole;
+	});
+}
+
+/** A value written inside `quote`, as kerf-core's `escape_attr` writes it. */
+function escapeAttr(value: string, quote: '"' | "'"): string {
+	let out = '';
+	for (const c of value) {
+		if (c === '&') out += '&amp;';
+		else if (c === '<') out += '&lt;';
+		else if (c === '"' && quote === '"') out += '&quot;';
+		else if (c === "'" && quote === "'") out += '&apos;';
+		else out += c;
+	}
+	return out;
+}
+
+/** A start tag's attributes, name to value as XML reads it (entities decoded); the first of a repeated name. */
 function attributes(raw: string): Map<string, string> {
 	const attrs = new Map<string, string>();
-	for (const a of raw.matchAll(ATTRIBUTE)) if (!attrs.has(a[1])) attrs.set(a[1], a[2] ?? a[3] ?? '');
+	for (const a of raw.matchAll(ATTRIBUTE)) if (!attrs.has(a[1])) attrs.set(a[1], decodeEntities(a[2] ?? a[3] ?? ''));
 	return attrs;
 }
 
@@ -136,7 +160,21 @@ export function declarations(body: string): string[] {
 }
 
 /** Whether a `<style>` sheet of the title mentions `inline-size` (a rule could give a text a box). */
-const sheetNamesInlineSize = (svg: string): boolean => /<style[\s>][\s\S]*?inline-size[\s\S]*?<\/style\s*>/i.test(svg);
+function sheetNamesInlineSize(svg: string): boolean {
+	// The engine's check: the text of each `<style>` element (CDATA's as written, entities decoded), lower-cased.
+	for (const m of svg.matchAll(TOKEN)) {
+		if (m[2] === undefined || m[2].split(':').pop() !== 'style' || m[4] === '/') continue;
+		const from = (m.index ?? 0) + m[0].length;
+		const close = svg.indexOf(`</${m[2]}`, from);
+		const body = svg.slice(from, close < 0 ? svg.length : close);
+		const text = body
+			.split(/(<!\[CDATA\[[\s\S]*?\]\]>)/)
+			.map((part) => (part.startsWith('<![CDATA[') ? part.slice(9, -3) : decodeEntities(part)))
+			.join('');
+		if (text.toLowerCase().includes('inline-size')) return true;
+	}
+	return false;
+}
 
 /** Every text of the title with an `id` no other element has (a box goes on one element, by its id), in document
  *  order, with its box (`text_box_of`). */
@@ -169,11 +207,14 @@ export function boxWidthRefusal(raw: string): string | null {
 const number = (v: number): string => v.toFixed(3).replace(/\.?0+$/, '');
 
 /** `svg` with the `<text>` `element` given `box` (`set_text_box`): its old `inline-size` attribute, fit mark and any
- *  `inline-size` in its `style` taken out, the width written last in its `style` and important (it beats a `<style>`
- *  rule; `auto` where a rule may give one and there is no box), the fit mark at the end of its start tag. The
- *  harness's. */
+ *  `inline-size` in its `style` taken out, the width written first in its `style` and important (it beats a `<style>`
+ *  rule, and is read before a declaration the renderer cannot read; `auto` where a rule may give one and there is no
+ *  box), the fit mark at the end of its start tag. The style is split as XML reads it and written back escaped as the
+ *  engine escapes it; `text-box-corpus.test.ts` replays what kerf-core does. The harness's. */
 export function withTextBox(svg: string, element: string, box: TextBox): string {
-	if (box.width !== null && boxWidthRefusal(String(box.width))) throw invalid(boxWidthRefusal(String(box.width))!);
+	if (box.width !== null && !(Number.isFinite(box.width) && box.width > 0 && box.width <= MAX_BOX_WIDTH)) {
+		throw invalid(`a text box is wider than nothing and at most ${MAX_BOX_WIDTH} units`);
+	}
 	const tags = [...svg.matchAll(TOKEN)].filter((m) => m[2] !== undefined && attributes(m[3]).get('id') === element);
 	if (tags.length === 0) throw invalid(`the title has no element with the id “${element}”`);
 	if (tags.length > 1) throw invalid(`more than one element has the id “${element}”`);
@@ -192,13 +233,14 @@ export function withTextBox(svg: string, element: string, box: TextBox): string 
 			if (name === 'inline-size' || name === FIT_MARK) return '';
 			if (name !== 'style') return whole;
 			styled = true;
-			const value = dq ?? sq ?? '';
+			const raw = dq ?? sq ?? '';
+			const value = decodeEntities(raw);
 			const q = dq !== undefined ? '"' : "'";
-			const kept = declarations(value).filter((d) => !isProperty(d, 'inline-size'));
-			if (decl) kept.push(decl);
+			const kept = [...(decl ? [decl] : []), ...declarations(value).filter((d) => !isProperty(d, 'inline-size'))];
 			const next = kept.join(';');
 			if (next.trim() === '') return '';
-			return `${whole.slice(0, whole.length - value.length - 2)}${q}${next}${q}`;
+			if (next === value) return whole;
+			return `${whole.slice(0, whole.length - raw.length - 2)}${q}${escapeAttr(next, q)}${q}`;
 		}
 	);
 	if (!styled && decl) raw += ` style="${decl}"`;
@@ -245,6 +287,11 @@ export function setTitleTextBoxIn(
 	element: string,
 	box: TextBox
 ): { overlay?: SvgOverlay; clip?: Clip; warnings: string[] } {
+	// A box moved into the `style` would leave a control on the attribute with nothing to set.
+	const control = findTitle(timeline, id)?.template?.controls.find((c) =>
+		c.targets.some((t) => t.element === element && t.attribute === 'inline-size')
+	);
+	if (control) throw invalid(`the template's control “${control.label}” sets the box width of “${element}”: change it there`);
 	return { ...editTitle(timeline, id, (svg) => withTextBox(textForm(svg), element, box)), warnings: [HARNESS_NOTE] };
 }
 

@@ -520,9 +520,13 @@
     scaled by `width / widest` (up to four passes: the optical size moves with the size), never up. A text kept as text with a
     box says it does not wrap / shrink. `svg::set_text_box(svg, element, &TextBox {width, fit})` writes it on the `<text>`
     with that id (unique; a `<tspan>` or anything else is refused; a width finite, positive, at most `MAX_BOX_WIDTH`): its old
-    `inline-size` / fit attributes and any `inline-size` in its `style` are cut, the width written **last in its `style`,
-    `!important`** (`inline-size:Wpx !important`: it beats the attribute and any `<style>` rule; no box where a sheet mentions
-    `inline-size` is `auto !important`), the fit mark at the end of its start tag, nothing else moves; `text_box_of` reads it
+    `inline-size` / fit attributes and any `inline-size` in its `style` are cut, the width written **first in its `style`,
+    `!important`** (`inline-size:Wpx !important`: it beats the attribute and any `<style>` rule, and comes before any
+    declaration simplecss's tokenizer stops at — `drop-shadow(… rgba(…))`, one with no colon, `--x:…` — which would hide a
+    later one; no box where a sheet mentions `inline-size` is `auto !important`, first too), the fit mark at the end of its
+    start tag, nothing else moves; refused in `TitleTextInputs::text_box` when a template control targets the text's
+    `inline-size` attribute (the box is that control's to set). `fixtures/text-box-corpus.json` (blessed with
+    `KERF_BLESS_CORPUS=1 … -- text_box_corpus`) is what the frontend's port replays; `text_box_of` reads it
     back as the cascade weighs it (the `style`'s last `inline-size` first, `auto` none, else the attribute; a sheet is not
     read). `Project::title_text_inputs(id)` (floating or a title clip, any title but a **preset**, which is drawn again from its
     parameters; a template's stored controls checked with `validate_controls_shape`) → `TitleTextInputs::text_box(element,
@@ -534,7 +538,8 @@
     prepared, label)`, the "try again" rule of template values. The ops are the user's to make on custom titles and templates
     alike; a box survives a values change (it is in the text form the values are spliced into) and a save as a template
     (`build_template` restores, keeping it). **Custom artwork with a box and no outlines** (`update_svg_overlay` /
-    `update_title_clip` / `add_*` with new `svg`) is drawn with its fonts: `SvgDoc::parse` adds `svg::BOX_NOTE` to its warnings,
+    `update_title_clip` / `add_*` with new `svg`) is drawn with its fonts: `SvgDoc::parse` adds `svg::BOX_NOTE` to its warnings
+    (for an `inline-size` other than `auto`, written anywhere),
     which `outlined_counted` drops (what it outlines draws its box; a kept boxed text has its own warning) and
     `Template::validate` drops (a template is outlined whenever it is applied). A **template's poster** is drawn from the
     outlined title (`render_poster` outlines with the template's fonts), so a box shows on it, on save and on import alike.

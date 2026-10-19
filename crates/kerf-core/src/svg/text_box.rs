@@ -38,7 +38,7 @@ pub struct TextBox {
 pub const MAX_BOX_WIDTH: f64 = 100_000.0;
 
 /// `svg` (a title in its text form) with the `<text>` whose `id` is `element` given `text_box`: its
-/// `inline-size`, written last in its `style` and important (an `inline-size` attribute, and one already in
+/// `inline-size`, written first in its `style` and important (an `inline-size` attribute, and one already in
 /// its `style`, are taken out), and its fit mark, or neither. Nothing else of the document moves.
 pub fn set_text_box(svg: &str, element: &str, text_box: &TextBox) -> Result<String> {
     if let Some(w) = text_box.width {
@@ -69,8 +69,8 @@ pub fn set_text_box(svg: &str, element: &str, text_box: &TextBox) -> Result<Stri
             node.tag_name().name()
         )));
     }
-    // The width goes in the `style` attribute, marked important: it beats a presentation attribute and any
-    // `<style>` rule, as the box the user set should. No box where a rule may still give one is `auto`.
+    // The width goes first in the `style` attribute, marked important: it beats a presentation attribute and
+    // any `<style>` rule, as the box the user set should. No box where a rule may still give one is `auto`.
     let declaration = match text_box.width {
         Some(w) => Some(format!("inline-size:{}px !important", number(w))),
         None if sheet_names_inline_size(&doc) => Some("inline-size:auto !important".to_string()),
@@ -90,11 +90,14 @@ pub fn set_text_box(svg: &str, element: &str, text_box: &TextBox) -> Result<Stri
             "inline-size" | FIT_MARK => cuts.push(cut_whole(range)),
             "style" => {
                 styled = true;
-                let mut kept: Vec<&str> = declarations(attr.value())
-                    .into_iter()
-                    .filter(|d| !is_property(d, "inline-size"))
-                    .collect();
-                kept.extend(declaration.as_deref());
+                // First: a declaration the renderer's tokenizer cannot read (a `drop-shadow(...)` filter, a
+                // custom property, one with no colon) ends its reading of the list there.
+                let mut kept: Vec<&str> = declaration.as_deref().into_iter().collect();
+                kept.extend(
+                    declarations(attr.value())
+                        .into_iter()
+                        .filter(|d| !is_property(d, "inline-size")),
+                );
                 let value = kept.join(";");
                 if value.trim().is_empty() {
                     cuts.push(cut_whole(range));
@@ -223,12 +226,12 @@ mod tests {
         let out = set_text_box(&src, "t", &boxed(120.5, TextFit::Wrap)).unwrap();
         assert_eq!(
             out,
-            doc(r#"<text id="t" x="5" y="50" style="fill:red;opacity:.5;inline-size:120.5px !important">Hi</text>"#)
+            doc(r#"<text id="t" x="5" y="50" style="inline-size:120.5px !important;fill:red;opacity:.5">Hi</text>"#)
         );
         assert_eq!(text_box_of(&out, "t"), Some(boxed(120.5, TextFit::Wrap)));
         let shrunk = set_text_box(&out, "t", &boxed(300.0, TextFit::Shrink)).unwrap();
         assert!(
-            shrunk.contains(r#"style="fill:red;opacity:.5;inline-size:300px !important" data-kerf-fit="shrink">Hi"#),
+            shrunk.contains(r#"style="inline-size:300px !important;fill:red;opacity:.5" data-kerf-fit="shrink">Hi"#),
             "{shrunk}"
         );
         assert_eq!(text_box_of(&shrunk, "t"), Some(boxed(300.0, TextFit::Shrink)));
@@ -250,6 +253,170 @@ mod tests {
         assert_eq!(text_box_of(&both, "t"), Some(boxed(30.0, TextFit::Wrap)));
         let auto = doc(r#"<text id="t" inline-size="80" style="inline-size:auto">a</text>"#);
         assert_eq!(text_box_of(&auto, "t"), Some(TextBox::default()));
+    }
+
+    const CORPUS_PATH: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../frontend/src/lib/fixtures/text-box-corpus.json"
+    );
+
+    /// Titles, a box set on one of their texts, and what `set_text_box` wrote (or refused) and `text_box_of`
+    /// reads back: for the frontend's port (`title-text.ts`'s `withTextBox` and `titleTexts`, replayed by
+    /// `text-box-corpus.test.ts`).
+    fn corpus() -> serde_json::Value {
+        let sheet = "<style>.n{inline-size:60px}</style>";
+        let cases: Vec<(&str, String, &str, TextBox)> = vec![
+            (
+                "replaces an attribute, a fit mark and a style declaration",
+                doc(
+                    r#"<text id="t" x="5" y="50" inline-size="80" data-kerf-fit="shrink" style="fill:red; inline-size: 9px;opacity:.5">Hi</text>"#,
+                ),
+                "t",
+                boxed(120.5, TextFit::Wrap),
+            ),
+            (
+                "shrink",
+                doc(r#"<text id="t" style="fill:red">Hi</text>"#),
+                "t",
+                boxed(300.0, TextFit::Shrink),
+            ),
+            (
+                "no style yet",
+                doc(r#"<text id="t" x="5" y="50"/>"#),
+                "t",
+                boxed(10.0, TextFit::Wrap),
+            ),
+            (
+                "taken away",
+                doc(r#"<text id="t" style="inline-size:10px !important" data-kerf-fit="shrink">a</text>"#),
+                "t",
+                TextBox::default(),
+            ),
+            (
+                "taken away, others kept",
+                doc(r#"<text id="t" style="inline-size:10px !important;fill:red">a</text>"#),
+                "t",
+                TextBox::default(),
+            ),
+            (
+                "a sheet, none",
+                doc(&format!(r#"{sheet}<text id="t" class="n">a</text>"#)),
+                "t",
+                TextBox::default(),
+            ),
+            (
+                "a sheet, a box",
+                doc(&format!(r#"{sheet}<text id="t" class="n">a</text>"#)),
+                "t",
+                boxed(90.0, TextFit::Wrap),
+            ),
+            (
+                "a quoted semicolon",
+                doc(r#"<text id="t" style="font-family:'A;B'; inline-size:9px">a</text>"#),
+                "t",
+                boxed(20.0, TextFit::Wrap),
+            ),
+            (
+                "entities",
+                doc(r#"<text id="t" style="font-family:&quot;A;B&quot;;fill:red;content:'&lt;&amp;&gt;'">a</text>"#),
+                "t",
+                boxed(20.0, TextFit::Wrap),
+            ),
+            (
+                "single quotes around double ones",
+                doc(r#"<text id="t" style='font-family:"A&apos;s";fill:red'>a</text>"#),
+                "t",
+                boxed(20.0, TextFit::Shrink),
+            ),
+            (
+                "what the tokenizer cannot read",
+                doc(r#"<text id="t" style="filter:drop-shadow(0 0 2px rgba(0,0,0,.5));bogus;--x:1px;/* ; */">a</text>"#),
+                "t",
+                boxed(33.333, TextFit::Wrap),
+            ),
+            (
+                "a comment and spaces",
+                doc(r#"<text id="t" style=" /* x */ ; ">a</text>"#),
+                "t",
+                TextBox::default(),
+            ),
+            (
+                "not a text",
+                doc(r#"<rect id="r" width="1" height="1"/>"#),
+                "r",
+                boxed(10.0, TextFit::Wrap),
+            ),
+            ("no such id", doc(r#"<text id="t">a</text>"#), "x", boxed(10.0, TextFit::Wrap)),
+            (
+                "a repeated id",
+                doc(r#"<text id="d">b</text><text id="d">c</text>"#),
+                "d",
+                boxed(10.0, TextFit::Wrap),
+            ),
+            ("no width", doc(r#"<text id="t">a</text>"#), "t", boxed(0.0, TextFit::Wrap)),
+            (
+                "too wide",
+                doc(r#"<text id="t">a</text>"#),
+                "t",
+                boxed(MAX_BOX_WIDTH * 2.0, TextFit::Wrap),
+            ),
+        ];
+        let cases: Vec<serde_json::Value> = cases
+            .into_iter()
+            .map(|(name, svg, element, text_box)| {
+                let expect = match set_text_box(&svg, element, &text_box) {
+                    Ok(out) => serde_json::json!({ "ok": { "read": text_box_of(&out, element), "svg": out } }),
+                    Err(e) => serde_json::json!({ "err": e.to_string() }),
+                };
+                serde_json::json!({ "name": name, "svg": svg, "element": element, "box": text_box, "expect": expect })
+            })
+            .collect();
+        serde_json::json!({
+            "about": "Written by kerf-core (svg/text_box.rs); replayed by text-box-corpus.test.ts. Regenerate: KERF_BLESS_CORPUS=1 cargo test -p kerf-core --no-default-features -- text_box_corpus",
+            "cases": cases,
+        })
+    }
+
+    #[test]
+    fn text_box_corpus_is_what_this_engine_writes() {
+        let fresh = format!("{}\n", serde_json::to_string(&corpus()).expect("serializes"));
+        if std::env::var_os("KERF_BLESS_CORPUS").is_some() {
+            std::fs::write(CORPUS_PATH, &fresh).expect("writes the corpus");
+            return;
+        }
+        let on_disk = std::fs::read_to_string(CORPUS_PATH)
+            .expect("frontend/src/lib/fixtures/text-box-corpus.json — generate it with KERF_BLESS_CORPUS=1")
+            .replace("\r\n", "\n");
+        assert!(
+            on_disk == fresh,
+            "the text box corpus is stale: regenerate with KERF_BLESS_CORPUS=1 cargo test -p kerf-core \
+             --no-default-features -- text_box_corpus, then run `bun test` — the replay says what withTextBox has to follow"
+        );
+    }
+
+    #[test]
+    fn the_box_is_read_whatever_the_rest_of_the_style_holds() {
+        // simplecss stops at each of these; written first, the box is read before it.
+        let glyphs = |svg: &str| {
+            let out = super::super::outline::outline_text(svg, &crate::fonts::svg_fontdb()).unwrap();
+            let at = out.svg.find("<g data-kerf-glyphs").expect("outlined");
+            out.svg[at..].to_string()
+        };
+        for style in [
+            "filter:drop-shadow(0 0 2px rgba(0,0,0,.5))",
+            "bogus;fill:red",
+            "--x:1px;fill:red",
+        ] {
+            let text = format!(
+                r#"<text id="t" x="5" y="50" font-family="Geist" font-size="20" style="{style}">one two three four five six</text>"#
+            );
+            let set = set_text_box(&doc(&text), "t", &boxed(80.0, TextFit::Wrap)).unwrap();
+            assert!(set.contains(r#"style="inline-size:80px !important;"#), "{set}");
+            let attribute = doc(&text.replace(r#" style="#, r#" inline-size="80" style="#));
+            assert_eq!(glyphs(&set), glyphs(&attribute), "{style}");
+            let unwrapped = doc(&text);
+            assert_ne!(glyphs(&set), glyphs(&unwrapped), "{style}: the box wraps the text");
+        }
     }
 
     #[test]

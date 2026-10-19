@@ -55,9 +55,14 @@ pub const BOX_NOTE: &str = "a text box (inline-size, data-kerf-fit) is drawn onl
                             this artwork draws its text with its fonts, running on, until its text is converted to outlines \
                             (convert_title_text, or Draw as outlines in the Inspector)";
 
-/// Whether sanitised `src` gives a text a box but holds no outlines.
+/// Whether sanitised `src` gives a text a box (an `inline-size` other than `auto`, in an attribute, a
+/// `style` or a sheet) but holds no outlines.
 fn has_unoutlined_box(src: &str) -> bool {
-    (src.contains("inline-size") || src.contains(outline::FIT_MARK)) && !src.contains(outline::GLYPHS_MARK)
+    !src.contains(outline::GLYPHS_MARK)
+        && src.match_indices("inline-size").any(|(i, m)| {
+            let value = src[i + m.len()..].trim_start_matches(|c: char| c.is_whitespace() || matches!(c, ':' | '=' | '"' | '\''));
+            !value.get(..4).is_some_and(|v| v.eq_ignore_ascii_case("auto"))
+        })
 }
 
 /// Whether sanitised source could move at all: whether it holds an animation element (`animate`,

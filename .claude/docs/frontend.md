@@ -1669,7 +1669,10 @@ outlined text keeps, its `style`'s `inline-size` first as `text_box_of` reads it
 box; `boxWidthRefusal` before the round trip) and *Wrap lines* / *Shrink to fit*, each commit one `setTitleTextBox` edit
 (nothing while locked, busy or previewing a proposal; the engine's notes said as a toast), and for a custom title *Draw as
 outlines* / *Draw with fonts* (`convertTitleText`). The harness writes the box (`withTextBox`, `set_text_box`'s splice: the
-width last in the `style`, `!important`, its declarations split as `declarations` splits them, quotes and comments kept whole) and
+width first in the `style`, `!important`; the value's entities decoded before `declarations` splits it, quotes and comments
+kept whole, and written back as `escape_attr` writes it; the engine's `<style>` check; a box a template control sets refused),
+replayed against kerf-core by `text-box-corpus.test.ts` (`fixtures/text-box-corpus.json`, `KERF_BLESS_CORPUS=1 … --
+text_box_corpus`), and
 draws text with its fonts, saying so (`HARNESS_NOTE`). `template-ui.ts` is the pure side (bun-tested): `slugId`
 (a control id from its label: lower case, accents dropped, `-2` past a taken one), `defaultAttribute` (a color's `stop-color`
 on a `stop`, else `fill`; an image's `href`; a font's `font-family`; a number's usual size), `elementsFor` (text at

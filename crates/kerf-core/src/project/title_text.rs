@@ -62,6 +62,18 @@ impl TitleTextInputs {
     /// saying why (taking one away is not). Slow (the sanitiser, the text engine): not for under the project
     /// lock.
     pub fn text_box(&self, element: &str, text_box: &TextBox) -> Result<PreparedText> {
+        // A box moved into the `style` would leave a control on the attribute with nothing to set.
+        let control = self.controls.iter().flatten().find(|c| {
+            c.targets
+                .iter()
+                .any(|t| t.element == element && t.attribute.as_deref() == Some("inline-size"))
+        });
+        if let Some(c) = control {
+            return Err(Error::InvalidArgument(format!(
+                "the template's control \u{201c}{}\u{201d} sets the box width of \u{201c}{element}\u{201d}: change it there",
+                c.label
+            )));
+        }
         let boxed = set_text_box(&restore_text(&self.svg)?, element, text_box)?;
         let (doc, _, kept) = self.read(&boxed)?;
         if text_box.width.is_some() {
@@ -311,6 +323,12 @@ mod tests {
             "{:?}",
             out.warnings()
         );
+        // A box of `auto` is none, however it is written.
+        for auto in [r#" inline-size="auto""#, r#" style="inline-size: AUTO !important""#] {
+            let svg = ART.replace(r#"<text id="name""#, &format!(r#"<text id="name"{auto}"#));
+            let doc = crate::svg::SvgDoc::parse(&svg).unwrap();
+            assert!(!doc.warnings().iter().any(|w| w == crate::svg::BOX_NOTE), "{auto}");
+        }
         // Plain artwork says nothing of boxes.
         let plain = project
             .add_svg_overlay(SvgSource::Custom(ART.to_string()), 0.0, Some(4.0), SvgLayout::default())
@@ -351,6 +369,35 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("dy") && err.contains("dx"), "{err}");
+    }
+
+    #[test]
+    fn a_box_a_template_control_sets_is_changed_there() {
+        let project = Project::open_in_memory().unwrap();
+        let mut t = crate::template::fixtures::template();
+        t.svg = t.svg.replace(r#"<text id="tag""#, r#"<text id="tag" inline-size="100""#);
+        t.manifest.controls.push(crate::template::TemplateControl {
+            id: "width".into(),
+            label: "Line width".into(),
+            kind: crate::template::TemplateKind::Number,
+            targets: vec![crate::template::TemplateTarget {
+                element: "tag".into(),
+                attribute: Some("inline-size".into()),
+            }],
+            min: None,
+            max: None,
+        });
+        let o = project
+            .apply_template(&t, &Default::default(), 0.0, None, SvgLayout::default())
+            .unwrap()
+            .overlay;
+        let err = project.set_title_text_box(o.id, "tag", shrink(60.0)).unwrap_err().to_string();
+        assert!(err.contains("“Line width”") && err.contains("change it there"), "{err}");
+        // The control still sets it.
+        let set = project
+            .set_title_values(o.id, &[("width".to_string(), "70".to_string())].into())
+            .unwrap();
+        assert!(restore_text(svg_of(&set)).unwrap().contains(r#"inline-size="70""#));
     }
 
     #[test]

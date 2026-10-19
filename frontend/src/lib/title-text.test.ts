@@ -18,10 +18,10 @@ describe('a text box', () => {
 		);
 		const wrapped = withTextBox(src, 't', { width: 120.5, fit: 'wrap' });
 		expect(wrapped).toBe(
-			doc('<text id="t" x="5" y="50" style="fill:red;opacity:.5;inline-size:120.5px !important">Hi</text>')
+			doc('<text id="t" x="5" y="50" style="inline-size:120.5px !important;fill:red;opacity:.5">Hi</text>')
 		);
 		const shrunk = withTextBox(wrapped, 't', { width: 300, fit: 'shrink' });
-		expect(shrunk).toContain('style="fill:red;opacity:.5;inline-size:300px !important" data-kerf-fit="shrink">Hi');
+		expect(shrunk).toContain('style="inline-size:300px !important;fill:red;opacity:.5" data-kerf-fit="shrink">Hi');
 		expect(titleTexts(shrunk)).toEqual([{ id: 't', outlined: false, box: { width: 300, fit: 'shrink' } }]);
 		const none = withTextBox(shrunk, 't', { width: null, fit: 'shrink' });
 		expect(none).toBe(doc('<text id="t" x="5" y="50" style="fill:red;opacity:.5">Hi</text>'));
@@ -40,7 +40,7 @@ describe('a text box', () => {
 		expect(titleTexts(doc('<text id="t" inline-size="80" style="inline-size:auto">a</text>'))[0].box.width).toBeNull();
 		const quoted = doc(`<text id="t" style="font-family:'A;B'; inline-size:9px">a</text>`);
 		expect(withTextBox(quoted, 't', { width: 20, fit: 'wrap' })).toBe(
-			doc(`<text id="t" style="font-family:'A;B';inline-size:20px !important">a</text>`)
+			doc(`<text id="t" style="inline-size:20px !important;font-family:'A;B'">a</text>`)
 		);
 		const sheet = doc('<style>.n{inline-size:60px}</style><text id="t" class="n">a</text>');
 		expect(withTextBox(sheet, 't', { width: null, fit: 'wrap' })).toContain('style="inline-size:auto !important"');
@@ -81,6 +81,21 @@ describe('the harness', () => {
 		expect(o?.svg).toContain('style="inline-size:90px !important" data-kerf-fit="shrink"');
 		expect(warnings).toEqual([HARNESS_NOTE]);
 		expect(convertTitleTextIn(tl, 'o', 'outlines').warnings).toEqual([HARNESS_NOTE]);
+	});
+
+	test('refuses a box a template control sets', () => {
+		const control = {
+			id: 'width',
+			label: 'Line width',
+			kind: 'number',
+			targets: [{ element: 't', attribute: 'inline-size' }]
+		};
+		const tl = timeline(
+			overlay(doc('<text id="t" inline-size="90">Hi</text>'), {
+				template: { template_id: 'x', name: 'T', controls: [control], values: {} }
+			} as unknown as Partial<SvgOverlay>)
+		);
+		expect(() => setTitleTextBoxIn(tl, 'o', 't', { width: 40, fit: 'wrap' })).toThrow('“Line width”');
 	});
 
 	test('takes outlines away, refuses a preset and a template going back to text', () => {
