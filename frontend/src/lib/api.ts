@@ -117,6 +117,7 @@ import type {
 	TemplateList,
 	TemplateSaved,
 	TextKeyframe,
+	TitleClipPatch,
 	TextOverlay,
 	Timeline,
 	TimelineDiff,
@@ -216,6 +217,7 @@ import {
 	validateSvgSource
 } from './svg-dev';
 import {
+	applyTemplateClipTo,
 	applyTemplateTo,
 	deleteTemplateDev,
 	exportTemplateDev,
@@ -228,6 +230,7 @@ import {
 	templateImageValueOf,
 	templatePosterDev
 } from './template-dev';
+import { checkTitleSpan, isTitleClip, placeTitleClip, titleClip, titleOf } from './title-clips';
 import { VOICE_IDS, DEFAULT_SPEED, DEFAULT_VOICE, clampSpeed, estimateSeconds, scriptSegments, voiceInfo } from './voiceover';
 
 export type { AudioDetached };
@@ -2037,8 +2040,9 @@ export async function getBandBalance(request: BandBalanceRequest): Promise<BandB
 			if (!Number.isFinite(r.start) || !Number.isFinite(r.end) || r.start < 0 || r.end <= r.start) {
 				throw invalid('range needs 0 <= start < end, in seconds');
 			}
-			const cut = timelineDuration(devTimeline);
-			if (cut <= 0 || r.start >= cut) throw invalid(`range starts at ${r.start.toFixed(1)}s but the cut is ${cut.toFixed(1)}s long`);
+			const why = rangePastTheSound(devTimeline, r.start);
+			if (why) throw invalid(why);
+			const cut = untitledDuration(devTimeline);
 			target = 'mix';
 			name = 'mix';
 			origin = r.start;
@@ -2693,10 +2697,8 @@ export async function getLevels(range?: { start: number; end: number } | null, l
 	if (!inTauri()) {
 		// The backend refuses a span that starts past the end rather than widening it
 		// to the whole cut, which would answer a question nobody asked.
-		const cut = timelineDuration(devTimeline);
-		if (range && cut > 0 && range.start >= cut) {
-			throw new Error(`range starts at ${range.start.toFixed(1)}s but the cut is only ${cut.toFixed(1)}s long`);
-		}
+		const why = range && untitledDuration(devTimeline) > 0 ? rangePastTheSound(devTimeline, range.start) : null;
+		if (why) throw new Error(why);
 		return estimateLevels(devTimeline, sampleAssets, (id) => sampleAnalysis[id]?.loudness ?? undefined, {
 			range,
 			loudnorm
@@ -2788,6 +2790,10 @@ export async function setSpeed(clipId: string, speed: number, link?: boolean): P
 	if (!inTauri()) {
 		// Linked clips are retimed by the same ratio (`setSpeedLinked`) and re-placed about the
 		// named clip, so a picture and its sound keep step; `link: false` retimes the named clip alone.
+		const found = locate(devTimeline, clipId);
+		if (found && titleOf(found[0].clips[found[1]]) && speed !== 1) {
+			throw new Error('that edit would leave the timeline invalid: the clip is a title, which plays at its own speed');
+		}
 		devRun((tl) => ops.setSpeed(tl, devEnv(undefined, link), clipId, speed));
 		return snapshot();
 	}
@@ -3439,11 +3445,88 @@ export async function applyTemplate(
  *  and a title that changed while the values were being applied ("try again"). */
 export async function setTemplateValues(overlayId: string, values: Record<string, string>): Promise<TemplateEdit> {
 	if (!inTauri()) {
-		const { overlay, warnings } = setTemplateValuesIn(devTimeline, overlayId, values);
+		const { overlay, clip, warnings } = setTemplateValuesIn(devTimeline, overlayId, values);
 		recordDev('Set template values');
-		return { timeline: snapshot(), overlay_id: overlay.id, warnings };
+		return { timeline: snapshot(), overlay_id: overlay?.id, clip_id: clip?.id, warnings };
 	}
 	return invoke<TemplateEdit>('set_template_values', { overlayId, values });
+}
+
+/** Add a library template as a title clip on a video track, so it takes transitions (a dip to white from the shot
+ *  before it), fades and keys and extends like any clip. It runs from `start` for `duration` seconds (default: its own
+ *  length) on `trackId` (default: the lowest video track free over its span, else a new one on top). Resolves to the
+ *  refreshed timeline, the new clip's id (`clip_id`, to select it) and the warnings. */
+export async function applyTemplateClip(
+	templateId: string,
+	values: Record<string, string>,
+	start: number,
+	duration?: number | null,
+	trackId?: string | null,
+	name?: string | null
+): Promise<TemplateEdit> {
+	if (!inTauri()) {
+		const { clip, warnings } = applyTemplateClipTo(devTimeline, templateId, values, start, duration, trackId, name);
+		recordDev(`Add template title “${titleOf(clip)?.name ?? ''}”`);
+		return { timeline: snapshot(), clip_id: clip.id, warnings };
+	}
+	return invoke<TemplateEdit>('apply_template_clip', {
+		templateId,
+		values,
+		start,
+		duration: duration ?? null,
+		trackId: trackId ?? null,
+		name: name ?? null
+	});
+}
+
+/** Add custom SVG artwork as a title clip on a video track (placed as `applyTemplateClip` places one). `duration`
+ *  defaults to how long its animations run. */
+export async function addTitleClip(
+	svg: string,
+	start: number,
+	duration?: number | null,
+	trackId?: string | null,
+	name?: string | null
+): Promise<TemplateEdit> {
+	if (!inTauri()) {
+		const checked = validateSvgSource(svg);
+		const length = duration ?? 4;
+		checkTitleSpan(start, length);
+		const clip = titleClip({ name: name?.trim() ?? '', svg: checked.svg }, Math.max(0, start), length);
+		placeTitleClip(devTimeline, clip, trackId);
+		recordDev('Add title clip');
+		return { timeline: snapshot(), clip_id: clip.id, warnings: checked.warnings };
+	}
+	return invoke<TemplateEdit>('add_title_clip', {
+		svg,
+		start,
+		duration: duration ?? null,
+		trackId: trackId ?? null,
+		name: name ?? null
+	});
+}
+
+/** Rename a title clip or replace its artwork (`svg`, which ends a template). One edit; the clip keeps its place. */
+export async function updateTitleClip(clipId: string, patch: TitleClipPatch): Promise<TemplateEdit> {
+	if (!inTauri()) {
+		const clip = devTimeline.tracks.flatMap((t) => t.clips).find((c) => c.id === clipId);
+		const title = clip && titleOf(clip);
+		if (!clip || !title) throw new Error(`the clip ${clipId} is not a title`);
+		if (patch.name === undefined && patch.svg === undefined) throw new Error('nothing to change: give a name or svg');
+		let warnings: string[] = [];
+		const next = { ...title };
+		if (patch.name !== undefined) next.name = patch.name.trim();
+		if (patch.svg !== undefined) {
+			const checked = validateSvgSource(patch.svg);
+			next.svg = checked.svg;
+			next.template = undefined;
+			warnings = checked.warnings;
+		}
+		clip.generator = { ...next, kind: 'title' };
+		recordDev('Update title clip');
+		return { timeline: snapshot(), clip_id: clipId, warnings };
+	}
+	return invoke<TemplateEdit>('update_title_clip', { clipId, patch });
 }
 
 /** Bring a `.kerftemplate` file into the library. Never overwrites: the same template is `already_present`,
@@ -4059,6 +4142,21 @@ export async function revisionDiff(seq: number): Promise<TimelineDiff | null> {
 
 function timelineDuration(tl: Timeline): number {
 	return tl.tracks.reduce((m, t) => Math.max(m, trackEnd(t)), 0);
+}
+
+/** How long the cut runs without its titles on tracks, which have no sound (`Timeline::untitled_duration`): what a
+ *  pass over the mix measures. */
+function untitledDuration(tl: Timeline): number {
+	return timelineDuration({ ...tl, tracks: tl.tracks.map((t) => ({ ...t, clips: t.clips.filter((c) => !isTitleClip(c)) })) });
+}
+
+/** Why a range starting at `start` measures nothing of the mix (`Timeline::range_past_the_sound`). */
+function rangePastTheSound(tl: Timeline, start: number): string | null {
+	const cut = untitledDuration(tl);
+	if (cut > 0 && start < cut) return null;
+	return timelineDuration(tl) > cut + 1e-9
+		? `range starts at ${start.toFixed(1)}s, but the cut ends at ${cut.toFixed(1)}s before its titles, which have no sound`
+		: `range starts at ${start.toFixed(1)}s but the cut is only ${cut.toFixed(1)}s long`;
 }
 
 /** The `true` in the browser harness: `?staged=1` seeds a fake agent proposal. */

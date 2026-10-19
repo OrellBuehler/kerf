@@ -130,6 +130,11 @@ impl Project {
 
     fn sync_side(&self, timeline: &Timeline, clip_id: Uuid) -> Result<SyncSide> {
         let clip = timeline.clip(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
+        if clip.is_generated() {
+            return Err(Error::InvalidArgument(format!(
+                "clip {clip_id} is a title, which has no sound to sync by"
+            )));
+        }
         check_plain_speed(clip)?;
         let asset = self.get_asset(clip.asset_id)?.ok_or(Error::AssetNotFound(clip.asset_id))?;
         if !asset.has_audio() {

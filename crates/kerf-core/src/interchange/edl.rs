@@ -151,6 +151,10 @@ pub(super) fn export(timeline: &Timeline, assets: &[Asset], opts: &InterchangeOp
             report.warn("disabled clips were left out of the EDL");
             continue;
         }
+        if clip.is_generated() {
+            report.warn("titles and captions are not carried by an EDL");
+            continue;
+        }
         if !tb.on_frame(clip.timeline_start) || !tb.on_frame(clip.timeline_end()) {
             report.warn("clip edges between frames were rounded to the nearest frame");
         }

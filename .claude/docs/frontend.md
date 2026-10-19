@@ -874,8 +874,8 @@ edits folds from a chevron in it, and its one legend line says what the two icon
 `+page.svelte` brings it forward once when a proposal lands (`editor.staged`
 going null → set) — a review nobody can see is not a review. Under **Quick
 edits**, four preset chips run an edit now (`quick-edits.ts`: `Remove silences` / `Frame for the delivery`
-/ `Caption the cut` (analyzes whatever is in the cut but not yet transcribed,
-then captions it) / `Cut to the beat` — which
+/ `Caption the cut` (analyzes whatever is in the cut but not yet transcribed — `cutAssets`, which
+leaves out titles on tracks: they have no asset — then captions it) / `Cut to the beat` — which
 analyzes whatever is on the audio tracks first, then calls `snap_to_beats`, and says
 "No cuts were near a beat" instead of claiming an alignment when the grid never reached
 them); **the task is recorded only after the edit has run** (`record`: add, then resolve), so a connected agent never sees a task it could claim and redo (short of a window of two IPC round trips: `add_task` has no already-done form, so the task is `queued` until the `resolve_task` that follows — closing it needs a backend command that creates it done), and a failed edit leaves nothing in the queue. The rest enqueue for the agent — `Assemble rough cut` is one of them now: it used to run the same silence removal as `Remove silences` under a bigger name. Remove silences acts on `quickTarget`: the footage of the selected clip, else the selected library asset, else the first picture on the cut, and says which (a line under the chips, the toast naming it, "Nothing to remove" when the cut did not change); the local chips are off while a proposal is previewed. In the browser there is no agent, so
@@ -1642,6 +1642,21 @@ browser's canvas (`css-color.ts`). Harness: `?empty=1` has no templates, `?templ
 `template-dev.ts` now refuses what core does (nested text controls, `attribute_name_ok`, control characters in name /
 description / label, a blank name falling back to the title's, Rust's `f64` grammar for numbers, 128 KiB after the
 splice). Tests: `template-ui`, `template-actions`, `template-wiring`, `css-color`, `api-templates`, `api-templates-changed` (the desktop half of `templates-changed`).
+
+**Titles on tracks in the editor.** A title clip is a `Clip` with `generator: {kind: 'title', name, svg, template?}` and
+`asset_id` `GENERATED_ASSET` (`types.ts`); `title-clips.ts` (bun-tested) is the pure side — `isTitleClip` / `titleOf` /
+`titleName`, `findTitle(timeline, id)` (a `TitleRef` for a floating title or a title clip: what `TemplateSection`, the save
+dialog and `setTemplateValue` read through `editor.titleById`), `titleClip` and `placeTitleClip` (kerf-core's placement: the named
+video track, else the lowest unlocked one free over the span, else a new `V{n}` on top). `api.ts`: `applyTemplateClip(templateId,
+values, start, duration?, trackId?, name?)`, `addTitleClip(svg, start, duration?, trackId?, name?)`, `updateTitleClip(clipId,
+patch)` → `TemplateEdit` with `clip_id`; `setTemplateValues` takes either id (the harness's `setTemplateValuesIn` answers
+`overlay` or `clip`, `applyTemplateClipTo` places one, and `setSpeed` refuses a title as the engine's invariant does).
+`editor.applyTemplateClip` / `addTitleClip` / `updateTitleClip` select the clip they made; `editor.select` of the generated asset
+looks nothing up. **Template card**: *Add to a track at the playhead* beside *Add at the playhead*. **Inspector**: a selected
+title clip shows its name with the template mark, a **Title** section (the name field, through `FieldEdits` like every plain
+field: `renameTitle` writes to the clip it took focus on) and the **Template** section of a floating title (`TemplateSection`
+takes `{id, svg, template}`), and has no Speed section; Timing, Fades, Transform (keyframes: an animated placement), Color, Mask
+and Transition are the clip's. Tests: `title-clips.test.ts`.
 
 **Animated SVG titles in the editor.** The engine draws the artwork (resvg, into every preview and export frame), so the
 page **never inlines the SVG** — `svg-titles.test.ts` fails on any `{@html}` / `innerHTML` in `src/` — and shows it only as an

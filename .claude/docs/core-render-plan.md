@@ -64,6 +64,8 @@
   clock), `pick_fps` (the `fps=` filter's parse, `av_d2q` with `INT_MAX` — the grid clips
   are placed on; the same for every rate with small terms, different for `29.970029`),
   `pix_fmt`, gif and composite colour policy.
+  **A title clip** (a generated clip, `core-model.md`) is no layer: a frame it is on names it in `RenderPlan::svg` after the
+  floating titles, by clip id, so the compositor refuses the frame (`Unsupported::Svg`) and FFmpeg draws it from resvg's pictures.
   **Two modes.** `Still` is the contract the GPU path started with (`build_still_args`:
   one sampled transform, half-open spans, text drawn statically) **and the FFmpeg still's own frame
   inside a transition** (`engine/cli/still_fx.rs`): the fades still changing the picture, counted at the

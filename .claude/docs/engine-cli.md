@@ -1039,6 +1039,29 @@ so the feature is **only** activated through these forwards — which is what ma
     elsewhere reading the one directory, and the stream (from the playhead mid-title the
     box is already across). A 10 s text-heavy lower third at 960 px: 301 frames in 3.0 s on 4 shared cores (10 ms a frame).
     **Not drawn**: `animateMotion`, CSS animation, an `<image>` whose `href` is not a `data:` URL of PNG / JPEG / GIF / WebP.
+  **Titles on tracks** (generated clips, `svg_layer::clip_sequences`, tests in `engine/cli/title_clips.rs`). A title clip's
+  input is the same rasteriser's pictures a floating title reads, drawn **over the whole frame** (`fmt` size, opaque, the clip's
+  chain fits and places it), one per output frame the clip is on — from the first at or after its start to the last **before** its
+  end, tail included (a decoded clip has no frame at its end either) — picture `j` the document at the slot start of frame
+  `first + j` on the clip's clock (`doc_t0 = source_in + exact_time(first) - timeline_start`). A clip on no frame still has one
+  picture, so every clip has its input. A document that cannot move is the held picture, looped. `push_inputs` pushes the
+  sequence (never shared by `plan_inputs`) and records `InputPlan::stamps`, and `video_clip_chain_stamped` starts the chain with
+  `settb=expr=den/num,setpts=N+k` (`,trim=end_frame=n` for a held picture) in place of `trim` / `reverse` / `setpts`; everything
+  after (crop, fit, zoom, colour, grade, effects, `format=yuva420p` for its alpha, fades, dips) is the clip's own chain, so a dip
+  to white fades the title's pixels and a dissolve its alpha (a transparent title over nothing dips only its artwork; give an
+  end card a background to dip the whole frame). **Drawn before the spawn** like the floating titles: `prepare_export` and the
+  stream (`PreviewCut::pictures`) prepare them with the overlays' sequences; the stream's are named for the slice (a stream from
+  another playhead draws the rest of the title again; the floating titles' grid-named reuse is not done for clips yet). **A still**
+  reads one picture of the document at the layer's source time over the canvas (`still_clip_picture`, `-f image2 -pattern_type
+  none`, drawn by `still_titles`), through the image path of the still chain; `active_video_clips` does not clamp a title's source
+  time to an asset. **A graph that draws no picture names no title**: `export_timeline` drops title clips for an audio-only
+  container (`drop_titles`), as the levels and mix passes and a scrub window do (a window's frames are never under a title: a
+  title clip has no asset, so `Snapshot::plain` is false over it and the one-shot still draws it). Interchange: OTIO writes a
+  `GeneratorReference.1` (`generator_kind` `KerfTitle`, the artwork in `metadata.kerf`), the EDL leaves titles out with a warning.
+  Golden: the `title-clip*` family (`core-golden.md`). Measured (`#[ignore]`d, 6.1.1): every export frame of a sliding title on
+  a track equals its still within 2 levels at 24 / 25 / 29.97 / 30 fps and the frames off it are the plain cut; a dip to white
+  from the shot into an end card is white at the cut and the card holds its last state when extended; a head-trimmed title starts
+  part-way; a held one ends with its clip; the stream from mid-title shows it part-way across.
   **360 footage** is reprojected by `v360`: `StreamInfo.projection` is detected at
   probe time (`detect_projection` — a `Spherical Mapping` side-data entry, or an
   Insta360 `.insv` whose frame is two squares side by side; deliberately *no*
