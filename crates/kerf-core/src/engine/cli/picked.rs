@@ -741,6 +741,14 @@ fn late_numbered(dir: &Path, name: &str, lead: f64) -> Option<Source> {
         let mut asset = video.asset;
         asset.path = out.to_string_lossy().into_owned();
         asset.duration = probed_duration(&out);
+        // The lead an import records, which the export seeks and places the picture by.
+        let lead = probe(&out)
+            .ok()
+            .and_then(|p| p.streams.into_iter().find(|s| s.kind == StreamKind::Video))
+            .map_or(0.0, |s| s.lead);
+        for s in asset.streams.iter_mut().filter(|s| s.kind == StreamKind::Video) {
+            s.lead = lead;
+        }
         Source {
             asset,
             numbers: video.numbers,
@@ -810,6 +818,27 @@ fn proxy_late_video_start_picks_what_the_preview_graph_renders() {
         let plan = [original.clone(), filler.clone()];
         for (seek, speed) in [(0.0, 1.0), (0.0, -1.0), (1.0, 1.0), (0.35, 1.0), (0.0, 0.5), (1.0, -2.0)] {
             let (timeline, clip) = timeline_of_clip(original, &filler, seek, 1.0, speed, 6.0 / 30.0);
+            // The original, as the export reads it: the window inside the lead unseeked and its
+            // first picture late by `picture_delay`, the pick with it.
+            let tag = format!("late{i}-{seek}-{speed}");
+            let found = compare(
+                &timeline,
+                clip,
+                &plan,
+                &plan,
+                None,
+                Some(Path::new(&original.path)),
+                &source.numbers,
+                30.0,
+                &dir,
+                &tag,
+                H / 2,
+            );
+            assert!(
+                found.wrong.is_empty(),
+                "original, lead {lead}, seek {seek}, speed {speed}: (frame, rendered, planned) {:?}",
+                &found.wrong[..found.wrong.len().min(6)]
+            );
             let tag = format!("proxy{i}-{seek}-{speed}");
             let found = compare(
                 &timeline,
@@ -851,7 +880,7 @@ fn proxy_late_video_start_picks_what_the_preview_graph_renders() {
                 .unwrap();
             assert!(layer.source.proxy && layer.path == proxy.to_string_lossy());
             let drops = matches!(layer.pick, crate::frame_pick::Pick::Fps(p) if p.drop_first);
-            assert_eq!(drops, padded && seek == 0.0, "lead {lead}, seek {seek}");
+            assert_eq!(drops, padded && clip_seek(seek, lead) == 0.0, "lead {lead}, seek {seek}");
         }
     }
     assert_eq!(padded_seen, 2);

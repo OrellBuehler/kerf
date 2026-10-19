@@ -38,6 +38,11 @@
 //! picture, a stream reads the title's own sequence from `-start_number`, a still is `-f image2
 //! -pattern_type none`) moved those four lines (blocks 60..63) and nothing else.
 //!
+//! **Late-starting twins.** `retarget_late` (every nineteenth case, no dice) cuts the clips of
+//! `interview` and `phone` from twins whose video starts after their sound (`StreamInfo::lead`),
+//! half of them from the head of the file: the window read without a seek and the picture's
+//! `+(start+delay)/TB` (`late-start-delay`). Only those 248 cases moved.
+//!
 //! **The multi-delivery family is appended the same way**: the [`TOGETHER_CASES`] after those draw
 //! from the same generator and are then exported at two or three delivery frames by one run
 //! ([`together_for`], on dice of its own): their export text is `together::build_together_args`
@@ -178,6 +183,8 @@ reframe-fisheye ih_fov=
 still-reframe v360=input=
 shared-input [vsp
 head-padded-proxy trim=start_frame=1
+late-start-delay )/TB
+preview-late-start-delay )/TB
 image-input -loop 1 -framerate
 image-under-a-frame -t 0.0
 overlay drawtext=
@@ -387,7 +394,7 @@ fn stream(kind: StreamKind, codec: &str, size: (u32, u32), fps: f64) -> StreamIn
     StreamInfo {
         index: 0, kind, codec: codec.into(), width: video.then_some(size.0), height: video.then_some(size.1), fps: video.then_some(fps),
         sample_rate: None, channels: None, image: false, projection: None, rotation: 0, color_transfer: None, color_primaries: None,
-        pix_fmt: video.then(|| "yuv420p".into()), color_space: None,
+        pix_fmt: video.then(|| "yuv420p".into()), color_space: None, lead: 0.0,
     }
 }
 
@@ -463,6 +470,25 @@ fn pool() -> Vec<Asset> {
         .map(|s| if s.kind == StreamKind::Video { StreamInfo { width: Some(1440), height: Some(1080), ..s } } else { s })
         .collect();
     pool.push(Asset { id: Uuid::from_u128(300), path: "/golden/hdr-hlg-43.mp4".into(), name: "hdr-hlg-43".into(), streams, ..hlg });
+    // Footage whose video starts after its sound (`StreamInfo::lead`): the twins of `interview`
+    // (80 ms, a phone's) and `phone` (half a second), and the head-padded proxy of the first,
+    // which carries its original's lead — reached only by [`retarget_late`].
+    let late = |name: &str, lead: f64, path: String, twin: &str| {
+        let original = pool.iter().find(|a| a.name == name).unwrap().clone();
+        let streams = original
+            .streams
+            .iter()
+            .cloned()
+            .map(|s| if s.kind == StreamKind::Video { StreamInfo { lead, ..s } } else { s })
+            .collect();
+        Asset { id: Uuid::from_u128(400 + original.id.as_u128() + 50 * u128::from(path.contains("proxies"))), path, name: format!("{name}{twin}"), streams, ..original }
+    };
+    let late_twins = [
+        late("interview", 0.08, "/golden/interview-late.mov".into(), "-late"),
+        late("phone", 0.5, "/golden/phone-late.mp4".into(), "-late"),
+        late("interview", 0.08, format!("/golden/kerf/proxies/{:016x}.lead.mp4", 0x5eed_1000), "-late-padded"),
+    ];
+    pool.extend(late_twins);
     pool
 }
 
@@ -520,6 +546,37 @@ fn retarget_hdr43(tl: &mut Timeline, i: usize, assets: &[Asset]) {
     for clip in tl.tracks.iter_mut().flat_map(|t| &mut t.clips) {
         if assets[..LIBRARY].iter().any(|a| a.id == clip.asset_id && a.hdr().is_some()) && clip.id.as_u128() % 3 == 0 {
             clip.asset_id = twin;
+        }
+    }
+}
+
+/// Every nineteenth case, the clips of `interview` and `phone` are cut from their late-starting
+/// twins (about a third of `interview`'s from its padded proxy), and half of those from the head
+/// of the file, their length kept: what puts `ClipFx::lead` — the window read without a seek and
+/// the picture's `picture_delay` — in the oracle. No dice of its own: the clip's id decides.
+fn retarget_late(tl: &mut Timeline, i: usize, assets: &[Asset]) {
+    if i % 19 != 6 {
+        return;
+    }
+    for clip in tl.tracks.iter_mut().flat_map(|t| &mut t.clips) {
+        let Some(original) = assets[..LIBRARY].iter().find(|a| a.id == clip.asset_id) else {
+            continue;
+        };
+        let twin = if original.name == "interview" && clip.id.as_u128() % 3 == 0 {
+            "-late-padded"
+        } else {
+            "-late"
+        };
+        let Some(twin) = assets[LIBRARY..]
+            .iter()
+            .find(|a| a.name.strip_suffix(twin) == Some(&original.name))
+        else {
+            continue;
+        };
+        clip.asset_id = twin.id;
+        if (clip.id.as_u128() >> 2) % 2 == 0 {
+            clip.source_out -= clip.source_in;
+            clip.source_in = 0.0;
         }
     }
 }
@@ -981,6 +1038,7 @@ fn case(i: usize, assets: &[Asset]) -> Case {
     retarget_alpha(&mut timeline, i, assets);
     retarget_hdr43(&mut timeline, i, assets);
     retarget_tiny(&mut timeline, i);
+    retarget_late(&mut timeline, i, assets);
     if (CASES..CASES + MASTER_CASES).contains(&i) {
         timeline.master = master_for(i - CASES);
     }
@@ -1402,8 +1460,9 @@ fn families(c: &Case, assets: &[Asset], text: &[String; 3], table: &[(&str, &str
     // read the facts the builders decide from. The export's graph is the range's slice, the
     // preview's the cut from the playhead, a still's the layers on screen.
     let untagged_hd = |name: &str| {
+        let name = name.strip_suffix("-padded").unwrap_or(name);
         matches!(
-            name.strip_suffix("-padded").unwrap_or(name),
+            name.strip_suffix("-late").unwrap_or(name),
             "interview" | "broll" | "phone" | "wide" | "sphere" | "lenses"
         )
     };
