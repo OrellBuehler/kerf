@@ -73,7 +73,7 @@
 			<div style="flex:1;display:flex;align-items:center;gap:10px;min-width:0">
 				<ProgressBar value={progress?.waiting ? null : (progress?.fraction ?? 0)} label="Exporting" />
 				<span style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted)"
-					>{#if progress?.total != null && progress.total > 1}{(progress.variant ?? 0) + 1}/{progress.total} · {/if}{Math.round(
+					>{#if progress?.together}{progress.total} at once · {:else if progress?.total != null && progress.total > 1}{(progress.variant ?? 0) + 1}/{progress.total} · {/if}{Math.round(
 						(progress?.fraction ?? 0) * 100
 					)}%</span
 				>

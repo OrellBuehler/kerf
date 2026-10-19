@@ -1412,6 +1412,8 @@ export interface ExportProgress {
 	 *  `fraction` then spans all of them. */
 	variant?: number;
 	total?: number;
+	/** A multi-format export rendering every file in one pass: `variant` is then 0. */
+	together?: boolean;
 }
 
 /** Payload of the `import-progress` event, emitted while a 360 pair is stitched. */

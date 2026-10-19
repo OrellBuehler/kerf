@@ -191,11 +191,16 @@
   9:16, 1:1` revision that a re-run leaves alone — and `engine::render_variants`
   renders `ExportVariant`s (a `Delivery` + an output path; `ExportVariant::beside`
   names each file by shape, `cut-9x16.mp4`, an `x` because `:` is not a Windows
-  filename character) **one after another**, each variant's `resolution` / `fit`
-  taken from its delivery, reporting a `VariantProgress` (which file of how many
-  plus the overall fraction). Sequential on purpose: an export takes every core
-  it is given and `cpu::lease` would serialize them anyway, and a cancel is
-  then clean — the file in flight is deleted, the finished ones kept.
+  filename character), each variant's `resolution` / `fit` taken from its
+  delivery, reporting a `VariantProgress` (which file of how many plus the
+  overall fraction). With `together` (the app's default, `single_pass`) every
+  file comes out of **one ffmpeg run** (`engine/cli/together.rs`, see
+  engine-cli.md): the sources decoded once and `split` into each frame's graph,
+  the mix built once and `asplit` into each file, a stop removing every file it
+  touched (`VariantProgress.together`, `variant` 0). Without it, or where one run
+  cannot write them (two-pass, a hardware encoder, an audio-only container, two
+  variants on one file name), they render **one after another**, and a cancel
+  deletes the file in flight and keeps the finished ones.
   **Side-files of a delivery** (`project/exports.rs`): `delivery_inputs` snapshots the
   working timeline, the *original* assets, the render frame rate (`render_geometry`) and the
   project's name under the lock; the static `captions_document` (refused with no captions;

@@ -75,7 +75,7 @@ pub use engine::{
     BandWindow, Container, DownloadProgress, ExportOptions, ExportProgress, ExportVariant, Filmstrip, FilmstripSheet, Fit,
     GeqEdge, ImageFormat, LoudnessPreset, MusicStatus, PlaybackParams, PlaybackRequest, PreviewFrame, RateControl, Region,
     RenderStatus, ScrubConfig, ScrubFrames, ScrubStats, SpeechModelInfo, StemsStatus, StyleInfo, TextPart, TextRasterGraph,
-    VariantProgress, VoiceInfo, VoiceoverStatus, WaveformLevel, WaveformPyramid, WaveformRange, WindowBalance,
+    VariantProgress, VariantsRun, VoiceInfo, VoiceoverStatus, WaveformLevel, WaveformPyramid, WaveformRange, WindowBalance,
     DEFAULT_SPEECH_MODEL, DEFAULT_VOICE, FILMSTRIP_HEIGHT, MAX_FILMSTRIP_FRAMES, MAX_STREAM_FPS, MAX_STREAM_WIDTH,
     MAX_VOICE_SPEED, MAX_WAVEFORM_BUCKETS, MIN_STREAM_FPS, MIN_STREAM_WIDTH, MIN_VOICE_SPEED, STEM_NAMES,
 };

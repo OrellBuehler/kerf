@@ -817,7 +817,10 @@ named by shape (`variantPath`, the bun-tested mirror of
 per-file row in the platform check judged at that file's frame (`platformCheck([w, h])`),
 in place of the single-file line — with shapes picked, the Scaling rows hide (each
 delivery brings its own resolution and fit) and the button reads `Export N
-files`; `export-progress` then carries `variant` / `total`. The
+files`; `export-progress` then carries `variant` / `total`, and `together` when the files render in one
+pass (the default; `exportVariants`' `singlePass`), which the progress text shows as `3 at once ·`
+instead of `1/3 ·`; a stopped single pass rejects with `export cancelled; all N files were removed`, which
+the dialog's toast repeats. The
 **Transcript tab** of the library (`TranscriptPanel.svelte`, over the pure, bun-tested
 `src/lib/transcript.ts`) **is an editing surface**: lines resolve to the clip carrying them,
 click seeks, the playhead line highlights, and `×` cuts the sentence from the timeline
