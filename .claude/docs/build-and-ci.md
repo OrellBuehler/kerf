@@ -81,6 +81,9 @@ one on Linux, Windows and macOS, and runs weekly, so a pruned BtbN pin shows
 up before a release needs it; the `parity` job is the same pair on Linux (the
 GPU compositor against each FFmpeg, on lavapipe); a `libav` job compiles the `ffmpeg` /
 `libav-render` features against the Ubuntu dev libraries.
+CI's cargo caches save only from `main` (`save-if`); PRs restore them. Saving per PR ref
+filled the 10 GB cache: the pinned FFmpeg archives `main` had just saved were gone within
+the hour, and every macOS run went back to evermeet.cx and its 429s.
 
 **Publishing a release would open a gap in the feed**, so the workflow closes it:
 the new tag becomes `releases/latest` the moment it is published, but its

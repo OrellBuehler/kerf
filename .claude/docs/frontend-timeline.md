@@ -345,6 +345,10 @@ a canvas cannot read `var()`, so `readPalette` resolves `--waveform` / `--danger
 `STEREO_MIN_HEIGHT` (48) px tall (`laneCount`, a function of pixels so the track-height
 presets drive it) and folds to one below that; the default 64 px track is stereo.
 `get_waveform` is no longer used by the timeline (the MCP tool keeps it).
+**A title clip** (a generated clip, `title-clips.ts`) has no filmstrip — it decodes no asset — and shows the template mark at
+its head and its title's name (`titleName`) as its label (`data-title-clip`); every gesture, trim, roll, slip, slide and
+transition handle is the clip's as for footage (its source limit is the engine's 24 h: `trimBounds` gives a title clip that
+reach whatever the caller passes, so its right edge extends and its left edge stops at the document's start).
 **Filmstrips** are the video twin: one `<canvas>` per video clip over its on-screen part
 (`ClipFilmstrip.svelte`; the waveform's windowing, DPR cap and size discipline), blitted from
 the asset's `get_filmstrip` sheets. `filmstrip-view.ts` is the pure layout: a clip is a row of
@@ -441,7 +445,22 @@ clip's own ffmpeg chain (`audio_effects_filter`, the same string the export rend
 the chain is part of the buffer cache key and retuning an EQ re-fetches. It runs before
 this engine's gain envelope where the export runs it after the clip gain — audible only
 to a level-dependent effect, and keeping volume in Web Audio is what lets the fader stay
-live instead of re-fetching PCM on every drag. Reverse shuttle is still silent. The
+live instead of re-fetching PCM on every drag. **Reverse shuttle is audible**: a negative rate
+plays each clip behind the playhead backwards from where the playhead meets it (its end, or the
+playhead inside it), varispeed like the forward shuttle, from a buffer stored the other way round
+(`#buffer(clip, backwards)`: a forward clip's samples back-to-front, a reversed clip's front-to-back,
+first padded to the window's own length so the buffer's first sample is the window's end even when
+the decode ran out early — `audio_pcm` does not pad) and through the same gain envelope met in reverse
+(`gainAutomationBack` in `audio-mix.ts`: the forward pass's points in the order they are reached, a
+keyed step met from above); the clock counts down and the clips are asked for nearest first. The
+`MAX_WINDOW` (600 s of source) window is held at the end the playhead enters by, so — the mirror of
+forward — reverse is silent while the playhead is more than 600 s of source from a clip's end. A window
+is cached one way round at a time: asked for the other, the cached copy is turned in memory and
+replaces it (no second fetch, no second copy counted against `CACHE_CAP`). Decoding and turning both
+write straight into the new buffer with an indexed loop: a per-sample callback (`Float32Array.from` with
+a map) made a 600 s decode ~17× slower on the main thread. `audio.test.ts` pins it with
+an offset oracle (speeds ±0.5..2, a `source_in`, an early-ending decode: each source heard at the time its
+timeline time maps to), keyed volume, J→L re-anchoring and the teardown on stop. The
 playhead follows the audio clock — edits mid-playback re-anchor via
 `ui.resync()` from a `+page.svelte` effect. The timeline
 toolbar's `+ V` / `+ A` add tracks and each track header has a `×` to remove one

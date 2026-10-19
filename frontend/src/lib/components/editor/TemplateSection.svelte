@@ -1,5 +1,5 @@
 <script lang="ts">
-	// The Inspector's Template section for an animated SVG title. A title that came from a template shows one field
+	// The Inspector's Template section for an animated SVG title, floating or on a track. A title that came from a template shows one field
 	// per control — text, color, number, font, image — and each committed change is one `set_template_values` edit: a
 	// text, color or font field on change, a number on blur or Enter (every step of its arrows would be an edit), never
 	// per keystroke. A change made while another edit runs keeps what was typed and is made when that edit is done.
@@ -28,9 +28,10 @@
 	} from '#lib/template-ui';
 	import { swatchHex } from '#lib/title-color';
 	import { tip } from '#lib/tip';
-	import type { SvgOverlay, TemplateControl } from '#lib/types';
+	import type { TemplateControl, TemplateInstance } from '#lib/types';
 
-	let { o }: { o: SvgOverlay } = $props();
+	/** A title, floating or on a track: its id, artwork and template. */
+	let { o }: { o: { id: string; svg: string; template?: TemplateInstance | null } } = $props();
 
 	const template = $derived(o.template);
 	let choosing = $state<string | null>(null);
@@ -75,7 +76,7 @@
 
 	/** What a field shows for a control now: the title's value (a color picker, its swatch). */
 	function shownNow(el: HTMLInputElement | HTMLSelectElement, id: string, control: string): string {
-		const now = editor.svgOverlays.find((t) => t.id === id)?.template?.values[control] ?? '';
+		const now = editor.titleById(id)?.template?.values[control] ?? '';
 		return el.type === 'color' ? swatch(now) : now;
 	}
 
@@ -93,7 +94,7 @@
 		const back = () => {
 			if (el.isConnected) el.value = shownNow(el, id, controlId);
 		};
-		const title = editor.svgOverlays.find((t) => t.id === id);
+		const title = editor.titleById(id);
 		const control = title?.template?.controls.find((x) => x.id === controlId);
 		if (!title || !control) return;
 		const was = title.template!.values[control.id] ?? '';

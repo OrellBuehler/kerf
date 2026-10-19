@@ -61,7 +61,7 @@ agent isn't scripting a black box; it drives the identical engine — and its ed
 | | |
 | --- | --- |
 | **Multi-track NLE** | Bespoke timeline: video/audio/text tracks, free clip positioning with gaps, drag-to-move across tracks, edge-drag trim, razor split, **roll / slip / slide** trim tools, trim-to-playhead, ripple delete, markers, mute/solo/lock, snapping to edges / playhead / **beats**. |
-| **Real playback** | Not a slideshow — one long-lived FFmpeg streams the **composited** cut (every track, effect, keyframe and overlay) paced against the audio clock, with J/K/L shuttle and audible Web-Audio scrub. |
+| **Real playback** | Not a slideshow — one long-lived FFmpeg streams the **composited** cut (every track, effect, keyframe and overlay) paced against the audio clock, with J/K/L shuttle audible both ways and audible Web-Audio scrub. |
 | **Delivery frames** | 16:9 / 9:16 / 1:1 / 4:5 is a property of the **project**, so preview, scrub and export all render the same frame — with platform **safe-area guides** and cover-crop instead of letterboxing. |
 | **Smart crop** | Reshaping 16:9 to 9:16 throws away most of one axis. `smart_crop` samples where each shot's content actually is (edge detail + motion, no model to ship) and writes the crop that keeps it, per clip — an ordinary transform the sliders can still override. |
 | **Ready to publish?** | `platform_check` judges the cut against Reels / Shorts / TikTok / Instagram / YouTube — length, shape, resolution, captions — and tells a **hard** limit (rejected) apart from a **reach** limit (accepted, then buried). Advisory only; nothing blocks an export. **Cover frames** save at the full delivery resolution. |
@@ -143,7 +143,7 @@ Now ask the agent to work on the project you have open — _"skim the interview 
 the dead air, and drop in captions."_ It will claim a task, use the tools below, and hand
 back a reviewable result.
 
-### The tools (170)
+### The tools (172)
 
 <details>
 <summary><b>See / analyze</b></summary>
@@ -186,7 +186,7 @@ score, fitted to the cuts) ·
 `set_reframe_keyframes` · `add_reframe_keyframe` · `set_track_volume` · `set_track_pan` ·
 `set_master_volume` · `set_master_limiter` · `set_master_true_peak` · `set_master_duck` ·
 `add_overlay` · `update_overlay` · `remove_overlay` · `set_overlay_keyframes` ·
-`add_svg_overlay` · `update_svg_overlay` · `remove_svg_overlay` · `list_svg_presets` ·
+`add_svg_overlay` · `update_svg_overlay` · `remove_svg_overlay` · `list_svg_presets` · `add_title_clip` · `update_title_clip` ·
 `list_templates` · `save_template` · `apply_template` · `set_template_values` · `import_template` · `export_template` · `delete_template` ·
 `generate_captions` · `import_captions` · `clear_captions` · `export_srt` · `export_captions` · `list_fonts` ·
 `set_delivery_format` · `set_asset_projection`
@@ -331,8 +331,7 @@ Kerf is a working editor under active development — not a scaffold. The timeli
 preview, transcript, analysis, effects, keyframes, captions, playback and export are all
 wired to real backend state, and the MCP surface is exercised end-to-end.
 
-**Roadmap:** a live activity stream pushed from the MCP server (the queue is polled today), and
-audible reverse shuttle.
+**Roadmap:** a live activity stream pushed from the MCP server (the queue is polled today).
 
 Contributions welcome — see [`CONTRIBUTING.md`](./CONTRIBUTING.md).
 

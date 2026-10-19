@@ -1,6 +1,7 @@
-//! The golden argv oracle: 6800 seeded timelines (4000, then 800 with a master bus, then 800
+//! The golden argv oracle: 7200 seeded timelines (4000, then 800 with a master bus, then 800
 //! with per-property channels, then 400 with an AMF or VAAPI encoder, then 400 with animated SVG
-//! titles, then 400 exported at several delivery frames in one run) whose ffmpeg argv must not move.
+//! titles, then 400 exported at several delivery frames in one run, then 400 with titles on tracks) whose
+//! ffmpeg argv must not move.
 //!
 //! `build_export_args_phase`, `build_still_args` and `build_preview_args_with` are
 //! built for every case and their argv reduced to a digest, checked against three
@@ -38,6 +39,11 @@
 //! picture, a stream reads the title's own sequence from `-start_number`, a still is `-f image2
 //! -pattern_type none`) moved those four lines (blocks 60..63) and nothing else.
 //!
+//! **Late-starting twins.** `retarget_late` (every nineteenth case, no dice) cuts the clips of
+//! `interview` and `phone` from twins whose video starts after their sound (`StreamInfo::lead`),
+//! half of them from the head of the file: the window read without a seek and the picture's
+//! `+(start+delay)/TB` (`late-start-delay`). Only those 248 cases moved.
+//!
 //! **The multi-delivery family is appended the same way**: the [`TOGETHER_CASES`] after those draw
 //! from the same generator and are then exported at two or three delivery frames by one run
 //! ([`together_for`], on dice of its own): their export text is `together::build_together_args`
@@ -45,6 +51,13 @@
 //! clips carry framings, a quarter mux captions and chapters, and the encode is made one the run
 //! takes (no two-pass, a software encoder); a tenth keep an audio-only container, which no run
 //! writes together. Only 4 block lines were appended to each file.
+//!
+//! **The title-clip family is appended the same way**: the [`TITLE_CASES`] after those draw their
+//! timelines from the same generator and then get one or two titles on video tracks ([`title_clip_for`],
+//! on dice of its own seeded by the case, the same fixed artworks): after the last clip of the lowest
+//! video track, touching it under a transition or across a gap, or over the cut on a track of their own;
+//! some head-trimmed, faded or placed. The first 6800 per-case digests are the ones the commit before
+//! title clips gave; only 4 block lines were appended to each file.
 //!
 //! **Machine-independent by construction.** The builders read the machine in five
 //! places, each pinned: the preview's decode acceleration (the
@@ -104,7 +117,10 @@ const SVG_FIRST: usize = CASES + MASTER_CASES + CHANNEL_CASES + HW_CASES;
 /// The multi-delivery cases appended after the animated-title ones (see the module docs).
 const TOGETHER_CASES: usize = 400;
 const TOGETHER_FIRST: usize = SVG_FIRST + SVG_CASES;
-const TOTAL: usize = TOGETHER_FIRST + TOGETHER_CASES;
+/// The title-clip cases appended after the multi-delivery ones (see the module docs).
+const TITLE_CASES: usize = 400;
+const TITLE_FIRST: usize = TOGETHER_FIRST + TOGETHER_CASES;
+const TOTAL: usize = TITLE_FIRST + TITLE_CASES;
 const BLOCK: usize = 100;
 const MIN_PER_FAMILY: usize = 20;
 const KINDS: [&str; 3] = ["export", "still", "preview"];
@@ -178,6 +194,8 @@ reframe-fisheye ih_fov=
 still-reframe v360=input=
 shared-input [vsp
 head-padded-proxy trim=start_frame=1
+late-start-delay )/TB
+preview-late-start-delay )/TB
 image-input -loop 1 -framerate
 image-under-a-frame -t 0.0
 overlay drawtext=
@@ -216,6 +234,8 @@ preview-svg-input -f image2 -framerate
 preview-svg-held -f image2 -pattern_type none -loop 1 -framerate
 preview-svg-seek -start_number
 preview-svg-overlay ][svg0]overlay=x=
+title-clip-held ,trim=end_frame=
+preview-title-clip-held ,trim=end_frame=
 cover-fit force_original_aspect_ratio=increase
 scaler-flag :flags=lanczos
 pix-fmt format=yuv422p10le
@@ -387,7 +407,7 @@ fn stream(kind: StreamKind, codec: &str, size: (u32, u32), fps: f64) -> StreamIn
     StreamInfo {
         index: 0, kind, codec: codec.into(), width: video.then_some(size.0), height: video.then_some(size.1), fps: video.then_some(fps),
         sample_rate: None, channels: None, image: false, projection: None, rotation: 0, color_transfer: None, color_primaries: None,
-        pix_fmt: video.then(|| "yuv420p".into()), color_space: None,
+        pix_fmt: video.then(|| "yuv420p".into()), color_space: None, lead: 0.0,
     }
 }
 
@@ -463,6 +483,25 @@ fn pool() -> Vec<Asset> {
         .map(|s| if s.kind == StreamKind::Video { StreamInfo { width: Some(1440), height: Some(1080), ..s } } else { s })
         .collect();
     pool.push(Asset { id: Uuid::from_u128(300), path: "/golden/hdr-hlg-43.mp4".into(), name: "hdr-hlg-43".into(), streams, ..hlg });
+    // Footage whose video starts after its sound (`StreamInfo::lead`): the twins of `interview`
+    // (80 ms, a phone's) and `phone` (half a second), and the head-padded proxy of the first,
+    // which carries its original's lead — reached only by [`retarget_late`].
+    let late = |name: &str, lead: f64, path: String, twin: &str| {
+        let original = pool.iter().find(|a| a.name == name).unwrap().clone();
+        let streams = original
+            .streams
+            .iter()
+            .cloned()
+            .map(|s| if s.kind == StreamKind::Video { StreamInfo { lead, ..s } } else { s })
+            .collect();
+        Asset { id: Uuid::from_u128(400 + original.id.as_u128() + 50 * u128::from(path.contains("proxies"))), path, name: format!("{name}{twin}"), streams, ..original }
+    };
+    let late_twins = [
+        late("interview", 0.08, "/golden/interview-late.mov".into(), "-late"),
+        late("phone", 0.5, "/golden/phone-late.mp4".into(), "-late"),
+        late("interview", 0.08, format!("/golden/kerf/proxies/{:016x}.lead.mp4", 0x5eed_1000), "-late-padded"),
+    ];
+    pool.extend(late_twins);
     pool
 }
 
@@ -520,6 +559,37 @@ fn retarget_hdr43(tl: &mut Timeline, i: usize, assets: &[Asset]) {
     for clip in tl.tracks.iter_mut().flat_map(|t| &mut t.clips) {
         if assets[..LIBRARY].iter().any(|a| a.id == clip.asset_id && a.hdr().is_some()) && clip.id.as_u128() % 3 == 0 {
             clip.asset_id = twin;
+        }
+    }
+}
+
+/// Every nineteenth case, the clips of `interview` and `phone` are cut from their late-starting
+/// twins (about a third of `interview`'s from its padded proxy), and half of those from the head
+/// of the file, their length kept: what puts `ClipFx::lead` — the window read without a seek and
+/// the picture's `picture_delay` — in the oracle. No dice of its own: the clip's id decides.
+fn retarget_late(tl: &mut Timeline, i: usize, assets: &[Asset]) {
+    if i % 19 != 6 {
+        return;
+    }
+    for clip in tl.tracks.iter_mut().flat_map(|t| &mut t.clips) {
+        let Some(original) = assets[..LIBRARY].iter().find(|a| a.id == clip.asset_id) else {
+            continue;
+        };
+        let twin = if original.name == "interview" && clip.id.as_u128() % 3 == 0 {
+            "-late-padded"
+        } else {
+            "-late"
+        };
+        let Some(twin) = assets[LIBRARY..]
+            .iter()
+            .find(|a| a.name.strip_suffix(twin) == Some(&original.name))
+        else {
+            continue;
+        };
+        clip.asset_id = twin.id;
+        if (clip.id.as_u128() >> 2) % 2 == 0 {
+            clip.source_out -= clip.source_in;
+            clip.source_in = 0.0;
         }
     }
 }
@@ -937,6 +1007,81 @@ fn svg_for(tl: &mut Timeline, j: usize) {
     }
 }
 
+/// The titles on tracks of the `j`-th title-clip case: one or two, on dice of their own (seeded by the
+/// case). Half follow the last clip of the lowest video track, most of those touching it and most of
+/// those under a transition; the rest go over the cut on a video track of their own, on top. Some are
+/// head-trimmed (their document starts part-way, as a slice leaves it), faded, or scaled and moved.
+fn title_clip_for(tl: &mut Timeline, j: usize) {
+    let mut r = Rng::new(0x5449_544c_0000 + j as u64);
+    let Some(lowest) = tl.tracks.iter().position(|t| t.kind == StreamKind::Video) else {
+        return;
+    };
+    for _ in 0..r.pick(&[1, 1, 2]) {
+        let title = crate::model::TitleClip {
+            name: String::new(),
+            svg: r.pick(&SVG_DOCS).into(),
+            template: None,
+        };
+        let length = r.real(0.4, 6.0);
+        let after = r.chance(0.5);
+        let start = if after {
+            let end = tl.tracks[lowest].end();
+            if r.chance(0.75) {
+                end
+            } else {
+                end + r.real(0.1, 2.0)
+            }
+        } else {
+            r.real(0.0, tl.duration().max(1.0))
+        };
+        let mut clip = Clip::title(title, start, length);
+        clip.id = r.id();
+        if after && r.chance(0.7) {
+            clip.transition_in = Some(Transition {
+                kind: r.pick(&TransitionKind::ALL),
+                duration: r.real(0.2, 1.5),
+            });
+        }
+        if r.chance(0.2) {
+            clip.source_in = r.real(0.1, 2.0);
+            clip.source_out += clip.source_in;
+        }
+        if r.chance(0.25) {
+            clip.fade_in = r.real(0.1, 1.0);
+        }
+        if r.chance(0.25) {
+            clip.fade_out = r.real(0.1, 1.0);
+        }
+        if r.chance(0.3) {
+            clip.transform.scale = r.real(0.3, 1.2);
+            clip.transform.pos_x = r.real(-0.3, 0.3);
+            clip.transform.pos_y = r.real(-0.3, 0.3);
+        }
+        if after {
+            tl.tracks[lowest].clips.push(clip);
+        } else {
+            let mut track = Track::new(StreamKind::Video, "TT");
+            track.id = r.id();
+            track.clips.push(clip);
+            let at = tl
+                .tracks
+                .iter()
+                .rposition(|t| t.kind == StreamKind::Video)
+                .map_or(0, |i| i + 1);
+            tl.tracks.insert(at, track);
+        }
+    }
+}
+
+/// Whether a graph holds a title clip's chain: one that starts by stamping its pictures onto the
+/// canvas' grid (`setpts=N+k,` and the clip's chain going on, where a floating title's ends on its pad).
+fn stamped_chain(graph: &str) -> bool {
+    graph.match_indices("setpts=N+").any(|(at, needle)| {
+        let rest = &graph[at + needle.len()..];
+        rest.trim_start_matches(|c: char| c.is_ascii_digit()).starts_with(',')
+    })
+}
+
 /// Every eighth title case is exported as a gif (no dice): the titles end on `vcomp`, ahead of the
 /// palette, which the text overlay's and the plain cut's graphs never do.
 fn svg_container_for(j: usize) -> Option<Container> {
@@ -952,7 +1097,7 @@ fn hw_encoder_for(n: usize) -> &'static str {
 /// One timeline of each family: what `project::persist_tests` freezes as the shape a file stores.
 pub(crate) fn sample_timelines() -> Vec<Timeline> {
     let assets = pool();
-    [0, 4, CASES + MASTER_CASES, CASES + MASTER_CASES + 1, SVG_FIRST]
+    [0, 4, CASES + MASTER_CASES, CASES + MASTER_CASES + 1, SVG_FIRST, TITLE_FIRST]
         .into_iter()
         .map(|i| case(i, &assets).timeline)
         .collect()
@@ -981,6 +1126,7 @@ fn case(i: usize, assets: &[Asset]) -> Case {
     retarget_alpha(&mut timeline, i, assets);
     retarget_hdr43(&mut timeline, i, assets);
     retarget_tiny(&mut timeline, i);
+    retarget_late(&mut timeline, i, assets);
     if (CASES..CASES + MASTER_CASES).contains(&i) {
         timeline.master = master_for(i - CASES);
     }
@@ -989,6 +1135,9 @@ fn case(i: usize, assets: &[Asset]) -> Case {
     }
     if (SVG_FIRST..TOGETHER_FIRST).contains(&i) {
         svg_for(&mut timeline, i - SVG_FIRST);
+    }
+    if i >= TITLE_FIRST {
+        title_clip_for(&mut timeline, i - TITLE_FIRST);
     }
     let dur = timeline.duration();
     let edges: Vec<f64> = (timeline.tracks.iter().flat_map(|t| &t.clips))
@@ -1033,7 +1182,7 @@ fn case(i: usize, assets: &[Asset]) -> Case {
     if (SVG_FIRST..TOGETHER_FIRST).contains(&i) {
         svg_playhead(&mut c, i - SVG_FIRST);
     }
-    if i >= TOGETHER_FIRST {
+    if (TOGETHER_FIRST..TITLE_FIRST).contains(&i) {
         together_for(&mut c, i - TOGETHER_FIRST);
     }
     c
@@ -1254,7 +1403,7 @@ fn transitions(c: &Case, assets: &[Asset]) -> Vec<String> {
 }
 
 /// The families that come from the case's structure rather than from argv text.
-const STRUCTURAL: [&str; 33] = [
+const STRUCTURAL: [&str; 38] = [
     "muted-track",
     "solo-track",
     "disabled-clip",
@@ -1285,6 +1434,11 @@ const STRUCTURAL: [&str; 33] = [
     "svg-under-text",
     "svg-gif",
     "svg-offset",
+    "title-clip",
+    "title-clip-dip",
+    "title-clip-under-transition",
+    "still-title-clip",
+    "preview-title-clip",
     "bt709-mix",
     "still-bt709-mix",
     "preview-bt709-mix",
@@ -1402,8 +1556,9 @@ fn families(c: &Case, assets: &[Asset], text: &[String; 3], table: &[(&str, &str
     // read the facts the builders decide from. The export's graph is the range's slice, the
     // preview's the cut from the playhead, a still's the layers on screen.
     let untagged_hd = |name: &str| {
+        let name = name.strip_suffix("-padded").unwrap_or(name);
         matches!(
-            name.strip_suffix("-padded").unwrap_or(name),
+            name.strip_suffix("-late").unwrap_or(name),
             "interview" | "broll" | "phone" | "wide" | "sphere" | "lenses"
         )
     };
@@ -1515,6 +1670,30 @@ fn families(c: &Case, assets: &[Asset], text: &[String; 3], table: &[(&str, &str
             flat[0].contains("][svg0]overlay=") && export_timeline(tl, &c.opts).svg_overlays.iter().any(|o| o.offset > 0.0),
             "svg-offset",
         ),
+        // Titles on tracks: drawn by the export, dipping, under a transition of either kind, in a still,
+        // and in the stream.
+        (stamped_chain(&flat[0]), "title-clip"),
+        (
+            stamped_chain(&flat[0])
+                && export_timeline(tl, &c.opts)
+                    .title_clips()
+                    .any(|(k, _)| k.transition_in.is_some_and(|t| t.kind.dip_color().is_some())),
+            "title-clip-dip",
+        ),
+        (
+            stamped_chain(&flat[0])
+                && export_timeline(tl, &c.opts)
+                    .title_clips()
+                    .any(|(k, _)| k.transition_in.is_some_and(|t| t.kind.dip_color().is_none())),
+            "title-clip-under-transition",
+        ),
+        (
+            c.stills
+                .iter()
+                .any(|(t, _)| layers(*t).iter().any(|l| l.active.clip.is_generated())),
+            "still-title-clip",
+        ),
+        (stamped_chain(&flat[2]), "preview-title-clip"),
         (bt709_export, "bt709-mix"),
         (bt709_still, "still-bt709-mix"),
         (bt709_preview, "preview-bt709-mix"),

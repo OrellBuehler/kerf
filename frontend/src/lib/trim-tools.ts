@@ -43,7 +43,8 @@ import { gestureReason } from './link-ui';
 import { trim } from './link-ops';
 import { formatTime, type TimeMode } from './time-format';
 import type { Asset, Clip, SplitSide, StreamKind, Timeline, Track } from './types';
-import { clipDuration } from './types';
+import { clipDuration, GENERATED_ASSET } from './types';
+import { MAX_TITLE_SECONDS } from './title-clips';
 
 /** The tools that move a boundary rather than a whole clip. */
 export type TrimTool = 'roll' | 'slip' | 'slide';
@@ -98,9 +99,12 @@ const messageOf = (e: unknown) =>
 	gestureReason((e instanceof Error ? e.message : String(e)).replace(/^invalid argument: /, ''));
 
 /** How far each asset's footage reaches — `Project::source_limits`: its duration,
- *  or `Infinity` for a still (it loops, so it never runs out). */
+ *  or `Infinity` for a still (it loops, so it never runs out), and a title's document its first 24 hours. */
 export function sourceLimits(assets: readonly Pick<Asset, 'id' | 'duration' | 'streams'>[]): SourceLimits {
-	return new Map(assets.map((a) => [a.id, a.streams.some((s) => s.image) ? Infinity : a.duration]));
+	const limits: [string, number][] = assets.map((a) => [a.id, a.streams.some((s) => s.image) ? Infinity : a.duration]);
+	// A title on a track reaches as far as its document may run.
+	limits.push([GENERATED_ASSET, MAX_TITLE_SECONDS]);
+	return new Map(limits);
 }
 
 /** What `trimRefusal` needs to know about the project. */

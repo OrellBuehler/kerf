@@ -132,6 +132,28 @@ fn clip_json(tb: &Timebase, clip: &Clip, asset: Option<&Asset>, report: &mut Rep
         ));
     }
     let state = serde_json::to_value(clip).map_err(|e| Error::Other(e.to_string()))?;
+    if let Some(generator) = &clip.generator {
+        report.info("titles on tracks are written as generator references; their artwork is kept in metadata.kerf");
+        return Ok(json!({
+            "OTIO_SCHEMA": "Clip.2",
+            "name": generator.display_name(),
+            "source_range": range(tb, clip.source_in, clip.duration()),
+            "effects": effects,
+            "markers": [],
+            "enabled": clip.enabled,
+            "media_references": {"DEFAULT_MEDIA": {
+                "OTIO_SCHEMA": "GeneratorReference.1",
+                "name": generator.display_name(),
+                "generator_kind": "KerfTitle",
+                "parameters": {},
+                "available_range": null,
+                "available_image_bounds": null,
+                "metadata": {},
+            }},
+            "active_media_reference_key": "DEFAULT_MEDIA",
+            "metadata": {"kerf": state},
+        }));
+    }
     Ok(json!({
         "OTIO_SCHEMA": "Clip.2",
         "name": asset.map(|a| a.name.as_str()).unwrap_or(""),

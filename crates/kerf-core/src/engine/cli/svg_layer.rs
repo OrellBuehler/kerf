@@ -33,7 +33,7 @@ use std::time::{Duration, Instant};
 use sha2::{Digest, Sha256};
 
 use super::{cpu, export_format, export_timeline, ExportFormat, ExportOptions, ExportProgress};
-use crate::clip_timing::Rational;
+use crate::clip_timing::{ClipFx, ClipTiming, Rational};
 use crate::error::{Error, Result};
 use crate::fonts::{self, FontSet};
 use crate::model::{Asset, StreamKind, SvgOverlay, Timeline};
@@ -264,15 +264,35 @@ fn argv_root(root: &std::path::Path) -> String {
     root.to_string_lossy().trim_end_matches(std::path::is_separator).to_string()
 }
 
+/// What a sequence draws and when it is on screen: a floating title's artwork and window, or a title
+/// clip's (whole frame, opaque; its window is the clip's).
+struct Art<'a> {
+    svg: &'a str,
+    opacity: f64,
+    start: f64,
+    end: f64,
+}
+
+impl<'a> Art<'a> {
+    fn of(o: &'a SvgOverlay) -> Self {
+        Art {
+            svg: &o.svg,
+            opacity: clamped_opacity(o),
+            start: o.start,
+            end: o.end,
+        }
+    }
+}
+
 fn seq_of<'a>(
-    o: &'a SvgOverlay,
+    o: Art<'a>,
     root: &std::path::Path,
     fps: Rational,
     rect: Rect,
     layout: Layout,
     registered: &Arc<FontSet>,
 ) -> SvgSeq<'a> {
-    let fonts = registered.named_by([o.svg.as_str()]);
+    let fonts = registered.named_by([o.svg]);
     let Layout {
         lands_on,
         window_start,
@@ -281,21 +301,21 @@ fn seq_of<'a>(
         doc_t0,
         frames,
     } = layout;
-    let opacity = clamped_opacity(o);
-    if !crate::svg::may_animate(&o.svg) {
+    let opacity = o.opacity;
+    if !crate::svg::may_animate(o.svg) {
         // Nothing moves, so the picture is the same at every moment, and what decides it is the
         // artwork, its size and its opacity: not when the title starts, how long it runs, or the
         // rate, so trimming a held title keeps its picture.
         let key = digest(&fonts, |h| {
             h.update(b"held");
-            hash_svg(h, &o.svg);
+            hash_svg(h, o.svg);
             h.update([rect.w.to_le_bytes(), rect.h.to_le_bytes()].concat());
             h.update(opacity.to_bits().to_le_bytes());
         });
         let dir = root.join(&key);
         let input = format!("{}/{key}/{}", argv_root(root), raster::frame_name(0));
         return SvgSeq {
-            svg: &o.svg,
+            svg: o.svg,
             dir,
             input,
             kind: Kind::Held,
@@ -316,7 +336,7 @@ fn seq_of<'a>(
     // only moved keeps its frames.
     let key = digest(&fonts, |h| {
         h.update(b"sequence");
-        hash_svg(h, &o.svg);
+        hash_svg(h, o.svg);
         h.update(doc_t0.to_bits().to_le_bytes());
         h.update([fps.num.to_le_bytes(), fps.den.to_le_bytes()].concat());
         h.update(frames.to_le_bytes());
@@ -326,7 +346,7 @@ fn seq_of<'a>(
     let dir = root.join(&key);
     let input = format!("{}/{key}/%06d.png", argv_root(root).replace('%', "%%"));
     SvgSeq {
-        svg: &o.svg,
+        svg: o.svg,
         dir,
         input,
         kind: Kind::Frames,
@@ -381,7 +401,7 @@ pub(super) fn svg_sequences<'a>(timeline: &'a Timeline, fmt: &ExportFormat) -> V
                 doc_t0,
                 frames,
             };
-            Some(seq_of(o, &root, fps, rect, layout, &registered))
+            Some(seq_of(Art::of(o), &root, fps, rect, layout, &registered))
         })
         .collect()
 }
@@ -450,7 +470,7 @@ pub(super) fn stream_sequences<'a>(
                 doc_t0,
                 frames,
             };
-            Some(seq_of(o, &root, fps, rect, layout, &registered))
+            Some(seq_of(Art::of(o), &root, fps, rect, layout, &registered))
         })
         .collect()
 }
@@ -509,6 +529,126 @@ pub(super) fn push_chains(seqs: &[SvgSeq<'_>], first_input: usize, from: &str, t
         ));
         cur = out;
     }
+}
+
+// ---- a title on a track --------------------------------------------------------------------------
+
+/// A title clip's pictures as the input of its clip chain: the sequence, and how many output frames
+/// the clip is drawn on (a held picture, which ffmpeg loops for ever, is cut after that many).
+#[derive(Debug, Clone)]
+pub(super) struct ClipSeq<'a> {
+    pub seq: SvgSeq<'a>,
+    pub count: u64,
+}
+
+/// How a title clip's chain restamps its pictures onto the canvas' grid: the chain's first filters,
+/// in place of a decoded clip's `trim` and `setpts`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ClipStamp {
+    pub num: u32,
+    pub den: u32,
+    pub first_frame: u64,
+    pub held: Option<u64>,
+}
+
+impl ClipSeq<'_> {
+    pub(super) fn stamp(&self) -> ClipStamp {
+        ClipStamp {
+            num: self.seq.fps.num,
+            den: self.seq.fps.den,
+            first_frame: self.seq.first_frame,
+            held: (self.seq.kind == Kind::Held).then_some(self.count),
+        }
+    }
+}
+
+impl ClipStamp {
+    /// `settb=expr=den/num,setpts=N+k`, counted in frames as a floating title is (see [`push_chains`]),
+    /// then for a held picture `trim=end_frame=n`.
+    pub(super) fn filters(&self) -> String {
+        let stamp = format!("settb=expr={}/{},setpts=N+{}", self.den, self.num, self.first_frame);
+        match self.held {
+            Some(n) => format!("{stamp},trim=end_frame={n}"),
+            None => stamp,
+        }
+    }
+}
+
+/// The pictures of every title clip of `timeline` (already `for_render`ed and sliced, as the builders
+/// have it) on a canvas of `fmt`, indexed like `fx` (flat storage order); `None` for a clip of footage.
+/// Pure: it names the files, it writes none.
+///
+/// A title is drawn over the whole frame (its clip chain fits and places it from there), on exactly the
+/// output frames its clip is on: from the first at or after its start to the last **before** its end,
+/// tail included (a decoded clip has no frame at its end either), and not past the cut's last frame.
+/// Picture `j` is the document at the slot start of frame `first + j`, on the clip's own clock
+/// (`source_in` is what a head trim or a slice cut off the front). A clip on no frame at all still has
+/// one picture, so that every clip has its input; its overlay's `enable` never shows it.
+pub(super) fn clip_sequences<'a>(timeline: &'a Timeline, fmt: &ExportFormat, fx: &[ClipFx]) -> Vec<Option<ClipSeq<'a>>> {
+    let clips = timeline.tracks.iter().flat_map(|t| t.clips.iter().map(move |c| (t.kind, c)));
+    let mut out: Vec<Option<ClipSeq<'a>>> = clips.clone().map(|_| None).collect();
+    if !clips.clone().any(|(_, c)| c.is_generated()) {
+        return out;
+    }
+    let Some(fps) = Rational::from_fps(fmt.fps) else {
+        return out;
+    };
+    let last_output = last_frame_to(fps, timeline.duration(), true).unwrap_or(0);
+    let root = raster::root();
+    let registered = fonts::snapshot();
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        w: fmt.width.max(1),
+        h: fmt.height.max(1),
+    };
+    for (flat, (kind, clip)) in clips.enumerate() {
+        let Some(generator) = clip.generator.as_ref().filter(|_| kind == StreamKind::Video) else {
+            continue;
+        };
+        let (start, end) = ClipTiming::new(clip, fx.get(flat).unwrap_or(&ClipFx::default())).window();
+        let first = first_frame_from(fps, start);
+        let last = last_frame_to(fps, end.min(MAX_SECONDS), true)
+            .map(|l| l.min(last_output))
+            .filter(|l| *l >= first);
+        let count = last.map_or(1, |l| l - first + 1);
+        let doc_t0 = clip.generator_time(fps.exact_time(first) - clip.timeline_start);
+        let layout = Layout {
+            lands_on: first,
+            window_start: first,
+            first_picture: 0,
+            pictures: count,
+            doc_t0,
+            frames: count,
+        };
+        let art = Art {
+            svg: generator.svg(),
+            opacity: 1.0,
+            start,
+            end,
+        };
+        out[flat] = Some(ClipSeq {
+            seq: seq_of(art, &root, fps, rect, layout, &registered),
+            count,
+        });
+    }
+    out
+}
+
+/// The sequences of `clips` (from [`clip_sequences`]) a preparation draws.
+pub(super) fn clip_seqs<'a>(clips: &[Option<ClipSeq<'a>>]) -> Vec<SvgSeq<'a>> {
+    clips.iter().flatten().map(|c| c.seq.clone()).collect()
+}
+
+/// A title clip's picture in a still: the document at `doc_t`, over the whole `w` x `h` canvas.
+pub(super) fn still_clip_picture<'a>(svg: &'a str, w: u32, h: u32, doc_t: f64) -> StillSvg<'a> {
+    let rect = Rect {
+        x: 0,
+        y: 0,
+        w: w.max(1),
+        h: h.max(1),
+    };
+    still_of(svg, rect, doc_t, 1.0, &raster::root(), &fonts::snapshot())
 }
 
 // ---- drawing -------------------------------------------------------------------------------------
@@ -836,7 +976,7 @@ pub(super) fn prepare_export(
     progress: &mut dyn FnMut(ExportProgress),
     cancel: &dyn Fn() -> bool,
 ) -> Result<Option<Vec<Pin>>> {
-    if timeline.svg_overlays.is_empty() {
+    if timeline.svg_overlays.is_empty() && timeline.title_clips().next().is_none() {
         return Ok(Some(Vec::new()));
     }
     let cut = export_timeline(timeline, opts);
@@ -846,7 +986,8 @@ pub(super) fn prepare_export(
         return Ok(Some(Vec::new()));
     }
     let fmt = export_format(&cut, assets, opts);
-    let seqs = svg_sequences(&cut, &fmt);
+    let mut seqs = svg_sequences(&cut, &fmt);
+    seqs.extend(clip_seqs(&clip_sequences(&cut, &fmt, &super::transition_fx(&cut, assets))));
     if seqs.is_empty() {
         return Ok(Some(Vec::new()));
     }
@@ -988,27 +1129,37 @@ pub(super) fn still_svgs<'a>(timeline: &'a Timeline, w: u32, h: u32, t: f64) -> 
         .filter(|o| t >= o.start && t < o.end)
         .filter_map(|o| {
             let rect = rect_px(o, w, h)?;
-            let doc_t = o.doc_time(t);
-            let opacity = clamped_opacity(o);
-            let fonts = registered.named_by([o.svg.as_str()]);
-            let key = digest(&fonts, |hash| {
-                hash.update(b"still");
-                hash_svg(hash, &o.svg);
-                hash.update(doc_t.to_bits().to_le_bytes());
-                hash.update([rect.w.to_le_bytes(), rect.h.to_le_bytes()].concat());
-                hash.update(opacity.to_bits().to_le_bytes());
-            });
-            Some(StillSvg {
-                svg: &o.svg,
-                path: root.join(format!("still-{key}.png")),
-                input: format!("{}/still-{key}.png", argv_root(&root)),
-                rect,
-                doc_t,
-                opacity,
-                fonts,
-            })
+            Some(still_of(&o.svg, rect, o.doc_time(t), clamped_opacity(o), &root, &registered))
         })
         .collect()
+}
+
+/// One picture of `svg` at its clock `doc_t`, `rect` big, named by what decides it.
+fn still_of<'a>(
+    svg: &'a str,
+    rect: Rect,
+    doc_t: f64,
+    opacity: f64,
+    root: &std::path::Path,
+    registered: &Arc<FontSet>,
+) -> StillSvg<'a> {
+    let fonts = registered.named_by([svg]);
+    let key = digest(&fonts, |hash| {
+        hash.update(b"still");
+        hash_svg(hash, svg);
+        hash.update(doc_t.to_bits().to_le_bytes());
+        hash.update([rect.w.to_le_bytes(), rect.h.to_le_bytes()].concat());
+        hash.update(opacity.to_bits().to_le_bytes());
+    });
+    StillSvg {
+        svg,
+        path: root.join(format!("still-{key}.png")),
+        input: format!("{}/still-{key}.png", argv_root(root)),
+        rect,
+        doc_t,
+        opacity,
+        fonts,
+    }
 }
 
 /// The `-i` of each picture, after the clips' inputs. `-pattern_type none` makes the path one file

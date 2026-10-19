@@ -10,6 +10,7 @@ import {
 	fadeOutOf,
 	gainAtFullScale,
 	gainAutomation,
+	gainAutomationBack,
 	type GainClip,
 	type GainPoint,
 	limitedFullScaleDb,
@@ -318,5 +319,62 @@ describe('a keyed volume', () => {
 			]
 		});
 		expect(gainAutomation(flat, 10, 14, 10).every((p) => !p.jump)).toBe(true);
+	});
+});
+
+describe('a gain met backwards (reverse shuttle)', () => {
+	const keyed: GainClip = {
+		volume: 0.77,
+		fade_in: 0,
+		fade_out: 0,
+		channels: [
+			{
+				prop: 'volume',
+				keys: [
+					{ time: 0.2, value: 0.2 },
+					{ time: 1.1, value: 1.8 },
+					{ time: 1.7, value: 0.4, easing: 'hold' },
+					{ time: 2.2, value: 1 }
+				]
+			}
+		]
+	};
+
+	test('ramps through the forward points in the order they are met, a step met from above', () => {
+		const points = gainAutomationBack(keyed, 10, 15, 15);
+		expect(points.map((p) => [Number(p.time.toFixed(9)), !!p.jump])).toEqual([
+			[12.2, false],
+			[12.2, true],
+			[11.7, false],
+			[11.1, false],
+			[10.2, false],
+			[10, false]
+		]);
+		// Arriving at the step from above the gain is the one it lands on going forwards (1), and the
+		// jump sets the hold's (0.4); the rest is the curve.
+		expect(points[0].value).toBeCloseTo(1, 6);
+		expect(points[1].value).toBeCloseTo(0.4, 6);
+		expect(points[2].value).toBeCloseTo(0.4, 6);
+		expect(points[3].value).toBeCloseTo(1.8, 6);
+		expect(points[4].value).toBeCloseTo(0.2, 6);
+		// Played back from inside the hold, the step is behind and nothing jumps.
+		expect(gainAutomationBack(keyed, 10, 15, 12).every((p) => !p.jump)).toBe(true);
+	});
+
+	test('a plain clip is its fades the other way round', () => {
+		const plain: GainClip = { volume: 0.8, fade_in: 1, fade_out: 2 };
+		const points = gainAutomationBack(plain, 10, 15, 15);
+		expect(points.map((p) => [p.time, p.value])).toEqual([
+			[13, 0.8],
+			[11, 0.8],
+			[10, 0]
+		]);
+		// From inside the fade-out only what is still behind the playhead.
+		expect(gainAutomationBack(plain, 10, 15, 12).map((p) => p.time)).toEqual([11, 10]);
+		// A constant-power fade-in is met through every step of its curve, from the top.
+		const pair: GainClip = { volume: 1, fade_in: 0, fade_out: 0, transition_in: { kind: 'crossfade', duration: 1 }, power_pair: true };
+		const curve = gainAutomationBack(pair, 10, 15, 15).map((p) => p.time);
+		expect(curve).toEqual([...fadeInTimes(pair, 10)].reverse().concat(10));
+		expect(gainAutomationBack(pair, 10, 15, 15).at(-1)!.value).toBe(0);
 	});
 });

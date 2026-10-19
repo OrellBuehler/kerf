@@ -136,6 +136,8 @@ pub(super) const TOOLS: &[(&str, &str, Effect)] = &[
     ("add_svg_overlay", "Add SVG title", Edit),
     ("update_svg_overlay", "Update SVG title", Set),
     ("remove_svg_overlay", "Remove SVG title", Edit),
+    ("add_title_clip", "Add title clip", Edit),
+    ("update_title_clip", "Update title clip", Set),
     ("list_svg_presets", "List SVG title presets", Read),
     ("validate_svg", "Validate SVG", Read),
     ("preview_svg_overlay", "Preview SVG title", Read),
