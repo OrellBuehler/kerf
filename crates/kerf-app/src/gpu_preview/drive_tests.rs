@@ -493,7 +493,7 @@ fn a_frame_the_plan_refuses_is_counted_by_kind() {
 }
 
 /// A preview over a real device whose screen keeps the last picture it was given, read back.
-fn keeping() -> (GpuPreview, Arc<Mutex<ScreenLog>>, Arc<Gpu>) {
+pub(super) fn keeping() -> (GpuPreview, Arc<Mutex<ScreenLog>>, Arc<Gpu>) {
     let log = Arc::new(Mutex::new(ScreenLog::default()));
     let gpu = Gpu::new(GpuOptions::for_tests()).expect("a GPU adapter (install mesa-vulkan-drivers for lavapipe)");
     {
@@ -504,7 +504,7 @@ fn keeping() -> (GpuPreview, Arc<Mutex<ScreenLog>>, Arc<Gpu>) {
     (preview_on(&log, Arc::clone(&gpu)), log, gpu)
 }
 
-fn picture(log: &Arc<Mutex<ScreenLog>>) -> Vec<u8> {
+pub(super) fn picture(log: &Arc<Mutex<ScreenLog>>) -> Vec<u8> {
     lock(log).picture.take().expect("a picture")
 }
 

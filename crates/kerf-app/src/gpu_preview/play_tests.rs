@@ -584,3 +584,87 @@ fn a_play_being_served_or_held_is_not_primed_over() {
     assert!(!preview.prime(&inputs, 0.2));
     assert!(lock(&preview.primed).is_none());
 }
+
+/// The keys of a title that slides across the frame over `seconds`.
+fn slide(seconds: f64) -> Vec<TextKeyframe> {
+    let key = |time: f64, pos_x: f64| TextKeyframe {
+        time,
+        pos_x,
+        pos_y: 0.8,
+        opacity: 1.0,
+    };
+    vec![key(0.0, 0.2), key(seconds, 0.8)]
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_play_the_stream_took_over_is_taken_back_where_the_gpu_draws_again_from_cursors_made_ready() {
+    let _turn = exclusive();
+    let (preview, log, _gpu) = super::drive_tests::keeping();
+    // Nine seconds of video, and a title that slides from 0.5 s to 1.5 s.
+    let project = Project::open_in_memory().expect("a project");
+    for path in [&media()[0], &media()[1], &media()[0]] {
+        let asset = project.insert_or_get_asset(&probed(path)).expect("asset");
+        project.cut_clip(asset.id, 0.0, 3.0).expect("a clip");
+    }
+    let title = project.add_overlay("Sliding".into(), 0.5, 1.5).expect("a title").id;
+    project.set_overlay_keyframes(title, slide(1.0)).expect("keyframes");
+    let inputs = PlanInputs::of(&project).expect("inputs");
+    let _ = preview.frame(&inputs, Want::at(2.0), 320);
+    wait_open(&preview);
+    lock(&log).presented.clear();
+
+    // From 0 s the title is within the horizon: the stream plays, and the answer says where the GPU stops.
+    let declined = preview.play(&inputs, &key(2), 0.0, false).expect("an answer");
+    assert_eq!(declined.renderer, "stream");
+    let ahead = declined.play.and_then(|p| p.ahead).expect("where the GPU stops");
+    assert_eq!(ahead.kind, "moving_text");
+    assert!((ahead.at - 0.5).abs() < 1.0 / FPS, "{}", ahead.at);
+
+    // The stream plays; the page asks where the GPU can take the play back. The first frame after the title
+    // starts a run it draws, and the play from there is made ready: nothing is drawn.
+    let ready = preview.ready_play(&inputs, &key(3), 0.2, false).expect("an answer");
+    assert_eq!(ready.renderer, "ready", "{:?}", ready.reasons);
+    let resume = ready.play.and_then(|p| p.resume).expect("where");
+    assert!((1.5..1.5 + 2.0 / FPS).contains(&resume), "{resume}");
+    assert!(lock(&log).presented.is_empty(), "a ready request draws nothing");
+    assert_eq!(
+        lock(&preview.primed).as_ref().map(|p| p.motion.feed().waiting()),
+        Some(1),
+        "the cursor of the frame it resumes at is open"
+    );
+
+    // The page's session from there adopts it.
+    let taken = preview.play(&inputs, &key(3), resume + 0.001, false).expect("an answer");
+    assert_eq!(taken.renderer, "gpu", "{:?}", taken.reasons);
+    assert!(lock(&preview.primed).is_none(), "the session took what was made ready");
+    let drawn = super::drive_tests::picture(&log);
+    preview.end_play();
+    // The same frame as a play begun there cold.
+    let cold = preview.play(&inputs, &key(4), resume + 0.001, false).expect("an answer");
+    assert_eq!(cold.renderer, "gpu", "{:?}", cold.reasons);
+    assert!(
+        super::drive_tests::picture(&log) == drawn,
+        "the play taken back draws what a play begun there draws"
+    );
+    preview.end_play();
+
+    // A title that slides for longer than the reach: not yet, and where the GPU stops is said again.
+    project
+        .update_overlay(title, None, None, Some(8.0), None, None, None, None, None, None, None)
+        .expect("a longer title");
+    project.set_overlay_keyframes(title, slide(7.5)).expect("keyframes");
+    let inputs = PlanInputs::of(&project).expect("inputs");
+    let not_yet = preview.ready_play(&inputs, &key(5), 1.0, false).expect("an answer");
+    assert_eq!(not_yet.renderer, "stream");
+    let info = not_yet.play.expect("not yet, with where the GPU stops");
+    assert_eq!(info.resume, None);
+    assert_eq!(info.ahead.map(|a| a.kind), Some("moving_text"));
+    assert!(lock(&preview.primed).is_none());
+
+    // With the setting off there is no play to take back.
+    assert!(preview.set_enabled(false));
+    let off = preview.ready_play(&inputs, &key(6), 8.2, false).expect("an answer");
+    assert_eq!(off.renderer, "stream");
+    assert!(off.play.is_none(), "{:?}", off.reasons);
+}

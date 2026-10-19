@@ -20,6 +20,9 @@
 //!   first frame the compositor does not draw (or one it would not draw *in time*, see
 //!   [`PlayRefusal`]) and says where a stream that carries on has to start, as [`SpanPlan::handover`]
 //!   defines it for this slice.
+//! * **A clean run ahead is a place to take back.** [`PlayCut::resume`] finds the first frame from
+//!   which the compositor draws a whole horizon again, where a play the stream took over (or began
+//!   with) can be handed back to the compositor.
 //!
 //! Pure: it plans, it decodes nothing, so it is tested without an FFmpeg.
 
@@ -279,6 +282,31 @@ impl PlayCut {
         })
     }
 
+    /// Where a compositor that gave the play to the stream can take it back: the time of the first
+    /// frame, from the one on screen at `from` to the one `reach` seconds later, from which every
+    /// frame for `horizon` seconds is drawn (what [`Self::ahead`] asks of a session begun there);
+    /// `None` when no frame within `reach` starts such a run. Frames are planned in order, each once,
+    /// and the scan stops at the first run long enough.
+    pub fn resume(&self, from: f64, reach: f64, horizon: f64, size: (u32, u32), caps: &GpuCaps) -> Option<f64> {
+        let last_start = self.frame_at(from + reach.max(0.0)).max(self.frame_at(from));
+        let mut run: Option<u64> = None;
+        let mut k = self.frame_at(from);
+        loop {
+            if self.refusal(k, size, caps).is_some() {
+                run = None;
+                if k >= last_start {
+                    return None;
+                }
+            } else {
+                let start = *run.get_or_insert(k);
+                if k >= self.frame_at(self.time_of(start) + horizon.max(0.0)) {
+                    return Some(self.time_of(start));
+                }
+            }
+            k += 1;
+        }
+    }
+
     /// Where a stream that carries on from the compositor at timeline time `t` has to start:
     /// [`SpanPlan::handover`] of this slice's windows, at or before `t`.
     pub fn handover_at(&self, t: f64) -> f64 {
@@ -500,6 +528,43 @@ mod tests {
             ahead.why
         );
         assert!((ahead.at - 0.2).abs() < 1.0 / 30.0, "{}", ahead.at);
+    }
+
+    #[test]
+    fn the_compositor_takes_a_play_back_where_a_run_as_long_as_the_horizon_begins() {
+        // 0-2 s forward, 2-3 s a reversed clip, then forward to 10 s.
+        let a = asset(1280, 720, 30.0);
+        let mut back = make_clip(a.id, 0.0, 1.0, 2.0);
+        back.speed = -1.0;
+        let tl = timeline_of(vec![video_track(vec![
+            make_clip(a.id, 0.0, 2.0, 0.0),
+            back,
+            make_clip(a.id, 10.0, 17.0, 3.0),
+        ])]);
+        let assets = [a];
+        let c = cut(&tl, &assets, 0.0);
+        let size = (640, 360);
+        // The run from 0 s is cut by the reversed clip; the next one begins with the first frame after it
+        // (the frame at 3 s is still the reversed clip's: its window holds its end, as `between` has it).
+        let after = c.time_of(c.frame_at(3.0) + 1);
+        assert!(c.ahead(3.0, 0.0, size, &caps()).is_some());
+        assert_eq!(c.resume(0.0, 4.0, 5.0, size, &caps()), Some(after));
+        assert_eq!(c.resume(2.5, 1.0, 5.0, size, &caps()), Some(after));
+        // A short horizon fits before it.
+        assert_eq!(c.resume(0.0, 4.0, 1.0, size, &caps()), Some(0.0));
+        // Nothing begins within the reach: the reversed clip is all there is of it.
+        assert_eq!(c.resume(2.0, 0.5, 5.0, size, &caps()), None);
+        // What a session begun there scans is drawn.
+        let from = c.resume(2.0, 2.0, 5.0, size, &caps()).expect("a run");
+        assert_eq!(c.ahead(from, 5.0, size, &caps()), None);
+        assert!(
+            c.ahead(from - 1.0 / 30.0, 5.0, size, &caps()).is_some(),
+            "the frame before is refused"
+        );
+        // The end of the cut ends the run: what is past it is not a refusal.
+        assert_eq!(c.resume(2.5, 1.0, 30.0, size, &caps()), Some(after));
+        // A compositor that draws none of it never takes it back.
+        assert_eq!(c.resume(0.0, 4.0, 5.0, size, &GpuCaps::A0), None);
     }
 
     #[test]
