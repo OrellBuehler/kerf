@@ -355,6 +355,29 @@ fn a_sharpen_and_the_tables_are_the_references_byte_for_byte() {
 
 #[test]
 #[ignore = "needs a GPU adapter (lavapipe is enough)"]
+fn a_chroma_keys_alpha_is_the_references_at_any_thread_count() {
+    use kerf_gpu::effects::{self, ChromaKeyOptions};
+    let uv = effects::chroma_key_uv([0, 128, 0]);
+    for (w, h) in [(64u32, 36u32), (97, 55), (2, 2), (640, 360)] {
+        // Chroma about the key, so the alpha is graded and every entry of the window counts.
+        let mut frame = noise(w, h, 3);
+        let near = |c: u8, n: u8| (i32::from(c) + i32::from(n % 61) - 30) as u8;
+        frame.u = frame.u.iter().map(|n| near(uv[0], *n)).collect();
+        frame.v = frame.v.iter().rev().map(|n| near(uv[1], *n)).collect();
+        for threads in [1u32, 3, 5, 16] {
+            let c = compositor().with_graph_threads(threads);
+            for (similarity, blend) in [(0.02f32, 0.2f32), (0.15, 0.1), (0.05, 0.0), (0.01, 1.0)] {
+                let key = ChromaKeyOptions { uv, similarity, blend };
+                let got = c.chroma_key_alpha(&frame, &key).unwrap();
+                let want = effects::chroma_key_plane(&frame.u, &frame.v, w, h, &key, threads);
+                assert!(got == want, "{w}x{h} {threads} threads {key:?}");
+            }
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU adapter (lavapipe is enough)"]
 fn a_mask_is_the_alpha_plane_blended_over_black() {
     use kerf_core::{Mask, MaskShape};
     let (w, h) = (64u32, 36u32);

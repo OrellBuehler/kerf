@@ -2293,6 +2293,7 @@ fn what_is_ahead_of_a_moving_zoom_is_drawn_at_the_fit_size_and_magnified() {
         ("sharpen", kerf_core::VideoEffect::Sharpen { amount: 1.5 }, SCALED),
         ("grayscale", kerf_core::VideoEffect::Grayscale, SCALED),
         ("invert", kerf_core::VideoEffect::Invert, SCALED),
+        ("chroma key", key("green", 0.2, 0.2), ZOOMED_MASK),
     ] {
         let tl = with(&|c| c.effects = vec![effect.clone()]);
         run_zoom(&format!("zoom+{name}"), &tl, &assets, limits);
@@ -2477,6 +2478,14 @@ fn a_moving_zoom_behind_a_rotation_or_an_opacity_is_refused() {
 // ---- masks and effects, with nothing zooming ----------------------------------------------------
 
 /// A clip on a layer of bars: `edit` decides what it carries.
+fn key(color: &str, similarity: f64, blend: f64) -> kerf_core::VideoEffect {
+    kerf_core::VideoEffect::ChromaKey {
+        color: color.into(),
+        similarity,
+        blend,
+    }
+}
+
 fn over_bars(m: &Media, edit: &dyn Fn(&mut Clip)) -> (Timeline, Vec<Asset>) {
     let mut c = clip(&m.testsrc, 0.5, 1.5, 0.0);
     edit(&mut c);
@@ -2778,6 +2787,47 @@ fn effects_are_drawn_as_their_filters_draw_them() {
         c.effects = vec![E::Blur { sigma: 2.0 }, E::Sharpen { amount: 0.5 }];
     });
     run("effect/odd 211x118", &tl, &assets, 30.0, 0.5, EFFECT_SCALED);
+    // A chroma key: an alpha plane at the picture's size, from the chroma (exact), blended as a mask's is.
+    for (name, effects) in [
+        ("chroma key green", vec![key("green", 0.15, 0.1)]),
+        ("chroma key hard", vec![key("0x2050a0", 0.2, 0.0)]),
+        ("chroma key after tables", vec![E::Invert, key("magenta", 0.25, 0.05)]),
+    ] {
+        let (tl, assets) = over_bars(m, &|c| c.effects = effects.clone());
+        run(&format!("effect/{name}"), &tl, &assets, 30.0, 0.5, EXACT);
+    }
+    let mut c = clip(&m.noise, 0.5, 1.5, 0.0);
+    c.effects = vec![key("0x808080", 0.05, 0.3)];
+    run(
+        "effect/chroma key noise",
+        &timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None),
+        &[m.bars.clone(), m.noise.clone()],
+        30.0,
+        0.4,
+        EXACT,
+    );
+    // Through its fades and a dissolve (the ramp acts on the key's alpha).
+    let (tl, assets) = over_bars(m, &|c| {
+        c.effects = vec![key("green", 0.2, 0.2)];
+        c.fade_in = 0.3;
+        c.fade_out = 0.3;
+    });
+    run("effect/chroma key with fades", &tl, &assets, 30.0, 1.0, EXACT);
+    let out = clip(&m.bars, 0.5, 1.5, 0.0);
+    let mut inc = clip(&m.testsrc, 0.5, 1.5, 1.0);
+    inc.effects = vec![key("green", 0.2, 0.2)];
+    inc.transition_in = Some(Transition {
+        kind: TransitionKind::Crossfade,
+        duration: 0.5,
+    });
+    run(
+        "effect/chroma key dissolve",
+        &timeline(vec![vec![out, inc]], None),
+        &[m.bars.clone(), m.testsrc.clone()],
+        30.0,
+        2.0,
+        EXACT,
+    );
     // A sharpen after a scale, up to half strength: the scaler's level through the filter's gain (2).
     for (name, effects) in [
         ("sharpen 0.5", vec![E::Sharpen { amount: 0.5 }]),
@@ -2921,14 +2971,20 @@ fn what_the_compositor_does_not_draw_of_an_effect_or_a_mask_is_refused() {
     use kerf_core::VideoEffect as E;
     let (tl, assets) = over_bars(m, &|c| c.effects = vec![E::Vignette]);
     refused("effect/vignette", &tl, &assets, &opts, upto(1.0, 30.0), "vignette");
+    // A chroma key on chroma that is not FFmpeg's to the level: after a scale (a level moves its alpha by up to
+    // 1/blend levels).
     let (tl, assets) = over_bars(m, &|c| {
-        c.effects = vec![E::ChromaKey {
-            color: "green".into(),
-            similarity: 0.1,
-            blend: 0.1,
-        }];
+        c.transform.scale = 0.6;
+        c.effects = vec![key("green", 0.15, 0.1)];
     });
-    refused("effect/chroma key", &tl, &assets, &opts, upto(1.0, 30.0), "chroma key");
+    refused(
+        "effect/chroma key on a pip",
+        &tl,
+        &assets,
+        &opts,
+        upto(1.0, 30.0),
+        "chroma key after a scale or a blur",
+    );
     let (tl, assets) = over_bars(m, &|c| c.effects = vec![E::Blur { sigma: 2000.0 }]);
     refused(
         "effect/blur sigma 2000",

@@ -721,7 +721,7 @@ fn effect_refusal(effect: &VideoEffect, caps: &GpuCaps) -> Option<&'static str> 
             VideoEffect::Grayscale => "grayscale",
             VideoEffect::Invert => "invert",
             VideoEffect::Vignette => "a vignette, whose dither is a counter that runs on from one frame to the next",
-            VideoEffect::ChromaKey { .. } => "a chroma key, whose alpha is a float colour distance",
+            VideoEffect::ChromaKey { .. } => "a chroma key",
         });
     }
     match effect {
@@ -755,6 +755,13 @@ fn effect_on_picture_refusal(effect: &VideoEffect, stream: &PlanStream, policy: 
         }
         VideoEffect::Invert if stream.layout() == Some(PixLayout::Gray) => {
             Some("an invert on a gray picture (FFmpeg negates its luma only)")
+        }
+        // `chromakey` reads the chroma of the `yuva420p` FFmpeg converts the picture to; the compositor's is the
+        // decode's 4:2:0, the same picture only when that is what it was.
+        VideoEffect::ChromaKey { .. }
+            if stream.pix_fmt.as_deref() != Some("yuv420p") || stream.maybe_full_range_in(policy) =>
+        {
+            Some("a chroma key on a picture that is not 8-bit 4:2:0 yuv420p (FFmpeg keys the chroma it converts it to)")
         }
         _ => None,
     }
@@ -802,6 +809,7 @@ impl RenderPlan {
                 if let Some(what) = layer.effects.iter().find_map(|e| match e {
                     VideoEffect::Blur { .. } => Some("a blur"),
                     VideoEffect::Sharpen { .. } => Some("a sharpen"),
+                    VideoEffect::ChromaKey { .. } => Some("a chroma key"),
                     _ => None,
                 }) {
                     reasons.push(Unsupported::Matte(self.layer_ref(n, layer), what));
@@ -834,6 +842,22 @@ impl RenderPlan {
                     }
                     _ => {}
                 }
+            }
+            // A chroma key's alpha is a distance in the chroma over `blend`: a level of difference in a chroma
+            // sample moves it by up to 1/blend levels (a blend of 0 flips it from 0 to 255), so it is drawn only on
+            // chroma that is FFmpeg's to the level. It runs after every effect: no scale ahead of the effects and
+            // no blur among them (a sharpen leaves the chroma alone, the tables are exact).
+            let chroma_keyed = layer.effects.iter().any(|e| matches!(e, VideoEffect::ChromaKey { .. }));
+            let scaled = geom.stages[..before_effects].iter().any(|s| s.scaled != (s.src.w, s.src.h));
+            let blurred = layer
+                .effects
+                .iter()
+                .any(|e| matches!(e, VideoEffect::Blur { sigma } if *sigma > 0.0));
+            if chroma_keyed && caps.effects.contains(EffectKinds::CHROMA_KEY) && (scaled || blurred) {
+                reasons.push(Unsupported::Effects(
+                    self.layer_ref(n, layer),
+                    "a chroma key after a scale or a blur: its alpha is a distance in the chroma, which their one-level difference from FFmpeg's moves by up to 1/blend levels",
+                ));
             }
             if err > MAX_SHARPEN_ERROR {
                 reasons.push(Unsupported::Effects(
@@ -1039,12 +1063,23 @@ impl RenderPlan {
             {
                 out.push(Unsupported::Effects(at(), what));
             }
+            let chroma_keyed = layer.effects.iter().any(|e| matches!(e, VideoEffect::ChromaKey { .. }));
             if layer.mask.is_some() {
                 if !caps.mask {
                     out.push(Unsupported::Mask(at()));
-                } else if let Some(what) = self.mask_refusal(layer) {
+                } else if let Some(what) = self
+                    .mask_refusal(layer)
+                    .or_else(|| chroma_keyed.then_some("over a chroma key (geq multiplies the key's alpha)"))
+                {
                     out.push(Unsupported::MaskWith(at(), what));
                 }
+            }
+            // The key's alpha goes through what a mask's would: the compositor turns or fades neither.
+            if chroma_keyed && caps.effects.contains(EffectKinds::CHROMA_KEY) && self.mask_refusal(layer).is_some() {
+                out.push(Unsupported::Effects(
+                    at(),
+                    "a chroma key on a rotated layer or one below full opacity",
+                ));
             }
             if (layer.reframe.is_some() || layer.projection.is_some()) && !caps.reframe {
                 out.push(Unsupported::Reframe(at()));
@@ -2537,6 +2572,95 @@ mod tests {
             "{why:?}"
         );
         assert!(letterboxed(&|c| c.effects = vec![VideoEffect::Invert, VideoEffect::Grayscale]).is_empty());
+    }
+
+    #[test]
+    fn a_chroma_key_is_drawn_only_on_the_chroma_ffmpeg_keys() {
+        let caps = GpuCaps {
+            effects: EffectKinds::ALL,
+            mask: true,
+            ..GpuCaps::A0
+        };
+        let key = || VideoEffect::ChromaKey {
+            color: "green".into(),
+            similarity: 0.15,
+            blend: 0.1,
+        };
+        let why_of = |stream: StreamInfo, delivery: Option<Delivery>, edit: &dyn Fn(&mut Clip)| {
+            let plan = fading_plan_of(stream, delivery, CompositeColorPolicy::FixedBt601, |c| edit(c), 0.5);
+            plan.reasons(&caps, plan.size(u32::MAX))
+        };
+        let why = |edit: &dyn Fn(&mut Clip)| why_of(video(640, 360), None, edit);
+        let effects = |why: &[Unsupported], what: &str| {
+            why.iter()
+                .any(|u| matches!(u, Unsupported::Effects(_, w) if w.contains(what)))
+        };
+        // At the picture's size, after the exact effects (tables, a sharpen of the luma), a grade.
+        assert_eq!(why(&|c| c.effects = vec![key()]), vec![]);
+        assert_eq!(
+            why(&|c| {
+                c.color.saturation = 1.3;
+                c.effects = vec![
+                    VideoEffect::Invert,
+                    VideoEffect::Sharpen { amount: 2.0 },
+                    key(),
+                    VideoEffect::Grayscale,
+                ];
+            }),
+            vec![]
+        );
+        // Not after a scale or a blur, wherever the blur is in the list (the key runs after every effect).
+        assert!(effects(
+            &why(&|c| {
+                c.transform.scale = 0.6;
+                c.effects = vec![key()];
+            }),
+            "chroma key after a scale or a blur"
+        ));
+        assert!(effects(
+            &why(&|c| c.effects = vec![key(), VideoEffect::Blur { sigma: 2.0 }]),
+            "chroma key after a scale or a blur"
+        ));
+        // Not on a letterbox, another pixel format, a rotated or translucent layer, or under a mask.
+        let boxed = why_of(video(640, 360), Some(Delivery::new(360, 640, Fit::Contain)), &|c| {
+            c.effects = vec![key()];
+        });
+        assert!(
+            boxed
+                .iter()
+                .any(|u| matches!(u, Unsupported::Matte(_, w) if w.contains("chroma key"))),
+            "{boxed:?}"
+        );
+        for pix_fmt in ["yuvj420p", "yuv422p", "yuv420p10le", "rgb24"] {
+            let mut stream = video(640, 360);
+            stream.pix_fmt = Some(pix_fmt.into());
+            assert!(
+                effects(&why_of(stream, None, &|c| c.effects = vec![key()]), "yuv420p"),
+                "{pix_fmt}"
+            );
+        }
+        assert!(effects(
+            &why(&|c| {
+                c.transform.rotation = 10.0;
+                c.effects = vec![key()];
+            }),
+            "chroma key on a rotated layer"
+        ));
+        assert!(effects(
+            &why(&|c| {
+                c.transform.opacity = 0.5;
+                c.effects = vec![key()];
+            }),
+            "below full opacity"
+        ));
+        let masked = why(&|c| {
+            c.mask = Some(crate::model::Mask::default());
+            c.effects = vec![key()];
+        });
+        assert!(
+            matches!(masked.as_slice(), [Unsupported::MaskWith(_, w)] if w.contains("chroma key")),
+            "{masked:?}"
+        );
     }
 
     #[test]

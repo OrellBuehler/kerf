@@ -239,6 +239,16 @@ struct BlurParams {
     pad: [f32; 3],
 }
 
+/// `chromakey.wgsl`'s uniform.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct KeyParams {
+    size: [u32; 2],
+    key: [u32; 2],
+    slices: u32,
+    pad: [u32; 3],
+}
+
 /// One plane on the GPU. A handle: cloning shares the texture.
 #[derive(Clone)]
 struct Plane {
@@ -292,6 +302,11 @@ pub struct Compositor {
     masks: MaskCache,
     /// What FFmpeg's `geq` does at a plane's last column and row, when the host knows it: else probed.
     geq_edge: Option<GeqEdge>,
+    /// `chromakey`'s distance terms ([`effects::chroma_key_terms`]), uploaded by the first keyed frame.
+    key_terms: OnceLock<wgpu::Buffer>,
+    /// The threads FFmpeg's filter graph slices a frame into: `chromakey` starts its window over at
+    /// each slice, so its alpha at the first sample of a slice depends on them.
+    graph_threads: u32,
 }
 
 /// The passes over a layer's planes between the scaler and the blend (`planeops.wgsl`, `blur.wgsl`):
@@ -307,6 +322,8 @@ struct PlaneOps {
     blur_v: wgpu::ComputePipeline,
     blur_out_layout: wgpu::BindGroupLayout,
     blur_out: wgpu::RenderPipeline,
+    key_layout: wgpu::BindGroupLayout,
+    key: wgpu::RenderPipeline,
 }
 
 /// A mask's alpha plane for one picture size (`kerf_core::mask_alpha_plane`), made once because a
@@ -414,6 +431,9 @@ struct LayerLook {
     /// A moving zoom comes last in FFmpeg's chain: everything above runs on the fit-size picture,
     /// and the second scale stage zooms the result.
     zoom_last: bool,
+    /// `chromakey` after the effects: the last one's, as each writes the whole alpha plane from the
+    /// chroma, which none of them changes.
+    key: Option<effects::ChromaKeyOptions>,
 }
 
 enum Step {
@@ -656,7 +676,7 @@ impl Compositor {
     /// * `motion`, `fades`, `transitions`, `dip_white`: fades, dips, dissolves, slides and pushes, in
     ///   still plans and in export frames (`tests/motion_parity.rs`);
     /// * `keyed_zoom`: a moving zoom drawn last, as FFmpeg's chain has it;
-    /// * `mask`, and the blur, sharpen, grayscale and invert `effects`.
+    /// * `mask`, and the blur, sharpen, grayscale, invert and chroma key `effects`.
     ///
     /// A vignette, a chroma key and the combinations the plan names (`Unsupported`) stay FFmpeg's.
     /// Each later pass flips its bit beside the pass and its parity cases.
@@ -677,7 +697,8 @@ impl Compositor {
         caps.effects = EffectKinds::BLUR
             .union(EffectKinds::SHARPEN)
             .union(EffectKinds::GRAYSCALE)
-            .union(EffectKinds::INVERT);
+            .union(EffectKinds::INVERT)
+            .union(EffectKinds::CHROMA_KEY);
         caps
     };
 
@@ -687,6 +708,15 @@ impl Compositor {
     #[must_use]
     pub fn with_geq_edge(mut self, edge: GeqEdge) -> Self {
         self.geq_edge = Some(edge);
+        self
+    }
+
+    /// Draw `chromakey` as an FFmpeg filter graph of `threads` slice threads draws it (the default is
+    /// what an export on this machine runs: [`kerf_core::cpu_graph_threads`]): the first sample of each
+    /// slice but the first has no window carried over from the row before it.
+    #[must_use]
+    pub fn with_graph_threads(mut self, threads: u32) -> Self {
+        self.graph_threads = threads.max(1);
         self
     }
 
@@ -938,6 +968,8 @@ impl Compositor {
                 ops,
                 masks: MaskCache::default(),
                 geq_edge: None,
+                key_terms: OnceLock::new(),
+                graph_threads: u32::try_from(kerf_core::cpu_graph_threads()).unwrap_or(1),
             })
         })
     }
@@ -1051,6 +1083,21 @@ impl Compositor {
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/blur_out.wgsl").into()),
         });
         let blur_out = render("blur out", &out_module, &blur_out_layout, "fs_out");
+        let key_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("chroma key"),
+            entries: &[
+                entry(0, uniform, wgpu::ShaderStages::FRAGMENT),
+                entry(1, texture, wgpu::ShaderStages::FRAGMENT),
+                entry(2, texture, wgpu::ShaderStages::FRAGMENT),
+                entry(3, storage(true), wgpu::ShaderStages::FRAGMENT),
+                entry(4, storage(true), wgpu::ShaderStages::FRAGMENT),
+            ],
+        });
+        let key_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("kerf chroma key"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/chromakey.wgsl").into()),
+        });
+        let key = render("chroma key", &key_module, &key_layout, "fs_key");
         PlaneOps {
             layout,
             lut,
@@ -1062,6 +1109,8 @@ impl Compositor {
             blur_v,
             blur_out_layout,
             blur_out,
+            key_layout,
+            key,
         }
     }
 
@@ -1467,6 +1516,86 @@ impl Compositor {
         [out, input[1].clone(), input[2].clone()]
     }
 
+    /// The alpha plane the compositor keys `frame` to (`chromakey.wgsl`, at the picture's own size, with this
+    /// compositor's graph threads): what a keyed layer is blended with, read back so the pass can be compared
+    /// with the filter directly.
+    pub fn chroma_key_alpha(&self, frame: &YuvFrame, key: &effects::ChromaKeyOptions) -> Result<Vec<u8>, GpuError> {
+        let (w, h) = (frame.width, frame.height);
+        if !frame.is_consistent() || w < 2 || h < 2 {
+            return Err(GpuError::Unsupported(format!("a chroma key of a {w}x{h} frame")));
+        }
+        let (cw, ch) = chroma_size(w, h);
+        let planes = [
+            self.upload("key y", w, h, &frame.y),
+            self.upload("key u", cw, ch, &frame.u),
+            self.upload("key v", cw, ch, &frame.v),
+        ];
+        let mut enc = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("chroma key"),
+        });
+        let alpha = self.chroma_key_plane(&mut enc, &planes, key);
+        Ok(read_texels(&self.gpu, enc, &alpha.texture, w, h, 1)?.data)
+    }
+
+    /// `chromakey`'s alpha plane, at the picture's size, from its chroma (`chromakey.wgsl`).
+    fn chroma_key_plane(&self, enc: &mut wgpu::CommandEncoder, planes: &[Plane; 3], key: &effects::ChromaKeyOptions) -> Plane {
+        let device = &self.gpu.device;
+        let (w, h) = (planes[0].w, planes[0].h);
+        let words = |bits: &[u64]| -> Vec<u32> { bits.iter().flat_map(|b| [(b >> 32) as u32, *b as u32]).collect() };
+        let terms = self.key_terms.get_or_init(|| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("chroma key terms"),
+                contents: bytemuck::cast_slice(&words(&effects::chroma_key_terms())),
+                usage: wgpu::BufferUsages::STORAGE,
+            })
+        });
+        let thresholds = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("chroma key thresholds"),
+            contents: bytemuck::cast_slice(&words(&effects::chroma_key_thresholds(key.similarity, key.blend))),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let params = KeyParams {
+            size: [w, h],
+            key: [u32::from(key.uv[0]), u32::from(key.uv[1])],
+            slices: self.graph_threads.min(h),
+            pad: [0; 3],
+        };
+        let ubuf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("chroma key params"),
+            contents: bytemuck::bytes_of(&params),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("chroma key"),
+            layout: &self.ops.key_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: ubuf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&planes[1].view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&planes[2].view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: terms.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: thresholds.as_entire_binding(),
+                },
+            ],
+        });
+        let out = self.out_plane("chroma key alpha", &planes[0]);
+        self.pass(enc, &self.ops.key, &out.view, &bind, None, None);
+        out
+    }
+
     /// `gblur` on all three planes, each at its own size with the same sigma.
     fn blur_planes(&self, enc: &mut wgpu::CommandEncoder, input: &[Plane; 3], g: &Gaussian) -> [Plane; 3] {
         let device = &self.gpu.device;
@@ -1593,6 +1722,7 @@ impl Compositor {
         let mut steps: Vec<Step> = Vec::new();
         let mut pending: Option<[[u8; 256]; 3]> = None;
         let mut split = false;
+        let mut key = None;
         for effect in &layer.effects {
             match effect {
                 VideoEffect::Grayscale | VideoEffect::Invert => {
@@ -1637,6 +1767,22 @@ impl Compositor {
                     split = true;
                     steps.push(Step::Sharpen(a));
                 }
+                VideoEffect::ChromaKey {
+                    color,
+                    similarity,
+                    blend,
+                } => {
+                    if pw < 2 || ph < 2 {
+                        return Err(unsupported(format!("a chroma key on a {pw}x{ph} picture")));
+                    }
+                    let rgb =
+                        kerf_core::color_rgb(color).ok_or_else(|| unsupported(format!("a chroma key colour of {color:?}")))?;
+                    key = Some(effects::ChromaKeyOptions {
+                        uv: effects::chroma_key_uv(rgb),
+                        similarity: *similarity as f32,
+                        blend: *blend as f32,
+                    });
+                }
                 other => return Err(unsupported(format!("the {} effect is not drawn", other.name()))),
             }
         }
@@ -1646,6 +1792,7 @@ impl Compositor {
         // `geq` runs on the frame `pad` made of a letterboxed picture, bars included: the mask is the
         // size of the whole layer there, the canvas.
         let mask = match &layer.mask {
+            Some(_) if key.is_some() => return Err(unsupported("a mask over a chroma key".into())),
             Some(mask) => {
                 if geom.rotation.is_some() {
                     return Err(unsupported("a mask on a rotated layer".into()));
@@ -1685,6 +1832,7 @@ impl Compositor {
             mask,
             mask_edge,
             zoom_last,
+            key,
         })
     }
 
@@ -2009,10 +2157,13 @@ impl Compositor {
             }
             // The mask is the alpha plane (`geq` rewrites it); nothing else gives the layer one but the
             // dissolve's ramp, which acts on whatever plane there is.
-            let mut alpha: Option<Plane> = look
-                .mask
-                .as_ref()
-                .map(|m| m.gpu.get_or_init(|| self.upload("mask", m.w, m.h, &m.data)).clone());
+            let mut alpha: Option<Plane> = match &look.key {
+                Some(key) => Some(self.chroma_key_plane(&mut enc, &current, key)),
+                None => look
+                    .mask
+                    .as_ref()
+                    .map(|m| m.gpu.get_or_init(|| self.upload("mask", m.w, m.h, &m.data)).clone()),
+            };
             // Below full opacity FFmpeg takes the layer through RGB and back before
             // `overlay` sees it (see `roundtrip.rs`); that happens to the scaled
             // picture, ahead of the rotation. An opaque layer never leaves YUV.
@@ -2594,16 +2745,22 @@ fn refuse_prefetch(hint: Hint) -> Result<(), GpuError> {
 }
 
 /// Copy an `Rgba8Unorm` texture of `w` x `h` back to the CPU, after the work in `enc`.
-fn read_texture(
+fn read_texture(gpu: &Gpu, enc: wgpu::CommandEncoder, texture: &wgpu::Texture, w: u32, h: u32) -> Result<RgbaFrame, GpuError> {
+    read_texels(gpu, enc, texture, w, h, 4)
+}
+
+/// [`read_texture`] for a texture of `bpp` bytes a texel.
+fn read_texels(
     gpu: &Gpu,
     mut enc: wgpu::CommandEncoder,
     texture: &wgpu::Texture,
     w: u32,
     h: u32,
+    bpp: u32,
 ) -> Result<RgbaFrame, GpuError> {
     let device = &gpu.device;
     // Rows in a texture-to-buffer copy are padded to 256 bytes.
-    let pitch = (w * 4).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
+    let pitch = (w * bpp).next_multiple_of(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
     let buffer = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("readback"),
         size: u64::from(pitch) * u64::from(h),
@@ -2651,9 +2808,9 @@ fn read_texture(
         .slice(..)
         .get_mapped_range()
         .map_err(|e| GpuError::Readback(e.to_string()))?;
-    let mut data = Vec::with_capacity((w * h * 4) as usize);
+    let mut data = Vec::with_capacity((w * h * bpp) as usize);
     for row in mapped.chunks(pitch as usize).take(h as usize) {
-        data.extend_from_slice(&row[..(w * 4) as usize]);
+        data.extend_from_slice(&row[..(w * bpp) as usize]);
     }
     drop(mapped);
     buffer.unmap();
