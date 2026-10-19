@@ -74,15 +74,22 @@
 		preview = v;
 		onLive?.(v, pending.scope as S, owner);
 	}
-	// A row that goes away mid-gesture (its clip undone, the panel switched) ends its draft with it.
-	$effect(() => () => onLive?.(null, (pending.scope ?? scope) as S, owner));
+	/** Writes let go of and not landed yet: each ends its draft itself once its edit has landed. */
+	let writing = 0;
+	// A row that goes away mid-gesture (its clip undone, the panel switched) ends its draft with it, unless a
+	// write is in flight: that one ends it when it lands, so the picture does not step back in between.
+	$effect(() => () => {
+		if (writing === 0) onLive?.(null, (pending.scope ?? scope) as S, owner);
+	});
 	/** The slider keeps showing where it was let go until the write has landed, so it does not
 	 *  jump back to the old value for the length of a round trip. */
 	async function write(v: number, at: S) {
 		preview = v;
+		writing += 1;
 		try {
 			await onCommit(v, at);
 		} finally {
+			writing -= 1;
 			preview = null;
 			onLive?.(null, at, owner);
 		}

@@ -587,13 +587,35 @@ fn a_drag_frame_is_the_picture_the_edit_draws_once_it_is_written() {
     assert_eq!(written.renderer, "gpu", "{:?}", written.reasons);
     assert!(picture(&log) == move_picture, "the moved clip's frame, once written");
 
-    // A drag into something the GPU does not draw: the frame is FFmpeg's, of the cut as it is.
+    // A drag the edits would write but the GPU does not draw (a mask on a rotated layer, which the plan
+    // refuses): the frame is FFmpeg's, of the cut as it is, with the plan's reason and the note.
     let timeline = lock(&shared).working_timeline().expect("a timeline");
+    let mut masked = timeline.tracks[0].clips[0].clone();
+    masked.transform.rotation = 10.0;
+    masked.mask = Some(kerf_core::Mask::default());
+    let unsupported = ask(&preview, &take, 0.5, Some(one_clip(track, masked)));
+    assert_eq!(unsupported.renderer, "ffmpeg");
+    assert!(unsupported.frame.is_some());
+    assert!(
+        unsupported.reasons.iter().any(|r| r.contains("a mask on a rotated layer")),
+        "the plan's own refusal, not the draft's: {:?}",
+        unsupported.reasons
+    );
+    assert_eq!(
+        unsupported.reasons.last().map(String::as_str),
+        Some(DRAFT_NOTE),
+        "{:?}",
+        unsupported.reasons
+    );
+
+    // A drag into what no drafted edit writes (an effect added): the draft is refused, and the frame is
+    // the cut as it is.
     let mut vignetted = timeline.tracks[0].clips[0].clone();
     vignetted.effects.push(kerf_core::VideoEffect::Vignette);
     let refused = ask(&preview, &take, 0.5, Some(one_clip(track, vignetted)));
     assert_eq!(refused.renderer, "ffmpeg");
     assert!(refused.frame.is_some());
+    assert!(refused.reasons[0].contains("a drag changes only"), "{:?}", refused.reasons);
     assert_eq!(
         refused.reasons.last().map(String::as_str),
         Some(DRAFT_NOTE),

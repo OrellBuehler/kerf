@@ -380,6 +380,13 @@
   **Overlaps are not checked**: Kerf allows them (an explicit `add_clip`, a trim into the next clip, old
   files), and the ripple already treats an overlap the edit did not make as old news. Nothing is indexed
   by position in the stored timeline (everything is by id), so there is no index range to check.
+- **Edit values** (`model/values.rs`, pure + a table test pinning ranges and messages): the ranges a
+  setter holds what it is handed to, before it changes anything — `Transform::check_values` /
+  `check_crop` (`set_transform`), `Color::check_values` (`set_color`), `Clip::check_fades` (`set_fade`),
+  `Clip::check_trim` + `Asset::check_source_out` (`trim`; the latter `add_clip_to_timeline` too), `TextOverlay::check_values` /
+  `check_span` (`update_overlay`), `TextKeyframe::check` (`set_overlay_keyframes`). They are shared with
+  the GPU preview's drag frames (`PreviewDraft::apply`, `app.md`), so a preview never shows a value the
+  edit would refuse: change a range here, not in a setter.
 - **Fit music to length** (`model/music_fit.rs`, pure + unit-tested): `plan_music_fit(music,
   target, rate)` keeps the intro (before the first downbeat) and the ending (after the last
   whole bar) and walks the bars between, **jumping only between repeating phrases**
