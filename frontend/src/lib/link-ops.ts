@@ -162,11 +162,11 @@ export function ensureTrackEditable(tl: Timeline, trackId: string) {
 }
 
 /** `default_track`: where a clip of `kind` goes when the edit names no track — the first unlocked one. */
-function defaultTrack(tl: Timeline, kind: Track['kind']): Track {
+export function defaultTrack(tl: Timeline, kind: Track['kind']): Track {
 	const track = tl.tracks.find((x) => x.kind === kind && !x.locked);
 	if (track) return track;
 	if (tl.tracks.some((x) => x.kind === kind))
-		throw invalid(`every ${kind === 'audio' ? 'audio' : 'video'} track is locked — unlock one, or name a track`);
+		throw invalid(`every ${kind === 'audio' ? 'audio' : 'video'} track is locked — unlock one, or add a track`);
 	throw new Error('no suitable track for asset');
 }
 

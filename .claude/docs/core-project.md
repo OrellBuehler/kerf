@@ -20,16 +20,24 @@
   are single revisions (`Move N clips` / `Remove N clips`), and refuse clips on a locked track.
   **A lock is the core's to enforce, not only the GUI's**: every single-clip op that changes what is
   on a track, where, how long or whether it plays — split, trim, cut range, move (source and
-  destination), reorder, ripple delete, remove, speed, enable / disable, add, paste / duplicate —
-  refuses a locked track (`Timeline::ensure_editable` / `ensure_track_editable`, inside the edit, so
+  destination), reorder, ripple delete, remove, speed, enable / disable, add, paste / duplicate, and the
+  placing ops (a title or a voiceover on a named track or the locked `VO` lane, the beat snap on a named
+  track) — refuses a locked track (`Timeline::ensure_editable` / `ensure_track_editable`, inside the edit, so
   on the timeline the edit lands on: `track V1 is locked`, nothing written), as the group ops, roll /
   slip / slide, detach / reattach and link / unlink already did. A clip's look and sound (volume, fades,
-  effects, grade, transform, keyframes) stay editable, as the Inspector leaves them. A clip added with
-  no track named goes to the first **unlocked** track of its kind (`default_track`; all of them locked
-  refuses, `add_asset_audio` makes a new audio track as a detach does). **A lock set while an agent's
-  proposal is open holds for it**: `run_edit`'s staged path lays the live cut's locks over the proposal
-  for the edit and takes them off again, so the proposal does not record the user's lock as its own.
-  `link-ops.ts` mirrors all of it for the harness (`link-ops.test.ts`).
+  effects, grade, transform, keyframes) stay editable; the GUI turns off only what the core refuses
+  (`track-locks.ts`: the Inspector's Rate, Reverse, Remove and Ripple delete, the clip menu's Duplicate; a
+  paste aimed at a locked track lands on the first unlocked one of its kind). A clip added with no track
+  named goes to the first **unlocked** track of its kind (`default_track`; all of them locked refuses with
+  `… unlock one, or add a track`, and `add_asset_audio` makes a new audio track as a detach does). **The lock
+  is the user's**: an agent may lock a track but not unlock one (`set_track_locked(false)` refused, review on or
+  off, so a lock is never only advisory) nor remove a locked one; the user may remove their own. **A lock set
+  while an agent's proposal is open holds for it**: `working_timeline()` lays the live cut's locks over the
+  proposal for every agent read (so `get_timeline_state` shows the lock it is refused by), and `run_edit`'s
+  staged path does the same for the edit and takes them off again, so the stored proposal never records the
+  user's lock as its own. A forced accept (`apply_staged(force)`) of a stale proposal lands the proposal's
+  timeline, so a lock the user set after it branched is dropped with the rest of their newer work.
+  `link-ops.ts` mirrors all of it for the harness (`link-ops.test.ts`, `api-locks.test.ts`).
   `roll_edit` / `slip_clip` / `slide_clip` (`Roll edit` / `Slip clip` / `Slide
   clip`, one revision each, `source_limits()` read before the edit) are
   `edit_timeline_exact` — they move no length, only where footage changes hands;

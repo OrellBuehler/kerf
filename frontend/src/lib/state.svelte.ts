@@ -1,5 +1,6 @@
 // Central editor state (Svelte 5 runes).
 
+import { duplicateBlocked, pastePlacements } from './track-locks';
 import type { AudioDetached, Placement } from './api';
 import {
 	addClip,
@@ -1096,10 +1097,13 @@ class EditorState {
 		return this.clipboard.length;
 	}
 
-	/** Paste the clipboard so its earliest clip lands at `at`. */
+	/** Paste the clipboard so its earliest clip lands at `at` — each clip on the track it came from, or the first
+	 *  unlocked one of its kind when that track is locked (`pastePlacements`). */
 	async paste(at: number): Promise<number> {
 		if (this.clipboard.length === 0) return 0;
-		await this.#apply(() => insertClips([...this.clipboard], at));
+		const aimed = pastePlacements(this.timeline, this.clipboard);
+		if ('reason' in aimed) throw new Error(aimed.reason);
+		await this.#apply(() => insertClips(aimed.placements, at));
 		return this.clipboard.length;
 	}
 
@@ -1107,6 +1111,8 @@ class EditorState {
 	async duplicateSelection(): Promise<number> {
 		const sel = this.selectedClips;
 		if (sel.length === 0) return 0;
+		const blocked = duplicateBlocked(this.timeline, sel.map((c) => c.id));
+		if (blocked) throw new Error(blocked);
 		const end = Math.max(...sel.map((c) => c.timeline_start + clipDuration(c)));
 		await this.#apply(() => duplicateClips(sel.map((c) => c.id), end));
 		return sel.length;

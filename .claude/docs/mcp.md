@@ -111,9 +111,13 @@ detached (`source_audio: false`) carries none — its linked audio clip is the o
 pins it against the generated schemas, the way `ripple` is pinned); `timeline_summary` gives each
 track `linked_clips` / `detached_sound_clips`, and the server `instructions` carry one paragraph.
 **Locked tracks hold over MCP**: the core refuses every layout edit on a locked track, the agent's
-staged ones included, even for a lock the user set while the proposal was open (`core-project.md`);
-the `instructions` say what a lock refuses and leaves, in the refusal's own words
-(`the_server_instructions_say_what_a_locked_track_refuses`).
+staged ones included, even for a lock the user set while the proposal was open — and the agent *sees*
+that lock (`get_timeline_state` reads `working_timeline()`, which lays the live locks over the proposal).
+An agent may lock but not unlock a track, nor remove a locked one (`core-project.md`). The `instructions`
+and `set_track_locked`'s description say what a lock refuses and leaves, in the refusal's own words
+(`the_server_instructions_say_what_a_locked_track_refuses`, `an_agent_session_is_refused_a_locked_track_and_cannot_unlock_it`);
+`cut_clip`, `remove_silence`, `add_asset_audio` and `concatenate` say they use the first **unlocked** track,
+and the `ripple` descriptions that a ripple never moves a locked track and placing on one is refused.
 **Grading over MCP**: `set_grade` (`clip_id`, `curves?` `{master, red, green, blue: [{x, y}]}`, `wheels?`
 `{shadows, midtones, highlights: {x, y, lightness}}`, `lut_path?` (`""` removes), `lut_intensity?`): omitted parts are
 kept, the same `lut_path` without an intensity keeps the current one; a new LUT file is read and checked before the

@@ -90,6 +90,7 @@ fn place(timeline: &mut Timeline, track_id: Option<Uuid>, clip: Clip) -> Result<
     let free = |t: &Track| !t.locked && t.clips.iter().all(|c| c.timeline_end() <= start || c.timeline_start >= end);
     let tid = match track_id {
         Some(id) => {
+            timeline.ensure_track_editable(id)?;
             let track = timeline.track(id).ok_or(Error::TrackNotFound(id))?;
             if track.kind != StreamKind::Video {
                 return Err(Error::InvalidArgument(format!(
@@ -334,6 +335,28 @@ mod tests {
 
     fn video(p: &Project) -> Uuid {
         p.timeline().unwrap().first_track_of(StreamKind::Video).unwrap()
+    }
+
+    #[test]
+    fn a_title_is_not_put_on_a_named_locked_track_and_the_default_passes_it_by() {
+        let p = Project::open_in_memory().unwrap();
+        let v1 = video(&p);
+        p.set_track_locked(v1, true).unwrap();
+        let named = p.add_title_clip(
+            ART,
+            1.0,
+            None,
+            TitleClipPlacement {
+                track_id: Some(v1),
+                ..Default::default()
+            },
+        );
+        assert!(
+            matches!(&named, Err(Error::InvalidArgument(why)) if why == "track V1 is locked"),
+            "{named:?}"
+        );
+        let placed = p.add_title_clip(ART, 1.0, None, TitleClipPlacement::default()).unwrap();
+        assert_ne!(placed.track_id, v1);
     }
 
     #[test]

@@ -203,6 +203,9 @@
 	const track = $derived(
 		clip ? editor.timeline.tracks.find((t) => t.clips.some((c) => c.id === clip.id)) : undefined
 	);
+	/** Why the clip's speed, direction and place on the cut are off: its track is locked (the backend refuses
+	 *  those; its look and sound stay editable). */
+	const lockedWhy = $derived(track?.locked ? `Track ${track.name} is locked` : undefined);
 	/** Something is drawn from this clip: its footage has a picture *and* it sits on a picture track.
 	 *  The sound half of a linked pair has the picture's asset but plays no picture of its own. */
 	const picture = $derived(kind === 'video' && track?.kind !== 'audio');
@@ -617,9 +620,17 @@
 				{ type: 'separator' }
 			);
 		}
+		const why = lockedWhy;
 		items.push(
-			{ label: 'Remove clip', icon: 'trash', danger: true, action: () => runUndoable('Clip removed', () => editor.remove(c.id)) },
-			{ label: 'Ripple delete', icon: 'trash', danger: true, action: () => runUndoable('Clip ripple-deleted', () => editor.rippleDelete(c.id)) }
+			{ label: 'Remove clip', icon: 'trash', danger: true, disabled: !!why, reason: why, action: () => runUndoable('Clip removed', () => editor.remove(c.id)) },
+			{
+				label: 'Ripple delete',
+				icon: 'trash',
+				danger: true,
+				disabled: !!why,
+				reason: why,
+				action: () => runUndoable('Clip ripple-deleted', () => editor.rippleDelete(c.id))
+			}
 		);
 		contextMenu.show(e, items);
 	}
@@ -767,9 +778,10 @@
 	spec: RowSpec,
 	onCommit: (v: number, at: Edit) => unknown,
 	animate?: Property,
-	live?: Live
+	live?: Live,
+	blocked?: boolean
 )}
-	<SliderRow {label} {value} {spec} {scope} disabled={editor.locked} {onCommit} onLive={live ? toPreview(live) : undefined}>
+	<SliderRow {label} {value} {spec} {scope} disabled={editor.locked || !!blocked} {onCommit} onLive={live ? toPreview(live) : undefined}>
 		{#snippet keyframe()}
 			{#if animate}{@render keyToggle(animate)}{/if}
 		{/snippet}
@@ -1454,10 +1466,13 @@
 			{@render rangeRow('Rate', Math.abs(speed), { min: 0.25, max: 4, step: 0.25, neutral: 1, ...TIMES }, (v, at) => {
 				const c = clipOf(at);
 				if (c) return run(() => editor.setSpeed(c.id, (c.speed ?? 1) < 0 ? -v : v));
-			})}
-			<CheckRow checked={speed < 0} pending={editor.locked} onchange={() => run(() => editor.setSpeed(clip.id, -speed))}>
+			}, undefined, undefined, !!lockedWhy)}
+			<CheckRow checked={speed < 0} pending={editor.locked} disabled={!!lockedWhy} onchange={() => run(() => editor.setSpeed(clip.id, -speed))}>
 				Reverse
 			</CheckRow>
+			{#if lockedWhy}
+				<div data-locked-note style="font-size:12px;line-height:1.4;color:var(--text-muted);margin-top:6px">{lockedWhy} — unlock it to change the speed.</div>
+			{/if}
 			</InspectorSection>
 			{/if}
 
@@ -1827,12 +1842,15 @@
 					icon="trash"
 					iconSize={13}
 					pending={editor.locked}
+					disabled={!!lockedWhy}
+					title={lockedWhy}
 					onclick={() => runUndoable('Clip removed', () => editor.remove(clip.id))}>Remove clip</Btn
 				>
 				<Btn
 					size="sm"
 					pending={editor.locked}
-					title={'Remove the clip and close the gap it leaves'}
+					disabled={!!lockedWhy}
+					title={lockedWhy ?? 'Remove the clip and close the gap it leaves'}
 					onclick={() => runUndoable('Clip ripple-deleted', () => editor.rippleDelete(clip.id))}
 					>Ripple delete</Btn
 				>

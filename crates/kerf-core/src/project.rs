@@ -286,10 +286,6 @@ fn owned_by_other(owner: Option<&str>, caller: Option<&str>) -> bool {
     matches!(owner, Some(o) if caller != Some(o))
 }
 
-/// The timeline as the JSON that is stored, refusing one that holds a number JSON cannot say.
-/// `serde_json` writes `NaN` and `inf` as `null`, which a plain number field then fails to read
-/// back — the whole project would stop opening — so this is checked on every write, whatever
-/// the setter that produced the number did or did not validate.
 /// Where a clip of `kind` goes when the edit names no track: the first unlocked track of that kind.
 /// Every one of them locked refuses (a locked track is never written to); none at all is the old
 /// "no suitable track".
@@ -297,13 +293,17 @@ fn default_track(timeline: &Timeline, kind: StreamKind) -> Result<Uuid> {
     timeline.first_unlocked_track_of(kind).ok_or_else(|| {
         if timeline.first_track_of(kind).is_some() {
             let word = if kind == StreamKind::Audio { "audio" } else { "video" };
-            Error::InvalidArgument(format!("every {word} track is locked — unlock one, or name a track"))
+            Error::InvalidArgument(format!("every {word} track is locked — unlock one, or add a track"))
         } else {
             Error::Other("no suitable track for asset".to_string())
         }
     })
 }
 
+/// The timeline as the JSON that is stored, refusing one that holds a number JSON cannot say.
+/// `serde_json` writes `NaN` and `inf` as `null`, which a plain number field then fails to read
+/// back — the whole project would stop opening — so this is checked on every write, whatever
+/// the setter that produced the number did or did not validate.
 fn timeline_to_json(timeline: &Timeline) -> Result<String> {
     if let Some(at) = crate::finite::first_non_finite(timeline) {
         return Err(Error::InvalidArgument(format!(
@@ -2428,7 +2428,7 @@ impl Project {
                 // proposal's edits honour the live cut's locks as they are now, laid over it for the
                 // edit and taken off again, so the proposal does not record the user's lock as a
                 // change of its own (one the agent made itself stays).
-                let live_locks: HashSet<Uuid> = self.timeline()?.tracks.iter().filter(|t| t.locked).map(|t| t.id).collect();
+                let live_locks = self.live_locks()?;
                 let f = move |timeline: &mut Timeline| -> Result<R> {
                     let own: HashMap<Uuid, bool> = timeline.tracks.iter().map(|t| (t.id, t.locked)).collect();
                     for track in &mut timeline.tracks {
@@ -2502,13 +2502,26 @@ impl Project {
     /// agent sees its own staged work — including the preview and export paths,
     /// which is the point: it can look at the cut it is proposing before handing
     /// it over. The GUI never stages, so it always sees the live timeline.
+    ///
+    /// The user's track locks are read off the live cut as they are now and laid over the proposal (the
+    /// stored proposal is left as it was): the user can lock a track while the agent works, and the agent
+    /// has to see the lock it will be refused by.
     pub fn working_timeline(&self) -> Result<Timeline> {
         if self.actor == EditSource::Agent {
-            if let Some(timeline) = self.staged_timeline()? {
+            if let Some(mut timeline) = self.staged_timeline()? {
+                let live = self.live_locks()?;
+                for track in &mut timeline.tracks {
+                    track.locked |= live.contains(&track.id);
+                }
                 return Ok(timeline);
             }
         }
         self.timeline()
+    }
+
+    /// The tracks locked on the live cut.
+    fn live_locks(&self) -> Result<HashSet<Uuid>> {
+        Ok(self.timeline()?.tracks.iter().filter(|t| t.locked).map(|t| t.id).collect())
     }
 
     fn staged_row(&self) -> Result<Option<StagedRow>> {
@@ -4190,9 +4203,19 @@ impl Project {
 
     /// Lock or unlock a track against editing. A locked track still renders;
     /// this only guards its clips from being moved, trimmed or split.
+    ///
+    /// A lock is the user's: an agent may lock a track but not unlock one (review on or off), so a
+    /// lock is never only advisory — the refusal tells it to ask the user.
     pub fn set_track_locked(&self, track_id: Uuid, locked: bool) -> Result<Track> {
+        let agent = self.actor == EditSource::Agent;
         self.edit_timeline(if locked { "Lock track" } else { "Unlock track" }, |timeline| {
             let track = timeline.track_mut(track_id).ok_or(Error::TrackNotFound(track_id))?;
+            if agent && !locked && track.locked {
+                return Err(Error::InvalidArgument(format!(
+                    "track {} is locked, and only the user can unlock it — ask them to",
+                    track.name
+                )));
+            }
             track.locked = locked;
             Ok(track.clone())
         })
@@ -4210,13 +4233,23 @@ impl Project {
     }
 
     /// Remove a track and all of its clips. Refuses to remove the last track.
+    ///
+    /// An agent may not remove a locked track (it is the user's); the user may — deleting their own
+    /// locked track is an explicit act.
     pub fn remove_track(&self, track_id: Uuid) -> Result<()> {
+        let agent = self.actor == EditSource::Agent;
         self.edit_timeline("Remove track", |timeline| {
             let idx = timeline
                 .tracks
                 .iter()
                 .position(|t| t.id == track_id)
                 .ok_or(Error::TrackNotFound(track_id))?;
+            if agent && timeline.tracks[idx].locked {
+                return Err(Error::InvalidArgument(format!(
+                    "track {} is locked — only the user can remove it",
+                    timeline.tracks[idx].name
+                )));
+            }
             if timeline.tracks.len() <= 1 {
                 return Err(Error::InvalidArgument("cannot remove the last track".to_string()));
             }
@@ -4911,7 +4944,7 @@ impl Project {
             };
             let targets: Vec<Uuid> = match track_id {
                 Some(id) => {
-                    timeline.track(id).ok_or(Error::TrackNotFound(id))?;
+                    timeline.ensure_track_editable(id)?;
                     vec![id]
                 }
                 None => timeline
@@ -6843,6 +6876,22 @@ impl Project {
     /// dropped on top of the dialogue or the music bed on `A1`. With no
     /// `timeline_start` it is appended after whatever that track already holds.
     pub fn place_voiceover(&self, asset: &Asset, track_id: Option<Uuid>, timeline_start: Option<f64>) -> Result<(Asset, Clip)> {
+        // Where it goes may not be locked: a named track, or the voiceover lane the user locked. Asked
+        // before the asset is stored, so a refusal leaves nothing behind, and again in the edit.
+        let lane_open = |timeline: &Timeline| -> Result<()> {
+            match track_id {
+                Some(t) => timeline.ensure_track_editable(t),
+                None => match timeline
+                    .tracks
+                    .iter()
+                    .find(|t| t.kind == StreamKind::Audio && t.name == VOICEOVER_TRACK)
+                {
+                    Some(lane) => timeline.ensure_track_editable(lane.id),
+                    None => Ok(()),
+                },
+            }
+        };
+        lane_open(&self.working_timeline()?)?;
         let asset = self.insert_or_get_asset(asset)?;
         if let Some(voiceover) = &asset.voiceover {
             // Keep whatever an earlier analysis measured; only the transcript is
@@ -6862,6 +6911,7 @@ impl Project {
         let clip_id = Uuid::new_v4();
         self.edit_lanes.borrow_mut().push(clip_id);
         let clip = self.edit_timeline("Add voiceover", |timeline| {
+            lane_open(timeline)?;
             let tid = match track_id {
                 Some(t) => {
                     let track = timeline.track(t).ok_or(Error::TrackNotFound(t))?;
@@ -12495,6 +12545,142 @@ mod tests {
         // the proposal.
         project.set_volume(b.id, 0.25).unwrap();
         assert!(!project.staged_timeline().unwrap().unwrap().track(v1).unwrap().locked);
+    }
+
+    #[test]
+    fn the_agent_sees_the_lock_it_is_refused_by_and_a_refusal_leaves_its_proposal_alone() {
+        let (mut project, _, [a, b, _]) = abutting_project();
+        let v1 = project.timeline().unwrap().tracks[0].id;
+        project.set_actor(EditSource::Agent);
+        project.set_volume(a.id, 0.5).unwrap();
+        project.set_actor(EditSource::User);
+        project.set_track_locked(v1, true).unwrap();
+
+        project.set_actor(EditSource::Agent);
+        // What get_timeline_state and every other agent read see: the lock, as the user set it.
+        assert!(project.working_timeline().unwrap().track(v1).unwrap().locked);
+        // The stored proposal is not rewritten to say so.
+        assert!(!project.staged_timeline().unwrap().unwrap().track(v1).unwrap().locked);
+
+        let before = serde_json::to_value(project.staged_timeline().unwrap().unwrap()).unwrap();
+        let depth = project.staged().unwrap().unwrap().undo_depth;
+        assert!(project.split_at(b.id, b.timeline_start + 1.0).is_err());
+        assert_eq!(
+            serde_json::to_value(project.staged_timeline().unwrap().unwrap()).unwrap(),
+            before
+        );
+        assert_eq!(project.staged().unwrap().unwrap().undo_depth, depth);
+    }
+
+    #[test]
+    fn an_agent_may_lock_a_track_but_only_the_user_unlocks_one() {
+        for review in [true, false] {
+            let (mut project, _, _) = abutting_project();
+            project.set_agent_review(review);
+            let v1 = project.timeline().unwrap().tracks[0].id;
+            project.set_actor(EditSource::User);
+            project.set_track_locked(v1, true).unwrap();
+
+            project.set_actor(EditSource::Agent);
+            let refused = project.set_track_locked(v1, false);
+            assert!(
+                matches!(&refused, Err(Error::InvalidArgument(why)) if why == "track V1 is locked, and only the user can unlock it — ask them to"),
+                "review {review}: {refused:?}"
+            );
+            assert!(project.timeline().unwrap().track(v1).unwrap().locked, "review {review}");
+
+            // Locking is the agent's to do; so is "unlocking" a track that is not locked.
+            let v2 = project.add_track(StreamKind::Video, None).unwrap().id;
+            project.set_track_locked(v2, true).unwrap();
+            project.set_actor(EditSource::User);
+            project.set_track_locked(v1, false).unwrap();
+        }
+    }
+
+    #[test]
+    fn an_agent_may_not_remove_a_locked_track_and_the_user_may() {
+        let (mut project, _, _) = abutting_project();
+        project.set_agent_review(false);
+        let v2 = project.add_track(StreamKind::Video, None).unwrap().id;
+        project.set_track_locked(v2, true).unwrap();
+        project.set_actor(EditSource::Agent);
+        let refused = project.remove_track(v2);
+        assert!(
+            matches!(&refused, Err(Error::InvalidArgument(why)) if why == "track V2 is locked — only the user can remove it"),
+            "{refused:?}"
+        );
+        project.set_actor(EditSource::User);
+        project.remove_track(v2).unwrap();
+        assert!(project.timeline().unwrap().track(v2).is_none());
+    }
+
+    #[test]
+    fn a_voiceover_does_not_land_on_a_locked_lane_and_leaves_no_asset_behind() {
+        let project = Project::open_in_memory().unwrap();
+        let a2 = project.add_track(StreamKind::Audio, None).unwrap().id;
+        project.set_track_locked(a2, true).unwrap();
+        let named = project.place_voiceover(&voiceover_asset("/vo/a.wav"), Some(a2), None);
+        assert!(
+            matches!(&named, Err(Error::InvalidArgument(why)) if why.contains("is locked")),
+            "{named:?}"
+        );
+        assert!(
+            project.list_assets().unwrap().is_empty(),
+            "a refused voiceover stores nothing"
+        );
+
+        // The voiceover lane, once the user has locked it.
+        project.place_voiceover(&voiceover_asset("/vo/b.wav"), None, None).unwrap();
+        let vo = project
+            .timeline()
+            .unwrap()
+            .tracks
+            .iter()
+            .find(|t| t.name == VOICEOVER_TRACK)
+            .unwrap()
+            .id;
+        project.set_track_locked(vo, true).unwrap();
+        let lane = project.place_voiceover(&voiceover_asset("/vo/c.wav"), None, None);
+        assert!(
+            matches!(&lane, Err(Error::InvalidArgument(why)) if why == "track VO is locked"),
+            "{lane:?}"
+        );
+        assert_eq!(project.list_assets().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn the_beat_snap_refuses_a_named_locked_track() {
+        let project = Project::open_in_memory().unwrap();
+        let video = project
+            .insert_or_get_asset(&asset_with("/beat-video.mp4", vec![vid_stream(false)]))
+            .unwrap();
+        let music = project
+            .insert_or_get_asset(&asset_with("/beat-music.wav", vec![aud_stream()]))
+            .unwrap();
+        project
+            .set_analysis(&AssetAnalysis {
+                asset_id: music.id,
+                tempo: Some(crate::model::Tempo {
+                    downbeats: Vec::new(),
+                    bpm: 120.0,
+                    beats: (0..=20).map(|i| i as f64 * 0.5).collect(),
+                    confidence: 0.8,
+                }),
+                ..Default::default()
+            })
+            .unwrap();
+        project.add_asset_audio(music.id).unwrap();
+        project.cut_clip(video.id, 0.0, 1.1).unwrap();
+        project.cut_clip(video.id, 2.0, 3.4).unwrap();
+        let v1 = project.timeline().unwrap().first_track_of(StreamKind::Video).unwrap();
+        project.set_track_locked(v1, true).unwrap();
+        let named = project.snap_to_beats(Some(v1), None);
+        assert!(
+            matches!(&named, Err(Error::InvalidArgument(why)) if why == "track V1 is locked"),
+            "{named:?}"
+        );
+        // Named no track, it aligns the unlocked ones: none here.
+        assert_eq!(project.snap_to_beats(None, None).unwrap(), 0);
     }
 
     // ---- edit modes: roll, slip, slide, split-and-remove -------------------------
