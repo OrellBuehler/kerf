@@ -424,12 +424,23 @@ enum Step {
 }
 
 /// What drawing overlays needs: `text.wgsl`'s pipeline, a mask for the blends that have none (the
-/// box), and the rasterised overlays ([`TextAtlas`]).
+/// box), and the rasterised overlays ([`TextAtlas`]): the cut's, and a drag's poses apart from them.
 struct TextPass {
     layout: wgpu::BindGroupLayout,
     pipeline: wgpu::RenderPipeline,
     blank: wgpu::TextureView,
     atlas: TextAtlas,
+    drafts: TextAtlas,
+}
+
+/// Whose frame a composite draws, for where its titles are kept.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Texts {
+    /// The cut's: titles are rasterised into the atlas, to be served again.
+    Cut,
+    /// A drag's (the cut as a gesture under way would leave it): a title the atlas does not hold is
+    /// a pose of the drag, kept apart ([`TextAtlas::get_drafted`]).
+    Draft,
 }
 
 /// An overlay of a frame, rasterised: what to blend and the masks to blend it with.
@@ -922,6 +933,7 @@ impl Compositor {
                     pipeline: text_pipeline,
                     blank,
                     atlas: TextAtlas::default(),
+                    drafts: TextAtlas::with_limits(text::DRAFT_ATLAS_MAX_ENTRIES, text::DRAFT_ATLAS_MAX_BYTES),
                 },
                 ops,
                 masks: MaskCache::default(),
@@ -1752,6 +1764,17 @@ impl Compositor {
         size: (u32, u32),
         output: Output,
     ) -> Result<Rendered, GpuError> {
+        self.composite_texts(plan, frames, size, output, Texts::Cut)
+    }
+
+    fn composite_texts<F: Borrow<YuvFrame>>(
+        &self,
+        plan: &RenderPlan,
+        frames: &[Option<F>],
+        size: (u32, u32),
+        output: Output,
+        texts: Texts,
+    ) -> Result<Rendered, GpuError> {
         let reasons = plan.reasons(&self.caps(), size);
         if !reasons.is_empty() {
             return Err(GpuError::Unsupported(join_reasons(&reasons)));
@@ -1847,7 +1870,7 @@ impl Compositor {
         // FFmpeg rasterises what text there is, here, before the GPU is touched. No project lock is
         // held, but the caller's render lock is (the app's preview holds `RenderState` across a render,
         // decode included): the wait for a first-seen caption is one process, bounded by RASTER_TIMEOUT.
-        let texts = self.prepare_text(plan, size)?;
+        let texts = self.prepare_text(plan, size, texts)?;
         self.gpu
             .guarded("compositing a frame", || self.draw(plan, &drawn, &texts, size, output))
     }
@@ -1855,14 +1878,18 @@ impl Compositor {
     /// Every overlay of the frame rasterised (or served from the atlas) and turned into the blends
     /// that draw it. Blocks for one `ffmpeg` process (at most `RASTER_TIMEOUT`) the first time a state
     /// is seen, so a caller holding a lock across a render holds it that long.
-    fn prepare_text(&self, plan: &RenderPlan, size: (u32, u32)) -> Result<Vec<PreparedText>, GpuError> {
+    fn prepare_text(&self, plan: &RenderPlan, size: (u32, u32), texts: Texts) -> Result<Vec<PreparedText>, GpuError> {
         let limit = self.gpu.device.limits().max_texture_dimension_2d;
         plan.overlays
             .iter()
             .map(|t| {
                 let graph = kerf_core::text_raster_graph(t, size);
                 let key = text::Key::new(&graph, t.font_file.as_deref());
-                let raster = self.text.atlas.get(key, || text::rasterize(&graph))?;
+                let make = || text::rasterize(&graph);
+                let raster = match texts {
+                    Texts::Cut => self.text.atlas.get(key, make)?,
+                    Texts::Draft => self.text.atlas.get_drafted(&self.text.drafts, key, make)?,
+                };
                 if let Some(mask) = &raster.glyphs {
                     if mask.w > limit || mask.h > limit {
                         return Err(GpuError::Unsupported(format!(
@@ -2453,6 +2480,30 @@ impl Compositor {
         source: &FrameSource,
         hint: Hint,
     ) -> Result<(RenderedFrame, RenderTimings), GpuError> {
+        self.render_texture(plan, size, source, hint, Texts::Cut)
+    }
+
+    /// [`Compositor::render_plan_texture_with`] for a drag's frame: `plan` is made from the cut as a
+    /// gesture under way would leave it, drawn exactly as any other, but the poses of its titles are
+    /// kept apart from the cut's ([`TextAtlas::get_drafted`]), so a drag does not push them out.
+    pub fn render_draft_texture_with(
+        &self,
+        plan: &RenderPlan,
+        size: (u32, u32),
+        source: &FrameSource,
+        hint: Hint,
+    ) -> Result<(RenderedFrame, RenderTimings), GpuError> {
+        self.render_texture(plan, size, source, hint, Texts::Draft)
+    }
+
+    fn render_texture(
+        &self,
+        plan: &RenderPlan,
+        size: (u32, u32),
+        source: &FrameSource,
+        hint: Hint,
+        texts: Texts,
+    ) -> Result<(RenderedFrame, RenderTimings), GpuError> {
         let reasons = plan.reasons(&self.caps(), size);
         if !reasons.is_empty() {
             return Err(GpuError::Unsupported(join_reasons(&reasons)));
@@ -2462,7 +2513,7 @@ impl Compositor {
         let frames = source.frames(&plan.layers, hint)?;
         let decode = t0.elapsed();
         let t1 = Instant::now();
-        let rendered = match self.composite_as(plan, &frames, size, Output::Texture)? {
+        let rendered = match self.composite_texts(plan, &frames, size, Output::Texture, texts)? {
             Rendered::Texture(texture) => texture,
             Rendered::Pixels(_) => return Err(GpuError::Gpu("pixels were rendered where a texture was asked for".into())),
         };
@@ -2527,7 +2578,7 @@ impl Compositor {
     /// drawing; the frame that draws the title then finds it in the atlas. A plan with no text
     /// costs nothing.
     pub fn warm_text(&self, plan: &RenderPlan, size: (u32, u32)) -> Result<(), GpuError> {
-        self.prepare_text(plan, size).map(|_| ())
+        self.prepare_text(plan, size, Texts::Cut).map(|_| ())
     }
 }
 
