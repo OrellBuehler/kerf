@@ -6855,6 +6855,7 @@ fn build_filter_complex_with(
 ) -> FilterGraph {
     let has_audio = |clip: &crate::model::Clip| clip_sounds(clip, assets);
     let is_image = |clip: &crate::model::Clip| assets.iter().find(|a| a.id == clip.asset_id).is_some_and(|a| a.is_image());
+    let picture_of = |clip: &crate::model::Clip| picture_size(assets.iter().find(|a| a.id == clip.asset_id));
     let layout = fmt.channel_layout();
 
     // Assign each clip its ffmpeg input index (track-then-storage order, matching
@@ -6991,9 +6992,21 @@ fn build_filter_complex_with(
             } else {
                 format!("{input}:v")
             };
+            // A clip the blurred fill does not suit is placed with Contain's chain.
+            let contained;
+            let clip_fmt =
+                if fmt.fit == Fit::Blur && !takes_blur_fill(clip, picture_of(clip), (fmt.width, fmt.height), fx[*flat].alpha) {
+                    contained = ExportFormat {
+                        fit: Fit::Contain,
+                        ..fmt.clone()
+                    };
+                    &contained
+                } else {
+                    fmt
+                };
             chains.push(format!(
                 "[{src}]{chain}[v{flat}]",
-                chain = video_clip_chain(clip, fmt, &fx[*flat], is_image(clip), &format!("c{flat}"))
+                chain = video_clip_chain(clip, clip_fmt, &fx[*flat], is_image(clip), &format!("c{flat}"))
             ));
             let out = if n == last {
                 composite_pad.to_string()
@@ -8077,13 +8090,18 @@ fn fade_filter(step: &FadeStep) -> String {
 
 /// The [`Fit::Blur`] fit of a picture into a `w`x`h` frame (pure): split in two, the
 /// picture scaled to fit (`decrease`, with `even` and the delivery's scaler flags `sf`, as
-/// the Contain fit) over a copy scaled to cover a sixteenth-size frame, cropped to it,
-/// box-blurred twice and scaled back up — a blur of a few dozen pixels, at the cost of one
-/// on a thumbnail. `label` names the chain's inner pads, unique within its graph. Its text
-/// joins a chain like a filter: `...,split[..];...;[..][..]overlay=...,...`.
+/// the Contain fit) over a copy scaled to cover a thumbnail an eighth of the frame on each
+/// side (even, at least 4x4), cropped to it, box-blurred twice and scaled back up — a blur of
+/// a few dozen pixels, at the cost of one on a thumbnail. `label` names the chain's inner pads,
+/// unique within its graph. Its text joins a chain like a filter:
+/// `...,split[..];...;[..][..]overlay=...,...`. Which clips take it is [`takes_blur_fill`]'s.
+///
+/// The `overlay` composes in 8-bit 4:2:0 (its default): a 10-bit HDR picture is fitted at 8 bits
+/// ahead of the tone-map. `format=yuv420p10` would keep it, but FFmpeg 4.4 has no such format.
 fn blur_fill(w: u32, h: u32, even: &str, sf: &str, label: &str) -> String {
     let (bw, bh) = ((w / 16 * 2).max(4), (h / 16 * 2).max(4));
-    // A radius above half the chroma plane is refused; the smaller side, a sixteenth.
+    // A radius above half the chroma plane is refused; a sixteenth of the thumbnail's smaller
+    // side, whole pixels (so the strength is only roughly the same from one frame size to another).
     let radius = (bw.min(bh) / 16).max(1);
     format!(
         "split[{label}b][{label}f];\
@@ -8092,6 +8110,31 @@ fn blur_fill(w: u32, h: u32, even: &str, sf: &str, label: &str) -> String {
          [{label}f]scale={w}:{h}:force_original_aspect_ratio=decrease{even}{sf}[{label}ff];\
          [{label}bb][{label}ff]overlay=(W-w)/2:(H-h)/2"
     )
+}
+
+/// Whether `clip` takes the [`Fit::Blur`] fill in a `frame`-sized delivery (pure), its picture
+/// `picture` (the probed, displayed size) and `alpha` whether it carries an alpha channel. Only a
+/// picture placed by the plain fit that leaves bars: not one moved, scaled, rotated, cropped or
+/// animated by its transform, not a 360 reframe (which draws the frame itself), not one that is
+/// see-through (an alpha source, a chroma key, a mask: the fill would show through it as a
+/// blurred halo) and not one of the frame's own shape or of an unknown one (nothing to fill).
+/// Anything else is placed with Contain's own chain, byte for byte.
+fn takes_blur_fill(clip: &Clip, picture: Option<(u32, u32)>, frame: (u32, u32), alpha: bool) -> bool {
+    let other_shape =
+        picture.is_some_and(|(w, h)| w > 0 && h > 0 && u64::from(w) * u64::from(frame.1) != u64::from(h) * u64::from(frame.0));
+    clip.transform.is_identity()
+        && !clip.is_animated()
+        && clip.reframe.is_none()
+        && clip.mask.is_none()
+        && !alpha
+        && !clip.effects.iter().any(|e| e.produces_alpha())
+        && other_shape
+}
+
+/// The displayed size of `asset`'s picture, when it was probed.
+fn picture_size(asset: Option<&Asset>) -> Option<(u32, u32)> {
+    let stream = asset?.streams.iter().find(|s| s.kind == StreamKind::Video)?;
+    Some((stream.width?, stream.height?))
 }
 
 /// The video filter chain for one clip (everything between its `[i:v]` input
@@ -8116,7 +8159,9 @@ fn blur_fill(w: u32, h: u32, even: &str, sf: &str, label: &str) -> String {
 /// between them. Every other clip keeps the chain it always had.
 ///
 /// `instance` is the clip's unique flat index, used to name its `v360` so
-/// `sendcmd` can address it; it is unused for clips that do not reframe.
+/// `sendcmd` can address it and the inner pads of a [`Fit::Blur`] fill; it is unused
+/// for clips that do neither. A `fmt` whose fit is `Blur` gives the clip the fill: the caller
+/// passes Contain for a clip that does not take it ([`takes_blur_fill`]).
 fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool, instance: &str) -> String {
     let s = clip.speed_mag();
     let t = &clip.transform;
@@ -9023,7 +9068,15 @@ fn build_still_args_rendered(
                 clip.zoom_animated(),
                 &layer.fades,
                 layer.label_bt709,
-                (!clip.is_animated()).then(|| format!("bf{n}")).as_deref()
+                (fmt.fit == Fit::Blur
+                    && takes_blur_fill(
+                        clip,
+                        picture_size(asset_of(clip.asset_id)),
+                        (fmt.width, fmt.height),
+                        asset_of(clip.asset_id).is_some_and(Asset::has_alpha)
+                    ))
+                .then(|| format!("bf{n}"))
+                .as_deref()
             )
         ));
         let out = format!("ov{n}");
@@ -9095,8 +9148,9 @@ struct StillCanvas {
 /// `grade` is the clip's curves, wheels and LUT, right after the `eq`, as `video_clip_chain` places them.
 ///
 /// `blur_label` names the inner pads of a [`Fit::Blur`] fill ([`blur_fill`]), unique in the graph,
-/// and is `None` for a clip the export gives none (an animated one: its pose is not the plain fit
-/// even where it samples to it).
+/// and is `None` for a clip the export gives none ([`takes_blur_fill`]: an animated one, whose pose
+/// is not the plain fit even where it samples to it, a see-through one, a reframe, one of the
+/// frame's own shape), which is then placed as under Contain.
 #[allow(clippy::too_many_arguments)]
 fn still_clip_chain_graded(
     tf: &Transform,
@@ -9153,8 +9207,9 @@ fn still_clip_chain_graded(
     let mut late_zoom: Option<String> = None;
     if tf.is_identity() {
         // Cover already fills the frame; padding it would be a no-op that still
-        // costs a filter, so only the letterboxed path needs it.
-        if fit == Fit::Contain {
+        // costs a filter, so only the letterboxed path needs it (a blurred fill is the
+        // frame; a clip that does not take one is letterboxed as under Contain).
+        if fit == Fit::Contain || (fit == Fit::Blur && blur_label.is_none()) {
             p.push(format!("pad={ow}:{oh}:(ow-iw)/2:(oh-ih)/2"));
         }
     } else if (tf.scale - 1.0).abs() > 1e-9 {
@@ -16613,10 +16668,36 @@ mod tests {
         // Contain is what it was, and a clip placed by its transform gets Contain's chain.
         let contain = graph(plain.clone(), Fit::Contain);
         assert!(contain.contains("force_original_aspect_ratio=decrease,pad=1080:1920") && !contain.contains("boxblur"));
-        let mut pip = plain;
+        let mut pip = plain.clone();
         pip.transform.scale = 0.5;
         let (blurred, contained) = (graph(pip.clone(), Fit::Blur), graph(pip, Fit::Contain));
         assert_eq!(blurred, contained);
+        // Nor does a see-through picture (the fill would show through it as a halo), a 360
+        // reframe, or a picture of the frame's own shape: Contain's graph, byte for byte.
+        let mut keyed = plain.clone();
+        keyed.effects.push(VideoEffect::ChromaKey {
+            color: "green".into(),
+            similarity: 0.1,
+            blend: 0.0,
+        });
+        let mut masked = plain.clone();
+        masked.mask = Some(crate::model::Mask::default());
+        let mut reframed = plain.clone();
+        reframed.reframe = Some(crate::model::Reframe::new(crate::model::Projection::Flat));
+        for clip in [keyed, masked, reframed] {
+            assert_eq!(graph(clip.clone(), Fit::Blur), graph(clip, Fit::Contain));
+        }
+        let fill_of = |picture, alpha| takes_blur_fill(&plain, picture, (1080, 1920), alpha);
+        assert!(fill_of(Some((1920, 1080)), false));
+        assert!(!fill_of(Some((1920, 1080)), true), "an alpha source");
+        assert!(!fill_of(Some((540, 960)), false), "the frame's own shape");
+        assert!(!fill_of(None, false) && !fill_of(Some((0, 0)), false), "an unknown shape");
+        let wide = |fit| {
+            let mut tl = single(vec![plain.clone()]);
+            tl.format = Some(Delivery::new(1920, 1080, fit));
+            build_export_args(&tl, std::slice::from_ref(&asset), "out.mp4", &ExportOptions::default()).unwrap()
+        };
+        assert_eq!(wide(Fit::Blur), wide(Fit::Contain), "nothing to fill");
         // The scrubbed still: the same fill, labelled per layer.
         let mut tl = single(vec![make_clip(asset.id, 0.0, 5.0, 0.0)]);
         tl.tracks.push(video_track(vec![make_clip(asset.id, 0.0, 5.0, 0.0)]));
@@ -16638,6 +16719,20 @@ mod tests {
             g.contains("scale=66:120:force_original_aspect_ratio=increase:flags=bilinear,crop=66:120,boxblur=4:2,scale=540:960"),
             "{g}"
         );
+        // An alpha source takes no fill, in the export or the still: Contain's graphs.
+        let mut sticker = asset.clone();
+        sticker.streams[0].pix_fmt = Some("yuva420p".into());
+        let both = |fit| {
+            let mut tl = single(vec![make_clip(sticker.id, 0.0, 5.0, 0.0)]);
+            tl.format = Some(Delivery::new(1080, 1920, fit));
+            let assets = std::slice::from_ref(&sticker);
+            let opts = ExportOptions::default();
+            (
+                build_export_args(&tl, assets, "out.mp4", &opts).unwrap(),
+                build_still_args(&tl, assets, &opts, 1.0, 540, None, &out).unwrap(),
+            )
+        };
+        assert_eq!(both(Fit::Blur), both(Fit::Contain));
     }
 
     #[test]

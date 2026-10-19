@@ -1,6 +1,7 @@
 //! The blurred fill ([`Fit::Blur`]) through the real `ffmpeg` (`#[ignore]`d): a landscape clip in
 //! a vertical frame keeps its whole picture in the middle, and the bars above and below it are a
-//! blurred copy of the picture instead of black; the scrubbed still draws the same frame.
+//! blurred copy of the picture instead of black; the scrubbed still draws the same frame; a
+//! picture with an alpha channel takes no fill (it would show through as a halo).
 //!
 //! `cargo test -p kerf-core --no-default-features -- --ignored blur_rendered`
 
@@ -94,5 +95,40 @@ fn a_blurred_fill_fills_the_bars_with_the_picture_blurred() {
     let worst = run.stdout.iter().zip(&blur).map(|(a, b)| a.abs_diff(*b)).max().unwrap_or(255);
     assert_eq!(run.stdout.len(), blur.len());
     assert!(worst <= 3, "the still is the export's frame: {worst} levels apart at worst");
+
+    // A picture that is half transparent takes no fill: a blurred copy would show through its
+    // clear half as a halo. Under Blur it renders as under Contain, pixel for pixel.
+    let sticker = sticker(&dir);
+    let stickers = vec![sticker.clone()];
+    let over = |fit| {
+        let mut tl = single(vec![make_clip(sticker.id, 0.0, 1.0, 0.0)]);
+        tl.format = Some(Delivery::new(W, H, fit));
+        export_frames_sized(&tl, &stickers, 25.0, (W, H), &dir, &format!("sticker-{fit:?}")).swap_remove(10)
+    };
+    let (blur, contain) = (over(Fit::Blur), over(Fit::Contain));
+    assert!(blur == contain, "an alpha source under Blur is drawn as under Contain");
+    assert!(mean(&blur, 4..36, 0..72) < 20.0, "with no fill in its bars");
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A 128x72 picture with an alpha channel (FFV1 `yuva420p`): opaque white on its left half, clear
+/// on its right.
+fn sticker(dir: &Path) -> Asset {
+    let path = dir.join("sticker.mkv");
+    let made = command(&ffmpeg_bin())
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i"])
+        .arg(
+            "color=c=white:s=128x72:r=25:d=2,format=yuva420p,geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':a='if(lt(X,64),255,0)'",
+        )
+        .args(["-c:v", "ffv1"])
+        .arg(&path)
+        .status_bounded()
+        .expect("run ffmpeg");
+    assert!(made.success());
+    let mut stream = video_stream(128, 72, 25.0);
+    stream.pix_fmt = Some("yuva420p".into());
+    let mut asset = test_asset(vec![stream]);
+    asset.path = path.to_string_lossy().into_owned();
+    asset.duration = 2.0;
+    asset
 }
