@@ -143,7 +143,7 @@ Now ask the agent to work on the project you have open — _"skim the interview 
 the dead air, and drop in captions."_ It will claim a task, use the tools below, and hand
 back a reviewable result.
 
-### The tools (169)
+### The tools (170)
 
 <details>
 <summary><b>See / analyze</b></summary>
@@ -180,7 +180,7 @@ score, fitted to the cuts) ·
 <details>
 <summary><b>Style & animate</b></summary>
 
-`set_volume` · `set_fade` · `set_speed` · `set_transform` · `set_color` ·
+`set_volume` · `set_fade` · `set_speed` · `set_transform` · `set_transform_at` · `set_color` ·
 `set_grade` (curves, colour wheels, a .cube LUT) · `set_transition` · `set_mask` · `set_video_effects` · `set_audio_effects` ·
 `set_keyframes` · `add_keyframe` · `set_keyframe_easing` · `set_property_keyframes` · `set_property_tracks` · `copy_keyframes` · `clear_keyframes` · `set_reframe` · `clear_reframe` ·
 `set_reframe_keyframes` · `add_reframe_keyframe` · `set_track_volume` · `set_track_pan` ·
@@ -331,8 +331,8 @@ Kerf is a working editor under active development — not a scaffold. The timeli
 preview, transcript, analysis, effects, keyframes, captions, playback and export are all
 wired to real backend state, and the MCP surface is exercised end-to-end.
 
-**Roadmap:** exporting one cut at every delivery frame in a single pass, a live activity
-stream pushed from the MCP server (the queue is polled today), and audible reverse shuttle.
+**Roadmap:** a live activity stream pushed from the MCP server (the queue is polled today), and
+audible reverse shuttle.
 
 Contributions welcome — see [`CONTRIBUTING.md`](./CONTRIBUTING.md).
 

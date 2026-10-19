@@ -121,6 +121,7 @@ describe('routePreview', () => {
 		streaming: false,
 		empty: false,
 		titlesShown: false,
+		handles: false,
 		trimMonitor: false,
 		guides: false,
 		covered: false
@@ -158,7 +159,7 @@ describe('routePreview', () => {
 	});
 
 	test('anything the page draws over the picture needs a surface under it', () => {
-		for (const patch of [{ titlesShown: true }, { trimMonitor: true }, { guides: true }]) {
+		for (const patch of [{ titlesShown: true }, { handles: true }, { trimMonitor: true }, { guides: true }]) {
 			expect(routePreview({ ...on, ...patch })).toMatchObject({ via: 'jpeg', overlays: true, why: 'overlays' });
 			expect(routePreview({ ...on, ...patch, overlaysCapable: true })).toEqual({ via: 'gpu', overlays: true });
 		}

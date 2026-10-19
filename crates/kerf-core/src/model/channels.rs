@@ -623,6 +623,55 @@ impl Clip {
         }
     }
 
+    /// Pose the transform as it should read `time` seconds into the clip, in one edit: a number
+    /// of `patch` that is keyed gets a key there — in its own track when it has one, else in the
+    /// bundle (the bundle's other numbers at their sampled values, as `add_keyframe` puts a key
+    /// in) — and every other number, the crop edges always, becomes its static value. A track
+    /// left empty to hold a number off the bundle is static, so it stays so.
+    pub fn pose_transform(&mut self, time: f64, patch: &TransformPatch) {
+        let numbers = patch.animatable();
+        let tracked = |c: &Clip, p: Property| c.channel(p).is_some_and(|t| !t.keys.is_empty());
+        let bundled: Vec<(Property, f64)> = numbers
+            .iter()
+            .copied()
+            .filter(|(p, _)| self.channel(*p).is_none() && self.is_keyed(*p))
+            .collect();
+        if !bundled.is_empty() {
+            let mut kf = Keyframe::from_transform(time, &self.transform_at(time));
+            for (p, v) in &bundled {
+                match p {
+                    Property::Scale => kf.scale = *v,
+                    Property::PosX => kf.pos_x = *v,
+                    Property::PosY => kf.pos_y = *v,
+                    Property::Rotation => kf.rotation = *v,
+                    _ => kf.opacity = *v,
+                }
+            }
+            self.insert_keyframe(kf);
+        }
+        let mut statics = TransformPatch {
+            crop_left: patch.crop_left,
+            crop_right: patch.crop_right,
+            crop_top: patch.crop_top,
+            crop_bottom: patch.crop_bottom,
+            ..TransformPatch::default()
+        };
+        for (p, v) in numbers {
+            if tracked(self, p) {
+                self.insert_property_key(p, PropertyKey::new(time, v));
+            } else if !bundled.iter().any(|(b, _)| *b == p) {
+                match p {
+                    Property::Scale => statics.scale = Some(v),
+                    Property::PosX => statics.pos_x = Some(v),
+                    Property::PosY => statics.pos_y = Some(v),
+                    Property::Rotation => statics.rotation = Some(v),
+                    _ => statics.opacity = Some(v),
+                }
+            }
+        }
+        statics.apply(&mut self.transform);
+    }
+
     /// Back to the static transform: the bundle and every transform property's track go.
     pub fn clear_transform_animation(&mut self) {
         self.keyframes.clear();
@@ -1566,5 +1615,100 @@ mod tests {
         let mut retimed = taken.clone();
         retimed.channels[0].keys[1].time = 3.0;
         assert_eq!(channel_changes(&taken, &retimed), ["scale keyframes changed"]);
+    }
+
+    fn moved(x: f64, y: f64) -> TransformPatch {
+        TransformPatch {
+            pos_x: Some(x),
+            pos_y: Some(y),
+            ..TransformPatch::default()
+        }
+    }
+
+    #[test]
+    fn posing_an_unkeyed_clip_writes_its_static_transform() {
+        let mut c = clip();
+        c.pose_transform(
+            1.0,
+            &TransformPatch {
+                scale: Some(0.5),
+                crop_left: Some(0.1),
+                ..moved(0.2, -0.1)
+            },
+        );
+        assert!(c.keyframes.is_empty() && c.channels.is_empty());
+        assert_eq!(
+            (c.transform.scale, c.transform.pos_x, c.transform.pos_y, c.transform.crop_left),
+            (0.5, 0.2, -0.1, 0.1)
+        );
+    }
+
+    #[test]
+    fn posing_a_bundle_keyed_clip_keys_the_bundle_at_the_time() {
+        let mut c = clip();
+        c.keyframes = vec![
+            bundle_key(0.0, 1.0, 1.0, Easing::Linear),
+            bundle_key(2.0, 2.0, 0.0, Easing::Linear),
+        ];
+        c.pose_transform(
+            1.0,
+            &TransformPatch {
+                crop_top: Some(0.2),
+                ..moved(0.3, 0.1)
+            },
+        );
+        assert_eq!(c.keyframes.len(), 3);
+        let k = c.keyframes[1];
+        // The moved numbers are what was asked; the others stay on the curve they were on.
+        assert_eq!((k.time, k.pos_x, k.pos_y, k.scale, k.opacity), (1.0, 0.3, 0.1, 1.5, 0.5));
+        assert_eq!((c.transform.pos_x, c.transform.crop_top), (0.0, 0.2), "the crop is static");
+        assert!(c.channels.is_empty());
+        assert_eq!(c.transform_at(1.0).pos_x, 0.3);
+    }
+
+    #[test]
+    fn posing_keys_the_numbers_with_tracks_and_sets_the_rest_static() {
+        let mut c = clip();
+        c.set_property_keys(
+            Property::PosX,
+            vec![key(0.0, 0.0, Easing::Linear), key(2.0, 0.4, Easing::Linear)],
+        );
+        c.pose_transform(1.0, &moved(-0.2, 0.25));
+        assert!(c.keyframes.is_empty(), "no bundle is started");
+        assert_eq!(c.property_keys(Property::PosX).len(), 3);
+        assert_eq!(c.property_at(Property::PosX, 1.0), -0.2);
+        assert!(!c.is_keyed(Property::PosY));
+        assert_eq!(c.transform.pos_y, 0.25);
+        assert_eq!(c.transform.pos_x, 0.0, "a keyed number's static value is not touched");
+    }
+
+    #[test]
+    fn posing_beside_a_bundle_keeps_each_number_where_it_is_driven_from() {
+        let mut c = clip();
+        c.keyframes = vec![
+            bundle_key(0.0, 1.0, 1.0, Easing::Linear),
+            bundle_key(2.0, 2.0, 0.0, Easing::Linear),
+        ];
+        // Scale has keys of its own; opacity is held static against the bundle by an empty track.
+        c.set_property_keys(
+            Property::Scale,
+            vec![key(0.0, 1.0, Easing::Linear), key(2.0, 1.0, Easing::Linear)],
+        );
+        c.set_property_keys(Property::Opacity, vec![]);
+        c.pose_transform(
+            1.0,
+            &TransformPatch {
+                scale: Some(3.0),
+                opacity: Some(0.7),
+                pos_x: Some(0.1),
+                ..TransformPatch::default()
+            },
+        );
+        assert_eq!(c.property_at(Property::Scale, 1.0), 3.0);
+        assert_eq!(c.property_keys(Property::Scale).len(), 3);
+        assert!(!c.is_keyed(Property::Opacity), "the held number stays static");
+        assert_eq!(c.transform.opacity, 0.7);
+        assert_eq!(c.keyframes.len(), 3, "position is keyed in the bundle");
+        assert_eq!(c.transform_at(1.0).pos_x, 0.1);
     }
 }

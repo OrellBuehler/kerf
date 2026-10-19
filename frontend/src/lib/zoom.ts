@@ -32,9 +32,13 @@ export const MIN_SPAN_SEC = 8;
  *  millions (and lose sub-pixel precision past 2^24); this stays well inside. */
 export const LANE_PX_CAP = 8_000_000;
 
+/** How far past a whole pixel a product may land and still be that pixel: `(962 / 30) * 30` is
+ *  `962.0000000000001`, and rounding that up makes a fitted lane a pixel wider than its window. */
+const PX_EPSILON = 1e-6;
+
 /** The width of the lane for a cut `duration` seconds long at `pxPerSec`. */
 export function laneWidth(duration: number, pxPerSec: number): number {
-	return Math.max(LANE_MIN_PX, Math.ceil(Math.max(duration, MIN_SPAN_SEC) * pxPerSec) + LANE_TAIL_PX);
+	return Math.max(LANE_MIN_PX, Math.ceil(Math.max(duration, MIN_SPAN_SEC) * pxPerSec - PX_EPSILON) + LANE_TAIL_PX);
 }
 
 /** The fastest zoom a cut of `duration` seconds may be shown at: `ZOOM_MAX`, or less

@@ -2,7 +2,7 @@
 //! these before they change anything, and whatever shows a value before it is written (the GPU
 //! preview's drag frames) calls the same ones, so it never shows a value the edit would refuse.
 
-use super::{Asset, Clip, Color, TextKeyframe, TextOverlay, Transform};
+use super::{Asset, Clip, Color, TextKeyframe, TextOverlay, Transform, TransformPatch};
 use crate::error::{Error, Result};
 
 /// How far the footage of a clip may be asked past the asset's length (seconds): the float noise
@@ -52,6 +52,23 @@ impl Transform {
             return Err(invalid("crop removes the entire frame"));
         }
         Ok(())
+    }
+}
+
+impl TransformPatch {
+    /// The numbers `Project::set_transform` / `set_transform_at` take ([`Transform::check_values`]).
+    pub fn check_values(&self) -> Result<()> {
+        Transform::check_values(
+            self.scale,
+            self.pos_x,
+            self.pos_y,
+            self.rotation,
+            self.opacity,
+            self.crop_left,
+            self.crop_right,
+            self.crop_top,
+            self.crop_bottom,
+        )
     }
 }
 

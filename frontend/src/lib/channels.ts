@@ -10,9 +10,9 @@
  * editor's sampled pose, the harness's edits and the export read one curve. Its numbers are pinned
  * against the Rust tests (`channels.test.ts`).
  */
-import { easedPoints, splitEasing, EASE_STEPS, curve } from './easing';
+import { easedPoints, splitEasing, EASE_STEPS, curve, insertKeyframe } from './easing';
 import type { Clip, Color, Easing, Keyframe, Mask, Property, PropertyKey, PropertyTrack, Transform } from './types';
-import { DEFAULT_COLOR, DEFAULT_MASK, DEFAULT_TRANSFORM } from './types';
+import { DEFAULT_COLOR, DEFAULT_TRANSFORM } from './types';
 
 /** What the samplers read of a clip: a gain clip (`audio-mix.ts`) carries no transform. */
 export type Animatable = Pick<Clip, 'volume' | 'channels' | 'keyframes' | 'transform' | 'color'> & Partial<Pick<Clip, 'mask'>>;
@@ -303,6 +303,11 @@ export const colorAnimated = (clip: Animatable) => COLOR_PROPERTIES.some((p) => 
 /** Whether the clip's volume is keyed (`Clip::volume_animated`). */
 export const volumeAnimated = (clip: Animatable) => isKeyed(clip, 'volume');
 
+/** Where a key written at the playhead goes, clip-local: the very moment the pose is sampled at,
+ *  unrounded. A rounded time can land just after the playhead, where a hold before it still reads
+ *  the old value; every keyed write uses this, so the Inspector and the handles hit the same key. */
+export const keyTime = (clip: { timeline_start: number }, playhead: number) => Math.max(0, playhead - clip.timeline_start);
+
 /** The clip's static transform with every keyed number sampled at `local` (`Clip::transform_at`). */
 export function transformAt(clip: Animatable, local: number): Transform {
 	const t: Transform = { ...DEFAULT_TRANSFORM, ...(clip.transform ?? {}) };
@@ -502,6 +507,32 @@ export function clearTransformAnimation(clip: Clip) {
 		clip.channels = clip.channels.filter((c) => !isTransformProperty(c.prop));
 		if (clip.channels.length === 0) delete clip.channels;
 	}
+}
+
+/** Pose the transform as it should read `time` seconds into the clip (`Clip::pose_transform`): a
+ *  keyed number gets a key there — in its own track when it has one, else in the bundle (the rest
+ *  of the bundle at its sampled values) — and every other number, the crop always, its static value. */
+export function poseTransform(clip: Clip, time: number, patch: Partial<Transform>) {
+	const numbers = TRANSFORM_PROPERTIES.filter((p) => patch[p as keyof Transform] !== undefined).map(
+		(p) => [p, patch[p as keyof Transform] as number] as const
+	);
+	const tracked = (p: Property) => (channelOf(clip, p)?.keys.length ?? 0) > 0;
+	const bundled = numbers.filter(([p]) => !channelOf(clip, p) && isKeyed(clip, p));
+	if (bundled.length) {
+		const tf = transformAt(clip, time);
+		const key: Keyframe = { time, scale: tf.scale, pos_x: tf.pos_x, pos_y: tf.pos_y, rotation: tf.rotation, opacity: tf.opacity };
+		for (const [p, v] of bundled) key[p as 'scale'] = v;
+		clip.keyframes = insertKeyframe(clip.keyframes ?? [], key);
+	}
+	const next: Transform = { ...DEFAULT_TRANSFORM, ...(clip.transform ?? {}) };
+	for (const edge of ['crop_left', 'crop_right', 'crop_top', 'crop_bottom'] as const) {
+		if (patch[edge] !== undefined) next[edge] = patch[edge];
+	}
+	for (const [p, v] of numbers) {
+		if (tracked(p)) insertPropertyKey(clip, p, { time, value: v });
+		else if (!bundled.some(([b]) => b === p)) next[p as 'scale'] = v;
+	}
+	clip.transform = next;
 }
 
 /** The keys of `props` (every keyed number when empty) as they would be on a clip whose start is

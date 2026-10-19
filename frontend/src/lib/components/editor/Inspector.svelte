@@ -49,6 +49,7 @@
 		isKeyed,
 		maskAt,
 		MAX_CROP_ZOOM,
+		keyTime,
 		propertyAt,
 		propertyKeys,
 		transformAnimated,
@@ -224,7 +225,7 @@
 		return points[points.length - 1][1];
 	}
 	/** Seconds into the selected clip at the playhead (clip-local, what keys are in). */
-	const localTime = $derived(clip ? Math.max(0, ui.time - clip.timeline_start) : 0);
+	const localTime = $derived(clip ? keyTime(clip, ui.time) : 0);
 	// Every keyed number as the eased polyline the export draws, whichever of the legacy bundle and
 	// the numbers' own tracks drives it (`transformAt`).
 	const tf = $derived(clip ? transformAt(clip, localTime) : { ...DEFAULT_TRANSFORM });
@@ -236,8 +237,7 @@
 		if (!c) return;
 		const animatable = Object.keys(patch).every((k) => ANIM_KEYS.has(k));
 		if (c.keyframes?.length && animatable) {
-			const time = Math.max(0, at.time - c.timeline_start);
-			return run(() => editor.addKeyframe(c.id, Math.round(time * 1000) / 1000, patch as Record<string, number>));
+			return run(() => editor.addKeyframe(c.id, keyTime(c, at.time), patch as Record<string, number>));
 		} else if (animatable && transformAnimated(c)) {
 			// Numbers keyed on their own (no whole-transform keys): a key at the playhead for each
 			// of those, the static transform for the rest.
@@ -251,21 +251,19 @@
 			return run(() => editor.setTransform(c.id, patch));
 		}
 	}
-	/** A key for `prop` at the playhead (clip-local, to the millisecond), put in as the backend does:
+	/** A key for `prop` at the playhead ([`keyTime`]), put in as the backend does:
 	 *  re-keying a moment keeps how it leaves, a key inside a segment splits it. */
 	function keyAtPlayhead(c: Clip, prop: Property, value: number, playhead: number = ui.time) {
-		const time = Math.round(Math.max(0, playhead - c.timeline_start) * 1000) / 1000;
-		return editor.setPropertyKeyframes(c.id, prop, upsertKey(propertyKeys(c, prop), { time, value }));
+		return editor.setPropertyKeyframes(c.id, prop, upsertKey(propertyKeys(c, prop), { time: keyTime(c, playhead), value }));
 	}
 	/** The ◆ beside a number: key it at the playhead at the value it has there, or — a key already
 	 *  sits there — take that key out (the last one makes the number static again). */
 	function toggleKey(prop: Property) {
 		const c = clip;
 		if (!c) return;
-		const time = Math.round(localTime * 1000) / 1000;
 		const keys = propertyKeys(c, prop);
-		if (keys.some((k) => Math.abs(k.time - time) <= 0.02)) {
-			void run(() => editor.setPropertyKeyframes(c.id, prop, keys.filter((k) => Math.abs(k.time - time) > 0.02)));
+		if (keys.some((k) => Math.abs(k.time - localTime) <= 0.02)) {
+			void run(() => editor.setPropertyKeyframes(c.id, prop, keys.filter((k) => Math.abs(k.time - localTime) > 0.02)));
 		} else {
 			void run(() => keyAtPlayhead(c, prop, propertyAt(c, prop, localTime)));
 		}
@@ -360,10 +358,7 @@
 		if (!c) return;
 		const animatable = Object.keys(patch).every((k) => CAM_KEYS.has(k));
 		if (c.reframe?.keyframes?.length && animatable) {
-			const time = Math.max(0, at.time - c.timeline_start);
-			return run(() =>
-				editor.addReframeKeyframe(c.id, Math.round(time * 1000) / 1000, patch as Record<string, number>)
-			);
+			return run(() => editor.addReframeKeyframe(c.id, keyTime(c, at.time), patch as Record<string, number>));
 		} else {
 			return run(() => editor.setReframe(c.id, patch));
 		}
@@ -542,8 +537,7 @@
 	function addKeyframeHere() {
 		const c = clip;
 		if (!c) return;
-		const time = Math.max(0, ui.time - c.timeline_start);
-		void run(() => editor.addKeyframe(c.id, Math.round(time * 1000) / 1000));
+		void run(() => editor.addKeyframe(c.id, keyTime(c, ui.time)));
 	}
 	function setEasing(el: HTMLSelectElement, k: { time: number }, was: string) {
 		// Pending, not disabled, so the keys still reach the select: nothing is written, and it goes back.
@@ -1488,7 +1482,7 @@
 								run(() =>
 									editor.addReframeKeyframe(
 										clip.id,
-										Math.round(Math.max(0, ui.time - clip.timeline_start) * 1000) / 1000
+										keyTime(clip, ui.time)
 									)
 								)}>Camera key</Btn
 						>

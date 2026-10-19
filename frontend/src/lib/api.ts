@@ -148,6 +148,7 @@ import {
 	insertPropertyKey,
 	isMaskProperty,
 	keyableProblem,
+	poseTransform,
 	pruneChannels,
 	propertyKeysProblem,
 	propertyKeysShifted,
@@ -2833,6 +2834,39 @@ export async function setTransform(clipId: string, patch: Partial<Transform>): P
 	});
 }
 
+/** Set a clip's transform as it should look `time` seconds into the clip, as one revision: a keyed
+ *  number gets a key there, every other number (the crop always) its static value. */
+export async function setTransformAt(clipId: string, time: number, patch: Partial<Transform>): Promise<Timeline> {
+	if (!inTauri()) {
+		if (!Number.isFinite(time) || time < 0) throw new Error('time must be >= 0');
+		const found = locate(devTimeline, clipId);
+		if (!found) throw new Error(`clip ${clipId} not found`);
+		const clip = found[0].clips[found[1]];
+		const before = structuredClone(clip);
+		poseTransform(clip, time, patch);
+		const t = clip.transform!;
+		if (t.crop_left + t.crop_right >= 1 || t.crop_top + t.crop_bottom >= 1) {
+			found[0].clips[found[1]] = before;
+			throw new Error('crop removes the entire frame');
+		}
+		recordDev('Set transform');
+		return snapshot();
+	}
+	return invoke<Timeline>('set_transform_at', {
+		clipId,
+		time,
+		scale: patch.scale,
+		posX: patch.pos_x,
+		posY: patch.pos_y,
+		rotation: patch.rotation,
+		opacity: patch.opacity,
+		cropLeft: patch.crop_left,
+		cropRight: patch.crop_right,
+		cropTop: patch.crop_top,
+		cropBottom: patch.crop_bottom
+	});
+}
+
 /** Update a clip's color correction; only the provided fields change. */
 export async function setColor(clipId: string, patch: Partial<Color>): Promise<Timeline> {
 	if (!inTauri()) {
@@ -4703,17 +4737,20 @@ export async function exportTimeline(outputPath: string, options: ExportOptions)
 	return invoke<string>('export_timeline', { outputPath, options });
 }
 
-/** Render the cut once per delivery frame — one file per shape beside
+/** Render the cut at every delivery frame — one file per shape beside
  *  `outputPath`, named by shape (`cut-9x16.mp4`). With `smartCrop` every shot
- *  is framed for every shape first, recorded on the clips as one revision. */
+ *  is framed for every shape first, recorded on the clips as one revision.
+ *  `singlePass` (the default) writes every file from one decode of the cut where
+ *  the encode allows; false renders them one after another. */
 export async function exportVariants(
 	outputPath: string,
 	formats: Delivery[],
 	smartCrop: boolean,
-	options: ExportOptions
+	options: ExportOptions,
+	singlePass = true
 ): Promise<string[]> {
 	if (!inTauri()) throw new Error('export is only available in the desktop app');
-	return invoke<string[]>('export_variants', { outputPath, formats, smartCrop, options });
+	return invoke<string[]>('export_variants', { outputPath, formats, smartCrop, singlePass, options });
 }
 
 /** Ask the backend to stop the in-flight export; it then rejects with `export cancelled`. */

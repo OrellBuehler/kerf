@@ -22,12 +22,16 @@
   `-start_number`); families `svg-input`, `svg-held`, `svg-overlay`, `svg-two`, `svg-partly-off`, `svg-restamp`, `still-svg`,
   `still-svg-one-file`, `preview-svg-*` (`input`, `held`, `seek`, `overlay`) and
   the structural `svg-under-text`, `svg-gif`, `svg-offset`, which gave 28 to hundreds of cases each) and **400 more**
-  with a keyed mask or crop (`mask_crop_for`, on dice seeded by case and clip, after the titles and without them:
-  some mask numbers keyed on a mask the clip had or was given, a feather keyed to nothing in places, the crop's zoom
-  and pan each with its own chance; families `mask-keyed`, `mask-keyed-feather`, `preview-mask-keyed`, `crop-keyed`,
-  `preview-crop-keyed`; the first 6400 digests did not move, 4 block lines appended to each file), have their
+  exported at two or three delivery frames by one run (`together_for`, on dice of its own: framings on the clips,
+  titles on every other case, captions and chapters to mux on a quarter, the encode made one the run takes, every
+  tenth an audio-only container that none does; their export text is `together::build_together_args` plus its
+  `sinks_from_end`; families `together-*`) and **400 more** with a keyed mask or crop (`mask_crop_for`, on dice
+  seeded by case and clip, after those and without titles or a second delivery frame: some mask numbers keyed on a
+  mask the clip had or was given, a feather keyed to nothing in places, the crop's zoom and pan each with its own
+  chance; families `mask-keyed`, `mask-keyed-feather`, `preview-mask-keyed`, `crop-keyed`, `preview-crop-keyed`; the
+  first 6800 digests did not move, 4 block lines appended to each file), have their
   `build_export_args_phase`, `build_still_args` and `build_preview_args_with` argv reduced to
-  FNV-1a digests, committed as 64 block digests each in
+  FNV-1a digests, committed as 72 block digests each in
   `engine/cli/golden/{export,still,preview}.txt` (LF: `.gitattributes`, and the comparison
   ignores `\r`). A refactor of the graph builders must leave all three untouched; an
   intended argv change moves the files of the builders it touched. (`build_proxy_args` and
@@ -141,7 +145,7 @@
   MJPEG and SpeedHQ at `yuv422p`, JPEG-LS grey, a decode-only `thp`, AMV, an `rgb24` with `bt470bg` from FFV1) and the label must be in no argv, and by explicitly tagged H.264
   clips (`bt709`, `smpte170m`, full-range `yuvj420p` `bt709`) and must then be exactly where the HDR clip's was. It moves no digest.
   The 400 animated-title cases (`6000..6400`) were blessed with the label in (blocks `60`..`63`; the first 6000 are the digests the label gave);
-  with the label text stripped from every argv all 64 block digests equal the ones committed before it.
+  with the label text stripped from every argv all 64 block digests of the time equal the ones committed before it.
 - **Constant-power crossfades** (`afade …:curve=qsin` only on a fade that is wholly one half of a real
   pair: a dissolve or motion transition from an adjacent clip whose overlap plays different sound — not a
   fade up from black, not a dip, not a cut inside one take) re-blessed `export.txt` alone: 1304 of 6400
