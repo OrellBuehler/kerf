@@ -3,9 +3,14 @@ import { drawnMoveTracks, planMove } from './multi-move';
 import { trimEdit } from './frames';
 import {
 	colorDraft,
+	draftHolds,
+	draftTouches,
+	EMPTY_SLOT,
 	fadeDraft,
 	maskDraft,
 	moveDraft,
+	putDraft,
+	sameDraft,
 	titleMoveDraft,
 	titleSizeDraft,
 	transformDraft,
@@ -131,5 +136,73 @@ describe('a timeline gesture is drafted where its ghosts are', () => {
 		const c2 = tl.tracks[0].clips[1];
 		expect(trimDraft(tl, 'c2', trimEdit(c2, 'l', 14))?.clips[0].clip).toMatchObject({ source_in: 2, source_out: 8, timeline_start: 14 });
 		expect(trimDraft(tl, 'c2', trimEdit(c2, 'r', 18))?.clips[0].clip).toMatchObject({ source_in: 0, source_out: 6, timeline_start: 12 });
+	});
+});
+
+describe('the one draft slot', () => {
+	const a = Symbol('row a');
+	const b = Symbol('timeline');
+
+	test('a draft that says the same is the slot as it was, so no frame is asked for again', () => {
+		const tl = sample();
+		const one = putDraft(EMPTY_SLOT, a, transformDraft(tl, 'c1', { scale: 0.5 }));
+		expect(one.owner).toBe(a);
+		expect(putDraft(one, a, transformDraft(tl, 'c1', { scale: 0.5 }))).toBe(one);
+		expect(putDraft(one, a, transformDraft(tl, 'c1', { scale: 0.6 }))).not.toBe(one);
+		const plan = () => planMove(drawnMoveTracks(tl), ['c2'], 'c2', 20, 'v2');
+		const moved = putDraft(EMPTY_SLOT, b, moveDraft(tl, plan()));
+		// A pointer event on the same frame.
+		expect(putDraft(moved, b, moveDraft(tl, plan()))).toBe(moved);
+		expect(sameDraft(null, null)).toBe(true);
+		expect(sameDraft(moveDraft(tl, plan()), null)).toBe(false);
+	});
+
+	test("one writer's end never clears another's draft, and the last writer holds it", () => {
+		const tl = sample();
+		const row = putDraft(EMPTY_SLOT, a, transformDraft(tl, 'c1', { scale: 0.5 }));
+		// The timeline's effect with no gesture under way.
+		expect(putDraft(row, b, null)).toBe(row);
+		expect(putDraft(row, a, null)).toBe(EMPTY_SLOT);
+		const taken = putDraft(row, b, trimDraft(tl, 'c2', { source_out: 6 }));
+		expect(taken.owner).toBe(b);
+		expect(putDraft(taken, a, null)).toBe(taken);
+	});
+
+	test('a draft that names a clip, a track or a title the cut no longer holds does not hold', () => {
+		const tl = sample();
+		const d = transformDraft(tl, 'c1', { scale: 0.5 })!;
+		expect(draftHolds(d, tl, tl.overlays ?? [])).toBe(true);
+		const undone = { ...tl, tracks: tl.tracks.map((t) => ({ ...t, clips: t.clips.filter((c) => c.id !== 'c1') })) };
+		expect(draftHolds(d, undone, tl.overlays ?? [])).toBe(false);
+		const moved = moveDraft(tl, planMove(drawnMoveTracks(tl), ['c2'], 'c2', 20, 'v2'))!;
+		expect(draftHolds(moved, { ...tl, tracks: tl.tracks.filter((t) => t.id !== 'v2') }, [])).toBe(false);
+		const t = titleSizeDraft([title()], 't1', 0.1)!;
+		expect(draftHolds(t, tl, [title()])).toBe(true);
+		expect(draftHolds(t, tl, [])).toBe(false);
+	});
+});
+
+describe('a draft is sent only when it changes the frame at the playhead', () => {
+	test('a video clip where it is or where it goes, or near enough for a transition to reach', () => {
+		const tl = sample();
+		// c2 (12-20 on V1) moved to V2 at 20.
+		const moved = moveDraft(tl, planMove(drawnMoveTracks(tl), ['c2'], 'c2', 20, 'v2'))!;
+		expect(draftTouches(moved, tl, [], 14)).toBe(true);
+		expect(draftTouches(moved, tl, [], 24)).toBe(true);
+		expect(draftTouches(moved, tl, [], 5)).toBe(false);
+		expect(draftTouches(moved, tl, [], 11.95)).toBe(true);
+		const faded = sample();
+		faded.tracks[0].clips[0].transition_in = { kind: 'crossfade', duration: 2 };
+		expect(draftTouches(moved, faded, [], 10.5)).toBe(true);
+	});
+
+	test('a clip on an audio track and a title off screen change no picture', () => {
+		const tl = sample();
+		expect(draftTouches(fadeDraft(tl, 'c4', { fade_in: 1 })!, tl, [], 5)).toBe(false);
+		const t = titleSizeDraft([title()], 't1', 0.1)!;
+		expect(draftTouches(t, tl, [title()], 2)).toBe(true);
+		expect(draftTouches(t, tl, [title()], 9)).toBe(false);
+		const later = titleMoveDraft([title({ start: 6, end: 9 })], 't1', 0.2, 0.2, 7)!;
+		expect(draftTouches(later, tl, [title({ start: 6, end: 9 })], 2)).toBe(false);
 	});
 });

@@ -45,11 +45,11 @@
 	import { renderedDuration, renderedFps, timecodeRate } from '#lib/timecode';
 	import { logFrontend } from '#lib/log';
 	import { clipDuration } from '#lib/types';
-	import type { SvgOverlay, TextOverlay } from '#lib/types';
+	import type { PreviewDraft, SvgOverlay, TextOverlay } from '#lib/types';
 	import { dragRect, rectOf, rectPatch, roundRect, svgDisplayName, type Rect, type RectHandle } from '#lib/svg-titles';
 	import { boxPadding, containRect, dragPosition, inkBox, isVisibleAt, sampleOverlay, scaledSize, titleFamily } from '#lib/titles';
 	import { tip } from '#lib/tip';
-	import { titleMoveDraft, titleSizeDraft } from '#lib/preview-draft';
+	import { draftHolds, draftTouches, titleMoveDraft, titleSizeDraft } from '#lib/preview-draft';
 
 	const duration = $derived(Math.max(editor.duration, 0.001));
 	/** The transport bar's own width, or undefined until it has been measured (and while it
@@ -134,8 +134,7 @@
 		width: () => frameWidth,
 		timelineFrame: (t, width) => getTimelineFrame(t, width),
 		previewFrame: (t, overlays, width, order, play, draft) => getPreviewFrame(t, width, overlays, order, play, draft),
-		// A proposal being previewed is read-only: no gesture runs, and the backend draws the user's cut.
-		draft: () => (editor.previewingStaged ? null : ui.previewDraft),
+		draft: () => sentDraft,
 		answered: (result) => gpuPreview.note(result),
 		gpuFailed: (error) => {
 			gpuPreview.noteJpeg(`the GPU preview failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -151,6 +150,21 @@
 			gpuPlay = null;
 			playbackWaiting = message;
 		}
+	});
+	/** The draft the frame is asked with: the gesture's, while the cut still holds what it names and it changes
+	 *  the frame at the playhead (a clip moved on an audio track, or far from the playhead, draws the frame the
+	 *  cut already draws). The same draft object while it says the same, so the pump asks once for it. A proposal
+	 *  being previewed is read-only: no gesture runs, and the backend draws the user's cut. */
+	const sentDraft = $derived.by((): PreviewDraft | null => {
+		const draft = ui.previewDraft;
+		if (!draft || editor.previewingStaged) return null;
+		if (!draftHolds(draft, editor.timeline, editor.overlays)) return null;
+		return draftTouches(draft, editor.timeline, editor.overlays, ui.time) ? draft : null;
+	});
+	// A draft that names a clip or a title the cut no longer holds (an undo mid-gesture) is dropped, whoever wrote it.
+	$effect(() => {
+		const draft = ui.previewDraft;
+		if (draft && !draftHolds(draft, editor.timeline, editor.overlays)) ui.dropDraft();
 	});
 	const frameUrl = $derived(frames.frameUrl);
 	const gpuShown = $derived(frames.gpuShown);
@@ -827,20 +841,28 @@
 	function cancelTitleDrag() {
 		if (!tdrag || tdrag.committing) return;
 		tdrag = null;
-		ui.previewDraft = null;
+		ui.setDraft(titleOwner, null);
 		releaseTitleCapture();
 	}
 
+	/** The title box's drafts are its own (`ui.setDraft`). */
+	const titleOwner = Symbol('title-box');
+	/** The drafts of the title drag under way: a frame drawn from one of them shows the title where the drag is. */
+	let titleDrafts = $state.raw(new WeakSet<PreviewDraft>());
 	/** The title as the drag would write it, for the GPU preview to draw while the drag runs. */
 	function draftTitle(d: TitleDrag) {
 		if (!d.moved) return;
-		ui.previewDraft =
+		ui.setDraft(
+			titleOwner,
 			d.mode === 'move'
 				? titleMoveDraft(editor.overlays, d.id, round4(d.x), round4(d.y), d.at)
-				: titleSizeDraft(editor.overlays, d.id, round4(d.size));
+				: titleSizeDraft(editor.overlays, d.id, round4(d.size))
+		);
+		if (ui.previewDraft) titleDrafts.add(ui.previewDraft);
 	}
-	/** The GPU drew the drag's frame: the title is in the picture where it is going, and the box carries no ghost of it. */
-	const draftDrawn = $derived(gpuShown && ui.previewDraft !== null);
+	/** The GPU has presented a frame of this drag's draft: the title is in the picture where it is going, and
+	 *  the box carries no ghost of it. Until then (a round trip) the ghost shows where the title goes. */
+	const draftDrawn = $derived(gpuShown && frames.drawnDraft !== null && titleDrafts.has(frames.drawnDraft));
 
 	/** Abandon an animated title's box gesture without writing anything. */
 	function cancelSvgDrag() {
@@ -917,6 +939,7 @@
 		const cx = box.left + box.width / 2;
 		const cy = box.top + box.height / 2;
 		const pose = sampleOverlay(o, ui.time);
+		titleDrafts = new WeakSet();
 		tdrag = {
 			id: o.id,
 			mode,
@@ -981,7 +1004,7 @@
 			report(err);
 		} finally {
 			tdrag = null;
-			ui.previewDraft = null;
+			ui.setDraft(titleOwner, null);
 		}
 	}
 

@@ -3,7 +3,9 @@
    and zoom. `runAnalysis` performs real analysis via kerf-core (desktop) or the
    in-browser sample backend; there is no scripted demo workflow. */
 
+import { untrack } from 'svelte';
 import { editor } from './state.svelte';
+import { EMPTY_SLOT, putDraft, type DraftSlot } from './preview-draft';
 import {
 	cancelAnalysis,
 	cancelLevels,
@@ -71,8 +73,23 @@ class EditorUi {
 	 *  and it is `null` the moment the gesture ends however it ends. */
 	trimMonitor = $state<TrimMonitor | null>(null);
 	/** What the gesture under way would write (`preview-draft.ts`), for the GPU preview to draw before it
-	 *  is written; `null` once the gesture's edit has landed or the gesture was abandoned. */
-	previewDraft = $state.raw<PreviewDraft | null>(null);
+	 *  is written, with who wrote it; empty once the gesture's edit has landed or the gesture was abandoned. */
+	#draft = $state.raw<DraftSlot>(EMPTY_SLOT);
+	get previewDraft(): PreviewDraft | null {
+		return this.#draft.draft;
+	}
+	/** `owner`'s gesture would write `draft`, or (`null`) is over: only its own draft is cleared, and the
+	 *  same draft again changes nothing (`putDraft`). Reads nothing a caller's effect would depend on. */
+	setDraft(owner: symbol, draft: PreviewDraft | null) {
+		untrack(() => {
+			this.#draft = putDraft(this.#draft, owner, draft);
+		});
+	}
+	/** The draft names what the cut no longer holds (an undo took the clip away mid-gesture): drop it,
+	 *  whoever wrote it. */
+	dropDraft() {
+		this.#draft = EMPTY_SLOT;
+	}
 	playing = $state(false);
 	/** The asset being dragged from the media bin, while a drag is in flight. */
 	dndAsset = $state<{ id: string; kind: 'video' | 'audio'; duration: number } | null>(null);

@@ -563,9 +563,12 @@
 			if (landing === draft) landing = null;
 		});
 	}
+	/** The timeline's drafts are its own: another gesture's (an Inspector row's) is never cleared by it. */
+	const draftOwner = Symbol('timeline');
 	$effect(() => {
-		ui.previewDraft = gestureDraft ?? landing;
+		ui.setDraft(draftOwner, gestureDraft ?? landing);
 	});
+	$effect(() => () => ui.setDraft(draftOwner, null));
 
 	function onEdgePointerDown(e: PointerEvent, c: Clip, t: Track, edge: 'l' | 'r') {
 		if (e.button !== 0 || ui.tool !== 'pointer') return; // the other tools own the clip body

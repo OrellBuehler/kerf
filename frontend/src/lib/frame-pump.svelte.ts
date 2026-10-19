@@ -89,6 +89,10 @@ export function createFramePump(deps: FramePumpDeps) {
 	let frameUrl = $state<string | null>(null);
 	/** The frame on show was drawn in the native surface: nothing is painted over it. */
 	let gpuShown = $state(false);
+	/** The draft of the gesture the frame on show was drawn from (the GPU route's answer to a request
+	 *  that carried one), `null` for any other picture: what the page draws over the frame of a drag goes
+	 *  by what is in it. */
+	let drawnDraft = $state.raw<PreviewDraft | null>(null);
 	/** The frame on show is the playback stream's, drawn on the canvas: the picture until a fetched
 	 *  frame lands on top of it. */
 	let streamShown = $state(false);
@@ -110,6 +114,7 @@ export function createFramePump(deps: FramePumpDeps) {
 		shown = seq;
 		frameUrl = url;
 		gpuShown = false;
+		drawnDraft = null;
 		streamShown = false;
 	}
 
@@ -145,11 +150,13 @@ export function createFramePump(deps: FramePumpDeps) {
 		deps.answered(result);
 		if (result.renderer === 'gpu') {
 			gpuShown = true;
+			drawnDraft = want.draft;
 			streamShown = false;
 			// The canvas the compositor drew has the delivery's shape.
 			if (result.timings?.width && result.timings.height) imgAspect = result.timings.width / result.timings.height;
 		} else if (result.frame) {
 			gpuShown = false;
+			drawnDraft = null;
 			streamShown = false;
 			frameUrl = result.frame;
 		}
@@ -204,6 +211,7 @@ export function createFramePump(deps: FramePumpDeps) {
 		shown = seq;
 		deps.answered(result);
 		gpuShown = true;
+		drawnDraft = null;
 		streamShown = false;
 		if (result.timings?.width && result.timings.height) imgAspect = result.timings.width / result.timings.height;
 	}
@@ -248,6 +256,9 @@ export function createFramePump(deps: FramePumpDeps) {
 		get gpuShown() {
 			return gpuShown;
 		},
+		get drawnDraft() {
+			return drawnDraft;
+		},
 		get imgAspect() {
 			return imgAspect;
 		},
@@ -258,6 +269,7 @@ export function createFramePump(deps: FramePumpDeps) {
 		 *  never the surface, in the element the settled still then replaces it in. */
 		showStreamed(url: string) {
 			gpuShown = false;
+			drawnDraft = null;
 			streamShown = false;
 			frameUrl = url;
 		},
@@ -265,12 +277,14 @@ export function createFramePump(deps: FramePumpDeps) {
 		 *  the picture, never the surface, and stays so until a fetched frame replaces it. */
 		streamDrawn(aspect: number) {
 			gpuShown = false;
+			drawnDraft = null;
 			streamShown = true;
 			imgAspect = aspect;
 		},
 		/** The picture on screen is not the surface's any more (the setting went off). */
 		surfaceGone() {
 			gpuShown = false;
+			drawnDraft = null;
 		},
 		/** The `<img>` loaded: the aspect it has. */
 		pictureAspect(aspect: number) {
@@ -299,6 +313,7 @@ export function createFramePump(deps: FramePumpDeps) {
 			if (!deps.hasClips()) {
 				frameUrl = null;
 				gpuShown = false;
+				drawnDraft = null;
 				streamShown = false;
 				queued = null;
 				return;

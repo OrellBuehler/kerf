@@ -9,7 +9,7 @@ import { isKeyed } from './channels';
 import { withKeyframeAt } from './titles';
 import type { MovePlan } from './multi-move';
 import { DEFAULT_COLOR, DEFAULT_MASK, DEFAULT_TRANSFORM, clipDuration } from './types';
-import type { Clip, Color, Mask, PreviewDraft, Property, TextOverlay, Timeline, Transform } from './types';
+import type { Clip, Color, Mask, PreviewDraft, Property, TextOverlay, Timeline, Track, Transform } from './types';
 
 /** The numbers a transform key can hold (`setTf`'s `ANIM_KEYS`); crop is always the static transform. */
 const ANIMATABLE: ReadonlySet<string> = new Set(['scale', 'pos_x', 'pos_y', 'rotation', 'opacity']);
@@ -95,6 +95,78 @@ export function moveDraft(timeline: Timeline, plan: MovePlan | null): PreviewDra
 		clips.push({ track_id: g.trackId, clip: { ...at.clip, timeline_start: g.start } });
 	}
 	return clips.length ? { clips, overlays: [] } : null;
+}
+
+/** Two drafts that say the same: a gesture's pointer events that leave the edit as it was (a move held on
+ *  one frame) are not new frames to draw. */
+export function sameDraft(a: PreviewDraft | null, b: PreviewDraft | null): boolean {
+	return same(a, b);
+}
+
+function same(a: unknown, b: unknown): boolean {
+	if (Object.is(a, b)) return true;
+	if (typeof a !== 'object' || typeof b !== 'object' || a === null || b === null) return false;
+	if (Array.isArray(a) !== Array.isArray(b)) return false;
+	const x = a as Record<string, unknown>;
+	const y = b as Record<string, unknown>;
+	const keys = (o: Record<string, unknown>) => Object.keys(o).filter((k) => o[k] !== undefined);
+	const kx = keys(x);
+	return kx.length === keys(y).length && kx.every((k) => same(x[k], y[k]));
+}
+
+/** The one draft there is, and who wrote it (an Inspector row, the timeline, the Preview's title box). */
+export interface DraftSlot {
+	owner: symbol | null;
+	draft: PreviewDraft | null;
+}
+
+export const EMPTY_SLOT: DraftSlot = { owner: null, draft: null };
+
+/** The slot once `owner` wrote `draft`: its draft replaces whatever is there, but its `null` clears only its
+ *  own, so one gesture ending never takes another's frame away. The slot itself comes back when nothing
+ *  changes (the same writer, the same draft), so a pointer event that changes nothing asks for no frame. */
+export function putDraft(slot: DraftSlot, owner: symbol, draft: PreviewDraft | null): DraftSlot {
+	if (draft === null) return slot.owner === owner ? EMPTY_SLOT : slot;
+	if (slot.owner === owner && sameDraft(slot.draft, draft)) return slot;
+	return { owner, draft };
+}
+
+/** Whether the cut still holds everything `draft` names: an undo, or an agent's edit, may have taken a clip
+ *  or a title away under a gesture, and the backend refuses a draft that names one it does not hold. */
+export function draftHolds(draft: PreviewDraft, timeline: Timeline, overlays: readonly TextOverlay[]): boolean {
+	return (
+		draft.clips.every((d) => find(timeline, d.clip.id) && timeline.tracks.some((t) => t.id === d.track_id)) &&
+		draft.overlays.every((o) => overlays.some((held) => held.id === o.id))
+	);
+}
+
+/** A frame either side of the playhead, beyond any frame rate's. */
+const NEAR = 0.1;
+
+/** Whether `draft` changes the frame at `t`: a clip on a video track, where it is or where it goes, that is
+ *  at `t` (or near enough for a transition across one of its cuts to reach it), or a title on screen at `t`
+ *  either way. A draft that touches nothing there draws the frame the cut already draws, so it is not sent. */
+export function draftTouches(draft: PreviewDraft, timeline: Timeline, overlays: readonly TextOverlay[], t: number): boolean {
+	const track = (id: string) => timeline.tracks.find((tr) => tr.id === id);
+	/** How far a transition on these tracks reaches across a cut. */
+	const reach = (...tracks: (Track | undefined)[]) =>
+		NEAR + Math.max(0, ...tracks.flatMap((tr) => tr?.clips.map((c) => c.transition_in?.duration ?? 0) ?? []));
+	const covers = (c: Clip, r: number) => t >= c.timeline_start - r && t <= c.timeline_start + clipDuration(c) + r;
+	for (const d of draft.clips) {
+		const at = find(timeline, d.clip.id);
+		if (!at) return true;
+		const from = track(at.trackId);
+		const to = track(d.track_id);
+		if (from?.kind !== 'video' && to?.kind !== 'video') continue;
+		const r = reach(from, to) + (d.clip.transition_in?.duration ?? 0);
+		if (covers(at.clip, r) || covers(d.clip, r)) return true;
+	}
+	for (const o of draft.overlays) {
+		const was = overlays.find((held) => held.id === o.id);
+		if (!was) return true;
+		if ([was, o].some((x) => t >= x.start - NEAR && t <= x.end + NEAR)) return true;
+	}
+	return false;
 }
 
 /** A trim of one clip alone (no ripple, no partners following): the fields `trimEdit` writes. */

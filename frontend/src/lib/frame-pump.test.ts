@@ -128,6 +128,7 @@ interface Harness {
 	frames: {
 		frameUrl: string | null;
 		gpuShown: boolean;
+		drawnDraft: PreviewDraft | null;
 		imgAspect: number | null;
 		streamShown: boolean;
 		streamDrawn(aspect: number): void;
@@ -275,6 +276,35 @@ describe("a gesture's draft", () => {
 		expect(g.asked).toEqual(['jpeg@0']);
 		h.stop();
 		over.stop();
+	});
+
+	test('the frame on show says which draft the GPU drew it from, and a JPEG none', async () => {
+		let refuse = false;
+		const r = recorder({
+			gpu: async (t) =>
+				refuse
+					? { renderer: 'ffmpeg' as const, frame: `data:ffmpeg-${t}`, reasons: ['the draft was refused'], timings: null }
+					: { renderer: 'gpu' as const, frame: null, reasons: [], timings: null }
+		});
+		const h = harness({ enabled: true, overlaysCapable: true, ...r });
+		await settle();
+		expect(h.frames.gpuShown).toBe(true);
+		expect(h.frames.drawnDraft).toBeNull();
+		const first = drafted('c1');
+		h.draft = first;
+		await settle();
+		expect(h.frames.drawnDraft).toBe(first);
+		refuse = true;
+		h.draft = drafted('c2');
+		await settle();
+		expect(h.frames.gpuShown).toBe(false);
+		expect(h.frames.drawnDraft).toBeNull();
+		refuse = false;
+		h.draft = null;
+		await settle();
+		expect(h.frames.gpuShown).toBe(true);
+		expect(h.frames.drawnDraft).toBeNull();
+		h.stop();
 	});
 });
 

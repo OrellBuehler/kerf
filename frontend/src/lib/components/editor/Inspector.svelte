@@ -137,9 +137,9 @@
 			return titleMoveDraft(editor.overlays, ov.id, x ?? pose.x, y ?? pose.y, at.time);
 		};
 	const liveTitleSize: Live = (v, at) => (at.overlayId ? titleSizeDraft(editor.overlays, at.overlayId, v) : null);
-	/** The row's live value as the preview's draft; cleared when the gesture is over. */
-	const toPreview = (live: Live) => (v: number | null, at: Edit) => {
-		ui.previewDraft = v === null ? null : live(v, at);
+	/** The row's live value as the preview's draft, as that row's; cleared when its gesture is over. */
+	const toPreview = (live: Live) => (v: number | null, at: Edit, owner: symbol) => {
+		ui.setDraft(owner, v === null ? null : live(v, at));
 	};
 
 	/** Move a title to `x` / `y`, the other coordinate as it was sampled when the edit began. */
