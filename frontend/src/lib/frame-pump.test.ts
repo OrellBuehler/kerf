@@ -45,6 +45,7 @@ export function harness(env) {
 			streaming,
 			empty: false,
 			titlesShown: titles.length > 0,
+			handles: false,
 			trimMonitor,
 			guides: false,
 			covered

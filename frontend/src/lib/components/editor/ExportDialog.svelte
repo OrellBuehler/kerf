@@ -272,7 +272,8 @@
 	function exportFailed(e: unknown) {
 		const m = msg(e);
 		// A user-requested stop is not a failure — keep the dialog open quietly.
-		if (m === 'export cancelled') toast.info('Export cancelled');
+		// A stopped single pass of several files says it removed them all.
+		if (m.startsWith('export cancelled')) toast.info('E' + m.slice(1));
 		else toast.error(failure('Export failed', e));
 	}
 	async function render(finalOpts: ExportOptions) {
@@ -736,7 +737,7 @@
 						style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted);min-width:104px;text-align:right"
 					>
 						{#if progress?.waiting}{progress.waiting}…{:else}
-						{#if progress?.total != null && progress.total > 1}{(progress.variant ?? 0) + 1}/{progress.total} · {/if}{Math.round(
+						{#if progress?.together}{progress.total} at once · {:else if progress?.total != null && progress.total > 1}{(progress.variant ?? 0) + 1}/{progress.total} · {/if}{Math.round(
 							(progress?.fraction ?? 0) * 100
 						)}%{progress?.eta_secs != null ? ` · ${fmtEta(progress.eta_secs)} left` : ''}{/if}
 					</span>

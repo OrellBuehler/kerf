@@ -558,6 +558,33 @@ force), because the static `pos_x/pos_y` is not what an animated render reads;
 resizing always writes the static `size`. Pure logic (box math, keyframe upsert,
 row packing, snapping, span trim) is `src/lib/titles.ts`, bun-tested.
 
+**Transform handles in the Preview** (`TransformHandles.svelte`, pure math in `transform-handles.ts`). The selected clip's
+picture at the playhead (paused, not streaming, no proposal previewed, no trim monitor; not on a locked track, not a 360
+reframe) gets a box drawn **where the export puts it**: the canvas is `renderCanvas` (`export_format` without options — the
+delivery frame, else the first picture of the rendered cut, even sides, the delivery's fit), the box is
+`layer-geometry.ts`, a faithful port of kerf-core's `layer_geometry.rs` (crop / fit / second scale / rotate / overlay
+rounding, chroma grids, `pix_fmt_subsampling`) replayed against a Rust-written corpus (`core-render-plan.md`), at the
+clip's pose at the playhead (`transformAt`). A translucent picture of odd size, which the engine's geometry refuses for its
+pixels (FFmpeg's RGB round trip), is boxed as if opaque: opacity moves nothing; only a picture nothing draws (an empty
+crop) has no box. A click on a picture selects the topmost clip under it (later video tracks
+on top) and can carry straight into a move. Body = move, corners = scale about the centre, the knob = rotate, edges =
+crop — only under a Contain fit with position / scale / rotation unkeyed, and it moves the scale and position so the rest
+of the picture stays put (the export re-fits and re-centres a cropped window). Snapping (on with the timeline's snap
+toggle, **Alt** inverts it, 6 px) puts an edge or the centre of the bounds on the frame's edges and centre lines, the
+title-safe box and the platform chrome when the safe-area guides are drawn, and the other pictures' edges and centres;
+scale also stops at 100 %; rotation lands on a right angle within 5°, **Shift** turns in 15° steps and keeps a move to one
+axis — the tooltip names both with `settings.modLabel`. While held, the box is an exact ghost of the pose (D9: the picture
+under it settles on release) with a readout (`· key` when a keyed number is moving). **One `setTransformAt` on release**
+(`set_transform_at`: a keyed number keyed at the playhead, the rest static — one revision even when position x is keyed
+and y is not) at `keyTime` — the unrounded clip-local playhead, the moment the pose is sampled at (a 1 ms grid can land
+after it, where a hold still reads the old value); the Inspector's keyed writes use it too, so both hit one key. Only a
+number whose value, rounded as the gesture writes it, differs from the start is sent, so the other axis of a Shift move
+gets no key and a drag back to the start writes nothing; Escape / pointercancel / lost capture / blur abandon it.
+The handles count as page overlays for `routePreview` (`handles`), so on an X11 child-window surface the frame falls back
+to the JPEG while they show (a click on the surface itself never reaches the page there: select the clip in the timeline);
+under a transparent webview they draw over the surface. Not done: separate X / Y scale (the model has one `scale`; it
+needs a model, export-graph and GPU change), a live GPU picture during the drag (A3).
+
 
 The timeline toolbar carries a **delivery frame picker** (also View › Delivery frame; Source / 16:9 / 9:16 / 1:1 / 4:5,
 from `src/lib/delivery-formats.ts`, bun-tested; with a frame set the toolbar's menu adds *Footage: fill & crop / fit &
@@ -819,7 +846,10 @@ named by shape (`variantPath`, the bun-tested mirror of
 per-file row in the platform check judged at that file's frame (`platformCheck([w, h])`),
 in place of the single-file line — with shapes picked, the Scaling rows hide (each
 delivery brings its own resolution and fit) and the button reads `Export N
-files`; `export-progress` then carries `variant` / `total`. The
+files`; `export-progress` then carries `variant` / `total`, and `together` when the files render in one
+pass (the default; `exportVariants`' `singlePass`), which the progress text shows as `3 at once ·`
+instead of `1/3 ·`; a stopped single pass rejects with `export cancelled; all N files were removed`, which
+the dialog's toast repeats. The
 **Transcript tab** of the library (`TranscriptPanel.svelte`, over the pure, bun-tested
 `src/lib/transcript.ts`) **is an editing surface**: lines resolve to the clip carrying them,
 click seeks, the playhead line highlights, and `×` cuts the sentence from the timeline

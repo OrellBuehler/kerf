@@ -493,6 +493,9 @@ impl LayerGeometry {
 }
 
 #[cfg(test)]
+mod corpus;
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
