@@ -2043,6 +2043,24 @@ fn a_keyed_colour_is_the_eq_of_each_frame() {
         20,
         EXACT,
     );
+    // The outgoing clip of a dissolve plays on past its end (its tail) with its `eq` still running: the curve holds its
+    // last value there.
+    let mut leaving = colour_keyed(&m.testsrc, &all, &linear_keys);
+    leaving.timeline_start = 0.0;
+    let mut entering = clip(&m.bars, 0.5, 1.5, 1.0);
+    entering.transition_in = Some(Transition {
+        kind: TransitionKind::Crossfade,
+        duration: 0.5,
+    });
+    run_colour(
+        "keyed colour/outgoing clip on its tail",
+        &timeline(vec![vec![leaving, entering]], None),
+        &[m.testsrc.clone(), m.bars.clone()],
+        30.0,
+        2.0,
+        20,
+        EXACT,
+    );
     // Beside a keyed opacity: one clip, an `eq` and a `geq` alpha each written per frame.
     let over_the_bars = |c: Clip| timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None);
     let two = [m.bars.clone(), m.testsrc.clone()];

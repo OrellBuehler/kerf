@@ -423,7 +423,7 @@ pub struct Animated {
     /// colour like a static one; an export frame carries the numbers `eq` evaluates at that frame
     /// ([`PlanLayer::color`]) and is refused until the compositor says it draws them
     /// (`GpuCaps::keyed_color`). The clip has an `eq` in its chain on every frame of it, whether
-    /// or not this frame's numbers are neutral ([`RenderPlan::graded`]).
+    /// or not this frame's numbers are neutral (`RenderPlan::graded`).
     pub color: bool,
     /// Some number of the mask is keyed: the export's mask `geq` reads it per frame. A still plan
     /// draws the mask sampled at its instant ([`Clip::mask_at`]) as a static one; an export frame
