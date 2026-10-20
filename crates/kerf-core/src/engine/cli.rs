@@ -7820,6 +7820,59 @@ fn keyframe_expr(points: &[(f64, f64)], tvar: &str, start: f64) -> String {
     )
 }
 
+/// What [`keyframe_expr`]`(points, _, start)` evaluates to at time `t`, in the expression's own
+/// `double` arithmetic and order (`av_expr` parses the constants back to these `f64`s, subtracts
+/// as it adds the negation and multiplies by its sign 1): the same segment, picked by the same
+/// comparisons, and the same line through it. A filter that keys a number per frame (`geq`'s
+/// opacity) can be followed to the last bit.
+pub(crate) fn keyframe_value(points: &[(f64, f64)], t: f64, start: f64) -> f64 {
+    // (A curve is sorted already; the stable sort of one that is changes nothing, so it is not copied.)
+    let sorted;
+    let pts: &[(f64, f64)] = if points.windows(2).all(|w| w[0].0.total_cmp(&w[1].0).is_le()) {
+        points
+    } else {
+        let mut copy = points.to_vec();
+        copy.sort_by(|a, b| a.0.total_cmp(&b.0));
+        sorted = copy;
+        &sorted
+    };
+    match pts.len() {
+        0 => return 0.0,
+        1 => return pts[0].1,
+        _ => {}
+    }
+    let lt = t - start;
+    let segment = |w: usize| {
+        let (t0, v0) = pts[w];
+        let (t1, v1) = pts[w + 1];
+        if (t1 - t0).abs() < 1e-9 {
+            v0
+        } else {
+            v0 + (v1 - v0) * (lt - t0) / (t1 - t0)
+        }
+    };
+    if lt < pts[0].0 {
+        return pts[0].1;
+    }
+    let last = pts[pts.len() - 1];
+    if pts.len() > KEYFRAME_TREE_POINTS {
+        if lt >= last.0 {
+            return last.1;
+        }
+        let (mut lo, mut hi) = (0, pts.len() - 1);
+        while hi - lo > 1 {
+            let mid = (lo + hi) / 2;
+            if lt < pts[mid].0 {
+                hi = mid;
+            } else {
+                lo = mid;
+            }
+        }
+        return segment(lo);
+    }
+    (0..pts.len() - 1).find(|&w| lt < pts[w + 1].0).map_or(last.1, segment)
+}
+
 /// The value inside segment `w` (`pts[w]` to `pts[w + 1]`): a straight line, or the first
 /// value for a step (equal times).
 fn keyframe_segment(pts: &[(f64, f64)], w: usize, lt: &str) -> String {

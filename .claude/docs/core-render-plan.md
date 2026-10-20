@@ -271,7 +271,7 @@
   evaluated graph.
   **What the compositor may draw is data**: `GpuCaps` (`Compositor::caps()`: the bits `motion`, `fades`,
   `transitions`, `dip_white`, `keyed_opacity`, `keyed_zoom`, `keyed_color`, `mask`, `text`, `reframe`, `hdr` and an
-  `EffectKinds` bitset; today `GpuCaps::A0` plus every one of them but `keyed_opacity`, `keyed_color`, `reframe`, `hdr`
+  `EffectKinds` bitset; today `GpuCaps::A0` plus every one of them but `keyed_color`, `reframe`, `hdr`
   with every effect kind), and **`RenderPlan::reasons(&caps,
   size)` is a pure function of the plan's fields** returning `Unsupported` values whose
   `Display` is the message the plan has always given — nothing is decided while planning,
@@ -280,8 +280,15 @@
   keyframed zoom is refused until `caps.keyed_zoom` (`KeyedZoom`: the export draws it last, at the output
   frame's time; a compositor that sets the cap draws the grade, the effects, the mask and the fades at the fit size and zooms after
   them), and
-  keyed opacity (a `geq` alpha, not the RGB round trip), a non-`yuv420p` delivery and a
-  gif are refused. **With `keyed_zoom` the plan still refuses a rotation, an opacity below 1 and a dip to white in front of a moving
+  keyed opacity until `caps.keyed_opacity` (`KeyedOpacity`: a `geq` alpha, not the RGB round trip), a non-`yuv420p` delivery and a
+  gif are refused. **`PlanLayer::keyed_alpha`** is that `geq`'s alpha in an export frame, `(int)(opacity(T) * 255)`: the opacity
+  curve evaluated by `engine::keyframe_value`, which is `keyframe_expr`'s arithmetic in its own order (the same segment by the same
+  comparisons, the constants the `f64`s `av_expr` parses back; `sweep.rs` holds it to the evaluated text to the bit), at `T` =
+  `ffmpeg_frame_time(k)` on the clip's `fps` grid, as `geq` reads `pts * av_q2d(tb)`; `None` in a still (which samples the opacity
+  and draws it like a static one) and for a curve that never leaves 1 (no `geq`). That `geq` is the mask's too, so the opacity a
+  mask, a chroma key or a moving zoom is judged by is the layer's `keyed_alpha < 255` as well as the sampled opacity (`mask_refusal`,
+  `zoom_order_refusal`), and **a chroma key under a keyed opacity is refused for the clip** (`Effects`, every frame of it: `geq` reads the
+  key's alpha plane, one in at the edge on 6.1). **With `keyed_zoom` the plan still refuses a rotation, an opacity below 1 and a dip to white in front of a moving
   zoom** (`ZoomBehind(layer, what)`, Still and Motion alike: the rotated alpha plane and the RGB round trip would have to be scaled
   with the zoom), and without it a Still refuses a grade, rotation, opacity, mask or effect in front of one. The old API stays: `gpu_supported()` / `unsupported_reasons()` (an owned
   `Vec<String>`) / `unsupported_reasons_at(size)` / `gpu_supported_at(size)` are

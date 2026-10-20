@@ -1613,6 +1613,138 @@ fn keyframed_position_and_rotation_in_an_export_frame() {
     );
 }
 
+/// A keyed opacity is a `geq` alpha, `(int)(opacity(T) * 255)`, which the plan evaluates in the expression's own
+/// arithmetic (`PlanLayer::keyed_alpha`): blended at the picture's size it is exact.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_keyed_opacity_is_the_geq_alpha_of_each_frame() {
+    use kerf_core::{Easing, Property, PropertyKey};
+    let m = media();
+    let fading = |asset: &Asset, keys: Vec<PropertyKey>| {
+        let mut c = clip(asset, 0.5, 1.5, 0.0);
+        c.set_property_keys(Property::Opacity, keys);
+        c
+    };
+    let key = |time: f64, value: f64| PropertyKey::new(time, value);
+    let eased = |time: f64, value: f64, easing: Easing| PropertyKey { time, value, easing };
+    let over_the_bars = |c: Clip| timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None);
+    let assets = [m.bars.clone(), m.testsrc.clone()];
+    for (name, keys) in [
+        ("linear", vec![key(0.0, 1.0), key(1.0, 0.2)]),
+        ("from nothing", vec![key(0.1, 0.0), key(0.9, 1.0)]),
+        ("ease in-out", vec![eased(0.0, 0.9, Easing::EaseInOut), key(1.0, 0.1)]),
+        ("hold", vec![eased(0.0, 0.7, Easing::Hold), key(0.5, 0.3), key(1.0, 0.8)]),
+        (
+            "bezier, off the frame grid",
+            vec![
+                eased(
+                    0.013,
+                    0.95,
+                    Easing::Bezier {
+                        x1: 0.2,
+                        y1: 0.9,
+                        x2: 0.7,
+                        y2: 0.1,
+                    },
+                ),
+                key(0.517, 0.05),
+                key(0.871, 0.6),
+            ],
+        ),
+        (
+            "many eased keys",
+            (0..10)
+                .map(|i| eased(f64::from(i) * 0.1, 0.15 + 0.08 * f64::from(i % 9), Easing::EaseInOut))
+                .collect(),
+        ),
+    ] {
+        let tl = over_the_bars(fading(&m.testsrc, keys));
+        run(&format!("keyed opacity/{name}"), &tl, &assets, 30.0, 1.0, EXACT);
+    }
+    // At 29.97 the clip's time is another grid of doubles.
+    let tl = over_the_bars(fading(&m.testsrc, vec![key(0.0, 1.0), key(1.0, 0.0)]));
+    run("keyed opacity/29.97", &tl, &assets, 30000.0 / 1001.0, 1.0, EXACT);
+    // Through the clip's fades and the dissolve it enters by: both act on the `geq`'s alpha plane.
+    let mut faded = fading(&m.testsrc, vec![key(0.0, 0.4), key(1.0, 0.9)]);
+    faded.fade_in = 0.3;
+    faded.fade_out = 0.3;
+    run("keyed opacity/with fades", &over_the_bars(faded), &assets, 30.0, 1.0, EXACT);
+    let out = clip(&m.bars, 0.5, 1.5, 0.0);
+    let mut inc = clip(&m.testsrc, 0.5, 1.5, 1.0);
+    inc.set_property_keys(Property::Opacity, vec![key(0.0, 0.3), key(1.0, 0.8)]);
+    inc.transition_in = Some(Transition {
+        kind: TransitionKind::Crossfade,
+        duration: 0.5,
+    });
+    run(
+        "keyed opacity/dissolve",
+        &timeline(vec![vec![out, inc]], None),
+        &assets,
+        30.0,
+        2.0,
+        EXACT,
+    );
+    // Scaled and moving: the scaler's level, as for any scaled layer.
+    let mut pip = fading(&m.testsrc, vec![key(0.0, 0.2), key(1.0, 0.9)]);
+    pip.transform.scale = 0.6;
+    pip.set_property_keys(Property::PosX, vec![key(0.0, -0.2), key(1.0, 0.2)]);
+    run("keyed opacity/moving pip", &over_the_bars(pip), &assets, 30.0, 1.0, SCALED);
+    let mut odd = fading(&m.testsrc, vec![key(0.0, 0.5), key(1.0, 0.7)]);
+    odd.transform.scale = 0.33;
+    run("keyed opacity/odd 211x118", &over_the_bars(odd), &assets, 30.0, 1.0, SCALED);
+    // Under a mask one `geq` multiplies the mask by the opacity: refused below 1.
+    let mut masked = fading(&m.testsrc, vec![key(0.0, 0.5), key(1.0, 0.7)]);
+    masked.mask = Some(mask_of(kerf_core::MaskShape::Ellipse, 0.1, false));
+    refused(
+        "keyed opacity/under a mask",
+        &over_the_bars(masked),
+        &assets,
+        &at_fps(30.0),
+        upto(1.0, 30.0),
+        "below full opacity",
+    );
+    // ... and drawn while the curve holds 1 (its `geq` writes the mask), refused once it falls.
+    let mut masked = fading(&m.testsrc, vec![key(0.0, 1.0), key(0.5, 1.0), key(1.0, 0.3)]);
+    masked.mask = Some(mask_of(kerf_core::MaskShape::Ellipse, 0.1, false));
+    run_refusing(
+        "keyed opacity/under a mask, 1 then falling",
+        &over_the_bars(masked),
+        &assets,
+        30.0,
+        1.0,
+        EXACT,
+        &refusing("MaskWith", |u| matches!(u, Unsupported::MaskWith(..))),
+    );
+    // Under a chroma key the same `geq` reads the key's alpha plane (`alpha(X,Y)`), and on a build whose `geq` reads a
+    // plane's last column and row one in (6.1) that is the key's alpha one in: measured 21 levels of luma at the
+    // edge, on the frames where the curve holds 1. Refused for the clip, on those frames too (3 is at 255).
+    let mut keyed_out = fading(&m.testsrc, vec![key(0.0, 1.0), key(0.5, 1.0), key(1.0, 0.3)]);
+    keyed_out.effects = vec![crate::key("green", 0.2, 0.2)];
+    let tl = over_the_bars(keyed_out);
+    for frames in [3..4, upto(1.0, 30.0)] {
+        refused(
+            "keyed opacity/under a chroma key",
+            &tl,
+            &assets,
+            &at_fps(30.0),
+            frames,
+            "under a keyed opacity",
+        );
+    }
+    // Turned: the `rotate` that follows the `geq` turns its alpha plane with the picture.
+    let mut turned = fading(&m.smooth, vec![key(0.0, 0.3), key(1.0, 0.9)]);
+    turned.transform.rotation = 12.0;
+    turned.transform.scale = 0.6;
+    run_rotated(
+        "keyed opacity/rotated",
+        &timeline(vec![vec![clip(&m.black, 0.5, 1.5, 0.0)], vec![turned]], None),
+        &[m.black.clone(), m.smooth.clone()],
+        30.0,
+        1.0,
+        ROTATED,
+    );
+}
+
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn a_rotated_layer_fades_on_an_alpha_plane() {
@@ -2465,6 +2597,33 @@ fn a_moving_zoom_behind_a_rotation_or_an_opacity_is_refused() {
         upto(1.0, 30.0),
         "an opacity below 1",
     );
+    // A keyed opacity that holds 1 and then falls (the keys take every number): while it holds, its `geq` is
+    // the identity on the alpha plane, copying Y, U and V (one in at the edge on 6.1) ahead of the zoom, and the
+    // frame is drawn; once it falls the alpha plane would be scaled with the zoom, and the frame is refused.
+    let mut fading = zooming(&m.testsrc, 1.0, 1.6, (0.0, 0.0));
+    fading.keyframes = vec![
+        zoom_key(0.0, 1.0, 0.0, 0.0),
+        zoom_key(0.5, 1.3, 0.0, 0.0),
+        kerf_core::Keyframe {
+            opacity: 0.3,
+            ..zoom_key(1.0, 1.6, 0.0, 0.0)
+        },
+    ];
+    let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![fading]], None);
+    check_motion(Check {
+        case: "keyed opacity + moving zoom (curve holds 1, then falls)",
+        tl: &tl,
+        assets: &assets,
+        opts: at_fps(30.0),
+        frames: upto(1.0, 30.0),
+        limits: SCALED,
+        look: &LOOK_ZOOM,
+        rotated: false,
+        refusing: Some(&refusing(
+            "ZoomBehind(an opacity below 1)",
+            |u| matches!(u, Unsupported::ZoomBehind(_, w) if w.contains("opacity below 1")),
+        )),
+    });
     let out = clip(&m.bars, 0.5, 1.5, 0.0);
     let mut inc = zooming(&m.testsrc, 1.0, 1.4, (0.0, 0.0));
     inc.timeline_start = 1.0;

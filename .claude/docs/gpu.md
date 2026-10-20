@@ -11,7 +11,7 @@ Windows) and nothing may depend on an optional wgpu feature. **A GPU failure is 
 error, not a panic**: every unit of wgpu work runs in out-of-memory / validation /
 internal error scopes (`Gpu::guarded`), anything uncaptured is logged and remembered,
 `Compositor::new` and `composite` return `Result` (and `Compositor::caps()` says what it
-draws, `GpuCaps::A0` plus `text`, `motion`, `fades`, `transitions`, `dip_white`, `keyed_zoom`, `mask` and the blur / sharpen / grayscale / invert / vignette / chroma key `effects` today, which `composite` / `render_plan` judge the plan by), and a lost device is tracked — every
+draws, `GpuCaps::A0` plus `text`, `motion`, `fades`, `transitions`, `dip_white`, `keyed_zoom`, `keyed_opacity`, `mask` and the blur / sharpen / grayscale / invert / vignette / chroma key `effects` today, which `composite` / `render_plan` judge the plan by), and a lost device is tracked — every
 later call is `GpuError::DeviceLost` and the **owner builds a new `Gpu` and
 `Compositor`** (the device is not recreated behind the caller's back).
 
@@ -640,9 +640,26 @@ before the zoom acts at the **fit size** and the zoom magnifies it (a blur grows
 * **FFmpeg 6.1's `geq` reads a plane's last column and row one in** (its bilinear read clamps to `w - 2` / `h - 2`): the masked picture's right-most
   column and bottom row, on all three planes, are their neighbours'; 9.0 copies them. `kerf_core::geq_edge()` measures which (the filter over a 16x16
   picture of distinct samples, once per process, outside any lock; `Unknown`, not a guess, retried after a backoff). The blend then reads the layer one in
-  (`ComposeParams::edge`, a letterbox included), a late zoom's planes are shifted before its scale (`fs_edge`), and a mask is `Unsupported` while the build
-  is `Unknown`. `kerf_gpu::prepare(&plan)` measures it ahead of the render lock; `Compositor::with_geq_edge` pins it.
+  (`ComposeParams::edge`, a letterbox included), a late zoom's planes are shifted before its scale (`fs_edge`), and a mask or a keyed opacity is `Unsupported` while the
+  build is `Unknown`. `kerf_gpu::prepare(&plan)` measures it ahead of the render lock; `Compositor::with_geq_edge` pins it.
 * Refused (`MaskWith`): a mask on a **rotated** layer, or one below full opacity (the sampled one: its alpha goes through `colorchannelmixer`).
+
+**Keyed opacity** (export frames). FFmpeg's chain has a `geq` whose alpha is `(int)(opacity(T) * 255)` (`T` the frame's time on the
+clip's `fps` grid) where a constant opacity takes `colorchannelmixer` and the RGB round trip. The plan evaluates it
+(`PlanLayer::keyed_alpha`, `core-render-plan.md`) and the compositor blends with that one alpha in integers (`LayerFades::alpha`),
+no round trip; the clip's fades and a dissolve's ramp act on it as on any alpha plane. The `geq` also copies Y, U and V through
+`lum` / `cb` / `cr`, so on a build whose `geq` reads a plane's last column and row one in (6.1) the blend reads them so too
+(`mask_edge`, as for a mask). Byte for byte at the picture's size (linear, eased, held, bezier off the frame grid, a tree of many
+keys, 29.97, with fades, in a dissolve); the scaler's level on a pip or an odd size; `ROTATED` turned. A mask with it is drawn
+while the curve holds 1 (the `geq` writes the mask, byte for byte) and refused on the frames below it (`MaskWith`: one `geq`
+multiplies both); **the alpha judged is the `geq`'s own (`keyed_alpha < 255`), not the sampled opacity**, which can sit on the
+other side of 1 by the last bit. **Before a moving zoom** it is drawn on the frames where the curve holds 1 (the `geq` is the identity on
+the alpha plane and copies Y, U, V: the zoom-last path of a mask, `edge_planes` ahead of the scale; `SCALED`, measured 1 / 1 on 6.1.1 and
+9.0.2) and refused once it falls (`ZoomBehind`: its alpha plane would be scaled with the zoom). A **chroma key under it is refused for the clip** (`Effects`, on the frames at 255 too, so a clip is
+not drawn by two renderers in turn): that `geq` reads the key's plane (`alpha(X,Y)`), and on a build that reads a plane's last
+column and row one in (6.1) it reads the key's alpha there one in, which the compositor's key does not (measured on the frames at
+255: luma 21 off at the edge, 2636 samples over 14 frames; 9.0.2 is exact, so shifting the key's alpha under `mask_edge` is the
+follow-up, with its zoom-last variant). The compositor refuses the combination itself too.
 
 **Effects.**
 
@@ -686,7 +703,7 @@ before the zoom acts at the **fit size** and the zoom magnifies it (a blur grows
   format: other planes, another dither course), a vignette map over the device's storage-buffer limit; a chroma key after a scale or a
   blur (its alpha moves by up to 1/blend levels for a level of chroma, and a blend of 0 flips it 0 to 255: drawn only on chroma that is
   FFmpeg's to the level), on a picture that is not `yuv420p` or whose format says full range, on a rotated layer or one below full
-  opacity, on one narrower or shorter than 2, or with a similarity or a blend `chromakey` refuses (0.00001 to 1, 0 to 1); `MaskWith`: a mask over a chroma key (`geq` multiplies the key's alpha). A sigma outside 0 to 1024
+  opacity, on one narrower or shorter than 2, or with a similarity or a blend `chromakey` refuses (0.00001 to 1, 0 to 1), or under a keyed opacity (see above); `MaskWith`: a mask over a chroma key (`geq` multiplies the key's alpha). A sigma outside 0 to 1024
   or an amount outside -2 to 5 (FFmpeg's options refuse them too), a blur over the device's storage-buffer limit, and a **sharpen that amplifies a difference upstream of it** (judged with the geometry, so by render size): FFmpeg's scale or blur is a level from ours, and `unsharp` carries it through at worst `1 + 2|amount|` at an edge sample and rounds up a level more with each further sharpen (its `>> 16` floors). From the first source (a scale before the effects: every stage, or the fit scale when a zoom comes last; or a blur with sigma > 0) the worst case starts at 1 and each later sharpen that is not zero at `unsharp`'s 16 bits adds `ceil(2 * err * |amount|)`; the frame is refused when it passes 2. So one sharpen of at most 0.5 is drawn (0.6 is not), and any second one is refused, however small. With no source upstream a sharpen is exact at any amount, chained or not, and a blur after it counts for nothing. `Matte`: a blur, a sharpen, a vignette or a chroma key on a
   letterbox (they would see the bars as picture; tables and a grade carry the bars through). By the picture (`effect_on_picture_refusal`): an invert,
   blur or sharpen on a **full-range** picture or one whose format was never recorded (`maybe_full_range_in(policy)`: where FFmpeg 9 negotiates the range this
@@ -724,8 +741,8 @@ a dissolve, dip, slide or push into a zooming clip and out of one) hold the boun
 
 | Bound (Y / UV) | Cases | Why |
 | --- | --- | --- |
-| 0 | a mask at the picture's size (20 of 27 mask rows), grayscale, invert, sharpen, a vignette (every frame of the run) and a chroma key (its fades and dissolve included) at the picture's size | integer arithmetic, reproduced |
-| 1 (`SCALED`) | a layer the compositor scales, a mask or a vignette on it, a one-stage zoom | swscale's x86 scaler is not bit-exact with the C arithmetic the shader follows |
+| 0 | a mask at the picture's size (20 of 27 mask rows), grayscale, invert, sharpen, a vignette (every frame of the run), a chroma key and a keyed opacity (the fades and dissolve of each included) at the picture's size | integer arithmetic, reproduced |
+| 1 (`SCALED`) | a layer the compositor scales, a mask, a vignette or a keyed opacity on it, a one-stage zoom | swscale's x86 scaler is not bit-exact with the C arithmetic the shader follows |
 | 1 (`EFFECT`) | a blur at the picture's size, and a blur then a vignette (measured 0: the vignette's factor is at most 1) | `gblur`'s SIMD summation order (above) |
 | 2 | a layer the compositor scales *and* makes translucent, no effect (`tests/playback.rs`, `play/pip/translucent and scaled`, measured Y 2 / UV 2 on both FFmpegs); `EFFECT_SCALED`: a blur, grayscale or invert on a scaled or translucent layer; a blur then a sharpen of at most 0.5 even unscaled and opaque (the blur's level times the gain); a sharpen of at most 0.5 after a scale. `CASCADED`: a zoom (the fit scale, then the zoom's). `ZOOMED_MASK`: a soft mask edge, or a chroma key's, on a zoomed picture (measured 2 / 2). Rotated, graded and scaled, dip to white (Y three on BT.709, `WHITE_709`) | two of the causes above on one sample; the RGB kernel for white |
 
@@ -773,7 +790,7 @@ the **unmeasured-policy** case (`Unknown`: BT.601 stacks drawn, BT.709 / BT.2020
 the **full-range grading** cases (a graded `yuvj` clip, and a graded layer in a stack with
 one, refused; ungraded and limited-range controls drawn),
 and **refusals** (an EXIF-oriented JPEG, FFV1 `yuva420p`, the same with the pixel
-format unrecorded, a translucent odd layer, a moving zoom behind a rotation, an opacity below 1 or a dip to white, a vignette on a 4:4:4 picture or a letterbox, a chroma key on a pip, after a blur, on a 4:4:4 picture, under a mask or on a rotated layer, a mask on a rotated or a translucent layer, a blur on a letterbox, an invert / blur / sharpen on a full-range picture, an invert on a gray one) —
+format unrecorded, a translucent odd layer, a moving zoom behind a rotation, an opacity below 1 or a dip to white, a vignette on a 4:4:4 picture or a letterbox, a chroma key on a pip, after a blur, on a 4:4:4 picture, under a mask or a keyed opacity or on a rotated layer, a mask on a rotated or a translucent layer, a blur on a letterbox, an invert / blur / sharpen on a full-range picture, an invert on a gray one) —
 each of which FFmpeg still renders (and a fade to black or white on a translucent layer, a dip to white on a rotated, letterboxed, odd, resized or non-`yuv420p` layer or beside a black fade, a fade on a full-range picture under FFmpeg 9), **transitions** (`transition/`, `transition-kind/`, `fade/`: every kind and a clip's own fades in a still, see
 above), **a moving zoom last, masks and effects** (`zoom/`, `zoom+mask/`, `mask/`, `effect/`, and `effect-planes/`: the blur, sharpen, tables and vignette plane by plane against the real filters, all sizes), and **text** (the `text/` family: the app's title and
 caption styles, positions and edges, boxes, colours, sizes, keyframed and overlapping overlays, escapes, installed fonts,

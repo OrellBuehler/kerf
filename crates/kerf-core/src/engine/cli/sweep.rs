@@ -797,6 +797,71 @@ fn a_keyed_volume_expression_is_the_curve_at_every_time_on_the_clips_own_clock()
 }
 
 #[test]
+fn a_keyed_value_is_its_expression_to_the_last_bit() {
+    let key = |time: f64, value: f64, easing: Easing| PropertyKey { time, value, easing };
+    let mut clip = make_clip(uuid::Uuid::new_v4(), 0.0, 20.0, 1.25);
+    let eased = [
+        Easing::Linear,
+        Easing::EaseIn,
+        Easing::EaseOut,
+        Easing::EaseInOut,
+        Easing::Hold,
+        Easing::Bezier {
+            x1: 0.3,
+            y1: 0.1,
+            x2: 0.7,
+            y2: 0.9,
+        },
+    ];
+    // A few keys (a chain), many eased ones (a tree), a step, and off-grid times.
+    let curves = vec![
+        vec![key(0.0, 1.0, Easing::Linear), key(1.0, 0.3, Easing::Linear)],
+        vec![
+            key(0.1, 0.2, Easing::EaseInOut),
+            key(0.7, 0.9, Easing::Linear),
+            key(0.7, 0.4, Easing::Linear),
+            key(2.3, 0.0, Easing::Linear),
+        ],
+        (0..9)
+            .map(|i| {
+                key(
+                    f64::from(i) * 0.37,
+                    0.1 + 0.1 * f64::from(i % 7),
+                    eased[i as usize % eased.len()],
+                )
+            })
+            .collect(),
+    ];
+    for keys in curves {
+        clip.set_property_keys(Property::Opacity, keys);
+        let points = clip.property_curve(Property::Opacity);
+        let expr = keyframe_expr(&points, "T", clip.timeline_start);
+        // Points out of order are sorted first, as the expression does.
+        let backwards: Vec<_> = points.iter().rev().copied().collect();
+        let backwards_expr = keyframe_expr(&backwards, "T", clip.timeline_start);
+        for k in 0..240u64 {
+            for (num, den) in [(30, 1), (30000, 1001), (25, 1), (24000, 1001)] {
+                let t = ffmpeg_frame_time(k, num, den);
+                let want = eval(&expr, &[("T", t)]);
+                assert_eq!(
+                    keyframe_value(&backwards, t, clip.timeline_start).to_bits(),
+                    eval(&backwards_expr, &[("T", t)]).to_bits(),
+                    "{} points, reversed, at {t}",
+                    points.len()
+                );
+                let got = keyframe_value(&points, t, clip.timeline_start);
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "{} points at {t}: {got} against {want}",
+                    points.len()
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn an_unkeyed_volume_is_the_gain_it_always_was() {
     let mut asset = test_asset(vec![
         video_stream(1920, 1080, 30.0),

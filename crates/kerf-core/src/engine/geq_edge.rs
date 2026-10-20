@@ -1,7 +1,8 @@
 //! How this ffmpeg's `geq` reads the last column and the last row of a plane.
 //!
-//! A mask is `geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':a='(keep)*alpha(X,Y)'`: the three colour
-//! planes are copied through `lum` / `cb` / `cr` and the alpha plane is rewritten. `geq` reads a
+//! A mask is `geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':a='(keep)*alpha(X,Y)'` (a keyed opacity is
+//! the same `geq` with its curve for `keep`): the three colour planes are copied through `lum` /
+//! `cb` / `cr` and the alpha plane is rewritten. `geq` reads a
 //! sample with bilinear interpolation by default, and FFmpeg 6.1 clamps the position to
 //! `0..=w-2` and `0..=h-2` first (`av_clipd(x, 0, w - 2)`), so at the last column and the last row
 //! the "copy" returns the sample **one in**: the masked picture's right-most column and bottom row

@@ -513,7 +513,7 @@ fn bench_a_mask_a_blur_and_a_moving_zoom() {
         eprintln!("skipped: set KERF_BENCH=1 to run the benchmark");
         return;
     }
-    use kerf_core::{Container, Delivery, Fit, Keyframe, Mask, MaskShape, RateControl, VideoEffect};
+    use kerf_core::{Container, Delivery, Fit, Keyframe, Mask, MaskShape, Property, PropertyKey, RateControl, VideoEffect};
     let gpu = Gpu::new(GpuOptions::for_tests()).expect("a GPU adapter");
     let info = gpu.adapter_info().clone();
     let comp = Compositor::new(gpu).expect("compositor");
@@ -554,6 +554,15 @@ fn bench_a_mask_a_blur_and_a_moving_zoom() {
             Box::new(|c| c.effects = vec![VideoEffect::Sharpen { amount: 0.5 }]),
         ),
         ("vignette", Box::new(|c| c.effects = vec![VideoEffect::Vignette])),
+        (
+            "keyed opacity 1 -> 0.3",
+            Box::new(|c| {
+                c.set_property_keys(
+                    Property::Opacity,
+                    vec![PropertyKey::new(0.0, 1.0), PropertyKey::new(2.0, 0.3)],
+                );
+            }),
+        ),
         (
             "moving zoom 1 -> 1.25",
             Box::new(move |c| c.keyframes = vec![key(0.0, 1.0, 0.0), key(2.0, 1.25, -0.05)]),
