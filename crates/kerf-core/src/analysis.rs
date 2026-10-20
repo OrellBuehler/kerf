@@ -1423,11 +1423,12 @@ mod tests {
             })
         };
         until("the step to say it is waiting", || !stages.lock().unwrap().is_empty());
-        // It has been round the gate again since saying so, and the proxy still has the slot: the
-        // step is queued, not started.
+        // It has been round the gate twice more since saying so (the first look can be the immediate
+        // re-poll after the announcement, so two make a full poll interval), and the proxy still has
+        // the slot: the step is queued, not started.
         let looked = looks.load(Ordering::SeqCst);
-        until("the queued step to look at the gate again", || {
-            looks.load(Ordering::SeqCst) > looked
+        until("the queued step to look at the gate twice more", || {
+            looks.load(Ordering::SeqCst) >= looked + 2
         });
         {
             let said = stages.lock().unwrap();

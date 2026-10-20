@@ -6143,8 +6143,10 @@ mod tests {
     /// `connect-src` blocking `_app/version.json` — SvelteKit fetches it from the app's own origin
     /// (`tauri://localhost`, `http://tauri.localhost`) whenever the window becomes visible or regains
     /// focus — so `connect-src` has `'self'`; scripts (the limiter worklet included) stay `'self'` only.
-    /// Every directive is pinned, and the set of them, in the packaged policy and in the dev one (which
-    /// adds the dev server and the inline script its hot reload needs, and nothing else).
+    /// Every directive is pinned, and the set of them, in the packaged policy and in the dev one. The dev
+    /// policy differs in three ways: `script-src` adds `'unsafe-inline'` (the inline script hot reload
+    /// needs), `connect-src` names the dev server (http and ws) instead of `'self'`, and there is no
+    /// `form-action`.
     #[test]
     fn the_packaged_csp_admits_what_the_app_loads_and_nothing_more() {
         let conf: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
