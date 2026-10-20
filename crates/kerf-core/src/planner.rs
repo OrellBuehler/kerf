@@ -58,7 +58,7 @@ use crate::clip_timing::{
     clip_seek, clip_source_window, clips_with_fx, ffmpeg_frame_time, graph_bt709_labels, ClipFx, ClipTiming, FadeEdge, FadeStep,
     MotionKeys, Rational,
 };
-use crate::engine::{render_geometry, safe_color, valid_color, Container, ExportOptions};
+use crate::engine::{keyframe_value, render_geometry, safe_color, valid_color, Container, ExportOptions};
 use crate::error::{Error, Result};
 use crate::frame_pick::{FpsPick, Pick};
 use crate::layer_geometry::Keyed;
@@ -645,6 +645,12 @@ impl Planner {
                         tail: planned.tail && eval >= clip.timeline_end(),
                     },
                     animated: planned.animated,
+                    keyed_alpha: (motion && planned.animated.is_some_and(|a| a.opacity)).then(|| {
+                        let pick = self.canvas.pick_fps;
+                        let t = ffmpeg_frame_time(u64::try_from(frame).unwrap_or(0), pick.num, pick.den);
+                        let opacity = keyframe_value(&clip.property_curve(Property::Opacity), t, clip.timeline_start);
+                        (opacity * 255.0) as u8
+                    }),
                     timing: PlanTiming {
                         window: planned.window,
                         source_window: planned.source_window,
@@ -1494,6 +1500,140 @@ mod tests {
         assert!(still.matte && still.stages.len() == 1);
         assert!(!export.matte && export.stages.len() == 2);
         assert_eq!((export.picture, export.origin), ((1080, 608), (0, 656)));
+    }
+
+    #[test]
+    fn an_export_frame_carries_the_alpha_its_geq_writes_for_a_keyed_opacity() {
+        use crate::model::PropertyKey;
+        let a = asset();
+        let mut clip = make_clip(a.id, 0.0, 4.0, 0.25);
+        clip.set_property_keys(
+            Property::Opacity,
+            vec![
+                PropertyKey::new(0.0, 1.0),
+                PropertyKey::new(0.6, 0.3),
+                PropertyKey::new(1.3, 0.75),
+            ],
+        );
+        let curve = clip.property_curve(Property::Opacity);
+        let tl = single(vec![clip]);
+        for (fps, (num, den)) in [(30.0, (30, 1)), (30000.0 / 1001.0, (30000, 1001))] {
+            let motion = planner(&tl, std::slice::from_ref(&a), PlanMode::Motion, &opts(fps));
+            for k in 8..60u64 {
+                let plan = motion.at_frame(k).unwrap();
+                let want = (keyframe_value(&curve, ffmpeg_frame_time(k, num, den), 0.25) * 255.0) as u8;
+                assert_eq!(plan.layers[0].keyed_alpha, Some(want), "{fps} fps frame {k}");
+            }
+        }
+        // A still samples the opacity and draws it like a static one; a curve that never leaves 1 has no `geq`.
+        let still = planner(&tl, std::slice::from_ref(&a), PlanMode::Still, &opts(30.0))
+            .at(1.0)
+            .unwrap();
+        assert_eq!(still.layers[0].keyed_alpha, None);
+        let mut opaque = make_clip(a.id, 0.0, 4.0, 0.0);
+        opaque.set_property_keys(
+            Property::Opacity,
+            vec![PropertyKey::new(0.0, 1.0), PropertyKey::new(1.0, 1.0)],
+        );
+        let tl = single(vec![opaque]);
+        let plan = planner(&tl, std::slice::from_ref(&a), PlanMode::Motion, &opts(30.0))
+            .at_frame(10)
+            .unwrap();
+        assert_eq!(plan.layers[0].keyed_alpha, None);
+    }
+
+    #[test]
+    fn a_keyed_opacity_shares_its_geq_with_a_mask_and_is_never_drawn_under_a_chroma_key() {
+        use crate::model::{PropertyKey, VideoEffect};
+        let a = asset();
+        let assets = [a.clone()];
+        let caps = GpuCaps {
+            motion: true,
+            fades: true,
+            transitions: true,
+            dip_white: true,
+            keyed_opacity: true,
+            keyed_zoom: true,
+            keyed_color: true,
+            mask: true,
+            text: true,
+            reframe: true,
+            hdr: true,
+            effects: EffectKinds::ALL,
+        };
+        let holding = |edit: &dyn Fn(&mut Clip)| {
+            let mut clip = make_clip(a.id, 0.0, 4.0, 0.0);
+            clip.set_property_keys(
+                Property::Opacity,
+                vec![
+                    PropertyKey::new(0.0, 1.0),
+                    PropertyKey::new(1.0, 1.0),
+                    PropertyKey::new(2.0, 0.3),
+                ],
+            );
+            edit(&mut clip);
+            planner(&single(vec![clip]), &assets, PlanMode::Motion, &opts(30.0))
+        };
+        let why = |p: &Planner, frame: u64| {
+            let plan = p.at_frame(frame).unwrap();
+            (plan.layers[0].keyed_alpha, plan.reasons(&caps, plan.size(u32::MAX)))
+        };
+        // Alone, on every frame.
+        let bare = holding(&|_| {});
+        for frame in [15, 45, 70] {
+            assert!(why(&bare, frame).1.is_empty(), "frame {frame}");
+        }
+        // Under a mask one `geq` multiplies both: drawn where the curve holds 1, refused once it falls.
+        let masked = holding(&|c| c.mask = Some(Mask::default()));
+        assert_eq!(why(&masked, 15), (Some(255), vec![]));
+        let (alpha, below) = why(&masked, 45);
+        assert_eq!(alpha, Some(165));
+        assert!(
+            matches!(below.as_slice(), [Unsupported::MaskWith(_, w)] if w.contains("below full opacity")),
+            "{below:?}"
+        );
+        // Under a chroma key `alpha(X,Y)` reads the key's plane (a plane's last column and row one in on some
+        // builds): refused for the clip, on the frames where the curve holds 1 as on the others.
+        let keyed = holding(&|c| {
+            c.effects = vec![VideoEffect::ChromaKey {
+                color: "green".into(),
+                similarity: 0.15,
+                blend: 0.1,
+            }];
+        });
+        for frame in [15, 45] {
+            let (alpha, why) = why(&keyed, frame);
+            assert!(alpha.is_some(), "frame {frame}");
+            assert!(
+                why.iter()
+                    .any(|u| matches!(u, Unsupported::Effects(_, w) if w.contains("under a keyed opacity"))),
+                "frame {frame}: {why:?}"
+            );
+        }
+        // A still samples the opacity (no `geq`), so a chroma key is judged by the sampled value as before.
+        let mut sampled = make_clip(a.id, 0.0, 4.0, 0.0);
+        sampled.effects = vec![VideoEffect::ChromaKey {
+            color: "green".into(),
+            similarity: 0.15,
+            blend: 0.1,
+        }];
+        sampled.set_property_keys(
+            Property::Opacity,
+            vec![
+                PropertyKey::new(0.0, 1.0),
+                PropertyKey::new(1.0, 1.0),
+                PropertyKey::new(2.0, 0.3),
+            ],
+        );
+        let still = planner(&single(vec![sampled]), &assets, PlanMode::Still, &opts(30.0));
+        let held = still.at(0.5).unwrap();
+        assert_eq!(held.layers[0].keyed_alpha, None);
+        assert!(held.reasons(&caps, held.size(u32::MAX)).is_empty());
+        let falling = still.at(1.5).unwrap();
+        assert!(falling
+            .reasons(&caps, falling.size(u32::MAX))
+            .iter()
+            .any(|u| matches!(u, Unsupported::Effects(_, w) if w.contains("below full opacity"))));
     }
 
     #[test]

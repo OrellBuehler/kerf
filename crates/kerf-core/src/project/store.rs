@@ -90,6 +90,12 @@ const MIGRATIONS: &[Migration] = &[
         destructive: false,
         needed_to_read: false,
     },
+    Migration {
+        run: v9_to_v10,
+        needed: v9_to_v10_needed,
+        destructive: false,
+        needed_to_read: false,
+    },
 ];
 
 /// The schema this build writes and the newest it opens.
@@ -223,17 +229,32 @@ fn v7_to_v8_needed(_: &Connection) -> bool {
     true
 }
 
-/// v9: an asset's video stream may carry `StreamInfo.color_range` (`"pc"` or `"tv"`, in the `streams` JSON
-/// column), the sample range the file declares. It is a field an older build drops at its next write of the
-/// asset, and then reads the picture as it did before the tag was recorded. Assets stored before this step
-/// have none, which stays "not known" (a renderer treats it as it always did); the tag is read when the file is
-/// probed again (a relink, or the file imported anew). Nothing in the file's tables changes; the step is the
-/// version that keeps an older build out, after the file is copied aside.
+/// v9: a `<text>` of a title may carry an animation, `data-kerf-animate` (JSON, `svg/text_animation.rs`), that the
+/// text engine compiles into per-glyph SMIL when the text is set as outlines (`svg/glyph_smil.rs`). The JSON's
+/// shape is the same, its meaning is not: an older build draws the compiled animation it finds in a stored title
+/// but does not know the attribute, so the next time it sets that title's text again (a template value, a box,
+/// Draw as outlines) the animation is gone while the attribute stays, and it saves such a title as a template
+/// without it playing. Nothing in the file's tables changes; the step is the version that keeps an older build
+/// out, after the file is copied aside.
 fn v8_to_v9(_: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
 fn v8_to_v9_needed(_: &Connection) -> bool {
+    true
+}
+
+/// v10: an asset's video stream may carry `StreamInfo.color_range` (`"pc"` or `"tv"`, in the `streams` JSON
+/// column), the sample range the file declares. It is a field an older build drops at its next write of the
+/// asset, and then reads the picture as it did before the tag was recorded. Assets stored before this step
+/// have none, which stays "not known" (a renderer treats it as it always did); the tag is read when the file is
+/// probed again (a relink, or the file imported anew). Nothing in the file's tables changes; the step is the
+/// version that keeps an older build out, after the file is copied aside.
+fn v9_to_v10(_: &Connection) -> rusqlite::Result<()> {
+    Ok(())
+}
+
+fn v9_to_v10_needed(_: &Connection) -> bool {
     true
 }
 

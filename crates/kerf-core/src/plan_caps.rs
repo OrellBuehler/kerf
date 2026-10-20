@@ -415,7 +415,7 @@ impl fmt::Display for Unsupported {
                 "{l}: a full-range picture {where_} that the scaler resizes (swscale converts its range inside the resize: chroma up to 15 levels off)"
             ),
             Self::Tail(l) => write!(f, "{l}: playing on past its end under a transition"),
-            Self::KeyedOpacity(l) => write!(f, "{l}: keyframed opacity (a geq alpha, whose rounding is not measured)"),
+            Self::KeyedOpacity(l) => write!(f, "{l}: keyframed opacity (a geq alpha written per frame, which no compositor pass draws or has a parity case for yet)"),
             Self::KeyedColor(l) => write!(
                 f,
                 "{l}: keyframed colour correction (an eq written per frame, which no compositor pass draws or has a parity case for yet)"

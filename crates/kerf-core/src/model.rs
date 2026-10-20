@@ -140,7 +140,7 @@ pub struct StreamInfo {
     pub color_space: Option<String>,
     /// The sample range the stream declares, as ffprobe names it: `"pc"` (full range) or `"tv"`
     /// (limited); `None` when it declares none, **and for an asset probed before the tag was
-    /// recorded** (schema v9), which a renderer must read as "not known" and not as limited. The
+    /// recorded** (schema v10), which a renderer must read as "not known" and not as limited. The
     /// tag is the truth about the range: ffprobe's `yuvj…` names only the 8-bit formats FFmpeg
     /// itself calls full range, while a VP9 (or HEVC, AV1) file flagged `pc` probes as plain
     /// `yuv420p` and FFmpeg runs its raw samples through a graph. Stored as ffprobe says it, so an

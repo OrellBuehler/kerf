@@ -8,7 +8,7 @@
   so old JSON reads an ordinary start. The export seeks and places the clip's picture by it
   (`ClipFx::lead`, `engine-cli.md`); a proxy-decoded asset keeps the original's only for a `.lead`
   padded proxy (`media::decoded_lead`, `Project::preview_assets_of`). It also carries
-  **`color_range`** (`pc` / `tv`, schema v9; `None` when the file says none and for an asset
+  **`color_range`** (`pc` / `tv`, schema v10; `None` when the file says none and for an asset
   probed before it was recorded), the flag a `yuv420p` VP9 / HEVC / AV1 file marks full range
   with (`engine-cli.md`, `core-render-plan.md`). A `Clip`
   references a source range (`source_in`/`source_out`) of an asset at a

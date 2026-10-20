@@ -248,3 +248,21 @@ Details: `core-project.md` ("A text's box and the title's text form").
 
 - A box height (and shrink to a box of lines), a minimum size for shrink, and drawing the box in the preview while it is edited.
 - Positioned `<tspan>` lines, decorations, right-to-left paragraphs, small caps and font features, `font-variation-settings`.
+
+## Phase 3a as built (text animators)
+
+Details: `core-project.md` ("Text animations"). The rest of phase 3 (AE-style speed / influence easing with overshoot and springs,
+trim paths, `animateMotion`, artwork entering from outside its viewBox) is 3b and later.
+
+- **Stored as data**: `data-kerf-animate` (JSON) on the `<text>`; the outline pass compiles it into per-glyph SMIL (translate,
+  rotate, scale, opacity, blur), so floating titles, title clips and templates all play it, a template saved from an animated
+  title carries it, and `restore_text` (the text form) is unchanged. **Schema step v9** (a JSON step: an older build would drop
+  the animation at the next re-outline). No manifest change, so no `template::model::UPGRADES` step; no graph change, no golden family.
+- **Model**: a range selector (window, offset slid over the animation, six shapes) and a seeded wiggly selector over characters,
+  words or lines; properties in em; eight presets (rise, fade in, typewriter, pop, blur in, spin in, drop in, wiggle).
+- **Surfaces**: `set_title_text_animation` and `list_text_animation_presets` (Tauri commands and MCP tools), the Inspector's Text
+  section (a preset picker with delay and duration), `api.ts` with its harness fallback, `types.ts`.
+- **Left for later**: easing curves per property and overshoot / springs (3b), looping an animation for a title longer than it, a
+  custom-animation editor in the Inspector (the range, the wiggle and the properties are reachable through MCP and the data only),
+  a preview of the selector's window, animating text that stays text (positioned `<tspan>`s, `textPath`), and per-unit anchor
+  point choices.

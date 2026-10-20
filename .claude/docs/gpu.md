@@ -11,7 +11,7 @@ Windows) and nothing may depend on an optional wgpu feature. **A GPU failure is 
 error, not a panic**: every unit of wgpu work runs in out-of-memory / validation /
 internal error scopes (`Gpu::guarded`), anything uncaptured is logged and remembered,
 `Compositor::new` and `composite` return `Result` (and `Compositor::caps()` says what it
-draws, `GpuCaps::A0` plus `text`, `motion`, `fades`, `transitions`, `dip_white`, `keyed_zoom`, `mask` and the blur / sharpen / grayscale / invert / vignette / chroma key `effects` today, which `composite` / `render_plan` judge the plan by), and a lost device is tracked — every
+draws, `GpuCaps::A0` plus `text`, `motion`, `fades`, `transitions`, `dip_white`, `keyed_zoom`, `keyed_opacity`, `mask` and the blur / sharpen / grayscale / invert / vignette / chroma key `effects` today, which `composite` / `render_plan` judge the plan by), and a lost device is tracked — every
 later call is `GpuError::DeviceLost` and the **owner builds a new `Gpu` and
 `Compositor`** (the device is not recreated behind the caller's back).
 
@@ -600,14 +600,14 @@ with an **odd** side (the round trip reads past the line); and on a layer the **
 `rgb24` by the fade's negotiation and scales and converts in one pass, chroma interpolated from other samples than the compositor's scale-then-convert (a half-size layer
 Y 19, UV 28 off at sharp edges, an enlargement 11 / 10) — found by the harness comparing the frames beside a refusal. **A full-range (`yuvj`) picture is refused
 whenever the composite policy is not `FixedBt601`** (FFmpeg 9; `PlanStream::maybe_full_range_in(policy)`, which also counts **every deeper-than-8-bit YCbCr or gray format** there, because the
-name is only a heuristic and the range *tag* is the truth, which `StreamInfo.color_range` records since schema v9 (`pc` / `tv`, `None` for a file that says none and for an asset stored before): a 10-bit file tagged `pc` probes as `yuv420p10le` like the limited one, and 9.0.2 handles it as it does `yuvj` —
+name is only a heuristic and the range *tag* is the truth, which `StreamInfo.color_range` records since schema v10 (`pc` / `tv`, `None` for a file that says none and for an asset stored before): a 10-bit file tagged `pc` probes as `yuv420p10le` like the limited one, and 9.0.2 handles it as it does `yuvj` —
 Y 16 off in an export's planes, flat 16 / 15 / 11 under a still's fade — so a **YCbCr** picture **flagged `pc` is refused in any format** there (an RGB or gray one is never a flag: ffprobe prints `pc` for them on both FFmpegs, and counting it refused every PNG under FFmpeg 9 — the suite found it), and with no flag recorded the **limited 10-bit picture is refused with it** (the depth heuristic stays for `None` and `tv`: a file may say nothing); FFmpeg 6.1.1 draws both exactly: Y 0 / UV 0 in Motion, 3 in a still's fade, so the name alone decides there, as before — **except a `yuv420p` flagged `pc`** (below): in a still, while a fade, dip or dissolve runs on it (`fade` darkens the *raw* values toward the
 limited-range black 16 and converts the range afterwards: frame 0 of a fade-in reads Y 30 where black is 16, 15 to 19 levels off over the fade), and **every export frame of a cut that holds one**
 (`Unsupported::FullRangeCut`, from `PlanCanvas::full_range_cut`, which the `Planner` sets from the cut's clips): FFmpeg 9 flags the whole export full range, keeps the full-range
 clip's raw values (Y 17 / UV 16 off a compositor that converts first) and **converts every limited-range frame of the cut to full range** (a black frame reads Y 0 where the compositor draws 16, a test pattern
 76 against 81, a gap too), before the clip, after it and on another track alike, so no frame of such a cut is drawn, not only the full-range layer's. **A `yuv420p` flagged `pc` (`color_range=pc`; a VP9, HEVC or AV1 file, FFV1 in Matroska; `PlanStream::raw_full_range`) is not a `yuvj` picture on FFmpeg 6.** Its format is already the overlay's, so
 nothing converts its range ahead of the graph's filters and its **raw samples reach `fade`, `eq`, `vignette`, `chromakey`, `unsharp`, `gblur` and the rest on both FFmpegs**, where the compositor's decode (`scale=out_range=tv`) has converted it. Measured with the range flag cleared
-(what a pre-v9 asset's plan sees), 6.1.1 / 9.0.2: a still's vignette 13 / 12 levels off, a fade 11 / 9, `eq` within the bounds / 11, the chroma key within them / 19 on a gradient (73 on the test pattern); an export's planes on 6.1.1 a fade Y 14, vignette 10, invert 4, `eq` 6, sharpen 20, blur 1 and a resize UV 8; on 9.0.2
+(what a pre-v10 asset's plan sees), 6.1.1 / 9.0.2: a still's vignette 13 / 12 levels off, a fade 11 / 9, `eq` within the bounds / 11, the chroma key within them / 19 on a gradient (73 on the test pattern); an export's planes on 6.1.1 a fade Y 14, vignette 10, invert 4, `eq` 6, sharpen 20, blur 1 and a resize UV 8; on 9.0.2
 every export frame of the cut 16 off (the flagged-export reason, as for `yuvj`). A plain layer, a cut and a shrunk layer over bars are exact on 6.1.1 and, in a still, within the strict bounds on 9.0.2. So `maybe_full_range()` is true for it (the blur / sharpen / invert / vignette / key / `eq` refusals, `FullRangeResized`, and
 `FullRangeCut` where the policy is not `FixedBt601`), and `FullRangeNegotiated` fires **under every policy** for it, in a still and in the export frames a fade runs in (under FFmpeg 9 the cut is the export frames' reason). `Unknown` and `tv` leave the picture as it was. **The policy is a proxy for the behaviour, measured on
 FFmpeg 6.1.1 and 9.0.2 only: 5.x, 7.x, 8.x and distro builds are unmeasured** (`composite_color_policy()` probes the composite's colour, not the range handling; a build that negotiates the colour but
@@ -644,9 +644,26 @@ before the zoom acts at the **fit size** and the zoom magnifies it (a blur grows
 * **FFmpeg 6.1's `geq` reads a plane's last column and row one in** (its bilinear read clamps to `w - 2` / `h - 2`): the masked picture's right-most
   column and bottom row, on all three planes, are their neighbours'; 9.0 copies them. `kerf_core::geq_edge()` measures which (the filter over a 16x16
   picture of distinct samples, once per process, outside any lock; `Unknown`, not a guess, retried after a backoff). The blend then reads the layer one in
-  (`ComposeParams::edge`, a letterbox included), a late zoom's planes are shifted before its scale (`fs_edge`), and a mask is `Unsupported` while the build
-  is `Unknown`. `kerf_gpu::prepare(&plan)` measures it ahead of the render lock; `Compositor::with_geq_edge` pins it.
+  (`ComposeParams::edge`, a letterbox included), a late zoom's planes are shifted before its scale (`fs_edge`), and a mask or a keyed opacity is `Unsupported` while the
+  build is `Unknown`. `kerf_gpu::prepare(&plan)` measures it ahead of the render lock; `Compositor::with_geq_edge` pins it.
 * Refused (`MaskWith`): a mask on a **rotated** layer, or one below full opacity (the sampled one: its alpha goes through `colorchannelmixer`).
+
+**Keyed opacity** (export frames). FFmpeg's chain has a `geq` whose alpha is `(int)(opacity(T) * 255)` (`T` the frame's time on the
+clip's `fps` grid) where a constant opacity takes `colorchannelmixer` and the RGB round trip. The plan evaluates it
+(`PlanLayer::keyed_alpha`, `core-render-plan.md`) and the compositor blends with that one alpha in integers (`LayerFades::alpha`),
+no round trip; the clip's fades and a dissolve's ramp act on it as on any alpha plane. The `geq` also copies Y, U and V through
+`lum` / `cb` / `cr`, so on a build whose `geq` reads a plane's last column and row one in (6.1) the blend reads them so too
+(`mask_edge`, as for a mask). Byte for byte at the picture's size (linear, eased, held, bezier off the frame grid, a tree of many
+keys, 29.97, with fades, in a dissolve); the scaler's level on a pip or an odd size; `ROTATED` turned. A mask with it is drawn
+while the curve holds 1 (the `geq` writes the mask, byte for byte) and refused on the frames below it (`MaskWith`: one `geq`
+multiplies both); **the alpha judged is the `geq`'s own (`keyed_alpha < 255`), not the sampled opacity**, which can sit on the
+other side of 1 by the last bit. **Before a moving zoom** it is drawn on the frames where the curve holds 1 (the `geq` is the identity on
+the alpha plane and copies Y, U, V: the zoom-last path of a mask, `edge_planes` ahead of the scale; `SCALED`, measured 1 / 1 on 6.1.1 and
+9.0.2) and refused once it falls (`ZoomBehind`: its alpha plane would be scaled with the zoom). A **chroma key under it is refused for the clip** (`Effects`, on the frames at 255 too, so a clip is
+not drawn by two renderers in turn): that `geq` reads the key's plane (`alpha(X,Y)`), and on a build that reads a plane's last
+column and row one in (6.1) it reads the key's alpha there one in, which the compositor's key does not (measured on the frames at
+255: luma 21 off at the edge, 2636 samples over 14 frames; 9.0.2 is exact, so shifting the key's alpha under `mask_edge` is the
+follow-up, with its zoom-last variant). The compositor refuses the combination itself too.
 
 **Effects.**
 
@@ -667,9 +684,9 @@ before the zoom acts at the **fit size** and the zoom magnifies it (a blur grows
   `composite_counted` / `composite_yuv_counted`; without it the frame is `Unsupported`). Byte for byte, still and export, every frame (the late start,
   speed, reverse and dissolve cases included), on 6.1.1 and 9.0.2. The count is the **full cut's**: a range export (`rendered.slice`) and the
   preview's hand-over stream start their graph at the slice, so their dither restarts there, a phase the GPU does not follow (a level on a
-  dithered sample, never more). **Full range:** a full-range picture is refused when its format says so (`yuvj*`) **or its range flag does** (`StreamInfo.color_range == "pc"`, schema v9; `PlanStream::maybe_full_range`): a VP9
-  (HEVC / AV1) file probes as `yuv420p` with `color_range=pc`, FFmpeg vignettes its raw values and the GPU would vignette the converted ones (measured 12 to 13 levels off, still and export). The invert, blur and sharpen are refused with it. **Gap, narrower:** an asset stored before v9 has no flag
-  (`None`, "not known", judged by its name as ever) until the file is probed again (a relink replaces its streams; the library does not re-probe on open), so a pre-v9 `yuv420p` file that was `pc` is still drawn wrong.
+  dithered sample, never more). **Full range:** a full-range picture is refused when its format says so (`yuvj*`) **or its range flag does** (`StreamInfo.color_range == "pc"`, schema v10; `PlanStream::maybe_full_range`): a VP9
+  (HEVC / AV1) file probes as `yuv420p` with `color_range=pc`, FFmpeg vignettes its raw values and the GPU would vignette the converted ones (measured 12 to 13 levels off, still and export). The invert, blur and sharpen are refused with it. **Gap, narrower:** an asset stored before v10 has no flag
+  (`None`, "not known", judged by its name as ever) until the file is probed again (a relink replaces its streams; the library does not re-probe on open), so a pre-v10 `yuv420p` file that was `pc` is still drawn wrong.
 * **Chroma key** is `chromakey` after `format=yuva420p` (`chromakey.wgsl`, `effects.rs`): the layer's alpha plane, at the picture's size, from
   its chroma (the effects change none of it, so only the last key counts). Each luma sample's alpha is the mean of nine `sqrt((du² + dv²) /
   (255² * 2))` over the 3x3 window of chroma samples around it, from the key's U, V (`RGB_TO_U` / `RGB_TO_V` in 10-bit fixed point of the
@@ -683,12 +700,12 @@ before the zoom acts at the **fit size** and the zoom magnifies it (a blur grows
   else `kerf_core::cpu_graph_threads()` (the budget's when it caps the graph, else FFmpeg's default of cores + 1, at most 16), which is the
   playback stream's and an export's; `Compositor::with_graph_threads` pins it. An FFmpeg run with another thread count differs at those
   samples, as FFmpeg's own runs do. Byte for byte against the filter at the same thread count (`Compositor::chroma_key_alpha` reads the
-  plane back for the plane-level test; the parity stills and export frames use the budget's). **Full range:** a `yuv420p` picture whose full range is only a `color_range=pc` tag (VP9, HEVC, AV1) is refused (schema v9 records the range): FFmpeg keys its raw chroma, the compositor the converted one (19 levels off on a gradient and 73 on the test pattern under 9.0.2; 6.1.1 happened to agree on the gradient). The same **gap** as the vignette for an asset stored before v9.
+  plane back for the plane-level test; the parity stills and export frames use the budget's). **Full range:** a `yuv420p` picture whose full range is only a `color_range=pc` tag (VP9, HEVC, AV1) is refused (schema v10 records the range): FFmpeg keys its raw chroma, the compositor the converted one (19 levels off on a gradient and 73 on the test pattern under 9.0.2; 6.1.1 happened to agree on the gradient). The same **gap** as the vignette for an asset stored before v10.
 * Refused (`Effects`): a vignette on a picture that is not `yuv420p` or that is full range (by its format or its `pc` flag: `maybe_full_range_in`; FFmpeg vignettes it in its own
   format: other planes, another dither course), a vignette map over the device's storage-buffer limit; a chroma key after a scale or a
   blur (its alpha moves by up to 1/blend levels for a level of chroma, and a blend of 0 flips it 0 to 255: drawn only on chroma that is
   FFmpeg's to the level), on a picture that is not `yuv420p` or that is full range, on a rotated layer or one below full
-  opacity, on one narrower or shorter than 2, or with a similarity or a blend `chromakey` refuses (0.00001 to 1, 0 to 1); `MaskWith`: a mask over a chroma key (`geq` multiplies the key's alpha). A sigma outside 0 to 1024
+  opacity, on one narrower or shorter than 2, or with a similarity or a blend `chromakey` refuses (0.00001 to 1, 0 to 1), or under a keyed opacity (see above); `MaskWith`: a mask over a chroma key (`geq` multiplies the key's alpha). A sigma outside 0 to 1024
   or an amount outside -2 to 5 (FFmpeg's options refuse them too), a blur over the device's storage-buffer limit, and a **sharpen that amplifies a difference upstream of it** (judged with the geometry, so by render size): FFmpeg's scale or blur is a level from ours, and `unsharp` carries it through at worst `1 + 2|amount|` at an edge sample and rounds up a level more with each further sharpen (its `>> 16` floors). From the first source (a scale before the effects: every stage, or the fit scale when a zoom comes last; or a blur with sigma > 0) the worst case starts at 1 and each later sharpen that is not zero at `unsharp`'s 16 bits adds `ceil(2 * err * |amount|)`; the frame is refused when it passes 2. So one sharpen of at most 0.5 is drawn (0.6 is not), and any second one is refused, however small. With no source upstream a sharpen is exact at any amount, chained or not, and a blur after it counts for nothing. `Matte`: a blur, a sharpen, a vignette or a chroma key on a
   letterbox (they would see the bars as picture; tables and a grade carry the bars through). By the picture (`effect_on_picture_refusal`): an invert,
   blur or sharpen on a **full-range** picture or one whose format was never recorded (`maybe_full_range_in(policy)`: where FFmpeg 9 negotiates the range this
@@ -717,7 +734,7 @@ the export), `every_kind_of_transition_and_the_clips_own_fades_are_drawn_in_a_st
 a lossless FFV1 `yuv420p` file flagged `-color_range pc` (a codec whose decoder keeps the format `yuv420p`, as VP9 / HEVC / AV1 do; H.264 would call it `yuvj420p`), the same pattern flagged `tv` and unflagged. Motion: plain, black-then-flagged
 and flagged-then-limited cuts exact under FFmpeg 6 and refused as the cut (`FullRangeCut`) under 9; the fade refused for the frames it runs in under 6 (`FullRangeNegotiated`; the one frame at full factor is held exact) and as the cut under 9; a shrink and an enlargement refused
 (`FullRangeResized`) under both; the vignette, invert, blur, sharpen, `eq` and chroma key refused on every frame under both; the `tv` and unflagged controls exact in all of them. Still: the same refusals with FFmpeg rendering each fallback, the plain, shrunk, enlarged and
-after-limited frames strictly drawn, and **the refusal's necessity** (`drawn_anyway`): the very frames planned as an asset stored before v9 would be (flag `None`) and drawn are outside the strict bounds (vignette 12 / 13, fade 9 / 11, and on FFmpeg 9 the key and `eq`), so a compositor that learns to
+after-limited frames strictly drawn, and **the refusal's necessity** (`drawn_anyway`): the very frames planned as an asset stored before v10 would be (flag `None`) and drawn are outside the strict bounds (vignette 12 / 13, fade 9 / 11, and on FFmpeg 9 the key and `eq`), so a compositor that learns to
 read raw samples fails the test and the refusal can go.
 **The BT.709 label's case** (`untagged_hd_is_labelled_for_the_whole_graph_that_holds_a_matrix`): a 1280x720 untagged HD clip made translucent (2 levels of Y / UV, the scaler's and the round trip's:
 `HD_TRANSLUCENT`) alone in the first second of a cut whose second second holds a BT.709 clip, and over a BT.709 clip, plus the same frames with no BT.709 clip in the graph; the Motion plan labels by the cut's graph where a
@@ -732,8 +749,8 @@ a dissolve, dip, slide or push into a zooming clip and out of one) hold the boun
 
 | Bound (Y / UV) | Cases | Why |
 | --- | --- | --- |
-| 0 | a mask at the picture's size (20 of 27 mask rows), grayscale, invert, sharpen, a vignette (every frame of the run) and a chroma key (its fades and dissolve included) at the picture's size | integer arithmetic, reproduced |
-| 1 (`SCALED`) | a layer the compositor scales, a mask or a vignette on it, a one-stage zoom | swscale's x86 scaler is not bit-exact with the C arithmetic the shader follows |
+| 0 | a mask at the picture's size (20 of 27 mask rows), grayscale, invert, sharpen, a vignette (every frame of the run), a chroma key and a keyed opacity (the fades and dissolve of each included) at the picture's size | integer arithmetic, reproduced |
+| 1 (`SCALED`) | a layer the compositor scales, a mask, a vignette or a keyed opacity on it, a one-stage zoom | swscale's x86 scaler is not bit-exact with the C arithmetic the shader follows |
 | 1 (`EFFECT`) | a blur at the picture's size, and a blur then a vignette (measured 0: the vignette's factor is at most 1) | `gblur`'s SIMD summation order (above) |
 | 2 | a layer the compositor scales *and* makes translucent, no effect (`tests/playback.rs`, `play/pip/translucent and scaled`, measured Y 2 / UV 2 on both FFmpegs); `EFFECT_SCALED`: a blur, grayscale or invert on a scaled or translucent layer; a blur then a sharpen of at most 0.5 even unscaled and opaque (the blur's level times the gain); a sharpen of at most 0.5 after a scale. `CASCADED`: a zoom (the fit scale, then the zoom's). `ZOOMED_MASK`: a soft mask edge, or a chroma key's, on a zoomed picture (measured 2 / 2). Rotated, graded and scaled, dip to white (Y three on BT.709, `WHITE_709`) | two of the causes above on one sample; the RGB kernel for white |
 
@@ -781,7 +798,7 @@ the **unmeasured-policy** case (`Unknown`: BT.601 stacks drawn, BT.709 / BT.2020
 the **full-range grading** cases (a graded `yuvj` clip, and a graded layer in a stack with
 one, refused; ungraded and limited-range controls drawn), the **range-flag** cases (a `yuv420p` file flagged `pc`: effects, `eq`, a running fade refused, plain / shrunk / enlarged drawn; `tv` / unflagged controls drawn),
 and **refusals** (an EXIF-oriented JPEG, FFV1 `yuva420p`, the same with the pixel
-format unrecorded, a translucent odd layer, a moving zoom behind a rotation, an opacity below 1 or a dip to white, a vignette on a 4:4:4 picture or a letterbox, a chroma key on a pip, after a blur, on a 4:4:4 picture, under a mask or on a rotated layer, a mask on a rotated or a translucent layer, a blur on a letterbox, an invert / blur / sharpen on a full-range picture, an invert on a gray one) —
+format unrecorded, a translucent odd layer, a moving zoom behind a rotation, an opacity below 1 or a dip to white, a vignette on a 4:4:4 picture or a letterbox, a chroma key on a pip, after a blur, on a 4:4:4 picture, under a mask or a keyed opacity or on a rotated layer, a mask on a rotated or a translucent layer, a blur on a letterbox, an invert / blur / sharpen on a full-range picture, an invert on a gray one) —
 each of which FFmpeg still renders (and a fade to black or white on a translucent layer, a dip to white on a rotated, letterboxed, odd, resized or non-`yuv420p` layer or beside a black fade, a fade on a full-range picture under FFmpeg 9), **transitions** (`transition/`, `transition-kind/`, `fade/`: every kind and a clip's own fades in a still, see
 above), **a moving zoom last, masks and effects** (`zoom/`, `zoom+mask/`, `mask/`, `effect/`, and `effect-planes/`: the blur, sharpen, tables and vignette plane by plane against the real filters, all sizes), and **text** (the `text/` family: the app's title and
 caption styles, positions and edges, boxes, colours, sizes, keyframed and overlapping overlays, escapes, installed fonts,

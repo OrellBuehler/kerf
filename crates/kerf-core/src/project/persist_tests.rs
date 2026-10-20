@@ -114,16 +114,16 @@ fn a_legacy_file_is_backed_up_once_then_upgraded() {
 }
 
 /// The columns are there, so their steps change nothing; the file is still copied aside, once,
-/// for v5, v6, v7, v8 and v9 (JSON steps: `needed` always, so an older build's file is kept before it is locked out).
+/// for v5 to v10 (JSON steps: `needed` always, so an older build's file is kept before it is locked out).
 #[test]
 fn a_legacy_file_that_already_has_the_columns_is_backed_up_only_for_the_json_step() {
     let dir = scratch();
     let path = dir.join("cut.kerf");
     edited(1).0.save_as(&path).unwrap();
     make_legacy(&path, true);
-    // Every step that adds a table or a column finds it there; only v5 to v9 (JSON steps) are pending.
+    // Every step that adds a table or a column finds it there; only v5 to v10 (JSON steps) are pending.
     let pending: Vec<u32> = store::pending_steps(&Connection::open(&path).unwrap(), 0);
-    assert_eq!(pending, vec![4, 5, 6, 7, 8], "only the v4 -> v5 to v8 -> v9 steps");
+    assert_eq!(pending, vec![4, 5, 6, 7, 8, 9], "only the v4 -> v5 to v9 -> v10 steps");
     drop(Project::open(&path).unwrap());
     assert_eq!(version_of(&path), SCHEMA_VERSION);
     let mut names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
@@ -251,7 +251,7 @@ fn a_v2_file_is_backed_up_once_then_gets_the_fonts_table() {
     let path = dir.join("cut.kerf");
     edited(2).0.save_as(&path).unwrap();
     make_v2(&path);
-    assert_eq!(SCHEMA_VERSION, 9);
+    assert_eq!(SCHEMA_VERSION, 10);
     assert!(!has_fonts_table(&path));
 
     let project = Project::open(&path).unwrap();
@@ -281,7 +281,7 @@ fn a_v2_file_is_backed_up_once_then_gets_the_fonts_table() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// The fonts table is there, so v3 changes nothing; the one backup is for v5 to v9 (JSON steps).
+/// The fonts table is there, so v3 changes nothing; the one backup is for v5 to v10 (JSON steps).
 #[test]
 fn a_v2_file_that_already_has_the_fonts_table_is_backed_up_only_for_the_json_step() {
     let dir = scratch();
@@ -293,7 +293,7 @@ fn a_v2_file_that_already_has_the_fonts_table_is_backed_up_only_for_the_json_ste
         .unwrap();
     assert_eq!(
         store::pending_steps(&Connection::open(&path).unwrap(), 2),
-        vec![4, 5, 6, 7, 8]
+        vec![4, 5, 6, 7, 8, 9]
     );
     drop(Project::open(&path).unwrap());
     assert_eq!(version_of(&path), SCHEMA_VERSION);
@@ -526,6 +526,45 @@ fn outlined_title(project: &Project) -> SvgOverlay {
     applied.overlay
 }
 
+/// A template title as applied with an animation on its tagline: its text as outlines with per-glyph SMIL.
+fn animated_title(project: &Project) -> SvgOverlay {
+    let id = outlined_title(project).id;
+    let rise = crate::svg::text_animation_preset("rise").unwrap().animation;
+    match project.set_title_text_animation(id, "tag", Some(rise)).unwrap() {
+        crate::project::TitleEdited::Overlay(done) => {
+            assert!(done.overlay.svg.contains("animateTransform"), "{}", done.overlay.svg);
+            done.overlay
+        }
+        crate::project::TitleEdited::Clip(_) => unreachable!("a floating title"),
+    }
+}
+
+#[test]
+fn a_v8_file_is_backed_up_stamped_v9_and_keeps_its_animated_title() {
+    let dir = scratch();
+    let path = dir.join("cut.kerf");
+    let (project, _) = edited(0);
+    let title = animated_title(&project);
+    project.save_as(&path).unwrap();
+    drop(project);
+    Connection::open(&path)
+        .unwrap()
+        .pragma_update(None, "user_version", 8)
+        .unwrap();
+    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 8), vec![8, 9]);
+
+    let project = Project::open(&path).unwrap();
+    assert_eq!(version_of(&path), SCHEMA_VERSION);
+    let kept = project.timeline().unwrap().svg_overlays;
+    assert_eq!(
+        kept.iter().find(|o| o.id == title.id).map(|o| o.svg.as_str()),
+        Some(title.svg.as_str())
+    );
+    drop(project);
+    assert_eq!(version_of(&schema_backup_path(&path, 8)), 8);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[test]
 fn a_v7_file_is_backed_up_stamped_v8_and_keeps_its_outlined_title() {
     let dir = scratch();
@@ -538,7 +577,7 @@ fn a_v7_file_is_backed_up_stamped_v8_and_keeps_its_outlined_title() {
         .unwrap()
         .pragma_update(None, "user_version", 7)
         .unwrap();
-    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 7), vec![7, 8]);
+    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 7), vec![7, 8, 9]);
 
     let project = Project::open(&path).unwrap();
     assert_eq!(version_of(&path), SCHEMA_VERSION);
@@ -573,7 +612,7 @@ fn a_v6_file_is_backed_up_stamped_v7_and_keeps_its_keyed_mask_and_crop() {
         .unwrap()
         .pragma_update(None, "user_version", 6)
         .unwrap();
-    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 6), vec![6, 7, 8]);
+    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 6), vec![6, 7, 8, 9]);
 
     let project = Project::open(&path).unwrap();
     assert_eq!(version_of(&path), SCHEMA_VERSION);
@@ -615,10 +654,10 @@ fn a_v4_file_is_backed_up_stamped_v5_and_keeps_its_title_clips() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// A video asset stored with the range its file declares keeps it, and one stored before v9 (no `color_range` in
+/// A video asset stored with the range its file declares keeps it, and one stored before v10 (no `color_range` in
 /// its stream JSON) reads as not known, which is not limited range: the plan treats it as it always did.
 #[test]
-fn a_v8_file_is_backed_up_stamped_v9_and_its_assets_read_as_range_unknown() {
+fn a_v9_file_is_backed_up_stamped_v10_and_its_assets_read_as_range_unknown() {
     let dir = scratch();
     let path = dir.join("cut.kerf");
     let project = Project::open_in_memory().unwrap();
@@ -634,17 +673,17 @@ fn a_v8_file_is_backed_up_stamped_v9_and_its_assets_read_as_range_unknown() {
     let json = serde_json::to_value(&old.streams[0]).unwrap();
     assert!(
         json.get("color_range").is_none(),
-        "an unset range is omitted, so a stored stream is byte-identical to a v8 one"
+        "an unset range is omitted, so a stored stream is byte-identical to a v9 one"
     );
     assert_eq!(serde_json::to_value(&tagged).unwrap()["color_range"], "pc");
     let read: StreamInfo = serde_json::from_value(json).unwrap();
-    assert_eq!(read.color_range, None, "a stream written before v9 reads as not known");
+    assert_eq!(read.color_range, None, "a stream written before v10 reads as not known");
 
     Connection::open(&path)
         .unwrap()
-        .pragma_update(None, "user_version", 8)
+        .pragma_update(None, "user_version", 9)
         .unwrap();
-    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 8), vec![8]);
+    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 9), vec![9]);
 
     let project = Project::open(&path).unwrap();
     assert_eq!(version_of(&path), SCHEMA_VERSION);
@@ -653,8 +692,8 @@ fn a_v8_file_is_backed_up_stamped_v9_and_its_assets_read_as_range_unknown() {
     assert_eq!(range(old.id), None);
     drop(project);
     assert_eq!(
-        version_of(&schema_backup_path(&path, 8)),
-        8,
+        version_of(&schema_backup_path(&path, 9)),
+        9,
         "an older build drops the tag at its next write, so the file as it was is kept"
     );
     std::fs::remove_dir_all(&dir).ok();
@@ -670,6 +709,7 @@ const PERSISTED: &[(u32, &str)] = &[
     (6, include_str!("persisted/timelines-v6.json")),
     (7, include_str!("persisted/timelines-v7.json")),
     (8, include_str!("persisted/timelines-v8.json")),
+    (9, include_str!("persisted/timelines-v9.json")),
 ];
 
 fn persisted_path(version: u32) -> PathBuf {
@@ -695,6 +735,10 @@ fn the_stored_timeline_shape_moves_only_with_the_schema_version() {
         let titled = Project::sample().unwrap();
         outlined_title(&titled);
         timelines.push(titled.timeline().unwrap());
+        // The same with an animation on its text (v9).
+        let animated = Project::sample().unwrap();
+        animated_title(&animated);
+        timelines.push(animated.timeline().unwrap());
         let lines: Vec<String> = timelines.iter().map(|t| serde_json::to_string(t).unwrap()).collect();
         std::fs::write(persisted_path(SCHEMA_VERSION), format!("[\n{}\n]\n", lines.join(",\n"))).unwrap();
         return;

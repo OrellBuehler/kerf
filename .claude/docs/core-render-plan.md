@@ -271,7 +271,7 @@
   evaluated graph.
   **What the compositor may draw is data**: `GpuCaps` (`Compositor::caps()`: the bits `motion`, `fades`,
   `transitions`, `dip_white`, `keyed_opacity`, `keyed_zoom`, `keyed_color`, `mask`, `text`, `reframe`, `hdr` and an
-  `EffectKinds` bitset; today `GpuCaps::A0` plus every one of them but `keyed_opacity`, `keyed_color`, `reframe`, `hdr`
+  `EffectKinds` bitset; today `GpuCaps::A0` plus every one of them but `keyed_color`, `reframe`, `hdr`
   with every effect kind), and **`RenderPlan::reasons(&caps,
   size)` is a pure function of the plan's fields** returning `Unsupported` values whose
   `Display` is the message the plan has always given — nothing is decided while planning,
@@ -280,8 +280,15 @@
   keyframed zoom is refused until `caps.keyed_zoom` (`KeyedZoom`: the export draws it last, at the output
   frame's time; a compositor that sets the cap draws the grade, the effects, the mask and the fades at the fit size and zooms after
   them), and
-  keyed opacity (a `geq` alpha, not the RGB round trip), a non-`yuv420p` delivery and a
-  gif are refused. **With `keyed_zoom` the plan still refuses a rotation, an opacity below 1 and a dip to white in front of a moving
+  keyed opacity until `caps.keyed_opacity` (`KeyedOpacity`: a `geq` alpha, not the RGB round trip), a non-`yuv420p` delivery and a
+  gif are refused. **`PlanLayer::keyed_alpha`** is that `geq`'s alpha in an export frame, `(int)(opacity(T) * 255)`: the opacity
+  curve evaluated by `engine::keyframe_value`, which is `keyframe_expr`'s arithmetic in its own order (the same segment by the same
+  comparisons, the constants the `f64`s `av_expr` parses back; `sweep.rs` holds it to the evaluated text to the bit), at `T` =
+  `ffmpeg_frame_time(k)` on the clip's `fps` grid, as `geq` reads `pts * av_q2d(tb)`; `None` in a still (which samples the opacity
+  and draws it like a static one) and for a curve that never leaves 1 (no `geq`). That `geq` is the mask's too, so the opacity a
+  mask, a chroma key or a moving zoom is judged by is the layer's `keyed_alpha < 255` as well as the sampled opacity (`mask_refusal`,
+  `zoom_order_refusal`), and **a chroma key under a keyed opacity is refused for the clip** (`Effects`, every frame of it: `geq` reads the
+  key's alpha plane, one in at the edge on 6.1). **With `keyed_zoom` the plan still refuses a rotation, an opacity below 1 and a dip to white in front of a moving
   zoom** (`ZoomBehind(layer, what)`, Still and Motion alike: the rotated alpha plane and the RGB round trip would have to be scaled
   with the zoom), and without it a Still refuses a grade, rotation, opacity, mask or effect in front of one. The old API stays: `gpu_supported()` / `unsupported_reasons()` (an owned
   `Vec<String>`) / `unsupported_reasons_at(size)` / `gpu_supported_at(size)` are
@@ -310,8 +317,8 @@
   but `FixedBt601` **no frame of a cut that holds a full-range clip** is drawn — before it, after it, on another track or a gap. FFmpeg 6 converts at the decode, as the
   compositor does, and draws it all to the level, except that **`FullRangeResized`** (under either FFmpeg, from `reasons(size)`) refuses a full-range
   picture the scaler resizes in an export frame and inside a fade (swscale converts the range inside the resize: chroma up to 15 levels off).
-  `maybe_full_range()` is true for a `yuvj…` name, no recorded format, or **a `yuv420p` flagged full range** (`StreamInfo.color_range == "pc"`, recorded since schema v9; a VP9 / HEVC / AV1 file probes as plain `yuv420p`): the range flag is the truth, but an
-  asset stored before v9 has none (`None`, "not known": judged by its name as ever; so does an unflagged file and a `tv` one). `flagged_full_range()` is the flag in any YCbCr format (RGB and gray pictures read `pc` from ffprobe on every FFmpeg, so for them it says nothing). Under a policy that is not
+  `maybe_full_range()` is true for a `yuvj…` name, no recorded format, or **a `yuv420p` flagged full range** (`StreamInfo.color_range == "pc"`, recorded since schema v10; a VP9 / HEVC / AV1 file probes as plain `yuv420p`): the range flag is the truth, but an
+  asset stored before v10 has none (`None`, "not known": judged by its name as ever; so does an unflagged file and a `tv` one). `flagged_full_range()` is the flag in any YCbCr format (RGB and gray pictures read `pc` from ffprobe on every FFmpeg, so for them it says nothing). Under a policy that is not
   `FixedBt601`, `maybe_full_range_in(policy)` also counts a YCbCr picture flagged `pc` in any format and any deeper-than-8-bit YCbCr / gray format (`pix_fmt_is_high_bit`) whatever it says: a `pc`-tagged 10-bit file probes as `yuv420p10le`, 9.0.2 handles it as `yuvj`, and a
   limited 10-bit picture is refused with it, because a file may say nothing of its range (it is what the cut flag, `FullRangeNegotiated` and the grading refusals use; 6.1.1 draws a 10-bit one exactly, so there only the name and a `yuv420p` flag decide).
   A flagged `yuv420p` is the exception on 6.1.1: nothing converts it ahead of the filters, so its raw samples meet the vignette, key, `eq`, fade and the other effects on every FFmpeg (refused under any policy), while a plain layer and a cut are exact there. Only a clip the export holds sets the cut flag (not a muted track, a
