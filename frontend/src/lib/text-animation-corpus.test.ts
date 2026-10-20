@@ -4,9 +4,9 @@ import { TEXT_ANIMATION_PRESETS, animationJson, parseAnimation } from './text-an
 import { titleTexts, withTextAnimation } from './title-text';
 import type { TextAnimation, TextAnimationPreset } from './types';
 
-// The differential test for `withTextAnimation`, the animation `titleTexts` reads, the presets and the JSON an attribute
-// holds, ports of kerf-core's `set_text_animation`, `text_animation_of`, `text_animation_presets` and
-// `TextAnimation::to_attribute`: kerf-core writes down titles, an animation set on one of their texts and what it wrote (or
+// The differential test for `withTextAnimation`, the animation `titleTexts` reads, the presets, the JSON an attribute
+// holds and its reading, ports of kerf-core's `set_text_animation`, `text_animation_of`, `text_animation_presets`,
+// `TextAnimation::to_attribute` and `from_attribute`: kerf-core writes down titles, an animation set on one of their texts and what it wrote (or
 // refused) and reads back (`svg/text_animation.rs` → `fixtures/text-animation-corpus.json`), and every case is replayed
 // here. Regenerate with `KERF_BLESS_CORPUS=1 cargo test -p kerf-core --no-default-features -- text_animation_corpus` after an
 // intended change.
@@ -19,7 +19,11 @@ interface Case {
 	expect: { ok: { svg: string; read: TextAnimation | null } } | { err: string };
 }
 
-const { cases, presets } = corpus as unknown as { cases: Case[]; presets: TextAnimationPreset[] };
+const { cases, presets, parses } = corpus as unknown as {
+	cases: Case[];
+	presets: TextAnimationPreset[];
+	parses: { name: string; raw: string; read: TextAnimation | null }[];
+};
 
 describe('the text animation corpus', () => {
 	test('has answers and refusals', () => {
@@ -53,4 +57,17 @@ describe('the presets', () => {
 			expect(JSON.parse(json)).toEqual(p.animation);
 		}
 	});
+});
+
+describe('reading an attribute', () => {
+	test('has answers and refusals', () => {
+		expect(parses.filter((c) => c.read).length).toBeGreaterThanOrEqual(4);
+		expect(parses.filter((c) => !c.read).length).toBeGreaterThanOrEqual(15);
+	});
+
+	for (const c of parses) {
+		test(c.name, () => {
+			expect(parseAnimation(c.raw)).toEqual(c.read);
+		});
+	}
 });

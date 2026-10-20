@@ -90,9 +90,13 @@ const isObject = (v: unknown): v is Json => typeof v === 'object' && v !== null 
 function merged<T extends object>(what: string, v: unknown, defaults: T): T {
 	if (v === undefined) return defaults;
 	if (!isObject(v)) throw new Error(`${what} is not an object`);
-	for (const k of Object.keys(v)) if (!(k in defaults)) throw new Error(`unknown field \`${k}\` in ${what}`);
+	for (const k of Object.keys(v)) if (!Object.hasOwn(defaults, k)) throw new Error(`unknown field \`${k}\` in ${what}`);
 	return { ...defaults, ...v };
 }
+
+/** serde reads `seed` as a `u32`, so `7.0` and `1e3` are floats it refuses; `JSON.parse` cannot tell them from `7`. */
+const seedsAreIntegers = (raw: string): boolean =>
+	[...raw.matchAll(/"seed"\s*:\s*([^\s,}\]]*)/g)].every((m) => /^\d+$/.test(m[1]));
 
 function number(what: string, v: unknown): number {
 	if (typeof v !== 'number') throw new Error(`${what} is not a number`);
@@ -109,6 +113,7 @@ function oneOf<T extends string>(what: string, v: unknown, allowed: readonly T[]
 export function parseAnimation(raw: string | undefined): TextAnimation | null {
 	if (raw === undefined || raw.length > MAX_JSON) return null;
 	try {
+		if (!seedsAreIntegers(raw)) return null;
 		const d = defaultAnimation();
 		const top = merged('the animation', JSON.parse(raw), { ...d, wiggle: d.wiggle as unknown });
 		const range = merged('range', top.range, d.range);

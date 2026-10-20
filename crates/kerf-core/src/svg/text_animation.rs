@@ -744,7 +744,84 @@ mod tests {
             "about": "Written by kerf-core (svg/text_animation.rs); replayed by text-animation-corpus.test.ts. Regenerate: KERF_BLESS_CORPUS=1 cargo test -p kerf-core --no-default-features -- text_animation_corpus",
             "presets": text_animation_presets(),
             "cases": cases,
+            "parses": parse_corpus(),
         })
+    }
+
+    /// Attribute JSON, as `from_attribute` reads it: for `parseAnimation`, which has to refuse what serde does.
+    fn parse_corpus() -> Vec<serde_json::Value> {
+        let wiggle = |w: &str| format!(r#"{{"properties":{{"opacity":0}},"wiggle":{w}}}"#);
+        let cases: Vec<(&str, String)> = vec![
+            ("only what differs from the defaults", r#"{"properties":{"y":0.5}}"#.into()),
+            ("every field", rise().to_attribute()),
+            ("a wiggle with its defaults", wiggle("{}")),
+            ("no wiggle", wiggle("null")),
+            ("a seed", wiggle(r#"{"seed":7}"#)),
+            ("the largest seed", wiggle(r#"{"seed":4294967295}"#)),
+            ("a seed past a u32", wiggle(r#"{"seed":4294967296}"#)),
+            ("a negative seed", wiggle(r#"{"seed":-1}"#)),
+            ("a seed with a fraction", wiggle(r#"{"seed":7.5}"#)),
+            ("a seed written 7.0", wiggle(r#"{"seed":7.0}"#)),
+            ("a seed in exponent form", wiggle(r#"{"seed":1e3}"#)),
+            ("a seed that is a string", wiggle(r#"{"seed":"7"}"#)),
+            ("a seed that is null", wiggle(r#"{"seed":null}"#)),
+            ("a seed of minus zero", wiggle(r#"{"seed":-0}"#)),
+            ("an unknown field", r#"{"properties":{"opacity":0},"extra":1}"#.into()),
+            (
+                "a field named like an inherited one",
+                r#"{"constructor":1,"properties":{"opacity":0}}"#.into(),
+            ),
+            (
+                "a field named __proto__",
+                r#"{"__proto__":{},"properties":{"opacity":0}}"#.into(),
+            ),
+            (
+                "a field named toString",
+                r#"{"toString":1,"properties":{"opacity":0}}"#.into(),
+            ),
+            (
+                "an inherited name inside the properties",
+                r#"{"properties":{"opacity":0,"hasOwnProperty":1}}"#.into(),
+            ),
+            ("an inherited name inside the wiggle", wiggle(r#"{"constructor":1}"#)),
+            (
+                "an inherited name inside the range",
+                r#"{"properties":{"opacity":0},"range":{"valueOf":1}}"#.into(),
+            ),
+            (
+                "an unknown name inside the offset",
+                r#"{"properties":{"opacity":0},"range":{"offset":{"by":1}}}"#.into(),
+            ),
+            ("a wrong type", r#"{"duration":"1","properties":{"opacity":0}}"#.into()),
+            (
+                "a null where a number goes",
+                r#"{"delay":null,"properties":{"opacity":0}}"#.into(),
+            ),
+            (
+                "a null where an object goes",
+                r#"{"range":null,"properties":{"opacity":0}}"#.into(),
+            ),
+            ("an unknown word", r#"{"by":"letter","properties":{"opacity":0}}"#.into()),
+            (
+                "a number out of range",
+                r#"{"duration":31,"properties":{"opacity":0}}"#.into(),
+            ),
+            (
+                "a number too big for a float",
+                r#"{"duration":1e999,"properties":{"opacity":0}}"#.into(),
+            ),
+            ("nothing that changes", "{}".into()),
+            ("an array", "[]".into()),
+            ("null", "null".into()),
+            ("not json", "not json".into()),
+        ];
+        cases
+            .into_iter()
+            .map(|(name, raw)| {
+                let read = TextAnimation::from_attribute(&raw).ok();
+                serde_json::json!({ "name": name, "raw": raw, "read": read })
+            })
+            .collect()
     }
 
     #[test]
