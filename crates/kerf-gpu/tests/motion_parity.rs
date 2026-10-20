@@ -164,6 +164,11 @@ struct Media {
     /// cases with a rotated layer.
     smooth: Asset,
     black: Asset,
+    /// 8-pixel blocks of limited-range black (16) and white (235): hard edges, whose scaled overshoot runs
+    /// down to the bottom of the range and clips there, where a table's first entries are steepest.
+    edges: Asset,
+    /// Luma 0 to 255 left to right, chroma ramps against it: every entry of every table, smoothly.
+    ramp: Asset,
     /// `testsrc` whose picture starts 0.3 s after its sound (`StreamInfo::lead`), muxed into MP4
     /// with an edit list as a phone writes it.
     late: Asset,
@@ -217,6 +222,14 @@ fn media() -> &'static Media {
             &format!("gradients=size=640x360:rate=30:duration=4:c0=0xd03020:c1=0x2040e0:c2=0x30c060:nb_colors=3:seed=11:x0=0:y0=0:x1=640:y1=360:speed=0.00001,format=yuv420p,{untagged}"),
         );
         let black = video("black.mp4", "color=c=black:s=640x360:r=30:d=4");
+        let edges = video(
+            "edges.mp4",
+            "nullsrc=size=640x360:rate=30:duration=4,format=yuv420p,geq=lum='if(gt(mod(floor(X/8)+floor(Y/8),2),0.5),16,235)':cb=128:cr=128",
+        );
+        let ramp = video(
+            "ramp.mp4",
+            "nullsrc=size=640x360:rate=30:duration=4,format=yuv420p,geq=lum='X*255/640':cb='X*255/640':cr='255-X*255/640'",
+        );
         let late = dir.join("late.mp4");
         ffmpeg(&[
             "-itsoffset",
@@ -258,6 +271,8 @@ fn media() -> &'static Media {
             noise: probed(&noise),
             smooth: probed(&smooth),
             black: probed(&black),
+            edges: probed(&edges),
+            ramp: probed(&ramp),
             late: probed(&late),
         }
     })
@@ -410,16 +425,12 @@ const HD_TRANSLUCENT: Limits = Limits { y: 2, uv: 2 };
 /// two levels show whether the layer fades, dissolves or is keyed.
 const ROTATED: Limits = Limits { y: 2, uv: 2 };
 
-/// Two levels: a layer the compositor scales *and* grades. The scaler's one level is scaled by the
-/// `eq` contrast (1.1) and rounded again.
+/// Two levels: a layer the compositor scales *and* grades, with tables that step by at most two between neighbouring entries
+/// (`eq::table_steps`, `MAX_AMPLIFIED_ERROR`). The scaler's one level (`SCALED`) is mapped through the tables, so a pair of
+/// values a level apart come out as far apart as the tables' steepest step; the plan draws the frames inside that bound and
+/// refuses the others (`GradeSteep`: contrast past 2, saturation past 2, gamma past about 1.2, a black point parked above 0 under a
+/// gamma above 1; measured Y 3 to 19 and UV 3 on them), exact or not. A bound the grade is judged by, not a number measured and blessed.
 const GRADED_SCALED: Limits = Limits { y: 2, uv: 2 };
-
-/// A layer the compositor scales under a grade at the far ends of the ranges (contrast 1.8, saturation 2, gamma 2
-/// or 0.5, temperature 1): the scaler's one level (`SCALED`) multiplied by the slope of the tables, which for a
-/// gamma above 1 grows without bound toward black (`pow(v, 1/gamma)`). A static grade of those values measures the
-/// same, so it is the scaler's difference being magnified, not the grade's arithmetic (which is exact at the
-/// picture's own size, `EXACT`, however steep).
-const GRADED_STEEP: Limits = Limits { y: 5, uv: 3 };
 
 /// A dip to white: two levels in every plane on the pictures it is drawn for — 8-bit limited-range
 /// untagged 4:2:0, test patterns and noise in all three planes (every Y, U, V combination, clipped RGB
@@ -1811,6 +1822,37 @@ fn run_colour(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, secs: f64, 
     run(case, tl, assets, fps, secs, limits);
 }
 
+fn grade_steep_refused() -> Refusing {
+    refusing("GradeSteep", |u| matches!(u, Unsupported::GradeSteep(..)))
+}
+
+/// How many frames of the first `secs` of a cut the plan refuses for `GradeSteep`, and how many it draws.
+fn grade_steep_split(tl: &Timeline, assets: &[Asset], fps: f64, secs: f64) -> (usize, usize) {
+    let planner = Planner::new(tl, assets, &at_fps(fps), PlanRequest::motion(policy())).expect("planner");
+    let (mut refused, mut drawn) = (0, 0);
+    for k in upto(secs, fps) {
+        let plan = planner.at_frame(k).expect("plan");
+        let why = plan.reasons(&compositor().caps(), plan.size(u32::MAX));
+        if why.iter().any(|u| matches!(u, Unsupported::GradeSteep(..))) {
+            refused += 1;
+        } else if why.is_empty() {
+            drawn += 1;
+        }
+    }
+    (refused, drawn)
+}
+
+/// [`run_refusing`] for a grade whose tables step past two on some frames of a layer the scaler resizes: those frames are
+/// FFmpeg's and the others are held to the export at `limits`. `refused` is how many frames that is (`None`: some, not all).
+fn run_grade_steep(case: &str, tl: &Timeline, assets: &[Asset], secs: f64, limits: Limits, refused: Option<usize>) {
+    let (n, drawn) = grade_steep_split(tl, assets, 30.0, secs);
+    match refused {
+        Some(want) => assert_eq!(n, want, "{case}: {n} frames refused, {drawn} drawn"),
+        None => assert!(n > 0 && drawn > 0, "{case}: {n} frames refused, {drawn} drawn"),
+    }
+    run_refusing(case, tl, assets, 30.0, secs, limits, &grade_steep_refused());
+}
+
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn a_keyed_colour_is_the_eq_of_each_frame() {
@@ -1969,6 +2011,21 @@ fn a_keyed_colour_is_the_eq_of_each_frame() {
         20,
         EXACT,
     );
+    // ... and late on the grid of 29.97 fps, spelled as the text and as the ratio: the start is off the frame grid, and the
+    // time the curve is read at is the clip's own on the `fps` filter's grid.
+    for (name, fps) in [("29.97", 29.97), ("30000/1001", 30000.0 / 1001.0)] {
+        let mut late = colour_keyed(&m.noise, &all, &linear_keys);
+        late.timeline_start = 1.25;
+        run_colour(
+            &format!("keyed colour/late on the timeline @{name}"),
+            &alone(late),
+            noise,
+            fps,
+            2.25,
+            20,
+            EXACT,
+        );
+    }
     let mut fast = colour_keyed(&m.noise, &all, &linear_keys);
     (fast.source_out, fast.speed, fast.timeline_start) = (2.5, 2.0, 0.4);
     run_colour("keyed colour/speed 2", &alone(fast), noise, 30.0, 1.4, 20, EXACT);
@@ -2087,16 +2144,16 @@ fn a_keyed_colour_is_the_eq_of_each_frame() {
         20,
         EXACT,
     );
-    // A layer the compositor scales: the scaler is a level off swscale's x86 kernels, and the grade's tables
-    // multiply that (by their slope: contrast, and gamma's power, which is steepest in the darks). A gentle
-    // grade keeps `GRADED_SCALED`; at the far ends of every range the same holds as for a static grade of
-    // those values, `GRADED_STEEP`.
-    let gentle = |c: &mut Clip| {
+    // A layer the compositor scales: the scaler is a level off swscale's x86 kernels, and the grade's tables multiply that by
+    // their steepest step (`eq::table_steps`: contrast, gamma's power toward black, a black point parked above 0). A frame is
+    // drawn while that step is at most two (`GRADED_SCALED`) and FFmpeg's past it (`GradeSteep`), so a keyed ramp is judged one
+    // frame at a time: the frames inside are held to the export, the others are refused (and the export renders them all the same).
+    let gentle = |c: &mut Clip, gamma_to: f64| {
         for (prop, lo, hi) in [
             (Property::Brightness, -0.1, 0.1),
             (Property::Contrast, 0.9, 1.25),
             (Property::Saturation, 0.8, 1.3),
-            (Property::Gamma, 0.85, 1.2),
+            (Property::Gamma, 0.85, gamma_to),
             (Property::Temperature, -0.5, 0.5),
         ] {
             c.set_property_keys(prop, linear_keys(lo, hi));
@@ -2107,7 +2164,7 @@ fn a_keyed_colour_is_the_eq_of_each_frame() {
         c.set_property_keys(Property::PosX, linear_keys(-0.2, 0.2));
     };
     let mut gentle_pip = clip(&m.testsrc, 0.5, 1.5, 0.0);
-    gentle(&mut gentle_pip);
+    gentle(&mut gentle_pip, 1.1);
     moving(&mut gentle_pip);
     run_colour(
         "keyed colour/moving pip, gentle",
@@ -2118,40 +2175,35 @@ fn a_keyed_colour_is_the_eq_of_each_frame() {
         20,
         GRADED_SCALED,
     );
+    // ... with the gamma going on to 1.2 the ramp's tables step by 3 on one frame (a cliff at the dark end: the first entry
+    // above 0 is 3), which is that frame's alone.
+    let mut gentler_pip = clip(&m.testsrc, 0.5, 1.5, 0.0);
+    gentle(&mut gentler_pip, 1.2);
+    moving(&mut gentler_pip);
+    run_grade_steep(
+        "keyed colour/moving pip, gamma to 1.2",
+        &over_the_bars(gentler_pip),
+        &two,
+        1.0,
+        GRADED_SCALED,
+        Some(1),
+    );
+    // The far ends of every range: the early frames of the ramp (contrast 0.5, saturation 0, gamma 0.5) are inside, the rest steepen.
     let mut steep_pip = colour_keyed(&m.testsrc, &all, &linear_keys);
     moving(&mut steep_pip);
-    run_colour(
+    run_grade_steep(
         "keyed colour/moving pip, steep",
         &over_the_bars(steep_pip),
         &two,
-        30.0,
         1.0,
-        20,
-        GRADED_STEEP,
-    );
-    // ... and a static grade of the values the steep ramp ends on, which is where the bound comes from.
-    let mut static_pip = clip(&m.testsrc, 0.5, 1.5, 0.0);
-    static_pip.transform.scale = 0.6;
-    static_pip.color = Color {
-        brightness: 0.3,
-        contrast: 1.8,
-        saturation: 2.0,
-        gamma: 2.0,
-        temperature: 1.0,
-    };
-    run(
-        "static colour/pip at the end of the steep ramp",
-        &over_the_bars(static_pip),
-        &two,
-        30.0,
-        1.0,
-        GRADED_STEEP,
+        GRADED_SCALED,
+        None,
     );
     // Letterboxed: `pad`'s bars are in the picture `eq` sees, and go through the tables of the frame (the portrait
     // picture is shrunk into the frame: the scaler's level again).
     let delivery = Some(Delivery::new(640, 360, Fit::Contain));
     let mut boxed = clip(&m.portrait, 0.5, 1.5, 0.0);
-    gentle(&mut boxed);
+    gentle(&mut boxed, 1.1);
     run_colour(
         "keyed colour/letterboxed, gentle",
         &timeline(vec![vec![boxed]], delivery),
@@ -2162,14 +2214,13 @@ fn a_keyed_colour_is_the_eq_of_each_frame() {
         GRADED_SCALED,
     );
     let boxed = colour_keyed(&m.portrait, &all, &linear_keys);
-    run_colour(
+    run_grade_steep(
         "keyed colour/letterboxed, steep",
         &timeline(vec![vec![boxed]], delivery),
         std::slice::from_ref(&m.portrait),
-        30.0,
         1.0,
-        20,
-        GRADED_STEEP,
+        GRADED_SCALED,
+        None,
     );
     // Turned (`rotate` follows the `eq`, on the alpha plane) and translucent (the RGB round trip a constant opacity takes
     // reads the graded picture). The turned layer is scaled too, and `ROTATED` is the bound of that alone (ungraded: Y 1 /
@@ -2243,6 +2294,102 @@ fn a_keyed_colour_is_the_eq_of_each_frame() {
     }
     let tl = over_the_bars(zoomed);
     run_colour("keyed colour/under a moving zoom", &tl, &two, 30.0, 1.0, 20, SCALED);
+}
+
+/// A grade on a layer the scaler resizes: the scaler is a level off swscale's and the tables multiply that by their steepest
+/// step (`eq::table_steps`), so a frame is drawn while that step is at most two and FFmpeg's past it (`GradeSteep`), static
+/// grades included. The drawn ones are held to **the step itself** (the bound the plan judged them by) on sources that look at
+/// every table entry: noise, a luma ramp, and hard 16 / 235 edges whose scaled overshoot reaches the bottom of the range. The
+/// refused ones are the grades measured far past it with the refusal bypassed (noise, edges and the ramp, Y / UV off the export:
+/// gamma 1.3 3 / 1, 1.4 4 / 1, 2 6 / 1; contrast 3 3 / 1; contrast 1.8 and gamma 2 12 / 1, with a brightness of 0.3 19 / 1;
+/// saturation 3 1 / 3), here refused on every frame with the export rendering them.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_grade_on_a_layer_the_scaler_resizes_is_drawn_while_its_tables_step_by_two_and_refused_past_it() {
+    use kerf_core::eq::table_steps;
+    let m = media();
+    let grade = |brightness: f64, contrast: f64, saturation: f64, gamma: f64, temperature: f64| Color {
+        brightness,
+        contrast,
+        saturation,
+        gamma,
+        temperature,
+    };
+    let pip = |src: &Asset, color: Color| {
+        let mut c = clip(src, 0.5, 1.5, 0.0);
+        c.transform.scale = 0.6;
+        c.color = color;
+        (
+            timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None),
+            [m.bars.clone(), src.clone()],
+        )
+    };
+    let (noise, edges, ramp) = (("noise", &m.noise), ("edges", &m.edges), ("ramp", &m.ramp));
+    for (name, color, sources) in [
+        // Fixed point: contrast steps by its ceiling and a brightness has no cliff.
+        ("brightness 0.3", grade(0.3, 1.0, 1.0, 1.0, 0.0), vec![ramp, edges]),
+        ("contrast 2", grade(0.0, 2.0, 1.0, 1.0, 0.0), vec![ramp, edges]),
+        // The pow table: a gamma above 1 steepens toward black (2 at 1.2); a brightness that lifts the dark end off the
+        // table's cliff takes the steepness away again (gamma 2, step 1).
+        ("gamma 1.2", grade(0.0, 1.0, 1.0, 1.2, 0.0), vec![ramp, edges, noise]),
+        ("gamma 0.5", grade(0.0, 1.0, 1.0, 0.5, 0.0), vec![ramp]),
+        (
+            "brightness 0.3 and gamma 2",
+            grade(0.3, 1.0, 1.0, 2.0, 0.0),
+            vec![ramp, edges],
+        ),
+        // Chroma: saturation is the tables' contrast, a temperature a power of the chroma.
+        ("saturation 2", grade(0.0, 1.0, 2.0, 1.0, 0.0), vec![noise, ramp]),
+        ("temperature 1", grade(0.0, 1.0, 1.0, 1.0, 1.0), vec![noise]),
+    ] {
+        let [y, u, v] = table_steps(&color);
+        assert!(y.max(u).max(v) <= 2, "{name}: steps {y}/{u}/{v} are past what is drawn");
+        let limits = Limits {
+            y: y as i32,
+            uv: u.max(v) as i32,
+        };
+        for (source, asset) in sources {
+            let (tl, assets) = pip(asset, color);
+            run(
+                &format!("static colour/pip, {name}, {source}"),
+                &tl,
+                &assets,
+                30.0,
+                0.4,
+                limits,
+            );
+        }
+    }
+    // Past two, every frame is FFmpeg's. The dark end by gamma (the first table entry above 0 steps by 256 * (1/255)^(1/gamma)),
+    // by a brightness that parks the black point above 0 under a gamma, by contrast, by saturation, and at the far end of every range.
+    for (name, color) in [
+        ("gamma 1.3", grade(0.0, 1.0, 1.0, 1.3, 0.0)),
+        ("gamma 1.4", grade(0.0, 1.0, 1.0, 1.4, 0.0)),
+        ("gamma 2", grade(0.0, 1.0, 1.0, 2.0, 0.0)),
+        ("brightness -0.3 and gamma 1.5", grade(-0.3, 1.0, 1.0, 1.5, 0.0)),
+        ("contrast 3", grade(0.0, 3.0, 1.0, 1.0, 0.0)),
+        ("contrast 1.8 and gamma 2", grade(0.0, 1.8, 1.0, 2.0, 0.0)),
+        ("saturation 3", grade(0.0, 1.0, 3.0, 1.0, 0.0)),
+        ("the far end of every range", grade(0.3, 1.8, 2.0, 2.0, 1.0)),
+    ] {
+        let steps = table_steps(&color);
+        assert!(steps.into_iter().max().unwrap() > 2, "{name}: {steps:?}");
+        let (tl, assets) = pip(&m.ramp, color);
+        let case = format!("static colour/pip, {name}, refused");
+        assert_eq!(grade_steep_split(&tl, &assets, 30.0, 0.4), (12, 0), "{case}");
+        run_refusing(&case, &tl, &assets, 30.0, 0.4, GRADED_SCALED, &grade_steep_refused());
+    }
+    // The same far end at the picture's size is exact (nothing is resized): drawn, to the level.
+    let mut alone = clip(&m.ramp, 0.5, 1.5, 0.0);
+    alone.color = grade(0.3, 1.8, 2.0, 2.0, 1.0);
+    run(
+        "static colour/the far end of every range, unscaled",
+        &timeline(vec![vec![alone]], None),
+        std::slice::from_ref(&m.ramp),
+        30.0,
+        0.4,
+        EXACT,
+    );
 }
 
 /// The colour is graded in the picture the chain has made 4:2:0 and 8-bit by then, so a keyed colour is exact

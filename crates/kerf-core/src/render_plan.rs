@@ -27,6 +27,7 @@ use uuid::Uuid;
 
 use crate::clip_timing::{FadeEdge, FadeStep, FadeTint, Rational, FADE_FULL};
 use crate::engine::Fit;
+use crate::eq;
 use crate::error::Result;
 use crate::frame_pick::Pick;
 use crate::layer_geometry::{Keyed, LayerGeometry, Placement};
@@ -753,9 +754,11 @@ fn effect_refusal(effect: &VideoEffect, caps: &GpuCaps) -> Option<&'static str> 
     }
 }
 
-/// The worst-case luma error, in levels, the plan allows through the sharpens after a scale or a blur (which
-/// start it at one): two, the bound of a scaled blur. One sharpen of 0.5 reaches it exactly.
-const MAX_SHARPEN_ERROR: f64 = 2.0;
+/// The worst-case error, in levels, the plan allows a one-level difference from FFmpeg's upstream (the
+/// compositor's scaler, a blur's summation order) to grow to through what is drawn after it: the steepest step
+/// of a grade's tables (`eq::table_steps`) and the sharpens (which start it at one, or at the grade's step).
+/// Two is the bound of a scaled blur and of a gentle grade on a scaled layer; one sharpen of 0.5 reaches it exactly.
+pub const MAX_AMPLIFIED_ERROR: u32 = 2;
 
 /// What an effect does to this kind of picture that the compositor, which works on the 4:2:0 limited-range
 /// planes the decode hands it, does not: FFmpeg runs the filter on the picture as it is in the graph, and the
@@ -849,22 +852,37 @@ impl RenderPlan {
             // the first adds up to a level of its own however small its amount (two of 0.2 reach 3, three
             // of 0.1 reach 4). From the first source of difference on (a scale ahead of the effects: every
             // stage, or the fit scale when a moving zoom comes last; or a blur with a sigma) the worst case
-            // is followed through the sharpens that count, `err += ceil(2 * err * |amount|)` from 1, and the
+            // is followed through the sharpens that count, `err += ceil(2 * err * |amount|)` from 1 (from the
+            // luma step of the grade between them where the layer is graded), and the
             // frame is drawn only while it stays within the two levels a scaled blur does: one sharpen of
             // at most 0.5, and no second one. A sharpen of nothing at `unsharp`'s 16-bit precision counts
             // for nothing; with no source upstream a sharpen is exact at any amount.
             let zoom_last = layer.animated.is_some_and(|a| a.zooms) && geom.stages.len() == 2;
             let before_effects = if zoom_last { 1 } else { geom.stages.len() };
-            let mut err = if geom.stages[..before_effects].iter().any(|s| s.scaled != (s.src.w, s.src.h)) {
-                1.0
-            } else {
-                0.0
-            };
+            let scaled = geom.stages[..before_effects].iter().any(|s| s.scaled != (s.src.w, s.src.h));
+            // The `eq` is next in the chain after those scales (the compositor applies its tables in the vertical
+            // pass of the last of them), and they multiply the scaler's level: two pictures a level apart are, after
+            // them, as far apart as the tables' steepest step between neighbouring entries (`eq::table_steps`,
+            // the whole table: the scaler's overshoot at a hard edge reaches the bottom of the range, where a
+            // table leaving 0 for its first entry steps by 256 * (1/255)^(1/gamma) at a black point of 0 and by
+            // more where a contrast or a negative brightness parks it higher). Up to two is the bound of a
+            // scaled blur and `GRADED_SCALED`'s (contrast and saturation up to 2, a gamma toward 1 or a little
+            // over: 1.2); past it the step is not bounded (12 and 19 levels measured at the far ends of every
+            // range), so the frame is FFmpeg's. A plan with a keyed colour judges each frame's numbers, and
+            // the luma step is where a sharpen after the grade starts its own worst case from, below.
+            let steps = if scaled { eq::table_steps(&layer.color) } else { [1; 3] };
+            let steepest = steps.into_iter().max().unwrap_or(1);
+            if steepest > MAX_AMPLIFIED_ERROR {
+                reasons.push(Unsupported::GradeSteep(self.layer_ref(n, layer), steepest));
+            }
+            let mut err = if scaled { f64::from(steps[0]).max(1.0) } else { 0.0 };
+            let mut sharpened = false;
             for effect in &layer.effects {
                 match effect {
                     VideoEffect::Blur { sigma } if *sigma > 0.0 && err == 0.0 => err = 1.0,
                     VideoEffect::Sharpen { amount } if err > 0.0 && (f64::from(*amount as f32) * 65536.0) as i32 != 0 => {
                         err += (2.0 * err * amount.abs()).ceil();
+                        sharpened = true;
                     }
                     _ => {}
                 }
@@ -874,7 +892,6 @@ impl RenderPlan {
             // chroma that is FFmpeg's to the level. It runs after every effect: no scale ahead of the effects and
             // no blur among them (a sharpen leaves the chroma alone, the tables are exact).
             let chroma_keyed = layer.effects.iter().any(|e| matches!(e, VideoEffect::ChromaKey { .. }));
-            let scaled = geom.stages[..before_effects].iter().any(|s| s.scaled != (s.src.w, s.src.h));
             let blurred = layer
                 .effects
                 .iter()
@@ -898,7 +915,7 @@ impl RenderPlan {
                     "a chroma key on a picture narrower or shorter than 2",
                 ));
             }
-            if err > MAX_SHARPEN_ERROR {
+            if sharpened && err > f64::from(MAX_AMPLIFIED_ERROR) {
                 reasons.push(Unsupported::Effects(
                     self.layer_ref(n, layer),
                     "a sharpen after a scale or a blur: it amplifies their one-level difference from FFmpeg's by 1 + 2|amount| and rounds up a level more with each further sharpen, past two levels",
@@ -2907,6 +2924,147 @@ mod tests {
         // (a blur still counts ahead of a zoom: the sharpen after it is of a blurred picture)
         let why = reasons(&zooming(vec![blur(), sharp(1.0)]), u32::MAX);
         assert!(refused(&why), "{why:?}");
+    }
+
+    #[test]
+    fn a_grade_whose_tables_amplify_the_scalers_level_past_two_is_refused_on_a_layer_it_resizes() {
+        use crate::model::Keyframe;
+        let caps = GpuCaps {
+            effects: EffectKinds::SHARPEN.union(EffectKinds::BLUR).union(EffectKinds::INVERT),
+            keyed_zoom: true,
+            ..GpuCaps::A0
+        };
+        let grade = |brightness: f64, contrast: f64, saturation: f64, gamma: f64, temperature: f64| Color {
+            brightness,
+            contrast,
+            saturation,
+            gamma,
+            temperature,
+        };
+        let steepest = |why: &[Unsupported]| {
+            why.iter().find_map(|u| match u {
+                Unsupported::GradeSteep(_, n) => Some(*n),
+                _ => None,
+            })
+        };
+        let pip = |color: Color| {
+            move |c: &mut Clip| {
+                c.transform.scale = 0.6;
+                c.color = color;
+            }
+        };
+        let why_of = |edit: &dyn Fn(&mut Clip), width: u32| {
+            let plan = fading_plan(|c| edit(c), 0.5);
+            plan.reasons(&caps, plan.size(width))
+        };
+        // Up to a step of two between neighbouring table entries the scaler's level is two at worst, which is what a
+        // scaled blur is held to; past it the frame is FFmpeg's, and the reason says how steep. (The boundary: contrast
+        // 2 steps by exactly 2, 2.05 by 3; the chroma tables' contrast is the saturation, and a temperature is a power
+        // of the chroma toward 1.)
+        for (name, color, step) in [
+            ("identity", Color::default(), None),
+            ("brightness alone", grade(0.3, 1.0, 1.0, 1.0, 0.0), None),
+            ("the montage's grade", grade(0.0, 1.1, 1.2, 1.0, 0.0), None),
+            ("contrast 2", grade(0.0, 2.0, 1.0, 1.0, 0.0), None),
+            ("contrast 2.05", grade(0.0, 2.05, 1.0, 1.0, 0.0), Some(3)),
+            ("contrast 4", grade(0.0, 4.0, 1.0, 1.0, 0.0), Some(4)),
+            ("saturation 2", grade(0.0, 1.0, 2.0, 1.0, 0.0), None),
+            ("saturation 2.05", grade(0.0, 1.0, 2.05, 1.0, 0.0), Some(3)),
+            ("saturation 3", grade(0.0, 1.0, 3.0, 1.0, 0.0), Some(3)),
+            ("temperature 1", grade(0.0, 1.0, 1.0, 1.0, 1.0), None),
+            ("temperature 1 and saturation 2", grade(0.0, 1.0, 2.0, 1.0, 1.0), Some(3)),
+            // The dark end: a table that leaves 0 for its first entry steps from nothing to a power of one
+            // sample, in the luma when the contrast or a negative brightness parks the black point above
+            // the bottom of the range, and a brightness that lifts it clear of the table has no such step.
+            ("gamma 1.2", grade(0.0, 1.0, 1.0, 1.2, 0.0), None),
+            ("contrast 1.8 and gamma 1.2", grade(0.0, 1.8, 1.0, 1.2, 0.0), Some(4)),
+            ("brightness -0.3 and gamma 1.2", grade(-0.3, 1.0, 1.0, 1.2, 0.0), None),
+            ("brightness -0.3 and gamma 1.5", grade(-0.3, 1.0, 1.0, 1.5, 0.0), Some(4)),
+            ("brightness -0.2 and gamma 2", grade(-0.2, 1.0, 1.0, 2.0, 0.0), Some(16)),
+            ("contrast 1.8 and gamma 2", grade(0.0, 1.8, 1.0, 2.0, 0.0), Some(12)),
+            ("brightness 0.3 and gamma 2", grade(0.3, 1.0, 1.0, 2.0, 0.0), None),
+            ("the far end of every range", grade(0.3, 1.8, 2.0, 2.0, 1.0), Some(19)),
+        ] {
+            let why = why_of(&pip(color), u32::MAX);
+            let got = steepest(&why);
+            assert_eq!(got, step, "{name}: {why:?}");
+            assert_eq!(why.len(), usize::from(step.is_some()), "{name}: {why:?}");
+            if let Some(step) = step {
+                assert!(
+                    why[0].to_string().contains(&format!("step {step} levels")),
+                    "{name}: {}",
+                    why[0]
+                );
+                assert_eq!(why[0].kind(), "grade_steep");
+            }
+            // At the picture's own size nothing is resized, the tables are exact, and any grade is drawn.
+            let why = why_of(&|c| c.color = color, u32::MAX);
+            assert!(why.is_empty(), "{name} unscaled: {why:?}");
+        }
+        // The scaler is what feeds the tables: rendered smaller, the fit scale is a real one; a Cover or Contain fit
+        // into another frame is too; and a crop alone is not.
+        let steep = grade(0.0, 1.8, 1.0, 2.0, 0.0);
+        let why = why_of(&|c| c.color = steep, 480);
+        assert!(steepest(&why).is_some(), "{why:?}");
+        let why = why_of(
+            &|c| {
+                c.color = steep;
+                c.transform.crop_left = 0.1;
+            },
+            u32::MAX,
+        );
+        assert!(why.is_empty(), "a crop leaves the size: {why:?}");
+        let plan = fading_plan_of(
+            video(360, 640),
+            Some(Delivery::new(640, 360, Fit::Contain)),
+            CompositeColorPolicy::FixedBt601,
+            |c| c.color = steep,
+            0.5,
+        );
+        assert!(steepest(&plan.reasons(&caps, plan.size(u32::MAX))).is_some(), "letterboxed");
+        // A moving zoom comes last: only the fit scale is ahead of the `eq`.
+        let zooming = |color: Color| {
+            move |c: &mut Clip| {
+                let key = |time: f64, scale: f64| Keyframe {
+                    time,
+                    scale,
+                    pos_x: 0.0,
+                    pos_y: 0.0,
+                    rotation: 0.0,
+                    opacity: 1.0,
+                    easing: Default::default(),
+                };
+                c.keyframes = vec![key(0.0, 1.0), key(4.0, 1.5)];
+                c.color = color;
+            }
+        };
+        let why = why_of(&zooming(steep), u32::MAX);
+        assert!(
+            why.is_empty(),
+            "the grade runs at the fit size, which is the picture's: {why:?}"
+        );
+        let why = why_of(&zooming(steep), 480);
+        assert!(steepest(&why).is_some(), "{why:?}");
+        // The grade's step is where a sharpen after it starts from (it is luma only): a luma step of two
+        // plus any sharpen is past two levels, a step of one is the plain scaler's.
+        let sharpened = |color: Color, amount: f64| {
+            let why = why_of(
+                &|c| {
+                    pip(color)(c);
+                    c.effects = vec![VideoEffect::Sharpen { amount }];
+                },
+                u32::MAX,
+            );
+            why.is_empty()
+        };
+        assert!(sharpened(grade(0.2, 1.0, 1.0, 1.0, 0.0), 0.5));
+        assert!(!sharpened(grade(0.2, 1.0, 1.0, 1.0, 0.0), 0.6));
+        assert!(
+            sharpened(grade(0.0, 1.0, 1.0, 1.0, 1.0), 0.5),
+            "a chroma step is not the luma's"
+        );
+        assert!(!sharpened(grade(0.0, 1.1, 1.0, 1.0, 0.0), 0.1));
+        assert!(!sharpened(grade(0.0, 1.1, 1.0, 1.0, 0.0), 0.5));
     }
 
     #[test]

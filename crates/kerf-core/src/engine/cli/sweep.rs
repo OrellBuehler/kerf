@@ -464,9 +464,8 @@ fn pushed_clip_for_bundle(asset: uuid::Uuid) -> Clip {
     clip
 }
 
-/// The cuts that key single numbers of a clip (see `cuts`).
-const CHANNEL_CUTS: [&str; 6] = [
-    "colour channels",
+/// The cuts that key single numbers of a clip (see `cuts`), other than the colour: that one takes all five rates.
+const CHANNEL_CUTS: [&str; 5] = [
     "opacity keyed alone",
     "position keyed alone",
     "zoom keyed alone",
@@ -490,8 +489,8 @@ fn the_motion_plan_samples_the_curves_the_graphs_expressions_write_at_every_outp
             (30.0, (30, 1)),
             (60.0, (60, 1)),
         ] {
-            // The channel cuts take 24 and 29.97, the rates whose frame times part from `k / fps` (the sweep is the slow test
-            // of the suite); the others take all five.
+            // The other channel cuts take 24 and 29.97, the rates whose frame times part from `k / fps` (the sweep is the
+            // slow test of the suite); the colour's, whose numbers are held to the bit, and the others take all five.
             if CHANNEL_CUTS.contains(&name) && !matches!(num, 24 | 2997) {
                 continue;
             }

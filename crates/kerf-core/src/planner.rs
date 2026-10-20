@@ -2062,6 +2062,60 @@ mod tests {
     }
 
     #[test]
+    fn a_keyed_colour_is_judged_by_the_steps_of_each_frames_tables_on_a_layer_the_scaler_resizes() {
+        use crate::eq::table_steps;
+        use crate::model::{Property, PropertyKey};
+        let caps = GpuCaps {
+            motion: true,
+            keyed_color: true,
+            ..GpuCaps::A0
+        };
+        let a = asset();
+        let assets = [a.clone()];
+        // Gamma climbs from 1 to 2 over a second: the tables' dark end steepens with it (a first entry that is
+        // not 0 is a step of its own), and the frames are judged one by one, drawn while the steepest step is two.
+        let ramp = |scale: f64| {
+            let mut clip = make_clip(a.id, 0.0, 4.0, 1.0);
+            clip.transform.scale = scale;
+            clip.set_property_keys(Property::Gamma, vec![PropertyKey::new(0.0, 1.0), PropertyKey::new(1.0, 2.0)]);
+            clip
+        };
+        let judged = |scale: f64| -> Vec<(u32, bool)> {
+            let tl = single(vec![ramp(scale)]);
+            let p = planner(&tl, &assets, PlanMode::Motion, &opts(30.0));
+            (30..60)
+                .map(|k| {
+                    let plan = p.at_frame(k).unwrap();
+                    let why = plan.reasons(&caps, plan.size(u32::MAX));
+                    let steepest = table_steps(&plan.layers[0].color).into_iter().max().unwrap();
+                    let refused = why.iter().find_map(|u| match u {
+                        Unsupported::GradeSteep(_, n) => Some(*n),
+                        _ => None,
+                    });
+                    assert_eq!(
+                        refused,
+                        (scale < 1.0 && steepest > 2).then_some(steepest),
+                        "frame {k}: {why:?}"
+                    );
+                    assert_eq!(why.len(), usize::from(refused.is_some()), "frame {k}: {why:?}");
+                    (steepest, refused.is_some())
+                })
+                .collect()
+        };
+        // A pip: the first frames (gamma 1) are drawn, the last (gamma 2) refused, and the steps never fall back as
+        // the gamma goes up.
+        let pip = judged(0.6);
+        assert!(!pip[0].1 && pip[29].1, "{pip:?}");
+        assert!(pip.windows(2).all(|w| w[0].0 <= w[1].0), "{pip:?}");
+        let drawn = pip.iter().filter(|(_, refused)| !refused).count();
+        assert!((1..29).contains(&drawn), "{drawn} of 30 frames drawn: {pip:?}");
+        // At the picture's size the tables are exact, whatever they step by.
+        let plain = judged(1.0);
+        assert!(plain.iter().all(|(_, refused)| !refused), "{plain:?}");
+        assert_eq!(plain, pip.iter().map(|(n, _)| (*n, false)).collect::<Vec<_>>());
+    }
+
+    #[test]
     fn a_keyed_mask_is_sampled_per_frame_and_a_keyed_crop_is_refused_in_every_frame() {
         use crate::model::{Mask, Property, PropertyKey};
         let a = asset();
