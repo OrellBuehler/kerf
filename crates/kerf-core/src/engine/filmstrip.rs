@@ -1480,6 +1480,7 @@ mod tests {
             color_transfer: None,
             color_primaries: None,
             color_space: None,
+            color_range: None,
             pix_fmt: None,
             lead: 0.0,
         }

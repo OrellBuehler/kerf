@@ -752,6 +752,7 @@ mod tests {
             color_primaries: None,
             pix_fmt: None,
             color_space: None,
+            color_range: None,
             lead: 0.0,
         }
     }

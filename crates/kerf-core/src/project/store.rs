@@ -90,6 +90,12 @@ const MIGRATIONS: &[Migration] = &[
         destructive: false,
         needed_to_read: false,
     },
+    Migration {
+        run: v9_to_v10,
+        needed: v9_to_v10_needed,
+        destructive: false,
+        needed_to_read: false,
+    },
 ];
 
 /// The schema this build writes and the newest it opens.
@@ -235,6 +241,20 @@ fn v8_to_v9(_: &Connection) -> rusqlite::Result<()> {
 }
 
 fn v8_to_v9_needed(_: &Connection) -> bool {
+    true
+}
+
+/// v10: an asset's video stream may carry `StreamInfo.color_range` (`"pc"` or `"tv"`, in the `streams` JSON
+/// column), the sample range the file declares. It is a field an older build drops at its next write of the
+/// asset, and then reads the picture as it did before the tag was recorded. Assets stored before this step
+/// have none, which stays "not known" (a renderer treats it as it always did); the tag is read when the file is
+/// probed again (a relink, or the file imported anew). Nothing in the file's tables changes; the step is the
+/// version that keeps an older build out, after the file is copied aside.
+fn v9_to_v10(_: &Connection) -> rusqlite::Result<()> {
+    Ok(())
+}
+
+fn v9_to_v10_needed(_: &Connection) -> bool {
     true
 }
 

@@ -2592,8 +2592,8 @@ fn a_translucent_layer_dissolves_and_is_refused_its_fades_to_black() {
 struct Variants {
     tenbit: Asset,
     /// 10-bit tagged full range (`-color_range pc`): ffprobe names it `yuv420p10le`, like the limited
-    /// one, and [`StreamInfo`](kerf_core::StreamInfo) does not record the tag, so nothing in a plan
-    /// tells the two apart.
+    /// one. The probe records the tag now, but a limited file may say nothing, so under FFmpeg 9 the
+    /// plan still refuses a deeper picture by its depth; the tag settles it where it is there.
     tenbit_pc: Asset,
     yuv444: Asset,
     yuv422: Asset,
@@ -4170,4 +4170,168 @@ fn a_labelled_hd_clip_dips_through_white_with_the_bt709_round_trip() {
         "the graph holds a BT.709 clip: the dipping HD clip is labelled"
     );
     run("label/dip-white-labelled-hd", &tl, &assets, 30.0, 2.0, WHITE_709);
+}
+
+// ---- a yuv420p flagged full range ---------------------------------------------------------------
+
+/// The same pictures as `tests/parity.rs`' (`range_media`), long enough for a clip cut from the middle: lossless
+/// FFV1, which keeps the format `yuv420p` whatever the flag (H.264 would call a full-range stream `yuvj420p`).
+struct RangeMedia {
+    /// The test pattern flagged `-color_range pc`, the same flagged `tv` and not flagged, and a gradient flagged `pc`.
+    pc: Asset,
+    tv: Asset,
+    unflagged: Asset,
+    pc_gradient: Asset,
+}
+
+fn range_media() -> &'static RangeMedia {
+    static R: OnceLock<RangeMedia> = OnceLock::new();
+    R.get_or_init(|| {
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("motion-media-range");
+        std::fs::create_dir_all(&dir).unwrap();
+        let testsrc = "testsrc2=size=640x360:rate=30:duration=4";
+        let gradients = "gradients=size=640x360:rate=30:duration=4:c0=0xd03020:c1=0x2040e0:c2=0x30c060:nb_colors=3:seed=11:x0=0:y0=0:x1=640:y1=360:speed=0.00001,format=yuv420p";
+        let make = |name: &str, lavfi: &str, flag: Option<&str>| -> Asset {
+            let p = dir.join(name);
+            let mut args = vec!["-f", "lavfi", "-i", lavfi, "-c:v", "ffv1", "-pix_fmt", "yuv420p"];
+            if let Some(flag) = flag {
+                args.extend(["-color_range", flag]);
+            }
+            args.push(p.to_str().unwrap());
+            ffmpeg(&args);
+            let a = probed(&p);
+            assert_eq!(a.streams[0].pix_fmt.as_deref(), Some("yuv420p"), "{name}");
+            // (An unflagged FFV1 file reads `tv` from FFmpeg 9's muxer and nothing from 6.1.1's: neither is full range.)
+            match flag {
+                Some(flag) => assert_eq!(a.streams[0].color_range.as_deref(), Some(flag), "{name}"),
+                None => assert_ne!(a.streams[0].color_range.as_deref(), Some("pc"), "{name}"),
+            }
+            a
+        };
+        RangeMedia {
+            pc: make("pc.mkv", testsrc, Some("pc")),
+            tv: make("tv.mkv", testsrc, Some("tv")),
+            unflagged: make("unflagged.mkv", testsrc, None),
+            pc_gradient: make("pc-gradient.mkv", gradients, Some("pc")),
+        }
+    })
+}
+
+/// A `yuv420p` flagged full range (a VP9, HEVC or AV1 file) is, in an export, what a `yuvj420p` is under FFmpeg 9 and
+/// what it is not under FFmpeg 6: FFmpeg 9 flags the whole export full range and keeps the clip's raw
+/// samples (every frame of the cut 16 levels off, a black one included), so the cut is refused as for a `yuvj` clip;
+/// FFmpeg 6 hands its raw samples to the filters too (no conversion ahead of them: a format that is already the
+/// overlay's), so a plain frame, a cut and a layer over it are exact there while a fade (14 levels), a vignette (10),
+/// an invert (4), `eq` (6), a sharpen (20), a blur (1) and a resize (UV 8) are not, and those are refused under both.
+/// The same pictures flagged `tv`, or not at all, are drawn as ever.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_yuv420p_flagged_full_range_is_drawn_or_refused_as_the_export_reads_its_raw_samples() {
+    use kerf_core::VideoEffect as E;
+    let m = media();
+    let r = range_media();
+    eprintln!("composite colour policy of this FFmpeg: {:?}", policy());
+    let one = |a: &Asset, edit: &dyn Fn(&mut Clip)| {
+        let mut c = clip(a, 0.5, 1.5, 0.0);
+        edit(&mut c);
+        timeline(vec![vec![c]], None)
+    };
+    let over_bars = |a: &Asset, edit: &dyn Fn(&mut Clip)| {
+        let mut c = clip(a, 0.5, 1.5, 0.0);
+        edit(&mut c);
+        (
+            timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None),
+            vec![m.bars.clone(), a.clone()],
+        )
+    };
+    let pc = std::slice::from_ref(&r.pc);
+
+    // Plain: exact under FFmpeg 6; under FFmpeg 9 the cut is the export's flag. A cut that holds the clip too, either side of it.
+    run_full_range("range/pc-plain", &one(&r.pc, &|_| {}), pc, 30.0, 1.0, EXACT);
+    let tl = timeline(vec![vec![clip(&m.black, 0.5, 1.5, 0.0), clip(&r.pc, 0.5, 1.5, 1.0)]], None);
+    run_full_range("range/black-then-pc", &tl, &[m.black.clone(), r.pc.clone()], 30.0, 2.0, EXACT);
+    let tl = timeline(vec![vec![clip(&r.pc, 0.5, 1.5, 0.0), clip(&m.testsrc, 0.5, 1.5, 1.0)]], None);
+    run_full_range(
+        "range/pc-then-limited",
+        &tl,
+        &[r.pc.clone(), m.testsrc.clone()],
+        30.0,
+        2.0,
+        EXACT,
+    );
+
+    // A fade: refused for the frames it runs in under FFmpeg 6 (the rest of the clip, plain, is exact there), and the
+    // cut under FFmpeg 9.
+    let fade_refused = match policy() {
+        CompositeColorPolicy::FixedBt601 => refusing("FullRangeNegotiated", |u| matches!(u, Unsupported::FullRangeNegotiated(_))),
+        _ => full_range_cut_refused(),
+    };
+    let tl = one(&r.pc, &|c| {
+        c.fade_in = 0.5;
+        c.fade_out = 0.5;
+    });
+    run_refusing("range/pc-fade", &tl, pc, 30.0, 1.0, EXACT, &fade_refused);
+    // The scaler resizes it (an enlargement, or a shrink over the bars): swscale converts the range inside the resize,
+    // under either FFmpeg.
+    let (tl, assets) = over_bars(&r.pc, &|c| c.transform.scale = 0.5);
+    run_refusing(
+        "range/pc-shrunk-over-bars",
+        &tl,
+        &assets,
+        30.0,
+        1.0,
+        SCALED,
+        &full_range_resized_refused(),
+    );
+    let enlarged = timeline(
+        vec![vec![clip(&r.pc, 0.5, 1.5, 0.0)]],
+        Some(Delivery::new(960, 540, Fit::Contain)),
+    );
+    run_refusing(
+        "range/pc-enlarged",
+        &enlarged,
+        pc,
+        30.0,
+        1.0,
+        EXACT,
+        &full_range_resized_refused(),
+    );
+
+    // What reads the values: refused on every frame, under both.
+    let at = at_fps(30.0);
+    for (name, effects, why) in [
+        ("vignette", vec![E::Vignette], "vignette"),
+        ("invert", vec![E::Invert], "full-range"),
+        ("blur", vec![E::Blur { sigma: 3.0 }], "full-range"),
+        ("sharpen", vec![E::Sharpen { amount: 1.0 }], "full-range"),
+    ] {
+        let tl = one(&r.pc, &|c| c.effects = effects.clone());
+        refused(&format!("range/pc-{name}"), &tl, pc, &at, 0..30, why);
+    }
+    refused(
+        "range/pc-graded",
+        &one(&r.pc, &|c| c.color.gamma = 1.4),
+        pc,
+        &at,
+        0..30,
+        "colour correction",
+    );
+    let (tl, assets) = over_bars(&r.pc_gradient, &|c| c.effects = vec![key("green", 0.3, 0.3)]);
+    refused("range/pc-chroma-key", &tl, &assets, &at, 0..30, "chroma key");
+
+    // Flagged limited, or not flagged: the same graphs are exact, as ever.
+    for (label, a) in [("tv", &r.tv), ("unflagged", &r.unflagged)] {
+        let one_a = std::slice::from_ref(a);
+        for (name, effects) in [("vignette", vec![E::Vignette]), ("invert", vec![E::Invert])] {
+            let tl = one(a, &|c| c.effects = effects.clone());
+            run(&format!("range/{label}-{name}"), &tl, one_a, 30.0, 1.0, EXACT);
+        }
+        let tl = one(a, &|c| {
+            c.fade_in = 0.5;
+            c.fade_out = 0.5;
+        });
+        run(&format!("range/{label}-fade"), &tl, one_a, 30.0, 1.0, EXACT);
+        let tl = one(a, &|c| c.color.gamma = 1.4);
+        run(&format!("range/{label}-graded"), &tl, one_a, 30.0, 1.0, EXACT);
+    }
 }

@@ -1370,6 +1370,66 @@ mod tests {
         assert!(!holds(vec![base(), audio], bt), "audio-only use");
     }
 
+    /// A `yuv420p` flagged `pc` is FFmpeg 9's flagged-export cut like a `yuvj` clip, and FFmpeg 6's raw
+    /// fade (nothing converts its range ahead of the fade) in the frames the fade runs in, a plain frame of
+    /// it being exact there.
+    #[test]
+    fn a_yuv420p_flagged_full_range_refuses_the_cut_under_ffmpeg_9_and_its_fade_under_both() {
+        let caps = GpuCaps {
+            motion: true,
+            fades: true,
+            transitions: true,
+            ..GpuCaps::A0
+        };
+        let limited = asset();
+        let mut flagged = asset();
+        flagged.streams[0].color_range = Some("pc".into());
+        let mut tv = asset();
+        tv.streams[0].color_range = Some("tv".into());
+        let (plain, bt) = (CompositeColorPolicy::FixedBt601, CompositeColorPolicy::BottomLayerTag);
+        let at = |a: &Asset, fade: f64, policy: CompositeColorPolicy, k: u64| {
+            let mut c = make_clip(a.id, 0.0, 4.0, 0.0);
+            c.fade_in = fade;
+            let tl = single(vec![c]);
+            let plan = Planner::new(&tl, std::slice::from_ref(a), &opts(30.0), PlanRequest::motion(policy))
+                .unwrap()
+                .at_frame(k)
+                .unwrap();
+            plan.reasons(&caps, plan.size(u32::MAX))
+        };
+        // Plain: FFmpeg 9 flags the export full range (the cut's reason); FFmpeg 6 draws it to the level.
+        assert!(at(&flagged, 0.0, bt, 10).contains(&Unsupported::FullRangeCut));
+        assert_eq!(at(&flagged, 0.0, plain, 10), vec![]);
+        // Not flagged, or flagged limited: as before.
+        for a in [&limited, &tv] {
+            assert_eq!(at(a, 1.0, bt, 10), vec![]);
+            assert_eq!(at(a, 1.0, plain, 10), vec![]);
+        }
+        // The fade: refused under FFmpeg 6 in the frames it runs in (frame 10 of a 1 s fade) and drawn after it.
+        let why = at(&flagged, 1.0, plain, 10);
+        assert!(matches!(why.as_slice(), [Unsupported::FullRangeNegotiated(_)]), "{why:?}");
+        assert_eq!(at(&flagged, 1.0, plain, 60), vec![], "the fade is over");
+        // Under FFmpeg 9 the cut is the reason, and a layer's own is a still's.
+        let why = at(&flagged, 1.0, bt, 10);
+        assert!(why.contains(&Unsupported::FullRangeCut), "{why:?}");
+        assert!(
+            !why.iter().any(|w| matches!(w, Unsupported::FullRangeNegotiated(_))),
+            "{why:?}"
+        );
+        // ffprobe prints `pc` for an RGB picture and a gray one on every FFmpeg: not a flag, no cut.
+        for fmt in ["rgb24", "bgr0", "gray"] {
+            let mut flat = asset();
+            flat.streams[0].pix_fmt = Some(fmt.into());
+            flat.streams[0].color_range = Some("pc".into());
+            let tl = single(vec![make_clip(flat.id, 0.0, 4.0, 0.0)]);
+            let plan = Planner::new(&tl, std::slice::from_ref(&flat), &opts(30.0), PlanRequest::motion(bt))
+                .unwrap()
+                .at_frame(10)
+                .unwrap();
+            assert!(!plan.canvas.full_range_cut, "{fmt}");
+        }
+    }
+
     #[test]
     fn a_deeper_than_8_bit_picture_may_be_full_range_only_where_ffmpeg_9_handles_it_raw() {
         let mut limited = asset();
@@ -1579,6 +1639,56 @@ mod tests {
             .reasons(&caps, falling.size(u32::MAX))
             .iter()
             .any(|u| matches!(u, Unsupported::Effects(_, w) if w.contains("below full opacity"))));
+    }
+
+    /// A keyed opacity copies the picture's samples through its `geq`, so it neither adds a full-range reason
+    /// nor hides one: a flagged `yuv420p` under a chroma key is refused for the key (naming the flag) and for
+    /// the opacity, and under no effect it is drawn like a plain layer.
+    #[test]
+    fn a_keyed_opacity_on_a_flagged_full_range_picture_adds_nothing_to_its_reasons() {
+        use crate::model::{PropertyKey, VideoEffect};
+        let mut flagged = asset();
+        flagged.streams[0].color_range = Some("pc".into());
+        let caps = GpuCaps {
+            motion: true,
+            keyed_opacity: true,
+            effects: EffectKinds::ALL,
+            ..GpuCaps::A0
+        };
+        let why = |key: bool| {
+            let mut clip = make_clip(flagged.id, 0.0, 4.0, 0.0);
+            clip.set_property_keys(
+                Property::Opacity,
+                vec![PropertyKey::new(0.0, 1.0), PropertyKey::new(2.0, 0.3)],
+            );
+            if key {
+                clip.effects = vec![VideoEffect::ChromaKey {
+                    color: "green".into(),
+                    similarity: 0.15,
+                    blend: 0.1,
+                }];
+            }
+            let plan = Planner::new(
+                &single(vec![clip]),
+                std::slice::from_ref(&flagged),
+                &opts(30.0),
+                PlanRequest::motion(FIXED),
+            )
+            .unwrap()
+            .at_frame(30)
+            .unwrap();
+            assert!(plan.layers[0].keyed_alpha.is_some_and(|a| a < 255));
+            plan.reasons(&caps, plan.size(u32::MAX))
+        };
+        assert_eq!(why(false), vec![]);
+        let keyed = why(true);
+        let effect = |what: &str| {
+            keyed
+                .iter()
+                .any(|u| matches!(u, Unsupported::Effects(_, w) if w.contains(what)))
+        };
+        assert!(effect("flagged full range"), "{keyed:?}");
+        assert!(effect("under a keyed opacity"), "{keyed:?}");
     }
 
     #[test]

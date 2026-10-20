@@ -1251,7 +1251,15 @@ so the feature is **only** activated through these forwards — which is what ma
   tag on an FFmpeg old enough to lack it) therefore reports the **displayed**
   size in `StreamInfo.width/height` — what `export_format`, fit/crop, smart crop
   and the bin's spec line all do their geometry against — and keeps the angle in
-  `StreamInfo.rotation`. `fps` goes through `nominal_fps`: `r_frame_rate` on a
+  `StreamInfo.rotation`. *Range*: `StreamInfo.color_range` records the sample range the file
+  declares, `pc` (full) or `tv` (limited), from ffprobe's `color_range` (`range_tag`; `unknown`,
+  nothing and anything else read as `None`; the libav probe's `range_name` agrees) for a video
+  stream. A VP9 / HEVC / AV1 file flagged full range is plain `yuv420p` to `pix_fmt`, which is why the
+  flag is recorded (`render_plan.rs` refuses the picture on it, `core-render-plan.md`). It is stored as
+  ffprobe says it, so an RGB picture (a PNG) and a gray one read `pc` too, on every FFmpeg: the plan reads the
+  flag on YCbCr formats only. Schema v10 added
+  it, so an asset stored before has `None`, which is "not known" and is judged by its name as it
+  always was; relinking replaces an asset's streams and records it. `fps` goes through `nominal_fps`: `r_frame_rate` on a
   jittery variable-frame-rate clip can be a multiple of the real rate (a ~30 fps
   clip probing as 120), so past 1.5x the average the average, snapped to a
   standard rate, is used instead. *HDR*: `StreamInfo.color_transfer` /
