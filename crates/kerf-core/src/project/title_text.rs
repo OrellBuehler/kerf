@@ -111,7 +111,7 @@ impl TitleTextInputs {
         if animation.is_none() && !has_outlines(&self.svg) {
             return Ok(self.prepared(SvgDoc::parse(&animated)?, Vec::new()));
         }
-        let (doc, _, kept) = self.read(&animated)?;
+        let (doc, count, kept) = self.read(&animated)?;
         if animation.is_some() {
             if let Some(why) = kept
                 .iter()
@@ -120,6 +120,12 @@ impl TitleTextInputs {
                 return Err(Error::InvalidArgument(format!(
                     "{why} cannot be drawn as outlines, so its animation would not play"
                 )));
+            }
+            if count == 0 {
+                return Err(Error::InvalidArgument(
+                    "the title's text could not be set as outlines (the outlines would not read back), so its animation would not play"
+                        .to_string(),
+                ));
             }
         }
         Ok(self.prepared(doc, Vec::new()))
@@ -577,6 +583,28 @@ mod tests {
             .set_title_text_animation(id, "name", Some(TextAnimation::default()))
             .is_err());
         assert_eq!(project.history().unwrap().len(), revisions);
+    }
+
+    #[test]
+    fn an_animation_whose_outlines_do_not_read_back_is_an_error_not_a_title_that_does_not_play_it() {
+        // A document one animated text takes over the element cap: the outlines are made, do not read, and the
+        // title is drawn with its fonts as it was. For an animation that is not a success.
+        let project = Project::open_in_memory().unwrap();
+        let full = ART.replace("</svg>", &format!("{}</svg>", "<g/>".repeat(19_990)));
+        let id = project
+            .add_svg_overlay(SvgSource::Custom(full), 0.0, Some(4.0), SvgLayout::default())
+            .unwrap()
+            .overlay
+            .id;
+        let revisions = project.history().unwrap().len();
+        let err = project
+            .set_title_text_animation(id, "name", Some(rise()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("would not read back") && err.contains("would not play"), "{err}");
+        assert_eq!(project.history().unwrap().len(), revisions);
+        // Taking one off, or a title that sets no animation, is not held to it.
+        assert!(project.set_title_text_animation(id, "name", None).is_ok());
     }
 
     #[test]
