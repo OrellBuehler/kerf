@@ -593,8 +593,15 @@
     differ) are applied at that amount. `delay` / `duration` (0..30 / 0.05..30 s) place it on the title's own clock; the title's
     default length follows `SvgDoc::natural_duration`. **Compiled** (`glyph_smil::wrap`, per unit): the amount is sampled every
     1/120 s, reduced by Ramer-Douglas-Peucker to the points a straight line stays within 0.4 % of an em of movement or blur, 0.2°
-    and 0.4 % of scale or opacity (one 8-bit level) of (a hard `square` edge stays a step one cell wide; at most 96 points; all of a unit's
-    properties share the points and one `keyTimes`), and written as a `<g>` round the unit's paths holding `animateTransform`
+    and 0.4 % of scale or opacity (one 8-bit level) of (a hard `square` edge stays a step one cell wide; all of a unit's
+    properties share the points and one `keyTimes`). **At most 96 points, in one pass**: the stretch furthest off its chord is
+    split first (a heap, each stretch read once) until every one is within tolerance or 96 points are kept, so a simple signal
+    gets exactly plain RDP's points and a noisy one (a wiggle with more new values, rate × duration, than 96 points can draw: hundreds) keeps the 96 that
+    cut its worst errors. **Never loosen the tolerance to fit**: an earlier version did, past the
+    noise's amplitude, and a long or fast wiggle compiled to *no* animation; a channel `varies` against the real tolerance. **Work
+    cap**: a document's units are sampled at most `MAX_WORK` (3 M) times in all, a unit costing its grid (up to 7,201: delay +
+    duration ≤ 60 s) — 416 units of the longest animation, ~0.6 s in release — else the text stays text with a warning; the 128 KiB
+    cap usually ends a heavy one first. Written as a `<g>` round the unit's paths holding `animateTransform`
     (translate, rotate, scale, `additive="sum"`, in that order), `animate` on `opacity` and, for blur, a `<filter
     filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">` with its `feGaussianBlur` and an `animate` of
     `stdDeviation` (the region is the unit's ink and 2.5σ and a tenth of an em around it, in the group's own coordinates, so it
@@ -607,11 +614,13 @@
     (`Outlined::kept`, like a box); custom artwork with the attribute and no outlines says `svg::ANIMATE_NOTE`, which
     `outlined_counted` and `Template::validate` drop. **`TitleTextInputs::text_animation(element, Option<&TextAnimation>)`**
     (`svg::set_text_animation` on the text form, then outline; refused when a template control targets the attribute; a text
-    that stays text is an error saying why; taking an animation off a title that was never outlined leaves it so) → `set_title_text_parsed`,
+    that stays text is an error saying why, and so is outlines that did not read back — `outlined_counted` falls back to the
+    un-outlined title then, count 0; taking an animation off a title that was never outlined leaves it so) → `set_title_text_parsed`,
     the box's lock-free shape; `svg::text_animation_presets()` lists the **eight presets** (rise, fade in, typewriter, pop, blur
     in, spin in, drop in, wiggle: plain `TextAnimation`s, copied onto the text and referred to by nothing). `fixtures/text-animation-corpus.json`
     (`KERF_BLESS_CORPUS=1 … -- text_animation_corpus`) is what the frontend's `withTextAnimation`, `animationJson`, `parseAnimation`
-    and presets replay. `#[ignore]`d `svg_rendered` tests export a typed and a wiggling blurred text through the real ffmpeg
+    and presets replay (`parses`: attribute JSON and what `from_attribute` makes of it; serde refuses a `7.0` or `1e3` seed, which
+    `JSON.parse` cannot tell from `7`, so `parseAnimation` reads the raw token; a repeated key it does not refuse). `#[ignore]`d `svg_rendered` tests export a typed and a wiggling blurred text through the real ffmpeg
     (each frame is its still, letters arrive in order, a seeded wiggle is the same twice). No graph change, no golden family.
   * **Lock-free shape.** The zip, the fonts, the sanitiser and the poster are all outside the project lock.
     Apply: `TemplateLibrary::get(id)` (or any `Template`) → `Template::prepare(&values)` →

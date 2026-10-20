@@ -1676,7 +1676,8 @@ text_box_corpus`), and
 draws text with its fonts, saying so (`HARNESS_NOTE`). **Text animations** (`text-animation.ts`, pure, bun-tested): the
 bounds (`checkAnimation`, `TextAnimation::check`'s words), `animationJson` (the JSON an attribute holds, byte for byte what
 `to_attribute` writes: fields in the engine's order, a whole number as `1.0`), `parseAnimation` (defaults laid under what is
-there, an unknown field, a wrong type or a number out of bounds is `null`), `TEXT_ANIMATION_PRESETS` (the picker's list and what
+there, an unknown field — own names only, so `constructor` is one —, a wrong type, a seed that is not an integer *literal* (`7.0`,
+`1e3`), or a number out of bounds is `null`), `TEXT_ANIMATION_PRESETS` (the picker's list and what
 `presetOf` matches a text's animation against) and, in `title-text.ts`, `withTextAnimation` (`set_text_animation`'s splice:
 the attribute replaced or taken away at the end of the start tag, single-quoted) and the `animation` each `titleTexts` entry
 carries — all replayed against kerf-core by `text-animation-corpus.test.ts` (`fixtures/text-animation-corpus.json`,
