@@ -899,6 +899,9 @@ so the feature is **only** activated through these forwards — which is what ma
   under a moving zoom, beside a static grade and in a range export
   (`engine/cli/keyed_channels.rs`, `#[ignore]`d; without `eval=frame` it fails at the second frame). A test
   picture's luma must sit away from 128 or a `contrast` ramp does nothing visible (it pivots there).
+  `keyed_color_value(clip, T)` is the same expressions evaluated in Rust (each keyed number through `keyframe_value`, the
+  temperature's `gamma_r` / `gamma_b` as `1 + 0.3 t` / `1 - 0.3 t`): the Motion plan carries it as the layer's colour, and
+  the GPU compositor builds `eq`'s tables from it every frame (`gpu.md`, byte for byte on 6.1.1 and 9.0.2).
   **A keyed mask** is the mask's own alpha `geq` (`keyed_mask_alpha`): the same distance and feather ramp as
   `mask_keep_expr`, but each keyed number's curve (over `geq`'s `T`) is evaluated **once a row** — at `X` 0 it is
   stored with `st(slot,…)` (slots 0–4 in `Property::MASK` order, a keyed opacity beside it in 5) and every other

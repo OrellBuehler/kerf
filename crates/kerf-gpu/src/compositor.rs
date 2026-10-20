@@ -755,6 +755,8 @@ impl Compositor {
     /// * `keyed_zoom`: a moving zoom drawn last, as FFmpeg's chain has it;
     /// * `keyed_opacity`: an export frame's `geq` alpha, the value the plan evaluates
     ///   ([`kerf_core::PlanLayer::keyed_alpha`]);
+    /// * `keyed_color`: an export frame's `eq`, whose tables FFmpeg builds again for every frame from the
+    ///   numbers the plan evaluates ([`kerf_core::PlanLayer::color`]);
     /// * `mask`, and the blur, sharpen, grayscale, invert, vignette and chroma key `effects`.
     ///
     /// The combinations the plan names (`Unsupported`) stay FFmpeg's.
@@ -773,6 +775,7 @@ impl Compositor {
         caps.dip_white = true;
         caps.keyed_zoom = true;
         caps.keyed_opacity = true;
+        caps.keyed_color = true;
         caps.mask = true;
         caps.effects = EffectKinds::BLUR
             .union(EffectKinds::SHARPEN)

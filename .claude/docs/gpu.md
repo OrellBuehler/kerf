@@ -11,7 +11,7 @@ Windows) and nothing may depend on an optional wgpu feature. **A GPU failure is 
 error, not a panic**: every unit of wgpu work runs in out-of-memory / validation /
 internal error scopes (`Gpu::guarded`), anything uncaptured is logged and remembered,
 `Compositor::new` and `composite` return `Result` (and `Compositor::caps()` says what it
-draws, `GpuCaps::A0` plus `text`, `motion`, `fades`, `transitions`, `dip_white`, `keyed_zoom`, `keyed_opacity`, `mask` and the blur / sharpen / grayscale / invert / vignette / chroma key `effects` today, which `composite` / `render_plan` judge the plan by), and a lost device is tracked — every
+draws, `GpuCaps::A0` plus `text`, `motion`, `fades`, `transitions`, `dip_white`, `keyed_zoom`, `keyed_opacity`, `keyed_color`, `mask` and the blur / sharpen / grayscale / invert / vignette / chroma key `effects` today, which `composite` / `render_plan` judge the plan by), and a lost device is tracked — every
 later call is `GpuError::DeviceLost` and the **owner builds a new `Gpu` and
 `Compositor`** (the device is not recreated behind the caller's back).
 
@@ -661,6 +661,28 @@ column and row one in (6.1) it reads the key's alpha there one in, which the com
 255: luma 21 off at the edge, 2636 samples over 14 frames; 9.0.2 is exact, so shifting the key's alpha under `mask_edge` is the
 follow-up, with its zoom-last variant). The compositor refuses the combination itself too.
 
+**Keyed colour** (export frames). The clip's `eq` is `eval=frame`: each keyed number a quoted expression of `t` (the frame's timestamp on the
+clip's `fps` grid, `pts * av_q2d(tb)`), which `eq` evaluates per frame, clamps through a `float` (`av_clipf`) and builds its Y / U / V tables from again.
+The plan carries the numbers the expressions evaluate to (`PlanLayer::color`, `engine::keyed_color_value`: each keyed number through
+`keyframe_value`, the others the clip's own; the temperature's `gamma_r` / `gamma_b` are `1 + 0.3 t` and `1 - 0.3 t`, which
+`Color::temperature_gammas` computes in the same order; `sweep.rs` holds all of them to the evaluated text **to the bit**, at five rates) and
+`look_of` builds the tables from them every frame (`eq::luts`, as for a static grade: 768 bytes, a few microseconds, uploaded with the layer), so there is no
+shader change. They compose with a following grayscale or invert and sit ahead of a blur, as a static grade's do. **Byte for byte (0 differing
+samples, over noise in all three planes so that every table entry is looked at, identically on 6.1.1 and 9.0.2)** at the picture's size: each of the
+five numbers alone and all five, linear / eased / held / bezier off the frame grid / many eased keys (a tree), the temperature crossing 0 (on a frame
+and between two: `gamma_r = gamma_b = 1`, the chroma tables the identity) and going to 0, at 24 / 25 / 29.97 (`29.97` and `30000/1001`) / 30 / 60 fps, late on the
+timeline, at speed 2 / 0.5 / reversed, beside a static grade (the numbers not keyed are the clip's own), with the clip's fades, in a dissolve, after a dip,
+beside a keyed opacity (an `eq` and a `geq` written per frame), under a mask, before an invert / grayscale / sharpen / vignette, translucent (`TRANSLUCENT`: the RGB round trip
+reads the graded picture; Y 0 / UV 1), turned (`ROTATED` with a mild grade, Y 1 / UV 2), and on a 10-bit,
+4:2:2, 4:4:4, gray, RGB or BT.709 source (the `eq` runs on the picture the chain has made 4:2:0 by then, as for a static grade). A blur after it is `EFFECT`'s level, a moving
+zoom after it `SCALED` (the grade runs at the fit size). On a layer the compositor scales, the scaler's level is multiplied by the slope of the
+tables (contrast, and gamma's power, which grows without bound toward black for a gamma above 1): `GRADED_SCALED` (2) for a gentle ramp, **`GRADED_STEEP`
+(Y 5 / UV 3) at the far ends of every range, which a static grade of those values measures too** (so it is the scaler's difference being magnified, not the
+grade: pre-existing for any strong grade on a scaled or letterboxed layer, not refused). **Refused for the clip, not the frame**
+(`RenderPlan::graded`: a keyed `eq` is in the chain on every frame of the clip, neutral numbers or not): a full-range picture (`GradedFullRange`: FFmpeg 9 grades
+the raw values before it converts the range, the compositor converts first) on every frame, the ones where the curve passes through neutral
+included, and a graded layer in a stack that holds one where the composite's colour is negotiated (`GradedInFullRangeStack`).
+
 **Effects.**
 
 * `Grayscale` (`hue=s=0`: U, V to 128) and `Invert` (`negate`: `255 - v` on Y, U, V) are tables, composed with `eq`'s and applied in the scaler's vertical
@@ -741,10 +763,11 @@ a dissolve, dip, slide or push into a zooming clip and out of one) hold the boun
 
 | Bound (Y / UV) | Cases | Why |
 | --- | --- | --- |
-| 0 | a mask at the picture's size (20 of 27 mask rows), grayscale, invert, sharpen, a vignette (every frame of the run), a chroma key and a keyed opacity (the fades and dissolve of each included) at the picture's size | integer arithmetic, reproduced |
-| 1 (`SCALED`) | a layer the compositor scales, a mask, a vignette or a keyed opacity on it, a one-stage zoom | swscale's x86 scaler is not bit-exact with the C arithmetic the shader follows |
+| 0 | a mask at the picture's size (20 of 27 mask rows), grayscale, invert, sharpen, a vignette (every frame of the run), a chroma key, a keyed opacity and a keyed colour (the fades and dissolve of each included) at the picture's size | integer arithmetic, reproduced |
+| 1 (`SCALED`) | a layer the compositor scales, a mask, a vignette or a keyed opacity on it, a one-stage zoom, a keyed colour before a moving zoom | swscale's x86 scaler is not bit-exact with the C arithmetic the shader follows |
 | 1 (`EFFECT`) | a blur at the picture's size, and a blur then a vignette (measured 0: the vignette's factor is at most 1) | `gblur`'s SIMD summation order (above) |
-| 2 | a layer the compositor scales *and* makes translucent, no effect (`tests/playback.rs`, `play/pip/translucent and scaled`, measured Y 2 / UV 2 on both FFmpegs); `EFFECT_SCALED`: a blur, grayscale or invert on a scaled or translucent layer; a blur then a sharpen of at most 0.5 even unscaled and opaque (the blur's level times the gain); a sharpen of at most 0.5 after a scale. `CASCADED`: a zoom (the fit scale, then the zoom's). `ZOOMED_MASK`: a soft mask edge, or a chroma key's, on a zoomed picture (measured 2 / 2). Rotated, graded and scaled, dip to white (Y three on BT.709, `WHITE_709`) | two of the causes above on one sample; the RGB kernel for white |
+| 2 | a layer the compositor scales *and* makes translucent, no effect (`tests/playback.rs`, `play/pip/translucent and scaled`, measured Y 2 / UV 2 on both FFmpegs); `EFFECT_SCALED`: a blur, grayscale or invert on a scaled or translucent layer; a blur then a sharpen of at most 0.5 even unscaled and opaque (the blur's level times the gain); a sharpen of at most 0.5 after a scale. `CASCADED`: a zoom (the fit scale, then the zoom's). `ZOOMED_MASK`: a soft mask edge, or a chroma key's, on a zoomed picture (measured 2 / 2). Rotated, graded and scaled (`GRADED_SCALED`, a gentle keyed or static grade; measured 2 / 2), dip to white (Y three on BT.709, `WHITE_709`) | two of the causes above on one sample; the RGB kernel for white |
+| 5 / 3 (`GRADED_STEEP`) | a layer the compositor scales under a grade at the far ends of the ranges (contrast 1.8, saturation 2, gamma 2, temperature 1), keyed or static (measured 4 / 3 keyed, 5 / 3 static, a pip and a letterbox) | the scaler's level times the tables' slope |
 
 A **sharpen after a scale or a blur has no row beyond that: it is refused past a worst-case error of 2.** `unsharp` is exact, but it carries the one-level difference upstream (the scaler's, or `gblur`'s SIMD order) through at worst `1 + 2|amount|` levels of luma at an edge sample (measured after a scale: 3 at 1.5, 7 at 3, 11 at 5; after a blur on 6.1.1: 2 at 1, 3 at 1.5, 5-6 at 5), and its `>> 16` floors, so each further sharpen adds at least a level (measured on 6.1.1: two of 0.2 reach 3, three of 0.1 reach 4), and the GPU refuses rather than approximates. One sharpen of 0.5 is the two levels of a scaled blur. (A grade between a scale and a sharpen amplifies too: `GRADED_SCALED` already accepts two.)
 
@@ -788,7 +811,7 @@ format, **chroma-grid cases** (crops, Cover offsets and letterbox gaps chosen so
 the crops of finer-chroma pictures that cannot be placed exactly are asserted refused),
 the **unmeasured-policy** case (`Unknown`: BT.601 stacks drawn, BT.709 / BT.2020 refused),
 the **full-range grading** cases (a graded `yuvj` clip, and a graded layer in a stack with
-one, refused; ungraded and limited-range controls drawn),
+one, refused; ungraded and limited-range controls drawn; a keyed colour on a `yuvj` clip refused on every frame, the neutral ones included),
 and **refusals** (an EXIF-oriented JPEG, FFV1 `yuva420p`, the same with the pixel
 format unrecorded, a translucent odd layer, a moving zoom behind a rotation, an opacity below 1 or a dip to white, a vignette on a 4:4:4 picture or a letterbox, a chroma key on a pip, after a blur, on a 4:4:4 picture, under a mask or a keyed opacity or on a rotated layer, a mask on a rotated or a translucent layer, a blur on a letterbox, an invert / blur / sharpen on a full-range picture, an invert on a gray one) —
 each of which FFmpeg still renders (and a fade to black or white on a translucent layer, a dip to white on a rotated, letterboxed, odd, resized or non-`yuv420p` layer or beside a black fade, a fade on a full-range picture under FFmpeg 9), **transitions** (`transition/`, `transition-kind/`, `fade/`: every kind and a clip's own fades in a still, see

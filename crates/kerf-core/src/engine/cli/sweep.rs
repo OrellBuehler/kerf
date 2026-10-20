@@ -579,7 +579,9 @@ fn the_motion_plan_samples_the_curves_the_graphs_expressions_write_at_every_outp
                         );
                     }
                     // The grade: every number the `eq` writes, evaluated at the frame's time, is
-                    // the colour the plan sampled.
+                    // the colour the plan carries **to the last bit** (the compositor builds `eq`'s tables
+                    // from it: a number an ulp off can land a table entry on the other side of a
+                    // truncation).
                     if let Some(eq) = options(chain, "eq").filter(|o| opt(o, "eval") == Some("frame")) {
                         let c = layer.color;
                         let vars = [("t", t)];
@@ -590,12 +592,20 @@ fn the_motion_plan_samples_the_curves_the_graphs_expressions_write_at_every_outp
                             ("gamma", c.gamma),
                         ] {
                             let got = eval(opt(&eq, name).unwrap(), &vars);
-                            assert!((got - want).abs() < 1e-9, "{at}: eq {name} is {got}, the plan says {want}");
+                            assert_eq!(
+                                got.to_bits(),
+                                want.to_bits(),
+                                "{at}: eq {name} is {got}, the plan says {want}"
+                            );
                         }
                         let (gr, gb) = c.temperature_gammas().unwrap_or((1.0, 1.0));
                         for (name, want) in [("gamma_r", gr), ("gamma_b", gb)] {
                             let got = opt(&eq, name).map_or(1.0, |e| eval(e, &vars));
-                            assert!((got - want).abs() < 1e-9, "{at}: eq {name} is {got}, the plan says {want}");
+                            assert_eq!(
+                                got.to_bits(),
+                                want.to_bits(),
+                                "{at}: eq {name} is {got}, the plan says {want}"
+                            );
                         }
                         colours_checked += 1;
                     }

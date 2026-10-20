@@ -420,8 +420,10 @@ pub struct Animated {
     pub zooms: bool,
     /// Some colour number is keyed: the export's `eq` is written per frame (`eval=frame`),
     /// off a colour sampled at the frame's time. A still plan samples it too and draws that
-    /// colour like a static one; an export frame is refused until the compositor says it draws
-    /// one (`GpuCaps::keyed_color`).
+    /// colour like a static one; an export frame carries the numbers `eq` evaluates at that frame
+    /// ([`PlanLayer::color`]) and is refused until the compositor says it draws them
+    /// (`GpuCaps::keyed_color`). The clip has an `eq` in its chain on every frame of it, whether
+    /// or not this frame's numbers are neutral ([`RenderPlan::graded`]).
     pub color: bool,
     /// Some number of the mask is keyed: the export's mask `geq` reads it per frame. A still plan
     /// draws the mask sampled at its instant ([`Clip::mask_at`]) as a static one; an export frame
@@ -591,6 +593,10 @@ pub struct PlanLayer {
     pub stream: PlanStream,
     /// The transform **sampled** at this instant.
     pub transform: Transform,
+    /// The colour correction at this frame. A keyed colour is `Clip::color_at` in a still plan (drawn
+    /// like a static one); in a Motion plan it is what the export's `eq` evaluates at the `fps` grid's
+    /// time (`PlanCanvas::pick_fps`, `engine::keyed_color_value`: each keyed number through the
+    /// expression's own arithmetic, the others the clip's), which is what `eq` builds its tables from.
     pub color: Color,
     /// The clip's curves, wheels and LUT. No compositor draws them yet: a layer with any of them
     /// is refused ([`Unsupported::Grade`]).
@@ -1074,7 +1080,7 @@ impl RenderPlan {
             // clip, in every knob), so a full-range picture is not graded on the GPU
             // — and a picture whose format was never recorded is not known not to be
             // full-range.
-            if !layer.color.is_identity() && stream.maybe_full_range_in(self.canvas.policy) {
+            if self.graded(layer) && stream.maybe_full_range_in(self.canvas.policy) {
                 let detail = match stream.pix_fmt.as_deref() {
                     Some(f) if stream.maybe_full_range() => {
                         format!("a full-range picture ({f}), which FFmpeg grades before converting its range")
@@ -1256,7 +1262,7 @@ impl RenderPlan {
         // holds a full-range picture is FFmpeg's.
         if policy != CompositeColorPolicy::FixedBt601 && self.layers.iter().any(|l| l.stream.maybe_full_range_in(policy)) {
             for (n, layer) in self.layers.iter().enumerate() {
-                if !layer.color.is_identity() && !layer.stream.maybe_full_range_in(policy) {
+                if self.graded(layer) && !layer.stream.maybe_full_range_in(policy) {
                     out.push(Unsupported::GradedInFullRangeStack(n));
                 }
             }
@@ -1269,6 +1275,15 @@ impl RenderPlan {
             index,
             name: layer.name.clone(),
         }
+    }
+
+    /// Whether the layer's chain has an `eq` that does something to the picture: a colour that is not the
+    /// identity, or in an export frame a **keyed** one, whose `eq` (`eval=frame`) is in the chain on every
+    /// frame of the clip, neutral numbers or not. A refusal about grading a picture (a full-range one,
+    /// whose range FFmpeg 9 converts after the `eq`) judges the clip, so that a keyed colour is not drawn
+    /// by one renderer on the frames its curve passes through neutral and by the other on the rest.
+    fn graded(&self, layer: &PlanLayer) -> bool {
+        !layer.color.is_identity() || (self.mode == PlanMode::Motion && layer.animated.is_some_and(|a| a.color))
     }
 
     /// Why a compositor that draws masks still does not draw this layer's: the mask is `geq`

@@ -564,6 +564,20 @@ fn bench_a_mask_a_blur_and_a_moving_zoom() {
             }),
         ),
         (
+            "keyed colour, all five",
+            Box::new(|c| {
+                for (prop, from, to) in [
+                    (Property::Brightness, -0.2, 0.2),
+                    (Property::Contrast, 0.8, 1.4),
+                    (Property::Saturation, 0.6, 1.5),
+                    (Property::Gamma, 0.8, 1.3),
+                    (Property::Temperature, -0.6, 0.6),
+                ] {
+                    c.set_property_keys(prop, vec![PropertyKey::new(0.0, from), PropertyKey::new(2.0, to)]);
+                }
+            }),
+        ),
+        (
             "moving zoom 1 -> 1.25",
             Box::new(move |c| c.keyframes = vec![key(0.0, 1.0, 0.0), key(2.0, 1.25, -0.05)]),
         ),

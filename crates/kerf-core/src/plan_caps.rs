@@ -97,8 +97,9 @@ pub struct GpuCaps {
     pub keyed_zoom: bool,
     /// Keyframed colour: FFmpeg writes the clip's `eq` per frame (`eval=frame`, an expression
     /// of the frame's time for each keyed number), which a compositor that sets this draws
-    /// as the colour sampled at the frame's time. Export frames only: a still plan samples
-    /// the colour and draws it like a static one.
+    /// from the numbers an export frame's plan carries (`PlanLayer::color`: those expressions
+    /// evaluated at the frame's time) by building the `eq` tables again every frame. Export
+    /// frames only: a still plan samples the colour and draws it like a static one.
     pub keyed_color: bool,
     /// A mask (`geq` rewriting the alpha plane): drawn as a per-sample alpha. Still refused on a
     /// rotated layer and on one below full opacity (`MaskWith`).
@@ -416,7 +417,7 @@ impl fmt::Display for Unsupported {
             Self::KeyedOpacity(l) => write!(f, "{l}: keyframed opacity (a geq alpha written per frame, which no compositor pass draws or has a parity case for yet)"),
             Self::KeyedColor(l) => write!(
                 f,
-                "{l}: keyframed colour correction (an eq written per frame, which no compositor pass draws or has a parity case for yet)"
+                "{l}: keyframed colour correction (an eq whose numbers are evaluated per frame, which this compositor does not rebuild its tables for)"
             ),
             Self::KeyedMask(l) => write!(
                 f,
