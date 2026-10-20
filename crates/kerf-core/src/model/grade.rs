@@ -300,8 +300,20 @@ pub fn frame_matrix(stream: Option<&StreamInfo>, tone_mapped: bool) -> Option<&'
     if tone_mapped {
         return Some("bt709");
     }
-    let s = stream.filter(|s| s.has_a_yuv_tag())?;
-    match s.color_space.as_deref()?.trim() {
+    let s = stream?;
+    frame_matrix_tag(s.color_space.as_deref(), s.pix_fmt.as_deref())
+}
+
+/// [`frame_matrix`] of a stream's tag and pixel format: the tag when it names a YCbCr matrix the grade gives
+/// back (not `gbr`, and not on an RGB picture, which has no YCbCr matrix to name).
+pub fn frame_matrix_tag(color_space: Option<&str>, pix_fmt: Option<&str>) -> Option<&'static str> {
+    if !matrix_tag_is_stated(color_space)
+        || color_space.map(str::trim) == Some("gbr")
+        || pix_fmt.and_then(pix_fmt_layout) == Some(PixLayout::Rgb)
+    {
+        return None;
+    }
+    match color_space?.trim() {
         "bt709" => Some("bt709"),
         "smpte170m" => Some("smpte170m"),
         "bt470bg" => Some("bt470bg"),

@@ -229,27 +229,39 @@ impl Lut3d {
         o
     }
 
+    /// The table `intensity` of the way from the identity to this one: the values the `.cube` copy holds (and
+    /// that `lut3d` reads back, each number the shortest text of its `f32`), red fastest.
+    pub fn at_intensity(&self, intensity: f64) -> Vec<[f32; 3]> {
+        let n = (self.size - 1) as f64;
+        let k = intensity.clamp(0.0, 1.0);
+        self.data
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let grid = [
+                    (i % self.size) as f64 / n,
+                    (i / self.size % self.size) as f64 / n,
+                    (i / (self.size * self.size)) as f64 / n,
+                ];
+                let mix = |c: usize| {
+                    if k == 1.0 {
+                        v[c]
+                    } else {
+                        (k * f64::from(v[c]) + (1.0 - k) * grid[c]) as f32
+                    }
+                };
+                [mix(0), mix(1), mix(2)]
+            })
+            .collect()
+    }
+
     /// The table `intensity` of the way from the identity to this one, as the `.cube` text FFmpeg
     /// reads: the size and the rows, each number the shortest text of its `f32`.
     pub fn to_cube(&self, intensity: f64) -> String {
-        let n = (self.size - 1) as f64;
-        let k = intensity.clamp(0.0, 1.0);
         let mut out = String::with_capacity(self.data.len() * 30 + 20);
         out.push_str(&format!("LUT_3D_SIZE {}\n", self.size));
-        for (i, v) in self.data.iter().enumerate() {
-            let grid = [
-                (i % self.size) as f64 / n,
-                (i / self.size % self.size) as f64 / n,
-                (i / (self.size * self.size)) as f64 / n,
-            ];
-            let mix = |c: usize| {
-                if k == 1.0 {
-                    v[c]
-                } else {
-                    (k * f64::from(v[c]) + (1.0 - k) * grid[c]) as f32
-                }
-            };
-            out.push_str(&format!("{} {} {}\n", mix(0), mix(1), mix(2)));
+        for v in self.at_intensity(intensity) {
+            out.push_str(&format!("{} {} {}\n", v[0], v[1], v[2]));
         }
         out
     }
@@ -331,6 +343,68 @@ pub(crate) fn lut_file(lut: &ClipLut) -> Option<PathBuf> {
         map.insert(key, p.clone());
     }
     path
+}
+
+/// A LUT as the graph's `lut3d` reads it: the table at its intensity, `size³` rows, red fastest — the
+/// numbers of the copy [`lut_file`] writes, for a renderer that does the interpolation itself.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BakedLut {
+    pub size: usize,
+    pub data: Vec<[f32; 3]>,
+}
+
+/// The tables read by [`baked_lut`], the newest last: kept so a renderer asking for every frame of a clip does
+/// not parse (and mix) a 3 MB table each time. Keyed like the copies: the file's path, length and
+/// modification time, and the intensity in hundredths.
+fn baked_cache() -> &'static Mutex<Vec<BakedEntry>> {
+    static CACHE: std::sync::OnceLock<Mutex<Vec<BakedEntry>>> = std::sync::OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// A table [`baked_lut`] read, with what it was read from.
+type BakedEntry = (Source, std::sync::Arc<BakedLut>);
+
+/// How many baked tables are kept.
+const BAKED_KEPT: usize = 4;
+
+/// The table the graph's `lut3d` reads for `lut` ([`lut_file`]'s copy, as numbers), `None` when the graph leaves
+/// the LUT out: the file is missing or not a usable LUT. Looked at on every call (one `stat`), re-read only when
+/// the file or the intensity changed.
+pub fn baked_lut(lut: &ClipLut) -> Option<std::sync::Arc<BakedLut>> {
+    let lut = lut.normalized();
+    // The graph leaves the LUT out when its copy cannot be made (no directory to write it to) as well as when the
+    // file is missing or broken: the same answer here, so that no frame is drawn with a LUT FFmpeg's would not have.
+    lut_file(&lut)?;
+    let meta = std::fs::metadata(&lut.path).ok()?;
+    let key = Source {
+        path: lut.path.clone(),
+        len: meta.len(),
+        modified: meta.modified().ok(),
+        hundredths: (lut.intensity * 100.0).round() as u32,
+    };
+    let mut cache = baked_cache().lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(at) = cache.iter().position(|(k, _)| *k == key) {
+        let hit = cache.remove(at);
+        let table = hit.1.clone();
+        cache.push(hit);
+        return Some(table);
+    }
+    let table = match Lut3d::read(Path::new(&lut.path)) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!("LUT left out of the graph: {e}");
+            return None;
+        }
+    };
+    let baked = std::sync::Arc::new(BakedLut {
+        size: table.size,
+        data: table.at_intensity(lut.intensity),
+    });
+    if cache.len() >= BAKED_KEPT {
+        cache.remove(0);
+    }
+    cache.push((key, baked.clone()));
+    Some(baked)
 }
 
 fn lut_dirs() -> impl Iterator<Item = PathBuf> {
@@ -554,6 +628,38 @@ pub(crate) mod tests {
         assert!(inspect_lut("relative.cube").is_err());
         let _ = std::fs::remove_file(&a);
         let _ = std::fs::remove_file(&half);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_baked_table_is_what_the_copy_holds_and_follows_the_file() {
+        let dir = std::env::temp_dir().join(format!("kerf-lut-baked-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("baked.cube");
+        std::fs::write(&src, cube_text(4, |[r, g, b]| [g * 0.9, b, 1.0 - r])).unwrap();
+        let lut = ClipLut {
+            path: src.to_string_lossy().into_owned(),
+            intensity: 0.4,
+        };
+        // The numbers the graph's `lut3d` reads: the copy, parsed back (each the shortest text of its `f32`).
+        let copy = Lut3d::parse_cube(&std::fs::read_to_string(lut_file(&lut).unwrap()).unwrap()).unwrap();
+        let baked = baked_lut(&lut).expect("a usable file");
+        assert_eq!((baked.size, &baked.data), (copy.size, &copy.data));
+        // Asked again it is the same table, not a new parse; another intensity is another table.
+        assert!(std::sync::Arc::ptr_eq(&baked, &baked_lut(&lut).unwrap()));
+        let full = baked_lut(&ClipLut {
+            intensity: 1.0,
+            ..lut.clone()
+        })
+        .unwrap();
+        assert_eq!(full.data, Lut3d::read(&src).unwrap().data);
+        assert_ne!(full.data, baked.data);
+        // The file changing is a new table (the length is part of the key).
+        std::fs::write(&src, cube_text(3, |c| c)).unwrap();
+        assert_eq!(baked_lut(&lut).unwrap().size, 3);
+        // A file the graph leaves out is none.
+        std::fs::remove_file(&src).unwrap();
+        assert_eq!(baked_lut(&lut), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

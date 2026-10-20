@@ -35,7 +35,7 @@ use crate::model::{
     pix_fmt_is_high_bit, pix_fmt_layout, pix_fmt_subsampling, Asset, Clip, Color, Grade, Hdr, Mask, PixLayout, Projection,
     ResolvedReframe, StreamInfo, StreamKind, Subsampling, Timeline, Transform, VideoEffect,
 };
-use crate::plan_caps::{DipWhy, EffectKinds, GpuCaps, LayerRef, Unsupported};
+use crate::plan_caps::{DipWhy, EffectKinds, GpuCaps, GradeKinds, LayerRef, Unsupported};
 use crate::planner::{PlanRequest, Planner};
 use crate::ExportOptions;
 
@@ -347,6 +347,19 @@ impl PlanStream {
         }
     }
 
+    /// The matrix tag the graph's grade hands the picture's RGB back with: the label when the graph labels the
+    /// picture BT.709, else the stream's tag when it names a YCbCr matrix the grade knows
+    /// ([`crate::model::frame_matrix_tag`]). `None` for an untagged picture, which is BT.601 both ways and
+    /// gets no `scale` back out of RGB; a tagged one is converted back by an explicit `scale` to 4:4:4
+    /// (FFmpeg 6.1 would convert back as BT.601 and leave the tag unknown), which the 4:2:0 conversion
+    /// that follows turns into 4:2:0 in a second step ([`PlanLayer::grade_route`]).
+    pub fn grade_tag(&self) -> Option<&'static str> {
+        if self.label_bt709 {
+            return Some("bt709");
+        }
+        crate::model::frame_matrix_tag(self.color_space.as_deref(), self.pix_fmt.as_deref())
+    }
+
     /// The native chroma grid `crop`, `pad` and the Cover crop round to for this
     /// picture ([`pix_fmt_subsampling`]); `None` when the pixel format was never
     /// recorded or is not one whose rounding was measured.
@@ -651,6 +664,36 @@ pub struct PlanLayer {
     pub timing: PlanTiming,
 }
 
+/// How FFmpeg carries a graded layer's picture through the RGB filters and back, for a picture whose route is
+/// reproduced ([`PlanLayer::grade_route`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GradeRoute {
+    /// The matrix the picture is converted out of YCbCr with and back into: the frame's own tag, BT.601 for a
+    /// picture with none (`smpte170m` and `bt470bg` are BT.601's coefficients).
+    pub matrix: YuvMatrix,
+    /// The graph ends the grade in an explicit `scale` back to YCbCr 4:4:4 (a tagged picture: FFmpeg 6.1 would
+    /// otherwise convert back as BT.601 and drop the tag), which the next filter's conversion turns into 4:2:0
+    /// with a scale of its own. An untagged picture goes `rgb24` straight back to 4:2:0.
+    pub via_444: bool,
+}
+
+impl PlanLayer {
+    /// The route of this layer's grade, or `None` for a picture whose colour matrix has no measured round
+    /// trip (BT.2020, `fcc`, `smpte240m`).
+    pub fn grade_route(&self) -> Option<GradeRoute> {
+        let tag = self.stream.grade_tag();
+        let matrix = match tag {
+            None | Some("smpte170m" | "bt470bg") => YuvMatrix::Bt601,
+            Some("bt709") => YuvMatrix::Bt709,
+            Some(_) => return None,
+        };
+        Some(GradeRoute {
+            matrix,
+            via_444: tag.is_some(),
+        })
+    }
+}
+
 /// The ordered video layers visible at one timeline time, on their canvas.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RenderPlan {
@@ -734,13 +777,14 @@ pub(crate) fn composite_matrix(layers: &[PlanLayer], policy: CompositeColorPolic
     (matrix, unsupported)
 }
 
-/// What of a clip's [`Grade`] a compositor would have to draw, or `None` for an identity grade.
-fn grade_refusal(grade: &Grade) -> Option<&'static str> {
-    if grade.lut().is_some() {
+/// What of a clip's [`Grade`] a compositor with `caps` does not draw, or `None` for an identity grade or one it
+/// draws every part of.
+fn grade_refusal(grade: &Grade, caps: &GpuCaps) -> Option<&'static str> {
+    if grade.lut().is_some() && !caps.grade.contains(GradeKinds::LUT) {
         Some("a 3D LUT")
-    } else if grade.curves().is_some() {
+    } else if grade.curves().is_some() && !caps.grade.contains(GradeKinds::CURVES) {
         Some("curves")
-    } else if grade.wheels().is_some() {
+    } else if grade.wheels().is_some() && !caps.grade.contains(GradeKinds::WHEELS) {
         Some("colour wheels")
     } else {
         None
@@ -877,6 +921,29 @@ impl RenderPlan {
                     _ => None,
                 }) {
                     reasons.push(Unsupported::Matte(self.layer_ref(n, layer), what));
+                }
+            }
+            // A grade runs in RGB on the picture at the size the chain has made it, and what the compositor
+            // reproduces is that conversion at the picture's own size: the scaler's one-level difference from
+            // swscale's (its vertical filter has an x86 kernel the shader does not follow) is carried through the
+            // conversions and a table (an identity grade turns it into 3 levels of luma and 2 of chroma on noise,
+            // gamma and curves into 4), so a layer the compositor resizes is FFmpeg's. The bars of a letterbox
+            // are part of the padded frame the grade sees (they are graded, and their chroma meets the
+            // picture's in the conversion back), an odd side makes the conversions read past the line.
+            if !layer.grade.is_identity() && grade_refusal(&layer.grade, caps).is_none() {
+                let at = || self.layer_ref(n, layer);
+                if geom.matte {
+                    reasons.push(Unsupported::Matte(at(), "a grade"));
+                } else if geom.stages.iter().any(|s| s.scaled != (s.src.w, s.src.h)) {
+                    reasons.push(Unsupported::GradeWith(
+                        at(),
+                        "on a layer the compositor's scaler resizes (its one-level difference from swscale's grows to 3 or 4 levels through the RGB conversions)",
+                    ));
+                } else if geom.picture.0 % 2 == 1 || geom.picture.1 % 2 == 1 {
+                    reasons.push(Unsupported::GradeWith(
+                        at(),
+                        "on a picture with an odd side (swscale's conversions to and from RGB read past the line)",
+                    ));
                 }
             }
             // A sharpen is exact, but what it sharpens is not exactly FFmpeg's: the compositor's scaler is a
@@ -1147,9 +1214,12 @@ impl RenderPlan {
             }
             // Curves (`lutrgb`), wheels (`colorbalance`) and a LUT (`lut3d`) run in RGB, through a round
             // trip FFmpeg negotiates; no compositor pass or parity case draws them.
-            if let Some(what) = grade_refusal(&layer.grade) {
+            let grade_drawn = if let Some(what) = grade_refusal(&layer.grade, caps) {
                 out.push(Unsupported::Grade(at(), what));
-            }
+                false
+            } else {
+                !layer.grade.is_identity()
+            };
             if let Some(what) = layer
                 .effects
                 .iter()
@@ -1216,6 +1286,11 @@ impl RenderPlan {
             // format, and a black fade of the clip that runs ahead of it is a filter of its own in
             // the YUV.
             let ops = self.fade_ops(layer);
+            if grade_drawn {
+                if let Some(what) = self.grade_chain_refusal(layer, &ops) {
+                    out.push(Unsupported::GradeWith(at(), what));
+                }
+            }
             if self.white_round_trip(layer) {
                 let why = if !caps.dip_white {
                     Some(DipWhy::NoRoundTrip)
@@ -1282,6 +1357,7 @@ impl RenderPlan {
                 } else if keyed {
                     out.push(Unsupported::KeyedZoom(at()));
                 } else if !layer.color.is_identity()
+                    || !layer.grade.is_identity()
                     || layer.transform.rotation != 0.0
                     || layer.transform.opacity < 1.0
                     || layer.mask.is_some()
@@ -1342,7 +1418,31 @@ impl RenderPlan {
     /// whose range FFmpeg 9 converts after the `eq`) judges the clip, so that a keyed colour is not drawn
     /// by one renderer on the frames its curve passes through neutral and by the other on the rest.
     fn graded(&self, layer: &PlanLayer) -> bool {
-        !layer.color.is_identity() || (self.mode == PlanMode::Motion && layer.animated.is_some_and(|a| a.color))
+        !layer.color.is_identity()
+            || !layer.grade.is_identity()
+            || (self.mode == PlanMode::Motion && layer.animated.is_some_and(|a| a.color))
+    }
+
+    /// Why a compositor that draws this layer's grade parts still does not draw its chain. FFmpeg's grade
+    /// runs in RGB: the picture goes `yuv420p -> rgb24` (swscale's x86 kernel, reproduced to the level), through
+    /// `lut3d`, `lutrgb` and `colorbalance` in turn, and back to 4:2:0 by a scale whose vertical filter has
+    /// its own x86 kernel (a tagged picture first to 4:4:4 by an explicit `scale`, then to 4:2:0 by the next
+    /// filter's). All of it is reproduced for the one picture it was measured on, 8-bit limited-range
+    /// `yuv420p` at an even size, and only where nothing between the grade and the next 4:2:0 conversion
+    /// sees the RGB (or 4:4:4) picture: a video effect or a black or white fade there runs on it in the format
+    /// FFmpeg negotiates, and a moving zoom's `scale` converts it in the same pass.
+    fn grade_chain_refusal(&self, layer: &PlanLayer, ops: &[FadeOp]) -> Option<&'static str> {
+        if layer.stream.pix_fmt.as_deref() != Some("yuv420p") {
+            Some("on a picture that is not 8-bit 4:2:0 yuv420p (FFmpeg grades it in the format it negotiates for that picture)")
+        } else if layer.grade_route().is_none() {
+            Some("on a picture whose colour matrix has no measured round trip (BT.601, BT.709 and untagged are drawn)")
+        } else if layer.effects.iter().any(|e| !matches!(e, VideoEffect::ChromaKey { .. })) {
+            Some("under video effects (FFmpeg runs them on the RGB or 4:4:4 picture it negotiates after the grade)")
+        } else if self.white_round_trip(layer) || ops.iter().any(|o| o.tint != FadeTint::Alpha && o.factor < FADE_FULL) {
+            Some("while a fade to black or white runs on it (FFmpeg fades the RGB picture the grade leaves)")
+        } else {
+            None
+        }
     }
 
     /// Why a compositor that draws masks still does not draw this layer's: the mask is `geq`
@@ -1373,7 +1473,9 @@ impl RenderPlan {
     fn zoom_order_refusal(&self, layer: &PlanLayer, ops: &[FadeOp]) -> Option<&'static str> {
         let rotated =
             layer.transform.rotation != 0.0 || (self.mode == PlanMode::Motion && layer.animated.is_some_and(|a| a.rotates));
-        if rotated {
+        if !layer.grade.is_identity() {
+            Some("a grade")
+        } else if rotated {
             Some("a rotation")
         } else if layer.transform.opacity < 1.0 || layer.keyed_alpha.is_some_and(|a| a < 255) {
             Some("an opacity below 1")
@@ -3325,6 +3427,273 @@ mod tests {
                 _ => assert!(why.is_empty(), "{e:?}: {why:?}"),
             }
         }
+    }
+
+    /// The grade's chain, judged: what the compositor reproduces (8-bit limited-range `yuv420p` at an even size
+    /// that is not resized, BT.601 / BT.709 / untagged, nothing after the grade that sees the RGB or 4:4:4 picture)
+    /// and each thing it does not, with its own reason.
+    #[test]
+    fn a_grade_is_drawn_for_the_pictures_its_round_trip_was_measured_on_and_refused_elsewhere() {
+        use crate::model::{ClipLut, CurvePoint, Curves, Wheel, Wheels};
+        let all = GpuCaps {
+            motion: true,
+            fades: true,
+            transitions: true,
+            dip_white: true,
+            keyed_zoom: true,
+            effects: EffectKinds::ALL,
+            grade: GradeKinds::ALL,
+            ..GpuCaps::A0
+        };
+        let wheels = Grade {
+            wheels: Some(Wheels {
+                midtones: Wheel {
+                    x: 0.2,
+                    y: 0.1,
+                    lightness: 0.05,
+                },
+                ..Wheels::default()
+            }),
+            ..Grade::default()
+        };
+        let curves = Grade {
+            curves: Some(Curves {
+                master: vec![CurvePoint { x: 0.0, y: 0.1 }, CurvePoint { x: 1.0, y: 0.9 }],
+                ..Curves::default()
+            }),
+            ..Grade::default()
+        };
+        let lut = Grade {
+            lut: Some(ClipLut {
+                path: "/looks/a.cube".into(),
+                intensity: 1.0,
+            }),
+            ..Grade::default()
+        };
+        let why = |stream: StreamInfo, delivery: Option<Delivery>, edit: &dyn Fn(&mut Clip), t: f64| {
+            let plan = fading_plan_of(
+                stream,
+                delivery,
+                CompositeColorPolicy::FixedBt601,
+                |c| {
+                    c.grade = wheels.clone();
+                    edit(c);
+                },
+                t,
+            );
+            plan.reasons(&all, plan.size(u32::MAX))
+        };
+        let with = |w: Vec<Unsupported>, what: &str| {
+            assert!(
+                matches!(w.as_slice(), [Unsupported::GradeWith(_, m)] if m.contains(what)),
+                "{what}: {w:?}"
+            );
+        };
+        // Drawn: each part, the three, a picture that names BT.601 or BT.709, a crop, an alpha plane.
+        assert!(why(video(640, 360), None, &|_| {}, 0.5).is_empty());
+        for g in [
+            curves.clone(),
+            lut.clone(),
+            Grade {
+                lut: lut.lut,
+                curves: curves.curves.clone(),
+                wheels: wheels.wheels,
+            },
+        ] {
+            assert!(why(video(640, 360), None, &|c| c.grade = g.clone(), 0.5).is_empty());
+        }
+        for tag in ["bt709", "smpte170m", "bt470bg"] {
+            let stream = StreamInfo {
+                color_space: Some(tag.into()),
+                ..video(640, 360)
+            };
+            assert!(why(stream, None, &|_| {}, 0.5).is_empty(), "{tag}");
+        }
+        assert!(why(video(640, 360), None, &|c| c.transform.opacity = 0.5, 0.5).is_empty());
+        assert!(
+            why(video(640, 360), None, &|c| c.fade_in = 2.0, 5.0).is_empty(),
+            "past its fade-in"
+        );
+        // A compositor without a part is asked about nothing else of it.
+        let plan = fading_plan_of(
+            video(640, 360),
+            None,
+            CompositeColorPolicy::FixedBt601,
+            |c| c.grade = curves.clone(),
+            0.5,
+        );
+        let only_wheels = GpuCaps {
+            grade: GradeKinds::WHEELS,
+            ..all
+        };
+        assert!(matches!(
+            plan.reasons(&only_wheels, plan.size(u32::MAX)).as_slice(),
+            [Unsupported::Grade(_, "curves")]
+        ));
+        // Formats: anything but 8-bit 4:2:0 (FFmpeg grades it in the format it negotiates), one never recorded.
+        for fmt in ["yuv420p10le", "yuv444p", "yuv422p", "gray", "rgb24", "bgr0"] {
+            let stream = StreamInfo {
+                pix_fmt: Some(fmt.into()),
+                ..video(640, 360)
+            };
+            with(why(stream, None, &|_| {}, 0.5), "8-bit 4:2:0");
+        }
+        let w = why(
+            StreamInfo {
+                pix_fmt: None,
+                ..video(640, 360)
+            },
+            None,
+            &|_| {},
+            0.5,
+        );
+        assert!(
+            w.iter()
+                .any(|u| matches!(u, Unsupported::GradeWith(_, m) if m.contains("8-bit 4:2:0")))
+                && w.iter().any(|u| matches!(u, Unsupported::GradedFullRange(..))),
+            "never recorded: {w:?}"
+        );
+        // A full-range picture is refused as every colour correction on one is.
+        let full = StreamInfo {
+            pix_fmt: Some("yuvj420p".into()),
+            ..video(640, 360)
+        };
+        let w = why(full, None, &|_| {}, 0.5);
+        assert!(
+            w.iter().any(|u| matches!(u, Unsupported::GradedFullRange(..))),
+            "a grade on a full-range picture: {w:?}"
+        );
+        // A matrix with no measured round trip.
+        for tag in ["bt2020nc", "fcc", "smpte240m"] {
+            let stream = StreamInfo {
+                color_space: Some(tag.into()),
+                ..video(640, 360)
+            };
+            with(why(stream, None, &|_| {}, 0.5), "colour matrix");
+        }
+        // Effects behind the grade run on the RGB (or 4:4:4) picture FFmpeg negotiates; a chroma key is behind `format=yuva420p`.
+        for e in [
+            VideoEffect::Blur { sigma: 3.0 },
+            VideoEffect::Sharpen { amount: 0.5 },
+            VideoEffect::Grayscale,
+            VideoEffect::Invert,
+            VideoEffect::Vignette,
+        ] {
+            with(
+                why(video(640, 360), None, &|c| c.effects = vec![e.clone()], 0.5),
+                "video effects",
+            );
+        }
+        let keyed = why(
+            video(640, 360),
+            None,
+            &|c| {
+                c.effects = vec![VideoEffect::ChromaKey {
+                    color: "green".into(),
+                    similarity: 0.3,
+                    blend: 0.1,
+                }];
+            },
+            0.5,
+        );
+        assert!(keyed.is_empty(), "{keyed:?}");
+        // A fade to black or white that is running, and a dip to white wherever it is in the chain; a dissolve is alpha.
+        with(
+            why(video(640, 360), None, &|c| c.fade_in = 2.0, 0.5),
+            "fade to black or white",
+        );
+        with(
+            why(video(640, 360), None, &|c| c.fade_out = 20.0, 0.5),
+            "fade to black or white",
+        );
+        let dip = |c: &mut Clip| {
+            c.transition_in = Some(Transition {
+                kind: TransitionKind::DipToWhite,
+                duration: 2.0,
+            });
+        };
+        with(why(video(640, 360), None, &dip, 0.5), "fade to black or white");
+        assert!(why(
+            video(640, 360),
+            None,
+            &|c| c.transition_in = Some(Transition {
+                kind: TransitionKind::Crossfade,
+                duration: 2.0
+            }),
+            0.5
+        )
+        .is_empty());
+        // A moving zoom.
+        let key = |time: f64, scale: f64| Keyframe {
+            time,
+            scale,
+            pos_x: 0.0,
+            pos_y: 0.0,
+            rotation: 0.0,
+            opacity: 1.0,
+            easing: Default::default(),
+        };
+        let w = why(
+            video(640, 360),
+            None,
+            &|c| c.keyframes = vec![key(0.0, 1.0), key(4.0, 1.5)],
+            0.5,
+        );
+        assert!(w.iter().any(|u| matches!(u, Unsupported::ZoomBehind(_, "a grade"))), "{w:?}");
+        // The geometry: a resize (whatever the ratio), a letterbox, an odd picture.
+        for scale in [0.5, 1.5] {
+            with(why(video(640, 360), None, &|c| c.transform.scale = scale, 0.5), "resizes");
+        }
+        with(
+            why(video(640, 360), Some(Delivery::new(960, 540, Fit::Contain)), &|_| {}, 0.5),
+            "resizes",
+        );
+        let w = why(video(360, 640), Some(Delivery::new(640, 360, Fit::Contain)), &|_| {}, 0.5);
+        assert!(matches!(w.as_slice(), [Unsupported::Matte(_, "a grade")]), "{w:?}");
+        // ... where a crop the canvas is cut to is not a resize, and an odd picture is (a canvas that is odd is the only way here).
+        let mut plan = fading_plan_of(
+            video(641, 361),
+            Some(Delivery::new(640, 360, Fit::Contain)),
+            CompositeColorPolicy::FixedBt601,
+            |c| c.grade = wheels.clone(),
+            0.5,
+        );
+        plan.canvas.width = 641;
+        plan.canvas.height = 361;
+        plan.layers[0].transform.pos_x = 0.05;
+        with(plan.reasons(&all, (641, 361)), "odd side");
+        // The route the conversions take.
+        let route = |stream: StreamInfo, label: bool| {
+            let mut plan = fading_plan_of(
+                stream,
+                None,
+                CompositeColorPolicy::FixedBt601,
+                |c| c.grade = wheels.clone(),
+                0.5,
+            );
+            plan.layers[0].stream.label_bt709 = label;
+            plan.layers[0].grade_route()
+        };
+        let tagged = |tag: &str| StreamInfo {
+            color_space: Some(tag.into()),
+            ..video(640, 360)
+        };
+        let r = |matrix, via_444| Some(GradeRoute { matrix, via_444 });
+        assert_eq!(
+            route(video(640, 360), false),
+            r(YuvMatrix::Bt601, false),
+            "untagged: BT.601 both ways"
+        );
+        assert_eq!(route(video(640, 360), true), r(YuvMatrix::Bt709, true), "the graph's label");
+        assert_eq!(route(tagged("bt709"), false), r(YuvMatrix::Bt709, true));
+        assert_eq!(route(tagged("smpte170m"), false), r(YuvMatrix::Bt601, true));
+        assert_eq!(route(tagged("bt470bg"), false), r(YuvMatrix::Bt601, true));
+        assert_eq!(
+            route(tagged("reserved"), false),
+            r(YuvMatrix::Bt601, false),
+            "a reserved tag is none"
+        );
+        assert_eq!(route(tagged("bt2020nc"), false), None);
     }
 
     #[test]

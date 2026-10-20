@@ -1565,6 +1565,7 @@ mod tests {
             reframe: true,
             hdr: true,
             effects: EffectKinds::ALL,
+            grade: crate::plan_caps::GradeKinds::NONE,
         };
         let holding = |edit: &dyn Fn(&mut Clip)| {
             let mut clip = make_clip(a.id, 0.0, 4.0, 0.0);
@@ -1780,6 +1781,7 @@ mod tests {
             reframe: true,
             hdr: true,
             effects: EffectKinds::ALL,
+            grade: crate::plan_caps::GradeKinds::NONE,
         };
         // (The overlay names the shipped default font, which a text pass can draw.)
         assert_eq!(plan.reasons(&all, size), vec![]);
@@ -2113,6 +2115,7 @@ mod tests {
             reframe: true,
             hdr: true,
             effects: EffectKinds::ALL,
+            grade: crate::plan_caps::GradeKinds::NONE,
         };
         let keyed_clip = |a: &Asset| {
             let mut clip = make_clip(a.id, 0.0, 4.0, 1.0);

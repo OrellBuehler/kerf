@@ -9974,6 +9974,14 @@ mod rendered;
 mod grade;
 use grade::grade_filters;
 
+/// The filters of a clip's grade as the graph writes them, in chain order, for frames tagged `frame_matrix`
+/// (`None`: untagged): `lut3d`, `lutrgb`, `colorbalance`, and for a tagged picture the `scale` / `format` /
+/// `setparams` that bring it back to YCbCr. For a renderer's tests, which run the very text.
+/// Reads the disk for a LUT (its copy); empty for an identity grade.
+pub fn grade_filter_chain(grade: &Grade, frame_matrix: Option<&str>) -> Vec<String> {
+    grade_filters(grade, frame_matrix)
+}
+
 /// The still inside a fade, a dip, a dissolve, a slide or a push: its layers and their fades.
 mod still_fx;
 use still_fx::{still_layers, StillFades};
