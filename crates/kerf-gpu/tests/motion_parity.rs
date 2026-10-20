@@ -3330,7 +3330,9 @@ fn a_moving_zoom_on_the_outgoing_clip_under_a_transition() {
 /// A rotation, an opacity below 1 or a dip to white in front of a moving zoom is the order the compositor
 /// does not have: the rotated picture's alpha (or the RGB round trip) would have to be scaled with the zoom,
 /// and the zoom's `scale` takes the RGB frame `fade c=white` leaves and converts it in the same pass (up to
-/// 14 levels off a draw that scales the converted picture on 6.1.1, 3 on 9.0.2).
+/// 14 levels off a draw that scales the converted picture on 6.1.1, 3 on 9.0.2). It also checks the other
+/// way: while a keyed opacity still holds 1 the frames are drawn (and compared with the export), so a plan
+/// that refused all of them would not pass.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn a_moving_zoom_behind_a_rotation_or_an_opacity_is_refused() {
@@ -3379,6 +3381,18 @@ fn a_moving_zoom_behind_a_rotation_or_an_opacity_is_refused() {
             |u| matches!(u, Unsupported::ZoomBehind(_, w) if w.contains("opacity below 1")),
         )),
     });
+    // (The check above compares every frame the plan does not refuse; this is that there are some.)
+    let planner = Planner::new(&tl, &assets, &at_fps(30.0), PlanRequest::motion(policy())).expect("planner");
+    let drawn = upto(1.0, 30.0)
+        .filter(|k| {
+            let plan = planner.at_frame(*k).expect("plan");
+            plan.reasons(&compositor().caps(), plan.size(u32::MAX)).is_empty()
+        })
+        .count();
+    assert!(
+        drawn > 0,
+        "keyed opacity + moving zoom: no frame was drawn while the curve holds 1"
+    );
     let out = clip(&m.bars, 0.5, 1.5, 0.0);
     let mut inc = zooming(&m.testsrc, 1.0, 1.4, (0.0, 0.0));
     inc.timeline_start = 1.0;

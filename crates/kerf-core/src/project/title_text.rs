@@ -123,8 +123,7 @@ impl TitleTextInputs {
             }
             if count == 0 {
                 return Err(Error::InvalidArgument(
-                    "the title's text could not be set as outlines (the outlines would not read back), so its animation would not play"
-                        .to_string(),
+                    "nothing in the title could be set as outlines, so its animation would not play".to_string(),
                 ));
             }
         }
@@ -601,7 +600,10 @@ mod tests {
             .set_title_text_animation(id, "name", Some(rise()))
             .unwrap_err()
             .to_string();
-        assert!(err.contains("would not read back") && err.contains("would not play"), "{err}");
+        assert!(
+            err.contains("nothing in the title could be set as outlines") && err.contains("would not play"),
+            "{err}"
+        );
         assert_eq!(project.history().unwrap().len(), revisions);
         // Taking one off, or a title that sets no animation, is not held to it.
         assert!(project.set_title_text_animation(id, "name", None).is_ok());

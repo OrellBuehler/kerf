@@ -351,7 +351,9 @@ struct CutClipParams {
 struct AddClipParams {
     #[schemars(description = "UUID of the source asset")]
     asset_id: String,
-    #[schemars(description = "Target track UUID; omit to auto-select by asset kind")]
+    #[schemars(
+        description = "Target track UUID; omit to auto-select the first unlocked track of the asset's main kind. A named track must suit the clip: a video track needs media with a picture, an audio track media with sound (footage with both may go on either); an unsuitable or locked track refuses"
+    )]
     track_id: Option<String>,
     #[schemars(description = "In-point in the source asset (seconds)")]
     source_in: f64,
@@ -2801,8 +2803,11 @@ impl KerfMcp {
 
     #[tool(
         description = "Add a clip referencing a source range of an asset to the timeline. Appended after the \
-                       track's last clip unless timeline_start says where. In ripple mode (get_ripple_mode, or \
-                       pass `ripple`) a clip dropped onto footage that is already there pushes it later."
+                       track's last clip unless timeline_start says where. A track you name must suit the clip: \
+                       a video track takes media with a picture, an audio track media with sound (footage with \
+                       both may go on either), and a locked track refuses; omit track_id to land on the first \
+                       unlocked track of the asset's main kind. In ripple mode (get_ripple_mode, or pass \
+                       `ripple`) a clip dropped onto footage that is already there pushes it later."
     )]
     fn add_clip_to_timeline(&self, Parameters(p): Parameters<AddClipParams>) -> Result<String, McpError> {
         let asset_id = parse_arg("asset_id", &p.asset_id)?;
