@@ -6332,3 +6332,286 @@ fn a_yuv420p_flagged_full_range_is_refused_where_ffmpeg_reads_its_raw_samples() 
         );
     }
 }
+
+// ---- the grade: LUT, curves and wheels ---------------------------------------------------------
+
+/// A `.cube` of `size`^3 rows, written to the target directory; `f` maps a lattice point in `0..=1` to its row.
+fn grade_cube(name: &str, size: usize, f: impl Fn([f32; 3]) -> [f32; 3]) -> String {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("parity-grade-luts");
+    std::fs::create_dir_all(&dir).unwrap();
+    let n = (size - 1) as f32;
+    let mut data = Vec::with_capacity(size * size * size);
+    for b in 0..size {
+        for g in 0..size {
+            for r in 0..size {
+                data.push(f([r as f32 / n, g as f32 / n, b as f32 / n]));
+            }
+        }
+    }
+    let table = kerf_core::color_lut::Lut3d {
+        title: String::new(),
+        size,
+        data,
+    };
+    let path = dir.join(format!("{name}.cube"));
+    std::fs::write(&path, table.to_cube(1.0)).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+fn grade_points(p: &[(f64, f64)]) -> Vec<kerf_core::CurvePoint> {
+    p.iter().map(|&(x, y)| kerf_core::CurvePoint { x, y }).collect()
+}
+
+fn grade_puck(x: f64, y: f64, lightness: f64) -> kerf_core::Wheel {
+    kerf_core::Wheel { x, y, lightness }
+}
+
+/// The grades of this section: each part alone, then the three together.
+fn grades() -> Vec<(&'static str, kerf_core::Grade)> {
+    use kerf_core::{ClipLut, Curves, Grade, Wheels};
+    let look = |c: [f32; 3]| {
+        [
+            0.92 * c[0] + 0.08 * c[1] * c[2] + 0.03,
+            0.05 * c[0] * c[0] + 0.9 * c[1] + 0.04 * c[2],
+            (0.1 + 0.8 * c[2] + 0.15 * c[0] * c[1]).min(1.0),
+        ]
+    };
+    let wheels = Wheels {
+        shadows: grade_puck(0.4, -0.2, 0.1),
+        midtones: grade_puck(-0.3, 0.5, -0.05),
+        highlights: grade_puck(0.1, 0.7, 0.2),
+    };
+    let curves = Curves {
+        master: grade_points(&[(0.0, 0.03), (0.25, 0.15), (0.75, 0.85), (1.0, 0.98)]),
+        red: grade_points(&[(0.0, 0.0), (0.5, 0.58), (1.0, 1.0)]),
+        green: Vec::new(),
+        blue: grade_points(&[(0.0, 0.1), (1.0, 0.8)]),
+    };
+    let lut = |name: &str, size: usize, intensity: f64| ClipLut {
+        path: grade_cube(name, size, look),
+        intensity,
+    };
+    vec![
+        (
+            "wheels",
+            Grade {
+                wheels: Some(wheels),
+                ..Grade::default()
+            },
+        ),
+        (
+            "curves",
+            Grade {
+                curves: Some(curves.clone()),
+                ..Grade::default()
+            },
+        ),
+        (
+            "curves invert",
+            Grade {
+                curves: Some(Curves {
+                    master: grade_points(&[(0.0, 1.0), (1.0, 0.0)]),
+                    ..Curves::default()
+                }),
+                ..Grade::default()
+            },
+        ),
+        (
+            "lut",
+            Grade {
+                lut: Some(lut("look17", 17, 1.0)),
+                ..Grade::default()
+            },
+        ),
+        (
+            "lut at 40%",
+            Grade {
+                lut: Some(lut("look33", 33, 0.4)),
+                ..Grade::default()
+            },
+        ),
+        (
+            "lut, curves and wheels",
+            Grade {
+                lut: Some(lut("look17", 17, 0.75)),
+                curves: Some(curves),
+                wheels: Some(wheels),
+            },
+        ),
+    ]
+}
+
+/// A graded clip alone, at the footage's own size.
+fn graded(asset: &Asset, grade: &kerf_core::Grade, edit: &dyn Fn(&mut Clip)) -> (Timeline, Vec<Asset>) {
+    let mut c = clip(asset, 0.0, 2.0, 0.0);
+    c.grade = grade.clone();
+    edit(&mut c);
+    (timeline(vec![vec![c]], None), vec![asset.clone()])
+}
+
+/// The grade is FFmpeg's `lut3d`, `lutrgb` and `colorbalance` between a conversion to RGB and one back, and the
+/// compositor draws all of it to the level (`tests/grade.rs` holds the arithmetic to the filters on noise,
+/// `motion_parity.rs` the export's planes); here it is the still: a graded layer at its own size, alone, over
+/// another track, translucent, masked, rotated, through a dissolve, among the stills of a tagged (BT.709) clip.
+/// The final conversion to RGB is the only place the picture is not exact, which is why the numbers are a plain
+/// layer's (flat PSNR 49 dB and above on 6.1.1).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_grade_is_drawn_as_the_still_draws_it() {
+    let m = media();
+    for (name, grade) in grades() {
+        for (source, asset) in [
+            ("testsrc", &m.testsrc),
+            ("bars", &m.bars),
+            ("gradient", &m.gradient),
+            ("testsrc709", &m.testsrc709),
+            ("bars709", &m.bars709),
+        ] {
+            let (tl, assets) = graded(asset, &grade, &|_| {});
+            check(&format!("grade/{name}, {source}"), &tl, &assets, &[0.5], STRICT);
+        }
+    }
+    let all = grades();
+    let heavy = &all[5].1;
+    // Noise: every Y, U, V combination, tables walked in no order.
+    let (tl, assets) = graded(&m.noise, heavy, &|c| c.source_out = 0.2);
+    check("grade/lut, curves and wheels, noise", &tl, &assets, &[0.1], BUSY);
+    // After the `eq`, with an opacity, a mask, a rotation.
+    let (tl, assets) = graded(&m.testsrc, heavy, &|c| {
+        c.color = Color {
+            contrast: 1.2,
+            saturation: 1.3,
+            gamma: 1.1,
+            ..Color::default()
+        }
+    });
+    check("grade/after an eq", &tl, &assets, &[0.5], STRICT);
+    let (tl, assets) = graded(&m.testsrc, heavy, &|c| c.transform.opacity = 0.6);
+    check("grade/translucent", &tl, &assets, &[0.5], STRICT);
+    let (tl, assets) = graded(&m.testsrc, heavy, &|c| {
+        c.mask = Some(kerf_core::Mask {
+            shape: kerf_core::MaskShape::Ellipse,
+            x: 0.5,
+            y: 0.5,
+            width: 0.6,
+            height: 0.6,
+            feather: 0.2,
+            inverted: false,
+        });
+    });
+    check("grade/masked", &tl, &assets, &[0.5], STRICT);
+    let (tl, assets) = graded(&m.gradient, heavy, &|c| c.transform.rotation = 20.0);
+    check("grade/rotated", &tl, &assets, &[0.5], ROTATED);
+    // A layer over another: the grade does not cover what is below, and the picture is placed by the overlay.
+    let mut upper = clip(&m.testsrc, 0.0, 2.0, 0.0);
+    upper.grade = heavy.clone();
+    upper.transform.crop_left = 0.25;
+    upper.transform.crop_right = 0.25;
+    upper.transform.pos_x = 0.2;
+    let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![upper]], None);
+    check(
+        "grade/cropped and moved over another track",
+        &tl,
+        &[m.bars.clone(), m.testsrc.clone()],
+        &[0.5],
+        STRICT,
+    );
+    // A dissolve into a graded clip, and out of one.
+    let mut into = clip(&m.testsrc, 0.0, 2.0, 1.0);
+    into.grade = heavy.clone();
+    into.transition_in = Some(Transition {
+        kind: TransitionKind::Crossfade,
+        duration: 0.6,
+    });
+    let tl = timeline(vec![vec![clip(&m.bars, 0.0, 1.0, 0.0), into]], None);
+    check(
+        "grade/dissolving in",
+        &tl,
+        &[m.bars.clone(), m.testsrc.clone()],
+        &[0.95, 1.1, 1.3, 1.7],
+        STRICT,
+    );
+}
+
+/// What is refused for a graded layer, each with FFmpeg rendering the frame: a layer the compositor resizes
+/// (its scaler is a level off swscale's, which the RGB conversions grow to 3 or 4), a letterbox (the bars are
+/// graded and their chroma meets the picture's), every format but 8-bit limited-range
+/// `yuv420p`, a matrix with no measured round trip, effects behind the grade, a fade running on it and a moving zoom.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn what_the_compositor_does_not_draw_of_a_grade_is_refused() {
+    use kerf_core::VideoEffect as E;
+    let m = media();
+    let all = grades();
+    let heavy = &all[5].1;
+    let one = |asset: &Asset, edit: &dyn Fn(&mut Clip)| graded(asset, heavy, edit);
+    let refuse = |case: &str, (tl, assets): (Timeline, Vec<Asset>), t: f64, why: &'static str| {
+        check_refused(&format!("grade/refused {case}"), &tl, &assets, t, Refusal::Plan(why));
+    };
+    refuse("pip", one(&m.testsrc, &|c| c.transform.scale = 0.6), 0.5, "resizes");
+    refuse(
+        "enlarged",
+        {
+            let (mut tl, a) = one(&m.testsrc, &|_| {});
+            tl.format = Some(Delivery::new(960, 540, Fit::Contain));
+            (tl, a)
+        },
+        0.5,
+        "resizes",
+    );
+    refuse(
+        "letterboxed",
+        {
+            let (mut tl, a) = one(&m.portrait, &|_| {});
+            tl.format = Some(Delivery::new(640, 360, Fit::Contain));
+            (tl, a)
+        },
+        0.5,
+        "letterboxed",
+    );
+    for (name, asset) in [
+        ("10-bit", &m.tenbit),
+        ("4:4:4", &m.yuv444),
+        ("4:2:2", &m.yuv422),
+        ("gray", &m.gray),
+        ("bgr0", &m.bgr0),
+    ] {
+        refuse(name, one(asset, &|_| {}), 0.5, "8-bit 4:2:0");
+    }
+    refuse("full range", one(&m.fullrange, &|_| {}), 0.5, "colour correction");
+    refuse("bt2020", one(&m.testsrc2020, &|_| {}), 0.5, "colour matrix");
+    let mut unknown = m.testsrc.clone();
+    unknown.streams[0].pix_fmt = None;
+    refuse("unrecorded format", one(&unknown, &|_| {}), 0.5, "8-bit 4:2:0");
+    for (name, effect) in [
+        ("blur", E::Blur { sigma: 2.0 }),
+        ("sharpen", E::Sharpen { amount: 0.5 }),
+        ("grayscale", E::Grayscale),
+        ("invert", E::Invert),
+        ("vignette", E::Vignette),
+    ] {
+        refuse(
+            &format!("{name} behind it"),
+            one(&m.testsrc, &|c| c.effects = vec![effect.clone()]),
+            0.5,
+            "video effects",
+        );
+    }
+    refuse(
+        "fading in",
+        one(&m.testsrc, &|c| c.fade_in = 1.0),
+        0.3,
+        "fade to black or white",
+    );
+    refuse(
+        "moving zoom",
+        one(&m.testsrc, &|c| {
+            c.keyframes = zoom_keys(1.0, 1.4, (0.0, 0.0));
+        }),
+        0.5,
+        "a grade",
+    );
+    // The same clip past its fade is drawn.
+    let (tl, assets) = one(&m.testsrc, &|c| c.fade_in = 0.3);
+    check("grade/after its fade-in", &tl, &assets, &[1.0], STRICT);
+}
