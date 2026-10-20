@@ -114,16 +114,16 @@ fn a_legacy_file_is_backed_up_once_then_upgraded() {
 }
 
 /// The columns are there, so their steps change nothing; the file is still copied aside, once,
-/// for v5 to v9 (JSON steps: `needed` always, so an older build's file is kept before it is locked out).
+/// for v5 to v10 (JSON steps: `needed` always, so an older build's file is kept before it is locked out).
 #[test]
 fn a_legacy_file_that_already_has_the_columns_is_backed_up_only_for_the_json_step() {
     let dir = scratch();
     let path = dir.join("cut.kerf");
     edited(1).0.save_as(&path).unwrap();
     make_legacy(&path, true);
-    // Every step that adds a table or a column finds it there; only v5 to v9 (JSON steps) are pending.
+    // Every step that adds a table or a column finds it there; only v5 to v10 (JSON steps) are pending.
     let pending: Vec<u32> = store::pending_steps(&Connection::open(&path).unwrap(), 0);
-    assert_eq!(pending, vec![4, 5, 6, 7, 8], "only the v4 -> v5 to v8 -> v9 steps");
+    assert_eq!(pending, vec![4, 5, 6, 7, 8, 9], "only the v4 -> v5 to v9 -> v10 steps");
     drop(Project::open(&path).unwrap());
     assert_eq!(version_of(&path), SCHEMA_VERSION);
     let mut names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
@@ -251,7 +251,7 @@ fn a_v2_file_is_backed_up_once_then_gets_the_fonts_table() {
     let path = dir.join("cut.kerf");
     edited(2).0.save_as(&path).unwrap();
     make_v2(&path);
-    assert_eq!(SCHEMA_VERSION, 9);
+    assert_eq!(SCHEMA_VERSION, 10);
     assert!(!has_fonts_table(&path));
 
     let project = Project::open(&path).unwrap();
@@ -281,7 +281,7 @@ fn a_v2_file_is_backed_up_once_then_gets_the_fonts_table() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// The fonts table is there, so v3 changes nothing; the one backup is for v5 to v9 (JSON steps).
+/// The fonts table is there, so v3 changes nothing; the one backup is for v5 to v10 (JSON steps).
 #[test]
 fn a_v2_file_that_already_has_the_fonts_table_is_backed_up_only_for_the_json_step() {
     let dir = scratch();
@@ -293,7 +293,7 @@ fn a_v2_file_that_already_has_the_fonts_table_is_backed_up_only_for_the_json_ste
         .unwrap();
     assert_eq!(
         store::pending_steps(&Connection::open(&path).unwrap(), 2),
-        vec![4, 5, 6, 7, 8]
+        vec![4, 5, 6, 7, 8, 9]
     );
     drop(Project::open(&path).unwrap());
     assert_eq!(version_of(&path), SCHEMA_VERSION);
@@ -551,7 +551,7 @@ fn a_v8_file_is_backed_up_stamped_v9_and_keeps_its_animated_title() {
         .unwrap()
         .pragma_update(None, "user_version", 8)
         .unwrap();
-    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 8), vec![8]);
+    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 8), vec![8, 9]);
 
     let project = Project::open(&path).unwrap();
     assert_eq!(version_of(&path), SCHEMA_VERSION);
@@ -577,7 +577,7 @@ fn a_v7_file_is_backed_up_stamped_v8_and_keeps_its_outlined_title() {
         .unwrap()
         .pragma_update(None, "user_version", 7)
         .unwrap();
-    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 7), vec![7, 8]);
+    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 7), vec![7, 8, 9]);
 
     let project = Project::open(&path).unwrap();
     assert_eq!(version_of(&path), SCHEMA_VERSION);
@@ -612,7 +612,7 @@ fn a_v6_file_is_backed_up_stamped_v7_and_keeps_its_keyed_mask_and_crop() {
         .unwrap()
         .pragma_update(None, "user_version", 6)
         .unwrap();
-    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 6), vec![6, 7, 8]);
+    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 6), vec![6, 7, 8, 9]);
 
     let project = Project::open(&path).unwrap();
     assert_eq!(version_of(&path), SCHEMA_VERSION);
@@ -650,6 +650,51 @@ fn a_v4_file_is_backed_up_stamped_v5_and_keeps_its_title_clips() {
         version_of(&schema_backup_path(&path, 4)),
         4,
         "an older build is locked out of the upgraded file, so the file as it was is kept"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A video asset stored with the range its file declares keeps it, and one stored before v10 (no `color_range` in
+/// its stream JSON) reads as not known, which is not limited range: the plan treats it as it always did.
+#[test]
+fn a_v9_file_is_backed_up_stamped_v10_and_its_assets_read_as_range_unknown() {
+    let dir = scratch();
+    let path = dir.join("cut.kerf");
+    let project = Project::open_in_memory().unwrap();
+    let mut tagged = stream(StreamKind::Video);
+    tagged.color_range = Some("pc".into());
+    let full = asset("/full.mkv", 10.0, vec![tagged.clone()]);
+    let old = asset("/old.mp4", 10.0, vec![stream(StreamKind::Video)]);
+    project.insert_asset(&full).unwrap();
+    project.insert_asset(&old).unwrap();
+    project.save_as(&path).unwrap();
+    drop(project);
+
+    let json = serde_json::to_value(&old.streams[0]).unwrap();
+    assert!(
+        json.get("color_range").is_none(),
+        "an unset range is omitted, so a stored stream is byte-identical to a v9 one"
+    );
+    assert_eq!(serde_json::to_value(&tagged).unwrap()["color_range"], "pc");
+    let read: StreamInfo = serde_json::from_value(json).unwrap();
+    assert_eq!(read.color_range, None, "a stream written before v10 reads as not known");
+
+    Connection::open(&path)
+        .unwrap()
+        .pragma_update(None, "user_version", 9)
+        .unwrap();
+    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 9), vec![9]);
+
+    let project = Project::open(&path).unwrap();
+    assert_eq!(version_of(&path), SCHEMA_VERSION);
+    let range = |id| project.require_asset(id).unwrap().streams[0].color_range.clone();
+    assert_eq!(range(full.id).as_deref(), Some("pc"));
+    assert_eq!(range(old.id), None);
+    drop(project);
+    assert_eq!(
+        version_of(&schema_backup_path(&path, 9)),
+        9,
+        "an older build drops the tag at its next write, so the file as it was is kept"
     );
     std::fs::remove_dir_all(&dir).ok();
 }

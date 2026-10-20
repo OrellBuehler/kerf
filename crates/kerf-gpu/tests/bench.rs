@@ -70,6 +70,7 @@ fn source(dir: &Path, w: u32, h: u32) -> Asset {
             // second one that looks for transparency).
             pix_fmt: Some("yuv420p".into()),
             color_space: None,
+            color_range: None,
             lead: 0.0,
         }],
         imported_at: Utc::now(),

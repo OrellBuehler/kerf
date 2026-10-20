@@ -71,6 +71,7 @@ pub fn probe(path: &Path) -> Result<ProbeResult> {
             color_primaries: None,
             pix_fmt: None,
             color_space: None,
+            color_range: None,
             lead: 0.0,
         };
 
@@ -85,6 +86,7 @@ pub fn probe(path: &Path) -> Result<ProbeResult> {
                     // ffprobe's spelling (`yuva420p`). `None` is "unspecified".
                     info.pix_fmt = Some(format!("{:?}", video.format()).to_lowercase()).filter(|p| p != "none");
                     info.color_space = space_name(video.color_space());
+                    info.color_range = range_name(video.color_range());
                 }
                 // Mirror the ffprobe path's two projection signals (see
                 // `super::cli::detect_projection`): the container's declared
@@ -181,6 +183,17 @@ fn space_name(s: ff::color::Space) -> Option<String> {
         _ => return None,
     };
     Some(name.to_string())
+}
+
+/// The stream's declared sample range in ffprobe's spelling (`tv` / `pc`), `None` when it declares
+/// none. A JPEG-range stream is `pc`, as `color_range` reads on the ffprobe path.
+fn range_name(r: ff::color::Range) -> Option<String> {
+    use ff::color::Range as R;
+    match r {
+        R::MPEG => Some("tv".to_string()),
+        R::JPEG => Some("pc".to_string()),
+        R::Unspecified => None,
+    }
 }
 
 fn primaries_name(p: ff::color::Primaries) -> Option<String> {

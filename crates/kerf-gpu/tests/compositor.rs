@@ -45,6 +45,7 @@ fn asset(w: u32, h: u32) -> Asset {
             color_primaries: None,
             pix_fmt: Some("yuv420p".into()),
             color_space: None,
+            color_range: None,
             lead: 0.0,
         }],
         imported_at: Utc::now(),

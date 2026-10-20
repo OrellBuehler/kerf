@@ -434,7 +434,7 @@ fn stream(kind: StreamKind, codec: &str, size: (u32, u32), fps: f64) -> StreamIn
     StreamInfo {
         index: 0, kind, codec: codec.into(), width: video.then_some(size.0), height: video.then_some(size.1), fps: video.then_some(fps),
         sample_rate: None, channels: None, image: false, projection: None, rotation: 0, color_transfer: None, color_primaries: None,
-        pix_fmt: video.then(|| "yuv420p".into()), color_space: None, lead: 0.0,
+        pix_fmt: video.then(|| "yuv420p".into()), color_space: None, color_range: None, lead: 0.0,
     }
 }
 

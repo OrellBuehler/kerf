@@ -310,15 +310,18 @@
   The dip-to-white refusals are the **Motion** plane bound's and are conservative in stills on purpose: bypassed, RGB, 10-bit, 4:4:4,
   4:2:2, gray, BT.2020, full-range and half-size layers all pass a still's strict bounds, but `reasons()` is one function for both modes.
   `FullRangeNegotiated(layer)` (a still): a `yuvj` (or unrecorded-format) picture inside a running fade, dip or dissolve where FFmpeg 9 works on its raw
-  values and converts the range afterwards (`fade` darkens toward the limited-range 16 first: frame 0 of a fade-in reads Y 30 where black is 16).
+  values and converts the range afterwards (`fade` darkens toward the limited-range 16 first: frame 0 of a fade-in reads Y 30 where black is 16). A **`yuv420p`
+  flagged `pc`** (`PlanStream::raw_full_range`) gets it under **every** policy and in an export frame too (under `FixedBt601` only; the cut is the reason where FFmpeg 9 flags it): its format is already the overlay's, so FFmpeg 6 has no conversion ahead of the fade either.
   **`FullRangeCut`** (an export frame; a plan-level reason, from `PlanCanvas::full_range_cut`, which the `Planner` sets when any clip of the cut
   `maybe_full_range()`): FFmpeg 9 flags the whole export full range and converts every limited-range frame of it (a black frame reads Y 0, not 16), so under any policy
   but `FixedBt601` **no frame of a cut that holds a full-range clip** is drawn — before it, after it, on another track or a gap. FFmpeg 6 converts at the decode, as the
   compositor does, and draws it all to the level, except that **`FullRangeResized`** (under either FFmpeg, from `reasons(size)`) refuses a full-range
   picture the scaler resizes in an export frame and inside a fade (swscale converts the range inside the resize: chroma up to 15 levels off).
-  `maybe_full_range()` is a name heuristic (`yuvj…`, or no recorded format): the range tag (`color_range`) is the truth and `StreamInfo` does not record it. Under a policy that is not
-  `FixedBt601`, `maybe_full_range_in(policy)` therefore also counts any deeper-than-8-bit YCbCr / gray format (`pix_fmt_is_high_bit`): a `pc`-tagged 10-bit file probes as `yuv420p10le`, 9.0.2 handles it as `yuvj`, and the
-  limited 10-bit picture is refused with it (it is what the cut flag, `FullRangeNegotiated` and the grading refusals use; 6.1.1 draws both exactly, so the name alone decides there). Only a clip the export holds sets the cut flag (not a muted track, a
+  `maybe_full_range()` is true for a `yuvj…` name, no recorded format, or **a `yuv420p` flagged full range** (`StreamInfo.color_range == "pc"`, recorded since schema v10; a VP9 / HEVC / AV1 file probes as plain `yuv420p`): the range flag is the truth, but an
+  asset stored before v10 has none (`None`, "not known": judged by its name as ever; so does an unflagged file and a `tv` one). `flagged_full_range()` is the flag in any YCbCr format (RGB and gray pictures read `pc` from ffprobe on every FFmpeg, so for them it says nothing). Under a policy that is not
+  `FixedBt601`, `maybe_full_range_in(policy)` also counts a YCbCr picture flagged `pc` in any format and any deeper-than-8-bit YCbCr / gray format (`pix_fmt_is_high_bit`) whatever it says: a `pc`-tagged 10-bit file probes as `yuv420p10le`, 9.0.2 handles it as `yuvj`, and a
+  limited 10-bit picture is refused with it, because a file may say nothing of its range (it is what the cut flag, `FullRangeNegotiated` and the grading refusals use; 6.1.1 draws a 10-bit one exactly, so there only the name and a `yuv420p` flag decide).
+  A flagged `yuv420p` is the exception on 6.1.1: nothing converts it ahead of the filters, so its raw samples meet the vignette, key, `eq`, fade and the other effects on every FFmpeg (refused under any policy), while a plain layer and a cut are exact there. Only a clip the export holds sets the cut flag (not a muted track, a
   disabled clip, a track a solo shadows, or an audio track's use of the asset).
   The policy condition is a **proxy measured only on FFmpeg 6.1.1 and 9.0.2** (5.x, 7.x, 8.x and distro builds are unmeasured).
   **`gpu_supported_at(size)` is the per-frame fallback switch** (`gpu_supported()` is
@@ -444,11 +447,11 @@
     known (never recorded, or off the table) is refused wherever the grids disagree
     (`LayerGeometry::resolve_any_grid`).
   - **Range.** The decode converts a full-range picture (ffprobe names it `yuvj…`,
-    whatever the container) to limited range up front; FFmpeg 9 keeps it full range
+    whatever the container, or it is a `yuv420p` flagged `color_range=pc`) to limited range up front; FFmpeg 9 keeps it full range
     through the graph (tagged `pc`) and runs `eq` and the overlay on it, converting
     last. That agrees with no colour correction and disagrees with it by 34 to 44 dB
     (every knob, measured on both an mjpeg file and full-range H.264), so **colour
-    correction on a `yuvj` picture is refused** (under any policy — FFmpeg 6 happened
+    correction on a `yuvj` picture, or a `yuv420p` flagged `pc`, is refused** (under any policy — FFmpeg 6 happened
     to agree, but it is the decode order that is different), and so is **a graded layer
     in a stack that holds one** wherever the composite's colour is negotiated or
     unknown (the range, like the matrix, is the bottom layer's). An asset that never

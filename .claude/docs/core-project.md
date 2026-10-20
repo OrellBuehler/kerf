@@ -146,9 +146,14 @@
   title; v8→v9 is the same kind of JSON step for a text animation (`data-kerf-animate` on a `<text>`, compiled into per-glyph
   SMIL inside its glyph group; "Text animations" below): an older build draws the compiled animation it finds but does not know
   the attribute, so setting that title's text again (a template value, a box, Draw as outlines) drops the animation while the
-  attribute stays; `persisted/timelines-v9.json` holds an animated template title. The schema is at **v9** (`SCHEMA_VERSION`).
-  `persist_tests` pins which steps a file has pending with
-  `store::pending_steps` (a legacy file that has every column: `[4, 5, 6, 7, 8]`). A step's `needed_to_read` says whether a build that
+  attribute stays; `persisted/timelines-v9.json` holds an animated template title; v9→v10 is a JSON step for a **new field**,
+  `StreamInfo.color_range` (`"pc"` / `"tv"`) in an asset's `streams` JSON column
+  (the range the file declares, which a `yuv420p` VP9 / HEVC / AV1 file flags where its format name says nothing: the GPU plan refuses such a
+  picture on it, `core-render-plan.md`): an older build drops it at its next write of the asset and would draw the picture as limited range; an asset stored before has none
+  and reads "not known" (omitted when `None`, so a stored stream stays byte-identical), judged by its name as it always was, until a
+  relink or a fresh import probes it again; no timeline JSON moves, so there is no `persisted/` file for v10.
+  The schema is at **v10** (`SCHEMA_VERSION`). `persist_tests` pins which steps a file has pending with
+  `store::pending_steps` (a legacy file that has every column: `[4, 5, 6, 7, 8, 9]`). A step's `needed_to_read` says whether a build that
   cannot write must still refuse a file lacking what it adds: true for the v1, v2 and v4 columns (the reads
   name them), false for the `fonts` table (reads tolerate its absence), so a write-protected v2 project
   opens as it is. A new file is stamped `SCHEMA_VERSION`; a
