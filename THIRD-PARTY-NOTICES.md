@@ -32,6 +32,16 @@ controls model of [EffectCraft](https://github.com/storytold/effectcraft) (`crat
 template (a manifest with named controls bound to elements of the artwork, a poster and embedded fonts) is.
 Its brand marks are not used.
 
+## Text animators modelled on EffectCraft
+
+The text animators (`crates/kerf-core/src/svg/text_animation.rs`, `glyph_smil.rs`, and their TypeScript mirror
+`frontend/src/lib/text-animation.ts`) follow the design of [EffectCraft](https://github.com/storytold/effectcraft)'s text
+animators (`crates/text/src/selectors.rs`, `crates/render/src/text.rs`, `crates/engine/src/presets/text_animators.json`), which is
+licensed MIT OR Apache-2.0: a range selector (start, end, offset and a shape) and a wiggly selector that give each character,
+word or line an amount, and animator properties applied at that amount, with a set of eight presets (rise, fade in, typewriter, pop, blur in, spin in, drop
+in, wiggle). No EffectCraft code or preset data is copied: the engine here compiles the model into per-glyph SMIL for the SVG
+rasteriser, samples the selectors itself, and the presets are Kerf's own values.
+
 ## Adapted from EffectCraft
 
 From EffectCraft 0.12.0 (`crates/text`, revision `ef74d82`), licensed MIT OR Apache-2.0 and used here under

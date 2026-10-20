@@ -55,6 +55,7 @@ import {
 	removeSvgOverlay as apiRemoveSvgOverlay,
 	setTemplateValues as apiSetTemplateValues,
 	setTitleTextBox as apiSetTitleTextBox,
+	setTitleTextAnimation as apiSetTitleTextAnimation,
 	convertTitleText as apiConvertTitleText,
 	updateSvgOverlay as apiUpdateSvgOverlay,
 	setAudioEffects,
@@ -178,6 +179,7 @@ import type {
 	SvgOverlayPatch,
 	SvgSource,
 	TemplateEdit,
+	TextAnimation,
 	TextBox,
 	TitleTextForm,
 	TitleClipPatch,
@@ -1396,6 +1398,15 @@ class EditorState {
 		let edit!: TemplateEdit;
 		await this.#apply(async () => {
 			edit = await apiSetTitleTextBox(titleId, element, textBox);
+			return edit.timeline;
+		});
+		return edit;
+	}
+	/** Give a title's `<text>` an animation (or none); its text is set as outlines again. */
+	async setTitleTextAnimation(titleId: string, element: string, animation: TextAnimation | null) {
+		let edit!: TemplateEdit;
+		await this.#apply(async () => {
+			edit = await apiSetTitleTextAnimation(titleId, element, animation);
 			return edit.timeline;
 		});
 		return edit;

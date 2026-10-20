@@ -303,6 +303,14 @@ title cannot go back to text). Both take `title_text_inputs` and prepare on `blo
 both are idempotent sets. `svg_bytes` in `SvgOverlaySummary` / `TitleClipSummary` is the **text form's** size
 (`text_form_bytes`, the source `get_timeline_state` shows), not the stored one with its paths; `validate_svg`'s is the sanitised
 document's (an agent's own source is never outlined). The instructions name `set_title_text_box` for text of any length.
+**`set_title_text_animation { title_id, element, preset?, delay?, duration?, animation? }`** animates a `<text>` (any title but a
+preset): a `preset` id (`list_text_animation_presets`: rise, fade_in, typewriter, pop, blur_in, spin_in, drop_in, wiggle) or a whole
+`animation` of the agent's own (`by`, `delay`, `duration`, `easing`, `range`, `wiggle`, `properties` in em; every field has a
+default), `delay` / `duration` overriding either's, neither taking the animation away; one that changes nothing or is out of
+bounds, a text that cannot be an outline and a `preset` with an `animation` are errors saying why. Same lock-free shape as the box
+(`TitleTextInputs::text_animation` on `blocking`, then `edit()` → `set_title_text_parsed`, label `Set text animation`); the
+`get_timeline_state` source shows it as `data-kerf-animate` on the `<text>`. **`list_text_animation_presets`** (read) returns
+`[{id, name, description, animation}]`. The instructions name both.
 `import_asset` refuses a UNC / device-namespace `path` before any filesystem call (`require_local_input_path`), then a URL,
 protocol, relative path or missing file (`validate_import_path`). It is the one write that does **not** stage — a file on disk is not
 an edit to the user's cut, so imported media (and its background proxy) lands for
@@ -598,7 +606,7 @@ Every tool, by purpose (a test pins that this list names each registered tool, a
 - **Titles, captions, markers, frame**: `add_overlay`, `update_overlay`, `remove_overlay`, `set_overlay_keyframes`,
   `add_svg_overlay`, `update_svg_overlay`, `remove_svg_overlay`, `add_title_clip`, `update_title_clip`, `list_svg_presets`, `validate_svg`, `preview_svg_overlay`,
   `preview_svg_preset`, `list_templates`, `save_template`, `apply_template`, `set_template_values`, `set_title_text_box`,
-  `convert_title_text`, `import_template`,
+  `set_title_text_animation`, `list_text_animation_presets`, `convert_title_text`, `import_template`,
   `export_template`, `delete_template`, `generate_captions`, `import_captions`, `clear_captions`, `export_srt`, `export_captions`, `add_marker`,
   `update_marker`, `remove_marker`, `set_delivery_format`.
 - **Voiceover**: `generate_voiceover`, `voiceover_status`.

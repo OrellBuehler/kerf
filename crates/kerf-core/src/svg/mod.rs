@@ -24,6 +24,7 @@
 
 mod anim;
 mod cost;
+mod glyph_smil;
 pub(crate) mod images;
 mod outline;
 mod presets;
@@ -31,6 +32,7 @@ pub mod raster;
 mod rules;
 mod sanitize;
 pub(crate) mod splice;
+mod text_animation;
 mod text_box;
 mod values;
 
@@ -46,7 +48,19 @@ use sanitize::{escape_attr, is_attribute_name, plain_attribute, value_range, SVG
 use values::{TransformType, Value};
 
 pub use outline::restore_text;
+
+/// Whether a title holds any text set as glyph outlines (`<g data-kerf-text="">`).
+pub fn has_outlines(svg: &str) -> bool {
+    svg.contains(outline::TEXT_MARK)
+}
+
+/// The attribute of a `<text>` that holds its animation (JSON of a [`TextAnimation`]).
+pub const ANIMATE_ATTRIBUTE: &str = text_animation::ANIMATE_MARK;
 pub use presets::{check_params, preset_infos, render_preset, SvgPresetInfo, SvgPresetParamInfo, DEFAULT_FRAME};
+pub use text_animation::{
+    set_text_animation, text_animation_of, text_animation_preset, text_animation_presets, AnimateBy, Easing, Offset, Properties,
+    RangeSelector, Shape, TextAnimation, TextAnimationPreset, Wiggle,
+};
 pub use text_box::{set_text_box, text_box_of, TextBox, TextFit, MAX_BOX_WIDTH};
 
 /// What [`SvgDoc::parse`] says of artwork with a text box (`inline-size`, `data-kerf-fit`) and no outlines:
@@ -54,6 +68,17 @@ pub use text_box::{set_text_box, text_box_of, TextBox, TextFit, MAX_BOX_WIDTH};
 pub const BOX_NOTE: &str = "a text box (inline-size, data-kerf-fit) is drawn only when the title's text is glyph outlines: \
                             this artwork draws its text with its fonts, running on, until its text is converted to outlines \
                             (convert_title_text, or Draw as outlines in the Inspector)";
+
+/// What [`SvgDoc::parse`] says of artwork with a text animation (`data-kerf-animate`) and no outlines: the
+/// animation is compiled for glyph outlines only, so this artwork's text stays still until it is converted.
+pub const ANIMATE_NOTE: &str = "a text animation (data-kerf-animate) plays only when the title's text is glyph outlines: \
+                                this artwork draws its text with its fonts, still, until its text is converted to outlines \
+                                (convert_title_text, or Draw as outlines in the Inspector)";
+
+/// Whether sanitised `src` gives a text an animation but holds no outlines.
+fn has_unoutlined_animation(src: &str) -> bool {
+    src.contains(text_animation::ANIMATE_MARK) && !src.contains(outline::GLYPHS_MARK)
+}
 
 /// Whether sanitised `src` gives a text a box (an `inline-size` other than `auto`, in an attribute, a
 /// `style` or a sheet) but holds no outlines.
@@ -226,6 +251,9 @@ impl SvgDoc {
         if has_unoutlined_box(&text) {
             warnings.push(BOX_NOTE.to_string());
         }
+        if has_unoutlined_animation(&text) {
+            warnings.push(ANIMATE_NOTE.to_string());
+        }
         let doc = Document::parse_with_options(&text, xml_options()).map_err(|e| invalid(format!("not valid XML: {e}")))?;
         if !has_size(&doc.root_element()) {
             return Err(invalid(
@@ -328,9 +356,10 @@ impl SvgDoc {
     }
 
     /// [`SvgDoc::outlined`], with how many texts are outlines now and each that stays text and why. The
-    /// generic [`BOX_NOTE`] goes: what is outlined draws its box, and a boxed text that is not says so itself.
+    /// generic [`BOX_NOTE`] and [`ANIMATE_NOTE`] go: what is outlined draws its box and plays its animation, and a text
+    /// that is not says so itself.
     pub(crate) fn outlined_counted(mut self, db: &fontdb::Database) -> Result<(SvgDoc, usize, Vec<String>)> {
-        self.warnings.retain(|w| w != BOX_NOTE);
+        self.warnings.retain(|w| w != BOX_NOTE && w != ANIMATE_NOTE);
         let out = outline::outline_text(&self.src, db)?;
         let (mut doc, count) = match out.count {
             0 => (self, 0),

@@ -269,11 +269,11 @@ impl Template {
         let doc = SvgDoc::parse(&self.svg)?;
         self.svg = doc.sanitized().to_string();
         validate_controls(&self.manifest.controls, &self.svg)?;
-        // A template's text is set as outlines whenever it is applied: its boxes are drawn.
+        // A template's text is set as outlines whenever it is applied: its boxes are drawn, its animations play.
         let warnings = doc
             .warnings()
             .iter()
-            .filter(|w| *w != crate::svg::BOX_NOTE)
+            .filter(|w| *w != crate::svg::BOX_NOTE && *w != crate::svg::ANIMATE_NOTE)
             .cloned()
             .collect();
         Ok(Checked { doc, warnings })
