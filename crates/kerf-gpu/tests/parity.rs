@@ -1731,6 +1731,95 @@ fn colour_adjustments() {
     );
 }
 
+/// The scaler is a level from swscale's and `eq` maps two values a level apart to values its tables' steepest step apart, so
+/// on a layer the compositor scales a grade whose tables step past two (`eq::table_steps`, `MAX_AMPLIFIED_ERROR`) is FFmpeg's:
+/// `GradeSteep`, in a still as in an export frame (`motion_parity.rs` holds the frames drawn inside the bound to the level, and
+/// the keyed ramps frame by frame). Contrast and saturation past 2, a gamma past about 1.2, a black point parked above 0 under a
+/// gamma above 1 (a negative brightness, or a contrast), at the far ends of every range. The same grades at the picture's own size are
+/// exact and drawn, and so is a gentle one on the scaled layer.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_grade_whose_tables_amplify_the_scalers_level_past_two_is_refused_on_a_layer_it_resizes() {
+    let m = media();
+    let grade = |brightness: f64, contrast: f64, saturation: f64, gamma: f64, temperature: f64| Color {
+        brightness,
+        contrast,
+        saturation,
+        gamma,
+        temperature,
+    };
+    let reason = || Refusal::Plan("colour correction whose tables step");
+    let shifted = Transform {
+        scale: 0.6,
+        pos_x: 0.1,
+        pos_y: -0.1,
+        ..Transform::default()
+    };
+    let pip = |color: Color| {
+        let mut c = clip(&m.testsrc, 0.0, 2.0, 0.0);
+        c.transform = shifted;
+        c.color = color;
+        timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![c]], None)
+    };
+    let under = [m.bars.clone(), m.testsrc.clone()];
+    let steep = [
+        ("contrast 3", grade(0.0, 3.0, 1.0, 1.0, 0.0)),
+        ("saturation 3", grade(0.0, 1.0, 3.0, 1.0, 0.0)),
+        ("gamma 1.4", grade(0.0, 1.0, 1.0, 1.4, 0.0)),
+        ("gamma 2", grade(0.0, 1.0, 1.0, 2.0, 0.0)),
+        ("brightness -0.3 and gamma 1.5", grade(-0.3, 1.0, 1.0, 1.5, 0.0)),
+        ("contrast 1.8 and gamma 2", grade(0.0, 1.8, 1.0, 2.0, 0.0)),
+        ("the far end of every range", grade(0.3, 1.8, 2.0, 2.0, 1.0)),
+    ];
+    for (name, color) in steep {
+        check_refused(&format!("refused/steep-grade-pip-{name}"), &pip(color), &under, 0.5, reason());
+    }
+    // A letterboxed layer (the portrait picture shrunk into a landscape frame, the bars in the picture the `eq` sees) and a
+    // layer scaled by the fit alone.
+    let boxed = |color: Color| {
+        let mut c = clip(&m.portrait, 0.0, 2.0, 0.0);
+        c.color = color;
+        timeline(vec![vec![c]], Some(Delivery::new(640, 360, Fit::Contain)))
+    };
+    for (name, color) in steep {
+        check_refused(
+            &format!("refused/steep-grade-letterbox-{name}"),
+            &boxed(color),
+            std::slice::from_ref(&m.portrait),
+            0.5,
+            reason(),
+        );
+    }
+    let mut cover = clip(&m.testsrc, 0.0, 2.0, 0.0);
+    cover.color = grade(0.0, 1.8, 1.0, 2.0, 0.0);
+    check_refused(
+        "refused/steep-grade-cover-fit",
+        &timeline(vec![vec![cover]], Some(Delivery::new(360, 640, Fit::Cover))),
+        std::slice::from_ref(&m.testsrc),
+        0.5,
+        reason(),
+    );
+    // A layer the compositor does not resize: the tables are exact at any step.
+    let mut alone = clip(&m.testsrc, 0.0, 2.0, 0.0);
+    alone.color = grade(0.3, 1.8, 2.0, 2.0, 1.0);
+    check(
+        "colour/the far end of every range at the picture's size",
+        &timeline(vec![vec![alone]], None),
+        std::slice::from_ref(&m.testsrc),
+        &[0.5],
+        STRICT,
+    );
+    // ... and a grade that steps by two at most is drawn on the scaled layer.
+    for (name, color) in [
+        ("contrast 2", grade(0.0, 2.0, 1.0, 1.0, 0.0)),
+        ("saturation 2", grade(0.0, 1.0, 2.0, 1.0, 0.0)),
+        ("gamma 1.2", grade(0.0, 1.0, 1.0, 1.2, 0.0)),
+        ("brightness 0.3 and gamma 2", grade(0.3, 1.0, 1.0, 2.0, 0.0)),
+    ] {
+        check(&format!("colour/pip, {name}"), &pip(color), &under, &[0.5], STRICT);
+    }
+}
+
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn still_images() {
@@ -3344,8 +3433,9 @@ fn grading_a_full_range_picture_is_refused_and_ungraded_it_is_drawn() {
     ] {
         let mut pip = clip(top, 0.0, 2.0, 0.0);
         pip.transform = transform;
+        // (A gamma of 1.2: the limited-range pip is scaled, and a steeper one is the plan's own refusal, below.)
         pip.color = Color {
-            gamma: 1.4,
+            gamma: 1.2,
             ..Color::default()
         };
         let tl = timeline(vec![vec![clip(bottom, 0.0, 2.0, 0.0)], vec![pip]], None);

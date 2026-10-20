@@ -248,10 +248,25 @@
   **A grade is refused**: `PlanLayer.grade` is the clip's `Grade`, and curves, wheels or a LUT that changes the picture
   are `Unsupported::Grade(layer, what)` (kind `grade`) whatever the caps — no compositor pass or parity case draws
   `lutrgb` / `colorbalance` / `lut3d` or their RGB round trip yet.
-  **Colour and partly-keyed transforms in the plan.** `PlanLayer.color` is `Clip::color_at(local)`, sampled
-  per frame (a still plan draws it like a static grade; the ZoomBehind check reads it), and a **Motion**
-  plan with a keyed colour is refused (`Unsupported::KeyedColor`, until `GpuCaps::keyed_color`: the
-  file's `eq` is written per frame, and no pass or parity case draws one yet). A **keyed mask** is the same:
+  **Colour and partly-keyed transforms in the plan.** `PlanLayer.color` is `Clip::color_at(local)` in a still plan
+  (a static grade's sample; the ZoomBehind check reads it) and, in a **Motion** plan with a keyed colour, **the numbers
+  the export's `eq` evaluates to at that frame**: `engine::keyed_color_value(clip, T)`, each keyed number through
+  `keyframe_value` (the quoted expression's own arithmetic, as `keyed_alpha` is) at `T` = `ffmpeg_frame_time(k)` on the
+  clip's `fps` grid — `eq` reads `pts * av_q2d(tb)` behind `fps` — and the numbers not keyed the clip's own, the temperature
+  as `Color::temperature_gammas` makes `1 + 0.3 t` / `1 - 0.3 t` of it (`sweep.rs` holds every number, `gamma_r` and `gamma_b`
+  included, to the evaluated graph text to the bit, at all five rates). `eq` rebuilds its tables from them every frame, so a
+  compositor that sets `GpuCaps::keyed_color` (a Motion plan is refused `Unsupported::KeyedColor` without it) builds its
+  tables from the layer's colour each frame, as for a static grade. **A keyed `eq` is in the chain on every frame of the
+  clip**, neutral numbers or not, so the refusals about grading a picture (`GradedFullRange`, `GradedInFullRangeStack`) judge
+  `RenderPlan::graded(layer)` — a colour that is not the identity, or in a Motion plan any keyed colour — and a full-range clip
+  is refused on the frames where the curve passes through neutral too. **A grade on a layer the scaler resizes is judged by its tables**
+  (`Unsupported::GradeSteep`, from `reasons(size)`, static grades and each frame of a keyed one alike): the compositor's scaler is a
+  level from swscale's and `eq` maps two values a level apart to `eq::table_steps(&layer.color)` apart (`kerf_core::eq`: the port of `eq`'s
+  tables, shared with the compositor; the steepest step between neighbouring entries of the Y, U and V tables of that colour, the whole table, a
+  black point parked above 0 included), so a frame whose steepest step is past `MAX_AMPLIFIED_ERROR` (2) is FFmpeg's. The geometry is the
+  sharpen rule's below (a scale ahead of the `eq`: every stage, or the fit scale when a moving zoom comes last); an unscaled layer is exact
+  at any step. Nothing is built for an ungraded or unscaled layer, and the last four colours' answers are kept per thread (the build is about
+  20 microseconds on the `pow` path). A **keyed mask** is the same:
   `PlanLayer.mask` is `Clip::mask_at(local)`, a still plan draws it as a static mask (the FFmpeg still draws
   `mask_at` through the static `geq`, the compositor `mask_alpha_plane` of it), and a Motion plan is refused
   (`Unsupported::KeyedMask`, no cap). A **keyed crop** is refused in both modes (`Unsupported::KeyedCrop`): the
@@ -271,7 +286,7 @@
   evaluated graph.
   **What the compositor may draw is data**: `GpuCaps` (`Compositor::caps()`: the bits `motion`, `fades`,
   `transitions`, `dip_white`, `keyed_opacity`, `keyed_zoom`, `keyed_color`, `mask`, `text`, `reframe`, `hdr` and an
-  `EffectKinds` bitset; today `GpuCaps::A0` plus every one of them but `keyed_color`, `reframe`, `hdr`
+  `EffectKinds` bitset; today `GpuCaps::A0` plus every one of them but `reframe`, `hdr`
   with every effect kind), and **`RenderPlan::reasons(&caps,
   size)` is a pure function of the plan's fields** returning `Unsupported` values whose
   `Display` is the message the plan has always given — nothing is decided while planning,
@@ -328,7 +343,7 @@
   its size-free half; `unsupported_reasons_at(size)` says *no, with reasons*) for
   anything the compositor does not render exactly: video effects (`Effects(layer, what)`: names the effect without its kind
   in the caps, or the value
-  `gblur` / `unsharp` refuse itself: a sigma outside 0 to 1024, an amount outside -2 to 5; or what the picture changes: an invert, blur or sharpen on a full-range or never-recorded picture, an invert on a gray one, a vignette on anything but a limited-range `yuv420p` one (`vignette` works in the picture's own format), a chroma key on anything but a `yuv420p` one, or on a rotated or translucent layer; in `reasons` a chroma key after a scale ahead of the effects or a blur (its alpha moves by up to 1/blend levels for a level of chroma) or on a picture under two samples a side; a similarity or blend `chromakey` refuses itself (0.00001 to 1, 0 to 1); and in `reasons`, by render size, a sharpen after a scale or a blur: from the first scale or blur with sigma > 0, the worst case starts at 1 and each later non-zero sharpen adds `ceil(2 * err * |amount|)`, so the frame is refused past 2: one sharpen above 0.5, or a second one), masks (`Mask` without `caps.mask`;
+  `gblur` / `unsharp` refuse itself: a sigma outside 0 to 1024, an amount outside -2 to 5; or what the picture changes: an invert, blur or sharpen on a full-range or never-recorded picture, an invert on a gray one, a vignette on anything but a limited-range `yuv420p` one (`vignette` works in the picture's own format), a chroma key on anything but a `yuv420p` one, or on a rotated or translucent layer; in `reasons` a chroma key after a scale ahead of the effects or a blur (its alpha moves by up to 1/blend levels for a level of chroma) or on a picture under two samples a side; a similarity or blend `chromakey` refuses itself (0.00001 to 1, 0 to 1); and in `reasons`, by render size, a sharpen after a scale or a blur: from the first scale or blur with sigma > 0, the worst case starts at 1 (at the grade's steepest luma step when a scaled layer is graded) and each later non-zero sharpen adds `ceil(2 * err * |amount|)`, so the frame is refused past 2: one sharpen above 0.5, or a second one; and a grade whose tables step past 2, above), masks (`Mask` without `caps.mask`;
   `MaskWith(layer, what)` with it, on a rotated layer or one below full opacity, or over a chroma key; `Matte(layer, what)` for a blur, a sharpen, a vignette or a chroma key on a
   letterboxed picture, judged with the geometry in `reasons`: FFmpeg's `pad` hands them the padded frame, bars included — a mask is cut
   from that frame too and is drawn at the layer's size), 360 reframe,

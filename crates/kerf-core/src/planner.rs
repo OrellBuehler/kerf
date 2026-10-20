@@ -58,7 +58,7 @@ use crate::clip_timing::{
     clip_seek, clip_source_window, clips_with_fx, ffmpeg_frame_time, graph_bt709_labels, ClipFx, ClipTiming, FadeEdge, FadeStep,
     MotionKeys, Rational,
 };
-use crate::engine::{keyframe_value, render_geometry, safe_color, valid_color, Container, ExportOptions};
+use crate::engine::{keyed_color_value, keyframe_value, render_geometry, safe_color, valid_color, Container, ExportOptions};
 use crate::error::{Error, Result};
 use crate::frame_pick::{FpsPick, Pick};
 use crate::layer_geometry::Keyed;
@@ -628,7 +628,12 @@ impl Planner {
                     clip_time: local,
                     stream,
                     transform: clip.transform_at(local),
-                    color: clip.color_at(local),
+                    color: if motion && planned.animated.is_some_and(|a| a.color) {
+                        let pick = self.canvas.pick_fps;
+                        keyed_color_value(clip, ffmpeg_frame_time(u64::try_from(frame).unwrap_or(0), pick.num, pick.den))
+                    } else {
+                        clip.color_at(local)
+                    },
                     grade: clip.grade.clone(),
                     name: asset.name.clone(),
                     projection: asset.projection,
@@ -802,7 +807,7 @@ mod tests {
     use super::*;
     use crate::clip_timing::FadeTint;
     use crate::engine::test_support::{make_clip, single, test_asset, timeline_of, video_stream, video_track};
-    use crate::model::{Clip, Delivery, Fit, Framing, Keyframe, Mask, Track, Transform, Transition, TransitionKind};
+    use crate::model::{Clip, Color, Delivery, Fit, Framing, Keyframe, Mask, Track, Transform, Transition, TransitionKind};
     use crate::plan_caps::{EffectKinds, GpuCaps, Unsupported};
     use crate::render_plan::active_video_clips;
     use crate::render_plan::RenderPlan;
@@ -2022,6 +2027,202 @@ mod tests {
             .at_frame(60)
             .unwrap();
         assert!(plan.layers[0].animated.is_none());
+    }
+
+    #[test]
+    fn an_export_frame_carries_the_colour_its_eq_evaluates_to_and_a_still_the_models() {
+        use crate::model::{Easing, Property, PropertyKey};
+        let a = asset();
+        let assets = [a.clone()];
+        let mut clip = make_clip(a.id, 0.0, 4.0, 0.7);
+        clip.color.contrast = 1.25;
+        clip.color.saturation = 0.9;
+        clip.set_property_keys(
+            Property::Brightness,
+            vec![
+                PropertyKey {
+                    time: 0.0,
+                    value: -0.3,
+                    easing: Easing::EaseInOut,
+                },
+                PropertyKey::new(1.7, 0.4),
+                PropertyKey::new(2.9, -0.1),
+            ],
+        );
+        clip.set_property_keys(
+            Property::Temperature,
+            vec![PropertyKey::new(0.4, -1.0), PropertyKey::new(1.9, 1.0)],
+        );
+        let curve = |p: Property| clip.property_curve(p);
+        let tl = single(vec![clip.clone()]);
+        for (fps, (num, den)) in [(30.0, (30, 1)), (30000.0 / 1001.0, (30000, 1001)), (24.0, (24, 1))] {
+            let motion = planner(&tl, &assets, PlanMode::Motion, &opts(fps));
+            let still = planner(&tl, &assets, PlanMode::Still, &opts(fps));
+            for k in 22..100u64 {
+                let t = ffmpeg_frame_time(k, num, den);
+                let c = motion.at_frame(k).unwrap().layers[0].color;
+                // The numbers the expressions evaluate to, in their arithmetic ...
+                assert_eq!(
+                    c.brightness,
+                    keyframe_value(&curve(Property::Brightness), t, 0.7),
+                    "{fps} fps frame {k}"
+                );
+                assert_eq!(
+                    c.temperature,
+                    keyframe_value(&curve(Property::Temperature), t, 0.7),
+                    "{fps} fps frame {k}"
+                );
+                // ... the model's value of the same curve to a rounding, and the numbers that are not keyed are the clip's own.
+                let model = clip.color_at((t - 0.7).max(0.0));
+                assert!((c.brightness - model.brightness).abs() < 1e-9 && (c.temperature - model.temperature).abs() < 1e-9);
+                assert_eq!((c.contrast, c.saturation, c.gamma), (1.25, 0.9, 1.0));
+                // A still keeps drawing the model's sample.
+                let s = still.at_frame(k).unwrap();
+                assert_eq!(s.layers[0].color, clip.color_at(s.layers[0].clip_time), "{fps} fps still {k}");
+            }
+        }
+        // A clip with a static grade is drawn with it, bit for bit, in an export frame as ever.
+        let mut graded = make_clip(a.id, 0.0, 4.0, 0.7);
+        graded.color = Color {
+            brightness: 0.1,
+            contrast: 1.2,
+            saturation: 1.3,
+            gamma: 0.9,
+            temperature: -0.2,
+        };
+        let plan = planner(&single(vec![graded.clone()]), &assets, PlanMode::Motion, &opts(30.0))
+            .at_frame(40)
+            .unwrap();
+        assert_eq!(plan.layers[0].color, graded.color);
+        assert!(plan.layers[0].animated.is_none());
+    }
+
+    #[test]
+    fn a_keyed_colour_is_graded_on_every_frame_of_its_clip_for_the_refusals_about_grading() {
+        use crate::model::{Property, PropertyKey};
+        let caps = GpuCaps {
+            motion: true,
+            fades: true,
+            transitions: true,
+            dip_white: true,
+            keyed_opacity: true,
+            keyed_zoom: true,
+            keyed_color: true,
+            mask: true,
+            text: true,
+            reframe: true,
+            hdr: true,
+            effects: EffectKinds::ALL,
+        };
+        let keyed_clip = |a: &Asset| {
+            let mut clip = make_clip(a.id, 0.0, 4.0, 1.0);
+            // Neutral at the clip's first frame (brightness 0), away from it after.
+            clip.set_property_keys(
+                Property::Brightness,
+                vec![PropertyKey::new(0.0, 0.0), PropertyKey::new(1.0, 0.3)],
+            );
+            clip
+        };
+        let judged = |fmt: &str, mode: PlanMode, frame: u64| {
+            let mut a = asset();
+            a.streams[0].pix_fmt = Some(fmt.into());
+            let tl = single(vec![keyed_clip(&a)]);
+            let plan = planner(&tl, std::slice::from_ref(&a), mode, &opts(30.0))
+                .at_frame(frame)
+                .unwrap();
+            let neutral = plan.layers[0].color.is_identity();
+            let why = plan.reasons(&caps, plan.size(u32::MAX));
+            (neutral, has(&why, |u| matches!(u, Unsupported::GradedFullRange(..))))
+        };
+        // Frame 30 is the clip's first (neutral); frame 45 is half way along the ramp.
+        assert_eq!(
+            judged("yuvj420p", PlanMode::Motion, 30),
+            (true, true),
+            "refused while the numbers are neutral too"
+        );
+        assert_eq!(judged("yuvj420p", PlanMode::Motion, 45), (false, true));
+        assert_eq!(judged("yuv420p", PlanMode::Motion, 30), (true, false));
+        assert_eq!(judged("yuv420p", PlanMode::Motion, 45), (false, false));
+        // A still draws the sampled colour like a static one: nothing to grade where it is neutral.
+        assert_eq!(judged("yuvj420p", PlanMode::Still, 30), (true, false));
+        assert_eq!(judged("yuvj420p", PlanMode::Still, 45), (false, true));
+        // Where range is negotiated, the same of the limited-range layer above a full-range one.
+        let stacked = |frame: u64| {
+            let mut full = asset();
+            full.streams[0].pix_fmt = Some("yuvj420p".into());
+            let limited = asset();
+            let tl = timeline_of(vec![
+                video_track(vec![make_clip(full.id, 0.0, 4.0, 0.0)]),
+                video_track(vec![keyed_clip(&limited)]),
+            ]);
+            let request = PlanRequest {
+                mode: PlanMode::Motion,
+                ..PlanRequest::still(CompositeColorPolicy::BottomLayerTag)
+            };
+            let assets = [full, limited];
+            let plan = Planner::new(&tl, &assets, &opts(30.0), request)
+                .unwrap()
+                .at_frame(frame)
+                .unwrap();
+            has(&plan.reasons(&caps, plan.size(u32::MAX)), |u| {
+                matches!(u, Unsupported::GradedInFullRangeStack(_))
+            })
+        };
+        assert!(stacked(30) && stacked(45));
+    }
+
+    #[test]
+    fn a_keyed_colour_is_judged_by_the_steps_of_each_frames_tables_on_a_layer_the_scaler_resizes() {
+        use crate::eq::table_steps;
+        use crate::model::{Property, PropertyKey};
+        let caps = GpuCaps {
+            motion: true,
+            keyed_color: true,
+            ..GpuCaps::A0
+        };
+        let a = asset();
+        let assets = [a.clone()];
+        // Gamma climbs from 1 to 2 over a second: the tables' dark end steepens with it (a first entry that is
+        // not 0 is a step of its own), and the frames are judged one by one, drawn while the steepest step is two.
+        let ramp = |scale: f64| {
+            let mut clip = make_clip(a.id, 0.0, 4.0, 1.0);
+            clip.transform.scale = scale;
+            clip.set_property_keys(Property::Gamma, vec![PropertyKey::new(0.0, 1.0), PropertyKey::new(1.0, 2.0)]);
+            clip
+        };
+        let judged = |scale: f64| -> Vec<(u32, bool)> {
+            let tl = single(vec![ramp(scale)]);
+            let p = planner(&tl, &assets, PlanMode::Motion, &opts(30.0));
+            (30..60)
+                .map(|k| {
+                    let plan = p.at_frame(k).unwrap();
+                    let why = plan.reasons(&caps, plan.size(u32::MAX));
+                    let steepest = table_steps(&plan.layers[0].color).into_iter().max().unwrap();
+                    let refused = why.iter().find_map(|u| match u {
+                        Unsupported::GradeSteep(_, n) => Some(*n),
+                        _ => None,
+                    });
+                    assert_eq!(
+                        refused,
+                        (scale < 1.0 && steepest > 2).then_some(steepest),
+                        "frame {k}: {why:?}"
+                    );
+                    assert_eq!(why.len(), usize::from(refused.is_some()), "frame {k}: {why:?}");
+                    (steepest, refused.is_some())
+                })
+                .collect()
+        };
+        // A pip: the first frames (gamma 1) are drawn, the last (gamma 2) refused, and the steps never fall back as
+        // the gamma goes up.
+        let pip = judged(0.6);
+        assert!(!pip[0].1 && pip[29].1, "{pip:?}");
+        assert!(pip.windows(2).all(|w| w[0].0 <= w[1].0), "{pip:?}");
+        let drawn = pip.iter().filter(|(_, refused)| !refused).count();
+        assert!((1..29).contains(&drawn), "{drawn} of 30 frames drawn: {pip:?}");
+        // At the picture's size the tables are exact, whatever they step by.
+        let plain = judged(1.0);
+        assert!(plain.iter().all(|(_, refused)| !refused), "{plain:?}");
+        assert_eq!(plain, pip.iter().map(|(n, _)| (*n, false)).collect::<Vec<_>>());
     }
 
     #[test]

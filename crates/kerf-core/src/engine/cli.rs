@@ -7987,6 +7987,29 @@ fn eq_filter_keyed(clip: &Clip) -> String {
     f
 }
 
+/// The colour [`eq_filter_keyed`]`(clip)` evaluates to at the frame time `t` (`pts * av_q2d(tb)` of the
+/// `fps` grid the filter sits behind): each keyed number its curve through [`keyframe_value`], the same
+/// arithmetic as the quoted expression `av_expr` parses back, the unkeyed ones the clip's own. A renderer
+/// that draws the filter's tables with no FFmpeg (`eq` rebuilds them every frame) is given these numbers;
+/// `Clip::color_at` is the model's value of the same curve, to within a rounding, and is the still's.
+pub(crate) fn keyed_color_value(clip: &Clip, t: f64) -> Color {
+    let value = |prop: Property, fixed: f64| {
+        if clip.is_keyed(prop) {
+            keyframe_value(&clip.property_curve(prop), t, clip.timeline_start)
+        } else {
+            fixed
+        }
+    };
+    let c = &clip.color;
+    Color {
+        brightness: value(Property::Brightness, c.brightness),
+        contrast: value(Property::Contrast, c.contrast),
+        saturation: value(Property::Saturation, c.saturation),
+        gamma: value(Property::Gamma, c.gamma),
+        temperature: value(Property::Temperature, c.temperature),
+    }
+}
+
 /// The filter for a non-alpha video effect, or `None` for chroma key (which
 /// establishes alpha and is emitted separately, after the alpha plane exists).
 fn video_effect_filter(e: &VideoEffect) -> Option<String> {

@@ -15,7 +15,7 @@ use std::fmt;
 
 use crate::clip_timing::{FadeEdge, Rational};
 use crate::model::VideoEffect;
-use crate::render_plan::{YuvMatrix, MAX_SHRINK, MIN_TEXT_PX};
+use crate::render_plan::{YuvMatrix, MAX_AMPLIFIED_ERROR, MAX_SHRINK, MIN_TEXT_PX};
 
 /// A set of [`VideoEffect`] kinds: what a compositor draws one by one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -97,8 +97,9 @@ pub struct GpuCaps {
     pub keyed_zoom: bool,
     /// Keyframed colour: FFmpeg writes the clip's `eq` per frame (`eval=frame`, an expression
     /// of the frame's time for each keyed number), which a compositor that sets this draws
-    /// as the colour sampled at the frame's time. Export frames only: a still plan samples
-    /// the colour and draws it like a static one.
+    /// from the numbers an export frame's plan carries (`PlanLayer::color`: those expressions
+    /// evaluated at the frame's time) by building the `eq` tables again every frame. Export
+    /// frames only: a still plan samples the colour and draws it like a static one.
     pub keyed_color: bool,
     /// A mask (`geq` rewriting the alpha plane): drawn as a per-sample alpha. Still refused on a
     /// rotated layer and on one below full opacity (`MaskWith`).
@@ -215,6 +216,10 @@ pub enum Unsupported {
     TranslucentMatrix(LayerRef, String),
     /// Colour correction on a picture that may be full range (the detail says what is known).
     GradedFullRange(LayerRef, String),
+    /// Colour correction whose tables step by more than [`MAX_AMPLIFIED_ERROR`] levels between neighbouring
+    /// values (the second number is the steepest step), on a picture the compositor's scaler resizes ahead of
+    /// the `eq`: the scaler is a level from swscale's, and the tables multiply that by their step.
+    GradeSteep(LayerRef, u32),
     /// Curves, colour wheels or a 3D LUT (the detail names which): drawn by FFmpeg in RGB, with no
     /// compositor pass or parity case yet.
     Grade(LayerRef, &'static str),
@@ -318,6 +323,7 @@ impl Unsupported {
             Self::NotKnownOpaque(..) => "not_known_opaque",
             Self::TranslucentMatrix(..) => "translucent_matrix",
             Self::GradedFullRange(..) => "graded_full_range",
+            Self::GradeSteep(..) => "grade_steep",
             Self::Grade(..) => "grade",
             Self::Effects(..) => "effects",
             Self::Mask(_) => "mask",
@@ -384,6 +390,10 @@ impl fmt::Display for Unsupported {
                 write!(f, "{l}: opacity below 1 on a picture whose colour matrix is {detail}")
             }
             Self::GradedFullRange(l, detail) => write!(f, "{l}: colour correction on {detail}"),
+            Self::GradeSteep(l, step) => write!(
+                f,
+                "{l}: colour correction whose tables step {step} levels between neighbouring values, on a picture the compositor scales ahead of it (the scaler's one-level difference from FFmpeg's becomes {step}, past the {MAX_AMPLIFIED_ERROR} levels held)"
+            ),
             Self::Grade(l, what) => write!(f, "{l}: {what} (drawn by FFmpeg only)"),
             Self::Effects(l, what) => write!(f, "{l}: video effects ({what})"),
             Self::Mask(l) => write!(f, "{l}: mask"),
@@ -418,7 +428,7 @@ impl fmt::Display for Unsupported {
             Self::KeyedOpacity(l) => write!(f, "{l}: keyframed opacity (a geq alpha written per frame, which no compositor pass draws or has a parity case for yet)"),
             Self::KeyedColor(l) => write!(
                 f,
-                "{l}: keyframed colour correction (an eq written per frame, which no compositor pass draws or has a parity case for yet)"
+                "{l}: keyframed colour correction (an eq whose numbers are evaluated per frame, which this compositor does not rebuild its tables for)"
             ),
             Self::KeyedMask(l) => write!(
                 f,
@@ -518,6 +528,7 @@ mod tests {
             Unsupported::Hdr(layer(0, "")).kind(),
             Unsupported::Effects(layer(0, ""), "a blur").kind(),
             Unsupported::Grade(layer(0, ""), "curves").kind(),
+            Unsupported::GradeSteep(layer(0, ""), 12).kind(),
             Unsupported::MaskWith(layer(0, ""), "on a rotated layer").kind(),
             Unsupported::Matte(layer(0, ""), "of a translucent layer").kind(),
             Unsupported::FadeOnTranslucent(layer(0, "")).kind(),
