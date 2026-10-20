@@ -1636,6 +1636,56 @@ mod tests {
             .any(|u| matches!(u, Unsupported::Effects(_, w) if w.contains("below full opacity"))));
     }
 
+    /// A keyed opacity copies the picture's samples through its `geq`, so it neither adds a full-range reason
+    /// nor hides one: a flagged `yuv420p` under a chroma key is refused for the key (naming the flag) and for
+    /// the opacity, and under no effect it is drawn like a plain layer.
+    #[test]
+    fn a_keyed_opacity_on_a_flagged_full_range_picture_adds_nothing_to_its_reasons() {
+        use crate::model::{PropertyKey, VideoEffect};
+        let mut flagged = asset();
+        flagged.streams[0].color_range = Some("pc".into());
+        let caps = GpuCaps {
+            motion: true,
+            keyed_opacity: true,
+            effects: EffectKinds::ALL,
+            ..GpuCaps::A0
+        };
+        let why = |key: bool| {
+            let mut clip = make_clip(flagged.id, 0.0, 4.0, 0.0);
+            clip.set_property_keys(
+                Property::Opacity,
+                vec![PropertyKey::new(0.0, 1.0), PropertyKey::new(2.0, 0.3)],
+            );
+            if key {
+                clip.effects = vec![VideoEffect::ChromaKey {
+                    color: "green".into(),
+                    similarity: 0.15,
+                    blend: 0.1,
+                }];
+            }
+            let plan = Planner::new(
+                &single(vec![clip]),
+                std::slice::from_ref(&flagged),
+                &opts(30.0),
+                PlanRequest::motion(FIXED),
+            )
+            .unwrap()
+            .at_frame(30)
+            .unwrap();
+            assert!(plan.layers[0].keyed_alpha.is_some_and(|a| a < 255));
+            plan.reasons(&caps, plan.size(u32::MAX))
+        };
+        assert_eq!(why(false), vec![]);
+        let keyed = why(true);
+        let effect = |what: &str| {
+            keyed
+                .iter()
+                .any(|u| matches!(u, Unsupported::Effects(_, w) if w.contains(what)))
+        };
+        assert!(effect("flagged full range"), "{keyed:?}");
+        assert!(effect("under a keyed opacity"), "{keyed:?}");
+    }
+
     #[test]
     fn what_the_compositor_may_not_draw_is_a_function_of_the_plan_and_its_caps() {
         let a = asset();

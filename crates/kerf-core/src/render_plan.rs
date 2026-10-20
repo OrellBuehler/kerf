@@ -800,14 +800,22 @@ fn effect_on_picture_refusal(effect: &VideoEffect, stream: &PlanStream, policy: 
         VideoEffect::Vignette
             if stream.pix_fmt.as_deref() != Some("yuv420p") || stream.maybe_full_range_in(policy) =>
         {
-            Some("a vignette on a picture that is not 8-bit 4:2:0 yuv420p (FFmpeg vignettes it in its own format)")
+            Some(if stream.pix_fmt.as_deref() == Some("yuv420p") {
+                "a vignette on a yuv420p picture flagged full range (color_range=pc: FFmpeg vignettes its raw values)"
+            } else {
+                "a vignette on a picture that is not 8-bit 4:2:0 yuv420p (FFmpeg vignettes it in its own format)"
+            })
         }
         // `chromakey` reads the chroma of the `yuva420p` FFmpeg converts the picture to; the compositor's is the
         // decode's 4:2:0, the same picture only when that is what it was.
         VideoEffect::ChromaKey { .. }
             if stream.pix_fmt.as_deref() != Some("yuv420p") || stream.maybe_full_range_in(policy) =>
         {
-            Some("a chroma key on a picture that is not 8-bit 4:2:0 yuv420p (FFmpeg keys the chroma it converts it to)")
+            Some(if stream.pix_fmt.as_deref() == Some("yuv420p") {
+                "a chroma key on a yuv420p picture flagged full range (color_range=pc: FFmpeg keys its raw chroma)"
+            } else {
+                "a chroma key on a picture that is not 8-bit 4:2:0 yuv420p (FFmpeg keys the chroma it converts it to)"
+            })
         }
         _ => None,
     }
@@ -2751,8 +2759,10 @@ mod tests {
             // Drawn plain: the still converts at the end, as the compositor does.
             assert_eq!(why(flagged(), policy, &|_| {}, 0.5), vec![], "{policy:?}");
             let vignette = why(flagged(), policy, &|c| c.effects = vec![VideoEffect::Vignette], 0.5);
+            assert!(effect(&vignette, "flagged full range"), "{policy:?}: {vignette:?}");
             assert!(effect(&vignette, "vignette"), "{policy:?}: {vignette:?}");
             let keyed = why(flagged(), policy, &|c| c.effects = vec![key()], 0.5);
+            assert!(effect(&keyed, "flagged full range"), "{policy:?}: {keyed:?}");
             assert!(effect(&keyed, "chroma key"), "{policy:?}: {keyed:?}");
             for table in [
                 VideoEffect::Invert,
