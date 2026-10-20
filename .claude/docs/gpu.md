@@ -692,7 +692,7 @@ follow-up, with its zoom-last variant). The compositor refuses the combination i
   (`chroma_key_add`, round to nearest even), and the rest of the filter's `double` arithmetic is monotone in the sum, so it is 255 thresholds
   the CPU finds by bisection (`chroma_key_thresholds`) and the shader counts. **Outside the picture** a window entry is not reloaded: it keeps
   what the filter last wrote there in the same slice, the key colour where a slice starts, so the first sample of each slice depends on the
-  graph's **slice threads** (`min(h, threads)`), and the compositor uses those of the graph the frame stands in for, read at each draw
+  graph's **slice threads** (`min(h, threads)`), and the compositor uses those of the graph the frame stands in for, read at each draw (once, by the first keyed layer)
   (`Compositor::graph_threads_for`): one for a paused frame or scrub window whose every input is a proxy or an image (`single_frame_args`),
   else `kerf_core::cpu_graph_threads()` (the budget's when it caps the graph, else FFmpeg's default of cores + 1, at most 16), which is the
   playback stream's and an export's; `Compositor::with_graph_threads` pins it. An FFmpeg run with another thread count differs at those

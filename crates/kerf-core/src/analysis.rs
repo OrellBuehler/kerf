@@ -1372,46 +1372,63 @@ mod tests {
 
     #[test]
     fn a_step_says_it_is_waiting_for_a_proxy_and_does_not_start_until_the_proxy_is_done() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::time::{Duration, Instant};
+
+        // Every wait here is on a condition, bounded: a stuck run fails with what it was waiting for.
+        fn until(what: &str, mut done: impl FnMut() -> bool) {
+            let start = Instant::now();
+            while !done() {
+                assert!(start.elapsed() < Duration::from_secs(10), "timed out waiting for {what}");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+
         let _gate = crate::engine::cpu::test_lock();
         // A preview proxy is queued: analysis that starts now goes behind it, and says so.
         let reservation = crate::engine::cpu::reserve();
         let stages = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, Option<String>)>::new()));
-        let seen = stages.clone();
-        let asset = asset();
-        let worker = std::thread::spawn(move || {
-            let fake = Fake::new();
-            let (si, sc, lo, rh, tr) = (
-                Probe(&fake, AnalysisKind::Silence),
-                Probe(&fake, AnalysisKind::Scenes),
-                Probe(&fake, AnalysisKind::Loudness),
-                Probe(&fake, AnalysisKind::Rhythm),
-                Probe(&fake, AnalysisKind::Transcript),
-            );
-            let providers = AnalysisProviders {
-                silence: &si,
-                scene: &sc,
-                transcriber: &tr,
-                loudness: &lo,
-                rhythm: &rh,
-            };
-            analyze_steps(
-                &asset,
-                &[AnalysisKind::Silence],
-                &providers,
-                &mut |p| seen.lock().unwrap().push((p.stage, p.detail)),
-                &mut |_| {},
-                NEVER_CANCEL,
-            )
+        let fake = std::sync::Arc::new(Fake::new());
+        // How often the queued step looked at the gate (it polls its cancel on every look).
+        let looks = std::sync::Arc::new(AtomicUsize::new(0));
+        let worker = {
+            let (seen, fake, looks) = (stages.clone(), fake.clone(), looks.clone());
+            let asset = asset();
+            std::thread::spawn(move || {
+                let (si, sc, lo, rh, tr) = (
+                    Probe(&fake, AnalysisKind::Silence),
+                    Probe(&fake, AnalysisKind::Scenes),
+                    Probe(&fake, AnalysisKind::Loudness),
+                    Probe(&fake, AnalysisKind::Rhythm),
+                    Probe(&fake, AnalysisKind::Transcript),
+                );
+                let providers = AnalysisProviders {
+                    silence: &si,
+                    scene: &sc,
+                    transcriber: &tr,
+                    loudness: &lo,
+                    rhythm: &rh,
+                };
+                analyze_steps(
+                    &asset,
+                    &[AnalysisKind::Silence],
+                    &providers,
+                    &mut |p| seen.lock().unwrap().push((p.stage, p.detail)),
+                    &mut |_| {},
+                    &|| {
+                        looks.fetch_add(1, Ordering::SeqCst);
+                        false
+                    },
+                )
+            })
+        };
+        until("the step to say it is waiting", || !stages.lock().unwrap().is_empty());
+        // It has been round the gate again since saying so, and the proxy still has the slot: the
+        // step is queued, not started.
+        let looked = looks.load(Ordering::SeqCst);
+        until("the queued step to look at the gate again", || {
+            looks.load(Ordering::SeqCst) > looked
         });
-        let start = std::time::Instant::now();
-        while stages.lock().unwrap().is_empty() {
-            assert!(
-                start.elapsed() < std::time::Duration::from_secs(10),
-                "no word from the waiting step"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
         {
             let said = stages.lock().unwrap();
             assert_eq!(
@@ -1422,11 +1439,17 @@ mod tests {
             assert_eq!(said[0].0, "waiting");
             assert!(said[0].1.as_deref().unwrap().contains("proxy"), "{said:?}");
         }
+        assert!(fake.ran.lock().unwrap().is_empty(), "the step ran before the proxy was done");
         // The proxy takes the slot, finishes, and the analysis goes.
         drop(reservation.lease());
+        until("the analysis to finish", || worker.is_finished());
         let run = worker.join().unwrap();
         assert_eq!(run.patch.ran, [AnalysisKind::Silence]);
-        let said: Vec<String> = stages.lock().unwrap().iter().map(|(s, _)| s.clone()).collect();
+        assert_eq!(*fake.ran.lock().unwrap(), ["silence"]);
+        // Any other test's job that takes the slot first makes it say it waits for that job too
+        // (the gate is shared by the whole test process), so only the order of the stages is pinned.
+        let mut said: Vec<String> = stages.lock().unwrap().iter().map(|(s, _)| s.clone()).collect();
+        said.dedup();
         assert_eq!(said, ["waiting", "silence", "done"]);
     }
 

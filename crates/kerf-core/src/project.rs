@@ -3932,7 +3932,7 @@ impl Project {
     /// Insert `placements` — each a `(track_id, clip)` pair — so the earliest
     /// lands at `at`, preserving the relative offsets between them. Backs both
     /// paste (clips carried on a clipboard, whose sources may already be gone)
-    /// and [`Self::duplicate_clips`].
+    /// and (through `insert_clips_into`) [`Self::duplicate_clips`].
     ///
     /// Everything about a clip comes along — trims, speed, transform, color,
     /// transition, effects, keyframes and reframe — which is exactly what
@@ -3959,11 +3959,13 @@ impl Project {
         // What each clip's footage has, to keep it off a track it cannot play on: a picture on a video track
         // (a title is one), sound on an audio track. A clip whose asset is unknown here is not judged.
         let mut streams: HashMap<Uuid, (bool, bool)> = HashMap::new();
-        for (_, clip) in placements {
-            if !clip.is_generated() && !streams.contains_key(&clip.asset_id) {
-                if let Some(asset) = self.get_asset(clip.asset_id)? {
-                    let video = asset.streams.iter().any(|s| s.kind == StreamKind::Video);
-                    streams.insert(clip.asset_id, (video, asset.has_audio()));
+        if check_kind {
+            for (_, clip) in placements {
+                if !clip.is_generated() && !streams.contains_key(&clip.asset_id) {
+                    if let Some(asset) = self.get_asset(clip.asset_id)? {
+                        let video = asset.streams.iter().any(|s| s.kind == StreamKind::Video);
+                        streams.insert(clip.asset_id, (video, asset.has_audio()));
+                    }
                 }
             }
         }
@@ -4054,7 +4056,9 @@ impl Project {
 
     /// Copy the clips named by `clip_ids` and insert the copies so the earliest
     /// lands at `at`, each staying on its source track. The by-id convenience
-    /// over [`Self::insert_clips`], for duplicate and for agent use.
+    /// over [`Self::insert_clips`], for duplicate and for agent use — except
+    /// that it does not judge a clip's track kind (the clip is already on that
+    /// track) and so looks up no asset.
     pub fn duplicate_clips(&self, clip_ids: &[Uuid], at: f64) -> Result<Vec<Clip>> {
         finite("the paste position", at)?;
         let timeline = self.working_timeline()?;

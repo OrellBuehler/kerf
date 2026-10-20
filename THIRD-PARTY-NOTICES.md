@@ -35,12 +35,12 @@ Its brand marks are not used.
 ## Text animators modelled on EffectCraft
 
 The text animators (`crates/kerf-core/src/svg/text_animation.rs`, `glyph_smil.rs`, and their TypeScript mirror
-`frontend/src/lib/text-animation.ts`) follow the design of [EffectCraft](https://github.com/storytold/effectcraft)'s text
-animators (`crates/text/src/selectors.rs`, `crates/render/src/text.rs`, `crates/engine/src/presets/text_animators.json`), which is
-licensed MIT OR Apache-2.0: a range selector (start, end, offset and a shape) and a wiggly selector that give each character,
-word or line an amount, and animator properties applied at that amount, with a set of eight presets (rise, fade in, typewriter, pop, blur in, spin in, drop
-in, wiggle). No EffectCraft code or preset data is copied: the engine here compiles the model into per-glyph SMIL for the SVG
-rasteriser, samples the selectors itself, and the presets are Kerf's own values.
+`frontend/src/lib/text-animation.ts`) are modelled on the text animators of
+[EffectCraft](https://github.com/storytold/effectcraft), which is licensed MIT OR Apache-2.0: the range selector (start,
+end, offset and a shape) and the wiggly selector that give each character, word or line an amount, with animator
+properties applied at that amount, and the idea of shipping a set of presets. The eight presets (rise, fade in,
+typewriter, pop, blur in, spin in, drop in, wiggle) and all their values are Kerf's own. No EffectCraft code or data is
+copied: the engine here compiles the model into per-glyph SMIL for the SVG rasteriser and samples the selectors itself.
 
 ## Adapted from EffectCraft
 
