@@ -1731,6 +1731,95 @@ fn colour_adjustments() {
     );
 }
 
+/// The scaler is a level from swscale's and `eq` maps two values a level apart to values its tables' steepest step apart, so
+/// on a layer the compositor scales a grade whose tables step past two (`eq::table_steps`, `MAX_AMPLIFIED_ERROR`) is FFmpeg's:
+/// `GradeSteep`, in a still as in an export frame (`motion_parity.rs` holds the frames drawn inside the bound to the level, and
+/// the keyed ramps frame by frame). Contrast and saturation past 2, a gamma past about 1.2, a black point parked above 0 under a
+/// gamma above 1 (a negative brightness, or a contrast), at the far ends of every range. The same grades at the picture's own size are
+/// exact and drawn, and so is a gentle one on the scaled layer.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_grade_whose_tables_amplify_the_scalers_level_past_two_is_refused_on_a_layer_it_resizes() {
+    let m = media();
+    let grade = |brightness: f64, contrast: f64, saturation: f64, gamma: f64, temperature: f64| Color {
+        brightness,
+        contrast,
+        saturation,
+        gamma,
+        temperature,
+    };
+    let reason = || Refusal::Plan("colour correction whose tables step");
+    let shifted = Transform {
+        scale: 0.6,
+        pos_x: 0.1,
+        pos_y: -0.1,
+        ..Transform::default()
+    };
+    let pip = |color: Color| {
+        let mut c = clip(&m.testsrc, 0.0, 2.0, 0.0);
+        c.transform = shifted;
+        c.color = color;
+        timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![c]], None)
+    };
+    let under = [m.bars.clone(), m.testsrc.clone()];
+    let steep = [
+        ("contrast 3", grade(0.0, 3.0, 1.0, 1.0, 0.0)),
+        ("saturation 3", grade(0.0, 1.0, 3.0, 1.0, 0.0)),
+        ("gamma 1.4", grade(0.0, 1.0, 1.0, 1.4, 0.0)),
+        ("gamma 2", grade(0.0, 1.0, 1.0, 2.0, 0.0)),
+        ("brightness -0.3 and gamma 1.5", grade(-0.3, 1.0, 1.0, 1.5, 0.0)),
+        ("contrast 1.8 and gamma 2", grade(0.0, 1.8, 1.0, 2.0, 0.0)),
+        ("the far end of every range", grade(0.3, 1.8, 2.0, 2.0, 1.0)),
+    ];
+    for (name, color) in steep {
+        check_refused(&format!("refused/steep-grade-pip-{name}"), &pip(color), &under, 0.5, reason());
+    }
+    // A letterboxed layer (the portrait picture shrunk into a landscape frame, the bars in the picture the `eq` sees) and a
+    // layer scaled by the fit alone.
+    let boxed = |color: Color| {
+        let mut c = clip(&m.portrait, 0.0, 2.0, 0.0);
+        c.color = color;
+        timeline(vec![vec![c]], Some(Delivery::new(640, 360, Fit::Contain)))
+    };
+    for (name, color) in steep {
+        check_refused(
+            &format!("refused/steep-grade-letterbox-{name}"),
+            &boxed(color),
+            std::slice::from_ref(&m.portrait),
+            0.5,
+            reason(),
+        );
+    }
+    let mut cover = clip(&m.testsrc, 0.0, 2.0, 0.0);
+    cover.color = grade(0.0, 1.8, 1.0, 2.0, 0.0);
+    check_refused(
+        "refused/steep-grade-cover-fit",
+        &timeline(vec![vec![cover]], Some(Delivery::new(360, 640, Fit::Cover))),
+        std::slice::from_ref(&m.testsrc),
+        0.5,
+        reason(),
+    );
+    // A layer the compositor does not resize: the tables are exact at any step.
+    let mut alone = clip(&m.testsrc, 0.0, 2.0, 0.0);
+    alone.color = grade(0.3, 1.8, 2.0, 2.0, 1.0);
+    check(
+        "colour/the far end of every range at the picture's size",
+        &timeline(vec![vec![alone]], None),
+        std::slice::from_ref(&m.testsrc),
+        &[0.5],
+        STRICT,
+    );
+    // ... and a grade that steps by two at most is drawn on the scaled layer.
+    for (name, color) in [
+        ("contrast 2", grade(0.0, 2.0, 1.0, 1.0, 0.0)),
+        ("saturation 2", grade(0.0, 1.0, 2.0, 1.0, 0.0)),
+        ("gamma 1.2", grade(0.0, 1.0, 1.0, 1.2, 0.0)),
+        ("brightness 0.3 and gamma 2", grade(0.3, 1.0, 1.0, 2.0, 0.0)),
+    ] {
+        check(&format!("colour/pip, {name}"), &pip(color), &under, &[0.5], STRICT);
+    }
+}
+
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn still_images() {
@@ -2611,8 +2700,9 @@ fn a_full_range_picture_fades_as_the_ffmpeg_in_use_converts_its_range() {
         true,
     );
     // A 10-bit file tagged full range probes as `yuv420p10le` like the limited one and 9.0.2 fades its raw values
-    // (flat max 16 / 15 / 11 against a bound of 8): the name cannot tell the two apart, so under FFmpeg 9 every
-    // deeper-than-8-bit picture is refused inside a fade, the limited one included. FFmpeg 6 draws both.
+    // (flat max 16 / 15 / 11 against a bound of 8): the name cannot tell the two apart, and a limited file may say
+    // nothing of its range, so under FFmpeg 9 every deeper-than-8-bit picture is refused inside a fade, the limited
+    // one included (the flag now settles the full-range one where it is recorded). FFmpeg 6 draws both.
     for (name, a) in [("pc-tagged 10-bit", &m.tenbit_pc), ("limited 10-bit", &m.tenbit)] {
         let mut fading = clip(a, 0.0, 1.5, 0.0);
         fading.fade_in = 0.5;
@@ -3343,8 +3433,9 @@ fn grading_a_full_range_picture_is_refused_and_ungraded_it_is_drawn() {
     ] {
         let mut pip = clip(top, 0.0, 2.0, 0.0);
         pip.transform = transform;
+        // (A gamma of 1.2: the limited-range pip is scaled, and a steeper one is the plan's own refusal, below.)
         pip.color = Color {
-            gamma: 1.4,
+            gamma: 1.2,
             ..Color::default()
         };
         let tl = timeline(vec![vec![clip(bottom, 0.0, 2.0, 0.0)], vec![pip]], None);
@@ -6009,3 +6100,235 @@ fn the_previews_proxies_stack_as_their_originals_do() {
 //   noise-hd   max 5  worst mean 0.792   (1280x720 down to 32x18, 40:1)
 //   testsrc2   max 3  worst mean 0.521   (down to 32x18, 20:1)
 // ... FFmpeg 9.0.2: the same maxima, worst means 0.493 / 0.572 / 0.191 / 0.227 / 0.833 / 0.521.
+
+// ---- a yuv420p flagged full range -----------------------------------------------------------
+
+/// The pictures of `a_yuv420p_flagged_full_range_is_refused_where_ffmpeg_reads_its_raw_samples`: the same
+/// pattern in lossless FFV1 (which keeps the format `yuv420p` whatever the flag; H.264 would call a full-range
+/// stream `yuvj420p`), flagged full range, flagged limited and not flagged.
+struct RangeMedia {
+    /// The test pattern, and a smooth gradient (so a key's alpha moves everywhere), flagged `-color_range pc`.
+    pc: Asset,
+    pc_gradient: Asset,
+    /// The pattern and the gradient flagged `tv` and not flagged at all.
+    tv: Asset,
+    unflagged: Asset,
+    tv_gradient: Asset,
+    unflagged_gradient: Asset,
+}
+
+fn range_media() -> &'static RangeMedia {
+    static R: OnceLock<RangeMedia> = OnceLock::new();
+    R.get_or_init(|| {
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("parity-media-range");
+        std::fs::create_dir_all(&dir).unwrap();
+        let testsrc = "testsrc2=size=640x360:rate=30:duration=2";
+        let gradients = "gradients=size=640x360:rate=30:duration=2:c0=0xd03020:c1=0x2040e0:c2=0x30c060:nb_colors=3:seed=11:x0=0:y0=0:x1=640:y1=360:speed=0.00001,format=yuv420p";
+        let make = |name: &str, lavfi: &str, flag: Option<&str>| -> Asset {
+            let p = dir.join(name);
+            let mut args = vec!["-f", "lavfi", "-i", lavfi, "-c:v", "ffv1", "-pix_fmt", "yuv420p"];
+            if let Some(flag) = flag {
+                args.extend(["-color_range", flag]);
+            }
+            args.push(p.to_str().unwrap());
+            ffmpeg(&args);
+            let a = probed(&p);
+            assert_eq!(a.streams[0].pix_fmt.as_deref(), Some("yuv420p"), "{name}: the format says nothing of the range");
+            // (An unflagged FFV1 file reads `tv` from FFmpeg 9's muxer and nothing from 6.1.1's: neither is full range.)
+            match flag {
+                Some(flag) => assert_eq!(a.streams[0].color_range.as_deref(), Some(flag), "{name}: the probe records the flag"),
+                None => assert_ne!(a.streams[0].color_range.as_deref(), Some("pc"), "{name}"),
+            }
+            a
+        };
+        RangeMedia {
+            pc: make("pc.mkv", testsrc, Some("pc")),
+            pc_gradient: make("pc-gradient.mkv", gradients, Some("pc")),
+            tv: make("tv.mkv", testsrc, Some("tv")),
+            unflagged: make("unflagged.mkv", testsrc, None),
+            tv_gradient: make("tv-gradient.mkv", gradients, Some("tv")),
+            unflagged_gradient: make("unflagged-gradient.mkv", gradients, None),
+        }
+    })
+}
+
+/// How far the compositor's frame of `tl` at `t` is from FFmpeg's still, **whatever the plan says**: the
+/// frame the plan refuses, drawn anyway, to show the refusal is needed and not just cautious.
+fn drawn_anyway(tl: &Timeline, assets: &[Asset], t: f64) -> Metrics {
+    let opts = ExportOptions::default();
+    let plan = RenderPlan::at(tl, assets, &opts, t, policy()).expect("plan");
+    let size = plan.size(u32::MAX);
+    let scratch = Path::new(env!("CARGO_TARGET_TMPDIR")).join("parity-ref");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let png = scratch.join(format!("anyway-{t}.png"));
+    export_still(tl, assets, &opts, t, &png, ImageFormat::Png, 0).expect("FFmpeg still");
+    let reference = ffmpeg(&["-i", png.to_str().unwrap(), "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]);
+    let _ = std::fs::remove_file(&png);
+    let (frame, _) = compositor().render_plan(&plan, size).expect("GPU render");
+    let (w, h) = (size.0 as usize, size.1 as usize);
+    compare(&reference, &rgba_to_rgb(&frame.data), w, h, STRICT.edge_step).0
+}
+
+/// `yuv420p` is the format every overlay takes, so a `yuv420p` picture flagged full range (a VP9, HEVC or AV1
+/// file; ffprobe names it `yuvj420p` only where the decoder says so) reaches FFmpeg's filters **raw**, on 6.1.1 and
+/// on 9.0.2, where the compositor's decode has converted it to limited range. Anything that reads the values
+/// disagrees: a vignette (10 to 13 levels off), a fade (9 to 14), `eq`, and on 9.0.2 the chroma key (19 on the gradient, 73 on
+/// the test pattern). A plain
+/// layer is the same picture, so it is drawn (on 9.0.2 an export is refused as a cut, `FullRangeCut`, as a
+/// `yuvj` clip's is). The same file flagged `tv`, or not at all, is drawn as before, and so is an asset stored
+/// before the flag was recorded (`color_range` `None`), which is what the plan knows of it.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_yuv420p_flagged_full_range_is_refused_where_ffmpeg_reads_its_raw_samples() {
+    use kerf_core::VideoEffect as E;
+    let m = media();
+    let r = range_media();
+    let fixed = policy() == CompositeColorPolicy::FixedBt601;
+    eprintln!("composite colour policy of this FFmpeg: {:?}", policy());
+    let one = |a: &Asset, edit: &dyn Fn(&mut Clip)| {
+        let mut c = clip(a, 0.0, 2.0, 0.0);
+        edit(&mut c);
+        timeline(vec![vec![c]], None)
+    };
+    let over_bars = |a: &Asset, edit: &dyn Fn(&mut Clip)| {
+        let mut c = clip(a, 0.0, 2.0, 0.0);
+        edit(&mut c);
+        (
+            timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![c]], None),
+            vec![m.bars.clone(), a.clone()],
+        )
+    };
+
+    // What FFmpeg's graph reads raw: refused by the plan (and FFmpeg renders the frame), one reason each.
+    for (name, effects, why) in [
+        ("vignette", vec![E::Vignette], "vignette"),
+        ("invert", vec![E::Invert], "full-range"),
+        ("blur", vec![E::Blur { sigma: 3.0 }], "full-range"),
+        ("sharpen", vec![E::Sharpen { amount: 1.0 }], "full-range"),
+    ] {
+        check_refused(
+            &format!("range/pc-{name}"),
+            &one(&r.pc, &|c| c.effects = effects.clone()),
+            std::slice::from_ref(&r.pc),
+            0.5,
+            Refusal::Plan(why),
+        );
+    }
+    let (tl, assets) = over_bars(&r.pc_gradient, &|c| c.effects = vec![a_key("green", 0.3, 0.3)]);
+    check_refused("range/pc-chroma-key", &tl, &assets, 0.5, Refusal::Plan("chroma key"));
+    check_refused(
+        "range/pc-graded",
+        &one(&r.pc, &|c| c.color.gamma = 1.4),
+        std::slice::from_ref(&r.pc),
+        0.5,
+        Refusal::Plan("colour correction"),
+    );
+    // A fade running on it, under either FFmpeg; the same fade over is the plain picture.
+    let fading = |a: &Asset| one(a, &|c| c.fade_in = 1.0);
+    check_refused(
+        "range/pc-fade-running",
+        &fading(&r.pc),
+        std::slice::from_ref(&r.pc),
+        0.5,
+        Refusal::Plan("full-range picture inside a fade"),
+    );
+    check(
+        "range/pc-fade-over",
+        &fading(&r.pc),
+        std::slice::from_ref(&r.pc),
+        &[1.5],
+        STRICT,
+    );
+
+    // The same picture in the same graphs, flagged limited or not flagged: drawn, exactly as before.
+    for (label, a) in [("tv", &r.tv), ("unflagged", &r.unflagged)] {
+        for (name, effects) in [
+            ("vignette", vec![E::Vignette]),
+            ("invert", vec![E::Invert]),
+            ("blur", vec![E::Blur { sigma: 3.0 }]),
+        ] {
+            check(
+                &format!("range/{label}-{name}"),
+                &one(a, &|c| c.effects = effects.clone()),
+                std::slice::from_ref(a),
+                &[0.5],
+                STRICT,
+            );
+        }
+        check(
+            &format!("range/{label}-graded"),
+            &one(a, &|c| c.color.gamma = 1.4),
+            std::slice::from_ref(a),
+            &[0.5],
+            STRICT,
+        );
+        check(
+            &format!("range/{label}-fade-running"),
+            &fading(a),
+            std::slice::from_ref(a),
+            &[0.5],
+            STRICT,
+        );
+    }
+    for (label, a) in [("tv", &r.tv_gradient), ("unflagged", &r.unflagged_gradient)] {
+        let (tl, assets) = over_bars(a, &|c| c.effects = vec![a_key("green", 0.3, 0.3)]);
+        check(&format!("range/{label}-chroma-key"), &tl, &assets, &[0.5], STRICT);
+    }
+
+    // A plain picture agrees with FFmpeg's: alone, under bars, shrunk over them, enlarged, and after a
+    // limited one on the same track. (Under FFmpeg 9 an *export* of the cut is refused as a whole.)
+    let pc = std::slice::from_ref(&r.pc);
+    check("range/pc-plain", &one(&r.pc, &|_| {}), pc, &[0.5], STRICT);
+    let (tl, assets) = over_bars(&r.pc, &|c| c.transform.scale = 0.5);
+    check("range/pc-scaled-over-bars", &tl, &assets, &[0.5], STRICT);
+    let enlarged = timeline(
+        vec![vec![clip(&r.pc, 0.0, 2.0, 0.0)]],
+        Some(Delivery::new(960, 540, Fit::Contain)),
+    );
+    check("range/pc-enlarged", &enlarged, pc, &[0.5], STRICT);
+    let after = timeline(vec![vec![clip(&m.testsrc, 0.0, 1.0, 0.0), clip(&r.pc, 0.0, 1.0, 1.0)]], None);
+    check(
+        "range/pc-after-limited",
+        &after,
+        &[m.testsrc.clone(), r.pc.clone()],
+        &[0.5, 1.5],
+        STRICT,
+    );
+
+    // The refusal is needed: plan the very same frames as a file stored before the flag was recorded would be
+    // (`None`), draw them anyway, and the compositor is outside the strict bounds.
+    let unrecorded = |a: &Asset| {
+        let mut a = a.clone();
+        a.streams[0].color_range = None;
+        a
+    };
+    let off = |what: &str, m: Metrics| {
+        eprintln!("{what}: drawn anyway: flat PSNR {:.1} dB, max {}", m.psnr_flat, m.max_flat);
+        assert!(
+            m.psnr_flat < STRICT.psnr_flat || m.max_flat > STRICT.max_flat,
+            "{what}: the compositor agrees with FFmpeg ({:.1} dB, max {}): the refusal is no longer needed",
+            m.psnr_flat,
+            m.max_flat
+        );
+    };
+    let old = unrecorded(&r.pc);
+    off(
+        "vignette",
+        drawn_anyway(
+            &one(&old, &|c| c.effects = vec![E::Vignette]),
+            std::slice::from_ref(&old),
+            0.5,
+        ),
+    );
+    off("fade", drawn_anyway(&fading(&old), std::slice::from_ref(&old), 0.5));
+    if !fixed {
+        // (FFmpeg 6 keys this gradient as the compositor does; FFmpeg 9 is 19 levels off on it.)
+        let old = unrecorded(&r.pc_gradient);
+        let (tl, assets) = over_bars(&old, &|c| c.effects = vec![a_key("green", 0.3, 0.3)]);
+        off("chroma key", drawn_anyway(&tl, &assets, 0.5));
+        off(
+            "graded",
+            drawn_anyway(&one(&unrecorded(&r.pc), &|c| c.color.gamma = 1.4), &[unrecorded(&r.pc)], 0.5),
+        );
+    }
+}

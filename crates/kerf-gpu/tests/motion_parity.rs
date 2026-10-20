@@ -164,6 +164,11 @@ struct Media {
     /// cases with a rotated layer.
     smooth: Asset,
     black: Asset,
+    /// 8-pixel blocks of limited-range black (16) and white (235): hard edges, whose scaled overshoot runs
+    /// down to the bottom of the range and clips there, where a table's first entries are steepest.
+    edges: Asset,
+    /// Luma 0 to 255 left to right, chroma ramps against it: every entry of every table, smoothly.
+    ramp: Asset,
     /// `testsrc` whose picture starts 0.3 s after its sound (`StreamInfo::lead`), muxed into MP4
     /// with an edit list as a phone writes it.
     late: Asset,
@@ -217,6 +222,14 @@ fn media() -> &'static Media {
             &format!("gradients=size=640x360:rate=30:duration=4:c0=0xd03020:c1=0x2040e0:c2=0x30c060:nb_colors=3:seed=11:x0=0:y0=0:x1=640:y1=360:speed=0.00001,format=yuv420p,{untagged}"),
         );
         let black = video("black.mp4", "color=c=black:s=640x360:r=30:d=4");
+        let edges = video(
+            "edges.mp4",
+            "nullsrc=size=640x360:rate=30:duration=4,format=yuv420p,geq=lum='if(gt(mod(floor(X/8)+floor(Y/8),2),0.5),16,235)':cb=128:cr=128",
+        );
+        let ramp = video(
+            "ramp.mp4",
+            "nullsrc=size=640x360:rate=30:duration=4,format=yuv420p,geq=lum='X*255/640':cb='X*255/640':cr='255-X*255/640'",
+        );
         let late = dir.join("late.mp4");
         ffmpeg(&[
             "-itsoffset",
@@ -258,6 +271,8 @@ fn media() -> &'static Media {
             noise: probed(&noise),
             smooth: probed(&smooth),
             black: probed(&black),
+            edges: probed(&edges),
+            ramp: probed(&ramp),
             late: probed(&late),
         }
     })
@@ -410,8 +425,11 @@ const HD_TRANSLUCENT: Limits = Limits { y: 2, uv: 2 };
 /// two levels show whether the layer fades, dissolves or is keyed.
 const ROTATED: Limits = Limits { y: 2, uv: 2 };
 
-/// Two levels: a layer the compositor scales *and* grades. The scaler's one level is scaled by the
-/// `eq` contrast (1.1) and rounded again.
+/// Two levels: a layer the compositor scales *and* grades, with tables that step by at most two between neighbouring entries
+/// (`eq::table_steps`, `MAX_AMPLIFIED_ERROR`). The scaler's one level (`SCALED`) is mapped through the tables, so a pair of
+/// values a level apart come out as far apart as the tables' steepest step; the plan draws the frames inside that bound and
+/// refuses the others (`GradeSteep`: contrast past 2, saturation past 2, gamma past about 1.2, a black point parked above 0 under a
+/// gamma above 1; measured Y 3 to 19 and UV 3 on them), exact or not. A bound the grade is judged by, not a number measured and blessed.
 const GRADED_SCALED: Limits = Limits { y: 2, uv: 2 };
 
 /// A dip to white: two levels in every plane on the pictures it is drawn for — 8-bit limited-range
@@ -1745,6 +1763,743 @@ fn a_keyed_opacity_is_the_geq_alpha_of_each_frame() {
     );
 }
 
+// ---- a keyed colour: `eq eval=frame` builds its tables again for every frame ------------------------------------
+//
+// A keyed colour number is a quoted expression of the frame's time in the clip's `eq`, which FFmpeg evaluates
+// per frame and clamps (`av_clipf`: through a `float`) before it builds the luma, U and V tables. The plan carries
+// the numbers the expressions evaluate to (`PlanLayer::color`, `keyframe_value` at the `fps` grid's time) and the
+// compositor builds its tables from them as it does a static grade's, so the planes are the export's to the level.
+
+/// The span each colour number moves over in the cases below.
+fn colour_span(prop: kerf_core::Property) -> (f64, f64) {
+    use kerf_core::Property;
+    match prop {
+        Property::Brightness => (-0.3, 0.3),
+        Property::Contrast => (0.5, 1.8),
+        Property::Saturation => (0.0, 2.0),
+        Property::Gamma => (0.5, 2.0),
+        Property::Temperature => (-1.0, 1.0),
+        _ => unreachable!("not a colour number"),
+    }
+}
+
+/// A second of `asset` with each of `props` keyed along `shape(low, high)`.
+fn colour_keyed(asset: &Asset, props: &[kerf_core::Property], shape: &dyn Fn(f64, f64) -> Vec<kerf_core::PropertyKey>) -> Clip {
+    let mut c = clip(asset, 0.5, 1.5, 0.0);
+    for &prop in props {
+        let (lo, hi) = colour_span(prop);
+        c.set_property_keys(prop, shape(lo, hi));
+    }
+    c
+}
+
+fn linear_keys(lo: f64, hi: f64) -> Vec<kerf_core::PropertyKey> {
+    vec![kerf_core::PropertyKey::new(0.0, lo), kerf_core::PropertyKey::new(1.0, hi)]
+}
+
+/// That the colour the plan carries for the top layer of a cut moves (at least `moves` different ones over the
+/// frames): a case whose colour stood still would pass anything.
+fn colour_moves(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, secs: f64, moves: usize) {
+    let planner = Planner::new(tl, assets, &at_fps(fps), PlanRequest::motion(policy())).expect("planner");
+    let mut seen: Vec<Color> = Vec::new();
+    for k in upto(secs, fps) {
+        if let Some(layer) = planner.at_frame(k).expect("plan").layers.last() {
+            if !seen.contains(&layer.color) {
+                seen.push(layer.color);
+            }
+        }
+    }
+    assert!(
+        seen.len() >= moves,
+        "{case}: only {} different colours over the cut",
+        seen.len()
+    );
+}
+
+/// [`run`] for a cut whose top layer has a keyed colour that moves.
+fn run_colour(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, secs: f64, moves: usize, limits: Limits) {
+    colour_moves(case, tl, assets, fps, secs, moves);
+    run(case, tl, assets, fps, secs, limits);
+}
+
+fn grade_steep_refused() -> Refusing {
+    refusing("GradeSteep", |u| matches!(u, Unsupported::GradeSteep(..)))
+}
+
+/// How many frames of the first `secs` of a cut the plan refuses for `GradeSteep`, and how many it draws.
+fn grade_steep_split(tl: &Timeline, assets: &[Asset], fps: f64, secs: f64) -> (usize, usize) {
+    let planner = Planner::new(tl, assets, &at_fps(fps), PlanRequest::motion(policy())).expect("planner");
+    let (mut refused, mut drawn) = (0, 0);
+    for k in upto(secs, fps) {
+        let plan = planner.at_frame(k).expect("plan");
+        let why = plan.reasons(&compositor().caps(), plan.size(u32::MAX));
+        if why.iter().any(|u| matches!(u, Unsupported::GradeSteep(..))) {
+            refused += 1;
+        } else if why.is_empty() {
+            drawn += 1;
+        }
+    }
+    (refused, drawn)
+}
+
+/// [`run_refusing`] for a grade whose tables step past two on some frames of a layer the scaler resizes: those frames are
+/// FFmpeg's and the others are held to the export at `limits`. `refused` is how many frames that is (`None`: some, not all).
+fn run_grade_steep(case: &str, tl: &Timeline, assets: &[Asset], secs: f64, limits: Limits, refused: Option<usize>) {
+    let (n, drawn) = grade_steep_split(tl, assets, 30.0, secs);
+    match refused {
+        Some(want) => assert_eq!(n, want, "{case}: {n} frames refused, {drawn} drawn"),
+        None => assert!(n > 0 && drawn > 0, "{case}: {n} frames refused, {drawn} drawn"),
+    }
+    run_refusing(case, tl, assets, 30.0, secs, limits, &grade_steep_refused());
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_keyed_colour_is_the_eq_of_each_frame() {
+    use kerf_core::{Easing, Property, PropertyKey};
+    let m = media();
+    let noise = std::slice::from_ref(&m.noise);
+    let alone = |c: Clip| timeline(vec![vec![c]], None);
+    fn eased(time: f64, value: f64, easing: Easing) -> PropertyKey {
+        PropertyKey { time, value, easing }
+    }
+    let all = Property::COLOR;
+    type Shape = Box<dyn Fn(f64, f64) -> Vec<PropertyKey>>;
+    let shapes: [(&str, Shape, usize); 5] = [
+        ("linear", Box::new(linear_keys), 20),
+        (
+            "ease in-out",
+            Box::new(|lo, hi| vec![eased(0.0, lo, Easing::EaseInOut), PropertyKey::new(1.0, hi)]),
+            20,
+        ),
+        (
+            "hold",
+            Box::new(|lo, hi| {
+                vec![
+                    eased(0.0, lo, Easing::Hold),
+                    eased(0.5, hi, Easing::Hold),
+                    PropertyKey::new(1.0, lo + (hi - lo) * 0.25),
+                ]
+            }),
+            2,
+        ),
+        (
+            "bezier, off the frame grid",
+            Box::new(|lo, hi| {
+                vec![
+                    eased(
+                        0.013,
+                        lo,
+                        Easing::Bezier {
+                            x1: 0.2,
+                            y1: 0.9,
+                            x2: 0.7,
+                            y2: 0.1,
+                        },
+                    ),
+                    PropertyKey::new(0.517, hi),
+                    PropertyKey::new(0.871, lo + (hi - lo) * 0.4),
+                ]
+            }),
+            20,
+        ),
+        (
+            // Over 24 points a keyframe expression is a balanced tree, not a chain.
+            "many eased keys",
+            Box::new(|lo, hi| {
+                (0..10)
+                    .map(|i| {
+                        eased(
+                            f64::from(i) * 0.1,
+                            lo + (hi - lo) * f64::from((i * 7) % 9) / 8.0,
+                            Easing::EaseInOut,
+                        )
+                    })
+                    .collect()
+            }),
+            20,
+        ),
+    ];
+    // Every number alone, and all five together, along each shape of curve, over noise in all three planes: every
+    // entry of every table is looked at.
+    for (name, shape, moves) in &shapes {
+        for prop in all {
+            run_colour(
+                &format!("keyed colour/{prop:?}, {name}"),
+                &alone(colour_keyed(&m.noise, &[prop], shape.as_ref())),
+                noise,
+                30.0,
+                1.0,
+                *moves,
+                EXACT,
+            );
+        }
+        run_colour(
+            &format!("keyed colour/all five, {name}"),
+            &alone(colour_keyed(&m.noise, &all, shape.as_ref())),
+            noise,
+            30.0,
+            1.0,
+            *moves,
+            EXACT,
+        );
+    }
+    // The temperature crossing zero: on a frame (-1 to 1 over a second is 0 at frame 15, where `gamma_r` and
+    // `gamma_b` are both 1 and the chroma tables are the identity) and between two.
+    let crossing = |lo: f64, hi: f64, end: f64| {
+        let mut c = clip(&m.noise, 0.5, 1.5, 0.0);
+        c.set_property_keys(
+            Property::Temperature,
+            vec![PropertyKey::new(0.0, lo), PropertyKey::new(end, hi)],
+        );
+        c
+    };
+    run_colour(
+        "keyed colour/temperature crossing 0 on a frame",
+        &alone(crossing(-1.0, 1.0, 1.0)),
+        noise,
+        30.0,
+        1.0,
+        20,
+        EXACT,
+    );
+    run_colour(
+        "keyed colour/temperature crossing 0 between two",
+        &alone(crossing(-0.6, 0.3, 0.9)),
+        noise,
+        30.0,
+        1.0,
+        20,
+        EXACT,
+    );
+    run_colour(
+        "keyed colour/temperature 1 to 0",
+        &alone(crossing(1.0, 0.0, 1.0)),
+        noise,
+        30.0,
+        1.0,
+        20,
+        EXACT,
+    );
+    // The frame grids of other rates: 29.97 spelled as the text (2997/100) and as the ratio, 24 and 25 fps.
+    for (name, fps) in [
+        ("29.97", 29.97),
+        ("30000/1001", 30000.0 / 1001.0),
+        ("24", 24.0),
+        ("25", 25.0),
+        ("60", 60.0),
+    ] {
+        run_colour(
+            &format!("keyed colour/all five @{name}"),
+            &alone(colour_keyed(&m.noise, &all, &linear_keys)),
+            noise,
+            fps,
+            1.0,
+            20,
+            EXACT,
+        );
+    }
+    // Late on the timeline, sped up, slowed down, reversed: only the clip's own clock reads the curve.
+    let mut late = colour_keyed(&m.noise, &all, &linear_keys);
+    late.timeline_start = 1.25;
+    run_colour(
+        "keyed colour/late on the timeline",
+        &alone(late),
+        noise,
+        30.0,
+        2.25,
+        20,
+        EXACT,
+    );
+    // ... and late on the grid of 29.97 fps, spelled as the text and as the ratio: the start is off the frame grid, and the
+    // time the curve is read at is the clip's own on the `fps` filter's grid.
+    for (name, fps) in [("29.97", 29.97), ("30000/1001", 30000.0 / 1001.0)] {
+        let mut late = colour_keyed(&m.noise, &all, &linear_keys);
+        late.timeline_start = 1.25;
+        run_colour(
+            &format!("keyed colour/late on the timeline @{name}"),
+            &alone(late),
+            noise,
+            fps,
+            2.25,
+            20,
+            EXACT,
+        );
+    }
+    let mut fast = colour_keyed(&m.noise, &all, &linear_keys);
+    (fast.source_out, fast.speed, fast.timeline_start) = (2.5, 2.0, 0.4);
+    run_colour("keyed colour/speed 2", &alone(fast), noise, 30.0, 1.4, 20, EXACT);
+    let mut slow = colour_keyed(&m.noise, &all, &linear_keys);
+    (slow.source_out, slow.speed) = (1.0, 0.5);
+    run_colour("keyed colour/speed 0.5", &alone(slow), noise, 30.0, 1.0, 20, EXACT);
+    let mut back = colour_keyed(&m.noise, &all, &linear_keys);
+    back.speed = -1.0;
+    run_colour("keyed colour/reversed", &alone(back), noise, 30.0, 1.0, 20, EXACT);
+    // Beside a static grade: the numbers that are not keyed are the clip's own, to the last digit.
+    let mut beside = colour_keyed(&m.noise, &[Property::Brightness, Property::Gamma], &linear_keys);
+    beside.color = Color {
+        contrast: 1.3,
+        saturation: 0.8,
+        temperature: -0.35,
+        ..Color::default()
+    };
+    run_colour(
+        "keyed colour/beside a static grade",
+        &alone(beside),
+        noise,
+        30.0,
+        1.0,
+        20,
+        EXACT,
+    );
+    let mut warm = colour_keyed(&m.noise, &[Property::Contrast], &linear_keys);
+    warm.color.temperature = 0.4;
+    run_colour(
+        "keyed colour/beside a static temperature",
+        &alone(warm),
+        noise,
+        30.0,
+        1.0,
+        20,
+        EXACT,
+    );
+
+    // The clip's fades and the dissolve it enters by act after the `eq`.
+    let mut faded = colour_keyed(&m.noise, &all, &linear_keys);
+    faded.fade_in = 0.3;
+    faded.fade_out = 0.3;
+    run_colour("keyed colour/with fades", &alone(faded), noise, 30.0, 1.0, 20, EXACT);
+    let out = clip(&m.bars, 0.5, 1.5, 0.0);
+    let mut inc = colour_keyed(&m.noise, &all, &linear_keys);
+    inc.timeline_start = 1.0;
+    inc.transition_in = Some(Transition {
+        kind: TransitionKind::Crossfade,
+        duration: 0.5,
+    });
+    run_colour(
+        "keyed colour/dissolve",
+        &timeline(vec![vec![out, inc]], None),
+        &[m.bars.clone(), m.noise.clone()],
+        30.0,
+        2.0,
+        20,
+        EXACT,
+    );
+    let mut dipped = colour_keyed(&m.testsrc, &all, &linear_keys);
+    dipped.timeline_start = 1.0;
+    dipped.transition_in = Some(Transition {
+        kind: TransitionKind::DipToBlack,
+        duration: 0.6,
+    });
+    run_colour(
+        "keyed colour/dip to black",
+        &timeline(vec![vec![clip(&m.testsrc, 0.5, 1.5, 0.0), dipped]], None),
+        std::slice::from_ref(&m.testsrc),
+        30.0,
+        2.0,
+        20,
+        EXACT,
+    );
+    // The outgoing clip of a dissolve plays on past its end (its tail) with its `eq` still running: the curve holds its
+    // last value there.
+    let mut leaving = colour_keyed(&m.testsrc, &all, &linear_keys);
+    leaving.timeline_start = 0.0;
+    let mut entering = clip(&m.bars, 0.5, 1.5, 1.0);
+    entering.transition_in = Some(Transition {
+        kind: TransitionKind::Crossfade,
+        duration: 0.5,
+    });
+    run_colour(
+        "keyed colour/outgoing clip on its tail",
+        &timeline(vec![vec![leaving, entering]], None),
+        &[m.testsrc.clone(), m.bars.clone()],
+        30.0,
+        2.0,
+        20,
+        EXACT,
+    );
+    // Beside a keyed opacity: one clip, an `eq` and a `geq` alpha each written per frame.
+    let over_the_bars = |c: Clip| timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None);
+    let two = [m.bars.clone(), m.testsrc.clone()];
+    let mut both = colour_keyed(&m.testsrc, &all, &linear_keys);
+    both.set_property_keys(Property::Opacity, linear_keys(1.0, 0.4));
+    run_colour(
+        "keyed colour/with a keyed opacity",
+        &over_the_bars(both),
+        &two,
+        30.0,
+        1.0,
+        20,
+        EXACT,
+    );
+    let mut both = colour_keyed(&m.testsrc, &[Property::Brightness, Property::Temperature], &linear_keys);
+    both.set_property_keys(Property::Opacity, linear_keys(0.2, 0.9));
+    both.fade_in = 0.3;
+    run_colour(
+        "keyed colour/with a keyed opacity and a fade",
+        &over_the_bars(both),
+        &two,
+        30.0,
+        1.0,
+        20,
+        EXACT,
+    );
+    // A layer the compositor scales: the scaler is a level off swscale's x86 kernels, and the grade's tables multiply that by
+    // their steepest step (`eq::table_steps`: contrast, gamma's power toward black, a black point parked above 0). A frame is
+    // drawn while that step is at most two (`GRADED_SCALED`) and FFmpeg's past it (`GradeSteep`), so a keyed ramp is judged one
+    // frame at a time: the frames inside are held to the export, the others are refused (and the export renders them all the same).
+    let gentle = |c: &mut Clip, gamma_to: f64| {
+        for (prop, lo, hi) in [
+            (Property::Brightness, -0.1, 0.1),
+            (Property::Contrast, 0.9, 1.25),
+            (Property::Saturation, 0.8, 1.3),
+            (Property::Gamma, 0.85, gamma_to),
+            (Property::Temperature, -0.5, 0.5),
+        ] {
+            c.set_property_keys(prop, linear_keys(lo, hi));
+        }
+    };
+    let moving = |c: &mut Clip| {
+        c.transform.scale = 0.6;
+        c.set_property_keys(Property::PosX, linear_keys(-0.2, 0.2));
+    };
+    let mut gentle_pip = clip(&m.testsrc, 0.5, 1.5, 0.0);
+    gentle(&mut gentle_pip, 1.1);
+    moving(&mut gentle_pip);
+    run_colour(
+        "keyed colour/moving pip, gentle",
+        &over_the_bars(gentle_pip),
+        &two,
+        30.0,
+        1.0,
+        20,
+        GRADED_SCALED,
+    );
+    // ... with the gamma going on to 1.2 the ramp's tables step by 3 on one frame (a cliff at the dark end: the first entry
+    // above 0 is 3), which is that frame's alone.
+    let mut gentler_pip = clip(&m.testsrc, 0.5, 1.5, 0.0);
+    gentle(&mut gentler_pip, 1.2);
+    moving(&mut gentler_pip);
+    run_grade_steep(
+        "keyed colour/moving pip, gamma to 1.2",
+        &over_the_bars(gentler_pip),
+        &two,
+        1.0,
+        GRADED_SCALED,
+        Some(1),
+    );
+    // The far ends of every range: the early frames of the ramp (contrast 0.5, saturation 0, gamma 0.5) are inside, the rest steepen.
+    let mut steep_pip = colour_keyed(&m.testsrc, &all, &linear_keys);
+    moving(&mut steep_pip);
+    run_grade_steep(
+        "keyed colour/moving pip, steep",
+        &over_the_bars(steep_pip),
+        &two,
+        1.0,
+        GRADED_SCALED,
+        None,
+    );
+    // Letterboxed: `pad`'s bars are in the picture `eq` sees, and go through the tables of the frame (the portrait
+    // picture is shrunk into the frame: the scaler's level again).
+    let delivery = Some(Delivery::new(640, 360, Fit::Contain));
+    let mut boxed = clip(&m.portrait, 0.5, 1.5, 0.0);
+    gentle(&mut boxed, 1.1);
+    run_colour(
+        "keyed colour/letterboxed, gentle",
+        &timeline(vec![vec![boxed]], delivery),
+        std::slice::from_ref(&m.portrait),
+        30.0,
+        1.0,
+        20,
+        GRADED_SCALED,
+    );
+    let boxed = colour_keyed(&m.portrait, &all, &linear_keys);
+    run_grade_steep(
+        "keyed colour/letterboxed, steep",
+        &timeline(vec![vec![boxed]], delivery),
+        std::slice::from_ref(&m.portrait),
+        1.0,
+        GRADED_SCALED,
+        None,
+    );
+    // Turned (`rotate` follows the `eq`, on the alpha plane) and translucent (the RGB round trip a constant opacity takes
+    // reads the graded picture). The turned layer is scaled too, and `ROTATED` is the bound of that alone (ungraded: Y 1 /
+    // UV 2): a brightness and a warm / cool shift, which magnify it least; a steeper grade is the scaled layers' above
+    // (a static saturation of 1.3 and gamma of 1.2 on the same layer measure Y 2 / UV 3).
+    let mut turned = clip(&m.smooth, 0.5, 1.5, 0.0);
+    turned.set_property_keys(Property::Brightness, linear_keys(-0.1, 0.1));
+    turned.set_property_keys(Property::Temperature, linear_keys(-0.5, 0.5));
+    turned.transform.rotation = 12.0;
+    turned.transform.scale = 0.6;
+    let on_black = timeline(vec![vec![clip(&m.black, 0.5, 1.5, 0.0)], vec![turned]], None);
+    let smooth = [m.black.clone(), m.smooth.clone()];
+    colour_moves("keyed colour/rotated", &on_black, &smooth, 30.0, 1.0, 20);
+    run_rotated("keyed colour/rotated", &on_black, &smooth, 30.0, 1.0, ROTATED);
+    let mut translucent = colour_keyed(&m.testsrc, &all, &linear_keys);
+    translucent.transform.opacity = 0.6;
+    run_colour(
+        "keyed colour/translucent",
+        &over_the_bars(translucent),
+        &two,
+        30.0,
+        1.0,
+        20,
+        TRANSLUCENT,
+    );
+    // The tables of the frame ahead of the effects that follow: composed with a grayscale or an invert, and
+    // ahead of a blur.
+    for (name, effects, limits) in [
+        ("invert", vec![kerf_core::VideoEffect::Invert], EXACT),
+        (
+            "grayscale then invert",
+            vec![kerf_core::VideoEffect::Grayscale, kerf_core::VideoEffect::Invert],
+            EXACT,
+        ),
+        (
+            "blur then grayscale",
+            vec![kerf_core::VideoEffect::Blur { sigma: 3.0 }, kerf_core::VideoEffect::Grayscale],
+            EFFECT,
+        ),
+        ("sharpen", vec![kerf_core::VideoEffect::Sharpen { amount: 1.0 }], EXACT),
+        ("vignette", vec![kerf_core::VideoEffect::Vignette], EXACT),
+    ] {
+        let mut c = colour_keyed(&m.testsrc, &all, &linear_keys);
+        c.effects = effects;
+        run_colour(
+            &format!("keyed colour/then {name}"),
+            &over_the_bars(c),
+            &two,
+            30.0,
+            1.0,
+            20,
+            limits,
+        );
+    }
+    // A mask is cut after the grade.
+    let mut masked = colour_keyed(&m.testsrc, &all, &linear_keys);
+    masked.mask = Some(mask_of(kerf_core::MaskShape::Ellipse, 0.1, false));
+    run_colour(
+        "keyed colour/under a mask",
+        &over_the_bars(masked),
+        &two,
+        30.0,
+        1.0,
+        20,
+        EXACT,
+    );
+    // A moving zoom comes last: the grade is at the fit size, magnified with the picture.
+    let mut zoomed = zooming(&m.testsrc, 1.0, 1.4, (0.0, 0.0));
+    for prop in all {
+        zoomed.set_property_keys(prop, linear_keys(colour_span(prop).0, colour_span(prop).1));
+    }
+    let tl = over_the_bars(zoomed);
+    run_colour("keyed colour/under a moving zoom", &tl, &two, 30.0, 1.0, 20, SCALED);
+}
+
+/// A grade on a layer the scaler resizes: the scaler is a level off swscale's and the tables multiply that by their steepest
+/// step (`eq::table_steps`), so a frame is drawn while that step is at most two and FFmpeg's past it (`GradeSteep`), static
+/// grades included. The drawn ones are held to **the step itself** (the bound the plan judged them by) on sources that look at
+/// every table entry: noise, a luma ramp, and hard 16 / 235 edges whose scaled overshoot reaches the bottom of the range. The
+/// refused ones are the grades measured far past it with the refusal bypassed (noise, edges and the ramp, Y / UV off the export:
+/// gamma 1.3 3 / 1, 1.4 4 / 1, 2 6 / 1; contrast 3 3 / 1; contrast 1.8 and gamma 2 12 / 1, with a brightness of 0.3 19 / 1;
+/// saturation 3 1 / 3), here refused on every frame with the export rendering them.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_grade_on_a_layer_the_scaler_resizes_is_drawn_while_its_tables_step_by_two_and_refused_past_it() {
+    use kerf_core::eq::table_steps;
+    let m = media();
+    let grade = |brightness: f64, contrast: f64, saturation: f64, gamma: f64, temperature: f64| Color {
+        brightness,
+        contrast,
+        saturation,
+        gamma,
+        temperature,
+    };
+    let pip = |src: &Asset, color: Color| {
+        let mut c = clip(src, 0.5, 1.5, 0.0);
+        c.transform.scale = 0.6;
+        c.color = color;
+        (
+            timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None),
+            [m.bars.clone(), src.clone()],
+        )
+    };
+    let (noise, edges, ramp) = (("noise", &m.noise), ("edges", &m.edges), ("ramp", &m.ramp));
+    for (name, color, sources) in [
+        // Fixed point: contrast steps by its ceiling and a brightness has no cliff.
+        ("brightness 0.3", grade(0.3, 1.0, 1.0, 1.0, 0.0), vec![ramp, edges]),
+        ("contrast 2", grade(0.0, 2.0, 1.0, 1.0, 0.0), vec![ramp, edges]),
+        // The pow table: a gamma above 1 steepens toward black (2 at 1.2); a brightness that lifts the dark end off the
+        // table's cliff takes the steepness away again (gamma 2, step 1).
+        ("gamma 1.2", grade(0.0, 1.0, 1.0, 1.2, 0.0), vec![ramp, edges, noise]),
+        ("gamma 0.5", grade(0.0, 1.0, 1.0, 0.5, 0.0), vec![ramp]),
+        (
+            "brightness 0.3 and gamma 2",
+            grade(0.3, 1.0, 1.0, 2.0, 0.0),
+            vec![ramp, edges],
+        ),
+        // Chroma: saturation is the tables' contrast, a temperature a power of the chroma.
+        ("saturation 2", grade(0.0, 1.0, 2.0, 1.0, 0.0), vec![noise, ramp]),
+        ("temperature 1", grade(0.0, 1.0, 1.0, 1.0, 1.0), vec![noise]),
+    ] {
+        let [y, u, v] = table_steps(&color);
+        assert!(y.max(u).max(v) <= 2, "{name}: steps {y}/{u}/{v} are past what is drawn");
+        let limits = Limits {
+            y: y as i32,
+            uv: u.max(v) as i32,
+        };
+        for (source, asset) in sources {
+            let (tl, assets) = pip(asset, color);
+            run(
+                &format!("static colour/pip, {name}, {source}"),
+                &tl,
+                &assets,
+                30.0,
+                0.4,
+                limits,
+            );
+        }
+    }
+    // Past two, every frame is FFmpeg's. The dark end by gamma (the first table entry above 0 steps by 256 * (1/255)^(1/gamma)),
+    // by a brightness that parks the black point above 0 under a gamma, by contrast, by saturation, and at the far end of every range.
+    for (name, color) in [
+        ("gamma 1.3", grade(0.0, 1.0, 1.0, 1.3, 0.0)),
+        ("gamma 1.4", grade(0.0, 1.0, 1.0, 1.4, 0.0)),
+        ("gamma 2", grade(0.0, 1.0, 1.0, 2.0, 0.0)),
+        ("brightness -0.3 and gamma 1.5", grade(-0.3, 1.0, 1.0, 1.5, 0.0)),
+        ("contrast 3", grade(0.0, 3.0, 1.0, 1.0, 0.0)),
+        ("contrast 1.8 and gamma 2", grade(0.0, 1.8, 1.0, 2.0, 0.0)),
+        ("saturation 3", grade(0.0, 1.0, 3.0, 1.0, 0.0)),
+        ("the far end of every range", grade(0.3, 1.8, 2.0, 2.0, 1.0)),
+    ] {
+        let steps = table_steps(&color);
+        assert!(steps.into_iter().max().unwrap() > 2, "{name}: {steps:?}");
+        let (tl, assets) = pip(&m.ramp, color);
+        let case = format!("static colour/pip, {name}, refused");
+        assert_eq!(grade_steep_split(&tl, &assets, 30.0, 0.4), (12, 0), "{case}");
+        run_refusing(&case, &tl, &assets, 30.0, 0.4, GRADED_SCALED, &grade_steep_refused());
+    }
+    // The same far end at the picture's size is exact (nothing is resized): drawn, to the level.
+    let mut alone = clip(&m.ramp, 0.5, 1.5, 0.0);
+    alone.color = grade(0.3, 1.8, 2.0, 2.0, 1.0);
+    run(
+        "static colour/the far end of every range, unscaled",
+        &timeline(vec![vec![alone]], None),
+        std::slice::from_ref(&m.ramp),
+        30.0,
+        0.4,
+        EXACT,
+    );
+}
+
+/// The colour is graded in the picture the chain has made 4:2:0 and 8-bit by then, so a keyed colour is exact
+/// on a 10-bit, 4:2:2, 4:4:4, gray or RGB source and on a BT.709 one, as a static grade is. (A deeper-than-8-bit
+/// picture may be a full-range one, which FFmpeg 9 grades before it converts: it is FFmpeg's there.)
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_keyed_colour_is_drawn_on_pictures_that_are_not_plain_8_bit_420() {
+    use kerf_core::Property;
+    let v = variants();
+    for (name, a) in [
+        ("10-bit", &v.tenbit),
+        ("4:4:4", &v.yuv444),
+        ("4:2:2", &v.yuv422),
+        ("gray", &v.gray),
+        ("rgb png", &v.rgb_png),
+        ("bt709", &v.testsrc709),
+    ] {
+        let (lo, hi) = if a.streams[0].image { (0.0, 1.0) } else { (0.5, 1.5) };
+        let mut keyed = clip(a, lo, hi, 0.0);
+        for prop in Property::COLOR {
+            let (from, to) = colour_span(prop);
+            keyed.set_property_keys(prop, linear_keys(from, to));
+        }
+        let tl = timeline(vec![vec![keyed]], None);
+        let case = format!("keyed colour/{name}");
+        let one = std::slice::from_ref(a);
+        if name == "10-bit" && policy() != CompositeColorPolicy::FixedBt601 {
+            run_refusing(&case, &tl, one, 30.0, 1.0, EXACT, &full_range_cut_refused());
+        } else {
+            run_colour(&case, &tl, one, 30.0, 1.0, 20, EXACT);
+        }
+    }
+}
+
+/// A keyed colour is `eq` in the clip's chain on every frame, so a refusal about grading a picture judges
+/// the clip: on a full-range picture FFmpeg 9 grades before it converts the range, and the compositor
+/// converts first, so every frame is FFmpeg's, the ones where the curve passes through neutral included.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_keyed_colour_on_a_full_range_picture_is_refused_on_every_frame() {
+    use kerf_core::{Property, PropertyKey};
+    let v = variants();
+    let m = media();
+    for (name, a) in [("mjpeg", &v.mjpeg), ("jpeg-still", &v.jpeg)] {
+        let (lo, hi) = if a.streams[0].image { (0.0, 1.0) } else { (0.5, 1.5) };
+        let mut c = clip(a, lo, hi, 0.0);
+        // Brightness 0 at the first frame: the numbers there are the identity.
+        c.set_property_keys(
+            Property::Brightness,
+            vec![PropertyKey::new(0.0, 0.0), PropertyKey::new(1.0, 0.3)],
+        );
+        let tl = timeline(vec![vec![c]], None);
+        let opts = at_fps(30.0);
+        let planner = Planner::new(&tl, std::slice::from_ref(a), &opts, PlanRequest::motion(policy())).expect("planner");
+        for k in upto(1.0, 30.0) {
+            let plan = planner.at_frame(k).expect("plan");
+            let why = plan.reasons(&compositor().caps(), plan.size(u32::MAX));
+            assert!(
+                why.iter().any(|u| matches!(u, Unsupported::GradedFullRange(..))),
+                "keyed colour/full-range {name}: frame {k} (colour {:?}) is not refused for grading a full-range picture: {why:?}",
+                plan.layers[0].color
+            );
+        }
+        eprintln!(
+            "{:<44} every frame refused for grading a full-range picture, FFmpeg renders them",
+            format!("keyed colour/full-range {name}")
+        );
+        // The same colour on limited-range footage is drawn (the cases above), and so is the full-range clip ungraded.
+        let plain = timeline(vec![vec![clip(a, lo, hi, 0.0)]], None);
+        let plan = Planner::new(&plain, std::slice::from_ref(a), &opts, PlanRequest::motion(policy()))
+            .expect("planner")
+            .at_frame(3)
+            .expect("plan");
+        assert!(
+            !plan
+                .reasons(&compositor().caps(), plan.size(u32::MAX))
+                .iter()
+                .any(|u| matches!(u, Unsupported::GradedFullRange(..))),
+            "{name}: an ungraded full-range clip is not a graded one"
+        );
+    }
+    // Where range is negotiated (FFmpeg 9), a limited-range layer with a keyed colour above a full-range one.
+    let mut over = colour_keyed(&m.testsrc, &[Property::Brightness], &|_, hi| linear_keys(0.0, hi));
+    over.transform.scale = 0.5;
+    let tl = timeline(vec![vec![clip(&v.mjpeg, 0.5, 1.5, 0.0)], vec![over]], None);
+    let assets = [v.mjpeg.clone(), m.testsrc.clone()];
+    let opts = at_fps(30.0);
+    let planner = Planner::new(&tl, &assets, &opts, PlanRequest::motion(policy())).expect("planner");
+    let refused = upto(1.0, 30.0)
+        .filter(|&k| {
+            let plan = planner.at_frame(k).expect("plan");
+            plan.reasons(&compositor().caps(), plan.size(u32::MAX))
+                .iter()
+                .any(|u| matches!(u, Unsupported::GradedInFullRangeStack(_) | Unsupported::FullRangeCut))
+        })
+        .count();
+    match policy() {
+        CompositeColorPolicy::FixedBt601 => assert_eq!(
+            refused, 0,
+            "FFmpeg 6 converts the range at the decode, as the compositor does"
+        ),
+        _ => assert_eq!(refused, 30, "where range is negotiated the whole stack is FFmpeg's"),
+    }
+    eprintln!(
+        "keyed colour/over a full-range layer: {refused} of 30 frames refused under {:?}",
+        policy()
+    );
+}
+
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn a_rotated_layer_fades_on_an_alpha_plane() {
@@ -1837,8 +2592,8 @@ fn a_translucent_layer_dissolves_and_is_refused_its_fades_to_black() {
 struct Variants {
     tenbit: Asset,
     /// 10-bit tagged full range (`-color_range pc`): ffprobe names it `yuv420p10le`, like the limited
-    /// one, and [`StreamInfo`](kerf_core::StreamInfo) does not record the tag, so nothing in a plan
-    /// tells the two apart.
+    /// one. The probe records the tag now, but a limited file may say nothing, so under FFmpeg 9 the
+    /// plan still refuses a deeper picture by its depth; the tag settles it where it is there.
     tenbit_pc: Asset,
     yuv444: Asset,
     yuv422: Asset,
@@ -3429,4 +4184,168 @@ fn a_labelled_hd_clip_dips_through_white_with_the_bt709_round_trip() {
         "the graph holds a BT.709 clip: the dipping HD clip is labelled"
     );
     run("label/dip-white-labelled-hd", &tl, &assets, 30.0, 2.0, WHITE_709);
+}
+
+// ---- a yuv420p flagged full range ---------------------------------------------------------------
+
+/// The same pictures as `tests/parity.rs`' (`range_media`), long enough for a clip cut from the middle: lossless
+/// FFV1, which keeps the format `yuv420p` whatever the flag (H.264 would call a full-range stream `yuvj420p`).
+struct RangeMedia {
+    /// The test pattern flagged `-color_range pc`, the same flagged `tv` and not flagged, and a gradient flagged `pc`.
+    pc: Asset,
+    tv: Asset,
+    unflagged: Asset,
+    pc_gradient: Asset,
+}
+
+fn range_media() -> &'static RangeMedia {
+    static R: OnceLock<RangeMedia> = OnceLock::new();
+    R.get_or_init(|| {
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("motion-media-range");
+        std::fs::create_dir_all(&dir).unwrap();
+        let testsrc = "testsrc2=size=640x360:rate=30:duration=4";
+        let gradients = "gradients=size=640x360:rate=30:duration=4:c0=0xd03020:c1=0x2040e0:c2=0x30c060:nb_colors=3:seed=11:x0=0:y0=0:x1=640:y1=360:speed=0.00001,format=yuv420p";
+        let make = |name: &str, lavfi: &str, flag: Option<&str>| -> Asset {
+            let p = dir.join(name);
+            let mut args = vec!["-f", "lavfi", "-i", lavfi, "-c:v", "ffv1", "-pix_fmt", "yuv420p"];
+            if let Some(flag) = flag {
+                args.extend(["-color_range", flag]);
+            }
+            args.push(p.to_str().unwrap());
+            ffmpeg(&args);
+            let a = probed(&p);
+            assert_eq!(a.streams[0].pix_fmt.as_deref(), Some("yuv420p"), "{name}");
+            // (An unflagged FFV1 file reads `tv` from FFmpeg 9's muxer and nothing from 6.1.1's: neither is full range.)
+            match flag {
+                Some(flag) => assert_eq!(a.streams[0].color_range.as_deref(), Some(flag), "{name}"),
+                None => assert_ne!(a.streams[0].color_range.as_deref(), Some("pc"), "{name}"),
+            }
+            a
+        };
+        RangeMedia {
+            pc: make("pc.mkv", testsrc, Some("pc")),
+            tv: make("tv.mkv", testsrc, Some("tv")),
+            unflagged: make("unflagged.mkv", testsrc, None),
+            pc_gradient: make("pc-gradient.mkv", gradients, Some("pc")),
+        }
+    })
+}
+
+/// A `yuv420p` flagged full range (a VP9, HEVC or AV1 file) is, in an export, what a `yuvj420p` is under FFmpeg 9 and
+/// what it is not under FFmpeg 6: FFmpeg 9 flags the whole export full range and keeps the clip's raw
+/// samples (every frame of the cut 16 levels off, a black one included), so the cut is refused as for a `yuvj` clip;
+/// FFmpeg 6 hands its raw samples to the filters too (no conversion ahead of them: a format that is already the
+/// overlay's), so a plain frame, a cut and a layer over it are exact there while a fade (14 levels), a vignette (10),
+/// an invert (4), `eq` (6), a sharpen (20), a blur (1) and a resize (UV 8) are not, and those are refused under both.
+/// The same pictures flagged `tv`, or not at all, are drawn as ever.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_yuv420p_flagged_full_range_is_drawn_or_refused_as_the_export_reads_its_raw_samples() {
+    use kerf_core::VideoEffect as E;
+    let m = media();
+    let r = range_media();
+    eprintln!("composite colour policy of this FFmpeg: {:?}", policy());
+    let one = |a: &Asset, edit: &dyn Fn(&mut Clip)| {
+        let mut c = clip(a, 0.5, 1.5, 0.0);
+        edit(&mut c);
+        timeline(vec![vec![c]], None)
+    };
+    let over_bars = |a: &Asset, edit: &dyn Fn(&mut Clip)| {
+        let mut c = clip(a, 0.5, 1.5, 0.0);
+        edit(&mut c);
+        (
+            timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None),
+            vec![m.bars.clone(), a.clone()],
+        )
+    };
+    let pc = std::slice::from_ref(&r.pc);
+
+    // Plain: exact under FFmpeg 6; under FFmpeg 9 the cut is the export's flag. A cut that holds the clip too, either side of it.
+    run_full_range("range/pc-plain", &one(&r.pc, &|_| {}), pc, 30.0, 1.0, EXACT);
+    let tl = timeline(vec![vec![clip(&m.black, 0.5, 1.5, 0.0), clip(&r.pc, 0.5, 1.5, 1.0)]], None);
+    run_full_range("range/black-then-pc", &tl, &[m.black.clone(), r.pc.clone()], 30.0, 2.0, EXACT);
+    let tl = timeline(vec![vec![clip(&r.pc, 0.5, 1.5, 0.0), clip(&m.testsrc, 0.5, 1.5, 1.0)]], None);
+    run_full_range(
+        "range/pc-then-limited",
+        &tl,
+        &[r.pc.clone(), m.testsrc.clone()],
+        30.0,
+        2.0,
+        EXACT,
+    );
+
+    // A fade: refused for the frames it runs in under FFmpeg 6 (the rest of the clip, plain, is exact there), and the
+    // cut under FFmpeg 9.
+    let fade_refused = match policy() {
+        CompositeColorPolicy::FixedBt601 => refusing("FullRangeNegotiated", |u| matches!(u, Unsupported::FullRangeNegotiated(_))),
+        _ => full_range_cut_refused(),
+    };
+    let tl = one(&r.pc, &|c| {
+        c.fade_in = 0.5;
+        c.fade_out = 0.5;
+    });
+    run_refusing("range/pc-fade", &tl, pc, 30.0, 1.0, EXACT, &fade_refused);
+    // The scaler resizes it (an enlargement, or a shrink over the bars): swscale converts the range inside the resize,
+    // under either FFmpeg.
+    let (tl, assets) = over_bars(&r.pc, &|c| c.transform.scale = 0.5);
+    run_refusing(
+        "range/pc-shrunk-over-bars",
+        &tl,
+        &assets,
+        30.0,
+        1.0,
+        SCALED,
+        &full_range_resized_refused(),
+    );
+    let enlarged = timeline(
+        vec![vec![clip(&r.pc, 0.5, 1.5, 0.0)]],
+        Some(Delivery::new(960, 540, Fit::Contain)),
+    );
+    run_refusing(
+        "range/pc-enlarged",
+        &enlarged,
+        pc,
+        30.0,
+        1.0,
+        EXACT,
+        &full_range_resized_refused(),
+    );
+
+    // What reads the values: refused on every frame, under both.
+    let at = at_fps(30.0);
+    for (name, effects, why) in [
+        ("vignette", vec![E::Vignette], "vignette"),
+        ("invert", vec![E::Invert], "full-range"),
+        ("blur", vec![E::Blur { sigma: 3.0 }], "full-range"),
+        ("sharpen", vec![E::Sharpen { amount: 1.0 }], "full-range"),
+    ] {
+        let tl = one(&r.pc, &|c| c.effects = effects.clone());
+        refused(&format!("range/pc-{name}"), &tl, pc, &at, 0..30, why);
+    }
+    refused(
+        "range/pc-graded",
+        &one(&r.pc, &|c| c.color.gamma = 1.4),
+        pc,
+        &at,
+        0..30,
+        "colour correction",
+    );
+    let (tl, assets) = over_bars(&r.pc_gradient, &|c| c.effects = vec![key("green", 0.3, 0.3)]);
+    refused("range/pc-chroma-key", &tl, &assets, &at, 0..30, "chroma key");
+
+    // Flagged limited, or not flagged: the same graphs are exact, as ever.
+    for (label, a) in [("tv", &r.tv), ("unflagged", &r.unflagged)] {
+        let one_a = std::slice::from_ref(a);
+        for (name, effects) in [("vignette", vec![E::Vignette]), ("invert", vec![E::Invert])] {
+            let tl = one(a, &|c| c.effects = effects.clone());
+            run(&format!("range/{label}-{name}"), &tl, one_a, 30.0, 1.0, EXACT);
+        }
+        let tl = one(a, &|c| {
+            c.fade_in = 0.5;
+            c.fade_out = 0.5;
+        });
+        run(&format!("range/{label}-fade"), &tl, one_a, 30.0, 1.0, EXACT);
+        let tl = one(a, &|c| c.color.gamma = 1.4);
+        run(&format!("range/{label}-graded"), &tl, one_a, 30.0, 1.0, EXACT);
+    }
 }

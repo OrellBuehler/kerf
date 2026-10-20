@@ -248,10 +248,25 @@
   **A grade is refused**: `PlanLayer.grade` is the clip's `Grade`, and curves, wheels or a LUT that changes the picture
   are `Unsupported::Grade(layer, what)` (kind `grade`) whatever the caps — no compositor pass or parity case draws
   `lutrgb` / `colorbalance` / `lut3d` or their RGB round trip yet.
-  **Colour and partly-keyed transforms in the plan.** `PlanLayer.color` is `Clip::color_at(local)`, sampled
-  per frame (a still plan draws it like a static grade; the ZoomBehind check reads it), and a **Motion**
-  plan with a keyed colour is refused (`Unsupported::KeyedColor`, until `GpuCaps::keyed_color`: the
-  file's `eq` is written per frame, and no pass or parity case draws one yet). A **keyed mask** is the same:
+  **Colour and partly-keyed transforms in the plan.** `PlanLayer.color` is `Clip::color_at(local)` in a still plan
+  (a static grade's sample; the ZoomBehind check reads it) and, in a **Motion** plan with a keyed colour, **the numbers
+  the export's `eq` evaluates to at that frame**: `engine::keyed_color_value(clip, T)`, each keyed number through
+  `keyframe_value` (the quoted expression's own arithmetic, as `keyed_alpha` is) at `T` = `ffmpeg_frame_time(k)` on the
+  clip's `fps` grid — `eq` reads `pts * av_q2d(tb)` behind `fps` — and the numbers not keyed the clip's own, the temperature
+  as `Color::temperature_gammas` makes `1 + 0.3 t` / `1 - 0.3 t` of it (`sweep.rs` holds every number, `gamma_r` and `gamma_b`
+  included, to the evaluated graph text to the bit, at all five rates). `eq` rebuilds its tables from them every frame, so a
+  compositor that sets `GpuCaps::keyed_color` (a Motion plan is refused `Unsupported::KeyedColor` without it) builds its
+  tables from the layer's colour each frame, as for a static grade. **A keyed `eq` is in the chain on every frame of the
+  clip**, neutral numbers or not, so the refusals about grading a picture (`GradedFullRange`, `GradedInFullRangeStack`) judge
+  `RenderPlan::graded(layer)` — a colour that is not the identity, or in a Motion plan any keyed colour — and a full-range clip
+  is refused on the frames where the curve passes through neutral too. **A grade on a layer the scaler resizes is judged by its tables**
+  (`Unsupported::GradeSteep`, from `reasons(size)`, static grades and each frame of a keyed one alike): the compositor's scaler is a
+  level from swscale's and `eq` maps two values a level apart to `eq::table_steps(&layer.color)` apart (`kerf_core::eq`: the port of `eq`'s
+  tables, shared with the compositor; the steepest step between neighbouring entries of the Y, U and V tables of that colour, the whole table, a
+  black point parked above 0 included), so a frame whose steepest step is past `MAX_AMPLIFIED_ERROR` (2) is FFmpeg's. The geometry is the
+  sharpen rule's below (a scale ahead of the `eq`: every stage, or the fit scale when a moving zoom comes last); an unscaled layer is exact
+  at any step. Nothing is built for an ungraded or unscaled layer, and the last four colours' answers are kept per thread (the build is about
+  20 microseconds on the `pow` path). A **keyed mask** is the same:
   `PlanLayer.mask` is `Clip::mask_at(local)`, a still plan draws it as a static mask (the FFmpeg still draws
   `mask_at` through the static `geq`, the compositor `mask_alpha_plane` of it), and a Motion plan is refused
   (`Unsupported::KeyedMask`, no cap). A **keyed crop** is refused in both modes (`Unsupported::KeyedCrop`): the
@@ -271,7 +286,7 @@
   evaluated graph.
   **What the compositor may draw is data**: `GpuCaps` (`Compositor::caps()`: the bits `motion`, `fades`,
   `transitions`, `dip_white`, `keyed_opacity`, `keyed_zoom`, `keyed_color`, `mask`, `text`, `reframe`, `hdr` and an
-  `EffectKinds` bitset; today `GpuCaps::A0` plus every one of them but `keyed_color`, `reframe`, `hdr`
+  `EffectKinds` bitset; today `GpuCaps::A0` plus every one of them but `reframe`, `hdr`
   with every effect kind), and **`RenderPlan::reasons(&caps,
   size)` is a pure function of the plan's fields** returning `Unsupported` values whose
   `Display` is the message the plan has always given — nothing is decided while planning,
@@ -310,22 +325,25 @@
   The dip-to-white refusals are the **Motion** plane bound's and are conservative in stills on purpose: bypassed, RGB, 10-bit, 4:4:4,
   4:2:2, gray, BT.2020, full-range and half-size layers all pass a still's strict bounds, but `reasons()` is one function for both modes.
   `FullRangeNegotiated(layer)` (a still): a `yuvj` (or unrecorded-format) picture inside a running fade, dip or dissolve where FFmpeg 9 works on its raw
-  values and converts the range afterwards (`fade` darkens toward the limited-range 16 first: frame 0 of a fade-in reads Y 30 where black is 16).
+  values and converts the range afterwards (`fade` darkens toward the limited-range 16 first: frame 0 of a fade-in reads Y 30 where black is 16). A **`yuv420p`
+  flagged `pc`** (`PlanStream::raw_full_range`) gets it under **every** policy and in an export frame too (under `FixedBt601` only; the cut is the reason where FFmpeg 9 flags it): its format is already the overlay's, so FFmpeg 6 has no conversion ahead of the fade either.
   **`FullRangeCut`** (an export frame; a plan-level reason, from `PlanCanvas::full_range_cut`, which the `Planner` sets when any clip of the cut
   `maybe_full_range()`): FFmpeg 9 flags the whole export full range and converts every limited-range frame of it (a black frame reads Y 0, not 16), so under any policy
   but `FixedBt601` **no frame of a cut that holds a full-range clip** is drawn — before it, after it, on another track or a gap. FFmpeg 6 converts at the decode, as the
   compositor does, and draws it all to the level, except that **`FullRangeResized`** (under either FFmpeg, from `reasons(size)`) refuses a full-range
   picture the scaler resizes in an export frame and inside a fade (swscale converts the range inside the resize: chroma up to 15 levels off).
-  `maybe_full_range()` is a name heuristic (`yuvj…`, or no recorded format): the range tag (`color_range`) is the truth and `StreamInfo` does not record it. Under a policy that is not
-  `FixedBt601`, `maybe_full_range_in(policy)` therefore also counts any deeper-than-8-bit YCbCr / gray format (`pix_fmt_is_high_bit`): a `pc`-tagged 10-bit file probes as `yuv420p10le`, 9.0.2 handles it as `yuvj`, and the
-  limited 10-bit picture is refused with it (it is what the cut flag, `FullRangeNegotiated` and the grading refusals use; 6.1.1 draws both exactly, so the name alone decides there). Only a clip the export holds sets the cut flag (not a muted track, a
+  `maybe_full_range()` is true for a `yuvj…` name, no recorded format, or **a `yuv420p` flagged full range** (`StreamInfo.color_range == "pc"`, recorded since schema v10; a VP9 / HEVC / AV1 file probes as plain `yuv420p`): the range flag is the truth, but an
+  asset stored before v10 has none (`None`, "not known": judged by its name as ever; so does an unflagged file and a `tv` one). `flagged_full_range()` is the flag in any YCbCr format (RGB and gray pictures read `pc` from ffprobe on every FFmpeg, so for them it says nothing). Under a policy that is not
+  `FixedBt601`, `maybe_full_range_in(policy)` also counts a YCbCr picture flagged `pc` in any format and any deeper-than-8-bit YCbCr / gray format (`pix_fmt_is_high_bit`) whatever it says: a `pc`-tagged 10-bit file probes as `yuv420p10le`, 9.0.2 handles it as `yuvj`, and a
+  limited 10-bit picture is refused with it, because a file may say nothing of its range (it is what the cut flag, `FullRangeNegotiated` and the grading refusals use; 6.1.1 draws a 10-bit one exactly, so there only the name and a `yuv420p` flag decide).
+  A flagged `yuv420p` is the exception on 6.1.1: nothing converts it ahead of the filters, so its raw samples meet the vignette, key, `eq`, fade and the other effects on every FFmpeg (refused under any policy), while a plain layer and a cut are exact there. Only a clip the export holds sets the cut flag (not a muted track, a
   disabled clip, a track a solo shadows, or an audio track's use of the asset).
   The policy condition is a **proxy measured only on FFmpeg 6.1.1 and 9.0.2** (5.x, 7.x, 8.x and distro builds are unmeasured).
   **`gpu_supported_at(size)` is the per-frame fallback switch** (`gpu_supported()` is
   its size-free half; `unsupported_reasons_at(size)` says *no, with reasons*) for
   anything the compositor does not render exactly: video effects (`Effects(layer, what)`: names the effect without its kind
   in the caps, or the value
-  `gblur` / `unsharp` refuse itself: a sigma outside 0 to 1024, an amount outside -2 to 5; or what the picture changes: an invert, blur or sharpen on a full-range or never-recorded picture, an invert on a gray one, a vignette on anything but a limited-range `yuv420p` one (`vignette` works in the picture's own format), a chroma key on anything but a `yuv420p` one, or on a rotated or translucent layer; in `reasons` a chroma key after a scale ahead of the effects or a blur (its alpha moves by up to 1/blend levels for a level of chroma) or on a picture under two samples a side; a similarity or blend `chromakey` refuses itself (0.00001 to 1, 0 to 1); and in `reasons`, by render size, a sharpen after a scale or a blur: from the first scale or blur with sigma > 0, the worst case starts at 1 and each later non-zero sharpen adds `ceil(2 * err * |amount|)`, so the frame is refused past 2: one sharpen above 0.5, or a second one), masks (`Mask` without `caps.mask`;
+  `gblur` / `unsharp` refuse itself: a sigma outside 0 to 1024, an amount outside -2 to 5; or what the picture changes: an invert, blur or sharpen on a full-range or never-recorded picture, an invert on a gray one, a vignette on anything but a limited-range `yuv420p` one (`vignette` works in the picture's own format), a chroma key on anything but a `yuv420p` one, or on a rotated or translucent layer; in `reasons` a chroma key after a scale ahead of the effects or a blur (its alpha moves by up to 1/blend levels for a level of chroma) or on a picture under two samples a side; a similarity or blend `chromakey` refuses itself (0.00001 to 1, 0 to 1); and in `reasons`, by render size, a sharpen after a scale or a blur: from the first scale or blur with sigma > 0, the worst case starts at 1 (at the grade's steepest luma step when a scaled layer is graded) and each later non-zero sharpen adds `ceil(2 * err * |amount|)`, so the frame is refused past 2: one sharpen above 0.5, or a second one; and a grade whose tables step past 2, above), masks (`Mask` without `caps.mask`;
   `MaskWith(layer, what)` with it, on a rotated layer or one below full opacity, or over a chroma key; `Matte(layer, what)` for a blur, a sharpen, a vignette or a chroma key on a
   letterboxed picture, judged with the geometry in `reasons`: FFmpeg's `pad` hands them the padded frame, bars included — a mask is cut
   from that frame too and is drawn at the layer's size), 360 reframe,
@@ -444,11 +462,11 @@
     known (never recorded, or off the table) is refused wherever the grids disagree
     (`LayerGeometry::resolve_any_grid`).
   - **Range.** The decode converts a full-range picture (ffprobe names it `yuvj…`,
-    whatever the container) to limited range up front; FFmpeg 9 keeps it full range
+    whatever the container, or it is a `yuv420p` flagged `color_range=pc`) to limited range up front; FFmpeg 9 keeps it full range
     through the graph (tagged `pc`) and runs `eq` and the overlay on it, converting
     last. That agrees with no colour correction and disagrees with it by 34 to 44 dB
     (every knob, measured on both an mjpeg file and full-range H.264), so **colour
-    correction on a `yuvj` picture is refused** (under any policy — FFmpeg 6 happened
+    correction on a `yuvj` picture, or a `yuv420p` flagged `pc`, is refused** (under any policy — FFmpeg 6 happened
     to agree, but it is the decode order that is different), and so is **a graded layer
     in a stack that holds one** wherever the composite's colour is negotiated or
     unknown (the range, like the matrix, is the bottom layer's). An asset that never

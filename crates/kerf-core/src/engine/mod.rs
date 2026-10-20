@@ -138,7 +138,7 @@ pub use cli::{
     composite_color_policy, export_seek_arg, ffmpeg_command, ffmpeg_path, fps_mode_flag, limit_ffmpeg_args,
     source_is_indexed_container, text_raster_graph, text_still_filter, TextPart, TextRasterGraph,
 };
-pub(crate) use cli::{keyframe_value, proxy_fidelity, ProxyFidelity};
+pub(crate) use cli::{keyed_color_value, keyframe_value, proxy_fidelity, ProxyFidelity};
 pub use colors::color_rgb;
 pub(crate) use colors::{safe_color, valid_color};
 

@@ -27,6 +27,7 @@ use uuid::Uuid;
 
 use crate::clip_timing::{FadeEdge, FadeStep, FadeTint, Rational, FADE_FULL};
 use crate::engine::Fit;
+use crate::eq;
 use crate::error::Result;
 use crate::frame_pick::Pick;
 use crate::layer_geometry::{Keyed, LayerGeometry, Placement};
@@ -300,6 +301,9 @@ pub struct PlanStream {
     pub pix_fmt: Option<String>,
     /// The YCbCr matrix the stream declares, as ffprobe names it.
     pub color_space: Option<String>,
+    /// The sample range the stream declares (`pc` full, `tv` limited), `None` when it says none or the
+    /// asset was probed before the tag was recorded: not known, which is not the same as limited.
+    pub color_range: Option<String>,
     /// The export graph **labels this picture BT.709** (`setparams`): it is untagged HD YCbCr
     /// beside an input of the same graph that names a matrix (`model::bt709_labels`), decided over
     /// the original's stream and the inputs of the graph the plan mirrors (every clip of the cut for
@@ -350,27 +354,50 @@ impl PlanStream {
         self.pix_fmt.as_deref().and_then(pix_fmt_subsampling)
     }
 
-    /// Whether the picture may be full range **by its name**: ffprobe names a full-range 8-bit
-    /// 4:2:0 / 4:2:2 / 4:4:4 picture `yuvj…` (a JPEG, an mjpeg, an H.264 file flagged `pc`), and an
-    /// asset that never recorded its format is not known not to be. This is a heuristic: the
-    /// range *tag* (`color_range`) is the truth, and [`StreamInfo`] does not record it, so a
-    /// deeper-than-8-bit file flagged `pc` still reads `yuv420p10le` and is not caught here; see
-    /// [`PlanStream::maybe_full_range_in`].
+    /// Whether the file flags the picture full range (`color_range=pc`), in a YCbCr format. `None` and
+    /// `tv` are not a flag: an asset probed before the range was recorded (schema v10) says nothing,
+    /// and is judged as it always was, by its name ([`PlanStream::maybe_full_range`]). An RGB or gray
+    /// picture is no flag either: ffprobe prints `pc` for every one of them on every FFmpeg (an RGB or
+    /// gray format has no limited range to be told from), so the word carries nothing there.
+    pub fn flagged_full_range(&self) -> bool {
+        self.color_range.as_deref() == Some("pc") && matches!(self.layout(), Some(PixLayout::Yuv420 | PixLayout::OtherYuv))
+    }
+
+    /// A `yuv420p` picture flagged full range (a VP9, HEVC or AV1 file; ffprobe names the format
+    /// `yuvj420p` only for the codecs whose decoder says so). Its format is the one every overlay takes, so
+    /// nothing converts its range ahead of the graph's filters, and its **raw samples** reach `fade`, `eq`,
+    /// `vignette`, `chromakey` and the rest on every FFmpeg (measured 6.1.1 and 9.0.2); a `yuvj420p` is converted at the
+    /// decode by FFmpeg 6 and only FFmpeg 9 keeps its raw values. The compositor's decode converts to
+    /// limited range first, so the two disagree wherever a filter reads the values.
+    pub fn raw_full_range(&self) -> bool {
+        self.flagged_full_range() && self.pix_fmt.as_deref() == Some("yuv420p")
+    }
+
+    /// Whether the picture may be full range **by its name or its flag**: ffprobe names a full-range 8-bit
+    /// 4:2:0 / 4:2:2 / 4:4:4 picture `yuvj…` (a JPEG, an mjpeg, an H.264 file flagged `pc`), an
+    /// asset that never recorded its format is not known not to be, and a `yuv420p` flagged `pc`
+    /// ([`PlanStream::raw_full_range`]) is. The range *tag* is the truth, but an asset probed before it was
+    /// recorded has none, so a deeper-than-8-bit file flagged `pc` that predates it still reads
+    /// `yuv420p10le` and is not caught here; see [`PlanStream::maybe_full_range_in`].
     pub fn maybe_full_range(&self) -> bool {
-        self.pix_fmt
-            .as_deref()
-            .is_none_or(|f| f.to_ascii_lowercase().starts_with("yuvj"))
+        self.raw_full_range()
+            || self
+                .pix_fmt
+                .as_deref()
+                .is_none_or(|f| f.to_ascii_lowercase().starts_with("yuvj"))
     }
 
     /// [`PlanStream::maybe_full_range`], and under a policy that is not
-    /// [`CompositeColorPolicy::FixedBt601`] (FFmpeg 9 and what could not be measured) **every
-    /// deeper-than-8-bit YCbCr or gray format too**: the name says nothing about its range there,
-    /// and 9.0.2 handles a `pc`-tagged one as it does `yuvj` (raw values kept, the whole export
-    /// flagged full range; measured Y 16 off on 10-bit). FFmpeg 6 handled the high-bit pictures
-    /// measured exactly whatever their tag, so there the name alone decides, as before.
+    /// [`CompositeColorPolicy::FixedBt601`] (FFmpeg 9 and what could not be measured) **every YCbCr picture
+    /// flagged `pc` in any format, and every deeper-than-8-bit YCbCr or gray format whose range is not
+    /// recorded**: 9.0.2 handles a `pc`-tagged one as it does `yuvj` (raw values kept, the whole export
+    /// flagged full range; measured Y 16 off on 10-bit), and a file probed before the flag was recorded
+    /// does not say. FFmpeg 6 handled the high-bit pictures measured exactly whatever their tag, so there
+    /// the name alone decides, as before; a `yuv420p` flagged `pc` is the exception it handles raw.
     pub fn maybe_full_range_in(&self, policy: CompositeColorPolicy) -> bool {
         self.maybe_full_range()
-            || (policy != CompositeColorPolicy::FixedBt601 && self.pix_fmt.as_deref().is_some_and(pix_fmt_is_high_bit))
+            || (policy != CompositeColorPolicy::FixedBt601
+                && (self.flagged_full_range() || self.pix_fmt.as_deref().is_some_and(pix_fmt_is_high_bit)))
     }
 
     /// An RGB-family picture (see [`PixLayout::Rgb`]).
@@ -389,6 +416,7 @@ impl PlanStream {
             color_primaries: s.color_primaries.clone(),
             pix_fmt: s.pix_fmt.clone(),
             color_space: s.color_space.clone(),
+            color_range: s.color_range.clone(),
             label_bt709: false,
         })
     }
@@ -420,8 +448,10 @@ pub struct Animated {
     pub zooms: bool,
     /// Some colour number is keyed: the export's `eq` is written per frame (`eval=frame`),
     /// off a colour sampled at the frame's time. A still plan samples it too and draws that
-    /// colour like a static one; an export frame is refused until the compositor says it draws
-    /// one (`GpuCaps::keyed_color`).
+    /// colour like a static one; an export frame carries the numbers `eq` evaluates at that frame
+    /// ([`PlanLayer::color`]) and is refused until the compositor says it draws them
+    /// (`GpuCaps::keyed_color`). The clip has an `eq` in its chain on every frame of it, whether
+    /// or not this frame's numbers are neutral (`RenderPlan::graded`).
     pub color: bool,
     /// Some number of the mask is keyed: the export's mask `geq` reads it per frame. A still plan
     /// draws the mask sampled at its instant ([`Clip::mask_at`]) as a static one; an export frame
@@ -591,6 +621,10 @@ pub struct PlanLayer {
     pub stream: PlanStream,
     /// The transform **sampled** at this instant.
     pub transform: Transform,
+    /// The colour correction at this frame. A keyed colour is `Clip::color_at` in a still plan (drawn
+    /// like a static one); in a Motion plan it is what the export's `eq` evaluates at the `fps` grid's
+    /// time (`PlanCanvas::pick_fps`, `engine::keyed_color_value`: each keyed number through the
+    /// expression's own arithmetic, the others the clip's), which is what `eq` builds its tables from.
     pub color: Color,
     /// The clip's curves, wheels and LUT. No compositor draws them yet: a layer with any of them
     /// is refused ([`Unsupported::Grade`]).
@@ -747,9 +781,11 @@ fn effect_refusal(effect: &VideoEffect, caps: &GpuCaps) -> Option<&'static str> 
     }
 }
 
-/// The worst-case luma error, in levels, the plan allows through the sharpens after a scale or a blur (which
-/// start it at one): two, the bound of a scaled blur. One sharpen of 0.5 reaches it exactly.
-const MAX_SHARPEN_ERROR: f64 = 2.0;
+/// The worst-case error, in levels, the plan allows a one-level difference from FFmpeg's upstream (the
+/// compositor's scaler, a blur's summation order) to grow to through what is drawn after it: the steepest step
+/// of a grade's tables (`eq::table_steps`) and the sharpens (which start it at one, or at the grade's step).
+/// Two is the bound of a scaled blur and of a gentle grade on a scaled layer; one sharpen of 0.5 reaches it exactly.
+pub const MAX_AMPLIFIED_ERROR: u32 = 2;
 
 /// What an effect does to this kind of picture that the compositor, which works on the 4:2:0 limited-range
 /// planes the decode hands it, does not: FFmpeg runs the filter on the picture as it is in the graph, and the
@@ -773,14 +809,22 @@ fn effect_on_picture_refusal(effect: &VideoEffect, stream: &PlanStream, policy: 
         VideoEffect::Vignette
             if stream.pix_fmt.as_deref() != Some("yuv420p") || stream.maybe_full_range_in(policy) =>
         {
-            Some("a vignette on a picture that is not 8-bit 4:2:0 yuv420p (FFmpeg vignettes it in its own format)")
+            Some(if stream.pix_fmt.as_deref() == Some("yuv420p") {
+                "a vignette on a yuv420p picture flagged full range (color_range=pc: FFmpeg vignettes its raw values)"
+            } else {
+                "a vignette on a picture that is not 8-bit 4:2:0 yuv420p (FFmpeg vignettes it in its own format)"
+            })
         }
         // `chromakey` reads the chroma of the `yuva420p` FFmpeg converts the picture to; the compositor's is the
         // decode's 4:2:0, the same picture only when that is what it was.
         VideoEffect::ChromaKey { .. }
             if stream.pix_fmt.as_deref() != Some("yuv420p") || stream.maybe_full_range_in(policy) =>
         {
-            Some("a chroma key on a picture that is not 8-bit 4:2:0 yuv420p (FFmpeg keys the chroma it converts it to)")
+            Some(if stream.pix_fmt.as_deref() == Some("yuv420p") {
+                "a chroma key on a yuv420p picture flagged full range (color_range=pc: FFmpeg keys its raw chroma)"
+            } else {
+                "a chroma key on a picture that is not 8-bit 4:2:0 yuv420p (FFmpeg keys the chroma it converts it to)"
+            })
         }
         _ => None,
     }
@@ -843,22 +887,37 @@ impl RenderPlan {
             // the first adds up to a level of its own however small its amount (two of 0.2 reach 3, three
             // of 0.1 reach 4). From the first source of difference on (a scale ahead of the effects: every
             // stage, or the fit scale when a moving zoom comes last; or a blur with a sigma) the worst case
-            // is followed through the sharpens that count, `err += ceil(2 * err * |amount|)` from 1, and the
+            // is followed through the sharpens that count, `err += ceil(2 * err * |amount|)` from 1 (from the
+            // luma step of the grade between them where the layer is graded), and the
             // frame is drawn only while it stays within the two levels a scaled blur does: one sharpen of
             // at most 0.5, and no second one. A sharpen of nothing at `unsharp`'s 16-bit precision counts
             // for nothing; with no source upstream a sharpen is exact at any amount.
             let zoom_last = layer.animated.is_some_and(|a| a.zooms) && geom.stages.len() == 2;
             let before_effects = if zoom_last { 1 } else { geom.stages.len() };
-            let mut err = if geom.stages[..before_effects].iter().any(|s| s.scaled != (s.src.w, s.src.h)) {
-                1.0
-            } else {
-                0.0
-            };
+            let scaled = geom.stages[..before_effects].iter().any(|s| s.scaled != (s.src.w, s.src.h));
+            // The `eq` is next in the chain after those scales (the compositor applies its tables in the vertical
+            // pass of the last of them), and they multiply the scaler's level: two pictures a level apart are, after
+            // them, as far apart as the tables' steepest step between neighbouring entries (`eq::table_steps`,
+            // the whole table: the scaler's overshoot at a hard edge reaches the bottom of the range, where a
+            // table leaving 0 for its first entry steps by 256 * (1/255)^(1/gamma) at a black point of 0 and by
+            // more where a contrast or a negative brightness parks it higher). Up to two is the bound of a
+            // scaled blur and `GRADED_SCALED`'s (contrast and saturation up to 2, a gamma toward 1 or a little
+            // over: 1.2); past it the step is not bounded (12 and 19 levels measured at the far ends of every
+            // range), so the frame is FFmpeg's. A plan with a keyed colour judges each frame's numbers, and
+            // the luma step is where a sharpen after the grade starts its own worst case from, below.
+            let steps = if scaled { eq::table_steps(&layer.color) } else { [1; 3] };
+            let steepest = steps.into_iter().max().unwrap_or(1);
+            if steepest > MAX_AMPLIFIED_ERROR {
+                reasons.push(Unsupported::GradeSteep(self.layer_ref(n, layer), steepest));
+            }
+            let mut err = if scaled { f64::from(steps[0]).max(1.0) } else { 0.0 };
+            let mut sharpened = false;
             for effect in &layer.effects {
                 match effect {
                     VideoEffect::Blur { sigma } if *sigma > 0.0 && err == 0.0 => err = 1.0,
                     VideoEffect::Sharpen { amount } if err > 0.0 && (f64::from(*amount as f32) * 65536.0) as i32 != 0 => {
                         err += (2.0 * err * amount.abs()).ceil();
+                        sharpened = true;
                     }
                     _ => {}
                 }
@@ -868,7 +927,6 @@ impl RenderPlan {
             // chroma that is FFmpeg's to the level. It runs after every effect: no scale ahead of the effects and
             // no blur among them (a sharpen leaves the chroma alone, the tables are exact).
             let chroma_keyed = layer.effects.iter().any(|e| matches!(e, VideoEffect::ChromaKey { .. }));
-            let scaled = geom.stages[..before_effects].iter().any(|s| s.scaled != (s.src.w, s.src.h));
             let blurred = layer
                 .effects
                 .iter()
@@ -892,7 +950,7 @@ impl RenderPlan {
                     "a chroma key on a picture narrower or shorter than 2",
                 ));
             }
-            if err > MAX_SHARPEN_ERROR {
+            if sharpened && err > f64::from(MAX_AMPLIFIED_ERROR) {
                 reasons.push(Unsupported::Effects(
                     self.layer_ref(n, layer),
                     "a sharpen after a scale or a blur: it amplifies their one-level difference from FFmpeg's by 1 + 2|amount| and rounds up a level more with each further sharpen, past two levels",
@@ -1074,8 +1132,11 @@ impl RenderPlan {
             // clip, in every knob), so a full-range picture is not graded on the GPU
             // — and a picture whose format was never recorded is not known not to be
             // full-range.
-            if !layer.color.is_identity() && stream.maybe_full_range_in(self.canvas.policy) {
+            if self.graded(layer) && stream.maybe_full_range_in(self.canvas.policy) {
                 let detail = match stream.pix_fmt.as_deref() {
+                    Some(f) if stream.raw_full_range() => {
+                        format!("a picture flagged full range ({f}, color_range=pc), whose raw values FFmpeg grades before converting its range")
+                    }
                     Some(f) if stream.maybe_full_range() => {
                         format!("a full-range picture ({f}), which FFmpeg grades before converting its range")
                     }
@@ -1175,13 +1236,17 @@ impl RenderPlan {
             }
             // FFmpeg 9 keeps a full-range picture's raw values in the graph and converts the range at
             // the end: `fade` darkens them toward the limited-range black 16 first (frame 0 of a
-            // fade-in reads Y 30 where black is 16). FFmpeg 6 converts at the decode, as the compositor
-            // does. (An export frame is refused for the cut it is in, below.)
-            if self.mode == PlanMode::Still
-                && self.canvas.policy != CompositeColorPolicy::FixedBt601
-                && stream.maybe_full_range_in(self.canvas.policy)
-                && ops.iter().any(|o| o.factor < FADE_FULL)
-            {
+            // fade-in reads Y 30 where black is 16). FFmpeg 6 converts a `yuvj` picture at the decode, as
+            // the compositor does, but not a `yuv420p` flagged `pc`, whose format is already the
+            // overlay's: that one is refused under every policy, in an export frame as in a still. (Under
+            // FFmpeg 9 an export frame is refused for the cut it is in, below.)
+            let negotiated = self.canvas.policy != CompositeColorPolicy::FixedBt601;
+            let raw_kept = if self.mode == PlanMode::Still {
+                (negotiated && stream.maybe_full_range_in(self.canvas.policy)) || stream.raw_full_range()
+            } else {
+                !negotiated && stream.raw_full_range()
+            };
+            if raw_kept && ops.iter().any(|o| o.factor < FADE_FULL) {
                 out.push(Unsupported::FullRangeNegotiated(at()));
             }
             if self.through_rgba(layer) && ops.iter().any(|o| o.tint != FadeTint::Alpha && o.factor < FADE_FULL) {
@@ -1256,7 +1321,7 @@ impl RenderPlan {
         // holds a full-range picture is FFmpeg's.
         if policy != CompositeColorPolicy::FixedBt601 && self.layers.iter().any(|l| l.stream.maybe_full_range_in(policy)) {
             for (n, layer) in self.layers.iter().enumerate() {
-                if !layer.color.is_identity() && !layer.stream.maybe_full_range_in(policy) {
+                if self.graded(layer) && !layer.stream.maybe_full_range_in(policy) {
                     out.push(Unsupported::GradedInFullRangeStack(n));
                 }
             }
@@ -1269,6 +1334,15 @@ impl RenderPlan {
             index,
             name: layer.name.clone(),
         }
+    }
+
+    /// Whether the layer's chain has an `eq` that does something to the picture: a colour that is not the
+    /// identity, or in an export frame a **keyed** one, whose `eq` (`eval=frame`) is in the chain on every
+    /// frame of the clip, neutral numbers or not. A refusal about grading a picture (a full-range one,
+    /// whose range FFmpeg 9 converts after the `eq`) judges the clip, so that a keyed colour is not drawn
+    /// by one renderer on the frames its curve passes through neutral and by the other on the rest.
+    fn graded(&self, layer: &PlanLayer) -> bool {
+        !layer.color.is_identity() || (self.mode == PlanMode::Motion && layer.animated.is_some_and(|a| a.color))
     }
 
     /// Why a compositor that draws masks still does not draw this layer's: the mask is `geq`
@@ -1485,6 +1559,7 @@ mod tests {
             color_primaries: None,
             pix_fmt: Some("yuv420p".into()),
             color_space: None,
+            color_range: None,
             lead: 0.0,
         }
     }
@@ -2676,6 +2751,142 @@ mod tests {
         );
     }
 
+    /// A `yuv420p` flagged full range reaches the graph's filters raw on every FFmpeg (measured 6.1.1 and
+    /// 9.0.2), where the compositor's decode has converted it: so what reads the values is FFmpeg's, under
+    /// any policy. The same picture with no flag, a `tv` one, or a file probed before the flag was recorded
+    /// is drawn as it always was.
+    #[test]
+    fn a_yuv420p_flagged_full_range_is_refused_where_a_filter_reads_its_raw_samples() {
+        let caps = GpuCaps {
+            effects: EffectKinds::ALL,
+            mask: true,
+            fades: true,
+            ..GpuCaps::A0
+        };
+        let stream = |fmt: &str, range: Option<&str>| StreamInfo {
+            pix_fmt: Some(fmt.into()),
+            color_range: range.map(Into::into),
+            ..video(640, 360)
+        };
+        let why = |s: StreamInfo, policy: CompositeColorPolicy, edit: &dyn Fn(&mut Clip), t: f64| {
+            let plan = fading_plan_of(s, None, policy, |c| edit(c), t);
+            plan.reasons(&caps, plan.size(u32::MAX))
+        };
+        let key = || VideoEffect::ChromaKey {
+            color: "green".into(),
+            similarity: 0.15,
+            blend: 0.1,
+        };
+        let effect = |why: &[Unsupported], what: &str| {
+            why.iter()
+                .any(|u| matches!(u, Unsupported::Effects(_, w) if w.contains(what)))
+        };
+        let policies = [
+            CompositeColorPolicy::FixedBt601,
+            CompositeColorPolicy::BottomLayerTag,
+            CompositeColorPolicy::Unknown,
+        ];
+        for policy in policies {
+            let flagged = || stream("yuv420p", Some("pc"));
+            // Drawn plain: the still converts at the end, as the compositor does.
+            assert_eq!(why(flagged(), policy, &|_| {}, 0.5), vec![], "{policy:?}");
+            let vignette = why(flagged(), policy, &|c| c.effects = vec![VideoEffect::Vignette], 0.5);
+            assert!(effect(&vignette, "flagged full range"), "{policy:?}: {vignette:?}");
+            assert!(effect(&vignette, "vignette"), "{policy:?}: {vignette:?}");
+            let keyed = why(flagged(), policy, &|c| c.effects = vec![key()], 0.5);
+            assert!(effect(&keyed, "flagged full range"), "{policy:?}: {keyed:?}");
+            assert!(effect(&keyed, "chroma key"), "{policy:?}: {keyed:?}");
+            for table in [
+                VideoEffect::Invert,
+                VideoEffect::Blur { sigma: 3.0 },
+                VideoEffect::Sharpen { amount: 1.0 },
+            ] {
+                let tabled = why(flagged(), policy, &|c| c.effects = vec![table.clone()], 0.5);
+                assert!(effect(&tabled, "full-range"), "{policy:?} {table:?}: {tabled:?}");
+            }
+            let graded = why(flagged(), policy, &|c| c.color.gamma = 1.4, 0.5);
+            assert!(
+                matches!(graded.as_slice(), [Unsupported::GradedFullRange(_, d)] if d.contains("color_range=pc")),
+                "{policy:?}: {graded:?}"
+            );
+            // Inside a running fade, under FFmpeg 6 as well (nothing converts its range ahead of `fade`);
+            // drawn once the fade is over.
+            let fading = why(flagged(), policy, &|c| c.fade_in = 1.0, 0.5);
+            assert!(
+                matches!(fading.as_slice(), [Unsupported::FullRangeNegotiated(_)]),
+                "{policy:?}: {fading:?}"
+            );
+            assert_eq!(why(flagged(), policy, &|c| c.fade_in = 1.0, 5.0), vec![], "{policy:?}");
+            // Not flagged, flagged limited, or probed before the flag: drawn as before.
+            for range in [None, Some("tv")] {
+                let tagged = || stream("yuv420p", range);
+                assert_eq!(
+                    why(tagged(), policy, &|c| c.effects = vec![VideoEffect::Vignette], 0.5),
+                    vec![],
+                    "{policy:?} {range:?}"
+                );
+                assert_eq!(
+                    why(tagged(), policy, &|c| c.effects = vec![key()], 0.5),
+                    vec![],
+                    "{policy:?} {range:?}"
+                );
+                assert_eq!(
+                    why(tagged(), policy, &|c| c.color.gamma = 1.4, 0.5),
+                    vec![],
+                    "{policy:?} {range:?}"
+                );
+                assert_eq!(
+                    why(tagged(), policy, &|c| c.fade_in = 1.0, 0.5),
+                    vec![],
+                    "{policy:?} {range:?}"
+                );
+            }
+        }
+        // A `yuvj` picture is converted at the decode by FFmpeg 6 and fades as drawn there: its flag
+        // (ffprobe prints `pc` for it too) adds nothing.
+        let jpeg = || stream("yuvj420p", Some("pc"));
+        assert_eq!(
+            why(jpeg(), CompositeColorPolicy::FixedBt601, &|c| c.fade_in = 1.0, 0.5),
+            vec![]
+        );
+        // Another format flagged `pc` is converted ahead of the graph by FFmpeg 6 (10-bit measured exact) and
+        // handled raw by FFmpeg 9, which is told by the flag now rather than guessed from the depth.
+        for fmt in ["yuv420p10le", "yuv422p", "yuv444p"] {
+            let graded = |range: Option<&str>, policy| why(stream(fmt, range), policy, &|c| c.color.gamma = 1.4, 0.5);
+            assert_eq!(graded(Some("pc"), CompositeColorPolicy::FixedBt601), vec![], "{fmt}");
+            assert!(
+                matches!(
+                    graded(Some("pc"), CompositeColorPolicy::BottomLayerTag).as_slice(),
+                    [Unsupported::GradedFullRange(..)]
+                ),
+                "{fmt}"
+            );
+        }
+        // RGB and gray pictures read `pc` from ffprobe on every FFmpeg (nothing limited to be told from): no flag, so a
+        // PNG or a gray clip is drawn, graded and in a cut, as before.
+        for fmt in ["rgb24", "bgr0", "gbrp", "gray", "gray10le"] {
+            for policy in policies {
+                let graded = why(stream(fmt, Some("pc")), policy, &|c| c.color.gamma = 1.4, 0.5);
+                let same = why(stream(fmt, None), policy, &|c| c.color.gamma = 1.4, 0.5);
+                assert_eq!(graded, same, "{fmt} {policy:?}: a `pc` word on {fmt} changes nothing");
+            }
+        }
+        // The depth heuristic stays for a file that does not say: deeper than 8 bits may be full range
+        // where FFmpeg 9 keeps a tag's raw values, tagged limited or not.
+        for range in [None, Some("tv")] {
+            let graded = why(
+                stream("yuv420p10le", range),
+                CompositeColorPolicy::BottomLayerTag,
+                &|c| c.color.gamma = 1.4,
+                0.5,
+            );
+            assert!(
+                matches!(graded.as_slice(), [Unsupported::GradedFullRange(..)]),
+                "{range:?}: {graded:?}"
+            );
+        }
+    }
+
     #[test]
     fn a_chroma_key_is_drawn_only_on_the_chroma_ffmpeg_keys() {
         let caps = GpuCaps {
@@ -2892,6 +3103,147 @@ mod tests {
         // (a blur still counts ahead of a zoom: the sharpen after it is of a blurred picture)
         let why = reasons(&zooming(vec![blur(), sharp(1.0)]), u32::MAX);
         assert!(refused(&why), "{why:?}");
+    }
+
+    #[test]
+    fn a_grade_whose_tables_amplify_the_scalers_level_past_two_is_refused_on_a_layer_it_resizes() {
+        use crate::model::Keyframe;
+        let caps = GpuCaps {
+            effects: EffectKinds::SHARPEN.union(EffectKinds::BLUR).union(EffectKinds::INVERT),
+            keyed_zoom: true,
+            ..GpuCaps::A0
+        };
+        let grade = |brightness: f64, contrast: f64, saturation: f64, gamma: f64, temperature: f64| Color {
+            brightness,
+            contrast,
+            saturation,
+            gamma,
+            temperature,
+        };
+        let steepest = |why: &[Unsupported]| {
+            why.iter().find_map(|u| match u {
+                Unsupported::GradeSteep(_, n) => Some(*n),
+                _ => None,
+            })
+        };
+        let pip = |color: Color| {
+            move |c: &mut Clip| {
+                c.transform.scale = 0.6;
+                c.color = color;
+            }
+        };
+        let why_of = |edit: &dyn Fn(&mut Clip), width: u32| {
+            let plan = fading_plan(|c| edit(c), 0.5);
+            plan.reasons(&caps, plan.size(width))
+        };
+        // Up to a step of two between neighbouring table entries the scaler's level is two at worst, which is what a
+        // scaled blur is held to; past it the frame is FFmpeg's, and the reason says how steep. (The boundary: contrast
+        // 2 steps by exactly 2, 2.05 by 3; the chroma tables' contrast is the saturation, and a temperature is a power
+        // of the chroma toward 1.)
+        for (name, color, step) in [
+            ("identity", Color::default(), None),
+            ("brightness alone", grade(0.3, 1.0, 1.0, 1.0, 0.0), None),
+            ("the montage's grade", grade(0.0, 1.1, 1.2, 1.0, 0.0), None),
+            ("contrast 2", grade(0.0, 2.0, 1.0, 1.0, 0.0), None),
+            ("contrast 2.05", grade(0.0, 2.05, 1.0, 1.0, 0.0), Some(3)),
+            ("contrast 4", grade(0.0, 4.0, 1.0, 1.0, 0.0), Some(4)),
+            ("saturation 2", grade(0.0, 1.0, 2.0, 1.0, 0.0), None),
+            ("saturation 2.05", grade(0.0, 1.0, 2.05, 1.0, 0.0), Some(3)),
+            ("saturation 3", grade(0.0, 1.0, 3.0, 1.0, 0.0), Some(3)),
+            ("temperature 1", grade(0.0, 1.0, 1.0, 1.0, 1.0), None),
+            ("temperature 1 and saturation 2", grade(0.0, 1.0, 2.0, 1.0, 1.0), Some(3)),
+            // The dark end: a table that leaves 0 for its first entry steps from nothing to a power of one
+            // sample, in the luma when the contrast or a negative brightness parks the black point above
+            // the bottom of the range, and a brightness that lifts it clear of the table has no such step.
+            ("gamma 1.2", grade(0.0, 1.0, 1.0, 1.2, 0.0), None),
+            ("contrast 1.8 and gamma 1.2", grade(0.0, 1.8, 1.0, 1.2, 0.0), Some(4)),
+            ("brightness -0.3 and gamma 1.2", grade(-0.3, 1.0, 1.0, 1.2, 0.0), None),
+            ("brightness -0.3 and gamma 1.5", grade(-0.3, 1.0, 1.0, 1.5, 0.0), Some(4)),
+            ("brightness -0.2 and gamma 2", grade(-0.2, 1.0, 1.0, 2.0, 0.0), Some(16)),
+            ("contrast 1.8 and gamma 2", grade(0.0, 1.8, 1.0, 2.0, 0.0), Some(12)),
+            ("brightness 0.3 and gamma 2", grade(0.3, 1.0, 1.0, 2.0, 0.0), None),
+            ("the far end of every range", grade(0.3, 1.8, 2.0, 2.0, 1.0), Some(19)),
+        ] {
+            let why = why_of(&pip(color), u32::MAX);
+            let got = steepest(&why);
+            assert_eq!(got, step, "{name}: {why:?}");
+            assert_eq!(why.len(), usize::from(step.is_some()), "{name}: {why:?}");
+            if let Some(step) = step {
+                assert!(
+                    why[0].to_string().contains(&format!("step {step} levels")),
+                    "{name}: {}",
+                    why[0]
+                );
+                assert_eq!(why[0].kind(), "grade_steep");
+            }
+            // At the picture's own size nothing is resized, the tables are exact, and any grade is drawn.
+            let why = why_of(&|c| c.color = color, u32::MAX);
+            assert!(why.is_empty(), "{name} unscaled: {why:?}");
+        }
+        // The scaler is what feeds the tables: rendered smaller, the fit scale is a real one; a Cover or Contain fit
+        // into another frame is too; and a crop alone is not.
+        let steep = grade(0.0, 1.8, 1.0, 2.0, 0.0);
+        let why = why_of(&|c| c.color = steep, 480);
+        assert!(steepest(&why).is_some(), "{why:?}");
+        let why = why_of(
+            &|c| {
+                c.color = steep;
+                c.transform.crop_left = 0.1;
+            },
+            u32::MAX,
+        );
+        assert!(why.is_empty(), "a crop leaves the size: {why:?}");
+        let plan = fading_plan_of(
+            video(360, 640),
+            Some(Delivery::new(640, 360, Fit::Contain)),
+            CompositeColorPolicy::FixedBt601,
+            |c| c.color = steep,
+            0.5,
+        );
+        assert!(steepest(&plan.reasons(&caps, plan.size(u32::MAX))).is_some(), "letterboxed");
+        // A moving zoom comes last: only the fit scale is ahead of the `eq`.
+        let zooming = |color: Color| {
+            move |c: &mut Clip| {
+                let key = |time: f64, scale: f64| Keyframe {
+                    time,
+                    scale,
+                    pos_x: 0.0,
+                    pos_y: 0.0,
+                    rotation: 0.0,
+                    opacity: 1.0,
+                    easing: Default::default(),
+                };
+                c.keyframes = vec![key(0.0, 1.0), key(4.0, 1.5)];
+                c.color = color;
+            }
+        };
+        let why = why_of(&zooming(steep), u32::MAX);
+        assert!(
+            why.is_empty(),
+            "the grade runs at the fit size, which is the picture's: {why:?}"
+        );
+        let why = why_of(&zooming(steep), 480);
+        assert!(steepest(&why).is_some(), "{why:?}");
+        // The grade's step is where a sharpen after it starts from (it is luma only): a luma step of two
+        // plus any sharpen is past two levels, a step of one is the plain scaler's.
+        let sharpened = |color: Color, amount: f64| {
+            let why = why_of(
+                &|c| {
+                    pip(color)(c);
+                    c.effects = vec![VideoEffect::Sharpen { amount }];
+                },
+                u32::MAX,
+            );
+            why.is_empty()
+        };
+        assert!(sharpened(grade(0.2, 1.0, 1.0, 1.0, 0.0), 0.5));
+        assert!(!sharpened(grade(0.2, 1.0, 1.0, 1.0, 0.0), 0.6));
+        assert!(
+            sharpened(grade(0.0, 1.0, 1.0, 1.0, 1.0), 0.5),
+            "a chroma step is not the luma's"
+        );
+        assert!(!sharpened(grade(0.0, 1.1, 1.0, 1.0, 0.0), 0.1));
+        assert!(!sharpened(grade(0.0, 1.1, 1.0, 1.0, 0.0), 0.5));
     }
 
     #[test]

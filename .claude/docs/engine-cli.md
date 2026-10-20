@@ -899,6 +899,9 @@ so the feature is **only** activated through these forwards — which is what ma
   under a moving zoom, beside a static grade and in a range export
   (`engine/cli/keyed_channels.rs`, `#[ignore]`d; without `eval=frame` it fails at the second frame). A test
   picture's luma must sit away from 128 or a `contrast` ramp does nothing visible (it pivots there).
+  `keyed_color_value(clip, T)` is the same expressions evaluated in Rust (each keyed number through `keyframe_value`, the
+  temperature's `gamma_r` / `gamma_b` as `1 + 0.3 t` / `1 - 0.3 t`): the Motion plan carries it as the layer's colour, and
+  the GPU compositor builds `eq`'s tables from it every frame (`gpu.md`, byte for byte on 6.1.1 and 9.0.2).
   **A keyed mask** is the mask's own alpha `geq` (`keyed_mask_alpha`): the same distance and feather ramp as
   `mask_keep_expr`, but each keyed number's curve (over `geq`'s `T`) is evaluated **once a row** — at `X` 0 it is
   stored with `st(slot,…)` (slots 0–4 in `Property::MASK` order, a keyed opacity beside it in 5) and every other
@@ -1248,7 +1251,15 @@ so the feature is **only** activated through these forwards — which is what ma
   tag on an FFmpeg old enough to lack it) therefore reports the **displayed**
   size in `StreamInfo.width/height` — what `export_format`, fit/crop, smart crop
   and the bin's spec line all do their geometry against — and keeps the angle in
-  `StreamInfo.rotation`. `fps` goes through `nominal_fps`: `r_frame_rate` on a
+  `StreamInfo.rotation`. *Range*: `StreamInfo.color_range` records the sample range the file
+  declares, `pc` (full) or `tv` (limited), from ffprobe's `color_range` (`range_tag`; `unknown`,
+  nothing and anything else read as `None`; the libav probe's `range_name` agrees) for a video
+  stream. A VP9 / HEVC / AV1 file flagged full range is plain `yuv420p` to `pix_fmt`, which is why the
+  flag is recorded (`render_plan.rs` refuses the picture on it, `core-render-plan.md`). It is stored as
+  ffprobe says it, so an RGB picture (a PNG) and a gray one read `pc` too, on every FFmpeg: the plan reads the
+  flag on YCbCr formats only. Schema v10 added
+  it, so an asset stored before has `None`, which is "not known" and is judged by its name as it
+  always was; relinking replaces an asset's streams and records it. `fps` goes through `nominal_fps`: `r_frame_rate` on a
   jittery variable-frame-rate clip can be a multiple of the real rate (a ~30 fps
   clip probing as 120), so past 1.5x the average the average, snapped to a
   standard rate, is used instead. *HDR*: `StreamInfo.color_transfer` /

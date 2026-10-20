@@ -70,6 +70,7 @@ fn source(dir: &Path, w: u32, h: u32) -> Asset {
             // second one that looks for transparency).
             pix_fmt: Some("yuv420p".into()),
             color_space: None,
+            color_range: None,
             lead: 0.0,
         }],
         imported_at: Utc::now(),
@@ -561,6 +562,20 @@ fn bench_a_mask_a_blur_and_a_moving_zoom() {
                     Property::Opacity,
                     vec![PropertyKey::new(0.0, 1.0), PropertyKey::new(2.0, 0.3)],
                 );
+            }),
+        ),
+        (
+            "keyed colour, all five",
+            Box::new(|c| {
+                for (prop, from, to) in [
+                    (Property::Brightness, -0.2, 0.2),
+                    (Property::Contrast, 0.8, 1.4),
+                    (Property::Saturation, 0.6, 1.5),
+                    (Property::Gamma, 0.8, 1.3),
+                    (Property::Temperature, -0.6, 0.6),
+                ] {
+                    c.set_property_keys(prop, vec![PropertyKey::new(0.0, from), PropertyKey::new(2.0, to)]);
+                }
             }),
         ),
         (
