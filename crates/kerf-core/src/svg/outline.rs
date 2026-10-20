@@ -70,7 +70,10 @@ const MIN_GLYPH_BYTES: usize = 24;
 const MIN_UNIT_BYTES: usize = 40;
 /// Most units (characters, words or lines) of one text an animation is compiled for.
 const MAX_UNITS: usize = 600;
-/// Most amounts a document's animations are sampled at in all (a unit a grid of 120 a second): about a tenth of a second.
+/// Most amounts a document's animations are sampled at in all (a unit takes a grid of 120 a second, up to 7,201):
+/// 416 units of the longest animation. Sampling a unit and cutting it down to its points takes about 1.5 ms of a
+/// release build at 7,201 points (a 30 a second wiggle, the dearest signal to cut down), so a document at the cap
+/// takes about 0.6 s; the title's size cap usually ends it long before.
 const MAX_WORK: usize = 3_000_000;
 
 /// What setting a document's text as outlines did.
@@ -2437,6 +2440,24 @@ three</text>"##,
         let mut other = text_animation_preset("wiggle").unwrap().animation;
         other.wiggle.as_mut().unwrap().seed = 8;
         assert_ne!(outline(&animated_with("Wiggle", &other)).svg, out.svg);
+    }
+
+    #[test]
+    fn a_long_or_fast_wiggle_moves_every_letter_and_still_comes_to_rest() {
+        let mut a = text_animation_preset("wiggle").unwrap().animation;
+        a.duration = 30.0;
+        a.wiggle.as_mut().unwrap().rate = 20.0;
+        let src = animated_with("Wiggle", &a);
+        let out = outline(&src);
+        assert_eq!(out.count, 1, "{:?}", out.kept);
+        let parsed = SvgDoc::parse(&out.svg).unwrap();
+        assert!(parsed.warnings().is_empty(), "{:?}", parsed.warnings());
+        assert_eq!(out.svg.matches("type=\"translate\"").count(), 6, "an animation a letter");
+        assert_eq!(out.svg.matches("type=\"rotate\"").count(), 6, "an animation a letter");
+        let rest = pixels(&SvgDoc::parse(&outline(&at_rest(&src)).svg).unwrap().at(0.0));
+        assert_eq!(ink(&parsed, 0.0), rest, "it starts at rest");
+        assert_eq!(ink(&parsed, 30.0), rest, "and settles");
+        assert_ne!(ink(&parsed, 12.3), rest, "in between it is off");
     }
 
     #[test]

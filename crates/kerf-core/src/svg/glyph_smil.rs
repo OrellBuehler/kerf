@@ -4,9 +4,15 @@
 //! **Sampled, then simplified.** A unit's amount is a function of time (the window slides, the noise moves),
 //! so it is evaluated on a fine grid (1/120 s) and reduced to the few points a straight-line animation needs
 //! (Ramer-Douglas-Peucker on the deviation from the chord, in units of how far each property may be off: a
-//! a third of a pixel of movement at a 90 px font (0.4 % of an em), a fifth of a degree, 0.4 % of scale or opacity (a level of 8-bit)). A hard edge
-//! (a `square` window) stays a step one grid cell wide; a held stretch is one segment. Every property of a
-//! unit shares those points, so one `keyTimes` list serves them all.
+//! third of a pixel of movement at a 90 px font (0.4 % of an em), a fifth of a degree, 0.4 % of scale or opacity
+//! (a level of 8-bit)). A hard edge (a `square` window) stays a step one cell wide; a held stretch is one segment.
+//! Every property of a unit shares those points, so one `keyTimes` list serves them all.
+//!
+//! **At most [`MAX_KEYS`] points, one pass.** The segment that is furthest off its chord is split first, and the
+//! splitting stops when every segment is within its tolerance or the points run out. A signal that is simple
+//! enough ends by the first rule, with exactly the points plain Ramer-Douglas-Peucker keeps. A noisy one (a fast or
+//! long wiggle) ends by the second: it keeps the 96 points that cut its worst errors, never a looser tolerance,
+//! so it still moves, at a lower pace than the noise has.
 //!
 //! **What a unit becomes**: a `<g>` that carries the unit's glyph paths and its animation, in this order of
 //! transforms (`additive="sum"`): translate, rotate, scale. Rotation and scale turn about the unit's centre, so
@@ -16,7 +22,7 @@
 //! not change over the animation is written as an attribute, not an animation; a unit that is never touched
 //! gets no group.
 
-use std::collections::HashSet;
+use std::collections::{BinaryHeap, HashSet};
 
 use super::text_animation::{AnimateBy, Easing, Shape, TextAnimation, Wiggle};
 
@@ -163,36 +169,80 @@ struct Sample {
     v: [f64; N],
 }
 
-/// Simplify `samples` to points a straight line between them stays within `tol` (per component) of, keeping
-/// the first and the last. Iterative, so a long grid cannot overflow the stack.
-fn simplify(samples: &[Sample], tol: &[f64; N], active: &[bool; N], scale: f64) -> Vec<usize> {
+/// A stretch of the samples, `lo..=hi`, and the sample inside it furthest off the chord between its ends
+/// (`dev` of the tolerance, so 1 is just within it).
+struct Stretch {
+    dev: f64,
+    at: usize,
+    lo: usize,
+    hi: usize,
+}
+
+impl Stretch {
+    fn of(samples: &[Sample], tol: &[f64; N], channels: &[usize], lo: usize, hi: usize) -> Self {
+        let (a, b) = (&samples[lo], &samples[hi]);
+        let span = b.t - a.t;
+        let (mut dev, mut at) = (0.0f64, lo);
+        for (i, sample) in samples.iter().enumerate().take(hi).skip(lo + 1) {
+            let f = (sample.t - a.t) / span;
+            let mut off = 0.0f64;
+            for &c in channels {
+                let line = a.v[c] + (b.v[c] - a.v[c]) * f;
+                off = off.max((sample.v[c] - line).abs() / tol[c]);
+            }
+            if off > dev {
+                (dev, at) = (off, i);
+            }
+        }
+        Stretch { dev, at, lo, hi }
+    }
+}
+
+impl PartialEq for Stretch {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for Stretch {}
+
+impl PartialOrd for Stretch {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Stretch {
+    /// The worst first; of equals, the earlier.
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.dev.total_cmp(&other.dev).then(other.lo.cmp(&self.lo))
+    }
+}
+
+/// Simplify `samples` to at most `max` points a straight line between them stays within `tol` (per component) of
+/// where it can, keeping the first and the last: the stretch furthest off its chord is split first, and it stops
+/// when none is more than `tol` off or `max` points are kept. Each stretch is read once when it is made, so the
+/// work is a few passes over the grid whatever the signal does.
+fn simplify(samples: &[Sample], tol: &[f64; N], active: &[bool; N], max: usize) -> Vec<usize> {
     let n = samples.len();
+    let channels: Vec<usize> = (0..N).filter(|c| active[*c]).collect();
     let mut keep = vec![false; n];
     keep[0] = true;
     keep[n - 1] = true;
-    let mut stack = vec![(0usize, n - 1)];
-    while let Some((lo, hi)) = stack.pop() {
-        if hi <= lo + 1 {
-            continue;
+    let mut kept = 2;
+    let mut open = BinaryHeap::new();
+    open.push(Stretch::of(samples, tol, &channels, 0, n - 1));
+    while kept < max {
+        let Some(worst) = open.pop() else { break };
+        if worst.dev <= 1.0 {
+            break;
         }
-        let (a, b) = (&samples[lo], &samples[hi]);
-        let span = b.t - a.t;
-        let (mut worst, mut at) = (0.0f64, lo);
-        for (i, sample) in samples.iter().enumerate().take(hi).skip(lo + 1) {
-            let f = (sample.t - a.t) / span;
-            let mut dev = 0.0f64;
-            for c in (0..N).filter(|c| active[*c]) {
-                let line = a.v[c] + (b.v[c] - a.v[c]) * f;
-                dev = dev.max((sample.v[c] - line).abs() / (tol[c] * scale));
+        keep[worst.at] = true;
+        kept += 1;
+        for (lo, hi) in [(worst.lo, worst.at), (worst.at, worst.hi)] {
+            if hi > lo + 1 {
+                open.push(Stretch::of(samples, tol, &channels, lo, hi));
             }
-            if dev > worst {
-                (worst, at) = (dev, i);
-            }
-        }
-        if worst > 1.0 {
-            keep[at] = true;
-            stack.push((lo, at));
-            stack.push((at, hi));
         }
     }
     (0..n).filter(|i| keep[*i]).collect()
@@ -234,45 +284,37 @@ pub(crate) fn wrap(a: &TextAnimation, unit: usize, count: usize, geom: &UnitGeom
     let end = a.end();
     let size = f64::from(geom.size);
     let grid = grid_points(a) - 1;
-    let amounts: Vec<(f64, f64)> = (0..=grid)
-        .map(|i| {
-            let t = end * i as f64 / grid as f64;
-            (t, amount_at(a, unit, count, t))
-        })
-        .collect();
-    if amounts.iter().all(|(_, m)| m.abs() < 1e-9) {
-        return None;
-    }
     let p = &a.properties;
     let active = [p.moves(), p.moves(), p.turns(), p.scales(), p.fades(), p.blurs()];
     let tol = [0.004 * size, 0.004 * size, 0.2, 0.004, 0.004, 0.004 * size];
-    let samples: Vec<Sample> = amounts
-        .iter()
-        .map(|&(t, m)| Sample {
-            t,
-            v: [
-                p.x * m * size,
-                p.y * m * size,
-                p.rotation * m,
-                (1.0 + (p.scale - 1.0) * m).max(MIN_SCALE),
-                (1.0 + (p.opacity - 1.0) * m).clamp(0.0, 1.0),
-                (p.blur * m).max(0.0) * size,
-            ],
+    let mut touched = false;
+    let samples: Vec<Sample> = (0..=grid)
+        .map(|i| {
+            let t = end * i as f64 / grid as f64;
+            let m = amount_at(a, unit, count, t);
+            touched |= m.abs() >= 1e-9;
+            Sample {
+                t,
+                v: [
+                    p.x * m * size,
+                    p.y * m * size,
+                    p.rotation * m,
+                    (1.0 + (p.scale - 1.0) * m).max(MIN_SCALE),
+                    (1.0 + (p.opacity - 1.0) * m).clamp(0.0, 1.0),
+                    (p.blur * m).max(0.0) * size,
+                ],
+            }
         })
         .collect();
-    let mut loosen = 1.0;
-    let keys = loop {
-        let keys = simplify(&samples, &tol, &active, loosen);
-        if keys.len() <= MAX_KEYS {
-            break keys;
-        }
-        loosen *= 1.6;
-    };
+    if !touched {
+        return None;
+    }
+    let keys = simplify(&samples, &tol, &active, MAX_KEYS);
     let at = |c: usize| keys.iter().map(|&k| samples[k].v[c]).collect::<Vec<f64>>();
     // A component varies when some point is further from the first than it may be off.
     let varies = |cs: &[usize]| {
         cs.iter()
-            .any(|&c| active[c] && at(c).iter().any(|v| (v - samples[keys[0]].v[c]).abs() > tol[c] * loosen))
+            .any(|&c| active[c] && at(c).iter().any(|v| (v - samples[keys[0]].v[c]).abs() > tol[c]))
     };
     let first = |c: usize| samples[keys[0]].v[c];
     let dur = fmt(end, 4);
@@ -653,6 +695,133 @@ mod tests {
         );
         let (_, n) = units_of("   ", AnimateBy::Character);
         assert_eq!(n, 0);
+    }
+
+    /// A wiggle of the preset's properties, `rate` a second for `duration` seconds.
+    fn wiggling(rate: f64, duration: f64) -> TextAnimation {
+        let mut a = text_animation_preset("wiggle").unwrap().animation;
+        a.duration = duration;
+        a.wiggle = Some(Wiggle {
+            rate,
+            ..a.wiggle.unwrap()
+        });
+        a
+    }
+
+    /// The `(keyTimes, values)` of the first `animateTransform` of `kind` in `open`, one number a point for
+    /// `rotate` and the x of `translate`.
+    fn polyline(open: &str, kind: &str) -> (Vec<f64>, Vec<f64>) {
+        let tag = open
+            .split("<animateTransform")
+            .skip(1)
+            .find(|t| t.contains(&format!("type=\"{kind}\"")))
+            .unwrap();
+        let attr = |name: &str| {
+            tag.split(&format!("{name}=\""))
+                .nth(1)
+                .unwrap()
+                .split('"')
+                .next()
+                .unwrap()
+                .to_string()
+        };
+        let times = attr("keyTimes").split(';').map(|v| v.parse().unwrap()).collect();
+        let values = attr("values")
+            .split(';')
+            .map(|v| v.split(' ').next().unwrap().parse().unwrap())
+            .collect();
+        (times, values)
+    }
+
+    fn at_time(times: &[f64], values: &[f64], q: f64) -> f64 {
+        let i = times.iter().rposition(|t| *t <= q).unwrap().min(times.len() - 2);
+        let f = (q - times[i]) / (times[i + 1] - times[i]);
+        values[i] + (values[i + 1] - values[i]) * f
+    }
+
+    #[test]
+    fn a_long_or_fast_wiggle_still_moves_every_unit_and_follows_the_noise() {
+        // Past what 96 points can draw exactly: 180 and 300 new values, and 900 of them.
+        for (rate, duration) in [(6.0, 30.0), (8.0, 30.0), (30.0, 10.0), (30.0, 30.0), (12.0, 20.0)] {
+            let a = wiggling(rate, duration);
+            let (taken, next) = ids();
+            let mut src = IdSource { taken: &taken, next };
+            for unit in 0..12 {
+                let w = wrap(&a, unit, 12, &geom(), &mut src).unwrap();
+                assert_eq!(w.animations, 2, "rate {rate} for {duration} s, unit {unit}: {}", w.open);
+                let (times, rotation) = polyline(&w.open, "rotate");
+                assert!(times.len() <= MAX_KEYS, "{}", times.len());
+                assert_eq!((times[0], times[times.len() - 1]), (0.0, 1.0));
+                // What it draws is the noise at the points it kept: it swings as far as the noise does, and
+                // never further, and sits on it at each of them.
+                let signal: Vec<f64> = (0..=(a.end() * 120.0) as usize)
+                    .map(|i| a.properties.rotation * amount_at(&a, unit, 12, i as f64 / 120.0))
+                    .collect();
+                let reach = |v: &[f64]| v.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+                let (want, got) = (reach(&signal), reach(&rotation));
+                assert!(
+                    got > 0.8 * want && got <= want + 0.01,
+                    "rate {rate} for {duration} s, unit {unit}: swings {got} of {want}"
+                );
+                for (q, v) in times.iter().zip(&rotation) {
+                    // (The times are written to four places: the nearest grid point is the one meant.)
+                    let t = (q * a.end() * 120.0).round() / 120.0;
+                    let truth = a.properties.rotation * amount_at(&a, unit, 12, t);
+                    assert!((v - truth).abs() < 0.01, "at {q}: {v} vs {truth}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_wiggle_within_the_points_it_may_have_stays_within_the_tolerance() {
+        // 18 new values over 3 seconds: all the points it needs fit, so nothing is loosened.
+        let a = wiggling(6.0, 3.0);
+        let (taken, next) = ids();
+        let mut src = IdSource { taken: &taken, next };
+        for unit in 0..6 {
+            let w = wrap(&a, unit, 6, &geom(), &mut src).unwrap();
+            let (times, rotation) = polyline(&w.open, "rotate");
+            assert!(times.len() < MAX_KEYS, "{}", times.len());
+            for i in 0..=360 {
+                let t = f64::from(i) / 120.0;
+                let drawn = at_time(&times, &rotation, t / a.end());
+                let truth = a.properties.rotation * amount_at(&a, unit, 6, t);
+                assert!((drawn - truth).abs() <= 0.2 + 0.01, "unit {unit} at {t}: {drawn} vs {truth}");
+            }
+        }
+    }
+
+    #[test]
+    fn simplifying_keeps_the_points_that_cut_the_worst_error_within_the_budget() {
+        let tol = [1.0; N];
+        let mut active = [false; N];
+        active[0] = true;
+        let samples = |f: &dyn Fn(f64) -> f64| -> Vec<Sample> {
+            (0..=7_200)
+                .map(|i| {
+                    let t = f64::from(i) / 120.0;
+                    let mut v = [0.0; N];
+                    v[0] = f(t);
+                    Sample { t, v }
+                })
+                .collect()
+        };
+        // A straight line is its two ends; a triangle wave needs a point at each corner.
+        assert_eq!(simplify(&samples(&|t| 3.0 * t), &tol, &active, MAX_KEYS), vec![0, 7_200]);
+        let tri = |t: f64| 50.0 * (1.0 - (2.0 * (t / 10.0 - (t / 10.0).floor()) - 1.0).abs());
+        let corners = simplify(&samples(&tri), &tol, &active, MAX_KEYS);
+        assert_eq!(corners.len(), 2 * 6 + 1, "{corners:?}");
+        // Noise no 96 points follow keeps 96, the ends among them, and is the same every time.
+        let noise = |t: f64| 40.0 * (hash01(1, 0, (t * 30.0) as i64) - 0.5);
+        let noisy = simplify(&samples(&noise), &tol, &active, MAX_KEYS);
+        assert_eq!(noisy.len(), MAX_KEYS);
+        assert_eq!((noisy[0], noisy[MAX_KEYS - 1]), (0, 7_200));
+        assert_eq!(noisy, simplify(&samples(&noise), &tol, &active, MAX_KEYS));
+        // A smaller budget keeps a prefix of the order in which points were chosen: its points are among these.
+        let fewer = simplify(&samples(&noise), &tol, &active, 24);
+        assert_eq!(fewer.len(), 24);
+        assert!(fewer.iter().all(|i| noisy.contains(i)));
     }
 
     /// The group a unit gets, read back as an SVG document: the animations are ones the reader keeps, and what
