@@ -703,6 +703,63 @@ export interface TextBox {
 	fit: TextFit;
 }
 
+/** What a text animation's selectors count (`AnimateBy`). */
+export type AnimateBy = 'character' | 'word' | 'line';
+
+/** The pace of the window's slide (`Easing`). */
+export type AnimationEasing = 'linear' | 'ease_in' | 'ease_out' | 'ease_in_out';
+
+/** The amount inside the window (`Shape`). */
+export type AnimationShape = 'square' | 'ramp_up' | 'ramp_down' | 'triangle' | 'round' | 'smooth';
+
+/** A window of the text and how it slides (`RangeSelector`): fractions of the text, the offset from the animation's
+ *  start to its end. */
+export interface AnimationRange {
+	start: number;
+	end: number;
+	offset: { from: number; to: number };
+	shape: AnimationShape;
+}
+
+/** Seeded noise that multiplies the range's amount (`Wiggle`). */
+export interface AnimationWiggle {
+	rate: number;
+	min: number;
+	max: number;
+	correlation: number;
+	seed: number;
+}
+
+/** What a unit does at an amount of 1 (`Properties`): x / y / blur in em, rotation in degrees. */
+export interface AnimationProperties {
+	x: number;
+	y: number;
+	scale: number;
+	rotation: number;
+	opacity: number;
+	blur: number;
+}
+
+/** A text's animation (`TextAnimation`), written on its `<text>` as `data-kerf-animate` and compiled to per-glyph SMIL
+ *  when the text is glyph outlines. */
+export interface TextAnimation {
+	by: AnimateBy;
+	delay: number;
+	duration: number;
+	easing: AnimationEasing;
+	range: AnimationRange;
+	wiggle: AnimationWiggle | null;
+	properties: AnimationProperties;
+}
+
+/** A ready-made animation (`TextAnimationPreset`): choosing one copies `animation` onto the text. */
+export interface TextAnimationPreset {
+	id: string;
+	name: string;
+	description: string;
+	animation: TextAnimation;
+}
+
 /** How a title's text is drawn (`TitleTextForm`): as glyph outlines, or with its fonts. */
 export type TitleTextForm = 'outlines' | 'text';
 

@@ -2,11 +2,15 @@ import { describe, expect, test } from 'bun:test';
 import {
 	boxWidthRefusal,
 	convertTitleTextIn,
+	HARNESS_ANIMATION_NOTE,
 	HARNESS_NOTE,
+	setTitleTextAnimationIn,
 	setTitleTextBoxIn,
 	titleTexts,
+	withTextAnimation,
 	withTextBox
 } from './title-text';
+import { TEXT_ANIMATION_PRESETS } from './text-animation';
 import type { SvgOverlay, Timeline } from './types';
 
 const doc = (body: string) => `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 200">${body}</svg>`;
@@ -22,7 +26,7 @@ describe('a text box', () => {
 		);
 		const shrunk = withTextBox(wrapped, 't', { width: 300, fit: 'shrink' });
 		expect(shrunk).toContain('style="inline-size:300px !important;fill:red;opacity:.5" data-kerf-fit="shrink">Hi');
-		expect(titleTexts(shrunk)).toEqual([{ id: 't', outlined: false, box: { width: 300, fit: 'shrink' } }]);
+		expect(titleTexts(shrunk)).toEqual([{ id: 't', outlined: false, box: { width: 300, fit: 'shrink' }, animation: null }]);
 		const none = withTextBox(shrunk, 't', { width: null, fit: 'shrink' });
 		expect(none).toBe(doc('<text id="t" x="5" y="50" style="fill:red;opacity:.5">Hi</text>'));
 		const empty = withTextBox(doc('<text id="t" x="5" y="50"/>'), 't', { width: 10, fit: 'wrap' });
@@ -63,9 +67,9 @@ describe('a text box', () => {
 			'<text id="a" style="inline-size: 50px">a</text><text>no id</text><g data-kerf-text="" id="b" inline-size="9">b</g><s:text xmlns:s="http://www.w3.org/2000/svg" id="c">c</s:text>'
 		);
 		expect(titleTexts(src)).toEqual([
-			{ id: 'a', outlined: false, box: { width: 50, fit: 'wrap' } },
-			{ id: 'b', outlined: true, box: { width: 9, fit: 'wrap' } },
-			{ id: 'c', outlined: false, box: { width: null, fit: 'wrap' } }
+			{ id: 'a', outlined: false, box: { width: 50, fit: 'wrap' }, animation: null },
+			{ id: 'b', outlined: true, box: { width: 9, fit: 'wrap' }, animation: null },
+			{ id: 'c', outlined: false, box: { width: null, fit: 'wrap' }, animation: null }
 		]);
 	});
 });
@@ -109,5 +113,61 @@ describe('the harness', () => {
 			overlay(outlined, { template: { template_id: 'x', name: 'T', controls: [], values: {} } } as Partial<SvgOverlay>)
 		);
 		expect(() => convertTitleTextIn(template, 'o', 'text')).toThrow('template');
+	});
+});
+
+describe('a text animation', () => {
+	const rise = TEXT_ANIMATION_PRESETS[0].animation;
+
+	test('is written on the text, read back from it, replaced and taken away', () => {
+		const src = doc('<text id="t" x="5" y="50">Hi</text>');
+		const set = withTextAnimation(src, 't', rise);
+		expect(set).toContain(" data-kerf-animate='{");
+		expect(titleTexts(set)[0].animation).toEqual(rise);
+		const slower = { ...rise, duration: 3 };
+		const replaced = withTextAnimation(set, 't', slower);
+		expect(replaced.match(/data-kerf-animate/g)).toHaveLength(1);
+		expect(titleTexts(replaced)[0].animation?.duration).toBe(3);
+		expect(withTextAnimation(replaced, 't', null)).toBe(src);
+	});
+
+	test('is refused for what the engine refuses', () => {
+		const src = doc('<rect id="r" width="1" height="1"/><text id="t">a</text><text id="d">b</text><text id="d">c</text>');
+		expect(() => withTextAnimation(src, 'r', rise)).toThrow('<rect>');
+		expect(() => withTextAnimation(src, 'x', rise)).toThrow('no element');
+		expect(() => withTextAnimation(src, 'd', rise)).toThrow('more than one');
+		expect(() => withTextAnimation(src, 't', { ...rise, duration: 0 })).toThrow('duration');
+		expect(() => withTextAnimation(src, 't', { ...rise, properties: { ...rise.properties, opacity: 1, y: 0 } })).toThrow('changes nothing');
+		expect(() => withTextAnimation(doc('<g data-kerf-text="" id="t"/>'), 't', rise)).toThrow('text form');
+	});
+
+	test('reads nothing from an attribute that is not an animation of ours', () => {
+		const read = (raw: string) => titleTexts(doc(`<text id="t" data-kerf-animate='${raw}'>a</text>`))[0].animation;
+		expect(read('{"properties":{"y":0.5}}')?.duration).toBe(1);
+		expect(read('{"properties":{"y":0.5},"extra":1}')).toBeNull();
+		expect(read('{"by":"letter","properties":{"y":0.5}}')).toBeNull();
+		expect(read('{"properties":{}}')).toBeNull();
+		expect(read('{"properties":{"y":"high"}}')).toBeNull();
+		expect(read('nope')).toBeNull();
+	});
+
+	test('in the harness writes the attribute and says it plays nothing', () => {
+		const overlay = {
+			id: 'o',
+			name: 'Card',
+			svg: doc('<text id="t">Hi</text>'),
+			start: 0,
+			end: 4,
+			x: 0,
+			y: 0,
+			width: 1,
+			height: 1,
+			opacity: 1
+		} as unknown as SvgOverlay;
+		const tl = { tracks: [], svg_overlays: [overlay] } as unknown as Timeline;
+		const { overlay: o, warnings } = setTitleTextAnimationIn(tl, 'o', 't', rise);
+		expect(o?.svg).toContain('data-kerf-animate');
+		expect(warnings).toEqual([HARNESS_ANIMATION_NOTE]);
+		expect(setTitleTextAnimationIn(tl, 'o', 't', null).warnings).toEqual([]);
 	});
 });
