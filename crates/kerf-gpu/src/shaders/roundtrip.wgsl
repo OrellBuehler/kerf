@@ -20,6 +20,10 @@ struct P {
     taps: i32,        // fs_chroma_v: taps per output row
     white_in: i32,    // fs_rgb: a dip to white's `fade` factors in the RGB (65535: not running)
     white_out: i32,
+    start: i32,       // fs_chroma_v_x86: the sum's start, `(64 + 8 * (taps - 1)) >> 4` for the filter size aligned to 2
+    pad0: i32,
+    pad1: i32,
+    pad2: i32,
 }
 
 @group(0) @binding(0) var<uniform> p: P;
@@ -120,5 +124,59 @@ fn fs_chroma_v(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         acc = acc + w * i32(v);
     }
     let q = clamp(acc >> 19u, 0, 255);
+    return vec4<f32>(f32(q) / 255.0, 0.0, 0.0, 1.0);
+}
+
+// The vertical pass of the grade's way back (src/grade.rs): swscale's x86 `yuv2yuvX` for every row but the last
+// chroma row, which `swscale.c` gives to the C kernel (`dstY >= dstH - 2`). Each tap is `pmulhw`, the high half of the
+// 16-bit product, summed from `start`, then `>> 3`.
+@fragment
+fn fs_chroma_v_x86(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+    let o = vec2<i32>(frag.xy);
+    let pos = i32(textureLoad(t2, vec2<i32>(0, o.y), 0).r);
+    let last = o.y == p.csize.y - 1;
+    var acc = p.start;
+    if (last) {
+        acc = 64 << 12u;
+    }
+    for (var j = 0; j < p.taps; j = j + 1) {
+        let w = i32(textureLoad(t2, vec2<i32>(1 + j, o.y), 0).r);
+        let r = clamp(pos + j, 0, p.size.y - 1);
+        let s = textureLoad(t1, vec2<i32>(o.x, r), 0);
+        var v = s.r;
+        if (p.channel == 1) {
+            v = s.g;
+        }
+        if (last) {
+            acc = acc + w * i32(v);
+        } else {
+            acc = acc + ((w * i32(v)) >> 16u);
+        }
+    }
+    var q = clamp(acc >> 3u, 0, 255);
+    if (last) {
+        q = clamp(acc >> 19u, 0, 255);
+    }
+    return vec4<f32>(f32(q) / 255.0, 0.0, 0.0, 1.0);
+}
+
+// One plane of `rgb24 -> yuv444p` (the explicit `scale` a tagged picture's grade ends in), the unscaled vertical
+// pass included: channel 0 is luma, 1 and 2 are U and V, each at the picture's size.
+@fragment
+fn fs_plane444(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+    let o = vec2<i32>(frag.xy);
+    let c = vec3<i32>(round(textureLoad(t1, o, 0).rgb * 255.0));
+    var q: i32;
+    if (p.channel == 0) {
+        let y14 = (p.ky.x * c.x + p.ky.y * c.y + p.ky.z * c.z + (32 << 14u) + (1 << 8u)) >> 9u;
+        q = clamp((y14 + 32) >> 6u, 0, 255);
+    } else {
+        var k = p.ku;
+        if (p.channel == 2) {
+            k = p.kv;
+        }
+        let c14 = (k.x * c.x + k.y * c.y + k.z * c.z + (256 << 14u) + (1 << 8u)) >> 9u;
+        q = clamp((c14 * 2 + 64) >> 7u, 0, 255);
+    }
     return vec4<f32>(f32(q) / 255.0, 0.0, 0.0, 1.0);
 }

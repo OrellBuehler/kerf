@@ -44,7 +44,7 @@ use std::time::{Duration, Instant};
 
 use bytemuck::{Pod, Zeroable};
 use kerf_core::{
-    EffectKinds, FadeEdge, FadeTint, GeqEdge, GpuCaps, Mask, MaskShape, RenderPlan, VideoEffect, YuvMatrix, FADE_FULL,
+    EffectKinds, FadeEdge, FadeTint, GeqEdge, GpuCaps, GradeKinds, Mask, MaskShape, RenderPlan, VideoEffect, YuvMatrix, FADE_FULL,
 };
 use wgpu::util::DeviceExt;
 
@@ -54,9 +54,12 @@ use crate::frame_source::{FrameSource, Hint};
 use crate::gpu::{Gpu, GpuError};
 use crate::motion::MotionFrames;
 use crate::roundtrip::{Rgb2Yuv, Yuv2Rgb};
+
+mod grade_passes;
 use crate::source::{chroma_size, decode_layers, YuvFrame};
 use crate::sws::{self, Filter};
 use crate::text::{self, Blend, Raster, Source, TextAtlas};
+use grade_passes::{GradeLook, GradePasses};
 use kerf_core::layer_geometry::{LayerGeometry, Rect, ScaleStage};
 
 /// A rendered frame: tightly packed 8-bit RGBA, top row first.
@@ -151,7 +154,8 @@ struct ResampleParams {
     apply_lut: u32,
     plane: u32,
     taps: i32,
-    pad: u32,
+    /// The vertical pass's x86 kernel start constant, or 0 for the C arithmetic (`grade.rs`).
+    x86: u32,
 }
 
 #[repr(C)]
@@ -201,6 +205,9 @@ struct RoundTripParams {
     taps: i32,
     /// A dip to white's `fade` factors, run in the RGB between the conversions.
     white: [i32; 2],
+    /// The grade's vertical pass (`fs_chroma_v_x86`): the sum's start constant. Padding for the rest.
+    start: i32,
+    pad: [i32; 3],
 }
 
 /// `text.wgsl`'s uniform: one blend of an overlay.
@@ -304,6 +311,8 @@ pub struct Compositor {
     rt_chroma_h: wgpu::RenderPipeline,
     rt_chroma_v: wgpu::RenderPipeline,
     rt_v_layout: wgpu::BindGroupLayout,
+    /// The grade's passes (`grade.wgsl`).
+    grade: GradePasses,
     /// A 256x3 table that changes nothing, bound when a layer has no `eq`.
     identity_lut: wgpu::TextureView,
     text: TextPass,
@@ -503,6 +512,8 @@ struct LayerLook {
     /// `chromakey` after the effects: the last one's, as each writes the whole alpha plane from the
     /// chroma, which none of them changes.
     key: Option<effects::ChromaKeyOptions>,
+    /// The LUT, curves and wheels (`grade.rs`): after the `eq`'s tables, ahead of everything else.
+    grade: Option<GradeLook>,
 }
 
 enum Step {
@@ -777,6 +788,7 @@ impl Compositor {
         caps.keyed_opacity = true;
         caps.keyed_color = true;
         caps.mask = true;
+        caps.grade = GradeKinds::ALL;
         caps.effects = EffectKinds::BLUR
             .union(EffectKinds::SHARPEN)
             .union(EffectKinds::GRAYSCALE)
@@ -978,6 +990,8 @@ impl Compositor {
             let rt_chroma_h = rt_pipeline("rt chroma h", &convert_layout, "fs_chroma_h", CHROMA_FORMAT);
             let rt_chroma_v = rt_pipeline("rt chroma v", &rt_v_layout, "fs_chroma_v", PLANE_FORMAT);
 
+            let grade = GradePasses::new(&g, &rt_shader, &convert_layout, &rt_v_layout);
+
             let identity: Vec<u8> = (0..3).flat_map(|_| 0..=255u8).collect();
             let identity_lut = Self::lut_texture(&g, &identity);
 
@@ -1057,6 +1071,7 @@ impl Compositor {
                 rt_chroma_h,
                 rt_chroma_v,
                 rt_v_layout,
+                grade,
                 identity_lut,
                 text: TextPass {
                     layout: text_layout,
@@ -1370,6 +1385,8 @@ impl Compositor {
             channel: 0,
             taps: 0,
             white: white.map(|f| f as i32),
+            start: 0,
+            pad: [0; 3],
         };
         let rgb = self.plane("rt rgb", w, h, CANVAS_FORMAT, wgpu::TextureUsages::RENDER_ATTACHMENT);
         let bind = self.rt_bind(&self.compose_layout, &params, &[&py.view, &pu.view, &pv.view]);
@@ -1466,7 +1483,7 @@ impl Compositor {
             apply_lut: 0,
             plane: 0,
             taps: filters.h.size as i32,
-            pad: 0,
+            x86: 0,
         };
         let (lut_view, lut_row) = lut.map_or((&self.identity_lut, 0), |(v, r)| (v, r));
         let bind = |params: ResampleParams, view: &wgpu::TextureView, taps: &wgpu::TextureView| {
@@ -1507,6 +1524,7 @@ impl Compositor {
                 apply_lut: u32::from(lut.is_some()),
                 plane: lut_row,
                 taps: filters.v.size as i32,
+                x86: filters.x86_start,
                 ..base
             },
             &mid.view,
@@ -1905,6 +1923,28 @@ impl Compositor {
         } else {
             geom.picture
         };
+        // The grade runs in RGB on the picture the chain has made, at its own size: FFmpeg carries it through
+        // `rgb24` and back, and what is reproduced is that for a picture the scaler did not resize, with nothing
+        // after the grade that sees the RGB (or, for a tagged picture, 4:4:4) frame (the plan refuses the rest;
+        // so does this, for a caller that did not ask it).
+        let grade = self.grade_look(layer)?;
+        if grade.is_some() {
+            if geom.matte {
+                return Err(unsupported("a grade on a letterboxed picture".into()));
+            }
+            if zoom_last {
+                return Err(unsupported("a grade before a moving zoom".into()));
+            }
+            if geom.stages.iter().any(|s| s.scaled != (s.src.w, s.src.h)) {
+                return Err(unsupported("a grade on a layer the scaler resizes".into()));
+            }
+            if pw % 2 != 0 || ph % 2 != 0 {
+                return Err(unsupported(format!("a grade on a {pw}x{ph} picture (odd sides)")));
+            }
+            if layer.effects.iter().any(|e| !matches!(e, VideoEffect::ChromaKey { .. })) {
+                return Err(unsupported("video effects behind a grade".into()));
+            }
+        }
         let mut leading = eq::luts(&layer.color);
         let mut steps: Vec<Step> = Vec::new();
         let mut pending: Option<[[u8; 256]; 3]> = None;
@@ -2040,6 +2080,7 @@ impl Compositor {
             mask_edge,
             zoom_last,
             key,
+            grade,
         })
     }
 
@@ -2236,12 +2277,20 @@ impl Compositor {
                     Ok(PlaneFilters {
                         h: sws::bicubic(ps.src.w, ps.scaled.0, sws::ONE_HORIZONTAL).ok_or_else(too_far)?,
                         v: sws::bicubic(ps.src.h, ps.scaled.1, sws::ONE_VERTICAL).ok_or_else(too_far)?,
+                        x86_start: 0,
                     })
                 };
                 filters.push([table(false)?, table(true)?, table(true)?]);
             }
             let fades = LayerFades::of(plan, layer, &geom)?;
             let look = self.look_of(layer, &geom)?;
+            // `fade` takes `rgb24` and runs on the picture the grade leaves in RGB (a dip to white is in the
+            // chain for every frame of the clip, and converts the picture through RGB itself).
+            if look.grade.is_some() && (fades.fade_in < FADE_FULL || fades.fade_out < FADE_FULL || fades.white_round_trip) {
+                return Err(GpuError::Unsupported(format!(
+                    "layer {n}: a fade to black or white running on a graded layer (FFmpeg fades the RGB picture the grade leaves)"
+                )));
+            }
             let count = if look.steps.iter().any(|s| matches!(s, Step::Vignette)) {
                 layer_count(plan, n, counts)?
             } else {
@@ -2385,6 +2434,9 @@ impl Compositor {
             for (si, stage) in geom.stages[..before_zoom].iter().enumerate() {
                 let lut = (si + 1 == before_zoom).then_some(tables.as_ref()).flatten();
                 current = self.scale_stage(&mut enc, &current, stage, &filters[si], lut);
+            }
+            if let Some(grade) = &look.grade {
+                current = self.grade_planes(&mut enc, &current, grade)?;
             }
             for step in &look.steps {
                 current = match step {
@@ -3105,6 +3157,9 @@ struct PlaneStage {
 struct PlaneFilters {
     h: Filter,
     v: Filter,
+    /// 0: the vertical pass is swscale's C arithmetic (the scaler of every layer); else the x86 kernel's start
+    /// constant (the grade's 4:4:4 -> 4:2:0 chroma, `grade.rs`).
+    x86_start: u32,
 }
 
 /// A scale stage as one plane sees it. The chroma planes are half the size

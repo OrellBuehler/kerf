@@ -133,6 +133,7 @@ pub mod eq;
 pub mod frame_cache;
 pub mod frame_source;
 pub mod gpu;
+pub mod grade;
 pub mod motion;
 pub mod present;
 pub mod roundtrip;

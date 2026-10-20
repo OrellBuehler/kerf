@@ -40,7 +40,7 @@
 use kerf_core::YuvMatrix;
 
 /// `ff_yuv2rgb_coeffs`: `{crv, cbu, cgu, cgv}` per matrix.
-fn coefficients(m: YuvMatrix) -> [i64; 4] {
+pub(crate) fn coefficients(m: YuvMatrix) -> [i64; 4] {
     match m {
         YuvMatrix::Bt601 => [104_597, 132_201, 25_675, 53_279],
         YuvMatrix::Bt709 => [117_489, 138_438, 13_975, 34_925],
@@ -177,6 +177,15 @@ impl Rgb2Yuv {
     pub fn luma(&self, r: i32, g: i32, b: i32) -> i32 {
         let y14 = (self.ry * r + self.gy * g + self.by * b + (32 << 14) + (1 << 8)) >> 9;
         ((y14 + 32) >> 6).clamp(0, 255)
+    }
+
+    /// The 15-bit `(U, V)` of one RGB pixel (swscale's `rgb24ToUV_c`: the chroma of 4:4:4 output, one sample
+    /// a pixel), before the vertical pass.
+    pub fn pixel_to_chroma15(&self, rgb: [i32; 3]) -> (i32, i32) {
+        let [r, g, b] = rgb;
+        let u = (self.ru * r + self.gu * g + self.bu * b + (256 << 14) + (1 << 8)) >> 9;
+        let v = (self.rv * r + self.gv * g + self.bv * b + (256 << 14) + (1 << 8)) >> 9;
+        (u * 2, v * 2)
     }
 
     /// The 15-bit `(U, V)` of a horizontal pair of RGB pixels given as the *sum* of

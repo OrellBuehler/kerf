@@ -12,7 +12,10 @@
 //! * `pip`: a gradient with a shrunk, cropped, translucent, colour-graded picture-in-picture over
 //!   it (the scaler down, `eq`, the opacity RGB round trip, `overlay`);
 //! * `bt709`: a BT.709-tagged stack (the composite colour policy the plan was given, which is how
-//!   FFmpeg 6 and 9 disagree).
+//!   FFmpeg 6 and 9 disagree);
+//! * `grade`: a clip at the canvas' own size through a LUT, curves and colour wheels (the conversions
+//!   to RGB and back, `lut3d`, `lutrgb`, `colorbalance`: the arithmetic of `crate::grade`, which a build with
+//!   another `swscale` or another format negotiation draws differently).
 //!
 //! No rotation: its float sampling can differ by a level between GPUs for reasons that are not
 //! drift, and a false alarm turns the feature off for someone it works for. The limits are the
@@ -35,8 +38,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use kerf_core::{
-    composite_color_policy, export_still, Asset, Clip, Color, CompositeColorPolicy, Delivery, ExportOptions, Fit, ImageFormat,
-    Project, RenderPlan, StreamKind, Timeline, Track, Transform, YuvMatrix,
+    composite_color_policy, export_still, Asset, Clip, ClipLut, Color, CompositeColorPolicy, CurvePoint, Curves, Delivery,
+    ExportOptions, Fit, Grade, ImageFormat, Project, RenderPlan, StreamKind, Timeline, Track, Transform, Wheel, Wheels,
+    YuvMatrix,
 };
 
 use crate::compositor::Compositor;
@@ -281,11 +285,15 @@ struct Case {
     assets: Vec<Asset>,
 }
 
-/// The three fixture clips, probed the way an import probes them.
+/// The fixture clips, probed the way an import probes them.
 struct Media {
     testsrc: Asset,
     gradient: Asset,
     testsrc709: Asset,
+    /// A test pattern at the canvas' size, so that the grade runs on a picture the scaler leaves alone.
+    graded: Asset,
+    /// The `.cube` the graded clip is looked up through.
+    cube: String,
 }
 
 impl Media {
@@ -296,12 +304,18 @@ impl Media {
             CLIP.0, CLIP.1
         );
         let testsrc709 = format!("testsrc2=size={}x{}:rate=30:duration={CLIP_SECS},{BT709}", CLIP.0, CLIP.1);
+        let graded = format!(
+            "testsrc2=size={}x{}:rate=30:duration={CLIP_SECS},{UNTAGGED}",
+            CANVAS.0, CANVAS.1
+        );
+        let cube = write_cube(dir)?;
         past(deadline, "making the check clips")?;
         let made: Vec<Result<Asset, SelfTestError>> = std::thread::scope(|scope| {
             let handles: Vec<_> = [
                 ("testsrc.mkv", &testsrc),
                 ("gradient.mkv", &gradient),
                 ("testsrc709.mkv", &testsrc709),
+                ("graded.mkv", &graded),
             ]
             .into_iter()
             .map(|(name, lavfi)| scope.spawn(move || make_clip(dir, name, lavfi)))
@@ -315,11 +329,13 @@ impl Media {
                 .collect()
         });
         let mut made = made.into_iter();
-        let mut next = || made.next().expect("three clips");
+        let mut next = || made.next().expect("four clips");
         Ok(Self {
             testsrc: next()?,
             gradient: next()?,
             testsrc709: next()?,
+            graded: next()?,
+            cube,
         })
     }
 
@@ -347,6 +363,35 @@ impl Media {
             pos_y: 0.15,
             ..Transform::default()
         };
+        let mut graded = clip(&self.graded);
+        graded.grade = Grade {
+            lut: Some(ClipLut {
+                path: self.cube.clone(),
+                intensity: 0.8,
+            }),
+            curves: Some(Curves {
+                master: vec![
+                    CurvePoint { x: 0.0, y: 0.03 },
+                    CurvePoint { x: 0.3, y: 0.22 },
+                    CurvePoint { x: 0.75, y: 0.84 },
+                    CurvePoint { x: 1.0, y: 0.98 },
+                ],
+                ..Curves::default()
+            }),
+            wheels: Some(Wheels {
+                shadows: Wheel {
+                    x: 0.4,
+                    y: -0.2,
+                    lightness: 0.1,
+                },
+                highlights: Wheel {
+                    x: 0.1,
+                    y: 0.7,
+                    lightness: 0.05,
+                },
+                ..Wheels::default()
+            }),
+        };
         vec![
             Case {
                 name: "fit",
@@ -362,6 +407,11 @@ impl Media {
                 name: "bt709",
                 timeline: timeline(vec![vec![clip(&self.testsrc709)], vec![small]]),
                 assets: vec![self.testsrc709.clone()],
+            },
+            Case {
+                name: "grade",
+                timeline: timeline(vec![vec![graded]]),
+                assets: vec![self.graded.clone()],
             },
         ]
     }
@@ -383,6 +433,34 @@ fn timeline(tracks: Vec<Vec<Clip>>) -> Timeline {
         format: Some(Delivery::new(CANVAS.0, CANVAS.1, Fit::Contain)),
         master: Default::default(),
     }
+}
+
+/// A 5x5x5 `.cube` with a tint and cross-channel terms, written to `dir`: the LUT of the `grade` frame.
+fn write_cube(dir: &Path) -> Result<String, SelfTestError> {
+    let size = 5usize;
+    let n = (size - 1) as f32;
+    let mut data = Vec::with_capacity(size * size * size);
+    for b in 0..size {
+        for g in 0..size {
+            for r in 0..size {
+                let (r, g, b) = (r as f32 / n, g as f32 / n, b as f32 / n);
+                data.push([
+                    0.92 * r + 0.08 * g * b + 0.03,
+                    0.05 * r * r + 0.9 * g + 0.04 * b,
+                    (0.1 + 0.8 * b + 0.15 * r * g).min(1.0),
+                ]);
+            }
+        }
+    }
+    let table = kerf_core::color_lut::Lut3d {
+        title: String::new(),
+        size,
+        data,
+    };
+    let path = dir.join("look.cube");
+    std::fs::write(&path, table.to_cube(1.0))
+        .map_err(|e| SelfTestError::inconclusive(format!("could not write the check LUT: {e}")))?;
+    Ok(path.to_string_lossy().into_owned())
 }
 
 /// A lossless clip of `lavfi` (FFV1 in Matroska: ffmpeg's own encoder, an indexed container, every
@@ -701,7 +779,7 @@ mod tests {
         let _one = one_at_a_time();
         let gpu = adapter();
         let report = parity_self_test(&gpu).unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(report.cases.len(), 3);
+        assert_eq!(report.cases.len(), 4);
         eprintln!("self-test: {}", report.summary());
         assert!(report.elapsed < Duration::from_secs(30), "{:?}", report.elapsed);
         // The scratch directory is gone.
