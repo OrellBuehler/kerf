@@ -311,7 +311,12 @@ fn gpu() -> Arc<Gpu> {
 
 fn compositor() -> &'static Compositor {
     static C: OnceLock<Compositor> = OnceLock::new();
-    C.get_or_init(|| Compositor::new(gpu()).expect("a compositor"))
+    C.get_or_init(|| {
+        // The grade is in the caps once this FFmpeg's conversions are known to be the model's (the app's `prepare` asks
+        // ahead of a frame): the harness measures them once, up front, and its grade cases hold the answer to `Match`.
+        let _ = kerf_gpu::grade::kernels();
+        Compositor::new(gpu()).expect("a compositor")
+    })
 }
 
 /// One frame source for the whole suite, as the app would have: every case's frames are decoded
@@ -428,6 +433,9 @@ struct Media {
     bars709: Asset,
     testsrc709: Asset,
     gradient709: Asset,
+    /// The test pattern tagged as an NTSC (`smpte170m`) and a PAL (`bt470bg`) file is: BT.601's coefficients under a tag.
+    testsrc170m: Asset,
+    bars470bg: Asset,
     testsrc2020: Asset,
     gradient2020: Asset,
     /// The test pattern in formats that are not 8-bit 4:2:0 — what FFmpeg scales
@@ -483,10 +491,14 @@ fn media() -> &'static Media {
         let untagged = "setparams=colorspace=unknown:color_primaries=unknown:color_trc=unknown";
         let bt709 = "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709";
         let bt2020 = "setparams=colorspace=bt2020nc:color_primaries=bt2020:color_trc=bt709";
+        let smpte170m = "setparams=colorspace=smpte170m:color_primaries=smpte170m:color_trc=smpte170m";
+        let bt470bg = "setparams=colorspace=bt470bg:color_primaries=bt470bg:color_trc=bt470bg";
         let bars = video("bars.mp4", &format!("smptehdbars=size=640x360:rate=30:duration=2,{untagged}"));
         let bars709 = video("bars709.mp4", &format!("smptehdbars=size=640x360:rate=30:duration=2,{bt709}"));
         let testsrc709 = video("testsrc709.mp4", &format!("testsrc2=size=640x360:rate=30:duration=2,{bt709}"));
         let testsrc2020 = video("testsrc2020.mp4", &format!("testsrc2=size=640x360:rate=30:duration=2,{bt2020}"));
+        let testsrc170m = video("testsrc170m.mp4", &format!("testsrc2=size=640x360:rate=30:duration=2,{smpte170m}"));
+        let bars470bg = video("bars470bg.mp4", &format!("smptehdbars=size=640x360:rate=30:duration=2,{bt470bg}"));
         let gradients = "gradients=size=640x360:rate=30:duration=2:c0=0xd03020:c1=0x2040e0:c2=0x30c060:nb_colors=3:seed=11:x0=0:y0=0:x1=640:y1=360:speed=0.00001";
         // (`gradients` makes RGB: the conversion to 4:2:0 has to come before the tag,
         // or it replaces it with "unspecified".)
@@ -653,6 +665,8 @@ fn media() -> &'static Media {
             bars709: probed(&bars709),
             testsrc709: probed(&testsrc709),
             gradient709: probed(&gradient709),
+            testsrc170m: probed(&testsrc170m),
+            bars470bg: probed(&bars470bg),
             testsrc2020: probed(&testsrc2020),
             gradient2020: probed(&gradient2020),
             png640: probed(&png640),
@@ -6421,9 +6435,11 @@ fn graded(asset: &Asset, grade: &kerf_core::Grade, edit: &dyn Fn(&mut Clip)) -> 
 /// The grade is FFmpeg's `lut3d`, `lutrgb` and `colorbalance` between a conversion to RGB and one back, and the
 /// compositor draws all of it to the level (`tests/grade.rs` holds the arithmetic to the filters on noise,
 /// `motion_parity.rs` the export's planes); here it is the still: a graded layer at its own size, alone, over
-/// another track, translucent, masked, rotated, through a dissolve, among the stills of a tagged (BT.709) clip.
+/// another track, translucent, masked, rotated, through a dissolve, among the stills of a clip tagged BT.709 and of
+/// one tagged `smpte170m` / `bt470bg` (BT.601's coefficients through 4:4:4), and beside the layers of another
+/// matrix (drawn under FFmpeg 6, refused as mixed matrices under 9, which converts them into the bottom layer's).
 /// The final conversion to RGB is the only place the picture is not exact, which is why the numbers are a plain
-/// layer's (flat PSNR 49 dB and above on 6.1.1).
+/// layer's: flat PSNR 45 to 51 dB, max error 2 to 4 (`STRICT`: 40 dB, 8), the same on both builds.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn a_grade_is_drawn_as_the_still_draws_it() {
@@ -6435,6 +6451,8 @@ fn a_grade_is_drawn_as_the_still_draws_it() {
             ("gradient", &m.gradient),
             ("testsrc709", &m.testsrc709),
             ("bars709", &m.bars709),
+            ("testsrc170m", &m.testsrc170m),
+            ("bars470bg", &m.bars470bg),
         ] {
             let (tl, assets) = graded(asset, &grade, &|_| {});
             check(&format!("grade/{name}, {source}"), &tl, &assets, &[0.5], STRICT);
@@ -6498,6 +6516,45 @@ fn a_grade_is_drawn_as_the_still_draws_it() {
         &tl,
         &[m.bars.clone(), m.testsrc.clone()],
         &[0.95, 1.1, 1.3, 1.7],
+        STRICT,
+    );
+    // Beside a layer of another matrix on screen: FFmpeg 6 takes each as it is and the stack is drawn, FFmpeg 9 converts
+    // the layers into the bottom one's, which the plan refuses (a frame with the graded clip alone is the graph of that
+    // clip alone, as a still builds it: drawn). Beside one of its own matrix, drawn on both.
+    let mut over = clip(&m.testsrc, 0.0, 2.0, 0.0);
+    over.grade = heavy.clone();
+    let tl = timeline(vec![vec![clip(&m.bars709, 0.0, 2.0, 0.0)], vec![over.clone()]], None);
+    check_mixed(
+        "grade/untagged SD over a BT.709 clip",
+        &tl,
+        &[m.bars709.clone(), m.testsrc.clone()],
+        &[0.5],
+        "different YCbCr matrices",
+    );
+    let tl = timeline(vec![vec![over.clone()], vec![clip(&m.testsrc709, 0.0, 2.0, 0.0)]], None);
+    check_mixed(
+        "grade/untagged SD under a BT.709 clip",
+        &tl,
+        &[m.testsrc.clone(), m.testsrc709.clone()],
+        &[0.5],
+        "different YCbCr matrices",
+    );
+    let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![over]], None);
+    check(
+        "grade/untagged SD over untagged",
+        &tl,
+        &[m.bars.clone(), m.testsrc.clone()],
+        &[0.5],
+        STRICT,
+    );
+    let mut over = clip(&m.testsrc170m, 0.0, 2.0, 0.0);
+    over.grade = heavy.clone();
+    let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![over]], None);
+    check(
+        "grade/smpte170m over untagged",
+        &tl,
+        &[m.bars.clone(), m.testsrc170m.clone()],
+        &[0.5],
         STRICT,
     );
 }
@@ -6572,6 +6629,25 @@ fn what_the_compositor_does_not_draw_of_a_grade_is_refused() {
         0.3,
         "fade to black or white",
     );
+    // A clip's own fade is `fade` to black of the picture whatever its track (not an alpha ramp: a dissolve's is), so it is
+    // refused on a layer over another one too.
+    let fade_in = |c: &mut Clip| c.fade_in = 1.0;
+    let fade_out = |c: &mut Clip| c.fade_out = 1.0;
+    for (name, edit, t) in [
+        ("fading in over another track", &fade_in as &dyn Fn(&mut Clip), 0.3),
+        ("fading out over another track", &fade_out, 1.7),
+    ] {
+        let (mut tl, mut assets) = one(&m.testsrc, edit);
+        tl.tracks.insert(
+            0,
+            Track {
+                clips: vec![clip(&m.bars, 0.0, 2.0, 0.0)],
+                ..Track::new(StreamKind::Video, "V0")
+            },
+        );
+        assets.push(m.bars.clone());
+        refuse(name, (tl, assets), t, "fade to black or white");
+    }
     refuse(
         "moving zoom",
         one(&m.testsrc, &|c| {
