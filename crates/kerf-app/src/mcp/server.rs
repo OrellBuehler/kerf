@@ -1176,6 +1176,10 @@ mod tests {
         panic!("timed out waiting for {what}");
     }
 
+    /// `supervise` publishes where it listens and why it does not into the process-wide status, which the first of
+    /// the tests that run one reads back, so those take turns.
+    static ONE_AT_A_TIME: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     fn config_for(addr: &str, token: &str, enabled: bool) -> McpConfig {
         McpConfig {
             enabled,
@@ -1189,6 +1193,7 @@ mod tests {
     /// new token applies to the very next request without a restart.
     #[tokio::test(flavor = "multi_thread")]
     async fn the_server_follows_its_settings_live() {
+        let _turn = ONE_AT_A_TIME.lock().await;
         let (a, b) = (format!("127.0.0.1:{}", free_port()), format!("127.0.0.1:{}", free_port()));
         let (tx, rx) = tokio::sync::watch::channel(config_for(&a, &"1".repeat(40), true));
         let task = tokio::spawn(supervise(|| Nothing, rx));
@@ -1227,7 +1232,7 @@ mod tests {
         tx.send_replace(config_for(&b, &"2".repeat(40), true));
         until("the new address to listen", || listening(&b)).await;
         until("the old address to stop", || !listening(&a)).await;
-        assert_eq!(bind_addr(), b);
+        until("the status to name the new address", || bind_addr() == b).await;
 
         // Switched off: nothing listens, and that is not an error.
         tx.send_replace(config_for(&b, &"2".repeat(40), false));
@@ -1287,6 +1292,7 @@ mod tests {
     /// client holding it has to start over with the new token — and the old token opens nothing.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_new_token_ends_the_sessions_opened_under_the_old_one() {
+        let _turn = ONE_AT_A_TIME.lock().await;
         let text = format!("127.0.0.1:{}", free_port());
         let addr: std::net::SocketAddr = text.parse().unwrap();
         let (old, new) = ("a".repeat(48), "b".repeat(48));
@@ -1472,6 +1478,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn a_subscribed_session_hears_a_job_move_on_its_stream() {
         use super::super::activity::{publish, Event};
+        let _turn = ONE_AT_A_TIME.lock().await;
         let text = format!("127.0.0.1:{}", free_port());
         let addr: std::net::SocketAddr = text.parse().unwrap();
         let token = "s".repeat(48);

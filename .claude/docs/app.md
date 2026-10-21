@@ -252,7 +252,7 @@ not the whole object — only the fields that changed (`{workspaces}`, `{theme}`
 pushed into the engine (so a layout write never re-applies the stored CPU share
 over a `KERF_CPU_PERCENT` override). The write is atomic (temp file in the same
 directory, fsync, rename over) and **happens before the patch is put into force**
-(a write that fails is an error and changes nothing). A file that cannot be read, is not UTF-8,
+(a write that fails is an error and changes nothing; the tests that put a patch or a reset into force, the safe areas and the review switch being process-wide statics, take turns: `ONE_AT_A_TIME`). A file that cannot be read, is not UTF-8,
 is not JSON or is not an object is moved aside to `settings.corrupt-<unix-ms>.json` before defaults
 load, so the next save cannot destroy an imported theme; a file that parses is read **field by field**
 (`parse`): a value that does not fit its field (an unknown enum name, a number out of range, the wrong
