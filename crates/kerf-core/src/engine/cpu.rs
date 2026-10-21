@@ -111,11 +111,13 @@ fn limited() -> bool {
     cpu_percent() < 100
 }
 
-/// The slice threads an export's filter graph runs: the budget's where [`limit_args`] caps them, else
-/// FFmpeg's own default (`avpriv_slicethread_create`: one more than the cores, at most 16; one on a single
-/// core). A filter that slices a frame can depend on it (`chromakey` starts its window over at each
-/// slice). FFmpeg counts the cores it may run on, `cores` also a cgroup's quota: where the two differ, so
-/// can this.
+/// The slice threads the filter graph of a job at the user's budget runs (an export, the playback stream):
+/// the budget's where [`limit_args`] caps them (a budget under 100%, short of the cores), else FFmpeg's own
+/// default (`avpriv_slicethread_create`: one more than the cores, at most 16; one on a single core). Not the
+/// graph of a [`single_frame_args`] read, which runs on one thread at any budget, nor of a job capped by
+/// [`cap_args`] at a count of its own. A filter that slices a frame can depend on it (`chromakey` starts its
+/// window over at each slice). FFmpeg counts the cores it may run on, `cores` also a cgroup's quota: where
+/// the two differ, so can this.
 pub fn graph_threads() -> usize {
     graph_threads_for(cores(), budget_threads(), limited())
 }

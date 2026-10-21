@@ -256,7 +256,7 @@ out in order); closing a window is dockview's own (it re-docks the panels where 
 the *Return* entries just close the window. What it gives a window beyond dockview's: the live theme
 (`mirrorRoot` copies `<html>`'s class and inline custom properties from a MutationObserver, otherwise a
 window shows the stylesheet's defaults whatever the theme), a title (`Library — Kerf`), a slider-fill
-observer of its own, **`inert` while a modal is open**, and the shortcut handler (`windows.listen`).
+observer of its own, **`inert` while a modal is open**, the shortcut handler (`windows.listen`) and the CSP-violation logger (`watchCspViolations`: its document is its own, so the editor window's listener never hears it).
 **The rule for panel code: `window` and `document` are the editor window's, and an event that happens in a
 detached window is dispatched there and never reaches a listener on this one.** So `windows.svelte.ts`
 (the registry; `version` moves when a window opens or closes or a panel moves) and `realm.ts` (pure:

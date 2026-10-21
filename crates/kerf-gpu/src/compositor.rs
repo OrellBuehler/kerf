@@ -2415,6 +2415,8 @@ impl Compositor {
 
         // The canvas as it was before a layer that blends, made once the first one needs it.
         let mut before: Option<Plane> = None;
+        // The graph's slice threads, read once per draw, by the first layer that is keyed.
+        let graph_threads = std::cell::OnceCell::new();
         for Drawn {
             layer,
             frame,
@@ -2471,7 +2473,10 @@ impl Compositor {
             // The mask is the alpha plane (`geq` rewrites it); nothing else gives the layer one but the
             // dissolve's ramp, which acts on whatever plane there is.
             let mut alpha: Option<Plane> = match &look.key {
-                Some(key) => Some(self.chroma_key_plane(&mut enc, &current, key, self.graph_threads_for(plan))),
+                Some(key) => {
+                    let threads = *graph_threads.get_or_init(|| self.graph_threads_for(plan));
+                    Some(self.chroma_key_plane(&mut enc, &current, key, threads))
+                }
                 None => look
                     .mask
                     .as_ref()

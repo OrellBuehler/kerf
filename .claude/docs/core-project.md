@@ -45,7 +45,7 @@
   the user), and the answer says `locked: false` rather than claim it. A paste (`insert_clips`) and an add to a
   named track (`add_clip_to_timeline`) refuse a clip on a track it cannot play on (`check_track_kind`) — no
   picture on a video track, no sound on an audio track (a title is a picture; footage with both may go on
-  either, as a detached sound does); a duplicate keeps a clip on the track it is already on and does not ask.
+  either, as a detached sound does); a duplicate keeps a clip on the track it is already on and does not ask (nor look the asset up).
   `link-ops.ts` mirrors all of it for the harness (`link-ops.test.ts`, `api-locks.test.ts`).
   `roll_edit` / `slip_clip` / `slide_clip` (`Roll edit` / `Slip clip` / `Slide
   clip`, one revision each, `source_limits()` read before the edit) are
@@ -619,8 +619,8 @@
     (`Outlined::kept`, like a box); custom artwork with the attribute and no outlines says `svg::ANIMATE_NOTE`, which
     `outlined_counted` and `Template::validate` drop. **`TitleTextInputs::text_animation(element, Option<&TextAnimation>)`**
     (`svg::set_text_animation` on the text form, then outline; refused when a template control targets the attribute; a text
-    that stays text is an error saying why, and so is outlines that did not read back — `outlined_counted` falls back to the
-    un-outlined title then, count 0; taking an animation off a title that was never outlined leaves it so) → `set_title_text_parsed`,
+    that stays text is an error saying why, and so is a title with nothing set as outlines (outlines that did not read back —
+    `outlined_counted` falls back to the un-outlined title then, count 0 — or nothing to draw: "nothing in the title could be set as outlines"); taking an animation off a title that was never outlined leaves it so) → `set_title_text_parsed`,
     the box's lock-free shape; `svg::text_animation_presets()` lists the **eight presets** (rise, fade in, typewriter, pop, blur
     in, spin in, drop in, wiggle: plain `TextAnimation`s, copied onto the text and referred to by nothing). `fixtures/text-animation-corpus.json`
     (`KERF_BLESS_CORPUS=1 … -- text_animation_corpus`) is what the frontend's `withTextAnimation`, `animationJson`, `parseAnimation`
