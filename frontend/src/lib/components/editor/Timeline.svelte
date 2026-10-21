@@ -1803,18 +1803,14 @@
 		ui.seek(x / pxPerSec);
 	}
 
-	// ---- drop a bin asset onto a track (HTML5 drag-and-drop) ------------------
+	// ---- drop a bin asset onto a track ---------------------------------------
+	// The bin drags with pointer events (`ui.dndPoint`) and calls `ui.assetDropTarget` on release; the lane
+	// under the pointer is found by hit-testing, since the pointer stays over the bin's own element.
 
 	let dropGhost = $state<{ trackId: string; start: number; dur: number; ok: boolean } | null>(null);
 
-	// The bin clears `ui.dndAsset` on dragend; mirror that to drop the ghost.
-	$effect(() => {
-		if (!ui.dndAsset) dropGhost = null;
-	});
-
-	function dropStart(e: DragEvent, t: Track, dur: number): number {
-		const laneLeft = (e.currentTarget as HTMLElement).getBoundingClientRect().left;
-		return snapStart(laneTime(e.clientX, laneLeft), t.id, '', dur);
+	function dropStart(x: number, lane: HTMLElement, t: Track, dur: number): number {
+		return snapStart(laneTime(x, lane.getBoundingClientRect().left), t.id, '', dur);
 	}
 
 	/** Whether [start, start+dur) would overlap an existing clip on the track —
@@ -1826,35 +1822,30 @@
 		return track.clips.some((c) => start < c.timeline_start + clipDuration(c) && c.timeline_start < end);
 	}
 
-	function onLaneDragOver(e: DragEvent, t: Track) {
+	function laneAt(x: number, y: number): { lane: HTMLElement; t: Track } | null {
+		const lane = document.elementFromPoint(x, y)?.closest<HTMLElement>('[data-lane]');
+		const t = lane && editor.timeline.tracks.find((t) => t.id === lane.dataset.trackId);
+		return lane && t ? { lane, t } : null;
+	}
+
+	$effect(() => {
 		const a = ui.dndAsset;
-		if (!a || a.kind !== t.kind || t.locked || editor.previewingStaged) {
+		const p = ui.dndPoint;
+		const hit = a && p ? laneAt(p.x, p.y) : null;
+		if (!a || !p || !hit || a.kind !== hit.t.kind || hit.t.locked || editor.previewingStaged) {
 			dropGhost = null; // wrong-kind track: not a drop target
 			return;
 		}
-		// Always allow the drop so the drop event fires reliably across webview
-		// engines; onLaneDrop rejects overlaps. The ghost turns red to warn.
-		e.preventDefault();
-		if (e.dataTransfer) e.dataTransfer.dropEffect = 'copy';
-		const start = dropStart(e, t, a.duration);
-		dropGhost = { trackId: t.id, start, dur: a.duration, ok: !wouldOverlap(t.id, start, a.duration) };
-	}
+		const start = dropStart(p.x, hit.lane, hit.t, a.duration);
+		dropGhost = { trackId: hit.t.id, start, dur: a.duration, ok: !wouldOverlap(hit.t.id, start, a.duration) };
+	});
 
-	function onLaneDragLeave(e: DragEvent, t: Track) {
-		// Only clear when truly leaving the lane (not entering one of its clips).
-		const to = e.relatedTarget as Node | null;
-		if (!to || !(e.currentTarget as HTMLElement).contains(to)) {
-			if (dropGhost?.trackId === t.id) dropGhost = null;
-		}
-	}
-
-	function onLaneDrop(e: DragEvent, t: Track) {
-		const a = ui.dndAsset;
+	function onLaneDrop(a: { id: string; kind: 'video' | 'audio'; duration: number }, x: number, y: number) {
 		dropGhost = null;
-		ui.dndAsset = null;
-		if (!a || a.kind !== t.kind) return;
+		const hit = laneAt(x, y);
+		if (!hit || a.kind !== hit.t.kind) return;
+		const { lane, t } = hit;
 		if (editor.previewingStaged) {
-			e.preventDefault();
 			holdForPreview();
 			return;
 		}
@@ -1862,14 +1853,20 @@
 			toast.error(`Track ${t.name} is locked`);
 			return;
 		}
-		e.preventDefault();
-		const start = dropStart(e, t, a.duration);
+		const start = dropStart(x, lane, t, a.duration);
 		if (wouldOverlap(t.id, start, a.duration)) {
 			toast.error('Drop into free space — a clip would overlap another here');
 			return;
 		}
 		void editor.add(a.id, 0, a.duration, t.id, start).catch(err);
 	}
+
+	$effect(() => {
+		ui.assetDropTarget = onLaneDrop;
+		return () => {
+			if (ui.assetDropTarget === onLaneDrop) ui.assetDropTarget = null;
+		};
+	});
 
 	// ---- tracks (add / remove) -----------------------------------------------
 
@@ -3531,9 +3528,6 @@
 						razor = null;
 					}}
 					oncontextmenu={(e) => onLaneContextMenu(e, t)}
-					ondragover={(e) => onLaneDragOver(e, t)}
-					ondragleave={(e) => onLaneDragLeave(e, t)}
-					ondrop={(e) => onLaneDrop(e, t)}
 					style="height:{trackHeight(t)};border-bottom:var(--line-width) solid var(--border-subtle);position:relative;box-shadow:{opensAudioGroup(drawn, t)
 						? 'inset 0 2px 0 var(--border-strong)'
 						: 'none'}"

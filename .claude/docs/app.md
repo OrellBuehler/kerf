@@ -776,7 +776,9 @@ Windows are positioned in logical pixels clamped against `available_monitors` (w
 **Not verified outside Linux/WSLg**: WebView2's `NewWindowRequested` + `SetNewWindow` (the popup
 being scriptable, no deadlock building a window inside the handler), WKWebView's `close_popout`
 path and `window_features` placement, `screenX` against mixed-DPI monitors, `requestAnimationFrame`
-in a main window that is minimized, HTML5 tab drags between windows against Tauri's drag-drop
-handler on Windows (`dragDropEnabled` — Kerf keeps it on for file drops). The GPU preview
+in a main window that is minimized, drags between windows. Tauri's drag-drop
+handler (`dragDropEnabled`, kept on for file drops) answers an in-page HTML5 drag with `DROPEFFECT_NONE` on Windows
+(wry `drag_drop.rs`), so WebView2 never delivers its `dragover` / `drop`: in-page drags are pointer drags (the bin →
+lane drag, `frontend-timeline.md`). The GPU preview
 (`gpu_preview.rs`) hard-codes the `main` window for its surface and its bounds, so a Preview in a
 popout takes the JPEG path (`routePreview`'s `detached` reason) and hides the surface.
