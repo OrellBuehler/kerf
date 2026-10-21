@@ -3011,6 +3011,13 @@ fn list_text_animation_presets() -> Vec<kerf_core::svg::TextAnimationPreset> {
     kerf_core::svg::text_animation_presets()
 }
 
+/// The curves a text animation's moving properties can be given (`ease_out`, `overshoot`, `spring`, ...): each a
+/// `Curve` (`null` for the straight line) to put on an animation's `curves`. Needs no project.
+#[tauri::command(async)]
+fn list_text_animation_curves() -> Vec<kerf_core::svg::CurvePreset> {
+    kerf_core::svg::curve_presets()
+}
+
 /// Draw the text of the title `title_id` as glyph outlines (the same on every machine, whatever fonts it
 /// has) or with its fonts again. Each text that cannot be an outline says why in the warnings.
 #[tauri::command]
@@ -5482,6 +5489,7 @@ pub fn run() {
             set_title_text_box,
             set_title_text_animation,
             list_text_animation_presets,
+            list_text_animation_curves,
             convert_title_text,
             import_template,
             export_template,
