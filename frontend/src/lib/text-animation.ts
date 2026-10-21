@@ -3,7 +3,16 @@
  * page needs of it: the bounds an animation is held to (`checkAnimation`), the canonical JSON an attribute holds
  * (`animationJson`) and its reading (`parseAnimation`), and the presets. `text-animation-corpus.test.ts` replays what
  * kerf-core wrote down. Nothing here draws a frame: the engine does. */
-import type { AnimateBy, AnimationEasing, AnimationShape, TextAnimation, TextAnimationPreset } from './types';
+import type {
+	AnimateBy,
+	AnimationCurve,
+	AnimationCurvePreset,
+	AnimationCurves,
+	AnimationEasing,
+	AnimationShape,
+	TextAnimation,
+	TextAnimationPreset
+} from './types';
 
 export const ANIMATE_MARK = 'data-kerf-animate';
 
@@ -13,6 +22,12 @@ export const MIN_DURATION = 0.05;
 export const MAX_REACH = 10;
 /** The most JSON an attribute may hold (`MAX_JSON`). */
 const MAX_JSON = 8 * 1024;
+/** The bounds a curve is held to (`svg/curve.rs`). */
+export const MAX_SPEED = 5;
+export const MIN_INFLUENCE = 0.01;
+export const MAX_INFLUENCE = 1;
+export const MIN_BOUNCE = 0.05;
+export const MAX_BOUNCE = 0.8;
 
 const BY: readonly AnimateBy[] = ['character', 'word', 'line'];
 const EASING: readonly AnimationEasing[] = ['linear', 'ease_in', 'ease_out', 'ease_in_out'];
@@ -33,6 +48,34 @@ export function defaultAnimation(): TextAnimation {
 
 const within = (name: string, v: number, lo: number, hi: number): string | null =>
 	Number.isFinite(v) && v >= lo && v <= hi ? null : `a text animation's ${name} is between ${lo} and ${hi}`;
+
+/** The properties that can have a curve, in the order the engine writes them. */
+const CURVED = ['x', 'y', 'scale', 'rotation', 'opacity', 'blur'] as const;
+
+/** Why `c` is not a curve, or `null` (`Curve::check`, the same words); `what` names the property. */
+function checkCurve(what: string, c: AnimationCurve): string | null {
+	const named = (name: string, v: number, lo: number, hi: number): string | null =>
+		Number.isFinite(v) && v >= lo && v <= hi ? null : `${what}: ${name} is between ${lo} and ${hi}`;
+	if (c.kind === 'spring') return named('bounce', c.bounce, MIN_BOUNCE, MAX_BOUNCE);
+	return (
+		named('out speed', c.out_speed, -MAX_SPEED, MAX_SPEED) ??
+		named('out influence', c.out_influence, MIN_INFLUENCE, MAX_INFLUENCE) ??
+		named('in speed', c.in_speed, -MAX_SPEED, MAX_SPEED) ??
+		named('in influence', c.in_influence, MIN_INFLUENCE, MAX_INFLUENCE)
+	);
+}
+
+/** Why `curves` are not an animation's (`Curves::check`), or `null`. */
+function checkCurves(curves: AnimationCurves | undefined): string | null {
+	for (const name of CURVED) {
+		const c = curves?.[name];
+		if (c) {
+			const why = checkCurve(`a text animation's ${name} curve`, c);
+			if (why) return why;
+		}
+	}
+	return null;
+}
 
 /** Why `a` cannot be a text's animation, or `null` (`TextAnimation::check`, the same words). */
 export function checkAnimation(a: TextAnimation): string | null {
@@ -58,7 +101,8 @@ export function checkAnimation(a: TextAnimation): string | null {
 		within('scale', p.scale, 0, 10) ??
 		within('rotation', p.rotation, -3600, 3600) ??
 		within('opacity', p.opacity, 0, 1) ??
-		within('blur', p.blur, 0, 1);
+		within('blur', p.blur, 0, 1) ??
+		checkCurves(a.curves);
 	if (refusal) return refusal;
 	if (p.x === 0 && p.y === 0 && p.scale === 1 && p.rotation === 0 && p.opacity === 1 && p.blur === 0) {
 		return 'a text animation changes nothing: give it an x, y, scale, rotation, opacity or blur other than the neutral one';
@@ -68,6 +112,22 @@ export function checkAnimation(a: TextAnimation): string | null {
 
 /** A number as kerf-core's JSON writes an `f64`: a whole one with a `.0`. */
 const num = (v: number): string => (Number.isInteger(v) ? v.toFixed(1) : String(v));
+
+/** A curve's JSON, byte for byte what serde writes (`Curve`). */
+export function curveJson(c: AnimationCurve): string {
+	return c.kind === 'spring'
+		? `{"kind":"spring","bounce":${num(c.bounce)}}`
+		: `{"kind":"speed","out_speed":${num(c.out_speed)},"out_influence":${num(c.out_influence)},"in_speed":${num(c.in_speed)},"in_influence":${num(c.in_influence)}}`;
+}
+
+/** The curves' JSON: only the properties that have one, none at all as the empty string (`Curves`, skipped when empty). */
+function curvesJson(curves: AnimationCurves | undefined): string {
+	const parts = CURVED.flatMap((name) => {
+		const c = curves?.[name];
+		return c ? [`"${name}":${curveJson(c)}`] : [];
+	});
+	return parts.length ? `,"curves":{${parts.join(',')}}` : '';
+}
 
 /** The JSON an attribute holds, byte for byte what `TextAnimation::to_attribute` writes (fields in the engine's order). */
 export function animationJson(a: TextAnimation): string {
@@ -79,7 +139,8 @@ export function animationJson(a: TextAnimation): string {
 		`{"by":"${a.by}","delay":${num(a.delay)},"duration":${num(a.duration)},"easing":"${a.easing}",` +
 		`"range":{"start":${num(r.start)},"end":${num(r.end)},"offset":{"from":${num(r.offset.from)},"to":${num(r.offset.to)}},"shape":"${r.shape}"},` +
 		`"wiggle":${wiggle},` +
-		`"properties":{"x":${num(p.x)},"y":${num(p.y)},"scale":${num(p.scale)},"rotation":${num(p.rotation)},"opacity":${num(p.opacity)},"blur":${num(p.blur)}}}`
+		`"properties":{"x":${num(p.x)},"y":${num(p.y)},"scale":${num(p.scale)},"rotation":${num(p.rotation)},"opacity":${num(p.opacity)},"blur":${num(p.blur)}}` +
+		`${curvesJson(a.curves)}}`
 	);
 }
 
@@ -103,6 +164,43 @@ function number(what: string, v: unknown): number {
 	return v;
 }
 
+/** A curve read as serde reads a `Curve`: a `kind`, then exactly that kind's fields, every one a number. */
+function readCurve(what: string, v: unknown): AnimationCurve {
+	if (!isObject(v)) throw new Error(`${what} is not an object`);
+	const fields = (kind: string, names: readonly string[]) => {
+		for (const k of Object.keys(v)) if (k !== 'kind' && !names.includes(k)) throw new Error(`unknown field \`${k}\` in ${what} (${kind})`);
+		for (const k of names) if (!Object.hasOwn(v, k)) throw new Error(`missing field \`${k}\` in ${what}`);
+	};
+	if (v.kind === 'spring') {
+		fields('spring', ['bounce']);
+		return { kind: 'spring', bounce: number('bounce', v.bounce) };
+	}
+	if (v.kind === 'speed') {
+		fields('speed', ['out_speed', 'out_influence', 'in_speed', 'in_influence']);
+		return {
+			kind: 'speed',
+			out_speed: number('out_speed', v.out_speed),
+			out_influence: number('out_influence', v.out_influence),
+			in_speed: number('in_speed', v.in_speed),
+			in_influence: number('in_influence', v.in_influence)
+		};
+	}
+	throw new Error(`${what} has no known kind`);
+}
+
+/** The curves of an animation read as serde reads `Curves`: absent is none, `null` is not an object, a property may be
+ *  `null`, a name it does not have is refused. */
+function readCurves(v: unknown): AnimationCurves | undefined {
+	if (v === undefined) return undefined;
+	const named = merged('curves', v, Object.fromEntries(CURVED.map((name) => [name, null as unknown])));
+	const curves: AnimationCurves = {};
+	for (const name of CURVED) {
+		const c = named[name];
+		if (c !== null && c !== undefined) curves[name] = readCurve(`the ${name} curve`, c);
+	}
+	return Object.keys(curves).length ? curves : undefined;
+}
+
 function oneOf<T extends string>(what: string, v: unknown, allowed: readonly T[]): T {
 	if (typeof v !== 'string' || !(allowed as readonly string[]).includes(v)) throw new Error(`${what} is not one of ${allowed.join(', ')}`);
 	return v as T;
@@ -115,7 +213,7 @@ export function parseAnimation(raw: string | undefined): TextAnimation | null {
 	try {
 		if (!seedsAreIntegers(raw)) return null;
 		const d = defaultAnimation();
-		const top = merged('the animation', JSON.parse(raw), { ...d, wiggle: d.wiggle as unknown });
+		const top = merged('the animation', JSON.parse(raw), { ...d, wiggle: d.wiggle as unknown, curves: undefined as unknown });
 		const range = merged('range', top.range, d.range);
 		const offset = merged('offset', range.offset, d.range.offset);
 		const properties = merged('properties', top.properties, d.properties);
@@ -152,6 +250,8 @@ export function parseAnimation(raw: string | undefined): TextAnimation | null {
 				blur: number('blur', properties.blur)
 			}
 		};
+		const curves = readCurves(top.curves);
+		if (curves) a.curves = curves;
 		return checkAnimation(a) ? null : a;
 	} catch {
 		return null;
@@ -160,6 +260,113 @@ export function parseAnimation(raw: string | undefined): TextAnimation | null {
 
 /** Whether two animations are the same one. */
 export const sameAnimation = (a: TextAnimation, b: TextAnimation): boolean => animationJson(a) === animationJson(b);
+
+/** The same animation with no curves (what a preset is, whatever has been done to its properties' paths). */
+const withoutCurves = (a: TextAnimation): TextAnimation => {
+	const { curves: _curves, ...rest } = a;
+	return rest;
+};
+
+/** A third of the way: the influence of After Effects' Easy Ease. */
+const THIRD = 1 / 3;
+
+const curve = (out_speed: number, out_influence: number, in_speed: number, in_influence: number): AnimationCurve => ({
+	kind: 'speed',
+	out_speed,
+	out_influence,
+	in_speed,
+	in_influence
+});
+
+/** The curves a picker lists, as `curve_presets` lists them (replayed against it by the corpus test): the harness's list,
+ *  and what the Inspector matches an animation's motion against. */
+export const CURVE_PRESETS: readonly AnimationCurvePreset[] = [
+	{ id: 'linear', name: 'Linear', description: 'Every property moves at one pace.', curve: null },
+	{
+		id: 'ease_in',
+		name: 'Ease in',
+		description: 'Starts slowly and arrives at full speed.',
+		curve: curve(0, THIRD, 1, THIRD)
+	},
+	{
+		id: 'ease_out',
+		name: 'Ease out',
+		description: 'Starts at full speed and slows into place.',
+		curve: curve(1, THIRD, 0, THIRD)
+	},
+	{
+		id: 'ease_in_out',
+		name: 'Ease in and out',
+		description: 'Slow to start and slow to arrive (Easy Ease).',
+		curve: curve(0, THIRD, 0, THIRD)
+	},
+	{
+		id: 'overshoot',
+		name: 'Overshoot',
+		description: 'Goes a little past its place, then comes back.',
+		curve: curve(4, 0.4, 0, 0.4)
+	},
+	{
+		id: 'spring',
+		name: 'Spring',
+		description: 'Swings past its place and back, settling like a spring.',
+		curve: { kind: 'spring', bounce: 0.5 }
+	}
+];
+
+/** Whether the animation moves, scales or turns the text: what a motion curve is for (`has_motion`). */
+export const hasMotion = (a: TextAnimation): boolean =>
+	a.properties.x !== 0 || a.properties.y !== 0 || a.properties.scale !== 1 || a.properties.rotation !== 0;
+
+/** The properties of the animation a motion curve goes on: x, y, scale and rotation, the ones it changes. */
+function motionProperties(a: TextAnimation): ('x' | 'y' | 'scale' | 'rotation')[] {
+	const p = a.properties;
+	const used: ('x' | 'y' | 'scale' | 'rotation')[] = [];
+	if (p.x !== 0) used.push('x');
+	if (p.y !== 0) used.push('y');
+	if (p.scale !== 1) used.push('scale');
+	if (p.rotation !== 0) used.push('rotation');
+	return used;
+}
+
+/** `a` with `curve` (`null`: a straight line) on each of x, y, scale and rotation that it changes and none on those it
+ *  does not; opacity's and blur's curves stay (`TextAnimation::with_motion_curve`, the same words). A curve for an
+ *  animation that moves, scales and turns nothing is refused. */
+export function withMotionCurve(a: TextAnimation, next: AnimationCurve | null): TextAnimation {
+	if (next) {
+		const why = checkCurve('the curve', next);
+		if (why) throw new Error(`invalid argument: ${why}`);
+		if (!hasMotion(a)) {
+			throw new Error('invalid argument: this animation changes no x, y, scale or rotation, so a motion curve has nothing to shape');
+		}
+	}
+	const used = motionProperties(a);
+	const curves: AnimationCurves = { ...a.curves };
+	for (const name of ['x', 'y', 'scale', 'rotation'] as const) delete curves[name];
+	if (next) for (const name of used) curves[name] = { ...next };
+	const out = withoutCurves(a);
+	const kept = Object.fromEntries(CURVED.flatMap((name) => (curves[name] ? [[name, curves[name]]] : [])));
+	return Object.keys(kept).length ? { ...out, curves: kept } : out;
+}
+
+/** The curve every one of x, y, scale and rotation that `a` changes shares (`curve` `null`: a straight line, which an
+ *  animation that changes none of them has too), or `mixed` when they differ (`TextAnimation::motion_curve`). */
+export function motionCurveOf(a: TextAnimation): { mixed: boolean; curve: AnimationCurve | null } {
+	const curves = motionProperties(a).map((name) => a.curves?.[name] ?? null);
+	if (curves.length === 0) return { mixed: false, curve: null };
+	const first = curves[0] ? curveJson(curves[0]) : null;
+	const same = curves.every((c) => (c ? curveJson(c) : null) === first);
+	return same ? { mixed: false, curve: curves[0] } : { mixed: true, curve: null };
+}
+
+/** The id of the curve preset `a`'s motion has, or `null` for a mix or a curve of its own. */
+export function curveIdOf(a: TextAnimation): string | null {
+	const { mixed, curve: c } = motionCurveOf(a);
+	if (mixed) return null;
+	if (!c) return 'linear';
+	const json = curveJson(c);
+	return CURVE_PRESETS.find((p) => p.curve && curveJson(p.curve) === json)?.id ?? null;
+}
 
 const props = (p: Partial<TextAnimation['properties']>): TextAnimation['properties'] => ({
 	...defaultAnimation().properties,
@@ -233,6 +440,9 @@ export const TEXT_ANIMATION_PRESETS: readonly TextAnimationPreset[] = [
 	})
 ];
 
-/** The id of the preset `a` is, or `null`. */
-export const presetOf = (a: TextAnimation | null): string | null =>
-	a ? (TEXT_ANIMATION_PRESETS.find((p) => sameAnimation(p.animation, a))?.id ?? null) : null;
+/** The id of the preset `a` is, or `null`; a preset with curves on it is still that preset. */
+export const presetOf = (a: TextAnimation | null): string | null => {
+	if (!a) return null;
+	const bare = withoutCurves(a);
+	return TEXT_ANIMATION_PRESETS.find((p) => sameAnimation(p.animation, bare))?.id ?? null;
+};

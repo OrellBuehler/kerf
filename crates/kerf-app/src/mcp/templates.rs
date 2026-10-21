@@ -180,7 +180,11 @@ pub(super) struct SetTitleTextAnimationParams {
     #[schemars(description = "Seconds the animation takes (0.05 to 30); changes a `preset`'s own")]
     duration: Option<f64>,
     #[schemars(
-        description = "A whole animation of your own instead of a `preset`: `by` (character | word | line), `delay`, `duration`, `easing` (linear | ease_in | ease_out | ease_in_out), `range` {start, end, offset {from, to}, shape} (a window over the text, as fractions of it, slid from offset.from to offset.to; shape square | ramp_up | ramp_down | triangle | round | smooth: the amount each unit gets, 0 to 1), `wiggle` {rate, min, max, correlation, seed} (noise that multiplies the amount, or null) and `properties` {x, y, scale, rotation, opacity, blur} (what a unit does at an amount of 1: x and y in em, rotation in degrees, blur in em; scale 1, opacity 1 and the rest 0 change nothing, and at least one must). Every field has a default"
+        description = "The id of a ready-made curve (list_text_animation_curves): linear, ease_in, ease_out, ease_in_out, overshoot or spring. It shapes how the x, y, scale and rotation the animation changes travel to their place (an overshoot or a spring goes past it and comes back); opacity and blur stay as they are. Replaces the curves of those four that a `preset` or `animation` has; needs one of them, and an animation that moves, scales and turns nothing has nothing for a curve to shape"
+    )]
+    curve: Option<String>,
+    #[schemars(
+        description = "A whole animation of your own instead of a `preset`: `by` (character | word | line), `delay`, `duration`, `easing` (linear | ease_in | ease_out | ease_in_out), `range` {start, end, offset {from, to}, shape} (a window over the text, as fractions of it, slid from offset.from to offset.to; shape square | ramp_up | ramp_down | triangle | round | smooth: the amount each unit gets, 0 to 1), `wiggle` {rate, min, max, correlation, seed} (noise that multiplies the amount, or null), `properties` {x, y, scale, rotation, opacity, blur} (what a unit does at an amount of 1: x and y in em, rotation in degrees, blur in em; scale 1, opacity 1 and the rest 0 change nothing, and at least one must) and `curves` {x, y, scale, rotation, opacity, blur} (how each property travels there, each null for a straight line or {kind: \"spring\", bounce 0.05..0.8} or {kind: \"speed\", out_speed, out_influence, in_speed, in_influence}: After Effects' speed and influence, the speeds -5..5 times the average and the influences 0.01..1; see list_text_animation_curves). A curve is written for a unit settling into its place, as in every preset; a square window has nothing to shape. Every field has a default"
     )]
     animation: Option<kerf_core::svg::TextAnimation>,
 }
@@ -246,29 +250,45 @@ fn bad(message: impl Into<String>) -> McpError {
 }
 
 /// The animation a `set_title_text_animation` call asks for: a preset or a whole animation (not both), `delay` and
-/// `duration` overriding either's own, or none (the animation taken away).
+/// `duration` overriding either's own, `curve` (a curve preset's id) put on the properties it moves, or none (the
+/// animation taken away).
 fn resolve_animation(
     preset: Option<&str>,
     animation: Option<kerf_core::svg::TextAnimation>,
     delay: Option<f64>,
     duration: Option<f64>,
+    curve: Option<&str>,
 ) -> Result<Option<kerf_core::svg::TextAnimation>, McpError> {
     let timed = |mut a: kerf_core::svg::TextAnimation| {
         a.delay = delay.unwrap_or(a.delay);
         a.duration = duration.unwrap_or(a.duration);
-        Some(a)
+        a
     };
-    match (preset, animation) {
-        (Some(_), Some(_)) => Err(bad("give a `preset` or an `animation`, not both")),
+    let resolved = match (preset, animation) {
+        (Some(_), Some(_)) => return Err(bad("give a `preset` or an `animation`, not both")),
         (Some(id), None) => match kerf_core::svg::text_animation_preset(id) {
-            Some(found) => Ok(timed(found.animation)),
-            None => Err(bad(format!(
-                "no text animation preset \u{201c}{id}\u{201d}; see list_text_animation_presets"
-            ))),
+            Some(found) => Some(timed(found.animation)),
+            None => {
+                return Err(bad(format!(
+                    "no text animation preset \u{201c}{id}\u{201d}; see list_text_animation_presets"
+                )))
+            }
         },
-        (None, Some(a)) => Ok(timed(a)),
-        (None, None) => Ok(None),
-    }
+        (None, Some(a)) => Some(timed(a)),
+        (None, None) => None,
+    };
+    let Some(id) = curve else { return Ok(resolved) };
+    let Some(animation) = resolved else {
+        return Err(bad(
+            "a `curve` shapes the animation of a `preset` or an `animation`: give one",
+        ));
+    };
+    let Some(found) = kerf_core::svg::curve_preset(id) else {
+        return Err(bad(format!(
+            "no text animation curve \u{201c}{id}\u{201d}; see list_text_animation_curves"
+        )));
+    };
+    animation.with_motion_curve(found.curve).map(Some).map_err(core_err)
 }
 
 fn library() -> Result<TemplateLibrary, McpError> {
@@ -557,12 +577,25 @@ impl KerfMcp {
     }
 
     #[tool(
+        description = "List the curves set_title_text_animation can put on an animation by `curve` id, each with the \
+                       curve it stands for (`null` for the straight line; read them to write your own `curves`): \
+                       linear, ease_in, ease_out, ease_in_out (After Effects' speed and influence), overshoot (goes a \
+                       little past its place, then comes back) and spring (swings past and back, settling). A curve is \
+                       written for a unit settling into its place, as every preset does; a unit leaving it walks the \
+                       same path backwards, and a `square` window has nothing to shape."
+    )]
+    fn list_text_animation_curves(&self) -> Result<String, McpError> {
+        json(&kerf_core::svg::curve_presets())
+    }
+
+    #[tool(
         description = "Animate a <text> of an animated title (custom or a template, floating or a title clip; not a \
                        preset) letter by letter: pick a ready-made `preset` (list_text_animation_presets) or write an \
                        `animation` of your own, a window that slides over the characters, words or lines of the text \
                        (a typewriter, a stagger) and/or seeded noise (a wiggle), driving each unit's position, scale, \
-                       rotation, opacity and blur in em. It runs from `delay` for `duration` seconds on the title's \
-                       own clock; the title's default length follows it. Omit `preset` and `animation` to take the \
+                       rotation, opacity and blur in em, and a `curve` (list_text_animation_curves: ease_out, an \
+                       overshoot, a spring) shapes how they travel. It runs from `delay` for `duration` seconds on \
+                       the title's own clock; the title's default length follows it. Omit `preset` and `animation` to take the \
                        animation away. It is compiled to per-glyph SMIL when the text is glyph outlines, so the \
                        title's text is set as outlines (see convert_title_text); a text that cannot be one (a \
                        textPath, positioned tspans, ...) is an error saying why, and so is an animation with nothing \
@@ -574,7 +607,7 @@ impl KerfMcp {
     )]
     async fn set_title_text_animation(&self, Parameters(p): Parameters<SetTitleTextAnimationParams>) -> Result<String, McpError> {
         let title_id = parse_arg("title_id", &p.title_id)?;
-        let animation = resolve_animation(p.preset.as_deref(), p.animation, p.delay, p.duration)?;
+        let animation = resolve_animation(p.preset.as_deref(), p.animation, p.delay, p.duration, p.curve.as_deref())?;
         let (project, owner, element) = (self.project.clone(), self.owner(), p.element);
         let prepared = blocking(move || {
             let inputs = lock_agent_as(&project, owner.as_deref())
@@ -1079,31 +1112,68 @@ mod tests {
     #[test]
     fn a_preset_or_an_animation_of_ones_own_with_its_timing_changed_or_none_at_all() {
         let rise = kerf_core::svg::text_animation_preset("rise").unwrap().animation;
-        assert_eq!(resolve_animation(Some("rise"), None, None, None).unwrap(), Some(rise.clone()));
-        let slower = resolve_animation(Some("rise"), None, Some(0.5), Some(3.0)).unwrap().unwrap();
+        assert_eq!(
+            resolve_animation(Some("rise"), None, None, None, None).unwrap(),
+            Some(rise.clone())
+        );
+        let slower = resolve_animation(Some("rise"), None, Some(0.5), Some(3.0), None)
+            .unwrap()
+            .unwrap();
         assert_eq!((slower.delay, slower.duration), (0.5, 3.0));
         assert_eq!(slower.properties, rise.properties, "only the timing changed");
         let own = kerf_core::svg::TextAnimation { duration: 2.0, ..rise };
         assert_eq!(
-            resolve_animation(None, Some(own.clone()), None, None).unwrap(),
+            resolve_animation(None, Some(own.clone()), None, None, None).unwrap(),
             Some(own.clone())
         );
         assert_eq!(
-            resolve_animation(None, Some(own), None, Some(4.0)).unwrap().unwrap().duration,
+            resolve_animation(None, Some(own), None, Some(4.0), None)
+                .unwrap()
+                .unwrap()
+                .duration,
             4.0
         );
         assert_eq!(
-            resolve_animation(None, None, Some(1.0), Some(1.0)).unwrap(),
+            resolve_animation(None, None, Some(1.0), Some(1.0), None).unwrap(),
             None,
             "neither takes it away"
         );
-        let both = resolve_animation(Some("rise"), Some(rise), None, None).unwrap_err();
+        let both = resolve_animation(Some("rise"), Some(rise), None, None, None).unwrap_err();
         assert!(both.message.contains("not both"), "{}", both.message);
-        let unknown = resolve_animation(Some("spin"), None, None, None).unwrap_err();
+        let unknown = resolve_animation(Some("spin"), None, None, None, None).unwrap_err();
         assert!(
             unknown.message.contains("spin") && unknown.message.contains("list_text_animation_presets"),
             "{}",
             unknown.message
         );
+    }
+
+    #[test]
+    fn a_curve_goes_on_what_the_animation_moves_or_is_refused_by_name() {
+        let rise = kerf_core::svg::text_animation_preset("rise").unwrap().animation;
+        let sprung = resolve_animation(Some("rise"), None, None, Some(2.0), Some("spring"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(sprung.duration, 2.0);
+        assert_eq!(sprung.curves.y, kerf_core::svg::curve_preset("spring").unwrap().curve);
+        assert_eq!((sprung.curves.x, sprung.curves.opacity), (None, None));
+        assert_eq!(sprung.properties, rise.properties);
+        // It also shapes an animation of one's own, and linear takes a curve off.
+        let own = resolve_animation(None, Some(sprung), None, None, Some("linear"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(own.curves, Default::default());
+        let unknown = resolve_animation(Some("rise"), None, None, None, Some("bouncy")).unwrap_err();
+        assert!(
+            unknown.message.contains("bouncy") && unknown.message.contains("list_text_animation_curves"),
+            "{}",
+            unknown.message
+        );
+        let alone = resolve_animation(None, None, None, None, Some("spring")).unwrap_err();
+        assert!(alone.message.contains("preset"), "{}", alone.message);
+        // Nothing to shape: a fade moves nothing.
+        let fade = resolve_animation(Some("fade_in"), None, None, None, Some("spring")).unwrap_err();
+        assert!(fade.message.contains("nothing to shape"), "{}", fade.message);
+        assert!(resolve_animation(Some("fade_in"), None, None, None, Some("linear")).is_ok());
     }
 }

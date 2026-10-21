@@ -86,7 +86,7 @@ schemars = "1.2"
 axum = "0.8"
 # The server's shutdown token (rmcp takes this type) and the OS RNG behind the bearer token.
 tokio-util = "0.7"
-getrandom = "0.3"
+getrandom = "0.4"
 
 # Desktop shell — Tauri v2
 tauri = { version = "2", features = [] }

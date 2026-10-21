@@ -20,10 +20,14 @@
 //!
 //! The animation runs from `delay` for `duration` seconds on the title's own clock; before and after it a unit
 //! is where the selectors put it at the start and at the end.
+//!
+//! Each property can have a **curve** (`curve.rs`) for the path it takes to its value: After Effects' speed and
+//! influence ease, or a spring. Without one it moves in a straight line, as it always did.
 
 use roxmltree::Document;
 use serde::{Deserialize, Serialize};
 
+use super::curve::{Curve, Curves};
 use super::outline::TEXT_MARK;
 use super::sanitize::{apply, escape_attr, nesting_exceeds, plain_attribute, start_tag_end, SVG_NS};
 use super::{invalid, xml_options, MAX_BYTES, MAX_DEPTH};
@@ -38,6 +42,12 @@ pub const MAX_DURATION: f64 = 30.0;
 pub const MIN_DURATION: f64 = 0.05;
 /// How far a window or its offset may reach, in text lengths.
 pub const MAX_REACH: f64 = 10.0;
+/// The largest a property may be at an amount of 1 (and so the farthest a curve may carry it): a move in em, a
+/// turn in degrees, a scale, a blur in em.
+pub(crate) const MAX_MOVE: f64 = 20.0;
+pub(crate) const MAX_TURN: f64 = 3600.0;
+pub(crate) const MAX_SCALE: f64 = 10.0;
+pub(crate) const MAX_BLUR: f64 = 1.0;
 /// The largest a stored animation may be, in bytes of JSON.
 const MAX_JSON: usize = 8 * 1024;
 
@@ -220,6 +230,9 @@ pub struct TextAnimation {
     /// Noise on top of the range, or none.
     pub wiggle: Option<Wiggle>,
     pub properties: Properties,
+    /// How each property travels to its value (`curve.rs`): a straight line unless one is given.
+    #[serde(skip_serializing_if = "Curves::is_empty")]
+    pub curves: Curves,
 }
 
 impl Default for TextAnimation {
@@ -232,6 +245,7 @@ impl Default for TextAnimation {
             range: RangeSelector::default(),
             wiggle: None,
             properties: Properties::default(),
+            curves: Curves::default(),
         }
     }
 }
@@ -267,12 +281,13 @@ impl TextAnimation {
             within("wiggle correlation", w.correlation, 0.0, 1.0)?;
         }
         let p = &self.properties;
-        within("x", p.x, -20.0, 20.0)?;
-        within("y", p.y, -20.0, 20.0)?;
-        within("scale", p.scale, 0.0, 10.0)?;
-        within("rotation", p.rotation, -3600.0, 3600.0)?;
+        within("x", p.x, -MAX_MOVE, MAX_MOVE)?;
+        within("y", p.y, -MAX_MOVE, MAX_MOVE)?;
+        within("scale", p.scale, 0.0, MAX_SCALE)?;
+        within("rotation", p.rotation, -MAX_TURN, MAX_TURN)?;
         within("opacity", p.opacity, 0.0, 1.0)?;
-        within("blur", p.blur, 0.0, 1.0)?;
+        within("blur", p.blur, 0.0, MAX_BLUR)?;
+        self.curves.check()?;
         if !p.animates_something() {
             return Err(invalid(
                 "a text animation changes nothing: give it an x, y, scale, rotation, opacity or blur other than the neutral one",
@@ -299,6 +314,48 @@ impl TextAnimation {
     /// When the animation has run, on the title's clock.
     pub fn end(&self) -> f64 {
         self.delay + self.duration
+    }
+
+    /// Whether it moves, scales or turns the text: the properties a motion curve is for.
+    pub fn has_motion(&self) -> bool {
+        self.properties.moves() || self.properties.scales() || self.properties.turns()
+    }
+
+    /// This animation with `curve` (`None`: a straight line) on each of x, y, scale and rotation that it changes, and
+    /// no curve on those it does not; the opacity and blur curves stay as they are (a fade has nothing to overshoot,
+    /// and a spring on it only trembles below 1). A curve for an animation that moves, scales and turns nothing is
+    /// refused rather than dropped.
+    pub fn with_motion_curve(&self, curve: Option<Curve>) -> Result<TextAnimation> {
+        if let Some(c) = &curve {
+            c.check("the curve")?;
+            if !self.has_motion() {
+                return Err(invalid(
+                    "this animation changes no x, y, scale or rotation, so a motion curve has nothing to shape",
+                ));
+            }
+        }
+        let p = &self.properties;
+        let mut out = self.clone();
+        out.curves.x = curve.filter(|_| p.x != 0.0);
+        out.curves.y = curve.filter(|_| p.y != 0.0);
+        out.curves.scale = curve.filter(|_| p.scales());
+        out.curves.rotation = curve.filter(|_| p.turns());
+        Ok(out)
+    }
+
+    /// The curve every one of x, y, scale and rotation that this animation changes shares (`Some(None)`: a straight
+    /// line, which an animation that changes none of them has too), or `None` when they differ.
+    pub fn motion_curve(&self) -> Option<Option<Curve>> {
+        let p = &self.properties;
+        let used = [
+            (p.x != 0.0).then_some(self.curves.x),
+            (p.y != 0.0).then_some(self.curves.y),
+            p.scales().then_some(self.curves.scale),
+            p.turns().then_some(self.curves.rotation),
+        ];
+        let mut used = used.into_iter().flatten();
+        let first = used.next().unwrap_or(None);
+        used.all(|c| c == first).then_some(first)
     }
 }
 
@@ -552,6 +609,7 @@ pub fn text_animation_preset(id: &str) -> Option<TextAnimationPreset> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::curve::{curve_preset, curve_presets};
     use super::super::sanitize::value_range;
     use super::*;
 
@@ -637,6 +695,110 @@ mod tests {
         assert_eq!((a.duration, a.by, a.properties.opacity), (1.0, AnimateBy::Character, 1.0));
     }
 
+    fn spring() -> Curve {
+        curve_preset("spring").unwrap().curve.unwrap()
+    }
+
+    #[test]
+    fn an_animation_without_curves_writes_none_and_reads_curves_back() {
+        // The presets are what they were: no `curves` in their JSON.
+        for p in text_animation_presets() {
+            assert!(!p.animation.to_attribute().contains("curves"), "{}", p.id);
+        }
+        let a = rise().with_motion_curve(Some(spring())).unwrap();
+        let json = a.to_attribute();
+        assert!(json.ends_with(r#""curves":{"y":{"kind":"spring","bounce":0.5}}}"#), "{json}");
+        assert_eq!(TextAnimation::from_attribute(&json).unwrap(), a);
+        // Curves are optional, null is none, and an unknown property or field is refused.
+        assert!(TextAnimation::from_attribute(r#"{"properties":{"y":1},"curves":{}}"#).is_ok());
+        let nulls = TextAnimation::from_attribute(r#"{"properties":{"y":1},"curves":{"y":null}}"#).unwrap();
+        assert_eq!(nulls.curves, Curves::default());
+        assert!(TextAnimation::from_attribute(r#"{"properties":{"y":1},"curves":{"z":null}}"#).is_err());
+        assert!(TextAnimation::from_attribute(r#"{"properties":{"y":1},"curves":{"y":{"kind":"spring"}}}"#).is_err());
+        assert!(TextAnimation::from_attribute(r#"{"properties":{"y":1},"curves":null}"#).is_err());
+    }
+
+    #[test]
+    fn a_curve_out_of_bounds_is_refused_by_the_property_it_is_on() {
+        let on = |f: fn(&mut Curves, Curve)| {
+            let mut a = rise();
+            f(&mut a.curves, Curve::Spring { bounce: 0.99 });
+            a.check().unwrap_err().to_string()
+        };
+        assert!(on(|c, v| c.y = Some(v)).contains("y curve") && on(|c, v| c.y = Some(v)).contains("bounce"));
+        assert!(on(|c, v| c.x = Some(v)).contains("x curve"));
+        assert!(on(|c, v| c.scale = Some(v)).contains("scale curve"));
+        assert!(on(|c, v| c.rotation = Some(v)).contains("rotation curve"));
+        assert!(on(|c, v| c.opacity = Some(v)).contains("opacity curve"));
+        assert!(on(|c, v| c.blur = Some(v)).contains("blur curve"));
+        let mut b = rise();
+        b.curves.y = Some(Curve::Speed {
+            out_speed: 9.0,
+            out_influence: 0.3,
+            in_speed: 0.0,
+            in_influence: 0.3,
+        });
+        assert!(set_text_animation(&doc(r#"<text id="t">a</text>"#), "t", Some(&b))
+            .unwrap_err()
+            .to_string()
+            .contains("out speed"));
+    }
+
+    #[test]
+    fn a_motion_curve_goes_on_what_the_animation_moves_and_nothing_else() {
+        // rise changes y and opacity; pop scale and opacity; spin_in scale, rotation and opacity.
+        let r = rise().with_motion_curve(Some(spring())).unwrap();
+        assert_eq!(
+            r.curves,
+            Curves {
+                y: Some(spring()),
+                ..Curves::default()
+            },
+            "only y: not x (unchanged), not opacity"
+        );
+        let spin = text_animation_preset("spin_in")
+            .unwrap()
+            .animation
+            .with_motion_curve(Some(spring()))
+            .unwrap();
+        assert_eq!((spin.curves.scale, spin.curves.rotation), (Some(spring()), Some(spring())));
+        assert_eq!(
+            (spin.curves.x, spin.curves.y, spin.curves.opacity, spin.curves.blur),
+            (None, None, None, None)
+        );
+        // A straight line takes them off again, and leaves a fade's own curve alone.
+        let mut fading = r.clone();
+        fading.curves.opacity = Some(Curve::Spring { bounce: 0.2 });
+        let straight = fading.with_motion_curve(None).unwrap();
+        assert_eq!(straight.curves.y, None);
+        assert_eq!(straight.curves.opacity, Some(Curve::Spring { bounce: 0.2 }));
+        // What it reads back: one curve, none, or a mix.
+        assert_eq!(r.motion_curve(), Some(Some(spring())));
+        assert_eq!(rise().motion_curve(), Some(None));
+        let mut mixed = spin.clone();
+        mixed.curves.rotation = curve_preset("overshoot").unwrap().curve;
+        assert_eq!(mixed.motion_curve(), None);
+        let mut half = spin;
+        half.curves.rotation = None;
+        assert_eq!(half.motion_curve(), None, "one of two moved properties has it");
+        // A property the animation does not change is not read, so a stale curve on it does not make a mix.
+        let mut stale = r;
+        stale.curves.x = curve_preset("overshoot").unwrap().curve;
+        assert_eq!(stale.motion_curve(), Some(Some(spring())));
+        // Nothing to move: a curve is refused, a straight line is not.
+        let fade = text_animation_preset("fade_in").unwrap().animation;
+        assert!(!fade.has_motion() && rise().has_motion());
+        let err = fade.with_motion_curve(Some(spring())).unwrap_err().to_string();
+        assert!(err.contains("nothing to shape"), "{err}");
+        assert_eq!(fade.with_motion_curve(None).unwrap(), fade);
+        let wild = Curve::Spring { bounce: 2.0 };
+        assert!(rise()
+            .with_motion_curve(Some(wild))
+            .unwrap_err()
+            .to_string()
+            .contains("bounce"));
+    }
+
     const CORPUS_PATH: &str = concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/../../frontend/src/lib/fixtures/text-animation-corpus.json"
@@ -698,6 +860,45 @@ mod tests {
                 Some(tricky),
             ),
             (
+                "a spring on a rise",
+                doc(r#"<text id="t" x="5" y="50">Hi</text>"#),
+                "t",
+                Some(rise().with_motion_curve(curve_preset("spring").unwrap().curve).unwrap()),
+            ),
+            (
+                "curves of every kind, replacing a plain animation",
+                doc(&format!(
+                    r#"<text id="t" data-kerf-animate='{}'>Hi</text>"#,
+                    rise().to_attribute()
+                )),
+                "t",
+                Some({
+                    let mut a = text_animation_preset("spin_in").unwrap().animation;
+                    a.curves = Curves {
+                        scale: curve_preset("overshoot").unwrap().curve,
+                        rotation: Some(Curve::Speed {
+                            out_speed: -1.5,
+                            out_influence: 0.25,
+                            in_speed: 0.5,
+                            in_influence: 0.125,
+                        }),
+                        opacity: Some(Curve::Spring { bounce: 0.05 }),
+                        ..Curves::default()
+                    };
+                    a
+                }),
+            ),
+            (
+                "a curve out of bounds is refused",
+                doc(r#"<text id="t">a</text>"#),
+                "t",
+                Some({
+                    let mut a = rise();
+                    a.curves.y = Some(Curve::Spring { bounce: 0.95 });
+                    a
+                }),
+            ),
+            (
                 "nothing to change",
                 doc(r#"<text id="t">a</text>"#),
                 "t",
@@ -743,14 +944,103 @@ mod tests {
         serde_json::json!({
             "about": "Written by kerf-core (svg/text_animation.rs); replayed by text-animation-corpus.test.ts. Regenerate: KERF_BLESS_CORPUS=1 cargo test -p kerf-core --no-default-features -- text_animation_corpus",
             "presets": text_animation_presets(),
+            "curves": curve_presets(),
             "cases": cases,
             "parses": parse_corpus(),
+            "motion": motion_corpus(),
         })
+    }
+
+    /// `with_motion_curve` and `motion_curve` over animations that move different things, with every preset curve, one
+    /// of the extremes and some that are refused: for the frontend's `withMotionCurve` and `motionCurveOf`.
+    fn motion_corpus() -> Vec<serde_json::Value> {
+        let preset = |id: &str| text_animation_preset(id).unwrap().animation;
+        let read = |a: &TextAnimation| match a.motion_curve() {
+            Some(curve) => serde_json::json!({ "mixed": false, "curve": curve }),
+            None => serde_json::json!({ "mixed": true, "curve": null }),
+        };
+        let extreme = Curve::Speed {
+            out_speed: -5.0,
+            out_influence: 0.01,
+            in_speed: 5.0,
+            in_influence: 1.0,
+        };
+        let mut curves: Vec<(String, Option<Curve>)> = curve_presets().into_iter().map(|p| (p.id, p.curve)).collect();
+        curves.push(("an extreme".into(), Some(extreme)));
+        curves.push(("a spring that bounces too much".into(), Some(Curve::Spring { bounce: 0.9 })));
+        curves.push((
+            "an influence of nothing".into(),
+            Some(Curve::Speed {
+                out_speed: 1.0,
+                out_influence: 0.0,
+                in_speed: 1.0,
+                in_influence: 0.5,
+            }),
+        ));
+        let animations = [
+            ("rise", preset("rise")),
+            ("pop", preset("pop")),
+            ("spin_in", preset("spin_in")),
+            ("fade_in", preset("fade_in")),
+            ("wiggle", preset("wiggle")),
+            ("blur_in", preset("blur_in")),
+        ];
+        let mut cases = Vec::new();
+        for (name, animation) in &animations {
+            for (curve_name, curve) in &curves {
+                let expect = match animation.with_motion_curve(*curve) {
+                    Ok(a) => serde_json::json!({ "ok": { "motion": read(&a), "animation": a } }),
+                    Err(e) => serde_json::json!({ "err": e.to_string() }),
+                };
+                cases.push(serde_json::json!({
+                    "name": format!("{name} with {curve_name}"),
+                    "animation": animation,
+                    "curve": curve,
+                    "expect": expect,
+                }));
+            }
+        }
+        // Animations that already have curves: replaced, cleared, left alone on a fade, mixed.
+        let spring = curve_preset("spring").unwrap().curve;
+        let over = curve_preset("overshoot").unwrap().curve;
+        let mut with_fade = preset("rise");
+        with_fade.curves.opacity = Some(Curve::Spring { bounce: 0.3 });
+        with_fade.curves.x = over;
+        let mut mixed = preset("spin_in");
+        mixed.curves.scale = spring;
+        mixed.curves.rotation = over;
+        let mut half = preset("spin_in");
+        half.curves.scale = spring;
+        for (name, animation) in [
+            ("a fade's curve and a stale x curve", with_fade),
+            ("two moved properties with two curves", mixed),
+            ("one of two moved properties curved", half),
+        ] {
+            for (curve_name, curve) in [("none", None), ("a spring", spring)] {
+                let expect = match animation.with_motion_curve(curve) {
+                    Ok(a) => serde_json::json!({ "ok": { "motion": read(&a), "animation": a } }),
+                    Err(e) => serde_json::json!({ "err": e.to_string() }),
+                };
+                cases.push(serde_json::json!({
+                    "name": format!("{name} given {curve_name}"),
+                    "animation": animation,
+                    "curve": curve,
+                    "expect": expect,
+                }));
+            }
+            cases.push(serde_json::json!({
+                "name": format!("{name} read"),
+                "animation": animation,
+                "read": read(&animation),
+            }));
+        }
+        cases
     }
 
     /// Attribute JSON, as `from_attribute` reads it: for `parseAnimation`, which has to refuse what serde does.
     fn parse_corpus() -> Vec<serde_json::Value> {
         let wiggle = |w: &str| format!(r#"{{"properties":{{"opacity":0}},"wiggle":{w}}}"#);
+        let curved = |c: &str| format!(r#"{{"properties":{{"y":0.5,"scale":0}},"curves":{c}}}"#);
         let cases: Vec<(&str, String)> = vec![
             ("only what differs from the defaults", r#"{"properties":{"y":0.5}}"#.into()),
             ("every field", rise().to_attribute()),
@@ -810,6 +1100,43 @@ mod tests {
                 "a number too big for a float",
                 r#"{"duration":1e999,"properties":{"opacity":0}}"#.into(),
             ),
+            ("a spring", curved(r#"{"y":{"kind":"spring","bounce":0.5}}"#)),
+            (
+                "a speed ease with whole numbers",
+                curved(r#"{"scale":{"kind":"speed","out_speed":4,"out_influence":1,"in_speed":0,"in_influence":1}}"#),
+            ),
+            ("a curve that is null", curved(r#"{"y":null}"#)),
+            ("no curves at all", curved("{}")),
+            ("curves that are null", curved("null")),
+            ("an unknown property", curved(r#"{"z":{"kind":"spring","bounce":0.5}}"#)),
+            ("an inherited name as a property", curved(r#"{"constructor":null}"#)),
+            ("an unknown kind", curved(r#"{"y":{"kind":"wobble","bounce":0.5}}"#)),
+            ("a curve with no kind", curved(r#"{"y":{"bounce":0.5}}"#)),
+            ("a spring with no bounce", curved(r#"{"y":{"kind":"spring"}}"#)),
+            (
+                "a spring with another field",
+                curved(r#"{"y":{"kind":"spring","bounce":0.5,"out_speed":1}}"#),
+            ),
+            (
+                "a spring that bounces too much",
+                curved(r#"{"y":{"kind":"spring","bounce":0.9}}"#),
+            ),
+            ("a spring of a string", curved(r#"{"y":{"kind":"spring","bounce":"0.5"}}"#)),
+            (
+                "a speed ease missing a handle",
+                curved(r#"{"y":{"kind":"speed","out_speed":1,"out_influence":0.5,"in_speed":1}}"#),
+            ),
+            (
+                "a speed ease with no influence",
+                curved(r#"{"y":{"kind":"speed","out_speed":1,"out_influence":0,"in_speed":1,"in_influence":0.5}}"#),
+            ),
+            (
+                "a speed ease too fast",
+                curved(r#"{"y":{"kind":"speed","out_speed":5.5,"out_influence":0.5,"in_speed":1,"in_influence":0.5}}"#),
+            ),
+            ("a curve that is a string", curved(r#"{"y":"spring"}"#)),
+            ("a curve that is an array", curved(r#"{"y":[]}"#)),
+            ("a kind that is a number", curved(r#"{"y":{"kind":1,"bounce":0.5}}"#)),
             ("nothing that changes", "{}".into()),
             ("an array", "[]".into()),
             ("null", "null".into()),
