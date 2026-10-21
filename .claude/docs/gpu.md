@@ -11,7 +11,7 @@ Windows) and nothing may depend on an optional wgpu feature. **A GPU failure is 
 error, not a panic**: every unit of wgpu work runs in out-of-memory / validation /
 internal error scopes (`Gpu::guarded`), anything uncaptured is logged and remembered,
 `Compositor::new` and `composite` return `Result` (and `Compositor::caps()` says what it
-draws, `GpuCaps::A0` plus `text`, `motion`, `fades`, `transitions`, `dip_white`, `keyed_zoom`, `keyed_opacity`, `keyed_color`, `mask`, `grade` (every kind) and the blur / sharpen / grayscale / invert / vignette / chroma key `effects` today, which `composite` / `render_plan` judge the plan by), and a lost device is tracked — every
+draws, `GpuCaps::A0` plus `text`, `motion`, `fades`, `transitions`, `dip_white`, `keyed_zoom`, `keyed_opacity`, `keyed_color`, `mask`, `grade` (every kind, where `grade::measured()` says this FFmpeg's conversions are the model's: `Compositor::caps()` drops it otherwise) and the blur / sharpen / grayscale / invert / vignette / chroma key `effects` today, which `composite` / `render_plan` judge the plan by), and a lost device is tracked — every
 later call is `GpuError::DeviceLost` and the **owner builds a new `Gpu` and
 `Compositor`** (the device is not recreated behind the caller's back).
 
@@ -544,7 +544,7 @@ Over a full-range picture on 9.0 (text drawn in full range, converted last) the 
 
 **The runtime self-test** (`selftest.rs`, `parity_self_test(&Arc<Gpu>)`). Parity is proven in CI on two FFmpeg
 builds and one software adapter; a user has a third FFmpeg and a real GPU, so the first use of the GPU path
-(the app: `app.md`) draws four small frames on the compositor and through that machine's own FFmpeg and holds
+(the app: `app.md`) draws up to four small frames on the compositor and through that machine's own FFmpeg and holds
 them to the harness's **strict limits** (`PSNR_FLAT_MIN` 40 dB, `MAX_FLAT` 8, `PSNR_ALL_MIN` 40, `FLAT_SHARE_MIN`
 0.5, the same edge band: constants and `compare` are copies of `tests/parity.rs`', and
 `the_runtime_self_test_judges_by_the_limits_and_the_comparison_of_this_harness` holds them equal). The frames:
@@ -552,6 +552,7 @@ them to the harness's **strict limits** (`PSNR_FLAT_MIN` 40 dB, `MAX_FLAT` 8, `P
 cropped, 80%-opaque, graded picture-in-picture: the scaler down, `eq`, the opacity round trip, `overlay`) and
 `bt709` (a BT.709-tagged stack: the composite colour policy the plan was given, which is how 6 and 9 differ) and
 `grade` (a 640x360 untagged clip through a 5^3 LUT, curves and wheels: the x86 conversion kernels of this machine's FFmpeg, which is what `grade::kernels()` also asks).
+**The grade's frame is drawn only where `grade::kernels()` is `Match`**: the plan refuses a graded layer otherwise (`Compositor::caps()`, below), so there is no frame to draw, and a self-test that tried to would stop on `Inconclusive` ("the plan refuses its own check frame") and close the whole GPU path on a machine whose FFmpeg merely differs (an arm64 build, or a probe that timed out) even for ungraded frames. `parity_self_test` asks `kernels_for_selftest()` first, makes no graded clip, and the other three decide the check; `run` takes the answer as a parameter (`a_machine_whose_conversions_differ_or_are_unknown_is_checked_on_the_other_three_frames`: `Differs` and `Unknown` pass on `fit`, `pip`, `bt709` alone; the wrong colour policy still fails `bt709`). **A probe that could not tell holds the grade back**: `kernels_for_selftest()` returning `Unknown` sets `held_back` in the probe's state, and while it is set `kernels()` / `measured()` answer `Unknown` without probing, so a probe that succeeds later cannot open a grade the check never looked at; the next self-test that can tell (the setting turned off and on) lifts it. A `Differs` is permanent and holds nothing back.
 No rotation: its float sampling can differ by a level between GPUs for reasons that are not drift. The clips are
 made by that FFmpeg itself (FFV1 in Matroska, three of them in parallel, 480x270, 0.4 s, probed as an import
 probes), the references are `export_still`, the GPU frames come through a private `FrameSource` (`Hint::Scrub`,
@@ -769,22 +770,36 @@ text vs the shaders, 21 grades (every part alone, in pairs, all three, untagged 
 * **Out, tagged** (the stream names a matrix, or the graph labels it BT.709): the engine ends the grade with `scale=out_color_matrix=<m>,format=yuv444p,setparams=colorspace=<m>`
   (6.1 converts back as BT.601 otherwise), so the picture goes `rgb24 -> yuv444p` (`fs_plane444` x3) and the 4:2:0 conversion that follows is a 2:1 horizontal bicubic plus the same
   vertical rule (`PlaneFilters.x86_start`). The matrix is `PlanLayer::grade_route()`: BT.601 / untagged and BT.709 are drawn, any other tag is refused.
-* **Does this FFmpeg convert like that?** The kernels are SIMD, and another CPU's FFmpeg (NEON, plain C) agrees to a level or two, not to the level. `grade::kernels()` runs three
-  short `ffmpeg` children per process, concurrently (a 48x32 picture of integer noise in all three planes made by `geq` from the coordinates, then the same through the untagged
-  route and through the tagged one with an identity `lutrgb`; bounded at 20 s each, `-loglevel error`) and compares both results with the reference: `Match`, `Differs(route)` or
-  `Unknown` (it could not tell: not cached, asked again after a 5 s backoff doubling to 5 min, like `geq_edge`). **One graph per route, and not `random()`**: the first probe stacked
-  the routes in one graph and was wrong on 9.0.2 only (FFmpeg 9 negotiates the matrix across a whole graph, so the BT.709-tagged branch made the untagged one convert as BT.709, and the
-  GPU refused every graded layer there until the parity run showed it), and `random()` restarts its sequence for every slice thread. Anything but `Match` makes `grade_look`
-  return `Unsupported` for a graded layer, and `prepare()` runs the probe on the blocking thread ahead of the frame (`with_grade_kernels` pins the answer for tests; the probe picture
-  is held to tell the x86 vertical kernel from the C one, `the_probe_picture_tells_the_x86_vertical_kernel_from_the_c_one`). **The grade is measured on x86-64 only**; elsewhere the
-  probe decides.
+* **Does this FFmpeg convert like that?** The kernels are SIMD, and another CPU's FFmpeg (NEON, plain C) agrees to a level or two, not to the level; the RGB format
+  FFmpeg negotiates is a property of the build **and of which filters the chain holds** (the intersection of what they take). `grade::kernels()` runs a 48x32 picture of
+  integer noise in all three planes (made by `geq` from the coordinates) and then **every non-empty set of the grade's parts (the LUT, the curves, the wheels: seven) through both
+  routes (untagged, BT.709-tagged), each as its own graph with the filters `kerf_core::grade_filter_chain` writes for it** (the very text the export uses: a LUT's copy, `lutrgb`
+  expressions, `colorbalance` options, the `scale` / `format` / `setparams` of the tagged way out) and compares each result with `grade::reference` of the same grade: `Match`,
+  `Differs(the chain)` (named: "a LUT and wheels on a BT.709-tagged picture") or `Unknown`. That is fifteen short children at once, thread-capped
+  (`limit_frame_args`: the budget's threads shared among them, at any budget; **not niced**: a frame waits on the probe, and a probe that loses its slice to a busy machine times out into `Unknown`), a
+  `-loglevel error` each, bounded at 20 s, about 0.3 s on 9.0.2 and 0.6 s on 6.1.1 on a loaded 4-core box (the first probe, an identity `lutrgb` in three graphs, was 0.1 s and tested the conversions only: a build that
+  picks planar `gbrp` for `colorbalance` beside `lut3d` would not have shown). **One graph per chain, and not `random()`**: the first probe stacked the routes in one graph and was wrong on 9.0.2 only (FFmpeg 9 negotiates the matrix across a
+  whole graph, so the BT.709-tagged branch made the untagged one convert as BT.709, and the GPU refused every graded layer there until the parity run showed it), and `random()` restarts its sequence for every slice thread.
+  The cache and backoff are `cached(state, now, measure)` (like `geq_edge`'s; unit-tested: an `Unknown` is never remembered, a measured answer is kept for good, the wait doubles from 5 s to 5 min, two failures at once are one, the first answer stored wins and the probe runs with no lock held).
+  **Anything but `Match` takes the grade out of the caps**: `Compositor::caps()` is `CAPS` less `grade` unless the pin (`with_grade_kernels`) or `grade::measured()` (what is known without
+  running anything: `Unknown` before the first probe, during a backoff and while held back) says `Match`, so the plan refuses a graded layer (`Unsupported::Grade`) before anything is decoded for it, and playback / priming
+  (`cut.ahead`) hand a cut with one to the stream. Never-measured counts as not known: `prepare()` (the still path, off the render lock) and the render bar (a cut with a grade asks, on its blocking thread) measure ahead of it, and so does
+  the self-test, which every GPU frame waits for. `Compositor::caps_for(kernels)` is the same without a device (the render bar's). `grade_look` keeps its own check (`Unsupported` for a caller that skipped the plan), and
+  `Compositor::CAPS` stays the build's "assuming they match" (coverage, benches). The probe picture is held to tell the x86 vertical kernel from the C one (`the_probe_picture_tells_the_x86_vertical_kernel_from_the_c_one`); the 14 chains are held to be 14 different answers.
+  **The grade is measured on x86-64 only**; elsewhere the probe decides.
 * **Refused** (each `Unsupported::GradeWith` / `Matte` / `ZoomBehind` in the plan, a held case in `parity.rs` and `motion_parity.rs` with FFmpeg rendering the fallback; `core-render-plan.md`
   has the list): a layer the compositor's scaler resizes (the scaler's one-level difference goes through the conversions and the tables as 3 levels of luma and 2 of chroma on an
   identity grade over noise, 4 with a gamma or curves: past the bound of 2, so a picture-in-picture, an enlargement, a Cover fit and a letterbox are FFmpeg's), a letterbox (the bars are
   graded and their chroma meets the picture's in the conversion back), an odd side, any picture but 8-bit limited-range `yuv420p` (FFmpeg grades the others in the format it
   negotiates), a BT.2020 / `fcc` / `smpte240m` tag, a video effect other than a chroma key after the grade, a fade to black or white or a dip to white running on it, a moving zoom
-  last, a part the caps do not name. Drawn **with** a grade: a crop that is the canvas, a position on a canvas the picture fits, an opacity (the alpha plane), a mask, a rotation,
-  a dissolve, a chroma key, a clip's alpha-ramp fade, an `eq` ahead of it (static and keyed), speed, keyed position, and the layers under it.
+  last, **a cut that mixes colour matrices under a negotiating policy** (see below), a part the caps do not name. Drawn **with** a grade: a crop that is the canvas, a position on a canvas the picture fits, an opacity (the alpha plane), a mask, a rotation,
+  a dissolve (its alpha ramp; **a clip's own `fade_in` / `fade_out` is not one**: it is `fade` to black of the picture on whatever track, so it is refused where it runs, on a layer over another track as on the bottom one), a chroma key, an `eq` ahead of it (static and keyed), speed,
+  a keyed opacity, a keyed position, and the layers under it.
+* **A cut that mixes colour matrices** (`PlanCanvas::mixed_matrices_cut`, Motion plans only: the cut's video inputs are not all one `PlanStream::matrix()`, the graph's BT.709 label included; an RGB picture is its own business): under `BottomLayerTag` FFmpeg 9 converts the picture the grade
+  leaves into the bottom layer's matrix **inside the graph, on every frame of the clip**, not only where the two are on screen together (an untagged 640x360 clip graded after a BT.709 one: up to 24 levels of Y and 22 of UV off the model on every frame of the clip, which the per-frame stack check
+  (`MixedMatrices`) saw none of), so `GradeWith("in a cut that mixes colour matrices")` refuses the graded clip in every frame of such a cut and FFmpeg draws it. Under `FixedBt601` each layer is taken as it is and the cut is drawn to the level in either order. One matrix is not a mix:
+  untagged beside untagged, beside a `smpte170m` tag (BT.601's coefficients), BT.709 beside BT.709 and untagged HD beside BT.709 (labelled) are exact on both builds in either order. A Still plan's graph is the layers on screen, which `MixedMatrices` already judges.
+  **Not the grade's alone, and not fixed here**: the same cut *without* a grade is wrong in the same frames on 9.0.2 (an untagged 640x360 clip after a BT.709 one: up to 31 levels of Y and 18 of UV off on every frame of the clip; the compositor draws the clip's samples as they are and FFmpeg converts them into the bottom layer's matrix, and the other way round, a BT.709 clip after an untagged one, is 22 levels of Y and 12 of UV off) because a Motion plan's `composite_matrix` is per frame, which is the A7 concern in `core-render-plan.md`, now measured. The cut-level fact (`mixed_matrices_cut`) is used for the one thing that is drawn through RGB; ungraded layers still need it (a follow-up).
 * **Cost** (`bench_a_grade`, 1080p, lavapipe, a loaded 4-core box; `target/parity/bench-grade.txt`): a still composite (ms, min of runs) is 49 for a plain cut, 189 with wheels, 152 with
   curves, 165 with a 33-point LUT and 234 with all three; the FFmpeg still is 202 / 229 / 243 / 265 / 316. An export frame (decode + composite) is 53 / 160 / 155 / 191 / 244
   against FFmpeg's 45 / 75 / 58 / 72 / 96 ms: on a software adapter the grade is a handful of full-size render passes (to RGB, the LUT, the curves, the wheels, luma, chroma), and

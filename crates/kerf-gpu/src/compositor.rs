@@ -59,7 +59,7 @@ mod grade_passes;
 use crate::source::{chroma_size, decode_layers, YuvFrame};
 use crate::sws::{self, Filter};
 use crate::text::{self, Blend, Raster, Source, TextAtlas};
-use grade_passes::{GradeLook, GradePasses};
+use grade_passes::{grade_geometry_refusal, GradeLook, GradePasses};
 use kerf_core::layer_geometry::{LayerGeometry, Rect, ScaleStage};
 
 /// A rendered frame: tightly packed 8-bit RGBA, top row first.
@@ -748,9 +748,20 @@ fn extent(w: u32, h: u32) -> wgpu::Extent3d {
     }
 }
 
+/// Whether a moving zoom comes last in this layer's chain, and the picture the effects, the mask and the grade act on:
+/// the fit-size one when it does (the zoom's `scale` follows them), else the layer's picture.
+fn effect_picture(layer: &kerf_core::PlanLayer, geom: &LayerGeometry) -> (bool, (u32, u32)) {
+    let zoom_last = layer.animated.is_some_and(|a| a.zooms) && geom.stages.len() == 2;
+    if zoom_last {
+        (true, (geom.stages[0].keep.w, geom.stages[0].keep.h))
+    } else {
+        (false, geom.picture)
+    }
+}
+
 /// Do ahead of a frame what a plan needs measured and what takes a while: FFmpeg's `geq`, for a
 /// plan with a mask or a keyed opacity (the export's `geq`), and its conversions to and from RGB, for a plan with a
-/// grade ([`crate::grade::kernels`]; three short child processes at once, once per process).
+/// grade ([`crate::grade::kernels`]; fifteen short child processes at once, once per process: the grade is in the caps only once it is known to match).
 /// Call it from a blocking thread **off the render lock**, with the plan in hand, so the first such
 /// frame does not pay for it under the lock; a compositor pinned with [`Compositor::with_geq_edge`] needs none of it.
 pub fn prepare(plan: &RenderPlan) {
@@ -775,15 +786,31 @@ impl Compositor {
     ///   ([`kerf_core::PlanLayer::keyed_alpha`]);
     /// * `keyed_color`: an export frame's `eq`, whose tables FFmpeg builds again for every frame from the
     ///   numbers the plan evaluates ([`kerf_core::PlanLayer::color`]);
-    /// * `mask`, and the blur, sharpen, grayscale, invert, vignette and chroma key `effects`.
+    /// * `mask`, and the blur, sharpen, grayscale, invert, vignette and chroma key `effects`;
+    /// * `grade`: a clip's LUT, curves and wheels, **where this FFmpeg's conversions to and from RGB are the
+    ///   ones the grade follows** ([`crate::grade::measured`], or the pin of [`Compositor::with_grade_kernels`]).
+    ///   Until that is known to be a match (a probe that found a difference, one that could not tell, one that has
+    ///   not run: [`prepare`] runs it) the grade is not in the caps, so the plan refuses a graded layer up front
+    ///   and nothing is decoded for a frame the render would refuse.
     ///
     /// The combinations the plan names (`Unsupported`) stay FFmpeg's.
     /// Each later pass flips its bit beside the pass and its parity cases.
     pub fn caps(&self) -> GpuCaps {
-        Self::CAPS
+        Self::caps_for(self.grade_kernels.unwrap_or_else(crate::grade::measured))
     }
 
-    /// [`Compositor::caps`] without a device: what any compositor of this build draws.
+    /// [`Compositor::caps`] for a machine whose FFmpeg's conversions are `kernels`, without a device: the way a host that
+    /// has none to ask (the render bar) says what the GPU draws.
+    pub fn caps_for(kernels: crate::grade::Kernels) -> GpuCaps {
+        let mut caps = Self::CAPS;
+        if kernels != crate::grade::Kernels::Match {
+            caps.grade = GradeKinds::NONE;
+        }
+        caps
+    }
+
+    /// What any compositor of this build draws, without a device and **assuming** the measured things match
+    /// (the grade's conversions: [`Compositor::caps`] is this less the grade where they do not).
     pub const CAPS: GpuCaps = {
         let mut caps = GpuCaps::A0;
         caps.text = true;
@@ -815,8 +842,8 @@ impl Compositor {
     }
 
     /// Pin whether this FFmpeg converts to and from RGB as the grade's model does, instead of measuring the ffmpeg
-    /// this process runs ([`crate::grade::kernels`], one child process, on the first graded frame unless [`prepare`]
-    /// ran ahead of it): for a host that knows its ffmpeg, and for tests.
+    /// this process runs ([`crate::grade::kernels`], on the first graded plan unless [`prepare`] ran ahead
+    /// of it): for a host that knows its ffmpeg, and for tests. Anything but `Match` takes the grade out of [`Compositor::caps`].
     #[must_use]
     pub fn with_grade_kernels(mut self, kernels: crate::grade::Kernels) -> Self {
         self.grade_kernels = Some(kernels);
@@ -1933,33 +1960,15 @@ impl Compositor {
     /// What happens to `layer`'s planes between the scaler and the blend, beyond its fades.
     fn look_of(&self, layer: &kerf_core::PlanLayer, geom: &LayerGeometry) -> Result<LayerLook, GpuError> {
         let unsupported = |what: String| GpuError::Unsupported(format!("layer {}: {what}", layer.name));
-        let zoom_last = layer.animated.is_some_and(|a| a.zooms) && geom.stages.len() == 2;
-        // The picture the effects and the mask act on: the fit-size one when the zoom comes last.
-        let (pw, ph) = if zoom_last {
-            (geom.stages[0].keep.w, geom.stages[0].keep.h)
-        } else {
-            geom.picture
-        };
+        let (zoom_last, (pw, ph)) = effect_picture(layer, geom);
         // The grade runs in RGB on the picture the chain has made, at its own size: FFmpeg carries it through
         // `rgb24` and back, and what is reproduced is that for a picture the scaler did not resize, with nothing
         // after the grade that sees the RGB (or, for a tagged picture, 4:4:4) frame (the plan refuses the rest;
         // so does this, for a caller that did not ask it).
         let grade = self.grade_look(layer)?;
         if grade.is_some() {
-            if geom.matte {
-                return Err(unsupported("a grade on a letterboxed picture".into()));
-            }
-            if zoom_last {
-                return Err(unsupported("a grade before a moving zoom".into()));
-            }
-            if geom.stages.iter().any(|s| s.scaled != (s.src.w, s.src.h)) {
-                return Err(unsupported("a grade on a layer the scaler resizes".into()));
-            }
-            if pw % 2 != 0 || ph % 2 != 0 {
-                return Err(unsupported(format!("a grade on a {pw}x{ph} picture (odd sides)")));
-            }
-            if layer.effects.iter().any(|e| !matches!(e, VideoEffect::ChromaKey { .. })) {
-                return Err(unsupported("video effects behind a grade".into()));
+            if let Some(why) = grade_geometry_refusal(layer, geom) {
+                return Err(unsupported(why));
             }
         }
         let mut leading = eq::luts(&layer.color);
@@ -3235,6 +3244,23 @@ mod tests {
     fn held(cache: &MaskCache) -> Vec<(u32, u32)> {
         let entries = cache.entries.lock().unwrap();
         entries.iter().map(|(k, _)| (k.1, k.2)).collect()
+    }
+
+    /// The grade is in the caps only where this FFmpeg's conversions are known to be the ones it draws: a probe that found a
+    /// difference, one that could not tell and one that has not run all leave it out (the plan then refuses a graded layer
+    /// before anything is decoded for it), and the rest of the caps are the build's either way.
+    #[test]
+    fn the_grade_is_in_the_caps_only_where_the_conversions_are_known_to_match() {
+        use crate::grade::Kernels;
+        assert_eq!(Compositor::caps_for(Kernels::Match), Compositor::CAPS);
+        assert_eq!(Compositor::CAPS.grade, GradeKinds::ALL);
+        for kernels in [Kernels::Differs("a chain"), Kernels::Unknown] {
+            let caps = Compositor::caps_for(kernels);
+            assert_eq!(caps.grade, GradeKinds::NONE, "{kernels:?}");
+            let mut restored = caps;
+            restored.grade = GradeKinds::ALL;
+            assert_eq!(restored, Compositor::CAPS, "{kernels:?}: nothing else moves");
+        }
     }
 
     #[test]

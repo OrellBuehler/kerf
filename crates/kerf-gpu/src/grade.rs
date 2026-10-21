@@ -31,9 +31,12 @@
 //! `pin` (an OR with a uniform that is zero), which a compiler cannot see through, and every `float` division
 //! is a table made here (`v / 255.0f`).
 
-use std::sync::Arc;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::{Duration, Instant};
 
-use kerf_core::{BakedLut, Curves, Grade, GradeRoute, Wheels, YuvMatrix};
+use kerf_core::{BakedLut, ClipLut, CurvePoint, Curves, Grade, GradeRoute, Wheel, Wheels, YuvMatrix};
 
 use crate::roundtrip::{coefficients, Rgb2Yuv};
 use crate::sws;
@@ -417,42 +420,98 @@ pub fn reference(stages: &GradeStages, planes: [&[u8]; 3], w: usize, h: usize) -
 
 // ---- does this FFmpeg convert as the model does? ----------------------------------------------------
 
-/// Whether this FFmpeg's conversions to and from RGB are the ones this module follows. They are SIMD kernels
-/// (`yuv_2_rgb.asm` and `yuv2yuvX.asm` on x86), and another CPU's FFmpeg runs other kernels (NEON, plain C), which agree
-/// with these to a level or two and not to the level: the grade is drawn exactly or not at all, so it is
-/// measured, once per process, on the very conversions the grade's chain makes (like [`kerf_core::geq_edge`]).
+/// Whether this FFmpeg's conversions to and from RGB, and the filters between them, are the ones this module follows.
+/// The conversions are SIMD kernels (`yuv_2_rgb.asm` and `yuv2yuvX.asm` on x86), and another CPU's FFmpeg runs other
+/// kernels (NEON, plain C), which agree with these to a level or two and not to the level; the format FFmpeg
+/// negotiates for the RGB filters is a property of the build and of which filters the chain holds. The grade is drawn
+/// exactly or not at all, so it is measured, once per process, on the very chains the grade writes (like
+/// [`kerf_core::geq_edge`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Kernels {
-    /// A picture of noise through the untagged and the tagged route came back as the reference computes it.
+    /// Noise through every chain of the grade (each subset of the LUT, the curves and the wheels, untagged and
+    /// BT.709-tagged) came back as the reference computes it.
     Match,
-    /// It did not: the route that differs.
+    /// It did not: the chain that differs.
     Differs(&'static str),
-    /// Not measured: FFmpeg would not run or timed out, and is asked again after a backoff.
+    /// Not known: not measured yet, FFmpeg would not run or timed out (asked again after a backoff), or a self-test
+    /// could not tell (see `kernels_for_selftest`).
     Unknown,
 }
 
 /// The probe picture's size.
 const PROBE: (usize, usize) = (48, 32);
-const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// What the process knows: the measured answer once there is one (kept for good), else how many probes failed and when
+/// the next may run.
 struct KernelState {
     measured: Option<Kernels>,
     failures: u32,
-    retry_at: Option<std::time::Instant>,
+    retry_at: Option<Instant>,
+    /// A self-test could not tell whether the grade is drawn as this FFmpeg draws it, so it did not draw the grade's
+    /// frame: nothing is believed until a self-test has (a probe that succeeds later must not open a grade the
+    /// check never looked at).
+    held_back: bool,
 }
 
-/// Whether this FFmpeg converts as the model does ([`Kernels`]). The first call runs three short `ffmpeg` children at once
-/// (tens of milliseconds, bounded by 20 s) with no lock held: a blocking thread's, ahead of the frame that needs it
-/// ([`crate::prepare`]). [`Kernels::Unknown`] is not remembered.
+impl KernelState {
+    const fn new() -> Self {
+        Self {
+            measured: None,
+            failures: 0,
+            retry_at: None,
+            held_back: false,
+        }
+    }
+}
+
+static STATE: Mutex<KernelState> = Mutex::new(KernelState::new());
+
+fn lock(state: &Mutex<KernelState>) -> std::sync::MutexGuard<'_, KernelState> {
+    state.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Whether this FFmpeg converts as the model does ([`Kernels`]). The first call runs the probe: fifteen
+/// short `ffmpeg` children at once (tens of milliseconds each, bounded by 20 s) with no lock held: a blocking
+/// thread's, ahead of the frame that needs it ([`crate::prepare`]). [`Kernels::Unknown`] is not remembered: the probe
+/// is run again after a backoff.
 pub fn kernels() -> Kernels {
-    static STATE: std::sync::Mutex<KernelState> = std::sync::Mutex::new(KernelState {
-        measured: None,
-        failures: 0,
-        retry_at: None,
-    });
-    let now = std::time::Instant::now();
+    cached(&STATE, Instant::now(), measure)
+}
+
+/// What is known without running anything: the measured answer, else [`Kernels::Unknown`] (not measured yet, backing
+/// off after a probe that failed, or held back by a self-test). What a plan's caps are made from
+/// ([`crate::Compositor::caps`]): a plan does not wait for a probe.
+pub fn measured() -> Kernels {
+    known(&STATE)
+}
+
+/// [`kernels`] for the runtime self-test, which draws the grade's frame only when this is [`Kernels::Match`]. A
+/// `Unknown` here holds the grade back for the process ([`KernelState::held_back`]) until a self-test that can tell
+/// has run, so that the frames the GPU draws are never the ones its check skipped; a `Differs` is permanent and needs
+/// no holding.
+pub(crate) fn kernels_for_selftest() -> Kernels {
+    checked(&STATE, Instant::now(), measure)
+}
+
+fn backoff(failures: u32) -> Duration {
+    Duration::from_secs((5u64 << failures.saturating_sub(1).min(6)).min(300))
+}
+
+fn known(state: &Mutex<KernelState>) -> Kernels {
+    let s = lock(state);
+    if s.held_back {
+        return Kernels::Unknown;
+    }
+    s.measured.unwrap_or(Kernels::Unknown)
+}
+
+fn cached(state: &Mutex<KernelState>, now: Instant, measure: impl FnOnce() -> Option<Kernels>) -> Kernels {
     {
-        let s = STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let s = lock(state);
+        if s.held_back {
+            return Kernels::Unknown;
+        }
         if let Some(k) = s.measured {
             return k;
         }
@@ -460,24 +519,31 @@ pub fn kernels() -> Kernels {
             return Kernels::Unknown;
         }
     }
+    // Measured with no lock held: a probe is child processes, and nothing else waits behind them. Callers that arrive
+    // meanwhile measure too, boundedly; the first answer stored wins.
     let measured = measure();
-    let mut s = STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let mut s = lock(state);
     if let Some(k) = s.measured {
         return k;
     }
     match measured {
         Some(k) => {
             if let Kernels::Differs(why) = k {
-                tracing::warn!(why, "this FFmpeg's conversions to and from RGB are not the ones the GPU's grade follows; graded layers are drawn by FFmpeg");
+                tracing::warn!(
+                    why,
+                    "this FFmpeg's conversions to and from RGB are not the ones the GPU's grade follows; graded layers are drawn by FFmpeg"
+                );
             }
             s.measured = Some(k);
             k
         }
+        // (A failure another caller recorded while this probe ran has put the retry in the future: this one is the
+        // same failure, not another, and does not double the wait.)
         None if s.retry_at.is_some_and(|t| t > now) => Kernels::Unknown,
         None => {
             s.failures += 1;
-            let wait = std::time::Duration::from_secs((5u64 << s.failures.saturating_sub(1).min(6)).min(300));
-            s.retry_at = Some(std::time::Instant::now() + wait);
+            let wait = backoff(s.failures);
+            s.retry_at = Some(Instant::now() + wait);
             tracing::warn!(
                 failures = s.failures,
                 retry_in_secs = wait.as_secs(),
@@ -486,6 +552,15 @@ pub fn kernels() -> Kernels {
             Kernels::Unknown
         }
     }
+}
+
+fn checked(state: &Mutex<KernelState>, now: Instant, measure: impl FnOnce() -> Option<Kernels>) -> Kernels {
+    lock(state).held_back = false;
+    let k = cached(state, now, measure);
+    if k == Kernels::Unknown {
+        lock(state).held_back = true;
+    }
+    k
 }
 
 /// The probe picture: noise-like (a polynomial of the coordinates, mod 256, in the integers `geq` computes exactly)
@@ -499,54 +574,215 @@ fn probe_source() -> String {
     )
 }
 
-/// The three graphs of the probe: the picture, and the picture through the grade's two routes with an identity
-/// `lutrgb` (which is what puts it through RGB). **One graph each**, not one graph stacking them: FFmpeg 9
-/// negotiates the colour matrix across a whole graph, so a tagged branch beside an untagged one converts both
-/// with its matrix, and the answer is no longer that of either route.
-fn probe_graphs() -> [String; 3] {
-    let source = probe_source();
+/// The parts of a probe grade, as a set: the LUT, the curves, the wheels.
+pub(crate) const PART_LUT: u8 = 1;
+pub(crate) const PART_CURVES: u8 = 2;
+pub(crate) const PART_WHEELS: u8 = 4;
+pub(crate) const PARTS_ALL: u8 = 7;
+
+/// The `.cube` of the probe grade's LUT: a 5^3 table with a tint and cross-channel terms (every tetrahedron of a cell is
+/// walked).
+pub(crate) fn probe_cube() -> String {
+    let size = 5usize;
+    let n = (size - 1) as f32;
+    let mut data = Vec::with_capacity(size * size * size);
+    for b in 0..size {
+        for g in 0..size {
+            for r in 0..size {
+                let (r, g, b) = (r as f32 / n, g as f32 / n, b as f32 / n);
+                data.push([
+                    0.92 * r + 0.08 * g * b + 0.03,
+                    0.05 * r * r + 0.9 * g + 0.04 * b,
+                    (0.1 + 0.8 * b + 0.15 * r * g).min(1.0),
+                ]);
+            }
+        }
+    }
+    kerf_core::color_lut::Lut3d {
+        title: String::new(),
+        size,
+        data,
+    }
+    .to_cube(1.0)
+}
+
+/// A grade of the parts in `parts` ([`PART_LUT`] and the others), strong enough to move every channel: the LUT is
+/// `cube`, a file holding [`probe_cube`].
+pub(crate) fn probe_grade(parts: u8, cube: &str) -> Grade {
+    let point = |x, y| CurvePoint { x, y };
+    Grade {
+        lut: (parts & PART_LUT != 0).then(|| ClipLut {
+            path: cube.to_string(),
+            intensity: 0.8,
+        }),
+        curves: (parts & PART_CURVES != 0).then(|| Curves {
+            master: vec![point(0.0, 0.03), point(0.3, 0.22), point(0.75, 0.84), point(1.0, 0.98)],
+            ..Curves::default()
+        }),
+        wheels: (parts & PART_WHEELS != 0).then(|| Wheels {
+            shadows: Wheel {
+                x: 0.4,
+                y: -0.2,
+                lightness: 0.1,
+            },
+            highlights: Wheel {
+                x: 0.1,
+                y: 0.7,
+                lightness: 0.05,
+            },
+            ..Wheels::default()
+        }),
+    }
+}
+
+/// What a probe chain is, by its parts (1 to 7: [`PART_LUT`] as bit 0) and then untagged or BT.709-tagged.
+const WHY: [[&str; 2]; 7] = [
+    ["a LUT on an untagged picture", "a LUT on a BT.709-tagged picture"],
+    ["curves on an untagged picture", "curves on a BT.709-tagged picture"],
     [
-        source.clone(),
-        format!("{source},lutrgb=r=val,format=yuv420p"),
-        format!(
-            "{source},setparams=colorspace=bt709,lutrgb=r=val,scale=out_color_matrix=bt709,\
-             format=yuv444p|yuv444p10le|yuv444p12le|yuv444p16le,setparams=colorspace=bt709,format=yuv420p"
+        "a LUT and curves on an untagged picture",
+        "a LUT and curves on a BT.709-tagged picture",
+    ],
+    ["wheels on an untagged picture", "wheels on a BT.709-tagged picture"],
+    [
+        "a LUT and wheels on an untagged picture",
+        "a LUT and wheels on a BT.709-tagged picture",
+    ],
+    [
+        "curves and wheels on an untagged picture",
+        "curves and wheels on a BT.709-tagged picture",
+    ],
+    [
+        "a LUT, curves and wheels on an untagged picture",
+        "a LUT, curves and wheels on a BT.709-tagged picture",
+    ],
+];
+
+/// How many graphs the probe runs: the picture, then every non-empty set of the grade's parts through each route.
+const PROBE_CHAINS: usize = 1 + 2 * 7;
+
+/// One chain of the probe: a grade's filters as the graph writes them, over the probe picture.
+struct Chain {
+    why: &'static str,
+    graph: String,
+    stages: GradeStages,
+}
+
+/// The probe's chains. **One graph each**, not one graph stacking them: FFmpeg 9 negotiates the colour matrix across a
+/// whole graph, so a tagged branch beside an untagged one converts both with its matrix, and the answer is no longer
+/// that of either route. **Every non-empty set of parts**, not an identity `lutrgb`: the RGB format FFmpeg
+/// negotiates is the intersection of what the chain's filters take, so a build that picks another one (planar
+/// `gbrp`, say) for `colorbalance` beside `lut3d` than for either alone would convert elsewhere than the model does.
+/// The filters are `kerf_core::grade_filter_chain`'s text, the expected picture the compositor's own reference.
+/// `None` when the chain is not the one it should be (a LUT's copy that could not be written leaves the filter out).
+fn chains(cube: &str) -> Option<Vec<Chain>> {
+    let source = probe_source();
+    let routes = [
+        (
+            None,
+            GradeRoute {
+                matrix: YuvMatrix::Bt601,
+                via_444: false,
+            },
         ),
-    ]
+        (
+            Some("bt709"),
+            GradeRoute {
+                matrix: YuvMatrix::Bt709,
+                via_444: true,
+            },
+        ),
+    ];
+    let mut out = Vec::with_capacity(PROBE_CHAINS - 1);
+    for parts in 1..=PARTS_ALL {
+        let grade = probe_grade(parts, cube);
+        for (tagged, (tag, route)) in routes.iter().enumerate() {
+            let filters = kerf_core::grade_filter_chain(&grade, *tag);
+            if filters.len() != parts.count_ones() as usize + if tag.is_some() { 3 } else { 0 } {
+                return None;
+            }
+            let mut parts_of_graph = vec![source.clone()];
+            if let Some(tag) = tag {
+                parts_of_graph.push(format!("setparams=colorspace={tag}"));
+            }
+            parts_of_graph.extend(filters);
+            parts_of_graph.push("format=yuv420p".to_string());
+            out.push(Chain {
+                why: WHY[usize::from(parts) - 1][tagged],
+                graph: parts_of_graph.join(","),
+                stages: GradeStages::of(&grade, *route)?,
+            });
+        }
+    }
+    Some(out)
 }
 
 fn probe_frame_len() -> usize {
     PROBE.0 * PROBE.1 * 3 / 2
 }
 
+/// A scratch directory holding the probe's `.cube`, removed when dropped.
+struct ProbeDir(PathBuf);
+
+impl ProbeDir {
+    fn new() -> std::io::Result<Self> {
+        static NEXT: AtomicU32 = AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "kerf-gpu-grade-probe-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir)?;
+        Ok(Self(dir))
+    }
+}
+
+impl Drop for ProbeDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 fn measure() -> Option<Kernels> {
-    let graphs = probe_graphs();
+    let dir = ProbeDir::new().ok()?;
+    let cube = dir.0.join("probe.cube");
+    std::fs::write(&cube, probe_cube()).ok()?;
+    let chains = chains(&cube.to_string_lossy())?;
+    let mut graphs = vec![probe_source()];
+    graphs.extend(chains.iter().map(|c| c.graph.clone()));
+    let share = graphs.len();
     let frames: Vec<Option<Vec<u8>>> = std::thread::scope(|scope| {
         let runs: Vec<_> = graphs
             .iter()
             .map(|graph| {
                 scope.spawn(move || {
+                    let mut args: Vec<String> = ["-hide_banner", "-loglevel", "error", "-nostdin", "-f", "lavfi", "-i"]
+                        .into_iter()
+                        .map(String::from)
+                        .collect();
+                    args.push(graph.clone());
+                    args.extend(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "yuv420p", "pipe:1"].map(String::from));
+                    // The probe is what a frame waits on, so it is not niced, but it is not allowed every core
+                    // times its dozen: the budget's threads are shared among the children.
+                    kerf_core::limit_frame_args(&mut args, share);
                     let mut cmd = kerf_core::ffmpeg_command();
-                    cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-f", "lavfi", "-i"]);
-                    cmd.arg(graph);
-                    cmd.args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "yuv420p", "pipe:1"]);
+                    cmd.args(&args);
                     crate::source::run_child(cmd, probe_frame_len() + 1, PROBE_TIMEOUT).ok()
                 })
             })
             .collect();
         runs.into_iter().map(|run| run.join().ok().flatten()).collect()
     });
-    match frames.as_slice() {
-        [Some(source), Some(untagged), Some(tagged)] => classify(source, untagged, tagged),
-        _ => None,
-    }
+    let (source, rest) = frames.split_first()?;
+    classify(source.as_deref()?, &chains, rest)
 }
 
-/// The answer from the three probe pictures: `None` when one is not the size it should be.
-fn classify(source: &[u8], untagged: &[u8], tagged: &[u8]) -> Option<Kernels> {
+/// The answer from the probe pictures: `None` when the source or one of the chains' is missing or not the size it
+/// should be and none of the others differs (a difference is conclusive wherever the rest stands).
+fn classify(source: &[u8], chains: &[Chain], frames: &[Option<Vec<u8>>]) -> Option<Kernels> {
     let (w, h) = PROBE;
     let (cw, ch) = (w / 2, h / 2);
-    if [source, untagged, tagged].iter().any(|f| f.len() != probe_frame_len()) {
+    if source.len() != probe_frame_len() || frames.len() != chains.len() {
         return None;
     }
     let planes = |f: &[u8]| -> [Vec<u8>; 3] {
@@ -556,17 +792,17 @@ fn classify(source: &[u8], untagged: &[u8], tagged: &[u8]) -> Option<Kernels> {
     };
     let [y, u, v] = planes(source);
     let source = [&y[..], &u[..], &v[..]];
-    if planes(untagged) != rgb_to_yuv420(&yuv420_to_rgb(source, w, h, YuvMatrix::Bt601), w, h, YuvMatrix::Bt601) {
-        return Some(Kernels::Differs(
-            "the conversion to RGB and back to 4:2:0 of an untagged picture",
-        ));
+    let mut unknown = false;
+    for (chain, frame) in chains.iter().zip(frames) {
+        match frame.as_deref().filter(|f| f.len() == probe_frame_len()) {
+            None => unknown = true,
+            Some(frame) if planes(frame) != reference(&chain.stages, source, w, h) => {
+                return Some(Kernels::Differs(chain.why));
+            }
+            Some(_) => {}
+        }
     }
-    if planes(tagged) != rgb_to_yuv420_via_444(&yuv420_to_rgb(source, w, h, YuvMatrix::Bt709), w, h, YuvMatrix::Bt709) {
-        return Some(Kernels::Differs(
-            "the conversion to RGB and back through 4:4:4 of a tagged picture",
-        ));
-    }
-    Some(Kernels::Match)
+    (!unknown).then_some(Kernels::Match)
 }
 
 #[cfg(test)]
@@ -703,33 +939,219 @@ mod tests {
         p.iter().flatten().copied().collect()
     }
 
-    #[test]
-    fn a_probe_that_is_the_reference_is_a_match_and_one_sample_off_is_not() {
+    /// Run `f` over the probe's chains, with the LUT file they read in a directory that is gone afterwards.
+    fn with_chains<T>(f: impl FnOnce(&[Chain]) -> T) -> T {
+        let dir = ProbeDir::new().expect("a scratch directory");
+        let cube = dir.0.join("probe.cube");
+        std::fs::write(&cube, probe_cube()).unwrap();
+        let chains = chains(&cube.to_string_lossy()).expect("the probe's chains");
+        f(&chains)
+    }
+
+    /// What a build that converts as the model does makes of the probe picture, chain by chain.
+    fn expected(chains: &[Chain]) -> Vec<Option<Vec<u8>>> {
         let (w, h) = PROBE;
         let src = probe_picture();
         let source = [&src[0][..], &src[1][..], &src[2][..]];
-        let untagged = concat(&rgb_to_yuv420(
-            &yuv420_to_rgb(source, w, h, YuvMatrix::Bt601),
-            w,
-            h,
-            YuvMatrix::Bt601,
-        ));
-        let tagged = concat(&rgb_to_yuv420_via_444(
-            &yuv420_to_rgb(source, w, h, YuvMatrix::Bt709),
-            w,
-            h,
-            YuvMatrix::Bt709,
-        ));
-        let source = concat(&src);
-        assert_eq!(classify(&source, &untagged, &tagged), Some(Kernels::Match));
-        assert_eq!(classify(&source[1..], &untagged, &tagged), None);
-        let mut off = untagged.clone();
-        off[w * h + 5] ^= 1;
-        assert!(matches!(classify(&source, &off, &tagged), Some(Kernels::Differs(why)) if why.contains("untagged")));
-        let mut off = tagged;
-        let last = off.len() - 1;
-        off[last] ^= 1;
-        assert!(matches!(classify(&source, &untagged, &off), Some(Kernels::Differs(why)) if why.contains("tagged")));
+        chains
+            .iter()
+            .map(|c| Some(concat(&reference(&c.stages, source, w, h))))
+            .collect()
+    }
+
+    #[test]
+    fn the_probe_runs_every_set_of_parts_through_both_routes_as_the_graph_writes_them() {
+        with_chains(|chains| {
+            assert_eq!(chains.len(), PROBE_CHAINS - 1);
+            let mut whys: Vec<_> = chains.iter().map(|c| c.why).collect();
+            whys.sort_unstable();
+            whys.dedup();
+            assert_eq!(whys.len(), 14, "every chain is named for what it is");
+            for (i, chain) in chains.iter().enumerate() {
+                let (parts, tagged) = (i / 2 + 1, i % 2 == 1);
+                let g = &chain.graph;
+                let at = |filter: &str| g.find(filter);
+                assert_eq!(at("lut3d=").is_some(), parts & 1 != 0, "{g}");
+                assert_eq!(at("lutrgb=").is_some(), parts & 2 != 0, "{g}");
+                assert_eq!(at("colorbalance=").is_some(), parts & 4 != 0, "{g}");
+                // In the graph's order.
+                let order: Vec<_> = ["lut3d=", "lutrgb=", "colorbalance="].iter().filter_map(|f| at(f)).collect();
+                assert!(order.windows(2).all(|w| w[0] < w[1]), "{g}");
+                assert_eq!(g.contains("setparams=colorspace=bt709"), tagged, "{g}");
+                assert_eq!(g.contains("scale=out_color_matrix=bt709"), tagged, "{g}");
+                assert_eq!(chain.stages.route.via_444, tagged);
+                assert_eq!(
+                    chain.stages.route.matrix,
+                    if tagged { YuvMatrix::Bt709 } else { YuvMatrix::Bt601 }
+                );
+                assert!(g.starts_with("nullsrc=") && g.ends_with(",format=yuv420p"), "{g}");
+                assert_eq!(chain.stages.lut.is_some(), parts & 1 != 0);
+                assert_eq!(chain.stages.curves.is_some(), parts & 2 != 0);
+                assert_eq!(chain.stages.balance.is_some(), parts & 4 != 0);
+            }
+            // A probe whose chains all came out alike would prove nothing about any of them.
+            let mut answers: Vec<_> = expected(chains).into_iter().flatten().collect();
+            answers.sort();
+            answers.dedup();
+            assert_eq!(answers.len(), 14);
+        });
+    }
+
+    #[test]
+    fn a_probe_that_is_the_reference_is_a_match_and_one_sample_off_in_any_chain_is_named() {
+        with_chains(|chains| {
+            let (w, h) = PROBE;
+            let source = concat(&probe_picture());
+            let good = expected(chains);
+            assert_eq!(classify(&source, chains, &good), Some(Kernels::Match));
+            // Not the sizes it should be: no answer.
+            assert_eq!(classify(&source[1..], chains, &good), None);
+            assert_eq!(classify(&source, chains, &good[1..]), None);
+            let mut missing = good.clone();
+            missing[3] = None;
+            assert_eq!(classify(&source, chains, &missing), None);
+            let mut short = good.clone();
+            short[0] = Some(vec![0; 5]);
+            assert_eq!(classify(&source, chains, &short), None);
+            // One sample a level off, in a plane of each chain in turn: that chain is the one named.
+            for (i, chain) in chains.iter().enumerate() {
+                for at in [0, w * h + 5, w * h * 5 / 4 + 2] {
+                    let mut off = good.clone();
+                    off[i].as_mut().unwrap()[at] ^= 1;
+                    assert_eq!(classify(&source, chains, &off), Some(Kernels::Differs(chain.why)), "{i} {at}");
+                }
+            }
+            // A difference is conclusive wherever the rest stands.
+            let mut both = good;
+            both[2] = None;
+            both[5].as_mut().unwrap()[0] ^= 1;
+            assert_eq!(classify(&source, chains, &both), Some(Kernels::Differs(chains[5].why)));
+        });
+    }
+
+    fn fresh() -> Mutex<KernelState> {
+        Mutex::new(KernelState::new())
+    }
+
+    #[test]
+    fn a_measured_answer_is_kept_and_unknown_is_never_remembered() {
+        let state = fresh();
+        let t0 = Instant::now();
+        assert_eq!(known(&state), Kernels::Unknown, "nothing measured yet");
+        assert_eq!(cached(&state, t0, || None), Kernels::Unknown);
+        assert_eq!(known(&state), Kernels::Unknown);
+        // Inside the backoff the probe is not run again.
+        assert_eq!(
+            cached(&state, t0, || panic!("probed again inside the backoff")),
+            Kernels::Unknown
+        );
+        // After it, it is (the failure was not kept as an answer), and what it finds is kept for good.
+        let later = t0 + Duration::from_secs(60);
+        assert_eq!(
+            cached(&state, later, || Some(Kernels::Differs("a chain"))),
+            Kernels::Differs("a chain")
+        );
+        assert_eq!(known(&state), Kernels::Differs("a chain"));
+        assert_eq!(
+            cached(&state, later, || panic!("a measured answer is kept")),
+            Kernels::Differs("a chain")
+        );
+        assert_eq!(lock(&state).failures, 1);
+        // A match is kept the same way.
+        let state = fresh();
+        assert_eq!(cached(&state, t0, || Some(Kernels::Match)), Kernels::Match);
+        assert_eq!(known(&state), Kernels::Match);
+        assert_eq!(cached(&state, t0, || panic!("a measured answer is kept")), Kernels::Match);
+    }
+
+    #[test]
+    fn the_wait_doubles_with_each_failure_up_to_five_minutes() {
+        assert_eq!(backoff(1).as_secs(), 5);
+        assert_eq!(backoff(2).as_secs(), 10);
+        assert_eq!(backoff(3).as_secs(), 20);
+        assert_eq!(backoff(40).as_secs(), 300);
+        let state = fresh();
+        let mut now = Instant::now();
+        for failures in 1..=3u32 {
+            let before = Instant::now();
+            assert_eq!(cached(&state, now, || None), Kernels::Unknown);
+            let s = lock(&state);
+            assert_eq!(s.failures, failures);
+            let retry = s.retry_at.expect("a retry is set");
+            let wait = retry.duration_since(before);
+            assert!(
+                wait >= backoff(failures) && wait < backoff(failures) + Duration::from_secs(1),
+                "{wait:?}"
+            );
+            now = retry + Duration::from_millis(1);
+        }
+    }
+
+    #[test]
+    fn the_probe_runs_with_no_lock_held_and_the_first_answer_stored_wins() {
+        let state = fresh();
+        let now = Instant::now();
+        // While the probe runs another caller is not queued behind it: it can take the lock, and its own answer
+        // (here the whole nested call) is stored first.
+        let got = cached(&state, now, || {
+            assert!(state.try_lock().is_ok(), "the state is locked while the probe runs");
+            assert_eq!(cached(&state, now, || Some(Kernels::Match)), Kernels::Match);
+            Some(Kernels::Differs("late"))
+        });
+        assert_eq!(got, Kernels::Match, "the first writer wins");
+        assert_eq!(cached(&state, now, || panic!("measured twice")), Kernels::Match);
+        // A failure that lost the race to an answer changes nothing.
+        let state = fresh();
+        let got = cached(&state, now, || {
+            cached(&state, now, || Some(Kernels::Match));
+            None
+        });
+        assert_eq!(got, Kernels::Match);
+        assert_eq!(lock(&state).failures, 0);
+        // Two failures at once are one: the second does not double the wait...
+        let state = fresh();
+        let got = cached(&state, now, || {
+            assert_eq!(cached(&state, now, || None), Kernels::Unknown);
+            None
+        });
+        assert_eq!(got, Kernels::Unknown);
+        assert_eq!(lock(&state).failures, 1);
+        // ...while one after the wait has passed is another, and does.
+        assert_eq!(cached(&state, now + Duration::from_secs(60), || None), Kernels::Unknown);
+        assert_eq!(lock(&state).failures, 2);
+    }
+
+    #[test]
+    fn a_self_test_that_cannot_tell_holds_the_grade_back_until_one_can() {
+        let state = fresh();
+        let t0 = Instant::now();
+        assert_eq!(checked(&state, t0, || None), Kernels::Unknown);
+        assert!(lock(&state).held_back);
+        // A probe that would succeed now is not believed (and not run): the check skipped the grade's frame.
+        let later = t0 + Duration::from_secs(60);
+        assert_eq!(cached(&state, later, || panic!("probed while held back")), Kernels::Unknown);
+        assert_eq!(known(&state), Kernels::Unknown);
+        // The next self-test that can tell lifts the hold, and the answer stands.
+        assert_eq!(checked(&state, later, || Some(Kernels::Match)), Kernels::Match);
+        assert!(!lock(&state).held_back);
+        assert_eq!(known(&state), Kernels::Match);
+        assert_eq!(cached(&state, later, || panic!("measured twice")), Kernels::Match);
+        // One that finds a difference holds nothing back: the difference is permanent.
+        let state = fresh();
+        assert_eq!(
+            checked(&state, t0, || Some(Kernels::Differs("a chain"))),
+            Kernels::Differs("a chain")
+        );
+        assert!(!lock(&state).held_back);
+        // A measured answer is what a self-test finds, with no probe.
+        let state = fresh();
+        cached(&state, t0, || Some(Kernels::Match));
+        assert_eq!(checked(&state, t0, || panic!("measured twice")), Kernels::Match);
+        // One still inside the backoff cannot tell, and holds the grade back again.
+        let state = fresh();
+        assert_eq!(cached(&state, t0, || None), Kernels::Unknown);
+        assert_eq!(checked(&state, t0, || panic!("probed inside the backoff")), Kernels::Unknown);
+        assert!(lock(&state).held_back);
     }
 
     /// A probe that cannot tell the kernels it is for from the plain C ones proves nothing: this picture makes

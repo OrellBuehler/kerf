@@ -107,8 +107,10 @@
 //!   scaler's x86 vertical filter ([`grade`], `shaders/grade.wgsl`): reproduced
 //!   sample for sample on a layer at its own size, on both FFmpeg builds, and refused on
 //!   a resized or letterboxed layer, an odd side, any other picture format, and under
-//!   effects or a fade ([`kerf_core::RenderPlan::reasons`]). [`grade::kernels`] measures
-//!   that this machine's FFmpeg converts that way (it does not on another CPU's SIMD).
+//!   effects or a fade, and in a cut that mixes colour matrices under FFmpeg 9
+//!   ([`kerf_core::RenderPlan::reasons`]). [`grade::kernels`] measures that this machine's FFmpeg
+//!   converts that way (it does not on another CPU's SIMD), chain by chain, and until it says so
+//!   [`Compositor::caps`] has no grade in it.
 //! * **What the GPU does not draw is refused, loudly.** Per frame the plan says no
 //!   ([`kerf_core::RenderPlan::gpu_supported_at`], which also takes the render size:
 //!   a resize of a picture whose chroma is not 4:2:0, a translucent layer of

@@ -148,6 +148,28 @@ impl GradePasses {
     }
 }
 
+/// Why a layer whose grade is drawn cannot be drawn at this geometry, or `None`: the grade runs in RGB on the picture the
+/// chain has made, at its own size, and what is reproduced is FFmpeg's round trip for a picture the scaler did not
+/// resize, with nothing after the grade that sees the RGB (or, for a tagged picture, 4:4:4) frame. The plan refuses
+/// all of these first (`RenderPlan::reasons`: `Matte`, `GradeWith`, `ZoomBehind`); this is the render's own check,
+/// for a caller that did not ask.
+pub(super) fn grade_geometry_refusal(layer: &kerf_core::PlanLayer, geom: &LayerGeometry) -> Option<String> {
+    let (zoom_last, (pw, ph)) = effect_picture(layer, geom);
+    if geom.matte {
+        Some("a grade on a letterboxed picture".into())
+    } else if zoom_last {
+        Some("a grade before a moving zoom".into())
+    } else if geom.stages.iter().any(|s| s.scaled != (s.src.w, s.src.h)) {
+        Some("a grade on a layer the scaler resizes".into())
+    } else if pw % 2 != 0 || ph % 2 != 0 {
+        Some(format!("a grade on a {pw}x{ph} picture (odd sides)"))
+    } else if layer.effects.iter().any(|e| !matches!(e, VideoEffect::ChromaKey { .. })) {
+        Some("video effects behind a grade".into())
+    } else {
+        None
+    }
+}
+
 impl Compositor {
     /// What a layer's grade needs on the GPU (its LUT, uploaded once for the frames that follow), or `None` when
     /// nothing of the grade is left to draw: FFmpeg takes the picture through RGB only for the filters it has.
@@ -467,5 +489,225 @@ impl Compositor {
                 v,
             })
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kerf_core::{
+        Asset, Clip, CompositeColorPolicy, Delivery, ExportOptions, Fit, Grade, Keyframe, PlanRequest, Planner, RenderPlan,
+        StreamInfo, StreamKind, Timeline, Track, Wheel, Wheels,
+    };
+
+    fn stream(w: u32, h: u32) -> StreamInfo {
+        StreamInfo {
+            index: 0,
+            kind: StreamKind::Video,
+            codec: "h264".into(),
+            width: Some(w),
+            height: Some(h),
+            fps: Some(30.0),
+            sample_rate: None,
+            channels: None,
+            image: false,
+            projection: None,
+            rotation: 0,
+            color_transfer: None,
+            color_primaries: None,
+            pix_fmt: Some("yuv420p".into()),
+            color_space: None,
+            color_range: None,
+            lead: 0.0,
+        }
+    }
+
+    fn wheels() -> Grade {
+        Grade {
+            wheels: Some(Wheels {
+                midtones: Wheel {
+                    x: 0.2,
+                    y: 0.1,
+                    lightness: 0.05,
+                },
+                ..Wheels::default()
+            }),
+            ..Grade::default()
+        }
+    }
+
+    /// The Motion plan of one graded clip of `w`x`h` footage at its fourth frame, on a canvas of `delivery` (the
+    /// footage's own size without one), `edit` applied to the clip.
+    fn plan(w: u32, h: u32, delivery: Option<Delivery>, edit: impl FnOnce(&mut Clip)) -> RenderPlan {
+        let asset = Asset {
+            id: uuid::Uuid::new_v4(),
+            path: "/media/a.mp4".into(),
+            name: "a".into(),
+            duration: 20.0,
+            streams: vec![stream(w, h)],
+            imported_at: chrono::Utc::now(),
+            source_paths: Vec::new(),
+            voiceover: None,
+            music_score: None,
+        };
+        let mut clip = Clip::new(asset.id, 0.0, 10.0, 0.0);
+        clip.grade = wheels();
+        edit(&mut clip);
+        let timeline = Timeline {
+            tracks: vec![Track {
+                clips: vec![clip],
+                ..Track::new(StreamKind::Video, "V1")
+            }],
+            overlays: Vec::new(),
+            svg_overlays: Vec::new(),
+            markers: Vec::new(),
+            format: delivery,
+            master: Default::default(),
+        };
+        let opts = ExportOptions {
+            fps: Some(30.0),
+            ..ExportOptions::default()
+        };
+        Planner::new(
+            &timeline,
+            std::slice::from_ref(&asset),
+            &opts,
+            PlanRequest::motion(CompositeColorPolicy::FixedBt601),
+        )
+        .expect("a planner")
+        .at_frame(3)
+        .expect("a plan")
+    }
+
+    fn geometry(plan: &RenderPlan) -> LayerGeometry {
+        plan.layer_geometry(&plan.layers[0], plan.size(u32::MAX)).expect("a geometry")
+    }
+
+    fn zoom(time: f64, scale: f64) -> Keyframe {
+        Keyframe {
+            time,
+            scale,
+            pos_x: 0.0,
+            pos_y: 0.0,
+            rotation: 0.0,
+            opacity: 1.0,
+            easing: Default::default(),
+        }
+    }
+
+    type Edit = Box<dyn Fn(&mut Clip)>;
+
+    /// A layer a grade is not drawn for: what it is, its footage's size, the canvas, the edit of its clip, and the word its refusal holds.
+    type Refused = (&'static str, (u32, u32), Option<Delivery>, Edit, &'static str);
+
+    /// Every layer a grade is not drawn for at its geometry, with the word its refusal holds: the plan refuses these
+    /// first (`RenderPlan::reasons`), and the render says no too, for a caller that did not ask.
+    fn refused() -> Vec<Refused> {
+        vec![
+            (
+                "a letterbox",
+                (360, 640),
+                Some(Delivery::new(640, 360, Fit::Contain)),
+                Box::new(|_| {}),
+                "letterboxed",
+            ),
+            (
+                "a picture-in-picture",
+                (640, 360),
+                None,
+                Box::new(|c| c.transform.scale = 0.6),
+                "resizes",
+            ),
+            (
+                "an enlargement",
+                (640, 360),
+                Some(Delivery::new(960, 540, Fit::Contain)),
+                Box::new(|_| {}),
+                "resizes",
+            ),
+            (
+                "a blur behind it",
+                (640, 360),
+                None,
+                Box::new(|c| c.effects = vec![kerf_core::VideoEffect::Blur { sigma: 2.0 }]),
+                "video effects",
+            ),
+            (
+                "a moving zoom last",
+                (640, 360),
+                None,
+                Box::new(|c| c.keyframes = vec![zoom(0.0, 1.0), zoom(4.0, 1.4)]),
+                "moving zoom",
+            ),
+        ]
+    }
+
+    #[test]
+    fn a_layer_at_its_own_size_has_nothing_to_refuse() {
+        let p = plan(640, 360, None, |_| {});
+        assert_eq!(grade_geometry_refusal(&p.layers[0], &geometry(&p)), None);
+        // A chroma key is behind `format=yuva420p`, after the grade's conversion back.
+        let p = plan(640, 360, None, |c| {
+            c.effects = vec![kerf_core::VideoEffect::ChromaKey {
+                color: "green".into(),
+                similarity: 0.3,
+                blend: 0.1,
+            }];
+        });
+        assert_eq!(grade_geometry_refusal(&p.layers[0], &geometry(&p)), None);
+    }
+
+    #[test]
+    fn a_letterbox_a_resize_an_effect_and_a_zoom_last_are_each_refused_at_the_render() {
+        for (name, (w, h), delivery, edit, word) in refused() {
+            let p = plan(w, h, delivery, |c| edit(c));
+            let why = grade_geometry_refusal(&p.layers[0], &geometry(&p)).unwrap_or_else(|| panic!("{name}: drawn"));
+            assert!(why.contains(word), "{name}: {why}");
+        }
+    }
+
+    #[test]
+    fn an_odd_side_is_refused_at_the_render() {
+        let mut p = plan(640, 360, None, |_| {});
+        let geom = geometry(&p);
+        // (A picture is odd only on a canvas that is: the plan's canvas is what the render's size is made of.)
+        p.layers[0].stream.width = 641;
+        let geom = LayerGeometry {
+            picture: (641, 360),
+            ..geom
+        };
+        let why = grade_geometry_refusal(&p.layers[0], &geom).expect("an odd picture is refused");
+        assert!(why.contains("641x360") && why.contains("odd"), "{why}");
+        let geom = LayerGeometry {
+            picture: (640, 361),
+            ..geom
+        };
+        assert!(grade_geometry_refusal(&p.layers[0], &geom).is_some());
+    }
+
+    #[test]
+    #[ignore = "needs an adapter (lavapipe is enough)"]
+    fn look_of_refuses_them_itself_whatever_the_plan_said() {
+        use crate::gpu::{Gpu, GpuOptions};
+        use crate::grade::Kernels;
+        let gpu = Gpu::new(GpuOptions::for_tests()).expect("a GPU adapter (install mesa-vulkan-drivers for lavapipe)");
+        let compositor = Compositor::new(gpu).expect("a compositor").with_grade_kernels(Kernels::Match);
+        let own = plan(640, 360, None, |_| {});
+        assert!(compositor.look_of(&own.layers[0], &geometry(&own)).is_ok());
+        for (name, (w, h), delivery, edit, word) in refused() {
+            let p = plan(w, h, delivery, |c| edit(c));
+            let Err(GpuError::Unsupported(why)) = compositor.look_of(&p.layers[0], &geometry(&p)) else {
+                panic!("{name}: drawn");
+            };
+            assert!(why.contains(word), "{name}: {why}");
+        }
+        // The kernels come first: a machine that converts otherwise draws no grade at all.
+        let unmeasured = Compositor::new(Gpu::new(GpuOptions::for_tests()).expect("a GPU adapter"))
+            .expect("a compositor")
+            .with_grade_kernels(Kernels::Unknown);
+        let Err(GpuError::Unsupported(why)) = unmeasured.look_of(&own.layers[0], &geometry(&own)) else {
+            panic!("drawn with unknown kernels");
+        };
+        assert!(why.contains("measured"), "{why}");
     }
 }

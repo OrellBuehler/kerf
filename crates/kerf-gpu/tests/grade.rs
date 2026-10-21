@@ -523,14 +523,23 @@ fn a_1080p_frame_is_ffmpegs_to_the_level() {
 }
 
 /// This FFmpeg converts to and from RGB as the model does, which is what lets the compositor draw a grade at all:
-/// the probe runs the grade's two routes over noise and compares them with the reference.
+/// the probe runs every set of the grade's parts (the LUT, the curves, the wheels: seven) through both routes over
+/// noise, each as its own graph with the filters the engine writes, and compares them with the reference. It has to
+/// say `Match` on both builds in CI, and it is a cost of the first graded frame, so it is timed.
 #[test]
 #[ignore = "needs ffmpeg"]
 fn this_ffmpeg_converts_as_the_model_does() {
+    let started = std::time::Instant::now();
+    let kernels = kerf_gpu::grade::kernels();
+    eprintln!(
+        "grade/kernels probe: {kernels:?} in {:.0} ms",
+        started.elapsed().as_secs_f64() * 1e3
+    );
+    assert_eq!(kernels, kerf_gpu::grade::Kernels::Match, "{}", kerf_core::ffmpeg_path());
+    // What a plan is made from is the same answer, without running anything.
+    assert_eq!(kerf_gpu::grade::measured(), kerf_gpu::grade::Kernels::Match);
     assert_eq!(
-        kerf_gpu::grade::kernels(),
-        kerf_gpu::grade::Kernels::Match,
-        "{}",
-        kerf_core::ffmpeg_path()
+        Compositor::caps_for(kerf_gpu::grade::measured()).grade,
+        kerf_core::GradeKinds::ALL
     );
 }
