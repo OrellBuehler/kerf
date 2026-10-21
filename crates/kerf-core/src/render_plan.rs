@@ -278,6 +278,13 @@ pub struct PlanCanvas {
     /// under this plan's policy), wherever it is on the timeline: the export's range is one for the
     /// whole stream.
     pub full_range_cut: bool,
+    /// A [`PlanMode::Motion`] plan's cut holds inputs of more than one colour matrix
+    /// ([`PlanStream::matrix`], the graph's BT.709 label included; RGB pictures and pictures of no known matrix
+    /// aside), wherever they are on the timeline. FFmpeg 9 negotiates the matrix across the whole graph and
+    /// converts every input of another matrix into the bottom layer's, so what a layer of the cut goes through
+    /// is not decided by the layers on screen with it ([`composite_matrix`] judges those). Always `false` in a
+    /// Still plan, whose graph is the layers on screen.
+    pub mixed_matrices_cut: bool,
 }
 
 /// What the compositor needs to know about a layer's source picture.
@@ -1440,6 +1447,8 @@ impl RenderPlan {
             Some("under video effects (FFmpeg runs them on the RGB or 4:4:4 picture it negotiates after the grade)")
         } else if self.white_round_trip(layer) || ops.iter().any(|o| o.tint != FadeTint::Alpha && o.factor < FADE_FULL) {
             Some("while a fade to black or white runs on it (FFmpeg fades the RGB picture the grade leaves)")
+        } else if self.canvas.mixed_matrices_cut && self.canvas.policy != CompositeColorPolicy::FixedBt601 {
+            Some("in a cut that mixes colour matrices (FFmpeg 9 converts the picture the grade leaves into the bottom layer's matrix inside the graph, on every frame of the clip, not only where the two are on screen together)")
         } else {
             None
         }
