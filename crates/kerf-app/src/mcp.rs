@@ -6691,7 +6691,9 @@ const EDITING_GUIDE: &str = "How to edit with Kerf. The user queues editing task
              (clips_offset / clips_limit); history, list_tasks, list_assets, \
              staged_diff and revision_diff page with offset / limit. list_assets shows each asset's preview proxy (ready, \
              queued, building with an ETA, failed, off) and which analyses have \
-             run, and timeline_summary's `media_notes` lists the cut's media whose \
+             run; in a big library pass it `fields: \"compact\"` (one short line per asset) and, to find \
+             what an import added, `imported_after` set to the `newest_imported_at` it gave before the import. \
+             timeline_summary's `media_notes` lists the cut's media whose \
              proxy is not ready (previews of it are slower; export is unaffected) \
              or whose source file is missing (missing_assets lists every asset whose file \
              is gone; relinking or removing media is the user's, in Kerf's library). \
@@ -9145,6 +9147,42 @@ mod tests {
             assert_eq!(job(name)["required"], serde_json::json!(["job_id"]), "{name}");
         }
         assert!(job("list_jobs")["properties"].as_object().is_none_or(|p| p.is_empty()));
+    }
+
+    /// A big library is listed in short lines, and what an import added is asked for by time: both
+    /// arguments are in the schema (so the strict-argument check lets them through), optional, and
+    /// explained to a model that has not seen the window; the tool stays read-only.
+    #[test]
+    fn list_assets_takes_a_compact_view_and_an_import_time_and_stays_read_only() {
+        let tools = router().list_all();
+        let tool = tools.iter().find(|t| t.name == "list_assets").unwrap();
+        for field in ["offset", "limit", "fields", "imported_after"] {
+            assert!(
+                tool.input_schema["properties"].get(field).is_some(),
+                "list_assets takes {field}"
+            );
+        }
+        assert!(tool
+            .input_schema
+            .get("required")
+            .is_none_or(|r| r.as_array().is_some_and(Vec::is_empty)));
+        let fields = serde_json::to_string(&tool.input_schema["properties"]["fields"]).unwrap();
+        assert!(fields.contains("compact") && fields.contains("full"), "{fields}");
+        let text = tool.description.as_deref().unwrap_or_default();
+        for needle in ["compact", "imported_after", "newest_imported_at", "next_offset", "20,000"] {
+            assert!(text.contains(needle), "the description does not say `{needle}`: {text}");
+        }
+        assert_eq!(tool.annotations.as_ref().unwrap().read_only_hint, Some(true));
+
+        let accepted = serde_json::json!({"fields": "compact", "imported_after": "2026-10-22T09:30:00Z", "limit": 20});
+        assert!(reject_unknown_arguments(&call("list_assets", accepted)).is_ok());
+        let e = reject_unknown_arguments(&call("list_assets", serde_json::json!({"compact": true}))).unwrap_err();
+        assert!(
+            e.message.contains("\"compact\"") && e.message.contains("fields") && e.message.contains("imported_after"),
+            "{}",
+            e.message
+        );
+        assert!(super::INSTRUCTIONS.contains("compact") && super::INSTRUCTIONS.contains("imported_after"));
     }
 
     #[test]
