@@ -101,6 +101,14 @@
 //!   converts later, which agrees without colour correction and disagrees by 34 to
 //!   44 dB with it — on the picture itself, and on a graded layer anywhere in a stack
 //!   with a full-range one. The plan refuses both.
+//! * **A clip's grade (wheels, curves, a 3D LUT) is FFmpeg's RGB round trip, drawn to the
+//!   level.** `colorbalance`, `lutrgb` and `lut3d` only take RGB, so FFmpeg converts
+//!   `yuv420p -> rgb24` with swscale's x86 kernel, grades, and converts back with the
+//!   scaler's x86 vertical filter ([`grade`], `shaders/grade.wgsl`): reproduced
+//!   sample for sample on a layer at its own size, on both FFmpeg builds, and refused on
+//!   a resized or letterboxed layer, an odd side, any other picture format, and under
+//!   effects or a fade ([`kerf_core::RenderPlan::reasons`]). [`grade::kernels`] measures
+//!   that this machine's FFmpeg converts that way (it does not on another CPU's SIMD).
 //! * **What the GPU does not draw is refused, loudly.** Per frame the plan says no
 //!   ([`kerf_core::RenderPlan::gpu_supported_at`], which also takes the render size:
 //!   a resize of a picture whose chroma is not 4:2:0, a translucent layer of

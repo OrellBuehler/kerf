@@ -488,53 +488,80 @@ pub fn kernels() -> Kernels {
     }
 }
 
-/// The probe's filter graph: a picture of noise, and the same through the grade's two routes with an identity
-/// `lutrgb` (which is what puts the picture through RGB), stacked in one frame.
-fn probe_graph() -> String {
+/// The probe picture: noise-like (a polynomial of the coordinates, mod 256, in the integers `geq` computes exactly)
+/// in all three planes, so that every kernel branch is looked at. It is not `random()`: that restarts for every
+/// slice thread, so the picture would depend on how many threads the child got.
+fn probe_source() -> String {
     let (w, h) = PROBE;
     format!(
-        "nullsrc=s={w}x{h}:r=1:d=1,format=yuv420p,geq=lum='random(1)*255':cb='random(2)*255':cr='random(3)*255',split=3[a][b][c];\
-         [b]lutrgb=r=val,format=yuv420p[g];\
-         [c]setparams=colorspace=bt709,lutrgb=r=val,scale=out_color_matrix=bt709,format=yuv444p|yuv444p10le|yuv444p12le|yuv444p16le,setparams=colorspace=bt709,format=yuv420p[t];\
-         [a][g][t]vstack=inputs=3"
+        "nullsrc=s={w}x{h}:r=1:d=1,format=yuv420p,\
+         geq=lum='mod(X*X*37+Y*Y*91+X*Y*53+X*11+Y*29,256)':cb='mod(X*X*13+Y*Y*71+X*Y*29+X*7+Y*3,256)':cr='mod(X*X*53+Y*Y*19+X*Y*97+X*5+Y*17,256)'"
     )
 }
 
-fn measure() -> Option<Kernels> {
-    let mut cmd = kerf_core::ffmpeg_command();
-    cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-f", "lavfi", "-i"]);
-    cmd.arg(probe_graph());
-    cmd.args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "yuv420p", "pipe:1"]);
-    let out = crate::source::run_child(cmd, 3 * PROBE.0 * PROBE.1 * 3 / 2 + 1, PROBE_TIMEOUT).ok()?;
-    classify(&out)
+/// The three graphs of the probe: the picture, and the picture through the grade's two routes with an identity
+/// `lutrgb` (which is what puts it through RGB). **One graph each**, not one graph stacking them: FFmpeg 9
+/// negotiates the colour matrix across a whole graph, so a tagged branch beside an untagged one converts both
+/// with its matrix, and the answer is no longer that of either route.
+fn probe_graphs() -> [String; 3] {
+    let source = probe_source();
+    [
+        source.clone(),
+        format!("{source},lutrgb=r=val,format=yuv420p"),
+        format!(
+            "{source},setparams=colorspace=bt709,lutrgb=r=val,scale=out_color_matrix=bt709,\
+             format=yuv444p|yuv444p10le|yuv444p12le|yuv444p16le,setparams=colorspace=bt709,format=yuv420p"
+        ),
+    ]
 }
 
-/// The answer in a stacked probe frame: `None` when it is not the size it should be.
-fn classify(frame: &[u8]) -> Option<Kernels> {
+fn probe_frame_len() -> usize {
+    PROBE.0 * PROBE.1 * 3 / 2
+}
+
+fn measure() -> Option<Kernels> {
+    let graphs = probe_graphs();
+    let frames: Vec<Option<Vec<u8>>> = std::thread::scope(|scope| {
+        let runs: Vec<_> = graphs
+            .iter()
+            .map(|graph| {
+                scope.spawn(move || {
+                    let mut cmd = kerf_core::ffmpeg_command();
+                    cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-f", "lavfi", "-i"]);
+                    cmd.arg(graph);
+                    cmd.args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "yuv420p", "pipe:1"]);
+                    crate::source::run_child(cmd, probe_frame_len() + 1, PROBE_TIMEOUT).ok()
+                })
+            })
+            .collect();
+        runs.into_iter().map(|run| run.join().ok().flatten()).collect()
+    });
+    match frames.as_slice() {
+        [Some(source), Some(untagged), Some(tagged)] => classify(source, untagged, tagged),
+        _ => None,
+    }
+}
+
+/// The answer from the three probe pictures: `None` when one is not the size it should be.
+fn classify(source: &[u8], untagged: &[u8], tagged: &[u8]) -> Option<Kernels> {
     let (w, h) = PROBE;
     let (cw, ch) = (w / 2, h / 2);
-    if frame.len() != 3 * (w * h + 2 * cw * ch) {
+    if [source, untagged, tagged].iter().any(|f| f.len() != probe_frame_len()) {
         return None;
     }
-    // Planes of a vertical stack: luma of the three pictures, then their U, then their V.
-    let (y, rest) = frame.split_at(3 * w * h);
-    let (u, v) = rest.split_at(3 * cw * ch);
-    let picture = |n: usize| -> [&[u8]; 3] {
-        [
-            &y[n * w * h..(n + 1) * w * h],
-            &u[n * cw * ch..(n + 1) * cw * ch],
-            &v[n * cw * ch..(n + 1) * cw * ch],
-        ]
+    let planes = |f: &[u8]| -> [Vec<u8>; 3] {
+        let (y, rest) = f.split_at(w * h);
+        let (u, v) = rest.split_at(cw * ch);
+        [y.to_vec(), u.to_vec(), v.to_vec()]
     };
-    let source = picture(0);
-    let untagged = rgb_to_yuv420(&yuv420_to_rgb(source, w, h, YuvMatrix::Bt601), w, h, YuvMatrix::Bt601);
-    if picture(1) != [&untagged[0][..], &untagged[1][..], &untagged[2][..]] {
+    let [y, u, v] = planes(source);
+    let source = [&y[..], &u[..], &v[..]];
+    if planes(untagged) != rgb_to_yuv420(&yuv420_to_rgb(source, w, h, YuvMatrix::Bt601), w, h, YuvMatrix::Bt601) {
         return Some(Kernels::Differs(
             "the conversion to RGB and back to 4:2:0 of an untagged picture",
         ));
     }
-    let tagged = rgb_to_yuv420_via_444(&yuv420_to_rgb(source, w, h, YuvMatrix::Bt709), w, h, YuvMatrix::Bt709);
-    if picture(2) != [&tagged[0][..], &tagged[1][..], &tagged[2][..]] {
+    if planes(tagged) != rgb_to_yuv420_via_444(&yuv420_to_rgb(source, w, h, YuvMatrix::Bt709), w, h, YuvMatrix::Bt709) {
         return Some(Kernels::Differs(
             "the conversion to RGB and back through 4:4:4 of a tagged picture",
         ));
@@ -654,41 +681,93 @@ mod tests {
         assert_eq!(u444.len(), w * h / 4);
     }
 
-    #[test]
-    fn a_probe_frame_that_is_the_reference_is_a_match_and_one_sample_off_is_not() {
+    /// The probe picture, as `probe_source`'s expressions make it (the integers are exact in `geq`'s doubles).
+    fn probe_picture() -> [Vec<u8>; 3] {
         let (w, h) = PROBE;
-        let mut state = 7u32;
-        let mut noise = |n: usize| -> Vec<u8> {
-            (0..n)
-                .map(|_| {
-                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                    (state >> 24) as u8
+        let plane = |w: usize, h: usize, k: [usize; 5]| -> Vec<u8> {
+            (0..w * h)
+                .map(|i| {
+                    let (x, y) = (i % w, i / w);
+                    ((x * x * k[0] + y * y * k[1] + x * y * k[2] + x * k[3] + y * k[4]) % 256) as u8
                 })
                 .collect()
         };
-        let (y, u, v) = (noise(w * h), noise(w * h / 4), noise(w * h / 4));
-        let untagged = rgb_to_yuv420(&yuv420_to_rgb([&y, &u, &v], w, h, YuvMatrix::Bt601), w, h, YuvMatrix::Bt601);
-        let tagged = rgb_to_yuv420_via_444(&yuv420_to_rgb([&y, &u, &v], w, h, YuvMatrix::Bt709), w, h, YuvMatrix::Bt709);
-        let stack = |a: &[Vec<u8>; 3], b: &[Vec<u8>; 3]| -> Vec<u8> {
-            let mut out = Vec::new();
-            for plane in 0..3 {
-                let source = [&y, &u, &v][plane];
-                out.extend_from_slice(source);
-                out.extend_from_slice(&a[plane]);
-                out.extend_from_slice(&b[plane]);
-            }
-            out
-        };
-        let frame = stack(&untagged, &tagged);
-        assert_eq!(classify(&frame), Some(Kernels::Match));
-        assert_eq!(classify(&frame[1..]), None);
-        let mut off = frame.clone();
+        [
+            plane(w, h, [37, 91, 53, 11, 29]),
+            plane(w / 2, h / 2, [13, 71, 29, 7, 3]),
+            plane(w / 2, h / 2, [53, 19, 97, 5, 17]),
+        ]
+    }
+
+    fn concat(p: &[Vec<u8>; 3]) -> Vec<u8> {
+        p.iter().flatten().copied().collect()
+    }
+
+    #[test]
+    fn a_probe_that_is_the_reference_is_a_match_and_one_sample_off_is_not() {
+        let (w, h) = PROBE;
+        let src = probe_picture();
+        let source = [&src[0][..], &src[1][..], &src[2][..]];
+        let untagged = concat(&rgb_to_yuv420(
+            &yuv420_to_rgb(source, w, h, YuvMatrix::Bt601),
+            w,
+            h,
+            YuvMatrix::Bt601,
+        ));
+        let tagged = concat(&rgb_to_yuv420_via_444(
+            &yuv420_to_rgb(source, w, h, YuvMatrix::Bt709),
+            w,
+            h,
+            YuvMatrix::Bt709,
+        ));
+        let source = concat(&src);
+        assert_eq!(classify(&source, &untagged, &tagged), Some(Kernels::Match));
+        assert_eq!(classify(&source[1..], &untagged, &tagged), None);
+        let mut off = untagged.clone();
         off[w * h + 5] ^= 1;
-        assert!(matches!(classify(&off), Some(Kernels::Differs(why)) if why.contains("untagged")));
-        let mut off = frame;
+        assert!(matches!(classify(&source, &off, &tagged), Some(Kernels::Differs(why)) if why.contains("untagged")));
+        let mut off = tagged;
         let last = off.len() - 1;
         off[last] ^= 1;
-        assert!(matches!(classify(&off), Some(Kernels::Differs(why)) if why.contains("tagged")));
+        assert!(matches!(classify(&source, &untagged, &off), Some(Kernels::Differs(why)) if why.contains("tagged")));
+    }
+
+    /// A probe that cannot tell the kernels it is for from the plain C ones proves nothing: this picture makes
+    /// the x86 vertical scaler's chroma differ from the C arithmetic's on a good share of samples.
+    #[test]
+    fn the_probe_picture_tells_the_x86_vertical_kernel_from_the_c_one() {
+        let (w, h) = PROBE;
+        let src = probe_picture();
+        let source = [&src[0][..], &src[1][..], &src[2][..]];
+        let rgb = yuv420_to_rgb(source, w, h, YuvMatrix::Bt601);
+        let x86 = rgb_to_yuv420(&rgb, w, h, YuvMatrix::Bt601);
+        let k = Rgb2Yuv::new(YuvMatrix::Bt601);
+        let (cw, ch) = (w / 2, h / 2);
+        let mut u15 = vec![0i32; cw * h];
+        for y in 0..h {
+            for x in 0..cw {
+                let px = |dx: usize| -> [i32; 3] { std::array::from_fn(|c| i32::from(rgb[(y * w + 2 * x + dx) * 3 + c])) };
+                let (a, b) = (px(0), px(1));
+                u15[y * cw + x] = k.pair_to_chroma15([a[0] + b[0], a[1] + b[1], a[2] + b[2]]).0;
+            }
+        }
+        let filter = sws::bicubic(h as u32, ch as u32, sws::ONE_VERTICAL).expect("a 2:1 vertical filter");
+        let mut differing = 0;
+        for i in 0..ch {
+            for x in 0..cw {
+                let acc: i64 = (64 << 12)
+                    + (0..filter.size)
+                        .map(|j| {
+                            let row = (filter.pos[i] as usize + j).min(h - 1);
+                            i64::from(filter.coeff[i * filter.size + j]) * i64::from(u15[row * cw + x])
+                        })
+                        .sum::<i64>();
+                if (acc >> 19).clamp(0, 255) as u8 != x86[1][i * cw + x] {
+                    differing += 1;
+                }
+            }
+        }
+        assert!(differing >= 10, "{differing} of {} chroma samples differ", cw * ch);
     }
 
     #[test]

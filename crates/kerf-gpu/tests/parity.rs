@@ -2202,37 +2202,6 @@ fn frames_the_gpu_would_draw_wrong_are_refused() {
         0.5,
         Refusal::Plan("odd size"),
     );
-    // Curves, colour wheels and a LUT: RGB filters FFmpeg converts around, which no pass draws.
-    let curves = kerf_core::Grade {
-        curves: Some(kerf_core::Curves {
-            master: vec![
-                kerf_core::CurvePoint { x: 0.0, y: 1.0 },
-                kerf_core::CurvePoint { x: 1.0, y: 0.0 },
-            ],
-            ..kerf_core::Curves::default()
-        }),
-        ..kerf_core::Grade::default()
-    };
-    let wheels = kerf_core::Grade {
-        wheels: Some(kerf_core::Wheels {
-            midtones: kerf_core::Wheel {
-                x: 0.3,
-                y: 0.0,
-                lightness: 0.0,
-            },
-            ..kerf_core::Wheels::default()
-        }),
-        ..kerf_core::Grade::default()
-    };
-    for (name, grade, why) in [
-        ("refused/curves", curves, "curves"),
-        ("refused/wheels", wheels, "colour wheels"),
-    ] {
-        let mut c = clip(&m.testsrc, 0.0, 2.0, 0.0);
-        c.grade = grade;
-        let tl = timeline(vec![vec![c]], None);
-        check_refused(name, &tl, std::slice::from_ref(&m.testsrc), 0.5, Refusal::Plan(why));
-    }
     // A moving zoom with a rotation or a fade of opacity in front of it: FFmpeg (the still and the
     // export alike) runs the zoom last, so those act on the picture at its fit size and are
     // magnified with it, an order the compositor does not have for these two (a grade, a mask, the
