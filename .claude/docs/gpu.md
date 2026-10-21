@@ -902,7 +902,7 @@ over every kind of picture, with no layer, and the text it must refuse, each hel
 holds 822 rows on FFmpeg 6.1.1 (775 on the pinned 9.0.2 the Windows and macOS bundles ship, where the mixed-tag stacks are asserted refused instead of compared; CI runs the harness without `--nocapture`, so it keeps no report); on 6.1.1 152 rows are `text/`, its
 controls included, 191 the transitions, fades and dips and 184 the zoom, mask, effect and chroma key cases, plus the plane-level scaler (75), effect (108) and chroma key alpha (12) runs, all passing strictly. A failing case writes the reference, GPU and diff images to `target/parity/`
 (`KERF_PARITY_KEEP=1` keeps them for passing ones; `KERF_PARITY_EXPLORE=1` prints
-everything and fails nothing); every run writes `target/parity/report.txt`.
+everything and fails nothing); every run writes `target/parity/report.txt`. The tests of a binary run in parallel on one compositor, so a fixture they share is written once and renamed into place (`tests/common`, `write_fixture`: the grades' `.cube` files): `std::fs::write` truncates first, and a plan or an FFmpeg that read the file in that window found it empty ("no LUT_3D_SIZE"), left the LUT out and drew the frame without it (one frame of `grade/keyed position` at Y 11 / UV 8, intermittent in CI, while FFmpeg's export and the GPU were each deterministic).
 `tests/bench.rs` times a still on the GPU against FFmpeg at 1080p / 4K and 1 / 3 / 6
 layers, decode apart from composite (`KERF_BENCH=1`), and a captioned frame cold (FFmpeg rasterises the caption: one
 process, +30 to +95 ms on lavapipe by FFmpeg and size) and warm (the atlas: a few ms, inside the noise), and a mask, a blur, a sharpen and a

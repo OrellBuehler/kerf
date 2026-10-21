@@ -30,6 +30,8 @@
 
 #![allow(clippy::print_stderr)]
 
+mod common;
+
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::ops::Range;
@@ -4390,7 +4392,7 @@ fn grade_cube(name: &str, size: usize, f: impl Fn([f32; 3]) -> [f32; 3]) -> Stri
         data,
     };
     let path = dir.join(format!("{name}.cube"));
-    std::fs::write(&path, table.to_cube(1.0)).unwrap();
+    common::write_fixture(&path, &table.to_cube(1.0));
     path.to_string_lossy().into_owned()
 }
 

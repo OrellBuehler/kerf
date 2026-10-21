@@ -924,6 +924,10 @@ mod tests {
         assert!(reset_keep(&merged).editing.is_none(), "a reset puts them back");
     }
 
+    /// `update_file` and `reset_file` put preferences into force in process-wide statics (the safe areas, the agent-review
+    /// switch), so the tests that call them or read those back take turns.
+    static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
     fn scratch() -> PathBuf {
         let dir = std::env::temp_dir().join(format!("kerf-settings-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -1303,6 +1307,7 @@ mod tests {
 
     #[test]
     fn the_agent_review_switch_is_one_the_agent_tools_read() {
+        let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let before = agent_review();
         set_agent_review(false);
         assert!(!agent_review());
@@ -1394,10 +1399,11 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// Everything that touches the engine's process-wide preferences, in one test so two
-    /// of them never race for the same global.
+    /// Everything that puts a patch into force, in one test, taking its turn with the others that touch the
+    /// engine's process-wide preferences.
     #[test]
     fn a_patch_is_saved_before_it_is_put_into_force_and_a_reset_goes_back_to_the_defaults() {
+        let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let dir = scratch();
         let before = safe_areas();
 
@@ -1607,6 +1613,7 @@ mod tests {
 
     #[test]
     fn a_setting_a_newer_build_wrote_survives_a_save_of_something_else() {
+        let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let dir = scratch();
         let file = dir.join("settings.json");
         std::fs::write(
@@ -1647,6 +1654,7 @@ mod tests {
 
     #[test]
     fn only_the_newest_backups_of_each_kind_are_kept() {
+        let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
         let dir = scratch();
         let file = dir.join("settings.json");
         for ms in 100..112u32 {
