@@ -196,7 +196,7 @@ and no `blob:`; core serializes the geometry without pixels) and **no MCP tool**
 `get_timeline_frame` (the composited still at a time; see Scrubbed frames below),
 `get_scopes` (`kerf_core::scopes` of the export's still at a time, from the originals: the summary and the grids asked
 for; the MCP tool of the same name) / `get_render_bar` (`kerf_core::render_bar` over the working cut, for the GPU
-preview's `Compositor::CAPS` when the setting is on, the proxy waits and the measured colour policy; GUI-only, see
+preview's caps when the setting is on (`Compositor::caps_for(grade::measured())`: the grade is in them once this FFmpeg's conversions are known to be the ones the GPU draws, which a cut with a graded clip asks for first, on the command's blocking thread), the proxy waits and the measured colour policy; GUI-only, see
 `frontend-timeline.md`),
 detached panels (`popout_expect` / `popout_cancel` / `popout_focus` / `popout_move` / `close_popout`, see Detached panels below; GUI-only, no MCP tool),
 `start_playback { playback_id, start, fps?, max_width?, on_frame }` / `stop_playback` — streamed
@@ -546,7 +546,7 @@ has `Immediate` or `Mailbox`. The mode is decided **by a request, not by a timer
 the last frame of a drag is presented as the drag's were (without vsync), and the surface goes back to vsync only with the
 request that makes a second lull in a row (a request 600 ms or more after the one before, twice: the second click after a
 drag). The mode changes just before the frame that is presented into the reconfigured surface. *Self-test* (`check.rs`): the first frame the GPU would draw starts `kerf_gpu::parity_self_test`
-(`gpu.md`) on a thread of its own and is FFmpeg's, as is every frame until the verdict (`gpu-preview-checked` is
+(`gpu.md`; three frames, a fourth for the grade where this FFmpeg's conversions are the ones it draws: a machine whose are not has no graded frame to check and is checked on the other three) on a thread of its own and is FFmpeg's, as is every frame until the verdict (`gpu-preview-checked` is
 emitted then, and the page asks for the frame again). Passed opens the GPU path for the session. A **mismatch** and a check
 that **could not be made** both close it, and **turning the setting off and on runs the check again** for either (a driver, an
 FFmpeg or a machine under load may not be what it was; a mismatch that is real is found again for a couple of seconds of

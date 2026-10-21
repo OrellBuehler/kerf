@@ -30,7 +30,7 @@ struct ResampleParams {
     apply_lut: u32,
     plane: u32,           // row of the LUT texture
     taps: i32,            // taps per output sample in `filt`
-    pad0: u32,
+    x86: u32,             // fs_v: 0, swscale's C vertical arithmetic; else the x86 `yuv2yuvX`'s start constant (below)
 }
 
 @group(0) @binding(0) var src: texture_2d<f32>;
@@ -63,12 +63,26 @@ fn fs_v(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let pos = i32(textureLoad(filt, vec2<i32>(0, idx), 0).r);
     // `yuv2planeX_8`: rounding offset (64 << 12), 12-bit weights, >> 19, clipped.
     var acc = 64 << 12u;
+    // The x86 kernel (the grade's chroma, src/grade.rs): each tap is the high half of the 16-bit product, the sum
+    // starts from `x86` and is shifted by 3 -- except the picture's last row, which swscale hands to the C kernel.
+    let x86 = rp.x86 != 0u && idx != rp.out_size.y + rp.dst_off.y - 1;
+    if (x86) {
+        acc = i32(rp.x86);
+    }
     for (var j = 0; j < rp.taps; j = j + 1) {
         let c = i32(textureLoad(filt, vec2<i32>(1 + j, idx), 0).r);
         let sy = clamp(pos + j, 0, rp.src_size.y - 1);
-        acc = acc + c * i32(textureLoad(src, vec2<i32>(o.x, sy), 0).r);
+        let t = c * i32(textureLoad(src, vec2<i32>(o.x, sy), 0).r);
+        if (x86) {
+            acc = acc + (t >> 16u);
+        } else {
+            acc = acc + t;
+        }
     }
     var q = clamp(acc >> 19u, 0, 255);
+    if (x86) {
+        q = clamp(acc >> 3u, 0, 255);
+    }
     // The next filter gets an 8-bit plane: for the last stage of a
     // colour-corrected layer that is vf_eq's table run on that byte.
     if (rp.apply_lut != 0u) {

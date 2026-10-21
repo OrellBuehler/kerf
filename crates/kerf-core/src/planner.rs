@@ -366,6 +366,19 @@ impl Planner {
                 .and_then(|a| a.stream.as_ref())
                 .is_some_and(|s| s.maybe_full_range_in(req.color))
         });
+        // The graph of an export holds every clip of the cut: FFmpeg 9 converts an input of another matrix than the
+        // bottom layer's into it wherever the two are on the timeline. (A still's graph is the layers on screen.)
+        let mixed_matrices_cut = req.mode == PlanMode::Motion && {
+            let mut matrices = clips.iter().filter_map(|c| {
+                let mut stream = c.asset.as_ref()?.stream.clone()?;
+                stream.label_bt709 = c.fx.label_bt709;
+                if stream.is_rgb() {
+                    return None;
+                }
+                stream.matrix()
+            });
+            matrices.next().is_some_and(|first| matrices.any(|m| m != first))
+        };
         Ok(Self {
             mode: req.mode,
             canvas: PlanCanvas {
@@ -380,6 +393,7 @@ impl Planner {
                 pix_fmt: geom.pix_fmt,
                 gif: opts.container == Container::Gif,
                 full_range_cut,
+                mixed_matrices_cut,
             },
             rendered,
             clips,
@@ -1370,6 +1384,100 @@ mod tests {
         assert!(!holds(vec![base(), audio], bt), "audio-only use");
     }
 
+    /// An export's graph holds every clip of the cut: one of another matrix than its neighbour's is converted into it
+    /// (FFmpeg 9) on frames where the two are not on screen together too, so the cut says it
+    /// (`mixed_matrices_cut`), and a grade (whose way back is that conversion) is refused in it under a
+    /// negotiating policy.
+    #[test]
+    fn a_cut_that_mixes_colour_matrices_refuses_a_grade_in_every_frame_of_it_under_ffmpeg_9() {
+        use crate::model::{Grade, Wheel, Wheels};
+        use crate::plan_caps::GradeKinds;
+        let caps = GpuCaps {
+            motion: true,
+            grade: GradeKinds::ALL,
+            ..GpuCaps::A0
+        };
+        // Standard definition, so that an untagged clip is read as BT.601 and not labelled BT.709 (an untagged HD
+        // clip beside a matrix-naming one is, which makes them one matrix).
+        let sd = || {
+            let mut a = asset();
+            (a.streams[0].width, a.streams[0].height) = (Some(640), Some(360));
+            a
+        };
+        let untagged = sd();
+        let mut phone = sd();
+        phone.streams[0].color_space = Some("bt709".into());
+        let mut pal = sd();
+        pal.streams[0].color_space = Some("bt470bg".into());
+        let hd = asset();
+        let mut png = sd();
+        png.streams[0].pix_fmt = Some("rgb24".into());
+        let assets = [untagged.clone(), phone.clone(), pal.clone(), hd.clone(), png.clone()];
+        let (plain, bt) = (CompositeColorPolicy::FixedBt601, CompositeColorPolicy::BottomLayerTag);
+        let graded = Grade {
+            wheels: Some(Wheels {
+                midtones: Wheel {
+                    x: 0.2,
+                    y: 0.1,
+                    lightness: 0.05,
+                },
+                ..Wheels::default()
+            }),
+            ..Grade::default()
+        };
+        // The cut: `first` for a second, then `second`; the graded clip is the one whose frame is asked.
+        let cut = |first: &Asset, second: &Asset, policy: CompositeColorPolicy, mode_still: bool| {
+            let mut a = make_clip(first.id, 0.0, 1.0, 0.0);
+            a.grade = graded.clone();
+            let b = make_clip(second.id, 0.0, 1.0, 1.0);
+            let tl = single(vec![a, b]);
+            let req = if mode_still {
+                PlanRequest::still(policy)
+            } else {
+                PlanRequest::motion(policy)
+            };
+            let planner = Planner::new(&tl, &assets, &opts(30.0), req).unwrap();
+            let plan = if mode_still {
+                planner.at(0.5).unwrap()
+            } else {
+                planner.at_frame(10).unwrap()
+            };
+            let flag = plan.canvas.mixed_matrices_cut;
+            (flag, plan.reasons(&caps, plan.size(u32::MAX)))
+        };
+        let mixes = |why: &[Unsupported]| {
+            why.iter()
+                .any(|w| matches!(w, Unsupported::GradeWith(_, m) if m.contains("mixes colour matrices")))
+        };
+        // BT.601 (untagged) beside BT.709, either way round: every frame of the graded clip, in an export.
+        for (a, b) in [(&untagged, &phone), (&phone, &untagged), (&pal, &phone)] {
+            let (flag, why) = cut(a, b, bt, false);
+            assert!(flag && mixes(&why), "{why:?}");
+            // FFmpeg 6 takes each layer as it is.
+            let (flag, why) = cut(a, b, plain, false);
+            assert!(flag && !mixes(&why), "{why:?}");
+            // A still's graph is the layers on screen: the one clip.
+            let (flag, why) = cut(a, b, bt, true);
+            assert!(!flag && !mixes(&why), "{why:?}");
+        }
+        // One matrix is not a mix: untagged beside a BT.601 tag, the same clip twice, an untagged HD clip (which the
+        // graph labels BT.709) beside a BT.709 one, and an RGB picture (its own business) beside anything.
+        for (a, b) in [
+            (&untagged, &pal),
+            (&untagged, &untagged),
+            (&phone, &phone),
+            (&hd, &phone),
+            (&untagged, &png),
+        ] {
+            let (flag, why) = cut(a, b, bt, false);
+            assert!(
+                !flag && !mixes(&why),
+                "{:?} {why:?}",
+                (&a.streams[0].color_space, &b.streams[0].color_space)
+            );
+        }
+    }
+
     /// A `yuv420p` flagged `pc` is FFmpeg 9's flagged-export cut like a `yuvj` clip, and FFmpeg 6's raw
     /// fade (nothing converts its range ahead of the fade) in the frames the fade runs in, a plain frame of
     /// it being exact there.
@@ -1565,6 +1673,7 @@ mod tests {
             reframe: true,
             hdr: true,
             effects: EffectKinds::ALL,
+            grade: crate::plan_caps::GradeKinds::NONE,
         };
         let holding = |edit: &dyn Fn(&mut Clip)| {
             let mut clip = make_clip(a.id, 0.0, 4.0, 0.0);
@@ -1780,6 +1889,7 @@ mod tests {
             reframe: true,
             hdr: true,
             effects: EffectKinds::ALL,
+            grade: crate::plan_caps::GradeKinds::NONE,
         };
         // (The overlay names the shipped default font, which a text pass can draw.)
         assert_eq!(plan.reasons(&all, size), vec![]);
@@ -2113,6 +2223,7 @@ mod tests {
             reframe: true,
             hdr: true,
             effects: EffectKinds::ALL,
+            grade: crate::plan_caps::GradeKinds::NONE,
         };
         let keyed_clip = |a: &Asset| {
             let mut clip = make_clip(a.id, 0.0, 4.0, 1.0);

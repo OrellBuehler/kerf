@@ -887,6 +887,9 @@ so the feature is **only** activated through these forwards — which is what ma
   range, all three in order) and an HD BT.709 clip's export to the model in its own RGB, delivered with the ungraded
   clip's tags. That clip's still is not held to the model: its RGB is the composite's matrix
   (`composite_color_policy`), not the clip's.
+  **The GPU draws this chain** (`gpu.md`, "The clip's grade"): the order of the three filters, the `frame_matrix` rule (`model::frame_matrix_tag`, which the plan's
+  `grade_tag` reads) and the closing `scale=out_color_matrix` are what its route (`GradeRoute`) and `kerf-gpu/tests/grade.rs` are held to; `kerf_core::grade_filter_chain(grade,
+  matrix)` hands the tests the very text `video_clip_chain` writes. Change one of them and the parity cases (both FFmpegs) move with it.
   **A keyed colour is an `eq` with `eval=frame`** (`eq_filter_keyed`):
   each keyed number a quoted expression of the frame's time `t` — `t` is the frame timestamp, which
   `setpts` has put on the timeline, so clip-local time is `(t-start)` as everywhere else — the unkeyed

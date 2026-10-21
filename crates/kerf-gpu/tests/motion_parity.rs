@@ -54,7 +54,12 @@ fn gpu() -> Arc<Gpu> {
 
 fn compositor() -> &'static Compositor {
     static C: OnceLock<Compositor> = OnceLock::new();
-    C.get_or_init(|| Compositor::new(gpu()).expect("a compositor"))
+    C.get_or_init(|| {
+        // The grade is in the caps once this FFmpeg's conversions are known to be the model's (the app's `prepare` asks
+        // ahead of a frame): the harness measures them once, up front, and its grade cases hold the answer to `Match`.
+        let _ = kerf_gpu::grade::kernels();
+        Compositor::new(gpu()).expect("a compositor")
+    })
 }
 
 fn frame_source() -> Arc<FrameSource> {
@@ -2605,6 +2610,10 @@ struct Variants {
     jpeg: Asset,
     bars709: Asset,
     testsrc709: Asset,
+    /// The test pattern tagged as an NTSC (`smpte170m`) and a PAL (`bt470bg`) file is: BT.601's coefficients under a tag.
+    testsrc170m: Asset,
+    testsrc470bg: Asset,
+    bars470bg: Asset,
 }
 
 /// The file's range tag as ffprobe reads it (`pc`, `tv`, or empty when untagged).
@@ -2634,6 +2643,8 @@ fn variants() -> &'static Variants {
         };
         let ts = "testsrc2=size=640x360:rate=30:duration=4";
         let bt709 = "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709";
+        let smpte170m = "setparams=colorspace=smpte170m:color_primaries=smpte170m:color_trc=smpte170m";
+        let bt470bg = "setparams=colorspace=bt470bg:color_primaries=bt470bg:color_trc=bt470bg";
         let x264 = ["-c:v", "libx264", "-preset", "ultrafast", "-qp", "0", "-g", "10"];
         let still = ["-frames:v", "1"];
         Variants {
@@ -2677,6 +2688,14 @@ fn variants() -> &'static Variants {
                 &x264,
             ),
             testsrc709: make("testsrc709.mp4", &format!("{ts},{bt709}"), "yuv420p", &x264),
+            testsrc170m: make("testsrc170m.mp4", &format!("{ts},{smpte170m}"), "yuv420p", &x264),
+            testsrc470bg: make("testsrc470bg.mp4", &format!("{ts},{bt470bg}"), "yuv420p", &x264),
+            bars470bg: make(
+                "bars470bg.mp4",
+                &format!("smptehdbars=size=640x360:rate=30:duration=4,{bt470bg}"),
+                "yuv420p",
+                &x264,
+            ),
         }
     })
 }
@@ -4348,4 +4367,659 @@ fn a_yuv420p_flagged_full_range_is_drawn_or_refused_as_the_export_reads_its_raw_
         let tl = one(a, &|c| c.color.gamma = 1.4);
         run(&format!("range/{label}-graded"), &tl, one_a, 30.0, 1.0, EXACT);
     }
+}
+
+// ---- the grade: LUT, curves and wheels ----------------------------------------------------------------
+
+/// A `.cube` of `size`^3 rows, written to the target directory; `f` maps a lattice point in `0..=1` to its row.
+fn grade_cube(name: &str, size: usize, f: impl Fn([f32; 3]) -> [f32; 3]) -> String {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("motion-grade-luts");
+    std::fs::create_dir_all(&dir).unwrap();
+    let n = (size - 1) as f32;
+    let mut data = Vec::with_capacity(size * size * size);
+    for b in 0..size {
+        for g in 0..size {
+            for r in 0..size {
+                data.push(f([r as f32 / n, g as f32 / n, b as f32 / n]));
+            }
+        }
+    }
+    let table = kerf_core::color_lut::Lut3d {
+        title: String::new(),
+        size,
+        data,
+    };
+    let path = dir.join(format!("{name}.cube"));
+    std::fs::write(&path, table.to_cube(1.0)).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+fn curve(p: &[(f64, f64)]) -> Vec<kerf_core::CurvePoint> {
+    p.iter().map(|&(x, y)| kerf_core::CurvePoint { x, y }).collect()
+}
+
+fn puck(x: f64, y: f64, lightness: f64) -> kerf_core::Wheel {
+    kerf_core::Wheel { x, y, lightness }
+}
+
+/// The grades of this section, by name: each part alone and the three together.
+fn grades() -> Vec<(&'static str, kerf_core::Grade)> {
+    use kerf_core::{ClipLut, Curves, Grade, Wheels};
+    let look = |c: [f32; 3]| {
+        [
+            0.92 * c[0] + 0.08 * c[1] * c[2] + 0.03,
+            0.05 * c[0] * c[0] + 0.9 * c[1] + 0.04 * c[2],
+            (0.1 + 0.8 * c[2] + 0.15 * c[0] * c[1]).min(1.0),
+        ]
+    };
+    let look17 = grade_cube("look17", 17, look);
+    let look33 = grade_cube("look33", 33, look);
+    let twist = grade_cube("twist2", 2, |c| [1.0 - c[0], c[1], c[2] * 0.5]);
+    let wheels = Wheels {
+        shadows: puck(0.4, -0.2, 0.1),
+        midtones: puck(-0.3, 0.5, -0.05),
+        highlights: puck(0.1, 0.7, 0.2),
+    };
+    let curves = Curves {
+        master: curve(&[(0.0, 0.03), (0.25, 0.15), (0.75, 0.85), (1.0, 0.98)]),
+        red: curve(&[(0.0, 0.0), (0.5, 0.58), (1.0, 1.0)]),
+        green: Vec::new(),
+        blue: curve(&[(0.0, 0.1), (1.0, 0.8)]),
+    };
+    vec![
+        (
+            "wheels midtone lift",
+            Grade {
+                wheels: Some(Wheels {
+                    midtones: puck(0.0, 0.0, 0.1),
+                    ..Wheels::default()
+                }),
+                ..Grade::default()
+            },
+        ),
+        (
+            "wheels all three",
+            Grade {
+                wheels: Some(wheels),
+                ..Grade::default()
+            },
+        ),
+        (
+            "curves master S",
+            Grade {
+                curves: Some(Curves {
+                    master: curve(&[(0.0, 0.0), (0.25, 0.15), (0.75, 0.85), (1.0, 1.0)]),
+                    ..Curves::default()
+                }),
+                ..Grade::default()
+            },
+        ),
+        (
+            "curves red invert",
+            Grade {
+                curves: Some(Curves {
+                    red: curve(&[(0.0, 1.0), (1.0, 0.0)]),
+                    ..Curves::default()
+                }),
+                ..Grade::default()
+            },
+        ),
+        (
+            "curves three channels and a master",
+            Grade {
+                curves: Some(curves.clone()),
+                ..Grade::default()
+            },
+        ),
+        (
+            "lut look 17",
+            Grade {
+                lut: Some(ClipLut {
+                    path: look17.clone(),
+                    intensity: 1.0,
+                }),
+                ..Grade::default()
+            },
+        ),
+        (
+            "lut look 33 at 40%",
+            Grade {
+                lut: Some(ClipLut {
+                    path: look33,
+                    intensity: 0.4,
+                }),
+                ..Grade::default()
+            },
+        ),
+        (
+            "lut two points",
+            Grade {
+                lut: Some(ClipLut {
+                    path: twist,
+                    intensity: 1.0,
+                }),
+                ..Grade::default()
+            },
+        ),
+        (
+            "lut, curves and wheels",
+            Grade {
+                lut: Some(ClipLut {
+                    path: look17,
+                    intensity: 0.75,
+                }),
+                curves: Some(curves),
+                wheels: Some(wheels),
+            },
+        ),
+    ]
+}
+
+/// A clip of `asset` alone, graded.
+fn graded_alone(asset: &Asset, grade: &kerf_core::Grade, edit: &dyn Fn(&mut Clip)) -> (Timeline, Vec<Asset>) {
+    let mut c = clip(asset, 0.5, 1.5, 0.0);
+    c.grade = grade.clone();
+    edit(&mut c);
+    (timeline(vec![vec![c]], None), vec![asset.clone()])
+}
+
+/// A graded layer drawn at its own size is the export's, plane for plane: the picture goes `yuv420p -> rgb24`
+/// (swscale's x86 kernel), through the LUT, the curves and the wheels, and back (the x86 vertical scaler's
+/// chroma, the C kernel on the last row), and every sample of every plane is FFmpeg's, on 6.1.1 and on 9.0.2.
+/// (`tests/grade.rs` holds the arithmetic to FFmpeg on noise of many sizes; this is the plan, the frames and
+/// the compositor on top of it.)
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_grade_at_the_pictures_size_is_the_export_to_the_level() {
+    let m = media();
+    for (name, grade) in grades() {
+        for (source, asset) in [
+            ("noise", &m.noise),
+            ("testsrc", &m.testsrc),
+            ("bars", &m.bars),
+            ("ramp", &m.ramp),
+        ] {
+            let (tl, assets) = graded_alone(asset, &grade, &|_| {});
+            run(&format!("grade/{name}, {source}"), &tl, &assets, 30.0, 0.4, EXACT);
+        }
+    }
+}
+
+/// A picture that names its matrix goes out of the grade through 4:4:4 (an explicit `scale`) and into 4:2:0 by a
+/// 2:1 scale of the chroma: exact, with BT.709 coefficients; and so is an untagged HD clip the graph labels.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_grade_on_a_tagged_picture_goes_through_444() {
+    let v = variants();
+    for (name, grade) in grades() {
+        for (source, asset) in [("testsrc709", &v.testsrc709), ("bars709", &v.bars709)] {
+            let (tl, assets) = graded_alone(asset, &grade, &|_| {});
+            let planner = Planner::new(&tl, &assets, &at_fps(30.0), PlanRequest::motion(policy())).unwrap();
+            let route = planner.at_frame(3).unwrap().layers[0].grade_route().unwrap();
+            assert!(route.via_444 && route.matrix == kerf_core::YuvMatrix::Bt709);
+            run(&format!("grade/{name}, {source}"), &tl, &assets, 30.0, 0.4, EXACT);
+        }
+    }
+    // Untagged HD beside a clip that names a matrix is labelled BT.709 by the graph, and graded as the file tagged so.
+    let h = hd_pair();
+    let assets = [h.untagged.clone(), h.phone.clone()];
+    let (_, grade) = grades().remove(8);
+    let mut graded = clip(&h.untagged, 0.0, 1.0, 1.0);
+    graded.grade = grade;
+    let tl = timeline(
+        vec![vec![clip(&h.phone, 0.0, 1.0, 0.0), graded]],
+        Some(Delivery::new(1280, 720, Fit::Contain)),
+    );
+    let plan = Planner::new(&tl, &assets, &at_fps(30.0), PlanRequest::motion(policy()))
+        .unwrap()
+        .at_frame(40)
+        .unwrap();
+    assert!(
+        plan.layers[0].stream.label_bt709,
+        "the graph holds a BT.709 clip: the HD clip is labelled"
+    );
+    run("grade/labelled hd", &tl, &assets, 30.0, 2.0, EXACT);
+}
+
+/// What follows the grade in the chain is as it was: a colour correction ahead of it (the `eq`, static and keyed),
+/// the alpha plane (an opacity, a mask, a rotation, a dissolve, a chroma key), a position, a layer under it, a
+/// speed. The grade's output is exact, so the layers on top of it are held to what they are held to without a grade.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn what_follows_a_grade_is_drawn_as_it_is_without_one() {
+    use kerf_core::{Property, PropertyKey};
+    let m = media();
+    let all = grades();
+    let wheels_and_lut = &all[8].1;
+    let curves = &all[2].1;
+    let on = |asset: &Asset, grade: &kerf_core::Grade, edit: &dyn Fn(&mut Clip)| graded_alone(asset, grade, edit);
+
+    // Ahead of the grade.
+    let (tl, a) = on(&m.testsrc, wheels_and_lut, &|c| {
+        c.color.contrast = 1.2;
+        c.color.saturation = 1.3;
+        c.color.gamma = 1.1;
+    });
+    run("grade/after an eq", &tl, &a, 30.0, 0.4, EXACT);
+    let (tl, a) = on(&m.testsrc, curves, &|c| {
+        c.set_property_keys(
+            Property::Brightness,
+            vec![PropertyKey::new(0.0, -0.1), PropertyKey::new(0.5, 0.1)],
+        );
+    });
+    run("grade/after a keyed eq", &tl, &a, 30.0, 0.4, EXACT);
+    let (tl, a) = on(&m.testsrc, wheels_and_lut, &|c| {
+        c.speed = 2.0;
+        c.source_out = 2.5;
+    });
+    run("grade/at speed 2", &tl, &a, 30.0, 0.4, EXACT);
+    // (A crop that the canvas is cut to, so that nothing is resized.)
+    let (mut tl, a) = on(&m.testsrc, wheels_and_lut, &|c| {
+        c.transform.crop_left = 0.125;
+        c.transform.crop_top = 0.25;
+    });
+    tl.format = Some(Delivery::new(560, 270, Fit::Contain));
+    run("grade/a cropped picture", &tl, &a, 30.0, 0.4, EXACT);
+
+    // The alpha plane: `format=yuva420p` follows the grade.
+    let (tl, a) = on(&m.testsrc, wheels_and_lut, &|c| c.transform.opacity = 0.6);
+    run("grade/translucent", &tl, &a, 30.0, 0.4, TRANSLUCENT);
+    let (tl, a) = on(&m.noise, curves, &|c| {
+        c.mask = Some(mask_of(kerf_core::MaskShape::Ellipse, 0.2, false));
+    });
+    run("grade/under a soft ellipse mask", &tl, &a, 30.0, 0.4, EXACT);
+    let (tl, a) = on(&m.bars, wheels_and_lut, &|c| c.effects = vec![key("green", 0.3, 0.3)]);
+    run("grade/under a chroma key", &tl, &a, 30.0, 0.4, EXACT);
+
+    // On a layer: placed by the overlay (no resize), over another track, and dissolving in and out (its alpha ramp).
+    let mut upper = clip(&m.noise, 0.5, 1.5, 0.0);
+    upper.grade = wheels_and_lut.clone();
+    upper.transform.crop_left = 0.25;
+    upper.transform.crop_right = 0.25;
+    upper.transform.pos_x = 0.2;
+    let under = clip(&m.bars, 0.5, 1.5, 0.0);
+    let tl = timeline(vec![vec![under], vec![upper]], None);
+    run(
+        "grade/cropped and moved over another track",
+        &tl,
+        &[m.bars.clone(), m.noise.clone()],
+        30.0,
+        0.4,
+        EXACT,
+    );
+
+    let (out, mut inc) = (clip(&m.bars, 0.5, 1.5, 0.0), clip(&m.testsrc, 0.5, 1.5, 1.0));
+    inc.grade = all[4].1.clone();
+    inc.transition_in = Some(Transition {
+        kind: TransitionKind::Crossfade,
+        duration: 0.6,
+    });
+    let tl = timeline(vec![vec![out, inc]], None);
+    run(
+        "grade/dissolving in",
+        &tl,
+        &[m.bars.clone(), m.testsrc.clone()],
+        30.0,
+        2.0,
+        EXACT,
+    );
+    let mut leaving = clip(&m.testsrc, 0.5, 1.5, 0.0);
+    leaving.grade = all[4].1.clone();
+    let mut next = clip(&m.bars, 0.5, 1.5, 1.0);
+    next.transition_in = Some(Transition {
+        kind: TransitionKind::Crossfade,
+        duration: 0.6,
+    });
+    let tl = timeline(vec![vec![leaving, next]], None);
+    run(
+        "grade/dissolving out",
+        &tl,
+        &[m.bars.clone(), m.testsrc.clone()],
+        30.0,
+        2.0,
+        EXACT,
+    );
+
+    let (tl, a) = on(&m.smooth, wheels_and_lut, &|c| c.transform.rotation = 20.0);
+    run_rotated("grade/rotated", &tl, &a, 30.0, 0.4, ROTATED);
+
+    // A fade that is not running leaves the picture where it is: the frames after a fade-in are drawn.
+    let (tl, a) = on(&m.testsrc, wheels_and_lut, &|c| c.fade_in = 0.2);
+    run_refusing(
+        "grade/after its fade-in",
+        &tl,
+        &a,
+        30.0,
+        0.8,
+        EXACT,
+        &refusing("GradeWith", |u| matches!(u, Unsupported::GradeWith(..))),
+    );
+}
+
+/// What is refused for a graded layer, each held: the frames the plan refuses are FFmpeg's (its export
+/// renders them), the others are compared with it.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn what_the_compositor_does_not_draw_of_a_grade_is_refused() {
+    use kerf_core::VideoEffect as E;
+    let m = media();
+    let v = variants();
+    let all = grades();
+    let grade = &all[8].1;
+    let at = at_fps(30.0);
+    let frames = 0..12;
+    let one = |asset: &Asset, edit: &dyn Fn(&mut Clip)| graded_alone(asset, grade, edit);
+
+    // A layer the scaler resizes: the picture-in-picture, an enlargement, a source that is not the canvas's size.
+    let (tl, a) = one(&m.testsrc, &|c| c.transform.scale = 0.6);
+    refused("grade/pip", &tl, &a, &at, frames.clone(), "resizes");
+    let tl = timeline(
+        vec![vec![{
+            let mut c = clip(&m.testsrc, 0.5, 1.5, 0.0);
+            c.grade = grade.clone();
+            c
+        }]],
+        Some(Delivery::new(960, 540, Fit::Contain)),
+    );
+    refused(
+        "grade/enlarged",
+        &tl,
+        std::slice::from_ref(&m.testsrc),
+        &at,
+        frames.clone(),
+        "resizes",
+    );
+    // A letterbox: the bars are part of the frame the grade sees.
+    let tl = timeline(
+        vec![vec![{
+            let mut c = clip(&m.testsrc, 0.5, 1.5, 0.0);
+            c.grade = grade.clone();
+            c
+        }]],
+        Some(Delivery::new(1280, 360, Fit::Contain)),
+    );
+    refused(
+        "grade/letterboxed",
+        &tl,
+        std::slice::from_ref(&m.testsrc),
+        &at,
+        frames.clone(),
+        "letterboxed",
+    );
+    // Every other picture than 8-bit limited-range 4:2:0.
+    for (name, asset) in [
+        ("10-bit", &v.tenbit),
+        ("4:4:4", &v.yuv444),
+        ("4:2:2", &v.yuv422),
+        ("gray", &v.gray),
+        ("rgb", &v.rgb_png),
+    ] {
+        let (tl, a) = graded_alone(asset, grade, &|c| {
+            if asset.streams[0].image {
+                c.source_in = 0.0;
+                c.source_out = 1.0;
+            }
+        });
+        refused(&format!("grade/{name}"), &tl, &a, &at, frames.clone(), "8-bit 4:2:0");
+    }
+    let (tl, a) = one(&v.mjpeg, &|_| {});
+    refused("grade/full range", &tl, &a, &at, frames.clone(), "colour correction");
+    // What would see the RGB (or 4:4:4) picture the grade leaves.
+    for (name, effect) in [
+        ("blur", E::Blur { sigma: 2.0 }),
+        ("sharpen", E::Sharpen { amount: 0.5 }),
+        ("grayscale", E::Grayscale),
+        ("invert", E::Invert),
+        ("vignette", E::Vignette),
+    ] {
+        let (tl, a) = one(&m.testsrc, &|c| c.effects = vec![effect.clone()]);
+        refused(
+            &format!("grade/{name} behind it"),
+            &tl,
+            &a,
+            &at,
+            frames.clone(),
+            "video effects",
+        );
+    }
+    // A fade to black or white that is running (the frames after it are drawn: see above), a dip to white anywhere.
+    let (tl, a) = one(&m.testsrc, &|c| c.fade_out = 0.3);
+    refused("grade/fading out", &tl, &a, &at, 24..30, "fade to black or white");
+    let mut inc = clip(&m.testsrc, 0.5, 1.5, 1.0);
+    inc.grade = grade.clone();
+    inc.transition_in = Some(Transition {
+        kind: TransitionKind::DipToWhite,
+        duration: 0.6,
+    });
+    let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0), inc]], None);
+    refused(
+        "grade/dipping through white",
+        &tl,
+        &[m.bars.clone(), m.testsrc.clone()],
+        &at,
+        0..60,
+        "fade to black or white",
+    );
+    // A moving zoom behind the grade.
+    let (tl, a) = one(&m.testsrc, &|c| {
+        c.keyframes = vec![zoom_key(0.0, 1.0, 0.0, 0.0), zoom_key(1.0, 1.4, 0.0, 0.0)];
+    });
+    refused("grade/moving zoom", &tl, &a, &at, frames.clone(), "a grade");
+    // A matrix with no measured round trip.
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("motion-media-grade");
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("bt2020.mp4");
+    ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc2=size=640x360:rate=30:duration=2,setparams=colorspace=bt2020nc",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-qp",
+        "0",
+        "-pix_fmt",
+        "yuv420p",
+        p.to_str().unwrap(),
+    ]);
+    let bt2020 = probed(&p);
+    let (tl, a) = one(&bt2020, &|_| {});
+    refused("grade/bt2020", &tl, &a, &at, frames, "colour matrix");
+
+    // A machine whose FFmpeg does not convert as the model does (another CPU's kernels), or whose probe could not tell, has no
+    // grade in its caps: the plan refuses the layer up front (nothing is decoded for it), and the frame is FFmpeg's.
+    let (tl, a) = one(&m.testsrc, &|_| {});
+    let planner = Planner::new(&tl, &a, &at, PlanRequest::motion(policy())).expect("planner");
+    let plan = planner.at_frame(3).expect("plan");
+    let size = plan.size(u32::MAX);
+    assert!(plan.reasons(&compositor().caps(), size).is_empty());
+    let picture = kerf_gpu::decode_layers(&plan.layers).expect("decode");
+    for kernels in [kerf_gpu::grade::Kernels::Differs("a test"), kerf_gpu::grade::Kernels::Unknown] {
+        let unmatched = Compositor::new(gpu()).expect("a compositor").with_grade_kernels(kernels);
+        assert_eq!(unmatched.caps().grade, kerf_core::GradeKinds::NONE, "{kernels:?}");
+        let why = plan.reasons(&unmatched.caps(), size);
+        assert!(
+            why.iter().any(|u| matches!(u, Unsupported::Grade(..))),
+            "{kernels:?}: the plan should refuse the grade: {why:?}"
+        );
+        let err = unmatched
+            .composite_yuv(&plan, &picture, size)
+            .expect_err("the render should refuse");
+        assert!(matches!(&err, kerf_gpu::GpuError::Unsupported(_)), "{kernels:?}: {err}");
+    }
+    let measured = Compositor::new(gpu())
+        .expect("a compositor")
+        .with_grade_kernels(kerf_gpu::grade::Kernels::Match);
+    assert_eq!(measured.caps().grade, kerf_core::GradeKinds::ALL);
+    measured.composite_yuv(&plan, &picture, size).expect("pinned to match: drawn");
+    eprintln!("grade/kernels                                a machine whose conversions differ is refused by the plan");
+}
+
+/// What follows the grade in the chain that is the layer's own: a keyed opacity (a `geq` on the alpha plane, the value the
+/// plan evaluates) and a keyed position (the overlay's, per frame), on a layer over another track, are held to what they
+/// are held to without a grade (a dissolve's alpha ramp is in `what_follows_a_grade_is_drawn_as_it_is_without_one`). A clip's own
+/// `fade_in` / `fade_out` is not an alpha ramp: it is
+/// `fade` to black of the picture, whatever the track, which runs on the RGB picture the grade leaves, so the frames it
+/// runs on are FFmpeg's (and the others are compared).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_graded_layer_is_keyed_in_opacity_and_position_over_another_and_its_fades_are_refused() {
+    use kerf_core::{Property, PropertyKey};
+    let m = media();
+    let all = grades();
+    let heavy = all[8].1.clone();
+    let wheels = all[1].1.clone();
+    let assets = [m.bars.clone(), m.testsrc.clone()];
+    let over = |c: Clip| timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None);
+    let graded = |grade: &kerf_core::Grade| {
+        let mut c = clip(&m.testsrc, 0.5, 1.5, 0.0);
+        c.grade = grade.clone();
+        c
+    };
+    let key = |time: f64, value: f64| PropertyKey::new(time, value);
+
+    // A keyed opacity.
+    for (name, grade) in [("all three", &heavy), ("wheels", &wheels)] {
+        let mut c = graded(grade);
+        c.set_property_keys(Property::Opacity, vec![key(0.0, 1.0), key(1.0, 0.2)]);
+        run(&format!("grade/keyed opacity, {name}"), &over(c), &assets, 30.0, 1.0, EXACT);
+    }
+    let mut c = graded(&heavy);
+    c.set_property_keys(Property::Opacity, vec![key(0.1, 0.0), key(0.9, 1.0)]);
+    run("grade/keyed opacity from nothing", &over(c), &assets, 30.0, 1.0, EXACT);
+    // A keyed position: the picture stays its own size and the overlay moves it, off the canvas' edge too.
+    let mut c = graded(&heavy);
+    c.set_property_keys(Property::PosX, vec![key(0.0, -0.1), key(1.0, 0.1)]);
+    run("grade/keyed position", &over(c), &assets, 30.0, 1.0, EXACT);
+    let mut c = graded(&heavy);
+    c.set_property_keys(Property::PosX, vec![key(0.0, 0.0), key(1.0, 0.3)]);
+    c.set_property_keys(Property::PosY, vec![key(0.0, 0.0), key(1.0, -0.2)]);
+    run("grade/keyed position, both axes", &over(c), &assets, 30.0, 1.0, EXACT);
+    // Both at once.
+    let mut c = graded(&heavy);
+    c.set_property_keys(Property::Opacity, vec![key(0.0, 0.3), key(1.0, 0.9)]);
+    c.set_property_keys(Property::PosX, vec![key(0.0, -0.1), key(1.0, 0.1)]);
+    run("grade/keyed opacity and position", &over(c), &assets, 30.0, 1.0, EXACT);
+
+    // Its own fade-in and fade-out, on a layer over another track: refused where they run, drawn after and before.
+    let mut c = graded(&heavy);
+    c.fade_in = 0.3;
+    c.fade_out = 0.3;
+    run_refusing(
+        "grade/fades over another track",
+        &over(c),
+        &assets,
+        30.0,
+        1.0,
+        EXACT,
+        &refusing("GradeWith", |u| matches!(u, Unsupported::GradeWith(..))),
+    );
+}
+
+/// A picture that names BT.601's coefficients (`smpte170m`, `bt470bg`) is carried through the grade like BT.709's: out of
+/// YCbCr with the tag's matrix, graded, back through an explicit `scale=out_color_matrix=bt470` to 4:4:4 and into 4:2:0 by the
+/// next filter's conversion, tag set again. The route is BT.601's constants and the tagged way out (`GradeRoute`): exact.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_grade_on_a_picture_tagged_smpte170m_or_bt470bg_is_the_601_matrix_the_tagged_way() {
+    let v = variants();
+    for (name, grade) in grades() {
+        for (source, asset) in [("testsrc170m", &v.testsrc170m), ("testsrc470bg", &v.testsrc470bg)] {
+            let (tl, assets) = graded_alone(asset, &grade, &|_| {});
+            let planner = Planner::new(&tl, &assets, &at_fps(30.0), PlanRequest::motion(policy())).unwrap();
+            let route = planner.at_frame(3).unwrap().layers[0].grade_route().unwrap();
+            assert!(
+                route.via_444 && route.matrix == kerf_core::YuvMatrix::Bt601,
+                "{source}: {route:?}"
+            );
+            run(&format!("grade/{name}, {source}"), &tl, &assets, 30.0, 0.4, EXACT);
+        }
+    }
+    let (_, heavy) = grades().remove(8);
+    let (tl, assets) = graded_alone(&v.bars470bg, &heavy, &|_| {});
+    run("grade/lut, curves and wheels, bars470bg", &tl, &assets, 30.0, 0.4, EXACT);
+}
+
+/// A graded clip beside a clip of another colour matrix in the same cut (an untagged standard-definition one, which FFmpeg
+/// reads as BT.601, beside a BT.709 one). FFmpeg 9 negotiates the matrix across the whole graph: it converts the grade's
+/// way back into the bottom layer's matrix on every frame of the clip, whether or not the two are on screen together
+/// (22 to 24 levels off the model on the untagged clip's frames, which the per-frame stack check did not see), so under
+/// `BottomLayerTag` the plan refuses the clip in a cut that mixes matrices (`mixed_matrices_cut`), and FFmpeg draws it.
+/// Under `FixedBt601` (6.1) every layer is taken as it is and the cut is drawn to the level, in either order.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_graded_clip_beside_a_clip_of_another_matrix_is_refused_where_ffmpeg_converts_it_across_the_graph() {
+    let m = media();
+    let v = variants();
+    let all = grades();
+    let negotiates = policy() == CompositeColorPolicy::BottomLayerTag;
+    let mixed = refusing(
+        "GradeWith(mixes colour matrices)",
+        |u| matches!(u, Unsupported::GradeWith(_, why) if why.contains("mixes colour matrices")),
+    );
+    let case = |name: &str, tl: &Timeline, assets: &[Asset], secs: f64| {
+        if negotiates {
+            run_refusing(name, tl, assets, 30.0, secs, EXACT, &mixed);
+        } else {
+            run(name, tl, assets, 30.0, secs, EXACT);
+        }
+    };
+    for (name, grade) in [&all[1], &all[8]] {
+        let graded = |start: f64| {
+            let mut c = clip(&m.testsrc, 0.5, 1.5, start);
+            c.grade = grade.clone();
+            c
+        };
+        let assets = [v.bars709.clone(), m.testsrc.clone()];
+        // After the BT.709 clip (the bottom layer's matrix is BT.709; the frames of the BT.709 clip are drawn).
+        let tl = timeline(vec![vec![clip(&v.bars709, 0.5, 1.5, 0.0), graded(1.0)]], None);
+        case(&format!("grade/untagged SD after a BT.709 clip, {name}"), &tl, &assets, 2.0);
+        // Stacked: the graded one over the BT.709 one, and under it.
+        let tl = timeline(vec![vec![clip(&v.bars709, 0.5, 1.5, 0.0)], vec![graded(0.0)]], None);
+        case(&format!("grade/untagged SD over a BT.709 clip, {name}"), &tl, &assets, 1.0);
+        let tl = timeline(vec![vec![graded(0.0)], vec![clip(&v.testsrc709, 0.5, 1.5, 0.0)]], None);
+        let stacked = [m.testsrc.clone(), v.testsrc709.clone()];
+        case(&format!("grade/untagged SD under a BT.709 clip, {name}"), &tl, &stacked, 1.0);
+        // The other way round (the graded clip is the bottom layer, and the BT.709 clip is converted into BT.601, which
+        // is the ungraded clip's own matter, unmeasured: `core-render-plan.md`'s A7 concern): drawn under 6.1 only.
+        if !negotiates {
+            let tl = timeline(vec![vec![graded(0.0), clip(&v.bars709, 0.5, 1.5, 1.0)]], None);
+            case(&format!("grade/untagged SD before a BT.709 clip, {name}"), &tl, &assets, 2.0);
+        }
+    }
+}
+
+/// What is one matrix is not a mix: a graded clip beside clips of its own matrix is drawn to the level on both FFmpegs, in
+/// either order (untagged beside untagged and beside a BT.601 tag, a BT.709 clip beside another, a BT.709-tagged one
+/// beside an untagged high-definition clip, which the graph labels BT.709).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_graded_clip_beside_a_clip_of_its_own_matrix_is_drawn_in_either_order() {
+    let m = media();
+    let v = variants();
+    let (_, grade) = grades().remove(8);
+    let pairs: [(&str, &Asset, &Asset); 3] = [
+        ("untagged and untagged", &m.testsrc, &m.bars),
+        ("untagged and smpte170m", &m.testsrc, &v.testsrc170m),
+        ("bt709 and bt709", &v.testsrc709, &v.bars709),
+    ];
+    for (name, graded, other) in pairs {
+        let assets = [graded.clone(), other.clone()];
+        let mut g = clip(graded, 0.5, 1.5, 1.0);
+        g.grade = grade.clone();
+        let tl = timeline(vec![vec![clip(other, 0.5, 1.5, 0.0), g]], None);
+        run(&format!("grade/{name}, graded second"), &tl, &assets, 30.0, 2.0, EXACT);
+        let mut g = clip(graded, 0.5, 1.5, 0.0);
+        g.grade = grade.clone();
+        let tl = timeline(vec![vec![g, clip(other, 0.5, 1.5, 1.0)]], None);
+        run(&format!("grade/{name}, graded first"), &tl, &assets, 30.0, 2.0, EXACT);
+    }
+    // The tagged way out (smpte170m / bt470bg: BT.601's coefficients through 4:4:4) beside an untagged clip.
+    let mut g = clip(&v.testsrc170m, 0.5, 1.5, 1.0);
+    g.grade = grade;
+    let assets = [m.bars.clone(), v.testsrc170m.clone()];
+    let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0), g]], None);
+    run("grade/smpte170m after untagged", &tl, &assets, 30.0, 2.0, EXACT);
 }

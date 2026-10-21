@@ -239,15 +239,34 @@
   read at the output frame's time and shown is `keyed_zoom.rs`'s, above). **A7 concern**: a Motion
   plan decides the composite's matrix per frame from the layers on it
   (`composite_matrix`), while FFmpeg 9 negotiates colourspace across the whole graph, so
-  over a cut whose bottom layer changes the matrix the export converts with may not be the
-  one a frame's own layers suggest — to be measured before the GPU encodes an export.
+  over a cut whose bottom layer changes the matrix the export converts with is not the
+  one a frame's own layers suggest — **measured** (9.0.2, `gpu.md`): an untagged 640x360 clip after a BT.709 one is up to 31 levels of Y and 18 of UV off the compositor's plain copy on every frame of the clip,
+  and a BT.709 clip after an untagged one 22 and 12. `PlanCanvas::mixed_matrices_cut` is the cut-level fact; only a graded layer is refused by it so far (`GradeWith`), ungraded layers of such a cut
+  are still drawn per frame — to be fixed before the GPU encodes an export.
   **The mask's alpha is shared too**: `kerf_core::mask_alpha_plane(&Mask, w, h)` is `mask_filter`'s `geq` evaluated in `f64` and
   truncated as `geq` stores it (`engine::cli::rendered`, `a_mask_plane_is_the_geq_planes_sample_for_sample`: 21 million samples equal on both
   FFmpegs), at the size of the picture the `geq` sees — `LayerGeometry::picture`, or the fit-size `stages[0].keep` when a moving zoom
   comes last — so a compositor draws a mask with no FFmpeg and no per-frame cost.
-  **A grade is refused**: `PlanLayer.grade` is the clip's `Grade`, and curves, wheels or a LUT that changes the picture
-  are `Unsupported::Grade(layer, what)` (kind `grade`) whatever the caps — no compositor pass or parity case draws
-  `lutrgb` / `colorbalance` / `lut3d` or their RGB round trip yet.
+  **The clip's grade (`PlanLayer.grade`: LUT, curves, wheels) is drawn by what the caps say, and judged for the chain**:
+  `GpuCaps::grade` is a `GradeKinds` bitset (`WHEELS`, `CURVES`, `LUT`, `ALL`; `A0` has none), and a part the compositor
+  does not draw is `Unsupported::Grade(layer, what)` (kind `grade`) — which is also what a compositor whose FFmpeg's conversions are not (or not yet known to be) the ones it follows says:
+  `Compositor::caps()` is `CAPS` less `grade` until `kerf_gpu::grade::measured()` is `Match`, so the plan refuses a graded layer before anything is decoded. FFmpeg's grade is a round trip through RGB (`yuv420p` to
+  `rgb24` by swscale's x86 kernel, `lut3d`, `lutrgb`, `colorbalance`, and back by the scaler whose vertical filter has an x86
+  kernel of its own), so what a compositor reproduces is bounded by where that was measured, and the rest is
+  `Unsupported::GradeWith(layer, what)` (kind `grade_with`): a picture that is not 8-bit limited-range `yuv420p` (`grade_chain_refusal`),
+  a colour matrix with no measured round trip (BT.601, BT.709 and untagged are drawn: `PlanLayer::grade_route()` is the
+  matrix and whether the grade ends in `scale=out_color_matrix` to 4:4:4, which is when the stream names a matrix or the graph
+  labels it BT.709, `PlanStream::grade_tag()`), a video effect other than a chroma key after the grade (they run on the RGB or 4:4:4
+  picture FFmpeg negotiates), a fade to black or white running on it (a clip's own `fade_in` / `fade_out` is one on any track; a dissolve's alpha ramp is not), a dip to white,
+  **a cut that mixes colour matrices** under a negotiating policy (`PlanCanvas::mixed_matrices_cut`: a Motion plan's cut holds video inputs of more than one `PlanStream::matrix()`, the BT.709 label included; FFmpeg 9 converts the grade's way back into the bottom layer's matrix
+  on every frame of the clip, whether or not the two are on screen together), a layer the compositor's scaler resizes
+  (the scaler's one-level difference becomes 3 or 4 through the conversions, past the bound of 2), an odd side (swscale reads
+  past the line), and in `reasons` the geometry ones `Matte(layer, "a grade")` (a letterbox: the bars are part of the frame the
+  grade sees) and `ZoomBehind(.., "a grade")` (a moving zoom last: its `scale` converts the RGB in one pass). `RenderPlan::graded()`
+  includes a grade, so the full-range refusals (`GradedFullRange`, `GradedInFullRangeStack`) judge it too. `kerf_core::baked_lut`
+  gives a compositor the LUT's table with its intensity applied (`Lut3d::at_intensity`, the same numbers `to_cube` writes,
+  four cached by path / length / mtime), `grade_filter_chain` the filters the engine writes for it, and `frame_matrix_tag` the
+  matrix word `frame_matrix` reads. A grade has no keyable number, so a Motion plan needs nothing more of it.
   **Colour and partly-keyed transforms in the plan.** `PlanLayer.color` is `Clip::color_at(local)` in a still plan
   (a static grade's sample; the ZoomBehind check reads it) and, in a **Motion** plan with a keyed colour, **the numbers
   the export's `eq` evaluates to at that frame**: `engine::keyed_color_value(clip, T)`, each keyed number through
@@ -285,9 +304,9 @@
   placed as a static one, and the sweep holds origin, zoom, turn, opacity and grade of the new cuts to the
   evaluated graph.
   **What the compositor may draw is data**: `GpuCaps` (`Compositor::caps()`: the bits `motion`, `fades`,
-  `transitions`, `dip_white`, `keyed_opacity`, `keyed_zoom`, `keyed_color`, `mask`, `text`, `reframe`, `hdr` and an
+  `transitions`, `dip_white`, `keyed_opacity`, `keyed_zoom`, `keyed_color`, `mask`, `text`, `reframe`, `hdr`, a `GradeKinds` bitset and an
   `EffectKinds` bitset; today `GpuCaps::A0` plus every one of them but `reframe`, `hdr`
-  with every effect kind), and **`RenderPlan::reasons(&caps,
+  with every effect kind and every grade kind), and **`RenderPlan::reasons(&caps,
   size)` is a pure function of the plan's fields** returning `Unsupported` values whose
   `Display` is the message the plan has always given — nothing is decided while planning,
   so one plan answers for any caps and an A5 pass is a flip beside the pass and its parity

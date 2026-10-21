@@ -1,4 +1,4 @@
-//! The runtime parity self-test: three small frames drawn by the compositor and by this
+//! The runtime parity self-test: up to four small frames drawn by the compositor and by this
 //! machine's own FFmpeg, and compared the way the parity harness compares them.
 //!
 //! Parity is proven in CI on two FFmpeg builds and one software adapter. A user has a third
@@ -12,7 +12,14 @@
 //! * `pip`: a gradient with a shrunk, cropped, translucent, colour-graded picture-in-picture over
 //!   it (the scaler down, `eq`, the opacity RGB round trip, `overlay`);
 //! * `bt709`: a BT.709-tagged stack (the composite colour policy the plan was given, which is how
-//!   FFmpeg 6 and 9 disagree).
+//!   FFmpeg 6 and 9 disagree);
+//! * `grade`: a clip at the canvas' own size through a LUT, curves and colour wheels (the conversions
+//!   to RGB and back, `lut3d`, `lutrgb`, `colorbalance`: the arithmetic of `crate::grade`, which a build with
+//!   another `swscale` or another format negotiation draws differently). **Only where
+//!   [`crate::grade::kernels`] says this FFmpeg converts as the grade's model does** ([`Kernels::Match`]): the plan
+//!   refuses a graded layer otherwise ([`Compositor::caps`]), so there is no frame to draw, and the other three decide
+//!   the check as they would. A probe that could not tell holds the grade back until a self-test can
+//!   (`crate::grade::kernels_for_selftest`), so a grade is never drawn that this check did not look at.
 //!
 //! No rotation: its float sampling can differ by a level between GPUs for reasons that are not
 //! drift, and a false alarm turns the feature off for someone it works for. The limits are the
@@ -42,6 +49,7 @@ use kerf_core::{
 use crate::compositor::Compositor;
 use crate::frame_source::{FrameSource, FrameSourceConfig, Hint};
 use crate::gpu::{Gpu, GpuError};
+use crate::grade::{probe_cube, probe_grade, Kernels, PARTS_ALL};
 use crate::source::{run_child, RunError};
 
 /// Pixels this close to a strong reference gradient are the edge band (`tests/parity.rs`' `BAND`).
@@ -163,24 +171,41 @@ pub fn parity_self_test(gpu: &Arc<Gpu>) -> Result<SelfTestReport, SelfTestError>
             "this FFmpeg's composite colour policy could not be measured",
         ));
     }
-    run(gpu, policy, policy, Instant::now() + DEADLINE)
+    run(
+        gpu,
+        policy,
+        policy,
+        crate::grade::kernels_for_selftest(),
+        Instant::now() + DEADLINE,
+    )
 }
 
 /// [`parity_self_test`] with the policy the GPU's plans are made under given apart from the one
-/// FFmpeg really has (`ffmpeg_policy`, which only decides whether a BT.709 stack is checkable):
-/// the way to rehearse the drift this test is for.
+/// FFmpeg really has (`ffmpeg_policy`, which only decides whether a BT.709 stack is checkable), and the answer
+/// to "does this FFmpeg convert as the grade's model does" given (`kernels`; the compositor is pinned to it, and
+/// the grade's frame is drawn only for [`Kernels::Match`]): the ways to rehearse the drift this test is for.
 fn run(
     gpu: &Arc<Gpu>,
     ffmpeg_policy: CompositeColorPolicy,
     plan_policy: CompositeColorPolicy,
+    kernels: Kernels,
     deadline: Instant,
 ) -> Result<SelfTestReport, SelfTestError> {
     let started = Instant::now();
+    let with_grade = kernels == Kernels::Match;
+    if !with_grade {
+        tracing::info!(
+            ?kernels,
+            "the GPU self-test leaves out the grade's frame: the grade is drawn by FFmpeg on this machine"
+        );
+    }
     let scratch = Scratch::new().map_err(|e| SelfTestError::inconclusive(format!("no scratch directory: {e}")))?;
-    let media = Media::make(scratch.path(), deadline)?;
+    let media = Media::make(scratch.path(), with_grade, deadline)?;
     let cases = media.cases();
 
-    let compositor = Compositor::new(Arc::clone(gpu)).map_err(gpu_error)?;
+    let compositor = Compositor::new(Arc::clone(gpu))
+        .map_err(gpu_error)?
+        .with_grade_kernels(kernels);
     let source = FrameSource::new(FrameSourceConfig::default());
     let mut reports = Vec::with_capacity(cases.len());
     for case in &cases {
@@ -281,31 +306,43 @@ struct Case {
     assets: Vec<Asset>,
 }
 
-/// The three fixture clips, probed the way an import probes them.
+/// The fixture clips, probed the way an import probes them.
 struct Media {
     testsrc: Asset,
     gradient: Asset,
     testsrc709: Asset,
+    /// A test pattern at the canvas' size, so that the grade runs on a picture the scaler leaves alone, and the
+    /// `.cube` its LUT is looked up through: none where the grade is not checked.
+    graded: Option<(Asset, String)>,
 }
 
 impl Media {
-    fn make(dir: &Path, deadline: Instant) -> Result<Self, SelfTestError> {
+    fn make(dir: &Path, with_grade: bool, deadline: Instant) -> Result<Self, SelfTestError> {
         let testsrc = format!("testsrc2=size={}x{}:rate=30:duration={CLIP_SECS},{UNTAGGED}", CLIP.0, CLIP.1);
         let gradient = format!(
             "gradients=size={0}x{1}:rate=30:duration={CLIP_SECS}:c0=0xd03020:c1=0x2040e0:c2=0x30c060:nb_colors=3:seed=11:x0=0:y0=0:x1={0}:y1={1}:speed=0.00001,format=yuv420p,{UNTAGGED}",
             CLIP.0, CLIP.1
         );
         let testsrc709 = format!("testsrc2=size={}x{}:rate=30:duration={CLIP_SECS},{BT709}", CLIP.0, CLIP.1);
+        let graded = format!(
+            "testsrc2=size={}x{}:rate=30:duration={CLIP_SECS},{UNTAGGED}",
+            CANVAS.0, CANVAS.1
+        );
+        let cube = if with_grade { Some(write_cube(dir)?) } else { None };
         past(deadline, "making the check clips")?;
+        let mut clips = vec![
+            ("testsrc.mkv", &testsrc),
+            ("gradient.mkv", &gradient),
+            ("testsrc709.mkv", &testsrc709),
+        ];
+        if with_grade {
+            clips.push(("graded.mkv", &graded));
+        }
         let made: Vec<Result<Asset, SelfTestError>> = std::thread::scope(|scope| {
-            let handles: Vec<_> = [
-                ("testsrc.mkv", &testsrc),
-                ("gradient.mkv", &gradient),
-                ("testsrc709.mkv", &testsrc709),
-            ]
-            .into_iter()
-            .map(|(name, lavfi)| scope.spawn(move || make_clip(dir, name, lavfi)))
-            .collect();
+            let handles: Vec<_> = clips
+                .into_iter()
+                .map(|(name, lavfi)| scope.spawn(move || make_clip(dir, name, lavfi)))
+                .collect();
             handles
                 .into_iter()
                 .map(|h| {
@@ -315,11 +352,15 @@ impl Media {
                 .collect()
         });
         let mut made = made.into_iter();
-        let mut next = || made.next().expect("three clips");
+        let mut next = || made.next().expect("a clip for every name");
         Ok(Self {
             testsrc: next()?,
             gradient: next()?,
             testsrc709: next()?,
+            graded: match cube {
+                Some(cube) => Some((next()?, cube)),
+                None => None,
+            },
         })
     }
 
@@ -347,7 +388,7 @@ impl Media {
             pos_y: 0.15,
             ..Transform::default()
         };
-        vec![
+        let mut cases = vec![
             Case {
                 name: "fit",
                 timeline: timeline(vec![vec![clip(&self.testsrc)]]),
@@ -363,7 +404,17 @@ impl Media {
                 timeline: timeline(vec![vec![clip(&self.testsrc709)], vec![small]]),
                 assets: vec![self.testsrc709.clone()],
             },
-        ]
+        ];
+        if let Some((asset, cube)) = &self.graded {
+            let mut graded = clip(asset);
+            graded.grade = probe_grade(PARTS_ALL, cube);
+            cases.push(Case {
+                name: "grade",
+                timeline: timeline(vec![vec![graded]]),
+                assets: vec![asset.clone()],
+            });
+        }
+        cases
     }
 }
 
@@ -383,6 +434,15 @@ fn timeline(tracks: Vec<Vec<Clip>>) -> Timeline {
         format: Some(Delivery::new(CANVAS.0, CANVAS.1, Fit::Contain)),
         master: Default::default(),
     }
+}
+
+/// The `.cube` of the `grade` frame's LUT ([`crate::grade::probe_cube`]: a 5x5x5 table with a tint and cross-channel
+/// terms), written to `dir`.
+fn write_cube(dir: &Path) -> Result<String, SelfTestError> {
+    let path = dir.join("look.cube");
+    std::fs::write(&path, probe_cube())
+        .map_err(|e| SelfTestError::inconclusive(format!("could not write the check LUT: {e}")))?;
+    Ok(path.to_string_lossy().into_owned())
 }
 
 /// A lossless clip of `lavfi` (FFV1 in Matroska: ffmpeg's own encoder, an indexed container, every
@@ -701,7 +761,10 @@ mod tests {
         let _one = one_at_a_time();
         let gpu = adapter();
         let report = parity_self_test(&gpu).unwrap_or_else(|e| panic!("{e}"));
-        assert_eq!(report.cases.len(), 3);
+        // The grade's frame is drawn where this FFmpeg converts as the grade's model does, and only there.
+        let grade_drawn = crate::grade::kernels() == Kernels::Match;
+        assert_eq!(report.cases.len(), 3 + usize::from(grade_drawn), "{}", report.summary());
+        assert_eq!(report.cases.iter().any(|c| c.name == "grade"), grade_drawn);
         eprintln!("self-test: {}", report.summary());
         assert!(report.elapsed < Duration::from_secs(30), "{:?}", report.elapsed);
         // The scratch directory is gone.
@@ -725,7 +788,7 @@ mod tests {
             CompositeColorPolicy::BottomLayerTag => CompositeColorPolicy::FixedBt601,
             CompositeColorPolicy::Unknown => panic!("the colour probe could not read this FFmpeg"),
         };
-        match run(&gpu, real, wrong, Instant::now() + DEADLINE) {
+        match run(&gpu, real, wrong, crate::grade::kernels(), Instant::now() + DEADLINE) {
             Err(SelfTestError::Mismatch(report)) => {
                 eprintln!("drift: {}", report.summary());
                 let failed: Vec<_> = report.cases.iter().filter(|c| !c.passed()).map(|c| c.name).collect();
@@ -735,13 +798,41 @@ mod tests {
         }
     }
 
+    /// A machine whose FFmpeg does not convert as the grade's model does (another CPU's kernels), or whose probe could
+    /// not tell, has no grade frame to draw: the plan refuses it. That must not close the GPU path for the frames that
+    /// are drawn (it used to: the check stopped on its own refused frame): the other three decide the check.
+    #[test]
+    #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+    fn a_machine_whose_conversions_differ_or_are_unknown_is_checked_on_the_other_three_frames() {
+        let _one = one_at_a_time();
+        let gpu = adapter();
+        let policy = composite_color_policy();
+        for kernels in [Kernels::Differs("rehearsed"), Kernels::Unknown] {
+            let report = run(&gpu, policy, policy, kernels, Instant::now() + DEADLINE)
+                .unwrap_or_else(|e| panic!("{kernels:?} closed the check: {e}"));
+            let names: Vec<_> = report.cases.iter().map(|c| c.name).collect();
+            assert_eq!(names, ["fit", "pip", "bt709"], "{kernels:?}");
+            assert!(report.passed(), "{kernels:?}: {}", report.summary());
+        }
+        // The other three still decide it: the wrong colour policy fails the BT.709 frame without the grade's.
+        let wrong = match policy {
+            CompositeColorPolicy::FixedBt601 => CompositeColorPolicy::BottomLayerTag,
+            _ => CompositeColorPolicy::FixedBt601,
+        };
+        let Err(SelfTestError::Mismatch(report)) = run(&gpu, policy, wrong, Kernels::Unknown, Instant::now() + DEADLINE) else {
+            panic!("expected a mismatch on the BT.709 frame");
+        };
+        let failed: Vec<_> = report.cases.iter().filter(|c| !c.passed()).map(|c| c.name).collect();
+        assert_eq!(failed, ["bt709"], "{}", report.summary());
+    }
+
     #[test]
     #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
     fn a_deadline_that_has_passed_is_could_not_check_and_leaves_nothing_behind() {
         let _one = one_at_a_time();
         let gpu = adapter();
         let policy = composite_color_policy();
-        let err = run(&gpu, policy, policy, Instant::now()).unwrap_err();
+        let err = run(&gpu, policy, policy, crate::grade::kernels(), Instant::now()).unwrap_err();
         assert!(
             matches!(&err, SelfTestError::Inconclusive(why) if why.contains("ran out of time")),
             "{err}"

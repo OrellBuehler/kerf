@@ -52,6 +52,29 @@ impl EffectKinds {
     }
 }
 
+/// A set of the parts of a clip's [`Grade`](crate::model::Grade): what a compositor draws one by one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct GradeKinds(u8);
+
+impl GradeKinds {
+    pub const NONE: Self = Self(0);
+    /// Colour wheels (`colorbalance`).
+    pub const WHEELS: Self = Self(1);
+    /// Tone curves (`lutrgb`).
+    pub const CURVES: Self = Self(1 << 1);
+    /// A 3D LUT (`lut3d`).
+    pub const LUT: Self = Self(1 << 2);
+    pub const ALL: Self = Self(0b111);
+
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+
 /// Which parts of a [`RenderPlan`](crate::render_plan::RenderPlan) a compositor
 /// draws exactly. [`GpuCaps::A0`] (also the default) is what shipped first: layers,
 /// transform, crop, fit, `eq`, opacity, stills and sampled keyframes — and nothing
@@ -108,6 +131,11 @@ pub struct GpuCaps {
     pub reframe: bool,
     pub hdr: bool,
     pub effects: EffectKinds,
+    /// The parts of a clip's grade (wheels, curves, a 3D LUT) drawn: FFmpeg carries the picture through RGB
+    /// for them, and a compositor that sets a part reproduces that round trip and the filter. Still refused
+    /// whatever the caps (`GradeWith`): a layer the scaler resizes, a letterbox, an odd picture, a format other
+    /// than 8-bit limited-range `yuv420p`, video effects behind the grade, a running black or white fade and a moving zoom.
+    pub grade: GradeKinds,
 }
 
 impl GpuCaps {
@@ -125,6 +153,7 @@ impl GpuCaps {
         reframe: false,
         hdr: false,
         effects: EffectKinds::NONE,
+        grade: GradeKinds::NONE,
     };
 }
 
@@ -220,9 +249,13 @@ pub enum Unsupported {
     /// values (the second number is the steepest step), on a picture the compositor's scaler resizes ahead of
     /// the `eq`: the scaler is a level from swscale's, and the tables multiply that by their step.
     GradeSteep(LayerRef, u32),
-    /// Curves, colour wheels or a 3D LUT (the detail names which): drawn by FFmpeg in RGB, with no
-    /// compositor pass or parity case yet.
+    /// Curves, colour wheels or a 3D LUT (the detail names which) that the compositor has no pass or parity
+    /// case for (`GpuCaps::grade`): drawn by FFmpeg in RGB.
     Grade(LayerRef, &'static str),
+    /// A grade the compositor draws in general but not in this layer's chain (the detail says why): FFmpeg
+    /// carries the picture through RGB for the filters and back, and the way in and out is only reproduced for
+    /// 8-bit limited-range `yuv420p` at the size it is drawn at.
+    GradeWith(LayerRef, &'static str),
     /// A video effect the compositor does not draw (the detail names it and says why), or one
     /// whose value FFmpeg's own filter refuses.
     Effects(LayerRef, &'static str),
@@ -325,6 +358,7 @@ impl Unsupported {
             Self::GradedFullRange(..) => "graded_full_range",
             Self::GradeSteep(..) => "grade_steep",
             Self::Grade(..) => "grade",
+            Self::GradeWith(..) => "grade_with",
             Self::Effects(..) => "effects",
             Self::Mask(_) => "mask",
             Self::MaskWith(..) => "mask_with",
@@ -395,6 +429,7 @@ impl fmt::Display for Unsupported {
                 "{l}: colour correction whose tables step {step} levels between neighbouring values, on a picture the compositor scales ahead of it (the scaler's one-level difference from FFmpeg's becomes {step}, past the {MAX_AMPLIFIED_ERROR} levels held)"
             ),
             Self::Grade(l, what) => write!(f, "{l}: {what} (drawn by FFmpeg only)"),
+            Self::GradeWith(l, what) => write!(f, "{l}: a grade {what}"),
             Self::Effects(l, what) => write!(f, "{l}: video effects ({what})"),
             Self::Mask(l) => write!(f, "{l}: mask"),
             Self::MaskWith(l, what) => write!(f, "{l}: a mask {what}, which the compositor does not draw"),
@@ -528,6 +563,7 @@ mod tests {
             Unsupported::Hdr(layer(0, "")).kind(),
             Unsupported::Effects(layer(0, ""), "a blur").kind(),
             Unsupported::Grade(layer(0, ""), "curves").kind(),
+            Unsupported::GradeWith(layer(0, ""), "on a letterboxed picture").kind(),
             Unsupported::GradeSteep(layer(0, ""), 12).kind(),
             Unsupported::MaskWith(layer(0, ""), "on a rotated layer").kind(),
             Unsupported::Matte(layer(0, ""), "of a translucent layer").kind(),

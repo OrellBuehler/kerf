@@ -10,6 +10,7 @@ pub mod captions_export;
 pub mod captions_import;
 mod clip_timing;
 pub mod color_lut;
+pub use color_lut::{baked_lut, BakedLut};
 pub mod eq;
 pub mod error;
 pub mod finite;
@@ -69,18 +70,19 @@ pub use engine::{
     band_balance, check_caption_sidecars, composite_color_policy, contact_sheet_times, decode_audio, decode_hwaccel,
     disable_decode_hwaccel, discard_partial, download_speech_model, download_speech_model_cancellable, export_seek_arg,
     export_still, export_still_cancellable, ffmpeg_command, ffmpeg_path, file_mtime, filmstrip_for, fps_mode_flag,
-    generate_proxy, geq_edge, geq_penultimate_plane, hw_encoders, insta360_pair, limit_ffmpeg_args, limit_frame_args,
-    music_status, playback_params, prepare_soundfont, prepare_variants, prepare_voiceover, proxy_path, proxy_width,
-    render_variants, render_with, render_with_progress, seek_arg, set_speech_model, source_identity, source_is_indexed_container,
-    source_seek_points_are_keyframes, speech_model_names, stems_status, stitch_insta360, stitch_insta360_with, stitched_path,
-    stream_preview, stream_preview_until, stream_preview_with, text_raster_graph, text_still_filter, validate_export,
-    voiceover_status, wav_bytes, waveform_pyramid, waveform_range, waveform_range_of, write_wav, AudioBuffer, BandLevel,
-    BandWindow, Container, DownloadProgress, ExportOptions, ExportProgress, ExportVariant, Filmstrip, FilmstripSheet, Fit,
-    GeqEdge, ImageFormat, LoudnessPreset, MusicStatus, PlaybackParams, PlaybackRequest, PreviewFrame, RateControl, Region,
-    RenderStatus, ScrubConfig, ScrubFrames, ScrubStats, SpeechModelInfo, StemsStatus, StyleInfo, TextPart, TextRasterGraph,
-    VariantProgress, VariantsRun, VoiceInfo, VoiceoverStatus, WaveformLevel, WaveformPyramid, WaveformRange, WindowBalance,
-    DEFAULT_SPEECH_MODEL, DEFAULT_VOICE, FILMSTRIP_HEIGHT, MAX_FILMSTRIP_FRAMES, MAX_STREAM_FPS, MAX_STREAM_WIDTH,
-    MAX_VOICE_SPEED, MAX_WAVEFORM_BUCKETS, MIN_STREAM_FPS, MIN_STREAM_WIDTH, MIN_VOICE_SPEED, STEM_NAMES,
+    generate_proxy, geq_edge, geq_penultimate_plane, grade_filter_chain, hw_encoders, insta360_pair, limit_ffmpeg_args,
+    limit_frame_args, music_status, playback_params, prepare_soundfont, prepare_variants, prepare_voiceover, proxy_path,
+    proxy_width, render_variants, render_with, render_with_progress, seek_arg, set_speech_model, source_identity,
+    source_is_indexed_container, source_seek_points_are_keyframes, speech_model_names, stems_status, stitch_insta360,
+    stitch_insta360_with, stitched_path, stream_preview, stream_preview_until, stream_preview_with, text_raster_graph,
+    text_still_filter, validate_export, voiceover_status, wav_bytes, waveform_pyramid, waveform_range, waveform_range_of,
+    write_wav, AudioBuffer, BandLevel, BandWindow, Container, DownloadProgress, ExportOptions, ExportProgress, ExportVariant,
+    Filmstrip, FilmstripSheet, Fit, GeqEdge, ImageFormat, LoudnessPreset, MusicStatus, PlaybackParams, PlaybackRequest,
+    PreviewFrame, RateControl, Region, RenderStatus, ScrubConfig, ScrubFrames, ScrubStats, SpeechModelInfo, StemsStatus,
+    StyleInfo, TextPart, TextRasterGraph, VariantProgress, VariantsRun, VoiceInfo, VoiceoverStatus, WaveformLevel,
+    WaveformPyramid, WaveformRange, WindowBalance, DEFAULT_SPEECH_MODEL, DEFAULT_VOICE, FILMSTRIP_HEIGHT, MAX_FILMSTRIP_FRAMES,
+    MAX_STREAM_FPS, MAX_STREAM_WIDTH, MAX_VOICE_SPEED, MAX_WAVEFORM_BUCKETS, MIN_STREAM_FPS, MIN_STREAM_WIDTH, MIN_VOICE_SPEED,
+    STEM_NAMES,
 };
 pub use error::{Error, Result};
 pub use fonts::list_system_fonts;
@@ -104,7 +106,7 @@ pub use model::{
     MASTER_MAX_VOLUME, MASTER_MIN_CEILING_DB, MAX_BPM, MAX_CHANNEL_VOLUME, MAX_SEED, MAX_SPEED, MAX_SVG_OVERLAYS,
     MAX_SVG_SECONDS, MAX_TITLE_CLIPS, MIN_BPM, MIN_EDIT_CLIP, MIN_SPEED, RELEASE_TAIL_S,
 };
-pub use plan_caps::{DipWhy, EffectKinds, GpuCaps, LayerRef, Unsupported};
+pub use plan_caps::{DipWhy, EffectKinds, GpuCaps, GradeKinds, LayerRef, Unsupported};
 pub use plan_epoch::{bump_plan_epoch, plan_epoch};
 pub use planner::{Handover, PlanRequest, Planner, SpanPlan, SpanRun};
 pub use platform::{
@@ -123,8 +125,8 @@ pub use project::{
 pub use proxy::{PreviewSource, ProxyInput, ProxyPhase, ProxySize, ProxyStatus, ProxyWait};
 pub use recovery::{Recoverable, RecoveryInfo};
 pub use render_plan::{
-    Animated, CompositeColorPolicy, FadeOp, LayerFx, PlanCanvas, PlanLayer, PlanMode, PlanReframe, PlanSource, PlanStream,
-    PlanText, PlanTiming, ReframeInterp, RenderPlan, YuvMatrix, MAX_AMPLIFIED_ERROR, MAX_SHRINK, MIN_TEXT_PX,
+    Animated, CompositeColorPolicy, FadeOp, GradeRoute, LayerFx, PlanCanvas, PlanLayer, PlanMode, PlanReframe, PlanSource,
+    PlanStream, PlanText, PlanTiming, ReframeInterp, RenderPlan, YuvMatrix, MAX_AMPLIFIED_ERROR, MAX_SHRINK, MIN_TEXT_PX,
 };
 pub use svg::{check_svg, render_preset, SvgCheck, SvgDoc, SvgPresetInfo, SvgPresetParamInfo, MAX_ANIMATIONS, MAX_VALUES};
 pub use template::{
