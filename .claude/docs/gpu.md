@@ -11,7 +11,7 @@ Windows) and nothing may depend on an optional wgpu feature. **A GPU failure is 
 error, not a panic**: every unit of wgpu work runs in out-of-memory / validation /
 internal error scopes (`Gpu::guarded`), anything uncaptured is logged and remembered,
 `Compositor::new` and `composite` return `Result` (and `Compositor::caps()` says what it
-draws, `GpuCaps::A0` plus `text`, `motion`, `fades`, `transitions`, `dip_white`, `keyed_zoom`, `keyed_opacity`, `keyed_color`, `mask` and the blur / sharpen / grayscale / invert / vignette / chroma key `effects` today, which `composite` / `render_plan` judge the plan by), and a lost device is tracked — every
+draws, `GpuCaps::A0` plus `text`, `motion`, `fades`, `transitions`, `dip_white`, `keyed_zoom`, `keyed_opacity`, `keyed_color`, `mask`, `grade` (every kind) and the blur / sharpen / grayscale / invert / vignette / chroma key `effects` today, which `composite` / `render_plan` judge the plan by), and a lost device is tracked — every
 later call is `GpuError::DeviceLost` and the **owner builds a new `Gpu` and
 `Compositor`** (the device is not recreated behind the caller's back).
 
@@ -544,25 +544,26 @@ Over a full-range picture on 9.0 (text drawn in full range, converted last) the 
 
 **The runtime self-test** (`selftest.rs`, `parity_self_test(&Arc<Gpu>)`). Parity is proven in CI on two FFmpeg
 builds and one software adapter; a user has a third FFmpeg and a real GPU, so the first use of the GPU path
-(the app: `app.md`) draws three small frames on the compositor and through that machine's own FFmpeg and holds
+(the app: `app.md`) draws four small frames on the compositor and through that machine's own FFmpeg and holds
 them to the harness's **strict limits** (`PSNR_FLAT_MIN` 40 dB, `MAX_FLAT` 8, `PSNR_ALL_MIN` 40, `FLAT_SHARE_MIN`
 0.5, the same edge band: constants and `compare` are copies of `tests/parity.rs`', and
 `the_runtime_self_test_judges_by_the_limits_and_the_comparison_of_this_harness` holds them equal). The frames:
 `fit` (one untagged layer enlarged 4:3: swscale's tables, the final conversion), `pip` (a gradient with a shrunk,
 cropped, 80%-opaque, graded picture-in-picture: the scaler down, `eq`, the opacity round trip, `overlay`) and
-`bt709` (a BT.709-tagged stack: the composite colour policy the plan was given, which is how 6 and 9 differ).
+`bt709` (a BT.709-tagged stack: the composite colour policy the plan was given, which is how 6 and 9 differ) and
+`grade` (a 640x360 untagged clip through a 5^3 LUT, curves and wheels: the x86 conversion kernels of this machine's FFmpeg, which is what `grade::kernels()` also asks).
 No rotation: its float sampling can differ by a level between GPUs for reasons that are not drift. The clips are
 made by that FFmpeg itself (FFV1 in Matroska, three of them in parallel, 480x270, 0.4 s, probed as an import
 probes), the references are `export_still`, the GPU frames come through a private `FrameSource` (`Hint::Scrub`,
 the preview's own), and everything runs the way interactive reads do: thread-capped children (`limit_frame_args`),
-no machine-budget slot, nothing under a project lock; it takes 1.9 to 2.7 s on FFmpeg 6.1.1 and 1.0 to 1.2 s on 9.0.2
-on lavapipe (release build, a loaded 4-core box; `docs/review-2026-10-10/after/gpu-5`). The answer is `Ok(report)`, **`SelfTestError::Mismatch`** (the GPU draws something else than this
+no machine-budget slot, nothing under a project lock; it took 1.9 to 2.7 s on FFmpeg 6.1.1 and 1.0 to 1.2 s on 9.0.2
+on lavapipe with three frames (release build, a loaded 4-core box; `docs/review-2026-10-10/after/gpu-5`), and 3.6 s and 1.7 s with the fourth, the grade (the same box, loaded). The answer is `Ok(report)`, **`SelfTestError::Mismatch`** (the GPU draws something else than this
 FFmpeg) or **`Inconclusive`** (an FFmpeg that would not make the clips, a colour policy that could not be
 measured, the plan refusing its own frame, the GPU failing on it, the 90 s deadline). **The deadline is looked at between
 steps** (before the clips and before each case), not inside one: a case begun just before it still runs its reference
 (`export_still`, a 120 s timeout of its own) and a conversion (30 s), so the worst case is about four minutes, during which
 every frame goes through FFmpeg as before. What the app does with the answer is in `app.md`. Measured on lavapipe, both
-FFmpegs: fit 48.8 dB / max 4, pip 46.4 dB / max 6, bt709 49.4 / max 5 on 6.1.1 and 48.6 / 5 on 9.0.2; the same GPU
+FFmpegs: fit 48.8 dB / max 4, pip 46.2 dB / max 6, bt709 49.4 / max 5 on 6.1.1 and 48.6 / 5 on 9.0.2, grade 45.6 dB / max 3 on both; the same GPU
 drawn under the *other* colour policy fails the bt709 frame at 24 dB / 40 to 42 levels (that is the 6-versus-9
 drift the test is for; `a_gpu_drawn_under_the_wrong_colour_policy_fails_it`).
 
@@ -746,6 +747,52 @@ included, and a graded layer in a stack that holds one where the composite's col
 * 4:2:2, 4:4:4, RGB and gray pictures (and 10-bit under `FixedBt601`) take every other effect and a mask at the plain source's own figures (max 3: the decode's rounding).
   Compute passes are core wgpu on every backend and the blur writes no storage texture: no optional feature.
 
+**The clip's grade** (wheels = `colorbalance`, curves = `lutrgb`, a 3D LUT = `lut3d`; `grade.rs`, `shaders/grade.wgsl`, `compositor/grade_passes.rs`,
+`GpuCaps::grade`; not the `eq` colour above, which is a YUV operation). The grade's filters only take RGB, so FFmpeg converts the picture `yuv420p -> rgb24`, runs
+`lut3d`, `lutrgb`, `colorbalance` (that order) and converts it back. The compositor draws **the conversions as well as the filters, to the level**: a graded layer at its
+own size is the export's, sample for sample (0 differing samples in `tests/grade.rs` and in 65 of the 67 `grade/` rows of `motion_parity`, on 6.1.1 and 9.0.2 alike; the other two are a rotated layer and a translucent one at their own ladder's level; the Still-plan `grade/` rows are the ungraded family's own 43-51 dB, max 2-4, `STRICT`). Every stage was written from the FFmpeg 6.1.1 and 9.0.2 sources, first as a numpy model, then as the scalar
+`grade::reference`, and held to both builds on noise in all three planes (every Y, U, V triple, clipped RGB included; `tests/grade.rs`: the reference vs FFmpeg's filter
+text vs the shaders, 21 grades (every part alone, in pairs, all three, untagged and BT.709, a 2^3 and a 33^3 LUT, a zigzag curve, wheels at the rim of the disc) on six pictures with odd chroma sizes and a 2x2, and three of them on a 1080p frame):
+* **In is swscale's x86 kernel, not the C tables of the translucent round trip** (`roundtrip.rs`'s `Yuv2Rgb` is `yuva420p -> argb`, which has no SIMD version). `yuv420p ->
+  rgb24` is `ff_yuv_420_rgb24_ssse3`: 16-bit lanes, `pmulhw` by 13-bit coefficients (`ff_yuv2rgb_c_init_tables`' `roundToInt16(c * 8192)`: BT.601 y 9539, vr 13075, ub 16525,
+  vg -6660, ug -3209, offset 128), chroma replicated 2x2 (`X86Kernel`, `fs_rgb`). The same on both FFmpegs. Odd heights leave it (swscale's generic path) and odd widths read past
+  the line, so the plan refuses odd sides.
+* **Wheels** are `color_balance8`'s `float` arithmetic op for op (`Balance`, `fs_balance`); **curves** are the `lutrgb` table (`curve_tables`, the model's value rounded: the
+  engine's expression equals it for every value); the **LUT** is `interp_8_tetrahedral` (`lut3d_apply`, `fs_lut3d`): the per-byte axes (`prev`, `next`, fraction) are made in
+  `f32` on the CPU (`LutAxes`), the table is `kerf_core::baked_lut` (the copy's rows with the intensity applied) uploaded as an `Rgba32Float` 3D texture (four cached), the
+  four products are summed left to right and the result **truncated** (`av_clip_uint8(sum * 255.0f)`: `(int)`, not `lrintf`). A GPU may fuse `a * b + c` into one rounding, a CPU's
+  FFmpeg does two, so every product a sum follows goes through `pin` (an OR with a uniform that is zero, which no compiler sees through) and every `/ 255.0f` is a table made on the CPU.
+* **Out, untagged**: `rgb24 -> yuv420p` by the generic scaler. Luma is `rgb24ToY_c`; chroma is `rgb24ToUV_half_c` (sums of horizontal pairs) and then the vertical filter, which is
+  **swscale's x86 `yuv2yuvX`** (`pmulhw` of each tap, `(coef * src) >> 16`, start `(64 + 8 * (N - 1)) >> 4` with N aligned to 2, then `>> 3`) **on every chroma row but the last**,
+  which `swscale.c` hands to the C `yuv2planeX` (`dstY >= dstH - 2`, "we can't use MMX here without overwriting this array's tail"). The shader's scaler (`sws.rs`) is the C
+  arithmetic; the two differ in one sample in fourteen by a level (`ResampleParams.x86`, `fs_v`'s branch, `fs_chroma_v_x86`).
+* **Out, tagged** (the stream names a matrix, or the graph labels it BT.709): the engine ends the grade with `scale=out_color_matrix=<m>,format=yuv444p,setparams=colorspace=<m>`
+  (6.1 converts back as BT.601 otherwise), so the picture goes `rgb24 -> yuv444p` (`fs_plane444` x3) and the 4:2:0 conversion that follows is a 2:1 horizontal bicubic plus the same
+  vertical rule (`PlaneFilters.x86_start`). The matrix is `PlanLayer::grade_route()`: BT.601 / untagged and BT.709 are drawn, any other tag is refused.
+* **Does this FFmpeg convert like that?** The kernels are SIMD, and another CPU's FFmpeg (NEON, plain C) agrees to a level or two, not to the level. `grade::kernels()` runs three
+  short `ffmpeg` children per process, concurrently (a 48x32 picture of integer noise in all three planes made by `geq` from the coordinates, then the same through the untagged
+  route and through the tagged one with an identity `lutrgb`; bounded at 20 s each, `-loglevel error`) and compares both results with the reference: `Match`, `Differs(route)` or
+  `Unknown` (it could not tell: not cached, asked again after a 5 s backoff doubling to 5 min, like `geq_edge`). **One graph per route, and not `random()`**: the first probe stacked
+  the routes in one graph and was wrong on 9.0.2 only (FFmpeg 9 negotiates the matrix across a whole graph, so the BT.709-tagged branch made the untagged one convert as BT.709, and the
+  GPU refused every graded layer there until the parity run showed it), and `random()` restarts its sequence for every slice thread. Anything but `Match` makes `grade_look`
+  return `Unsupported` for a graded layer, and `prepare()` runs the probe on the blocking thread ahead of the frame (`with_grade_kernels` pins the answer for tests; the probe picture
+  is held to tell the x86 vertical kernel from the C one, `the_probe_picture_tells_the_x86_vertical_kernel_from_the_c_one`). **The grade is measured on x86-64 only**; elsewhere the
+  probe decides.
+* **Refused** (each `Unsupported::GradeWith` / `Matte` / `ZoomBehind` in the plan, a held case in `parity.rs` and `motion_parity.rs` with FFmpeg rendering the fallback; `core-render-plan.md`
+  has the list): a layer the compositor's scaler resizes (the scaler's one-level difference goes through the conversions and the tables as 3 levels of luma and 2 of chroma on an
+  identity grade over noise, 4 with a gamma or curves: past the bound of 2, so a picture-in-picture, an enlargement, a Cover fit and a letterbox are FFmpeg's), a letterbox (the bars are
+  graded and their chroma meets the picture's in the conversion back), an odd side, any picture but 8-bit limited-range `yuv420p` (FFmpeg grades the others in the format it
+  negotiates), a BT.2020 / `fcc` / `smpte240m` tag, a video effect other than a chroma key after the grade, a fade to black or white or a dip to white running on it, a moving zoom
+  last, a part the caps do not name. Drawn **with** a grade: a crop that is the canvas, a position on a canvas the picture fits, an opacity (the alpha plane), a mask, a rotation,
+  a dissolve, a chroma key, a clip's alpha-ramp fade, an `eq` ahead of it (static and keyed), speed, keyed position, and the layers under it.
+* **Cost** (`bench_a_grade`, 1080p, lavapipe, a loaded 4-core box; `target/parity/bench-grade.txt`): a still composite (ms, min of runs) is 49 for a plain cut, 189 with wheels, 152 with
+  curves, 165 with a 33-point LUT and 234 with all three; the FFmpeg still is 202 / 229 / 243 / 265 / 316. An export frame (decode + composite) is 53 / 160 / 155 / 191 / 244
+  against FFmpeg's 45 / 75 / 58 / 72 / 96 ms: on a software adapter the grade is a handful of full-size render passes (to RGB, the LUT, the curves, the wheels, luma, chroma), and
+  FFmpeg's graded export is faster there. A real GPU is unmeasured.
+* **Not drawn yet, and why** (the next steps): a scaled graded layer needs an exact x86 vertical scaler in the resample pass (the C one the compositor has is the level off) and a
+  probe that holds it; a letterbox needs the bars as padded planes before the grade; an effect or a fade after a grade needs the RGB / 4:4:4 picture the filter negotiates; a dip to
+  white and a translucent layer are exact in the plan's other places and would gain from the same kernels. The 10-bit, 4:2:2 and 4:4:4 pictures need their own conversion kernels.
+
 **`tests/motion_parity.rs`** (`#[ignore]`d; both FFmpegs in CI's parity job) holds the compositor to the **export**, frame by frame: each case builds a short
 cut, renders it through `render_with` (the real graph) losslessly, reads **every frame back as `yuv420p` planes** (no colour conversion between: the planes `overlay`
 blended) and draws the same frames from a Motion plan through `MotionFrames`, comparing plane for plane with a stated bound per case, **every frame of the range, the last
@@ -755,7 +802,7 @@ format and range cases, `variants()` (10-bit, 4:4:4, 4:2:2, gray, an RGB PNG, MJ
 dips, dissolves, the eight slides and pushes, keyed position / rotation, rotated and translucent layers on an alpha plane, and the coverage archetypes' montage and talking-head
 shapes. **Every sample equals the export's wherever a picture is drawn at its own size on 9.0.2 and 6.1.1 (max error 0)**; one level where the compositor scales a layer (the
 scaler's, `parity.rs`), two where it scales **and** grades, two inside a rotated layer (the band within 3 px of its edge, from the plan's geometry, is left out), and a dip to
-white at two (`WHITE`; three of Y on BT.709, `WHITE_709`). **A refusal case** (`run_refusing`) skips the frames the plan refuses for its reason, requires at least one, and
+white at two (`WHITE`; three of Y on BT.709, `WHITE_709`). **A grade at the picture's size is exact on both** (0 differing samples in all 67 `grade/` rows: each part alone and the three together over six pictures, untagged and BT.709, a crop, speed 2, an `eq` ahead of it (static and keyed), over another track, dissolving in and out, under a mask and a chroma key, a labelled HD clip; rotated at one level and translucent at one level of chroma, which is those layers' own ladder). **A refusal case** (`run_refusing`) skips the frames the plan refuses for its reason, requires at least one, and
 holds **every other frame to the export** (a refusal wider than it has to be shows): the letterboxed / odd / resized / not-`yuv420p` dips to white, the fades on a translucent layer,
 the full-range pictures (`run_full_range`: drawn exactly under `FixedBt601`, refused under the negotiating policies), and the grades whose tables step past two on a layer the scaler resizes (`run_grade_steep`: a keyed ramp frame by frame; `a_grade_on_a_layer_the_scaler_resizes_is_drawn_while_its_tables_step_by_two_and_refused_past_it` holds the static ones drawn to **the step itself** on a luma ramp, hard edges and noise, and refuses the steeper). A mutation of the chroma constant by nine in 65536 fails the dips
 at once. The Still-plan side is `parity.rs`: `frames_inside_a_transition_are_drawn_as_ffmpegs_still_draws_them` (the plan holds the frame and the GPU is held strictly to the still, the still to
@@ -829,6 +876,7 @@ the **unmeasured-policy** case (`Unknown`: BT.601 stacks drawn, BT.709 / BT.2020
 the **full-range grading** cases (a graded `yuvj` clip, and a graded layer in a stack with
 one, refused; ungraded and limited-range controls drawn; a keyed colour on a `yuvj` clip refused on every frame, the neutral ones included), the **range-flag** cases (a `yuv420p` file flagged `pc`: effects, `eq`, a running fade refused, plain / shrunk / enlarged drawn; `tv` / unflagged controls drawn),
 the **steep grades** (`a_grade_whose_tables_amplify_the_scalers_level_past_two_is_refused_on_a_layer_it_resizes`: contrast and saturation past 2, a gamma past 1.2, a black point parked above 0, the far end of every range, on a pip, a letterbox and a Cover fit, each refused with FFmpeg rendering it; the same grade at the picture's size, and a gentle one on the pip, drawn),
+the **clip's grade** (`grade/`: wheels, curves, a LUT at 100 % and 40 % and all three, over bars, testsrc2 and a gradient, untagged and BT.709, after an `eq`, cropped and moved over another track, dissolving in, masked, rotated, translucent, after a fade-in; its refusals in `what_the_compositor_does_not_draw_of_a_grade_is_refused`: a pip, an enlargement, a letterbox, 10-bit / 4:4:4 / 4:2:2 / gray / BGR0, full range, BT.2020, an unrecorded format, each effect, a running fade, a moving zoom),
 and **refusals** (an EXIF-oriented JPEG, FFV1 `yuva420p`, the same with the pixel
 format unrecorded, a translucent odd layer, a moving zoom behind a rotation, an opacity below 1 or a dip to white, a vignette on a 4:4:4 picture or a letterbox, a chroma key on a pip, after a blur, on a 4:4:4 picture, under a mask or a keyed opacity or on a rotated layer, a mask on a rotated or a translucent layer, a blur on a letterbox, an invert / blur / sharpen on a full-range picture, an invert on a gray one) —
 each of which FFmpeg still renders (and a fade to black or white on a translucent layer, a dip to white on a rotated, letterboxed, odd, resized or non-`yuv420p` layer or beside a black fade, a fade on a full-range picture under FFmpeg 9), **transitions** (`transition/`, `transition-kind/`, `fade/`: every kind and a clip's own fades in a still, see
@@ -836,14 +884,14 @@ above), **a moving zoom last, masks and effects** (`zoom/`, `zoom+mask/`, `mask/
 caption styles, positions and edges, boxes, colours, sizes, keyframed and overlapping overlays, escapes, installed fonts,
 over every kind of picture, with no layer, and the text it must refuse, each held to the same picture without the text; see
 "Text" above). The table
-holds 781 rows on FFmpeg 6.1.1 (on the pinned 9.0.2 the Windows and macOS bundles ship, where the mixed-tag stacks are asserted refused instead of compared, the count is unmeasured: CI runs the harness without `--nocapture`, so it keeps no report); on 6.1.1 152 rows are `text/`, its
+holds 822 rows on FFmpeg 6.1.1 (775 on the pinned 9.0.2 the Windows and macOS bundles ship, where the mixed-tag stacks are asserted refused instead of compared; CI runs the harness without `--nocapture`, so it keeps no report); on 6.1.1 152 rows are `text/`, its
 controls included, 191 the transitions, fades and dips and 184 the zoom, mask, effect and chroma key cases, plus the plane-level scaler (75), effect (108) and chroma key alpha (12) runs, all passing strictly. A failing case writes the reference, GPU and diff images to `target/parity/`
 (`KERF_PARITY_KEEP=1` keeps them for passing ones; `KERF_PARITY_EXPLORE=1` prints
 everything and fails nothing); every run writes `target/parity/report.txt`.
 `tests/bench.rs` times a still on the GPU against FFmpeg at 1080p / 4K and 1 / 3 / 6
 layers, decode apart from composite (`KERF_BENCH=1`), and a captioned frame cold (FFmpeg rasterises the caption: one
 process, +30 to +95 ms on lavapipe by FFmpeg and size) and warm (the atlas: a few ms, inside the noise), and a mask, a blur, a sharpen and a
-moving zoom frame against FFmpeg's still and export (`bench_a_mask_a_blur_and_a_moving_zoom`: the mask plane's one-off cost apart), and a chroma key at 1080p (`bench_a_chroma_key`: on lavapipe the key pass is about 200 ms a frame, nine emulated `double` adds a sample; to FFmpeg the key adds about 80 ms to a still and 15 ms to an export frame on 3 slice threads; a real GPU unmeasured).
+moving zoom frame against FFmpeg's still and export (`bench_a_mask_a_blur_and_a_moving_zoom`: the mask plane's one-off cost apart), a graded frame at 1080p (`bench_a_grade`: wheels, curves, a 33-point LUT and all three against FFmpeg's still and export; `bench-grade.txt`), and a chroma key at 1080p (`bench_a_chroma_key`: on lavapipe the key pass is about 200 ms a frame, nine emulated `double` adds a sample; to FFmpeg the key adds about 80 ms to a still and 15 ms to an export frame on 3 slice threads; a real GPU unmeasured).
 `tests/coverage.rs` plans the review's archetypes (no decode, no adapter), still plans and export frames, and tells how many
 frames a compositor draws before and after fades and transitions (still plans: the captioned 9:16 talking head 96.0% to 100%, the
 same without captions 96.0% to 100%, the 16:9 montage with dissolves, dips and a slide 78.8% to 100%; export frames: 0% to 100% for those, since a Motion plan was

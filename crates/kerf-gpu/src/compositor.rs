@@ -750,7 +750,7 @@ fn extent(w: u32, h: u32) -> wgpu::Extent3d {
 
 /// Do ahead of a frame what a plan needs measured and what takes a while: FFmpeg's `geq`, for a
 /// plan with a mask or a keyed opacity (the export's `geq`), and its conversions to and from RGB, for a plan with a
-/// grade ([`crate::grade::kernels`]; each one short child process, once per process).
+/// grade ([`crate::grade::kernels`]; three short child processes at once, once per process).
 /// Call it from a blocking thread **off the render lock**, with the plan in hand, so the first such
 /// frame does not pay for it under the lock; a compositor pinned with [`Compositor::with_geq_edge`] needs none of it.
 pub fn prepare(plan: &RenderPlan) {

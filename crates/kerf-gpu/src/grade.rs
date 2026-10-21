@@ -441,7 +441,7 @@ struct KernelState {
     retry_at: Option<std::time::Instant>,
 }
 
-/// Whether this FFmpeg converts as the model does ([`Kernels`]). The first call runs one short `ffmpeg`
+/// Whether this FFmpeg converts as the model does ([`Kernels`]). The first call runs three short `ffmpeg` children at once
 /// (tens of milliseconds, bounded by 20 s) with no lock held: a blocking thread's, ahead of the frame that needs it
 /// ([`crate::prepare`]). [`Kernels::Unknown`] is not remembered.
 pub fn kernels() -> Kernels {
