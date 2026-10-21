@@ -710,4 +710,48 @@ mod tests {
         };
         assert!(why.contains("measured"), "{why}");
     }
+
+    fn flat(w: u32, h: u32) -> YuvFrame {
+        let (cw, ch) = crate::source::chroma_size(w, h);
+        YuvFrame {
+            width: w,
+            height: h,
+            y: vec![100; (w * h) as usize],
+            u: vec![110; (cw * ch) as usize],
+            v: vec![140; (cw * ch) as usize],
+        }
+    }
+
+    /// The same refusals through `composite_yuv`, which is what a host that skipped the plan calls: each guard of
+    /// `look_of` is an error out of the render (and no frame), and the layer at its own size is drawn. (An odd side
+    /// has no plan to start from: the canvas is even and a crop of a 4:2:0 picture snaps to even, so
+    /// `an_odd_side_is_refused_at_the_render` hands the guard the geometry itself.)
+    #[test]
+    #[ignore = "needs an adapter (lavapipe is enough)"]
+    fn composite_yuv_refuses_each_of_them_and_draws_a_layer_at_its_own_size() {
+        use crate::gpu::{Gpu, GpuOptions};
+        use crate::grade::Kernels;
+        let gpu = Gpu::new(GpuOptions::for_tests()).expect("a GPU adapter (install mesa-vulkan-drivers for lavapipe)");
+        let compositor = Compositor::new(gpu).expect("a compositor").with_grade_kernels(Kernels::Match);
+        let own = plan(640, 360, None, |_| {});
+        let drawn = compositor
+            .composite_yuv(&own, &[Some(flat(640, 360))], own.size(u32::MAX))
+            .expect("a graded layer at its own size is drawn");
+        assert_eq!((drawn.width, drawn.height), (640, 360));
+        for (name, (w, h), delivery, edit, word) in refused() {
+            let p = plan(w, h, delivery, |c| edit(c));
+            let Err(GpuError::Unsupported(why)) = compositor.composite_yuv(&p, &[Some(flat(w, h))], p.size(u32::MAX)) else {
+                panic!("{name}: drawn");
+            };
+            assert!(why.contains(word), "{name}: {why}");
+        }
+        for kernels in [Kernels::Differs("a test"), Kernels::Unknown] {
+            let pinned = Compositor::new(Gpu::new(GpuOptions::for_tests()).expect("a GPU adapter"))
+                .expect("a compositor")
+                .with_grade_kernels(kernels);
+            let Err(GpuError::Unsupported(_)) = pinned.composite_yuv(&own, &[Some(flat(640, 360))], own.size(u32::MAX)) else {
+                panic!("{kernels:?}: drawn");
+            };
+        }
+    }
 }

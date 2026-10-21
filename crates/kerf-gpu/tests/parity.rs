@@ -6547,6 +6547,18 @@ fn a_grade_is_drawn_as_the_still_draws_it() {
         &[0.5],
         STRICT,
     );
+    // A still's graph is the layers on screen: the graded clip after a BT.709 one in the cut is the graph of that clip
+    // alone at its time, drawn on both builds (the export's graph holds both clips, which is the motion plan's refusal).
+    let mut after = clip(&m.testsrc, 0.0, 1.0, 1.0);
+    after.grade = heavy.clone();
+    let tl = timeline(vec![vec![clip(&m.bars709, 0.0, 1.0, 0.0), after]], None);
+    check(
+        "grade/untagged SD after a BT.709 clip, the graded clip's still",
+        &tl,
+        &[m.bars709.clone(), m.testsrc.clone()],
+        &[1.5],
+        STRICT,
+    );
     let mut over = clip(&m.testsrc170m, 0.0, 2.0, 0.0);
     over.grade = heavy.clone();
     let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![over]], None);
