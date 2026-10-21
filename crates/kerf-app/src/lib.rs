@@ -6151,23 +6151,60 @@ mod tests {
     /// `connect-src` blocking `_app/version.json` — SvelteKit fetches it from the app's own origin
     /// (`tauri://localhost`, `http://tauri.localhost`) whenever the window becomes visible or regains
     /// focus — so `connect-src` has `'self'`; scripts (the limiter worklet included) stay `'self'` only.
+    /// Every directive is pinned, and the set of them, in the packaged policy and in the dev one. The dev
+    /// policy differs in three ways: `script-src` adds `'unsafe-inline'` (the inline script hot reload
+    /// needs), `connect-src` names the dev server (http and ws) instead of `'self'`, and there is no
+    /// `form-action`.
     #[test]
     fn the_packaged_csp_admits_what_the_app_loads_and_nothing_more() {
         let conf: serde_json::Value = serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
-        let csp = &conf["app"]["security"]["csp"];
-        let sources = |directive: &str| -> Vec<String> {
-            csp[directive]
-                .as_str()
-                .unwrap_or_else(|| panic!("{directive} is set"))
-                .split_whitespace()
-                .map(str::to_string)
+        let security = &conf["app"]["security"];
+        let policy = |csp: &serde_json::Value| -> std::collections::BTreeMap<String, Vec<String>> {
+            csp.as_object()
+                .expect("the CSP is a directive map")
+                .iter()
+                .map(|(directive, value)| {
+                    let sources = value.as_str().unwrap_or_else(|| panic!("{directive} is a string"));
+                    (directive.clone(), sources.split_whitespace().map(str::to_string).collect())
+                })
                 .collect()
         };
-        assert_eq!(sources("script-src"), ["'self'"]);
-        assert_eq!(sources("connect-src"), ["'self'", "ipc:", "http://ipc.localhost"]);
-        assert_eq!(sources("default-src"), ["'self'"]);
-        assert_eq!(sources("object-src"), ["'none'"]);
-        assert_eq!(sources("base-uri"), ["'none'"]);
+        let expect = |directives: &[(&str, &[&str])]| -> std::collections::BTreeMap<String, Vec<String>> {
+            directives
+                .iter()
+                .map(|(d, s)| (d.to_string(), s.iter().map(|s| s.to_string()).collect()))
+                .collect()
+        };
+        assert_eq!(
+            policy(&security["csp"]),
+            expect(&[
+                ("default-src", &["'self'"]),
+                ("script-src", &["'self'"]),
+                ("style-src", &["'self'", "'unsafe-inline'"]),
+                ("font-src", &["'self'", "data:"]),
+                ("img-src", &["'self'", "data:"]),
+                ("connect-src", &["'self'", "ipc:", "http://ipc.localhost"]),
+                ("object-src", &["'none'"]),
+                ("base-uri", &["'none'"]),
+                ("form-action", &["'none'"]),
+            ])
+        );
+        assert_eq!(
+            policy(&security["devCsp"]),
+            expect(&[
+                ("default-src", &["'self'"]),
+                ("script-src", &["'self'", "'unsafe-inline'"]),
+                ("style-src", &["'self'", "'unsafe-inline'"]),
+                ("font-src", &["'self'", "data:"]),
+                ("img-src", &["'self'", "data:"]),
+                (
+                    "connect-src",
+                    &["ipc:", "http://ipc.localhost", "http://localhost:1420", "ws://localhost:1420"]
+                ),
+                ("object-src", &["'none'"]),
+                ("base-uri", &["'none'"]),
+            ])
+        );
     }
 
     #[test]
