@@ -742,8 +742,33 @@ export interface AnimationProperties {
 	blur: number;
 }
 
+/** The path a property takes to its resting value (`Curve`): After Effects' speed and influence (the speeds in multiples of
+ *  the average speed, -5 to 5; the influences the share of the way each holds for, 0.01 to 1), or a damped spring
+ *  (`bounce` 0.05 to 0.8). Written for a unit settling into its place; a value may pass its resting one and come back. */
+export type AnimationCurve =
+	| { kind: 'speed'; out_speed: number; out_influence: number; in_speed: number; in_influence: number }
+	| { kind: 'spring'; bounce: number };
+
+/** A curve for each property of an animation (`Curves`); one left out, or `null`, is a straight line. */
+export interface AnimationCurves {
+	x?: AnimationCurve | null;
+	y?: AnimationCurve | null;
+	scale?: AnimationCurve | null;
+	rotation?: AnimationCurve | null;
+	opacity?: AnimationCurve | null;
+	blur?: AnimationCurve | null;
+}
+
+/** A named curve (`CurvePreset`): `curve` is `null` for the straight line. */
+export interface AnimationCurvePreset {
+	id: string;
+	name: string;
+	description: string;
+	curve: AnimationCurve | null;
+}
+
 /** A text's animation (`TextAnimation`), written on its `<text>` as `data-kerf-animate` and compiled to per-glyph SMIL
- *  when the text is glyph outlines. */
+ *  when the text is glyph outlines. `curves` is absent when no property has one. */
 export interface TextAnimation {
 	by: AnimateBy;
 	delay: number;
@@ -752,6 +777,7 @@ export interface TextAnimation {
 	range: AnimationRange;
 	wiggle: AnimationWiggle | null;
 	properties: AnimationProperties;
+	curves?: AnimationCurves;
 }
 
 /** A ready-made animation (`TextAnimationPreset`): choosing one copies `animation` onto the text. */
