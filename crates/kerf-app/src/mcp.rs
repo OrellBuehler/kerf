@@ -234,7 +234,7 @@ struct ComposeAlignParams {
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct ComposeMusicParams {
     #[schemars(
-        description = "The piece, as a score: {bpm, key, style, sections, hits?, seed?, instruments?}. See the tool description for what each field takes."
+        description = "The piece, as a score: {bpm 40-240, key, style, sections, hits?, seed?, instruments?}, 4/4 only. key: a tonic and an optional m — G, F#m, Bb, Ebm. style: tropical_house (four-on-the-floor, marimba stabs, pan-flute hook, 100-120 BPM), pop (backbeat, fingered bass, piano, strings, 100-124), lofi (lazy swung boom-bap, Rhodes sevenths, vibraphone, 70-90), cinematic (strings, horns, timpani and big hits, 60-100), ambient (pad and harp, no real beat, 55-80), rock (power-chord guitar, picked bass, live drums, 100-150); music_status lists them with a tempo. sections = [{kind, bars, chords, energy?}] played in order, bars 1-128 each, 400 bars and 10 minutes at most. kind shapes the arrangement: intro (sparse: pad and a hint of the groove), verse (the steady groove), build (pulsing bass, a snare roll that quickens, a riser into whatever follows), drop (everything at once, with a crash and impact), breakdown (no kick or bass: pad, keys and hook), outro (thins out and its last bar resolves on the tonic chord). A typical piece: intro, build, drop, breakdown, build, drop, outro. energy 0-1 sets how loud and busy a section is when its kind's default is not what you want (intro 0.3, verse 0.5, build 0.7, drop 1, breakdown 0.3, outro 0.3). chords: ONE per bar; a list shorter than bars cycles, so [\"vi\",\"IV\",\"I\",\"V\"] over 8 bars plays the four chords twice. Write chord names (C, Em, F#m7, Gsus4, D/F#, Bbmaj7, E5, Cadd9, Am7b5 — types: maj min dim aug sus2 sus4 5 7 maj7 m7 m7b5 dim7 6 m6 add9 madd9 9 maj9 m9) or roman numerals in the score's key (I, V, vi, IV, ii7, bVII): upper case is major, lower case minor, a trailing 7 / maj7 / sus4 etc. adds the type, a leading b or # moves the root a semitone, and numerals count the key's own scale (in A minor, VI is F and VII is G). lofi turns plain triads into sevenths and ambient adds a ninth. hits = [{at_s, kind}] — moments in the picture, at_s in seconds from the START OF THE MUSIC (not the timeline): impact (a crash, timpani and low boom), riser (a rising sweep about a bar long that peaks at at_s), dropout (everything but the effects goes silent for one beat from at_s), whoosh (a ~1 s sweep peaking at at_s). A drop already opens with its own crash and impact, so hits are for moments in the picture the sections do not cover (align adds them at cuts for you). seed (an integer 0-9007199254740991, i.e. 2^53 - 1; a bigger one is refused) varies the humanization and the hook; instruments overrides a role's General MIDI program (drums, bass, pad, keys, lead: 0-127). A score that is wrong (an unknown chord, bars 0, a hit past the end) is refused with the offending section or chord named, and so is a field the score does not have: a misspelled `chord`, `enrgy` or `at` is an error, not a silent default."
     )]
     score: kerf_core::MusicScore,
     #[schemars(
@@ -246,7 +246,7 @@ struct ComposeMusicParams {
     )]
     at: Option<f64>,
     #[schemars(
-        description = "Fit the score to the picture before rendering: nudge the tempo so cuts land on beats and add impact / dropout / riser hits at the cuts. Omit to render the score as written."
+        description = "Fit the score to the picture of the cut you are proposing before it is rendered: {to: \"cuts\" | \"markers\", track_id?, max_tempo_change?}; omit to render the score as written. The tempo is nudged (within max_tempo_change, default 0.06 = 6 %, at most 0.25; never to one that ends the piece before a hit you wrote) so as many cuts as possible land on beats (a downbeat counts double). Then hits are added: an impact on every cut that lands on a downbeat; and for each `drop` that starts more than a beat in and that a cut lands within a beat of, a dropout (a beat of silence) one beat before it, plus a riser peaking at the drop's start — except when the drop follows a build (the build ends in its own riser) or starts earlier than half a bar, where only the dropout is added. Hits within 50 ms of one you wrote are not added twice, and a score stops at 256 hits (`align.notes` says if some were left out). To make a cut hit hard, lay out the sections so a drop starts near it. Cuts are the boundaries between the clips of a video track (default: the first); give `at` if the music does not start at 0. Align after the picture is cut: a later edit moves the cuts, and the music is then composed again with replace_clip_id. The answer's `align` lists the cuts on a beat / downbeat before and after and the hits added, and `score` is the score actually rendered (new bpm, added hits)."
     )]
     align: Option<ComposeAlignParams>,
     #[schemars(
@@ -2633,6 +2633,18 @@ impl KerfMcp {
     }
 
     #[tool(
+        description = "The guide to editing with Kerf: how the tools fit together, in the order an edit uses \
+                       them (inspect and analyse, look at the footage, cut, adjust, ripple mode, linked picture \
+                       and sound, locked tracks, polish, effects, mixing, keyframes, 360 reframing, captions, \
+                       SVG titles and templates, voiceover, delivery formats, staging and review, background \
+                       jobs and subscriptions, paging, history, platform checks, loudness, music, export). \
+                       Read it once before your first edit."
+    )]
+    fn get_editing_guide(&self) -> Result<String, McpError> {
+        Ok(EDITING_GUIDE.to_string())
+    }
+
+    #[tool(
         description = "Which speech-to-text backend this build of Kerf will use for transcription, and whether its model is downloaded yet. Call this when an asset's transcript comes back empty: it says whether transcription is unavailable (and why), or simply that the first run still has to fetch a model."
     )]
     fn transcription_status(&self) -> Result<String, McpError> {
@@ -4327,17 +4339,26 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Compose original music from a score and put it on the timeline. You write the score — tempo, key, style and sections of chords — and Kerf plays it through a General MIDI SoundFont synthesizer (drums, bass, pad, keys, a hook and effects, with the kick pumping the bass and pad), so it is deterministic: the same score is the same audio. The result is a 48 kHz stereo clip on the `M` audio track (created on first use) at `at`, else appended after what the track holds; peaks at -1 dBFS, loudness left to the master bus and export. \
-                       SCORE = {bpm 40-240, key, style, sections, hits?, seed?, instruments?}, 4/4 only. \
-                       key: a tonic and an optional m — G, F#m, Bb, Ebm. \
-                       style: tropical_house (four-on-the-floor, marimba stabs, pan-flute hook, 100-120 BPM), pop (backbeat, fingered bass, piano, strings, 100-124), lofi (lazy swung boom-bap, Rhodes sevenths, vibraphone, 70-90), cinematic (strings, horns, timpani and big hits, 60-100), ambient (pad and harp, no real beat, 55-80), rock (power-chord guitar, picked bass, live drums, 100-150); music_status lists them with a tempo. \
-                       sections = [{kind, bars, chords, energy?}] played in order, bars 1-128 each, 400 bars and 10 minutes at most. kind shapes the arrangement: intro (sparse: pad and a hint of the groove), verse (the steady groove), build (pulsing bass, a snare roll that quickens, a riser into whatever follows), drop (everything at once, with a crash and impact), breakdown (no kick or bass: pad, keys and hook), outro (thins out and its last bar resolves on the tonic chord). A typical piece: intro, build, drop, breakdown, build, drop, outro. energy 0-1 sets how loud and busy a section is when its kind's default is not what you want (intro 0.3, verse 0.5, build 0.7, drop 1, breakdown 0.3, outro 0.3). \
-                       chords: ONE per bar; a list shorter than bars cycles, so [\"vi\",\"IV\",\"I\",\"V\"] over 8 bars plays the four chords twice. Write chord names (C, Em, F#m7, Gsus4, D/F#, Bbmaj7, E5, Cadd9, Am7b5 — types: maj min dim aug sus2 sus4 5 7 maj7 m7 m7b5 dim7 6 m6 add9 madd9 9 maj9 m9) or roman numerals in the score's key (I, V, vi, IV, ii7, bVII): upper case is major, lower case minor, a trailing 7 / maj7 / sus4 etc. adds the type, a leading b or # moves the root a semitone, and numerals count the key's own scale (in A minor, VI is F and VII is G). lofi turns plain triads into sevenths and ambient adds a ninth. \
-                       hits = [{at_s, kind}] — moments in the picture, at_s in seconds from the START OF THE MUSIC (not the timeline): impact (a crash, timpani and low boom), riser (a rising sweep about a bar long that peaks at at_s), dropout (everything but the effects goes silent for one beat from at_s), whoosh (a ~1 s sweep peaking at at_s). A drop already opens with its own crash and impact, so hits are for moments in the picture the sections do not cover (align adds them at cuts for you). seed (an integer 0-9007199254740991, i.e. 2^53 - 1; a bigger one is refused) varies the humanization and the hook; instruments overrides a role's General MIDI program (drums, bass, pad, keys, lead: 0-127). A score that is wrong (an unknown chord, bars 0, a hit past the end) is refused with the offending section or chord named, and so is a field the score does not have: a misspelled `chord`, `enrgy` or `at` is an error, not a silent default. \
-                       ALIGN: with align {to: \"cuts\" | \"markers\", track_id?, max_tempo_change?} the score is fitted to the picture of the cut you are proposing before it is rendered. The tempo is nudged (within max_tempo_change, default 0.06 = 6 %, at most 0.25; never to one that ends the piece before a hit you wrote) so as many cuts as possible land on beats (a downbeat counts double). Then hits are added: an impact on every cut that lands on a downbeat; and for each `drop` that starts more than a beat in and that a cut lands within a beat of, a dropout (a beat of silence) one beat before it, plus a riser peaking at the drop's start — except when the drop follows a build (the build ends in its own riser) or starts earlier than half a bar, where only the dropout is added. Hits within 50 ms of one you wrote are not added twice, and a score stops at 256 hits (`align.notes` says if some were left out). To make a cut hit hard, lay out the sections so a drop starts near it. Cuts are the boundaries between the clips of a video track (default: the first); give `at` if the music does not start at 0. Align after the picture is cut: a later edit moves the cuts, and the music is then composed again with replace_clip_id. The answer's `align` lists the cuts on a beat / downbeat before and after and the hits added, and `score` is the score actually rendered (new bpm, added hits). \
-                       RECOMPOSE: the score rides on its asset (list_assets shows `music_score`). To change a piece, edit that score and call again with replace_clip_id set to any clip of the music: the WHOLE bed is replaced — every clip of that asset on its track (fit_music turns one piece into several segments) becomes ONE clip of the new render, at the earliest of their starts, with the named clip's id, the first one's gain, fade-in and effects, the last one's fade-out and the new length (fit_music it again if the piece should be another length). Refused before anything renders: a clip that is not composed music, a locked track, music linked to a picture (unlink_clips first), and — with ripple off — a longer piece that would run into the next clip. The answer's `replaced` lists the clip ids that were replaced (empty when a clip was added). \
-                       The asset's tempo and bar structure are written from the score, so get_music_structure, fit_music and snap_to_beats work at once (no analyze_asset needed). Then: fit_music if the picture is longer or shorter than the piece (or compose to the length you need), set_track_duck plus set_master_duck to dip it under dialogue, and check it with get_levels and get_band_balance. \
-                       The first call downloads the SoundFont (~32 MB). A piece renders in seconds to about a minute — send a `progressToken` for progress (stages download_soundfont, waiting, render) and cancel the request to stop it, or pass `background: true` for a job_id. The rendered audio lands for the user at once like an import; placing it on the timeline is an ordinary staged edit. Before anything renders it is checked that the score is valid, that the track, the replaced clip and the align target are usable and not locked, and — by rehearsing the placement under the ripple in force — that the music will not land on another clip of its track (the refusal says where); if the cut changes while it renders, placing it is checked again and, if refused, stores nothing. Returns {asset, clip, score, align, replaced: [clip ids]}."
+        description = "Compose original music from a score and put it on the timeline. You write the score \
+                       (tempo, key, style, sections of chords, optional hits: the `score` field says what each \
+                       takes) and Kerf plays it through a General MIDI SoundFont synthesizer, so the same score is \
+                       the same audio. Styles: tropical_house, pop, lofi, cinematic, ambient, rock (music_status \
+                       lists them with a tempo). The result is a 48 kHz stereo clip on the `M` audio track (created \
+                       on first use) at `at`, else appended after what the track holds; peaks at -1 dBFS, loudness \
+                       left to the master bus and export. \
+                       Cut the picture first, then compose with `align` so the tempo and hits land on the cuts. To \
+                       change a piece, edit its score (list_assets shows it as `music_score`) and call again with \
+                       replace_clip_id. The asset's tempo and bars are written from the score, so \
+                       get_music_structure, fit_music and snap_to_beats work at once (no analyze_asset needed). \
+                       Then: fit_music if the piece is the wrong length, set_track_duck plus set_master_duck to dip \
+                       it under dialogue, and get_levels and get_band_balance to check it. \
+                       The first call downloads the SoundFont (~32 MB). A piece renders in seconds to about a \
+                       minute: send a `progressToken` for progress (stages download_soundfont, waiting, render) and \
+                       cancel the request to stop it, or pass `background: true` for a job_id. Before anything \
+                       renders, the score, the track, the replaced clip and the align target are checked, and so \
+                       is (under the ripple in force) whether the music would land on another clip of its track; \
+                       if the cut changes while it renders, placing it is checked again and a refusal stores \
+                       nothing. Returns {asset, clip, score, align, replaced: [clip ids]}."
     )]
     async fn compose_music(
         &self,
@@ -6409,7 +6430,41 @@ fn server_identity() -> Implementation {
 
 /// What the server tells a client about itself and how to work (the MCP
 /// `instructions`): the workflow an agent cannot infer from the tool list.
-const INSTRUCTIONS: &str = "Kerf MCP server. The user queues editing tasks in the desktop app; \
+/// Sent at `initialize`. Clients cut server instructions short (Claude Code at 4096 characters),
+/// so this stays a short routing note and the whole workflow is `EDITING_GUIDE`.
+const INSTRUCTIONS: &str = "Kerf is the video editor open on this computer, and the user watches what you do \
+             in its window. Use these tools for any video or audio work (cutting, titles, captions, \
+             music, voiceover, reframing, export) instead of running ffmpeg or writing scripts: an edit \
+             made here lands in the user's timeline, stays editable, is reviewed by them, and nothing is \
+             re-encoded until export. Call get_editing_guide once before your first edit: it explains \
+             how the tools fit together (ripple mode, linked picture and sound, captions, titles and \
+             templates, music, voiceover, delivery formats, loudness, jobs) and what a refusal means. \
+             The loop: claim_next_task takes the user's oldest queued task (list_tasks shows the queue). \
+             See what is there with list_assets / get_timeline_state (import_asset adds a file by its \
+             absolute path) and analyze_asset (silence, scenes, transcript, loudness, beats). When the \
+             user says \"this clip\", \"here\" or \"the selection\", get_editor_context says what they \
+             have selected and where the playhead and marks are. Look at the footage with skim_asset \
+             (a contact sheet), get_frame and preview_timeline (the cut you have built) before and after \
+             you edit. Cut with split / trim / move_clip / remove / ripple_delete, then polish with \
+             set_volume, set_fade, set_transition, set_transform, set_color, add_overlay and \
+             generate_captions (caption last, once the cut is settled). Before you call a cut done, run \
+             platform_check, and get_levels for anything going to social; export renders it to an \
+             absolute path. \
+             Your edits are STAGED: they go into a proposal the user accepts or dismisses in Kerf, and \
+             your reads (get_timeline_state, preview_timeline, timeline_summary) show the proposal; \
+             staged_diff shows what you are handing over. Finish a task with complete_task (or \
+             fail_task) and tell the user the proposal is ready: while review is on you cannot apply it \
+             yourself. \
+             A LOCKED track (`locked` in get_timeline_state) is the user's: nothing on it is moved, \
+             trimmed, split, removed or added to, and the call fails with `track V1 is locked`. You may \
+             lock a track but not unlock one, so ask the user; a clip added without a track goes to the \
+             first unlocked one. \
+             Long tools (analyze_asset, export, compose_music, generate_voiceover, smart_crop, ...) take \
+             `background: true` and answer a job_id at once; follow it with job_status or subscribe to \
+             kerf://jobs/{job_id}.";
+
+/// What `get_editing_guide` answers: the workflow across every tool.
+const EDITING_GUIDE: &str = "How to edit with Kerf. The user queues editing tasks in the desktop app; \
              call claim_next_task to take the oldest one (or list_tasks to see \
              the whole queue). To work a task, inspect loaded media with \
              list_assets / get_asset_metadata / get_timeline_state (import_asset \
@@ -7968,6 +8023,17 @@ mod tests {
         assert_eq!(span["format"], "9:16");
     }
 
+    /// Claude Code shows a server's instructions up to 4096 characters and drops the rest.
+    #[test]
+    fn the_server_instructions_fit_a_client_cap_and_route_editing_here() {
+        let text = super::INSTRUCTIONS;
+        assert!(text.len() <= 3500, "{} characters", text.len());
+        for needle in ["instead of running ffmpeg", "get_editing_guide", "STAGED", "complete_task"] {
+            assert!(text.contains(needle), "{needle}: {text}");
+        }
+        assert!(router().list_all().iter().any(|t| t.name == "get_editing_guide"));
+    }
+
     #[test]
     fn the_server_instructions_point_at_the_editor_context() {
         let text = super::INSTRUCTIONS;
@@ -8136,16 +8202,17 @@ mod tests {
     }
 
     #[test]
-    fn the_server_instructions_send_a_social_cut_through_get_levels() {
-        let text = super::INSTRUCTIONS;
+    fn the_editing_guide_send_a_social_cut_through_get_levels() {
+        let text = super::EDITING_GUIDE;
         assert!(text.contains("get_levels"), "{text}");
         assert!(text.contains("-14 LUFS") && text.contains("loudnorm"), "{text}");
         assert!(text.contains("set_master_limiter"), "{text}");
     }
 
-    /// An agent that has never seen the GUI writes the score from the tool's description alone, so
-    /// the description has to carry every style, every section kind, the chord syntax (names and
-    /// roman numerals), the hits and how to align or recompose.
+    /// An agent that has never seen the GUI writes the score from the tool alone, so its description
+    /// and schema have to carry every style, every section kind, the chord syntax (names and roman
+    /// numerals), the hits and how to align or recompose. The description stays short: a client
+    /// shows it up front, and the schema only once the tool is loaded.
     #[test]
     fn compose_music_describes_the_score_and_the_music_tools_are_on_the_surface() {
         let tools = router().list_all();
@@ -8157,12 +8224,14 @@ mod tests {
         };
         let text = |name: &str| tool(name).description.as_deref().unwrap_or_default().to_string();
         let compose = text("compose_music");
+        assert!(
+            compose.len() <= 3000,
+            "compose_music's description is {} characters",
+            compose.len()
+        );
+        let compose = compose + &serde_json::to_string(&tool("compose_music").input_schema).unwrap();
         for style in kerf_core::MusicStyle::ALL {
-            assert!(
-                compose.contains(style.name()),
-                "the description names the style {}",
-                style.name()
-            );
+            assert!(compose.contains(style.name()), "the tool names the style {}", style.name());
         }
         for needle in [
             "intro",
@@ -8196,7 +8265,7 @@ mod tests {
             "256 hits",
             "misspelled",
         ] {
-            assert!(compose.contains(needle), "the description should mention {needle}");
+            assert!(compose.contains(needle), "the tool should mention {needle}");
         }
 
         let schema = &tool("compose_music").input_schema;
@@ -8306,8 +8375,8 @@ mod tests {
 
     /// A music request routes compose (aligned to the cuts) → fit → duck → measure.
     #[test]
-    fn the_server_instructions_route_a_music_request_through_compose_music() {
-        let text = super::INSTRUCTIONS;
+    fn the_editing_guide_route_a_music_request_through_compose_music() {
+        let text = super::EDITING_GUIDE;
         let at = |needle: &str| {
             text.find(needle)
                 .unwrap_or_else(|| panic!("the instructions should mention {needle}"))
@@ -8410,8 +8479,8 @@ mod tests {
     }
 
     #[test]
-    fn the_server_instructions_describe_the_svg_subset() {
-        let text = super::INSTRUCTIONS;
+    fn the_editing_guide_describe_the_svg_subset() {
+        let text = super::EDITING_GUIDE;
         for needle in [
             "add_svg_overlay",
             "list_svg_presets",
@@ -8448,8 +8517,8 @@ mod tests {
     }
 
     #[test]
-    fn the_server_instructions_send_a_reusable_title_through_a_template() {
-        let text = super::INSTRUCTIONS;
+    fn the_editing_guide_send_a_reusable_title_through_a_template() {
+        let text = super::EDITING_GUIDE;
         let at = |needle: &str| text.find(needle).unwrap_or_else(|| panic!("`{needle}` in the instructions"));
         assert!(
             at("preview_timeline at a few moments between its start") < at("To reuse a title")
@@ -9190,8 +9259,8 @@ mod tests {
     }
 
     #[test]
-    fn the_server_instructions_cover_review_jobs_paging_and_proxies() {
-        let text = super::INSTRUCTIONS;
+    fn the_editing_guide_cover_review_jobs_paging_and_proxies() {
+        let text = super::EDITING_GUIDE;
         for needle in [
             "STAGED",
             "agent_review",

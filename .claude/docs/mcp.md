@@ -6,6 +6,14 @@ into an `axum` router) at `/mcp`, on `127.0.0.1:7777` by default. The server's w
 tools are in `mcp.rs` and four submodules (`jobs.rs`, `reads.rs`, `project_tools.rs`, and `server.rs` itself), each
 with its own `#[tool_router(router = …)]` impl — `router()` adds them together once.
 
+**Instructions and the guide.** Clients cut server `instructions` short (Claude Code shows 4096 characters) and load
+deferred tools only when the model searches for them, so `INSTRUCTIONS` is a short routing note (≤ 3500 characters,
+pinned by a test): use Kerf instead of ffmpeg, the core loop, staging, locks, and "call `get_editing_guide` first". The
+whole cross-tool workflow is `EDITING_GUIDE`, which `get_editing_guide` returns; the tests that pin a workflow paragraph
+read that. Keep a tool's description short too (the up-front cap applies to it) and put the reference for its
+arguments in their `schemars` docs, as `compose_music` does for `score` and `align`. Where this file says "the
+`instructions`" for a workflow, read the guide.
+
 **Connecting and auth** (`mcp/server.rs`, settings `mcp_enabled` / `mcp_addr` / `mcp_require_token` / `mcp_token`,
 `mcp_commands.rs` for the GUI). Every request needs `Authorization: Bearer <token>` (`mcp_require_token`, on by default;
 the token is 32 random bytes in hex, made on the first start and kept in the settings file, compared in constant time by an
@@ -371,14 +379,14 @@ least half a bar in (a test pins the words). `music_status` is its read side (So
 compositions in flight, the styles). `get_band_balance { asset_id? | clip_id? | range?, sections? }` is
 `get_levels`' shape (read-only, resolve under `lock_agent_as`, decode with the lock released, `context.ct` and a
 replaced project stop it): exactly one target is checked by the core (`invalid_params` otherwise), and the answer is the
-core `BandBalance` (windows, `overall`, `windows_from`, `notes`). The descriptions carry everything a model needs to
+core `BandBalance` (windows, `overall`, `windows_from`, `notes`). The description and the `score` / `align` schema docs carry everything a model needs to
 write a score — styles, section kinds and what each does to the arrangement, chord names and roman numerals, the hit
-kinds in **music** seconds, align's rules, recomposing — and a test pins that they do. The `instructions` route a music
+kinds in **music** seconds, align's rules, recomposing — and a test pins that they do. The guide routes a music
 request compose_music (align to the cuts) → fit_music → duck → get_levels / get_band_balance.
 `set_master_volume` / `set_master_limiter` / `set_master_true_peak` are staged edits like any other;
 `get_levels` (`range?`, `loudnorm?`) measures the working timeline (the proposal) and takes
-`context.ct` as its cancel, and the server `instructions` — now a `const INSTRUCTIONS`, so a
-test can pin them — send a social cut through it (-14 LUFS, true peak under -1 dBTP, fix with
+`context.ct` as its cancel, and the guide (`EDITING_GUIDE`, pinned by a
+test) sends a social cut through it (-14 LUFS, true peak under -1 dBTP, fix with
 the master tools or `loudnorm`). `set_master_limiter` names the ceiling the engine really
 defaults to (a test ties its text to `MASTER_DEFAULT_CEILING_DB`) and says that a true peak still
 over -1 dBTP with the limiter on is fixed by `set_master_true_peak` or a lower ceiling, not by
@@ -593,7 +601,7 @@ Every tool, by purpose (a test pins that this list names each registered tool, a
   `refine_transcript`, `get_analysis_detail`,
   `transcription_status`, `download_speech_model`, `set_speech_model`, `proxy_status`, `rebuild_proxy`, `delete_proxy`,
   `get_music_structure`.
-- **Looking and measuring**: `timeline_summary`, `get_timeline_state`, `get_editor_context`, `get_scopes`, `skim_asset`, `get_frame`, `preview_timeline`,
+- **Looking and measuring**: `get_editing_guide`, `timeline_summary`, `get_timeline_state`, `get_editor_context`, `get_scopes`, `skim_asset`, `get_frame`, `preview_timeline`,
   `get_waveform`, `get_waveform_range`, `get_energy`, `get_levels`, `get_band_balance`, `platform_check`.
 - **Editing the cut**: `cut_clip`, `add_clip_to_timeline`, `split_at`, `trim`, `reorder`, `move_clip`, `move_clips`,
   `ripple_delete`, `cut_clip_range`, `roll_edit`, `slip_clip`, `slide_clip`, `split_remove`, `split_remove_clips`, `remove`,

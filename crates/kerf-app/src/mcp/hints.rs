@@ -65,6 +65,7 @@ pub(super) const TOOLS: &[(&str, &str, Effect)] = &[
     ("delete_proxy", "Delete proxy", Erase),
     ("get_timeline_state", "Timeline state", Read),
     ("get_editor_context", "Editor context", Read),
+    ("get_editing_guide", "Editing guide", Read),
     ("transcription_status", "Transcription status", Read),
     ("download_speech_model", "Download speech model", Fetch),
     ("analyze_asset", "Analyze asset", Fetch),
