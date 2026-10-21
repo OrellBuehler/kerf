@@ -521,3 +521,16 @@ fn a_1080p_frame_is_ffmpegs_to_the_level() {
         assert_eq!(d.max, [0; 3], "{}: {:?}", case.name, d.differing);
     }
 }
+
+/// This FFmpeg converts to and from RGB as the model does, which is what lets the compositor draw a grade at all:
+/// the probe runs the grade's two routes over noise and compares them with the reference.
+#[test]
+#[ignore = "needs ffmpeg"]
+fn this_ffmpeg_converts_as_the_model_does() {
+    assert_eq!(
+        kerf_gpu::grade::kernels(),
+        kerf_gpu::grade::Kernels::Match,
+        "{}",
+        kerf_core::ffmpeg_path()
+    );
+}

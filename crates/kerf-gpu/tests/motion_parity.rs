@@ -4794,4 +4794,28 @@ fn what_the_compositor_does_not_draw_of_a_grade_is_refused() {
     let bt2020 = probed(&p);
     let (tl, a) = one(&bt2020, &|_| {});
     refused("grade/bt2020", &tl, &a, &at, frames, "colour matrix");
+
+    // A machine whose FFmpeg does not convert as the model does (another CPU's kernels) is not drawn for, though
+    // the plan allows the layer: the render refuses it, and the frame is FFmpeg's.
+    let (tl, a) = one(&m.testsrc, &|_| {});
+    let planner = Planner::new(&tl, &a, &at, PlanRequest::motion(policy())).expect("planner");
+    let plan = planner.at_frame(3).expect("plan");
+    let size = plan.size(u32::MAX);
+    assert!(plan.reasons(&compositor().caps(), size).is_empty());
+    let picture = kerf_gpu::decode_layers(&plan.layers).expect("decode");
+    for kernels in [kerf_gpu::grade::Kernels::Differs("a test"), kerf_gpu::grade::Kernels::Unknown] {
+        let unmatched = Compositor::new(gpu()).expect("a compositor").with_grade_kernels(kernels);
+        let err = unmatched
+            .composite_yuv(&plan, &picture, size)
+            .expect_err("the render should refuse");
+        assert!(
+            matches!(&err, kerf_gpu::GpuError::Unsupported(why) if why.contains("conversions")),
+            "{kernels:?}: {err}"
+        );
+    }
+    let measured = Compositor::new(gpu())
+        .expect("a compositor")
+        .with_grade_kernels(kerf_gpu::grade::Kernels::Match);
+    measured.composite_yuv(&plan, &picture, size).expect("pinned to match: drawn");
+    eprintln!("grade/kernels                                a machine whose conversions differ is refused at the render");
 }

@@ -824,3 +824,198 @@ fn bench_a_chroma_key() {
     let _ = std::fs::create_dir_all(&out);
     let _ = std::fs::write(out.join("bench-chroma-key.txt"), &report);
 }
+
+/// A graded clip at 1080p (the picture at its own size: a grade is drawn only where nothing scales ahead of it),
+/// against the plain cut: FFmpeg's still and a second of its export, and the compositor's. Same gate. The
+/// compositor's cost is the conversions to RGB and back (five or six passes at the picture's size) plus the
+/// filters; on a software adapter the LUT's interpolation is the dear one (every product pinned, three channels).
+#[test]
+#[ignore = "benchmark: set KERF_BENCH=1; needs ffmpeg and a GPU adapter"]
+fn bench_a_grade() {
+    if std::env::var_os("KERF_BENCH").is_none() {
+        eprintln!("skipped: set KERF_BENCH=1 to run the benchmark");
+        return;
+    }
+    use kerf_core::color_lut::Lut3d;
+    use kerf_core::{ClipLut, Container, CurvePoint, Curves, Grade, RateControl, Wheel, Wheels};
+    let gpu = Gpu::new(GpuOptions::for_tests()).expect("a GPU adapter");
+    let info = gpu.adapter_info().clone();
+    let comp = Compositor::new(gpu).expect("compositor");
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"));
+    let scratch = dir.join(format!("bench-grade-{}.jpg", std::process::id()));
+    let asset = playback_source(dir, 1920, 1080, 2);
+    let assets = std::slice::from_ref(&asset);
+    let opts = ExportOptions::default();
+    let policy = kerf_core::composite_color_policy();
+    let cube = {
+        let size = 33usize;
+        let n = (size - 1) as f32;
+        let mut data = Vec::with_capacity(size * size * size);
+        for b in 0..size {
+            for g in 0..size {
+                for r in 0..size {
+                    let (r, g, b) = (r as f32 / n, g as f32 / n, b as f32 / n);
+                    data.push([
+                        0.92 * r + 0.08 * g * b + 0.03,
+                        0.05 * r * r + 0.9 * g + 0.04 * b,
+                        (0.1 + 0.8 * b + 0.15 * r * g).min(1.0),
+                    ]);
+                }
+            }
+        }
+        let path = dir.join(format!("bench-grade-{}.cube", std::process::id()));
+        let table = Lut3d {
+            title: String::new(),
+            size,
+            data,
+        };
+        std::fs::write(&path, table.to_cube(1.0)).unwrap();
+        path.to_string_lossy().into_owned()
+    };
+    let wheels = Wheels {
+        shadows: Wheel {
+            x: 0.4,
+            y: -0.2,
+            lightness: 0.1,
+        },
+        highlights: Wheel {
+            x: 0.1,
+            y: 0.7,
+            lightness: 0.05,
+        },
+        ..Wheels::default()
+    };
+    let curves = Curves {
+        master: vec![
+            CurvePoint { x: 0.0, y: 0.03 },
+            CurvePoint { x: 0.3, y: 0.22 },
+            CurvePoint { x: 0.75, y: 0.84 },
+            CurvePoint { x: 1.0, y: 0.98 },
+        ],
+        ..Curves::default()
+    };
+    let lut = ClipLut {
+        path: cube,
+        intensity: 1.0,
+    };
+    let cases: [(&str, Grade); 5] = [
+        ("plain cut", Grade::default()),
+        (
+            "wheels",
+            Grade {
+                wheels: Some(wheels),
+                ..Grade::default()
+            },
+        ),
+        (
+            "curves",
+            Grade {
+                curves: Some(curves.clone()),
+                ..Grade::default()
+            },
+        ),
+        (
+            "lut 33",
+            Grade {
+                lut: Some(lut.clone()),
+                ..Grade::default()
+            },
+        ),
+        (
+            "all three",
+            Grade {
+                lut: Some(lut),
+                curves: Some(curves),
+                wheels: Some(wheels),
+            },
+        ),
+    ];
+    let both = |v: Vec<Duration>| {
+        let min = v.iter().min().copied().unwrap_or_default();
+        format!("{:>6.0} ({:.0})", ms(min), ms(median(v)))
+    };
+    let mut report = format!(
+        "adapter: {} ({:?}, {:?}); ffmpeg: {}; a 1920x1080 30 fps source, {} graph threads, min of the runs after a warm-up (median in brackets)\n\n{:<12} {:>14} {:>16} {:>19}\n",
+        info.name,
+        info.backend,
+        info.device_type,
+        kerf_core::ffmpeg_path(),
+        kerf_core::cpu_graph_threads(),
+        "still 1080p",
+        "ffmpeg ms",
+        "gpu decode ms",
+        "gpu composite ms"
+    );
+    for (label, grade) in &cases {
+        let mut tl = timeline(&asset, 1);
+        tl.tracks[0].clips[0].grade = grade.clone();
+        tl.tracks[0].clips[0].source_out = 2.0;
+        let plan = RenderPlan::at(&tl, assets, &opts, 1.0, policy).expect("plan");
+        let size = plan.size(u32::MAX);
+        assert!(plan.reasons(&Compositor::CAPS, size).is_empty(), "{label}");
+        kerf_gpu::prepare(&plan);
+        let (mut ff, mut dec, mut comp_t) = (Vec::new(), Vec::new(), Vec::new());
+        for run in 0..8 {
+            let t0 = Instant::now();
+            export_still(&tl, assets, &opts, 1.0, &scratch, ImageFormat::Jpeg, 4).expect("ffmpeg still");
+            let ffmpeg_time = t0.elapsed();
+            let (_, timings) = comp.render_plan(&plan, size).expect("gpu render");
+            if run > 0 {
+                ff.push(ffmpeg_time);
+                dec.push(timings.decode);
+                comp_t.push(timings.composite);
+            }
+        }
+        let line = format!("{:<12} {:>14} {:>16} {:>19}\n", label, both(ff), both(dec), both(comp_t));
+        eprint!("{line}");
+        report.push_str(&line);
+    }
+    report.push_str(&format!(
+        "\n{:<12} {:>26} {:>26}\n",
+        "export 1080p", "ffmpeg ms a frame", "gpu ms a frame (decode + composite)"
+    ));
+    let export_opts = ExportOptions {
+        fps: Some(30.0),
+        container: Container::Mkv,
+        video_codec: Some("libx264".into()),
+        rate_control: RateControl::Lossless,
+        ..ExportOptions::default()
+    };
+    let out = dir.join(format!("bench-grade-{}.mkv", std::process::id()));
+    for (label, grade) in &cases {
+        let mut tl = timeline(&asset, 1);
+        tl.tracks[0].clips[0].grade = grade.clone();
+        tl.tracks[0].clips[0].source_in = 0.5;
+        tl.tracks[0].clips[0].source_out = 1.5;
+        let planner =
+            kerf_core::Planner::new(&tl, assets, &export_opts, kerf_core::PlanRequest::motion(policy)).expect("planner");
+        let size = planner.at_frame(0).expect("plan").size(u32::MAX);
+        let (mut ff, mut gpu_t) = (Vec::new(), Vec::new());
+        for run in 0..4 {
+            let t0 = Instant::now();
+            kerf_core::render_with(&tl, assets, &out, &export_opts).expect("ffmpeg export");
+            let ffmpeg_time = t0.elapsed();
+            let mut motion = kerf_gpu::MotionFrames::new(kerf_gpu::FrameSource::new(kerf_gpu::FrameSourceConfig::default()));
+            let t0 = Instant::now();
+            for k in 0..30 {
+                let plan = planner.at_frame(k).expect("plan");
+                assert!(plan.reasons(&Compositor::CAPS, size).is_empty(), "{label} frame {k}");
+                let frames = motion.frames(&plan).expect("cursor frames");
+                comp.composite_shared(&plan, &frames, size).expect("composite");
+            }
+            let gpu_time = t0.elapsed();
+            if run > 0 {
+                ff.push(ffmpeg_time / 30);
+                gpu_t.push(gpu_time / 30);
+            }
+        }
+        let line = format!("{:<12} {:>26} {:>26}\n", label, both(ff), both(gpu_t));
+        eprint!("{line}");
+        report.push_str(&line);
+    }
+    let _ = std::fs::remove_file(&out);
+    let _ = std::fs::remove_file(&scratch);
+    let out = Path::new(env!("CARGO_TARGET_TMPDIR")).parent().unwrap().join("parity");
+    let _ = std::fs::create_dir_all(&out);
+    let _ = std::fs::write(out.join("bench-grade.txt"), &report);
+}

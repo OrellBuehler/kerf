@@ -323,6 +323,9 @@ pub struct Compositor {
     geq_edge: Option<GeqEdge>,
     /// `chromakey`'s distance terms ([`effects::chroma_key_terms`]), uploaded by the first keyed frame.
     key_terms: OnceLock<wgpu::Buffer>,
+    /// Whether this FFmpeg's conversions to and from RGB are the ones the grade follows, when pinned
+    /// ([`Compositor::with_grade_kernels`]); else measured ([`crate::grade::kernels`]).
+    grade_kernels: Option<crate::grade::Kernels>,
     /// The threads FFmpeg's filter graph slices a frame into, when pinned ([`Compositor::with_graph_threads`]);
     /// else they are the graph's the frame stands in for ([`Compositor::graph_threads_for`]).
     graph_threads: Option<u32>,
@@ -745,13 +748,17 @@ fn extent(w: u32, h: u32) -> wgpu::Extent3d {
     }
 }
 
-/// Do ahead of a frame what a plan needs measured and what takes a while: today FFmpeg's `geq`, for a
-/// plan with a mask or a keyed opacity (the export's `geq`; one short child process, once per process).
+/// Do ahead of a frame what a plan needs measured and what takes a while: FFmpeg's `geq`, for a
+/// plan with a mask or a keyed opacity (the export's `geq`), and its conversions to and from RGB, for a plan with a
+/// grade ([`crate::grade::kernels`]; each one short child process, once per process).
 /// Call it from a blocking thread **off the render lock**, with the plan in hand, so the first such
 /// frame does not pay for it under the lock; a compositor pinned with [`Compositor::with_geq_edge`] needs none of it.
 pub fn prepare(plan: &RenderPlan) {
     if plan.layers.iter().any(|l| l.mask.is_some() || l.keyed_alpha.is_some()) {
         let _ = kerf_core::geq_edge();
+    }
+    if plan.layers.iter().any(|l| !l.grade.is_identity()) {
+        let _ = crate::grade::kernels();
     }
 }
 
@@ -804,6 +811,15 @@ impl Compositor {
     #[must_use]
     pub fn with_geq_edge(mut self, edge: GeqEdge) -> Self {
         self.geq_edge = Some(edge);
+        self
+    }
+
+    /// Pin whether this FFmpeg converts to and from RGB as the grade's model does, instead of measuring the ffmpeg
+    /// this process runs ([`crate::grade::kernels`], one child process, on the first graded frame unless [`prepare`]
+    /// ran ahead of it): for a host that knows its ffmpeg, and for tests.
+    #[must_use]
+    pub fn with_grade_kernels(mut self, kernels: crate::grade::Kernels) -> Self {
+        self.grade_kernels = Some(kernels);
         self
     }
 
@@ -1084,6 +1100,7 @@ impl Compositor {
                 masks: MaskCache::default(),
                 vignettes: VignetteMaps::default(),
                 geq_edge: None,
+                grade_kernels: None,
                 key_terms: OnceLock::new(),
                 graph_threads: None,
             })

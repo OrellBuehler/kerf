@@ -156,6 +156,18 @@ impl Compositor {
             return Ok(None);
         }
         let unsupported = |what: &str| GpuError::Unsupported(format!("layer {}: a grade {what}", layer.name));
+        // The conversions are the model's only where this FFmpeg's kernels are the x86 ones it follows.
+        match self.grade_kernels.unwrap_or_else(crate::grade::kernels) {
+            crate::grade::Kernels::Match => {}
+            crate::grade::Kernels::Differs(why) => {
+                return Err(unsupported(&format!(
+                    "because this FFmpeg's conversions are not the ones the compositor follows ({why})"
+                )))
+            }
+            crate::grade::Kernels::Unknown => {
+                return Err(unsupported("until this FFmpeg's conversions to and from RGB can be measured"))
+            }
+        }
         if layer.stream.pix_fmt.as_deref() != Some("yuv420p") {
             return Err(unsupported("on a picture that is not 8-bit 4:2:0 yuv420p"));
         }

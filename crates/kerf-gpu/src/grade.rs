@@ -415,6 +415,133 @@ pub fn reference(stages: &GradeStages, planes: [&[u8]; 3], w: usize, h: usize) -
     }
 }
 
+// ---- does this FFmpeg convert as the model does? ----------------------------------------------------
+
+/// Whether this FFmpeg's conversions to and from RGB are the ones this module follows. They are SIMD kernels
+/// (`yuv_2_rgb.asm` and `yuv2yuvX.asm` on x86), and another CPU's FFmpeg runs other kernels (NEON, plain C), which agree
+/// with these to a level or two and not to the level: the grade is drawn exactly or not at all, so it is
+/// measured, once per process, on the very conversions the grade's chain makes (like [`kerf_core::geq_edge`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kernels {
+    /// A picture of noise through the untagged and the tagged route came back as the reference computes it.
+    Match,
+    /// It did not: the route that differs.
+    Differs(&'static str),
+    /// Not measured: FFmpeg would not run or timed out, and is asked again after a backoff.
+    Unknown,
+}
+
+/// The probe picture's size.
+const PROBE: (usize, usize) = (48, 32);
+const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+
+struct KernelState {
+    measured: Option<Kernels>,
+    failures: u32,
+    retry_at: Option<std::time::Instant>,
+}
+
+/// Whether this FFmpeg converts as the model does ([`Kernels`]). The first call runs one short `ffmpeg`
+/// (tens of milliseconds, bounded by 20 s) with no lock held: a blocking thread's, ahead of the frame that needs it
+/// ([`crate::prepare`]). [`Kernels::Unknown`] is not remembered.
+pub fn kernels() -> Kernels {
+    static STATE: std::sync::Mutex<KernelState> = std::sync::Mutex::new(KernelState {
+        measured: None,
+        failures: 0,
+        retry_at: None,
+    });
+    let now = std::time::Instant::now();
+    {
+        let s = STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(k) = s.measured {
+            return k;
+        }
+        if s.retry_at.is_some_and(|t| now < t) {
+            return Kernels::Unknown;
+        }
+    }
+    let measured = measure();
+    let mut s = STATE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(k) = s.measured {
+        return k;
+    }
+    match measured {
+        Some(k) => {
+            if let Kernels::Differs(why) = k {
+                tracing::warn!(why, "this FFmpeg's conversions to and from RGB are not the ones the GPU's grade follows; graded layers are drawn by FFmpeg");
+            }
+            s.measured = Some(k);
+            k
+        }
+        None if s.retry_at.is_some_and(|t| t > now) => Kernels::Unknown,
+        None => {
+            s.failures += 1;
+            let wait = std::time::Duration::from_secs((5u64 << s.failures.saturating_sub(1).min(6)).min(300));
+            s.retry_at = Some(std::time::Instant::now() + wait);
+            tracing::warn!(
+                failures = s.failures,
+                retry_in_secs = wait.as_secs(),
+                "could not measure FFmpeg's conversions to and from RGB; graded layers are not drawn on the GPU until it can"
+            );
+            Kernels::Unknown
+        }
+    }
+}
+
+/// The probe's filter graph: a picture of noise, and the same through the grade's two routes with an identity
+/// `lutrgb` (which is what puts the picture through RGB), stacked in one frame.
+fn probe_graph() -> String {
+    let (w, h) = PROBE;
+    format!(
+        "nullsrc=s={w}x{h}:r=1:d=1,format=yuv420p,geq=lum='random(1)*255':cb='random(2)*255':cr='random(3)*255',split=3[a][b][c];\
+         [b]lutrgb=r=val,format=yuv420p[g];\
+         [c]setparams=colorspace=bt709,lutrgb=r=val,scale=out_color_matrix=bt709,format=yuv444p|yuv444p10le|yuv444p12le|yuv444p16le,setparams=colorspace=bt709,format=yuv420p[t];\
+         [a][g][t]vstack=inputs=3"
+    )
+}
+
+fn measure() -> Option<Kernels> {
+    let mut cmd = kerf_core::ffmpeg_command();
+    cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-f", "lavfi", "-i"]);
+    cmd.arg(probe_graph());
+    cmd.args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "yuv420p", "pipe:1"]);
+    let out = crate::source::run_child(cmd, 3 * PROBE.0 * PROBE.1 * 3 / 2 + 1, PROBE_TIMEOUT).ok()?;
+    classify(&out)
+}
+
+/// The answer in a stacked probe frame: `None` when it is not the size it should be.
+fn classify(frame: &[u8]) -> Option<Kernels> {
+    let (w, h) = PROBE;
+    let (cw, ch) = (w / 2, h / 2);
+    if frame.len() != 3 * (w * h + 2 * cw * ch) {
+        return None;
+    }
+    // Planes of a vertical stack: luma of the three pictures, then their U, then their V.
+    let (y, rest) = frame.split_at(3 * w * h);
+    let (u, v) = rest.split_at(3 * cw * ch);
+    let picture = |n: usize| -> [&[u8]; 3] {
+        [
+            &y[n * w * h..(n + 1) * w * h],
+            &u[n * cw * ch..(n + 1) * cw * ch],
+            &v[n * cw * ch..(n + 1) * cw * ch],
+        ]
+    };
+    let source = picture(0);
+    let untagged = rgb_to_yuv420(&yuv420_to_rgb(source, w, h, YuvMatrix::Bt601), w, h, YuvMatrix::Bt601);
+    if picture(1) != [&untagged[0][..], &untagged[1][..], &untagged[2][..]] {
+        return Some(Kernels::Differs(
+            "the conversion to RGB and back to 4:2:0 of an untagged picture",
+        ));
+    }
+    let tagged = rgb_to_yuv420_via_444(&yuv420_to_rgb(source, w, h, YuvMatrix::Bt709), w, h, YuvMatrix::Bt709);
+    if picture(2) != [&tagged[0][..], &tagged[1][..], &tagged[2][..]] {
+        return Some(Kernels::Differs(
+            "the conversion to RGB and back through 4:4:4 of a tagged picture",
+        ));
+    }
+    Some(Kernels::Match)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -525,6 +652,43 @@ mod tests {
         assert_eq!((y.len(), u.len(), v.len()), (w * h, w * h / 4, w * h / 4));
         let [_, u444, _] = rgb_to_yuv420_via_444(&rgb, w, h, YuvMatrix::Bt709);
         assert_eq!(u444.len(), w * h / 4);
+    }
+
+    #[test]
+    fn a_probe_frame_that_is_the_reference_is_a_match_and_one_sample_off_is_not() {
+        let (w, h) = PROBE;
+        let mut state = 7u32;
+        let mut noise = |n: usize| -> Vec<u8> {
+            (0..n)
+                .map(|_| {
+                    state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                    (state >> 24) as u8
+                })
+                .collect()
+        };
+        let (y, u, v) = (noise(w * h), noise(w * h / 4), noise(w * h / 4));
+        let untagged = rgb_to_yuv420(&yuv420_to_rgb([&y, &u, &v], w, h, YuvMatrix::Bt601), w, h, YuvMatrix::Bt601);
+        let tagged = rgb_to_yuv420_via_444(&yuv420_to_rgb([&y, &u, &v], w, h, YuvMatrix::Bt709), w, h, YuvMatrix::Bt709);
+        let stack = |a: &[Vec<u8>; 3], b: &[Vec<u8>; 3]| -> Vec<u8> {
+            let mut out = Vec::new();
+            for plane in 0..3 {
+                let source = [&y, &u, &v][plane];
+                out.extend_from_slice(source);
+                out.extend_from_slice(&a[plane]);
+                out.extend_from_slice(&b[plane]);
+            }
+            out
+        };
+        let frame = stack(&untagged, &tagged);
+        assert_eq!(classify(&frame), Some(Kernels::Match));
+        assert_eq!(classify(&frame[1..]), None);
+        let mut off = frame.clone();
+        off[w * h + 5] ^= 1;
+        assert!(matches!(classify(&off), Some(Kernels::Differs(why)) if why.contains("untagged")));
+        let mut off = frame;
+        let last = off.len() - 1;
+        off[last] ^= 1;
+        assert!(matches!(classify(&off), Some(Kernels::Differs(why)) if why.contains("tagged")));
     }
 
     #[test]
