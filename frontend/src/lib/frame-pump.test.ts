@@ -32,6 +32,7 @@ export function harness(env) {
 	let trimMonitor = $state(false);
 	let titles = $state.raw([]);
 	let covered = $state(false);
+	let hasClips = $state(true);
 	let width = $state(env.width === undefined ? 960 : env.width);
 	let playback = $state.raw(null);
 	let draft = $state.raw(null);
@@ -60,7 +61,7 @@ export function harness(env) {
 		routeVia: () => routeVia,
 		routeOverlays: () => routeOverlays,
 		boundsEpoch: () => boundsEpoch,
-		hasClips: () => true,
+		hasClips: () => hasClips,
 		streaming: () => streaming,
 		width: () => width,
 		timelineFrame: env.timelineFrame,
@@ -93,6 +94,7 @@ export function harness(env) {
 		set trim(v) { trimMonitor = v; },
 		set titles(v) { titles = v; },
 		set covered(v) { covered = v; },
+		set hasClips(v) { hasClips = v; },
 		set width(v) { width = v; },
 		set status(v) { status = v; },
 		set playback(v) { playback = v; },
@@ -128,6 +130,8 @@ interface Env {
 interface Harness {
 	frames: {
 		frameUrl: string | null;
+		frameSeq: number;
+		frameCovers: boolean;
 		gpuShown: boolean;
 		drawnDraft: PreviewDraft | null;
 		imgAspect: number | null;
@@ -145,6 +149,7 @@ interface Harness {
 	trim: boolean;
 	titles: unknown[];
 	covered: boolean;
+	hasClips: boolean;
 	width: number | null;
 	status: unknown;
 	playback: GpuPlayback | null;
@@ -665,6 +670,95 @@ describe('the playback stream through the pane\u2019s one <img>', () => {
 		await settle();
 		expect(h.frames.frameUrl).toBe('data:jpeg-4');
 		expect(h.frames.streamShown).toBe(false);
+		h.stop();
+	});
+});
+
+describe('the pictures handed to the two stacked <img>s', () => {
+	test('every frame is a new one for the Preview, an identical URL included, and says whether it replaced the surface', async () => {
+		const r = recorder({ gpu: async () => ({ renderer: 'gpu', frame: null, reasons: [], timings: { width: 1920, height: 1080, decode_ms: 1, composite_ms: 1, present_ms: 1 } }) });
+		const h = harness({ enabled: true, ...r });
+		await settle();
+		expect(h.frames.gpuShown).toBe(true);
+		const seq = h.frames.frameSeq;
+		h.streaming = true;
+		h.frames.showStreamed('data:same');
+		expect(h.frames.frameCovers).toBe(true);
+		expect(h.frames.frameSeq).toBe(seq + 1);
+		h.frames.showStreamed('data:same');
+		expect(h.frames.frameCovers).toBe(false);
+		expect(h.frames.frameSeq).toBe(seq + 2);
+		h.stop();
+	});
+
+	test('a cut with nothing on it clears the picture, once', async () => {
+		const r = recorder();
+		const h = harness({ enabled: false, ...r });
+		await settle();
+		expect(h.frames.frameUrl).toBe('data:jpeg-0');
+		h.hasClips = false;
+		await settle();
+		expect(h.frames.frameUrl).toBeNull();
+		const seq = h.frames.frameSeq;
+		h.time = 2;
+		h.time = 3;
+		await settle();
+		expect(h.frames.frameSeq).toBe(seq);
+		h.hasClips = true;
+		await settle();
+		expect(h.frames.frameUrl).toBe('data:jpeg-3');
+		h.stop();
+	});
+
+	test('a still that takes the pane from the stream\u2019s canvas covers it', async () => {
+		const r = recorder();
+		const h = harness({ enabled: false, ...r });
+		await settle();
+		expect(h.frames.frameCovers).toBe(false);
+		h.streaming = true;
+		h.frames.streamDrawn(1.5);
+		h.time = 4;
+		h.streaming = false;
+		await settle();
+		expect(h.frames.frameUrl).toBe('data:jpeg-4');
+		expect(h.frames.frameCovers).toBe(true);
+		h.stop();
+	});
+
+	test('a still fetched over the GPU\u2019s picture says so too', async () => {
+		const r = recorder({ gpu: async (t) => (t === 0 ? { renderer: 'gpu', frame: null, reasons: [], timings: null } : { renderer: 'ffmpeg', frame: `data:ffmpeg-${t}`, reasons: ['a title'], timings: null }) });
+		const h = harness({ enabled: true, ...r });
+		await settle();
+		expect(h.frames.gpuShown).toBe(true);
+		h.time = 2;
+		await settle();
+		expect(h.frames.frameUrl).toBe('data:ffmpeg-2');
+		expect(h.frames.frameCovers).toBe(true);
+		h.time = 3;
+		await settle();
+		expect(h.frames.frameUrl).toBe('data:ffmpeg-3');
+		expect(h.frames.frameCovers).toBe(false);
+		h.stop();
+	});
+
+	test('a still asked for before the stream started never lands over its frames, even after the play ends', async () => {
+		let release: (url: string) => void = () => {};
+		const r = recorder({ jpeg: (t) => (t === 0 ? Promise.resolve('data:jpeg-0') : new Promise<string>((resolve) => (release = resolve))) });
+		const h = harness({ enabled: false, ...r });
+		await settle();
+		expect(h.frames.frameUrl).toBe('data:jpeg-0');
+		h.time = 3;
+		await settle();
+		h.streaming = true;
+		h.frames.showStreamed('data:streamed');
+		h.streaming = false;
+		release('data:stale-still');
+		await settle();
+		expect(h.frames.frameUrl).toBe('data:streamed');
+		// The settled still asked for after the play is the picture that follows.
+		release('data:jpeg-3');
+		await settle();
+		expect(h.frames.frameUrl).toBe('data:jpeg-3');
 		h.stop();
 	});
 });

@@ -32,6 +32,7 @@
 		surfaceShowing
 	} from '#lib/preview-bounds';
 	import { createFramePump } from '#lib/frame-pump.svelte';
+	import { createPictureBuffer, type Slot } from '#lib/picture-buffer';
 	import { singleFlight } from '#lib/single-flight';
 	import { measuredWidth, transportParts } from '#lib/transport-bar';
 	import { RESIZE_SETTLE_MS, capToSource, dprQuery, requestWidth } from '#lib/preview-size';
@@ -170,6 +171,35 @@
 	});
 	const frameUrl = $derived(frames.frameUrl);
 	const gpuShown = $derived(frames.gpuShown);
+
+	// The JPEG route's picture (a streamed frame, a settled still) goes through two stacked `<img>`s that stay
+	// mounted: the next one is decoded in the slot that is not on show and swapped in once it can be painted
+	// (`picture-buffer.ts`), so a new `src` is never painted undecoded as the black matte, whatever the route
+	// does around it. `pictureSlot` is the one on show; while a picture that replaced the GPU's decodes, the
+	// older one is hidden and the frame is transparent, so the surface under it is what stays.
+	let pictureEls = $state<[HTMLImageElement | null, HTMLImageElement | null]>([null, null]);
+	let pictureSlot = $state<Slot | null>(null);
+	let pictureCovered = $state(false);
+	const pictures = createPictureBuffer({
+		load: async (slot, url) => {
+			const el = pictureEls[slot];
+			if (!el) throw new Error('the picture is not mounted');
+			el.src = url;
+			await el.decode();
+		},
+		show: (slot, covered) => {
+			pictureSlot = slot;
+			pictureCovered = covered;
+			const el = slot === null ? null : pictureEls[slot];
+			if (el?.naturalWidth && el.naturalHeight) frames.pictureAspect(el.naturalWidth / el.naturalHeight);
+		}
+	});
+	$effect(() => {
+		void frames.frameSeq;
+		const url = frames.frameUrl;
+		const over = frames.frameCovers;
+		untrack(() => (url === null ? pictures.reset() : pictures.push(url, over)));
+	});
 	const streamShown = $derived(frames.streamShown);
 	const imgAspect = $derived(frames.imgAspect);
 
@@ -182,7 +212,7 @@
 	//
 	// The stream plays at the cut's own frame rate (`renderedFps`: the cut as it renders, as the
 	// engine reads it) and the width the pane asks for. Its frames are raw JPEG bytes; the ones
-	// the gate lets through become a data URL for the pane's one `<img>` (`frame-transport.ts`: with
+	// the gate lets through become a data URL for the pane's two stacked `<img>`s (`frame-transport.ts`: with
 	// `CANVAS_PAINTER` on, a canvas decoded by `createImageBitmap` instead). A machine that cannot hold
 	// the rate is not played behind the sound: the gate says so and the stream restarts from the
 	// playhead one rung cheaper (`createLadder`, `playback-sync.ts`), halving the rate before it
@@ -1218,7 +1248,7 @@
 				bind:this={frameEl}
 				data-gpu-frame={onSurface ? 'surface' : undefined}
 				data-request-width={frameWidth ?? undefined}
-				style="position:relative;aspect-ratio:{aspect};{frameBox};border-radius:4px;background:{gpuShown ? 'transparent' : 'radial-gradient(120% 120% at 30% 20%, var(--surface-active) 0%, var(--surface-raised) 55%, var(--surface-void) 100%)'};border:var(--line-width) solid var(--border-strong);box-shadow:var(--shadow-md)"
+				style="position:relative;aspect-ratio:{aspect};{frameBox};border-radius:4px;background:{gpuShown || pictureCovered ? 'transparent' : 'radial-gradient(120% 120% at 30% 20%, var(--surface-active) 0%, var(--surface-raised) 55%, var(--surface-void) 100%)'};border:var(--line-width) solid var(--border-strong);box-shadow:var(--shadow-md)"
 			>
 				{#if settings.gpuPreview}
 					<!-- Colour probes: what the backend paints around the picture and behind the page. -->
@@ -1237,18 +1267,21 @@
 						style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:var(--frame-matte);border-radius:3px;display:{streamShown && !gpuShown ? 'block' : 'none'}"
 					></canvas>
 				{/if}
+				<!-- The JPEG route's picture: two stacked images that stay mounted (see `pictures`). One is on show
+				     unless the surface or the canvas is the picture, and the one that is not is decoding the next. -->
+				{#each [0, 1] as const as slot (slot)}
+					<img
+						bind:this={pictureEls[slot]}
+						decoding="async"
+						alt="preview frame"
+						style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:var(--frame-matte);border-radius:3px;visibility:{pictureSlot === slot && !gpuShown && !streamShown ? 'visible' : 'hidden'}"
+					/>
+				{/each}
 				{#if gpuShown}
 					<!-- Drawn by the GPU in the native surface: nothing here covers it. -->
 				{:else if streamShown}
 					<!-- The canvas above is the picture. -->
-				{:else if frameUrl}
-					<img src={frameUrl} decoding="async" alt="preview frame" style="position:absolute;inset:0;width:100%;height:100%;object-fit:contain;background:var(--frame-matte);border-radius:3px"
-						onload={(e) => {
-							const im = e.currentTarget as HTMLImageElement;
-							if (im.naturalWidth && im.naturalHeight) frames.pictureAspect(im.naturalWidth / im.naturalHeight);
-						}}
-					/>
-				{:else}
+				{:else if !frameUrl}
 					<div style="position:absolute;inset:0;background:linear-gradient(115deg, transparent 40%, color-mix(in srgb,var(--kerf-500) 6%,transparent) 60%)"></div>
 					<div style="position:absolute;inset:0;display:grid;place-items:center;color:color-mix(in srgb,var(--text-on-video) 22%,transparent)">
 						<Icon n={ui.playing ? 'pause' : 'play'} s={44} />

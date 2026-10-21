@@ -7,8 +7,8 @@
  * the backend's. What the page does with the bytes is `CANVAS_PAINTER`:
  *
  *  - off (the default): the page builds the data URL itself, for the frames it shows (`jpegDataUrl`:
- *    `Uint8Array.prototype.toBase64` where the webview has it) and hands it to the pane's one `<img
- *    decoding="async">`, the route that always was. The first measurement of the alternative found nothing
+ *    `Uint8Array.prototype.toBase64` where the webview has it) and hands it to the pane's two stacked `<img
+ *    decoding="async">`s (`picture-buffer.ts`: the next is decoded before it is shown), the route that always was. The first measurement of the alternative found nothing
  *    to gain from it in Chromium: its data-URL images are decoded lazily and off the main thread, so the old
  *    path's `JSON.parse` and `img.src =` cost 0.1-0.3 ms a frame and a decode took 3.5 / 5.9 / 9.3 ms at
  *    960 / 1280 / 1920 px, where `createImageBitmap` + draw took 5.2 / 7.2 / 12.2 ms (headless, software
