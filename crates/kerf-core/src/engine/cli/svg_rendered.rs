@@ -907,6 +907,63 @@ fn a_wiggling_blurred_text_is_the_same_picture_in_every_export_of_it() {
     let _ = std::fs::remove_dir_all(dir);
 }
 
+#[test]
+#[ignore = "drives the real ffmpeg"]
+fn a_sprung_text_grows_past_its_size_and_settles_in_the_export_and_each_frame_is_its_still() {
+    use crate::svg::{curve_preset, Offset, Properties, RangeSelector, Shape, TextAnimation};
+    let dir = scratch("sprung");
+    with_pinned_dir(dir.join("cache").to_str().unwrap(), || {
+        let bg = background(&dir, "30");
+        let assets = [bg.clone()];
+        // Four letters that grow from nothing, each taking a second over a two second animation.
+        let grow = TextAnimation {
+            duration: 2.0,
+            range: RangeSelector {
+                start: 0.0,
+                end: 1.0,
+                offset: Offset { from: -1.0, to: 1.0 },
+                shape: Shape::RampUp,
+            },
+            properties: Properties {
+                scale: 0.0,
+                ..Properties::default()
+            },
+            ..TextAnimation::default()
+        };
+        let sprung = grow.with_motion_curve(curve_preset("spring").unwrap().curve).unwrap();
+        let opts = options(30.0);
+        let straight_cut = cut(&bg, vec![title(typed_title(&grow), 0.0, 3.0)]);
+        let sprung_cut = cut(&bg, vec![title(typed_title(&sprung), 0.0, 3.0)]);
+        let straight = export_rgb(&straight_cut, &assets, &opts, &dir, "straight");
+        let sprung_frames = export_rgb(&sprung_cut, &assets, &opts, &dir, "sprung");
+        assert_eq!(
+            export_rgb(&sprung_cut, &assets, &opts, &dir, "again"),
+            sprung_frames,
+            "the same every time"
+        );
+        let (rest_straight, rest_sprung) = (white(&straight[89]), white(&sprung_frames[89]));
+        assert_eq!(straight[89], sprung_frames[89], "both end as the text is");
+        assert_eq!(white(&straight[0]), 0);
+        let most = |frames: &[Vec<u8>]| frames[..80].iter().map(|f| white(f)).max().unwrap();
+        assert!(
+            (most(&straight) as f64) <= rest_straight as f64 * 1.05,
+            "straight: {} vs {rest_straight}",
+            most(&straight)
+        );
+        assert!(
+            (most(&sprung_frames) as f64) > rest_sprung as f64 * 1.1,
+            "a spring grows past the size it settles at: {} vs {rest_sprung}",
+            most(&sprung_frames)
+        );
+        for k in [8usize, 19, 31, 44, 58] {
+            let still = still_rgb(&sprung_cut, &assets, &opts, k as f64 / 30.0);
+            let worst = distance(&sprung_frames[k], &still);
+            assert!(worst <= 2, "frame {k} is {worst} levels off its still");
+        }
+    });
+    let _ = std::fs::remove_dir_all(dir);
+}
+
 #[allow(clippy::print_stderr)]
 fn eprintln_timing(took: std::time::Duration, frames: u32) {
     eprintln!(

@@ -114,16 +114,16 @@ fn a_legacy_file_is_backed_up_once_then_upgraded() {
 }
 
 /// The columns are there, so their steps change nothing; the file is still copied aside, once,
-/// for v5 to v10 (JSON steps: `needed` always, so an older build's file is kept before it is locked out).
+/// for v5 to v11 (JSON steps: `needed` always, so an older build's file is kept before it is locked out).
 #[test]
 fn a_legacy_file_that_already_has_the_columns_is_backed_up_only_for_the_json_step() {
     let dir = scratch();
     let path = dir.join("cut.kerf");
     edited(1).0.save_as(&path).unwrap();
     make_legacy(&path, true);
-    // Every step that adds a table or a column finds it there; only v5 to v10 (JSON steps) are pending.
+    // Every step that adds a table or a column finds it there; only v5 to v11 (JSON steps) are pending.
     let pending: Vec<u32> = store::pending_steps(&Connection::open(&path).unwrap(), 0);
-    assert_eq!(pending, vec![4, 5, 6, 7, 8, 9], "only the v4 -> v5 to v9 -> v10 steps");
+    assert_eq!(pending, vec![4, 5, 6, 7, 8, 9, 10], "only the v4 -> v5 to v10 -> v11 steps");
     drop(Project::open(&path).unwrap());
     assert_eq!(version_of(&path), SCHEMA_VERSION);
     let mut names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
@@ -251,7 +251,7 @@ fn a_v2_file_is_backed_up_once_then_gets_the_fonts_table() {
     let path = dir.join("cut.kerf");
     edited(2).0.save_as(&path).unwrap();
     make_v2(&path);
-    assert_eq!(SCHEMA_VERSION, 10);
+    assert_eq!(SCHEMA_VERSION, 11);
     assert!(!has_fonts_table(&path));
 
     let project = Project::open(&path).unwrap();
@@ -281,7 +281,7 @@ fn a_v2_file_is_backed_up_once_then_gets_the_fonts_table() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// The fonts table is there, so v3 changes nothing; the one backup is for v5 to v10 (JSON steps).
+/// The fonts table is there, so v3 changes nothing; the one backup is for v5 to v11 (JSON steps).
 #[test]
 fn a_v2_file_that_already_has_the_fonts_table_is_backed_up_only_for_the_json_step() {
     let dir = scratch();
@@ -293,7 +293,7 @@ fn a_v2_file_that_already_has_the_fonts_table_is_backed_up_only_for_the_json_ste
         .unwrap();
     assert_eq!(
         store::pending_steps(&Connection::open(&path).unwrap(), 2),
-        vec![4, 5, 6, 7, 8, 9]
+        vec![4, 5, 6, 7, 8, 9, 10]
     );
     drop(Project::open(&path).unwrap());
     assert_eq!(version_of(&path), SCHEMA_VERSION);
@@ -539,6 +539,22 @@ fn animated_title(project: &Project) -> SvgOverlay {
     }
 }
 
+/// The same with a spring on its movement (v11): `curves` in the animation on its text.
+fn eased_title(project: &Project) -> SvgOverlay {
+    let id = outlined_title(project).id;
+    let rise = crate::svg::text_animation_preset("rise").unwrap().animation;
+    let spring = crate::svg::curve_preset("spring").unwrap().curve;
+    let eased = rise.with_motion_curve(spring).unwrap();
+    match project.set_title_text_animation(id, "tag", Some(eased)).unwrap() {
+        crate::project::TitleEdited::Overlay(done) => {
+            assert!(done.overlay.svg.contains("\"curves\""), "{}", done.overlay.svg);
+            assert!(done.overlay.svg.contains("animateTransform"), "{}", done.overlay.svg);
+            done.overlay
+        }
+        crate::project::TitleEdited::Clip(_) => unreachable!("a floating title"),
+    }
+}
+
 #[test]
 fn a_v8_file_is_backed_up_stamped_v9_and_keeps_its_animated_title() {
     let dir = scratch();
@@ -551,7 +567,7 @@ fn a_v8_file_is_backed_up_stamped_v9_and_keeps_its_animated_title() {
         .unwrap()
         .pragma_update(None, "user_version", 8)
         .unwrap();
-    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 8), vec![8, 9]);
+    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 8), vec![8, 9, 10]);
 
     let project = Project::open(&path).unwrap();
     assert_eq!(version_of(&path), SCHEMA_VERSION);
@@ -577,7 +593,7 @@ fn a_v7_file_is_backed_up_stamped_v8_and_keeps_its_outlined_title() {
         .unwrap()
         .pragma_update(None, "user_version", 7)
         .unwrap();
-    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 7), vec![7, 8, 9]);
+    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 7), vec![7, 8, 9, 10]);
 
     let project = Project::open(&path).unwrap();
     assert_eq!(version_of(&path), SCHEMA_VERSION);
@@ -612,7 +628,10 @@ fn a_v6_file_is_backed_up_stamped_v7_and_keeps_its_keyed_mask_and_crop() {
         .unwrap()
         .pragma_update(None, "user_version", 6)
         .unwrap();
-    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 6), vec![6, 7, 8, 9]);
+    assert_eq!(
+        store::pending_steps(&Connection::open(&path).unwrap(), 6),
+        vec![6, 7, 8, 9, 10]
+    );
 
     let project = Project::open(&path).unwrap();
     assert_eq!(version_of(&path), SCHEMA_VERSION);
@@ -683,7 +702,7 @@ fn a_v9_file_is_backed_up_stamped_v10_and_its_assets_read_as_range_unknown() {
         .unwrap()
         .pragma_update(None, "user_version", 9)
         .unwrap();
-    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 9), vec![9]);
+    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 9), vec![9, 10]);
 
     let project = Project::open(&path).unwrap();
     assert_eq!(version_of(&path), SCHEMA_VERSION);
@@ -699,6 +718,48 @@ fn a_v9_file_is_backed_up_stamped_v10_and_its_assets_read_as_range_unknown() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A title with curves in its animation is kept as it is, and a file stored before v11 has none: an animation with no
+/// curves is written as it always was, so a stored title is byte-identical. The file is copied aside, since an older
+/// build refuses an attribute with a field it does not know and so leaves the text as text.
+#[test]
+fn a_v10_file_is_backed_up_stamped_v11_and_keeps_its_eased_title() {
+    let dir = scratch();
+    let path = dir.join("cut.kerf");
+    let (project, _) = edited(0);
+    let plain = animated_title(&project);
+    let plain_attribute = crate::svg::text_animation_of(&crate::svg::restore_text(&plain.svg).unwrap(), "tag").unwrap();
+    assert!(
+        !plain_attribute.to_attribute().contains("curves"),
+        "an animation with no curves writes none: {}",
+        plain_attribute.to_attribute()
+    );
+    let eased = Project::sample().unwrap();
+    let title = eased_title(&eased);
+    drop(project);
+    eased.save_as(&path).unwrap();
+    drop(eased);
+    Connection::open(&path)
+        .unwrap()
+        .pragma_update(None, "user_version", 10)
+        .unwrap();
+    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 10), vec![10]);
+
+    let project = Project::open(&path).unwrap();
+    assert_eq!(version_of(&path), SCHEMA_VERSION);
+    let kept = project.timeline().unwrap().svg_overlays;
+    assert_eq!(
+        kept.iter().find(|o| o.id == title.id).map(|o| o.svg.as_str()),
+        Some(title.svg.as_str())
+    );
+    drop(project);
+    assert_eq!(
+        version_of(&schema_backup_path(&path, 10)),
+        10,
+        "an older build cannot play the curves, so the file as it was is kept"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// The timelines a file holds, `persisted/timelines-v<N>.json`, frozen at each schema version that moved
 /// the stored shape (the sample's and a few of the golden oracle's). Every one must still read; the newest
 /// must come back as it was stored, so a change to the shape is a decision (a new version, see
@@ -710,6 +771,7 @@ const PERSISTED: &[(u32, &str)] = &[
     (7, include_str!("persisted/timelines-v7.json")),
     (8, include_str!("persisted/timelines-v8.json")),
     (9, include_str!("persisted/timelines-v9.json")),
+    (11, include_str!("persisted/timelines-v11.json")),
 ];
 
 fn persisted_path(version: u32) -> PathBuf {
@@ -739,6 +801,10 @@ fn the_stored_timeline_shape_moves_only_with_the_schema_version() {
         let animated = Project::sample().unwrap();
         animated_title(&animated);
         timelines.push(animated.timeline().unwrap());
+        // The same with curves on the animation (v11).
+        let eased = Project::sample().unwrap();
+        eased_title(&eased);
+        timelines.push(eased.timeline().unwrap());
         let lines: Vec<String> = timelines.iter().map(|t| serde_json::to_string(t).unwrap()).collect();
         std::fs::write(persisted_path(SCHEMA_VERSION), format!("[\n{}\n]\n", lines.join(",\n"))).unwrap();
         return;

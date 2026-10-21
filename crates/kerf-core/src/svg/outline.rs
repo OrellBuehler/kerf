@@ -70,8 +70,9 @@ const MIN_GLYPH_BYTES: usize = 24;
 const MIN_UNIT_BYTES: usize = 40;
 /// Most units (characters, words or lines) of one text an animation is compiled for.
 const MAX_UNITS: usize = 600;
-/// Most amounts a document's animations are sampled at in all (a unit takes a grid of 120 a second, up to 7,201):
-/// 416 units of the longest animation. Sampling a unit and cutting it down to its points takes about 1.5 ms of a
+/// Most amounts a document's animations are sampled at in all (a unit takes a grid of 120 a second, up to 7,201, and
+/// the grid again for each different curve it is passed through, `glyph_smil::unit_work`): 416 units of the longest
+/// animation without a curve. Sampling a unit and cutting it down to its points takes about 1.5 ms of a
 /// release build at 7,201 points (a 30 a second wiggle, the dearest signal to cut down), so a document at the cap
 /// takes about 0.6 s; the title's size cap usually ends it long before.
 const MAX_WORK: usize = 3_000_000;
@@ -1517,7 +1518,7 @@ fn animated_out(cx: &mut Ctx, set: &Set, units: &Units, out: &mut String) -> std
         }
     }
     let rounded = |v: f32| (v * 100.0).round() / 100.0;
-    let cost = members.iter().filter(|m| !m.is_empty()).count() * glyph_smil::grid_points(&units.animation);
+    let cost = members.iter().filter(|m| !m.is_empty()).count() * glyph_smil::unit_work(&units.animation);
     if cost > cx.work {
         return Err("too long or too many units to animate (shorten the animation or animate by word)".into());
     }
@@ -2571,5 +2572,107 @@ three</text>"##,
         // The middle word has not come in while the first has.
         let early = ink(&parsed, 0.35);
         assert_ne!(early, rest);
+    }
+
+    use crate::svg::{curve_preset, Curve, Curves};
+
+    /// The light ink in each frame from `from` to `to` seconds, 120 a second (a spring's first swing lasts a few frames).
+    fn ink_over_time(parsed: &SvgDoc, from: f64, to: f64) -> Vec<usize> {
+        ((from * 120.0) as usize..=(to * 120.0) as usize)
+            .map(|i| lit(&ink(parsed, i as f64 / 120.0), 0..400))
+            .collect()
+    }
+
+    /// Letters that grow from nothing (no fade, so what is drawn is what the scale says) one after another.
+    fn grow() -> TextAnimation {
+        TextAnimation {
+            duration: 1.0,
+            range: crate::svg::RangeSelector {
+                start: 0.0,
+                end: 0.3,
+                offset: crate::svg::Offset { from: -0.3, to: 1.0 },
+                shape: crate::svg::Shape::RampUp,
+            },
+            properties: crate::svg::Properties {
+                scale: 0.0,
+                ..Default::default()
+            },
+            ..TextAnimation::default()
+        }
+    }
+
+    #[test]
+    fn a_spring_is_compiled_like_any_animation_and_carries_the_text_past_its_place() {
+        let linear = animated_with("Hi", &grow());
+        let spring = animated_with(
+            "Hi",
+            &grow().with_motion_curve(curve_preset("spring").unwrap().curve).unwrap(),
+        );
+        let out = outline(&spring);
+        assert_eq!(out.count, 1, "{:?}", out.kept);
+        assert!(out.warnings.is_empty() && out.kept.is_empty(), "{:?}", out.warnings);
+        assert_eq!(
+            restore_text(&out.svg).unwrap(),
+            spring,
+            "the curve is data on the text: restoring keeps it"
+        );
+        let parsed = SvgDoc::parse(&out.svg).unwrap();
+        assert_eq!(parsed.sanitized(), out.svg, "the sanitiser leaves it as it is");
+        assert!(parsed.warnings().is_empty(), "{:?}", parsed.warnings());
+        assert_eq!(outline(&spring).svg, out.svg, "the same bytes the second time");
+        // It ends as the text is, whatever the curve did on the way.
+        let rest = pixels(&SvgDoc::parse(&outline(&at_rest(&spring)).svg).unwrap().at(0.0));
+        assert_eq!(ink(&parsed, parsed.natural_duration().unwrap() + 1.0), rest);
+        // Growing from nothing, the straight letters never have much more ink than the text (anti-aliasing moves the
+        // count a few percent as they scale); the spring grows past its size, which a straight growth never does.
+        let resting = lit(&rest, 0..400) as f64;
+        let most = |frames: Vec<usize>| frames.into_iter().max().unwrap() as f64;
+        let straight = most(ink_over_time(&SvgDoc::parse(&outline(&linear).svg).unwrap(), 0.3, 0.9));
+        let sprung = most(ink_over_time(&parsed, 0.3, 0.9));
+        assert!(straight <= resting * 1.1, "{straight} vs {resting}");
+        assert!(sprung > straight * 1.05, "{sprung} vs {straight}");
+    }
+
+    #[test]
+    fn a_curve_the_attribute_cannot_read_leaves_the_text_as_text() {
+        let src = doc(
+            r#"<text id="t" x="20" y="110" font-family="Geist" font-size="60" data-kerf-animate='{"properties":{"y":0.5},"curves":{"y":{"kind":"spring","bounce":4}}}'>Hi</text>"#,
+        );
+        let out = outline(&src);
+        assert_eq!(out.count, 0);
+        assert!(
+            out.kept[0].contains("does not read") && out.kept[0].contains("bounce"),
+            "{:?}",
+            out.kept
+        );
+        let unknown = src.replace("\"spring\"", "\"wobble\"");
+        assert!(
+            outline(&unknown).kept[0].contains("does not read"),
+            "{:?}",
+            outline(&unknown).kept
+        );
+    }
+
+    #[test]
+    fn a_curve_makes_a_unit_cost_more_to_sample_and_the_work_cap_counts_it() {
+        let mut slow = text_animation_preset("rise").unwrap().animation;
+        slow.delay = 30.0;
+        slow.duration = 30.0;
+        // 200 units of 7,201 amounts is inside the cap straight, and 1.4 million more with a curve on y: 2.9 million
+        // is still inside; a second different curve on opacity takes it over.
+        let text = "iiii lll ".repeat(23);
+        assert_eq!(outline(&animated_with(&text, &slow)).count, 1);
+        let one = slow.with_motion_curve(curve_preset("spring").unwrap().curve).unwrap();
+        assert_eq!(outline(&animated_with(&text, &one)).count, 1);
+        let two = TextAnimation {
+            curves: Curves {
+                opacity: Some(Curve::Spring { bounce: 0.3 }),
+                ..one.curves
+            },
+            ..one
+        };
+        let out = outline(&animated_with(&text, &two));
+        assert_eq!(out.count, 0);
+        assert!(out.kept[0].contains("too long or too many units"), "{:?}", out.kept);
     }
 }

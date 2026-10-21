@@ -14,6 +14,12 @@
 //! long wiggle) ends by the second: it keeps the 96 points that cut its worst errors, never a looser tolerance,
 //! so it still moves, at a lower pace than the noise has.
 //!
+//! **Curves.** A property may have a curve (`curve.rs`): the unit's amount goes through it before it scales the property's
+//! change, so the path between the text as drawn and the property's value is a speed / influence ease or a spring, and may
+//! go past either end (an overshoot). The sample is then held to the bound its property has (`MAX_MOVE`, `MAX_TURN`,
+//! `MAX_SCALE`, `MAX_BLUR`; opacity 0..1), so what SMIL is given is finite and never more than the animation could have
+//! asked for. Without curves nothing in the sampling differs from what it was.
+//!
 //! **What a unit becomes**: a `<g>` that carries the unit's glyph paths and its animation, in this order of
 //! transforms (`additive="sum"`): translate, rotate, scale. Rotation and scale turn about the unit's centre, so
 //! when either is in use the paths are written relative to it and the group starts with
@@ -24,7 +30,10 @@
 
 use std::collections::{BinaryHeap, HashSet};
 
-use super::text_animation::{AnimateBy, Easing, Shape, TextAnimation, Wiggle};
+use super::curve::Curve;
+use super::text_animation::{
+    AnimateBy, Easing, Properties, Shape, TextAnimation, Wiggle, MAX_BLUR, MAX_MOVE, MAX_SCALE, MAX_TURN,
+};
 
 /// The grid a unit's amount is evaluated on, seconds.
 const STEP: f64 = 1.0 / 120.0;
@@ -273,9 +282,45 @@ fn animation(tag: &str, target: &str, values: &[String], key_times: Option<&str>
     out
 }
 
-/// How many points `wrap` evaluates a unit's amount at: what one unit costs, so a document can be held to a budget.
+/// How many points `wrap` evaluates a unit's amount at.
 pub(crate) fn grid_points(a: &TextAnimation) -> usize {
     ((a.end() / STEP).ceil() as usize).clamp(2, MAX_GRID) + 1
+}
+
+/// Which of the six components the animation changes.
+fn active(p: &Properties) -> [bool; N] {
+    [p.moves(), p.moves(), p.turns(), p.scales(), p.fades(), p.blurs()]
+}
+
+/// The curve of each component that is changed (`None`: a straight line).
+fn curves_in_use(a: &TextAnimation) -> [Option<Curve>; N] {
+    let (active, curves) = (active(&a.properties), a.curves.by_channel());
+    std::array::from_fn(|c| curves[c].filter(|_| active[c]))
+}
+
+/// What one unit costs to compile, in amounts evaluated, so a document can be held to a budget: the grid, and again
+/// for each different curve (a spring is an `exp`, a `sin` and a `cos`; a speed curve solves a cubic).
+pub(crate) fn unit_work(a: &TextAnimation) -> usize {
+    let curves = curves_in_use(a);
+    let distinct = (0..N)
+        .filter(|&c| curves[c].is_some() && !(0..c).any(|j| curves[j] == curves[c]))
+        .count();
+    grid_points(a) * (1 + distinct)
+}
+
+/// A unit's amount `m` as each component sees it: through its curve, or as it is. A component that shares a curve
+/// with an earlier one takes that one's answer.
+fn settled(curves: &[Option<Curve>; N], m: f64) -> [f64; N] {
+    let mut out = [m; N];
+    for c in 0..N {
+        if let Some(curve) = &curves[c] {
+            out[c] = match (0..c).find(|&j| curves[j] == curves[c]) {
+                Some(j) => out[j],
+                None => Curve::settle(Some(curve), m),
+            };
+        }
+    }
+    out
 }
 
 /// Whether `unit` of `count` is touched by the animation, and the group (with its filter and animations) that
@@ -285,23 +330,27 @@ pub(crate) fn wrap(a: &TextAnimation, unit: usize, count: usize, geom: &UnitGeom
     let size = f64::from(geom.size);
     let grid = grid_points(a) - 1;
     let p = &a.properties;
-    let active = [p.moves(), p.moves(), p.turns(), p.scales(), p.fades(), p.blurs()];
+    let active = active(p);
+    let curves = curves_in_use(a);
     let tol = [0.004 * size, 0.004 * size, 0.2, 0.004, 0.004, 0.004 * size];
     let mut touched = false;
+    // A curve may carry a value past the one the animation gives it, so each is held to the bound that value has:
+    // what SMIL is given is finite and as large as the animation could have asked for (opacity, as SVG clamps it).
     let samples: Vec<Sample> = (0..=grid)
         .map(|i| {
             let t = end * i as f64 / grid as f64;
             let m = amount_at(a, unit, count, t);
             touched |= m.abs() >= 1e-9;
+            let c = settled(&curves, m);
             Sample {
                 t,
                 v: [
-                    p.x * m * size,
-                    p.y * m * size,
-                    p.rotation * m,
-                    (1.0 + (p.scale - 1.0) * m).max(MIN_SCALE),
-                    (1.0 + (p.opacity - 1.0) * m).clamp(0.0, 1.0),
-                    (p.blur * m).max(0.0) * size,
+                    (p.x * c[0] * size).clamp(-MAX_MOVE * size, MAX_MOVE * size),
+                    (p.y * c[1] * size).clamp(-MAX_MOVE * size, MAX_MOVE * size),
+                    (p.rotation * c[2]).clamp(-MAX_TURN, MAX_TURN),
+                    (1.0 + (p.scale - 1.0) * c[3]).clamp(MIN_SCALE, MAX_SCALE),
+                    (1.0 + (p.opacity - 1.0) * c[4]).clamp(0.0, 1.0),
+                    (p.blur * c[5]).clamp(0.0, MAX_BLUR) * size,
                 ],
             }
         })
@@ -822,6 +871,244 @@ mod tests {
         let fewer = simplify(&samples(&noise), &tol, &active, 24);
         assert_eq!(fewer.len(), 24);
         assert!(fewer.iter().all(|i| noisy.contains(i)));
+    }
+
+    use crate::svg::curve::{curve_preset, Curves};
+
+    fn with_curve(a: &TextAnimation, id: &str) -> TextAnimation {
+        a.with_motion_curve(curve_preset(id).unwrap().curve).unwrap()
+    }
+
+    fn wrapped(a: &TextAnimation, unit: usize, count: usize) -> Wrap {
+        let (taken, next) = ids();
+        let mut src = IdSource { taken: &taken, next };
+        wrap(a, unit, count, &geom(), &mut src).expect("a unit the animation reaches")
+    }
+
+    /// Every number in the `values` attributes of `open`, with the `keyTimes` apart.
+    fn all_values(open: &str) -> Vec<f64> {
+        open.split("values=\"")
+            .skip(1)
+            .flat_map(|rest| {
+                rest.split('"')
+                    .next()
+                    .unwrap()
+                    .split([';', ' '])
+                    .map(|v| v.parse::<f64>().unwrap())
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_curve_reshapes_the_path_between_the_same_two_ends() {
+        let pop = text_animation_preset("pop").unwrap().animation;
+        let (plain, eased) = (wrapped(&pop, 2, 6), wrapped(&with_curve(&pop, "ease_in_out"), 2, 6));
+        assert_ne!(plain.open, eased.open);
+        let (pt, ps) = polyline(&plain.open, "scale");
+        let (et, es) = polyline(&eased.open, "scale");
+        assert_eq!(
+            (ps[0], ps[ps.len() - 1]),
+            (es[0], es[es.len() - 1]),
+            "from nothing to full size"
+        );
+        assert_eq!((pt[0], pt[pt.len() - 1]), (et[0], et[et.len() - 1]));
+        // Both are inside the stretch the unit is moving: the eased path is not where the straight one is.
+        let mid = |t: &[f64], v: &[f64], q: f64| at_time(t, v, q);
+        let (q1, q2) = (0.22, 0.29);
+        assert!(
+            (mid(&et, &es, q1) - mid(&pt, &ps, q1)).abs() + (mid(&et, &es, q2) - mid(&pt, &ps, q2)).abs() > 0.01,
+            "{:?} {:?}",
+            (&pt, &ps),
+            (&et, &es)
+        );
+        // Opacity has no curve (the picker's rule): it is the same path, though it is sampled at the scale's points.
+        let opacity = |w: &Wrap| {
+            let tag = w
+                .open
+                .split("attributeName=\"opacity\"")
+                .nth(1)
+                .unwrap()
+                .split("/>")
+                .next()
+                .unwrap();
+            let attr = |name: &str| tag.split(&format!("{name}=\"")).nth(1).unwrap().split('"').next().unwrap();
+            let times: Vec<f64> = attr("keyTimes").split(';').map(|v| v.parse().unwrap()).collect();
+            let values: Vec<f64> = attr("values").split(';').map(|v| v.parse().unwrap()).collect();
+            (times, values)
+        };
+        let ((t1, v1), (t2, v2)) = (opacity(&plain), opacity(&eased));
+        for i in 0..=40 {
+            let q = f64::from(i) / 40.0;
+            assert!((at_time(&t1, &v1, q) - at_time(&t2, &v2, q)).abs() < 0.01, "opacity at {q}");
+        }
+    }
+
+    #[test]
+    fn a_spring_carries_a_property_past_its_resting_value_and_back() {
+        let pop = text_animation_preset("pop").unwrap().animation;
+        let w = wrapped(&with_curve(&pop, "spring"), 2, 6);
+        let (_, scale) = polyline(&w.open, "scale");
+        assert!(scale.iter().all(|v| v.is_finite() && *v >= MIN_SCALE));
+        let peak = scale.iter().copied().fold(0.0f64, f64::max);
+        assert!(
+            (1.1..1.25).contains(&peak),
+            "a spring of 0.5 overshoots by about a sixth: {peak}"
+        );
+        assert_eq!((scale[0], scale[scale.len() - 1]), (MIN_SCALE, 1.0), "from nothing, at rest");
+        assert!(scale.len() > 6 && scale.len() <= MAX_KEYS, "{}", scale.len());
+        // Rising into place, going past it and settling: more than one change of direction.
+        let turns = scale.windows(3).filter(|w| (w[1] - w[0]) * (w[2] - w[1]) < 0.0).count();
+        assert!(turns >= 2, "{scale:?}");
+    }
+
+    #[test]
+    fn a_curve_cannot_carry_a_value_out_of_the_bounds_its_property_has() {
+        // The widest everything and the wildest curves: every number written is finite, and inside the bounds.
+        let wild = Curve::Speed {
+            out_speed: 5.0,
+            out_influence: 1.0,
+            in_speed: -5.0,
+            in_influence: 1.0,
+        };
+        let a = TextAnimation {
+            duration: 2.0,
+            range: crate::svg::text_animation::RangeSelector {
+                shape: Shape::RampUp,
+                ..typewriter().range
+            },
+            properties: Properties {
+                x: 20.0,
+                y: -20.0,
+                scale: 10.0,
+                rotation: 3600.0,
+                opacity: 0.0,
+                blur: 1.0,
+            },
+            curves: Curves {
+                x: Some(wild),
+                y: Some(wild),
+                scale: Some(wild),
+                rotation: Some(Curve::Spring { bounce: 0.8 }),
+                opacity: Some(Curve::Spring { bounce: 0.8 }),
+                blur: Some(wild),
+            },
+            ..TextAnimation::default()
+        };
+        a.check().unwrap();
+        let mut animated = (0, 0);
+        for unit in 0..5 {
+            let w = wrapped(&a, unit, 5);
+            let size = 40.0;
+            for kind in ["translate", "rotate", "scale"] {
+                let (_, v) = polyline(&w.open, kind);
+                let bound = match kind {
+                    "translate" => 20.0 * size,
+                    "rotate" => 3600.0,
+                    _ => 10.0,
+                };
+                assert!(v.iter().all(|x| x.is_finite() && x.abs() <= bound + 0.01), "{kind}: {v:?}");
+            }
+            let series = |name: &str| {
+                w.open
+                    .split(&format!("attributeName=\"{name}\" values=\""))
+                    .nth(1)
+                    .map(|rest| {
+                        rest.split('"')
+                            .next()
+                            .unwrap()
+                            .split(';')
+                            .map(|v| v.parse::<f64>().unwrap())
+                            .collect::<Vec<_>>()
+                    })
+            };
+            if let Some(opacity) = series("opacity") {
+                animated.0 += 1;
+                assert!(opacity.iter().all(|v| (0.0..=1.0).contains(v)), "{opacity:?}");
+            }
+            if let Some(blur) = series("stdDeviation") {
+                animated.1 += 1;
+                assert!(blur.iter().all(|v| (0.0..=size + 0.01).contains(v)), "{blur:?}");
+            }
+            assert!(all_values(&w.open).iter().all(|v| v.is_finite()));
+            if let Some(filter) = w.open.split("<filter").nth(1) {
+                let region = filter.split(" x=\"").nth(1).unwrap().split('>').next().unwrap();
+                let numbers: Vec<f64> = region.split('"').filter_map(|v| v.parse().ok()).collect();
+                assert_eq!(numbers.len(), 4, "{region}");
+                assert!(numbers.iter().all(|v| v.is_finite() && v.abs() < 5000.0), "{numbers:?}");
+            }
+        }
+        assert!(
+            animated.0 > 0 && animated.1 > 0,
+            "both a fade and a blur were checked: {animated:?}"
+        );
+    }
+
+    #[test]
+    fn a_curve_has_nothing_to_shape_where_the_amount_jumps() {
+        // A square window is 1 or 0 and nothing between: every curve answers 1 for 1 and 0 for 0.
+        let a = typewriter();
+        let eased = TextAnimation {
+            curves: Curves {
+                opacity: Some(Curve::Spring { bounce: 0.8 }),
+                ..Curves::default()
+            },
+            ..a
+        };
+        for unit in 0..4 {
+            assert_eq!(wrapped(&a, unit, 4).open, wrapped(&eased, unit, 4).open);
+        }
+    }
+
+    #[test]
+    fn a_wiggle_through_a_curve_stays_bounded_and_settles() {
+        let a = text_animation_preset("wiggle").unwrap().animation;
+        let a = a.with_motion_curve(curve_preset("spring").unwrap().curve).unwrap();
+        for unit in 0..6 {
+            let w = wrapped(&a, unit, 6);
+            let (times, rotation) = polyline(&w.open, "rotate");
+            assert!(times.len() <= MAX_KEYS);
+            assert!(rotation.iter().all(|r| r.abs() <= 3600.0 && r.is_finite()));
+            assert_eq!(
+                (rotation[0], rotation[rotation.len() - 1]),
+                (0.0, 0.0),
+                "at rest at both ends"
+            );
+        }
+    }
+
+    #[test]
+    fn what_a_curve_costs_is_counted_by_the_curves_that_differ() {
+        let rise = text_animation_preset("rise").unwrap().animation;
+        let grid = grid_points(&rise);
+        assert_eq!(unit_work(&rise), grid, "no curve, the cost it always had");
+        // x is unchanged by rise, y and opacity are changed: y's curve counts, and so does a different opacity one.
+        let y = with_curve(&rise, "spring");
+        assert_eq!(unit_work(&y), 2 * grid);
+        let both = TextAnimation {
+            curves: Curves {
+                opacity: Some(Curve::Spring { bounce: 0.3 }),
+                ..y.curves
+            },
+            ..y
+        };
+        assert_eq!(unit_work(&both), 3 * grid);
+        let same = TextAnimation {
+            curves: Curves {
+                opacity: y.curves.y,
+                ..y.curves
+            },
+            ..y
+        };
+        assert_eq!(unit_work(&same), 2 * grid, "one curve on two properties is evaluated once");
+        // A curve on a property the animation leaves alone is not run.
+        let dead = TextAnimation {
+            curves: Curves {
+                blur: y.curves.y,
+                ..Curves::default()
+            },
+            ..rise
+        };
+        assert_eq!(unit_work(&dead), grid);
     }
 
     /// The group a unit gets, read back as an SVG document: the animations are ones the reader keeps, and what
