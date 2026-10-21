@@ -362,13 +362,13 @@ mod tests {
             let a = f64::from(i) / 20.0;
             assert!((line.progress(a) - a).abs() < 1e-9, "{a}");
         }
-        let (ein, eout, both) = (named("ease_in"), named("ease_out"), named("ease_in_out"));
-        assert!(ein.progress(0.25) < 0.25 && ein.progress(0.5) < 0.5 && ein.progress(0.75) < 0.75);
-        assert!(eout.progress(0.25) > 0.25 && eout.progress(0.5) > 0.5 && eout.progress(0.75) > 0.75);
+        let (slow_start, slow_end, both) = (named("ease_in"), named("ease_out"), named("ease_in_out"));
+        assert!(slow_start.progress(0.25) < 0.25 && slow_start.progress(0.5) < 0.5 && slow_start.progress(0.75) < 0.75);
+        assert!(slow_end.progress(0.25) > 0.25 && slow_end.progress(0.5) > 0.5 && slow_end.progress(0.75) > 0.75);
         assert!(both.progress(0.25) < 0.25 && both.progress(0.75) > 0.75);
         assert!((both.progress(0.5) - 0.5).abs() < 1e-9, "symmetric");
         // None of the three leaves the path.
-        for c in [ein, eout, both] {
+        for c in [slow_start, slow_end, both] {
             for i in 0..=200 {
                 let v = c.progress(f64::from(i) / 200.0);
                 assert!((0.0..=1.0).contains(&v), "{c:?}: {v}");
