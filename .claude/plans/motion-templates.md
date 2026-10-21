@@ -262,7 +262,42 @@ trim paths, `animateMotion`, artwork entering from outside its viewBox) is 3b an
   words or lines; properties in em; eight presets (rise, fade in, typewriter, pop, blur in, spin in, drop in, wiggle).
 - **Surfaces**: `set_title_text_animation` and `list_text_animation_presets` (Tauri commands and MCP tools), the Inspector's Text
   section (a preset picker with delay and duration), `api.ts` with its harness fallback, `types.ts`.
-- **Left for later**: easing curves per property and overshoot / springs (3b), looping an animation for a title longer than it, a
-  custom-animation editor in the Inspector (the range, the wiggle and the properties are reachable through MCP and the data only),
-  a preview of the selector's window, animating text that stays text (positioned `<tspan>`s, `textPath`), and per-unit anchor
-  point choices.
+- **Left for later**: easing curves per property and overshoot / springs (done in 3b, below), looping an animation for a title
+  longer than it, a custom-animation editor in the Inspector (the range, the wiggle and the properties are reachable through MCP and
+  the data only), a preview of the selector's window, animating text that stays text (positioned `<tspan>`s, `textPath`), and
+  per-unit anchor point choices.
+
+## Phase 3b as built (per-property curves: speed / influence and springs)
+
+Details: `core-project.md` ("Text animations", "Curves"). The owner's split is 3b = speed / influence easing and springs, 3c = trim
+paths and `animateMotion`, 3d = artwork entering from outside its viewBox; none of 3c / 3d is started.
+
+- **Stored as data, in the same attribute**: `TextAnimation.curves` {x, y, scale, rotation, opacity, blur}, each an optional
+  `Curve`, `{"kind":"speed", out_speed, out_influence, in_speed, in_influence}` (After Effects' temporal ease, normalised to a segment
+  of length 1: speeds in multiples of the average speed, influences the share of the segment each holds) or `{"kind":"spring",
+  bounce}` (a damped oscillator that has all but stopped when the property arrives). Absent when empty, so every existing animation
+  writes, reads and compiles exactly as before (the compiled units were compared byte for byte with the previous build's over every
+  preset and extreme properties). **Schema step v11** (a JSON step: an older build refuses the unknown field, leaving the text as text
+  at its next re-outline); no `.kerftemplate` manifest change, so no `UPGRADES` step; no graph change, no golden family.
+- **Where it acts**: a curve maps a unit's amount (the selector's 0..1, times the wiggle) to the factor on the property's change, so it
+  is applied in the sampling of `glyph_smil::wrap` and everything after (the 96-point simplify, the tolerance, `keyTimes`) is unchanged.
+  **A curve is written for a unit settling into its place** (the amount falling to 0, as in every preset): an overshoot goes through
+  the resting value and back, and a unit leaving walks the path backwards. A `square` window has nothing to shape.
+- **Bounded**: each sampled value is clamped to the bound its property has (so a curve cannot take a move past 20 em, a turn past
+  3600°, a scale past 10 or a blur past 1 em, and a scale never goes below the drawable minimum), opacity to 0..1 as SVG does; a
+  non-finite result falls back to the straight line. Caps: the 96 points, `MAX_WORK` (a unit costs one more grid per different curve in
+  use), 128 KiB and the unit caps are as in 3a; 23 characters of a spring cost 20 KB against 15 KB straight.
+- **Surfaces**: `list_text_animation_curves` (Tauri command and MCP tool), `set_title_text_animation`'s MCP `curve` (an id from that
+  list, put on the x, y, scale and rotation the animation changes) and its `animation.curves`; the Inspector's Text section gets one
+  **motion curve select** (six curves) for an animation that moves, scales or turns something; `api.ts` with its harness fallback,
+  `types.ts`, and `text-animation.ts` (`checkAnimation`, `animationJson`, `parseAnimation`, `CURVE_PRESETS`, `withMotionCurve`,
+  `motionCurveOf`), replayed against kerf-core's corpus.
+- **Product calls** (the conservative reading where the brief left a choice): the eight presets are left as they are (no curves);
+  picking a preset replaces the whole animation, curves included; the select acts on motion (x, y, scale, rotation) only, because an
+  overshoot or a spring on opacity only clamps at 1 and trembles under it (the data and MCP reach opacity and blur); the select is
+  not shown for an animation that changes none of those (a fade, a typewriter, a blur in); curves are written in terms of the
+  arrival, with `ease_out` slowing into place.
+- **Not done / left for later**: a preview of the curve (a small plot) in the Inspector, per-property pickers, a curve for the
+  window's own slide (the animation's `easing` stays the four fixed ones), looping, and a springs-on-opacity default.
+- **Source**: written from After Effects' published speed / influence model; EffectCraft's `crates/keyframe` was not consulted and
+  nothing is ported (so no new attribution).

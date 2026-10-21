@@ -114,6 +114,7 @@ import type {
 	Task,
 	TemplateControl,
 	TemplateEdit,
+	AnimationCurvePreset,
 	TextAnimation,
 	TextAnimationPreset,
 	TextBox,
@@ -238,7 +239,7 @@ import {
 	templatePosterDev
 } from './template-dev';
 import { checkTitleSpan, isTitleClip, placeTitleClip, titleClip, titleOf } from './title-clips';
-import { TEXT_ANIMATION_PRESETS } from './text-animation';
+import { CURVE_PRESETS, TEXT_ANIMATION_PRESETS } from './text-animation';
 import { convertTitleTextIn, setTitleTextAnimationIn, setTitleTextBoxIn } from './title-text';
 import { VOICE_IDS, DEFAULT_SPEED, DEFAULT_VOICE, clampSpeed, estimateSeconds, scriptSegments, voiceInfo } from './voiceover';
 
@@ -3547,6 +3548,13 @@ export async function setTitleTextAnimation(
 export async function listTextAnimationPresets(): Promise<TextAnimationPreset[]> {
 	if (!inTauri()) return structuredClone([...TEXT_ANIMATION_PRESETS]);
 	return invoke<TextAnimationPreset[]>('list_text_animation_presets');
+}
+
+/** The curves a text animation's moving properties can be given (`ease_out`, `overshoot`, `spring`, ...): each a curve
+ *  (`null` for the straight line) for `withMotionCurve` or an animation's `curves`. */
+export async function listTextAnimationCurves(): Promise<AnimationCurvePreset[]> {
+	if (!inTauri()) return structuredClone([...CURVE_PRESETS]);
+	return invoke<AnimationCurvePreset[]>('list_text_animation_curves');
 }
 
 /** Draw a title's text as glyph outlines (the same on every machine, and what a box needs) or with its fonts again.

@@ -96,6 +96,12 @@ const MIGRATIONS: &[Migration] = &[
         destructive: false,
         needed_to_read: false,
     },
+    Migration {
+        run: v10_to_v11,
+        needed: v10_to_v11_needed,
+        destructive: false,
+        needed_to_read: false,
+    },
 ];
 
 /// The schema this build writes and the newest it opens.
@@ -255,6 +261,21 @@ fn v9_to_v10(_: &Connection) -> rusqlite::Result<()> {
 }
 
 fn v9_to_v10_needed(_: &Connection) -> bool {
+    true
+}
+
+/// v11: a text animation (`data-kerf-animate`, v9) may carry `curves`, a speed / influence ease or a spring for each of
+/// its properties (`svg/curve.rs`). It is a new field in JSON an older build reads strictly: it refuses the attribute
+/// (an unknown field), so the next time it sets that title's text again (a template value, a box, Draw as outlines)
+/// the text is left as text and its animation stops playing, while the attribute stays; it saves such a title as a
+/// template that no older build can play. An animation with no curves is written as it was, so a stored title that has
+/// none is unchanged. Nothing in the file's tables changes; the step is the version that keeps an older build out, after
+/// the file is copied aside. (A `.kerftemplate` manifest is unchanged: the animation is in its `title.svg`.)
+fn v10_to_v11(_: &Connection) -> rusqlite::Result<()> {
+    Ok(())
+}
+
+fn v10_to_v11_needed(_: &Connection) -> bool {
     true
 }
 

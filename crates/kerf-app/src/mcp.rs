@@ -6572,7 +6572,8 @@ const INSTRUCTIONS: &str = "Kerf MCP server. The user queues editing tasks in th
              set_title_text_box: it wraps, or with fit=\"shrink\" stays on one line \
              made smaller to fit, and animate its letters, words or lines with \
              set_title_text_animation (a `preset` from list_text_animation_presets: \
-             rise, typewriter, blur_in, ...). save_template, import_template and \
+             rise, typewriter, blur_in, ..., and a `curve` from \
+             list_text_animation_curves: an overshoot or a spring). save_template, import_template and \
              export_template change the user's library or a file, not your \
              proposal, and delete_template is refused while the user reviews your \
              edits. \
@@ -8494,6 +8495,7 @@ mod tests {
         assert_eq!(required("set_title_text_box"), ["element", "title_id"]);
         assert_eq!(required("set_title_text_animation"), ["element", "title_id"]);
         assert!(required("list_text_animation_presets").is_empty());
+        assert!(required("list_text_animation_curves").is_empty());
         assert_eq!(required("convert_title_text"), ["title_id", "to"]);
         assert_eq!(required("import_template"), ["path"]);
         assert_eq!(required("export_template"), ["output_path", "template_id"]);
@@ -8519,9 +8521,19 @@ mod tests {
             ),
             (
                 "set_title_text_animation",
-                &["preset", "data-kerf-animate", "convert_title_text", "per-glyph"][..],
+                &[
+                    "preset",
+                    "data-kerf-animate",
+                    "convert_title_text",
+                    "per-glyph",
+                    "list_text_animation_curves",
+                ][..],
             ),
             ("list_text_animation_presets", &["typewriter", "wiggle", "`animation`"][..]),
+            (
+                "list_text_animation_curves",
+                &["spring", "overshoot", "`curves`", "`null`"][..],
+            ),
             ("import_template", &["already_present", "added_as_copy", "network share"][..]),
             ("export_template", &[".kerftemplate", "overwrite"][..]),
             ("delete_template", &["cannot be undone", "review"][..]),

@@ -151,9 +151,14 @@
   (the range the file declares, which a `yuv420p` VP9 / HEVC / AV1 file flags where its format name says nothing: the GPU plan refuses such a
   picture on it, `core-render-plan.md`): an older build drops it at its next write of the asset and would draw the picture as limited range; an asset stored before has none
   and reads "not known" (omitted when `None`, so a stored stream stays byte-identical), judged by its name as it always was, until a
-  relink or a fresh import probes it again; no timeline JSON moves, so there is no `persisted/` file for v10.
-  The schema is at **v10** (`SCHEMA_VERSION`). `persist_tests` pins which steps a file has pending with
-  `store::pending_steps` (a legacy file that has every column: `[4, 5, 6, 7, 8, 9]`). A step's `needed_to_read` says whether a build that
+  relink or a fresh import probes it again; no timeline JSON moves, so there is no `persisted/` file for v10; v10→v11 is a JSON step
+  for a **new field** in a text animation, `curves` (`data-kerf-animate`, "Text animations" below): an older build reads the
+  attribute strictly and refuses it, so the next time it sets that title's text again the text stays text and the animation stops
+  playing, while the attribute stays; an animation with no curves is written as it was, so a stored title without them is
+  byte-identical, and a `.kerftemplate` manifest is unchanged (the animation is in its `title.svg`; no `UPGRADES` step);
+  `persisted/timelines-v11.json` holds a title with a spring.
+  The schema is at **v11** (`SCHEMA_VERSION`). `persist_tests` pins which steps a file has pending with
+  `store::pending_steps` (a legacy file that has every column: `[4, 5, 6, 7, 8, 9, 10]`). A step's `needed_to_read` says whether a build that
   cannot write must still refuse a file lacking what it adds: true for the v1, v2 and v4 columns (the reads
   name them), false for the `fonts` table (reads tolerate its absence), so a write-protected v2 project
   opens as it is. A new file is stamped `SCHEMA_VERSION`; a
@@ -581,7 +586,7 @@
     `Template::validate` drops (a template is outlined whenever it is applied). A **template's poster** is drawn from the
     outlined title (`render_poster` outlines with the template's fonts), so a box shows on it, on save and on import alike.
     `user_space_paint` follows an `href` only within its family (gradient to gradient, pattern to pattern), as usvg does.
-  * **Text animations** (`svg/text_animation.rs`, `svg/glyph_smil.rs`, compiled in `svg/outline.rs`; plan phase 3a). A `<text>`
+  * **Text animations** (`svg/text_animation.rs`, `svg/glyph_smil.rs`, `svg/curve.rs`, compiled in `svg/outline.rs`; plan phases 3a and 3b). A `<text>`
     carries its animation as JSON in **`data-kerf-animate`** (single-quoted; `TextAnimation::to_attribute`, `from_attribute`
     refuses an unknown field, a wrong type, a number out of bounds or an animation that changes nothing). It is **data, not
     SMIL**: the outline pass (`Template::prepare`, `TitleTextInputs`, `SvgDoc::outlined`) compiles it, so the attribute stays on
@@ -605,7 +610,9 @@
     cut its worst errors. **Never loosen the tolerance to fit**: an earlier version did, past the
     noise's amplitude, and a long or fast wiggle compiled to *no* animation; a channel `varies` against the real tolerance. **Work
     cap**: a document's units are sampled at most `MAX_WORK` (3 M) times in all, a unit costing its grid (up to 7,201: delay +
-    duration ≤ 60 s) — 416 units of the longest animation, ~0.6 s in release — else the text stays text with a warning; the 128 KiB
+    duration ≤ 60 s), **and once more for each different curve on a property the animation changes** (`glyph_smil::unit_work`: a
+    spring is an `exp`, a `sin` and a `cos` an amount, a speed curve solves a cubic) — 416 units of the longest animation with no
+    curve, 208 with one, ~0.6 s in release — else the text stays text with a warning; the 128 KiB
     cap usually ends a heavy one first. Written as a `<g>` round the unit's paths holding `animateTransform`
     (translate, rotate, scale, `additive="sum"`, in that order), `animate` on `opacity` and, for blur, a `<filter
     filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">` with its `feGaussianBlur` and an `animate` of
@@ -626,7 +633,30 @@
     (`KERF_BLESS_CORPUS=1 … -- text_animation_corpus`) is what the frontend's `withTextAnimation`, `animationJson`, `parseAnimation`
     and presets replay (`parses`: attribute JSON and what `from_attribute` makes of it; serde refuses a `7.0` or `1e3` seed, which
     `JSON.parse` cannot tell from `7`, so `parseAnimation` reads the raw token; a repeated key it does not refuse). `#[ignore]`d `svg_rendered` tests export a typed and a wiggling blurred text through the real ffmpeg
-    (each frame is its still, letters arrive in order, a seeded wiggle is the same twice). No graph change, no golden family.
+    (each frame is its still, letters arrive in order, a seeded wiggle is the same twice, a spring grows past its size and settles). No graph change, no golden family.
+    **Curves (3b, `svg/curve.rs`)**: `curves` {x, y, scale, rotation, opacity, blur}, each an optional `Curve` (`{"kind":"speed",
+    out_speed, out_influence, in_speed, in_influence}` or `{"kind":"spring","bounce"}`, read strictly), shape how a property travels
+    between the text as drawn (amount 0) and its value (amount 1). **Written for a unit settling into its place**, the way every preset
+    runs (the amount falls 1 → 0): `Curve::progress(a)` is how far along the path the property is when it is `a` of the way (0 at its
+    value, 1 at rest, free to go beyond either), and the factor on the property's change is `1 - progress(1 - amount)` (`Curve::settle`;
+    a negative amount, from a wiggle, is the positive one mirrored; no curve is the amount itself, so a straight animation compiles
+    **byte-identical**: checked against the previous build over every preset and extreme properties). So an overshoot carries the property
+    through its resting value and back, and a unit leaving its place (the amount rising, `ramp_down`) walks the same path backwards
+    (a wind-up first). A `square` window jumps 1 → 0 and a curve has nothing to shape there. **Speed** is After Effects' temporal ease
+    normalised to a segment of length 1: speeds in multiples of the average speed (-5..5), influences the share of the segment each
+    holds (0.01..1), a cubic Bezier through `(out_influence, out_speed * out_influence)` and `(1 - in_influence, 1 - in_speed *
+    in_influence)`, solved for time by Newton with a bisection fallback (x only moves forward). **Spring** is a damped oscillator of
+    ratio `1 - bounce` (`bounce` 0.05..0.8: a sixth of the way past rest at 0.5, five swings at 0.8) stretched to be a thousandth
+    of its swing at the end, the remainder spread linearly so it ends exactly at rest. **Bounded by construction**: a curve may carry
+    a value past the one the animation gives it, so each sample is clamped to its property's own bound (`MAX_MOVE` 20 em, `MAX_TURN`
+    3600°, scale `MIN_SCALE`..`MAX_SCALE` 10, blur 0..1 em, opacity 0..1 as SVG clamps it), and a curve cannot produce a non-finite
+    number (`progress` falls back to the straight line on one). The compiled points are the same sampling and the same ≤ 96-point
+    simplify, so a spring takes a unit from ~8 points to ~30 (23 characters of `rise`: 15 KB straight, 20 KB sprung; `spin_in` 21 →
+    30 KB). `TextAnimation::with_motion_curve(Option<Curve>)` puts a curve on the x, y, scale and rotation the animation **changes** (and
+    none on the others; opacity's and blur's stay: a spring on a fade only trembles under 1) and refuses one for an animation that
+    changes none; `motion_curve()` reads back the shared curve (or a mix). `curve_presets()`: linear, ease_in, ease_out, ease_in_out
+    (Easy Ease thirds), overshoot (about 11 % past), spring (bounce 0.5). The eight animation presets are unchanged (no curves). The
+    corpus carries the curve presets, `with_motion_curve` / `motion_curve` over six animations × every curve, and curve `parses`.
   * **Lock-free shape.** The zip, the fonts, the sanitiser and the poster are all outside the project lock.
     Apply: `TemplateLibrary::get(id)` (or any `Template`) → `Template::prepare(&values)` →
     `PreparedTemplate` → under the lock `Project::apply_template_parsed(prepared, start, end?, SvgLayout)`.

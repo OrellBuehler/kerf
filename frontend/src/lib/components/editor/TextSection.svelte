@@ -2,21 +2,30 @@
 	// The Inspector's Text section for an animated SVG title, floating or on a track (not a preset, which is drawn from its
 	// parameters). Each `<text>` with an id can be given a box: a width its lines wrap to, or that it shrinks to fit on one
 	// line (`set_title_text_box`, one edit when a field commits, never per keystroke), and an animation: a preset picked
-	// from the engine's list, its delay and its duration (`set_title_text_animation`, one edit each). A box is drawn and an
-	// animation played only when the text is glyph outlines, which a template title's always is; a custom title's text can be
+	// from the engine's list, its delay and its duration, and the curve its movement, scale and rotation travel on (a
+	// spring, an overshoot, an ease: `set_title_text_animation` again, one edit each; the curves are the engine's too). A
+	// box is drawn and an animation played only when the text is glyph outlines, which a template title's always is; a custom title's text can be
 	// set as outlines or drawn with its fonts again (`convert_title_text`). The artwork stays the engine's: nothing here draws it.
 	import InspectorSection from './InspectorSection.svelte';
 	import Btn from './Btn.svelte';
 	import { onMount } from 'svelte';
 	import { editor } from '#lib/state.svelte';
-	import { listTextAnimationPresets } from '#lib/api';
+	import { listTextAnimationCurves, listTextAnimationPresets } from '#lib/api';
 	import { tip } from '#lib/tip';
-	import { TEXT_ANIMATION_PRESETS, checkAnimation, presetOf } from '#lib/text-animation';
+	import { CURVE_PRESETS, TEXT_ANIMATION_PRESETS, checkAnimation, curveIdOf, hasMotion, presetOf, withMotionCurve } from '#lib/text-animation';
 	import { holdForPreview, report } from '#lib/ops';
 	import { say } from '#lib/template-actions';
 	import { appliedLine } from '#lib/template-ui';
 	import { boxWidthRefusal, isOutlined, titleTexts, type TitleText } from '#lib/title-text';
-	import type { TemplateInstance, TextAnimation, TextAnimationPreset, TextBox, TextFit, TitleTextForm } from '#lib/types';
+	import type {
+		AnimationCurvePreset,
+		TemplateInstance,
+		TextAnimation,
+		TextAnimationPreset,
+		TextBox,
+		TextFit,
+		TitleTextForm
+	} from '#lib/types';
 
 	/** A title, floating or on a track: its id, name, artwork and template. */
 	let { o }: { o: { id: string; name: string; svg: string; template?: TemplateInstance | null } } = $props();
@@ -24,10 +33,16 @@
 	const texts = $derived(titleTexts(o.svg));
 	// The engine's list; the page's own copy (replayed against it by a test) stands in until it answers.
 	let presets = $state<TextAnimationPreset[]>([...TEXT_ANIMATION_PRESETS]);
+	let curves = $state<AnimationCurvePreset[]>([...CURVE_PRESETS]);
 	onMount(() => {
 		void listTextAnimationPresets()
 			.then((list) => {
 				if (list.length) presets = list;
+			})
+			.catch(() => {});
+		void listTextAnimationCurves()
+			.then((list) => {
+				if (list.length) curves = list;
 			})
 			.catch(() => {});
 	});
@@ -85,6 +100,27 @@
 		if (picked === choiceOf(t) || picked === 'custom') return back();
 		const next = picked === '' ? null : (presets.find((p) => p.id === picked)?.animation ?? null);
 		if (picked !== '' && !next) return back();
+		void setAnimation(t, next, back);
+	}
+
+	/** What the curve select shows for a text: a curve preset's id, `custom` for one of its own or a mix. */
+	const curveChoice = (t: TitleText): string => (t.animation ? (curveIdOf(t.animation) ?? 'custom') : 'linear');
+
+	/** A curve picked: one edit that puts it on the properties the animation moves (or takes it off). */
+	function chooseCurve(el: HTMLSelectElement, t: TitleText) {
+		const current = t.animation;
+		const back = () => {
+			if (el.isConnected) el.value = curveChoice(t);
+		};
+		const found = curves.find((c) => c.id === el.value);
+		if (!current || !found || found.id === curveChoice(t)) return back();
+		let next: TextAnimation;
+		try {
+			next = withMotionCurve(current, found.curve);
+		} catch (e) {
+			report(e);
+			return back();
+		}
 		void setAnimation(t, next, back);
 	}
 
@@ -214,6 +250,23 @@
 					/>
 				{/if}
 			</div>
+			{#if t.animation && hasMotion(t.animation)}
+				<select
+					class="k-select"
+					value={curveChoice(t)}
+					aria-label="{labelOf(t)}: motion curve"
+					aria-disabled={editor.locked || undefined}
+					use:tip={curves.find((c) => c.id === curveChoice(t))?.description ?? 'Curve of the movement, scale and rotation'}
+					onchange={(e) => chooseCurve(e.currentTarget, t)}
+				>
+					{#each curves as c (c.id)}
+						<option value={c.id}>{c.name}</option>
+					{/each}
+					{#if curveChoice(t) === 'custom'}
+						<option value="custom" disabled>Custom curve</option>
+					{/if}
+				</select>
+			{/if}
 			{#if t.animation && !t.outlined}
 				<div style={caption}>Drawn with its font, so it does not play.</div>
 			{/if}
@@ -225,7 +278,8 @@
 		<div style="{caption};margin-top:4px">
 			The width is in the artwork's units, from where the text is anchored. Shrink to fit keeps it on one line, made smaller
 			until it fits. An animation moves each character, word or line in turn; its delay and duration are in seconds from
-			the start of the title.
+			the start of the title. Its curve shapes how what moves, turns or scales gets into place: an overshoot or a spring
+			goes past it and comes back.
 		</div>
 	{/if}
 	<div style="{caption};margin-top:8px">

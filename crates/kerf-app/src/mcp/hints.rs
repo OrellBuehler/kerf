@@ -148,6 +148,7 @@ pub(super) const TOOLS: &[(&str, &str, Effect)] = &[
     ("set_title_text_box", "Set title text box", Set),
     ("set_title_text_animation", "Set title text animation", Set),
     ("list_text_animation_presets", "List text animation presets", Read),
+    ("list_text_animation_curves", "List text animation curves", Read),
     ("convert_title_text", "Convert title text", Set),
     ("import_template", "Import template", Set),
     ("export_template", "Export template", Destroy),
