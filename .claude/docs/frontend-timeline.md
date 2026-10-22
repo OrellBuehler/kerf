@@ -298,6 +298,12 @@ would otherwise round back onto the frame it shows, or skip one. A keyframe diam
 keyframe-at-playhead check has a tolerance that assumes the playhead is *at* the key). A scrub bar's hover chip says the frame a
 click would land on. It also **cannot stand past the end of the cut**: an effect in
 `+page.svelte` takes it back to the new end when an edit shortens the cut (an empty cut reads `00:00:00:00 / 00:00:00:00`). With nothing on the timeline the lane says *Drop media here to start cutting.* **in the first lane** (sticky, left of the clip's landing place) — it was centred over the whole stack and sat on the line between V1 and A1.
+
+**A library drop is a pointer drag**, not HTML5 drag-and-drop, which never reaches the page on Windows (`app.md`).
+`MediaBin` starts it past a 4 px slop and writes `ui.dndAsset` / `ui.dndPoint`; the timeline hit-tests the lane under
+the point (`laneAt`, `[data-lane]`) for the ghost, and the release calls `ui.assetDropTarget` (`onLaneDrop`, one
+`editor.add`). Escape, pointercancel and blur abandon it. It works within one window: a bin in a popout does not drop
+onto the main window's lanes.
 The playhead's *head* lives in the sticky ruler, so it stays when the tracks scroll vertically.
 **The render bar** (`RenderBar.svelte`, `render-bar.ts`) is a 3 px strip along the ruler's top edge saying how the
 Preview will play each span, from `get_render_bar` (`kerf_core::render_bar`: the cut planned as a play session from

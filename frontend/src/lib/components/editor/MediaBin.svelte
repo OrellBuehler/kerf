@@ -74,19 +74,48 @@
 	const err = report;
 
 	// Drag an asset out of the bin; the timeline lanes accept the drop and add a
-	// clip. `ui.dndAsset` carries the payload (dataTransfer is opaque on dragover).
-	function onAssetDragStart(e: DragEvent, { asset, info }: BinAsset) {
-		ui.dndAsset = { id: asset.id, kind: info.kind === 'audio' ? 'audio' : 'video', duration: placementOut(asset, settings.editing.still_seconds) };
-		if (e.dataTransfer) {
-			e.dataTransfer.effectAllowed = 'copy';
-			// A custom MIME so an off-target drop on a text field doesn't paste the
-			// name; the drop is coordinated entirely via `ui.dndAsset`.
-			e.dataTransfer.setData('application/x-kerf-asset', asset.id);
-		}
-	}
-
-	function onAssetDragEnd() {
-		ui.dndAsset = null;
+	// clip. A pointer drag, not HTML5 drag-and-drop: on Windows, Tauri's file-drop
+	// handler (kept on for files from the OS) answers an in-page drag with "no
+	// drop", so WebView2 never delivers its dragover / drop to the page.
+	const DRAG_SLOP = 4;
+	function onAssetPointerDown(e: PointerEvent, { asset, info }: BinAsset) {
+		if (e.button !== 0) return;
+		e.preventDefault();
+		const payload = { id: asset.id, kind: info.kind === 'audio' ? ('audio' as const) : ('video' as const), duration: placementOut(asset, settings.editing.still_seconds) };
+		const [x0, y0] = [e.clientX, e.clientY];
+		const root = document.documentElement;
+		const cursor = root.style.cursor;
+		const end = () => {
+			window.removeEventListener('pointermove', move);
+			window.removeEventListener('pointerup', up);
+			window.removeEventListener('pointercancel', end);
+			window.removeEventListener('keydown', key);
+			window.removeEventListener('blur', end);
+			root.style.cursor = cursor;
+			ui.dndAsset = null;
+			ui.dndPoint = null;
+		};
+		const move = (m: PointerEvent) => {
+			if (!ui.dndAsset) {
+				if (Math.hypot(m.clientX - x0, m.clientY - y0) < DRAG_SLOP) return;
+				ui.dndAsset = payload;
+				root.style.cursor = 'grabbing';
+			}
+			ui.dndPoint = { x: m.clientX, y: m.clientY };
+		};
+		const up = (u: PointerEvent) => {
+			const dragging = !!ui.dndAsset;
+			end();
+			if (dragging) ui.assetDropTarget?.(payload, u.clientX, u.clientY);
+		};
+		const key = (k: KeyboardEvent) => {
+			if (k.key === 'Escape') end();
+		};
+		window.addEventListener('pointermove', move);
+		window.addEventListener('pointerup', up);
+		window.addEventListener('pointercancel', end);
+		window.addEventListener('keydown', key);
+		window.addEventListener('blur', end);
 	}
 
 	function onAssetContextMenu(e: MouseEvent, { asset, info }: BinAsset) {
@@ -356,9 +385,7 @@
 						role="button"
 						tabindex="0"
 						aria-pressed={sel}
-						draggable={true}
-						ondragstart={(e) => onAssetDragStart(e, a)}
-						ondragend={onAssetDragEnd}
+						onpointerdown={(e) => onAssetPointerDown(e, a)}
 						oncontextmenu={(e) => onAssetContextMenu(e, a)}
 						onclick={() => onSelect(a.asset.id)}
 						onkeydown={(e) => {

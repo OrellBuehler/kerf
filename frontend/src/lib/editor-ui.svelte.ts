@@ -93,6 +93,11 @@ class EditorUi {
 	playing = $state(false);
 	/** The asset being dragged from the media bin, while a drag is in flight. */
 	dndAsset = $state<{ id: string; kind: 'video' | 'audio'; duration: number } | null>(null);
+	/** Where that drag's pointer is (client pixels), for the timeline's drop ghost. */
+	dndPoint = $state<{ x: number; y: number } | null>(null);
+	/** The timeline's drop handler, set while one is mounted; the bin calls it on release. */
+	assetDropTarget: ((asset: { id: string; kind: 'video' | 'audio'; duration: number }, x: number, y: number) => void) | null =
+		null;
 	/** Whether an analysis pass is currently running. */
 	analyzing = $state(false);
 	/** The asset currently being analyzed (so the bin badges the right one). */

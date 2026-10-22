@@ -283,10 +283,7 @@
 			void import('@tauri-apps/api/webview').then(async ({ getCurrentWebview }) => {
 				unlisteners.push(
 					await getCurrentWebview().onDragDropEvent((e) => {
-						// A clip being dragged out of the media bin is an HTML5 drag
-						// inside the webview, not files arriving from the OS; it must
-						// not raise the import overlay over the lane it is aiming at.
-						if (ui.dndAsset || modalOpen) return;
+						if (modalOpen) return;
 						if (e.payload.type === 'enter' || e.payload.type === 'over') dropHover = true;
 						else if (e.payload.type === 'leave') dropHover = false;
 						else if (e.payload.type === 'drop') {
