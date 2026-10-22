@@ -208,6 +208,8 @@ pub(super) fn build_together_args(
     args.push(chains.join(";"));
 
     let muted = has_audio && !want_audio && !c.is_video_only();
+    // Every file carries the first variant's mix, so its ceiling is every file's.
+    let peak_ceiling = holds_peak_ceiling(&cut.master, &per[0]);
     let mut sinks = Vec::with_capacity(variants.len());
     for (k, v) in variants.iter().enumerate() {
         let output = v
@@ -226,6 +228,7 @@ pub(super) fn build_together_args(
             &per[k],
             &fmts[k],
             (graphs[k].has_video, mixed),
+            peak_ceiling,
             muted,
             PassPhase::Single,
             "",
@@ -452,6 +455,29 @@ mod tests {
         let last = args.len() - 1;
         let sinks: Vec<&str> = built.sinks_from_end.iter().map(|d| args[last - d].as_str()).collect();
         assert_eq!(sinks, ["/out/cut-9x16.mp4", "/out/cut-1x1.mp4"]);
+    }
+
+    #[test]
+    fn every_file_of_the_run_keeps_aac_noise_substitution_off_under_a_ceiling() {
+        let (mut timeline, mut assets) = cut();
+        assets[0].streams = vec![video_stream(1920, 1080, 30.0), audio_stream(48_000, 2)];
+        let opts = ExportOptions {
+            audio_codec: Some("aac".into()),
+            ..ExportOptions::default()
+        };
+        let pns = |timeline: &Timeline, opts: &ExportOptions| {
+            let args = build_together_args(timeline, &assets, &variants(), opts)
+                .unwrap()
+                .expect("mergeable")
+                .args;
+            args.windows(4).filter(|w| w == &["-c:a", "aac", "-aac_pns", "0"]).count()
+        };
+        assert_eq!(pns(&timeline, &opts), 0);
+        timeline.master.limiter = true;
+        assert_eq!(pns(&timeline, &opts), 2);
+        timeline.master.limiter = false;
+        let normalized = ExportOptions { loudnorm: true, ..opts };
+        assert_eq!(pns(&timeline, &normalized), 2);
     }
 
     #[test]

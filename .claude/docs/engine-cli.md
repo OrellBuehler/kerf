@@ -557,6 +557,14 @@ so the feature is **only** activated through these forwards — which is what ma
   limiter oversampled: `aresample=<4×rate>,alimiter=…,aresample=<rate>` (`oversampled`), so the
   peaks between samples stay under the ceiling (rendered: an 11 kHz tone pushed into a -1 dB ceiling
   reads ≤ -0.9 dBTP with it, more without). Latency probing is the same `limiter_filter`.
+  **AAC under a ceiling gets `-aac_pns 0`** (`holds_peak_ceiling`: `master.limiter`, or `loudness` /
+  `loudnorm`, static or not; `push_output_opts` writes it right after `-c:a aac`, `together.rs` passes
+  the first variant's answer to every file since they share its mix). The native encoder's perceptual noise
+  substitution (on in the `twoloop` coder, FFmpeg 9.0's default; 4.4 defaults to `fast`) adds isolated +3..+8
+  dBTP spikes after click-like transients, even from a mix held at about -1.2 dBTP; with it off every
+  test signal stayed within ~1 dB of the WAV export. The option exists in 4.4 and 9.0, so it is not probed.
+  Omitted without a ceiling (argv unchanged) and for every other codec; `audio_codec: None` (the container
+  picks) is not covered. Ignored test: `an_aac_export_through_the_limiter_keeps_its_true_peak` (`levels.rs`).
   **Static loudness** (`ExportOptions.loudness_static`, with a `loudness` / `loudnorm` target):
   instead of single-pass `loudnorm` (which rides the gain and overshoots TP), `render_with_progress`
   first runs one `levels::static_loudness_gain` pass (after the preflight; skipped when nothing writes

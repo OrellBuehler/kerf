@@ -294,6 +294,7 @@ audio-lowpass lowpass=
 audio-tempo atempo=
 audio-reverse areverse
 audio-aac -c:a aac
+audio-aac-pns-off -c:a aac -aac_pns 0
 audio-mp3 -c:a libmp3lame
 audio-opus -c:a libopus
 audio-flac -c:a flac

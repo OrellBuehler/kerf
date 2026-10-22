@@ -1001,13 +1001,21 @@ size=N/A time=00:00:03.90 bitrate=N/A speed=  53x
 
     /// [`read_back`] over `(start, seconds)` of the file.
     fn read_back_span(file: &Path, span: Option<(f64, f64)>) -> LevelReading {
+        read_back_as(file, span, Some("wav"))
+    }
+
+    /// [`read_back_span`] of a file in `format` (`None` lets ffmpeg probe it: an `.m4a`).
+    fn read_back_as(file: &Path, span: Option<(f64, f64)>, format: Option<&str>) -> LevelReading {
         let mut cmd = command(&ffmpeg_bin());
         cmd.args(["-hide_banner", "-nostats"]);
         if let Some((start, secs)) = span {
             cmd.args(["-ss", &start.to_string(), "-t", &secs.to_string()]);
         }
+        if let Some(format) = format {
+            cmd.args(["-f", format]);
+        }
         let out = cmd
-            .args(["-f", "wav", "-i"])
+            .arg("-i")
             .arg(file)
             .args(["-af", "ebur128@x=peak=sample+true", "-f", "null", "-"])
             .stdin(Stdio::null())
@@ -1220,6 +1228,62 @@ size=N/A time=00:00:03.90 bitrate=N/A speed=  53x
         );
         let back = read_back(&file);
         assert!(back.true_peak_dbtp.unwrap() <= -0.95, "{back:?}");
+    }
+
+    /// The native AAC encoder's perceptual noise substitution puts isolated peaks of +3 to +8
+    /// dBTP after click-like transients (FFmpeg 9's default coder; 4.4's `fast` coder does not),
+    /// through a mix the limiter holds under its ceiling. With the limiter on, the file's true
+    /// peak stays within a dB of the ceiling, as the WAV of the same mix does.
+    #[test]
+    #[ignore = "needs the ffmpeg binary"]
+    fn an_aac_export_through_the_limiter_keeps_its_true_peak() {
+        let dir = scratch("aac-peak");
+        let path = dir.join("transients.flac");
+        // Half-millisecond clicks every tenth of a second at three levels, over a quiet bed:
+        // the shape that sets the encoder's noise substitution off.
+        let made = command(&ffmpeg_bin())
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i"])
+            .arg(
+                "aevalsrc=exprs='if(lt(mod(t,0.1),0.0005),0.9*(0.5+0.5*mod(floor(t*10),3)/2),0.02*sin(2*PI*3000*t))':s=48000:d=8",
+            )
+            .args(["-af", "pan=stereo|c0=c0|c1=c0", "-c:a", "flac", "-sample_fmt", "s32"])
+            .arg(&path)
+            .status_bounded()
+            .expect("run ffmpeg");
+        assert!(made.success());
+        let mut hot = test_asset(vec![audio_stream(48_000, 2)]);
+        hot.path = path.to_string_lossy().into_owned();
+        hot.duration = 8.0;
+        let assets = std::slice::from_ref(&hot);
+        let ceiling = -1.0;
+        let mut tl = tracks_of(&hot, 1);
+        tl.master = MasterBus {
+            limiter: true,
+            true_peak: true,
+            ceiling_db: ceiling,
+            ..MasterBus::default()
+        };
+        let wav = dir.join("limited.wav");
+        export_wav(&tl, assets, &wav, ExportOptions::default());
+        let reference = read_back(&wav).true_peak_dbtp.unwrap();
+        assert!(reference <= ceiling + 0.1, "the WAV holds the ceiling: {reference}");
+
+        for bitrate in ["96k", "192k"] {
+            let file = dir.join(format!("limited-{bitrate}.m4a"));
+            let opts = ExportOptions {
+                container: Container::M4a,
+                audio_codec: Some("aac".into()),
+                audio_bitrate: Some(bitrate.into()),
+                ..ExportOptions::default()
+            };
+            let status = render_with_progress(&tl, assets, &file, &opts, &mut |_| {}, &|| false).expect("export");
+            assert_eq!(status, RenderStatus::Completed);
+            let tp = read_back_as(&file, None, None).true_peak_dbtp.unwrap();
+            assert!(
+                tp <= ceiling + 1.0,
+                "{bitrate} AAC peaks at {tp} dBTP, the WAV of the same mix at {reference}"
+            );
+        }
     }
 
     /// A crossfade between two tones of equal level keeps the power of either: the

@@ -5052,6 +5052,7 @@ fn build_export_args_phase(
         opts,
         &fmt,
         (graph.has_video, graph.has_audio),
+        holds_peak_ceiling(&timeline.master, opts),
         muted,
         pass,
         passlog,
@@ -5068,14 +5069,23 @@ fn build_export_args_phase(
     Ok(args)
 }
 
+/// Whether the export's mix is held under a peak ceiling: the master limiter is on, or a loudness
+/// target (`loudness` / `loudnorm`, moving or static) closes the mix at its true-peak limit.
+fn holds_peak_ceiling(master: &crate::model::MasterBus, opts: &ExportOptions) -> bool {
+    master.limiter || opts.loudness.is_some() || opts.loudnorm
+}
+
 /// What follows an output's maps: the encoders and their settings, an explicit mute (`muted`: the
 /// cut has sound and the export drops it) and the muxer's flags. `(has_video, has_audio)` is
-/// whether the graph feeds the output a picture and a sound.
+/// whether the graph feeds the output a picture and a sound; `peak_ceiling` is
+/// [`holds_peak_ceiling`] for the mix it carries.
+#[allow(clippy::too_many_arguments)]
 fn push_output_opts(
     args: &mut Vec<String>,
     opts: &ExportOptions,
     fmt: &ExportFormat,
     (has_video, has_audio): (bool, bool),
+    peak_ceiling: bool,
     muted: bool,
     pass: PassPhase,
     passlog: &str,
@@ -5101,6 +5111,12 @@ fn push_output_opts(
         if let Some(ac) = opts.audio_codec.as_deref() {
             args.push("-c:a".to_string());
             args.push(ac.to_string());
+            // The native encoder's perceptual noise substitution adds isolated +3..+8 dBTP spikes
+            // after click-like transients, through a mix the limiter holds under its ceiling.
+            if ac == "aac" && peak_ceiling {
+                args.push("-aac_pns".to_string());
+                args.push("0".to_string());
+            }
             match ac {
                 "aac" | "libmp3lame" | "libopus" => {
                     if let Some(b) = &opts.audio_bitrate {
@@ -15866,6 +15882,147 @@ mod tests {
         let cv = args.iter().position(|a| a == "-c:v").unwrap();
         let crf = args.iter().position(|a| a == "-crf").unwrap();
         assert!(map < cv && cv < crf);
+    }
+
+    /// The argv of `opts` over a 1080p clip whose master bus is `master`.
+    fn args_with_master(master: MasterBus, opts: &ExportOptions) -> Vec<String> {
+        let asset = av_asset(Uuid::new_v4(), 30.0);
+        let mut timeline = single(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]);
+        timeline.master = master;
+        build_export_args(&timeline, &[asset], "/out/x", opts).unwrap()
+    }
+
+    fn limited() -> MasterBus {
+        MasterBus {
+            limiter: true,
+            ..MasterBus::default()
+        }
+    }
+
+    fn with_audio(codec: &str) -> ExportOptions {
+        ExportOptions {
+            audio_codec: Some(codec.into()),
+            audio_bitrate: Some("192k".into()),
+            ..ExportOptions::default()
+        }
+    }
+
+    #[test]
+    fn aac_under_a_peak_ceiling_has_perceptual_noise_substitution_off() {
+        // The master limiter alone, then each way of asking for a loudness target.
+        let targets = [
+            ExportOptions::default(),
+            ExportOptions {
+                loudnorm: true,
+                ..ExportOptions::default()
+            },
+            ExportOptions {
+                loudness: Some(LoudnessPreset::Apple),
+                ..ExportOptions::default()
+            },
+            ExportOptions {
+                loudness: Some(LoudnessPreset::Youtube),
+                loudness_static: true,
+                loudness_gain_db: Some(3.0),
+                ..ExportOptions::default()
+            },
+        ];
+        for (n, extra) in targets.into_iter().enumerate() {
+            let master = if n == 0 { limited() } else { MasterBus::default() };
+            let opts = ExportOptions {
+                audio_codec: Some("aac".into()),
+                audio_bitrate: Some("192k".into()),
+                ..extra
+            };
+            let args = args_with_master(master, &opts);
+            let at = args.iter().position(|a| a == "-c:a").expect("-c:a");
+            assert_eq!(
+                args[at..at + 5],
+                ["-c:a", "aac", "-aac_pns", "0", "-b:a"],
+                "case {n}: {args:?}"
+            );
+            assert_eq!(args[at + 5], "192k");
+        }
+        // The audio-only container takes the same path.
+        let opts = ExportOptions {
+            container: Container::M4a,
+            ..with_audio("aac")
+        };
+        assert_eq!(flag_val(&args_with_master(limited(), &opts), "-aac_pns"), Some("0"));
+    }
+
+    #[test]
+    fn aac_without_a_peak_ceiling_keeps_its_argv() {
+        let opts = with_audio("aac");
+        let args = args_with_master(MasterBus::default(), &opts);
+        assert!(!args.contains(&"-aac_pns".to_string()), "{args:?}");
+        assert_eq!(flag_val(&args, "-c:a"), Some("aac"));
+        assert_eq!(flag_val(&args, "-b:a"), Some("192k"));
+        // A stored ceiling beside the limiter turned off, and a fader, hold nothing.
+        let quiet = MasterBus {
+            ceiling_db: -3.0,
+            volume: 0.8,
+            true_peak: true,
+            ..MasterBus::default()
+        };
+        assert!(!args_with_master(quiet, &opts).contains(&"-aac_pns".to_string()));
+        // The limiter on beside a silent export: no sound, no encoder to tune.
+        let muted = ExportOptions {
+            include_audio: false,
+            ..with_audio("aac")
+        };
+        let args = args_with_master(limited(), &muted);
+        assert!(
+            !args.contains(&"-aac_pns".to_string()) && !args.contains(&"-c:a".to_string()),
+            "{args:?}"
+        );
+    }
+
+    #[test]
+    fn no_other_audio_codec_is_given_the_aac_option() {
+        let normalized = ExportOptions {
+            loudnorm: true,
+            ..ExportOptions::default()
+        };
+        for codec in ["libmp3lame", "libopus", "flac", "pcm_s16le", "alac", "bogus"] {
+            let opts = ExportOptions {
+                audio_codec: Some(codec.into()),
+                ..normalized.clone()
+            };
+            let args = args_with_master(limited(), &opts);
+            assert_eq!(flag_val(&args, "-c:a"), Some(codec));
+            assert!(!args.contains(&"-aac_pns".to_string()), "{codec}: {args:?}");
+        }
+        // No codec named: the container picks it, and nothing is said about the encoder.
+        let args = args_with_master(limited(), &normalized);
+        assert!(!args.contains(&"-aac_pns".to_string()), "{args:?}");
+    }
+
+    #[test]
+    fn a_peak_ceiling_is_the_limiter_or_a_loudness_target() {
+        let off = ExportOptions::default();
+        assert!(!holds_peak_ceiling(&MasterBus::default(), &off));
+        assert!(holds_peak_ceiling(&limited(), &off));
+        for opts in [
+            ExportOptions {
+                loudnorm: true,
+                ..off.clone()
+            },
+            ExportOptions {
+                loudness: Some(LoudnessPreset::Broadcast),
+                ..off.clone()
+            },
+        ] {
+            assert!(holds_peak_ceiling(&MasterBus::default(), &opts));
+        }
+        // Nothing else the master carries is a ceiling.
+        let others = MasterBus {
+            volume: 1.5,
+            ceiling_db: -6.0,
+            true_peak: true,
+            ..MasterBus::default()
+        };
+        assert!(!holds_peak_ceiling(&others, &off));
     }
 
     #[test]

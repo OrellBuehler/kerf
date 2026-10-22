@@ -171,3 +171,8 @@
   which also equals the committed digests), exactly the new `audio-crossfade-qsin` family
   (`KERF_GOLDEN_FAMILIES`); no still or preview digest moved. `MasterBus.true_peak` and
   `ExportOptions.loudness_static` landed in the same change and move nothing (both off in every case).
+- **`-aac_pns 0` under a peak ceiling** (`-c:a aac` with the master limiter or a loudness target; `engine-cli.md`)
+  re-blessed `export.txt` alone: 66 of 8000 export cases moved (36 block lines), exactly the new `audio-aac-pns-off`
+  family (needle `-c:a aac -aac_pns 0`; `KERF_GOLDEN_CASES` before / after with the option compiled out for the before) and
+  exactly the `audio-aac` cases that also hit `master-limiter` or `loudnorm`: no AAC case without a ceiling, no other
+  codec, no still or preview digest moved.
