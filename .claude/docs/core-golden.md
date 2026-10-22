@@ -164,6 +164,18 @@
   clips (`bt709`, `smpte170m`, full-range `yuvj420p` `bt709`) and must then be exactly where the HDR clip's was. It moves no digest.
   The 400 animated-title cases (`6000..6400`) were blessed with the label in (blocks `60`..`63`; the first 6000 are the digests the label gave);
   with the label text stripped from every argv all 64 block digests of the time equal the ones committed before it.
+- **The export in parts** (`golden/parts.txt`, the fourth digest file, **new**: none of the other three moved, so only it was
+  blessed): `the_parts_argv_builders_produce_the_golden_digests` plans every case of the corpus (`0..TOTAL`) with
+  `plan_export` under `PARTS_LIMITS` (5 Mpx, 4 inputs, 10 s of pre-roll: the corpus' footage is 1080p and up, so most
+  cases are cut; a gif, an audio-only container and a VAAPI encode are `NO-PARTS`) and digests the argv of **every part
+  and of the last pass** (`build_part_args` with `-fps_mode` pinned, `build_final_args` with the case's own two-pass phase) in blocks
+  of `BLOCK` cases like the others, under the same `pinned` machine. Its own coverage table (`PARTS_FAMILIES`, at least
+  `MIN_PER_FAMILY` each): `parts`, `parts-refused`, `parts-many`, `parts-straddler` (a clip is an input of two parts),
+  `parts-restart` (a still picked up at a cut), `parts-bare-canvas` (a part with no clip), `parts-sound` (`-vn`),
+  `parts-svg-pictures` (`-start_number`), `parts-held`, `parts-two-pass`, `parts-10-bit`, `parts-hdr`, `parts-caption`,
+  `parts-faststart`. `KERF_GOLDEN_PARTS_CASES=<file>` writes a digest per case, `KERF_GOLDEN_PARTS_DUMP=<case>` prints one
+  case's argv. The three single-run files are the proof that a small export is unchanged: they hold, per case, the digests
+  the commit before gave.
 - **Constant-power crossfades** (`afade …:curve=qsin` only on a fade that is wholly one half of a real
   pair: a dissolve or motion transition from an adjacent clip whose overlap plays different sound — not a
   fade up from black, not a dip, not a cut inside one take) re-blessed `export.txt` alone: 1304 of 6400

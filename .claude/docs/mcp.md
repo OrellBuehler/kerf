@@ -207,7 +207,8 @@ delivery: `formats` are shape names (`9:16` / `1:1` / `4:5` / `16:9`, or
 `smart_crop` is false (the one write it makes, `project-changed` only when a
 clip actually changed), renders through `render_variants` with progress on
 the client's token naming the file in flight (`rendering 3 together (9:16, 1:1, 16:9)` for a
-single pass), and reports each file with the
+single pass; `, rendering part 2 of 5` / `, encoding` after it when that file is rendered in parts, as the
+plain `export`'s `rendering part 2 of 5, 3m to go` is), and reports each file with the
 platforms it is `ready_for` and its non-tip issues — judged at *that* file's
 frame and over the span of the export's `range` (`variant_output` →
 `cut_summary_in(Some(frame), range)`), so the agent does not run

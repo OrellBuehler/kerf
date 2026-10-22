@@ -451,7 +451,9 @@ the window of neighbours one process draws for it (`engine-cli.md`, "Scrubbed fr
 window (`scrub.stop()`), `new_project` / `open_project` clear it (`scrub.clear()`). The MCP `preview_timeline`
 stays the one-shot still on purpose: an agent asks for exactly that time and the staged cut. Environment:
 `KERF_SCRUB_CACHE_MB` (64), `KERF_SCRUB_WINDOW` (frames per window, 24; `off` / `0` = one cached still per miss);
-`KERF_GPU_LANE=off` keeps every job on the cores' slot (`engine-cli.md`, `cpu.rs`).
+`KERF_GPU_LANE=off` keeps every job on the cores' slot (`engine-cli.md`, `cpu.rs`); `KERF_EXPORT_PARTS=off` never renders an export in parts
+(a number is the decode budget in megapixels), `KERF_SEGMENT_DIR` moves the parts' lossless files, `KERF_KEEP_PARTS` keeps them (`engine-cli.md`, "A long export is
+rendered in parts"; `export-progress` then carries `part: {index, total, encoding}`).
 
 **GPU preview (A2, `gpu_preview.rs`, opt-in).** *Settings › Preview › GPU preview (experimental)*
 (`Settings.gpu_preview`, default off, persisted beside `safe_areas`) draws the Preview

@@ -692,6 +692,72 @@ so the feature is **only** activated through these forwards — which is what ma
   (`a_keyed_reframe_pans_in_every_file`); a stop removes all three files, a stop before the
   run spares the files already there. The x264 output of a lossy encode is not compared (the
   encoder threads differ between the two runs).
+  **A long export is rendered in parts** (`cli/segments.rs`; the tests are `segments_tests.rs`, pure, and
+  `segments_rendered.rs`, `#[ignore]`d). One run opens **every** clip of the span as an input, and each started
+  decoder holds its frames in flight whether or not the cut has reached its clip. Measured (FFmpeg 4.4.2, 16 threads,
+  4K / 5.3K HEVC 10-bit, x264 `veryfast` to 1080p50): a decoder costs 0.8 / 1.5 GB at default threads (about 95 MB per
+  megapixel, in proportion to its threads; 270 / 460 MB at two), so 4 UHD inputs hold 4.4 GB before the first frame
+  and 8 went over 6.6 GB; the reported reel (47 inputs) took 7.2 GB in 6 s on the pinned 9.0.2 with no frame out, and
+  21 GB in 20 s on the Windows build with `d3d11va`, then sat at 0 frames until killed (the 300 s stall).
+  `plan_export` plans the span into parts **only when the whole span is over `SEGMENT_LIMITS`** (32 megapixels
+  of open decode area, 16 inputs; a still counts a quarter): below it nothing here runs and the argv is the single
+  run's, byte for byte (the golden oracle's first 8000 cases). `KERF_EXPORT_PARTS=off` never splits, a number
+  replaces the 32; a gif, an audio-only container, a VAAPI encode, and a cut no cut can help are left whole.
+  * **Where to cut** (`plan_parts`, pure): greedily from the front, each part reaching as far as the limits allow, at
+    the frame where a clip's last drawable frame has gone or the next one's first comes (`touch`: a hair wide,
+    the window closed at both ends as `between` is, so a hard cut is one frame of overlap), preferring a cut no clip
+    straddles. A clip that straddles a cut is an input of **both** parts, read from **its own start in both**
+    with its own seek, trim, fades and keys, so a transition, a fade or a keyed zoom across a cut is the single
+    run's chain, not an approximation of it. A footage clip is not cut through if that makes a part decode more than
+    `preroll_s` (20 s) of source to drop it (a long clip under many short ones keeps the cut away: re-seeking a
+    clip mid-way would have to know its first frame's timestamp, which `-ss` rebases away). A **still image** costs
+    nothing: its frames are made up, so a part restarts it (`Restart`: `-f image2 -pattern_type none -loop 1`,
+    `settb,setpts=N+k,trim=end_frame=n`, the end from `frame_pick::fps_span`, the model of the `fps` pick) at the
+    cut however long it has been on screen — unless something keeps a count across frames (a keyed crop's
+    `perspective`, `vignette`'s dither, speed, reverse), when it is read from its start like footage.
+  * **Time is the export's.** A part's canvas is frames `first..first+n` of the whole export's (`color=...:d=(n-0.5)/fps`,
+    `setpts=N+first`: counted in frames, a half frame of slack in the duration so no rounding adds or drops
+    one), the clips' chains come from `build_filter_complex_with` unchanged (given the **whole cut's** `ClipFx` table
+    and a plan over the clips of the part, `Scope` / `InputScope`), and every timestamp a clip, title or caption
+    expression sees is the one it has in the single run; the part is shifted to start at zero only as it leaves the
+    graph (`setpts=PTS-STARTPTS`). Nothing is rebased, so nothing moves by an ulp. Titles (floating SVG) read the
+    pictures of the whole export's directory from the first one the part needs (`-start_number`); captions are the
+    overlays that touch it. A part with no clip is the canvas in the 8-bit 4:2:0 the overlays compose in.
+    `canvas_frames` reproduces `color=d=`'s frame count (checked against the binary).
+  * **The join is lossless, and the encode is one.** Each part is FFV1 (intra, `-coder 1`, in Matroska, `-pix_fmt yuv420p`
+    — **every part the same format**: a mid-stream change of pixel format made the concat reader reconfigure the graph and
+    lose frames) of exactly its frame count, checked from ffmpeg's `frame=`; the **last pass** reads them with the concat
+    demuxer (each file with its exact `duration`), re-stamps `settb=expr=1/fps,setpts=N`, and writes the file with the
+    user's codec, rate control, two passes, faststart, hardware encoder and container options through the same
+    `push_output_opts`. Why not encode each part in the final codec and `concat -c copy`: that needs identical SPS
+    / GOP / rate-control state at every join and clean DTS across B-frame delays (the seams this design cannot have: one
+    encoder, one frame sequence), does nothing for two-pass, gif or a hardware session, and faststart would need a
+    remux anyway. The cost is disk: a lossless intermediate of the span (1080p50 is about 12 MB/s), in
+    `<cache>/kerf/segments/<pid>-<n>` (or `KERF_SEGMENT_DIR`), removed on success, failure, cancel and panic (`KERF_KEEP_PARTS` keeps it
+    for debugging; a dead process's are swept at the next start).
+  * **Sound is one pass.** The last pass mixes the whole cut from the clips that have any, each opened `-vn`
+    (`InputScope::sound_only`, no picture decoder dragged along; `InputPlan::base` shifts the graph's `[N:a]` past the concat
+    input), through the export's own audio graph, so ducking, the master bus, `loudnorm`, the static loudness gain and the
+    encoder see the whole program: no click, gap or pumping at a join is possible, not merely unlikely. On 4.4.2 the sound of a
+    cut in parts is sample-for-sample the whole export's; on 9.0.2 two runs of the *same* whole export differ in the last
+    0.1 to 0.25 s (loudnorm's flush, by up to 0.08 of full scale), so the tests allow the last half second.
+  * **Budget and watchdog.** The parts and the last pass run under **one** foreground `cpu::lease` taken first
+    (nothing queued gets in between), each as a `run_ffmpeg_progress_counted` child with the stall watchdog and cancel
+    as ever; each part's decoders are `-threads 4` (`cpu::cap_input_threads`: `limit_args`' head flags reach only the first
+    input's group, so every other decoder used to run on all cores), a third of the memory per megapixel and 70 fps
+    against 86 for 4K HEVC 10-bit. `ExportProgress.part` (`ExportPart`: `rendering part 2 of 5`, then `encoding`) rides beside
+    `stage` (each part's run reports `Starting` / `Rendering` as any run does, its `Finishing` told as `Rendering`: only the last pass closes
+    the file; the parts take 55 % of the bar, the last pass the rest); `together` refuses a cut that needs parts (each delivery
+    renders in parts on its own).
+  * **Measured** on the reported shape (43 inputs: 4K / 5.3K HEVC 10-bit at 24 / 29.97 / 30, three PNG overlays across
+    the whole span, a music bed; 1080p50 libx264 `veryfast` crf 17, 60 s, pinned 9.0.2): single run killed at 7.2 GB in 6 s
+    with no frame out; in 42 parts it completes in 195 s, first progress after 11.5 s, peak 1.3 GB over all children. `a_reel_of_many_big_inputs_completes_in_parts_...` (24 UHD
+    inputs, `#[ignore]`d) holds the peak under 2.5 GB. Rendered whole and in parts, lossless, every frame and every
+    sample of a timeline with a crossfade, a dip, fades, a keyed zoom, a speed change, a faded logo, an animated SVG title and
+    captions is the same at the planner's cuts and at cuts chosen inside each of those, in 8 and 10 bit, on 4.4.2 and 9.0.2;
+    golden: `golden/parts.txt` (`core-golden.md`). Not done: cutting a long footage clip mid-way (it keeps the cuts
+    away), `together` in parts (one delivery at a time instead), pipelining the parts into the encode (the intermediate
+    exists whole before the last pass starts), and a free-space check before the parts start.
   **Levels** (`Project::levels_inputs` → static `measure_levels` → `engine::mix_levels`,
   `engine/cli/levels.rs`; lock-free split again): one ffmpeg pass over the export's own
   audio graph. `build_filter_complex_metered` is `build_filter_complex` plus taps
