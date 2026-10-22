@@ -10758,6 +10758,10 @@ mod segments;
 #[cfg(test)]
 mod segments_tests;
 
+/// An export in parts through the real ffmpeg, the whole export's frames and samples (`#[ignore]`d).
+#[cfg(test)]
+mod segments_rendered;
+
 /// The one run held to the variants rendered one by one, frame for frame (`#[ignore]`d).
 #[cfg(test)]
 mod together_rendered;
