@@ -1,12 +1,22 @@
+import { MAX_DELIVERY_FPS, MIN_DELIVERY_FPS } from './delivery-formats';
 import { trackRenders } from './levels';
 import { clipDuration, type Asset, type Timeline } from './types';
 
 const validFps = (fps: number | undefined): number =>
 	fps !== undefined && Number.isFinite(fps) && fps > 0 ? fps : 30;
 
-/** Match the engine's default export timebase: first clip carrying video,
-	* across all tracks, with a 30 fps fallback. Media selection is irrelevant. */
+/** The rate the project's delivery frame states, when it is one a delivery may name (`Delivery::rate`: a stored
+	* value out of range is ignored, as the engine ignores it). */
+function deliveryRate(timeline: Timeline): number | null {
+	const fps = timeline.format?.fps;
+	return fps !== undefined && fps !== null && Number.isFinite(fps) && fps >= MIN_DELIVERY_FPS && fps <= MAX_DELIVERY_FPS ? fps : null;
+}
+
+/** Match the engine's default export timebase: the delivery frame's rate when the project states one, else the
+	* first clip carrying video, across all tracks, with a 30 fps fallback. Media selection is irrelevant. */
 export function timelineFps(timeline: Timeline, assets: Asset[]): number {
+	const delivered = deliveryRate(timeline);
+	if (delivered !== null) return delivered;
 	for (const track of timeline.tracks) {
 		for (const clip of track.clips) {
 			const stream = assets.find(a => a.id === clip.asset_id)?.streams.find(s => s.kind === 'video');
@@ -22,6 +32,8 @@ export function timelineFps(timeline: Timeline, assets: Asset[]): number {
 	* What playback's rate, ladder and gate follow; timecode keeps [`timelineFps`], which is a frame
 	* count of the cut as it is edited. */
 export function renderedFps(timeline: Timeline, assets: Asset[]): number {
+	const delivered = deliveryRate(timeline);
+	if (delivered !== null) return delivered;
 	for (const track of timeline.tracks) {
 		if (!trackRenders(timeline, track)) continue;
 		for (const clip of track.clips) {

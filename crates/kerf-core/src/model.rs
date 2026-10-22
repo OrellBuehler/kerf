@@ -4083,8 +4083,8 @@ impl Fit {
 /// not discovered in the rendered file. Setting this makes the preview, the
 /// scrubbed still, the streamed playback and the export all render the same
 /// frame — an explicit export `resolution` still wins, so nothing about the
-/// existing dialog changes.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, schemars::JsonSchema)]
+/// existing dialog changes. The same goes for the frame rate it may carry.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct Delivery {
     pub width: u32,
     pub height: u32,
@@ -4093,17 +4093,78 @@ pub struct Delivery {
     /// keeps it over a blurred copy of itself.
     #[serde(default)]
     pub fit: Fit,
+    /// The frame rate the cut is delivered at: what the export, the streamed playback and
+    /// the stills render at when the export options name none. Absent follows the footage
+    /// (the first clip with a picture, which in mixed footage is whichever comes first),
+    /// and is not written, so a project that never set one stores what it always did. Set
+    /// through [`Delivery::with_fps`], which holds it to
+    /// [`MIN_DELIVERY_FPS`]`..=`[`MAX_DELIVERY_FPS`] and makes an NTSC rate written short
+    /// (`29.97`) the exact `30000/1001`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fps: Option<f64>,
+}
+
+/// The slowest and the fastest rate a delivery may name.
+pub const MIN_DELIVERY_FPS: f64 = 1.0;
+pub const MAX_DELIVERY_FPS: f64 = 240.0;
+
+/// How near a rate must be to an NTSC one (`n * 1000 / 1001`) to be taken for it. `23.976`, `29.97`
+/// and `59.94` are how `24000/1001`, `30000/1001` and `60000/1001` are written, and FFmpeg reads the
+/// short decimals as `2997/100` — a different rate, which counts out of step with the footage a
+/// player knows as 29.97.
+const NTSC_SNAP: f64 = 0.005;
+
+/// The whole rates that have an NTSC twin.
+const NTSC_BASES: [f64; 6] = [24.0, 30.0, 48.0, 60.0, 120.0, 240.0];
+
+/// A delivery frame rate, checked: positive, finite and within
+/// [`MIN_DELIVERY_FPS`]`..=`[`MAX_DELIVERY_FPS`], with an NTSC rate written short (`23.976`,
+/// `29.97`, `59.94`) made the exact `n * 1000 / 1001`. Any other rate is kept as given.
+pub fn check_delivery_fps(fps: f64) -> Result<f64> {
+    if !fps.is_finite() || !(MIN_DELIVERY_FPS..=MAX_DELIVERY_FPS).contains(&fps) {
+        return Err(Error::InvalidArgument(format!(
+            "a delivery frame rate must be between {MIN_DELIVERY_FPS} and {MAX_DELIVERY_FPS} fps, got {fps}"
+        )));
+    }
+    let ntsc = NTSC_BASES
+        .iter()
+        .map(|base| base * 1000.0 / 1001.0)
+        .find(|ntsc| (fps - ntsc).abs() < NTSC_SNAP);
+    Ok(ntsc.unwrap_or(fps))
+}
+
+/// A frame rate as people write it: `50`, `29.97`, `23.976`.
+pub fn fmt_fps(fps: f64) -> String {
+    format!("{}", (fps * 1000.0).round() / 1000.0)
 }
 
 impl Delivery {
-    /// Even-clamped, and never zero — the dimensions reach a filtergraph.
+    /// Even-clamped, and never zero — the dimensions reach a filtergraph. Follows the
+    /// footage's frame rate; [`Delivery::with_fps`] states one.
     pub fn new(width: u32, height: u32, fit: Fit) -> Self {
         let even = |v: u32| v.max(2) & !1;
         Self {
             width: even(width),
             height: even(height),
             fit,
+            fps: None,
         }
+    }
+
+    /// This frame delivered at `fps` (`None` follows the footage), checked by
+    /// [`check_delivery_fps`].
+    pub fn with_fps(self, fps: Option<f64>) -> Result<Self> {
+        Ok(Self {
+            fps: fps.map(check_delivery_fps).transpose()?,
+            ..self
+        })
+    }
+
+    /// The rate the engine renders at: [`Delivery::fps`] when it is one a delivery may name. A
+    /// stored value out of range (a hand-edited file) is ignored rather than reaching a filtergraph.
+    pub fn rate(&self) -> Option<f64> {
+        self.fps
+            .filter(|f| f.is_finite() && (MIN_DELIVERY_FPS..=MAX_DELIVERY_FPS).contains(f))
     }
 
     pub fn aspect(&self) -> f64 {
@@ -4752,7 +4813,8 @@ impl Timeline {
     /// to the new aspect the way [`Timeline::captions`] fit them to the old one
     /// (a 9:16 frame is half as wide, and `drawtext` draws off the edge rather
     /// than wrapping); a typed title is left alone. Delivering the shape the
-    /// project is already cut for changes only the size.
+    /// project is already cut for changes only the size. The copy keeps the
+    /// project's frame rate unless `delivery` names its own.
     pub fn for_delivery(&self, delivery: Delivery) -> Timeline {
         let ratio = delivery.ratio();
         let same_shape = self.format.is_some_and(|f| f.ratio() == ratio);
@@ -4804,7 +4866,12 @@ impl Timeline {
                 })
                 .collect(),
             markers: self.markers.clone(),
-            format: Some(delivery),
+            // A variant is a shape of the same cut: it keeps the project's frame rate unless
+            // it names its own.
+            format: Some(Delivery {
+                fps: delivery.fps.or_else(|| self.format.and_then(|f| f.fps)),
+                ..delivery
+            }),
             // The same mix at every frame: a variant changes the picture only.
             master: self.master,
         }
@@ -6720,7 +6787,10 @@ fn master_changes(before: &MasterBus, after: &MasterBus) -> Option<String> {
 }
 
 fn fmt_delivery(d: &Delivery) -> String {
-    format!("{}x{} ({})", d.width, d.height, d.fit.as_str())
+    match d.rate() {
+        Some(fps) => format!("{}x{} ({}, {} fps)", d.width, d.height, d.fit.as_str(), fmt_fps(fps)),
+        None => format!("{}x{} ({})", d.width, d.height, d.fit.as_str()),
+    }
 }
 
 impl Timeline {
@@ -8616,6 +8686,85 @@ mod tests {
         );
         // Every entry lands in the rendered summary the agent reads back.
         assert_eq!(diff.summary().lines().count(), 4);
+    }
+
+    #[test]
+    fn diff_names_a_frame_rate_that_is_the_only_change_to_the_delivery() {
+        let mut before = Timeline::new();
+        before.format = Some(Delivery::new(1080, 1920, Fit::Cover));
+        let mut after = before.clone();
+        after.format = before.format.map(|d| d.with_fps(Some(29.97)).unwrap());
+        let diff = before.diff(&after);
+        assert_eq!(diff.entries.len(), 1, "{diff:?}");
+        assert_eq!(diff.entries[0].kind, DiffKind::FormatChanged);
+        assert_eq!(
+            diff.entries[0].summary,
+            "Delivery frame 1080x1920 (cover) → 1080x1920 (cover, 29.97 fps)"
+        );
+    }
+
+    #[test]
+    fn delivery_frame_rates_are_held_to_a_sane_range_and_ntsc_is_made_exact() {
+        for ok in [1.0, 12.0, 24.0, 25.0, 30.0, 50.0, 60.0, 120.0, 240.0, 33.5] {
+            assert_eq!(check_delivery_fps(ok).unwrap(), ok, "{ok}");
+        }
+        for bad in [
+            0.0,
+            0.99,
+            -24.0,
+            240.5,
+            1000.0,
+            1e9,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
+            assert!(check_delivery_fps(bad).is_err(), "{bad} is not a delivery rate");
+        }
+        // The short decimals people write are the exact NTSC rates...
+        for (typed, exact) in [
+            (23.976, 24_000.0 / 1001.0),
+            (23.98, 24_000.0 / 1001.0),
+            (29.97, 30_000.0 / 1001.0),
+            (47.952, 48_000.0 / 1001.0),
+            (59.94, 60_000.0 / 1001.0),
+            (119.88, 120_000.0 / 1001.0),
+            (239.76, 240_000.0 / 1001.0),
+            (30_000.0 / 1001.0, 30_000.0 / 1001.0),
+        ] {
+            assert_eq!(check_delivery_fps(typed).unwrap(), exact, "{typed}");
+        }
+        // ...and nothing near a whole rate is dragged onto an NTSC one.
+        for plain in [24.0, 29.0, 29.9, 30.0, 59.9, 60.0, 23.9, 25.0] {
+            assert_eq!(check_delivery_fps(plain).unwrap(), plain, "{plain}");
+        }
+    }
+
+    #[test]
+    fn a_delivery_with_no_rate_stores_exactly_what_it_always_did() {
+        let plain = Delivery::new(1080, 1920, Fit::Cover);
+        assert_eq!(
+            serde_json::to_string(&plain).unwrap(),
+            r#"{"width":1080,"height":1920,"fit":"cover"}"#
+        );
+        let rated = plain.with_fps(Some(50.0)).unwrap();
+        assert_eq!(
+            serde_json::to_string(&rated).unwrap(),
+            r#"{"width":1080,"height":1920,"fit":"cover","fps":50.0}"#
+        );
+        // Both read back, and one stored before frame rates existed follows the footage.
+        assert_eq!(
+            serde_json::from_str::<Delivery>(r#"{"width":1080,"height":1920,"fit":"cover"}"#).unwrap(),
+            plain
+        );
+        assert_eq!(
+            serde_json::from_str::<Delivery>(&serde_json::to_string(&rated).unwrap()).unwrap(),
+            rated
+        );
+        assert_eq!(plain.rate(), None);
+        assert_eq!(rated.rate(), Some(50.0));
+        assert!(plain.with_fps(Some(0.0)).is_err());
+        assert_eq!(rated.with_fps(None).unwrap(), plain);
     }
 
     #[test]

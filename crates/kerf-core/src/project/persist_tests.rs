@@ -114,16 +114,20 @@ fn a_legacy_file_is_backed_up_once_then_upgraded() {
 }
 
 /// The columns are there, so their steps change nothing; the file is still copied aside, once,
-/// for v5 to v11 (JSON steps: `needed` always, so an older build's file is kept before it is locked out).
+/// for v5 to v12 (JSON steps: `needed` always, so an older build's file is kept before it is locked out).
 #[test]
 fn a_legacy_file_that_already_has_the_columns_is_backed_up_only_for_the_json_step() {
     let dir = scratch();
     let path = dir.join("cut.kerf");
     edited(1).0.save_as(&path).unwrap();
     make_legacy(&path, true);
-    // Every step that adds a table or a column finds it there; only v5 to v11 (JSON steps) are pending.
+    // Every step that adds a table or a column finds it there; only v5 to v12 (JSON steps) are pending.
     let pending: Vec<u32> = store::pending_steps(&Connection::open(&path).unwrap(), 0);
-    assert_eq!(pending, vec![4, 5, 6, 7, 8, 9, 10], "only the v4 -> v5 to v10 -> v11 steps");
+    assert_eq!(
+        pending,
+        vec![4, 5, 6, 7, 8, 9, 10, 11],
+        "only the v4 -> v5 to v11 -> v12 steps"
+    );
     drop(Project::open(&path).unwrap());
     assert_eq!(version_of(&path), SCHEMA_VERSION);
     let mut names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
@@ -251,7 +255,7 @@ fn a_v2_file_is_backed_up_once_then_gets_the_fonts_table() {
     let path = dir.join("cut.kerf");
     edited(2).0.save_as(&path).unwrap();
     make_v2(&path);
-    assert_eq!(SCHEMA_VERSION, 11);
+    assert_eq!(SCHEMA_VERSION, 12);
     assert!(!has_fonts_table(&path));
 
     let project = Project::open(&path).unwrap();
@@ -281,7 +285,7 @@ fn a_v2_file_is_backed_up_once_then_gets_the_fonts_table() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// The fonts table is there, so v3 changes nothing; the one backup is for v5 to v11 (JSON steps).
+/// The fonts table is there, so v3 changes nothing; the one backup is for v5 to v12 (JSON steps).
 #[test]
 fn a_v2_file_that_already_has_the_fonts_table_is_backed_up_only_for_the_json_step() {
     let dir = scratch();
@@ -293,7 +297,7 @@ fn a_v2_file_that_already_has_the_fonts_table_is_backed_up_only_for_the_json_ste
         .unwrap();
     assert_eq!(
         store::pending_steps(&Connection::open(&path).unwrap(), 2),
-        vec![4, 5, 6, 7, 8, 9, 10]
+        vec![4, 5, 6, 7, 8, 9, 10, 11]
     );
     drop(Project::open(&path).unwrap());
     assert_eq!(version_of(&path), SCHEMA_VERSION);
@@ -567,7 +571,7 @@ fn a_v8_file_is_backed_up_stamped_v9_and_keeps_its_animated_title() {
         .unwrap()
         .pragma_update(None, "user_version", 8)
         .unwrap();
-    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 8), vec![8, 9, 10]);
+    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 8), vec![8, 9, 10, 11]);
 
     let project = Project::open(&path).unwrap();
     assert_eq!(version_of(&path), SCHEMA_VERSION);
@@ -593,7 +597,10 @@ fn a_v7_file_is_backed_up_stamped_v8_and_keeps_its_outlined_title() {
         .unwrap()
         .pragma_update(None, "user_version", 7)
         .unwrap();
-    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 7), vec![7, 8, 9, 10]);
+    assert_eq!(
+        store::pending_steps(&Connection::open(&path).unwrap(), 7),
+        vec![7, 8, 9, 10, 11]
+    );
 
     let project = Project::open(&path).unwrap();
     assert_eq!(version_of(&path), SCHEMA_VERSION);
@@ -630,7 +637,7 @@ fn a_v6_file_is_backed_up_stamped_v7_and_keeps_its_keyed_mask_and_crop() {
         .unwrap();
     assert_eq!(
         store::pending_steps(&Connection::open(&path).unwrap(), 6),
-        vec![6, 7, 8, 9, 10]
+        vec![6, 7, 8, 9, 10, 11]
     );
 
     let project = Project::open(&path).unwrap();
@@ -702,7 +709,7 @@ fn a_v9_file_is_backed_up_stamped_v10_and_its_assets_read_as_range_unknown() {
         .unwrap()
         .pragma_update(None, "user_version", 9)
         .unwrap();
-    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 9), vec![9, 10]);
+    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 9), vec![9, 10, 11]);
 
     let project = Project::open(&path).unwrap();
     assert_eq!(version_of(&path), SCHEMA_VERSION);
@@ -742,7 +749,7 @@ fn a_v10_file_is_backed_up_stamped_v11_and_keeps_its_eased_title() {
         .unwrap()
         .pragma_update(None, "user_version", 10)
         .unwrap();
-    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 10), vec![10]);
+    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 10), vec![10, 11]);
 
     let project = Project::open(&path).unwrap();
     assert_eq!(version_of(&path), SCHEMA_VERSION);
@@ -760,6 +767,44 @@ fn a_v10_file_is_backed_up_stamped_v11_and_keeps_its_eased_title() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A delivery frame with a frame rate is kept as it is, and one stored before v12 has none: a delivery with no rate is
+/// written as it always was, so a stored one is byte-identical. The file is copied aside, since an older build drops the
+/// rate at its next write and the export goes back to the rate of whichever clip is first.
+#[test]
+fn a_v11_file_is_backed_up_stamped_v12_and_keeps_its_delivery_frame_rate() {
+    use crate::model::{Delivery, Fit};
+    let dir = scratch();
+    let path = dir.join("cut.kerf");
+    let plain = Delivery::new(1080, 1920, Fit::Cover);
+    let json = serde_json::to_value(plain).unwrap();
+    assert!(json.get("fps").is_none(), "no rate is written: {json}");
+    let read: Delivery = serde_json::from_value(json).unwrap();
+    assert_eq!(read.fps, None, "a delivery stored before v12 reads as following the footage");
+
+    let (project, _) = edited(1);
+    project
+        .set_delivery_format(Some(plain.with_fps(Some(50.0)).unwrap()))
+        .unwrap();
+    project.save_as(&path).unwrap();
+    drop(project);
+    Connection::open(&path)
+        .unwrap()
+        .pragma_update(None, "user_version", 11)
+        .unwrap();
+    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 11), vec![11]);
+
+    let project = Project::open(&path).unwrap();
+    assert_eq!(version_of(&path), SCHEMA_VERSION);
+    assert_eq!(project.timeline().unwrap().format.and_then(|f| f.fps), Some(50.0));
+    drop(project);
+    assert_eq!(
+        version_of(&schema_backup_path(&path, 11)),
+        11,
+        "an older build drops the rate, so the file as it was is kept"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// The timelines a file holds, `persisted/timelines-v<N>.json`, frozen at each schema version that moved
 /// the stored shape (the sample's and a few of the golden oracle's). Every one must still read; the newest
 /// must come back as it was stored, so a change to the shape is a decision (a new version, see
@@ -772,6 +817,7 @@ const PERSISTED: &[(u32, &str)] = &[
     (8, include_str!("persisted/timelines-v8.json")),
     (9, include_str!("persisted/timelines-v9.json")),
     (11, include_str!("persisted/timelines-v11.json")),
+    (12, include_str!("persisted/timelines-v12.json")),
 ];
 
 fn persisted_path(version: u32) -> PathBuf {
@@ -805,6 +851,16 @@ fn the_stored_timeline_shape_moves_only_with_the_schema_version() {
         let eased = Project::sample().unwrap();
         eased_title(&eased);
         timelines.push(eased.timeline().unwrap());
+        // A delivery frame with a frame rate (v12).
+        let rated = Project::sample().unwrap();
+        rated
+            .set_delivery_format(Some(
+                crate::model::Delivery::new(1080, 1920, crate::model::Fit::Cover)
+                    .with_fps(Some(50.0))
+                    .unwrap(),
+            ))
+            .unwrap();
+        timelines.push(rated.timeline().unwrap());
         let lines: Vec<String> = timelines.iter().map(|t| serde_json::to_string(t).unwrap()).collect();
         std::fs::write(persisted_path(SCHEMA_VERSION), format!("[\n{}\n]\n", lines.join(",\n"))).unwrap();
         return;

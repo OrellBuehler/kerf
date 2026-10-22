@@ -2,6 +2,7 @@
 // mirrors kerf_core::engine (validate_export, build_export_args) so the UI
 // reflects exactly what the backend will do.
 
+import { fpsLabel } from './delivery-formats';
 import type { Container, Delivery, ExportOptions, Fit, LoudnessPreset, RateControl } from './types';
 import { DEFAULT_EXPORT_OPTIONS } from './types';
 
@@ -263,10 +264,16 @@ export const FRAME_RATES: { label: string; value: number | null }[] = [
 ];
 
 /** The frame-rate choices with the current value among them: a rate a preset or an agent set
- *  that the list does not carry would otherwise leave the select blank. */
-export function frameRateOptions(fps: number | null | undefined): { label: string; value: number | null }[] {
-	if (!fps || FRAME_RATES.some((f) => f.value === fps)) return FRAME_RATES;
-	return [...FRAME_RATES, { label: String(fps), value: fps }];
+ *  that the list does not carry would otherwise leave the select blank. With a `projectFps` (the delivery
+ *  frame's rate) the "Source" choice is that rate, as the resolution's is the project frame: the export
+ *  and the preview must not be able to disagree about the deliverable. */
+export function frameRateOptions(
+	fps: number | null | undefined,
+	projectFps?: number | null
+): { label: string; value: number | null }[] {
+	const rates = !fps || FRAME_RATES.some((f) => f.value === fps) ? FRAME_RATES : [...FRAME_RATES, { label: String(fps), value: fps }];
+	if (projectFps == null) return rates;
+	return rates.map((r) => (r.value === null ? { ...r, label: `Project rate (${fpsLabel(projectFps)} fps)` } : r));
 }
 
 /** How the preset select groups its options. */
@@ -419,9 +426,12 @@ export function applyPreset(id: string, hw: readonly string[] = []): ExportOptio
  *  cropped because the 9:16 preset fills. */
 export function initialExport(format: Delivery | null | undefined): { id: string; opts: ExportOptions } {
 	if (!format) return { id: 'web_1080p', opts: applyPreset('web_1080p') };
+	// A project that states its frame rate exports at it: the preset's own (the social ones say 30) would
+	// override it, and the rate the user set on the delivery frame would come out as another.
+	const rate: Partial<ExportOptions> = format.fps != null ? { fps: null } : {};
 	const hit = PRESETS.find((p) => p.opts.resolution?.[0] === format.width && p.opts.resolution?.[1] === format.height);
-	if (hit) return { id: hit.id, opts: { ...applyPreset(hit.id), fit: format.fit } };
-	return { id: 'custom', opts: { ...applyPreset('web_1080p'), resolution: null, fit: format.fit } };
+	if (hit) return { id: hit.id, opts: { ...applyPreset(hit.id), fit: format.fit, ...rate } };
+	return { id: 'custom', opts: { ...applyPreset('web_1080p'), resolution: null, fit: format.fit, ...rate } };
 }
 
 export function containerInfo(c: Container): ContainerInfo {

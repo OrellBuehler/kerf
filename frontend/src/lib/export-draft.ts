@@ -14,9 +14,11 @@ export interface ExportDraft {
 	frame: string | null;
 }
 
-/** The project's delivery frame as something comparable; `null` when it has none. */
-export function frameKey(frame: Pick<Delivery, 'width' | 'height' | 'fit'> | null | undefined): string | null {
-	return frame ? `${frame.width}x${frame.height}/${frame.fit}` : null;
+/** The project's delivery frame as something comparable; `null` when it has none. Its frame rate is part of it
+ *  (a draft remembers the rate it exported at, and the project's has changed since), and a frame that states none
+ *  is keyed as it always was. */
+export function frameKey(frame: Pick<Delivery, 'width' | 'height' | 'fit' | 'fps'> | null | undefined): string | null {
+	return frame ? `${frame.width}x${frame.height}/${frame.fit}${frame.fps != null ? `@${frame.fps}` : ''}` : null;
 }
 
 /** The draft to open on, or `null` to start from the project's frame as ever: with no draft, or

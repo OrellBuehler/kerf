@@ -22,6 +22,34 @@ describe('timeline timebase', () => {
 	});
 });
 
+describe('the delivery frame rate', () => {
+	const rated = (fps: number | undefined, ids: string[] = ['b', 'a']) =>
+		({ ...timeline(ids), format: { width: 1080, height: 1920, fit: 'cover', fps } }) as Timeline;
+
+	// The twin of `the_delivery_rate_is_the_default_of_every_render_path_and_an_explicit_one_wins`
+	// (kerf-core): the rate the project states is the cut's, not the first clip's.
+	test('is the cut’s rate, for timecode and for what renders, whatever the footage is', () => {
+		expect(timelineFps(rated(50), assets)).toBe(50);
+		expect(renderedFps(rated(50), assets)).toBe(50);
+		expect(renderedFps(rated(29.97), assets)).toBe(29.97);
+		// With no clip at all there is still a rate to count in.
+		expect(timelineFps(rated(25, []), assets)).toBe(25);
+		expect(renderedFps(rated(25, []), assets)).toBe(25);
+	});
+
+	test('a frame that states none leaves the footage’s rate alone', () => {
+		expect(timelineFps(rated(undefined), assets)).toBe(24);
+		expect(renderedFps(rated(undefined), assets)).toBe(24);
+	});
+
+	test('a stored rate out of range is ignored, as the engine ignores it', () => {
+		for (const fps of [0, -30, 0.5, 241, 1e9, NaN, Infinity]) {
+			expect(timelineFps(rated(fps), assets)).toBe(24);
+			expect(renderedFps(rated(fps), assets)).toBe(24);
+		}
+	});
+});
+
 describe('rendered timebase', () => {
 	const fast = { id: 'fast', streams: [{ kind: 'video', fps: 60 }] };
 	const slow = { id: 'slow', streams: [{ kind: 'video', fps: 24 }] };

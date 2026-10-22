@@ -108,8 +108,10 @@ ripple closed — the transcript-editing primitive), `add_track`, `remove_track`
 `target?`, `fadeOut` → `{timeline, report}`), `stems_status`, `separate_stems` (`assetId`, `clipId?` →
 `{placed, timeline}`; streams `stems-progress`, rejects `stems cancelled`), `cancel_stems`, `get_levels` (`range?`,
 `loudnorm?` → `Levels`; whole-file, so lock-free; `cancel_levels` stops it, rejecting with
-`levels cancelled`), `set_delivery_format` (the project's delivery frame; omit
-width/height to clear it), `remove_clip`, `remove_clips { clipIds, ripple? }`
+`levels cancelled`), `set_delivery_format` (`width?`, `height?`, `fit?`, `fps?`: the project's delivery frame and
+the frame rate exports, playback and stills default to; omit width/height to clear it, rate included; the rate is
+set *with* the frame, so a call without `fps` clears it — the page keeps the project's with `keepRate`; refused
+outside 1..240), `remove_clip`, `remove_clips { clipIds, ripple? }`
 (one revision; `ripple: true` is the multi-select ripple delete, via
 `with_ripple`; omitted follows the project's mode), `set_volume`, `set_fade`,
 `set_speed`, `set_transform`, `set_transform_at { clipId, time, …transform fields }` (one revision: a keyed number keyed at

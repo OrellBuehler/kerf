@@ -31,7 +31,8 @@
   `Instagram Reels'` / `TikTok's` (`possessive`); `platforms.ts` mirrors it.
 - `render_plan.rs` + `planner.rs` + `plan_caps.rs` — **what one frame is made of**,
   shared by every renderer. `RenderPlan::at(timeline, assets, opts, t, color)` is the
-  canvas (the same `export_format` the still uses, through `render_geometry`) plus the
+  canvas (the same `export_format` the still uses, through `render_geometry` — so its `fps` is the delivery
+  frame's rate when the project states one) plus the
   ordered video layers visible at `t`: asset path, resolved source time (speed / reverse /
   clamped), the `Transform` sampled at clip-local time, `Color`, the stream's
   displayed size / rotation / transfer / pixel format / matrix. It is a one-shot

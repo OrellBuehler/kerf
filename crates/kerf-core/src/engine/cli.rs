@@ -4195,7 +4195,9 @@ pub struct ExportOptions {
     /// (the default), filled and cropped, or letterboxed over a blurred copy of
     /// itself. Only matters when the two differ.
     pub fit: Fit,
-    /// Output fps, baked into the filtergraph; never emits `-r`.
+    /// Output fps, baked into the filtergraph; never emits `-r`. `None` is the project's
+    /// delivery frame rate (`Delivery::fps`) when it has one, else the first clip with a
+    /// picture's.
     pub fps: Option<f64>,
     /// `scale=…:flags=` scaler (bicubic / bilinear / lanczos / neighbor / spline).
     pub scaler: Option<String>,
@@ -4672,15 +4674,83 @@ impl ExportFormat {
     }
 }
 
-/// Derive the output shape from the first clip (across all tracks) that carries
-/// a video stream and the first that carries audio, falling back to 1080p30
-/// stereo defaults. When `opts` carries resolution or fps overrides those win.
 /// The frame this timeline actually renders at: the project's delivery format
 /// when one is set, otherwise the shape its footage gives it. What a readiness
 /// check has to compare a platform's expectations against.
 pub fn delivery_frame(timeline: &Timeline, assets: &[Asset]) -> (u32, u32) {
     let f = export_format(timeline, assets, &ExportOptions::default());
     (f.width, f.height)
+}
+
+/// Where a render's frame rate came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FpsSource {
+    /// The export options named one (`ExportOptions::fps`).
+    Options,
+    /// The project's delivery frame states one (`Delivery::fps`).
+    Delivery,
+    /// Neither did, so it is the rate of the first clip with a picture — in footage of mixed
+    /// rates, whichever comes first.
+    Footage,
+    /// Nothing to follow: no clip with a picture, so the 30 fps default.
+    Default,
+}
+
+/// The frame rate the cut renders at when the export names none — the delivery frame's, else the
+/// first picture's — and which of the two it was. What a stream plays at, a still is placed on and
+/// an export writes by default; `timeline_summary` shows it so the default is not a surprise.
+pub fn delivery_rate(timeline: &Timeline, assets: &[Asset]) -> (f64, FpsSource) {
+    let (f, source) = export_format_sourced(&timeline.for_render(), assets, &ExportOptions::default());
+    (f.fps, source)
+}
+
+/// The picture an export writes, as it will be rendered: what the options and the project's
+/// delivery frame made of the footage's own, reported back so a caller sees the size and the rate
+/// it got rather than the ones it hoped for.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, schemars::JsonSchema)]
+pub struct ExportedFrame {
+    pub width: u32,
+    pub height: u32,
+    pub fps: f64,
+    /// Where `fps` came from. `footage` and `default` are the cases a caller who cares about the
+    /// rate should set `options.fps`, or the delivery frame's `fps`, for.
+    pub fps_source: FpsSource,
+}
+
+/// The picture `render_with_progress(timeline, assets, .., opts, ..)` writes: the frame of the cut as
+/// the export renders it (a range sliced, muted tracks gone). `None` when it writes no picture (an
+/// audio container, or a cut with no video clip).
+pub fn exported_frame(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions) -> Option<ExportedFrame> {
+    let cut = export_timeline(timeline, opts);
+    let has_video = cut.tracks.iter().any(|t| t.kind == StreamKind::Video && !t.clips.is_empty());
+    if opts.container.is_audio_only() || !has_video {
+        return None;
+    }
+    let (f, fps_source) = export_format_sourced(&cut, assets, opts);
+    Some(ExportedFrame {
+        width: f.width,
+        height: f.height,
+        fps: f.fps,
+        fps_source,
+    })
+}
+
+/// [`exported_frame`] of one file of a multi-format export: the cut delivered at `variant`'s frame
+/// (which keeps the project's frame rate, [`Timeline::for_delivery`]) with `opts` as
+/// `render_variants` takes them.
+pub fn variant_frame(
+    timeline: &Timeline,
+    assets: &[Asset],
+    variant: &ExportVariant,
+    opts: &ExportOptions,
+) -> Option<ExportedFrame> {
+    let per_variant = ExportOptions {
+        resolution: Some((variant.delivery.width, variant.delivery.height)),
+        fit: variant.delivery.fit,
+        ..opts.clone()
+    };
+    exported_frame(&timeline.for_delivery(variant.delivery), assets, &per_variant)
 }
 
 /// The slice of [`ExportFormat`] a renderer of one *frame* needs — the canvas
@@ -4714,7 +4784,17 @@ pub(crate) fn render_geometry(timeline: &Timeline, assets: &[Asset], opts: &Expo
     }
 }
 
+/// Derive the output shape from the first clip (across all tracks) that carries
+/// a video stream and the first that carries audio, falling back to 1080p30
+/// stereo defaults. The project's delivery frame (size, fit and frame rate) comes
+/// next, and `opts` carrying resolution or fps overrides win over all of it.
 fn export_format(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions) -> ExportFormat {
+    export_format_sourced(timeline, assets, opts).0
+}
+
+/// [`export_format`], and where its frame rate came from.
+fn export_format_sourced(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions) -> (ExportFormat, FpsSource) {
+    let mut fps_source = FpsSource::Default;
     let stream_of = |clip: &crate::model::Clip, kind: StreamKind| {
         assets
             .iter()
@@ -4740,6 +4820,7 @@ fn export_format(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions) ->
         }
         if let Some(f) = v.fps.filter(|f| *f > 0.0) {
             fmt.fps = f;
+            fps_source = FpsSource::Footage;
         }
     }
     if let Some(a) = clips().find_map(|c| stream_of(c, StreamKind::Audio)) {
@@ -4754,10 +4835,17 @@ fn export_format(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions) ->
     // export resolution: it overrides "whatever the first clip is" so the
     // preview, the still and the export agree on the shape being cut for, and
     // yields to a resolution typed into the export dialog so a one-off render
-    // at a different size still works.
+    // at a different size still works. Its frame rate, when it states one, is
+    // the same: the footage's rate is only the default of a cut that never
+    // chose (in mixed footage, whichever clip is first), and `opts.fps` below
+    // still wins over it.
     if let Some(d) = timeline.format {
         fmt.width = d.width;
         fmt.height = d.height;
+        if let Some(fps) = d.rate() {
+            fmt.fps = fps;
+            fps_source = FpsSource::Delivery;
+        }
     }
     if let Some((w, h)) = opts.resolution {
         fmt.width = w;
@@ -4765,6 +4853,7 @@ fn export_format(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions) ->
     }
     if let Some(f) = opts.fps.filter(|f| *f > 0.0) {
         fmt.fps = f;
+        fps_source = FpsSource::Options;
     }
     if let Some(r) = opts.audio_sample_rate.filter(|r| *r > 0) {
         fmt.sample_rate = r;
@@ -4802,7 +4891,7 @@ fn export_format(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions) ->
         (Some(d), Fit::Contain) => d.fit,
         (_, f) => f,
     };
-    fmt
+    (fmt, fps_source)
 }
 
 /// Build the complete argument list for `ffmpeg` (everything after the binary
@@ -11569,6 +11658,7 @@ mod tests {
             width: 1080,
             height: 1920,
             fit: Fit::Cover,
+            fps: None,
         });
         let out = StillOutput::File {
             path: "/covers/cover.jpg".to_string(),
@@ -11652,6 +11742,7 @@ mod tests {
             width: 1080,
             height: 1350,
             fit: Fit::Cover,
+            fps: None,
         });
 
         for (name, format) in [("cover.jpg", ImageFormat::Jpeg), ("cover.png", ImageFormat::Png)] {
@@ -17011,6 +17102,179 @@ mod tests {
         assert_eq!((d.width, d.height), (1080, 2));
     }
 
+    /// Footage of 100, 24 and 29.97 fps on one track: the cut an agent reported, whose export with no
+    /// `fps` came out at whatever rate the first clip happened to have.
+    fn mixed_rates() -> (Timeline, Vec<Asset>) {
+        let assets: Vec<Asset> = [100.0, 24.0, 29.97]
+            .iter()
+            .map(|fps| test_asset(vec![video_stream(1920, 1080, *fps)]))
+            .collect();
+        let clips = assets
+            .iter()
+            .enumerate()
+            .map(|(i, a)| make_clip(a.id, 0.0, 2.0, i as f64 * 2.0))
+            .collect();
+        (single(clips), assets)
+    }
+
+    fn delivered_at(fps: Option<f64>) -> Delivery {
+        Delivery::new(1080, 1920, Fit::Cover).with_fps(fps).unwrap()
+    }
+
+    #[test]
+    fn with_no_delivery_rate_the_export_follows_the_first_clip_as_it_always_did() {
+        let (mut timeline, assets) = mixed_rates();
+        let opts = ExportOptions::default();
+        assert_eq!(export_format(&timeline, &assets, &opts).fps, 100.0);
+        assert_eq!(delivery_rate(&timeline, &assets), (100.0, FpsSource::Footage));
+        // "First" is the stored order, which is why it is no answer: reorder and the rate moves.
+        timeline.tracks[0].clips.reverse();
+        assert_eq!(export_format(&timeline, &assets, &opts).fps, 29.97);
+
+        // A delivery frame with no rate of its own leaves it alone; so does no clip with a picture.
+        timeline.format = Some(delivered_at(None));
+        assert_eq!(export_format(&timeline, &assets, &opts).fps, 29.97);
+        let none = export_format_sourced(&Timeline::default(), &[], &opts);
+        assert_eq!((none.0.fps, none.1), (30.0, FpsSource::Default));
+    }
+
+    #[test]
+    fn the_delivery_rate_is_the_default_of_every_render_path_and_an_explicit_one_wins() {
+        let (mut timeline, assets) = mixed_rates();
+        timeline.format = Some(delivered_at(Some(50.0)));
+        let opts = ExportOptions::default();
+        assert_eq!(export_format(&timeline, &assets, &opts).fps, 50.0);
+        assert_eq!(delivery_rate(&timeline, &assets), (50.0, FpsSource::Delivery));
+        // Only the rate moved: the delivery's size and fit are what they were.
+        let fmt = export_format(&timeline, &assets, &opts);
+        assert_eq!((fmt.width, fmt.height, fmt.fit), (1080, 1920, Fit::Cover));
+
+        // The export options still have the last word.
+        let explicit = ExportOptions {
+            fps: Some(25.0),
+            ..Default::default()
+        };
+        let (fmt, source) = export_format_sourced(&timeline, &assets, &explicit);
+        assert_eq!((fmt.fps, source), (25.0, FpsSource::Options));
+
+        // The export graph's canvas and every clip's `fps` follow it, not a clip's own rate.
+        let args = build_export_args(&timeline, &assets, "out.mp4", &opts).unwrap();
+        let graph = flag_val(&args, "-filter_complex").unwrap();
+        assert!(graph.contains(":r=50:"), "{graph}");
+        assert_eq!(graph.matches("fps=50").count(), 3, "{graph}");
+        assert!(
+            !graph.contains("fps=100") && !graph.contains("fps=24") && !graph.contains("29.97"),
+            "{graph}"
+        );
+
+        // The same graph is what plays and what a still is placed on.
+        let params = playback_params(&timeline, &assets, PlaybackRequest::default());
+        assert_eq!(params.fps, 50.0);
+        let preview = build_preview_args(&timeline, &assets, 0.0, params.fps, params.max_width, PREVIEW_STREAM_QUALITY).unwrap();
+        assert!(flag_val(&preview, "-filter_complex").unwrap().contains("fps=50"));
+        assert_eq!(render_geometry(&timeline, &assets, &opts).fps, 50.0);
+        // The playback clamp is the stream's own: a 240 fps delivery plays at what a display paints.
+        timeline.format = Some(delivered_at(Some(240.0)));
+        assert_eq!(
+            playback_params(&timeline, &assets, PlaybackRequest::default()).fps,
+            MAX_STREAM_FPS
+        );
+    }
+
+    #[test]
+    fn ntsc_delivery_rates_reach_the_graph_as_the_exact_rate() {
+        let (mut timeline, assets) = mixed_rates();
+        for (typed, exact) in [
+            (23.976, 24_000.0 / 1001.0),
+            (29.97, 30_000.0 / 1001.0),
+            (59.94, 60_000.0 / 1001.0),
+        ] {
+            timeline.format = Some(delivered_at(Some(typed)));
+            let fps = export_format(&timeline, &assets, &ExportOptions::default()).fps;
+            assert_eq!(fps, exact, "{typed}");
+            // What FFmpeg parses `fps=` and `color=r=` to is the NTSC rational, not 2997/100.
+            let rational = crate::clip_timing::Rational::from_fps(fps).unwrap();
+            assert_eq!(
+                (rational.num, rational.den),
+                ((typed * 1001.0 / 1000.0).round() as u32 * 1000, 1001)
+            );
+        }
+    }
+
+    #[test]
+    fn a_stored_delivery_rate_out_of_range_is_ignored() {
+        let (mut timeline, assets) = mixed_rates();
+        for bad in [0.0, -30.0, 0.5, 1e9, f64::NAN, f64::INFINITY] {
+            timeline.format = Some(Delivery {
+                fps: Some(bad),
+                ..delivered_at(None)
+            });
+            assert_eq!(
+                export_format_sourced(&timeline, &assets, &ExportOptions::default()).1,
+                FpsSource::Footage,
+                "{bad} is not a rate"
+            );
+            assert_eq!(export_format(&timeline, &assets, &ExportOptions::default()).fps, 100.0);
+        }
+    }
+
+    #[test]
+    fn a_variant_keeps_the_project_rate_unless_it_names_its_own() {
+        let (mut timeline, assets) = mixed_rates();
+        timeline.format = Some(delivered_at(Some(50.0)));
+        let square = Delivery::new(1080, 1080, Fit::Cover);
+        assert_eq!(timeline.for_delivery(square).format.unwrap().fps, Some(50.0));
+        let own = square.with_fps(Some(24.0)).unwrap();
+        assert_eq!(timeline.for_delivery(own).format.unwrap().fps, Some(24.0));
+        // A project with no rate hands none on.
+        timeline.format = Some(delivered_at(None));
+        assert_eq!(timeline.for_delivery(square).format.unwrap().fps, None);
+
+        timeline.format = Some(delivered_at(Some(50.0)));
+        let variant = ExportVariant::beside(Path::new("/out/cut.mp4"), square);
+        let frame = variant_frame(&timeline, &assets, &variant, &ExportOptions::default()).unwrap();
+        assert_eq!(
+            (frame.width, frame.height, frame.fps, frame.fps_source),
+            (1080, 1080, 50.0, FpsSource::Delivery)
+        );
+    }
+
+    #[test]
+    fn an_export_reports_the_frame_it_writes() {
+        let (mut timeline, assets) = mixed_rates();
+        let opts = ExportOptions::default();
+        let frame = exported_frame(&timeline, &assets, &opts).unwrap();
+        assert_eq!(
+            (frame.width, frame.height, frame.fps, frame.fps_source),
+            (1920, 1080, 100.0, FpsSource::Footage)
+        );
+
+        timeline.format = Some(delivered_at(Some(29.97)));
+        let frame = exported_frame(&timeline, &assets, &opts).unwrap();
+        assert_eq!((frame.width, frame.height), (1080, 1920));
+        assert_eq!((frame.fps, frame.fps_source), (30_000.0 / 1001.0, FpsSource::Delivery));
+
+        // What the options changed is what is reported, not what the project asked for.
+        let resized = ExportOptions {
+            resolution: Some((720, 1280)),
+            fps: Some(24.0),
+            ..Default::default()
+        };
+        let frame = exported_frame(&timeline, &assets, &resized).unwrap();
+        assert_eq!(
+            (frame.width, frame.height, frame.fps, frame.fps_source),
+            (720, 1280, 24.0, FpsSource::Options)
+        );
+
+        // No picture, no frame to report.
+        let audio = ExportOptions {
+            container: Container::Mp3,
+            ..Default::default()
+        };
+        assert_eq!(exported_frame(&timeline, &assets, &audio), None);
+        assert_eq!(exported_frame(&Timeline::default(), &[], &opts), None);
+    }
+
     #[test]
     fn the_preview_canvas_follows_the_delivery_frame() {
         let timeline = Timeline {
@@ -18793,6 +19057,86 @@ mod tests {
         let dims = String::from_utf8_lossy(&probed.stdout).trim().to_string();
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(dims, "1080,1920", "the project frame decides the file's shape");
+    }
+
+    /// The file's own frame rate, as `ffprobe` reads it: `50/1`, `30000/1001`.
+    fn probed_rate(path: &Path) -> String {
+        let probed = command(&ffprobe_bin())
+            .args(["-v", "error", "-select_streams", "v:0"])
+            .args(["-show_entries", "stream=r_frame_rate", "-of", "csv=p=0"])
+            .arg(path)
+            .output()
+            .expect("run ffprobe");
+        String::from_utf8_lossy(&probed.stdout).trim().to_string()
+    }
+
+    /// Footage of 24 and 25 fps in one cut: with no rate on the delivery frame the file takes the first
+    /// clip's, a delivery rate decides it instead (an NTSC one as the exact `30000/1001`, which FFmpeg
+    /// would otherwise read as `2997/100`), and the export's own `fps` still wins.
+    ///
+    /// `cargo test -p kerf-core --no-default-features -- --ignored delivery_rate_decides`
+    #[test]
+    #[ignore = "needs the ffmpeg binary"]
+    fn the_delivery_rate_decides_the_files_frame_rate_in_mixed_footage() {
+        let dir = std::env::temp_dir().join(format!("kerf-delivery-rate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let source = |name: &str, rate: u32| {
+            let media = dir.join(name);
+            let ok = command(&ffmpeg_bin())
+                .args(["-hide_banner", "-loglevel", "error", "-y"])
+                .args(["-f", "lavfi", "-i", &format!("testsrc=size=640x360:rate={rate}:duration=2")])
+                .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+                .arg(&media)
+                .status_bounded()
+                .expect("run ffmpeg");
+            assert!(ok.success());
+            let mut asset = av_asset(Uuid::new_v4(), 2.0);
+            asset.path = media.to_string_lossy().into_owned();
+            asset.streams = vec![video_stream(640, 360, f64::from(rate))];
+            asset
+        };
+        let (slow, quick) = (source("slow.mp4", 24), source("quick.mp4", 25));
+        let cut = |format: Option<Delivery>| Timeline {
+            format,
+            ..single(vec![make_clip(slow.id, 0.0, 1.0, 0.0), make_clip(quick.id, 0.0, 1.0, 1.0)])
+        };
+        let assets = [slow.clone(), quick.clone()];
+        let opts = ExportOptions {
+            container: Container::Mp4,
+            video_codec: Some("libx264".into()),
+            include_audio: false,
+            ..Default::default()
+        };
+        let rate_of = |name: &str, format: Option<Delivery>, opts: &ExportOptions| {
+            let out = dir.join(name);
+            render_with(&cut(format), &assets, &out, opts).expect("export");
+            probed_rate(&out)
+        };
+        let frame = Delivery::new(640, 360, Fit::Contain);
+        let at = |fps: f64| Some(frame.with_fps(Some(fps)).unwrap());
+
+        let explicit = ExportOptions {
+            fps: Some(25.0),
+            ..opts.clone()
+        };
+        let seen = [
+            ("footage", rate_of("footage.mp4", Some(frame), &opts)),
+            ("none", rate_of("none.mp4", None, &opts)),
+            ("50", rate_of("fifty.mp4", at(50.0), &opts)),
+            ("29.97", rate_of("ntsc.mp4", at(29.97), &opts)),
+            ("explicit", rate_of("explicit.mp4", at(50.0), &explicit)),
+        ];
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            seen,
+            [
+                ("footage", "24/1".to_string()),
+                ("none", "24/1".to_string()),
+                ("50", "50/1".to_string()),
+                ("29.97", "30000/1001".to_string()),
+                ("explicit", "25/1".to_string()),
+            ]
+        );
     }
 
     // ---- rotation, colour and frame rate at probe time ----------------------

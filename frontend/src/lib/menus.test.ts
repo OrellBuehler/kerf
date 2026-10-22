@@ -295,6 +295,29 @@ describe('View', () => {
 		expect(items.filter((i) => i.checked).map((i) => i.label)).toEqual(['9:16']);
 	});
 
+	test('the delivery frame rate submenu is Source and the rates, with the project’s ticked', () => {
+		const rates = (over: Partial<MenuState>) =>
+			(find(menu('view', over).items, 'Delivery frame rate') as Extract<MenuEntry, { kind: 'submenu' }>).items as Extract<MenuEntry, { kind: 'command' }>[];
+		const items = rates({ delivery: 'vertical', deliveryFps: 50 });
+		expect(items.map((i) => i.label)).toEqual(['Source', '23.976', '24', '25', '29.97', '30', '50', '59.94', '60']);
+		expect(items.map((i) => (i.command.type === 'deliveryFps' ? i.command.fps : 'x'))).toEqual([null, 23.976, 24, 25, 29.97, 30, 50, 59.94, 60]);
+		expect(items.filter((i) => i.checked).map((i) => i.label)).toEqual(['50']);
+		// A frame that states none follows the footage; the backend's exact NTSC rate ticks the 29.97 entry.
+		expect(rates({ deliveryFps: null }).filter((i) => i.checked).map((i) => i.label)).toEqual(['Source']);
+		expect(rates({ deliveryFps: 30000 / 1001 }).filter((i) => i.checked).map((i) => i.label)).toEqual(['29.97']);
+		expect(items.every((i) => !i.disabled)).toBe(true);
+	});
+
+	test('the rate is part of the frame: without one every rate is off, and says why; so is a previewed proposal', () => {
+		const rates = (over: Partial<MenuState>) =>
+			(find(menu('view', over).items, 'Delivery frame rate') as Extract<MenuEntry, { kind: 'submenu' }>).items as Extract<MenuEntry, { kind: 'command' }>[];
+		for (const e of rates({ hasFrame: false })) {
+			expect(e.disabled, e.label).toBe(true);
+			expect(e.reason, e.label).toContain('delivery frame');
+		}
+		for (const e of rates({ previewing: true })) expect(e.disabled, e.label).toBe(true);
+	});
+
 	test('the safe-area guides are a tick that needs a delivery frame', () => {
 		const on = find(menu('view', { safeAreas: true }).items, 'Safe-area guides');
 		expect(on.kind === 'action' && on.checked).toBe(true);

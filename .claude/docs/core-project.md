@@ -156,9 +156,14 @@
   attribute strictly and refuses it, so the next time it sets that title's text again the text stays text and the animation stops
   playing, while the attribute stays; an animation with no curves is written as it was, so a stored title without them is
   byte-identical, and a `.kerftemplate` manifest is unchanged (the animation is in its `title.svg`; no `UPGRADES` step);
-  `persisted/timelines-v11.json` holds a title with a spring.
-  The schema is at **v11** (`SCHEMA_VERSION`). `persist_tests` pins which steps a file has pending with
-  `store::pending_steps` (a legacy file that has every column: `[4, 5, 6, 7, 8, 9, 10]`). A step's `needed_to_read` says whether a build that
+  `persisted/timelines-v11.json` holds a title with a spring; v11→v12 is a JSON step for a **new field**,
+  `Delivery.fps` (`"fps"` beside `"fit"` in the timeline's `format`; the delivery frame rate, 1..240, `Project::set_delivery_format`
+  validates it and labels the revision `Deliver 1080x1920 at 50 fps`): an older build drops it at its next write and the
+  export then goes back to the first clip's rate without a word; a delivery with none is written as before
+  (`a_delivery_with_no_rate_stores_exactly_what_it_always_did`), `run` a no-op, `needed` always,
+  `needed_to_read` false; `persisted/timelines-v12.json` holds a 9:16 delivery at 50 fps.
+  The schema is at **v12** (`SCHEMA_VERSION`). `persist_tests` pins which steps a file has pending with
+  `store::pending_steps` (a legacy file that has every column: `[4, 5, 6, 7, 8, 9, 10, 11]`). A step's `needed_to_read` says whether a build that
   cannot write must still refuse a file lacking what it adds: true for the v1, v2 and v4 columns (the reads
   name them), false for the `fonts` table (reads tolerate its absence), so a write-protected v2 project
   opens as it is. A new file is stamped `SCHEMA_VERSION`; a

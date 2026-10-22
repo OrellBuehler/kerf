@@ -20,8 +20,8 @@ a 0.05s minimum; left edges commit `trim_clip` with `timeline_start` so the righ
 stays put; stills extend freely since they loop).
 **Gestures are frame-quantized** (`src/lib/frames.ts`, bun-tested; keyframes stay in
 seconds): a trim, move, drop, razor cut and fade length land on a frame of the cut's
-rate — `editor.fps`, i.e. `timelineFps`, the first video clip's rate else 30, which is
-`export_format`'s rule. Each rounds **once, from the raw pointer position** (a frame is
+rate — `editor.fps`, i.e. `timelineFps`: the delivery frame's rate when the project states one (`Delivery.fps`), else the
+first video clip's, else 30, which is `export_format`'s rule. Each rounds **once, from the raw pointer position** (a frame is
 `k / fps` from an integer `k`, so equal frames are equal doubles and nothing drifts over
 a long run of edits), the ghost and the commit use that one value, and a trim derives
 every field from it (`trimEdit`). A magnet within reach (`ui.snap`: 0 / playhead / bars and beats
@@ -446,7 +446,7 @@ The **toolbar** is `ToolbarToggle`s (`frontend.md`, Shared components): tools | 
 zoom | snapping and Ripple | the three track heights and the overview | `+ V` / `+ A` and the delivery frame on the right,
 a rule between each group. Every one is 24 px high with a 24 px target at least, and lit the same way (amber outline
 and wash) — a tool, snapping (a magnet, `aria-pressed`), Ripple, the heights, the overview, a fade that is set, and the delivery
-frame once one is chosen. The track header's own S / L / DUCK toggles are not part of it.
+frame once one is chosen (its label then carries the frame rate when it states one: `9:16 · 50 fps`). The track header's own S / L / DUCK toggles are not part of it.
 The **minimap** (`Minimap.svelte` over the pure `minimap.ts`; toolbar toggle, remembered; **hidden while
 the view already takes in 98 % of the cut** — `viewCoversCut`, so it costs its 37 px only once you are zoomed
 in, and the window fitted at open never shows it) is the whole cut on a 36 px strip: a block per clip per track row (runs too fine to tell apart

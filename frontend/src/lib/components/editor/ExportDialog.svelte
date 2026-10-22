@@ -206,6 +206,9 @@
 		return d ? `${d.width}×${d.height}` : null;
 	});
 
+	// ...and its frame rate: what an unset one resolves to.
+	const projectRate = $derived(editor.timeline.format?.fps ?? null);
+
 	function resValue(): string {
 		if (customRes) return 'custom';
 		return opts.resolution ? `${opts.resolution[0]}x${opts.resolution[1]}` : 'source';
@@ -448,9 +451,14 @@
 			{@render selectRow(
 				'Frame rate',
 				opts.fps ? String(opts.fps) : 'source',
-				frameRateOptions(opts.fps).map((f) => ({ value: f.value ? String(f.value) : 'source', label: f.label })),
+				frameRateOptions(opts.fps, projectRate).map((f) => ({ value: f.value ? String(f.value) : 'source', label: f.label })),
 				(v) => patch({ fps: v === 'source' ? null : parseFloat(v) })
 			)}
+			{#if !opts.fps && projectRate}
+				<div style="font-size:12px;color:var(--text-muted);padding:0 0 6px;text-align:right">
+					Renders at the delivery frame’s rate. Pick a rate to override it here only.
+				</div>
+			{/if}
 			{#if qualityOptions.length}
 				{@render selectRow(
 					'Quality',

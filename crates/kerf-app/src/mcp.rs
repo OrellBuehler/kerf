@@ -878,6 +878,14 @@ struct SetDeliveryFormatParams {
                               \"blur\" scales the whole picture in over a blurred, enlarged copy of itself \
                               that fills the bars")]
     fit: Option<Fit>,
+    #[schemars(
+        description = "The frame rate the cut is delivered at, 1 to 240 (24, 25, 30, 50, 60, or the \
+                              NTSC rates 23.976 / 29.97 / 59.94). An export, the preview and the stills use it \
+                              whenever `options.fps` names none. Omit to keep the rate the project already \
+                              has (none: exports follow the FIRST clip's rate, which in footage of mixed \
+                              rates is whichever comes first); 0 clears it back to following the footage."
+    )]
+    fps: Option<f64>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -1750,7 +1758,8 @@ struct ExportParams {
                        audio_codec (aac/libmp3lame/libopus/flac/alac/pcm_s16le/pcm_s24le); \
                        rate_control (crf/bitrate/two_pass/lossless); crf; video_bitrate (\"8M\"); \
                        preset; hwaccel (\"auto\"/\"cuda\"/\"vaapi\"/\"videotoolbox\"/\"qsv\" — GPU \
-                       decode, composes with any encoder); resolution ([w,h]); fps; audio_bitrate \
+                       decode, composes with any encoder); resolution ([w,h]); fps (default: the delivery \
+                       frame's rate from set_delivery_format, else the first clip's); audio_bitrate \
                        (\"192k\"); include_audio; faststart; range ({start,end} timeline seconds — \
                        render only that span); embed_captions (mux the cut's captions in as a soft \
                        subtitle stream — mp4/mov/mkv/webm only, not shown by default); \
@@ -2417,11 +2426,17 @@ struct TimelineSummary {
     /// source. Absent when there are none.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     title_clips: Vec<TitleClipSummary>,
-    /// The frame this cut is being made for, e.g. "1080x1920 (cover)". Absent
-    /// when the project follows its footage's shape. Worth reading before
-    /// framing anything: under a cover delivery the crop decides what survives.
+    /// The frame this cut is being made for, e.g. "1080x1920 (cover, 50 fps)" (the rate only when
+    /// the delivery states one). Absent when the project follows its footage's shape. Worth reading
+    /// before framing anything: under a cover delivery the crop decides what survives.
     #[serde(skip_serializing_if = "Option::is_none")]
     delivery_format: Option<String>,
+    /// The frame rate an export writes when it is given no `fps` of its own, and where that comes from
+    /// (`delivery`: the delivery frame's rate; `footage`: the first clip with a picture, which in
+    /// footage of mixed rates is whichever comes first — set one with set_delivery_format). Absent
+    /// with no picture and no delivery rate.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    export_fps: Option<ExportFps>,
     /// Set while edits are staged: this summary describes the **proposal**, not
     /// the cut the user is looking at. `staged_diff` spells out the difference.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2430,6 +2445,58 @@ struct TimelineSummary {
     /// Absent when everything is ready.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     media_notes: Vec<reads::MediaNote>,
+}
+
+/// The delivery frame a `set_delivery_format` call asks for, given the one the project has now (`None`
+/// clears it). A width and height set the frame; its rate is `fps` (0 clears it), else the one the
+/// project already delivers at, so reshaping does not lose it. `fps` alone changes the rate of the
+/// frame the project has (and refuses when there is none); nothing at all clears the frame.
+fn next_delivery(p: &SetDeliveryFormatParams, current: Option<Delivery>) -> kerf_core::Result<Option<Delivery>> {
+    let rate = match p.fps {
+        Some(0.0) => None,
+        Some(fps) => Some(fps),
+        None => current.and_then(|d| d.rate()),
+    };
+    match (p.width, p.height, p.fps, current) {
+        (Some(w), Some(h), _, _) => Delivery::new(w, h, p.fit.unwrap_or(Fit::Cover)).with_fps(rate).map(Some),
+        (None, None, Some(_), Some(frame)) => Delivery {
+            fit: p.fit.unwrap_or(frame.fit),
+            ..frame
+        }
+        .with_fps(rate)
+        .map(Some),
+        (None, None, Some(0.0), None) => Ok(None),
+        (None, None, Some(_), None) => Err(kerf_core::Error::InvalidArgument(
+            "no delivery frame is set, so there is no frame to give a rate: pass width and height too".to_string(),
+        )),
+        _ => Ok(None),
+    }
+}
+
+/// A frame rate and where it comes from (`kerf_core::FpsSource`).
+#[derive(Serialize)]
+struct ExportFps {
+    fps: f64,
+    from: kerf_core::FpsSource,
+}
+
+/// The rate an export with no `fps` of its own writes for `timeline` (as it renders), or `None` when
+/// nothing sets one: no clip with a picture and no delivery rate.
+fn export_fps_of(timeline: &Timeline, assets: &[kerf_core::Asset]) -> Option<ExportFps> {
+    let (fps, from) = kerf_core::delivery_rate(timeline, assets);
+    (from != kerf_core::FpsSource::Default).then_some(ExportFps { fps, from })
+}
+
+/// `frame` (what an export wrote: its size and rate, and where the rate came from) put on a result
+/// object. A render with no picture (an audio file) has none and leaves the object as it is.
+fn with_frame(mut result: serde_json::Value, frame: Option<kerf_core::ExportedFrame>) -> serde_json::Value {
+    if let (Some(frame), Some(map)) = (frame, result.as_object_mut()) {
+        map.insert("width".into(), frame.width.into());
+        map.insert("height".into(), frame.height.into());
+        map.insert("fps".into(), frame.fps.into());
+        map.insert("fps_source".into(), serde_json::json!(frame.fps_source));
+    }
+    result
 }
 
 // ---- tools -----------------------------------------------------------------
@@ -3240,24 +3307,34 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Set the frame this project is cut for — the shape of the delivered video, e.g. \
-                       1080x1920 for a vertical Reel or 1080x1080 for a square feed post. Everything \
+        description = "Set the frame this project is cut for — the shape and frame rate of the delivered video, e.g. \
+                       1080x1920 at 30 fps for a vertical Reel or 1080x1080 for a square feed post. Everything \
                        that renders a picture (preview_timeline, get_frame and the export) then uses \
                        it, so what you look at while cutting is what ships. With \"cover\" (the default) \
                        a 16:9 shot is filled and cropped to the frame, which means the crop decides what \
                        survives: check preview_timeline and use set_transform's position to slide the \
                        important part of a shot back into frame. With \"blur\" the whole shot shows, the \
                        bars filled with a blurred copy of it (a clip moved or scaled by its transform gets \
-                       plain bars). Omit width and height to clear it."
+                       plain bars). `fps` is the frame rate every export defaults to: without one an export \
+                       takes the rate of the FIRST clip with a picture, which in footage of mixed rates \
+                       (100, 24 and 29.97 fps) is whichever happens to come first — set it whenever the \
+                       footage is mixed or the user has a rate in mind; an explicit `options.fps` on the \
+                       export still wins. Omit `fps` to keep the project's current rate, pass 0 to clear it; \
+                       `fps` alone (no width and height) changes just the rate of the frame the project has. \
+                       Omit all three to clear the whole frame, rate included. Returns the frame and \
+                       the rate an export will use (`export_fps`, and where it comes from)."
     )]
     fn set_delivery_format(&self, Parameters(p): Parameters<SetDeliveryFormatParams>) -> Result<String, McpError> {
-        let format = match (p.width, p.height) {
-            (Some(w), Some(h)) => Some(Delivery::new(w, h, p.fit.unwrap_or(Fit::Cover))),
-            _ => None,
-        };
         self.edit(|project| {
+            let current = project.working_timeline().map_err(core_err)?.format;
+            let format = next_delivery(&p, current).map_err(core_err)?;
             let timeline = project.set_delivery_format(format).map_err(core_err)?;
-            json(&serde_json::json!({ "format": timeline.format, "timeline": reads::timeline_brief(&timeline) }))
+            let assets = project.list_assets().map_err(core_err)?;
+            json(&serde_json::json!({
+                "format": timeline.format,
+                "export_fps": export_fps_of(&timeline, &assets),
+                "timeline": reads::timeline_brief(&timeline),
+            }))
         })
     }
 
@@ -5292,7 +5369,12 @@ impl KerfMcp {
     #[tool(
         description = "Render the timeline to a file with full ffmpeg encode control (container, video/audio codec, \
                        rate control, resolution, fps, bitrate, faststart, gif, audio-only …). Omit `options` for the \
-                       safe H.264/AAC MP4 default. `options.loudness` normalizes the mix to a platform target: \
+                       safe H.264/AAC MP4 default. Frame size and rate: `options.resolution` and `options.fps` win; \
+                       without them the file takes the project's delivery frame (set_delivery_format: its size and \
+                       its `fps`), and without that the FIRST clip with a picture, which in footage of mixed frame \
+                       rates is whichever comes first. The result reports the `width`, `height` and `fps` the file \
+                       was written at and where the rate came from (`fps_source`: options / delivery / footage); \
+                       check it against what was asked for. `options.loudness` normalizes the mix to a platform target: \
                        youtube / spotify (-14 LUFS), apple (-16), broadcast (EBU R128, -23), all at -1 dBTP; add \
                        `options.loudness_static: true` to get there with one measured gain and a true-peak limiter \
                        (the mix's dynamics untouched; the render measures it first) instead of loudnorm's riding gain. A render takes minutes: send a `progressToken` in the request's \
@@ -5347,6 +5429,9 @@ impl KerfMcp {
                     );
                 };
                 let before = kerf_core::file_mtime(&output);
+                // The picture the file will be, said back: the size and rate the options and the
+                // delivery frame made of the footage's own.
+                let frame = kerf_core::exported_frame(&timeline, &assets, &opts);
                 let status =
                     kerf_core::render_with_progress(&timeline, &assets, &output, &opts, &mut on_progress, &|| run.cancelled())
                         .map_err(|e| {
@@ -5361,12 +5446,14 @@ impl KerfMcp {
                     // anyone is still holding its handle.
                     kerf_core::discard_partial(&output, before);
                 }
-                Ok((status, output))
+                Ok((status, output, frame))
             })
             .await?;
             match status {
-                (kerf_core::RenderStatus::Completed, output) => json(&serde_json::json!({ "output": output })),
-                (kerf_core::RenderStatus::Cancelled, output) => Err(McpError::internal_error(
+                (kerf_core::RenderStatus::Completed, output, frame) => {
+                    json(&with_frame(serde_json::json!({ "output": output }), frame))
+                }
+                (kerf_core::RenderStatus::Cancelled, output, _) => Err(McpError::internal_error(
                     format!("export cancelled; the partial file at {} was removed", output.display()),
                     None,
                 )),
@@ -5381,8 +5468,9 @@ impl KerfMcp {
                        smart-cropped per shape first (unless smart_crop is false), which is recorded on the clips as \
                        one revision and reused by later exports; generated captions are re-fit to each frame. The \
                        project's own frame is untouched. Files land beside output_path named by shape \
-                       (`cut-9x16.mp4`). Reports each file with the platforms it is ready for and any issue, so \
-                       there is no need to run platform_check per variant afterwards. Progress and cancellation \
+                       (`cut-9x16.mp4`) and keep the project's delivery frame rate (set_delivery_format's `fps`; \
+                       `options.fps` wins). Reports each file with the size and frame rate it was written at, \
+                       the platforms it is ready for and any issue, so there is no need to run platform_check per variant afterwards. Progress and cancellation \
                        work as in `export` (and `background: true` returns a job_id). The files render in one pass by \
                        default (single_pass): one decode of the sources split into every frame, so cancelling removes \
                        them all; with single_pass false they render one after another and cancelling keeps the files \
@@ -5503,7 +5591,10 @@ impl KerfMcp {
                 let mut outputs = Vec::new();
                 let project = lock_agent_as(&project, owner.as_deref());
                 for v in render_variants.iter().take(ended.completed) {
-                    outputs.push(variant_output(&project, v, range)?);
+                    // The size and rate that file was written at, not the delivery's nominal ones: the
+                    // options may have named their own, and the project's frame rate rides along.
+                    let frame = kerf_core::variant_frame(&timeline, &assets, v, &opts);
+                    outputs.push(with_frame(variant_output(&project, v, range)?, frame));
                 }
                 Ok((ended.status, outputs, ended.together))
             })
@@ -6100,9 +6191,17 @@ impl KerfMcp {
                 tracks,
                 svg_overlays: timeline.svg_overlays.iter().map(SvgOverlaySummary::from).collect(),
                 title_clips: TitleClipSummary::all(&timeline),
-                delivery_format: timeline
-                    .format
-                    .map(|d| format!("{}x{} ({})", d.width, d.height, format!("{:?}", d.fit).to_lowercase())),
+                delivery_format: timeline.format.map(|d| match d.rate() {
+                    Some(fps) => format!(
+                        "{}x{} ({}, {} fps)",
+                        d.width,
+                        d.height,
+                        format!("{:?}", d.fit).to_lowercase(),
+                        kerf_core::fmt_fps(fps)
+                    ),
+                    None => format!("{}x{} ({})", d.width, d.height, format!("{:?}", d.fit).to_lowercase()),
+                }),
+                export_fps: export_fps_of(&timeline, &assets),
                 staged_changes,
                 media_notes: media.notes,
             })
@@ -6653,7 +6752,11 @@ const EDITING_GUIDE: &str = "How to edit with Kerf. The user queues editing task
              the frame it is being made for and smart_crop then frames each shot \
              for it — reshaping 16:9 footage to 9:16 throws away most of the \
              width, and without this the middle is what survives, subject or \
-             not. Look at the result with preview_timeline; the crop is an \
+             not. It also sets the frame RATE every export defaults to (`fps`): \
+             without one an export takes the rate of the first clip with a \
+             picture, which in footage of mixed rates is whichever comes first — \
+             timeline_summary shows what it would be (`export_fps`), and an \
+             export reports the rate it wrote. Look at the result with preview_timeline; the crop is an \
              ordinary transform the user can adjust. When the same cut is \
              going to several places, export_variants renders it at every \
              shape (9:16, 1:1, 4:5, 16:9) in one call and one pass, framing each shot for \
@@ -7184,9 +7287,9 @@ fn json<T: Serialize>(value: &T) -> Result<String, McpError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        caption_source, clip_moves, core_err, elide_large_svg, fmt_ts, image_result, log_tool_error, png_result,
+        caption_source, clip_moves, core_err, elide_large_svg, export_fps_of, fmt_ts, image_result, log_tool_error, png_result,
         refuse_overwrite, reject_unknown_arguments, require_window, router, server_identity, svg_moments, svg_preview,
-        svg_sheet_caption, svg_sheet_times, svg_source, track_gaps, variant_output, ClipMoveParams, SvgMoments,
+        svg_sheet_caption, svg_sheet_times, svg_source, track_gaps, variant_output, with_frame, ClipMoveParams, SvgMoments,
         SvgOverlaySummary, SvgPreviewTitle, SvgValidation,
     };
 
@@ -8060,6 +8163,117 @@ mod tests {
             assert!(text.contains(needle), "{needle}: {text}");
         }
         assert!(router().list_all().iter().any(|t| t.name == "get_editing_guide"));
+    }
+
+    /// `set_delivery_format` takes a frame rate, and the words an agent reads say what leaving it out
+    /// does and where exports now get their rate from.
+    #[test]
+    fn next_delivery_keeps_the_rate_through_a_reshape_and_sets_it_alone() {
+        use kerf_core::{Delivery, Fit};
+        let ask = |width, height, fit, fps| super::SetDeliveryFormatParams { width, height, fit, fps };
+        let vertical = Delivery::new(1080, 1920, Fit::Cover).with_fps(Some(50.0)).unwrap();
+        let next = |p, current| super::next_delivery(&p, current).unwrap();
+        // A reshape with no rate keeps the one the project has; a stated one replaces it, 0 clears it.
+        let square = next(ask(Some(1080), Some(1080), None, None), Some(vertical)).unwrap();
+        assert_eq!((square.width, square.height, square.fps), (1080, 1080, Some(50.0)));
+        let square = next(ask(Some(1080), Some(1080), None, Some(25.0)), Some(vertical)).unwrap();
+        assert_eq!(square.fps, Some(25.0));
+        let square = next(ask(Some(1080), Some(1080), None, Some(0.0)), Some(vertical)).unwrap();
+        assert_eq!(square.fps, None);
+        // The short NTSC decimals are made exact, as the core does for every caller.
+        let ntsc = next(ask(Some(1080), Some(1920), None, Some(29.97)), None).unwrap();
+        assert_eq!(ntsc.fps, Some(30_000.0 / 1001.0));
+        // A rate alone is the frame's rate, its shape and fit as they were.
+        let rated = next(ask(None, None, None, Some(30.0)), Some(vertical)).unwrap();
+        assert_eq!(
+            (rated.width, rated.height, rated.fit, rated.fps),
+            (1080, 1920, Fit::Cover, Some(30.0))
+        );
+        assert_eq!(next(ask(None, None, None, Some(0.0)), Some(vertical)).unwrap().fps, None);
+        // ...which there has to be one of; and nothing at all still clears the frame.
+        assert!(super::next_delivery(&ask(None, None, None, Some(30.0)), None).is_err());
+        assert_eq!(next(ask(None, None, None, Some(0.0)), None), None);
+        assert_eq!(next(ask(None, None, None, None), Some(vertical)), None);
+        // Not a rate: refused whichever way it arrives.
+        for bad in [-1.0, 0.5, 241.0, f64::NAN] {
+            assert!(
+                super::next_delivery(&ask(Some(1080), Some(1920), None, Some(bad)), None).is_err(),
+                "{bad}"
+            );
+            assert!(
+                super::next_delivery(&ask(None, None, None, Some(bad)), Some(vertical)).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_delivery_tool_takes_a_frame_rate_and_says_what_it_decides() {
+        let tools = router().list_all();
+        let tool = tools.iter().find(|t| t.name == "set_delivery_format").expect("registered");
+        let props = tool.input_schema["properties"].as_object().unwrap();
+        let mut names: Vec<&str> = props.keys().map(String::as_str).collect();
+        names.sort();
+        assert_eq!(names, ["fit", "fps", "height", "width"]);
+        assert!(tool
+            .input_schema
+            .get("required")
+            .is_none_or(|r| r.as_array().is_some_and(|r| r.is_empty())));
+        let text = tool.description.as_deref().unwrap_or_default();
+        assert!(text.contains("FIRST clip"), "{text}");
+        assert!(text.contains("options.fps"), "{text}");
+        let param = props["fps"]["description"].as_str().unwrap_or_default();
+        assert!(param.contains("1 to 240") && param.contains("0 clears"), "{param}");
+
+        for name in ["export", "export_variants"] {
+            let tool = tools.iter().find(|t| t.name == name).expect("registered");
+            let text = tool.description.as_deref().unwrap_or_default();
+            assert!(text.contains("set_delivery_format"), "{name}: {text}");
+            assert!(text.contains("fps"), "{name}: {text}");
+        }
+    }
+
+    #[test]
+    fn an_export_result_carries_the_frame_it_wrote() {
+        let frame = kerf_core::ExportedFrame {
+            width: 1080,
+            height: 1920,
+            fps: 50.0,
+            fps_source: kerf_core::FpsSource::Delivery,
+        };
+        let said = with_frame(serde_json::json!({ "output": "/out/cut.mp4" }), Some(frame));
+        assert_eq!(
+            said,
+            serde_json::json!({
+                "output": "/out/cut.mp4", "width": 1080, "height": 1920, "fps": 50.0, "fps_source": "delivery"
+            })
+        );
+        // A render with no picture says nothing of one.
+        let audio = serde_json::json!({ "output": "/out/cut.mp3" });
+        assert_eq!(with_frame(audio.clone(), None), audio);
+    }
+
+    /// The summary says what an export would write, so a default taken from the footage is no surprise.
+    #[test]
+    fn the_summary_names_the_rate_an_export_defaults_to_and_where_it_comes_from() {
+        let project = kerf_core::Project::sample().unwrap();
+        let assets = project.list_assets().unwrap();
+        let timeline = project.timeline().unwrap();
+        let footage = export_fps_of(&timeline, &assets).expect("the sample has footage");
+        assert_eq!(footage.from, kerf_core::FpsSource::Footage);
+
+        let delivered = project
+            .set_delivery_format(Some(
+                kerf_core::Delivery::new(1080, 1920, kerf_core::Fit::Cover)
+                    .with_fps(Some(50.0))
+                    .unwrap(),
+            ))
+            .unwrap();
+        let said = serde_json::to_value(export_fps_of(&delivered, &assets)).unwrap();
+        assert_eq!(said, serde_json::json!({ "fps": 50.0, "from": "delivery" }));
+
+        // Nothing to follow: no clip with a picture and no delivery rate, so nothing is claimed.
+        assert!(export_fps_of(&kerf_core::Timeline::default(), &[]).is_none());
     }
 
     #[test]

@@ -11,7 +11,7 @@
 
 import { actionDef, type ActionId } from './keymap';
 import { focusableRows, stepRow, typeaheadRow, type NavRow } from './menu-nav';
-import { DELIVERY_PRESETS, fitLabel } from './delivery-formats';
+import { DELIVERY_PRESETS, DELIVERY_RATES, fitLabel, sameRate } from './delivery-formats';
 import { exportButtonState } from './export-button';
 import { PANEL_IDS, PANELS, type PanelId } from './layout';
 import { PREVIEW_READ_ONLY_REASON } from './proposal-ui';
@@ -24,6 +24,8 @@ export type MenuId = 'file' | 'edit' | 'view' | 'playback' | 'window' | 'help' |
 /** What a menu choice that is not a registry action does. */
 export type MenuCommand =
 	| { type: 'delivery'; preset: string }
+	/** The frame rate the delivery frame is delivered at (`null`: follow the footage). */
+	| { type: 'deliveryFps'; fps: number | null }
 	| { type: 'height'; preset: HeightPreset }
 	| { type: 'panel'; panel: PanelId }
 	/** Move a panel into a window of its own, or give it back. */
@@ -78,6 +80,8 @@ export interface MenuState {
 	tool: string;
 	/** The id of the delivery preset the project is cut for. */
 	delivery: string;
+	/** The frame rate the delivery frame states, or null when it follows the footage's. */
+	deliveryFps?: number | null;
 	/** The height every track shares, or null when they differ. */
 	allHeight: HeightPreset | null;
 	workspace: WorkspaceId;
@@ -295,6 +299,21 @@ export function buildMenus(s: MenuState): MenuDef[] {
 						role: 'radio',
 						checked: s.delivery === p.id,
 						...hold({})
+					})
+				)
+			},
+			{
+				// The rate is part of the frame, so it needs one; Source follows the first clip's.
+				kind: 'submenu',
+				label: 'Delivery frame rate',
+				items: DELIVERY_RATES.map(
+					(r): MenuEntry => ({
+						kind: 'command',
+						command: { type: 'deliveryFps', fps: r.fps },
+						label: r.label,
+						role: 'radio',
+						checked: sameRate(r.fps, s.deliveryFps ?? null),
+						...(s.hasFrame ? hold({}) : { disabled: true, reason: 'Pick a delivery frame first — the rate is part of it' })
 					})
 				)
 			},

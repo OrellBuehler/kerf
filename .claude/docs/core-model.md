@@ -192,7 +192,14 @@
   carries a `duck` flag (sidechain-ducked under the rest of the mix on export).
   `Fit` and `Delivery` live here (the domain owns the delivery shape; `engine::cli`
   re-exports `Fit`: `Contain`, `Cover`, and `Blur` — Contain over a blurred copy of the picture,
-  `engine-cli.md`), and `Timeline.format` is the frame the project is cut for.
+  `engine-cli.md`), and `Timeline.format` is the frame the project is cut for. A `Delivery` also
+  carries an optional **frame rate** (`fps`, schema v12): `Delivery::with_fps` / `check_delivery_fps` hold it to
+  `MIN_DELIVERY_FPS..=MAX_DELIVERY_FPS` (1..240, an `InvalidArgument` outside) and make an NTSC rate within 0.005
+  (`23.976`, `29.97`, `59.94`, also 47.952 / 119.88 / 239.76) the exact `n * 1000 / 1001`; `Delivery::rate()` is the
+  value the engine reads (a stored one out of range is ignored); `Delivery::new` has none, an absent one is not
+  written (`skip_serializing_if`), so a delivery that never had one stores byte-for-byte what it did (`Eq` went with
+  the `f64`); `for_delivery` keeps the project's rate for a variant that names none; the diff reads
+  `1080x1920 (cover, 29.97 fps)` (`fmt_delivery`).
   **Smart crop** is here too and pure + unit-tested: `SalienceMap::crop_for` slides a
   window of the delivery aspect across the sampled map and returns the `CropFrame`
   (per-edge fractions, plus how far off centre it landed) that keeps the content —

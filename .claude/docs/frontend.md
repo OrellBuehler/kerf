@@ -622,6 +622,26 @@ under a transparent webview they draw over the surface. Not done: separate X / Y
 needs a model, export-graph and GPU change), a live GPU picture during the drag (A3).
 
 
+**The delivery frame has a frame rate** (`Delivery.fps`, optional, 1..240): what exports, the playback and the stills default
+to, instead of the first clip's (arbitrary in mixed footage). It is part of the frame, so it is chosen where the frame
+is: the toolbar menu lists *Frame rate: Source rate / 23.976 / 24 / 25 / 29.97 / 30 / 50 / 59.94 / 60 fps*
+(`rateChoices`, the project's ticked, one it lacks added; only with a frame set, as the fit rows are) and View › Delivery frame
+rate has the same as a radio group (`deliveryFps` `MenuCommand`, off without a frame with the reason, and while previewing),
+both through `setDeliveryFps` in `menu-commands.ts`, which keeps the frame and sets the rate in one edit. The button reads
+`9:16 · 50 fps` once a rate is set (`deliveryLabel`; the tip says it too). **A new shape keeps the rate** (`keepRate` in
+`setDeliveryPreset`: `set_delivery_format` takes the rate with the frame, so a call without it clears it); picking *Source
+shape* clears the frame and its rate. `delivery-formats.ts` mirrors `check_delivery_fps` (`checkDeliveryFps`: the range, and
+`29.97` made `30000/1001`) for the browser harness, whose `setDeliveryFormat` refuses and normalises like the backend and
+writes the backend's history label (`deliverLabel`); `sameRate` compares a typed and a stored NTSC rate. The
+rate is the cut's everywhere the page counts frames: `timelineFps` / `renderedFps` (`timecode.ts`) return it ahead of any
+clip's (a stored value out of range is ignored, as `Delivery::rate()` ignores it), so timecode, frame-quantized gestures, the
+playback ladder and the status bar's `50 fps · 1080×1920` follow. The Deliver panel's *Frame rate* row says it, and
+`24 fps · first clip` (with a tip saying how to set one) when the frame states none. **The export dialog**: its Frame rate
+select's *Source* reads *Project rate (50 fps)* when the frame states one (`frameRateOptions(fps, projectFps)`, with a line under
+it, as the resolution's *Project frame*), `initialExport` starts a project with a rate on *that* instead of the preset's own
+(the social presets say 30, which would override the rate the user set), and the remembered draft is dropped when the
+rate changed (`frameKey` carries `@fps`, only when set, so other keys are unchanged).
+
 The timeline toolbar carries a **delivery frame picker** (also View › Delivery frame; Source / 16:9 / 9:16 / 1:1 / 4:5,
 from `src/lib/delivery-formats.ts`, bun-tested; with a frame set the toolbar's menu adds *Footage: fill & crop / fit &
 letterbox / fit & blurred fill*, `DELIVERY_FITS` through `setDeliveryFit` in `menu-commands.ts`, which keeps the frame and

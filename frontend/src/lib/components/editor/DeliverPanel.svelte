@@ -12,7 +12,7 @@
 	import Readiness from './Readiness.svelte';
 	import { editor } from '#lib/state.svelte';
 	import { ui } from '#lib/editor-ui.svelte';
-	import { formatsFor, hasPicture, presetFor, ratioLabel } from '#lib/delivery-formats';
+	import { formatsFor, hasPicture, presetFor, ratioLabel, rateLine } from '#lib/delivery-formats';
 	import { timeDisplay } from '#lib/time-display.svelte';
 	import { timecodeRate } from '#lib/timecode';
 	import { tip } from '#lib/tip';
@@ -23,6 +23,7 @@
 	const picture = $derived(hasPicture(editor.timeline));
 	const shapes = $derived(picture ? formatsFor(ui.deliverShapes) : []);
 	const frame = $derived(presetFor(editor.timeline.format));
+	const rate = $derived(picture ? rateLine(editor.timeline.format, editor.fps) : null);
 	const rendering = $derived(editor.exportRun !== null);
 	const progress = $derived(editor.exportRun?.progress ?? null);
 	const lengthTip = $derived(
@@ -47,6 +48,12 @@
 					>{#if frame.format}{frame.format.width}×{frame.format.height} · {ratioLabel(frame.format.width, frame.format.height)}{:else}follows the footage{/if}</span
 				>
 			</div>
+			{#if rate}
+				<div style="display:flex;justify-content:space-between;gap:8px">
+					<span style="color:var(--text-muted)">Frame rate</span>
+					<span style="font-family:var(--font-mono)" use:tip={rate.tip}>{rate.text}</span>
+				</div>
+			{/if}
 			<div style="display:flex;justify-content:space-between;gap:8px">
 				<span style="color:var(--text-muted)">Clips</span>
 				<span style="font-family:var(--font-mono)">{clipCount}</span>

@@ -205,6 +205,7 @@ import { synthPcm } from './sample-audio';
 import { sampleFrameJpeg } from './sample-frame';
 import { harnessScopes } from './scopes-view';
 import { harnessRenderBar } from './render-bar';
+import { checkDeliveryFps, deliverLabel } from './delivery-formats';
 import { renderedFps } from './timecode';
 import { playbackFps } from './playback-sync';
 import { parsePlaybackMessage } from './frame-transport';
@@ -2758,17 +2759,24 @@ export async function getLevels(range?: { start: number; end: number } | null, l
 	return invoke<Levels>('get_levels', { range: range ?? null, loudnorm });
 }
 
-/** Set the frame the project is cut for, or pass `null` to follow the footage. */
+/** Set the frame the project is cut for — its shape, fit and `fps`, the frame rate exports, playback and stills
+ *  default to — or pass `null` to follow the footage. The rate is set with the frame: a frame without one clears it
+ *  (the caller keeps the project's rate with `keepRate`). A rate outside 1..240 is refused. */
 export async function setDeliveryFormat(format: Delivery | null): Promise<Timeline> {
 	if (!inTauri()) {
-		devTimeline.format = format;
-		recordDev(format ? `Deliver ${format.width}x${format.height}` : 'Deliver at source shape');
+		// What `Project::set_delivery_format` does: check the rate (and make an NTSC one exact), write the frame
+		// and its history label, nothing at all when the rate is refused.
+		const checked = format ? (format.fps != null ? { ...format, fps: checkDeliveryFps(format.fps) } : { ...format }) : null;
+		if (checked && checked.fps == null) delete checked.fps;
+		devTimeline.format = checked;
+		recordDev(deliverLabel(checked));
 		return snapshot();
 	}
 	return invoke<Timeline>('set_delivery_format', {
 		width: format?.width ?? null,
 		height: format?.height ?? null,
-		fit: format?.fit ?? null
+		fit: format?.fit ?? null,
+		fps: format?.fps ?? null
 	});
 }
 

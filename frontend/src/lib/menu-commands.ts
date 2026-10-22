@@ -4,7 +4,7 @@
 // Shared with the timeline's own delivery picker, so a frame chosen from either
 // is chosen the same way.
 
-import { DELIVERY_PRESETS, fitLabel } from './delivery-formats';
+import { DELIVERY_PRESETS, fitLabel, fpsLabel, keepRate, sameRate, withRate } from './delivery-formats';
 import { editor } from './state.svelte';
 import { ui } from './editor-ui.svelte';
 import { workspace } from './workspace.svelte';
@@ -22,8 +22,11 @@ export async function setDeliveryPreset(id: string): Promise<void> {
 	const p = DELIVERY_PRESETS.find((d) => d.id === id);
 	if (!p || holdForPreview()) return;
 	try {
-		await editor.setDeliveryFormat(p.format);
-		toast.success(p.format ? `Cutting for ${p.label} (${fitLabel(p.format.fit)})` : 'Following the footage');
+		// A different shape does not take the frame rate away: it is the project's.
+		const format = keepRate(p.format, editor.timeline.format);
+		await editor.setDeliveryFormat(format);
+		const rate = format?.fps != null ? ` at ${fpsLabel(format.fps)} fps` : '';
+		toast.success(format ? `Cutting for ${p.label} (${fitLabel(format.fit)})${rate}` : 'Following the footage');
 	} catch (err) {
 		report(err);
 	}
@@ -41,10 +44,26 @@ export async function setDeliveryFit(fit: Fit): Promise<void> {
 	}
 }
 
+/** Keep the delivery frame and change the frame rate it is delivered at (`null`: follow the footage) — the rate every
+ *  export, the playback and the stills default to, instead of the first clip's. */
+export async function setDeliveryFps(fps: number | null): Promise<void> {
+	const format = editor.timeline.format;
+	if (!format || sameRate(format.fps, fps) || holdForPreview()) return;
+	try {
+		await editor.setDeliveryFormat(withRate(format, fps));
+		toast.success(fps == null ? 'Frame rate follows the footage' : `Delivering at ${fpsLabel(fps)} fps`);
+	} catch (err) {
+		report(err);
+	}
+}
+
 export function runMenuCommand(c: MenuCommand): void {
 	switch (c.type) {
 		case 'delivery':
 			void setDeliveryPreset(c.preset);
+			break;
+		case 'deliveryFps':
+			void setDeliveryFps(c.fps);
 			break;
 		case 'height':
 			ui.setAllHeights(c.preset);
