@@ -87,7 +87,7 @@ export const CONFIRM = {
 	agentReviewOff: {
 		title: 'Let the agent edit without review?',
 		message:
-			'With review off, an agent’s edits land on your timeline as soon as it makes them, as steps you can undo. Nothing waits for you to apply it. You can turn review back on at any time.',
+			'With review off, an agent’s edits land on your timeline as soon as it makes them, as steps you can undo — also the work it does on the tasks you queue, which then show as applied instead of waiting for you. A proposal that is already waiting stays until you apply or discard it. You can turn review back on at any time.',
 		ok: 'Turn review off',
 		cancel: 'Keep reviewing'
 	},

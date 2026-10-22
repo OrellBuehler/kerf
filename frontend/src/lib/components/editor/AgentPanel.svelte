@@ -24,7 +24,7 @@
 	import { QUICK_EDIT_HELD, cutAssets, cutSignature, heldWhilePreviewing, isLocalPreset, quickTarget, silenceOutcome, targetNote } from '#lib/quick-edits';
 	import { holdForPreview, report } from '#lib/ops';
 	import { STATUS_MAP, PRESETS } from './data';
-	import { agentLine, showComposerHint } from '#lib/agent-status';
+	import { agentLine, queueEmptyHint, queuedChipLegend, reviewOffNote, showComposerHint } from '#lib/agent-status';
 	import type { DiffEntry, EditSource, McpConnectionInfo, Task, TaskStatus, Timeline, TimelineDiff } from '#lib/types';
 	import { tip } from '#lib/tip';
 
@@ -488,7 +488,7 @@
 			style="flex:none;display:flex;align-items:center;gap:8px;padding:6px 12px;background:color-mix(in srgb,var(--orange-400) 12%,transparent);border-bottom:var(--line-width) solid color-mix(in srgb,var(--orange-400) 35%,transparent);font-size:12px;line-height:1.4;color:var(--text-primary)"
 		>
 			<Icon n="alert-triangle" s={13} color="var(--orange-400)" />
-			<span style="flex:1;min-width:0">Review is off — an agent’s edits land on your timeline as it makes them.</span>
+			<span style="flex:1;min-width:0">{reviewOffNote(staged !== null)}</span>
 			<Btn variant="ghost" size="sm" onclick={() => settings.openSection('agent')}>Turn on</Btn>
 		</div>
 	{/if}
@@ -512,7 +512,7 @@
 					</div>
 				{/if}
 				<div style="font-size:12px;color:var(--text-muted);line-height:1.5">
-					The agent edits the project you have open and proposes cuts you review here. Address, token and review
+					The agent edits the project you have open{settings.agentReview ? ' and proposes cuts you review here' : ', and with review off its edits land directly'}. Address, token and review
 					live in <button
 						type="button"
 						onclick={() => settings.openSection('agent')}
@@ -679,7 +679,7 @@
 						<Icon n="list-plus" s={20} color="var(--text-muted)" />
 						<div style="font-size:12px;color:var(--text-secondary)">No tasks queued</div>
 						<div style="font-size:12px;color:var(--text-muted);line-height:1.5">
-							Queue a task below. Your connected agent claims it and proposes edits.
+							{queueEmptyHint(settings.agentReview)}
 						</div>
 					</div>
 				{:else}
@@ -710,7 +710,7 @@
 				<div id="agent-quick-edits" style="display:flex;flex-direction:column;gap:8px">
 					<div style="font-size:12px;color:var(--text-muted);line-height:1.45">
 						<Icon n="play" s={11} style="vertical-align:-1px" /> runs now and lands in your history ·
-						<Icon n="list-plus" s={11} style="vertical-align:-1px" /> is queued for your agent, which you review before it lands
+						<Icon n="list-plus" s={11} style="vertical-align:-1px" /> {queuedChipLegend(settings.agentReview)}
 					</div>
 					<div style="display:flex;flex-wrap:wrap;gap:6px">
 						{#each [true, false] as local (local)}
