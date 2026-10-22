@@ -1440,7 +1440,31 @@ fn odd_sizes_and_layers_that_leave_the_canvas() {
         &[0.5],
         ROTATED,
     );
-    // Zoomed past the frame and panned: the layer starts left of the canvas.
+    // Moved so far that the layer starts left of the canvas and above it.
+    let tl = timeline(
+        vec![
+            vec![base.clone()],
+            vec![over(
+                Transform {
+                    pos_x: -0.3,
+                    pos_y: -0.2,
+                    ..Transform::default()
+                },
+                &m.testsrc,
+            )],
+        ],
+        None,
+    );
+    check(
+        "geometry/pan-off-canvas",
+        &tl,
+        &[m.gradient.clone(), m.testsrc.clone()],
+        &[0.5],
+        STRICT,
+    );
+    // Zoomed in past the frame and panned: FFmpeg takes the picture from the source in one resample
+    // (to the fit of the frame times the zoom), where the compositor fits it to the frame and scales
+    // that, so the plan refuses it (`FoldedFit`) and FFmpeg draws the frame.
     let tl = timeline(
         vec![
             vec![base.clone()],
@@ -1456,12 +1480,12 @@ fn odd_sizes_and_layers_that_leave_the_canvas() {
         ],
         None,
     );
-    check(
+    check_refused(
         "geometry/zoom-off-canvas",
         &tl,
         &[m.gradient.clone(), m.testsrc.clone()],
-        &[0.5],
-        STRICT,
+        0.5,
+        Refusal::Plan("one resample"),
     );
     // Entirely off the canvas: nothing to draw, the base shows.
     let tl = timeline(

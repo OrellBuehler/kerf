@@ -4127,6 +4127,7 @@ pub enum RateControl {
 }
 
 pub use crate::model::Fit;
+use crate::model::FitOrder;
 
 /// Which ffmpeg invocation [`build_export_args`] is emitting for. Injected so
 /// the builder stays pure (no knowledge of the platform null device or the temp
@@ -8106,6 +8107,34 @@ fn zoom_scale(factor: &str, keyed: bool, tiny: bool, even: bool, sf: &str) -> St
     }
 }
 
+/// The one `scale` that fits a picture to a `w`x`h` frame and zooms it by `factor` in the same
+/// resample ([`FitOrder::Folded`], with `decrease`): the frame times the zoom is the box the
+/// aspect-preserving fit is made in, so the picture is taken from the source once instead of
+/// being fitted to the frame and the fitted picture enlarged. A zoom of 1 is the frame's own box.
+///
+/// `tone_mapped` (a `zscale` follows, which refuses an odd size in 4:2:0) rounds the box and the
+/// result to even sizes, and a zoom under [`TINY_SCALE`] keeps the box at a pixel or more, as
+/// [`zoom_scale`] does. Neither is written when it is not needed.
+fn fit_scale(w: u32, h: u32, factor: f64, aspect: &str, tone_mapped: bool, sf: &str) -> String {
+    let zoomed = (factor - 1.0).abs() > 1e-9;
+    let tiny = zoomed && factor < TINY_SCALE;
+    let side = |n: u32| {
+        let e = if zoomed { format!("{n}*{factor}") } else { n.to_string() };
+        match (tone_mapped && zoomed, tiny) {
+            (true, _) => format!("max(2,2*trunc(({e})/2))"),
+            (false, true) => format!("max(1,{e})"),
+            (false, false) => e,
+        }
+    };
+    let (bw, bh) = (side(w), side(h));
+    let even = if tone_mapped { ":force_divisible_by=2" } else { "" };
+    if (tone_mapped && zoomed) || tiny {
+        format!("scale=w='{bw}':h='{bh}':force_original_aspect_ratio={aspect}{even}{sf}")
+    } else {
+        format!("scale={bw}:{bh}:force_original_aspect_ratio={aspect}{even}{sf}")
+    }
+}
+
 /// Polyline points above which [`keyframe_expr`] writes a balanced tree instead of a chain.
 /// libavutil refuses an expression nested deeper than 100 levels (`Invalid argument`, from
 /// the filter that holds it), a chain is a level per point, and an eased key is 12 points: ten
@@ -9050,6 +9079,9 @@ fn video_clip_chain_stamped(
     // A keyframed clip is treated as non-identity so its picture is centered by
     // the overlay (not padded full-frame), and its zoom is re-evaluated per frame.
     let geom_identity = t.is_identity() && !anim;
+    // Whether the clip's zoom is part of the fit (one resample from the source), or follows it.
+    let order = clip.fit_order(fmt.fit);
+    let held = clip.held_scale().unwrap_or(1.0);
     match fmt.fit {
         // The whole picture over a blurred copy of itself that covers the frame: a
         // full-size canvas, as the padded identity case is.
@@ -9061,6 +9093,11 @@ fn video_clip_chain_stamped(
             tone_mapped,
             &format!("bf{instance}"),
         )),
+        // The zoom in is the fit's own: the frame times the zoom is the box the picture is fitted
+        // in, so it is taken from the source once rather than fitted to the frame and enlarged.
+        Fit::Contain | Fit::Blur if order == FitOrder::Folded => {
+            p.push(fit_scale(fmt.width, fmt.height, held, "decrease", tone_mapped, &sf));
+        }
         // Fit inside the frame; the identity case then pads out to full size so
         // the overlay lands on a complete canvas.
         Fit::Contain | Fit::Blur => {
@@ -9088,7 +9125,7 @@ fn video_clip_chain_stamped(
     }
     // A transformed clip's own zoom rides on top of that base fit.
     let mut late_zoom: Option<String> = None;
-    if !geom_identity {
+    if !geom_identity && order == FitOrder::Fitted {
         if scale_keyed {
             // Per-frame zoom: re-evaluate the scale expression every frame.
             let expr = keyframe_expr(&clip.property_curve(Property::Scale), "t", clip.timeline_start);
@@ -9877,6 +9914,7 @@ fn build_still_args_rendered(
                     )
                 }),
                 clip.zoom_animated(),
+                clip.fit_order(fmt.fit),
                 &layer.fades,
                 layer.label_bt709,
                 (fmt.fit == Fit::Blur
@@ -9948,6 +9986,9 @@ struct StillCanvas {
 /// the frame you scrub to would be sharper than the file at a zoom-in and softer at a
 /// zoom-out. Every other clip zooms first, as it always did.
 ///
+/// `order` is [`Clip::fit_order`] (a pose sampled to the identity is `Fitted` whatever it says): a
+/// zoom in under Contain is taken in the fit's own `scale`, as the export's chain takes it.
+///
 /// `fades` are the clip's fades still changing the picture at the still's frame
 /// ([`still_fx`]): where the export's chain applies its `fade` steps, after the rotation and
 /// ahead of a moving zoom, the same filters run on the frame. None at all for a still
@@ -9974,6 +10015,7 @@ fn still_clip_chain_graded(
     mask: Option<&Mask>,
     keyed_crop: Option<(f64, f64, f64)>,
     zoom_last: bool,
+    order: FitOrder,
     fades: &StillFades,
     label_bt709: bool,
     blur_label: Option<&str>,
@@ -10014,10 +10056,17 @@ fn still_clip_chain_graded(
     // the scrubbed still exactly as it will in the file. Letterboxing here while
     // the export cropped meant the one frame you look at while cutting was the
     // one shape you were never going to ship.
+    // A pose the still samples to the identity is the plain fit, whatever the clip's chain in the
+    // export is (a keyed clip is never padded there).
+    let order = if tf.is_identity() { FitOrder::Fitted } else { order };
     match fit {
         Fit::Blur if tf.is_identity() && blur_label.is_some() => {
             // The still tone-maps ahead of the chain: its picture is 8-bit SDR here.
             p.push(blur_fill(ow, oh, "", sf, false, blur_label.unwrap_or_default()));
+        }
+        // The zoom in is the fit's own scale, as the export draws it.
+        Fit::Contain | Fit::Blur if order == FitOrder::Folded => {
+            p.push(fit_scale(ow, oh, tf.scale, "decrease", false, sf));
         }
         Fit::Contain | Fit::Blur => p.push(format!("scale={ow}:{oh}:force_original_aspect_ratio=decrease{sf}")),
         Fit::Cover => {
@@ -10033,7 +10082,7 @@ fn still_clip_chain_graded(
         if fit == Fit::Contain || (fit == Fit::Blur && blur_label.is_none()) {
             p.push(format!("pad={ow}:{oh}:(ow-iw)/2:(oh-ih)/2"));
         }
-    } else if (tf.scale - 1.0).abs() > 1e-9 {
+    } else if (tf.scale - 1.0).abs() > 1e-9 && order == FitOrder::Fitted {
         let zoom = zoom_scale(&tf.scale.to_string(), false, tf.scale < TINY_SCALE, false, sf);
         if zoom_last {
             late_zoom = Some(zoom);
@@ -10091,6 +10140,11 @@ fn still_clip_chain(
     fades: &StillFades,
     label_bt709: bool,
 ) -> String {
+    // The order a clip with this pose and no keys has (`Clip::fit_order`).
+    let order = match canvas.fit {
+        Fit::Contain | Fit::Blur if !zoom_last && tf.scale > 1.0 + 1e-9 => FitOrder::Folded,
+        _ => FitOrder::Fitted,
+    };
     still_clip_chain_graded(
         tf,
         color,
@@ -10102,6 +10156,7 @@ fn still_clip_chain(
         mask,
         None,
         zoom_last,
+        order,
         fades,
         label_bt709,
         Some("bf0"),
@@ -10402,6 +10457,11 @@ mod picked;
 /// The blurred fill through the real `ffmpeg` (`#[ignore]`d).
 #[cfg(test)]
 mod blur_rendered;
+
+/// A zoom taken from the source in the fit's own resample, and a `Cover` clip that pans across the
+/// picture: the chains, and the real `ffmpeg`'s pixels (`#[ignore]`d).
+#[cfg(test)]
+mod zoom_fit;
 
 /// A source whose video starts late keeps its sync in the export (`#[ignore]`d).
 #[cfg(test)]
@@ -13147,7 +13207,7 @@ mod tests {
     fn the_still_of_a_moving_zoom_runs_the_zoom_last_and_every_other_still_zooms_first() {
         use crate::model::{Mask, VideoEffect};
         let tf = Transform {
-            scale: 1.4,
+            scale: 0.6,
             pos_x: 0.1,
             rotation: 20.0,
             opacity: 0.7,
@@ -13182,7 +13242,7 @@ mod tests {
             &StillFades::default(),
             false,
         );
-        let zoom = "scale=iw*1.4:ih*1.4";
+        let zoom = "scale=iw*0.6:ih*0.6";
         // Last: after the rotation, with nothing behind it, and only once.
         assert!(last.ends_with(zoom), "{last}");
         assert_eq!(last.matches(zoom).count(), 1, "{last}");
@@ -13194,6 +13254,32 @@ mod tests {
         assert!(!first.ends_with(zoom), "{first}");
         let strip = |c: &str| c.replace(&format!(",{zoom}"), "");
         assert_eq!(strip(&last), strip(&first), "only the zoom's place differs");
+        // A zoom in under Contain that does not move is the fit's own scale (taken from the source once),
+        // where a moving one is still fitted and then zoomed last.
+        let tf_in = Transform { scale: 1.4, ..tf };
+        let chain = |zoom_last: bool| {
+            still_clip_chain(
+                &tf_in,
+                &color,
+                &effects,
+                None,
+                &canvas,
+                Some(&mask),
+                zoom_last,
+                &StillFades::default(),
+                false,
+            )
+        };
+        let (folded, moving) = (chain(false), chain(true));
+        let fold = "scale=640*1.4:360*1.4:force_original_aspect_ratio=decrease";
+        assert!(
+            folded.contains(&format!("{fold},setsar=1")) && !folded.contains("iw*1.4"),
+            "{folded}"
+        );
+        assert_eq!(folded.matches("scale=").count(), 1, "{folded}");
+        assert!(
+            moving.starts_with("trim=end_frame=1,setpts=PTS-STARTPTS,scale=640:360:") && moving.ends_with("scale=iw*1.4:ih*1.4")
+        );
         // A moving zoom that has no zoom at the sampled instant has none to move.
         let at_rest = Transform { scale: 1.0, ..tf };
         assert_eq!(
@@ -13247,13 +13333,15 @@ mod tests {
             moving.find("gblur=").unwrap() < moving.find("scale=iw*1.25").unwrap(),
             "{moving}"
         );
-        // Held at 1.25 the whole way: zoom first, as ever.
+        // Held at 1.25 the whole way: zoom first, as ever, and a zoom in under Contain is the fit's own scale.
         let held = chain_of(blurred(1.25, 1.25));
+        assert!(!held.contains("iw*1.25"), "{held}");
         assert!(
-            !held.ends_with("[v0]") || !held.contains(",scale=iw*1.25:ih*1.25[v0]"),
+            held.find("scale=640*1.25:360*1.25:force_original_aspect_ratio=decrease")
+                .unwrap()
+                < held.find("gblur=").unwrap(),
             "{held}"
         );
-        assert!(held.find("scale=iw*1.25").unwrap() < held.find("gblur=").unwrap(), "{held}");
     }
 
     /// `scale` reads a size that evaluates to 0 as "keep the input's", so a picture zoomed
@@ -15084,7 +15172,10 @@ mod tests {
         let chain = first_video_chain(&single(vec![fading.clone()]), assets);
         // The opacity is a `geq` alpha; the zoom and the turn are the constant ones.
         assert!(chain.contains("geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':a='("), "{chain}");
-        assert!(chain.contains("scale=iw*1.5:ih*1.5"), "{chain}");
+        assert!(
+            chain.contains("scale=1920*1.5:1080*1.5:force_original_aspect_ratio=decrease,setsar=1"),
+            "{chain}"
+        );
         assert!(!chain.contains("eval=frame"), "no zoom is keyed: {chain}");
         assert!(chain.contains("rotate=0.3490658503988659:fillcolor=none"), "{chain}");
         assert!(!chain.contains("colorchannelmixer"), "{chain}");

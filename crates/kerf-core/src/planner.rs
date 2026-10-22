@@ -63,7 +63,9 @@ use crate::error::{Error, Result};
 use crate::frame_pick::{FpsPick, Pick};
 use crate::layer_geometry::Keyed;
 use crate::media::{MediaResolver, OriginalMedia, SourceMedia};
-use crate::model::{bt709_labels, Asset, Hdr, Projection, Property, StreamInfo, StreamKind, TextOverlay, Timeline, VideoEffect};
+use crate::model::{
+    bt709_labels, Asset, FitOrder, Hdr, Projection, Property, StreamInfo, StreamKind, TextOverlay, Timeline, VideoEffect,
+};
 use crate::plan_caps::{GpuCaps, LayerRef};
 use crate::render_plan::{
     clip_source_time, composite_matrix, Animated, CompositeColorPolicy, LayerFx, PlanCanvas, PlanLayer, PlanMode, PlanReframe,
@@ -664,6 +666,13 @@ impl Planner {
                         tail: planned.tail && eval >= clip.timeline_end(),
                     },
                     animated: planned.animated,
+                    // A still that samples a keyed pose to the identity draws the plain fit; the
+                    // export's chain for the clip (a keyed clip is never padded) is the clip's own.
+                    fit_order: if !motion && clip.transform_at(local).is_identity() {
+                        FitOrder::Fitted
+                    } else {
+                        clip.fit_order(self.canvas.fit)
+                    },
                     keyed_alpha: (motion && planned.animated.is_some_and(|a| a.opacity)).then(|| {
                         let pick = self.canvas.pick_fps;
                         let t = ffmpeg_frame_time(u64::try_from(frame).unwrap_or(0), pick.num, pick.den);
@@ -2023,6 +2032,72 @@ mod tests {
         };
         let plan = planner(&tl, &assets, PlanMode::Motion, &opts(30.0)).at_frame(15).unwrap();
         assert!(plan.reasons(&caps, plan.size(u32::MAX)).is_empty());
+    }
+
+    /// The graph takes a zoom in from the source in the fit's own `scale` (`FitOrder::Folded`); the
+    /// compositor fits the picture to the frame and scales that, which is another picture, so the
+    /// plan refuses it (still and export frame alike, every cap) and draws every pose whose order
+    /// has not changed.
+    #[test]
+    fn a_zoom_in_taken_in_the_fit_scale_is_refused_and_every_other_pose_is_not() {
+        let a = asset();
+        let assets = [a.clone()];
+        let caps = GpuCaps {
+            motion: true,
+            keyed_zoom: true,
+            ..GpuCaps::A0
+        };
+        let refused = |clip: crate::model::Clip, mode: PlanMode, ask: &GpuCaps| {
+            let plan = planner(&single(vec![clip]), &assets, mode, &opts(30.0)).at_frame(15).unwrap();
+            let folded = plan.layers.iter().any(|l| l.fit_order == FitOrder::Folded);
+            (
+                folded,
+                has(&plan.reasons(ask, plan.size(u32::MAX)), |u| {
+                    matches!(u, Unsupported::FoldedFit(..))
+                }),
+            )
+        };
+        let scaled = |scale: f64| {
+            let mut c = make_clip(a.id, 0.0, 4.0, 0.0);
+            c.transform.scale = scale;
+            c
+        };
+        for mode in [PlanMode::Still, PlanMode::Motion] {
+            for ask in [&GpuCaps::A0, &caps] {
+                assert_eq!(refused(scaled(1.5), mode, ask), (true, true), "{mode:?}");
+                // A zoom out, no zoom and a move keep the fit-then-scale order.
+                for fitted in [scaled(0.5), scaled(1.0), {
+                    let mut moved = scaled(1.0);
+                    moved.transform.pos_x = 0.2;
+                    moved
+                }] {
+                    assert_eq!(refused(fitted, mode, ask), (false, false), "{mode:?}");
+                }
+                // A keyed zoom that holds still at 1.5 is the same single scale; one that moves is
+                // the chain's last stage, at the fit size, as ever.
+                let mut held = scaled(1.0);
+                held.keyframes = vec![keyed(0.0, 1.5, 0.0), keyed(2.0, 1.5, 0.1)];
+                assert!(refused(held, mode, ask).0, "{mode:?}");
+                let mut moving = scaled(1.0);
+                moving.keyframes = vec![keyed(0.0, 1.0, 0.0), keyed(2.0, 1.5, 0.0)];
+                assert!(!refused(moving, mode, ask).0, "{mode:?}");
+            }
+        }
+        // A still that samples a keyed clip to the identity draws the plain fit; the export's chain
+        // for that clip is the clip's own, never padded.
+        let mut settled = scaled(1.0);
+        settled.keyframes = vec![keyed(0.0, 1.0, 0.0), keyed(2.0, 1.0, 0.1)];
+        assert_eq!(refused(settled, PlanMode::Still, &GpuCaps::A0), (false, false));
+        let message = {
+            let plan = planner(&single(vec![scaled(1.5)]), &assets, PlanMode::Still, &opts(30.0))
+                .at_frame(15)
+                .unwrap();
+            plan.unsupported_reasons_at(plan.size(u32::MAX)).join("; ")
+        };
+        assert!(
+            message.contains("one resample") && message.contains("a zoom in under Contain"),
+            "{message}"
+        );
     }
 
     #[test]

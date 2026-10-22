@@ -447,6 +447,7 @@ mod tests {
             reframe: None,
             fx: LayerFx::default(),
             animated: None,
+            fit_order: kerf_core::FitOrder::Fitted,
             keyed_alpha: None,
             timing: PlanTiming {
                 window: (0.0, 10.0),

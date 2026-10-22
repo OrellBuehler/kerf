@@ -32,8 +32,8 @@ use crate::error::Result;
 use crate::frame_pick::Pick;
 use crate::layer_geometry::{Keyed, LayerGeometry, Placement};
 use crate::model::{
-    pix_fmt_is_high_bit, pix_fmt_layout, pix_fmt_subsampling, Asset, Clip, Color, Grade, Hdr, Mask, PixLayout, Projection,
-    ResolvedReframe, StreamInfo, StreamKind, Subsampling, Timeline, Transform, VideoEffect,
+    pix_fmt_is_high_bit, pix_fmt_layout, pix_fmt_subsampling, Asset, Clip, Color, FitOrder, Grade, Hdr, Mask, PixLayout,
+    Projection, ResolvedReframe, StreamInfo, StreamKind, Subsampling, Timeline, Transform, VideoEffect,
 };
 use crate::plan_caps::{DipWhy, EffectKinds, GpuCaps, GradeKinds, LayerRef, Unsupported};
 use crate::planner::{PlanRequest, Planner};
@@ -664,6 +664,11 @@ pub struct PlanLayer {
     pub fx: LayerFx,
     /// `Some` for a clip with a keyed transform or colour number.
     pub animated: Option<Animated>,
+    /// How the graph fits the picture to the frame and applies the clip's static zoom
+    /// ([`Clip::fit_order`]; `Fitted` for a still that samples a pose to the identity, which the
+    /// still draws as the plain fit). Anything but `Fitted` takes the picture from the source in
+    /// one resample, which no compositor pass draws: [`Unsupported::FoldedFit`].
+    pub fit_order: FitOrder,
     /// The alpha the export's `geq` writes at this frame for an opacity keyed below 1:
     /// `(int)(opacity(T) * 255)`, the curve evaluated in the expression's own arithmetic at the
     /// clip's `fps` time. `None` in a still plan, and for a clip whose opacity has no key below 1.
@@ -1351,6 +1356,13 @@ impl RenderPlan {
             }
             if layer.animated.is_some_and(|a| a.crop) {
                 out.push(Unsupported::KeyedCrop(at()));
+            }
+            // The graph fits and zooms in one `scale` from the source; the compositor's geometry (and
+            // `LayerGeometry`, which the Preview's handles are placed by) still fits to the frame and
+            // scales that, which is another picture. Nothing draws the new one yet.
+            match layer.fit_order {
+                FitOrder::Fitted => {}
+                FitOrder::Folded => out.push(Unsupported::FoldedFit(at(), "a zoom in under Contain")),
             }
             if layer.animated.is_some_and(|a| a.zooms) {
                 if caps.keyed_zoom {
@@ -2205,14 +2217,20 @@ mod tests {
 
     #[test]
     fn what_depends_on_the_render_size_is_decided_with_it() {
+        // An enlargement (`scale` over 1) is the frame's: the fit of the 640x360 picture into a frame that
+        // many times larger. The clip's own zoom in is taken from the source in the fit's scale, which
+        // the plan refuses on its own account (`FoldedFit`), whatever the picture.
         let with_fmt = |fmt: Option<&str>, scale: f64, opacity: f64| {
             let mut v = video(640, 360);
             v.pix_fmt = fmt.map(Into::into);
             let a = asset("a", 20.0, vec![v]);
             let mut c = Clip::new(a.id, 0.0, 10.0, 0.0);
-            c.transform.scale = scale;
+            c.transform.scale = scale.min(1.0);
             c.transform.opacity = opacity;
-            let tl = timeline(vec![vec![c]]);
+            let mut tl = timeline(vec![vec![c]]);
+            if scale > 1.0 {
+                tl.format = Some(Delivery::new((640.0 * scale) as u32, (360.0 * scale) as u32, Fit::Contain));
+            }
             plan(&tl, std::slice::from_ref(&a), 1.0)
         };
         // Resizing a picture FFmpeg scales in another format is refused — enlarging
@@ -3650,9 +3668,14 @@ mod tests {
         );
         assert!(w.iter().any(|u| matches!(u, Unsupported::ZoomBehind(_, "a grade"))), "{w:?}");
         // The geometry: a resize (whatever the ratio), a letterbox, an odd picture.
-        for scale in [0.5, 1.5] {
-            with(why(video(640, 360), None, &|c| c.transform.scale = scale, 0.5), "resizes");
-        }
+        with(why(video(640, 360), None, &|c| c.transform.scale = 0.5, 0.5), "resizes");
+        // (A zoom in is the fit's own resample, which the plan refuses for itself: `FoldedFit`.)
+        let w = why(video(640, 360), None, &|c| c.transform.scale = 1.5, 0.5);
+        assert!(
+            w.iter().any(|u| matches!(u, Unsupported::FoldedFit(..)))
+                && w.iter().any(|u| matches!(u, Unsupported::GradeWith(..))),
+            "{w:?}"
+        );
         with(
             why(video(640, 360), Some(Delivery::new(960, 540, Fit::Contain)), &|_| {}, 0.5),
             "resizes",
@@ -3780,7 +3803,23 @@ mod tests {
         dipped(on_layer(&|c| c.transform.scale = 0.4985), DipWhy::OddSize(319, 179));
         // A layer the scaler resizes, whatever the ratio: the scale filter converts to RGB itself.
         dipped(on_layer(&|c| c.transform.scale = 0.5), DipWhy::Resized);
-        dipped(on_layer(&|c| c.transform.scale = 1.5), DipWhy::Resized);
+        let enlarged = fading_plan_of(
+            video(640, 360),
+            Some(Delivery::new(960, 540, Fit::Contain)),
+            CompositeColorPolicy::FixedBt601,
+            white,
+            0.5,
+        );
+        dipped(enlarged.reasons(&all, enlarged.size(u32::MAX)), DipWhy::Resized);
+        // (A zoom in is the fit's own resample, which the plan refuses for itself: `FoldedFit`.)
+        let zoomed = on_layer(&|c| c.transform.scale = 1.5);
+        assert!(
+            zoomed.iter().any(|u| matches!(u, Unsupported::FoldedFit(..)))
+                && zoomed
+                    .iter()
+                    .any(|u| matches!(u, Unsupported::DipToWhite(_, DipWhy::Resized))),
+            "{zoomed:?}"
+        );
         // ... where a crop that leaves the picture its size is exact, and so is a layer that is not resized.
         assert!(on_layer(&|c| {
             c.transform.crop_left = 0.25;

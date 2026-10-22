@@ -3369,6 +3369,39 @@ impl Clip {
             .is_some_and(|first| keys.iter().any(|k| (k.value - first.value).abs() > 1e-9))
     }
 
+    /// The zoom the clip holds still at: its static scale, or the one value a keyed scale
+    /// that never moves ([`Clip::zoom_animated`]) holds. `None` for a zoom that moves.
+    pub fn held_scale(&self) -> Option<f64> {
+        if self.zoom_animated() {
+            None
+        } else if self.is_keyed(Property::Scale) {
+            Some(self.property_at(Property::Scale, 0.0))
+        } else {
+            Some(self.transform.scale)
+        }
+    }
+
+    /// In what order the clip's chain fits the picture to the delivery frame and zooms it
+    /// (pure; `fit` is the delivery's, a [`Fit::Blur`] counting as `Contain` for a clip that
+    /// is not the plain fit). One answer for the export, the stream, the scrubbed still and
+    /// the render plan, so none can disagree on whether a layer is the order a compositor
+    /// draws. See [`FitOrder`].
+    pub fn fit_order(&self, fit: Fit) -> FitOrder {
+        // The identity transform is the fit alone, and a moving zoom is the chain's last stage,
+        // at the fit size: both keep the order they always had.
+        if (self.transform.is_identity() && !self.is_animated()) || self.zoom_animated() {
+            return FitOrder::Fitted;
+        }
+        let Some(scale) = self.held_scale().filter(|s| s.is_finite() && *s > 0.0) else {
+            return FitOrder::Fitted;
+        };
+        match fit {
+            Fit::Contain | Fit::Blur if scale > 1.0 + 1e-9 => FitOrder::Folded,
+            Fit::Contain | Fit::Blur => FitOrder::Fitted,
+            Fit::Cover => FitOrder::Fitted,
+        }
+    }
+
     /// The clip's keyframes sorted by time (the stored order is kept sorted by
     /// the editing op, but render code must not assume it).
     pub fn sorted_keyframes(&self) -> Vec<Keyframe> {
@@ -4062,6 +4095,18 @@ pub enum Fit {
     /// landscape footage). A clip whose geometry is not the plain fit (scaled, moved,
     /// rotated, cropped or animated) is placed as under `Contain`, with no fill.
     Blur,
+}
+
+/// How a clip's chain fits its picture to the delivery frame and applies the clip's static zoom
+/// ([`Clip::fit_order`]). The picture is resampled once whenever it can be: a zoom taken from
+/// a picture already fitted to the frame is a fraction of the source's detail, enlarged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FitOrder {
+    /// Fit to the frame (`Cover` then crops to it), then zoom: the order every chain had, and
+    /// still has for the identity transform, a zoom out, a moving zoom and `Cover`.
+    Fitted,
+    /// `Contain`, zoomed in: one `scale` from the source to the fit of the frame times the zoom.
+    Folded,
 }
 
 impl Fit {
