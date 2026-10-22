@@ -3568,15 +3568,27 @@ fn resizing_a_picture_ffmpeg_scales_in_another_format_is_refused() {
         ("yuvj420p-jpeg", &m.jpeg),
     ] {
         let assets = std::slice::from_ref(a);
-        // A zoom in under Contain: FFmpeg takes it from the source in one resample, where the
-        // compositor fits and then scales, so the plan refuses it (`FoldedFit`) and FFmpeg draws it.
-        check_refused(
-            &format!("enlarge-ok/{name}-x1.5"),
-            &scaled(a, 1.5, None),
-            assets,
-            0.5,
-            Refusal::Plan("one resample"),
-        );
+        // A zoom in of footage under Contain: FFmpeg takes it from the source in one resample, where
+        // the compositor fits and then scales, so the plan refuses it (`FoldedFit`) and FFmpeg draws
+        // it. A still's `duration` is 0, so its clip here has no length and the frame is empty: there
+        // is nothing to refuse.
+        if a.is_image() {
+            check(
+                &format!("enlarge-ok/{name}-x1.5"),
+                &scaled(a, 1.5, None),
+                assets,
+                &[0.5],
+                STRICT,
+            );
+        } else {
+            check_refused(
+                &format!("enlarge-ok/{name}-x1.5"),
+                &scaled(a, 1.5, None),
+                assets,
+                0.5,
+                Refusal::Plan("one resample"),
+            );
+        }
         check(
             &format!("enlarge-ok/{name}-fit-to-960x540"),
             &scaled(a, 1.0, Some(Delivery::new(960, 540, Fit::Contain))),
