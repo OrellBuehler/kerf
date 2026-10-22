@@ -7269,16 +7269,27 @@ fn export_wait_line(waiting: Option<&str>, stage: Option<kerf_core::ExportStage>
 
 /// The progress line of `export`.
 fn export_message(progress: &kerf_core::ExportProgress) -> String {
-    export_wait_line(progress.waiting, progress.stage).unwrap_or_else(|| match progress.eta_secs {
-        Some(eta) => format!("rendering, {} to go", fmt_ts(eta)),
-        None => "rendering".to_string(),
-    })
+    // An export rendered in parts says which, in place of "rendering": "rendering part 2 of 5", "encoding".
+    let stage = progress.part.map_or_else(|| "rendering".to_string(), |part| part.to_string());
+    match export_wait_line(progress.waiting, progress.stage) {
+        Some(line) => match progress.part {
+            Some(part) if progress.waiting.is_none() => format!("{line} ({part})"),
+            _ => line,
+        },
+        None => match progress.eta_secs {
+            Some(eta) => format!("{stage}, {} to go", fmt_ts(eta)),
+            None => stage,
+        },
+    }
 }
 
 /// The progress line of `export_variants`: which file of how many, or all of them at once.
 fn variants_message(progress: &kerf_core::VariantProgress, labels: &[String]) -> String {
     if let Some(line) = export_wait_line(progress.waiting, progress.stage) {
-        return line;
+        return match progress.part {
+            Some(part) if progress.waiting.is_none() => format!("{line} ({part})"),
+            _ => line,
+        };
     }
     let mut message = if progress.together {
         format!("rendering {} together ({})", progress.total, labels.join(", "))
@@ -7290,6 +7301,9 @@ fn variants_message(progress: &kerf_core::VariantProgress, labels: &[String]) ->
             labels.get(progress.variant).cloned().unwrap_or_default()
         )
     };
+    if let Some(part) = progress.part {
+        message.push_str(&format!(", {part}"));
+    }
     if let Some(eta) = progress.eta_secs {
         message.push_str(&format!(", {} to go", fmt_ts(eta)));
     }
@@ -7476,6 +7490,7 @@ mod tests {
             eta_secs: eta,
             waiting,
             stage,
+            part: None,
         }
     }
 
@@ -7514,6 +7529,43 @@ mod tests {
         assert_eq!(line(export_progress(0.5, None, None, None)), "rendering");
     }
 
+    /// An export rendered in parts says which part in place of "rendering", and keeps the part beside
+    /// what a stage says (the seconds each part spends opening its footage).
+    #[test]
+    fn an_export_job_in_parts_says_which_part() {
+        use kerf_core::ExportStage as S;
+        let part = |index, encoding| kerf_core::ExportPart {
+            index,
+            total: 5,
+            encoding,
+        };
+        let line = |p: kerf_core::ExportProgress, part| export_message(&kerf_core::ExportProgress { part: Some(part), ..p });
+        assert_eq!(
+            line(export_progress(0.2, None, None, Some(S::Rendering)), part(2, false)),
+            "rendering part 2 of 5"
+        );
+        assert_eq!(
+            line(export_progress(0.2, Some(65.0), None, Some(S::Rendering)), part(2, false)),
+            "rendering part 2 of 5, 01:05.000 to go"
+        );
+        assert_eq!(
+            line(export_progress(0.2, None, None, Some(S::Starting)), part(2, false)),
+            "starting ffmpeg and seeking the footage (rendering part 2 of 5)"
+        );
+        assert_eq!(
+            line(export_progress(0.7, None, None, Some(S::Rendering)), part(5, true)),
+            "encoding"
+        );
+        // A queue is a queue, whatever it will render in.
+        assert_eq!(
+            line(
+                export_progress(0.0, None, Some("waiting for another job"), None),
+                part(1, false)
+            ),
+            "waiting for another job"
+        );
+    }
+
     #[test]
     fn a_multi_format_job_names_the_file_and_the_stage() {
         use kerf_core::ExportStage as S;
@@ -7526,6 +7578,7 @@ mod tests {
             eta_secs: eta,
             waiting,
             stage,
+            part: None,
             together,
         };
         assert_eq!(

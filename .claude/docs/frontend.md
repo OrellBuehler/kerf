@@ -919,7 +919,8 @@ in place of the single-file line — with shapes picked, the Scaling rows hide (
 delivery brings its own resolution and fit) and the button reads `Export N
 files`; `export-progress` then carries `variant` / `total`, and `together` when the files render in one
 pass (the default; `exportVariants`' `singlePass`), which the progress text shows as `3 at once ·`
-instead of `1/3 ·`; a stopped single pass rejects with `export cancelled; all N files were removed`, which
+instead of `1/3 ·`; an export rendered in parts (`ExportProgress.part`, `export-progress.ts`'s `exportPartLabel`)
+adds `rendering part 2 of 5 ·` / `encoding ·` in front of the percentage (the dialog, the Deliver panel, the status bar); a stopped single pass rejects with `export cancelled; all N files were removed`, which
 the dialog's toast repeats. The
 **Transcript tab** of the library (`TranscriptPanel.svelte`, over the pure, bun-tested
 `src/lib/transcript.ts`) **is an editing surface**: lines resolve to the clip carrying them,

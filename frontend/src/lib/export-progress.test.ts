@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { fmtSpan, progressLine, statusText } from './export-progress';
+import { exportPartLabel, fmtSpan, progressLine, statusText } from './export-progress';
 import type { ExportProgress } from './types';
 
 const at = (over: Partial<ExportProgress>): ExportProgress => ({ fraction: 0, elapsed_secs: 0, ...over });
@@ -50,6 +50,23 @@ describe('progressLine', () => {
 	test('closing the file and reading it back are told as what they are', () => {
 		expect(progressLine(at({ fraction: 0.99, stage: 'finishing' })).text).toBe('Finishing the file…');
 		expect(progressLine(at({ fraction: 0.98, stage: 'measuring' })).text).toBe('Checking the file…');
+	});
+
+	test('an export rendered in parts says which part, then that it is encoding', () => {
+		const part = { index: 2, total: 5, encoding: false };
+		expect(progressLine(at({ fraction: 0.3, stage: 'rendering', part })).text).toBe('rendering part 2 of 5 · 30%');
+		expect(progressLine(at({ fraction: 0.3, stage: 'starting', elapsed_secs: 3, part })).text).toBe(
+			'rendering part 2 of 5 · Opening the footage… 3s'
+		);
+		expect(progressLine(at({ fraction: 0.7, stage: 'rendering', eta_secs: 40, part: { index: 5, total: 5, encoding: true } })).text).toBe(
+			'encoding · 70% · 40s left'
+		);
+		expect(statusText(at({ fraction: 0.3, stage: 'rendering', part }))).toBe('Exporting 30% · rendering part 2 of 5');
+		expect(statusText(at({ fraction: 0.3, stage: 'starting', part }))).toBe('Export opening the footage… (rendering part 2 of 5)');
+		// An export that runs whole says nothing of parts.
+		expect(exportPartLabel(at({}))).toBe('');
+		expect(exportPartLabel(at({ part: null }))).toBe('');
+		expect(exportPartLabel(null)).toBe('');
 	});
 
 	test('a fraction outside 0..1 never shows as more than 100 %', () => {

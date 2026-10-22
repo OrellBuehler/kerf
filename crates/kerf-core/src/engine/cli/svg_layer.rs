@@ -103,7 +103,7 @@ fn rect_px(o: &SvgOverlay, frame_w: u32, frame_h: u32) -> Option<Rect> {
 }
 
 /// The first output frame whose graph time is at or after `t`.
-fn first_frame_from(fps: Rational, t: f64) -> u64 {
+pub(super) fn first_frame_from(fps: Rational, t: f64) -> u64 {
     let t = if t.is_finite() { t.clamp(0.0, MAX_SECONDS) } else { 0.0 };
     let mut k = fps.frame_containing(t).saturating_sub(1);
     while fps.frame_time(k) < t {
@@ -117,7 +117,7 @@ fn first_frame_from(fps: Rational, t: f64) -> u64 {
 
 /// The last output frame whose graph time is at or before `t` (before it when `strict`); `None`
 /// when not even frame 0 is.
-fn last_frame_to(fps: Rational, t: f64, strict: bool) -> Option<u64> {
+pub(super) fn last_frame_to(fps: Rational, t: f64, strict: bool) -> Option<u64> {
     if t.is_nan() {
         return None;
     }

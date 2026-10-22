@@ -399,7 +399,7 @@ fn prune_stale(base: &Path, own: u32) {
 }
 
 #[cfg(unix)]
-fn process_alive(pid: u32) -> bool {
+pub(crate) fn process_alive(pid: u32) -> bool {
     let Ok(pid) = i32::try_from(pid) else { return false };
     // SAFETY: signal 0 only checks that the process exists and may be signalled; it sends nothing.
     let rc = unsafe { libc::kill(pid, 0) };
@@ -407,7 +407,7 @@ fn process_alive(pid: u32) -> bool {
 }
 
 #[cfg(not(unix))]
-fn process_alive(_pid: u32) -> bool {
+pub(crate) fn process_alive(_pid: u32) -> bool {
     true
 }
 

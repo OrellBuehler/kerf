@@ -123,10 +123,10 @@ pub use cli::{
     salience_map_cancellable, seek_arg, set_proxy_base_width, source_identity, stitch_insta360, stitch_insta360_with,
     stitched_path, stream_mix_pcm, stream_preview, stream_preview_until, stream_preview_with, timeline_frame_cancellable,
     timeline_frame_region_cancellable, timeline_frame_yuv_cancellable, validate_export, variant_frame, waveform,
-    waveform_cancellable, Container, ExportOptions, ExportProgress, ExportReport, ExportStage, ExportVariant, ExportedFrame, Fit,
-    FpsSource, ImageFormat, LoudnessPreset, LoudnessTarget, PlaybackParams, PlaybackRequest, PreviewFrame, ProxyRun, RateControl,
-    Region, RenderStatus, ScrubConfig, ScrubFrames, ScrubStats, VariantProgress, VariantsRun, WrittenAudio, WrittenVideo,
-    MAX_STREAM_FPS, MAX_STREAM_WIDTH, MIN_STREAM_FPS, MIN_STREAM_WIDTH,
+    waveform_cancellable, Container, ExportOptions, ExportPart, ExportProgress, ExportReport, ExportStage, ExportVariant,
+    ExportedFrame, Fit, FpsSource, ImageFormat, LoudnessPreset, LoudnessTarget, PlaybackParams, PlaybackRequest, PreviewFrame,
+    ProxyRun, RateControl, Region, RenderStatus, ScrubConfig, ScrubFrames, ScrubStats, VariantProgress, VariantsRun,
+    WrittenAudio, WrittenVideo, MAX_STREAM_FPS, MAX_STREAM_WIDTH, MIN_STREAM_FPS, MIN_STREAM_WIDTH,
 };
 
 #[cfg(test)]

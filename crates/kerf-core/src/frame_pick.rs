@@ -391,6 +391,17 @@ pub fn fps_pick(pick: &FpsPick, src: &SourceFrames) -> Option<usize> {
     }
 }
 
+/// The slots a clip's stream fills, `(first, end)`: the slot of its first frame and the slot the
+/// stream ends at (no output frame is at or past it), or `None` for a clip with no stream. What a
+/// run that picks the clip up part-way (an export in parts, restarting a still at a cut) has to
+/// reproduce: [`fps_pick`] is `Some` for exactly the output frames in `first..end`.
+pub fn fps_span(pick: &FpsPick, src: &SourceFrames) -> Option<(i64, i64)> {
+    let frames = frames_of(pick, src);
+    let run = run(pick, &frames)?;
+    let first = run.slot(frames.pts(run.kept.start) - run.shift);
+    Some((first, run.end))
+}
+
 /// The frames a pick is made over: `src`, or, for a still image, its loop: `-t` keeps the frames
 /// before `end` (at least one), and the next one is the frame that ended the input.
 fn frames_of<'a>(pick: &FpsPick, src: &'a SourceFrames<'a>) -> Frames<'a> {

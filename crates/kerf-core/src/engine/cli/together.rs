@@ -84,6 +84,18 @@ pub(super) fn renders_together(variants: &[ExportVariant], opts: &ExportOptions)
         && !opts.container.is_audio_only()
 }
 
+/// Whether the cut has more open at once than one run should hold, so that each variant is rendered
+/// in parts on its own ([`segments`]) — one run over every delivery frame's inputs would open them
+/// all again, times the number of frames (pure). What a delivery frame changes (crops, captions) is
+/// not what [`segments::plan_export`] decides on, so the first variant speaks for all.
+pub(super) fn export_in_parts(timeline: &Timeline, assets: &[Asset], variants: &[ExportVariant], opts: &ExportOptions) -> bool {
+    let (Some(first), Some(limits)) = (variants.first(), segments::limits()) else {
+        return false;
+    };
+    let framed = timeline.for_delivery(first.delivery);
+    segments::plan_export(&framed, assets, &variant_opts(opts, first.delivery), limits).is_some()
+}
+
 /// The argv of the one run, and where its outputs sit.
 #[derive(Debug)]
 pub(super) struct TogetherArgs {
@@ -168,6 +180,7 @@ pub(super) fn build_together_args(
                 false,
                 Some(&titles[k]),
                 &if k == 0 { String::new() } else { format!("d{k}") },
+                None,
             )
         })
         .collect();
@@ -259,7 +272,7 @@ pub(super) fn render_together(
     progress: &mut dyn FnMut(VariantProgress),
     cancel: &dyn Fn() -> bool,
 ) -> Result<Option<RenderStatus>> {
-    if !renders_together(variants, opts) {
+    if !renders_together(variants, opts) || export_in_parts(timeline, assets, variants, opts) {
         return Ok(None);
     }
     let opts = ExportOptions {
