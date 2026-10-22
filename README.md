@@ -137,7 +137,8 @@ claude mcp add --transport http kerf http://127.0.0.1:7777/mcp \
 ```
 
 An agent's edits wait in a proposal for you to accept (all of it, or only some changes)
-unless you switch review off in the same place.
+unless you switch review off in the same place: then its edits, the work on the tasks
+you queue included, land on the cut as it makes them, each one an undoable step.
 
 Now ask the agent to work on the project you have open — _"skim the interview clip, cut
 the dead air, and drop in captions."_ It will claim a task, use the tools below, and hand

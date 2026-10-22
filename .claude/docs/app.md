@@ -286,7 +286,9 @@ state says nothing about it, so `running` is false and `error` empty, which is w
 and `set_mcp_settings { mcp_enabled?, mcp_addr?, mcp_require_token?, agent_review? }` (refuses any other key; a network
 address needs the token; `settings::update` restarts the listener when the address or switch moves, see `mcp.md`) are the Agent
 settings page's commands — the settings file holds `agent_review`, `mcp_enabled`, `mcp_addr`, `mcp_require_token` and
-`mcp_token`, and `SettingsView` carries all but the token. A **failed or cancelled render deletes what it wrote**, and the engine does it
+`mcp_token`, and `SettingsView` carries all but the token. `agent_review` off means an agent's edits — **task work included** — land on the
+live cut as ordinary revisions (claiming a task opens no proposal; `core-project.md`, `mcp.md`); a proposal already open when it is
+turned off stays open and is not applied for anyone, and the app has nothing to do on the flip (every agent lock re-reads the static). A **failed or cancelled render deletes what it wrote**, and the engine does it
 (`kerf_core::discard_partial`, inside `render_with_progress` and so inside `render_variants`; the MCP `export` repeats it
 so a cancel lands before the handler's future can be dropped): only if this run touched the file
 (mtime differs from before), so a failure or a cancel before ffmpeg opened the output cannot delete the
