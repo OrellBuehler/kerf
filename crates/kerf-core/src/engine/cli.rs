@@ -18958,16 +18958,17 @@ mod tests {
         let frame = Delivery::new(640, 360, Fit::Contain);
         let at = |fps: f64| Some(frame.with_fps(Some(fps)).unwrap());
 
-        let mut seen = Vec::new();
-        seen.push(("footage", rate_of("footage.mp4", Some(frame), &opts)));
-        seen.push(("none", rate_of("none.mp4", None, &opts)));
-        seen.push(("50", rate_of("fifty.mp4", at(50.0), &opts)));
-        seen.push(("29.97", rate_of("ntsc.mp4", at(29.97), &opts)));
         let explicit = ExportOptions {
             fps: Some(25.0),
             ..opts.clone()
         };
-        seen.push(("explicit", rate_of("explicit.mp4", at(50.0), &explicit)));
+        let seen = [
+            ("footage", rate_of("footage.mp4", Some(frame), &opts)),
+            ("none", rate_of("none.mp4", None, &opts)),
+            ("50", rate_of("fifty.mp4", at(50.0), &opts)),
+            ("29.97", rate_of("ntsc.mp4", at(29.97), &opts)),
+            ("explicit", rate_of("explicit.mp4", at(50.0), &explicit)),
+        ];
         let _ = std::fs::remove_dir_all(&dir);
         assert_eq!(
             seen,
