@@ -683,6 +683,23 @@ fn splice_caps(args: &mut Vec<String>, threads: usize, capped: bool) {
     args.splice(0..0, head);
 }
 
+/// Cap the decoder of **every** input of an argv to `threads` (a `-threads` ahead of each `-i`):
+/// [`limit_args`]'s head flags reach only the first input's group, and a frame-threaded decoder
+/// holds a frame per thread whether or not the cut has got to its clip. For a run that opens
+/// several decoders at once (a part of an export in parts). Holds at any budget, 100% included.
+pub fn cap_input_threads(args: &mut Vec<String>, threads: usize) {
+    let n = threads.max(1).to_string();
+    let mut capped = Vec::with_capacity(args.len() + 8);
+    for arg in std::mem::take(args) {
+        if arg == "-i" {
+            capped.push("-threads".to_string());
+            capped.push(n.clone());
+        }
+        capped.push(arg);
+    }
+    *args = capped;
+}
+
 /// [`limit_args`] for one run that writes several files (`sinks`: the argv index of each
 /// output path). The decode is capped once at the front, as ever; the encoders run side by
 /// side in the one process, so each output's `-threads` is its share of the budget

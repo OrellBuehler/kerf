@@ -4923,19 +4923,37 @@ pub fn build_export_args(timeline: &Timeline, assets: &[Asset], output_path: &st
 struct InputPlan {
     /// The representative clip flat-index for each unique input, in `-i` order.
     representatives: Vec<usize>,
-    /// Per clip flat-index → its unique input index (position in `representatives`).
+    /// Per clip flat-index → its unique input index (position in `representatives`);
+    /// [`NO_INPUT`] for a clip that takes no part in this plan.
     clip_input: Vec<usize>,
     /// Per clip flat-index, how a title clip's pictures are stamped onto the canvas' grid (its chain's
     /// first filters); `None` for a clip of footage. Filled by [`push_inputs`], which names the pictures.
     stamps: Vec<Option<svg_layer::ClipStamp>>,
+    /// Added to every input index the graph prints (`[N:v]`, `[N:a]`): the inputs the argv
+    /// has ahead of this plan's own. `0` for every graph that runs alone.
+    base: usize,
 }
 
+/// A clip in no input of a plan ([`InputPlan::clip_input`]).
+const NO_INPUT: usize = usize::MAX;
+
+#[cfg(test)]
 fn plan_inputs(timeline: &Timeline, assets: &[Asset], fx: &[ClipFx]) -> InputPlan {
+    plan_inputs_for(timeline, assets, fx, &|_| true)
+}
+
+/// [`plan_inputs`] for the clips `include` names (by flat index): the inputs of one part of an
+/// export in parts, or of its sound alone. The others get no input.
+fn plan_inputs_for(timeline: &Timeline, assets: &[Asset], fx: &[ClipFx], include: &dyn Fn(usize) -> bool) -> InputPlan {
     let image_of = |id| assets.iter().find(|a| a.id == id).is_some_and(|a| a.is_image());
     let mut representatives: Vec<usize> = Vec::new();
     let mut clip_input: Vec<usize> = Vec::new();
     let mut seen: std::collections::HashMap<(uuid::Uuid, String), usize> = std::collections::HashMap::new();
     for (flat, clip) in timeline.tracks.iter().flat_map(|t| t.clips.iter()).enumerate() {
+        if !include(flat) {
+            clip_input.push(NO_INPUT);
+            continue;
+        }
         let input = if image_of(clip.asset_id) || clip.is_generated() {
             let i = representatives.len();
             representatives.push(flat);
@@ -4958,16 +4976,41 @@ fn plan_inputs(timeline: &Timeline, assets: &[Asset], fx: &[ClipFx]) -> InputPla
         representatives,
         clip_input,
         stamps,
+        base: 0,
     }
+}
+
+/// A still image an export in parts picks up at a cut instead of reading from its start: the output
+/// frame its first picture lands on, and how many pictures it keeps (so that it ends where the
+/// whole export's run of it does).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Restart {
+    frame: u64,
+    count: u64,
+}
+
+/// Which inputs a run opens and how: all of them by default ([`push_inputs`]), or the part of an
+/// export in parts ([`segments`]).
+struct InputScope<'a> {
+    /// The cut's transition table, whole: a clip's look does not depend on which part draws it.
+    fx: &'a [ClipFx],
+    /// The clips (by flat index) that get an input.
+    include: &'a dyn Fn(usize) -> bool,
+    /// Stills read from a frame onward (by flat index).
+    restarts: &'a HashMap<usize, Restart>,
+    /// Open the sound of each input only (`-vn`): the sound of an export in parts is one pass over
+    /// the whole cut, from the clips that have any.
+    sound_only: bool,
+    /// The inputs ahead of these in the argv.
+    base: usize,
 }
 
 /// Push the `-i` inputs for every clip in `timeline` and return the plan the
 /// filtergraph indexes by.
 ///
-/// Extracted so export and the live preview stream ([`build_preview_args`])
-/// decode their sources *identically* — same deduplication, same per-input
-/// fast-seek, same still-image looping — and only differ at the two ends of the
-/// pipeline (which files go in, what muxer comes out).
+/// Extracted so export and the live preview stream ([`build_preview_args`]) decode their sources
+/// *identically* — same deduplication, same per-input fast-seek, same still-image looping — and
+/// only differ at the two ends of the pipeline (which files go in, what muxer comes out).
 fn push_inputs(
     timeline: &Timeline,
     assets: &[Asset],
@@ -4975,14 +5018,35 @@ fn push_inputs(
     opts: &ExportOptions,
     args: &mut Vec<String>,
 ) -> Result<InputPlan> {
+    let fx = transition_fx(timeline, assets);
+    let scope = InputScope {
+        fx: &fx,
+        include: &|_| true,
+        restarts: &HashMap::new(),
+        sound_only: false,
+        base: 0,
+    };
+    push_inputs_scoped(timeline, assets, fmt, opts, &scope, args)
+}
+
+/// [`push_inputs`] for the clips and the way of reading them an [`InputScope`] names.
+fn push_inputs_scoped(
+    timeline: &Timeline,
+    assets: &[Asset],
+    fmt: &ExportFormat,
+    opts: &ExportOptions,
+    scope: &InputScope<'_>,
+    args: &mut Vec<String>,
+) -> Result<InputPlan> {
     let path_of = |id: uuid::Uuid| assets.iter().find(|a| a.id == id).map(|a| a.path.as_str());
     let image_of = |id: uuid::Uuid| assets.iter().find(|a| a.id == id).is_some_and(|a| a.is_image());
-    let fx = transition_fx(timeline, assets);
+    let fx = scope.fx;
     // Deduplicate inputs: clips whose `-i` args are identical (same asset, same
     // fast-seek) share one decoded input, fanned out in the graph with `split`.
-    let mut plan = plan_inputs(timeline, assets, &fx);
+    let mut plan = plan_inputs_for(timeline, assets, fx, scope.include);
+    plan.base = scope.base;
     // A title clip's input is its pictures, drawn before ffmpeg is spawned (`svg_layer::prepare`).
-    let titles = svg_layer::clip_sequences(timeline, fmt, &fx);
+    let titles = svg_layer::clip_sequences(timeline, fmt, fx);
     let clips: Vec<&crate::model::Clip> = timeline.tracks.iter().flat_map(|t| t.clips.iter()).collect();
     for &rep in &plan.representatives {
         let clip = clips[rep];
@@ -4996,7 +5060,20 @@ fn push_inputs(
         }
         let path = path_of(clip.asset_id).ok_or(Error::AssetNotFound(clip.asset_id))?;
         let (start, end) = clip_source_window(clip, &fx[rep]);
-        if image_of(clip.asset_id) {
+        if let Some(restart) = scope.restarts.get(&rep) {
+            // A still picked up at a cut: the picture, looped, numbered onto the frames it still
+            // has (the way a held title is), where the whole export reads it from its own start.
+            let rate = Rational::from_fps(fmt.fps)
+                .ok_or_else(|| Error::Engine(format!("frame rate {} cannot restart a still", fmt.fps)))?;
+            args.extend(["-f", "image2", "-pattern_type", "none", "-loop", "1", "-framerate"].map(String::from));
+            args.push(format!("{}", fmt.fps));
+            plan.stamps[rep] = Some(svg_layer::ClipStamp {
+                num: rate.num,
+                den: rate.den,
+                first_frame: restart.frame,
+                held: Some(restart.count),
+            });
+        } else if image_of(clip.asset_id) {
             // A still has no timeline of its own: loop the single frame and read it
             // for the clip's whole source window. The in-graph trim (with the seek
             // forced to 0 for images) then carves the clip's duration out of it.
@@ -5013,7 +5090,9 @@ fn push_inputs(
             // per-input and only for real media — a still gains nothing. Frames
             // are downloaded to system memory (no `-hwaccel_output_format`), so the
             // per-input `-ss` fast-seek and the CPU filtergraph still work.
-            if let Some(hw) = opts
+            if scope.sound_only {
+                args.push("-vn".to_string());
+            } else if let Some(hw) = opts
                 .hwaccel
                 .as_deref()
                 .filter(|h| !h.is_empty() && !h.eq_ignore_ascii_case("none"))
@@ -5049,6 +5128,16 @@ fn export_timeline(timeline: &Timeline, opts: &ExportOptions) -> Timeline {
     cut
 }
 
+/// [`export_timeline`] as the export builder has it: with the generated captions dropped when the
+/// export carries them as a subtitle track or a file instead (`skip_burned_captions`).
+fn prepared_cut(timeline: &Timeline, opts: &ExportOptions) -> Timeline {
+    let mut cut = export_timeline(timeline, opts);
+    if opts.skip_burned_captions {
+        cut.overlays.retain(|o| !o.generated);
+    }
+    cut
+}
+
 /// Take the title clips out of a cut whose graph draws no picture (an audio-only export, the levels
 /// and the mix passes): their input is pictures nobody drew, and they have no sound.
 fn drop_titles(timeline: &mut Timeline) {
@@ -5073,10 +5162,7 @@ fn build_export_args_phase(
 ) -> Result<Vec<String>> {
     // Drop muted / solo-shadowed tracks and disabled clips up front, and cut the range an export
     // of one span draws, so the rest of the builder never has to reason about either.
-    let mut cut = export_timeline(timeline, opts);
-    if opts.skip_burned_captions {
-        cut.overlays.retain(|o| !o.generated);
-    }
+    let cut = prepared_cut(timeline, opts);
     let timeline = &cut;
 
     // Stream gating: decide what the graph emits and what we `-map`, in lockstep.
@@ -5683,6 +5769,7 @@ fn preview_args(cut: &PreviewCut, assets: &[Asset], quality: u8) -> Result<Vec<S
         false,
         Some(&titles),
         "",
+        None,
     );
     args.push("-filter_complex".to_string());
     args.push(graph.filter);
@@ -5993,6 +6080,31 @@ pub struct ExportProgress {
     /// What the export is doing now, once it is working ([`ExportStage`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stage: Option<ExportStage>,
+    /// Set while an export that is rendered in parts ([`ExportPart`]) is under way.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub part: Option<ExportPart>,
+}
+
+/// Where an export that is rendered in parts has got to: "rendering part 2 of 5", then, with every
+/// part done, "encoding" (the one pass that joins them, mixes the sound and writes the file).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub struct ExportPart {
+    /// The part being rendered, from 1 (the last part, when `encoding`).
+    pub index: u32,
+    /// How many parts the export is rendered in.
+    pub total: u32,
+    /// Every part is rendered and the file is being written.
+    pub encoding: bool,
+}
+
+impl std::fmt::Display for ExportPart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.encoding {
+            write!(f, "encoding")
+        } else {
+            write!(f, "rendering part {} of {}", self.index, self.total)
+        }
+    }
 }
 
 impl ExportProgress {
@@ -6004,6 +6116,7 @@ impl ExportProgress {
             eta_secs: None,
             waiting: Some(why),
             stage: None,
+            part: None,
         }
     }
 }
@@ -6157,6 +6270,7 @@ fn measure_static_loudness(
                 eta_secs: None,
                 waiting: None,
                 stage: Some(ExportStage::Metering),
+                part: None,
             },
         });
     };
@@ -6473,6 +6587,9 @@ pub struct VariantProgress {
     /// [`ExportProgress::stage`]: what the export is doing now.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stage: Option<ExportStage>,
+    /// [`ExportProgress::part`]: the file in flight is rendered in parts.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub part: Option<ExportPart>,
     /// Every variant is rendering in the one run ([`render_variants`] `together`): `variant`
     /// is then 0 and `fraction` is each file's as much as the whole.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
@@ -6490,6 +6607,7 @@ impl VariantProgress {
             eta_secs: p.eta_secs,
             waiting: p.waiting,
             stage: p.stage,
+            part: p.part,
             together,
         }
     }
@@ -6641,6 +6759,7 @@ fn measuring(measured: f64, started: Instant) -> ExportProgress {
         eta_secs: None,
         waiting: None,
         stage: Some(ExportStage::Measuring),
+        part: None,
     }
 }
 
@@ -6760,6 +6879,12 @@ fn render_attempt(
     hw_used: &std::cell::Cell<bool>,
 ) -> Result<RenderStatus> {
     let (has_video, _) = export_preflight(timeline, assets, opts)?;
+
+    // A span with more open at once than a run should hold is rendered in parts (`segments`);
+    // everything under the limits keeps the single run below, argv for argv.
+    if let Some(parts) = segments::limits().and_then(|limits| segments::plan_export(timeline, assets, opts, limits)) {
+        return segments::render_in_parts(&parts, assets, output, opts, progress, cancel, hw_used);
+    }
 
     let output_str = output
         .to_str()
@@ -7052,6 +7177,22 @@ fn run_ffmpeg_progress_into(
     run_progress_with(&ffmpeg_bin(), args, sinks, output, bar, resource, progress, cancel)
 }
 
+/// [`run_ffmpeg_progress_into`] that also says how many frames the run had written when it ended
+/// (ffmpeg's `frame=` in the `-progress` stream), for a run whose count is part of what it promises.
+#[allow(clippy::too_many_arguments)]
+fn run_ffmpeg_progress_counted(
+    args: &[String],
+    sinks: &[usize],
+    output: &Path,
+    bar: Bar,
+    resource: cpu::Resource,
+    progress: &mut dyn FnMut(ExportProgress),
+    cancel: &dyn Fn() -> bool,
+    frames: &mut u64,
+) -> Result<RenderStatus> {
+    run_progress_counting(&ffmpeg_bin(), args, sinks, output, bar, resource, progress, cancel, frames)
+}
+
 /// [`run_ffmpeg_progress_into`] with the binary named (a test runs a script that talks like ffmpeg).
 #[allow(clippy::too_many_arguments)]
 fn run_progress_with(
@@ -7063,6 +7204,22 @@ fn run_progress_with(
     resource: cpu::Resource,
     progress: &mut dyn FnMut(ExportProgress),
     cancel: &dyn Fn() -> bool,
+) -> Result<RenderStatus> {
+    run_progress_counting(bin, args, sinks, output, bar, resource, progress, cancel, &mut 0)
+}
+
+/// [`run_progress_with`] that also counts the frames written (`frames`).
+#[allow(clippy::too_many_arguments)]
+fn run_progress_counting(
+    bin: &str,
+    args: &[String],
+    sinks: &[usize],
+    output: &Path,
+    bar: Bar,
+    resource: cpu::Resource,
+    progress: &mut dyn FnMut(ExportProgress),
+    cancel: &dyn Fn() -> bool,
+    frames: &mut u64,
 ) -> Result<RenderStatus> {
     use std::io::{BufRead, BufReader, Read};
     use std::process::Stdio;
@@ -7144,6 +7301,7 @@ fn run_progress_with(
             eta_secs,
             waiting: None,
             stage: Some(stage),
+            part: None,
         });
     };
     say(progress, bar.offset, None, ExportStage::Starting);
@@ -7180,6 +7338,9 @@ fn run_progress_with(
             }
         };
         last_output = Instant::now();
+        if let Some(n) = line.strip_prefix("frame=").and_then(|v| v.trim().parse::<u64>().ok()) {
+            *frames = n;
+        }
         let block = reader.feed(&line);
         match block {
             // The output has been written to: its position against the length of the cut (the
@@ -7277,6 +7438,19 @@ struct Meter {
     track: Option<usize>,
 }
 
+/// One part of an export in parts, as its picture graph draws it ([`segments`]): the clips of the
+/// plan (`InputPlan`: the ones that are on screen for these output frames) over a canvas that is
+/// those frames of the whole export's. Times in the graph stay the whole export's (a part's frames carry the
+/// timestamps they have in it, so every expression of a clip, a title or a caption is the one the
+/// single run evaluates); the part is shifted to start at zero only as it leaves the graph.
+struct Scope<'a> {
+    /// The cut's transition table, whole: a clip's look is the export's, whichever part draws it.
+    fx: &'a [ClipFx],
+    /// The output frames the part covers: `frames` of them from `first_frame`.
+    first_frame: u64,
+    frames: u64,
+}
+
 /// Build the positional, multi-track `filter_complex`.
 ///
 /// Unlike a flat `concat`, this honors each clip's `timeline_start` and layers
@@ -7340,7 +7514,7 @@ fn build_filter_complex_metered(
     meter: bool,
 ) -> FilterGraph {
     build_filter_complex_with(
-        timeline, assets, fmt, total, opts, want_video, want_audio, plan, meter, None, "",
+        timeline, assets, fmt, total, opts, want_video, want_audio, plan, meter, None, "", None,
     )
 }
 
@@ -7363,6 +7537,7 @@ fn build_filter_complex_with(
     meter: bool,
     titles: Option<&[svg_layer::SvgSeq<'_>]>,
     instances: &str,
+    scope: Option<&Scope<'_>>,
 ) -> FilterGraph {
     let has_audio = |clip: &crate::model::Clip| clip_sounds(clip, assets);
     let is_image = |clip: &crate::model::Clip| assets.iter().find(|a| a.id == clip.asset_id).is_some_and(|a| a.is_image());
@@ -7394,6 +7569,9 @@ fn build_filter_complex_with(
             let clip = &track.clips[cj];
             let flat = base + cj;
             let input = plan.clip_input[flat];
+            if input == NO_INPUT {
+                continue;
+            }
             if track.kind == StreamKind::Video {
                 video.push((flat, input, clip));
             }
@@ -7416,10 +7594,18 @@ fn build_filter_complex_with(
 
     // Per-clip transition adjustments (crossfade tail / alpha, dip-to-black
     // fades), computed per track from each clip's `transition_in`.
-    let fx = transition_fx(timeline, assets);
+    let fx_own;
+    let fx: &[ClipFx] = match scope {
+        Some(scope) => scope.fx,
+        None => {
+            fx_own = transition_fx(timeline, assets);
+            &fx_own
+        }
+    };
 
     let gif = opts.container == Container::Gif;
-    let has_video = want_video && !video.is_empty();
+    // A part with no clip on screen is still a picture: the canvas, and what is drawn on it.
+    let has_video = want_video && (!video.is_empty() || scope.is_some());
     let has_audio_out = want_audio && !audio.is_empty();
 
     // How many clips consume each input as video / as audio. An input used by
@@ -7441,7 +7627,7 @@ fn build_filter_complex_with(
         for (i, &cnt) in vcount.iter().enumerate() {
             if cnt > 1 {
                 let outs: String = (0..cnt).map(|k| format!("[vsp{i}_{k}]")).collect();
-                chains.push(format!("[{i}:v]split={cnt}{outs}"));
+                chains.push(format!("[{}:v]split={cnt}{outs}", plan.base + i));
             }
         }
     }
@@ -7449,7 +7635,7 @@ fn build_filter_complex_with(
         for (i, &cnt) in acount.iter().enumerate() {
             if cnt > 1 {
                 let outs: String = (0..cnt).map(|k| format!("[asp{i}_{k}]")).collect();
-                chains.push(format!("[{i}:a]asplit={cnt}{outs}"));
+                chains.push(format!("[{}:a]asplit={cnt}{outs}", plan.base + i));
             }
         }
     }
@@ -7460,15 +7646,6 @@ fn build_filter_complex_with(
 
     // ---- picture: black base + positioned overlays --------------------------
     if has_video {
-        chains.push(format!(
-            "color=c=black:s={w}x{h}:r={fps}:d={total},format={pf}[vbase]",
-            w = fmt.width,
-            h = fmt.height,
-            fps = fmt.fps,
-            total = total.max(0.0),
-            pf = fmt.pix_fmt,
-        ));
-        let mut cur = "vbase".to_string();
         let draw = !timeline.overlays.is_empty();
         // Animated titles: PNG sequences read as inputs after the clips'. They go over the whole
         // composite and under the text.
@@ -7480,9 +7657,14 @@ fn build_filter_complex_with(
                 &own
             }
         };
-        // The picture ends on `[outv]`, or on `vhw` when a VAAPI encoder's upload follows.
+        // The picture ends on `[outv]`, or on `vhw` when a VAAPI encoder's upload follows. A part
+        // of an export in parts ends on `vpart`, which is shifted to start at zero on its way out.
         let vaapi = uploads_to_vaapi(opts);
-        let final_pad = if vaapi { "vhw" } else { "outv" };
+        let final_pad = match (vaapi, scope) {
+            (_, Some(_)) => "vpart",
+            (true, None) => "vhw",
+            (false, None) => "outv",
+        };
         // What comes after the titles: `vcomp` for gif (palettegen follows), `vtext`
         // when text overlays will be drawn on top, else directly on `final_pad`.
         let after_svg = if draw {
@@ -7494,14 +7676,49 @@ fn build_filter_complex_with(
         };
         // The clips land on `vsvg` when titles follow, else where the titles would have gone.
         let composite_pad = if svg.is_empty() { after_svg } else { "vsvg" };
-        let last = video.len() - 1;
+        // The canvas. A part has its own frames of it: `frames` from `first_frame`, numbered as the
+        // whole export's (`setpts=N+k`, counted in frames like a title's), and — when no clip is
+        // overlaid, which is where the graph would otherwise leave a picture in the delivery's
+        // format — in the 8-bit 4:2:0 every `overlay` composes in, so that what is drawn on it
+        // (titles, captions) is drawn as in the whole export.
+        let canvas_pad = if video.is_empty() { composite_pad } else { "vbase" };
+        match scope {
+            None => chains.push(format!(
+                "color=c=black:s={w}x{h}:r={fps}:d={total},format={pf}[{canvas_pad}]",
+                w = fmt.width,
+                h = fmt.height,
+                fps = fmt.fps,
+                total = total.max(0.0),
+                pf = fmt.pix_fmt,
+            )),
+            Some(part) => {
+                // Half a frame short of the last one's slot, so that no rounding of the duration
+                // can add a frame or take one away.
+                let d = (part.frames as f64 - 0.5) / fmt.fps;
+                let composes = if video.is_empty() && svg.is_empty() && fmt.pix_fmt != "yuv420p" {
+                    ",format=yuv420p"
+                } else {
+                    ""
+                };
+                chains.push(format!(
+                    "color=c=black:s={w}x{h}:r={fps}:d={d},format={pf},setpts=N+{k}{composes}[{canvas_pad}]",
+                    w = fmt.width,
+                    h = fmt.height,
+                    fps = fmt.fps,
+                    pf = fmt.pix_fmt,
+                    k = part.first_frame,
+                ));
+            }
+        }
+        let mut cur = "vbase".to_string();
+        let last = video.len().wrapping_sub(1);
         for (n, (flat, input, clip)) in video.iter().enumerate() {
             let src = if vcount[*input] > 1 {
                 let k = vnext[*input];
                 vnext[*input] += 1;
                 format!("vsp{input}_{k}")
             } else {
-                format!("{input}:v")
+                format!("{}:v", plan.base + input)
             };
             // A clip the blurred fill does not suit is placed with Contain's chain.
             let contained;
@@ -7577,7 +7794,7 @@ fn build_filter_complex_with(
             cur = out;
         }
         if !svg.is_empty() {
-            svg_layer::push_chains(svg, n_inputs, composite_pad, after_svg, &mut chains);
+            svg_layer::push_chains(svg, plan.base + n_inputs, composite_pad, after_svg, &mut chains);
         }
         // Text overlays (titles / lower-thirds / captions) drawn on the composited
         // picture in order; the last produces the gif source `vcomp` or `[outv]`.
@@ -7609,8 +7826,11 @@ fn build_filter_complex_with(
             chains.push("[gpsrc]palettegen=stats_mode=diff[gpal]".to_string());
             chains.push(format!("[gpuse][gpal]paletteuse=dither={dither}[outv]"));
         }
-        if vaapi {
+        if vaapi && scope.is_none() {
             chains.push("[vhw]format=nv12,hwupload[outv]".to_string());
+        }
+        if scope.is_some() {
+            chains.push("[vpart]setpts=PTS-STARTPTS[outv]".to_string());
         }
     }
 
@@ -7623,7 +7843,7 @@ fn build_filter_complex_with(
                 anext[*input] += 1;
                 format!("asp{input}_{k}")
             } else {
-                format!("{input}:a")
+                format!("{}:a", plan.base + input)
             };
             chains.push(format!(
                 "[{src}]{chain}[a{flat}]",
@@ -10531,6 +10751,12 @@ mod side_files;
 
 /// Every delivery frame of a multi-format export in one ffmpeg run.
 mod together;
+
+/// A long export rendered in parts, so that what is open at once stays bounded.
+mod segments;
+
+#[cfg(test)]
+mod segments_tests;
 
 /// The one run held to the variants rendered one by one, frame for frame (`#[ignore]`d).
 #[cfg(test)]

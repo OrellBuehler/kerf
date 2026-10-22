@@ -332,6 +332,7 @@ mod tests {
             eta_secs: Some(9.0),
             waiting: None,
             stage: Some(ExportStage::Rendering),
+            part: None,
         };
         let seen = p.within(0.08, 1.0, since);
         assert!((seen.fraction - 0.54).abs() < 1e-12, "{}", seen.fraction);
@@ -368,6 +369,7 @@ mod tests {
             eta_secs: None,
             waiting: None,
             stage: Some(ExportStage::Finishing),
+            part: None,
         };
         let json = serde_json::to_value(p).unwrap();
         assert_eq!(json["stage"], "finishing");
