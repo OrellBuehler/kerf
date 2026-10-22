@@ -184,6 +184,21 @@ again; `context.ct` cancels it, a slot wait goes out as a progress notification)
 compared. `export_variants` progress says `measuring the mix's loudness` while a static normalization meters. `export`'s `options.loudness_static` is in its description.
 `set_delivery_format`'s `fit` takes `cover` (the default), `contain` or `blur` (the whole
 picture over a blurred, enlarged copy of itself; a clip placed by its transform gets plain bars).
+Its **`fps`** is the delivery frame rate (`Delivery::fps`, 1 to 240, `23.976` / `29.97` / `59.94` made the exact
+`n * 1000 / 1001`; refused otherwise): every export, the playback and the stills default to it, and an
+explicit `options.fps` wins. Without one an export takes the **first** clip with a picture's rate, which in
+mixed footage (100, 24 and 29.97 fps) is arbitrary, so the tool, `export` and the server `instructions` all
+say to set it. **Omitting `fps` keeps the project's current rate** (a reshape does not lose it; `next_delivery` is the pure rule), `0` clears it,
+`fps` alone (no width / height) changes just the rate of the frame the project has (refused when there is none), and
+a call with none of the three clears the frame, rate included. The answer carries `format` (with `fps`),
+`export_fps` (`{fps, from}`: what an export would write, `from` = `delivery` / `footage`, absent with nothing to
+follow) and the brief. `timeline_summary` shows the same: `delivery_format` reads `1080x1920 (cover, 50 fps)`
+when the rate is stated, and `export_fps` is always there for a cut with a picture; `get_timeline_state` is the
+timeline JSON, so `format.fps`. **`export` reports the frame it wrote**: `{output, width, height, fps, fps_source}`
+(`kerf_core::exported_frame`, taken from the same snapshot the render reads; `fps_source` is `options` /
+`delivery` / `footage`; an audio-only render has no picture and none of the four), and each `export_variants`
+output has the `width` / `height` / `fps` / `fps_source` of that file (`variant_frame`: `for_delivery` keeps the project's
+rate, `options.resolution` and `fit` are the variant's) beside `format`.
 `smart_crop` frames each shot for the delivery frame (the server `instructions`
 pair it with `set_delivery_format`, since reshaping to 9:16 otherwise keeps
 whatever was in the middle). `export_variants` is the one-call multi-format
@@ -497,7 +512,7 @@ Agent edits **stage** (`core-project.md`). The adapter's part:
   `fit_music` and `snap_to_beats` answer `reads::timeline_brief` (durations, clip counts per track) instead of the whole
   timeline; `staged_diff` has the entries (each with an `id`, the key `apply_staged_subset` takes). The tools that
   set a track's switches answer `reads::track_brief` (the track without its clips, with a `clip_count`),
-  `set_delivery_format` the format and a `timeline_brief`, `remove_task` the id and how many tasks remain.
+  `set_delivery_format` the format, the `export_fps` it gives and a `timeline_brief`, `remove_task` the id and how many tasks remain.
 
 ## Background jobs (`mcp/jobs.rs`)
 

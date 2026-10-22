@@ -453,11 +453,29 @@ so the feature is **only** activated through these forwards — which is what ma
   and a half-transparent FFV1 source renders under Blur exactly as under Contain; a 10-bit HLG ramp's
   picture is Contain's to 2 levels (the tone-map's error diffusion), 5 with an 8-bit overlay.
   **The shape itself is a property of the project**, not of one render:
-  `Timeline.format: Option<Delivery>` (`{width, height, fit}`) is the frame the cut
+  `Timeline.format: Option<Delivery>` (`{width, height, fit, fps?}`) is the frame the cut
   is being made *for*. `export_format` applies it between the footage-derived
   default and an explicit `opts.resolution` — so the shape follows the footage when
   unset (every pre-existing timeline, byte-identical graphs), the project frame when
-  set, and a size typed into the export dialog always wins. Because
+  set, and a size typed into the export dialog always wins. **The frame rate is the same
+  kind of default** (`Delivery.fps`, schema v12): without it `fmt.fps` is the rate of the first
+  clip with a picture in stored order — whichever that is in mixed footage (100, 24 and
+  29.97 fps: the export an agent got at 24 when the user's earlier ones were 50) — and a
+  delivery that states one (`Delivery::rate()`, 1..240, a stored value out of range ignored
+  rather than reaching a graph) replaces it, with `opts.fps` still winning over both. `export_format_sourced` also says
+  which of the three set it (`FpsSource`: `Options` / `Delivery` / `Footage`, else `Default` 30),
+  which `delivery_rate` (the summary's `export_fps`), `exported_frame` and `variant_frame` (what an
+  export result reports: `ExportedFrame {width, height, fps, fps_source}`, `None` for an audio
+  container or a cut with no picture; computed from `export_timeline`, so a range and a muted
+  track count as the render counts them) hand out. `check_delivery_fps` makes `23.976` / `29.97` / `59.94` (within 0.005 of
+  `n * 1000 / 1001`) the exact NTSC rate, because FFmpeg reads the short decimals as `2997/100`, not
+  `30000/1001` (`Rational::from_fps` of the stored value is the rational a probed 29.97 source has). A variant keeps the
+  project's rate (`Timeline::for_delivery` copies `fps` unless the variant names its own), so
+  `render_variants` and `together` write every file at it. No golden moves: a delivery with no rate
+  builds the argv it always did (`with_no_delivery_rate_the_export_follows_the_first_clip_as_it_always_did`);
+  with one, `the_delivery_rate_is_the_default_of_every_render_path_and_an_explicit_one_wins` pins the
+  canvas `r=`, every clip's `fps=`, `playback_params`, the preview graph and `render_geometry` (the GPU plan's
+  canvas, `scrub`'s grid and the OTIO / EDL rate read the same number). Because
   `preview_resolution` and `build_timeline_frame_args` already derive their canvas
   from `export_format`, the streamed playback, the scrubbed still and the export all
   render the same frame from that one change — `Timeline::slice`/`for_render` carry
@@ -1224,8 +1242,9 @@ so the feature is **only** activated through these forwards — which is what ma
   slower than it plays — late grows frame by frame in the second case. **Rate and
   width are `playback_params`** (pure, unit-tested; `stream_preview_with` takes a
   `PlaybackRequest { fps, max_width }`, `stream_preview` is a stated rate at the default
-  width): an unstated rate is **the cut's own** — `export_format` of `for_render()`, so a
-  muted track's footage does not set it — clamped to `MIN_STREAM_FPS..=MAX_STREAM_FPS`
+  width): an unstated rate is **the cut's own** — `export_format` of `for_render()` (the delivery
+  frame's rate when it states one, else the first clip as it renders: a
+  muted track's footage does not set it) — clamped to `MIN_STREAM_FPS..=MAX_STREAM_FPS`
   (1..60: a display paints no more), and a stated one is clamped the same, a NaN /
   zero / negative one counting as unstated; an unstated width is 960
   (`PREVIEW_STREAM_WIDTH`), a stated one is clamped to 64..=1920 (the frame tools' own
