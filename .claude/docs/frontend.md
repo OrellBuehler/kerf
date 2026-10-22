@@ -786,9 +786,22 @@ frame is as sharp as the paused one.
 message (`frame-transport.ts` `parsePlaybackMessage`: an `f64` time, then the JPEG, a view into the
 message; the handler cannot throw into the channel's own ordering) into `{ time, jpeg }`, and only a
 frame the gate lets through is turned into anything: `jpegDataUrl` (`Uint8Array.toBase64` where the
-webview has it, a chunked `btoa` otherwise) goes to `frames.showStreamed`, into the pane's **one
-persistent `<img decoding="async">`** — which the settled still then replaces the `src` of, so
-pausing swaps no element. `CANVAS_PAINTER` (`frame-transport.ts`, **off**) is the alternative: a
+webview has it, a chunked `btoa` otherwise) goes to `frames.showStreamed`, into `frameUrl`, the one slot the
+settled stills share with it. **The picture is double-buffered** (`picture-buffer.ts`, bun-tested): the pane has **two
+stacked `<img decoding="async">`** that stay mounted across every route (hidden with `visibility`, never `{#if}`, for
+the GPU's surface or the canvas), and a new `src` is set on the one that is *not* on show, `await img.decode()`d, and
+only then made the visible one (`pictureSlot`) — an `<img>` whose `src` is replaced paints its own background for the
+frames a data URL takes to decode, and the matte is black in every theme (a black flash on WebView2, and an animated
+SVG title, which FFmpeg burns into the streamed JPEGs, flickered with it; a fresh async `<img>` at each GPU↔stream
+hand-over was blank the same way). One decode at a time, the newest picture waiting; pictures are shown in the order
+`frameUrl` was handed them (`frameSeq` counts every one, an identical URL included, so a stream frame cannot land over a
+newer still), a decode that finishes with a newer picture waiting is dropped (at most `MAX_DROPS` in a row, so a
+machine that decodes slower than the rate still moves), a decode that rejects keeps the picture on show, and a null
+`frameUrl` (nothing on the cut) resets it. A picture that replaces the surface's or the canvas's (`frameCovers`) does
+not show the picture from before the GPU played, which is seconds old: it is hidden and the frame is transparent (the
+surface under it stays) until the new one has decoded. `showStreamed` also marks every request made so far stale
+(`shown = asked + 1`), so a still fetched before the play cannot land over its frames once it ends. The aspect
+(`pictureAspect`, for the title layer) is reported when a picture is put on show. `CANVAS_PAINTER` (`frame-transport.ts`, **off**) is the alternative: a
 stream painter (`createStreamPainter`: two decodes in flight at most, the newest waiting frame wins,
 a frame that finishes after a newer one is dropped, nothing is drawn after `stop`) decodes with
 `createImageBitmap` (`frame-canvas.ts`, with a data-URL `Image` fallback it only commits to after
@@ -997,7 +1010,7 @@ put focus there its own keys are ← → a frame, ⇧← ⇧→ a second, Home /
 (`routePreview`: pure and bun-tested — setting, platform support, playback streaming, an
 empty timeline, overlays, covered) is asked of `getPreviewFrame` instead of
 `getTimelineFrame`, and when the backend says `renderer: 'gpu'` the frame draws *nothing*
-(`gpuShown`: no image, no backdrop — the surface is what is seen); a frame it hands back is
+(`gpuShown`: the two images hidden, no backdrop — the surface is what is seen); a frame it hands back is
 the JPEG as ever. The frame's content box is reported to `set_preview_bounds` by a
 `ResizeObserver`, the window events and a 150 ms poll, one report at a time (`singleFlight`),
 `deviceRect` rounding both edges so neighbours never gap at 125 / 150 %, and a hidden report

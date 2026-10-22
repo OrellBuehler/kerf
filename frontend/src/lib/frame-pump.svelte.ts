@@ -4,6 +4,9 @@
 // answers `superseded` for the ones it replaced), and the answer shown as a picture
 // (`frameUrl`), as nothing at all (`gpuShown`: the native surface is what is seen) or, with the canvas
 // painter on (`CANVAS_PAINTER`), as the last frame of the playback stream on a canvas of its own (`streamShown`).
+// `frameUrl` is the one slot for the stream's frames and the fetched stills, in the order they were handed
+// over; the Preview paints it through two stacked `<img>`s (`picture-buffer.ts`), told of each by `frameSeq`
+// (an identical URL is still a new frame) and of whether it replaced the surface's or the canvas's by `frameCovers`.
 //
 // **GPU playback** (`playback` set) is a third route: while the cut plays forward at 1x and the
 // session is the GPU's, `run` runs once per animation frame (the playhead moves) and asks the backend
@@ -25,6 +28,7 @@
 // as its two primitives in `run` — the only parts of it that should bring a frame back — and handed
 // to `pump` as values.
 
+import { untrack } from 'svelte';
 import { isProxyWaitMessage } from './proxy-wait';
 import type { GpuPlayback } from './gpu-playback';
 import type { PlayAhead, PlayAsk, PreviewDraft, PreviewFrameResult, PreviewOrder } from './types';
@@ -87,6 +91,13 @@ export interface FramePumpDeps {
 
 export function createFramePump(deps: FramePumpDeps) {
 	let frameUrl = $state<string | null>(null);
+	/** Bumped for every picture handed to the pane, `frameUrl` unchanged or not (a still can be byte for byte
+	 *  the one before the GPU played). */
+	let frameSeq = $state(0);
+	let frameCount = 0;
+	/** `frameUrl` took the pane from a picture the `<img>`s did not show (the GPU's surface, the stream's
+	 *  canvas): what they hold is older than what was last seen. */
+	let frameCovers = $state(false);
 	/** The frame on show was drawn in the native surface: nothing is painted over it. */
 	let gpuShown = $state(false);
 	/** The draft of the gesture the frame on show was drawn from (the GPU route's answer to a request
@@ -108,11 +119,19 @@ export function createFramePump(deps: FramePumpDeps) {
 	 *  counting again from zero without being behind the first. */
 	const client = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 
+	/** A picture for the pane. Call before `gpuShown` is cleared: it says what the picture replaces. */
+	function setFrame(url: string | null) {
+		frameCovers = url !== null && (gpuShown || streamShown);
+		frameUrl = url;
+		// Not `frameSeq++`: that reads it, and `run` (an effect) hands over a null.
+		frameSeq = ++frameCount;
+	}
+
 	/** Show a JPEG that is the newest answer so far. */
 	function showUrl(url: string | null, seq: number) {
 		if (!url || deps.streaming() || seq < shown) return;
 		shown = seq;
-		frameUrl = url;
+		setFrame(url);
 		gpuShown = false;
 		drawnDraft = null;
 		streamShown = false;
@@ -155,10 +174,10 @@ export function createFramePump(deps: FramePumpDeps) {
 			// The canvas the compositor drew has the delivery's shape.
 			if (result.timings?.width && result.timings.height) imgAspect = result.timings.width / result.timings.height;
 		} else if (result.frame) {
+			setFrame(result.frame);
 			gpuShown = false;
 			drawnDraft = null;
 			streamShown = false;
-			frameUrl = result.frame;
 		}
 	}
 
@@ -255,6 +274,12 @@ export function createFramePump(deps: FramePumpDeps) {
 		get frameUrl() {
 			return frameUrl;
 		},
+		get frameSeq() {
+			return frameSeq;
+		},
+		get frameCovers() {
+			return frameCovers;
+		},
 		get gpuShown() {
 			return gpuShown;
 		},
@@ -270,10 +295,12 @@ export function createFramePump(deps: FramePumpDeps) {
 		/** A frame of the playback stream, as the data URL the pane's `<img>` shows: the picture,
 		 *  never the surface, in the element the settled still then replaces it in. */
 		showStreamed(url: string) {
+			// Newer than every request made so far: a still or the GPU's frame still on its way back is stale.
+			shown = asked + 1;
+			setFrame(url);
 			gpuShown = false;
 			drawnDraft = null;
 			streamShown = false;
-			frameUrl = url;
 		},
 		/** A frame of the playback stream was drawn on the canvas, `aspect` wide for its height: it is
 		 *  the picture, never the surface, and stays so until a fetched frame replaces it. */
@@ -322,7 +349,7 @@ export function createFramePump(deps: FramePumpDeps) {
 			// window moved to another screen) asks again, at the new width.
 			const width = deps.width();
 			if (!deps.hasClips()) {
-				frameUrl = null;
+				if (untrack(() => frameUrl) !== null) setFrame(null);
 				gpuShown = false;
 				drawnDraft = null;
 				streamShown = false;
