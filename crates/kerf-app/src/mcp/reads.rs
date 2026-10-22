@@ -1989,7 +1989,8 @@ mod tests {
         let before = the_old_answer(&inputs, &statuses).len();
         let (_, compact, _) = listed(&inputs, &statuses, &query(Some(AssetFields::Compact), None, None, None));
         let (full_page, full, _) = listed(&inputs, &statuses, &query(None, None, None, None));
-        assert!(before > 50_000, "the library is as big as the one that overflowed: {before}");
+        // Each asset's path is this checkout's own Cargo.toml, so the size moves with where the repo lives.
+        assert!(before > 40_000, "the library is as big as the one that overflowed: {before}");
         assert!(compact.len() < 15_000, "all 66 in a line each: {}", compact.len());
         assert!(
             compact.len() * 3 < before,

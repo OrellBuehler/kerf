@@ -9182,7 +9182,7 @@ mod tests {
             "{}",
             e.message
         );
-        assert!(super::INSTRUCTIONS.contains("compact") && super::INSTRUCTIONS.contains("imported_after"));
+        assert!(super::EDITING_GUIDE.contains("compact") && super::EDITING_GUIDE.contains("imported_after"));
     }
 
     #[test]
