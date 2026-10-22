@@ -1566,6 +1566,20 @@ export interface ExportProgress {
 	total?: number;
 	/** A multi-format export rendering every file in one pass: `variant` is then 0. */
 	together?: boolean;
+	/** Set while an export that is rendered in parts is under way (a span with more open at once than one
+	 *  ffmpeg run should hold): which part, of how many, then `encoding` once every part is done and the
+	 *  one last pass writes the file. A multi-format export sets it for the file in flight. */
+	part?: ExportPart | null;
+}
+
+/** Where an export rendered in parts has got to (`kerf_core::ExportPart`). */
+export interface ExportPart {
+	/** The part being rendered, from 1. */
+	index: number;
+	/** How many parts the export is rendered in. */
+	total: number;
+	/** Every part is rendered and the file is being written. */
+	encoding: boolean;
 }
 
 /** The first picture stream of a written file (`kerf_core::WrittenVideo`). */

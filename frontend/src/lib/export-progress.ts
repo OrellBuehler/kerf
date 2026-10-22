@@ -14,6 +14,17 @@ export function fmtSpan(s: number | null | undefined): string {
 
 const percent = (p: ExportProgress) => Math.round(Math.min(1, Math.max(0, p.fraction)) * 100);
 
+/** What an export rendered in parts says it is doing (`rendering part 2 of 5`, then `encoding`: the words of
+ *  `kerf_core::ExportPart`'s `Display`); empty for one that runs whole. */
+export function exportPartLabel(p: Pick<ExportProgress, 'part'> | null | undefined): string {
+	const part = p?.part;
+	if (!part) return '';
+	return part.encoding ? 'encoding' : `rendering part ${part.index} of ${part.total}`;
+}
+
+/** The part, ahead of whatever else the line says (`rendering part 2 of 5 · `). */
+const partPrefix = (p: ExportProgress) => (p.part ? `${exportPartLabel(p)} · ` : '');
+
 /** Which file of how many, ahead of a render's percentage (`3 at once · `, `2/3 · `). */
 function filePrefix(p: ExportProgress): string {
 	if (p.together) return `${p.total} at once · `;
@@ -37,7 +48,7 @@ export function progressLine(p: ExportProgress | null | undefined): ProgressLine
 		case 'starting': {
 			// ffmpeg is opening the footage and decoding up to a range's start: nothing is counted, so say how long.
 			const spent = fmtSpan(p.elapsed_secs);
-			return { value: null, text: spent ? `Opening the footage… ${spent}` : 'Opening the footage…' };
+			return { value: null, text: `${partPrefix(p)}${spent ? `Opening the footage… ${spent}` : 'Opening the footage…'}` };
 		}
 		case 'finishing':
 			return { value: p.fraction, text: 'Finishing the file…' };
@@ -45,7 +56,7 @@ export function progressLine(p: ExportProgress | null | undefined): ProgressLine
 			return { value: p.fraction, text: 'Checking the file…' };
 		default: {
 			const eta = p.eta_secs != null ? ` · ${fmtSpan(p.eta_secs)} left` : '';
-			return { value: p.fraction, text: `${filePrefix(p)}${percent(p)}%${eta}` };
+			return { value: p.fraction, text: `${partPrefix(p)}${filePrefix(p)}${percent(p)}%${eta}` };
 		}
 	}
 }
@@ -58,12 +69,12 @@ export function statusText(p: ExportProgress | null | undefined): string {
 		case 'metering':
 			return `Metering loudness ${percent(p)}%`;
 		case 'starting':
-			return 'Export opening the footage…';
+			return p.part ? `Export opening the footage… (${exportPartLabel(p)})` : 'Export opening the footage…';
 		case 'finishing':
 			return 'Finishing the file…';
 		case 'measuring':
 			return 'Checking the file…';
 		default:
-			return `Exporting ${percent(p)}%`;
+			return p.part ? `Exporting ${percent(p)}% · ${exportPartLabel(p)}` : `Exporting ${percent(p)}%`;
 	}
 }
