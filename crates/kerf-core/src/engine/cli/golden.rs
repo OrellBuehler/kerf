@@ -72,6 +72,10 @@
 //! per-case digests are the ones the commit before those numbers could be keyed gave; only 4 block
 //! lines were appended to each file.
 //!
+//! **The export in parts has a file of its own** (`golden/parts.txt`, [`the_parts_argv_builders_produce_the_golden_digests`]):
+//! every case is planned with `segments::plan_export` under [`PARTS_LIMITS`] and the argv of every part and of the last pass is
+//! digested, so the three files above prove that a small export is unchanged and this one pins what a long one is made of.
+//!
 //! **Machine-independent by construction.** The builders read the machine in five
 //! places, each pinned: the preview's decode acceleration (the
 //! `build_preview_args_with` seam), `zscale_available()` (`with_zscale`; a case
@@ -2224,4 +2228,175 @@ fn a_decoders_default_tag_names_no_matrix_in_any_graph_of_the_corpus() {
             labelled[n]
         );
     }
+}
+
+// ---- the export in parts -----------------------------------------------------------------------
+
+/// The limits the parts family is planned under: small enough that the corpus' footage (1080p and up)
+/// is cut into parts.
+const PARTS_LIMITS: segments::SegmentLimits = segments::SegmentLimits {
+    decode_mpx: 5.0,
+    inputs: 4,
+    preroll_s: 10.0,
+};
+const PARTS_BLESSED: &str = include_str!("golden/parts.txt");
+
+/// The families of the parts oracle: what must show in at least [`MIN_PER_FAMILY`] cases.
+const PARTS_FAMILIES: [&str; 14] = [
+    "parts",
+    "parts-refused",
+    "parts-many",
+    "parts-straddler",
+    "parts-restart",
+    "parts-bare-canvas",
+    "parts-sound",
+    "parts-svg-pictures",
+    "parts-held",
+    "parts-two-pass",
+    "parts-10-bit",
+    "parts-hdr",
+    "parts-caption",
+    "parts-faststart",
+];
+
+/// The argv of every part of a case's export in parts and of its last pass (the case's own two-pass
+/// phase), as one text, and the parts families it hits. `NO-PARTS` for a case the plan leaves whole.
+fn parts_text(c: &Case, assets: &[Asset]) -> (String, Vec<&'static str>) {
+    pinned(true, true, || {
+        let Some(plan) = segments::plan_export(&c.timeline, assets, &c.opts, PARTS_LIMITS) else {
+            return ("NO-PARTS".to_string(), vec!["parts-refused"]);
+        };
+        let floating = svg_layer::svg_sequences(&plan.cut, &plan.fmt);
+        let mut text = String::new();
+        let contents: Vec<_> = plan.parts.iter().map(|p| segments::part_contents(&plan, p)).collect();
+        for (k, part) in plan.parts.iter().enumerate() {
+            text += &repr(&segments::build_part_args(
+                &plan,
+                assets,
+                &c.opts,
+                part,
+                &floating,
+                &format!("/golden/part-{k:04}.mkv"),
+                "-fps_mode",
+            ));
+            text.push('\u{1}');
+        }
+        let (pass, null_sink, passlog) = c.pass;
+        text += &repr(&segments::build_final_args(
+            &plan,
+            assets,
+            "/golden/out.mp4",
+            &c.opts,
+            pass,
+            null_sink,
+            passlog,
+            "/golden/parts.ffconcat",
+        ));
+        let words = text.replace(['\0', '\u{1}'], " ");
+        let flats = contents.first().map_or(0, |c| c.include.len());
+        let mut hit = vec!["parts"];
+        let mut add = |on: bool, name: &'static str| {
+            if on {
+                hit.push(name);
+            }
+        };
+        add(plan.parts.len() >= 4, "parts-many");
+        add(
+            (0..flats).any(|f| contents.iter().filter(|c| c.include[f]).count() >= 2),
+            "parts-straddler",
+        );
+        add(contents.iter().any(|c| !c.restarts.is_empty()), "parts-restart");
+        add(contents.iter().any(|c| c.include.iter().all(|&on| !on)), "parts-bare-canvas");
+        add(words.contains(" -vn "), "parts-sound");
+        add(words.contains("-start_number"), "parts-svg-pictures");
+        add(words.contains("trim=end_frame="), "parts-held");
+        add(words.contains("-pass 1"), "parts-two-pass");
+        add(words.contains("p10le"), "parts-10-bit");
+        add(words.contains("zscale="), "parts-hdr");
+        add(words.contains("drawtext="), "parts-caption");
+        add(words.contains("+faststart"), "parts-faststart");
+        (round_libm(&text), hit)
+    })
+}
+
+#[test]
+#[allow(clippy::print_stderr)]
+fn the_parts_argv_builders_produce_the_golden_digests() {
+    let assets = pool();
+    if let Some(n) = std::env::var("KERF_GOLDEN_PARTS_DUMP")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        let (text, hit) = parts_text(&case(n, &assets), &assets);
+        eprintln!("case {n}: {hit:?}\n{}", text.replace('\0', " ").replace('\u{1}', "\n"));
+    }
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8);
+    let mut results: Vec<(usize, u64, Vec<&'static str>)> = std::thread::scope(|s| {
+        let workers: Vec<_> = (0..threads)
+            .map(|w| {
+                let assets = &assets;
+                s.spawn(move || {
+                    (w..TOTAL)
+                        .step_by(threads)
+                        .map(|i| {
+                            let (text, hit) = parts_text(&case(i, assets), assets);
+                            (i, fnv1a(&text), hit)
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        workers.into_iter().flat_map(|w| w.join().unwrap()).collect()
+    });
+    results.sort_by_key(|(i, ..)| *i);
+    if let Some(path) = std::env::var_os("KERF_GOLDEN_PARTS_CASES") {
+        let lines: String = results.iter().map(|(i, h, _)| format!("{i} {h:016x}\n")).collect();
+        std::fs::write(path, lines).unwrap();
+    }
+
+    let digests: Vec<u64> = results.iter().map(|(_, h, _)| *h).collect();
+    let mut want = format!(
+        "# parts argv digests (engine/cli/golden.rs): block, then FNV-1a of its {BLOCK} cases.\n\
+         # Regenerate after an intended change: KERF_GOLDEN_BLESS=1 cargo test -p kerf-core --no-default-features golden\n"
+    );
+    for (i, block) in digests.chunks(BLOCK).enumerate() {
+        want += &format!("{i} {:016x}\n", fnv1a(&format!("{block:x?}")));
+    }
+    let blessed = PARTS_BLESSED.replace("\r\n", "\n");
+    let mut failures = Vec::new();
+    if std::env::var("KERF_GOLDEN_BLESS").as_deref() == Ok("1") {
+        let file = "src/engine/cli/golden/parts.txt";
+        std::fs::write(Path::new(env!("CARGO_MANIFEST_DIR")).join(file), &want).unwrap();
+        eprintln!(
+            "golden: wrote {file} ({} blocks, {})",
+            digests.chunks(BLOCK).count(),
+            if want != blessed { "changed" } else { "unchanged" }
+        );
+    } else if want != blessed {
+        let bad: Vec<_> = want
+            .lines()
+            .zip(blessed.lines())
+            .filter(|(a, b)| a != b)
+            .map(|(a, _)| a.split(' ').next().unwrap().to_string())
+            .collect();
+        failures.push(format!(
+            "the parts argv moved in blocks {bad:?} (case = block x {BLOCK} .. +{BLOCK}; an empty list is a stale file). If that is intended, \
+             re-bless (see the module docs) and review `git diff`; otherwise find the case with KERF_GOLDEN_PARTS_CASES=<file>."
+        ));
+    }
+    let mut seen: BTreeMap<&str, usize> = PARTS_FAMILIES.iter().map(|f| (*f, 0)).collect();
+    for (_, _, hit) in &results {
+        for f in hit {
+            *seen
+                .get_mut(f)
+                .unwrap_or_else(|| panic!("a family the oracle does not list: {f}")) += 1;
+        }
+    }
+    let thin: Vec<_> = seen.iter().filter(|(_, n)| **n < MIN_PER_FAMILY).collect();
+    if !thin.is_empty() {
+        failures.push(format!(
+            "parts families under {MIN_PER_FAMILY} cases (the generator stopped covering them, or the argv text changed): {thin:?}"
+        ));
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
