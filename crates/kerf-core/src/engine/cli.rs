@@ -22,8 +22,8 @@ use super::decode_policy::{
 use super::source_probe::{ProbeCache, SOURCE_PROBE_TIMEOUT};
 use super::ProbeResult;
 use crate::clip_timing::{
-    clip_seek, clip_source_window, is_cache_proxy, is_head_padded_proxy, transition_fx, ClipFx, ClipTiming, FadeEdge, FadeStep,
-    FadeTint, Rational, HEAD_PADDED_SUFFIX,
+    clip_seek, clip_source_window, end_frame, is_cache_proxy, is_head_padded_proxy, picture_window, transition_fx, ClipFx,
+    ClipTiming, FadeEdge, FadeStep, FadeTint, Rational, HEAD_PADDED_SUFFIX,
 };
 use crate::error::{Error, Result};
 use crate::model::{
@@ -5059,7 +5059,7 @@ fn push_inputs_scoped(
             continue;
         }
         let path = path_of(clip.asset_id).ok_or(Error::AssetNotFound(clip.asset_id))?;
-        let (start, end) = clip_source_window(clip, &fx[rep]);
+        let (start, end) = picture_window(clip, &fx[rep], fmt.fps);
         if let Some(restart) = scope.restarts.get(&rep) {
             // A still picked up at a cut: the picture, looped, numbered onto the frames it still
             // has (the way a held title is), where the whole export reads it from its own start.
@@ -5083,6 +5083,7 @@ fn push_inputs_scoped(
             args.push("-framerate".to_string());
             args.push(format!("{}", fmt.fps));
             args.push("-t".to_string());
+            // As long as the chain's trim reads it (`picture_window`).
             args.push(format!("{}", end.max(1.0 / fmt.fps)));
         } else {
             // Hardware-accelerated decode for this input when requested. `-hwaccel`
@@ -7749,7 +7750,8 @@ fn build_filter_complex_with(
             } else {
                 format!("vov{n}")
             };
-            let (start, end) = ClipTiming::new(clip, &fx[*flat]).window();
+            let timing = ClipTiming::new(clip, &fx[*flat]);
+            let (start, end) = Rational::from_fps(fmt.fps).map_or_else(|| timing.window(), |rate| timing.enable_window(rate));
             // A slide / push adds its travel to whatever position the clip already
             // has, so a transition composes with a static offset or an animated one
             // instead of overriding it.
@@ -9258,7 +9260,10 @@ fn video_clip_chain_stamped(
     // A crossfade tail borrows unused source: forward clips extend past source_out,
     // reversed clips extend below source_in (reverse plays high->low, so the visible
     // tail is at the low end).
-    let (trim_start, trim_end) = clip_source_window(clip, fx);
+    // The picture reads on past the window (see `picture_window`); `cut` ends its stream at the
+    // clip's end once `fps` has put it on the output grid.
+    let (trim_start, trim_end) = picture_window(clip, fx, fmt.fps);
+    let cut = Rational::from_fps_filter(fmt.fps).map(|rate| format!("trim=end_pts={}", end_frame(timing.window().1, rate)));
     // Relative to the input-side `-ss` (see `build_export_args_phase`): when the
     // window is fast-seeked the trim starts at 0, otherwise it is unchanged. A still
     // image is never seeked (it is `-loop`ed from t=0), so its trim stays absolute.
@@ -9337,6 +9342,7 @@ fn video_clip_chain_stamped(
         } else {
             p.push(format!("fps={}", fmt.fps));
         }
+        p.extend(cut.clone());
         // `sendcmd` sits upstream of `v360`: a command takes effect as a frame
         // passes through, so downstream it would land one frame late. Both sit
         // after `setpts`, which puts the timestamps `sendcmd` matches on the
@@ -9358,6 +9364,7 @@ fn video_clip_chain_stamped(
     if crop_keyed {
         if reframe.is_none() {
             p.push(crop_fps);
+            p.extend(cut.clone());
         }
         p.push(crop_remap_filter(clip, crop_rate, crop_first));
     }
@@ -9487,6 +9494,7 @@ fn video_clip_chain_stamped(
     p.push("setsar=1".to_string());
     if reframe.is_none() && !crop_keyed {
         p.push(format!("fps={}", fmt.fps));
+        p.extend(cut);
     }
     // HDR → SDR, once per clip, as late as the geometry allows: after the fit
     // scale has cut a 4K frame to the delivery size and `fps` has dropped the
@@ -11632,7 +11640,10 @@ mod tests {
         };
         // From the head: the clone goes, ahead of the trim that rebases the clip.
         let head = graph(&padded, 0.0);
-        assert!(head.contains("trim=start_frame=1,trim=start=0:end=4,"), "{head}");
+        assert!(
+            head.contains("trim=start_frame=1,trim=start=0:end=4.066666666666666,"),
+            "{head}"
+        );
         // `clip_seek` treats a millisecond as the head too; just past it is seeked.
         assert!(graph(&padded, 0.0005).contains("trim=start_frame=1,"));
         assert!(!graph(&padded, 0.002).contains("start_frame"), "a seek skips the clone");
@@ -12938,7 +12949,8 @@ mod tests {
         // overlay per video clip; the last overlay writes [outv].
         assert!(f.contains("color=c=black:s=1920x1080"));
         assert!(f.contains("overlay=eof_action=pass:enable='between(t,0,5)'"));
-        assert!(f.contains("enable='between(t,5,7)'")); // second clip: start 5, dur 2
+        // Second clip: start 5, dur 2, its window opened a frame early.
+        assert!(f.contains("enable='between(t,4.966666666666667,7)'"));
         assert!(f.contains("[outv]"));
         assert!(f.contains("volume=0.5"));
         assert!(f.contains("[0:v]trim=start=0:end=5"));
@@ -12981,7 +12993,7 @@ mod tests {
         // Two overlays: B-roll (input 1) composites on top of the interview.
         assert_eq!(f.matches("overlay=eof_action=pass").count(), 2);
         assert!(f.contains("[1:v]trim=start=0:end=6"));
-        assert!(f.contains("enable='between(t,4,10)'"));
+        assert!(f.contains("enable='between(t,3.966666666666667,10)'"));
         // Only the interview carries audio, so the mix has one input.
         assert!(g.has_audio);
         assert!(f.contains("amix=inputs=1"));
@@ -15316,7 +15328,7 @@ mod tests {
         // `(lead - source_in) / speed` after the clip's start, spelled beside it.
         let (seeked, g) = graph(make_clip(asset.id, 0.2, 5.0, 3.0));
         assert!(
-            !seeked && g.contains("trim=start=0.2:end=5,setpts=PTS-STARTPTS+(3+0.3)/TB"),
+            !seeked && g.contains("trim=start=0.2:end=5.066666666666666,setpts=PTS-STARTPTS+(3+0.3)/TB"),
             "{g}"
         );
         assert!(g.contains("atrim=start=0.2:end=5,asetpts=PTS-STARTPTS"), "{g}");
@@ -16532,8 +16544,9 @@ mod tests {
             args.contains(&"-framerate".to_string()),
             "the looped still gets an input framerate"
         );
-        // `-t` bounds how long the looped still is read — its source window end.
-        assert_eq!(flag_val(&args, "-t"), Some("5"));
+        // `-t` bounds how long the looped still is read: its source window end and the read past
+        // it (`picture_window`: a still's rate is unknown, a tenth of a second, and an output frame).
+        assert_eq!(flag_val(&args, "-t"), Some("5.133333333333333"));
         let i_pos = args.iter().position(|a| a == "-i").unwrap();
         assert_eq!(args[i_pos + 1], "/media/title.png");
         // No seek to subtract, so the trim window stays absolute, positioned at t=12.
@@ -16550,7 +16563,11 @@ mod tests {
         let timeline = single(vec![make_clip(asset.id, 1.0, 4.0, 0.0)]);
         let args = build_export_args(&timeline, &[asset], "/out/x.mp4", &ExportOptions::default()).unwrap();
         assert!(!args.contains(&"-ss".to_string()));
-        assert_eq!(flag_val(&args, "-t"), Some("4"), "read the looped still up to source_out");
+        assert_eq!(
+            flag_val(&args, "-t"),
+            Some("4.133333333333333"),
+            "read the looped still past source_out"
+        );
         let filter = flag_val(&args, "-filter_complex").unwrap();
         assert!(filter.contains("trim=start=1:end=4"), "absolute, not seek-relative: {filter}");
     }
@@ -18581,7 +18598,7 @@ mod tests {
         let plain = make_clip(asset.id, 0.0, 5.0, 0.0);
         let g = graph(plain.clone(), Fit::Blur);
         assert!(
-            g.contains("[0:v]trim=start=0:end=5,setpts=PTS-STARTPTS+0/TB,split[bfc0b][bfc0f];"),
+            g.contains("[0:v]trim=start=0:end=5.066666666666666,setpts=PTS-STARTPTS+0/TB,split[bfc0b][bfc0f];"),
             "{g}"
         );
         assert!(g.contains("[bfc0bb][bfc0ff]overlay=(W-w)/2:(H-h)/2,setsar=1,"), "{g}");

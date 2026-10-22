@@ -55,8 +55,8 @@ use std::collections::HashMap;
 use uuid::Uuid;
 
 use crate::clip_timing::{
-    clip_seek, clip_source_window, clips_with_fx, ffmpeg_frame_time, graph_bt709_labels, ClipFx, ClipTiming, FadeEdge, FadeStep,
-    MotionKeys, Rational,
+    clip_seek, clip_source_window, clips_with_fx, ffmpeg_frame_time, graph_bt709_labels, picture_window, ClipFx, ClipTiming,
+    FadeEdge, FadeStep, MotionKeys, Rational,
 };
 use crate::engine::{keyed_color_value, keyframe_value, render_geometry, safe_color, valid_color, Container, ExportOptions};
 use crate::error::{Error, Result};
@@ -147,6 +147,8 @@ struct PlannedClip {
     /// The overlay's `enable` window, tail included.
     window: (f64, f64),
     source_window: (f64, f64),
+    /// The window the clip's picture chain trims ([`picture_window`]): the export's `fps` pick reads it.
+    picture_window: (f64, f64),
     hdr: Option<Hdr>,
     fades: Vec<FadeStep>,
     keys: Option<MotionKeys>,
@@ -302,6 +304,7 @@ impl Planner {
                 fx,
                 window: timing.window(),
                 source_window: clip_source_window(clip, &fx),
+                picture_window: picture_window(clip, &fx, geom.fps),
                 hdr: fx.hdr,
                 fades: timing.fades(),
                 keys: timing.motion_keys(),
@@ -571,15 +574,21 @@ impl Planner {
         // A still's tail window is judged at the slot's start, which can be before `eval` (the `t`
         // it was asked for, inside the frame): look from there.
         let from = if motion { eval } else { eval.min(tail_at) };
+        // The export's `enable` opens a frame early (`ClipTiming::enable_window`).
+        let early = if motion {
+            f64::from(fps.den) / f64::from(fps.num)
+        } else {
+            0.0
+        };
         for track in &self.tracks {
-            for ci in self.candidates_between(track, from, eval) {
+            for ci in self.candidates_between(track, from, eval + early) {
                 let planned = &self.clips[ci];
                 let clip = &self.rendered.tracks[planned.track].clips[planned.index];
                 // The index only narrows to windows that could hold `eval`. The export asks
-                // the overlay's own `enable` (tail included, closed at the end); a still shows
+                // the overlay's own `enable` (tail included, closed at the end, a frame early); a still shows
                 // the clip's own span, half open, and its tail for the frames the tail window is open for.
                 let on = if motion {
-                    ClipTiming::new(clip, &planned.fx).enabled(eval)
+                    ClipTiming::new(clip, &planned.fx).enabled(eval, fps)
                 } else {
                     eval < clip.timeline_end() || (planned.tail && tail_at < clip.timeline_end() + planned.fx.tail)
                 };
@@ -617,8 +626,9 @@ impl Planner {
                     Pick::Fps(FpsPick {
                         speed: clip.speed_mag(),
                         reverse: clip.is_reversed(),
-                        window: planned.source_window,
+                        window: planned.picture_window,
                         start: clip.timeline_start,
+                        end: planned.window.1,
                         frame: u64::try_from(frame).unwrap_or(0),
                         fps: self.canvas.pick_fps,
                         drop_first: !asset.is_image
@@ -982,7 +992,12 @@ mod tests {
                 for ti in 0..3 {
                     let mut track: Vec<_> = rows.iter().filter(|r| r.0 == ti).collect();
                     track.sort_by(|x, y| x.2.timeline_start.total_cmp(&y.2.timeline_start));
-                    want.extend(track.iter().filter(|r| ClipTiming::new(r.2, &r.3).enabled(t)).map(|r| r.2.id));
+                    want.extend(
+                        track
+                            .iter()
+                            .filter(|r| ClipTiming::new(r.2, &r.3).enabled(t, rate))
+                            .map(|r| r.2.id),
+                    );
                 }
                 let got: Vec<_> = planner.at_frame(k).unwrap().layers.iter().map(|l| l.clip_id).collect();
                 clips_seen += got.len();
@@ -993,13 +1008,15 @@ mod tests {
     }
 
     #[test]
-    fn a_frame_aligned_clip_misses_its_first_frame_where_ffmpeg_reads_the_time_just_under_it() {
-        // `rendered.rs` pins that the export does not draw a clip on the frame it starts on
-        // when `k * (den / num)` lands an ulp below the start: frame 5 of a 24 fps export.
+    fn a_frame_aligned_clip_keeps_its_first_frame_where_ffmpeg_reads_the_time_just_under_it() {
+        // `rendered.rs` pins that the export draws a clip on the frame it starts on when
+        // `k * (den / num)` lands an ulp below the start (frame 5 of a 24 fps export): its enable
+        // window opens a frame early, so the frame before is a candidate its pick leaves undrawn.
         let a = asset();
         let tl = single(vec![make_clip(a.id, 0.0, 1.0, 5.0 / 24.0)]);
         let m24 = planner(&tl, std::slice::from_ref(&a), PlanMode::Motion, &opts(24.0));
-        assert!(m24.at_frame(5).unwrap().layers.is_empty());
+        assert!(m24.at_frame(3).unwrap().layers.is_empty());
+        assert_eq!(m24.at_frame(5).unwrap().layers.len(), 1);
         assert_eq!(m24.at_frame(6).unwrap().layers.len(), 1);
         // 25 fps never drops one, and a still (which has no graph clock) shows it at 5/24.
         let tl = single(vec![make_clip(a.id, 0.0, 1.0, 0.2)]);
@@ -1041,8 +1058,9 @@ mod tests {
         assert!(!incoming.fx.tail);
         assert_eq!(incoming.fx.strength(FadeTint::Alpha, mid.frame, fps), 0.5);
         assert_eq!(incoming.fx.strength(FadeTint::Black, mid.frame, fps), 1.0);
-        // Before the cut there is only the outgoing clip, and not on its tail.
-        let before = motion.at_frame(59).unwrap();
+        // Before the cut there is only the outgoing clip, and not on its tail (on frame 59 the
+        // incoming one is a candidate too: its enable window opens a frame early).
+        let before = motion.at_frame(58).unwrap();
         assert_eq!((before.layers.len(), before.layers[0].fx.tail), (1, false));
         // A still at the same time holds the same two layers, the outgoing one on its tail and the
         // incoming one on the ramp, as the FFmpeg still draws them; the frame it is in counts the ramp.
@@ -2882,6 +2900,7 @@ mod tests {
             reverse: true,
             window: (2.0, 6.0),
             start: 1.0,
+            end: 3.0,
             frame: 45,
             fps: Rational::new(30, 1).unwrap(),
             drop_first: false,
@@ -2891,7 +2910,9 @@ mod tests {
         assert_eq!(export.layers[0].pick, Pick::Fps(want));
         // A still image is a run of frames made up from the delivery rate (`-loop 1 -framerate`).
         assert!(matches!(export.layers[1].pick, Pick::Fps(p) if p.image == Some(Rational::new(30, 1).unwrap()) && !p.drop_first));
-        // A transition's tail is in the pick's window, as it is in the chain's trim.
+        // A transition's tail is in the pick's window, as it is in the chain's trim, and so is the
+        // read past the clip's end (a frame of the 30 fps source and an output frame), which the
+        // pick's `end` cuts off again.
         let (out, mut inc) = (
             make_clip(assets[0].id, 0.0, 2.0, 0.0),
             make_clip(assets[0].id, 10.0, 14.0, 2.0),
@@ -2902,7 +2923,7 @@ mod tests {
         });
         let tl = single(vec![out, inc]);
         let plan = planner(&tl, &assets, PlanMode::Motion, &opts(30.0)).at_frame(75).unwrap();
-        assert!(matches!(plan.layers[0].pick, Pick::Fps(p) if p.window == (0.0, 3.0)));
+        assert!(matches!(plan.layers[0].pick, Pick::Fps(p) if p.window == (0.0, 3.0 + 1.0 / 30.0 + 1.0 / 30.0) && p.end == 3.0));
     }
 
     #[test]
@@ -3108,12 +3129,13 @@ mod tests {
         // on its tail, the incoming on its ramp): runs of refusals either side of what is drawn.
         let span = p.span(0.0, 6.0, size, &motion);
         let runs: Vec<_> = span.runs().iter().map(|r| (r.frames.clone(), r.supported)).collect();
-        // (Frame 150 is the cut's closing frame: the outgoing clip is still drawn there, on its tail.)
-        assert_eq!(runs, [(0..30, false), (30..120, true), (120..151, false), (151..180, true)]);
+        // (Frame 119 holds the incoming clip as a candidate, its enable window opened a frame
+        // early, and frame 150 is the cut's closing frame, a candidate of the outgoing one.)
+        assert_eq!(runs, [(0..30, false), (30..119, true), (119..151, false), (151..180, true)]);
         // Asking for the next refusal is asking for the first frame of a run.
         let at = |k: u64| Rational::new(30, 1).unwrap().exact_time(k);
         assert_eq!(span.first_unsupported(0.0, 5.0), Some(0.0));
-        assert_eq!(span.first_unsupported(1.5, 5.0), Some(at(120)));
+        assert_eq!(span.first_unsupported(1.5, 5.0), Some(at(119)));
         assert_eq!(span.first_unsupported(1.5, 2.0), None);
         assert_eq!(span.first_unsupported(4.5, 5.0), Some(4.5));
         assert_eq!(span.first_unsupported(5.0, 5.0), Some(5.0));

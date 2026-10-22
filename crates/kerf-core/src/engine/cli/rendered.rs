@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 
 use super::picked::source_frames;
 use super::*;
-use crate::clip_timing::{clips_with_fx, ffmpeg_frame_time, ClipTiming, FadeTint};
+use crate::clip_timing::{clips_with_fx, end_frame, ffmpeg_frame_time, ClipTiming, FadeTint, Rational};
 use crate::engine::test_support::{make_clip, test_asset, timeline_of, video_stream, video_track, StatusBounded};
 use crate::model::{Asset, Clip, Transition, TransitionKind};
 use crate::planner::{PlanRequest, Planner};
@@ -147,26 +147,23 @@ fn planned_strength(planner: &Planner, clip: &Clip, tint: FadeTint, k: u64) -> f
         .map_or(0.0, |l| plan.strength(l, tint))
 }
 
-/// A clip is drawn on exactly the output frames whose FFmpeg time is inside its
-/// window — closed at the start, open at the end, where the source has no frame.
+/// A clip is drawn on exactly its own output frames: from its first frame's slot up to the
+/// first frame at or after its end (`end_frame`), whatever the rate and the source.
 ///
 /// 36 frame-aligned red clips of 3 to 7 frames over a green base, at each rate, cut
 /// from the head of the footage and from one second in. For every frame from one
-/// before a clip to one after it: red exactly when
-/// `start <= ffmpeg_frame_time(k) < end`. It is not `k / fps`: at 24 fps a third of
-/// the clips (and at 29.97 half) start on a frame whose FFmpeg time is an ulp under
-/// their start, and lose that frame. A slower source behaves differently again (it
-/// is drawn on the frame at `end` through the `fps` filter, covered below): which
-/// frames those are is `fps_pick`'s answer, held to the pixels here.
+/// before a clip to one after it: red exactly on `sf..sf + n`. At 24 fps a third of the
+/// clips (and at 29.97 half) start on a frame whose FFmpeg time is an ulp under their
+/// start, which an `enable` opened at the start lost; it opens a frame early, and none is
+/// lost. A slower source is held by the `fps` filter and cut at its end as well (covered
+/// below): which frames those are is `fps_pick`'s answer, held to the pixels here.
 #[test]
 #[ignore = "needs the ffmpeg binary"]
 fn a_clip_is_drawn_on_the_frames_its_window_and_its_source_leave_it() {
     let dir = scratch("boundary");
-    let mut lost_first_frames = Vec::new();
     let mut edge_candidates = 0;
     for (name, num, den) in RATES {
         let fps: f64 = name.parse().unwrap();
-        let mut lost = 0;
         for src_in in [0.0, 1.0] {
             let red = solid(&dir, "red", name, 4.0);
             let green = solid(&dir, "green", name, 16.0);
@@ -186,33 +183,34 @@ fn a_clip_is_drawn_on_the_frames_its_window_and_its_source_leave_it() {
             let planner = motion_planner(&timeline, &assets, fps);
             let probed = source_frames(Path::new(&assets[0].path));
             let red_frames = probed.frames();
+            let rate = Rational { num, den };
             for (ti, ci, clip, fx) in clips_with_fx(&timeline, &assets).filter(|r| r.0 == 1) {
                 let timing = ClipTiming::new(clip, &fx);
-                let (start, end) = timing.window();
                 let (sf, n) = spans[ci];
                 assert_eq!(ti, 1);
                 for k in sf - 1..=sf + n {
                     let drawn = is_red(rgb(&frames[k as usize]));
                     let t = ffmpeg_frame_time(k, num, den);
-                    let expected = t >= start && t < end - 1e-9;
+                    let expected = k >= sf && k < sf + n;
                     assert_eq!(
-                        drawn, expected,
-                        "{name} fps, source from {src_in}: clip {ci} (frames {sf}..{}) at output frame {k}, t = {t:?}, window {start:?}..{end:?}",
+                        drawn,
+                        expected,
+                        "{name} fps, source from {src_in}: clip {ci} (frames {sf}..{}) at output frame {k}, t = {t:?}",
                         sf + n
                     );
                     // The enable window is necessary for a frame to be drawn.
                     assert!(
-                        !drawn || timing.enabled(t),
+                        !drawn || timing.enabled(t, rate),
                         "{name} fps: frame {k} drawn outside the enable window"
                     );
-                    // The plan holds every clip the export draws, and no other but the one
-                    // whose window closes on this frame — and the pick resolves those
-                    // candidates: the layers whose pick names a frame are exactly the ones drawn.
+                    // The plan holds every clip the export draws, and no other but the one whose
+                    // window opens a frame early or closes on this frame — and the pick resolves
+                    // those candidates: the layers whose pick names a frame are exactly the ones drawn.
                     let plan = planner.at_frame(k).unwrap();
                     let layer = plan.layers.iter().find(|l| l.clip_id == clip.id);
                     let planned = layer.is_some();
                     assert!(
-                        planned == drawn || (planned && t >= end - 1e-9),
+                        planned == drawn || (planned && (k + 1 == sf || k == sf + n)),
                         "{name} fps, source from {src_in}: clip {ci} at output frame {k}: drawn {drawn}, planned {planned}"
                     );
                     assert_eq!(
@@ -221,23 +219,16 @@ fn a_clip_is_drawn_on_the_frames_its_window_and_its_source_leave_it() {
                         "{name} fps, source from {src_in}: clip {ci} at output frame {k}: the pick against the pixels"
                     );
                     edge_candidates += usize::from(planned && !drawn);
-                    lost += usize::from(k == sf && !drawn);
                 }
             }
         }
-        lost_first_frames.push((name, lost));
     }
-    // The premise: FFmpeg's time is not the exact one. Where `k * (den / num)` lands
-    // under `k / fps` the first frame is lost, and where it does not, nothing is.
-    let lost = |name: &str| lost_first_frames.iter().find(|r| r.0 == name).unwrap().1;
-    assert!(lost("24") > 0 && lost("29.97") > 0, "{lost_first_frames:?}");
-    assert_eq!(lost("25"), 0, "{lost_first_frames:?}");
-    // ... and the plan really does hold a clip on the frame its window closes on, which
-    // an equal-rate source is not drawn on.
+    // The plan really does hold a clip on the frames its enable window opens early and closes
+    // on, which it is not drawn on.
     assert!(edge_candidates > 100, "{edge_candidates}");
 
-    // A source slower than the export is held by the `fps` filter, so a clip can be
-    // drawn on the frame at its own end — which an equal-rate one never is.
+    // A source slower than the export is held by the `fps` filter, and cut at its end like any
+    // other: it is not drawn on the frame its window closes on.
     let (fps, (num, den)) = (30.0, (30, 1));
     let red = solid(&dir, "red", "24", 4.0);
     let green = solid(&dir, "green", "30", 16.0);
@@ -255,28 +246,19 @@ fn a_clip_is_drawn_on_the_frames_its_window_and_its_source_leave_it() {
     let planner = motion_planner(&timeline, &assets, fps);
     let probed = source_frames(Path::new(&assets[0].path));
     let red_frames = probed.frames();
-    let mut at_end = 0;
-    for (_, ci, clip, fx) in clips_with_fx(&timeline, &assets).filter(|r| r.0 == 1) {
-        let timing = ClipTiming::new(clip, &fx);
+    for (_, ci, clip, _) in clips_with_fx(&timeline, &assets).filter(|r| r.0 == 1) {
         let (sf, n) = spans[ci];
         for k in sf - 1..=sf + n + 1 {
             let drawn = is_red(rgb(&frames[k as usize]));
-            assert!(
-                !drawn || (k <= sf + n && timing.enabled(ffmpeg_frame_time(k, num, den))),
-                "24 -> 30: clip {ci} drawn at output frame {k}, outside {sf}..={}",
+            assert_eq!(
+                drawn,
+                k >= sf && k < sf + n,
+                "24 -> 30: clip {ci} at output frame {k}, t = {:?}, its frames {sf}..{}",
+                ffmpeg_frame_time(k, num, den),
                 sf + n
             );
-            at_end += usize::from(k == sf + n && drawn);
-            // Here the export draws the clip on the frame its window closes on, so the plan
-            // has to hold it there: the closing edge is a candidate, never a refusal.
             let plan = planner.at_frame(k).unwrap();
             let layer = plan.layers.iter().find(|l| l.clip_id == clip.id);
-            assert!(
-                !drawn || layer.is_some(),
-                "24 -> 30: clip {ci} drawn at output frame {k} but not planned"
-            );
-            // ... and the pick says so: this is where an equal-rate clip is not drawn and a slower
-            // one is.
             assert_eq!(
                 layer.is_some_and(|l| l.pick.select(&red_frames).is_some()),
                 drawn,
@@ -284,10 +266,73 @@ fn a_clip_is_drawn_on_the_frames_its_window_and_its_source_leave_it() {
             );
         }
     }
-    assert!(
-        at_end > 0,
-        "a 24 fps source in a 30 fps export is never drawn on the frame at its end"
-    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Back-to-back clips leave no frame between them: the outgoing clip fills every frame that
+/// starts before its end, wherever its source's frames fall.
+///
+/// Cut by `trim` at its window, a clip's stream ended where the first frame past the window
+/// would have landed — up to a source frame short of the clip's end — and `fps` rounds that to
+/// its nearest slot: a cut halfway between two frames (12.75 s at 30 fps), a slowed clip and a
+/// clip from a slower source lost their last frame wherever the window's first frame fell late
+/// enough, and the base showed through (a black frame in a real cut). A run of red clips over a
+/// green base, from a 59.94 and a 25 fps source, at speeds 1, 0.7667 and 0.5, each cut from a
+/// different point between two source frames, back to back with cuts on and halfway between
+/// frames: no green from the first clip's first frame to the last one's end, and the plan's
+/// picks agree.
+#[test]
+#[ignore = "needs the ffmpeg binary"]
+fn back_to_back_clips_leave_no_frame_between_them() {
+    let dir = scratch("cuts");
+    let (fps, num, den) = (30.0, 30, 1);
+    let green = solid(&dir, "green", "30", 30.0);
+    for source in ["59.94", "25"] {
+        let red = solid(&dir, "red", source, 30.0);
+        let mut clips = Vec::new();
+        let mut at = 0.5;
+        for i in 0..36u32 {
+            let speed = [1.0, 0.7667, 0.5][i as usize % 3];
+            // 0.5 s to 0.6 s long, so every other cut lands halfway between two frames.
+            let len = 0.5 + f64::from(i % 2) * (1.5 / fps);
+            let src_in = 1.0 + f64::from(i) * 0.4 + f64::from(i) * 0.00137;
+            let mut clip = make_clip(red.id, src_in, src_in + len * speed, at);
+            clip.speed = speed;
+            clips.push(clip);
+            at += len;
+        }
+        let first = (0.5 * fps) as u64;
+        let last = end_frame(at, Rational { num, den }) as u64;
+        let cut: Vec<_> = clips.iter().map(|c: &Clip| c.id).collect();
+        let timeline = timeline_of(vec![
+            video_track(vec![make_clip(green.id, 0.0, at + 1.0, 0.0)]),
+            video_track(clips),
+        ]);
+        let assets = [red, green.clone()];
+        let tag = format!("cuts-{}", source.replace('/', "-"));
+        let frames = export_frames(&timeline, &assets, fps, &dir, &tag);
+        let planner = motion_planner(&timeline, &assets, fps);
+        let probed = source_frames(Path::new(&assets[0].path));
+        let red_frames = probed.frames();
+        for k in first - 1..=last {
+            let drawn = is_red(rgb(&frames[k as usize]));
+            assert_eq!(
+                drawn,
+                k >= first && k < last,
+                "{source}: output frame {k}, t = {:?}",
+                ffmpeg_frame_time(k, num, den)
+            );
+            let plan = planner.at_frame(k).unwrap();
+            let picked = plan
+                .layers
+                .iter()
+                .any(|l| cut.contains(&l.clip_id) && l.pick.select(&red_frames).is_some());
+            assert_eq!(
+                picked, drawn,
+                "{source}: output frame {k}: the plan's picks against the pixels"
+            );
+        }
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }
 

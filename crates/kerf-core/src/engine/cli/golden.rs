@@ -222,6 +222,8 @@ reframe-fisheye ih_fov=
 still-reframe v360=input=
 shared-input [vsp
 head-padded-proxy trim=start_frame=1
+clip-end-cut ,trim=end_pts=
+preview-clip-end-cut ,trim=end_pts=
 late-start-delay )/TB
 preview-late-start-delay )/TB
 image-input -loop 1 -framerate

@@ -81,6 +81,7 @@ fn pick(frame: u64) -> FpsPick {
         reverse: false,
         window: (0.0, 10.0),
         start: 0.0,
+        end: f64::INFINITY,
         frame,
         fps: Rational::new(30, 1).unwrap(),
         drop_first: false,

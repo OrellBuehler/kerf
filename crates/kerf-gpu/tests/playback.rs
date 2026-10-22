@@ -658,12 +658,16 @@ fn a_cursor_opened_ahead_is_the_one_the_cut_uses() {
     feed.open(layer, wanted).expect("and again: nothing new");
     assert!(feed.has(layer.clip_id));
     assert_eq!(feed.waiting(), 1);
-    // Playing the first clip leaves it waiting; the cut takes it over at its first frame, and the
-    // first clip's own cursor goes once the plan has no layer of it.
-    for k in 0..30 {
+    // Playing the first clip leaves it waiting; the cut takes it over a frame before its first (its
+    // overlay opens a frame early), and the first clip's own cursor goes once the plan has no layer of it.
+    for k in 0..29 {
         motion.frames(&cut.at_frame(k).unwrap()).expect("a frame");
     }
     assert_eq!((motion.cursors(), feed.waiting()), (1, 1));
+    let before = motion.frames(&cut.at_frame(29).unwrap()).expect("the frame before the cut");
+    assert_eq!(before.len(), 2);
+    assert!(before[1].is_none(), "the second clip has no frame before its first");
+    assert_eq!((motion.cursors(), feed.waiting()), (2, 0));
     let at_the_cut = motion.frames(&cut.at_frame(30).unwrap()).expect("the cut");
     assert_eq!(
         at_the_cut.len(),

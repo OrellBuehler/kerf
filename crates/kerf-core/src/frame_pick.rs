@@ -55,7 +55,7 @@
 //!
 //! Pure: no I/O.
 
-use crate::clip_timing::{clip_seek, parse_micros, parse_micros_text, picture_delay, Rational};
+use crate::clip_timing::{clip_seek, end_frame, parse_micros, parse_micros_text, picture_delay, Rational};
 use crate::engine::{export_seek_arg, seek_arg};
 
 /// The frames of one decoded file as ffprobe or `showinfo` state them.
@@ -106,11 +106,14 @@ pub struct FpsPick {
     pub speed: f64,
     /// Played backwards.
     pub reverse: bool,
-    /// The source window the chain trims (`clip_source_window`, tail included): its start is
-    /// also the input-side seek (`clip_seek`).
+    /// The source window the chain trims (`picture_window`: tail included, read on past the
+    /// clip's end): its start is also the input-side seek (`clip_seek`).
     pub window: (f64, f64),
     /// The clip's `timeline_start`.
     pub start: f64,
+    /// Where the clip's picture ends on the timeline, tail included (`ClipTiming::window`): the
+    /// chain cuts its stream at the first output frame at or after it (`end_frame`).
+    pub end: f64,
     /// The output frame.
     pub frame: u64,
     /// The rate as the clip's `fps=` filter parses it (`PlanCanvas::pick_fps`).
@@ -256,7 +259,9 @@ struct Run {
     unit: bool,
     time_base: Rational,
     fps: Rational,
-    /// The slot the end of the stream lands in, retimed: no output frame is at or past it.
+    /// The slot the stream ends at: where the end of the trimmed window lands, retimed, or the
+    /// chain's cut at the clip's end ([`end_frame`]), whichever is first. No output frame is at
+    /// or past it.
     end: i64,
 }
 
@@ -346,7 +351,7 @@ fn run(pick: &FpsPick, frames: &Frames) -> Option<Run> {
         fps: pick.fps,
         end: 0,
     };
-    run.end = run.slot(beyond);
+    run.end = run.slot(beyond).min(end_frame(pick.end, pick.fps));
     Some(run)
 }
 
@@ -555,11 +560,14 @@ fn fps_progress(pick: &FpsPick, read: &SourceFrames, eof: bool) -> PickProgress 
     let len = read.pts.len();
     let ready = |shown, keep_from| PickProgress::Ready { shown, keep_from };
     if pick.image.is_some() {
-        return match fps_pick(pick, read) {
-            None => ready(None, len),
-            Some(_) if len > 0 => ready(Some(0), 0),
-            Some(_) if eof => ready(None, 0),
-            Some(_) => PickProgress::NeedMore,
+        // Asked before it starts (its overlay opens a frame early), it keeps its one frame.
+        let frames = frames_of(pick, read);
+        return match run(pick, &frames).map(|r| place(pick, &frames, &r)) {
+            None | Some(Placed::Late) => ready(None, len),
+            Some(Placed::Early) => ready(None, 0),
+            Some(Placed::At(_)) if len > 0 => ready(Some(0), 0),
+            Some(Placed::At(_)) if eof => ready(None, 0),
+            Some(Placed::At(_)) => PickProgress::NeedMore,
         };
     }
     if !(pick.speed > 0.0 && pick.speed.is_finite()) {
@@ -618,6 +626,7 @@ mod tests {
             reverse,
             window,
             start,
+            end: f64::INFINITY,
             frame: k,
             fps: Rational::new(fps.0, fps.1).unwrap(),
             drop_first: false,
@@ -811,6 +820,49 @@ mod tests {
         // the stream is the same length — and the frame at slot 52 is now the *first* source frame.
         let back = |k| fps_pick(&pick((1.0, 1.0 + 8.0 / 30.0), 44.0 / 30.0, 1.0, true, (30, 1), k), &src);
         assert_eq!((back(44), back(52), back(53)), (Some(30), Some(24), None));
+    }
+
+    #[test]
+    fn a_clip_read_past_its_window_and_cut_at_its_end_fills_every_frame_that_starts_before_it() {
+        // 24 fps footage, slowed to 0.77, in a 30 fps export: clips of 7.5 export frames placed at
+        // frame 44, cut from points all over one source frame. Trimmed at the window the stream ended
+        // up to a source frame short of the clip's end, and `fps` rounding that end lost frame 51,
+        // the last that starts before the clip's end (51.5 frames in): `missing`. Read a source
+        // frame and an output frame on and cut at `end_frame` (52), every frame from the first to
+        // 51 is drawn and 52 is not.
+        let tb = Rational { num: 1, den: 12_288 };
+        let pts: Vec<i64> = (0..96).map(|i| i * 512).collect();
+        let src = SourceFrames {
+            pts: &pts,
+            time_base: tb,
+            start_us: 0,
+            last_duration: 0,
+        };
+        let (speed, start, len) = (0.77, 44.0 / 30.0, 7.5 / 30.0);
+        let mut missing = 0;
+        for i in 0..40 {
+            let from = 1.0 + f64::from(i) / 960.0;
+            let window = (from, from + len * speed);
+            let old = |k| fps_pick(&pick(window, start, speed, false, (30, 1), k), &src);
+            missing += usize::from(old(51).is_none());
+            let read = (from, window.1 + 1.0 / 24.0 + speed / 30.0);
+            let new = |k| {
+                fps_pick(
+                    &FpsPick {
+                        end: start + len,
+                        ..pick(read, start, speed, false, (30, 1), k)
+                    },
+                    &src,
+                )
+            };
+            assert!((44..=51).all(|k| new(k).is_some()), "from {from}");
+            assert_eq!(new(52), None, "from {from}");
+            // What it shows on its last frame is no later than the clip's length past the first
+            // frame it shows (which `setpts` put on its start).
+            let first = (from * 24.0).ceil() / 24.0;
+            assert!(new(51).is_some_and(|f| (f as f64) / 24.0 <= first + len * speed + 1e-9));
+        }
+        assert!(missing > 0, "the window's own end never lost a frame");
     }
 
     #[test]
@@ -1135,6 +1187,27 @@ mod tests {
                 keep_from: 0
             }
         );
+        // Before its first slot it shows nothing and keeps its frame for the next.
+        let late = |k| {
+            Pick::Fps(FpsPick {
+                image: Some(rate),
+                ..pick((0.0, 1.0), 1.0, 1.0, false, (30, 1), k)
+            })
+        };
+        assert_eq!(
+            late(29).progress(&one, false),
+            PickProgress::Ready {
+                shown: None,
+                keep_from: 0
+            }
+        );
+        assert_eq!(
+            late(30).progress(&one, false),
+            PickProgress::Ready {
+                shown: Some(0),
+                keep_from: 0
+            }
+        );
         // Past the loop the still is over, whatever was read.
         assert_eq!(
             still(30).progress(&one, false),
@@ -1221,6 +1294,7 @@ mod tests {
                 reverse: rnd(3) == 0,
                 window: (a, b),
                 start: rnd(100) as f64 / 100.0,
+                end: f64::INFINITY,
                 frame: rnd(70),
                 fps: Rational::new(fps.0, fps.1).unwrap(),
                 drop_first: rnd(6) == 0,

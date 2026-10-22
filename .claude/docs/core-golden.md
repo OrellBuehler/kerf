@@ -133,6 +133,11 @@
 - **Sample-exact `adelay`** (a clip starting between milliseconds is delayed by samples)
   re-blessed `export.txt` alone: 2718 of 4800 cases moved, exactly the new
   `audio-delay-samples` family (`S:all=1`); still and preview carry no sound.
+- **Clip edges** (a forward clip's picture read past its out point, cut at `end_frame` with `trim=end_pts=`, the
+  `enable` window opened a frame early): `export.txt`, `preview.txt` and `parts.txt` re-blessed, `still.txt` untouched (the still
+  reads one frame at `-ss`). 6904 export / 5758 preview of 8000 cases moved: every case of the new families `clip-end-cut` /
+  `preview-clip-end-cut` (`,trim=end_pts=`: 6265 / 5758), and 639 more exports, all `image-input` without a video graph (an
+  audio-only container still opens a still's `-loop` input, whose `-t` reads past the window too).
 - **The animated-title round** (appended, nothing re-blessed): the three files gained exactly four block lines each (`60`..`63`, 12 insertions,
   0 deletions in `git diff`), so every one of the 6000 earlier per-case digests is the one the commit before gave. The HW swap is now restricted
   to its own range (`5600..6000`) so it does not reach the title cases, and the time draws take the titles' edges only where titles exist.
