@@ -993,12 +993,7 @@ pub(super) fn prepare_export(
     }
     let started = Instant::now();
     let say = |progress: &mut dyn FnMut(ExportProgress), waiting| {
-        progress(ExportProgress {
-            fraction: 0.0,
-            elapsed_secs: started.elapsed().as_secs_f64(),
-            eta_secs: None,
-            waiting: Some(waiting),
-        });
+        progress(ExportProgress::queued(0.0, started.elapsed().as_secs_f64(), waiting));
     };
     if seqs.iter().all(is_ready) {
         return prepare(&seqs, 1, None, cancel).map(Some);

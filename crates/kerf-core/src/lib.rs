@@ -77,7 +77,7 @@ pub use engine::{
     stitch_insta360, stitch_insta360_with, stitched_path, stream_preview, stream_preview_until, stream_preview_with,
     text_raster_graph, text_still_filter, validate_export, variant_frame, voiceover_status, wav_bytes, waveform_pyramid,
     waveform_range, waveform_range_of, write_wav, AudioBuffer, BandLevel, BandWindow, Container, DownloadProgress, ExportOptions,
-    ExportProgress, ExportVariant, ExportedFrame, Filmstrip, FilmstripSheet, Fit, FpsSource, GeqEdge, ImageFormat,
+    ExportProgress, ExportStage, ExportVariant, ExportedFrame, Filmstrip, FilmstripSheet, Fit, FpsSource, GeqEdge, ImageFormat,
     LoudnessPreset, MusicStatus, PlaybackParams, PlaybackRequest, PreviewFrame, RateControl, Region, RenderStatus, ScrubConfig,
     ScrubFrames, ScrubStats, SpeechModelInfo, StemsStatus, StyleInfo, TextPart, TextRasterGraph, VariantProgress, VariantsRun,
     VoiceInfo, VoiceoverStatus, WaveformLevel, WaveformPyramid, WaveformRange, WindowBalance, DEFAULT_SPEECH_MODEL,

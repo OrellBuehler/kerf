@@ -1540,16 +1540,26 @@ export interface PlatformReport {
 	targets: DeliveryCheck[];
 }
 
-/** Payload of the `export-progress` event streamed during a render. */
+/** The part of an export that is running (`kerf_core::ExportStage`). */
+export type ExportStage = 'metering' | 'starting' | 'rendering' | 'finishing' | 'measuring';
+
+/** Payload of the `export-progress` event streamed during a render. `fraction` is over the whole
+ *  export: its stages each own a share of the bar, so it only moves forward. */
 export interface ExportProgress {
 	fraction: number;
+	/** Since the export began (not since the render did). */
 	elapsed_secs: number;
+	/** Time left, once the render has a rate of its own (not counting the seconds ffmpeg spent opening the footage). */
 	eta_secs?: number | null;
-	/** Set while the render has not started: the machine is busy with another heavy job
-	 *  (`waiting for the preview proxy`), or a static loudness normalization is metering the mix
-	 *  (`measuring the mix's loudness`) — so the export is not hung at 0%. A multi-format export
-	 *  sets it too. */
+	/** Set while the work has not started: the machine is busy with another heavy job
+	 *  (`waiting for the preview proxy`), or the animated titles are being drawn first
+	 *  (`rendering animated titles`) — so the export is not hung at 0%. A multi-format export
+	 *  sets it too. Wins over `stage`. */
 	waiting?: string | null;
+	/** What the export is doing now: `metering` (a static loudness normalization reads the mix first),
+	 *  `starting` (ffmpeg opens the footage and decodes up to a range's start; nothing is written yet),
+	 *  `rendering`, `finishing` (the muxer closes the file) and `measuring` (the written file is read back). */
+	stage?: ExportStage | null;
 	/** Set by a multi-format export: which file is rendering, of how many.
 	 *  `fraction` then spans all of them. */
 	variant?: number;

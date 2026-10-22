@@ -5975,23 +5975,37 @@ pub fn render(timeline: &Timeline, assets: &[Asset], output: &Path, _format: &st
     render_with(timeline, assets, output, &ExportOptions::default())
 }
 
-/// Progress emitted during an export: `fraction` in `0.0..=1.0`, wall-clock
-/// `elapsed_secs`, and an `eta_secs` estimate once enough has rendered to
-/// extrapolate. Derived from ffmpeg's `-progress` stream.
+/// Progress emitted during an export: `fraction` in `0.0..=1.0` over the **whole** export (its
+/// stages each own a share of the bar, see [`progress::StageSplit`]), wall-clock `elapsed_secs`
+/// since the export began, and an `eta_secs` estimate once enough has rendered to extrapolate.
+/// Derived from ffmpeg's `-progress` stream.
 #[derive(Debug, Clone, Copy, serde::Serialize)]
 pub struct ExportProgress {
     pub fraction: f64,
     pub elapsed_secs: f64,
     pub eta_secs: Option<f64>,
-    /// Set while the render has not started: the machine is busy with another heavy job
-    /// (`waiting for the preview proxy`), or a static loudness normalization is metering the mix
-    /// first (`measuring the mix's loudness`) — so the export does not look hung at 0%.
+    /// Set while the work has not started: the machine is busy with another heavy job
+    /// (`waiting for the preview proxy`), or the animated titles are being drawn first
+    /// (`rendering animated titles`) — so the export does not look hung at 0%. Wins over `stage`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub waiting: Option<&'static str>,
+    /// What the export is doing now, once it is working ([`ExportStage`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage: Option<ExportStage>,
 }
 
-/// What an export's `waiting` line says while a static loudness normalization meters the mix.
-const METERING_LOUDNESS: &str = "measuring the mix's loudness";
+impl ExportProgress {
+    /// A report that waits (`why`), at `fraction` of the bar.
+    fn queued(fraction: f64, elapsed_secs: f64, why: &'static str) -> Self {
+        Self {
+            fraction,
+            elapsed_secs,
+            eta_secs: None,
+            waiting: Some(why),
+            stage: None,
+        }
+    }
+}
 
 /// Whether an export ran to completion or was stopped by the cancel callback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -6067,18 +6081,30 @@ pub fn render_with_progress(
         ),
         ..opts.clone()
     };
+    let started = Instant::now();
     let status = discarding_partial(output, || {
         // A request that would be refused anyway is refused before the titles are drawn (and before
         // a static loudness normalization spends a pass metering the mix).
-        let (_, has_audio) = export_preflight(timeline, assets, &opts)?;
-        match measure_static_loudness(timeline, assets, &mut opts, has_audio, progress, cancel) {
+        let (has_video, has_audio) = export_preflight(timeline, assets, &opts)?;
+        // The metering pass owns the first part of the bar, the render the rest. Each reports in its
+        // own 0..1 and `within` puts it on the whole export's.
+        let meter = metering_share(meters_loudness_first(&opts, has_audio), has_video);
+        match measure_static_loudness(
+            timeline,
+            assets,
+            &mut opts,
+            has_audio,
+            &mut |p| progress(p.within(0.0, meter, started)),
+            cancel,
+        ) {
             Err(Error::Cancelled) => return Ok(RenderStatus::Cancelled),
             r => r?,
         }
         let opts = &opts;
+        let mut render_bar = |p: ExportProgress| progress(p.within(meter, 1.0, started));
         // The animated titles are pictures on disk before any ffmpeg is spawned: drawn once for this
         // export — a second pass and the software retry read the same files — and kept until it is over.
-        let Some(_titles) = svg_layer::prepare_export(timeline, assets, opts, progress, cancel)? else {
+        let Some(_titles) = svg_layer::prepare_export(timeline, assets, opts, &mut render_bar, cancel)? else {
             return Ok(RenderStatus::Cancelled);
         };
         // The captions and chapters to mux in are files for the length of the export. The caption
@@ -6088,7 +6114,7 @@ pub fn render_with_progress(
         side_files::check_sidecars(output, &opts)?;
         retry_export_in_software(
             &opts,
-            |o, hw_used| render_attempt(timeline, assets, output, o, progress, cancel, hw_used),
+            |o, hw_used| render_attempt(timeline, assets, output, o, &mut render_bar, cancel, hw_used),
             convict_hardware_decode,
         )
     })?;
@@ -6103,8 +6129,11 @@ pub fn render_with_progress(
 /// Fill in `opts.loudness_gain_db` for a static loudness normalization that has not been
 /// measured yet: one metering pass over the export's own mix, without the normalization
 /// (see [`ExportOptions::loudness_static`]). Nothing for any other export, nor for one that
-/// writes no sound (a cut without any, or a container that carries none). The pass shows in
-/// `progress` as the export's `waiting` line — queued for the slot, then metering.
+/// writes no sound (a cut without any, or a container that carries none).
+///
+/// The pass reports in its own `0.0..=1.0` (the length of the mix metered so far, which it walks
+/// — a known duration — as [`ExportStage::Metering`]), after a `waiting` line while it is queued
+/// for the slot; the caller puts that on the export's bar.
 fn measure_static_loudness(
     timeline: &Timeline,
     assets: &[Asset],
@@ -6113,24 +6142,35 @@ fn measure_static_loudness(
     progress: &mut dyn FnMut(ExportProgress),
     cancel: &dyn Fn() -> bool,
 ) -> Result<()> {
-    let target = opts.loudness.is_some() || opts.loudnorm;
-    let writes_sound = has_audio && opts.include_audio && !opts.container.is_video_only();
-    if !(opts.loudness_static && target && writes_sound) || opts.loudness_gain_db.is_some() {
+    if !meters_loudness_first(opts, has_audio) {
         return Ok(());
     }
     let started = Instant::now();
-    let mut status = |wait: Option<cpu::Wait>| {
-        progress(ExportProgress {
-            fraction: 0.0,
-            elapsed_secs: started.elapsed().as_secs_f64(),
-            eta_secs: None,
-            waiting: Some(wait.map_or(METERING_LOUDNESS, cpu::Wait::message)),
+    let mut status = |metering: levels::Metering| {
+        let elapsed = started.elapsed().as_secs_f64();
+        progress(match metering {
+            levels::Metering::Waiting(wait) => ExportProgress::queued(0.0, elapsed, wait.message()),
+            levels::Metering::Running(fraction) => ExportProgress {
+                fraction,
+                elapsed_secs: elapsed,
+                eta_secs: None,
+                waiting: None,
+                stage: Some(ExportStage::Metering),
+            },
         });
     };
     // A mix too quiet to measure is left at its level (the limiter still holds the peaks).
     opts.loudness_gain_db = Some(levels::static_loudness_gain(timeline, assets, opts, &mut status, cancel)?.unwrap_or(0.0));
     tracing::debug!(gain_db = ?opts.loudness_gain_db, "measured the mix for static loudness normalization");
     Ok(())
+}
+
+/// Whether an export meters its mix before it renders (pure): a static loudness normalization
+/// with a target, whose gain has not been measured yet, over a cut that writes sound.
+fn meters_loudness_first(opts: &ExportOptions, has_audio: bool) -> bool {
+    let target = opts.loudness.is_some() || opts.loudnorm;
+    let writes_sound = has_audio && opts.include_audio && !opts.container.is_video_only();
+    opts.loudness_static && target && writes_sound && opts.loudness_gain_db.is_none()
 }
 
 /// Run an export attempt, and once more in software when one that asked an input for hardware
@@ -6375,31 +6415,40 @@ pub fn prepare_variants(
     progress: &mut dyn FnMut(VariantProgress),
     cancel: &dyn Fn() -> bool,
 ) -> Result<Option<ExportOptions>> {
-    let mut has_audio = false;
+    prepare_variants_sharing(timeline, assets, variants, opts, Instant::now(), progress, cancel)
+        .map(|prepared| prepared.map(|(opts, _)| opts))
+}
+
+/// [`prepare_variants`] on the bar of an export that began at `started`: the options, and the
+/// share of the bar the metering pass took (0 when it measured nothing), which the renders that
+/// follow start after.
+fn prepare_variants_sharing(
+    timeline: &Timeline,
+    assets: &[Asset],
+    variants: &[ExportVariant],
+    opts: &ExportOptions,
+    started: Instant,
+    progress: &mut dyn FnMut(VariantProgress),
+    cancel: &dyn Fn() -> bool,
+) -> Result<Option<(ExportOptions, f64)>> {
+    let (mut has_video, mut has_audio) = (false, false);
     for variant in variants {
         let per_variant = ExportOptions {
             resolution: Some((variant.delivery.width, variant.delivery.height)),
             fit: variant.delivery.fit,
             ..opts.clone()
         };
-        has_audio |= export_preflight(&timeline.for_delivery(variant.delivery), assets, &per_variant)?.1;
+        let (video, audio) = export_preflight(&timeline.for_delivery(variant.delivery), assets, &per_variant)?;
+        has_video |= video;
+        has_audio |= audio;
     }
     let mut opts = opts.clone();
     let total = variants.len();
-    let mut on_meter = |p: ExportProgress| {
-        progress(VariantProgress {
-            variant: 0,
-            total,
-            fraction: 0.0,
-            elapsed_secs: p.elapsed_secs,
-            eta_secs: None,
-            waiting: p.waiting,
-            together: false,
-        });
-    };
+    let meter = metering_share(meters_loudness_first(&opts, has_audio), has_video);
+    let mut on_meter = |p: ExportProgress| progress(VariantProgress::of(p.within(0.0, meter, started), 0, total, false));
     match measure_static_loudness(timeline, assets, &mut opts, has_audio, &mut on_meter, cancel) {
         Err(Error::Cancelled) => Ok(None),
-        r => r.map(|()| Some(opts)),
+        r => r.map(|()| Some((opts, meter))),
     }
 }
 
@@ -6417,13 +6466,32 @@ pub struct VariantProgress {
     /// Time left across the remaining variants, estimated from how long the
     /// completed share has taken.
     pub eta_secs: Option<f64>,
-    /// [`ExportProgress::waiting`]: queued for the slot, or metering the mix's loudness.
+    /// [`ExportProgress::waiting`]: queued for the slot, or drawing the animated titles.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub waiting: Option<&'static str>,
+    /// [`ExportProgress::stage`]: what the export is doing now.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage: Option<ExportStage>,
     /// Every variant is rendering in the one run ([`render_variants`] `together`): `variant`
     /// is then 0 and `fraction` is each file's as much as the whole.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub together: bool,
+}
+
+impl VariantProgress {
+    /// `p` — already on the whole export's bar — as the report of variant `variant` of `total`.
+    fn of(p: ExportProgress, variant: usize, total: usize, together: bool) -> Self {
+        Self {
+            variant,
+            total,
+            fraction: p.fraction,
+            elapsed_secs: p.elapsed_secs,
+            eta_secs: p.eta_secs,
+            waiting: p.waiting,
+            stage: p.stage,
+            together,
+        }
+    }
 }
 
 /// Refuse an export whose caption files would replace ones already beside `output`, unless
@@ -6467,7 +6535,7 @@ pub fn render_variants(
         completed,
         together,
     };
-    let Some(opts) = prepare_variants(timeline, assets, variants, opts, progress, cancel)? else {
+    let Some((opts, meter)) = prepare_variants_sharing(timeline, assets, variants, opts, started, progress, cancel)? else {
         return Ok(run(
             RenderStatus::Cancelled,
             0,
@@ -6475,7 +6543,7 @@ pub fn render_variants(
         ));
     };
     if together {
-        match together::render_together(timeline, assets, variants, &opts, progress, cancel)? {
+        match together::render_together(timeline, assets, variants, &opts, (meter, started), progress, cancel)? {
             Some(RenderStatus::Completed) => return Ok(run(RenderStatus::Completed, total, true)),
             Some(RenderStatus::Cancelled) => return Ok(run(RenderStatus::Cancelled, 0, true)),
             None => {}
@@ -6488,19 +6556,19 @@ pub fn render_variants(
             fit: variant.delivery.fit,
             ..opts.clone()
         };
+        // Each variant owns an equal share of what the metering pass left of the bar.
+        let (from, to) = (
+            meter + (1.0 - meter) * i as f64 / total as f64,
+            meter + (1.0 - meter) * (i + 1) as f64 / total as f64,
+        );
         let mut on_progress = |p: ExportProgress| {
-            let fraction = (i as f64 + p.fraction.clamp(0.0, 1.0)) / total as f64;
-            let elapsed_secs = started.elapsed().as_secs_f64();
-            let eta_secs = (fraction > 0.0).then(|| elapsed_secs / fraction - elapsed_secs);
-            progress(VariantProgress {
-                variant: i,
+            let eta_secs = variants_eta(p.eta_secs, p.fraction, total - 1 - i);
+            progress(VariantProgress::of(
+                ExportProgress { eta_secs, ..p }.within(from, to, started),
+                i,
                 total,
-                fraction,
-                elapsed_secs,
-                eta_secs,
-                waiting: p.waiting,
-                together: false,
-            });
+                false,
+            ));
         };
         // `render_with_progress` discards a failed or cancelled variant's partial file, but only
         // if this run touched it: a cancel while the batch was still queued leaves an earlier
@@ -6825,7 +6893,12 @@ const CANCEL_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 /// treated as hung. ffmpeg reports every half second while it is working, even
 /// through a slow filter, so this is a deadlock, not a heavy render — the bound
 /// is generous because killing a render that was merely slow is the worse error.
+/// (It reports nothing while it opens the footage and decodes up to a range's start, so this is
+/// also the most a seek into a recording with no keyframes to land on may take.)
 const EXPORT_STALL: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How often a running export that has written nothing yet repeats that it is starting.
+const STARTING_BEAT: std::time::Duration = std::time::Duration::from_secs(1);
 
 /// Spawn the `ffmpeg` binary with `args`, streaming `-progress` from stdout to
 /// map elapsed render time onto `bar`, and polling `cancel` between updates
@@ -6867,21 +6940,34 @@ fn run_ffmpeg_progress_into(
     progress: &mut dyn FnMut(ExportProgress),
     cancel: &dyn Fn() -> bool,
 ) -> Result<RenderStatus> {
+    run_progress_with(&ffmpeg_bin(), args, sinks, output, bar, resource, progress, cancel)
+}
+
+/// [`run_ffmpeg_progress_into`] with the binary named (a test runs a script that talks like ffmpeg).
+#[allow(clippy::too_many_arguments)]
+fn run_progress_with(
+    bin: &str,
+    args: &[String],
+    sinks: &[usize],
+    output: &Path,
+    bar: Bar,
+    resource: cpu::Resource,
+    progress: &mut dyn FnMut(ExportProgress),
+    cancel: &dyn Fn() -> bool,
+) -> Result<RenderStatus> {
     use std::io::{BufRead, BufReader, Read};
     use std::process::Stdio;
 
-    let bin = ffmpeg_bin();
     // The heaviest thing the engine does. The lease is reentrant, so an export's
     // second pass and a stitch inside an import do not queue behind themselves. It is the
     // foreground lane — ahead of any proxy still queued — and a render that has to wait says
     // so through `progress` and can be cancelled while it does.
     let mut on_wait = |wait: cpu::Wait| {
-        progress(ExportProgress {
-            fraction: bar.offset,
-            elapsed_secs: bar.start.elapsed().as_secs_f64(),
-            eta_secs: None,
-            waiting: Some(wait.message()),
-        });
+        progress(ExportProgress::queued(
+            bar.offset,
+            bar.start.elapsed().as_secs_f64(),
+            wait.message(),
+        ));
     };
     let leased = match resource {
         cpu::Resource::Cpu => cpu::lease_waiting(&mut on_wait, cancel),
@@ -6904,7 +6990,7 @@ fn run_ffmpeg_progress_into(
 
     // `-progress pipe:1` writes machine-readable key=value blocks to stdout;
     // `-stats_period` bounds how often, and thus the cancel-poll latency.
-    let mut child = bg_command(&bin)
+    let mut child = bg_command(bin)
         .arg("-progress")
         .arg("pipe:1")
         .arg("-stats_period")
@@ -6914,7 +7000,7 @@ fn run_ffmpeg_progress_into(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| launch_err(&bin, e))?;
+        .map_err(|e| launch_err(bin, e))?;
 
     let stderr = child.stderr.take().expect("stderr piped");
     let stderr_handle = std::thread::spawn(move || {
@@ -6923,7 +7009,6 @@ fn run_ffmpeg_progress_into(
         buf
     });
 
-    let total = bar.total.max(1e-9);
     let mut cancelled = false;
     let mut stalled = false;
     let stdout = child.stdout.take().expect("stdout piped");
@@ -6940,7 +7025,25 @@ fn run_ffmpeg_progress_into(
             }
         }
     });
+    // ffmpeg opens the footage before it writes anything — and decodes up to a range's start,
+    // which on a long-GOP source takes as long as it takes, with the output file empty. Say so
+    // now: it also replaces whatever the stage before this one (a queue, a metering pass) last said.
+    let say = |progress: &mut dyn FnMut(ExportProgress), fraction: f64, eta_secs: Option<f64>, stage: ExportStage| {
+        progress(ExportProgress {
+            fraction,
+            elapsed_secs: bar.start.elapsed().as_secs_f64(),
+            eta_secs,
+            waiting: None,
+            stage: Some(stage),
+        });
+    };
+    say(progress, bar.offset, None, ExportStage::Starting);
+    let mut reader = ProgressReader::default();
+    // The wall clock and the place on the bar at the first output: the rate (and so the time
+    // left) is judged from there, not from the spawn.
+    let mut first_output: Option<(Instant, f64)> = None;
     let mut last_output = Instant::now();
+    let mut last_beat = Instant::now();
     loop {
         let line = match rx.recv_timeout(CANCEL_POLL) {
             Ok(line) => line,
@@ -6956,30 +7059,44 @@ fn run_ffmpeg_progress_into(
                     stalled = true;
                     break;
                 }
+                // ffmpeg prints no `-progress` block while it opens the footage and decodes up
+                // to a range's start (measured on 4.4: the first block comes only once the first
+                // packet is written), so the silence of that stretch is the engine's to keep
+                // alive: a beat a second, which moves the elapsed time.
+                if first_output.is_none() && last_beat.elapsed() >= STARTING_BEAT {
+                    last_beat = Instant::now();
+                    say(progress, bar.offset, None, ExportStage::Starting);
+                }
                 continue;
             }
         };
         last_output = Instant::now();
-        if line == "progress=end" {
-            break;
+        let block = reader.feed(&line);
+        match block {
+            // The output has been written to: its position against the length of the cut (the
+            // output starts at 0 whatever the range's offset — the input seek rebases the
+            // timestamps — so a range is measured against its own length). The last block is told
+            // too: it carries the end of the output, which no periodic one was late enough to.
+            Some(Block::Working(Some(position)) | Block::End(Some(position))) => {
+                let (pass, stage) = pass_position(position, bar.total);
+                let fraction = (bar.offset + bar.width * pass).clamp(0.0, 1.0);
+                let (at, from) = *first_output.get_or_insert((Instant::now(), fraction));
+                let eta = eta_secs(at.elapsed().as_secs_f64(), fraction - from, 1.0 - fraction);
+                say(progress, fraction, eta, stage);
+            }
+            // Nothing written yet: ffmpeg is still opening and seeking. A beat, so the elapsed
+            // time moves and the stage stays honest.
+            Some(Block::Working(None)) if first_output.is_none() => say(progress, bar.offset, None, ExportStage::Starting),
+            _ => {}
         }
-        // `out_time_us` is the output timeline position in microseconds (printed
-        // as `N/A` before the first frame, which `parse` skips).
-        if let Some(us) = line.strip_prefix("out_time_us=").and_then(|v| v.trim().parse::<i64>().ok()) {
-            let pass = (us.max(0) as f64 / 1_000_000.0 / total).clamp(0.0, 1.0);
-            let fraction = (bar.offset + bar.width * pass).clamp(0.0, 1.0);
-            let elapsed = bar.start.elapsed().as_secs_f64();
-            let eta = (fraction > 1e-3).then(|| elapsed * (1.0 - fraction) / fraction);
-            progress(ExportProgress {
-                fraction,
-                elapsed_secs: elapsed,
-                eta_secs: eta,
-                waiting: None,
-            });
-        }
+        // A cancel that arrives with the last block still counts (the file is removed, as for any
+        // other): the check comes before the end of the stream ends the loop.
         if cancel() {
             let _ = child.kill();
             cancelled = true;
+            break;
+        }
+        if matches!(block, Some(Block::End(_))) {
             break;
         }
     }
@@ -10057,6 +10174,12 @@ fn atempo_chain(speed: f64) -> String {
     parts.join(",")
 }
 
+/// The stages of an export, the share of the bar each owns, and ffmpeg's `-progress` stream read
+/// into positions.
+mod progress;
+pub use progress::ExportStage;
+use progress::{eta_secs, metering_share, pass_position, variants_eta, Block, ProgressReader};
+
 /// Measuring the mix (`ebur128` meters on the export's own audio graph): a child
 /// module so it reaches the private graph builders.
 mod levels;
@@ -10074,6 +10197,9 @@ mod bt709_label;
 /// What the export graph draws, pinned against rendered pixels (`#[ignore]`d).
 #[cfg(test)]
 mod rendered;
+
+#[cfg(test)]
+mod export_progress_rendered;
 
 /// A clip's curves, wheels and LUT as filters.
 mod grade;
@@ -12059,6 +12185,97 @@ mod tests {
         assert_eq!(told, [Some("waiting for the preview proxy")]);
         release_tx.send(()).unwrap();
         proxy.join().unwrap();
+    }
+
+    /// A child that talks like `ffmpeg -progress` — a block with no output position yet (it is
+    /// opening and seeking the footage), then the output's position through a 10 s cut, the last of
+    /// it past the end while the muxer closes the file — as the export's progress tells it: a
+    /// stage that says so before any output, a rising fraction on the pass's share of the bar, and
+    /// 99 % of the pass until ffmpeg has exited. No ffmpeg needed.
+    #[cfg(unix)]
+    #[test]
+    fn a_pass_tells_it_is_starting_then_rendering_then_finishing_and_never_runs_the_bar_backwards() {
+        use std::os::unix::fs::PermissionsExt;
+        let _serial = cpu::test_lock();
+        let dir = Scratch::new("talks-like-ffmpeg");
+        let script = dir.join("ffmpeg.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\n\
+             printf 'frame=0\\nout_time_ms=N/A\\nout_time=N/A\\nprogress=continue\\n'; sleep 0.3\n\
+             printf 'out_time_us=N/A\\nout_time_ms=N/A\\nprogress=continue\\n'; sleep 0.3\n\
+             for us in 1000000 5000000 9500000 10000000 10120000; do\n\
+               printf \"out_time_us=$us\\nprogress=continue\\n\"; sleep 0.1\n\
+             done\n\
+             printf 'out_time_us=10150000\\nprogress=end\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        // The second pass of a two-pass export: the second half of the bar, over a 10 s cut.
+        let bar = Bar {
+            total: 10.0,
+            offset: 0.5,
+            width: 0.5,
+            start: Instant::now(),
+        };
+        let mut seen: Vec<ExportProgress> = Vec::new();
+        let status = run_progress_with(
+            script.to_str().unwrap(),
+            &[],
+            &[],
+            Path::new("/nonexistent/out.mp4"),
+            bar,
+            cpu::Resource::Cpu,
+            &mut |p| seen.push(p),
+            &|| false,
+        )
+        .unwrap();
+        assert_eq!(status, RenderStatus::Completed);
+        let stages: Vec<_> = seen.iter().filter_map(|p| p.stage).collect();
+        let mut distinct = stages.clone();
+        distinct.dedup();
+        assert_eq!(
+            distinct,
+            [ExportStage::Starting, ExportStage::Rendering, ExportStage::Finishing],
+            "{stages:?}"
+        );
+        assert!(seen.iter().all(|p| p.waiting.is_none()));
+        // The spawn says it, and so does each block before the first output: three beats of
+        // "starting" at the pass's own start — not 0, not stuck on a stale word.
+        let starting: Vec<f64> = seen
+            .iter()
+            .filter(|p| p.stage == Some(ExportStage::Starting))
+            .map(|p| p.fraction)
+            .collect();
+        assert_eq!(starting, [0.5, 0.5, 0.5]);
+        // The position is measured against the cut's length: 1 s of 10 is a tenth of the half.
+        let rendering: Vec<f64> = seen
+            .iter()
+            .filter(|p| p.stage == Some(ExportStage::Rendering))
+            .map(|p| p.fraction)
+            .collect();
+        assert!(
+            (rendering[0] - 0.55).abs() < 1e-9 && (rendering[1] - 0.75).abs() < 1e-9,
+            "{rendering:?}"
+        );
+        // Held under the end of the pass until ffmpeg exits, however far past the cut it says it is.
+        let finishing: Vec<f64> = seen
+            .iter()
+            .filter(|p| p.stage == Some(ExportStage::Finishing))
+            .map(|p| p.fraction)
+            .collect();
+        assert!(
+            !finishing.is_empty() && finishing.iter().all(|f| (*f - 0.995).abs() < 1e-9),
+            "{finishing:?}"
+        );
+        let all: Vec<f64> = seen.iter().map(|p| p.fraction).collect();
+        assert!(all.windows(2).all(|w| w[0] <= w[1]), "the bar went backwards: {all:?}");
+        assert!(all.iter().all(|f| *f < 1.0), "{all:?}");
+        // Time left appears once a rate does, and never before the first output.
+        assert!(seen
+            .iter()
+            .filter(|p| p.stage == Some(ExportStage::Starting))
+            .all(|p| p.eta_secs.is_none()));
     }
 
     /// The streamed encode reports a rising fraction under 1 and can be abandoned: a cancel

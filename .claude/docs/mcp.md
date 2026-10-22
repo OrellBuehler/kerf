@@ -181,7 +181,7 @@ their sound (inputs under `lock_agent`, decode + correlate without it, `apply_au
 again; `context.ct` cancels it, a slot wait goes out as a progress notification) and answers
 `AudioSync` (offset, confidence, distinct — `null` for no rival peak —, reliable, inverted, applied);
 `project-changed` only when it moved. Its description says only each clip's used source window is
-compared. `export_variants` progress says `measuring the mix's loudness` while a static normalization meters. `export`'s `options.loudness_static` is in its description.
+compared. `export` and `export_variants` progress say `metering loudness` while a static normalization meters (see Background jobs). `export`'s `options.loudness_static` is in its description.
 `set_delivery_format`'s `fit` takes `cover` (the default), `contain` or `blur` (the whole
 picture over a blurred, enlarged copy of itself; a clip placed by its transform gets plain bars).
 Its **`fps`** is the delivery frame rate (`Delivery::fps`, 1 to 240, `23.976` / `29.97` / `59.94` made the exact
@@ -545,7 +545,12 @@ Every job that resolves inputs under the lock notes `Project::generation()` and 
 opened since (`require_generation`) — a Save As does not count as one (`replace_with_saved_copy` keeps it). The reads
 that decode (`get_waveform`, `get_waveform_range`, `get_energy`, `skim_asset`, `preview_timeline`, `get_frame`) take the
 request's cancellation token, so a dropped request kills its ffmpeg; `export_cover` reports `reading the cut` →
-`rendering the cover frame` → `cover written` on the `progressToken`.
+`rendering the cover frame` → `cover written` on the `progressToken`. **`export` and `export_variants` word every tick
+from the engine's `ExportProgress`** (`export_message` / `variants_message`): the queue (`waiting for the preview
+proxy`), `metering loudness` (a static loudness pass, with a real fraction), `starting ffmpeg and seeking the
+footage` (nothing written yet — a range deep into a long recording), `rendering, … to go`, `finishing the file`;
+`progress` is over the whole export and only moves forward (`export_variants` gives its smart-crop framing pass the
+first tenth). `export` used to say `rendering` at 0.0 for all of those.
 
 ## Live activity stream (`mcp/activity.rs`)
 

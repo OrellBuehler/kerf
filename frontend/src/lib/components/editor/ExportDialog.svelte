@@ -12,6 +12,7 @@
 	import { confirmAction, inTauri, pathsExist, pickExportPath, hwEncoders, knownHwEncoders, revealPath } from '#lib/api';
 	import { overwriteCopy } from '#lib/confirm-copy';
 	import { exportTargets, filesToReplace } from '#lib/export-overwrite';
+	import { progressLine } from '#lib/export-progress';
 	import { toast } from '#lib/notifications.svelte';
 	import { formatsFor, hasPicture } from '#lib/delivery-formats';
 	import { timeDisplay } from '#lib/time-display.svelte';
@@ -92,7 +93,7 @@
 	// The render outlives this dialog (see `editor.exportRun`), so reopening it
 	// mid-render shows the progress and a Stop rather than a dead Export button.
 	const rendering = $derived(editor.exportRun !== null);
-	const progress = $derived(editor.exportRun?.progress ?? null);
+	const line = $derived(progressLine(editor.exportRun?.progress));
 	const cancelling = $derived(editor.exportRun?.cancelling ?? false);
 	let showAdvanced = $state(false);
 	let showCommand = $state(false);
@@ -123,12 +124,6 @@
 	);
 
 	const fmtTime = (s: number): string => timeDisplay.fmt(s);
-
-	function fmtEta(s: number | null | undefined): string {
-		if (s == null || !isFinite(s)) return '';
-		const r = Math.max(0, Math.round(s));
-		return r >= 60 ? `${Math.floor(r / 60)}m ${String(r % 60).padStart(2, '0')}s` : `${r}s`;
-	}
 
 	const assets = $derived(editor.assets);
 	const hasVideo = $derived(hasPicture(editor.timeline));
@@ -739,15 +734,12 @@
 		<div style="display:flex;align-items:center;gap:8px;padding:12px 16px">
 			{#if rendering}
 				<div style="flex:1;display:flex;align-items:center;gap:10px">
-					<ProgressBar value={progress?.waiting ? null : (progress?.fraction ?? 0)} label="Exporting" />
+					<ProgressBar value={line.value} label="Exporting" />
 					<span
 						data-testid="export-progress-text"
 						style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted);min-width:104px;text-align:right"
 					>
-						{#if progress?.waiting}{progress.waiting}…{:else}
-						{#if progress?.together}{progress.total} at once · {:else if progress?.total != null && progress.total > 1}{(progress.variant ?? 0) + 1}/{progress.total} · {/if}{Math.round(
-							(progress?.fraction ?? 0) * 100
-						)}%{progress?.eta_secs != null ? ` · ${fmtEta(progress.eta_secs)} left` : ''}{/if}
+						{line.text}
 					</span>
 				</div>
 				<Btn variant="destructive" size="md" data-rescue disabled={cancelling} onclick={stop}>
