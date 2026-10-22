@@ -632,6 +632,24 @@ impl Planner {
                 } else {
                     Pick::AtOrAfter(source_time)
                 };
+                // A still that samples a keyed pose to the identity draws the plain fit; the export's chain
+                // for the clip (a keyed clip is never padded) is the clip's own. Under Cover it matters whether
+                // the cover of the frame hangs over it, judged from the picture as decoded (a reprojection
+                // comes out at the frame's size).
+                let canvas_size = (self.canvas.width, self.canvas.height);
+                let fit_order = if !motion && clip.transform_at(local).is_identity() {
+                    FitOrder::Fitted
+                } else {
+                    let picture = if reframe.is_some() {
+                        Some(canvas_size)
+                    } else {
+                        Some((stream.width, stream.height))
+                    };
+                    clip.fit_order(
+                        self.canvas.fit,
+                        crate::layer_geometry::cover_overflows(picture, canvas_size, &clip.transform),
+                    )
+                };
                 layers.push(PlanLayer {
                     clip_id: clip.id,
                     asset_id: clip.asset_id,
@@ -666,13 +684,7 @@ impl Planner {
                         tail: planned.tail && eval >= clip.timeline_end(),
                     },
                     animated: planned.animated,
-                    // A still that samples a keyed pose to the identity draws the plain fit; the
-                    // export's chain for the clip (a keyed clip is never padded) is the clip's own.
-                    fit_order: if !motion && clip.transform_at(local).is_identity() {
-                        FitOrder::Fitted
-                    } else {
-                        clip.fit_order(self.canvas.fit)
-                    },
+                    fit_order,
                     keyed_alpha: (motion && planned.animated.is_some_and(|a| a.opacity)).then(|| {
                         let pick = self.canvas.pick_fps;
                         let t = ffmpeg_frame_time(u64::try_from(frame).unwrap_or(0), pick.num, pick.den);
@@ -2098,6 +2110,72 @@ mod tests {
             message.contains("one resample") && message.contains("a zoom in under Contain"),
             "{message}"
         );
+    }
+
+    /// Under Cover a clip that zooms or pans is scaled to cover the frame times the zoom and cut by the
+    /// canvas (`FitOrder::Uncropped`), where the compositor crops to the frame first: refused. A clip
+    /// that shows no more than the frame (the identity, a turn, a fade, a crop, a mask) is cropped as ever.
+    #[test]
+    fn a_cover_clip_that_zooms_or_pans_is_refused_and_one_that_shows_the_frame_is_not() {
+        let a = asset();
+        let assets = [a.clone()];
+        let cover = ExportOptions {
+            resolution: Some((360, 640)),
+            fit: Fit::Cover,
+            ..opts(30.0)
+        };
+        let refused = |clip: crate::model::Clip, mode: PlanMode| {
+            let plan = planner(&single(vec![clip]), &assets, mode, &cover).at_frame(15).unwrap();
+            let order = plan.layers[0].fit_order;
+            let why = plan.reasons(&GpuCaps::A0, plan.size(u32::MAX));
+            (order, has(&why, |u| matches!(u, Unsupported::FoldedFit(..))))
+        };
+        let posed = |edit: &dyn Fn(&mut crate::model::Clip)| {
+            let mut c = make_clip(a.id, 0.0, 4.0, 0.0);
+            edit(&mut c);
+            c
+        };
+        for mode in [PlanMode::Still, PlanMode::Motion] {
+            for (name, clip) in [
+                ("zoom in", posed(&|c| c.transform.scale = 1.5)),
+                ("zoom out", posed(&|c| c.transform.scale = 0.5)),
+                ("pan", posed(&|c| c.transform.pos_x = 0.2)),
+                (
+                    "keyed pan",
+                    posed(&|c| c.keyframes = vec![keyed(0.0, 1.0, -0.3), keyed(2.0, 1.0, 0.0)]),
+                ),
+            ] {
+                assert_eq!(refused(clip, mode), (FitOrder::Uncropped, true), "{mode:?} {name}");
+            }
+            for (name, clip) in [
+                ("identity", posed(&|_| {})),
+                ("turn", posed(&|c| c.transform.rotation = 20.0)),
+                ("opacity", posed(&|c| c.transform.opacity = 0.5)),
+                ("crop", posed(&|c| c.transform.crop_left = 0.1)),
+                (
+                    "mask",
+                    posed(&|c| {
+                        c.transform.pos_x = 0.2;
+                        c.mask = Some(crate::model::Mask::default());
+                    }),
+                ),
+                (
+                    "vignette",
+                    posed(&|c| {
+                        c.transform.scale = 2.0;
+                        c.effects = vec![VideoEffect::Vignette];
+                    }),
+                ),
+                // A zoom that moves is the chain's last stage, as under Contain.
+                (
+                    "moving zoom",
+                    posed(&|c| c.keyframes = vec![keyed(0.0, 0.5, 0.0), keyed(2.0, 2.0, 0.0)]),
+                ),
+            ] {
+                let (order, refused) = refused(clip, mode);
+                assert_eq!((order, refused), (FitOrder::Fitted, false), "{mode:?} {name}");
+            }
+        }
     }
 
     #[test]

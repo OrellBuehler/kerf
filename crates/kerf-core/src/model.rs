@@ -3386,7 +3386,11 @@ impl Clip {
     /// is not the plain fit). One answer for the export, the stream, the scrubbed still and
     /// the render plan, so none can disagree on whether a layer is the order a compositor
     /// draws. See [`FitOrder`].
-    pub fn fit_order(&self, fit: Fit) -> FitOrder {
+    ///
+    /// `cover_overflows` is [`crate::layer_geometry::cover_overflows`] for this clip's picture and the frame (`true`
+    /// when the picture's size is not known): under `Cover` a picture of the frame's own shape has
+    /// nothing past the frame to reveal, so only a zoom in changes its chain.
+    pub fn fit_order(&self, fit: Fit, cover_overflows: bool) -> FitOrder {
         // The identity transform is the fit alone, and a moving zoom is the chain's last stage,
         // at the fit size: both keep the order they always had.
         if (self.transform.is_identity() && !self.is_animated()) || self.zoom_animated() {
@@ -3395,11 +3399,41 @@ impl Clip {
         let Some(scale) = self.held_scale().filter(|s| s.is_finite() && *s > 0.0) else {
             return FitOrder::Fitted;
         };
+        let zooms_in = scale > 1.0 + 1e-9;
         match fit {
-            Fit::Contain | Fit::Blur if scale > 1.0 + 1e-9 => FitOrder::Folded,
+            Fit::Contain | Fit::Blur if zooms_in => FitOrder::Folded,
             Fit::Contain | Fit::Blur => FitOrder::Fitted,
-            Fit::Cover => FitOrder::Fitted,
+            Fit::Cover => {
+                // A mask and a vignette are laid out over the picture the chain hands them, which
+                // under `Cover` has always been the frame's: where the cover hangs over the frame
+                // they keep cropping first.
+                let picture_relative = self.mask.is_some() || self.effects.iter().any(|e| matches!(e, VideoEffect::Vignette));
+                if cover_overflows && picture_relative {
+                    return FitOrder::Fitted;
+                }
+                let (px, py) = self.pan_extent();
+                let reveals = cover_overflows && ((scale - 1.0).abs() > 1e-9 || px > 1e-9 || py > 1e-9);
+                if reveals || zooms_in {
+                    FitOrder::Uncropped
+                } else {
+                    FitOrder::Fitted
+                }
+            }
         }
+    }
+
+    /// The furthest the picture is ever moved from the centre, as a fraction of the frame width
+    /// and of its height: the static position, or the greatest value of a keyed one's curve (the
+    /// polyline every renderer draws, so its extremes are its points).
+    pub fn pan_extent(&self) -> (f64, f64) {
+        let reach = |prop: Property| {
+            if self.is_keyed(prop) {
+                self.property_curve(prop).iter().fold(0.0_f64, |m, p| m.max(p.1.abs()))
+            } else {
+                self.static_value(prop).abs()
+            }
+        };
+        (reach(Property::PosX), reach(Property::PosY))
     }
 
     /// The clip's keyframes sorted by time (the stored order is kept sorted by
@@ -4103,10 +4137,15 @@ pub enum Fit {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FitOrder {
     /// Fit to the frame (`Cover` then crops to it), then zoom: the order every chain had, and
-    /// still has for the identity transform, a zoom out, a moving zoom and `Cover`.
+    /// still has for the identity transform, a zoom out, a moving zoom, and a `Cover` clip that
+    /// shows nothing more than the frame (or has a mask or a vignette, laid out over the frame).
     Fitted,
     /// `Contain`, zoomed in: one `scale` from the source to the fit of the frame times the zoom.
     Folded,
+    /// `Cover` with a zoom or a position (or any zoom out): one `scale` from the source to the
+    /// cover of the frame times the zoom, **not cropped to the frame** — the overlay cuts what hangs
+    /// over the canvas, so a position pans across the real picture instead of revealing black.
+    Uncropped,
 }
 
 impl Fit {

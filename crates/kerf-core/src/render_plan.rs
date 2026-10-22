@@ -1363,6 +1363,7 @@ impl RenderPlan {
             match layer.fit_order {
                 FitOrder::Fitted => {}
                 FitOrder::Folded => out.push(Unsupported::FoldedFit(at(), "a zoom in under Contain")),
+                FitOrder::Uncropped => out.push(Unsupported::FoldedFit(at(), "a Cover clip that zooms or pans")),
             }
             if layer.animated.is_some_and(|a| a.zooms) {
                 if caps.keyed_zoom {

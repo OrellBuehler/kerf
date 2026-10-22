@@ -1518,7 +1518,7 @@ fn transitions(c: &Case, assets: &[Asset]) -> Vec<String> {
 }
 
 /// The families that come from the case's structure rather than from argv text.
-const STRUCTURAL: [&str; 41] = [
+const STRUCTURAL: [&str; 44] = [
     "muted-track",
     "solo-track",
     "disabled-clip",
@@ -1560,6 +1560,9 @@ const STRUCTURAL: [&str; 41] = [
     "zoom-folded",
     "preview-zoom-folded",
     "still-zoom-folded",
+    "cover-uncropped",
+    "preview-cover-uncropped",
+    "still-cover-uncropped",
 ];
 
 fn expected(table: &[(&str, &str)]) -> Vec<String> {
@@ -1590,11 +1593,17 @@ fn still_zoom_last(still: &str) -> bool {
 }
 
 /// Splits `s` at the `sep`s outside single quotes (an expression's own commas, and the semicolons of a
-/// keyed mask's statements, are quoted).
+/// keyed mask's statements, are quoted). A backslash escapes the character after it **outside** quotes,
+/// as the filtergraph parser reads it (inside them it is a backslash: `'It\'\''s'` is one quoted
+/// piece, an escaped apostrophe, another quoted piece).
 fn split_unquoted(s: &str, sep: char) -> Vec<&str> {
-    let (mut out, mut quoted, mut from) = (Vec::new(), false, 0);
+    let (mut out, mut quoted, mut escaped, mut from) = (Vec::new(), false, false, 0);
     for (i, c) in s.char_indices() {
+        if std::mem::take(&mut escaped) {
+            continue;
+        }
         match c {
+            '\\' if !quoted => escaped = true,
             '\'' => quoted = !quoted,
             c if c == sep && !quoted => {
                 out.push(&s[from..i]);
@@ -1652,6 +1661,30 @@ fn zoom_folded(graph: &str) -> bool {
             };
             let boxed = args.starts_with("w='") || args.split(':').next().is_some_and(|b| b.contains('*'));
             boxed && !args.contains("iw") && args.contains("force_original_aspect_ratio=decrease")
+        })
+    })
+}
+
+/// Whether a clip chain of a graph holds a Cover clip that is not cropped to the frame: a `scale` to
+/// cover (`force_original_aspect_ratio=increase`) that the plain Cover fit would follow with
+/// `crop=<W>:<H>`, followed instead by the export's centred `crop=w='iw-4*floor(` (`bounded`) or, in a
+/// still, by nothing of the kind.
+fn cover_uncropped(graph: &str, bounded: bool) -> bool {
+    split_unquoted(graph, ';').into_iter().any(|segment| {
+        let Some((head, _)) = segment.trim_end().rsplit_once('[') else {
+            return false;
+        };
+        let f = filters(head);
+        f.iter().enumerate().any(|(i, filter)| {
+            filter.contains("scale=")
+                && filter.contains("force_original_aspect_ratio=increase")
+                && f.get(i + 1).is_some_and(|next| {
+                    if bounded {
+                        next.starts_with("crop=w='iw-4*floor(")
+                    } else {
+                        !next.starts_with("crop=")
+                    }
+                })
         })
     })
 }
@@ -1846,6 +1879,9 @@ fn families(c: &Case, assets: &[Asset], text: &[String; 3], table: &[(&str, &str
         (zoom_folded(&flat[0]), "zoom-folded"),
         (zoom_folded(&flat[2]), "preview-zoom-folded"),
         (zoom_folded(&flat[1]), "still-zoom-folded"),
+        (cover_uncropped(&flat[0], true), "cover-uncropped"),
+        (cover_uncropped(&flat[2], true), "preview-cover-uncropped"),
+        (cover_uncropped(&flat[1], false), "still-cover-uncropped"),
         (chain_tails(&flat[0]).1, "alpha-kept"),
         (chain_tails(&flat[2]).1, "preview-alpha-kept"),
         (

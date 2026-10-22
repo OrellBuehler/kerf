@@ -27,12 +27,20 @@ fn clip(scale: f64) -> Clip {
     clip
 }
 
+/// The footage `clip()` is cut from: wide, so that under `Cover` in the vertical frame it hangs over.
+const WIDE: (u32, u32) = (4096, 2160);
+
 fn chain_with(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx) -> String {
-    video_clip_chain(clip, fmt, fx, false, "c0")
+    video_clip_chain_of(clip, fmt, fx, false, Some(WIDE), "c0")
 }
 
 fn chain(clip: &Clip, fit: Fit) -> String {
     chain_with(clip, &format(fit), &ClipFx::default())
+}
+
+/// The chain of a clip cut from footage of the size `picture` (`None`: not known).
+fn chain_of(clip: &Clip, fit: Fit, picture: Option<(u32, u32)>) -> String {
+    video_clip_chain_of(clip, &format(fit), &ClipFx::default(), false, picture, "c0")
 }
 
 fn key(time: f64, scale: f64, pos_x: f64) -> Keyframe {
@@ -85,7 +93,7 @@ fn the_fit_scale_of_a_zoom_is_the_frame_times_the_zoom() {
 #[test]
 fn a_zoom_in_under_contain_is_one_scale_from_the_source() {
     let zoomed = clip(3.3713);
-    assert_eq!(zoomed.fit_order(Fit::Contain), FitOrder::Folded);
+    assert_eq!(zoomed.fit_order(Fit::Contain, true), FitOrder::Folded);
     let c = chain(&zoomed, Fit::Contain);
     assert!(
         c.contains("scale=1080*3.3713:1920*3.3713:force_original_aspect_ratio=decrease,setsar=1"),
@@ -105,7 +113,7 @@ fn a_zoom_in_under_contain_is_one_scale_from_the_source() {
         "{c}"
     );
     // A blurred fill is Contain's chain for a clip that is not the plain fit.
-    assert_eq!(zoomed.fit_order(Fit::Blur), FitOrder::Folded);
+    assert_eq!(zoomed.fit_order(Fit::Blur, true), FitOrder::Folded);
     let c = chain(&zoomed, Fit::Blur);
     assert!(
         c.contains("scale=1080*3.3713:1920*3.3713:force_original_aspect_ratio=decrease,setsar=1"),
@@ -139,7 +147,7 @@ fn what_is_not_a_zoom_in_keeps_the_chain_it_had() {
     );
     // A zoom out: the fit, then the shrink.
     let shrunk = clip(0.5);
-    assert_eq!(shrunk.fit_order(Fit::Contain), FitOrder::Fitted);
+    assert_eq!(shrunk.fit_order(Fit::Contain, true), FitOrder::Fitted);
     let c = chain(&shrunk, Fit::Contain);
     assert!(
         c.contains("scale=1080:1920:force_original_aspect_ratio=decrease,scale=iw*0.5:ih*0.5,setsar=1"),
@@ -148,7 +156,7 @@ fn what_is_not_a_zoom_in_keeps_the_chain_it_had() {
     // A move that does not zoom: the fit alone, centred by the overlay.
     let mut moved = clip(1.0);
     moved.transform.pos_x = 0.2;
-    assert_eq!(moved.fit_order(Fit::Contain), FitOrder::Fitted);
+    assert_eq!(moved.fit_order(Fit::Contain, true), FitOrder::Fitted);
     let c = chain(&moved, Fit::Contain);
     assert!(
         c.contains("scale=1080:1920:force_original_aspect_ratio=decrease,setsar=1"),
@@ -157,7 +165,7 @@ fn what_is_not_a_zoom_in_keeps_the_chain_it_had() {
     // A zoom that moves is the chain's last stage, at the fit size.
     let mut moving = clip(1.0);
     moving.keyframes = vec![key(0.0, 0.5, 0.0), key(2.0, 3.0, 0.0)];
-    assert_eq!(moving.fit_order(Fit::Contain), FitOrder::Fitted);
+    assert_eq!(moving.fit_order(Fit::Contain, true), FitOrder::Fitted);
     let c = chain(&moving, Fit::Contain);
     assert!(
         c.contains("scale=1080:1920:force_original_aspect_ratio=decrease,setsar=1"),
@@ -171,7 +179,7 @@ fn a_zoom_that_is_keyed_but_held_is_the_same_scale() {
     let mut held = clip(1.0);
     held.keyframes = vec![key(0.0, 2.0, 0.0), key(2.0, 2.0, 0.1)];
     assert_eq!(held.held_scale(), Some(2.0));
-    assert_eq!(held.fit_order(Fit::Contain), FitOrder::Folded);
+    assert_eq!(held.fit_order(Fit::Contain, true), FitOrder::Folded);
     let c = chain(&held, Fit::Contain);
     assert!(
         c.contains("scale=1080*2:1920*2:force_original_aspect_ratio=decrease,setsar=1") && !c.contains("eval=frame"),
@@ -180,8 +188,169 @@ fn a_zoom_that_is_keyed_but_held_is_the_same_scale() {
     // Held at or under 1 it keeps the per-frame scale it always had.
     let mut under = clip(1.0);
     under.keyframes = vec![key(0.0, 0.8, 0.0), key(2.0, 0.8, 0.1)];
-    assert_eq!(under.fit_order(Fit::Contain), FitOrder::Fitted);
+    assert_eq!(under.fit_order(Fit::Contain, true), FitOrder::Fitted);
     assert!(chain(&under, Fit::Contain).contains("eval=frame"));
+}
+
+#[test]
+fn a_cover_clip_that_pans_is_scaled_to_cover_and_the_overlay_cuts_it() {
+    let mut panned = clip(1.0);
+    panned.transform.pos_x = 0.3;
+    assert_eq!(panned.fit_order(Fit::Cover, true), FitOrder::Uncropped);
+    let c = chain(&panned, Fit::Cover);
+    // The cover of the frame, not cropped to it; the window kept is the half frame plus the pan on
+    // each side of the centre (1080 * 0.8 * 2 = 1728) and a margin of 8 px: 1744 wide, 1936 tall.
+    assert!(
+        c.contains(
+            "scale=1080:1920:force_original_aspect_ratio=increase,crop=w='iw-4*floor(max(0,iw-1744)/4)':h='ih-4*floor(max(0,ih-1936)/4)',setsar=1"
+        ),
+        "{c}"
+    );
+    assert!(!c.contains("crop=1080:1920"), "{c}");
+    assert_eq!(scales(&c), 1, "{c}");
+    // A zoom is the same scale, whatever the side of 1.
+    for (scale, text) in [(2.0, "1080*2:1920*2"), (0.5, "1080*0.5:1920*0.5")] {
+        let mut zoomed = clip(scale);
+        zoomed.transform.pos_y = -0.1;
+        assert_eq!(zoomed.fit_order(Fit::Cover, true), FitOrder::Uncropped);
+        let c = chain(&zoomed, Fit::Cover);
+        assert!(
+            c.contains(&format!(
+                "scale={text}:force_original_aspect_ratio=increase,crop=w='iw-4*floor("
+            )),
+            "{c}"
+        );
+        assert_eq!(scales(&c), 1, "{c}");
+    }
+    // A position that is keyed pans as far as its curve goes (0.4), and the zoom may be held keyed.
+    let mut keyed = clip(1.0);
+    keyed.keyframes = vec![key(0.0, 1.5, -0.4), key(2.0, 1.5, 0.2)];
+    assert_eq!(keyed.fit_order(Fit::Cover, true), FitOrder::Uncropped);
+    assert_eq!(keyed.pan_extent(), (0.4, 0.0));
+    let c = chain(&keyed, Fit::Cover);
+    assert!(
+        c.contains("scale=1080*1.5:1920*1.5:force_original_aspect_ratio=increase,crop=w='iw-4*floor(max(0,iw-1960)/4)'"),
+        "{c}"
+    );
+    assert!(!c.contains("eval=frame"), "{c}");
+}
+
+#[test]
+fn what_a_cover_clip_shows_of_the_frame_alone_is_cropped_to_it_as_it_was() {
+    let crops = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1";
+    // The identity.
+    assert!(chain(&clip(1.0), Fit::Cover).contains(crops));
+    // Neither zoom nor position: a turn, a fade of opacity, a crop of the source.
+    let mut turned = clip(1.0);
+    turned.transform.rotation = 15.0;
+    let mut faint = clip(1.0);
+    faint.transform.opacity = 0.5;
+    let mut trimmed = clip(1.0);
+    trimmed.transform.crop_left = 0.1;
+    for c in [turned, faint, trimmed] {
+        assert_eq!(c.fit_order(Fit::Cover, true), FitOrder::Fitted);
+        assert!(chain(&c, Fit::Cover).contains(crops), "{}", chain(&c, Fit::Cover));
+    }
+    // A mask and a vignette are laid out over the frame the chain hands them: they keep cropping
+    // first, a pan or a zoom or not.
+    let mut masked = clip(1.0);
+    masked.transform.pos_x = 0.3;
+    masked.mask = Some(crate::model::Mask::default());
+    let mut vignetted = clip(2.0);
+    vignetted.effects = vec![crate::model::VideoEffect::Vignette];
+    for c in [masked, vignetted] {
+        assert_eq!(c.fit_order(Fit::Cover, true), FitOrder::Fitted);
+        let c = chain(&c, Fit::Cover);
+        assert!(c.contains("crop=1080:1920,") && !c.contains("floor("), "{c}");
+    }
+    // A zoom that moves is the chain's last stage, at the cover-and-cropped fit size.
+    let mut moving = clip(1.0);
+    moving.keyframes = vec![key(0.0, 0.5, 0.2), key(2.0, 2.0, 0.2)];
+    assert_eq!(moving.fit_order(Fit::Cover, true), FitOrder::Fitted);
+    let c = chain(&moving, Fit::Cover);
+    assert!(c.contains(crops) && c.contains("eval=frame"), "{c}");
+}
+
+/// Under Cover a picture of the frame's own shape has nothing past the frame to reveal, so a move or
+/// a zoom out changes nothing a crop to the frame hid: those keep the chain they had (a webcam shrunk
+/// over a 16:9 cut in a 16:9 frame is the common one), and only a zoom in, which is detail, is taken
+/// from the source in one scale.
+#[test]
+fn a_cover_clip_of_the_frames_own_shape_keeps_its_chain_unless_it_zooms_in() {
+    let tall = Some((2160, 3840));
+    let crops = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,";
+    let mut pip = clip(0.25);
+    pip.transform.pos_x = 0.35;
+    pip.transform.pos_y = 0.3;
+    let c = chain_of(&pip, Fit::Cover, tall);
+    assert!(c.contains(&format!("{crops}scale=iw*0.25:ih*0.25,setsar=1")), "{c}");
+    let mut moved = clip(1.0);
+    moved.transform.pos_x = 0.3;
+    assert!(chain_of(&moved, Fit::Cover, tall).contains(&format!("{crops}setsar=1")));
+    // ... but a footage of another shape, or of a size not known, hangs over the frame.
+    for picture in [Some(WIDE), None] {
+        assert!(chain_of(&pip, Fit::Cover, picture).contains("floor("), "{picture:?}");
+        assert!(chain_of(&moved, Fit::Cover, picture).contains("floor("), "{picture:?}");
+    }
+    // A zoom in is the frame's cover times the zoom, whatever the shape, and the centred crop keeps the
+    // picture to the frame it can show.
+    let zoomed = clip(1.5);
+    let c = chain_of(&zoomed, Fit::Cover, tall);
+    assert!(
+        c.contains("scale=1080*1.5:1920*1.5:force_original_aspect_ratio=increase,crop=w='iw-4*floor(max(0,iw-1096)/4)'"),
+        "{c}"
+    );
+    // A reprojected picture comes out at the frame's size: a move of it is cropped as it was.
+    let mut reframed = clip(1.0);
+    reframed.transform.pos_x = 0.3;
+    reframed.reframe = Some(crate::model::Reframe::new(crate::model::Projection::Equirect));
+    let c = chain_of(&reframed, Fit::Cover, Some(WIDE));
+    assert!(c.contains(&format!("{crops}setsar=1")), "{c}");
+}
+
+#[test]
+fn the_window_kept_of_an_uncropped_picture_follows_the_pan_the_turn_and_the_blur() {
+    let crop = |pan, rotation, margin| bound_crop((1080, 1920), pan, rotation, margin);
+    let text = |w: u32, h: u32| format!("crop=w='iw-4*floor(max(0,iw-{w})/4)':h='ih-4*floor(max(0,ih-{h})/4)'");
+    // The frame and the margin on each side of the centre.
+    assert_eq!(crop((0.0, 0.0), Rotated::No, 8.0), text(1096, 1936));
+    // A pan adds to the reach on the side it goes from, as far as it ever goes.
+    assert_eq!(crop((0.3, 0.1), Rotated::No, 8.0), text(1744, 2320));
+    // A quarter turn swaps the axes; a turn that is keyed is the circle round the frame.
+    assert_eq!(
+        crop((0.0, 0.0), Rotated::By(std::f64::consts::FRAC_PI_2), 8.0),
+        text(1936, 1096)
+    );
+    let circle = (540.0_f64.hypot(960.0) * 2.0 + 16.0).ceil() as u32;
+    assert_eq!(crop((0.0, 0.0), Rotated::Keyed, 8.0), text(circle, circle));
+    // A blur reads about three sigma past a pixel.
+    assert_eq!(crop((0.0, 0.0), Rotated::No, 8.0 + 3.0 * 10.0), text(1156, 1996));
+}
+
+#[test]
+fn an_uncropped_hdr_picture_is_even_where_the_tone_map_reads_it() {
+    let hlg = ClipFx {
+        hdr: Some(Hdr::Hlg),
+        ..ClipFx::default()
+    };
+    let mut panned = clip(1.0);
+    panned.transform.pos_x = 0.3;
+    let c = chain_with(&panned, &format(Fit::Cover), &hlg);
+    assert!(
+        c.contains("scale=1080:1920:force_original_aspect_ratio=increase:force_divisible_by=2,crop=w='iw-4*floor("),
+        "{c}"
+    );
+    let mut zoomed = clip(1.5);
+    zoomed.transform.pos_x = 0.3;
+    let c = chain_with(&zoomed, &format(Fit::Cover), &hlg);
+    assert!(
+        c.contains(
+            "scale=w='max(2,2*trunc((1080*1.5)/2))':h='max(2,2*trunc((1920*1.5)/2))':force_original_aspect_ratio=increase:force_divisible_by=2,crop="
+        ),
+        "{c}"
+    );
+    let tone = c.find("zscale").or_else(|| c.find("colorspace")).unwrap();
+    assert!(c.find("floor(").unwrap() < tone, "{c}");
 }
 
 // ---- rendered (`#[ignore]`d: they drive the real ffmpeg) --------------------------------------------
@@ -283,6 +452,25 @@ fn picture_rows(frame: &[u8]) -> (u32, u32) {
     ((0..FH).find(|&y| lit(y)).unwrap(), (0..FH).rev().find(|&y| lit(y)).unwrap())
 }
 
+/// The scrubbed still of `tl` at `t`, at the delivery size, as raw rgb24.
+fn still_frame(tl: &Timeline, assets: &[Asset], t: f64) -> Vec<u8> {
+    let opts = ExportOptions {
+        resolution: Some((FW, FH)),
+        fps: Some(5.0),
+        ..ExportOptions::default()
+    };
+    let args = build_still_args(tl, assets, &opts, t, FW, None, &StillOutput::RgbPipe).unwrap();
+    let run = command(&ffmpeg_bin()).args(&args).stdin(Stdio::null()).output().unwrap();
+    assert!(
+        run.status.success(),
+        "{}\n{}",
+        args.join(" "),
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert_eq!(run.stdout.len(), (FW * FH * 3) as usize);
+    run.stdout
+}
+
 fn psnr(a: &[u8], b: &[u8]) -> f64 {
     let mse = a
         .iter()
@@ -330,7 +518,7 @@ fn a_zoom_in_under_contain_keeps_the_detail_the_fitted_picture_lost() {
     // 1080 columns, 104 rows down.
     let reference = first_frame(&tl, &assets, &dir, "reference", |_| {
         "color=c=black:s=1080x1920:r=5:d=1,format=yuv420p[vbase];\
-         [0:v]trim=start=0:end=0.4,setpts=PTS-STARTPTS,scale=3240:1709,crop=1080:1709:1080:0,\
+         [0:v]trim=start=0:end=0.4,setpts=PTS-STARTPTS,scale=3240:1709,crop=1080:1709:1080:0:exact=1,\
          setsar=1,fps=5,format=yuv420p[v0];[vbase][v0]overlay=x=0:y=104[outv]"
             .to_string()
     });
@@ -356,7 +544,107 @@ fn a_zoom_in_under_contain_keeps_the_detail_the_fitted_picture_lost() {
     assert!(lost < 0.3 * truth, "fitting first lost it: {lost} of {truth}");
     let (to_new, to_old) = (psnr(&new, &reference), psnr(&old, &reference));
     eprintln!("PSNR against the source scaled once: new {to_new:.1} dB, old {to_old:.1} dB");
-    assert!(to_new > 35.0, "{to_new}");
+    assert!(to_new > 45.0, "the source scaled once, to the pixel: {to_new}");
     assert!(to_new > to_old + 10.0, "well above the old path: {to_new} vs {to_old}");
+    // The scrubbed still of the same moment draws the same picture.
+    let still = still_frame(&tl, &assets, 0.1);
+    let to_still = psnr(&still, &new);
+    eprintln!("PSNR of the still against the export: {to_still:.1} dB");
+    assert!(to_still > 45.0, "the still is the export's frame: {to_still}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The columns (from, to) of the frame, in the rows `rows`, whose pixels are black: the bars a panned
+/// picture leaves where it does not reach.
+fn black_columns(frame: &[u8], rows: std::ops::Range<u32>) -> u32 {
+    (0..FW).filter(|&x| rows.clone().all(|y| luma(frame, x, y) < 12.0)).count() as u32
+}
+
+/// A 16:9 clip in a vertical frame under Cover, moved sideways: the picture goes on past the frame, so
+/// the frame shows more of it — where cropping to the frame first left a black bar of the move's width.
+/// With a zoom as well, the frame is a window of the source scaled once, and it is the window the
+/// position says (to the pixel: the same scale and crop done by hand).
+#[test]
+#[ignore = "needs the ffmpeg binary"]
+#[allow(clippy::print_stderr)]
+fn a_cover_clip_that_pans_shows_the_picture_past_the_frame_not_black() {
+    let dir = scratch("zoom-fit-cover");
+    let asset = fine(&dir);
+    let assets = vec![asset.clone()];
+    let cut = |scale: f64, pos: (f64, f64)| {
+        let mut c = make_clip(asset.id, 0.0, 0.4, 0.0);
+        c.transform.scale = scale;
+        c.transform.pos_x = pos.0;
+        c.transform.pos_y = pos.1;
+        let mut tl = single(vec![c]);
+        tl.format = Some(Delivery::new(FW, FH, Fit::Cover));
+        tl
+    };
+    // The picture by hand: the source scaled to `w`x`h` once, the window of the frame cut from it at
+    // (x, y), black where it does not reach (nowhere in these cases).
+    let by_hand = |w: u32, h: u32, x: u32, y: u32| {
+        format!(
+            "color=c=black:s=1080x1920:r=5:d=1,format=yuv420p[vbase];\
+             [0:v]trim=start=0:end=0.4,setpts=PTS-STARTPTS,scale={w}:{h},crop=1080:1920:{x}:{y},\
+             setsar=1,fps=5,format=yuv420p[v0];[vbase][v0]overlay=x=0:y=0[outv]"
+        )
+    };
+
+    // A move of 0.3 of the frame to the right, no zoom: the cover is 3641x1920, centred at -1280.5 and
+    // moved 324, so the frame's left edge is the picture's column 956.
+    let tl = cut(1.0, (0.3, 0.0));
+    let new = first_frame(&tl, &assets, &dir, "pan", |g| {
+        assert!(g.contains("force_original_aspect_ratio=increase,crop=w='iw-4*floor("), "{g}");
+        g.to_string()
+    });
+    let old = first_frame(&tl, &assets, &dir, "pan-old", |g| {
+        let at = g
+            .find("scale=1080:1920:force_original_aspect_ratio=increase,crop=w='")
+            .unwrap();
+        let to = g[at..].find(",setsar=1").unwrap() + at;
+        format!(
+            "{}scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920{}",
+            &g[..at],
+            &g[to..]
+        )
+    });
+    let truth = first_frame(&tl, &assets, &dir, "pan-reference", |_| by_hand(3641, 1920, 956, 0));
+    let (black_new, black_old) = (black_columns(&new, 0..FH), black_columns(&old, 0..FH));
+    eprintln!("black columns: {black_new} (picture across the frame), {black_old} (cropped to the frame first)");
+    assert_eq!(black_new, 0, "the picture is there to the edge");
+    assert!(black_old >= 320, "the bug: a bar as wide as the move: {black_old}");
+    let (to_new, to_old) = (psnr(&new, &truth), psnr(&old, &truth));
+    eprintln!("PSNR against the picture by hand: new {to_new:.1} dB, old {to_old:.1} dB");
+    assert!(to_new > 45.0 && to_new > to_old + 10.0, "{to_new} vs {to_old}");
+
+    let first_pan = new;
+
+    // Zoomed 2x and moved right and up: the cover of the frame times 2 is 7282x3840 (centred, then moved
+    // 216 right and 192 up), cut to the window the move leaves at (2886, 1152).
+    let tl = cut(2.0, (0.2, -0.1));
+    let new = first_frame(&tl, &assets, &dir, "zoom-pan", str::to_string);
+    let truth = first_frame(&tl, &assets, &dir, "zoom-pan-reference", |_| by_hand(7282, 3840, 2886, 1152));
+    let old = first_frame(&tl, &assets, &dir, "zoom-pan-old", |g| {
+        let at = g
+            .find("scale=1080*2:1920*2:force_original_aspect_ratio=increase,crop=w='")
+            .unwrap();
+        let to = g[at..].find(",setsar=1").unwrap() + at;
+        format!(
+            "{}scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,scale=iw*2:ih*2{}",
+            &g[..at],
+            &g[to..]
+        )
+    });
+    let (to_new, to_old) = (psnr(&new, &truth), psnr(&old, &truth));
+    eprintln!("zoomed and moved: PSNR against the picture by hand: new {to_new:.1} dB, old {to_old:.1} dB");
+    assert_eq!(black_columns(&new, 0..FH), 0);
+    assert!(to_new > 45.0 && to_new > to_old + 10.0, "{to_new} vs {to_old}");
+    // The scrubbed still of the same moment, for both poses, is the export's frame.
+    for (tag, scale, pos, export) in [("pan", 1.0, (0.3, 0.0), &first_pan), ("zoom and pan", 2.0, (0.2, -0.1), &new)] {
+        let still = still_frame(&cut(scale, pos), &assets, 0.1);
+        let to_export = psnr(&still, export);
+        eprintln!("PSNR of the still against the export, {tag}: {to_export:.1} dB");
+        assert!(to_export > 45.0, "{tag}: the still is the export's frame: {to_export}");
+    }
     let _ = std::fs::remove_dir_all(&dir);
 }

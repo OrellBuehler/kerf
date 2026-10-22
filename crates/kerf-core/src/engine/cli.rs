@@ -7523,6 +7523,7 @@ fn build_filter_complex_with(
                     &fx[*flat],
                     is_image(clip),
                     plan.stamps.get(*flat).copied().flatten(),
+                    picture_of(clip),
                     &format!("{instances}c{flat}")
                 )
             ));
@@ -8108,9 +8109,10 @@ fn zoom_scale(factor: &str, keyed: bool, tiny: bool, even: bool, sf: &str) -> St
 }
 
 /// The one `scale` that fits a picture to a `w`x`h` frame and zooms it by `factor` in the same
-/// resample ([`FitOrder::Folded`], with `decrease`): the frame times the zoom is the box the
-/// aspect-preserving fit is made in, so the picture is taken from the source once instead of
-/// being fitted to the frame and the fitted picture enlarged. A zoom of 1 is the frame's own box.
+/// resample ([`FitOrder::Folded`] with `decrease`, [`FitOrder::Uncropped`] with `increase`): the
+/// frame times the zoom is the box the aspect-preserving fit is made in, so the picture is taken
+/// from the source once instead of being fitted to the frame and the fitted picture enlarged. A
+/// zoom of 1 is the frame's own box.
 ///
 /// `tone_mapped` (a `zscale` follows, which refuses an odd size in 4:2:0) rounds the box and the
 /// result to even sizes, and a zoom under [`TINY_SCALE`] keeps the box at a pixel or more, as
@@ -8133,6 +8135,49 @@ fn fit_scale(w: u32, h: u32, factor: f64, aspect: &str, tone_mapped: bool, sf: &
     } else {
         format!("scale={bw}:{bh}:force_original_aspect_ratio={aspect}{even}{sf}")
     }
+}
+
+/// The `crop` that keeps an [`FitOrder::Uncropped`] picture — the cover of the frame times the
+/// zoom, which can be several frames wide — to what any frame of the clip can show, so the
+/// overlay is not handed a needlessly large picture (pure).
+///
+/// The window is **centred on the picture**, so the overlay's own `(W-w)/2` still puts the picture's
+/// centre where it would have put the whole one, and it is cut in steps of four pixels
+/// (`iw - 4q`), so an even picture stays even and each side loses an even amount, which the
+/// overlay's rounding down to even then leaves alone. Its half-extent is how far the canvas
+/// reaches from the picture's centre: half the frame plus the furthest the picture is ever moved
+/// (`pan`: the position's greatest value and a slide or push's travel, in frame fractions), turned
+/// with the picture (`rotation`: the angle of a static one, the circle round the frame when the
+/// rotation is keyed) and given `margin` pixels for what reads past the edge of the window (a
+/// blur). Where the picture is smaller than that, it is not cut at all.
+fn bound_crop(frame: (u32, u32), pan: (f64, f64), rotation: Rotated, margin: f64) -> String {
+    let ax = f64::from(frame.0) * (0.5 + pan.0);
+    let ay = f64::from(frame.1) * (0.5 + pan.1);
+    let (wx, wy) = match rotation {
+        Rotated::No => (ax, ay),
+        Rotated::By(angle) => (
+            ax * angle.cos().abs() + ay * angle.sin().abs(),
+            ax * angle.sin().abs() + ay * angle.cos().abs(),
+        ),
+        Rotated::Keyed => (ax.hypot(ay), ax.hypot(ay)),
+    };
+    // (A turn of exactly 90 degrees leaves a cosine of 1e-16; the epsilon keeps it from costing a pixel.)
+    let need = |half: f64| (2.0 * half + 2.0 * margin - 1e-6).ceil().clamp(2.0, 1e9) as u64;
+    format!(
+        "crop=w='iw-4*floor(max(0,iw-{nw})/4)':h='ih-4*floor(max(0,ih-{nh})/4)'",
+        nw = need(wx),
+        nh = need(wy)
+    )
+}
+
+/// How an [`FitOrder::Uncropped`] clip turns its picture, for [`bound_crop`].
+#[derive(Clone, Copy)]
+enum Rotated {
+    No,
+    /// A static rotation, in radians.
+    By(f64),
+    /// A keyed rotation that turns the picture: any angle.
+    Keyed,
 }
 
 /// Polyline points above which [`keyframe_expr`] writes a balanced tree instead of a chain.
@@ -8925,18 +8970,35 @@ fn picture_size(asset: Option<&Asset>) -> Option<(u32, u32)> {
 /// passes Contain for a clip that does not take it ([`takes_blur_fill`]).
 #[cfg(test)]
 fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool, instance: &str) -> String {
-    video_clip_chain_stamped(clip, fmt, fx, is_image, None, instance)
+    video_clip_chain_stamped(clip, fmt, fx, is_image, None, None, instance)
+}
+
+/// [`video_clip_chain`] for a picture of a known size (`None`: not known, which a Cover clip's
+/// chain reads as "the cover may hang over the frame").
+#[cfg(test)]
+fn video_clip_chain_of(
+    clip: &Clip,
+    fmt: &ExportFormat,
+    fx: &ClipFx,
+    is_image: bool,
+    picture: Option<(u32, u32)>,
+    instance: &str,
+) -> String {
+    video_clip_chain_stamped(clip, fmt, fx, is_image, None, picture, instance)
 }
 
 /// [`video_clip_chain`] for a clip whose input may be a title's pictures: `stamp` puts them on the
 /// canvas' grid in place of the `trim` and `setpts` a decoded clip starts with (they are drawn for
-/// exactly the frames the clip is on, tail included); everything after is the same chain.
+/// exactly the frames the clip is on, tail included); everything after is the same chain. `picture`
+/// is the displayed size of the clip's footage ([`picture_size`]) when it is known: under `Cover`
+/// it decides whether the cover of the frame has anything past the frame to show.
 fn video_clip_chain_stamped(
     clip: &Clip,
     fmt: &ExportFormat,
     fx: &ClipFx,
     is_image: bool,
     stamp: Option<svg_layer::ClipStamp>,
+    picture: Option<(u32, u32)>,
     instance: &str,
 ) -> String {
     let s = clip.speed_mag();
@@ -9080,7 +9142,16 @@ fn video_clip_chain_stamped(
     // the overlay (not padded full-frame), and its zoom is re-evaluated per frame.
     let geom_identity = t.is_identity() && !anim;
     // Whether the clip's zoom is part of the fit (one resample from the source), or follows it.
-    let order = clip.fit_order(fmt.fit);
+    // A reprojected picture and a title's pictures come out at the frame's own size: nothing hangs over it.
+    let picture = if reframe.is_some() || stamp.is_some() {
+        Some((fmt.width, fmt.height))
+    } else {
+        picture
+    };
+    let order = clip.fit_order(
+        fmt.fit,
+        crate::layer_geometry::cover_overflows(picture, (fmt.width, fmt.height), t),
+    );
     let held = clip.held_scale().unwrap_or(1.0);
     match fmt.fit {
         // The whole picture over a blurred copy of itself that covers the frame: a
@@ -9097,6 +9168,41 @@ fn video_clip_chain_stamped(
         // in, so it is taken from the source once rather than fitted to the frame and enlarged.
         Fit::Contain | Fit::Blur if order == FitOrder::Folded => {
             p.push(fit_scale(fmt.width, fmt.height, held, "decrease", tone_mapped, &sf));
+        }
+        // Fill the frame times the zoom and keep all of it: the overlay cuts what hangs over the
+        // canvas, so a position pans across the picture (cropped to the frame first, there is
+        // nothing past it to pan to). What no frame of the clip can show is cut here, round the
+        // centre, so the overlay is not handed the whole cover of a wide shot in a tall frame.
+        Fit::Cover if order == FitOrder::Uncropped => {
+            p.push(fit_scale(fmt.width, fmt.height, held, "increase", tone_mapped, &sf));
+            let rotation = if anim_rotation {
+                Rotated::Keyed
+            } else if !rotation_keyed && t.rotation != 0.0 {
+                Rotated::By(t.rotation.to_radians())
+            } else {
+                Rotated::No
+            };
+            let (mut px, mut py) = clip.pan_extent();
+            if let Some(travel) = timing.motion_keys() {
+                let reach = |pts: &[(f64, f64)]| pts.iter().fold(0.0_f64, |m, p| m.max(p.1.abs()));
+                px += reach(&travel.x);
+                py += reach(&travel.y);
+            }
+            // A blur reads about three sigma past a pixel, so the window keeps that much margin.
+            let sigma = clip
+                .effects
+                .iter()
+                .filter_map(|e| match e {
+                    VideoEffect::Blur { sigma } if sigma.is_finite() => Some(sigma.clamp(0.0, 4096.0)),
+                    _ => None,
+                })
+                .fold(0.0_f64, f64::max);
+            p.push(bound_crop(
+                (fmt.width, fmt.height),
+                (px, py),
+                rotation,
+                8.0 + (3.0 * sigma).ceil(),
+            ));
         }
         // Fit inside the frame; the identity case then pads out to full size so
         // the overlay lands on a complete canvas.
@@ -9914,7 +10020,19 @@ fn build_still_args_rendered(
                     )
                 }),
                 clip.zoom_animated(),
-                clip.fit_order(fmt.fit),
+                clip.fit_order(
+                    fmt.fit,
+                    // (Judged at the delivery frame, as the export judges it, not at the preview's size.)
+                    crate::layer_geometry::cover_overflows(
+                        if rf.is_some() {
+                            Some((fmt.width, fmt.height))
+                        } else {
+                            picture_size(asset_of(clip.asset_id))
+                        },
+                        (fmt.width, fmt.height),
+                        &tf,
+                    ),
+                ),
                 &layer.fades,
                 layer.label_bt709,
                 (fmt.fit == Fit::Blur
@@ -10069,6 +10187,12 @@ fn still_clip_chain_graded(
             p.push(fit_scale(ow, oh, tf.scale, "decrease", false, sf));
         }
         Fit::Contain | Fit::Blur => p.push(format!("scale={ow}:{oh}:force_original_aspect_ratio=decrease{sf}")),
+        // The cover of the frame times the zoom, whole: the overlay cuts what hangs over the canvas, as
+        // the export's does. (It does not bound the picture with the export's centred `crop`; one frame
+        // is cheap, and the crop shows nothing the canvas does not.)
+        Fit::Cover if order == FitOrder::Uncropped => {
+            p.push(fit_scale(ow, oh, tf.scale, "increase", false, sf));
+        }
         Fit::Cover => {
             p.push(format!("scale={ow}:{oh}:force_original_aspect_ratio=increase{sf}"));
             p.push(format!("crop={ow}:{oh}"));
@@ -10141,8 +10265,14 @@ fn still_clip_chain(
     label_bt709: bool,
 ) -> String {
     // The order a clip with this pose and no keys has (`Clip::fit_order`).
+    let picture_relative = mask.is_some() || effects.iter().any(|e| matches!(e, VideoEffect::Vignette));
     let order = match canvas.fit {
         Fit::Contain | Fit::Blur if !zoom_last && tf.scale > 1.0 + 1e-9 => FitOrder::Folded,
+        Fit::Cover
+            if !zoom_last && !picture_relative && ((tf.scale - 1.0).abs() > 1e-9 || tf.pos_x != 0.0 || tf.pos_y != 0.0) =>
+        {
+            FitOrder::Uncropped
+        }
         _ => FitOrder::Fitted,
     };
     still_clip_chain_graded(
@@ -13434,12 +13564,22 @@ mod tests {
             hdr.find("force_divisible_by").unwrap() < tone && hdr.find("trunc(").unwrap() < tone,
             "{hdr}"
         );
-        // Cover crops to the (even) frame; its intermediate size never reaches `zscale`.
+        // Cover crops the plain fit to the (even) frame; its intermediate size never reaches `zscale`.
         let cover = ExportFormat {
             fit: Fit::Cover,
             ..ExportFormat::default()
         };
-        assert!(!video_clip_chain(&clip, &cover, &hlg, false, "c0").contains("force_divisible_by"));
+        let plain = make_clip(asset.id, 0.0, 4.0, 0.0);
+        assert!(!video_clip_chain(&plain, &cover, &hlg, false, "c0").contains("force_divisible_by"));
+        // ... but a Cover clip that zooms is not cropped ahead of the tone-map: the cover of the frame
+        // times the zoom reaches it, so that is made even (rounded up, as `increase` rounds).
+        let zoomed = video_clip_chain(&clip, &cover, &hlg, false, "c0");
+        assert!(
+            zoomed.contains(
+                "scale=w='max(2,2*trunc((1920*0.45)/2))':h='max(2,2*trunc((1080*0.45)/2))':force_original_aspect_ratio=increase:force_divisible_by=2"
+            ),
+            "{zoomed}"
+        );
         // A moving zoom is the last stage, after the tone-map: its sizes are not made even.
         clip.keyframes = vec![key(0.0, 0.3, 0.0, 0.0, 1.0), key(2.0, 1.6, 0.0, 0.0, 1.0)];
         let moving = video_clip_chain(&clip, &fmt, &hlg, false, "c0");

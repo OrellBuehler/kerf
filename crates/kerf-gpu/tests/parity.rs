@@ -1326,15 +1326,28 @@ fn two_overlapping_tracks() {
         ..Transform::default()
     };
     let tl = timeline(
-        vec![vec![clip(&m.gradient, 0.0, 2.0, 0.0)], vec![pip]],
-        Some(Delivery::new(360, 640, Fit::Cover)),
+        vec![vec![clip(&m.gradient, 0.0, 2.0, 0.0)], vec![pip.clone()]],
+        Some(Delivery::new(360, 640, Fit::Contain)),
     );
     check(
-        "pip/cover-then-scale",
+        "pip/contain-then-scale",
         &tl,
         &[m.gradient.clone(), m.testsrc.clone()],
         &[0.5],
         STRICT,
+    );
+    // Under Cover the same picture-in-picture is the cover of the frame times 0.6, in one resample, cut by
+    // the canvas: the plan refuses it (`FoldedFit`) and FFmpeg draws it.
+    let tl = timeline(
+        vec![vec![clip(&m.gradient, 0.0, 2.0, 0.0)], vec![pip]],
+        Some(Delivery::new(360, 640, Fit::Cover)),
+    );
+    check_refused(
+        "pip/cover-then-scale",
+        &tl,
+        &[m.gradient.clone(), m.testsrc.clone()],
+        0.5,
+        Refusal::Plan("one resample"),
     );
 }
 
@@ -3241,6 +3254,12 @@ fn crop_rounds_to_the_native_chroma_grid_and_pad_and_cover_to_the_420_one() {
                     differs_here, expect_differs,
                     "{case}: the case does not exercise what it says"
                 );
+            }
+            // A Cover clip that zooms is scaled to cover the frame times the zoom in one resample and cut
+            // by the canvas (no crop to the frame first): FFmpeg's, whatever the picture.
+            if *fit == Fit::Cover && tf.scale != 1.0 {
+                check_refused(&case, &tl, &assets, 0.5, Refusal::Plan("one resample"));
+                continue;
             }
             // A picture that is not 4:2:0 or gray is FFmpeg's whenever it is resized (and
             // every crop frame here resizes it), and also — said first — when its crop
