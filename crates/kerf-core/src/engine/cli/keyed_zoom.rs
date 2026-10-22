@@ -29,7 +29,7 @@ use std::process::Stdio;
 use super::*;
 use crate::clip_timing::ffmpeg_frame_time;
 use crate::engine::test_support::{image_stream, make_clip, test_asset, timeline_of, video_stream, video_track, StatusBounded};
-use crate::model::{Asset, Clip, Easing, Keyframe, Mask, MaskShape, Transition, TransitionKind, VideoEffect};
+use crate::model::{Asset, Clip, Easing, FitOrder, Keyframe, Mask, MaskShape, Transition, TransitionKind, VideoEffect};
 
 /// The export frame.
 const CW: u32 = 320;
@@ -401,9 +401,10 @@ struct Expected {
     opacity: f64,
 }
 
-/// The geometry of `clip` at `local` seconds, from `Clip::transform_at` alone: crop the
-/// source, fit it into the frame, zoom it about its centre, cut it with the mask,
-/// rotate it about its centre, put that centre at the frame's centre plus the offset.
+/// The geometry of `clip` at `local` seconds, from `Clip::transform_at` alone (and the order
+/// `Clip::fit_order` fits and zooms in): crop the source, fit it into the frame, zoom it about its
+/// centre, cut it with the mask, rotate it about its centre, put that centre at the frame's centre
+/// plus the offset.
 fn expected(clip: &Clip, local: f64, fit: Fit, clear_left: bool) -> Expected {
     let tf = clip.transform_at(local);
     let (sw, sh) = (f64::from(SW), f64::from(SH));
@@ -419,9 +420,14 @@ fn expected(clip: &Clip, local: f64, fit: Fit, clear_left: bool) -> Expected {
         Fit::Contain | Fit::Blur => (cw / kw).min(ch / kh),
         Fit::Cover => (cw / kw).max(ch / kh),
     };
-    // `Cover` cuts the overshoot before the zoom, so the picture is the frame, zoomed.
+    // `Cover` cuts the overshoot before the zoom, so the picture is the frame, zoomed, unless the
+    // clip's zoom is part of the fit (`FitOrder::Uncropped`: a static zoom or a position over a
+    // cover that hangs over the frame): then the whole cover is zoomed and the canvas cuts it.
+    let uncropped = fit == Fit::Cover
+        && clip.fit_order(fit, crate::layer_geometry::cover_overflows(Some((SW, SH)), (CW, CH), &tf)) == FitOrder::Uncropped;
     let (pw, ph) = match fit {
         Fit::Contain | Fit::Blur => (kw * fit_k * tf.scale, kh * fit_k * tf.scale),
+        Fit::Cover if uncropped => (kw * fit_k * tf.scale, kh * fit_k * tf.scale),
         Fit::Cover => (cw * tf.scale, ch * tf.scale),
     };
     let k = fit_k * tf.scale;
@@ -506,6 +512,32 @@ fn expected(clip: &Clip, local: f64, fit: Fit, clear_left: bool) -> Expected {
         blue: (!nothing(blue)).then(|| place(blue)).flatten(),
         opacity: tf.opacity,
     }
+}
+
+/// Where `expected` puts a Cover clip held at 0.8 and moved 0.1 right, cut from 4:3 footage in the
+/// 16:9 frame: the whole cover zoomed (256x192 about the centre, cut by the frame at the top and
+/// bottom), which is what `Clip::fit_order` makes of it, and not the cropped frame zoomed. A moving
+/// zoom keeps the order it always had.
+#[test]
+fn the_expected_picture_of_a_zoomed_out_cover_clip_follows_its_fit_order() {
+    let rect = |x0, y0, x1, y1| Rect { x0, y0, x1, y1 };
+    let mut clip = make_clip(uuid::Uuid::new_v4(), 0.0, 2.0, 0.0);
+    clip.transform.scale = 0.8;
+    clip.transform.pos_x = 0.1;
+    let whole = expected(&clip, 0.5, Fit::Cover, true).picture.expect("on the frame");
+    assert!(whole.off_by(rect(192.0, 0.0, 320.0, 180.0)) < 0.01, "{whole:?}");
+    let key = |time, scale| Keyframe {
+        time,
+        scale,
+        pos_x: 0.1,
+        pos_y: 0.0,
+        rotation: 0.0,
+        opacity: 1.0,
+        easing: Default::default(),
+    };
+    clip.keyframes = vec![key(0.0, 0.8), key(1.0, 1.2)];
+    let cropped = expected(&clip, 0.0, Fit::Cover, true).picture.expect("on the frame");
+    assert!(cropped.off_by(rect(192.0, 18.0, 320.0, 162.0)) < 0.01, "{cropped:?}");
 }
 
 // ---- a case -----------------------------------------------------------------

@@ -1326,15 +1326,28 @@ fn two_overlapping_tracks() {
         ..Transform::default()
     };
     let tl = timeline(
-        vec![vec![clip(&m.gradient, 0.0, 2.0, 0.0)], vec![pip]],
-        Some(Delivery::new(360, 640, Fit::Cover)),
+        vec![vec![clip(&m.gradient, 0.0, 2.0, 0.0)], vec![pip.clone()]],
+        Some(Delivery::new(360, 640, Fit::Contain)),
     );
     check(
-        "pip/cover-then-scale",
+        "pip/contain-then-scale",
         &tl,
         &[m.gradient.clone(), m.testsrc.clone()],
         &[0.5],
         STRICT,
+    );
+    // Under Cover the same picture-in-picture is the cover of the frame times 0.6, in one resample, cut by
+    // the canvas: the plan refuses it (`FoldedFit`) and FFmpeg draws it.
+    let tl = timeline(
+        vec![vec![clip(&m.gradient, 0.0, 2.0, 0.0)], vec![pip]],
+        Some(Delivery::new(360, 640, Fit::Cover)),
+    );
+    check_refused(
+        "pip/cover-then-scale",
+        &tl,
+        &[m.gradient.clone(), m.testsrc.clone()],
+        0.5,
+        Refusal::Plan("one resample"),
     );
 }
 
@@ -1440,7 +1453,31 @@ fn odd_sizes_and_layers_that_leave_the_canvas() {
         &[0.5],
         ROTATED,
     );
-    // Zoomed past the frame and panned: the layer starts left of the canvas.
+    // Moved so far that the layer starts left of the canvas and above it.
+    let tl = timeline(
+        vec![
+            vec![base.clone()],
+            vec![over(
+                Transform {
+                    pos_x: -0.3,
+                    pos_y: -0.2,
+                    ..Transform::default()
+                },
+                &m.testsrc,
+            )],
+        ],
+        None,
+    );
+    check(
+        "geometry/pan-off-canvas",
+        &tl,
+        &[m.gradient.clone(), m.testsrc.clone()],
+        &[0.5],
+        STRICT,
+    );
+    // Zoomed in past the frame and panned: FFmpeg takes the picture from the source in one resample
+    // (to the fit of the frame times the zoom), where the compositor fits it to the frame and scales
+    // that, so the plan refuses it (`FoldedFit`) and FFmpeg draws the frame.
     let tl = timeline(
         vec![
             vec![base.clone()],
@@ -1456,12 +1493,12 @@ fn odd_sizes_and_layers_that_leave_the_canvas() {
         ],
         None,
     );
-    check(
+    check_refused(
         "geometry/zoom-off-canvas",
         &tl,
         &[m.gradient.clone(), m.testsrc.clone()],
-        &[0.5],
-        STRICT,
+        0.5,
+        Refusal::Plan("one resample"),
     );
     // Entirely off the canvas: nothing to draw, the base shows.
     let tl = timeline(
@@ -3218,6 +3255,12 @@ fn crop_rounds_to_the_native_chroma_grid_and_pad_and_cover_to_the_420_one() {
                     "{case}: the case does not exercise what it says"
                 );
             }
+            // A Cover clip that zooms is scaled to cover the frame times the zoom in one resample and cut
+            // by the canvas (no crop to the frame first): FFmpeg's, whatever the picture.
+            if *fit == Fit::Cover && tf.scale != 1.0 {
+                check_refused(&case, &tl, &assets, 0.5, Refusal::Plan("one resample"));
+                continue;
+            }
             // A picture that is not 4:2:0 or gray is FFmpeg's whenever it is resized (and
             // every crop frame here resizes it), and also — said first — when its crop
             // lands between two 4:2:0 chroma samples: luma is exact and chroma is not.
@@ -3525,13 +3568,27 @@ fn resizing_a_picture_ffmpeg_scales_in_another_format_is_refused() {
         ("yuvj420p-jpeg", &m.jpeg),
     ] {
         let assets = std::slice::from_ref(a);
-        check(
-            &format!("enlarge-ok/{name}-x1.5"),
-            &scaled(a, 1.5, None),
-            assets,
-            &[0.5],
-            STRICT,
-        );
+        // A zoom in of footage under Contain: FFmpeg takes it from the source in one resample, where
+        // the compositor fits and then scales, so the plan refuses it (`FoldedFit`) and FFmpeg draws
+        // it. A still's `duration` is 0, so its clip here has no length and the frame is empty: there
+        // is nothing to refuse.
+        if a.is_image() {
+            check(
+                &format!("enlarge-ok/{name}-x1.5"),
+                &scaled(a, 1.5, None),
+                assets,
+                &[0.5],
+                STRICT,
+            );
+        } else {
+            check_refused(
+                &format!("enlarge-ok/{name}-x1.5"),
+                &scaled(a, 1.5, None),
+                assets,
+                0.5,
+                Refusal::Plan("one resample"),
+            );
+        }
         check(
             &format!("enlarge-ok/{name}-fit-to-960x540"),
             &scaled(a, 1.0, Some(Delivery::new(960, 540, Fit::Contain))),

@@ -61,7 +61,9 @@
   is `temperature_gammas`' exactly); a transform number *without* one reads the bundle's keys as stored;
   anything else is its static value. `property_curve` (the eased polyline), `property_at`, `transform_at`,
   `color_at`, `volume_at`, `is_animated` / `color_animated` / `volume_animated` / `zoom_animated` are all
-  views of it, so the still, the preview, the plan and the export cannot disagree. **Nothing is converted
+  views of it (and `held_scale`, `pan_extent` and `fit_order`, which decides whether the chain fits the picture to the frame and
+  then zooms it, or takes the zoom in the fit's own `scale`: `engine-cli.md`), so the still, the preview, the plan and the export
+  cannot disagree. **Nothing is converted
   behind anyone's back, and an old project renders the graph it always did** (the golden digests of the
   first 4800 cases are untouched): the bundle is not migrated on load and not on write — the first
   per-property write *detaches* just that number (`channel_mut` copies its bundle keys into a track, the

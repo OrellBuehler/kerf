@@ -1518,7 +1518,7 @@ fn transitions(c: &Case, assets: &[Asset]) -> Vec<String> {
 }
 
 /// The families that come from the case's structure rather than from argv text.
-const STRUCTURAL: [&str; 38] = [
+const STRUCTURAL: [&str; 44] = [
     "muted-track",
     "solo-track",
     "disabled-clip",
@@ -1557,6 +1557,12 @@ const STRUCTURAL: [&str; 38] = [
     "bt709-mix",
     "still-bt709-mix",
     "preview-bt709-mix",
+    "zoom-folded",
+    "preview-zoom-folded",
+    "still-zoom-folded",
+    "cover-uncropped",
+    "preview-cover-uncropped",
+    "still-cover-uncropped",
 ];
 
 fn expected(table: &[(&str, &str)]) -> Vec<String> {
@@ -1586,13 +1592,20 @@ fn still_zoom_last(still: &str) -> bool {
     })
 }
 
-/// Splits `s` at the commas outside single quotes (an expression's own commas are quoted).
-fn filters(s: &str) -> Vec<&str> {
-    let (mut out, mut quoted, mut from) = (Vec::new(), false, 0);
+/// Splits `s` at the `sep`s outside single quotes (an expression's own commas, and the semicolons of a
+/// keyed mask's statements, are quoted). A backslash escapes the character after it **outside** quotes,
+/// as the filtergraph parser reads it (inside them it is a backslash: `'It\'\''s'` is one quoted
+/// piece, an escaped apostrophe, another quoted piece).
+fn split_unquoted(s: &str, sep: char) -> Vec<&str> {
+    let (mut out, mut quoted, mut escaped, mut from) = (Vec::new(), false, false, 0);
     for (i, c) in s.char_indices() {
+        if std::mem::take(&mut escaped) {
+            continue;
+        }
         match c {
+            '\\' if !quoted => escaped = true,
             '\'' => quoted = !quoted,
-            ',' if !quoted => {
+            c if c == sep && !quoted => {
                 out.push(&s[from..i]);
                 from = i + 1;
             }
@@ -1601,6 +1614,11 @@ fn filters(s: &str) -> Vec<&str> {
     }
     out.push(&s[from..]);
     out
+}
+
+/// Splits `s` at the commas outside single quotes (an expression's own commas are quoted).
+fn filters(s: &str) -> Vec<&str> {
+    split_unquoted(s, ',')
 }
 
 /// How the clip chains of an export or preview graph end: `(zoom last, alpha kept)`. A chain
@@ -1627,6 +1645,48 @@ fn chain_tails(graph: &str) -> (bool, bool) {
         }
     }
     (zoom, alpha)
+}
+
+/// Whether a clip chain of a graph holds a zoom in folded into the fit: the fit's own `scale`
+/// with a product for its box (`scale=<W>*<S>:<H>*<S>:force_original_aspect_ratio=decrease`), where
+/// the plain fit's box is the frame's own numbers and a zoom after it reads `iw` and `ih`.
+fn zoom_folded(graph: &str) -> bool {
+    split_unquoted(graph, ';').into_iter().any(|segment| {
+        let Some((head, _)) = segment.trim_end().rsplit_once('[') else {
+            return false;
+        };
+        filters(head).iter().any(|filter| {
+            let Some(args) = filter.split_once("scale=").map(|(_, a)| a) else {
+                return false;
+            };
+            let boxed = args.starts_with("w='") || args.split(':').next().is_some_and(|b| b.contains('*'));
+            boxed && !args.contains("iw") && args.contains("force_original_aspect_ratio=decrease")
+        })
+    })
+}
+
+/// Whether a clip chain of a graph holds a Cover clip that is not cropped to the frame: a `scale` to
+/// cover (`force_original_aspect_ratio=increase`) that the plain Cover fit would follow with
+/// `crop=<W>:<H>`, followed instead by the export's centred `crop=w='iw-4*floor(` (`bounded`) or, in a
+/// still, by nothing of the kind.
+fn cover_uncropped(graph: &str, bounded: bool) -> bool {
+    split_unquoted(graph, ';').into_iter().any(|segment| {
+        let Some((head, _)) = segment.trim_end().rsplit_once('[') else {
+            return false;
+        };
+        let f = filters(head);
+        f.iter().enumerate().any(|(i, filter)| {
+            filter.contains("scale=")
+                && filter.contains("force_original_aspect_ratio=increase")
+                && f.get(i + 1).is_some_and(|next| {
+                    if bounded {
+                        next.starts_with("crop=w='iw-4*floor(")
+                    } else {
+                        !next.starts_with("crop=")
+                    }
+                })
+        })
+    })
 }
 
 /// The families a case hits: its transition branches, the table entries whose text is
@@ -1816,6 +1876,12 @@ fn families(c: &Case, assets: &[Asset], text: &[String; 3], table: &[(&str, &str
         (still_transitions.1, "still-travel"),
         (chain_tails(&flat[0]).0, "zoom-keyed-last"),
         (chain_tails(&flat[2]).0, "preview-zoom-keyed-last"),
+        (zoom_folded(&flat[0]), "zoom-folded"),
+        (zoom_folded(&flat[2]), "preview-zoom-folded"),
+        (zoom_folded(&flat[1]), "still-zoom-folded"),
+        (cover_uncropped(&flat[0], true), "cover-uncropped"),
+        (cover_uncropped(&flat[2], true), "preview-cover-uncropped"),
+        (cover_uncropped(&flat[1], false), "still-cover-uncropped"),
         (chain_tails(&flat[0]).1, "alpha-kept"),
         (chain_tails(&flat[2]).1, "preview-alpha-kept"),
         (

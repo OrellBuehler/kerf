@@ -309,6 +309,10 @@ pub enum Unsupported {
     /// order (the detail says what): FFmpeg applies those to the picture at its fit size and
     /// magnifies the result.
     ZoomBehind(LayerRef, &'static str),
+    /// The picture is taken from the source in **one** resample to the frame times the clip's zoom
+    /// (the detail says which case: [`crate::model::FitOrder`]), where the compositor fits the
+    /// picture to the frame and scales that in a second stage.
+    FoldedFit(LayerRef, &'static str),
     /// A text overlay is live.
     Text,
     /// A live text overlay names no font file the compositor can draw with (the shipped default font
@@ -378,6 +382,7 @@ impl Unsupported {
             Self::KeyedCrop(_) => "keyed_crop",
             Self::KeyedZoom(_) => "keyed_zoom",
             Self::ZoomBehind(..) => "zoom_behind",
+            Self::FoldedFit(..) => "folded_fit",
             Self::Text => "text",
             Self::TextWithoutFont => "text_without_font",
             Self::TextBorder => "text_border",
@@ -480,6 +485,10 @@ impl fmt::Display for Unsupported {
             Self::ZoomBehind(l, what) => write!(
                 f,
                 "{l}: a moving zoom with {what} ahead of it (FFmpeg applies it at the fit size and magnifies the result)"
+            ),
+            Self::FoldedFit(l, what) => write!(
+                f,
+                "{l}: {what} (FFmpeg takes the picture from the source in one resample, to the frame times the zoom; the compositor fits it to the frame and scales that)"
             ),
             Self::Text => f.write_str("a text overlay is live"),
             Self::TextWithoutFont => f.write_str("a text overlay names no font file to draw with"),

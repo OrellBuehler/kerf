@@ -240,6 +240,27 @@ fn rotated_box(iw: u32, ih: u32, angle: f64) -> (u32, u32) {
     (((w + 0.5) as u32).max(1), ((h + 0.5) as u32).max(1))
 }
 
+/// Whether the cover of the `frame` — the picture `src` (cropped by `tf`'s crop) scaled to fill it —
+/// hangs over the frame by more than rounding: the picture has more to show than the frame holds,
+/// which a zoom out or a move can reveal. A picture of the frame's own shape does not (its cover is the
+/// frame, give or take a pixel), and neither does one whose size is not known (`None`) or whose crop
+/// leaves nothing: those answer `true`, which is the cautious answer ([`crate::model::Clip::fit_order`]).
+pub fn cover_overflows(src: Option<(u32, u32)>, frame: (u32, u32), tf: &Transform) -> bool {
+    let Some((iw, ih)) = src else {
+        return true;
+    };
+    let (ow, oh) = (i64::from(frame.0), i64::from(frame.1));
+    let Ok(win) = crop_window(iw, ih, tf, Subsampling::YUV420) else {
+        return true;
+    };
+    if win.w == 0 || win.h == 0 || ow == 0 || oh == 0 {
+        return true;
+    }
+    let fw = av_rescale(oh, i64::from(win.w), i64::from(win.h)).max(ow);
+    let fh = av_rescale(ow, i64::from(win.h), i64::from(win.w)).max(oh);
+    fw >= ow + 2 || fh >= oh + 2
+}
+
 impl LayerGeometry {
     /// [`LayerGeometry::resolve`] for a picture whose native chroma grid is not
     /// known — a format that was never recorded, or one whose rounding was not
@@ -1017,6 +1038,43 @@ mod tests {
         let zoomed = Transform { scale: 1.5, ..t() };
         assert_eq!(place(&zoomed, nothing_but_the_position).stages.len(), 2);
         assert_eq!(place(&t(), keyed(false, (0.0, 0.0))).stages.len(), 2);
+    }
+
+    #[test]
+    fn the_cover_of_a_frame_hangs_over_it_only_where_the_picture_is_another_shape() {
+        let tf = t();
+        // A picture of the frame's own shape, at any size, and one a pixel off it from rounding.
+        assert!(!cover_overflows(Some((640, 360)), (640, 360), &tf));
+        assert!(!cover_overflows(Some((4096, 2160)), (1920, 1012), &tf));
+        assert!(!cover_overflows(Some((1001, 563)), (1920, 1080), &tf));
+        assert!(!cover_overflows(Some((2160, 3840)), (1080, 1920), &tf));
+        // Another shape: 16:9 into 9:16, 9:16 into 16:9, 4:3 into 16:9, a square into either.
+        assert!(cover_overflows(Some((1920, 1080)), (1080, 1920), &tf));
+        assert!(cover_overflows(Some((1080, 1920)), (1920, 1080), &tf));
+        assert!(cover_overflows(Some((1440, 1080)), (1920, 1080), &tf));
+        assert!(cover_overflows(Some((1000, 1000)), (1920, 1080), &tf));
+        // A crop changes the picture's shape: 16:9 cropped to 9:16 fills a vertical frame, a vertical
+        // one cropped wide overhangs it.
+        let tall = Transform {
+            crop_left: 0.341_666_7,
+            crop_right: 0.341_666_7,
+            ..tf
+        };
+        assert!(!cover_overflows(Some((1920, 1080)), (1080, 1920), &tall));
+        let wide = Transform {
+            crop_top: 0.3,
+            crop_bottom: 0.3,
+            ..tf
+        };
+        assert!(cover_overflows(Some((1080, 1920)), (1080, 1920), &wide));
+        // Not known, or cropped to nothing: the cautious answer.
+        assert!(cover_overflows(None, (1080, 1920), &tf));
+        let nothing = Transform {
+            crop_left: 0.6,
+            crop_right: 0.6,
+            ..tf
+        };
+        assert!(cover_overflows(Some((640, 360)), (640, 360), &nothing));
     }
 
     #[test]

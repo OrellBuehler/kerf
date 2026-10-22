@@ -176,3 +176,13 @@
   family (needle `-c:a aac -aac_pns 0`; `KERF_GOLDEN_CASES` before / after with the option compiled out for the before) and
   exactly the `audio-aac` cases that also hit `master-limiter` or `loudnorm`: no AAC case without a ceiling, no other
   codec, no still or preview digest moved.
+- **A zoom taken in the fit's own scale** (`Clip::fit_order`; `engine-cli.md`) went in as two changes, each blessed alone with
+  `KERF_GOLDEN_CASES` / `KERF_GOLDEN_FAMILIES` between, of 8000 cases. **Contain, zoom in** (`scale=W*S:H*S:force_original_aspect_ratio=decrease`
+  for the fit and the zoom): export 2305, still 964 and preview 2291 moved, exactly the new structural families `zoom-folded`,
+  `still-zoom-folded` and `preview-zoom-folded` (read off the text: a `scale` whose box is a product and that fits with `decrease`; no case
+  of a family stayed, none outside one moved). **Cover, no crop to the frame** (a centred `crop=w='iw-4*floor(` after the cover `scale`, a
+  still's cover `scale` with no `crop=` after it): export 1654, still 656 and preview 523 moved, exactly `cover-uncropped`,
+  `still-cover-uncropped` and `preview-cover-uncropped`. Everything else is byte-identical: the identity, Cover at scale 1 with no pan, a
+  zoom out under Contain, a moving zoom, a Cover clip of the frame's own shape that only moves or zooms out. The families split
+  the graph on `;` and `,` **outside quotes, with a backslash escaping outside them** (`split_unquoted`): a keyed mask's `;`-separated
+  statements and a title's `\'` would otherwise merge chains.
