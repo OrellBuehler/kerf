@@ -97,3 +97,24 @@ export function reviewChipText(indicator: ProposalIndicator, cellWidth: number):
 	if (cellWidth >= REVIEW_CHIP_COUNT_WIDTH) return indicator.count === 0 ? 'Review' : changes(indicator.count);
 	return String(indicator.count || 'Review');
 }
+
+/** The strip under the Agent panel's status line while review is off. With a proposal still open the agent's edits keep
+ *  going into it (its reads follow it, so they cannot split between it and the cut) and nothing applies it for the
+ *  user, so "edits land as it makes them" over an open proposal would be wrong. */
+export function reviewOffNote(proposalOpen: boolean): string {
+	return proposalOpen
+		? 'Review is off, but this proposal is still open — the agent’s edits keep going into it until you apply or discard it.'
+		: 'Review is off — an agent’s edits, its task work included, land on your timeline as it makes them.';
+}
+
+/** What the empty queue says an agent does with a task you queue. */
+export function queueEmptyHint(review: boolean): string {
+	return review
+		? 'Queue a task below. Your connected agent claims it and proposes edits.'
+		: 'Queue a task below. Your connected agent claims it and edits your timeline directly — review is off.';
+}
+
+/** The Quick edits legend for the queued chip: where the agent's work for it ends up. */
+export function queuedChipLegend(review: boolean): string {
+	return review ? 'is queued for your agent, which you review before it lands' : 'is queued for your agent, whose edits land as it makes them';
+}

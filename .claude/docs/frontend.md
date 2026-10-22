@@ -914,7 +914,7 @@ or Analyze — instead of a dead end. The **agent panel is a real MCP task
 queue** (one status line · review card · queue · quick edits · history · composer) — Kerf has no in-app chat; a connected
 LLM claims tasks over MCP. The queue is `agent` state (`src/lib/agent.svelte.ts`, a third
 runes singleton) backed by the `tasks` table over Tauri/MCP: the add-task box and preset chips
-`agent.add(...)` real tasks, and `ready` tasks show Apply/Dismiss (`resolve_task`/`remove_task`).
+`agent.add(...)` real tasks, and `ready` tasks show Apply/Dismiss (`resolve_task`/`remove_task`). **With review off a finished task is `done` straight away** (`complete_task` settles it: the badge reads *Applied* and the agent's summary is its line, no Apply button, since the edits landed as they were made and sit in the history as the agent's); a `ready` task is one whose work still waits (review on, or a proposal still open), and its card offers Apply only when no proposal of its own is in the review card (`readyCard`). The empty-queue line and the Quick edits legend follow the switch (`queueEmptyHint`, `queuedChipLegend`).
 The panel is **one status line** (`agentLine`: `Agent connected` / `No agent connected` / `Last seen 4m ago` /
 `Agent working` / the endpoint's error — it had an `idle` badge over a "No agent connected" row, two statuses that could
 disagree) with a **Connect** button that opens the setup card *under it* (the code rows wrap), then **review card → queue
@@ -931,7 +931,7 @@ analyzes whatever is on the audio tracks first, then calls `snap_to_beats`, and 
 "No cuts were near a beat" instead of claiming an alignment when the grid never reached
 them); **the task is recorded only after the edit has run** (`record`: add, then resolve), so a connected agent never sees a task it could claim and redo (short of a window of two IPC round trips: `add_task` has no already-done form, so the task is `queued` until the `resolve_task` that follows — closing it needs a backend command that creates it done), and a failed edit leaves nothing in the queue. The rest enqueue for the agent — `Assemble rough cut` is one of them now: it used to run the same silence removal as `Remove silences` under a bigger name. Remove silences acts on `quickTarget`: the footage of the selected clip, else the selected library asset, else the first picture on the cut, and says which (a line under the chips, the toast naming it, "Nothing to remove" when the cut did not change); the local chips are off while a proposal is previewed. In the browser there is no agent, so
 queued tasks correctly just wait. Above the queue sits the **review card** — the
-panel's whole point, since an agent's task edits never touch the open cut. It renders
+panel's whole point while review is on, since an agent's task edits then never touch the open cut (with it off there is no proposal for a task, and the card is absent unless a stage_edits proposal or one left from before the switch is open). It renders
 `editor.staged`: the agent's note, a headline (`4 changes · 2:00.0 → 1:40.0 (-20.0s)`),
 the changes grouped by what they touch and tinted by the design system's own
 `--diff-add`/`--diff-remove`/`--diff-shift`, each row clicking through to the moment
@@ -1351,7 +1351,7 @@ and its status line. **Performance** — the CPU limit as three named budgets ov
 **Analysis** — a master "analyze on import" and one switch per kind (`auto_analysis`; the same set decides what an agent's `analyze_asset`
 runs when it names no steps), the **speech model** (select, status, *Download now* with a progress bar showing bytes and a **Stop**:
 `ui.fetchSpeechModel` / `ui.stopModelDownload` over `model-progress`, a stopped download is a notice, not an error) and the voiceover
-model. **Agent** — *Review the agent's edits* (`agent_review`; turning it **off** asks), *Let agents connect* with the listener's state
+model. **Agent** — *Review the agent's edits* (`agent_review`; turning it **off** asks, and the question says that task work lands too and that a proposal already waiting stays; the hint and the Agent panel's review-off strip, `reviewOffNote` in `agent-status.ts`, say the same, and the strip does not claim edits land while a proposal is still open), *Let agents connect* with the listener's state
 (`mcpStatus`: off / listening on URL / why it is not / starting) and when an agent last came, the *address* (validated before it is sent,
 `addressProblem`; the server restarts by itself; `KERF_MCP_ADDR` in the environment wins and the row says so — a restart-required note
 rather than a silent no-op; a network address needs the token), the *access token* (require switch; masked until *Show*; *Copy*;

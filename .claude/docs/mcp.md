@@ -481,6 +481,17 @@ Agent edits **stage** (`core-project.md`). The adapter's part:
   `undo_staged_edit` (the last step of the proposal, up to 20), `discard_staged_edits` and `restore_discarded_edits` (the
   last discarded proposal, once) work on the agent's own proposal at any time. `get_settings` shows `agent_review`;
   `set_settings` cannot change it.
+- **Review off: task work lands live.** `claim_next_task` opens a proposal only with review on; off, it just marks the task
+  `working` and each edit is an ordinary revision attributed to the agent (undoable, `undo` allowed for the agent), so the
+  tool text, `INSTRUCTIONS` and `EDITING_GUIDE` tell the agent there is no proposal to check or hand over. `complete_task`
+  answers a task that is `done` (the GUI's "Applied") when nothing is held back and `ready` while review is on or a proposal
+  of the task's, or the caller's, is still open; `fail_task` only settles it and the edits made stay on the cut (the
+  description says so, so the agent undoes them or reports what is left); `resolve_task` stays the user's accept (an agent may
+  call it with review off). `stage_edits` is kept as the explicit opt-in to hold a change back when review is off (its text
+  says so; `apply_staged_edits` then lands it, or the user does). A proposal already open when the switch is turned off stays
+  open, keeps taking the agent's edits and is never applied for it; `claim_next_task` is refused while it is open. No
+  proposal means no session owner: two sessions each claim a different task (the claim is atomic) and edit the same live
+  cut, the project lock serialising every edit, and the guide tells the agent to re-read after a pause.
 - **A proposal outlives its session.** `note_session` records every session id that made a call (`server::note_session_seen`);
   `lock_agent` asks `Project::release_orphaned_staging` whether the proposal's owner is a session that was seen and is
   no longer on any listener (closed, expired, or gone with a restart — a new token ends them all), and clears the owner if

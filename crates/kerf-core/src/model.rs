@@ -6029,7 +6029,8 @@ pub enum TaskStatus {
     Working,
     /// The agent finished; the resulting edit is staged for the user to review.
     Ready,
-    /// Reviewed and accepted by the user.
+    /// Accepted by the user — or finished by the agent with review off, when its edits already
+    /// landed on the live cut as it made them and there is nothing left to accept.
     Done,
     /// The agent could not complete it.
     Failed,
@@ -6060,8 +6061,8 @@ impl TaskStatus {
 
 /// A unit of work in the agent queue. A human (or a planning agent) enqueues a
 /// `prompt`; a connected LLM claims it over MCP, performs timeline edits through
-/// the same engine the GUI uses, then marks it `ready` (or `failed`). Kerf never
-/// edits on its own.
+/// the same engine the GUI uses, then marks it `ready` (or `done` with review off,
+/// or `failed`). Kerf never edits on its own.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Task {
     pub id: Uuid,

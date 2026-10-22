@@ -5083,10 +5083,11 @@ impl KerfMcp {
         description = "Begin a staged edit: from here on your edits are held back as a proposal the user reviews \
                        instead of changing the cut they are looking at. Your own reads (get_timeline_state, \
                        preview_timeline, timeline_summary, export) follow the proposal, so you can check your work \
-                       before handing it over. claim_next_task already does this for you, and while the user has \
-                       review switched on (the default) your first edit opens the proposal by itself, so you rarely \
-                       need this. The proposal belongs to your session: another agent connected at the same time is \
-                       refused while it is open."
+                       before handing it over. While the user has review switched on (the default) claim_next_task \
+                       and your first edit open the proposal by themselves, so you rarely need this. With review \
+                       off your edits, task work included, land on the cut as you make them; call this to hold a \
+                       change back for the user to look at first. The proposal belongs to your session: another \
+                       agent connected at the same time is refused while it is open."
     )]
     fn stage_edits(&self, Parameters(p): Parameters<StageEditsParams>) -> Result<String, McpError> {
         let owner = self.owner();
@@ -5122,9 +5123,11 @@ impl KerfMcp {
         description = "Apply your staged edits to the live timeline, as one revision — ONLY while the user has agent \
                        review switched off (Settings › Agent). With review on (the default) this is refused: the user \
                        applies agent edits in Kerf, so finish with complete_task (or just tell them the proposal is \
-                       ready) and ask them to review it; `force` does not get round that. With review off it fails if \
-                       the user has edited the timeline since you staged, unless `force`. Returns a summary of the \
-                       timeline afterwards (get_timeline_state has all of it)."
+                       ready) and ask them to review it; `force` does not get round that. With review off there is \
+                       only a proposal to apply when you opened one with stage_edits (or one was open when the user \
+                       switched review off); other edits have already landed. It fails if the user has edited the \
+                       timeline since you staged, unless `force`. Returns a summary of the timeline afterwards \
+                       (get_timeline_state has all of it)."
     )]
     fn apply_staged_edits(&self, Parameters(p): Parameters<ApplyStagedParams>) -> Result<String, McpError> {
         self.act(|project| {
@@ -5666,9 +5669,10 @@ impl KerfMcp {
 
     #[tool(
         description = "Claim the oldest queued task (marks it working) and return it; returns null when the queue is empty. \
-                       Claiming opens a proposal for the task, whether or not the user has review switched on: your edits go \
-                       into it instead of the live cut, and the user reviews and accepts it in Kerf (only with review off \
-                       may you apply_staged_edits yourself)."
+                       With the user's review on (the default) claiming opens a proposal for the task: your edits go \
+                       into it instead of the live cut, and the user reviews and accepts it in Kerf. With review off no \
+                       proposal is opened: each edit lands on the live cut as you make it, an undoable revision \
+                       attributed to you. Refused while another proposal is open (it must be applied or discarded first)."
     )]
     fn claim_next_task(&self) -> Result<String, McpError> {
         let owner = self.owner();
@@ -5678,7 +5682,12 @@ impl KerfMcp {
         })
     }
 
-    #[tool(description = "Mark a claimed task ready for the user to review, with a summary of the edits made")]
+    #[tool(
+        description = "Hand a claimed task over, with a summary of the edits made. With review on (the default) it is \
+                       marked ready: the proposal waits for the user to accept it in Kerf. With review off and no proposal \
+                       of yours open, your edits have already landed on the live cut, so it is marked done (a proposal \
+                       opened with stage_edits still waiting leaves it ready)."
+    )]
     fn complete_task(&self, Parameters(p): Parameters<CompleteTaskParams>) -> Result<String, McpError> {
         let id = parse_arg("task_id", &p.task_id)?;
         self.act(|project| {
@@ -5687,7 +5696,10 @@ impl KerfMcp {
         })
     }
 
-    #[tool(description = "Mark a task failed with an error message")]
+    #[tool(
+        description = "Mark a task failed with an error message; a proposal staged under it is discarded. With review \
+                       off the edits you already made stay on the live cut (undo steps them back), so say what is left."
+    )]
     fn fail_task(&self, Parameters(p): Parameters<FailTaskParams>) -> Result<String, McpError> {
         let id = parse_arg("task_id", &p.task_id)?;
         self.act(|project| {
@@ -6450,11 +6462,13 @@ const INSTRUCTIONS: &str = "Kerf is the video editor open on this computer, and 
              generate_captions (caption last, once the cut is settled). Before you call a cut done, run \
              platform_check, and get_levels for anything going to social; export renders it to an \
              absolute path. \
-             Your edits are STAGED: they go into a proposal the user accepts or dismisses in Kerf, and \
-             your reads (get_timeline_state, preview_timeline, timeline_summary) show the proposal; \
-             staged_diff shows what you are handing over. Finish a task with complete_task (or \
-             fail_task) and tell the user the proposal is ready: while review is on you cannot apply it \
-             yourself. \
+             While the user's review is on (the default; get_settings shows `agent_review`) your edits \
+             are STAGED: they go into a proposal the user accepts or dismisses in Kerf, your reads \
+             (get_timeline_state, preview_timeline, timeline_summary) show the proposal, and staged_diff \
+             shows what you are handing over; you cannot apply it yourself. With review off your edits, \
+             task work included, land on the cut as you make them, each an undoable step (stage_edits \
+             holds a change back for the user to look at first). Finish a task with complete_task (or \
+             fail_task) either way, and say what you did. \
              A LOCKED track (`locked` in get_timeline_state) is the user's: nothing on it is moved, \
              trimmed, split, removed or added to, and the call fails with `track V1 is locked`. You may \
              lock a track but not unlock one, so ask the user; a clip added without a track goes to the \
@@ -6614,7 +6628,7 @@ const EDITING_GUIDE: &str = "How to edit with Kerf. The user queues editing task
              tagline, a brand colour, a logo: each names an element id and a kind \
              of text, color, number, font or image). list_templates shows the \
              user's library; apply_template puts one on the cut as an animated \
-             title with `values` for its controls (a staged edit, like any other) \
+             title with `values` for its controls (an edit like any other) \
              and set_template_values changes them later; a title made from a \
              template lists its controls and current values under `template` in \
              timeline_summary. update_svg_overlay with `svg` replaces the artwork \
@@ -6645,9 +6659,9 @@ const EDITING_GUIDE: &str = "How to edit with Kerf. The user queues editing task
              shape (9:16, 1:1, 4:5, 16:9) in one call and one pass, framing each shot for \
              each shape and reporting what each file is ready for — prefer it \
              to exporting three times by hand. \
-             Your edits are STAGED, not applied. While the user has review switched \
-             on (the default; get_settings shows `agent_review`), claiming a task — \
-             or simply making your first edit — opens a proposal that is yours \
+             Whether your edits are STAGED depends on the user's switch (Settings › Agent; \
+             get_settings shows `agent_review`, on by default). With review ON, claiming a \
+             task — or simply making your first edit — opens a proposal that is yours \
              alone, and every edit goes into it instead of changing the cut the \
              user is looking at. Your own reads follow the proposal, so \
              get_timeline_state / preview_timeline / timeline_summary show the cut \
@@ -6661,13 +6675,25 @@ const EDITING_GUIDE: &str = "How to edit with Kerf. The user queues editing task
              and resolve_task are refused while review is on (`force` does not get \
              round that), and so are undo / redo / revert_to, which would rewrite \
              their live cut; say the proposal is ready and ask them to review it. \
-             Review is the user's switch (Settings › Agent); with it off, those \
-             tools work and your edits land as you make them — except while a \
-             proposal is open (claim_next_task always opens one for its task, and \
-             stage_edits opens one outside a task), when they go into it until you \
-             apply_staged_edits or the user accepts it. One agent's proposal is \
-             closed to another connected at the same time (it is yours again if \
-             your connection drops and you reconnect). \
+             With review OFF nothing is staged for you: claim_next_task only marks the \
+             task working, and every edit lands on the live cut as you make it — an \
+             ordinary revision in history, attributed to you, that the user (or you, \
+             with undo) can step back. Your reads are the live cut, so look at the \
+             result with preview_timeline as you go. complete_task then just settles the \
+             task (it shows as done; its summary is what the user reads), and fail_task \
+             only marks it failed: what you already did stays on the cut, so undo it \
+             yourself or say what is left. The user's locks hold directly, and the user \
+             may edit between your calls — each edit meets the cut as it is then. Another \
+             agent connected at the same time edits the same live cut, so read \
+             get_timeline_state again after a pause rather than trusting an old read. \
+             stage_edits is still yours to call: it opens a proposal even with review \
+             off, for a change worth the user's look before it lands (everything above \
+             about a proposal then applies to it, apply_staged_edits included — or leave \
+             it for the user). A proposal that is already open when the user switches \
+             review off stays open and keeps taking your edits until it is applied or \
+             discarded; it is never applied for you, and claim_next_task is refused while \
+             it is open. A proposal is closed to another agent connected at the same time \
+             (it is yours again if your connection drops and you reconnect). \
              Long tools (analyze_asset, export, export_variants, \
              generate_voiceover, compose_music, separate_stems, download_speech_model, \
              import_asset, smart_crop, refine_transcript, sync_clips_by_audio) take \
@@ -9259,6 +9285,42 @@ mod tests {
         assert!(description("discard_staged_edits").contains("restore_discarded_edits"));
         assert!(description("resolve_task").contains("complete_task"));
         assert!(description("claim_next_task").contains("proposal"));
+    }
+
+    /// With review off a claimed task's work lands live, so the tools that move a task along say so
+    /// rather than promise a proposal, and `stage_edits` says it is the way to hold a change back.
+    #[test]
+    fn the_task_tools_say_what_review_off_means_for_task_work() {
+        let tools = router().list_all();
+        let description = |name: &str| -> String {
+            tools
+                .iter()
+                .find(|t| t.name == name)
+                .and_then(|t| t.description.as_deref())
+                .unwrap_or_default()
+                .to_string()
+        };
+        let claim = description("claim_next_task");
+        assert!(
+            claim.contains("With review off no proposal is opened") && claim.contains("live cut"),
+            "{claim}"
+        );
+        assert!(!claim.contains("whether or not the user has review switched on"), "{claim}");
+        let complete = description("complete_task");
+        assert!(complete.contains("ready") && complete.contains("marked done"), "{complete}");
+        assert!(description("fail_task").contains("undo steps them back"));
+        let stage = description("stage_edits");
+        assert!(
+            stage.contains("review off") && stage.contains("task work included"),
+            "{stage}"
+        );
+        assert!(description("apply_staged_edits").contains("stage_edits"));
+        assert!(super::INSTRUCTIONS.contains("With review off your edits, task work included"));
+        for text in [super::INSTRUCTIONS, super::EDITING_GUIDE] {
+            assert!(!text.contains("claim_next_task always opens"), "{text}");
+        }
+        assert!(super::EDITING_GUIDE.contains("With review OFF nothing is staged"));
+        assert!(super::EDITING_GUIDE.contains("already open when the user switches"));
     }
 
     #[test]

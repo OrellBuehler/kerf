@@ -150,8 +150,9 @@
 
 <SettingRow id="agent-review" for="sw-agent-review" label="Review the agent’s edits before they land">
 	{#snippet hint()}
-		On, everything an agent changes waits as a proposal: you look at it on the timeline and apply, pick or discard it.
-		Off, its edits land as they are made (each one still a step you can undo).
+		On, everything an agent changes waits as a proposal, a task it works on included: you look at it on the timeline and
+		apply, pick or discard it. Off, its edits land as they are made, task work too (each one still a step you can
+		undo), and a finished task shows as applied; a proposal that is already waiting stays until you apply or discard it.
 	{/snippet}
 	<Switch
 		id="sw-agent-review"

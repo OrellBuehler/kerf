@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
-import { agentTabLabel, ago, agentLine, COMPOSER_HINT_MIN_HEIGHT, proposalIndicator, REVIEW_CHIP_COUNT_WIDTH, REVIEW_CHIP_FULL_WIDTH, reviewChipText, showComposerHint } from './agent-status';
+import { agentTabLabel, ago, agentLine, COMPOSER_HINT_MIN_HEIGHT, proposalIndicator, queueEmptyHint, queuedChipLegend, REVIEW_CHIP_COUNT_WIDTH, REVIEW_CHIP_FULL_WIDTH, reviewChipText, reviewOffNote, showComposerHint } from './agent-status';
+import { CONFIRM } from './confirm-copy';
 import { STATUS_MAP } from './components/editor/data';
 import type { StagedEdit, TimelineDiff } from './types';
 
@@ -121,5 +122,37 @@ describe('the Agent tab’s name', () => {
 
 	test('starts with the word on the tab, so a voice command for the visible label still works', () => {
 		expect(agentTabLabel(proposalIndicator(staged(2))).startsWith('Agent')).toBe(true);
+	});
+});
+
+describe('what the panel says while review is off', () => {
+	test('task work lands too, so the strip says so', () => {
+		expect(reviewOffNote(false)).toContain('task work included');
+		expect(reviewOffNote(false)).toContain('land on your timeline');
+	});
+
+	test('a proposal that is still open keeps taking the agent’s edits, and the strip does not claim they land', () => {
+		const note = reviewOffNote(true);
+		expect(note).toContain('proposal is still open');
+		expect(note).toContain('apply or discard');
+		expect(note).not.toContain('land on your timeline');
+	});
+
+	test('the empty queue and the queued chip say where the agent’s work goes', () => {
+		expect(queueEmptyHint(true)).toContain('proposes edits');
+		expect(queueEmptyHint(false)).toContain('edits your timeline directly');
+		expect(queuedChipLegend(true)).toContain('you review before it lands');
+		expect(queuedChipLegend(false)).toContain('land as it makes them');
+	});
+
+	test('a task the agent finished with review off reads as applied, not as waiting for review', () => {
+		expect(STATUS_MAP.done.label).toBe('Applied');
+		expect(STATUS_MAP.ready.label).toBe('Ready to review');
+	});
+
+	test('turning review off says task work lands too and that an open proposal stays', () => {
+		const { message } = CONFIRM.agentReviewOff;
+		expect(message).toContain('tasks you queue');
+		expect(message).toContain('already waiting stays');
 	});
 });

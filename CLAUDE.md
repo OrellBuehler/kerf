@@ -117,8 +117,9 @@ touch an installed Kerf's settings — see `.claude/docs/build-and-ci.md`.
   release it, run ffmpeg / decode / inference, re-lock to apply (`*_inputs` → static
   `decode_*` / `sample_*` → `apply_*`). No Tauri command runs on the main thread: quick
   ones are `#[tauri::command(async)]`, heavy ones go through `blocking()`.
-- **Agent edits stage.** Edits with `EditSource::Agent` go into the staged proposal;
-  every read an edit depends on goes through `working_timeline()`. Mutating MCP tools use
+- **Agent edits stage.** Edits with `EditSource::Agent` go into the staged proposal (with the
+  user's review on, the default; off, they land live as ordinary revisions, task work included,
+  unless a proposal is open); every read an edit depends on goes through `working_timeline()`. Mutating MCP tools use
   the `edit()` helper, which emits `project-changed` only *after* releasing the lock.
 - **All timeline edits go through `edit_timeline` / `run_edit`**, which apply ripple and
   the linked-A/V sync lock; layout-deciding ops use `edit_timeline_exact`. Timeline math

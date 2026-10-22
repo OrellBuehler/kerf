@@ -316,8 +316,8 @@
   paths), so the agent can *look at* the cut it is proposing, and the GUI, which
   never stages, always sees the live one. `restore` (undo/redo/revert) refuses
   for an agent holding staged edits rather than walking the ground out from under
-  them. The queue ties in at both ends: `claim_next_task` opens a staging session
-  for the task, `resolve_task` applies it (accepting the task *is* accepting its
+  them. The queue ties in at both ends: with review on `claim_next_task` opens a staging session
+  for the task (**with review off it opens none — see below**), `resolve_task` applies it (accepting the task *is* accepting its
   edits) and `remove_task` discards it — **the proposal first, in one transaction with the delete**: an agent
   that does not own the proposal is refused `StagedEditOwnedByOther` with the task still in the queue (it used
   to delete the row and then fail). `diff_revisions` / `revision_diff` point
@@ -330,7 +330,7 @@
   included), `apply_staged_subset`, `resolve_task` of a task with staged edits, and
   `undo`/`redo`/`revert_to` as the agent are refused (`AgentReviewRequired` / an
   `InvalidArgument` for the history) — the actor on the lock *is* the "initiated by" argument.
-  Off, an agent edits live unless a session is open. **A proposal has an owner** (the MCP
+  Off, an agent edits live unless a session is open — **task work too** (next paragraph). **A proposal has an owner** (the MCP
   session id, `staged.owner`; `StagedEdit` serialises only `owned_by_agent`, never the id): the
   adapter calls `ensure_agent_staging(owner)` inside the same lock as an agent edit — it **declares
   and checks and writes nothing**: it records which session is acting (`set_actor` forgets it at
@@ -347,7 +347,31 @@
   being told another agent owns it; with no owner left, the ordinary adoption rule applies and the steps are kept.
   `set_ripple_mode` as an agent is refused while review is on (the flag is the user's toolbar setting and applies
   at once, to a proposal in progress too): the edit's `ripple` argument is how an agent ripples for one call.
-  `claim_next_task(owner)` / `begin_staging(task, note, owner)` open a session for a given owner.
+  `claim_next_task(owner)` (review on) / `begin_staging(task, note, owner)` open a session for a given owner.
+  **Review off: task work lands live** (`task_tests.rs`). `claim_next_task` then only marks the task `working` — no
+  proposal — and every edit is an ordinary `edit_timeline` revision attributed to the agent (`history` source `agent`,
+  one step each, undoable by the user or by the agent itself: `undo` works for an agent with review off and none open). The
+  agent's reads are the live cut. `complete_task` is `done` when review is off and nothing is held back, `ready` otherwise
+  (`task_work_waits`: review on — accepting is the user's even with no proposal left; or a proposal open that is the task's,
+  is unowned, or is the calling session's, e.g. one it opened with `stage_edits`; a proposal another session owns is not this
+  task's). `fail_task` only settles the task: the edits already made are not rolled back (they are in the history, and the
+  agent's tool text says so). `stage_edits` / `begin_staging` still open a proposal with review off — the explicit opt-in to
+  hold a change back — and a claim is still refused (`StagedEditPending`) while any non-terminal proposal is open, so a
+  task's edits are never silently folded into someone else's. **What the proposal's owner gave, and what is left without
+  one:** it kept two sessions from interleaving edits into one unapplied cut, and made the user's later edits mark it `stale`
+  and the user's locks overlay it. A live edit has no such state to protect: each is one atomic read-modify-write under the
+  project lock/transaction on the cut as it is *then* (so nothing is lost or goes stale; two sessions' edits interleave in
+  history, the later of two edits to the same value wins, as for any two editors), the user's locks apply directly
+  (`ensure_editable` on the live cut), and `claim_next_task` is atomic, so two sessions get different tasks (a proposal used
+  to serialise them). Nothing replaces the owner because nothing is held; an explicit `stage_edits` proposal keeps its owner
+  and blocks the other session's edits (`StagedEditOwnedByOther`) as before.
+  **The switch flipping with a proposal open** is safe both ways because `run_edit` routes on whether a proposal *exists*, not
+  on the flag: turned off, an open proposal stays open, keeps taking the agent's edits (its reads follow it, so they cannot split
+  between it and the live cut), is never applied or discarded for the user, and now the owning agent may apply it itself
+  (`apply_staged`) while the user can still accept, pick or discard it; `claim_next_task` is refused while it is open and
+  `complete_task` leaves its task `ready`. Turned on mid-task, what already landed stays landed (it is in the history), the
+  next agent edit opens a proposal (with no task: the claim opened none), and the agent's undo/redo/revert are refused again;
+  `complete_task` then reads `ready`.
   **Asset-level agent writes are staged too**: `set_asset_projection` as the agent records a
   `StagedAssetChange` in the proposal (the `staged.assets` column) instead of rewriting the
   library, the agent's own `get_asset` / `list_assets` read through the pending changes (the
