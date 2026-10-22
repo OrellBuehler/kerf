@@ -118,10 +118,21 @@
   rounds to its slot half away from zero, and **the stream ends where the frame `trim`
   dropped would have landed** (the first frame past the window, retimed; for a window to the
   end of the file one frame interval — the file's last — past the last frame): nothing is
-  drawn from that slot on (`overlay=eof_action=pass`), so a slowed clip's last frame is held
-  for its whole share, the last frame of a sped-up or reversed one whose slot is past the end
-  is dropped, and the equal-rate end is not drawn. That end, not the overlay's `enable`,
-  decides a clip's closing edge. The time base is therefore an input (`start/TB` is
+  drawn from that slot on (`overlay=eof_action=pass`). That end, rounded, came up to a source frame
+  short of the clip's end, and a clip lost its last frame wherever its window's first frame fell
+  late enough: a black frame at a cut halfway between two frames (12.75 s at 30 fps), and at a
+  slowed or low-rate clip's end on the grid. So a forward clip's picture **reads on past its
+  window** (`picture_window`: one source frame, `ClipFx::frame`, a tenth of a second when the
+  probe has no rate, plus one output frame at its speed; a still's `-t` with it) and **is cut at
+  `end_frame`** (`trim=end_pts=` after `fps`: the first output frame at or after its end, tail
+  included, with a millionth of a frame of slack). `FpsPick.window` is the picture window and
+  `FpsPick.end` that end; the run ends at the earlier of the two. A clip is drawn on every frame
+  from its first frame's slot up to the one before its end's, an equal-rate end is not drawn,
+  and the frame on a mid-frame end shows the nearest source frame, never one more than half an
+  output frame past the clip's own length. A reversed clip keeps its window (its read past the end
+  would be below its start, under the seek): its closing edge is the stream's, as before.
+  (`tpad=stop_mode=clone` would hold the last frame instead, but FFmpeg 4.4 crashes on a clone of a
+  stream that had no frame.) The time base is therefore an input (`start/TB` is
   truncated to a tick: a frame-aligned speed-2 clip's exact tie falls on the low side), and
   so is the container's start (`start_us`: `-ss` is relative to it). The export spells its
   `-ss` and `trim` with `{}` of the `f64` (FFmpeg reads whole microseconds, truncated); only

@@ -291,7 +291,7 @@ pub(super) fn picture_clips(
             if track.kind != StreamKind::Video {
                 continue;
             }
-            let (start, end) = ClipTiming::new(clip, &fx[this]).window();
+            let (start, end) = ClipTiming::new(clip, &fx[this]).enable_window(rate);
             let Some((first, last)) = touch(start, end, rate, frames) else {
                 continue;
             };
@@ -410,8 +410,9 @@ pub(super) fn part_contents(plan: &PartsPlan, part: &Part) -> PartContents {
         let pick = FpsPick {
             speed: 1.0,
             reverse: false,
-            window: clip_source_window(clip, &plan.fx[c.flat]),
+            window: picture_window(clip, &plan.fx[c.flat], plan.fmt.fps),
             start: clip.timeline_start,
+            end: ClipTiming::new(clip, &plan.fx[c.flat]).window().1,
             frame: part.first,
             fps,
             drop_first: false,

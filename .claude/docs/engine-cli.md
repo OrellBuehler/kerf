@@ -419,7 +419,12 @@ so the feature is **only** activated through these forwards — which is what ma
   canvas with every video clip `overlay`'d at its `timeline_start` (later tracks on
   top, gaps fall through to black) and every audio-bearing clip `adelay`'d to its
   position and summed with `amix` — so clip positions, gaps and track layering all
-  render. `ExportOptions.fit` decides what happens when the delivery aspect differs
+  render. **Clip edges:** each clip's chain trims its `picture_window` (read a source frame and
+  an output frame past its out point, forward clips), puts it on the grid with `fps=` and cuts
+  it with `trim=end_pts=<end_frame>`; the overlay's `enable` opens a frame early
+  (`ClipTiming::enable_window`). Back-to-back clips then leave no frame between them wherever
+  the cut and the sources' frames fall (`rendered.rs`,
+  `back_to_back_clips_leave_no_frame_between_them`). `ExportOptions.fit` decides what happens when the delivery aspect differs
   from the footage: `Contain` (the default, and the historical behaviour) scales to
   fit and pads, `Cover` scales with `force_original_aspect_ratio=increase` and crops
   — which is what makes the vertical / square presets produce a usable shot rather
@@ -930,11 +935,14 @@ so the feature is **only** activated through these forwards — which is what ma
   `motion_at(t)` / `FadeStep::progress_at_frame` a frame renderer *evaluates* — one
   decision, two readers. `fades` is video-only (`audio_clip_chain` composes the same
   `ClipFx` its own way and shares only the duration, window and seek). **The number is
-  not what FFmpeg does with it**: `enabled` is the overlay's `enable` predicate (closed
-  at `end`), necessary and not sufficient — an equal-rate source is drawn on
-  `start <= t < end` and nothing at `end`; graph expressions are evaluated at
-  `ffmpeg_frame_time(k) = k * (den / num)`, an ulp off `k / fps`, which drops the first
-  frame of a third of the frame-aligned clips at 24 fps and half at 29.97; and a `fade`
+  not what FFmpeg does with it**: `enabled(t, fps)` is the overlay's `enable` predicate
+  (`enable_window`: opened one canvas frame early, closed at `end`), necessary and not
+  sufficient — a clip is drawn from its first frame's slot up to `end_frame` of its end and
+  nothing at `end`; graph expressions are evaluated at `ffmpeg_frame_time(k) = k * (den / num)`,
+  an ulp off `k / fps`, which with the window opened at `start` dropped the first frame of a
+  third of the frame-aligned clips at 24 fps and half at 29.97 (a black frame at a cut on
+  `30.6` at 30 fps), hence the frame of slack (the stream has nothing before its first slot,
+  and an overlay with no frame yet passes the base through); and a `fade`
   counts frames (`S = round(st * fps)`, `N = round(d * fps)`, `i / N`), it does not
   interpolate time. Exact rationals are for the frame pick alone: `Rational` is the delivery
   rate as FFmpeg parses the text the graph prints (`av_d2q(x, 1001000)`, ported and checked

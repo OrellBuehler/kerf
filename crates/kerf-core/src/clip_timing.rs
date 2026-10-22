@@ -131,6 +131,10 @@ pub struct ClipFx {
     /// `setparams` name), which the grade's RGB filters must give back: FFmpeg 6.1 converts out of
     /// RGB as BT.601 and drops the tag. `None` for an untagged or RGB picture.
     pub frame_matrix: Option<&'static str>,
+    /// How long one frame of the clip's source lasts, in source seconds (`1 / fps` of its video
+    /// stream), or `0.0` when the probe recorded no rate: how far past its window the chain reads
+    /// ([`picture_window`]).
+    pub frame: f64,
 }
 
 /// Which clips of `timeline` the graph built from it labels BT.709, indexed like [`transition_fx`]
@@ -173,6 +177,7 @@ pub fn transition_fx(timeline: &Timeline, assets: &[Asset]) -> Vec<ClipFx> {
         let stream = asset.and_then(|a| a.streams.iter().find(|s| s.kind == StreamKind::Video));
         fx[flat].lead = stream.filter(|s| !s.image).map_or(0.0, |s| s.lead);
         fx[flat].frame_matrix = crate::model::frame_matrix(stream, fx[flat].hdr.is_some());
+        fx[flat].frame = stream.and_then(|s| s.fps).filter(|f| *f > 0.0).map_or(0.0, |f| 1.0 / f);
     }
     for (fx, label) in fx.iter_mut().zip(graph_bt709_labels(timeline, assets)) {
         fx.label_bt709 = label;
@@ -327,6 +332,38 @@ pub fn clip_source_window(clip: &Clip, fx: &ClipFx) -> (f64, f64) {
     } else {
         (clip.source_in, clip.source_out + fx.tail * s)
     }
+}
+
+/// What a source is taken to step by when its rate is unknown: a tenth of a second, longer than
+/// a frame of anything shot for motion.
+const UNKNOWN_FRAME: f64 = 0.1;
+
+/// The source window a clip's **picture** chain trims: [`clip_source_window`] read on past its
+/// end by one frame of the source and one output frame (`out_fps`) at the clip's speed, for a
+/// forward clip. The chain then cuts the stream at the clip's own end ([`end_frame`]), so the read
+/// past it shows nothing past that end; what it gives is a stream that does not run out early.
+/// Cut at the window, the stream ended where the first frame past the window would have landed,
+/// up to a source frame early, and `fps` rounds that end to its nearest slot: a clip whose last
+/// output frame began more than half a frame before the stream's end lost it, and the frame
+/// behind showed through — black at a cut halfway between two frames (12.75 s at 30 fps), and at a
+/// slowed or low-rate clip's end on the grid. A reversed clip keeps its window: its read past the
+/// end would be below its start, under the seek.
+pub fn picture_window(clip: &Clip, fx: &ClipFx, out_fps: f64) -> (f64, f64) {
+    let (start, end) = clip_source_window(clip, fx);
+    if clip.is_reversed() || !(out_fps > 0.0 && out_fps.is_finite()) {
+        return (start, end);
+    }
+    let frame = if fx.frame > 0.0 { fx.frame } else { UNKNOWN_FRAME };
+    (start, end + frame + clip.speed_mag() / out_fps)
+}
+
+/// The first output frame (of `fps`) at or after `end`: a clip's stream is cut there
+/// (`trim=end_pts=`), so it is drawn on the frames that start before its end and on none after.
+/// A millionth of a frame of slack keeps an end printed a hair past a frame boundary (`23 / 30`
+/// is `0.7666666666666667`) on that boundary.
+pub fn end_frame(end: f64, fps: Rational) -> i64 {
+    // `as` saturates: an end at infinity is no cut, and NaN is frame 0.
+    (end * f64::from(fps.num) / f64::from(fps.den) - 1e-6).ceil().max(0.0) as i64
 }
 
 /// The input-side fast-seek for a clip's window start: seek there when it is past
@@ -697,15 +734,27 @@ impl<'a> ClipTiming<'a> {
         (self.clip.timeline_start, self.clip.timeline_end() + self.fx.tail)
     }
 
-    /// Whether the overlay's `enable` expression is true at `t`: the window with
-    /// both ends included, as `between` has it. **Necessary, not sufficient, for the
-    /// clip to be drawn**: it is not "on screen at `t`". The export draws nothing at
-    /// `t == end` from an equal-rate source (the source has no frame there), draws a
-    /// slower source's last frame at it through the `fps` filter, and is evaluated
-    /// at [`ffmpeg_frame_time`], not at an exact `k / fps`. Which frames are drawn is
-    /// the pick's decision.
-    pub fn enabled(&self, t: f64) -> bool {
+    /// The overlay's `enable` window as the graph prints it: [`Self::window`] opened one frame of
+    /// the canvas (`fps`) early. The graph evaluates frame `k` at [`ffmpeg_frame_time`], an ulp
+    /// under `k / fps` for about a third of the frames, so a clip starting on a frame boundary lost
+    /// its first frame to `between` (`918 * (1 / 30)` is `30.599999999999998`), and `fps` places a
+    /// clip's first frame on its *nearest* slot, which can start before the clip does. The clip's
+    /// stream has nothing before that slot, so the frame of slack draws nothing early: the stream,
+    /// not `enable`, decides the opening edge as [`end_frame`] does the closing one.
+    pub fn enable_window(&self, fps: Rational) -> (f64, f64) {
         let (start, end) = self.window();
+        // Nothing is before the timeline's start: a clip there keeps its `0`.
+        ((start - f64::from(fps.den) / f64::from(fps.num)).max(start.min(0.0)), end)
+    }
+
+    /// Whether the overlay's `enable` expression is true at `t`: the [`Self::enable_window`] with
+    /// both ends included, as `between` has it. **Necessary, not sufficient, for the clip to be
+    /// drawn**: it is not "on screen at `t`". The export draws a clip on the frames its stream
+    /// fills, from its first frame's slot up to [`end_frame`] of its end, and is evaluated at
+    /// [`ffmpeg_frame_time`], not at an exact `k / fps`. Which frames are drawn is the pick's
+    /// decision.
+    pub fn enabled(&self, t: f64, fps: Rational) -> bool {
+        let (start, end) = self.enable_window(fps);
         t >= start && t <= end
     }
 
@@ -869,6 +918,7 @@ mod tests {
         assert!(transition_fx(&tl, &assets).iter().all(|f| ClipFx {
             label_bt709: false,
             frame_matrix: None,
+            frame: 0.0,
             ..*f
         } == ClipFx::default()));
 
@@ -914,14 +964,24 @@ mod tests {
         let asset = asset();
         let tl = single(vec![make_clip(asset.id, 5.0, 9.0, 3.0)]);
         let fx = transition_fx(&tl, std::slice::from_ref(&asset));
-        assert_eq!(fx, vec![ClipFx::default()]);
+        assert_eq!(
+            fx,
+            vec![ClipFx {
+                frame: 1.0 / 30.0,
+                ..ClipFx::default()
+            }]
+        );
         let t = timing(&tl, &fx, 0);
         assert_eq!((t.duration(), t.window()), (4.0, (3.0, 7.0)));
-        // `between(t,3,7)` includes both ends. That is the *enable* expression, not
-        // what is drawn: the export draws nothing at t == 7 from an equal-rate source
+        // `between(t,2.96,7)` at 25 fps: both ends included, opened a frame early. That is the
+        // *enable* expression, not what is drawn: the stream decides both edges, and is cut at
+        // frame 175 (t == 7), so nothing is drawn there
         // (`a_clip_is_drawn_on_the_frames_its_window_and_its_source_leave_it`).
-        assert!(t.enabled(3.0) && t.enabled(7.0) && t.enabled(5.0));
-        assert!(!t.enabled(2.999) && !t.enabled(7.001));
+        let fps = Rational { num: 25, den: 1 };
+        assert_eq!(t.enable_window(fps), (3.0 - 0.04, 7.0));
+        assert!(t.enabled(2.96, fps) && t.enabled(3.0, fps) && t.enabled(7.0, fps) && t.enabled(5.0, fps));
+        assert!(!t.enabled(2.959, fps) && !t.enabled(7.001, fps));
+        assert_eq!(end_frame(7.0, fps), 175);
         assert!(t.fades().is_empty());
         assert_eq!(t.motion_keys(), None);
         assert_eq!(t.motion_at(4.0), (0.0, 0.0));
@@ -961,7 +1021,8 @@ mod tests {
         let (out, inc) = (timing(&tl, &fx, 0), timing(&tl, &fx, 1));
         // The outgoing clip keeps playing for the transition, on source past its out point.
         assert_eq!((out.duration(), out.window()), (11.0, (0.0, 11.0)));
-        assert!(out.enabled(10.5) && !out.enabled(11.5));
+        let fps = Rational { num: 25, den: 1 };
+        assert!(out.enabled(10.5, fps) && !out.enabled(11.5, fps));
         assert_eq!(clip_source_window(out.clip, out.fx), (0.0, 11.0));
         // Its picture is not faded: the incoming clip's alpha ramp does the mixing.
         assert!(out.fades().is_empty());
@@ -1035,7 +1096,16 @@ mod tests {
         });
         let tl = single(vec![a, b]);
         let fx = transition_fx(&tl, std::slice::from_ref(&asset));
-        assert_eq!(fx, vec![ClipFx::default(); 2]);
+        assert_eq!(
+            fx,
+            vec![
+                ClipFx {
+                    frame: 1.0 / 30.0,
+                    ..ClipFx::default()
+                };
+                2
+            ]
+        );
         // A still never runs out: it loops, so its handle is unbounded.
         let still = img_asset(uuid::Uuid::new_v4());
         let (tl, fx) = pair(&still, TransitionKind::Crossfade, 1.0);
@@ -1093,9 +1163,41 @@ mod tests {
         close(out.motion_at(10.0), (0.0, 0.0));
         close(out.motion_at(11.0), (0.0, -0.5));
         close(out.motion_at(12.0), (0.0, -1.0));
-        assert!(out.enabled(12.0) && !out.enabled(12.001));
+        assert!(out.enabled(12.0, Rational { num: 25, den: 1 }) && !out.enabled(12.001, Rational { num: 25, den: 1 }));
         // The keys are what the graph prints: clip-local seconds.
         assert_eq!(inc.motion_keys().unwrap().y, vec![(0.0, 1.0), (2.0, 0.0)]);
+    }
+
+    #[test]
+    fn a_clip_is_cut_at_the_first_frame_at_or_after_its_end() {
+        let thirty = Rational { num: 30, den: 1 };
+        // Halfway through frame 382: it starts before the end, so it is the clip's.
+        assert_eq!(end_frame(12.75, thirty), 383);
+        // A hair short of a boundary is still that boundary's frame: the next clip starts there.
+        assert_eq!(end_frame(12.74998, thirty), 383);
+        // On a boundary, printed a hair past it.
+        assert_eq!(end_frame(23.0 / 30.0, thirty), 23);
+        assert_eq!(end_frame(0.0, thirty), 0);
+        assert_eq!(end_frame(f64::INFINITY, thirty), i64::MAX);
+        assert_eq!(end_frame(7.0, Rational { num: 30000, den: 1001 }), 210);
+    }
+
+    #[test]
+    fn a_forward_clips_picture_reads_a_source_frame_and_an_output_frame_past_its_window() {
+        let asset = test_asset(vec![video_stream(1920, 1080, 25.0)]);
+        let tl = single(vec![make_clip(asset.id, 5.0, 9.0, 3.0)]);
+        let mut fx = transition_fx(&tl, std::slice::from_ref(&asset));
+        assert_eq!(fx[0].frame, 0.04);
+        let clip = &tl.tracks[0].clips[0];
+        assert_eq!(clip_source_window(clip, &fx[0]), (5.0, 9.0));
+        assert_eq!(picture_window(clip, &fx[0], 50.0), (5.0, 9.0 + 0.04 + 0.02));
+        // A rate the probe did not record reads a tenth of a second.
+        fx[0].frame = 0.0;
+        assert_eq!(picture_window(clip, &fx[0], 50.0), (5.0, 9.0 + 0.1 + 0.02));
+        // Reversed, the read past its end would be below its start: it keeps its window.
+        let mut back = clip.clone();
+        back.speed = -2.0;
+        assert_eq!(picture_window(&back, &fx[0], 50.0), clip_source_window(&back, &fx[0]));
     }
 
     #[test]
@@ -1230,7 +1332,13 @@ mod tests {
         assert_eq!((fx[0].hdr, fx[0].head_pad), (Some(Hdr::Hlg), true));
         let sdr = asset();
         let tl = single(vec![make_clip(sdr.id, 0.0, 4.0, 0.0)]);
-        assert_eq!(transition_fx(&tl, std::slice::from_ref(&sdr)), vec![ClipFx::default()]);
+        assert_eq!(
+            transition_fx(&tl, std::slice::from_ref(&sdr)),
+            vec![ClipFx {
+                frame: 1.0 / 30.0,
+                ..ClipFx::default()
+            }]
+        );
     }
 
     #[test]
