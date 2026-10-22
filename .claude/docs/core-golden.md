@@ -175,7 +175,16 @@
   `parts-svg-pictures` (`-start_number`), `parts-held`, `parts-two-pass`, `parts-10-bit`, `parts-hdr`, `parts-caption`,
   `parts-faststart`. `KERF_GOLDEN_PARTS_CASES=<file>` writes a digest per case, `KERF_GOLDEN_PARTS_DUMP=<case>` prints one
   case's argv. The three single-run files are the proof that a small export is unchanged: they hold, per case, the digests
-  the commit before gave.
+  the commit before gave. A change to a clip's chain moves this file along with the others, so **check what moved**:
+  `a_part_draws_every_clip_of_the_corpus_as_the_whole_export_does` builds, for every case that is cut, the whole export
+  and every part and asserts each clip a part holds has the whole export's chain (stamps aside) and `overlay` — 4932
+  cases, 74k clips — so a moved digest is the chain's change and not one the parts made alone. It found a still restarted
+  at a cut judged by the frame's size where the whole export judges it by its own picture (the fit order of a Cover still
+  with a mask, or one that reveals what the frame crops; 9 cases, fixed in `video_clip_chain_stamped`). Re-blessed once when the zoom-in fit order
+  (`Clip::fit_order`) landed: 3270 of 8000 cases moved, 3269 of them with the export family `zoom-folded` or
+  `cover-uncropped`, the other (6509) a `together` case planned on its base Contain options, whose whole export is folded
+  (its listed families are its deliveries'). Of the 597 zoom cases that did not move, 536 are `NO-PARTS`, 49 are
+  `together` cases whose base options hold nothing to fold, and 12 hold a zoomed clip shorter than a frame that no part draws.
 - **Constant-power crossfades** (`afade …:curve=qsin` only on a fade that is wholly one half of a real
   pair: a dissolve or motion transition from an adjacent clip whose overlap plays different sound — not a
   fade up from black, not a dip, not a cut inside one take) re-blessed `export.txt` alone: 1304 of 6400
