@@ -329,6 +329,59 @@ fn a_cover_clip_of_the_frames_own_shape_keeps_its_chain_unless_it_zooms_in() {
     assert!(c.contains(&format!("{crops}setsar=1")), "{c}");
 }
 
+/// The keyed-zoom harness's alpha case: 4:3 footage (160x120) in a 16:9 frame (320x180) under
+/// Cover, held at 0.8 and moved 0.1 right. The cover is 320x240, so a zoom out of 0.8 is 256x192:
+/// not the cropped frame zoomed (256x144), which is what a crop ahead of the zoom made of it, but
+/// the whole cover, which reaches the top and bottom of the frame and which the overlay cuts there.
+#[test]
+fn a_zoom_out_of_a_cover_clip_of_another_shape_is_the_whole_cover_zoomed() {
+    let fmt = ExportFormat {
+        width: 320,
+        height: 180,
+        fit: Fit::Cover,
+        ..ExportFormat::default()
+    };
+    let asset = test_asset(vec![video_stream(160, 120, 30.0)]);
+    let mut zoomed_out = make_clip(asset.id, 0.0, 4.0, 0.0);
+    zoomed_out.transform.scale = 0.8;
+    zoomed_out.transform.pos_x = 0.1;
+    let chain = |clip: &Clip, picture| video_clip_chain_of(clip, &fmt, &ClipFx::default(), false, picture, "c0");
+    assert!(crate::layer_geometry::cover_overflows(
+        Some((160, 120)),
+        (320, 180),
+        &zoomed_out.transform
+    ));
+    assert_eq!(zoomed_out.fit_order(Fit::Cover, true), FitOrder::Uncropped);
+    // One resample to the cover times the zoom, no crop to the frame; the window kept is the half
+    // frame plus the pan on each side of the centre (320 * 0.6 * 2 = 384, 180 * 0.5 * 2 = 180)
+    // and a margin of 8 px.
+    let c = chain(&zoomed_out, Some((160, 120)));
+    assert!(
+        c.contains(
+            "scale=320*0.8:180*0.8:force_original_aspect_ratio=increase,crop=w='iw-4*floor(max(0,iw-400)/4)':h='ih-4*floor(max(0,ih-196)/4)',setsar=1"
+        ),
+        "{c}"
+    );
+    assert!(!c.contains("crop=320:180"), "{c}");
+    assert_eq!(scales(&c), 1, "{c}");
+    // The same clip held by a moving zoom is the chain it always had: the cover cropped to the frame,
+    // then the zoom, so the picture is the frame zoomed (256x144).
+    let mut moving = zoomed_out.clone();
+    moving.keyframes = vec![key(0.0, 0.8, 0.1), key(2.0, 1.2, 0.1)];
+    assert_eq!(moving.fit_order(Fit::Cover, true), FitOrder::Fitted);
+    let c = chain(&moving, Some((160, 120)));
+    assert!(
+        c.contains("scale=320:180:force_original_aspect_ratio=increase,crop=320:180,") && !c.contains("floor("),
+        "{c}"
+    );
+    // Footage of the frame's own shape has no overhang: it is cropped to the frame as it was.
+    let c = chain(&zoomed_out, Some((320, 180)));
+    assert!(
+        c.contains("scale=320:180:force_original_aspect_ratio=increase,crop=320:180,scale=iw*0.8:ih*0.8,setsar=1"),
+        "{c}"
+    );
+}
+
 #[test]
 fn the_window_kept_of_an_uncropped_picture_follows_the_pan_the_turn_and_the_blur() {
     let crop = |pan, rotation, margin| bound_crop((1080, 1920), pan, rotation, margin);

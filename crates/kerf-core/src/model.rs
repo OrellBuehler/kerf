@@ -7783,6 +7783,56 @@ mod tests {
     }
 
     #[test]
+    fn a_cover_clip_zoomed_out_and_moved_over_a_cover_that_overhangs_is_uncropped() {
+        let key = |time: f64, scale: f64| Keyframe {
+            time,
+            scale,
+            pos_x: 0.1,
+            pos_y: 0.0,
+            rotation: 0.0,
+            opacity: 1.0,
+            easing: Default::default(),
+        };
+        // The case that hangs 4:3 footage in a 16:9 frame: a static zoom out of 0.8 and a pan of 0.1.
+        let mut clip = clip_at(0.0, 4.0);
+        clip.transform.scale = 0.8;
+        clip.transform.pos_x = 0.1;
+        assert_eq!(clip.held_scale(), Some(0.8));
+        assert_eq!(clip.pan_extent(), (0.1, 0.0));
+        // The whole cover is zoomed and the canvas cuts it (the zoom out reveals the overhang)...
+        assert_eq!(clip.fit_order(Fit::Cover, true), FitOrder::Uncropped);
+        // ... but a picture of the frame's own shape has none to reveal, so it keeps its chain,
+        assert_eq!(clip.fit_order(Fit::Cover, false), FitOrder::Fitted);
+        // as does a zoom out under Contain,
+        assert_eq!(clip.fit_order(Fit::Contain, true), FitOrder::Fitted);
+        // a zoom that moves (it is the chain's last stage, at the fit size),
+        clip.keyframes = vec![key(0.0, 0.8), key(2.0, 1.2)];
+        assert_eq!(clip.held_scale(), None);
+        assert_eq!(clip.fit_order(Fit::Cover, true), FitOrder::Fitted);
+        // and a mask or a vignette, which are laid out over the frame the chain hands them.
+        clip.keyframes.clear();
+        clip.mask = Some(Mask::default());
+        assert_eq!(clip.fit_order(Fit::Cover, true), FitOrder::Fitted);
+        clip.mask = None;
+        clip.effects = vec![VideoEffect::Vignette];
+        assert_eq!(clip.fit_order(Fit::Cover, true), FitOrder::Fitted);
+        // A keyed pan over a held zoom is the same order as the static one.
+        let mut keyed = clip_at(0.0, 4.0);
+        keyed.keyframes = vec![key(0.0, 0.8), key(2.0, 0.8)];
+        assert_eq!(keyed.held_scale(), Some(0.8));
+        assert_eq!(keyed.fit_order(Fit::Cover, true), FitOrder::Uncropped);
+        // A zoom in is the cover times the zoom whatever the shape; the identity and a turn are never.
+        let mut zoomed = clip_at(0.0, 4.0);
+        zoomed.transform.scale = 1.5;
+        assert_eq!(zoomed.fit_order(Fit::Cover, false), FitOrder::Uncropped);
+        assert_eq!(zoomed.fit_order(Fit::Contain, false), FitOrder::Folded);
+        let mut turned = clip_at(0.0, 4.0);
+        turned.transform.rotation = 15.0;
+        assert_eq!(turned.fit_order(Fit::Cover, true), FitOrder::Fitted);
+        assert_eq!(clip_at(0.0, 4.0).fit_order(Fit::Cover, true), FitOrder::Fitted);
+    }
+
+    #[test]
     fn beat_grid_maps_source_beats_onto_the_timeline() {
         // A music clip cut from 2s into the source and placed at 10s: a beat at
         // source 3.0 is heard at 11.0, and beats outside the window never sound.

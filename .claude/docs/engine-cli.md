@@ -938,7 +938,10 @@ so the feature is **only** activated through these forwards — which is what ma
   rotation, crop, mask, effects, grade, fades, HLG, Cover, a still, speed, reverse, every
   transition, a range export, every frame rate, a slow source, a shared input and the
   playback stream (`KERF_ZOOM_KEEP` keeps what they rendered, `KERF_ZOOM_VERBOSE` prints
-  the frames worth a look); `rendered.rs`'s `a_keyframed_zoom_is_read_at_the_output_frame_…`
+  the frames worth a look; their oracle, `expected`, takes `Clip::fit_order` into account: a static zoom or a
+  position over a Cover picture that hangs over the frame is the **whole cover** zoomed and cut by the canvas,
+  not the cropped frame zoomed, which the alpha case "transparent FFV1, cover" (4:3 in 16:9, 0.8, pos 0.1) caught);
+  `rendered.rs`'s `a_keyframed_zoom_is_read_at_the_output_frame_…`
   is the mechanism, straight off the filter. The plan (`render_plan`) mirrors the order by
   refusing what a compositor does not order that way: a Motion plan refuses a moving zoom (`Unsupported::KeyedZoom`, until
   `GpuCaps::keyed_zoom`, which `kerf-gpu` sets: it draws the grade, effects, mask and fades at the fit size and zooms after
