@@ -64,7 +64,7 @@ fn assert_tiles(parts: &[Part], frames: u64) {
     assert!(parts.iter().all(|p| p.frames > 0));
 }
 
-fn graph_of(args: &[String]) -> String {
+pub(super) fn graph_of(args: &[String]) -> String {
     args[args.iter().position(|a| a == "-filter_complex").unwrap() + 1].clone()
 }
 
@@ -534,4 +534,210 @@ fn a_multi_format_export_of_a_long_cut_is_rendered_one_delivery_at_a_time() {
     let short = sequence(&a, 3, 1.4);
     assert!(together::export_in_parts(&long, &assets, &variants, &opts()));
     assert!(!together::export_in_parts(&short, &assets, &variants, &opts()));
+}
+
+// ---- a part draws a clip as the whole export does ------------------------------------------------
+
+/// `s` split at `sep` where ffmpeg's graph parser would: not inside single quotes, not after a
+/// backslash (a filter's expression holds commas and a `sendcmd` list holds semicolons).
+pub(super) fn split_top(s: &str, sep: char) -> Vec<&str> {
+    let (mut parts, mut from, mut quoted, mut escaped) = (Vec::new(), 0, false, false);
+    for (i, c) in s.char_indices() {
+        match c {
+            _ if escaped => escaped = false,
+            '\\' => escaped = true,
+            '\'' => quoted = !quoted,
+            c if c == sep && !quoted => {
+                parts.push(&s[from..i]);
+                from = i + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(&s[from..]);
+    parts
+}
+
+/// The statements of a graph (split once) that make clip `flat`'s picture: the chain ending `[v{flat}]`,
+/// and the inner statements of a blurred fill before it, the source label of the first taken off. What
+/// is left is the clip's chain, which is the same whichever input it reads.
+pub(super) fn clip_chain(statements: &[&str], flat: usize) -> Option<Vec<String>> {
+    let end = format!("[v{flat}]");
+    let inner = ["b", "f", "bb", "ff"].map(|k| format!("[bfc{flat}{k}]"));
+    let at = statements.iter().position(|s| s.ends_with(&end))?;
+    let mut mine: Vec<String> = (0..=at)
+        .filter(|&i| i == at || inner.iter().any(|label| statements[i].contains(label.as_str())))
+        .map(|i| statements[i].to_string())
+        .collect();
+    let first = &mut mine[0];
+    *first = first[first.find(']')? + 1..].to_string();
+    Some(mine)
+}
+
+/// A restarted still's chain starts `settb,setpts=N+k,trim=end_frame=n` where the whole export's
+/// starts `trim,setpts=PTS-STARTPTS+…` (a crop sits between those two): the same chain once those
+/// stamps are taken off both.
+pub(super) fn without_stamp(mut chain: Vec<String>, restarted: bool) -> Vec<String> {
+    let filters: Vec<String> = split_top(&chain[0], ',').iter().map(ToString::to_string).collect();
+    let kept: Vec<&str> = filters
+        .iter()
+        .map(String::as_str)
+        .filter(|f| {
+            let stamp = if restarted {
+                f.starts_with("settb=expr=") || f.starts_with("setpts=N+") || f.starts_with("trim=end_frame=")
+            } else {
+                f.starts_with("trim=start=") || f.starts_with("setpts=PTS-STARTPTS")
+            };
+            !stamp
+        })
+        .collect();
+    chain[0] = kept.join(",");
+    chain
+}
+
+/// What a statement list says about how clip `flat` is laid over the canvas: its `overlay` filter.
+fn overlay_of(statements: &[&str], flat: usize) -> Option<String> {
+    let at = format!("][v{flat}]overlay");
+    statements
+        .iter()
+        .find(|l| l.contains(&at))
+        .map(|l| l[l.find("overlay").unwrap()..l.rfind('[').unwrap()].to_string())
+}
+
+/// Whether every clip a part draws has the chain, and the overlay, it has in the whole export's graph
+/// (`whole_args` is the whole export's argv). `Err` names the first that does not; `Ok` counts the clips
+/// compared.
+pub(super) fn parts_draw_as_whole(
+    plan: &PartsPlan,
+    assets: &[Asset],
+    opts: &ExportOptions,
+    whole_args: &[String],
+) -> std::result::Result<usize, String> {
+    let whole_graph = graph_of(whole_args);
+    let whole = split_top(&whole_graph, ';');
+    let floating = svg_layer::svg_sequences(&plan.cut, &plan.fmt);
+    let mut compared = 0;
+    for (i, part) in plan.parts.iter().enumerate() {
+        let args = build_part_args(
+            plan,
+            assets,
+            opts,
+            part,
+            &floating,
+            &format!("/tmp/part-{i}.mkv"),
+            "-fps_mode",
+        )
+        .map_err(|e| format!("part {i}: {e}"))?;
+        let graph = graph_of(&args);
+        let mine = split_top(&graph, ';');
+        let contents = part_contents(plan, part);
+        for flat in (0..contents.include.len()).filter(|&f| contents.include[f]) {
+            let restarted = contents.restarts.contains_key(&flat);
+            let (Some(drawn), Some(expected)) = (clip_chain(&mine, flat), clip_chain(&whole, flat)) else {
+                return Err(format!("clip {flat} has no chain in part {i} or in the whole graph"));
+            };
+            let (drawn, expected) = if restarted {
+                (without_stamp(drawn, true), without_stamp(expected, false))
+            } else {
+                (drawn, expected)
+            };
+            if drawn != expected {
+                return Err(format!(
+                    "clip {flat} in part {i}{}:\n part  {drawn:?}\n whole {expected:?}",
+                    if restarted { " (restarted)" } else { "" }
+                ));
+            }
+            let (lay, whole_lay) = (overlay_of(&mine, flat), overlay_of(&whole, flat));
+            if lay != whole_lay || lay.is_none() {
+                return Err(format!(
+                    "the overlay of clip {flat} in part {i}:\n part  {lay:?}\n whole {whole_lay:?}"
+                ));
+            }
+            compared += 1;
+        }
+    }
+    Ok(compared)
+}
+
+/// Twenty-four 4K clips under a logo that stays on screen, with every kind of zoom and pan the fit
+/// order has an opinion on: zoomed in and out, a keyed zoom that never moves and one that does, a
+/// pan, reversed, cropped, under a vignette.
+fn zoomed_reel() -> (Timeline, Vec<Asset>) {
+    use crate::model::{Property, PropertyKey, PropertyTrack};
+    let a = uhd("/m/a.mp4");
+    let l = logo("/m/logo.png");
+    let mut clips: Vec<Clip> = (0..24)
+        .map(|i| make_clip(a.id, 1.0 + i as f64 * 0.37, 2.4 + i as f64 * 0.37, i as f64 * 1.4))
+        .collect();
+    let keyed = |keys: [(f64, f64); 2], prop| PropertyTrack {
+        prop,
+        keys: keys.iter().map(|&(t, v)| PropertyKey::new(t, v)).collect(),
+    };
+    clips[3].transform.scale = 1.3;
+    clips[4].channels = vec![keyed([(0.0, 1.3), (1.0, 1.3)], Property::Scale)];
+    clips[5].channels = vec![keyed([(0.0, 1.0), (1.0, 1.5)], Property::Scale)];
+    clips[6].transform.scale = 0.8;
+    clips[7].transform.pos_x = 0.3;
+    clips[8].speed = -1.0;
+    clips[8].transform.scale = 1.3;
+    clips[9].transform.scale = 1.1;
+    clips[9].channels = vec![keyed([(0.0, 0.0), (1.0, 0.4)], Property::PosX)];
+    clips[10].transform.crop_left = 0.1;
+    clips[10].transform.scale = 1.2;
+    clips[11].effects = vec![crate::model::VideoEffect::Vignette];
+    clips[11].transform.scale = 1.3;
+    clips[12].channels = vec![
+        keyed([(0.0, 1.2), (1.0, 1.2)], Property::Scale),
+        keyed([(0.0, 0.2), (1.0, 0.2)], Property::PosX),
+    ];
+    let mut overlay = make_clip(l.id, 0.0, 34.0, 0.0);
+    overlay.transform.scale = 1.3;
+    overlay.transform.pos_x = 0.2;
+    let mut timeline = timeline_of(vec![video_track(clips)]);
+    timeline.tracks.push(crate::model::Track {
+        clips: vec![overlay],
+        ..crate::model::Track::new(StreamKind::Video, "V2")
+    });
+    // A second logo that is shrunk and moved: under Cover it reveals what the frame's crop would hide.
+    let l2 = logo("/m/logo2.png");
+    let mut small = make_clip(l2.id, 0.0, 34.0, 0.0);
+    small.transform.scale = 0.8;
+    small.transform.pos_x = 0.2;
+    timeline.tracks.push(crate::model::Track {
+        clips: vec![small],
+        ..crate::model::Track::new(StreamKind::Video, "V3")
+    });
+    (timeline, vec![a, l, l2])
+}
+
+#[test]
+fn a_part_fits_and_zooms_a_clip_in_the_order_the_whole_export_does() {
+    // Under Contain a zoom in is folded into the fit's own scale, under Cover it is cut from the whole
+    // picture rather than the frame's crop of it, and a zoom that holds still counts as one that is
+    // static: the order is the clip's and the frame's, so a part must not judge it otherwise — not for
+    // a keyed zoom that holds still, not for a Cover clip whose picture overhangs the frame, and not
+    // for a still the part picks up at a cut, which has a picture of its own size too.
+    let (timeline, assets) = zoomed_reel();
+    let mut restarted = 0;
+    for fit in [Fit::Contain, Fit::Cover, Fit::Blur] {
+        for resolution in [(1920, 1080), (1080, 1920), (1080, 1080)] {
+            let opts = ExportOptions {
+                fit,
+                resolution: Some(resolution),
+                ..opts()
+            };
+            let plan = plan_export(&timeline, &assets, &opts, SEGMENT_LIMITS).expect("parts");
+            assert!(plan.parts.len() > 3);
+            let whole = build_export_args(&timeline, &assets, "out.mp4", &opts).unwrap();
+            let compared =
+                parts_draw_as_whole(&plan, &assets, &opts, &whole).unwrap_or_else(|e| panic!("{fit:?} {resolution:?}: {e}"));
+            assert!(compared >= 26, "{compared} clips compared");
+            restarted += plan
+                .parts
+                .iter()
+                .filter(|p| !part_contents(&plan, p).restarts.is_empty())
+                .count();
+        }
+    }
+    assert!(restarted >= 54, "the logo is picked up at a cut in later parts: {restarted}");
 }

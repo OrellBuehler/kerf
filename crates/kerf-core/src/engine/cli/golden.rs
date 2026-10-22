@@ -2400,3 +2400,56 @@ fn the_parts_argv_builders_produce_the_golden_digests() {
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
+
+/// In every case of the corpus a part draws each clip it holds with the chain, and the overlay, the clip
+/// has in the whole export's graph: the fit order, the zoom, the crop, the effects. The digests pin the
+/// parts' argv, which a change to the whole chain moves along with it; this is what says the move was
+/// not one the parts alone made.
+#[test]
+fn a_part_draws_every_clip_of_the_corpus_as_the_whole_export_does() {
+    let assets = pool();
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8);
+    let results: Vec<(usize, Option<String>, usize)> = std::thread::scope(|s| {
+        let workers: Vec<_> = (0..threads)
+            .map(|w| {
+                let assets = &assets;
+                s.spawn(move || {
+                    (w..TOTAL)
+                        .step_by(threads)
+                        .filter_map(|i| {
+                            let c = case(i, assets);
+                            pinned(true, true, || {
+                                let plan = segments::plan_export(&c.timeline, assets, &c.opts, PARTS_LIMITS)?;
+                                let whole = build_export_args(&c.timeline, assets, "/golden/out.mp4", &c.opts).ok()?;
+                                Some(match segments_tests::parts_draw_as_whole(&plan, assets, &c.opts, &whole) {
+                                    Ok(n) => (i, None, n),
+                                    Err(e) => (i, Some(e), 0),
+                                })
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        workers.into_iter().flat_map(|w| w.join().unwrap()).collect()
+    });
+    let wrong: Vec<_> = results.iter().filter(|(_, e, _)| e.is_some()).collect();
+    let compared: usize = results.iter().map(|r| r.2).sum();
+    assert!(
+        results.len() > TOTAL / 2 && compared > 8 * TOTAL,
+        "the corpus stopped being cut into parts: {} cases, {compared} clips",
+        results.len()
+    );
+    assert!(
+        wrong.is_empty(),
+        "{} of {} cases have a part that draws a clip other than the whole export does; the first:\n{}",
+        wrong.len(),
+        results.len(),
+        wrong
+            .iter()
+            .take(5)
+            .map(|(i, e, _)| format!("case {i}: {}", e.as_deref().unwrap_or_default()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}

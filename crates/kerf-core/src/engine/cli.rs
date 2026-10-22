@@ -9370,7 +9370,9 @@ fn video_clip_chain_stamped(
     // the overlay (not padded full-frame), and its zoom is re-evaluated per frame.
     let geom_identity = t.is_identity() && !anim;
     // A reprojected picture and a title's pictures come out at the frame's own size: nothing hangs over it.
-    let picture = if reframe.is_some() || stamp.is_some() {
+    // (A title is the clip that has no asset: a still an export in parts picks up at a cut is stamped too,
+    // and keeps its own picture, whose size decides the order as it does in the whole export.)
+    let picture = if reframe.is_some() || clip.is_generated() {
         Some((fmt.width, fmt.height))
     } else {
         picture

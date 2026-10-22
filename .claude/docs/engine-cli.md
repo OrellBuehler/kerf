@@ -723,7 +723,12 @@ so the feature is **only** activated through these forwards — which is what ma
     graph (`setpts=PTS-STARTPTS`). Nothing is rebased, so nothing moves by an ulp. Titles (floating SVG) read the
     pictures of the whole export's directory from the first one the part needs (`-start_number`); captions are the
     overlays that touch it. A part with no clip is the canvas in the 8-bit 4:2:0 the overlays compose in.
-    `canvas_frames` reproduces `color=d=`'s frame count (checked against the binary).
+    `canvas_frames` reproduces `color=d=`'s frame count (checked against the binary). A clip's **chain is the whole
+    run's** for the same reason: the fit order (`Clip::fit_order`: a zoom in folded into the fit, a Cover left
+    uncropped, or fitted first) is decided by the clip, the frame and the clip's picture, so a still the part restarts
+    keeps its asset's size for `cover_overflows` (only a title and a reprojected picture are the frame's size; the
+    stamp is not the test). `a_part_fits_and_zooms_a_clip_in_the_order_the_whole_export_does` (a keyed zoom that holds
+    still, Cover clips and stills restarted at a cut) and the corpus test in `golden.rs` hold every part's chains against the whole's.
   * **The join is lossless, and the encode is one.** Each part is FFV1 (intra, `-coder 1`, in Matroska, `-pix_fmt yuv420p`
     — **every part the same format**: a mid-stream change of pixel format made the concat reader reconfigure the graph and
     lose frames) of exactly its frame count, checked from ffmpeg's `frame=`; the **last pass** reads them with the concat
