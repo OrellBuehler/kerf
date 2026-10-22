@@ -55,8 +55,8 @@ function hostTriple() {
 // does, or before cutting a release that has been a while coming. Note these builds are
 // configured `--disable-whisper`, so the bundled binary has no `whisper` filter
 // — transcription on a bundled platform needs the `whisper` cargo feature.
-const BTBN_TAG = "autobuild-2026-10-18-13-01";
-const BTBN_BUILD = "n9.0.2-28-g669f5ab083";
+const BTBN_TAG = "autobuild-2026-10-21-13-06";
+const BTBN_BUILD = "n9.0.2-31-gc89d6ee1ca";
 const BTBN_BRANCH = "9.0";
 const BTBN = `https://github.com/BtbN/FFmpeg-Builds/releases/download/${BTBN_TAG}`;
 // evermeet.cx serves per-version URLs alongside its rolling `getrelease` ones.
@@ -72,7 +72,7 @@ function sources({ btbn: BTBN, build: BTBN_BUILD, branch: BTBN_BRANCH, evermeet:
       archives: [
         {
           url: `${BTBN}/ffmpeg-${BTBN_BUILD}-win64-gpl-${BTBN_BRANCH}.zip`,
-          sha256: "a38198cc130ed3fa02097d0baebcea9c1b8a9d9d3d1d8161d691d1f03709158b",
+          sha256: "48c50bfed1374179b9d8cc993d6c4b64e8da5b35f348c6381bf475385c89befa",
           wants: ["ffmpeg.exe", "ffprobe.exe"],
         },
       ],
@@ -82,7 +82,7 @@ function sources({ btbn: BTBN, build: BTBN_BUILD, branch: BTBN_BRANCH, evermeet:
       archives: [
         {
           url: `${BTBN}/ffmpeg-${BTBN_BUILD}-linux64-gpl-${BTBN_BRANCH}.tar.xz`,
-          sha256: "d2cc2d5446f14ff32b411e4fee488005b472023fb6554bed0ea80b7110f0b3a6",
+          sha256: "2212009529e7a18809c0a23700e8045364c17853c4390cf8c051e6b65dd97bde",
           wants: ["ffmpeg", "ffprobe"],
         },
       ],
