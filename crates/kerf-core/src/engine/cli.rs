@@ -8162,7 +8162,15 @@ fn bound_crop(frame: (u32, u32), pan: (f64, f64), rotation: Rotated, margin: f64
         Rotated::Keyed => (ax.hypot(ay), ax.hypot(ay)),
     };
     // (A turn of exactly 90 degrees leaves a cosine of 1e-16; the epsilon keeps it from costing a pixel.)
-    let need = |half: f64| (2.0 * half + 2.0 * margin - 1e-6).ceil().clamp(2.0, 1e9) as u64;
+    // (A number that is not one — a hand-edited file — keeps the whole picture, as it never cuts.)
+    let need = |half: f64| {
+        let v = 2.0 * half + 2.0 * margin - 1e-6;
+        if v.is_finite() {
+            v.ceil().clamp(2.0, 1e9) as u64
+        } else {
+            1_000_000_000
+        }
+    };
     format!(
         "crop=w='iw-4*floor(max(0,iw-{nw})/4)':h='ih-4*floor(max(0,ih-{nh})/4)'",
         nw = need(wx),
@@ -9141,13 +9149,13 @@ fn video_clip_chain_stamped(
     // A keyframed clip is treated as non-identity so its picture is centered by
     // the overlay (not padded full-frame), and its zoom is re-evaluated per frame.
     let geom_identity = t.is_identity() && !anim;
-    // Whether the clip's zoom is part of the fit (one resample from the source), or follows it.
     // A reprojected picture and a title's pictures come out at the frame's own size: nothing hangs over it.
     let picture = if reframe.is_some() || stamp.is_some() {
         Some((fmt.width, fmt.height))
     } else {
         picture
     };
+    // Whether the clip's zoom is part of the fit (one resample from the source), or follows it.
     let order = clip.fit_order(
         fmt.fit,
         crate::layer_geometry::cover_overflows(picture, (fmt.width, fmt.height), t),

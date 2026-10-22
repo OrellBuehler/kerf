@@ -467,7 +467,10 @@ so the feature is **only** activated through these forwards — which is what ma
   overlay's own `(W-w)/2` still puts the centre where the whole picture would be, cut in fours so an even picture stays
   even and each side loses an even amount (the overlay's round-down-to-even then changes nothing). Rendered
   (`cli/zoom_fit.rs`, `#[ignore]`d, 4.4.2) it is **bit-identical** (PSNR 99 dB) to the source scaled and cropped by hand,
-  and the still is bit-identical to the export. Uncropped needs the cover to hang over the frame
+  and the still is bit-identical to the export; with a rotation the bounded picture is the whole cover's to 49.6 dB (8 degrees),
+  99 dB (90) and 47.7 dB (keyed) on a slowly changing picture (`rotw` of a different size moves the centre half a pixel). The
+  bound saves the overlay and everything after it, **not the `scale` before it**, which is the cover times the zoom (63 Mpx for
+  4K 16:9 zoomed 3x in a vertical frame): cropping the source first would, at the price of the exact geometry; not done. Uncropped needs the cover to hang over the frame
   (`layer_geometry::cover_overflows`: the displayed size is known and another shape, else cautious yes) *and* a zoom (either
   side of 1) or a pan, or any zoom in; **a picture of the frame's own shape keeps its chain for a move or a zoom out** (a
   webcam PiP over a 16:9 cut in a 16:9 frame: nothing past the frame to reveal). Unchanged, byte for byte: the identity;
@@ -477,7 +480,9 @@ so the feature is **only** activated through these forwards — which is what ma
   frame's); a reframed clip and a title (their pictures come out at the frame's size). Folding the moving zoom
   (`iw*fit*expr` from the source size) was left: every stage between the fit and the zoom (colour, grade, effects, mask,
   `rotate`, fades, the tone-map) would run at source size, 4x the pixels (`geq` ~150 ms a frame at 1080p) and with a blur's
-  sigma, a vignette and a mask edge defined at another scale. The still follows
+  sigma, a vignette and a mask edge defined at another scale. Only a chain with nothing between (a bare Ken Burns) could be
+  folded, and that would make every GPU-6 keyed-zoom case a refusal, unredrawable here (no adapter), on a per-frame
+  `force_original_aspect_ratio` that was not measured on 6.1 / 9.0. The still follows
   (`still_clip_chain_graded(.., order)`; judged at the *delivery* frame, no `bound_crop`: one frame). Golden: structural
   families `zoom-folded`, `cover-uncropped` and their `still-` / `preview-` forms; the moved sets equal them exactly.
   **The shape itself is a property of the project**, not of one render:

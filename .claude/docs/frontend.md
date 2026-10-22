@@ -602,7 +602,9 @@ delivery frame, else the first picture of the rendered cut, even sides, the deli
 rounding, chroma grids, `pix_fmt_subsampling`) replayed against a Rust-written corpus (`core-render-plan.md`), at the
 clip's pose at the playhead (`transformAt`). A translucent picture of odd size, which the engine's geometry refuses for its
 pixels (FFmpeg's RGB round trip), is boxed as if opaque: opacity moves nothing; only a picture nothing draws (an empty
-crop) has no box. A click on a picture selects the topmost clip under it (later video tracks
+crop) has no box. (A zoom in under Contain, and a Cover clip that zooms or pans, are one `scale` from the source in the file now
+(`engine-cli.md`, "A zoom is part of the fit"): the port still places fit-then-zoom, within a pixel or two for Contain and, for
+Cover, as the zoomed *frame* where the file has the larger cover cut by the canvas.) A click on a picture selects the topmost clip under it (later video tracks
 on top) and can carry straight into a move. Body = move, corners = scale about the centre, the knob = rotate, edges =
 crop — only under a Contain fit with position / scale / rotation unkeyed, and it moves the scale and position so the rest
 of the picture stays put (the export re-fits and re-centres a cropped window). Snapping (on with the timeline's snap

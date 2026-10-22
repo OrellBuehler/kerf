@@ -235,6 +235,27 @@ fn a_cover_clip_that_pans_is_scaled_to_cover_and_the_overlay_cuts_it() {
     assert!(!c.contains("eval=frame"), "{c}");
 }
 
+/// A slide or push brings the clip in from a frame away: the window it keeps has to hold what the
+/// canvas shows of it all the way (the travel adds to the position's own reach).
+#[test]
+fn the_window_of_a_cover_clip_that_slides_in_holds_the_whole_travel() {
+    let mut zoomed = clip(1.5);
+    zoomed.transform.pos_y = 0.1;
+    let sliding = ClipFx {
+        // From a frame to the left, over half a second.
+        move_in: Some((-1.0, 0.0, 0.5)),
+        ..ClipFx::default()
+    };
+    let c = chain_with(&zoomed, &format(Fit::Cover), &sliding);
+    // 1080 * (0.5 + 1) * 2 + 16 across; 1920 * (0.5 + 0.1) * 2 + 16 down.
+    assert!(
+        c.contains("crop=w='iw-4*floor(max(0,iw-3256)/4)':h='ih-4*floor(max(0,ih-2320)/4)'"),
+        "{c}"
+    );
+    let still = chain_with(&zoomed, &format(Fit::Cover), &ClipFx::default());
+    assert!(still.contains("max(0,iw-1096)"), "{still}");
+}
+
 #[test]
 fn what_a_cover_clip_shows_of_the_frame_alone_is_cropped_to_it_as_it_was() {
     let crops = "scale=1080:1920:force_original_aspect_ratio=increase,crop=1080:1920,setsar=1";
@@ -325,6 +346,11 @@ fn the_window_kept_of_an_uncropped_picture_follows_the_pan_the_turn_and_the_blur
     assert_eq!(crop((0.0, 0.0), Rotated::Keyed, 8.0), text(circle, circle));
     // A blur reads about three sigma past a pixel.
     assert_eq!(crop((0.0, 0.0), Rotated::No, 8.0 + 3.0 * 10.0), text(1156, 1996));
+    // A pan that is no number keeps the picture whole rather than cutting it to nothing.
+    assert_eq!(
+        crop((f64::NAN, f64::INFINITY), Rotated::No, 8.0),
+        text(1_000_000_000, 1_000_000_000)
+    );
 }
 
 #[test]
@@ -376,6 +402,29 @@ fn fine(dir: &Path) -> Asset {
             .arg(
                 "nullsrc=s=4096x2160:r=5:d=0.6,format=yuv420p,\
                  geq=lum='128+100*sin(X*0.8)*sin(Y*0.8)':cb=128:cr=128",
+            )
+            .args(["-c:v", "libx264", "-preset", "ultrafast", "-crf", "0", "-pix_fmt", "yuv420p"])
+            .arg(&path)
+            .status_bounded()
+            .expect("run ffmpeg");
+        assert!(made.success());
+    }
+    let mut asset = test_asset(vec![video_stream(4096, 2160, 5.0)]);
+    asset.path = path.to_string_lossy().into_owned();
+    asset.duration = 0.6;
+    asset
+}
+
+/// A 4096x2160 picture that changes slowly (features a few hundred pixels across): two frames of it
+/// that differ by a fraction of a pixel are alike to 40 dB and more, where the grid of `fine` is not.
+fn broad(dir: &Path) -> Asset {
+    let path = dir.join("broad.mp4");
+    if !path.exists() {
+        let made = command(&ffmpeg_bin())
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i"])
+            .arg(
+                "nullsrc=s=4096x2160:r=5:d=0.6,format=yuv420p,\
+                 geq=lum='128+80*sin(X*0.006)*sin(Y*0.007)+30*sin((X+Y)*0.02)':cb='128+40*sin(X*0.003)':cr='128+40*sin(Y*0.003)'",
             )
             .args(["-c:v", "libx264", "-preset", "ultrafast", "-crf", "0", "-pix_fmt", "yuv420p"])
             .arg(&path)
@@ -645,6 +694,74 @@ fn a_cover_clip_that_pans_shows_the_picture_past_the_frame_not_black() {
         let to_export = psnr(&still, export);
         eprintln!("PSNR of the still against the export, {tag}: {to_export:.1} dB");
         assert!(to_export > 45.0, "{tag}: the still is the export's frame: {to_export}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `graph` with the export's centred bounding `crop` taken out: the cover of the frame times the zoom,
+/// whole, as the overlay would be handed it without the bound.
+fn without_the_bound(graph: &str) -> String {
+    let at = graph.find(",crop=w='iw-4*floor(").expect("a bounded picture");
+    let end = at + graph[at..].find(")/4)'").unwrap() + 5;
+    let end = end + graph[end..].find(")/4)'").unwrap() + 5;
+    format!("{}{}", &graph[..at], &graph[end..])
+}
+
+/// Whether the corners of the frame (a block of 8x8 pixels at each) are picture, not black.
+fn corners_are_picture(frame: &[u8]) -> bool {
+    [(0, 0), (FW - 8, 0), (0, FH - 8), (FW - 8, FH - 8)]
+        .iter()
+        .all(|&(x0, y0)| (0..8).all(|dy| (0..8).all(|dx| luma(frame, x0 + dx, y0 + dy) > 12.0)))
+}
+
+/// The centred window the export keeps of an uncropped picture is what any frame can show, **turned
+/// with the picture**: a Cover clip that zooms, moves and turns (a static angle, and the keyed one's
+/// circle) draws the same frame as the whole cover of the frame would, to the pixel, and the frame is
+/// picture to its corners.
+#[test]
+#[ignore = "needs the ffmpeg binary"]
+#[allow(clippy::print_stderr)]
+fn the_bounded_picture_of_a_turning_cover_clip_draws_what_the_whole_cover_would() {
+    let dir = scratch("zoom-fit-turn");
+    let asset = broad(&dir);
+    let assets = vec![asset.clone()];
+    let turned = |edit: &dyn Fn(&mut Clip)| {
+        let mut c = make_clip(asset.id, 0.0, 0.4, 0.0);
+        c.transform.scale = 1.2;
+        c.transform.pos_x = 0.1;
+        c.transform.pos_y = -0.02;
+        edit(&mut c);
+        let mut tl = single(vec![c]);
+        tl.format = Some(Delivery::new(FW, FH, Fit::Cover));
+        tl
+    };
+    let key = |time: f64, rotation: f64| Keyframe {
+        time,
+        scale: 1.2,
+        pos_x: 0.1,
+        pos_y: -0.02,
+        rotation,
+        opacity: 1.0,
+        easing: Default::default(),
+    };
+    for (name, tl) in [
+        ("static 8 degrees", turned(&|c| c.transform.rotation = 8.0)),
+        ("static 90 degrees", turned(&|c| c.transform.rotation = 90.0)),
+        ("keyed", turned(&|c| c.keyframes = vec![key(0.0, 0.0), key(0.4, 10.0)])),
+    ] {
+        let bounded = first_frame(&tl, &assets, &dir, name, str::to_string);
+        let whole = first_frame(&tl, &assets, &dir, &format!("{name}-whole"), without_the_bound);
+        // The two differ by the half pixel the rotated box's parity moves the centre by (`rotw` of a
+        // picture that is not the same size), which a slowly changing picture shows at 40 dB and more.
+        let same = psnr(&bounded, &whole);
+        eprintln!(
+            "{name}: bounded against whole: PSNR {same:.1} dB; corners are picture: {}",
+            corners_are_picture(&whole)
+        );
+        assert!(same > 40.0, "{name}: the bound cost more than a pixel of the frame: {same}");
+        if name == "static 8 degrees" {
+            assert!(corners_are_picture(&bounded), "{name}: the corners are the picture's");
+        }
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
