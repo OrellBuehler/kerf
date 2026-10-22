@@ -5381,9 +5381,19 @@ impl KerfMcp {
                        `_meta` to receive progress notifications while it runs, and cancel the request \
                        (`notifications/cancelled`) to stop it — a cancelled render deletes its half-written file \
                        rather than leaving a broken one behind. Or pass `background: true` to get a job_id at once \
-                       and poll job_status (cancel_job stops it). Refuses to overwrite an existing file unless \
+                       and poll job_status (cancel_job stops it); its `message` says the stage — `metering loudness`, \
+                       `starting ffmpeg and seeking the footage` (nothing is written while it opens a long recording and \
+                       seeks a range's start), `rendering, … to go`, `finishing the file`, `measuring the written file` — \
+                       and `progress` is over the whole export. Refuses to overwrite an existing file unless \
                        overwrite is true, and refuses to write over a file the project still uses (a source, a \
-                       proxy, the project itself)."
+                       proxy, the project itself). The result is `{output, report}`: `report` is what the written FILE \
+                       measures (not the timeline mix `get_levels` reads) — `container`, `duration_secs`, `size_bytes`, overall \
+                       `bit_rate`, `video` (codec, width, height, fps, pix_fmt, bit_rate), `audio` (codec, sample_rate, \
+                       channels, bit_rate) and, when it has sound, `loudness` (integrated_lufs, true_peak_dbtp, \
+                       loudness_range_lu, peak_dbfs: the file's own, after the lossy encode), with the `target` of \
+                       `options.loudness` and `true_peak_over_db` when the true peak is over that target's ceiling. A \
+                       measurement that fails (or is stopped by cancel) says why in `report.problem` and does not fail \
+                       the export."
     )]
     async fn export(
         &self,
@@ -5420,20 +5430,17 @@ impl KerfMcp {
                     )
                 };
                 let mut on_progress = |progress: kerf_core::ExportProgress| {
-                    run.progress(
-                        Some(progress.fraction),
-                        match progress.eta_secs {
-                            Some(eta) => format!("rendering, {} to go", fmt_ts(eta)),
-                            None => "rendering".to_string(),
-                        },
-                    );
+                    run.progress(Some(progress.fraction), export_message(&progress));
                 };
                 let before = kerf_core::file_mtime(&output);
                 // The picture the file will be, said back: the size and rate the options and the
                 // delivery frame made of the footage's own.
                 let frame = kerf_core::exported_frame(&timeline, &assets, &opts);
-                let status =
-                    kerf_core::render_with_progress(&timeline, &assets, &output, &opts, &mut on_progress, &|| run.cancelled())
+                // A completed render is read back in the same job (`report`: the file's streams and
+                // its own loudness), stopped by the same cancel; a measurement that fails says so in
+                // the report and does not fail the export.
+                let (status, report) =
+                    kerf_core::render_measured(&timeline, &assets, &output, &opts, &mut on_progress, &|| run.cancelled())
                         .map_err(|e| {
                             // A failed render must not leave a truncated file that reads as a
                             // finished one — and must not touch an earlier export it never wrote over.
@@ -5446,14 +5453,14 @@ impl KerfMcp {
                     // anyone is still holding its handle.
                     kerf_core::discard_partial(&output, before);
                 }
-                Ok((status, output, frame))
+                Ok((status, output, frame, report))
             })
             .await?;
             match status {
-                (kerf_core::RenderStatus::Completed, output, frame) => {
-                    json(&with_frame(serde_json::json!({ "output": output }), frame))
+                (kerf_core::RenderStatus::Completed, output, frame, report) => {
+                    json(&with_frame(serde_json::json!({ "output": output, "report": report }), frame))
                 }
-                (kerf_core::RenderStatus::Cancelled, output, _) => Err(McpError::internal_error(
+                (kerf_core::RenderStatus::Cancelled, output, _, _) => Err(McpError::internal_error(
                     format!("export cancelled; the partial file at {} was removed", output.display()),
                     None,
                 )),
@@ -5474,7 +5481,10 @@ impl KerfMcp {
                        work as in `export` (and `background: true` returns a job_id). The files render in one pass by \
                        default (single_pass): one decode of the sources split into every frame, so cancelling removes \
                        them all; with single_pass false they render one after another and cancelling keeps the files \
-                       already finished and deletes the one in flight. Refuses to overwrite any existing variant file unless overwrite is true."
+                       already finished and deletes the one in flight. Refuses to overwrite any existing variant file unless overwrite is true. \
+                       Each entry of `outputs` carries a `report` of what that written file measures (container, picture, \
+                       sound, and its own integrated loudness / true peak / loudness range, with `true_peak_over_db` when it \
+                       is over the `options.loudness` target's ceiling), as `export` does."
     )]
     async fn export_variants(
         &self,
@@ -5535,6 +5545,9 @@ impl KerfMcp {
             let result = blocking(move || {
                 // Frame first: plan under the lock, sample with it released (one
                 // short decode per clip, shared by every shape), apply under it again.
+                // The framing pass owns the first tenth of the job's progress when it runs; the
+                // render takes the rest (it reports its own 0..1 over every file).
+                let mut rendering_from = 0.0;
                 if smart_crop {
                     let plan = lock_agent_as(&project, owner.as_deref())
                         .framing_inputs(&deliveries)
@@ -5543,13 +5556,14 @@ impl KerfMcp {
                         let stop = crate::stop_or_replaced(|| run.cancelled(), &project, generation);
                         let framings = Project::sample_framings_with(
                             &plan,
-                            &mut |f| run.progress(Some(f64::from(f) * 0.1), "framing each shot"),
+                            &mut |f| run.progress(Some(f64::from(f) * FRAMING_SHARE), "framing each shot"),
                             &stop,
                         )
                         .map_err(core_err)?;
                         let guard = lock_agent_edit(&project, owner.as_deref())?;
                         require_generation(&guard, generation, "the shots were being framed")?;
                         wrote.store(guard.apply_framings(&framings).map_err(core_err)?, Ordering::SeqCst);
+                        rendering_from = FRAMING_SHARE;
                     }
                 }
                 let (timeline, assets) = {
@@ -5560,23 +5574,15 @@ impl KerfMcp {
                     )
                 };
                 let mut on_progress = |progress: kerf_core::VariantProgress| {
-                    let mut message = match progress.waiting {
-                        Some(why) => why.to_string(),
-                        None if progress.together => format!("rendering {} together ({})", progress.total, labels.join(", ")),
-                        None => format!(
-                            "rendering {} of {} ({})",
-                            progress.variant + 1,
-                            progress.total,
-                            labels.get(progress.variant).cloned().unwrap_or_default()
-                        ),
-                    };
-                    if let Some(eta) = progress.eta_secs {
-                        message.push_str(&format!(", {} to go", fmt_ts(eta)));
-                    }
-                    run.progress(Some(progress.fraction), message);
+                    run.progress(
+                        Some(rendering_from + (1.0 - rendering_from) * progress.fraction),
+                        variants_message(&progress, &labels),
+                    );
                 };
                 // Core removes the file of a variant that failed or was cancelled in flight.
-                let ended = kerf_core::render_variants(
+                // A completed run reads every file back (`reports`, one per file in order: the
+                // file's streams and its own loudness); a stopped one has none to give.
+                let (ended, reports) = kerf_core::render_variants_measured(
                     &timeline,
                     &assets,
                     &render_variants,
@@ -5590,11 +5596,13 @@ impl KerfMcp {
                 let range = opts.range.map(|r| (r.start, r.end));
                 let mut outputs = Vec::new();
                 let project = lock_agent_as(&project, owner.as_deref());
-                for v in render_variants.iter().take(ended.completed) {
+                for (i, v) in render_variants.iter().enumerate().take(ended.completed) {
                     // The size and rate that file was written at, not the delivery's nominal ones: the
                     // options may have named their own, and the project's frame rate rides along.
                     let frame = kerf_core::variant_frame(&timeline, &assets, v, &opts);
-                    outputs.push(with_frame(variant_output(&project, v, range)?, frame));
+                    let mut output = with_frame(variant_output(&project, v, range)?, frame);
+                    output["report"] = serde_json::to_value(reports.get(i)).unwrap_or(serde_json::Value::Null);
+                    outputs.push(output);
                 }
                 Ok((ended.status, outputs, ended.together))
             })
@@ -7243,6 +7251,51 @@ fn refuse_overwrite(path: &std::path::Path, overwrite: bool) -> Result<(), McpEr
     Ok(())
 }
 
+/// The part of an `export_variants` job's progress its smart-crop framing pass takes, when it runs.
+const FRAMING_SHARE: f64 = 0.1;
+
+/// What a running export says when it is not (yet) rendering (pure): the queue it waits in, or the
+/// stage it is in — metering the mix, starting ffmpeg, finishing the file, measuring what it wrote.
+/// `None` for the render itself, which each tool words with its own detail. Without this the tools
+/// told every tick "rendering": a queued export, a metering pass and the seconds ffmpeg spends
+/// opening the footage all read as a render stuck at 0.
+fn export_wait_line(waiting: Option<&str>, stage: Option<kerf_core::ExportStage>) -> Option<String> {
+    match (waiting, stage) {
+        (Some(why), _) => Some(why.to_string()),
+        (None, Some(stage)) if stage != kerf_core::ExportStage::Rendering => Some(stage.label().to_string()),
+        _ => None,
+    }
+}
+
+/// The progress line of `export`.
+fn export_message(progress: &kerf_core::ExportProgress) -> String {
+    export_wait_line(progress.waiting, progress.stage).unwrap_or_else(|| match progress.eta_secs {
+        Some(eta) => format!("rendering, {} to go", fmt_ts(eta)),
+        None => "rendering".to_string(),
+    })
+}
+
+/// The progress line of `export_variants`: which file of how many, or all of them at once.
+fn variants_message(progress: &kerf_core::VariantProgress, labels: &[String]) -> String {
+    if let Some(line) = export_wait_line(progress.waiting, progress.stage) {
+        return line;
+    }
+    let mut message = if progress.together {
+        format!("rendering {} together ({})", progress.total, labels.join(", "))
+    } else {
+        format!(
+            "rendering {} of {} ({})",
+            progress.variant + 1,
+            progress.total,
+            labels.get(progress.variant).cloned().unwrap_or_default()
+        )
+    };
+    if let Some(eta) = progress.eta_secs {
+        message.push_str(&format!(", {} to go", fmt_ts(eta)));
+    }
+    message
+}
+
 /// Format a seconds offset as `mm:ss.mmm` for frame / contact-sheet captions.
 /// Rounds to milliseconds *before* splitting so a value just under a minute
 /// carries into the minute (59.9999 → `01:00.000`, not `00:60.000`).
@@ -7287,10 +7340,10 @@ fn json<T: Serialize>(value: &T) -> Result<String, McpError> {
 #[cfg(test)]
 mod tests {
     use super::{
-        caption_source, clip_moves, core_err, elide_large_svg, export_fps_of, fmt_ts, image_result, log_tool_error, png_result,
-        refuse_overwrite, reject_unknown_arguments, require_window, router, server_identity, svg_moments, svg_preview,
-        svg_sheet_caption, svg_sheet_times, svg_source, track_gaps, variant_output, with_frame, ClipMoveParams, SvgMoments,
-        SvgOverlaySummary, SvgPreviewTitle, SvgValidation,
+        caption_source, clip_moves, core_err, elide_large_svg, export_fps_of, export_message, fmt_ts, image_result,
+        log_tool_error, png_result, refuse_overwrite, reject_unknown_arguments, require_window, router, server_identity,
+        svg_moments, svg_preview, svg_sheet_caption, svg_sheet_times, svg_source, track_gaps, variant_output, variants_message,
+        with_frame, ClipMoveParams, SvgMoments, SvgOverlaySummary, SvgPreviewTitle, SvgValidation,
     };
 
     /// The resources read what the polling tools answer: the project's brief, the queue's first
@@ -7409,6 +7462,92 @@ mod tests {
         assert_eq!(fmt_ts(119.9997), "02:00.000");
         assert_eq!(fmt_ts(59.9994), "00:59.999");
         assert_eq!(fmt_ts(125.25), "02:05.250");
+    }
+
+    fn export_progress(
+        fraction: f64,
+        eta: Option<f64>,
+        waiting: Option<&'static str>,
+        stage: Option<kerf_core::ExportStage>,
+    ) -> kerf_core::ExportProgress {
+        kerf_core::ExportProgress {
+            fraction,
+            elapsed_secs: 1.0,
+            eta_secs: eta,
+            waiting,
+            stage,
+        }
+    }
+
+    /// A job's `message` said "rendering" at progress 0.0 for a queue, a metering pass and the
+    /// seconds ffmpeg spent opening the footage alike; each says what it is.
+    #[test]
+    fn an_export_job_says_what_it_is_doing_not_just_rendering() {
+        use kerf_core::ExportStage as S;
+        let line = |p: kerf_core::ExportProgress| export_message(&p);
+        assert_eq!(
+            line(export_progress(0.0, None, Some("waiting for the preview proxy"), None)),
+            "waiting for the preview proxy"
+        );
+        assert_eq!(
+            line(export_progress(0.03, None, None, Some(S::Metering))),
+            "metering loudness"
+        );
+        assert_eq!(
+            line(export_progress(0.08, None, None, Some(S::Starting))),
+            "starting ffmpeg and seeking the footage"
+        );
+        assert_eq!(line(export_progress(0.5, None, None, Some(S::Rendering))), "rendering");
+        assert_eq!(
+            line(export_progress(0.5, Some(65.0), None, Some(S::Rendering))),
+            "rendering, 01:05.000 to go"
+        );
+        assert_eq!(
+            line(export_progress(0.99, Some(0.0), None, Some(S::Finishing))),
+            "finishing the file"
+        );
+        assert_eq!(
+            line(export_progress(0.98, None, None, Some(S::Measuring))),
+            "measuring the written file"
+        );
+        // A report from before stages existed is a render.
+        assert_eq!(line(export_progress(0.5, None, None, None)), "rendering");
+    }
+
+    #[test]
+    fn a_multi_format_job_names_the_file_and_the_stage() {
+        use kerf_core::ExportStage as S;
+        let labels = vec!["9:16".to_string(), "1:1".to_string()];
+        let at = |variant, together, waiting, stage, eta| kerf_core::VariantProgress {
+            variant,
+            total: 2,
+            fraction: 0.5,
+            elapsed_secs: 1.0,
+            eta_secs: eta,
+            waiting,
+            stage,
+            together,
+        };
+        assert_eq!(
+            variants_message(&at(0, false, None, Some(S::Rendering), None), &labels),
+            "rendering 1 of 2 (9:16)"
+        );
+        assert_eq!(
+            variants_message(&at(1, false, None, Some(S::Rendering), Some(12.0)), &labels),
+            "rendering 2 of 2 (1:1), 00:12.000 to go"
+        );
+        assert_eq!(
+            variants_message(&at(0, true, None, Some(S::Rendering), None), &labels),
+            "rendering 2 together (9:16, 1:1)"
+        );
+        assert_eq!(
+            variants_message(&at(0, true, None, Some(S::Metering), None), &labels),
+            "metering loudness"
+        );
+        assert_eq!(
+            variants_message(&at(0, false, Some("waiting for another job to finish"), None, None), &labels),
+            "waiting for another job to finish"
+        );
     }
 
     #[test]
@@ -9570,6 +9709,39 @@ mod tests {
         assert!(description("timeline_summary").contains("media_notes"));
         assert!(description("platform_check").contains("width"));
         assert!(description("generate_voiceover").contains("warning"));
+    }
+
+    /// An agent verifying an AAC true-peak problem had to run ffmpeg's ebur128 on the file itself:
+    /// the export tells what it wrote, and says where it differs from `get_levels`.
+    #[test]
+    fn the_export_descriptions_say_what_the_written_file_is_measured_for() {
+        let tools = router().list_all();
+        let description = |name: &str| -> String {
+            tools
+                .iter()
+                .find(|t| t.name == name)
+                .and_then(|t| t.description.as_deref())
+                .unwrap_or_default()
+                .to_string()
+        };
+        let export = description("export");
+        for needle in [
+            "report",
+            "get_levels",
+            "integrated_lufs",
+            "true_peak_dbtp",
+            "true_peak_over_db",
+            "report.problem",
+            "metering loudness",
+            "starting ffmpeg",
+        ] {
+            assert!(export.contains(needle), "export: {needle} in {export}");
+        }
+        let variants = description("export_variants");
+        assert!(
+            variants.contains("report") && variants.contains("true_peak_over_db"),
+            "{variants}"
+        );
     }
 
     #[test]

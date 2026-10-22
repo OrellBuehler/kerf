@@ -4118,13 +4118,17 @@ async fn hw_encoders() -> CmdResult<Vec<String>> {
     blocking(|| Ok(kerf_core::hw_encoders().to_vec())).await
 }
 
+/// Render the timeline to `output_path`, streaming `export-progress`, and answer an `ExportReport`:
+/// what the written file measures (container, picture, sound, and — with sound — its own integrated
+/// loudness, true peak and loudness range, flagged when the true peak is over the `loudness`
+/// target's ceiling). A measurement that fails says why in the report and does not fail the export.
 #[tauri::command]
 async fn export_timeline(
     app: AppHandle,
     state: State<'_, AppState>,
     output_path: String,
     options: ExportOptions,
-) -> CmdResult<String> {
+) -> CmdResult<kerf_core::ExportReport> {
     require_user_output_path(&output_path)?;
     // Snapshot the timeline + assets under the lock, then release it before the
     // (seconds-to-minutes) ffmpeg render. Otherwise the export would hold the
@@ -4153,7 +4157,9 @@ async fn export_timeline(
         };
         // A render that fails or is cancelled removes what it wrote (`kerf_core::discard_partial`,
         // only if this run touched the file), so no earlier export at the path is lost to it.
-        let status = kerf_core::render_with_progress(
+        // A completed one is read back (the file's streams and its own loudness): the same job, the
+        // same Stop, and a measurement that fails says so in the report instead of failing the export.
+        let (status, report) = kerf_core::render_measured(
             &timeline,
             &assets,
             std::path::Path::new(&output_path),
@@ -4163,9 +4169,10 @@ async fn export_timeline(
         )
         .map_err(|e| e.to_string())?;
 
-        match status {
-            kerf_core::RenderStatus::Completed => Ok(output_path),
-            kerf_core::RenderStatus::Cancelled => Err("export cancelled".to_string()),
+        match (status, report) {
+            (kerf_core::RenderStatus::Completed, Some(report)) => Ok(report),
+            (kerf_core::RenderStatus::Completed, None) => Err("the export finished without a report".to_string()),
+            (kerf_core::RenderStatus::Cancelled, _) => Err("export cancelled".to_string()),
         }
     })
     .await
@@ -4190,7 +4197,8 @@ struct FramingProgress {
 /// (default true) writes every file from one decode of the cut where the encode
 /// allows; false renders them one after another. Streams the same
 /// `export-progress` event as a single export, with `variant` / `total` (and
-/// `together` for a single pass) added.
+/// `together` for a single pass) added. Answers one `ExportReport` per file (what
+/// each turned out to be, read back from the file), in the order of `formats`.
 #[tauri::command]
 async fn export_variants(
     app: AppHandle,
@@ -4200,7 +4208,7 @@ async fn export_variants(
     smart_crop: bool,
     single_pass: Option<bool>,
     options: ExportOptions,
-) -> CmdResult<Vec<String>> {
+) -> CmdResult<Vec<kerf_core::ExportReport>> {
     let single_pass = single_pass.unwrap_or(true);
     if formats.is_empty() {
         return Err("pick at least one delivery frame".to_string());
@@ -4285,7 +4293,8 @@ async fn export_variants(
         let mut on_progress = |p: kerf_core::VariantProgress| {
             let _ = app.emit("export-progress", p);
         };
-        match kerf_core::render_variants(
+        // Each finished file is read back too (one report per file, in order).
+        match kerf_core::render_variants_measured(
             &timeline,
             &assets,
             &variants,
@@ -4294,13 +4303,12 @@ async fn export_variants(
             &mut on_progress,
             &|| cancel(),
         ) {
-            Ok(run) if run.status == kerf_core::RenderStatus::Completed => {}
+            Ok((run, reports)) if run.status == kerf_core::RenderStatus::Completed => Ok(reports),
             // A stopped single pass took every file with it; the dialog says so.
-            Ok(run) if run.together => return Err(format!("export cancelled; all {} files were removed", variants.len())),
-            Ok(_) => return Err("export cancelled".to_string()),
-            Err(e) => return Err(e.to_string()),
+            Ok((run, _)) if run.together => Err(format!("export cancelled; all {} files were removed", variants.len())),
+            Ok(_) => Err("export cancelled".to_string()),
+            Err(e) => Err(e.to_string()),
         }
-        Ok(variants.iter().map(|v| v.output.to_string_lossy().into_owned()).collect())
     })
     .await
 }

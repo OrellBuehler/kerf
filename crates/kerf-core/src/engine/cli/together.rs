@@ -255,6 +255,7 @@ pub(super) fn render_together(
     assets: &[Asset],
     variants: &[ExportVariant],
     opts: &ExportOptions,
+    (from, since): (f64, Instant),
     progress: &mut dyn FnMut(VariantProgress),
     cancel: &dyn Fn() -> bool,
 ) -> Result<Option<RenderStatus>> {
@@ -273,17 +274,8 @@ pub(super) fn render_together(
         return Ok(None);
     }
     let total = variants.len();
-    let mut progress = |p: ExportProgress| {
-        progress(VariantProgress {
-            variant: 0,
-            total,
-            fraction: p.fraction,
-            elapsed_secs: p.elapsed_secs,
-            eta_secs: p.eta_secs,
-            waiting: p.waiting,
-            together: true,
-        });
-    };
+    // `from` is where the metering pass (shared by every file) left the bar, `since` when it began.
+    let mut progress = |p: ExportProgress| progress(VariantProgress::of(p.within(from, 1.0, since), 0, total, true));
     let framed: Vec<Timeline> = variants.iter().map(|v| timeline.for_delivery(v.delivery)).collect();
     let before: Vec<_> = variants.iter().map(|v| file_mtime(&v.output)).collect();
     let status = (|| {

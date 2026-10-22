@@ -586,8 +586,9 @@ so the feature is **only** activated through these forwards — which is what ma
   **Static loudness** (`ExportOptions.loudness_static`, with a `loudness` / `loudnorm` target):
   instead of single-pass `loudnorm` (which rides the gain and overshoots TP), `render_with_progress`
   first runs one `levels::static_loudness_gain` pass (after the preflight; skipped when nothing writes
-  sound — a silent cut, `include_audio` off, a video-only container; its slot wait and the pass itself
-  show as the export's `waiting` line, `measuring the mix's loudness`). `prepare_variants` preflights
+  sound — a silent cut, `include_audio` off, a video-only container; its slot wait is the export's
+  `waiting` line and the pass itself is `ExportStage::Metering` with a real fraction, see *Export
+  progress* below). `prepare_variants` preflights
   every variant and then measures **once** for all of them; `render_variants` runs it, and the app's
   one-variant-per-call loop calls it first and hands its options on. The pass meters the export's
   own graph with the normalization off and fills the `serde(skip)`
@@ -596,6 +597,32 @@ so the feature is **only** activated through these forwards — which is what ma
   -1 dBTP less `STATIC_TP_MARGIN_DB` 0.3 (the resample back rings over what it held). Off, every graph
   is byte-identical; a cancel during the measure is `Cancelled`. Rendered: two passages 18 dB apart
   land on -14 / -23 LUFS ±0.5 and stay 18 dB apart, TP ≤ -0.95; clicks given +10 dB stay ≤ -0.95 dBTP.
+  **Export progress** (`cli/progress.rs`, pure + unit-tested). `ExportProgress.fraction` is over the *whole*
+  export, `elapsed_secs` since it began; each stage owns a share of the bar (`ExportProgress::within`;
+  `metering_share`: 0.08 with a picture, 0.4 for sound alone, 0 when nothing is metered; the render takes the
+  rest) and says what it is in `stage` (`ExportStage`: `metering`, `starting`, `rendering`, `finishing`,
+  `measuring`). `waiting` (queued for the slot, drawing the animated titles) wins over `stage`. The
+  metering pass walks the mix: `MeterParser::position` is the furthest `t:` of the `ebur128` frame log over the
+  mix's length, told at every full percent and at most five times a second (`metered_fraction`). **Measured
+  on FFmpeg 4.4.2** (`export_progress_rendered.rs`, a 1080p source with one keyframe, range 120–151.5 s,
+  x264 slow CRF 17, AAC, faststart): ffmpeg prints **no** `-progress` block while it opens the footage and
+  decodes up to an input `-ss`; the first block arrives with the first packet (`out_time_us=0`) and the output
+  file is empty until then (12 s on a loaded 16-core machine here, minutes for a long-GOP 4K file) — the
+  old loop only parsed `out_time_us`, so the callback said nothing at all and the last words stayed up (the
+  metering pass's, at 0.0); with `faststart` the file is rewritten after the last `out_time` and before
+  `progress=end`. The range's offset itself is not the cause: the input seek rebases the timestamps, the
+  output starts at 0 and is measured against the range's own length. So `run_progress_with` says
+  `starting` at spawn and once a second until the first packet; `ProgressReader` reads a block at its
+  `progress=` line (`out_time_us`, else `out_time_ms` — microseconds despite the name — else `out_time`;
+  `N/A` is no position); a pass is held at 99 % until ffmpeg has exited (`finishing` from 99.8 %, the
+  muxer closing the file); the time left is judged from the **first output** (`eta_secs`), not the spawn
+  (the first estimate used to read 1136 s). `EXPORT_STALL` also covers the silent start: a seek that needs
+  more than 300 s of decoding is killed as a stall. `render_variants` gives each file an equal share of what
+  metering left (`variants_eta` adds the files still to come to the time left). Not fixed: on FFmpeg 4.4.x
+  a single-pass `loudnorm,aresample=<rate>` that reaches an encoder fails with `Cannot select channel
+  layout for the link between filters Parsed_aresample … and format_out` (loudnorm leaves the layout
+  unset; an `aformat=channel_layouts=` after it works) — static loudness and the levels pass are
+  unaffected, and a fix moves every loudnorm graph in the golden oracle.
   **Every delivery frame in one run** (`cli/together.rs`, `render_variants(.., together: true, ..)`):
   `build_together_args` (pure) builds each variant's graph with the export's own
   `build_filter_complex_with` over `for_delivery` + `export_timeline`, then `relabel`s it into a
@@ -660,6 +687,29 @@ so the feature is **only** activated through these forwards — which is what ma
   is float, so nothing clips until the mix is written and the master can still bring
   it under. `levels.ts` `levelNotes` mirrors the words exactly (a string in both
   languages' tests pins that).
+  **An export reads back what it wrote** (`cli/written.rs`, `render_measured` / `render_variants_measured`,
+  `measure_export` underneath). `get_levels` measures the timeline's mix; the file is what a platform judges and a
+  lossy encode moves (an AAC re-encode put a limited peak back over its ceiling, and an agent had to run
+  `ffmpeg -af ebur128=peak=true` itself). After a **completed** export (`render_with_progress`'s own
+  contract is unchanged: it returns a `RenderStatus`) the file is probed — `ffprobe -show_format -show_streams`,
+  `output_bounded_cancellable` 60 s — into an `ExportReport`: `container` (ffprobe's format name), `duration_secs`,
+  `size_bytes`, overall `bit_rate` (the size over the length when the container does not say), `video` (codec, size,
+  fps — the average, else `r_frame_rate` —, `pix_fmt`, bit rate), `audio` (codec, rate, channels, bit rate: what the
+  packets add up to, not the `-b:a` asked for). With sound its first audio stream is metered —
+  `ffmpeg -vn -sn -dn -i file -map 0:a:0 -af ebur128@file=peak=sample+true -f null -`, read by the same
+  `levels::run_meters` loop and `MeterParser` as the levels pass — into `loudness` (a `LevelReading`: integrated,
+  range, sample and true peak, short-term maximum), beside the `target` (`LoudnessPreset` of `loudness` / `loudnorm`)
+  and `true_peak_over_db`, how far the true peak is over that target's ceiling (compared to a tenth, as shown, and
+  only when over). **It never fails the export**: the file is written and valid, so a probe or meter failure, or a
+  stop, is `problem` and the rest stands; Stop during it keeps the finished file. It is the last part of the same job
+  (`ExportStage::Measuring` in the last `VERIFY_SHARE` 3 % of the bar, ended at 1.0; each file of a multi-format
+  export takes an equal share) and **ungated** like `stream_mix_pcm` — `cap_args`-capped and niced, no heavy-job
+  lease: it reads a file the export just wrote (hot in the page cache) at about 1 % of real time, and taking the
+  slot would let a proxy that started meanwhile hold a finished export's answer for minutes. A multi-format run
+  that did not complete returns no reports (a stopped single pass removed every file; one after another keeps
+  files that were never measured). Rendered (`#[ignore]`d, `written.rs`, `export_progress_rendered.rs`): a static
+  -14 LUFS AAC mp4 reads -14.0 LUFS / -13.9 dBTP from the file, a sound-only wav has no picture, a silent mp4 no
+  loudness, a missing file and a stop are reported not raised, and each variant is read at its own frame.
   **`stream_mix_pcm`** (same file) is the other reader of that graph: `build_mix_pcm_args` is `build_filter_complex` (no meters)
   with `-map [outa] -ac N -ar R -f f32le pipe:1`, streamed through `pump_pcm_cancellable` — what band balance measures over
   a range of the mix (`engine-media.md`); ungated, `cap_args`-capped and niced like the agent's other reads.

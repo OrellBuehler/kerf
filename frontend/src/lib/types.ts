@@ -1540,22 +1540,86 @@ export interface PlatformReport {
 	targets: DeliveryCheck[];
 }
 
-/** Payload of the `export-progress` event streamed during a render. */
+/** The part of an export that is running (`kerf_core::ExportStage`). */
+export type ExportStage = 'metering' | 'starting' | 'rendering' | 'finishing' | 'measuring';
+
+/** Payload of the `export-progress` event streamed during a render. `fraction` is over the whole
+ *  export: its stages each own a share of the bar, so it only moves forward. */
 export interface ExportProgress {
 	fraction: number;
+	/** Since the export began (not since the render did). */
 	elapsed_secs: number;
+	/** Time left, once the render has a rate of its own (not counting the seconds ffmpeg spent opening the footage). */
 	eta_secs?: number | null;
-	/** Set while the render has not started: the machine is busy with another heavy job
-	 *  (`waiting for the preview proxy`), or a static loudness normalization is metering the mix
-	 *  (`measuring the mix's loudness`) — so the export is not hung at 0%. A multi-format export
-	 *  sets it too. */
+	/** Set while the work has not started: the machine is busy with another heavy job
+	 *  (`waiting for the preview proxy`), or the animated titles are being drawn first
+	 *  (`rendering animated titles`) — so the export is not hung at 0%. A multi-format export
+	 *  sets it too. Wins over `stage`. */
 	waiting?: string | null;
+	/** What the export is doing now: `metering` (a static loudness normalization reads the mix first),
+	 *  `starting` (ffmpeg opens the footage and decodes up to a range's start; nothing is written yet),
+	 *  `rendering`, `finishing` (the muxer closes the file) and `measuring` (the written file is read back). */
+	stage?: ExportStage | null;
 	/** Set by a multi-format export: which file is rendering, of how many.
 	 *  `fraction` then spans all of them. */
 	variant?: number;
 	total?: number;
 	/** A multi-format export rendering every file in one pass: `variant` is then 0. */
 	together?: boolean;
+}
+
+/** The first picture stream of a written file (`kerf_core::WrittenVideo`). */
+export interface WrittenVideo {
+	codec: string;
+	width: number | null;
+	height: number | null;
+	fps: number | null;
+	pix_fmt: string | null;
+	/** Bits per second, when the container records it. */
+	bit_rate: number | null;
+}
+
+/** The first sound stream of a written file (`kerf_core::WrittenAudio`). */
+export interface WrittenAudio {
+	codec: string;
+	sample_rate: number | null;
+	channels: number | null;
+	/** Bits per second. */
+	bit_rate: number | null;
+}
+
+/** A delivery's loudness target (`kerf_core::LoudnessTarget`). */
+export interface LoudnessTarget {
+	lufs: number;
+	/** The true-peak ceiling, dBTP. */
+	true_peak_dbtp: number;
+}
+
+/**
+ * What an export wrote, read back from the file (`kerf_core::ExportReport`) — the answer of
+ * `export_timeline` (one) and `export_variants` (one per file). `get_levels` measures the timeline's
+ * mix; this is the FILE, which a lossy encode can move (an AAC re-encode raised a limited peak back
+ * over its ceiling). Every field is null where it could not be read or does not apply.
+ */
+export interface ExportReport {
+	path: string;
+	size_bytes: number | null;
+	/** ffprobe's format name (`mov,mp4,m4a,3gp,3g2,mj2`, `matroska,webm`, `wav`). */
+	container: string | null;
+	duration_secs: number | null;
+	/** The whole file's bit rate, bits per second. */
+	bit_rate: number | null;
+	video: WrittenVideo | null;
+	audio: WrittenAudio | null;
+	/** The file's own audio, metered. Null for a file with no sound. */
+	loudness: LevelReading | null;
+	/** The loudness target the export was asked for, if any. */
+	target: LoudnessTarget | null;
+	/** How far the file's true peak is over the target's ceiling, in dB, only when it is over it. */
+	true_peak_over_db: number | null;
+	/** Why part of the measurement is missing (the file could not be probed or metered, or the measurement
+	 *  was stopped). The export itself succeeded. */
+	problem: string | null;
 }
 
 /** Payload of the `import-progress` event, emitted while a 360 pair is stitched. */

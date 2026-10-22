@@ -12,13 +12,15 @@
 	import { confirmAction, inTauri, pathsExist, pickExportPath, hwEncoders, knownHwEncoders, revealPath } from '#lib/api';
 	import { overwriteCopy } from '#lib/confirm-copy';
 	import { exportTargets, filesToReplace } from '#lib/export-overwrite';
+	import { progressLine } from '#lib/export-progress';
+	import { writtenNotice } from '#lib/export-written';
 	import { toast } from '#lib/notifications.svelte';
 	import { formatsFor, hasPicture } from '#lib/delivery-formats';
 	import { timeDisplay } from '#lib/time-display.svelte';
 	import { frameKey, restoreDraft } from '#lib/export-draft';
 	import { judgeable } from '#lib/platform-verdict';
 	import type { RowSpec } from '#lib/slider-row';
-	import type { Container, ExportOptions, Fit, RateControl, SubtitleFormat } from '#lib/types';
+	import type { Container, ExportOptions, ExportReport, Fit, RateControl, SubtitleFormat } from '#lib/types';
 	import { exportedLine, failure } from '#lib/failure-copy';
 	import {
 		initialExport,
@@ -92,7 +94,7 @@
 	// The render outlives this dialog (see `editor.exportRun`), so reopening it
 	// mid-render shows the progress and a Stop rather than a dead Export button.
 	const rendering = $derived(editor.exportRun !== null);
-	const progress = $derived(editor.exportRun?.progress ?? null);
+	const line = $derived(progressLine(editor.exportRun?.progress));
 	const cancelling = $derived(editor.exportRun?.cancelling ?? false);
 	let showAdvanced = $state(false);
 	let showCommand = $state(false);
@@ -123,12 +125,6 @@
 	);
 
 	const fmtTime = (s: number): string => timeDisplay.fmt(s);
-
-	function fmtEta(s: number | null | undefined): string {
-		if (s == null || !isFinite(s)) return '';
-		const r = Math.max(0, Math.round(s));
-		return r >= 60 ? `${Math.floor(r / 60)}m ${String(r % 60).padStart(2, '0')}s` : `${r}s`;
-	}
 
 	const assets = $derived(editor.assets);
 	const hasVideo = $derived(hasPicture(editor.timeline));
@@ -280,21 +276,25 @@
 		else toast.error(failure('Export failed', e));
 	}
 	async function render(finalOpts: ExportOptions) {
-		if (variantFormats.length) {
-			const outs = await editor.exportVariants(outputPath, variantFormats, ui.deliverSmartCrop, finalOpts);
-			const first = outs[0];
-			toast.success(exportedLine(outs), {
-				action: { label: 'Show in folder', onClick: () => void revealPath(first).catch(() => {}) }
-			});
-			onClose();
-			return;
-		}
-		const out = await editor.export(outputPath, finalOpts);
-		// A path in a toast is not much use on its own — offer the folder.
-		toast.success(exportedLine([out]), {
-			action: { label: 'Show in folder', onClick: () => void revealPath(out).catch(() => {}) }
-		});
+		const reports = variantFormats.length
+			? await editor.exportVariants(outputPath, variantFormats, ui.deliverSmartCrop, finalOpts)
+			: [await editor.export(outputPath, finalOpts)];
+		finished(reports);
 		onClose();
+	}
+	/** The notice an export ends on: the files, and what the written files measure — their loudness and true
+	 *  peak, a warning when a true peak is over the target's ceiling. A path in a toast is not much use on its
+	 *  own, so it offers the folder. */
+	function finished(reports: readonly ExportReport[]) {
+		const first = reports[0]?.path;
+		const { over, description } = writtenNotice(reports);
+		const opts = {
+			...(description ? { description } : {}),
+			...(first ? { action: { label: 'Show in folder', onClick: () => void revealPath(first).catch(() => {}) } } : {})
+		};
+		const line = exportedLine(reports.map((r) => r.path));
+		if (over) toast.warning(line, opts);
+		else toast.success(line, opts);
 	}
 	const stop = () => editor.stopExport();
 </script>
@@ -739,15 +739,12 @@
 		<div style="display:flex;align-items:center;gap:8px;padding:12px 16px">
 			{#if rendering}
 				<div style="flex:1;display:flex;align-items:center;gap:10px">
-					<ProgressBar value={progress?.waiting ? null : (progress?.fraction ?? 0)} label="Exporting" />
+					<ProgressBar value={line.value} label="Exporting" />
 					<span
 						data-testid="export-progress-text"
 						style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted);min-width:104px;text-align:right"
 					>
-						{#if progress?.waiting}{progress.waiting}…{:else}
-						{#if progress?.together}{progress.total} at once · {:else if progress?.total != null && progress.total > 1}{(progress.variant ?? 0) + 1}/{progress.total} · {/if}{Math.round(
-							(progress?.fraction ?? 0) * 100
-						)}%{progress?.eta_secs != null ? ` · ${fmtEta(progress.eta_secs)} left` : ''}{/if}
+						{line.text}
 					</span>
 				</div>
 				<Btn variant="destructive" size="md" data-rescue disabled={cancelling} onclick={stop}>

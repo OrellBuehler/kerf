@@ -55,6 +55,11 @@ describe('progress bars', () => {
 	});
 
 	test('an export that is waiting on its proxy is indeterminate, not 0 %', () => {
-		for (const f of ['ExportDialog', 'DeliverPanel']) expect(read(`${EDITOR}${f}.svelte`), f).toContain('progress?.waiting ? null :');
+		// `progressLine` decides (export-progress.test.ts: a queue and ffmpeg's start-up have no value); the bars take its value.
+		for (const f of ['ExportDialog', 'DeliverPanel']) {
+			const source = read(`${EDITOR}${f}.svelte`);
+			expect(source, f).toContain('progressLine(editor.exportRun?.progress)');
+			expect(source, f).toContain('<ProgressBar value={line.value}');
+		}
 	});
 });

@@ -118,14 +118,15 @@ pub use cli::{
     contact_sheet_times, decode_hwaccel, delivery_frame, delivery_rate, detect_scenes_preferring_cancellable,
     detect_silence_cancellable, disable_decode_hwaccel, discard_partial, export_still, export_still_cancellable, exported_frame,
     file_mtime, frame_at, frame_jpeg, frame_jpeg_cancellable, frame_jpeg_region, frame_jpeg_region_cancellable, generate_proxy,
-    generate_proxy_with, hw_encoders, insta360_pair, mix_levels, playback_params, proxy_base_width, proxy_path, proxy_width,
-    proxy_width_for, ready_proxy, remove_proxy_files, salience_map_cancellable, seek_arg, set_proxy_base_width, source_identity,
-    stitch_insta360, stitch_insta360_with, stitched_path, stream_mix_pcm, stream_preview, stream_preview_until,
-    stream_preview_with, timeline_frame_cancellable, timeline_frame_region_cancellable, timeline_frame_yuv_cancellable,
-    validate_export, variant_frame, waveform, waveform_cancellable, Container, ExportOptions, ExportProgress, ExportVariant,
-    ExportedFrame, Fit, FpsSource, ImageFormat, LoudnessPreset, PlaybackParams, PlaybackRequest, PreviewFrame, ProxyRun,
-    RateControl, Region, RenderStatus, ScrubConfig, ScrubFrames, ScrubStats, VariantProgress, VariantsRun, MAX_STREAM_FPS,
-    MAX_STREAM_WIDTH, MIN_STREAM_FPS, MIN_STREAM_WIDTH,
+    generate_proxy_with, hw_encoders, insta360_pair, measure_export, mix_levels, playback_params, proxy_base_width, proxy_path,
+    proxy_width, proxy_width_for, ready_proxy, remove_proxy_files, render_measured, render_variants_measured,
+    salience_map_cancellable, seek_arg, set_proxy_base_width, source_identity, stitch_insta360, stitch_insta360_with,
+    stitched_path, stream_mix_pcm, stream_preview, stream_preview_until, stream_preview_with, timeline_frame_cancellable,
+    timeline_frame_region_cancellable, timeline_frame_yuv_cancellable, validate_export, variant_frame, waveform,
+    waveform_cancellable, Container, ExportOptions, ExportProgress, ExportReport, ExportStage, ExportVariant, ExportedFrame, Fit,
+    FpsSource, ImageFormat, LoudnessPreset, LoudnessTarget, PlaybackParams, PlaybackRequest, PreviewFrame, ProxyRun, RateControl,
+    Region, RenderStatus, ScrubConfig, ScrubFrames, ScrubStats, VariantProgress, VariantsRun, WrittenAudio, WrittenVideo,
+    MAX_STREAM_FPS, MAX_STREAM_WIDTH, MIN_STREAM_FPS, MIN_STREAM_WIDTH,
 };
 
 #[cfg(test)]

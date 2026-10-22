@@ -13,6 +13,7 @@
 	import { editor } from '#lib/state.svelte';
 	import { ui } from '#lib/editor-ui.svelte';
 	import { formatsFor, hasPicture, presetFor, ratioLabel, rateLine } from '#lib/delivery-formats';
+	import { progressLine } from '#lib/export-progress';
 	import { timeDisplay } from '#lib/time-display.svelte';
 	import { timecodeRate } from '#lib/timecode';
 	import { tip } from '#lib/tip';
@@ -25,7 +26,7 @@
 	const frame = $derived(presetFor(editor.timeline.format));
 	const rate = $derived(picture ? rateLine(editor.timeline.format, editor.fps) : null);
 	const rendering = $derived(editor.exportRun !== null);
-	const progress = $derived(editor.exportRun?.progress ?? null);
+	const line = $derived(progressLine(editor.exportRun?.progress));
 	const lengthTip = $derived(
 		timeDisplay.mode === 'seconds' ? 'Minutes and seconds' : timecodeRate(editor.fps).drop > 0 ? 'Drop-frame timecode' : 'Non-drop timecode'
 	);
@@ -78,12 +79,8 @@
 	>
 		{#if rendering}
 			<div style="flex:1;display:flex;align-items:center;gap:10px;min-width:0">
-				<ProgressBar value={progress?.waiting ? null : (progress?.fraction ?? 0)} label="Exporting" />
-				<span style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted)"
-					>{#if progress?.together}{progress.total} at once · {:else if progress?.total != null && progress.total > 1}{(progress.variant ?? 0) + 1}/{progress.total} · {/if}{Math.round(
-						(progress?.fraction ?? 0) * 100
-					)}%</span
-				>
+				<ProgressBar value={line.value} label="Exporting" />
+				<span style="font-family:var(--font-mono);font-size:12px;color:var(--text-muted)">{line.text}</span>
 			</div>
 			<Btn variant="destructive" size="md" disabled={editor.exportRun?.cancelling} onclick={() => editor.stopExport()}>
 				{editor.exportRun?.cancelling ? 'Stopping…' : 'Stop'}

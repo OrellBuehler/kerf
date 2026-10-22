@@ -1653,7 +1653,17 @@ message starting `waiting for the preview proxy` (`proxy-wait.ts`, import-free b
 compiled alone in its test). The pump treats that as the preview waiting — the picture and the GPU surface
 stay, nothing falls back to the JPEG — and `Preview.svelte` shows `playback waits for the proxy` instead of
 a `Playback preview failed:` toast, restarting the stream when a proxy lands. A queued export reads
-`Export waiting for the preview proxy…` (`ExportProgress.waiting`) instead of a stuck 0%.
+`Export waiting for the preview proxy…` (`ExportProgress.waiting`) instead of a stuck 0%. **The export's words come
+from `export-progress.ts`** (`progressLine` for the dialog and the Deliver panel, `statusText` for the status bar;
+bun-tested) over `ExportProgress.stage`: `Metering loudness · 4%` (a static-loudness pass), `Opening the footage… 12s`
+on an indeterminate bar (ffmpeg writes nothing while it seeks a range's start in a long recording),
+`46% · 1m 23s left` (the render; `2/3 · ` or `3 at once · ` ahead of it for several files), `Finishing the file…`,
+`Checking the file…`. The fraction is over the whole export and never runs back. **The export's last notice
+carries what the written file measured** (`ExportReport`, `export-written.ts` `writtenNotice`, bun-tested): the
+toast's description is the file's own `-14.2 LUFS · true peak -1.2 dBTP · LRA 6.1 LU` (a line per file, named, for
+several), and a true peak over the target's ceiling turns it into a warning — `True peak -0.4 dBTP is 0.6 dB over the
+-1.0 dBTP ceiling (-14.2 LUFS)`; a measurement that failed adds `not measured: …` without alarm. `exportTimeline`
+answers one `ExportReport`, `exportVariants` an array (`editor.export` / `exportVariants` pass them on).
 
 **Animated SVG titles in `api.ts`.** `addSvgOverlay(source, start, end?, layout?)` / `updateSvgOverlay(id, patch)` /
 `removeSvgOverlay(id)` (each answers the refreshed `Timeline`), `validateSvg(svg)` → `SvgCheck`, `listSvgPresets()` and

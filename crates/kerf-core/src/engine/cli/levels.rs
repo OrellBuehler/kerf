@@ -39,6 +39,15 @@ pub struct MixLevels {
     pub tracks: Vec<(usize, LevelReading)>,
 }
 
+/// What a metering pass tells whoever shows it ([`measure_mix`]'s `status`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) enum Metering {
+    /// Queued for the machine's one heavy-job slot.
+    Waiting(cpu::Wait),
+    /// Holding the slot and reading the mix: the fraction of its length metered so far, `0.0..=1.0`.
+    Running(f64),
+}
+
 /// How long a metering pass may go without ffmpeg writing a line before it is
 /// given up on. The meters log ten lines per second of audio processed, so this
 /// is a hang (or a source that has stopped delivering), not a heavy render.
@@ -205,13 +214,14 @@ pub fn stream_mix_pcm(
 /// The gain static loudness normalization applies to an export with `opts`: its target's
 /// loudness less the mix's own, measured through the export's graph without the
 /// normalization (`None` when the mix is silent, under the meter's gate, or has no
-/// target to reach). Whole-file work, like [`mix_levels`]; `status` hears `Some` while it waits
-/// for the slot and `None` once it meters.
+/// target to reach). Whole-file work, like [`mix_levels`]; `status` hears [`Metering::Waiting`]
+/// while it waits for the slot and [`Metering::Running`] with how much of the mix is metered once
+/// it holds it.
 pub(super) fn static_loudness_gain(
     timeline: &Timeline,
     assets: &[Asset],
     opts: &ExportOptions,
-    status: &mut dyn FnMut(Option<cpu::Wait>),
+    status: &mut dyn FnMut(Metering),
     cancel: &dyn Fn() -> bool,
 ) -> Result<Option<f64>> {
     let Some(target) = opts.loudness.or(opts.loudnorm.then_some(LoudnessPreset::Youtube)) else {
@@ -237,25 +247,42 @@ pub(super) fn static_gain_db(target: LoudnessPreset, integrated: Option<f64>) ->
         .map(|i| (target.lufs() - i).clamp(-LOUDNESS_MAX_GAIN_DB, LOUDNESS_MAX_GAIN_DB))
 }
 
-fn measure_mix(
-    timeline: &Timeline,
-    assets: &[Asset],
-    opts: &ExportOptions,
-    status: &mut dyn FnMut(Option<cpu::Wait>),
-    cancel: &dyn Fn() -> bool,
-) -> Result<MixLevels> {
-    let Some(run) = build_levels_args(timeline, assets, opts)? else {
-        return Ok(MixLevels::default());
-    };
+/// The least time between two reports of a metering pass: ffmpeg meters a minute of audio in well
+/// under a second, and a client does not need a hundred notices of it.
+const METERING_REPORT_EVERY: Duration = Duration::from_millis(200);
 
+/// How far through the mix the meters have read (pure): `position` seconds of `duration`, when that
+/// is a step worth telling about — a full percent past what `told` already said, and `quiet_for`
+/// (the time since it said it) is at least [`METERING_REPORT_EVERY`] — and `None` otherwise (a meter
+/// logs ten lines a second, a bar does not need them all). Held under 1: the pass is not over until
+/// ffmpeg has written the summaries and exited.
+fn metered_fraction(position: f64, duration: f64, told: f64, quiet_for: Duration) -> Option<f64> {
+    // (`> 0.0` is false for a NaN too, which `<= 0.0` would let through.)
+    let has_length = duration > 0.0;
+    if !has_length || quiet_for < METERING_REPORT_EVERY {
+        return None;
+    }
+    let fraction = (position / duration).clamp(0.0, 0.99);
+    (fraction >= told + 0.01).then_some(fraction)
+}
+
+/// Run a metering ffmpeg (`args`: `ebur128` taps on a `-f null` sink) to its end and read what its
+/// meters logged. `seconds` is how long the audio it meters lasts, so `on_fraction` hears how far
+/// along it is (a first `0.0` when it has started, then a step of a percent at most five times a
+/// second). `tag` names the graph's script file if it is too long for argv. Returns the parser and
+/// the last lines that were not a meter's (for an error message); a pass that fails, goes silent for
+/// [`LEVELS_STALL`] or is stopped by `cancel` ([`Error::Cancelled`]) is an error, never a reading.
+/// The caller decides what slot of the machine's budget it runs in (the lease, the thread caps in
+/// `args`).
+pub(super) fn run_meters(
+    mut args: Vec<String>,
+    tag: &str,
+    seconds: f64,
+    on_fraction: &mut dyn FnMut(f64),
+    cancel: &dyn Fn() -> bool,
+) -> Result<(MeterParser, String)> {
     let bin = ffmpeg_bin();
-    // Foreground, and stoppable while it waits for the slot (the Mixer's Stop works on a queued
-    // measurement as on a running one).
-    let lease = cpu::lease_waiting(&mut |w| status(Some(w)), cancel)?;
-    status(None);
-    let mut args = run.args;
-    cpu::limit_args(&mut args, lease.threads());
-    let _script = externalize_filter_complex(&mut args, "lv")?;
+    let _script = externalize_filter_complex(&mut args, tag)?;
     tracing::debug!(command = %format!("{bin} {}", args.join(" ")), "ffmpeg levels command");
 
     let mut child = bg_command(&bin)
@@ -265,6 +292,7 @@ fn measure_mix(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| launch_err(&bin, e))?;
+    on_fraction(0.0);
     let stderr = child.stderr.take().expect("stderr piped");
 
     // Lines are read on a side thread so the loop below keeps polling `cancel`
@@ -292,6 +320,7 @@ fn measure_mix(
     // The last lines that are not meter frames, for the error of a run that fails.
     let mut tail: std::collections::VecDeque<String> = std::collections::VecDeque::new();
     let mut last_line = Instant::now();
+    let (mut told, mut told_at) = (0.0_f64, Instant::now());
     let (mut cancelled, mut stalled) = (false, false);
     loop {
         match rx.recv_timeout(LEVELS_POLL) {
@@ -302,6 +331,9 @@ fn measure_mix(
                         tail.pop_front();
                     }
                     tail.push_back(line);
+                } else if let Some(fraction) = metered_fraction(parser.position(), seconds, told, told_at.elapsed()) {
+                    (told, told_at) = (fraction, Instant::now());
+                    on_fraction(fraction);
                 }
                 if cancel() {
                     let _ = child.kill();
@@ -340,6 +372,26 @@ fn measure_mix(
         tracing::error!(status = %status, "ffmpeg levels pass failed:\n{tail}");
         return Err(Error::Engine(format!("ffmpeg exited with {status}: {}", tail.trim())));
     }
+    Ok((parser, tail))
+}
+
+fn measure_mix(
+    timeline: &Timeline,
+    assets: &[Asset],
+    opts: &ExportOptions,
+    status: &mut dyn FnMut(Metering),
+    cancel: &dyn Fn() -> bool,
+) -> Result<MixLevels> {
+    let Some(run) = build_levels_args(timeline, assets, opts)? else {
+        return Ok(MixLevels::default());
+    };
+
+    // Foreground, and stoppable while it waits for the slot (the Mixer's Stop works on a queued
+    // measurement as on a running one).
+    let lease = cpu::lease_waiting(&mut |w| status(Metering::Waiting(w)), cancel)?;
+    let mut args = run.args;
+    cpu::limit_args(&mut args, lease.threads());
+    let (parser, tail) = run_meters(args, "lv", run.duration, &mut |f| status(Metering::Running(f)), cancel)?;
 
     let mut master = None;
     let mut tracks = Vec::new();
@@ -376,6 +428,8 @@ pub(super) struct MeterParser {
     /// The meter whose summary is being read, if one is.
     summary: Option<String>,
     section: Section,
+    /// Seconds of audio the meters have read so far: the furthest `t:` any of them has logged.
+    position: f64,
 }
 
 #[derive(Debug, Default)]
@@ -413,8 +467,11 @@ impl MeterParser {
             self.section = Section::None;
             let acc = self.meters.entry(name.to_string()).or_default();
             let message = message.trim();
-            if message.starts_with("t:") {
+            if let Some(clock) = message.strip_prefix("t:") {
                 // `t: 0.1  TARGET:-23 LUFS    M:-120.7 S:-120.7     I: -70.0 LUFS …`
+                if let Some(t) = number(clock) {
+                    self.position = self.position.max(t);
+                }
                 if let Some(s) = message.find(" S:").and_then(|i| number(&message[i + 3..])) {
                     if s > SHORT_TERM_FLOOR && acc.reading.short_term_max_lufs.is_none_or(|m| s > m) {
                         acc.reading.short_term_max_lufs = Some(s);
@@ -455,6 +512,11 @@ impl MeterParser {
             },
         }
         true
+    }
+
+    /// Seconds of audio the meters have read so far (the furthest frame line any of them logged).
+    pub(super) fn position(&self) -> f64 {
+        self.position
     }
 
     /// What `name` read, once its summary has arrived.
@@ -558,6 +620,38 @@ size=N/A time=00:00:03.90 bitrate=N/A speed=  53x
         // of the real ones is.
         assert_eq!(p.reading("master").unwrap().short_term_max_lufs, Some(-15.4));
         assert_eq!(p.reading("t0").unwrap().short_term_max_lufs, Some(-9.4));
+    }
+
+    #[test]
+    fn the_frame_log_says_how_far_through_the_mix_the_meters_are() {
+        let mut p = MeterParser::default();
+        assert_eq!(p.position(), 0.0);
+        p.feed("[ebur128@t0 @ 0x1] t: 0.0999792  TARGET:-23 LUFS    M:-120.7 S:-120.7     I: -70.0 LUFS");
+        assert!((p.position() - 0.0999792).abs() < 1e-9);
+        // Several meters log the same instants; the furthest is the position, whoever spoke last.
+        p.feed("[ebur128@master @ 0x2] t: 3.09998  TARGET:-23 LUFS    M: -15.0 S: -16.3     I: -15.0 LUFS");
+        p.feed("[ebur128@t0 @ 0x1] t: 2.9  TARGET:-23 LUFS    M:  -9.0 S: -10.2     I:  -9.0 LUFS");
+        assert!((p.position() - 3.09998).abs() < 1e-9);
+        // A summary is not a position.
+        p.feed("[ebur128@master @ 0x2] Summary:");
+        assert!((p.position() - 3.09998).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_metering_pass_tells_a_step_of_its_progress_not_every_frame_line() {
+        let quiet = Duration::from_secs(1);
+        // 40 s mix: a full percent is 0.4 s.
+        assert_eq!(metered_fraction(0.1, 40.0, 0.0, quiet), None);
+        assert_eq!(metered_fraction(0.4, 40.0, 0.0, quiet), Some(0.01));
+        assert_eq!(metered_fraction(0.5, 40.0, 0.01, quiet), None);
+        assert_eq!(metered_fraction(20.0, 40.0, 0.01, quiet), Some(0.5));
+        // ... and not twice within a blink, however far it has gone.
+        assert_eq!(metered_fraction(20.0, 40.0, 0.01, Duration::from_millis(50)), None);
+        // Held under 1 until ffmpeg has summarised and exited; a mix without a length says nothing.
+        assert_eq!(metered_fraction(40.0, 40.0, 0.5, quiet), Some(0.99));
+        assert_eq!(metered_fraction(41.0, 40.0, 0.99, quiet), None);
+        assert_eq!(metered_fraction(5.0, 0.0, 0.0, quiet), None);
+        assert_eq!(metered_fraction(f64::NAN, 40.0, 0.0, quiet), None);
     }
 
     #[test]

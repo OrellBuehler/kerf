@@ -295,6 +295,11 @@ turned off stays open and is not applied for anyone, and the app has nothing to 
 so a cancel lands before the handler's future can be dropped): only if this run touched the file
 (mtime differs from before), so a failure or a cancel before ffmpeg opened the output cannot delete the
 earlier export sitting at that path, and the commands neither remove nor compare anything themselves.
+The `export-progress` payload is the engine's `ExportProgress` / `VariantProgress` (`fraction` over the whole
+export, `elapsed_secs`, `eta_secs`, `waiting`, and `stage`: `metering` · `starting` · `rendering` · `finishing` ·
+`measuring`; `frontend/src/lib/export-progress.ts` words it for the dialog, the Deliver panel and the status bar).
+`export_timeline` answers an `ExportReport` (`render_measured`: the written file's streams and its own loudness /
+true peak, read back in the same job) and `export_variants` one per file (`render_variants_measured`).
 `export_variants` is one `render_variants` call over every file, in one ffmpeg run unless `single_pass` is
 false (or the encode cannot share one): a stopped single pass removes every file (rejecting with `export cancelled;
 all N files were removed`), one after another the one in

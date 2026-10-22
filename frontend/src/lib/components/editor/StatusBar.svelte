@@ -12,6 +12,7 @@
 	import { timeDisplay } from '#lib/time-display.svelte';
 	import { assetLine, projectFrame, projectLine } from '#lib/status-facts';
 	import { jobLine } from '#lib/job-line';
+	import { statusText as exportStatusText } from '#lib/export-progress';
 
 	const showLogs = inTauri();
 
@@ -115,14 +116,14 @@
 		     visible and stoppable. -->
 		<span style="display:inline-flex;align-items:center;gap:6px;font-size:var(--text-xs);color:var(--kerf-300)">
 			<span class="kerf-spin" style="width:9px;height:9px;border:1.5px solid var(--kerf-400);border-top-color:transparent;border-radius:50%"></span>
-			{#if editor.exportRun.progress?.waiting}Export {editor.exportRun.progress.waiting}…{:else}Exporting {Math.round(
-					(editor.exportRun.progress?.fraction ?? 0) * 100
-				)}%{/if}
+			{exportStatusText(editor.exportRun.progress)}
 		</span>
 		<button
 			type="button"
 			disabled={editor.exportRun.cancelling}
-			use:tip={'Stop the export and delete the partial file'}
+			use:tip={editor.exportRun.progress?.stage === 'measuring'
+				? 'Stop reading the finished file back (the export is kept)'
+				: 'Stop the export and delete the partial file'}
 			onclick={() => void editor.stopExport()}
 			style="background:none;border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);cursor:pointer;color:var(--text-secondary);font-size:var(--text-xs);height:24px;padding:0 8px"
 		>
