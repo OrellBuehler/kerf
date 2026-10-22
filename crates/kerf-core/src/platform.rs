@@ -515,6 +515,7 @@ mod tests {
             width: 1080,
             height: 1350,
             fit: crate::model::Fit::Cover,
+            fps: None,
         };
         assert_eq!(target_for(Some(&d)).map(|t| t.id), Some("ig_feed"));
         assert_eq!(target_for(None), None);

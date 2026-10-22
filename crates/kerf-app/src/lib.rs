@@ -1970,16 +1970,23 @@ fn cancel_levels(state: State<'_, AppState>) {
 
 /// Set the frame the project is cut for, or clear it back to the source shape.
 /// The preview, the scrubbed still and the export all read it, so the vertical
-/// crop is visible while cutting instead of only in the rendered file.
+/// crop is visible while cutting instead of only in the rendered file. `fps` is the
+/// frame rate every export, playback and still defaults to (1 to 240; `None` follows the
+/// footage), and it is set with the frame: a call without one clears it.
 #[tauri::command(async)]
 fn set_delivery_format(
     state: State<'_, AppState>,
     width: Option<u32>,
     height: Option<u32>,
     fit: Option<Fit>,
+    fps: Option<f64>,
 ) -> CmdResult<Timeline> {
     let format = match (width, height) {
-        (Some(w), Some(h)) => Some(Delivery::new(w, h, fit.unwrap_or(Fit::Cover))),
+        (Some(w), Some(h)) => Some(
+            Delivery::new(w, h, fit.unwrap_or(Fit::Cover))
+                .with_fps(fps)
+                .map_err(|e| e.to_string())?,
+        ),
         _ => None,
     };
     state.project().set_delivery_format(format).map_err(|e| e.to_string())

@@ -4241,13 +4241,24 @@ impl Project {
     /// at render time. `None` restores the default: the shape follows the
     /// footage. An explicit `ExportOptions::resolution` still overrides it, so
     /// a one-off render at another size is unaffected.
+    ///
+    /// The frame carries the **frame rate** the cut is delivered at (`Delivery::fps`): an export,
+    /// the playback and the stills use it when the export options name none, instead of the rate
+    /// of whichever clip is first. It is checked (1 to 240 fps; 23.976 / 29.97 / 59.94 become the
+    /// exact NTSC rates) and refused when it is not a rate; `None` follows the footage.
     pub fn set_delivery_format(&self, format: Option<Delivery>) -> Result<Timeline> {
+        let format = format
+            .map(|d| Delivery::new(d.width, d.height, d.fit).with_fps(d.fps))
+            .transpose()?;
         let label = match format {
-            Some(d) => format!("Deliver {}x{}", d.width, d.height),
+            Some(d) => match d.fps {
+                Some(fps) => format!("Deliver {}x{} at {} fps", d.width, d.height, crate::model::fmt_fps(fps)),
+                None => format!("Deliver {}x{}", d.width, d.height),
+            },
             None => "Deliver at source shape".to_string(),
         };
         self.edit_timeline(&label, |timeline| {
-            timeline.format = format.map(|d| Delivery::new(d.width, d.height, d.fit));
+            timeline.format = format;
             // Preset titles are drawn for the frame they were made at.
             let frame = timeline.preset_frame();
             timeline.regenerate_svg_presets(frame);
@@ -7740,6 +7751,7 @@ mod tests {
                 width: 1080,
                 height: 1920,
                 fit: Fit::Cover,
+                fps: None,
             }))
             .unwrap();
         let summary = project.cut_summary(None).unwrap();
@@ -10674,6 +10686,55 @@ mod tests {
         // Both edits are in the log, so the frame change is undoable like any other.
         let history = project.history().unwrap();
         assert!(history.iter().any(|r| r.label == "Deliver 1080x1920"), "{history:?}");
+    }
+
+    #[test]
+    fn the_delivery_frame_rate_is_set_checked_persisted_and_undoable() {
+        let project = Project::sample().unwrap();
+        let at = |fps: Option<f64>| Delivery::new(1080, 1920, Fit::Cover).with_fps(fps).unwrap();
+
+        // A rate is part of the frame; the short NTSC decimals are made exact on the way in.
+        let tl = project
+            .set_delivery_format(Some(Delivery {
+                fps: Some(29.97),
+                ..at(None)
+            }))
+            .unwrap();
+        assert_eq!(tl.format.unwrap().fps, Some(30_000.0 / 1001.0));
+        let tl = project.set_delivery_format(Some(at(Some(50.0)))).unwrap();
+        assert_eq!(tl.format, Some(at(Some(50.0))));
+        let history = project.history().unwrap();
+        assert!(
+            history.iter().any(|r| r.label == "Deliver 1080x1920 at 50 fps"),
+            "{history:?}"
+        );
+
+        // Not a rate: refused, and the frame is as it was.
+        for bad in [0.0, -25.0, 0.5, 241.0, f64::NAN, f64::INFINITY] {
+            let err = project
+                .set_delivery_format(Some(Delivery {
+                    fps: Some(bad),
+                    ..at(None)
+                }))
+                .unwrap_err();
+            assert!(err.to_string().contains("frame rate"), "{bad}: {err}");
+        }
+        assert_eq!(project.timeline().unwrap().format, Some(at(Some(50.0))));
+
+        // It survives a reload, and a frame set without one clears it: the rate belongs to the frame.
+        let path = std::env::temp_dir().join(format!("kerf-delivery-fps-{}.kerf", Uuid::new_v4()));
+        project.save_as(&path).unwrap();
+        let reopened = Project::open(&path).unwrap();
+        assert_eq!(reopened.timeline().unwrap().format, Some(at(Some(50.0))));
+        drop(reopened);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(project.set_delivery_format(Some(at(None))).unwrap().format, Some(at(None)));
+        assert!(project.set_delivery_format(None).unwrap().format.is_none());
+
+        // The change is a revision like any other, so undo puts the rate back.
+        project.undo().unwrap();
+        project.undo().unwrap();
+        assert_eq!(project.timeline().unwrap().format, Some(at(Some(50.0))));
     }
 
     #[test]

@@ -102,6 +102,12 @@ const MIGRATIONS: &[Migration] = &[
         destructive: false,
         needed_to_read: false,
     },
+    Migration {
+        run: v11_to_v12,
+        needed: v11_to_v12_needed,
+        destructive: false,
+        needed_to_read: false,
+    },
 ];
 
 /// The schema this build writes and the newest it opens.
@@ -276,6 +282,19 @@ fn v10_to_v11(_: &Connection) -> rusqlite::Result<()> {
 }
 
 fn v10_to_v11_needed(_: &Connection) -> bool {
+    true
+}
+
+/// v12: a delivery frame may carry the frame rate the cut is delivered at (`Delivery.fps`, `"fps"` beside `"fit"` in the
+/// timeline JSON's `format`). It is a new field an older build drops at its next write, and the export then goes back to
+/// the rate of whichever clip is first, without a word: a 50 fps reel comes out at the 24 of its first b-roll. A delivery
+/// with none is written as it was, so a stored one is unchanged. Nothing in the file's tables changes; the step is the
+/// version that keeps an older build out, after the file is copied aside.
+fn v11_to_v12(_: &Connection) -> rusqlite::Result<()> {
+    Ok(())
+}
+
+fn v11_to_v12_needed(_: &Connection) -> bool {
     true
 }
 
