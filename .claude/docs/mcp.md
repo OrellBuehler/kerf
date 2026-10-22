@@ -564,9 +564,20 @@ the real listener, middleware and session, over a socket).
 
 ## Small answers, paged reads (`mcp/reads.rs`)
 
-`list_assets` pages (`offset` / `limit`, 100 by default, at most 500; `{total, offset, returned, next_offset, assets}`, and
+`list_assets` pages (`offset` / `limit`, 100 by default, at most 500; `{total, offset, returned, next_offset, newest_imported_at, note?, assets}`, and
 only the assets of the page are looked at on the disk) and lists each asset with `source_missing` (stat, outside the lock), `proxy` (`ProxyBrief`: state, fraction, ETA,
-reason) and per-kind `analysis` states; `get_asset_metadata` and `analyze_asset` answer an `AnalysisSummary` (counts, totals,
+reason) and per-kind `analysis` states. A big library is the reason for three more things (`assets_page`, a pure function the tests drive with a
+66-asset library): **a page is also cut at ~20,000 characters** (`ASSET_PAGE_CHARS`, always at least one asset, `next_offset` where it stopped, a
+`note` saying so; proxies are looked up 16 assets at a time, so a short page does not pay for the ones left out). A whole entry is ~1 KB (every
+stream the probe found, a music score without a bound), so a full page holds ~25 GoPro-style assets, not the 100 of `limit`.
+**`fields: "compact"`** (default `full`, so no existing caller loses a field; a full page past 8,000 characters carries a `note` naming it) answers
+`AssetLine`: `id`, `name`, `duration` (to the ms), `media` (`3840x2160@59.94`, `4000x3000 still`, `audio`, `data`), `imported_at`, `proxy` (the state
+only), `analysis` (`all`, `none`, or the done kinds as `silence scenes`), and only when set `analysis_running`, `analysis_failed`, `music_score` (true;
+the score is in the full entry and `get_asset_metadata`) and `source_missing` — ~200 characters, a quarter of the full entry. **`imported_after`**
+(RFC 3339, strictly after) is how an agent finds what an import added: assets already carry `imported_at` (the column the list is ordered by, so no
+migration), the list is already oldest-import-first, and `newest_imported_at` (the whole library's, whatever the filter) is the baseline to take
+before importing and hand back afterwards; `total` and `offset` then count within the matches. A time that does not parse is `invalid_params`.
+`get_asset_metadata` and `analyze_asset` answer an `AnalysisSummary` (counts, totals,
 the first ~600 characters of the transcript); `get_transcript` and `get_analysis_detail` page the lists (`offset` / `limit`,
 `next_offset`, windows in source seconds; `get_transcript` also takes `speaker` and `words`: the lines carry their speaker label and the
 timed words only on request, `speakers` lists the labels, and the summaries name the speakers but never carry words); `get_timeline_state` moves the *generated* captions into a `captions` window

@@ -134,6 +134,253 @@ impl AssetEntry {
     }
 }
 
+// ---- the library listing, in pages that fit ------------------------------------
+
+/// How much of the asset list one `list_assets` page may hold, in characters of JSON. A client
+/// refuses (or saves to a file) a tool result past its limit, and a full entry is ~1 KB — every
+/// stream the probe found, plus a music score — so a page is cut here whatever `limit` says.
+const ASSET_PAGE_CHARS: usize = 20_000;
+/// A full page past this size gets the pointer to the compact view.
+const ASSET_HINT_CHARS: usize = 8_000;
+/// Assets whose proxy is looked up (a cached ffprobe each) at a time while a page fills, so a
+/// page cut short does not pay for the assets it leaves out.
+const ASSET_CHUNK: usize = 16;
+
+/// How much of each asset `list_assets` shows.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub(super) enum AssetFields {
+    /// The whole asset: every probed stream, a voiceover's script, a music score.
+    #[default]
+    Full,
+    /// One short line: id, name, duration, picture format, proxy and analysis state.
+    Compact,
+}
+
+/// An asset as `compact` lists it: what is needed to pick one, and nothing to read twice.
+#[derive(Debug, Serialize)]
+pub(super) struct AssetLine {
+    id: uuid::Uuid,
+    name: String,
+    /// Seconds, to the millisecond.
+    duration: f64,
+    /// `3840x2160@59.94` for video, `4000x3000 still` for an image, `audio`, or `data`.
+    media: String,
+    imported_at: chrono::DateTime<chrono::Utc>,
+    /// The preview proxy's state (`ready`, `building`, `queued`, `missing`, `failed`, `off`,
+    /// `not_needed`); `proxy_status` has the rest.
+    proxy: ProxyPhase,
+    /// The kinds that are done, in pass order, as `silence scenes loudness`; `all` when every one is,
+    /// `none` when none is.
+    analysis: String,
+    /// The kinds whose step is running now, in the same words. Absent when none is.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    analysis_running: String,
+    /// Why a kind failed, by kind. Absent when none did.
+    #[serde(skip_serializing_if = "serde_json::Map::is_empty")]
+    analysis_failed: serde_json::Map<String, serde_json::Value>,
+    /// The audio was composed from a score (`compose_music`); the score is in the full listing.
+    /// Absent otherwise.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    music_score: bool,
+    /// The source file is gone from disk. Absent otherwise.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    source_missing: bool,
+}
+
+/// `59.94005994` as `59.94`, `30.0` as `30`.
+fn fps_label(fps: f64) -> String {
+    let text = format!("{fps:.2}");
+    text.trim_end_matches('0').trim_end_matches('.').to_string()
+}
+
+/// The picture (or the lack of one) in a few characters.
+fn media_label(asset: &Asset) -> String {
+    use kerf_core::StreamKind;
+    match asset.primary_kind() {
+        StreamKind::Audio => "audio".to_string(),
+        StreamKind::Video => {
+            let video = asset.streams.iter().find(|s| s.kind == StreamKind::Video);
+            let size = video.and_then(|s| Some((s.width?, s.height?)));
+            match (size, video.and_then(|s| s.fps)) {
+                (Some((w, h)), _) if asset.is_image() => format!("{w}x{h} still"),
+                (Some((w, h)), Some(fps)) if fps > 0.0 => format!("{w}x{h}@{}", fps_label(fps)),
+                (Some((w, h)), _) => format!("{w}x{h}"),
+                (None, _) => "video".to_string(),
+            }
+        }
+        _ => "data".to_string(),
+    }
+}
+
+/// The analysis kinds in `state`, in pass order.
+fn kinds_in(status: &kerf_core::AnalysisStatus, state: kerf_core::AnalysisState) -> Vec<&'static str> {
+    status
+        .kinds
+        .iter()
+        .filter(|k| k.state == state)
+        .map(|k| k.kind.name())
+        .collect()
+}
+
+impl AssetLine {
+    pub(super) fn new(asset: &Asset, proxy: &ProxyStatus, status: &kerf_core::AnalysisStatus) -> Self {
+        let (_, analysis_failed) = AnalysisBrief::of(status);
+        let done = kinds_in(status, kerf_core::AnalysisState::Done);
+        let analysis = match done.len() {
+            0 => "none".to_string(),
+            n if n == status.kinds.len() => "all".to_string(),
+            _ => done.join(" "),
+        };
+        Self {
+            id: asset.id,
+            name: asset.name.clone(),
+            duration: (asset.duration * 1000.0).round() / 1000.0,
+            media: media_label(asset),
+            imported_at: asset.imported_at,
+            proxy: proxy.state,
+            analysis,
+            analysis_running: kinds_in(status, kerf_core::AnalysisState::Running).join(" "),
+            analysis_failed,
+            music_score: asset.music_score.is_some(),
+            source_missing: !std::path::Path::new(&asset.path).exists(),
+        }
+    }
+}
+
+/// One asset of a listing, in the view that was asked for.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+pub(super) enum AssetRow {
+    Full(Box<AssetEntry>),
+    Compact(Box<AssetLine>),
+}
+
+/// What `list_assets` answers.
+#[derive(Debug, Serialize)]
+pub(super) struct AssetsPage {
+    /// The assets that match (all of them unless `imported_after` narrowed it).
+    total: usize,
+    offset: usize,
+    returned: usize,
+    /// Where the next page starts; null on the last.
+    next_offset: Option<usize>,
+    /// When the newest asset of the whole library was imported, whatever the filter: the
+    /// `imported_after` that finds what is imported from here on. Absent for an empty library.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    newest_imported_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    note: Option<String>,
+    assets: Vec<AssetRow>,
+}
+
+/// The page a `list_assets` call asked for.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct AssetsQuery {
+    fields: AssetFields,
+    imported_after: Option<chrono::DateTime<chrono::Utc>>,
+    offset: usize,
+    limit: usize,
+}
+
+impl ListAssetsParams {
+    /// The query, with the defaults and the cap applied. A time that is not RFC 3339 is the
+    /// caller's mistake, said as one.
+    pub(super) fn query(&self) -> Result<AssetsQuery, McpError> {
+        let imported_after = match self.imported_after.as_deref().map(str::trim) {
+            None | Some("") => None,
+            Some(text) => Some(
+                chrono::DateTime::parse_from_rfc3339(text)
+                    .map_err(|e| {
+                        McpError::invalid_params(
+                            format!(
+                                "`imported_after` must be an RFC 3339 time such as 2026-10-22T09:30:00Z (the \
+                                 `newest_imported_at` of an earlier list_assets answer works): {e}"
+                            ),
+                            None,
+                        )
+                    })?
+                    .with_timezone(&chrono::Utc),
+            ),
+        };
+        let (offset, limit) = page_of(self.offset, self.limit, DEFAULT_PAGE, MAX_PAGE);
+        Ok(AssetsQuery {
+            fields: self.fields.unwrap_or_default(),
+            imported_after,
+            offset,
+            limit,
+        })
+    }
+}
+
+/// One page of the library: the assets imported after the query's time, from its offset, in the
+/// view it chose, and no more than [`ASSET_PAGE_CHARS`] of them (at least one). The disk is asked
+/// only about the assets the page holds, a chunk at a time; `proxies_of` answers a chunk's proxy
+/// states (`kerf_core::proxy::statuses`).
+pub(super) fn assets_page(
+    mut inputs: Vec<kerf_core::proxy::ProxyInput>,
+    statuses: &HashMap<uuid::Uuid, kerf_core::AnalysisStatus>,
+    query: &AssetsQuery,
+    proxies_of: impl Fn(&[kerf_core::proxy::ProxyInput]) -> Vec<ProxyStatus>,
+) -> AssetsPage {
+    let newest_imported_at = inputs.iter().map(|i| i.asset.imported_at).max();
+    if let Some(after) = query.imported_after {
+        inputs.retain(|i| i.asset.imported_at > after);
+    }
+    let total = inputs.len();
+    let start = query.offset.min(total);
+    let window = &inputs[start..];
+    let window = &window[..window.len().min(query.limit)];
+
+    let mut assets = Vec::new();
+    let (mut used, mut consumed, mut cut) = (0, 0, false);
+    'page: for chunk in window.chunks(ASSET_CHUNK) {
+        let proxies: HashMap<_, _> = proxies_of(chunk).into_iter().map(|p| (p.asset_id, p)).collect();
+        for input in chunk {
+            let id = input.asset.id;
+            if let (Some(proxy), Some(status)) = (proxies.get(&id), statuses.get(&id)) {
+                let row = match query.fields {
+                    AssetFields::Full => AssetRow::Full(Box::new(AssetEntry::new(&input.asset, proxy, status))),
+                    AssetFields::Compact => AssetRow::Compact(Box::new(AssetLine::new(&input.asset, proxy, status))),
+                };
+                let size = serde_json::to_string(&row).map_or(0, |s| s.len() + 1);
+                if !assets.is_empty() && used + size > ASSET_PAGE_CHARS {
+                    cut = true;
+                    break 'page;
+                }
+                used += size;
+                assets.push(row);
+            }
+            consumed += 1;
+        }
+    }
+
+    let end = start + consumed;
+    let mut note = String::new();
+    if query.fields == AssetFields::Full && (cut || used > ASSET_HINT_CHARS) {
+        note.push_str(
+            "Each asset here carries its whole probe (every stream) and any music score: pass fields=\"compact\" \
+             for one short line per asset (id, name, duration, media, proxy, analysis) when you are looking for \
+             one, and get_asset_metadata for one asset's detail. ",
+        );
+    }
+    if cut {
+        note.push_str(&format!(
+            "This page stops at {} assets to stay under about {ASSET_PAGE_CHARS} characters; next_offset continues it.",
+            assets.len()
+        ));
+    }
+    AssetsPage {
+        total,
+        offset: query.offset,
+        returned: assets.len(),
+        next_offset: (end < total).then_some(end),
+        newest_imported_at,
+        note: (!note.is_empty()).then(|| note.trim_end().to_string()),
+        assets,
+    }
+}
+
 // ---- an analysis, summarised --------------------------------------------------
 
 #[derive(Debug, Serialize, PartialEq)]
@@ -659,11 +906,29 @@ fn window_clips(timeline: &Timeline, value: &mut serde_json::Value, view: &State
 // ---- tools --------------------------------------------------------------------
 
 #[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
-pub(super) struct ListPageParams {
-    #[schemars(description = "Skip this many assets (default 0), to page on; `next_offset` in the answer is the next page")]
+pub(super) struct ListAssetsParams {
+    #[schemars(
+        description = "Skip this many of the matching assets (default 0), to page on; `next_offset` in the answer is the next page"
+    )]
     offset: Option<usize>,
-    #[schemars(description = "Most assets to return (default 100, at most 500)")]
+    #[schemars(
+        description = "Most assets to return (default 100, at most 500). A page is also cut at about 20,000 characters, so \
+                       a big library comes in several pages: follow `next_offset`"
+    )]
     limit: Option<usize>,
+    #[schemars(
+        description = "`full` (default): each asset whole — every probed stream, a voiceover's script, a music score — about 1 KB \
+                       apiece. `compact`: one short line each (id, name, duration, media = picture format / audio, imported_at, \
+                       proxy state, analysis, and `music_score` / `source_missing` when true), about a quarter of the size: use it to \
+                       find an asset in a big library"
+    )]
+    fields: Option<AssetFields>,
+    #[schemars(
+        description = "Only the assets imported strictly after this RFC 3339 time (e.g. 2026-10-22T09:30:00Z) — what a batch import \
+                       just added. Take `newest_imported_at` from a list_assets answer before you import and pass it back after. \
+                       Assets come oldest import first; `offset` counts within the matches"
+    )]
+    imported_after: Option<String>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -736,19 +1001,28 @@ fn check_window(from: Option<f64>, to: Option<f64>) -> Result<(), McpError> {
 #[tool_router(router = tool_router_reads, vis = "pub(super)")]
 impl KerfMcp {
     #[tool(
-        description = "List the media assets in the project, `limit` (default 100, at most 500) from `offset` — the answer has \
-                       `total`, `returned` and `next_offset` — under `assets`. Each carries its probed streams, `source_missing` (the \
-                       file is gone from disk — set only when true), `proxy` (the preview proxy: `state` is ready, \
-                       building with `fraction` and `eta_secs`, queued, missing, failed with a `reason`, off, or \
-                       not_needed; until it is ready previews decode the original and are slower — export is not \
-                       affected) and `analysis` (per kind — silence, scenes, loudness, rhythm, transcript — done, \
-                       not_run, running, failed or off; `analysis_failed` says why). proxy_status and analysis_status \
-                       give the same per asset in more detail; get_asset_metadata summarises what the analysis found."
+        description = "List the media assets in the project, oldest import first. The answer has `total` (the assets that \
+                       match), `returned`, `next_offset` (null on the last page), `newest_imported_at` (when the newest asset of \
+                       the whole library was imported) and `assets`. A page is at most `limit` assets (default 100, at most 500) \
+                       and about 20,000 characters, so a big library comes in several pages: follow `next_offset`. By default \
+                       each asset is shown whole, about 1 KB apiece: its probed streams, `source_missing` (the file is gone \
+                       from disk — set only when true), `music_score` (set when the audio was composed with compose_music), \
+                       `proxy` (the preview proxy: `state` is ready, building with `fraction` and `eta_secs`, queued, missing, \
+                       failed with a `reason`, off, or not_needed; until it is ready previews decode the original and are \
+                       slower — export is not affected) and `analysis` (per kind — silence, scenes, loudness, rhythm, \
+                       transcript — done, not_run, running, failed or off; `analysis_failed` says why). For a big library pass \
+                       `fields: \"compact\"`: one short line per asset — `id`, `name`, `duration`, `media` (\"3840x2160@59.94\", \
+                       \"audio\", \"4000x3000 still\"), `imported_at`, `proxy` (just its state), `analysis` (the kinds that are \
+                       done: \"all\", \"none\" or e.g. \"silence scenes\"; `analysis_running` and `analysis_failed` when any) and \
+                       `music_score` (true: the score itself is in the whole entry and in get_asset_metadata) / `source_missing` when true. To find what an import added, take `newest_imported_at` from \
+                       this tool before importing and pass it as `imported_after` afterwards: only the assets imported strictly \
+                       after that time come back. proxy_status and analysis_status give the same per asset in more detail; \
+                       get_asset_metadata summarises what the analysis found."
     )]
-    async fn list_assets(&self, Parameters(page): Parameters<ListPageParams>) -> Result<String, McpError> {
-        let (offset, limit) = page_of(page.offset, page.limit, DEFAULT_PAGE, MAX_PAGE);
+    async fn list_assets(&self, Parameters(p): Parameters<ListAssetsParams>) -> Result<String, McpError> {
+        let query = p.query()?;
         let (project, owner) = (self.project.clone(), self.owner());
-        let entries = blocking(move || {
+        let page = blocking(move || {
             // The transcription backend may need an ffmpeg start the first time it is asked: before
             // the lock, never inside it.
             crate::warm_transcription_backend();
@@ -761,34 +1035,13 @@ impl KerfMcp {
                     project.analysis_statuses().map_err(core_err)?,
                 )
             };
-            // Only the assets of this page are looked at on the disk (a proxy's state is a cached
+            // Only the assets the page holds are looked at on the disk (a proxy's state is a cached
             // ffprobe, `source_missing` a stat, each): the listing of a library of thousands stays cheap.
-            let total = inputs.len();
-            let window: Vec<_> = inputs.into_iter().skip(offset).take(limit).collect();
-            let proxies: HashMap<_, _> = kerf_core::proxy::statuses(&window)
-                .into_iter()
-                .map(|s| (s.asset_id, s))
-                .collect();
             let statuses: HashMap<_, _> = statuses.into_iter().map(|s| (s.asset_id, s)).collect();
-            let items = window
-                .iter()
-                .filter_map(|input| {
-                    let id = input.asset.id;
-                    Some(AssetEntry::new(&input.asset, proxies.get(&id)?, statuses.get(&id)?))
-                })
-                .collect::<Vec<_>>();
-            Ok((total, items))
+            Ok(assets_page(inputs, &statuses, &query, kerf_core::proxy::statuses))
         })
         .await?;
-        let (total, items) = entries;
-        let end = offset.saturating_add(items.len());
-        json(&serde_json::json!({
-            "total": total,
-            "offset": offset,
-            "returned": items.len(),
-            "next_offset": (end < total).then_some(end),
-            "assets": items,
-        }))
+        json(&page)
     }
 
     #[tool(
@@ -1488,5 +1741,410 @@ mod tests {
         assert_eq!(entry["analysis"]["silence"], "done");
         assert_eq!(entry["source_missing"], true, "/nope.mp4 is not there");
         assert!(entry.get("analysis_failed").is_none());
+    }
+
+    // ---- list_assets: the compact view, what an import added, pages that fit ----------------
+
+    /// When the `n`th asset of a test library was imported: a quarter of a second apart, as a
+    /// batch import lands.
+    fn imported(n: usize) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-10-20T08:00:00Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+            + chrono::TimeDelta::milliseconds(n as i64 * 250)
+    }
+
+    /// A score of `sections` sections of `bars` bars each, a chord per bar.
+    fn long_score(sections: usize, bars: usize) -> serde_json::Value {
+        serde_json::json!({
+            "bpm": 96.0,
+            "key": "Am",
+            "style": "lofi",
+            "sections": (0..sections).map(|i| serde_json::json!({
+                "kind": if i % 2 == 0 { "verse" } else { "drop" },
+                "bars": bars,
+                "chords": (0..bars).map(|b| ["Am7", "Fmaj7", "C", "G/B", "Dm7", "E7"][b % 6]).collect::<Vec<_>>(),
+                "energy": 0.6,
+            })).collect::<Vec<_>>(),
+            "hits": [{"at_s": 12.5, "kind": "impact"}],
+            "seed": 7,
+        })
+    }
+
+    /// The `n`th asset of a library like the one that overflowed: GoPro clips (a picture, a sound
+    /// and three data tracks apiece), a music bed with its score every eleventh, and a still.
+    fn library_asset(n: usize, score: (usize, usize)) -> Asset {
+        let (name, streams, score) = match n % 11 {
+            5 => (
+                format!("lofi bed {n}.wav"),
+                serde_json::json!([{"index": 0, "kind": "audio", "codec": "pcm_s16le", "sample_rate": 44100, "channels": 2}]),
+                Some(long_score(score.0, score.1)),
+            ),
+            8 => (
+                format!("title card {n}.jpg"),
+                serde_json::json!([{"index": 0, "kind": "video", "codec": "mjpeg", "width": 4000, "height": 3000,
+                                    "image": true, "pix_fmt": "yuvj444p", "color_range": "pc"}]),
+                None,
+            ),
+            _ => (
+                format!("GX01{n:04}.MP4"),
+                serde_json::json!([
+                    {"index": 0, "kind": "video", "codec": "hevc", "width": 3840, "height": 2160, "fps": 59.94005994005994,
+                     "color_transfer": "bt709", "color_primaries": "bt709", "pix_fmt": "yuvj420p", "color_space": "bt709",
+                     "color_range": "pc"},
+                    {"index": 1, "kind": "audio", "codec": "aac", "sample_rate": 48000, "channels": 2},
+                    {"index": 2, "kind": "data", "codec": "none"},
+                    {"index": 3, "kind": "data", "codec": "none"},
+                    {"index": 4, "kind": "data", "codec": "none"},
+                ]),
+                None,
+            ),
+        };
+        let mut asset = serde_json::json!({
+            "id": Uuid::from_u128(n as u128 + 1),
+            // A file that exists, so no entry says `source_missing`.
+            "path": concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"),
+            "name": name,
+            "duration": 23.123456 + n as f64,
+            "streams": streams,
+            "imported_at": imported(n),
+        });
+        if let Some(score) = score {
+            asset["music_score"] = score;
+        }
+        serde_json::from_value(asset).unwrap()
+    }
+
+    /// An analysis status with the first `kinds` of the five kinds done and the rest not run.
+    fn done(kinds: usize) -> kerf_core::AnalysisStatus {
+        use kerf_core::AnalysisState::{Done, NotRun};
+        kerf_core::AnalysisStatus {
+            asset_id: Uuid::nil(),
+            kinds: AnalysisKind::ALL
+                .iter()
+                .enumerate()
+                .map(|(i, kind)| kerf_core::AnalysisKindStatus {
+                    kind: *kind,
+                    state: if i < kinds { Done } else { NotRun },
+                    reason: None,
+                })
+                .collect(),
+        }
+    }
+
+    type Library = (Vec<kerf_core::ProxyInput>, HashMap<Uuid, kerf_core::AnalysisStatus>);
+
+    /// The first `count` assets of the library, with an analysis status each: all five kinds done,
+    /// four done, or none; asset 3 is transcribing and asset 4's transcript failed.
+    fn library(count: usize, score: (usize, usize)) -> Library {
+        use kerf_core::AnalysisState::{Failed, Running};
+        let mut inputs = Vec::new();
+        let mut statuses = HashMap::new();
+        for n in 0..count {
+            let asset = library_asset(n, score);
+            let mut status = done([5, 4, 0][n % 3]);
+            status.asset_id = asset.id;
+            if n == 3 || n == 4 {
+                let transcript = status.kinds.last_mut().unwrap();
+                (transcript.state, transcript.reason) = if n == 3 {
+                    (Running, None)
+                } else {
+                    (Failed, Some("no speech model".to_string()))
+                };
+            }
+            statuses.insert(asset.id, status);
+            inputs.push(kerf_core::ProxyInput { asset, declined: false });
+        }
+        (inputs, statuses)
+    }
+
+    fn query(
+        fields: Option<AssetFields>,
+        imported_after: Option<&str>,
+        offset: Option<usize>,
+        limit: Option<usize>,
+    ) -> AssetsQuery {
+        ListAssetsParams {
+            offset,
+            limit,
+            fields,
+            imported_after: imported_after.map(str::to_string),
+        }
+        .query()
+        .unwrap()
+    }
+
+    /// The page the tool would answer: as the client's JSON, as the text, and how many assets the
+    /// disk was asked about for their proxies.
+    fn listed(
+        inputs: &[kerf_core::ProxyInput],
+        statuses: &HashMap<Uuid, kerf_core::AnalysisStatus>,
+        q: &AssetsQuery,
+    ) -> (serde_json::Value, String, usize) {
+        let looked_at = std::cell::Cell::new(0);
+        let page = assets_page(inputs.to_vec(), statuses, q, |chunk| {
+            looked_at.set(looked_at.get() + chunk.len());
+            chunk.iter().map(|i| proxy(i.asset.id, ProxyPhase::Ready)).collect()
+        });
+        let text = serde_json::to_string(&page).unwrap();
+        (serde_json::from_str(&text).unwrap(), text, looked_at.get())
+    }
+
+    /// The test-library numbers of a page's assets.
+    fn ids(page: &serde_json::Value) -> Vec<u128> {
+        page["assets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| Uuid::parse_str(a["id"].as_str().unwrap()).unwrap().as_u128() - 1)
+            .collect()
+    }
+
+    /// What `list_assets` answered before this view existed: the first hundred assets, whole.
+    fn the_old_answer(inputs: &[kerf_core::ProxyInput], statuses: &HashMap<Uuid, kerf_core::AnalysisStatus>) -> String {
+        let items: Vec<_> = inputs
+            .iter()
+            .take(DEFAULT_PAGE)
+            .map(|i| AssetEntry::new(&i.asset, &proxy(i.asset.id, ProxyPhase::Ready), &statuses[&i.asset.id]))
+            .collect();
+        serde_json::to_string(&serde_json::json!({
+            "total": inputs.len(),
+            "offset": 0,
+            "returned": items.len(),
+            "next_offset": serde_json::Value::Null,
+            "assets": items,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn compact_is_a_short_line_per_asset_with_the_fields_an_agent_picks_by() {
+        let (inputs, statuses) = library(66, (6, 8));
+        let (page, text, _) = listed(&inputs, &statuses, &query(Some(AssetFields::Compact), None, None, None));
+        assert_eq!((page["total"].as_u64(), page["returned"].as_u64()), (Some(66), Some(66)));
+        assert!(page["next_offset"].is_null() && page.get("note").is_none(), "{page}");
+
+        // A GoPro clip: the id, the name, the length to the millisecond, the picture, when it came.
+        let clip = &page["assets"][0];
+        assert_eq!(
+            clip,
+            &serde_json::json!({
+                "id": Uuid::from_u128(1),
+                "name": "GX010000.MP4",
+                "duration": 23.123,
+                "media": "3840x2160@59.94",
+                "imported_at": "2026-10-20T08:00:00Z",
+                "proxy": "ready",
+                "analysis": "all",
+            })
+        );
+        // The analysis in a word: how far it got, what is running, why a kind failed.
+        assert_eq!(page["assets"][1]["analysis"], "silence scenes loudness rhythm");
+        assert_eq!(page["assets"][2]["analysis"], "none");
+        assert_eq!(page["assets"][3]["analysis"], "silence scenes loudness rhythm");
+        assert_eq!(page["assets"][3]["analysis_running"], "transcript");
+        assert_eq!(page["assets"][4]["analysis_failed"]["transcript"], "no speech model");
+        // Sound only, a score, a still: said in the same few words.
+        let bed = &page["assets"][5];
+        assert_eq!(
+            (bed["media"].as_str(), bed["music_score"].as_bool()),
+            (Some("audio"), Some(true))
+        );
+        assert!(bed.get("streams").is_none() && bed.get("sections").is_none(), "{bed}");
+        assert_eq!(page["assets"][8]["media"], "4000x3000 still");
+        assert!(clip.get("music_score").is_none(), "set only for a composed bed: {clip}");
+        let scored = page["assets"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|a| a.get("music_score").is_some());
+        assert_eq!(scored.count(), 6);
+        assert!(text.len() / 66 < 260, "{} characters a line", text.len() / 66);
+    }
+
+    #[test]
+    fn a_missing_source_and_a_picture_without_a_rate_are_still_said() {
+        let mut asset = library_asset(0, (1, 4));
+        asset.path = "/nope/gone.mp4".to_string();
+        asset.streams[0].fps = None;
+        let line = AssetLine::new(&asset, &proxy(asset.id, ProxyPhase::Building), &done(2));
+        let line = serde_json::to_value(line).unwrap();
+        assert_eq!(line["source_missing"], true);
+        assert_eq!(
+            (line["media"].as_str(), line["proxy"].as_str()),
+            (Some("3840x2160"), Some("building"))
+        );
+        assert_eq!(line["analysis"], "silence scenes");
+        assert_eq!(fps_label(29.97002997), "29.97");
+        assert_eq!(fps_label(30.0), "30");
+        assert_eq!(fps_label(120.0), "120");
+        assert_eq!(fps_label(23.976), "23.98");
+        asset.streams.clear();
+        assert_eq!(media_label(&asset), "data");
+    }
+
+    #[test]
+    fn the_whole_listing_overflowed_and_the_compact_one_and_the_full_page_do_not() {
+        let (inputs, statuses) = library(66, (6, 8));
+        let before = the_old_answer(&inputs, &statuses).len();
+        let (_, compact, _) = listed(&inputs, &statuses, &query(Some(AssetFields::Compact), None, None, None));
+        let (full_page, full, _) = listed(&inputs, &statuses, &query(None, None, None, None));
+        // Each asset's path is this checkout's own Cargo.toml, so the size moves with where the repo lives.
+        assert!(before > 40_000, "the library is as big as the one that overflowed: {before}");
+        assert!(compact.len() < 15_000, "all 66 in a line each: {}", compact.len());
+        assert!(
+            compact.len() * 3 < before,
+            "the compact view is a third of it or less: {} of {before}",
+            compact.len()
+        );
+        assert!(full.len() < 22_000, "a full page is cut well under 25k: {}", full.len());
+        assert!(full_page["returned"].as_u64().unwrap() < 66);
+    }
+
+    #[test]
+    fn a_full_page_is_cut_at_the_budget_and_points_at_compact_and_the_next_page() {
+        let (inputs, statuses) = library(66, (6, 8));
+        let (first, text, looked_at) = listed(&inputs, &statuses, &query(None, None, None, None));
+        assert!(text.len() <= ASSET_PAGE_CHARS + 1_000, "{}", text.len());
+        let returned = first["returned"].as_u64().unwrap() as usize;
+        assert!((10..40).contains(&returned), "{returned}");
+        assert_eq!(first["next_offset"], returned);
+        let note = first["note"].as_str().unwrap();
+        assert!(note.contains("fields=\"compact\"") && note.contains("next_offset"), "{note}");
+        assert!(
+            looked_at < returned + 2 * ASSET_CHUNK,
+            "the disk was asked about {looked_at} assets for a page of {returned}"
+        );
+        // The entry itself is the one the listing always had.
+        let first_entry = AssetEntry::new(
+            &inputs[0].asset,
+            &proxy(inputs[0].asset.id, ProxyPhase::Ready),
+            &statuses[&inputs[0].asset.id],
+        );
+        assert_eq!(first["assets"][0], serde_json::to_value(first_entry).unwrap());
+
+        // Following next_offset reads every asset once, in import order.
+        let mut seen = Vec::new();
+        let mut offset = Some(0);
+        let mut pages = 0;
+        while let Some(at) = offset {
+            let (page, text, _) = listed(&inputs, &statuses, &query(None, None, Some(at), None));
+            assert!(text.len() <= ASSET_PAGE_CHARS + 1_000, "{}", text.len());
+            seen.extend(ids(&page));
+            offset = page["next_offset"].as_u64().map(|n| n as usize);
+            pages += 1;
+        }
+        assert_eq!(seen, (0..66).map(|n| n as u128).collect::<Vec<_>>());
+        assert!(pages > 2, "{pages}");
+    }
+
+    #[test]
+    fn a_few_assets_come_back_whole_without_a_note_as_before() {
+        let (inputs, statuses) = library(3, (1, 4));
+        let (page, text, _) = listed(&inputs, &statuses, &query(None, None, None, None));
+        assert!(page.get("note").is_none() && page["next_offset"].is_null(), "{page}");
+        assert!(page.as_object().unwrap().contains_key("next_offset"), "still there, as null");
+        assert_eq!(page["returned"], 3);
+        // What was there is there, in the same words.
+        let old: serde_json::Value = serde_json::from_str(&the_old_answer(&inputs, &statuses)).unwrap();
+        assert_eq!(page["assets"], old["assets"]);
+        assert_eq!(page["total"], old["total"]);
+        assert!(text.len() < ASSET_HINT_CHARS);
+    }
+
+    #[test]
+    fn a_page_of_long_scores_still_fits_and_one_asset_over_the_budget_is_still_returned() {
+        // Sixty-four sections of 64 bars apiece: a score bigger than the page budget on its own.
+        let (inputs, statuses) = library(66, (64, 64));
+        assert_eq!(inputs.iter().filter(|i| i.asset.music_score.is_some()).count(), 6);
+        let (page, text, _) = listed(&inputs[..16], &statuses, &query(None, None, None, None));
+        assert!(text.len() <= ASSET_PAGE_CHARS + 1_000, "{}", text.len());
+        assert_eq!(ids(&page), (0..5).collect::<Vec<_>>(), "the page stops before the long score");
+        assert_eq!(page["next_offset"], 5);
+        // A page that starts at the long score is that one asset, not an empty page and no way on.
+        let (page, text, _) = listed(&inputs, &statuses, &query(None, None, Some(5), Some(500)));
+        assert!(text.len() > ASSET_PAGE_CHARS, "{}", text.len());
+        assert_eq!(ids(&page), vec![5]);
+        assert_eq!(page["next_offset"], 6, "it moves on");
+        // Compact leaves the score out whatever its size.
+        let (page, text, _) = listed(&inputs, &statuses, &query(Some(AssetFields::Compact), None, None, None));
+        assert_eq!(page["returned"], 66);
+        assert!(text.len() < 15_000, "{}", text.len());
+    }
+
+    #[test]
+    fn imported_after_finds_what_a_batch_added() {
+        let (all, statuses) = library(66, (2, 8));
+        // The library as it stood before 16 GoPro clips were imported: take the newest time.
+        let (before, _, _) = listed(&all[..50], &statuses, &query(None, None, None, Some(1)));
+        let mark = before["newest_imported_at"].as_str().unwrap().to_string();
+        assert_eq!(mark, "2026-10-20T08:00:12.250Z", "the 50th asset, to the millisecond");
+
+        let compact = Some(AssetFields::Compact);
+        let (batch, _, _) = listed(&all, &statuses, &query(compact, Some(&mark), None, None));
+        assert_eq!(ids(&batch), (50..66).collect::<Vec<_>>(), "the 16 clips and nothing else");
+        assert_eq!((batch["total"].as_u64(), batch["returned"].as_u64()), (Some(16), Some(16)));
+        assert!(batch["next_offset"].is_null());
+        assert_eq!(
+            batch["newest_imported_at"], "2026-10-20T08:00:16.250Z",
+            "the library's, not the match's"
+        );
+
+        // Strictly after: the asset stamped with the mark itself is not new.
+        assert!(!ids(&batch).contains(&49));
+        // Paging counts within the matches.
+        let (second, _, _) = listed(&all, &statuses, &query(compact, Some(&mark), Some(10), Some(4)));
+        assert_eq!(ids(&second), (60..64).collect::<Vec<_>>());
+        assert_eq!(
+            (second["total"].as_u64(), second["next_offset"].as_u64()),
+            (Some(16), Some(14))
+        );
+        // Any offset of RFC 3339 does, and the full view filters the same way.
+        let at = Some("2026-10-20T10:00:12.250+02:00");
+        let (full, _, looked_at) = listed(&all, &statuses, &query(None, at, None, Some(5)));
+        assert_eq!(ids(&full), (50..55).collect::<Vec<_>>());
+        assert_eq!(full["total"], 16);
+        assert!(
+            looked_at <= ASSET_CHUNK,
+            "only the page is looked at on the disk: {looked_at}"
+        );
+        // Nothing new is an empty page that still names the newest time.
+        let (none, _, _) = listed(&all, &statuses, &query(compact, Some("2026-10-20T08:00:16.250Z"), None, None));
+        assert_eq!((none["total"].as_u64(), none["returned"].as_u64()), (Some(0), Some(0)));
+        assert_eq!(none["assets"], serde_json::json!([]));
+        assert_eq!(none["newest_imported_at"], "2026-10-20T08:00:16.250Z");
+        // No assets, no time.
+        let (empty, _, _) = listed(&[], &statuses, &query(None, None, None, None));
+        assert!(empty.get("newest_imported_at").is_none() && empty["total"] == 0);
+    }
+
+    #[test]
+    fn the_listing_arguments_are_checked_and_capped() {
+        let q = query(None, None, None, None);
+        assert_eq!(
+            (q.offset, q.limit, q.fields, q.imported_after),
+            (0, DEFAULT_PAGE, AssetFields::Full, None)
+        );
+        assert_eq!(query(None, Some("  "), Some(3), Some(9_999)).limit, MAX_PAGE);
+        assert_eq!(query(None, Some(""), None, None).imported_after, None, "blank is no filter");
+        for bad in ["yesterday", "2026-10-22", "2026-10-22 09:30:00", "1700000000"] {
+            let e = ListAssetsParams {
+                imported_after: Some(bad.to_string()),
+                ..Default::default()
+            }
+            .query()
+            .unwrap_err();
+            assert_eq!(e.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{bad}");
+            assert!(
+                e.message.contains("RFC 3339") && e.message.contains("newest_imported_at"),
+                "{}",
+                e.message
+            );
+        }
+        // A view that is not one of the two is refused at the schema, not read as the default.
+        let typo = serde_json::from_value::<ListAssetsParams>(serde_json::json!({"fields": "short"}));
+        assert!(typo.is_err());
+        let ok: ListAssetsParams = serde_json::from_value(serde_json::json!({"fields": "compact"})).unwrap();
+        assert_eq!(ok.fields, Some(AssetFields::Compact));
     }
 }
