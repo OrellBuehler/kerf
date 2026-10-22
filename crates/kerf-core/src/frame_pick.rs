@@ -560,11 +560,14 @@ fn fps_progress(pick: &FpsPick, read: &SourceFrames, eof: bool) -> PickProgress 
     let len = read.pts.len();
     let ready = |shown, keep_from| PickProgress::Ready { shown, keep_from };
     if pick.image.is_some() {
-        return match fps_pick(pick, read) {
-            None => ready(None, len),
-            Some(_) if len > 0 => ready(Some(0), 0),
-            Some(_) if eof => ready(None, 0),
-            Some(_) => PickProgress::NeedMore,
+        // Asked before it starts (its overlay opens a frame early), it keeps its one frame.
+        let frames = frames_of(pick, read);
+        return match run(pick, &frames).map(|r| place(pick, &frames, &r)) {
+            None | Some(Placed::Late) => ready(None, len),
+            Some(Placed::Early) => ready(None, 0),
+            Some(Placed::At(_)) if len > 0 => ready(Some(0), 0),
+            Some(Placed::At(_)) if eof => ready(None, 0),
+            Some(Placed::At(_)) => PickProgress::NeedMore,
         };
     }
     if !(pick.speed > 0.0 && pick.speed.is_finite()) {
@@ -1179,6 +1182,27 @@ mod tests {
         );
         assert_eq!(
             still(7).progress(&one, false),
+            PickProgress::Ready {
+                shown: Some(0),
+                keep_from: 0
+            }
+        );
+        // Before its first slot it shows nothing and keeps its frame for the next.
+        let late = |k| {
+            Pick::Fps(FpsPick {
+                image: Some(rate),
+                ..pick((0.0, 1.0), 1.0, 1.0, false, (30, 1), k)
+            })
+        };
+        assert_eq!(
+            late(29).progress(&one, false),
+            PickProgress::Ready {
+                shown: None,
+                keep_from: 0
+            }
+        );
+        assert_eq!(
+            late(30).progress(&one, false),
             PickProgress::Ready {
                 shown: Some(0),
                 keep_from: 0
