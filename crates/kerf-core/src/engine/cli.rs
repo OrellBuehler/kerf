@@ -18902,6 +18902,85 @@ mod tests {
         assert_eq!(dims, "1080,1920", "the project frame decides the file's shape");
     }
 
+    /// The file's own frame rate, as `ffprobe` reads it: `50/1`, `30000/1001`.
+    fn probed_rate(path: &Path) -> String {
+        let probed = command(&ffprobe_bin())
+            .args(["-v", "error", "-select_streams", "v:0"])
+            .args(["-show_entries", "stream=r_frame_rate", "-of", "csv=p=0"])
+            .arg(path)
+            .output()
+            .expect("run ffprobe");
+        String::from_utf8_lossy(&probed.stdout).trim().to_string()
+    }
+
+    /// Footage of 24 and 25 fps in one cut: with no rate on the delivery frame the file takes the first
+    /// clip's, a delivery rate decides it instead (an NTSC one as the exact `30000/1001`, which FFmpeg
+    /// would otherwise read as `2997/100`), and the export's own `fps` still wins.
+    ///
+    /// `cargo test -p kerf-core --no-default-features -- --ignored delivery_rate_decides`
+    #[test]
+    #[ignore = "needs the ffmpeg binary"]
+    fn the_delivery_rate_decides_the_files_frame_rate_in_mixed_footage() {
+        let dir = std::env::temp_dir().join(format!("kerf-delivery-rate-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let source = |name: &str, rate: u32| {
+            let media = dir.join(name);
+            let ok = command(&ffmpeg_bin())
+                .args(["-hide_banner", "-loglevel", "error", "-y"])
+                .args(["-f", "lavfi", "-i", &format!("testsrc=size=640x360:rate={rate}:duration=2")])
+                .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+                .arg(&media)
+                .status_bounded()
+                .expect("run ffmpeg");
+            assert!(ok.success());
+            let mut asset = av_asset(Uuid::new_v4(), 2.0);
+            asset.path = media.to_string_lossy().into_owned();
+            asset.streams = vec![video_stream(640, 360, f64::from(rate))];
+            asset
+        };
+        let (slow, quick) = (source("slow.mp4", 24), source("quick.mp4", 25));
+        let cut = |format: Option<Delivery>| Timeline {
+            format,
+            ..single(vec![make_clip(slow.id, 0.0, 1.0, 0.0), make_clip(quick.id, 0.0, 1.0, 1.0)])
+        };
+        let assets = [slow.clone(), quick.clone()];
+        let opts = ExportOptions {
+            container: Container::Mp4,
+            video_codec: Some("libx264".into()),
+            include_audio: false,
+            ..Default::default()
+        };
+        let rate_of = |name: &str, format: Option<Delivery>, opts: &ExportOptions| {
+            let out = dir.join(name);
+            render_with(&cut(format), &assets, &out, opts).expect("export");
+            probed_rate(&out)
+        };
+        let frame = Delivery::new(640, 360, Fit::Contain);
+        let at = |fps: f64| Some(frame.with_fps(Some(fps)).unwrap());
+
+        let mut seen = Vec::new();
+        seen.push(("footage", rate_of("footage.mp4", Some(frame), &opts)));
+        seen.push(("none", rate_of("none.mp4", None, &opts)));
+        seen.push(("50", rate_of("fifty.mp4", at(50.0), &opts)));
+        seen.push(("29.97", rate_of("ntsc.mp4", at(29.97), &opts)));
+        let explicit = ExportOptions {
+            fps: Some(25.0),
+            ..opts.clone()
+        };
+        seen.push(("explicit", rate_of("explicit.mp4", at(50.0), &explicit)));
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            seen,
+            [
+                ("footage", "24/1".to_string()),
+                ("none", "24/1".to_string()),
+                ("50", "50/1".to_string()),
+                ("29.97", "30000/1001".to_string()),
+                ("explicit", "25/1".to_string()),
+            ]
+        );
+    }
+
     // ---- rotation, colour and frame rate at probe time ----------------------
 
     fn probe_json(video: &str) -> ProbeResult {

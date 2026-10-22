@@ -2447,6 +2447,32 @@ struct TimelineSummary {
     media_notes: Vec<reads::MediaNote>,
 }
 
+/// The delivery frame a `set_delivery_format` call asks for, given the one the project has now (`None`
+/// clears it). A width and height set the frame; its rate is `fps` (0 clears it), else the one the
+/// project already delivers at, so reshaping does not lose it. `fps` alone changes the rate of the
+/// frame the project has (and refuses when there is none); nothing at all clears the frame.
+fn next_delivery(p: &SetDeliveryFormatParams, current: Option<Delivery>) -> kerf_core::Result<Option<Delivery>> {
+    let rate = match p.fps {
+        Some(0.0) => None,
+        Some(fps) => Some(fps),
+        None => current.and_then(|d| d.rate()),
+    };
+    match (p.width, p.height, p.fps, current) {
+        (Some(w), Some(h), _, _) => Delivery::new(w, h, p.fit.unwrap_or(Fit::Cover)).with_fps(rate).map(Some),
+        (None, None, Some(_), Some(frame)) => Delivery {
+            fit: p.fit.unwrap_or(frame.fit),
+            ..frame
+        }
+        .with_fps(rate)
+        .map(Some),
+        (None, None, Some(0.0), None) => Ok(None),
+        (None, None, Some(_), None) => Err(kerf_core::Error::InvalidArgument(
+            "no delivery frame is set, so there is no frame to give a rate: pass width and height too".to_string(),
+        )),
+        _ => Ok(None),
+    }
+}
+
 /// A frame rate and where it comes from (`kerf_core::FpsSource`).
 #[derive(Serialize)]
 struct ExportFps {
@@ -3293,27 +3319,15 @@ impl KerfMcp {
                        takes the rate of the FIRST clip with a picture, which in footage of mixed rates \
                        (100, 24 and 29.97 fps) is whichever happens to come first — set it whenever the \
                        footage is mixed or the user has a rate in mind; an explicit `options.fps` on the \
-                       export still wins. Omit `fps` to keep the project's current rate, pass 0 to clear it. \
-                       Omit width and height to clear the whole frame, rate included. Returns the frame and \
+                       export still wins. Omit `fps` to keep the project's current rate, pass 0 to clear it; \
+                       `fps` alone (no width and height) changes just the rate of the frame the project has. \
+                       Omit all three to clear the whole frame, rate included. Returns the frame and \
                        the rate an export will use (`export_fps`, and where it comes from)."
     )]
     fn set_delivery_format(&self, Parameters(p): Parameters<SetDeliveryFormatParams>) -> Result<String, McpError> {
         self.edit(|project| {
-            let format = match (p.width, p.height) {
-                (Some(w), Some(h)) => {
-                    let fps = match p.fps {
-                        Some(0.0) => None,
-                        Some(f) => Some(f),
-                        None => project.working_timeline().map_err(core_err)?.format.and_then(|f| f.rate()),
-                    };
-                    Some(
-                        Delivery::new(w, h, p.fit.unwrap_or(Fit::Cover))
-                            .with_fps(fps)
-                            .map_err(core_err)?,
-                    )
-                }
-                _ => None,
-            };
+            let current = project.working_timeline().map_err(core_err)?.format;
+            let format = next_delivery(&p, current).map_err(core_err)?;
             let timeline = project.set_delivery_format(format).map_err(core_err)?;
             let assets = project.list_assets().map_err(core_err)?;
             json(&serde_json::json!({
@@ -8125,6 +8139,46 @@ mod tests {
 
     /// `set_delivery_format` takes a frame rate, and the words an agent reads say what leaving it out
     /// does and where exports now get their rate from.
+    #[test]
+    fn next_delivery_keeps_the_rate_through_a_reshape_and_sets_it_alone() {
+        use kerf_core::{Delivery, Fit};
+        let ask = |width, height, fit, fps| super::SetDeliveryFormatParams { width, height, fit, fps };
+        let vertical = Delivery::new(1080, 1920, Fit::Cover).with_fps(Some(50.0)).unwrap();
+        let next = |p, current| super::next_delivery(&p, current).unwrap();
+        // A reshape with no rate keeps the one the project has; a stated one replaces it, 0 clears it.
+        let square = next(ask(Some(1080), Some(1080), None, None), Some(vertical)).unwrap();
+        assert_eq!((square.width, square.height, square.fps), (1080, 1080, Some(50.0)));
+        let square = next(ask(Some(1080), Some(1080), None, Some(25.0)), Some(vertical)).unwrap();
+        assert_eq!(square.fps, Some(25.0));
+        let square = next(ask(Some(1080), Some(1080), None, Some(0.0)), Some(vertical)).unwrap();
+        assert_eq!(square.fps, None);
+        // The short NTSC decimals are made exact, as the core does for every caller.
+        let ntsc = next(ask(Some(1080), Some(1920), None, Some(29.97)), None).unwrap();
+        assert_eq!(ntsc.fps, Some(30_000.0 / 1001.0));
+        // A rate alone is the frame's rate, its shape and fit as they were.
+        let rated = next(ask(None, None, None, Some(30.0)), Some(vertical)).unwrap();
+        assert_eq!(
+            (rated.width, rated.height, rated.fit, rated.fps),
+            (1080, 1920, Fit::Cover, Some(30.0))
+        );
+        assert_eq!(next(ask(None, None, None, Some(0.0)), Some(vertical)).unwrap().fps, None);
+        // ...which there has to be one of; and nothing at all still clears the frame.
+        assert!(super::next_delivery(&ask(None, None, None, Some(30.0)), None).is_err());
+        assert_eq!(next(ask(None, None, None, Some(0.0)), None), None);
+        assert_eq!(next(ask(None, None, None, None), Some(vertical)), None);
+        // Not a rate: refused whichever way it arrives.
+        for bad in [-1.0, 0.5, 241.0, f64::NAN] {
+            assert!(
+                super::next_delivery(&ask(Some(1080), Some(1920), None, Some(bad)), None).is_err(),
+                "{bad}"
+            );
+            assert!(
+                super::next_delivery(&ask(None, None, None, Some(bad)), Some(vertical)).is_err(),
+                "{bad}"
+            );
+        }
+    }
+
     #[test]
     fn the_delivery_tool_takes_a_frame_rate_and_says_what_it_decides() {
         let tools = router().list_all();
