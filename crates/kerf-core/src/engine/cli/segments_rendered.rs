@@ -393,11 +393,7 @@ fn assert_same_sound(whole: &[u8], parts: &[u8], tag: &str) {
     let head = whole.len() - SOUND_TAIL;
     let at = whole[..head].iter().zip(&parts[..head]).position(|(x, y)| x != y);
     assert_eq!(at, None, "{tag}: sound differs from byte {at:?} of {}", whole.len());
-    let floats = |b: &[u8]| -> Vec<f32> {
-        b.chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect()
-    };
+    let floats = |b: &[u8]| -> Vec<f32> { b.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect() };
     let worst = floats(&whole[head..])
         .iter()
         .zip(floats(&parts[head..]))
@@ -499,7 +495,7 @@ fn a_ten_bit_export_in_parts_is_the_whole_export() {
 
 #[test]
 #[ignore = "drives the real ffmpeg"]
-fn two_passes_faststart_and_the_container_options_are_the_last_passs() {
+fn two_passes_faststart_and_the_container_options_go_to_the_last_pass() {
     let fx = fixture("two-pass");
     with_pinned_dir(fx.dir.join("cache").to_str().unwrap(), || {
         let opts = ExportOptions {

@@ -24,6 +24,8 @@ sectons = "sectons"
 lable = "lable"
 # the OpenType width axis tag
 wdth = "wdth"
+# ffmpeg's noise filter strength for all planes (`noise=alls=`)
+alls = "alls"
 
 [files]
 # argv digests of the golden oracle: 16-hex FNV hashes, not words
