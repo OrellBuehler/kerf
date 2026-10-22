@@ -43,8 +43,8 @@
 	import { addAnimatedTitle, addCustomSvgTitle, addTitleHere, dropCaptions, importCaptionFile, makeCaptions } from '#lib/title-actions';
 	import { keyframeOffer } from '#lib/keyframe-copy';
 	import type { ActionId } from '#lib/keymap';
-	import { DELIVERY_PRESETS, deliveryTip, fitChoices, presetFor } from '#lib/delivery-formats';
-	import { setDeliveryFit, setDeliveryPreset } from '#lib/menu-commands';
+	import { DELIVERY_PRESETS, deliveryLabel, deliveryTip, fitChoices, presetFor, rateChoices } from '#lib/delivery-formats';
+	import { setDeliveryFit, setDeliveryFps, setDeliveryPreset } from '#lib/menu-commands';
 	import { generatedCount, importMenuEntries, importableAssets } from '#lib/caption-import-ui';
 	import type { Clip, Marker, PreviewDraft, StreamKind, SvgOverlay, TextOverlay, Track } from '#lib/types';
 	import { moveDraft, trimDraft } from '#lib/preview-draft';
@@ -767,7 +767,8 @@
 					icon: p.id === delivery.id ? 'check' : undefined,
 					action: () => void setDeliveryPreset(p.id)
 				})),
-				// With a frame set: how footage of another shape meets it (the project's fit ticked).
+				// With a frame set: how footage of another shape meets it (the project's fit ticked), and the
+				// frame rate it is delivered at, which exports, playback and stills default to.
 				...(editor.timeline.format
 					? [
 							{ type: 'separator' as const },
@@ -775,6 +776,13 @@
 								label: c.label,
 								icon: c.checked ? 'check' : undefined,
 								action: () => void setDeliveryFit(c.fit)
+							})),
+							{ type: 'separator' as const },
+							{ type: 'header' as const, label: 'Frame rate', sub: 'Exports, playback and stills' },
+							...rateChoices(editor.timeline.format).map((c) => ({
+								label: c.fps == null ? 'Source rate' : `${c.label} fps`,
+								icon: c.checked ? 'check' : undefined,
+								action: () => void setDeliveryFps(c.fps)
 							}))
 						]
 					: [])
@@ -2993,7 +3001,7 @@
 					on={!!delivery.format}
 					disabled={editor.previewingStaged}
 					aria-haspopup="menu"
-					onclick={pickDelivery}>{delivery.label}</ToolbarToggle
+					onclick={pickDelivery}>{deliveryLabel(editor.timeline.format)}</ToolbarToggle
 				>
 			</span>
 		</div>

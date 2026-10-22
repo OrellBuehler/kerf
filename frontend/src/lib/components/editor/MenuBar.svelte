@@ -70,6 +70,7 @@
 		hasFrame: !!editor.timeline.format,
 		tool: ui.tool,
 		delivery: presetFor(editor.timeline.format).id,
+		deliveryFps: editor.timeline.format?.fps ?? null,
 		allHeight: uniformPreset(
 			ui.heights,
 			editor.timeline.tracks.map((t) => t.id)

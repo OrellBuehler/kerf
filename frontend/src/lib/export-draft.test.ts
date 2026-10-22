@@ -26,6 +26,16 @@ describe('frameKey', () => {
 		expect(frameKey(undefined)).toBeNull();
 	});
 
+	test('carries the frame rate when there is one, and is what it always was when there is none', () => {
+		expect(frameKey({ width: 1080, height: 1920, fit: 'cover', fps: 50 })).toBe('1080x1920/cover@50');
+		expect(frameKey({ width: 1080, height: 1920, fit: 'cover', fps: undefined })).toBe('1080x1920/cover');
+		// A rate changed since the dialog was closed must not bring back the rate it remembered.
+		const at = (fps: number | undefined) => frameKey({ width: 1920, height: 1080, fit: 'contain', fps });
+		expect(at(50)).not.toBe(at(25));
+		expect(at(50)).not.toBe(at(undefined));
+		expect(restoreDraft(draft({ frame: at(25) }), at(50))).toBeNull();
+	});
+
 	test("differs when only the fit differs, since the dialog opens with the cut's fit", () => {
 		expect(frameKey({ width: 1920, height: 1080, fit: 'cover' })).not.toBe(frameKey({ width: 1920, height: 1080, fit: 'contain' }));
 	});

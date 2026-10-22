@@ -101,6 +101,17 @@ describe('the frame-rate select', () => {
 		expect(frameRateOptions(30)).toBe(FRAME_RATES);
 		expect(frameRateOptions(null)).toBe(FRAME_RATES);
 		expect(frameRateOptions(undefined)).toBe(FRAME_RATES);
+		expect(frameRateOptions(30, null)).toBe(FRAME_RATES);
+		expect(frameRateOptions(30, undefined)).toBe(FRAME_RATES);
+	});
+
+	test('with the project’s rate set, "Source" is that rate — the choice that follows it, as the resolution’s follows the frame', () => {
+		const options = frameRateOptions(null, 50);
+		expect(options[0]).toEqual({ label: 'Project rate (50 fps)', value: null });
+		// Every other choice is as it was, and the list still opens on a choice the select has.
+		expect(options.slice(1)).toEqual(FRAME_RATES.slice(1));
+		expect(frameRateOptions(null, 30000 / 1001)[0].label).toBe('Project rate (29.97 fps)');
+		expect(frameRateOptions(18, 50).at(-1)).toEqual({ label: '18', value: 18 });
 	});
 });
 
@@ -305,5 +316,15 @@ describe('initialExport', () => {
 		const odd = initialExport({ width: 1000, height: 1000, fit: 'blur' });
 		expect([odd.id, odd.opts.resolution, odd.opts.fit]).toEqual(['custom', null, 'blur']);
 		expect(initialExport(null).id).toBe('web_1080p');
+	});
+
+	test('a project that states its frame rate exports at it, not at the preset’s own', () => {
+		// The Reels preset says 30; a 9:16 project delivered at 50 must not open on it.
+		expect(initialExport({ width: 1080, height: 1920, fit: 'cover' }).opts.fps).toBe(30);
+		const rated = initialExport({ width: 1080, height: 1920, fit: 'cover', fps: 50 });
+		expect(rated.opts.fps).toBeNull();
+		expect(rated.opts.resolution).toEqual([1080, 1920]);
+		const odd = initialExport({ width: 1000, height: 1000, fit: 'cover', fps: 50 });
+		expect([odd.id, odd.opts.resolution, odd.opts.fps]).toEqual(['custom', null, null]);
 	});
 });

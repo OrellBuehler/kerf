@@ -1079,6 +1079,10 @@ export interface Delivery {
 	width: number;
 	height: number;
 	fit: Fit;
+	/** The frame rate the cut is delivered at (1 to 240): what an export, the playback and the stills
+	 *  default to when the export names none. Absent follows the footage — the first clip with a picture.
+	 *  An NTSC rate is the exact `n * 1000 / 1001` (`checkDeliveryFps`). */
+	fps?: number;
 }
 
 /**
