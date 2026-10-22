@@ -40,6 +40,7 @@ import type {
 	MarkerPatch,
 	SubtitleFormat,
 	ExportProgress,
+	ExportReport,
 	Filmstrip,
 	GpuPreviewStatus,
 	ImportOutcome,
@@ -4954,25 +4955,28 @@ export async function getEnergy(assetId: string, buckets: number): Promise<numbe
 
 // ---- export ----------------------------------------------------------------
 
-export async function exportTimeline(outputPath: string, options: ExportOptions): Promise<string> {
+/** Render the cut. Answers what the written file measures (`ExportReport`): its streams and, with sound, its own
+ *  loudness and true peak — read back from the file in the same job; a measurement that fails says so in
+ *  `problem` and does not fail the export. */
+export async function exportTimeline(outputPath: string, options: ExportOptions): Promise<ExportReport> {
 	if (!inTauri()) throw new Error('export is only available in the desktop app');
-	return invoke<string>('export_timeline', { outputPath, options });
+	return invoke<ExportReport>('export_timeline', { outputPath, options });
 }
 
 /** Render the cut at every delivery frame — one file per shape beside
  *  `outputPath`, named by shape (`cut-9x16.mp4`). With `smartCrop` every shot
  *  is framed for every shape first, recorded on the clips as one revision.
  *  `singlePass` (the default) writes every file from one decode of the cut where
- *  the encode allows; false renders them one after another. */
+ *  the encode allows; false renders them one after another. Answers one `ExportReport` per file, in order. */
 export async function exportVariants(
 	outputPath: string,
 	formats: Delivery[],
 	smartCrop: boolean,
 	options: ExportOptions,
 	singlePass = true
-): Promise<string[]> {
+): Promise<ExportReport[]> {
 	if (!inTauri()) throw new Error('export is only available in the desktop app');
-	return invoke<string[]>('export_variants', { outputPath, formats, smartCrop, singlePass, options });
+	return invoke<ExportReport[]>('export_variants', { outputPath, formats, smartCrop, singlePass, options });
 }
 
 /** Ask the backend to stop the in-flight export; it then rejects with `export cancelled`. */

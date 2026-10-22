@@ -153,3 +153,105 @@ fn an_export_that_meters_nothing_starts_its_bar_at_the_render() {
     assert!(working.iter().any(|p| p.fraction > 0.0), "{working:?}");
     assert!(working.iter().all(|p| p.fraction < 1.0), "{working:?}");
 }
+
+/// The export measured: the read-back is the last of the same job's bar, ends it at 1.0 and hands
+/// back what the file turned out to be.
+#[test]
+#[ignore = "needs the ffmpeg binary"]
+fn a_measured_export_ends_on_the_read_back_and_reports_the_file() {
+    let dir = scratch("measured");
+    let asset = long_gop_source(&dir, 8.0);
+    let tl = timeline_of(vec![video_track(vec![make_clip(asset.id, 0.0, 8.0, 0.0)])]);
+    let opts = ExportOptions {
+        video_codec: Some("libx264".into()),
+        preset: Some("ultrafast".into()),
+        audio_codec: Some("aac".into()),
+        loudness: Some(LoudnessPreset::Youtube),
+        loudness_static: true,
+        range: Some(TimeRange { start: 2.0, end: 7.0 }),
+        ..ExportOptions::default()
+    };
+    let out = dir.join("measured.mp4");
+    let mut seen = Vec::new();
+    let (status, report) = render_measured(&tl, std::slice::from_ref(&asset), &out, &opts, &mut |p| seen.push(p), &|| {
+        false
+    })
+    .expect("export");
+    assert_eq!(status, RenderStatus::Completed);
+    let report = report.expect("a completed export is measured");
+    assert_eq!(report.problem, None, "{report:?}");
+    assert_eq!(report.path, out.to_string_lossy());
+    assert!(
+        (report.duration_secs.unwrap() - 5.0).abs() < 0.2,
+        "{:?}",
+        report.duration_secs
+    );
+    assert!(report.video.is_some() && report.audio.is_some());
+    let integrated = report.loudness.unwrap().integrated_lufs.unwrap();
+    assert!((integrated + 14.0).abs() < 1.0, "{integrated}");
+
+    let mut order: Vec<ExportStage> = seen.iter().filter_map(|p| p.stage).collect();
+    order.dedup();
+    assert_eq!(order.last(), Some(&ExportStage::Measuring), "{order:?}");
+    let fractions: Vec<f64> = seen.iter().map(|p| p.fraction).collect();
+    assert!(fractions.windows(2).all(|w| w[0] <= w[1] + 1e-9), "{fractions:?}");
+    assert!((fractions.last().unwrap() - 1.0).abs() < 1e-9, "{fractions:?}");
+    // The read-back owns the end of the bar and nothing before it.
+    assert!(seen
+        .iter()
+        .filter(|p| p.stage == Some(ExportStage::Measuring))
+        .all(|p| p.fraction >= 1.0 - VERIFY_SHARE - 1e-9));
+    assert!(seen
+        .iter()
+        .filter(|p| p.stage != Some(ExportStage::Measuring))
+        .all(|p| p.fraction <= 1.0 - VERIFY_SHARE + 1e-9));
+}
+
+/// Every file of a multi-format export is read back, at its own frame, in the order asked.
+#[test]
+#[ignore = "needs the ffmpeg binary"]
+fn measured_variants_report_each_file_at_its_own_frame() {
+    let dir = scratch("variants");
+    let asset = long_gop_source(&dir, 4.0);
+    let tl = timeline_of(vec![video_track(vec![make_clip(asset.id, 0.0, 4.0, 0.0)])]);
+    let opts = ExportOptions {
+        video_codec: Some("libx264".into()),
+        preset: Some("ultrafast".into()),
+        audio_codec: Some("aac".into()),
+        ..ExportOptions::default()
+    };
+    let base = dir.join("cut.mp4");
+    let variants = vec![
+        ExportVariant::beside(&base, Delivery::new(90, 160, Fit::Cover)),
+        ExportVariant::beside(&base, Delivery::new(160, 160, Fit::Cover)),
+    ];
+    for together in [true, false] {
+        let mut seen: Vec<VariantProgress> = Vec::new();
+        let (run, reports) = render_variants_measured(
+            &tl,
+            std::slice::from_ref(&asset),
+            &variants,
+            &opts,
+            together,
+            &mut |p| seen.push(p),
+            &|| false,
+        )
+        .expect("export");
+        assert_eq!(run.status, RenderStatus::Completed);
+        assert_eq!(run.together, together);
+        let frames: Vec<(Option<u32>, Option<u32>)> = reports
+            .iter()
+            .map(|r| r.video.as_ref().map(|v| (v.width, v.height)).unwrap_or_default())
+            .collect();
+        assert_eq!(frames, [(Some(90), Some(160)), (Some(160), Some(160))], "together={together}");
+        assert!(reports.iter().all(|r| r.problem.is_none() && r.loudness.is_some()));
+        assert_eq!(reports[1].path, variants[1].output.to_string_lossy());
+        let fractions: Vec<f64> = seen.iter().map(|p| p.fraction).collect();
+        assert!(
+            fractions.windows(2).all(|w| w[0] <= w[1] + 1e-9),
+            "together={together}: {fractions:?}"
+        );
+        assert!((fractions.last().unwrap() - 1.0).abs() < 1e-9, "{fractions:?}");
+        assert_eq!(seen.last().and_then(|p| p.stage), Some(ExportStage::Measuring));
+    }
+}

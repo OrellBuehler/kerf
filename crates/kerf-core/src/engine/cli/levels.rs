@@ -266,25 +266,23 @@ fn metered_fraction(position: f64, duration: f64, told: f64, quiet_for: Duration
     (fraction >= told + 0.01).then_some(fraction)
 }
 
-fn measure_mix(
-    timeline: &Timeline,
-    assets: &[Asset],
-    opts: &ExportOptions,
-    status: &mut dyn FnMut(Metering),
+/// Run a metering ffmpeg (`args`: `ebur128` taps on a `-f null` sink) to its end and read what its
+/// meters logged. `seconds` is how long the audio it meters lasts, so `on_fraction` hears how far
+/// along it is (a first `0.0` when it has started, then a step of a percent at most five times a
+/// second). `tag` names the graph's script file if it is too long for argv. Returns the parser and
+/// the last lines that were not a meter's (for an error message); a pass that fails, goes silent for
+/// [`LEVELS_STALL`] or is stopped by `cancel` ([`Error::Cancelled`]) is an error, never a reading.
+/// The caller decides what slot of the machine's budget it runs in (the lease, the thread caps in
+/// `args`).
+pub(super) fn run_meters(
+    mut args: Vec<String>,
+    tag: &str,
+    seconds: f64,
+    on_fraction: &mut dyn FnMut(f64),
     cancel: &dyn Fn() -> bool,
-) -> Result<MixLevels> {
-    let Some(run) = build_levels_args(timeline, assets, opts)? else {
-        return Ok(MixLevels::default());
-    };
-
+) -> Result<(MeterParser, String)> {
     let bin = ffmpeg_bin();
-    // Foreground, and stoppable while it waits for the slot (the Mixer's Stop works on a queued
-    // measurement as on a running one).
-    let lease = cpu::lease_waiting(&mut |w| status(Metering::Waiting(w)), cancel)?;
-    status(Metering::Running(0.0));
-    let mut args = run.args;
-    cpu::limit_args(&mut args, lease.threads());
-    let _script = externalize_filter_complex(&mut args, "lv")?;
+    let _script = externalize_filter_complex(&mut args, tag)?;
     tracing::debug!(command = %format!("{bin} {}", args.join(" ")), "ffmpeg levels command");
 
     let mut child = bg_command(&bin)
@@ -294,6 +292,7 @@ fn measure_mix(
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| launch_err(&bin, e))?;
+    on_fraction(0.0);
     let stderr = child.stderr.take().expect("stderr piped");
 
     // Lines are read on a side thread so the loop below keeps polling `cancel`
@@ -332,9 +331,9 @@ fn measure_mix(
                         tail.pop_front();
                     }
                     tail.push_back(line);
-                } else if let Some(fraction) = metered_fraction(parser.position(), run.duration, told, told_at.elapsed()) {
+                } else if let Some(fraction) = metered_fraction(parser.position(), seconds, told, told_at.elapsed()) {
                     (told, told_at) = (fraction, Instant::now());
-                    status(Metering::Running(fraction));
+                    on_fraction(fraction);
                 }
                 if cancel() {
                     let _ = child.kill();
@@ -373,6 +372,26 @@ fn measure_mix(
         tracing::error!(status = %status, "ffmpeg levels pass failed:\n{tail}");
         return Err(Error::Engine(format!("ffmpeg exited with {status}: {}", tail.trim())));
     }
+    Ok((parser, tail))
+}
+
+fn measure_mix(
+    timeline: &Timeline,
+    assets: &[Asset],
+    opts: &ExportOptions,
+    status: &mut dyn FnMut(Metering),
+    cancel: &dyn Fn() -> bool,
+) -> Result<MixLevels> {
+    let Some(run) = build_levels_args(timeline, assets, opts)? else {
+        return Ok(MixLevels::default());
+    };
+
+    // Foreground, and stoppable while it waits for the slot (the Mixer's Stop works on a queued
+    // measurement as on a running one).
+    let lease = cpu::lease_waiting(&mut |w| status(Metering::Waiting(w)), cancel)?;
+    let mut args = run.args;
+    cpu::limit_args(&mut args, lease.threads());
+    let (parser, tail) = run_meters(args, "lv", run.duration, &mut |f| status(Metering::Running(f)), cancel)?;
 
     let mut master = None;
     let mut tracks = Vec::new();

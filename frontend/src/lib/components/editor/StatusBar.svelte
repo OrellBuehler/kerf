@@ -121,7 +121,9 @@
 		<button
 			type="button"
 			disabled={editor.exportRun.cancelling}
-			use:tip={'Stop the export and delete the partial file'}
+			use:tip={editor.exportRun.progress?.stage === 'measuring'
+				? 'Stop reading the finished file back (the export is kept)'
+				: 'Stop the export and delete the partial file'}
 			onclick={() => void editor.stopExport()}
 			style="background:none;border:var(--line-width) solid var(--border-strong);border-radius:var(--radius-sm);cursor:pointer;color:var(--text-secondary);font-size:var(--text-xs);height:24px;padding:0 8px"
 		>

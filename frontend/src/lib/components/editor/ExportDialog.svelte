@@ -13,13 +13,14 @@
 	import { overwriteCopy } from '#lib/confirm-copy';
 	import { exportTargets, filesToReplace } from '#lib/export-overwrite';
 	import { progressLine } from '#lib/export-progress';
+	import { writtenNotice } from '#lib/export-written';
 	import { toast } from '#lib/notifications.svelte';
 	import { formatsFor, hasPicture } from '#lib/delivery-formats';
 	import { timeDisplay } from '#lib/time-display.svelte';
 	import { frameKey, restoreDraft } from '#lib/export-draft';
 	import { judgeable } from '#lib/platform-verdict';
 	import type { RowSpec } from '#lib/slider-row';
-	import type { Container, ExportOptions, Fit, RateControl, SubtitleFormat } from '#lib/types';
+	import type { Container, ExportOptions, ExportReport, Fit, RateControl, SubtitleFormat } from '#lib/types';
 	import { exportedLine, failure } from '#lib/failure-copy';
 	import {
 		initialExport,
@@ -275,21 +276,25 @@
 		else toast.error(failure('Export failed', e));
 	}
 	async function render(finalOpts: ExportOptions) {
-		if (variantFormats.length) {
-			const outs = await editor.exportVariants(outputPath, variantFormats, ui.deliverSmartCrop, finalOpts);
-			const first = outs[0];
-			toast.success(exportedLine(outs), {
-				action: { label: 'Show in folder', onClick: () => void revealPath(first).catch(() => {}) }
-			});
-			onClose();
-			return;
-		}
-		const out = await editor.export(outputPath, finalOpts);
-		// A path in a toast is not much use on its own — offer the folder.
-		toast.success(exportedLine([out]), {
-			action: { label: 'Show in folder', onClick: () => void revealPath(out).catch(() => {}) }
-		});
+		const reports = variantFormats.length
+			? await editor.exportVariants(outputPath, variantFormats, ui.deliverSmartCrop, finalOpts)
+			: [await editor.export(outputPath, finalOpts)];
+		finished(reports);
 		onClose();
+	}
+	/** The notice an export ends on: the files, and what the written files measure — their loudness and true
+	 *  peak, a warning when a true peak is over the target's ceiling. A path in a toast is not much use on its
+	 *  own, so it offers the folder. */
+	function finished(reports: readonly ExportReport[]) {
+		const first = reports[0]?.path;
+		const { over, description } = writtenNotice(reports);
+		const opts = {
+			...(description ? { description } : {}),
+			...(first ? { action: { label: 'Show in folder', onClick: () => void revealPath(first).catch(() => {}) } } : {})
+		};
+		const line = exportedLine(reports.map((r) => r.path));
+		if (over) toast.warning(line, opts);
+		else toast.success(line, opts);
 	}
 	const stop = () => editor.stopExport();
 </script>

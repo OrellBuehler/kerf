@@ -1568,6 +1568,60 @@ export interface ExportProgress {
 	together?: boolean;
 }
 
+/** The first picture stream of a written file (`kerf_core::WrittenVideo`). */
+export interface WrittenVideo {
+	codec: string;
+	width: number | null;
+	height: number | null;
+	fps: number | null;
+	pix_fmt: string | null;
+	/** Bits per second, when the container records it. */
+	bit_rate: number | null;
+}
+
+/** The first sound stream of a written file (`kerf_core::WrittenAudio`). */
+export interface WrittenAudio {
+	codec: string;
+	sample_rate: number | null;
+	channels: number | null;
+	/** Bits per second. */
+	bit_rate: number | null;
+}
+
+/** A delivery's loudness target (`kerf_core::LoudnessTarget`). */
+export interface LoudnessTarget {
+	lufs: number;
+	/** The true-peak ceiling, dBTP. */
+	true_peak_dbtp: number;
+}
+
+/**
+ * What an export wrote, read back from the file (`kerf_core::ExportReport`) — the answer of
+ * `export_timeline` (one) and `export_variants` (one per file). `get_levels` measures the timeline's
+ * mix; this is the FILE, which a lossy encode can move (an AAC re-encode raised a limited peak back
+ * over its ceiling). Every field is null where it could not be read or does not apply.
+ */
+export interface ExportReport {
+	path: string;
+	size_bytes: number | null;
+	/** ffprobe's format name (`mov,mp4,m4a,3gp,3g2,mj2`, `matroska,webm`, `wav`). */
+	container: string | null;
+	duration_secs: number | null;
+	/** The whole file's bit rate, bits per second. */
+	bit_rate: number | null;
+	video: WrittenVideo | null;
+	audio: WrittenAudio | null;
+	/** The file's own audio, metered. Null for a file with no sound. */
+	loudness: LevelReading | null;
+	/** The loudness target the export was asked for, if any. */
+	target: LoudnessTarget | null;
+	/** How far the file's true peak is over the target's ceiling, in dB, only when it is over it. */
+	true_peak_over_db: number | null;
+	/** Why part of the measurement is missing (the file could not be probed or metered, or the measurement
+	 *  was stopped). The export itself succeeded. */
+	problem: string | null;
+}
+
 /** Payload of the `import-progress` event, emitted while a 360 pair is stitched. */
 export interface ImportProgress extends ExportProgress {
 	/** The file the user picked, so a batch import can label which one is working. */

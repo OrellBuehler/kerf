@@ -5381,9 +5381,19 @@ impl KerfMcp {
                        `_meta` to receive progress notifications while it runs, and cancel the request \
                        (`notifications/cancelled`) to stop it — a cancelled render deletes its half-written file \
                        rather than leaving a broken one behind. Or pass `background: true` to get a job_id at once \
-                       and poll job_status (cancel_job stops it). Refuses to overwrite an existing file unless \
+                       and poll job_status (cancel_job stops it); its `message` says the stage — `metering loudness`, \
+                       `starting ffmpeg and seeking the footage` (nothing is written while it opens a long recording and \
+                       seeks a range's start), `rendering, … to go`, `finishing the file`, `measuring the written file` — \
+                       and `progress` is over the whole export. Refuses to overwrite an existing file unless \
                        overwrite is true, and refuses to write over a file the project still uses (a source, a \
-                       proxy, the project itself)."
+                       proxy, the project itself). The result is `{output, report}`: `report` is what the written FILE \
+                       measures (not the timeline mix `get_levels` reads) — `container`, `duration_secs`, `size_bytes`, overall \
+                       `bit_rate`, `video` (codec, width, height, fps, pix_fmt, bit_rate), `audio` (codec, sample_rate, \
+                       channels, bit_rate) and, when it has sound, `loudness` (integrated_lufs, true_peak_dbtp, \
+                       loudness_range_lu, peak_dbfs: the file's own, after the lossy encode), with the `target` of \
+                       `options.loudness` and `true_peak_over_db` when the true peak is over that target's ceiling. A \
+                       measurement that fails (or is stopped by cancel) says why in `report.problem` and does not fail \
+                       the export."
     )]
     async fn export(
         &self,
@@ -5426,8 +5436,11 @@ impl KerfMcp {
                 // The picture the file will be, said back: the size and rate the options and the
                 // delivery frame made of the footage's own.
                 let frame = kerf_core::exported_frame(&timeline, &assets, &opts);
-                let status =
-                    kerf_core::render_with_progress(&timeline, &assets, &output, &opts, &mut on_progress, &|| run.cancelled())
+                // A completed render is read back in the same job (`report`: the file's streams and
+                // its own loudness), stopped by the same cancel; a measurement that fails says so in
+                // the report and does not fail the export.
+                let (status, report) =
+                    kerf_core::render_measured(&timeline, &assets, &output, &opts, &mut on_progress, &|| run.cancelled())
                         .map_err(|e| {
                             // A failed render must not leave a truncated file that reads as a
                             // finished one — and must not touch an earlier export it never wrote over.
@@ -5440,14 +5453,14 @@ impl KerfMcp {
                     // anyone is still holding its handle.
                     kerf_core::discard_partial(&output, before);
                 }
-                Ok((status, output, frame))
+                Ok((status, output, frame, report))
             })
             .await?;
             match status {
-                (kerf_core::RenderStatus::Completed, output, frame) => {
-                    json(&with_frame(serde_json::json!({ "output": output }), frame))
+                (kerf_core::RenderStatus::Completed, output, frame, report) => {
+                    json(&with_frame(serde_json::json!({ "output": output, "report": report }), frame))
                 }
-                (kerf_core::RenderStatus::Cancelled, output, _) => Err(McpError::internal_error(
+                (kerf_core::RenderStatus::Cancelled, output, _, _) => Err(McpError::internal_error(
                     format!("export cancelled; the partial file at {} was removed", output.display()),
                     None,
                 )),
@@ -5468,7 +5481,10 @@ impl KerfMcp {
                        work as in `export` (and `background: true` returns a job_id). The files render in one pass by \
                        default (single_pass): one decode of the sources split into every frame, so cancelling removes \
                        them all; with single_pass false they render one after another and cancelling keeps the files \
-                       already finished and deletes the one in flight. Refuses to overwrite any existing variant file unless overwrite is true."
+                       already finished and deletes the one in flight. Refuses to overwrite any existing variant file unless overwrite is true. \
+                       Each entry of `outputs` carries a `report` of what that written file measures (container, picture, \
+                       sound, and its own integrated loudness / true peak / loudness range, with `true_peak_over_db` when it \
+                       is over the `options.loudness` target's ceiling), as `export` does."
     )]
     async fn export_variants(
         &self,
@@ -5564,7 +5580,9 @@ impl KerfMcp {
                     );
                 };
                 // Core removes the file of a variant that failed or was cancelled in flight.
-                let ended = kerf_core::render_variants(
+                // A completed run reads every file back (`reports`, one per file in order: the
+                // file's streams and its own loudness); a stopped one has none to give.
+                let (ended, reports) = kerf_core::render_variants_measured(
                     &timeline,
                     &assets,
                     &render_variants,
@@ -5578,11 +5596,13 @@ impl KerfMcp {
                 let range = opts.range.map(|r| (r.start, r.end));
                 let mut outputs = Vec::new();
                 let project = lock_agent_as(&project, owner.as_deref());
-                for v in render_variants.iter().take(ended.completed) {
+                for (i, v) in render_variants.iter().enumerate().take(ended.completed) {
                     // The size and rate that file was written at, not the delivery's nominal ones: the
                     // options may have named their own, and the project's frame rate rides along.
                     let frame = kerf_core::variant_frame(&timeline, &assets, v, &opts);
-                    outputs.push(with_frame(variant_output(&project, v, range)?, frame));
+                    let mut output = with_frame(variant_output(&project, v, range)?, frame);
+                    output["report"] = serde_json::to_value(reports.get(i)).unwrap_or(serde_json::Value::Null);
+                    outputs.push(output);
                 }
                 Ok((ended.status, outputs, ended.together))
             })
@@ -9689,6 +9709,39 @@ mod tests {
         assert!(description("timeline_summary").contains("media_notes"));
         assert!(description("platform_check").contains("width"));
         assert!(description("generate_voiceover").contains("warning"));
+    }
+
+    /// An agent verifying an AAC true-peak problem had to run ffmpeg's ebur128 on the file itself:
+    /// the export tells what it wrote, and says where it differs from `get_levels`.
+    #[test]
+    fn the_export_descriptions_say_what_the_written_file_is_measured_for() {
+        let tools = router().list_all();
+        let description = |name: &str| -> String {
+            tools
+                .iter()
+                .find(|t| t.name == name)
+                .and_then(|t| t.description.as_deref())
+                .unwrap_or_default()
+                .to_string()
+        };
+        let export = description("export");
+        for needle in [
+            "report",
+            "get_levels",
+            "integrated_lufs",
+            "true_peak_dbtp",
+            "true_peak_over_db",
+            "report.problem",
+            "metering loudness",
+            "starting ffmpeg",
+        ] {
+            assert!(export.contains(needle), "export: {needle} in {export}");
+        }
+        let variants = description("export_variants");
+        assert!(
+            variants.contains("report") && variants.contains("true_peak_over_db"),
+            "{variants}"
+        );
     }
 
     #[test]

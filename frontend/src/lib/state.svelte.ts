@@ -142,6 +142,7 @@ import type {
 	ClipMove,
 	SplitSide,
 	ExportProgress,
+	ExportReport,
 	Asset,
 	AnalysisKind,
 	AssetAnalysis,
@@ -1719,7 +1720,7 @@ class EditorState {
 		await cancelExport();
 	}
 
-	export(outputPath: string, options: ExportOptions): Promise<string> {
+	export(outputPath: string, options: ExportOptions): Promise<ExportReport> {
 		return this.#render(() => exportTimeline(outputPath, options));
 	}
 
@@ -1729,7 +1730,7 @@ class EditorState {
 		smartCrop: boolean,
 		options: ExportOptions,
 		singlePass = true
-	): Promise<string[]> {
+	): Promise<ExportReport[]> {
 		try {
 			return await this.#render(() => exportVariants(outputPath, formats, smartCrop, options, singlePass), smartCrop);
 		} finally {

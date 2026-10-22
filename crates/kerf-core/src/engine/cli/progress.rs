@@ -62,6 +62,9 @@ const METER_SHARE_WITH_PICTURE: f64 = 0.08;
 /// ... and of one that writes sound only, where metering is about as much work as the encode.
 const METER_SHARE_SOUND_ONLY: f64 = 0.4;
 
+/// What reading the written file back takes of the bar, at the end of it ([`render_measured`]).
+pub(super) const VERIFY_SHARE: f64 = 0.03;
+
 /// The share of the bar a metering pass takes ahead of the render (pure): nothing when nothing is
 /// metered. An estimate of cost, not a measurement: a pass that meters the mix decodes only the
 /// sound and runs a meter, a small part of a picture encode, but most of an export of sound alone.
@@ -347,7 +350,7 @@ mod tests {
         assert_eq!(metering_share(false, false), 0.0);
         for picture in [true, false] {
             let m = metering_share(true, picture);
-            assert!(m > 0.0 && m < 0.5, "{picture}: {m}");
+            assert!(m > 0.0 && m + VERIFY_SHARE < 1.0, "{picture}: {m}");
         }
         // Sound alone: metering is most of the work of the encode.
         assert!(metering_share(true, false) > metering_share(true, true));

@@ -550,7 +550,12 @@ from the engine's `ExportProgress`** (`export_message` / `variants_message`): th
 proxy`), `metering loudness` (a static loudness pass, with a real fraction), `starting ffmpeg and seeking the
 footage` (nothing written yet — a range deep into a long recording), `rendering, … to go`, `finishing the file`;
 `progress` is over the whole export and only moves forward (`export_variants` gives its smart-crop framing pass the
-first tenth). `export` used to say `rendering` at 0.0 for all of those.
+first tenth). `export` used to say `rendering` at 0.0 for all of those. **`export` answers `{output, report}`**
+and `export_variants` adds a `report` to each entry of `outputs`: an `ExportReport` read back from the written file
+(container, `video`, `audio`, size, duration, bit rates and — with sound — the file's own `loudness`, the `target`,
+`true_peak_over_db` when a lossy encode left the true peak over the target's ceiling, `problem` when the measurement
+failed or was stopped), in the same job and under the same cancel; both descriptions say so (`job_status`' `result`
+carries it for a background job). `get_levels` is still the timeline mix.
 
 ## Live activity stream (`mcp/activity.rs`)
 

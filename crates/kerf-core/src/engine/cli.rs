@@ -6591,6 +6591,114 @@ pub struct VariantsRun {
     pub together: bool,
 }
 
+/// [`render_with_progress`], and once the export has **completed**, a read-back of the file it wrote
+/// ([`measure_export`]): its container, picture and sound as `ffprobe` finds them and, when it has
+/// sound, its own integrated loudness, true peak and loudness range — what `get_levels` (the mix on
+/// the timeline) cannot say once a lossy encode has moved it. The read-back is the last part of the
+/// same job: it reports [`ExportStage::Measuring`] in the last [`VERIFY_SHARE`] of the bar and
+/// stops on the same `cancel` — which leaves the finished file alone and says so in the report. A
+/// measurement that fails never fails the export: the report says why. `None` when the export did
+/// not complete (a cancelled one has removed its file).
+pub fn render_measured(
+    timeline: &Timeline,
+    assets: &[Asset],
+    output: &Path,
+    opts: &ExportOptions,
+    progress: &mut dyn FnMut(ExportProgress),
+    cancel: &dyn Fn() -> bool,
+) -> Result<(RenderStatus, Option<ExportReport>)> {
+    let started = Instant::now();
+    let status = render_with_progress(
+        timeline,
+        assets,
+        output,
+        opts,
+        &mut |p| progress(p.within(0.0, 1.0 - VERIFY_SHARE, started)),
+        cancel,
+    )?;
+    if status != RenderStatus::Completed {
+        return Ok((status, None));
+    }
+    let report = measure_export(
+        output,
+        written::loudness_target(opts),
+        &mut |measured| {
+            progress(measuring(measured, started));
+        },
+        cancel,
+    );
+    // The end of the bar is the end of the job, whatever the meter last said.
+    progress(measuring(1.0, started));
+    Ok((status, Some(report)))
+}
+
+/// The report of a read-back that is `measured` (0..1) through, on the bar of an export begun at `started`.
+fn measuring(measured: f64, started: Instant) -> ExportProgress {
+    ExportProgress {
+        fraction: 1.0 - VERIFY_SHARE + VERIFY_SHARE * measured.clamp(0.0, 1.0),
+        elapsed_secs: started.elapsed().as_secs_f64(),
+        eta_secs: None,
+        waiting: None,
+        stage: Some(ExportStage::Measuring),
+    }
+}
+
+/// [`render_variants`], and once every file has been written, a read-back of each
+/// ([`render_measured`]'s, one report per file in `variants` order). Empty when the run did not
+/// complete: a stopped one has removed what it touched or, one after another, keeps files that were
+/// never measured.
+pub fn render_variants_measured(
+    timeline: &Timeline,
+    assets: &[Asset],
+    variants: &[ExportVariant],
+    opts: &ExportOptions,
+    together: bool,
+    progress: &mut dyn FnMut(VariantProgress),
+    cancel: &dyn Fn() -> bool,
+) -> Result<(VariantsRun, Vec<ExportReport>)> {
+    let started = Instant::now();
+    let run = render_variants(
+        timeline,
+        assets,
+        variants,
+        opts,
+        together,
+        &mut |p| {
+            progress(VariantProgress {
+                fraction: p.fraction * (1.0 - VERIFY_SHARE),
+                ..p
+            });
+        },
+        cancel,
+    )?;
+    if run.status != RenderStatus::Completed {
+        return Ok((run, Vec::new()));
+    }
+    let target = written::loudness_target(opts);
+    let total = variants.len();
+    let mut reports = Vec::with_capacity(total);
+    for (k, variant) in variants.iter().enumerate().take(run.completed) {
+        let report = measure_export(
+            &variant.output,
+            target,
+            &mut |measured| {
+                // The files take equal shares of the read-back's part of the bar.
+                let of_all = (k as f64 + measured.clamp(0.0, 1.0)) / total as f64;
+                progress(VariantProgress::of(measuring(of_all, started), k, total, run.together));
+            },
+            cancel,
+        );
+        progress(VariantProgress::of(
+            measuring((k + 1) as f64 / total as f64, started),
+            k,
+            total,
+            run.together,
+        ));
+        reports.push(report);
+    }
+    Ok((run, reports))
+}
+
 /// What an export is refused for before anything is drawn or spawned — an empty timeline, options
 /// that would export nothing or that the container cannot hold — and whether it has picture and
 /// sound. Asked ahead of the animated titles' drawing so a bad request does not spend seconds of the
@@ -10178,7 +10286,11 @@ fn atempo_chain(speed: f64) -> String {
 /// into positions.
 mod progress;
 pub use progress::ExportStage;
-use progress::{eta_secs, metering_share, pass_position, variants_eta, Block, ProgressReader};
+use progress::{eta_secs, metering_share, pass_position, variants_eta, Block, ProgressReader, VERIFY_SHARE};
+
+/// What an export wrote, read back from the file: its streams and its own loudness.
+mod written;
+pub use written::{measure_export, ExportReport, LoudnessTarget, WrittenAudio, WrittenVideo};
 
 /// Measuring the mix (`ebur128` meters on the export's own audio graph): a child
 /// module so it reaches the private graph builders.
