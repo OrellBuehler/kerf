@@ -497,6 +497,17 @@ What the parity harness forced, all recorded in `kerf-gpu`'s docs and shaders:
   and round down to even (the 4:2:0 grid, whatever the source was), `rotate` rounds its box half-up and samples bilinear about the pixel-index
   centres, chroma outside a rotated picture is clamped to its edge (FFmpeg leaves a few
   green pixels there; the GPU does not copy them).
+  **That geometry is fit, then zoom, and FFmpeg's graph no longer is for a zoom in**: a static zoom over 1 under Contain, and a Cover
+  clip that zooms or pans over a cover that hangs over the frame, are one `scale` from the source to the frame times the zoom (and
+  Cover no longer crops to the frame first), so the plan refuses them (`Unsupported::FoldedFit`, `core-render-plan.md`) and FFmpeg
+  draws the frame. Zooms out under Contain (the PiP cascade: fit, then shrink) and everything with scale 1 and no pan are unchanged,
+  and so are the coverage archetypes (100%). The parity cases follow: `geometry/zoom-off-canvas` and `pip/cover-then-scale` are held
+  as refusals (with `geometry/pan-off-canvas` and `pip/contain-then-scale` keeping what they drew), and the grid cases
+  `cover-odd-*-then-scale` are refused the same way. **Not run where this was written (no Vulkan adapter, no lavapipe)**: the refusals
+  are plan-level and unit-tested in kerf-core (`planner.rs`, `render_plan.rs`) and the coverage test ran; the adapter suites
+  (`parity.rs`, `motion_parity.rs`) were edited and compile but not run. Drawing a folded layer needs a one-stage
+  `LayerGeometry` (`scaled` = the folded box, `keep` = the centred window a Cover clip keeps), the TS port and corpus
+  following, and a parity case per shape on both FFmpegs.
 
 **Text: FFmpeg rasterises, the compositor blends** (`text.rs`, `shaders/text.wgsl`, `GpuCaps::text`).
 

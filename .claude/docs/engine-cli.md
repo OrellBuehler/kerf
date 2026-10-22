@@ -452,6 +452,34 @@ so the feature is **only** activated through these forwards — which is what ma
   across the edge (Contain's are black), the still draws the export's frame (3 levels at worst),
   and a half-transparent FFV1 source renders under Blur exactly as under Contain; a 10-bit HLG ramp's
   picture is Contain's to 2 levels (the tone-map's error diffusion), 5 with an 8-bit overlay.
+  **A zoom is part of the fit where it can be** (`Clip::fit_order(fit, cover_overflows)` -> `FitOrder`, pure, the one
+  answer for the export, the stream, the scrubbed still and the plan). The chain used to fit the picture to the delivery
+  frame and then enlarge the *fitted* picture by the transform's zoom (a 4096x2160 clip at 3.37x in 1080x1920 was scaled to
+  1080x570 and up again: ~70% of its detail gone), and under Cover it cropped to the frame before the transform, so a
+  `pos_x` pan revealed black instead of the overflow. Now **`Folded`** (Contain / Blur, a static zoom over 1, or a keyed
+  one that holds still: `Clip::held_scale`): one `fit_scale`, `scale=W*S:H*S:force_original_aspect_ratio=decrease` (the
+  delivery's flags kept; ahead of a tone-map the box is `max(2,2*trunc((W*S)/2))` and `force_divisible_by=2`; below
+  `TINY_SCALE` `max(1,..)`), the same size as before to within a pixel. **`Uncropped`** (Cover): the same with `increase` and
+  *no* crop to the frame, so the overlay cuts what hangs over the canvas and a position pans across the real picture;
+  `bound_crop` then keeps the frame bounded with a **centred** `crop=w='iw-4*floor(max(0,iw-N)/4)':h=..` (N = twice
+  the half frame plus the greatest |pos| (a keyed curve's points, a slide / push's travel) turned with the picture
+  (a static rotation exactly, a keyed one as the circle round the frame), +8 px and 3 sigma of a blur): centred so the
+  overlay's own `(W-w)/2` still puts the centre where the whole picture would be, cut in fours so an even picture stays
+  even and each side loses an even amount (the overlay's round-down-to-even then changes nothing). Rendered
+  (`cli/zoom_fit.rs`, `#[ignore]`d, 4.4.2) it is **bit-identical** (PSNR 99 dB) to the source scaled and cropped by hand,
+  and the still is bit-identical to the export. Uncropped needs the cover to hang over the frame
+  (`layer_geometry::cover_overflows`: the displayed size is known and another shape, else cautious yes) *and* a zoom (either
+  side of 1) or a pan, or any zoom in; **a picture of the frame's own shape keeps its chain for a move or a zoom out** (a
+  webcam PiP over a 16:9 cut in a 16:9 frame: nothing past the frame to reveal). Unchanged, byte for byte: the identity;
+  Cover at scale 1 with no pan (a turn, a fade, a crop); a zoom out under Contain (the cascade loses nothing worth a
+  filter and the compositor draws it); a **moving** zoom (below: it is the chain's last stage, at the fit size); a Cover
+  clip with a **mask or vignette** where the cover overhangs (both are laid out over the picture the chain hands them, the
+  frame's); a reframed clip and a title (their pictures come out at the frame's size). Folding the moving zoom
+  (`iw*fit*expr` from the source size) was left: every stage between the fit and the zoom (colour, grade, effects, mask,
+  `rotate`, fades, the tone-map) would run at source size, 4x the pixels (`geq` ~150 ms a frame at 1080p) and with a blur's
+  sigma, a vignette and a mask edge defined at another scale. The still follows
+  (`still_clip_chain_graded(.., order)`; judged at the *delivery* frame, no `bound_crop`: one frame). Golden: structural
+  families `zoom-folded`, `cover-uncropped` and their `still-` / `preview-` forms; the moved sets equal them exactly.
   **The shape itself is a property of the project**, not of one render:
   `Timeline.format: Option<Delivery>` (`{width, height, fit, fps?}`) is the frame the cut
   is being made *for*. `export_format` applies it between the footage-derived

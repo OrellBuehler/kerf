@@ -304,6 +304,19 @@
   `Placement::keyframed` carries that (`Keyed::all(rotates)` is the legacy bundle), a colour-only clip is
   placed as a static one, and the sweep holds origin, zoom, turn, opacity and grade of the new cuts to the
   evaluated graph.
+  **A zoom that is part of the fit is refused** (`PlanLayer.fit_order`, `Clip::fit_order(canvas.fit, cover_overflows)`;
+  `engine-cli.md`, "A zoom is part of the fit"): FFmpeg takes such a picture from the source in **one** `scale` to the frame times
+  the zoom (`Folded`: a zoom in under Contain; `Uncropped`: a Cover clip that zooms or pans and whose cover hangs over the frame,
+  or any Cover zoom in) where `LayerGeometry` and the compositor fit to the frame and scale that (two stages, Cover's crop between
+  them). So `size_free_reasons` pushes `Unsupported::FoldedFit(layer, which)` (kind `folded_fit`) in a Still and a Motion plan, for every cap,
+  until the compositor draws the one-stage picture with parity cases (**not done: no adapter where it was written**). A still
+  that samples a keyed pose to the identity draws the plain fit (`Fitted`), as the still builder does; a moving zoom, a zoom out under Contain,
+  a Cover clip of the frame's own shape that moves or zooms out (`cover_overflows`, judged from the decoded picture and the delivery
+  canvas) and a masked or vignetted one stay `Fitted`, so a webcam PiP over a 16:9 cut keeps drawing (the coverage archetypes are 100%).
+  `LayerGeometry` is **unchanged** (still fit-then-zoom: the compositor's order, and `layer-geometry.ts`, the Preview handles' port): a Contain
+  zoom's picture is within a pixel or two of the file's, and for Cover the handles show the zoomed *frame* where the file now has the
+  larger cover, cut by the canvas. Drawing these layers means a one-stage `LayerGeometry` (`scaled` = the folded box, `keep` = the centred
+  window), the port and the corpus following it, and parity cases on both FFmpegs.
   **What the compositor may draw is data**: `GpuCaps` (`Compositor::caps()`: the bits `motion`, `fades`,
   `transitions`, `dip_white`, `keyed_opacity`, `keyed_zoom`, `keyed_color`, `mask`, `text`, `reframe`, `hdr`, a `GradeKinds` bitset and an
   `EffectKinds` bitset; today `GpuCaps::A0` plus every one of them but `reframe`, `hdr`
