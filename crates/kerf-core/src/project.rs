@@ -688,10 +688,15 @@ impl Project {
     }
 
     /// Hold an agent's edits for review (the default): every edit made as [`EditSource::Agent`]
-    /// lands in a staged proposal, opened by its first edit, instead of on the cut the user is
-    /// looking at. Off, an agent edits the live cut directly unless a proposal is already open (a
-    /// claimed task opens one regardless). The app sets this from its settings; it is not stored
-    /// in the project file.
+    /// lands in a staged proposal, opened by its first edit (or by claiming a task), instead of on
+    /// the cut the user is looking at. Off, an agent edits the live cut directly — task work
+    /// included: claiming a task opens no proposal, and each edit is an ordinary undoable revision
+    /// attributed to the agent. Only a proposal the agent opens on purpose
+    /// ([`Project::begin_staging`], the `stage_edits` tool) holds back its edits, and one that is
+    /// already open when the switch flips is left exactly as it is: it keeps taking the agent's
+    /// edits (its reads follow it, so they must not split between it and the live cut) until it is
+    /// applied or discarded, and nothing applies it on the switch's account. The app sets this from
+    /// its settings; it is not stored in the project file.
     pub fn set_agent_review(&self, on: bool) {
         self.agent_review.set(on);
     }
@@ -5524,7 +5529,11 @@ impl Project {
     /// Claim the oldest `queued` task, marking it `working`. Returns `None` when
     /// nothing is waiting — the agent's "give me work" primitive.
     ///
-    /// `owner` is the agent session (MCP session id) the task's proposal will belong to.
+    /// With review on (the default) claiming opens a staging session for the task, so the work an
+    /// agent does on the user's behalf is a proposal and never rewrites the open cut unasked;
+    /// `owner` is the agent session (MCP session id) that proposal will belong to. With review
+    /// off **no proposal is opened**: the task is only marked `working`, and the agent's edits land
+    /// on the live cut one by one, as ordinary revisions attributed to the agent.
     pub fn claim_next_task(&self, owner: Option<&str>) -> Result<Option<Task>> {
         let next: Option<String> = self
             .conn
@@ -5536,16 +5545,15 @@ impl Project {
             .optional()?;
         let Some(id) = next else { return Ok(None) };
         let id = parse_uuid(&id)?;
-        // Claiming a task opens a staging session for it, so the work an agent
-        // does on the user's behalf is a proposal by default and never
-        // rewrites the open cut unasked. A session already open for a
-        // *different* task (or for none) must not silently absorb this one's
-        // edits too — that folds two tasks' work into a single proposal and
-        // leaves the second task with no review of its own — so refuse before
-        // touching this task's state at all. The one exception is a session
-        // whose owning task has already gone terminal: `fail_task` used to
-        // leave one behind with nothing to ever clean it up, which wedged the
+        // A session already open for a *different* task (or for none) must not silently absorb
+        // this one's edits too — that folds two tasks' work into a single proposal and leaves the
+        // second task with no review of its own (and, with review off, would hold back work that
+        // was meant to land) — so refuse before touching this task's state at all. That goes for a
+        // proposal that was open when the user turned review off as much as for one opened on
+        // purpose. The one exception is a session whose owning task has already gone terminal:
+        // `fail_task` used to leave one behind with nothing to ever clean it up, which wedged the
         // queue for good, so a claim is also the chance to clear it out.
+        let review = self.agent_review.get();
         match self.staged_row()? {
             Some(row) if row.task_id == Some(id) => {}
             Some(row) => {
@@ -5561,23 +5569,51 @@ impl Project {
                 }
                 // Nobody's work any more (its task is over), so whoever claims next may clear it.
                 self.discard_row(&row)?;
-                self.begin_staging(Some(id), None, owner)?;
+                if review {
+                    self.begin_staging(Some(id), None, owner)?;
+                }
             }
             None => {
-                self.begin_staging(Some(id), None, owner)?;
+                if review {
+                    self.begin_staging(Some(id), None, owner)?;
+                }
             }
         }
         Ok(Some(self.set_task_state(id, TaskStatus::Working, None)?))
     }
 
-    /// Mark a task `ready` for review, recording the agent's summary.
+    /// Hand a claimed task over, recording the agent's summary. The task is `ready` when its
+    /// work waits for the user — review is on, where accepting is theirs, or a proposal is open
+    /// that is the task's or that the calling agent holds — and `done` when review is off and
+    /// nothing is held back: the edits already landed on the live cut as they were made, so
+    /// there is nothing to review and the task is only settled.
     pub fn complete_task(&self, id: Uuid, result: Option<String>) -> Result<Task> {
-        self.set_task_state(id, TaskStatus::Ready, Some(result))
+        let status = if self.task_work_waits(id)? {
+            TaskStatus::Ready
+        } else {
+            TaskStatus::Done
+        };
+        self.set_task_state(id, status, Some(result))
+    }
+
+    /// Whether the work of task `id` is held back for the user: always with review on, and with it
+    /// off while a proposal is open that is the task's, that the calling agent holds, or that
+    /// nobody does. A proposal another agent session owns is that session's, not this task's.
+    fn task_work_waits(&self, id: Uuid) -> Result<bool> {
+        if self.agent_review.get() {
+            return Ok(true);
+        }
+        Ok(match self.staged_row()? {
+            None => false,
+            Some(row) => row.task_id == Some(id) || !owned_by_other(row.owner.as_deref(), self.agent_owner.borrow().as_deref()),
+        })
     }
 
     /// Mark a task `failed`, recording the error, and drop any proposal staged
     /// under it — like `remove_task`, a task that will never be resolved must
-    /// not leave its session behind to wedge the queue.
+    /// not leave its session behind to wedge the queue. With review off and no proposal there is
+    /// nothing to drop: the task is only settled, and what the agent already did to the live cut
+    /// stays in the history (undoable like any revision) rather than being rolled back.
     pub fn fail_task(&self, id: Uuid, error: &str) -> Result<Task> {
         if self.staged_row()?.is_some_and(|r| r.task_id == Some(id)) {
             self.discard_staged()?;
@@ -7652,6 +7688,11 @@ mod linked_tests;
 /// The review round's project-level fixes (numbers, ranges, footage, staging, library, paths).
 #[cfg(test)]
 mod review_tests;
+
+/// Task work with review off (it lands live, no proposal) and on, and the switch flipping with a
+/// proposal open.
+#[cfg(test)]
+mod task_tests;
 
 /// The Rust half of the differential corpus the browser harness is replayed against.
 #[cfg(test)]
@@ -11041,7 +11082,6 @@ mod tests {
 
         project.set_actor(EditSource::Agent);
 
-        project.set_agent_review(false);
         let claimed = project.claim_next_task(None).unwrap().unwrap();
         let staged = project.staged().unwrap().unwrap();
         assert_eq!(staged.task_id, Some(claimed.id));
@@ -11053,7 +11093,8 @@ mod tests {
         project
             .complete_task(task.id, Some("added a B-roll track".to_string()))
             .unwrap();
-        // Accepting the task is accepting its edits.
+        // Accepting the task is accepting its edits — and the user's to do.
+        project.set_actor(EditSource::User);
         project.resolve_task(task.id).unwrap();
         assert_eq!(project.timeline().unwrap().tracks.len(), 3);
         assert!(project.staged().unwrap().is_none());
@@ -11064,7 +11105,6 @@ mod tests {
         let mut project = Project::open_in_memory().unwrap();
         let task = project.add_task("tighten the intro").unwrap();
         project.set_actor(EditSource::Agent);
-        project.set_agent_review(false);
         project.claim_next_task(None).unwrap().unwrap();
         project.add_track(StreamKind::Video, Some("B-roll".to_string())).unwrap();
 
@@ -11079,7 +11119,6 @@ mod tests {
         let first = project.add_task("tighten the intro").unwrap();
         let second = project.add_task("caption the cut").unwrap();
         project.set_actor(EditSource::Agent);
-        project.set_agent_review(false);
 
         let claimed = project.claim_next_task(None).unwrap().unwrap();
         assert_eq!(claimed.id, first.id);
@@ -11098,7 +11137,6 @@ mod tests {
         let first = project.add_task("tighten the intro").unwrap();
         let second = project.add_task("caption the cut").unwrap();
         project.set_actor(EditSource::Agent);
-        project.set_agent_review(false);
 
         let claimed = project.claim_next_task(None).unwrap().unwrap();
         assert_eq!(claimed.id, first.id);
@@ -11124,12 +11162,14 @@ mod tests {
         let first = project.add_task("tighten the intro").unwrap();
         let second = project.add_task("caption the cut").unwrap();
         project.set_actor(EditSource::Agent);
-        project.set_agent_review(false);
         project.begin_staging(Some(first.id), None, None).unwrap();
         project.complete_task(first.id, Some("done".to_string())).unwrap();
+        // Accepting is the user's while review is on.
+        project.set_actor(EditSource::User);
         project.resolve_task(first.id).unwrap();
         // `resolve_task` already applies/clears its own session; stage a fresh
         // one directly against the now-`Done` task to simulate the orphan.
+        project.set_actor(EditSource::Agent);
         project.begin_staging(Some(first.id), None, None).unwrap();
 
         let claimed = project.claim_next_task(None).unwrap().unwrap();
