@@ -69,6 +69,15 @@ pub(super) const SEGMENT_LIMITS: SegmentLimits = SegmentLimits {
     preroll_s: 20.0,
 };
 
+/// The limits a playback stream is planned with: what it opens before its first frame is what Play
+/// waits for, so a part holds a few inputs, and the next part decodes its pre-roll while this one
+/// plays.
+pub(super) const PLAYBACK_LIMITS: SegmentLimits = SegmentLimits {
+    decode_mpx: 32.0,
+    inputs: 2,
+    preroll_s: 10.0,
+};
+
 /// The threads each decoder of a part is capped to (`-threads` ahead of its `-i`), the budget's
 /// where that is fewer. A frame-threaded decoder holds a frame per thread, and in a part one clip
 /// plays at a time: four threads decode 4K HEVC 10-bit at 70 fps against 86 with eight.
@@ -499,12 +508,30 @@ pub(super) fn build_part_args(
     out: &str,
     fps_mode: &str,
 ) -> Result<Vec<String>> {
+    let mut args: Vec<String> = vec!["-y".to_string(), "-hide_banner".to_string(), "-nostats".to_string()];
+    push_part_picture(plan, assets, opts, part, floating_titles, &mut args)?;
+    args.extend([fps_mode, "passthrough", "-pix_fmt", "yuv420p"].map(String::from));
+    args.extend(MEZZANINE.map(String::from));
+    args.extend(["-frames:v".to_string(), part.frames.to_string(), out.to_string()]);
+    Ok(args)
+}
+
+/// What a part draws, onto `args` (pure): its inputs, the picture graph over a canvas of its frames,
+/// and `-map [outv] -an`. The sink is the caller's: an export's lossless file, the playback stream's
+/// JPEGs.
+pub(super) fn push_part_picture(
+    plan: &PartsPlan,
+    assets: &[Asset],
+    opts: &ExportOptions,
+    part: &Part,
+    floating_titles: &[svg_layer::SvgSeq<'_>],
+    args: &mut Vec<String>,
+) -> Result<()> {
     let contents = part_contents(plan, part);
     let mut timeline = plan.cut.clone();
     timeline.overlays = part_overlays(&plan.cut, plan.rate, part);
     let titles = part_titles(floating_titles, plan.rate, part);
 
-    let mut args: Vec<String> = vec!["-y".to_string(), "-hide_banner".to_string(), "-nostats".to_string()];
     let scope = InputScope {
         fx: &plan.fx,
         include: &|flat| contents.include.get(flat).copied().unwrap_or(false),
@@ -512,8 +539,8 @@ pub(super) fn build_part_args(
         sound_only: false,
         base: 0,
     };
-    let inputs = push_inputs_scoped(&timeline, assets, &plan.fmt, opts, &scope, &mut args)?;
-    svg_layer::push_inputs(&titles, &plan.fmt, &mut args);
+    let inputs = push_inputs_scoped(&timeline, assets, &plan.fmt, opts, &scope, args)?;
+    svg_layer::push_inputs(&titles, &plan.fmt, args);
     let part_scope = Scope {
         fx: &plan.fx,
         first_frame: part.first,
@@ -535,10 +562,8 @@ pub(super) fn build_part_args(
     );
     args.push("-filter_complex".to_string());
     args.push(graph.filter);
-    args.extend(["-map", "[outv]", "-an", fps_mode, "passthrough", "-pix_fmt", "yuv420p"].map(String::from));
-    args.extend(MEZZANINE.map(String::from));
-    args.extend(["-frames:v".to_string(), part.frames.to_string(), out.to_string()]);
-    Ok(args)
+    args.extend(["-map", "[outv]", "-an"].map(String::from));
+    Ok(())
 }
 
 /// The text of the concat list that reads the parts back as one picture: each file with its exact

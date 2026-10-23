@@ -1401,7 +1401,19 @@ so the feature is **only** activated through these forwards — which is what ma
   solo-shadowed track is as absent from playback as from the file. Only the ends
   differ: proxy paths in (the caller passes
   `timeline_frame_inputs`' proxy-swapped assets), `-c:v mjpeg -f image2pipe pipe:1`
-  out. **Nothing waits on ffmpeg forever**: the stream reads stdout on a side
+  out. **A stream plays in parts** (`preview_parts`, `segments::PLAYBACK_LIMITS`: two inputs a part, 10 s of
+  pre-roll): one run opens every clip from the playhead to the end before its first frame, about 40 ms a clip
+  here (4.4.2) and ~100 on the Windows build, so a 19-clip reel took 2 s to start playing. The export's
+  planner (`plan_export`) cuts the slice, each part is the export's part graph (`push_part_picture`, shared
+  with `build_part_args`) with `-frames:v` and the JPEG sink (`preview_part_args`), and `pump_runs` starts
+  the next part's ffmpeg once this one has shown its first frame — the pipe holds it at its first frames
+  until its turn — on one clock (a frame's time and slot are its part's first frame plus its index). A cut
+  within the limits is the one run, argv unchanged. Measured: first frame ~115 ms at 5, 20 or 40 clips
+  (was 0.25 / 0.8 / 1.6 s), no late frame at the seams even with 0.25 s clips;
+  `the_playback_stream_in_parts_is_the_stream_in_one_run` (`#[ignore]`d) holds every JPEG equal to the one
+  run's, from the start, mid-crossfade and off the grid. A part that dies before its first frame having
+  asked for hardware decode turns it off and is started again in software (the old whole-stream retry);
+  `KERF_PLAYBACK_PARTS=off` plays in one run. **Nothing waits on ffmpeg forever**: the stream reads stdout on a side
   thread and gives up (killing the child, so the hwaccel retry falls back to
   software) after 30 s with no first frame or 15 s between frames; an export
   polls cancel every 250 ms rather than per progress line and is killed after

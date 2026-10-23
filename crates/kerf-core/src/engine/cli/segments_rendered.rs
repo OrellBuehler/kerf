@@ -749,3 +749,54 @@ fn peak_child_mb() -> u64 {
         0
     }
 }
+
+/// Every JPEG a playback stream of the fixture sends from `start`, in parts under `limits` or in one
+/// run with `None`, with the stream frame each is on.
+fn streamed(fx: &Fixture, start: f64, limits: Option<SegmentLimits>) -> Vec<(f64, Vec<u8>)> {
+    let mut frames = Vec::new();
+    stream_preview_in(
+        &fx.timeline,
+        &fx.assets,
+        start,
+        PlaybackRequest::default(),
+        &|| false,
+        limits,
+        &mut |f| {
+            frames.push((f.time, f.jpeg));
+            true
+        },
+    )
+    .unwrap();
+    frames
+}
+
+/// The playback stream opens only the clips of the part it is playing and starts the next part's
+/// ffmpeg ahead: what it sends is what one run over the whole cut sends, byte for byte, from the
+/// start, from a playhead inside the crossfade and the title, and from one between frames.
+#[test]
+#[ignore = "drives the real ffmpeg"]
+fn the_playback_stream_in_parts_is_the_stream_in_one_run() {
+    let fx = fixture("stream");
+    with_pinned_dir(fx.dir.join("cache").to_str().unwrap(), || {
+        let rendered = fx.timeline.for_render();
+        for start in [0.0, 4.2, 6.517] {
+            let cut = preview_cut(&fx.timeline, &fx.assets, start, FPS, PREVIEW_STREAM_WIDTH, None).unwrap();
+            let plan = preview_parts(&cut, &fx.assets, PLAYBACK_LIMITS).expect("a plan in parts");
+            assert!(plan.parts.len() >= 4, "{:?}", plan.parts);
+            let whole = streamed(&fx, start, None);
+            let parts = streamed(&fx, start, Some(PLAYBACK_LIMITS));
+            assert_eq!(whole.len() as u64, plan.frames, "from {start}: the frames of the plan");
+            assert!((whole.len() as f64 - (rendered.duration() - start) * FPS).abs() <= 1.0);
+            let times = |s: &[(f64, Vec<u8>)]| s.iter().map(|f| f.0).collect::<Vec<_>>();
+            assert_eq!(times(&whole), times(&parts), "from {start}: the frames' times");
+            let at = whole.iter().zip(&parts).position(|(w, p)| w.1 != p.1);
+            assert_eq!(
+                at,
+                None,
+                "from {start}: a frame differs, in {} parts {:?}",
+                plan.parts.len(),
+                plan.parts
+            );
+        }
+    });
+}
