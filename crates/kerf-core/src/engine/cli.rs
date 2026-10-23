@@ -5665,7 +5665,7 @@ fn build_preview_args_with(
     hwaccel: Option<String>,
 ) -> Result<Vec<String>> {
     let cut = preview_cut(timeline, assets, start, fps, max_width, hwaccel)?;
-    preview_args(&cut, assets, quality)
+    preview_args(&cut, &cut.opts, assets, quality)
 }
 
 /// What the playback stream plays: the cut from the playhead, how it is rendered and the frame it
@@ -5748,13 +5748,21 @@ fn preview_cut(
     })
 }
 
-/// The argv that plays a [`PreviewCut`] as JPEGs on stdout.
-fn preview_args(cut: &PreviewCut, assets: &[Asset], quality: u8) -> Result<Vec<String>> {
-    let PreviewCut { sliced, opts, fmt, .. } = cut;
-    let mut args: Vec<String> = ["-hide_banner", "-nostats", "-nostdin", "-loglevel", "error"]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
+/// The head every playback run starts with.
+const PREVIEW_HEAD: [&str; 5] = ["-hide_banner", "-nostats", "-nostdin", "-loglevel", "error"];
+
+/// The JPEGs on stdout every playback run ends with.
+fn push_preview_sink(args: &mut Vec<String>, quality: u8) {
+    args.extend(["-c:v", "mjpeg", "-q:v"].map(String::from));
+    args.push(quality.clamp(2, 31).to_string());
+    args.extend(["-f", "image2pipe", "pipe:1"].map(String::from));
+}
+
+/// The argv that plays a [`PreviewCut`] in one run as JPEGs on stdout, with `opts` (the cut's own,
+/// but for the decode acceleration, which is read again for every run).
+fn preview_args(cut: &PreviewCut, opts: &ExportOptions, assets: &[Asset], quality: u8) -> Result<Vec<String>> {
+    let PreviewCut { sliced, fmt, .. } = cut;
+    let mut args: Vec<String> = Vec::from(PREVIEW_HEAD.map(String::from));
     let plan = push_inputs(sliced, assets, fmt, opts, &mut args)?;
     let titles = cut.svg();
     svg_layer::push_inputs(&titles, fmt, &mut args);
@@ -5777,14 +5785,45 @@ fn preview_args(cut: &PreviewCut, assets: &[Asset], quality: u8) -> Result<Vec<S
     args.push("-map".to_string());
     args.push("[outv]".to_string());
     args.push("-an".to_string());
-    args.push("-c:v".to_string());
-    args.push("mjpeg".to_string());
-    args.push("-q:v".to_string());
-    args.push(quality.clamp(2, 31).to_string());
-    args.push("-f".to_string());
-    args.push("image2pipe".to_string());
-    args.push("pipe:1".to_string());
+    push_preview_sink(&mut args, quality);
     Ok(args)
+}
+
+/// The argv that plays one part of a stream planned in parts ([`preview_parts`]) as JPEGs on
+/// stdout: exactly the part's frames, drawn by the export's part graph (pure).
+fn preview_part_args(
+    plan: &segments::PartsPlan,
+    part: &segments::Part,
+    titles: &[svg_layer::SvgSeq<'_>],
+    opts: &ExportOptions,
+    assets: &[Asset],
+    quality: u8,
+    fps_mode: &str,
+) -> Result<Vec<String>> {
+    let mut args: Vec<String> = Vec::from(PREVIEW_HEAD.map(String::from));
+    segments::push_part_picture(plan, assets, opts, part, titles, &mut args)?;
+    args.extend([fps_mode, "passthrough", "-frames:v"].map(String::from));
+    args.push(part.frames.to_string());
+    push_preview_sink(&mut args, quality);
+    Ok(args)
+}
+
+/// The parts a stream of `cut` plays in, or `None` to play it in one run (pure). One run opens
+/// every clip from the playhead to the end before it draws its first frame — measured here at
+/// about 40 ms a clip, so a reel of twenty short clips took most of a second (two on the Windows
+/// build) to start — where a part opens only the few on screen for it, and the next part is
+/// started while this one plays.
+fn preview_parts(cut: &PreviewCut, assets: &[Asset], limits: segments::SegmentLimits) -> Option<segments::PartsPlan> {
+    segments::plan_export(&cut.sliced, assets, &cut.opts, limits)
+}
+
+/// The limits a stream is planned in parts with, or `None` (`KERF_PLAYBACK_PARTS=off`) to play every
+/// stream in one run.
+fn playback_limits() -> Option<segments::SegmentLimits> {
+    match std::env::var("KERF_PLAYBACK_PARTS") {
+        Ok(v) if matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "0" | "no" | "false") => None,
+        _ => Some(segments::PLAYBACK_LIMITS),
+    }
 }
 
 /// Find the first complete JPEG in `buf` — its `FFD8` start-of-image through the
@@ -5839,26 +5878,67 @@ pub fn stream_preview_until(
     cancel: &dyn Fn() -> bool,
     on_frame: &mut dyn FnMut(PreviewFrame) -> bool,
 ) -> Result<()> {
-    let params = playback_params(timeline, assets, request);
-    // Whether the run that was spawned asked any input for hardware decode: none of a proxy's
-    // inputs do, and a failure of a run that did not is not the hardware's.
-    let mut hw = false;
-    // `None` until ffmpeg is running: a timeline with nothing to play fails
-    // before that, and says nothing about the hardware.
-    let mut sent = None;
-    match stream_preview_once(timeline, assets, start, params, cancel, on_frame, &mut sent, &mut hw) {
-        // A hardware decode that dies before the first frame is `-hwaccel`
-        // being unusable here, not the graph: a static ffmpeg aborts outright
-        // when `auto` probes a VAAPI whose libva isn't installed. Once frames
-        // have been shown, restarting would replay them, so only then is the
-        // failure reported as it is.
-        Err(e) if hw && sent == Some(0) => {
-            HWACCEL_OK.store(false, std::sync::atomic::Ordering::Relaxed);
-            tracing::warn!("hardware decode failed starting playback; using software decode: {e}");
-            stream_preview_once(timeline, assets, start, params, cancel, on_frame, &mut sent, &mut hw)
-        }
-        r => r,
+    stream_preview_in(timeline, assets, start, request, cancel, playback_limits(), on_frame)
+}
+
+/// [`stream_preview_until`] planned in parts under `limits`, or in one run with `None`.
+fn stream_preview_in(
+    timeline: &Timeline,
+    assets: &[Asset],
+    start: f64,
+    request: PlaybackRequest,
+    cancel: &dyn Fn() -> bool,
+    limits: Option<segments::SegmentLimits>,
+    on_frame: &mut dyn FnMut(PreviewFrame) -> bool,
+) -> Result<()> {
+    let PlaybackParams { fps, max_width } = playback_params(timeline, assets, request);
+    let cut = preview_cut(timeline, assets, start, fps, max_width, decode_hwaccel())?;
+    // Animated titles are pictures on disk by now (a few seconds' work at most); held until the
+    // stream is over so the cache cannot take them away mid-play.
+    let _titles = svg_layer::prepare_preview(&cut.pictures(assets), cancel)?;
+    let plan = limits.and_then(|limits| preview_parts(&cut, assets, limits));
+    let titles = cut.svg();
+    if let Some(plan) = &plan {
+        tracing::debug!(parts = plan.parts.len(), frames = plan.frames, "playing in parts");
     }
+    let mut spawn = |i: usize| -> Result<Option<PreviewRun>> {
+        // Read for every run: a hardware decode that failed has turned it off for the rest.
+        let opts = ExportOptions {
+            hwaccel: decode_hwaccel(),
+            ..cut.opts.clone()
+        };
+        let (mut args, first) = match &plan {
+            None if i == 0 => (preview_args(&cut, &opts, assets, PREVIEW_STREAM_QUALITY)?, 0),
+            None => return Ok(None),
+            Some(plan) => match plan.parts.get(i) {
+                Some(part) => (
+                    preview_part_args(plan, part, &titles, &opts, assets, PREVIEW_STREAM_QUALITY, fps_mode_flag())?,
+                    part.first,
+                ),
+                None => return Ok(None),
+            },
+        };
+        // The composited graph outgrows argv just as the export's does.
+        let graph = externalize_filter_complex(&mut args, "preview")?;
+        // Hardware decode is per input, and a proxy (what the stream reads once one is ready) is
+        // faster in software, start-up included.
+        let hw = tune_inputs(&mut args, HostOs::CURRENT, Reading::Stream, &facts_from_assets(assets)).hw;
+        // Playback is paced to the wall clock, so it never races ahead; the cap is
+        // there so the budget means the same thing while the cut is playing.
+        cpu::limit_args(&mut args, cpu::budget_threads());
+        let bin = ffmpeg_bin();
+        tracing::debug!(start, fps, max_width, part = i, "starting preview stream");
+        let child = command(&bin)
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| launch_err(&bin, e))?;
+        Ok(Some(PreviewRun::start(child, first, hw, graph)))
+    };
+    let mut sent = None;
+    pump_runs(&mut spawn, start, fps, PREVIEW_TIMEOUTS, on_frame, &mut sent)
 }
 
 /// [`stream_preview_with`] at a stated `fps` and the default width.
@@ -5895,99 +5975,136 @@ const PREVIEW_TIMEOUTS: PreviewTimeouts = PreviewTimeouts {
     stall: std::time::Duration::from_secs(15),
 };
 
-#[allow(clippy::too_many_arguments)]
-fn stream_preview_once(
-    timeline: &Timeline,
-    assets: &[Asset],
-    start: f64,
-    params: PlaybackParams,
-    cancel: &dyn Fn() -> bool,
-    on_frame: &mut dyn FnMut(PreviewFrame) -> bool,
-    sent: &mut Option<u64>,
-    hw_used: &mut bool,
-) -> Result<()> {
-    let PlaybackParams { fps, max_width } = params;
-    let cut = preview_cut(timeline, assets, start, fps, max_width, decode_hwaccel())?;
-    // Animated titles are pictures on disk by now (a few seconds' work at most); held until the
-    // stream is over so the cache cannot take them away mid-play.
-    let _titles = svg_layer::prepare_preview(&cut.pictures(assets), cancel)?;
-    let mut args = preview_args(&cut, assets, PREVIEW_STREAM_QUALITY)?;
-    // The composited graph outgrows argv just as the export's does.
-    let _script = externalize_filter_complex(&mut args, "preview")?;
-    // Hardware decode is per input, and a proxy (what the stream reads once one is ready) is
-    // faster in software, start-up included.
-    *hw_used = tune_inputs(&mut args, HostOs::CURRENT, Reading::Stream, &facts_from_assets(assets)).hw;
-    // Playback is paced to the wall clock, so it never races ahead; the cap is
-    // there so the budget means the same thing while the cut is playing.
-    cpu::limit_args(&mut args, cpu::budget_threads());
-
-    let bin = ffmpeg_bin();
-    tracing::debug!(start, fps, max_width, "starting preview stream");
-    let child = command(&bin)
-        .args(&args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| launch_err(&bin, e))?;
-    *sent = Some(0);
-    pump_preview(child, start, fps, PREVIEW_TIMEOUTS, on_frame, sent)
+/// One ffmpeg of a playback stream: its stdout read on a side thread so the pump can give up on a
+/// silent one (`recv_timeout`) instead of blocking in `read`, its stderr drained on another so a
+/// warning flood can't deadlock the frame read. Killed and reaped when dropped.
+struct PreviewRun {
+    child: std::process::Child,
+    rx: Option<std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>>,
+    stderr: Option<std::thread::JoinHandle<String>>,
+    /// The frame of the stream its first picture is.
+    first: u64,
+    /// Whether it asked any input for hardware decode.
+    hw: bool,
+    _graph: GraphScript,
 }
 
-/// Read JPEG frames off a running ffmpeg's stdout, pace them to `fps` against
-/// the wall clock and hand them to `on_frame`, until the stream ends, the
-/// callback declines a frame, or ffmpeg stops producing for longer than
-/// `timeouts` allows (it is then killed and the call fails). Always reaps the
-/// child.
+impl PreviewRun {
+    fn start(mut child: std::process::Child, first: u64, hw: bool, graph: GraphScript) -> Self {
+        use std::io::Read;
+        let stderr = child.stderr.take().expect("stderr piped");
+        let stderr = std::thread::spawn(move || {
+            let mut buf = String::new();
+            let _ = std::io::BufReader::new(stderr).read_to_string(&mut buf);
+            buf
+        });
+        // The bounded channel keeps the backpressure: once a few chunks are queued the reader stops
+        // reading, the pipe fills and ffmpeg is throttled to the pacing — or, for the run started
+        // ahead, held at its first frames until it is the one playing.
+        let mut stdout = child.stdout.take().expect("stdout piped");
+        let (tx, rx) = std::sync::mpsc::sync_channel::<std::io::Result<Vec<u8>>>(4);
+        // Detached: after the kill it ends on EOF (or on the dropped receiver).
+        std::thread::spawn(move || {
+            let mut chunk = vec![0u8; 64 * 1024];
+            loop {
+                let msg = match stdout.read(&mut chunk) {
+                    Ok(0) => return,
+                    Ok(n) => Ok(chunk[..n].to_vec()),
+                    Err(e) => Err(e),
+                };
+                let failed = msg.is_err();
+                if tx.send(msg).is_err() || failed {
+                    return;
+                }
+            }
+        });
+        Self {
+            child,
+            rx: Some(rx),
+            stderr: Some(stderr),
+            first,
+            hw,
+            _graph: graph,
+        }
+    }
+
+    fn recv(
+        &self,
+        wait: std::time::Duration,
+    ) -> std::result::Result<std::io::Result<Vec<u8>>, std::sync::mpsc::RecvTimeoutError> {
+        match &self.rx {
+            Some(rx) => rx.recv_timeout(wait),
+            None => Err(std::sync::mpsc::RecvTimeoutError::Disconnected),
+        }
+    }
+
+    /// Kill it (with `kill`) and reap it: how it exited and the tail of what it said.
+    fn end(&mut self, kill: bool) -> (Result<std::process::ExitStatus>, String) {
+        if kill {
+            let _ = self.child.kill();
+        }
+        self.rx = None;
+        let status = reap(&mut self.child);
+        let text = self.stderr.take().and_then(|h| h.join().ok()).unwrap_or_default();
+        let mut tail: Vec<&str> = text.lines().rev().take(12).collect();
+        tail.reverse();
+        (status, tail.join("\n").trim().to_string())
+    }
+}
+
+impl Drop for PreviewRun {
+    fn drop(&mut self) {
+        if self.stderr.is_some() {
+            let _ = self.end(true);
+        }
+    }
+}
+
+/// [`pump_runs`] over the one ffmpeg already running.
+#[cfg(test)]
 fn pump_preview(
-    mut child: std::process::Child,
+    child: std::process::Child,
     start: f64,
     fps: f64,
     timeouts: PreviewTimeouts,
     on_frame: &mut dyn FnMut(PreviewFrame) -> bool,
     sent: &mut Option<u64>,
 ) -> Result<()> {
-    use std::io::Read;
-    use std::sync::mpsc::{sync_channel, RecvTimeoutError};
+    let mut one = Some(PreviewRun::start(child, 0, false, GraphScript(None)));
+    pump_runs(&mut |_| Ok(one.take()), start, fps, timeouts, on_frame, sent)
+}
 
-    // Drain stderr on a side thread so a warning flood can't deadlock the frame
-    // read, keeping only the tail for a failure message.
-    let stderr = child.stderr.take().expect("stderr piped");
-    let stderr_handle = std::thread::spawn(move || {
-        let mut buf = String::new();
-        let _ = std::io::BufReader::new(stderr).read_to_string(&mut buf);
-        buf
-    });
-
-    // stdout is read on its own thread so the loop below can give up on a
-    // silent ffmpeg (`recv_timeout`) instead of blocking in `read`. The bounded
-    // channel keeps the old backpressure: once a few chunks are queued the reader
-    // stops reading, the pipe fills and ffmpeg is throttled to the pacing.
-    let mut stdout = child.stdout.take().expect("stdout piped");
-    let (tx, rx) = sync_channel::<std::io::Result<Vec<u8>>>(4);
-    // Detached: after the kill it ends on EOF (or on the dropped receiver).
-    std::thread::spawn(move || {
-        let mut chunk = vec![0u8; 64 * 1024];
-        loop {
-            let msg = match stdout.read(&mut chunk) {
-                Ok(0) => return,
-                Ok(n) => Ok(chunk[..n].to_vec()),
-                Err(e) => Err(e),
-            };
-            let failed = msg.is_err();
-            if tx.send(msg).is_err() || failed {
-                return;
-            }
-        }
-    });
-
+/// Read JPEG frames off the runs `spawn` starts (run `i`, or `None` past the last), pace them to
+/// `fps` against the wall clock and hand them to `on_frame`, until the last run ends, the callback
+/// declines a frame, or a run stops producing for longer than `timeouts` allows (it is then killed
+/// and the call fails). **The next run is started once this one has shown its first frame**, so it
+/// opens its inputs while this one plays and the pipe holds it at its first frames until its turn.
+/// A run that fails before its first frame having asked for hardware decode is `-hwaccel` being
+/// unusable here, not the graph (a static ffmpeg aborts outright when `auto` probes a VAAPI whose
+/// libva isn't installed): decode goes to software for the process and that run is started again,
+/// which replays nothing. Every run is reaped.
+fn pump_runs(
+    spawn: &mut dyn FnMut(usize) -> Result<Option<PreviewRun>>,
+    start: f64,
+    fps: f64,
+    timeouts: PreviewTimeouts,
+    on_frame: &mut dyn FnMut(PreviewFrame) -> bool,
+    sent: &mut Option<u64>,
+) -> Result<()> {
+    let Some(mut run) = spawn(0)? else {
+        return Ok(());
+    };
+    *sent = Some(0);
+    let mut at = 0usize;
+    // The run after this one, once it has been asked for (`None` in it past the last).
+    let mut next: Option<Option<PreviewRun>> = None;
     let mut buf: Vec<u8> = Vec::with_capacity(256 * 1024);
+    // Frames shown in all, and of this run.
     let mut index: u64 = 0;
+    let mut shown: u64 = 0;
     let mut origin: Option<std::time::Instant> = None;
-    let mut stopped = false;
-    let mut failure: Option<String> = None;
 
-    'read: loop {
+    loop {
         while let Some((s, e)) = next_jpeg(&buf) {
             let jpeg = buf[s..e].to_vec();
             buf.drain(..e);
@@ -5995,7 +6112,8 @@ fn pump_preview(
             // set up, and pacing from before that would make every later frame
             // look overdue and play the whole stream at a sprint.
             let t0 = *origin.get_or_insert_with(std::time::Instant::now);
-            let due = std::time::Duration::from_secs_f64(index as f64 / fps);
+            let frame_no = run.first + shown;
+            let due = std::time::Duration::from_secs_f64(frame_no as f64 / fps);
             let late = match due.checked_sub(t0.elapsed()) {
                 Some(wait) => {
                     std::thread::sleep(wait);
@@ -6006,54 +6124,68 @@ fn pump_preview(
                 None => (t0.elapsed() - due).as_secs_f64(),
             };
             let frame = PreviewFrame {
-                time: start + index as f64 / fps,
+                time: start + frame_no as f64 / fps,
                 jpeg,
                 late,
             };
             index += 1;
+            shown += 1;
             *sent = Some(index);
             if !on_frame(frame) {
-                stopped = true;
-                break 'read;
+                return Ok(());
+            }
+            if shown == 1 {
+                next = Some(spawn(at + 1)?);
             }
         }
-        let wait = if index == 0 { timeouts.first } else { timeouts.stall };
-        match rx.recv_timeout(wait) {
-            Ok(Ok(bytes)) => buf.extend_from_slice(&bytes),
-            Ok(Err(e)) => {
-                failure = Some(format!("preview stream read failed: {e}"));
-                break;
+        let wait = if shown == 0 { timeouts.first } else { timeouts.stall };
+        let failure = match run.recv(wait) {
+            Ok(Ok(bytes)) => {
+                buf.extend_from_slice(&bytes);
+                continue;
             }
-            Err(RecvTimeoutError::Disconnected) => break,
-            Err(RecvTimeoutError::Timeout) => {
-                failure = Some(format!(
-                    "preview stream stalled: ffmpeg produced no {} for {}s",
-                    if index == 0 { "first frame" } else { "frame" },
-                    wait.as_secs_f32()
-                ));
-                break;
+            Ok(Err(e)) => format!("preview stream read failed: {e}"),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                let (status, tail) = run.end(false);
+                if status?.success() {
+                    let following = match next.take() {
+                        Some(n) => n,
+                        None => spawn(at + 1)?,
+                    };
+                    let Some(following) = following else {
+                        return Ok(());
+                    };
+                    run = following;
+                    at += 1;
+                    shown = 0;
+                    buf.clear();
+                    continue;
+                }
+                format!("preview stream failed: {tail}")
             }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => format!(
+                "preview stream stalled: ffmpeg produced no {} for {}s",
+                if shown == 0 { "first frame" } else { "frame" },
+                wait.as_secs_f32()
+            ),
+        };
+        let (_, tail) = run.end(true);
+        if shown == 0 && run.hw {
+            HWACCEL_OK.store(false, std::sync::atomic::Ordering::Relaxed);
+            tracing::warn!("hardware decode failed starting playback; using software decode: {failure}\n{tail}");
+            // The run started ahead asked for it too.
+            next = None;
+            run = spawn(at)?.ok_or_else(|| Error::Engine("preview stream lost its part".to_string()))?;
+            buf.clear();
+            continue;
         }
+        let reason = if failure.ends_with(&tail) {
+            failure
+        } else {
+            format!("{failure}\n{tail}")
+        };
+        return Err(Error::Engine(reason.trim().to_string()));
     }
-
-    if stopped || failure.is_some() {
-        let _ = child.kill();
-    }
-    drop(rx);
-    let status = reap(&mut child)?;
-    let stderr_text = stderr_handle.join().unwrap_or_default();
-    let tail = || {
-        let mut tail: Vec<&str> = stderr_text.lines().rev().take(12).collect();
-        tail.reverse();
-        tail.join("\n").trim().to_string()
-    };
-    if let Some(reason) = failure {
-        return Err(Error::Engine(format!("{reason}\n{}", tail()).trim().to_string()));
-    }
-    if !stopped && !status.success() {
-        return Err(Error::Engine(format!("preview stream failed: {}", tail())));
-    }
-    Ok(())
 }
 
 /// Render the timeline by driving the `ffmpeg` binary with a generated
@@ -18412,6 +18544,120 @@ mod tests {
         )
         .expect("ends cleanly");
         assert!(delays.iter().all(|l| *l < 0.05), "{delays:?}");
+    }
+
+    /// A stream in parts plays them one after the other on one clock: each frame is on the frame of
+    /// the stream its part starts at, and the next part is started once this one has shown its first
+    /// frame, not before.
+    #[cfg(unix)]
+    #[test]
+    fn a_stream_in_parts_plays_them_in_turn_and_starts_each_next_one_ahead() {
+        let scripts = [
+            r"printf '\377\330a\377\331\377\330b\377\331'",
+            r"printf '\377\330c\377\331'",
+            r"printf '\377\330d\377\331\377\330e\377\331'",
+        ];
+        let firsts = [0u64, 2, 3];
+        let spawned = std::cell::RefCell::new(Vec::new());
+        let shown = std::cell::Cell::new(0u64);
+        let mut spawn = |i: usize| -> Result<Option<PreviewRun>> {
+            spawned.borrow_mut().push((i, shown.get()));
+            Ok(scripts
+                .get(i)
+                .map(|s| PreviewRun::start(fake_stream(s), firsts[i], false, GraphScript(None))))
+        };
+        let mut frames = Vec::new();
+        let mut sent = None;
+        pump_runs(
+            &mut spawn,
+            10.0,
+            1000.0,
+            short_timeouts(),
+            &mut |f| {
+                frames.push((f.time, f.jpeg[2]));
+                shown.set(shown.get() + 1);
+                true
+            },
+            &mut sent,
+        )
+        .expect("ends cleanly");
+        assert_eq!(
+            frames,
+            vec![(10.0, b'a'), (10.001, b'b'), (10.002, b'c'), (10.003, b'd'), (10.004, b'e')]
+        );
+        assert_eq!(sent, Some(5));
+        // Part 1 after part 0's first frame, part 2 after part 1's (which is the stream's third), and
+        // the end asked for once.
+        assert_eq!(*spawned.borrow(), vec![(0, 0), (1, 1), (2, 3), (3, 4)]);
+    }
+
+    /// A part that dies before its first frame having asked for hardware decode is started again in
+    /// software (nothing of it was shown, so nothing is replayed); one that asked for none fails the
+    /// stream, as does one that dies after showing frames.
+    #[cfg(unix)]
+    #[test]
+    fn a_part_whose_hardware_decode_fails_starts_again_and_any_other_failure_ends_the_stream() {
+        let before = HWACCEL_OK.load(std::sync::atomic::Ordering::Relaxed);
+        let attempts = std::cell::Cell::new(0);
+        let mut spawn = |i: usize| -> Result<Option<PreviewRun>> {
+            Ok(match i {
+                0 => Some(PreviewRun::start(
+                    fake_stream(r"printf '\377\330a\377\331'"),
+                    0,
+                    false,
+                    GraphScript(None),
+                )),
+                1 => {
+                    attempts.set(attempts.get() + 1);
+                    let hw = attempts.get() == 1;
+                    let script = if hw {
+                        "echo no device >&2; exit 1"
+                    } else {
+                        r"printf '\377\330b\377\331'"
+                    };
+                    Some(PreviewRun::start(fake_stream(script), 1, hw, GraphScript(None)))
+                }
+                _ => None,
+            })
+        };
+        let mut frames = Vec::new();
+        let mut sent = None;
+        pump_runs(
+            &mut spawn,
+            0.0,
+            1000.0,
+            short_timeouts(),
+            &mut |f| {
+                frames.push(f.jpeg[2]);
+                true
+            },
+            &mut sent,
+        )
+        .expect("the software run plays");
+        HWACCEL_OK.store(before, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!((frames, attempts.get()), (vec![b'a', b'b'], 2));
+
+        let mut spawn = |i: usize| -> Result<Option<PreviewRun>> {
+            Ok(match i {
+                0 => Some(PreviewRun::start(
+                    fake_stream(r"printf '\377\330a\377\331'"),
+                    0,
+                    false,
+                    GraphScript(None),
+                )),
+                1 => Some(PreviewRun::start(
+                    fake_stream("echo bad graph >&2; exit 1"),
+                    1,
+                    false,
+                    GraphScript(None),
+                )),
+                _ => None,
+            })
+        };
+        let err = pump_runs(&mut spawn, 0.0, 1000.0, short_timeouts(), &mut |_| true, &mut sent)
+            .expect_err("a software part that fails ends the stream")
+            .to_string();
+        assert!(err.contains("preview stream failed") && err.contains("bad graph"), "{err}");
     }
 
     fn params_for(fps: f64, request: PlaybackRequest) -> PlaybackParams {
