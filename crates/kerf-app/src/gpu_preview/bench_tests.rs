@@ -102,6 +102,7 @@ fn big_project(dir: &Path, assets: usize, clips: usize) -> Project {
         markers: Vec::new(),
         format: None,
         master: Default::default(),
+        thumbnails: Vec::new(),
     };
     project.save_timeline(&timeline).expect("a timeline");
     project
@@ -586,6 +587,7 @@ fn play_project(clips: &[PathBuf; 2], heavy: bool) -> Project {
         markers: Vec::new(),
         format: None,
         master: Default::default(),
+        thumbnails: Vec::new(),
     };
     project.save_timeline(&timeline).expect("a timeline");
     project

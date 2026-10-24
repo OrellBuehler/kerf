@@ -40,6 +40,7 @@ pub mod scopes;
 pub mod svg;
 pub mod template;
 pub mod text;
+pub mod thumbnail;
 pub mod timecode;
 pub mod transcript;
 
@@ -101,7 +102,7 @@ pub use model::{
     Projection, Property, PropertyKey, PropertyTrack, Reframe, ReframeKeyframe, ResolvedReframe, Revision, Rhythm, SalienceMap,
     ScoreHit, ScoreSection, SectionKind, SectionSpan, SkippedChange, SkippedDetach, SourceLimits, SplitSide, StagedAssetChange,
     StagedEdit, StreamInfo, StreamKind, Subsampling, SubsetMerge, SvgOverlay, SvgOverlayPatch, SvgPreset, SvgPresetKind,
-    SvgPresetParams, Task, TaskStatus, TextKeyframe, TextOverlay, TimeRange, Timeline, TimelineDiff, TitleClip, Track,
+    SvgPresetParams, Task, TaskStatus, TextKeyframe, TextOverlay, Thumbnail, ThumbnailLayer, TimeRange, Timeline, TimelineDiff, TitleClip, Track,
     TrackLevels, TranscriptSegment, Transform, TransformPatch, Transition, TransitionKind, VideoEffect, Voiceover, Wheel, Wheels,
     Word, ADJACENT_EPS, DEFAULT_MAX_TEMPO_CHANGE, GENERATED_ASSET, LEVELS_TARGET_LUFS, LEVELS_TRUE_PEAK_CEILING_DBTP,
     MASTER_DEFAULT_CEILING_DB, MASTER_MAX_VOLUME, MASTER_MIN_CEILING_DB, MAX_BPM, MAX_CHANNEL_VOLUME, MAX_DELIVERY_FPS, MAX_SEED,
@@ -120,7 +121,7 @@ pub use project::{
     AlignTo, AudioSync, AudioSyncMeasure, AudioSyncPlan, BandBalance, BandBalanceRequest, BandPlan, BandSource, ComposePlan,
     ComposeRequest, Composed, DeliveryInputs, ExportedFile, FramingPlan, MissingAsset, Page, PreparedText, Project, RelinkCheck,
     Relinked, RemovedAsset, ScoreAlign, SmartCropJob, SmartCropPlan, StemsPlaced, SubsetApplied, SvgChecked, SvgLayout,
-    SvgOverlayResult, SvgSource, SyncSide, TitleClipPatch, TitleClipPlacement, TitleClipResult, TitleEdited, TitleTextForm,
+    SvgOverlayResult, SvgSource, SyncSide, ThumbnailLayerSpec, ThumbnailResult, ThumbnailSpec, TitleClipPatch, TitleClipPlacement, TitleClipResult, TitleEdited, TitleTextForm,
     TitleTextInputs, DEFAULT_HISTORY_LIMIT, MAX_CHANNEL_KEYS, MAX_SYNC_SECONDS, MUSIC_TRACK, SCHEMA_VERSION, STAGED_UNDO_DEPTH,
     SYNC_SAMPLE_RATE, VOICEOVER_TRACK,
 };

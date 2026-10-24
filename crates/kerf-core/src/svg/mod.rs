@@ -58,7 +58,7 @@ pub fn has_outlines(svg: &str) -> bool {
 /// The attribute of a `<text>` that holds its animation (JSON of a [`TextAnimation`]).
 pub const ANIMATE_ATTRIBUTE: &str = text_animation::ANIMATE_MARK;
 pub use curve::{curve_preset, curve_presets, Curve, CurvePreset, Curves};
-pub use presets::{check_params, preset_infos, render_preset, SvgPresetInfo, SvgPresetParamInfo, DEFAULT_FRAME};
+pub use presets::{check_params, preset_infos, render_headline, render_preset, SvgPresetInfo, SvgPresetParamInfo, DEFAULT_FRAME};
 pub use text_animation::{
     set_text_animation, text_animation_of, text_animation_preset, text_animation_presets, AnimateBy, Easing, Offset, Properties,
     RangeSelector, Shape, TextAnimation, TextAnimationPreset, Wiggle,

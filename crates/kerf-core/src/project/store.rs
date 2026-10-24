@@ -108,6 +108,12 @@ const MIGRATIONS: &[Migration] = &[
         destructive: false,
         needed_to_read: false,
     },
+    Migration {
+        run: v12_to_v13,
+        needed: v12_to_v13_needed,
+        destructive: false,
+        needed_to_read: false,
+    },
 ];
 
 /// The schema this build writes and the newest it opens.
@@ -295,6 +301,19 @@ fn v11_to_v12(_: &Connection) -> rusqlite::Result<()> {
 }
 
 fn v11_to_v12_needed(_: &Connection) -> bool {
+    true
+}
+
+/// v13: a timeline may carry thumbnails (`Timeline.thumbnails`, `"thumbnails"` in the timeline JSON: a frame, a size, a
+/// focus and layers of their own). It is a new field an older build drops at its next write, and the thumbnails the
+/// user designed are gone without a word. A timeline with none is written as it was, so a stored one is unchanged.
+/// Nothing in the file's tables changes; the step is the version that keeps an older build out, after the file is
+/// copied aside.
+fn v12_to_v13(_: &Connection) -> rusqlite::Result<()> {
+    Ok(())
+}
+
+fn v12_to_v13_needed(_: &Connection) -> bool {
     true
 }
 

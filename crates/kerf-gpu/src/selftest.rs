@@ -433,6 +433,7 @@ fn timeline(tracks: Vec<Vec<Clip>>) -> Timeline {
         markers: Vec::new(),
         format: Some(Delivery::new(CANVAS.0, CANVAS.1, Fit::Contain)),
         master: Default::default(),
+        thumbnails: Vec::new(),
     }
 }
 

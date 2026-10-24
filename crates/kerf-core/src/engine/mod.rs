@@ -122,7 +122,7 @@ pub use cli::{
     proxy_width, proxy_width_for, ready_proxy, remove_proxy_files, render_measured, render_variants_measured,
     salience_map_cancellable, seek_arg, set_proxy_base_width, source_identity, stitch_insta360, stitch_insta360_with,
     stitched_path, stream_mix_pcm, stream_preview, stream_preview_until, stream_preview_with, timeline_frame_cancellable,
-    timeline_frame_region_cancellable, timeline_frame_yuv_cancellable, validate_export, variant_frame, waveform,
+    timeline_frame_region_cancellable, timeline_frame_yuv_cancellable, transcode_image, validate_export, variant_frame, waveform,
     waveform_cancellable, Container, ExportOptions, ExportPart, ExportProgress, ExportReport, ExportStage, ExportVariant,
     ExportedFrame, Fit, FpsSource, ImageFormat, LoudnessPreset, LoudnessTarget, PlaybackParams, PlaybackRequest, PreviewFrame,
     ProxyRun, RateControl, Region, RenderStatus, ScrubConfig, ScrubFrames, ScrubStats, VariantProgress, VariantsRun,

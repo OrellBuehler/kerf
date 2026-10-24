@@ -239,6 +239,7 @@ fn layer(a: &Asset, t: f64) -> PlanLayer {
         markers: Vec::new(),
         format: None,
         master: Default::default(),
+        thumbnails: Vec::new(),
     };
     let plan = RenderPlan::at(
         &tl,

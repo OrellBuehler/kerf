@@ -221,6 +221,7 @@ fn timeline(a: &Asset, b: &Asset, logo: &Asset, bed: &Asset) -> Timeline {
         markers: Vec::new(),
         format: None,
         master: Default::default(),
+        thumbnails: Vec::new(),
     };
     tl.master.limiter = true;
     tl.master.ceiling_db = -3.0;
@@ -699,6 +700,7 @@ fn a_reel_of_many_big_inputs_completes_in_parts_with_bounded_memory() {
         markers: Vec::new(),
         format: None,
         master: Default::default(),
+        thumbnails: Vec::new(),
     };
     let opts = ExportOptions {
         container: Container::Mp4,
