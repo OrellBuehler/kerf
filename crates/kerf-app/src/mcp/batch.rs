@@ -180,7 +180,7 @@ impl KerfMcp {
                        what earlier ones made (\"$0.right.id\"; see `ops`). `dry_run` reports what the edits would \
                        change and keeps nothing. Imports, analysis, captions, SVG titles, voiceover, music, smart_crop, \
                        exports, staging, history and settings are refused: call them on their own. Returns each op's \
-                       answer (clips cut down to their place), the timeline afterwards in brief and, for a dry run, \
+                       answer (a list or pair of clips cut down to their places), the timeline afterwards in brief and, for a dry run, \
                        the diff."
     )]
     fn apply_edits(&self, Parameters(p): Parameters<ApplyEditsParams>) -> Result<String, McpError> {
@@ -262,7 +262,7 @@ fn run(project: &Project, p: ApplyEditsParams) -> Result<String, McpError> {
             Ok::<_, Failed>(answers)
         })
         .map_err(|Failed(e)| e)?;
-    let results: Vec<Value> = done.result.iter().map(compact).collect();
+    let results: Vec<Value> = done.result.iter().map(compact_answer).collect();
     let mut out = serde_json::json!({
         "applied": !dry_run,
         "ops": results.len(),
@@ -332,28 +332,39 @@ fn reference(s: &str, answers: &[Value]) -> Result<Option<Value>, String> {
     Ok(Some(node.clone()))
 }
 
-/// An op's answer with every clip in it cut to where it is: its id, asset, place and span.
+/// An op's answer as the tool gives it when it is the one clip the op edited, else with every clip in it
+/// cut down to its place (`compact`).
+fn compact_answer(value: &Value) -> Value {
+    if is_clip(value) {
+        return value.clone();
+    }
+    compact(value)
+}
+
+fn is_clip(value: &Value) -> bool {
+    value.get("asset_id").is_some() && value.get("timeline_start").is_some()
+}
+
+/// `value` with every clip in it cut to where it is: its id, asset, place and span.
 fn compact(value: &Value) -> Value {
     match value {
-        Value::Object(map) if map.contains_key("asset_id") && map.contains_key("timeline_start") => {
-            match serde_json::from_value::<kerf_core::Clip>(value.clone()) {
-                Ok(clip) => {
-                    let mut out = serde_json::json!({
-                        "id": clip.id,
-                        "asset_id": clip.asset_id,
-                        "timeline_start": clip.timeline_start,
-                        "timeline_end": clip.timeline_end(),
-                        "source_in": clip.source_in,
-                        "source_out": clip.source_out,
-                    });
-                    if let Some(link) = clip.link_id {
-                        out["link_id"] = serde_json::json!(link);
-                    }
-                    out
+        Value::Object(_) if is_clip(value) => match serde_json::from_value::<kerf_core::Clip>(value.clone()) {
+            Ok(clip) => {
+                let mut out = serde_json::json!({
+                    "id": clip.id,
+                    "asset_id": clip.asset_id,
+                    "timeline_start": clip.timeline_start,
+                    "timeline_end": clip.timeline_end(),
+                    "source_in": clip.source_in,
+                    "source_out": clip.source_out,
+                });
+                if let Some(link) = clip.link_id {
+                    out["link_id"] = serde_json::json!(link);
                 }
-                Err(_) => value.clone(),
+                out
             }
-        }
+            Err(_) => value.clone(),
+        },
         Value::Object(map) => Value::Object(map.iter().map(|(k, v)| (k.clone(), compact(v))).collect()),
         Value::Array(items) => Value::Array(items.iter().map(compact).collect()),
         _ => value.clone(),
@@ -397,7 +408,9 @@ mod tests {
 
     #[test]
     fn every_batchable_tool_is_a_registered_edit_named_in_the_schema() {
-        let schema = serde_json::to_string(&router().get("apply_edits").unwrap().input_schema).unwrap();
+        let schema = serde_json::to_string(&router().get("apply_edits").unwrap().input_schema)
+            .unwrap()
+            .replace("\\n", " ");
         let words: Vec<&str> = schema.split(|c: char| !(c.is_ascii_lowercase() || c == '_')).collect();
         for name in BATCHABLE {
             assert!(words.contains(name), "{name} is not listed under `tool`");

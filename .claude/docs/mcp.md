@@ -486,8 +486,8 @@ SVG titles, staging, history or settings is refused naming the op. Each op is ch
 tool's **own body**: every batchable tool is `edit(|p| Self::<tool>_op(p, params))`, and the batch reads `args` into the
 same parameter struct and calls the same `_op`, so `ripple` / `link` and every refusal are the tool's. A failing op is the
 tool's error with `op K (tool): ` in front (same code). A string `"$K.path"` in `args` is replaced by that value of op K's
-answer (an earlier op; keys or indices; `"$$…"` is a literal `$`). The answer: `results` (each op's answer, clips cut to
-id / asset / span by `compact`), `timeline_brief`, the `label` and `staged`, or for `dry_run` the `diff` (`diff_page` of
+answer (an earlier op; keys or indices; `"$$…"` is a literal `$`). The answer: `results` (each op's answer: one clip whole,
+the clips inside a larger answer cut to id / asset / span by `compact`), `timeline_brief`, the `label` and `staged`, or for `dry_run` the `diff` (`diff_page` of
 before → after) — a dry run keeps nothing and emits no `project-changed`. No Tauri command: the GUI's gestures already write
 one edit each, and its multi-clip edits have their own commands.
 
