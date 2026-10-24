@@ -27,8 +27,9 @@ use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabiliti
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{schemars, tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler};
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, Manager};
 use uuid::Uuid;
+
+use crate::shell::Shell;
 
 mod activity;
 mod args;
@@ -40,10 +41,10 @@ mod server;
 mod templates;
 
 use jobs::Run;
-pub(crate) use server::bind_problem;
+pub(crate) use server::{bind_problem, start};
 pub use server::{
-    check_addr, check_token, connection_info, endpoint_url, generate_token, server_error, settings_changed, start,
-    ConnectionInfo, DEFAULT_ADDR,
+    check_addr, check_token, connection_info, endpoint_url, generate_token, server_error, settings_changed, ConnectionInfo,
+    DEFAULT_ADDR,
 };
 
 /// Ceilings on the sizes a tool call may ask for. These numbers reach us from a
@@ -66,7 +67,7 @@ const SVG_INLINE_LIMIT: usize = 4 * 1024;
 #[derive(Clone)]
 pub struct KerfMcp {
     project: Arc<Mutex<Project>>,
-    app: AppHandle,
+    app: Shell,
     /// The rmcp session this server instance belongs to (the `Mcp-Session-Id` the client sends).
     /// rmcp makes one instance per session, so this is the agent's identity: it owns the
     /// proposal its edits open, and no other session may touch it. `None` for a client that
@@ -2692,7 +2693,6 @@ impl KerfMcp {
                        stopped reporting, and `reported` is false when no window ever has (Kerf headless)."
     )]
     fn get_editor_context(&self) -> Result<String, McpError> {
-        use tauri::Manager;
         match self.app.try_state::<crate::editor_context::EditorContextState>() {
             Some(state) => json(&state.read()),
             None => json(&crate::editor_context::EditorContextState::default().read()),
@@ -6220,7 +6220,7 @@ impl KerfMcp {
 }
 
 impl KerfMcp {
-    fn new(project: Arc<Mutex<Project>>, app: AppHandle) -> Self {
+    fn new(project: Arc<Mutex<Project>>, app: Shell) -> Self {
         Self {
             project,
             app,
@@ -6337,16 +6337,15 @@ fn check_outputs_now(project: &Mutex<Project>, owner: Option<&str>, paths: &[std
 /// Forwards the `analysis-progress` events the GUI's bin listens to — for one asset — to a [`Run`],
 /// so an agent hears what the user sees: the step and how far it is. Stops listening when dropped.
 struct AnalysisProgressRelay {
-    app: AppHandle,
+    app: Shell,
     id: tauri::EventId,
 }
 
 impl AnalysisProgressRelay {
-    fn new(app: &AppHandle, asset: Uuid, run: &Run) -> Self {
-        use tauri::Listener;
+    fn new(app: &Shell, asset: Uuid, run: &Run) -> Self {
         let (run, asset) = (run.clone(), asset.to_string());
-        let id = app.listen("analysis-progress", move |event| {
-            let Ok(p) = serde_json::from_str::<serde_json::Value>(event.payload()) else {
+        let id = app.listen("analysis-progress", move |payload| {
+            let Ok(p) = serde_json::from_str::<serde_json::Value>(payload) else {
                 return;
             };
             if p["asset_id"] != asset.as_str() {
@@ -6365,7 +6364,6 @@ impl AnalysisProgressRelay {
 
 impl Drop for AnalysisProgressRelay {
     fn drop(&mut self) {
-        use tauri::Listener;
         self.app.unlisten(self.id);
     }
 }

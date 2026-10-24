@@ -13,10 +13,10 @@ use std::sync::{Arc, Mutex};
 use kerf_core::Project;
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{schemars, tool, tool_router, ErrorData as McpError};
-use tauri::Manager;
 
 use super::{blocking, core_err, json, lock_agent_as, reads, KerfMcp};
 use crate::settings;
+use crate::shell::Shell;
 
 /// Whether `project` holds work that exists only in memory: it has no file, and something in it.
 /// The same test as the window's "unsaved work" prompt.
@@ -460,14 +460,14 @@ impl KerfMcp {
             // preview decode from whichever it should now (what the GUI's own change does).
             if patch.get("proxy_size").is_some() || patch.get("preview_source").is_some() {
                 crate::respawn_proxies(&app);
-                let _ = tauri::Emitter::emit(&app, "proxy-ready", ());
+                let _ = app.emit("proxy-ready", ());
             }
             Ok(stored)
         })
         .await?;
         // The window's own copy of the settings (the full `SettingsView`, as `get_settings` answers it
         // there) is told what they are now.
-        if let Err(e) = tauri::Emitter::emit(&self.app, "settings-changed", settings::SettingsView::current(&stored)) {
+        if let Err(e) = self.app.emit("settings-changed", settings::SettingsView::current(&stored)) {
             tracing::warn!(error = %e, "failed to emit settings-changed");
         }
         json(&readable_settings(&stored))
@@ -476,7 +476,7 @@ impl KerfMcp {
 
 impl KerfMcp {
     /// What a replaced project needs besides the swap, as the window's own open does it.
-    fn after_replace(app: &tauri::AppHandle, shared: &Arc<Mutex<Project>>) {
+    fn after_replace(app: &Shell, shared: &Arc<Mutex<Project>>) {
         // The frames of the project that was open are of no use to this one.
         app.state::<crate::AppState>().scrub.clear();
         // The speech model is remembered per project, so transcribing in the new one uses the model
@@ -489,7 +489,7 @@ impl KerfMcp {
     /// Tell the window another project is open: it reloads everything, then refreshes as for any change.
     fn announce_replaced(&self) {
         let path = self.lock().path().map(Path::to_path_buf);
-        if let Err(e) = tauri::Emitter::emit(&self.app, "project-replaced", path.map(|p| p.display().to_string())) {
+        if let Err(e) = self.app.emit("project-replaced", path.map(|p| p.display().to_string())) {
             tracing::warn!(error = %e, "failed to emit project-replaced");
         }
         self.changed();

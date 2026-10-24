@@ -18,11 +18,11 @@ use kerf_core::Project;
 use rmcp::transport::streamable_http_server::{
     session::local::LocalSessionManager, StreamableHttpServerConfig, StreamableHttpService,
 };
-use tauri::AppHandle;
 use tokio_util::sync::CancellationToken;
 
 use super::KerfMcp;
 use crate::settings::Settings;
+use crate::shell::Shell;
 
 /// Default localhost bind address for the MCP endpoint; override in Settings or with `KERF_MCP_ADDR`.
 pub const DEFAULT_ADDR: &str = "127.0.0.1:7777";
@@ -473,7 +473,7 @@ fn set_token_problem(problem: Option<String>) {
 /// Fill in a token if there is none (the first start), persisting it, and return the settings as
 /// they stand. A token that cannot be made leaves none (the server then refuses to start while one
 /// is required); one that cannot be saved is kept for this run and the problem is reported.
-fn with_token(app: &AppHandle, mut settings: Settings) -> Settings {
+fn with_token(app: &Shell, mut settings: Settings) -> Settings {
     if settings.mcp_token.is_some() {
         return settings;
     }
@@ -500,8 +500,8 @@ fn with_token(app: &AppHandle, mut settings: Settings) -> Settings {
 /// Start the MCP server from the stored settings and keep it in step with them from here on.
 /// Called once, from the app's setup hook. The listener comes up on the async runtime; a failure
 /// to bind is reported by [`server_error`], not returned.
-pub fn start(app: &AppHandle, project: Arc<Mutex<Project>>) {
-    let settings = with_token(app, crate::settings::load(app));
+pub(crate) fn start(app: Shell, project: Arc<Mutex<Project>>) {
+    let settings = with_token(&app, crate::settings::load(&app));
     crate::settings::set_agent_review(settings.agent_review);
     project
         .lock()
@@ -514,7 +514,6 @@ pub fn start(app: &AppHandle, project: Arc<Mutex<Project>>) {
         return;
     }
     super::activity::pump_project();
-    let app = app.clone();
     tauri::async_runtime::spawn(supervise(move || KerfMcp::new(project.clone(), app.clone()), rx));
 }
 
