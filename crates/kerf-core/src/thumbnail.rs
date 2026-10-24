@@ -217,6 +217,12 @@ const MEASURE_WIDTH: u32 = 320;
 /// How many frames are decoded side by side.
 const MEASURE_THREADS: usize = 3;
 
+/// The scene changes analysis found in each asset, in source seconds.
+pub type SceneChanges = std::collections::HashMap<Uuid, Vec<f64>>;
+
+/// One decoded frame: its time, size and limited-range 4:4:4 planes.
+type Decoded = (f64, u32, u32, Vec<u8>);
+
 /// One suggested background frame and why.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct SuggestedFrame {
@@ -269,7 +275,7 @@ fn clean_windows(timeline: &Timeline) -> Vec<(f64, f64)> {
 /// through the clean windows, all inside `range`, at most `max`, in time order. Pure.
 pub fn candidate_times(
     timeline: &Timeline,
-    scenes: &std::collections::HashMap<Uuid, Vec<f64>>,
+    scenes: &SceneChanges,
     range: Option<(f64, f64)>,
     max: usize,
 ) -> Vec<f64> {
@@ -422,7 +428,7 @@ pub fn pick_best(mut scored: Vec<SuggestedFrame>, count: usize, gap: f64) -> Vec
 pub fn suggest_frames(
     timeline: &Timeline,
     assets: &[Asset],
-    scenes: &std::collections::HashMap<Uuid, Vec<f64>>,
+    scenes: &SceneChanges,
     count: usize,
     range: Option<(f64, f64)>,
     cancel: &(dyn Fn() -> bool + Sync),
@@ -437,7 +443,6 @@ pub fn suggest_frames(
     let cut = VideoGraphics::None.background_of(timeline);
     let opts = engine::ExportOptions::default();
     let next = AtomicUsize::new(0);
-    type Decoded = (f64, u32, u32, Vec<u8>);
     let decoded: Mutex<Vec<Decoded>> = Mutex::new(Vec::new());
     let failure: Mutex<Option<Error>> = Mutex::new(None);
     std::thread::scope(|scope| {
@@ -492,7 +497,7 @@ pub fn suggest_frames(
 }
 
 /// A PNG grid of the suggested frames, best first, each labelled with its time and score.
-fn suggestion_sheet(pictures: &[(&SuggestedFrame, &(f64, u32, u32, Vec<u8>))]) -> Result<Vec<u8>> {
+fn suggestion_sheet(pictures: &[(&SuggestedFrame, &Decoded)]) -> Result<Vec<u8>> {
     const GAP: u32 = 6;
     let (cw, ch) = pictures
         .iter()

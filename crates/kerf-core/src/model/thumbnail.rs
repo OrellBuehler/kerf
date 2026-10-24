@@ -454,9 +454,9 @@ mod tests {
         let mut b = a.clone();
         b.time = 3.0;
         let c = thumb(1080, 1920);
-        assert_eq!(thumbnail_changes(&[a.clone()], &[a.clone()]), None);
+        assert_eq!(thumbnail_changes(std::slice::from_ref(&a), std::slice::from_ref(&a)), None);
         assert_eq!(
-            thumbnail_changes(&[a.clone()], &[b, c]).as_deref(),
+            thumbnail_changes(std::slice::from_ref(&a), &[b, c]).as_deref(),
             Some("changed “T”, added “T”")
         );
         assert_eq!(thumbnail_changes(&[a], &[]).as_deref(), Some("removed “T”"));

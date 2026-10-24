@@ -6,7 +6,7 @@
 //! [`Project::apply_thumbnail_parsed`] only stores it — through `edit_timeline`, so it stages for an
 //! agent and undoes — refusing when the thumbnail changed in between.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -20,6 +20,7 @@ use crate::model::thumbnail::{
 use crate::model::{Asset, SvgPresetParams, Thumbnail, ThumbnailLayer, Timeline, VideoGraphics};
 use crate::svg::SvgDoc;
 use crate::template::{Library, TemplateEditInputs};
+use crate::thumbnail::SceneChanges;
 
 /// What a thumbnail should become. Each `None` keeps what it has (a new one: its default).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
@@ -422,9 +423,9 @@ impl Project {
 
     /// What suggesting frames needs: the working timeline, the assets and the scene changes analysis
     /// found in each asset of the cut (source seconds; none for one not analyzed).
-    pub fn frame_suggestion_inputs(&self) -> Result<(Timeline, Vec<Asset>, HashMap<Uuid, Vec<f64>>)> {
+    pub fn frame_suggestion_inputs(&self) -> Result<(Timeline, Vec<Asset>, SceneChanges)> {
         let timeline = self.working_timeline()?;
-        let mut scenes = HashMap::new();
+        let mut scenes = SceneChanges::new();
         for clip in timeline.tracks.iter().flat_map(|t| t.clips.iter()) {
             if scenes.contains_key(&clip.asset_id) || clip.generator.is_some() {
                 continue;
