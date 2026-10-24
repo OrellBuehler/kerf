@@ -439,10 +439,10 @@ mod tests {
         assert!(missing.message.contains("`platform`"), "{}", missing.message);
         let blank = get("social_reel", Some(&object(&[("platform", "  ")]))).unwrap_err();
         assert_eq!(blank.code, ErrorCode::INVALID_PARAMS);
-        let extra = get("deliver", Some(&object(&[("ouput", "/tmp/a.mp4")]))).unwrap_err();
+        let extra = get("deliver", Some(&object(&[("out_file", "/tmp/a.mp4")]))).unwrap_err();
         assert_eq!(extra.code, ErrorCode::INVALID_PARAMS);
         assert!(
-            extra.message.contains("`ouput`") && extra.message.contains("output"),
+            extra.message.contains("`out_file`") && extra.message.contains("output"),
             "{}",
             extra.message
         );
