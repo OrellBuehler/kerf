@@ -6,17 +6,19 @@ import {
 	exportCaptions,
 	exportCover,
 	exportInterchange,
+	exportThumbnail,
 	exportMarkers,
 	inTauri,
 	pickCoverPath,
 	pickSavePath,
+	pickThumbnailPath,
 	revealPath
 } from './api';
 import { describeReport, reportWarns } from './export-report';
 import type { ExportedFile, InterchangeFormat, MarkerListFormat } from './types';
 import { editor } from './state.svelte';
 import { toast } from './notifications.svelte';
-import { coverLine, failure, savedLine } from './failure-copy';
+import { coverLine, failure, savedLine, thumbnailLine } from './failure-copy';
 import { ui } from './editor-ui.svelte';
 import { isCancelled } from './ops';
 import { settings } from './settings.svelte';
@@ -41,6 +43,28 @@ export async function saveCoverFrame(): Promise<void> {
 	} catch (e) {
 		if (isCancelled(e)) toast.info('Stopped saving the cover frame');
 		else toast.error(failure("Couldn't save the cover frame", e));
+	} finally {
+		editor.coverRun = null;
+	}
+}
+
+/** Write a designed thumbnail at its full size, from the original media, to a file the user picks. */
+export async function saveThumbnail(thumbnailId: string, name: string): Promise<void> {
+	if (!inTauri()) {
+		toast.info('Thumbnails are drawn in the desktop app.');
+		return;
+	}
+	const path = await pickThumbnailPath(name);
+	if (!path) return;
+	editor.coverRun = { cancelling: false };
+	try {
+		const out = await exportThumbnail(thumbnailId, path);
+		toast.success(thumbnailLine(out), {
+			action: { label: 'Show in folder', onClick: () => void revealPath(out).catch(() => {}) }
+		});
+	} catch (e) {
+		if (isCancelled(e)) toast.info('Stopped saving the thumbnail');
+		else toast.error(failure("Couldn't save the thumbnail", e));
 	} finally {
 		editor.coverRun = null;
 	}

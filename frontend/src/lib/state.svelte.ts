@@ -102,6 +102,8 @@ import {
 	addMarker,
 	updateMarker,
 	removeMarker,
+	setThumbnail,
+	removeThumbnail,
 	linkClips,
 	reattachAudio,
 	reattachAudioClips,
@@ -137,6 +139,7 @@ import {
 	undo as apiUndo
 } from './api';
 import type {
+	ThumbnailSpec,
 	AudioSync,
 	ClipCut,
 	ClipMove,
@@ -1200,6 +1203,19 @@ class EditorState {
 	}
 	updateMarker(markerId: string, patch: MarkerPatch) {
 		return this.#apply(() => updateMarker(markerId, patch));
+	}
+	/** Add a thumbnail (`thumbnailId` null) or change one; resolves the thumbnail's id and the warnings. One edit. */
+	async setThumbnail(thumbnailId: string | null, spec: ThumbnailSpec): Promise<{ id: string; warnings: string[] }> {
+		let out = { id: '', warnings: [] as string[] };
+		await this.#apply(async () => {
+			const edit = await setThumbnail(thumbnailId, spec);
+			out = { id: edit.thumbnail_id, warnings: edit.warnings };
+			return edit.timeline;
+		});
+		return out;
+	}
+	removeThumbnail(thumbnailId: string) {
+		return this.#apply(() => removeThumbnail(thumbnailId));
 	}
 	removeMarker(markerId: string) {
 		return this.#apply(() => removeMarker(markerId));

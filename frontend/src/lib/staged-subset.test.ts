@@ -148,22 +148,25 @@ describe('mergeSubset', () => {
 		expect(() => mergeSubset(base, base, proposed, diff, ['clip_changed:nope'])).toThrow(/no change clip_changed:nope/);
 	});
 
-	test('text, markers and the master apply by identity too', () => {
+	test('text, markers, the master and the thumbnails apply by identity too', () => {
 		const base = cut();
 		const proposed = cut();
 		proposed.overlays = [{ id: 'o1', text: 'hello', start: 1, end: 2, pos_x: 0.5, pos_y: 0.5, size: 0.05, color: 'white', bold: false }];
 		proposed.markers = [{ id: 'm1', time: 3, name: 'beat' }];
 		proposed.master = { volume: 0.5, limiter: false, ceiling_db: -1.5 };
+		proposed.thumbnails = [{ id: 't1', name: 'YouTube', time: 2, width: 1280, height: 720, focus_x: 0.5, focus_y: 0.5 }];
 		const diff = diffOf(
 			{ kind: 'overlay_added', summary: 'Added text', overlay_id: 'o1', at: 1 },
 			{ kind: 'marker_added', summary: 'Added marker', marker_id: 'm1', at: 3 },
-			{ kind: 'master_changed', summary: 'Master volume' }
+			{ kind: 'master_changed', summary: 'Master volume' },
+			{ kind: 'thumbnails_changed', summary: 'Changed the thumbnails' }
 		);
 		const merge = mergeSubset(base, base, proposed, diff, diff.entries.map(entryId));
 		expect(merge.timeline.overlays?.map((o) => o.id)).toEqual(['o1']);
 		expect(merge.timeline.markers?.map((m) => m.id)).toEqual(['m1']);
 		expect(merge.timeline.master?.volume).toBe(0.5);
-		expect(merge.applied).toHaveLength(3);
+		expect(merge.timeline.thumbnails?.map((t) => t.id)).toEqual(['t1']);
+		expect(merge.applied).toHaveLength(4);
 	});
 
 	test('a pick that would pull linked clips out of step is refused, naming the tracks', () => {

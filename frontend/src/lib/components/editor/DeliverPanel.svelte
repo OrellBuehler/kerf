@@ -10,6 +10,7 @@
 	import SectionHead from './SectionHead.svelte';
 	import DeliverTo from './DeliverTo.svelte';
 	import Readiness from './Readiness.svelte';
+	import ThumbnailSection from './ThumbnailSection.svelte';
 	import { editor } from '#lib/state.svelte';
 	import { ui } from '#lib/editor-ui.svelte';
 	import { formatsFor, hasPicture, presetFor, ratioLabel, rateLine } from '#lib/delivery-formats';
@@ -71,6 +72,8 @@
 			<SectionHead label="Deliver to" />
 			<DeliverTo where="named by shape beside the file you choose when you export, as" />
 			<Readiness />
+			<SectionHead label="Thumbnails" />
+			<ThumbnailSection />
 		{/if}
 	</div>
 
