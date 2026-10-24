@@ -186,6 +186,7 @@ import {
 } from './edit-modes';
 import { dissolveAllOrphans, linkPartners, withLinkPartners } from './link-groups';
 import * as ops from './link-ops';
+import { isRamped } from './speed-ramp';
 import { landingLocks } from './track-locks';
 import { runEdit } from './link-ops';
 import { sourceLimits } from './trim-tools';
@@ -4136,7 +4137,7 @@ export async function syncClipsByAudio(referenceId: string, clipId: string, forc
 		const [r, c] = [ref[0].clips[ref[1]], own[0].clips[own[1]]];
 		for (const x of [r, c]) {
 			if (!assetById(x.asset_id)?.streams.some((st) => st.kind === 'audio')) throw new Error(`clip ${x.id} has no sound to sync by`);
-			if ((x.speed ?? 1) !== 1) throw new Error(`clip ${x.id} plays at another speed or reversed; sync needs both at normal speed`);
+			if ((x.speed ?? 1) !== 1 || isRamped(x)) throw new Error(`clip ${x.id} plays at another speed or reversed; sync needs both at normal speed`);
 		}
 		const start = r.timeline_start - r.source_in + c.source_in;
 		if (start < 0) throw new Error(`in sync the clip would start ${(-start).toFixed(3)}s before the timeline does; move the reference later first`);
