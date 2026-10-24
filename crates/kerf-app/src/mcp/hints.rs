@@ -217,6 +217,7 @@ pub(super) const TOOLS: &[(&str, &str, Effect, ToolSet)] = &[
     ("get_band_balance", "Band balance", Read, Audio),
     ("get_frame", "Get frame", Read, Core),
     ("skim_asset", "Skim asset", Read, Core),
+    ("skim_timeline", "Skim timeline", Read, Core),
     ("preview_timeline", "Preview timeline", Read, Core),
     ("timeline_summary", "Timeline summary", Read, Core),
     ("preview_svg_preset", "Preview SVG title preset", Read, Titles),

@@ -1985,6 +1985,60 @@ impl Project {
         engine::timeline_frame_region_cancellable(timeline, assets, &opts, time_secs, region, max_width, quality, cancel)
     }
 
+    /// The span of the cut a sheet of it covers: `[start, end)` clamped into `[0, duration]`,
+    /// defaulting to the whole cut. [`Project::timeline_sheet_times`] and a cell of a sheet both
+    /// read it, so a cell lands on the moment the sheet showed.
+    pub fn timeline_sheet_window(timeline: &Timeline, start: Option<f64>, end: Option<f64>) -> (f64, f64) {
+        let duration = timeline.duration();
+        let start = start.unwrap_or(0.0).clamp(0.0, duration);
+        let end = end.unwrap_or(duration).min(duration).max(start);
+        (start, end)
+    }
+
+    /// The timeline time each cell of a `columns`×`rows` sheet of the cut shows, row-major
+    /// ([`engine::contact_sheet_times`] over [`Project::timeline_sheet_window`]).
+    pub fn timeline_sheet_times(timeline: &Timeline, start: Option<f64>, end: Option<f64>, columns: u32, rows: u32) -> Vec<f64> {
+        let (start, end) = Self::timeline_sheet_window(timeline, start, end);
+        engine::contact_sheet_times(start, end, columns, rows)
+    }
+
+    /// A contact sheet of the cut from already-resolved inputs ([`Project::timeline_frame_inputs`],
+    /// so the preview's proxies), **without** `&self`: the composited still at each of
+    /// `columns`×`rows` moments across `[start, end)` (the whole cut by default), `cell_width` px
+    /// wide, tiled into one JPEG, with each cell's time and the clips on screen there. A gap is
+    /// black. `cancel` stops it ([`Error::Cancelled`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn composite_timeline_sheet_cancellable(
+        timeline: &Timeline,
+        assets: &[Asset],
+        start: Option<f64>,
+        end: Option<f64>,
+        columns: u32,
+        rows: u32,
+        cell_width: u32,
+        quality: u8,
+        cancel: &(dyn Fn() -> bool + Sync),
+    ) -> Result<(Vec<u8>, Vec<engine::SheetCell>)> {
+        if timeline.duration() <= 0.0 {
+            return Err(Error::InvalidArgument(
+                "the timeline is empty: there is no cut to skim".to_string(),
+            ));
+        }
+        let opts = engine::ExportOptions {
+            hwaccel: engine::decode_hwaccel(),
+            ..engine::ExportOptions::default()
+        };
+        let times = Self::timeline_sheet_times(timeline, start, end, columns, rows);
+        let jpeg = engine::timeline_sheet_cancellable(timeline, assets, &opts, &times, columns, cell_width, quality, cancel)?;
+        Ok((jpeg, engine::timeline_sheet_cells(timeline, assets, &opts, &times)))
+    }
+
+    /// The clips on screen at each of `times`, bottom to top: what a sheet's caption, or one
+    /// cell's, names.
+    pub fn timeline_sheet_cells(timeline: &Timeline, assets: &[Asset], times: &[f64]) -> Vec<engine::SheetCell> {
+        engine::timeline_sheet_cells(timeline, assets, &engine::ExportOptions::default(), times)
+    }
+
     /// How ready the current cut is for each publishing target — what a platform
     /// would reject, what it would accept and then quietly under-distribute, and
     /// what would simply be better — with the cut it was judged on.
@@ -7826,6 +7880,32 @@ mod tests {
         let timeline = project.timeline().unwrap();
         let total_clips: usize = timeline.tracks.iter().map(|t| t.clips.len()).sum();
         assert!(total_clips >= 3);
+    }
+
+    #[test]
+    fn a_sheet_of_the_cut_covers_the_whole_cut_unless_told_and_clamps_into_it() {
+        let timeline = Project::sample().unwrap().timeline().unwrap();
+        let d = timeline.duration();
+        assert!(d > 0.0);
+        assert_eq!(Project::timeline_sheet_window(&timeline, None, None), (0.0, d));
+        assert_eq!(
+            Project::timeline_sheet_window(&timeline, Some(-3.0), Some(d + 10.0)),
+            (0.0, d)
+        );
+        assert_eq!(Project::timeline_sheet_window(&timeline, Some(d + 5.0), None), (d, d));
+        assert_eq!(Project::timeline_sheet_window(&timeline, Some(2.0), Some(1.0)), (2.0, 2.0));
+        let times = Project::timeline_sheet_times(&timeline, None, None, 4, 2);
+        assert_eq!(times.len(), 8);
+        assert_eq!(times[0], 0.0);
+        assert!((times[1] - d / 8.0).abs() < 1e-9);
+        assert!(times.iter().all(|&t| t < d), "{times:?}");
+        assert!(Project::timeline_sheet_times(&timeline, Some(1.0), Some(1.0), 2, 2)
+            .iter()
+            .all(|&t| t == 1.0));
+        let mut empty = timeline.clone();
+        empty.tracks.clear();
+        let refused = Project::composite_timeline_sheet_cancellable(&empty, &[], None, None, 4, 4, 240, 5, &|| false);
+        assert!(matches!(refused, Err(Error::InvalidArgument(_))), "{refused:?}");
     }
 
     #[test]

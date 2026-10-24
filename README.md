@@ -37,8 +37,8 @@ agent isn't scripting a black box; it drives the identical engine — and its ed
 **staged for review**, so they never move the cut you are looking at.
 
 - 🎬 **The agent has eyes.** `get_frame`, `skim_asset` (a contact-sheet montage for
-  finding the good parts), and `preview_timeline` (the composited cut at a given time)
-  return real images the model *sees* — so it can find the right moment and confirm the
+  finding the good parts), `preview_timeline` (the composited cut at a given time) and
+  `skim_timeline` (a contact sheet of the whole cut) return real images the model *sees* — so it can find the right moment and confirm the
   cut, not guess from metadata.
 - 🧠 **Same engine, same project.** The MCP server and the webview hold the *same*
   `Project` behind one lock — no import/export round-trip, no second copy of the truth,
@@ -161,7 +161,7 @@ their speakers; the timed words on request) · `get_cut_transcript` (what the cu
 selected and where the playhead is) · `get_scopes` (waveform / parade / vectorscope / histogram numbers of a
 frame) · `get_waveform` · `get_energy` ·
 **`get_frame`** (drill-in frame) · **`skim_asset`** (contact-sheet montage) ·
-**`preview_timeline`** (the composited cut) · **`preview_svg_overlay`** (an animated title
+**`preview_timeline`** (the composited cut) · **`skim_timeline`** (a contact sheet of the cut) · **`preview_svg_overlay`** (an animated title
 as a contact sheet of moments) · `preview_svg_preset` · `validate_svg` — the bold ones return images the model
 can see, and `get_frame` / `preview_timeline` take a `region` to **zoom** into a quarter of
 the frame at full source detail. Also `get_waveform_range` · `analysis_status` · `missing_assets` ·

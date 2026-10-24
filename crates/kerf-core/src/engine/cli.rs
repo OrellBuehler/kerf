@@ -9896,19 +9896,49 @@ fn run_still(
     out: &StillOutput,
     cancel: &dyn Fn() -> bool,
 ) -> Result<Vec<u8>> {
-    let piping = matches!(out, StillOutput::JpegPipe { .. });
-    // The scopes are a measurement, not the frame the user is waiting to see: niced. Their output
-    // size is known, so the read buffer is allocated once instead of doubling through ~3 MB.
-    let (background, capacity) = match out {
-        StillOutput::Yuv444Pipe { width, height } => (true, (*width as usize) * (*height as usize) * 3),
-        _ => (false, 0),
+    // The scopes are a measurement, not the frame the user is waiting to see: niced.
+    let spawn = StillSpawn {
+        share: 1,
+        background: matches!(out, StillOutput::Yuv444Pipe { .. }),
     };
+    run_still_as(timeline, assets, opts, t, max_width, region, out, spawn, cancel)
+}
+
+/// How a still's ffmpeg is spawned: the share of the budget it takes among stills drawn side by
+/// side ([`tune_still_args_shared`]), and whether it runs niced.
+#[derive(Debug, Clone, Copy)]
+struct StillSpawn {
+    share: usize,
+    background: bool,
+}
+
+/// [`run_still`] spawned as `spawn` says.
+#[allow(clippy::too_many_arguments)]
+fn run_still_as(
+    timeline: &Timeline,
+    assets: &[Asset],
+    opts: &ExportOptions,
+    t: f64,
+    max_width: u32,
+    region: Option<Region>,
+    out: &StillOutput,
+    spawn: StillSpawn,
+    cancel: &dyn Fn() -> bool,
+) -> Result<Vec<u8>> {
+    let piping = matches!(out, StillOutput::JpegPipe { .. });
+    // The scopes' output size is known, so the read buffer is allocated once instead of doubling
+    // through ~3 MB.
+    let capacity = match out {
+        StillOutput::Yuv444Pipe { width, height } => (*width as usize) * (*height as usize) * 3,
+        _ => 0,
+    };
+    let background = spawn.background;
     let hw_used = std::cell::Cell::new(false);
     // The titles' pictures, on disk and kept for the run (and its software retry).
     let _titles = still_titles(timeline, assets, opts, t, max_width, region)?;
     let run = |o: &ExportOptions| -> Result<Vec<u8>> {
         let mut args = build_still_args(timeline, assets, o, t, max_width, region, out)?;
-        hw_used.set(tune_still_args(&mut args, assets, HostOs::CURRENT));
+        hw_used.set(tune_still_args_shared(&mut args, assets, HostOs::CURRENT, spawn.share));
         let _script = externalize_filter_complex(&mut args, "still")?;
         let bin = ffmpeg_bin();
         let mut cmd = if background { bg_command(&bin) } else { command(&bin) };
@@ -10068,12 +10098,20 @@ pub(super) fn output_bounded_cancellable(
 /// still whose every input is a proxy runs its graph and encoder on one thread too), the budget's
 /// threads otherwise. Returns whether any input still asks for hardware decode. At spawn time,
 /// not in [`build_still_args`], so the builder keeps describing exactly what was asked for.
+#[cfg(test)]
 fn tune_still_args(args: &mut Vec<String>, assets: &[Asset], os: HostOs) -> bool {
+    tune_still_args_shared(args, assets, os, 1)
+}
+
+/// [`tune_still_args`] for one of `share` stills drawn side by side (a sheet of the cut): what is
+/// not cheap takes its share of the budget's threads ([`cpu::limit_args_shared`]; a lone still is
+/// [`cpu::limit_args`] at the budget exactly).
+fn tune_still_args_shared(args: &mut Vec<String>, assets: &[Asset], os: HostOs, share: usize) -> bool {
     let tuning = tune_inputs(args, os, Reading::Frame, &facts_from_assets(assets));
     if tuning.all_cheap {
         cpu::single_frame_args(args);
     } else {
-        cpu::limit_args(args, cpu::budget_threads());
+        cpu::limit_args_shared(args, share);
     }
     tuning.hw
 }
@@ -10939,6 +10977,10 @@ mod still_cache;
 /// The scrubbed frame: cached, with a window of its neighbours drawn by one process.
 mod scrub;
 pub use scrub::{ScrubConfig, ScrubFrames, ScrubStats};
+
+/// A contact sheet of the composited cut: a still per moment, tiled.
+mod timeline_sheet;
+pub use timeline_sheet::{timeline_sheet_cancellable, timeline_sheet_cells, SheetCell, SheetClip};
 
 /// The scrub window held to the export's frames and the still's (`#[ignore]`d).
 #[cfg(test)]
