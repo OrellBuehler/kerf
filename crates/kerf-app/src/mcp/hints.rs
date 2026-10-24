@@ -84,6 +84,7 @@ pub(super) const TOOLS: &[(&str, &str, Effect)] = &[
     ("slide_clip", "Slide clip", Edit),
     ("split_remove", "Split and remove", Edit),
     ("split_remove_clips", "Split and remove clips", Edit),
+    ("apply_edits", "Apply several edits", Edit),
     ("add_track", "Add track", Edit),
     ("remove_track", "Remove track", Edit),
     ("set_track_duck", "Duck track", Set),

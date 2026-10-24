@@ -54,6 +54,14 @@
   follows the mode, re-reading its clip like `trim`; `split_remove_clips` is that
   for a group — one revision (`Split and remove left (2 clips)`), the single-clip
   `split_remove` being a group of one. All of them refuse a locked track.
+  **Several edits as one** (`project/batch.rs`): `Project::batch(label, dry_run, |p| …)` runs ordinary edit calls inside one
+  transaction — each still through `run_edit` (ripple, sync lock, locks, checks; each sees the ones before) — and records
+  them as **one** step: live, `run_edit` skips its revision while `batch` is set and the batch writes one (`label`, else the
+  one edit's label or `N edits: kinds`, plus the trimmed-sound suffix); staged, the first edit pushes the step (undo entry +
+  label, relabelled at the end) and the rest only move the proposal (`continue_staged_step`), so `undo_staged` takes back the
+  whole batch. A failure rolls everything back, a proposal the batch opened included; `dry_run` rolls back after reading the
+  working timeline (`Batch { result, before, after, label }`, `diff()`). Batches do not nest. Every write's transaction is
+  `Project::tx`: `BEGIN` at the top level, a `SAVEPOINT` inside a batch's.
   **Two counters tell the app that the project under a job is not the one it left.**
   `generation()` moves when `replace_with` swaps a project in (open / new): a job notes it
   when it resolves its inputs under the lock and drops its result if it changed. **`replace_with_saved_copy`
