@@ -161,7 +161,7 @@ Now ask the agent to work on the project you have open — _"skim the interview 
 the dead air, and drop in captions."_ It will claim a task, use the tools below, and hand
 back a reviewable result.
 
-### The tools (182)
+### The tools (183)
 
 <details>
 <summary><b>See / analyze</b></summary>
@@ -193,7 +193,7 @@ the frame at full source detail. Also `get_waveform_range` · `analysis_status` 
 `add_asset_audio` · `set_ripple_mode` · `plan_music_fit` · `fit_music` · `compose_music` (original music from a
 score, fitted to the cuts) ·
 `detach_audio` · `detach_audio_clips` · `reattach_audio` · `reattach_audio_clips` ·
-`link_clips` · `unlink_clips`
+`link_clips` · `unlink_clips` · `apply_edits` (several edits as one revision, all or nothing, with a dry run)
 </details>
 
 <details>

@@ -118,10 +118,10 @@ pub use platform::{
 };
 pub use play_plan::{PlayAhead, PlayCut, PlayRefusal};
 pub use project::{
-    AlignTo, AudioSync, AudioSyncMeasure, AudioSyncPlan, BandBalance, BandBalanceRequest, BandPlan, BandSource, ComposePlan,
-    ComposeRequest, Composed, CutTranscript, CutTranscriptInputs, DeliveryInputs, ExportedFile, FramingPlan, MissingAsset, Page,
-    PreparedText, Project, RelinkCheck, Relinked, RemovedAsset, ScoreAlign, SmartCropJob, SmartCropPlan, StemsPlaced,
-    SubsetApplied, SvgChecked, SvgLayout, SvgOverlayResult, SvgSource, SyncSide, TitleClipPatch, TitleClipPlacement,
+    AlignTo, AudioSync, AudioSyncMeasure, AudioSyncPlan, BandBalance, BandBalanceRequest, BandPlan, BandSource, Batch,
+    ComposePlan, ComposeRequest, Composed, CutTranscript, CutTranscriptInputs, DeliveryInputs, ExportedFile, FramingPlan,
+    MissingAsset, Page, PreparedText, Project, RelinkCheck, Relinked, RemovedAsset, ScoreAlign, SmartCropJob, SmartCropPlan,
+    StemsPlaced, SubsetApplied, SvgChecked, SvgLayout, SvgOverlayResult, SvgSource, SyncSide, TitleClipPatch, TitleClipPlacement,
     TitleClipResult, TitleEdited, TitleTextForm, TitleTextInputs, Untranscribed, DEFAULT_HISTORY_LIMIT, MAX_CHANNEL_KEYS,
     MAX_SYNC_SECONDS, MUSIC_TRACK, SCHEMA_VERSION, STAGED_UNDO_DEPTH, SYNC_SAMPLE_RATE, VOICEOVER_TRACK,
 };

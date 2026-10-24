@@ -423,6 +423,8 @@ pub struct Project {
     /// project ([`Project::replace_with`]) can make them the drawing fonts without reading the table
     /// under the lock. A `RefCell`, like the overrides above.
     embedded: RefCell<Vec<crate::fonts::EmbeddedFont>>,
+    /// The edits of the [`Project::batch`] in progress, so they land as one step.
+    batch: RefCell<Option<batch::BatchSteps>>,
 }
 
 /// How many steps back [`Project::undo_staged`] can take a proposal.
@@ -453,6 +455,34 @@ fn trimmed_suffix(notes: &[String]) -> String {
         String::new()
     } else {
         format!(" (trimmed sound on {})", seen.join(", "))
+    }
+}
+
+/// A write begun by [`Project::tx`]; dropped without [`Tx::commit`], it rolls back.
+struct Tx<'a> {
+    conn: &'a Connection,
+    nested: bool,
+    open: bool,
+}
+
+impl Tx<'_> {
+    fn commit(mut self) -> Result<()> {
+        self.conn
+            .execute_batch(if self.nested { "RELEASE kerf_edit" } else { "COMMIT" })?;
+        self.open = false;
+        Ok(())
+    }
+}
+
+impl Drop for Tx<'_> {
+    fn drop(&mut self) {
+        if self.open && !self.conn.is_autocommit() {
+            let _ = self.conn.execute_batch(if self.nested {
+                "ROLLBACK TO kerf_edit; RELEASE kerf_edit"
+            } else {
+                "ROLLBACK"
+            });
+        }
     }
 }
 
@@ -503,6 +533,7 @@ impl Project {
             recovery,
             history_limit: default_history_limit(),
             embedded: RefCell::new(Vec::new()),
+            batch: RefCell::new(None),
         }
     }
 
@@ -1325,7 +1356,7 @@ impl Project {
             }
         }
         asset.source_paths.clear();
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.tx()?;
         self.insert_asset(&asset)?;
         if !keep {
             self.conn
@@ -1408,7 +1439,7 @@ impl Project {
                 })
             })?;
         }
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.tx()?;
         if let Some(row) = &staged {
             let touched = !in_proposal.is_empty() || row.assets.iter().any(|c| c.asset_id == asset_id);
             if touched {
@@ -2412,6 +2443,19 @@ impl Project {
             .query_row("SELECT data FROM timeline WHERE id = 1", [], |r| r.get(0))?)
     }
 
+    /// Begin a write that is all or nothing: a transaction of its own, or a savepoint inside the one
+    /// already open (a [`Project::batch`]'s), so an edit made in a batch rolls back alone or with it.
+    fn tx(&self) -> Result<Tx<'_>> {
+        let nested = !self.conn.is_autocommit();
+        self.conn
+            .execute_batch(if nested { "SAVEPOINT kerf_edit" } else { "BEGIN DEFERRED" })?;
+        Ok(Tx {
+            conn: &self.conn,
+            nested,
+            open: true,
+        })
+    }
+
     pub fn save_timeline(&self, timeline: &Timeline) -> Result<()> {
         self.save_timeline_str(&timeline_to_json(timeline)?)
     }
@@ -2567,7 +2611,7 @@ impl Project {
                     }
                     out
                 };
-                let tx = self.conn.unchecked_transaction()?;
+                let tx = self.tx()?;
                 self.adopt_staged(row.owner.as_deref())?;
                 let out = self.edit_staged(row, label, f)?;
                 tx.commit()?;
@@ -2576,7 +2620,7 @@ impl Project {
             if self.agent_review.get() {
                 // The session opens in the same transaction as the edit it was opened for, so an
                 // edit that fails leaves no empty proposal behind.
-                let tx = self.conn.unchecked_transaction()?;
+                let tx = self.tx()?;
                 self.open_session(None, None, declared.as_deref())?;
                 let row = self.staged_row()?.ok_or(Error::NoStagedEdit)?;
                 let out = self.edit_staged(row, label, f)?;
@@ -2584,13 +2628,15 @@ impl Project {
                 return Ok(out);
             }
         }
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.tx()?;
         let mut timeline = self.timeline()?;
         let result = f(&mut timeline)?;
         let json = timeline_to_json(&timeline)?;
         self.save_timeline_str(&json)?;
-        let label = format!("{}{}", label(&result), trimmed_suffix(&self.edit_notes.take()));
-        self.record_revision(&label, self.actor, &json)?;
+        let (label, notes) = (label(&result), self.edit_notes.take());
+        if self.note_batch_step(&label, &notes, false).is_none() {
+            self.record_revision(&format!("{label}{}", trimmed_suffix(&notes)), self.actor, &json)?;
+        }
         tx.commit()?;
         Ok(result)
     }
@@ -2723,8 +2769,11 @@ impl Project {
         let mut timeline: Timeline = serde_json::from_str(&row.timeline)?;
         let result = f(&mut timeline)?;
         let json = timeline_to_json(&timeline)?;
-        let label = format!("{}{}", label(&result), trimmed_suffix(&self.edit_notes.take()));
-        self.push_staged_step(&row, &json, &row.assets, label)?;
+        let (label, notes) = (label(&result), self.edit_notes.take());
+        match self.note_batch_step(&label, &notes, true) {
+            Some(false) => self.continue_staged_step(&json)?,
+            _ => self.push_staged_step(&row, &json, &row.assets, format!("{label}{}", trimmed_suffix(&notes)))?,
+        }
         Ok(result)
     }
 
@@ -2927,7 +2976,7 @@ impl Project {
         };
         let mut edits = row.edits;
         let label = edits.pop().unwrap_or_else(|| "edit".to_string());
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.tx()?;
         self.conn.execute(
             "UPDATE staged SET timeline = ?1, assets = ?2, edits = ?3, updated_at = ?4 WHERE id = 1",
             params![timeline, assets, serde_json::to_string(&edits)?, Utc::now().to_rfc3339()],
@@ -2983,7 +3032,7 @@ impl Project {
             (None, [one]) => one.clone(),
             (None, edits) => format!("Agent edit ({} of {} changes)", diff.entries.len(), edits.len()),
         };
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.tx()?;
         if !diff.is_empty() {
             self.save_timeline_str(&landing)?;
             self.record_revision(&label, EditSource::Agent, &landing)?;
@@ -3059,7 +3108,7 @@ impl Project {
             Some(note) => format!("{note} ({applied} of {total})"),
             None => format!("Agent edit ({applied} of {total} changes)"),
         };
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.tx()?;
         if merged_json != live_json {
             self.save_timeline_str(&merged_json)?;
             self.record_revision(&label, EditSource::Agent, &merged_json)?;
@@ -3250,7 +3299,7 @@ impl Project {
                 row.task_id = None;
             }
         }
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.tx()?;
         self.conn.execute(
             "INSERT INTO staged (id, base_seq, base, timeline, edits, task_id, note, created_at, updated_at, owner, assets)
              VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
@@ -3362,7 +3411,7 @@ impl Project {
         let snapshot = snapshot.ok_or(Error::RevisionNotFound(seq))?;
         let timeline: Timeline = serde_json::from_str(&snapshot)?;
         self.refuse_removed_media(&timeline)?;
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.tx()?;
         self.save_timeline_str(&snapshot)?;
         self.set_head(seq)?;
         tx.commit()?;
@@ -5732,7 +5781,7 @@ impl Project {
     /// not after it was deleted.
     pub fn remove_task(&self, id: Uuid) -> Result<()> {
         self.require_task(id)?;
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.tx()?;
         if self.staged_row()?.is_some_and(|r| r.task_id == Some(id)) {
             self.discard_staged()?;
         }
@@ -6249,7 +6298,7 @@ impl Project {
     fn stage_asset_projection(&self, mut asset: Asset, projection: Option<Projection>) -> Result<Asset> {
         let declared = self.agent_owner.borrow().clone();
         let stored = self.stored_asset(asset.id)?.ok_or(Error::AssetNotFound(asset.id))?;
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.tx()?;
         if !self.staged_exists()? {
             self.open_session(None, None, declared.as_deref())?;
         }
@@ -7691,6 +7740,8 @@ mod store;
 pub use store::{backup_path as schema_backup_path, SCHEMA_VERSION};
 mod exports;
 pub use exports::{DeliveryInputs, ExportedFile};
+mod batch;
+pub use batch::Batch;
 mod templates;
 mod title_clips;
 pub use title_clips::{TitleClipPatch, TitleClipPlacement, TitleClipResult, TitleEdited};

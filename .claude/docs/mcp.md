@@ -519,6 +519,20 @@ exports (a file outside the project) and `delete_proxy` are. Reads and previews 
 `selected_asset_id`, with `age_secs` and `stale`; before any report (headless) it is
 `{reported: false, stale: true, note}`. The `instructions` point "this clip" / "here" at it.
 
+**Batches (`mcp/batch.rs`).** `apply_edits { ops: [{tool, args}], dry_run?, label? }` runs a plan of edits as **one**
+revision (one staged step with review on) through `Project::batch` (`core-project.md`), all or nothing. `tool` must be in
+`BATCHABLE` — the quick edits that change only the cut (the editing, linked, look, keyframe, mix, overlay and marker tools,
+`set_delivery_format`, `fit_music`, `clear_captions`, `set_grade` without a `lut_path`); a long job, a file, an import, captions,
+SVG titles, staging, history or settings is refused naming the op. Each op is checked before the lock like a call of its own
+(`args::unknown_argument` against that tool's schema, at most 200 ops, `EditOp` itself `deny_unknown_fields`) and runs the
+tool's **own body**: every batchable tool is `edit(|p| Self::<tool>_op(p, params))`, and the batch reads `args` into the
+same parameter struct and calls the same `_op`, so `ripple` / `link` and every refusal are the tool's. A failing op is the
+tool's error with `op K (tool): ` in front (same code). A string `"$K.path"` in `args` is replaced by that value of op K's
+answer (an earlier op; keys or indices; `"$$…"` is a literal `$`). The answer: `results` (each op's answer: one clip whole,
+the clips inside a larger answer cut to id / asset / span by `compact`), `timeline_brief`, the `label` and `staged`, or for `dry_run` the `diff` (`diff_page` of
+before → after) — a dry run keeps nothing and emits no `project-changed`. No Tauri command: the GUI's gestures already write
+one edit each, and its multi-clip edits have their own commands.
+
 ## Prompts and tool sets (`mcp/prompts.rs`, `mcp/toolsets.rs`)
 
 **Prompts.** `get_info` advertises `prompts`; `list_prompts` / `get_prompt` (written by hand, not rmcp's prompt macros)
@@ -722,7 +736,7 @@ Every tool, by purpose (a test pins that this list names each registered tool, a
 - **Editing the cut**: `cut_clip`, `add_clip_to_timeline`, `split_at`, `trim`, `reorder`, `move_clip`, `move_clips`,
   `ripple_delete`, `cut_clip_range`, `roll_edit`, `slip_clip`, `slide_clip`, `split_remove`, `split_remove_clips`, `remove`,
   `remove_clips`, `duplicate_clips`, `concatenate`, `remove_silence`, `snap_to_beats`, `sync_clips_by_audio`, `smart_crop`, `add_track`,
-  `remove_track`, `get_ripple_mode`, `set_ripple_mode`.
+  `remove_track`, `get_ripple_mode`, `set_ripple_mode`, `apply_edits`.
 - **Linked picture and sound**: `extract_audio`, `add_asset_audio`, `detach_audio`, `detach_audio_clips`, `reattach_audio`,
   `reattach_audio_clips`, `link_clips`, `unlink_clips`.
 - **Clip look and sound**: `set_volume`, `set_fade`, `set_speed`, `set_transform`, `set_transform_at`, `set_color`, `set_transition`,

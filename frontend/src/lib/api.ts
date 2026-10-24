@@ -5217,7 +5217,7 @@ function harnessTokenProblem(): string | null {
 
 /** The desktop app reads these from `mcp/toolsets.rs`; the harness shows the same sets. */
 const HARNESS_TOOL_SETS: McpToolSet[] = [
-	{ name: 'core', description: 'Look at the media and the cut, cut and arrange, volume / fades / transitions, review and history, jobs', tools: 59 },
+	{ name: 'core', description: 'Look at the media and the cut, cut and arrange, volume / fades / transitions, review and history, jobs', tools: 60 },
 	{ name: 'analysis', description: 'Transcripts, speakers, filler words, waveforms, scopes, speech model, proxies, audio sync', tools: 18 },
 	{ name: 'clips', description: 'Speed, transform, colour and grade, effects, masks, linked picture and sound', tools: 17 },
 	{ name: 'keyframes', description: 'Keyframes, per-property animation and 360 reframing', tools: 12 },
