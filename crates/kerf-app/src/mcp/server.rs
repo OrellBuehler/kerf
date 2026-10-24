@@ -56,7 +56,22 @@ impl std::fmt::Debug for McpConfig {
 
 impl McpConfig {
     pub fn from_settings(settings: &Settings) -> Self {
-        Self::resolve(settings, std::env::var(ENV_ADDR).ok())
+        let config = Self::resolve(settings, std::env::var(ENV_ADDR).ok());
+        match OVERRIDES.get() {
+            Some(overrides) => config.overridden(overrides),
+            None => config,
+        }
+    }
+
+    /// What `kerf-app --headless` holds the server to: on, behind a token, at its own address and
+    /// token when it names them. Applied to every config, so a settings change cannot undo it.
+    fn overridden(self, overrides: &Overrides) -> Self {
+        Self {
+            enabled: true,
+            require_token: true,
+            addr: overrides.addr.clone().unwrap_or(self.addr),
+            token: overrides.token.clone().or(self.token),
+        }
     }
 
     /// [`McpConfig::from_settings`] with the environment passed in (so a test need not set it).
@@ -79,6 +94,22 @@ impl McpConfig {
             require_token: settings.mcp_require_token,
             token: settings.mcp_token.clone().or_else(run_token),
         }
+    }
+}
+
+/// The headless run's own address (`--mcp-addr`) and token (`KERF_MCP_TOKEN`, never stored).
+#[derive(Default)]
+pub(crate) struct Overrides {
+    pub addr: Option<String>,
+    pub token: Option<String>,
+}
+
+static OVERRIDES: OnceLock<Overrides> = OnceLock::new();
+
+/// Hold the server to `overrides` for the rest of the process. Call it before [`start`].
+pub(crate) fn set_overrides(overrides: Overrides) {
+    if OVERRIDES.set(overrides).is_err() {
+        tracing::warn!("the MCP overrides were set twice");
     }
 }
 
@@ -305,19 +336,23 @@ struct Status {
     running: bool,
     error: Option<String>,
     addr: Option<String>,
+    /// Where the listener is bound: the real port of a `:0` address.
+    bound: Option<std::net::SocketAddr>,
 }
 
 static STATUS: Mutex<Status> = Mutex::new(Status {
     running: false,
     error: None,
     addr: None,
+    bound: None,
 });
 
-fn set_status(running: bool, error: Option<String>, addr: &str) {
+fn set_status(running: bool, error: Option<String>, addr: &str, bound: Option<std::net::SocketAddr>) {
     *STATUS.lock().unwrap_or_else(|e| e.into_inner()) = Status {
         running,
         error,
         addr: Some(addr.to_string()),
+        bound,
     };
 }
 
@@ -474,7 +509,7 @@ fn set_token_problem(problem: Option<String>) {
 /// they stand. A token that cannot be made leaves none (the server then refuses to start while one
 /// is required); one that cannot be saved is kept for this run and the problem is reported.
 fn with_token(app: &Shell, mut settings: Settings) -> Settings {
-    if settings.mcp_token.is_some() {
+    if settings.mcp_token.is_some() || OVERRIDES.get().is_some_and(|o| o.token.is_some()) {
         return settings;
     }
     match generate_token() {
@@ -515,6 +550,50 @@ pub(crate) fn start(app: Shell, project: Arc<Mutex<Project>>) {
     }
     super::activity::pump_project();
     tauri::async_runtime::spawn(supervise(move || KerfMcp::new(project.clone(), app.clone()), rx));
+}
+
+/// Wait until the listener is up (where it is bound) or has failed (why), at most `timeout`.
+pub(crate) async fn wait_listening(timeout: std::time::Duration) -> Result<std::net::SocketAddr, String> {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let now = status();
+        if let (true, Some(bound)) = (now.running, now.bound) {
+            return Ok(bound);
+        }
+        if let Some(error) = now.error {
+            return Err(error);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err("the agent endpoint did not come up in time".to_string());
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// The token the server checks now (the headless run's, the stored one or this run's own).
+pub(crate) fn current_token() -> Option<String> {
+    CONTROL.get().and_then(|tx| tx.borrow().token.clone())
+}
+
+/// Switch the listener off and wait (at most `timeout`) until it is closed, its sessions with it.
+pub(crate) async fn stop(timeout: std::time::Duration) {
+    let Some(tx) = CONTROL.get() else { return };
+    tx.send_modify(|config| config.enabled = false);
+    let deadline = tokio::time::Instant::now() + timeout;
+    while status().running && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
+/// Ask every agent job to stop and wait (at most `timeout`) for them to end; how many did not.
+pub(crate) async fn finish_jobs(timeout: std::time::Duration) -> usize {
+    let jobs = super::jobs::jobs();
+    jobs.cancel_all();
+    let deadline = tokio::time::Instant::now() + timeout;
+    while jobs.running() > 0 && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    jobs.running()
 }
 
 /// Tell the running server the settings moved. A patch that carries no `mcp_*` field changes
@@ -589,6 +668,7 @@ pub fn session_alive(id: &str) -> bool {
 }
 
 struct Running {
+    bound: std::net::SocketAddr,
     sessions: Arc<LocalSessionManager>,
     stop: CancellationToken,
     task: tauri::async_runtime::JoinHandle<std::io::Result<()>>,
@@ -637,16 +717,16 @@ where
         if config.enabled {
             match launch(&config, factory.clone(), auth.clone()).await {
                 Ok(up) => {
-                    set_status(true, None, &config.addr);
+                    set_status(true, None, &config.addr, Some(up.bound));
                     running = Some(up);
                 }
                 Err(e) => {
                     tracing::error!(error = %e, addr = %config.addr, "MCP server did not start");
-                    set_status(false, Some(describe_server_error(&config.addr, &e)), &config.addr);
+                    set_status(false, Some(describe_server_error(&config.addr, &e)), &config.addr, None);
                 }
             }
         } else {
-            set_status(false, None, &config.addr);
+            set_status(false, None, &config.addr, None);
         }
         // A new address, a new token (or the requirement for one) and the server being switched on
         // or off all restart the listener. A server that is not up retries on any change.
@@ -705,15 +785,21 @@ where
         .nest_service("/mcp", service)
         .layer(middleware::from_fn_with_state(auth, require_bearer));
     let listener = tokio::net::TcpListener::bind(&config.addr).await?;
+    let bound = listener.local_addr()?;
     register_sessions(&sessions);
-    tracing::info!(addr = %config.addr, token = config.require_token, "kerf MCP server listening on http://{}/mcp", config.addr);
+    tracing::info!(addr = %config.addr, %bound, token = config.require_token, "kerf MCP server listening on http://{}/mcp", config.addr);
     let shutdown = stop.clone();
     let task = tauri::async_runtime::spawn(async move {
         axum::serve(listener, router)
             .with_graceful_shutdown(shutdown.cancelled_owned())
             .await
     });
-    Ok(Running { sessions, stop, task })
+    Ok(Running {
+        bound,
+        sessions,
+        stop,
+        task,
+    })
 }
 
 #[cfg(test)]
@@ -724,8 +810,8 @@ mod tests {
     fn a_listener_is_only_reported_up_for_the_address_it_was_started_on() {
         let up = Status {
             running: true,
-            error: None,
             addr: Some("127.0.0.1:7777".into()),
+            ..Status::default()
         };
         assert_eq!(listener_state(&up, "127.0.0.1:7777"), (true, None));
         assert_eq!(
@@ -734,9 +820,9 @@ mod tests {
             "not yet restarted for the new one"
         );
         let failed = Status {
-            running: false,
             error: Some("in use".into()),
             addr: Some("127.0.0.1:7777".into()),
+            ..Status::default()
         };
         assert_eq!(listener_state(&failed, "127.0.0.1:7777"), (false, Some("in use".into())));
         assert_eq!(
@@ -1256,6 +1342,43 @@ mod tests {
         drop(tx);
         task.await.unwrap();
         assert!(!listening(&b), "the server stops with its supervisor");
+    }
+
+    /// A `:0` address binds a free port, and the status says which: what a headless run reports.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_port_zero_bind_reports_the_port_it_got() {
+        let _turn = ONE_AT_A_TIME.lock().await;
+        // The test before may have left its listener's status behind.
+        set_status(false, None, "127.0.0.1:0", None);
+        let (tx, rx) = tokio::sync::watch::channel(config_for("127.0.0.1:0", &"z".repeat(40), true));
+        let task = tokio::spawn(supervise(|| Nothing, rx));
+        let bound = wait_listening(std::time::Duration::from_secs(5)).await.expect("up");
+        assert_ne!(bound.port(), 0);
+        assert!(listening(&bound.to_string()));
+        drop(tx);
+        task.await.unwrap();
+    }
+
+    #[test]
+    fn the_headless_overrides_hold_whatever_the_settings_say() {
+        let off = Settings {
+            mcp_enabled: false,
+            mcp_require_token: false,
+            mcp_addr: Some("127.0.0.1:9000".into()),
+            mcp_token: Some("s".repeat(40)),
+            ..Settings::default()
+        };
+        let named = Overrides {
+            addr: Some("127.0.0.1:0".into()),
+            token: Some("e".repeat(40)),
+        };
+        let config = McpConfig::resolve(&off, None).overridden(&named);
+        assert!(config.enabled && config.require_token);
+        assert_eq!(config.addr, "127.0.0.1:0");
+        assert_eq!(config.token, Some("e".repeat(40)), "the environment's token wins");
+        let config = McpConfig::resolve(&off, Some("127.0.0.1:8000".into())).overridden(&Overrides::default());
+        assert_eq!(config.addr, "127.0.0.1:8000", "KERF_MCP_ADDR wins over the stored address");
+        assert_eq!(config.token, Some("s".repeat(40)), "else the stored token");
     }
 
     /// One MCP `initialize` over a plain socket: the session id the server hands out, if it lets us in.

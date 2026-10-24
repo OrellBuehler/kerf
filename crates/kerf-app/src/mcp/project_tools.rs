@@ -173,8 +173,9 @@ pub(super) const READABLE: [&str; 6] = [
 ];
 pub(super) const WRITABLE: [&str; 5] = ["auto_analysis", "cpu_percent", "proxy_size", "preview_source", "time_display"];
 
-/// The settings an agent can see, from the stored file and what the engine has in force.
-pub(super) fn readable_settings(stored: &settings::Settings) -> serde_json::Value {
+/// The settings an agent can see, from the stored file and what the engine has in force; `review`
+/// is the review switch in force, which a headless run may hold apart from the stored one.
+pub(super) fn readable_settings(stored: &settings::Settings, review: bool) -> serde_json::Value {
     let mut all = serde_json::to_value(stored).unwrap_or_default();
     if let (Some(all), Ok(serde_json::Value::Object(view))) = (
         all.as_object_mut(),
@@ -183,6 +184,7 @@ pub(super) fn readable_settings(stored: &settings::Settings) -> serde_json::Valu
         for (k, v) in view {
             all.insert(k, v);
         }
+        all.insert("agent_review".to_string(), review.into());
     }
     let picked: serde_json::Map<String, serde_json::Value> = READABLE
         .iter()
@@ -434,7 +436,7 @@ impl KerfMcp {
                        you cannot change this). Nothing else of the user's settings is visible or changeable from here."
     )]
     fn get_settings(&self) -> Result<String, McpError> {
-        json(&readable_settings(&settings::load(&self.app)))
+        json(&readable_settings(&settings::load(&self.app), settings::agent_review()))
     }
 
     #[tool(
@@ -470,7 +472,7 @@ impl KerfMcp {
         if let Err(e) = self.app.emit("settings-changed", settings::SettingsView::current(&stored)) {
             tracing::warn!(error = %e, "failed to emit settings-changed");
         }
-        json(&readable_settings(&stored))
+        json(&readable_settings(&stored, settings::agent_review()))
     }
 }
 
@@ -629,7 +631,7 @@ mod tests {
             mcp_addr: Some("127.0.0.1:9000".to_string()),
             ..settings::Settings::default()
         };
-        let view = readable_settings(&stored);
+        let view = readable_settings(&stored, true);
         let object = view.as_object().unwrap();
         for key in object.keys() {
             assert!(READABLE.contains(&key.as_str()), "{key} leaked");
@@ -732,7 +734,7 @@ mod tests {
         assert_eq!(read.proxy_size, kerf_core::ProxySize::W1080);
         assert_eq!(read.preview_source, kerf_core::PreviewSource::Original);
         assert_eq!(read.time_display, settings::TimeDisplay::Seconds);
-        let seen = readable_settings(&settings::Settings::default());
+        let seen = readable_settings(&settings::Settings::default(), true);
         assert!(seen.get("time_display").is_some(), "the display mode is readable: {seen}");
     }
 }

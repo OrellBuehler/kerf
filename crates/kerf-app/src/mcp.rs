@@ -41,7 +41,9 @@ mod server;
 mod templates;
 
 use jobs::Run;
-pub(crate) use server::{bind_problem, start};
+pub(crate) use server::{
+    bind_problem, client_url, current_token, finish_jobs, set_overrides, start, stop, wait_listening, Overrides,
+};
 pub use server::{
     check_addr, check_token, connection_info, endpoint_url, generate_token, server_error, settings_changed, ConnectionInfo,
     DEFAULT_ADDR,

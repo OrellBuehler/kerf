@@ -15,6 +15,7 @@
 
 mod editor_context;
 mod gpu_preview;
+mod headless;
 mod mcp;
 mod mcp_commands;
 mod popout;
@@ -264,6 +265,26 @@ impl AppState {
     pub(crate) fn begin_export(&self) -> impl Fn() -> bool + Send + Sync + 'static {
         self.export_cancel.begin()
     }
+
+    /// Press every Stop at once: every long job running now ends (a headless run shutting down).
+    fn stop_all(&self) {
+        for stop in [
+            &self.export_cancel,
+            &self.analysis_cancel,
+            &self.levels_cancel,
+            &self.sync_cancel,
+            &self.voiceover_cancel,
+            &self.music_cancel,
+            &self.bands_cancel,
+            &self.stems_cancel,
+            &self.model_cancel,
+            &self.cover_cancel,
+            &self.smart_crop_cancel,
+            &self.import_stop,
+        ] {
+            stop.stop();
+        }
+    }
 }
 
 /// Lock the shared project for a GUI command, attributing edits to the user;
@@ -333,12 +354,12 @@ fn parse_transition(kind: Option<String>, duration: Option<f64>) -> CmdResult<Op
 /// token) and their backups, and the logs. Filled once at startup ([`set_app_dirs`]).
 static APP_DIRS: std::sync::OnceLock<Vec<(std::path::PathBuf, String)>> = std::sync::OnceLock::new();
 
-fn set_app_dirs(app: &AppHandle) {
+fn set_app_dirs(app: &impl Host) {
     let mut dirs = Vec::new();
-    if let Ok(config) = app.path().app_config_dir() {
+    if let Some(config) = app.config_dir() {
         dirs.push((config, "Kerf's settings".to_string()));
     }
-    if let Ok(logs) = log_dir_path(app) {
+    if let Some(logs) = log_dir_path(app) {
         dirs.push((logs, "Kerf's logs".to_string()));
     }
     let _ = crate::APP_DIRS.set(dirs);
@@ -4807,15 +4828,15 @@ async fn write_text_file(path: String, contents: String) -> CmdResult<String> {
 
 /// Where the logfiles live: `<app data dir>/logs`. The one place this is
 /// decided, so `init_logging` and `reveal_logs` cannot disagree.
-fn log_dir_path(app: &AppHandle) -> tauri::Result<std::path::PathBuf> {
-    app.path().app_data_dir().map(|dir| dir.join("logs"))
+fn log_dir_path(app: &impl Host) -> Option<std::path::PathBuf> {
+    app.data_dir().map(|dir| dir.join("logs"))
 }
 
 /// Open the log directory in the OS file manager so users can attach the file.
 #[tauri::command(async)]
 fn reveal_logs(app: AppHandle) -> CmdResult<()> {
     use tauri_plugin_opener::OpenerExt;
-    let dir = log_dir_path(&app).map_err(|e| e.to_string())?;
+    let dir = log_dir_path(&app).ok_or("no data directory for the logs")?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     app.opener()
         .open_path(dir.to_string_lossy().into_owned(), None::<&str>)
@@ -4953,18 +4974,26 @@ where
     tracing_subscriber::fmt::layer().with_ansi(false).with_writer(appender)
 }
 
-/// Install the global tracing subscriber: always to stdout, and — when the
-/// log directory (`<app data dir>/logs`) is writable — to a daily-rolling
-/// `kerf.<date>.log` there so users hitting an issue can attach it.
+/// Install the global tracing subscriber: always to the console (stdout, or stderr for a headless
+/// run, whose stdout is its ready line), and — when the log directory (`<app data dir>/logs`) is
+/// writable — to a daily-rolling `kerf.<date>.log` there so users hitting an issue can attach it.
 /// Level is `info` by default; override with `RUST_LOG` (e.g. `RUST_LOG=debug`).
-fn init_logging(app: &AppHandle) {
+fn init_logging(log_dir: Option<std::path::PathBuf>, to_stderr: bool) {
+    use std::io::IsTerminal;
+    use tracing_subscriber::fmt::writer::BoxMakeWriter;
     use tracing_subscriber::prelude::*;
 
     let filter =
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let stdout = tracing_subscriber::fmt::layer().with_writer(std::io::stdout);
+    let stdout = if to_stderr {
+        tracing_subscriber::fmt::layer()
+            .with_ansi(std::io::stderr().is_terminal())
+            .with_writer(BoxMakeWriter::new(std::io::stderr))
+    } else {
+        tracing_subscriber::fmt::layer().with_writer(BoxMakeWriter::new(std::io::stdout))
+    };
 
-    let file = log_dir_path(app).ok().and_then(|dir| {
+    let file = log_dir.and_then(|dir| {
         std::fs::create_dir_all(&dir).ok()?;
         Some((file_layer(file_appender(&dir).ok()?), dir))
     });
@@ -5289,6 +5318,24 @@ fn on_second_launch(app: &AppHandle, argv: Vec<String>, cwd: String) {
     }
 }
 
+/// The app's compiled-in configuration: the one `generate_context!`, shared by the window and the
+/// headless run (which reads only its identifier).
+fn context() -> tauri::Context {
+    tauri::generate_context!()
+}
+
+/// `kerf-app --headless …`: the MCP server with no window, until a signal; the exit code. `None`
+/// when the command line does not ask for it (the desktop app then runs).
+pub fn headless_main() -> Option<i32> {
+    let argv: Vec<String> = std::env::args_os().map(|a| a.to_string_lossy().into_owned()).collect();
+    if !headless::requested(&argv) {
+        return None;
+    }
+    // Before a thread exists: this sets environment variables.
+    let bundled_ffmpeg = use_bundled_ffmpeg();
+    Some(headless::main(&argv, &bundled_ffmpeg))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Before a thread exists: this sets environment variables.
@@ -5325,7 +5372,7 @@ pub fn run() {
         .setup(move |app| {
             // Logging needs the resolved app data directory, so set it up here
             // (before anything else in setup) rather than at the top of `run`.
-            init_logging(app.handle());
+            init_logging(log_dir_path(app.handle()), false);
             install_panic_hook();
             set_app_dirs(app.handle());
             // The untitled project moves into a crash-recovery file before anything can edit it.
@@ -5614,7 +5661,7 @@ pub fn run() {
             popout::popout_focus,
             popout::popout_move
         ])
-        .build(tauri::generate_context!())
+        .build(context())
         .expect("error while building Kerf")
         .run(|app, event| {
             // The logfile's last line then says whether the end was a clean exit

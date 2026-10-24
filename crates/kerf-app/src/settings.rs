@@ -334,7 +334,7 @@ fn sibling(path: &Path, name: &str) -> PathBuf {
 /// never a truncated one: write a temp file beside it, fsync, rename over.
 /// `std::fs::rename` replaces an existing file on every platform (Windows uses
 /// `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`).
-fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
 
     if let Some(parent) = path.parent() {

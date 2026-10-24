@@ -93,6 +93,9 @@ bunx @tauri-apps/cli@2 dev   --config crates/kerf-app/tauri.conf.json
 bunx @tauri-apps/cli@2 build --config crates/kerf-app/tauri.conf.json
 cargo run -p kerf-app        # also works; runs the frontend dev command first
 
+# MCP without a window (CI, servers): ready line on stdout, logs on stderr
+cargo run -p kerf-app --no-default-features -- --headless --mcp-addr 127.0.0.1:7777 [--project x.kerf]
+
 # MCP: run the app, then
 #   claude mcp add --transport http kerf http://127.0.0.1:7777/mcp \
 #     --header "Authorization: Bearer <token>"   (Settings > Agent shows it; KERF_MCP_ADDR overrides the address)
@@ -112,7 +115,8 @@ touch an installed Kerf's settings — see `.claude/docs/build-and-ci.md`.
 
 - **Engine first, then surfaces.** New capability lands in `kerf-core`, then as a Tauri
   command (`lib.rs`), an MCP tool (`mcp.rs`), the `api.ts` bridge + its browser-harness
-  fallback, and `types.ts`. Serde structs ↔ `types.ts` stay in sync; JSON is snake_case.
+  fallback, and `types.ts`. Serde structs ↔ `types.ts` stay in sync; JSON is snake_case. Code the
+  MCP server reaches takes a `Shell` / `&impl Host` (`shell.rs`), never an `AppHandle`: it also runs headless.
 - **Never hold the project lock across media work.** Resolve inputs under the lock,
   release it, run ffmpeg / decode / inference, re-lock to apply (`*_inputs` → static
   `decode_*` / `sample_*` → `apply_*`). No Tauri command runs on the main thread: quick
