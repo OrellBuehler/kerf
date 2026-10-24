@@ -678,7 +678,10 @@ mod tests {
         let (x, y, w, h) = titled.layers[0].rect_px(640, 360).unwrap();
         let differs = |px: u32, py: u32| bare.pixel(px, py) != with_title.pixel(px, py);
         let inside = (y as u32..y as u32 + h).flat_map(|py| (x as u32..x as u32 + w).map(move |px| (px, py)));
-        assert!(inside.filter(|&(px, py)| differs(px, py)).count() > 500, "the headline is drawn");
+        assert!(
+            inside.filter(|&(px, py)| differs(px, py)).count() > 500,
+            "the headline is drawn"
+        );
         assert!((0..640).all(|px| !differs(px, 10)), "nothing above the headline's band moves");
 
         for (name, format) in [("t.png", "png"), ("t.jpg", "jpeg"), ("t.webp", "webp")] {

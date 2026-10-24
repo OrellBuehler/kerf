@@ -126,10 +126,19 @@ impl Project {
             return Ok(0);
         }
         let live = self.timeline()?;
-        let mut titles: Vec<String> = live.title_sources().chain(live.thumbnail_sources()).map(str::to_lowercase).collect();
+        let mut titles: Vec<String> = live
+            .title_sources()
+            .chain(live.thumbnail_sources())
+            .map(str::to_lowercase)
+            .collect();
         if let Some(row) = self.staged_row()? {
             let proposed: crate::model::Timeline = serde_json::from_str(&row.timeline)?;
-            titles.extend(proposed.title_sources().chain(proposed.thumbnail_sources()).map(str::to_lowercase));
+            titles.extend(
+                proposed
+                    .title_sources()
+                    .chain(proposed.thumbnail_sources())
+                    .map(str::to_lowercase),
+            );
         }
         let mut gone = 0;
         let mut delete = self.conn.prepare("DELETE FROM fonts WHERE sha256 = ?1")?;

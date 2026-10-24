@@ -247,11 +247,21 @@ pub fn render_headline(params: &SvgPresetParams) -> String {
     let mut body = String::new();
     let mut top = pad;
     for line in &lines {
-        body.push_str(&Line::new(width / 2.0, top + 0.88 * SIZE, SIZE, &ctx.color).bold().extra(&big).render(&ctx, &esc(line)));
+        body.push_str(
+            &Line::new(width / 2.0, top + 0.88 * SIZE, SIZE, &ctx.color)
+                .bold()
+                .extra(&big)
+                .render(&ctx, &esc(line)),
+        );
         top += 1.12 * SIZE;
     }
     if let Some(sub) = &ctx.subtitle {
-        body.push_str(&Line::new(width / 2.0, top + 0.95 * sub_size, sub_size, &ctx.accent).bold().extra(&small).render(&ctx, &esc(sub)));
+        body.push_str(
+            &Line::new(width / 2.0, top + 0.95 * sub_size, sub_size, &ctx.accent)
+                .bold()
+                .extra(&small)
+                .render(&ctx, &esc(sub)),
+        );
         top += 1.3 * sub_size;
     }
     let height = top + pad;

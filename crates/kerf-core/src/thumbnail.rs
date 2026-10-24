@@ -273,12 +273,7 @@ fn clean_windows(timeline: &Timeline) -> Vec<(f64, f64)> {
 /// The times worth looking at: the middle of each shot (a clip's clean window split at the scene
 /// changes of its footage, `scenes` by asset, in source seconds), topped up with times spread evenly
 /// through the clean windows, all inside `range`, at most `max`, in time order. Pure.
-pub fn candidate_times(
-    timeline: &Timeline,
-    scenes: &SceneChanges,
-    range: Option<(f64, f64)>,
-    max: usize,
-) -> Vec<f64> {
+pub fn candidate_times(timeline: &Timeline, scenes: &SceneChanges, range: Option<(f64, f64)>, max: usize) -> Vec<f64> {
     let cut = timeline.for_render();
     let (lo, hi) = range.unwrap_or((0.0, cut.duration()));
     let windows: Vec<(f64, f64)> = clean_windows(&cut)

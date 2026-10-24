@@ -571,7 +571,10 @@ fn a_v8_file_is_backed_up_stamped_v9_and_keeps_its_animated_title() {
         .unwrap()
         .pragma_update(None, "user_version", 8)
         .unwrap();
-    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 8), vec![8, 9, 10, 11, 12]);
+    assert_eq!(
+        store::pending_steps(&Connection::open(&path).unwrap(), 8),
+        vec![8, 9, 10, 11, 12]
+    );
 
     let project = Project::open(&path).unwrap();
     assert_eq!(version_of(&path), SCHEMA_VERSION);
@@ -709,7 +712,10 @@ fn a_v9_file_is_backed_up_stamped_v10_and_its_assets_read_as_range_unknown() {
         .unwrap()
         .pragma_update(None, "user_version", 9)
         .unwrap();
-    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 9), vec![9, 10, 11, 12]);
+    assert_eq!(
+        store::pending_steps(&Connection::open(&path).unwrap(), 9),
+        vec![9, 10, 11, 12]
+    );
 
     let project = Project::open(&path).unwrap();
     assert_eq!(version_of(&path), SCHEMA_VERSION);

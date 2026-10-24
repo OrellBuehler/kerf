@@ -7531,9 +7531,7 @@ pub use title_clips::{TitleClipPatch, TitleClipPlacement, TitleClipResult, Title
 mod title_text;
 pub use title_text::{PreparedText, TitleTextForm, TitleTextInputs};
 mod thumbnails;
-pub use thumbnails::{
-    prepare_thumbnail, PreparedThumbnail, ThumbnailBase, ThumbnailLayerSpec, ThumbnailResult, ThumbnailSpec,
-};
+pub use thumbnails::{prepare_thumbnail, PreparedThumbnail, ThumbnailBase, ThumbnailLayerSpec, ThumbnailResult, ThumbnailSpec};
 
 /// A window onto a long, ordered list (the edit history, the task queue): `offset` of the
 /// **newest** entries are skipped and up to `limit` of the ones before them returned, kept in
