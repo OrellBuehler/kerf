@@ -284,7 +284,7 @@ to report and the panel judges from the age instead of the green dot it used to
 show unconditionally). `mcp_connection_info` (URL, token, `token_problem` — why the token is not what it should be, or `null` —, `running` / `error`
 **for the address now configured** (`listener_state`: until the supervisor has restarted for a new address, the old one's
 state says nothing about it, so `running` is false and `error` empty, which is what lets the page wait for the restart),
-`claude_code_command` with the bearer header and a generic `mcpServers` JSON snippet; `mcp_commands.rs`), `regenerate_mcp_token` (the old token stops working at once)
+`claude_code_command` with the bearer header, a generic `mcpServers` JSON snippet and `tool_sets` for a `?tools=` URL; `mcp_commands.rs`), `regenerate_mcp_token` (the old token stops working at once)
 and `set_mcp_settings { mcp_enabled?, mcp_addr?, mcp_require_token?, agent_review? }` (refuses any other key; a network
 address needs the token; `settings::update` restarts the listener when the address or switch moves, see `mcp.md`) are the Agent
 settings page's commands — the settings file holds `agent_review`, `mcp_enabled`, `mcp_addr`, `mcp_require_token` and

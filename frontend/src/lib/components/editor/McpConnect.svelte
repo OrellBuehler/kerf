@@ -6,8 +6,10 @@
 	import IconBtn from './IconBtn.svelte';
 	import Btn from './Btn.svelte';
 	import ChoiceChips from './ChoiceChips.svelte';
+	import Chip from './Chip.svelte';
 	import { toast } from '#lib/notifications.svelte';
 	import { clientHelps, type ClientHelp } from '#lib/mcp-clients';
+	import { withToolSets } from '#lib/mcp-connect';
 	import { maskSecret } from '#lib/mcp-ui';
 	import type { McpConnectionInfo } from '#lib/types';
 
@@ -17,7 +19,15 @@
 		compact = false
 	}: { info: McpConnectionInfo; revealed?: boolean; compact?: boolean } = $props();
 
-	const helps = $derived(clientHelps(info));
+	// The tool sets to ask for (`?tools=`); none is every tool. Only the snippets change: it is the client's choice.
+	let sets = $state<string[]>([]);
+	const shown = $derived(withToolSets(info, sets));
+	const helps = $derived(clientHelps(shown));
+
+	function toggle(name: string) {
+		const next = sets.includes(name) ? sets.filter((s) => s !== name) : [...sets, name];
+		sets = info.tool_sets.map((s) => s.name).filter((s) => next.includes(s));
+	}
 	let pick = $state<ClientHelp['id']>('claude-code');
 	const help = $derived(helps.find((h) => h.id === pick) ?? helps[0]);
 	let copied = $state<string | null>(null);
@@ -60,8 +70,25 @@
 	{/if}
 	<div>
 		<div style="font-size:12px;color:var(--text-muted);line-height:1.5;margin-bottom:6px">Any MCP client connects to this local endpoint:</div>
-		{@render copyRow(info.url, info.url, 'url', 'Copy the endpoint')}
+		{@render copyRow(shown.url, shown.url, 'url', 'Copy the endpoint')}
 	</div>
+
+	{#if !compact && info.tool_sets.length > 0}
+		<div>
+			<div style="font-size:12px;color:var(--text-muted);line-height:1.5;margin-bottom:6px">
+				Every tool by default. Pick sets to list only those and spare the agent's context (the guide, the timeline summary,
+				the staged diff and job status always come):
+			</div>
+			<div role="group" aria-label="Tool sets" style="display:flex;flex-wrap:wrap;gap:6px">
+				<Chip pressed={sets.length === 0} data-testid="mcp-tools-all" onclick={() => (sets = [])}>All</Chip>
+				{#each info.tool_sets as set (set.name)}
+					<Chip pressed={sets.includes(set.name)} title={`${set.description} (${set.tools} tools)`} data-testid="mcp-tools-{set.name}" onclick={() => toggle(set.name)}
+						>{set.name}</Chip
+					>
+				{/each}
+			</div>
+		</div>
+	{/if}
 
 	<div>
 		<div style="font-size:12px;color:var(--text-muted);line-height:1.5;margin-bottom:6px">

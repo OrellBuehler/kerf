@@ -2343,6 +2343,16 @@ export interface McpConnectionInfo {
 	claude_code_command: string;
 	/** A `mcpServers` JSON snippet for any other MCP client. */
 	generic_json_config: string;
+	/** The tool sets a client may ask for with `?tools=core,titles` on the URL; without, it gets every tool. */
+	tool_sets: McpToolSet[];
+}
+
+/** One MCP tool set (`crates/kerf-app/src/mcp/toolsets.rs`). */
+export interface McpToolSet {
+	name: string;
+	description: string;
+	/** How many tools it lists; the essentials (guide, summary, staged diff, job status) come with any selection. */
+	tools: number;
 }
 
 /** The agent switches `set_mcp_settings` takes — any of them. The server restarts by itself when

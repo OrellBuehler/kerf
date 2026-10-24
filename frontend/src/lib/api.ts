@@ -89,6 +89,7 @@ import type {
 	Scopes,
 	AppSettings,
 	McpConnectionInfo,
+	McpToolSet,
 	McpSettingsPatch,
 	TimeDisplay,
 	SettingsPatch,
@@ -5151,6 +5152,20 @@ function harnessTokenProblem(): string | null {
 	return 'The token could not be saved (permission denied). It works until Kerf quits; the next start makes a new one.';
 }
 
+/** The desktop app reads these from `mcp/toolsets.rs`; the harness shows the same sets. */
+const HARNESS_TOOL_SETS: McpToolSet[] = [
+	{ name: 'core', description: 'Look at the media and the cut, cut and arrange, volume / fades / transitions, review and history, jobs', tools: 56 },
+	{ name: 'analysis', description: 'Transcripts, speakers, filler words, waveforms, scopes, speech model, proxies, audio sync', tools: 17 },
+	{ name: 'clips', description: 'Speed, transform, colour and grade, effects, masks, linked picture and sound', tools: 17 },
+	{ name: 'keyframes', description: 'Keyframes, per-property animation and 360 reframing', tools: 12 },
+	{ name: 'titles', description: 'Text overlays, SVG titles and templates, captions, markers, fonts', tools: 32 },
+	{ name: 'audio', description: 'Track and master mix, ducking, loudness and band balance, voiceover', tools: 13 },
+	{ name: 'music', description: 'Music structure, fitting and composing music, stems, snapping cuts to beats', tools: 8 },
+	{ name: 'delivery', description: 'Delivery format, smart crop, export, variants, cover, captions and interchange files', tools: 10 },
+	{ name: 'tasks', description: "The user's task queue", tools: 7 },
+	{ name: 'project', description: 'Open, create and save projects as, missing media, settings', tools: 6 }
+];
+
 function harnessMcpInfo(next: Partial<McpConnectionInfo>): McpConnectionInfo {
 	const base: McpConnectionInfo = harnessMcp ?? {
 		enabled: true,
@@ -5164,7 +5179,8 @@ function harnessMcpInfo(next: Partial<McpConnectionInfo>): McpConnectionInfo {
 		env_override: false,
 		agent_review: true,
 		claude_code_command: '',
-		generic_json_config: ''
+		generic_json_config: '',
+		tool_sets: HARNESS_TOOL_SETS
 	};
 	const merged = { ...base, ...next };
 	merged.url = clientUrl(merged.configured_addr ?? '127.0.0.1:7777');

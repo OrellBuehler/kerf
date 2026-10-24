@@ -377,6 +377,7 @@ pub struct ConnectionInfo {
     pub agent_review: bool,
     pub claude_code_command: String,
     pub generic_json_config: String,
+    pub tool_sets: Vec<super::ToolSetInfo>,
 }
 
 /// The URL a client on this machine connects to for a server bound to `addr`: a wildcard bind is
@@ -400,8 +401,14 @@ pub fn client_url(addr: &str) -> String {
     }
 }
 
-/// The command that adds the server to Claude Code, with the token header when one is required.
+/// The command that adds the server to Claude Code, with the token header when one is required. A
+/// URL with a query (`?tools=core`) is quoted, since a shell would read `?` as a pattern.
 pub fn claude_code_command(url: &str, token: Option<&str>, require_token: bool) -> String {
+    let url = if url.contains('?') {
+        format!("\"{url}\"")
+    } else {
+        url.to_string()
+    };
     match token.filter(|_| require_token) {
         Some(token) => format!("claude mcp add --transport http kerf {url} --header \"Authorization: Bearer {token}\""),
         None => format!("claude mcp add --transport http kerf {url}"),
@@ -443,6 +450,7 @@ pub fn connection_info(settings: &Settings) -> ConnectionInfo {
         configured_addr: settings.mcp_addr.clone(),
         env_override: env_override(),
         agent_review: settings.agent_review,
+        tool_sets: super::toolsets::catalogue(),
     }
 }
 
@@ -1070,6 +1078,21 @@ mod tests {
         Some((status, headers))
     }
 
+    /// A request to `path` and the whole response as text (what arrived before a read timed out).
+    fn exchange_text(addr: std::net::SocketAddr, path: &str, body: &str) -> String {
+        use std::io::{Read, Write};
+        let request = format!(
+            "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nAccept: application/json, text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let mut stream = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(2)).unwrap();
+        stream.set_read_timeout(Some(std::time::Duration::from_secs(3))).unwrap();
+        stream.write_all(request.as_bytes()).unwrap();
+        let mut reply = Vec::new();
+        let _ = stream.read_to_end(&mut reply);
+        String::from_utf8_lossy(&reply).into_owned()
+    }
+
     const INITIALIZE: &str = r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}"#;
     const INITIALIZED: &str = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
 
@@ -1136,6 +1159,11 @@ mod tests {
         );
         let bare: serde_json::Value = serde_json::from_str(&generic_json_config(url, Some(&token), false)).unwrap();
         assert!(bare["mcpServers"]["kerf"].get("headers").is_none());
+        assert_eq!(
+            claude_code_command(&format!("{url}?tools=core,titles"), None, false),
+            format!("claude mcp add --transport http kerf \"{url}?tools=core,titles\""),
+            "a URL with a query is quoted for the shell"
+        );
     }
 
     #[test]
@@ -1152,6 +1180,44 @@ mod tests {
     #[derive(Clone)]
     struct Nothing;
     impl rmcp::ServerHandler for Nothing {}
+
+    /// Initializes the way `KerfMcp` does, tool-set check included.
+    #[derive(Clone)]
+    struct Selecting;
+
+    impl rmcp::ServerHandler for Selecting {
+        async fn initialize(
+            &self,
+            request: rmcp::model::InitializeRequestParams,
+            context: rmcp::service::RequestContext<rmcp::RoleServer>,
+        ) -> Result<rmcp::model::InitializeResult, rmcp::ErrorData> {
+            super::super::checked_initialize(self, request, &context)
+        }
+    }
+
+    /// The `?tools=` of the URL reaches the handler through the real listener: a set that is no set
+    /// is refused at `initialize`, a known one connects.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_url_query_picks_the_tool_sets_and_an_unknown_one_is_refused_at_connect() {
+        let auth = Arc::new(RwLock::new(Auth::default()));
+        let addr = format!("127.0.0.1:{}", free_port());
+        let config = McpConfig {
+            enabled: true,
+            addr: addr.clone(),
+            require_token: false,
+            token: None,
+        };
+        let up = launch(&config, || Selecting, auth).await.expect("bind");
+        let socket: std::net::SocketAddr = addr.parse().unwrap();
+        let ask = move |path: &'static str| tokio::task::spawn_blocking(move || exchange_text(socket, path, INITIALIZE));
+        let known = ask("/mcp?tools=core,titles").await.unwrap();
+        assert!(known.contains("protocolVersion") && !known.contains("no tool set"), "{known}");
+        let unknown = ask("/mcp?tools=core,colour").await.unwrap();
+        assert!(unknown.contains("`colour` is no tool set"), "{unknown}");
+        let plain = ask("/mcp").await.unwrap();
+        assert!(plain.contains("protocolVersion"), "{plain}");
+        up.stop().await;
+    }
 
     fn free_port() -> u16 {
         std::net::TcpListener::bind("127.0.0.1:0")

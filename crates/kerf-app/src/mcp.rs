@@ -35,9 +35,11 @@ mod args;
 mod hints;
 mod jobs;
 mod project_tools;
+mod prompts;
 mod reads;
 mod server;
 mod templates;
+mod toolsets;
 
 use jobs::Run;
 pub(crate) use server::bind_problem;
@@ -45,6 +47,7 @@ pub use server::{
     check_addr, check_token, connection_info, endpoint_url, generate_token, server_error, settings_changed, start,
     ConnectionInfo, DEFAULT_ADDR,
 };
+pub use toolsets::ToolSetInfo;
 
 /// Ceilings on the sizes a tool call may ask for. These numbers reach us from a
 /// model reading a schema description, not from a UI slider, so they are
@@ -2707,8 +2710,9 @@ impl KerfMcp {
                        jobs and subscriptions, paging, history, platform checks, loudness, music, export). \
                        Read it once before your first edit."
     )]
-    fn get_editing_guide(&self) -> Result<String, McpError> {
-        Ok(EDITING_GUIDE.to_string())
+    fn get_editing_guide(&self, context: RequestContext<RoleServer>) -> Result<String, McpError> {
+        let note = tool_selection(&context)?.note().unwrap_or_default();
+        Ok(format!("{EDITING_GUIDE}{note}"))
     }
 
     #[tool(
@@ -6540,6 +6544,37 @@ fn reject_unknown_arguments(request: &rmcp::model::CallToolRequestParams) -> Res
     }
 }
 
+/// The tool sets the request's URL asks for (`?tools=core,titles`, `toolsets.rs`); every tool for a
+/// request that came some other way.
+fn tool_selection(context: &RequestContext<RoleServer>) -> Result<toolsets::Selection, McpError> {
+    let query = context
+        .extensions
+        .get::<axum::http::request::Parts>()
+        .and_then(|parts| parts.uri.query());
+    toolsets::Selection::from_query(query).map_err(|e| McpError::invalid_params(e, None))
+}
+
+/// `initialize`, refused when the URL names a tool set there is not.
+fn checked_initialize<S: ServerHandler>(
+    server: &S,
+    request: rmcp::model::InitializeRequestParams,
+    context: &RequestContext<RoleServer>,
+) -> Result<rmcp::model::InitializeResult, McpError> {
+    tool_selection(context)?;
+    context.peer.set_peer_info(request.clone());
+    server.negotiate_initialize(&request)
+}
+
+/// What the server offers: tools, the workflow prompts and the resources with their subscriptions.
+fn capabilities() -> ServerCapabilities {
+    ServerCapabilities::builder()
+        .enable_prompts()
+        .enable_resources()
+        .enable_resources_subscribe()
+        .enable_tools()
+        .build()
+}
+
 /// How the server introduces itself to clients. `ServerConfig::default()` fills
 /// `server_info` in from *rmcp's* own build env, so an untouched default has
 /// every client listing this server as "rmcp".
@@ -6582,7 +6617,10 @@ const INSTRUCTIONS: &str = "Kerf is the video editor open on this computer, and 
              first unlocked one. \
              Long tools (analyze_asset, export, compose_music, generate_voiceover, smart_crop, ...) take \
              `background: true` and answer a job_id at once; follow it with job_status or subscribe to \
-             kerf://jobs/{job_id}.";
+             kerf://jobs/{job_id}. \
+             The prompts (rough_cut_from_transcript, podcast_cleanup, social_reel, music_bed, deliver) are \
+             these workflows as steps. A client may connect with ?tools=core,titles on the URL to list \
+             fewer tools; get_editing_guide then names the sets left out.";
 
 /// What `get_editing_guide` answers: the workflow across every tool.
 const EDITING_GUIDE: &str = "How to edit with Kerf. The user queues editing tasks in the desktop app; \
@@ -6870,7 +6908,12 @@ const EDITING_GUIDE: &str = "How to edit with Kerf. The user queues editing task
              export / export_srt / export_captions / export_interchange / \
              export_markers / export_cover / export_variants all take an \
              absolute local output path and refuse to overwrite a file that's \
-             already there unless you pass overwrite=true.";
+             already there unless you pass overwrite=true. \
+             The server's prompts — rough_cut_from_transcript, podcast_cleanup, social_reel, music_bed and \
+             deliver — are these workflows as numbered steps the user can start. A connection may list only \
+             some tool sets (`?tools=core,titles` on the server URL; the sets are core, analysis, clips, \
+             keyframes, titles, audio, music, delivery, tasks and project), and this guide then ends by \
+             saying which.";
 
 #[tool_handler(router = router())]
 impl ServerHandler for KerfMcp {
@@ -6904,13 +6947,57 @@ impl ServerHandler for KerfMcp {
         note_agent_activity();
         let mut info = ServerConfig::default();
         info.server_info = server_identity();
-        info.capabilities = ServerCapabilities::builder()
-            .enable_resources()
-            .enable_resources_subscribe()
-            .enable_tools()
-            .build();
+        info.capabilities = capabilities();
         info.instructions = Some(INSTRUCTIONS.to_string());
         info
+    }
+
+    /// A URL naming a tool set there is not is refused here, where the client is connecting,
+    /// rather than leaving it with a short tool list and no reason.
+    async fn initialize(
+        &self,
+        request: rmcp::model::InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::InitializeResult, McpError> {
+        checked_initialize(self, request, &context)
+    }
+
+    /// The tools of the sets the connection asked for (all of them by default). A call to one
+    /// left out still runs: the selection trims the list, it is not a permission.
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, McpError> {
+        self.listener.touch();
+        let selection = tool_selection(&context)?;
+        let mut tools = router().list_all();
+        tools.retain(|tool| selection.lists(&tool.name));
+        let supports_cache_hints = context
+            .protocol_version()
+            .is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2026_07_28);
+        let mut result = rmcp::model::ListToolsResult::with_all_items(tools);
+        result.ttl_ms = supports_cache_hints.then_some(0);
+        result.cache_scope = supports_cache_hints.then_some(rmcp::model::CacheScope::Public);
+        Ok(result)
+    }
+
+    async fn list_prompts(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::ListPromptsResult, McpError> {
+        self.listener.touch();
+        Ok(rmcp::model::ListPromptsResult::with_all_items(prompts::list()))
+    }
+
+    async fn get_prompt(
+        &self,
+        request: rmcp::model::GetPromptRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::GetPromptResponse, McpError> {
+        self.listener.touch();
+        Ok(prompts::get(&request.name, request.arguments.as_ref())?.into())
     }
 
     async fn ping(&self, _context: RequestContext<RoleServer>) -> Result<(), McpError> {
@@ -8561,6 +8648,38 @@ mod tests {
 
     /// A client decides from these hints what to run unasked and what to confirm,
     /// so a tool without them is a tool it has to guess about.
+    /// Each tool is listed by exactly one tool set (its row in `hints::TOOLS`), each set lists
+    /// something, and the essentials every selection keeps are tools.
+    #[test]
+    fn every_tool_is_in_one_tool_set() {
+        let names = tool_names();
+        let unset: Vec<&String> = names.iter().filter(|n| super::toolsets::set_of(n).is_none()).collect();
+        assert!(
+            unset.is_empty(),
+            "tools in no tool set (add a row to hints::TOOLS): {unset:?}"
+        );
+        for set in super::toolsets::ToolSet::ALL {
+            let tools: Vec<&str> = set.tools().collect();
+            assert!(!tools.is_empty(), "{} lists nothing", set.name());
+            for tool in tools {
+                assert!(
+                    names.iter().any(|n| n == tool),
+                    "{} names {tool}, which is no tool",
+                    set.name()
+                );
+            }
+        }
+        for tool in super::toolsets::ESSENTIALS {
+            assert!(names.iter().any(|n| n == tool), "essential {tool} is no tool");
+        }
+    }
+
+    #[test]
+    fn the_server_offers_prompts_tools_and_resources() {
+        let caps = super::capabilities();
+        assert!(caps.prompts.is_some() && caps.tools.is_some() && caps.resources.is_some());
+    }
+
     #[test]
     fn every_tool_is_titled_and_annotated() {
         let tools = router().list_all();

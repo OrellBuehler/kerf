@@ -136,6 +136,12 @@ claude mcp add --transport http kerf http://127.0.0.1:7777/mcp \
 }
 ```
 
+Every tool is listed by default. A client that loads every tool's schema up front can ask for fewer by
+adding tool sets to the URL — `http://127.0.0.1:7777/mcp?tools=core,titles` (sets: `core`, `analysis`,
+`clips`, `keyframes`, `titles`, `audio`, `music`, `delivery`, `tasks`, `project`; Settings › Agent builds
+the command for you). The server also offers workflow **prompts** — `rough_cut_from_transcript`,
+`podcast_cleanup`, `social_reel`, `music_bed`, `deliver` — which Claude Code shows as `/mcp__kerf__<name>`.
+
 An agent's edits wait in a proposal for you to accept (all of it, or only some changes)
 unless you switch review off in the same place: then its edits, the work on the tasks
 you queue included, land on the cut as it makes them, each one an undoable step.

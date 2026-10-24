@@ -32,7 +32,8 @@ beyond loopback is refused unless the token is required (`bind_problem`, also ch
 `KERF_MCP_ADDR` still overrides the stored address. A supervisor task restarts the listener when the address or the enabled
 switch changes (`settings::update` → `settings_changed`; sessions on the old listener end), and reports a bind failure through
 `server_error()` instead of exiting. `mcp_connection_info` returns the URL, the token, `running` / `error` and the ready-made
-`claude mcp add --transport http kerf <url> --header "Authorization: Bearer <token>"` plus a generic `mcpServers` JSON snippet;
+`claude mcp add --transport http kerf <url> --header "Authorization: Bearer <token>"` (the URL quoted when it has a query) plus a generic
+`mcpServers` JSON snippet, and `tool_sets` (name, description, tool count: Prompts and tool sets, below);
 `regenerate_mcp_token` and `set_mcp_settings` (only `mcp_*` and `agent_review`) are the other two commands.
 It shares the **same** `Arc<Mutex<Project>>` the Tauri commands hold, so the agent edits the project the user has open.
 Patterns that matter if you edit
@@ -468,7 +469,7 @@ map) accepts anything. Only **top-level** keys are checked; keys inside a nested
 (`mcp_parameters_take_no_serde_alias` scans `mcp.rs` and the `mcp/` modules). Every tool has a `title` and the four hints from the table in
 `mcp/hints.rs`, applied to the routes once in `router()`; `every_tool_is_titled_and_annotated`
 fails on a tool missing from it (and on an entry naming no tool), so **a new tool needs a
-row there**. Staged (or undoable) agent edits are not destructive; applying / discarding a
+row there** — whose last column is its tool set (below). Staged (or undoable) agent edits are not destructive; applying / discarding a
 proposal, `resolve_task` / `remove_task`, undo / redo / `revert_to` (the live cut), the
 exports (a file outside the project) and `delete_proxy` are. Reads and previews are
 `readOnlyHint`, and `openWorldHint` marks the tools that may download a model.
@@ -476,6 +477,32 @@ exports (a file outside the project) and `delete_proxy` are. Reads and previews 
 `selected_clip_ids`, `mark_in` / `mark_out`, `visible_range`, `focused_panel`,
 `selected_asset_id`, with `age_secs` and `stale`; before any report (headless) it is
 `{reported: false, stale: true, note}`. The `instructions` point "this clip" / "here" at it.
+
+## Prompts and tool sets (`mcp/prompts.rs`, `mcp/toolsets.rs`)
+
+**Prompts.** `get_info` advertises `prompts`; `list_prompts` / `get_prompt` (written by hand, not rmcp's prompt macros)
+serve `prompts::list` / `prompts::get`: `rough_cut_from_transcript { assets?, target_length?, brief? }`, `podcast_cleanup
+{ asset?, loudness? }`, `social_reel { platform, length?, aspect? }`, `music_bed { music?, style? }` and `deliver { output?,
+platform? }` — the guide's workflows as a numbered step list in one user message (Claude Code offers them as
+`/mcp__kerf__<name>`). Each step is the guide's own rule (staging, captions last, `get_ripple_mode` first, platform_check
+and get_levels before done, export reads the proposal), not new behaviour. A prompt names its tools in **backticks** and only
+tools: `every_tool_a_prompt_names_is_registered` renders each with only its required arguments and with all of them and
+fails on a backticked name that is no tool (field names stay unquoted), on fewer than five tools, or on a long text. An
+unknown prompt, an argument it does not take and a missing (or blank) required one are `invalid_params` naming what is
+accepted.
+**Tool sets.** Each `hints::TOOLS` row ends with the tool's one `ToolSet` — `core` (looking, cutting and arranging, volume /
+fade / transition, review and history, jobs, the project's basics), `analysis`, `clips`, `keyframes`, `titles`, `audio`,
+`music`, `delivery`, `tasks`, `project` — so a new tool's author edits one row; `every_tool_is_in_one_tool_set` pins that.
+A client asks for some with **`?tools=core,titles` on the MCP URL** (repeated `tools` parameters add up, `%2C` reads as a
+comma). It is read from each request's `http::request::Parts` (rmcp puts them in the `RequestContext` extensions), so it
+needs no session state; no query, an empty one or `all` is every tool, which keeps existing setups as they were. `initialize`
+refuses a name that is no set (`invalid_params` listing the sets), where the client is connecting; `list_tools` (overridden,
+the `router()` borrow filtered, the cache hints of the generated one kept) shows the selected sets plus `ESSENTIALS`
+(`get_editing_guide`, `timeline_summary`, `staged_diff`, `job_status`), and `get_editing_guide` appends a line naming the
+sets listed and the ones left out (`Selection::note`). **A call to a tool outside the selection still runs**: the selection
+trims the context a client loads, the bearer token is the permission, and the guide and the prompts name tools across sets,
+so refusing would only stop an agent in a client that lets it call by name. `mcp_connection_info.tool_sets`
+(`toolsets::catalogue`) feeds the chips in `McpConnect` that put the selection on the URL and in the snippets.
 
 ## Review, ownership and the live cut
 
