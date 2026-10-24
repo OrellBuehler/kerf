@@ -619,6 +619,23 @@ async fn missing_assets(state: State<'_, AppState>) -> CmdResult<Vec<MissingAsse
     .await
 }
 
+/// Where `query` is said across the library's transcripts, paged, each hit with the clips of the cut
+/// that use it. The cached transcripts are read under the lock and searched with it released.
+#[tauri::command]
+async fn search_transcripts(
+    state: State<'_, AppState>,
+    query: kerf_core::transcript::TranscriptQuery,
+) -> CmdResult<kerf_core::transcript::TranscriptSearch> {
+    let shared = state.project.clone();
+    blocking(move || {
+        let inputs = lock_user(&shared)
+            .transcript_search_inputs(query.asset_ids.as_deref())
+            .map_err(|e| e.to_string())?;
+        kerf_core::transcript::search_transcripts(inputs, &query).map_err(|e| e.to_string())
+    })
+    .await
+}
+
 /// Which of `paths` exist, in order: the export dialog asks before it overwrites a file.
 /// Stats on the blocking pool; at most 256 paths.
 #[tauri::command]
@@ -5425,6 +5442,7 @@ pub fn run() {
             relink_asset,
             check_relink,
             missing_assets,
+            search_transcripts,
             paths_exist,
             import_asset,
             cancel_import,

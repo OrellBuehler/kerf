@@ -6,6 +6,8 @@
 // explorable without the desktop shell.
 
 import type {
+	TranscriptQuery,
+	TranscriptSearch,
 	AudioDetached,
 	Asset,
 	AssetAnalysis,
@@ -206,6 +208,7 @@ import { centeredCrop } from './smart-crop';
 import { synthWaveformRange } from './sample-waveform';
 import { analysisKindDone, ALL_KINDS } from './analysis-steps';
 import { sampleFilmstrip } from './sample-filmstrip';
+import { searchTranscripts as harnessSearchTranscripts } from './transcript-search';
 import { synthPcm } from './sample-audio';
 import { sampleFrameJpeg } from './sample-frame';
 import { harnessScopes } from './scopes-view';
@@ -823,6 +826,13 @@ export async function missingAssets(): Promise<MissingAsset[]> {
 			}));
 	}
 	return invoke<MissingAsset[]>('missing_assets');
+}
+
+/** Where `query.query` is said across the library's transcripts (`phrase`, `all_words` within a line, or
+ *  `any_word`), paged, each hit with the clips of the cut that use it (`in_cut`, empty when unused). */
+export async function searchTranscripts(query: TranscriptQuery): Promise<TranscriptSearch> {
+	if (!inTauri()) return harnessSearchTranscripts(sampleAssets, sampleAnalysis, devTimeline, query);
+	return invoke<TranscriptSearch>('search_transcripts', { query });
 }
 
 /** Open a native file picker for the file to relink `name` to (media files only); `null` if cancelled. The

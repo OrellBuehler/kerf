@@ -12,6 +12,9 @@ use std::borrow::Cow;
 use crate::engine::{diarize, vad};
 use crate::model::{TimeRange, TranscriptSegment, Word};
 
+pub mod search;
+pub use search::{search_transcripts, MatchMode, TranscriptQuery, TranscriptSearch, TranscriptSearchInputs};
+
 /// The rate [`refine`] wants its samples at.
 pub const SAMPLE_RATE: u32 = crate::engine::mel::RATE;
 

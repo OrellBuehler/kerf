@@ -156,7 +156,8 @@ back a reviewable result.
 <summary><b>See / analyze</b></summary>
 
 `get_editing_guide` (how the tools fit together) · `list_assets` (`fields: "compact"` for a big library, `imported_after` for what an import added) · `import_asset` · `get_asset_metadata` · `analyze_asset` · `get_transcript` (lines with
-their speakers; the timed words on request) · `get_cut_transcript` (what the cut says, in timeline time) · `speaker_ranges` · `find_filler_words` · `refine_transcript` ·
+their speakers; the timed words on request) · `get_cut_transcript` (what the cut says, in timeline time) · `speaker_ranges` · `find_filler_words` ·
+`search_transcripts` (where anything is said across the library, and whether the cut uses it) · `refine_transcript` ·
 `get_analysis_detail` · `get_timeline_state` · `timeline_summary` · `get_editor_context` (what the user has
 selected and where the playhead is) · `get_scopes` (waveform / parade / vectorscope / histogram numbers of a
 frame) · `get_waveform` · `get_energy` ·

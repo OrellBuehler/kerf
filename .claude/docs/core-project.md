@@ -825,7 +825,9 @@
   cache no longer holds `read`, so a refinement never overwrites a newer transcript). `speaker_ranges(asset, speaker?,
   join_gap)` (errors naming the known speakers for an unknown one, or when nothing is labelled) and
   `filler_words(asset, fillers)` (default um / uh / … / you know, phrases matched across words of one
-  line) read it by word bounds. **What a request runs** is `resolve_steps(asset, requested)`: a file with no audio is
+  line) read it by word bounds. `transcript_search_inputs(asset_ids?)` is the locked half of a library-wide search
+  (`transcript::search`, `engine-media.md`): the assets in library order, each one's analysis row as the stored JSON
+  (unparsed — parsing is most of the cost) and the working timeline; an unknown id is `AssetNotFound`. **What a request runs** is `resolve_steps(asset, requested)`: a file with no audio is
   not asked for silence, loudness, rhythm or speech (silent b-roll used to get a failed transcript
   chip and an error toast on every import), a still has nothing to analyze, and an empty answer is
   an `InvalidArgument` that says why (everything switched off; a silent file asked for its speech)

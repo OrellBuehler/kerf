@@ -1006,6 +1006,26 @@ pub(super) struct CutTranscriptParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub(super) struct SearchTranscriptsParams {
+    #[schemars(
+        description = "What was said: a word or phrase. Case, punctuation, apostrophes and accents are ignored (\"Don't\" finds \"dont\", \"cafe\" finds \"café\")."
+    )]
+    query: String,
+    #[schemars(description = "Only these assets (UUIDs); omit to search the whole library")]
+    asset_ids: Option<Vec<String>>,
+    #[schemars(description = "Only hits spoken by this speaker (e.g. \"S2\"), when speakers were labelled")]
+    speaker: Option<String>,
+    #[schemars(
+        description = "phrase (default): the words in order, next to each other, across lines too; all_words: every word, in any order, within one line; any_word: each occurrence of any of the words"
+    )]
+    mode: Option<kerf_core::transcript::MatchMode>,
+    #[schemars(description = "Skip this many hits (default 0), to page on; `next_offset` in the answer is the next page")]
+    offset: Option<usize>,
+    #[schemars(description = "Most hits to return (default 50, at most 500)")]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub(super) struct AnalysisDetailParams {
     #[schemars(description = "UUID of the asset (analyzed: analyze_asset)")]
     asset_id: String,
@@ -1221,6 +1241,44 @@ impl KerfMcp {
         })
         .await?;
         json(&answer)
+    }
+
+    #[tool(
+        description = "Find where something is said across the library's transcripts at once, instead of paging \
+                       get_transcript asset by asset. Each hit: `asset_id`, `asset_name`, SOURCE-seconds `start`/`end` \
+                       (word-exact: from the first matched word to the last), `speaker`, `text`, `context` (the line \
+                       with the match between « and »), `words_estimated` when the word times were spread over the \
+                       line rather than reported, and `in_cut` — the clips of the cut (your proposal while one is \
+                       open) that already use that stretch, each with its timeline start/end (`partial` when it holds \
+                       only part); empty means unused. To use a hit, cut_clip / add_clip_to_timeline its asset with \
+                       source_in/out around start/end. Ordered by asset (library order), then time; paged with \
+                       `total` and `next_offset`. `searched_assets` and `assets_without_transcript` (count, first ids: \
+                       run analyze_asset with `transcript` on them) say what was covered."
+    )]
+    async fn search_transcripts(&self, Parameters(p): Parameters<SearchTranscriptsParams>) -> Result<String, McpError> {
+        let asset_ids = p
+            .asset_ids
+            .map(|ids| ids.iter().map(|id| parse_arg("asset_ids", id)).collect::<Result<Vec<_>, _>>())
+            .transpose()?;
+        let query = kerf_core::transcript::TranscriptQuery {
+            query: p.query,
+            asset_ids,
+            speaker: p.speaker,
+            mode: p.mode.unwrap_or_default(),
+            offset: p.offset,
+            limit: p.limit,
+        };
+        let (project, owner) = (self.project.clone(), self.owner());
+        let found = blocking(move || {
+            // The cached analysis is read as stored under the lock; parsing hours of words and
+            // matching them happen with it released.
+            let inputs = lock_agent_as(&project, owner.as_deref())
+                .transcript_search_inputs(query.asset_ids.as_deref())
+                .map_err(core_err)?;
+            kerf_core::transcript::search_transcripts(inputs, &query).map_err(core_err)
+        })
+        .await?;
+        json(&found)
     }
 
     #[tool(
