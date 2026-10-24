@@ -620,6 +620,17 @@
   are not title clips yet**: a preset is laid out for its length and would have to be re-made by every op that changes a
   clip's length; a template or custom artwork holds its end instead. `frontend/src/lib/title-clips.ts` mirrors placement,
   naming and lookup.
+- **Thumbnails** (`model/thumbnail.rs`, pure + unit-tested): `Timeline.thumbnails: Vec<Thumbnail>` (absent when empty, so a cut
+  without one stores what it always did; nothing that renders the cut reads it — `slice` / `for_render` copies drop it). A
+  `Thumbnail` is `time` (timeline seconds), `width` x `height` (`parse_thumbnail_size`: `youtube`, `vertical`, `square`, `4:5`,
+  `16:9` or `WxH`, 16..4096), `focus_x` / `focus_y` (where `crop_in` centres the largest rect of its shape in the frame, kept
+  inside), `graphics` (`VideoGraphics::{None, Titles, All}`, `background_of`: no titles / text / captions / title clips, no
+  captions — the default — or everything) and `layers: Vec<ThumbnailLayer>` (sanitised `svg` fitted "contain" into a rect of
+  fractions, `rect_px` rounding like a title's; `text: Option<SvgPresetParams>` for a headline, `template: Option<TemplateInstance>`,
+  `at`: the moment drawn, `None` = `settled_moment`, the latest of 17 samples within 1 % of the most coverage, so a title that
+  animates out is drawn settled). `background_scale` renders the frame larger than the delivery (≤ 7680 px long side) so a crop
+  of another shape is not upscaled. The diff has one `ThumbnailsChanged` entry ("Changed the thumbnails", detail `added “A”,
+  changed “B”`), and partial accept lays the proposal's whole list (`subset.rs`, `staged-subset.ts`).
 - `timecode.rs` — SMPTE timecode at the timeline's `f64` rate: `TimecodeRate` (nominal base, frames
   dropped per minute — drop-frame at 29.97 / 59.94, told by closeness to `30000/1001` / `60000/1001`),
   `fields` / `frames` / `format` and `parse` (Premiere-style entry, relative `+` / `-`, a dropped label
