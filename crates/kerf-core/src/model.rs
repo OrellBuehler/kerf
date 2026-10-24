@@ -3208,6 +3208,11 @@ pub struct Clip {
     /// is its source span divided by the magnitude of the speed.
     #[serde(default = "one")]
     pub speed: f64,
+    /// A rate that changes over the clip ([`SpeedKey`]s in clip-local timeline seconds). While it
+    /// holds a well-formed ramp it decides the rate and `speed` only gives the direction (see the
+    /// `speed_ramp` module). Empty, and absent from the file, for a clip at one speed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub speed_ramp: Vec<SpeedKey>,
     /// Geometric transform (scale / position / crop / rotation / opacity).
     #[serde(default)]
     pub transform: Transform,
@@ -3311,6 +3316,7 @@ impl Clip {
             fade_in: 0.0,
             fade_out: 0.0,
             speed: 1.0,
+            speed_ramp: Vec::new(),
             transform: Transform::default(),
             color: Color::default(),
             grade: Grade::default(),
@@ -3521,7 +3527,8 @@ impl Clip {
         (self.source_out - self.source_in).max(0.0)
     }
 
-    /// Speed magnitude, clamped away from zero (direction dropped).
+    /// Speed magnitude, clamped away from zero (direction dropped). A ramped clip's rate varies:
+    /// convert between the clocks with [`Clip::along`] / [`Clip::local_at_along`] instead.
     pub fn speed_mag(&self) -> f64 {
         self.speed.abs().max(MIN_SPEED)
     }
@@ -3531,9 +3538,9 @@ impl Clip {
         self.speed < 0.0
     }
 
-    /// Duration on the timeline (seconds), i.e. the source span retimed by speed.
+    /// Duration on the timeline (seconds), i.e. the source span retimed by speed (or its ramp).
     pub fn duration(&self) -> f64 {
-        self.source_duration() / self.speed_mag()
+        self.local_at_along(self.source_duration())
     }
 
     pub fn timeline_end(&self) -> f64 {
@@ -3549,14 +3556,14 @@ impl Clip {
         } else {
             source - self.source_in
         };
-        self.timeline_start + offset / self.speed_mag()
+        self.timeline_start + self.local_at_along(offset)
     }
 
     /// The source timestamp playing at timeline time `time` — the inverse of
     /// [`Clip::source_to_timeline`], honoring speed and reverse. Not clamped to the
     /// clip's window.
     pub fn timeline_to_source(&self, time: f64) -> f64 {
-        let along = (time - self.timeline_start) * self.speed_mag();
+        let along = self.along(time - self.timeline_start);
         if self.is_reversed() {
             self.source_out - along
         } else {
@@ -5102,8 +5109,10 @@ impl Timeline {
 }
 
 mod channels;
+mod speed_ramp;
 use channels::channel_changes;
 pub use channels::{key_polyline, Property, PropertyKey, PropertyTrack, MAX_CHANNEL_VOLUME};
+pub use speed_ramp::{ramp_is_valid, RampEasing, SpeedKey, MAX_SPEED_KEYS};
 
 mod links;
 pub use links::{Detached, DetachedMany, SkippedDetach};
