@@ -48,9 +48,9 @@ The routes are fixed at compile time, so it is built once and
 then mutates fields — including `server_info` (`server_identity`), because that
 default is filled from **rmcp's own** crate identity and left alone the server
 introduces itself to every client as "rmcp". Most tools return `Result<String, McpError>` (**compact** JSON: `json()` no longer pretty-prints — indentation is a third of a timeline's weight), but the
-four **visual** tools — `get_frame` (a single drill-in frame), `skim_asset` (a
+five **visual** tools — `get_frame` (a single drill-in frame), `skim_asset` (a
 contact-sheet montage of an asset + a text index of cell→timestamp, for finding good
-parts), `preview_timeline` (the composited cut at a timeline time) and
+parts), `preview_timeline` (the composited cut at a timeline time), `skim_timeline` (below) and
 `preview_svg_overlay` (below) — return
 `Result<CallToolResult, McpError>` built by the `image_result` helper (`png_result` for the
 SVG sheet, a drawing JPEG would smear): a caption
@@ -58,6 +58,15 @@ SVG sheet, a drawing JPEG would smear): a caption
 actually *see* (rmcp wants bare base64 + MIME, **not** a `data:` URL). `preview_timeline` stays the one-shot
 still (`composite_timeline_frame`, the working cut, the exact time asked): the scrub cache and its windows
 (`app.md`) are the GUI's, where frames come one after another from a dragged playhead.
+**`skim_timeline`** is `skim_asset` for the cut: `columns`×`rows` moments over `[start, end)` of the working cut
+(`Project::timeline_sheet_window`, the whole cut by default; same grid defaults and clamps, `sheet_grid`), each the
+one-shot still `preview_timeline` draws from the preview's proxies at `cell_width`, drawn up to four at a time
+(`engine::timeline_sheet_cancellable`: niced, `limit_args_shared` for non-proxy inputs, the first failure or the
+request's cancel stops the rest) and tiled by one more small ffmpeg (`-f mjpeg` over the concatenated cells, `tile`).
+A gap is the still's black canvas. The caption indexes cell → timeline time → the clips on screen bottom first
+(`timeline_sheet_cells`: the still's own `still_layers`, so a transition's outgoing clip counts), or `no clip (gap)`.
+`cell` (+ `max_width`, `region`) opens one cell as `preview_timeline` would, never rebuilding the sheet. A 4x4 sheet of
+proxied footage is about a second. No Tauri command: the GUI has its filmstrips and the preview.
 **`get_scopes`** measures instead of showing (`kerf_core::scopes`, `engine-cli.md`): the summary of the frame the
 export writes at a time — per channel min / max / mean, pixels clipped at 0 and 1 counted over every pixel, the mean
 chroma's hue and saturation, the densest vectorscope spots — so an agent checks exposure, clipping or a cast with no
@@ -544,7 +553,7 @@ project is replaced (`stop_or_replaced`). `analyze_asset` also forwards the GUI'
 to the client (`AnalysisProgressRelay`); `download_speech_model` emits `model-progress` like the GUI's own download.
 Every job that resolves inputs under the lock notes `Project::generation()` and refuses to land its result in a project
 opened since (`require_generation`) — a Save As does not count as one (`replace_with_saved_copy` keeps it). The reads
-that decode (`get_waveform`, `get_waveform_range`, `get_energy`, `skim_asset`, `preview_timeline`, `get_frame`) take the
+that decode (`get_waveform`, `get_waveform_range`, `get_energy`, `skim_asset`, `preview_timeline`, `skim_timeline`, `get_frame`) take the
 request's cancellation token, so a dropped request kills its ffmpeg; `export_cover` reports `reading the cut` →
 `rendering the cover frame` → `cover written` on the `progressToken`. **`export` and `export_variants` word every tick
 from the engine's `ExportProgress`** (`export_message` / `variants_message`): the queue (`waiting for the preview
@@ -649,7 +658,7 @@ Every tool, by purpose (a test pins that this list names each registered tool, a
   `refine_transcript`, `get_analysis_detail`,
   `transcription_status`, `download_speech_model`, `set_speech_model`, `proxy_status`, `rebuild_proxy`, `delete_proxy`,
   `get_music_structure`.
-- **Looking and measuring**: `get_editing_guide`, `timeline_summary`, `get_timeline_state`, `get_editor_context`, `get_scopes`, `skim_asset`, `get_frame`, `preview_timeline`,
+- **Looking and measuring**: `get_editing_guide`, `timeline_summary`, `get_timeline_state`, `get_editor_context`, `get_scopes`, `skim_asset`, `get_frame`, `preview_timeline`, `skim_timeline`,
   `get_waveform`, `get_waveform_range`, `get_energy`, `get_levels`, `get_band_balance`, `platform_check`.
 - **Editing the cut**: `cut_clip`, `add_clip_to_timeline`, `split_at`, `trim`, `reorder`, `move_clip`, `move_clips`,
   `ripple_delete`, `cut_clip_range`, `roll_edit`, `slip_clip`, `slide_clip`, `split_remove`, `split_remove_clips`, `remove`,

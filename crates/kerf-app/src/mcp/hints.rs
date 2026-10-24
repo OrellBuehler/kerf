@@ -211,6 +211,7 @@ pub(super) const TOOLS: &[(&str, &str, Effect)] = &[
     ("get_frame", "Get frame", Read),
     ("skim_asset", "Skim asset", Read),
     ("preview_timeline", "Preview timeline", Read),
+    ("skim_timeline", "Skim timeline", Read),
     ("timeline_summary", "Timeline summary", Read),
     ("preview_svg_preset", "Preview SVG title preset", Read),
     ("missing_assets", "Missing media", Read),

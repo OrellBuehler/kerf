@@ -23,7 +23,11 @@ so the feature is **only** activated through these forwards — which is what ma
   **composited timeline still**
   (`timeline_frame_cancellable` / `build_still_args`, pure + unit-tested — overlays
   every clip visible at a timeline time onto a black canvas, mirroring the export
-  geometry, so an agent can *see the cut*), the **cover frame** (`export_still` —
+  geometry, so an agent can *see the cut*; `cli/timeline_sheet.rs` tiles one per moment into
+  `skim_timeline`'s **sheet of the cut** — up to four stills at a time through `run_still_as`
+  (`StillSpawn`: niced, a share of the budget for non-proxy inputs via `tune_still_args_shared`,
+  which at share 1 is `run_still`'s tuning exactly), then one `-f mjpeg … tile` run over the
+  concatenated cells; one export pass would decode every frame of the span), the **cover frame** (`export_still` —
   the same graph and the same builder, but a `StillOutput::File` sink and no
   preview width cap, so the thumbnail is a real frame of the finished video at
   the delivery shape rather than a screenshot to crop back into agreement; the

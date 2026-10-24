@@ -1965,6 +1965,30 @@ struct TimelineFrameParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SkimTimelineParams {
+    #[schemars(description = "Start of the span of the cut in timeline seconds (default 0)")]
+    start: Option<f64>,
+    #[schemars(description = "End of the span in timeline seconds (default the end of the cut)")]
+    end: Option<f64>,
+    #[schemars(description = "Grid columns (default 4, max 8)")]
+    columns: Option<u32>,
+    #[schemars(description = "Grid rows (default 4, max 8)")]
+    rows: Option<u32>,
+    #[schemars(description = "Width of each grid cell in pixels (default 240, 80 to 640)")]
+    cell_width: Option<u32>,
+    #[schemars(
+        description = "Open one cell of the sheet instead of building it: the 1-based, row-major cell number from a previous skim_timeline with the same span and grid. Returns the cut at that cell's moment as one frame, max_width wide (what preview_timeline shows there)."
+    )]
+    cell: Option<u32>,
+    #[schemars(description = "Width of the cell frame in pixels when `cell` is given (default 640, capped at 1920)")]
+    max_width: Option<u32>,
+    #[schemars(
+        description = "With `cell`: zoom into part of that frame, a rectangle in fractions of the frame (0..1), as preview_timeline's `region`. Ignored without `cell`."
+    )]
+    region: Option<RegionParams>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct ScopesParams {
     #[schemars(description = "Timeline position to measure (seconds)")]
     time_secs: f64,
@@ -6020,9 +6044,7 @@ impl KerfMcp {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let id = parse_arg("asset_id", &p.asset_id)?;
-        let columns = p.columns.unwrap_or(4).clamp(1, 8);
-        let rows = p.rows.unwrap_or(4).clamp(1, 8);
-        let cell_width = p.cell_width.unwrap_or(240).clamp(80, 640);
+        let (columns, rows, cell_width) = sheet_grid(p.columns, p.rows, p.cell_width);
         let project = self.project.clone();
         if let Some(cell) = p.cell {
             return self.skim_cell(id, &p, (columns, rows, cell), context).await;
@@ -6130,6 +6152,101 @@ impl KerfMcp {
         .await?;
         let mut caption = format!("timeline composite @ {}", fmt_ts(p.time_secs.max(0.0)));
         if let Some(r) = region {
+            caption.push_str(&format!(", {}", r.describe()));
+        }
+        Ok(image_result(caption, jpeg))
+    }
+
+    #[tool(
+        description = "Skim the cut you have assembled: the composited timeline at moments spread evenly across a span (default the whole cut) tiled into one contact-sheet image, plus a text index of each cell's timeline time and the clips on screen there (clip id and name, bottom track first). The one-call check of an assembled cut: pacing, black frames (a gap renders black), the same shot twice, the flow from shot to shot. Reads the cut you are proposing, staged edits included. Pass `cell` (same span and grid) to see one cell as a full frame, with an optional `region` to zoom, or call preview_timeline at any time."
+    )]
+    async fn skim_timeline(
+        &self,
+        Parameters(p): Parameters<SkimTimelineParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let (columns, rows, cell_width) = sheet_grid(p.columns, p.rows, p.cell_width);
+        if let Some(cell) = p.cell {
+            return self.skim_timeline_cell(&p, (columns, rows, cell), context).await;
+        }
+        let project = self.project.clone();
+        let cancel = context.ct.clone();
+        let (start, end) = (p.start, p.end);
+        let (jpeg, cells, window) = blocking(move || {
+            // Snapshot the inputs under the lock, composite every cell with it released. A dropped
+            // request kills the stills in flight.
+            let (timeline, assets) = lock_agent(&project).timeline_frame_inputs().map_err(core_err)?;
+            let window = Project::timeline_sheet_window(&timeline, start, end);
+            let (jpeg, cells) = Project::composite_timeline_sheet_cancellable(
+                &timeline,
+                &assets,
+                start,
+                end,
+                columns,
+                rows,
+                cell_width,
+                5,
+                &|| cancel.is_cancelled(),
+            )
+            .map_err(core_err)?;
+            Ok::<_, McpError>((jpeg, cells, window))
+        })
+        .await?;
+        Ok(image_result(timeline_sheet_caption(columns, rows, window, &cells), jpeg))
+    }
+
+    /// The `cell` form of [`Self::skim_timeline`]: the cut at the moment one cell showed, drawn
+    /// as `preview_timeline` draws it. The sheet is never rebuilt.
+    async fn skim_timeline_cell(
+        &self,
+        p: &SkimTimelineParams,
+        (columns, rows, cell): (u32, u32, u32),
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let cells = columns * rows;
+        if cell < 1 || cell > cells {
+            return Err(McpError::invalid_params(
+                format!("cell must be 1..={cells} for a {columns}x{rows} sheet, got {cell}"),
+                None,
+            ));
+        }
+        let max_width = p.max_width.unwrap_or(640).clamp(64, MAX_PREVIEW_WIDTH);
+        let (start, end, region) = (p.start, p.end, p.region);
+        let project = self.project.clone();
+        let cancel = context.ct.clone();
+        let (jpeg, on_screen) = blocking(move || {
+            let (timeline, assets) = lock_agent(&project).timeline_frame_inputs().map_err(core_err)?;
+            if timeline.duration() <= 0.0 {
+                return Err(core_err(kerf_core::Error::InvalidArgument(
+                    "the timeline is empty: there is no cut to skim".to_string(),
+                )));
+            }
+            let time = Project::timeline_sheet_times(&timeline, start, end, columns, rows)[(cell - 1) as usize];
+            let jpeg = match region {
+                Some(r) => Project::composite_timeline_region_cancellable(
+                    &timeline,
+                    &assets,
+                    time,
+                    r.region(),
+                    max_width,
+                    ZOOM_QUALITY,
+                    &|| cancel.is_cancelled(),
+                ),
+                None => Project::composite_timeline_frame_cancellable(&timeline, &assets, time, max_width, 4, &|| {
+                    cancel.is_cancelled()
+                }),
+            }
+            .map_err(core_err)?;
+            let on_screen = Project::timeline_sheet_cells(&timeline, &assets, &[time]).remove(0);
+            Ok::<_, McpError>((jpeg, on_screen))
+        })
+        .await?;
+        let mut caption = format!(
+            "cell {cell} of {columns}x{rows} sheet, timeline composite @ {}: {}",
+            fmt_ts(on_screen.time),
+            on_screen_clips(&on_screen.clips)
+        );
+        if let Some(r) = p.region {
             caption.push_str(&format!(", {}", r.describe()));
         }
         Ok(image_result(caption, jpeg))
@@ -6564,7 +6681,7 @@ const INSTRUCTIONS: &str = "Kerf is the video editor open on this computer, and 
              user says \"this clip\", \"here\" or \"the selection\", get_editor_context says what they \
              have selected and where the playhead and marks are. Look at the footage with skim_asset \
              (a contact sheet), get_frame and preview_timeline (the cut you have built) before and after \
-             you edit. Cut with split / trim / move_clip / remove / ripple_delete, then polish with \
+             you edit, and at a whole assembled cut with skim_timeline. Cut with split / trim / move_clip / remove / ripple_delete, then polish with \
              set_volume, set_fade, set_transition, set_transform, set_color, add_overlay and \
              generate_captions (caption last, once the cut is settled). Before you call a cut done, run \
              platform_check, and get_levels for anything going to social; export renders it to an \
@@ -6599,8 +6716,12 @@ const EDITING_GUIDE: &str = "How to edit with Kerf. The user queues editing task
              You can also SEE the footage: skim_asset returns a contact-sheet \
              image of a clip (survey it to find the good parts), get_frame shows \
              a single moment up close, and preview_timeline renders the cut you \
-             have assembled at a given time so you can check it on screen. Look, \
-             then look closer: skim_asset with `cell` opens one sheet cell at \
+             have assembled at a given time so you can check it on screen. Once a \
+             cut is assembled, check it with skim_timeline: one contact sheet of \
+             the cut (or a span of it), each cell indexed to its timeline time and \
+             the clips on screen, so the pacing, a black gap, a shot used twice and \
+             the flow show in one call. Look, \
+             then look closer: skim_asset and skim_timeline with `cell` open one sheet cell at \
              full detail, and get_frame / preview_timeline take a `region` \
              (fractions of the frame) that is cropped out and enlarged — the way \
              to read a face, on-screen text, a caption against the safe area or \
@@ -7128,6 +7249,42 @@ fn log_tool_error(tool: &str, e: &McpError) {
 /// Wrap JPEG bytes as an MCP tool result the model can *see*: a caption text
 /// block followed by an image content block (rmcp expects bare base64 + MIME,
 /// not a `data:` URL).
+/// A contact sheet's grid as asked for, clamped: `skim_asset` and `skim_timeline` share it.
+fn sheet_grid(columns: Option<u32>, rows: Option<u32>, cell_width: Option<u32>) -> (u32, u32, u32) {
+    (
+        columns.unwrap_or(4).clamp(1, 8),
+        rows.unwrap_or(4).clamp(1, 8),
+        cell_width.unwrap_or(240).clamp(80, 640),
+    )
+}
+
+/// The text index of a sheet of the cut: each cell's timeline time and the clips on screen there.
+fn timeline_sheet_caption(columns: u32, rows: u32, (start, end): (f64, f64), cells: &[kerf_core::SheetCell]) -> String {
+    let index = cells
+        .iter()
+        .enumerate()
+        .map(|(i, c)| format!("  cell {}: {}  {}", i + 1, fmt_ts(c.time), on_screen_clips(&c.clips)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "contact sheet {columns}x{rows} (row-major) of the cut {} - {}, cell -> timeline time, clips on screen (bottom first):\n{index}",
+        fmt_ts(start),
+        fmt_ts(end)
+    )
+}
+
+/// The clips a cell shows, bottom first; a gap says so.
+fn on_screen_clips(clips: &[kerf_core::SheetClip]) -> String {
+    if clips.is_empty() {
+        return "no clip (gap)".to_string();
+    }
+    clips
+        .iter()
+        .map(|c| format!("clip {} {:?}", c.clip_id, c.name))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn image_result(caption: String, jpeg: Vec<u8>) -> CallToolResult {
     image_block(caption, &jpeg, "image/jpeg")
 }
@@ -7356,8 +7513,9 @@ mod tests {
     use super::{
         caption_source, clip_moves, core_err, elide_large_svg, export_fps_of, export_message, fmt_ts, image_result,
         log_tool_error, png_result, refuse_overwrite, reject_unknown_arguments, require_window, router, server_identity,
-        svg_moments, svg_preview, svg_sheet_caption, svg_sheet_times, svg_source, track_gaps, variant_output, variants_message,
-        with_frame, ClipMoveParams, SvgMoments, SvgOverlaySummary, SvgPreviewTitle, SvgValidation,
+        sheet_grid, svg_moments, svg_preview, svg_sheet_caption, svg_sheet_times, svg_source, timeline_sheet_caption, track_gaps,
+        variant_output, variants_message, with_frame, ClipMoveParams, SkimTimelineParams, SvgMoments, SvgOverlaySummary,
+        SvgPreviewTitle, SvgValidation,
     };
 
     /// The resources read what the polling tools answer: the project's brief, the queue's first
@@ -8085,6 +8243,55 @@ mod tests {
     /// and getting that wrong degrades silently into an image the model cannot
     /// see rather than into a build failure.
     #[test]
+    fn a_sheet_of_the_cut_indexes_each_cell_with_its_time_and_the_clips_on_screen() {
+        use kerf_core::{SheetCell, SheetClip};
+        let (a, b) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let clip = |clip_id, name: &str| SheetClip {
+            clip_id,
+            name: name.to_string(),
+        };
+        let cells = [
+            SheetCell {
+                time: 0.0,
+                clips: vec![clip(a, "intro.mp4")],
+            },
+            SheetCell {
+                time: 2.5,
+                clips: vec![clip(a, "intro.mp4"), clip(b, "logo.png")],
+            },
+            SheetCell {
+                time: 5.0,
+                clips: Vec::new(),
+            },
+        ];
+        let caption = timeline_sheet_caption(3, 1, (0.0, 7.5), &cells);
+        assert!(
+            caption.starts_with(&format!(
+                "contact sheet 3x1 (row-major) of the cut {} - {}",
+                fmt_ts(0.0),
+                fmt_ts(7.5)
+            )),
+            "{caption}"
+        );
+        for line in [
+            format!("  cell 1: {}  clip {a} \"intro.mp4\"", fmt_ts(0.0)),
+            format!("  cell 2: {}  clip {a} \"intro.mp4\", clip {b} \"logo.png\"", fmt_ts(2.5)),
+            format!("  cell 3: {}  no clip (gap)", fmt_ts(5.0)),
+        ] {
+            assert!(caption.lines().any(|l| l == line), "{line}\n{caption}");
+        }
+    }
+
+    #[test]
+    fn a_sheet_grid_is_clamped_like_skim_assets() {
+        assert_eq!(sheet_grid(None, None, None), (4, 4, 240));
+        assert_eq!(sheet_grid(Some(0), Some(99), Some(10_000)), (1, 8, 640));
+        assert_eq!(sheet_grid(Some(3), Some(2), Some(1)), (3, 2, 80));
+        let p: SkimTimelineParams = serde_json::from_value(serde_json::json!({})).expect("every field is optional");
+        assert!(p.start.is_none() && p.cell.is_none() && p.region.is_none());
+    }
+
+    #[test]
     fn image_results_serialize_as_caption_plus_bare_base64() {
         let jpeg = [0xFF, 0xD8, 0xFF, 0xD9];
         let value =
@@ -8590,6 +8797,7 @@ mod tests {
         for read in [
             "get_timeline_state",
             "preview_timeline",
+            "skim_timeline",
             "staged_diff",
             "get_editor_context",
             "get_levels",
