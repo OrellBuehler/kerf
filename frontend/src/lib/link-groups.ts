@@ -11,6 +11,7 @@
 // identity, not position: an edit carries the *change* to the partners and never
 // forces them to line up. A partner on a locked track refuses the whole edit.
 
+import { sameRamp, sourceToTimeline } from './speed-ramp';
 import type { Clip, Timeline, Track } from './types';
 
 /** kerf-core's `STEP_EPS`: offsets closer than this are the same offset. */
@@ -236,8 +237,7 @@ export function unlinkClips(timeline: Timeline, ids: string[]): number {
  *  the timeline. A reversed clip plays its window backwards, so it is measured from the
  *  out side (`content_offset` in kerf-core). */
 export function contentOffset(clip: Clip): number {
-	const mag = Math.max(Math.abs(clip.speed ?? 1), 0.01);
-	return (clip.speed ?? 1) < 0 ? clip.timeline_start + clip.source_out / mag : clip.timeline_start - clip.source_in / mag;
+	return sourceToTimeline(clip, 0);
 }
 
 /** Whether any clip is linked — the cheap test that lets an unlinked project skip the guard. */
@@ -280,10 +280,12 @@ export function firstSyncBreak(after: Timeline, before: Timeline): [string, stri
 				const inStepBefore =
 					pa.asset_id === pb.asset_id &&
 					Math.abs(speed(pa) - speed(pb)) < EPS &&
+					sameRamp(pa, pb, EPS) &&
 					Math.abs(contentOffset(pa) - contentOffset(pb)) < EPS;
 				if (!inStepBefore) continue;
 				if (
 					Math.abs(speed(a.clip) - speed(b.clip)) >= EPS ||
+					!sameRamp(a.clip, b.clip, EPS) ||
 					Math.abs(contentOffset(a.clip) - contentOffset(b.clip)) >= EPS
 				) {
 					const pair: [number, number] = [Math.min(a.ti, b.ti), Math.max(a.ti, b.ti)];

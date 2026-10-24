@@ -47,6 +47,7 @@
 	import { renderedDuration, renderedFps, timecodeRate } from '#lib/timecode';
 	import { logFrontend } from '#lib/log';
 	import { clipDuration } from '#lib/types';
+	import { timelineToSource } from '#lib/speed-ramp';
 	import type { PreviewDraft, SvgOverlay, TextOverlay } from '#lib/types';
 	import { dragRect, rectOf, rectPatch, roundRect, svgDisplayName, type Rect, type RectHandle } from '#lib/svg-titles';
 	import { boxPadding, containRect, dragPosition, inkBox, isVisibleAt, sampleOverlay, scaledSize, titleFamily } from '#lib/titles';
@@ -70,13 +71,9 @@
 			for (const c of t.clips) {
 				const end = c.timeline_start + clipDuration(c);
 				if (ui.time >= c.timeline_start && ui.time < end) {
-					// Source advances by the speed magnitude per timeline second (and
-					// backwards for a reversed clip).
-					const sp = c.speed ?? 1;
-					const mag = Math.max(Math.abs(sp), 0.01);
-					const srcOffset = (ui.time - c.timeline_start) * mag;
-					const srcTime = sp < 0 ? c.source_out - srcOffset : c.source_in + srcOffset;
-					return { assetId: c.asset_id, srcTime };
+					// Source advances by the speed magnitude per timeline second (through the
+					// clip's ramp, and backwards for a reversed clip).
+					return { assetId: c.asset_id, srcTime: timelineToSource(c, ui.time) };
 				}
 			}
 		}

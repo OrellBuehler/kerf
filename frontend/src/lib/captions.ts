@@ -8,6 +8,7 @@
  *  the same arrangement as `platforms.ts` and `smart-crop.ts`.
  */
 
+import { clipDuration, sourceToTimeline } from './speed-ramp';
 import type { CaptionOptions, CaptionStyle, Clip, TextOverlay, Timeline, TranscriptSegment, Word } from './types';
 
 /** Shortest a generated line stays on screen; below this it reads as a flicker. */
@@ -93,19 +94,8 @@ export function fitSize(text: string, size: number, aspect: number): number {
 	return Math.min(size, (CAPTION_WIDTH * aspect) / (Math.max([...text].length, 1) * CHAR_ADVANCE));
 }
 
-const MIN_SPEED = 0.01;
-const speedMag = (c: Clip) => Math.max(Math.abs(c.speed ?? 1), MIN_SPEED);
-const reversed = (c: Clip) => (c.speed ?? 1) < 0;
-
-export function clipDuration(c: Clip): number {
-	return Math.max(c.source_out - c.source_in, 0) / speedMag(c);
-}
-
-/** Where a source timestamp of this clip lands on the timeline. */
-export function sourceToTimeline(c: Clip, source: number): number {
-	const offset = reversed(c) ? c.source_out - source : source - c.source_in;
-	return c.timeline_start + offset / speedMag(c);
-}
+// The clip's length and where a source timestamp lands on the timeline go through its speed ramp.
+export { clipDuration, sourceToTimeline } from './speed-ramp';
 
 /** Whether any of the source span `[from, to)` is inside the clip's window. */
 export function coversSource(c: Clip, from: number, to: number): boolean {

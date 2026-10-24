@@ -1,5 +1,6 @@
 // The browser harness's `search_transcripts` (kerf-core `transcript::search`, simplified: every
 // combining mark is dropped and each Han / kana / Thai character is a term).
+import { isRamped, sourceToTimeline } from './speed-ramp';
 import type {
 	Asset,
 	AssetAnalysis,
@@ -104,7 +105,8 @@ function cutUses(timeline: Timeline, assetId: string, start: number, end: number
 			const a = Math.max(start, c.source_in);
 			const b = Math.min(end, c.source_out);
 			const speed = Math.max(Math.abs(c.speed ?? 1), 1e-6);
-			const at = (t: number) => c.timeline_start + ((c.speed ?? 1) < 0 ? c.source_out - t : t - c.source_in) / speed;
+			const at = (t: number) =>
+				isRamped(c) ? sourceToTimeline(c, t) : c.timeline_start + ((c.speed ?? 1) < 0 ? c.source_out - t : t - c.source_in) / speed;
 			const [x, y] = [at(a), at(b)];
 			const use: CutUse = { clip_id: c.id, track_id: track.id, start: Math.min(x, y), end: Math.max(x, y) };
 			if (a > start || b < end) use.partial = true;

@@ -4,6 +4,7 @@
  * `Track::align_cuts_to_beats`) so the ruler's ticks, the drag snapping and the
  * browser harness's "cut to the beat" all agree with what the backend does.
  */
+import { along, clipDuration, localAtAlong, sourceToTimeline as clipSourceToTimeline } from './speed-ramp';
 import type { Clip, Tempo, Timeline } from './types';
 
 /** Tempo estimates below this confidence are ignored. */
@@ -12,11 +13,9 @@ export const BEAT_MIN_CONFIDENCE = 0.25;
 /** Shortest clip an alignment may leave behind, seconds. */
 export const MIN_BEAT_CLIP = 0.05;
 
-/** Where a source timestamp of a clip lands on the timeline, honoring speed and reverse. */
+/** Where a source timestamp of a clip lands on the timeline, honoring speed, its ramp and reverse. */
 export function sourceToTimeline(c: Clip, source: number): number {
-	const speed = c.speed ?? 1;
-	const mag = Math.max(Math.abs(speed), 0.01);
-	return c.timeline_start + (speed < 0 ? c.source_out - source : source - c.source_in) / mag;
+	return clipSourceToTimeline(c, source);
 }
 
 /** The marks of the audio tracks (`marksOf` picks which list of an asset's tempo) in timeline
@@ -127,9 +126,8 @@ export function alignCutsToBeats(
 	let previousEnd = 0; // ...and where it ended before
 	for (const clip of clips) {
 		const speed = clip.speed ?? 1;
-		const mag = Math.max(Math.abs(speed), 0.01);
 		const gap = Math.max(clip.timeline_start - previousEnd, 0);
-		previousEnd = clip.timeline_start + (clip.source_out - clip.source_in) / mag;
+		previousEnd = clip.timeline_start + clipDuration(clip);
 
 		let start = cursor + gap;
 		if (gap > 1e-6) {
@@ -140,11 +138,11 @@ export function alignCutsToBeats(
 			}
 		}
 
-		let duration = (clip.source_out - clip.source_in) / mag;
+		let duration = clipDuration(clip);
 		const beat = nearestBeat(beats, start + duration, tolerance);
 		if (beat !== null) {
 			const left = speed < 0 ? clip.source_out : Math.max(limitFor(clip.asset_id) - clip.source_in, 0);
-			const available = Math.max(left / mag, MIN_BEAT_CLIP);
+			const available = Math.max(localAtAlong(clip, left), MIN_BEAT_CLIP);
 			const wanted = Math.min(Math.max(beat - start, MIN_BEAT_CLIP), available);
 			if (Math.abs(wanted - duration) > 1e-6) {
 				moved += 1;
@@ -153,8 +151,8 @@ export function alignCutsToBeats(
 		}
 
 		clip.timeline_start = start;
-		if (speed < 0) clip.source_in = Math.max(clip.source_out - duration * mag, 0);
-		else clip.source_out = clip.source_in + duration * mag;
+		if (speed < 0) clip.source_in = Math.max(clip.source_out - along(clip, duration), 0);
+		else clip.source_out = clip.source_in + along(clip, duration);
 		cursor = start + duration;
 	}
 	return moved;

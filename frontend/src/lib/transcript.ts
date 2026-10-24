@@ -2,6 +2,7 @@
 // timeline clip currently carrying it, so a line can seek to itself, be cut
 // out, and read as struck through once it is gone.
 
+import { localAtAlong } from './speed-ramp';
 import type { Clip, Track, TranscriptSegment, Word } from './types';
 
 export type TxLine = {
@@ -41,12 +42,10 @@ export function fmtClock(s: number): string {
 }
 
 /** Timeline time of a source point within a clip (mirrors the timeline's
- *  mapping, honoring speed and reverse). */
+ *  mapping, honoring speed, its ramp and reverse). */
 export function srcToTimeline(c: Clip, src: number): number {
-	const sp = c.speed ?? 1;
-	const mag = Math.max(Math.abs(sp), 0.01);
-	const off = sp < 0 ? c.source_out - src : src - c.source_in;
-	return c.timeline_start + Math.max(0, off) / mag;
+	const off = (c.speed ?? 1) < 0 ? c.source_out - src : src - c.source_in;
+	return c.timeline_start + localAtAlong(c, Math.max(0, off));
 }
 
 /** Each segment resolved to the clip showing the most of what cutting it removes (its

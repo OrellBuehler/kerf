@@ -865,6 +865,14 @@ export interface CaptionImportRequest {
 	offset?: number;
 }
 
+/** One key of a clip's speed ramp (`SpeedKey`): the speed magnitude from `time` (clip-local timeline seconds), and how
+ *  it moves from here to the next key (`linear` when absent, the backend omits it). */
+export interface SpeedKey {
+	time: number;
+	speed: number;
+	easing?: 'linear' | 'hold';
+}
+
 export interface Clip {
 	id: string;
 	asset_id: string;
@@ -877,6 +885,10 @@ export interface Clip {
 	// New per-clip primitives. Optional so browser-sample / older clip literals
 	// still type-check; the backend always serializes them.
 	speed?: number;
+	/** The clip's playback rate over its length (`speed_ramp.rs`): keys in clip-local timeline seconds. While it
+	 *  holds a well-formed ramp the keys decide the rate and `speed` only gives the direction (its sign). The backend
+	 *  omits it when empty. */
+	speed_ramp?: SpeedKey[];
 	transform?: Transform;
 	color?: Color;
 	/** Curves, colour wheels and a LUT; absent when unused (the backend omits it). */
@@ -2329,11 +2341,7 @@ export const DEFAULT_EXPORT_OPTIONS: ExportOptions = {
 	hwaccel: 'auto'
 };
 
-export const clipDuration = (clip: Clip): number => {
-	const span = Math.max(0, clip.source_out - clip.source_in);
-	const speed = Math.max(Math.abs(clip.speed ?? 1), 0.01);
-	return span / speed;
-};
+export { clipDuration } from './speed-ramp';
 
 /** What detaching sound from several clips did (`AudioDetached` in `crates/kerf-app/src/lib.rs`, the
  *  answer of `extract_audio` and `detach_audio_clips`): the refreshed timeline, how many clips were

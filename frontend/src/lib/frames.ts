@@ -16,6 +16,9 @@
  * it is within reach; frame quantization is what applies otherwise. It is not
  * switched off with the magnet: time has no meaning between frames. */
 
+import { along } from './speed-ramp';
+import type { SpeedKey } from './types';
+
 /** A time this close to a clip edge is that edge (seconds) — see `quantizeTime`. */
 export const WELD_EPS = 1e-6;
 
@@ -235,6 +238,7 @@ export interface TrimSource {
 	source_out: number;
 	timeline_start: number;
 	speed?: number;
+	speed_ramp?: SpeedKey[];
 }
 
 /** The fields a trim writes — only the ones it changes. */
@@ -255,14 +259,13 @@ export interface TrimEdit {
  */
 export function trimEdit(clip: TrimSource, edge: 'l' | 'r', pos: number): TrimEdit {
 	const speed = clip.speed ?? 1;
-	const mag = Math.max(Math.abs(speed), 0.01);
 	if (edge === 'r') {
 		const newDur = pos - clip.timeline_start;
 		return speed < 0
-			? { source_in: clip.source_out - newDur * mag }
-			: { source_out: clip.source_in + newDur * mag };
+			? { source_in: clip.source_out - along(clip, newDur) }
+			: { source_out: clip.source_in + along(clip, newDur) };
 	}
-	const delta = (pos - clip.timeline_start) * mag; // > 0 shortens from the left
+	const delta = along(clip, pos - clip.timeline_start); // > 0 shortens from the left
 	return speed < 0
 		? { source_out: clip.source_out - delta, timeline_start: pos }
 		: { source_in: clip.source_in + delta, timeline_start: pos };

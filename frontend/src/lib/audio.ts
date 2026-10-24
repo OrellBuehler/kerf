@@ -46,6 +46,7 @@
 
 import { getAudio } from './api';
 import type { Clip, MasterBus, Timeline } from './types';
+import { along, clipDuration, clipRamp, rateAutomation, sourceDuration, speedMag } from './speed-ramp';
 import { panGains } from './mixer';
 import {
 	clipGainAt,
@@ -184,10 +185,6 @@ interface Oriented {
 	rev: boolean;
 }
 
-function speedMag(clip: Clip): number {
-	return Math.max(Math.abs(clip.speed ?? 1), 0.01);
-}
-
 export class AudioEngine {
 	#ctx: AudioContext | null = null;
 	#master: Master | null = null;
@@ -277,7 +274,7 @@ export class AudioEngine {
 				if (!clipSounds(clip, audioAssets)) return false;
 				// Still ahead of the playhead in the direction it runs.
 				if (back) return clip.timeline_start < t;
-				return clip.timeline_start + (clip.source_out - clip.source_in) / speedMag(clip) > t;
+				return clip.timeline_start + clipDuration(clip) > t;
 			});
 			if (playing.length === 0) continue;
 			const bus = this.#makeBus(ctx, track.volume ?? 1, track.pan ?? 0);
@@ -501,7 +498,8 @@ export class AudioEngine {
 	#schedule(clip: Clip, buf: AudioBuffer, s: Session, bus: Bus, powerPair = false) {
 		const ctx = this.#ctx!;
 		const mag = speedMag(clip);
-		const dur = (clip.source_out - clip.source_in) / mag;
+		const keys = clipRamp(clip);
+		const dur = clipDuration(clip);
 		const clipStart = clip.timeline_start;
 		const clipEnd = clipStart + dur;
 		const now = ctx.currentTime;
@@ -511,7 +509,7 @@ export class AudioEngine {
 
 		const src = ctx.createBufferSource();
 		src.buffer = buf;
-		src.playbackRate.value = mag * Math.abs(s.rate);
+		if (!keys) src.playbackRate.value = mag * Math.abs(s.rate);
 		const gain = ctx.createGain();
 		src.connect(gain);
 		gain.connect(bus.input);
@@ -524,9 +522,24 @@ export class AudioEngine {
 		// buffer stored the other way round — its end.
 		const entry = back ? clipEnd : clipStart;
 		const inside = back ? clipEnd > nowT : clipStart < nowT;
-		const offsetSrc = inside ? Math.abs(nowT - entry) * mag : 0;
+		const into = inside ? Math.abs(nowT - entry) : 0;
+		// A ramp is run as the player's rate: the source's position is the area under the speed curve.
+		const offsetSrc = !inside ? 0 : keys ? (back ? sourceDuration(clip) - along(clip, dur - into) : along(clip, into)) : into * mag;
 		if (offsetSrc >= buf.duration) return;
-		src.start(Math.max(at(entry), now), offsetSrc, buf.duration - offsetSrc);
+		const startAt = Math.max(at(entry), now);
+		src.start(startAt, offsetSrc, buf.duration - offsetSrc);
+		if (keys) {
+			const rate = src.playbackRate;
+			const k = Math.abs(s.rate);
+			const [from, to] = back ? [0, dur - into] : [into, dur];
+			const [first, ...rest] = rateAutomation(keys, from, to, back);
+			rate.setValueAtTime(first.speed * k, startAt);
+			for (const p of rest) {
+				const when = at(clipStart + p.time);
+				if (p.step) rate.setValueAtTime(p.speed * k, when);
+				else rate.linearRampToValueAtTime(p.speed * k, when);
+			}
+		}
 
 		// Gain envelope: clip volume shaped by fade-in/out. A transition
 		// approximates as an extra fade-in (the export folds it in the same way).

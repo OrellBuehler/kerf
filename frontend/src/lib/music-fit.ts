@@ -12,6 +12,7 @@
  */
 import { BEAT_MIN_CONFIDENCE } from './beats';
 import { formatTime } from './diff';
+import { isRamped } from './speed-ramp';
 import { clipDuration } from './types';
 import type {
 	Asset,
@@ -370,7 +371,7 @@ export function musicFitInputs(timeline: Timeline, src: FitSources, clipId: stri
 	const clip = track?.clips.find((c) => c.id === clipId);
 	if (!track || !clip) throw new Error(`clip not found: ${clipId}`);
 	if (track.kind !== 'audio') throw new Error('invalid argument: fit music to length works on a clip on an audio track');
-	if (Math.abs((clip.speed ?? 1) - 1) > 1e-9) throw new Error('invalid argument: fit music to length needs the clip at normal speed');
+	if (Math.abs((clip.speed ?? 1) - 1) > 1e-9 || isRamped(clip)) throw new Error('invalid argument: fit music to length needs the clip at normal speed');
 	const asset = src.assets.find((a) => a.id === clip.asset_id);
 	if (!asset) throw new Error(`asset not found: ${clip.asset_id}`);
 	const music = src.analysisOf(asset.id)?.music;

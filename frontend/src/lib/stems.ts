@@ -124,6 +124,7 @@ export function placeStems(timeline: Timeline, source: string, stems: readonly A
 			fade_out: clip.fade_out,
 			speed: clip.speed ?? 1
 		};
+		if (clip.speed_ramp?.length) c.speed_ramp = structuredClone(clip.speed_ramp);
 		timeline.tracks.push({ id: newId(), kind: 'audio', name: capitalized(name), clips: [structuredClone(c)] });
 		placed.push(c);
 	});
