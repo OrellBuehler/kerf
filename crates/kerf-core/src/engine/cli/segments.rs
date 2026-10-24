@@ -273,6 +273,7 @@ fn restartable(clip: &Clip, asset: Option<&Asset>, fx: &ClipFx) -> bool {
         && !clip.is_generated()
         && !clip.is_reversed()
         && (clip.speed_mag() - 1.0).abs() < 1e-9
+        && !clip.is_ramped()
         && !clip.crop_animated()
         && clip.effects.is_empty()
         && clip.reframe.is_none()
@@ -331,7 +332,7 @@ pub(super) fn picture_clips(
                 last,
                 input,
                 mpx,
-                source_per_frame: clip.speed_mag() * f64::from(rate.den) / f64::from(rate.num),
+                source_per_frame: clip.mean_speed() * f64::from(rate.den) / f64::from(rate.num),
                 restart: restartable(clip, asset, &fx[this]),
             });
         }

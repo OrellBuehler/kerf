@@ -36,6 +36,8 @@ use std::path::Path;
 
 use crate::model::{bt709_labels, interpolate, Asset, Clip, Hdr, StreamInfo, StreamKind, Timeline, SPLICE_CROSSFADE_S};
 
+pub(crate) mod ramp;
+
 /// The marker a head-padded proxy carries in its file name, ahead of `.mp4`.
 pub(crate) const HEAD_PADDED_SUFFIX: &str = ".lead.mp4";
 
@@ -241,6 +243,15 @@ pub fn transition_fx(timeline: &Timeline, assets: &[Asset]) -> Vec<ClipFx> {
                             // A title's document runs on past its out-point too.
                             let avail = if is_still(p.asset_id) || p.is_generated() {
                                 f64::INFINITY
+                            } else if p.is_ramped() {
+                                // The handle is source; the time it takes to play on is the ramp's,
+                                // at the last key's speed past the clip's end.
+                                let handle = if p.is_reversed() {
+                                    p.source_in
+                                } else {
+                                    asset_dur(p.asset_id).map(|ad| (ad - p.source_out).max(0.0)).unwrap_or(0.0)
+                                };
+                                p.local_at_along(p.source_duration() + handle) - p.duration()
                             } else if p.is_reversed() {
                                 p.source_in / p.speed_mag()
                             } else {
@@ -291,7 +302,8 @@ pub fn transition_fx(timeline: &Timeline, assets: &[Asset]) -> Vec<ClipFx> {
 /// longer than [`SPLICE_CROSSFADE_S`] (a music fit's splice between bars chosen to sound alike,
 /// which constant power would push over the song's own peak).
 pub fn same_sound(out: &Clip, inn: &Clip, overlap: f64) -> bool {
-    if out.asset_id != inn.asset_id || (out.speed - inn.speed).abs() > 1e-9 {
+    // A ramp is a rate that moves: the two sides do not play the same samples at the same pace.
+    if out.asset_id != inn.asset_id || (out.speed - inn.speed).abs() > 1e-9 || out.is_ramped() || inn.is_ramped() {
         return false;
     }
     let (continues, picks_up) = if out.is_reversed() {
@@ -326,11 +338,18 @@ pub fn clips_with_fx<'a>(
 /// for both the per-input `-ss` fast-seek and the in-graph `trim` / `atrim`, so
 /// the seek and the trim window can never drift out of lockstep.
 pub fn clip_source_window(clip: &Clip, fx: &ClipFx) -> (f64, f64) {
-    let s = clip.speed_mag();
-    if clip.is_reversed() {
-        ((clip.source_in - fx.tail * s).max(0.0), clip.source_out)
+    // The tail plays on past the clip's end: `tail` timeline seconds of source at the clip's speed
+    // there (a ramp's last key's, through the map).
+    let tail = if clip.is_ramped() {
+        let end = clip.duration();
+        clip.along(end + fx.tail) - clip.along(end)
     } else {
-        (clip.source_in, clip.source_out + fx.tail * s)
+        fx.tail * clip.speed_mag()
+    };
+    if clip.is_reversed() {
+        ((clip.source_in - tail).max(0.0), clip.source_out)
+    } else {
+        (clip.source_in, clip.source_out + tail)
     }
 }
 
@@ -354,6 +373,10 @@ pub fn picture_window(clip: &Clip, fx: &ClipFx, out_fps: f64) -> (f64, f64) {
         return (start, end);
     }
     let frame = if fx.frame > 0.0 { fx.frame } else { UNKNOWN_FRAME };
+    if clip.is_ramped() {
+        let at = clip.duration() + fx.tail;
+        return (start, end + frame + clip.along(at + 1.0 / out_fps) - clip.along(at));
+    }
     (start, end + frame + clip.speed_mag() / out_fps)
 }
 
@@ -761,8 +784,28 @@ impl<'a> ClipTiming<'a> {
     /// How long into the clip its first picture plays: the [`picture_delay`] of its source
     /// window on a late-starting source, else `0.0`.
     pub fn picture_delay(&self) -> f64 {
+        if self.clip.is_ramped() {
+            // The first picture is `ramp_offset` source seconds in, wherever the ramp has got by then.
+            return match self.ramp_offset() {
+                a if a > 0.0 => self.clip.local_at_along(a),
+                _ => 0.0,
+            };
+        }
         let (start, _) = clip_source_window(self.clip, self.fx);
         picture_delay(start, self.fx.lead, self.clip.speed_mag(), self.clip.is_reversed())
+    }
+
+    /// For a ramped clip: the source seconds travelled before its first picture, when its window
+    /// starts inside a late-starting file's lead (`lead - window start`, forward clips only), else
+    /// `0.0`. The ramp's `setpts` starts its source clock there ([`ramp::setpts`]), where a constant
+    /// speed adds the [`picture_delay`] to the clip's start.
+    pub fn ramp_offset(&self) -> f64 {
+        let (start, _) = clip_source_window(self.clip, self.fx);
+        if self.clip.is_reversed() || start >= self.fx.lead {
+            0.0
+        } else {
+            self.fx.lead - start
+        }
     }
 
     /// The fades of the clip's picture, in the order the chain applies them: its

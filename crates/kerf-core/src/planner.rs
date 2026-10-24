@@ -622,9 +622,14 @@ impl Planner {
                 // A still plan asks for the frame `-ss` lands on (a still image has the one); the
                 // export asks the `fps` filter, which needs the whole window and the rate — of a
                 // still image too, whose `-loop` input is a run of frames like any other.
+                //
+                // A speed ramp has no `fps` pick modelled: its `speed` is infinite, which names no frame
+                // (`run` refuses a speed that is not a positive number) where a constant one would
+                // name a wrong one. The plan is refused for it (`Unsupported::SpeedRamp`) before any
+                // frame is drawn, so this is a guard against a caller that skips the reasons.
                 let pick = if motion {
                     Pick::Fps(FpsPick {
-                        speed: clip.speed_mag(),
+                        speed: if clip.is_ramped() { f64::INFINITY } else { clip.speed_mag() },
                         reverse: clip.is_reversed(),
                         window: planned.picture_window,
                         start: clip.timeline_start,
@@ -704,8 +709,9 @@ impl Planner {
                     timing: PlanTiming {
                         window: planned.window,
                         source_window: planned.source_window,
-                        speed: clip.speed_mag(),
+                        speed: clip.mean_speed(),
                         reversed: clip.is_reversed(),
+                        ramped: clip.is_ramped(),
                     },
                 });
             }

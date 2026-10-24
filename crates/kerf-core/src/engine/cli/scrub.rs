@@ -360,6 +360,7 @@ impl<'a> Snapshot<'a> {
                     && clip.timeline_end() > t + 1e-9
                     && clip.reframe.is_none()
                     && asset.hdr().is_none()
+                    && !clip.is_ramped()
                     && decimates_evenly(asset, clip.speed_mag(), self.grid.fps)
             })
     }

@@ -22,7 +22,7 @@ use super::decode_policy::{
 use super::source_probe::{ProbeCache, SOURCE_PROBE_TIMEOUT};
 use super::ProbeResult;
 use crate::clip_timing::{
-    clip_seek, clip_source_window, end_frame, is_cache_proxy, is_head_padded_proxy, picture_window, transition_fx, ClipFx,
+    clip_seek, clip_source_window, end_frame, is_cache_proxy, is_head_padded_proxy, picture_window, ramp, transition_fx, ClipFx,
     ClipTiming, FadeEdge, FadeStep, FadeTint, Rational, HEAD_PADDED_SUFFIX,
 };
 use crate::error::{Error, Result};
@@ -7980,10 +7980,7 @@ fn build_filter_complex_with(
             } else {
                 format!("{}:a", plan.base + input)
             };
-            chains.push(format!(
-                "[{src}]{chain}[a{flat}]",
-                chain = audio_clip_chain(clip, fmt, &fx[*flat], layout, *mix)
-            ));
+            chains.extend(audio_clip_chains(&src, *flat, clip, fmt, &fx[*flat], layout, *mix));
         }
         // What the final sum adds up, as `(pad, ducked)`: every clip's own pad —
         // or, when metering, each track's submix (tapped on its way in).
@@ -9460,7 +9457,11 @@ fn video_clip_chain_stamped(
             d if d > 0.0 => format!("({}+{d})", clip.timeline_start),
             _ => clip.timeline_start.to_string(),
         };
-        if (s - 1.0).abs() < 1e-9 {
+        if let Some(retime) = ramp::setpts(clip, timing.ramp_offset(), clip.timeline_start) {
+            // A ramp's map takes the source seconds the frame is in to its place on the clip's
+            // timeline, the delay of a late first picture included (`ramp_offset`).
+            p.push(retime);
+        } else if (s - 1.0).abs() < 1e-9 {
             p.push(format!("setpts=PTS-STARTPTS+{start}/TB"));
         } else {
             p.push(format!("setpts=(PTS-STARTPTS)/{s}+{start}/TB"));
@@ -10759,26 +10760,51 @@ fn still_overlay(t: &Transform, motion: (f64, f64)) -> String {
 /// The audio filter chain for one clip (between `[i:a]` and `[a{i}]`): trim,
 /// optional reverse / tempo, gain, fades (including transition cross-fades) and
 /// delay to the clip's timeline position. Defaults reduce to the original chain.
+///
+/// One chain, so one tempo: a clip with a speed ramp of more than one step goes through
+/// [`audio_clip_chains`] instead (this plays it at its mean speed, which is no ramp).
 fn audio_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, layout: &str, mix: TrackMix) -> String {
-    let s = clip.speed_mag();
-    let dur = ClipTiming::new(clip, fx).duration();
+    let mut p = audio_clip_head(clip, fx);
+    let s = if clip.is_ramped() {
+        match ramp::audio_steps(clip, ClipTiming::new(clip, fx).duration()).as_slice() {
+            [only] => only.tempo(),
+            _ => clip.mean_speed(),
+        }
+    } else {
+        clip.speed_mag()
+    };
+    if (s - 1.0).abs() > 1e-9 {
+        p.push(atempo_chain(s));
+    }
+    p.extend(audio_clip_tail(clip, fmt, fx, layout, mix));
+    p.join(",")
+}
+
+/// The sound of a clip as the chain starts it: the source window (with the crossfade tail, and
+/// relative to the input-side `-ss`), restamped to zero, and played backwards when the clip is.
+fn audio_clip_head(clip: &Clip, fx: &ClipFx) -> Vec<String> {
     // Mirror the video crossfade tail (extends below source_in when reversed) and
     // the same input-side `-ss` fast-seek, so the atrim is relative to the seek.
     let (trim_start, trim_end) = clip_source_window(clip, fx);
     let seek = clip_seek(trim_start, fx.lead);
-    let delay = audio_delay(clip.timeline_start, fmt.sample_rate);
-    let fi = clip.fade_in + fx.black_in + fx.white_in + fx.afade_in;
-    let fo = clip.fade_out + fx.black_out + fx.white_out + fx.tail;
-
     let mut p: Vec<String> = Vec::new();
     p.push(format!("atrim=start={}:end={}", trim_start - seek, trim_end - seek));
     p.push("asetpts=PTS-STARTPTS".to_string());
     if clip.is_reversed() {
         p.push("areverse".to_string());
     }
-    if (s - 1.0).abs() > 1e-9 {
-        p.push(atempo_chain(s));
-    }
+    p
+}
+
+/// What follows the tempo in a clip's sound: gain (keyed or not), effects, the fades, the track
+/// fader, the delivery format and pan, and the delay to the clip's place on the timeline.
+fn audio_clip_tail(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, layout: &str, mix: TrackMix) -> Vec<String> {
+    let dur = ClipTiming::new(clip, fx).duration();
+    let delay = audio_delay(clip.timeline_start, fmt.sample_rate);
+    let fi = clip.fade_in + fx.black_in + fx.white_in + fx.afade_in;
+    let fo = clip.fade_out + fx.black_out + fx.white_out + fx.tail;
+
+    let mut p: Vec<String> = Vec::new();
     if clip.volume_animated() {
         // A keyed gain: `volume` evaluated per frame, after `atempo` so its `t` is the
         // clip's own playing time. It holds one gain for a whole frame, so the frames are
@@ -10842,7 +10868,84 @@ fn audio_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, layout: &str, 
         p.push(format!("pan=stereo|c0={}*c0|c1={}*c1", fnum(gl), fnum(gr)));
     }
     p.push(format!("adelay={delay}:all=1"));
-    p.join(",")
+    p
+}
+
+/// The chains of a clip's sound, `[src]…[a{flat}]`: [`audio_clip_chain`]'s one chain, or for a speed
+/// ramp of several steps the pieces of [`ramp::audio_pieces`] cut from the source, each through its own
+/// `atempo` and trimmed to its share of the timeline, crossfaded end to end, and then the chain's usual
+/// tail on the whole. The head is resampled to the delivery rate first, so the trims count its samples.
+///
+/// ```text
+/// [src]atrim=…,asetpts=PTS-STARTPTS,aresample=48000,asplit=3[ar0s0][ar0s1][ar0s2]
+/// [ar0s0]atrim=start=0:end=1.18,asetpts=PTS-STARTPTS,atempo=1.1,adelay=…S:all=1,apad=whole_len=…,atrim=start_sample=0:end_sample=…,asetpts=PTS-STARTPTS[ar0p0]
+/// … [ar0p0][ar0p1]acrossfade=d=0.01[ar0x1] … [ar0x2]volume=1,…,adelay=0:all=1[a0]
+/// ```
+fn audio_clip_chains(
+    src: &str,
+    flat: usize,
+    clip: &Clip,
+    fmt: &ExportFormat,
+    fx: &ClipFx,
+    layout: &str,
+    mix: TrackMix,
+) -> Vec<String> {
+    let steps = if clip.is_ramped() {
+        ramp::audio_steps(clip, ClipTiming::new(clip, fx).duration())
+    } else {
+        Vec::new()
+    };
+    if steps.len() < 2 {
+        return vec![format!(
+            "[{src}]{chain}[a{flat}]",
+            chain = audio_clip_chain(clip, fmt, fx, layout, mix)
+        )];
+    }
+    let (pieces, overlaps) = ramp::audio_pieces(&steps, fmt.sample_rate);
+    let n = pieces.len();
+    let mut chains = Vec::with_capacity(2 * n + 1);
+    let mut head = audio_clip_head(clip, fx);
+    head.push(format!("aresample={}", fmt.sample_rate));
+    head.push(format!(
+        "asplit={n}{}",
+        (0..n).map(|i| format!("[ar{flat}s{i}]")).collect::<String>()
+    ));
+    chains.push(format!("[{src}]{}", head.join(",")));
+    for (i, piece) in pieces.iter().enumerate() {
+        let mut p = vec![
+            format!("atrim=start={}:end={}", piece.from, piece.to),
+            "asetpts=PTS-STARTPTS".to_string(),
+        ];
+        if ramp::tempo_applies(piece.tempo) {
+            p.push(ramp::atempo_stages(piece.tempo));
+        }
+        if piece.lead > 0 {
+            p.push(format!("adelay={}S:all=1", piece.lead));
+        }
+        p.push(format!("apad=whole_len={}", piece.skip + piece.keep));
+        p.push(format!(
+            "atrim=start_sample={}:end_sample={}",
+            piece.skip,
+            piece.skip + piece.keep
+        ));
+        p.push("asetpts=PTS-STARTPTS".to_string());
+        chains.push(format!("[ar{flat}s{i}]{}[ar{flat}p{i}]", p.join(",")));
+    }
+    let mut joined = format!("ar{flat}p0");
+    for (i, overlap) in overlaps.iter().enumerate() {
+        let out = format!("ar{flat}x{}", i + 1);
+        chains.push(format!(
+            "[{joined}][ar{flat}p{}]acrossfade=d={}[{out}]",
+            i + 1,
+            *overlap as f64 / f64::from(fmt.sample_rate)
+        ));
+        joined = out;
+    }
+    chains.push(format!(
+        "[{joined}]{}[a{flat}]",
+        audio_clip_tail(clip, fmt, fx, layout, mix).join(",")
+    ));
+    chains
 }
 
 /// Samples in a frame the keyed volume is evaluated on (2.7 ms at 48 kHz): the gain steps by
@@ -11040,6 +11143,10 @@ mod sweep;
 /// The `fps` pick against the frames the export renders (`#[ignore]`d).
 #[cfg(test)]
 mod picked;
+
+/// Speed ramps through the real `ffmpeg`: the frames, the scrubbed still, the sound's sync (`#[ignore]`d).
+#[cfg(test)]
+mod ramp_rendered;
 
 /// The blurred fill through the real `ffmpeg` (`#[ignore]`d).
 #[cfg(test)]

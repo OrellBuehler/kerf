@@ -66,12 +66,12 @@ impl ActiveClip<'_> {
     }
 }
 
-/// The source time a clip shows at timeline time `t`: honors speed and reverse and
+/// The source time a clip shows at timeline time `t`: honors speed (a ramp's map) and reverse and
 /// is clamped to the asset (`asset_duration`), because a seek past the end would
 /// decode nothing. It is not limited to the clip's own `source_in..source_out`: a
 /// clip playing on under a transition borrows the handle beyond it.
 pub(crate) fn clip_source_time(clip: &Clip, asset_duration: f64, t: f64) -> f64 {
-    let off = (t - clip.timeline_start) * clip.speed_mag();
+    let off = clip.along(t - clip.timeline_start);
     let raw = if clip.is_reversed() {
         clip.source_out - off
     } else {
@@ -547,9 +547,12 @@ pub struct PlanTiming {
     pub window: (f64, f64),
     /// The source window the chain trims (`clip_source_window`, tail included).
     pub source_window: (f64, f64),
-    /// Speed magnitude.
+    /// Speed magnitude: the clip's mean over its length for a speed ramp.
     pub speed: f64,
     pub reversed: bool,
+    /// The speed moves over the clip (`Clip::speed_ramp`): `speed` is its average, the pick names no
+    /// frame, and the compositor refuses the layer ([`Unsupported::SpeedRamp`]).
+    pub ramped: bool,
 }
 
 /// The interpolation `v360` resamples with: the export's, or the still's.
@@ -1172,6 +1175,12 @@ impl RenderPlan {
                 name: layer.name.clone(),
             };
             let stream = &layer.stream;
+            // A ramped clip's frame is chosen by the export's retime expression, whose `fps` pick the
+            // plan does not model (`PlanLayer::pick` names none), and a still of it would show the
+            // frame the map says where the file shows the one its slot has come to: FFmpeg draws it.
+            if layer.timing.ramped {
+                out.push(Unsupported::SpeedRamp(at()));
+            }
             if layer.hdr.is_some() && !caps.hdr {
                 out.push(Unsupported::Hdr(at()));
             }
