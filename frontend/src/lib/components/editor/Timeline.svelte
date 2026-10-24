@@ -108,6 +108,8 @@
 	} from '#lib/timeline-cull';
 	import { clipDuration } from '#lib/types';
 	import { barGrid, beatGrid, beatPeriod, gridMagnets, sourceToTimeline } from '#lib/beats';
+	import { isRamped, meanSpeed } from '#lib/speed-ramp';
+	import { fmtSpeed, miniCurve, rampSummary } from '#lib/speed-ramp-edit';
 	import { NAME_CHIP_PCT, showsLabel } from '#lib/clip-label';
 	import { titleName, titleOf } from '#lib/title-clips';
 	import { fitOffer } from '#lib/music-ui';
@@ -1590,7 +1592,7 @@
 			downX: e.clientX,
 			downScroll: scroller?.scrollLeft ?? 0,
 			dur: clipDuration(c),
-			speed: c.speed ?? 1,
+			speed: meanSpeed(c),
 			requested: 0,
 			moved: false,
 			nx: 0,
@@ -3740,7 +3742,17 @@
 									style="--chip:{NAME_CHIP_PCT}%">{name}</span
 								>
 							{/if}
-							{#if (c.speed ?? 1) !== 1}
+							{#if isRamped(c) && width >= 40}
+								<span
+									data-ramp-badge
+									use:tip={`${rampSummary(c)} (average ${fmtSpeed(meanSpeed(c))})${(c.speed ?? 1) < 0 ? ', reversed' : ''}`}
+									style="position:absolute;right:3px;top:3px;display:inline-flex;align-items:center;gap:3px;font-size:var(--text-2xs);font-weight:700;color:var(--text-on-video);background:color-mix(in srgb,var(--scrim) 55%,transparent);border-radius:3px;padding:1px 4px;pointer-events:none"
+								>
+									<svg width="14" height="9" viewBox="0 0 14 9" aria-hidden="true" style="flex:none"
+										><path d={miniCurve(c, 14, 9)} fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" /></svg
+									>{fmtSpeed(meanSpeed(c), 2)}{(c.speed ?? 1) < 0 ? ' ⟲' : ''}</span
+								>
+							{:else if !isRamped(c) && (c.speed ?? 1) !== 1}
 								{@const sp = c.speed ?? 1}
 								<span
 									use:tip={`Speed ${sp}×`}
