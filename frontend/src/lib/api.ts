@@ -103,6 +103,7 @@ import type {
 	SettingsPatch,
 	SettingsView,
 	SmartCropProgress,
+	SpeedKey,
 	SplitSide,
 	StagedEdit,
 	StagedUndone,
@@ -2878,6 +2879,23 @@ export async function setSpeed(clipId: string, speed: number, link?: boolean): P
 		return snapshot();
 	}
 	return invoke<Timeline>('set_speed', { clipId, speed, link });
+}
+
+/** Give a clip a speed ramp: keys of a clip-local timeline time, a speed magnitude and an easing (`linear` or
+ *  `hold`), sorted by the backend and refused when malformed (a duplicate time, a speed outside 0.01-100x, more
+ *  than 16 keys). Empty `keys` clears the ramp. The source window stays, so the clip's length changes (and
+ *  ripples) as a speed change does; linked partners get the same ramp unless `link` is false. A constant `setSpeed`
+ *  clears it. */
+export async function setSpeedRamp(clipId: string, keys: SpeedKey[], link?: boolean): Promise<Timeline> {
+	if (!inTauri()) {
+		const found = locate(devTimeline, clipId);
+		if (found && titleOf(found[0].clips[found[1]]) && keys.length > 0) {
+			throw new Error('that edit would leave the timeline invalid: the clip is a title, which plays at its own speed');
+		}
+		devRun((tl) => ops.setSpeedRamp(tl, devEnv(undefined, link), clipId, keys));
+		return snapshot();
+	}
+	return invoke<Timeline>('set_speed_ramp', { clipId, keys, link });
 }
 
 /** Update a clip's geometric transform; only the provided fields change. */

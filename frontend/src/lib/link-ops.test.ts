@@ -31,6 +31,7 @@ const layout: [string, (t: Timeline) => unknown][] = [
 	['ripple delete', (t) => ops.rippleDelete(t, env, 'b')],
 	['remove', (t) => ops.remove(t, env, 'b')],
 	['speed', (t) => ops.setSpeed(t, env, 'b', 2)],
+	['speed ramp', (t) => ops.setSpeedRamp(t, env, 'b', [{ time: 0, speed: 2 }])],
 	['duplicate', (t) => ops.duplicateClips(t, env, ['b'], 30)]
 ];
 

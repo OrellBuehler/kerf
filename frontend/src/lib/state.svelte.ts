@@ -127,6 +127,7 @@ import {
 	setFade,
 	setRippleMode,
 	setSpeed,
+	setSpeedRamp,
 	setTransform,
 	setTransformAt,
 	setTransition,
@@ -143,6 +144,7 @@ import type {
 	AudioSync,
 	ClipCut,
 	ClipMove,
+	SpeedKey,
 	SplitSide,
 	ExportProgress,
 	ExportReport,
@@ -1240,6 +1242,9 @@ class EditorState {
 	}
 	setSpeed(clipId: string, speed: number) {
 		return this.#apply(() => setSpeed(clipId, speed));
+	}
+	setSpeedRamp(clipId: string, keys: SpeedKey[]) {
+		return this.#apply(() => setSpeedRamp(clipId, keys));
 	}
 	setTransformAt(clipId: string, time: number, patch: Partial<Transform>) {
 		return this.#apply(() => setTransformAt(clipId, time, patch));

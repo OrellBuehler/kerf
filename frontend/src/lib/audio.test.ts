@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, mock, test } from 'bun:test';
 import { dbToGain, panGains } from './mixer';
 import { limiterParams } from './audio-mix';
 import { alimiterDelay, limiterLimit, type LimiterMessage } from './alimiter';
+import { clipDuration, speedAt, timelineToSource } from './speed-ramp';
 import type { Clip, Timeline, Track } from './types';
 
 // The preview's audio graph, driven over a fake `AudioContext` that records what is
@@ -377,6 +378,39 @@ describe('reverse shuttle', () => {
 							expect(Math.abs(heardAt(src, asked[0][1], src.started[0][1]) - expected), label).toBeLessThan(2 / RATE);
 							expect(src.playbackRate.value, label).toBeCloseTo(mag * Math.abs(rate), 9);
 						}
+	});
+
+	test('a ramped clip is heard at the source time its timeline time maps to, its rate automated along the ramp', async () => {
+		// 1x to 3x over 0.4 s covers the clip's 0.8 s of source exactly.
+		const keys = [
+			{ time: 0, speed: 1 },
+			{ time: 0.4, speed: 3 }
+		];
+		for (const speed of [1, -1])
+			for (const rate of [1, 2, -1, -3])
+				for (const fraction of [0.1, 0.5, 0.9]) {
+					ctx = new FakeContext();
+					const { e, asked } = ramped();
+					const c = clip('c', 'voice', { timeline_start: 1.5, source_in: 0, source_out: 0.8, speed, speed_ramp: keys });
+					const dur = clipDuration(c);
+					expect(dur).toBeCloseTo(0.4, 9);
+					const t = 1.5 + dur * fraction;
+					e.start({ tracks: [track('a1', 'audio', [c])] }, SOUND, t, rate);
+					await settle();
+					const label = `speed ${speed}, rate ${rate}, at ${fraction}`;
+					const [src] = ctx.of<FakeSource>('source');
+					expect(src.started, label).toHaveLength(1);
+					expect(Math.abs(heardAt(src, asked[0][1], src.started[0][1]) - timelineToSource(c, t)), label).toBeLessThan(2 / RATE);
+					// The player's rate is the ramp's speed: a set where it enters, then a straight line to the far end.
+					const calls = src.playbackRate.calls;
+					const k = Math.abs(rate);
+					expect(calls, label).toHaveLength(2);
+					expect(calls[0][0]).toBe('set');
+					expect(calls[0][1]).toBeCloseTo(speedAt(c, dur * fraction) * k, 9);
+					expect(calls[1][0]).toBe('ramp');
+					expect(calls[1][1]).toBeCloseTo((rate > 0 ? 3 : 1) * k, 9);
+					expect(calls[1][2]).toBeCloseTo(((rate > 0 ? 1.5 + dur : 1.5) - t) / rate, 9);
+				}
 	});
 
 	test('one window is fetched once, and turned rather than held twice when the shuttle turns', async () => {

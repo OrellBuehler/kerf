@@ -13,6 +13,7 @@ import {
 	rampAlong,
 	rampIsValid,
 	rampLocalAt,
+	rateAutomation,
 	rampSpeedAt,
 	rebaseRamp,
 	sourceToTimeline,
@@ -254,5 +255,61 @@ describe('rebaseRamp', () => {
 		const c = ramped([key(1, 2), key(1, 3)], 5);
 		rebaseRamp(c, 2);
 		expect(c.speed_ramp).toEqual([key(1, 2), key(1, 3)]);
+	});
+});
+
+describe('rateAutomation', () => {
+	/** The distance a player covers following `points` (events in the order it meets them) — what an `AudioParam`
+	 *  makes of `setValueAtTime` and `linearRampToValueAtTime` — up to `end`, the rate holding after the last event. */
+	function distance(points: ReturnType<typeof rateAutomation>, end: number): number {
+		const last = points[points.length - 1];
+		let total = last.speed * Math.abs(end - last.time);
+		for (let i = 1; i < points.length; i++) {
+			const [p, q] = [points[i - 1], points[i]];
+			const span = Math.abs(q.time - p.time);
+			total += q.step ? p.speed * span : ((p.speed + q.speed) / 2) * span;
+		}
+		return total;
+	}
+
+	const keys = [key(0.5, 1), key(1, 0.25), key(2, 0.25, 'hold'), key(2.5, 4), key(3, 1, 'hold'), key(3.5, 2)];
+
+	test('a player at the automated rate covers what the map says, whichever way it runs', () => {
+		for (const [a, b] of [
+			[0, 4],
+			[0.2, 3.7],
+			[1.4, 2.2],
+			[2.6, 3.4],
+			[0.7, 0.9],
+			[3.2, 5]
+		]) {
+			const want = rampAlong(keys, b) - rampAlong(keys, a);
+			expect(distance(rateAutomation(keys, a, b), b) - want).toBeCloseTo(0, 9);
+			expect(distance(rateAutomation(keys, a, b, true), a) - want).toBeCloseTo(0, 9);
+		}
+	});
+
+	test('it starts where the player does, steps at a hold and ramps along a line', () => {
+		const up = rateAutomation([key(0, 1, 'hold'), key(2, 3), key(4, 1)], 0.5, 3);
+		expect(up).toEqual([
+			{ time: 0.5, speed: 1, step: true },
+			{ time: 2, speed: 3, step: true },
+			{ time: 3, speed: 2, step: false }
+		]);
+		const down = rateAutomation([key(0, 1, 'hold'), key(2, 3), key(4, 1)], 0.5, 3, true);
+		expect(down[0]).toEqual({ time: 3, speed: 2, step: true });
+		expect(down.slice(1)).toEqual([
+			{ time: 2, speed: 3, step: false },
+			{ time: 2, speed: 1, step: true },
+			{ time: 0.5, speed: 1, step: false }
+		]);
+	});
+
+	test('a single key is one constant rate', () => {
+		expect(rateAutomation([key(1, 2)], 0, 5)).toEqual([
+			{ time: 0, speed: 2, step: true },
+			{ time: 1, speed: 2, step: false },
+			{ time: 5, speed: 2, step: false }
+		]);
 	});
 });

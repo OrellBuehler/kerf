@@ -60,6 +60,7 @@ import { checkOwnLanes, conformLinks, rippleLanes } from './ripple';
 import { splitRemoveClips as splitRemoveClipsOn } from './edit-modes';
 import type { Asset, Clip, ClipCut, ClipMove, SpeedKey, SplitSide, Timeline, Track } from './types';
 import { clipDuration } from './types';
+import { trimRamp } from './speed-ramp';
 
 /** What a call is made under: the project's ripple mode (or the call's override), whether
  *  links are in force (`link: false` is off), how far each asset's footage reaches and which
@@ -268,6 +269,8 @@ export function trim(
 			if (sourceIn != null) clip.source_in = sourceIn;
 			if (sourceOut != null) clip.source_out = sourceOut;
 			if (clip.source_out <= clip.source_in) throw invalid('source_out must be greater than source_in');
+			// A ramp rides with the footage: a head given up (or taken on) rebases it, so the tail stays put.
+			trimRamp(was, clip);
 			if (timelineStart != null) {
 				clip.timeline_start = Math.max(0, timelineStart);
 				track.clips.sort((a, b) => a.timeline_start - b.timeline_start);
