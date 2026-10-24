@@ -56,6 +56,7 @@ pub(super) const TOOLS: &[(&str, &str, Effect)] = &[
     ("get_asset_metadata", "Asset metadata", Read),
     ("get_scopes", "Scopes of a frame", Read),
     ("get_transcript", "Transcript", Read),
+    ("get_cut_transcript", "Transcript of the cut", Read),
     ("speaker_ranges", "Speaker time ranges", Read),
     ("find_filler_words", "Find filler words", Read),
     ("refine_transcript", "Refine transcript", Set),

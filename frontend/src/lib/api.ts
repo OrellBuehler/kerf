@@ -25,6 +25,7 @@ import type {
 	Clip,
 	ClipCut,
 	ClipMove,
+	CutTranscript,
 	Mask,
 	MissingAsset,
 	Color,
@@ -213,6 +214,7 @@ import { parsePlaybackMessage } from './frame-transport';
 import { playbackId } from './playback-id';
 import { entryId, mergeSubset, subsetMessage } from './staged-subset';
 import { captionsForTimeline, resolveCaptions } from './captions';
+import { cutTranscript } from './cut-transcript';
 import { estimateWords } from './transcript';
 import { describeError, logFrontend } from './log';
 import { parseLaunchRequest } from './launch';
@@ -3748,6 +3750,34 @@ export async function generateCaptions(options?: CaptionOptions): Promise<Timeli
 		return snapshot();
 	}
 	return invoke<Timeline>('generate_captions', { options: options ?? null });
+}
+
+/** What the cut says: every audible clip's transcript in timeline time, and the assets the cut plays with no
+ *  transcript yet. The harness reads its sample analysis through the `cut-transcript.ts` mirror. */
+export async function getCutTranscript(): Promise<CutTranscript> {
+	if (!inTauri()) {
+		const transcripts: Record<string, TranscriptSegment[]> = {};
+		const untranscribed: CutTranscript['untranscribed'] = [];
+		const soloed = new Set(devTimeline.tracks.filter((t) => t.solo).map((t) => t.kind));
+		for (const track of devTimeline.tracks) {
+			if (track.muted || (soloed.has(track.kind) && !track.solo)) continue;
+			for (const clip of track.clips) {
+				if (clip.enabled === false || clip.source_audio === false) continue;
+				const segs = sampleAnalysis[clip.asset_id]?.transcript;
+				if (segs?.length) {
+					transcripts[clip.asset_id] = segs;
+					continue;
+				}
+				const asset = assetById(clip.asset_id);
+				if (!asset?.streams.some((s) => s.kind === 'audio')) continue;
+				const noted = untranscribed.find((u) => u.asset_id === clip.asset_id);
+				if (noted) noted.clips += 1;
+				else untranscribed.push({ asset_id: clip.asset_id, name: asset.name, clips: 1 });
+			}
+		}
+		return { lines: cutTranscript(devTimeline, transcripts), untranscribed };
+	}
+	return invoke<CutTranscript>('cut_transcript');
 }
 
 /** Remove the generated captions, leaving typed titles and lower-thirds alone. */

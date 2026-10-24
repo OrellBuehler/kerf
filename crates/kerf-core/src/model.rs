@@ -2898,40 +2898,54 @@ fn project_through_clips<'a>(
     layout: CaptionLayout,
 ) -> Vec<CaptionLine> {
     let mut lines: Vec<CaptionLine> = Vec::new();
+    for (_, clip, origin, seg) in segments_in_cut(rendered, segments_for) {
+        let text = seg.text.trim();
+        let window = (clip.timeline_start, clip.timeline_end());
+        if !seg.words.is_empty() {
+            for (shown, spoken, chunk) in word_chunks(&seg.words, seg.end, layout) {
+                let said = clip.source_span_to_timeline(spoken.start, spoken.end);
+                let span = clip.source_span_to_timeline(shown.start, shown.end);
+                let start = span.start.max(window.0);
+                let end = span.end.min(window.1);
+                if said.end.min(window.1) > said.start.max(window.0) && end - start >= layout.min_visible {
+                    lines.push(CaptionLine {
+                        range: TimeRange { start, end },
+                        text: chunk,
+                        origin,
+                    });
+                }
+            }
+            continue;
+        }
+        let span = clip.source_span_to_timeline(seg.start, seg.end);
+        push_caption_lines(&mut lines, text, span, window, origin, layout);
+    }
+    lines
+}
+
+/// Every timed, non-empty segment that meets the source window of a clip of `rendered` showing
+/// its asset, with the track and clip it reaches the cut through and its index among
+/// `segments_for(asset)` — in track order, then clip order, then segment order. What
+/// [`Timeline::captions`] and [`Timeline::cut_transcript`] both map through.
+fn segments_in_cut<'t, 'a>(
+    rendered: &'t Timeline,
+    segments_for: impl Fn(Uuid) -> Option<&'a [TranscriptSegment]>,
+) -> Vec<(&'t Track, &'t Clip, usize, &'a TranscriptSegment)> {
+    let mut found = Vec::new();
     for track in &rendered.tracks {
         for clip in &track.clips {
             let Some(segments) = segments_for(clip.asset_id) else {
                 continue;
             };
-            let window = (clip.timeline_start, clip.timeline_end());
             for (origin, seg) in segments.iter().enumerate() {
-                let text = seg.text.trim();
                 let timed = seg.start.is_finite() && seg.end.is_finite() && seg.end > seg.start;
-                if text.is_empty() || !timed || !clip.covers_source(seg.start, seg.end) {
-                    continue;
+                if !seg.text.trim().is_empty() && timed && clip.covers_source(seg.start, seg.end) {
+                    found.push((track, clip, origin, seg));
                 }
-                if !seg.words.is_empty() {
-                    for (shown, spoken, chunk) in word_chunks(&seg.words, seg.end, layout) {
-                        let said = clip.source_span_to_timeline(spoken.start, spoken.end);
-                        let span = clip.source_span_to_timeline(shown.start, shown.end);
-                        let start = span.start.max(window.0);
-                        let end = span.end.min(window.1);
-                        if said.end.min(window.1) > said.start.max(window.0) && end - start >= layout.min_visible {
-                            lines.push(CaptionLine {
-                                range: TimeRange { start, end },
-                                text: chunk,
-                                origin,
-                            });
-                        }
-                    }
-                    continue;
-                }
-                let span = clip.source_span_to_timeline(seg.start, seg.end);
-                push_caption_lines(&mut lines, text, span, window, origin, layout);
             }
         }
     }
-    lines
+    found
 }
 
 /// How lines that start at the same moment are ordered — which of them gets the
@@ -5086,6 +5100,9 @@ pub use channels::{key_polyline, Property, PropertyKey, PropertyTrack, MAX_CHANN
 
 mod links;
 pub use links::{Detached, DetachedMany, SkippedDetach};
+
+mod cut_transcript;
+pub use cut_transcript::{CutLine, CutWord};
 
 mod subset;
 pub use subset::{AutoIncluded, SkippedChange, SubsetMerge};

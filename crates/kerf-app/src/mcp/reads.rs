@@ -8,12 +8,12 @@
 
 use std::collections::HashMap;
 
-use kerf_core::{AnalysisKind, Asset, AssetAnalysis, ProxyPhase, ProxyStatus, TimeRange, Timeline, TranscriptSegment};
+use kerf_core::{AnalysisKind, Asset, AssetAnalysis, CutLine, ProxyPhase, ProxyStatus, TimeRange, Timeline, TranscriptSegment};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::{schemars, tool, tool_router, ErrorData as McpError};
 use serde::Serialize;
 
-use super::{blocking, core_err, json, lock_agent_as, parse_arg, KerfMcp};
+use super::{blocking, core_err, json, lock_agent_as, parse_arg, require_window, KerfMcp};
 
 /// How much of a transcript a summary quotes.
 const TRANSCRIPT_PREVIEW_CHARS: usize = 600;
@@ -561,6 +561,30 @@ pub(super) fn transcript_window(
         .collect()
 }
 
+/// The lines of the cut's transcript overlapping `range` (timeline seconds), of `speaker` when one
+/// is named (case ignored); their words only with `words`.
+pub(super) fn cut_transcript_window(
+    lines: Vec<CutLine>,
+    range: Option<TimeRange>,
+    speaker: Option<&str>,
+    words: bool,
+) -> Vec<CutLine> {
+    let want = speaker.map(str::trim).filter(|s| !s.is_empty());
+    lines
+        .into_iter()
+        .filter(|l| {
+            range.is_none_or(|r| l.end > r.start && l.start < r.end)
+                && want.is_none_or(|w| l.speaker.as_deref().is_some_and(|sp| sp.eq_ignore_ascii_case(w)))
+        })
+        .map(|mut l| {
+            if !words {
+                l.words.clear();
+            }
+            l
+        })
+        .collect()
+}
+
 /// The speaker labels of a transcript, in order of first appearance.
 pub(super) fn speakers_of(transcript: &[TranscriptSegment]) -> Vec<String> {
     let mut speakers: Vec<String> = Vec::new();
@@ -962,6 +986,26 @@ pub(super) struct TranscriptParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub(super) struct CutTranscriptParams {
+    #[schemars(
+        description = "Only lines that overlap this span of the cut, {start, end} in TIMELINE seconds. Omit for the whole cut."
+    )]
+    range: Option<TimeRange>,
+    #[schemars(
+        description = "Include each line's words with their timeline start/end and source_start/source_end (default false: the lines alone, far fewer tokens). Ask for them over a range."
+    )]
+    words: Option<bool>,
+    #[schemars(description = "Only the lines of this speaker (e.g. \"S2\"), when speakers were labelled")]
+    speaker: Option<String>,
+    #[schemars(
+        description = "Skip this many matching lines (for paging; default 0). `next_offset` in the answer is the next page."
+    )]
+    offset: Option<usize>,
+    #[schemars(description = "Most lines to return (default 100, at most 500)")]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub(super) struct AnalysisDetailParams {
     #[schemars(description = "UUID of the asset (analyzed: analyze_asset)")]
     asset_id: String,
@@ -1133,6 +1177,49 @@ impl KerfMcp {
             map.insert("segments".to_string(), map.get("items").cloned().unwrap_or_default());
             map.remove("items");
         }
+        json(&answer)
+    }
+
+    #[tool(
+        description = "Read what the CUT says: every transcribed clip the cut plays the sound of, its transcript mapped \
+                       through trims, speed and reverse into TIMELINE seconds, in time order — the read for text-based \
+                       editing. Each line is `{start, end, text, speaker, clip_id, track_id, asset_id, source_start, \
+                       source_end}`: the words of one transcript line that one clip keeps (a line a cut splits comes \
+                       once per clip, each with its own words). Muted tracks, disabled clips and a picture whose sound \
+                       was detached say nothing (its audio clip does); overlapping clips on several tracks all come, \
+                       tagged with their clip and track. A word belongs to the clip that plays its midpoint, clipped \
+                       to it. words=true adds each line's `words` with their timeline start/end and their \
+                       source_start/source_end (`estimated: true` when spread over the line rather than reported). To \
+                       cut words, pass the line's clip_id and the words' source_start/source_end to cut_clip_range, or \
+                       use the timeline start/end with split_at / ripple_delete. Paged: `range` {start, end} keeps lines \
+                       overlapping it, `speaker` one speaker's, at most `limit` (default 100, at most 500) from \
+                       `offset`, with `total` and `next_offset`. `untranscribed` lists assets the cut plays with no \
+                       transcript yet — run analyze_asset with steps [\"transcript\"] on them first."
+    )]
+    async fn get_cut_transcript(&self, Parameters(p): Parameters<CutTranscriptParams>) -> Result<String, McpError> {
+        if let Some(r) = p.range {
+            require_window(r.start, r.end)?;
+        }
+        let (offset, limit) = page_of(p.offset, p.limit, DEFAULT_PAGE, MAX_PAGE);
+        let (project, owner) = (self.project.clone(), self.owner());
+        let answer = blocking(move || {
+            let inputs = lock_agent_as(&project, owner.as_deref())
+                .cut_transcript_inputs()
+                .map_err(core_err)?;
+            let cut = inputs.read();
+            let window = cut_transcript_window(cut.lines, p.range, p.speaker.as_deref(), p.words.unwrap_or(false));
+            let mut answer =
+                serde_json::to_value(paged(&window, offset, limit)).map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            if let Some(map) = answer.as_object_mut() {
+                map.insert("lines".to_string(), map.get("items").cloned().unwrap_or_default());
+                map.remove("items");
+                if !cut.untranscribed.is_empty() {
+                    map.insert("untranscribed".to_string(), serde_json::json!(cut.untranscribed));
+                }
+            }
+            Ok(answer)
+        })
+        .await?;
         json(&answer)
     }
 
@@ -1350,6 +1437,34 @@ mod tests {
         let page = paged(&s1, 0, 2);
         assert_eq!((page.total, page.returned, page.next_offset), (3, 2, Some(2)));
         assert!(transcript_window(&a, None, None, Some("S9"), false).is_empty());
+    }
+
+    /// The cut's lines come in timeline time; a range and a speaker narrow them and words come only
+    /// when asked for.
+    #[test]
+    fn a_cut_transcript_read_is_windowed_by_timeline_time() {
+        let asset = Uuid::new_v4();
+        let mut t = Timeline::new();
+        let a1 = t.first_track_of(kerf_core::StreamKind::Audio).unwrap();
+        let track = t.tracks.iter_mut().find(|tr| tr.id == a1).unwrap();
+        track.clips.push(kerf_core::Clip::new(asset, 2.0, 9.0, 10.0));
+        let a = lines();
+        let cut = t.cut_transcript(&HashMap::from([(asset, a.transcript)]));
+        assert_eq!(cut.iter().map(|l| l.start).collect::<Vec<_>>(), [10.0, 12.0, 14.0, 16.0]);
+        assert_eq!(cut[3].text, "one", "a word whose midpoint is past the out-point is not read");
+        assert!(cut.iter().all(|l| l.track_id == a1 && !l.words.is_empty()));
+
+        let plain = cut_transcript_window(cut.clone(), None, None, false);
+        assert!(plain.iter().all(|l| l.words.is_empty()));
+        let text = serde_json::to_string(&plain[0]).unwrap();
+        assert!(!text.contains("\"words\"") && text.contains("\"source_start\":2.0"), "{text}");
+
+        let range = TimeRange { start: 11.0, end: 13.0 };
+        let some = cut_transcript_window(cut.clone(), Some(range), None, true);
+        assert_eq!(some.iter().map(|l| l.start).collect::<Vec<_>>(), [10.0, 12.0]);
+        assert!(some.iter().all(|l| !l.words.is_empty()));
+        let s2 = cut_transcript_window(cut, None, Some("s2"), false);
+        assert!(s2.iter().all(|l| l.speaker.as_deref() == Some("S2")) && !s2.is_empty());
     }
 
     #[test]

@@ -424,6 +424,14 @@ labels; never the words or the lines). `get_transcript { asset_id, words?, speak
 limit? }` (`reads.rs`) pages the lines overlapping the source window, each with its `speaker`, at most `limit`
 (default 100, ≤ 500) from `offset` with `total`, `speakers` and `next_offset` to page on; `words: true` (default
 false) adds the words, estimated on the fly for a transcript cached before words were recorded.
+`get_cut_transcript { range?, words?, speaker?, offset?, limit? }` (`reads.rs`) is the same read for the **cut**, the one
+text-based editing works from: `Project::cut_transcript_inputs` (working timeline + cached transcripts, under the lock) then
+`CutTranscriptInputs::read` (`Timeline::cut_transcript`, pure, lock released). Lines `{start, end, text, speaker, clip_id,
+track_id, asset_id, source_start, source_end}` in timeline seconds, time-ordered, filtered to those overlapping `range`
+(timeline seconds, `require_window`) and paged like `get_transcript` (`lines`, `total`, `next_offset`); `words: true` keeps
+each word's timeline and source bounds (for `cut_clip_range` on the line's clip). `untranscribed` (omitted when empty) names
+the audible assets with an audio stream that have no transcript yet, with their clip count, so the agent knows what to
+`analyze_asset`. The `EDITING_GUIDE` names it as the read for cutting by words.
 `speaker_ranges { asset_id, speaker?, join_gap?, offset?, limit? }` (gap clamped 0..10 s, default 0.75) is "cut to speaker": each
 speaker's source-time ranges (by each word's label, not the line's majority; a window of `limit` ≤ 2000 per speaker, `total_ranges`
 and `more` say what is left) and speaking time.
@@ -645,7 +653,7 @@ Every tool, by purpose (a test pins that this list names each registered tool, a
 
 - **Project and library**: `project_info`, `save_project`, `save_project_as`, `open_project`, `new_project`, `list_assets`,
   `missing_assets`, `get_asset_metadata`, `import_asset`, `set_asset_projection`, `list_fonts`.
-- **Analysis and proxies**: `analyze_asset`, `analysis_status`, `get_transcript`, `speaker_ranges`, `find_filler_words`,
+- **Analysis and proxies**: `analyze_asset`, `analysis_status`, `get_transcript`, `get_cut_transcript`, `speaker_ranges`, `find_filler_words`,
   `refine_transcript`, `get_analysis_detail`,
   `transcription_status`, `download_speech_model`, `set_speech_model`, `proxy_status`, `rebuild_proxy`, `delete_proxy`,
   `get_music_structure`.
