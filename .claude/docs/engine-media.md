@@ -233,6 +233,21 @@ from the samples it already decoded (`Transcriber::refines`). A refinement that 
 failed decode, a cancel, a stop while queued — keeps the transcript with estimated words and no
 speakers: a finished transcription is never thrown away.
 
+**Searching transcripts** (`transcript/search.rs`, pure; `search_transcripts` in `mcp.md`). Text is folded the same
+way on both sides (`terms`): NFD (`unicode-normalization`, already linked through misaki-rs) with the combining marks of
+Latin / Greek / Cyrillic letters dropped (elsewhere a mark is part of its letter: Devanagari vowel signs, kana voicing),
+lower case, apostrophes removed (`don't` = `dont`), any other non-alphanumeric a break, and each Han / kana / Thai /
+Lao / Khmer / Myanmar character a term of its own (those scripts have no spaces). `find_matches` folds every word
+(`words_of`, so an old transcript matches on estimated words and says `estimated`) into one buffer: `phrase` slides
+over the terms across lines, `all_words` takes the tightest window holding every term within one line, `any_word`
+every occurrence, one hit per word; `speaker` filters by the first word's label. `describe` builds the context only
+for the page asked for (the line(s) with the match between « and », ~200 characters, cut at spaces), and `cut_uses` the
+working timeline's clips covering the range (clamped, mapped with `source_span_to_timeline`; `partial`, `disabled`).
+`search_transcripts(inputs, query)` parses each stored analysis row into just `{transcript, ran}`: an asset whose
+transcript step never ran counts in `assets_without_transcript` when it has sound or was named. 50 h of timed words
+(44 MB of JSON) take ~35 ms under the lock and ~200 ms after it in release, most of it parsing (the `#[ignore]`d
+`a_large_library_searches_its_transcripts_quickly`).
+
 **Voiceover works in every build too** (`engine/tts.rs`, always compiled, no cargo
 feature): Kokoro-82M text-to-speech, **in-process on ONNX Runtime**. Nothing of it
 ships — `ort` is built `load-dynamic`, and the runtime library (Microsoft's release

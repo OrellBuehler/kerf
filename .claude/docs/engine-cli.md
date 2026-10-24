@@ -23,7 +23,11 @@ so the feature is **only** activated through these forwards — which is what ma
   **composited timeline still**
   (`timeline_frame_cancellable` / `build_still_args`, pure + unit-tested — overlays
   every clip visible at a timeline time onto a black canvas, mirroring the export
-  geometry, so an agent can *see the cut*), the **cover frame** (`export_still` —
+  geometry, so an agent can *see the cut*; `cli/timeline_sheet.rs` tiles one per moment into
+  `skim_timeline`'s **sheet of the cut** — up to four stills at a time through `run_still_as`
+  (`StillSpawn`: niced, a share of the budget for non-proxy inputs via `tune_still_args_shared`,
+  which at share 1 is `run_still`'s tuning exactly), then one `-f mjpeg … tile` run over the
+  concatenated cells; one export pass would decode every frame of the span), the **cover frame** (`export_still` —
   the same graph and the same builder, but a `StillOutput::File` sink and no
   preview width cap, so the thumbnail is a real frame of the finished video at
   the delivery shape rather than a screenshot to crop back into agreement; the
@@ -1586,3 +1590,20 @@ decimated read misses) and a decimated frame (at most 480 x 270 samples) for the
 the peaks (a 64² vectorscope, cells with at least 1 % of the samples). A measurement, not a frame anyone waits to see:
 ungated by `cpu::lease`, but niced (`bg_command`) and thread-capped by the still's spawn-time tuning, supervised like every still (`output_supervised_sized`: `STILL_TIMEOUT`, the cancel, killed past either), at most
 `MAX_SCOPE_WIDTH` (3840) wide, the pipe read into a buffer sized from the frame (the `capacity` of `output_supervised_sized`, `output_bounded` takes one too). `scopes_of_a_rendered_frame` (`#[ignore]`d) holds a one-pixel clip through the real graph.
+
+## Thumbnails (`thumbnail.rs`)
+
+A designed thumbnail is drawn without a graph of its own: the background is `export_still` of `VideoGraphics::background_of`
+the cut, to a temporary PNG, with `opts.resolution` the delivery frame times `Thumbnail::background_scale` (and times the preview
+width over the thumbnail's for a preview) — at scale 1 the argv is the cover's, so the golden oracle does not move. The frame is
+cropped and scaled with tiny-skia (bicubic), each layer drawn by `svg::raster::render_with` with the fonts its sources name
+(`fonts::snapshot_for`) and composited source-over; a PNG is written atomically, a `.jpg` / `.webp` is that PNG through
+`transcode_image` (`-c:v mjpeg -q:v 2` / `libwebp -quality 90`, killed past `STILL_TIMEOUT`, cancellable, a failed run's file
+removed). **Frame suggestions** (`suggest_frames`): `candidate_times` (pure) splits each video clip's clean window — its span less
+fades, its `transition_in` and the next clip's — at its asset's analyzed scene changes and takes each piece's middle, topped up
+with evenly spread times, at most 24; each is `timeline_frame_yuv_cancellable` at 320 px of the cut with no graphics, three at a
+time; `frame_stats` (mean, spread, clipped share and Laplacian variance of the Y plane) drops black / faded / flat frames
+(`is_blank`), `score_frames` weighs sharpness (relative to the sharpest) 0.5, exposure 0.25, contrast 0.25, and `pick_best` keeps
+the top N at least `span / 4N` apart; the answer carries a labelled PNG contact sheet of them. The `#[ignore]`d
+`a_thumbnail_renders_at_its_size_with_its_layers_and_leaves_the_cover_alone` (`project/thumbnails.rs`) renders lavfi media:
+sizes, a headline changing only its band, PNG / JPEG / WebP, a vertical crop, the cover byte-identical, and suggestions.

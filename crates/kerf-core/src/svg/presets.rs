@@ -206,6 +206,72 @@ pub fn render_preset(kind: SvgPresetKind, params: &SvgPresetParams, duration: f6
     )
 }
 
+/// A thumbnail headline: `params.text` (a line per `\n`, at most three) set large and bold in `color` with a
+/// dark outline, `subtitle` under it in `accent`. Static, and its `viewBox` is the text's own box (estimated,
+/// as the presets' sizes are), so the layer's rectangle alone decides where it lands and how large it is.
+pub fn render_headline(params: &SvgPresetParams) -> String {
+    const SIZE: f64 = 100.0;
+    let lines: Vec<String> = params
+        .text
+        .split('\n')
+        .map(clean_text)
+        .filter(|l| !l.is_empty())
+        .take(3)
+        .collect();
+    let sub_size = 0.45 * SIZE;
+    let est = |text: &str, size: f64| text.chars().count().max(1) as f64 * 0.6 * size;
+    let pad = 0.12 * SIZE;
+    let ctx = Ctx {
+        w: 0.0,
+        h: 0.0,
+        dur: 0.0,
+        font: esc(&font_family(params.font.as_deref())),
+        color: fill(&params.color, "#ffffff"),
+        accent: fill(&params.accent, "#ffb000"),
+        text: String::new(),
+        subtitle: params.subtitle.as_deref().map(clean_text).filter(|s| !s.is_empty()),
+    };
+    let width = lines
+        .iter()
+        .map(|l| est(l, SIZE))
+        .chain(ctx.subtitle.iter().map(|s| est(s, sub_size)))
+        .fold(SIZE, f64::max)
+        + 2.0 * pad;
+    let outline = |size: f64| {
+        format!(
+            " stroke=\"#000000\" stroke-opacity=\"0.85\" stroke-width=\"{}\" stroke-linejoin=\"round\" paint-order=\"stroke\"",
+            fmt_num(0.08 * size)
+        )
+    };
+    let (big, small) = (outline(SIZE), outline(sub_size));
+    let mut body = String::new();
+    let mut top = pad;
+    for line in &lines {
+        body.push_str(
+            &Line::new(width / 2.0, top + 0.88 * SIZE, SIZE, &ctx.color)
+                .bold()
+                .extra(&big)
+                .render(&ctx, &esc(line)),
+        );
+        top += 1.12 * SIZE;
+    }
+    if let Some(sub) = &ctx.subtitle {
+        body.push_str(
+            &Line::new(width / 2.0, top + 0.95 * sub_size, sub_size, &ctx.accent)
+                .bold()
+                .extra(&small)
+                .render(&ctx, &esc(sub)),
+        );
+        top += 1.3 * sub_size;
+    }
+    let height = top + pad;
+    format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{w}\" height=\"{h}\" viewBox=\"0 0 {w} {h}\">{body}</svg>",
+        w = fmt_num(width),
+        h = fmt_num(height),
+    )
+}
+
 fn secs(v: f64) -> String {
     format!("{}s", fmt_num(v))
 }
@@ -464,6 +530,23 @@ mod tests {
 
     fn ink(svg: &str) -> usize {
         draw(svg).pixels().iter().filter(|p| p.alpha() > 0).count()
+    }
+
+    #[test]
+    fn a_headline_is_static_sanitiser_clean_and_boxed_to_its_text() {
+        let mut p = params(true);
+        p.text = "Big & news\nsecond line\n\nthird\nfourth".to_string();
+        let svg = render_headline(&p);
+        let doc = SvgDoc::parse(&svg).unwrap();
+        assert_eq!(doc.sanitized(), svg, "the sanitiser keeps it as it is");
+        assert!(!doc.is_animated() && doc.warnings().is_empty(), "{:?}", doc.warnings());
+        assert_eq!(svg.matches("<text").count(), 4, "three lines and the subtitle: {svg}");
+        assert!(svg.contains("paint-order=\"stroke\"") && svg.contains("&amp;"));
+        let short = render_headline(&SvgPresetParams::new("Hi"));
+        let long = render_headline(&SvgPresetParams::new("A much longer headline"));
+        let width = |svg: &str| crate::svg::intrinsic_size(svg).unwrap().0;
+        assert!(width(&long) > 2.0 * width(&short));
+        assert!(ink(&short) > 0);
     }
 
     #[test]

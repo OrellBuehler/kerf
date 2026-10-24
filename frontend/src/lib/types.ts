@@ -1118,6 +1118,93 @@ export interface Timeline {
 	format?: Delivery | null;
 	/** The master bus. Unset = unity gain, no limiter. */
 	master?: MasterBus;
+	/** Thumbnails designed beside the cut, never drawn in it. The backend omits the list when empty. */
+	thumbnails?: Thumbnail[];
+}
+
+/** Which of the video's own graphics a thumbnail's background keeps — mirrors `kerf_core::VideoGraphics`. */
+export type VideoGraphics = 'none' | 'titles' | 'all';
+
+/** One picture over a thumbnail's background — mirrors `kerf_core::ThumbnailLayer`. Its SVG is fitted
+ *  "contain" into the rect `x, y, width, height` (fractions of the thumbnail). */
+export interface ThumbnailLayer {
+	id: string;
+	name: string;
+	svg: string;
+	/** Set for a headline: what its artwork is made from. */
+	text?: SvgPresetParams | null;
+	/** Set for a layer made from a motion template. */
+	template?: TemplateInstance | null;
+	/** The moment of the artwork drawn (seconds); unset = its settled state. */
+	at?: number | null;
+	x: number;
+	y: number;
+	width: number;
+	height: number;
+	opacity: number;
+}
+
+/** A thumbnail — mirrors `kerf_core::Thumbnail`: a frame of the cut at `time`, cropped to `width` x `height`
+ *  around the focus point, under its own layers. */
+export interface Thumbnail {
+	id: string;
+	name: string;
+	time: number;
+	width: number;
+	height: number;
+	focus_x: number;
+	focus_y: number;
+	graphics?: VideoGraphics;
+	layers?: ThumbnailLayer[];
+}
+
+/** One layer of a `ThumbnailSpec` — mirrors `kerf_core::ThumbnailLayerSpec`: an existing layer (`layer_id`), or a
+ *  new one from exactly one of `text`, `template_id`, `svg`, `image` (a `data:` URL). */
+export interface ThumbnailLayerSpec {
+	layer_id?: string | null;
+	text?: SvgPresetParams | null;
+	template_id?: string | null;
+	values?: Record<string, string> | null;
+	svg?: string | null;
+	image?: string | null;
+	name?: string | null;
+	/** Negative goes back to the settled moment. */
+	at?: number | null;
+	x?: number | null;
+	y?: number | null;
+	width?: number | null;
+	height?: number | null;
+	opacity?: number | null;
+}
+
+/** What a thumbnail should become — mirrors `kerf_core::ThumbnailSpec`; each unset field keeps what it has. */
+export interface ThumbnailSpec {
+	name?: string | null;
+	time?: number | null;
+	/** `youtube`, `vertical`, `square`, `4:5`, `16:9` or `WxH`. */
+	size?: string | null;
+	focus_x?: number | null;
+	focus_y?: number | null;
+	graphics?: VideoGraphics | null;
+	/** The whole new stack, bottom first. */
+	layers?: ThumbnailLayerSpec[] | null;
+}
+
+/** What `set_thumbnail` answers. */
+export interface ThumbnailEdit {
+	timeline: Timeline;
+	thumbnail_id: string;
+	warnings: string[];
+}
+
+/** A frame `suggest_thumbnail_frames` proposes — mirrors `kerf_core::thumbnail::SuggestedFrame`. */
+export interface SuggestedFrame {
+	time: number;
+	/** 0..1: half sharpness, a quarter exposure, a quarter contrast. */
+	score: number;
+	sharpness: number;
+	exposure: number;
+	contrast: number;
 }
 
 /**
@@ -1257,7 +1344,8 @@ export type DiffKind =
 	| 'marker_removed'
 	| 'marker_changed'
 	| 'format_changed'
-	| 'master_changed';
+	| 'master_changed'
+	| 'thumbnails_changed';
 
 export interface DiffEntry {
 	/** The change's stable name, `<kind>:<the clip, text, marker or track it is about>`, which it keeps for
@@ -1378,6 +1466,45 @@ export interface AssetRemoval extends RemovedAsset {
 	timeline: Timeline;
 }
 
+/** One transcript line as the cut plays it: the words of it one clip keeps (`kerf_core::CutLine`). */
+export interface CutLine {
+	/** Timeline seconds. */
+	start: number;
+	end: number;
+	text: string;
+	speaker?: string | null;
+	clip_id: string;
+	track_id: string;
+	asset_id: string;
+	/** The same span in the asset's own seconds. */
+	source_start: number;
+	source_end: number;
+	words?: CutWord[];
+}
+
+/** One word of a `CutLine`, in timeline and source seconds (`kerf_core::CutWord`). */
+export interface CutWord {
+	text: string;
+	start: number;
+	end: number;
+	source_start: number;
+	source_end: number;
+	estimated?: boolean;
+}
+
+/** An asset the cut plays the sound of with no transcript yet (`kerf_core::Untranscribed`). */
+export interface Untranscribed {
+	asset_id: string;
+	name: string;
+	clips: number;
+}
+
+/** What the cut says (`kerf_core::CutTranscript`). */
+export interface CutTranscript {
+	lines: CutLine[];
+	untranscribed: Untranscribed[];
+}
+
 /** An asset whose source file is gone (`kerf_core::MissingAsset`). */
 export interface MissingAsset {
 	asset_id: string;
@@ -1385,6 +1512,59 @@ export interface MissingAsset {
 	path: string;
 	/** Clips of the cut that use it. */
 	clips: number;
+}
+
+/** How the words of a transcript search must appear: in order and adjacent (across lines too), all
+ *  within one line, or any one of them. */
+export type MatchMode = 'phrase' | 'all_words' | 'any_word';
+
+export interface TranscriptQuery {
+	query: string;
+	/** Only these assets; absent searches the whole library. */
+	asset_ids?: string[] | null;
+	speaker?: string | null;
+	mode?: MatchMode;
+	offset?: number | null;
+	/** Default 50, at most 500. */
+	limit?: number | null;
+}
+
+/** A clip of the cut that uses (part of) a hit, in timeline seconds. */
+export interface CutUse {
+	clip_id: string;
+	track_id: string;
+	start: number;
+	end: number;
+	/** The clip holds only part of the hit. */
+	partial?: boolean;
+	disabled?: boolean;
+}
+
+export interface TranscriptHit {
+	asset_id: string;
+	asset_name: string;
+	/** Source seconds, first matched word's start to the last one's end. */
+	start: number;
+	end: number;
+	speaker?: string;
+	text: string;
+	/** The line(s) around the match, the match between « and ». */
+	context: string;
+	words_estimated?: boolean;
+	/** Empty when the cut does not use it. */
+	in_cut: CutUse[];
+}
+
+export interface TranscriptSearch {
+	mode: MatchMode;
+	total: number;
+	offset: number;
+	returned: number;
+	next_offset?: number;
+	searched_assets: number;
+	/** Assets with sound (or named) not transcribed yet: how many, and the first ids. */
+	assets_without_transcript: { count: number; asset_ids: string[] };
+	hits: TranscriptHit[];
 }
 
 export type TaskStatus = 'queued' | 'working' | 'ready' | 'done' | 'failed';
@@ -1538,6 +1718,28 @@ export interface CutSummary {
 export interface PlatformReport {
 	cut: CutSummary;
 	targets: DeliveryCheck[];
+}
+
+/** One check of the editing lint, and the `kind` of what it finds (`kerf_core::review::Check`). */
+export type ReviewCheck = 'flash_frame' | 'mid_word_cut' | 'hard_audio_cut' | 'jump_cut' | 'stale_captions' | 'black_gap';
+
+/** A defect in the cut (`kerf_core::ReviewIssue`), at timeline `time` (to `end` for a span), with the tools that fix it. */
+export interface ReviewIssue {
+	kind: ReviewCheck;
+	severity: Severity;
+	time: number;
+	end?: number;
+	clip_ids: string[];
+	message: string;
+	fix: string;
+}
+
+/** `kerf_core::CutReview`: what the editing lint found, which checks ran and why the others did not. */
+export interface CutReview {
+	issues: ReviewIssue[];
+	counts_by_kind: Partial<Record<ReviewCheck, number>>;
+	checked: ReviewCheck[];
+	skipped: { check: ReviewCheck; reason: string }[];
 }
 
 /** The part of an export that is running (`kerf_core::ExportStage`). */
@@ -2343,6 +2545,16 @@ export interface McpConnectionInfo {
 	claude_code_command: string;
 	/** A `mcpServers` JSON snippet for any other MCP client. */
 	generic_json_config: string;
+	/** The tool sets a client may ask for with `?tools=core,titles` on the URL; without, it gets every tool. */
+	tool_sets: McpToolSet[];
+}
+
+/** One MCP tool set (`crates/kerf-app/src/mcp/toolsets.rs`). */
+export interface McpToolSet {
+	name: string;
+	description: string;
+	/** How many tools it lists; the essentials (guide, summary, staged diff, job status) come with any selection. */
+	tools: number;
 }
 
 /** The agent switches `set_mcp_settings` takes — any of them. The server restarts by itself when

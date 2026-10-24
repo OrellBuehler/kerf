@@ -27,24 +27,32 @@ use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabiliti
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{schemars, tool, tool_handler, tool_router, ErrorData as McpError, ServerHandler};
 use serde::Serialize;
-use tauri::{AppHandle, Emitter, Manager};
 use uuid::Uuid;
+
+use crate::shell::Shell;
 
 mod activity;
 mod args;
+mod batch;
 mod hints;
 mod jobs;
 mod project_tools;
+mod prompts;
 mod reads;
 mod server;
 mod templates;
+mod thumbnails;
+mod toolsets;
 
 use jobs::Run;
-pub(crate) use server::bind_problem;
-pub use server::{
-    check_addr, check_token, connection_info, endpoint_url, generate_token, server_error, settings_changed, start,
-    ConnectionInfo, DEFAULT_ADDR,
+pub(crate) use server::{
+    bind_problem, client_url, current_token, finish_jobs, set_overrides, start, stop, wait_listening, Overrides,
 };
+pub use server::{
+    check_addr, check_token, connection_info, endpoint_url, generate_token, server_error, settings_changed, ConnectionInfo,
+    DEFAULT_ADDR,
+};
+pub use toolsets::ToolSetInfo;
 
 /// Ceilings on the sizes a tool call may ask for. These numbers reach us from a
 /// model reading a schema description, not from a UI slider, so they are
@@ -66,7 +74,7 @@ const SVG_INLINE_LIMIT: usize = 4 * 1024;
 #[derive(Clone)]
 pub struct KerfMcp {
     project: Arc<Mutex<Project>>,
-    app: AppHandle,
+    app: Shell,
     /// The rmcp session this server instance belongs to (the `Mcp-Session-Id` the client sends).
     /// rmcp makes one instance per session, so this is the agent's identity: it owns the
     /// proposal its edits open, and no other session may touch it. `None` for a client that
@@ -864,6 +872,18 @@ struct PlatformCheckParams {
     width: Option<u32>,
     #[schemars(description = "Frame height in pixels; see `width`")]
     height: Option<u32>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ReviewCutParams {
+    #[schemars(
+        description = "Report only what falls in this span of the cut, {start, end} in timeline seconds. Omit for the whole cut"
+    )]
+    range: Option<TimeRange>,
+    #[schemars(
+        description = "Run only these checks: flash_frame, mid_word_cut, hard_audio_cut, jump_cut, stale_captions, black_gap. Omit for all"
+    )]
+    checks: Option<Vec<String>>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -1965,6 +1985,30 @@ struct TimelineFrameParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SkimTimelineParams {
+    #[schemars(description = "Start of the span of the cut in timeline seconds (default 0)")]
+    start: Option<f64>,
+    #[schemars(description = "End of the span in timeline seconds (default the end of the cut)")]
+    end: Option<f64>,
+    #[schemars(description = "Grid columns (default 4, max 8)")]
+    columns: Option<u32>,
+    #[schemars(description = "Grid rows (default 4, max 8)")]
+    rows: Option<u32>,
+    #[schemars(description = "Width of each grid cell in pixels (default 240, 80 to 640)")]
+    cell_width: Option<u32>,
+    #[schemars(
+        description = "Open one cell of the sheet instead of building it: the 1-based, row-major cell number from a previous skim_timeline with the same span and grid. Returns the cut at that cell's moment as one frame, max_width wide (what preview_timeline shows there)."
+    )]
+    cell: Option<u32>,
+    #[schemars(description = "Width of the cell frame in pixels when `cell` is given (default 640, capped at 1920)")]
+    max_width: Option<u32>,
+    #[schemars(
+        description = "With `cell`: zoom into part of that frame, a rectangle in fractions of the frame (0..1), as preview_timeline's `region`. Ignored without `cell`."
+    )]
+    region: Option<RegionParams>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct ScopesParams {
     #[schemars(description = "Timeline position to measure (seconds)")]
     time_secs: f64,
@@ -2426,6 +2470,10 @@ struct TimelineSummary {
     /// source. Absent when there are none.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     title_clips: Vec<TitleClipSummary>,
+    /// The thumbnails designed beside the cut (add_thumbnail), without their layers' sources. Absent
+    /// when there are none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    thumbnails: Vec<serde_json::Value>,
     /// The frame this cut is being made for, e.g. "1080x1920 (cover, 50 fps)" (the rate only when
     /// the delivery states one). Absent when the project follows its footage's shape. Worth reading
     /// before framing anything: under a cover delivery the crop decides what survives.
@@ -2692,7 +2740,6 @@ impl KerfMcp {
                        stopped reporting, and `reported` is false when no window ever has (Kerf headless)."
     )]
     fn get_editor_context(&self) -> Result<String, McpError> {
-        use tauri::Manager;
         match self.app.try_state::<crate::editor_context::EditorContextState>() {
             Some(state) => json(&state.read()),
             None => json(&crate::editor_context::EditorContextState::default().read()),
@@ -2707,8 +2754,9 @@ impl KerfMcp {
                        jobs and subscriptions, paging, history, platform checks, loudness, music, export). \
                        Read it once before your first edit."
     )]
-    fn get_editing_guide(&self) -> Result<String, McpError> {
-        Ok(EDITING_GUIDE.to_string())
+    fn get_editing_guide(&self, context: RequestContext<RoleServer>) -> Result<String, McpError> {
+        let note = tool_selection(&context)?.note().unwrap_or_default();
+        Ok(format!("{EDITING_GUIDE}{note}"))
     }
 
     #[tool(
@@ -2873,11 +2921,13 @@ impl KerfMcp {
         description = "Cut [start, end) of an asset (SOURCE seconds) and append it to the first UNLOCKED track of the asset's main kind — the first unlocked video track for footage, the first unlocked audio track for audio-only media — after the last clip already there (every one of them locked refuses). It does not take a track or a position: add_clip_to_timeline does. Returns the clip."
     )]
     fn cut_clip(&self, Parameters(p): Parameters<CutClipParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::cut_clip_op(project, p))
+    }
+
+    fn cut_clip_op(project: &Project, p: CutClipParams) -> Result<String, McpError> {
         let id = parse_arg("asset_id", &p.asset_id)?;
-        self.edit(|project| {
-            let out = project.cut_clip(id, p.start, p.end).map_err(core_err)?;
-            json(&out)
-        })
+        let out = project.cut_clip(id, p.start, p.end).map_err(core_err)?;
+        json(&out)
     }
 
     #[tool(
@@ -2889,16 +2939,18 @@ impl KerfMcp {
                        `ripple`) a clip dropped onto footage that is already there pushes it later."
     )]
     fn add_clip_to_timeline(&self, Parameters(p): Parameters<AddClipParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::add_clip_to_timeline_op(project, p))
+    }
+
+    fn add_clip_to_timeline_op(project: &Project, p: AddClipParams) -> Result<String, McpError> {
         let asset_id = parse_arg("asset_id", &p.asset_id)?;
         let track_id = p.track_id.as_deref().map(|s| parse_arg("track_id", s)).transpose()?;
-        self.edit(|project| {
-            let out = project
-                .with_ripple(p.ripple, |project| {
-                    project.add_clip_to_timeline(asset_id, track_id, p.source_in, p.source_out, p.timeline_start)
-                })
-                .map_err(core_err)?;
-            json(&out)
-        })
+        let out = project
+            .with_ripple(p.ripple, |project| {
+                project.add_clip_to_timeline(asset_id, track_id, p.source_in, p.source_out, p.timeline_start)
+            })
+            .map_err(core_err)?;
+        json(&out)
     }
 
     #[tool(
@@ -2907,15 +2959,17 @@ impl KerfMcp {
                        linked to each other); pass link=false to split only this clip."
     )]
     fn split_at(&self, Parameters(p): Parameters<SplitParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::split_at_op(project, p))
+    }
+
+    fn split_at_op(project: &Project, p: SplitParams) -> Result<String, McpError> {
         let clip_id = parse_arg("clip_id", &p.clip_id)?;
-        self.edit(|project| {
-            let (left, right) = project
-                .with_links(p.link, |project| {
-                    project.with_ripple(p.ripple, |project| project.split_at(clip_id, p.at))
-                })
-                .map_err(core_err)?;
-            json(&serde_json::json!({ "left": left, "right": right }))
-        })
+        let (left, right) = project
+            .with_links(p.link, |project| {
+                project.with_ripple(p.ripple, |project| project.split_at(clip_id, p.at))
+            })
+            .map_err(core_err)?;
+        json(&serde_json::json!({ "left": left, "right": right }))
     }
 
     #[tool(
@@ -2928,17 +2982,19 @@ impl KerfMcp {
                        trim only this clip. Returns the clip as it ended up."
     )]
     fn trim(&self, Parameters(p): Parameters<TrimParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::trim_op(project, p))
+    }
+
+    fn trim_op(project: &Project, p: TrimParams) -> Result<String, McpError> {
         let clip_id = parse_arg("clip_id", &p.clip_id)?;
-        self.edit(|project| {
-            let out = project
-                .with_links(p.link, |project| {
-                    project.with_ripple(p.ripple, |project| {
-                        project.trim(clip_id, p.source_in, p.source_out, p.timeline_start)
-                    })
+        let out = project
+            .with_links(p.link, |project| {
+                project.with_ripple(p.ripple, |project| {
+                    project.trim(clip_id, p.source_in, p.source_out, p.timeline_start)
                 })
-                .map_err(core_err)?;
-            json(&out)
-        })
+            })
+            .map_err(core_err)?;
+        json(&out)
     }
 
     #[tool(
@@ -2948,12 +3004,14 @@ impl KerfMcp {
                        link=false is not offered here — use move_clip to reposition one clip."
     )]
     fn reorder(&self, Parameters(p): Parameters<ReorderParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::reorder_op(project, p))
+    }
+
+    fn reorder_op(project: &Project, p: ReorderParams) -> Result<String, McpError> {
         let track_id = parse_arg("track_id", &p.track_id)?;
         let clip_id = parse_arg("clip_id", &p.clip_id)?;
-        self.edit(|project| {
-            project.reorder(track_id, clip_id, p.new_index).map_err(core_err)?;
-            Ok("ok".to_string())
-        })
+        project.reorder(track_id, clip_id, p.new_index).map_err(core_err)?;
+        Ok("ok".to_string())
     }
 
     #[tool(
@@ -2964,14 +3022,16 @@ impl KerfMcp {
                        start before 0, land on another clip or sit on a locked track refuses the move."
     )]
     fn move_clip(&self, Parameters(p): Parameters<MoveClipParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::move_clip_op(project, p))
+    }
+
+    fn move_clip_op(project: &Project, p: MoveClipParams) -> Result<String, McpError> {
         let clip_id = parse_arg("clip_id", &p.clip_id)?;
         let track_id = p.track_id.as_deref().map(|s| parse_arg("track_id", s)).transpose()?;
-        self.edit(|project| {
-            let out = project
-                .with_links(p.link, |project| project.move_clip(clip_id, p.timeline_start, track_id))
-                .map_err(core_err)?;
-            json(&out)
-        })
+        let out = project
+            .with_links(p.link, |project| project.move_clip(clip_id, p.timeline_start, track_id))
+            .map_err(core_err)?;
+        json(&out)
     }
 
     #[tool(
@@ -2987,13 +3047,15 @@ impl KerfMcp {
                        the order given, then the linked partners carried along."
     )]
     fn move_clips(&self, Parameters(p): Parameters<MoveClipsParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::move_clips_op(project, p))
+    }
+
+    fn move_clips_op(project: &Project, p: MoveClipsParams) -> Result<String, McpError> {
         let moves = clip_moves(&p.moves)?;
-        self.edit(|project| {
-            let out = project
-                .with_links(p.link, |project| project.move_clips(&moves))
-                .map_err(core_err)?;
-            json(&out)
-        })
+        let out = project
+            .with_links(p.link, |project| project.move_clips(&moves))
+            .map_err(core_err)?;
+        json(&out)
     }
 
     #[tool(
@@ -3002,29 +3064,33 @@ impl KerfMcp {
                        link=false to remove only this clip."
     )]
     fn ripple_delete(&self, Parameters(p): Parameters<RippleDeleteParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::ripple_delete_op(project, p))
+    }
+
+    fn ripple_delete_op(project: &Project, p: RippleDeleteParams) -> Result<String, McpError> {
         let clip_id = parse_arg("clip_id", &p.clip_id)?;
-        self.edit(|project| {
-            project
-                .with_links(p.link, |project| project.ripple_delete(clip_id))
-                .map_err(core_err)?;
-            Ok("ok".to_string())
-        })
+        project
+            .with_links(p.link, |project| project.ripple_delete(clip_id))
+            .map_err(core_err)?;
+        Ok("ok".to_string())
     }
 
     #[tool(
         description = "Cut a source-time range out of a clip and close the gap (split + ripple in one edit) — \
                        the transcript-editing primitive: pass a transcript segment's start/end to delete that \
-                       sentence from the cut, or a word's (get_transcript, find_filler_words) to delete one word. Linked clips lose the same stretch of timeline (a picture's \
+                       sentence from the cut, or a word's (get_transcript, get_cut_transcript, find_filler_words) to delete one word. Linked clips lose the same stretch of timeline (a picture's \
                        detached sound is cut with it); pass link=false to cut only this clip."
     )]
     fn cut_clip_range(&self, Parameters(p): Parameters<CutClipRangeParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::cut_clip_range_op(project, p))
+    }
+
+    fn cut_clip_range_op(project: &Project, p: CutClipRangeParams) -> Result<String, McpError> {
         let clip_id = parse_arg("clip_id", &p.clip_id)?;
-        self.edit(|project| {
-            let pieces = project
-                .with_links(p.link, |project| project.cut_clip_range(clip_id, p.from, p.to))
-                .map_err(core_err)?;
-            json(&pieces)
-        })
+        let pieces = project
+            .with_links(p.link, |project| project.cut_clip_range(clip_id, p.from, p.to))
+            .map_err(core_err)?;
+        json(&pieces)
     }
 
     #[tool(
@@ -3039,13 +3105,15 @@ impl KerfMcp {
                        linked partner pair that shares this one rolls too (clamped to the tightest) unless link=false."
     )]
     fn roll_edit(&self, Parameters(p): Parameters<RollEditParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::roll_edit_op(project, p))
+    }
+
+    fn roll_edit_op(project: &Project, p: RollEditParams) -> Result<String, McpError> {
         let (a, b) = (parse_arg("clip_a", &p.clip_a)?, parse_arg("clip_b", &p.clip_b)?);
-        self.edit(|project| {
-            let out = project
-                .with_links(p.link, |project| project.roll_edit(a, b, p.delta))
-                .map_err(core_err)?;
-            json(&out)
-        })
+        let out = project
+            .with_links(p.link, |project| project.roll_edit(a, b, p.delta))
+            .map_err(core_err)?;
+        json(&out)
     }
 
     #[tool(
@@ -3058,13 +3126,15 @@ impl KerfMcp {
                        ripples. Linked partners slip by the same moment of footage unless link=false."
     )]
     fn slip_clip(&self, Parameters(p): Parameters<SlipClipParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::slip_clip_op(project, p))
+    }
+
+    fn slip_clip_op(project: &Project, p: SlipClipParams) -> Result<String, McpError> {
         let clip_id = parse_arg("clip_id", &p.clip_id)?;
-        self.edit(|project| {
-            let out = project
-                .with_links(p.link, |project| project.slip_clip(clip_id, p.delta))
-                .map_err(core_err)?;
-            json(&out)
-        })
+        let out = project
+            .with_links(p.link, |project| project.slip_clip(clip_id, p.delta))
+            .map_err(core_err)?;
+        json(&out)
     }
 
     #[tool(
@@ -3080,13 +3150,15 @@ impl KerfMcp {
                        giving way and the whole slide clamped to the tightest, unless link=false."
     )]
     fn slide_clip(&self, Parameters(p): Parameters<SlideClipParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::slide_clip_op(project, p))
+    }
+
+    fn slide_clip_op(project: &Project, p: SlideClipParams) -> Result<String, McpError> {
         let clip_id = parse_arg("clip_id", &p.clip_id)?;
-        self.edit(|project| {
-            let out = project
-                .with_links(p.link, |project| project.slide_clip(clip_id, p.delta))
-                .map_err(core_err)?;
-            json(&out)
-        })
+        let out = project
+            .with_links(p.link, |project| project.slide_clip(clip_id, p.delta))
+            .map_err(core_err)?;
+        json(&out)
     }
 
     #[tool(
@@ -3101,15 +3173,17 @@ impl KerfMcp {
                        Errors if `at` is not inside the clip or would leave under 0.05s, or the track is locked."
     )]
     fn split_remove(&self, Parameters(p): Parameters<SplitRemoveParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::split_remove_op(project, p))
+    }
+
+    fn split_remove_op(project: &Project, p: SplitRemoveParams) -> Result<String, McpError> {
         let clip_id = parse_arg("clip_id", &p.clip_id)?;
-        self.edit(|project| {
-            let out = project
-                .with_links(p.link, |project| {
-                    project.with_ripple(p.ripple, |project| project.split_remove(clip_id, p.at, p.side))
-                })
-                .map_err(core_err)?;
-            json(&out)
-        })
+        let out = project
+            .with_links(p.link, |project| {
+                project.with_ripple(p.ripple, |project| project.split_remove(clip_id, p.at, p.side))
+            })
+            .map_err(core_err)?;
+        json(&out)
     }
 
     #[tool(
@@ -3124,35 +3198,41 @@ impl KerfMcp {
                        the clips that remain, in the order given, then the partners'."
     )]
     fn split_remove_clips(&self, Parameters(p): Parameters<SplitRemoveClipsParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::split_remove_clips_op(project, p))
+    }
+
+    fn split_remove_clips_op(project: &Project, p: SplitRemoveClipsParams) -> Result<String, McpError> {
         let cuts = clip_cuts(&p.cuts)?;
-        self.edit(|project| {
-            let out = project
-                .with_links(p.link, |project| {
-                    project.with_ripple(p.ripple, |project| project.split_remove_clips(&cuts, p.side))
-                })
-                .map_err(core_err)?;
-            json(&out)
-        })
+        let out = project
+            .with_links(p.link, |project| {
+                project.with_ripple(p.ripple, |project| project.split_remove_clips(&cuts, p.side))
+            })
+            .map_err(core_err)?;
+        json(&out)
     }
 
     #[tool(
         description = "Add a new empty track (\"video\" or \"audio\"), e.g. a B-roll lane above the interview; later video tracks composite on top at export"
     )]
     fn add_track(&self, Parameters(p): Parameters<AddTrackParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::add_track_op(project, p))
+    }
+
+    fn add_track_op(project: &Project, p: AddTrackParams) -> Result<String, McpError> {
         let kind = parse_kind(&p.kind)?;
-        self.edit(|project| {
-            let track = project.add_track(kind, p.name).map_err(core_err)?;
-            json(&track)
-        })
+        let track = project.add_track(kind, p.name).map_err(core_err)?;
+        json(&track)
     }
 
     #[tool(description = "Remove a track and all of its clips (refuses to remove the last track)")]
     fn remove_track(&self, Parameters(p): Parameters<TrackIdParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::remove_track_op(project, p))
+    }
+
+    fn remove_track_op(project: &Project, p: TrackIdParams) -> Result<String, McpError> {
         let track_id = parse_arg("track_id", &p.track_id)?;
-        self.edit(|project| {
-            project.remove_track(track_id).map_err(core_err)?;
-            Ok("ok".to_string())
-        })
+        project.remove_track(track_id).map_err(core_err)?;
+        Ok("ok".to_string())
     }
 
     #[tool(
@@ -3160,11 +3240,13 @@ impl KerfMcp {
                        other tracks, so e.g. a music bed dips automatically whenever dialogue plays"
     )]
     fn set_track_duck(&self, Parameters(p): Parameters<SetTrackDuckParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::set_track_duck_op(project, p))
+    }
+
+    fn set_track_duck_op(project: &Project, p: SetTrackDuckParams) -> Result<String, McpError> {
         let track_id = parse_arg("track_id", &p.track_id)?;
-        self.edit(|project| {
-            let track = project.set_track_duck(track_id, p.duck).map_err(core_err)?;
-            json(&reads::track_brief(&track))
-        })
+        let track = project.set_track_duck(track_id, p.duck).map_err(core_err)?;
+        json(&reads::track_brief(&track))
     }
 
     #[tool(description = "Cut a clip to a shape: inside the shape the clip is kept, outside it goes \
@@ -3180,40 +3262,42 @@ impl KerfMcp {
                        keyed number is read from its keys, not from this static value, and clearing the \
                        mask clears its keys.")]
     fn set_mask(&self, Parameters(p): Parameters<SetMaskParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::set_mask_op(project, p))
+    }
+
+    fn set_mask_op(project: &Project, p: SetMaskParams) -> Result<String, McpError> {
         let clip_id = parse_arg("clip_id", &p.clip_id)?;
-        self.edit(|project| {
-            let mask = match p.shape {
-                None => None,
-                Some(ref s) => {
-                    let shape = MaskShape::parse(s).ok_or_else(|| {
-                        McpError::invalid_params(format!("invalid mask shape '{s}'; expected \"rect\" or \"ellipse\""), None)
-                    })?;
-                    // Omitted fields keep the clip's current mask, so nudging one
-                    // number (move the ellipse a little left) does not reset the
-                    // size and feather back to the defaults out from under it.
-                    // Deliberately not `.ok()…unwrap_or_default()`: a read that
-                    // failed is not the same answer as "this clip has no mask
-                    // yet", and collapsing the two silently resets every field
-                    // the caller did not name.
-                    let timeline = project.working_timeline().map_err(core_err)?;
-                    let (ti, ci) = timeline
-                        .locate(clip_id)
-                        .ok_or_else(|| core_err(kerf_core::Error::ClipNotFound(clip_id)))?;
-                    let d = timeline.tracks[ti].clips[ci].mask.unwrap_or_default();
-                    Some(Mask {
-                        shape,
-                        x: p.x.unwrap_or(d.x),
-                        y: p.y.unwrap_or(d.y),
-                        width: p.width.unwrap_or(d.width),
-                        height: p.height.unwrap_or(d.height),
-                        feather: p.feather.unwrap_or(d.feather),
-                        inverted: p.inverted.unwrap_or(d.inverted),
-                    })
-                }
-            };
-            let clip = project.set_mask(clip_id, mask).map_err(core_err)?;
-            json(&clip)
-        })
+        let mask = match p.shape {
+            None => None,
+            Some(ref s) => {
+                let shape = MaskShape::parse(s).ok_or_else(|| {
+                    McpError::invalid_params(format!("invalid mask shape '{s}'; expected \"rect\" or \"ellipse\""), None)
+                })?;
+                // Omitted fields keep the clip's current mask, so nudging one
+                // number (move the ellipse a little left) does not reset the
+                // size and feather back to the defaults out from under it.
+                // Deliberately not `.ok()…unwrap_or_default()`: a read that
+                // failed is not the same answer as "this clip has no mask
+                // yet", and collapsing the two silently resets every field
+                // the caller did not name.
+                let timeline = project.working_timeline().map_err(core_err)?;
+                let (ti, ci) = timeline
+                    .locate(clip_id)
+                    .ok_or_else(|| core_err(kerf_core::Error::ClipNotFound(clip_id)))?;
+                let d = timeline.tracks[ti].clips[ci].mask.unwrap_or_default();
+                Some(Mask {
+                    shape,
+                    x: p.x.unwrap_or(d.x),
+                    y: p.y.unwrap_or(d.y),
+                    width: p.width.unwrap_or(d.width),
+                    height: p.height.unwrap_or(d.height),
+                    feather: p.feather.unwrap_or(d.feather),
+                    inverted: p.inverted.unwrap_or(d.inverted),
+                })
+            }
+        };
+        let clip = project.set_mask(clip_id, mask).map_err(core_err)?;
+        json(&clip)
     }
 
     #[tool(
@@ -3224,11 +3308,13 @@ impl KerfMcp {
                        level should simply sit lower rather than dip and recover."
     )]
     fn set_track_volume(&self, Parameters(p): Parameters<SetTrackVolumeParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::set_track_volume_op(project, p))
+    }
+
+    fn set_track_volume_op(project: &Project, p: SetTrackVolumeParams) -> Result<String, McpError> {
         let track_id = parse_arg("track_id", &p.track_id)?;
-        self.edit(|project| {
-            let track = project.set_track_volume(track_id, p.volume).map_err(core_err)?;
-            json(&reads::track_brief(&track))
-        })
+        let track = project.set_track_volume(track_id, p.volume).map_err(core_err)?;
+        json(&reads::track_brief(&track))
     }
 
     #[tool(
@@ -3238,11 +3324,13 @@ impl KerfMcp {
                        this footage is watched on."
     )]
     fn set_track_pan(&self, Parameters(p): Parameters<SetTrackPanParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::set_track_pan_op(project, p))
+    }
+
+    fn set_track_pan_op(project: &Project, p: SetTrackPanParams) -> Result<String, McpError> {
         let track_id = parse_arg("track_id", &p.track_id)?;
-        self.edit(|project| {
-            let track = project.set_track_pan(track_id, p.pan).map_err(core_err)?;
-            json(&reads::track_brief(&track))
-        })
+        let track = project.set_track_pan(track_id, p.pan).map_err(core_err)?;
+        json(&reads::track_brief(&track))
     }
 
     #[tool(
@@ -3253,10 +3341,12 @@ impl KerfMcp {
                        Returns the master bus."
     )]
     fn set_master_volume(&self, Parameters(p): Parameters<SetMasterVolumeParams>) -> Result<String, McpError> {
-        self.edit(|project| {
-            let master = project.set_master_volume(p.volume).map_err(core_err)?;
-            json(&master)
-        })
+        self.edit(|project| Self::set_master_volume_op(project, p))
+    }
+
+    fn set_master_volume_op(project: &Project, p: SetMasterVolumeParams) -> Result<String, McpError> {
+        let master = project.set_master_volume(p.volume).map_err(core_err)?;
+        json(&master)
     }
 
     #[tool(
@@ -3272,10 +3362,12 @@ impl KerfMcp {
                        already under its ceiling and leaves it alone. Returns the master bus."
     )]
     fn set_master_limiter(&self, Parameters(p): Parameters<SetMasterLimiterParams>) -> Result<String, McpError> {
-        self.edit(|project| {
-            let master = project.set_master_limiter(p.enabled, p.ceiling_db).map_err(core_err)?;
-            json(&master)
-        })
+        self.edit(|project| Self::set_master_limiter_op(project, p))
+    }
+
+    fn set_master_limiter_op(project: &Project, p: SetMasterLimiterParams) -> Result<String, McpError> {
+        let master = project.set_master_limiter(p.enabled, p.ceiling_db).map_err(core_err)?;
+        json(&master)
     }
 
     #[tool(
@@ -3286,10 +3378,12 @@ impl KerfMcp {
                        (the setting is kept). Returns the master bus."
     )]
     fn set_master_true_peak(&self, Parameters(p): Parameters<SetMasterTruePeakParams>) -> Result<String, McpError> {
-        self.edit(|project| {
-            let master = project.set_master_true_peak(p.enabled).map_err(core_err)?;
-            json(&master)
-        })
+        self.edit(|project| Self::set_master_true_peak_op(project, p))
+    }
+
+    fn set_master_true_peak_op(project: &Project, p: SetMasterTruePeakParams) -> Result<String, McpError> {
+        let master = project.set_master_true_peak(p.enabled).map_err(core_err)?;
+        json(&master)
     }
 
     #[tool(
@@ -3300,10 +3394,12 @@ impl KerfMcp {
                        the speech is. Returns the master bus."
     )]
     fn set_master_duck(&self, Parameters(p): Parameters<SetMasterDuckParams>) -> Result<String, McpError> {
-        self.edit(|project| {
-            let master = project.set_master_duck(p.depth_db).map_err(core_err)?;
-            json(&master)
-        })
+        self.edit(|project| Self::set_master_duck_op(project, p))
+    }
+
+    fn set_master_duck_op(project: &Project, p: SetMasterDuckParams) -> Result<String, McpError> {
+        let master = project.set_master_duck(p.depth_db).map_err(core_err)?;
+        json(&master)
     }
 
     #[tool(
@@ -3325,17 +3421,19 @@ impl KerfMcp {
                        the rate an export will use (`export_fps`, and where it comes from)."
     )]
     fn set_delivery_format(&self, Parameters(p): Parameters<SetDeliveryFormatParams>) -> Result<String, McpError> {
-        self.edit(|project| {
-            let current = project.working_timeline().map_err(core_err)?.format;
-            let format = next_delivery(&p, current).map_err(core_err)?;
-            let timeline = project.set_delivery_format(format).map_err(core_err)?;
-            let assets = project.list_assets().map_err(core_err)?;
-            json(&serde_json::json!({
-                "format": timeline.format,
-                "export_fps": export_fps_of(&timeline, &assets),
-                "timeline": reads::timeline_brief(&timeline),
-            }))
-        })
+        self.edit(|project| Self::set_delivery_format_op(project, p))
+    }
+
+    fn set_delivery_format_op(project: &Project, p: SetDeliveryFormatParams) -> Result<String, McpError> {
+        let current = project.working_timeline().map_err(core_err)?.format;
+        let format = next_delivery(&p, current).map_err(core_err)?;
+        let timeline = project.set_delivery_format(format).map_err(core_err)?;
+        let assets = project.list_assets().map_err(core_err)?;
+        json(&serde_json::json!({
+            "format": timeline.format,
+            "export_fps": export_fps_of(&timeline, &assets),
+            "timeline": reads::timeline_brief(&timeline),
+        }))
     }
 
     #[tool(
@@ -3344,6 +3442,10 @@ impl KerfMcp {
                        the user can see and jump to. Good for reporting findings from skim_asset."
     )]
     fn add_marker(&self, Parameters(p): Parameters<AddMarkerParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::add_marker_op(project, p))
+    }
+
+    fn add_marker_op(project: &Project, p: AddMarkerParams) -> Result<String, McpError> {
         let patch = kerf_core::MarkerPatch {
             color: p.color,
             duration: p.duration,
@@ -3351,16 +3453,18 @@ impl KerfMcp {
             kind: p.kind,
             ..kerf_core::MarkerPatch::default()
         };
-        self.edit(|project| {
-            let marker = project.add_marker_with(p.time, p.name, patch).map_err(core_err)?;
-            json(&marker)
-        })
+        let marker = project.add_marker_with(p.time, p.name, patch).map_err(core_err)?;
+        json(&marker)
     }
 
     #[tool(
         description = "Move, rename, recolor or re-kind a marker, or set its duration or comment; omitted fields are left alone"
     )]
     fn update_marker(&self, Parameters(p): Parameters<UpdateMarkerParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::update_marker_op(project, p))
+    }
+
+    fn update_marker_op(project: &Project, p: UpdateMarkerParams) -> Result<String, McpError> {
         let marker_id = parse_arg("marker_id", &p.marker_id)?;
         let patch = kerf_core::MarkerPatch {
             time: p.time,
@@ -3370,19 +3474,19 @@ impl KerfMcp {
             comment: p.comment,
             kind: p.kind,
         };
-        self.edit(|project| {
-            let marker = project.edit_marker(marker_id, patch).map_err(core_err)?;
-            json(&marker)
-        })
+        let marker = project.edit_marker(marker_id, patch).map_err(core_err)?;
+        json(&marker)
     }
 
     #[tool(description = "Remove a marker from the timeline")]
     fn remove_marker(&self, Parameters(p): Parameters<MarkerIdParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::remove_marker_op(project, p))
+    }
+
+    fn remove_marker_op(project: &Project, p: MarkerIdParams) -> Result<String, McpError> {
         let marker_id = parse_arg("marker_id", &p.marker_id)?;
-        self.edit(|project| {
-            project.remove_marker(marker_id).map_err(core_err)?;
-            Ok("ok".to_string())
-        })
+        project.remove_marker(marker_id).map_err(core_err)?;
+        Ok("ok".to_string())
     }
 
     #[tool(
@@ -3391,11 +3495,13 @@ impl KerfMcp {
                        without a music bed, or to park B-roll without deleting it."
     )]
     fn set_track_muted(&self, Parameters(p): Parameters<SetTrackMutedParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::set_track_muted_op(project, p))
+    }
+
+    fn set_track_muted_op(project: &Project, p: SetTrackMutedParams) -> Result<String, McpError> {
         let track_id = parse_arg("track_id", &p.track_id)?;
-        self.edit(|project| {
-            let track = project.set_track_muted(track_id, p.muted).map_err(core_err)?;
-            json(&reads::track_brief(&track))
-        })
+        let track = project.set_track_muted(track_id, p.muted).map_err(core_err)?;
+        json(&reads::track_brief(&track))
     }
 
     #[tool(
@@ -3404,11 +3510,13 @@ impl KerfMcp {
                        bed does not blank the picture. Several tracks may be soloed at once."
     )]
     fn set_track_solo(&self, Parameters(p): Parameters<SetTrackSoloParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::set_track_solo_op(project, p))
+    }
+
+    fn set_track_solo_op(project: &Project, p: SetTrackSoloParams) -> Result<String, McpError> {
         let track_id = parse_arg("track_id", &p.track_id)?;
-        self.edit(|project| {
-            let track = project.set_track_solo(track_id, p.solo).map_err(core_err)?;
-            json(&reads::track_brief(&track))
-        })
+        let track = project.set_track_solo(track_id, p.solo).map_err(core_err)?;
+        json(&reads::track_brief(&track))
     }
 
     #[tool(
@@ -3420,11 +3528,13 @@ impl KerfMcp {
                        unlocked since it began cannot be locked again from it (the answer says `locked: false`)."
     )]
     fn set_track_locked(&self, Parameters(p): Parameters<SetTrackLockedParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::set_track_locked_op(project, p))
+    }
+
+    fn set_track_locked_op(project: &Project, p: SetTrackLockedParams) -> Result<String, McpError> {
         let track_id = parse_arg("track_id", &p.track_id)?;
-        self.edit(|project| {
-            let track = project.set_track_locked(track_id, p.locked).map_err(core_err)?;
-            json(&reads::track_brief(&track))
-        })
+        let track = project.set_track_locked(track_id, p.locked).map_err(core_err)?;
+        json(&reads::track_brief(&track))
     }
 
     #[tool(
@@ -3434,11 +3544,13 @@ impl KerfMcp {
                        leaves its linked audio clip playing, so disable that clip too."
     )]
     fn set_clip_enabled(&self, Parameters(p): Parameters<SetClipEnabledParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::set_clip_enabled_op(project, p))
+    }
+
+    fn set_clip_enabled_op(project: &Project, p: SetClipEnabledParams) -> Result<String, McpError> {
         let clip_id = parse_arg("clip_id", &p.clip_id)?;
-        self.edit(|project| {
-            let clip = project.set_clip_enabled(clip_id, p.enabled).map_err(core_err)?;
-            json(&clip)
-        })
+        let clip = project.set_clip_enabled(clip_id, p.enabled).map_err(core_err)?;
+        json(&clip)
     }
 
     #[tool(
@@ -3449,15 +3561,17 @@ impl KerfMcp {
                        outright if any copy would overlap, so a partial paste never lands."
     )]
     fn duplicate_clips(&self, Parameters(p): Parameters<DuplicateClipsParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::duplicate_clips_op(project, p))
+    }
+
+    fn duplicate_clips_op(project: &Project, p: DuplicateClipsParams) -> Result<String, McpError> {
         let ids = p
             .clip_ids
             .iter()
             .map(|s| parse_arg("clip_ids", s))
             .collect::<Result<Vec<_>, _>>()?;
-        self.edit(|project| {
-            let clips = project.duplicate_clips(&ids, p.at).map_err(core_err)?;
-            json(&clips)
-        })
+        let clips = project.duplicate_clips(&ids, p.at).map_err(core_err)?;
+        json(&clips)
     }
 
     #[tool(
@@ -3466,15 +3580,17 @@ impl KerfMcp {
                        it (a picture's detached sound goes too) unless link=false."
     )]
     fn remove(&self, Parameters(p): Parameters<RemoveClipParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::remove_op(project, p))
+    }
+
+    fn remove_op(project: &Project, p: RemoveClipParams) -> Result<String, McpError> {
         let clip_id = parse_arg("clip_id", &p.clip_id)?;
-        self.edit(|project| {
-            project
-                .with_links(p.link, |project| {
-                    project.with_ripple(p.ripple, |project| project.remove(clip_id))
-                })
-                .map_err(core_err)?;
-            Ok("ok".to_string())
-        })
+        project
+            .with_links(p.link, |project| {
+                project.with_ripple(p.ripple, |project| project.remove(clip_id))
+            })
+            .map_err(core_err)?;
+        Ok("ok".to_string())
     }
 
     #[tool(
@@ -3488,34 +3604,36 @@ impl KerfMcp {
                        moved, and how many — ripple on with nothing after the removed clips moves nothing)."
     )]
     fn remove_clips(&self, Parameters(p): Parameters<RemoveClipsParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::remove_clips_op(project, p))
+    }
+
+    fn remove_clips_op(project: &Project, p: RemoveClipsParams) -> Result<String, McpError> {
         let ids = p
             .clip_ids
             .iter()
             .map(|s| parse_arg("clip_ids", s))
             .collect::<Result<Vec<_>, _>>()?;
-        self.edit(|project| {
-            // What the agent sees is the cut it is building: the proposal while it has
-            // one staged, the live timeline otherwise.
-            let before = project.working_timeline().map_err(core_err)?;
-            let (removed, ripple) = project
-                .with_links(p.link, |project| {
-                    project.with_ripple(p.ripple, |project| {
-                        let ripple = project.ripple_active()?;
-                        project.remove_clips(&ids).map(|removed| (removed, ripple))
-                    })
+        // What the agent sees is the cut it is building: the proposal while it has
+        // one staged, the live timeline otherwise.
+        let before = project.working_timeline().map_err(core_err)?;
+        let (removed, ripple) = project
+            .with_links(p.link, |project| {
+                project.with_ripple(p.ripple, |project| {
+                    let ripple = project.ripple_active()?;
+                    project.remove_clips(&ids).map(|removed| (removed, ripple))
                 })
-                .map_err(core_err)?;
-            // Ripple on is a promise to try, not a result: a locked track never moves
-            // and a lane the shift would leave overlapping is declined, silently.
-            // So say what happened.
-            let shifted = project.working_timeline().map_err(core_err)?.clips_moved_since(&before);
-            json(&serde_json::json!({
-                "removed": removed,
-                "ripple_active": ripple,
-                "rippled": shifted > 0,
-                "clips_shifted": shifted,
-            }))
-        })
+            })
+            .map_err(core_err)?;
+        // Ripple on is a promise to try, not a result: a locked track never moves
+        // and a lane the shift would leave overlapping is declined, silently.
+        // So say what happened.
+        let shifted = project.working_timeline().map_err(core_err)?.clips_moved_since(&before);
+        json(&serde_json::json!({
+            "removed": removed,
+            "ripple_active": ripple,
+            "rippled": shifted > 0,
+            "clips_shifted": shifted,
+        }))
     }
 
     #[tool(
@@ -3563,11 +3681,13 @@ impl KerfMcp {
                        keys (pass []) for it to apply."
     )]
     fn set_volume(&self, Parameters(p): Parameters<VolumeParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::set_volume_op(project, p))
+    }
+
+    fn set_volume_op(project: &Project, p: VolumeParams) -> Result<String, McpError> {
         let clip_id = parse_arg("clip_id", &p.clip_id)?;
-        self.edit(|project| {
-            let out = project.set_volume(clip_id, p.volume).map_err(core_err)?;
-            json(&out)
-        })
+        let out = project.set_volume(clip_id, p.volume).map_err(core_err)?;
+        json(&out)
     }
 
     #[tool(
@@ -3577,56 +3697,66 @@ impl KerfMcp {
                        `link_id`) is a separate clip to fade."
     )]
     fn set_fade(&self, Parameters(p): Parameters<FadeParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::set_fade_op(project, p))
+    }
+
+    fn set_fade_op(project: &Project, p: FadeParams) -> Result<String, McpError> {
         let clip_id = parse_arg("clip_id", &p.clip_id)?;
-        self.edit(|project| {
-            let out = project.set_fade(clip_id, p.fade_in, p.fade_out).map_err(core_err)?;
-            json(&out)
-        })
+        let out = project.set_fade(clip_id, p.fade_in, p.fade_out).map_err(core_err)?;
+        json(&out)
     }
 
     #[tool(
         description = "Set a clip's playback speed (1.0 = unchanged, 2.0 = 2x faster, 0.5 = half, negative = reverse); this retimes the clip and changes its timeline duration. In ripple mode (get_ripple_mode, or pass `ripple`) the later clips on the track follow the change in duration. Linked partners are retimed by the same ratio so a picture and its sound stay in step (link=false: this clip only)."
     )]
     fn set_speed(&self, Parameters(p): Parameters<SpeedParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::set_speed_op(project, p))
+    }
+
+    fn set_speed_op(project: &Project, p: SpeedParams) -> Result<String, McpError> {
         let clip_id = parse_arg("clip_id", &p.clip_id)?;
-        self.edit(|project| {
-            let out = project
-                .with_links(p.link, |project| {
-                    project.with_ripple(p.ripple, |project| project.set_speed(clip_id, p.speed))
-                })
-                .map_err(core_err)?;
-            json(&out)
-        })
+        let out = project
+            .with_links(p.link, |project| {
+                project.with_ripple(p.ripple, |project| project.set_speed(clip_id, p.speed))
+            })
+            .map_err(core_err)?;
+        json(&out)
     }
 
     #[tool(
         description = "Set a clip's geometric transform — scale / position (pos_x, pos_y as fractions of the frame) / rotation / opacity / per-edge crop. Use a sub-1.0 scale with a position for picture-in-picture. Omit a field to leave it unchanged. A number that is animated (set_keyframes / add_keyframe, or set_property_keyframes) is read from its keys, not from this static value, which only applies once its keys are cleared; the crop edges are never animated."
     )]
     fn set_transform(&self, Parameters(p): Parameters<TransformParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::set_transform_op(project, p))
+    }
+
+    fn set_transform_op(project: &Project, p: TransformParams) -> Result<String, McpError> {
         let clip_id = parse_arg("clip_id", &p.clip_id)?;
-        self.edit(|project| {
-            let out = project
-                .set_transform(
-                    clip_id,
-                    p.scale,
-                    p.pos_x,
-                    p.pos_y,
-                    p.rotation,
-                    p.opacity,
-                    p.crop_left,
-                    p.crop_right,
-                    p.crop_top,
-                    p.crop_bottom,
-                )
-                .map_err(core_err)?;
-            json(&out)
-        })
+        let out = project
+            .set_transform(
+                clip_id,
+                p.scale,
+                p.pos_x,
+                p.pos_y,
+                p.rotation,
+                p.opacity,
+                p.crop_left,
+                p.crop_right,
+                p.crop_top,
+                p.crop_bottom,
+            )
+            .map_err(core_err)?;
+        json(&out)
     }
 
     #[tool(
         description = "Set how a clip looks at one moment of it (`time`, seconds from the clip's start), in one edit, whether or not it is animated: each named number that has keyframes (set_keyframes / add_keyframe, or set_property_keyframes) gets a key at that time — the rest of the animation is kept — and every other named number, the crop edges always, is set as set_transform sets it. Use it to change a pose without first finding out which numbers are animated. Returns the clip."
     )]
     fn set_transform_at(&self, Parameters(p): Parameters<TransformAtParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::set_transform_at_op(project, p))
+    }
+
+    fn set_transform_at_op(project: &Project, p: TransformAtParams) -> Result<String, McpError> {
         let clip_id = parse_arg("clip_id", &p.clip_id)?;
         let patch = kerf_core::TransformPatch {
             scale: p.scale,
@@ -3639,23 +3769,23 @@ impl KerfMcp {
             crop_top: p.crop_top,
             crop_bottom: p.crop_bottom,
         };
-        self.edit(|project| {
-            let out = project.set_transform_at(clip_id, p.time, patch).map_err(core_err)?;
-            json(&out)
-        })
+        let out = project.set_transform_at(clip_id, p.time, patch).map_err(core_err)?;
+        json(&out)
     }
 
     #[tool(
         description = "Set a clip's color correction — brightness / contrast / saturation / gamma / temperature (warm-cool). Omit a field to leave it unchanged. A number that is animated (set_property_keyframes) is read from its keys, not from this static value, which only applies once its keys are cleared (pass [])."
     )]
     fn set_color(&self, Parameters(p): Parameters<ColorParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::set_color_op(project, p))
+    }
+
+    fn set_color_op(project: &Project, p: ColorParams) -> Result<String, McpError> {
         let clip_id = parse_arg("clip_id", &p.clip_id)?;
-        self.edit(|project| {
-            let out = project
-                .set_color(clip_id, p.brightness, p.contrast, p.saturation, p.gamma, p.temperature)
-                .map_err(core_err)?;
-            json(&out)
-        })
+        let out = project
+            .set_color(clip_id, p.brightness, p.contrast, p.saturation, p.gamma, p.temperature)
+            .map_err(core_err)?;
+        json(&out)
     }
 
     #[tool(
@@ -3670,97 +3800,109 @@ impl KerfMcp {
             kerf_core::paths::validate_import_path(std::path::Path::new(path)).map_err(core_err)?;
             kerf_core::color_lut::inspect_lut(path).map_err(core_err)?;
         }
-        self.edit(|project| {
-            let timeline = project.working_timeline().map_err(core_err)?;
-            let (ti, ci) = timeline
-                .locate(clip_id)
-                .ok_or_else(|| core_err(kerf_core::Error::ClipNotFound(clip_id)))?;
-            let mut grade = timeline.tracks[ti].clips[ci].grade.clone();
-            if let Some(curves) = p.curves.clone() {
-                grade.curves = Some(curves.into());
+        self.edit(|project| Self::set_grade_op(project, clip_id, p))
+    }
+
+    fn set_grade_op(project: &Project, clip_id: Uuid, p: GradeParams) -> Result<String, McpError> {
+        let timeline = project.working_timeline().map_err(core_err)?;
+        let (ti, ci) = timeline
+            .locate(clip_id)
+            .ok_or_else(|| core_err(kerf_core::Error::ClipNotFound(clip_id)))?;
+        let mut grade = timeline.tracks[ti].clips[ci].grade.clone();
+        if let Some(curves) = p.curves.clone() {
+            grade.curves = Some(curves.into());
+        }
+        if let Some(wheels) = p.wheels {
+            grade.wheels = Some(wheels.into());
+        }
+        match (p.lut_path.as_deref(), p.lut_intensity) {
+            (Some(""), _) => grade.lut = None,
+            (Some(path), intensity) => {
+                let kept = grade.lut.as_ref().filter(|l| l.path == path).map(|l| l.intensity);
+                grade.lut = Some(ClipLut {
+                    path: path.to_string(),
+                    intensity: intensity.or(kept).unwrap_or(1.0),
+                });
             }
-            if let Some(wheels) = p.wheels {
-                grade.wheels = Some(wheels.into());
+            (None, Some(intensity)) => {
+                let lut = grade
+                    .lut
+                    .as_mut()
+                    .ok_or_else(|| McpError::invalid_params("the clip has no LUT whose intensity to change", None))?;
+                lut.intensity = intensity;
             }
-            match (p.lut_path.as_deref(), p.lut_intensity) {
-                (Some(""), _) => grade.lut = None,
-                (Some(path), intensity) => {
-                    let kept = grade.lut.as_ref().filter(|l| l.path == path).map(|l| l.intensity);
-                    grade.lut = Some(ClipLut {
-                        path: path.to_string(),
-                        intensity: intensity.or(kept).unwrap_or(1.0),
-                    });
-                }
-                (None, Some(intensity)) => {
-                    let lut = grade
-                        .lut
-                        .as_mut()
-                        .ok_or_else(|| McpError::invalid_params("the clip has no LUT whose intensity to change", None))?;
-                    lut.intensity = intensity;
-                }
-                (None, None) => {}
-            }
-            let out = project.set_grade(clip_id, grade).map_err(core_err)?;
-            json(&out)
-        })
+            (None, None) => {}
+        }
+        let out = project.set_grade(clip_id, grade).map_err(core_err)?;
+        json(&out)
     }
 
     #[tool(
         description = "Set or clear the transition blending a clip's start with the clip before it on the same track, with a duration in seconds; omit kind to clear. A dissolve or a motion transition plays both shots at once, so it borrows the outgoing clip's unused source — a clip trimmed to the very end of its footage has none to lend and the transition falls back to a hard cut. Dips need no handle. Reach for a fade between scenes and a motion transition between shots in a montage; a cut needs no transition at all."
     )]
     fn set_transition(&self, Parameters(p): Parameters<TransitionParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::set_transition_op(project, p))
+    }
+
+    fn set_transition_op(project: &Project, p: TransitionParams) -> Result<String, McpError> {
         let clip_id = parse_arg("clip_id", &p.clip_id)?;
         let transition = parse_transition(p.kind, p.duration)?;
-        self.edit(|project| {
-            let out = project.set_transition(clip_id, transition).map_err(core_err)?;
-            json(&out)
-        })
+        let out = project.set_transition(clip_id, transition).map_err(core_err)?;
+        json(&out)
     }
 
     #[tool(
         description = "Replace a clip's video effect chain (applied in order at export): blur, sharpen, grayscale, invert, vignette, or chroma_key (key a color to transparency so footage on a lower track shows through). Pass an empty list to clear."
     )]
     fn set_video_effects(&self, Parameters(p): Parameters<VideoEffectsParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::set_video_effects_op(project, p))
+    }
+
+    fn set_video_effects_op(project: &Project, p: VideoEffectsParams) -> Result<String, McpError> {
         let clip_id = parse_arg("clip_id", &p.clip_id)?;
-        self.edit(|project| {
-            let out = project.set_video_effects(clip_id, p.effects).map_err(core_err)?;
-            json(&out)
-        })
+        let out = project.set_video_effects(clip_id, p.effects).map_err(core_err)?;
+        json(&out)
     }
 
     #[tool(
         description = "Replace a clip's audio effect chain (applied in order at export): highpass, lowpass, equalizer (parametric band), compressor (dynamics) or gate (noise gate). Pass an empty list to clear."
     )]
     fn set_audio_effects(&self, Parameters(p): Parameters<AudioEffectsParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::set_audio_effects_op(project, p))
+    }
+
+    fn set_audio_effects_op(project: &Project, p: AudioEffectsParams) -> Result<String, McpError> {
         let clip_id = parse_arg("clip_id", &p.clip_id)?;
-        self.edit(|project| {
-            let out = project.set_audio_effects(clip_id, p.effects).map_err(core_err)?;
-            json(&out)
-        })
+        let out = project.set_audio_effects(clip_id, p.effects).map_err(core_err)?;
+        json(&out)
     }
 
     #[tool(
         description = "Replace a clip's whole-transform keyframes — the keys that animate scale / position / rotation / opacity together over time. Two or more keyframes animate the clip (e.g. a Ken Burns zoom, a moving picture-in-picture). An empty list clears these keyframes only: a number that has keys of its own (set_property_keyframes) keeps them, so the clip can still be animated afterwards — clear_keyframes makes the whole transform static. Colour and volume keys are never touched."
     )]
     fn set_keyframes(&self, Parameters(p): Parameters<KeyframesParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::set_keyframes_op(project, p))
+    }
+
+    fn set_keyframes_op(project: &Project, p: KeyframesParams) -> Result<String, McpError> {
         let clip_id = parse_arg("clip_id", &p.clip_id)?;
-        self.edit(|project| {
-            let out = project.set_keyframes(clip_id, p.keyframes).map_err(core_err)?;
-            json(&out)
-        })
+        let out = project.set_keyframes(clip_id, p.keyframes).map_err(core_err)?;
+        json(&out)
     }
 
     #[tool(
         description = "Add (or replace) one transform keyframe at a time offset from the clip's start; unspecified channels capture the clip's current pose there. Use two calls to animate between two poses. A key added inside an eased segment splits it (a hold stays held, a curve stays the same curve); re-keying a moment keeps how it leaves."
     )]
     fn add_keyframe(&self, Parameters(p): Parameters<AddKeyframeParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::add_keyframe_op(project, p))
+    }
+
+    fn add_keyframe_op(project: &Project, p: AddKeyframeParams) -> Result<String, McpError> {
         let clip_id = parse_arg("clip_id", &p.clip_id)?;
-        self.edit(|project| {
-            let out = project
-                .add_keyframe(clip_id, p.time, p.scale, p.pos_x, p.pos_y, p.rotation, p.opacity)
-                .map_err(core_err)?;
-            json(&out)
-        })
+        let out = project
+            .add_keyframe(clip_id, p.time, p.scale, p.pos_x, p.pos_y, p.rotation, p.opacity)
+            .map_err(core_err)?;
+        json(&out)
     }
 
     #[tool(
@@ -3770,15 +3912,17 @@ impl KerfMcp {
                        (a colour number, the volume, or a transform number). Returns the clip."
     )]
     fn set_keyframe_easing(&self, Parameters(p): Parameters<SetKeyframeEasingParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::set_keyframe_easing_op(project, p))
+    }
+
+    fn set_keyframe_easing_op(project: &Project, p: SetKeyframeEasingParams) -> Result<String, McpError> {
         let clip_id = parse_arg("clip_id", &p.clip_id)?;
-        self.edit(|project| {
-            let out = match p.prop {
-                Some(prop) => project.set_property_easing(clip_id, prop, p.time, p.easing),
-                None => project.set_keyframe_easing(clip_id, p.time, p.easing),
-            }
-            .map_err(core_err)?;
-            json(&out)
-        })
+        let out = match p.prop {
+            Some(prop) => project.set_property_easing(clip_id, prop, p.time, p.easing),
+            None => project.set_keyframe_easing(clip_id, p.time, p.easing),
+        }
+        .map_err(core_err)?;
+        json(&out)
     }
 
     #[tool(
@@ -3796,11 +3940,13 @@ impl KerfMcp {
                        Returns the clip."
     )]
     fn set_property_keyframes(&self, Parameters(p): Parameters<PropertyKeyframesParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::set_property_keyframes_op(project, p))
+    }
+
+    fn set_property_keyframes_op(project: &Project, p: PropertyKeyframesParams) -> Result<String, McpError> {
         let clip_id = parse_arg("clip_id", &p.clip_id)?;
-        self.edit(|project| {
-            let out = project.set_property_keyframes(clip_id, p.prop, p.keys).map_err(core_err)?;
-            json(&out)
-        })
+        let out = project.set_property_keyframes(clip_id, p.prop, p.keys).map_err(core_err)?;
+        json(&out)
     }
 
     #[tool(
@@ -3809,12 +3955,14 @@ impl KerfMcp {
                        colour keys at once, as one undo step. Numbers not listed are untouched. Returns the clip."
     )]
     fn set_property_tracks(&self, Parameters(p): Parameters<PropertyTracksParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::set_property_tracks_op(project, p))
+    }
+
+    fn set_property_tracks_op(project: &Project, p: PropertyTracksParams) -> Result<String, McpError> {
         let clip_id = parse_arg("clip_id", &p.clip_id)?;
-        self.edit(|project| {
-            let tracks = p.tracks.into_iter().map(PropertyTrack::from).collect();
-            let out = project.set_property_tracks(clip_id, tracks).map_err(core_err)?;
-            json(&out)
-        })
+        let tracks = p.tracks.into_iter().map(PropertyTrack::from).collect();
+        let out = project.set_property_tracks(clip_id, tracks).map_err(core_err)?;
+        json(&out)
     }
 
     #[tool(
@@ -3824,27 +3972,31 @@ impl KerfMcp {
                        destination clip."
     )]
     fn copy_keyframes(&self, Parameters(p): Parameters<CopyKeyframesParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::copy_keyframes_op(project, p))
+    }
+
+    fn copy_keyframes_op(project: &Project, p: CopyKeyframesParams) -> Result<String, McpError> {
         let (from, to) = (
             parse_arg("from_clip_id", &p.from_clip_id)?,
             parse_arg("to_clip_id", &p.to_clip_id)?,
         );
-        self.edit(|project| {
-            let out = project
-                .copy_keyframes(from, to, &p.props.unwrap_or_default(), p.offset.unwrap_or(0.0))
-                .map_err(core_err)?;
-            json(&out)
-        })
+        let out = project
+            .copy_keyframes(from, to, &p.props.unwrap_or_default(), p.offset.unwrap_or(0.0))
+            .map_err(core_err)?;
+        json(&out)
     }
 
     #[tool(
         description = "Remove all transform keyframes from a clip (back to its static transform): the whole-transform keys and any scale / position / rotation / opacity keys of their own. Colour and volume keys stay — clear those with set_property_keyframes and an empty list."
     )]
     fn clear_keyframes(&self, Parameters(p): Parameters<ClipIdParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::clear_keyframes_op(project, p))
+    }
+
+    fn clear_keyframes_op(project: &Project, p: ClipIdParams) -> Result<String, McpError> {
         let clip_id = parse_arg("clip_id", &p.clip_id)?;
-        self.edit(|project| {
-            let out = project.clear_keyframes(clip_id).map_err(core_err)?;
-            json(&out)
-        })
+        let out = project.clear_keyframes(clip_id).map_err(core_err)?;
+        json(&out)
     }
 
     #[tool(
@@ -3854,13 +4006,15 @@ impl KerfMcp {
                        and decide where the subject is. Omit a field to leave it unchanged."
     )]
     fn set_reframe(&self, Parameters(p): Parameters<ReframeParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::set_reframe_op(project, p))
+    }
+
+    fn set_reframe_op(project: &Project, p: ReframeParams) -> Result<String, McpError> {
         let clip_id = parse_arg("clip_id", &p.clip_id)?;
-        self.edit(|project| {
-            let out = project
-                .set_reframe(clip_id, p.yaw, p.pitch, p.roll, p.fov, p.lens_fov, p.input, p.output)
-                .map_err(core_err)?;
-            json(&out)
-        })
+        let out = project
+            .set_reframe(clip_id, p.yaw, p.pitch, p.roll, p.fov, p.lens_fov, p.input, p.output)
+            .map_err(core_err)?;
+        json(&out)
     }
 
     #[tool(
@@ -3892,11 +4046,13 @@ impl KerfMcp {
                        the timeline."
     )]
     fn clear_reframe(&self, Parameters(p): Parameters<ClipIdParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::clear_reframe_op(project, p))
+    }
+
+    fn clear_reframe_op(project: &Project, p: ClipIdParams) -> Result<String, McpError> {
         let clip_id = parse_arg("clip_id", &p.clip_id)?;
-        self.edit(|project| {
-            let out = project.clear_reframe(clip_id).map_err(core_err)?;
-            json(&out)
-        })
+        let out = project.clear_reframe(clip_id).map_err(core_err)?;
+        json(&out)
     }
 
     #[tool(
@@ -3905,11 +4061,13 @@ impl KerfMcp {
                        view. Pass an empty list to hold a static pose."
     )]
     fn set_reframe_keyframes(&self, Parameters(p): Parameters<ReframeKeyframesParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::set_reframe_keyframes_op(project, p))
+    }
+
+    fn set_reframe_keyframes_op(project: &Project, p: ReframeKeyframesParams) -> Result<String, McpError> {
         let clip_id = parse_arg("clip_id", &p.clip_id)?;
-        self.edit(|project| {
-            let out = project.set_reframe_keyframes(clip_id, p.keyframes).map_err(core_err)?;
-            json(&out)
-        })
+        let out = project.set_reframe_keyframes(clip_id, p.keyframes).map_err(core_err)?;
+        json(&out)
     }
 
     #[tool(
@@ -3917,47 +4075,55 @@ impl KerfMcp {
                        channels capture the camera's current pose there. Two calls pan between two directions."
     )]
     fn add_reframe_keyframe(&self, Parameters(p): Parameters<AddReframeKeyframeParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::add_reframe_keyframe_op(project, p))
+    }
+
+    fn add_reframe_keyframe_op(project: &Project, p: AddReframeKeyframeParams) -> Result<String, McpError> {
         let clip_id = parse_arg("clip_id", &p.clip_id)?;
-        self.edit(|project| {
-            let out = project
-                .add_reframe_keyframe(clip_id, p.time, p.yaw, p.pitch, p.roll, p.fov)
-                .map_err(core_err)?;
-            json(&out)
-        })
+        let out = project
+            .add_reframe_keyframe(clip_id, p.time, p.yaw, p.pitch, p.roll, p.fov)
+            .map_err(core_err)?;
+        json(&out)
     }
 
     #[tool(
         description = "Add a text overlay (title / lower-third / caption / watermark) drawn over the composited picture between start and end (timeline seconds). Returns the overlay; style or animate it with update_overlay / set_overlay_keyframes."
     )]
     fn add_overlay(&self, Parameters(p): Parameters<AddOverlayParams>) -> Result<String, McpError> {
-        self.edit(|project| {
-            let out = project.add_overlay(p.text, p.start, p.end).map_err(core_err)?;
-            json(&out)
-        })
+        self.edit(|project| Self::add_overlay_op(project, p))
+    }
+
+    fn add_overlay_op(project: &Project, p: AddOverlayParams) -> Result<String, McpError> {
+        let out = project.add_overlay(p.text, p.start, p.end).map_err(core_err)?;
+        json(&out)
     }
 
     #[tool(
         description = "Update a text overlay's text, timing, position (pos_x / pos_y as 0–1 frame fractions), size (font height fraction), color, box background (bg, empty string clears), font (system font family from list_fonts, empty string clears) or bold. Omit a field to leave it unchanged."
     )]
     fn update_overlay(&self, Parameters(p): Parameters<UpdateOverlayParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::update_overlay_op(project, p))
+    }
+
+    fn update_overlay_op(project: &Project, p: UpdateOverlayParams) -> Result<String, McpError> {
         let overlay_id = parse_arg("overlay_id", &p.overlay_id)?;
-        self.edit(|project| {
-            let out = project
-                .update_overlay(
-                    overlay_id, p.text, p.start, p.end, p.pos_x, p.pos_y, p.size, p.color, p.bg, p.font, p.bold,
-                )
-                .map_err(core_err)?;
-            json(&out)
-        })
+        let out = project
+            .update_overlay(
+                overlay_id, p.text, p.start, p.end, p.pos_x, p.pos_y, p.size, p.color, p.bg, p.font, p.bold,
+            )
+            .map_err(core_err)?;
+        json(&out)
     }
 
     #[tool(description = "Remove a text overlay")]
     fn remove_overlay(&self, Parameters(p): Parameters<OverlayIdParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::remove_overlay_op(project, p))
+    }
+
+    fn remove_overlay_op(project: &Project, p: OverlayIdParams) -> Result<String, McpError> {
         let overlay_id = parse_arg("overlay_id", &p.overlay_id)?;
-        self.edit(|project| {
-            project.remove_overlay(overlay_id).map_err(core_err)?;
-            Ok("ok".to_string())
-        })
+        project.remove_overlay(overlay_id).map_err(core_err)?;
+        Ok("ok".to_string())
     }
 
     #[tool(
@@ -4093,11 +4259,13 @@ impl KerfMcp {
 
     #[tool(description = "Remove an animated SVG title (its id is in timeline_summary's `svg_overlays`)")]
     fn remove_svg_overlay(&self, Parameters(p): Parameters<OverlayIdParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::remove_svg_overlay_op(project, p))
+    }
+
+    fn remove_svg_overlay_op(project: &Project, p: OverlayIdParams) -> Result<String, McpError> {
         let overlay_id = parse_arg("overlay_id", &p.overlay_id)?;
-        self.edit(|project| {
-            project.remove_svg_overlay(overlay_id).map_err(core_err)?;
-            Ok("ok".to_string())
-        })
+        project.remove_svg_overlay(overlay_id).map_err(core_err)?;
+        Ok("ok".to_string())
     }
 
     #[tool(
@@ -4241,11 +4409,13 @@ impl KerfMcp {
         description = "Set or clear (empty list) a text overlay's position/opacity keyframes, to animate it over its lifetime (e.g. a title that slides in and fades out)"
     )]
     fn set_overlay_keyframes(&self, Parameters(p): Parameters<OverlayKeyframesParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::set_overlay_keyframes_op(project, p))
+    }
+
+    fn set_overlay_keyframes_op(project: &Project, p: OverlayKeyframesParams) -> Result<String, McpError> {
         let overlay_id = parse_arg("overlay_id", &p.overlay_id)?;
-        self.edit(|project| {
-            let out = project.set_overlay_keyframes(overlay_id, p.keyframes).map_err(core_err)?;
-            json(&out)
-        })
+        let out = project.set_overlay_keyframes(overlay_id, p.keyframes).map_err(core_err)?;
+        json(&out)
     }
 
     #[tool(
@@ -4608,10 +4778,12 @@ impl KerfMcp {
         description = "Remove the captions generate_captions or import_captions wrote, leaving hand-made titles and lower-thirds alone. Returns how many were removed."
     )]
     fn clear_captions(&self) -> Result<String, McpError> {
-        self.edit(|project| {
-            let removed = project.clear_captions().map_err(core_err)?;
-            Ok(format!("removed {removed} generated caption(s)"))
-        })
+        self.edit(Self::clear_captions_op)
+    }
+
+    fn clear_captions_op(project: &Project) -> Result<String, McpError> {
+        let removed = project.clear_captions().map_err(core_err)?;
+        Ok(format!("removed {removed} generated caption(s)"))
     }
 
     #[tool(
@@ -4802,11 +4974,13 @@ impl KerfMcp {
         description = "Append the non-silent spans of an asset as clips, end to end after what the first UNLOCKED track of the asset's main kind already holds (the first unlocked video track for footage, the first unlocked audio track for audio-only media; every one of them locked refuses), as one revision. It needs the asset's `silence` analysis (analyze_asset with steps [\"silence\"]): with no analysis at all it fails, and if the silence step was never run it keeps the whole file. The silent spans are dropped, not rippled: nothing already on the track moves. Returns the clips."
     )]
     fn remove_silence(&self, Parameters(p): Parameters<AssetIdParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::remove_silence_op(project, p))
+    }
+
+    fn remove_silence_op(project: &Project, p: AssetIdParams) -> Result<String, McpError> {
         let id = parse_arg("asset_id", &p.asset_id)?;
-        self.edit(|project| {
-            let out = project.remove_silence(id).map_err(core_err)?;
-            json(&out)
-        })
+        let out = project.remove_silence(id).map_err(core_err)?;
+        json(&out)
     }
 
     #[tool(
@@ -4911,16 +5085,18 @@ impl KerfMcp {
         description = "Cut to the beat: ripple a track's cuts onto the beat grid of the analyzed music on the audio tracks, retrimming each clip so its outgoing cut lands on a beat. Analyze the music asset first"
     )]
     fn snap_to_beats(&self, Parameters(p): Parameters<SnapToBeatsParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::snap_to_beats_op(project, p))
+    }
+
+    fn snap_to_beats_op(project: &Project, p: SnapToBeatsParams) -> Result<String, McpError> {
         let track = p.track_id.as_deref().map(|s| parse_arg("track_id", s)).transpose()?;
-        self.edit(|project| {
-            let aligned = project.snap_to_beats(track, p.tolerance).map_err(core_err)?;
-            // The *working* timeline, like every other read here: inside a task the
-            // alignment lands in the staged proposal, and `timeline()` would hand
-            // back the user's untouched cut — a timeline with none of the moves the
-            // `cuts_aligned` count beside it just reported.
-            let timeline = project.working_timeline().map_err(core_err)?;
-            json(&serde_json::json!({ "cuts_aligned": aligned, "timeline": reads::timeline_brief(&timeline) }))
-        })
+        let aligned = project.snap_to_beats(track, p.tolerance).map_err(core_err)?;
+        // The *working* timeline, like every other read here: inside a task the
+        // alignment lands in the staged proposal, and `timeline()` would hand
+        // back the user's untouched cut — a timeline with none of the moves the
+        // `cuts_aligned` count beside it just reported.
+        let timeline = project.working_timeline().map_err(core_err)?;
+        json(&serde_json::json!({ "cuts_aligned": aligned, "timeline": reads::timeline_brief(&timeline) }))
     }
 
     #[tool(
@@ -4975,14 +5151,16 @@ impl KerfMcp {
                        the remainder matters. Returns the new clip ids, the plan and a summary of the timeline (get_timeline_state has all of it)."
     )]
     fn fit_music(&self, Parameters(p): Parameters<FitMusicParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::fit_music_op(project, p))
+    }
+
+    fn fit_music_op(project: &Project, p: FitMusicParams) -> Result<String, McpError> {
         let clip_id = parse_arg("clip_id", &p.clip_id)?;
-        self.edit(|project| {
-            let report = project
-                .fit_music(clip_id, p.target, p.fade_out.unwrap_or(true))
-                .map_err(core_err)?;
-            let timeline = project.working_timeline().map_err(core_err)?;
-            json(&serde_json::json!({ "fit": report, "timeline": reads::timeline_brief(&timeline) }))
-        })
+        let report = project
+            .fit_music(clip_id, p.target, p.fade_out.unwrap_or(true))
+            .map_err(core_err)?;
+        let timeline = project.working_timeline().map_err(core_err)?;
+        json(&serde_json::json!({ "fit": report, "timeline": reads::timeline_brief(&timeline) }))
     }
 
     #[tool(
@@ -4996,11 +5174,13 @@ impl KerfMcp {
                        `detached` (each: the audio `clip`, its `track_id`, `created_track`) and `skipped`."
     )]
     fn extract_audio(&self, Parameters(p): Parameters<AssetIdParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::extract_audio_op(project, p))
+    }
+
+    fn extract_audio_op(project: &Project, p: AssetIdParams) -> Result<String, McpError> {
         let id = parse_arg("asset_id", &p.asset_id)?;
-        self.edit(|project| {
-            let out = project.extract_audio(id).map_err(core_err)?;
-            json(&out)
-        })
+        let out = project.extract_audio(id).map_err(core_err)?;
+        json(&out)
     }
 
     #[tool(
@@ -5011,11 +5191,13 @@ impl KerfMcp {
                        other audio-only assets this is how they reach the timeline. One revision. Returns the clip."
     )]
     fn add_asset_audio(&self, Parameters(p): Parameters<AssetIdParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::add_asset_audio_op(project, p))
+    }
+
+    fn add_asset_audio_op(project: &Project, p: AssetIdParams) -> Result<String, McpError> {
         let id = parse_arg("asset_id", &p.asset_id)?;
-        self.edit(|project| {
-            let out = project.add_asset_audio(id).map_err(core_err)?;
-            json(&out)
-        })
+        let out = project.add_asset_audio(id).map_err(core_err)?;
+        json(&out)
     }
 
     #[tool(
@@ -5036,11 +5218,13 @@ impl KerfMcp {
                        detach_audio_clips does several in one revision."
     )]
     fn detach_audio(&self, Parameters(p): Parameters<ClipIdParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::detach_audio_op(project, p))
+    }
+
+    fn detach_audio_op(project: &Project, p: ClipIdParams) -> Result<String, McpError> {
         let clip_id = parse_arg("clip_id", &p.clip_id)?;
-        self.edit(|project| {
-            let out = project.detach_audio(clip_id).map_err(core_err)?;
-            json(&out)
-        })
+        let out = project.detach_audio(clip_id).map_err(core_err)?;
+        json(&out)
     }
 
     #[tool(
@@ -5050,15 +5234,17 @@ impl KerfMcp {
                        `detached` (each: the audio `clip`, `track_id`, `created_track`) and `skipped`."
     )]
     fn detach_audio_clips(&self, Parameters(p): Parameters<DetachClipsParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::detach_audio_clips_op(project, p))
+    }
+
+    fn detach_audio_clips_op(project: &Project, p: DetachClipsParams) -> Result<String, McpError> {
         let ids = p
             .clip_ids
             .iter()
             .map(|s| parse_arg("clip_ids", s))
             .collect::<Result<Vec<Uuid>, _>>()?;
-        self.edit(|project| {
-            let out = project.detach_audio_clips(&ids).map_err(core_err)?;
-            json(&out)
-        })
+        let out = project.detach_audio_clips(&ids).map_err(core_err)?;
+        json(&out)
     }
 
     #[tool(
@@ -5070,11 +5256,13 @@ impl KerfMcp {
                        reattach_audio_clips does several in one revision."
     )]
     fn reattach_audio(&self, Parameters(p): Parameters<ClipIdParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::reattach_audio_op(project, p))
+    }
+
+    fn reattach_audio_op(project: &Project, p: ClipIdParams) -> Result<String, McpError> {
         let clip_id = parse_arg("clip_id", &p.clip_id)?;
-        self.edit(|project| {
-            let out = project.reattach_audio(clip_id).map_err(core_err)?;
-            json(&out)
-        })
+        let out = project.reattach_audio(clip_id).map_err(core_err)?;
+        json(&out)
     }
 
     #[tool(
@@ -5085,15 +5273,17 @@ impl KerfMcp {
                        error names the clip, changing nothing. Returns the picture clips."
     )]
     fn reattach_audio_clips(&self, Parameters(p): Parameters<ReattachClipsParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::reattach_audio_clips_op(project, p))
+    }
+
+    fn reattach_audio_clips_op(project: &Project, p: ReattachClipsParams) -> Result<String, McpError> {
         let ids = p
             .clip_ids
             .iter()
             .map(|s| parse_arg("clip_ids", s))
             .collect::<Result<Vec<Uuid>, _>>()?;
-        self.edit(|project| {
-            let out = project.reattach_audio_clips(&ids).map_err(core_err)?;
-            json(&out)
-        })
+        let out = project.reattach_audio_clips(&ids).map_err(core_err)?;
+        json(&out)
     }
 
     #[tool(
@@ -5113,15 +5303,17 @@ impl KerfMcp {
                        At least two clips, on different tracks, none on a locked track. detach_audio links for you. One revision. Returns the group's `link_id`."
     )]
     fn link_clips(&self, Parameters(p): Parameters<LinkClipsParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::link_clips_op(project, p))
+    }
+
+    fn link_clips_op(project: &Project, p: LinkClipsParams) -> Result<String, McpError> {
         let ids = p
             .clip_ids
             .iter()
             .map(|s| parse_arg("clip_ids", s))
             .collect::<Result<Vec<Uuid>, _>>()?;
-        self.edit(|project| {
-            let group = project.link_clips(&ids).map_err(core_err)?;
-            json(&serde_json::json!({ "link_id": group, "clips": ids.len() }))
-        })
+        let group = project.link_clips(&ids).map_err(core_err)?;
+        json(&serde_json::json!({ "link_id": group, "clips": ids.len() }))
     }
 
     #[tool(
@@ -5130,30 +5322,34 @@ impl KerfMcp {
                        how many of the named clips were linked."
     )]
     fn unlink_clips(&self, Parameters(p): Parameters<UnlinkClipsParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::unlink_clips_op(project, p))
+    }
+
+    fn unlink_clips_op(project: &Project, p: UnlinkClipsParams) -> Result<String, McpError> {
         let ids = p
             .clip_ids
             .iter()
             .map(|s| parse_arg("clip_ids", s))
             .collect::<Result<Vec<Uuid>, _>>()?;
-        self.edit(|project| {
-            let unlinked = project.unlink_clips(&ids).map_err(core_err)?;
-            json(&serde_json::json!({ "unlinked": unlinked }))
-        })
+        let unlinked = project.unlink_clips(&ids).map_err(core_err)?;
+        json(&serde_json::json!({ "unlinked": unlinked }))
     }
 
     #[tool(
         description = "Append the FULL length of each asset in `asset_ids`, in order, to the end of the first UNLOCKED track of its kind (footage on the first unlocked video track, audio-only media on the first unlocked audio track; every one of a kind locked refuses), as one revision — so a video clip and an audio-only clip do not play in sequence with each other, each kind has its own run. For part of an asset use cut_clip or add_clip_to_timeline. Returns the clips."
     )]
     fn concatenate(&self, Parameters(p): Parameters<ConcatParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::concatenate_op(project, p))
+    }
+
+    fn concatenate_op(project: &Project, p: ConcatParams) -> Result<String, McpError> {
         let ids = p
             .asset_ids
             .iter()
             .map(|s| parse_arg("asset_ids", s))
             .collect::<Result<Vec<Uuid>, _>>()?;
-        self.edit(|project| {
-            let out = project.concatenate(&ids).map_err(core_err)?;
-            json(&out)
-        })
+        let out = project.concatenate(&ids).map_err(core_err)?;
+        json(&out)
     }
 
     #[tool(
@@ -5669,6 +5865,30 @@ impl KerfMcp {
     }
 
     #[tool(
+        description = "Lint the cut for editing mistakes an agent cannot see without watching it: flash_frame (a visible \
+                       clip under 3 frames at the export rate), mid_word_cut (a sounding clip's edge inside a transcript \
+                       word; needs a transcript), hard_audio_cut (sound meeting sound with no fade or crossfade, a likely \
+                       click; needs silence analysis), jump_cut (the same shot resuming a moment later; a tip, it can be \
+                       deliberate), stale_captions (generated captions no longer over the words spoken, or speech left \
+                       uncaptioned, after a later edit) and black_gap (no picture while the cut plays). Reads the cut you \
+                       are building and the cached analysis; answers {issues: [{kind, severity, time, end?, clip_ids, \
+                       message, fix}], counts_by_kind, checked, skipped: [{check, reason}]}, each `fix` naming the tools \
+                       that address it. A picture and its linked sound report once. Run it with platform_check before \
+                       reporting a cut finished."
+    )]
+    async fn review_cut(&self, Parameters(p): Parameters<ReviewCutParams>) -> Result<String, McpError> {
+        let checks = kerf_core::ReviewCheck::parse_list(&p.checks.unwrap_or_default()).map_err(core_err)?;
+        let range = p.range.map(|r| (r.start, r.end));
+        let (project, owner) = (self.project.clone(), self.owner());
+        let review = blocking(move || {
+            let inputs = lock_agent_as(&project, owner.as_deref()).review_inputs().map_err(core_err)?;
+            Ok(kerf_core::review::review(&inputs, range, &checks))
+        })
+        .await?;
+        json(&review)
+    }
+
+    #[tool(
         description = "Write the composited timeline at a given time to an image file as a cover / thumbnail — full \
                        delivery resolution, rendered through the export graph, so it is a real frame of the finished \
                        video at the shape the project is cut for. Refuses to overwrite an existing file unless \
@@ -6020,9 +6240,7 @@ impl KerfMcp {
         context: RequestContext<RoleServer>,
     ) -> Result<CallToolResult, McpError> {
         let id = parse_arg("asset_id", &p.asset_id)?;
-        let columns = p.columns.unwrap_or(4).clamp(1, 8);
-        let rows = p.rows.unwrap_or(4).clamp(1, 8);
-        let cell_width = p.cell_width.unwrap_or(240).clamp(80, 640);
+        let (columns, rows, cell_width) = sheet_grid(p.columns, p.rows, p.cell_width);
         let project = self.project.clone();
         if let Some(cell) = p.cell {
             return self.skim_cell(id, &p, (columns, rows, cell), context).await;
@@ -6136,6 +6354,101 @@ impl KerfMcp {
     }
 
     #[tool(
+        description = "Skim the cut you have assembled: the composited timeline at moments spread evenly across a span (default the whole cut) tiled into one contact-sheet image, plus a text index of each cell's timeline time and the clips on screen there (clip id and name, bottom track first). The one-call check of an assembled cut: pacing, black frames (a gap renders black), the same shot twice, the flow from shot to shot. Reads the cut you are proposing, staged edits included. Pass `cell` (same span and grid) to see one cell as a full frame, with an optional `region` to zoom, or call preview_timeline at any time."
+    )]
+    async fn skim_timeline(
+        &self,
+        Parameters(p): Parameters<SkimTimelineParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let (columns, rows, cell_width) = sheet_grid(p.columns, p.rows, p.cell_width);
+        if let Some(cell) = p.cell {
+            return self.skim_timeline_cell(&p, (columns, rows, cell), context).await;
+        }
+        let project = self.project.clone();
+        let cancel = context.ct.clone();
+        let (start, end) = (p.start, p.end);
+        let (jpeg, cells, window) = blocking(move || {
+            // Snapshot the inputs under the lock, composite every cell with it released. A dropped
+            // request kills the stills in flight.
+            let (timeline, assets) = lock_agent(&project).timeline_frame_inputs().map_err(core_err)?;
+            let window = Project::timeline_sheet_window(&timeline, start, end);
+            let (jpeg, cells) = Project::composite_timeline_sheet_cancellable(
+                &timeline,
+                &assets,
+                start,
+                end,
+                columns,
+                rows,
+                cell_width,
+                5,
+                &|| cancel.is_cancelled(),
+            )
+            .map_err(core_err)?;
+            Ok::<_, McpError>((jpeg, cells, window))
+        })
+        .await?;
+        Ok(image_result(timeline_sheet_caption(columns, rows, window, &cells), jpeg))
+    }
+
+    /// The `cell` form of [`Self::skim_timeline`]: the cut at the moment one cell showed, drawn
+    /// as `preview_timeline` draws it. The sheet is never rebuilt.
+    async fn skim_timeline_cell(
+        &self,
+        p: &SkimTimelineParams,
+        (columns, rows, cell): (u32, u32, u32),
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let cells = columns * rows;
+        if cell < 1 || cell > cells {
+            return Err(McpError::invalid_params(
+                format!("cell must be 1..={cells} for a {columns}x{rows} sheet, got {cell}"),
+                None,
+            ));
+        }
+        let max_width = p.max_width.unwrap_or(640).clamp(64, MAX_PREVIEW_WIDTH);
+        let (start, end, region) = (p.start, p.end, p.region);
+        let project = self.project.clone();
+        let cancel = context.ct.clone();
+        let (jpeg, on_screen) = blocking(move || {
+            let (timeline, assets) = lock_agent(&project).timeline_frame_inputs().map_err(core_err)?;
+            if timeline.duration() <= 0.0 {
+                return Err(core_err(kerf_core::Error::InvalidArgument(
+                    "the timeline is empty: there is no cut to skim".to_string(),
+                )));
+            }
+            let time = Project::timeline_sheet_times(&timeline, start, end, columns, rows)[(cell - 1) as usize];
+            let jpeg = match region {
+                Some(r) => Project::composite_timeline_region_cancellable(
+                    &timeline,
+                    &assets,
+                    time,
+                    r.region(),
+                    max_width,
+                    ZOOM_QUALITY,
+                    &|| cancel.is_cancelled(),
+                ),
+                None => Project::composite_timeline_frame_cancellable(&timeline, &assets, time, max_width, 4, &|| {
+                    cancel.is_cancelled()
+                }),
+            }
+            .map_err(core_err)?;
+            let on_screen = Project::timeline_sheet_cells(&timeline, &assets, &[time]).remove(0);
+            Ok::<_, McpError>((jpeg, on_screen))
+        })
+        .await?;
+        let mut caption = format!(
+            "cell {cell} of {columns}x{rows} sheet, timeline composite @ {}: {}",
+            fmt_ts(on_screen.time),
+            on_screen_clips(&on_screen.clips)
+        );
+        if let Some(r) = p.region {
+            caption.push_str(&format!(", {}", r.describe()));
+        }
+        Ok(image_result(caption, jpeg))
+    }
+
+    #[tool(
         description = "Summarise the timeline: total duration, track count, clips per track, any per-track gaps, \
                        and per track how many clips are linked to a partner (`linked_clips`) and how many pictures \
                        have had their own sound detached (`detached_sound_clips`), and the animated SVG titles \
@@ -6199,6 +6512,7 @@ impl KerfMcp {
                 tracks,
                 svg_overlays: timeline.svg_overlays.iter().map(SvgOverlaySummary::from).collect(),
                 title_clips: TitleClipSummary::all(&timeline),
+                thumbnails: timeline.thumbnails.iter().map(thumbnails::thumbnail_view).collect(),
                 delivery_format: timeline.format.map(|d| match d.rate() {
                     Some(fps) => format!(
                         "{}x{} ({}, {} fps)",
@@ -6220,7 +6534,7 @@ impl KerfMcp {
 }
 
 impl KerfMcp {
-    fn new(project: Arc<Mutex<Project>>, app: AppHandle) -> Self {
+    fn new(project: Arc<Mutex<Project>>, app: Shell) -> Self {
         Self {
             project,
             app,
@@ -6337,16 +6651,15 @@ fn check_outputs_now(project: &Mutex<Project>, owner: Option<&str>, paths: &[std
 /// Forwards the `analysis-progress` events the GUI's bin listens to — for one asset — to a [`Run`],
 /// so an agent hears what the user sees: the step and how far it is. Stops listening when dropped.
 struct AnalysisProgressRelay {
-    app: AppHandle,
+    app: Shell,
     id: tauri::EventId,
 }
 
 impl AnalysisProgressRelay {
-    fn new(app: &AppHandle, asset: Uuid, run: &Run) -> Self {
-        use tauri::Listener;
+    fn new(app: &Shell, asset: Uuid, run: &Run) -> Self {
         let (run, asset) = (run.clone(), asset.to_string());
-        let id = app.listen("analysis-progress", move |event| {
-            let Ok(p) = serde_json::from_str::<serde_json::Value>(event.payload()) else {
+        let id = app.listen("analysis-progress", move |payload| {
+            let Ok(p) = serde_json::from_str::<serde_json::Value>(payload) else {
                 return;
             };
             if p["asset_id"] != asset.as_str() {
@@ -6365,7 +6678,6 @@ impl AnalysisProgressRelay {
 
 impl Drop for AnalysisProgressRelay {
     fn drop(&mut self) {
-        use tauri::Listener;
         self.app.unlisten(self.id);
     }
 }
@@ -6523,7 +6835,9 @@ fn router() -> &'static rmcp::handler::server::router::tool::ToolRouter<KerfMcp>
             + KerfMcp::tool_router_jobs()
             + KerfMcp::tool_router_reads()
             + KerfMcp::tool_router_project()
-            + KerfMcp::tool_router_templates();
+            + KerfMcp::tool_router_templates()
+            + KerfMcp::tool_router_batch()
+            + KerfMcp::tool_router_thumbnails();
         hints::annotate(&mut router);
         router
     })
@@ -6538,6 +6852,37 @@ fn reject_unknown_arguments(request: &rmcp::model::CallToolRequestParams) -> Res
         Some(message) => Err(McpError::invalid_params(message, None)),
         None => Ok(()),
     }
+}
+
+/// The tool sets the request's URL asks for (`?tools=core,titles`, `toolsets.rs`); every tool for a
+/// request that came some other way.
+fn tool_selection(context: &RequestContext<RoleServer>) -> Result<toolsets::Selection, McpError> {
+    let query = context
+        .extensions
+        .get::<axum::http::request::Parts>()
+        .and_then(|parts| parts.uri.query());
+    toolsets::Selection::from_query(query).map_err(|e| McpError::invalid_params(e, None))
+}
+
+/// `initialize`, refused when the URL names a tool set there is not.
+fn checked_initialize<S: ServerHandler>(
+    server: &S,
+    request: rmcp::model::InitializeRequestParams,
+    context: &RequestContext<RoleServer>,
+) -> Result<rmcp::model::InitializeResult, McpError> {
+    tool_selection(context)?;
+    context.peer.set_peer_info(request.clone());
+    server.negotiate_initialize(&request)
+}
+
+/// What the server offers: tools, the workflow prompts and the resources with their subscriptions.
+fn capabilities() -> ServerCapabilities {
+    ServerCapabilities::builder()
+        .enable_prompts()
+        .enable_resources()
+        .enable_resources_subscribe()
+        .enable_tools()
+        .build()
 }
 
 /// How the server introduces itself to clients. `ServerConfig::default()` fills
@@ -6560,14 +6905,16 @@ const INSTRUCTIONS: &str = "Kerf is the video editor open on this computer, and 
              templates, music, voiceover, delivery formats, loudness, jobs) and what a refusal means. \
              The loop: claim_next_task takes the user's oldest queued task (list_tasks shows the queue). \
              See what is there with list_assets / get_timeline_state (import_asset adds a file by its \
-             absolute path) and analyze_asset (silence, scenes, transcript, loudness, beats). When the \
+             absolute path) and analyze_asset (silence, scenes, transcript, loudness, beats); \
+             search_transcripts finds where anything is said across the whole library. When the \
              user says \"this clip\", \"here\" or \"the selection\", get_editor_context says what they \
              have selected and where the playhead and marks are. Look at the footage with skim_asset \
              (a contact sheet), get_frame and preview_timeline (the cut you have built) before and after \
-             you edit. Cut with split / trim / move_clip / remove / ripple_delete, then polish with \
+             you edit, and at a whole assembled cut with skim_timeline. Cut with split / trim / move_clip / remove / ripple_delete, then polish with \
              set_volume, set_fade, set_transition, set_transform, set_color, add_overlay and \
-             generate_captions (caption last, once the cut is settled). Before you call a cut done, run \
-             platform_check, and get_levels for anything going to social; export renders it to an \
+             generate_captions (caption last, once the cut is settled). A plan of several edits runs as \
+             one apply_edits call: one step, all or nothing, and dry_run previews it. Before you call a cut done, run \
+             platform_check and review_cut, and get_levels for anything going to social; export renders it to an \
              absolute path. \
              While the user's review is on (the default; get_settings shows `agent_review`) your edits \
              are STAGED: they go into a proposal the user accepts or dismisses in Kerf, your reads \
@@ -6582,7 +6929,10 @@ const INSTRUCTIONS: &str = "Kerf is the video editor open on this computer, and 
              first unlocked one. \
              Long tools (analyze_asset, export, compose_music, generate_voiceover, smart_crop, ...) take \
              `background: true` and answer a job_id at once; follow it with job_status or subscribe to \
-             kerf://jobs/{job_id}.";
+             kerf://jobs/{job_id}. \
+             The prompts (rough_cut_from_transcript, podcast_cleanup, social_reel, music_bed, deliver) are \
+             these workflows as steps. A client may connect with ?tools=core,titles on the URL to list \
+             fewer tools; get_editing_guide then names the sets left out.";
 
 /// What `get_editing_guide` answers: the workflow across every tool.
 const EDITING_GUIDE: &str = "How to edit with Kerf. The user queues editing tasks in the desktop app; \
@@ -6599,8 +6949,12 @@ const EDITING_GUIDE: &str = "How to edit with Kerf. The user queues editing task
              You can also SEE the footage: skim_asset returns a contact-sheet \
              image of a clip (survey it to find the good parts), get_frame shows \
              a single moment up close, and preview_timeline renders the cut you \
-             have assembled at a given time so you can check it on screen. Look, \
-             then look closer: skim_asset with `cell` opens one sheet cell at \
+             have assembled at a given time so you can check it on screen. Once a \
+             cut is assembled, check it with skim_timeline: one contact sheet of \
+             the cut (or a span of it), each cell indexed to its timeline time and \
+             the clips on screen, so the pacing, a black gap, a shot used twice and \
+             the flow show in one call. Look, \
+             then look closer: skim_asset and skim_timeline with `cell` open one sheet cell at \
              full detail, and get_frame / preview_timeline take a `region` \
              (fractions of the frame) that is cropped out and enlarged — the way \
              to read a face, on-screen text, a caption against the safe area or \
@@ -6610,7 +6964,12 @@ const EDITING_GUIDE: &str = "How to edit with Kerf. The user queues editing task
              cut/split/trim/add/reorder/move_clip/remove/ripple_delete tools \
              (move_clip frees a clip to any position or same-kind track; \
              ripple_delete closes the gap; move_clips / remove_clips do the \
-             same to several clips as one revision, all or nothing). To adjust \
+             same to several clips as one revision, all or nothing; apply_edits \
+             { ops: [{tool, args}], dry_run?, label? } runs a whole plan of the quick \
+             edit tools, each with its own arguments, as ONE revision or staged step: \
+             an op that fails applies nothing and the error names it, dry_run answers \
+             the diff and changes nothing, and \"$K.path\" in an op's args is a value \
+             from op K's answer, e.g. \"$0.right.id\" after a split_at). To adjust \
              a cut rather than build one: roll_edit moves the cut between two \
              adjacent clips (both shift, the pair's length is unchanged), \
              slip_clip shows other footage in the same place and length, \
@@ -6618,6 +6977,12 @@ const EDITING_GUIDE: &str = "How to edit with Kerf. The user queues editing task
              and split_remove trims a clip's start or end to a time (split_remove_clips \
              does that to a picture and its sound as one revision) — the first \
              three clamp to the footage and report `applied`, and never ripple. \
+             To edit by what is SAID, read the cut with get_cut_transcript: its \
+             lines are the words the cut plays, in timeline time, each with its \
+             clip_id, and words=true gives every word its timeline start/end and \
+             source_start/source_end. Cut words with cut_clip_range on that clip \
+             and those source times (or split_at at the timeline bounds and \
+             ripple_delete the piece), then read it again — later lines move. \
              The project may be in ripple mode, so check get_ripple_mode before you trim, \
              remove or retime: with it on, trim / set_speed / remove / \
              split_remove(_clips) / add_clip_to_timeline onto footage / \
@@ -6821,8 +7186,14 @@ const EDITING_GUIDE: &str = "How to edit with Kerf. The user queues editing task
              (a ping is enough) for five minutes loses its subscriptions. Results are kept small: get_asset_metadata and analyze_asset \
              summarise an analysis (counts, durations, the head of the transcript), \
              and get_transcript (lines with their speakers; words=true adds each \
-             line's timed words, best over a from/to window) / get_analysis_detail \
-             page through the rest; \
+             line's timed words, best over a from/to window) / get_cut_transcript \
+             (the same for the whole cut, in timeline time) / get_analysis_detail \
+             page through the rest. To find material by what is said, search_transcripts \
+             searches every transcript at once (a phrase, all_words within a line or any_word; \
+             `speaker` narrows it): each hit is an asset with SOURCE start/end and `in_cut`, \
+             the clips already using it (empty when unused) — cut_clip / \
+             add_clip_to_timeline that source window to use it, and \
+             `assets_without_transcript` names what still needs analyze_asset; \
              get_timeline_state shows generated captions as a window \
              (captions_offset / captions_limit) and, for a very long cut, its clips \
              (clips_offset / clips_limit); history, list_tasks, list_assets, \
@@ -6846,7 +7217,11 @@ const EDITING_GUIDE: &str = "How to edit with Kerf. The user queues editing task
              platform_check: it says whether the length and frame shape suit \
              where it is going, including the reach limits a platform enforces \
              silently (a Reel over 3 minutes uploads fine and then reaches only \
-             existing followers). For a cut going to social, also run get_levels: \
+             existing followers), and review_cut: it finds the editing mistakes \
+             you would see on a watch (flash frames, cuts inside a word, sound \
+             cut into sound with no fade, jump cuts, captions a later edit left \
+             behind, black gaps) and names the tool that fixes each. For a cut \
+             going to social, also run get_levels: \
              platforms play at about -14 LUFS and want a true peak under -1 dBTP, \
              so check it, then fix a hot mix with set_master_volume / \
              set_master_limiter or export with loudnorm (which normalises to \
@@ -6866,11 +7241,21 @@ const EDITING_GUIDE: &str = "How to edit with Kerf. The user queues editing task
              whether its low end or mids fight the voice. To change it, edit \
              the score (list_assets shows it as music_score) and compose again \
              with replace_clip_id. Call export to render, and export_cover to \
-             write the thumbnail the platform shows before anyone presses play. \
+             write a plain frame of the video as its cover. A thumbnail with \
+             graphics of its own (a headline, a template, a logo the video \
+             never shows) comes once the cut is final: suggest_thumbnail_frames \
+             for good frames (look at its contact sheet), add_thumbnail with \
+             the frame, a size and its layers, preview_thumbnail to look, \
+             update_thumbnail to adjust, export_thumbnail to write it. \
              export / export_srt / export_captions / export_interchange / \
-             export_markers / export_cover / export_variants all take an \
+             export_markers / export_cover / export_thumbnail / export_variants all take an \
              absolute local output path and refuse to overwrite a file that's \
-             already there unless you pass overwrite=true.";
+             already there unless you pass overwrite=true. \
+             The server's prompts — rough_cut_from_transcript, podcast_cleanup, social_reel, music_bed and \
+             deliver — are these workflows as numbered steps the user can start. A connection may list only \
+             some tool sets (`?tools=core,titles` on the server URL; the sets are core, analysis, clips, \
+             keyframes, titles, audio, music, delivery, tasks and project), and this guide then ends by \
+             saying which.";
 
 #[tool_handler(router = router())]
 impl ServerHandler for KerfMcp {
@@ -6904,13 +7289,57 @@ impl ServerHandler for KerfMcp {
         note_agent_activity();
         let mut info = ServerConfig::default();
         info.server_info = server_identity();
-        info.capabilities = ServerCapabilities::builder()
-            .enable_resources()
-            .enable_resources_subscribe()
-            .enable_tools()
-            .build();
+        info.capabilities = capabilities();
         info.instructions = Some(INSTRUCTIONS.to_string());
         info
+    }
+
+    /// A URL naming a tool set there is not is refused here, where the client is connecting,
+    /// rather than leaving it with a short tool list and no reason.
+    async fn initialize(
+        &self,
+        request: rmcp::model::InitializeRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::InitializeResult, McpError> {
+        checked_initialize(self, request, &context)
+    }
+
+    /// The tools of the sets the connection asked for (all of them by default). A call to one
+    /// left out still runs: the selection trims the list, it is not a permission.
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, McpError> {
+        self.listener.touch();
+        let selection = tool_selection(&context)?;
+        let mut tools = router().list_all();
+        tools.retain(|tool| selection.lists(&tool.name));
+        let supports_cache_hints = context
+            .protocol_version()
+            .is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2026_07_28);
+        let mut result = rmcp::model::ListToolsResult::with_all_items(tools);
+        result.ttl_ms = supports_cache_hints.then_some(0);
+        result.cache_scope = supports_cache_hints.then_some(rmcp::model::CacheScope::Public);
+        Ok(result)
+    }
+
+    async fn list_prompts(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::ListPromptsResult, McpError> {
+        self.listener.touch();
+        Ok(rmcp::model::ListPromptsResult::with_all_items(prompts::list()))
+    }
+
+    async fn get_prompt(
+        &self,
+        request: rmcp::model::GetPromptRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<rmcp::model::GetPromptResponse, McpError> {
+        self.listener.touch();
+        Ok(prompts::get(&request.name, request.arguments.as_ref())?.into())
     }
 
     async fn ping(&self, _context: RequestContext<RoleServer>) -> Result<(), McpError> {
@@ -7128,6 +7557,42 @@ fn log_tool_error(tool: &str, e: &McpError) {
 /// Wrap JPEG bytes as an MCP tool result the model can *see*: a caption text
 /// block followed by an image content block (rmcp expects bare base64 + MIME,
 /// not a `data:` URL).
+/// A contact sheet's grid as asked for, clamped: `skim_asset` and `skim_timeline` share it.
+fn sheet_grid(columns: Option<u32>, rows: Option<u32>, cell_width: Option<u32>) -> (u32, u32, u32) {
+    (
+        columns.unwrap_or(4).clamp(1, 8),
+        rows.unwrap_or(4).clamp(1, 8),
+        cell_width.unwrap_or(240).clamp(80, 640),
+    )
+}
+
+/// The text index of a sheet of the cut: each cell's timeline time and the clips on screen there.
+fn timeline_sheet_caption(columns: u32, rows: u32, (start, end): (f64, f64), cells: &[kerf_core::SheetCell]) -> String {
+    let index = cells
+        .iter()
+        .enumerate()
+        .map(|(i, c)| format!("  cell {}: {}  {}", i + 1, fmt_ts(c.time), on_screen_clips(&c.clips)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "contact sheet {columns}x{rows} (row-major) of the cut {} - {}, cell -> timeline time, clips on screen (bottom first):\n{index}",
+        fmt_ts(start),
+        fmt_ts(end)
+    )
+}
+
+/// The clips a cell shows, bottom first; a gap says so.
+fn on_screen_clips(clips: &[kerf_core::SheetClip]) -> String {
+    if clips.is_empty() {
+        return "no clip (gap)".to_string();
+    }
+    clips
+        .iter()
+        .map(|c| format!("clip {} {:?}", c.clip_id, c.name))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn image_result(caption: String, jpeg: Vec<u8>) -> CallToolResult {
     image_block(caption, &jpeg, "image/jpeg")
 }
@@ -7187,7 +7652,7 @@ fn check_frame(width: Option<u32>, height: Option<u32>) -> Result<Option<(u32, u
 /// timeline, whose windows are clips it already holds, but to a model a wall of
 /// zeros reads as "this part is silent", so a swapped `start` and `end` is
 /// reported as the mistake it is.
-fn require_window(start: f64, end: f64) -> Result<(), McpError> {
+pub(super) fn require_window(start: f64, end: f64) -> Result<(), McpError> {
     if start.is_finite() && end.is_finite() && end > start {
         Ok(())
     } else {
@@ -7356,8 +7821,9 @@ mod tests {
     use super::{
         caption_source, clip_moves, core_err, elide_large_svg, export_fps_of, export_message, fmt_ts, image_result,
         log_tool_error, png_result, refuse_overwrite, reject_unknown_arguments, require_window, router, server_identity,
-        svg_moments, svg_preview, svg_sheet_caption, svg_sheet_times, svg_source, track_gaps, variant_output, variants_message,
-        with_frame, ClipMoveParams, SvgMoments, SvgOverlaySummary, SvgPreviewTitle, SvgValidation,
+        sheet_grid, svg_moments, svg_preview, svg_sheet_caption, svg_sheet_times, svg_source, timeline_sheet_caption, track_gaps,
+        variant_output, variants_message, with_frame, ClipMoveParams, SkimTimelineParams, SvgMoments, SvgOverlaySummary,
+        SvgPreviewTitle, SvgValidation,
     };
 
     /// The resources read what the polling tools answer: the project's brief, the queue's first
@@ -8085,6 +8551,55 @@ mod tests {
     /// and getting that wrong degrades silently into an image the model cannot
     /// see rather than into a build failure.
     #[test]
+    fn a_sheet_of_the_cut_indexes_each_cell_with_its_time_and_the_clips_on_screen() {
+        use kerf_core::{SheetCell, SheetClip};
+        let (a, b) = (uuid::Uuid::new_v4(), uuid::Uuid::new_v4());
+        let clip = |clip_id, name: &str| SheetClip {
+            clip_id,
+            name: name.to_string(),
+        };
+        let cells = [
+            SheetCell {
+                time: 0.0,
+                clips: vec![clip(a, "intro.mp4")],
+            },
+            SheetCell {
+                time: 2.5,
+                clips: vec![clip(a, "intro.mp4"), clip(b, "logo.png")],
+            },
+            SheetCell {
+                time: 5.0,
+                clips: Vec::new(),
+            },
+        ];
+        let caption = timeline_sheet_caption(3, 1, (0.0, 7.5), &cells);
+        assert!(
+            caption.starts_with(&format!(
+                "contact sheet 3x1 (row-major) of the cut {} - {}",
+                fmt_ts(0.0),
+                fmt_ts(7.5)
+            )),
+            "{caption}"
+        );
+        for line in [
+            format!("  cell 1: {}  clip {a} \"intro.mp4\"", fmt_ts(0.0)),
+            format!("  cell 2: {}  clip {a} \"intro.mp4\", clip {b} \"logo.png\"", fmt_ts(2.5)),
+            format!("  cell 3: {}  no clip (gap)", fmt_ts(5.0)),
+        ] {
+            assert!(caption.lines().any(|l| l == line), "{line}\n{caption}");
+        }
+    }
+
+    #[test]
+    fn a_sheet_grid_is_clamped_like_skim_assets() {
+        assert_eq!(sheet_grid(None, None, None), (4, 4, 240));
+        assert_eq!(sheet_grid(Some(0), Some(99), Some(10_000)), (1, 8, 640));
+        assert_eq!(sheet_grid(Some(3), Some(2), Some(1)), (3, 2, 80));
+        let p: SkimTimelineParams = serde_json::from_value(serde_json::json!({})).expect("every field is optional");
+        assert!(p.start.is_none() && p.cell.is_none() && p.region.is_none());
+    }
+
+    #[test]
     fn image_results_serialize_as_caption_plus_bare_base64() {
         let jpeg = [0xFF, 0xD8, 0xFF, 0xD9];
         let value =
@@ -8275,6 +8790,36 @@ mod tests {
                 vec!["height".to_string(), "range".to_string(), "width".to_string()],
                 Vec::<String>::new()
             )
+        );
+        assert_eq!(
+            schema("review_cut"),
+            (vec!["checks".to_string(), "range".to_string()], Vec::<String>::new())
+        );
+    }
+
+    /// The lint is part of finishing a cut, beside the platform check, and names every check it takes.
+    #[test]
+    fn review_cut_is_a_finishing_step_and_lists_its_checks() {
+        let guide = super::EDITING_GUIDE;
+        let finish = guide.find("Before you report a cut finished").unwrap();
+        let step = &guide[finish..finish + 700];
+        assert!(step.contains("platform_check") && step.contains("review_cut"), "{step}");
+        assert!(super::INSTRUCTIONS.contains("review_cut"));
+        let text = router()
+            .list_all()
+            .into_iter()
+            .find(|t| t.name == "review_cut")
+            .and_then(|t| t.description.map(|d| d.to_string()))
+            .unwrap_or_default();
+        for check in kerf_core::ReviewCheck::ALL {
+            assert!(text.contains(check.name()), "{check:?}: {text}");
+        }
+        assert_eq!(
+            kerf_core::ReviewCheck::parse_list(&["flash"])
+                .map_err(super::core_err)
+                .unwrap_err()
+                .code,
+            rmcp::model::ErrorCode::INVALID_PARAMS
         );
     }
 
@@ -8561,6 +9106,38 @@ mod tests {
 
     /// A client decides from these hints what to run unasked and what to confirm,
     /// so a tool without them is a tool it has to guess about.
+    /// Each tool is listed by exactly one tool set (its row in `hints::TOOLS`), each set lists
+    /// something, and the essentials every selection keeps are tools.
+    #[test]
+    fn every_tool_is_in_one_tool_set() {
+        let names = tool_names();
+        let unset: Vec<&String> = names.iter().filter(|n| super::toolsets::set_of(n).is_none()).collect();
+        assert!(
+            unset.is_empty(),
+            "tools in no tool set (add a row to hints::TOOLS): {unset:?}"
+        );
+        for set in super::toolsets::ToolSet::ALL {
+            let tools: Vec<&str> = set.tools().collect();
+            assert!(!tools.is_empty(), "{} lists nothing", set.name());
+            for tool in tools {
+                assert!(
+                    names.iter().any(|n| n == tool),
+                    "{} names {tool}, which is no tool",
+                    set.name()
+                );
+            }
+        }
+        for tool in super::toolsets::ESSENTIALS {
+            assert!(names.iter().any(|n| n == tool), "essential {tool} is no tool");
+        }
+    }
+
+    #[test]
+    fn the_server_offers_prompts_tools_and_resources() {
+        let caps = super::capabilities();
+        assert!(caps.prompts.is_some() && caps.tools.is_some() && caps.resources.is_some());
+    }
+
     #[test]
     fn every_tool_is_titled_and_annotated() {
         let tools = router().list_all();
@@ -8590,6 +9167,7 @@ mod tests {
         for read in [
             "get_timeline_state",
             "preview_timeline",
+            "skim_timeline",
             "staged_diff",
             "get_editor_context",
             "get_levels",
@@ -9542,6 +10120,7 @@ mod tests {
             "compose_music",
             "download_speech_model",
             "export",
+            "export_thumbnail",
             "export_variants",
             "generate_voiceover",
             "import_asset",
@@ -9664,6 +10243,14 @@ mod tests {
             );
         }
         assert_eq!(transcript.input_schema["required"], serde_json::json!(["asset_id"]));
+        let search = tools.iter().find(|t| t.name == "search_transcripts").unwrap();
+        for field in ["query", "asset_ids", "speaker", "mode", "offset", "limit"] {
+            assert!(
+                search.input_schema["properties"].get(field).is_some(),
+                "search_transcripts takes {field}"
+            );
+        }
+        assert_eq!(search.input_schema["required"], serde_json::json!(["query"]));
         let detail = tools.iter().find(|t| t.name == "get_analysis_detail").unwrap();
         assert_eq!(detail.input_schema["required"], serde_json::json!(["asset_id", "kind"]));
     }

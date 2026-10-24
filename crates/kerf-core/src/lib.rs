@@ -36,10 +36,12 @@ pub mod proxy;
 pub mod recovery;
 pub mod render_bar;
 pub mod render_plan;
+pub mod review;
 pub mod scopes;
 pub mod svg;
 pub mod template;
 pub mod text;
+pub mod thumbnail;
 pub mod timecode;
 pub mod transcript;
 
@@ -80,10 +82,10 @@ pub use engine::{
     BandLevel, BandWindow, Container, DownloadProgress, ExportOptions, ExportPart, ExportProgress, ExportReport, ExportStage,
     ExportVariant, ExportedFrame, Filmstrip, FilmstripSheet, Fit, FpsSource, GeqEdge, ImageFormat, LoudnessPreset,
     LoudnessTarget, MusicStatus, PlaybackParams, PlaybackRequest, PreviewFrame, RateControl, Region, RenderStatus, ScrubConfig,
-    ScrubFrames, ScrubStats, SpeechModelInfo, StemsStatus, StyleInfo, TextPart, TextRasterGraph, VariantProgress, VariantsRun,
-    VoiceInfo, VoiceoverStatus, WaveformLevel, WaveformPyramid, WaveformRange, WindowBalance, WrittenAudio, WrittenVideo,
-    DEFAULT_SPEECH_MODEL, DEFAULT_VOICE, FILMSTRIP_HEIGHT, MAX_FILMSTRIP_FRAMES, MAX_STREAM_FPS, MAX_STREAM_WIDTH,
-    MAX_VOICE_SPEED, MAX_WAVEFORM_BUCKETS, MIN_STREAM_FPS, MIN_STREAM_WIDTH, MIN_VOICE_SPEED, STEM_NAMES,
+    ScrubFrames, ScrubStats, SheetCell, SheetClip, SpeechModelInfo, StemsStatus, StyleInfo, TextPart, TextRasterGraph,
+    VariantProgress, VariantsRun, VoiceInfo, VoiceoverStatus, WaveformLevel, WaveformPyramid, WaveformRange, WindowBalance,
+    WrittenAudio, WrittenVideo, DEFAULT_SPEECH_MODEL, DEFAULT_VOICE, FILMSTRIP_HEIGHT, MAX_FILMSTRIP_FRAMES, MAX_STREAM_FPS,
+    MAX_STREAM_WIDTH, MAX_VOICE_SPEED, MAX_WAVEFORM_BUCKETS, MIN_STREAM_FPS, MIN_STREAM_WIDTH, MIN_VOICE_SPEED, STEM_NAMES,
 };
 pub use error::{Error, Result};
 pub use fonts::list_system_fonts;
@@ -95,18 +97,18 @@ pub use media::{MediaResolver, OriginalMedia, ProxyMedia, SourceMedia};
 pub use model::{
     check_delivery_fps, fmt_fps, plan_score_to_picture, AlignOptions, AlignReport, AnalysisKind, Asset, AssetAnalysis,
     AudioEffect, AutoIncluded, BeatReading, CaptionLayout, CaptionOptions, CaptionPlacement, CaptionStyle, CaptionTimeBase, Clip,
-    ClipCut, ClipLut, ClipMove, Color, CropFrame, CurvePoint, Curves, CutAlignment, Delivery, DeltaRange, Detached, DetachedMany,
-    DiffEntry, DiffKind, Easing, EditOutcome, EditSource, FitOrder, Framing, Generator, Grade, HitKind, InstrumentOverrides,
-    Keyframe, LevelReading, Levels, Marker, MarkerKind, MarkerPatch, Mask, MaskShape, MasterBus, MusicScore, MusicStyle,
-    Projection, Property, PropertyKey, PropertyTrack, Reframe, ReframeKeyframe, ResolvedReframe, Revision, Rhythm, SalienceMap,
-    ScoreHit, ScoreSection, SectionKind, SectionSpan, SkippedChange, SkippedDetach, SourceLimits, SplitSide, StagedAssetChange,
-    StagedEdit, StreamInfo, StreamKind, Subsampling, SubsetMerge, SvgOverlay, SvgOverlayPatch, SvgPreset, SvgPresetKind,
-    SvgPresetParams, Task, TaskStatus, TextKeyframe, TextOverlay, TimeRange, Timeline, TimelineDiff, TitleClip, Track,
-    TrackLevels, TranscriptSegment, Transform, TransformPatch, Transition, TransitionKind, VideoEffect, Voiceover, Wheel, Wheels,
-    Word, ADJACENT_EPS, DEFAULT_MAX_TEMPO_CHANGE, GENERATED_ASSET, LEVELS_TARGET_LUFS, LEVELS_TRUE_PEAK_CEILING_DBTP,
-    MASTER_DEFAULT_CEILING_DB, MASTER_MAX_VOLUME, MASTER_MIN_CEILING_DB, MAX_BPM, MAX_CHANNEL_VOLUME, MAX_DELIVERY_FPS, MAX_SEED,
-    MAX_SPEED, MAX_SVG_OVERLAYS, MAX_SVG_SECONDS, MAX_TITLE_CLIPS, MIN_BPM, MIN_DELIVERY_FPS, MIN_EDIT_CLIP, MIN_SPEED,
-    RELEASE_TAIL_S,
+    ClipCut, ClipLut, ClipMove, Color, CropFrame, CurvePoint, Curves, CutAlignment, CutLine, CutWord, Delivery, DeltaRange,
+    Detached, DetachedMany, DiffEntry, DiffKind, Easing, EditOutcome, EditSource, FitOrder, Framing, Generator, Grade, HitKind,
+    InstrumentOverrides, Keyframe, LevelReading, Levels, Marker, MarkerKind, MarkerPatch, Mask, MaskShape, MasterBus, MusicScore,
+    MusicStyle, Projection, Property, PropertyKey, PropertyTrack, Reframe, ReframeKeyframe, ResolvedReframe, Revision, Rhythm,
+    SalienceMap, ScoreHit, ScoreSection, SectionKind, SectionSpan, SkippedChange, SkippedDetach, SourceLimits, SplitSide,
+    StagedAssetChange, StagedEdit, StreamInfo, StreamKind, Subsampling, SubsetMerge, SvgOverlay, SvgOverlayPatch, SvgPreset,
+    SvgPresetKind, SvgPresetParams, Task, TaskStatus, TextKeyframe, TextOverlay, Thumbnail, ThumbnailLayer, TimeRange, Timeline,
+    TimelineDiff, TitleClip, Track, TrackLevels, TranscriptSegment, Transform, TransformPatch, Transition, TransitionKind,
+    VideoEffect, VideoGraphics, Voiceover, Wheel, Wheels, Word, ADJACENT_EPS, DEFAULT_MAX_TEMPO_CHANGE, GENERATED_ASSET,
+    LEVELS_TARGET_LUFS, LEVELS_TRUE_PEAK_CEILING_DBTP, MASTER_DEFAULT_CEILING_DB, MASTER_MAX_VOLUME, MASTER_MIN_CEILING_DB,
+    MAX_BPM, MAX_CHANNEL_VOLUME, MAX_DELIVERY_FPS, MAX_SEED, MAX_SPEED, MAX_SVG_OVERLAYS, MAX_SVG_SECONDS, MAX_TITLE_CLIPS,
+    MIN_BPM, MIN_DELIVERY_FPS, MIN_EDIT_CLIP, MIN_SPEED, RELEASE_TAIL_S,
 };
 pub use plan_caps::{DipWhy, EffectKinds, GpuCaps, GradeKinds, LayerRef, Unsupported};
 pub use plan_epoch::{bump_plan_epoch, plan_epoch};
@@ -117,12 +119,13 @@ pub use platform::{
 };
 pub use play_plan::{PlayAhead, PlayCut, PlayRefusal};
 pub use project::{
-    AlignTo, AudioSync, AudioSyncMeasure, AudioSyncPlan, BandBalance, BandBalanceRequest, BandPlan, BandSource, ComposePlan,
-    ComposeRequest, Composed, DeliveryInputs, ExportedFile, FramingPlan, MissingAsset, Page, PreparedText, Project, RelinkCheck,
-    Relinked, RemovedAsset, ScoreAlign, SmartCropJob, SmartCropPlan, StemsPlaced, SubsetApplied, SvgChecked, SvgLayout,
-    SvgOverlayResult, SvgSource, SyncSide, TitleClipPatch, TitleClipPlacement, TitleClipResult, TitleEdited, TitleTextForm,
-    TitleTextInputs, DEFAULT_HISTORY_LIMIT, MAX_CHANNEL_KEYS, MAX_SYNC_SECONDS, MUSIC_TRACK, SCHEMA_VERSION, STAGED_UNDO_DEPTH,
-    SYNC_SAMPLE_RATE, VOICEOVER_TRACK,
+    AlignTo, AudioSync, AudioSyncMeasure, AudioSyncPlan, BandBalance, BandBalanceRequest, BandPlan, BandSource, Batch,
+    ComposePlan, ComposeRequest, Composed, CutTranscript, CutTranscriptInputs, DeliveryInputs, ExportedFile, FramingPlan,
+    MissingAsset, Page, PreparedText, Project, RelinkCheck, Relinked, RemovedAsset, ScoreAlign, SmartCropJob, SmartCropPlan,
+    StemsPlaced, SubsetApplied, SvgChecked, SvgLayout, SvgOverlayResult, SvgSource, SyncSide, ThumbnailLayerSpec,
+    ThumbnailResult, ThumbnailSpec, TitleClipPatch, TitleClipPlacement, TitleClipResult, TitleEdited, TitleTextForm,
+    TitleTextInputs, Untranscribed, DEFAULT_HISTORY_LIMIT, MAX_CHANNEL_KEYS, MAX_SYNC_SECONDS, MUSIC_TRACK, SCHEMA_VERSION,
+    STAGED_UNDO_DEPTH, SYNC_SAMPLE_RATE, VOICEOVER_TRACK,
 };
 pub use proxy::{PreviewSource, ProxyInput, ProxyPhase, ProxySize, ProxyStatus, ProxyWait};
 pub use recovery::{Recoverable, RecoveryInfo};
@@ -130,6 +133,7 @@ pub use render_plan::{
     Animated, CompositeColorPolicy, FadeOp, GradeRoute, LayerFx, PlanCanvas, PlanLayer, PlanMode, PlanReframe, PlanSource,
     PlanStream, PlanText, PlanTiming, ReframeInterp, RenderPlan, YuvMatrix, MAX_AMPLIFIED_ERROR, MAX_SHRINK, MIN_TEXT_PX,
 };
+pub use review::{Check as ReviewCheck, CutReview, ReviewInputs, ReviewIssue, SkippedCheck};
 pub use svg::{check_svg, render_preset, SvgCheck, SvgDoc, SvgPresetInfo, SvgPresetParamInfo, MAX_ANIMATIONS, MAX_VALUES};
 pub use template::{
     ImportOutcome, ImportStatus, Library as TemplateLibrary, PreparedTemplate, PreparedValues, Template, TemplateControl,

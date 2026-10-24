@@ -18,6 +18,7 @@ use crate::model::Grade;
 use crate::model::MarkerPatch;
 use crate::model::{default_beat_tolerance, fmt_time};
 use crate::model::{music_fit_clips, plan_music_fit, MusicFit, MusicFitReport, MAX_FIT_BARS};
+use crate::model::{AnalysisKind, CutLine};
 use crate::model::{
     Asset, AssetAnalysis, AudioEffect, CaptionOptions, CaptionStyle, CaptionTimeBase, Clip, ClipCut, ClipMove, CropFrame,
     Delivery, Easing, EditOutcome, EditSource, Framing, Keyframe, Levels, Marker, Mask, MasterBus, Projection, Reframe,
@@ -422,6 +423,8 @@ pub struct Project {
     /// project ([`Project::replace_with`]) can make them the drawing fonts without reading the table
     /// under the lock. A `RefCell`, like the overrides above.
     embedded: RefCell<Vec<crate::fonts::EmbeddedFont>>,
+    /// The edits of the [`Project::batch`] in progress, so they land as one step.
+    batch: RefCell<Option<batch::BatchSteps>>,
 }
 
 /// How many steps back [`Project::undo_staged`] can take a proposal.
@@ -452,6 +455,34 @@ fn trimmed_suffix(notes: &[String]) -> String {
         String::new()
     } else {
         format!(" (trimmed sound on {})", seen.join(", "))
+    }
+}
+
+/// A write begun by [`Project::tx`]; dropped without [`Tx::commit`], it rolls back.
+struct Tx<'a> {
+    conn: &'a Connection,
+    nested: bool,
+    open: bool,
+}
+
+impl Tx<'_> {
+    fn commit(mut self) -> Result<()> {
+        self.conn
+            .execute_batch(if self.nested { "RELEASE kerf_edit" } else { "COMMIT" })?;
+        self.open = false;
+        Ok(())
+    }
+}
+
+impl Drop for Tx<'_> {
+    fn drop(&mut self) {
+        if self.open && !self.conn.is_autocommit() {
+            let _ = self.conn.execute_batch(if self.nested {
+                "ROLLBACK TO kerf_edit; RELEASE kerf_edit"
+            } else {
+                "ROLLBACK"
+            });
+        }
     }
 }
 
@@ -502,6 +533,7 @@ impl Project {
             recovery,
             history_limit: default_history_limit(),
             embedded: RefCell::new(Vec::new()),
+            batch: RefCell::new(None),
         }
     }
 
@@ -1324,7 +1356,7 @@ impl Project {
             }
         }
         asset.source_paths.clear();
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.tx()?;
         self.insert_asset(&asset)?;
         if !keep {
             self.conn
@@ -1407,7 +1439,7 @@ impl Project {
                 })
             })?;
         }
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.tx()?;
         if let Some(row) = &staged {
             let touched = !in_proposal.is_empty() || row.assets.iter().any(|c| c.asset_id == asset_id);
             if touched {
@@ -1984,6 +2016,60 @@ impl Project {
         engine::timeline_frame_region_cancellable(timeline, assets, &opts, time_secs, region, max_width, quality, cancel)
     }
 
+    /// The span of the cut a sheet of it covers: `[start, end)` clamped into `[0, duration]`,
+    /// defaulting to the whole cut. [`Project::timeline_sheet_times`] and a cell of a sheet both
+    /// read it, so a cell lands on the moment the sheet showed.
+    pub fn timeline_sheet_window(timeline: &Timeline, start: Option<f64>, end: Option<f64>) -> (f64, f64) {
+        let duration = timeline.duration();
+        let start = start.unwrap_or(0.0).clamp(0.0, duration);
+        let end = end.unwrap_or(duration).min(duration).max(start);
+        (start, end)
+    }
+
+    /// The timeline time each cell of a `columns`×`rows` sheet of the cut shows, row-major
+    /// ([`engine::contact_sheet_times`] over [`Project::timeline_sheet_window`]).
+    pub fn timeline_sheet_times(timeline: &Timeline, start: Option<f64>, end: Option<f64>, columns: u32, rows: u32) -> Vec<f64> {
+        let (start, end) = Self::timeline_sheet_window(timeline, start, end);
+        engine::contact_sheet_times(start, end, columns, rows)
+    }
+
+    /// A contact sheet of the cut from already-resolved inputs ([`Project::timeline_frame_inputs`],
+    /// so the preview's proxies), **without** `&self`: the composited still at each of
+    /// `columns`×`rows` moments across `[start, end)` (the whole cut by default), `cell_width` px
+    /// wide, tiled into one JPEG, with each cell's time and the clips on screen there. A gap is
+    /// black. `cancel` stops it ([`Error::Cancelled`]).
+    #[allow(clippy::too_many_arguments)]
+    pub fn composite_timeline_sheet_cancellable(
+        timeline: &Timeline,
+        assets: &[Asset],
+        start: Option<f64>,
+        end: Option<f64>,
+        columns: u32,
+        rows: u32,
+        cell_width: u32,
+        quality: u8,
+        cancel: &(dyn Fn() -> bool + Sync),
+    ) -> Result<(Vec<u8>, Vec<engine::SheetCell>)> {
+        if timeline.duration() <= 0.0 {
+            return Err(Error::InvalidArgument(
+                "the timeline is empty: there is no cut to skim".to_string(),
+            ));
+        }
+        let opts = engine::ExportOptions {
+            hwaccel: engine::decode_hwaccel(),
+            ..engine::ExportOptions::default()
+        };
+        let times = Self::timeline_sheet_times(timeline, start, end, columns, rows);
+        let jpeg = engine::timeline_sheet_cancellable(timeline, assets, &opts, &times, columns, cell_width, quality, cancel)?;
+        Ok((jpeg, engine::timeline_sheet_cells(timeline, assets, &opts, &times)))
+    }
+
+    /// The clips on screen at each of `times`, bottom to top: what a sheet's caption, or one
+    /// cell's, names.
+    pub fn timeline_sheet_cells(timeline: &Timeline, assets: &[Asset], times: &[f64]) -> Vec<engine::SheetCell> {
+        engine::timeline_sheet_cells(timeline, assets, &engine::ExportOptions::default(), times)
+    }
+
     /// How ready the current cut is for each publishing target — what a platform
     /// would reject, what it would accept and then quietly under-distribute, and
     /// what would simply be better — with the cut it was judged on.
@@ -2038,6 +2124,34 @@ impl Project {
             has_audio,
             has_text: !rendered.overlays.is_empty(),
         })
+    }
+
+    /// What a [`crate::review::review`] of the cut reads: the **working** timeline, the assets and
+    /// the cached analysis of each asset the timeline uses. Resolved together so the caller can drop
+    /// the lock before reviewing.
+    pub fn review_inputs(&self) -> Result<crate::review::ReviewInputs> {
+        let timeline = self.working_timeline()?;
+        let mut analyses = HashMap::new();
+        for clip in timeline.tracks.iter().flat_map(|t| t.clips.iter()) {
+            if analyses.contains_key(&clip.asset_id) {
+                continue;
+            }
+            if let Some(analysis) = self.get_analysis(clip.asset_id)? {
+                analyses.insert(clip.asset_id, analysis);
+            }
+        }
+        Ok(crate::review::ReviewInputs {
+            timeline,
+            assets: self.list_assets()?,
+            analyses,
+        })
+    }
+
+    /// Review the working cut for craft defects ([`crate::review`]): `checks` by name (none is every
+    /// check; an unknown one is an [`Error::InvalidArgument`]), over `range` of the cut.
+    pub fn review_cut(&self, range: Option<(f64, f64)>, checks: &[String]) -> Result<crate::review::CutReview> {
+        let checks = crate::review::Check::parse_list(checks)?;
+        Ok(crate::review::review(&self.review_inputs()?, range, &checks))
     }
 
     /// The owned inputs a levels measurement needs: the working timeline and the
@@ -2329,6 +2443,19 @@ impl Project {
             .query_row("SELECT data FROM timeline WHERE id = 1", [], |r| r.get(0))?)
     }
 
+    /// Begin a write that is all or nothing: a transaction of its own, or a savepoint inside the one
+    /// already open (a [`Project::batch`]'s), so an edit made in a batch rolls back alone or with it.
+    fn tx(&self) -> Result<Tx<'_>> {
+        let nested = !self.conn.is_autocommit();
+        self.conn
+            .execute_batch(if nested { "SAVEPOINT kerf_edit" } else { "BEGIN DEFERRED" })?;
+        Ok(Tx {
+            conn: &self.conn,
+            nested,
+            open: true,
+        })
+    }
+
     pub fn save_timeline(&self, timeline: &Timeline) -> Result<()> {
         self.save_timeline_str(&timeline_to_json(timeline)?)
     }
@@ -2484,7 +2611,7 @@ impl Project {
                     }
                     out
                 };
-                let tx = self.conn.unchecked_transaction()?;
+                let tx = self.tx()?;
                 self.adopt_staged(row.owner.as_deref())?;
                 let out = self.edit_staged(row, label, f)?;
                 tx.commit()?;
@@ -2493,7 +2620,7 @@ impl Project {
             if self.agent_review.get() {
                 // The session opens in the same transaction as the edit it was opened for, so an
                 // edit that fails leaves no empty proposal behind.
-                let tx = self.conn.unchecked_transaction()?;
+                let tx = self.tx()?;
                 self.open_session(None, None, declared.as_deref())?;
                 let row = self.staged_row()?.ok_or(Error::NoStagedEdit)?;
                 let out = self.edit_staged(row, label, f)?;
@@ -2501,13 +2628,15 @@ impl Project {
                 return Ok(out);
             }
         }
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.tx()?;
         let mut timeline = self.timeline()?;
         let result = f(&mut timeline)?;
         let json = timeline_to_json(&timeline)?;
         self.save_timeline_str(&json)?;
-        let label = format!("{}{}", label(&result), trimmed_suffix(&self.edit_notes.take()));
-        self.record_revision(&label, self.actor, &json)?;
+        let (label, notes) = (label(&result), self.edit_notes.take());
+        if self.note_batch_step(&label, &notes, false).is_none() {
+            self.record_revision(&format!("{label}{}", trimmed_suffix(&notes)), self.actor, &json)?;
+        }
         tx.commit()?;
         Ok(result)
     }
@@ -2640,8 +2769,11 @@ impl Project {
         let mut timeline: Timeline = serde_json::from_str(&row.timeline)?;
         let result = f(&mut timeline)?;
         let json = timeline_to_json(&timeline)?;
-        let label = format!("{}{}", label(&result), trimmed_suffix(&self.edit_notes.take()));
-        self.push_staged_step(&row, &json, &row.assets, label)?;
+        let (label, notes) = (label(&result), self.edit_notes.take());
+        match self.note_batch_step(&label, &notes, true) {
+            Some(false) => self.continue_staged_step(&json)?,
+            _ => self.push_staged_step(&row, &json, &row.assets, format!("{label}{}", trimmed_suffix(&notes)))?,
+        }
         Ok(result)
     }
 
@@ -2844,7 +2976,7 @@ impl Project {
         };
         let mut edits = row.edits;
         let label = edits.pop().unwrap_or_else(|| "edit".to_string());
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.tx()?;
         self.conn.execute(
             "UPDATE staged SET timeline = ?1, assets = ?2, edits = ?3, updated_at = ?4 WHERE id = 1",
             params![timeline, assets, serde_json::to_string(&edits)?, Utc::now().to_rfc3339()],
@@ -2900,7 +3032,7 @@ impl Project {
             (None, [one]) => one.clone(),
             (None, edits) => format!("Agent edit ({} of {} changes)", diff.entries.len(), edits.len()),
         };
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.tx()?;
         if !diff.is_empty() {
             self.save_timeline_str(&landing)?;
             self.record_revision(&label, EditSource::Agent, &landing)?;
@@ -2976,7 +3108,7 @@ impl Project {
             Some(note) => format!("{note} ({applied} of {total})"),
             None => format!("Agent edit ({applied} of {total} changes)"),
         };
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.tx()?;
         if merged_json != live_json {
             self.save_timeline_str(&merged_json)?;
             self.record_revision(&label, EditSource::Agent, &merged_json)?;
@@ -3167,7 +3299,7 @@ impl Project {
                 row.task_id = None;
             }
         }
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.tx()?;
         self.conn.execute(
             "INSERT INTO staged (id, base_seq, base, timeline, edits, task_id, note, created_at, updated_at, owner, assets)
              VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
@@ -3279,7 +3411,7 @@ impl Project {
         let snapshot = snapshot.ok_or(Error::RevisionNotFound(seq))?;
         let timeline: Timeline = serde_json::from_str(&snapshot)?;
         self.refuse_removed_media(&timeline)?;
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.tx()?;
         self.save_timeline_str(&snapshot)?;
         self.set_head(seq)?;
         tx.commit()?;
@@ -5649,7 +5781,7 @@ impl Project {
     /// not after it was deleted.
     pub fn remove_task(&self, id: Uuid) -> Result<()> {
         self.require_task(id)?;
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.tx()?;
         if self.staged_row()?.is_some_and(|r| r.task_id == Some(id)) {
             self.discard_staged()?;
         }
@@ -6166,7 +6298,7 @@ impl Project {
     fn stage_asset_projection(&self, mut asset: Asset, projection: Option<Projection>) -> Result<Asset> {
         let declared = self.agent_owner.borrow().clone();
         let stored = self.stored_asset(asset.id)?.ok_or(Error::AssetNotFound(asset.id))?;
-        let tx = self.conn.unchecked_transaction()?;
+        let tx = self.tx()?;
         if !self.staged_exists()? {
             self.open_session(None, None, declared.as_deref())?;
         }
@@ -6768,6 +6900,54 @@ impl Project {
         Ok(created)
     }
 
+    /// What the cut says: every audible clip's cached transcript mapped into timeline time
+    /// ([`Timeline::cut_transcript`] over the working timeline), and the assets the cut plays
+    /// that have no transcript yet. Reads the cache only — nothing is transcribed here.
+    pub fn cut_transcript(&self) -> Result<CutTranscript> {
+        Ok(self.cut_transcript_inputs()?.read())
+    }
+
+    /// The part of [`Project::cut_transcript`] that needs the project: the working timeline and
+    /// the transcripts of what it plays. [`CutTranscriptInputs::read`] maps them with the lock
+    /// released.
+    pub fn cut_transcript_inputs(&self) -> Result<CutTranscriptInputs> {
+        let timeline = self.working_timeline()?;
+        let rendered = timeline.for_render();
+        let mut heard: Vec<(Uuid, usize)> = Vec::new();
+        for clip in rendered.tracks.iter().flat_map(|t| &t.clips) {
+            if !clip.source_audio || clip.asset_id == GENERATED_ASSET {
+                continue;
+            }
+            match heard.iter_mut().find(|(id, _)| *id == clip.asset_id) {
+                Some((_, clips)) => *clips += 1,
+                None => heard.push((clip.asset_id, 1)),
+            }
+        }
+        let mut transcripts: HashMap<Uuid, Vec<TranscriptSegment>> = HashMap::new();
+        let mut untranscribed = Vec::new();
+        for (asset_id, clips) in heard {
+            match self.get_analysis(asset_id)?.filter(|a| a.done(AnalysisKind::Transcript)) {
+                Some(analysis) => {
+                    transcripts.insert(asset_id, analysis.transcript);
+                }
+                None => {
+                    if let Some(asset) = self.stored_asset(asset_id)?.filter(Asset::has_audio) {
+                        untranscribed.push(Untranscribed {
+                            asset_id,
+                            name: asset.name,
+                            clips,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(CutTranscriptInputs {
+            timeline,
+            transcripts,
+            untranscribed,
+        })
+    }
+
     /// Caption the cut from a parsed subtitle file: lay its cues onto the cut and
     /// write them as caption overlays — as **one** `Import captions` revision.
     ///
@@ -7174,6 +7354,41 @@ impl Project {
     pub fn filler_words(&self, asset_id: Uuid, fillers: &[String]) -> Result<Vec<crate::transcript::FillerWord>> {
         Ok(crate::transcript::filler_words(&self.transcript(asset_id)?, fillers))
     }
+
+    /// What [`crate::transcript::search_transcripts`] reads, under the lock: the assets in library order
+    /// (only `asset_ids`, when given), their cached analysis unparsed, and the working timeline.
+    pub fn transcript_search_inputs(&self, asset_ids: Option<&[Uuid]>) -> Result<crate::transcript::TranscriptSearchInputs> {
+        let library = self.list_assets()?;
+        let named: Option<HashSet<Uuid>> = asset_ids.map(|ids| ids.iter().copied().collect());
+        if let Some(missing) = named.iter().flatten().find(|id| !library.iter().any(|a| a.id == **id)) {
+            return Err(Error::AssetNotFound(*missing));
+        }
+        let assets: Vec<crate::transcript::search::SearchAsset> = library
+            .into_iter()
+            .filter(|a| named.as_ref().is_none_or(|n| n.contains(&a.id)))
+            .map(|a| crate::transcript::search::SearchAsset {
+                has_audio: a.has_audio(),
+                named: named.is_some(),
+                id: a.id,
+                name: a.name,
+            })
+            .collect();
+        let mut stmt = self.conn.prepare("SELECT data FROM analysis WHERE asset_id = ?1")?;
+        let mut cached = HashMap::new();
+        for asset in &assets {
+            let data = stmt
+                .query_row(params![asset.id.to_string()], |r| r.get::<_, String>(0))
+                .optional()?;
+            if let Some(data) = data {
+                cached.insert(asset.id, data);
+            }
+        }
+        Ok(crate::transcript::TranscriptSearchInputs {
+            assets,
+            cached,
+            timeline: self.working_timeline()?,
+        })
+    }
 }
 
 /// Refuse a number that is `NaN` or infinite, naming what it was for.
@@ -7525,11 +7740,15 @@ mod store;
 pub use store::{backup_path as schema_backup_path, SCHEMA_VERSION};
 mod exports;
 pub use exports::{DeliveryInputs, ExportedFile};
+mod batch;
+pub use batch::Batch;
 mod templates;
 mod title_clips;
 pub use title_clips::{TitleClipPatch, TitleClipPlacement, TitleClipResult, TitleEdited};
 mod title_text;
 pub use title_text::{PreparedText, TitleTextForm, TitleTextInputs};
+mod thumbnails;
+pub use thumbnails::{prepare_thumbnail, PreparedThumbnail, ThumbnailBase, ThumbnailLayerSpec, ThumbnailResult, ThumbnailSpec};
 
 /// A window onto a long, ordered list (the edit history, the task queue): `offset` of the
 /// **newest** entries are skipped and up to `limit` of the ones before them returned, kept in
@@ -7621,6 +7840,41 @@ pub struct AssetFile {
     pub name: String,
     pub path: String,
     /// Clips of the live timeline that use the asset.
+    pub clips: usize,
+}
+
+/// What [`Project::cut_transcript_inputs`] read under the lock.
+#[derive(Debug, Clone)]
+pub struct CutTranscriptInputs {
+    timeline: Timeline,
+    transcripts: HashMap<Uuid, Vec<TranscriptSegment>>,
+    untranscribed: Vec<Untranscribed>,
+}
+
+impl CutTranscriptInputs {
+    /// Map the transcripts through the cut. Pure.
+    pub fn read(self) -> CutTranscript {
+        CutTranscript {
+            lines: self.timeline.cut_transcript(&self.transcripts),
+            untranscribed: self.untranscribed,
+        }
+    }
+}
+
+/// The transcript of the cut (see [`Project::cut_transcript`]).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CutTranscript {
+    pub lines: Vec<CutLine>,
+    /// Assets the cut plays the sound of that have not been transcribed, in track order.
+    pub untranscribed: Vec<Untranscribed>,
+}
+
+/// An asset the cut plays the sound of with no transcript yet.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Untranscribed {
+    pub asset_id: Uuid,
+    pub name: String,
+    /// Audible clips of the cut cut from it.
     pub clips: usize,
 }
 
@@ -7745,6 +7999,32 @@ mod tests {
     }
 
     #[test]
+    fn a_sheet_of_the_cut_covers_the_whole_cut_unless_told_and_clamps_into_it() {
+        let timeline = Project::sample().unwrap().timeline().unwrap();
+        let d = timeline.duration();
+        assert!(d > 0.0);
+        assert_eq!(Project::timeline_sheet_window(&timeline, None, None), (0.0, d));
+        assert_eq!(
+            Project::timeline_sheet_window(&timeline, Some(-3.0), Some(d + 10.0)),
+            (0.0, d)
+        );
+        assert_eq!(Project::timeline_sheet_window(&timeline, Some(d + 5.0), None), (d, d));
+        assert_eq!(Project::timeline_sheet_window(&timeline, Some(2.0), Some(1.0)), (2.0, 2.0));
+        let times = Project::timeline_sheet_times(&timeline, None, None, 4, 2);
+        assert_eq!(times.len(), 8);
+        assert_eq!(times[0], 0.0);
+        assert!((times[1] - d / 8.0).abs() < 1e-9);
+        assert!(times.iter().all(|&t| t < d), "{times:?}");
+        assert!(Project::timeline_sheet_times(&timeline, Some(1.0), Some(1.0), 2, 2)
+            .iter()
+            .all(|&t| t == 1.0));
+        let mut empty = timeline;
+        empty.tracks.clear();
+        let refused = Project::composite_timeline_sheet_cancellable(&empty, &[], None, None, 4, 4, 240, 5, &|| false);
+        assert!(matches!(refused, Err(Error::InvalidArgument(_))), "{refused:?}");
+    }
+
+    #[test]
     fn a_grade_is_normalized_stored_and_diffed() {
         use crate::model::{ClipLut, CurvePoint, Curves};
         let project = Project::sample().unwrap();
@@ -7813,6 +8093,29 @@ mod tests {
             .issues
             .iter()
             .any(|i| i.severity == crate::platform::Severity::Warning && i.message.contains("letterboxed")));
+    }
+
+    #[test]
+    fn review_cut_reads_the_working_cut_and_its_analysis() {
+        let project = Project::sample().unwrap();
+        let timeline = project.working_timeline().unwrap();
+        let clip = timeline.tracks.iter().flat_map(|t| t.clips.iter()).next().unwrap().clone();
+        project
+            .set_analysis(&AssetAnalysis {
+                asset_id: clip.asset_id,
+                scene_changes: vec![1.0],
+                ..AssetAnalysis::default()
+            })
+            .unwrap();
+        let inputs = project.review_inputs().unwrap();
+        assert_eq!(inputs.timeline.duration(), timeline.duration());
+        assert!(inputs.analyses.contains_key(&clip.asset_id));
+        let review = project.review_cut(None, &["flash_frame".to_string()]).unwrap();
+        assert_eq!(review.checked, vec![crate::review::Check::FlashFrame]);
+        assert!(matches!(
+            project.review_cut(None, &["flash".to_string()]),
+            Err(Error::InvalidArgument(_))
+        ));
     }
 
     #[test]
@@ -7958,6 +8261,27 @@ mod tests {
         let timeline = project.timeline().unwrap();
         assert_eq!(timeline.tracks.iter().filter(|t| t.name == VOICEOVER_TRACK).count(), 1);
         assert_eq!(second.timeline_start, 6.0);
+    }
+
+    #[test]
+    fn the_cut_transcript_reads_the_working_cut_and_names_what_is_untranscribed() {
+        let project = Project::open_in_memory().unwrap();
+        let (vo, _) = project
+            .place_voiceover(&voiceover_asset("/vo/a.wav"), None, Some(2.0))
+            .unwrap();
+        let music = asset_with("/music.wav", vec![aud_stream()]);
+        project.insert_asset(&music).unwrap();
+        project.add_clip_to_timeline(music.id, None, 0.0, 3.0, Some(0.0)).unwrap();
+        let cut = project.cut_transcript().unwrap();
+        let lines: Vec<(&str, f64)> = cut
+            .lines
+            .iter()
+            .map(|l| (l.text.as_str(), (l.start * 1000.0).round() / 1000.0))
+            .collect();
+        assert_eq!(lines, [("Welcome to the shop.", 2.0), ("We open at nine.", 3.85)]);
+        assert!(cut.lines.iter().all(|l| l.asset_id == vo.id));
+        assert_eq!(cut.untranscribed.len(), 1);
+        assert_eq!((cut.untranscribed[0].asset_id, cut.untranscribed[0].clips), (music.id, 1));
     }
 
     #[test]
@@ -8351,6 +8675,118 @@ mod tests {
         assert_eq!((fillers[0].start, fillers[0].end), (0.0, 0.3));
         let analysis = project.get_analysis(asset.id).unwrap().unwrap();
         assert!(analysis.ran.contains(&crate::model::AnalysisKind::Transcript));
+
+        let silent = project
+            .insert_or_get_asset(&asset_with("/kerf-silent.mp4", vec![vid_stream(false)]))
+            .unwrap();
+        let spoken = project
+            .insert_or_get_asset(&asset_with("/kerf-untranscribed.mov", vec![aud_stream()]))
+            .unwrap();
+        let clip = project.cut_clip(asset.id, 0.2, 1.0).unwrap();
+        let search = |text: &str, ids: Option<&[Uuid]>| {
+            let inputs = project.transcript_search_inputs(ids).unwrap();
+            let query = crate::transcript::TranscriptQuery {
+                query: text.into(),
+                ..Default::default()
+            };
+            crate::transcript::search_transcripts(inputs, &query).unwrap()
+        };
+        let found = search("UM hello", None);
+        assert_eq!((found.total, found.searched_assets), (1, 1));
+        assert_eq!(found.assets_without_transcript.asset_ids, vec![spoken.id]);
+        let hit = &found.hits[0];
+        assert_eq!((hit.start, hit.end, hit.speaker.as_deref()), (0.0, 0.9, Some("S1")));
+        assert_eq!(hit.in_cut.len(), 1);
+        assert_eq!(hit.in_cut[0].clip_id, clip.id);
+        assert!(hit.in_cut[0].partial);
+        assert!(search("hi", None).hits[0].in_cut.is_empty());
+        let named = search("hi", Some(&[silent.id]));
+        assert_eq!((named.total, named.assets_without_transcript.count), (0, 1));
+        assert!(matches!(
+            project.transcript_search_inputs(Some(&[Uuid::new_v4()])),
+            Err(Error::AssetNotFound(_))
+        ));
+    }
+
+    /// 50 assets × one hour of speech (≈ 9,600 timed words each), timed: what is read under the lock
+    /// and the search after it. Run it with
+    /// `cargo test --release -p kerf-core --no-default-features a_large_library -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    #[allow(clippy::print_stderr)]
+    fn a_large_library_searches_its_transcripts_quickly() {
+        use crate::model::Word;
+        use crate::transcript::{search_transcripts, MatchMode, TranscriptQuery};
+        let vocab = [
+            "so", "we", "went", "out", "to", "the", "lake", "and", "then", "it", "started", "raining", "really", "hard", "café",
+            "don't",
+        ];
+        let project = Project::open_in_memory().unwrap();
+        for a in 0..50 {
+            let asset = project
+                .insert_or_get_asset(&Asset {
+                    duration: 3600.0,
+                    ..asset_with(&format!("/kerf-hour-{a}.mov"), vec![aud_stream()])
+                })
+                .unwrap();
+            let transcript = (0..1200)
+                .map(|l| {
+                    let start = l as f64 * 3.0;
+                    let words: Vec<Word> = (0..8)
+                        .map(|w| Word {
+                            text: vocab[(a * 7 + l * 3 + w) % vocab.len()].into(),
+                            start: start + w as f64 * 0.35,
+                            end: start + w as f64 * 0.35 + 0.3,
+                            confidence: Some(0.9),
+                            speaker: Some(format!("S{}", l % 2 + 1)),
+                            ..Word::default()
+                        })
+                        .collect();
+                    TranscriptSegment {
+                        start,
+                        end: start + 2.8,
+                        text: words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" "),
+                        words,
+                        speaker: Some(format!("S{}", l % 2 + 1)),
+                    }
+                })
+                .collect();
+            project
+                .merge_analysis(&AssetAnalysis {
+                    asset_id: asset.id,
+                    transcript,
+                    ran: vec![crate::model::AnalysisKind::Transcript],
+                    ..AssetAnalysis::default()
+                })
+                .unwrap();
+            project.cut_clip(asset.id, 60.0, 120.0).unwrap();
+        }
+        let mut report = Vec::new();
+        for (text, mode) in [
+            ("the lake", MatchMode::Phrase),
+            ("raining lake", MatchMode::AllWords),
+            ("the", MatchMode::AnyWord),
+        ] {
+            let t = std::time::Instant::now();
+            let inputs = project.transcript_search_inputs(None).unwrap();
+            let locked = t.elapsed();
+            let bytes: usize = inputs.cached.values().map(String::len).sum();
+            let query = TranscriptQuery {
+                query: text.into(),
+                mode,
+                ..TranscriptQuery::default()
+            };
+            let t = std::time::Instant::now();
+            let found = search_transcripts(inputs, &query).unwrap();
+            assert_eq!(found.searched_assets, 50);
+            report.push(format!(
+                "{mode:?}: {} MB read under the lock in {locked:?}, searched in {:?} ({} hits)",
+                bytes / 1_000_000,
+                t.elapsed(),
+                found.total
+            ));
+        }
+        eprintln!("{}", report.join("\n"));
     }
 
     #[test]

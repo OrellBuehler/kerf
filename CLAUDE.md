@@ -30,7 +30,7 @@ Most rules in these files exist because a bug already happened. They record *why
 | `.claude/docs/engine-media.md` | `peaks.rs` waveforms, `filmstrip.rs`, libav backend, whisper transcription (word timings, VAD, speakers), audio sync, Kokoro TTS voiceover, optional cargo features |
 | `.claude/docs/core-model.md` | `model.rs`: clips, easing, transitions, captions, caption import, beats, diff, ripple, edit modes, per-property keyframe channels, markers / chapters, timecode, OTIO / EDL interchange, hostile-input tests |
 | `.claude/docs/core-links.md` | Linked A/V: detach/reattach, carried edits, sync lock, `run_edit`, the links corpus |
-| `.claude/docs/core-render-plan.md` | `platform.rs`, `render_plan.rs` / `planner.rs` / `plan_caps.rs`, frame picks, GPU refusal rules, colour / partly-keyed transforms in the plan |
+| `.claude/docs/core-render-plan.md` | `platform.rs`, `review.rs` (the `review_cut` lint), `render_plan.rs` / `planner.rs` / `plan_caps.rs`, frame picks, GPU refusal rules, colour / partly-keyed transforms in the plan |
 | `.claude/docs/core-golden.md` | The golden argv oracle and how to bless it |
 | `.claude/docs/core-project.md` | `project.rs` persistence, ripple flag, smart crop, multi-format delivery, task queue, staged agent edits (owners, partial accept, restore), schema versions and migrations, crash recovery, motion templates and embedded fonts, `analysis.rs` (analysis steps, per-kind status), `proxy.rs` (proxy status / queue / settings) |
 | `.claude/docs/gpu.md` | kerf-gpu: frame cache, y4m/showinfo parsing, router, `FrameSource`, `FrameCursor`, presenting a frame (A2), parity harness findings |
@@ -93,6 +93,9 @@ bunx @tauri-apps/cli@2 dev   --config crates/kerf-app/tauri.conf.json
 bunx @tauri-apps/cli@2 build --config crates/kerf-app/tauri.conf.json
 cargo run -p kerf-app        # also works; runs the frontend dev command first
 
+# MCP without a window (CI, servers): ready line on stdout, logs on stderr
+cargo run -p kerf-app --no-default-features -- --headless --mcp-addr 127.0.0.1:7777 [--project x.kerf]
+
 # MCP: run the app, then
 #   claude mcp add --transport http kerf http://127.0.0.1:7777/mcp \
 #     --header "Authorization: Bearer <token>"   (Settings > Agent shows it; KERF_MCP_ADDR overrides the address)
@@ -112,7 +115,8 @@ touch an installed Kerf's settings — see `.claude/docs/build-and-ci.md`.
 
 - **Engine first, then surfaces.** New capability lands in `kerf-core`, then as a Tauri
   command (`lib.rs`), an MCP tool (`mcp.rs`), the `api.ts` bridge + its browser-harness
-  fallback, and `types.ts`. Serde structs ↔ `types.ts` stay in sync; JSON is snake_case.
+  fallback, and `types.ts`. Serde structs ↔ `types.ts` stay in sync; JSON is snake_case. Code the
+  MCP server reaches takes a `Shell` / `&impl Host` (`shell.rs`), never an `AppHandle`: it also runs headless.
 - **Never hold the project lock across media work.** Resolve inputs under the lock,
   release it, run ffmpeg / decode / inference, re-lock to apply (`*_inputs` → static
   `decode_*` / `sample_*` → `apply_*`). No Tauri command runs on the main thread: quick

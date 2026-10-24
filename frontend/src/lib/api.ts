@@ -6,6 +6,11 @@
 // explorable without the desktop shell.
 
 import type {
+	TranscriptQuery,
+	TranscriptSearch,
+	SuggestedFrame,
+	ThumbnailEdit,
+	ThumbnailSpec,
 	AudioDetached,
 	Asset,
 	AssetAnalysis,
@@ -25,6 +30,7 @@ import type {
 	Clip,
 	ClipCut,
 	ClipMove,
+	CutTranscript,
 	Mask,
 	MissingAsset,
 	Color,
@@ -32,6 +38,8 @@ import type {
 	LutInfo,
 	Delivery,
 	PlatformReport,
+	CutReview,
+	ReviewCheck,
 	EditSource,
 	ExportOptions,
 	ExportedFile,
@@ -89,6 +97,7 @@ import type {
 	Scopes,
 	AppSettings,
 	McpConnectionInfo,
+	McpToolSet,
 	McpSettingsPatch,
 	TimeDisplay,
 	SettingsPatch,
@@ -202,17 +211,20 @@ import { centeredCrop } from './smart-crop';
 import { synthWaveformRange } from './sample-waveform';
 import { analysisKindDone, ALL_KINDS } from './analysis-steps';
 import { sampleFilmstrip } from './sample-filmstrip';
+import { searchTranscripts as harnessSearchTranscripts } from './transcript-search';
 import { synthPcm } from './sample-audio';
 import { sampleFrameJpeg } from './sample-frame';
 import { harnessScopes } from './scopes-view';
 import { harnessRenderBar } from './render-bar';
 import { checkDeliveryFps, deliverLabel } from './delivery-formats';
-import { renderedFps } from './timecode';
+import { renderedDuration, renderedFps } from './timecode';
 import { playbackFps } from './playback-sync';
 import { parsePlaybackMessage } from './frame-transport';
 import { playbackId } from './playback-id';
 import { entryId, mergeSubset, subsetMessage } from './staged-subset';
+import { evenFrames, putThumbnail } from './thumbnail-design';
 import { captionsForTimeline, resolveCaptions } from './captions';
+import { cutTranscript } from './cut-transcript';
 import { estimateWords } from './transcript';
 import { describeError, logFrontend } from './log';
 import { parseLaunchRequest } from './launch';
@@ -818,6 +830,13 @@ export async function missingAssets(): Promise<MissingAsset[]> {
 			}));
 	}
 	return invoke<MissingAsset[]>('missing_assets');
+}
+
+/** Where `query.query` is said across the library's transcripts (`phrase`, `all_words` within a line, or
+ *  `any_word`), paged, each hit with the clips of the cut that use it (`in_cut`, empty when unused). */
+export async function searchTranscripts(query: TranscriptQuery): Promise<TranscriptSearch> {
+	if (!inTauri()) return harnessSearchTranscripts(sampleAssets, sampleAnalysis, devTimeline, query);
+	return invoke<TranscriptSearch>('search_transcripts', { query });
 }
 
 /** Open a native file picker for the file to relink `name` to (media files only); `null` if cancelled. The
@@ -3750,6 +3769,34 @@ export async function generateCaptions(options?: CaptionOptions): Promise<Timeli
 	return invoke<Timeline>('generate_captions', { options: options ?? null });
 }
 
+/** What the cut says: every audible clip's transcript in timeline time, and the assets the cut plays with no
+ *  transcript yet. The harness reads its sample analysis through the `cut-transcript.ts` mirror. */
+export async function getCutTranscript(): Promise<CutTranscript> {
+	if (!inTauri()) {
+		const transcripts: Record<string, TranscriptSegment[]> = {};
+		const untranscribed: CutTranscript['untranscribed'] = [];
+		const soloed = new Set(devTimeline.tracks.filter((t) => t.solo).map((t) => t.kind));
+		for (const track of devTimeline.tracks) {
+			if (track.muted || (soloed.has(track.kind) && !track.solo)) continue;
+			for (const clip of track.clips) {
+				if (clip.enabled === false || clip.source_audio === false) continue;
+				const segs = sampleAnalysis[clip.asset_id]?.transcript;
+				if (segs?.length) {
+					transcripts[clip.asset_id] = segs;
+					continue;
+				}
+				const asset = assetById(clip.asset_id);
+				if (!asset?.streams.some((s) => s.kind === 'audio')) continue;
+				const noted = untranscribed.find((u) => u.asset_id === clip.asset_id);
+				if (noted) noted.clips += 1;
+				else untranscribed.push({ asset_id: clip.asset_id, name: asset.name, clips: 1 });
+			}
+		}
+		return { lines: cutTranscript(devTimeline, transcripts), untranscribed };
+	}
+	return invoke<CutTranscript>('cut_transcript');
+}
+
 /** Remove the generated captions, leaving typed titles and lower-thirds alone. */
 export async function clearCaptions(): Promise<Timeline> {
 	if (!inTauri()) {
@@ -5040,6 +5087,60 @@ export async function exportCover(timeSecs: number, outputPath: string): Promise
 	return invoke<string>('export_cover', { timeSecs, outputPath, format: null });
 }
 
+/** Add a thumbnail (`thumbnailId` null) or change one to `spec` — each unset field keeps what it has, `layers` is the
+ *  whole new stack. One edit. In the browser harness the layers carry no artwork (the engine draws it). */
+export async function setThumbnail(thumbnailId: string | null, spec: ThumbnailSpec): Promise<ThumbnailEdit> {
+	if (!inTauri()) {
+		const t = putThumbnail(devTimeline, thumbnailId, spec, uid);
+		recordDev(`${thumbnailId == null ? 'Add' : 'Change'} thumbnail “${t.name}”`);
+		return { timeline: snapshot(), thumbnail_id: t.id, warnings: [] };
+	}
+	return invoke<ThumbnailEdit>('set_thumbnail', { thumbnailId, spec });
+}
+
+export async function removeThumbnail(thumbnailId: string): Promise<Timeline> {
+	if (!inTauri()) {
+		const before = devTimeline.thumbnails?.length ?? 0;
+		devTimeline.thumbnails = (devTimeline.thumbnails ?? []).filter((t) => t.id !== thumbnailId);
+		if (devTimeline.thumbnails.length === before) throw new Error(`no thumbnail ${thumbnailId}`);
+		recordDev('Remove thumbnail');
+		return snapshot();
+	}
+	return invoke<Timeline>('remove_thumbnail', { thumbnailId });
+}
+
+/** The thumbnail drawn `width` px wide (from the proxies) as an object URL the caller revokes; `null` in the
+ *  browser harness, which draws no thumbnails. */
+export async function thumbnailPreview(thumbnailId: string, width: number): Promise<string | null> {
+	if (!inTauri()) return null;
+	const bytes = await invoke<ArrayBuffer>('thumbnail_preview', { thumbnailId, width: Math.round(width) });
+	return URL.createObjectURL(new Blob([bytes], { type: 'image/png' }));
+}
+
+/** Write the thumbnail at full size from the original media: `.png`, `.jpg` or `.webp` by the extension. */
+export async function exportThumbnail(thumbnailId: string, outputPath: string): Promise<string> {
+	if (!inTauri()) throw new Error('saving a thumbnail is only available in the desktop app');
+	return invoke<string>('export_thumbnail', { thumbnailId, outputPath });
+}
+
+/** The best frames of the cut for a thumbnail, best first. In the browser harness: frames spread evenly. */
+export async function suggestThumbnailFrames(count = 6): Promise<SuggestedFrame[]> {
+	if (!inTauri()) return evenFrames(renderedDuration(devTimeline), count);
+	return invoke<SuggestedFrame[]>('suggest_thumbnail_frames', { count, range: null });
+}
+
+/** Open a save dialog for a thumbnail image. */
+export async function pickThumbnailPath(name: string): Promise<string | null> {
+	if (!inTauri()) return null;
+	const { save } = await import('@tauri-apps/plugin-dialog');
+	const stem = name.replace(/[^\p{L}\p{N}]+/gu, '-').replace(/^-|-$/g, '').toLowerCase() || 'thumbnail';
+	const path = await save({
+		filters: [{ name: 'Image', extensions: ['png', 'jpg', 'webp'] }],
+		defaultPath: `${stem}.png`
+	});
+	return typeof path === 'string' ? path : null;
+}
+
 /** Open a save dialog for a cover image. */
 export async function pickCoverPath(): Promise<string | null> {
 	if (!inTauri()) return null;
@@ -5088,6 +5189,27 @@ export async function platformCheck(
 		height: frame?.[1] ?? null,
 		range: range ?? null
 	});
+}
+
+/** The working cut's editing mistakes (`kerf_core::review`): `checks` by name (all when omitted), `range` keeps what
+ *  falls in that span. The browser harness does not review: every check comes back skipped. */
+export async function reviewCut(
+	range?: { start: number; end: number } | null,
+	checks?: ReviewCheck[] | null
+): Promise<CutReview> {
+	if (!inTauri()) {
+		const all: ReviewCheck[] = ['flash_frame', 'mid_word_cut', 'hard_audio_cut', 'jump_cut', 'stale_captions', 'black_gap'];
+		return {
+			issues: [],
+			counts_by_kind: {},
+			checked: [],
+			skipped: (checks?.length ? all.filter((c) => checks.includes(c)) : all).map((check) => ({
+				check,
+				reason: 'the browser harness does not review the cut'
+			}))
+		};
+	}
+	return invoke<CutReview>('review_cut', { range: range ?? null, checks: checks ?? null });
 }
 
 let platformTargetsKnown: Promise<PlatformTarget[]> | null = null;
@@ -5151,6 +5273,20 @@ function harnessTokenProblem(): string | null {
 	return 'The token could not be saved (permission denied). It works until Kerf quits; the next start makes a new one.';
 }
 
+/** The desktop app reads these from `mcp/toolsets.rs`; the harness shows the same sets. */
+const HARNESS_TOOL_SETS: McpToolSet[] = [
+	{ name: 'core', description: 'Look at the media and the cut, cut and arrange, volume / fades / transitions, review and history, jobs', tools: 60 },
+	{ name: 'analysis', description: 'Transcripts, speakers, filler words, waveforms, scopes, speech model, proxies, audio sync', tools: 18 },
+	{ name: 'clips', description: 'Speed, transform, colour and grade, effects, masks, linked picture and sound', tools: 17 },
+	{ name: 'keyframes', description: 'Keyframes, per-property animation and 360 reframing', tools: 12 },
+	{ name: 'titles', description: 'Text overlays, SVG titles and templates, captions, markers, fonts', tools: 32 },
+	{ name: 'audio', description: 'Track and master mix, ducking, loudness and band balance, voiceover', tools: 13 },
+	{ name: 'music', description: 'Music structure, fitting and composing music, stems, snapping cuts to beats', tools: 8 },
+	{ name: 'delivery', description: 'Delivery format, smart crop, export, variants, cover, captions and interchange files', tools: 16 },
+	{ name: 'tasks', description: "The user's task queue", tools: 7 },
+	{ name: 'project', description: 'Open, create and save projects as, missing media, settings', tools: 6 }
+];
+
 function harnessMcpInfo(next: Partial<McpConnectionInfo>): McpConnectionInfo {
 	const base: McpConnectionInfo = harnessMcp ?? {
 		enabled: true,
@@ -5164,7 +5300,8 @@ function harnessMcpInfo(next: Partial<McpConnectionInfo>): McpConnectionInfo {
 		env_override: false,
 		agent_review: true,
 		claude_code_command: '',
-		generic_json_config: ''
+		generic_json_config: '',
+		tool_sets: HARNESS_TOOL_SETS
 	};
 	const merged = { ...base, ...next };
 	merged.url = clientUrl(merged.configured_addr ?? '127.0.0.1:7777');

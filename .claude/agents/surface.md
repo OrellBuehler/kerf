@@ -21,7 +21,8 @@ belongs in kerf-core.
    part. Mutating ops return the refreshed `Timeline`.
 2. **MCP tool** in `crates/kerf-app/src/mcp.rs` inside the `#[tool_router]`
    impl. Mutations go through `edit()` (runs under `lock_agent`, releases, then
-   emits `project-changed`). Map caller mistakes with `core_err` so they reach the
+   emits `project-changed` through `self.app`, a `Shell` — `self.app.emit(…)`, never
+   `tauri::Emitter::emit`, so the tool also runs headless). Map caller mistakes with `core_err` so they reach the
    model as `invalid_params`. Clamp any size a model picks from a schema. Write
    the tool description for a model that has never seen the GUI; update the
    server `instructions` if the tool changes the recommended flow.

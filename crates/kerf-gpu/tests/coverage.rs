@@ -64,6 +64,7 @@ fn archetypes(base: &Asset, side: &Asset) -> Vec<(&'static str, Timeline)> {
         markers: vec![],
         format: Some(format),
         master: Default::default(),
+        thumbnails: Vec::new(),
     };
     let mut clips = vec![];
     for i in 0..15 {

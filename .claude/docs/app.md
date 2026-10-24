@@ -39,6 +39,27 @@ working towards a result that would be dropped is killed instead of finishing.
 (`fetch_max`) and the highest stopped id (`stopped >= id` ends a stream), so a start that arrives after a newer one, a
 stop that arrives before its start, and a reloaded page whose counter restarted at 1 all resolve by comparison.
 
+**Headless mode** (`headless.rs`, `shell.rs`). `kerf-app --headless [--project x.kerf | --new-project x.kerf]
+[--mcp-addr ADDR] [--data-dir DIR] [--token-file PATH] [--show-token] [--review] [--proxies] [--cpu-percent N]` runs the MCP
+server with no display and no webview: `main.rs` calls `headless_main()` before `run()`, which builds no Tauri app (tao
+initialises GTK and panics with no display) and runs on `tauri::async_runtime` with a `Shell::Headless` in place of the
+`AppHandle` — so **code the MCP server reaches takes a `Shell` or `&impl Host`, never an `AppHandle`**. On Linux the binary
+still links GTK / WebKitGTK (the libraries must be installed, a display need not be). `--project` must exist and
+`--new-project` must not (exit 2); with neither, an untitled recovery-backed project as in the window. Directories: the
+desktop app's config / data dirs for the build's identifier (`context()`, the one `generate_context!`, so a debug build uses
+`.dev`), or `--data-dir` for settings, logs and recovery alike (CI isolation). No single-instance plugin: a taken port exits
+3 (`port in use … --mcp-addr`), and two runs sharing a settings file can race to make the first token (use `--data-dir` or
+`KERF_MCP_TOKEN`). In memory only: review off unless `--review`, proxies off (`PreviewSource::Original`) unless `--proxies`,
+`--cpu-percent`. No GPU preview, crash marker, reveal failsafe or launch slot. **stdout** is one JSON ready line once the
+listener is up — `{"kerf":"listening","url","addr","pid","project","agent_review","token_source":"env|settings|generated"}`
+— and `--help`; logs go to **stderr** (`init_logging(dir, to_stderr)`) and `<data>/logs`. The token is never printed unless
+`--show-token` (stderr, past the log file); `--token-file` writes it atomically with mode 0600; otherwise a stderr banner names
+the settings file. SIGINT / SIGTERM (Ctrl+C on Windows): the listener closes (`mcp::stop`), `AppState::stop_all` presses every
+Stop, proxies and agent jobs are cancelled and waited for up to 10 s, `recovery::on_exit` keeps an untitled project with work
+(its directory logged); a second signal exits 130. Exit codes: 0 stopped by a signal, 1 failure, 2 usage, 3 not listening.
+Release Windows builds are `windows_subsystem = "windows"`: pipes work, an interactive console shows nothing.
+`tests/headless.rs` drives the real binary (no `DISPLAY`): ready line, 401 / 200 / 202, two tools, SIGTERM → 0.
+
 **Process start.** `use_bundled_ffmpeg()` sets `KERF_FFMPEG` / `KERF_FFPROBE` and is the **first statement of `run()`**,
 before the runtime, the webview or any thread exists (`set_var` races every concurrent read of the environment);
 logging is not up yet, so it returns what it set and `setup` logs it.
@@ -49,7 +70,9 @@ released), `relink_asset { assetId, newPath }` → `Relinked` (`relink_inputs` u
 comparison of both files' ends — with it released, `apply_relink_probed` under it, `forget_media_caches` released
 again; `cancel_import` stops the probe), `check_relink { assetId, newPath }` → `RelinkCheck {analysis_kept, has_analysis}` (the same
 lock-free probe and refusals, changing nothing: what a relink would cost, so the prompt can say a different recording drops the analysis first), `missing_assets` → `MissingAsset[]` (`missing_assets_inputs` under the lock,
-`find_missing_assets` stat-ing the files with it released: a share that went away can take long to say so), `paths_exist { paths }` → `boolean[]` (the export dialog's
+`find_missing_assets` stat-ing the files with it released: a share that went away can take long to say so), `search_transcripts
+{ query: TranscriptQuery }` → `TranscriptSearch` (the MCP tool's search over the user's cut: `transcript_search_inputs` under the
+lock, parsed and matched with it released), `paths_exist { paths }` → `boolean[]` (the export dialog's
 overwrite check), `recent_projects`, `open_recent { path }` (a vanished file is dropped from the list, never created —
 `open_project` refuses a path that names nothing too) and `clear_recent_projects`. Staged proposals:
 `apply_staged_subset { entryIds, force? }` → `SubsetApplied`, `undo_staged_edit` → `{label, staged}`,
@@ -169,7 +192,8 @@ text engine) and store with `set_title_text_parsed` (same "try again" rule) thro
 `list_text_animation_presets` and `list_text_animation_curves` (stateless `#[tauri::command(async)]`s) list the eight presets and the six
 curves (`linear`, `ease_in`, `ease_out`, `ease_in_out`, `overshoot`, `spring`; `CurvePreset { id, name, description, curve }`). The library is app-level (not undone, not staged);
 `generate_captions` / `clear_captions` (caption the whole cut, in timeline
-time), `import_captions` / `import_captions_text` (a subtitle file by path / by text —
+time), `cut_transcript` → `CutTranscript` (what the cut says in timeline time, plus `untranscribed`;
+`cut_transcript_inputs` under the lock, mapped on the blocking pool with it released), `import_captions` / `import_captions_text` (a subtitle file by path / by text —
 the text variant is what an `<input type=file>` or a paste uses; both return
 `{timeline, summary}` rather than a bare `Timeline`), `export_srt`, `export_captions` (the cut's
 captions as `.srt` / `.vtt`), `export_interchange` (OTIO / EDL, returns `{path, report}`),
@@ -217,8 +241,13 @@ id** rather than a generation counter, because start and stop are separate async
 out of order and a late stop must not kill the stream that replaced it —
 `get_audio` → a clip window as **raw mono s16le PCM via `tauri::ipc::Response`**, the
 only non-JSON command — the preview's Web Audio playback decodes it),
-delivery (`export_cover` → a cover image at the full delivery frame,
-`platform_targets` / `platform_check` (frame, range → a `PlatformReport`: the checks and the cut they judged) → the platform check, `reveal_path` →
+delivery (`export_cover` → a cover image at the full delivery frame; **thumbnails** (`thumbnail_commands.rs`):
+`set_thumbnail { thumbnailId?, spec }` → `{timeline, thumbnail_id, warnings}` (add, or change to a `ThumbnailSpec`; templates
+and the sanitiser run before the lock), `remove_thumbnail` → `Timeline`, `thumbnail_preview { thumbnailId, width }` → the PNG
+bytes via `tauri::ipc::Response` (proxies), `export_thumbnail { thumbnailId, outputPath }` (originals, `.png` / `.jpg` /
+`.webp`; the cover's Cancel stops it), `suggest_thumbnail_frames { count?, range? }` → `SuggestedFrame[]`,
+`platform_targets` / `platform_check` (frame, range → a `PlatformReport`: the checks and the cut they judged) → the platform check,
+`review_cut` (range, checks → a `CutReview`, the editing lint `review_cut` gives an agent; no UI yet), `reveal_path` →
 show a rendered file in the OS file manager, opening its *containing folder*
 rather than the file, since "show me where it went" is not a request to launch a
 player), the
@@ -284,7 +313,7 @@ to report and the panel judges from the age instead of the green dot it used to
 show unconditionally). `mcp_connection_info` (URL, token, `token_problem` — why the token is not what it should be, or `null` —, `running` / `error`
 **for the address now configured** (`listener_state`: until the supervisor has restarted for a new address, the old one's
 state says nothing about it, so `running` is false and `error` empty, which is what lets the page wait for the restart),
-`claude_code_command` with the bearer header and a generic `mcpServers` JSON snippet; `mcp_commands.rs`), `regenerate_mcp_token` (the old token stops working at once)
+`claude_code_command` with the bearer header, a generic `mcpServers` JSON snippet and `tool_sets` for a `?tools=` URL; `mcp_commands.rs`), `regenerate_mcp_token` (the old token stops working at once)
 and `set_mcp_settings { mcp_enabled?, mcp_addr?, mcp_require_token?, agent_review? }` (refuses any other key; a network
 address needs the token; `settings::update` restarts the listener when the address or switch moves, see `mcp.md`) are the Agent
 settings page's commands — the settings file holds `agent_review`, `mcp_enabled`, `mcp_addr`, `mcp_require_token` and
@@ -374,8 +403,8 @@ comes back `ForbiddenUrl` and the "Release notes" button silently does nothing.
 *project* `project_path`, `new_project`, `open_project`, `save_project_as`, `recent_projects`, `open_recent`,
 `clear_recent_projects`, `take_launch_project`, `show_main_window`, `list_recoveries`, `recover_project`, `discard_recovery`,
 `discard_recovery_at_exit`; *library* `list_assets`, `get_asset_metadata`,
-`list_fonts`, `import_asset`, `cancel_import`, `remove_asset`, `relink_asset`, `check_relink`, `missing_assets`, `paths_exist`,
-`set_asset_projection`; *analysis, proxies, transcription* `analyze_asset`, `cancel_analysis`, `analysis_statuses`,
+`list_fonts`, `import_asset`, `cancel_import`, `remove_asset`, `relink_asset`, `check_relink`, `missing_assets`, `search_transcripts`,
+`paths_exist`, `set_asset_projection`; *analysis, proxies, transcription* `analyze_asset`, `cancel_analysis`, `analysis_statuses`,
 `proxy_statuses`, `rebuild_proxy`, `delete_proxy`, `transcription_status`, `set_speech_model`, `download_speech_model`,
 `cancel_model_download`; *voiceover, music, stems, mixing* `voiceover_status`, `prepare_voiceover`, `generate_voiceover`,
 `cancel_voiceover`, `music_status`, `prepare_music`, `compose_music`, `cancel_music`, `get_band_balance`,
@@ -395,7 +424,7 @@ comes back `ForbiddenUrl` and the "Release notes" button silently does nothing.
 `update_marker`, `remove_marker`, `add_overlay`, `update_overlay`, `remove_overlay`, `set_overlay_keyframes`,
 `add_svg_overlay`, `update_svg_overlay`, `remove_svg_overlay`, `validate_svg`, `list_svg_presets`,
 `svg_preset_preview`, `list_templates`, `template_poster`, `svg_element_ids`, `template_image_value`, `save_template`,
-`apply_template`, `apply_template_clip`, `add_title_clip`, `update_title_clip`, `set_template_values`, `set_title_text_box`, `set_title_text_animation`, `list_text_animation_presets`, `list_text_animation_curves`, `convert_title_text`, `import_template`, `export_template`, `delete_template`, `generate_captions`, `clear_captions`, `import_captions`, `import_captions_text`, `export_srt`, `export_captions`, `export_interchange`, `export_markers`,
+`apply_template`, `apply_template_clip`, `add_title_clip`, `update_title_clip`, `set_template_values`, `set_title_text_box`, `set_title_text_animation`, `list_text_animation_presets`, `list_text_animation_curves`, `convert_title_text`, `import_template`, `export_template`, `delete_template`, `generate_captions`, `clear_captions`, `cut_transcript`, `import_captions`, `import_captions_text`, `export_srt`, `export_captions`, `export_interchange`, `export_markers`,
 `refine_transcript`;
 *history and review* `get_history`, `revision_diff`, `undo`, `redo`, `revert_to`, `get_staged_edit`,
 `get_staged_timeline`, `apply_staged_edit`, `apply_staged_subset`, `discard_staged_edit`, `undo_staged_edit`,
@@ -403,7 +432,8 @@ comes back `ForbiddenUrl` and the "Release notes" button silently does nothing.
 *preview and media* `get_frame`, `get_timeline_frame`, `get_preview_frame`, `set_preview_bounds`, `gpu_preview_status`,
 `playback_session`, `start_playback`, `stop_playback`, `get_waveform_range`,
 `get_filmstrip`, `get_audio`, `get_energy`, `get_scopes`, `get_render_bar`; *delivery* `hw_encoders`, `export_timeline`, `export_variants`,
-`cancel_export`, `export_cover`, `cancel_cover_export`, `platform_targets`, `platform_check`, `reveal_path`;
+`cancel_export`, `export_cover`, `cancel_cover_export`, `set_thumbnail`, `remove_thumbnail`, `thumbnail_preview`,
+`export_thumbnail`, `suggest_thumbnail_frames`, `platform_targets`, `platform_check`, `review_cut`, `reveal_path`;
 *agent and app* `agent_status`, `report_ui_context`, `mcp_connection_info`, `regenerate_mcp_token`, `set_mcp_settings`, `get_settings`, `set_settings`, `reset_settings`, `reveal_settings_file`,
 `read_text_file`, `write_text_file`, `reveal_logs`, `log_frontend`; *detached panels* `popout_expect`,
 `popout_cancel`, `close_popout`, `popout_focus`, `popout_move`.

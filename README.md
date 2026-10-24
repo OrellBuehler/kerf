@@ -37,8 +37,8 @@ agent isn't scripting a black box; it drives the identical engine — and its ed
 **staged for review**, so they never move the cut you are looking at.
 
 - 🎬 **The agent has eyes.** `get_frame`, `skim_asset` (a contact-sheet montage for
-  finding the good parts), and `preview_timeline` (the composited cut at a given time)
-  return real images the model *sees* — so it can find the right moment and confirm the
+  finding the good parts), `preview_timeline` (the composited cut at a given time) and
+  `skim_timeline` (a contact sheet of the whole cut) return real images the model *sees* — so it can find the right moment and confirm the
   cut, not guess from metadata.
 - 🧠 **Same engine, same project.** The MCP server and the webview hold the *same*
   `Project` behind one lock — no import/export round-trip, no second copy of the truth,
@@ -64,7 +64,7 @@ agent isn't scripting a black box; it drives the identical engine — and its ed
 | **Real playback** | Not a slideshow — one long-lived FFmpeg streams the **composited** cut (every track, effect, keyframe and overlay) paced against the audio clock, with J/K/L shuttle audible both ways and audible Web-Audio scrub. |
 | **Delivery frames** | 16:9 / 9:16 / 1:1 / 4:5 is a property of the **project**, so preview, scrub and export all render the same frame — with platform **safe-area guides** and cover-crop instead of letterboxing. |
 | **Smart crop** | Reshaping 16:9 to 9:16 throws away most of one axis. `smart_crop` samples where each shot's content actually is (edge detail + motion, no model to ship) and writes the crop that keeps it, per clip — an ordinary transform the sliders can still override. |
-| **Ready to publish?** | `platform_check` judges the cut against Reels / Shorts / TikTok / Instagram / YouTube — length, shape, resolution, captions — and tells a **hard** limit (rejected) apart from a **reach** limit (accepted, then buried). Advisory only; nothing blocks an export. **Cover frames** save at the full delivery resolution. |
+| **Ready to publish?** | `platform_check` judges the cut against Reels / Shorts / TikTok / Instagram / YouTube — length, shape, resolution, captions — and tells a **hard** limit (rejected) apart from a **reach** limit (accepted, then buried). Advisory only; nothing blocks an export. `review_cut` lints the editing itself — flash frames, cuts inside a word, sound cut into sound, jump cuts, captions a later edit left behind, black gaps — each with the tool that fixes it. **Cover frames** save at the full delivery resolution. |
 | **Analysis & speech** | Silence and scene detection, an onset/**tempo** grid, EBU R128 loudness and speech-vs-music from one decode — plus **transcription in every build**, via FFmpeg's `whisper` filter or in-process whisper.cpp (models fetched on first use). |
 | **Cut to the beat** | The tempo grid is drawn on the ruler and snapped to while dragging, and `snap_to_beats` ripples a whole track's cuts onto it, retrimming each clip at its **outgoing** edge. |
 | **Effects, color & looks** | Per-clip video (`blur`/`sharpen`/`hue`/`negate`/`vignette`/`chromakey`) and audio (`highpass`/`lowpass`/`EQ`/`compressor`/`gate`) chains, transform + color grade, and one-click **Punchy / Warm / Cool / Faded / B&W** looks. |
@@ -136,26 +136,44 @@ claude mcp add --transport http kerf http://127.0.0.1:7777/mcp \
 }
 ```
 
+Every tool is listed by default. A client that loads every tool's schema up front can ask for fewer by
+adding tool sets to the URL — `http://127.0.0.1:7777/mcp?tools=core,titles` (sets: `core`, `analysis`,
+`clips`, `keyframes`, `titles`, `audio`, `music`, `delivery`, `tasks`, `project`; Settings › Agent builds
+the command for you). The server also offers workflow **prompts** — `rough_cut_from_transcript`,
+`podcast_cleanup`, `social_reel`, `music_bed`, `deliver` — which Claude Code shows as `/mcp__kerf__<name>`.
+
 An agent's edits wait in a proposal for you to accept (all of it, or only some changes)
 unless you switch review off in the same place: then its edits, the work on the tasks
 you queue included, land on the cut as it makes them, each one an undoable step.
+
+### Headless
+
+No display (CI, a server)? Run the MCP server without a window:
+
+```bash
+KERF_MCP_TOKEN=<32+ chars> kerf-app --headless --mcp-addr 127.0.0.1:7777 [--project cut.kerf]
+```
+
+It prints one JSON line on stdout once it listens and stops on SIGINT / SIGTERM; edits land live
+unless `--review`. `kerf-app --headless --help` lists the flags (`--data-dir`, `--token-file`, …).
 
 Now ask the agent to work on the project you have open — _"skim the interview clip, cut
 the dead air, and drop in captions."_ It will claim a task, use the tools below, and hand
 back a reviewable result.
 
-### The tools (178)
+### The tools (189)
 
 <details>
 <summary><b>See / analyze</b></summary>
 
 `get_editing_guide` (how the tools fit together) · `list_assets` (`fields: "compact"` for a big library, `imported_after` for what an import added) · `import_asset` · `get_asset_metadata` · `analyze_asset` · `get_transcript` (lines with
-their speakers; the timed words on request) · `speaker_ranges` · `find_filler_words` · `refine_transcript` ·
+their speakers; the timed words on request) · `get_cut_transcript` (what the cut says, in timeline time) · `speaker_ranges` · `find_filler_words` ·
+`search_transcripts` (where anything is said across the library, and whether the cut uses it) · `refine_transcript` ·
 `get_analysis_detail` · `get_timeline_state` · `timeline_summary` · `get_editor_context` (what the user has
 selected and where the playhead is) · `get_scopes` (waveform / parade / vectorscope / histogram numbers of a
 frame) · `get_waveform` · `get_energy` ·
 **`get_frame`** (drill-in frame) · **`skim_asset`** (contact-sheet montage) ·
-**`preview_timeline`** (the composited cut) · **`preview_svg_overlay`** (an animated title
+**`preview_timeline`** (the composited cut) · **`skim_timeline`** (a contact sheet of the cut) · **`preview_svg_overlay`** (an animated title
 as a contact sheet of moments) · `preview_svg_preset` · `validate_svg` — the bold ones return images the model
 can see, and `get_frame` / `preview_timeline` take a `region` to **zoom** into a quarter of
 the frame at full source detail. Also `get_waveform_range` · `analysis_status` · `missing_assets` ·
@@ -175,7 +193,7 @@ the frame at full source detail. Also `get_waveform_range` · `analysis_status` 
 `add_asset_audio` · `set_ripple_mode` · `plan_music_fit` · `fit_music` · `compose_music` (original music from a
 score, fitted to the cuts) ·
 `detach_audio` · `detach_audio_clips` · `reattach_audio` · `reattach_audio_clips` ·
-`link_clips` · `unlink_clips`
+`link_clips` · `unlink_clips` · `apply_edits` (several edits as one revision, all or nothing, with a dry run)
 </details>
 
 <details>
@@ -196,7 +214,7 @@ score, fitted to the cuts) ·
 <details>
 <summary><b>Render & hand-off</b></summary>
 
-`export` · `export_capabilities` · `export_cover` · `export_interchange` · `export_markers` · `platform_check` · `get_levels` · `stage_edits` ·
+`export` · `export_capabilities` · `export_cover` · `add_thumbnail` · `update_thumbnail` · `remove_thumbnail` · `preview_thumbnail` · `export_thumbnail` · `suggest_thumbnail_frames` · `export_interchange` · `export_markers` · `platform_check` · `review_cut` (flash frames, cuts inside a word, clicks, jump cuts, stale captions, black gaps) · `get_levels` · `stage_edits` ·
 `staged_diff` · `apply_staged_edits` · `discard_staged_edits` · `revision_diff` ·
 `list_tasks` · `add_task` · `claim_next_task` · `complete_task` · `fail_task` ·
 `resolve_task` · `remove_task` · `history` · `undo` · `redo` · `revert_to` ·

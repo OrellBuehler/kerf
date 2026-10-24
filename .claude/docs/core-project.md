@@ -54,6 +54,14 @@
   follows the mode, re-reading its clip like `trim`; `split_remove_clips` is that
   for a group — one revision (`Split and remove left (2 clips)`), the single-clip
   `split_remove` being a group of one. All of them refuse a locked track.
+  **Several edits as one** (`project/batch.rs`): `Project::batch(label, dry_run, |p| …)` runs ordinary edit calls inside one
+  transaction — each still through `run_edit` (ripple, sync lock, locks, checks; each sees the ones before) — and records
+  them as **one** step: live, `run_edit` skips its revision while `batch` is set and the batch writes one (`label`, else the
+  one edit's label or `N edits: kinds`, plus the trimmed-sound suffix); staged, the first edit pushes the step (undo entry +
+  label, relabelled at the end) and the rest only move the proposal (`continue_staged_step`), so `undo_staged` takes back the
+  whole batch. A failure rolls everything back, a proposal the batch opened included; `dry_run` rolls back after reading the
+  working timeline (`Batch { result, before, after, label }`, `diff()`). Batches do not nest. Every write's transaction is
+  `Project::tx`: `BEGIN` at the top level, a `SAVEPOINT` inside a batch's.
   **Two counters tell the app that the project under a job is not the one it left.**
   `generation()` moves when `replace_with` swaps a project in (open / new): a job notes it
   when it resolves its inputs under the lock and drops its result if it changed. **`replace_with_saved_copy`
@@ -162,8 +170,11 @@
   export then goes back to the first clip's rate without a word; a delivery with none is written as before
   (`a_delivery_with_no_rate_stores_exactly_what_it_always_did`), `run` a no-op, `needed` always,
   `needed_to_read` false; `persisted/timelines-v12.json` holds a 9:16 delivery at 50 fps.
-  The schema is at **v12** (`SCHEMA_VERSION`). `persist_tests` pins which steps a file has pending with
-  `store::pending_steps` (a legacy file that has every column: `[4, 5, 6, 7, 8, 9, 10, 11]`). A step's `needed_to_read` says whether a build that
+  v12→v13 is a JSON step for a **new field**, `Timeline.thumbnails` (designed thumbnails, below): an older build drops them
+  at its next write; a timeline with none is written as before, `run` a no-op, `needed` always, `needed_to_read` false;
+  `persisted/timelines-v13.json` holds a vertical thumbnail with a headline.
+  The schema is at **v13** (`SCHEMA_VERSION`). `persist_tests` pins which steps a file has pending with
+  `store::pending_steps` (a legacy file that has every column: `[4, 5, 6, 7, 8, 9, 10, 11, 12]`). A step's `needed_to_read` says whether a build that
   cannot write must still refuse a file lacking what it adds: true for the v1, v2 and v4 columns (the reads
   name them), false for the `fonts` table (reads tolerate its absence), so a write-protected v2 project
   opens as it is. A new file is stamped `SCHEMA_VERSION`; a
@@ -208,6 +219,8 @@
   project replaced (`#[must_use]`); the caller `close()`s it after releasing the lock, which deletes
   its recovery directory (it was saved, recovered into another, or let go). `close_at_exit` deletes it
   only when it holds no work (the same `summarize` rule) — anything else waits for the next launch.
+  A headless `kerf-app` without `--data-dir` keeps its untitled project in the desktop app's recovery root; its session lock
+  keeps a running window's scan away from it, and work it leaves at exit is offered at the window's next launch.
   `Project::sample()` seeds an in-memory demo (two assets + analysis + a starter
   timeline + a sample task queue); it backs the kerf-core tests, but the app now
   launches with an **empty** untitled project (`Project::create_recovery`, see above) — the user imports media or
@@ -825,7 +838,9 @@
   cache no longer holds `read`, so a refinement never overwrites a newer transcript). `speaker_ranges(asset, speaker?,
   join_gap)` (errors naming the known speakers for an unknown one, or when nothing is labelled) and
   `filler_words(asset, fillers)` (default um / uh / … / you know, phrases matched across words of one
-  line) read it by word bounds. **What a request runs** is `resolve_steps(asset, requested)`: a file with no audio is
+  line) read it by word bounds. `transcript_search_inputs(asset_ids?)` is the locked half of a library-wide search
+  (`transcript::search`, `engine-media.md`): the assets in library order, each one's analysis row as the stored JSON
+  (unparsed — parsing is most of the cost) and the working timeline; an unknown id is `AssetNotFound`. **What a request runs** is `resolve_steps(asset, requested)`: a file with no audio is
   not asked for silence, loudness, rhythm or speech (silent b-roll used to get a failed transcript
   chip and an error toast on every import), a still has nothing to analyze, and an empty answer is
   an `InvalidArgument` that says why (everything switched off; a silent file asked for its speech)
@@ -863,3 +878,15 @@
   back to the original. Smart crop's `salience_map` is not swapped.
 - `error.rs` — `Error`/`Result`; the `Ffmpeg(#[from] ffmpeg_next::Error)` variant is
   itself `#[cfg(feature = "ffmpeg")]`.
+- **Thumbnails** (`project/thumbnails.rs`; the model is `core-model.md`, the drawing `engine-cli.md`). The template shape:
+  `thumbnail_base(id?)` under the lock (the thumbnail as the working cut has it, or a new one's defaults: the delivery frame's
+  shape — vertical / square / 4:5, else `youtube` 1280x720 — and the frame at 0), the static `prepare_thumbnail(base, &ThumbnailSpec,
+  library)` with it released (each unset field keeps its value; `layers` is the whole new stack: a `ThumbnailLayerSpec` keeps a layer
+  by `layer_id` — its artwork and placement, changed by what it names, template `values` spliced through `TemplateEditInputs` — or
+  makes one from exactly one of `text` (`svg::render_headline`), `template_id` (`Template::prepare`), `svg`, `image` (a `data:` URL,
+  checked by `template::image_data_url`, wrapped in an SVG of its own size); the sanitiser runs here), then
+  `apply_thumbnail_parsed` — `Add thumbnail “X”` / `Change thumbnail “X”` through `edit_timeline` (so it stages, undoes and diffs),
+  refused when the stored thumbnail is no longer the one prepared from ("try again"), a template's fonts stored and held like
+  `apply_template_parsed`'s. `remove_thumbnail`; `MAX_THUMBNAILS` 20, `MAX_THUMBNAIL_LAYERS` 12. `collect_unused_fonts` keeps a font a
+  thumbnail layer names (`Timeline::thumbnail_sources`). `thumbnail_render_inputs(id)` (thumbnail, working timeline, originals) and
+  `frame_suggestion_inputs()` (plus each cut asset's analyzed `scene_changes`) feed `crate::thumbnail` with the lock released.

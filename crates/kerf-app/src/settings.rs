@@ -19,7 +19,8 @@ use std::sync::Mutex;
 
 use serde::de::Error as _;
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Manager};
+
+use crate::shell::Host;
 
 /// Set deliberately in the environment, this wins over the stored preference at
 /// launch (see [`apply`]).
@@ -321,8 +322,8 @@ const STORED_KEYS: [&str; 21] = [
     "transcribe",
 ];
 
-fn path(app: &AppHandle) -> Option<PathBuf> {
-    app.path().app_config_dir().ok().map(|dir| dir.join("settings.json"))
+fn path(app: &impl Host) -> Option<PathBuf> {
+    app.config_dir().map(|dir| dir.join("settings.json"))
 }
 
 fn sibling(path: &Path, name: &str) -> PathBuf {
@@ -333,7 +334,7 @@ fn sibling(path: &Path, name: &str) -> PathBuf {
 /// never a truncated one: write a temp file beside it, fsync, rename over.
 /// `std::fs::rename` replaces an existing file on every platform (Windows uses
 /// `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`).
-fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
 
     if let Some(parent) = path.parent() {
@@ -555,7 +556,7 @@ fn merge(settings: &Settings, patch: &serde_json::Value) -> Result<Settings, Str
 }
 
 /// The stored preferences (see [`load_from`]).
-pub fn load(app: &AppHandle) -> Settings {
+pub fn load(app: &impl Host) -> Settings {
     let Some(file) = path(app) else {
         return Settings::default();
     };
@@ -575,7 +576,7 @@ fn clamp_cpu(percent: u8) -> u8 {
 /// running app on settings the next launch will not have. Only the fields the patch
 /// carries reach the engine: re-applying the stored CPU budget because the layout moved
 /// would undo a `KERF_CPU_PERCENT` override.
-pub fn update(app: &AppHandle, patch: &serde_json::Value) -> Result<Settings, String> {
+pub fn update(app: &impl Host, patch: &serde_json::Value) -> Result<Settings, String> {
     let file = path(app).ok_or("no config directory available for settings")?;
     let _guard = FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     update_file(&file, patch)
@@ -630,7 +631,7 @@ fn reset_keep(current: &Settings) -> Settings {
 /// Put every preference back to its default and into force, keeping the old file as
 /// `settings.reset-<unix-ms>.json` beside it so a reset is never the end of a theme or a
 /// layout. `KERF_CPU_PERCENT` does not hold back an explicit reset.
-pub fn reset(app: &AppHandle) -> Result<Settings, String> {
+pub fn reset(app: &impl Host) -> Result<Settings, String> {
     let file = path(app).ok_or("no config directory available for settings")?;
     let _guard = FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     reset_file(&file)
@@ -659,7 +660,7 @@ fn reset_file(file: &Path) -> Result<Settings, String> {
 }
 
 /// Where the settings file lives (it may not exist yet).
-pub fn file_path(app: &AppHandle) -> Option<PathBuf> {
+pub fn file_path(app: &impl Host) -> Option<PathBuf> {
     path(app)
 }
 
@@ -692,7 +693,7 @@ pub fn reopen_target(settings: &Settings, exists: impl Fn(&Path) -> bool) -> Opt
 }
 
 /// Edit the stored settings under the file lock and write them back if `edit` says it changed them.
-fn edit_stored(app: &AppHandle, edit: impl FnOnce(&mut Settings) -> bool) -> Result<Settings, String> {
+fn edit_stored(app: &impl Host, edit: impl FnOnce(&mut Settings) -> bool) -> Result<Settings, String> {
     let file = path(app).ok_or("no config directory available for settings")?;
     let _guard = FILE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     edit_stored_file(&file, edit)
@@ -707,7 +708,7 @@ fn edit_stored_file(file: &Path, edit: impl FnOnce(&mut Settings) -> bool) -> Re
 }
 
 /// Edit the stored list under the file lock and write it back if `edit` says it changed.
-fn edit_recent(app: &AppHandle, edit: impl FnOnce(&mut Vec<String>) -> bool) -> Result<Vec<String>, String> {
+fn edit_recent(app: &impl Host, edit: impl FnOnce(&mut Vec<String>) -> bool) -> Result<Vec<String>, String> {
     edit_stored(app, |s| edit(&mut s.recent_projects)).map(|s| s.recent_projects)
 }
 
@@ -720,7 +721,7 @@ fn edit_recent_file(file: &Path, edit: impl FnOnce(&mut Vec<String>) -> bool) ->
 /// file or saved to one (it goes to the front of the recent list and becomes the one a launch
 /// reopens); `None` is a fresh project with no file, which a launch has nothing to reopen. Touches
 /// the disk: call it off the main thread.
-pub fn record_open(app: &AppHandle, path: Option<&str>) -> Result<(), String> {
+pub fn record_open(app: &impl Host, path: Option<&str>) -> Result<(), String> {
     edit_stored(app, |s| apply_open(s, path)).map(|_| ())
 }
 
@@ -738,7 +739,7 @@ fn apply_open(settings: &mut Settings, path: Option<&str>) -> bool {
 /// with the settings lock **released**, since a share that went away can take long to say so and
 /// every other settings write would wait behind it — then takes the lock and forgets the ones
 /// that were gone. Call it off the main thread.
-pub fn recent(app: &AppHandle) -> Result<Vec<String>, String> {
+pub fn recent(app: &impl Host) -> Result<Vec<String>, String> {
     let file = path(app).ok_or("no config directory available for settings")?;
     recent_in(&file, Path::is_file)
 }
@@ -762,7 +763,7 @@ fn missing_of(list: &[String], exists: impl Fn(&Path) -> bool) -> Vec<String> {
 }
 
 /// Forget every recent project.
-pub fn clear_recent(app: &AppHandle) -> Result<Vec<String>, String> {
+pub fn clear_recent(app: &impl Host) -> Result<Vec<String>, String> {
     edit_recent(app, |list| {
         let had = !list.is_empty();
         list.clear();

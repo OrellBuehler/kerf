@@ -56,6 +56,7 @@ fn layer(a: &Asset, t: f64) -> kerf_core::PlanLayer {
         markers: Vec::new(),
         format: None,
         master: Default::default(),
+        thumbnails: Vec::new(),
     };
     RenderPlan::at(
         &tl,

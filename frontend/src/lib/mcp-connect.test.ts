@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
-import { claudeCodeCommand, clientUrl, genericJsonConfig } from './mcp-connect';
+import { claudeCodeCommand, clientUrl, genericJsonConfig, withToolSets } from './mcp-connect';
+import type { McpConnectionInfo } from './types';
 
 // The Rust side (`mcp/server.rs`) builds these for the desktop app; these replay its tests so the
 // browser harness shows the same text.
@@ -17,6 +18,12 @@ describe('claudeCodeCommand', () => {
 	test('has no header when none is required, or none exists', () => {
 		expect(claudeCodeCommand(url, token, false)).toBe(`claude mcp add --transport http kerf ${url}`);
 		expect(claudeCodeCommand(url, null, true)).toBe(`claude mcp add --transport http kerf ${url}`);
+	});
+
+	test('quotes a URL with a query for the shell', () => {
+		expect(claudeCodeCommand(`${url}?tools=core,titles`, null, false)).toBe(
+			`claude mcp add --transport http kerf "${url}?tools=core,titles"`
+		);
 	});
 });
 
@@ -47,5 +54,27 @@ describe('clientUrl', () => {
 	test('reaches a wildcard bind through loopback', () => {
 		expect(clientUrl('0.0.0.0:9000')).toBe('http://127.0.0.1:9000/mcp');
 		expect(clientUrl('[::]:9000')).toBe('http://127.0.0.1:9000/mcp');
+	});
+});
+
+describe('withToolSets', () => {
+	const url = 'http://127.0.0.1:7777/mcp';
+	const info = {
+		url,
+		token: 'z'.repeat(40),
+		require_token: true,
+		claude_code_command: claudeCodeCommand(url, 'z'.repeat(40), true),
+		generic_json_config: genericJsonConfig(url, 'z'.repeat(40), true)
+	} as McpConnectionInfo;
+
+	test('no sets is every tool, the info as it is', () => {
+		expect(withToolSets(info, [])).toBe(info);
+	});
+
+	test('puts the sets on the URL and in both snippets', () => {
+		const picked = withToolSets(info, ['core', 'titles']);
+		expect(picked.url).toBe(`${url}?tools=core,titles`);
+		expect(picked.claude_code_command).toContain(`"${url}?tools=core,titles" --header`);
+		expect(JSON.parse(picked.generic_json_config).mcpServers.kerf.url).toBe(`${url}?tools=core,titles`);
 	});
 });

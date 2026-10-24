@@ -3,9 +3,12 @@
 // can be worked on without the shell. A change to the wording belongs in
 // `crates/kerf-app/src/mcp/server.rs` (`claude_code_command`, `generic_json_config`) too.
 
-/** The one-line command that adds Kerf to Claude Code, with the token header when one is required. */
+import type { McpConnectionInfo } from './types';
+
+/** The one-line command that adds Kerf to Claude Code, with the token header when one is required. A URL with a
+ *  query (`?tools=core`) is quoted, since a shell would read `?` as a pattern. */
 export function claudeCodeCommand(url: string, token: string | null, requireToken: boolean): string {
-	const base = `claude mcp add --transport http kerf ${url}`;
+	const base = `claude mcp add --transport http kerf ${url.includes('?') ? `"${url}"` : url}`;
 	return requireToken && token ? `${base} --header "Authorization: Bearer ${token}"` : base;
 }
 
@@ -25,4 +28,17 @@ export function clientUrl(addr: string): string {
 	const port = m[3];
 	if (host === '0.0.0.0' || host === '::') return `http://127.0.0.1:${port}/mcp`;
 	return m[1] !== undefined ? `http://[${host}]:${port}/mcp` : `http://${host}:${port}/mcp`;
+}
+
+/** The connection info for a client that asks for only some tool sets (`?tools=core,titles`): the URL and both
+ *  snippets carry the selection. No sets is every tool, the info as it is. */
+export function withToolSets(info: McpConnectionInfo, sets: readonly string[]): McpConnectionInfo {
+	if (sets.length === 0) return info;
+	const url = `${info.url}?tools=${sets.join(',')}`;
+	return {
+		...info,
+		url,
+		claude_code_command: claudeCodeCommand(url, info.token, info.require_token),
+		generic_json_config: genericJsonConfig(url, info.token, info.require_token)
+	};
 }

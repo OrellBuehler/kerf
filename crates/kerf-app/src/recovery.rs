@@ -11,6 +11,7 @@ use std::sync::Mutex;
 use kerf_core::{Project, Recoverable, RecoveryInfo};
 use tauri::{AppHandle, Manager, State};
 
+use crate::shell::Host;
 use crate::{blocking, lock_user, AppState, CmdResult};
 
 #[derive(Default)]
@@ -24,15 +25,15 @@ pub(crate) struct RecoveryState {
     let_go: Option<String>,
 }
 
-fn root(app: &AppHandle) -> Option<PathBuf> {
-    app.path().app_data_dir().ok().map(|dir| dir.join("recovery"))
+fn root(app: &impl Host) -> Option<PathBuf> {
+    app.data_dir().map(|dir| dir.join("recovery"))
 }
 
 /// A new untitled project in a recovery session, or an in-memory one when that cannot be made
 /// (no data directory, or no file locking): the app still works, it only cannot recover it.
-pub(crate) fn untitled(app: &AppHandle) -> CmdResult<Project> {
+pub(crate) fn untitled(app: &impl Host) -> CmdResult<Project> {
     let root = app
-        .try_state::<Mutex<RecoveryState>>()
+        .managed::<Mutex<RecoveryState>>()
         .and_then(|s| s.lock().ok()?.root.clone());
     if let Some(root) = root {
         match Project::create_recovery(&root) {
@@ -44,17 +45,19 @@ pub(crate) fn untitled(app: &AppHandle) -> CmdResult<Project> {
 }
 
 /// Resolve the recovery root and move the launch's empty project into a session.
-pub(crate) fn start(app: &AppHandle) {
-    let state = app.state::<Mutex<RecoveryState>>();
-    state.lock().unwrap_or_else(|e| e.into_inner()).root = root(app);
+pub(crate) fn start(app: &impl Host) {
+    if let Some(state) = app.managed::<Mutex<RecoveryState>>() {
+        state.lock().unwrap_or_else(|e| e.into_inner()).root = root(app);
+    }
     match untitled(app) {
         Ok(project) => {
             if let Some(id) = project.recovery_id() {
                 tracing::info!(session = id, "untitled project backed by a recovery file");
             }
-            let app_state = app.state::<AppState>();
-            let old = lock_user(&app_state.project).replace_with(project);
-            old.close();
+            if let Some(app_state) = app.managed::<AppState>() {
+                let old = lock_user(&app_state.project).replace_with(project);
+                old.close();
+            }
         }
         Err(e) => tracing::warn!(error = %e, "could not start an untitled project"),
     }
@@ -63,11 +66,11 @@ pub(crate) fn start(app: &AppHandle) {
 /// On a clean exit an untitled project that holds no work goes; one that does is kept for the
 /// next launch to offer (`Project::close_at_exit`), since the close guard can be bypassed. A
 /// crash never gets here, which is the point.
-pub(crate) fn on_exit(app: &AppHandle) {
+pub(crate) fn on_exit(app: &impl Host) {
     let let_go = app
-        .try_state::<Mutex<RecoveryState>>()
+        .managed::<Mutex<RecoveryState>>()
         .and_then(|s| s.lock().unwrap_or_else(|e| e.into_inner()).let_go.take());
-    if let Some(state) = app.try_state::<AppState>() {
+    if let Some(state) = app.managed::<AppState>() {
         if let Ok(empty) = Project::open_in_memory() {
             let old = lock_user(&state.project).replace_with(empty);
             close_on_exit(old, let_go.as_deref());

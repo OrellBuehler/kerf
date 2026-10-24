@@ -1,7 +1,7 @@
 # Embedded MCP server (`crates/kerf-app/src/mcp.rs`)
 
 The app **is** the MCP server — there is no separate binary. `mcp::start` (called from `lib.rs`'s Tauri `.setup`
-hook) hosts the tools over `rmcp`'s **streamable-HTTP** transport (`StreamableHttpService` + `LocalSessionManager`, nested
+hook, or by `kerf-app --headless` with no Tauri app at all — `app.md`) hosts the tools over `rmcp`'s **streamable-HTTP** transport (`StreamableHttpService` + `LocalSessionManager`, nested
 into an `axum` router) at `/mcp`, on `127.0.0.1:7777` by default. The server's whole lifecycle is `mcp/server.rs`; the
 tools are in `mcp.rs` and four submodules (`jobs.rs`, `reads.rs`, `project_tools.rs`, and `server.rs` itself), each
 with its own `#[tool_router(router = …)]` impl — `router()` adds them together once.
@@ -29,13 +29,25 @@ while a token is required, saying so as its `error`). rmcp's
 none; a web page must not drive the editor through the loopback port), and rmcp validates the inbound **`Host`** against
 `allowed_hosts` (loopback plus whatever the bind address names; a wildcard bind yields an empty list = allow any). A bind
 beyond loopback is refused unless the token is required (`bind_problem`, also checked when settings are patched).
-`KERF_MCP_ADDR` still overrides the stored address. A supervisor task restarts the listener when the address or the enabled
+`KERF_MCP_ADDR` still overrides the stored address. A headless run holds the server to `server::Overrides` (applied in
+`McpConfig::from_settings`, so no settings change undoes them): on, token required, `--mcp-addr` > `KERF_MCP_ADDR` > stored,
+and `KERF_MCP_TOKEN` (checked like a stored token, used for that run only and never written; no token is generated while it
+is set) > stored > generated. The status keeps the listener's `bound` address, so a `:0` bind reports its real port
+(`wait_listening`); `stop` switches the listener off and waits for it, `finish_jobs` cancels every job and waits. A supervisor task restarts the listener when the address or the enabled
 switch changes (`settings::update` → `settings_changed`; sessions on the old listener end), and reports a bind failure through
 `server_error()` instead of exiting. `mcp_connection_info` returns the URL, the token, `running` / `error` and the ready-made
-`claude mcp add --transport http kerf <url> --header "Authorization: Bearer <token>"` plus a generic `mcpServers` JSON snippet;
+`claude mcp add --transport http kerf <url> --header "Authorization: Bearer <token>"` (the URL quoted when it has a query) plus a generic
+`mcpServers` JSON snippet, and `tool_sets` (name, description, tool count: Prompts and tool sets, below);
 `regenerate_mcp_token` and `set_mcp_settings` (only `mcp_*` and `agent_review`) are the other two commands.
 It shares the **same** `Arc<Mutex<Project>>` the Tauri commands hold, so the agent edits the project the user has open.
-Patterns that matter if you edit
+**The app around the server is a `Shell`** (`shell.rs`): `KerfMcp.app` is `Shell::Gui(AppHandle)` or
+`Shell::Headless`, whose inherent `emit` / `state` / `try_state` / `listen` / `unlisten` mirror Tauri's, so tools write
+`self.app.emit(…)` and `self.app.state::<crate::AppState>()` either way (not `tauri::Emitter::emit(&app, …)` or
+`use tauri::Manager`: `Shell` implements neither trait). Headless, events reach only in-process listeners, `try_state`
+answers `AppState` and the recovery state (an `EditorContextState` is `None`: `get_editor_context` says `reported: false`),
+`note_open` leaves the desktop's recent list alone, and the agent's edits land live (review off for that process only,
+`--review` keeps it; `get_settings` reports the switch in force). The `lib.rs` / `settings.rs` / `recovery.rs` helpers the
+server reaches take `&impl Host`. Patterns that matter if you edit
 it: `#[tool_router]` on the impl + `#[tool_handler]` on `impl ServerHandler` — **no
 `tool_router` field on the struct** (the macro would call `Self::tool_router()`).
 That default is also the reason for the `router()` `OnceLock`: the generated
@@ -48,9 +60,9 @@ The routes are fixed at compile time, so it is built once and
 then mutates fields — including `server_info` (`server_identity`), because that
 default is filled from **rmcp's own** crate identity and left alone the server
 introduces itself to every client as "rmcp". Most tools return `Result<String, McpError>` (**compact** JSON: `json()` no longer pretty-prints — indentation is a third of a timeline's weight), but the
-four **visual** tools — `get_frame` (a single drill-in frame), `skim_asset` (a
+five **visual** tools — `get_frame` (a single drill-in frame), `skim_asset` (a
 contact-sheet montage of an asset + a text index of cell→timestamp, for finding good
-parts), `preview_timeline` (the composited cut at a timeline time) and
+parts), `preview_timeline` (the composited cut at a timeline time), `skim_timeline` (below) and
 `preview_svg_overlay` (below) — return
 `Result<CallToolResult, McpError>` built by the `image_result` helper (`png_result` for the
 SVG sheet, a drawing JPEG would smear): a caption
@@ -58,6 +70,15 @@ SVG sheet, a drawing JPEG would smear): a caption
 actually *see* (rmcp wants bare base64 + MIME, **not** a `data:` URL). `preview_timeline` stays the one-shot
 still (`composite_timeline_frame`, the working cut, the exact time asked): the scrub cache and its windows
 (`app.md`) are the GUI's, where frames come one after another from a dragged playhead.
+**`skim_timeline`** is `skim_asset` for the cut: `columns`×`rows` moments over `[start, end)` of the working cut
+(`Project::timeline_sheet_window`, the whole cut by default; same grid defaults and clamps, `sheet_grid`), each the
+one-shot still `preview_timeline` draws from the preview's proxies at `cell_width`, drawn up to four at a time
+(`engine::timeline_sheet_cancellable`: niced, `limit_args_shared` for non-proxy inputs, the first failure or the
+request's cancel stops the rest) and tiled by one more small ffmpeg (`-f mjpeg` over the concatenated cells, `tile`).
+A gap is the still's black canvas. The caption indexes cell → timeline time → the clips on screen bottom first
+(`timeline_sheet_cells`: the still's own `still_layers`, so a transition's outgoing clip counts), or `no clip (gap)`.
+`cell` (+ `max_width`, `region`) opens one cell as `preview_timeline` would, never rebuilding the sheet. A 4x4 sheet of
+proxied footage is about a second. No Tauri command: the GUI has its filmstrips and the preview.
 **`get_scopes`** measures instead of showing (`kerf_core::scopes`, `engine-cli.md`): the summary of the frame the
 export writes at a time — per channel min / max / mean, pixels clipped at 0 and 1 counted over every pixel, the mean
 chroma's hue and saturation, the densest vectorscope spots — so an agent checks exposure, clipping or a cast with no
@@ -411,7 +432,27 @@ switching it on again.
 that range would write, on the sliced cut) tells it whether the cut is publishable where it is going
 (and the server `instructions` tell it to run that before reporting a cut
 finished — an agent that assembles a four-minute Reel has done the work and lost
-the audience), and `export_cover` writes the thumbnail.
+the audience), and `export_cover` writes a plain frame of the video as its cover.
+**Thumbnails** (`mcp/thumbnails.rs`; core `model/thumbnail.rs`, `project/thumbnails.rs`, `thumbnail.rs`) are pictures
+designed beside the cut that never appear in it: `Timeline.thumbnails`, each a frame (`time_secs`), a size (`youtube`,
+`vertical`, `square`, `4:5`, `16:9` or `WxH`; a new one takes the delivery frame's shape), a focus point for the crop,
+`graphics` (which of the video's own titles / captions the background keeps; default titles, no captions) and a stack of
+layers — a headline (`text`: `svg::render_headline`, static, its viewBox boxed to the text), a library template with
+values, custom SVG or a picture file — each fitted into a rect of the thumbnail and drawn at its settled moment unless `at`
+says otherwise. `add_thumbnail` / `update_thumbnail` (the `layers` list is the whole new stack; `layer_id` keeps one, with
+new placement or template `values`) / `remove_thumbnail` are staged edits (`edit()`), the files and templates read on the
+blocking pool before the lock; one diffs as a single `thumbnails_changed` entry. `preview_thumbnail` (proxies,
+`max_width`) answers the PNG; `export_thumbnail` writes `.png` / `.jpg` / `.webp` from the originals, every thumbnail
+beside the path when no id is given, refusing to overwrite, `background` via `long_tool`. `suggest_thumbnail_frames`
+(`count`, `range`) answers the scored frames as the caption's JSON and a numbered contact sheet. `timeline_summary` lists
+the thumbnails without their sources.
+`review_cut { range?, checks? }` is the other half of that step (the guide and `INSTRUCTIONS` name both): read-only,
+`Project::review_inputs` under `lock_agent_as` on `blocking`, the pure `kerf_core::review::review` after the lock is
+released (`core-render-plan.md`). `checks` are names (`flash_frame`, `mid_word_cut`, `hard_audio_cut`, `jump_cut`,
+`stale_captions`, `black_gap`; omitted or empty = all, an unknown one `invalid_params` listing them); the answer is
+compact `{issues: [{kind, severity, time, end?, clip_ids, message, fix}], counts_by_kind, checked, skipped: [{check,
+reason}]}` — a check whose analysis is missing (no transcript, no silence analysis, captions from elsewhere) is
+skipped with the reason and the `analyze_asset` step to run, never guessed.
 `stage_edits` / `staged_diff` (the entries plus a rendered text summary) /
 `apply_staged_edits` / `discard_staged_edits` drive it explicitly, and
 `revision_diff` explains a past revision. The server `instructions` spell the flow
@@ -424,11 +465,25 @@ labels; never the words or the lines). `get_transcript { asset_id, words?, speak
 limit? }` (`reads.rs`) pages the lines overlapping the source window, each with its `speaker`, at most `limit`
 (default 100, ≤ 500) from `offset` with `total`, `speakers` and `next_offset` to page on; `words: true` (default
 false) adds the words, estimated on the fly for a transcript cached before words were recorded.
+`get_cut_transcript { range?, words?, speaker?, offset?, limit? }` (`reads.rs`) is the same read for the **cut**, the one
+text-based editing works from: `Project::cut_transcript_inputs` (working timeline + cached transcripts, under the lock) then
+`CutTranscriptInputs::read` (`Timeline::cut_transcript`, pure, lock released). Lines `{start, end, text, speaker, clip_id,
+track_id, asset_id, source_start, source_end}` in timeline seconds, time-ordered, filtered to those overlapping `range`
+(timeline seconds, `require_window`) and paged like `get_transcript` (`lines`, `total`, `next_offset`); `words: true` keeps
+each word's timeline and source bounds (for `cut_clip_range` on the line's clip). `untranscribed` (omitted when empty) names
+the audible assets with an audio stream that have no transcript yet, with their clip count, so the agent knows what to
+`analyze_asset`. The `EDITING_GUIDE` names it as the read for cutting by words.
 `speaker_ranges { asset_id, speaker?, join_gap?, offset?, limit? }` (gap clamped 0..10 s, default 0.75) is "cut to speaker": each
 speaker's source-time ranges (by each word's label, not the line's majority; a window of `limit` ≤ 2000 per speaker, `total_ranges`
 and `more` say what is left) and speaking time.
 `find_filler_words { asset_id, fillers?, offset?, limit? }` (≤ 100 fillers) returns fillers by word bounds for
-`cut_clip_range`, paged (`total`, `next_offset`; `limit` ≤ 1000). `refine_transcript { asset_id, background? }` re-times words and labels speakers on a cached
+`cut_clip_range`, paged (`total`, `next_offset`; `limit` ≤ 1000). `search_transcripts { query, asset_ids?, speaker?, mode?,
+offset?, limit? }` (`reads.rs`, also the `search_transcripts` command) is "where does anyone say X" over the whole library
+(`transcript::search`, `engine-media.md`): hits in library order then time (`limit` 50, ≤ 500), each with word-exact source
+`start`/`end`, `speaker`, `context` (match between « and »), `words_estimated` and `in_cut` (the working timeline's clips using
+the range, timeline seconds, `partial` / `disabled`), plus `searched_assets` and `assets_without_transcript` (count + first ten
+ids; an asset with no sound counts only when named). The cached analysis JSON is read under `lock_agent_as`
+(`transcript_search_inputs`), parsed and matched on `blocking` with the lock released. `refine_transcript { asset_id, background? }` re-times words and labels speakers on a cached
 transcript through `crate::run_refine`, the Tauri command's body: background lane, `analysis-progress`,
 stopped by the request's cancellation or the GUI's analysis Stop (`begin_analysis`), refused if a newer
 transcript landed meanwhile or the project was replaced (`require_generation`), `analysis-status` after
@@ -468,7 +523,7 @@ map) accepts anything. Only **top-level** keys are checked; keys inside a nested
 (`mcp_parameters_take_no_serde_alias` scans `mcp.rs` and the `mcp/` modules). Every tool has a `title` and the four hints from the table in
 `mcp/hints.rs`, applied to the routes once in `router()`; `every_tool_is_titled_and_annotated`
 fails on a tool missing from it (and on an entry naming no tool), so **a new tool needs a
-row there**. Staged (or undoable) agent edits are not destructive; applying / discarding a
+row there** — whose last column is its tool set (below). Staged (or undoable) agent edits are not destructive; applying / discarding a
 proposal, `resolve_task` / `remove_task`, undo / redo / `revert_to` (the live cut), the
 exports (a file outside the project) and `delete_proxy` are. Reads and previews are
 `readOnlyHint`, and `openWorldHint` marks the tools that may download a model.
@@ -476,6 +531,46 @@ exports (a file outside the project) and `delete_proxy` are. Reads and previews 
 `selected_clip_ids`, `mark_in` / `mark_out`, `visible_range`, `focused_panel`,
 `selected_asset_id`, with `age_secs` and `stale`; before any report (headless) it is
 `{reported: false, stale: true, note}`. The `instructions` point "this clip" / "here" at it.
+
+**Batches (`mcp/batch.rs`).** `apply_edits { ops: [{tool, args}], dry_run?, label? }` runs a plan of edits as **one**
+revision (one staged step with review on) through `Project::batch` (`core-project.md`), all or nothing. `tool` must be in
+`BATCHABLE` — the quick edits that change only the cut (the editing, linked, look, keyframe, mix, overlay and marker tools,
+`set_delivery_format`, `fit_music`, `clear_captions`, `set_grade` without a `lut_path`); a long job, a file, an import, captions,
+SVG titles, staging, history or settings is refused naming the op. Each op is checked before the lock like a call of its own
+(`args::unknown_argument` against that tool's schema, at most 200 ops, `EditOp` itself `deny_unknown_fields`) and runs the
+tool's **own body**: every batchable tool is `edit(|p| Self::<tool>_op(p, params))`, and the batch reads `args` into the
+same parameter struct and calls the same `_op`, so `ripple` / `link` and every refusal are the tool's. A failing op is the
+tool's error with `op K (tool): ` in front (same code). A string `"$K.path"` in `args` is replaced by that value of op K's
+answer (an earlier op; keys or indices; `"$$…"` is a literal `$`). The answer: `results` (each op's answer: one clip whole,
+the clips inside a larger answer cut to id / asset / span by `compact`), `timeline_brief`, the `label` and `staged`, or for `dry_run` the `diff` (`diff_page` of
+before → after) — a dry run keeps nothing and emits no `project-changed`. No Tauri command: the GUI's gestures already write
+one edit each, and its multi-clip edits have their own commands.
+
+## Prompts and tool sets (`mcp/prompts.rs`, `mcp/toolsets.rs`)
+
+**Prompts.** `get_info` advertises `prompts`; `list_prompts` / `get_prompt` (written by hand, not rmcp's prompt macros)
+serve `prompts::list` / `prompts::get`: `rough_cut_from_transcript { assets?, target_length?, brief? }`, `podcast_cleanup
+{ asset?, loudness? }`, `social_reel { platform, length?, aspect? }`, `music_bed { music?, style? }` and `deliver { output?,
+platform? }` — the guide's workflows as a numbered step list in one user message (Claude Code offers them as
+`/mcp__kerf__<name>`). Each step is the guide's own rule (staging, captions last, `get_ripple_mode` first, platform_check
+and get_levels before done, export reads the proposal), not new behaviour. A prompt names its tools in **backticks** and only
+tools: `every_tool_a_prompt_names_is_registered` renders each with only its required arguments and with all of them and
+fails on a backticked name that is no tool (field names stay unquoted), on fewer than five tools, or on a long text. An
+unknown prompt, an argument it does not take and a missing (or blank) required one are `invalid_params` naming what is
+accepted.
+**Tool sets.** Each `hints::TOOLS` row ends with the tool's one `ToolSet` — `core` (looking, cutting and arranging, volume /
+fade / transition, review and history, jobs, the project's basics), `analysis`, `clips`, `keyframes`, `titles`, `audio`,
+`music`, `delivery`, `tasks`, `project` — so a new tool's author edits one row; `every_tool_is_in_one_tool_set` pins that.
+A client asks for some with **`?tools=core,titles` on the MCP URL** (repeated `tools` parameters add up, `%2C` reads as a
+comma). It is read from each request's `http::request::Parts` (rmcp puts them in the `RequestContext` extensions), so it
+needs no session state; no query, an empty one or `all` is every tool, which keeps existing setups as they were. `initialize`
+refuses a name that is no set (`invalid_params` listing the sets), where the client is connecting; `list_tools` (overridden,
+the `router()` borrow filtered, the cache hints of the generated one kept) shows the selected sets plus `ESSENTIALS`
+(`get_editing_guide`, `timeline_summary`, `staged_diff`, `job_status`), and `get_editing_guide` appends a line naming the
+sets listed and the ones left out (`Selection::note`). **A call to a tool outside the selection still runs**: the selection
+trims the context a client loads, the bearer token is the permission, and the guide and the prompts name tools across sets,
+so refusing would only stop an agent in a client that lets it call by name. `mcp_connection_info.tool_sets`
+(`toolsets::catalogue`) feeds the chips in `McpConnect` that put the selection on the URL and in the snippets.
 
 ## Review, ownership and the live cut
 
@@ -541,10 +636,10 @@ of the same job: `analyze_asset`, `refine_transcript` (the analysis Stop), `impo
 begin_voiceover() / begin_music() / begin_stems() / begin_smart_crop() / begin_export())`; a Stop pressed before a run began does not end
 it, and a run begun after is not wiped by one), and the voiceover, music, stems, smart-crop and framing jobs also stop when the
 project is replaced (`stop_or_replaced`). `analyze_asset` also forwards the GUI's `analysis-progress` events for its asset
-to the client (`AnalysisProgressRelay`); `download_speech_model` emits `model-progress` like the GUI's own download.
+to the client (`AnalysisProgressRelay`, through `Shell::listen`: Tauri's listener in the window, an in-process bus headless); `download_speech_model` emits `model-progress` like the GUI's own download.
 Every job that resolves inputs under the lock notes `Project::generation()` and refuses to land its result in a project
 opened since (`require_generation`) — a Save As does not count as one (`replace_with_saved_copy` keeps it). The reads
-that decode (`get_waveform`, `get_waveform_range`, `get_energy`, `skim_asset`, `preview_timeline`, `get_frame`) take the
+that decode (`get_waveform`, `get_waveform_range`, `get_energy`, `skim_asset`, `preview_timeline`, `skim_timeline`, `get_frame`) take the
 request's cancellation token, so a dropped request kills its ffmpeg; `export_cover` reports `reading the cut` →
 `rendering the cover frame` → `cover written` on the `progressToken`. **`export` and `export_variants` word every tick
 from the engine's `ExportProgress`** (`export_message` / `variants_message`): the queue (`waiting for the preview
@@ -645,16 +740,16 @@ Every tool, by purpose (a test pins that this list names each registered tool, a
 
 - **Project and library**: `project_info`, `save_project`, `save_project_as`, `open_project`, `new_project`, `list_assets`,
   `missing_assets`, `get_asset_metadata`, `import_asset`, `set_asset_projection`, `list_fonts`.
-- **Analysis and proxies**: `analyze_asset`, `analysis_status`, `get_transcript`, `speaker_ranges`, `find_filler_words`,
-  `refine_transcript`, `get_analysis_detail`,
+- **Analysis and proxies**: `analyze_asset`, `analysis_status`, `get_transcript`, `get_cut_transcript`, `speaker_ranges`, `find_filler_words`,
+  `search_transcripts`, `refine_transcript`, `get_analysis_detail`,
   `transcription_status`, `download_speech_model`, `set_speech_model`, `proxy_status`, `rebuild_proxy`, `delete_proxy`,
   `get_music_structure`.
-- **Looking and measuring**: `get_editing_guide`, `timeline_summary`, `get_timeline_state`, `get_editor_context`, `get_scopes`, `skim_asset`, `get_frame`, `preview_timeline`,
-  `get_waveform`, `get_waveform_range`, `get_energy`, `get_levels`, `get_band_balance`, `platform_check`.
+- **Looking and measuring**: `get_editing_guide`, `timeline_summary`, `get_timeline_state`, `get_editor_context`, `get_scopes`, `skim_asset`, `get_frame`, `preview_timeline`, `skim_timeline`,
+  `get_waveform`, `get_waveform_range`, `get_energy`, `get_levels`, `get_band_balance`, `platform_check`, `review_cut`.
 - **Editing the cut**: `cut_clip`, `add_clip_to_timeline`, `split_at`, `trim`, `reorder`, `move_clip`, `move_clips`,
   `ripple_delete`, `cut_clip_range`, `roll_edit`, `slip_clip`, `slide_clip`, `split_remove`, `split_remove_clips`, `remove`,
   `remove_clips`, `duplicate_clips`, `concatenate`, `remove_silence`, `snap_to_beats`, `sync_clips_by_audio`, `smart_crop`, `add_track`,
-  `remove_track`, `get_ripple_mode`, `set_ripple_mode`.
+  `remove_track`, `get_ripple_mode`, `set_ripple_mode`, `apply_edits`.
 - **Linked picture and sound**: `extract_audio`, `add_asset_audio`, `detach_audio`, `detach_audio_clips`, `reattach_audio`,
   `reattach_audio_clips`, `link_clips`, `unlink_clips`.
 - **Clip look and sound**: `set_volume`, `set_fade`, `set_speed`, `set_transform`, `set_transform_at`, `set_color`, `set_transition`,
@@ -673,6 +768,8 @@ Every tool, by purpose (a test pins that this list names each registered tool, a
   `update_marker`, `remove_marker`, `set_delivery_format`.
 - **Voiceover**: `generate_voiceover`, `voiceover_status`.
 - **Delivery**: `export`, `export_variants`, `export_cover`, `export_capabilities`, `export_interchange`, `export_markers`.
+- **Thumbnails**: `add_thumbnail`, `update_thumbnail`, `remove_thumbnail`, `preview_thumbnail`, `export_thumbnail`,
+  `suggest_thumbnail_frames`.
 - **Review and history**: `stage_edits`, `staged_diff`, `apply_staged_edits`, `apply_staged_subset`, `discard_staged_edits`,
   `undo_staged_edit`, `restore_discarded_edits`, `history`, `revision_diff`, `undo`, `redo`, `revert_to`.
 - **Task queue**: `list_tasks`, `add_task`, `claim_next_task`, `complete_task`, `fail_task`, `resolve_task`, `remove_task`.

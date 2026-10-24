@@ -767,6 +767,16 @@ request are `caption-import-ui.ts` (pure); the flow is bun-tested over the harne
 `title-actions.test.ts`, which stubs `./api` and `./notifications.svelte` at module
 load (svelte-sonner cannot load under bun), and the desktop half — the dialog's
 filters, the `import_captions` arguments — in `api-caption-import.test.ts`.
+**Thumbnails** are designed in the Deliver panel (`ThumbnailSection.svelte`, under *Thumbnails*, for a cut with a picture):
+a select of the project's thumbnails, + (a new one at the playhead) and remove; the engine's preview (`thumbnail_preview`, PNG
+bytes as an object URL, asked 300 ms after the thumbnail or the cut last changed, the old URL revoked; the harness draws none and
+says so); the frame (Use playhead, Suggest → chips of `suggest_thumbnail_frames` times that seek and set it), size chips, which of
+the video's graphics the background keeps, focus sliders, and the layers — a headline's text / subtitle / colour, a template's
+text values, a Top / Middle / Bottom band (`HEADLINE_PLACEMENTS`), remove — plus Add headline / Add a template. Every change is
+one `editor.setThumbnail` (`set_thumbnail` with a `ThumbnailSpec`, the stack rebuilt from `keptLayers`), a field on change.
+*Save thumbnail…* is `saveThumbnail` (`file-actions.ts`, the cover's run and toasts). `thumbnail-design.ts` holds the sizes, the
+default shape and the harness's `putThumbnail` (bun-tested against the engine's rules); the default headline colours are in
+`title-color.ts`.
 The **cover frame** is saved from the preview's context menu
 (`Save cover frame…` → `export_cover` at the playhead), and both a finished
 export and a saved cover offer **Show in folder** in their toast.
@@ -1381,7 +1391,8 @@ rather than a silent no-op; a network address needs the token), the *access toke
 *New token…* asks; **a `token_problem` — the token could not be saved or made — is said under the switch and in `McpConnect`**, `?tokenproblem=1` seeds it in the harness), and **Connect an agent** (`McpConnect.svelte`, also the Agent panel's Connect card: the endpoint plus per-client setup
 — Claude Code's one-line command with the `Authorization: Bearer` header, a `mcpServers` JSON for Cursor / Windsurf / Cline / Zed, VS Code's
 `.vscode/mcp.json`, Claude Desktop through `mcp-remote`; `mcp-clients.ts`; the token is dots in the snippet until *Show token*, a copy
-always takes the real text). All of it goes through `setMcpSettings` / `mcpConnectionInfo` / `regenerateMcpToken`; **turning the server off or the token requirement off asks** (`CONFIRM.serverOff` / `tokenOff`), and a switch whose write is refused puts its box back (`flip`: the box moved by itself, the state it shows did not). A change that restarts the listener (address, switch, token requirement) is followed with `awaitListener` — read again until `listenerSettled` (up / off / failed), at most five seconds — and the address says what happened (`addressNotice`: listening on it, why it did not, `KERF_MCP_ADDR` wins, or *Address saved* while it is still starting), never what was hoped for. A `settings-changed`
+always takes the real text; outside the compact card, chips pick **tool sets** from `tool_sets` — *All* by default — and `withToolSets`
+(`mcp-connect.ts`) puts `?tools=…` on the endpoint and both snippets, Claude Code's URL quoted; the pick is the page's state, not a setting). All of it goes through `setMcpSettings` / `mcpConnectionInfo` / `regenerateMcpToken`; **turning the server off or the token requirement off asks** (`CONFIRM.serverOff` / `tokenOff`), and a switch whose write is refused puts its box back (`flip`: the box moved by itself, the state it shows did not). A change that restarts the listener (address, switch, token requirement) is followed with `awaitListener` — read again until `listenerSettled` (up / off / failed), at most five seconds — and the address says what happened (`addressNotice`: listening on it, why it did not, `KERF_MCP_ADDR` wins, or *Address saved* while it is still starting), never what was hoped for. A `settings-changed`
 event (an agent's `set_settings`) carries the `SettingsView` and is `settings.noteChanged(view)`; one without it (`null`) reads the settings again. Every on/off setting is a **`Switch`** (a 16 px native checkbox in a 32 × 28 px label, so the press need not land on the box) and its `SettingRow` takes `for` so the row's name toggles it. **Keyboard** — described above.
 **Advanced** — *Open logs*, *Show the settings file* (`reveal_settings_file`), *Reset layout* (every workspace to its preset, the question
 Window › Reset all workspaces asks: `resetAllWorkspacesAsked`) and *Reset all settings* (confirm; `reset_settings` keeps the old file beside

@@ -166,6 +166,7 @@ impl Rig {
             markers: Vec::new(),
             format: None,
             master: Default::default(),
+            thumbnails: Vec::new(),
         }
     }
 
@@ -396,6 +397,7 @@ fn an_edit_that_does_not_touch_a_frame_leaves_it_cached() {
         markers: Vec::new(),
         format: None,
         master: Default::default(),
+        thumbnails: Vec::new(),
     };
     let s = scrub();
     let cached = frame(&s, &cut, &rig, 30);

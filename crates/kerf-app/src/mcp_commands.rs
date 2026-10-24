@@ -5,7 +5,7 @@
 use serde::Serialize;
 use tauri::AppHandle;
 
-use crate::mcp::{self, ConnectionInfo};
+use crate::mcp::{self, ConnectionInfo, ToolSetInfo};
 use crate::settings;
 
 type CmdResult<T> = Result<T, String>;
@@ -39,6 +39,8 @@ pub struct McpConnectionInfo {
     pub claude_code_command: String,
     /// A JSON snippet (`mcpServers`) for any other MCP client.
     pub generic_json_config: String,
+    /// The tool sets a client may ask for with `?tools=core,titles` on the URL (all tools without).
+    pub tool_sets: Vec<ToolSetInfo>,
 }
 
 impl From<ConnectionInfo> for McpConnectionInfo {
@@ -56,6 +58,7 @@ impl From<ConnectionInfo> for McpConnectionInfo {
             agent_review: c.agent_review,
             claude_code_command: c.claude_code_command,
             generic_json_config: c.generic_json_config,
+            tool_sets: c.tool_sets,
         }
     }
 }

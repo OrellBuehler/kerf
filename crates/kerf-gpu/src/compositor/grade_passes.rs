@@ -563,6 +563,7 @@ mod tests {
             markers: Vec::new(),
             format: delivery,
             master: Default::default(),
+            thumbnails: Vec::new(),
         };
         let opts = ExportOptions {
             fps: Some(30.0),

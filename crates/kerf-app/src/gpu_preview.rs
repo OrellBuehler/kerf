@@ -2363,6 +2363,7 @@ mod tests {
             markers: Vec::new(),
             format: None,
             master: Default::default(),
+            thumbnails: Vec::new(),
         }
     }
 
