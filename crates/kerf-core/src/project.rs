@@ -7965,7 +7965,7 @@ mod tests {
         assert!(Project::timeline_sheet_times(&timeline, Some(1.0), Some(1.0), 2, 2)
             .iter()
             .all(|&t| t == 1.0));
-        let mut empty = timeline.clone();
+        let mut empty = timeline;
         empty.tracks.clear();
         let refused = Project::composite_timeline_sheet_cancellable(&empty, &[], None, None, 4, 4, 240, 5, &|| false);
         assert!(matches!(refused, Err(Error::InvalidArgument(_))), "{refused:?}");
