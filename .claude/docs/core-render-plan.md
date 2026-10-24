@@ -1,4 +1,4 @@
-# kerf-core: platform checks and the render plan
+# kerf-core: platform checks, the cut review and the render plan
 
 - `platform.rs` — **where the cut is going.** A static `TARGETS` table (Reels /
   Shorts / TikTok / Instagram feed / YouTube: delivery frame, accepted aspects,
@@ -29,6 +29,29 @@
   target's check *and* the `CutSummary` they judged, so a UI can state the file's
   frame and length without reading the project a second time. Messages say
   `Instagram Reels'` / `TikTok's` (`possessive`); `platforms.ts` mirrors it.
+- `review.rs` — **whether the editing is clean** (the MCP `review_cut`, Tauri `review_cut`). Pure `review(inputs,
+  range, checks)` over `ReviewInputs` (`Project::review_inputs`: the working timeline, the assets and the cached
+  analysis of the assets it uses, resolved under the lock; the review runs without it), on `for_render` at the
+  export rate (`delivery_rate`). Issues reuse `platform::Severity` and carry `kind` (the `Check`), `time` / `end`,
+  `clip_ids`, `message` and a `fix` naming the tools. Each check is tuned to stay quiet on ordinary edits, thresholds
+  as constants: **`flash_frame`** a visible clip (footage, still or title) on a video track under `FLASH_FRAMES` (3);
+  **`mid_word_cut`** a *sounding* clip's edge (`source_audio` and an audio stream, so a detached picture leaves it to its
+  sound) whose source time (through speed / reverse) is `WORD_TOLERANCE` (40 ms, `ESTIMATED_WORD_TOLERANCE` 120 ms
+  and a tip for estimated words) inside a word of at most `MAX_WORD_SECS`, not in a silence, not at the file's own
+  ends and not a split nothing was taken out of (`continues`: same asset and speed, contiguous source);
+  **`hard_audio_cut`** sounding clips meeting on a lane (half a frame) with no fade, transition or zero gain and
+  sound on both sides by silence analysis (`EDGE_SILENCE_MARGIN`); pairs without it are not guessed — all unjudged is
+  `skipped`, some is one tip counting them; **`jump_cut`** (tip) one asset's footage resuming on a video lane more than a
+  frame and at most `JUMP_MAX_SOURCE_GAP` (8 s) later with no transition, no scene change between and no reframing
+  (`PUNCH_IN_SCALE`, a move, crop, keyed transform or other 360 view); **`stale_captions`** — the model keeps no
+  options or revision stamp for captions, so it compares words: a generated caption whose words appear as a run in
+  the cut's transcripts (else it is imported or foreign and not compared; none are → `skipped`) is stale when fewer
+  than `CAPTION_MATCH` of its words are spoken within `CAPTION_SLACK` (0.6 s) of it — reaching further past a clip
+  edge the caption was cut short at — and speech the default captions would cover now with no caption near it, in
+  runs of `UNCAPTIONED_MIN_WORDS`, is footage added after captioning; one issue each; **`black_gap`** no visible clip
+  on any video track (more than half a frame, not under a typed title or SVG title): a warning inside, a tip
+  after the last picture while sound runs on. The same kind at the same moment in the same footage (a picture and
+  its sound doubled, a linked pair) merges into one issue naming every clip. Tests in `review.rs`.
 - `render_plan.rs` + `planner.rs` + `plan_caps.rs` — **what one frame is made of**,
   shared by every renderer. `RenderPlan::at(timeline, assets, opts, t, color)` is the
   canvas (the same `export_format` the still uses, through `render_geometry` — so its `fps` is the delivery

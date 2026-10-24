@@ -870,6 +870,18 @@ struct PlatformCheckParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct ReviewCutParams {
+    #[schemars(
+        description = "Report only what falls in this span of the cut, {start, end} in timeline seconds. Omit for the whole cut"
+    )]
+    range: Option<TimeRange>,
+    #[schemars(
+        description = "Run only these checks: flash_frame, mid_word_cut, hard_audio_cut, jump_cut, stale_captions, black_gap. Omit for all"
+    )]
+    checks: Option<Vec<String>>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct SetDeliveryFormatParams {
     #[schemars(description = "Delivery frame width in pixels, e.g. 1080. Omit (with height) to clear the \
                               format and go back to following the footage's shape.")]
@@ -5697,6 +5709,30 @@ impl KerfMcp {
     }
 
     #[tool(
+        description = "Lint the cut for editing mistakes an agent cannot see without watching it: flash_frame (a visible \
+                       clip under 3 frames at the export rate), mid_word_cut (a sounding clip's edge inside a transcript \
+                       word; needs a transcript), hard_audio_cut (sound meeting sound with no fade or crossfade, a likely \
+                       click; needs silence analysis), jump_cut (the same shot resuming a moment later; a tip, it can be \
+                       deliberate), stale_captions (generated captions no longer over the words spoken, or speech left \
+                       uncaptioned, after a later edit) and black_gap (no picture while the cut plays). Reads the cut you \
+                       are building and the cached analysis; answers {issues: [{kind, severity, time, end?, clip_ids, \
+                       message, fix}], counts_by_kind, checked, skipped: [{check, reason}]}, each `fix` naming the tools \
+                       that address it. A picture and its linked sound report once. Run it with platform_check before \
+                       reporting a cut finished."
+    )]
+    async fn review_cut(&self, Parameters(p): Parameters<ReviewCutParams>) -> Result<String, McpError> {
+        let checks = kerf_core::ReviewCheck::parse_list(&p.checks.unwrap_or_default()).map_err(core_err)?;
+        let range = p.range.map(|r| (r.start, r.end));
+        let (project, owner) = (self.project.clone(), self.owner());
+        let review = blocking(move || {
+            let inputs = lock_agent_as(&project, owner.as_deref()).review_inputs().map_err(core_err)?;
+            Ok(kerf_core::review::review(&inputs, range, &checks))
+        })
+        .await?;
+        json(&review)
+    }
+
+    #[tool(
         description = "Write the composited timeline at a given time to an image file as a cover / thumbnail — full \
                        delivery resolution, rendered through the export graph, so it is a real frame of the finished \
                        video at the shape the project is cut for. Refuses to overwrite an existing file unless \
@@ -6719,7 +6755,7 @@ const INSTRUCTIONS: &str = "Kerf is the video editor open on this computer, and 
              you edit, and at a whole assembled cut with skim_timeline. Cut with split / trim / move_clip / remove / ripple_delete, then polish with \
              set_volume, set_fade, set_transition, set_transform, set_color, add_overlay and \
              generate_captions (caption last, once the cut is settled). Before you call a cut done, run \
-             platform_check, and get_levels for anything going to social; export renders it to an \
+             platform_check and review_cut, and get_levels for anything going to social; export renders it to an \
              absolute path. \
              While the user's review is on (the default; get_settings shows `agent_review`) your edits \
              are STAGED: they go into a proposal the user accepts or dismisses in Kerf, your reads \
@@ -7012,7 +7048,11 @@ const EDITING_GUIDE: &str = "How to edit with Kerf. The user queues editing task
              platform_check: it says whether the length and frame shape suit \
              where it is going, including the reach limits a platform enforces \
              silently (a Reel over 3 minutes uploads fine and then reaches only \
-             existing followers). For a cut going to social, also run get_levels: \
+             existing followers), and review_cut: it finds the editing mistakes \
+             you would see on a watch (flash frames, cuts inside a word, sound \
+             cut into sound with no fade, jump cuts, captions a later edit left \
+             behind, black gaps) and names the tool that fixes each. For a cut \
+             going to social, also run get_levels: \
              platforms play at about -14 LUFS and want a true peak under -1 dBTP, \
              so check it, then fix a hot mix with set_master_volume / \
              set_master_limiter or export with loudnorm (which normalises to \
@@ -8576,6 +8616,36 @@ mod tests {
                 vec!["height".to_string(), "range".to_string(), "width".to_string()],
                 Vec::<String>::new()
             )
+        );
+        assert_eq!(
+            schema("review_cut"),
+            (vec!["checks".to_string(), "range".to_string()], Vec::<String>::new())
+        );
+    }
+
+    /// The lint is part of finishing a cut, beside the platform check, and names every check it takes.
+    #[test]
+    fn review_cut_is_a_finishing_step_and_lists_its_checks() {
+        let guide = super::EDITING_GUIDE;
+        let finish = guide.find("Before you report a cut finished").unwrap();
+        let step = &guide[finish..finish + 700];
+        assert!(step.contains("platform_check") && step.contains("review_cut"), "{step}");
+        assert!(super::INSTRUCTIONS.contains("review_cut"));
+        let text = router()
+            .list_all()
+            .into_iter()
+            .find(|t| t.name == "review_cut")
+            .and_then(|t| t.description.map(|d| d.to_string()))
+            .unwrap_or_default();
+        for check in kerf_core::ReviewCheck::ALL {
+            assert!(text.contains(check.name()), "{check:?}: {text}");
+        }
+        assert_eq!(
+            kerf_core::ReviewCheck::parse_list(&["flash"])
+                .map_err(super::core_err)
+                .unwrap_err()
+                .code,
+            rmcp::model::ErrorCode::INVALID_PARAMS
         );
     }
 

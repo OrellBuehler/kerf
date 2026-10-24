@@ -202,6 +202,7 @@ pub(super) const TOOLS: &[(&str, &str, Effect, ToolSet)] = &[
     ("export", "Export", Destroy, Delivery),
     ("export_variants", "Export variants", Destroy, Delivery),
     ("platform_check", "Platform check", Read, Core),
+    ("review_cut", "Review the cut", Read, Core),
     ("export_cover", "Export cover", Destroy, Delivery),
     ("list_tasks", "List tasks", Read, Tasks),
     ("add_task", "Add task", Edit, Tasks),

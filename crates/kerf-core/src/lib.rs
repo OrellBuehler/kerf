@@ -36,6 +36,7 @@ pub mod proxy;
 pub mod recovery;
 pub mod render_bar;
 pub mod render_plan;
+pub mod review;
 pub mod scopes;
 pub mod svg;
 pub mod template;
@@ -130,6 +131,7 @@ pub use render_plan::{
     Animated, CompositeColorPolicy, FadeOp, GradeRoute, LayerFx, PlanCanvas, PlanLayer, PlanMode, PlanReframe, PlanSource,
     PlanStream, PlanText, PlanTiming, ReframeInterp, RenderPlan, YuvMatrix, MAX_AMPLIFIED_ERROR, MAX_SHRINK, MIN_TEXT_PX,
 };
+pub use review::{Check as ReviewCheck, CutReview, ReviewInputs, ReviewIssue, SkippedCheck};
 pub use svg::{check_svg, render_preset, SvgCheck, SvgDoc, SvgPresetInfo, SvgPresetParamInfo, MAX_ANIMATIONS, MAX_VALUES};
 pub use template::{
     ImportOutcome, ImportStatus, Library as TemplateLibrary, PreparedTemplate, PreparedValues, Template, TemplateControl,
