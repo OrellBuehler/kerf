@@ -241,7 +241,11 @@ id** rather than a generation counter, because start and stop are separate async
 out of order and a late stop must not kill the stream that replaced it —
 `get_audio` → a clip window as **raw mono s16le PCM via `tauri::ipc::Response`**, the
 only non-JSON command — the preview's Web Audio playback decodes it),
-delivery (`export_cover` → a cover image at the full delivery frame,
+delivery (`export_cover` → a cover image at the full delivery frame; **thumbnails** (`thumbnail_commands.rs`):
+`set_thumbnail { thumbnailId?, spec }` → `{timeline, thumbnail_id, warnings}` (add, or change to a `ThumbnailSpec`; templates
+and the sanitiser run before the lock), `remove_thumbnail` → `Timeline`, `thumbnail_preview { thumbnailId, width }` → the PNG
+bytes via `tauri::ipc::Response` (proxies), `export_thumbnail { thumbnailId, outputPath }` (originals, `.png` / `.jpg` /
+`.webp`; the cover's Cancel stops it), `suggest_thumbnail_frames { count?, range? }` → `SuggestedFrame[]`,
 `platform_targets` / `platform_check` (frame, range → a `PlatformReport`: the checks and the cut they judged) → the platform check,
 `review_cut` (range, checks → a `CutReview`, the editing lint `review_cut` gives an agent; no UI yet), `reveal_path` →
 show a rendered file in the OS file manager, opening its *containing folder*
@@ -428,7 +432,8 @@ comes back `ForbiddenUrl` and the "Release notes" button silently does nothing.
 *preview and media* `get_frame`, `get_timeline_frame`, `get_preview_frame`, `set_preview_bounds`, `gpu_preview_status`,
 `playback_session`, `start_playback`, `stop_playback`, `get_waveform_range`,
 `get_filmstrip`, `get_audio`, `get_energy`, `get_scopes`, `get_render_bar`; *delivery* `hw_encoders`, `export_timeline`, `export_variants`,
-`cancel_export`, `export_cover`, `cancel_cover_export`, `platform_targets`, `platform_check`, `review_cut`, `reveal_path`;
+`cancel_export`, `export_cover`, `cancel_cover_export`, `set_thumbnail`, `remove_thumbnail`, `thumbnail_preview`,
+`export_thumbnail`, `suggest_thumbnail_frames`, `platform_targets`, `platform_check`, `review_cut`, `reveal_path`;
 *agent and app* `agent_status`, `report_ui_context`, `mcp_connection_info`, `regenerate_mcp_token`, `set_mcp_settings`, `get_settings`, `set_settings`, `reset_settings`, `reveal_settings_file`,
 `read_text_file`, `write_text_file`, `reveal_logs`, `log_frontend`; *detached panels* `popout_expect`,
 `popout_cancel`, `close_popout`, `popout_focus`, `popout_move`.

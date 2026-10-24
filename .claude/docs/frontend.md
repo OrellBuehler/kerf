@@ -767,6 +767,16 @@ request are `caption-import-ui.ts` (pure); the flow is bun-tested over the harne
 `title-actions.test.ts`, which stubs `./api` and `./notifications.svelte` at module
 load (svelte-sonner cannot load under bun), and the desktop half — the dialog's
 filters, the `import_captions` arguments — in `api-caption-import.test.ts`.
+**Thumbnails** are designed in the Deliver panel (`ThumbnailSection.svelte`, under *Thumbnails*, for a cut with a picture):
+a select of the project's thumbnails, + (a new one at the playhead) and remove; the engine's preview (`thumbnail_preview`, PNG
+bytes as an object URL, asked 300 ms after the thumbnail or the cut last changed, the old URL revoked; the harness draws none and
+says so); the frame (Use playhead, Suggest → chips of `suggest_thumbnail_frames` times that seek and set it), size chips, which of
+the video's graphics the background keeps, focus sliders, and the layers — a headline's text / subtitle / colour, a template's
+text values, a Top / Middle / Bottom band (`HEADLINE_PLACEMENTS`), remove — plus Add headline / Add a template. Every change is
+one `editor.setThumbnail` (`set_thumbnail` with a `ThumbnailSpec`, the stack rebuilt from `keptLayers`), a field on change.
+*Save thumbnail…* is `saveThumbnail` (`file-actions.ts`, the cover's run and toasts). `thumbnail-design.ts` holds the sizes, the
+default shape and the harness's `putThumbnail` (bun-tested against the engine's rules); the default headline colours are in
+`title-color.ts`.
 The **cover frame** is saved from the preview's context menu
 (`Save cover frame…` → `export_cover` at the playhead), and both a finished
 export and a saved cover offer **Show in folder** in their toast.

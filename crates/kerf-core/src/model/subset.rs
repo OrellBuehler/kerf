@@ -354,7 +354,7 @@ impl Timeline {
             });
         }
 
-        // 4. Text, markers, the delivery frame and the master bus.
+        // 4. Text, markers, the delivery frame, the master bus and the thumbnails.
         for &i in &chosen {
             let e = &entries[i];
             match e.kind {
@@ -407,6 +407,10 @@ impl Timeline {
                 }
                 DiffKind::MasterChanged => {
                     out.master = proposed.master;
+                    applied.insert(i);
+                }
+                DiffKind::ThumbnailsChanged => {
+                    out.thumbnails = proposed.thumbnails.clone();
                     applied.insert(i);
                 }
                 _ => {}

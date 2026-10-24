@@ -102,7 +102,7 @@ impl Project {
         }
     }
 
-    /// Delete the fonts no title names: a template's typeface stays in the project while a title uses it,
+    /// Delete the fonts no title (nor thumbnail layer) names: a template's typeface stays in the project while a title uses it,
     /// not for good. A font is **kept** when the source of an animated title on the live timeline, or on
     /// the open proposal's, names its family ([`fonts::names_family`]); everything else goes, which is
     /// what keeps a template an agent applied and the user turned down from using up the project's
@@ -125,10 +125,20 @@ impl Project {
         if stored.is_empty() {
             return Ok(0);
         }
-        let mut titles: Vec<String> = self.timeline()?.title_sources().map(str::to_lowercase).collect();
+        let live = self.timeline()?;
+        let mut titles: Vec<String> = live
+            .title_sources()
+            .chain(live.thumbnail_sources())
+            .map(str::to_lowercase)
+            .collect();
         if let Some(row) = self.staged_row()? {
             let proposed: crate::model::Timeline = serde_json::from_str(&row.timeline)?;
-            titles.extend(proposed.title_sources().map(str::to_lowercase));
+            titles.extend(
+                proposed
+                    .title_sources()
+                    .chain(proposed.thumbnail_sources())
+                    .map(str::to_lowercase),
+            );
         }
         let mut gone = 0;
         let mut delete = self.conn.prepare("DELETE FROM fonts WHERE sha256 = ?1")?;

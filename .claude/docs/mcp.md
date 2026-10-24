@@ -432,7 +432,20 @@ switching it on again.
 that range would write, on the sliced cut) tells it whether the cut is publishable where it is going
 (and the server `instructions` tell it to run that before reporting a cut
 finished — an agent that assembles a four-minute Reel has done the work and lost
-the audience), and `export_cover` writes the thumbnail.
+the audience), and `export_cover` writes a plain frame of the video as its cover.
+**Thumbnails** (`mcp/thumbnails.rs`; core `model/thumbnail.rs`, `project/thumbnails.rs`, `thumbnail.rs`) are pictures
+designed beside the cut that never appear in it: `Timeline.thumbnails`, each a frame (`time_secs`), a size (`youtube`,
+`vertical`, `square`, `4:5`, `16:9` or `WxH`; a new one takes the delivery frame's shape), a focus point for the crop,
+`graphics` (which of the video's own titles / captions the background keeps; default titles, no captions) and a stack of
+layers — a headline (`text`: `svg::render_headline`, static, its viewBox boxed to the text), a library template with
+values, custom SVG or a picture file — each fitted into a rect of the thumbnail and drawn at its settled moment unless `at`
+says otherwise. `add_thumbnail` / `update_thumbnail` (the `layers` list is the whole new stack; `layer_id` keeps one, with
+new placement or template `values`) / `remove_thumbnail` are staged edits (`edit()`), the files and templates read on the
+blocking pool before the lock; one diffs as a single `thumbnails_changed` entry. `preview_thumbnail` (proxies,
+`max_width`) answers the PNG; `export_thumbnail` writes `.png` / `.jpg` / `.webp` from the originals, every thumbnail
+beside the path when no id is given, refusing to overwrite, `background` via `long_tool`. `suggest_thumbnail_frames`
+(`count`, `range`) answers the scored frames as the caption's JSON and a numbered contact sheet. `timeline_summary` lists
+the thumbnails without their sources.
 `review_cut { range?, checks? }` is the other half of that step (the guide and `INSTRUCTIONS` name both): read-only,
 `Project::review_inputs` under `lock_agent_as` on `blocking`, the pure `kerf_core::review::review` after the lock is
 released (`core-render-plan.md`). `checks` are names (`flash_frame`, `mid_word_cut`, `hard_audio_cut`, `jump_cut`,
@@ -755,6 +768,8 @@ Every tool, by purpose (a test pins that this list names each registered tool, a
   `update_marker`, `remove_marker`, `set_delivery_format`.
 - **Voiceover**: `generate_voiceover`, `voiceover_status`.
 - **Delivery**: `export`, `export_variants`, `export_cover`, `export_capabilities`, `export_interchange`, `export_markers`.
+- **Thumbnails**: `add_thumbnail`, `update_thumbnail`, `remove_thumbnail`, `preview_thumbnail`, `export_thumbnail`,
+  `suggest_thumbnail_frames`.
 - **Review and history**: `stage_edits`, `staged_diff`, `apply_staged_edits`, `apply_staged_subset`, `discard_staged_edits`,
   `undo_staged_edit`, `restore_discarded_edits`, `history`, `revision_diff`, `undo`, `redo`, `revert_to`.
 - **Task queue**: `list_tasks`, `add_task`, `claim_next_task`, `complete_task`, `fail_task`, `resolve_task`, `remove_task`.

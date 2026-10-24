@@ -110,6 +110,7 @@ fn timeline(asset: &Asset, layers: usize) -> Timeline {
         markers: Vec::new(),
         format: None,
         master: Default::default(),
+        thumbnails: Vec::new(),
     }
 }
 

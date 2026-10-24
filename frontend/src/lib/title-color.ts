@@ -84,3 +84,8 @@ export function withPicked(current: string | null | undefined, picked: string, f
 export function swatchHex(text: string | null | undefined): string {
 	return parseColor(text)?.hex ?? '#000000';
 }
+
+/** What a thumbnail headline is drawn in when nothing is chosen: the engine's preset defaults
+ *  (`SvgPresetParams`), white with an amber subtitle. */
+export const HEADLINE_COLOR = '#ffffff';
+export const HEADLINE_ACCENT = '#ffb000';

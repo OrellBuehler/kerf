@@ -8,6 +8,9 @@
 import type {
 	TranscriptQuery,
 	TranscriptSearch,
+	SuggestedFrame,
+	ThumbnailEdit,
+	ThumbnailSpec,
 	AudioDetached,
 	Asset,
 	AssetAnalysis,
@@ -214,11 +217,12 @@ import { sampleFrameJpeg } from './sample-frame';
 import { harnessScopes } from './scopes-view';
 import { harnessRenderBar } from './render-bar';
 import { checkDeliveryFps, deliverLabel } from './delivery-formats';
-import { renderedFps } from './timecode';
+import { renderedDuration, renderedFps } from './timecode';
 import { playbackFps } from './playback-sync';
 import { parsePlaybackMessage } from './frame-transport';
 import { playbackId } from './playback-id';
 import { entryId, mergeSubset, subsetMessage } from './staged-subset';
+import { evenFrames, putThumbnail } from './thumbnail-design';
 import { captionsForTimeline, resolveCaptions } from './captions';
 import { cutTranscript } from './cut-transcript';
 import { estimateWords } from './transcript';
@@ -5083,6 +5087,60 @@ export async function exportCover(timeSecs: number, outputPath: string): Promise
 	return invoke<string>('export_cover', { timeSecs, outputPath, format: null });
 }
 
+/** Add a thumbnail (`thumbnailId` null) or change one to `spec` — each unset field keeps what it has, `layers` is the
+ *  whole new stack. One edit. In the browser harness the layers carry no artwork (the engine draws it). */
+export async function setThumbnail(thumbnailId: string | null, spec: ThumbnailSpec): Promise<ThumbnailEdit> {
+	if (!inTauri()) {
+		const t = putThumbnail(devTimeline, thumbnailId, spec, uid);
+		recordDev(`${thumbnailId == null ? 'Add' : 'Change'} thumbnail “${t.name}”`);
+		return { timeline: snapshot(), thumbnail_id: t.id, warnings: [] };
+	}
+	return invoke<ThumbnailEdit>('set_thumbnail', { thumbnailId, spec });
+}
+
+export async function removeThumbnail(thumbnailId: string): Promise<Timeline> {
+	if (!inTauri()) {
+		const before = devTimeline.thumbnails?.length ?? 0;
+		devTimeline.thumbnails = (devTimeline.thumbnails ?? []).filter((t) => t.id !== thumbnailId);
+		if (devTimeline.thumbnails.length === before) throw new Error(`no thumbnail ${thumbnailId}`);
+		recordDev('Remove thumbnail');
+		return snapshot();
+	}
+	return invoke<Timeline>('remove_thumbnail', { thumbnailId });
+}
+
+/** The thumbnail drawn `width` px wide (from the proxies) as an object URL the caller revokes; `null` in the
+ *  browser harness, which draws no thumbnails. */
+export async function thumbnailPreview(thumbnailId: string, width: number): Promise<string | null> {
+	if (!inTauri()) return null;
+	const bytes = await invoke<ArrayBuffer>('thumbnail_preview', { thumbnailId, width: Math.round(width) });
+	return URL.createObjectURL(new Blob([bytes], { type: 'image/png' }));
+}
+
+/** Write the thumbnail at full size from the original media: `.png`, `.jpg` or `.webp` by the extension. */
+export async function exportThumbnail(thumbnailId: string, outputPath: string): Promise<string> {
+	if (!inTauri()) throw new Error('saving a thumbnail is only available in the desktop app');
+	return invoke<string>('export_thumbnail', { thumbnailId, outputPath });
+}
+
+/** The best frames of the cut for a thumbnail, best first. In the browser harness: frames spread evenly. */
+export async function suggestThumbnailFrames(count = 6): Promise<SuggestedFrame[]> {
+	if (!inTauri()) return evenFrames(renderedDuration(devTimeline), count);
+	return invoke<SuggestedFrame[]>('suggest_thumbnail_frames', { count, range: null });
+}
+
+/** Open a save dialog for a thumbnail image. */
+export async function pickThumbnailPath(name: string): Promise<string | null> {
+	if (!inTauri()) return null;
+	const { save } = await import('@tauri-apps/plugin-dialog');
+	const stem = name.replace(/[^\p{L}\p{N}]+/gu, '-').replace(/^-|-$/g, '').toLowerCase() || 'thumbnail';
+	const path = await save({
+		filters: [{ name: 'Image', extensions: ['png', 'jpg', 'webp'] }],
+		defaultPath: `${stem}.png`
+	});
+	return typeof path === 'string' ? path : null;
+}
+
 /** Open a save dialog for a cover image. */
 export async function pickCoverPath(): Promise<string | null> {
 	if (!inTauri()) return null;
@@ -5224,7 +5282,7 @@ const HARNESS_TOOL_SETS: McpToolSet[] = [
 	{ name: 'titles', description: 'Text overlays, SVG titles and templates, captions, markers, fonts', tools: 32 },
 	{ name: 'audio', description: 'Track and master mix, ducking, loudness and band balance, voiceover', tools: 13 },
 	{ name: 'music', description: 'Music structure, fitting and composing music, stems, snapping cuts to beats', tools: 8 },
-	{ name: 'delivery', description: 'Delivery format, smart crop, export, variants, cover, captions and interchange files', tools: 10 },
+	{ name: 'delivery', description: 'Delivery format, smart crop, export, variants, cover, captions and interchange files', tools: 16 },
 	{ name: 'tasks', description: "The user's task queue", tools: 7 },
 	{ name: 'project', description: 'Open, create and save projects as, missing media, settings', tools: 6 }
 ];

@@ -4726,6 +4726,9 @@ pub struct Timeline {
     /// Defaulted and not written while untouched (see [`MasterBus`]).
     #[serde(default, skip_serializing_if = "master_is_default")]
     pub master: MasterBus,
+    /// Pictures designed beside the cut (see [`thumbnail`]): stored with it, never drawn in it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub thumbnails: Vec<Thumbnail>,
 }
 
 impl Default for Timeline {
@@ -4744,6 +4747,7 @@ impl Timeline {
             markers: Vec::new(),
             format: None,
             master: MasterBus::default(),
+            thumbnails: Vec::new(),
         }
     }
 
@@ -4897,6 +4901,7 @@ impl Timeline {
             markers: self.markers.clone(),
             format: self.format,
             master: self.master,
+            thumbnails: Vec::new(),
         }
     }
 
@@ -4972,6 +4977,7 @@ impl Timeline {
             }),
             // The same mix at every frame: a variant changes the picture only.
             master: self.master,
+            thumbnails: self.thumbnails.clone(),
         }
     }
 
@@ -5014,6 +5020,7 @@ impl Timeline {
             format: self.format,
             // ...and the same mix: a range export of a limited master is limited.
             master: self.master,
+            thumbnails: Vec::new(),
         };
         for track in &self.tracks {
             let mut t = Track {
@@ -5113,6 +5120,8 @@ pub use grade::{
 };
 mod check;
 mod generator;
+pub mod thumbnail;
+pub use thumbnail::{Thumbnail, ThumbnailLayer, VideoGraphics, MAX_THUMBNAILS, MAX_THUMBNAIL_LAYERS};
 mod values;
 pub(crate) use generator::too_many_titles;
 pub use generator::{Generator, TitleClip, GENERATED_ASSET, MAX_TITLE_CLIPS};
@@ -6303,6 +6312,7 @@ pub enum DiffKind {
     MarkerChanged,
     FormatChanged,
     MasterChanged,
+    ThumbnailsChanged,
 }
 
 impl DiffKind {
@@ -6325,6 +6335,7 @@ impl DiffKind {
             DiffKind::MarkerChanged => "marker_changed",
             DiffKind::FormatChanged => "format_changed",
             DiffKind::MasterChanged => "master_changed",
+            DiffKind::ThumbnailsChanged => "thumbnails_changed",
         }
     }
 
@@ -7292,6 +7303,9 @@ impl Timeline {
         if let Some(detail) = master_changes(&self.master, &after.master) {
             rest.push(DiffEntry::new(DiffKind::MasterChanged, "Changed the master bus".to_string()).detail(detail));
         }
+        if let Some(detail) = thumbnail::thumbnail_changes(&self.thumbnails, &after.thumbnails) {
+            rest.push(DiffEntry::new(DiffKind::ThumbnailsChanged, "Changed the thumbnails".to_string()).detail(detail));
+        }
 
         tracks.append(&mut clips);
         tracks.append(&mut rest);
@@ -7974,6 +7988,7 @@ mod tests {
             markers: Vec::new(),
             format: None,
             master: Default::default(),
+            thumbnails: Vec::new(),
         };
         let r = tl.for_render();
         // The disabled clip is gone but the enabled one stays.
@@ -8001,6 +8016,7 @@ mod tests {
             markers: Vec::new(),
             format: None,
             master: Default::default(),
+            thumbnails: Vec::new(),
         };
         let r = tl.for_render();
         assert!(r.tracks[0].clips.is_empty(), "unsoloed video track is shadowed");
@@ -8022,6 +8038,7 @@ mod tests {
             markers: Vec::new(),
             format: None,
             master: Default::default(),
+            thumbnails: Vec::new(),
         };
         assert!(tl.for_render().tracks[0].clips.is_empty());
     }
@@ -8080,6 +8097,7 @@ mod tests {
             markers: Vec::new(),
             format: Some(Delivery::new(1080, 1920, Fit::Cover)),
             master: Default::default(),
+            thumbnails: Vec::new(),
         };
 
         let square = tl.for_delivery(Delivery::new(1080, 1080, Fit::Cover));
@@ -8116,6 +8134,7 @@ mod tests {
             markers: Vec::new(),
             format: Some(Delivery::new(1920, 1080, Fit::Contain)),
             master: Default::default(),
+            thumbnails: Vec::new(),
         };
         let vertical = tl.for_delivery(Delivery::new(1080, 1920, Fit::Cover));
         let fitted = vertical.overlays[0].size;
@@ -8136,6 +8155,7 @@ mod tests {
             markers: Vec::new(),
             format: None,
             master: Default::default(),
+            thumbnails: Vec::new(),
         };
         let mut after = before.clone();
         after.tracks[0].clips[0].set_framing(framed((9, 16), 0.1, 0.5));
@@ -8159,6 +8179,7 @@ mod tests {
             markers: Vec::new(),
             format: None,
             master: Default::default(),
+            thumbnails: Vec::new(),
         };
         let r = tl.for_render();
         assert_eq!(
@@ -8331,6 +8352,7 @@ mod tests {
                 markers: Vec::new(),
                 format: None,
                 master: Default::default(),
+                thumbnails: Vec::new(),
             };
             // A cut inside the first (eased) segment, not on one of its pieces.
             let from = 1.1;
@@ -8368,6 +8390,7 @@ mod tests {
                 markers: Vec::new(),
                 format: None,
                 master: Default::default(),
+                thumbnails: Vec::new(),
             };
             let id = original.id;
             // The range cut, and the edit that trims the head and moves the clip: same result.
@@ -8573,6 +8596,7 @@ mod tests {
             markers: Vec::new(),
             format: None,
             master: Default::default(),
+            thumbnails: Vec::new(),
         };
         assert_eq!(tl.export_span(None), None);
         assert_eq!(tl.export_span(Some((10.0, 30.0))), Some((10.0, 30.0)));
@@ -8598,6 +8622,7 @@ mod tests {
             markers: vec![mk(1.0, "before"), mk(4.0, "inside"), mk(9.0, "after")],
             format: None,
             master: Default::default(),
+            thumbnails: Vec::new(),
         };
         let s = tl.slice(3.0, 7.0);
         let names: Vec<_> = s.markers.iter().map(|m| m.name.as_str()).collect();
@@ -8620,6 +8645,7 @@ mod tests {
             markers: Vec::new(),
             format: None,
             master: Default::default(),
+            thumbnails: Vec::new(),
         };
         let s = tl.slice(2.0, 6.0);
         assert!(s.tracks[0].muted && s.tracks[0].locked && s.tracks[0].duck);
@@ -9069,6 +9095,7 @@ mod tests {
             markers: Vec::new(),
             format: None,
             master: Default::default(),
+            thumbnails: Vec::new(),
         }
     }
 
@@ -9284,6 +9311,7 @@ mod tests {
         let tl = Timeline {
             tracks: vec![track(StreamKind::Audio, "A1", vec![clip_at(0.0, 8.0)])],
             master,
+            thumbnails: Vec::new(),
             ..Timeline::new()
         };
         assert_eq!(tl.for_render().master, master, "muted tracks are dropped, the mix is not");
@@ -9614,6 +9642,7 @@ mod tests {
             markers: Vec::new(),
             format: None,
             master: Default::default(),
+            thumbnails: Vec::new(),
         };
         let lines = captioned(&timeline, asset, vec![seg(0.0, 2.0, "first"), seg(10.0, 12.0, "second")]);
         assert_eq!(lines.len(), 2, "{lines:?}");
@@ -9638,6 +9667,7 @@ mod tests {
             markers: Vec::new(),
             format: None,
             master: Default::default(),
+            thumbnails: Vec::new(),
         };
         let lines = captioned(
             &timeline,
@@ -9779,6 +9809,7 @@ mod tests {
             markers: Vec::new(),
             format: None,
             master: Default::default(),
+            thumbnails: Vec::new(),
         };
         let lines = captioned(&timeline, asset, vec![seg(0.0, 3.0, "only once")]);
         assert_eq!(lines.len(), 1, "{lines:?}");

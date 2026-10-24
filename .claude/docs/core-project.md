@@ -170,8 +170,11 @@
   export then goes back to the first clip's rate without a word; a delivery with none is written as before
   (`a_delivery_with_no_rate_stores_exactly_what_it_always_did`), `run` a no-op, `needed` always,
   `needed_to_read` false; `persisted/timelines-v12.json` holds a 9:16 delivery at 50 fps.
-  The schema is at **v12** (`SCHEMA_VERSION`). `persist_tests` pins which steps a file has pending with
-  `store::pending_steps` (a legacy file that has every column: `[4, 5, 6, 7, 8, 9, 10, 11]`). A step's `needed_to_read` says whether a build that
+  v12→v13 is a JSON step for a **new field**, `Timeline.thumbnails` (designed thumbnails, below): an older build drops them
+  at its next write; a timeline with none is written as before, `run` a no-op, `needed` always, `needed_to_read` false;
+  `persisted/timelines-v13.json` holds a vertical thumbnail with a headline.
+  The schema is at **v13** (`SCHEMA_VERSION`). `persist_tests` pins which steps a file has pending with
+  `store::pending_steps` (a legacy file that has every column: `[4, 5, 6, 7, 8, 9, 10, 11, 12]`). A step's `needed_to_read` says whether a build that
   cannot write must still refuse a file lacking what it adds: true for the v1, v2 and v4 columns (the reads
   name them), false for the `fonts` table (reads tolerate its absence), so a write-protected v2 project
   opens as it is. A new file is stamped `SCHEMA_VERSION`; a
@@ -875,3 +878,15 @@
   back to the original. Smart crop's `salience_map` is not swapped.
 - `error.rs` — `Error`/`Result`; the `Ffmpeg(#[from] ffmpeg_next::Error)` variant is
   itself `#[cfg(feature = "ffmpeg")]`.
+- **Thumbnails** (`project/thumbnails.rs`; the model is `core-model.md`, the drawing `engine-cli.md`). The template shape:
+  `thumbnail_base(id?)` under the lock (the thumbnail as the working cut has it, or a new one's defaults: the delivery frame's
+  shape — vertical / square / 4:5, else `youtube` 1280x720 — and the frame at 0), the static `prepare_thumbnail(base, &ThumbnailSpec,
+  library)` with it released (each unset field keeps its value; `layers` is the whole new stack: a `ThumbnailLayerSpec` keeps a layer
+  by `layer_id` — its artwork and placement, changed by what it names, template `values` spliced through `TemplateEditInputs` — or
+  makes one from exactly one of `text` (`svg::render_headline`), `template_id` (`Template::prepare`), `svg`, `image` (a `data:` URL,
+  checked by `template::image_data_url`, wrapped in an SVG of its own size); the sanitiser runs here), then
+  `apply_thumbnail_parsed` — `Add thumbnail “X”` / `Change thumbnail “X”` through `edit_timeline` (so it stages, undoes and diffs),
+  refused when the stored thumbnail is no longer the one prepared from ("try again"), a template's fonts stored and held like
+  `apply_template_parsed`'s. `remove_thumbnail`; `MAX_THUMBNAILS` 20, `MAX_THUMBNAIL_LAYERS` 12. `collect_unused_fonts` keeps a font a
+  thumbnail layer names (`Timeline::thumbnail_sources`). `thumbnail_render_inputs(id)` (thumbnail, working timeline, originals) and
+  `frame_suggestion_inputs()` (plus each cut asset's analyzed `scene_changes`) feed `crate::thumbnail` with the lock released.

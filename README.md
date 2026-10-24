@@ -161,7 +161,7 @@ Now ask the agent to work on the project you have open — _"skim the interview 
 the dead air, and drop in captions."_ It will claim a task, use the tools below, and hand
 back a reviewable result.
 
-### The tools (183)
+### The tools (189)
 
 <details>
 <summary><b>See / analyze</b></summary>
@@ -214,7 +214,7 @@ score, fitted to the cuts) ·
 <details>
 <summary><b>Render & hand-off</b></summary>
 
-`export` · `export_capabilities` · `export_cover` · `export_interchange` · `export_markers` · `platform_check` · `review_cut` (flash frames, cuts inside a word, clicks, jump cuts, stale captions, black gaps) · `get_levels` · `stage_edits` ·
+`export` · `export_capabilities` · `export_cover` · `add_thumbnail` · `update_thumbnail` · `remove_thumbnail` · `preview_thumbnail` · `export_thumbnail` · `suggest_thumbnail_frames` · `export_interchange` · `export_markers` · `platform_check` · `review_cut` (flash frames, cuts inside a word, clicks, jump cuts, stale captions, black gaps) · `get_levels` · `stage_edits` ·
 `staged_diff` · `apply_staged_edits` · `discard_staged_edits` · `revision_diff` ·
 `list_tasks` · `add_task` · `claim_next_task` · `complete_task` · `fail_task` ·
 `resolve_task` · `remove_task` · `history` · `undo` · `redo` · `revert_to` ·

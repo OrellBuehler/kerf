@@ -1118,6 +1118,93 @@ export interface Timeline {
 	format?: Delivery | null;
 	/** The master bus. Unset = unity gain, no limiter. */
 	master?: MasterBus;
+	/** Thumbnails designed beside the cut, never drawn in it. The backend omits the list when empty. */
+	thumbnails?: Thumbnail[];
+}
+
+/** Which of the video's own graphics a thumbnail's background keeps — mirrors `kerf_core::VideoGraphics`. */
+export type VideoGraphics = 'none' | 'titles' | 'all';
+
+/** One picture over a thumbnail's background — mirrors `kerf_core::ThumbnailLayer`. Its SVG is fitted
+ *  "contain" into the rect `x, y, width, height` (fractions of the thumbnail). */
+export interface ThumbnailLayer {
+	id: string;
+	name: string;
+	svg: string;
+	/** Set for a headline: what its artwork is made from. */
+	text?: SvgPresetParams | null;
+	/** Set for a layer made from a motion template. */
+	template?: TemplateInstance | null;
+	/** The moment of the artwork drawn (seconds); unset = its settled state. */
+	at?: number | null;
+	x: number;
+	y: number;
+	width: number;
+	height: number;
+	opacity: number;
+}
+
+/** A thumbnail — mirrors `kerf_core::Thumbnail`: a frame of the cut at `time`, cropped to `width` x `height`
+ *  around the focus point, under its own layers. */
+export interface Thumbnail {
+	id: string;
+	name: string;
+	time: number;
+	width: number;
+	height: number;
+	focus_x: number;
+	focus_y: number;
+	graphics?: VideoGraphics;
+	layers?: ThumbnailLayer[];
+}
+
+/** One layer of a `ThumbnailSpec` — mirrors `kerf_core::ThumbnailLayerSpec`: an existing layer (`layer_id`), or a
+ *  new one from exactly one of `text`, `template_id`, `svg`, `image` (a `data:` URL). */
+export interface ThumbnailLayerSpec {
+	layer_id?: string | null;
+	text?: SvgPresetParams | null;
+	template_id?: string | null;
+	values?: Record<string, string> | null;
+	svg?: string | null;
+	image?: string | null;
+	name?: string | null;
+	/** Negative goes back to the settled moment. */
+	at?: number | null;
+	x?: number | null;
+	y?: number | null;
+	width?: number | null;
+	height?: number | null;
+	opacity?: number | null;
+}
+
+/** What a thumbnail should become — mirrors `kerf_core::ThumbnailSpec`; each unset field keeps what it has. */
+export interface ThumbnailSpec {
+	name?: string | null;
+	time?: number | null;
+	/** `youtube`, `vertical`, `square`, `4:5`, `16:9` or `WxH`. */
+	size?: string | null;
+	focus_x?: number | null;
+	focus_y?: number | null;
+	graphics?: VideoGraphics | null;
+	/** The whole new stack, bottom first. */
+	layers?: ThumbnailLayerSpec[] | null;
+}
+
+/** What `set_thumbnail` answers. */
+export interface ThumbnailEdit {
+	timeline: Timeline;
+	thumbnail_id: string;
+	warnings: string[];
+}
+
+/** A frame `suggest_thumbnail_frames` proposes — mirrors `kerf_core::thumbnail::SuggestedFrame`. */
+export interface SuggestedFrame {
+	time: number;
+	/** 0..1: half sharpness, a quarter exposure, a quarter contrast. */
+	score: number;
+	sharpness: number;
+	exposure: number;
+	contrast: number;
 }
 
 /**
@@ -1257,7 +1344,8 @@ export type DiffKind =
 	| 'marker_removed'
 	| 'marker_changed'
 	| 'format_changed'
-	| 'master_changed';
+	| 'master_changed'
+	| 'thumbnails_changed';
 
 export interface DiffEntry {
 	/** The change's stable name, `<kind>:<the clip, text, marker or track it is about>`, which it keeps for

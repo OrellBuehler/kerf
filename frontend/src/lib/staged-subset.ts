@@ -301,6 +301,9 @@ export function mergeSubset(live: Timeline, base: Timeline, proposed: Timeline, 
 		} else if (e.kind === 'master_changed') {
 			out.master = proposed.master;
 			applied.add(i);
+		} else if (e.kind === 'thumbnails_changed') {
+			out.thumbnails = proposed.thumbnails;
+			applied.add(i);
 		}
 	}
 

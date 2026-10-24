@@ -170,6 +170,7 @@ fn timeline(clips: Vec<Clip>) -> Timeline {
         markers: Vec::new(),
         format: None,
         master: Default::default(),
+        thumbnails: Vec::new(),
     }
 }
 
@@ -600,6 +601,7 @@ fn a_layer_over_another_track_with_a_transform_and_an_opacity_is_drawn_through_c
         markers: Vec::new(),
         format: None,
         master: Default::default(),
+        thumbnails: Vec::new(),
     };
     // A smaller layer, placed: the scaler's one level, as the export's (`SCALED` in `motion_parity.rs`).
     let mut pip = Clip::new(m.testsrc.id, 0.5, 1.5, 0.2);

@@ -1548,6 +1548,7 @@ fn probe_composite_red(ffmpeg: &str, ffprobe: &str, tag_bt709: bool, deadline: I
         markers: Vec::new(),
         format: None,
         master: Default::default(),
+        thumbnails: Vec::new(),
     };
     let args = build_still_args(
         &timeline,
@@ -9883,6 +9884,40 @@ pub fn export_still_cancellable(
     Ok(path.to_path_buf())
 }
 
+/// Write the picture file `input` again as `output`, encoded with `codec` (`-c:v mjpeg -q:v 2`, …): one
+/// frame, killed past [`STILL_TIMEOUT`] or once `cancel` is true ([`Error::Cancelled`]). A run that fails
+/// removes what it wrote ([`discard_partial`]).
+pub fn transcode_image(input: &Path, output: &Path, codec: &[&str], cancel: &dyn Fn() -> bool) -> Result<()> {
+    let before = file_mtime(output);
+    let bin = ffmpeg_bin();
+    let mut cmd = command(&bin);
+    cmd.args(["-hide_banner", "-loglevel", "error", "-i"])
+        .arg(input)
+        .args(["-frames:v", "1"])
+        .args(codec)
+        .args(["-f", "image2", "-update", "1", "-y"])
+        .arg(output);
+    let result = match output_supervised(cmd, std::time::Duration::MAX, Some(STILL_TIMEOUT), cancel) {
+        Err(e) => Err(launch_err(&bin, e)),
+        Ok(out) if out.cancelled => Err(Error::Cancelled),
+        Ok(out) if out.timed_out => Err(Error::Engine(format!(
+            "could not write {}: ffmpeg did not answer in {} s and was stopped",
+            output.display(),
+            STILL_TIMEOUT.as_secs()
+        ))),
+        Ok(out) if !out.status.success() => Err(Error::Engine(format!(
+            "could not write {}: {}",
+            output.display(),
+            out.stderr.trim()
+        ))),
+        Ok(_) => Ok(()),
+    };
+    if result.is_err() {
+        discard_partial(output, before);
+    }
+    result
+}
+
 /// Run a composited still through ffmpeg, retrying in software if hardware
 /// decode was asked for and failed. Returns stdout (empty for a file sink).
 #[allow(clippy::too_many_arguments)]
@@ -13255,6 +13290,7 @@ mod tests {
             markers: Vec::new(),
             format: None,
             master: Default::default(),
+            thumbnails: Vec::new(),
         };
         let fmt = export_format(&timeline, &[], &ExportOptions::default());
         assert_eq!((fmt.width, fmt.height), (1920, 1080));
@@ -20582,6 +20618,7 @@ mod tests {
                 markers: Vec::new(),
                 format: None,
                 master: Default::default(),
+                thumbnails: Vec::new(),
             };
             crate::render_plan::RenderPlan::at(&timeline, &[asset], &ExportOptions::default(), 1.0, policy).unwrap()
         };

@@ -22,6 +22,7 @@ mod popout;
 mod recovery;
 mod settings;
 mod shell;
+mod thumbnail_commands;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -5675,6 +5676,11 @@ pub fn run() {
             cancel_analysis,
             export_cover,
             cancel_cover_export,
+            thumbnail_commands::set_thumbnail,
+            thumbnail_commands::remove_thumbnail,
+            thumbnail_commands::thumbnail_preview,
+            thumbnail_commands::export_thumbnail,
+            thumbnail_commands::suggest_thumbnail_frames,
             cancel_smart_crop,
             get_scopes,
             get_render_bar,

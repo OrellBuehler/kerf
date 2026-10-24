@@ -38,3 +38,4 @@ export function exportedLine(outs: readonly string[]): string {
 
 export const savedLine = (path: string) => `Saved ${fileName(path)}`;
 export const coverLine = (path: string) => `Saved cover ${fileName(path)}`;
+export const thumbnailLine = (path: string) => `Saved thumbnail ${fileName(path)}`;
