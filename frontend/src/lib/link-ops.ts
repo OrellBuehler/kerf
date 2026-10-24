@@ -47,6 +47,7 @@ import {
 	rippleDeleteClip,
 	rippleDeleteLinked,
 	setSpeedLinked,
+	setSpeedRampAlone,
 	setSpeedRampLinked,
 	splitClip,
 	splitClipLinked,
@@ -353,20 +354,15 @@ export function setSpeed(tl: Timeline, env: EditEnv, clipId: string, speed: numb
 	);
 }
 
-/** `Project::set_speed_ramp`: the clip (and its partners) given a speed ramp over the same footage — the length
- *  changes, so the ripple and the sync lock follow like a speed change. Empty `keys` clears it. */
+/** `Project::set_speed_ramp`: the clip (and its partners, on the timeline) given a speed ramp over the same footage —
+ *  the length changes, so the ripple and the sync lock follow like a speed change. Empty `keys` clears it; clearing a
+ *  clip with no ramp is refused. */
 export function setSpeedRamp(tl: Timeline, env: EditEnv, clipId: string, keys: readonly SpeedKey[]): Edited<Clip> {
 	const sorted = checkedRamp(keys);
 	return edited(
 		runEdit(tl, { ...env, anchors: [clipId] }, (t) => {
 			ensureEditable(t, clipId);
-			if (env.links) return setSpeedRampLinked(t, clipId, sorted);
-			const found = locate(t, clipId);
-			if (!found) throw clipNotFound(clipId);
-			const clip = found[0].clips[found[1]];
-			if (sorted.length === 0) delete clip.speed_ramp;
-			else clip.speed_ramp = structuredClone(sorted);
-			return structuredClone(clip);
+			return env.links ? setSpeedRampLinked(t, clipId, sorted) : setSpeedRampAlone(t, clipId, sorted);
 		}),
 		'Set speed ramp'
 	);

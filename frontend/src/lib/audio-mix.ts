@@ -8,7 +8,6 @@
  *    export's own limiter in an AudioWorklet (`alimiter.ts`). */
 
 import { propertyCurve, volumeAnimated, volumeAt } from './channels';
-import { isRamped, sameRamp, tailSource } from './speed-ramp';
 import { clipDuration, type Clip } from './types';
 
 /** What decides a clip's gain: its volume, fades and a transition into it. `power_pair` (the
@@ -44,10 +43,9 @@ export const SPLICE_CROSSFADE_S = 0.01;
  *  (the same samples), or a de-click splice no longer than `SPLICE_CROSSFADE_S`. Mirrors
  *  `clip_timing::same_sound`. */
 export function sameSound(out: Clip, inn: Clip, overlap: number): boolean {
-	if (out.asset_id !== inn.asset_id || Math.abs(speedOf(out) - speedOf(inn)) > 1e-9 || !sameRamp(out, inn, 1e-9)) return false;
+	if (out.asset_id !== inn.asset_id || Math.abs(speedOf(out) - speedOf(inn)) > 1e-9) return false;
 	const [continues, picksUp] = speedOf(out) < 0 ? [out.source_in, inn.source_out] : [out.source_out, inn.source_in];
-	const reach = isRamped(out) ? Math.abs(tailSource(out, overlap)) : overlap * Math.max(Math.abs(speedOf(out)), 0.01);
-	return overlap <= SPLICE_CROSSFADE_S + 1e-9 || Math.abs(continues - picksUp) < reach;
+	return overlap <= SPLICE_CROSSFADE_S + 1e-9 || Math.abs(continues - picksUp) < overlap * Math.max(Math.abs(speedOf(out)), 0.01);
 }
 
 /** Whether `clip`'s transition is a real crossfade pair of two sounds, as `transition_fx` pairs it:

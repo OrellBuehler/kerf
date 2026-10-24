@@ -24,7 +24,7 @@
 import { curve, EASE_STEPS } from './easing';
 import { rebaseChannels, transformAt } from './channels';
 import { formatTime } from './diff';
-import { invalid, locateIndex, unlockedPartners } from './link-groups';
+import { invalid, locateIndex, samePace, unlockedPartners } from './link-groups';
 import { toFixedEven } from './format-fixed';
 import type {
 	Clip,
@@ -42,11 +42,13 @@ import {
 	clipDuration,
 	headSource,
 	headTime,
+	isRamped,
 	isReversed,
 	MAX_SPEED,
-	meanSpeed,
 	MIN_SPEED,
 	rebaseRamp,
+	speedAt,
+	speedMag,
 	tailSource,
 	tailTime
 } from './speed-ramp';
@@ -200,7 +202,7 @@ function fitEnd(clip: Clip, limit: number, looping: boolean) {
 	for (let i = 0; i < 16; i++) {
 		const over = endOf(clip) - limit;
 		if (over <= 0 || over > DIFF_EPS) return;
-		const by = -tailSource(clip, -over);
+		const by = over * speedAt(clip, clipDuration(clip));
 		if (reversed(clip) && !looping) {
 			const moved = clip.source_in + by;
 			clip.source_in = moved === clip.source_in ? nextAfter(clip.source_in, true) : moved;
@@ -793,14 +795,26 @@ function slipPartners(timeline: Timeline, clipId: string, footage: SourceLimits)
 	return out;
 }
 
+/** The speeds `clipId` and `partner` slip at: a slip is the same *timeline* shift of the footage in each, so
+ *  source seconds convert by the ratio of the two. Two clips on the same ramp slip alike (1 and 1); a ramp
+ *  against another pace has no one ratio and refuses (`slip_speeds`). */
+function slipSpeeds(timeline: Timeline, clipId: string, partner: string): [number, number] {
+	const [c, p] = [clipAt(timeline, clipId), clipAt(timeline, partner)];
+	if (!isRamped(c) && !isRamped(p)) return [speedMag(c), speedMag(p)];
+	if (samePace(c, p)) return [1, 1];
+	throw invalid(
+		`the linked clip on ${trackNameOf(timeline, partner)} runs at another pace than a speed-ramped clip, so a slip has no one ratio between them — slip them one at a time`
+	);
+}
+
 /** `slipRange` for the group, in the named clip's source seconds: a partner's range is
  *  converted by the ratio of the two speeds, then intersected. */
 export function slipRangeLinked(timeline: Timeline, clipId: string, footage: SourceLimits): DeltaRange {
 	let range = slipRange(timeline, clipId, footage);
-	const mag = meanSpeed(clipAt(timeline, clipId));
 	for (const partner of slipPartners(timeline, clipId, footage)) {
+		const [mag, pMag] = slipSpeeds(timeline, clipId, partner);
 		const theirs = slipRange(timeline, partner, footage);
-		range = intersect(range, onLinked(scaled(theirs, mag / meanSpeed(clipAt(timeline, partner))), trackNameOf(timeline, partner)));
+		range = intersect(range, onLinked(scaled(theirs, mag / pMag), trackNameOf(timeline, partner)));
 	}
 	return range;
 }
@@ -817,11 +831,11 @@ export function slipClipLinked(timeline: Timeline, clipId: string, delta: number
 	const partners = slipPartners(timeline, clipId, footage);
 	if (partners.length === 0) return slipClip(timeline, clipId, delta, footage);
 	const applied = resolve(slipRangeLinked(timeline, clipId, footage), delta, 'slip the footage');
-	const mag = meanSpeed(clipAt(timeline, clipId));
 	const scratch: Timeline = structuredClone(timeline);
 	const clips = slipClip(scratch, clipId, applied, footage).clips;
 	for (const partner of partners) {
-		const theirs = (applied * meanSpeed(clipAt(scratch, partner))) / mag;
+		const [mag, pMag] = slipSpeeds(timeline, clipId, partner);
+		const theirs = (applied * pMag) / mag;
 		if (Math.abs(theirs) > DIFF_EPS) clips.push(...slipClip(scratch, partner, theirs, footage).clips);
 	}
 	timeline.tracks = scratch.tracks;

@@ -97,6 +97,20 @@ describe('the curve', () => {
 	});
 });
 
+describe('the keys of a clip', () => {
+	test('keys a linked partner holds before its start are folded into a key at 0', () => {
+		const c = clip(10, { speed_ramp: [key(-1.5, 1), key(-0.5, 0.4), key(0.5, 0.4, 'hold'), key(1.5, 1.5)] });
+		expect(keysOf(c)).toEqual([key(0, 0.4), key(0.5, 0.4, 'hold'), key(1.5, 1.5)]);
+		for (let t = 0; t < 3; t += 0.2) expect(speedAt({ ...c, speed_ramp: keysOf(c) }, t)).toBeCloseTo(speedAt(c, t), 12);
+		const on = clip(10, { speed_ramp: [key(-1, 1), key(0, 0.5, 'hold'), key(2, 2)] });
+		expect(keysOf(on)).toEqual([key(0, 0.5, 'hold'), key(2, 2)]);
+		const inside = clip(10, { speed_ramp: [key(-2, 1), key(2, 3)] });
+		expect(keysOf(inside)).toEqual([key(0, 2), key(2, 3)]);
+		const plain = clip(10, { speed_ramp: [key(0, 1), key(2, 3)] });
+		expect(keysOf(plain)).toEqual([key(0, 1), key(2, 3)]);
+	});
+});
+
 describe('adding a key', () => {
 	test('on a clip with no ramp it keeps the constant speed and adds a key at the start too', () => {
 		const c = clip(10, { speed: 2 });

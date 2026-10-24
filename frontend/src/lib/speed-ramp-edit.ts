@@ -127,8 +127,17 @@ export function miniCurve(clip: Windowed, w: number, h: number): string {
 
 // ---- edits --------------------------------------------------------------------
 
-/** The keys of a clip's ramp, as a fresh list (none when it has no ramp the map reads). */
-export const keysOf = (clip: Windowed): SpeedKey[] => (clipRamp(clip) ?? []).map((k) => ({ ...k }));
+/** The keys of a clip's ramp, as a fresh list (none when it has no ramp the map reads). A ramp a linked partner got
+ *  can have keys before the clip's start (`set_speed_ramp_linked` keeps them on the timeline); the engine takes keys
+ *  from 0, so what the clip plays from its start is pinned as a key at 0 and the ones before are left out. */
+export function keysOf(clip: Windowed): SpeedKey[] {
+	const keys = clipRamp(clip) ?? [];
+	if (keys.length === 0 || keys[0].time >= 0) return keys.map((k) => ({ ...k }));
+	const gone = keys.filter((k) => k.time <= 0).length;
+	const pinned: SpeedKey = { time: 0, speed: rampSpeedAt(keys, 0) };
+	if (gone < keys.length && keys[gone - 1].easing === 'hold') pinned.easing = 'hold';
+	return [pinned, ...keys.slice(gone).map((k) => ({ ...k }))];
+}
 
 const keyOf = (time: number, speed: number, easing?: 'linear' | 'hold'): SpeedKey =>
 	easing === 'hold' ? { time, speed, easing } : { time, speed };

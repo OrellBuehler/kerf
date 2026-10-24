@@ -55,6 +55,11 @@ describe('set_speed_ramp', () => {
 		close(clipDuration(a), 4);
 	});
 
+	test('clearing a clip that has no ramp is an error', () => {
+		expect(() => ops.setSpeedRamp(cut(), env(), 'a', [])).toThrow('the clip has no speed ramp to clear');
+		expect(() => ops.setSpeedRamp(cut(), env({ links: false }), 'a', [])).toThrow('the clip has no speed ramp to clear');
+	});
+
 	test('empty keys clear it, on the partner too', () => {
 		const ramped = ops.setSpeedRamp(cut(), env(), 'a', RAMP).timeline;
 		const cleared = ops.setSpeedRamp(ramped, env(), 'a', []).timeline;
@@ -83,11 +88,13 @@ describe('set_speed_ramp', () => {
 		const t = cut();
 		const before = structuredClone(t);
 		const bad: [string, SpeedKey[]][] = [
-			['finite', [key(NaN, 1)]],
-			['finite', [key(0, Infinity)]],
-			['share', [key(1, 1), key(1, 2)]],
-			['between', [key(0, 0.001)]],
-			['between', [key(0, 101)]],
+			['time must be seconds', [key(NaN, 1)]],
+			['time must be seconds', [key(-1, 1)]],
+			['time must be seconds', [key(2e6, 1)]],
+			['speed must be between', [key(0, Infinity)]],
+			['two speed ramp keys', [key(1, 1), key(1, 2)]],
+			['speed must be between', [key(0, 0.001)]],
+			['speed must be between', [key(0, 101)]],
 			['at most', Array.from({ length: 17 }, (_, i) => key(i, 1))]
 		];
 		for (const [why, keys] of bad) expect(() => ops.setSpeedRamp(t, env(), 'a', keys)).toThrow(why);

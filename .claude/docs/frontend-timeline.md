@@ -620,5 +620,5 @@ the constant speed's place — a small curve of its keys on the log speed axis (
 the ramp: filmstrip slots and waveform columns (`sourceAt` over `along`), the scene / silence / beat marks
 (`sourceToTimeline`), captions and transcript lines, the clip's width (`clipDuration`) and the edge-trim bounds
 (`headTime` / `tailTime`, the time the ramp takes to play the handle). An edge trim on a ramped clip commits one `trim`
-and `Project::trim` has to rebase the ramp when the head moves (the harness does: `trimRamp`), or the far edge would not stay where the pointer put it;
+and `Project::trim` rebases the ramp when the head moves (`Clip::follow_head`; the harness: `trimRamp`), so the far edge stays where the pointer put it;
 `rippleTrimPreview` applies the same rebase to its scratch copy.

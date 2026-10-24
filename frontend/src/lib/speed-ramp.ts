@@ -25,13 +25,17 @@ export const MAX_SPEED = 100;
 /** The most keys one clip's ramp may hold (`MAX_SPEED_KEYS`): the export nests one `if` per key. */
 export const MAX_SPEED_KEYS = 16;
 
-/** Whether `keys` is a ramp the map can read: one to `MAX_SPEED_KEYS` keys, finite strictly increasing
- *  times, finite speeds in `MIN_SPEED..=MAX_SPEED` (`ramp_is_valid`). */
+/** The furthest a key may lie from the clip's start, seconds (`MAX_RAMP_TIME`, about eleven days): past it a
+ *  segment's squared length is no longer a number worth squaring. */
+export const MAX_RAMP_TIME = 1e6;
+
+/** Whether `keys` is a ramp the map can read: one to `MAX_SPEED_KEYS` keys, strictly increasing times within
+ *  `MAX_RAMP_TIME` of the start, finite speeds in `MIN_SPEED..=MAX_SPEED` (`ramp_is_valid`). */
 export function rampIsValid(keys: readonly SpeedKey[] | null | undefined): boolean {
 	if (!keys || keys.length === 0 || keys.length > MAX_SPEED_KEYS) return false;
 	for (let i = 0; i < keys.length; i++) {
 		const k = keys[i];
-		if (!Number.isFinite(k.time) || !Number.isFinite(k.speed) || k.speed < MIN_SPEED || k.speed > MAX_SPEED) return false;
+		if (!(Math.abs(k.time) <= MAX_RAMP_TIME) || !Number.isFinite(k.speed) || k.speed < MIN_SPEED || k.speed > MAX_SPEED) return false;
 		if (i > 0 && !(keys[i - 1].time < k.time)) return false;
 	}
 	return true;
@@ -206,30 +210,17 @@ export function lastFrameSpan(c: Windowed, fps: number): number {
 	return keys ? sourceDuration(c) - rampAlong(keys, clipDuration(c) - 1 / fps) : speedMag(c) / fps;
 }
 
-/** Whether two clips run the same ramp (or neither runs one), keys within `eps` of each other. */
-export function sameRamp(a: Pick<Clip, 'speed_ramp'>, b: Pick<Clip, 'speed_ramp'>, eps: number): boolean {
-	const [ka, kb] = [clipRamp(a), clipRamp(b)];
-	if (!ka || !kb) return !ka && !kb;
-	return (
-		ka.length === kb.length &&
-		ka.every(
-			(k, i) =>
-				Math.abs(k.time - kb[i].time) < eps && Math.abs(k.speed - kb[i].speed) < eps && holds(k) === holds(kb[i])
-		)
-	);
-}
-
 /** Source seconds the clip's window moves when its start moves `by` timeline seconds (positive
  *  shortens it): what `Clip::move_head` writes, `by * speed` unramped. Read BEFORE `rebaseRamp`. */
 export const headSource = (c: Speeding, by: number): number => along(c, by);
 
 /** Source seconds the clip's window moves when its end moves `by` timeline seconds (positive
- *  lengthens it): what `Clip::move_tail` writes, `by * speed` unramped. */
+ *  lengthens it): what `Clip::tail_shift` writes — `by * speed` unramped, else the ramp from the end on. */
 export function tailSource(c: Windowed, by: number): number {
 	const keys = clipRamp(c);
 	if (!keys) return by * speedMag(c);
-	const d = clipDuration(c);
-	return rampAlong(keys, d + by) - rampAlong(keys, d);
+	if (by === 0) return 0;
+	return rampAlong(keys, clipDuration(c) + by) - sourceDuration(c);
 }
 
 /** Re-time a clip's ramp after its start moved by `by` timeline seconds, so it rides with the content
@@ -240,21 +231,29 @@ export function tailSource(c: Windowed, by: number): number {
  *  does not read is left alone. */
 export function rebaseRamp(c: Pick<Clip, 'speed_ramp'>, by: number) {
 	const keys = clipRamp(c);
-	if (!keys || by === 0) return;
+	if (!keys || by === 0 || !Number.isFinite(by)) return;
 	if (by < 0) {
-		c.speed_ramp = keys.map((k) => ({ ...k, time: k.time - by }));
+		c.speed_ramp = settle(keys.map((k) => ({ ...k, time: k.time - by })));
 		return;
 	}
 	const rest = keys.filter((k) => k.time > by).map((k) => ({ ...k, time: k.time - by }));
 	let at = -1;
 	while (at + 1 < keys.length && keys[at + 1].time <= by) at++;
 	if (at < 0) {
-		c.speed_ramp = rest;
+		c.speed_ramp = settle(rest);
 		return;
 	}
 	const pinned: SpeedKey = { time: 0, speed: rampSpeedAt(keys, by) };
 	if (at + 1 < keys.length && holds(keys[at])) pinned.easing = 'hold';
-	c.speed_ramp = [pinned, ...rest];
+	c.speed_ramp = settle([pinned, ...rest]);
+}
+
+/** Keys in strictly increasing time again: an edit that shifts them can land two within rounding of each
+ *  other, and a ramp that is not strictly increasing is not read at all (`settle`). */
+function settle(keys: SpeedKey[]): SpeedKey[] {
+	const kept: SpeedKey[] = [];
+	for (const k of keys) if (!kept.length || k.time > kept[kept.length - 1].time) kept.push(k);
+	return kept;
 }
 
 /** What a trim does to a ramp (`Project::trim`): the clip's head moved when its window's start side did, and
