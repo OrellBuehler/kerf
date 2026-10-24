@@ -174,8 +174,9 @@ jobs:
             ffmpeg: pinned
             triple: x86_64-apple-darwin
     runs-on: ${{ matrix.os }}
-    # A green run takes 7-25 minutes (macOS Intel is the slowest); anything near this is a hang.
-    timeout-minutes: 40
+    # A green run takes 7-31 minutes, macOS Intel ~42 when a lockfile change leaves the build cold
+    # (the cache is saved only on main); anything near this is a hang.
+    timeout-minutes: 55
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
