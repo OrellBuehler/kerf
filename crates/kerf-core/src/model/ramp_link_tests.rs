@@ -169,6 +169,17 @@ fn a_clear_is_carried_and_a_constant_speed_replaces_the_ramp_on_every_clip() {
 }
 
 #[test]
+fn a_locked_track_refuses_the_ramp_whether_it_holds_the_named_clip_or_a_partner() {
+    for lock in [0, 1] {
+        let (mut t, p, _) = aligned_pair();
+        t.tracks[lock].locked = true;
+        let err = t.set_speed_ramp_linked(p, keys()).unwrap_err().to_string();
+        assert!(err.contains("locked"), "{err}");
+        assert!(t.tracks.iter().all(|tr| tr.clips.iter().all(|c| c.speed_ramp.is_empty())));
+    }
+}
+
+#[test]
 fn a_trim_is_carried_to_a_partner_that_shares_the_edge_with_the_same_ramp_rebase() {
     let (mut t, p, s) = aligned_pair();
     t.set_speed_ramp_linked(p, keys()).unwrap();

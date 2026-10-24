@@ -1827,6 +1827,7 @@ impl Timeline {
     /// outside the speeds a clip can play at. Returns the named clip.
     pub fn set_speed_ramp_linked(&mut self, clip_id: Uuid, keys: Vec<SpeedKey>) -> Result<Clip> {
         let keys = check_speed_ramp(keys)?;
+        self.ensure_editable(clip_id)?;
         let (ti, ci) = self.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
         let named = self.tracks[ti].clips[ci].clone();
         if keys.is_empty() && named.speed_ramp.is_empty() {
