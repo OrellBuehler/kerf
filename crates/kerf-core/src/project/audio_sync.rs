@@ -374,5 +374,11 @@ mod tests {
         assert!(check_plain_speed(&c).is_err());
         c.speed = -1.0;
         assert!(check_plain_speed(&c).is_err());
+        c.speed = 1.0;
+        c.speed_ramp = vec![crate::model::SpeedKey::new(0.0, 1.0)];
+        assert!(
+            check_plain_speed(&c).is_err(),
+            "a ramp is another speed even when it holds 1x"
+        );
     }
 }

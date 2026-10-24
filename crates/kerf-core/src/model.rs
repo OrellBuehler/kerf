@@ -5142,6 +5142,8 @@ impl Timeline {
 mod channels;
 mod ramp_edit;
 #[cfg(test)]
+mod ramp_link_tests;
+#[cfg(test)]
 mod ramp_tests;
 mod speed_ramp;
 use channels::channel_changes;

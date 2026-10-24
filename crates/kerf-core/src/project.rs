@@ -7994,6 +7994,10 @@ mod review_tests;
 #[cfg(test)]
 mod task_tests;
 
+/// Speed ramps at the project level: one revision, the length change rippling, a linked sound, a head trim.
+#[cfg(test)]
+mod ramp_tests;
+
 /// The Rust half of the differential corpus the browser harness is replayed against.
 #[cfg(test)]
 mod linked_corpus;

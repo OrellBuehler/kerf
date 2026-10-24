@@ -316,7 +316,7 @@ fn a_roll_stops_where_a_ramped_clip_runs_out_of_footage() {
     let t = lane(vec![a.clone(), b]);
     let range = t.roll_range(ia, ib, &footage(17.0)).unwrap();
     near(range.max, 1.0);
-    let mut rolled = t.clone();
+    let mut rolled = t;
     let out = rolled.roll_edit(ia, ib, 5.0, &footage(17.0)).unwrap();
     assert!(out.clamped);
     near(out.applied, 1.0);

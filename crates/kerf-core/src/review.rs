@@ -1219,6 +1219,35 @@ mod tests {
     }
 
     #[test]
+    fn a_ramped_clip_is_compared_at_the_speed_it_ends_and_begins_at() {
+        use crate::model::SpeedKey;
+        let a = av_asset(Uuid::new_v4(), 100.0);
+        let crawl = |at: f64, source_in: f64| {
+            let mut c = Clip::new(a.id, source_in, source_in + 1.0, at);
+            c.speed_ramp = vec![SpeedKey::new(0.0, 0.5)];
+            c
+        };
+        // Both crawl at half speed (2 s each) and the second resumes a second later in the footage: a jump.
+        let t = on_v1(vec![crawl(0.0, 10.0), crawl(2.0, 12.0)]);
+        let issues = found(&inputs(t, vec![a.clone()], vec![]), Check::JumpCut);
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        // One at full speed is not the same shot carrying on.
+        let mut fast = Clip::new(a.id, 12.0, 13.0, 2.0);
+        fast.speed = 1.0;
+        let t = on_v1(vec![crawl(0.0, 10.0), fast]);
+        assert!(found(&inputs(t, vec![a.clone()], vec![]), Check::JumpCut).is_empty());
+        // A ramped clip split in two plays on across the cut: nothing jumps, nothing is a "hard cut".
+        let mut ramp_clip = Clip::new(a.id, 10.0, 16.0, 0.0);
+        ramp_clip.speed_ramp = vec![SpeedKey::new(0.0, 1.0), SpeedKey::new(4.0, 0.25)];
+        let mut t = on_v1(vec![ramp_clip.clone()]);
+        let (left, right) = t.split_clip(ramp_clip.id, 2.0).unwrap();
+        assert!(found(&inputs(t.clone(), vec![a.clone()], vec![]), Check::JumpCut).is_empty());
+        let r = review(&inputs(t, vec![a.clone()], vec![]), None, &[Check::HardAudioCut]);
+        assert!(r.issues.is_empty(), "{:?}", r.issues);
+        assert_eq!(left.timeline_end(), right.timeline_start);
+    }
+
+    #[test]
     fn black_between_pictures_is_a_gap_and_after_the_last_a_tail() {
         let a = av_asset(Uuid::new_v4(), 100.0);
         let music = test_asset(vec![audio_stream(48_000, 2)]);

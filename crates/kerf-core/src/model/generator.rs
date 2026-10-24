@@ -8,7 +8,7 @@
 //!
 //! **Its source is the generator's own clock**: `source_in` / `source_out` are seconds of the document
 //! (`source_in` is what a head trim or a slice cut off the front, as `SvgOverlay::offset` is for a floating
-//! title), the speed is always 1 and it never plays backwards. It has no sound. It may run as long as a
+//! title), the speed is always 1 (no ramp either) and it never plays backwards. It has no sound. It may run as long as a
 //! floating title may ([`MAX_SVG_SECONDS`]); past the end of its animations the document holds its last
 //! state, so extending the clip holds the end of the title.
 //!
@@ -307,6 +307,13 @@ mod tests {
         let v = t.first_track_of(StreamKind::Video).unwrap();
         let mut clip = Clip::title(title("x"), 0.0, 2.0);
         clip.speed = 2.0;
+        t.track_mut(v).unwrap().clips.push(clip);
+        assert!(t.check().unwrap_err().to_string().contains("plays at its own speed"));
+
+        let mut t = Timeline::new();
+        let v = t.first_track_of(StreamKind::Video).unwrap();
+        let mut clip = Clip::title(title("x"), 0.0, 2.0);
+        clip.speed_ramp = vec![crate::model::SpeedKey::new(0.0, 1.0)];
         t.track_mut(v).unwrap().clips.push(clip);
         assert!(t.check().unwrap_err().to_string().contains("plays at its own speed"));
 

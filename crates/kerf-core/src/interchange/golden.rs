@@ -245,3 +245,62 @@ fn an_edl_of_a_missing_track_is_refused_and_reels_stay_unique() {
     .unwrap();
     assert!(text.contains("SHOT_A ") && text.contains("SHOT_A2 "), "{text}");
 }
+
+/// No interchange format here can write a rate that changes: the event is written at the clip's average
+/// speed — so it still covers the footage the clip plays — and the report says so.
+#[test]
+fn a_speed_ramp_is_written_at_its_average_speed_and_said_so() {
+    use crate::model::SpeedKey;
+    let a = asset(1, "/m/shot.mov", 100.0, false);
+    let mut ramped = clip(11, &a, 10.0, 16.0, 0.0);
+    // 1x easing down to 0.5x over two seconds, then 0.5x: 1.5 + 4.5 source seconds make 11 s.
+    ramped.speed_ramp = vec![SpeedKey::new(0.0, 1.0), SpeedKey::new(2.0, 0.5)];
+    assert_eq!(ramped.duration(), 11.0);
+    let tl = Timeline {
+        tracks: vec![track(101, StreamKind::Video, "V1", vec![ramped.clone()])],
+        ..Timeline::new()
+    };
+    let opts = InterchangeOptions {
+        rate: 24.0,
+        title: "ramp".into(),
+        video_track: 0,
+    };
+
+    let (edl, report) = export(InterchangeFormat::Edl, &tl, std::slice::from_ref(&a), &opts).unwrap();
+    assert!(
+        report
+            .to_string()
+            .contains("warning: speed ramps were written at their average speed"),
+        "{report}"
+    );
+    assert!(edl.contains("00:00:10:00 00:00:16:00 01:00:00:00 01:00:11:00"), "{edl}");
+    assert!(edl.contains("M2   ") && edl.contains(" 013.1 "), "{edl}");
+
+    let (otio, report) = export(InterchangeFormat::Otio, &tl, std::slice::from_ref(&a), &opts).unwrap();
+    assert!(
+        report
+            .to_string()
+            .contains("warning: speed ramps were written at their average speed"),
+        "{report}"
+    );
+    let doc: serde_json::Value = serde_json::from_str(&otio).unwrap();
+    let clip_json = &doc["tracks"]["children"][0]["children"][0];
+    let scalar = clip_json["effects"][0]["time_scalar"].as_f64().unwrap();
+    assert!((scalar - 6.0 / 11.0).abs() < 1e-9, "{scalar}");
+    // The ramp itself is not lost: it travels in metadata.kerf for Kerf to read back.
+    assert_eq!(clip_json["metadata"]["kerf"]["speed_ramp"].as_array().unwrap().len(), 2);
+
+    // A reversed clip keeps its direction.
+    let mut backwards = ramped;
+    backwards.speed = -1.0;
+    let tl = Timeline {
+        tracks: vec![track(101, StreamKind::Video, "V1", vec![backwards])],
+        ..Timeline::new()
+    };
+    let (otio, _) = export(InterchangeFormat::Otio, &tl, std::slice::from_ref(&a), &opts).unwrap();
+    let doc: serde_json::Value = serde_json::from_str(&otio).unwrap();
+    let scalar = doc["tracks"]["children"][0]["children"][0]["effects"][0]["time_scalar"]
+        .as_f64()
+        .unwrap();
+    assert!((scalar + 6.0 / 11.0).abs() < 1e-9, "{scalar}");
+}

@@ -506,13 +506,44 @@
   `MAX_HITS` (a note in the report says how many were left out) and the score returned is `validate()`d. The report lists every cut's
   `before` / `after` reading (on beat, on downbeat, offset) and the counts.
 - **Limits that keep a project loadable.** A clip's speed is `MIN_SPEED..=MAX_SPEED`
-  (0.01×..100×, either sign) — `set_speed` and the ratio `set_speed_linked` hands each partner
+  (0.01×..100×, either sign; so is every key of a speed ramp) — `set_speed` and the ratio `set_speed_linked` hands each partner
   both hold it (the audio tempo is one `atempo` step per doubling). `Mask::normalized` maps a
   non-finite size to a default instead of clamping `NaN` through. `Project`'s writes also run a
   serde walk (`finite.rs`, `first_non_finite`) over every timeline before it is stored: serde_json
   writes `NaN` as `null`, which a plain number field cannot read back, so one poisoned number would
   stop the project opening. The setters refuse non-finite input themselves with a message; the walk
   is the net under every op that computes a number.
+- **Speed ramps** (`model/speed_ramp.rs`: the type and the time map; `model/ramp_edit.rs`: the edits and the diff text; pure +
+  unit-tested in `ramp_tests.rs` / `ramp_link_tests.rs`). `Clip.speed_ramp: Vec<SpeedKey>` (absent when empty; schema v14) makes a
+  clip's rate change over its length. A `SpeedKey` is a clip-local **timeline** time, a speed magnitude (`MIN_SPEED..=MAX_SPEED`)
+  and the `RampEasing` of the segment leaving it (`linear`, the default and omitted, or `hold`). Before the first key the clip
+  runs at the first key's speed, after the last at the last's, between two keys the speed is a straight line in timeline time
+  (a trapezoid of source distance, a quadratic-root inverse) or held. The direction is still `speed`'s sign; its magnitude is
+  **not read** while a ramp is set. A ramp the map cannot read (`ramp_is_valid`: 1..=`MAX_SPEED_KEYS` (16) keys, strictly
+  increasing times within ±`MAX_RAMP_TIME` (1e6 s: the squared segment lengths stay finite, so the map never returns a NaN),
+  speeds in range) is ignored — the clip plays at its constant speed — and flagged by the invariants (`Rule::ClipSpeedRamp`), so
+  an old or hand-edited file still opens and no edit introduces one. **One map**: `Clip::along(local)` /
+  `local_at_along(along)` (plus `speed_at`, `mean_speed`, `is_ramped`); `duration`, `source_to_timeline`, `timeline_to_source`
+  read it, and anything that converts between the two clocks must too, never `speed_mag()` — an unramped clip keeps its old
+  `* speed` / `/ speed` arithmetic to the last bit, which is why no graph, golden or corpus case moved.
+  **Edits keep every frame on its footage.** A *head* move rebases the ramp (`Clip::rebase_ramp`, called from
+  `rebase_animation`, so from `move_head`, split's right half, `slice`, `cut_range_pieces`' tail and a linked partner's trim; and
+  from `Project::trim` through `follow_head`, which reads the head off the source in-points through the old ramp): a key at 0
+  with the speed at the cut — the easing of the segment the cut fell in, so a hold keeps holding — keys at or before the cut
+  dropped, the rest shifted back; a cut before the first key pins nothing (same curve, the cap is never exceeded); pulled
+  earlier every key shifts later and the new head runs at the first key's speed; keys that round onto one another are
+  dropped, never the ramp. A *tail* move (`move_tail`, `Clip::tail_shift`) leaves the keys and takes the source the ramp plays
+  there (`along(d + by) − S`); `handles` (what roll, slide and carried trims clamp to) are what the footage either side plays
+  for through the ramp; a slip keeps keys and length (the area under the curve is the source span); `slice`, the beat snap,
+  `fit_end` and the span `cut_range_pieces` removes go through the map. `Project::set_speed_ramp(clip, keys)`
+  (`Timeline::set_speed_ramp` / `set_speed_ramp_linked`, label "Set speed ramp") keeps the window and changes the length, so it
+  ripples like `set_speed`; `check_speed_ramp` takes ≤16 keys at times `0..=MAX_RAMP_TIME` with finite speeds in range, no two
+  at one time (sorted for you); no keys clears, and clearing a ramp that is not there is an error. `set_speed` **replaces** a
+  ramp (on every clip of a link group); linked partners get the same ramp on the timeline (`core-links.md`). A title must have
+  none (`generated_violations`). Diff: `speed ramp 3 keys, 0.30×–2.00×`, `speed ramp cleared`, `speed ramp 3 → 4 keys, …`,
+  `speed ramp retimed` (a head trim) / `changed`. OTIO and EDL cannot carry a ramp: they write the average speed
+  (`export_speed`: `mean_speed` in the clip's direction) with a warning, and OTIO keeps the ramp in `metadata.kerf`. Audio sync
+  and music fit refuse a ramped clip; `review_cut` compares neighbours' speeds at the cut (`pace_gap`).
 - **Animated SVG overlays** (`Timeline.svg_overlays: Vec<SvgOverlay>`, `svg/`, pure +
   unit-tested; the engine side is `engine-cli.md`). An overlay is SMIL-animated vector art
   drawn between `start` and `end`, fit *contain* and centred into the rect `x, y, width, height`

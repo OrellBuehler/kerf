@@ -73,9 +73,13 @@
   follow (V1 `X[0..10]` / A1 `S[9..15]`, cut X 8..10: S's remainder starts at 8, not 9), and
   a partner's leftover is a *linked* clip for the purpose of making room (`settle_linked`:
   linked now ∪ linked before, through `origin`), not an unlinked obstacle; *speed* applies the same
-  **ratio**; *split-and-remove* cuts partners the time is inside; *roll* rolls each
+  **ratio** (and replaces a ramp on every clip of the group); *speed ramp* (`set_speed_ramp_linked`) gives each
+  partner the same ramp **on the timeline** — a key 3 s into the named clip is a key at that moment in a partner that
+  starts earlier or later (keys shifted by the difference of the starts, speeds by the partner's pace over the
+  named clip's at the named clip's start, 1 for an ordinary pair) — so the slow-motion happens at once in picture
+  and sound; *split-and-remove* cuts partners the time is inside; *roll* rolls each
   partner pair sharing the cut, *slip* the same timeline moment of footage (scaled by the
-  speed ratio, stills skipped), *slide* each partner with its own neighbours — all clamped
+  speed ratio, 1 between two clips on the same ramp, a refusal between a ramp and another pace; stills skipped), *slide* each partner with its own neighbours — all clamped
   to the **intersection of the members' ranges**; the beat snap re-syncs afterwards
   (`carry_links_since`).
   **The sync lock is range-based (`Timeline::conform_links`)** — *what in step means* is
@@ -147,7 +151,7 @@
   `unlinked` / `own sound off|on`. `Project::sample()` seeds its interview sound
   detached-then-*unlinked*.
   **The browser harness is held to all of it by a differential corpus**: `project/linked_corpus.rs`
-  writes 102 edits (random J/L, mirrored and titled cuts, plus hand-made cases for every
+  writes 114 edits (random J/L, mirrored and titled cuts, plus hand-made cases for every
   rule above — both partners named, a cut's leftover and its lone resumed piece, a picture
   victim, the 0.05 s floor, a lead lost at 0) with the answer `Project` gave — canonical timeline (no ids: clips an edit
   creates have random ones), revision label, report or the exact refusal — to
@@ -158,3 +162,16 @@
   The fixture is pinned `eol=lf` in `.gitattributes` (like the golden argv files) *and* the
   freshness test compares with `\r\n` normalized, so a Windows checkout with `autocrlf`
   cannot fail it for a line ending.
+  **Speed ramps change what "in step" is measured by.** A ramped clip has no offset to compare: `content_offset` is a
+  point *outside* the window, reached by running the first key's speed backwards, and a head trim (which rebases the ramp
+  and so changes that speed) would move it while moving no footage — a partner would be shifted for nothing. So with a ramp
+  in a group, `content_shift` measures a member by the timeline time at which it plays one footage point (`step_anchor`: the
+  middle of the footage every member of that asset holds before and after the edit, so a picture and its L-cut sound are
+  judged at the same footage), and the guard (`first_sync_break`, `sound_already_playing`) by `same_pace` (the same speed at
+  every key of either and between them, over the time the clips share, in the same direction) and `step_gap` (how much
+  later `b` plays what `a` plays at one shared moment). Unramped groups keep the offset arithmetic bit for bit. A trim carried
+  to a ramped partner reads the head from the footage between the in-points through `was`'s ramp (`extent_edit`), and
+  moves it by the same timeline seconds, so both rebase alike. `detach_audio` and stem placement copy the ramp.
+  `linked_corpus.rs` has 12 ramp cases on a mirrored pair (set / clear / ripple / links off / `set_speed` / trims /
+  splits / cut range / split-and-remove); J/L pairs with a ramp are tested in `model/ramp_link_tests.rs` instead (an
+  edit that changes the speed a lead-in runs at pulls the sound out of step with its picture, and the guard refuses it).

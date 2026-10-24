@@ -6,7 +6,8 @@ use std::cell::Cell;
 
 use kerf_core::hostile::assert_no_panic;
 use kerf_core::{
-    decode_caption_bytes, parse_ass, parse_captions, parse_srt, CaptionFormat, CaptionImportRequest, Project, Timeline,
+    decode_caption_bytes, parse_ass, parse_captions, parse_srt, CaptionFormat, CaptionImportRequest, Project, RampEasing,
+    SpeedKey, Timeline, MAX_RAMP_TIME, MAX_SPEED, MIN_SPEED,
 };
 
 const ROUNDS: usize = 1500;
@@ -102,9 +103,113 @@ fn read_timeline(base: &Timeline, bytes: &[u8]) {
 /// staged copy, and read back on every open; a damaged blob is a load error, not a panic.
 #[test]
 fn hostile_stored_timelines_never_panic() {
-    let base = Project::sample().unwrap().timeline().unwrap();
+    let mut base = Project::sample().unwrap().timeline().unwrap();
+    // A speed ramp in the file, so the mutations land on its keys too.
+    base.tracks[0].clips[0].speed_ramp = vec![
+        SpeedKey::new(0.0, 1.0),
+        SpeedKey {
+            time: 1.5,
+            speed: 0.25,
+            easing: RampEasing::Hold,
+        },
+        SpeedKey::new(2.5, 2.0),
+    ];
     let json = serde_json::to_vec(&base).unwrap();
     assert_no_panic("stored timeline", &[&json], ROUNDS, |b| read_timeline(&base, b));
+}
+
+/// A ramp somebody wrote by hand: keys out of order, twice at one time, off to the edge of the number line,
+/// speeds of zero or ten thousand, a thousand of them. The map must never panic or hand back a number that is
+/// not one: a ramp it cannot read is ignored (the clip plays at its constant speed), one it can read is finite
+/// everywhere, and the invariant net flags the unreadable ones so no edit introduces one.
+#[test]
+fn hostile_speed_ramps_never_panic_or_produce_a_nan() {
+    let key = |time: f64, speed: f64| SpeedKey::new(time, speed);
+    let many = |n: usize| (0..n).map(|i| key(i as f64, 1.0 + (i % 7) as f64)).collect::<Vec<_>>();
+    let cases: Vec<(&str, Vec<SpeedKey>)> = vec![
+        ("nan time", vec![key(f64::NAN, 1.0)]),
+        ("inf time", vec![key(0.0, 1.0), key(f64::INFINITY, 2.0)]),
+        ("nan speed", vec![key(0.0, f64::NAN)]),
+        ("inf speed", vec![key(0.0, f64::INFINITY)]),
+        ("zero speed", vec![key(0.0, 0.0)]),
+        ("negative speed", vec![key(0.0, -3.0), key(1.0, 2.0)]),
+        ("huge speed", vec![key(0.0, 1e300)]),
+        ("tiny speed", vec![key(0.0, 1e-300)]),
+        ("out of order", vec![key(5.0, 1.0), key(1.0, 2.0), key(3.0, 3.0)]),
+        ("twice at a time", vec![key(1.0, 1.0), key(1.0, 5.0)]),
+        ("huge times", vec![key(0.0, 1.0), key(1e300, 100.0)]),
+        (
+            "the edge of the cap",
+            vec![key(-MAX_RAMP_TIME, MIN_SPEED), key(MAX_RAMP_TIME, MAX_SPEED)],
+        ),
+        (
+            "past the cap",
+            vec![key(-MAX_RAMP_TIME * 2.0, MIN_SPEED), key(MAX_RAMP_TIME * 2.0, MAX_SPEED)],
+        ),
+        (
+            "keys a hair apart",
+            vec![key(1.0, MIN_SPEED), key(1.0 + f64::EPSILON, MAX_SPEED), key(2.0, MIN_SPEED)],
+        ),
+        ("keys a denormal apart", vec![key(0.0, MIN_SPEED), key(5e-324, MAX_SPEED)]),
+        ("one key", vec![key(3.0, 2.0)]),
+        ("too many", many(17)),
+        ("a thousand", many(1000)),
+        ("the most", many(16)),
+        (
+            "all holds",
+            (0..16)
+                .map(|i| SpeedKey {
+                    time: i as f64 * 0.25,
+                    speed: MAX_SPEED,
+                    easing: RampEasing::Hold,
+                })
+                .collect(),
+        ),
+    ];
+    let base = Project::sample().unwrap().timeline().unwrap();
+    for (what, keys) in cases {
+        for speed in [1.0, -1.0, 0.01, 100.0, f64::NAN] {
+            let mut t = base.clone();
+            {
+                let c = &mut t.tracks[0].clips[0];
+                c.speed_ramp = keys.clone();
+                c.speed = speed;
+            }
+            let c = t.tracks[0].clips[0].clone();
+            let label = format!("{what} at speed {speed}");
+            if speed.is_finite() {
+                for x in [-1e9, -3.0, -0.5, 0.0, 0.25, 1.0, 7.5, 1e3, 1e9] {
+                    assert!(c.along(x).is_finite(), "{label}: along({x})");
+                    assert!(c.local_at_along(x).is_finite(), "{label}: local_at_along({x})");
+                    assert!(c.speed_at(x).is_finite(), "{label}: speed_at({x})");
+                    assert!(c.timeline_to_source(x).is_finite(), "{label}: timeline_to_source({x})");
+                    assert!(c.source_to_timeline(x).is_finite(), "{label}: source_to_timeline({x})");
+                }
+                assert!(c.duration().is_finite() && c.duration() >= 0.0, "{label}: duration");
+                assert!(c.mean_speed().is_finite(), "{label}: mean_speed");
+            }
+            // Whatever it is, the engine's reads of the cut do not panic.
+            let _ = t.duration();
+            let _ = t.slice(0.0, t.duration() / 2.0);
+            let _ = t.slice(0.1, 0.2);
+            let _ = t.diff(&base);
+            let _ = base.diff(&t);
+            let _ = t.for_render().duration();
+            if !keys.is_empty() && c.ramp().is_none() {
+                assert!(
+                    t.check().is_err(),
+                    "{label}: an unreadable ramp must be flagged by the invariants"
+                );
+            }
+            let mut edited = t.clone();
+            let _ = edited.split_clip(c.id, c.timeline_start + c.duration() / 2.0);
+            let mut edited = t.clone();
+            let _ = edited.set_speed_ramp(c.id, keys.clone());
+            if let Ok(json) = serde_json::to_string(&t) {
+                let _ = serde_json::from_str::<Timeline>(&json);
+            }
+        }
+    }
 }
 
 /// A `.kerftemplate` arrives by email: its zip, its manifest and the values a surface hands the splice

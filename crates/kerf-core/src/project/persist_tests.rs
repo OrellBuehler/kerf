@@ -114,19 +114,19 @@ fn a_legacy_file_is_backed_up_once_then_upgraded() {
 }
 
 /// The columns are there, so their steps change nothing; the file is still copied aside, once,
-/// for v5 to v13 (JSON steps: `needed` always, so an older build's file is kept before it is locked out).
+/// for v5 to v14 (JSON steps: `needed` always, so an older build's file is kept before it is locked out).
 #[test]
 fn a_legacy_file_that_already_has_the_columns_is_backed_up_only_for_the_json_step() {
     let dir = scratch();
     let path = dir.join("cut.kerf");
     edited(1).0.save_as(&path).unwrap();
     make_legacy(&path, true);
-    // Every step that adds a table or a column finds it there; only v5 to v13 (JSON steps) are pending.
+    // Every step that adds a table or a column finds it there; only v5 to v14 (JSON steps) are pending.
     let pending: Vec<u32> = store::pending_steps(&Connection::open(&path).unwrap(), 0);
     assert_eq!(
         pending,
-        vec![4, 5, 6, 7, 8, 9, 10, 11, 12],
-        "only the v4 -> v5 to v12 -> v13 steps"
+        vec![4, 5, 6, 7, 8, 9, 10, 11, 12, 13],
+        "only the v4 -> v5 to v13 -> v14 steps"
     );
     drop(Project::open(&path).unwrap());
     assert_eq!(version_of(&path), SCHEMA_VERSION);
@@ -255,7 +255,7 @@ fn a_v2_file_is_backed_up_once_then_gets_the_fonts_table() {
     let path = dir.join("cut.kerf");
     edited(2).0.save_as(&path).unwrap();
     make_v2(&path);
-    assert_eq!(SCHEMA_VERSION, 13);
+    assert_eq!(SCHEMA_VERSION, 14);
     assert!(!has_fonts_table(&path));
 
     let project = Project::open(&path).unwrap();
@@ -285,7 +285,7 @@ fn a_v2_file_is_backed_up_once_then_gets_the_fonts_table() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// The fonts table is there, so v3 changes nothing; the one backup is for v5 to v13 (JSON steps).
+/// The fonts table is there, so v3 changes nothing; the one backup is for v5 to v14 (JSON steps).
 #[test]
 fn a_v2_file_that_already_has_the_fonts_table_is_backed_up_only_for_the_json_step() {
     let dir = scratch();
@@ -297,7 +297,7 @@ fn a_v2_file_that_already_has_the_fonts_table_is_backed_up_only_for_the_json_ste
         .unwrap();
     assert_eq!(
         store::pending_steps(&Connection::open(&path).unwrap(), 2),
-        vec![4, 5, 6, 7, 8, 9, 10, 11, 12]
+        vec![4, 5, 6, 7, 8, 9, 10, 11, 12, 13]
     );
     drop(Project::open(&path).unwrap());
     assert_eq!(version_of(&path), SCHEMA_VERSION);
@@ -573,7 +573,7 @@ fn a_v8_file_is_backed_up_stamped_v9_and_keeps_its_animated_title() {
         .unwrap();
     assert_eq!(
         store::pending_steps(&Connection::open(&path).unwrap(), 8),
-        vec![8, 9, 10, 11, 12]
+        vec![8, 9, 10, 11, 12, 13]
     );
 
     let project = Project::open(&path).unwrap();
@@ -602,7 +602,7 @@ fn a_v7_file_is_backed_up_stamped_v8_and_keeps_its_outlined_title() {
         .unwrap();
     assert_eq!(
         store::pending_steps(&Connection::open(&path).unwrap(), 7),
-        vec![7, 8, 9, 10, 11, 12]
+        vec![7, 8, 9, 10, 11, 12, 13]
     );
 
     let project = Project::open(&path).unwrap();
@@ -640,7 +640,7 @@ fn a_v6_file_is_backed_up_stamped_v7_and_keeps_its_keyed_mask_and_crop() {
         .unwrap();
     assert_eq!(
         store::pending_steps(&Connection::open(&path).unwrap(), 6),
-        vec![6, 7, 8, 9, 10, 11, 12]
+        vec![6, 7, 8, 9, 10, 11, 12, 13]
     );
 
     let project = Project::open(&path).unwrap();
@@ -714,7 +714,7 @@ fn a_v9_file_is_backed_up_stamped_v10_and_its_assets_read_as_range_unknown() {
         .unwrap();
     assert_eq!(
         store::pending_steps(&Connection::open(&path).unwrap(), 9),
-        vec![9, 10, 11, 12]
+        vec![9, 10, 11, 12, 13]
     );
 
     let project = Project::open(&path).unwrap();
@@ -755,7 +755,10 @@ fn a_v10_file_is_backed_up_stamped_v11_and_keeps_its_eased_title() {
         .unwrap()
         .pragma_update(None, "user_version", 10)
         .unwrap();
-    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 10), vec![10, 11, 12]);
+    assert_eq!(
+        store::pending_steps(&Connection::open(&path).unwrap(), 10),
+        vec![10, 11, 12, 13]
+    );
 
     let project = Project::open(&path).unwrap();
     assert_eq!(version_of(&path), SCHEMA_VERSION);
@@ -797,7 +800,7 @@ fn a_v11_file_is_backed_up_stamped_v12_and_keeps_its_delivery_frame_rate() {
         .unwrap()
         .pragma_update(None, "user_version", 11)
         .unwrap();
-    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 11), vec![11, 12]);
+    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 11), vec![11, 12, 13]);
 
     let project = Project::open(&path).unwrap();
     assert_eq!(version_of(&path), SCHEMA_VERSION);
@@ -830,7 +833,7 @@ fn a_v12_file_is_backed_up_stamped_v13_and_keeps_its_thumbnails() {
         .unwrap()
         .pragma_update(None, "user_version", 12)
         .unwrap();
-    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 12), vec![12]);
+    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 12), vec![12, 13]);
 
     let project = Project::open(&path).unwrap();
     assert_eq!(version_of(&path), SCHEMA_VERSION);
@@ -840,6 +843,39 @@ fn a_v12_file_is_backed_up_stamped_v13_and_keeps_its_thumbnails() {
         version_of(&schema_backup_path(&path, 12)),
         12,
         "an older build drops the thumbnails, so the file as it was is kept"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A speed ramp is kept as it is, and a clip stored before v14 has none, written as it always was. The file is
+/// copied aside, since an older build drops the ramp at its next write and the clip then plays at one speed.
+#[test]
+fn a_v13_file_is_backed_up_stamped_v14_and_keeps_its_speed_ramps() {
+    use crate::model::SpeedKey;
+    let dir = scratch();
+    let path = dir.join("cut.kerf");
+    let (project, _) = edited(1);
+    let json = timeline_to_json(&project.timeline().unwrap()).unwrap();
+    assert!(!json.contains("speed_ramp"), "none is written: {json}");
+    let clip = project.timeline().unwrap().tracks[0].clips[0].id;
+    let keys = vec![SpeedKey::new(0.0, 2.0), SpeedKey::new(0.5, 0.25)];
+    project.set_speed_ramp(clip, keys.clone()).unwrap();
+    project.save_as(&path).unwrap();
+    drop(project);
+    Connection::open(&path)
+        .unwrap()
+        .pragma_update(None, "user_version", 13)
+        .unwrap();
+    assert_eq!(store::pending_steps(&Connection::open(&path).unwrap(), 13), vec![13]);
+
+    let project = Project::open(&path).unwrap();
+    assert_eq!(version_of(&path), SCHEMA_VERSION);
+    assert_eq!(project.timeline().unwrap().tracks[0].clips[0].speed_ramp, keys);
+    drop(project);
+    assert_eq!(
+        version_of(&schema_backup_path(&path, 13)),
+        13,
+        "an older build drops the ramp, so the file as it was is kept"
     );
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -858,6 +894,7 @@ const PERSISTED: &[(u32, &str)] = &[
     (11, include_str!("persisted/timelines-v11.json")),
     (12, include_str!("persisted/timelines-v12.json")),
     (13, include_str!("persisted/timelines-v13.json")),
+    (14, include_str!("persisted/timelines-v14.json")),
 ];
 
 fn persisted_path(version: u32) -> PathBuf {
@@ -919,6 +956,24 @@ fn the_stored_timeline_shape_moves_only_with_the_schema_version() {
             )
             .unwrap();
         timelines.push(thumbed.timeline().unwrap());
+        // A clip on a speed ramp, one segment held (v14).
+        let ramped = Project::sample().unwrap();
+        let clip = ramped.timeline().unwrap().tracks[0].clips[0].id;
+        ramped
+            .set_speed_ramp(
+                clip,
+                vec![
+                    crate::model::SpeedKey::new(0.0, 1.0),
+                    crate::model::SpeedKey {
+                        time: 1.0,
+                        speed: 0.25,
+                        easing: crate::model::RampEasing::Hold,
+                    },
+                    crate::model::SpeedKey::new(2.0, 2.0),
+                ],
+            )
+            .unwrap();
+        timelines.push(ramped.timeline().unwrap());
         let lines: Vec<String> = timelines.iter().map(|t| serde_json::to_string(t).unwrap()).collect();
         std::fs::write(persisted_path(SCHEMA_VERSION), format!("[\n{}\n]\n", lines.join(",\n"))).unwrap();
         return;
