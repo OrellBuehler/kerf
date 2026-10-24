@@ -7174,6 +7174,41 @@ impl Project {
     pub fn filler_words(&self, asset_id: Uuid, fillers: &[String]) -> Result<Vec<crate::transcript::FillerWord>> {
         Ok(crate::transcript::filler_words(&self.transcript(asset_id)?, fillers))
     }
+
+    /// What [`crate::transcript::search_transcripts`] reads, under the lock: the assets in library order
+    /// (only `asset_ids`, when given), their cached analysis unparsed, and the working timeline.
+    pub fn transcript_search_inputs(&self, asset_ids: Option<&[Uuid]>) -> Result<crate::transcript::TranscriptSearchInputs> {
+        let library = self.list_assets()?;
+        let named: Option<HashSet<Uuid>> = asset_ids.map(|ids| ids.iter().copied().collect());
+        if let Some(missing) = named.iter().flatten().find(|id| !library.iter().any(|a| a.id == **id)) {
+            return Err(Error::AssetNotFound(*missing));
+        }
+        let assets: Vec<crate::transcript::search::SearchAsset> = library
+            .into_iter()
+            .filter(|a| named.as_ref().is_none_or(|n| n.contains(&a.id)))
+            .map(|a| crate::transcript::search::SearchAsset {
+                has_audio: a.has_audio(),
+                named: named.is_some(),
+                id: a.id,
+                name: a.name,
+            })
+            .collect();
+        let mut stmt = self.conn.prepare("SELECT data FROM analysis WHERE asset_id = ?1")?;
+        let mut cached = HashMap::new();
+        for asset in &assets {
+            let data = stmt
+                .query_row(params![asset.id.to_string()], |r| r.get::<_, String>(0))
+                .optional()?;
+            if let Some(data) = data {
+                cached.insert(asset.id, data);
+            }
+        }
+        Ok(crate::transcript::TranscriptSearchInputs {
+            assets,
+            cached,
+            timeline: self.working_timeline()?,
+        })
+    }
 }
 
 /// Refuse a number that is `NaN` or infinite, naming what it was for.
@@ -8351,6 +8386,118 @@ mod tests {
         assert_eq!((fillers[0].start, fillers[0].end), (0.0, 0.3));
         let analysis = project.get_analysis(asset.id).unwrap().unwrap();
         assert!(analysis.ran.contains(&crate::model::AnalysisKind::Transcript));
+
+        let silent = project
+            .insert_or_get_asset(&asset_with("/kerf-silent.mp4", vec![vid_stream(false)]))
+            .unwrap();
+        let spoken = project
+            .insert_or_get_asset(&asset_with("/kerf-untranscribed.mov", vec![aud_stream()]))
+            .unwrap();
+        let clip = project.cut_clip(asset.id, 0.2, 1.0).unwrap();
+        let search = |text: &str, ids: Option<&[Uuid]>| {
+            let inputs = project.transcript_search_inputs(ids).unwrap();
+            let query = crate::transcript::TranscriptQuery {
+                query: text.into(),
+                ..Default::default()
+            };
+            crate::transcript::search_transcripts(inputs, &query).unwrap()
+        };
+        let found = search("UM hello", None);
+        assert_eq!((found.total, found.searched_assets), (1, 1));
+        assert_eq!(found.assets_without_transcript.asset_ids, vec![spoken.id]);
+        let hit = &found.hits[0];
+        assert_eq!((hit.start, hit.end, hit.speaker.as_deref()), (0.0, 0.9, Some("S1")));
+        assert_eq!(hit.in_cut.len(), 1);
+        assert_eq!(hit.in_cut[0].clip_id, clip.id);
+        assert!(hit.in_cut[0].partial);
+        assert!(search("hi", None).hits[0].in_cut.is_empty());
+        let named = search("hi", Some(&[silent.id]));
+        assert_eq!((named.total, named.assets_without_transcript.count), (0, 1));
+        assert!(matches!(
+            project.transcript_search_inputs(Some(&[Uuid::new_v4()])),
+            Err(Error::AssetNotFound(_))
+        ));
+    }
+
+    /// 50 assets × one hour of speech (≈ 9,600 timed words each), timed: what is read under the lock
+    /// and the search after it. Run it with
+    /// `cargo test --release -p kerf-core --no-default-features a_large_library -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    #[allow(clippy::print_stderr)]
+    fn a_large_library_searches_its_transcripts_quickly() {
+        use crate::model::Word;
+        use crate::transcript::{search_transcripts, MatchMode, TranscriptQuery};
+        let vocab = [
+            "so", "we", "went", "out", "to", "the", "lake", "and", "then", "it", "started", "raining", "really", "hard", "café",
+            "don't",
+        ];
+        let project = Project::open_in_memory().unwrap();
+        for a in 0..50 {
+            let asset = project
+                .insert_or_get_asset(&Asset {
+                    duration: 3600.0,
+                    ..asset_with(&format!("/kerf-hour-{a}.mov"), vec![aud_stream()])
+                })
+                .unwrap();
+            let transcript = (0..1200)
+                .map(|l| {
+                    let start = l as f64 * 3.0;
+                    let words: Vec<Word> = (0..8)
+                        .map(|w| Word {
+                            text: vocab[(a * 7 + l * 3 + w) % vocab.len()].into(),
+                            start: start + w as f64 * 0.35,
+                            end: start + w as f64 * 0.35 + 0.3,
+                            confidence: Some(0.9),
+                            speaker: Some(format!("S{}", l % 2 + 1)),
+                            ..Word::default()
+                        })
+                        .collect();
+                    TranscriptSegment {
+                        start,
+                        end: start + 2.8,
+                        text: words.iter().map(|w| w.text.as_str()).collect::<Vec<_>>().join(" "),
+                        words,
+                        speaker: Some(format!("S{}", l % 2 + 1)),
+                    }
+                })
+                .collect();
+            project
+                .merge_analysis(&AssetAnalysis {
+                    asset_id: asset.id,
+                    transcript,
+                    ran: vec![crate::model::AnalysisKind::Transcript],
+                    ..AssetAnalysis::default()
+                })
+                .unwrap();
+            project.cut_clip(asset.id, 60.0, 120.0).unwrap();
+        }
+        let mut report = Vec::new();
+        for (text, mode) in [
+            ("the lake", MatchMode::Phrase),
+            ("raining lake", MatchMode::AllWords),
+            ("the", MatchMode::AnyWord),
+        ] {
+            let t = std::time::Instant::now();
+            let inputs = project.transcript_search_inputs(None).unwrap();
+            let locked = t.elapsed();
+            let bytes: usize = inputs.cached.values().map(String::len).sum();
+            let query = TranscriptQuery {
+                query: text.into(),
+                mode,
+                ..TranscriptQuery::default()
+            };
+            let t = std::time::Instant::now();
+            let found = search_transcripts(inputs, &query).unwrap();
+            assert_eq!(found.searched_assets, 50);
+            report.push(format!(
+                "{mode:?}: {} MB read under the lock in {locked:?}, searched in {:?} ({} hits)",
+                bytes / 1_000_000,
+                t.elapsed(),
+                found.total
+            ));
+        }
+        eprintln!("{}", report.join("\n"));
     }
 
     #[test]

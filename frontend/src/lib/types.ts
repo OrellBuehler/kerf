@@ -1387,6 +1387,59 @@ export interface MissingAsset {
 	clips: number;
 }
 
+/** How the words of a transcript search must appear: in order and adjacent (across lines too), all
+ *  within one line, or any one of them. */
+export type MatchMode = 'phrase' | 'all_words' | 'any_word';
+
+export interface TranscriptQuery {
+	query: string;
+	/** Only these assets; absent searches the whole library. */
+	asset_ids?: string[] | null;
+	speaker?: string | null;
+	mode?: MatchMode;
+	offset?: number | null;
+	/** Default 50, at most 500. */
+	limit?: number | null;
+}
+
+/** A clip of the cut that uses (part of) a hit, in timeline seconds. */
+export interface CutUse {
+	clip_id: string;
+	track_id: string;
+	start: number;
+	end: number;
+	/** The clip holds only part of the hit. */
+	partial?: boolean;
+	disabled?: boolean;
+}
+
+export interface TranscriptHit {
+	asset_id: string;
+	asset_name: string;
+	/** Source seconds, first matched word's start to the last one's end. */
+	start: number;
+	end: number;
+	speaker?: string;
+	text: string;
+	/** The line(s) around the match, the match between « and ». */
+	context: string;
+	words_estimated?: boolean;
+	/** Empty when the cut does not use it. */
+	in_cut: CutUse[];
+}
+
+export interface TranscriptSearch {
+	mode: MatchMode;
+	total: number;
+	offset: number;
+	returned: number;
+	next_offset?: number;
+	searched_assets: number;
+	/** Assets with sound (or named) not transcribed yet: how many, and the first ids. */
+	assets_without_transcript: { count: number; asset_ids: string[] };
+	hits: TranscriptHit[];
+}
+
 export type TaskStatus = 'queued' | 'working' | 'ready' | 'done' | 'failed';
 
 export interface Task {

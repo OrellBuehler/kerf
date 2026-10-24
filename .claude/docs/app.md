@@ -49,7 +49,9 @@ released), `relink_asset { assetId, newPath }` → `Relinked` (`relink_inputs` u
 comparison of both files' ends — with it released, `apply_relink_probed` under it, `forget_media_caches` released
 again; `cancel_import` stops the probe), `check_relink { assetId, newPath }` → `RelinkCheck {analysis_kept, has_analysis}` (the same
 lock-free probe and refusals, changing nothing: what a relink would cost, so the prompt can say a different recording drops the analysis first), `missing_assets` → `MissingAsset[]` (`missing_assets_inputs` under the lock,
-`find_missing_assets` stat-ing the files with it released: a share that went away can take long to say so), `paths_exist { paths }` → `boolean[]` (the export dialog's
+`find_missing_assets` stat-ing the files with it released: a share that went away can take long to say so), `search_transcripts
+{ query: TranscriptQuery }` → `TranscriptSearch` (the MCP tool's search over the user's cut: `transcript_search_inputs` under the
+lock, parsed and matched with it released), `paths_exist { paths }` → `boolean[]` (the export dialog's
 overwrite check), `recent_projects`, `open_recent { path }` (a vanished file is dropped from the list, never created —
 `open_project` refuses a path that names nothing too) and `clear_recent_projects`. Staged proposals:
 `apply_staged_subset { entryIds, force? }` → `SubsetApplied`, `undo_staged_edit` → `{label, staged}`,
@@ -374,8 +376,8 @@ comes back `ForbiddenUrl` and the "Release notes" button silently does nothing.
 *project* `project_path`, `new_project`, `open_project`, `save_project_as`, `recent_projects`, `open_recent`,
 `clear_recent_projects`, `take_launch_project`, `show_main_window`, `list_recoveries`, `recover_project`, `discard_recovery`,
 `discard_recovery_at_exit`; *library* `list_assets`, `get_asset_metadata`,
-`list_fonts`, `import_asset`, `cancel_import`, `remove_asset`, `relink_asset`, `check_relink`, `missing_assets`, `paths_exist`,
-`set_asset_projection`; *analysis, proxies, transcription* `analyze_asset`, `cancel_analysis`, `analysis_statuses`,
+`list_fonts`, `import_asset`, `cancel_import`, `remove_asset`, `relink_asset`, `check_relink`, `missing_assets`, `search_transcripts`,
+`paths_exist`, `set_asset_projection`; *analysis, proxies, transcription* `analyze_asset`, `cancel_analysis`, `analysis_statuses`,
 `proxy_statuses`, `rebuild_proxy`, `delete_proxy`, `transcription_status`, `set_speech_model`, `download_speech_model`,
 `cancel_model_download`; *voiceover, music, stems, mixing* `voiceover_status`, `prepare_voiceover`, `generate_voiceover`,
 `cancel_voiceover`, `music_status`, `prepare_music`, `compose_music`, `cancel_music`, `get_band_balance`,

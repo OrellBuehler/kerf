@@ -428,7 +428,13 @@ false) adds the words, estimated on the fly for a transcript cached before words
 speaker's source-time ranges (by each word's label, not the line's majority; a window of `limit` ≤ 2000 per speaker, `total_ranges`
 and `more` say what is left) and speaking time.
 `find_filler_words { asset_id, fillers?, offset?, limit? }` (≤ 100 fillers) returns fillers by word bounds for
-`cut_clip_range`, paged (`total`, `next_offset`; `limit` ≤ 1000). `refine_transcript { asset_id, background? }` re-times words and labels speakers on a cached
+`cut_clip_range`, paged (`total`, `next_offset`; `limit` ≤ 1000). `search_transcripts { query, asset_ids?, speaker?, mode?,
+offset?, limit? }` (`reads.rs`, also the `search_transcripts` command) is "where does anyone say X" over the whole library
+(`transcript::search`, `engine-media.md`): hits in library order then time (`limit` 50, ≤ 500), each with word-exact source
+`start`/`end`, `speaker`, `context` (match between « and »), `words_estimated` and `in_cut` (the working timeline's clips using
+the range, timeline seconds, `partial` / `disabled`), plus `searched_assets` and `assets_without_transcript` (count + first ten
+ids; an asset with no sound counts only when named). The cached analysis JSON is read under `lock_agent_as`
+(`transcript_search_inputs`), parsed and matched on `blocking` with the lock released. `refine_transcript { asset_id, background? }` re-times words and labels speakers on a cached
 transcript through `crate::run_refine`, the Tauri command's body: background lane, `analysis-progress`,
 stopped by the request's cancellation or the GUI's analysis Stop (`begin_analysis`), refused if a newer
 transcript landed meanwhile or the project was replaced (`require_generation`), `analysis-status` after
@@ -646,7 +652,7 @@ Every tool, by purpose (a test pins that this list names each registered tool, a
 - **Project and library**: `project_info`, `save_project`, `save_project_as`, `open_project`, `new_project`, `list_assets`,
   `missing_assets`, `get_asset_metadata`, `import_asset`, `set_asset_projection`, `list_fonts`.
 - **Analysis and proxies**: `analyze_asset`, `analysis_status`, `get_transcript`, `speaker_ranges`, `find_filler_words`,
-  `refine_transcript`, `get_analysis_detail`,
+  `search_transcripts`, `refine_transcript`, `get_analysis_detail`,
   `transcription_status`, `download_speech_model`, `set_speech_model`, `proxy_status`, `rebuild_proxy`, `delete_proxy`,
   `get_music_structure`.
 - **Looking and measuring**: `get_editing_guide`, `timeline_summary`, `get_timeline_state`, `get_editor_context`, `get_scopes`, `skim_asset`, `get_frame`, `preview_timeline`,

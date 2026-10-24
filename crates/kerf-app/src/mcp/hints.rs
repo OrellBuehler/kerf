@@ -58,6 +58,7 @@ pub(super) const TOOLS: &[(&str, &str, Effect)] = &[
     ("get_transcript", "Transcript", Read),
     ("speaker_ranges", "Speaker time ranges", Read),
     ("find_filler_words", "Find filler words", Read),
+    ("search_transcripts", "Search transcripts", Read),
     ("refine_transcript", "Refine transcript", Set),
     ("proxy_status", "Proxy status", Read),
     ("analysis_status", "Analysis status", Read),

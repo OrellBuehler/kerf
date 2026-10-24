@@ -6560,7 +6560,8 @@ const INSTRUCTIONS: &str = "Kerf is the video editor open on this computer, and 
              templates, music, voiceover, delivery formats, loudness, jobs) and what a refusal means. \
              The loop: claim_next_task takes the user's oldest queued task (list_tasks shows the queue). \
              See what is there with list_assets / get_timeline_state (import_asset adds a file by its \
-             absolute path) and analyze_asset (silence, scenes, transcript, loudness, beats). When the \
+             absolute path) and analyze_asset (silence, scenes, transcript, loudness, beats); \
+             search_transcripts finds where anything is said across the whole library. When the \
              user says \"this clip\", \"here\" or \"the selection\", get_editor_context says what they \
              have selected and where the playhead and marks are. Look at the footage with skim_asset \
              (a contact sheet), get_frame and preview_timeline (the cut you have built) before and after \
@@ -6822,7 +6823,12 @@ const EDITING_GUIDE: &str = "How to edit with Kerf. The user queues editing task
              summarise an analysis (counts, durations, the head of the transcript), \
              and get_transcript (lines with their speakers; words=true adds each \
              line's timed words, best over a from/to window) / get_analysis_detail \
-             page through the rest; \
+             page through the rest. To find material by what is said, search_transcripts \
+             searches every transcript at once (a phrase, all_words within a line or any_word; \
+             `speaker` narrows it): each hit is an asset with SOURCE start/end and `in_cut`, \
+             the clips already using it (empty when unused) — cut_clip / \
+             add_clip_to_timeline that source window to use it, and \
+             `assets_without_transcript` names what still needs analyze_asset; \
              get_timeline_state shows generated captions as a window \
              (captions_offset / captions_limit) and, for a very long cut, its clips \
              (clips_offset / clips_limit); history, list_tasks, list_assets, \
@@ -9664,6 +9670,14 @@ mod tests {
             );
         }
         assert_eq!(transcript.input_schema["required"], serde_json::json!(["asset_id"]));
+        let search = tools.iter().find(|t| t.name == "search_transcripts").unwrap();
+        for field in ["query", "asset_ids", "speaker", "mode", "offset", "limit"] {
+            assert!(
+                search.input_schema["properties"].get(field).is_some(),
+                "search_transcripts takes {field}"
+            );
+        }
+        assert_eq!(search.input_schema["required"], serde_json::json!(["query"]));
         let detail = tools.iter().find(|t| t.name == "get_analysis_detail").unwrap();
         assert_eq!(detail.input_schema["required"], serde_json::json!(["asset_id", "kind"]));
     }

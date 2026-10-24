@@ -79,6 +79,8 @@ skrifa = { version = "0.44", default-features = false, features = ["std"] }
 unicode-bidi = "0.3"
 unicode-script = "0.5"
 unicode-linebreak = "0.1.5"
+# Diacritic folding for transcript search (transcript::search); misaki-rs already links it.
+unicode-normalization = "0.1.25"
 simplecss = "0.2"
 ffmpeg-next = { workspace = true, optional = true }
 whisper-rs = { version = "0.16.0", optional = true }
