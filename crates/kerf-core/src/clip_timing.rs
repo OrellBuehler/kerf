@@ -25,6 +25,12 @@
 //! (`afade_in` joins the fade-in, and the tail is its fade-out), so it keeps its
 //! own arithmetic and shares only [`ClipTiming::duration`], the window and the seek.
 //!
+//! **A speed ramp is a clip's rate moving over its length.** Every number here that turns a time
+//! on one clock into the other goes through the map (`Clip::along` / `local_at_along`), never
+//! `speed_mag()`: the tail's share of the source, the handle a tail can borrow, the picture's read
+//! past its end, the first picture of a late-starting file. What the chains print for a ramp (the
+//! picture's retime expression, the sound's steps) is [`ramp`].
+//!
 //! Pure: no I/O, no machine reads, no dependency on the engine.
 //!
 //! The reading half (`enabled`, `motion_at`, `ffmpeg_frame_time`, `clips_with_fx`,
@@ -1269,6 +1275,108 @@ mod tests {
         let fx = transition_fx(&tl, std::slice::from_ref(&asset));
         assert_eq!(timing(&tl, &fx, 0).window(), (0.0, 11.0));
         assert_eq!(clip_source_window(timing(&tl, &fx, 0).clip, &fx[0]), (0.0, 22.0));
+    }
+
+    #[test]
+    fn a_ramped_clips_tail_plays_on_at_the_last_keys_speed_through_the_map() {
+        use crate::model::{RampEasing, SpeedKey};
+        let asset = asset();
+        // 3x for a second, then a ramp down to 0.5x over a second, which it keeps: the end plays at 0.5x.
+        let keys = vec![
+            SpeedKey {
+                time: 0.0,
+                speed: 3.0,
+                easing: RampEasing::Hold,
+            },
+            SpeedKey::new(1.0, 3.0),
+            SpeedKey::new(2.0, 0.5),
+        ];
+        let with_next = |mut a: Clip| {
+            a.speed_ramp = keys.clone();
+            let mut b = make_clip(asset.id, 0.0, 10.0, a.timeline_end());
+            b.transition_in = Some(Transition {
+                kind: TransitionKind::Crossfade,
+                duration: 1.0,
+            });
+            let tl = single(vec![a, b]);
+            let fx = transition_fx(&tl, std::slice::from_ref(&asset));
+            (tl, fx)
+        };
+        // Forward, from 20 to 28: 3 + 1.75 source seconds in the first two, the rest at 0.5x.
+        let (tl, fx) = with_next(make_clip(asset.id, 20.0, 28.0, 0.0));
+        let t = timing(&tl, &fx, 0);
+        assert!((t.clip.duration() - 2.0 - (28.0 - 20.0 - 4.75) / 0.5).abs() < 1e-9);
+        assert!((fx[0].tail - 1.0).abs() < 1e-9, "{:?}", fx[0]);
+        // The tail's second is a second at the last key's speed: half a source second past the window.
+        let (start, end) = clip_source_window(t.clip, &fx[0]);
+        assert_eq!((start, end), (20.0, 28.5));
+        assert!((t.duration() - t.clip.duration() - 1.0).abs() < 1e-9);
+        // The picture reads on a source frame (1/30) and an output frame (1/50) of that speed.
+        let (_, read) = picture_window(t.clip, &fx[0], 50.0);
+        assert!((read - (28.5 + 1.0 / 30.0 + 0.5 / 50.0)).abs() < 1e-9, "{read}");
+        // Reversed: the handle is below `source_in`, played at the same speeds.
+        let mut rev = make_clip(asset.id, 20.0, 28.0, 0.0);
+        rev.speed = -1.0;
+        let (tl, fx) = with_next(rev);
+        assert_eq!(clip_source_window(timing(&tl, &fx, 0).clip, &fx[0]), (19.5, 28.0));
+        // The handle bounds the tail as it does at a constant speed: 0.25 s of source is half a second.
+        let mut short = asset.clone();
+        short.duration = 30.0;
+        let mut a = make_clip(short.id, 20.0, 29.75, 0.0);
+        a.speed_ramp = keys.clone();
+        let mut b = make_clip(short.id, 0.0, 10.0, a.timeline_end());
+        b.transition_in = Some(Transition {
+            kind: TransitionKind::Crossfade,
+            duration: 1.0,
+        });
+        let fx = transition_fx(&single(vec![a, b]), std::slice::from_ref(&short));
+        assert!((fx[0].tail - 0.5).abs() < 1e-9, "{}", fx[0].tail);
+    }
+
+    #[test]
+    fn a_ramped_clip_is_never_the_same_sound_on_both_sides_of_a_crossfade() {
+        use crate::model::SpeedKey;
+        let asset = asset();
+        let mut a = make_clip(asset.id, 0.0, 10.0, 0.0);
+        let b = make_clip(asset.id, 10.0, 20.0, 10.0);
+        // One take, one speed: the overlap plays the same samples.
+        assert!(same_sound(&a, &b, 1.0));
+        // A ramp does not: the two sides keep different paces.
+        a.speed_ramp = vec![SpeedKey::new(0.0, 1.0), SpeedKey::new(1.0, 1.0)];
+        assert!(!same_sound(&a, &b, 1.0) && !same_sound(&b, &a, 1.0));
+        assert!(!same_sound(&a, &a.clone(), 0.005));
+    }
+
+    #[test]
+    fn the_first_picture_of_a_ramped_clip_in_a_late_files_lead_plays_where_the_ramp_has_got_to() {
+        use crate::model::SpeedKey;
+        let mut stream = video_stream(1920, 1080, 30.0);
+        stream.lead = 0.5;
+        let late = test_asset(vec![stream]);
+        // 0.5x for a second, then 2x: 0.5 s of source travelled is a full second into the clip.
+        let mut clip = make_clip(late.id, 0.0, 6.0, 2.0);
+        clip.speed_ramp = vec![SpeedKey::new(0.0, 0.5), SpeedKey::new(1.0, 0.5), SpeedKey::new(1.001, 2.0)];
+        let tl = single(vec![clip]);
+        let fx = transition_fx(&tl, std::slice::from_ref(&late));
+        let t = timing(&tl, &fx, 0);
+        assert_eq!(t.ramp_offset(), 0.5);
+        assert!((t.picture_delay() - 1.0).abs() < 1e-9, "{}", t.picture_delay());
+        // It is the clock the chain's `setpts` starts from, not a delay added to the clip's start.
+        assert!(ramp::setpts(t.clip, t.ramp_offset(), 2.0).unwrap().contains("+0.5);"));
+        // A clip cut from past the lead, or reversed, is on time.
+        let mut past = tl.tracks[0].clips[0].clone();
+        past.source_in = 0.7;
+        let tl = single(vec![past]);
+        assert_eq!(timing(&tl, &fx, 0).ramp_offset(), 0.0);
+        assert_eq!(timing(&tl, &fx, 0).picture_delay(), 0.0);
+        let mut back = tl.tracks[0].clips[0].clone();
+        (back.source_in, back.speed) = (0.0, -1.0);
+        let tl = single(vec![back]);
+        assert_eq!(timing(&tl, &fx, 0).picture_delay(), 0.0);
+        // A clip without a ramp keeps the delay it had.
+        let plain = single(vec![make_clip(late.id, 0.0, 3.0, 2.0)]);
+        let fx = transition_fx(&plain, std::slice::from_ref(&late));
+        assert_eq!(timing(&plain, &fx, 0).picture_delay(), 0.5);
     }
 
     #[test]

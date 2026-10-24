@@ -565,6 +565,10 @@ mod tests {
         assert_eq!(Unsupported::Shrink(0, (4000, 2000), (50, 20)).kind(), "shrink");
         assert_ne!(Unsupported::Text.kind(), Unsupported::TextBorder.kind());
         assert_eq!(Unsupported::MixedMatrices.kind(), "mixed_matrices");
+        assert_eq!(Unsupported::SpeedRamp(layer(1, "a.mp4")).kind(), "speed_ramp");
+        assert!(Unsupported::SpeedRamp(layer(1, "a.mp4"))
+            .to_string()
+            .starts_with("layer 1 (a.mp4): a speed ramp"));
         assert_eq!(
             Unsupported::DipToWhite(layer(0, "a.mp4"), DipWhy::Resized).kind(),
             Unsupported::DipToWhite(layer(2, "b.mov"), DipWhy::Format).kind(),
@@ -590,6 +594,7 @@ mod tests {
             Unsupported::FullRangeNegotiated(layer(0, "")).kind(),
             Unsupported::FullRangeCut.kind(),
             Unsupported::FullRangeResized(layer(0, ""), "an export frame").kind(),
+            Unsupported::SpeedRamp(layer(0, "")).kind(),
         ];
         for kind in kinds {
             assert!(

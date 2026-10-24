@@ -22,7 +22,7 @@ use super::*;
 use crate::engine::test_support::{make_clip, single, StatusBounded};
 use crate::project::Project;
 
-const FPS: f64 = 25.0;
+pub(super) const FPS: f64 = 25.0;
 const RATE: usize = 48_000;
 const W: u32 = 64;
 const H: u32 = 36;
@@ -40,7 +40,7 @@ fn run_ffmpeg(args: &[String]) -> bool {
 /// A source whose video starts `lead` seconds after its audio, with [`MARK`] white frames from
 /// the video's own second 1 (the file's `lead + 1`) and a click as long at the same moment of
 /// the file. Probed like an import.
-fn late_source(dir: &Path, lead: f64, ext: &str) -> Asset {
+pub(super) fn late_source(dir: &Path, lead: f64, ext: &str) -> Asset {
     let video = dir.join("flash.mkv");
     let audio = dir.join(format!("click-{lead}.wav"));
     let out = dir.join(format!("late-{lead}.{ext}"));
@@ -186,7 +186,7 @@ fn lumas(timeline: &Timeline, assets: &[Asset], dir: &Path, tag: &str) -> Vec<f6
 
 /// The export of `timeline` as grey frames at [`FPS`] and mono samples at [`RATE`]: the time of
 /// the first white frame and of the first sample of the click.
-fn flash_and_click(timeline: &Timeline, assets: &[Asset], dir: &Path, tag: &str) -> (Option<f64>, Option<f64>) {
+pub(super) fn flash_and_click(timeline: &Timeline, assets: &[Asset], dir: &Path, tag: &str) -> (Option<f64>, Option<f64>) {
     let opts = ExportOptions {
         resolution: Some((W, H)),
         fps: Some(FPS),

@@ -190,6 +190,17 @@
   `cover-uncropped`, the other (6509) a `together` case planned on its base Contain options, whose whole export is folded
   (its listed families are its deliveries'). Of the 597 zoom cases that did not move, 536 are `NO-PARTS`, 49 are
   `together` cases whose base options hold nothing to fold, and 12 hold a zoomed clip shorter than a frame that no part draws.
+- **Speed ramps** (`ramp_for`; `engine-cli.md`, "Speed ramps"), **appended, nothing re-blessed**: the 400 cases after the keyed mask and
+  crop ones draw from the same generator (with the channel family's channels, one delivery frame, no titles), then most of their clips
+  get a ramp on dice of their own seeded by the case and the clip: one to five keys (sixteen now and then, the most the export nests), a
+  hold here and there, speeds from 0.2x to 8x, a quarter played backwards, a still image and a title left alone, and the track
+  rippled so clips that touched still touch (a ramp changes a clip's length: without it no transition would find its partner and no
+  tail would be covered). `git diff` of the four digest files is **16 insertions, 0 deletions** (four block lines each, `parts.txt`
+  included), so the first 8000 per-case digests are the ones the commit before gave. Families `speed-ramp` (`setpts='st(0,`: 287 of
+  the 400), `speed-ramp-linear` (`sqrt((`), `speed-ramp-audio` (`acrossfade=d=`), `preview-speed-ramp` and `preview-speed-ramp-linear`
+  by needle, and structurally `speed-ramp-hold`, `speed-ramp-reversed`, `speed-ramp-tail` (a ramped outgoing clip under a
+  transition: 124) and `still-speed-ramp` (a ramped clip on screen in a still). The still carries no sound and no `setpts`
+  of a ramp (its `-ss` is the map's source time), so it has the one structural family.
 - **Constant-power crossfades** (`afade …:curve=qsin` only on a fade that is wholly one half of a real
   pair: a dissolve or motion transition from an adjacent clip whose overlap plays different sound — not a
   fade up from black, not a dip, not a cut inside one take) re-blessed `export.txt` alone: 1304 of 6400

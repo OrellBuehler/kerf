@@ -8,13 +8,14 @@
 //! map's inverse in closed form: a hold is `r / v`, a linear segment `2x / (v + sqrt(v² + 2kx))`.
 //! The regions between keys are a **balanced tree** of `if(lte(…))` (an expression may nest about a
 //! hundred levels, and a chain of sixteen keys would be sixteen of them), and the value is stored once
-//! with `st(0, …)` and read back with `ld(0)`. [`Ex`] is both the text and the arithmetic, so the frame
-//! pick and the tests evaluate what the graph prints.
+//! with `st(0, …)` and read back with `ld(0)`. [`Ex`] is both the text and the arithmetic, so the tests
+//! evaluate exactly what the graph prints (and a frame pick over a ramp, which the plan does not model
+//! yet, would too).
 //!
 //! **Sound.** `atempo` takes one tempo for its whole stream, and its `tempo` command is no way round
 //! that: each command re-origins the stream (it drops the drift control that holds the long-run tempo,
-//! losing up to half a window of source per command on transient material, and FFmpeg 9 lists no command
-//! support for it at all). So a ramp is cut into steps of constant tempo, each its own `atempo` stream
+//! losing half a window of source, 1024 samples, per command on transient material; measured on 6.1 and
+//! 9.0). So a ramp is cut into steps of constant tempo, each its own `atempo` stream
 //! over the part of the source it plays, trimmed to the exact sample count of its share of the timeline
 //! and crossfaded into the next ([`audio_pieces`]). Each step's tempo is its source span over its
 //! timeline span, so the sound meets the picture at every step edge whatever `atempo` does inside one.
@@ -200,7 +201,7 @@ const STEP_FLOOR: f64 = 0.03;
 /// How far, in source seconds, a step's constant tempo may stray from the curve inside the step.
 const STEP_ERROR: f64 = 0.008;
 /// The most steps one clip's sound is cut into.
-pub(crate) const MAX_AUDIO_STEPS: usize = 48;
+pub(crate) const MAX_AUDIO_STEPS: usize = 128;
 
 /// One stretch of a ramped clip's sound at one tempo: `t0..t1` clip-local timeline seconds over
 /// `a0..a1` source seconds travelled.
@@ -256,28 +257,31 @@ pub(crate) fn audio_steps(clip: &Clip, total: f64) -> Vec<AudioStep> {
     let mut edges = vec![0.0];
     edges.extend(keys.iter().map(|k| k.time).filter(|t| *t > 0.0 && *t < total));
     edges.push(total);
-    let cut = |scale: f64| -> Vec<f64> {
-        let mut bounds = vec![0.0];
-        for w in edges.windows(2) {
-            let (lo, hi) = (w[0], w[1]);
-            let slope = slope_over(clip, lo, hi).abs();
-            let n = if slope > 0.0 {
-                let h = ((8.0 * STEP_ERROR / slope).sqrt() * scale).clamp(STEP_MIN, STEP_MAX);
-                ((hi - lo) / h).ceil().max(1.0) as usize
-            } else {
-                1
-            };
-            for i in 1..=n {
-                bounds.push(lo + (hi - lo) * i as f64 / n as f64);
-            }
-        }
-        bounds
+    // The steps of each stretch between edges at a `scale` of the finest step the error allows: counted
+    // first, so that a ramp which moves for hours is made coarser before a step of it is allocated.
+    let counts = |scale: f64| -> Vec<usize> {
+        edges
+            .windows(2)
+            .map(|w| {
+                let slope = slope_over(clip, w[0], w[1]).abs();
+                if slope > 0.0 {
+                    let h = (8.0 * STEP_ERROR / slope).sqrt().clamp(STEP_MIN, STEP_MAX) * scale;
+                    ((w[1] - w[0]) / h).ceil().clamp(1.0, 1e6) as usize
+                } else {
+                    1
+                }
+            })
+            .collect()
     };
     let mut scale = 1.0;
-    let mut bounds = cut(scale);
-    while bounds.len() > MAX_AUDIO_STEPS && scale < 1e6 {
+    let mut per_stretch = counts(scale);
+    while per_stretch.iter().sum::<usize>() > MAX_AUDIO_STEPS && scale < 1e12 {
         scale *= 1.5;
-        bounds = cut(scale);
+        per_stretch = counts(scale);
+    }
+    let mut bounds = vec![0.0];
+    for (w, n) in edges.windows(2).zip(per_stretch) {
+        bounds.extend((1..=n).map(|i| w[0] + (w[1] - w[0]) * i as f64 / n as f64));
     }
     // A step too short to crossfade is folded into the one before it (the first into the one after).
     let mut i = 1;
@@ -311,7 +315,7 @@ const STAGE_ADVANCE: f64 = 0.0145;
 /// next its output, so a stage's advance counts for the tempo of every stage before it: `A (1 + s + s² …)`
 /// for stages of tempo `s`. A step cut out of the middle of a stream is read this much later, so that it
 /// plays what the picture shows. Held at its value for 0.25x and for 8x outside them (measured to there:
-/// within 3 ms of the output from 0.5x to 8x, 7 ms at 0.25x; a step that slow or fast is a moment of the
+/// within 8 ms of the map from 0.5x to 8x, 16 at 0.25x; a step that slow or fast is a moment of the
 /// source however far it is stretched).
 pub(crate) fn tempo_advance(tempo: f64) -> f64 {
     if !(tempo.is_finite() && tempo > 0.0) {
@@ -350,8 +354,11 @@ pub(crate) struct AudioPiece {
 /// filter makes of the edges of its input is never heard.
 const ROLL: f64 = 0.06;
 const FLUSH: f64 = 0.1;
-/// The longest crossfade between two steps.
-const CROSSFADE: f64 = 0.010;
+/// The longest crossfade between two steps: the length of a click-free splice and no more. The pieces are
+/// independent `atempo` streams, so what they play of a steady tone differs in phase at a seam, and the longer
+/// the two are mixed the more of that is heard (a 440 Hz tone: 2 ms leaves the seams 28 dB under the tone, 10 ms
+/// 22, 40 ms 17).
+const CROSSFADE: f64 = 0.002;
 
 /// The steps of a ramped clip's sound as pieces of a stream resampled to `sample_rate`, with the
 /// samples each crossfade between neighbours overlaps by (even: half on each side). The pieces put end
@@ -416,4 +423,338 @@ pub(crate) fn atempo_stages(tempo: f64) -> String {
     let stages = stage_count(tempo);
     let each = tempo.powf(1.0 / stages as f64);
     vec![format!("atempo={each}"); stages].join(",")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{SpeedKey, MAX_SPEED_KEYS};
+    use uuid::Uuid;
+
+    fn hold(time: f64, speed: f64) -> SpeedKey {
+        SpeedKey {
+            time,
+            speed,
+            easing: RampEasing::Hold,
+        }
+    }
+
+    fn clip(keys: Vec<SpeedKey>, source_len: f64) -> Clip {
+        let mut c = Clip::new(Uuid::nil(), 3.0, 3.0 + source_len, 2.0);
+        c.speed_ramp = keys;
+        c
+    }
+
+    /// A ramp of `n` keys from a seed: random speeds in the model's range and a hold now and then.
+    fn random_keys(seed: u64, n: usize) -> Vec<SpeedKey> {
+        let mut state = seed | 1;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state % 10_000) as f64 / 10_000.0
+        };
+        let mut time = next() * 0.5;
+        (0..n)
+            .map(|_| {
+                time += 0.05 + next() * 1.5;
+                SpeedKey {
+                    time,
+                    speed: (0.02 + next() * next() * 30.0).min(100.0),
+                    easing: if next() < 0.3 { RampEasing::Hold } else { RampEasing::Linear },
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn the_expression_is_the_maps_inverse_for_every_shape_of_ramp() {
+        let ramps = [
+            vec![SpeedKey::new(0.0, 2.0)],
+            vec![SpeedKey::new(1.0, 0.5)],
+            vec![SpeedKey::new(0.0, 1.0), SpeedKey::new(2.0, 3.0)],
+            vec![SpeedKey::new(0.5, 4.0), SpeedKey::new(1.5, 0.25)],
+            vec![hold(0.0, 0.5), SpeedKey::new(1.0, 2.0)],
+            vec![
+                SpeedKey::new(0.0, 1.0),
+                hold(1.0, 2.5),
+                SpeedKey::new(2.0, 0.5),
+                SpeedKey::new(3.0, 0.5),
+            ],
+            vec![SpeedKey::new(-0.5, 2.0), SpeedKey::new(1.0, 0.2)],
+            vec![
+                SpeedKey::new(0.0, 1.0),
+                SpeedKey::new(1.0, 1.0),
+                SpeedKey::new(2.0, 1.0 + 1e-12),
+            ],
+        ];
+        let mut all: Vec<Vec<SpeedKey>> = ramps.to_vec();
+        for seed in 1..=60 {
+            all.push(random_keys(seed, 1 + seed as usize % MAX_SPEED_KEYS));
+        }
+        for keys in all {
+            let c = clip(keys.clone(), 40.0);
+            let expr = retime_expr(&c).expect("a ramp");
+            for i in 0..=400 {
+                let along = f64::from(i) * 0.1;
+                let want = c.local_at_along(along);
+                let got = expr.eval(along);
+                assert!(
+                    (got - want).abs() <= 1e-9 * want.abs().max(1.0),
+                    "{keys:?} at {along}: {got} against {want}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_regions_nest_as_a_balanced_tree_and_the_text_stays_small() {
+        for n in 1..=MAX_SPEED_KEYS {
+            let keys: Vec<SpeedKey> = (0..n).map(|i| SpeedKey::new(i as f64, 1.0 + (i % 5) as f64)).collect();
+            let expr = retime_expr(&clip(keys, 100.0)).unwrap();
+            // n keys cut the line into n + 1 regions: a tree over them is ceil(log2(n + 1)) high.
+            let height = (usize::BITS - n.leading_zeros()) as usize;
+            assert!(expr.depth() <= height, "{n} keys: {} deep", expr.depth());
+            let text = expr.to_string();
+            assert!(text.len() < 400 * (n + 1), "{n} keys: {} bytes", text.len());
+            // No exponent, no NaN: FFmpeg's number parser reads neither of those as written.
+            assert!(!text.as_bytes().windows(2).any(|w| w[0].is_ascii_digit() && w[1] == b'e'));
+            assert!(!text.contains("NaN") && !text.contains("inf"), "{text}");
+        }
+        let sixteen = random_keys(7, MAX_SPEED_KEYS);
+        let expr = retime_expr(&clip(sixteen, 400.0)).unwrap();
+        assert_eq!(expr.depth(), 5);
+    }
+
+    #[test]
+    fn a_ramps_setpts_is_one_quoted_value_that_stores_the_source_seconds_once() {
+        let c = clip(vec![SpeedKey::new(0.0, 1.0), SpeedKey::new(2.0, 3.0)], 10.0);
+        let text = setpts(&c, 0.0, 2.0).unwrap();
+        assert!(
+            text.starts_with("setpts='st(0,(PTS-STARTPTS)*TB);(") && text.ends_with("+2)/TB'"),
+            "{text}"
+        );
+        // Both ends of the quote, and none inside it.
+        assert_eq!(text.matches('\'').count(), 2);
+        assert!(text.contains("sqrt("));
+        // A hold is a division, and a window that starts in a late file's lead starts the clock late.
+        let held = clip(vec![hold(0.0, 0.5), SpeedKey::new(2.0, 3.0)], 10.0);
+        let text = setpts(&held, 0.25, 0.0).unwrap();
+        assert!(text.contains("st(0,(PTS-STARTPTS)*TB+0.25);"), "{text}");
+        assert!(!text.contains("sqrt("), "{text}");
+        // No ramp, no retime.
+        assert_eq!(setpts(&Clip::new(Uuid::nil(), 0.0, 4.0, 0.0), 0.0, 0.0), None);
+        let mut malformed = clip(vec![SpeedKey::new(1.0, 2.0), SpeedKey::new(1.0, 3.0)], 4.0);
+        malformed.speed = 1.0;
+        assert_eq!(setpts(&malformed, 0.0, 0.0), None);
+    }
+
+    #[test]
+    fn a_numbers_text_is_what_ffmpeg_parses_back() {
+        for (v, text) in [
+            (0.0, "0"),
+            (-0.0, "0"),
+            (1.0, "1"),
+            (0.1, "0.1"),
+            (-2.5, "(-2.5)"),
+            (1e-7, "0.0000001"),
+            (123456789.5, "123456789.5"),
+        ] {
+            assert_eq!(Ex::Num(v).to_string(), text);
+            let back: f64 = text.trim_matches(['(', ')']).parse().unwrap();
+            assert_eq!(back, if v == 0.0 { 0.0 } else { v });
+        }
+    }
+
+    fn total_of(c: &Clip) -> f64 {
+        c.duration()
+    }
+
+    #[test]
+    fn the_sounds_steps_cover_the_clip_and_meet_the_picture_at_every_edge() {
+        let ramps = [
+            vec![SpeedKey::new(0.0, 1.0), SpeedKey::new(2.0, 3.0)],
+            vec![
+                SpeedKey::new(0.0, 1.0),
+                hold(1.5, 2.5),
+                SpeedKey::new(2.5, 0.5),
+                SpeedKey::new(3.5, 0.5),
+            ],
+            vec![SpeedKey::new(1.0, 2.0), SpeedKey::new(3.0, 0.5)],
+            vec![SpeedKey::new(0.0, 0.01), SpeedKey::new(5.0, 100.0)],
+        ];
+        let mut all = ramps.to_vec();
+        all.extend((1..=40).map(|seed| random_keys(seed, 2 + seed as usize % 15)));
+        for keys in all {
+            let c = clip(keys.clone(), 30.0);
+            for tail in [0.0, 0.7] {
+                let total = total_of(&c) + tail;
+                let steps = audio_steps(&c, total);
+                assert!(
+                    !steps.is_empty() && steps.len() <= MAX_AUDIO_STEPS,
+                    "{keys:?}: {} steps",
+                    steps.len()
+                );
+                assert_eq!(steps[0].t0, 0.0);
+                assert_eq!(steps.last().unwrap().t1, total);
+                for w in steps.windows(2) {
+                    assert_eq!((w[0].t1, w[0].a1), (w[1].t0, w[1].a0), "{keys:?}: a gap");
+                }
+                for s in &steps {
+                    assert!(s.t1 - s.t0 >= STEP_FLOOR - 1e-12 || steps.len() == 1, "{keys:?}: {s:?}");
+                    // The step's tempo is its chord, so its edges are where the map has them.
+                    assert!((s.a0 - c.along(s.t0)).abs() < 1e-12 && (s.a1 - c.along(s.t1)).abs() < 1e-12);
+                    assert!(s.tempo() > 0.0 && s.tempo().is_finite());
+                    // A tempo never strays outside the speeds the step spans.
+                    let lo = (0..=8)
+                        .map(|i| c.speed_at(s.t0 + (s.t1 - s.t0) * f64::from(i) / 8.0))
+                        .fold(f64::MAX, f64::min);
+                    let hi = (0..=8)
+                        .map(|i| c.speed_at(s.t0 + (s.t1 - s.t0) * f64::from(i) / 8.0))
+                        .fold(0.0, f64::max);
+                    assert!(
+                        s.tempo() >= lo * (1.0 - 1e-9) && s.tempo() <= hi * (1.0 + 1e-9),
+                        "{keys:?}: {s:?} {lo} {hi}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_constant_stretch_is_one_step_and_a_moving_one_stays_close_to_its_curve() {
+        // A hold, and what lies before the first key and after the last, are a step each.
+        let c = clip(
+            vec![
+                hold(1.0, 2.0),
+                hold(2.0, 0.5),
+                SpeedKey::new(3.0, 0.5),
+                SpeedKey::new(4.0, 0.5),
+            ],
+            20.0,
+        );
+        let steps = audio_steps(&c, c.duration());
+        let edges: Vec<f64> = steps.iter().map(|s| s.t0).collect();
+        assert_eq!(edges, [0.0, 1.0, 2.0, 3.0, 4.0]);
+        // 1x to 3x over 4 s: the chord of a step is within STEP_ERROR of the parabola in the middle.
+        let c = clip(vec![SpeedKey::new(0.0, 1.0), SpeedKey::new(4.0, 3.0)], 40.0);
+        let steps = audio_steps(&c, 6.0);
+        assert!(steps.len() > 4, "{steps:?}");
+        for s in steps.iter().filter(|s| s.t1 <= 4.0) {
+            let mid = (s.t0 + s.t1) / 2.0;
+            let chord = (s.a0 + s.a1) / 2.0;
+            assert!(
+                (chord - c.along(mid)).abs() <= STEP_ERROR * 1.05,
+                "{s:?}: {chord} {}",
+                c.along(mid)
+            );
+        }
+        // A slope too steep for the step budget loosens the error rather than the count.
+        let steep = clip(
+            (0..16)
+                .map(|i| SpeedKey::new(f64::from(i) * 0.5, if i % 2 == 0 { 0.1 } else { 50.0 }))
+                .collect(),
+            400.0,
+        );
+        assert!(audio_steps(&steep, 8.0).len() <= MAX_AUDIO_STEPS);
+        // A ramp that moves for minutes lengthens its steps to stay in the budget (the first 16 keys of a
+        // long edit: nine seconds a segment, two minutes of it moving).
+        let long = clip(
+            (0..16)
+                .map(|i| SpeedKey::new(f64::from(i) * 9.0, [0.5, 3.0, 1.0, 6.0][i as usize % 4]))
+                .collect(),
+            590.0,
+        );
+        let steps = audio_steps(&long, long.duration());
+        assert!(steps.len() <= MAX_AUDIO_STEPS && steps.len() >= 16, "{} steps", steps.len());
+        assert_eq!(steps.last().unwrap().t1, long.duration());
+        // Hostile: a ramp over years, and a length that is not a number, allocate nothing like it.
+        let huge = clip(vec![SpeedKey::new(0.0, 0.01), SpeedKey::new(3.0e8, 100.0)], 1e9);
+        let steps = audio_steps(&huge, huge.duration());
+        assert!(steps.len() <= MAX_AUDIO_STEPS, "{} steps", steps.len());
+        for bad in [f64::NAN, f64::INFINITY, -1.0, 0.0] {
+            assert_eq!(audio_steps(&huge, bad).len(), 1, "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_pieces_with_their_crossfades_come_to_the_exact_sample_count_of_the_clip() {
+        for rate in [48_000, 44_100, 96_000, 22_050] {
+            for seed in 1..=30 {
+                let c = clip(random_keys(seed, 2 + seed as usize % 15), 30.0);
+                let total = total_of(&c) + if seed % 2 == 0 { 0.4 } else { 0.0 };
+                let steps = audio_steps(&c, total);
+                let (pieces, overlaps) = audio_pieces(&steps, rate);
+                assert_eq!(pieces.len(), steps.len());
+                assert_eq!(overlaps.len(), steps.len() - 1);
+                let kept: u64 = pieces.iter().map(|p| p.keep).sum();
+                let crossfaded: u64 = overlaps.iter().sum();
+                assert_eq!(
+                    kept - crossfaded,
+                    (total * f64::from(rate)).round() as u64,
+                    "{rate} Hz, seed {seed}"
+                );
+                assert!(overlaps.iter().all(|o| o % 2 == 0 && *o <= (0.0025 * f64::from(rate)) as u64));
+                for p in &pieces {
+                    assert!(p.to > p.from && p.from >= 0.0 && p.keep > 0, "{p:?}");
+                    assert!(p.skip == 0 || p.lead == 0, "{p:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_piece_is_read_where_atempo_will_have_made_up_its_early_start() {
+        let c = clip(vec![SpeedKey::new(0.0, 1.0), hold(2.0, 0.5), SpeedKey::new(4.0, 0.5)], 30.0);
+        let steps = audio_steps(&c, c.duration());
+        let (pieces, overlaps) = audio_pieces(&steps, 48_000);
+        // The first piece starts at the head of the source, so atempo's early start is silence put
+        // ahead of it; a piece cut from the middle is read later by the advance and trimmed by the roll.
+        assert!(
+            pieces[0].lead > 0 && pieces[0].skip == 0 && pieces[0].from == 0.0,
+            "{:?}",
+            pieces[0]
+        );
+        let (i, mid) = pieces.iter().enumerate().find(|(_, p)| p.from > 0.0).unwrap();
+        // It starts half its crossfade early, and what it plays there is `from` plus the roll and the advance.
+        let early = overlaps[i - 1] as f64 / 2.0 / 48_000.0 * mid.tempo;
+        let rolled = (mid.skip as f64 / 48_000.0) * mid.tempo;
+        assert!(
+            (steps[i].a0 - early - tempo_advance(mid.tempo) - mid.from - rolled).abs() < 0.001,
+            "{mid:?}"
+        );
+        // A step at 1x is the source as it is: no atempo, so no advance to make up.
+        let unit = clip(
+            vec![SpeedKey::new(0.0, 1.0), SpeedKey::new(2.0, 1.0), SpeedKey::new(3.0, 2.0)],
+            30.0,
+        );
+        let steps = audio_steps(&unit, unit.duration());
+        let (pieces, _) = audio_pieces(&steps, 48_000);
+        assert!(!tempo_applies(pieces[0].tempo) && pieces[0].lead == 0, "{:?}", pieces[0]);
+    }
+
+    #[test]
+    fn a_tempo_is_split_into_stages_each_inside_atempos_range() {
+        for tempo in [0.01, 0.1, 0.4, 0.5, 0.75, 1.5, 2.0, 2.01, 3.0, 7.9, 100.0] {
+            let text = atempo_stages(tempo);
+            let stages: Vec<f64> = text
+                .split(',')
+                .map(|s| s.strip_prefix("atempo=").unwrap().parse().unwrap())
+                .collect();
+            assert!(
+                stages.iter().all(|s| (0.5 - 1e-9..=2.0 + 1e-9).contains(s)),
+                "{tempo}: {text}"
+            );
+            let product: f64 = stages.iter().product();
+            assert!((product / tempo - 1.0).abs() < 1e-9, "{tempo}: {product}");
+        }
+        assert_eq!(atempo_stages(1.5), "atempo=1.5");
+        assert_eq!(atempo_stages(4.0), "atempo=2,atempo=2");
+        // The advance of a chain counts each stage at the tempo of those before it.
+        assert!((tempo_advance(0.5) - STAGE_ADVANCE).abs() < 1e-12);
+        assert!((tempo_advance(4.0) - STAGE_ADVANCE * 3.0).abs() < 1e-12);
+        assert_eq!(tempo_advance(f64::NAN), 0.0);
+        assert_eq!(tempo_advance(0.001), tempo_advance(0.25));
+        assert_eq!(tempo_advance(100.0), tempo_advance(8.0));
+    }
 }

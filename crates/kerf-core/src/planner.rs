@@ -2933,6 +2933,67 @@ mod tests {
     }
 
     #[test]
+    fn a_ramped_clip_plans_the_source_time_of_its_map_and_the_compositor_refuses_it() {
+        use crate::model::{RampEasing, SpeedKey};
+        let a = asset();
+        // 1x to 3x over 2 s, then 3x: source 10..20 is 2 s of ramp (4 source seconds) and 2 more at 3x.
+        let mut ramped = make_clip(a.id, 10.0, 20.0, 5.0);
+        ramped.speed_ramp = vec![SpeedKey::new(0.0, 1.0), SpeedKey::new(2.0, 3.0)];
+        assert!((ramped.duration() - 4.0).abs() < 1e-9);
+        let tl = single(vec![ramped]);
+        let caps = crate::plan_caps::GpuCaps::A0;
+        for mode in [PlanMode::Still, PlanMode::Motion] {
+            let planner = planner(&tl, std::slice::from_ref(&a), mode, &opts(30.0));
+            // At 6 s (1 s in) the clip has travelled 1.5 source seconds, not 1 or 3.
+            let plan = planner.at(6.0).unwrap();
+            let layer = &plan.layers[0];
+            assert!((layer.source_time - 11.5).abs() < 1e-9, "{mode:?}: {}", layer.source_time);
+            assert!((layer.clip_time - 1.0).abs() < 1e-9);
+            assert!(layer.timing.ramped && (layer.timing.speed - 2.5).abs() < 1e-9);
+            // Refused whole, in a still as in an export frame.
+            let why: Vec<_> = plan.size_free_reasons(&caps).iter().map(|u| u.kind()).collect();
+            assert!(why.contains(&"speed_ramp"), "{mode:?}: {why:?}");
+            assert!(!plan.gpu_supported());
+        }
+        // The export's pick names no frame rather than the wrong one a constant speed would.
+        let plan = planner(&tl, std::slice::from_ref(&a), PlanMode::Motion, &opts(30.0))
+            .at_frame(6 * 30)
+            .unwrap();
+        let Pick::Fps(pick) = plan.layers[0].pick else {
+            panic!("{:?}", plan.layers[0].pick)
+        };
+        let frames = crate::frame_pick::SourceFrames {
+            pts: &(0..600).map(|i| i * 512).collect::<Vec<i64>>(),
+            time_base: Rational::new(1, 15360).unwrap(),
+            start_us: 0,
+            last_duration: 512,
+        };
+        assert_eq!(Pick::Fps(pick).select(&frames), None);
+        // A clip without a ramp is not refused, whatever its constant speed.
+        let mut fast = make_clip(a.id, 10.0, 20.0, 5.0);
+        fast.speed = 3.0;
+        let plan = planner(&single(vec![fast]), std::slice::from_ref(&a), PlanMode::Still, &opts(30.0))
+            .at(6.0)
+            .unwrap();
+        assert!(!plan.layers[0].timing.ramped);
+        assert!(!plan.size_free_reasons(&caps).iter().any(|u| u.kind() == "speed_ramp"));
+        // A hold keeps its speed to the next key: the second after it is 1.5 source seconds at 1.5x.
+        let mut held = make_clip(a.id, 10.0, 20.0, 0.0);
+        held.speed_ramp = vec![
+            SpeedKey {
+                time: 0.0,
+                speed: 1.5,
+                easing: RampEasing::Hold,
+            },
+            SpeedKey::new(2.0, 4.0),
+        ];
+        let plan = planner(&single(vec![held]), std::slice::from_ref(&a), PlanMode::Still, &opts(30.0))
+            .at(1.0)
+            .unwrap();
+        assert!((plan.layers[0].source_time - 11.5).abs() < 1e-9);
+    }
+
+    #[test]
     fn a_padded_proxy_read_from_the_start_drops_the_clone_and_a_seek_skips_it() {
         let mut a = asset();
         a.path = "/home/u/.cache/kerf/proxies/0123456789abcdef.lead.mp4".into();

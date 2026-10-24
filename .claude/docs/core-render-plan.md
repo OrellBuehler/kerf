@@ -338,6 +338,17 @@
   `Placement::keyframed` carries that (`Keyed::all(rotates)` is the legacy bundle), a colour-only clip is
   placed as a static one, and the sweep holds origin, zoom, turn, opacity and grade of the new cuts to the
   evaluated graph.
+  **A speed ramp is refused** (`PlanTiming.ramped`, `Unsupported::SpeedRamp(layer)`, kind `speed_ramp`, from `size_free_reasons` in a
+  Still and a Motion plan alike, for every cap): the export retimes a ramped clip's frames with a `setpts` expression and lets `fps`
+  pick among them (`engine-cli.md`, "Speed ramps"), a pick over a rate that moves which `frame_pick.rs` does not model, and a
+  still's `-ss` names the frame the map says where the file shows the one whose slot has come (a neighbour in half the frames).
+  What the plan still holds is exact: `clip_source_time` is `Clip::along` of the clip-local time (`(t - start) * speed` bit for bit
+  for a clip without a ramp), `PlanTiming.speed` is the clip's mean speed (`Clip::mean_speed`), and a Motion plan's `FpsPick.speed` is
+  **infinite** (`run` refuses a speed that is not a positive number, so the pick names *no* frame rather than the wrong one a constant
+  speed would; infinite and not NaN, which would make the plan unequal to itself). The same keeps the other readers honest: the
+  scrub window's `Snapshot::plain` leaves a ramped clip to the one-shot still (the window's `fps` pick is not the still's), an export in
+  parts neither restarts a ramped still nor plans its cost at `speed_mag` (`source_per_frame` is the mean speed), and the
+  thumbnail suggestions place a scene change with `source_to_timeline`.
   **A zoom that is part of the fit is refused** (`PlanLayer.fit_order`, `Clip::fit_order(canvas.fit, cover_overflows)`;
   `engine-cli.md`, "A zoom is part of the fit"): FFmpeg takes such a picture from the source in **one** `scale` to the frame times
   the zoom (`Folded`: a zoom in under Contain; `Uncropped`: a Cover clip that zooms or pans and whose cover hangs over the frame,
