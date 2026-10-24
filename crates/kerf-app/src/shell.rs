@@ -212,7 +212,7 @@ mod tests {
         let id = {
             let heard = heard.clone();
             shell.listen("analysis-progress", move |payload| {
-                heard.lock().unwrap().push(payload.to_string())
+                heard.lock().unwrap().push(payload.to_string());
             })
         };
         shell
