@@ -116,6 +116,15 @@ describe('recomposing replaces the whole bed', () => {
 		expect(made.fade_out).toBe(4);
 	});
 
+	test('plays at 1x with no ramp, whatever the bed’s first piece did', () => {
+		const tl = bedTimeline();
+		Object.assign(mTrack(tl).clips[0], { speed: 2, speed_ramp: [{ time: 0, speed: 0.5 }, { time: 2, speed: 3 }] });
+		const made = mTrack(place(tl, asset(8), { replace_clip_id: 's1' }, 's1', false).timeline).clips[0];
+		expect(made.speed).toBe(1);
+		expect(made.speed_ramp).toBeUndefined();
+		expect(clipDuration(made)).toBe(8);
+	});
+
 	test('ignores `at` and `track_id`: it replaces where the bed is', () => {
 		const made = mTrack(place(bedTimeline(), asset(8), { replace_clip_id: 's1', at: 99, track_id: 'nowhere' }, 's1', false).timeline).clips[0];
 		expect(made.timeline_start).toBe(3);

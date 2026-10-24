@@ -7,6 +7,7 @@ import {
 	keysOf,
 	MIN_KEY_GAP,
 	moveKey,
+	planRampWrite,
 	presetKeys,
 	RAMP_PRESETS,
 	rampSummary,
@@ -26,7 +27,9 @@ import {
 	type TimeAxis
 } from './speed-ramp-edit';
 import { clipDuration, MAX_SPEED_KEYS, rampIsValid, speedAt } from './speed-ramp';
-import type { Clip, SpeedKey } from './types';
+import { clipById, linkClips } from './link-groups';
+import { setSpeedRampLinked } from './links';
+import type { Clip, SpeedKey, Timeline } from './types';
 
 const key = (time: number, speed: number, easing?: 'linear' | 'hold'): SpeedKey => (easing ? { time, speed, easing } : { time, speed });
 const clip = (len: number, extra: Partial<Clip> = {}): Clip => ({
@@ -162,6 +165,19 @@ describe('moving and removing keys', () => {
 		expect(rampIsValid(moveKey(keys, 1, 9, 3, 6))).toBe(true);
 	});
 
+	test('between neighbours too close to leave room the key keeps its time, so the order holds', () => {
+		const tight = [key(0, 1), key(0.01, 2), key(0.019, 3), key(4, 1)];
+		for (const to of [-5, 0, 0.015, 0.019, 3, 99]) {
+			const moved = moveKey(tight, 1, to, 5, 6);
+			expect(moved.map((k) => k.time)).toEqual([0, 0.01, 0.019, 4]);
+			expect(rampIsValid(moved)).toBe(true);
+			expect(moved[1].speed).toBe(5);
+		}
+		const first = [key(0.005, 1), key(0.01, 2)];
+		expect(moveKey(first, 0, 3, 1, 6)[0].time).toBe(0.005);
+		expect(rampIsValid(moveKey(first, 0, 3, 1, 6))).toBe(true);
+	});
+
 	test('a speed is rounded, held to the engine range and snapped to 1x', () => {
 		expect(roundSpeed(0.314)).toBe(0.31);
 		expect(roundSpeed(1.02)).toBe(1);
@@ -238,5 +254,145 @@ describe('words', () => {
 		expect(rampSummary(clip(4, { speed_ramp: [key(0, 1), key(2, 0.3), key(4, 4)] }))).toBe('Ramp · 0.3×–4×');
 		expect(rampSummary(clip(4, { speed_ramp: [key(0, 2)] }))).toBe('Ramp · 2×');
 		expect(rampSummary(clip(4))).toBe('');
+	});
+});
+
+// An edit made on a clip that starts after a linked partner must not clobber the partner's own head: the
+// write goes through the earliest partner, so `set_speed_ramp_linked`'s shift gives every member the curve.
+describe('planRampWrite', () => {
+	let serial = 0;
+	const member = (name: string, start: number, extra: Partial<Clip> = {}): Clip =>
+		clip(8, { id: name, timeline_start: start, ...extra });
+	/** Clips `[name, start, extra]` on one lane each, linked. */
+	function group(...members: [string, number, Partial<Clip>?][]): Timeline {
+		const t = {
+			tracks: members.map(([name, start, extra], i) => ({
+				id: `t${i}-${++serial}`,
+				kind: i === 0 ? 'video' : 'audio',
+				name: `T${i}`,
+				clips: [member(name, start, extra)]
+			}))
+		} as unknown as Timeline;
+		linkClips(t, members.map(([n]) => n));
+		return t;
+	}
+	const at = (t: Timeline, id: string) => clipById(t, id)!;
+	/** Every member's speed at timeline time `T`, from `from` on. */
+	const curve = (t: Timeline, id: string, T: number) => speedAt(at(t, id), T - at(t, id).timeline_start);
+	const apply = (t: Timeline, id: string, next: SpeedKey[]) => {
+		const w = planRampWrite(t, id, next)!;
+		expect(w).not.toBeNull();
+		setSpeedRampLinked(t, w.clipId, w.keys);
+		return w;
+	};
+	const N = [key(0, 1), key(1, 0.2), key(3, 1)];
+
+	function repro(): Timeline {
+		const t = group(['n', 0], ['p', 1]);
+		setSpeedRampLinked(t, 'n', N);
+		return t;
+	}
+
+	test('the later partner holds the earlier clip’s keys before its start, folded into a key at 0', () => {
+		const t = repro();
+		expect(at(t, 'p').speed_ramp).toEqual([key(-1, 1), key(0, 0.2), key(2, 1)]);
+		expect(keysOf(at(t, 'p'))).toEqual([key(0, 0.2), key(2, 1)]);
+	});
+
+	test('a write that changes nothing is not sent, whoever it is on', () => {
+		const t = repro();
+		const p = keysOf(at(t, 'p'));
+		expect(planRampWrite(t, 'p', p)).toBeNull();
+		expect(planRampWrite(t, 'p', setKeyEasing(p, 0, 'linear'))).toBeNull();
+		expect(planRampWrite(t, 'n', N.map((k) => ({ ...k })))).toBeNull();
+		expect(planRampWrite(t, 'n', setKeyEasing(N, 1, 'linear'))).toBeNull();
+		expect(planRampWrite(t, 'p', setKeyEasing(p, 0, 'hold'))).not.toBeNull();
+		const plain = group(['a', 0], ['b', 1]);
+		expect(planRampWrite(plain, 'a', [])).toBeNull();
+	});
+
+	test('a later partner’s edit goes through the earliest one and leaves its earlier keys', () => {
+		const t = repro();
+		const before = structuredClone(t);
+		const next = moveKey(keysOf(at(t, 'p')), 1, 2.5, 0.5, 4);
+		const w = apply(t, 'p', next);
+		expect(w.clipId).toBe('n');
+		expect(at(t, 'n').speed_ramp![0]).toEqual(key(0, 1));
+		// The partner has the keys it was given, to rounding…
+		const got = keysOf(at(t, 'p'));
+		expect(got.map((k) => k.time)).toEqual(next.map((k) => expect.closeTo(k.time, 9)));
+		expect(got.map((k) => k.speed)).toEqual(next.map((k) => expect.closeTo(k.speed, 9)));
+		// …the earlier clip still opens as it did, and both play one curve from the partner's start on.
+		for (const T of [0, 0.25, 0.5, 0.99]) expect(curve(t, 'n', T)).toBeCloseTo(curve(before, 'n', T), 9);
+		for (const T of [1, 1.4, 2, 3.5, 4.6, 6]) expect(curve(t, 'n', T)).toBeCloseTo(curve(t, 'p', T), 9);
+		// Written from the partner as the authority, the same edit loses the earlier key (the bug this routes around).
+		const naive = structuredClone(before);
+		setSpeedRampLinked(naive, 'p', next);
+		expect(at(naive, 'n').speed_ramp![0].time).not.toBe(0);
+	});
+
+	test('a key added from the later partner, and a preset, route the same way', () => {
+		for (const make of [
+			(t: Timeline) => addKeyAt(at(t, 'p'), 1.5)!,
+			(t: Timeline) => presetKeys(RAMP_PRESETS[0], at(t, 'p'), 0)
+		]) {
+			const t = repro();
+			const next = make(t);
+			expect(apply(t, 'p', next).clipId).toBe('n');
+			expect(at(t, 'n').speed_ramp![0]).toEqual(key(0, 1));
+			for (const T of [1, 1.7, 2.6, 4, 7]) expect(curve(t, 'p', T)).toBeCloseTo(speedAt({ ...at(t, 'p'), speed_ramp: next }, T - 1), 9);
+			for (const T of [1, 1.7, 2.6, 4, 7]) expect(curve(t, 'n', T)).toBeCloseTo(curve(t, 'p', T), 9);
+		}
+	});
+
+	test('a first key after the start still leaves the head flat, and the earlier keys alone before it', () => {
+		const t = repro();
+		const next = moveKey(keysOf(at(t, 'p')), 0, 0.75, 0.4, 4);
+		expect(next[0].time).toBe(0.75);
+		apply(t, 'p', next);
+		for (const T of [1, 1.3, 1.75, 2.4, 3.5, 5]) expect(curve(t, 'p', T)).toBeCloseTo(speedAt({ ...at(t, 'p'), speed_ramp: next }, T - 1), 9);
+		expect(curve(t, 'p', 1)).toBeCloseTo(0.4, 9);
+		expect(curve(t, 'n', 0)).toBe(1); // 1x opening kept; it eases to the 0.4x the partner now opens on
+		expect(curve(t, 'n', 0.25)).toBeCloseTo(1 - 0.6 * 0.25, 9);
+	});
+
+	test('the ratio between members is divided out and put back: a partner at another pace gets its own speeds', () => {
+		const t = group(['n', 0], ['p', 1, { speed: 2 }]);
+		setSpeedRampLinked(t, 'n', N);
+		expect(at(t, 'p').speed_ramp!.map((k) => k.speed)).toEqual([2, 0.4, 2]);
+		const next = moveKey(keysOf(at(t, 'p')), 1, 1.5, 0.6, 4);
+		const w = apply(t, 'p', next);
+		expect(w.clipId).toBe('n');
+		const got = keysOf(at(t, 'p'));
+		got.forEach((k, i) => {
+			expect(k.time).toBeCloseTo(next[i].time, 9);
+			expect(k.speed).toBeCloseTo(next[i].speed, 9);
+		});
+		expect(at(t, 'n').speed_ramp![0]).toEqual(key(0, 1));
+		for (const T of [1, 2, 2.5, 4]) expect(curve(t, 'p', T)).toBeCloseTo(2 * curve(t, 'n', T), 9);
+	});
+
+	test('with three members the earliest speaks for all of them', () => {
+		const t = group(['a', 0], ['b', 0.5], ['c', 1.25]);
+		setSpeedRampLinked(t, 'a', N);
+		const next = addKeyAt(at(t, 'c'), 1)!;
+		expect(apply(t, 'c', next).clipId).toBe('a');
+		for (const T of [1.25, 1.9, 2.25, 3, 4.5, 7]) {
+			const want = speedAt({ ...at(t, 'c'), speed_ramp: next }, T - 1.25);
+			for (const id of ['a', 'b', 'c']) expect(curve(t, id, T)).toBeCloseTo(want, 9);
+		}
+		expect(at(t, 'a').speed_ramp![0]).toEqual(key(0, 1));
+	});
+
+	test('the earliest clip, a clip alone, and a clear write straight', () => {
+		const t = repro();
+		const next = moveKey(N, 1, 1.5, 0.3, 4);
+		expect(planRampWrite(t, 'n', next)).toEqual({ clipId: 'n', keys: next });
+		expect(planRampWrite(t, 'p', [])).toEqual({ clipId: 'p', keys: [] });
+		const solo = clip(8, { id: 'solo', speed_ramp: [key(0, 1), key(2, 2)] });
+		const lone = { tracks: [{ id: 't', kind: 'video', name: 'V1', clips: [solo] }] } as unknown as Timeline;
+		expect(planRampWrite(lone, 'solo', [key(0, 1), key(3, 2)])).toEqual({ clipId: 'solo', keys: [key(0, 1), key(3, 2)] });
+		const ties = group(['x', 2], ['y', 2]);
+		expect(planRampWrite(ties, 'y', [key(0, 1), key(1, 2)])?.clipId).toBe('y');
 	});
 });

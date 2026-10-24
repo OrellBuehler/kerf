@@ -129,6 +129,21 @@ describe('a crossfade-in is constant-power, as the export draws it', () => {
 		expect(crossfadeIn(plain)).toBe(false);
 		expect(clipGainAt(plain, 10.5, 10, 20)).toBeCloseTo(0.5, 12);
 	});
+	test('a ramped side is never the same sound: its rate moves, so the pair is constant-power', () => {
+		const ramp = [{ time: 0, speed: 1 }];
+		const fade = { kind: 'crossfade', duration: 1 };
+		const out = { id: 'a', asset_id: 's', source_in: 0, source_out: 10, timeline_start: 0 };
+		const inn = { id: 'b', asset_id: 's', source_in: 10, source_out: 20, timeline_start: 10, transition_in: fade };
+		const pair = (o: object, i: object) => crossfadePair([o, i] as never, i as never);
+		expect(pair(out, inn)).toBe(false);
+		expect(pair({ ...out, speed_ramp: ramp }, inn)).toBe(true);
+		expect(pair(out, { ...inn, speed_ramp: ramp })).toBe(true);
+		expect(pair({ ...out, speed_ramp: ramp }, { ...inn, speed_ramp: ramp })).toBe(true);
+		// A de-click splice is the same sound too, ramped or not: only an unramped one is exempt.
+		const splice = { ...inn, transition_in: { kind: 'crossfade', duration: SPLICE_CROSSFADE_S }, source_in: 20, source_out: 30 };
+		expect(pair(out, splice)).toBe(false);
+		expect(pair({ ...out, speed_ramp: ramp }, splice)).toBe(true);
+	});
 	test('a clip fade beside it, a dip, or no transition stays linear', () => {
 		const mixed = { volume: 1, fade_in: 0.5, transition_in: { kind: 'crossfade', duration: 1.5 } } as never;
 		const dip = { volume: 1, transition_in: { kind: 'dip_to_black', duration: 2 } } as never;

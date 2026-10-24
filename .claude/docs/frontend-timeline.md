@@ -621,4 +621,4 @@ the ramp: filmstrip slots and waveform columns (`sourceAt` over `along`), the sc
 (`sourceToTimeline`), captions and transcript lines, the clip's width (`clipDuration`) and the edge-trim bounds
 (`headTime` / `tailTime`, the time the ramp takes to play the handle). An edge trim on a ramped clip commits one `trim`
 and `Project::trim` rebases the ramp when the head moves (`Clip::follow_head`; the harness: `trimRamp`), so the far edge stays where the pointer put it;
-`rippleTrimPreview` applies the same rebase to its scratch copy.
+`rippleTrimPreview` and `linkedTrimPreview` apply the same rebase to their scratch copies (`linkedTrimPreview` before `carryExtentEdit`, which reads the trimmed clip, so a partner is carried off the rebased ramp and a neighbour just past the far edge is not a false overlap).

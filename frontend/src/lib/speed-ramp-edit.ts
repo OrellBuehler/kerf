@@ -3,6 +3,7 @@
 // easing, delete one, apply a preset. The map the keys mean is `speed-ramp.ts`'s (kerf-core's); every list
 // that leaves here is one `ramp_is_valid` accepts, sorted, with times a `MIN_KEY_GAP` apart.
 
+import { clipById, linkPartners } from './link-groups';
 import {
 	clipDuration,
 	clipRamp,
@@ -14,7 +15,7 @@ import {
 	speedMag,
 	type Windowed
 } from './speed-ramp';
-import type { SpeedKey } from './types';
+import type { Clip, SpeedKey, Timeline } from './types';
 
 /** Closest two keys may sit, seconds: a key dragged against its neighbour stops here. */
 export const MIN_KEY_GAP = 0.02;
@@ -173,12 +174,56 @@ export function setKeyEasing(keys: readonly SpeedKey[], i: number, easing: 'line
 }
 
 /** Key `i` moved to `time` and `speed`: its time held between its neighbours' (never past them: a drag does not
- *  reorder) and inside `[0, span]`, its speed rounded as `roundSpeed` does. */
+ *  reorder) and inside `[0, span]`, its speed rounded as `roundSpeed` does. Between neighbours less than two
+ *  `MIN_KEY_GAP` apart there is no room to move: the key keeps its time (its speed still moves). */
 export function moveKey(keys: readonly SpeedKey[], i: number, time: number, speed: number, span: number): SpeedKey[] {
 	const lo = i > 0 ? keys[i - 1].time + MIN_KEY_GAP : 0;
 	const hi = i + 1 < keys.length ? keys[i + 1].time - MIN_KEY_GAP : Math.max(span, lo);
-	const t = clamp(time, lo, Math.max(hi, lo));
+	const t = lo > hi ? keys[i].time : clamp(time, lo, hi);
 	return keys.map((k, j) => (j === i ? keyOf(t, roundSpeed(speed), k.easing) : { ...k }));
+}
+
+/** A `set_speed_ramp` the editor sends: the clip that speaks for the group, and its keys. */
+export interface RampWrite {
+	clipId: string;
+	keys: SpeedKey[];
+}
+
+/** Closer than this two starts are one (a partner that starts no earlier is not routed through). */
+const START_EPS = 1e-9;
+
+/**
+ * What to send for `clipId` being given the ramp `next` (the editor's keys: clip-local, from 0), or `null` when it
+ * changes nothing — a write whose keys are those the clip shows already is not sent, whatever gesture made it.
+ *
+ * `set_speed_ramp_linked` makes the named clip the authority: its keys go to each partner shifted by the difference
+ * of their starts. A partner that starts earlier holds keys of its own before this clip's start, which this clip
+ * cannot see (`keysOf` folds them into a key at 0) and which a write from here would overwrite. So with such a
+ * partner the write goes through the earliest-starting one instead: its keys before this clip's start stay, and
+ * `next` follows in its clock (pinned at this clip's start, so a first key later than 0 still leaves the head flat),
+ * speeds divided by the ratio the backend will multiply them by (`set_speed_ramp_linked`'s own), so the shift gives
+ * this clip back `next` and every other member the same curve on the timeline. A clear is the same from anywhere.
+ */
+export function planRampWrite(timeline: Timeline, clipId: string, next: readonly SpeedKey[]): RampWrite | null {
+	const clip = clipById(timeline, clipId);
+	const direct: RampWrite = { clipId, keys: next.map((k) => ({ ...k })) };
+	if (!clip) return direct;
+	if (sameKeys(next, keysOf(clip))) return null;
+	if (next.length === 0) return direct;
+	let lead: Clip | undefined;
+	for (const id of linkPartners(timeline, clipId)) {
+		const p = clipById(timeline, id)!;
+		if (p.timeline_start < clip.timeline_start - START_EPS && (!lead || p.timeline_start < lead.timeline_start)) lead = p;
+	}
+	if (!lead) return direct;
+	const off = clip.timeline_start - lead.timeline_start;
+	let ratio = speedAt(clip, -off) / speedAt(lead, 0);
+	if (Math.abs(ratio - 1) < 1e-9) ratio = 1;
+	const kept = keysOf(lead).filter((k) => k.time < off - START_EPS);
+	const keys: SpeedKey[] = kept.map((k) => ({ ...k }));
+	if (kept.length > 0 && next[0].time > START_EPS) keys.push(keyOf(off, next[0].speed / ratio));
+	for (const k of next) keys.push(keyOf(k.time + off, k.speed / ratio, k.easing));
+	return { clipId: lead.id, keys };
 }
 
 /** Whether two lists are the same ramp (a gesture that ends where it began writes nothing). */

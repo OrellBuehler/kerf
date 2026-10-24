@@ -29,6 +29,7 @@ import { gestureReason, reasonOf } from './link-ui';
 import { carryExtentEdit, checkCarriedLanes } from './links';
 import { conformLinks, DIFF_EPS, rippleLanes } from './ripple';
 import { trimBounds, type TrimBounds } from './ripple-trim';
+import { trimRamp } from './speed-ramp';
 import { plainCopy } from './trim-tools';
 import type { Clip, Timeline, Track } from './types';
 import { clipDuration } from './types';
@@ -131,6 +132,7 @@ export function linkedTrimPreview(
 	// What `trim_clip` does with those fields.
 	if (e.source_in !== undefined) clip.source_in = e.source_in;
 	if (e.source_out !== undefined) clip.source_out = e.source_out;
+	trimRamp(was, clip);
 	if (e.timeline_start !== undefined) {
 		clip.timeline_start = Math.max(0, e.timeline_start);
 		home.clips.sort((a, b) => a.timeline_start - b.timeline_start);

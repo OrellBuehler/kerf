@@ -93,6 +93,7 @@ function replaceBed(timeline: Timeline, clipId: string, asset: PlacedAsset): Cli
 	clip.source_in = 0;
 	clip.source_out = asset.duration;
 	clip.speed = 1;
+	delete clip.speed_ramp;
 	clip.timeline_start = first.timeline_start;
 	const duration = clipDuration(clip);
 	clip.fade_in = Math.min(first.fade_in, duration);

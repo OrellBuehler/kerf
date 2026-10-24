@@ -1489,7 +1489,7 @@
 			</CheckRow>
 			{#if ramped}
 				<div data-ramp-note style="font-size:12px;line-height:1.4;color:var(--text-muted);margin-top:6px">
-					The ramp below sets the speed, so this rate is not used. Setting a rate or the direction here clears the ramp.
+					The ramp below sets the speed, so this rate is not used. Setting a rate here clears the ramp, and Reverse is off until you clear it.
 				</div>
 			{/if}
 			{#if lockedWhy}

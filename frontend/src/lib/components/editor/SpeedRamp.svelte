@@ -5,6 +5,8 @@
 	// window losing focus abandon it. A focused handle's arrows nudge it (a frame, a tenth of a stop), Delete
 	// removes it, and a double-click on empty graph adds a key there. *Add key at playhead* takes the speed the
 	// clip runs at there, so the timing does not jump; the presets replace the ramp; Clear takes it away.
+	// A write that changes nothing is not sent, and one on a clip that starts after a linked partner goes through
+	// the earliest partner (`planRampWrite`), so the partner's own keys before this clip's start survive.
 	// Keys are clip-local timeline seconds, like the engine's (`speed-ramp.ts` is the map they mean).
 	import Btn from './Btn.svelte';
 	import Chip from './Chip.svelte';
@@ -24,6 +26,7 @@
 		fmtSpeed,
 		keysOf,
 		moveKey,
+		planRampWrite,
 		presetKeys,
 		RAMP_PRESETS,
 		removeKey,
@@ -102,8 +105,10 @@
 
 	async function write(next: SpeedKey[], then?: () => void) {
 		if (off) return;
+		const plan = planRampWrite(editor.timeline, clip.id, next);
+		if (!plan) return;
 		try {
-			await editor.setSpeedRamp(clip.id, next);
+			await editor.setSpeedRamp(plan.clipId, plan.keys);
 			then?.();
 		} catch (e) {
 			report(e);
