@@ -102,7 +102,7 @@ pub use model::{
     Projection, Property, PropertyKey, PropertyTrack, Reframe, ReframeKeyframe, ResolvedReframe, Revision, Rhythm, SalienceMap,
     ScoreHit, ScoreSection, SectionKind, SectionSpan, SkippedChange, SkippedDetach, SourceLimits, SplitSide, StagedAssetChange,
     StagedEdit, StreamInfo, StreamKind, Subsampling, SubsetMerge, SvgOverlay, SvgOverlayPatch, SvgPreset, SvgPresetKind,
-    SvgPresetParams, Task, TaskStatus, TextKeyframe, TextOverlay, Thumbnail, ThumbnailLayer, TimeRange, Timeline, TimelineDiff, TitleClip, Track,
+    SvgPresetParams, Task, TaskStatus, TextKeyframe, TextOverlay, Thumbnail, ThumbnailLayer, TimeRange, VideoGraphics, Timeline, TimelineDiff, TitleClip, Track,
     TrackLevels, TranscriptSegment, Transform, TransformPatch, Transition, TransitionKind, VideoEffect, Voiceover, Wheel, Wheels,
     Word, ADJACENT_EPS, DEFAULT_MAX_TEMPO_CHANGE, GENERATED_ASSET, LEVELS_TARGET_LUFS, LEVELS_TRUE_PEAK_CEILING_DBTP,
     MASTER_DEFAULT_CEILING_DB, MASTER_MAX_VOLUME, MASTER_MIN_CEILING_DB, MAX_BPM, MAX_CHANNEL_VOLUME, MAX_DELIVERY_FPS, MAX_SEED,

@@ -38,6 +38,7 @@ mod project_tools;
 mod reads;
 mod server;
 mod templates;
+mod thumbnails;
 
 use jobs::Run;
 pub(crate) use server::bind_problem;
@@ -2426,6 +2427,10 @@ struct TimelineSummary {
     /// source. Absent when there are none.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     title_clips: Vec<TitleClipSummary>,
+    /// The thumbnails designed beside the cut (add_thumbnail), without their layers' sources. Absent
+    /// when there are none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    thumbnails: Vec<serde_json::Value>,
     /// The frame this cut is being made for, e.g. "1080x1920 (cover, 50 fps)" (the rate only when
     /// the delivery states one). Absent when the project follows its footage's shape. Worth reading
     /// before framing anything: under a cover delivery the crop decides what survives.
@@ -6199,6 +6204,7 @@ impl KerfMcp {
                 tracks,
                 svg_overlays: timeline.svg_overlays.iter().map(SvgOverlaySummary::from).collect(),
                 title_clips: TitleClipSummary::all(&timeline),
+                thumbnails: timeline.thumbnails.iter().map(thumbnails::thumbnail_view).collect(),
                 delivery_format: timeline.format.map(|d| match d.rate() {
                     Some(fps) => format!(
                         "{}x{} ({}, {} fps)",
@@ -6523,7 +6529,8 @@ fn router() -> &'static rmcp::handler::server::router::tool::ToolRouter<KerfMcp>
             + KerfMcp::tool_router_jobs()
             + KerfMcp::tool_router_reads()
             + KerfMcp::tool_router_project()
-            + KerfMcp::tool_router_templates();
+            + KerfMcp::tool_router_templates()
+            + KerfMcp::tool_router_thumbnails();
         hints::annotate(&mut router);
         router
     })
@@ -6866,9 +6873,14 @@ const EDITING_GUIDE: &str = "How to edit with Kerf. The user queues editing task
              whether its low end or mids fight the voice. To change it, edit \
              the score (list_assets shows it as music_score) and compose again \
              with replace_clip_id. Call export to render, and export_cover to \
-             write the thumbnail the platform shows before anyone presses play. \
+             write a plain frame of the video as its cover. A thumbnail with \
+             graphics of its own (a headline, a template, a logo the video \
+             never shows) comes once the cut is final: suggest_thumbnail_frames \
+             for good frames (look at its contact sheet), add_thumbnail with \
+             the frame, a size and its layers, preview_thumbnail to look, \
+             update_thumbnail to adjust, export_thumbnail to write it. \
              export / export_srt / export_captions / export_interchange / \
-             export_markers / export_cover / export_variants all take an \
+             export_markers / export_cover / export_thumbnail / export_variants all take an \
              absolute local output path and refuse to overwrite a file that's \
              already there unless you pass overwrite=true.";
 
@@ -9542,6 +9554,7 @@ mod tests {
             "compose_music",
             "download_speech_model",
             "export",
+            "export_thumbnail",
             "export_variants",
             "generate_voiceover",
             "import_asset",

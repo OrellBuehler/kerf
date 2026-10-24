@@ -313,7 +313,7 @@ fn template_path_arg(path: &str) -> Result<PathBuf, McpError> {
 
 /// The control values a call carries: `values`, and each `image_files` entry read (bounded) as the
 /// `data:` URL an image control takes. Reads files: for the blocking pool, before any lock.
-fn control_values(
+pub(super) fn control_values(
     values: Option<BTreeMap<String, String>>,
     image_files: Option<BTreeMap<String, String>>,
 ) -> Result<BTreeMap<String, String>, McpError> {
