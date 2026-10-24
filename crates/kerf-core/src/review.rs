@@ -262,6 +262,19 @@ fn tail_source(c: &Clip) -> f64 {
     }
 }
 
+/// How far apart the speeds of two neighbouring clips are where they meet: the difference of their
+/// speeds, or, when either changes its rate over its length, of the speeds at the cut (a clip that plays
+/// the other way round is infinitely far).
+fn pace_gap(a: &Clip, b: &Clip) -> f64 {
+    if !a.is_ramped() && !b.is_ramped() {
+        return (a.speed - b.speed).abs();
+    }
+    if a.is_reversed() != b.is_reversed() {
+        return f64::INFINITY;
+    }
+    (a.speed_at(a.duration()) - b.speed_at(0.0)).abs()
+}
+
 fn in_silence(analysis: &AssetAnalysis, t: f64) -> bool {
     analysis
         .silence_segments
@@ -347,8 +360,8 @@ impl Cut<'_> {
     /// Whether `b` plays on from where `a` stopped — a split nobody took anything out of, which
     /// is no cut at all to the eye or the ear.
     fn continues(&self, a: &Clip, b: &Clip) -> bool {
-        let tolerance = self.frame / 2.0 * a.speed_mag();
-        a.asset_id == b.asset_id && (a.speed - b.speed).abs() < 1e-9 && (head_source(b) - tail_source(a)).abs() <= tolerance
+        let tolerance = self.frame / 2.0 * a.speed_at(a.duration());
+        a.asset_id == b.asset_id && pace_gap(a, b) < 1e-9 && (head_source(b) - tail_source(a)).abs() <= tolerance
     }
 
     fn flash_frames(&self, issues: &mut Vec<ReviewIssue>) -> std::result::Result<(), String> {
@@ -510,11 +523,11 @@ impl Cut<'_> {
                 if a.asset_id != b.asset_id || !self.is_footage(a) || !self.meet(a, b) || b.transition_in.is_some() {
                     continue;
                 }
-                if a.is_reversed() || b.is_reversed() || (a.speed - b.speed).abs() > 1e-6 {
+                if a.is_reversed() || b.is_reversed() || pace_gap(a, b) > 1e-6 {
                     continue;
                 }
                 let gap = b.source_in - a.source_out;
-                if gap <= self.frame * a.speed_mag() || gap > JUMP_MAX_SOURCE_GAP {
+                if gap <= self.frame * a.speed_at(a.duration()) || gap > JUMP_MAX_SOURCE_GAP {
                     continue;
                 }
                 if reframed(a, b) {

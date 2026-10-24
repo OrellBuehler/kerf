@@ -181,7 +181,7 @@ pub(super) fn generated_violations(clip: &Clip, kind: StreamKind) -> Vec<&'stati
     if clip.asset_id != GENERATED_ASSET {
         out.push("is a title and also names an asset");
     }
-    if clip.speed != 1.0 {
+    if clip.speed != 1.0 || !clip.speed_ramp.is_empty() {
         out.push("is a title, which plays at its own speed");
     }
     if clip.link_id.is_some() {

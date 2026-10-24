@@ -3603,6 +3603,21 @@ impl Clip {
         if limit.is_infinite() {
             return (f64::INFINITY, f64::INFINITY);
         }
+        if self.is_ramped() {
+            // The footage either side is a source span; how long it plays depends on where it
+            // plays. Pulling the start out shifts the ramp later (the new head holds the first
+            // key's speed), extending the end runs on at the last key's.
+            let (before, after) = (self.source_in.max(0.0), (limit - self.source_out).max(0.0));
+            let (head, tail) = if self.is_reversed() {
+                (after, before)
+            } else {
+                (before, after)
+            };
+            return (
+                -self.local_at_along(-head),
+                self.local_at_along(self.source_duration() + tail) - self.duration(),
+            );
+        }
         let mag = self.speed_mag();
         let before = self.source_in.max(0.0) / mag;
         let after = (limit - self.source_out).max(0.0) / mag;
@@ -3613,13 +3628,25 @@ impl Clip {
         }
     }
 
+    /// Source seconds the end moves when it moves by `by` timeline seconds (positive lengthens): the
+    /// ramp from the end on, not a ratio, for a clip whose rate changes.
+    fn tail_shift(&self, by: f64) -> f64 {
+        if !self.is_ramped() {
+            return by * self.speed_mag();
+        }
+        if by == 0.0 {
+            return 0.0;
+        }
+        self.along(self.duration() + by) - self.source_duration()
+    }
+
     /// Move the clip's end by `by` timeline seconds (positive lengthens),
     /// writing the source window the way the clip plays it: a forward clip's
     /// out-point, a reversed clip's in-point. `looping` — a still — writes only
     /// the out-point whichever way it plays: a still's window is its length, and
     /// this way it can never reach below zero.
     fn move_tail(&mut self, by: f64, looping: bool) {
-        let shift = by * self.speed_mag();
+        let shift = self.tail_shift(by);
         if self.is_reversed() && !looping {
             self.source_in -= shift;
         } else {
@@ -3633,8 +3660,9 @@ impl Clip {
     /// [`Clip::move_tail`], and the animation rides with the content
     /// ([`Clip::rebase_animation`]).
     fn move_head(&mut self, by: f64, looping: bool) {
+        // The footage the head gives up is read off the ramp as it was, before it is rebased.
+        let shift = self.along(by);
         self.rebase_animation(by);
-        let shift = by * self.speed_mag();
         if self.is_reversed() || looping {
             self.source_out -= shift;
         } else {
@@ -3654,6 +3682,7 @@ impl Clip {
     /// [`Timeline::slice`] does for a range export) and later keys shift back.
     /// Pulled earlier (`by < 0`) every key shifts later, and the new head holds the
     /// first key's pose — which is what interpolation does before the first key.
+    /// The speed ramp rides with the content the same way ([`Clip::rebase_ramp`]).
     fn rebase_animation(&mut self, by: f64) {
         if by > 0.0 {
             if !self.keyframes.is_empty() {
@@ -3713,6 +3742,7 @@ impl Clip {
         }
         if by != 0.0 {
             self.rebase_channels(by);
+            self.rebase_ramp(by);
         }
     }
 
@@ -3892,7 +3922,6 @@ impl Track {
                 }
             }
 
-            let speed = clip.speed_mag();
             let mut duration = clip.duration();
             if let Some(beat) = nearest_beat(beats, start + duration, tolerance) {
                 let limit = source_limit.get(&clip.asset_id).copied().unwrap_or(f64::INFINITY);
@@ -3901,7 +3930,7 @@ impl Track {
                 } else {
                     (limit - clip.source_in).max(0.0)
                 };
-                let available = source_left / speed;
+                let available = clip.local_at_along(source_left);
                 let wanted = (beat - start).clamp(MIN_BEAT_CLIP, available.max(MIN_BEAT_CLIP));
                 if (wanted - duration).abs() > 1e-6 {
                     moved += 1;
@@ -3910,10 +3939,11 @@ impl Track {
             }
 
             clip.timeline_start = start;
+            let travelled = clip.along(duration);
             if clip.is_reversed() {
-                clip.source_in = (clip.source_out - duration * speed).max(0.0);
+                clip.source_in = (clip.source_out - travelled).max(0.0);
             } else {
-                clip.source_out = clip.source_in + duration * speed;
+                clip.source_out = clip.source_in + travelled;
             }
             cursor = clip.timeline_end();
         }
@@ -5040,14 +5070,15 @@ impl Timeline {
                     continue;
                 }
                 let mut c = clip.clone();
-                let mag = c.speed_mag();
                 let cut_front = (start - cs).max(0.0);
                 let cut_back = (ce - end).max(0.0);
+                // Both cuts are read off the ramp as the clip has it, before the front rebases it.
+                let (front_src, back_src) = (clip.along(cut_front), clip.tail_shift(-cut_back));
                 if cut_front > 0.0 {
                     if c.is_reversed() {
-                        c.source_out -= cut_front * mag;
+                        c.source_out -= front_src;
                     } else {
-                        c.source_in += cut_front * mag;
+                        c.source_in += front_src;
                     }
                     c.fade_in = 0.0;
                     c.transition_in = None;
@@ -5057,9 +5088,9 @@ impl Timeline {
                 }
                 if cut_back > 0.0 {
                     if c.is_reversed() {
-                        c.source_in += cut_back * mag;
+                        c.source_in -= back_src;
                     } else {
-                        c.source_out -= cut_back * mag;
+                        c.source_out += back_src;
                     }
                     c.fade_out = 0.0;
                 }
@@ -5109,10 +5140,14 @@ impl Timeline {
 }
 
 mod channels;
+mod ramp_edit;
+#[cfg(test)]
+mod ramp_tests;
 mod speed_ramp;
 use channels::channel_changes;
 pub use channels::{key_polyline, Property, PropertyKey, PropertyTrack, MAX_CHANNEL_VOLUME};
-pub use speed_ramp::{ramp_is_valid, RampEasing, SpeedKey, MAX_SPEED_KEYS};
+pub use ramp_edit::check_speed_ramp;
+pub use speed_ramp::{ramp_is_valid, RampEasing, SpeedKey, MAX_RAMP_TIME, MAX_SPEED_KEYS};
 
 mod links;
 pub use links::{Detached, DetachedMany, SkippedDetach};
@@ -5741,7 +5776,7 @@ fn fit_end(clip: &mut Clip, limit: f64, looping: bool) {
         if over <= 0.0 || over > DIFF_EPS {
             return;
         }
-        let by = over * clip.speed_mag();
+        let by = over * clip.speed_at(clip.duration());
         if clip.is_reversed() && !looping {
             // The end of a reversed clip is its in-point: raise it to shorten.
             let moved = clip.source_in + by;
@@ -6654,6 +6689,7 @@ fn clip_changes(before: &Clip, after: &Clip) -> Option<String> {
     if num_changed(before.speed, after.speed) {
         parts.push(format!("speed {:.2}× → {:.2}×", before.speed, after.speed));
     }
+    parts.extend(ramp_edit::ramp_changes(before, after));
     if before.enabled != after.enabled {
         parts.push(if after.enabled { "re-enabled" } else { "disabled" }.to_string());
     }

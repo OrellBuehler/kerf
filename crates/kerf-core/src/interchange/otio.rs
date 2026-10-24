@@ -7,7 +7,7 @@
 
 use serde_json::{json, Value};
 
-use super::{clip_extras, file_url, one_line, InterchangeOptions, Report, Timebase};
+use super::{clip_extras, export_speed, file_url, one_line, InterchangeOptions, Report, Timebase};
 use crate::clip_timing::transition_fx;
 use crate::error::{Error, Result};
 use crate::model::{Asset, Clip, Marker, StreamKind, Timeline, Track};
@@ -117,14 +117,20 @@ fn media_reference(tb: &Timebase, asset: Option<&Asset>, report: &mut Report) ->
 
 fn clip_json(tb: &Timebase, clip: &Clip, asset: Option<&Asset>, report: &mut Report) -> Result<Value> {
     let mut effects = Vec::new();
-    if (clip.speed - 1.0).abs() > f64::EPSILON {
+    let speed = export_speed(clip);
+    if (speed - 1.0).abs() > f64::EPSILON {
         effects.push(json!({
             "OTIO_SCHEMA": "LinearTimeWarp.1",
             "name": "",
             "effect_name": "LinearTimeWarp",
-            "time_scalar": clip.speed,
+            "time_scalar": speed,
             "metadata": {},
         }));
+    }
+    if clip.is_ramped() {
+        report.warn(
+            "speed ramps were written at their average speed (a LinearTimeWarp is one rate); the ramp itself is kept in metadata.kerf",
+        );
     }
     for extra in clip_extras(clip) {
         report.info(format!(

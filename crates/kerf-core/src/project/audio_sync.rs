@@ -226,7 +226,7 @@ impl Project {
 }
 
 fn check_plain_speed(clip: &Clip) -> Result<()> {
-    if clip.is_reversed() || (clip.speed_mag() - 1.0).abs() > 1e-9 {
+    if clip.is_reversed() || clip.is_ramped() || (clip.speed_mag() - 1.0).abs() > 1e-9 {
         return Err(Error::InvalidArgument(format!(
             "clip {} plays at another speed or reversed; sync needs both at normal speed",
             clip.id

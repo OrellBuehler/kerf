@@ -28,6 +28,10 @@ use super::*;
 /// The most keys one clip's ramp may hold: the export nests one `if` per key in a balanced tree.
 pub const MAX_SPEED_KEYS: usize = 16;
 
+/// The furthest a key may lie from the clip's start, in seconds (about eleven days): past it a segment's
+/// squared length is no longer a number worth squaring, and nothing is that long.
+pub const MAX_RAMP_TIME: f64 = 1e6;
+
 /// How the speed moves from one key to the next.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -67,14 +71,14 @@ impl SpeedKey {
     }
 }
 
-/// Whether `keys` is a ramp the map can read: one to [`MAX_SPEED_KEYS`] keys, finite strictly
-/// increasing times, finite speeds in `MIN_SPEED..=MAX_SPEED`.
+/// Whether `keys` is a ramp the map can read: one to [`MAX_SPEED_KEYS`] keys, strictly increasing
+/// times within [`MAX_RAMP_TIME`] of the start, finite speeds in `MIN_SPEED..=MAX_SPEED`.
 pub fn ramp_is_valid(keys: &[SpeedKey]) -> bool {
     !keys.is_empty()
         && keys.len() <= MAX_SPEED_KEYS
         && keys
             .iter()
-            .all(|k| k.time.is_finite() && k.speed.is_finite() && (MIN_SPEED..=MAX_SPEED).contains(&k.speed))
+            .all(|k| k.time.abs() <= MAX_RAMP_TIME && k.speed.is_finite() && (MIN_SPEED..=MAX_SPEED).contains(&k.speed))
         && keys.windows(2).all(|w| w[0].time < w[1].time)
 }
 
