@@ -32,8 +32,8 @@ use kerf_core::{
     Asset, AssetAnalysis, AudioEffect, CaptionFile, CaptionFormat, CaptionImportRequest, CaptionOptions, CaptionTimeBase,
     ClipCut, ClipMove, Delivery, EditSource, ExportOptions, Filmstrip, FilmstripSheet, Fit, Grade, ImportOutcome, ImportSummary,
     Keyframe, Levels, Mask, MissingAsset, Page, Project, Projection, Property, PropertyKey, PropertyTrack, ReframeKeyframe,
-    RelinkCheck, Relinked, RemovedAsset, Revision, SplitSide, StagedEdit, StreamKind, SubsetApplied, SvgCheck, SvgLayout,
-    SvgOverlayPatch, SvgPresetInfo, SvgPresetKind, SvgPresetParams, SvgSource, Task, TemplateControl, TemplateLibrary,
+    RelinkCheck, Relinked, RemovedAsset, Revision, SpeedKey, SplitSide, StagedEdit, StreamKind, SubsetApplied, SvgCheck,
+    SvgLayout, SvgOverlayPatch, SvgPresetInfo, SvgPresetKind, SvgPresetParams, SvgSource, Task, TemplateControl, TemplateLibrary,
     TemplateList, TemplateSaveRequest, TemplateSaved, TextKeyframe, TimeRange, Timeline, TimelineDiff, TitleClipPatch,
     TitleClipPlacement, TitleClipResult, TitleEdited, Transition, TransitionKind, VideoEffect, WaveformRange,
 };
@@ -2218,6 +2218,18 @@ fn set_speed(state: State<'_, AppState>, clip_id: String, speed: f64, link: Opti
     let project = state.project();
     project
         .with_links(link, |p| p.set_speed(id, speed))
+        .map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+/// Give a clip a speed ramp (keys in clip-local timeline seconds, empty clears it); its linked
+/// partners get the same ramp unless `link` is `false`.
+#[tauri::command(async)]
+fn set_speed_ramp(state: State<'_, AppState>, clip_id: String, keys: Vec<SpeedKey>, link: Option<bool>) -> CmdResult<Timeline> {
+    let id = id(&clip_id, "clip_id")?;
+    let project = state.project();
+    project
+        .with_links(link, |p| p.set_speed_ramp(id, keys))
         .map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
@@ -5564,6 +5576,7 @@ pub fn run() {
             set_volume,
             set_fade,
             set_speed,
+            set_speed_ramp,
             set_transform,
             set_transform_at,
             set_color,

@@ -18,9 +18,9 @@ use base64::Engine as _;
 use kerf_core::{
     AudioEffect, CaptionFormat, CaptionImportRequest, CaptionOptions, CaptionStyle, CaptionTimeBase, ClipCut, ClipLut, ClipMove,
     CurvePoint, Curves, Delivery, EditSource, ExportOptions, Fit, Keyframe, Mask, MaskShape, Project, Projection, Property,
-    PropertyKey, PropertyTrack, ReframeKeyframe, Region, SplitSide, StreamKind, SvgCheck, SvgDoc, SvgLayout, SvgOverlay,
-    SvgOverlayPatch, SvgOverlayResult, SvgPreset, SvgPresetKind, SvgPresetParams, SvgSource, TextKeyframe, TimeRange, Timeline,
-    TitleClipPatch, TitleClipPlacement, TitleClipResult, Transition, TransitionKind, VideoEffect, Wheel, Wheels,
+    PropertyKey, PropertyTrack, ReframeKeyframe, Region, SpeedKey, SplitSide, StreamKind, SvgCheck, SvgDoc, SvgLayout,
+    SvgOverlay, SvgOverlayPatch, SvgOverlayResult, SvgPreset, SvgPresetKind, SvgPresetParams, SvgSource, TextKeyframe, TimeRange,
+    Timeline, TitleClipPatch, TitleClipPlacement, TitleClipResult, Transition, TransitionKind, VideoEffect, Wheel, Wheels,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
@@ -1032,6 +1032,24 @@ struct SpeedParams {
     ripple: Option<bool>,
     #[schemars(
         description = "Linked-clip override for this call. Omitted, clips linked to the ones named — a picture and its detached sound (detach_audio, link_clips; `link_id` in get_timeline_state shows the groups) — are edited with them: partners are retimed by the same ratio and re-placed about the clip you named (a sound that leads its picture still leads it, scaled); the linked clips after follow it. false edits only what you named and ignores links, which can leave a picture and its sound out of sync. A linked clip on a locked track refuses the whole call."
+    )]
+    link: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SpeedRampParams {
+    #[schemars(description = "UUID of the clip")]
+    clip_id: String,
+    #[schemars(
+        description = "The ramp's keys, at most 16, each {time, speed, easing?}. `time` is seconds from the clip's START on the timeline (not source seconds), strictly increasing once sorted (keys are put in time order for you; two at one time are refused). `speed` is a magnitude from 0.01 to 100 (1 = normal, 0.3 = slow motion, 2 = fast); the clip's direction stays the sign of its own speed, so a reversed clip stays reversed. `easing` is how the speed moves from this key to the next: \"linear\" (default) changes steadily over timeline time, \"hold\" keeps this key's speed until the next key and then jumps. Before the first key the clip runs at the first key's speed, after the last at the last's. An empty list removes the ramp (the clip goes back to its own `speed`) and is an error when the clip has none."
+    )]
+    keys: Vec<SpeedKey>,
+    #[schemars(
+        description = "Ripple override for this call. Omitted, the project's ripple mode applies (get_ripple_mode). With ripple on, the later clips on the same track follow the change in this clip's duration, keeping their gaps; false leaves later clips where they are (a slowed clip then runs into its neighbour). Tracks ripple independently. Ripple is an attempt, not a guarantee: it never moves a locked track (and an edit to a clip ON a locked track is refused outright), and a lane it would leave overlapping (or before 0) is kept as the edit made it — check get_timeline_state afterwards rather than assuming the later clips moved."
+    )]
+    ripple: Option<bool>,
+    #[schemars(
+        description = "Linked-clip override for this call. Omitted, clips linked to the one named — a picture and its detached sound (`link_id` in get_timeline_state shows the groups) — get the same ramp on the timeline (a key 3 s into the named clip lands 3 s into that moment of a partner that starts elsewhere) and are re-placed about it; the linked clips after follow. false ramps only the clip you named, which can leave a picture and its sound out of sync. A linked clip on a locked track refuses the whole call."
     )]
     link: Option<bool>,
 }
@@ -2710,7 +2728,9 @@ impl KerfMcp {
                        (`svg_overlays`) carry their SVG source here, but a source over 4 KiB is replaced by a note with \
                        its size (a title can be 128 KiB): pass `full_svg: true` (or `full`) to get every source whole. \
                        A template title's source is shown with its text as `<text>` (it is drawn as glyph outlines, \
-                       which are left out); set its text with set_template_values. timeline_summary is much smaller (durations, gaps, proxies); preview_svg_overlay shows how a title looks."
+                       which are left out); set its text with set_template_values. A clip with `speed_ramp` keys \
+                       (set_speed_ramp) plays at a rate that changes over its length; its `speed` then only gives the \
+                       direction. timeline_summary is much smaller (durations, gaps, proxies); preview_svg_overlay shows how a title looks."
     )]
     fn get_timeline_state(&self, Parameters(p): Parameters<TimelineStateParams>) -> Result<String, McpError> {
         let mut timeline = self.lock().working_timeline().map_err(core_err)?;
@@ -3658,7 +3678,7 @@ impl KerfMcp {
                        setting, which shows in their toolbar and stays until changed again, and it applies at \
                        once — also to your staged edits. It is not an edit: no revision, and the timeline does \
                        not move. While the user has agent review switched on (the default) it is refused: pass \
-                       `ripple` to trim / set_speed / remove / remove_clips / add_clip_to_timeline to ripple (or not) \
+                       `ripple` to trim / set_speed / set_speed_ramp / remove / remove_clips / add_clip_to_timeline to ripple (or not) \
                        for one call, or ask the user to switch modes."
     )]
     fn set_ripple_mode(&self, Parameters(p): Parameters<SetRippleModeParams>) -> Result<String, McpError> {
@@ -3718,6 +3738,23 @@ impl KerfMcp {
         let out = project
             .with_links(p.link, |project| {
                 project.with_ripple(p.ripple, |project| project.set_speed(clip_id, p.speed))
+            })
+            .map_err(core_err)?;
+        json(&out)
+    }
+
+    #[tool(
+        description = "Give a clip a speed ramp: its playback rate changes over its length instead of holding one value — slow motion that eases in and out, a speed-up, a freeze-and-go. `keys` are {time, speed, easing?}: `time` is seconds from the clip's start on the TIMELINE (clip-local, like keyframes; trimming the clip's head carries the ramp with the footage), `speed` a magnitude from 0.01 to 100 (1 = normal; the direction stays the sign of the clip's own speed, so a reverse clip ramps in reverse). Between two keys the speed changes steadily over timeline time (`linear`, the default) or stays at the left key's value and jumps at the next key (`hold`); before the first key the clip runs at the first key's speed and after the last at the last's, so the clip's own `speed` is not read while a ramp is set. At most 16 keys, put in time order for you; two at one time are refused. Empty `keys` removes the ramp (an error when there is none). Example, slow to 0.3x for 1.5 s and back: [{\"time\":1,\"speed\":1},{\"time\":1.5,\"speed\":0.3},{\"time\":3,\"speed\":0.3},{\"time\":3.5,\"speed\":1}]. The source window stays and the clip's length changes (it covers the same footage in more or less time), so in ripple mode (get_ripple_mode, or pass `ripple`) the later clips on the track follow the change in duration. Linked partners get the same ramp so a picture and its sound stay in step (link=false: this clip only). set_speed replaces a ramp with one constant rate. A ramped clip's `speed_ramp` is listed with the clip in get_timeline_state."
+    )]
+    fn set_speed_ramp(&self, Parameters(p): Parameters<SpeedRampParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::set_speed_ramp_op(project, p))
+    }
+
+    fn set_speed_ramp_op(project: &Project, p: SpeedRampParams) -> Result<String, McpError> {
+        let clip_id = parse_arg("clip_id", &p.clip_id)?;
+        let out = project
+            .with_links(p.link, |project| {
+                project.with_ripple(p.ripple, |project| project.set_speed_ramp(clip_id, p.keys))
             })
             .map_err(core_err)?;
         json(&out)
@@ -5289,7 +5326,7 @@ impl KerfMcp {
     #[tool(
         description = "LINK clips into one group — a picture and the sound that goes with it, or any clips that must \
                        stay together. From then on move_clip(s) / trim / split_at / remove(_clips) / ripple_delete / \
-                       cut_clip_range / set_speed / roll_edit / slip_clip / slide_clip / split_remove(_clips) carry the \
+                       cut_clip_range / set_speed / set_speed_ramp / roll_edit / slip_clip / slide_clip / split_remove(_clips) carry the \
                        edit to the others (pass link=false on those to edit one alone) and any ripple, cut or delete \
                        that moves a linked clip moves its partners by the same amount — a sound that leads or trails \
                        its picture (a J- or L-cut) stays that far ahead or behind. Only linked clips follow: an \
@@ -6984,7 +7021,7 @@ const EDITING_GUIDE: &str = "How to edit with Kerf. The user queues editing task
              and those source times (or split_at at the timeline bounds and \
              ripple_delete the piece), then read it again — later lines move. \
              The project may be in ripple mode, so check get_ripple_mode before you trim, \
-             remove or retime: with it on, trim / set_speed / remove / \
+             remove or retime: with it on, trim / set_speed / set_speed_ramp / remove / \
              split_remove(_clips) / add_clip_to_timeline onto footage / \
              generate_voiceover / compose_music (replacing a clip) carry the \
              later clips on that track along by the change in length, gaps kept \
@@ -7020,7 +7057,9 @@ const EDITING_GUIDE: &str = "How to edit with Kerf. The user queues editing task
              rather than working around it; a clip added without a track goes to \
              the first unlocked one. Polish \
              with set_volume / set_fade (fade-in/out, e.g. to smooth hard cuts), \
-             set_speed, set_transform (scale / position / rotation / opacity / \
+             set_speed (one constant rate) or set_speed_ramp (slow motion or a speed-up that \
+             eases in and out: keys of clip-local timeline seconds and speed, which retime the \
+             clip like set_speed and so ripple the same), set_transform (scale / position / rotation / opacity / \
              crop — picture-in-picture; set_transform_at for an animated clip, which keys \
              what is animated at a moment), set_color and set_transition (a fade \
              between scenes, a slide or push between the shots of a montage). \
@@ -8373,6 +8412,7 @@ mod tests {
         for name in [
             "trim",
             "set_speed",
+            "set_speed_ramp",
             "remove",
             "remove_clips",
             "add_clip_to_timeline",
@@ -8448,6 +8488,7 @@ mod tests {
             "ripple_delete",
             "cut_clip_range",
             "set_speed",
+            "set_speed_ramp",
             "roll_edit",
             "slip_clip",
             "slide_clip",
