@@ -3018,7 +3018,7 @@ impl KerfMcp {
     #[tool(
         description = "Cut a source-time range out of a clip and close the gap (split + ripple in one edit) — \
                        the transcript-editing primitive: pass a transcript segment's start/end to delete that \
-                       sentence from the cut, or a word's (get_transcript, find_filler_words) to delete one word. Linked clips lose the same stretch of timeline (a picture's \
+                       sentence from the cut, or a word's (get_transcript, get_cut_transcript, find_filler_words) to delete one word. Linked clips lose the same stretch of timeline (a picture's \
                        detached sound is cut with it); pass link=false to cut only this clip."
     )]
     fn cut_clip_range(&self, Parameters(p): Parameters<CutClipRangeParams>) -> Result<String, McpError> {
@@ -6656,6 +6656,12 @@ const EDITING_GUIDE: &str = "How to edit with Kerf. The user queues editing task
              and split_remove trims a clip's start or end to a time (split_remove_clips \
              does that to a picture and its sound as one revision) — the first \
              three clamp to the footage and report `applied`, and never ripple. \
+             To edit by what is SAID, read the cut with get_cut_transcript: its \
+             lines are the words the cut plays, in timeline time, each with its \
+             clip_id, and words=true gives every word its timeline start/end and \
+             source_start/source_end. Cut words with cut_clip_range on that clip \
+             and those source times (or split_at at the timeline bounds and \
+             ripple_delete the piece), then read it again — later lines move. \
              The project may be in ripple mode, so check get_ripple_mode before you trim, \
              remove or retime: with it on, trim / set_speed / remove / \
              split_remove(_clips) / add_clip_to_timeline onto footage / \
@@ -6859,7 +6865,8 @@ const EDITING_GUIDE: &str = "How to edit with Kerf. The user queues editing task
              (a ping is enough) for five minutes loses its subscriptions. Results are kept small: get_asset_metadata and analyze_asset \
              summarise an analysis (counts, durations, the head of the transcript), \
              and get_transcript (lines with their speakers; words=true adds each \
-             line's timed words, best over a from/to window) / get_analysis_detail \
+             line's timed words, best over a from/to window) / get_cut_transcript \
+             (the same for the whole cut, in timeline time) / get_analysis_detail \
              page through the rest; \
              get_timeline_state shows generated captions as a window \
              (captions_offset / captions_limit) and, for a very long cut, its clips \
@@ -7274,7 +7281,7 @@ fn check_frame(width: Option<u32>, height: Option<u32>) -> Result<Option<(u32, u
 /// timeline, whose windows are clips it already holds, but to a model a wall of
 /// zeros reads as "this part is silent", so a swapped `start` and `end` is
 /// reported as the mistake it is.
-fn require_window(start: f64, end: f64) -> Result<(), McpError> {
+pub(super) fn require_window(start: f64, end: f64) -> Result<(), McpError> {
     if start.is_finite() && end.is_finite() && end > start {
         Ok(())
     } else {

@@ -18,6 +18,7 @@ use crate::model::Grade;
 use crate::model::MarkerPatch;
 use crate::model::{default_beat_tolerance, fmt_time};
 use crate::model::{music_fit_clips, plan_music_fit, MusicFit, MusicFitReport, MAX_FIT_BARS};
+use crate::model::{AnalysisKind, CutLine};
 use crate::model::{
     Asset, AssetAnalysis, AudioEffect, CaptionOptions, CaptionStyle, CaptionTimeBase, Clip, ClipCut, ClipMove, CropFrame,
     Delivery, Easing, EditOutcome, EditSource, Framing, Keyframe, Levels, Marker, Mask, MasterBus, Projection, Reframe,
@@ -6768,6 +6769,54 @@ impl Project {
         Ok(created)
     }
 
+    /// What the cut says: every audible clip's cached transcript mapped into timeline time
+    /// ([`Timeline::cut_transcript`] over the working timeline), and the assets the cut plays
+    /// that have no transcript yet. Reads the cache only — nothing is transcribed here.
+    pub fn cut_transcript(&self) -> Result<CutTranscript> {
+        Ok(self.cut_transcript_inputs()?.read())
+    }
+
+    /// The part of [`Project::cut_transcript`] that needs the project: the working timeline and
+    /// the transcripts of what it plays. [`CutTranscriptInputs::read`] maps them with the lock
+    /// released.
+    pub fn cut_transcript_inputs(&self) -> Result<CutTranscriptInputs> {
+        let timeline = self.working_timeline()?;
+        let rendered = timeline.for_render();
+        let mut heard: Vec<(Uuid, usize)> = Vec::new();
+        for clip in rendered.tracks.iter().flat_map(|t| &t.clips) {
+            if !clip.source_audio || clip.asset_id == GENERATED_ASSET {
+                continue;
+            }
+            match heard.iter_mut().find(|(id, _)| *id == clip.asset_id) {
+                Some((_, clips)) => *clips += 1,
+                None => heard.push((clip.asset_id, 1)),
+            }
+        }
+        let mut transcripts: HashMap<Uuid, Vec<TranscriptSegment>> = HashMap::new();
+        let mut untranscribed = Vec::new();
+        for (asset_id, clips) in heard {
+            match self.get_analysis(asset_id)?.filter(|a| a.done(AnalysisKind::Transcript)) {
+                Some(analysis) => {
+                    transcripts.insert(asset_id, analysis.transcript);
+                }
+                None => {
+                    if let Some(asset) = self.stored_asset(asset_id)?.filter(Asset::has_audio) {
+                        untranscribed.push(Untranscribed {
+                            asset_id,
+                            name: asset.name,
+                            clips,
+                        });
+                    }
+                }
+            }
+        }
+        Ok(CutTranscriptInputs {
+            timeline,
+            transcripts,
+            untranscribed,
+        })
+    }
+
     /// Caption the cut from a parsed subtitle file: lay its cues onto the cut and
     /// write them as caption overlays — as **one** `Import captions` revision.
     ///
@@ -7624,6 +7673,41 @@ pub struct AssetFile {
     pub clips: usize,
 }
 
+/// What [`Project::cut_transcript_inputs`] read under the lock.
+#[derive(Debug, Clone)]
+pub struct CutTranscriptInputs {
+    timeline: Timeline,
+    transcripts: HashMap<Uuid, Vec<TranscriptSegment>>,
+    untranscribed: Vec<Untranscribed>,
+}
+
+impl CutTranscriptInputs {
+    /// Map the transcripts through the cut. Pure.
+    pub fn read(self) -> CutTranscript {
+        CutTranscript {
+            lines: self.timeline.cut_transcript(&self.transcripts),
+            untranscribed: self.untranscribed,
+        }
+    }
+}
+
+/// The transcript of the cut (see [`Project::cut_transcript`]).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct CutTranscript {
+    pub lines: Vec<CutLine>,
+    /// Assets the cut plays the sound of that have not been transcribed, in track order.
+    pub untranscribed: Vec<Untranscribed>,
+}
+
+/// An asset the cut plays the sound of with no transcript yet.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct Untranscribed {
+    pub asset_id: Uuid,
+    pub name: String,
+    /// Audible clips of the cut cut from it.
+    pub clips: usize,
+}
+
 /// An asset whose source file is gone (see [`Project::missing_assets`]).
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct MissingAsset {
@@ -7958,6 +8042,27 @@ mod tests {
         let timeline = project.timeline().unwrap();
         assert_eq!(timeline.tracks.iter().filter(|t| t.name == VOICEOVER_TRACK).count(), 1);
         assert_eq!(second.timeline_start, 6.0);
+    }
+
+    #[test]
+    fn the_cut_transcript_reads_the_working_cut_and_names_what_is_untranscribed() {
+        let project = Project::open_in_memory().unwrap();
+        let (vo, _) = project
+            .place_voiceover(&voiceover_asset("/vo/a.wav"), None, Some(2.0))
+            .unwrap();
+        let music = asset_with("/music.wav", vec![aud_stream()]);
+        project.insert_asset(&music).unwrap();
+        project.add_clip_to_timeline(music.id, None, 0.0, 3.0, Some(0.0)).unwrap();
+        let cut = project.cut_transcript().unwrap();
+        let lines: Vec<(&str, f64)> = cut
+            .lines
+            .iter()
+            .map(|l| (l.text.as_str(), (l.start * 1000.0).round() / 1000.0))
+            .collect();
+        assert_eq!(lines, [("Welcome to the shop.", 2.0), ("We open at nine.", 3.85)]);
+        assert!(cut.lines.iter().all(|l| l.asset_id == vo.id));
+        assert_eq!(cut.untranscribed.len(), 1);
+        assert_eq!((cut.untranscribed[0].asset_id, cut.untranscribed[0].clips), (music.id, 1));
     }
 
     #[test]

@@ -95,15 +95,15 @@ pub use media::{MediaResolver, OriginalMedia, ProxyMedia, SourceMedia};
 pub use model::{
     check_delivery_fps, fmt_fps, plan_score_to_picture, AlignOptions, AlignReport, AnalysisKind, Asset, AssetAnalysis,
     AudioEffect, AutoIncluded, BeatReading, CaptionLayout, CaptionOptions, CaptionPlacement, CaptionStyle, CaptionTimeBase, Clip,
-    ClipCut, ClipLut, ClipMove, Color, CropFrame, CurvePoint, Curves, CutAlignment, Delivery, DeltaRange, Detached, DetachedMany,
-    DiffEntry, DiffKind, Easing, EditOutcome, EditSource, FitOrder, Framing, Generator, Grade, HitKind, InstrumentOverrides,
-    Keyframe, LevelReading, Levels, Marker, MarkerKind, MarkerPatch, Mask, MaskShape, MasterBus, MusicScore, MusicStyle,
-    Projection, Property, PropertyKey, PropertyTrack, Reframe, ReframeKeyframe, ResolvedReframe, Revision, Rhythm, SalienceMap,
-    ScoreHit, ScoreSection, SectionKind, SectionSpan, SkippedChange, SkippedDetach, SourceLimits, SplitSide, StagedAssetChange,
-    StagedEdit, StreamInfo, StreamKind, Subsampling, SubsetMerge, SvgOverlay, SvgOverlayPatch, SvgPreset, SvgPresetKind,
-    SvgPresetParams, Task, TaskStatus, TextKeyframe, TextOverlay, TimeRange, Timeline, TimelineDiff, TitleClip, Track,
-    TrackLevels, TranscriptSegment, Transform, TransformPatch, Transition, TransitionKind, VideoEffect, Voiceover, Wheel, Wheels,
-    Word, ADJACENT_EPS, DEFAULT_MAX_TEMPO_CHANGE, GENERATED_ASSET, LEVELS_TARGET_LUFS, LEVELS_TRUE_PEAK_CEILING_DBTP,
+    ClipCut, ClipLut, ClipMove, Color, CropFrame, CurvePoint, Curves, CutAlignment, CutLine, CutWord, Delivery, DeltaRange,
+    Detached, DetachedMany, DiffEntry, DiffKind, Easing, EditOutcome, EditSource, FitOrder, Framing, Generator, Grade, HitKind,
+    InstrumentOverrides, Keyframe, LevelReading, Levels, Marker, MarkerKind, MarkerPatch, Mask, MaskShape, MasterBus, MusicScore,
+    MusicStyle, Projection, Property, PropertyKey, PropertyTrack, Reframe, ReframeKeyframe, ResolvedReframe, Revision, Rhythm,
+    SalienceMap, ScoreHit, ScoreSection, SectionKind, SectionSpan, SkippedChange, SkippedDetach, SourceLimits, SplitSide,
+    StagedAssetChange, StagedEdit, StreamInfo, StreamKind, Subsampling, SubsetMerge, SvgOverlay, SvgOverlayPatch, SvgPreset,
+    SvgPresetKind, SvgPresetParams, Task, TaskStatus, TextKeyframe, TextOverlay, TimeRange, Timeline, TimelineDiff, TitleClip,
+    Track, TrackLevels, TranscriptSegment, Transform, TransformPatch, Transition, TransitionKind, VideoEffect, Voiceover, Wheel,
+    Wheels, Word, ADJACENT_EPS, DEFAULT_MAX_TEMPO_CHANGE, GENERATED_ASSET, LEVELS_TARGET_LUFS, LEVELS_TRUE_PEAK_CEILING_DBTP,
     MASTER_DEFAULT_CEILING_DB, MASTER_MAX_VOLUME, MASTER_MIN_CEILING_DB, MAX_BPM, MAX_CHANNEL_VOLUME, MAX_DELIVERY_FPS, MAX_SEED,
     MAX_SPEED, MAX_SVG_OVERLAYS, MAX_SVG_SECONDS, MAX_TITLE_CLIPS, MIN_BPM, MIN_DELIVERY_FPS, MIN_EDIT_CLIP, MIN_SPEED,
     RELEASE_TAIL_S,
@@ -118,11 +118,11 @@ pub use platform::{
 pub use play_plan::{PlayAhead, PlayCut, PlayRefusal};
 pub use project::{
     AlignTo, AudioSync, AudioSyncMeasure, AudioSyncPlan, BandBalance, BandBalanceRequest, BandPlan, BandSource, ComposePlan,
-    ComposeRequest, Composed, DeliveryInputs, ExportedFile, FramingPlan, MissingAsset, Page, PreparedText, Project, RelinkCheck,
-    Relinked, RemovedAsset, ScoreAlign, SmartCropJob, SmartCropPlan, StemsPlaced, SubsetApplied, SvgChecked, SvgLayout,
-    SvgOverlayResult, SvgSource, SyncSide, TitleClipPatch, TitleClipPlacement, TitleClipResult, TitleEdited, TitleTextForm,
-    TitleTextInputs, DEFAULT_HISTORY_LIMIT, MAX_CHANNEL_KEYS, MAX_SYNC_SECONDS, MUSIC_TRACK, SCHEMA_VERSION, STAGED_UNDO_DEPTH,
-    SYNC_SAMPLE_RATE, VOICEOVER_TRACK,
+    ComposeRequest, Composed, CutTranscript, CutTranscriptInputs, DeliveryInputs, ExportedFile, FramingPlan, MissingAsset, Page,
+    PreparedText, Project, RelinkCheck, Relinked, RemovedAsset, ScoreAlign, SmartCropJob, SmartCropPlan, StemsPlaced,
+    SubsetApplied, SvgChecked, SvgLayout, SvgOverlayResult, SvgSource, SyncSide, TitleClipPatch, TitleClipPlacement,
+    TitleClipResult, TitleEdited, TitleTextForm, TitleTextInputs, Untranscribed, DEFAULT_HISTORY_LIMIT, MAX_CHANNEL_KEYS,
+    MAX_SYNC_SECONDS, MUSIC_TRACK, SCHEMA_VERSION, STAGED_UNDO_DEPTH, SYNC_SAMPLE_RATE, VOICEOVER_TRACK,
 };
 pub use proxy::{PreviewSource, ProxyInput, ProxyPhase, ProxySize, ProxyStatus, ProxyWait};
 pub use recovery::{Recoverable, RecoveryInfo};

@@ -3125,6 +3125,18 @@ fn generate_captions(state: State<'_, AppState>, options: Option<CaptionOptions>
     project.timeline().map_err(|e| e.to_string())
 }
 
+/// What the cut says: every audible clip's cached transcript in timeline time, and the assets the cut
+/// plays with no transcript yet. The cache is read under the lock and mapped with it released.
+#[tauri::command]
+async fn cut_transcript(state: State<'_, AppState>) -> CmdResult<kerf_core::CutTranscript> {
+    let shared = state.project.clone();
+    blocking(move || {
+        let inputs = lock_user(&shared).cut_transcript_inputs().map_err(|e| e.to_string())?;
+        Ok(inputs.read())
+    })
+    .await
+}
+
 #[tauri::command(async)]
 fn clear_captions(state: State<'_, AppState>) -> CmdResult<Timeline> {
     let project = state.project();
@@ -5518,6 +5530,7 @@ pub fn run() {
             export_template,
             delete_template,
             generate_captions,
+            cut_transcript,
             clear_captions,
             import_captions,
             import_captions_text,

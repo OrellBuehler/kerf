@@ -1378,6 +1378,45 @@ export interface AssetRemoval extends RemovedAsset {
 	timeline: Timeline;
 }
 
+/** One transcript line as the cut plays it: the words of it one clip keeps (`kerf_core::CutLine`). */
+export interface CutLine {
+	/** Timeline seconds. */
+	start: number;
+	end: number;
+	text: string;
+	speaker?: string | null;
+	clip_id: string;
+	track_id: string;
+	asset_id: string;
+	/** The same span in the asset's own seconds. */
+	source_start: number;
+	source_end: number;
+	words?: CutWord[];
+}
+
+/** One word of a `CutLine`, in timeline and source seconds (`kerf_core::CutWord`). */
+export interface CutWord {
+	text: string;
+	start: number;
+	end: number;
+	source_start: number;
+	source_end: number;
+	estimated?: boolean;
+}
+
+/** An asset the cut plays the sound of with no transcript yet (`kerf_core::Untranscribed`). */
+export interface Untranscribed {
+	asset_id: string;
+	name: string;
+	clips: number;
+}
+
+/** What the cut says (`kerf_core::CutTranscript`). */
+export interface CutTranscript {
+	lines: CutLine[];
+	untranscribed: Untranscribed[];
+}
+
 /** An asset whose source file is gone (`kerf_core::MissingAsset`). */
 export interface MissingAsset {
 	asset_id: string;

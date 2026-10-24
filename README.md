@@ -150,13 +150,13 @@ Now ask the agent to work on the project you have open — _"skim the interview 
 the dead air, and drop in captions."_ It will claim a task, use the tools below, and hand
 back a reviewable result.
 
-### The tools (178)
+### The tools (179)
 
 <details>
 <summary><b>See / analyze</b></summary>
 
 `get_editing_guide` (how the tools fit together) · `list_assets` (`fields: "compact"` for a big library, `imported_after` for what an import added) · `import_asset` · `get_asset_metadata` · `analyze_asset` · `get_transcript` (lines with
-their speakers; the timed words on request) · `speaker_ranges` · `find_filler_words` · `refine_transcript` ·
+their speakers; the timed words on request) · `get_cut_transcript` (what the cut says, in timeline time) · `speaker_ranges` · `find_filler_words` · `refine_transcript` ·
 `get_analysis_detail` · `get_timeline_state` · `timeline_summary` · `get_editor_context` (what the user has
 selected and where the playhead is) · `get_scopes` (waveform / parade / vectorscope / histogram numbers of a
 frame) · `get_waveform` · `get_energy` ·

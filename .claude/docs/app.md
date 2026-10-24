@@ -169,7 +169,8 @@ text engine) and store with `set_title_text_parsed` (same "try again" rule) thro
 `list_text_animation_presets` and `list_text_animation_curves` (stateless `#[tauri::command(async)]`s) list the eight presets and the six
 curves (`linear`, `ease_in`, `ease_out`, `ease_in_out`, `overshoot`, `spring`; `CurvePreset { id, name, description, curve }`). The library is app-level (not undone, not staged);
 `generate_captions` / `clear_captions` (caption the whole cut, in timeline
-time), `import_captions` / `import_captions_text` (a subtitle file by path / by text —
+time), `cut_transcript` → `CutTranscript` (what the cut says in timeline time, plus `untranscribed`;
+`cut_transcript_inputs` under the lock, mapped on the blocking pool with it released), `import_captions` / `import_captions_text` (a subtitle file by path / by text —
 the text variant is what an `<input type=file>` or a paste uses; both return
 `{timeline, summary}` rather than a bare `Timeline`), `export_srt`, `export_captions` (the cut's
 captions as `.srt` / `.vtt`), `export_interchange` (OTIO / EDL, returns `{path, report}`),
@@ -395,7 +396,7 @@ comes back `ForbiddenUrl` and the "Release notes" button silently does nothing.
 `update_marker`, `remove_marker`, `add_overlay`, `update_overlay`, `remove_overlay`, `set_overlay_keyframes`,
 `add_svg_overlay`, `update_svg_overlay`, `remove_svg_overlay`, `validate_svg`, `list_svg_presets`,
 `svg_preset_preview`, `list_templates`, `template_poster`, `svg_element_ids`, `template_image_value`, `save_template`,
-`apply_template`, `apply_template_clip`, `add_title_clip`, `update_title_clip`, `set_template_values`, `set_title_text_box`, `set_title_text_animation`, `list_text_animation_presets`, `list_text_animation_curves`, `convert_title_text`, `import_template`, `export_template`, `delete_template`, `generate_captions`, `clear_captions`, `import_captions`, `import_captions_text`, `export_srt`, `export_captions`, `export_interchange`, `export_markers`,
+`apply_template`, `apply_template_clip`, `add_title_clip`, `update_title_clip`, `set_template_values`, `set_title_text_box`, `set_title_text_animation`, `list_text_animation_presets`, `list_text_animation_curves`, `convert_title_text`, `import_template`, `export_template`, `delete_template`, `generate_captions`, `clear_captions`, `cut_transcript`, `import_captions`, `import_captions_text`, `export_srt`, `export_captions`, `export_interchange`, `export_markers`,
 `refine_transcript`;
 *history and review* `get_history`, `revision_diff`, `undo`, `redo`, `revert_to`, `get_staged_edit`,
 `get_staged_timeline`, `apply_staged_edit`, `apply_staged_subset`, `discard_staged_edit`, `undo_staged_edit`,
