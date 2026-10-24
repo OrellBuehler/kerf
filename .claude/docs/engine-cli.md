@@ -1619,7 +1619,10 @@ ungated by `cpu::lease`, but niced (`bg_command`) and thread-capped by the still
   `tempo = source span / timeline span`, so the sound meets the picture at every edge whatever `atempo` does inside one. A step
   is its own chain over the stream after `atrim`, `asetpts`, `areverse` and `aresample` to the delivery rate (the sample
   counts below are in it): `atrim` of its part with a 60 ms roll-in and a 100 ms flush, `atempo` stages (the fewest within
-  0.5..2 sharing the tempo; none at 1x), `adelay` for a first step that starts before the source does, `apad=whole_len` and
+  0.5..2 sharing the tempo; none at 1x; the per-stage tempo is the `stages`-th root by `sqrt` or bisection, and the
+  stage count by doubling, never `powf` / `log2`: the last digit of a libm `pow` differs between glibc with and without
+  FMA, macOS, Windows and arm and is printed in the graph and in the `atrim` a piece is read from, so `tempo_advance` sums
+  its stages by plain multiplication too), `adelay` for a first step that starts before the source does, `apad=whole_len` and
   `atrim=start_sample:end_sample` to the exact samples of its share of the timeline plus half a 2 ms crossfade each side
   (`audio_pieces`, pure: the pieces less the overlaps come to `round(total·rate)` samples at 22 to 96 kHz), and `acrossfade`
   chains them (`ar{flat}s{i}` → `p{i}` → `x{i}` → the clip's usual tail). `atempo` plays its content early, 13 to 19 ms of its

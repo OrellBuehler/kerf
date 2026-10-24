@@ -300,9 +300,52 @@ pub(crate) fn audio_steps(clip: &Clip, total: f64) -> Vec<AudioStep> {
 }
 
 /// How many `atempo` filters play a stream at `tempo`: one within the filter's `0.5..=2` range,
-/// otherwise the fewest that bring each within it.
+/// otherwise the fewest that bring each within it. Counted by doubling, not by `log2`: no libm.
 fn stage_count(tempo: f64) -> usize {
-    ((tempo.max(1.0 / tempo).log2() - 1e-9).ceil().max(1.0)) as usize
+    let span = tempo.max(1.0 / tempo);
+    let mut stages = 1;
+    let mut limit = 2.0 * (1.0 + 6.9e-10);
+    while stages < MAX_STAGES && span > limit {
+        stages += 1;
+        limit *= 2.0;
+    }
+    stages
+}
+
+/// The most `atempo` stages a chain is made of: `2^64` is further from 1x than any tempo can be asked for.
+const MAX_STAGES: usize = 64;
+
+/// The tempo of each of `stages` equal `atempo` stages that together play `tempo`: its `stages`-th root,
+/// found by bisection on the product so that it needs nothing but IEEE `+ - * /` (and `sqrt`) and is the same
+/// bit for bit on every platform. `powf` is not: its last digit differs between glibc with and without FMA,
+/// macOS, Windows and arm, and that digit is printed in the graph (`atempo=1.933656967885146` or
+/// `…463`) and moves the `atrim` a piece is read from.
+fn stage_tempo(tempo: f64, stages: usize) -> f64 {
+    if stages <= 1 {
+        return tempo;
+    }
+    if stages == 2 {
+        return tempo.sqrt();
+    }
+    let power = |x: f64| (1..stages).fold(x, |p, _| p * x);
+    let (mut lo, mut hi) = (tempo.min(1.0), tempo.max(1.0));
+    for _ in 0..256 {
+        let mid = lo + (hi - lo) / 2.0;
+        if mid <= lo || mid >= hi {
+            break;
+        }
+        if power(mid) < tempo {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    // The two neighbours that bracket the root: the nearer one, so 8 in three stages is 2 and not a hair under.
+    if (tempo - power(lo)).abs() < (power(hi) - tempo).abs() {
+        lo
+    } else {
+        hi
+    }
 }
 
 /// How much of a stream's start one `atempo` stage plays early, in seconds of the stage's input:
@@ -323,8 +366,13 @@ pub(crate) fn tempo_advance(tempo: f64) -> f64 {
     }
     let tempo = tempo.clamp(0.25, 8.0);
     let stages = stage_count(tempo);
-    let each = tempo.powf(1.0 / stages as f64);
-    STAGE_ADVANCE * (0..stages).map(|j| each.powi(j as i32)).sum::<f64>()
+    let each = stage_tempo(tempo, stages);
+    let (mut sum, mut term) = (0.0, 1.0);
+    for _ in 0..stages {
+        sum += term;
+        term *= each;
+    }
+    STAGE_ADVANCE * sum
 }
 
 /// Whether a step at `tempo` goes through `atempo` at all (a step at 1x is the source as it is).
@@ -421,7 +469,7 @@ pub(crate) fn audio_pieces(steps: &[AudioStep], sample_rate: u32) -> (Vec<AudioP
 /// range, otherwise the fewest that bring each within it, sharing the tempo equally.
 pub(crate) fn atempo_stages(tempo: f64) -> String {
     let stages = stage_count(tempo);
-    let each = tempo.powf(1.0 / stages as f64);
+    let each = stage_tempo(tempo, stages);
     vec![format!("atempo={each}"); stages].join(",")
 }
 
@@ -750,11 +798,41 @@ mod tests {
         }
         assert_eq!(atempo_stages(1.5), "atempo=1.5");
         assert_eq!(atempo_stages(4.0), "atempo=2,atempo=2");
+        assert_eq!(atempo_stages(8.0), "atempo=2,atempo=2,atempo=2");
+        assert_eq!(atempo_stages(16.0), "atempo=2,atempo=2,atempo=2,atempo=2");
+        assert_eq!(atempo_stages(0.125), "atempo=0.5,atempo=0.5,atempo=0.5");
+        assert_eq!(atempo_stages(2.0), "atempo=2");
+        assert_eq!(atempo_stages(2.0 * (1.0 + 1e-12)), "atempo=2.000000000002");
         // The advance of a chain counts each stage at the tempo of those before it.
         assert!((tempo_advance(0.5) - STAGE_ADVANCE).abs() < 1e-12);
         assert!((tempo_advance(4.0) - STAGE_ADVANCE * 3.0).abs() < 1e-12);
         assert_eq!(tempo_advance(f64::NAN), 0.0);
         assert_eq!(tempo_advance(0.001), tempo_advance(0.25));
         assert_eq!(tempo_advance(100.0), tempo_advance(8.0));
+    }
+
+    #[test]
+    fn a_stage_tempo_is_the_nearest_root_found_without_libm() {
+        let next = |x: f64| f64::from_bits(x.to_bits() + 1);
+        let prev = |x: f64| f64::from_bits(x.to_bits() - 1);
+        for i in 0..2000 {
+            let tempo = 0.01 + f64::from(i) * 0.0517;
+            let stages = stage_count(tempo);
+            let each = stage_tempo(tempo, stages);
+            let power = |x: f64| (1..stages).fold(x, |p, _| p * x);
+            // Whatever a platform's `powf` makes of the last digit, this is the double whose power is nearest.
+            let error = |x: f64| (power(x) - tempo).abs();
+            assert!(
+                error(each) <= error(next(each)) && error(each) <= error(prev(each)),
+                "{tempo}"
+            );
+            assert!((each / tempo.powf(1.0 / stages as f64) - 1.0).abs() < 1e-15, "{tempo}");
+            if stages == 2 {
+                assert_eq!(each, tempo.sqrt());
+            }
+        }
+        assert_eq!(stage_tempo(1.5, 1), 1.5);
+        assert_eq!(stage_count(f64::INFINITY), MAX_STAGES);
+        assert_eq!(stage_count(f64::NAN), 1);
     }
 }

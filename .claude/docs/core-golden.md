@@ -61,7 +61,9 @@
   (no overlay names a font) and **libm** (`db_to_linear` is `powf`, whose last digits differ
   between glibc with and without FMA, macOS, Windows and arm, so `round_libm` keeps the
   compressor / gate numbers to 10 significant digits; the generator seeds dB values known to
-  differ, so a run under `GLIBC_TUNABLES=glibc.cpu.hwcaps=-FMA,-FMA4` fails without it). The
+  differ, so a run under `GLIBC_TUNABLES=glibc.cpu.hwcaps=-FMA,-FMA4` fails without it; a speed ramp's `atempo` stages
+  and advance are computed without libm at the source, `clip_timing/ramp.rs::stage_tempo`, since `round_libm` keeps only the
+  compressor / gate numbers). The
   digests are identical blessed with `KERF_HWACCEL` unset, `none` and `auto`. A coverage
   table (`family needle` lines, plus the branch `transition_fx` took and a few structural
   tags) fails the test if a family hits fewer than 20 cases — the generator stopped covering

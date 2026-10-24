@@ -100,7 +100,8 @@
 //! and libm: the
 //! compressor and gate thresholds go through `powf`, whose last digits differ between
 //! glibc builds (FMA or not), macOS, Windows and arm, so [`round_libm`] compares those
-//! numbers to 10 significant digits, which still pins the dB mapping. The digest files are
+//! numbers to 10 significant digits, which still pins the dB mapping (a ramp's `atempo` stages and read
+//! points are made without libm, `ramp::stage_tempo`, so they need no rounding). The digest files are
 //! LF whatever the checkout (`.gitattributes`, and the comparison ignores `\r`).
 //!
 //! **Bless** after an intended argv change, from the repo root:
