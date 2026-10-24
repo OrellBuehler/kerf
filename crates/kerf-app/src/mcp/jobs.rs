@@ -330,6 +330,18 @@ impl Jobs {
         }
         Some(running)
     }
+
+    /// Ask every running job to stop.
+    pub fn cancel_all(&self) {
+        for job in self.lock().iter().filter(|j| j.state == JobState::Running) {
+            job.cancel.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// How many jobs are running.
+    pub fn running(&self) -> usize {
+        self.lock().iter().filter(|j| j.state == JobState::Running).count()
+    }
 }
 
 /// The process-wide registry.
@@ -518,6 +530,19 @@ mod tests {
         jobs.cancel(&late);
         jobs.finish(&late, Ok("{}".to_string()));
         assert_eq!(jobs.view(&late).unwrap().state, JobState::Done);
+    }
+
+    #[test]
+    fn cancel_all_reaches_every_running_job() {
+        let jobs = registry(4, 10);
+        let (_a, a) = jobs.begin("export").unwrap();
+        let (_b, b) = jobs.begin("analyze_asset").unwrap();
+        let (done, c) = jobs.begin("export").unwrap();
+        jobs.finish(&done, Ok("{}".to_string()));
+        assert_eq!(jobs.running(), 2);
+        jobs.cancel_all();
+        assert!(a.cancelled() && b.cancelled());
+        assert!(!c.cancelled(), "a finished job is left alone");
     }
 
     #[test]

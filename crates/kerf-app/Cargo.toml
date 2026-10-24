@@ -60,7 +60,9 @@ axum.workspace = true
 tokio-util.workspace = true
 getrandom.workspace = true
 anyhow.workspace = true
-tokio = { workspace = true, features = ["net", "time"] }
+tokio = { workspace = true, features = ["net", "time", "signal"] }
+# The desktop app's config and data directories, for `--headless` (no Tauri app to ask).
+dirs = "7"
 
 [dev-dependencies]
 kerf-core = { workspace = true, features = ["test-support"] }

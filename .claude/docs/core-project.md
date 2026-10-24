@@ -208,6 +208,8 @@
   project replaced (`#[must_use]`); the caller `close()`s it after releasing the lock, which deletes
   its recovery directory (it was saved, recovered into another, or let go). `close_at_exit` deletes it
   only when it holds no work (the same `summarize` rule) — anything else waits for the next launch.
+  A headless `kerf-app` without `--data-dir` keeps its untitled project in the desktop app's recovery root; its session lock
+  keeps a running window's scan away from it, and work it leaves at exit is offered at the window's next launch.
   `Project::sample()` seeds an in-memory demo (two assets + analysis + a starter
   timeline + a sample task queue); it backs the kerf-core tests, but the app now
   launches with an **empty** untitled project (`Project::create_recovery`, see above) — the user imports media or

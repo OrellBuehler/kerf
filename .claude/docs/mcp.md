@@ -1,7 +1,7 @@
 # Embedded MCP server (`crates/kerf-app/src/mcp.rs`)
 
 The app **is** the MCP server — there is no separate binary. `mcp::start` (called from `lib.rs`'s Tauri `.setup`
-hook) hosts the tools over `rmcp`'s **streamable-HTTP** transport (`StreamableHttpService` + `LocalSessionManager`, nested
+hook, or by `kerf-app --headless` with no Tauri app at all — `app.md`) hosts the tools over `rmcp`'s **streamable-HTTP** transport (`StreamableHttpService` + `LocalSessionManager`, nested
 into an `axum` router) at `/mcp`, on `127.0.0.1:7777` by default. The server's whole lifecycle is `mcp/server.rs`; the
 tools are in `mcp.rs` and four submodules (`jobs.rs`, `reads.rs`, `project_tools.rs`, and `server.rs` itself), each
 with its own `#[tool_router(router = …)]` impl — `router()` adds them together once.
@@ -29,14 +29,25 @@ while a token is required, saying so as its `error`). rmcp's
 none; a web page must not drive the editor through the loopback port), and rmcp validates the inbound **`Host`** against
 `allowed_hosts` (loopback plus whatever the bind address names; a wildcard bind yields an empty list = allow any). A bind
 beyond loopback is refused unless the token is required (`bind_problem`, also checked when settings are patched).
-`KERF_MCP_ADDR` still overrides the stored address. A supervisor task restarts the listener when the address or the enabled
+`KERF_MCP_ADDR` still overrides the stored address. A headless run holds the server to `server::Overrides` (applied in
+`McpConfig::from_settings`, so no settings change undoes them): on, token required, `--mcp-addr` > `KERF_MCP_ADDR` > stored,
+and `KERF_MCP_TOKEN` (checked like a stored token, used for that run only and never written; no token is generated while it
+is set) > stored > generated. The status keeps the listener's `bound` address, so a `:0` bind reports its real port
+(`wait_listening`); `stop` switches the listener off and waits for it, `finish_jobs` cancels every job and waits. A supervisor task restarts the listener when the address or the enabled
 switch changes (`settings::update` → `settings_changed`; sessions on the old listener end), and reports a bind failure through
 `server_error()` instead of exiting. `mcp_connection_info` returns the URL, the token, `running` / `error` and the ready-made
 `claude mcp add --transport http kerf <url> --header "Authorization: Bearer <token>"` (the URL quoted when it has a query) plus a generic
 `mcpServers` JSON snippet, and `tool_sets` (name, description, tool count: Prompts and tool sets, below);
 `regenerate_mcp_token` and `set_mcp_settings` (only `mcp_*` and `agent_review`) are the other two commands.
 It shares the **same** `Arc<Mutex<Project>>` the Tauri commands hold, so the agent edits the project the user has open.
-Patterns that matter if you edit
+**The app around the server is a `Shell`** (`shell.rs`): `KerfMcp.app` is `Shell::Gui(AppHandle)` or
+`Shell::Headless`, whose inherent `emit` / `state` / `try_state` / `listen` / `unlisten` mirror Tauri's, so tools write
+`self.app.emit(…)` and `self.app.state::<crate::AppState>()` either way (not `tauri::Emitter::emit(&app, …)` or
+`use tauri::Manager`: `Shell` implements neither trait). Headless, events reach only in-process listeners, `try_state`
+answers `AppState` and the recovery state (an `EditorContextState` is `None`: `get_editor_context` says `reported: false`),
+`note_open` leaves the desktop's recent list alone, and the agent's edits land live (review off for that process only,
+`--review` keeps it; `get_settings` reports the switch in force). The `lib.rs` / `settings.rs` / `recovery.rs` helpers the
+server reaches take `&impl Host`. Patterns that matter if you edit
 it: `#[tool_router]` on the impl + `#[tool_handler]` on `impl ServerHandler` — **no
 `tool_router` field on the struct** (the macro would call `Self::tool_router()`).
 That default is also the reason for the `router()` `OnceLock`: the generated
@@ -598,7 +609,7 @@ of the same job: `analyze_asset`, `refine_transcript` (the analysis Stop), `impo
 begin_voiceover() / begin_music() / begin_stems() / begin_smart_crop() / begin_export())`; a Stop pressed before a run began does not end
 it, and a run begun after is not wiped by one), and the voiceover, music, stems, smart-crop and framing jobs also stop when the
 project is replaced (`stop_or_replaced`). `analyze_asset` also forwards the GUI's `analysis-progress` events for its asset
-to the client (`AnalysisProgressRelay`); `download_speech_model` emits `model-progress` like the GUI's own download.
+to the client (`AnalysisProgressRelay`, through `Shell::listen`: Tauri's listener in the window, an in-process bus headless); `download_speech_model` emits `model-progress` like the GUI's own download.
 Every job that resolves inputs under the lock notes `Project::generation()` and refuses to land its result in a project
 opened since (`require_generation`) — a Save As does not count as one (`replace_with_saved_copy` keeps it). The reads
 that decode (`get_waveform`, `get_waveform_range`, `get_energy`, `skim_asset`, `preview_timeline`, `skim_timeline`, `get_frame`) take the

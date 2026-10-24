@@ -15,11 +15,13 @@
 
 mod editor_context;
 mod gpu_preview;
+mod headless;
 mod mcp;
 mod mcp_commands;
 mod popout;
 mod recovery;
 mod settings;
+mod shell;
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -38,6 +40,8 @@ use kerf_core::{
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
 use uuid::Uuid;
+
+use crate::shell::Host;
 
 struct AppState {
     project: Arc<Mutex<Project>>,
@@ -261,6 +265,26 @@ impl AppState {
     pub(crate) fn begin_export(&self) -> impl Fn() -> bool + Send + Sync + 'static {
         self.export_cancel.begin()
     }
+
+    /// Press every Stop at once: every long job running now ends (a headless run shutting down).
+    fn stop_all(&self) {
+        for stop in [
+            &self.export_cancel,
+            &self.analysis_cancel,
+            &self.levels_cancel,
+            &self.sync_cancel,
+            &self.voiceover_cancel,
+            &self.music_cancel,
+            &self.bands_cancel,
+            &self.stems_cancel,
+            &self.model_cancel,
+            &self.cover_cancel,
+            &self.smart_crop_cancel,
+            &self.import_stop,
+        ] {
+            stop.stop();
+        }
+    }
 }
 
 /// Lock the shared project for a GUI command, attributing edits to the user;
@@ -330,12 +354,12 @@ fn parse_transition(kind: Option<String>, duration: Option<f64>) -> CmdResult<Op
 /// token) and their backups, and the logs. Filled once at startup ([`set_app_dirs`]).
 static APP_DIRS: std::sync::OnceLock<Vec<(std::path::PathBuf, String)>> = std::sync::OnceLock::new();
 
-fn set_app_dirs(app: &AppHandle) {
+fn set_app_dirs(app: &impl Host) {
     let mut dirs = Vec::new();
-    if let Ok(config) = app.path().app_config_dir() {
+    if let Some(config) = app.config_dir() {
         dirs.push((config, "Kerf's settings".to_string()));
     }
-    if let Ok(logs) = log_dir_path(app) {
+    if let Some(logs) = log_dir_path(app) {
         dirs.push((logs, "Kerf's logs".to_string()));
     }
     let _ = crate::APP_DIRS.set(dirs);
@@ -729,7 +753,11 @@ fn open_project_at(
 /// which leaves nothing to reopen. Used by every way a project becomes the open one, the MCP
 /// server's included. A list that cannot be written is not worth failing the open for; touches
 /// the disk, so call it off the main thread.
-pub(crate) fn note_open(app: &AppHandle, path: Option<&str>) {
+pub(crate) fn note_open(app: &impl Host, path: Option<&str>) {
+    // A headless run is not what the desktop's recent list and reopen are about.
+    if app.headless() {
+        return;
+    }
     if let Err(e) = settings::record_open(app, path) {
         tracing::warn!(error = %e, "could not record the open project");
     }
@@ -893,14 +921,14 @@ fn cancel_import(state: State<'_, AppState>) {
 /// What the webview is told about an asset's proxy: the `proxy-progress` event, on every
 /// change (queued, each percent of a build, ready, failed), and `proxy-ready` once one
 /// lands so the preview re-decodes the current frame from it.
-pub(crate) fn proxy_notifier(app: &AppHandle) -> kerf_core::proxy::Notify {
+pub(crate) fn proxy_notifier(app: &impl Host) -> kerf_core::proxy::Notify {
     let app = app.clone();
     Arc::new(move |status: &kerf_core::ProxyStatus| {
-        if let Err(e) = app.emit("proxy-progress", status) {
+        if let Err(e) = app.send("proxy-progress", status) {
             tracing::warn!(error = %e, "failed to emit proxy-progress");
         }
         if status.state == kerf_core::ProxyPhase::Ready {
-            if let Err(e) = app.emit("proxy-ready", ()) {
+            if let Err(e) = app.send("proxy-ready", ()) {
                 tracing::warn!(error = %e, "failed to emit proxy-ready");
             }
         }
@@ -918,9 +946,9 @@ pub(crate) fn proxy_notifier(app: &AppHandle) -> kerf_core::proxy::Notify {
 /// returns** (`kerf_core::proxy`), which is why imports call it before the webview can
 /// start analysing what they brought in. It may run an `ffprobe` (cached) the first time
 /// per file: call it from the blocking pool, never from an async task.
-pub(crate) fn spawn_proxy(app: &AppHandle, asset: &Asset) {
+pub(crate) fn spawn_proxy(app: &impl Host, asset: &Asset) {
     let declined = app
-        .try_state::<AppState>()
+        .managed::<AppState>()
         .and_then(|state| state.project().proxy_declined(asset.id).ok())
         .unwrap_or(false);
     let input = kerf_core::ProxyInput {
@@ -933,10 +961,10 @@ pub(crate) fn spawn_proxy(app: &AppHandle, asset: &Asset) {
 /// [`spawn_proxy`] for every asset of the open project, off the calling thread (a project
 /// can hold hundreds of them and each may need its probe): what a changed proxy size or
 /// preview source asks for.
-fn respawn_proxies(app: &AppHandle) {
+fn respawn_proxies(app: &impl Host) {
     let app = app.clone();
     std::thread::spawn(move || {
-        let (assets, generation) = match app.try_state::<AppState>() {
+        let (assets, generation) = match app.managed::<AppState>() {
             Some(state) => {
                 let project = state.project();
                 (project.list_assets().unwrap_or_default(), project.generation())
@@ -946,7 +974,7 @@ fn respawn_proxies(app: &AppHandle) {
         for asset in &assets {
             // Another project opened meanwhile: these are not its assets.
             let current = app
-                .try_state::<AppState>()
+                .managed::<AppState>()
                 .is_some_and(|state| state.project().generation() == generation);
             if !current {
                 return;
@@ -974,7 +1002,7 @@ async fn proxy_statuses(state: State<'_, AppState>) -> CmdResult<Vec<kerf_core::
 /// Returns where the new build starts; `proxy-progress` follows it. `lock` is how the caller
 /// takes the project (the GUI as the user, the MCP server as the agent).
 pub(crate) fn rebuild_proxy_now<'a>(
-    app: &AppHandle,
+    app: &impl Host,
     lock: &dyn Fn() -> std::sync::MutexGuard<'a, Project>,
     asset_id: Uuid,
 ) -> CmdResult<kerf_core::ProxyStatus> {
@@ -995,7 +1023,7 @@ pub(crate) fn rebuild_proxy_now<'a>(
 /// Delete an asset's proxy files at every size and stop any build of them; the proxy is not
 /// made again by itself until it is rebuilt. Returns the bytes freed and the new status.
 pub(crate) fn delete_proxy_now<'a>(
-    app: &AppHandle,
+    app: &impl Host,
     lock: &dyn Fn() -> std::sync::MutexGuard<'a, Project>,
     asset_id: Uuid,
 ) -> CmdResult<(u64, kerf_core::ProxyStatus)> {
@@ -1006,11 +1034,11 @@ pub(crate) fn delete_proxy_now<'a>(
     };
     let freed = kerf_core::proxy::delete(&input.asset);
     let status = kerf_core::proxy::status(&input);
-    if let Err(e) = app.emit("proxy-progress", &status) {
+    if let Err(e) = app.send("proxy-progress", &status) {
         tracing::warn!(error = %e, "failed to emit proxy-progress");
     }
     // Previews that were decoding the proxy decode the original from here on.
-    if let Err(e) = app.emit("proxy-ready", ()) {
+    if let Err(e) = app.send("proxy-ready", ()) {
         tracing::warn!(error = %e, "failed to emit proxy-ready");
     }
     Ok((freed, status))
@@ -1062,7 +1090,7 @@ pub(crate) struct AnalysisOutcome {
 /// not (it is in the outcome and the status). `lock` is how the caller takes the project: the
 /// GUI as the user, the MCP server as the agent (which also stamps its activity).
 pub(crate) fn run_analysis<'a>(
-    app: &AppHandle,
+    app: &impl Host,
     lock: &dyn Fn() -> std::sync::MutexGuard<'a, Project>,
     asset_id: Uuid,
     steps: Option<&[kerf_core::AnalysisKind]>,
@@ -1079,7 +1107,7 @@ pub(crate) fn run_analysis<'a>(
     // What is cached as of now: it grows with each finished step, and the status reads it.
     let current = std::cell::RefCell::new(stored);
     let emit_status = || {
-        let _ = app.emit(
+        let _ = app.send(
             "analysis-status",
             kerf_core::analysis_status(asset_id, current.borrow().as_ref()),
         );
@@ -1089,7 +1117,7 @@ pub(crate) fn run_analysis<'a>(
     // model and then runs inference for minutes, so each step is streamed to the webview
     // rather than hidden behind a spinner.
     let mut on_progress = |p: kerf_core::AnalysisProgress| {
-        let _ = app.emit(
+        let _ = app.send(
             "analysis-progress",
             AnalysisProgressEvent {
                 asset_id: id_text.clone(),
@@ -1161,7 +1189,7 @@ pub(crate) fn run_analysis<'a>(
 /// lock again, unless a newer transcript landed meanwhile. Only analysis moved, so it says so
 /// with `analysis-status`, not `project-changed`.
 pub(crate) fn run_refine<'a>(
-    app: &AppHandle,
+    app: &impl Host,
     lock: &dyn Fn() -> std::sync::MutexGuard<'a, Project>,
     asset_id: Uuid,
     cancel: &dyn Fn() -> bool,
@@ -1176,7 +1204,7 @@ pub(crate) fn run_refine<'a>(
     };
     let id_text = asset_id.to_string();
     let emit = |p: kerf_core::AnalysisProgress| {
-        let _ = app.emit(
+        let _ = app.send(
             "analysis-progress",
             AnalysisProgressEvent {
                 asset_id: id_text.clone(),
@@ -1200,7 +1228,7 @@ pub(crate) fn run_refine<'a>(
             .store_transcript(asset_id, &read, refined)
             .map_err(|e| e.to_string())?
     };
-    let _ = app.emit("analysis-status", kerf_core::analysis_status(asset_id, Some(&stored)));
+    let _ = app.send("analysis-status", kerf_core::analysis_status(asset_id, Some(&stored)));
     Ok(stored)
 }
 
@@ -4843,15 +4871,15 @@ async fn write_text_file(path: String, contents: String) -> CmdResult<String> {
 
 /// Where the logfiles live: `<app data dir>/logs`. The one place this is
 /// decided, so `init_logging` and `reveal_logs` cannot disagree.
-fn log_dir_path(app: &AppHandle) -> tauri::Result<std::path::PathBuf> {
-    app.path().app_data_dir().map(|dir| dir.join("logs"))
+fn log_dir_path(app: &impl Host) -> Option<std::path::PathBuf> {
+    app.data_dir().map(|dir| dir.join("logs"))
 }
 
 /// Open the log directory in the OS file manager so users can attach the file.
 #[tauri::command(async)]
 fn reveal_logs(app: AppHandle) -> CmdResult<()> {
     use tauri_plugin_opener::OpenerExt;
-    let dir = log_dir_path(&app).map_err(|e| e.to_string())?;
+    let dir = log_dir_path(&app).ok_or("no data directory for the logs")?;
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     app.opener()
         .open_path(dir.to_string_lossy().into_owned(), None::<&str>)
@@ -4989,18 +5017,26 @@ where
     tracing_subscriber::fmt::layer().with_ansi(false).with_writer(appender)
 }
 
-/// Install the global tracing subscriber: always to stdout, and — when the
-/// log directory (`<app data dir>/logs`) is writable — to a daily-rolling
-/// `kerf.<date>.log` there so users hitting an issue can attach it.
+/// Install the global tracing subscriber: always to the console (stdout, or stderr for a headless
+/// run, whose stdout is its ready line), and — when the log directory (`<app data dir>/logs`) is
+/// writable — to a daily-rolling `kerf.<date>.log` there so users hitting an issue can attach it.
 /// Level is `info` by default; override with `RUST_LOG` (e.g. `RUST_LOG=debug`).
-fn init_logging(app: &AppHandle) {
+fn init_logging(log_dir: Option<std::path::PathBuf>, to_stderr: bool) {
+    use std::io::IsTerminal;
+    use tracing_subscriber::fmt::writer::BoxMakeWriter;
     use tracing_subscriber::prelude::*;
 
     let filter =
         tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
-    let stdout = tracing_subscriber::fmt::layer().with_writer(std::io::stdout);
+    let stdout = if to_stderr {
+        tracing_subscriber::fmt::layer()
+            .with_ansi(std::io::stderr().is_terminal())
+            .with_writer(BoxMakeWriter::new(std::io::stderr))
+    } else {
+        tracing_subscriber::fmt::layer().with_writer(BoxMakeWriter::new(std::io::stdout))
+    };
 
-    let file = log_dir_path(app).ok().and_then(|dir| {
+    let file = log_dir.and_then(|dir| {
         std::fs::create_dir_all(&dir).ok()?;
         Some((file_layer(file_appender(&dir).ok()?), dir))
     });
@@ -5325,6 +5361,24 @@ fn on_second_launch(app: &AppHandle, argv: Vec<String>, cwd: String) {
     }
 }
 
+/// The app's compiled-in configuration: the one `generate_context!`, shared by the window and the
+/// headless run (which reads only its identifier).
+fn context() -> tauri::Context {
+    tauri::generate_context!()
+}
+
+/// `kerf-app --headless …`: the MCP server with no window, until a signal; the exit code. `None`
+/// when the command line does not ask for it (the desktop app then runs).
+pub fn headless_main() -> Option<i32> {
+    let argv: Vec<String> = std::env::args_os().map(|a| a.to_string_lossy().into_owned()).collect();
+    if !headless::requested(&argv) {
+        return None;
+    }
+    // Before a thread exists: this sets environment variables.
+    let bundled_ffmpeg = use_bundled_ffmpeg();
+    Some(headless::main(&argv, &bundled_ffmpeg))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     // Before a thread exists: this sets environment variables.
@@ -5361,7 +5415,7 @@ pub fn run() {
         .setup(move |app| {
             // Logging needs the resolved app data directory, so set it up here
             // (before anything else in setup) rather than at the top of `run`.
-            init_logging(app.handle());
+            init_logging(log_dir_path(app.handle()), false);
             install_panic_hook();
             set_app_dirs(app.handle());
             // The untitled project moves into a crash-recovery file before anything can edit it.
@@ -5423,7 +5477,7 @@ pub fn run() {
             // The app *is* the MCP server: host the tools over HTTP, sharing the
             // same Project the GUI edits, so a connected LLM works on the open
             // project and its edits show up live.
-            mcp::start(app.handle(), project);
+            mcp::start(shell::Shell::Gui(app.handle().clone()), project);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -5653,7 +5707,7 @@ pub fn run() {
             popout::popout_focus,
             popout::popout_move
         ])
-        .build(tauri::generate_context!())
+        .build(context())
         .expect("error while building Kerf")
         .run(|app, event| {
             // The logfile's last line then says whether the end was a clean exit

@@ -146,6 +146,17 @@ An agent's edits wait in a proposal for you to accept (all of it, or only some c
 unless you switch review off in the same place: then its edits, the work on the tasks
 you queue included, land on the cut as it makes them, each one an undoable step.
 
+### Headless
+
+No display (CI, a server)? Run the MCP server without a window:
+
+```bash
+KERF_MCP_TOKEN=<32+ chars> kerf-app --headless --mcp-addr 127.0.0.1:7777 [--project cut.kerf]
+```
+
+It prints one JSON line on stdout once it listens and stops on SIGINT / SIGTERM; edits land live
+unless `--review`. `kerf-app --headless --help` lists the flags (`--data-dir`, `--token-file`, …).
+
 Now ask the agent to work on the project you have open — _"skim the interview clip, cut
 the dead air, and drop in captions."_ It will claim a task, use the tools below, and hand
 back a reviewable result.
