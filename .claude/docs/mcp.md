@@ -412,6 +412,13 @@ that range would write, on the sliced cut) tells it whether the cut is publishab
 (and the server `instructions` tell it to run that before reporting a cut
 finished — an agent that assembles a four-minute Reel has done the work and lost
 the audience), and `export_cover` writes the thumbnail.
+`review_cut { range?, checks? }` is the other half of that step (the guide and `INSTRUCTIONS` name both): read-only,
+`Project::review_inputs` under `lock_agent_as` on `blocking`, the pure `kerf_core::review::review` after the lock is
+released (`core-render-plan.md`). `checks` are names (`flash_frame`, `mid_word_cut`, `hard_audio_cut`, `jump_cut`,
+`stale_captions`, `black_gap`; omitted or empty = all, an unknown one `invalid_params` listing them); the answer is
+compact `{issues: [{kind, severity, time, end?, clip_ids, message, fix}], counts_by_kind, checked, skipped: [{check,
+reason}]}` — a check whose analysis is missing (no transcript, no silence analysis, captions from elsewhere) is
+skipped with the reason and the `analyze_asset` step to run, never guessed.
 `stage_edits` / `staged_diff` (the entries plus a rendered text summary) /
 `apply_staged_edits` / `discard_staged_edits` drive it explicitly, and
 `revision_diff` explains a past revision. The server `instructions` spell the flow
@@ -650,7 +657,7 @@ Every tool, by purpose (a test pins that this list names each registered tool, a
   `transcription_status`, `download_speech_model`, `set_speech_model`, `proxy_status`, `rebuild_proxy`, `delete_proxy`,
   `get_music_structure`.
 - **Looking and measuring**: `get_editing_guide`, `timeline_summary`, `get_timeline_state`, `get_editor_context`, `get_scopes`, `skim_asset`, `get_frame`, `preview_timeline`,
-  `get_waveform`, `get_waveform_range`, `get_energy`, `get_levels`, `get_band_balance`, `platform_check`.
+  `get_waveform`, `get_waveform_range`, `get_energy`, `get_levels`, `get_band_balance`, `platform_check`, `review_cut`.
 - **Editing the cut**: `cut_clip`, `add_clip_to_timeline`, `split_at`, `trim`, `reorder`, `move_clip`, `move_clips`,
   `ripple_delete`, `cut_clip_range`, `roll_edit`, `slip_clip`, `slide_clip`, `split_remove`, `split_remove_clips`, `remove`,
   `remove_clips`, `duplicate_clips`, `concatenate`, `remove_silence`, `snap_to_beats`, `sync_clips_by_audio`, `smart_crop`, `add_track`,

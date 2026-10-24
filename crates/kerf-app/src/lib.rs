@@ -4604,6 +4604,20 @@ fn platform_check(
     state.project().platform_report(frame, range).map_err(|e| e.to_string())
 }
 
+/// The working cut's editing mistakes (`kerf_core::review`): flash frames, cuts inside a word,
+/// sound cut into sound, jump cuts, stale captions and black gaps. `checks` by name, none for all;
+/// `range` keeps what falls in that span. Inputs resolve under the lock; the review runs without it.
+#[tauri::command(async)]
+fn review_cut(
+    state: State<'_, AppState>,
+    range: Option<kerf_core::TimeRange>,
+    checks: Option<Vec<String>>,
+) -> CmdResult<kerf_core::CutReview> {
+    let checks = kerf_core::ReviewCheck::parse_list(&checks.unwrap_or_default()).map_err(|e| e.to_string())?;
+    let inputs = state.project().review_inputs().map_err(|e| e.to_string())?;
+    Ok(kerf_core::review::review(&inputs, range.map(|r| (r.start, r.end)), &checks))
+}
+
 /// Show a file in the OS file manager. The last step of an export: the render
 /// finished somewhere, and "somewhere" is not much use on its own.
 #[tauri::command(async)]
@@ -5581,6 +5595,7 @@ pub fn run() {
             get_render_bar,
             platform_targets,
             platform_check,
+            review_cut,
             reveal_path,
             agent_status,
             mcp_commands::mcp_connection_info,

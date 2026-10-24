@@ -64,7 +64,7 @@ agent isn't scripting a black box; it drives the identical engine — and its ed
 | **Real playback** | Not a slideshow — one long-lived FFmpeg streams the **composited** cut (every track, effect, keyframe and overlay) paced against the audio clock, with J/K/L shuttle audible both ways and audible Web-Audio scrub. |
 | **Delivery frames** | 16:9 / 9:16 / 1:1 / 4:5 is a property of the **project**, so preview, scrub and export all render the same frame — with platform **safe-area guides** and cover-crop instead of letterboxing. |
 | **Smart crop** | Reshaping 16:9 to 9:16 throws away most of one axis. `smart_crop` samples where each shot's content actually is (edge detail + motion, no model to ship) and writes the crop that keeps it, per clip — an ordinary transform the sliders can still override. |
-| **Ready to publish?** | `platform_check` judges the cut against Reels / Shorts / TikTok / Instagram / YouTube — length, shape, resolution, captions — and tells a **hard** limit (rejected) apart from a **reach** limit (accepted, then buried). Advisory only; nothing blocks an export. **Cover frames** save at the full delivery resolution. |
+| **Ready to publish?** | `platform_check` judges the cut against Reels / Shorts / TikTok / Instagram / YouTube — length, shape, resolution, captions — and tells a **hard** limit (rejected) apart from a **reach** limit (accepted, then buried). Advisory only; nothing blocks an export. `review_cut` lints the editing itself — flash frames, cuts inside a word, sound cut into sound, jump cuts, captions a later edit left behind, black gaps — each with the tool that fixes it. **Cover frames** save at the full delivery resolution. |
 | **Analysis & speech** | Silence and scene detection, an onset/**tempo** grid, EBU R128 loudness and speech-vs-music from one decode — plus **transcription in every build**, via FFmpeg's `whisper` filter or in-process whisper.cpp (models fetched on first use). |
 | **Cut to the beat** | The tempo grid is drawn on the ruler and snapped to while dragging, and `snap_to_beats` ripples a whole track's cuts onto it, retrimming each clip at its **outgoing** edge. |
 | **Effects, color & looks** | Per-clip video (`blur`/`sharpen`/`hue`/`negate`/`vignette`/`chromakey`) and audio (`highpass`/`lowpass`/`EQ`/`compressor`/`gate`) chains, transform + color grade, and one-click **Punchy / Warm / Cool / Faded / B&W** looks. |
@@ -144,7 +144,7 @@ Now ask the agent to work on the project you have open — _"skim the interview 
 the dead air, and drop in captions."_ It will claim a task, use the tools below, and hand
 back a reviewable result.
 
-### The tools (178)
+### The tools (179)
 
 <details>
 <summary><b>See / analyze</b></summary>
@@ -196,7 +196,7 @@ score, fitted to the cuts) ·
 <details>
 <summary><b>Render & hand-off</b></summary>
 
-`export` · `export_capabilities` · `export_cover` · `export_interchange` · `export_markers` · `platform_check` · `get_levels` · `stage_edits` ·
+`export` · `export_capabilities` · `export_cover` · `export_interchange` · `export_markers` · `platform_check` · `review_cut` (flash frames, cuts inside a word, clicks, jump cuts, stale captions, black gaps) · `get_levels` · `stage_edits` ·
 `staged_diff` · `apply_staged_edits` · `discard_staged_edits` · `revision_diff` ·
 `list_tasks` · `add_task` · `claim_next_task` · `complete_task` · `fail_task` ·
 `resolve_task` · `remove_task` · `history` · `undo` · `redo` · `revert_to` ·

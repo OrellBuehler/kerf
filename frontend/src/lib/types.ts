@@ -1540,6 +1540,28 @@ export interface PlatformReport {
 	targets: DeliveryCheck[];
 }
 
+/** One check of the editing lint, and the `kind` of what it finds (`kerf_core::review::Check`). */
+export type ReviewCheck = 'flash_frame' | 'mid_word_cut' | 'hard_audio_cut' | 'jump_cut' | 'stale_captions' | 'black_gap';
+
+/** A defect in the cut (`kerf_core::ReviewIssue`), at timeline `time` (to `end` for a span), with the tools that fix it. */
+export interface ReviewIssue {
+	kind: ReviewCheck;
+	severity: Severity;
+	time: number;
+	end?: number;
+	clip_ids: string[];
+	message: string;
+	fix: string;
+}
+
+/** `kerf_core::CutReview`: what the editing lint found, which checks ran and why the others did not. */
+export interface CutReview {
+	issues: ReviewIssue[];
+	counts_by_kind: Partial<Record<ReviewCheck, number>>;
+	checked: ReviewCheck[];
+	skipped: { check: ReviewCheck; reason: string }[];
+}
+
 /** The part of an export that is running (`kerf_core::ExportStage`). */
 export type ExportStage = 'metering' | 'starting' | 'rendering' | 'finishing' | 'measuring';
 

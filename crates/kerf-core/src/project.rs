@@ -2040,6 +2040,34 @@ impl Project {
         })
     }
 
+    /// What a [`crate::review::review`] of the cut reads: the **working** timeline, the assets and
+    /// the cached analysis of each asset the timeline uses. Resolved together so the caller can drop
+    /// the lock before reviewing.
+    pub fn review_inputs(&self) -> Result<crate::review::ReviewInputs> {
+        let timeline = self.working_timeline()?;
+        let mut analyses = HashMap::new();
+        for clip in timeline.tracks.iter().flat_map(|t| t.clips.iter()) {
+            if analyses.contains_key(&clip.asset_id) {
+                continue;
+            }
+            if let Some(analysis) = self.get_analysis(clip.asset_id)? {
+                analyses.insert(clip.asset_id, analysis);
+            }
+        }
+        Ok(crate::review::ReviewInputs {
+            timeline,
+            assets: self.list_assets()?,
+            analyses,
+        })
+    }
+
+    /// Review the working cut for craft defects ([`crate::review`]): `checks` by name (none is every
+    /// check; an unknown one is an [`Error::InvalidArgument`]), over `range` of the cut.
+    pub fn review_cut(&self, range: Option<(f64, f64)>, checks: &[String]) -> Result<crate::review::CutReview> {
+        let checks = crate::review::Check::parse_list(checks)?;
+        Ok(crate::review::review(&self.review_inputs()?, range, &checks))
+    }
+
     /// The owned inputs a levels measurement needs: the working timeline and the
     /// **original** assets — it measures what the export would write, so no proxy
     /// swap. Resolved together so the caller can drop the project lock before
@@ -7813,6 +7841,29 @@ mod tests {
             .issues
             .iter()
             .any(|i| i.severity == crate::platform::Severity::Warning && i.message.contains("letterboxed")));
+    }
+
+    #[test]
+    fn review_cut_reads_the_working_cut_and_its_analysis() {
+        let project = Project::sample().unwrap();
+        let timeline = project.working_timeline().unwrap();
+        let clip = timeline.tracks.iter().flat_map(|t| t.clips.iter()).next().unwrap().clone();
+        project
+            .set_analysis(&AssetAnalysis {
+                asset_id: clip.asset_id,
+                scene_changes: vec![1.0],
+                ..AssetAnalysis::default()
+            })
+            .unwrap();
+        let inputs = project.review_inputs().unwrap();
+        assert_eq!(inputs.timeline.duration(), timeline.duration());
+        assert!(inputs.analyses.contains_key(&clip.asset_id));
+        let review = project.review_cut(None, &["flash_frame".to_string()]).unwrap();
+        assert_eq!(review.checked, vec![crate::review::Check::FlashFrame]);
+        assert!(matches!(
+            project.review_cut(None, &["flash".to_string()]),
+            Err(Error::InvalidArgument(_))
+        ));
     }
 
     #[test]

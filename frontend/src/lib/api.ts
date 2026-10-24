@@ -32,6 +32,8 @@ import type {
 	LutInfo,
 	Delivery,
 	PlatformReport,
+	CutReview,
+	ReviewCheck,
 	EditSource,
 	ExportOptions,
 	ExportedFile,
@@ -5088,6 +5090,27 @@ export async function platformCheck(
 		height: frame?.[1] ?? null,
 		range: range ?? null
 	});
+}
+
+/** The working cut's editing mistakes (`kerf_core::review`): `checks` by name (all when omitted), `range` keeps what
+ *  falls in that span. The browser harness does not review: every check comes back skipped. */
+export async function reviewCut(
+	range?: { start: number; end: number } | null,
+	checks?: ReviewCheck[] | null
+): Promise<CutReview> {
+	if (!inTauri()) {
+		const all: ReviewCheck[] = ['flash_frame', 'mid_word_cut', 'hard_audio_cut', 'jump_cut', 'stale_captions', 'black_gap'];
+		return {
+			issues: [],
+			counts_by_kind: {},
+			checked: [],
+			skipped: (checks?.length ? all.filter((c) => checks.includes(c)) : all).map((check) => ({
+				check,
+				reason: 'the browser harness does not review the cut'
+			}))
+		};
+	}
+	return invoke<CutReview>('review_cut', { range: range ?? null, checks: checks ?? null });
 }
 
 let platformTargetsKnown: Promise<PlatformTarget[]> | null = null;
