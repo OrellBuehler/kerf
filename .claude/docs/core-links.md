@@ -28,8 +28,8 @@
   new clip's volume is `volume × picture fader ÷ audio fader` (a lane whose fader is at
   zero is never chosen, and the render check measures +0.00 dB through a V1 fader of 0.5
   into an A1 fader of 2.0) — **exact only while the clip's chain is linear**: folding the
-  fader into the volume moves the gain *ahead of* a compressor or gate
-  (`AudioEffect::is_dynamic`), which then reacts to a different level. So a clip with one
+  fader into the volume moves the gain *ahead of* a compressor, gate or denoise
+  (`AudioEffect::is_dynamic`; a denoiser's floor is an absolute level), which then reacts to a different level. So a clip with one
   goes to a lane whose fader **equals** the picture track's — an existing one with room,
   else a **new audio track at that fader**, there is no skip path — and its volume is left
   alone; filters and EQ commute with gain and still fold; the destination's **pan, duck flag and mute/solo** now decide

@@ -126,7 +126,7 @@
   master faders; overlay / marker / chroma-key colours go through `valid_color` when set;
   audio effect parameters are held to the ranges of the FFmpeg filters they become (`acompressor`:
   threshold −60..0 dB, ratio 1..20, attack 0.01..2000 ms, release 0.01..9000 ms, makeup 0..36 dB;
-  `agate` ≤ 0 dB; EQ gain ±900 dB; frequencies above 0 up to 999999 Hz — an `#[ignore]`d test runs
+  `agate` ≤ 0 dB; `afftdn` reduction 0.01..97 dB, floor −80..−20 dB; EQ gain ±900 dB; frequencies above 0 up to 999999 Hz — an `#[ignore]`d test runs
   every boundary through the real ffmpeg), video effects likewise (`gblur` 0..1024, `unsharp`
   −2..5, `chromakey` similarity ≥ 1e-5); a clip added or trimmed stays inside its footage
   (`source_in ≥ 0`, `source_out ≤` the asset's length, a still has no end), the new/trimmed clip
@@ -177,8 +177,12 @@
   its next write of the clip and the clip then plays at its constant speed, a different length; a clip with none is written as
   before, `run` a no-op, `needed` always, `needed_to_read` false (`a_v13_file_is_backed_up_stamped_v14_and_keeps_its_speed_ramps`);
   `persisted/timelines-v14.json` holds a clip on a ramp with a held segment.
-  The schema is at **v14** (`SCHEMA_VERSION`). `persist_tests` pins which steps a file has pending with
-  `store::pending_steps` (a legacy file that has every column: `[4, 5, 6, 7, 8, 9, 10, 11, 12, 13]`). A step's `needed_to_read` says whether a build that
+  v14→v15 is a JSON step for a **new variant**, `AudioEffect::Denoise` (`{"type":"denoise",…}` in a clip's `audio`): an older
+  build cannot read it, and with it the whole timeline; a chain without one is written as before, `run` a no-op, `needed` always,
+  `needed_to_read` false (`a_v14_file_is_backed_up_stamped_v15_and_keeps_its_denoise`); `persisted/timelines-v15.json` holds a
+  denoised clip with its floor tracked.
+  The schema is at **v15** (`SCHEMA_VERSION`). `persist_tests` pins which steps a file has pending with
+  `store::pending_steps` (a legacy file that has every column: `[4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]`). A step's `needed_to_read` says whether a build that
   cannot write must still refuse a file lacking what it adds: true for the v1, v2 and v4 columns (the reads
   name them), false for the `fonts` table (reads tolerate its absence), so a write-protected v2 project
   opens as it is. A new file is stamped `SCHEMA_VERSION`; a

@@ -554,7 +554,7 @@ one edit each, and its multi-clip edits have their own commands.
 
 **Prompts.** `get_info` advertises `prompts`; `list_prompts` / `get_prompt` (written by hand, not rmcp's prompt macros)
 serve `prompts::list` / `prompts::get`: `rough_cut_from_transcript { assets?, target_length?, brief? }`, `podcast_cleanup
-{ asset?, loudness? }`, `social_reel { platform, length?, aspect? }`, `music_bed { music?, style? }` and `deliver { output?,
+{ asset?, loudness? }` (its voice chain is highpass, denoise, compressor, gate, in that order), `social_reel { platform, length?, aspect? }`, `music_bed { music?, style? }` and `deliver { output?,
 platform? }` — the guide's workflows as a numbered step list in one user message (Claude Code offers them as
 `/mcp__kerf__<name>`). Each step is the guide's own rule (staging, captions last, `get_ripple_mode` first, platform_check
 and get_levels before done, export reads the proposal), not new behaviour. A prompt names its tools in **backticks** and only
