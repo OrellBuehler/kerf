@@ -211,6 +211,7 @@ fn layer(path: String, pick: Pick) -> PlanLayer {
             source_window: (0.0, 10.0),
             speed: 1.0,
             reversed: false,
+            ramped: false,
         },
     }
 }

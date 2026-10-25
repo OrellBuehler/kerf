@@ -293,6 +293,10 @@ pub enum Unsupported {
     /// which): swscale converts the range inside the resize, from chroma the compositor has already
     /// converted and scaled, which reads up to 15 levels of chroma off (FFmpeg 6 as well as 9).
     FullRangeResized(LayerRef, &'static str),
+    /// The layer's clip has a speed ramp: the export retimes its frames with an expression of closed
+    /// forms and `fps` picks among them, which the plan does not reproduce (a frame pick over a rate
+    /// that moves), and a still of it is the frame the map names, not the one the file shows.
+    SpeedRamp(LayerRef),
     /// The layer plays on past its end, under the clip that replaces it.
     Tail(LayerRef),
     KeyedOpacity(LayerRef),
@@ -375,6 +379,7 @@ impl Unsupported {
             Self::FullRangeNegotiated(_) => "full_range_negotiated",
             Self::FullRangeCut => "full_range_cut",
             Self::FullRangeResized(..) => "full_range_resized",
+            Self::SpeedRamp(_) => "speed_ramp",
             Self::Tail(_) => "tail",
             Self::KeyedOpacity(_) => "keyed_opacity",
             Self::KeyedColor(_) => "keyed_color",
@@ -463,6 +468,10 @@ impl fmt::Display for Unsupported {
             Self::FullRangeResized(l, where_) => write!(
                 f,
                 "{l}: a full-range picture {where_} that the scaler resizes (swscale converts its range inside the resize: chroma up to 15 levels off)"
+            ),
+            Self::SpeedRamp(l) => write!(
+                f,
+                "{l}: a speed ramp (the export retimes its frames by an expression and picks among them, which the compositor does not reproduce)"
             ),
             Self::Tail(l) => write!(f, "{l}: playing on past its end under a transition"),
             Self::KeyedOpacity(l) => write!(f, "{l}: keyframed opacity (a geq alpha written per frame, which no compositor pass draws or has a parity case for yet)"),
@@ -556,6 +565,10 @@ mod tests {
         assert_eq!(Unsupported::Shrink(0, (4000, 2000), (50, 20)).kind(), "shrink");
         assert_ne!(Unsupported::Text.kind(), Unsupported::TextBorder.kind());
         assert_eq!(Unsupported::MixedMatrices.kind(), "mixed_matrices");
+        assert_eq!(Unsupported::SpeedRamp(layer(1, "a.mp4")).kind(), "speed_ramp");
+        assert!(Unsupported::SpeedRamp(layer(1, "a.mp4"))
+            .to_string()
+            .starts_with("layer 1 (a.mp4): a speed ramp"));
         assert_eq!(
             Unsupported::DipToWhite(layer(0, "a.mp4"), DipWhy::Resized).kind(),
             Unsupported::DipToWhite(layer(2, "b.mov"), DipWhy::Format).kind(),
@@ -581,6 +594,7 @@ mod tests {
             Unsupported::FullRangeNegotiated(layer(0, "")).kind(),
             Unsupported::FullRangeCut.kind(),
             Unsupported::FullRangeResized(layer(0, ""), "an export frame").kind(),
+            Unsupported::SpeedRamp(layer(0, "")).kind(),
         ];
         for kind in kinds {
             assert!(

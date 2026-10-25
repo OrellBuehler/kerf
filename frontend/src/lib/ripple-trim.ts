@@ -18,8 +18,8 @@
 import { trimEdit } from './frames';
 import { DIFF_EPS, rippleFrom } from './ripple';
 import { isTitleClip, MAX_TITLE_SECONDS } from './title-clips';
+import { clipDuration, headTime, tailTime, trimRamp } from './speed-ramp';
 import type { Clip, Track } from './types';
-import { clipDuration } from './types';
 
 /** Shortest a clip may get when edge-trimming, seconds. */
 export const MIN_CLIP = 0.05;
@@ -50,7 +50,6 @@ export function trimBounds(
 	ripple: boolean
 ): TrimBounds {
 	const sp = clip.speed ?? 1;
-	const mag = Math.max(Math.abs(sp), 0.01);
 	if (isTitleClip(clip)) assetDuration = MAX_TITLE_SECONDS;
 	const start = clip.timeline_start;
 	const end = start + clipDuration(clip);
@@ -60,10 +59,10 @@ export function trimBounds(
 	if (edge === 'l') {
 		const prev = !ripple && i > 0 ? clips[i - 1] : null;
 		const prevEnd = prev ? prev.timeline_start + clipDuration(prev) : 0;
-		return { min: Math.max(0, prevEnd, still ? 0 : start - headHandle / mag), max: end - MIN_CLIP };
+		return { min: Math.max(0, prevEnd, still ? 0 : start - headTime(clip, headHandle)), max: end - MIN_CLIP };
 	}
 	const nextStart = !ripple && i >= 0 && i < clips.length - 1 ? clips[i + 1].timeline_start : Infinity;
-	return { min: start + MIN_CLIP, max: Math.min(nextStart, still ? Infinity : end + tailHandle / mag) };
+	return { min: start + MIN_CLIP, max: Math.min(nextStart, still ? Infinity : end + tailTime(clip, tailHandle)) };
 }
 
 /** One clip of the previewed track as the commit would leave it. */
@@ -103,10 +102,12 @@ export function rippleTrimPreview(
 	const before = copy();
 	const after = copy();
 	const clip = after.clips.find((c) => c.id === clipId)!;
+	const prior = { ...clip };
 	const e = trimEdit(clip, edge, pos);
 	// What `trim_clip` does with those fields.
 	if (e.source_in !== undefined) clip.source_in = e.source_in;
 	if (e.source_out !== undefined) clip.source_out = e.source_out;
+	trimRamp(prior, clip);
 	if (e.timeline_start !== undefined) {
 		clip.timeline_start = Math.max(0, e.timeline_start);
 		after.clips.sort((a, b) => a.timeline_start - b.timeline_start);

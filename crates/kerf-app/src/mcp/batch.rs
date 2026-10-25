@@ -42,7 +42,7 @@ pub struct EditOp {
     /// split_remove_clips, remove, remove_clips, duplicate_clips, concatenate, remove_silence, snap_to_beats,
     /// add_track, remove_track, extract_audio, add_asset_audio, detach_audio, detach_audio_clips,
     /// reattach_audio, reattach_audio_clips, link_clips, unlink_clips, set_volume, set_fade, set_speed,
-    /// set_transform, set_transform_at, set_color, set_grade (without a lut_path), set_transition,
+    /// set_speed_ramp, set_transform, set_transform_at, set_color, set_grade (without a lut_path), set_transition,
     /// set_video_effects, set_audio_effects, set_mask, set_clip_enabled, set_keyframes, add_keyframe,
     /// set_keyframe_easing, set_property_keyframes, set_property_tracks, copy_keyframes, clear_keyframes,
     /// set_reframe, clear_reframe, set_reframe_keyframes, add_reframe_keyframe, set_track_volume,
@@ -110,6 +110,7 @@ batchable! {
     set_volume => KerfMcp::set_volume_op,
     set_fade => KerfMcp::set_fade_op,
     set_speed => KerfMcp::set_speed_op,
+    set_speed_ramp => KerfMcp::set_speed_ramp_op,
     set_transform => KerfMcp::set_transform_op,
     set_transform_at => KerfMcp::set_transform_at_op,
     set_color => KerfMcp::set_color_op,
@@ -497,6 +498,56 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.message.contains("has not run yet"), "{}", err.message);
+    }
+
+    #[test]
+    fn a_speed_ramp_batches_and_a_bad_ramp_is_the_callers_to_fix() {
+        let (project, ids) = sample();
+        let slow_mo = json!([
+            {"time": 0.0, "speed": 1.0},
+            {"time": 0.5, "speed": 0.3},
+            {"time": 1.5, "speed": 0.3, "easing": "hold"},
+            {"time": 2.0, "speed": 1.0},
+        ]);
+        let out = apply(
+            &project,
+            json!({"ops": [{"tool": "set_speed_ramp", "args": {"clip_id": ids[0], "keys": slow_mo}}]}),
+        )
+        .unwrap();
+        let clip = &out["results"][0];
+        assert_eq!(clip["speed_ramp"].as_array().map(Vec::len), Some(4), "{clip}");
+        assert_eq!(clip["speed_ramp"][2]["easing"], "hold");
+        assert!(clip["speed_ramp"][0].get("easing").is_none(), "linear is the default: {clip}");
+
+        let out = apply(
+            &project,
+            json!({"ops": [{"tool": "set_speed_ramp", "args": {"clip_id": ids[0], "keys": []}}]}),
+        )
+        .unwrap();
+        assert!(
+            out["results"][0].get("speed_ramp").is_none(),
+            "empty keys clear the ramp: {out}"
+        );
+
+        for (keys, said) in [
+            (
+                json!([{"time": 1.0, "speed": 1.0}, {"time": 1.0, "speed": 2.0}]),
+                "op 0 (set_speed_ramp)",
+            ),
+            (json!([{"time": 0.0, "speed": 500.0}]), "op 0 (set_speed_ramp)"),
+            (
+                json!([{"time": 0.0, "speed": 1.0, "easing": "ease"}]),
+                "op 0 (set_speed_ramp)",
+            ),
+        ] {
+            let err = apply(
+                &project,
+                json!({"ops": [{"tool": "set_speed_ramp", "args": {"clip_id": ids[0], "keys": keys}}]}),
+            )
+            .unwrap_err();
+            assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{}", err.message);
+            assert!(err.message.starts_with(said), "{}", err.message);
+        }
     }
 
     #[test]

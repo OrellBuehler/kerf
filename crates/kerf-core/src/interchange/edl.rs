@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use uuid::Uuid;
 
-use super::{clip_extras, one_line, InterchangeOptions, Report, Timebase};
+use super::{clip_extras, export_speed, one_line, InterchangeOptions, Report, Timebase};
 use crate::clip_timing::transition_fx;
 use crate::error::{Error, Result};
 use crate::model::{Asset, Clip, StreamKind, Timeline};
@@ -84,7 +84,7 @@ fn source_entry(tb: &Timebase, clip: &Clip) -> i64 {
 /// Where a clip's source run ends after `rec_frames` of record time: the speed's worth of
 /// source frames on from the entry, counting down for a reversed clip.
 fn source_exit(src_in: i64, rec_frames: i64, clip: &Clip) -> i64 {
-    let span = (rec_frames as f64 * clip.speed_mag()).round() as i64;
+    let span = (rec_frames as f64 * clip.mean_speed()).round() as i64;
     if clip.is_reversed() {
         src_in - span
     } else {
@@ -169,6 +169,9 @@ pub(super) fn export(timeline: &Timeline, assets: &[Asset], opts: &InterchangeOp
         for extra in clip_extras(clip) {
             report.warn(format!("clip {extra} are not carried by an EDL"));
         }
+        if clip.is_ramped() {
+            report.warn("speed ramps were written at their average speed (an EDL holds one rate per event)");
+        }
         if clip.source_audio && asset_of(clip).is_some_and(|a| a.has_audio()) {
             report.warn("the sound of video clips is not written to the EDL (events are picture only, channel V)");
         }
@@ -235,7 +238,8 @@ pub(super) fn export(timeline: &Timeline, assets: &[Asset], opts: &InterchangeOp
                 comments.extend(file_of(clip).map(|f| format!("SOURCE FILE: {f}")));
             }
         }
-        let m2 = ((clip.speed - 1.0).abs() > f64::EPSILON).then(|| (reel.clone(), clip.speed * tb.base as f64, src_in));
+        let speed = export_speed(clip);
+        let m2 = ((speed - 1.0).abs() > f64::EPSILON).then(|| (reel.clone(), speed * tb.base as f64, src_in));
         events.push(Event { lines, m2, comments });
         previous = Some(j);
     }

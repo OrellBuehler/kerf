@@ -120,12 +120,16 @@ review is on — a call that wants one different answer passes `ripple` instead)
 clips_shifted}` — `rippled` is *measured* (`Timeline::clips_moved_since`, the clips
 standing elsewhere afterwards, matched by id), not the mode echoed back: ripple is an
 attempt, skipped on a locked track and declined for a lane the shift would leave
-overlapping) are the one-revision group edits, and the edits that follow the mode — `trim`, `set_speed`, `remove`,
+overlapping) are the one-revision group edits, and the edits that follow the mode — `trim`, `set_speed`, `set_speed_ramp`, `remove`,
 `remove_clips`, `add_clip_to_timeline`, `split_at`, `split_remove`, `generate_voiceover`'s and
 `compose_music`'s placement — take an optional `ripple` that is `project.with_ripple(p.ripple, …)`
 around the core call (omitted follows the project; `false` is the escape hatch); their
 descriptions say plainly that the push can be skipped, and an add *inside* a clip leaves
 the overlap.
+`set_speed_ramp { clip_id, keys: [{time, speed, easing?}], link?, ripple? }` is `set_speed`'s body around `Project::set_speed_ramp`
+(`with_links` over `with_ripple`; batchable): keys are clip-local *timeline* seconds, speeds `0.01..=100` magnitudes (direction stays the
+clip's sign), empty `keys` clears (an error when there is no ramp), the core refuses more than 16 keys and two at one time. Its description
+carries the slow-mo example; `set_speed` replaces a ramp; `get_timeline_state` shows `speed_ramp` on the clip.
 The ops that decide their own layout (`ripple_delete`, `cut_clip_range`,
 `snap_to_beats`, `move_clip`, `move_clips`, `roll_edit`, `slip_clip`, `slide_clip`,
 `reorder`, `duplicate_clips`) take none, which `ripple_is_an_optional_argument_on_exactly_the_edits_that_follow_the_mode`
@@ -752,7 +756,7 @@ Every tool, by purpose (a test pins that this list names each registered tool, a
   `remove_track`, `get_ripple_mode`, `set_ripple_mode`, `apply_edits`.
 - **Linked picture and sound**: `extract_audio`, `add_asset_audio`, `detach_audio`, `detach_audio_clips`, `reattach_audio`,
   `reattach_audio_clips`, `link_clips`, `unlink_clips`.
-- **Clip look and sound**: `set_volume`, `set_fade`, `set_speed`, `set_transform`, `set_transform_at`, `set_color`, `set_transition`,
+- **Clip look and sound**: `set_volume`, `set_fade`, `set_speed`, `set_speed_ramp`, `set_transform`, `set_transform_at`, `set_color`, `set_transition`,
   `set_grade`, `set_video_effects`, `set_audio_effects`, `set_mask`, `set_clip_enabled`.
 - **Keyframes and 360**: `set_keyframes`, `add_keyframe`, `set_keyframe_easing`, `set_property_keyframes`,
   `set_property_tracks`, `copy_keyframes`,

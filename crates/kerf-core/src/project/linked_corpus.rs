@@ -798,6 +798,113 @@ fn special_cases() -> Vec<Case> {
             json!({"kind": "ripple_delete", "clip_id": x1}),
         ));
     }
+
+    // Speed ramps on a mirrored pair (picture and sound the same window at the same place, linked), a plain
+    // pair after it. The ramp: 1x easing to half speed over two seconds, half speed until 5 s, held there to
+    // 6 s, then back to 1x — 8.5 s for the 6 s window.
+    {
+        let keys = || {
+            vec![
+                SpeedKey::new(0.0, 1.0),
+                SpeedKey::new(2.0, 0.5),
+                SpeedKey {
+                    time: 5.0,
+                    speed: 0.5,
+                    easing: crate::model::RampEasing::Hold,
+                },
+                SpeedKey::new(6.0, 1.0),
+            ]
+        };
+        let build = |ramped: bool| {
+            let mut ids = Ids::new();
+            let (mut p1, mut s1) = (ids.clip(AV, 10.0, 16.0, 1.0), ids.clip(AV, 10.0, 16.0, 1.0));
+            if ramped {
+                (p1.speed_ramp, s1.speed_ramp) = (keys(), keys());
+            }
+            let next = round3(p1.timeline_end());
+            let (p2, s2) = (ids.clip(AV, 30.0, 34.0, next), ids.clip(AV, 30.0, 34.0, next));
+            let mut t = timeline(vec![
+                lane(StreamKind::Video, "V1", 0, vec![p1.clone(), p2.clone()]),
+                lane(StreamKind::Audio, "A1", 1, vec![s1.clone(), s2.clone()]),
+            ]);
+            link(&mut t, &mut ids, &[p1.id, s1.id]);
+            link(&mut t, &mut ids, &[p2.id, s2.id]);
+            (t, p1)
+        };
+        let ramp_json = || serde_json::to_value(keys()).expect("serializes");
+        let (plain, p1) = build(false);
+        out.push(case(
+            "a speed ramp is carried to the sound",
+            plain.clone(),
+            json!({"kind": "set_speed_ramp", "clip_id": p1.id, "keys": ramp_json()}),
+        ));
+        let mut c = case(
+            "a speed ramp is a length change: ripple closes both lanes by it",
+            plain.clone(),
+            json!({"kind": "set_speed_ramp", "clip_id": p1.id, "keys": ramp_json()}),
+        );
+        c.ripple = true;
+        out.push(c);
+        let mut c = case(
+            "a speed ramp with the links off ramps the named clip alone",
+            plain,
+            json!({"kind": "set_speed_ramp", "clip_id": p1.id, "keys": ramp_json()}),
+        );
+        c.links = false;
+        out.push(c);
+        let (ramped, p1) = build(true);
+        let mut c = case(
+            "clearing a speed ramp clears the pair and ripple follows",
+            ramped.clone(),
+            json!({"kind": "set_speed_ramp", "clip_id": p1.id, "keys": []}),
+        );
+        c.ripple = true;
+        out.push(c);
+        out.push(case(
+            "a constant speed replaces the ramp on the pair",
+            ramped.clone(),
+            json!({"kind": "set_speed", "clip_id": p1.id, "speed": 2.0}),
+        ));
+        // The GUI's left-edge trim: a new in-point (2.0 source seconds in) and the start moved by what that plays for.
+        let head = round3(p1.local_at_along(2.0));
+        out.push(case(
+            "a left-edge trim of a ramped pair takes the ramp along with the footage",
+            ramped.clone(),
+            json!({"kind": "trim", "clip_id": p1.id, "source_in": 12.0, "timeline_start": round3(p1.timeline_start + head)}),
+        ));
+        out.push(case(
+            "a right-edge trim of a ramped pair leaves the ramp where it is",
+            ramped.clone(),
+            json!({"kind": "trim", "clip_id": p1.id, "source_out": 14.5}),
+        ));
+        out.push(case(
+            "a split of a ramped pair rebases the right halves",
+            ramped.clone(),
+            json!({"kind": "split_at", "clip_id": p1.id, "at": round3(p1.timeline_start + 3.0)}),
+        ));
+        out.push(case(
+            "a split inside the held stretch keeps holding in the right halves",
+            ramped.clone(),
+            json!({"kind": "split_at", "clip_id": p1.id, "at": round3(p1.timeline_start + 5.5)}),
+        ));
+        out.push(case(
+            "a cut range through a ramped pair takes the span the ramp plays it for",
+            ramped.clone(),
+            json!({"kind": "cut_clip_range", "clip_id": p1.id, "from": 11.0, "to": 12.5}),
+        ));
+        out.push(case(
+            "split and remove the left of a ramped pair",
+            ramped.clone(),
+            json!({"kind": "split_remove", "clip_id": p1.id, "at": round3(p1.timeline_start + 2.5), "side": "left"}),
+        ));
+        let mut c = case(
+            "a ripple trim of a ramped pair's tail closes both lanes",
+            ramped,
+            json!({"kind": "trim", "clip_id": p1.id, "source_out": 13.0}),
+        );
+        c.ripple = true;
+        out.push(c);
+    }
     out
 }
 
@@ -833,6 +940,10 @@ fn apply(p: &Project, op: &Value) -> Result<Value> {
         "remove" => p.remove(uuid_of(&op["clip_id"])).map(|_| Value::Null),
         "remove_clips" => p.remove_clips(&ids_of(&op["clip_ids"])).map(|n| json!({"removed": n})),
         "set_speed" => p.set_speed(uuid_of(&op["clip_id"]), f("speed")).map(|_| Value::Null),
+        "set_speed_ramp" => {
+            let keys: Vec<SpeedKey> = serde_json::from_value(op["keys"].clone()).expect("keys");
+            p.set_speed_ramp(uuid_of(&op["clip_id"]), keys).map(|_| Value::Null)
+        }
         "split_remove" => {
             let side = if op["side"] == "left" {
                 SplitSide::Left
@@ -1073,6 +1184,7 @@ fn the_corpus_covers_the_ops_and_both_outcomes() {
         "remove",
         "remove_clips",
         "set_speed",
+        "set_speed_ramp",
         "split_remove",
         "split_remove_clips",
         "move_clips",

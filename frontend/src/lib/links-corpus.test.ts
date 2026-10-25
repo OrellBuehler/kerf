@@ -78,6 +78,8 @@ function replay(c: Case): Outcome {
 		}
 		case 'set_speed':
 			return { ...ops.setSpeed(tl, e, op.clip_id, op.speed), report: null };
+		case 'set_speed_ramp':
+			return { ...ops.setSpeedRamp(tl, e, op.clip_id, op.keys), report: null };
 		case 'split_remove':
 			return { ...ops.splitRemoveClips(tl, e, [{ clip_id: op.clip_id, at: op.at }], op.side), report: null };
 		case 'split_remove_clips':

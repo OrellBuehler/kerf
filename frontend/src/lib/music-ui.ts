@@ -5,6 +5,7 @@
  */
 import { formatTime } from './diff';
 import { FIT_FADE_S, gridBarSeconds, gridBpm } from './music-fit';
+import { isRamped } from './speed-ramp';
 import type { AssetAnalysis, Clip, MusicAnalysis, MusicFit, MusicFitReport, Track } from './types';
 
 /** Whether a clip offers *Fit to video*, and if it cannot be used right now, why. */
@@ -24,7 +25,7 @@ export function fitOffer(track: Track | undefined, clip: Clip, analysis: Pick<As
 	if (track?.kind !== 'audio' || !analysis?.music) return { show: false, reason: null };
 	if (track.locked) return { show: true, reason: `Track ${track.name} is locked` };
 	if (clip.link_id) return { show: true, reason: 'Unlink the music from its picture first' };
-	if (Math.abs((clip.speed ?? 1) - 1) > 1e-9) return { show: true, reason: 'Needs the clip at normal speed' };
+	if (Math.abs((clip.speed ?? 1) - 1) > 1e-9 || isRamped(clip)) return { show: true, reason: 'Needs the clip at normal speed' };
 	return { show: true, reason: null };
 }
 

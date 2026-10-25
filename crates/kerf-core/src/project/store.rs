@@ -114,6 +114,12 @@ const MIGRATIONS: &[Migration] = &[
         destructive: false,
         needed_to_read: false,
     },
+    Migration {
+        run: v13_to_v14,
+        needed: v13_to_v14_needed,
+        destructive: false,
+        needed_to_read: false,
+    },
 ];
 
 /// The schema this build writes and the newest it opens.
@@ -314,6 +320,19 @@ fn v12_to_v13(_: &Connection) -> rusqlite::Result<()> {
 }
 
 fn v12_to_v13_needed(_: &Connection) -> bool {
+    true
+}
+
+/// v14: a clip may carry a speed ramp (`Clip.speed_ramp`, `"speed_ramp"` in the timeline JSON: keys of a clip-local time,
+/// a speed and an easing). It is a new field an older build drops at its next write of the clip, and the clip then plays
+/// at its constant speed, a different length, with everything after it out of step with the sound. A clip with none is
+/// written as it was, so a stored one is unchanged. Nothing in the file's tables changes; the step is the version that
+/// keeps an older build out, after the file is copied aside.
+fn v13_to_v14(_: &Connection) -> rusqlite::Result<()> {
+    Ok(())
+}
+
+fn v13_to_v14_needed(_: &Connection) -> bool {
     true
 }
 

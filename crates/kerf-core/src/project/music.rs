@@ -370,6 +370,7 @@ fn replace_bed(timeline: &mut Timeline, clip_id: Uuid, asset: &Asset) -> Result<
     clip.source_in = 0.0;
     clip.source_out = asset.duration;
     clip.speed = 1.0;
+    clip.speed_ramp.clear();
     clip.timeline_start = first.timeline_start;
     let duration = clip.duration();
     clip.fade_in = first.fade_in.min(duration);

@@ -13,6 +13,7 @@
 	import { untrack } from 'svelte';
 	import type { Clip } from '#lib/types';
 	import { effectiveGain } from '#lib/mixer';
+	import { slowestSpeed } from '#lib/speed-ramp';
 	import { waveforms } from '#lib/waveforms';
 	import { drawWaveform, type WavePalette } from '#lib/waveform-draw';
 	import {
@@ -73,7 +74,7 @@
 
 	const ratio = $derived(capDpr(dpr));
 	const rect = $derived(clipCanvasRect(clip.timeline_start * pxPerSec, width, viewLo, viewHi));
-	const cells = $derived(bucketCells(secondsPerDevicePx(pxPerSec, ratio, clip.speed)));
+	const cells = $derived(bucketCells(secondsPerDevicePx(pxPerSec, ratio, slowestSpeed(clip))));
 	const scale = $derived(rect ? canvasScale(rect.x1 - rect.x0, ratio) : ratio);
 	const columns = $derived(rect ? Math.max(1, Math.round((rect.x1 - rect.x0) * scale)) : 0);
 	const tiles = $derived(

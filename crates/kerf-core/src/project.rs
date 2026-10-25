@@ -16,6 +16,7 @@ use crate::error::{Error, Result};
 use crate::model::Color;
 use crate::model::Grade;
 use crate::model::MarkerPatch;
+use crate::model::{check_speed_ramp, SpeedKey};
 use crate::model::{default_beat_tolerance, fmt_time};
 use crate::model::{music_fit_clips, plan_music_fit, MusicFit, MusicFitReport, MAX_FIT_BARS};
 use crate::model::{AnalysisKind, CutLine};
@@ -3730,6 +3731,8 @@ impl Project {
                         "source_out must be greater than source_in".to_string(),
                     ));
                 }
+                // A speed ramp rides with the footage: a head that moved takes it along.
+                clip.follow_head(&was);
                 if let Some(start) = timeline_start {
                     clip.timeline_start = start.max(0.0);
                 }
@@ -4584,7 +4587,8 @@ impl Project {
     /// **Linked clips are retimed by the same ratio**, so a picture and its sound
     /// keep step (a partner at 1× next to a clip going 1× → 2× goes to 2×); each
     /// track's length changes by its own, and ripple mode follows per track.
-    /// `with_links(Some(false))` retimes the named clip alone.
+    /// `with_links(Some(false))` retimes the named clip alone. A constant speed replaces a speed
+    /// ramp ([`Project::set_speed_ramp`]), on every clip it reaches.
     pub fn set_speed(&self, clip_id: Uuid, speed: f64) -> Result<Clip> {
         if !speed.is_finite() || speed == 0.0 {
             return Err(Error::InvalidArgument("speed must be a non-zero, finite number".to_string()));
@@ -4605,7 +4609,37 @@ impl Project {
                 }
                 let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
                 timeline.tracks[ti].clips[ci].speed = speed;
+                timeline.tracks[ti].clips[ci].speed_ramp.clear();
                 Ok(timeline.tracks[ti].clips[ci].clone())
+            },
+        )
+    }
+
+    /// Give a clip a **speed ramp**: its rate changes over its length instead of holding one value
+    /// (`Clip::speed_ramp`, `model/speed_ramp.rs`). Each key is a clip-local timeline time (seconds from
+    /// the clip's start, so a head trim carries the ramp with the footage) and a speed magnitude
+    /// (`MIN_SPEED..=MAX_SPEED`); the speed moves in a straight line to the next key, or stays until it
+    /// (`RampEasing::Hold`), runs at the first key's speed before it and the last key's after. The clip
+    /// keeps its direction (its `speed`'s sign); its magnitude is not read while a ramp is set. Keys are
+    /// put in time order; none clears the ramp, back to the clip's own `speed`.
+    ///
+    /// The source window stays and the clip's length changes with the ramp, so — like [`Project::set_speed`]
+    /// — it ripples in ripple mode. **Linked clips get the same ramp on the timeline** (a key 3 s into the
+    /// named clip lands at that moment of a partner that starts elsewhere), re-placed as for a speed
+    /// change; `with_links(Some(false))` ramps the named clip alone. Errors on bad keys, a locked
+    /// track, and a clear of a ramp that is not there.
+    pub fn set_speed_ramp(&self, clip_id: Uuid, keys: Vec<SpeedKey>) -> Result<Clip> {
+        let keys = check_speed_ramp(keys)?;
+        let links = self.links_active();
+        self.edit_named(
+            &[clip_id],
+            |_| "Set speed ramp".to_string(),
+            |timeline| {
+                timeline.ensure_editable(clip_id)?;
+                if links {
+                    return timeline.set_speed_ramp_linked(clip_id, keys);
+                }
+                timeline.set_speed_ramp(clip_id, keys)
             },
         )
     }
@@ -5219,7 +5253,7 @@ impl Project {
             ));
         }
         let clip = timeline.tracks[ti].clips[ci].clone();
-        if (clip.speed - 1.0).abs() > 1e-9 {
+        if (clip.speed - 1.0).abs() > 1e-9 || clip.is_ramped() {
             return Err(Error::InvalidArgument(
                 "fit music to length needs the clip at normal speed".to_string(),
             ));
@@ -7164,6 +7198,7 @@ impl Project {
             for (stem, name) in stems.iter().zip(engine::STEM_NAMES) {
                 let mut c = Clip::for_asset(stem, clip.source_in, clip.source_out.min(stem.duration), clip.timeline_start);
                 c.speed = clip.speed;
+                c.speed_ramp = clip.speed_ramp.clone();
                 c.volume = clip.volume;
                 c.fade_in = clip.fade_in;
                 c.fade_out = clip.fade_out;
@@ -7958,6 +7993,10 @@ mod review_tests;
 /// proposal open.
 #[cfg(test)]
 mod task_tests;
+
+/// Speed ramps at the project level: one revision, the length change rippling, a linked sound, a head trim.
+#[cfg(test)]
+mod ramp_tests;
 
 /// The Rust half of the differential corpus the browser harness is replayed against.
 #[cfg(test)]

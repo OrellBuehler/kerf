@@ -120,6 +120,7 @@ pub(super) const TOOLS: &[(&str, &str, Effect, ToolSet)] = &[
     ("set_volume", "Clip volume", Set, Core),
     ("set_fade", "Clip fades", Set, Core),
     ("set_speed", "Clip speed", Set, Clips),
+    ("set_speed_ramp", "Clip speed ramp", Set, Clips),
     ("set_transform", "Clip transform", Set, Clips),
     ("set_transform_at", "Clip transform at a moment", Set, Clips),
     ("set_color", "Clip colour", Set, Clips),

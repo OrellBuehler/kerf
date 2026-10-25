@@ -3,6 +3,7 @@
 
 import { fmtDuration } from './media-info';
 export { PROXY_WAIT_PREFIX, isProxyWaitMessage } from './proxy-wait';
+import { clipDuration } from './speed-ramp';
 import type { Asset, PreviewSource, ProxySize, ProxyStatus, Timeline } from './types';
 
 export type BadgeTone = 'neutral' | 'kerf' | 'agent' | 'success' | 'warning' | 'danger';
@@ -180,8 +181,7 @@ function assetsAt(timeline: Pick<Timeline, 'tracks'>, assets: readonly Asset[], 
 	for (const track of timeline.tracks) {
 		if (track.kind !== 'video') continue;
 		for (const c of track.clips) {
-			const speed = Math.max(Math.abs(c.speed ?? 1), 0.01);
-			const end = c.timeline_start + Math.max(0, c.source_out - c.source_in) / speed;
+			const end = c.timeline_start + clipDuration(c);
 			if (c.enabled === false || t < c.timeline_start || t >= end || seen.has(c.asset_id)) continue;
 			seen.add(c.asset_id);
 			const asset = assets.find((a) => a.id === c.asset_id);

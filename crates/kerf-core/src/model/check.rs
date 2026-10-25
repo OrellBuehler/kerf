@@ -12,7 +12,7 @@ use std::collections::HashSet;
 
 use uuid::Uuid;
 
-use super::{fmt_time, Clip, Timeline, Track};
+use super::{fmt_time, ramp_is_valid, Clip, Timeline, Track};
 use crate::error::{Error, Result};
 
 /// Which invariant an item breaks; with the item's id, the same violation before and after an edit.
@@ -24,6 +24,7 @@ enum Rule {
     ClipTime,
     ClipEmpty,
     ClipSpeed,
+    ClipSpeedRamp,
     ClipFade,
     ClipTransition,
     ClipKeyframe,
@@ -182,6 +183,12 @@ fn clip_violations(c: &Clip) -> Vec<(Rule, &'static str)> {
     if !c.speed.is_finite() || !c.volume.is_finite() {
         out.push((Rule::ClipSpeed, "has a speed or volume that is not a number"));
     }
+    if !c.speed_ramp.is_empty() && !ramp_is_valid(&c.speed_ramp) {
+        out.push((
+            Rule::ClipSpeedRamp,
+            "has a speed ramp that is not readable (keys out of order, out of range or not numbers)",
+        ));
+    }
     if !(c.fade_in.is_finite() && c.fade_in >= 0.0 && c.fade_out.is_finite() && c.fade_out >= 0.0) {
         out.push((Rule::ClipFade, "has a negative fade"));
     }
@@ -266,6 +273,31 @@ mod tests {
     fn a_clip_with_no_footage_is_refused() {
         rejects("empty", |t| first(t).source_out = first(t).source_in);
         rejects("backwards", |t| first(t).source_in = 9.0);
+    }
+
+    #[test]
+    fn a_speed_ramp_the_map_cannot_read_is_refused() {
+        use crate::model::{SpeedKey, MAX_RAMP_TIME, MAX_SPEED, MAX_SPEED_KEYS};
+        let mut t = timeline();
+        first(&mut t).speed_ramp = vec![SpeedKey::new(0.0, 1.0), SpeedKey::new(2.0, 0.5)];
+        t.check().unwrap();
+        let bad: Vec<(&str, Vec<SpeedKey>)> = vec![
+            ("nan time", vec![SpeedKey::new(f64::NAN, 1.0)]),
+            ("inf time", vec![SpeedKey::new(f64::INFINITY, 1.0)]),
+            (
+                "huge time",
+                vec![SpeedKey::new(0.0, 1.0), SpeedKey::new(MAX_RAMP_TIME * 10.0, 2.0)],
+            ),
+            ("out of order", vec![SpeedKey::new(2.0, 1.0), SpeedKey::new(1.0, 1.0)]),
+            ("twice", vec![SpeedKey::new(1.0, 1.0), SpeedKey::new(1.0, 2.0)]),
+            ("nan speed", vec![SpeedKey::new(0.0, f64::NAN)]),
+            ("zero speed", vec![SpeedKey::new(0.0, 0.0)]),
+            ("fast", vec![SpeedKey::new(0.0, MAX_SPEED * 2.0)]),
+            ("many", (0..=MAX_SPEED_KEYS).map(|i| SpeedKey::new(i as f64, 1.0)).collect()),
+        ];
+        for (why, keys) in bad {
+            rejects(why, |t| first(t).speed_ramp = keys);
+        }
     }
 
     #[test]

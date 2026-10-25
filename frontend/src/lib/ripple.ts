@@ -29,7 +29,8 @@
 // another, or before 0, is returned exactly as the edit made it.
 
 import { clampFades, DIFF_EPS, MIN_EDIT_CLIP, moveHead, moveTail } from './edit-modes';
-import { contentOffset, invalid, linkedClipIds, lockedPartner, STEP_EPS } from './link-groups';
+import { contentShift, invalid, linkedClipIds, lockedPartner, STEP_EPS, stepAnchor } from './link-groups';
+import { isRamped } from './speed-ramp';
 import { formatTime } from './diff';
 import type { Clip, Timeline, Track } from './types';
 import { clipDuration } from './types';
@@ -174,13 +175,22 @@ export function conformLinks(
 	const shifts: [string, number][] = [];
 	for (const members of groups.values()) {
 		if (members.length < 2) continue;
+		// With a ramp in the group the members are judged at footage they share, not at the offset (`contentShift`).
+		const held: [Clip, Clip][] = [];
+		for (const id of members) {
+			const was = prior.get(origin.get(id) ?? id);
+			const here = now.get(id);
+			if (was && here) held.push([was, here.clip]);
+		}
+		const shared = held.some(([was, here]) => isRamped(was) || isRamped(here)) ? stepAnchor(held) : new Map<string, number>();
+		const shiftOf = (was: Clip, here: Clip) => contentShift(was, here, shared.get(here.asset_id));
 		// `[clip, its track, how far its offset moved]` for every member that has a before.
 		const moved: [string, number, number][] = [];
 		for (const id of members) {
 			const here = now.get(id);
 			const was = prior.get(origin.get(id) ?? id);
 			if (!here || !was) continue;
-			moved.push([id, here.ti, contentOffset(here.clip) - contentOffset(was)]);
+			moved.push([id, here.ti, shiftOf(was, here.clip)]);
 		}
 		if (moved.length < 2) continue;
 		const named = moved.filter(([id]) => anchors.has(id));
@@ -191,7 +201,7 @@ export function conformLinks(
 			const asLeft = (id: string, nowD: number) => {
 				const was = prior.get(origin.get(id) ?? id);
 				const l = leftAt.get(id);
-				return left && was && l ? contentOffset(l) - contentOffset(was) : nowD;
+				return left && was && l ? shiftOf(was, l) : nowD;
 			};
 			const firstLeft = asLeft(named[0][0], named[0][2]);
 			if (named.some(([id, , d]) => Math.abs(asLeft(id, d) - firstLeft) > STEP_EPS)) continue;

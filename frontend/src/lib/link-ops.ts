@@ -37,6 +37,7 @@ import {
 	carryExtentEdit,
 	carryLinksSince,
 	checkCarriedLanes,
+	checkedRamp,
 	cutClipRange,
 	cutClipRangeLinked,
 	detachAudio,
@@ -46,6 +47,8 @@ import {
 	rippleDeleteClip,
 	rippleDeleteLinked,
 	setSpeedLinked,
+	setSpeedRampAlone,
+	setSpeedRampLinked,
 	splitClip,
 	splitClipLinked,
 	withLinkedCuts,
@@ -56,8 +59,9 @@ import {
 import { moveClips as moveClipsOn, removeClips as removeClipsOn } from './multi-edit';
 import { checkOwnLanes, conformLinks, rippleLanes } from './ripple';
 import { splitRemoveClips as splitRemoveClipsOn } from './edit-modes';
-import type { Asset, Clip, ClipCut, ClipMove, SplitSide, Timeline, Track } from './types';
+import type { Asset, Clip, ClipCut, ClipMove, SpeedKey, SplitSide, Timeline, Track } from './types';
 import { clipDuration } from './types';
+import { trimRamp } from './speed-ramp';
 
 /** What a call is made under: the project's ripple mode (or the call's override), whether
  *  links are in force (`link: false` is off), how far each asset's footage reaches and which
@@ -266,6 +270,8 @@ export function trim(
 			if (sourceIn != null) clip.source_in = sourceIn;
 			if (sourceOut != null) clip.source_out = sourceOut;
 			if (clip.source_out <= clip.source_in) throw invalid('source_out must be greater than source_in');
+			// A ramp rides with the footage: a head given up (or taken on) rebases it, so the tail stays put.
+			trimRamp(was, clip);
 			if (timelineStart != null) {
 				clip.timeline_start = Math.max(0, timelineStart);
 				track.clips.sort((a, b) => a.timeline_start - b.timeline_start);
@@ -341,9 +347,24 @@ export function setSpeed(tl: Timeline, env: EditEnv, clipId: string, speed: numb
 			const found = locate(t, clipId);
 			if (!found) throw clipNotFound(clipId);
 			found[0].clips[found[1]].speed = speed;
+			delete found[0].clips[found[1]].speed_ramp;
 			return structuredClone(found[0].clips[found[1]]);
 		}),
 		'Set speed'
+	);
+}
+
+/** `Project::set_speed_ramp`: the clip (and its partners, on the timeline) given a speed ramp over the same footage —
+ *  the length changes, so the ripple and the sync lock follow like a speed change. Empty `keys` clears it; clearing a
+ *  clip with no ramp is refused. */
+export function setSpeedRamp(tl: Timeline, env: EditEnv, clipId: string, keys: readonly SpeedKey[]): Edited<Clip> {
+	const sorted = checkedRamp(keys);
+	return edited(
+		runEdit(tl, { ...env, anchors: [clipId] }, (t) => {
+			ensureEditable(t, clipId);
+			return env.links ? setSpeedRampLinked(t, clipId, sorted) : setSpeedRampAlone(t, clipId, sorted);
+		}),
+		'Set speed ramp'
 	);
 }
 

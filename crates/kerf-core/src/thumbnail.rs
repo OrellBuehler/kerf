@@ -295,7 +295,7 @@ pub fn candidate_times(timeline: &Timeline, scenes: &SceneChanges, range: Option
             let mut cuts = vec![a];
             if clip.speed > 0.0 {
                 for &s in scenes.get(&clip.asset_id).map(Vec::as_slice).unwrap_or_default() {
-                    let t = clip.timeline_start + (s - clip.source_in) / clip.speed;
+                    let t = clip.source_to_timeline(s);
                     if t > a && t < b {
                         cuts.push(t);
                     }

@@ -1590,6 +1590,59 @@ decimated read misses) and a decimated frame (at most 480 x 270 samples) for the
 the peaks (a 64² vectorscope, cells with at least 1 % of the samples). A measurement, not a frame anyone waits to see:
 ungated by `cpu::lease`, but niced (`bg_command`) and thread-capped by the still's spawn-time tuning, supervised like every still (`output_supervised_sized`: `STILL_TIMEOUT`, the cancel, killed past either), at most
 `MAX_SCOPE_WIDTH` (3840) wide, the pipe read into a buffer sized from the frame (the `capacity` of `output_supervised_sized`, `output_bounded` takes one too). `scopes_of_a_rendered_frame` (`#[ignore]`d) holds a one-pixel clip through the real graph.
+  **Speed ramps** (`Clip::speed_ramp`: keys of clip-local timeline time, speed and `linear` / `hold`; `model/speed_ramp.rs` is the
+  map, `Clip::along` / `local_at_along` its two directions; `clip_timing/ramp.rs` is what the graph prints). Nothing reads
+  `speed_mag()` for a ramped clip: the window, the tail, `picture_window`, the handle, the scrub, the plan, the cover and the
+  thumbnail times all go through the map. *Picture*: `setpts='st(0,(PTS-STARTPTS)*TB);(E+start)/TB'`, `E` the map's inverse in
+  closed form, per region of the keys: a hold (or equal speeds) is `T+(r-R)/v`, a linear segment `T+2x/(v+sqrt(v*v+2k*x))` with
+  `x = r-R` (no cancellation where `k` is near 0), `r` stored once with `st(0,…)` / `ld(0)`, the regions a **balanced**
+  `if(lte(ld(0),R_j),…)` tree (16 keys: 5 `if`s, 13 bracket levels, 1.3 kB, where a chain would be 16 deep of libavutil's ~100) and
+  the whole value quoted (it holds commas and a `;`). `Ex` is the text *and* the arithmetic (every operation parenthesised, no
+  exponent in a number), so `eval` computes what the graph does: tested against `local_at_along` over 60 random ramps and
+  rendered against the real binary, forward, reversed, from the head of a file, in the middle of one, and playing on under a
+  dissolve, where 0 of 191 / 146 / 191 / 106 / 108 output frames differ from the numbered source's frames picked by the
+  model's `setpts` truncation and `fps` rounding (6.1 and 9.0). `reverse` stamps the reversed frames with the forward
+  timestamps, so `r` is source seconds into the playing direction either way. A tail (`ClipFx::tail`) is
+  `along(dur+tail)-along(dur)` source seconds past the window (`clip_source_window`) and `picture_window` reads on a source
+  frame and an output frame of the ramp's pace there: a clip that ends mid-ramp plays on through the *rest of the ramp* as far
+  as its handle goes (`transition_fx`: `local_at_along(span + handle) - duration`); `same_sound` is false for a ramped side
+  (a rate that moves plays no two samples alike). A window that starts inside a late file's lead starts the clock late
+  (`ramp_offset` = `lead - window start`, inside the `st`) where a constant speed adds `(start+delay)`. **Everything keyed is on
+  the clock after `setpts`** and so unchanged by a ramp: keyframes, channels, fades, `sendcmd`, a keyed volume (the chains'
+  text is equal with and without a ramp, and a keyed opacity's pixels are, byte for byte).
+  *Sound*: `atempo` has one tempo per stream, and its `tempo` command is no way round — measured on 6.1 and 9.0 alike: each command
+  re-origins the stream and drops the drift control that holds the long-run tempo, losing 1024 samples of source (21 ms) per
+  command on transient material (a click track with 43 commands came out 0.9 s short of its cut), and one instance per step
+  loses up to 20 ms of length each. So `audio_steps` cuts the ramp — a hold, and the stretch before the first key and
+  after the last, one step each; a moving speed in steps whose chord stays within 8 ms of source of the curve (`slope·step²/8`),
+  0.12 to 1 s long, at most 128 of them (a ramp of minutes needs more: its steps lengthen, counted before any is allocated, and the chord strays further from the curve mid-step, never at an edge) — with
+  `tempo = source span / timeline span`, so the sound meets the picture at every edge whatever `atempo` does inside one. A step
+  is its own chain over the stream after `atrim`, `asetpts`, `areverse` and `aresample` to the delivery rate (the sample
+  counts below are in it): `atrim` of its part with a 60 ms roll-in and a 100 ms flush, `atempo` stages (the fewest within
+  0.5..2 sharing the tempo; none at 1x; the per-stage tempo is the `stages`-th root by `sqrt` or bisection, and the
+  stage count by doubling, never `powf` / `log2`: the last digit of a libm `pow` differs between glibc with and without
+  FMA, macOS, Windows and arm and is printed in the graph and in the `atrim` a piece is read from, so `tempo_advance` sums
+  its stages by plain multiplication too), `adelay` for a first step that starts before the source does, `apad=whole_len` and
+  `atrim=start_sample:end_sample` to the exact samples of its share of the timeline plus half a 2 ms crossfade each side
+  (`audio_pieces`, pure: the pieces less the overlaps come to `round(total·rate)` samples at 22 to 96 kHz), and `acrossfade`
+  chains them (`ar{flat}s{i}` → `p{i}` → `x{i}` → the clip's usual tail). `atempo` plays its content early, 13 to 19 ms of its
+  input *whatever* the tempo and the file (the same on 6.1 and 9.0; the onset of the constant-speed clip too), counted per
+  stage by the tempo of the stages before it (`tempo_advance` = `0.0145 · (1 + s + s² …)`, held at its 0.25x and 8x values),
+  so each step is read that much later. Measured with a click every half second: **heard −8.0 to +3.0 ms from the map from 0.5x
+  to 8x** (+15.8 at 0.25x), and on the hold-and-ramp clip, forward / from the head / reversed, **within 6.7 ms** at every click,
+  the sound as long as the cut (`a_click_is_heard_where_the_map_says_at_every_tempo`,
+  `a_ramped_clips_sound_meets_its_picture_at_every_step`); a clip cut from inside a late file's lead keeps its flash and
+  click within a frame. The steps are independent WSOLA runs, so a steady tone changes phase at a seam: a 440 Hz sine is 24 to 30 dB
+  over its residual through ramps and 38 through one `atempo` (`a_steady_tone_keeps_its_pitch_through_a_ramps_seams`), a
+  10 ms crossfade 18 to 26, 40 ms 17 — hence 2 ms, a click-free splice and no more. **`adelay` stamps the silence it puts out
+  first with no time when its input arrives late** (it does here: nothing leaves the crossfades until the first pieces are cut),
+  and the muxer takes `INT64_MAX` for a stamp ("Non-monotonic DTS", then "Conversion failed" some twenty packets in); the ramped
+  chain ends `asetpts=N/SR/TB` (the stream is whole samples from the clip's start). Found by a full AAC / mp4 export of a 600 s
+  stereo file with a 16-key ramp (174 s of cut in 10 s on a debug build, picture and sound as long as the cut); the raw-sample
+  tests do not see it. The scrubbed still is `-ss` at the map's source time: the export's frame or a neighbour (28 of 51 forward
+  and 22 of 51 reversed exactly, never further than the ramp's pace; a reversed still is a frame past the export's, as at a
+  constant speed). The golden family `speed-ramp` (400 appended cases, `ramp_for`) and `ramp_rendered.rs` (`cargo test … --
+  --ignored ramp_rendered`) hold it; the GPU refuses a ramped layer (`core-render-plan.md`).
 
 ## Thumbnails (`thumbnail.rs`)
 

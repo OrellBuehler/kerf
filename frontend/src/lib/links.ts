@@ -37,27 +37,41 @@ import {
 import {
 	clipById,
 	clipNotFound,
-	contentOffset,
 	invalid,
 	linkPartners,
 	locateIndex,
 	lockedPartner,
 	newId,
 	relinkSides,
+	samePace,
 	STEP_EPS,
+	stepGap,
 	unlockedPartners
 } from './link-groups';
 import { isKeyed, MAX_CHANNEL_VOLUME, propertyKeys } from './channels';
+import { toFixedEven } from './format-fixed';
 import { applyShifts, conformLinks, DIFF_EPS, runsIntoUnlinked, settleLinked, spansOverlap } from './ripple';
-import type { AudioEffect, Clip, ClipCut, ClipMove, Timeline, Track } from './types';
-import { clipDuration } from './types';
+import type { AudioEffect, Clip, ClipCut, ClipMove, SpeedKey, Timeline, Track } from './types';
+import {
+	along,
+	clipDuration,
+	isRamped,
+	isReversed,
+	localAtAlong,
+	MAX_RAMP_TIME,
+	MAX_SPEED_KEYS,
+	rampIsValid,
+	sourceToTimeline,
+	speedAt,
+	speedMag,
+	timelineToSource
+} from './speed-ramp';
 
 /** Whether an effect reacts to *level* (a compressor, a gate): a gain put ahead of it changes
  *  what it does (`AudioEffect::is_dynamic`). */
 const isDynamic = (e: AudioEffect) => e.type === 'compressor' || e.type === 'gate';
 
-const speedOf = (c: Clip) => Math.max(Math.abs(c.speed ?? 1), 0.01);
-const reversed = (c: Clip) => (c.speed ?? 1) < 0;
+const reversed = isReversed;
 const endOf = (c: Clip) => c.timeline_start + clipDuration(c);
 /** A track fader at or below this is silent: nothing can be carried onto it by scaling a clip up. */
 const MIN_FADER = 1e-3;
@@ -180,6 +194,7 @@ export function detachAudio(timeline: Timeline, clipId: string, hasAudio: boolea
 		audio: structuredClone(clip.audio ?? []),
 		link_id: group
 	};
+	if (clip.speed_ramp?.length) audio.speed_ramp = structuredClone(clip.speed_ramp);
 	if (clip.enabled === false) audio.enabled = false;
 	// A keyed volume *is* the gain, so it rides over with the sound, through the same fader ratio.
 	const volume = clip.channels?.find((c) => c.prop === 'volume' && c.keys.length > 0);
@@ -242,8 +257,8 @@ export function soundAlreadyPlaying(timeline: Timeline, picture: Clip, without: 
 			(c) =>
 				!without.has(c.id) &&
 				c.asset_id === picture.asset_id &&
-				Math.abs((c.speed ?? 1) - (picture.speed ?? 1)) < STEP_EPS &&
-				Math.abs(contentOffset(c) - contentOffset(picture)) < STEP_EPS &&
+				samePace(c, picture) &&
+				stepGap(c, picture) < STEP_EPS &&
 				spansOverlap([c.timeline_start, endOf(c)], [picture.timeline_start, endOf(picture)])
 		);
 }
@@ -382,11 +397,16 @@ export function extentEdit(was: Clip, now: Clip, looping: boolean): ExtentEdit |
 	const de = endOf(now) - endOf(was);
 	if (Math.abs(ds) <= DIFF_EPS && Math.abs(de) <= DIFF_EPS) return null;
 	if (Math.abs(ds - de) <= DIFF_EPS) return { shift: ds, head: 0, tail: 0 };
-	const mag = speedOf(now);
+	const mag = speedMag(now);
 	let head: number;
 	let tail: number;
 	if (looping) {
 		[head, tail] = [ds, de];
+	} else if (isRamped(was) || isRamped(now)) {
+		// The footage the head gave up plays for as long as `was`'s ramp says; whatever the length changed by
+		// beyond that is the tail (`now`'s ramp has been rebased to the new head).
+		head = localAtAlong(was, reversed(now) ? was.source_out - now.source_out : now.source_in - was.source_in);
+		tail = clipDuration(now) - clipDuration(was) + head;
 	} else if (reversed(now)) {
 		head = (was.source_out - now.source_out) / mag;
 		tail = (was.source_in - now.source_in) / mag;
@@ -536,8 +556,7 @@ export function splitClip(timeline: Timeline, clipId: string, at: number): [Clip
 	const [ti, ci] = found;
 	const clip = timeline.tracks[ti].clips[ci];
 	if (at <= clip.timeline_start || at >= endOf(clip)) throw invalid('split point must lie strictly inside the clip');
-	const mag = speedOf(clip);
-	const offset = (at - clip.timeline_start) * mag;
+	const offset = along(clip, at - clip.timeline_start);
 	const right: Clip = structuredClone(clip);
 	right.id = newId();
 	right.timeline_start = at;
@@ -662,8 +681,6 @@ function cutRangePieces(
 	const a = Math.max(from, clip.source_in);
 	const b = Math.min(to, clip.source_out);
 	if (b - a <= 1e-9) throw invalid("range does not overlap the clip's source window");
-	const mag = speedOf(clip);
-	const removed = (b - a) / mag;
 	const [head, tail] = reversed(clip)
 		? [
 				[b, clip.source_out],
@@ -675,6 +692,9 @@ function cutRangePieces(
 			];
 	const headOk = head[1] - head[0] > 1e-9;
 	const tailOk = tail[1] - tail[0] > 1e-9;
+	// Timeline seconds the head and the cut take on the clip's own curve (a ramp is not one speed).
+	const headSpan = head[1] - head[0];
+	const removed = isRamped(clip) ? localAtAlong(clip, headSpan + (b - a)) - localAtAlong(clip, headSpan) : (b - a) / speedMag(clip);
 	let headPiece: Clip | null = null;
 	let tailPiece: Clip | null = null;
 	let cursor = clip.timeline_start;
@@ -692,7 +712,7 @@ function cutRangePieces(
 		p.timeline_start = cursor;
 		// The tail starts after the head and the removed middle: its animation opens on the pose
 		// the whole clip had there (a sole-surviving tail is a head trim).
-		rebaseAnimation(p, (head[1] - head[0] + (b - a)) / mag);
+		rebaseAnimation(p, localAtAlong(clip, headSpan + (b - a)));
 		if (headOk) {
 			p.id = newId();
 			p.fade_in = 0;
@@ -791,18 +811,6 @@ export function cutClipRangeLinked(timeline: Timeline, clipId: string, from: num
 	return [head, tail].filter((c): c is Clip => !!c).map((c) => structuredClone(clipById(timeline, c.id) ?? c));
 }
 
-/** Where a source timestamp of `clip` lands on the timeline (kerf-core's `Clip::source_to_timeline`). */
-function sourceToTimeline(clip: Clip, source: number): number {
-	const offset = reversed(clip) ? clip.source_out - source : source - clip.source_in;
-	return clip.timeline_start + offset / speedOf(clip);
-}
-
-/** The source timestamp playing at timeline time `time` (kerf-core's `Clip::timeline_to_source`). */
-function timelineToSource(clip: Clip, time: number): number {
-	const along = (time - clip.timeline_start) * speedOf(clip);
-	return reversed(clip) ? clip.source_out - along : clip.source_in + along;
-}
-
 // ---- speed -----------------------------------------------------------------------
 
 /**
@@ -831,9 +839,102 @@ export function setSpeedLinked(timeline: Timeline, clipId: string, speed: number
 			);
 		updates.push([p, next]);
 	}
+	// A constant speed replaces a ramp, on the whole group: keys the clips no longer read would come back on the next ramp edit.
 	timeline.tracks[ti].clips[ci].speed = speed;
-	for (const [p, next] of updates) p.speed = next;
+	delete timeline.tracks[ti].clips[ci].speed_ramp;
+	for (const [p, next] of updates) {
+		p.speed = next;
+		delete p.speed_ramp;
+	}
 	return structuredClone(timeline.tracks[ti].clips[ci]);
+}
+
+/**
+ * Give `clipId` the speed ramp `keys` (or clear it with none) and every linked partner the **same ramp on the
+ * timeline** (`Timeline::set_speed_ramp_linked`): a key 3 s into the named clip is a key at that moment of the
+ * timeline in a partner that starts earlier or later, so the slow-motion happens at the same time in the picture
+ * and its sound. A partner that runs at another pace than the named clip (it plays 2x where the named clip opens
+ * at 1x) keeps the ratio, as `setSpeedLinked` does, and a partner keeps its own direction. The windows stay; each
+ * clip's length changes, and where that leaves the rest is the ripple's and the sync lock's, with the named clip
+ * the authority. Throws on bad keys, a locked partner, a clear of a ramp that is not there, or a partner whose keys
+ * would land outside the speeds a clip can play at. Returns the named clip.
+ */
+export function setSpeedRampLinked(timeline: Timeline, clipId: string, keys: readonly SpeedKey[]): Clip {
+	const sorted = checkedRamp(keys);
+	const found = locateIndex(timeline, clipId);
+	if (!found) throw clipNotFound(clipId);
+	if (timeline.tracks[found[0]].locked) throw invalid(`track ${timeline.tracks[found[0]].name} is locked`);
+	const named = timeline.tracks[found[0]].clips[found[1]];
+	if (sorted.length === 0 && !named.speed_ramp?.length) throw invalid(NO_RAMP_TO_CLEAR);
+	const updates: [Clip, SpeedKey[]][] = [];
+	for (const partner of unlockedPartners(timeline, clipId, new Set([clipId]))) {
+		const p = clipById(timeline, partner)!;
+		const shift = named.timeline_start - p.timeline_start;
+		// How fast the partner runs where the named clip opens, against how fast that clip does.
+		let ratio = speedAt(p, shift) / speedAt(named, 0);
+		if (Math.abs(ratio - 1) < 1e-9) ratio = 1;
+		const mapped = sorted.map((k) => ({ ...k, time: k.time + shift, speed: k.speed * ratio }));
+		if (mapped.length > 0 && !rampIsValid(mapped)) {
+			const outside = mapped.map((k) => k.speed).find((s) => !(s >= MIN_SPEED && s <= MAX_SPEED));
+			throw invalid(
+				outside !== undefined
+					? `a linked clip would end up at ${toFixedEven(outside, 3)}× — a clip's speed stays within ${MIN_SPEED}× to ${MAX_SPEED}×`
+					: 'a linked clip is too far from the named one for the same ramp to reach it'
+			);
+		}
+		updates.push([p, mapped]);
+	}
+	const set = (c: Clip, to: SpeedKey[]) => {
+		if (to.length === 0) delete c.speed_ramp;
+		else c.speed_ramp = to;
+	};
+	set(named, structuredClone(sorted));
+	for (const [p, mapped] of updates) set(p, mapped);
+	return structuredClone(named);
+}
+
+/** `Timeline::set_speed_ramp` (a clip alone): the keys checked and put in time order, a locked track refused, and a
+ *  clear of a ramp that is not there an error. Returns the clip. */
+export function setSpeedRampAlone(timeline: Timeline, clipId: string, keys: readonly SpeedKey[]): Clip {
+	const sorted = checkedRamp(keys);
+	const found = locateIndex(timeline, clipId);
+	if (!found) throw clipNotFound(clipId);
+	if (timeline.tracks[found[0]].locked) throw invalid(`track ${timeline.tracks[found[0]].name} is locked`);
+	const clip = timeline.tracks[found[0]].clips[found[1]];
+	if (sorted.length === 0 && !clip.speed_ramp?.length) throw invalid(NO_RAMP_TO_CLEAR);
+	if (sorted.length === 0) delete clip.speed_ramp;
+	else clip.speed_ramp = structuredClone(sorted);
+	return structuredClone(clip);
+}
+
+const NO_RAMP_TO_CLEAR = 'the clip has no speed ramp to clear';
+
+/** The keys of a ramp to set (`check_speed_ramp`): at most `MAX_SPEED_KEYS`, each a finite time from the clip's
+ *  start (`0..=MAX_RAMP_TIME`) and a speed in `MIN_SPEED..=MAX_SPEED`, no two at one time; put in time order.
+ *  Empty is a clear and passes. */
+export function checkedRamp(keys: readonly SpeedKey[]): SpeedKey[] {
+	if (keys.length > MAX_SPEED_KEYS) throw invalid(`a speed ramp holds at most ${MAX_SPEED_KEYS} keys, got ${keys.length}`);
+	keys.forEach((k, i) => {
+		if (!Number.isFinite(k.time) || k.time < 0 || k.time > MAX_RAMP_TIME)
+			throw invalid(`speed ramp key ${i + 1}: time must be seconds from the clip's start, 0 to ${MAX_RAMP_TIME}, got ${rustNumber(k.time)}`);
+		if (!Number.isFinite(k.speed) || k.speed < MIN_SPEED || k.speed > MAX_SPEED)
+			throw invalid(
+				`speed ramp key ${i + 1}: speed must be between ${MIN_SPEED}× and ${MAX_SPEED}× (a magnitude: the clip keeps its direction), got ${rustNumber(k.speed)}`
+			);
+	});
+	const sorted = keys.map((k) => ({ ...k, time: k.time + 0 })).sort((a, b) => a.time - b.time);
+	for (let i = 1; i < sorted.length; i++)
+		if (sorted[i].time === sorted[i - 1].time)
+			throw invalid(`two speed ramp keys at ${toFixedEven(sorted[i - 1].time, 3)}s — each key needs its own time`);
+	return sorted;
+}
+
+/** A number as Rust's `{}` prints an `f64`: `NaN`, `inf`, and no exponent. */
+function rustNumber(v: number): string {
+	if (Number.isNaN(v)) return 'NaN';
+	if (!Number.isFinite(v)) return v < 0 ? '-inf' : 'inf';
+	const s = String(v);
+	return s.includes('e') ? v.toLocaleString('fullwide', { useGrouping: false, maximumFractionDigits: 20 }) : s;
 }
 
 // ---- split and remove ------------------------------------------------------------

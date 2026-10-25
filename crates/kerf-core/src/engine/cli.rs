@@ -22,7 +22,7 @@ use super::decode_policy::{
 use super::source_probe::{ProbeCache, SOURCE_PROBE_TIMEOUT};
 use super::ProbeResult;
 use crate::clip_timing::{
-    clip_seek, clip_source_window, end_frame, is_cache_proxy, is_head_padded_proxy, picture_window, transition_fx, ClipFx,
+    clip_seek, clip_source_window, end_frame, is_cache_proxy, is_head_padded_proxy, picture_window, ramp, transition_fx, ClipFx,
     ClipTiming, FadeEdge, FadeStep, FadeTint, Rational, HEAD_PADDED_SUFFIX,
 };
 use crate::error::{Error, Result};
@@ -7980,10 +7980,7 @@ fn build_filter_complex_with(
             } else {
                 format!("{}:a", plan.base + input)
             };
-            chains.push(format!(
-                "[{src}]{chain}[a{flat}]",
-                chain = audio_clip_chain(clip, fmt, &fx[*flat], layout, *mix)
-            ));
+            chains.extend(audio_clip_chains(&src, *flat, clip, fmt, &fx[*flat], layout, *mix));
         }
         // What the final sum adds up, as `(pad, ducked)`: every clip's own pad —
         // or, when metering, each track's submix (tapped on its way in).
@@ -9312,6 +9309,10 @@ fn picture_size(asset: Option<&Asset>) -> Option<(u32, u32)> {
 /// effects, keyframe animation, fades and transition alpha. With all properties
 /// at their defaults this reduces to the original fit-and-letterbox chain.
 ///
+/// **The retime is one `setpts`**: `PTS-STARTPTS` over the speed, plus the clip's start, or for a
+/// speed ramp the quoted expression of `ramp::setpts` (the map from the frame's source seconds to
+/// its place on the clip). Everything animated after it reads the timeline clock either way.
+///
 /// **A keyframed zoom is the one stage that changes the picture's size from frame
 /// to frame**, and almost nothing downstream of it can follow: `format`
 /// negotiation inserts a fixed-size converter, `eq` / `geq` / `rotate` /
@@ -9460,7 +9461,11 @@ fn video_clip_chain_stamped(
             d if d > 0.0 => format!("({}+{d})", clip.timeline_start),
             _ => clip.timeline_start.to_string(),
         };
-        if (s - 1.0).abs() < 1e-9 {
+        if let Some(retime) = ramp::setpts(clip, timing.ramp_offset(), clip.timeline_start) {
+            // A ramp's map takes the source seconds the frame is in to its place on the clip's
+            // timeline, the delay of a late first picture included (`ramp_offset`).
+            p.push(retime);
+        } else if (s - 1.0).abs() < 1e-9 {
             p.push(format!("setpts=PTS-STARTPTS+{start}/TB"));
         } else {
             p.push(format!("setpts=(PTS-STARTPTS)/{s}+{start}/TB"));
@@ -10759,26 +10764,51 @@ fn still_overlay(t: &Transform, motion: (f64, f64)) -> String {
 /// The audio filter chain for one clip (between `[i:a]` and `[a{i}]`): trim,
 /// optional reverse / tempo, gain, fades (including transition cross-fades) and
 /// delay to the clip's timeline position. Defaults reduce to the original chain.
+///
+/// One chain, so one tempo: a clip with a speed ramp of more than one step goes through
+/// [`audio_clip_chains`] instead (this plays it at its mean speed, which is no ramp).
 fn audio_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, layout: &str, mix: TrackMix) -> String {
-    let s = clip.speed_mag();
-    let dur = ClipTiming::new(clip, fx).duration();
+    let mut p = audio_clip_head(clip, fx);
+    let s = if clip.is_ramped() {
+        match ramp::audio_steps(clip, ClipTiming::new(clip, fx).duration()).as_slice() {
+            [only] => only.tempo(),
+            _ => clip.mean_speed(),
+        }
+    } else {
+        clip.speed_mag()
+    };
+    if (s - 1.0).abs() > 1e-9 {
+        p.push(atempo_chain(s));
+    }
+    p.extend(audio_clip_tail(clip, fmt, fx, layout, mix));
+    p.join(",")
+}
+
+/// The sound of a clip as the chain starts it: the source window (with the crossfade tail, and
+/// relative to the input-side `-ss`), restamped to zero, and played backwards when the clip is.
+fn audio_clip_head(clip: &Clip, fx: &ClipFx) -> Vec<String> {
     // Mirror the video crossfade tail (extends below source_in when reversed) and
     // the same input-side `-ss` fast-seek, so the atrim is relative to the seek.
     let (trim_start, trim_end) = clip_source_window(clip, fx);
     let seek = clip_seek(trim_start, fx.lead);
-    let delay = audio_delay(clip.timeline_start, fmt.sample_rate);
-    let fi = clip.fade_in + fx.black_in + fx.white_in + fx.afade_in;
-    let fo = clip.fade_out + fx.black_out + fx.white_out + fx.tail;
-
     let mut p: Vec<String> = Vec::new();
     p.push(format!("atrim=start={}:end={}", trim_start - seek, trim_end - seek));
     p.push("asetpts=PTS-STARTPTS".to_string());
     if clip.is_reversed() {
         p.push("areverse".to_string());
     }
-    if (s - 1.0).abs() > 1e-9 {
-        p.push(atempo_chain(s));
-    }
+    p
+}
+
+/// What follows the tempo in a clip's sound: gain (keyed or not), effects, the fades, the track
+/// fader, the delivery format and pan, and the delay to the clip's place on the timeline.
+fn audio_clip_tail(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, layout: &str, mix: TrackMix) -> Vec<String> {
+    let dur = ClipTiming::new(clip, fx).duration();
+    let delay = audio_delay(clip.timeline_start, fmt.sample_rate);
+    let fi = clip.fade_in + fx.black_in + fx.white_in + fx.afade_in;
+    let fo = clip.fade_out + fx.black_out + fx.white_out + fx.tail;
+
+    let mut p: Vec<String> = Vec::new();
     if clip.volume_animated() {
         // A keyed gain: `volume` evaluated per frame, after `atempo` so its `t` is the
         // clip's own playing time. It holds one gain for a whole frame, so the frames are
@@ -10842,7 +10872,89 @@ fn audio_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, layout: &str, 
         p.push(format!("pan=stereo|c0={}*c0|c1={}*c1", fnum(gl), fnum(gr)));
     }
     p.push(format!("adelay={delay}:all=1"));
-    p.join(",")
+    p
+}
+
+/// The chains of a clip's sound, `[src]…[a{flat}]`: [`audio_clip_chain`]'s one chain, or for a speed
+/// ramp of several steps the pieces of [`ramp::audio_pieces`] cut from the source, each through its own
+/// `atempo` and trimmed to its share of the timeline, crossfaded end to end, and then the chain's usual
+/// tail on the whole. The head is resampled to the delivery rate first, so the trims count its samples.
+///
+/// ```text
+/// [src]atrim=…,asetpts=PTS-STARTPTS,aresample=48000,asplit=3[ar0s0][ar0s1][ar0s2]
+/// [ar0s0]atrim=start=0:end=1.18,asetpts=PTS-STARTPTS,atempo=1.1,adelay=…S:all=1,apad=whole_len=…,atrim=start_sample=0:end_sample=…,asetpts=N/SR/TB[ar0p0]
+/// … [ar0p0][ar0p1]acrossfade=d=0.002[ar0x1] … [ar0x2]volume=1,…,adelay=0:all=1,asetpts=N/SR/TB[a0]
+/// ```
+fn audio_clip_chains(
+    src: &str,
+    flat: usize,
+    clip: &Clip,
+    fmt: &ExportFormat,
+    fx: &ClipFx,
+    layout: &str,
+    mix: TrackMix,
+) -> Vec<String> {
+    let steps = if clip.is_ramped() {
+        ramp::audio_steps(clip, ClipTiming::new(clip, fx).duration())
+    } else {
+        Vec::new()
+    };
+    if steps.len() < 2 || fmt.sample_rate == 0 {
+        return vec![format!(
+            "[{src}]{chain}[a{flat}]",
+            chain = audio_clip_chain(clip, fmt, fx, layout, mix)
+        )];
+    }
+    let (pieces, overlaps) = ramp::audio_pieces(&steps, fmt.sample_rate);
+    let n = pieces.len();
+    let mut chains = Vec::with_capacity(2 * n + 1);
+    let mut head = audio_clip_head(clip, fx);
+    head.push(format!("aresample={}", fmt.sample_rate));
+    head.push(format!(
+        "asplit={n}{}",
+        (0..n).map(|i| format!("[ar{flat}s{i}]")).collect::<String>()
+    ));
+    chains.push(format!("[{src}]{}", head.join(",")));
+    for (i, piece) in pieces.iter().enumerate() {
+        let mut p = vec![
+            format!("atrim=start={}:end={}", piece.from, piece.to),
+            "asetpts=PTS-STARTPTS".to_string(),
+        ];
+        if ramp::tempo_applies(piece.tempo) {
+            p.push(ramp::atempo_stages(piece.tempo));
+        }
+        if piece.lead > 0 {
+            p.push(format!("adelay={}S:all=1", piece.lead));
+        }
+        p.push(format!("apad=whole_len={}", piece.skip + piece.keep));
+        p.push(format!(
+            "atrim=start_sample={}:end_sample={}",
+            piece.skip,
+            piece.skip + piece.keep
+        ));
+        // Counted, not rebased: the silence an `adelay` of `lead` puts first has no stamp to rebase.
+        p.push("asetpts=N/SR/TB".to_string());
+        chains.push(format!("[ar{flat}s{i}]{}[ar{flat}p{i}]", p.join(",")));
+    }
+    let mut joined = format!("ar{flat}p0");
+    for (i, overlap) in overlaps.iter().enumerate() {
+        let out = format!("ar{flat}x{}", i + 1);
+        chains.push(format!(
+            "[{joined}][ar{flat}p{}]acrossfade=d={}[{out}]",
+            i + 1,
+            *overlap as f64 / f64::from(fmt.sample_rate)
+        ));
+        joined = out;
+    }
+    // `adelay` puts out its silence before the first sample reaches it when its input is late (this
+    // chain's is: nothing leaves the crossfades until the first pieces are cut), and stamps it with no
+    // time at all, which the muxer cannot take. The stream is whole samples from the clip's start, so
+    // they are counted again.
+    chains.push(format!(
+        "[{joined}]{},asetpts=N/SR/TB[a{flat}]",
+        audio_clip_tail(clip, fmt, fx, layout, mix).join(",")
+    ));
+    chains
 }
 
 /// Samples in a frame the keyed volume is evaluated on (2.7 ms at 48 kHz): the gain steps by
@@ -11040,6 +11152,10 @@ mod sweep;
 /// The `fps` pick against the frames the export renders (`#[ignore]`d).
 #[cfg(test)]
 mod picked;
+
+/// Speed ramps through the real `ffmpeg`: the frames, the scrubbed still, the sound's sync (`#[ignore]`d).
+#[cfg(test)]
+mod ramp_rendered;
 
 /// The blurred fill through the real `ffmpeg` (`#[ignore]`d).
 #[cfg(test)]
@@ -13416,6 +13532,328 @@ mod tests {
         let ai = chain.find("acompressor=").expect("compressor");
         assert!(vi < hi && hi < ai, "effects follow the gain in author order: {chain}");
         assert!(chain.contains("ratio=3"));
+    }
+
+    /// The pads a chain reads (the labels it starts with) and writes (the labels it ends with).
+    fn pads_of(chain: &str) -> (Vec<String>, Vec<String>) {
+        let (mut ins, mut rest) = (Vec::new(), chain);
+        while let Some(inner) = rest.strip_prefix('[') {
+            let end = inner.find(']').expect("a closing bracket");
+            ins.push(inner[..end].to_string());
+            rest = &inner[end + 1..];
+        }
+        let (mut outs, mut rest) = (Vec::new(), rest);
+        while rest.ends_with(']') {
+            let open = rest.rfind('[').expect("an opening bracket");
+            outs.push(rest[open + 1..rest.len() - 1].to_string());
+            rest = &rest[..open];
+        }
+        outs.reverse();
+        (ins, outs)
+    }
+
+    /// Split `text` at the commas outside single quotes and brackets: the filters of a chain.
+    fn filters_of(text: &str) -> Vec<&str> {
+        let (mut parts, mut start, mut quoted, mut depth) = (Vec::new(), 0, false, 0i32);
+        for (i, c) in text.char_indices() {
+            match c {
+                '\'' => quoted = !quoted,
+                '(' if !quoted => depth += 1,
+                ')' if !quoted => depth -= 1,
+                ',' if !quoted && depth == 0 => {
+                    parts.push(&text[start..i]);
+                    start = i + 1;
+                }
+                _ => {}
+            }
+        }
+        parts.push(&text[start..]);
+        parts
+    }
+
+    fn ramp_keys() -> Vec<crate::model::SpeedKey> {
+        use crate::model::{RampEasing, SpeedKey};
+        vec![
+            SpeedKey::new(0.0, 1.0),
+            SpeedKey {
+                time: 1.5,
+                speed: 2.5,
+                easing: RampEasing::Hold,
+            },
+            SpeedKey::new(2.5, 0.5),
+            SpeedKey::new(3.5, 0.5),
+        ]
+    }
+
+    #[test]
+    fn a_ramped_clips_picture_is_retimed_by_one_quoted_expression() {
+        let fmt = fmt_1080p();
+        let mut clip = make_clip(Uuid::new_v4(), 1.0, 8.0, 2.0);
+        clip.speed_ramp = ramp_keys();
+        let chain = video_clip_chain(&clip, &fmt, &ClipFx::default(), false, "c0");
+        let filters = filters_of(&chain);
+        // The window is trimmed as ever, then the one `setpts` (commas and a `;` inside its quotes).
+        let setpts = filters.iter().find(|f| f.starts_with("setpts=")).expect("a setpts");
+        assert!(
+            setpts.starts_with("setpts='st(0,(PTS-STARTPTS)*TB);(") && setpts.ends_with("+2)/TB'"),
+            "{setpts}"
+        );
+        assert_eq!(filters.iter().filter(|f| f.starts_with("setpts")).count(), 1, "{chain}");
+        assert!(!chain.contains("/TB+") && !chain.contains(")/2.5+"), "{chain}");
+        let (trim, retime, fps) = (
+            filters.iter().position(|f| f.starts_with("trim=")).unwrap(),
+            filters.iter().position(|f| f.starts_with("setpts=")).unwrap(),
+            filters.iter().position(|f| f.starts_with("fps=")).unwrap(),
+        );
+        assert!(trim < retime && retime < fps, "{chain}");
+        // Reversed, the frames are put back in playing order first and the retime is the same text.
+        let mut back = clip;
+        back.speed = -1.0;
+        let reversed = video_clip_chain(&back, &fmt, &ClipFx::default(), false, "c0");
+        let filters = filters_of(&reversed);
+        assert!(
+            filters.iter().position(|f| *f == "reverse").unwrap()
+                < filters.iter().position(|f| f.starts_with("setpts=")).unwrap()
+        );
+        assert!(filters.contains(setpts), "{reversed}");
+        // Sixteen keys nest five `if`s and a bracket level per `(`, far from libavutil's hundred.
+        let mut many = make_clip(Uuid::new_v4(), 0.0, 400.0, 0.0);
+        many.speed_ramp = (0..16)
+            .map(|i| crate::model::SpeedKey::new(f64::from(i) * 0.5, 0.5 + f64::from(i % 4)))
+            .collect();
+        let chain = video_clip_chain(&many, &fmt, &ClipFx::default(), false, "c0");
+        let setpts = filters_of(&chain).into_iter().find(|f| f.starts_with("setpts=")).unwrap();
+        let (ifs, brackets) = nesting(setpts);
+        assert_eq!(ifs, 5, "{setpts}");
+        assert!(brackets < 40, "{brackets} levels in {setpts}");
+        // A clip at a constant speed keeps the divide it always had.
+        let mut fast = make_clip(Uuid::new_v4(), 1.0, 8.0, 2.0);
+        fast.speed = 2.0;
+        let chain = video_clip_chain(&fast, &fmt, &ClipFx::default(), false, "c0");
+        assert!(chain.contains("setpts=(PTS-STARTPTS)/2+2/TB"), "{chain}");
+    }
+
+    #[test]
+    fn a_ramp_leaves_the_animation_on_the_timeline_clock() {
+        // Keyframes and channels are clip-local seconds of the output, read after `setpts` has put the
+        // frames on the timeline: the same text with a ramp as without one, at any speed.
+        let fmt = fmt_1080p();
+        let mut plain = make_clip(Uuid::new_v4(), 1.0, 8.0, 2.0);
+        let keys = |pairs: &[(f64, f64)]| -> Vec<crate::model::PropertyKey> {
+            pairs.iter().map(|&(t, v)| crate::model::PropertyKey::new(t, v)).collect()
+        };
+        plain.set_property_keys(Property::Opacity, keys(&[(0.0, 0.2), (2.0, 1.0)]));
+        plain.set_property_keys(Property::Scale, keys(&[(0.0, 1.0), (3.0, 1.6)]));
+        plain.set_property_keys(Property::Rotation, keys(&[(0.0, 0.0), (3.0, 20.0)]));
+        let mut ramped = plain.clone();
+        ramped.speed_ramp = ramp_keys();
+        let (a, b) = (
+            video_clip_chain(&plain, &fmt, &ClipFx::default(), false, "c0"),
+            video_clip_chain(&ramped, &fmt, &ClipFx::default(), false, "c0"),
+        );
+        let animated = |chain: &str| -> Vec<String> {
+            filters_of(chain)
+                .into_iter()
+                .filter(|f| !f.starts_with("setpts") && !f.starts_with("trim") && !f.starts_with("fps"))
+                .map(String::from)
+                .collect()
+        };
+        assert!(a.contains("geq=") && a.contains("rotate=a="));
+        assert_eq!(animated(&a), animated(&b));
+        // And the sound's volume curve, evaluated after the steps are joined, is clip-local too.
+        let mut keyed = ramped;
+        keyed.set_property_keys(Property::Volume, keys(&[(0.0, 1.0), (2.0, 0.25)]));
+        let audio = audio_clip_chains("0:a", 0, &keyed, &fmt, &ClipFx::default(), "stereo", unity_mix());
+        let tail = audio.last().unwrap();
+        assert!(
+            tail.starts_with("[ar0x") && tail.contains("asetnsamples=n=128:p=0,volume='"),
+            "{tail}"
+        );
+        assert!(tail.ends_with("adelay=2000:all=1,asetpts=N/SR/TB[a0]"), "{tail}");
+    }
+
+    #[test]
+    fn a_ramped_clips_sound_is_cut_into_steps_and_joined_end_to_end() {
+        let fmt = ExportFormat::default();
+        let (src, flat) = ("0:a", 3);
+        let mut clip = make_clip(Uuid::new_v4(), 1.0, 8.0, 2.0);
+        clip.speed_ramp = ramp_keys();
+        let fx = ClipFx::default();
+        let chains = audio_clip_chains(src, flat, &clip, &fmt, &fx, "stereo", unity_mix());
+        let steps = ramp::audio_steps(&clip, clip.duration());
+        let n = steps.len();
+        assert!(n > 4, "{n} steps");
+        // The head splits the stream into one pad per step; one chain per step; one `acrossfade` per seam.
+        assert_eq!(chains.len(), 1 + n + (n - 1) + 1, "{chains:#?}");
+        assert!(
+            chains[0].starts_with("[0:a]atrim=start=0:end=7,asetpts=PTS-STARTPTS,aresample=48000,asplit="),
+            "{}",
+            chains[0]
+        );
+        let crossfades = chains.iter().filter(|c| c.contains("acrossfade=d=0.002")).count();
+        assert_eq!(crossfades, n - 1);
+        // Every pad is written once and read once, from the source to the clip's own `[a3]`.
+        let mut written = vec![src.to_string()];
+        let mut read: Vec<String> = Vec::new();
+        for chain in &chains {
+            let (ins, outs) = pads_of(chain);
+            read.extend(ins);
+            written.extend(outs);
+        }
+        let (mut written_sorted, mut read_sorted) = (written.clone(), read.clone());
+        written_sorted.sort();
+        read_sorted.sort();
+        let mut want = written_sorted.clone();
+        want.retain(|p| p != "a3");
+        assert_eq!(read_sorted, want, "written {written:?}\nread {read:?}");
+        assert_eq!(written.iter().filter(|p| *p == "a3").count(), 1);
+        assert!(
+            chains.last().unwrap().ends_with("adelay=2000:all=1,asetpts=N/SR/TB[a3]"),
+            "{}",
+            chains.last().unwrap()
+        );
+        // A step is its own `atempo` stream trimmed to whole samples, padded if the source ran short.
+        let hold = chains
+            .iter()
+            .find(|c| c.contains("atempo=1.5811388300841898,atempo=1.5811388300841898"))
+            .expect("the hold at 2.5x: two stages of its square root");
+        assert!(hold.contains("apad=whole_len="), "{hold}");
+        for piece in &chains[1..=n] {
+            assert!(
+                piece.contains(",apad=whole_len=") && piece.contains("atrim=start_sample="),
+                "{piece}"
+            );
+        }
+        // The two ends of the clip's sound are the ramp's two ends: the first step's tempo is the slope's start.
+        assert!(chains[1].contains("atempo="), "{}", chains[1]);
+        // A ramp of one step, and a clip without one, are the single chain they always were.
+        let mut flat_ramp = make_clip(Uuid::new_v4(), 0.0, 6.0, 0.0);
+        flat_ramp.speed_ramp = vec![crate::model::SpeedKey::new(0.0, 2.0)];
+        let one = audio_clip_chains(src, flat, &flat_ramp, &fmt, &fx, "stereo", unity_mix());
+        assert_eq!(one.len(), 1);
+        assert!(
+            one[0].starts_with("[0:a]atrim=start=0:end=6,asetpts=PTS-STARTPTS,atempo=2,volume=1,"),
+            "{}",
+            one[0]
+        );
+        let mut fast = flat_ramp;
+        (fast.speed_ramp, fast.speed) = (Vec::new(), 2.0);
+        assert_eq!(
+            audio_clip_chains(src, flat, &fast, &fmt, &fx, "stereo", unity_mix()),
+            one,
+            "a constant speed and a one-key ramp at it play the same"
+        );
+        assert_eq!(
+            one[0],
+            format!("[0:a]{}[a3]", audio_clip_chain(&fast, &fmt, &fx, "stereo", unity_mix()))
+        );
+    }
+
+    #[test]
+    fn a_ramped_clips_reversed_sound_is_reversed_before_it_is_cut_and_its_tail_is_stepped_too() {
+        let fmt = ExportFormat::default();
+        let mut clip = make_clip(Uuid::new_v4(), 10.0, 16.0, 1.0);
+        clip.speed = -1.0;
+        clip.speed_ramp = ramp_keys();
+        let fx = ClipFx {
+            tail: 0.75,
+            ..ClipFx::default()
+        };
+        let chains = audio_clip_chains("1:a", 0, &clip, &fmt, &fx, "stereo", unity_mix());
+        // The window reaches below the in-point by the tail at the last key's speed (0.5x: 0.375 s).
+        assert!(
+            chains[0].starts_with("[1:a]atrim=start=0:end=6.375,asetpts=PTS-STARTPTS,areverse,aresample=48000,asplit="),
+            "{}",
+            chains[0]
+        );
+        // The steps cover the clip and its tail: the sound fades out over the tail as ever.
+        let total = clip.duration() + 0.75;
+        let last = chains.last().unwrap();
+        assert!(last.contains(&format!("afade=t=out:st={}:d=0.75", clip.duration())), "{last}");
+        let steps = ramp::audio_steps(&clip, total);
+        assert_eq!(steps.last().unwrap().t1, total);
+    }
+
+    #[test]
+    fn hostile_ramps_never_panic_a_builder_and_a_malformed_one_is_a_constant_speed() {
+        let asset = test_asset(vec![video_stream(1920, 1080, 30.0), audio_stream(48_000, 2)]);
+        let numbers = [
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            -1.0,
+            0.0,
+            1e-300,
+            0.01,
+            0.37,
+            1.0,
+            2.5,
+            100.0,
+            101.0,
+            1e300,
+        ];
+        let mut state = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut pick = |n: usize| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 11) as usize % n
+        };
+        for round in 0..400 {
+            let keys: Vec<crate::model::SpeedKey> = (0..pick(20))
+                .map(|_| crate::model::SpeedKey {
+                    time: numbers[pick(numbers.len())],
+                    speed: numbers[pick(numbers.len())],
+                    easing: if pick(2) == 0 {
+                        crate::model::RampEasing::Hold
+                    } else {
+                        crate::model::RampEasing::Linear
+                    },
+                })
+                .collect();
+            let mut clip = make_clip(
+                asset.id,
+                numbers[pick(8)].abs().min(50.0),
+                60.0,
+                numbers[pick(8)].abs().min(9.0),
+            );
+            clip.speed = [1.0, -1.0, 2.0, 0.0][pick(4)];
+            clip.speed_ramp = keys.clone();
+            let tail = [0.0, 0.5][pick(2)];
+            let fx = ClipFx {
+                tail,
+                ..ClipFx::default()
+            };
+            let fmt = ExportFormat::default();
+            let _ = video_clip_chain(&clip, &fmt, &fx, false, "c0");
+            let chains = audio_clip_chains("0:a", 0, &clip, &fmt, &fx, "stereo", unity_mix());
+            assert!(!chains.is_empty());
+            assert!(!chains.concat().contains("NaN"), "round {round}: {chains:?}");
+            let silent = ExportFormat {
+                sample_rate: 0,
+                ..ExportFormat::default()
+            };
+            assert!(!audio_clip_chains("0:a", 0, &clip, &silent, &fx, "stereo", unity_mix())
+                .concat()
+                .contains("NaN"));
+            let timeline = crate::engine::test_support::single(vec![clip.clone()]);
+            let _ = build_export_args(&timeline, std::slice::from_ref(&asset), "/o.mp4", &ExportOptions::default());
+            if !crate::model::ramp_is_valid(&keys) {
+                // Not read: the same graph as the clip at its constant speed.
+                let mut plain = clip.clone();
+                plain.speed_ramp = Vec::new();
+                assert_eq!(
+                    video_clip_chain(&clip, &fmt, &fx, false, "c0"),
+                    video_clip_chain(&plain, &fmt, &fx, false, "c0"),
+                    "round {round}: {keys:?}"
+                );
+                assert_eq!(
+                    audio_clip_chains("0:a", 0, &clip, &fmt, &fx, "stereo", unity_mix()),
+                    audio_clip_chains("0:a", 0, &plain, &fmt, &fx, "stereo", unity_mix()),
+                    "round {round}: {keys:?}"
+                );
+            }
+        }
     }
 
     #[test]

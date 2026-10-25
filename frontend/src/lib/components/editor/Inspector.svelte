@@ -10,6 +10,7 @@
 	import CheckRow from './CheckRow.svelte';
 	import SliderRow from './SliderRow.svelte';
 	import GradeSections from './GradeSections.svelte';
+	import SpeedRamp from './SpeedRamp.svelte';
 	import TemplateSection from './TemplateSection.svelte';
 	import TextSection from './TextSection.svelte';
 	import MediaChips from './MediaChips.svelte';
@@ -67,6 +68,8 @@
 		timingSummary
 	} from '#lib/inspector-summary';
 	import { fitOffer, musicSummary } from '#lib/music-ui';
+	import { isRamped } from '#lib/speed-ramp';
+	import { rampSummary } from '#lib/speed-ramp-edit';
 	import MusicStructure from './MusicStructure.svelte';
 	import { DEGREES, NUMBER_COL, PERCENT, SECONDS, TIMES, readout, type RowSpec } from '#lib/slider-row';
 	import { FieldEdits } from '#lib/field-edit';
@@ -373,6 +376,7 @@
 
 	const col = $derived(clip ? colorAt(clip, localTime) : DEFAULT_COLOR);
 	const speed = $derived(clip?.speed ?? 1);
+	const ramped = $derived(clip ? isRamped(clip) : false);
 	const transition = $derived(clip?.transition_in ?? null);
 	const mask = $derived(clip?.mask ?? null);
 	/** The mask the sliders show: every keyed number its curve at the playhead. */
@@ -1475,17 +1479,23 @@
 				<TemplateSection o={{ id: clip.id, svg: titleClip.svg, template: titleClip.template }} />
 				<TextSection o={{ id: clip.id, name: titleName(titleClip), svg: titleClip.svg, template: titleClip.template }} />
 			{:else}
-			<InspectorSection title="Speed" summary={`${Math.abs(speed).toFixed(2)}×${speed < 0 ? ' · reverse' : ''}`}>
+			<InspectorSection title="Speed" summary={`${ramped ? rampSummary(clip) : `${Math.abs(speed).toFixed(2)}×`}${speed < 0 ? ' · reverse' : ''}`}>
 			{@render rangeRow('Rate', Math.abs(speed), { min: 0.25, max: 4, step: 0.25, neutral: 1, ...TIMES }, (v, at) => {
 				const c = clipOf(at);
 				if (c) return run(() => editor.setSpeed(c.id, (c.speed ?? 1) < 0 ? -v : v));
 			}, undefined, undefined, !!lockedWhy)}
-			<CheckRow checked={speed < 0} pending={editor.locked} disabled={!!lockedWhy} onchange={() => run(() => editor.setSpeed(clip.id, -speed))}>
+			<CheckRow checked={speed < 0} pending={editor.locked} disabled={!!lockedWhy || ramped} onchange={() => run(() => editor.setSpeed(clip.id, -speed))}>
 				Reverse
 			</CheckRow>
+			{#if ramped}
+				<div data-ramp-note style="font-size:12px;line-height:1.4;color:var(--text-muted);margin-top:6px">
+					The ramp below sets the speed, so this rate is not used. Setting a rate here clears the ramp, and Reverse is off until you clear it.
+				</div>
+			{/if}
 			{#if lockedWhy}
 				<div data-locked-note style="font-size:12px;line-height:1.4;color:var(--text-muted);margin-top:6px">{lockedWhy} — unlock it to change the speed.</div>
 			{/if}
+			<SpeedRamp {clip} {lockedWhy} />
 			</InspectorSection>
 			{/if}
 

@@ -11,11 +11,12 @@
  * asset) all land on tiles that are already cached.
  *
  * Source time and timeline pixels meet in `sourceAt`: forward, a clip's pixel
- * `x` shows source `source_in + x / pxPerSec * |speed|`; reversed, it counts down
- * from `source_out`, which is all "a reversed clip draws mirrored" is — the
+ * `x` shows source `source_in + x / pxPerSec * |speed|` (through the clip's speed ramp, when it
+ * has one: `along`); reversed, it counts down from `source_out`, which is all "a reversed clip draws mirrored" is — the
  * columns are read through the mapping, the data is never flipped. */
 
-import type { WaveformRange } from './types';
+import { along, isReversed as reversedClip, localAtAlong, speedMag as clipSpeedMag } from './speed-ramp';
+import type { SpeedKey, WaveformRange } from './types';
 
 /** The finest stored level is 500 buckets a second: a "cell" is its 2 ms bucket. */
 export const CELL_RATE = 500;
@@ -60,12 +61,13 @@ export interface ClipWindow {
 	source_in: number;
 	source_out: number;
 	speed?: number;
+	speed_ramp?: SpeedKey[];
 }
 
 /** Playback speed's magnitude, clamped away from zero like the engine's `speed_mag`. */
-export const speedMag = (c: { speed?: number }): number => Math.max(Math.abs(c.speed ?? 1), 0.01);
+export const speedMag = clipSpeedMag;
 
-export const isReversed = (c: { speed?: number }): boolean => (c.speed ?? 1) < 0;
+export const isReversed = reversedClip;
 
 /** A device pixel ratio as drawn: at least 1 (a zoomed-out page is not worth a
  *  sub-pixel canvas), at most `MAX_DPR`. */
@@ -79,13 +81,13 @@ export const secondsPerDevicePx = (pxPerSec: number, dpr: number, speed?: number
 
 /** The source second shown at `px` pixels from the clip's left edge. */
 export function sourceAt(c: ClipWindow, px: number, pxPerSec: number): number {
-	const t = (px / pxPerSec) * speedMag(c);
+	const t = along(c, px / pxPerSec);
 	return isReversed(c) ? c.source_out - t : c.source_in + t;
 }
 
 /** The pixel (from the clip's left edge) where source second `src` is shown. */
 export function pxAtSource(c: ClipWindow, src: number, pxPerSec: number): number {
-	const t = (isReversed(c) ? c.source_out - src : src - c.source_in) / speedMag(c);
+	const t = localAtAlong(c, isReversed(c) ? c.source_out - src : src - c.source_in);
 	return t * pxPerSec;
 }
 

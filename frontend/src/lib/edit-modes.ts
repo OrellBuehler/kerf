@@ -24,7 +24,7 @@
 import { curve, EASE_STEPS } from './easing';
 import { rebaseChannels, transformAt } from './channels';
 import { formatTime } from './diff';
-import { invalid, locateIndex, unlockedPartners } from './link-groups';
+import { invalid, locateIndex, samePace, unlockedPartners } from './link-groups';
 import { toFixedEven } from './format-fixed';
 import type {
 	Clip,
@@ -37,16 +37,26 @@ import type {
 	Timeline,
 	Transform
 } from './types';
-import { clipDuration, DEFAULT_REFRAME, DEFAULT_TRANSFORM } from './types';
+import { DEFAULT_REFRAME, DEFAULT_TRANSFORM } from './types';
+import {
+	clipDuration,
+	headSource,
+	headTime,
+	isRamped,
+	isReversed,
+	MAX_SPEED,
+	MIN_SPEED,
+	rebaseRamp,
+	speedAt,
+	speedMag,
+	tailSource,
+	tailTime
+} from './speed-ramp';
 
 /** Shortest a clip an edit-mode op may leave behind, seconds — the edge-trim floor too. */
 export const MIN_EDIT_CLIP = 0.05;
 
-/** Smallest speed magnitude a clip may be set to (`MIN_SPEED`, model.rs). */
-export const MIN_SPEED = 0.01;
-
-/** Largest speed magnitude a clip may be set to (`MAX_SPEED`, model.rs): 100×. */
-export const MAX_SPEED = 100;
+export { MAX_SPEED, MIN_SPEED };
 
 /** How far the footage of a clip may be asked past the asset's length, seconds (`SOURCE_EPS`, project.rs):
  *  the float noise of a duration that went through a probe and a JSON round trip. */
@@ -76,8 +86,7 @@ export interface DeltaRange {
 export const DIFF_EPS = 1e-6;
 
 const changed = (a: number, b: number) => Math.abs(a - b) > DIFF_EPS;
-const speedOf = (c: Clip) => Math.max(Math.abs(c.speed ?? 1), 0.01);
-const reversed = (c: Clip) => (c.speed ?? 1) < 0;
+const reversed = isReversed;
 const endOf = (c: Clip) => c.timeline_start + clipDuration(c);
 
 // ---- ranges ---------------------------------------------------------------
@@ -132,16 +141,17 @@ const outcome = (requested: number, applied: number, clips: Clip[]): EditOutcome
  *  source's *out* side and the two swap; a still has no footage to run out of. */
 export function handles(clip: Clip, limit: number): [number, number] {
 	if (!Number.isFinite(limit)) return [Infinity, Infinity];
-	const mag = speedOf(clip);
-	const before = Math.max(clip.source_in, 0) / mag;
-	const after = Math.max(limit - clip.source_out, 0) / mag;
-	return reversed(clip) ? [after, before] : [before, after];
+	const before = Math.max(clip.source_in, 0);
+	const after = Math.max(limit - clip.source_out, 0);
+	// The start side of a reversed clip is the source's out side; a ramp's handle is the time its
+	// speed takes to play that footage (the map extrapolated at the first / last key's speed).
+	return reversed(clip) ? [headTime(clip, after), tailTime(clip, before)] : [headTime(clip, before), tailTime(clip, after)];
 }
 
 /** Move the clip's end by `by` timeline seconds (positive lengthens). `looping` (a
  *  still) writes only the out-point whichever way it plays, so a window never goes below 0. */
 export function moveTail(clip: Clip, by: number, looping: boolean) {
-	const shift = by * speedOf(clip);
+	const shift = tailSource(clip, by);
 	if (reversed(clip) && !looping) clip.source_in -= shift;
 	else clip.source_out += shift;
 }
@@ -149,8 +159,8 @@ export function moveTail(clip: Clip, by: number, looping: boolean) {
 /** Move the clip's start by `by` timeline seconds — positive shortens it from the
  *  front, negative pulls it earlier and longer — so its end stays where it was. */
 export function moveHead(clip: Clip, by: number, looping: boolean) {
+	const shift = headSource(clip, by);
 	rebaseAnimation(clip, by);
-	const shift = by * speedOf(clip);
 	if (reversed(clip) || looping) clip.source_out -= shift;
 	else clip.source_in += shift;
 	clip.timeline_start += by;
@@ -192,7 +202,7 @@ function fitEnd(clip: Clip, limit: number, looping: boolean) {
 	for (let i = 0; i < 16; i++) {
 		const over = endOf(clip) - limit;
 		if (over <= 0 || over > DIFF_EPS) return;
-		const by = over * speedOf(clip);
+		const by = over * speedAt(clip, clipDuration(clip));
 		if (reversed(clip) && !looping) {
 			const moved = clip.source_in + by;
 			clip.source_in = moved === clip.source_in ? nextAfter(clip.source_in, true) : moved;
@@ -217,7 +227,8 @@ function startAfter(clips: readonly Clip[], end: number, skip: readonly number[]
 /** Re-time a clip's animation after its start moved by `by` timeline seconds:
  *  keyframes are clip-local, so they ride with the content. Shortened from the front
  *  (`by > 0`) the pose the clip now opens on is pinned as a key at 0 and later keys
- *  shift back; pulled earlier (`by < 0`) every key shifts later. */
+ *  shift back; pulled earlier (`by < 0`) every key shifts later. A speed ramp's keys
+ *  are the same kind of clip-local time (`rebaseRamp`). */
 export function rebaseAnimation(clip: Clip, by: number) {
 	if (by > 0) {
 		if (clip.keyframes?.length) {
@@ -271,8 +282,9 @@ export function rebaseAnimation(clip: Clip, by: number) {
 		for (const k of clip.keyframes ?? []) k.time -= by;
 		for (const k of clip.reframe?.keyframes ?? []) k.time -= by;
 	}
-	// Per-property channels ride with the content too (`Clip::rebase_channels`).
+	// Per-property channels ride with the content too (`Clip::rebase_channels`), and so does a speed ramp.
 	rebaseChannels(clip, by);
+	rebaseRamp(clip, by);
 }
 
 // ---- keyframe sampling (kerf-core's `interpolate` / `Clip::transform_at` / `Reframe::sample`) ----
@@ -783,14 +795,26 @@ function slipPartners(timeline: Timeline, clipId: string, footage: SourceLimits)
 	return out;
 }
 
+/** The speeds `clipId` and `partner` slip at: a slip is the same *timeline* shift of the footage in each, so
+ *  source seconds convert by the ratio of the two. Two clips on the same ramp slip alike (1 and 1); a ramp
+ *  against another pace has no one ratio and refuses (`slip_speeds`). */
+function slipSpeeds(timeline: Timeline, clipId: string, partner: string): [number, number] {
+	const [c, p] = [clipAt(timeline, clipId), clipAt(timeline, partner)];
+	if (!isRamped(c) && !isRamped(p)) return [speedMag(c), speedMag(p)];
+	if (samePace(c, p)) return [1, 1];
+	throw invalid(
+		`the linked clip on ${trackNameOf(timeline, partner)} runs at another pace than a speed-ramped clip, so a slip has no one ratio between them — slip them one at a time`
+	);
+}
+
 /** `slipRange` for the group, in the named clip's source seconds: a partner's range is
  *  converted by the ratio of the two speeds, then intersected. */
 export function slipRangeLinked(timeline: Timeline, clipId: string, footage: SourceLimits): DeltaRange {
 	let range = slipRange(timeline, clipId, footage);
-	const mag = speedOf(clipAt(timeline, clipId));
 	for (const partner of slipPartners(timeline, clipId, footage)) {
+		const [mag, pMag] = slipSpeeds(timeline, clipId, partner);
 		const theirs = slipRange(timeline, partner, footage);
-		range = intersect(range, onLinked(scaled(theirs, mag / speedOf(clipAt(timeline, partner))), trackNameOf(timeline, partner)));
+		range = intersect(range, onLinked(scaled(theirs, mag / pMag), trackNameOf(timeline, partner)));
 	}
 	return range;
 }
@@ -807,11 +831,11 @@ export function slipClipLinked(timeline: Timeline, clipId: string, delta: number
 	const partners = slipPartners(timeline, clipId, footage);
 	if (partners.length === 0) return slipClip(timeline, clipId, delta, footage);
 	const applied = resolve(slipRangeLinked(timeline, clipId, footage), delta, 'slip the footage');
-	const mag = speedOf(clipAt(timeline, clipId));
 	const scratch: Timeline = structuredClone(timeline);
 	const clips = slipClip(scratch, clipId, applied, footage).clips;
 	for (const partner of partners) {
-		const theirs = (applied * speedOf(clipAt(scratch, partner))) / mag;
+		const [mag, pMag] = slipSpeeds(timeline, clipId, partner);
+		const theirs = (applied * pMag) / mag;
 		if (Math.abs(theirs) > DIFF_EPS) clips.push(...slipClip(scratch, partner, theirs, footage).clips);
 	}
 	timeline.tracks = scratch.tracks;

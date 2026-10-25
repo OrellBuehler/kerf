@@ -132,7 +132,7 @@
   (`source_in ≥ 0`, `source_out ≤` the asset's length, a still has no end), the new/trimmed clip
   may not land on another clip of its lane (checked after the ripple, so ripple mode still
   pushes the later clips along), and `add_clip_to_timeline` keeps the track sorted;
-  `set_speed` is held to `MIN_SPEED..=MAX_SPEED`.
+  `set_speed` is held to `MIN_SPEED..=MAX_SPEED`, and so is every key of `set_speed_ramp` (`core-model.md`).
   **The file** (`project/store.rs`): `PRAGMA user_version` is the schema version, brought forward by
   `MIGRATIONS` (one step each, each in its own transaction stamping the version it reached; never edit
   a shipped step, append one). Version 0 is every file written before versions existed (the legacy
@@ -173,8 +173,12 @@
   v12→v13 is a JSON step for a **new field**, `Timeline.thumbnails` (designed thumbnails, below): an older build drops them
   at its next write; a timeline with none is written as before, `run` a no-op, `needed` always, `needed_to_read` false;
   `persisted/timelines-v13.json` holds a vertical thumbnail with a headline.
-  The schema is at **v13** (`SCHEMA_VERSION`). `persist_tests` pins which steps a file has pending with
-  `store::pending_steps` (a legacy file that has every column: `[4, 5, 6, 7, 8, 9, 10, 11, 12]`). A step's `needed_to_read` says whether a build that
+  v13→v14 is a JSON step for a **new field**, `Clip.speed_ramp` (a speed ramp, `core-model.md`): an older build drops it at
+  its next write of the clip and the clip then plays at its constant speed, a different length; a clip with none is written as
+  before, `run` a no-op, `needed` always, `needed_to_read` false (`a_v13_file_is_backed_up_stamped_v14_and_keeps_its_speed_ramps`);
+  `persisted/timelines-v14.json` holds a clip on a ramp with a held segment.
+  The schema is at **v14** (`SCHEMA_VERSION`). `persist_tests` pins which steps a file has pending with
+  `store::pending_steps` (a legacy file that has every column: `[4, 5, 6, 7, 8, 9, 10, 11, 12, 13]`). A step's `needed_to_read` says whether a build that
   cannot write must still refuse a file lacking what it adds: true for the v1, v2 and v4 columns (the reads
   name them), false for the `fonts` table (reads tolerate its absence), so a write-protected v2 project
   opens as it is. A new file is stamped `SCHEMA_VERSION`; a

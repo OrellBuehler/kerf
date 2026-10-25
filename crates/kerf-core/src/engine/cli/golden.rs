@@ -1,7 +1,8 @@
-//! The golden argv oracle: 8000 seeded timelines (4000, then 800 with a master bus, then 800
+//! The golden argv oracle: 8400 seeded timelines (4000, then 800 with a master bus, then 800
 //! with per-property channels, then 400 with an AMF or VAAPI encoder, then 400 with animated SVG
 //! titles, then 400 exported at several delivery frames in one run, then 400 with titles on tracks,
-//! then 400 with a blurred fill, then 400 with a keyed mask or crop) whose ffmpeg argv must not move.
+//! then 400 with a blurred fill, then 400 with a keyed mask or crop, then 400 with speed ramps)
+//! whose ffmpeg argv must not move.
 //!
 //! `build_export_args_phase`, `build_still_args` and `build_preview_args_with` are
 //! built for every case and their argv reduced to a digest, checked against three
@@ -72,6 +73,17 @@
 //! per-case digests are the ones the commit before those numbers could be keyed gave; only 4 block
 //! lines were appended to each file.
 //!
+//! **The speed-ramp family is appended the same way**: the [`RAMP_CASES`] after those draw from the
+//! same generator (with the channel family's channels, one delivery frame, no titles) and then have
+//! most of their clips ramped ([`ramp_for`], on dice of its own seeded by the case and the clip: one to
+//! five keys, sixteen now and then, a hold here and there, a quarter played backwards, the track rippled
+//! so clips that touched still touch and a transition keeps its tail). The first 8000 per-case digests
+//! are the ones the commit before ramps gave; 4 block lines were appended to each file, `parts.txt`'s too
+//! (`git diff` is additions only). Families `speed-ramp` (`setpts='st(0,`), `speed-ramp-linear`
+//! (`sqrt((`), `speed-ramp-audio` (`acrossfade=d=`), their `preview-` forms, and the structural
+//! `speed-ramp-hold`, `speed-ramp-reversed`, `speed-ramp-tail` (a ramped outgoing clip under a
+//! transition) and `still-speed-ramp`.
+//!
 //! **The export in parts has a file of its own** (`golden/parts.txt`, [`the_parts_argv_builders_produce_the_golden_digests`]):
 //! every case is planned with `segments::plan_export` under [`PARTS_LIMITS`] and the argv of every part and of the last pass is
 //! digested, so the three files above prove that a small export is unchanged and this one pins what a long one is made of.
@@ -88,7 +100,8 @@
 //! and libm: the
 //! compressor and gate thresholds go through `powf`, whose last digits differ between
 //! glibc builds (FMA or not), macOS, Windows and arm, so [`round_libm`] compares those
-//! numbers to 10 significant digits, which still pins the dB mapping. The digest files are
+//! numbers to 10 significant digits, which still pins the dB mapping (a ramp's `atempo` stages and read
+//! points are made without libm, `ramp::stage_tempo`, so they need no rounding). The digest files are
 //! LF whatever the checkout (`.gitattributes`, and the comparison ignores `\r`).
 //!
 //! **Bless** after an intended argv change, from the repo root:
@@ -119,7 +132,9 @@ use chrono::{TimeZone, Utc};
 use uuid::Uuid;
 
 use super::*;
-use crate::model::{Easing, Keyframe, MasterBus, Property, PropertyKey, TextKeyframe, Track, Transition, TransitionKind};
+use crate::model::{
+    Easing, Keyframe, MasterBus, Property, PropertyKey, RampEasing, SpeedKey, TextKeyframe, Track, Transition, TransitionKind,
+};
 
 const CASES: usize = 4000;
 /// The master-bus cases appended after the first [`CASES`] (see the module docs).
@@ -143,7 +158,10 @@ const BLUR_FIRST: usize = TITLE_FIRST + TITLE_CASES;
 /// The keyed mask and crop cases appended after the blurred-fill ones (see the module docs).
 const MASK_CROP_CASES: usize = 400;
 const MASK_CROP_FIRST: usize = BLUR_FIRST + BLUR_CASES;
-const TOTAL: usize = MASK_CROP_FIRST + MASK_CROP_CASES;
+/// The speed-ramp cases appended after the keyed mask and crop ones (see the module docs).
+const RAMP_CASES: usize = 400;
+const RAMP_FIRST: usize = MASK_CROP_FIRST + MASK_CROP_CASES;
+const TOTAL: usize = RAMP_FIRST + RAMP_CASES;
 const BLOCK: usize = 100;
 const MIN_PER_FAMILY: usize = 20;
 const KINDS: [&str; 3] = ["export", "still", "preview"];
@@ -379,6 +397,11 @@ together-chapters -map_chapters
 together-subtitles -disposition:s:0 0
 together-refused NOT-TOGETHER
 together-reframe-named v360@d1c
+speed-ramp setpts='st(0,
+speed-ramp-linear sqrt((
+speed-ramp-audio acrossfade=d=
+preview-speed-ramp setpts='st(0,
+preview-speed-ramp-linear sqrt((
 ";
 
 // ---- a seeded generator --------------------------------------------------------
@@ -765,6 +788,54 @@ fn mask_crop_for(tl: &mut Timeline, j: usize) {
                     clip.set_property_keys(p, keys(&mut r, p));
                 }
             }
+        }
+    }
+}
+
+/// A speed ramp on most of the clips of the `j`-th ramp case, on dice of its own seeded by the case and
+/// the clip (so the generator's are untouched): one to five keys, now and then sixteen (the most the
+/// export nests), speeds from a crawl to eight times, a hold here and there, a quarter of the clips played
+/// backwards. A still image and a title keep the constant speed they have. The window stays, so the clip's
+/// length changes, and what follows it on its track moves with it (the gaps and overlaps of the track kept,
+/// as a rippling edit would): clips that touched still touch, so a transition keeps its partner and its
+/// tail plays on at the last key's speed.
+fn ramp_for(tl: &mut Timeline, j: usize, assets: &[Asset]) {
+    let mut n = 0;
+    for track in &mut tl.tracks {
+        let old: Vec<(f64, f64)> = track.clips.iter().map(|c| (c.timeline_start, c.timeline_end())).collect();
+        for clip in &mut track.clips {
+            n += 1;
+            let mut r = Rng::new((3 << 40) + (j as u64) * 64 + n as u64);
+            let still = assets.iter().any(|a| a.id == clip.asset_id && a.is_image());
+            if still || clip.is_generated() || !r.chance(0.75) {
+                continue;
+            }
+            let count = if r.chance(0.06) { 16 } else { 1 + r.below(5) };
+            let mut time = if r.chance(0.5) { 0.0 } else { r.real(0.0, 1.0) };
+            clip.speed_ramp = (0..count)
+                .map(|_| {
+                    let key = SpeedKey {
+                        time,
+                        speed: match r.below(3) {
+                            0 => r.pick(&[0.25, 0.5, 0.75, 1.5, 2.0, 3.0, 8.0]),
+                            1 => r.real(0.2, 3.0),
+                            _ => r.real(0.5, 8.0),
+                        },
+                        easing: if r.chance(0.3) { RampEasing::Hold } else { RampEasing::Linear },
+                    };
+                    time += r.real(0.1, 1.6);
+                    key
+                })
+                .collect();
+            if r.chance(0.25) {
+                clip.speed = -clip.speed.abs().max(1.0);
+            }
+        }
+        let mut order: Vec<usize> = (0..track.clips.len()).collect();
+        order.sort_by(|&a, &b| old[a].0.total_cmp(&old[b].0));
+        for pair in order.windows(2) {
+            let gap = old[pair[1]].0 - old[pair[0]].1;
+            track.clips[pair[1]].timeline_start = (track.clips[pair[0]].timeline_end() + gap).max(0.0);
         }
     }
 }
@@ -1195,7 +1266,7 @@ pub(crate) fn sample_timelines() -> Vec<Timeline> {
             .flat_map(|t| &t.clips)
             .any(|c| props.iter().any(|p| c.is_keyed(*p)))
     };
-    let mask_crop = (MASK_CROP_FIRST..TOTAL)
+    let mask_crop = (MASK_CROP_FIRST..RAMP_FIRST)
         .find(|&i| keys(i, &Property::MASK) && keys(i, &Property::CROP))
         .expect("a case keying a mask and a crop");
     [
@@ -1254,8 +1325,11 @@ fn case(i: usize, assets: &[Asset]) -> Case {
             format.fit = Fit::Blur;
         }
     }
-    if (MASK_CROP_FIRST..TOTAL).contains(&i) {
+    if (MASK_CROP_FIRST..RAMP_FIRST).contains(&i) {
         mask_crop_for(&mut timeline, i - MASK_CROP_FIRST);
+    }
+    if (RAMP_FIRST..TOTAL).contains(&i) {
+        ramp_for(&mut timeline, i - RAMP_FIRST, assets);
     }
     let dur = timeline.duration();
     let edges: Vec<f64> = (timeline.tracks.iter().flat_map(|t| &t.clips))
@@ -1524,7 +1598,11 @@ fn transitions(c: &Case, assets: &[Asset]) -> Vec<String> {
 }
 
 /// The families that come from the case's structure rather than from argv text.
-const STRUCTURAL: [&str; 44] = [
+const STRUCTURAL: [&str; 48] = [
+    "speed-ramp-hold",
+    "speed-ramp-reversed",
+    "speed-ramp-tail",
+    "still-speed-ramp",
     "muted-track",
     "solo-track",
     "disabled-clip",
@@ -1890,6 +1968,33 @@ fn families(c: &Case, assets: &[Asset], text: &[String; 3], table: &[(&str, &str
         (cover_uncropped(&flat[1], false), "still-cover-uncropped"),
         (chain_tails(&flat[0]).1, "alpha-kept"),
         (chain_tails(&flat[2]).1, "preview-alpha-kept"),
+        // Speed ramps: a hold among the keys, a ramp played backwards, one with a transition's tail
+        // playing on at the last key's speed (picture or sound), and one on screen in a still.
+        (
+            rendered.tracks.iter().flat_map(|t| &t.clips).any(|k| {
+                k.ramp()
+                    .is_some_and(|keys| keys.iter().any(|key| key.easing == RampEasing::Hold))
+            }),
+            "speed-ramp-hold",
+        ),
+        (
+            rendered
+                .tracks
+                .iter()
+                .flat_map(|t| &t.clips)
+                .any(|k| k.is_ramped() && k.is_reversed()),
+            "speed-ramp-reversed",
+        ),
+        (
+            crate::clip_timing::clips_with_fx(&rendered, assets).any(|(_, _, k, fx)| k.is_ramped() && fx.tail > 0.0),
+            "speed-ramp-tail",
+        ),
+        (
+            c.stills
+                .iter()
+                .any(|(t, _)| layers(*t).iter().any(|l| l.active.clip.is_ramped())),
+            "still-speed-ramp",
+        ),
         (
             clips().any(|k| {
                 assets.iter().any(|a| {

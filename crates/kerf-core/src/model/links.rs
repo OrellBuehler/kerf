@@ -18,7 +18,8 @@
 //! | split (`split_clip_linked`) | are split at the same timeline time (if it is inside them); the pieces on each side form a group of their own (`relink_sides`) |
 //! | remove (`with_link_partners`) / ripple delete (`ripple_delete_linked`) | are removed too |
 //! | cut a source span (`cut_clip_range_linked`) | lose the same stretch of *timeline*; the part of a partner that survives it is put back in step with the named clip (a partner whose head was inside the stretch resumes at the cut) |
-//! | speed (`set_speed_linked`) | are retimed by the same ratio, and re-placed about the named clip |
+//! | speed (`set_speed_linked`) | are retimed by the same ratio, and re-placed about the named clip; a ramp is replaced by the constant speed |
+//! | speed ramp (`set_speed_ramp_linked`) | get the same ramp **on the timeline** (a key 3 s into the named clip lands at that moment in a partner that starts elsewhere), then are re-placed as for a speed |
 //! | split and remove (`with_linked_cuts`) | are cut at the same time, if it is inside them |
 //! | roll / slip / slide (`*_linked`) | get the same edit (roll: a partner *pair* sharing the cut), and the whole group clamps to its tightest member |
 //!
@@ -88,10 +89,90 @@ pub struct SkippedDetach {
 /// is measured from the out side.
 fn content_offset(clip: &Clip) -> f64 {
     if clip.is_reversed() {
-        clip.timeline_start + clip.source_out / clip.speed_mag()
+        clip.timeline_start + clip.local_at_along(clip.source_out)
     } else {
-        clip.timeline_start - clip.source_in / clip.speed_mag()
+        clip.timeline_start + clip.local_at_along(-clip.source_in)
     }
+}
+
+/// How far the footage of `clip` moved on the timeline from `was` to `now` (the same clip): the
+/// difference of their [`content_offset`]s — except when either has a speed ramp, where the offset (a
+/// point *outside* the window, reached by running the first key's speed backwards) moves with every
+/// head trim, which moves no footage. Then it is where the footage at `at` plays: `at` is a footage
+/// time both windows hold (see [`step_anchor`]), `None` the middle of what they share.
+fn content_shift(was: &Clip, now: &Clip, at: Option<f64>) -> f64 {
+    if !was.is_ramped() && !now.is_ramped() {
+        return content_offset(now) - content_offset(was);
+    }
+    let at = at.unwrap_or_else(|| {
+        let (lo, hi) = (was.source_in.max(now.source_in), was.source_out.min(now.source_out));
+        if hi > lo {
+            (lo + hi) / 2.0
+        } else {
+            was.source_in
+        }
+    });
+    now.source_to_timeline(at) - was.source_to_timeline(at)
+}
+
+/// Whether two linked clips run at the same pace: one speed, or — when either has a ramp — the same
+/// speed at every moment they share (judged at every key of either and between them), in the same
+/// direction. A pair that does is in step when the same footage plays at the same time ([`step_gap`]).
+fn same_pace(a: &Clip, b: &Clip) -> bool {
+    if !a.is_ramped() && !b.is_ramped() {
+        return (a.speed - b.speed).abs() < STEP_EPS;
+    }
+    if a.is_reversed() != b.is_reversed() {
+        return false;
+    }
+    let (lo, hi) = (a.timeline_start.max(b.timeline_start), a.timeline_end().min(b.timeline_end()));
+    let (lo, hi) = if hi > lo {
+        (lo, hi)
+    } else {
+        (a.timeline_start.min(b.timeline_start), a.timeline_end().max(b.timeline_end()))
+    };
+    let mut marks = vec![lo, hi];
+    for c in [a, b] {
+        if let Some(keys) = c.ramp() {
+            marks.extend(keys.iter().map(|k| c.timeline_start + k.time).filter(|t| *t > lo && *t < hi));
+        }
+    }
+    marks.sort_by(f64::total_cmp);
+    let mids: Vec<f64> = marks.windows(2).map(|w| (w[0] + w[1]) / 2.0).collect();
+    marks.extend(mids);
+    marks
+        .into_iter()
+        .all(|t| (a.speed_at(t - a.timeline_start) - b.speed_at(t - b.timeline_start)).abs() < STEP_EPS)
+}
+
+/// How far apart two clips of one pace play the same footage, in timeline seconds: the difference of
+/// their [`content_offset`]s, or — with a ramp on either — how much later or earlier `b` plays what `a`
+/// plays at one moment they share.
+fn step_gap(a: &Clip, b: &Clip) -> f64 {
+    if !a.is_ramped() && !b.is_ramped() {
+        return (content_offset(a) - content_offset(b)).abs();
+    }
+    let (lo, hi) = (a.timeline_start.max(b.timeline_start), a.timeline_end().min(b.timeline_end()));
+    let t = if hi > lo { (lo + hi) / 2.0 } else { a.timeline_start };
+    (b.source_to_timeline(a.timeline_to_source(t)) - t).abs()
+}
+
+/// For a link group with a ramp in it: the footage time of each asset at which the members' movement
+/// is measured — the middle of the footage every member of that asset holds before and after the edit
+/// (`pairs` is each member's clip before, and after). Members of one asset are then judged at the same
+/// footage, which is what keeps a picture and its sound in step when an edit stretches the time before
+/// it. An asset whose members share no footage has none, and each is judged at its own.
+fn step_anchor(pairs: &[(&Clip, &Clip)]) -> HashMap<Uuid, f64> {
+    let mut held: HashMap<Uuid, (f64, f64)> = HashMap::new();
+    for (was, now) in pairs {
+        let (lo, hi) = (was.source_in.max(now.source_in), was.source_out.min(now.source_out));
+        let slot = held.entry(now.asset_id).or_insert((f64::NEG_INFINITY, f64::INFINITY));
+        *slot = (slot.0.max(lo), slot.1.min(hi));
+    }
+    held.into_iter()
+        .filter(|(_, (lo, hi))| hi > lo)
+        .map(|(asset, (lo, hi))| (asset, (lo + hi) / 2.0))
+        .collect()
 }
 
 fn locked_partner(track: &Track) -> Error {
@@ -265,6 +346,15 @@ fn extent_edit(was: &Clip, now: &Clip, looping: bool) -> Option<ExtentEdit> {
     let mag = now.speed_mag();
     let (head, tail) = if looping {
         (ds, de)
+    } else if was.is_ramped() || now.is_ramped() {
+        // The footage the head gave up plays for as long as `was`'s ramp says; whatever the length
+        // changed by beyond that is the tail (`now`'s ramp has been rebased to the new head).
+        let head = was.local_at_along(if now.is_reversed() {
+            was.source_out - now.source_out
+        } else {
+            now.source_in - was.source_in
+        });
+        (head, now.duration() - was.duration() + head)
     } else if now.is_reversed() {
         ((was.source_out - now.source_out) / mag, (was.source_in - now.source_in) / mag)
     } else {
@@ -492,13 +582,11 @@ impl Timeline {
                     let (Some(pa), Some(pb)) = (prior.get(&a.id), prior.get(&b.id)) else {
                         continue;
                     };
-                    let in_step_before = pa.asset_id == pb.asset_id
-                        && (pa.speed - pb.speed).abs() < STEP_EPS
-                        && (content_offset(pa) - content_offset(pb)).abs() < STEP_EPS;
+                    let in_step_before = pa.asset_id == pb.asset_id && same_pace(pa, pb) && step_gap(pa, pb) < STEP_EPS;
                     if !in_step_before {
                         continue;
                     }
-                    if (a.speed - b.speed).abs() >= STEP_EPS || (content_offset(a) - content_offset(b)).abs() >= STEP_EPS {
+                    if !same_pace(a, b) || step_gap(a, b) >= STEP_EPS {
                         let pair = (*ta.min(tb), *ta.max(tb));
                         if first.is_none_or(|f| pair < f) {
                             first = Some(pair);
@@ -583,13 +671,25 @@ impl Timeline {
 
         let mut shifts: Vec<(Uuid, f64)> = Vec::new();
         for members in index.groups() {
+            // With a ramp in the group the members are judged at footage they share, not at the
+            // offset (`content_shift`).
+            let held: Vec<(&Clip, &Clip)> = members
+                .iter()
+                .filter_map(|id| Some((*prior.get(origin.get(id).unwrap_or(id))?, at.get(id)?.1)))
+                .collect();
+            let shared = if held.iter().any(|(was, now)| was.is_ramped() || now.is_ramped()) {
+                step_anchor(&held)
+            } else {
+                HashMap::new()
+            };
+            let shift_of = |was: &Clip, now: &Clip| content_shift(was, now, shared.get(&now.asset_id).copied());
             // `(clip, its track, how far its offset moved)` for every member that has a before.
             let moved: Vec<(Uuid, usize, f64)> = members
                 .iter()
                 .filter_map(|id| {
                     let (ti, now) = at.get(id)?;
                     let was = prior.get(origin.get(id).unwrap_or(id))?;
-                    Some((*id, *ti, content_offset(now) - content_offset(was)))
+                    Some((*id, *ti, shift_of(was, now)))
                 })
                 .collect();
             if moved.len() < 2 {
@@ -599,7 +699,7 @@ impl Timeline {
             let (authority, reference) = if let Some((first, _, d)) = named.first() {
                 // How far each named member was moved by the edit itself, before any ripple.
                 let as_left = |id: &Uuid, now: f64| match (&left_at, prior.get(origin.get(id).unwrap_or(id))) {
-                    (Some(l), Some(was)) => l.get(id).map_or(now, |c| content_offset(c) - content_offset(was)),
+                    (Some(l), Some(was)) => l.get(id).map_or(now, |c| shift_of(was, c)),
                     _ => now,
                 };
                 let first_left = as_left(first, *d);
@@ -874,6 +974,7 @@ impl Timeline {
         let group = clip.link_id.unwrap_or_else(Uuid::new_v4);
         let mut audio = Clip::new(clip.asset_id, clip.source_in, clip.source_out, clip.timeline_start);
         audio.speed = clip.speed;
+        audio.speed_ramp = clip.speed_ramp.clone();
         // The picture track's fader rode this sound; the destination's rides it now.
         let dest_fader = self.tracks[lane_ix].volume;
         audio.volume = if (picture_fader - dest_fader).abs() <= FADER_EPS {
@@ -966,8 +1067,8 @@ impl Timeline {
             .any(|c| {
                 !without.contains(&c.id)
                     && c.asset_id == picture.asset_id
-                    && (c.speed - picture.speed).abs() < STEP_EPS
-                    && (content_offset(c) - content_offset(picture)).abs() < STEP_EPS
+                    && same_pace(c, picture)
+                    && step_gap(c, picture) < STEP_EPS
                     && spans_overlap(
                         (c.timeline_start, c.timeline_end()),
                         (picture.timeline_start, picture.timeline_end()),
@@ -1325,9 +1426,10 @@ impl Timeline {
             ));
         }
         // Map the timeline split point to a source point honoring speed (the
-        // source advances by |speed| per timeline second), and backwards for a
-        // reversed clip, so the two halves stay gapless and keep total duration.
-        let offset = (at - clip.timeline_start) * clip.speed_mag();
+        // source advances by |speed| per timeline second, or as far as the ramp
+        // takes it), and backwards for a reversed clip, so the two halves stay
+        // gapless and keep total duration.
+        let offset = clip.along(at - clip.timeline_start);
         let (mut left, mut right) = (clip.clone(), clip);
         right.id = Uuid::new_v4();
         right.timeline_start = at;
@@ -1489,7 +1591,18 @@ impl Timeline {
                 "range does not overlap the clip's source window".to_string(),
             ));
         }
-        let removed = (b - a) / clip.speed_mag();
+        // Timeline seconds the cut span plays for: its two ends' distance from the clip's start along
+        // the footage, through the ramp.
+        let removed = if clip.is_ramped() {
+            let (near, far) = if clip.is_reversed() {
+                (clip.source_out - b, clip.source_out - a)
+            } else {
+                (a - clip.source_in, b - clip.source_in)
+            };
+            clip.local_at_along(far) - clip.local_at_along(near)
+        } else {
+            (b - a) / clip.speed_mag()
+        };
 
         let (head, tail) = if clip.is_reversed() {
             ((b, clip.source_out), (clip.source_in, a))
@@ -1518,7 +1631,7 @@ impl Timeline {
             // The animation is clip-local: the tail starts after the head and the removed
             // middle, so it opens on the pose the whole clip had there (without this it
             // replayed the animation from its first key; a sole-surviving tail is a head trim).
-            p.rebase_animation((head.1 - head.0 + (b - a)) / clip.speed_mag());
+            p.rebase_animation(clip.local_at_along(head.1 - head.0 + (b - a)));
             if head_ok {
                 p.id = Uuid::new_v4();
                 p.fade_in = 0.0;
@@ -1666,8 +1779,9 @@ impl Timeline {
     /// earlier or later than the named clip has its offset to it stretched by the same
     /// ratio, the whole group re-timed about the named clip — and what the longer
     /// or shorter clips push is [`Timeline::conform_links`]'s, after the ripple, with
-    /// the named clip the authority. Errors when a partner's new speed would be zero or
-    /// not finite, or a partner is on a locked track. Returns the named clip.
+    /// the named clip the authority. A constant speed replaces a ramp, on every clip of the
+    /// group. Errors when a partner's new speed would be zero or not finite, or a partner is
+    /// on a locked track. Returns the named clip.
     pub fn set_speed_linked(&mut self, clip_id: Uuid, speed: f64) -> Result<Clip> {
         if !speed.is_finite() || speed == 0.0 {
             return Err(Error::InvalidArgument("speed must be a non-zero, finite number".to_string()));
@@ -1693,8 +1807,66 @@ impl Timeline {
             updates.push((partner, new));
         }
         self.tracks[ti].clips[ci].speed = speed;
+        self.tracks[ti].clips[ci].speed_ramp.clear();
         for (partner, new) in updates {
-            self.clip_mut(partner).expect("a partner is on the timeline").speed = new;
+            let p = self.clip_mut(partner).expect("a partner is on the timeline");
+            p.speed = new;
+            p.speed_ramp.clear();
+        }
+        Ok(self.tracks[ti].clips[ci].clone())
+    }
+
+    /// Give `clip_id` a speed ramp (or clear it with no keys) and every linked partner the **same
+    /// ramp on the timeline**: a key 3 s into the named clip is a key at that moment of the
+    /// timeline in a partner that starts earlier or later, so the slow-motion happens at the same
+    /// time in the picture and its sound. A partner that runs at another pace than the named clip
+    /// (it plays 2× where the named clip opens at 1×) keeps the ratio, as [`Timeline::set_speed_linked`]
+    /// does, and a partner keeps its own direction. The windows stay; each clip's length changes, and
+    /// where that leaves the rest is the ripple's and [`Timeline::conform_links`]'s, with the named
+    /// clip the authority. Errors on bad keys, a locked partner, or a partner whose keys would land
+    /// outside the speeds a clip can play at. Returns the named clip.
+    pub fn set_speed_ramp_linked(&mut self, clip_id: Uuid, keys: Vec<SpeedKey>) -> Result<Clip> {
+        let keys = check_speed_ramp(keys)?;
+        self.ensure_editable(clip_id)?;
+        let (ti, ci) = self.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
+        let named = self.tracks[ti].clips[ci].clone();
+        if keys.is_empty() && named.speed_ramp.is_empty() {
+            return Err(Error::InvalidArgument("the clip has no speed ramp to clear".to_string()));
+        }
+        let mut updates: Vec<(Uuid, Vec<SpeedKey>)> = Vec::new();
+        for partner in self.unlocked_partners(clip_id, &HashSet::from([clip_id]))? {
+            let p = self.clip(partner).expect("a partner is on the timeline");
+            let shift = named.timeline_start - p.timeline_start;
+            // How fast the partner runs where the named clip opens, against how fast that clip does.
+            let ratio = p.speed_at(shift) / named.speed_at(0.0);
+            let ratio = if (ratio - 1.0).abs() < 1e-9 { 1.0 } else { ratio };
+            let mapped: Vec<SpeedKey> = keys
+                .iter()
+                .map(|k| SpeedKey {
+                    time: k.time + shift,
+                    speed: k.speed * ratio,
+                    easing: k.easing,
+                })
+                .collect();
+            if !mapped.is_empty() && !ramp_is_valid(&mapped) {
+                let outside = mapped
+                    .iter()
+                    .map(|k| k.speed)
+                    .find(|s| !(super::MIN_SPEED..=super::MAX_SPEED).contains(s));
+                return Err(Error::InvalidArgument(match outside {
+                    Some(s) => format!(
+                        "a linked clip would end up at {s:.3}× — a clip's speed stays within {}× to {}×",
+                        super::MIN_SPEED,
+                        super::MAX_SPEED
+                    ),
+                    None => "a linked clip is too far from the named one for the same ramp to reach it".to_string(),
+                }));
+            }
+            updates.push((partner, mapped));
+        }
+        self.tracks[ti].clips[ci].speed_ramp = keys;
+        for (partner, mapped) in updates {
+            self.clip_mut(partner).expect("a partner is on the timeline").speed_ramp = mapped;
         }
         Ok(self.tracks[ti].clips[ci].clone())
     }
@@ -1808,14 +1980,31 @@ impl Timeline {
         Ok(out)
     }
 
+    /// The speeds `clip_id` and `partner` slip at: a slip is the same *timeline* shift of the footage
+    /// in each, so source seconds convert by the ratio of the two. Two clips on the same ramp slip
+    /// alike (1 and 1); a ramp against another pace has no one ratio and refuses.
+    fn slip_speeds(&self, clip_id: Uuid, partner: Uuid) -> Result<(f64, f64)> {
+        let c = self.clip(clip_id).expect("slip_range found the clip");
+        let p = self.clip(partner).expect("a partner is on the timeline");
+        if !c.is_ramped() && !p.is_ramped() {
+            return Ok((c.speed_mag(), p.speed_mag()));
+        }
+        if same_pace(c, p) {
+            return Ok((1.0, 1.0));
+        }
+        Err(Error::InvalidArgument(format!(
+            "the linked clip on {} runs at another pace than a speed-ramped clip, so a slip has no one ratio between them — slip them one at a time",
+            self.track_name_of(partner)
+        )))
+    }
+
     /// [`Timeline::slip_range`] for the group, in the named clip's source seconds: a
     /// partner's range is converted by the ratio of the two speeds (a slip is the
     /// same *timeline* shift of the footage in each), then intersected.
     pub fn slip_range_linked(&self, clip_id: Uuid, footage: &SourceLimits) -> Result<DeltaRange> {
         let mut range = self.slip_range(clip_id, footage)?;
-        let mag = self.clip(clip_id).expect("slip_range found the clip").speed_mag();
         for partner in self.slip_partners(clip_id, footage)? {
-            let p_mag = self.clip(partner).expect("a partner is on the timeline").speed_mag();
+            let (mag, p_mag) = self.slip_speeds(clip_id, partner)?;
             let theirs = self.slip_range(partner, footage)?;
             range = range.intersect(&theirs.scaled(mag / p_mag).on_linked(&self.track_name_of(partner)));
         }
@@ -1833,11 +2022,10 @@ impl Timeline {
             return self.slip_clip(clip_id, delta, footage);
         }
         let applied = self.slip_range_linked(clip_id, footage)?.resolve(delta, "slip the footage")?;
-        let mag = self.clip(clip_id).expect("slip_range found the clip").speed_mag();
         let mut scratch = self.clone();
         let mut clips = scratch.slip_clip(clip_id, applied, footage)?.clips;
         for partner in partners {
-            let p_mag = scratch.clip(partner).expect("a partner is on the timeline").speed_mag();
+            let (mag, p_mag) = self.slip_speeds(clip_id, partner)?;
             let theirs = applied * p_mag / mag;
             if theirs.abs() > DIFF_EPS {
                 clips.extend(scratch.slip_clip(partner, theirs, footage)?.clips);

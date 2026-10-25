@@ -13,6 +13,7 @@ import { cutsOf, previewEdit, sourceLimits, type Cut, type GestureEdit } from '.
 import { linkPartners } from './link-groups';
 import type { Asset, Clip, Timeline } from './types';
 import { clipDuration } from './types';
+import { meanSpeed } from './speed-ramp';
 
 const endOf = (c: Clip) => c.timeline_start + clipDuration(c);
 const capital = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
@@ -157,8 +158,8 @@ export function planKeyEdit(
 		const clip = o.timeline.tracks.flatMap((t) => t.clips).find((c) => c.id === id);
 		if (!clip) return { ok: false, reason: NEEDS_CLIP };
 		edit = { tool, clipId: id };
-		const speed = Math.max(Math.abs(clip.speed ?? 1), 0.01);
-		// A slip is in source seconds; the footage runs `speed` source seconds per timeline second.
+		const speed = meanSpeed(clip);
+		// A slip is in source seconds; the footage runs `speed` source seconds per timeline second (a ramp's average).
 		delta = tool === 'slip' ? dir * frame * speed : dir * frame;
 		subject = id;
 	}

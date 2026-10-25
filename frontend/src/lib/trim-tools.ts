@@ -43,7 +43,8 @@ import { gestureReason } from './link-ui';
 import { trim } from './link-ops';
 import { formatTime, type TimeMode } from './time-format';
 import type { Asset, Clip, SplitSide, StreamKind, Timeline, Track } from './types';
-import { clipDuration, GENERATED_ASSET } from './types';
+import { GENERATED_ASSET } from './types';
+import { clipDuration, isReversed, lastFrameSpan, meanSpeed, speedMag } from './speed-ramp';
 import { MAX_TITLE_SECONDS } from './title-clips';
 
 /** The tools that move a boundary rather than a whole clip. */
@@ -74,8 +75,9 @@ export const TOOL_HINT: Record<TrimTool, string> = {
 export const CUT_REACH_PX = 8;
 
 const endOf = (c: Clip) => c.timeline_start + clipDuration(c);
-const speedMag = (c: Pick<Clip, 'speed'>) => Math.max(Math.abs(c.speed ?? 1), 0.01);
-const reversed = (c: Pick<Clip, 'speed'>) => (c.speed ?? 1) < 0;
+const reversed = isReversed;
+/** A ghost's average speed, for turning a slip's source seconds back into timeline ones. */
+const meanOf = (c: Clip | undefined) => (c ? meanSpeed(c) : 1);
 /** A deep copy that reads through a reactive proxy. `structuredClone` refuses one, and
  *  the timeline the editor holds *is* `$state` — the edits write to what they are handed,
  *  so a preview has to work on a plain copy. (The data is JSON all the way down.) */
@@ -352,7 +354,8 @@ export function previewEdit(
  *  dragging right shows *earlier* footage — a negative `delta` — and a reversed
  *  clip needs no special case: the backend's sign means the same on screen for
  *  both. Rounded to a frame of the cut, once, then scaled by speed (a 2× clip
- *  moves its picture two source seconds for every second the pointer covers). */
+ *  moves its picture two source seconds for every second the pointer covers; a ramped
+ *  one at its average speed — pass `meanSpeed` as `speed`). */
 export function slipDelta(dt: number, clip: Pick<Clip, 'speed'>, fps: number): number {
 	return 0 - snapToFrame(dt, fps) * speedMag(clip);
 }
@@ -397,7 +400,7 @@ export function readoutFor(p: EditPreview, fps: number, mode?: TimeMode): Readou
 	}
 	const me = g.find((x) => x.role === 'clip');
 	if (p.edit.tool === 'slip') {
-		const mag = me ? speedMag(me.clip) : 1;
+		const mag = meanOf(me?.clip);
 		const span = me ? ` · in ${tc(me.clip.source_in)} → out ${tc(me.clip.source_out)}` : '';
 		return { title: `${verb} ${deltaLabel(p.applied / mag, fps)}${span}${along}`, detail, tone };
 	}
@@ -414,7 +417,7 @@ export const refusalNotice = (p: EditPreview): string => capital(p.why);
 export function limitNotice(p: EditPreview, fps: number): string {
 	const tool = p.edit.tool;
 	if (Math.abs(p.applied) <= DIFF_EPS) return `Can't ${ACT[tool]} ${p.requested > 0 ? 'later' : 'earlier'} — ${p.why}`;
-	return `${TOOL_VERB[tool]} stopped at ${deltaLabel(tool === 'slip' ? p.applied / speedMag(p.ghosts[0]?.clip ?? {}) : p.applied, fps)} — ${p.why}`;
+	return `${TOOL_VERB[tool]} stopped at ${deltaLabel(tool === 'slip' ? p.applied / meanOf(p.ghosts[0]?.clip) : p.applied, fps)} — ${p.why}`;
 }
 
 // ---- the monitor: the frames either side of the edit ---------------------------
@@ -423,7 +426,7 @@ export function limitNotice(p: EditPreview, fps: number): string {
  *  `source_in` and closes one frame short of `source_out`; a reversed one plays the
  *  window backwards, so the two swap. A frame is the cut's (`fps`), scaled by speed. */
 export function edgeFrameTime(clip: Clip, edge: 'first' | 'last', fps: number): number {
-	const step = Number.isFinite(fps) && fps > 0 ? speedMag(clip) / fps : 0;
+	const step = Number.isFinite(fps) && fps > 0 ? lastFrameSpan(clip, fps) : 0;
 	const nearOut = Math.max(clip.source_in, clip.source_out - step);
 	const head = reversed(clip) ? nearOut : clip.source_in;
 	const tail = reversed(clip) ? clip.source_in : nearOut;

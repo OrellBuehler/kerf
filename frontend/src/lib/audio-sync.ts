@@ -3,6 +3,7 @@
  * up front keeps the menu from offering what would only fail. */
 
 import { linkPartners } from './link-groups';
+import { isRamped } from './speed-ramp';
 import type { Asset, AudioSync, Timeline } from './types';
 
 export interface SyncOffer {
@@ -35,7 +36,7 @@ export function syncOffer(
 	if (!ref || !own) return offer('The clips are not on the timeline');
 	for (const { clip } of [ref, own]) {
 		if (!assets.find((a) => a.id === clip.asset_id)?.streams.some((s) => s.kind === 'audio')) return offer('Both clips need sound');
-		if ((clip.speed ?? 1) !== 1) return offer('Both clips need to play at normal speed');
+		if ((clip.speed ?? 1) !== 1 || isRamped(clip)) return offer('Both clips need to play at normal speed');
 	}
 	const partners = linkPartners(timeline as Timeline, clickedId);
 	if (partners.includes(ref.clip.id)) return offer('The clips are linked — unlink them first');

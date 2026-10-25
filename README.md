@@ -161,7 +161,7 @@ Now ask the agent to work on the project you have open — _"skim the interview 
 the dead air, and drop in captions."_ It will claim a task, use the tools below, and hand
 back a reviewable result.
 
-### The tools (189)
+### The tools (190)
 
 <details>
 <summary><b>See / analyze</b></summary>
@@ -199,7 +199,7 @@ score, fitted to the cuts) ·
 <details>
 <summary><b>Style & animate</b></summary>
 
-`set_volume` · `set_fade` · `set_speed` · `set_transform` · `set_transform_at` · `set_color` ·
+`set_volume` · `set_fade` · `set_speed` · `set_speed_ramp` (slow motion / speed-up that eases) · `set_transform` · `set_transform_at` · `set_color` ·
 `set_grade` (curves, colour wheels, a .cube LUT) · `set_transition` · `set_mask` · `set_video_effects` · `set_audio_effects` ·
 `set_keyframes` · `add_keyframe` · `set_keyframe_easing` · `set_property_keyframes` · `set_property_tracks` · `copy_keyframes` · `clear_keyframes` · `set_reframe` · `clear_reframe` ·
 `set_reframe_keyframes` · `add_reframe_keyframe` · `set_track_volume` · `set_track_pan` ·

@@ -103,6 +103,7 @@ import type {
 	SettingsPatch,
 	SettingsView,
 	SmartCropProgress,
+	SpeedKey,
 	SplitSide,
 	StagedEdit,
 	StagedUndone,
@@ -185,6 +186,7 @@ import {
 } from './edit-modes';
 import { dissolveAllOrphans, linkPartners, withLinkPartners } from './link-groups';
 import * as ops from './link-ops';
+import { isRamped } from './speed-ramp';
 import { landingLocks } from './track-locks';
 import { runEdit } from './link-ops';
 import { sourceLimits } from './trim-tools';
@@ -2880,6 +2882,23 @@ export async function setSpeed(clipId: string, speed: number, link?: boolean): P
 	return invoke<Timeline>('set_speed', { clipId, speed, link });
 }
 
+/** Give a clip a speed ramp: keys of a clip-local timeline time, a speed magnitude and an easing (`linear` or
+ *  `hold`), sorted by the backend and refused when malformed (a duplicate time, a speed outside 0.01-100x, more
+ *  than 16 keys). Empty `keys` clears the ramp. The source window stays, so the clip's length changes (and
+ *  ripples) as a speed change does; linked partners get the same ramp unless `link` is false. A constant `setSpeed`
+ *  clears it. */
+export async function setSpeedRamp(clipId: string, keys: SpeedKey[], link?: boolean): Promise<Timeline> {
+	if (!inTauri()) {
+		const found = locate(devTimeline, clipId);
+		if (found && titleOf(found[0].clips[found[1]]) && keys.length > 0) {
+			throw new Error('that edit would leave the timeline invalid: the clip is a title, which plays at its own speed');
+		}
+		devRun((tl) => ops.setSpeedRamp(tl, devEnv(undefined, link), clipId, keys));
+		return snapshot();
+	}
+	return invoke<Timeline>('set_speed_ramp', { clipId, keys, link });
+}
+
 /** Update a clip's geometric transform; only the provided fields change. */
 export async function setTransform(clipId: string, patch: Partial<Transform>): Promise<Timeline> {
 	if (!inTauri()) {
@@ -4118,7 +4137,7 @@ export async function syncClipsByAudio(referenceId: string, clipId: string, forc
 		const [r, c] = [ref[0].clips[ref[1]], own[0].clips[own[1]]];
 		for (const x of [r, c]) {
 			if (!assetById(x.asset_id)?.streams.some((st) => st.kind === 'audio')) throw new Error(`clip ${x.id} has no sound to sync by`);
-			if ((x.speed ?? 1) !== 1) throw new Error(`clip ${x.id} plays at another speed or reversed; sync needs both at normal speed`);
+			if ((x.speed ?? 1) !== 1 || isRamped(x)) throw new Error(`clip ${x.id} plays at another speed or reversed; sync needs both at normal speed`);
 		}
 		const start = r.timeline_start - r.source_in + c.source_in;
 		if (start < 0) throw new Error(`in sync the clip would start ${(-start).toFixed(3)}s before the timeline does; move the reference later first`);

@@ -1,7 +1,10 @@
 import { describe, expect, test } from 'bun:test';
 import type { SourceLimits } from './edit-modes';
+import { trimEdit } from './frames';
+import * as ops from './link-ops';
 import { linkedTrimBounds, linkedTrimPreview, type LinkedTrimOptions } from './linked-trim';
 import { rippleTrimPreview, trimBounds } from './ripple-trim';
+import { clipDuration } from './speed-ramp';
 import { MAX_TITLE_SECONDS } from './title-clips';
 import type { Clip, StreamKind, Timeline, Track } from './types';
 import { GENERATED_ASSET } from './types';
@@ -317,5 +320,45 @@ describe('linkedTrimPreview without links is rippleTrimPreview', () => {
 				}
 			}
 		}
+	});
+});
+
+// A ramped clip's head trim rides the ramp (`Project::trim`'s `follow_head`): the far edge stays where the
+// pointer put it, so a neighbour just past it is no overlap.
+describe('linkedTrimPreview on a ramped clip', () => {
+	const ramp = [{ time: 0, speed: 0.5 }, { time: 2, speed: 3 }];
+	const ramped = (id: string, link?: string): Clip => ({ ...clip(id, 'x', 0, 12, 0, link), speed_ramp: structuredClone(ramp) });
+	const near = (a: number, b: number) => expect(Math.abs(a - b)).toBeLessThan(1e-9);
+	const env: ops.EditEnv = { ripple: false, links: true, footage, hasAudio: () => true };
+
+	test('a left-edge drag rebases the ramp, so the tail stays and a neighbour past it is not hit', () => {
+		const t: Timeline = { tracks: [lane('video', 'V1', [ramped('n'), clip('m', 'x', 40, 44, 4.9)])] };
+		const p = linkedTrimPreview(t, 'n', 'l', 1, opts({ links: false }))!;
+		expect(p.ok).toBe(true);
+		const n = p.ghosts.find((g) => g.id === 'n')!;
+		near(n.start, 1);
+		near(n.start + n.dur, clipDuration(t.tracks[0].clips[0]));
+		near(n.start + n.dur, 4.8333333333333333);
+		const real = ops.trim(t, { ...env, links: false }, 'n', trimEdit(t.tracks[0].clips[0], 'l', 1).source_in, null, 1);
+		const done = real.timeline.tracks[0].clips.find((c) => c.id === 'n')!;
+		near(n.start + n.dur, done.timeline_start + clipDuration(done));
+	});
+
+	test('a linked partner sharing the edge is carried off the rebased clip, as the backend does', () => {
+		const t: Timeline = {
+			tracks: [
+				lane('video', 'V1', [ramped('n', 'L'), clip('m', 'x', 40, 44, 4.9)]),
+				lane('audio', 'A1', [ramped('p', 'L')])
+			]
+		};
+		const p = linkedTrimPreview(t, 'n', 'l', 1, opts())!;
+		expect(p.ok).toBe(true);
+		const real = ops.trim(t, env, 'n', trimEdit(t.tracks[0].clips[0], 'l', 1).source_in, null, 1);
+		for (const g of p.ghosts) {
+			const done = real.timeline.tracks.flatMap((x) => x.clips).find((c) => c.id === g.id)!;
+			near(g.start, done.timeline_start);
+			near(g.dur, clipDuration(done));
+		}
+		expect(p.ghosts.map((g) => g.id).sort()).toEqual(['n', 'p']);
 	});
 });

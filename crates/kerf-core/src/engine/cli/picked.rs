@@ -47,8 +47,8 @@ use crate::model::{Asset, Timeline};
 use crate::planner::{PlanRequest, Planner};
 use crate::render_plan::CompositeColorPolicy;
 
-const W: u32 = 64;
-const H: u32 = 32;
+pub(super) const W: u32 = 64;
+pub(super) const H: u32 = 32;
 
 /// Bit `k` of the frame number plus one is the `k`-th eighth of the picture's width, white for
 /// 1 (so no frame reads as the black canvas, which is 0).
@@ -56,7 +56,7 @@ const BARCODE: &str = "geq=lum='if(bitand(trunc((N+1)/pow(2,trunc(X*8/W))),1),23
 
 /// The code a rendered frame carries on pixel row `y`: `frame number + 1`, or 0 for black
 /// (nothing drawn).
-fn code(frame: &[u8], y: u32) -> u32 {
+pub(super) fn code(frame: &[u8], y: u32) -> u32 {
     let row = (y * W) as usize * 3;
     (0..8u32)
         .filter(|k| frame[row + ((2 * k + 1) * W / 16) as usize * 3] > 125)
@@ -64,7 +64,7 @@ fn code(frame: &[u8], y: u32) -> u32 {
         .sum()
 }
 
-fn run(args: &[&str]) {
+pub(super) fn run(args: &[&str]) {
     let made = command(&ffmpeg_bin())
         .args(["-hide_banner", "-loglevel", "error", "-y"])
         .args(args)
@@ -74,25 +74,25 @@ fn run(args: &[&str]) {
 }
 
 /// A lossless clip as a source: its asset and the number of each frame in file order.
-struct Source {
-    asset: Asset,
-    numbers: Vec<u32>,
+pub(super) struct Source {
+    pub(super) asset: Asset,
+    pub(super) numbers: Vec<u32>,
 }
 
 /// How a source is written.
 #[derive(Clone, Copy)]
-struct Kind {
+pub(super) struct Kind {
     /// Every frame whose number mod 5 is 3 is left out, so the timestamps have gaps.
     vfr: bool,
     /// The container's extension.
     ext: &'static str,
 }
 
-const MP4: Kind = Kind { vfr: false, ext: "mp4" };
+pub(super) const MP4: Kind = Kind { vfr: false, ext: "mp4" };
 
 /// A lossless `W`x`H` clip of `secs` seconds at `fps` (the text ffmpeg is given), frame `n`
 /// carrying the code `n + 1`.
-fn numbered(dir: &Path, fps: &str, secs: u32, kind: Kind) -> Source {
+pub(super) fn numbered(dir: &Path, fps: &str, secs: u32, kind: Kind) -> Source {
     let name = format!("numbered-{fps}-{secs}{}.{}", if kind.vfr { "-vfr" } else { "" }, kind.ext);
     let path = dir.join(name);
     let select = if kind.vfr { ",select='not(eq(mod(n,5),3))'" } else { "" };
@@ -136,7 +136,7 @@ fn numbered(dir: &Path, fps: &str, secs: u32, kind: Kind) -> Source {
 }
 
 /// A black clip that keeps the canvas running under the one being tested.
-fn filler(dir: &Path) -> Asset {
+pub(super) fn filler(dir: &Path) -> Asset {
     let path = dir.join("filler.mp4");
     if !path.exists() {
         let graph = format!("color=c=black:s={W}x{H}:r=30:d=8,format=yuv420p");

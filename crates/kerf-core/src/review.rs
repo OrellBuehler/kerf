@@ -262,6 +262,19 @@ fn tail_source(c: &Clip) -> f64 {
     }
 }
 
+/// How far apart the speeds of two neighbouring clips are where they meet: the difference of their
+/// speeds, or, when either changes its rate over its length, of the speeds at the cut (a clip that plays
+/// the other way round is infinitely far).
+fn pace_gap(a: &Clip, b: &Clip) -> f64 {
+    if !a.is_ramped() && !b.is_ramped() {
+        return (a.speed - b.speed).abs();
+    }
+    if a.is_reversed() != b.is_reversed() {
+        return f64::INFINITY;
+    }
+    (a.speed_at(a.duration()) - b.speed_at(0.0)).abs()
+}
+
 fn in_silence(analysis: &AssetAnalysis, t: f64) -> bool {
     analysis
         .silence_segments
@@ -347,8 +360,8 @@ impl Cut<'_> {
     /// Whether `b` plays on from where `a` stopped — a split nobody took anything out of, which
     /// is no cut at all to the eye or the ear.
     fn continues(&self, a: &Clip, b: &Clip) -> bool {
-        let tolerance = self.frame / 2.0 * a.speed_mag();
-        a.asset_id == b.asset_id && (a.speed - b.speed).abs() < 1e-9 && (head_source(b) - tail_source(a)).abs() <= tolerance
+        let tolerance = self.frame / 2.0 * a.speed_at(a.duration());
+        a.asset_id == b.asset_id && pace_gap(a, b) < 1e-9 && (head_source(b) - tail_source(a)).abs() <= tolerance
     }
 
     fn flash_frames(&self, issues: &mut Vec<ReviewIssue>) -> std::result::Result<(), String> {
@@ -510,11 +523,11 @@ impl Cut<'_> {
                 if a.asset_id != b.asset_id || !self.is_footage(a) || !self.meet(a, b) || b.transition_in.is_some() {
                     continue;
                 }
-                if a.is_reversed() || b.is_reversed() || (a.speed - b.speed).abs() > 1e-6 {
+                if a.is_reversed() || b.is_reversed() || pace_gap(a, b) > 1e-6 {
                     continue;
                 }
                 let gap = b.source_in - a.source_out;
-                if gap <= self.frame * a.speed_mag() || gap > JUMP_MAX_SOURCE_GAP {
+                if gap <= self.frame * a.speed_at(a.duration()) || gap > JUMP_MAX_SOURCE_GAP {
                     continue;
                 }
                 if reframed(a, b) {
@@ -1203,6 +1216,35 @@ mod tests {
         let img = img_asset(Uuid::new_v4());
         let t = on_v1(vec![Clip::new(img.id, 0.0, 2.0, 0.0), Clip::new(img.id, 3.0, 5.0, 2.0)]);
         assert!(found(&inputs(t, vec![img], vec![]), Check::JumpCut).is_empty());
+    }
+
+    #[test]
+    fn a_ramped_clip_is_compared_at_the_speed_it_ends_and_begins_at() {
+        use crate::model::SpeedKey;
+        let a = av_asset(Uuid::new_v4(), 100.0);
+        let crawl = |at: f64, source_in: f64| {
+            let mut c = Clip::new(a.id, source_in, source_in + 1.0, at);
+            c.speed_ramp = vec![SpeedKey::new(0.0, 0.5)];
+            c
+        };
+        // Both crawl at half speed (2 s each) and the second resumes a second later in the footage: a jump.
+        let t = on_v1(vec![crawl(0.0, 10.0), crawl(2.0, 12.0)]);
+        let issues = found(&inputs(t, vec![a.clone()], vec![]), Check::JumpCut);
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        // One at full speed is not the same shot carrying on.
+        let mut fast = Clip::new(a.id, 12.0, 13.0, 2.0);
+        fast.speed = 1.0;
+        let t = on_v1(vec![crawl(0.0, 10.0), fast]);
+        assert!(found(&inputs(t, vec![a.clone()], vec![]), Check::JumpCut).is_empty());
+        // A ramped clip split in two plays on across the cut: nothing jumps, nothing is a "hard cut".
+        let mut ramp_clip = Clip::new(a.id, 10.0, 16.0, 0.0);
+        ramp_clip.speed_ramp = vec![SpeedKey::new(0.0, 1.0), SpeedKey::new(4.0, 0.25)];
+        let mut t = on_v1(vec![ramp_clip.clone()]);
+        let (left, right) = t.split_clip(ramp_clip.id, 2.0).unwrap();
+        assert!(found(&inputs(t.clone(), vec![a.clone()], vec![]), Check::JumpCut).is_empty());
+        let r = review(&inputs(t, vec![a.clone()], vec![]), None, &[Check::HardAudioCut]);
+        assert!(r.issues.is_empty(), "{:?}", r.issues);
+        assert_eq!(left.timeline_end(), right.timeline_start);
     }
 
     #[test]

@@ -265,6 +265,17 @@ pub(crate) fn one_line(s: &str) -> String {
         .to_string()
 }
 
+/// The one rate an interchange format can hold for `clip`: its speed, or — for a clip whose rate
+/// changes over its length, which no format here can write — its average, so the event still covers
+/// the footage it plays, in its direction.
+pub(crate) fn export_speed(clip: &Clip) -> f64 {
+    if clip.is_ramped() {
+        clip.mean_speed().copysign(clip.speed)
+    } else {
+        clip.speed
+    }
+}
+
 /// What a clip carries that an interchange format has no field for, one name
 /// per kind (so the report counts clips per kind).
 pub(crate) fn clip_extras(clip: &Clip) -> Vec<&'static str> {

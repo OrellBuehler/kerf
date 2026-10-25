@@ -178,7 +178,8 @@ a press away from any cut is a click), lit on hover; the cut follows the pointer
 offset it was grabbed at, snapped (playhead / beats / edges other than the pair's own) and
 frame-rounded once. *Slip* is `slipDelta`: the content follows the pointer (drag right =
 earlier footage = a negative backend `delta`, reversed clips included), rounded in
-timeline frames then × speed, and the clip's filmstrip / waveform redraw from the slipped
+timeline frames then × speed (a ramped clip's *mean* speed: its footage moves by source
+seconds and its keys are untouched, so the length stays), and the clip's filmstrip / waveform redraw from the slipped
 window as you drag. *Slide* snaps the clip's start as a move does, minus the clips that
 travel with it (`slideMembers`). The pointer is **held to the range** (`holdToRange` over
 `rollRange` / `slipRange` / `slideRange`), not refused, and the ghost is the **outcome**:
@@ -368,10 +369,11 @@ the marker's colour, one tick per spot).
 **Waveforms** are one `<canvas>` per audio clip covering only the on-screen part of it
 plus overscan (`ClipWaveform.svelte`; a one-hour clip at 96 px/s is 345 600 px, which no
 canvas holds). `waveform-view.ts` is the pure geometry: `sourceAt` maps clip pixels to
-source seconds through `source_in`/`source_out`, speed and reverse (a reversed clip is
+source seconds through `source_in`/`source_out`, speed (a **speed ramp** through `along` /
+`localAtAlong`, `speed-ramp.ts`) and reverse (a reversed clip is
 read through the mapping, mirrored, never flipped), the bucket width is the widest rung
 (the backend's 2 / 10 / 40 / 100 ms levels, then doubling) within 1.5 device pixels
-(DPR capped at 2), and what is fetched is fixed **tiles** of 2048 buckets aligned to the
+(DPR capped at 2; a ramped clip is drawn at its slowest key's, `slowestSpeed`), and what is fetched is fixed **tiles** of 2048 buckets aligned to the
 *source* clock — so a scroll, a trim, or a split's two halves land on cached tiles.
 `waveform-cache.ts` (injectable fetcher; the app's instance is `waveforms.ts`) caches by
 asset + window + bucket count, joins in-flight requests, runs three at a time newest
@@ -611,3 +613,12 @@ the plan runs over). A refusal is shown in the card *and* noticed once; Apply is
 `sample-music.ts` is the harness's song (`music.mp3` in the library: 120 BPM, 29 bars, a loop and a
 bridge, so a 20.5 s picture fits exactly), and **`?music=1`** lays it on a track A2 of its own so the
 bar ticks and the menu entry are there at once.
+
+**A ramped clip** (`Clip.speed_ramp`, `speed-ramp.ts`; the editor is the Inspector's, see frontend.md) wears a badge in
+the constant speed's place — a small curve of its keys on the log speed axis (`miniCurve`) and its mean speed (`1.9×`,
+`⟲` when reversed; the tooltip gives the range). Everything that draws footage on the timeline reads source time through
+the ramp: filmstrip slots and waveform columns (`sourceAt` over `along`), the scene / silence / beat marks
+(`sourceToTimeline`), captions and transcript lines, the clip's width (`clipDuration`) and the edge-trim bounds
+(`headTime` / `tailTime`, the time the ramp takes to play the handle). An edge trim on a ramped clip commits one `trim`
+and `Project::trim` rebases the ramp when the head moves (`Clip::follow_head`; the harness: `trimRamp`), so the far edge stays where the pointer put it;
+`rippleTrimPreview` and `linkedTrimPreview` apply the same rebase to their scratch copies (`linkedTrimPreview` before `carryExtentEdit`, which reads the trimmed clip, so a partner is carried off the rebased ramp and a neighbour just past the far edge is not a false overlap).

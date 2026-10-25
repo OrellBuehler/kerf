@@ -11,6 +11,7 @@
 // identity, not position: an edit carries the *change* to the partners and never
 // forces them to line up. A partner on a locked track refuses the whole edit.
 
+import { clipDuration, clipRamp, isRamped, isReversed, sourceToTimeline, speedAt, timelineToSource } from './speed-ramp';
 import type { Clip, Timeline, Track } from './types';
 
 /** kerf-core's `STEP_EPS`: offsets closer than this are the same offset. */
@@ -236,8 +237,67 @@ export function unlinkClips(timeline: Timeline, ids: string[]): number {
  *  the timeline. A reversed clip plays its window backwards, so it is measured from the
  *  out side (`content_offset` in kerf-core). */
 export function contentOffset(clip: Clip): number {
-	const mag = Math.max(Math.abs(clip.speed ?? 1), 0.01);
-	return (clip.speed ?? 1) < 0 ? clip.timeline_start + clip.source_out / mag : clip.timeline_start - clip.source_in / mag;
+	return sourceToTimeline(clip, 0);
+}
+
+/** How far the footage of a clip moved on the timeline from `was` to `now` (the same clip): the difference of
+ *  their `contentOffset`s — except when either has a speed ramp, where the offset (a point *outside* the window,
+ *  reached by running the first key's speed backwards) moves with every head trim, which moves no footage. Then it
+ *  is where the footage at `at` plays: `at` is a footage time both windows hold (`stepAnchor`), `undefined` the
+ *  middle of what they share (`content_shift`). */
+export function contentShift(was: Clip, now: Clip, at?: number): number {
+	if (!isRamped(was) && !isRamped(now)) return contentOffset(now) - contentOffset(was);
+	let src = at;
+	if (src === undefined) {
+		const [lo, hi] = [Math.max(was.source_in, now.source_in), Math.min(was.source_out, now.source_out)];
+		src = hi > lo ? (lo + hi) / 2 : was.source_in;
+	}
+	return sourceToTimeline(now, src) - sourceToTimeline(was, src);
+}
+
+const endOf = (c: Clip) => c.timeline_start + clipDuration(c);
+
+/** Whether two linked clips run at the same pace: one speed, or — when either has a ramp — the same speed at
+ *  every moment they share (judged at every key of either and between them), in the same direction. A pair that
+ *  does is in step when the same footage plays at the same time (`stepGap`) (`same_pace`). */
+export function samePace(a: Clip, b: Clip): boolean {
+	if (!isRamped(a) && !isRamped(b)) return Math.abs((a.speed ?? 1) - (b.speed ?? 1)) < STEP_EPS;
+	if (isReversed(a) !== isReversed(b)) return false;
+	let [lo, hi] = [Math.max(a.timeline_start, b.timeline_start), Math.min(endOf(a), endOf(b))];
+	if (!(hi > lo)) [lo, hi] = [Math.min(a.timeline_start, b.timeline_start), Math.max(endOf(a), endOf(b))];
+	const marks = [lo, hi];
+	for (const c of [a, b]) for (const k of clipRamp(c) ?? []) if (c.timeline_start + k.time > lo && c.timeline_start + k.time < hi) marks.push(c.timeline_start + k.time);
+	marks.sort((x, y) => x - y);
+	const mids = marks.slice(1).map((m, i) => (marks[i] + m) / 2);
+	marks.push(...mids);
+	return marks.every((t) => Math.abs(speedAt(a, t - a.timeline_start) - speedAt(b, t - b.timeline_start)) < STEP_EPS);
+}
+
+/** How far apart two clips of one pace play the same footage, in timeline seconds: the difference of their
+ *  `contentOffset`s, or — with a ramp on either — how much later or earlier `b` plays what `a` plays at one moment
+ *  they share (`step_gap`). */
+export function stepGap(a: Clip, b: Clip): number {
+	if (!isRamped(a) && !isRamped(b)) return Math.abs(contentOffset(a) - contentOffset(b));
+	const [lo, hi] = [Math.max(a.timeline_start, b.timeline_start), Math.min(endOf(a), endOf(b))];
+	const t = hi > lo ? (lo + hi) / 2 : a.timeline_start;
+	return Math.abs(sourceToTimeline(b, timelineToSource(a, t)) - t);
+}
+
+/** For a link group with a ramp in it: the footage time of each asset at which the members' movement is
+ *  measured — the middle of the footage every member of that asset holds before and after the edit (`pairs` is
+ *  each member's clip before, and after). Members of one asset are then judged at the same footage, which is what
+ *  keeps a picture and its sound in step when an edit stretches the time before it. An asset whose members share
+ *  no footage has none, and each is judged at its own (`step_anchor`). */
+export function stepAnchor(pairs: readonly (readonly [Clip, Clip])[]): Map<string, number> {
+	const held = new Map<string, [number, number]>();
+	for (const [was, now] of pairs) {
+		const [lo, hi] = [Math.max(was.source_in, now.source_in), Math.min(was.source_out, now.source_out)];
+		const slot = held.get(now.asset_id) ?? [-Infinity, Infinity];
+		held.set(now.asset_id, [Math.max(slot[0], lo), Math.min(slot[1], hi)]);
+	}
+	const out = new Map<string, number>();
+	for (const [asset, [lo, hi]] of held) if (hi > lo) out.set(asset, (lo + hi) / 2);
+	return out;
 }
 
 /** Whether any clip is linked — the cheap test that lets an unlinked project skip the guard. */
@@ -267,7 +327,6 @@ export function firstSyncBreak(after: Timeline, before: Timeline): [string, stri
 		}
 	});
 	const EPS = STEP_EPS;
-	const speed = (c: Clip) => c.speed ?? 1;
 	// Of every pair that broke, the one on the lowest tracks (`Timeline::first_sync_break`).
 	let first: [number, number] | null = null;
 	for (const members of groups.values()) {
@@ -277,15 +336,9 @@ export function firstSyncBreak(after: Timeline, before: Timeline): [string, stri
 				const pa = prior.get(a.clip.id);
 				const pb = prior.get(b.clip.id);
 				if (!pa || !pb) continue;
-				const inStepBefore =
-					pa.asset_id === pb.asset_id &&
-					Math.abs(speed(pa) - speed(pb)) < EPS &&
-					Math.abs(contentOffset(pa) - contentOffset(pb)) < EPS;
+				const inStepBefore = pa.asset_id === pb.asset_id && samePace(pa, pb) && stepGap(pa, pb) < EPS;
 				if (!inStepBefore) continue;
-				if (
-					Math.abs(speed(a.clip) - speed(b.clip)) >= EPS ||
-					Math.abs(contentOffset(a.clip) - contentOffset(b.clip)) >= EPS
-				) {
+				if (!samePace(a.clip, b.clip) || stepGap(a.clip, b.clip) >= EPS) {
 					const pair: [number, number] = [Math.min(a.ti, b.ti), Math.max(a.ti, b.ti)];
 					if (!first || pair[0] < first[0] || (pair[0] === first[0] && pair[1] < first[1])) first = pair;
 				}
