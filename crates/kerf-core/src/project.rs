@@ -28,7 +28,7 @@ use crate::model::{
     Voiceover, MASTER_MAX_VOLUME, MASTER_MIN_CEILING_DB, MAX_CHANNEL_VOLUME, MAX_FOV, MAX_SPEED, MAX_SVG_OVERLAYS,
     MAX_SVG_SECONDS, MIN_FOV, MIN_SPEED,
 };
-use crate::model::{AutoIncluded, SkippedChange, StagedAssetChange};
+use crate::model::{AutoIncluded, SkippedChange, StagedAssetChange, Tag};
 use crate::model::{Detached, DetachedMany};
 use crate::model::{Property, PropertyKey, PropertyTrack, TransformPatch};
 use crate::model::{SvgOverlay, SvgOverlayPatch, SvgPreset, GENERATED_ASSET};
@@ -187,7 +187,9 @@ CREATE TABLE IF NOT EXISTS assets (
     voiceover    TEXT,
     -- JSON `MusicScore` for audio Kerf composed from a score; NULL for media the
     -- user brought. Added to older files by the v2 to v3 migration (`store.rs`).
-    music_score  TEXT
+    music_score  TEXT,
+    -- JSON array of the asset's `Tag`s; NULL for none. Added to older files by the v14 to v15 migration.
+    tags         TEXT
 );
 
 CREATE TABLE IF NOT EXISTS analysis (
@@ -352,12 +354,23 @@ fn timeline_to_json(timeline: &Timeline) -> Result<String> {
     Ok(serde_json::to_string(timeline)?)
 }
 
-/// `asset` with the held-back projection changes that are about it applied.
-fn apply_asset_changes(asset: &mut Asset, changes: &[StagedAssetChange]) {
-    for change in changes.iter().filter(|c| c.asset_id == asset.id) {
-        for stream in asset.streams.iter_mut().filter(|s| s.kind == StreamKind::Video) {
-            stream.projection = change.projection;
+/// `asset` with one held-back change applied: its tags, or else its projection.
+fn apply_asset_change_to(asset: &mut Asset, change: &StagedAssetChange) {
+    match &change.tags {
+        Some(tags) => asset.tags.clone_from(tags),
+        None => {
+            for stream in asset.streams.iter_mut().filter(|s| s.kind == StreamKind::Video) {
+                stream.projection = change.projection;
+            }
         }
+    }
+}
+
+/// `asset` with the held-back changes that are about it applied.
+fn apply_asset_changes(asset: &mut Asset, changes: &[StagedAssetChange]) {
+    let id = asset.id;
+    for change in changes.iter().filter(|c| c.asset_id == id) {
+        apply_asset_change_to(asset, change);
     }
 }
 
@@ -1078,6 +1091,7 @@ impl Project {
             source_paths: Vec::new(),
             voiceover: None,
             music_score: None,
+            tags: Vec::new(),
         })
     }
 
@@ -1088,8 +1102,8 @@ impl Project {
     /// used to throw away its transcript, silence map and rhythm.
     pub fn insert_asset(&self, asset: &Asset) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO assets (id, path, name, duration, streams, imported_at, source_paths, voiceover, music_score)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+            "INSERT INTO assets (id, path, name, duration, streams, imported_at, source_paths, voiceover, music_score, tags)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(id) DO UPDATE SET
                  path = excluded.path,
                  name = excluded.name,
@@ -1098,7 +1112,8 @@ impl Project {
                  imported_at = excluded.imported_at,
                  source_paths = excluded.source_paths,
                  voiceover = excluded.voiceover,
-                 music_score = excluded.music_score",
+                 music_score = excluded.music_score,
+                 tags = excluded.tags",
             params![
                 asset.id.to_string(),
                 asset.path,
@@ -1113,6 +1128,7 @@ impl Project {
                 },
                 asset.voiceover.as_ref().map(serde_json::to_string).transpose()?,
                 asset.music_score.as_ref().map(serde_json::to_string).transpose()?,
+                tags_column(&asset.tags)?,
             ],
         )?;
         Ok(())
@@ -3212,9 +3228,7 @@ impl Project {
             // Removed since: nothing left to mark.
             return Ok(());
         };
-        for stream in asset.streams.iter_mut().filter(|s| s.kind == StreamKind::Video) {
-            stream.projection = change.projection;
-        }
+        apply_asset_change_to(&mut asset, change);
         self.insert_asset(&asset)
     }
 
@@ -5892,6 +5906,7 @@ impl Project {
             source_paths: Vec::new(),
             voiceover: None,
             music_score: None,
+            tags: Vec::new(),
         };
 
         let broll = Asset {
@@ -5922,6 +5937,7 @@ impl Project {
             source_paths: Vec::new(),
             voiceover: None,
             music_score: None,
+            tags: Vec::new(),
         };
 
         self.insert_asset(&interview)?;
@@ -6330,8 +6346,32 @@ impl Project {
 
     /// Hold an asset's new projection back with the agent's proposal (opening one if none is).
     fn stage_asset_projection(&self, mut asset: Asset, projection: Option<Projection>) -> Result<Asset> {
-        let declared = self.agent_owner.borrow().clone();
         let stored = self.stored_asset(asset.id)?.ok_or(Error::AssetNotFound(asset.id))?;
+        let id = StagedAssetChange::projection_id(asset.id);
+        let label = match projection {
+            Some(p) => format!("Mark {} as {}", asset.name, projection_label(p)),
+            None => format!("Mark {} as flat (not 360)", asset.name),
+        };
+        let change = (stored.projection() != projection).then(|| StagedAssetChange {
+            id: id.clone(),
+            asset_id: asset.id,
+            projection,
+            tags: None,
+            summary: label.clone(),
+        });
+        self.stage_asset_changes(label, vec![(id, change)])?;
+        for stream in asset.streams.iter_mut().filter(|s| s.kind == StreamKind::Video) {
+            stream.projection = projection;
+        }
+        Ok(asset)
+    }
+
+    /// Hold asset changes back with the agent's proposal (opening one if none is) as one undoable step. Each
+    /// entry is a change id and the change to hold under it, which replaces an earlier one with that id; `None`
+    /// asks for what the library already has, so it stages nothing but takes an earlier ask back. A call that
+    /// moves nothing leaves no proposal behind.
+    fn stage_asset_changes(&self, label: String, changes: Vec<(String, Option<StagedAssetChange>)>) -> Result<()> {
+        let declared = self.agent_owner.borrow().clone();
         let tx = self.tx()?;
         if !self.staged_exists()? {
             self.open_session(None, None, declared.as_deref())?;
@@ -6341,31 +6381,20 @@ impl Project {
             return Err(Error::StagedEditOwnedByOther);
         }
         self.adopt_staged(row.owner.as_deref())?;
-        let id = StagedAssetChange::projection_id(asset.id);
         let mut assets = row.assets.clone();
-        let had = assets.iter().any(|c| c.id == id);
-        assets.retain(|c| c.id != id);
-        let label = match projection {
-            Some(p) => format!("Mark {} as {}", asset.name, projection_label(p)),
-            None => format!("Mark {} as flat (not 360)", asset.name),
-        };
-        // Asking for what the library already has is no change, but it takes back an earlier ask.
-        if stored.projection() != projection {
-            assets.push(StagedAssetChange {
-                id,
-                asset_id: asset.id,
-                projection,
-                summary: label.clone(),
-            });
-        } else if !had {
-            return Ok(asset);
+        let mut moved = false;
+        for (id, change) in changes {
+            let had = assets.iter().any(|c| c.id == id);
+            assets.retain(|c| c.id != id);
+            moved |= had || change.is_some();
+            assets.extend(change);
+        }
+        if !moved {
+            return Ok(());
         }
         self.push_staged_step(&row, &row.timeline, &assets, label)?;
         tx.commit()?;
-        for stream in asset.streams.iter_mut().filter(|s| s.kind == StreamKind::Video) {
-            stream.projection = projection;
-        }
-        Ok(asset)
+        Ok(())
     }
 
     /// One `Option` per `v360` parameter: the Tauri command and the MCP tool both
@@ -7658,7 +7687,7 @@ fn row_to_task(
 }
 
 /// The `assets` columns every asset read selects, in [`read_asset_row`]'s order.
-const ASSET_COLUMNS: &str = "id, path, name, duration, streams, imported_at, source_paths, voiceover, music_score";
+const ASSET_COLUMNS: &str = "id, path, name, duration, streams, imported_at, source_paths, voiceover, music_score, tags";
 
 /// An `assets` row as stored, JSON columns still serialized.
 struct AssetRow {
@@ -7671,6 +7700,7 @@ struct AssetRow {
     source_paths: Option<String>,
     voiceover: Option<String>,
     music_score: Option<String>,
+    tags: Option<String>,
 }
 
 fn read_asset_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRow> {
@@ -7684,6 +7714,16 @@ fn read_asset_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRow> {
         source_paths: row.get(6)?,
         voiceover: row.get(7)?,
         music_score: row.get(8)?,
+        tags: row.get(9)?,
+    })
+}
+
+/// The `tags` column for `tags`: JSON, or NULL for none.
+fn tags_column(tags: &[Tag]) -> Result<Option<String>> {
+    Ok(if tags.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(tags)?)
     })
 }
 
@@ -7701,6 +7741,10 @@ fn row_to_asset(row: AssetRow) -> Result<Asset> {
         },
         voiceover: row.voiceover.map(|json| serde_json::from_str(&json)).transpose()?,
         music_score: row.music_score.map(|json| serde_json::from_str(&json)).transpose()?,
+        tags: match row.tags {
+            Some(json) => serde_json::from_str(&json)?,
+            None => Vec::new(),
+        },
     })
 }
 
@@ -7780,6 +7824,10 @@ pub use batch::Batch;
 mod templates;
 mod title_clips;
 pub use title_clips::{TitleClipPatch, TitleClipPlacement, TitleClipResult, TitleEdited};
+mod tags;
+pub use tags::{
+    AssembleByTag, AssemblePlan, AssembleSummary, AssembledGroup, GroupTitle, PreparedAssemble, SortWithin, MAX_TAG_TITLE_SECONDS,
+};
 mod title_text;
 pub use title_text::{PreparedText, TitleTextForm, TitleTextInputs};
 mod thumbnails;
@@ -8004,6 +8052,8 @@ mod linked_corpus;
 
 #[cfg(test)]
 mod persist_tests;
+#[cfg(test)]
+mod tags_tests;
 
 /// What [`Project::place_stems`] did: the stem assets (in `STEM_NAMES` order) and the
 /// clips it laid under the separated clip, if one was named.
@@ -8383,6 +8433,7 @@ mod tests {
             source_paths: Vec::new(),
             voiceover: None,
             music_score: None,
+            tags: Vec::new(),
         }
     }
 
@@ -9319,6 +9370,7 @@ mod tests {
             source_paths: Vec::new(),
             voiceover: None,
             music_score: None,
+            tags: Vec::new(),
         };
         project.insert_asset(&asset).unwrap();
 
@@ -10837,6 +10889,7 @@ mod tests {
             source_paths: Vec::new(),
             voiceover: None,
             music_score: None,
+            tags: Vec::new(),
         };
         project.insert_asset(&asset).unwrap();
 
@@ -10886,6 +10939,7 @@ mod tests {
             source_paths: Vec::new(),
             voiceover: None,
             music_score: None,
+            tags: Vec::new(),
         };
         project.insert_asset(&asset).unwrap();
         let clip = project.cut_clip(asset.id, 0.0, 10.0).unwrap();
@@ -10951,6 +11005,7 @@ mod tests {
             source_paths: Vec::new(),
             voiceover: None,
             music_score: None,
+            tags: Vec::new(),
         };
         let id = asset.id;
         project.insert_asset(&asset).unwrap();
@@ -11062,6 +11117,7 @@ mod tests {
             source_paths: Vec::new(),
             voiceover: None,
             music_score: None,
+            tags: Vec::new(),
         };
         project.insert_asset(&asset).unwrap();
 
@@ -11128,6 +11184,7 @@ mod tests {
             source_paths: Vec::new(),
             voiceover: None,
             music_score: None,
+            tags: Vec::new(),
         };
         project.insert_asset(&asset).unwrap();
 

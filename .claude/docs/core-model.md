@@ -332,7 +332,8 @@
   labels, `stale`, its diff, `owned_by_agent` — the session id itself (`owner`) is Rust-side only,
   `#[serde(skip)]`, so it never reaches the webview or another agent — how many steps `undo_staged` can take
   back, and the asset changes held back with it — `StagedAssetChange`, id
-  `asset_projection:<asset id>`, usable wherever an entry id is).
+  `asset_projection:<asset id>` (`projection`) or `asset_tags:<asset id>` (`tags`: the asset's whole tag list after the
+  change, `[]` clearing them; absent on a projection change, so a stored one reads as before), usable wherever an entry id is).
   **Partial accept** is `model/subset.rs` (pure + unit-tested): `Timeline::merge_subset(base,
   proposed, picked_ids)` writes each picked change onto the **live** cut by identity (this
   clip / text or animated title / marker / track — never by position), so what the user did since stands. A
@@ -663,8 +664,25 @@
   reaches `MAX_SVG_SECONDS` in `Project::source_limits` (one entry keyed `GENERATED_ASSET`), and `transition_fx` gives it an
   unbounded handle (a dissolve out of a title draws its document on) and `alpha` (its pictures are transparent). **Presets
   are not title clips yet**: a preset is laid out for its length and would have to be re-made by every op that changes a
-  clip's length; a template or custom artwork holds its end instead. `frontend/src/lib/title-clips.ts` mirrors placement,
+  clip's length; a template or custom artwork holds its end instead. (`assemble_by_tag` renders a preset once for its span and
+  stores it as artwork, so a later trim does not retime it.) `frontend/src/lib/title-clips.ts` mirrors placement,
   naming and lookup.
+- **Asset tags** (`model/tags.rs`, pure + unit-tested; storing, staging and `assemble_by_tag` are `core-project.md`):
+  `Asset.tags: Vec<Tag>` (absent from the JSON when empty). `Tag {key?, value}` is `location: Cumbuco` or the plain `jump`
+  (`Tag::parse` splits on the first `:`; `Display` writes it back). **Spelling**: whitespace (tabs and line breaks included)
+  collapses to one space, other control characters go, the key is lowercased, a value keeps its case; an empty key or value is
+  refused, a key is at most `MAX_TAG_KEY` (32) characters, a value `MAX_TAG_VALUE` (64), an asset `MAX_ASSET_TAGS` (64) tags.
+  Tags compare ignoring case, `dedupe_tags` keeps the first spelling, and several values of one key (`rider: A`, `rider: B`)
+  are fine. `TagEdit {add, remove, remove_keys}` (`deny_unknown_fields`) applies in that order — `remove_keys` (every tag of a
+  key), `remove` (exactly that key and value; a plain tag takes off only a plain one), `add` — normalizing everything it
+  names and refusing the whole edit on one invalid tag; replacing a location is `remove_keys: ["location"]` with
+  `add: [location: X]`. `TagFilter {key?, value?}` is one term: `{key, value}` that tag, `{key}` any tag with the key, `{value}`
+  a plain tag (`TagFilter::parse`: `location: X`, `location:*`, `jump`); `tags_match(&[TagFilter], &[Tag])` needs every term.
+  `TagSummary::of` is the vocabulary (`keys[] {key, assets, values[] {value, assets}}` and `plain[] {value, assets}`, A to Z,
+  an asset counted once per value). `group_by_key(assets, key, order, include_untagged)` is the grouping `assemble_by_tag`
+  uses: groups follow `order` (ignoring case), the rest A to Z, the assets lacking the key last as a group of no value when
+  asked; an asset with several values of the key joins the first in that order; `order` entries no asset carries come back as
+  `unmatched`. `StagedAssetChange.tags` is the held-back form.
 - **Thumbnails** (`model/thumbnail.rs`, pure + unit-tested): `Timeline.thumbnails: Vec<Thumbnail>` (absent when empty, so a cut
   without one stores what it always did; nothing that renders the cut reads it — `slice` / `for_render` copies drop it). A
   `Thumbnail` is `time` (timeline seconds), `width` x `height` (`parse_thumbnail_size`: `youtube`, `vertical`, `square`, `4:5`,
