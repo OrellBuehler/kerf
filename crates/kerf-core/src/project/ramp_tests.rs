@@ -17,7 +17,7 @@ fn timeline(p: &Project) -> Timeline {
 }
 
 fn clip_of(p: &Project, id: Uuid) -> Clip {
-    timeline(p).clip(id).cloned().unwrap_or_else(|| panic!("clip {id} is gone"))
+    timeline(p).clip(id).cloned().expect("the clip is gone")
 }
 
 fn revisions(p: &Project) -> usize {
@@ -25,7 +25,7 @@ fn revisions(p: &Project) -> usize {
 }
 
 fn near(a: f64, b: f64) {
-    assert!((a - b).abs() < 1e-9, "{a} is not {b}");
+    assert!((a - b).abs() < 1e-9, "two times differ");
 }
 
 /// 1x for a second, then down to a quarter over a second, then held there.
