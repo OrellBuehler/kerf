@@ -35,7 +35,7 @@ describe('rows', () => {
 		const rows = pickRows(
 			[],
 			[
-				{ id: 'asset_tags:x', asset_id: 'x', projection: null, tags: [{ key: 'location', value: 'Jeri' }], summary: 'Tag x.mp4: +location: Jeri' },
+				{ id: 'asset_tags:x', asset_id: 'x', projection: null, tag_edit: { add: [{ key: 'location', value: 'Jeri' }] }, summary: 'Tag x.mp4: +location: Jeri' },
 				{ id: 'asset_projection:x', asset_id: 'x', projection: null, summary: 'Mark x.mp4 as flat (not 360)' }
 			]
 		);

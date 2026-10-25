@@ -58,6 +58,14 @@ fn normalize_value(value: &str) -> Result<String> {
     Ok(value)
 }
 
+/// `text` split at its first `:` into a key and a value, when what comes before it reads as a key: one word of at most
+/// [`MAX_TAG_KEY`] characters (or nothing at all, which is refused as an empty key). `intro 10:30` has no key.
+fn split_key(text: &str) -> Option<(&str, &str)> {
+    let (key, value) = text.split_once(':')?;
+    let word = clean(key);
+    (word.is_empty() || (!word.contains(' ') && word.chars().count() <= MAX_TAG_KEY)).then_some((key, value))
+}
+
 /// A label on an asset: an optional key and a value. `{"key": "location", "value": "Cumbuco"}` is
 /// `location: Cumbuco`; `{"value": "jump"}` is the plain tag `jump`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize, schemars::JsonSchema)]
@@ -76,9 +84,10 @@ impl Tag {
         })
     }
 
-    /// `location: Cumbuco` splits on the first `:` into a key and a value; with no `:` it is a plain tag.
+    /// `location: Cumbuco` splits on the first `:` into a key and a value; with no `:`, or with more than one word before
+    /// it (`intro 10:30`), it is a plain tag.
     pub fn parse(text: &str) -> Result<Tag> {
-        match text.split_once(':') {
+        match split_key(text) {
             Some((key, value)) => Tag::new(Some(key), value),
             None => Tag::new(None, text),
         }
@@ -142,33 +151,74 @@ impl TagEdit {
         self.add.is_empty() && self.remove.is_empty() && self.remove_keys.is_empty()
     }
 
-    /// `tags` after the edit: repeats gone (the first spelling stays), at most [`MAX_ASSET_TAGS`]. Everything
-    /// the edit names is normalized first, and an invalid tag or key refuses the whole edit.
-    pub fn apply(&self, tags: &[Tag]) -> Result<Vec<Tag>> {
-        let keys = self
-            .remove_keys
-            .iter()
-            .map(|k| normalize_key(k))
-            .collect::<Result<HashSet<_>>>()?;
-        let remove = self
-            .remove
-            .iter()
-            .map(|t| t.normalized().map(|t| t.identity()))
-            .collect::<Result<HashSet<_>>>()?;
-        let add = self.add.iter().map(Tag::normalized).collect::<Result<Vec<_>>>()?;
-        let mut out: Vec<Tag> = tags
+    /// This edit with everything it names normalized and repeats gone; an invalid tag or key refuses it.
+    pub fn normalized(&self) -> Result<TagEdit> {
+        Ok(TagEdit {
+            add: dedupe_tags(self.add.iter().map(Tag::normalized).collect::<Result<_>>()?),
+            remove: dedupe_tags(self.remove.iter().map(Tag::normalized).collect::<Result<_>>()?),
+            remove_keys: dedupe_keys(self.remove_keys.iter().map(|k| normalize_key(k)).collect::<Result<_>>()?),
+        })
+    }
+
+    /// [`TagEdit::normalized`] leaving out what does not normalize: how a held-back edit is read at the last moment.
+    fn lenient(&self) -> TagEdit {
+        TagEdit {
+            add: dedupe_tags(self.add.iter().filter_map(|t| t.normalized().ok()).collect()),
+            remove: dedupe_tags(self.remove.iter().filter_map(|t| t.normalized().ok()).collect()),
+            remove_keys: dedupe_keys(self.remove_keys.iter().filter_map(|k| normalize_key(k).ok()).collect()),
+        }
+    }
+
+    /// An edit that is already normalized, run over `tags`: repeats gone (the first spelling stays), no limit.
+    fn run(&self, tags: &[Tag]) -> Vec<Tag> {
+        let keys: HashSet<String> = self.remove_keys.iter().cloned().collect();
+        let remove: HashSet<_> = self.remove.iter().map(Tag::identity).collect();
+        let kept = tags
             .iter()
             .filter(|t| !t.key.as_ref().is_some_and(|k| keys.contains(&k.to_lowercase())))
             .filter(|t| !remove.contains(&t.identity()))
+            .chain(&self.add)
             .cloned()
             .collect();
-        out.extend(add);
-        let out = dedupe_tags(out);
+        dedupe_tags(kept)
+    }
+
+    /// `tags` after the edit: repeats gone (the first spelling stays), at most [`MAX_ASSET_TAGS`]. Everything
+    /// the edit names is normalized first, and an invalid tag or key refuses the whole edit.
+    pub fn apply(&self, tags: &[Tag]) -> Result<Vec<Tag>> {
+        let out = self.normalized()?.run(tags);
         if out.len() > MAX_ASSET_TAGS {
             return Err(invalid(format!("an asset holds at most {MAX_ASSET_TAGS} tags")));
         }
         Ok(out)
     }
+
+    /// [`TagEdit::apply`] for an edit that was checked when it was made and is run later, over tags that may have
+    /// changed since: it never refuses. What would take the asset past [`MAX_ASSET_TAGS`] is left off, the last tags
+    /// added first, and an entry that does not normalize is skipped.
+    pub fn apply_capped(&self, tags: &[Tag]) -> Vec<Tag> {
+        let mut out = self.lenient().run(tags);
+        out.truncate(MAX_ASSET_TAGS);
+        out
+    }
+
+    /// The one edit that does what this does and then `later`: `apply_capped` of it over any tags is `later` over this over
+    /// them. Keys and removals add up; an add of this survives unless `later` takes it off. Both are normalized first.
+    pub fn then(&self, later: &TagEdit) -> Result<TagEdit> {
+        let (first, later) = (self.normalized()?, later.normalized()?);
+        let gone =
+            |t: &Tag| t.key.as_ref().is_some_and(|k| later.remove_keys.contains(k)) || later.remove.iter().any(|r| r.same_as(t));
+        Ok(TagEdit {
+            add: dedupe_tags(first.add.into_iter().filter(|t| !gone(t)).chain(later.add).collect()),
+            remove: dedupe_tags(first.remove.into_iter().chain(later.remove).collect()),
+            remove_keys: dedupe_keys(first.remove_keys.into_iter().chain(later.remove_keys).collect()),
+        })
+    }
+}
+
+fn dedupe_keys(keys: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    keys.into_iter().filter(|k| seen.insert(k.clone())).collect()
 }
 
 /// One condition on an asset's tags. `{key, value}` is that tag; `{key}` any tag with that key; `{value}` alone a
@@ -185,7 +235,7 @@ pub struct TagFilter {
 impl TagFilter {
     /// `location: Cumbuco` is that tag, `location:*` any tag with the key, `jump` the plain tag.
     pub fn parse(text: &str) -> Result<TagFilter> {
-        let term = match text.split_once(':') {
+        let term = match split_key(text) {
             Some((key, value)) if clean(value) == "*" => TagFilter {
                 key: Some(key.to_string()),
                 value: None,
@@ -425,6 +475,54 @@ mod tests {
     }
 
     #[test]
+    fn only_one_word_before_the_colon_is_a_key() {
+        let plain = |text: &str| {
+            let tag = t(text);
+            assert_eq!(tag.key, None, "{text:?}");
+            tag.value
+        };
+        assert_eq!(plain("intro 10:30"), "intro 10:30");
+        assert_eq!(plain("Part one: the beach"), "Part one: the beach");
+        assert_eq!(plain("at the 3:00 mark"), "at the 3:00 mark");
+        assert_eq!(
+            plain(&format!("{}:x", "k".repeat(MAX_TAG_KEY + 1))),
+            format!("{}:x", "k".repeat(MAX_TAG_KEY + 1))
+        );
+        assert_eq!(
+            t(&format!("{}:x", "k".repeat(MAX_TAG_KEY))).key.as_deref(),
+            Some("k".repeat(MAX_TAG_KEY).as_str())
+        );
+        assert_eq!(
+            t(" Location\t: x").key.as_deref(),
+            Some("location"),
+            "space around the word is not in it"
+        );
+        assert!(
+            Tag::parse(": x").is_err(),
+            "nothing before the colon is an empty key, not a plain tag"
+        );
+        assert_eq!(
+            plain("a b:"),
+            "a b:",
+            "a colon with words before it is text, so it has a value"
+        );
+        assert_eq!(
+            TagFilter::parse("intro 10:30").unwrap(),
+            TagFilter {
+                key: None,
+                value: Some("intro 10:30".into())
+            }
+        );
+        assert_eq!(
+            TagFilter::parse("intro 10:*").unwrap(),
+            TagFilter {
+                key: None,
+                value: Some("intro 10:*".into())
+            }
+        );
+    }
+
+    #[test]
     fn spelling_is_normalized() {
         let tag = t("  LoCation \t:\n  Jeri   coara\u{7} ");
         assert_eq!(tag.key.as_deref(), Some("location"), "keys are lowercased");
@@ -575,6 +673,122 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(again.apply(&full).unwrap().len(), MAX_ASSET_TAGS, "a repeat adds nothing");
+    }
+
+    /// A deterministic spread of edits over a small universe of tags, for the composition property.
+    fn edits() -> Vec<TagEdit> {
+        fn next(seed: &mut u64) -> u64 {
+            *seed ^= *seed << 13;
+            *seed ^= *seed >> 7;
+            *seed ^= *seed << 17;
+            *seed
+        }
+        let universe = list(&["a", "A", "b", "k: x", "K: X", "k: y", "m: z"]);
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let pick = |seed: &mut u64| -> Vec<Tag> {
+            (0..next(seed) % 3)
+                .map(|_| universe[(next(seed) % universe.len() as u64) as usize].clone())
+                .collect()
+        };
+        (0..300)
+            .map(|_| {
+                let (add, remove) = (pick(&mut seed), pick(&mut seed));
+                let remove_keys = ["k", "M", "zz"]
+                    .iter()
+                    .filter(|_| next(&mut seed).is_multiple_of(4))
+                    .map(|k| k.to_string())
+                    .collect();
+                TagEdit {
+                    add,
+                    remove,
+                    remove_keys,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn two_edits_in_a_row_are_one_edit() {
+        let starts = [list(&[]), list(&["a", "k: x"]), list(&["B", "k: Y", "m: z", "j"])];
+        let all = edits();
+        for (first, later) in all.iter().zip(all.iter().skip(1)) {
+            let composed = first.then(later).unwrap();
+            for start in &starts {
+                let one_after_the_other = later.apply_capped(&first.apply_capped(start));
+                assert_eq!(
+                    composed.apply_capped(start),
+                    one_after_the_other,
+                    "{first:?} then {later:?} over {start:?}"
+                );
+            }
+        }
+        // And composing is associative in what it does.
+        for three in all.windows(3) {
+            let left = three[0].then(&three[1]).unwrap().then(&three[2]).unwrap();
+            let right = three[0].then(&three[1].then(&three[2]).unwrap()).unwrap();
+            for start in &starts {
+                assert_eq!(left.apply_capped(start), right.apply_capped(start));
+            }
+        }
+    }
+
+    #[test]
+    fn a_composed_edit_adds_up_keys_and_removals_and_drops_the_adds_a_later_edit_takes_off() {
+        let first = TagEdit {
+            add: list(&["jump", "location: Jeri", "wave"]),
+            remove: list(&["old"]),
+            remove_keys: vec!["Rider".into()],
+        };
+        let later = TagEdit {
+            add: list(&["Wave2"]),
+            remove: list(&["WAVE"]),
+            remove_keys: vec!["location".into(), "rider".into()],
+        };
+        let both = first.then(&later).unwrap();
+        assert_eq!(shown(&both.add), ["jump", "Wave2"]);
+        assert_eq!(shown(&both.remove), ["old", "WAVE"]);
+        assert_eq!(both.remove_keys, ["rider", "location"]);
+        assert_eq!(TagEdit::default().then(&first).unwrap(), first.normalized().unwrap());
+        assert!(TagEdit::default().then(&TagEdit::default()).unwrap().is_empty());
+        assert!(first
+            .then(&TagEdit {
+                add: vec![Tag {
+                    key: None,
+                    value: " ".into()
+                }],
+                ..Default::default()
+            })
+            .is_err());
+    }
+
+    #[test]
+    fn a_held_edit_runs_later_without_refusing_and_leaves_the_overflow_off() {
+        let full: Vec<Tag> = (0..MAX_ASSET_TAGS - 1).map(|i| t(&format!("t{i}"))).collect();
+        let edit = TagEdit {
+            add: list(&["x1", "x2", "t0"]),
+            ..Default::default()
+        };
+        assert!(edit.apply(&full).is_err(), "made against these tags it would be refused");
+        let landed = edit.apply_capped(&full);
+        assert_eq!(landed.len(), MAX_ASSET_TAGS);
+        assert_eq!(
+            shown(&landed[MAX_ASSET_TAGS - 1..]),
+            ["x1"],
+            "the first add that fits stays, the rest are left off"
+        );
+        // An entry that does not normalize is skipped, not fatal.
+        let broken = TagEdit {
+            add: vec![
+                Tag {
+                    key: None,
+                    value: "  ".into(),
+                },
+                t("ok"),
+            ],
+            remove_keys: vec![" ".into()],
+            ..Default::default()
+        };
+        assert_eq!(shown(&broken.apply_capped(&list(&["a"]))), ["a", "ok"]);
     }
 
     #[test]

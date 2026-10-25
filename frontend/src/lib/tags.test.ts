@@ -4,6 +4,7 @@ import {
 	MAX_TAG_KEY,
 	MAX_TAG_VALUE,
 	applyTagEdit,
+	applyTagEditCapped,
 	checkTagFilter,
 	dedupeTags,
 	formatTag,
@@ -17,6 +18,7 @@ import {
 	sameTag,
 	sameTags,
 	tagEditIsEmpty,
+	tagEditThen,
 	tagFilterMatches,
 	tagSummary,
 	tagsMatch
@@ -46,6 +48,24 @@ describe('a tag', () => {
 		expect([url.key, url.value]).toEqual(['link', 'https://x.example/a']);
 		expect(formatTag(t('location: Cumbuco'))).toBe('location: Cumbuco');
 		expect(formatTag(t('jump'))).toBe('jump');
+	});
+
+	test('only one word before the colon is a key', () => {
+		const plain = (text: string) => {
+			expect(t(text).key).toBeUndefined();
+			return t(text).value;
+		};
+		expect(plain('intro 10:30')).toBe('intro 10:30');
+		expect(plain('Part one: the beach')).toBe('Part one: the beach');
+		expect(plain('at the 3:00 mark')).toBe('at the 3:00 mark');
+		const long = `${'k'.repeat(MAX_TAG_KEY + 1)}:x`;
+		expect(plain(long)).toBe(long);
+		expect(t(`${'k'.repeat(MAX_TAG_KEY)}:x`).key).toBe('k'.repeat(MAX_TAG_KEY));
+		expect(t(' Location\t: x').key).toBe('location');
+		expect(refused(() => parseTag(': x'))).toBe('invalid argument: a tag key cannot be empty');
+		expect(plain('a b:')).toBe('a b:');
+		expect(parseTagFilter('intro 10:30')).toEqual({ value: 'intro 10:30' });
+		expect(parseTagFilter('intro 10:*')).toEqual({ value: 'intro 10:*' });
 	});
 
 	test('spelling is normalized', () => {
@@ -137,6 +157,17 @@ describe('a tag edit', () => {
 		expect(applyTagEdit(full, { add: list(['TAG1']) })).toHaveLength(MAX_ASSET_TAGS);
 	});
 
+	test('run later over tags that changed never refuses and leaves the overflow off', () => {
+		const full = Array.from({ length: MAX_ASSET_TAGS - 1 }, (_, i) => t(`t${i}`));
+		const edit: TagEdit = { add: list(['x1', 'x2', 't0']) };
+		expect(refused(() => applyTagEdit(full, edit))).not.toBeNull();
+		const landed = applyTagEditCapped(full, edit);
+		expect(landed).toHaveLength(MAX_ASSET_TAGS);
+		expect(shown(landed.slice(MAX_ASSET_TAGS - 1))).toEqual(['x1']);
+		const broken: TagEdit = { add: [{ value: '  ' }, t('ok')], remove_keys: [' '] };
+		expect(shown(applyTagEditCapped(list(['a']), broken))).toEqual(['a', 'ok']);
+	});
+
 	test('with nothing in it is empty', () => {
 		expect(tagEditIsEmpty({})).toBe(true);
 		expect(tagEditIsEmpty({ add: [], remove: [], remove_keys: [] })).toBe(true);
@@ -148,6 +179,46 @@ describe('a tag edit', () => {
 		const before = structuredClone(tags);
 		applyTagEdit(tags, { add: list(['d']), remove_keys: ['b'] });
 		expect(tags).toEqual(before);
+	});
+});
+
+describe('two tag edits in a row', () => {
+	test('add up keys and removals and drop the adds a later edit takes off', () => {
+		const first: TagEdit = { add: list(['jump', 'location: Jeri', 'wave']), remove: list(['old']), remove_keys: ['Rider'] };
+		const later: TagEdit = { add: list(['Wave2']), remove: list(['WAVE']), remove_keys: ['location', 'rider'] };
+		const both = tagEditThen(first, later);
+		expect(shown(both.add)).toEqual(['jump', 'Wave2']);
+		expect(shown(both.remove)).toEqual(['old', 'WAVE']);
+		expect(both.remove_keys).toEqual(['rider', 'location']);
+		expect(tagEditThen({}, first)).toEqual({ add: list(['jump', 'location: Jeri', 'wave']), remove: list(['old']), remove_keys: ['rider'] });
+		expect(tagEditIsEmpty(tagEditThen({}, {}))).toBe(true);
+		expect(refused(() => tagEditThen(first, { add: [{ value: ' ' }] }))).not.toBeNull();
+	});
+
+	// The engine's `two_edits_in_a_row_are_one_edit`: the composed edit does what the two do, one after the other.
+	test('do what the composed edit does, over any tags', () => {
+		const universe = list(['a', 'A', 'b', 'k: x', 'K: X', 'k: y', 'm: z']);
+		let seed = 0x2545f491;
+		const next = () => {
+			seed ^= seed << 13;
+			seed ^= seed >>> 17;
+			seed ^= seed << 5;
+			return seed >>> 0;
+		};
+		const pick = () => Array.from({ length: next() % 3 }, () => universe[next() % universe.length]);
+		const edits: TagEdit[] = Array.from({ length: 300 }, () => ({
+			add: pick(),
+			remove: pick(),
+			remove_keys: ['k', 'M', 'zz'].filter(() => next() % 4 === 0)
+		}));
+		const starts = [list([]), list(['a', 'k: x']), list(['B', 'k: Y', 'm: z', 'j'])];
+		for (let i = 0; i + 1 < edits.length; i++) {
+			const composed = tagEditThen(edits[i], edits[i + 1]);
+			for (const start of starts) {
+				const stepwise = applyTagEditCapped(applyTagEditCapped(start, edits[i]), edits[i + 1]);
+				expect(applyTagEditCapped(start, composed)).toEqual(stepwise);
+			}
+		}
 	});
 });
 
@@ -254,9 +325,9 @@ describe('grouping by a key', () => {
 });
 
 describe('a staged change', () => {
-	test('is a tag change when it carries tags, and a projection mark otherwise', () => {
-		expect(isTagChange({ tags: [t('jump')] })).toBe(true);
-		expect(isTagChange({ tags: [] })).toBe(true);
+	test('is a tag change when it carries a tag edit, and a projection mark otherwise', () => {
+		expect(isTagChange({ tag_edit: { add: [t('jump')] } })).toBe(true);
+		expect(isTagChange({ tag_edit: {} })).toBe(true);
 		expect(isTagChange({})).toBe(false);
 	});
 });
@@ -360,5 +431,16 @@ describe('planning an assembly', () => {
 		expect(refused(() => planAssembleByTag(a, { key: 'location', title_seconds: 60 }))).toBeNull();
 		expect(refused(() => planAssembleByTag(a, { key: 'location', title_seconds: 61 }))).toContain('at most 60');
 		expect(refused(() => planAssembleByTag([], { key: 'location' }))).not.toBeNull();
+	});
+
+	test('a title or sort the engine does not know is refused as its request reader refuses it', () => {
+		const a = trip();
+		for (const title of ['banner', 'Overlay', '']) {
+			expect(refused(() => planAssembleByTag(a, { key: 'location', title: title as 'card' }))).toContain('unknown title');
+		}
+		expect(refused(() => planAssembleByTag(a, { key: 'location', sort_within: 'newest' as 'name' }))).toContain('unknown sort_within');
+		for (const title of ['overlay', 'card', 'none'] as const) {
+			expect(refused(() => planAssembleByTag(a, { key: 'location', title }))).toBeNull();
+		}
 	});
 });

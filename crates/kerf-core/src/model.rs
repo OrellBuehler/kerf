@@ -4035,7 +4035,7 @@ pub struct StagedEdit {
 /// timeline, so it cannot ride in the proposal's timeline; it is held back beside it instead
 /// and written when the proposal is accepted (or the entry is picked in a partial accept).
 ///
-/// Two kinds: a projection change (`tags` absent) and a tag change (`tags` set).
+/// Two kinds: a projection change (`tag_edit` absent) and a tag change (`tag_edit` set).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StagedAssetChange {
     /// `asset_projection:<asset id>` or `asset_tags:<asset id>` — usable wherever a [`DiffEntry::id`] is.
@@ -4043,9 +4043,10 @@ pub struct StagedAssetChange {
     pub asset_id: Uuid,
     /// The spherical projection the asset is to be marked with; `None` clears it. Not read by a tag change.
     pub projection: Option<Projection>,
-    /// A tag change: the asset's whole tag list once it lands (empty clears them). Absent for a projection change.
+    /// A tag change: everything the agent's edits did to the asset's tags, composed into one edit ([`TagEdit::then`]). It
+    /// is run over the asset's tags as they are when it is read, so it keeps what the user tagged in between.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tags: Option<Vec<Tag>>,
+    pub tag_edit: Option<TagEdit>,
     /// One line for the review card, e.g. `Mark interview.mp4 as equirect 360`.
     pub summary: String,
 }

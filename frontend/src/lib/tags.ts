@@ -81,9 +81,20 @@ export function newTag(key: string | null | undefined, value: string): Tag {
 	return k === null ? { value: v } : { key: k, value: v };
 }
 
-/** `location: Cumbuco` splits on the first `:` into a key and a value; with no `:` it is a plain tag (`Tag::parse`). */
-export function parseTag(text: string): Tag {
+/** Where `text` splits into a key and a value: at its first `:`, when what precedes it reads as a key — one word of at most
+ *  `MAX_TAG_KEY` characters (or nothing at all, which is then refused as an empty key). `intro 10:30` has no key
+ *  (`split_key`). */
+function keyEnd(text: string): number {
 	const at = text.indexOf(':');
+	if (at < 0) return -1;
+	const word = clean(text.slice(0, at));
+	return word === '' || (!word.includes(' ') && length(word) <= MAX_TAG_KEY) ? at : -1;
+}
+
+/** `location: Cumbuco` splits on the first `:` into a key and a value; with no `:`, or with more than one word before it
+ *  (`intro 10:30`), it is a plain tag (`Tag::parse`). */
+export function parseTag(text: string): Tag {
+	const at = keyEnd(text);
 	return at < 0 ? newTag(null, text) : newTag(text.slice(0, at), text.slice(at + 1));
 }
 
@@ -133,22 +144,71 @@ export function tagEditIsEmpty(edit: TagEdit): boolean {
 	return !edit.add?.length && !edit.remove?.length && !edit.remove_keys?.length;
 }
 
+/** This edit with everything it names normalized and repeats gone; an invalid tag or key refuses it
+ *  (`TagEdit::normalized`). */
+export function normalizedTagEdit(edit: TagEdit): Required<TagEdit> {
+	const keys = new Set<string>();
+	for (const k of edit.remove_keys ?? []) keys.add(normalizeKey(k));
+	return {
+		add: dedupeTags((edit.add ?? []).map(normalizedTag)),
+		remove: dedupeTags((edit.remove ?? []).map(normalizedTag)),
+		remove_keys: [...keys]
+	};
+}
+
+/** A normalized edit run over `tags`: repeats gone (the first spelling stays), no limit (`TagEdit::run`). */
+function runTagEdit(tags: readonly Tag[], edit: Required<TagEdit>): Tag[] {
+	const keys = new Set(edit.remove_keys);
+	const remove = new Set(edit.remove.map(identity));
+	const kept = tags.filter((t) => !(t.key != null && keys.has(t.key.toLowerCase()))).filter((t) => !remove.has(identity(t)));
+	return dedupeTags([...kept, ...edit.add]);
+}
+
 /** `tags` after the edit, applied in the order `remove_keys`, `remove`, `add`: repeats gone (the first spelling stays), at
  *  most `MAX_ASSET_TAGS`. Everything the edit names is normalized first, and an invalid tag or key refuses the whole edit
  *  (`TagEdit::apply`). */
 export function applyTagEdit(tags: readonly Tag[], edit: TagEdit): Tag[] {
-	const keys = new Set((edit.remove_keys ?? []).map(normalizeKey));
-	const remove = new Set((edit.remove ?? []).map((t) => identity(normalizedTag(t))));
-	const add = (edit.add ?? []).map(normalizedTag);
-	const kept = tags.filter((t) => !(t.key != null && keys.has(t.key.toLowerCase()))).filter((t) => !remove.has(identity(t)));
-	const out = dedupeTags([...kept, ...add]);
+	const out = runTagEdit(tags, normalizedTagEdit(edit));
 	if (out.length > MAX_ASSET_TAGS) throw invalid(`an asset holds at most ${MAX_ASSET_TAGS} tags`);
 	return out;
 }
 
+/** `applyTagEdit` for an edit a proposal holds, run when it is read or lands, over tags that may have changed since: it never
+ *  refuses. What would take the asset past `MAX_ASSET_TAGS` is left off (the last adds first) and an entry that does not
+ *  normalize is skipped (`TagEdit::apply_capped`). */
+export function applyTagEditCapped(tags: readonly Tag[], edit: TagEdit): Tag[] {
+	const tolerate = <T>(items: readonly T[], f: (item: T) => T): T[] =>
+		items.flatMap((item) => {
+			try {
+				return [f(item)];
+			} catch {
+				return [];
+			}
+		});
+	const lenient = {
+		add: dedupeTags(tolerate(edit.add ?? [], normalizedTag)),
+		remove: dedupeTags(tolerate(edit.remove ?? [], normalizedTag)),
+		remove_keys: [...new Set(tolerate(edit.remove_keys ?? [], normalizeKey))]
+	};
+	return runTagEdit(tags, lenient).slice(0, MAX_ASSET_TAGS);
+}
+
+/** The one edit that does `first` and then `later`: `applyTagEditCapped` of it over any tags is `later` over `first` over
+ *  them. Keys and removals add up; an add of `first` survives unless `later` takes it off (`TagEdit::then`). */
+export function tagEditThen(first: TagEdit, later: TagEdit): Required<TagEdit> {
+	const a = normalizedTagEdit(first);
+	const b = normalizedTagEdit(later);
+	const gone = (t: Tag) => (t.key != null && b.remove_keys.includes(t.key)) || b.remove.some((r) => sameTag(r, t));
+	return {
+		add: dedupeTags([...a.add.filter((t) => !gone(t)), ...b.add]),
+		remove: dedupeTags([...a.remove, ...b.remove]),
+		remove_keys: [...new Set([...a.remove_keys, ...b.remove_keys])]
+	};
+}
+
 /** `location: Cumbuco` is that tag, `location:*` any tag with the key, `jump` the plain tag (`TagFilter::parse`). */
 export function parseTagFilter(text: string): TagFilter {
-	const at = text.indexOf(':');
+	const at = keyEnd(text);
 	let term: TagFilter;
 	if (at < 0) term = { value: text };
 	else if (clean(text.slice(at + 1)) === '*') term = { key: text.slice(0, at) };
@@ -287,10 +347,13 @@ export function groupByKey(
 	return { groups: out, unmatched };
 }
 
-/** Whether a held-back change of the library is a tag change (its `tags` set) rather than a projection mark. */
-export function isTagChange(change: Pick<StagedAssetChange, 'tags'>): boolean {
-	return change.tags != null;
+/** Whether a held-back change of the library is a tag change (its `tag_edit` set) rather than a projection mark. */
+export function isTagChange(change: Pick<StagedAssetChange, 'tag_edit'>): boolean {
+	return change.tag_edit != null;
 }
+
+/** The values of `AssembleByTag.title` (`GroupTitle`). */
+const GROUP_TITLES: readonly string[] = ['overlay', 'card', 'none'];
 
 /** The longest a group's title (or card) may run (`MAX_TAG_TITLE_SECONDS`). */
 export const MAX_TAG_TITLE_SECONDS = 60;
@@ -324,6 +387,12 @@ const byTime = (a: Asset, b: Asset) => Date.parse(a.imported_at) - Date.parse(b.
 /** `Project::assemble_by_tag_inputs`: which of `library` go in which group, in order, for `req`. Refuses a title length
  *  out of range, a bad filter term, key or order entry, and a request no asset answers. */
 export function planAssembleByTag(library: readonly Asset[], req: AssembleByTag): AssemblePlan {
+	if (req.title != null && !GROUP_TITLES.includes(req.title)) {
+		throw invalid(`unknown title "${req.title}": expected ${GROUP_TITLES.join(', ')}`);
+	}
+	if (req.sort_within != null && req.sort_within !== 'imported' && req.sort_within !== 'name') {
+		throw invalid(`unknown sort_within "${req.sort_within}": expected imported, name`);
+	}
 	const seconds = req.title_seconds ?? DEFAULT_TAG_TITLE_SECONDS;
 	if (!(Number.isFinite(seconds) && seconds > 0 && seconds <= MAX_TAG_TITLE_SECONDS)) {
 		throw invalid(`title_seconds is a number of seconds above 0 and at most ${MAX_TAG_TITLE_SECONDS}`);

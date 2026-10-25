@@ -354,10 +354,10 @@ fn timeline_to_json(timeline: &Timeline) -> Result<String> {
     Ok(serde_json::to_string(timeline)?)
 }
 
-/// `asset` with one held-back change applied: its tags, or else its projection.
+/// `asset` with one held-back change applied: its tag edit run over its tags as they are, or else its projection.
 fn apply_asset_change_to(asset: &mut Asset, change: &StagedAssetChange) {
-    match &change.tags {
-        Some(tags) => asset.tags.clone_from(tags),
+    match &change.tag_edit {
+        Some(edit) => asset.tags = edit.apply_capped(&asset.tags),
         None => {
             for stream in asset.streams.iter_mut().filter(|s| s.kind == StreamKind::Video) {
                 stream.projection = change.projection;
@@ -6356,7 +6356,7 @@ impl Project {
             id: id.clone(),
             asset_id: asset.id,
             projection,
-            tags: None,
+            tag_edit: None,
             summary: label.clone(),
         });
         self.stage_asset_changes(label, vec![(id, change)])?;

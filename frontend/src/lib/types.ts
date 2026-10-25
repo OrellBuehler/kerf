@@ -1508,16 +1508,17 @@ export interface StagedEdit {
 }
 
 /** A change to an *asset* an agent made while a proposal was open (`kerf_core::StagedAssetChange`): either a projection
- *  mark (`tags` absent) or a tag change (`tags` set). Show `summary`; do not read `projection` of a tag change, which is
- *  `null` without meaning "mark as flat". */
+ *  mark (`tag_edit` absent) or a tag change (`tag_edit` set). Show `summary`; do not read `projection` of a tag change, which
+ *  is `null` without meaning "mark as flat". */
 export interface StagedAssetChange {
 	/** `asset_projection:<asset id>` or `asset_tags:<asset id>`, usable wherever a `DiffEntry.id` is. */
 	id: string;
 	asset_id: string;
 	/** The projection the asset is to be marked with; `null` clears it. Not read by a tag change (it is `null`). */
 	projection: Projection | null;
-	/** A tag change: the asset's whole tag list once it lands (empty clears them). Absent for a projection mark. */
-	tags?: Tag[];
+	/** A tag change: the agent's edits to the asset's tags composed into one (`TagEdit::then`). It is run over the tags
+	 *  the asset has when it lands, so what the user tagged in between stays. Absent for a projection mark. */
+	tag_edit?: TagEdit;
 	/** One line for the review card, e.g. `Mark interview.mp4 as equirect 360` or `Tag clip.mp4: +location: Cumbuco, -jump`. */
 	summary: string;
 }

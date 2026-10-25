@@ -10,7 +10,7 @@ use super::{default_track, Project};
 use crate::error::{Error, Result};
 use crate::model::{
     group_by_key, tags_match, Asset, Clip, EditSource, StagedAssetChange, StreamKind, SvgPresetKind, SvgPresetParams, Tag,
-    TagEdit, TagFilter, TagSummary, TitleClip, Track,
+    TagEdit, TagFilter, TagSummary, Timeline, TitleClip, Track,
 };
 use crate::svg::{check_params, render_preset, SvgDoc};
 
@@ -177,6 +177,33 @@ impl AssemblePlan {
     }
 }
 
+/// Put a sound-only `clip` on the first unlocked audio track with nothing over its span, or on a new audio track.
+fn place_sound(timeline: &mut Timeline, clip: Clip) -> Result<()> {
+    let (start, end) = (clip.timeline_start, clip.timeline_end());
+    let free = |t: &Track| {
+        t.kind == StreamKind::Audio && !t.locked && t.clips.iter().all(|c| c.timeline_end() <= start || c.timeline_start >= end)
+    };
+    let tid = match timeline.tracks.iter().find(|t| free(t)) {
+        Some(t) => t.id,
+        None => {
+            let count = timeline.tracks.iter().filter(|t| t.kind == StreamKind::Audio).count();
+            let track = Track::new(StreamKind::Audio, format!("A{}", count + 1));
+            let id = track.id;
+            timeline.tracks.push(track);
+            id
+        }
+    };
+    let track = timeline.track_mut(tid).ok_or(Error::TrackNotFound(tid))?;
+    track.clips.push(clip);
+    track.sort_by_start();
+    Ok(())
+}
+
+/// Whether two tag lists hold the same tags in the same spelling, in whatever order (they hold no repeats).
+fn same_spelling(a: &[Tag], b: &[Tag]) -> bool {
+    a.len() == b.len() && a.iter().all(|t| b.contains(t))
+}
+
 /// How a tag change reads in a review line: `Tag clip.mp4: +location: Cumbuco, -jump`.
 fn tag_change_summary(name: &str, from: &[Tag], to: &[Tag]) -> String {
     let parts: Vec<String> = to
@@ -197,9 +224,10 @@ impl Project {
     /// apply to one of them (an invalid tag, past 64 tags), refuses the lot and writes nothing. Returns the assets
     /// as the caller sees them. Not an edit of the cut, so no revision.
     ///
-    /// As the agent with review on (or a proposal open) the new tag lists are held back with the proposal as
-    /// [`StagedAssetChange`]s — `asset_tags:<asset id>`, each the asset's whole tag list — and land when it is
-    /// accepted, replacing the asset's tags as they are then; the agent's own reads see them meanwhile.
+    /// As the agent with review on (or a proposal open) the edit is held back with the proposal as one
+    /// [`StagedAssetChange`] per asset — `asset_tags:<asset id>`, the agent's edits to it composed into one — and runs
+    /// over the asset's tags as they are when the proposal is accepted (a tag the user added meanwhile stays; adds past
+    /// 64 tags are left off). The agent's own reads see it meanwhile, over the tags as they are then.
     pub fn edit_asset_tags(&self, asset_ids: &[Uuid], edit: &TagEdit) -> Result<Vec<Asset>> {
         if asset_ids.is_empty() {
             return Err(Error::InvalidArgument("name at least one asset to tag".to_string()));
@@ -224,12 +252,12 @@ impl Project {
             })
             .collect::<Result<Vec<_>>>()?;
         if self.actor == EditSource::Agent && (self.staged_exists()? || self.agent_review.get()) {
-            return self.stage_asset_tags(planned);
+            return self.stage_asset_tags(planned, edit);
         }
         let tx = self.tx()?;
         let mut out = Vec::with_capacity(planned.len());
         for (mut asset, tags) in planned {
-            if asset.tags != tags {
+            if !same_spelling(&asset.tags, &tags) {
                 self.conn.execute(
                     "UPDATE assets SET tags = ?1 WHERE id = ?2",
                     rusqlite::params![super::tags_column(&tags)?, asset.id.to_string()],
@@ -242,20 +270,31 @@ impl Project {
         Ok(out)
     }
 
-    /// Hold the tag lists back with the agent's proposal, one step for all of them.
-    fn stage_asset_tags(&self, planned: Vec<(Asset, Vec<Tag>)>) -> Result<Vec<Asset>> {
+    /// Hold the edit back with the agent's proposal as one step for all the assets it changes. Each asset's pending change
+    /// is its earlier edits composed with this one ([`TagEdit::then`]), so it is run over the tags the asset has when it is
+    /// read, the user's later ones included; an asset the edit leaves as the agent already sees it stages nothing, and one it
+    /// brings back to what the library has withdraws its change.
+    fn stage_asset_tags(&self, planned: Vec<(Asset, Vec<Tag>)>, edit: &TagEdit) -> Result<Vec<Asset>> {
+        let pending = self.pending_asset_changes()?;
         let mut changes = Vec::with_capacity(planned.len());
         let mut out = Vec::with_capacity(planned.len());
         let mut label = None;
         for (mut asset, tags) in planned {
+            if same_spelling(&asset.tags, &tags) {
+                out.push(asset);
+                continue;
+            }
             let stored = self.stored_asset(asset.id)?.ok_or(Error::AssetNotFound(asset.id))?;
             let id = StagedAssetChange::tags_id(asset.id);
-            let summary = tag_change_summary(&asset.name, &stored.tags, &tags);
-            let change = (stored.tags != tags).then(|| StagedAssetChange {
+            let earlier = pending.iter().find(|c| c.id == id).and_then(|c| c.tag_edit.clone());
+            let composed = earlier.unwrap_or_default().then(edit)?;
+            let landed = composed.apply_capped(&stored.tags);
+            let summary = tag_change_summary(&asset.name, &stored.tags, &landed);
+            let change = (!same_spelling(&landed, &stored.tags)).then(|| StagedAssetChange {
                 id: id.clone(),
                 asset_id: asset.id,
                 projection: None,
-                tags: Some(tags.clone()),
+                tag_edit: Some(composed),
                 summary: summary.clone(),
             });
             label = Some(summary);
@@ -263,9 +302,10 @@ impl Project {
             asset.tags = tags;
             out.push(asset);
         }
-        let label = match (label, out.len()) {
+        let label = match (label, changes.len()) {
+            (_, 0) => return Ok(out),
             (Some(one), 1) => one,
-            _ => format!("Tag {} assets", out.len()),
+            (_, n) => format!("Tag {n} assets"),
         };
         self.stage_asset_changes(label, changes)?;
         Ok(out)
@@ -342,10 +382,11 @@ impl Project {
 
     /// The locked last step of [`Project::assemble_by_tag`]: append the groups to the end of the cut as **one**
     /// `Assemble by <key>` edit (staged for an agent, rippled and sync-locked like any), whole assets with their
-    /// own sound as [`Project::concatenate`] lays them. The first clip starts at the end of the tracks the assets
-    /// land on; a group's clips follow one another across tracks. A title is a title clip: a card on the first
-    /// video track free over its span, an overlay on the first one free over the group's first clip (a new track
-    /// above when none is).
+    /// own sound as [`Project::concatenate`] lays them. The first clip starts at the end of the picture track when
+    /// the assets include any picture (a long music bed does not push the picture out), else at the end of the first
+    /// audio track; a group's clips follow one another across tracks, a sound-only one on the first audio track free
+    /// over its span (a new one when a bed is in the way). A title is a title clip: a card on the first video track free
+    /// over its span, an overlay on the first one free over the group's first clip (a new track above when none is).
     pub fn apply_assemble_by_tag(&self, prepared: PreparedAssemble) -> Result<AssembleSummary> {
         let PreparedAssemble { plan, titles } = prepared;
         let mut groups = Vec::with_capacity(plan.groups.len());
@@ -371,15 +412,17 @@ impl Project {
             )
         };
         self.edit_named(&[], label, |timeline| {
-            let mut targets = Vec::new();
-            for asset in groups.iter().flat_map(|g| &g.assets) {
-                targets.push(default_track(timeline, asset.primary_kind())?);
-            }
-            let mut cursor = targets
-                .iter()
-                .filter_map(|id| timeline.track(*id))
-                .map(Track::end)
-                .fold(0.0, f64::max);
+            let assets: Vec<&Asset> = groups.iter().flat_map(|g| &g.assets).collect();
+            let picture = assets.iter().any(|a| a.primary_kind() == StreamKind::Video);
+            let mut cursor = if picture {
+                let video = default_track(timeline, StreamKind::Video)?;
+                timeline.track(video).map_or(0.0, Track::end)
+            } else {
+                timeline
+                    .first_unlocked_track_of(StreamKind::Audio)
+                    .and_then(|id| timeline.track(id))
+                    .map_or(0.0, Track::end)
+            };
             let mut summary = AssembleSummary {
                 groups: Vec::with_capacity(groups.len()),
                 clip_ids: Vec::new(),
@@ -409,11 +452,15 @@ impl Project {
                 }
                 let first = cursor;
                 for asset in &group.assets {
-                    let tid = default_track(timeline, asset.primary_kind())?;
                     let clip = Clip::for_asset(asset, 0.0, asset.duration, cursor);
                     cursor = clip.timeline_end();
                     summary.clip_ids.push(clip.id);
-                    timeline.track_mut(tid).ok_or(Error::TrackNotFound(tid))?.clips.push(clip);
+                    if asset.primary_kind() == StreamKind::Video {
+                        let tid = default_track(timeline, StreamKind::Video)?;
+                        timeline.track_mut(tid).ok_or(Error::TrackNotFound(tid))?.clips.push(clip);
+                    } else {
+                        place_sound(timeline, clip)?;
+                    }
                 }
                 if let (Some(t), GroupTitle::Overlay) = (title, plan.title) {
                     check_title_room(timeline)?;

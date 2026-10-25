@@ -721,7 +721,7 @@ its pending tags count) answers core's `TagSummary`. `edit_asset_tags { asset_id
 `asset_changes`, with it off it lands live; no revision either way) and answers `{assets: [{id, name, tags}]}`. `assemble_by_tag` takes core's
 `AssembleByTag` as its parameters (schema and field docs come from `kerf-core`) and is the `add_title_clip` shape: `assemble_by_tag_inputs` +
 `prepare` on the blocking pool as this session (titles drawn with the lock released), then `edit(apply_assemble_by_tag)`; one staged step, not
-batchable. Tags are objects, not `"key: value"` strings, in every argument.
+batchable. Tags are objects, not `"key: value"` strings, in every argument; `edit_asset_tags`' `add` / `remove` entries refuse a member other than `key` and `value` (`TagArg`, `deny_unknown_fields`: `{"keys":…}` is `invalid_params`, not a plain tag), while the model's `Tag` stays lenient for what is stored. A staged `asset_tags:<id>` entry carries `tag_edit` (the agent's edits composed), not the list they made.
 `get_asset_metadata` and `analyze_asset` answer an `AnalysisSummary` (counts, totals,
 the first ~600 characters of the transcript); `get_transcript` and `get_analysis_detail` page the lists (`offset` / `limit`,
 `next_offset`, windows in source seconds; `get_transcript` also takes `speaker` and `words`: the lines carry their speaker label and the

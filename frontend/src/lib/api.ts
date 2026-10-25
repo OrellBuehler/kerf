@@ -3296,10 +3296,17 @@ function devAssembleByTag(request: AssembleByTag): AssembleEdit {
 	const env = devEnv(false, undefined);
 	let tl = structuredClone(devTimeline);
 	const kindOf = (a: Asset): Track['kind'] => (a.streams.some((s) => s.kind === 'video') ? 'video' : 'audio');
-	let cursor = 0;
-	for (const asset of plan.groups.flatMap((g) => g.assets)) {
-		cursor = Math.max(cursor, trackEnd(ops.defaultTrack(tl, kindOf(asset))));
-	}
+	// From the end of the picture track when the plan has any picture, else of the audio track: a long bed does not push it out.
+	const picture = plan.groups.some((g) => g.assets.some((a) => kindOf(a) === 'video'));
+	let cursor = trackEnd(ops.defaultTrack(tl, picture ? 'video' : 'audio'));
+	// A sound alone goes on the first audio track with nothing over its span, else on a new one (`place_sound`).
+	const soundTrack = (at: number, seconds: number): string => {
+		const free = (t: Track) =>
+			t.kind === 'audio' && !t.locked && t.clips.every((c) => c.timeline_start + clipDuration(c) <= at || c.timeline_start >= at + seconds);
+		let track = tl.tracks.find(free);
+		if (!track) tl.tracks.push((track = { id: uid(), kind: 'audio', name: `A${tl.tracks.filter((t) => t.kind === 'audio').length + 1}`, clips: [] }));
+		return track.id;
+	};
 	const art = plan.title === 'card' ? 'fade_up' : 'lower_third';
 	const title = (value: string, at: number, seconds: number) => {
 		const clip = titleClip({ name: value, svg: svgPresetArt(art, { text: value }) }, at, seconds);
@@ -3318,7 +3325,7 @@ function devAssembleByTag(request: AssembleByTag): AssembleEdit {
 		}
 		const first = cursor;
 		for (const asset of group.assets) {
-			const done = ops.addClip(tl, env, asset, null, 0, asset.duration, cursor);
+			const done = ops.addClip(tl, env, asset, kindOf(asset) === 'audio' ? soundTrack(cursor, asset.duration) : null, 0, asset.duration, cursor);
 			tl = done.timeline;
 			clipIds.push(done.result.id);
 			cursor = done.result.timeline_start + clipDuration(done.result);

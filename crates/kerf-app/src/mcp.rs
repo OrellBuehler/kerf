@@ -1322,6 +1322,24 @@ struct AssetProjectionParams {
     projection: Option<Projection>,
 }
 
+/// A tag as `edit_asset_tags` takes it. [`Tag`] itself reads what it knows and drops the rest, so a misspelt
+/// `{"keys":"location","value":"Cumbuco"}` would have become the plain tag `Cumbuco`; this refuses the field.
+#[derive(Debug, Clone, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct TagArg {
+    key: Option<String>,
+    value: String,
+}
+
+impl From<TagArg> for Tag {
+    fn from(arg: TagArg) -> Self {
+        Tag {
+            key: arg.key,
+            value: arg.value,
+        }
+    }
+}
+
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct EditAssetTagsParams {
     #[schemars(description = "UUIDs of the assets to change: one, or many to tag a whole batch in one call")]
@@ -1331,12 +1349,12 @@ struct EditAssetTagsParams {
                        key, {\"value\":\"jump\"}. Whitespace is tidied, a key is lowercased, a tag already there (ignoring \
                        case) is left as it is. A key is at most 32 characters, a value 64, an asset holds 64 tags"
     )]
-    add: Option<Vec<Tag>>,
+    add: Option<Vec<TagArg>>,
     #[schemars(
         description = "Tags to take off, spelled as in `add` (matched ignoring case; a plain tag only takes off a plain tag, \
                        `jump` leaves `style: jump`). One that is not there is ignored"
     )]
-    remove: Option<Vec<Tag>>,
+    remove: Option<Vec<TagArg>>,
     #[schemars(description = "Keys to take every tag of off, e.g. [\"location\"] clears all the locations of an asset")]
     remove_keys: Option<Vec<String>>,
 }
@@ -4119,8 +4137,8 @@ impl KerfMcp {
             .map(|s| parse_arg("asset_ids", s))
             .collect::<Result<Vec<Uuid>, _>>()?;
         let edit = TagEdit {
-            add: p.add.unwrap_or_default(),
-            remove: p.remove.unwrap_or_default(),
+            add: p.add.unwrap_or_default().into_iter().map(Tag::from).collect(),
+            remove: p.remove.unwrap_or_default().into_iter().map(Tag::from).collect(),
             remove_keys: p.remove_keys.unwrap_or_default(),
         };
         self.edit(|project| {
@@ -7956,7 +7974,7 @@ mod tests {
         log_tool_error, png_result, refuse_overwrite, reject_unknown_arguments, require_window, router, server_identity,
         sheet_grid, svg_moments, svg_preview, svg_sheet_caption, svg_sheet_times, svg_source, timeline_sheet_caption, track_gaps,
         variant_output, variants_message, with_frame, AtomicI64, ClipMoveParams, EditAssetTagsParams, KerfMcp, Ordering,
-        Parameters, Shell, SkimTimelineParams, SvgMoments, SvgOverlaySummary, SvgPreviewTitle, SvgValidation, Tag,
+        Parameters, Shell, SkimTimelineParams, SvgMoments, SvgOverlaySummary, SvgPreviewTitle, SvgValidation, TagArg,
     };
 
     /// The resources read what the polling tools answer: the project's brief, the queue's first
@@ -11016,12 +11034,44 @@ mod tests {
         asset
     }
 
-    fn tag(key: Option<&str>, value: &str) -> Tag {
-        Tag::new(key, value).unwrap()
+    fn tag(key: Option<&str>, value: &str) -> TagArg {
+        TagArg {
+            key: key.map(str::to_string),
+            value: value.to_string(),
+        }
     }
 
     fn answer(text: String) -> serde_json::Value {
         serde_json::from_str(&text).unwrap()
+    }
+
+    /// A tag `edit_asset_tags` is given names only `key` and `value`: a misspelt member is the caller's mistake, not a
+    /// plain tag that quietly lost its key.
+    #[test]
+    fn a_misspelt_tag_member_is_refused() {
+        let call = |add: serde_json::Value| {
+            serde_json::from_value::<EditAssetTagsParams>(serde_json::json!({
+                "asset_ids": ["00000000-0000-0000-0000-000000000001"],
+                "add": add,
+                "remove": add,
+            }))
+            .map(|p| (p.add.map_or(0, |a| a.len()), p.remove.map_or(0, |a| a.len())))
+            .map_err(|e| e.to_string())
+        };
+        assert_eq!(
+            call(serde_json::json!([{"key": "location", "value": "X"}, {"value": "jump"}])),
+            Ok((2, 2))
+        );
+        let typo = call(serde_json::json!([{"keys": "location", "value": "X"}])).unwrap_err();
+        assert!(typo.contains("unknown field `keys`"), "{typo}");
+        let missing = call(serde_json::json!([{"key": "location"}])).unwrap_err();
+        assert!(missing.contains("missing field `value`"), "{missing}");
+        let extra = serde_json::from_value::<EditAssetTagsParams>(serde_json::json!({
+            "asset_ids": [], "add": [{"value": "x", "colour": "red"}]
+        }))
+        .unwrap_err()
+        .to_string();
+        assert!(extra.contains("unknown field `colour`"), "{extra}");
     }
 
     /// The agent tags assets and builds a cut from them: with review on both are held back with its
@@ -11081,7 +11131,7 @@ mod tests {
             assert!(staged
                 .asset_changes
                 .iter()
-                .all(|c| c.id.starts_with("asset_tags:") && c.tags.is_some()));
+                .all(|c| c.id.starts_with("asset_tags:") && c.tag_edit.is_some()));
         }
 
         let vocabulary = answer(server.list_tags().unwrap());
@@ -11140,10 +11190,7 @@ mod tests {
         let empty = server
             .edit_asset_tags(Parameters(EditAssetTagsParams {
                 asset_ids: ids(&[&a]),
-                add: Some(vec![Tag {
-                    key: None,
-                    value: "  ".to_string(),
-                }]),
+                add: Some(vec![tag(None, "  ")]),
                 remove: None,
                 remove_keys: None,
             }))

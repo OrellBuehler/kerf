@@ -179,7 +179,7 @@
   `persisted/timelines-v14.json` holds a clip on a ramp with a held segment.
   v14→v15 adds `assets.tags` (JSON `Tag` list, NULL for none; a probe-and-`ALTER`, `needed` exactly when the column is missing,
   `needed_to_read` true) and changes the shape of `staged.assets`: a held-back `StagedAssetChange` may be a tag change
-  (`"tags"` beside `"projection"`), which an older build would read as a projection change and so clear the asset's projection
+  (`"tag_edit"` beside `"projection"`), which an older build would read as a projection change and so clear the asset's projection
   on accept (`a_v14_file_gains_the_tags_column_and_keeps_a_backup`); no timeline JSON moves, so there is no `persisted/` file for v15.
   The schema is at **v15** (`SCHEMA_VERSION`). `persist_tests` pins which steps a file has pending with
   `store::pending_steps` (a legacy file that has every column: `[4, 5, 6, 7, 8, 9, 10, 11, 12, 13]`). A step's `needed_to_read` says whether a build that
@@ -807,9 +807,13 @@
   -> Vec<Asset>` resolves every asset and applies the edit to each before writing any (an unknown id, an invalid tag or the
   65th tag refuses the lot), then writes in one transaction with `UPDATE assets SET tags` — no revision. As the agent with
   review on or a proposal open it instead stages one `StagedAssetChange { id: "asset_tags:<asset id>", projection: null,
-  tags: Some(whole list), summary: "Tag clip.mp4: +location: Cumbuco, -jump" }` per asset (a later edit builds on the pending
-  list and replaces that entry; one equal to the stored list withdraws it); accepting an entry **replaces the asset's tags
-  with that list**, so a tag the user added live in between is lost (the same is true of a projection). `list_tags() ->
+  tag_edit: Some(edit), summary: "Tag clip.mp4: +location: Cumbuco, -jump" }` per asset. **The held change is a delta, not
+  a snapshot**: the agent's edits to the asset composed into one `TagEdit` (`TagEdit::then`: keys and removals add up, an add a
+  later edit takes off drops out), run over the asset's tags **as they are when it is read** (`TagEdit::apply_capped`) — by the
+  agent's `get_asset` / `list_assets` / `list_tags`, and at accept — so a tag the user added live in between is kept, and what
+  would take the asset past 64 tags is left off (the last adds first) rather than failing the accept. An edit that leaves the
+  agent's view as it is (same tags, same spelling, any order) stages nothing and pushes no undo step; one that brings the asset back
+  to what the library has withdraws its change. `list_tags() ->
   TagSummary` and `list_assets_tagged(&[TagFilter])` read the agent's view. **`assemble_by_tag`** is three steps so the titles
   are read with the lock released: `assemble_by_tag_inputs(&AssembleByTag) -> AssemblePlan` (under the lock: the agent's view
   of the library filtered, sorted within by `imported_at` or name, grouped with `group_by_key`; no asset matching is an error),
@@ -817,9 +821,10 @@
   preset rendered for the working timeline's frame and `SvgDoc::parse`d), `apply_assemble_by_tag(PreparedAssemble) ->
   AssembleSummary` (one `edit_named` revision `Assemble by <key> (N groups, M clips)`, so ripple, the sync lock and an agent's
   staging apply). `assemble_by_tag(req)` runs all three for a caller with no lock. Layout: the first clip starts at the end of
-  the tracks the assets land on (their default track by kind, as `concatenate` lays one) and a cursor then runs on across
-  groups and tracks, so a picture-and-sound asset is one clip with its own sound and a sound-only one follows on the audio
-  track. A **card** is a title clip of `title_seconds` placed first (on the lowest free video track, V1); an **overlay** is
+  the picture track (the first unlocked video track) when the plan has any picture, else at the end of the first audio track,
+  so a long music bed on A1 does not push the picture out leaving black; a cursor then runs on across groups, so a
+  picture-and-sound asset is one clip with its own sound and a sound-only one follows on the first unlocked audio track free
+  over its span (a new `A{n}` when a bed is in the way). A **card** is a title clip of `title_seconds` placed first (on the lowest free video track, V1); an **overlay** is
   one over `min(title_seconds, first clip)` of the group's first clip, placed after the clips so it lands on the lowest free
   video track above them. The titles are title clips (`place`, `check_title_room`, the cap of 50 refuses the assembly whole)
   whose preset was rendered once for its span: like custom artwork it is not retimed by a later trim. The untagged group has no

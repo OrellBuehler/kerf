@@ -157,14 +157,14 @@ fn the_stored_change_of_an_older_build_still_reads() {
     let old = r#"{"id":"asset_projection:00000000-0000-0000-0000-000000000001","asset_id":"00000000-0000-0000-0000-000000000001","projection":"equirect","summary":"Mark a.mp4 as equirect 360"}"#;
     let change: StagedAssetChange = serde_json::from_str(old).unwrap();
     assert_eq!(change.projection, Some(Projection::Equirect));
-    assert_eq!(change.tags, None);
+    assert_eq!(change.tag_edit, None);
     let cleared: StagedAssetChange = serde_json::from_str(
         r#"{"id":"asset_projection:00000000-0000-0000-0000-000000000001","asset_id":"00000000-0000-0000-0000-000000000001","projection":null,"summary":"x"}"#,
     )
     .unwrap();
-    assert_eq!((cleared.projection, cleared.tags), (None, None));
+    assert_eq!((cleared.projection, cleared.tag_edit), (None, None));
     assert!(
-        !serde_json::to_string(&change).unwrap().contains("tags"),
+        !serde_json::to_string(&change).unwrap().contains("tag_edit"),
         "a projection change is written as it always was"
     );
 
@@ -172,11 +172,19 @@ fn the_stored_change_of_an_older_build_still_reads() {
         id: StagedAssetChange::tags_id(Uuid::nil()),
         asset_id: Uuid::nil(),
         projection: None,
-        tags: Some(Vec::new()),
+        tag_edit: Some(TagEdit {
+            add: tags(&["jump"]),
+            remove_keys: vec!["location".into()],
+            ..Default::default()
+        }),
         summary: "Tag a.mp4".into(),
     };
     let json = serde_json::to_value(&tagged).unwrap();
-    assert_eq!(json["tags"], serde_json::json!([]), "an empty list is a change that clears");
+    assert_eq!(
+        json["tag_edit"],
+        serde_json::json!({"add": [{"value": "jump"}], "remove_keys": ["location"]}),
+        "the composed edit, with its empty parts left out"
+    );
     assert_eq!(serde_json::from_value::<StagedAssetChange>(json).unwrap(), tagged);
 
     // And a proposal row an older build stored loads with its projection change.
@@ -184,7 +192,7 @@ fn the_stored_change_of_an_older_build_still_reads() {
     p.set_actor(EditSource::Agent);
     p.set_asset_projection(a[0].id, Some(Projection::Equirect)).unwrap();
     let held: String = p.conn.query_row("SELECT assets FROM staged", [], |r| r.get(0)).unwrap();
-    assert!(!held.contains("\"tags\""), "{held}");
+    assert!(!held.contains("tag_edit"), "{held}");
     p.set_actor(EditSource::User);
     let staged = p.staged().unwrap().unwrap();
     assert_eq!(staged.asset_changes[0].projection, Some(Projection::Equirect));
@@ -224,8 +232,9 @@ fn an_agents_tags_are_held_with_its_proposal_and_land_with_it() {
         staged.asset_changes
     );
     assert_eq!(
-        staged.asset_changes[0].tags.as_deref().map(shown),
-        Some(vec!["keep".into(), "location: Cumbuco".into()])
+        staged.asset_changes[0].tag_edit,
+        Some(add(&["location: Cumbuco"])),
+        "the edit is held, not the list it made"
     );
     assert_eq!(staged.edits, ["Tag 2 assets"], "one step for the call");
     assert!(staged.diff.is_empty(), "the cut is untouched");
@@ -366,6 +375,177 @@ fn one_session_cannot_tag_into_a_proposal_another_owns() {
     let err = p.edit_asset_tags(&[a[0].id], &add(&["jump"])).unwrap_err();
     assert!(matches!(err, Error::StagedEditOwnedByOther), "{err:?}");
     assert!(p.staged().unwrap().unwrap().asset_changes.is_empty());
+}
+
+#[test]
+fn what_the_user_tags_while_a_proposal_is_open_is_kept_when_it_lands() {
+    let (mut p, a) = library(&[("one", &["keep", "location: Jeri"])]);
+    p.set_actor(EditSource::Agent);
+    let swap = TagEdit {
+        add: tags(&["location: Cumbuco", "jump"]),
+        remove_keys: vec!["location".into()],
+        ..Default::default()
+    };
+    p.edit_asset_tags(&[a[0].id], &swap).unwrap();
+    assert_eq!(seen(&p, a[0].id), ["keep", "location: Cumbuco", "jump"]);
+
+    // The user tags the same asset live: they take a tag off and put two on.
+    p.set_actor(EditSource::User);
+    let theirs = TagEdit {
+        add: tags(&["wave", "rider: Orell"]),
+        remove: tags(&["keep"]),
+        ..Default::default()
+    };
+    p.edit_asset_tags(&[a[0].id], &theirs).unwrap();
+    assert_eq!(seen(&p, a[0].id), ["location: Jeri", "wave", "rider: Orell"]);
+
+    // The agent's view is its edit over what the library has now.
+    p.set_actor(EditSource::Agent);
+    assert_eq!(seen(&p, a[0].id), ["wave", "rider: Orell", "location: Cumbuco", "jump"]);
+    assert_eq!(
+        p.list_tags().unwrap().keys.iter().map(|k| k.key.as_str()).collect::<Vec<_>>(),
+        ["location", "rider"]
+    );
+
+    // And accepting runs the edit over those tags, not over the ones it was made against.
+    p.set_actor(EditSource::User);
+    p.apply_staged(false).unwrap();
+    assert_eq!(seen(&p, a[0].id), ["wave", "rider: Orell", "location: Cumbuco", "jump"]);
+}
+
+#[test]
+fn a_later_agent_edit_is_composed_with_the_earlier_ones() {
+    let (mut p, a) = library(&[("one", &["keep", "location: Jeri"])]);
+    p.set_actor(EditSource::Agent);
+    p.edit_asset_tags(&[a[0].id], &add(&["jump", "location: Cumbuco"])).unwrap();
+    let later = TagEdit {
+        add: tags(&["wave"]),
+        remove: tags(&["JUMP", "keep"]),
+        remove_keys: vec!["rider".into()],
+    };
+    p.edit_asset_tags(&[a[0].id], &later).unwrap();
+    let held = p.staged().unwrap().unwrap().asset_changes;
+    assert_eq!(held.len(), 1);
+    let edit = held[0].tag_edit.clone().unwrap();
+    assert_eq!(
+        shown(&edit.add),
+        ["location: Cumbuco", "wave"],
+        "the earlier add of `jump` was taken off again"
+    );
+    assert_eq!(shown(&edit.remove), ["JUMP", "keep"]);
+    assert_eq!(edit.remove_keys, ["rider"]);
+    p.set_actor(EditSource::User);
+    p.apply_staged(false).unwrap();
+    assert_eq!(seen(&p, a[0].id), ["location: Jeri", "location: Cumbuco", "wave"]);
+}
+
+#[test]
+fn landing_a_tag_edit_never_fails_on_the_limit_it_runs_into() {
+    let full: Vec<String> = (0..62).map(|i| format!("t{i}")).collect();
+    let refs: Vec<&str> = full.iter().map(String::as_str).collect();
+    let (mut p, a) = library(&[("one", &refs)]);
+    p.set_actor(EditSource::Agent);
+    p.edit_asset_tags(&[a[0].id], &add(&["x1", "x2"])).unwrap();
+    assert_eq!(seen(&p, a[0].id).len(), 64);
+
+    // The user has since put another tag on, so there is room for one of the agent's two.
+    p.set_actor(EditSource::User);
+    p.edit_asset_tags(&[a[0].id], &add(&["u1"])).unwrap();
+    p.set_actor(EditSource::Agent);
+    assert_eq!(seen(&p, a[0].id).len(), 64, "the agent's view is capped too");
+    p.set_actor(EditSource::User);
+    p.apply_staged(false).unwrap();
+    let landed = seen(&p, a[0].id);
+    assert_eq!(landed.len(), 64);
+    assert!(landed.contains(&"u1".to_string()) && landed.contains(&"x1".to_string()));
+    assert!(!landed.contains(&"x2".to_string()), "the add that did not fit was left off");
+}
+
+#[test]
+fn a_tag_the_user_also_added_is_taken_off_by_the_agents_remove() {
+    let (mut p, a) = library(&[("one", &["keep"])]);
+    p.set_actor(EditSource::Agent);
+    p.edit_asset_tags(&[a[0].id], &add(&["jump"])).unwrap();
+    p.set_actor(EditSource::User);
+    p.edit_asset_tags(&[a[0].id], &add(&["jump"])).unwrap();
+    p.set_actor(EditSource::Agent);
+    // The user already tagged `jump`, so asking for it again changes nothing the agent sees; taking it off is a change.
+    let before = p.staged().unwrap().unwrap();
+    p.edit_asset_tags(&[a[0].id], &add(&["jump"])).unwrap();
+    assert_eq!(p.staged().unwrap().unwrap().edits, before.edits);
+    let off = TagEdit {
+        remove: tags(&["jump"]),
+        ..Default::default()
+    };
+    p.edit_asset_tags(&[a[0].id], &off).unwrap();
+    assert_eq!(seen(&p, a[0].id), ["keep"]);
+    p.set_actor(EditSource::User);
+    p.apply_staged(false).unwrap();
+    assert_eq!(
+        seen(&p, a[0].id),
+        ["keep"],
+        "the proposal took `jump` off, the user's tag with it"
+    );
+}
+
+#[test]
+fn an_edit_that_changes_nothing_for_the_agent_pushes_no_step() {
+    let (mut p, a) = library(&[("one", &["keep"]), ("two", &[])]);
+    p.set_actor(EditSource::Agent);
+    p.edit_asset_tags(&[a[0].id, a[1].id], &add(&["jump"])).unwrap();
+    let held = p.staged().unwrap().unwrap();
+    assert_eq!((held.edits.len(), held.undo_depth), (1, 1));
+
+    // The same call again, a spelling of it, and taking off then putting back in one call: nothing moves.
+    p.edit_asset_tags(&[a[0].id, a[1].id], &add(&["jump"])).unwrap();
+    p.edit_asset_tags(&[a[0].id], &add(&["JUMP"])).unwrap();
+    let churn = TagEdit {
+        add: tags(&["keep"]),
+        remove: tags(&["keep"]),
+        ..Default::default()
+    };
+    p.edit_asset_tags(&[a[0].id], &churn).unwrap();
+    let after = p.staged().unwrap().unwrap();
+    assert_eq!((after.edits.clone(), after.undo_depth), (held.edits.clone(), 1));
+    assert_eq!(after.asset_changes, held.asset_changes);
+
+    // One asset changing among others that do not is a step of its own, labelled for the one that moved.
+    p.edit_asset_tags(&[a[0].id, a[1].id], &add(&["jump", "wave"])).unwrap();
+    let more = p.staged().unwrap().unwrap();
+    assert_eq!((more.edits.len(), more.undo_depth), (2, 2));
+    assert_eq!(more.edits[1], "Tag 2 assets");
+    p.undo_staged().unwrap();
+    assert_eq!(seen(&p, a[1].id), ["jump"]);
+}
+
+#[test]
+fn putting_a_tag_back_in_another_spelling_is_a_change() {
+    let (mut p, a) = library(&[("one", &["location: cumbuco"])]);
+    let respell = TagEdit {
+        add: tags(&["location: Cumbuco"]),
+        remove: tags(&["location: cumbuco"]),
+        ..Default::default()
+    };
+    p.set_actor(EditSource::Agent);
+    p.edit_asset_tags(&[a[0].id], &respell).unwrap();
+    assert_eq!(seen(&p, a[0].id), ["location: Cumbuco"]);
+    p.set_actor(EditSource::User);
+    p.apply_staged(false).unwrap();
+    assert_eq!(seen(&p, a[0].id), ["location: Cumbuco"]);
+    p.edit_asset_tags(
+        &[a[0].id],
+        &TagEdit {
+            add: tags(&["location: CUMBUCO"]),
+            remove: tags(&["location: cumbuco"]),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        seen(&p, a[0].id),
+        ["location: CUMBUCO"],
+        "and the same for the user's own edit"
+    );
 }
 
 // ---- the vocabulary ------------------------------------------------------------------------
@@ -767,6 +947,79 @@ fn sound_alone_lands_on_an_audio_track_after_the_picture_before_it() {
     let a1 = t.tracks.iter().find(|t| t.kind == StreamKind::Audio).unwrap();
     assert_eq!((a1.clips[0].asset_id, a1.clips[0].timeline_start), (song.id, 10.0));
     assert_eq!(picture(&project)[0].asset_id, video.id);
+}
+
+/// A project holding a 60 s untagged music bed on A1, a 10 s picture and two 5 s sounds, the last three tagged `act: one`.
+fn bed_and_footage() -> (Project, Asset, Vec<Asset>) {
+    let project = Project::open_in_memory().unwrap();
+    let now = Utc::now();
+    let make = |name: &str, seconds: f64, kinds: Vec<StreamInfo>, i: i64, tagged: bool| {
+        let mut a = asset(&format!("/{name}"), seconds, kinds);
+        a.imported_at = now + chrono::Duration::seconds(i);
+        if tagged {
+            a.tags = tags(&["act: one"]);
+        }
+        project.insert_asset(&a).unwrap();
+        a
+    };
+    let bed = make("bed.wav", 60.0, vec![stream(StreamKind::Audio)], 0, false);
+    project.add_asset_audio(bed.id).unwrap();
+    let rest = vec![
+        make(
+            "v.mp4",
+            10.0,
+            vec![stream(StreamKind::Video), stream(StreamKind::Audio)],
+            1,
+            true,
+        ),
+        make("s1.wav", 5.0, vec![stream(StreamKind::Audio)], 2, true),
+        make("s2.wav", 5.0, vec![stream(StreamKind::Audio)], 3, true),
+    ];
+    (project, bed, rest)
+}
+
+fn lane(p: &Project, kind: StreamKind, nth: usize) -> Vec<(Uuid, f64)> {
+    let t = p.timeline().unwrap();
+    let track = t.tracks.iter().filter(|t| t.kind == kind).nth(nth).unwrap();
+    track.clips.iter().map(|c| (c.asset_id, c.timeline_start)).collect()
+}
+
+#[test]
+fn a_long_music_bed_does_not_push_the_picture_out() {
+    let (p, bed, rest) = bed_and_footage();
+    let done = p
+        .assemble_by_tag(AssembleByTag {
+            title: GroupTitle::None,
+            ..AssembleByTag::new("act")
+        })
+        .unwrap();
+    assert_eq!(
+        done.groups[0].start, 0.0,
+        "from the start of the picture, not the end of the bed"
+    );
+    assert_eq!(lane(&p, StreamKind::Video, 0), [(rest[0].id, 0.0)]);
+    // The sounds follow the picture's cursor; the bed holds A1 over them, so they get a track of their own.
+    assert_eq!(lane(&p, StreamKind::Audio, 0), [(bed.id, 0.0)]);
+    assert_eq!(lane(&p, StreamKind::Audio, 1), [(rest[1].id, 10.0), (rest[2].id, 15.0)]);
+    assert_eq!(done.groups[0].end, 20.0);
+}
+
+#[test]
+fn sound_alone_starts_after_what_is_on_the_audio_track() {
+    let (p, bed, rest) = bed_and_footage();
+    p.remove_asset(rest[0].id, true).unwrap();
+    let done = p
+        .assemble_by_tag(AssembleByTag {
+            title: GroupTitle::None,
+            ..AssembleByTag::new("act")
+        })
+        .unwrap();
+    assert_eq!(done.groups[0].start, 60.0, "no picture in the plan: after the bed");
+    assert_eq!(
+        lane(&p, StreamKind::Audio, 0),
+        [(bed.id, 0.0), (rest[1].id, 60.0), (rest[2].id, 65.0)]
+    );
+    assert!(lane(&p, StreamKind::Video, 0).is_empty());
 }
 
 #[test]

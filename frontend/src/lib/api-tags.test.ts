@@ -177,6 +177,50 @@ describe('assembling a cut by a tag', () => {
 	});
 });
 
+describe('assembling in the harness as the engine does', () => {
+	const ART = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 9"><rect width="8" height="4"/></svg>';
+	const lane = (tl: Timeline, kind: 'video' | 'audio') => tl.tracks.find((t) => t.kind === kind)!.clips;
+	const endOf = (tl: Timeline, kind: 'video' | 'audio') => Math.max(0, ...lane(tl, kind).map((c) => c.timeline_start + (c.source_out - c.source_in) / (c.speed ?? 1)));
+
+	test('refuses a title it does not know, changing nothing', async () => {
+		const revisions = (await api.getHistory()).length;
+		const clipCount = clipsOf(await api.getTimeline()).length;
+		const message = await refusal(() => api.assembleByTag({ key: 'location', title: 'banner' as 'card' }));
+		expect(message).toContain('unknown title "banner"');
+		expect(await refusal(() => api.assembleByTag({ key: 'location', sort_within: 'newest' as 'name' }))).toContain('unknown sort_within');
+		expect((await api.getHistory()).length).toBe(revisions);
+		expect(clipsOf(await api.getTimeline()).length).toBe(clipCount);
+	});
+
+	test('holds to 50 titles on the tracks, refusing the whole assembly', async () => {
+		const room = 49;
+		for (let i = 0; i < room; i++) await api.addTitleClip(ART, 500 + 2 * i, 1);
+		const revisions = (await api.getHistory()).length;
+		const before = JSON.stringify(await api.getTimeline());
+		const message = await refusal(() => api.assembleByTag({ key: 'location' }));
+		expect(message).toContain('at most 50 titles');
+		expect((await api.getHistory()).length).toBe(revisions);
+		expect(JSON.stringify(await api.getTimeline())).toBe(before);
+		// With no title asked for the same assembly goes through: it adds none.
+		await api.assembleByTag({ key: 'location', title: 'none' });
+		await api.undo();
+		for (let i = 0; i < room; i++) await api.undo();
+	});
+
+	test('starts at the end of the picture, not of a long bed on the audio track', async () => {
+		for (let i = 0; i < 3; i++) await api.addAssetAudio(SONG);
+		const before = await api.getTimeline();
+		expect(endOf(before, 'audio')).toBeGreaterThan(endOf(before, 'video'));
+		// The song joins the plan as a sound alone: it follows the picture, and the bed does not push anything out.
+		await api.editAssetTags([SONG], { add: [{ key: 'location', value: 'Prea' }] });
+		const done = await api.assembleByTag({ key: 'location', title: 'none' });
+		expect(done.groups.map((x) => x.value)).toEqual(['Cumbuco', 'Jeri', 'Prea']);
+		expect(done.groups[0].start).toBe(endOf(before, 'video'));
+		await api.editAssetTags([SONG], { remove_keys: ['location'] });
+		for (let i = 0; i < 4; i++) await api.undo();
+	});
+});
+
 describe('the ask-on-import preference', () => {
 	test('is on until it is switched off, and a reset puts it back on', async () => {
 		expect((await api.getSettings()).ask_tags_on_import).toBe(true);

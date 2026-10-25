@@ -3611,7 +3611,7 @@ fn get_staged_timeline(state: State<'_, AppState>) -> CmdResult<Option<Timeline>
 fn staged_asset_changes(project: &Project) -> CmdResult<bool> {
     project
         .staged()
-        .map(|staged| staged.is_some_and(|staged| staged.asset_changes.iter().any(|c| c.tags.is_none())))
+        .map(|staged| staged.is_some_and(|staged| staged.asset_changes.iter().any(|c| c.tag_edit.is_none())))
         .map_err(|e| e.to_string())
 }
 
