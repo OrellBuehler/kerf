@@ -78,7 +78,7 @@ overwrite check), `recent_projects`, `open_recent { path }` (a vanished file is 
 `apply_staged_subset { entryIds, force? }` → `SubsetApplied`, `undo_staged_edit` → `{label, staged}`,
 `discarded_staged_edit`, `restore_discarded_edits` (a `StagedEdit` carries `owned_by_agent`, never the agent's session id);
 `apply_staged_edit`, `apply_staged_subset` and `resolve_task` make the
-proxies again when the proposal also marked assets (a 360 projection). `get_history` and `list_tasks` take optional
+proxies again when the proposal also marked assets (a 360 projection; a tag change leaves the footage alone, `staged_asset_changes` ignores it). `get_history` and `list_tasks` take optional
 `limit` / `offset` (a window from the newest end, oldest first). Ids that fail to parse name their argument
 (`invalid clip_id "…": not an id …`, `clip_ids[2]` for a list).
 
@@ -151,6 +151,12 @@ static) / `set_property_tracks { clipId, tracks }` (several numbers' keys in one
 `copy_keyframes { fromClipId, toClipId, props?, offset? }`,
 `set_reframe` / `clear_reframe` / `set_reframe_keyframes` / `add_reframe_keyframe`,
 `set_asset_projection` (asset-level 360 mark; returns the `Asset`),
+`edit_asset_tags { assetIds, edit }` (`edit` is a `TagEdit` `{add?, remove?, remove_keys?}`: one transaction, no revision; answers the `Asset`s as they now are) /
+`list_tags` (→ `TagSummary`, the vocabulary for autocomplete) / `assemble_by_tag { request }` (`AssembleByTag`; answers `AssembleEdit`,
+the refreshed `timeline` flattened with core's `AssembleSummary` `{groups, clip_ids, unmatched?}`). The tag ops are `#[tauri::command(async)]`;
+`assemble_by_tag` is `async` + `blocking` because its titles are drawn and sanitised with the project lock **released**
+(`assemble_by_tag_inputs` under `lock_user` → `AssemblePlan::prepare` free → `apply_assemble_by_tag` under it again, the shape of `add_title_clip`).
+`Asset.tags` rides on `list_assets` like any asset field; filtering the bin is the page's (`tagsMatch` in `tags.ts`), so `list_assets` takes no filter.
 `add_overlay` / `update_overlay` / `remove_overlay` / `set_overlay_keyframes`,
 `add_svg_overlay { source, start, end?, layout? }` (`source` is `{custom: svg}` or `{preset: {kind, params}}`) /
 `update_svg_overlay { overlayId, patch }` (the patch's `preset_kind` switches a preset title's kind in one edit, keeping
@@ -296,7 +302,8 @@ something unrelated costs nothing. A key that is a field of `Settings` must be i
 defaults is listed, and another round-trips every field through `save_to` / `load_from`. At most five `settings.corrupt-*` and five `settings.reset-*` copies are kept (the newest;
 `prune_backups`). The recent list is statted with the settings lock **released** (`recent_in`: read, stat, then lock and
 drop the ones the stat said were gone), so an offline share never holds up another settings write. The file also carries `time_display`
-(`timecode` | `seconds`), `reopen_last_project` and `recent_projects` (newest first, at most 10; kept by
+(`timecode` | `seconds`), `reopen_last_project`, `ask_tags_on_import` (default **on**: importing offers to tag what it brought; the
+prompt's "don't ask again" writes it off; only the page reads it, no engine state) and `recent_projects` (newest first, at most 10; kept by
 the app — `open_project`, `open_recent` and `save_project_as` push the path, `recent_projects` drops the
 files that are gone, `clear_recent_projects` empties it — and not writable by a patch) and `last_open_project` (see the
 launch paragraph; also app-kept, not in `SettingsView`).
@@ -405,7 +412,7 @@ comes back `ForbiddenUrl` and the "Release notes" button silently does nothing.
 `clear_recent_projects`, `take_launch_project`, `show_main_window`, `list_recoveries`, `recover_project`, `discard_recovery`,
 `discard_recovery_at_exit`; *library* `list_assets`, `get_asset_metadata`,
 `list_fonts`, `import_asset`, `cancel_import`, `remove_asset`, `relink_asset`, `check_relink`, `missing_assets`, `search_transcripts`,
-`paths_exist`, `set_asset_projection`; *analysis, proxies, transcription* `analyze_asset`, `cancel_analysis`, `analysis_statuses`,
+`paths_exist`, `set_asset_projection`, `edit_asset_tags`, `list_tags`, `assemble_by_tag`; *analysis, proxies, transcription* `analyze_asset`, `cancel_analysis`, `analysis_statuses`,
 `proxy_statuses`, `rebuild_proxy`, `delete_proxy`, `transcription_status`, `set_speech_model`, `download_speech_model`,
 `cancel_model_download`; *voiceover, music, stems, mixing* `voiceover_status`, `prepare_voiceover`, `generate_voiceover`,
 `cancel_voiceover`, `music_status`, `prepare_music`, `compose_music`, `cancel_music`, `get_band_balance`,

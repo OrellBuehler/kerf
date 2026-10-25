@@ -29,13 +29,14 @@ use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
 use kerf_core::{
-    Asset, AssetAnalysis, AudioEffect, CaptionFile, CaptionFormat, CaptionImportRequest, CaptionOptions, CaptionTimeBase,
-    ClipCut, ClipMove, Delivery, EditSource, ExportOptions, Filmstrip, FilmstripSheet, Fit, Grade, ImportOutcome, ImportSummary,
-    Keyframe, Levels, Mask, MissingAsset, Page, Project, Projection, Property, PropertyKey, PropertyTrack, ReframeKeyframe,
-    RelinkCheck, Relinked, RemovedAsset, Revision, SpeedKey, SplitSide, StagedEdit, StreamKind, SubsetApplied, SvgCheck,
-    SvgLayout, SvgOverlayPatch, SvgPresetInfo, SvgPresetKind, SvgPresetParams, SvgSource, Task, TemplateControl, TemplateLibrary,
-    TemplateList, TemplateSaveRequest, TemplateSaved, TextKeyframe, TimeRange, Timeline, TimelineDiff, TitleClipPatch,
-    TitleClipPlacement, TitleClipResult, TitleEdited, Transition, TransitionKind, VideoEffect, WaveformRange,
+    AssembleByTag, AssembleSummary, Asset, AssetAnalysis, AudioEffect, CaptionFile, CaptionFormat, CaptionImportRequest,
+    CaptionOptions, CaptionTimeBase, ClipCut, ClipMove, Delivery, EditSource, ExportOptions, Filmstrip, FilmstripSheet, Fit,
+    Grade, ImportOutcome, ImportSummary, Keyframe, Levels, Mask, MissingAsset, Page, Project, Projection, Property, PropertyKey,
+    PropertyTrack, ReframeKeyframe, RelinkCheck, Relinked, RemovedAsset, Revision, SpeedKey, SplitSide, StagedEdit, StreamKind,
+    SubsetApplied, SvgCheck, SvgLayout, SvgOverlayPatch, SvgPresetInfo, SvgPresetKind, SvgPresetParams, SvgSource, TagEdit,
+    TagSummary, Task, TemplateControl, TemplateLibrary, TemplateList, TemplateSaveRequest, TemplateSaved, TextKeyframe,
+    TimeRange, Timeline, TimelineDiff, TitleClipPatch, TitleClipPlacement, TitleClipResult, TitleEdited, Transition,
+    TransitionKind, VideoEffect, WaveformRange,
 };
 
 use serde::Serialize;
@@ -2534,6 +2535,49 @@ async fn set_asset_projection(
     .await
 }
 
+/// Add, take off or replace tags on assets (`edit`: `add`, `remove`, `remove_keys`, applied in that
+/// order after the keys go), all in one transaction. Returns the assets as they are now. Not an edit of the cut.
+#[tauri::command(async)]
+fn edit_asset_tags(state: State<'_, AppState>, asset_ids: Vec<String>, edit: TagEdit) -> CmdResult<Vec<Asset>> {
+    let ids = ids(&asset_ids, "asset_ids")?;
+    state.project().edit_asset_tags(&ids, &edit).map_err(|e| e.to_string())
+}
+
+/// Every tag in use across the library: the keys with their values and asset counts, and the plain tags.
+#[tauri::command(async)]
+fn list_tags(state: State<'_, AppState>) -> CmdResult<TagSummary> {
+    state.project().list_tags().map_err(|e| e.to_string())
+}
+
+/// What [`assemble_by_tag`] made: the refreshed cut and the groups laid out in it.
+#[derive(Serialize)]
+struct AssembleEdit {
+    timeline: Timeline,
+    #[serde(flatten)]
+    summary: AssembleSummary,
+}
+
+/// Lay the library out at the end of the cut grouped by the value of one tag key, a title per group. The
+/// groups are resolved under the lock, the titles drawn and read with it released, and the clips placed
+/// under it again.
+#[tauri::command]
+async fn assemble_by_tag(state: State<'_, AppState>, request: AssembleByTag) -> CmdResult<AssembleEdit> {
+    let shared = state.project.clone();
+    blocking(move || {
+        let plan = lock_user(&shared)
+            .assemble_by_tag_inputs(&request)
+            .map_err(|e| e.to_string())?;
+        let prepared = plan.prepare().map_err(|e| e.to_string())?;
+        let project = lock_user(&shared);
+        let summary = project.apply_assemble_by_tag(prepared).map_err(|e| e.to_string())?;
+        Ok(AssembleEdit {
+            timeline: project.timeline().map_err(|e| e.to_string())?,
+            summary,
+        })
+    })
+    .await
+}
+
 #[tauri::command(async)]
 fn clear_reframe(state: State<'_, AppState>, clip_id: String) -> CmdResult<Timeline> {
     let id = id(&clip_id, "clip_id")?;
@@ -3563,11 +3607,11 @@ fn get_staged_timeline(state: State<'_, AppState>) -> CmdResult<Option<Timeline>
 }
 
 /// Whether the open proposal also marks assets (a 360 projection): applying it changes the
-/// footage, so their preview proxies have to be made again.
+/// footage, so their preview proxies have to be made again. A tag change leaves the footage alone.
 fn staged_asset_changes(project: &Project) -> CmdResult<bool> {
     project
         .staged()
-        .map(|staged| staged.is_some_and(|staged| !staged.asset_changes.is_empty()))
+        .map(|staged| staged.is_some_and(|staged| staged.asset_changes.iter().any(|c| c.tags.is_none())))
         .map_err(|e| e.to_string())
 }
 
@@ -5595,6 +5639,9 @@ pub fn run() {
             clear_keyframes,
             set_reframe,
             set_asset_projection,
+            edit_asset_tags,
+            list_tags,
+            assemble_by_tag,
             clear_reframe,
             set_reframe_keyframes,
             add_reframe_keyframe,

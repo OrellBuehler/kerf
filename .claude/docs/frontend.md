@@ -1466,7 +1466,9 @@ always in the library, with a bar grid) on its own track A2 — bar ticks on the
 The library and review commands the desktop app answers have harness twins with the backend's wording:
 **`?missing=1`** leaves the b-roll and the song without a file (`missingAssets`, `relinkAsset` — kinds judged by
 extension, analysis kept only for the same file name — and `removeAsset`, which refuses a used asset without `force`
-in the backend's words), **`?recent=1`** seeds `recentProjects`, **`?exists=1`** makes `pathsExist` answer yes (the
+in the backend's words), **`?tags=1`** tags the interview (`location: Cumbuco`) and the b-roll (`location: Jeri`) — `editAssetTags`, `listTags` and `assembleByTag` run on
+the in-memory assets with the spelling, edits, filter, vocabulary and grouping of `tags.ts` (the faithful, bun-tested port of `model/tags.rs`; the
+assembly's plan, `planAssembleByTag`, is `Project::assemble_by_tag_inputs`), **`?recent=1`** seeds `recentProjects`, **`?exists=1`** makes `pathsExist` answer yes (the
 overwrite prompt), and the staged proposal carries core's entry ids so `applyStagedSubset` (the port in
 `staged-subset.ts`, tested case for case against `model/subset.rs`), `undoStagedEdit`, `discardedStagedEdit` and
 `restoreDiscardedEdits` run on it. Playback ids are `session * 2^32 + n` (`playback-id.ts`, session from

@@ -19,8 +19,9 @@ use kerf_core::{
     AudioEffect, CaptionFormat, CaptionImportRequest, CaptionOptions, CaptionStyle, CaptionTimeBase, ClipCut, ClipLut, ClipMove,
     CurvePoint, Curves, Delivery, EditSource, ExportOptions, Fit, Keyframe, Mask, MaskShape, Project, Projection, Property,
     PropertyKey, PropertyTrack, ReframeKeyframe, Region, SpeedKey, SplitSide, StreamKind, SvgCheck, SvgDoc, SvgLayout,
-    SvgOverlay, SvgOverlayPatch, SvgOverlayResult, SvgPreset, SvgPresetKind, SvgPresetParams, SvgSource, TextKeyframe, TimeRange,
-    Timeline, TitleClipPatch, TitleClipPlacement, TitleClipResult, Transition, TransitionKind, VideoEffect, Wheel, Wheels,
+    SvgOverlay, SvgOverlayPatch, SvgOverlayResult, SvgPreset, SvgPresetKind, SvgPresetParams, SvgSource, Tag, TagEdit,
+    TextKeyframe, TimeRange, Timeline, TitleClipPatch, TitleClipPlacement, TitleClipResult, Transition, TransitionKind,
+    VideoEffect, Wheel, Wheels,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
@@ -1319,6 +1320,25 @@ struct AssetProjectionParams {
                        the mark and treats the asset as ordinary flat footage"
     )]
     projection: Option<Projection>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct EditAssetTagsParams {
+    #[schemars(description = "UUIDs of the assets to change: one, or many to tag a whole batch in one call")]
+    asset_ids: Vec<String>,
+    #[schemars(
+        description = "Tags to put on, each {\"key\":\"location\",\"value\":\"Cumbuco\"} (shown `location: Cumbuco`) or, with no \
+                       key, {\"value\":\"jump\"}. Whitespace is tidied, a key is lowercased, a tag already there (ignoring \
+                       case) is left as it is. A key is at most 32 characters, a value 64, an asset holds 64 tags"
+    )]
+    add: Option<Vec<Tag>>,
+    #[schemars(
+        description = "Tags to take off, spelled as in `add` (matched ignoring case; a plain tag only takes off a plain tag, \
+                       `jump` leaves `style: jump`). One that is not there is ignored"
+    )]
+    remove: Option<Vec<Tag>>,
+    #[schemars(description = "Keys to take every tag of off, e.g. [\"location\"] clears all the locations of an asset")]
+    remove_keys: Option<Vec<String>>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -4076,6 +4096,73 @@ impl KerfMcp {
         .await?;
         self.changed();
         json(&asset)
+    }
+
+    #[tool(
+        description = "Tag whole assets so they can be found and cut together. A tag is a key and a value, \
+                       {\"key\":\"location\",\"value\":\"Cumbuco\"} (`location: Cumbuco`), or just a value, \
+                       {\"value\":\"jump\"} (a plain tag); a key is lowercased, tags compare ignoring case, and an asset \
+                       may hold several values of one key (two riders). One call changes many assets the same way: \
+                       `remove_keys` first, then `remove`, then `add`, so replacing a location is remove_keys \
+                       [\"location\"] plus add [{\"key\":\"location\",\"value\":\"Jeri\"}]. list_tags shows what is in \
+                       use (reuse its spelling) and list_assets shows and filters by tags; assemble_by_tag builds a cut \
+                       grouped by a key. A tag is the user's and yours alike: while review is on your change is held \
+                       back with your proposal for them to accept (list_assets and list_tags show it meanwhile; it is \
+                       an `asset_tags:<id>` line in staged_diff's `asset_changes`), with review off it lands at once. An \
+                       asset that does not exist, or a tag that is empty or too long, refuses the whole call and \
+                       changes nothing. Returns each asset's id, name and tags."
+    )]
+    fn edit_asset_tags(&self, Parameters(p): Parameters<EditAssetTagsParams>) -> Result<String, McpError> {
+        let ids = p
+            .asset_ids
+            .iter()
+            .map(|s| parse_arg("asset_ids", s))
+            .collect::<Result<Vec<Uuid>, _>>()?;
+        let edit = TagEdit {
+            add: p.add.unwrap_or_default(),
+            remove: p.remove.unwrap_or_default(),
+            remove_keys: p.remove_keys.unwrap_or_default(),
+        };
+        self.edit(|project| {
+            let assets = project.edit_asset_tags(&ids, &edit).map_err(core_err)?;
+            let assets: Vec<_> = assets
+                .iter()
+                .map(|a| serde_json::json!({ "id": a.id, "name": a.name, "tags": reads::tag_texts(&a.tags) }))
+                .collect();
+            json(&serde_json::json!({ "assets": assets }))
+        })
+    }
+
+    #[tool(
+        description = "Build a cut from the library grouped by a tag: one section per value of `key`, appended to the end \
+                       of the cut as ONE edit. `key` \"location\" with assets tagged `location: Cumbuco` / `location: Jeri` \
+                       makes a Cumbuco section then a Jeri section, each with its value as a title. Whole assets, picture \
+                       and sound, laid down as concatenate does (video on the first unlocked video track, audio-only \
+                       media on the first unlocked audio track); an asset with several values of the key goes in the first \
+                       one in order. Sections run A to Z unless `order` lists values first (the rest follow A to Z; an \
+                       entry no asset has comes back in `unmatched`). `filter` keeps only assets matching every term \
+                       (the `tags` terms of list_assets, e.g. [{\"key\":\"rider\",\"value\":\"Orell\"}]); \
+                       `include_untagged` puts assets without the key last, in a section with no title. `title`: \"overlay\" \
+                       (default) a lower-third title clip over the first `title_seconds` (default 3, at most 60) of the section, on a video track \
+                       above; \"card\" a title card of `title_seconds` before the section; \"none\". `sort_within` orders \
+                       a section's assets \"imported\" (default) or by \"name\". The titles are ordinary title clips \
+                       (restyle them with update_title_clip, set_transition, ...). Tag first (edit_asset_tags; list_tags \
+                       shows the keys and values), and use it on an empty cut or to extend one: it always appends. \
+                       Returns `groups` (value, asset_ids, title_clip_id, start and end in timeline seconds), `clip_ids` and \
+                       `unmatched`; an error when no asset matches."
+    )]
+    async fn assemble_by_tag(&self, Parameters(p): Parameters<kerf_core::AssembleByTag>) -> Result<String, McpError> {
+        let (project, owner) = (self.project.clone(), self.owner());
+        // The groups are decided under the lock as this session sees the library (its pending tags
+        // included); the titles are drawn and read with it released.
+        let prepared = blocking(move || {
+            let plan = lock_agent_as(&project, owner.as_deref())
+                .assemble_by_tag_inputs(&p)
+                .map_err(core_err)?;
+            plan.prepare().map_err(core_err)
+        })
+        .await?;
+        self.edit(|project| json(&project.apply_assemble_by_tag(prepared).map_err(core_err)?))
     }
 
     #[tool(
@@ -7240,6 +7327,13 @@ const EDITING_GUIDE: &str = "How to edit with Kerf. The user queues editing task
              queued, building with an ETA, failed, off) and which analyses have \
              run; in a big library pass it `fields: \"compact\"` (one short line per asset) and, to find \
              what an import added, `imported_after` set to the `newest_imported_at` it gave before the import. \
+             Assets carry TAGS the user (or you) put on them whole: `location: Cumbuco` is a keyed tag, `jump` a \
+             plain one. list_assets shows them and takes `tags` terms to narrow the list; list_tags is the \
+             vocabulary in use (each key with its values and counts) — read it before tagging, to keep the user's \
+             spelling; edit_asset_tags adds and removes tags on one asset or many (held back with your proposal \
+             like any edit). To cut a video by place, rider or any other tag, tag the assets and call \
+             assemble_by_tag with that key: one section per value, A to Z or in your `order`, each titled with \
+             its value, appended to the end of the cut as one edit. \
              timeline_summary's `media_notes` lists the cut's media whose \
              proxy is not ready (previews of it are slower; export is unaffected) \
              or whose source file is missing (missing_assets lists every asset whose file \
@@ -7861,8 +7955,8 @@ mod tests {
         caption_source, clip_moves, core_err, elide_large_svg, export_fps_of, export_message, fmt_ts, image_result,
         log_tool_error, png_result, refuse_overwrite, reject_unknown_arguments, require_window, router, server_identity,
         sheet_grid, svg_moments, svg_preview, svg_sheet_caption, svg_sheet_times, svg_source, timeline_sheet_caption, track_gaps,
-        variant_output, variants_message, with_frame, ClipMoveParams, SkimTimelineParams, SvgMoments, SvgOverlaySummary,
-        SvgPreviewTitle, SvgValidation,
+        variant_output, variants_message, with_frame, AtomicI64, ClipMoveParams, EditAssetTagsParams, KerfMcp, Ordering,
+        Parameters, Shell, SkimTimelineParams, SvgMoments, SvgOverlaySummary, SvgPreviewTitle, SvgValidation, Tag,
     };
 
     /// The resources read what the polling tools answer: the project's brief, the queue's first
@@ -10802,5 +10896,297 @@ mod tests {
         let second = super::lock_agent_edit(&shared, Some("session-b")).unwrap();
         second.add_overlay("Title".to_string(), 0.0, 2.0).unwrap();
         assert!(second.staged().unwrap().is_some());
+    }
+
+    /// The tag tools, the filter on `list_assets` and the way they are described.
+    #[test]
+    fn the_tag_tools_are_on_the_surface_and_described_for_a_model() {
+        let tools = router().list_all();
+        let tool = |name: &str| tools.iter().find(|t| t.name == name).unwrap_or_else(|| panic!("{name}"));
+        let description = |name: &str| tool(name).description.as_deref().unwrap_or_default().to_string();
+        let hint = |name: &str| tool(name).annotations.clone().unwrap();
+        let required = |name: &str| -> Vec<String> {
+            let mut required: Vec<String> = tool(name)
+                .input_schema
+                .get("required")
+                .and_then(|r| r.as_array())
+                .map(|r| r.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            required.sort();
+            required
+        };
+        assert_eq!(hint("list_tags").read_only_hint, Some(true));
+        assert!(required("list_tags").is_empty());
+        let edit = hint("edit_asset_tags");
+        assert_eq!(
+            (edit.read_only_hint, edit.destructive_hint, edit.idempotent_hint),
+            (Some(false), Some(false), Some(true))
+        );
+        assert_eq!(hint("assemble_by_tag").read_only_hint, Some(false));
+        assert_eq!(hint("assemble_by_tag").destructive_hint, Some(false));
+        assert_eq!(hint("assemble_by_tag").idempotent_hint, Some(false), "it appends every time");
+
+        assert_eq!(required("edit_asset_tags"), ["asset_ids"]);
+        for field in ["add", "remove", "remove_keys"] {
+            assert!(
+                tool("edit_asset_tags").input_schema["properties"].get(field).is_some(),
+                "{field}"
+            );
+        }
+        assert_eq!(required("assemble_by_tag"), ["key"]);
+        for field in [
+            "key",
+            "order",
+            "filter",
+            "include_untagged",
+            "title",
+            "title_seconds",
+            "sort_within",
+        ] {
+            assert!(
+                tool("assemble_by_tag").input_schema["properties"].get(field).is_some(),
+                "{field}"
+            );
+        }
+        assert!(tool("list_assets").input_schema["properties"].get("tags").is_some());
+
+        let edit = description("edit_asset_tags");
+        for needle in ["remove_keys", "location", "list_tags", "review", "whole call"] {
+            assert!(edit.contains(needle), "edit_asset_tags does not say `{needle}`: {edit}");
+        }
+        let assemble = description("assemble_by_tag");
+        for needle in [
+            "location",
+            "overlay",
+            "card",
+            "include_untagged",
+            "ONE edit",
+            "appends",
+            "unmatched",
+        ] {
+            assert!(
+                assemble.contains(needle),
+                "assemble_by_tag does not say `{needle}`: {assemble}"
+            );
+        }
+        assert!(description("list_tags").contains("assemble_by_tag") && description("list_tags").contains("plain"));
+        assert!(description("list_assets").contains("`tags`"));
+
+        let guide = super::EDITING_GUIDE;
+        for needle in ["TAGS", "list_tags", "edit_asset_tags", "assemble_by_tag"] {
+            assert!(guide.contains(needle), "the guide does not say `{needle}`");
+        }
+        let accepted = serde_json::json!({"tags": [{"key": "location", "value": "Cumbuco"}, {"value": "jump"}]});
+        assert!(reject_unknown_arguments(&call("list_assets", accepted)).is_ok());
+        let typo = serde_json::json!({"key": "location", "tittle": "card"});
+        let e = reject_unknown_arguments(&call("assemble_by_tag", typo)).unwrap_err();
+        assert!(
+            e.message.contains("tittle") && e.message.contains("title_seconds"),
+            "{}",
+            e.message
+        );
+        assert!(
+            serde_json::from_value::<kerf_core::AssembleByTag>(serde_json::json!({"key": "location", "tittle": "card"})).is_err()
+        );
+    }
+
+    fn headless_server() -> (KerfMcp, std::sync::Arc<std::sync::Mutex<kerf_core::Project>>) {
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(kerf_core::Project::open_in_memory().unwrap()));
+        let state = crate::AppState::new(
+            shared.clone(),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            crate::LaunchSlot::default(),
+            std::sync::Arc::new(kerf_core::ScrubFrames::new(kerf_core::ScrubConfig::default())),
+        );
+        let shell = Shell::Headless(std::sync::Arc::new(crate::shell::Headless::new(state, None, None)));
+        (KerfMcp::new(shared.clone(), shell), shared)
+    }
+
+    fn footage(project: &kerf_core::Project, name: &str, seconds: f64, imported: &str) -> kerf_core::Asset {
+        let asset: kerf_core::Asset = serde_json::from_value(serde_json::json!({
+            "id": uuid::Uuid::new_v4(),
+            "path": format!("/footage/{name}"),
+            "name": name,
+            "duration": seconds,
+            "streams": [{ "index": 0, "kind": "video", "codec": "h264", "width": 1920, "height": 1080, "fps": 30.0 }],
+            "imported_at": imported,
+        }))
+        .unwrap();
+        project.insert_or_get_asset(&asset).unwrap();
+        asset
+    }
+
+    fn tag(key: Option<&str>, value: &str) -> Tag {
+        Tag::new(key, value).unwrap()
+    }
+
+    fn answer(text: String) -> serde_json::Value {
+        serde_json::from_str(&text).unwrap()
+    }
+
+    /// The agent tags assets and builds a cut from them: with review on both are held back with its
+    /// proposal (the user's library and cut are untouched), the agent's own reads see them, and the
+    /// webview is told after each. A refused call changes nothing and says so as the caller's mistake.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_agent_tags_assets_and_assembles_a_cut_by_them_under_review() {
+        use rmcp::model::ErrorCode;
+        let (server, shared) = headless_server();
+        let (a, b, c) = {
+            let project = shared.lock().unwrap();
+            (
+                footage(&project, "a.mp4", 10.0, "2026-01-01T00:00:00Z"),
+                footage(&project, "b.mp4", 6.0, "2026-01-01T00:00:01Z"),
+                footage(&project, "c.mp4", 4.0, "2026-01-01T00:00:02Z"),
+            )
+        };
+        let changed = std::sync::Arc::new(AtomicI64::new(0));
+        {
+            let changed = changed.clone();
+            server.app.listen("project-changed", move |_| {
+                changed.fetch_add(1, Ordering::Relaxed);
+            });
+        }
+        let ids = |assets: &[&kerf_core::Asset]| assets.iter().map(|a| a.id.to_string()).collect::<Vec<_>>();
+
+        let done = answer(
+            server
+                .edit_asset_tags(Parameters(EditAssetTagsParams {
+                    asset_ids: ids(&[&a, &c]),
+                    add: Some(vec![tag(Some(" Location "), "Jeri"), tag(None, "jump")]),
+                    remove: None,
+                    remove_keys: None,
+                }))
+                .unwrap(),
+        );
+        assert_eq!(done["assets"][0]["name"], "a.mp4");
+        assert_eq!(done["assets"][0]["tags"], serde_json::json!(["location: Jeri", "jump"]));
+        server
+            .edit_asset_tags(Parameters(EditAssetTagsParams {
+                asset_ids: ids(&[&b]),
+                add: Some(vec![tag(Some("location"), "Cumbuco")]),
+                remove: None,
+                remove_keys: None,
+            }))
+            .unwrap();
+        assert_eq!(changed.load(Ordering::Relaxed), 2, "the webview is told after each");
+
+        {
+            let user = crate::lock_user(&shared);
+            assert!(
+                user.get_asset(a.id).unwrap().unwrap().tags.is_empty(),
+                "the library is the user's until they accept"
+            );
+            let staged = user.staged().unwrap().expect("the tags are held back as a proposal");
+            assert_eq!(staged.asset_changes.len(), 3);
+            assert!(staged
+                .asset_changes
+                .iter()
+                .all(|c| c.id.starts_with("asset_tags:") && c.tags.is_some()));
+        }
+
+        let vocabulary = answer(server.list_tags().unwrap());
+        assert_eq!(vocabulary["keys"][0]["key"], "location");
+        assert_eq!(vocabulary["keys"][0]["assets"], 3);
+        assert_eq!(
+            vocabulary["keys"][0]["values"],
+            serde_json::json!([{"value": "Cumbuco", "assets": 1}, {"value": "Jeri", "assets": 2}])
+        );
+        assert_eq!(vocabulary["plain"], serde_json::json!([{"value": "jump", "assets": 2}]));
+
+        // Cumbuco first, then Jeri; a title over the start of each section.
+        let mut req = kerf_core::AssembleByTag::new("location");
+        req.order = Some(vec!["cumbuco".to_string()]);
+        let built = answer(server.assemble_by_tag(Parameters(req)).await.unwrap());
+        let groups = built["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(
+            (groups[0]["value"].as_str(), groups[1]["value"].as_str()),
+            (Some("Cumbuco"), Some("Jeri"))
+        );
+        assert_eq!(groups[0]["asset_ids"], serde_json::json!([b.id]));
+        assert_eq!(groups[1]["asset_ids"], serde_json::json!([a.id, c.id]));
+        assert!(groups.iter().all(|g| g["title_clip_id"].is_string()));
+        assert_eq!(built["clip_ids"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            (groups[0]["start"].as_f64(), groups[1]["start"].as_f64()),
+            (Some(0.0), Some(6.0))
+        );
+        assert_eq!(changed.load(Ordering::Relaxed), 3);
+        {
+            let user = crate::lock_user(&shared);
+            assert!(
+                user.timeline().unwrap().tracks.iter().all(|t| t.clips.is_empty()),
+                "the cut is staged, not live"
+            );
+            let proposed = user.staged_timeline().unwrap().expect("the cut is in the proposal");
+            assert_eq!(
+                proposed.tracks.iter().flat_map(|t| &t.clips).count(),
+                5,
+                "three clips and two titles"
+            );
+        }
+
+        // Mistakes are the caller's, and leave nothing behind.
+        let before = changed.load(Ordering::Relaxed);
+        let unknown = server
+            .edit_asset_tags(Parameters(EditAssetTagsParams {
+                asset_ids: vec![a.id.to_string(), uuid::Uuid::new_v4().to_string()],
+                add: Some(vec![tag(None, "wave")]),
+                remove: None,
+                remove_keys: None,
+            }))
+            .unwrap_err();
+        assert_eq!(unknown.code, ErrorCode::INVALID_PARAMS);
+        let empty = server
+            .edit_asset_tags(Parameters(EditAssetTagsParams {
+                asset_ids: ids(&[&a]),
+                add: Some(vec![Tag {
+                    key: None,
+                    value: "  ".to_string(),
+                }]),
+                remove: None,
+                remove_keys: None,
+            }))
+            .unwrap_err();
+        assert_eq!(empty.code, ErrorCode::INVALID_PARAMS);
+        let nothing = server
+            .edit_asset_tags(Parameters(EditAssetTagsParams {
+                asset_ids: ids(&[&a]),
+                add: None,
+                remove: None,
+                remove_keys: None,
+            }))
+            .unwrap_err();
+        assert_eq!(nothing.code, ErrorCode::INVALID_PARAMS);
+        let not_an_id = server
+            .edit_asset_tags(Parameters(EditAssetTagsParams {
+                asset_ids: vec!["a.mp4".to_string()],
+                add: Some(vec![tag(None, "wave")]),
+                remove: None,
+                remove_keys: None,
+            }))
+            .unwrap_err();
+        assert_eq!(not_an_id.code, ErrorCode::INVALID_PARAMS);
+        let no_match = server
+            .assemble_by_tag(Parameters(kerf_core::AssembleByTag::new("rider")))
+            .await
+            .unwrap_err();
+        assert_eq!(no_match.code, ErrorCode::INVALID_PARAMS);
+        let too_long = {
+            let mut req = kerf_core::AssembleByTag::new("location");
+            req.title_seconds = 600.0;
+            server.assemble_by_tag(Parameters(req)).await.unwrap_err()
+        };
+        assert_eq!(too_long.code, ErrorCode::INVALID_PARAMS);
+        assert_eq!(
+            changed.load(Ordering::Relaxed),
+            before,
+            "a refused call tells the webview nothing"
+        );
+        assert_eq!(
+            crate::lock_user(&shared).staged().unwrap().unwrap().asset_changes.len(),
+            3,
+            "and holds nothing back"
+        );
     }
 }
