@@ -545,7 +545,7 @@ const ACTION_LIST = [
 		group: 'edit',
 		context: 'global',
 		defaults: ['Escape'],
-		hint: 'Escape also closes a menu or dialog and abandons a drag, whatever this is set to.'
+		hint: 'Clears the clip selection, and shrinks several assets picked in the media bin to one. Escape also closes a menu or dialog and abandons a drag, whatever this is set to.'
 	},
 
 	{ id: 'tool.pointer', label: 'Select tool', group: 'tools', context: 'global', defaults: ['V'] },

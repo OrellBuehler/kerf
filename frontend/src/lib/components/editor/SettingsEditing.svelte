@@ -74,3 +74,18 @@
 >
 	{@render length('title_seconds', 'title length')}
 </SettingRow>
+
+<SettingRow
+	id="ask-tags"
+	for="sw-ask-tags"
+	label="Ask for tags after importing"
+	hint="Importing media opens a prompt to tag the new files (location: Cumbuco, rider: Orell, jump), so an agent can find them and build a cut by a tag. Skip closes it; tags can always be added later from the bin or the Inspector."
+>
+	<Switch
+		id="sw-ask-tags"
+		label="Ask for tags after importing"
+		testid="ask-tags-on-import"
+		checked={settings.askTagsOnImport}
+		onchange={(on) => void settings.setAskTagsOnImport(on)}
+	/>
+</SettingRow>

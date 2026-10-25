@@ -28,6 +28,7 @@ import type {
 	Levels,
 	ModelProgress,
 	PreviewDraft,
+	TagFilter,
 	TranscriptionStatus
 } from './types';
 import { autoSteps, counterKind, kindInfo, kindOfStage, missingSteps, stepCounter, stepWords, type StepCounter } from './analysis-steps';
@@ -132,6 +133,11 @@ class EditorUi {
 	/** The Separate-stems dialog: `null` while closed, else the asset whose sound it splits and,
 	 *  when opened from a clip, the clip the stems are laid under. */
 	stemsDialog = $state<{ assetId: string; clipId: string | null } | null>(null);
+	/** The tag dialog: `null` while closed, else the assets it tags and why it opened (`import`: right after an import,
+	 *  where Skip and "Don't ask again" are offered; `bulk`: the bin's selection). */
+	tagDialog = $state<{ assetIds: string[]; mode: 'import' | 'bulk' } | null>(null);
+	/** The bin's tag filter: every term must hold (`tagsMatch`). Empty: the bin shows everything. */
+	tagFilter = $state<TagFilter[]>([]);
 	/** The Save-as-template dialog: `null` while closed, else the animated title being kept as a template. */
 	saveTemplateDialog = $state<{ overlayId: string } | null>(null);
 	/** The Fit-to-video dialog: `null` while closed, else the music clip it plans a fit for. */
@@ -321,6 +327,19 @@ class EditorUi {
 
 	closeStems() {
 		this.stemsDialog = null;
+	}
+
+	openTagDialog(assetIds: readonly string[], mode: 'import' | 'bulk' = 'bulk') {
+		if (assetIds.length > 0) this.tagDialog = { assetIds: [...assetIds], mode };
+	}
+
+	closeTagDialog() {
+		this.tagDialog = null;
+	}
+
+	/** Put `terms` in as the bin's tag filter (none: show everything again). */
+	setTagFilter(terms: readonly TagFilter[]) {
+		this.tagFilter = [...terms];
 	}
 
 	openSaveTemplate(overlayId: string) {

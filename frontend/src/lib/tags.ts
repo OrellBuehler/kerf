@@ -102,6 +102,9 @@ function identity(tag: Tag): string {
 	return JSON.stringify([tag.key == null ? null : tag.key.toLowerCase(), tag.value.toLowerCase()]);
 }
 
+/** A string that is equal for two spellings of one tag (`sameTag`'s comparison), for sets and map keys. */
+export const tagIdentity = identity;
+
 /** Whether `b` is the same tag, ignoring case (`Tag::same_as`). */
 export function sameTag(a: Tag, b: Tag): boolean {
 	return identity(a) === identity(b);

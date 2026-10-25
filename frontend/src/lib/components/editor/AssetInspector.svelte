@@ -10,6 +10,8 @@
 	import AnalysisRun from './AnalysisRun.svelte';
 	import InspectorSection from './InspectorSection.svelte';
 	import ComposedMusic from './ComposedMusic.svelte';
+	import TagChip from './TagChip.svelte';
+	import TagInput from './TagInput.svelte';
 	import { scoreTitle } from '#lib/music-score';
 	import MusicStructure from './MusicStructure.svelte';
 	import { musicSummary } from '#lib/music-ui';
@@ -29,7 +31,9 @@
 	import { tip } from '#lib/tip';
 	import { settings } from '#lib/settings.svelte';
 	import { placementOut } from '#lib/editing-prefs';
-	import type { Asset } from '#lib/types';
+	import { tidyReason } from '#lib/failure-copy';
+	import type { Asset, TagEdit } from '#lib/types';
+	import { untrack } from 'svelte';
 
 	let { asset }: { asset: Asset } = $props();
 
@@ -55,6 +59,36 @@
 	const KIND: Record<string, string> = { video: 'Video', audio: 'Audio', image: 'Still' };
 
 	const err = report;
+
+	// ---- tags ----
+	const tags = $derived(asset.tags ?? []);
+	let draft = $state('');
+	let tagError = $state('');
+	let saving = false;
+	// Another asset: what was typed, and the refusal of the last change, were about the previous one.
+	$effect(() => {
+		void asset.id;
+		untrack(() => {
+			draft = '';
+			tagError = '';
+		});
+	});
+
+	/** One tag put on or taken off, as one `edit_asset_tags`; the engine's refusal (past 64 tags) is said under the field. */
+	async function change(edit: TagEdit): Promise<boolean> {
+		if (saving) return false;
+		saving = true;
+		tagError = '';
+		try {
+			await editor.tagAssets([asset.id], edit);
+			return true;
+		} catch (e) {
+			tagError = tidyReason(e instanceof Error ? e.message : String(e));
+			return false;
+		} finally {
+			saving = false;
+		}
+	}
 </script>
 
 {#snippet row(f: Fact)}
@@ -93,6 +127,14 @@
 			</div>
 		</div>
 	</div>
+	{#if editor.selectedAssetIds.length > 1}
+		<div data-testid="asset-multi" style="margin-top:8px;display:flex;align-items:center;gap:8px;font-size:12px;color:var(--text-secondary)">
+			<span style="flex:1;min-width:0">{editor.selectedAssetIds.length - 1} more selected in the bin</span>
+			<Btn size="sm" icon="tag" iconSize={12} onclick={() => ui.openTagDialog([...editor.selectedAssetIds], 'bulk')}>
+				Tag {editor.selectedAssetIds.length} assets…
+			</Btn>
+		</div>
+	{/if}
 	{#if gone}
 		<div
 			role="alert"
@@ -142,6 +184,23 @@
 
 	<InspectorSection title="Media" summary={`${info.duration}${info.resolution ? ` · ${info.resolution}` : ''}`} open>
 		{#each facts.media as f (f.label)}{@render row(f)}{/each}
+	</InspectorSection>
+
+	<InspectorSection title="Tags" summary={tags.length === 0 ? 'none' : String(tags.length)} open>
+		<div data-testid="asset-tags" style="display:flex;flex-direction:column;gap:8px">
+			{#if tags.length > 0}
+				<div style="display:flex;flex-wrap:wrap;gap:6px">
+					{#each tags as tag (JSON.stringify(tag))}
+						<TagChip {tag} onremove={() => void change({ remove: [tag] })} />
+					{/each}
+				</div>
+			{:else}
+				<div style="font-size:12px;line-height:1.5;color:var(--text-muted)">
+					No tags. A tag like location: Cumbuco finds this later, and lets an agent build a cut by it.
+				</div>
+			{/if}
+			<TagInput bind:value={draft} exclude={tags} error={tagError} oncommit={(tag) => change({ add: [tag] })} />
+		</div>
 	</InspectorSection>
 
 	<InspectorSection title="Analysis" summary={facts.analyzed} open>
