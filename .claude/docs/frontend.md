@@ -533,7 +533,7 @@ menu (`Tag N assets…`, `Select only <the clicked asset>`); on one asset the me
 (`Append 3 shown files to the timeline`). *Showing*: a row draws its first three tags as compact
 `TagChip`s (`key: value`, key muted; `rowChips`) and `+N` with every tag in its tooltip. The Media header's tag button opens the
 vocabulary as a menu (`filterGroups` over `editor.tagVocabulary`: a group per key with `Any <key>` first, then the plain tags; a count
-in the new `meta` slot of a `MenuItem`, a tick on the terms in force); the terms are `ui.tagFilter`, ANDed through `tagsMatch`, listed
+in the new `meta` slot of a `MenuItem`, a tick on the terms in force); the terms are `ui.tagFilter`, combined with AND through `tagsMatch`, listed
 as removable chips with *Clear* over the bin, the header reads `MEDIA · 3 of 12`, and a project load clears the filter. The vocabulary is
 `listTags`, read again by a page effect whenever `tagsSignature(editor.assets)` moves; `refreshAssets` also notices tags an agent changed; every write of `editor.assets` goes through `#setAssets`, which stales a read
 in flight (`Generation`, as `refreshTimeline`), and a primary that disappears passes to another selected asset (`#pruneAssetSelection`).
