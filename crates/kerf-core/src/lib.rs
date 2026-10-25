@@ -96,11 +96,11 @@ pub use mask_plane::mask_alpha_plane;
 pub use media::{MediaResolver, OriginalMedia, ProxyMedia, SourceMedia};
 pub use model::{
     check_delivery_fps, check_speed_ramp, fmt_fps, plan_score_to_picture, ramp_is_valid, AlignOptions, AlignReport, AnalysisKind,
-    Asset, AssetAnalysis, AudioEffect, AutoIncluded, BeatReading, CaptionLayout, CaptionOptions, CaptionPlacement, CaptionStyle,
-    CaptionTimeBase, Clip, ClipCut, ClipLut, ClipMove, Color, CropFrame, CurvePoint, Curves, CutAlignment, CutLine, CutWord,
-    Delivery, DeltaRange, Detached, DetachedMany, DiffEntry, DiffKind, Easing, EditOutcome, EditSource, FitOrder, Framing,
-    Generator, Grade, HitKind, InstrumentOverrides, Keyframe, LevelReading, Levels, Marker, MarkerKind, MarkerPatch, Mask,
-    MaskShape, MasterBus, MusicScore, MusicStyle, Projection, Property, PropertyKey, PropertyTrack, RampEasing, Reframe,
+    Asset, AssetAnalysis, AudioEffect, AutoIncluded, BeatReading, BlendMode, CaptionLayout, CaptionOptions, CaptionPlacement,
+    CaptionStyle, CaptionTimeBase, Clip, ClipCut, ClipLut, ClipMove, Color, CropFrame, CurvePoint, Curves, CutAlignment, CutLine,
+    CutWord, Delivery, DeltaRange, Detached, DetachedMany, DiffEntry, DiffKind, Easing, EditOutcome, EditSource, FitOrder,
+    Framing, Generator, Grade, HitKind, InstrumentOverrides, Keyframe, LevelReading, Levels, Marker, MarkerKind, MarkerPatch,
+    Mask, MaskShape, MasterBus, MusicScore, MusicStyle, Projection, Property, PropertyKey, PropertyTrack, RampEasing, Reframe,
     ReframeKeyframe, ResolvedReframe, Revision, Rhythm, SalienceMap, ScoreHit, ScoreSection, SectionKind, SectionSpan,
     SkippedChange, SkippedDetach, SourceLimits, SpeedKey, SplitSide, StagedAssetChange, StagedEdit, StreamInfo, StreamKind,
     Subsampling, SubsetMerge, SvgOverlay, SvgOverlayPatch, SvgPreset, SvgPresetKind, SvgPresetParams, Task, TaskStatus,

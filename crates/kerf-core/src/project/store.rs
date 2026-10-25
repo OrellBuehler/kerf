@@ -120,6 +120,12 @@ const MIGRATIONS: &[Migration] = &[
         destructive: false,
         needed_to_read: false,
     },
+    Migration {
+        run: v14_to_v15,
+        needed: v14_to_v15_needed,
+        destructive: false,
+        needed_to_read: false,
+    },
 ];
 
 /// The schema this build writes and the newest it opens.
@@ -333,6 +339,19 @@ fn v13_to_v14(_: &Connection) -> rusqlite::Result<()> {
 }
 
 fn v13_to_v14_needed(_: &Connection) -> bool {
+    true
+}
+
+/// v15: a clip may carry a blend mode (`Clip.blend_mode`, `"blend_mode"` in the timeline JSON: `"multiply"`, `"screen"`,
+/// ...). It is a new field an older build drops at its next write of the clip, and the clip then composites as plain
+/// alpha-over: a screened light leak covers the shot instead of lighting it. A clip at `normal` is written as it was, so
+/// a stored one is unchanged. Nothing in the file's tables changes; the step is the version that keeps an older build
+/// out, after the file is copied aside.
+fn v14_to_v15(_: &Connection) -> rusqlite::Result<()> {
+    Ok(())
+}
+
+fn v14_to_v15_needed(_: &Connection) -> bool {
     true
 }
 

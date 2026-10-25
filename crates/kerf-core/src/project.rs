@@ -21,9 +21,9 @@ use crate::model::{default_beat_tolerance, fmt_time};
 use crate::model::{music_fit_clips, plan_music_fit, MusicFit, MusicFitReport, MAX_FIT_BARS};
 use crate::model::{AnalysisKind, CutLine};
 use crate::model::{
-    Asset, AssetAnalysis, AudioEffect, CaptionOptions, CaptionStyle, CaptionTimeBase, Clip, ClipCut, ClipMove, CropFrame,
-    Delivery, Easing, EditOutcome, EditSource, Framing, Keyframe, Levels, Marker, Mask, MasterBus, Projection, Reframe,
-    ReframeKeyframe, Revision, SourceLimits, SplitSide, StagedEdit, StreamInfo, StreamKind, Task, TaskStatus, Tempo,
+    Asset, AssetAnalysis, AudioEffect, BlendMode, CaptionOptions, CaptionStyle, CaptionTimeBase, Clip, ClipCut, ClipMove,
+    CropFrame, Delivery, Easing, EditOutcome, EditSource, Framing, Keyframe, Levels, Marker, Mask, MasterBus, Projection,
+    Reframe, ReframeKeyframe, Revision, SourceLimits, SplitSide, StagedEdit, StreamInfo, StreamKind, Task, TaskStatus, Tempo,
     TextKeyframe, TextOverlay, TimeRange, Timeline, TimelineDiff, Track, TrackLevels, TranscriptSegment, Transition, VideoEffect,
     Voiceover, MASTER_MAX_VOLUME, MASTER_MIN_CEILING_DB, MAX_CHANNEL_VOLUME, MAX_FOV, MAX_SPEED, MAX_SVG_OVERLAYS,
     MAX_SVG_SECONDS, MIN_FOV, MIN_SPEED,
@@ -5119,6 +5119,22 @@ impl Project {
         })
     }
 
+    /// How a clip composites onto the tracks below ([`BlendMode`]); `Normal` is plain alpha-over.
+    /// Only a clip on a video track draws a picture to blend.
+    pub fn set_blend_mode(&self, clip_id: Uuid, mode: BlendMode) -> Result<Clip> {
+        self.edit_timeline("Set blend mode", |timeline| {
+            let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
+            if timeline.tracks[ti].kind != StreamKind::Video {
+                return Err(Error::InvalidArgument(
+                    "a blend mode applies to a clip on a video track".to_string(),
+                ));
+            }
+            let clip = &mut timeline.tracks[ti].clips[ci];
+            clip.blend_mode = mode;
+            Ok(clip.clone())
+        })
+    }
+
     /// Set or clear (`None`) the transition that blends a clip's start with the
     /// clip preceding it on the same track. Realized at export.
     pub fn set_transition(&self, clip_id: Uuid, transition: Option<Transition>) -> Result<Clip> {
@@ -7997,6 +8013,10 @@ mod task_tests;
 /// Speed ramps at the project level: one revision, the length change rippling, a linked sound, a head trim.
 #[cfg(test)]
 mod ramp_tests;
+
+/// Blend modes at the project level: one revision, carried by a split / duplicate / paste, stored, diffed.
+#[cfg(test)]
+mod blend_tests;
 
 /// The Rust half of the differential corpus the browser harness is replayed against.
 #[cfg(test)]

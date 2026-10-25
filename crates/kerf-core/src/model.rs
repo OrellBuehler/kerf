@@ -1613,6 +1613,143 @@ impl Mask {
     }
 }
 
+/// How a clip's picture is laid onto the tracks below it. `Normal` is plain alpha-over; every
+/// other mode mixes the clip's colour with the composite under it by a formula of the two, and
+/// the clip's alpha (opacity, mask, key, a dissolve) then decides how much of that mix replaces
+/// the composite — outside the clip's picture the lower tracks are untouched.
+///
+/// Deliberately the separable modes FFmpeg's `blend` computes as the textbook defines them, per
+/// 8-bit channel in RGB (`engine::blend_chains`): its soft light, dodge, burn and subtract are
+/// other formulas, so they are not offered. Its `overlay` and `hardlight` condition on the *top*
+/// input and the bottom one respectively, the other way round from the usual names, which
+/// [`BlendMode::ffmpeg`] swaps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize, schemars::JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum BlendMode {
+    #[default]
+    Normal,
+    /// Darkens: white is neutral, black stays black.
+    Multiply,
+    /// Lightens: black is neutral, white stays white.
+    Screen,
+    /// Multiply in the composite's shadows, screen in its highlights: contrast from the clip.
+    Overlay,
+    /// Overlay with the roles swapped: the clip's own tones decide.
+    HardLight,
+    /// Linear dodge: the two summed, clipped at white.
+    Add,
+    Darken,
+    Lighten,
+    Difference,
+    /// Difference with less contrast.
+    Exclusion,
+}
+
+impl BlendMode {
+    pub const ALL: [BlendMode; 10] = [
+        BlendMode::Normal,
+        BlendMode::Multiply,
+        BlendMode::Screen,
+        BlendMode::Overlay,
+        BlendMode::HardLight,
+        BlendMode::Add,
+        BlendMode::Darken,
+        BlendMode::Lighten,
+        BlendMode::Difference,
+        BlendMode::Exclusion,
+    ];
+
+    pub fn is_normal(&self) -> bool {
+        *self == BlendMode::Normal
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            BlendMode::Normal => "normal",
+            BlendMode::Multiply => "multiply",
+            BlendMode::Screen => "screen",
+            BlendMode::Overlay => "overlay",
+            BlendMode::HardLight => "hard_light",
+            BlendMode::Add => "add",
+            BlendMode::Darken => "darken",
+            BlendMode::Lighten => "lighten",
+            BlendMode::Difference => "difference",
+            BlendMode::Exclusion => "exclusion",
+        }
+    }
+
+    /// The mode a name means: the serialized one, or a common spelling of it.
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim().to_ascii_lowercase().replace(['-', ' '], "_");
+        match s.as_str() {
+            "normal" | "none" => Some(BlendMode::Normal),
+            "multiply" => Some(BlendMode::Multiply),
+            "screen" => Some(BlendMode::Screen),
+            "overlay" => Some(BlendMode::Overlay),
+            "hard_light" | "hardlight" => Some(BlendMode::HardLight),
+            "add" | "linear_dodge" | "addition" => Some(BlendMode::Add),
+            "darken" => Some(BlendMode::Darken),
+            "lighten" => Some(BlendMode::Lighten),
+            "difference" => Some(BlendMode::Difference),
+            "exclusion" => Some(BlendMode::Exclusion),
+            _ => None,
+        }
+    }
+
+    /// FFmpeg `blend`'s name for the mode with the clip as its **top** input, `None` for `Normal`
+    /// (which is `overlay`, not `blend`).
+    pub fn ffmpeg(self) -> Option<&'static str> {
+        Some(match self {
+            BlendMode::Normal => return None,
+            BlendMode::Multiply => "multiply",
+            BlendMode::Screen => "screen",
+            BlendMode::Overlay => "hardlight",
+            BlendMode::HardLight => "overlay",
+            BlendMode::Add => "addition",
+            BlendMode::Darken => "darken",
+            BlendMode::Lighten => "lighten",
+            BlendMode::Difference => "difference",
+            BlendMode::Exclusion => "exclusion",
+        })
+    }
+
+    /// The mode in one channel, `top` the clip and `bottom` the composite, both `0..=1`: the
+    /// textbook formula FFmpeg's integer arithmetic rounds.
+    pub fn apply(self, top: f64, bottom: f64) -> f64 {
+        let (a, b) = (top, bottom);
+        let screen = |a: f64, b: f64| a + b - a * b;
+        let hard = |a: f64, b: f64| if a <= 0.5 { 2.0 * a * b } else { screen(2.0 * a - 1.0, b) };
+        match self {
+            BlendMode::Normal => a,
+            BlendMode::Multiply => a * b,
+            BlendMode::Screen => screen(a, b),
+            BlendMode::Overlay => hard(b, a),
+            BlendMode::HardLight => hard(a, b),
+            BlendMode::Add => (a + b).min(1.0),
+            BlendMode::Darken => a.min(b),
+            BlendMode::Lighten => a.max(b),
+            BlendMode::Difference => (a - b).abs(),
+            BlendMode::Exclusion => a + b - 2.0 * a * b,
+        }
+    }
+
+    /// The words a menu and a diff use.
+    pub fn label(self) -> &'static str {
+        match self {
+            BlendMode::Normal => "Normal",
+            BlendMode::Multiply => "Multiply",
+            BlendMode::Screen => "Screen",
+            BlendMode::Overlay => "Overlay",
+            BlendMode::HardLight => "Hard light",
+            BlendMode::Add => "Add",
+            BlendMode::Darken => "Darken",
+            BlendMode::Lighten => "Lighten",
+            BlendMode::Difference => "Difference",
+            BlendMode::Exclusion => "Exclusion",
+        }
+    }
+}
+
 fn finite_or(v: f64, fallback: f64) -> f64 {
     if v.is_finite() {
         v
@@ -3252,6 +3389,10 @@ pub struct Clip {
     /// track shows through. `None` is the whole frame.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mask: Option<Mask>,
+    /// How the clip composites onto the tracks below ([`BlendMode`]). `Normal`, and absent from the
+    /// file, for plain alpha-over: every graph without a blend is byte-identical.
+    #[serde(default, skip_serializing_if = "BlendMode::is_normal")]
+    pub blend_mode: BlendMode,
     /// Crops for delivery shapes other than the one the project is cut for —
     /// what lets one cut render as a 9:16 Reel *and* a 1:1 post with each shot
     /// framed for each. Written by the multi-format export's framing pass, read
@@ -3327,6 +3468,7 @@ impl Clip {
             channels: Vec::new(),
             reframe: None,
             mask: None,
+            blend_mode: BlendMode::Normal,
             framings: Vec::new(),
             enabled: true,
             link_id: None,
@@ -6773,6 +6915,13 @@ fn clip_changes(before: &Clip, after: &Clip) -> Option<String> {
             Some(m) => format!("masked ({})", m.shape.as_str()),
         });
     }
+    if before.blend_mode != after.blend_mode {
+        parts.push(format!(
+            "blend {} → {}",
+            before.blend_mode.label().to_lowercase(),
+            after.blend_mode.label().to_lowercase()
+        ));
+    }
     joined(parts)
 }
 
@@ -8881,6 +9030,50 @@ mod tests {
         let detail = diff.entries[0].detail.clone().unwrap();
         assert!(detail.contains("level 100% → 50%"), "{detail}");
         assert!(detail.contains("pan 0.00 → -0.30"), "{detail}");
+    }
+
+    #[test]
+    fn diff_sees_a_blend_mode() {
+        let tl = Timeline {
+            tracks: vec![track(StreamKind::Video, "V1", vec![clip_at(0.0, 4.0)])],
+            ..Timeline::new()
+        };
+        let mut after = tl.clone();
+        after.tracks[0].clips[0].blend_mode = BlendMode::HardLight;
+        let diff = tl.diff(&after);
+        assert_eq!(diff.entries.len(), 1, "{diff:?}");
+        let detail = diff.entries[0].detail.clone().unwrap();
+        assert!(detail.contains("blend normal → hard light"), "{detail}");
+    }
+
+    #[test]
+    fn blend_modes_name_themselves_one_way_and_reach_ffmpeg_swapped_where_its_names_are() {
+        for mode in BlendMode::ALL {
+            let json = serde_json::to_value(mode).unwrap();
+            assert_eq!(json, mode.as_str(), "the stored name is the one as_str gives");
+            assert_eq!(BlendMode::parse(mode.as_str()), Some(mode));
+            assert_eq!(mode.ffmpeg().is_none(), mode.is_normal());
+        }
+        assert_eq!(BlendMode::parse("Linear Dodge"), Some(BlendMode::Add));
+        assert_eq!(BlendMode::parse("hard-light"), Some(BlendMode::HardLight));
+        assert_eq!(BlendMode::parse("soft_light"), None, "FFmpeg's soft light is another formula");
+        // FFmpeg's `overlay` conditions on its top input (the clip): the textbook hard light.
+        assert_eq!(BlendMode::Overlay.ffmpeg(), Some("hardlight"));
+        assert_eq!(BlendMode::HardLight.ffmpeg(), Some("overlay"));
+        // Overlay is hard light with the roles swapped; both keep mid-grey of the clip neutral or not.
+        let (dark, light) = (0.2, 0.9);
+        assert_eq!(BlendMode::Overlay.apply(dark, light), BlendMode::HardLight.apply(light, dark));
+        assert!((BlendMode::Multiply.apply(0.5, 0.5) - 0.25).abs() < 1e-12);
+        assert!((BlendMode::Screen.apply(0.5, 0.5) - 0.75).abs() < 1e-12);
+        assert_eq!(BlendMode::Add.apply(0.7, 0.6), 1.0);
+        // A clip without the field is normal, and normal writes nothing.
+        let mut clip = clip_at(0.0, 4.0);
+        assert!(!serde_json::to_string(&clip).unwrap().contains("blend_mode"));
+        clip.blend_mode = BlendMode::Screen;
+        let json = serde_json::to_string(&clip).unwrap();
+        assert!(json.contains("\"blend_mode\":\"screen\""), "{json}");
+        let unknown = json.replace("\"screen\"", "\"soft_light\"");
+        assert!(serde_json::from_str::<Clip>(&unknown).is_err(), "only the listed modes read");
     }
 
     #[test]
