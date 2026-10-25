@@ -828,6 +828,10 @@
 						}}
 						style={fxTxt}
 					/>
+				{:else if typeof v === 'boolean'}
+					<CheckRow checked={v} pending={editor.locked} onchange={(ev) => onParam(i, k, ev.currentTarget.checked, scope)}>
+						{k.replaceAll('_', ' ')}
+					</CheckRow>
 				{:else}
 					<input
 						type="number"
