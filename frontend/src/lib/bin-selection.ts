@@ -26,12 +26,12 @@ export function selectionOf(ids: readonly string[], primary: string | null): Sel
 	return normalize(ids, primary);
 }
 
-/** A selection of more than one asset: the bin's right-click acts on all of them. */
-export function isMulti(sel: Selection): boolean {
-	return sel.ids.length > 1;
-}
-
 /** The selection a bare Escape leaves: only the primary, so the Inspector keeps its asset. */
 export function collapsed(sel: Selection): Selection {
 	return sel.primary === null ? sel : { ids: [sel.primary], primary: sel.primary };
+}
+
+/** The menu row that narrows a selection to the asset it was opened on: it names the asset it keeps. */
+export function selectOnlyLabel(name: string): string {
+	return `Select only ${name}`;
 }

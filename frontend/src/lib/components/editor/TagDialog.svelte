@@ -11,6 +11,7 @@
 	import TagInput from './TagInput.svelte';
 	import { editor } from '#lib/state.svelte';
 	import { settings } from '#lib/settings.svelte';
+	import { ui } from '#lib/editor-ui.svelte';
 	import { toast } from '#lib/notifications.svelte';
 	import { tidyReason } from '#lib/failure-copy';
 	import { sameTag } from '#lib/tags';
@@ -59,7 +60,11 @@
 
 	/** Leave the dialog; a ticked "Don’t ask again" is written whichever way it closes. */
 	function leave() {
-		if (mode === 'import' && never) void settings.setAskTagsOnImport(false);
+		if (mode === 'import' && never) {
+			void settings.setAskTagsOnImport(false);
+			// The prompts of other imports that are waiting are the same question.
+			ui.dropQueuedTagDialogs('import');
+		}
 		onClose();
 	}
 

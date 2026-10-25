@@ -2,6 +2,9 @@ import { describe, expect, test } from 'bun:test';
 import {
 	MAX_SUGGESTIONS,
 	addNote,
+	appendAllLabel,
+	appendedLine,
+	fillFor,
 	countLabel,
 	dialogTitle,
 	filterByTags,
@@ -17,6 +20,7 @@ import {
 	tallyNote,
 	tallyTags,
 	taggedLine,
+	termKey,
 	termLabel,
 	toggleTerm
 } from './tag-ui';
@@ -296,5 +300,38 @@ describe('tagsSignature', () => {
 		expect(tagsSignature([{ ...a, tags: list(['x: y', 'z']) }, { id: '2' }])).not.toBe(before);
 		expect(tagsSignature([{ ...a, tags: list(['x: Y']) }, { id: '2' }])).not.toBe(before);
 		expect(tagsSignature([a, { id: '2', tags: list(['q']) }])).not.toBe(before);
+	});
+});
+
+describe('Tab fills, only Enter adds', () => {
+	test('a key fills as `key: `, a tag as its whole spelling', () => {
+		const [key, tag] = [suggestTags('loc', vocab)[0], suggestTags('location: cu', vocab)[0]];
+		expect(fillFor(key)).toBe('location: ');
+		expect(fillFor(tag)).toBe('location: Cumbuco');
+		expect(parseTagInput(fillFor(tag))).toEqual({ tag: { key: 'location', value: 'Cumbuco' } });
+		expect(fillFor(suggestTags('ju', vocab)[0])).toBe('jump');
+	});
+});
+
+describe('the append row under a filter', () => {
+	test('says "all" for the whole library and "shown" for a filtered one', () => {
+		expect(appendAllLabel(12, 12)).toBe('Append all 12 files to the timeline');
+		expect(appendAllLabel(3, 12)).toBe('Append 3 shown files to the timeline');
+		expect(appendAllLabel(1, 12)).toBe('Append 1 shown file to the timeline');
+	});
+
+	test('the toast says what was appended', () => {
+		expect(appendedLine(1, 12)).toBe('Appended 1 file to the timeline');
+		expect(appendedLine(12, 12)).toBe('Appended 12 files to the timeline, in library order');
+		expect(appendedLine(3, 12)).toBe('Appended 3 shown files to the timeline, in library order');
+	});
+});
+
+describe('termKey', () => {
+	test('terms that read alike stay apart; the same term in another case is one', () => {
+		expect(termLabel({ key: 'a' })).toBe(termLabel({ key: 'a', value: 'any' }));
+		expect(termKey({ key: 'a' })).not.toBe(termKey({ key: 'a', value: 'any' }));
+		expect(termKey({ value: 'a' })).not.toBe(termKey({ key: 'a' }));
+		expect(termKey({ key: 'Loc', value: 'Jeri' })).toBe(termKey({ key: 'loc', value: 'jeri' }));
 	});
 });

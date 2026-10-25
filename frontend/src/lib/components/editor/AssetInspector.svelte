@@ -64,7 +64,6 @@
 	const tags = $derived(asset.tags ?? []);
 	let draft = $state('');
 	let tagError = $state('');
-	let saving = false;
 	// Another asset: what was typed, and the refusal of the last change, were about the previous one.
 	$effect(() => {
 		void asset.id;
@@ -74,20 +73,28 @@
 		});
 	});
 
-	/** One tag put on or taken off, as one `edit_asset_tags`; the engine's refusal (past 64 tags) is said under the field. */
-	async function change(edit: TagEdit): Promise<boolean> {
-		if (saving) return false;
-		saving = true;
-		tagError = '';
-		try {
-			await editor.tagAssets([asset.id], edit);
-			return true;
-		} catch (e) {
-			tagError = tidyReason(e instanceof Error ? e.message : String(e));
-			return false;
-		} finally {
-			saving = false;
-		}
+	/** The changes asked for, one after the other: a second × while the first is still on its way waits its turn rather
+	 *  than being dropped. */
+	let queue: Promise<unknown> = Promise.resolve();
+
+	/** One tag put on or taken off, as one `edit_asset_tags`; the engine's refusal (past 64 tags) is said under the field.
+	 *  It always lands on the asset it was asked for, but only says anything — and only clears the field — while the
+	 *  Inspector is still on that asset. */
+	function change(edit: TagEdit): Promise<boolean> {
+		const target = asset.id;
+		const run = async (): Promise<boolean> => {
+			if (asset.id === target) tagError = '';
+			try {
+				await editor.tagAssets([target], edit);
+				return asset.id === target;
+			} catch (e) {
+				if (asset.id === target) tagError = tidyReason(e instanceof Error ? e.message : String(e));
+				return false;
+			}
+		};
+		const next = queue.then(run, run);
+		queue = next;
+		return next;
 	}
 </script>
 

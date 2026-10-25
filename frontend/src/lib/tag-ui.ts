@@ -96,6 +96,12 @@ export function suggestTags(input: string, vocab: TagSummary, exclude: readonly 
 	return [...keys, ...plain, ...byValue].slice(0, limit);
 }
 
+/** What Tab puts in the field for a highlighted suggestion: a key completes to `key: `, a tag to its whole spelling. Only
+ *  Enter adds it. */
+export function fillFor(s: Suggestion): string {
+	return s.kind === 'key' ? s.insert : s.label;
+}
+
 /** What typing a tag and pressing Enter makes of the text: the tag, or why it is not one (in a sentence). */
 export function parseTagInput(text: string): { tag: Tag } | { error: string } {
 	if (text.trim() === '') return { error: 'Type a tag first, like location: Cumbuco or jump.' };
@@ -233,6 +239,11 @@ export function termLabel(term: TagFilter): string {
 	return term.key != null ? `${term.key}: ${term.value}` : (term.value ?? '');
 }
 
+/** A key for a term in a list: terms that read alike (`{key:'a'}` is `a: any`, `{key:'a', value:'any'}` too) stay apart. */
+export function termKey(term: TagFilter): string {
+	return JSON.stringify([term.key?.trim().toLowerCase() ?? null, term.value?.trim().toLowerCase() ?? null]);
+}
+
 /** The items that satisfy every term (all of them when there is no filter). */
 export function filterByTags<T extends { tags?: readonly Tag[] }>(items: readonly T[], filter: readonly TagFilter[]): T[] {
 	return filter.length === 0 ? [...items] : items.filter((i) => tagsMatch(filter, i.tags ?? []));
@@ -288,4 +299,18 @@ export function filterGroups(vocab: TagSummary, filter: readonly TagFilter[]): F
 /** The signature of the tags an asset list carries: changes when a tag is added, removed or renamed, and not for anything else. */
 export function tagsSignature(assets: readonly { id: string; tags?: readonly Tag[] }[]): string {
 	return assets.map((a) => `${a.id}\u0001${(a.tags ?? []).map(formatTag).join('\u0002')}`).join('\u0003');
+}
+
+/** The bin menu's "append them all" row: every file of the library, or — under a tag filter — the ones shown. */
+export function appendAllLabel(shown: number, total: number): string {
+	if (shown < total) return `Append ${shown} shown ${shown === 1 ? 'file' : 'files'} to the timeline`;
+	return `Append all ${total} files to the timeline`;
+}
+
+/** The toast after it: what was appended, and that a filter narrowed it. */
+export function appendedLine(appended: number, total: number): string {
+	if (appended === 1) return 'Appended 1 file to the timeline';
+	return appended < total
+		? `Appended ${appended} shown files to the timeline, in library order`
+		: `Appended ${appended} files to the timeline, in library order`;
 }

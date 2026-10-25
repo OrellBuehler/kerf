@@ -134,8 +134,11 @@ class EditorUi {
 	 *  when opened from a clip, the clip the stems are laid under. */
 	stemsDialog = $state<{ assetId: string; clipId: string | null } | null>(null);
 	/** The tag dialog: `null` while closed, else the assets it tags and why it opened (`import`: right after an import,
-	 *  where Skip and "Don't ask again" are offered; `bulk`: the bin's selection). */
-	tagDialog = $state<{ assetIds: string[]; mode: 'import' | 'bulk' } | null>(null);
+	 *  where Skip and "Don't ask again" are offered; `bulk`: the bin's selection). `id` is the dialog's own number, so a
+	 *  second one shown right after the first starts afresh. Opening another while one is up queues it (`#tagQueue`). */
+	tagDialog = $state<{ id: number; assetIds: string[]; mode: 'import' | 'bulk' } | null>(null);
+	#tagQueue: { assetIds: string[]; mode: 'import' | 'bulk' }[] = [];
+	#tagDialogs = 0;
 	/** The bin's tag filter: every term must hold (`tagsMatch`). Empty: the bin shows everything. */
 	tagFilter = $state<TagFilter[]>([]);
 	/** The Save-as-template dialog: `null` while closed, else the animated title being kept as a template. */
@@ -329,12 +332,24 @@ class EditorUi {
 		this.stemsDialog = null;
 	}
 
+	/** Ask for tags on these assets. One already open: this one waits its turn, so two imports that finish close together
+	 *  each get their prompt. */
 	openTagDialog(assetIds: readonly string[], mode: 'import' | 'bulk' = 'bulk') {
-		if (assetIds.length > 0) this.tagDialog = { assetIds: [...assetIds], mode };
+		if (assetIds.length === 0) return;
+		const next = { assetIds: [...assetIds], mode };
+		if (this.tagDialog) this.#tagQueue.push(next);
+		else this.tagDialog = { id: ++this.#tagDialogs, ...next };
 	}
 
+	/** The dialog is done: the next one that was waiting, if any, takes its place. */
 	closeTagDialog() {
-		this.tagDialog = null;
+		const next = this.#tagQueue.shift();
+		this.tagDialog = next ? { id: ++this.#tagDialogs, ...next } : null;
+	}
+
+	/** Forget the prompts that wait ("Don't ask again" was ticked: the ones queued behind it are the same question). */
+	dropQueuedTagDialogs(mode: 'import' | 'bulk') {
+		this.#tagQueue = this.#tagQueue.filter((d) => d.mode !== mode);
 	}
 
 	/** Put `terms` in as the bin's tag filter (none: show everything again). */

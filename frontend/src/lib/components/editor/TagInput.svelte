@@ -4,7 +4,7 @@
 	// then the values of the key typed, or the plain tags. Enter adds the highlighted suggestion, or else what is typed.
 	// The list is drawn in the flow, below the field: a dialog clips whatever hangs out of it.
 	import { editor } from '#lib/state.svelte';
-	import { MAX_SUGGESTIONS, parseTagInput, suggestTags, type Suggestion } from '#lib/tag-ui';
+	import { MAX_SUGGESTIONS, fillFor, parseTagInput, suggestTags, type Suggestion } from '#lib/tag-ui';
 	import type { Tag } from '#lib/types';
 
 	let {
@@ -97,11 +97,13 @@
 		} else if (e.key === 'Enter') {
 			e.preventDefault();
 			enter();
-		} else if (e.key === 'Tab' && open && !e.shiftKey && value.trim() !== '') {
-			// Tab completes: the highlighted suggestion, else the nearest.
+		} else if (e.key === 'Tab' && open && active >= 0 && !e.shiftKey) {
+			// Tab fills the field with the suggestion that is lit — it adds nothing, only Enter does — and a Tab with
+			// none lit moves on.
 			e.preventDefault();
 			e.stopPropagation();
-			accept(suggestions[Math.max(active, 0)]);
+			value = fillFor(suggestions[active]);
+			dismissed = false;
 		} else if (e.key === 'Escape' && open) {
 			e.preventDefault();
 			e.stopPropagation();
@@ -122,7 +124,7 @@
 		aria-label={label}
 		aria-autocomplete="list"
 		aria-expanded={open}
-		aria-controls={listId}
+		aria-controls={open ? listId : undefined}
 		aria-activedescendant={open && active >= 0 ? `${uid}-opt-${active}` : undefined}
 		aria-invalid={shown ? 'true' : undefined}
 		autocomplete="off"

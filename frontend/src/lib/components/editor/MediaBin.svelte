@@ -28,7 +28,8 @@
 	import { settings } from '#lib/settings.svelte';
 	import { placementOut } from '#lib/editing-prefs';
 	import { tagsMatch } from '#lib/tags';
-	import { rowChips, termLabel, toggleTerm } from '#lib/tag-ui';
+	import { appendAllLabel, rowChips, termKey, termLabel, toggleTerm } from '#lib/tag-ui';
+	import { selectOnlyLabel } from '#lib/bin-selection';
 
 	type BinAsset = { asset: Asset; info: MediaInfo };
 
@@ -98,7 +99,7 @@
 			window.removeEventListener('pointermove', move);
 			window.removeEventListener('pointerup', up);
 			window.removeEventListener('pointercancel', end);
-			window.removeEventListener('keydown', key);
+			window.removeEventListener('keydown', key, true);
 			window.removeEventListener('blur', end);
 			root.style.cursor = cursor;
 			ui.dndAsset = null;
@@ -117,35 +118,36 @@
 			end();
 			if (dragging) ui.assetDropTarget?.(payload, u.clientX, u.clientY);
 		};
+		// Heard before the page's own keys (capture), and kept from them: Escape gives the drag up and that is all it
+		// does — the page's Escape (clear the selection) must not also fire.
 		const key = (k: KeyboardEvent) => {
-			if (k.key === 'Escape') end();
+			if (k.key !== 'Escape') return;
+			k.stopPropagation();
+			k.preventDefault();
+			end();
 		};
 		window.addEventListener('pointermove', move);
 		window.addEventListener('pointerup', up);
 		window.addEventListener('pointercancel', end);
-		window.addEventListener('keydown', key);
+		window.addEventListener('keydown', key, true);
 		window.addEventListener('blur', end);
 	}
 
-	/** The menu of several selected assets: what can be done to all of them at once. */
-	function onSelectionContextMenu(e: MouseEvent) {
+	/** The menu of several selected assets: what can be done to all of them at once, and the way back to the one that
+	 *  was right-clicked. */
+	function onSelectionContextMenu(e: MouseEvent, clicked: Asset) {
 		const ids = [...editor.selectedAssetIds];
 		contextMenu.show(e, [
 			{ type: 'header', label: `${ids.length} assets`, sub: 'Selected in the bin' },
 			{ label: `Tag ${ids.length} assets…`, icon: 'tag', action: () => ui.openTagDialog(ids, 'bulk') },
 			{ type: 'separator' },
-			{
-				label: 'Clear selection',
-				icon: 'x',
-				shortcut: settings.shortcut('edit.clearSelection'),
-				action: () => void editor.collapseAssetSelection()
-			}
+			{ label: selectOnlyLabel(clicked.name), icon: 'x', action: () => void editor.select(clicked.id) }
 		]);
 	}
 
 	function onAssetContextMenu(e: MouseEvent, { asset, info }: BinAsset) {
 		// A right-click inside a selection of several acts on all of them; anywhere else it selects what it is on.
-		if (editor.selectedAssetIds.length > 1 && editor.selectedAssetSet.has(asset.id)) return onSelectionContextMenu(e);
+		if (editor.selectedAssetIds.length > 1 && editor.selectedAssetSet.has(asset.id)) return onSelectionContextMenu(e, asset);
 		void editor.select(asset.id);
 		const analysis = editor.analysisFor(asset.id);
 		const spherical = !!info.projection;
@@ -232,13 +234,17 @@
 			reason: hasTranscript ? undefined : 'Transcribe it first (Analyze › Transcribe speech)',
 			action: () => void exportTranscriptSrt(asset.id)
 		});
-		if (editor.assets.length > 1)
+		// Under a tag filter "all" is what the bin shows, and the row says so.
+		if (shown.length > 1)
 			items.push({
-				label: `Append all ${editor.assets.length} files to the timeline`,
+				label: appendAllLabel(shown.length, editor.assets.length),
 				icon: 'list-plus',
 				disabled: editor.locked,
 				reason: editor.locked ? 'Exit the proposal preview to edit' : undefined,
-				action: () => void appendAllMedia()
+				action: () =>
+					void appendAllMedia(
+						shown.map((a) => a.asset.id)
+					)
 			});
 
 		items.push({ label: 'Tag…', icon: 'tag', action: () => ui.openTagDialog([asset.id], 'bulk') });
@@ -349,7 +355,7 @@
 			data-testid="tag-filter-bar"
 			style="flex:none;display:flex;align-items:center;gap:6px;flex-wrap:wrap;padding:6px 12px;border-bottom:var(--line-width) solid var(--border-subtle)"
 		>
-			{#each ui.tagFilter as term (termLabel(term))}
+			{#each ui.tagFilter as term (termKey(term))}
 				<span
 					data-tag-term
 					style="display:inline-flex;align-items:center;gap:2px;min-width:0;max-width:100%;height:22px;padding:0 3px 0 8px;border-radius:var(--radius-sm);border:var(--line-width) solid var(--kerf-500);background:color-mix(in srgb,var(--kerf-500) 18%,transparent);font-size:12px;color:var(--text-primary)"

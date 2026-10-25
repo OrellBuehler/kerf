@@ -248,7 +248,8 @@ export class PreviewReadOnly extends EditRefused {
 class EditorState {
 	assets = $state<Asset[]>([]);
 	timeline = $state<Timeline>({ tracks: [] });
-	/** The asset the Inspector describes and a drag out of the bin takes: the primary of `selectedAssetIds`. */
+	/** The asset the Inspector describes: the primary of `selectedAssetIds`. (A drag out of the bin takes the asset it
+	 *  began on, selected or not.) */
 	selectedAssetId = $state<string | null>(null);
 	/** The assets selected in the bin (Ctrl/Cmd-click toggles, Shift-click extends). Holds `selectedAssetId` when that is
 	 *  set; every way of changing the two goes through `select` / `pickAsset` / `selectAssets`. */
@@ -355,7 +356,10 @@ class EditorState {
 	/** Sequence guard over `select()` — a slow metadata fetch for an earlier
 	 *  click must not overwrite a faster, newer one. */
 	#selectGen = new Generation();
-	#vocabGen = new Generation();
+	/** Orders the reads of the library (`refreshAssets`): a local write advances it (`#setAssets`). */
+	#assetsGen = new Generation();
+	/** Orders the reads of the tag vocabulary (`refreshTagVocabulary`). */
+	#vocabOrder = new ReadOrder();
 
 	get selectedAsset(): Asset | undefined {
 		return this.assets.find((a) => a.id === this.selectedAssetId);
@@ -622,7 +626,7 @@ class EditorState {
 				projectPath(),
 				this.loadRippleMode()
 			]);
-			this.assets = assets;
+			this.#setAssets(assets);
 			this.#setTimeline(timeline);
 			this.history = history;
 			this.historyMore = history.length >= this.historyLimit;
@@ -949,7 +953,7 @@ class EditorState {
 						// Both lens files of a 360 capture resolve to one stitched
 						// asset, so importing the pair must not list it twice.
 						if (!this.assets.some((a) => a.id === asset.id)) {
-							this.assets = [...this.assets, asset];
+							this.#setAssets([...this.assets, asset]);
 						}
 						return asset;
 					} catch (e) {
@@ -970,16 +974,42 @@ class EditorState {
 		}
 	}
 
+	/** Every write of `assets` goes through here, so a read of the library that began before it knows it is stale. */
+	#setAssets(next: Asset[]) {
+		this.#assetsGen.advance();
+		this.assets = next;
+	}
+
 	/** Re-read the asset list, for assets an agent brought in behind our back
 	 *  (a voiceover it generated) or tagged. Left alone when nothing is new, so the bin
-	 *  does not re-render on every agent edit. */
+	 *  does not re-render on every agent edit. A read that a local write (a tag edit, an import) overtook is dropped:
+	 *  it would put the old tags back. */
 	async refreshAssets() {
+		const snapshot = this.#assetsGen.read();
 		const assets = await listAssets();
+		if (!this.#assetsGen.isCurrent(snapshot)) return;
 		const known = new Set(this.assets.map((a) => a.id));
 		if (assets.length !== known.size || assets.some((a) => !known.has(a.id)) || tagsSignature(assets) !== tagsSignature(this.assets)) {
-			this.assets = assets;
+			this.#setAssets(assets);
 			const here = new Set(assets.map((a) => a.id));
-			if (this.selectedAssetIds.some((id) => !here.has(id))) this.selectedAssetIds = this.selectedAssetIds.filter((id) => here.has(id));
+			await this.#pruneAssetSelection((id) => here.has(id));
+		}
+	}
+
+	/** Take the assets that are gone out of the bin's selection. When the Inspector's own asset went, it passes to
+	 *  another selected one, or is cleared. */
+	async #pruneAssetSelection(exists: (id: string) => boolean) {
+		const kept = this.selectedAssetIds.filter(exists);
+		const primaryGone = this.selectedAssetId !== null && !exists(this.selectedAssetId);
+		if (kept.length === this.selectedAssetIds.length && !primaryGone) return;
+		this.selectedAssetIds = kept;
+		if (!primaryGone) return;
+		if (kept.length > 0) {
+			await this.selectAssets(normalize(kept, null));
+		} else {
+			this.#selectGen.advance();
+			this.selectedAssetId = null;
+			this.selectedMetadata = null;
 		}
 	}
 
@@ -988,19 +1018,20 @@ class EditorState {
 	async tagAssets(assetIds: readonly string[], edit: TagEdit): Promise<Asset[]> {
 		const done = await editAssetTags([...assetIds], edit);
 		const by = new Map(done.map((a) => [a.id, a]));
-		this.assets = this.assets.map((a) => by.get(a.id) ?? a);
+		this.#setAssets(this.assets.map((a) => by.get(a.id) ?? a));
 		const meta = this.selectedMetadata;
 		const fresh = meta ? by.get(meta.asset.id) : undefined;
 		if (meta && fresh) this.selectedMetadata = { ...meta, asset: fresh };
 		return done;
 	}
 
-	/** Read the library's tag vocabulary again. The newest read wins; a failed one keeps what was there. */
+	/** Read the library's tag vocabulary again. Of the reads that come back the newest writes, and a failed one keeps
+	 *  what was there (`ReadOrder`). */
 	async refreshTagVocabulary() {
-		const seq = this.#vocabGen.advance();
+		const ticket = this.#vocabOrder.begin();
 		try {
 			const vocab = await listTags();
-			if (this.#vocabGen.isCurrent(seq)) this.tagVocabulary = vocab;
+			if (this.#vocabOrder.land(ticket)) this.tagVocabulary = vocab;
 		} catch {
 			/* the autocomplete just has less to offer */
 		}
@@ -1014,15 +1045,9 @@ class EditorState {
 			done = await removeAsset(assetId, force);
 			return done.timeline;
 		});
-		this.assets = this.assets.filter((a) => a.id !== assetId);
+		this.#setAssets(this.assets.filter((a) => a.id !== assetId));
 		delete this.analyses[assetId];
-		this.selectedAssetIds = this.selectedAssetIds.filter((id) => id !== assetId);
-		if (this.selectedAssetId === assetId) {
-			this.selectedAssetId = null;
-			this.selectedMetadata = null;
-			// The others that were selected hand the Inspector one of them.
-			if (this.selectedAssetIds.length > 0) await this.selectAssets(normalize(this.selectedAssetIds, null));
-		}
+		await this.#pruneAssetSelection((id) => id !== assetId);
 		return done;
 	}
 
@@ -1030,7 +1055,7 @@ class EditorState {
 	 *  cut from it; its analysis stays only when the file is the old media moved. */
 	async relinkMedia(assetId: string, path: string): Promise<Relinked> {
 		const done = await relinkAsset(assetId, path);
-		this.assets = this.assets.map((a) => (a.id === assetId ? done.asset : a));
+		this.#setAssets(this.assets.map((a) => (a.id === assetId ? done.asset : a)));
 		if (!done.analysis_kept) delete this.analyses[assetId];
 		if (this.selectedAssetId === assetId) await this.select(assetId);
 		return done;
@@ -1392,7 +1417,7 @@ class EditorState {
 	/** Mark (or unmark) an asset as 360 footage; later cuts from it reframe. */
 	async setAssetProjection(assetId: string, projection: Projection | null) {
 		const asset = await setAssetProjection(assetId, projection);
-		this.assets = this.assets.map((a) => (a.id === asset.id ? asset : a));
+		this.#setAssets(this.assets.map((a) => (a.id === asset.id ? asset : a)));
 		if (this.selectedMetadata?.asset.id === asset.id) {
 			this.selectedMetadata = { ...this.selectedMetadata, asset };
 		}
@@ -1553,9 +1578,9 @@ class EditorState {
 		this.#busyCount++;
 		try {
 			const { asset, timeline } = await generateVoiceover(req);
-			this.assets = this.assets.some((a) => a.id === asset.id)
-				? this.assets.map((a) => (a.id === asset.id ? asset : a))
-				: [...this.assets, asset];
+			this.#setAssets(
+				this.assets.some((a) => a.id === asset.id) ? this.assets.map((a) => (a.id === asset.id ? asset : a)) : [...this.assets, asset]
+			);
 			this.#setTimeline(timeline);
 			await this.refreshHistory();
 			await this.select(asset.id);
@@ -1575,9 +1600,11 @@ class EditorState {
 		this.#busyCount++;
 		try {
 			const done = await composeMusic(req);
-			this.assets = this.assets.some((a) => a.id === done.asset.id)
-				? this.assets.map((a) => (a.id === done.asset.id ? done.asset : a))
-				: [...this.assets, done.asset];
+			this.#setAssets(
+				this.assets.some((a) => a.id === done.asset.id)
+					? this.assets.map((a) => (a.id === done.asset.id ? done.asset : a))
+					: [...this.assets, done.asset]
+			);
 			this.#setTimeline(done.timeline);
 			await this.refreshHistory();
 			this.selectClips([done.clip.id], done.clip.id);
@@ -1602,7 +1629,7 @@ class EditorState {
 			const { placed, timeline } = await separateStems(assetId, clipId);
 			const known = new Set(this.assets.map((a) => a.id));
 			const fresh = placed.assets.filter((a) => !known.has(a.id));
-			if (fresh.length > 0) this.assets = [...this.assets, ...fresh];
+			if (fresh.length > 0) this.#setAssets([...this.assets, ...fresh]);
 			if (clipId) {
 				this.#setTimeline(timeline);
 				await this.refreshHistory();

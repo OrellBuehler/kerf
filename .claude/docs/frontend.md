@@ -524,29 +524,36 @@ facts, *Rebuild* / *Delete*) — and *Relink…* / *Remove…* last, the row a c
 callout's alone while the file is gone). The rows are what the bin's right-click menu used to list as twenty (it was 960 px
 tall; it is the actions now, with Analyze as one entry that opens its own menu).
 **Asset tags** (the model is `tags.ts`, the port of `model/tags.rs`; this is how a person gets at it). *Selecting*: the bin picks several
-assets — `editor.selectedAssetIds`, with `selectedAssetId` still the **primary** (the Inspector's asset, the one a drag takes onto the
-timeline). A plain click replaces, Ctrl/Cmd toggles, Shift extends from the primary across the rows *shown* (`bin-selection.ts` over
+assets — `editor.selectedAssetIds`, with `selectedAssetId` still the **primary** (the Inspector's asset; a drag out of the bin takes the
+asset it began on and moves nothing else — Escape during it only gives the drag up, as the timeline's gestures do). A plain click replaces, Ctrl/Cmd toggles, Shift extends from the primary across the rows *shown* (`bin-selection.ts` over
 `selection.ts`, the clips' own rules); `editor.select` always resets to one. Escape is the existing `edit.clearSelection` action (no
 shortcut added): several shrink to the primary. A tag filter that hides part of the selection takes those out of it (a page effect,
 `restrictToVisible`; one that hides all of it leaves the Inspector's asset alone). A right-click inside a selection of several is its own
-menu (`Tag N assets…`, `Clear selection`); on one asset the menu has `Tag…`. *Showing*: a row draws its first three tags as compact
+menu (`Tag N assets…`, `Select only <the clicked asset>`); on one asset the menu has `Tag…`; *Append all N files* is the shown ones under a filter
+(`Append 3 shown files to the timeline`). *Showing*: a row draws its first three tags as compact
 `TagChip`s (`key: value`, key muted; `rowChips`) and `+N` with every tag in its tooltip. The Media header's tag button opens the
 vocabulary as a menu (`filterGroups` over `editor.tagVocabulary`: a group per key with `Any <key>` first, then the plain tags; a count
 in the new `meta` slot of a `MenuItem`, a tick on the terms in force); the terms are `ui.tagFilter`, ANDed through `tagsMatch`, listed
 as removable chips with *Clear* over the bin, the header reads `MEDIA · 3 of 12`, and a project load clears the filter. The vocabulary is
-`listTags`, read again by a page effect whenever `tagsSignature(editor.assets)` moves; `refreshAssets` also notices tags an agent changed.
+`listTags`, read again by a page effect whenever `tagsSignature(editor.assets)` moves; `refreshAssets` also notices tags an agent changed; every write of `editor.assets` goes through `#setAssets`, which stales a read
+in flight (`Generation`, as `refreshTimeline`), and a primary that disappears passes to another selected asset (`#pruneAssetSelection`).
+The vocabulary reads are ordered by `ReadOrder`.
 *Editing*: **`TagDialog`** (`ui.tagDialog`, so it is in the page's `modalOpen`) is the after-import prompt (`mode: 'import'`, from
 `finishImport` before the analysis starts, when `settings.askTagsOnImport`; *Skip*, and *Don’t ask again* writes the setting on any way out;
-Settings › Editing has the switch) and the bin's bulk dialog. The tags the assets carry are chips with `all` / `some (n)` (`tallyTags`) and
+Settings › Editing has the switch) and the bin's bulk dialog. A second prompt while one is open waits (`ui.openTagDialog` queues; the page
+keys the dialog by its number so the next starts afresh) — two imports finishing together each get theirs; *Don’t ask again* drops the waiting
+import prompts. The tags the assets carry are chips with `all` / `some (n)` (`tallyTags`) and
 an × that marks one for removal (struck through; the same button restores it); typed tags wait as pending chips above the field
 (`planAdd`: one already there, or on every asset, says so instead). Apply is **one** `editor.tagAssets` = one `edit_asset_tags` for every
 asset (`pendingEdit`, remove then add), what is typed and not yet added counts, and the engine's refusal is said under the field
 (`tidyReason`) with nothing changed; a tag edit is no revision and has no undo. **`TagInput`** is the field both dialogs and the Inspector
 use (a `combobox`): `suggestTags` offers keys first (accepting one types `key: `), then plain tags, then keyed tags by a word of their value;
-after a colon the values of that key; nearest match first, then most used; Tab completes, Enter adds the highlighted one or what is typed,
+after a colon the values of that key; nearest match first, then most used; Tab fills the field with the lit suggestion (`fillFor`; with none lit it
+moves focus on), only Enter adds — the lit one or what is typed —,
 Escape closes the list before it closes a dialog. The list is drawn in the flow, not floated (a dialog clips what hangs out of it), and the
 dialog reserves its room (`reserve`) so the centred dialog does not jump. The Inspector's **Tags** section is the chips (× removes) and the
-same field, each change one `tagAssets`, and a note with *Tag N assets…* when several are selected.
+same field, each change one `tagAssets` (queued in order, so a second × is never dropped, and a result that lands after the Inspector moved to
+another asset says nothing there), and a note with *Tag N assets…* when several are selected.
 **Polish presets** (`src/lib/style-presets.ts`, pure data over the existing
 surfaces): one-click **looks** — the library Effects tab's
 Punchy / Warm / Cool / Faded / B&W chips (the active one highlights; the Inspector's Color

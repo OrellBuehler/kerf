@@ -922,7 +922,10 @@
 {/if}
 
 {#if ui.tagDialog}
-	<TagDialog assetIds={ui.tagDialog.assetIds} mode={ui.tagDialog.mode} onClose={() => ui.closeTagDialog()} />
+	<!-- Keyed by the dialog's own number: the next one in the queue takes the place of the one that closed, afresh. -->
+	{#key ui.tagDialog.id}
+		<TagDialog assetIds={ui.tagDialog.assetIds} mode={ui.tagDialog.mode} onClose={() => ui.closeTagDialog()} />
+	{/key}
 {/if}
 
 {#if ui.saveTemplateDialog}

@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { collapsed, isMulti, pickAsset, restrictToVisible, selectionOf } from './bin-selection';
+import { collapsed, pickAsset, restrictToVisible, selectOnlyLabel, selectionOf } from './bin-selection';
 import type { Selection } from './selection';
 
 const none = { shiftKey: false, ctrlKey: false, metaKey: false };
@@ -85,7 +85,6 @@ describe('the selection as the editor holds it', () => {
 		expect(collapsed(sel(['a', 'b', 'c'], 'b'))).toEqual({ ids: ['b'], primary: 'b' });
 		expect(collapsed(sel(['a']))).toEqual({ ids: ['a'], primary: 'a' });
 		expect(collapsed(sel([]))).toEqual({ ids: [], primary: null });
-		expect(isMulti(sel(['a', 'b']))).toBe(true);
-		expect(isMulti(sel(['a']))).toBe(false);
+		expect(selectOnlyLabel('kite-0412.mp4')).toBe('Select only kite-0412.mp4');
 	});
 });
