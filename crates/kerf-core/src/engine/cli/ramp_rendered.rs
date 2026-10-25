@@ -353,7 +353,8 @@ fn still_number(timeline: &Timeline, assets: &[Asset], t: f64) -> Option<u32> {
         fps: Some(FPS),
         ..ExportOptions::default()
     };
-    let args = build_still_args(timeline, assets, &opts, t, W, None, &StillOutput::RgbPipe).unwrap();
+    let mut args = build_still_args(timeline, assets, &opts, t, W, None, &StillOutput::RgbPipe).unwrap();
+    let _script = externalize_filter_complex(&mut args, "ramp-still").unwrap();
     let run = command(&ffmpeg_bin()).args(&args).stdin(Stdio::null()).output().unwrap();
     assert!(
         run.status.success(),
@@ -490,6 +491,7 @@ fn frames_and_samples(timeline: &Timeline, assets: &[Asset], dir: &Path, tag: &s
     args.push(v.to_string_lossy().into_owned());
     args.extend(["-map", "[outa]", "-f", "f32le", "-ac", "1", "-ar", "48000"].map(String::from));
     args.push(a.to_string_lossy().into_owned());
+    let _script = externalize_filter_complex(&mut args, "ramp-frames").unwrap();
     let run = command(&ffmpeg_bin())
         .arg("-y")
         .args(&args)
@@ -644,7 +646,8 @@ fn export_whole(timeline: &Timeline, assets: &[Asset], dir: &Path, tag: &str) ->
         fps: Some(10.0),
         ..ExportOptions::default()
     };
-    let args = build_export_args(timeline, assets, &out.to_string_lossy(), &opts).unwrap();
+    let mut args = build_export_args(timeline, assets, &out.to_string_lossy(), &opts).unwrap();
+    let _script = externalize_filter_complex(&mut args, "ramp-export").unwrap();
     let began = std::time::Instant::now();
     let made = command(&ffmpeg_bin())
         .arg("-y")
