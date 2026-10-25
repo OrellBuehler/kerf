@@ -703,8 +703,8 @@ fn an_overlay_title_sits_over_the_first_seconds_of_each_groups_first_clip() {
     assert!(video[0].clips.iter().all(|c| !c.is_generated()) && video[1].clips.iter().all(|c| c.is_generated()));
 
     // A title never runs past a short first clip, and a different length can be asked for.
-    let (p, _) = library(&[("tiny", &["location: Here"])]);
-    let mut tiny = p.list_assets().unwrap().remove(0);
+    let (p, mut made) = library(&[("tiny", &["location: Here"])]);
+    let mut tiny = made.remove(0);
     tiny.duration = 1.5;
     p.insert_asset(&tiny).unwrap();
     p.assemble_by_tag(AssembleByTag::new("location")).unwrap();
