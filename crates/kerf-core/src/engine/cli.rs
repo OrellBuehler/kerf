@@ -1537,6 +1537,7 @@ fn probe_composite_red(ffmpeg: &str, ffprobe: &str, tag_bt709: bool, deadline: I
         source_paths: Vec::new(),
         voiceover: None,
         music_score: None,
+        tags: Vec::new(),
     };
     let timeline = Timeline {
         tracks: vec![crate::model::Track {
@@ -15413,6 +15414,7 @@ mod tests {
             source_paths: Vec::new(),
             voiceover: None,
             music_score: None,
+            tags: Vec::new(),
         };
         let timeline = single(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]);
         let assets = vec![asset];
@@ -15456,6 +15458,7 @@ mod tests {
             source_paths: Vec::new(),
             voiceover: None,
             music_score: None,
+            tags: Vec::new(),
         };
         let a2 = Asset {
             id: Uuid::new_v4(),
@@ -15467,6 +15470,7 @@ mod tests {
             source_paths: Vec::new(),
             voiceover: None,
             music_score: None,
+            tags: Vec::new(),
         };
         let timeline = single(vec![make_clip(a1.id, 0.0, 20.0, 0.0), make_clip(a2.id, 0.0, 10.0, 20.0)]);
         let assets = vec![a1, a2];
@@ -15497,6 +15501,7 @@ mod tests {
             source_paths: Vec::new(),
             voiceover: None,
             music_score: None,
+            tags: Vec::new(),
         };
         let timeline = single(vec![make_clip(video_only.id, 0.0, 5.0, 0.0)]);
         let assets = vec![video_only];
@@ -15526,6 +15531,7 @@ mod tests {
             source_paths: Vec::new(),
             voiceover: None,
             music_score: None,
+            tags: Vec::new(),
         };
         let timeline = single(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]);
         let assets = vec![asset];
@@ -15558,6 +15564,7 @@ mod tests {
             source_paths: Vec::new(),
             voiceover: None,
             music_score: None,
+            tags: Vec::new(),
         };
         let timeline = single(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]);
         let assets = vec![asset];
@@ -15598,6 +15605,7 @@ mod tests {
             source_paths: Vec::new(),
             voiceover: None,
             music_score: None,
+            tags: Vec::new(),
         }
     }
 
@@ -21045,6 +21053,7 @@ mod tests {
                 source_paths: Vec::new(),
                 voiceover: None,
                 music_score: None,
+                tags: Vec::new(),
             };
             let timeline = Timeline {
                 tracks: vec![crate::model::Track {

@@ -120,6 +120,12 @@ const MIGRATIONS: &[Migration] = &[
         destructive: false,
         needed_to_read: false,
     },
+    Migration {
+        run: v14_to_v15,
+        needed: v14_to_v15_needed,
+        destructive: false,
+        needed_to_read: true,
+    },
 ];
 
 /// The schema this build writes and the newest it opens.
@@ -334,6 +340,22 @@ fn v13_to_v14(_: &Connection) -> rusqlite::Result<()> {
 
 fn v13_to_v14_needed(_: &Connection) -> bool {
     true
+}
+
+/// v15: an asset carries tags (`assets.tags`, JSON; NULL for none), and a proposal's held-back asset changes
+/// (`staged.assets`, JSON) may be a tag change (`"tags"` beside `"projection"`). An older build reads such a change as the
+/// projection change it knows and clears the asset's projection when the proposal is accepted, and its reads do not
+/// select the column. Every file an older build wrote lacks the column, so the step is needed exactly then (the file is
+/// copied aside first) and reads depend on it.
+fn v14_to_v15(conn: &Connection) -> rusqlite::Result<()> {
+    if !has_column(conn, "assets", "tags") {
+        conn.execute("ALTER TABLE assets ADD COLUMN tags TEXT", [])?;
+    }
+    Ok(())
+}
+
+fn v14_to_v15_needed(conn: &Connection) -> bool {
+    !has_column(conn, "assets", "tags")
 }
 
 /// The index (the version each upgrades from) of every step from `found` on that would change this file.

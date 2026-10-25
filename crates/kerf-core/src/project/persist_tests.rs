@@ -255,7 +255,7 @@ fn a_v2_file_is_backed_up_once_then_gets_the_fonts_table() {
     let path = dir.join("cut.kerf");
     edited(2).0.save_as(&path).unwrap();
     make_v2(&path);
-    assert_eq!(SCHEMA_VERSION, 14);
+    assert_eq!(SCHEMA_VERSION, 15);
     assert!(!has_fonts_table(&path));
 
     let project = Project::open(&path).unwrap();
@@ -314,13 +314,16 @@ fn a_file_from_before_every_step_gets_each() {
     make_legacy(&path, false);
     Connection::open(&path)
         .unwrap()
-        .execute_batch("DROP TABLE fonts; ALTER TABLE staged DROP COLUMN owner; ALTER TABLE staged DROP COLUMN assets;")
+        .execute_batch(
+            "DROP TABLE fonts; ALTER TABLE staged DROP COLUMN owner; ALTER TABLE staged DROP COLUMN assets; \
+             ALTER TABLE assets DROP COLUMN tags;",
+        )
         .unwrap();
     drop(Project::open(&path).unwrap());
     assert_eq!(version_of(&path), SCHEMA_VERSION);
     assert!(has_fonts_table(&path));
     let conn = Connection::open(&path).unwrap();
-    assert!(conn.prepare("SELECT voiceover FROM assets").is_ok());
+    assert!(conn.prepare("SELECT voiceover, tags FROM assets").is_ok());
     assert!(conn.prepare("SELECT owner, assets FROM staged").is_ok());
     assert_eq!(version_of(&dir.join("cut (schema v0 backup).kerf")), 0);
     std::fs::remove_dir_all(&dir).ok();
@@ -876,6 +879,51 @@ fn a_v13_file_is_backed_up_stamped_v14_and_keeps_its_speed_ramps() {
         version_of(&schema_backup_path(&path, 13)),
         13,
         "an older build drops the ramp, so the file as it was is kept"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Tags are kept as they are, and a file stored before v15 has none. The file is copied aside, since an older build
+/// reads a held-back tag change as the projection change it knows; a build that cannot write refuses a file without
+/// the column, which its reads name.
+#[test]
+fn a_v14_file_gains_the_tags_column_and_keeps_a_backup() {
+    let dir = scratch();
+    let path = dir.join("cut.kerf");
+    let (project, asset) = edited(1);
+    let json = timeline_to_json(&project.timeline().unwrap()).unwrap();
+    assert!(!json.contains("tags"), "the cut itself holds none: {json}");
+    project.save_as(&path).unwrap();
+    drop(project);
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "user_version", 14).unwrap();
+        conn.execute_batch("ALTER TABLE assets DROP COLUMN tags").unwrap();
+        assert_eq!(store::pending_steps(&conn, 14), vec![14]);
+    }
+
+    let uri = format!("file:{}?mode=ro", path.display());
+    let err = Project::open(&uri).err().expect("reading an asset needs the column");
+    assert!(err.to_string().contains("read-only"), "{err}");
+
+    let project = Project::open(&path).unwrap();
+    assert_eq!(version_of(&path), SCHEMA_VERSION);
+    assert_eq!(version_of(&schema_backup_path(&path, 14)), 14, "the file as it was is kept");
+    assert!(project.list_assets().unwrap()[0].tags.is_empty());
+    let tag = crate::model::Tag::parse("location: Cumbuco").unwrap();
+    let edit = crate::model::TagEdit {
+        add: vec![tag.clone()],
+        ..Default::default()
+    };
+    project.edit_asset_tags(&[asset], &edit).unwrap();
+    drop(project);
+    assert_eq!(Project::open(&path).unwrap().list_assets().unwrap()[0].tags, vec![tag]);
+    let files = std::fs::read_dir(&dir).unwrap().count();
+    drop(Project::open(&path).unwrap());
+    assert_eq!(
+        std::fs::read_dir(&dir).unwrap().count(),
+        files,
+        "opening again makes no second backup"
     );
     std::fs::remove_dir_all(&dir).ok();
 }

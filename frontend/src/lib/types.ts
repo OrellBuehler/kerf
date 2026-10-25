@@ -56,6 +56,110 @@ export interface Asset {
 	/** Set on composed music: the score it was rendered from, which is what "edit and compose
 	 *  again" starts from. Absent for ordinary media. */
 	music_score?: MusicScore;
+	/** The labels on the asset (`location: Cumbuco`, `jump`), for finding it and for building a cut by a key.
+	 *  Set with `editAssetTags`, never by probing. Absent when it has none. */
+	tags?: Tag[];
+}
+
+/** A label on a whole asset (`kerf_core::Tag`): `{ key: 'location', value: 'Cumbuco' }` is `location: Cumbuco`,
+ *  `{ value: 'jump' }` the plain tag `jump`. Keys are lowercased and a tag is compared ignoring case; `tags.ts` has the
+ *  spelling rules (`parseTag`, `formatTag`). */
+export interface Tag {
+	key?: string;
+	value: string;
+}
+
+/** A change to an asset's tags (`kerf_core::TagEdit`), applied in the order `remove_keys`, `remove`, `add`: replacing a
+ *  location is `remove_keys: ['location']` with `add: [{ key: 'location', value: 'Jeri' }]`. */
+export interface TagEdit {
+	/** Tags to put on. */
+	add?: Tag[];
+	/** Tags to take off (the same key and value, ignoring case; a plain tag only takes off a plain tag). */
+	remove?: Tag[];
+	/** Keys to take every tag of off. */
+	remove_keys?: string[];
+}
+
+/** One condition on an asset's tags (`kerf_core::TagFilter`): `{ key, value }` is that tag, `{ key }` any tag with that
+ *  key, `{ value }` alone a plain tag with that value. Several together must all hold. */
+export interface TagFilter {
+	key?: string;
+	value?: string;
+}
+
+/** A value in the vocabulary and how many assets carry it (`kerf_core::TagCount`). */
+export interface TagCount {
+	value: string;
+	assets: number;
+}
+
+/** A key in the vocabulary: how many assets have it at all, and its values (`kerf_core::TagKeyCount`). */
+export interface TagKeyCount {
+	key: string;
+	assets: number;
+	values: TagCount[];
+}
+
+/** Every tag in use, for autocomplete and for choosing a key to group by (`kerf_core::TagSummary`). */
+export interface TagSummary {
+	/** Keyed tags by key, A to Z. */
+	keys: TagKeyCount[];
+	/** Plain tags, A to Z. */
+	plain: TagCount[];
+}
+
+/** How `assembleByTag` titles each group with its value. */
+export type GroupTitle = 'overlay' | 'card' | 'none';
+
+/** Which way the assets of one group are ordered: oldest import first, or by name. */
+export type SortWithin = 'imported' | 'name';
+
+/** A cut built from the library by the value of one tag key (`kerf_core::AssembleByTag`). Every member but `key` is
+ *  optional and left at its default when omitted. */
+export interface AssembleByTag {
+	/** The key to group by (`location`): one group per value. */
+	key: string;
+	/** The order of the groups, by value (ignoring case). Values it does not list follow A to Z; the default is A to Z. */
+	order?: string[];
+	/** Only assets matching every term are used. */
+	filter?: TagFilter[];
+	/** Assets with no value for `key` come last, in a group of their own with no title (default: left out). */
+	include_untagged?: boolean;
+	/** How a group is titled with its value (default `overlay`: a lower third over the first seconds of its first clip;
+	 *  `card` is `title_seconds` of the cut before the group). */
+	title?: GroupTitle;
+	/** How long a title (a card) runs, above 0 and at most 60 s (default 3). */
+	title_seconds?: number;
+	/** How a group's assets are ordered (default `imported`). */
+	sort_within?: SortWithin;
+}
+
+/** One group of the cut `assembleByTag` laid out (`kerf_core::AssembledGroup`). */
+export interface AssembledGroup {
+	/** The value that names the group; `null` for the assets with no value for the key. */
+	value: string | null;
+	/** Its assets, in the order they play. */
+	asset_ids: string[];
+	/** The group's title clip, when it has one. */
+	title_clip_id?: string;
+	/** Where the group begins on the timeline, seconds (a card's start, else its first clip's). */
+	start: number;
+	/** Where it ends. */
+	end: number;
+}
+
+/** What `assembleByTag` added (`kerf_core::AssembleSummary`). */
+export interface AssembleSummary {
+	groups: AssembledGroup[];
+	/** The clips added from the library, in play order: one for each of the groups' `asset_ids` in turn. */
+	clip_ids: string[];
+	/** Values of `order` that no asset carries. Absent when there are none. */
+	unmatched?: string[];
+}
+
+/** The answer of `assembleByTag`: the refreshed cut and what was laid out in it. */
+export interface AssembleEdit extends AssembleSummary {
+	timeline: Timeline;
 }
 
 /** What a generated voiceover was made from, kept on its asset so it can be
@@ -1394,7 +1498,7 @@ export interface StagedEdit {
 	edits: string[];
 	/** How many of the latest staged steps `undoStagedEdit` can still take back (absent: none). */
 	undo_depth?: number;
-	/** Changes to the library held back with the proposal (an asset marked as 360); they land with it. */
+	/** Changes to the library held back with the proposal (an asset marked as 360, an asset's tags changed); they land with it. */
 	asset_changes?: StagedAssetChange[];
 	created_at: string;
 	updated_at: string;
@@ -1403,14 +1507,19 @@ export interface StagedEdit {
 	diff: TimelineDiff;
 }
 
-/** A change to an *asset* an agent made while a proposal was open (`kerf_core::StagedAssetChange`). */
+/** A change to an *asset* an agent made while a proposal was open (`kerf_core::StagedAssetChange`): either a projection
+ *  mark (`tag_edit` absent) or a tag change (`tag_edit` set). Show `summary`; do not read `projection` of a tag change, which
+ *  is `null` without meaning "mark as flat". */
 export interface StagedAssetChange {
-	/** `asset_projection:<asset id>`, usable wherever a `DiffEntry.id` is. */
+	/** `asset_projection:<asset id>` or `asset_tags:<asset id>`, usable wherever a `DiffEntry.id` is. */
 	id: string;
 	asset_id: string;
-	/** The projection the asset is to be marked with; `null` clears it. */
+	/** The projection the asset is to be marked with; `null` clears it. Not read by a tag change (it is `null`). */
 	projection: Projection | null;
-	/** One line for the review card. */
+	/** A tag change: the agent's edits to the asset's tags composed into one (`TagEdit::then`). It is run over the tags
+	 *  the asset has when it lands, so what the user tagged in between stays. Absent for a projection mark. */
+	tag_edit?: TagEdit;
+	/** One line for the review card, e.g. `Mark interview.mp4 as equirect 360` or `Tag clip.mp4: +location: Cumbuco, -jump`. */
 	summary: string;
 }
 
@@ -2279,6 +2388,9 @@ export interface AppSettings {
 	time_display: TimeDisplay;
 	/** Open the project that was open last when Kerf starts without one named on its command line. */
 	reopen_last_project: boolean;
+	/** Whether importing media offers to tag the new assets afterwards. On by default; the prompt's own "don't ask
+	 *  again" switches it off. */
+	ask_tags_on_import: boolean;
 	/** The `.kerf` files opened or saved most recently, newest first, at most 10. Kept by the app
 	 *  (`recentProjects` prunes the ones that are gone, `clearRecentProjects` empties it); a settings
 	 *  patch cannot write it. */

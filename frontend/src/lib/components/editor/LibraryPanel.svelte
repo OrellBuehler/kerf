@@ -21,6 +21,9 @@
 	import { editor } from '#lib/state.svelte';
 	import { ui } from '#lib/editor-ui.svelte';
 	import { importMedia } from '#lib/import-media';
+	import { contextMenu } from '#lib/context-menu.svelte';
+	import type { MenuItem } from '#lib/context-menu.svelte';
+	import { countLabel, filterByTags, filterGroups, toggleTerm } from '#lib/tag-ui';
 	import { LIBRARY_MIN_OPEN_WIDTH, LIBRARY_OPEN_WIDTH, LIBRARY_RAIL_WIDTH } from '#lib/layout';
 	import { LIBRARY_TAB_SPECS, stepTab, type LibraryTab } from '#lib/workspaces';
 	import { tip } from '#lib/tip';
@@ -32,6 +35,9 @@
 	const tab = $derived(settings.libraryTab);
 	/** The Media tab's header carries the count and the two ways in once there is something in the bin. */
 	const assetCount = $derived(tab === 'media' ? editor.assets.length : 0);
+	/** The assets the bin's tag filter lets through, for `MEDIA · 3 of 12`. */
+	const filtered = $derived(ui.tagFilter.length > 0);
+	const matching = $derived(filtered ? filterByTags(editor.assets, ui.tagFilter).length : assetCount);
 	const spec = $derived(LIBRARY_TAB_SPECS.find((t) => t.id === tab) ?? LIBRARY_TAB_SPECS[0]);
 
 	// The rail can only stand alone when the library has its group to itself — a
@@ -59,6 +65,34 @@
 		} else {
 			settings.setLibraryTab(id);
 		}
+	}
+
+	/** The filter button: the library's vocabulary as a menu (a group per key, then the plain tags), each row a term to
+	 *  add to the filter or, when it is in it, to take off. Every term must hold. */
+	function openTagFilter(e: MouseEvent) {
+		const button = e.currentTarget as HTMLElement;
+		const r = button.getBoundingClientRect();
+		const toggle = (term: Parameters<typeof toggleTerm>[1]) => () => ui.setTagFilter(toggleTerm(ui.tagFilter, term));
+		const items: MenuItem[] = [{ type: 'header', label: 'Filter by tag', sub: 'An asset must have every tag you pick' }];
+		const groups = filterGroups(editor.tagVocabulary, ui.tagFilter);
+		if (groups.length === 0)
+			items.push({
+				label: 'No tags in the library yet',
+				disabled: true,
+				reason: 'Right-click an asset and choose Tag…',
+				action: () => {}
+			});
+		for (const g of groups) {
+			items.push({ type: 'separator' });
+			items.push({ type: 'header', label: g.title, sub: g.assets === null ? undefined : `${g.assets} ${g.assets === 1 ? 'asset' : 'assets'}` });
+			for (const row of g.rows)
+				items.push({ label: row.label, icon: row.active ? 'check' : undefined, meta: String(row.assets), action: toggle(row.term) });
+		}
+		if (filtered) {
+			items.push({ type: 'separator' });
+			items.push({ label: 'Clear filter', icon: 'x', action: () => ui.setTagFilter([]) });
+		}
+		contextMenu.show(new MouseEvent('contextmenu', { clientX: r.left, clientY: r.bottom + 2 }), items, button);
 	}
 
 	/** The header's collapse button unmounts with the content it sits in, which
@@ -229,9 +263,11 @@
 				style="height:32px;flex:none;display:flex;align-items:center;gap:8px;padding:0 6px 0 12px;border-bottom:var(--line-width) solid var(--border-subtle)"
 			>
 				<span
-					use:tip={assetCount > 0 ? `${spec.hint}\n${assetCount} ${assetCount === 1 ? 'asset' : 'assets'} in the bin` : spec.hint}
+					use:tip={assetCount > 0
+						? `${spec.hint}\n${filtered ? `${matching} of ${assetCount} assets match the tag filter` : `${assetCount} ${assetCount === 1 ? 'asset' : 'assets'} in the bin`}`
+						: spec.hint}
 					style="flex:1;min-width:0;font:var(--type-overline);letter-spacing:var(--tracking-caps);text-transform:uppercase;color:var(--text-muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
-					>{spec.label}{#if assetCount > 0}<span style="margin-left:6px;font-variant-numeric:tabular-nums">· {assetCount}</span>{/if}</span
+					>{spec.label}{#if assetCount > 0}<span data-testid="media-count" style="margin-left:6px;font-variant-numeric:tabular-nums;text-transform:none">· {countLabel(matching, assetCount, filtered)}</span>{/if}</span
 				>
 				{#if assetCount > 0}
 					{#if editor.importing}
@@ -251,6 +287,13 @@
 							>
 						</span>
 					{:else}
+						<IconBtn
+							title={{ text: 'Filter by tag', detail: filtered ? `${ui.tagFilter.length === 1 ? 'One tag' : `${ui.tagFilter.length} tags`} in force` : 'Show only the assets with a tag.' }}
+							size={24}
+							data-on={filtered ? '' : undefined}
+							data-testid="tag-filter-button"
+							onclick={openTagFilter}><Icon n="tags" s={14} /></IconBtn
+						>
 						<IconBtn
 							title={{ text: 'Compose music…', detail: 'Write a chord progression and Kerf plays it onto the timeline.' }}
 							size={24}

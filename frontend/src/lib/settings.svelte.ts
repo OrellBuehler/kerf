@@ -138,6 +138,8 @@ class SettingsStore {
 	timeMode = $state<TimeDisplay>('timecode');
 	/** Open the project that was open last when Kerf starts with none named. */
 	reopenLast = $state(false);
+	/** Offer to tag the media an import brought in (Settings › Editing; the prompt's "Don't ask again" turns it off). */
+	askTagsOnImport = $state(true);
 	/** The `.kerf` files opened or saved most recently, newest first, the vanished ones dropped
 	 *  (`refreshRecent`); File › Open Recent reads this. */
 	recent = $state<string[]>([]);
@@ -205,6 +207,7 @@ class SettingsStore {
 		this.timeMode = view.time_display ?? 'timecode';
 		timeDisplay.mode = this.timeMode;
 		this.reopenLast = view.reopen_last_project ?? false;
+		this.askTagsOnImport = view.ask_tags_on_import ?? true;
 		this.agentReview = view.agent_review ?? true;
 		this.editing = parseEditing(view.editing);
 		if (!this.editingRead) {
@@ -356,6 +359,12 @@ class SettingsStore {
 		if (on === this.reopenLast) return;
 		this.reopenLast = on;
 		await this.write({ reopen_last_project: on }, 'launch setting');
+	}
+
+	async setAskTagsOnImport(on: boolean) {
+		if (on === this.askTagsOnImport) return;
+		this.askTagsOnImport = on;
+		await this.write({ ask_tags_on_import: on }, 'import setting');
 	}
 
 	/** Re-read the recent projects: the ones whose file is gone are dropped (and forgotten by the backend). */

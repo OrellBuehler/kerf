@@ -526,6 +526,10 @@ pub struct Asset {
     /// again replaces the clip's audio; the asset's bar and tempo analysis is written from it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub music_score: Option<MusicScore>,
+    /// The labels on the asset (`location: Cumbuco`, `jump`), for finding it and for building a cut by
+    /// a key. Set with [`crate::Project::edit_asset_tags`], never by probing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tags: Vec<Tag>,
 }
 
 /// What a generated voiceover was made from — enough to regenerate it, and the
@@ -4030,21 +4034,32 @@ pub struct StagedEdit {
 /// A change to an *asset* an agent made while a proposal was open. The library is not the
 /// timeline, so it cannot ride in the proposal's timeline; it is held back beside it instead
 /// and written when the proposal is accepted (or the entry is picked in a partial accept).
+///
+/// Two kinds: a projection change (`tag_edit` absent) and a tag change (`tag_edit` set).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StagedAssetChange {
-    /// `asset_projection:<asset id>` — usable wherever a [`DiffEntry::id`] is.
+    /// `asset_projection:<asset id>` or `asset_tags:<asset id>` — usable wherever a [`DiffEntry::id`] is.
     pub id: String,
     pub asset_id: Uuid,
-    /// The spherical projection the asset is to be marked with; `None` clears it.
+    /// The spherical projection the asset is to be marked with; `None` clears it. Not read by a tag change.
     pub projection: Option<Projection>,
+    /// A tag change: everything the agent's edits did to the asset's tags, composed into one edit ([`TagEdit::then`]). It
+    /// is run over the asset's tags as they are when it is read, so it keeps what the user tagged in between.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tag_edit: Option<TagEdit>,
     /// One line for the review card, e.g. `Mark interview.mp4 as equirect 360`.
     pub summary: String,
 }
 
 impl StagedAssetChange {
-    /// The id every change of `kind` to `asset_id` has — one pending change per asset and kind.
+    /// The id every projection change to `asset_id` has — one pending change per asset and kind.
     pub fn projection_id(asset_id: Uuid) -> String {
         format!("asset_projection:{asset_id}")
+    }
+
+    /// The id every tag change to `asset_id` has.
+    pub fn tags_id(asset_id: Uuid) -> String {
+        format!("asset_tags:{asset_id}")
     }
 }
 
@@ -5172,6 +5187,11 @@ mod values;
 pub(crate) use generator::too_many_titles;
 pub use generator::{Generator, TitleClip, GENERATED_ASSET, MAX_TITLE_CLIPS};
 
+mod tags;
+pub use tags::{
+    dedupe_tags, group_by_key, normalize_key, same_tags, tags_match, Grouping, KeyGroup, Tag, TagCount, TagEdit, TagFilter,
+    TagKeyCount, TagSummary, MAX_ASSET_TAGS, MAX_TAG_KEY, MAX_TAG_VALUE,
+};
 mod score;
 pub use score::{
     bar_seconds, duration_s as score_duration_s, expand as expand_score, plan_score_to_picture, AlignOptions, AlignReport,
@@ -7796,6 +7816,7 @@ mod tests {
             source_paths: Vec::new(),
             voiceover: None,
             music_score: None,
+            tags: Vec::new(),
         };
         assert_eq!(asset.hdr(), Some(Hdr::Hlg));
         let proxied = asset.as_sdr_proxy();
