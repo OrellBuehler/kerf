@@ -1257,7 +1257,11 @@ struct AudioEffectsParams {
                        {\"type\":\"highpass\",\"hz\":80}, {\"type\":\"lowpass\",\"hz\":12000}, \
                        {\"type\":\"equalizer\",\"hz\":3000,\"width\":1000,\"gain_db\":3}, \
                        {\"type\":\"compressor\",\"threshold_db\":-18,\"ratio\":3,\"attack_ms\":20,\"release_ms\":250,\"makeup_db\":6}, \
-                       or {\"type\":\"gate\",\"threshold_db\":-40}. Pass [] to clear."
+                       {\"type\":\"gate\",\"threshold_db\":-40}, \
+                       or {\"type\":\"denoise\",\"reduction_db\":12,\"floor_db\":-50,\"track_noise\":false} \
+                       (spectral noise reduction: takes up to reduction_db, 0.01..97, off the hiss / hum under \
+                       floor_db, -80..-20 dBFS; set the floor at or a little above the noise's level, e.g. from \
+                       analyze_asset's loudness; track_noise lets the filter follow a floor that moves). Pass [] to clear."
     )]
     effects: Vec<AudioEffect>,
 }
@@ -3902,7 +3906,7 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Replace a clip's audio effect chain (applied in order at export): highpass, lowpass, equalizer (parametric band), compressor (dynamics) or gate (noise gate). Pass an empty list to clear."
+        description = "Replace a clip's audio effect chain (applied in order at export): highpass, lowpass, equalizer (parametric band), compressor (dynamics), gate (noise gate) or denoise (spectral noise reduction for hiss, hum and room tone: put it after a highpass and before a compressor, which would lift the noise). Pass an empty list to clear."
     )]
     fn set_audio_effects(&self, Parameters(p): Parameters<AudioEffectsParams>) -> Result<String, McpError> {
         self.edit(|project| Self::set_audio_effects_op(project, p))
@@ -7069,7 +7073,7 @@ const EDITING_GUIDE: &str = "How to edit with Kerf. The user queues editing task
              a lower track shows through — with a duplicated, blurred copy above, \
              that is how a face or a number plate is blurred), \
              set_audio_effects (highpass / lowpass / EQ / \
-             compressor / gate). Mix with set_track_volume — a music bed belongs \
+             compressor / gate / denoise). Mix with set_track_volume — a music bed belongs \
              on its own track pulled well under the speech (~0.3), which is most \
              of what makes a cut sound finished — plus set_track_duck to dip it \
              further under dialogue and set_track_pan to place it. Animate a clip \
