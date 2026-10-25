@@ -8845,6 +8845,11 @@ fn audio_effect_filter(e: &AudioEffect) -> String {
             fnum(db_to_linear(*makeup_db)),
         ),
         AudioEffect::Gate { threshold_db } => format!("agate=threshold={}", fnum(db_to_linear(*threshold_db))),
+        AudioEffect::Denoise {
+            reduction_db,
+            floor_db,
+            track_noise,
+        } => denoise_filter(*reduction_db, *floor_db, *track_noise),
     }
 }
 
@@ -10822,7 +10827,7 @@ fn audio_clip_tail(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, layout: &str, m
     } else {
         p.push(format!("volume={}", clip.volume));
     }
-    // Per-clip audio effects (EQ / compressor / gate / filters) in author order,
+    // Per-clip audio effects (EQ / compressor / gate / denoise / filters) in author order,
     // after the clip gain.
     for e in &clip.audio {
         p.push(audio_effect_filter(e));
@@ -11036,6 +11041,16 @@ pub use written::{measure_export, ExportReport, LoudnessTarget, WrittenAudio, Wr
 /// module so it reaches the private graph builders.
 mod levels;
 pub use levels::{mix_levels, stream_mix_pcm};
+
+/// A clip's noise reduction (`afftdn`), its delay taken back out where this ffmpeg has one.
+mod denoise;
+use denoise::denoise_filter;
+#[cfg(test)]
+use denoise::with_afftdn_delay;
+
+/// Noise reduction through the real `ffmpeg`: the sound keeps its sync and its length (`#[ignore]`d).
+#[cfg(test)]
+mod denoise_rendered;
 
 /// The golden argv oracle (see its docs): a child module so it reaches the
 /// private builders.

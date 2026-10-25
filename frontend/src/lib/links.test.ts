@@ -1577,7 +1577,7 @@ describe('a cut and what it leaves of a partner', () => {
 	});
 });
 
-describe('detach under a compressor or gate', () => {
+describe('detach under a compressor, gate or denoise', () => {
 	const compressor = (): AudioEffect => ({
 		type: 'compressor',
 		threshold_db: -18,
@@ -1588,7 +1588,12 @@ describe('detach under a compressor or gate', () => {
 	});
 
 	test('meets the same fader instead of folding it', () => {
-		for (const dynamic of [compressor(), { type: 'gate', threshold_db: -40 } as AudioEffect]) {
+		const dynamics: AudioEffect[] = [
+			compressor(),
+			{ type: 'gate', threshold_db: -40 },
+			{ type: 'denoise', reduction_db: 12, floor_db: -50, track_noise: false }
+		];
+		for (const dynamic of dynamics) {
 			const asset = uuid();
 			const c = clip(asset, 0, 10, 0);
 			c.volume = 0.8;

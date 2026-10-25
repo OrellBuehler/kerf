@@ -7483,7 +7483,7 @@ fn validate_video_effect(e: &VideoEffect) -> Result<()> {
 }
 
 /// Every audio effect parameter against the range of the FFmpeg filter it becomes (`highpass`,
-/// `lowpass`, `equalizer`, `acompressor`, `agate` — `ffmpeg -h filter=<name>`): outside it the
+/// `lowpass`, `equalizer`, `acompressor`, `agate`, `afftdn` — `ffmpeg -h filter=<name>`): outside it the
 /// export fails on the filter's own error, long after the edit was accepted. The dB parameters
 /// are converted to the linear values the filters take (`acompressor`'s threshold is
 /// 0.000976563..1, its makeup 1..64; `agate`'s threshold 0..1), which bounds them in dB.
@@ -7528,6 +7528,12 @@ fn validate_audio_effect(e: &AudioEffect) -> Result<()> {
             within(*makeup_db, "compressor makeup_db", " dB", 0.0, 36.0)?;
         }
         AudioEffect::Gate { threshold_db } => within(*threshold_db, "gate threshold_db", " dB", -100.0, 0.0)?,
+        AudioEffect::Denoise {
+            reduction_db, floor_db, ..
+        } => {
+            within(*reduction_db, "denoise reduction_db", " dB", 0.01, 97.0)?;
+            within(*floor_db, "denoise floor_db", " dB", -80.0, -20.0)?;
+        }
     }
     Ok(())
 }
