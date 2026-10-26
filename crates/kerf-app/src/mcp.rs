@@ -16,9 +16,9 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use base64::Engine as _;
 use kerf_core::{
-    AudioEffect, CaptionFormat, CaptionImportRequest, CaptionOptions, CaptionStyle, CaptionTimeBase, ClipCut, ClipLut, ClipMove,
-    CurvePoint, Curves, Delivery, EditSource, ExportOptions, Fit, Keyframe, Mask, MaskShape, Project, Projection, Property,
-    PropertyKey, PropertyTrack, ReframeKeyframe, Region, SpeedKey, SplitSide, StreamKind, SvgCheck, SvgDoc, SvgLayout,
+    AudioEffect, BlendMode, CaptionFormat, CaptionImportRequest, CaptionOptions, CaptionStyle, CaptionTimeBase, ClipCut, ClipLut,
+    ClipMove, CurvePoint, Curves, Delivery, EditSource, ExportOptions, Fit, Keyframe, Mask, MaskShape, Project, Projection,
+    Property, PropertyKey, PropertyTrack, ReframeKeyframe, Region, SpeedKey, SplitSide, StreamKind, SvgCheck, SvgDoc, SvgLayout,
     SvgOverlay, SvgOverlayPatch, SvgOverlayResult, SvgPreset, SvgPresetKind, SvgPresetParams, SvgSource, TextKeyframe, TimeRange,
     Timeline, TitleClipPatch, TitleClipPlacement, TitleClipResult, Transition, TransitionKind, VideoEffect, Wheel, Wheels,
 };
@@ -762,6 +762,16 @@ struct SetMaskParams {
     feather: Option<f64>,
     #[schemars(description = "Keep what is OUTSIDE the shape instead of inside it (default false)")]
     inverted: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SetBlendModeParams {
+    #[schemars(description = "UUID of the clip (on a video track) to blend")]
+    clip_id: String,
+    #[schemars(
+        description = "How the clip composites onto the tracks below: \"normal\" (plain, the default), \"multiply\", \"screen\", \"overlay\", \"hard_light\", \"add\" (linear dodge), \"darken\", \"lighten\", \"difference\" or \"exclusion\""
+    )]
+    mode: String,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -3317,6 +3327,35 @@ impl KerfMcp {
             }
         };
         let clip = project.set_mask(clip_id, mask).map_err(core_err)?;
+        json(&clip)
+    }
+
+    #[tool(
+        description = "Composite a clip onto the tracks BELOW it with a blend mode instead of laying it over \
+                       them: its colour is mixed with what is underneath, per pixel. multiply darkens (white \
+                       vanishes: paper textures, shadows, line art), screen lightens (black vanishes: light leaks, \
+                       lens flares, fire and smoke shot on black), add sums the two (a hotter glow), overlay and \
+                       hard_light add contrast from the clip, darken / lighten keep the darker / lighter of the \
+                       two, difference and exclusion invert where the clip is bright. \"normal\" goes back to \
+                       plain compositing. The clip's opacity, mask, chroma key and fades still decide how much of \
+                       the mix shows, and outside its picture the lower tracks are untouched; a clip with nothing \
+                       under it blends with black. Only a clip on a video track can blend. Check the result with \
+                       preview_timeline."
+    )]
+    fn set_blend_mode(&self, Parameters(p): Parameters<SetBlendModeParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::set_blend_mode_op(project, p))
+    }
+
+    fn set_blend_mode_op(project: &Project, p: SetBlendModeParams) -> Result<String, McpError> {
+        let clip_id = parse_arg("clip_id", &p.clip_id)?;
+        let mode = BlendMode::parse(&p.mode).ok_or_else(|| {
+            let known: Vec<&str> = BlendMode::ALL.iter().map(|m| m.as_str()).collect();
+            McpError::invalid_params(
+                format!("invalid blend mode '{}'; expected one of {}", p.mode, known.join(", ")),
+                None,
+            )
+        })?;
+        let clip = project.set_blend_mode(clip_id, mode).map_err(core_err)?;
         json(&clip)
     }
 
@@ -7068,6 +7107,8 @@ const EDITING_GUIDE: &str = "How to edit with Kerf. The user queues editing task
              track shows through), set_mask (cut a clip to a rectangle or ellipse so \
              a lower track shows through — with a duplicated, blurred copy above, \
              that is how a face or a number plate is blurred), \
+             set_blend_mode (screen a light leak or flare shot on black onto the shot \
+             below, multiply a texture into it), \
              set_audio_effects (highpass / lowpass / EQ / \
              compressor / gate). Mix with set_track_volume — a music bed belongs \
              on its own track pulled well under the speech (~0.3), which is most \
