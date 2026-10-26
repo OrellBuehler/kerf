@@ -544,6 +544,13 @@
   `speed ramp retimed` (a head trim) / `changed`. OTIO and EDL cannot carry a ramp: they write the average speed
   (`export_speed`: `mean_speed` in the clip's direction) with a warning, and OTIO keeps the ramp in `metadata.kerf`. Audio sync
   and music fit refuse a ramped clip; `review_cut` compares neighbours' speeds at the cut (`pace_gap`).
+- **Stabilization** (`model/stabilize.rs`). `Clip.stabilize: Option<Stabilize>` (absent when `None`; schema v15):
+  `strength` `0..=1` (default 0.5; the smoothing radius, up to a second of frames) and `zoom` percent `0..=MAX_STABILIZE_ZOOM`
+  (30) or `None` for automatic. `check` refuses a value out of range, `normalized` holds a stored one to them for the readers;
+  `Clip::is_stabilized` is set and not a title. Only the setting is in the timeline: the measurement is a cache
+  (`crate::stabilize`, `engine-cli.md`), so a split or a trim keeps the setting (a clone) and the cache, a paste or a duplicate
+  copies it, and it is not carried to linked partners (a picture's look, like the grade). Diff: `stabilized (50%)`,
+  `stabilization 80%`, `stabilization off`.
 - **Animated SVG overlays** (`Timeline.svg_overlays: Vec<SvgOverlay>`, `svg/`, pure +
   unit-tested; the engine side is `engine-cli.md`). An overlay is SMIL-animated vector art
   drawn between `start` and `end`, fit *contain* and centred into the rect `x, y, width, height`

@@ -1644,6 +1644,43 @@ ungated by `cpu::lease`, but niced (`bg_command`) and thread-capped by the still
   constant speed). The golden family `speed-ramp` (400 appended cases, `ramp_for`) and `ramp_rendered.rs` (`cargo test … --
   --ignored ramp_rendered`) hold it; the GPU refuses a ramped layer (`core-render-plan.md`).
 
+**Stabilization** (`crate::stabilize`, `engine/cli/stabilize.rs`; the model is `core-model.md`, the project ops
+`core-project.md`). **vid.stab when the binary has it** (`vidstab_available`: `-filters` lists `vidstabdetect` and
+`vidstabtransform`, probed once, a test override `with_vidstab`; the bundled GPL builds have libvidstab, a minimal or LGPL one
+does not), **`deshake` otherwise**. *Measuring* (`measure_motion`, background lane, `READ_STALL`, the cancel, in a fresh work
+directory so the files have plain names, not escaped paths): the clip's window of the **original** through
+`scale=w='min(1920,iw)':h=-2,vidstabdetect=result=motions.trf:shakiness=5:accuracy=15,showinfo` (each frame's time from
+`showinfo`'s integer `pts` in the stream's time base plus the seek, its size from `s:`), then one frame through the same scale
+and `vidstabtransform=input=motions.trf:debug=1`, which solves vid.stab's per-frame transforms as it opens and writes them as
+`global_motions.trf` (a fresh process, so its `rand()` in the gradient descent is the same sequence vid.stab's own second
+pass would use). The `MotionAnalysis` (times, `[x, y, angle]` per frame, measured size, the original's `source_key`) is kept
+as `<cache>/kerf/stabilize/<asset id>/<digest>.json`; a lookup takes the newest one of the same file that covers the clip.
+*Correcting*: `stabilize::corrections` is vid.stab's `cameraPathGaussian` (relative transforms integrated, a gaussian of
+radius `round(strength × fps)`, the path minus its average; vid.stab's own zoom term zeroed as its transform pass zeroes
+it), operation for operation, over the whole analysis, and **every graph hands `vidstabtransform` only the absolute
+corrections of the frames it reads** (`relative=0:smoothing=0:optzoom=0:zoom=Z:crop=black:interpol=bicubic`, vid.stab's
+old transforms format, written once as `<cache>/kerf/stabilize/slices/<digest>.trf` like a LUT's copy), scaled to the frame
+the input decodes (a proxy's size from `proxy_video_info`). So a preview from the playhead, a one-frame still, a proxy and
+the export move a frame alike; vid.stab's two passes would smooth and zoom over whatever stream they are given. The zoom is
+the setting's, else `auto_zoom` over the clip's own frames (1st / 99th percentile of the shifts, rotation left out, ≤ 30 %).
+*Which frame is which*: vid.stab numbers frames from the first it gets, so a stabilized clip's input is opened `SEEK_PAD` (3)
+source frames early (`clip_input_seek`, used for the `-ss`, the input dedup key, the picture's and the sound's trims and the
+parts' input count) and its chain trims at `Slice::start`, the midpoint before the first frame the slice corrects (or half a
+frame before it), never on a frame, so the first frame kept is the slice's first on the original and on a proxy alike; the
+filter goes straight after that `trim`, before `reverse` and the retime, since the correction is per source frame (speed,
+reverse and ramps keep it). A still seeks to the same midpoint and runs the one-line slice after its tone-map. A clip whose
+analysis does not cover it (or whose window opens before it) gets no filter and plays as shot; an image, a title and 360
+footage never do. *deshake*: `rx` / `ry` 16 to 64 (the filter takes multiples of 16) at about `0.5 % + 2.5 % × strength` of
+the width it reads, `edge=mirror`, then a centred `crop=w=iw/k:h=ih/k` by the zoom (else twice the reach); temporal, so a
+still or a stream from the playhead starts it afresh. **Known limits**: vid.stab and deshake are 8-bit filters, so a 10-bit or
+HDR source is converted ahead of them (before the export's tone-map); FFmpeg 6 regrids a variable-rate source's proxy, so
+its frames can drift from the original's and the preview's correction with them (the bundled 9.0 keeps the frames). Tests:
+the math and the slices (`stabilize.rs`), the argv and log parsing (`cli/stabilize.rs`), hostile logs and analyses, and
+`cli/stabilize_rendered.rs` (`#[ignore]`d, real ffmpeg): Kerf's corrections against vid.stab's own two passes frame for frame
+(from the first frame and from the middle), a stabilized export forward / reversed / at 2× holding a shaken still pattern
+still, `deshake` steadying it without vid.stab, the still equal to the export's frame and a half-size proxy moved by half,
+and an analysis job measured, kept, found again and stopped.
+
 ## Thumbnails (`thumbnail.rs`)
 
 A designed thumbnail is drawn without a graph of its own: the background is `export_still` of `VideoGraphics::background_of`

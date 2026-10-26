@@ -177,8 +177,12 @@
   its next write of the clip and the clip then plays at its constant speed, a different length; a clip with none is written as
   before, `run` a no-op, `needed` always, `needed_to_read` false (`a_v13_file_is_backed_up_stamped_v14_and_keeps_its_speed_ramps`);
   `persisted/timelines-v14.json` holds a clip on a ramp with a held segment.
-  The schema is at **v14** (`SCHEMA_VERSION`). `persist_tests` pins which steps a file has pending with
-  `store::pending_steps` (a legacy file that has every column: `[4, 5, 6, 7, 8, 9, 10, 11, 12, 13]`). A step's `needed_to_read` says whether a build that
+  v14→v15 is a JSON step for a **new field**, `Clip.stabilize` (`core-model.md`): an older build drops it at its next write
+  of the clip, which then plays shaken; a clip with none is written as before, `run` a no-op, `needed` always,
+  `needed_to_read` false (`a_v14_file_is_backed_up_stamped_v15_and_keeps_its_stabilized_clip`); the analysis is a cache
+  beside the footage, not in the file; `persisted/timelines-v15.json` holds a stabilized clip with a fixed zoom.
+  The schema is at **v15** (`SCHEMA_VERSION`). `persist_tests` pins which steps a file has pending with
+  `store::pending_steps` (a legacy file that has every column: `[4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]`). A step's `needed_to_read` says whether a build that
   cannot write must still refuse a file lacking what it adds: true for the v1, v2 and v4 columns (the reads
   name them), false for the `fonts` table (reads tolerate its absence), so a write-protected v2 project
   opens as it is. A new file is stamped `SCHEMA_VERSION`; a
@@ -796,6 +800,18 @@
   dropped), so a span inside a silent title tail is refused (`range_past_the_sound`) rather than widened to the whole cut. At
   most `MAX_TITLE_CLIPS` (50) titles on tracks: `put_title` refuses the 51st, and the invariant net refuses an op (a split)
   that would make one.
+- **Stabilization** (`project/stabilize.rs`; the design is `crate::stabilize`, `engine-cli.md`). `set_clip_stabilize(clip,
+  Option<Stabilize>)` is one `Stabilize clip` / `Stop stabilizing clip` revision through `edit_timeline` (so it stages); the
+  setting is `check`ed, and a clip on an audio track, a title, a still, a clip with no picture and 360 footage (a spherical
+  asset or a reframed clip) are refused with why (`why_not_stabilized`); a locked track does not refuse it (a look). The
+  analysis is the heavy-op split without an apply: `stabilize_inputs(clip)` under the lock (the working timeline's clip, its
+  **original**, the picture's source window with its tail, `RANGE_MARGIN` 2 s either side held to the file, at most
+  `MAX_ANALYSIS_SECONDS`, the picture's `lead`) → the static `analyze_stabilization(job, progress, cancel)` (nothing to do —
+  `Ok(false)` — without vid.stab or when an analysis of the same file already covers the clip; else `measure_motion` in the
+  background lane and `stabilize::store`), so a trim or split inside the window needs no new analysis.
+  `stabilization_status_inputs(ids?)` (the named clips, else every stabilized one) → static `stabilization_statuses`: `off`,
+  `unsupported`, `basic` (no vid.stab: `deshake`), then this session's job (`queued`, `analyzing`), else `ready` when a stored
+  analysis of the original covers `source_in..source_out`, else the job's `failed`, else `missing`.
 - `analysis.rs` — transcription / scene / silence / rhythm are **pluggable traits**
   (`Transcriber`, `SceneDetector`, `SilenceDetector`, `RhythmAnalyzer`). Real impls
   now exist:

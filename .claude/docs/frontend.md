@@ -414,7 +414,12 @@ release, Escape abandons via `beginDrag`; a click that only adds a point or puts
 a double-click, which undoes it, and a gesture that changes nothing writes nothing; three hue discs painted from `grade.ts`'s `wheelHue` with a lightness
 `SliderRow` each; a `.cube` picker, a Clear button and an intensity slider, with `inspect_lut` saying the size or why the
 file is not applied. Curves are drawn with `grade.ts`, the TS mirror of the engine's cubic; the preview shows the
-grade through FFmpeg because the GPU preview refuses a graded clip), **transition** (a grouped picker
+grade through FFmpeg because the GPU preview refuses a graded clip), **stabilize** (`StabilizeSection.svelte`, offered for
+moving footage on a video track only, `stabilize.ts`'s `canStabilize`: a switch, a strength `SliderRow`, an automatic-zoom
+switch and a zoom slider when it is off, each one `set_clip_stabilize`; a status badge and line from
+`clip_stabilization_status` and `stabilize-progress`; the panel starts `analyze_clip_stabilization` itself for a clip whose
+status is `missing`, once per clip, setting and window, and offers Analyze after a failure and Stop while it runs; the harness
+keeps the backend's refusals and reads `missing` until its stand-in analysis lands), **transition** (a grouped picker
 over `src/lib/transitions.ts` — fade / slide / push, then a direction, because
 that is the order the choice is actually made and a flat list of eleven names
 hides it; its bun test pins the ids against `TransitionKind::ALL`), plus **video / audio

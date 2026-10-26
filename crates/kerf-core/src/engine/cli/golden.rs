@@ -99,7 +99,7 @@
 //! every case is planned with `segments::plan_export` under [`PARTS_LIMITS`] and the argv of every part and of the last pass is
 //! digested, so the three files above prove that a small export is unchanged and this one pins what a long one is made of.
 //!
-//! **Machine-independent by construction.** The builders read the machine in five
+//! **Machine-independent by construction.** The builders read the machine in seven
 //! places, each pinned: the preview's decode acceleration (the
 //! `build_preview_args_with` seam), `zscale_available()` (`with_zscale`; a case
 //! holding HDR footage is built *both* ways), `alimiter_latency_available()`
@@ -108,6 +108,8 @@
 //! font path (`with_pinned_default_font`: the shipped default that an overlay with no
 //! family gets, and the one family an overlay names, `PINNED_FAMILY`, are fixed paths, so
 //! neither this machine's cache directory nor its installed fonts reach the argv),
+//! whether the ffmpeg has vid.stab (`with_vidstab`) and the stabilization analyses on disk
+//! (`stabilize::pinned`: made-up ones, slice files named and not written),
 //! and libm: the
 //! compressor and gate thresholds go through `powf`, whose last digits differ between
 //! glibc builds (FMA or not), macOS, Windows and arm, so [`round_libm`] compares those

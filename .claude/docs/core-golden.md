@@ -49,8 +49,9 @@
   `KERF_GOLDEN_BLESS=1 cargo test -p kerf-core --no-default-features golden -- --nocapture`
   (exactly `1`): it rewrites **all three** files and says so, and `git diff` is the guard —
   only the files you meant to change should move. It is **machine-independent**: the
-  builders read the machine in six places and each is pinned (the sixth is the animated titles' cache
-  directory, `svg::raster::with_pinned_dir`) — the preview's
+  builders read the machine in eight places and each is pinned (the sixth is the animated titles' cache
+  directory, `svg::raster::with_pinned_dir`; the seventh and eighth are whether the ffmpeg has vid.stab, `with_vidstab`, and
+  the stabilization analyses on disk, `stabilize::pinned`) — the preview's
   `decode_hwaccel()` (through `build_preview_args_with`), `zscale_available()` (a `cfg(test)`
   thread-local override; every HDR case is built both ways), `alimiter_latency_available()`
   (the same kind of override, `with_alimiter_latency`; every case is built with the option,
@@ -203,6 +204,14 @@
   by needle, and structurally `speed-ramp-hold`, `speed-ramp-reversed`, `speed-ramp-tail` (a ramped outgoing clip under a
   transition: 124) and `still-speed-ramp` (a ramped clip on screen in a still). The still carries no sound and no `setpts`
   of a ramp (its `-ss` is the map's source time), so it has the one structural family.
+- **Stabilization** (`stabilize_for`), **appended, nothing re-blessed**: the 400 cases after the speed ramps (`STABILIZE_FIRST`)
+  draw from the same generator and stabilize most clips of footage on dice of their own (a strength, a fixed zoom on a third, now
+  and then read through the asset's padded proxy twin); every fourth case is built for an ffmpeg without vid.stab
+  (`Case.vidstab`, `with_vidstab`). `pinned` hands over a made-up analysis per pool asset (`pinned_analyses`, plain arithmetic, no
+  libm) and names slice files instead of writing them (`/kerf-test/stabilize/<asset>-<k0>-<k1>-<scale>.trf`); the zoom in the argv
+  is rounded to a thousandth. `git diff` of the four digest files is 16 insertions, 0 deletions. Families `stabilize-vidstab`,
+  `stabilize-deshake`, `stabilize-proxy` / `stabilize-proxy-4k` (a proxy's slice scaled to 0.6667 / 0.3333) and their `still-` /
+  `preview-` forms.
 - **Constant-power crossfades** (`afade …:curve=qsin` only on a fade that is wholly one half of a real
   pair: a dissolve or motion transition from an adjacent clip whose overlap plays different sound — not a
   fade up from black, not a dip, not a cut inside one take) re-blessed `export.txt` alone: 1304 of 6400

@@ -140,7 +140,7 @@
   the multi-clip paths and `linked_clip_ids` feeds `timeline_summary`. Pairs already apart,
   different assets, `link: false` and a project that links nothing (no snapshot taken) are
   exempt from the lock and the guard. Property edits (volume / fades / effects / colour /
-  transitions), `set_clip_enabled` and captions are not carried (offsets do not change).
+  transitions), `set_clip_enabled`, stabilization and captions are not carried (offsets do not change).
   **Paste / duplicate** give copies of a pasted group a fresh shared link id, and a muted
   picture pasted *without* an audio partner carrying the same footage gets its own sound
   back (it would be silent for good). **`Project::with_links(Option<bool>, ..)`** is
