@@ -460,6 +460,10 @@ fn a_stabilized_hdr_clip_is_tone_mapped_then_steadied_alike_in_the_export_and_th
     let path = dir.join("hlg.mp4");
     let made = command(&ffmpeg_bin())
         .args(["-hide_banner", "-loglevel", "error", "-y", "-i", &sdr.path])
+        .args([
+            "-vf",
+            "setparams=color_primaries=bt2020:color_trc=arib-std-b67:colorspace=bt2020nc:range=tv",
+        ])
         .args(["-c:v", "libx264", "-crf", "8", "-g", "15", "-pix_fmt", "yuv420p"])
         .args([
             "-color_primaries",
