@@ -192,8 +192,8 @@ fn podcast_cleanup(args: &Args) -> String {
          shift. Speech models often leave fillers out, so few hits proves nothing.\n\
          6. Voices: `get_levels` measures the mix and each track. Give each voice clip one chain with \
          `set_audio_effects`, in this order: a highpass (~80 Hz) for rumble, a denoise for hiss and room tone \
-         (reduction_db ~12, floor_db at or a little above the noise between phrases — the quiet end of the loudness \
-         analysis — or track_noise true when it moves), then a compressor for an uneven voice and a gate last; \
+         (reduction_db ~12, floor_db -50, raised toward -40 / -35 for a noisy room — too high eats speech — or \
+         track_noise true when the noise moves), then a compressor for an uneven voice and a gate last; \
          `set_track_volume` balances speakers on separate tracks.\n\
          7. Loudness: `set_master_limiter` on and `set_master_true_peak`, then `get_levels` again; `set_master_volume` \
          fixes a mix that is still hot or quiet.\n\

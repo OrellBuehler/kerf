@@ -1260,8 +1260,9 @@ struct AudioEffectsParams {
                        {\"type\":\"gate\",\"threshold_db\":-40}, \
                        or {\"type\":\"denoise\",\"reduction_db\":12,\"floor_db\":-50,\"track_noise\":false} \
                        (spectral noise reduction: takes up to reduction_db, 0.01..97, off the hiss / hum under \
-                       floor_db, -80..-20 dBFS; set the floor at or a little above the noise's level, e.g. from \
-                       analyze_asset's loudness; track_noise lets the filter follow a floor that moves). Pass [] to clear."
+                       floor_db, -80..-20 dBFS; start at -50, raise it toward -40 / -35 for a noisy room, and back \
+                       off if speech goes thin or watery — too high a floor eats the voice; track_noise lets the \
+                       filter follow a floor that moves). Pass [] to clear."
     )]
     effects: Vec<AudioEffect>,
 }
