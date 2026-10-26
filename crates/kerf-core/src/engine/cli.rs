@@ -7925,7 +7925,17 @@ fn build_filter_complex_with(
                     py = quote(format!("(H-h)/2+({py})*H"), motion.is_some()),
                 )
             };
-            chains.push(format!("[{cur}][v{flat}]{overlay}[{out}]"));
+            match clip.blend_mode.ffmpeg() {
+                None => chains.push(format!("[{cur}][v{flat}]{overlay}[{out}]")),
+                Some(mode) => chains.extend(blend_chains(
+                    &cur,
+                    &format!("v{flat}"),
+                    &overlay,
+                    mode,
+                    &flat.to_string(),
+                    &out,
+                )),
+            }
             cur = out;
         }
         if !svg.is_empty() {
@@ -10495,10 +10505,11 @@ fn build_still_args_rendered(
             )
         ));
         let out = format!("ov{n}");
-        chains.push(format!(
-            "[{cur}][v{n}]{overlay}[{out}]",
-            overlay = still_overlay(&tf, layer.motion)
-        ));
+        let overlay = still_overlay(&tf, layer.motion);
+        match clip.blend_mode.ffmpeg() {
+            None => chains.push(format!("[{cur}][v{n}]{overlay}[{out}]")),
+            Some(mode) => chains.extend(blend_chains(&cur, &format!("v{n}"), &overlay, mode, &n.to_string(), &out)),
+        }
         cur = out;
     }
     // Titles over the clips, under the text, as in the export.
@@ -11056,6 +11067,15 @@ mod export_progress_rendered;
 /// A clip's curves, wheels and LUT as filters.
 mod grade;
 use grade::grade_filters;
+
+/// A clip composited with a blend mode instead of alpha-over.
+mod blend;
+use blend::blend_chains;
+
+/// Blend modes through the real `ffmpeg`: the pixels of each mode, the composite outside the clip, and `normal`
+/// through the blend graph against the plain `overlay` (`#[ignore]`d).
+#[cfg(test)]
+mod blend_rendered;
 
 /// The filters of a clip's grade as the graph writes them, in chain order, for frames tagged `frame_matrix`
 /// (`None`: untagged): `lut3d`, `lutrgb`, `colorbalance`, and for a tagged picture the `scale` / `format` /

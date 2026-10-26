@@ -84,6 +84,13 @@
 //! `speed-ramp-hold`, `speed-ramp-reversed`, `speed-ramp-tail` (a ramped outgoing clip under a
 //! transition) and `still-speed-ramp`.
 //!
+//! **The blend-mode family is appended the same way**: the [`BLEND_CASES`] after the ramp ones draw from the
+//! same generator (with the channel family's channels) and then have some of their video clips composited with
+//! a blend mode ([`blend_for`], on dice of its own seeded by the case and the clip, every mode but `normal`). The
+//! first 8400 per-case digests are the ones the commit before blend modes gave; 4 block lines were appended to
+//! each file, `parts.txt`'s too. Families `blend`, `still-blend`, `preview-blend` (`blend=c0_mode=`) and the two
+//! names that differ from the mode's own, `blend-hardlight` (overlay) and `blend-addition` (add).
+//!
 //! **The export in parts has a file of its own** (`golden/parts.txt`, [`the_parts_argv_builders_produce_the_golden_digests`]):
 //! every case is planned with `segments::plan_export` under [`PARTS_LIMITS`] and the argv of every part and of the last pass is
 //! digested, so the three files above prove that a small export is unchanged and this one pins what a long one is made of.
@@ -161,7 +168,10 @@ const MASK_CROP_FIRST: usize = BLUR_FIRST + BLUR_CASES;
 /// The speed-ramp cases appended after the keyed mask and crop ones (see the module docs).
 const RAMP_CASES: usize = 400;
 const RAMP_FIRST: usize = MASK_CROP_FIRST + MASK_CROP_CASES;
-const TOTAL: usize = RAMP_FIRST + RAMP_CASES;
+/// The blend-mode cases appended after the speed-ramp ones (see the module docs).
+const BLEND_CASES: usize = 400;
+const BLEND_FIRST: usize = RAMP_FIRST + RAMP_CASES;
+const TOTAL: usize = BLEND_FIRST + BLEND_CASES;
 const BLOCK: usize = 100;
 const MIN_PER_FAMILY: usize = 20;
 const KINDS: [&str; 3] = ["export", "still", "preview"];
@@ -402,6 +412,11 @@ speed-ramp-linear sqrt((
 speed-ramp-audio acrossfade=d=
 preview-speed-ramp setpts='st(0,
 preview-speed-ramp-linear sqrt((
+blend blend=c0_mode=
+blend-hardlight blend=c0_mode=hardlight:
+blend-addition blend=c0_mode=addition:
+still-blend blend=c0_mode=
+preview-blend blend=c0_mode=
 ";
 
 // ---- a seeded generator --------------------------------------------------------
@@ -836,6 +851,21 @@ fn ramp_for(tl: &mut Timeline, j: usize, assets: &[Asset]) {
         for pair in order.windows(2) {
             let gap = old[pair[1]].0 - old[pair[0]].1;
             track.clips[pair[1]].timeline_start = (track.clips[pair[0]].timeline_end() + gap).max(0.0);
+        }
+    }
+}
+
+/// A blend mode on some of the video clips of the `j`-th blend case, on dice of its own seeded by the case and the
+/// clip (so the generator's are untouched): every mode but `normal`, footage, stills and titles alike.
+fn blend_for(tl: &mut Timeline, j: usize) {
+    let mut n = 0;
+    for track in tl.tracks.iter_mut().filter(|t| t.kind == StreamKind::Video) {
+        for clip in &mut track.clips {
+            n += 1;
+            let mut r = Rng::new((4 << 40) + (j as u64) * 64 + n as u64);
+            if r.chance(0.6) {
+                clip.blend_mode = r.pick(&crate::model::BlendMode::ALL[1..]);
+            }
         }
     }
 }
@@ -1328,8 +1358,11 @@ fn case(i: usize, assets: &[Asset]) -> Case {
     if (MASK_CROP_FIRST..RAMP_FIRST).contains(&i) {
         mask_crop_for(&mut timeline, i - MASK_CROP_FIRST);
     }
-    if (RAMP_FIRST..TOTAL).contains(&i) {
+    if (RAMP_FIRST..BLEND_FIRST).contains(&i) {
         ramp_for(&mut timeline, i - RAMP_FIRST, assets);
+    }
+    if (BLEND_FIRST..TOTAL).contains(&i) {
+        blend_for(&mut timeline, i - BLEND_FIRST);
     }
     let dur = timeline.duration();
     let edges: Vec<f64> = (timeline.tracks.iter().flat_map(|t| &t.clips))
