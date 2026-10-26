@@ -902,7 +902,7 @@ mod tests {
     fn a_stamp_holds_while_the_file_it_names_is_unchanged() {
         let dir = std::env::temp_dir().join(format!("kerf-stamp-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("a|b.mp4");
+        let file = dir.join(if cfg!(windows) { "a b.mp4" } else { "a|b.mp4" });
         std::fs::write(&file, b"one").unwrap();
         let stamp = crate::engine::source_key(&file);
         assert!(stamp_holds(&stamp));
