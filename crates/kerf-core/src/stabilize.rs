@@ -529,7 +529,7 @@ pub(crate) mod pinned {
     }
 
     /// A made-up analysis of `seconds` of footage at `fps` from 0, `width` x `height`, its camera
-    /// shaking by a few pixels (a fixed pattern of the frame number, no randomness).
+    /// shaking by a few pixels (a fixed pattern of the frame number, no randomness and no libm).
     pub(crate) fn shaky(seconds: f64, fps: f64, width: u32, height: u32) -> MotionAnalysis {
         let n = (seconds * fps).round().max(1.0) as usize;
         MotionAnalysis {
@@ -540,8 +540,9 @@ pub(crate) mod pinned {
             times: (0..n).map(|k| k as f64 / fps).collect(),
             motions: (0..n)
                 .map(|k| {
-                    let k = k as f64;
-                    [3.0 * (k * 0.9).sin() + 0.5, 2.0 * (k * 1.3).cos(), 0.002 * (k * 0.7).sin()]
+                    // Plain arithmetic, no libm: the golden oracle's argv carries the zoom it gives.
+                    let wobble = |m: usize, by: usize| ((k * by) % m) as f64 - (m / 2) as f64;
+                    [wobble(13, 7) * 0.5 + 0.5, wobble(11, 5) * 0.4, wobble(9, 4) * 0.0005]
                 })
                 .collect(),
         }

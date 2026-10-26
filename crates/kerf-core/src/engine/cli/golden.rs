@@ -84,6 +84,17 @@
 //! `speed-ramp-hold`, `speed-ramp-reversed`, `speed-ramp-tail` (a ramped outgoing clip under a
 //! transition) and `still-speed-ramp`.
 //!
+//! **The stabilization family is appended the same way**: the [`STABILIZE_CASES`] after the ramp ones
+//! draw from the same generator (with the channel family's channels, one delivery frame, no titles) and
+//! then have most of their clips of footage stabilized ([`stabilize_for`], on dice of its own seeded by
+//! the case and the clip: a strength, a fixed zoom now and then), every fourth case for an ffmpeg without
+//! vid.stab (`deshake`). The analyses are pinned ([`pinned`]: a made-up one per asset of the pool, over
+//! its whole length, and slice files named rather than written), so no disk and no libm reaches the argv.
+//! The first 8400 per-case digests are the ones the commit before stabilization gave; 4 block lines were
+//! appended to each file, `parts.txt`'s too. Families `stabilize-vidstab`, `stabilize-deshake`,
+//! `stabilize-proxy` / `stabilize-proxy-4k` (a padded proxy's slice, scaled to its size: a clip of footage
+//! with a twin reads it now and then) and their `still-` / `preview-` forms.
+//!
 //! **The export in parts has a file of its own** (`golden/parts.txt`, [`the_parts_argv_builders_produce_the_golden_digests`]):
 //! every case is planned with `segments::plan_export` under [`PARTS_LIMITS`] and the argv of every part and of the last pass is
 //! digested, so the three files above prove that a small export is unchanged and this one pins what a long one is made of.
@@ -127,6 +138,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use chrono::{TimeZone, Utc};
 use uuid::Uuid;
@@ -161,7 +173,10 @@ const MASK_CROP_FIRST: usize = BLUR_FIRST + BLUR_CASES;
 /// The speed-ramp cases appended after the keyed mask and crop ones (see the module docs).
 const RAMP_CASES: usize = 400;
 const RAMP_FIRST: usize = MASK_CROP_FIRST + MASK_CROP_CASES;
-const TOTAL: usize = RAMP_FIRST + RAMP_CASES;
+/// The stabilization cases appended after the speed-ramp ones (see the module docs).
+const STABILIZE_CASES: usize = 400;
+const STABILIZE_FIRST: usize = RAMP_FIRST + RAMP_CASES;
+const TOTAL: usize = STABILIZE_FIRST + STABILIZE_CASES;
 const BLOCK: usize = 100;
 const MIN_PER_FAMILY: usize = 20;
 const KINDS: [&str; 3] = ["export", "still", "preview"];
@@ -402,6 +417,14 @@ speed-ramp-linear sqrt((
 speed-ramp-audio acrossfade=d=
 preview-speed-ramp setpts='st(0,
 preview-speed-ramp-linear sqrt((
+stabilize-vidstab vidstabtransform=input='/kerf-test/stabilize/
+stabilize-deshake ,deshake=rx=
+stabilize-proxy -0.6667x0.6667.trf'
+stabilize-proxy-4k -0.3333x0.3333.trf'
+still-stabilize-vidstab vidstabtransform=input='/kerf-test/stabilize/
+still-stabilize-deshake deshake=rx=
+preview-stabilize-vidstab vidstabtransform=input='/kerf-test/stabilize/
+preview-stabilize-deshake ,deshake=rx=
 ";
 
 // ---- a seeded generator --------------------------------------------------------
@@ -838,6 +861,53 @@ fn ramp_for(tl: &mut Timeline, j: usize, assets: &[Asset]) {
             track.clips[pair[1]].timeline_start = (track.clips[pair[0]].timeline_end() + gap).max(0.0);
         }
     }
+}
+
+/// Stabilization on most clips of footage of the `j`-th stabilization case, on dice of its own seeded by
+/// the case and the clip (the generator's are untouched): a strength from a little to all of it, a fixed
+/// zoom on a third. A still, a title, a clip of sound and 360 footage are left alone (the core refuses
+/// them; the graph would leave them out anyway).
+fn stabilize_for(tl: &mut Timeline, j: usize, assets: &[Asset]) {
+    let mut n = 0;
+    for track in tl.tracks.iter_mut().filter(|t| t.kind == StreamKind::Video) {
+        for clip in &mut track.clips {
+            n += 1;
+            let mut r = Rng::new((5 << 40) + (j as u64) * 64 + n as u64);
+            let asset = assets.iter().find(|a| a.id == clip.asset_id);
+            let footage = asset.is_some_and(|a| !a.is_image() && a.projection().is_none());
+            if !footage || clip.is_generated() || clip.reframe.is_some() || !r.chance(0.8) {
+                continue;
+            }
+            clip.stabilize = Some(crate::model::Stabilize {
+                strength: r.pick(&[0.1, 0.35, 0.5, 0.8, 1.0]),
+                zoom: r.chance(0.33).then(|| r.pick(&[0.0, 4.0, 7.5, 12.0])),
+            });
+            // Now and then read through its padded proxy, which the slice is scaled to.
+            let twin = asset.and_then(|a| assets.iter().find(|t| t.name == format!("{}-padded", a.name)));
+            if let Some(twin) = twin.filter(|_| r.chance(0.3)) {
+                clip.asset_id = twin.id;
+            }
+        }
+    }
+}
+
+/// The analyses a stabilized clip of the pool reads in the oracle: one made-up one per asset of
+/// footage (the padded proxies' twins too), over its whole length at its own size and rate.
+fn pinned_analyses() -> HashMap<Uuid, Arc<crate::stabilize::MotionAnalysis>> {
+    static ANALYSES: std::sync::OnceLock<HashMap<Uuid, Arc<crate::stabilize::MotionAnalysis>>> = std::sync::OnceLock::new();
+    ANALYSES
+        .get_or_init(|| {
+            pool()
+                .iter()
+                .filter(|a| !a.is_image())
+                .filter_map(|a| {
+                    let v = a.streams.iter().find(|s| s.kind == StreamKind::Video)?;
+                    let made = crate::stabilize::pinned::shaky(a.duration, v.fps?, v.width?, v.height?);
+                    Some((a.id, Arc::new(made)))
+                })
+                .collect()
+        })
+        .clone()
 }
 
 /// The master bus of the `j`-th master-bus case: a function of `j` alone, so the
@@ -1297,6 +1367,8 @@ struct Case {
     pass: (PassPhase, &'static str, &'static str),
     /// The delivery frames one run exports the cut at; none for an ordinary export.
     variants: Vec<ExportVariant>,
+    /// Whether the ffmpeg the case is built for has vid.stab (else a stabilized clip is `deshake`d).
+    vidstab: bool,
 }
 
 #[rustfmt::skip]
@@ -1328,8 +1400,11 @@ fn case(i: usize, assets: &[Asset]) -> Case {
     if (MASK_CROP_FIRST..RAMP_FIRST).contains(&i) {
         mask_crop_for(&mut timeline, i - MASK_CROP_FIRST);
     }
-    if (RAMP_FIRST..TOTAL).contains(&i) {
+    if (RAMP_FIRST..STABILIZE_FIRST).contains(&i) {
         ramp_for(&mut timeline, i - RAMP_FIRST, assets);
+    }
+    if (STABILIZE_FIRST..TOTAL).contains(&i) {
+        stabilize_for(&mut timeline, i - STABILIZE_FIRST, assets);
     }
     let dur = timeline.duration();
     let edges: Vec<f64> = (timeline.tracks.iter().flat_map(|t| &t.clips))
@@ -1373,6 +1448,7 @@ fn case(i: usize, assets: &[Asset]) -> Case {
         timeline,
         opts,
         variants: Vec::new(),
+        vidstab: !(STABILIZE_FIRST..TOTAL).contains(&i) || (i - STABILIZE_FIRST) % 4 != 3,
     };
     if (SVG_FIRST..TOGETHER_FIRST).contains(&i) {
         svg_playhead(&mut c, i - SVG_FIRST);
@@ -1531,35 +1607,42 @@ fn build(c: &Case, assets: &[Asset]) -> ([String; 3], Vec<String>) {
     };
     for &zscale in if both { &[true, false][..] } else { &[true][..] } {
         pinned(zscale, true, || {
-            text[0] += &export();
-            for (t, out) in &c.stills {
-                text[1] += &repr(&build_still_args(
-                    &c.timeline,
-                    assets,
-                    &c.opts,
-                    *t,
-                    c.still_width,
-                    c.region,
-                    out,
-                ));
-                text[1].push('\u{1}');
-            }
-            let (start, fps, width, quality, hw) = c.preview.clone();
-            text[2] += &repr(&build_preview_args_with(&c.timeline, assets, start, fps, width, quality, hw));
+            with_vidstab(c.vidstab, || {
+                text[0] += &export();
+                for (t, out) in &c.stills {
+                    text[1] += &repr(&build_still_args(
+                        &c.timeline,
+                        assets,
+                        &c.opts,
+                        *t,
+                        c.still_width,
+                        c.region,
+                        out,
+                    ));
+                    text[1].push('\u{1}');
+                }
+                let (start, fps, width, quality, hw) = c.preview.clone();
+                text[2] += &repr(&build_preview_args_with(&c.timeline, assets, start, fps, width, quality, hw));
+            })
         });
     }
     if c.timeline.master.limiter {
-        pinned(true, false, || text[0] += &export());
+        pinned(true, false, || with_vidstab(c.vidstab, || text[0] += &export()));
     }
     (text, transitions(c, assets))
 }
 
 /// `f` as if this ffmpeg did (or did not) have `zscale` and an `alimiter` with `latency`, and the
-/// shipped default font were at a fixed path.
+/// shipped default font were at a fixed path; with vid.stab, and the pool's stabilization analyses
+/// handed over without a disk ([`pinned_analyses`]).
 fn pinned<R>(zscale: bool, latency: bool, f: impl FnOnce() -> R) -> R {
     with_zscale(zscale, || {
         with_alimiter_latency(latency, || {
-            crate::fonts::with_pinned_default_font(|| crate::svg::raster::with_pinned_dir("/kerf-test/svg", f))
+            crate::fonts::with_pinned_default_font(|| {
+                crate::svg::raster::with_pinned_dir("/kerf-test/svg", || {
+                    crate::stabilize::pinned::with(pinned_analyses(), || with_vidstab(true, f))
+                })
+            })
         })
     })
 }
