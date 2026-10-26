@@ -151,9 +151,9 @@
   `unlinked` / `own sound off|on`. `Project::sample()` seeds its interview sound
   detached-then-*unlinked*.
   **The browser harness is held to all of it by a differential corpus**: `project/linked_corpus.rs`
-  writes 114 edits (random J/L, mirrored and titled cuts, plus hand-made cases for every
+  writes 115 edits (random J/L, mirrored and titled cuts, plus hand-made cases for every
   rule above — both partners named, a cut's leftover and its lone resumed piece, a picture
-  victim, the 0.05 s floor, a lead lost at 0) with the answer `Project` gave — canonical timeline (no ids: clips an edit
+  victim, the 0.05 s floor, a lead lost at 0, detach under a compressor, gate or denoise) with the answer `Project` gave — canonical timeline (no ids: clips an edit
   creates have random ones), revision label, report or the exact refusal — to
   `frontend/src/lib/fixtures/links-corpus.json`; `links-corpus.test.ts` replays each through
   `link-ops.ts` (the pure mirror of `Project`'s ops and of `run_edit`, which `api.ts` now

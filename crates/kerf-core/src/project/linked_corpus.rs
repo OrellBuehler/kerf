@@ -726,6 +726,17 @@ fn special_cases() -> Vec<Case> {
             t,
             json!({"kind": "detach_audio", "clip_id": c}),
         ));
+        let denoise = AudioEffect::Denoise {
+            reduction_db: 12.0,
+            floor_db: -50.0,
+            track_noise: false,
+        };
+        let (t, c) = build(&[2.0], Some(denoise));
+        out.push(case(
+            "a denoise on the clip: its floor is a level, so detach makes a lane at the picture track's fader",
+            t,
+            json!({"kind": "detach_audio", "clip_id": c}),
+        ));
     }
 
     // A J/L-cut under the sync lock.
