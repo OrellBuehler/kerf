@@ -808,7 +808,7 @@ mod tests {
             motions: (0..n)
                 .map(|k| {
                     let k = k as f64;
-                    let sway = if (k as usize) % 2 == 0 { 1.0 } else { -1.0 };
+                    let sway = if (k as usize).is_multiple_of(2) { 1.0 } else { -1.0 };
                     [sway * (0.2 + k * k * 0.004), -sway * (0.1 + k * 0.03), 0.0]
                 })
                 .collect(),
