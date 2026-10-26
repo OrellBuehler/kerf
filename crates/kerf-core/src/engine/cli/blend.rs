@@ -19,12 +19,15 @@
 //! conversions are the composite's own as the build negotiates it — not named here: FFmpeg 6 carries the
 //! composite untagged (BT.601 both ways), FFmpeg 9 negotiates the colourspace across the graph (its tag both
 //! ways); naming a matrix made FFmpeg 9 convert the whole composite into it at the last `overlay`. The scaler
-//! is `neighbor`, so 4:2:0 chroma is repeated on the way up and taken back on the way down, and a round trip
-//! is exact: the same graph run with `normal` is the plain `overlay`'s frame, byte for byte, on 6.1 and 9.0
-//! (`blend_rendered.rs`). **Known limit:** at the right or bottom edge of a layer of odd size, where a 2x2
-//! chroma block is only part covered, FFmpeg 9's `overlay` weighs that chroma sample its own way and the
-//! blended frame takes it from one pixel of the block: up to some tens of levels of chroma in that one column
-//! or row of chroma (6.1 agrees).
+//! is `neighbor`, so 4:2:0 chroma is repeated on the way up and taken back on the way down (a bicubic scaler
+//! bled chroma across the clip's edge: 14 levels): the same graph run with `normal` is the plain `overlay`'s
+//! frame byte for byte for a flat colour, opaque or not, and to a level of rounding for a smooth picture, on 6.1
+//! and 9.0 (`blend_rendered.rs`). **Known limits:** a 4:2:0 picture with sharp saturated edges, where a pixel's
+//! luma and its block's chroma make no RGB colour, is clipped into the gamut on the way (any RGB blend has to;
+//! ~25 levels at such edges of a test pattern); and at the right or bottom edge of a layer of odd size, where a
+//! 2x2 chroma block is only part covered, FFmpeg 9's `overlay` weighs that chroma sample its own way and the
+//! blended frame takes it from one pixel of the block (up to some tens of levels in that one column or row of
+//! chroma; on 6.1 it matches the plain `overlay` there too).
 //!
 //! **Cost.** Three whole-frame conversions, a `blend` and three `overlay`s per frame for as long as the
 //! composite runs, not only while the clip is on screen; FFmpeg draws it, the GPU compositor refuses it

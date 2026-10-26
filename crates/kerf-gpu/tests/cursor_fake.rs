@@ -201,6 +201,7 @@ fn layer(path: String, pick: Pick) -> PlanLayer {
         hdr: None,
         effects: Vec::new(),
         mask: None,
+        blend: kerf_core::BlendMode::Normal,
         reframe: None,
         fx: LayerFx::default(),
         animated: None,

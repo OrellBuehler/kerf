@@ -32,8 +32,8 @@ use crate::error::Result;
 use crate::frame_pick::Pick;
 use crate::layer_geometry::{Keyed, LayerGeometry, Placement};
 use crate::model::{
-    pix_fmt_is_high_bit, pix_fmt_layout, pix_fmt_subsampling, Asset, Clip, Color, FitOrder, Grade, Hdr, Mask, PixLayout,
-    Projection, ResolvedReframe, StreamInfo, StreamKind, Subsampling, Timeline, Transform, VideoEffect,
+    pix_fmt_is_high_bit, pix_fmt_layout, pix_fmt_subsampling, Asset, BlendMode, Clip, Color, FitOrder, Grade, Hdr, Mask,
+    PixLayout, Projection, ResolvedReframe, StreamInfo, StreamKind, Subsampling, Timeline, Transform, VideoEffect,
 };
 use crate::plan_caps::{DipWhy, EffectKinds, GpuCaps, GradeKinds, LayerRef, Unsupported};
 use crate::planner::{PlanRequest, Planner};
@@ -663,6 +663,9 @@ pub struct PlanLayer {
     pub effects: Vec<VideoEffect>,
     /// The clip's mask, normalized; fractions of the *layer* frame.
     pub mask: Option<Mask>,
+    /// How the clip composites onto the layers below. Anything but `Normal` is FFmpeg's `blend` in RGB, which
+    /// no compositor pass draws: [`Unsupported::BlendMode`].
+    pub blend: BlendMode,
     pub reframe: Option<PlanReframe>,
     pub fx: LayerFx,
     /// `Some` for a clip with a keyed transform or colour number.
@@ -1180,6 +1183,11 @@ impl RenderPlan {
             // frame the map says where the file shows the one its slot has come to: FFmpeg draws it.
             if layer.timing.ramped {
                 out.push(Unsupported::SpeedRamp(at()));
+            }
+            // A blend mode is FFmpeg's `blend` over the composite in RGB, through two placements and a conversion
+            // each way (`engine::blend_chains`): no compositor pass draws it, and refusing is the exact answer.
+            if !layer.blend.is_normal() {
+                out.push(Unsupported::BlendMode(at(), layer.blend));
             }
             if layer.hdr.is_some() && !caps.hdr {
                 out.push(Unsupported::Hdr(at()));

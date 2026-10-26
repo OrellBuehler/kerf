@@ -689,6 +689,7 @@ impl Planner {
                     hdr: planned.hdr,
                     effects: planned.effects.clone(),
                     mask: clip.mask_at(local),
+                    blend: clip.blend_mode,
                     reframe,
                     fx: LayerFx {
                         fades: planned.fades.clone(),
@@ -2991,6 +2992,43 @@ mod tests {
             .at(1.0)
             .unwrap();
         assert!((plan.layers[0].source_time - 11.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_blended_clip_is_planned_with_its_mode_and_the_compositor_refuses_it_alone() {
+        use crate::model::BlendMode;
+        let a = asset();
+        let mut screened = make_clip(a.id, 0.0, 4.0, 0.0);
+        screened.blend_mode = BlendMode::Screen;
+        let tl = timeline_of(vec![
+            video_track(vec![make_clip(a.id, 0.0, 4.0, 0.0)]),
+            video_track(vec![screened]),
+        ]);
+        let caps = crate::plan_caps::GpuCaps::A0;
+        for mode in [PlanMode::Still, PlanMode::Motion] {
+            let plan = planner(&tl, std::slice::from_ref(&a), mode, &opts(30.0)).at(1.0).unwrap();
+            let blends: Vec<_> = plan.layers.iter().map(|l| l.blend).collect();
+            assert_eq!(blends, [BlendMode::Normal, BlendMode::Screen], "{mode:?}");
+            let why = plan.size_free_reasons(&caps);
+            let refused: Vec<_> = why.iter().filter(|u| u.kind() == "blend_mode").collect();
+            assert_eq!(refused.len(), 1, "{mode:?}: {why:?}");
+            assert!(
+                refused[0].to_string().starts_with("layer 1 "),
+                "the top layer: {}",
+                refused[0]
+            );
+            assert!(!plan.gpu_supported());
+        }
+        // Normal is the plain composite and refuses nothing.
+        let plan = planner(
+            &single(vec![make_clip(a.id, 0.0, 4.0, 0.0)]),
+            std::slice::from_ref(&a),
+            PlanMode::Still,
+            &opts(30.0),
+        )
+        .at(1.0)
+        .unwrap();
+        assert!(!plan.size_free_reasons(&caps).iter().any(|u| u.kind() == "blend_mode"));
     }
 
     #[test]
