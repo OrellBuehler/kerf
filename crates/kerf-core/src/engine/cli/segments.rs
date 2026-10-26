@@ -319,7 +319,7 @@ pub(super) fn picture_clips(
                 (inputs - 1, area / 4.0 / 1e6)
             } else {
                 let (window_start, _) = clip_source_window(clip, &fx[this]);
-                let key = (clip.asset_id, format!("{}", clip_seek(window_start, fx[this].lead)));
+                let key = (clip.asset_id, format!("{}", clip_input_seek(clip, &fx[this], window_start)));
                 let input = *shared.entry(key).or_insert_with(|| {
                     inputs += 1;
                     inputs - 1

@@ -458,7 +458,7 @@ fn prune_dir(dir: &Path, now: SystemTime) {
 }
 
 /// FNV-1a: a name for the file (the content is compared whole before it is trusted).
-fn digest(bytes: &[u8]) -> u64 {
+pub(crate) fn digest(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in bytes {
         h ^= u64::from(*b);
@@ -468,7 +468,7 @@ fn digest(bytes: &[u8]) -> u64 {
 }
 
 /// `dir/file` holding exactly `bytes`: left alone if it does, else written atomically.
-fn write_once(dir: &Path, file: &str, bytes: &[u8]) -> Option<PathBuf> {
+pub(crate) fn write_once(dir: &Path, file: &str, bytes: &[u8]) -> Option<PathBuf> {
     let path = dir.join(file);
     if std::fs::read(&path).is_ok_and(|have| have == bytes) {
         // Marked as used, so the pruning of a later run keeps it.

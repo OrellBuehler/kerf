@@ -297,6 +297,9 @@ pub enum Unsupported {
     /// forms and `fps` picks among them, which the plan does not reproduce (a frame pick over a rate
     /// that moves), and a still of it is the frame the map names, not the one the file shows.
     SpeedRamp(LayerRef),
+    /// The layer's clip is stabilized: the export moves each of its frames by the clip's analysis
+    /// (vid.stab's transform, or `deshake`), which no compositor pass draws.
+    Stabilized(LayerRef),
     /// The layer plays on past its end, under the clip that replaces it.
     Tail(LayerRef),
     KeyedOpacity(LayerRef),
@@ -380,6 +383,7 @@ impl Unsupported {
             Self::FullRangeCut => "full_range_cut",
             Self::FullRangeResized(..) => "full_range_resized",
             Self::SpeedRamp(_) => "speed_ramp",
+            Self::Stabilized(_) => "stabilized",
             Self::Tail(_) => "tail",
             Self::KeyedOpacity(_) => "keyed_opacity",
             Self::KeyedColor(_) => "keyed_color",
@@ -468,6 +472,10 @@ impl fmt::Display for Unsupported {
             Self::FullRangeResized(l, where_) => write!(
                 f,
                 "{l}: a full-range picture {where_} that the scaler resizes (swscale converts its range inside the resize: chroma up to 15 levels off)"
+            ),
+            Self::Stabilized(l) => write!(
+                f,
+                "{l}: stabilized (the export moves each frame by the clip's analysis, which the compositor does not draw)"
             ),
             Self::SpeedRamp(l) => write!(
                 f,
@@ -595,6 +603,7 @@ mod tests {
             Unsupported::FullRangeCut.kind(),
             Unsupported::FullRangeResized(layer(0, ""), "an export frame").kind(),
             Unsupported::SpeedRamp(layer(0, "")).kind(),
+            Unsupported::Stabilized(layer(0, "")).kind(),
         ];
         for kind in kinds {
             assert!(

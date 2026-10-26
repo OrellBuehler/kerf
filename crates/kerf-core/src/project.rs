@@ -7782,6 +7782,8 @@ mod title_clips;
 pub use title_clips::{TitleClipPatch, TitleClipPlacement, TitleClipResult, TitleEdited};
 mod title_text;
 pub use title_text::{PreparedText, TitleTextForm, TitleTextInputs};
+mod stabilize;
+pub use stabilize::{StabilizeJob, StabilizeStatusInput};
 mod thumbnails;
 pub use thumbnails::{prepare_thumbnail, PreparedThumbnail, ThumbnailBase, ThumbnailLayerSpec, ThumbnailResult, ThumbnailSpec};
 

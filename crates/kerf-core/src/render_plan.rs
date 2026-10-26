@@ -553,6 +553,9 @@ pub struct PlanTiming {
     /// The speed moves over the clip (`Clip::speed_ramp`): `speed` is its average, the pick names no
     /// frame, and the compositor refuses the layer ([`Unsupported::SpeedRamp`]).
     pub ramped: bool,
+    /// The clip is stabilized (`Clip::stabilize`): each frame is moved by its analysis, which the
+    /// compositor does not draw ([`Unsupported::Stabilized`]).
+    pub stabilized: bool,
 }
 
 /// The interpolation `v360` resamples with: the export's, or the still's.
@@ -1180,6 +1183,11 @@ impl RenderPlan {
             // frame the map says where the file shows the one its slot has come to: FFmpeg draws it.
             if layer.timing.ramped {
                 out.push(Unsupported::SpeedRamp(at()));
+            }
+            // A stabilized clip's frames are moved by vid.stab's transform (or `deshake`) in the chain:
+            // nothing the compositor draws is that picture, so FFmpeg draws it.
+            if layer.timing.stabilized {
+                out.push(Unsupported::Stabilized(at()));
             }
             if layer.hdr.is_some() && !caps.hdr {
                 out.push(Unsupported::Hdr(at()));

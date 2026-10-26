@@ -455,6 +455,7 @@ mod tests {
                 speed: 1.0,
                 reversed: false,
                 ramped: false,
+                stabilized: false,
             },
         }
     }

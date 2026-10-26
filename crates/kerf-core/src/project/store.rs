@@ -120,6 +120,12 @@ const MIGRATIONS: &[Migration] = &[
         destructive: false,
         needed_to_read: false,
     },
+    Migration {
+        run: v14_to_v15,
+        needed: v14_to_v15_needed,
+        destructive: false,
+        needed_to_read: false,
+    },
 ];
 
 /// The schema this build writes and the newest it opens.
@@ -333,6 +339,19 @@ fn v13_to_v14(_: &Connection) -> rusqlite::Result<()> {
 }
 
 fn v13_to_v14_needed(_: &Connection) -> bool {
+    true
+}
+
+/// v15: a clip may be stabilized (`Clip.stabilize`, `"stabilize"` in the timeline JSON: a strength and an
+/// optional zoom). It is a new field an older build drops at its next write of the clip, which then plays
+/// shaken again with nothing to say why. A clip without it is written as it was, so a stored one is
+/// unchanged; the analysis is a cache beside the footage, not in the file. Nothing in the file's tables
+/// changes; the step is the version that keeps an older build out, after the file is copied aside.
+fn v14_to_v15(_: &Connection) -> rusqlite::Result<()> {
+    Ok(())
+}
+
+fn v14_to_v15_needed(_: &Connection) -> bool {
     true
 }
 

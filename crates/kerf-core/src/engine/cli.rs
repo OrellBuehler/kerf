@@ -22,8 +22,8 @@ use super::decode_policy::{
 use super::source_probe::{ProbeCache, SOURCE_PROBE_TIMEOUT};
 use super::ProbeResult;
 use crate::clip_timing::{
-    clip_seek, clip_source_window, end_frame, is_cache_proxy, is_head_padded_proxy, picture_window, ramp, transition_fx, ClipFx,
-    ClipTiming, FadeEdge, FadeStep, FadeTint, Rational, HEAD_PADDED_SUFFIX,
+    clip_input_seek, clip_seek, clip_source_window, end_frame, is_cache_proxy, is_head_padded_proxy, picture_window, ramp,
+    transition_fx, ClipFx, ClipTiming, FadeEdge, FadeStep, FadeTint, Rational, HEAD_PADDED_SUFFIX,
 };
 use crate::error::{Error, Result};
 use crate::model::{
@@ -2954,7 +2954,7 @@ pub(super) fn fnv1a(s: &str) -> u64 {
 /// the same source reuse the cached artifact, while a swapped-out source
 /// regenerates one. Shared by the proxy cache, the Insta360 stitch cache and
 /// the waveform peak cache.
-pub(super) fn source_key(src: &Path) -> String {
+pub(crate) fn source_key(src: &Path) -> String {
     let meta = std::fs::metadata(src).ok();
     let len = meta.as_ref().map(|m| m.len()).unwrap_or(0);
     let mtime = meta
@@ -4963,7 +4963,7 @@ fn plan_inputs_for(timeline: &Timeline, assets: &[Asset], fx: &[ClipFx], include
             let (start, _) = clip_source_window(clip, &fx[flat]);
             // Key on the exact emitted seek string: two clips share an input iff
             // their `-i` arguments (path is implied by asset_id) are identical.
-            let key = (clip.asset_id, format!("{}", clip_seek(start, fx[flat].lead)));
+            let key = (clip.asset_id, format!("{}", clip_input_seek(clip, &fx[flat], start)));
             *seen.entry(key).or_insert_with(|| {
                 let i = representatives.len();
                 representatives.push(flat);
@@ -5102,7 +5102,7 @@ fn push_inputs_scoped(
                 args.push("-hwaccel".to_string());
                 args.push(hw.to_string());
             }
-            let seek = clip_seek(start, fx[rep].lead);
+            let seek = clip_input_seek(clip, &fx[rep], start);
             if seek > 0.0 {
                 args.push("-ss".to_string());
                 args.push(export_seek_arg(seek));
@@ -7866,6 +7866,16 @@ fn build_filter_complex_with(
                 } else {
                     fmt
                 };
+            let stamp = plan.stamps.get(*flat).copied().flatten();
+            let stab = (stamp.is_none() && !is_image(clip))
+                .then(|| {
+                    stabilizer(
+                        clip,
+                        assets.iter().find(|a| a.id == clip.asset_id),
+                        picture_window(clip, &fx[*flat], clip_fmt.fps),
+                    )
+                })
+                .flatten();
             chains.push(format!(
                 "[{src}]{chain}[v{flat}]",
                 chain = video_clip_chain_stamped(
@@ -7873,8 +7883,9 @@ fn build_filter_complex_with(
                     clip_fmt,
                     &fx[*flat],
                     is_image(clip),
-                    plan.stamps.get(*flat).copied().flatten(),
+                    stamp,
                     picture_of(clip),
+                    stab.as_ref(),
                     &format!("{instances}c{flat}")
                 )
             ));
@@ -9334,7 +9345,7 @@ fn picture_size(asset: Option<&Asset>) -> Option<(u32, u32)> {
 /// passes Contain for a clip that does not take it ([`takes_blur_fill`]).
 #[cfg(test)]
 fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool, instance: &str) -> String {
-    video_clip_chain_stamped(clip, fmt, fx, is_image, None, None, instance)
+    video_clip_chain_stamped(clip, fmt, fx, is_image, None, None, None, instance)
 }
 
 /// [`video_clip_chain`] for a picture of a known size (`None`: not known, which a Cover clip's
@@ -9348,14 +9359,17 @@ fn video_clip_chain_of(
     picture: Option<(u32, u32)>,
     instance: &str,
 ) -> String {
-    video_clip_chain_stamped(clip, fmt, fx, is_image, None, picture, instance)
+    video_clip_chain_stamped(clip, fmt, fx, is_image, None, picture, None, instance)
 }
 
 /// [`video_clip_chain`] for a clip whose input may be a title's pictures: `stamp` puts them on the
 /// canvas' grid in place of the `trim` and `setpts` a decoded clip starts with (they are drawn for
 /// exactly the frames the clip is on, tail included); everything after is the same chain. `picture`
 /// is the displayed size of the clip's footage ([`picture_size`]) when it is known: under `Cover`
-/// it decides whether the cover of the frame has anything past the frame to show.
+/// it decides whether the cover of the frame has anything past the frame to show. `stab` is what
+/// steadies a stabilized clip ([`stabilizer`]): its frames are moved straight after the trim, which
+/// vid.stab's starts between two frames of its analysis.
+#[allow(clippy::too_many_arguments)]
 fn video_clip_chain_stamped(
     clip: &Clip,
     fmt: &ExportFormat,
@@ -9363,6 +9377,7 @@ fn video_clip_chain_stamped(
     is_image: bool,
     stamp: Option<svg_layer::ClipStamp>,
     picture: Option<(u32, u32)>,
+    stab: Option<&Stabilizer>,
     instance: &str,
 ) -> String {
     let s = clip.speed_mag();
@@ -9401,7 +9416,11 @@ fn video_clip_chain_stamped(
     // Relative to the input-side `-ss` (see `build_export_args_phase`): when the
     // window is fast-seeked the trim starts at 0, otherwise it is unchanged. A still
     // image is never seeked (it is `-loop`ed from t=0), so its trim stays absolute.
-    let seek = if is_image { 0.0 } else { clip_seek(trim_start, fx.lead) };
+    let seek = if is_image {
+        0.0
+    } else {
+        clip_input_seek(clip, fx, trim_start)
+    };
 
     let reframe = clip.reframe.as_ref();
     let crop = t.has_crop().then(|| {
@@ -9439,7 +9458,11 @@ fn video_clip_chain_stamped(
         if fx.head_pad && !is_image && seek == 0.0 {
             p.push("trim=start_frame=1".to_string());
         }
-        p.push(format!("trim=start={}:end={}", trim_start - seek, trim_end - seek));
+        // A stabilized clip's correction is per source frame, so it goes before the frames are reversed
+        // or retimed; vid.stab's trim opens on the first frame its corrections are for.
+        let start = stab.and_then(Stabilizer::trim_start).unwrap_or(trim_start);
+        p.push(format!("trim=start={}:end={}", start - seek, trim_end - seek));
+        p.extend(stab.map(Stabilizer::filters));
         if clip.is_reversed() {
             p.push("reverse".to_string());
         }
@@ -10396,13 +10419,20 @@ fn build_still_args_rendered(
     let drawn = still_clip_pictures(&active, ow, oh);
 
     let mut args: Vec<String> = vec!["-hide_banner".to_string(), "-loglevel".to_string(), "error".to_string()];
+    // What steadies each stabilized clip on screen: the frame at the seek moved as the export moves it.
+    let mut stabs: Vec<Option<Stabilizer>> = Vec::with_capacity(active.len());
     for (layer, picture) in active.iter().zip(&drawn) {
         if let Some(picture) = picture {
+            stabs.push(None);
             svg_layer::push_still_inputs(std::slice::from_ref(picture), &mut args);
             continue;
         }
         let (clip, src) = (layer.active.clip, layer.active.source_time);
         let asset = asset_of(clip.asset_id).ok_or(Error::AssetNotFound(clip.asset_id))?;
+        let stab = stabilizer(clip, Some(asset), (src, src));
+        // vid.stab's corrections are numbered from the frame its seek lands on: between two frames.
+        let src = stab.as_ref().and_then(Stabilizer::trim_start).unwrap_or(src);
+        stabs.push(stab);
         // A still has a single frame at t=0 (`trim=end_frame=1` in the chain picks
         // it up); seeking into it decodes nothing, so skip the `-ss` (and any
         // decode acceleration) for images.
@@ -10448,8 +10478,9 @@ fn build_still_args_rendered(
         } else {
             crate::model::frame_matrix(stream, hdr.is_some())
         };
+        let steady = stabs[n].as_ref().map(|s| format!("{},", s.filters())).unwrap_or_default();
         chains.push(format!(
-            "[{n}:v]{tone}{chain}[v{n}]",
+            "[{n}:v]{tone}{steady}{chain}[v{n}]",
             chain = still_clip_chain_graded(
                 &tf,
                 &ac.color(),
@@ -10790,7 +10821,7 @@ fn audio_clip_head(clip: &Clip, fx: &ClipFx) -> Vec<String> {
     // Mirror the video crossfade tail (extends below source_in when reversed) and
     // the same input-side `-ss` fast-seek, so the atrim is relative to the seek.
     let (trim_start, trim_end) = clip_source_window(clip, fx);
-    let seek = clip_seek(trim_start, fx.lead);
+    let seek = clip_input_seek(clip, fx, trim_start);
     let mut p: Vec<String> = Vec::new();
     p.push(format!("atrim=start={}:end={}", trim_start - seek, trim_end - seek));
     p.push("asetpts=PTS-STARTPTS".to_string());
@@ -11056,6 +11087,18 @@ mod export_progress_rendered;
 /// A clip's curves, wheels and LUT as filters.
 mod grade;
 use grade::grade_filters;
+
+/// Stabilization: a clip's frames moved against its camera's shake, and the passes that measure it.
+mod stabilize;
+pub(crate) use stabilize::measure_motion;
+pub use stabilize::vidstab_available;
+#[cfg(test)]
+pub(crate) use stabilize::with_vidstab;
+use stabilize::{stabilizer, Stabilizer};
+
+/// Stabilization rendered by the real ffmpeg (`#[ignore]`d).
+#[cfg(test)]
+mod stabilize_rendered;
 
 /// The filters of a clip's grade as the graph writes them, in chain order, for frames tagged `frame_matrix`
 /// (`None`: untagged): `lut3d`, `lutrgb`, `colorbalance`, and for a tagged picture the `scale` / `format` /

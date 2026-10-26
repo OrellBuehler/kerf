@@ -3285,6 +3285,11 @@ pub struct Clip {
     /// A generated clip's `asset_id` is [`GENERATED_ASSET`] and its source is the generator's clock.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub generator: Option<Generator>,
+    /// Video stabilization ([`Stabilize`]): the camera's shake taken out of the picture, per source
+    /// frame, from an analysis of the footage (`crate::stabilize`). `None`, and absent from the
+    /// file, for every clip that is not stabilized.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stabilize: Option<Stabilize>,
 }
 
 fn yes() -> bool {
@@ -3332,6 +3337,7 @@ impl Clip {
             link_id: None,
             source_audio: true,
             generator: None,
+            stabilize: None,
         }
     }
 
@@ -5146,10 +5152,12 @@ mod ramp_link_tests;
 #[cfg(test)]
 mod ramp_tests;
 mod speed_ramp;
+mod stabilize;
 use channels::channel_changes;
 pub use channels::{key_polyline, Property, PropertyKey, PropertyTrack, MAX_CHANNEL_VOLUME};
 pub use ramp_edit::check_speed_ramp;
 pub use speed_ramp::{ramp_is_valid, RampEasing, SpeedKey, MAX_RAMP_TIME, MAX_SPEED_KEYS};
+pub use stabilize::{Stabilize, MAX_STABILIZE_ZOOM};
 
 mod links;
 pub use links::{Detached, DetachedMany, SkippedDetach};
@@ -6773,6 +6781,7 @@ fn clip_changes(before: &Clip, after: &Clip) -> Option<String> {
             Some(m) => format!("masked ({})", m.shape.as_str()),
         });
     }
+    parts.extend(stabilize::stabilize_changes(before, after));
     joined(parts)
 }
 

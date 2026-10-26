@@ -69,3 +69,37 @@ fn hostile_silence_and_scene_logs_never_panic() {
         },
     );
 }
+
+/// What the stabilization passes read back (the detect pass's `showinfo` log, vid.stab's transforms) and
+/// the analysis kept on disk, mutated: no panic, and an analysis that reads is either refused or sliced.
+#[test]
+fn hostile_stabilization_logs_and_analyses_never_panic() {
+    let log = "[Parsed_showinfo_2 @ 0x1] config in time_base: 1/15360, frame_rate: 30/1\n[Parsed_showinfo_2 @ 0x1] n:   0 pts:      0 pts_time:0 duration:512 fmt:yuv420p sar:1/1 s:560x300 i:P\n[Parsed_showinfo_2 @ 0x1] n:   1 pts:    512 pts_time:0.0333 s:560x300\n";
+    let transforms = "0 0 0 0 0 1\n# no fields\n0 1.938609 -3.997462 0.003857 0.509595 0\n#\t\t 1.78 2\n";
+    assert_no_panic("stabilization logs", &[log.as_bytes(), transforms.as_bytes()], ROUNDS, |b| {
+        let text = String::from_utf8_lossy(b);
+        let _ = stabilize::parse_frames(&text, 1.5);
+        let _ = stabilize::parse_transforms(&text);
+    });
+    let analysis = serde_json::to_vec(&crate::stabilize::pinned::shaky(1.0, 30.0, 560, 300)).unwrap();
+    let asset = uuid::Uuid::from_u128(5);
+    assert_no_panic("stabilization analysis", &[&analysis], ROUNDS / 3, |b| {
+        let Ok(a) = serde_json::from_slice::<crate::stabilize::MotionAnalysis>(b) else {
+            return;
+        };
+        if !a.is_sound() {
+            return;
+        }
+        let mut clip = Clip::new(asset, 0.1, 0.9, 0.0);
+        clip.stabilize = Some(crate::model::Stabilize::default());
+        let analyses = std::collections::HashMap::from([(asset, std::sync::Arc::new(a))]);
+        crate::stabilize::pinned::with(analyses, || {
+            for window in [(0.1, 0.9), (0.0, 0.0), (0.5, 0.4), (-1.0, 99.0)] {
+                let setting = crate::model::Stabilize::default();
+                if let Some(s) = crate::stabilize::slice_for(&clip, &setting, window, None, None) {
+                    assert!(s.start.is_finite() && s.zoom.is_finite(), "{s:?}");
+                }
+            }
+        });
+    });
+}

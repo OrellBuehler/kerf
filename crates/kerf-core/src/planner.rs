@@ -712,6 +712,7 @@ impl Planner {
                         speed: clip.mean_speed(),
                         reversed: clip.is_reversed(),
                         ramped: clip.is_ramped(),
+                        stabilized: clip.is_stabilized(),
                     },
                 });
             }
@@ -2991,6 +2992,29 @@ mod tests {
             .at(1.0)
             .unwrap();
         assert!((plan.layers[0].source_time - 11.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn a_stabilized_clip_is_refused_in_a_still_and_an_export_frame() {
+        let a = asset();
+        let mut steady = make_clip(a.id, 10.0, 20.0, 0.0);
+        steady.stabilize = Some(crate::model::Stabilize::default());
+        let caps = crate::plan_caps::GpuCaps::A0;
+        for mode in [PlanMode::Still, PlanMode::Motion] {
+            let plan = planner(&single(vec![steady.clone()]), std::slice::from_ref(&a), mode, &opts(30.0))
+                .at(2.0)
+                .unwrap();
+            assert!(plan.layers[0].timing.stabilized);
+            let why: Vec<_> = plan.size_free_reasons(&caps).iter().map(|u| u.kind()).collect();
+            assert!(why.contains(&"stabilized"), "{mode:?}: {why:?}");
+            assert!(!plan.gpu_supported());
+        }
+        let plain = make_clip(a.id, 10.0, 20.0, 0.0);
+        let plan = planner(&single(vec![plain]), std::slice::from_ref(&a), PlanMode::Still, &opts(30.0))
+            .at(2.0)
+            .unwrap();
+        assert!(!plan.layers[0].timing.stabilized);
+        assert!(!plan.size_free_reasons(&caps).iter().any(|u| u.kind() == "stabilized"));
     }
 
     #[test]
