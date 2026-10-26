@@ -4,13 +4,14 @@
 	// the clip plays as shot until that lands. The panel starts the analysis itself for a clip nothing measured
 	// (`wantsAnalysis`), once per clip and window, and leaves a failure to the Analyze button. Each slider writes
 	// one edit on release (`SliderRow`). The preview shows the clip through FFmpeg (the GPU preview refuses a
-	// stabilized clip), so what is drawn is what the export renders.
+	// stabilized clip), so what is drawn is what the export renders; it is drawn again when an analysis lands.
 	import InspectorSection from './InspectorSection.svelte';
 	import SliderRow from './SliderRow.svelte';
 	import CheckRow from './CheckRow.svelte';
 	import Badge from './Badge.svelte';
 	import Btn from './Btn.svelte';
 	import { editor } from '#lib/state.svelte';
+	import { ui } from '#lib/editor-ui.svelte';
 	import { isCancelled, report } from '#lib/ops';
 	import { analyzeClipStabilization, cancelStabilization, clipStabilizationStatus, onStabilizeProgress } from '#lib/api';
 	import { PERCENT } from '#lib/slider-row';
@@ -57,6 +58,8 @@
 	async function analyze(id: string) {
 		try {
 			const s = await analyzeClipStabilization(id);
+			// The frame on screen was drawn before the clip could be steadied: draw it again.
+			if (s.state === 'ready' && status?.state !== 'ready') ui.refreshPreview();
 			if (id === clip.id) status = s;
 		} catch (e) {
 			if (!isCancelled(e)) report(e);
@@ -96,7 +99,10 @@
 		let gone = false;
 		let unlisten: (() => void) | undefined;
 		void onStabilizeProgress((p) => {
-			if (p.clip_id === id) status = p;
+			if (p.clip_id !== id) return;
+			// An analysis that landed (an agent's too) changes the picture of a cut that did not change.
+			if (p.state === 'ready' && status?.state !== 'ready') ui.refreshPreview();
+			status = p;
 		}).then((u) => {
 			if (gone) u();
 			else unlisten = u;

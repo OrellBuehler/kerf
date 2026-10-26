@@ -5132,6 +5132,12 @@ impl KerfMcp {
             })
             .await?;
             me.changed();
+            // The Inspector hears where the clip stands now, as it does for its own analysis.
+            if let Some(status) = &status {
+                if let Err(e) = me.app.emit("stabilize-progress", status.clone()) {
+                    tracing::warn!(error = %e, "failed to emit stabilize-progress");
+                }
+            }
             json(&serde_json::json!({
                 "clip_id": clip_id,
                 "stabilize": setting,
