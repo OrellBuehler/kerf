@@ -513,6 +513,15 @@
   writes `NaN` as `null`, which a plain number field cannot read back, so one poisoned number would
   stop the project opening. The setters refuse non-finite input themselves with a message; the walk
   is the net under every op that computes a number.
+- **Blend modes** (`BlendMode` in `model.rs`). `Clip.blend_mode` (absent at `normal`, the default; schema v15) is how the
+  clip composites onto the tracks below: `normal`, `multiply`, `screen`, `overlay`, `hard_light`, `add` (linear dodge),
+  `darken`, `lighten`, `difference`, `exclusion` — the separable modes FFmpeg's `blend` computes as the textbook defines them
+  (its soft light, dodge, burn and subtract are other formulas and are not offered; an unknown name does not read).
+  `BlendMode::ffmpeg` is `blend`'s name with the clip as the top input, which swaps `overlay` and `hard_light` (FFmpeg's
+  `overlay` conditions on the top input); `apply` is the formula per channel, which the render tests hold FFmpeg to;
+  `parse` takes common spellings (`hard-light`, `linear dodge`). Split, duplicate, paste and a link carry it as they carry
+  every field (a detached sound is a fresh clip at `normal`); the diff says `blend normal → screen`; OTIO and EDL have no
+  blend mode, the report says `clip blend modes …` and OTIO keeps it in `metadata.kerf`.
 - **Speed ramps** (`model/speed_ramp.rs`: the type and the time map; `model/ramp_edit.rs`: the edits and the diff text; pure +
   unit-tested in `ramp_tests.rs` / `ramp_link_tests.rs`). `Clip.speed_ramp: Vec<SpeedKey>` (absent when empty; schema v14) makes a
   clip's rate change over its length. A `SpeedKey` is a clip-local **timeline** time, a speed magnitude (`MIN_SPEED..=MAX_SPEED`)

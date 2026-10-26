@@ -1590,6 +1590,28 @@ decimated read misses) and a decimated frame (at most 480 x 270 samples) for the
 the peaks (a 64² vectorscope, cells with at least 1 % of the samples). A measurement, not a frame anyone waits to see:
 ungated by `cpu::lease`, but niced (`bg_command`) and thread-capped by the still's spawn-time tuning, supervised like every still (`output_supervised_sized`: `STILL_TIMEOUT`, the cancel, killed past either), at most
 `MAX_SCOPE_WIDTH` (3840) wide, the pipe read into a buffer sized from the frame (the `capacity` of `output_supervised_sized`, `output_bounded` takes one too). `scopes_of_a_rendered_frame` (`#[ignore]`d) holds a one-pixel clip through the real graph.
+  **Blend modes** (`Clip::blend_mode`, `engine/cli/blend.rs`; the module docs are the long form). A clip at `normal` keeps its
+  `[cur][v{flat}]overlay=…` byte for byte. Any other mode replaces that one statement with `blend_chains`: the composite is split
+  four ways (`format=yuv420p` first, the 8-bit 4:2:0 every `overlay` composes in); the clip's pad is split and laid out as a whole
+  frame **twice by the very `overlay` the plain composite would use** (position, travel, per-frame zoom, `enable`): opaque
+  (`lutyuv=a=255`, which follows a per-frame size where a `format` would pin it) onto a copy, for its colour, and onto a copy made
+  transparent (`lutyuv=a=0`), `alphaextract`ed, for its alpha (one `overlay` onto a transparent canvas would mix the canvas's
+  chroma into a translucent layer); `alphamerge`, both frames to `gbrap` and `blend=c0_mode=M:c1_mode=M:c2_mode=M` (the clip on
+  top; `c3` left `normal` copies the clip's alpha), back to `yuva420p`, and a last `overlay` onto the untouched composite:
+  `composite·(1−α) + mode(clip, composite)·α`, so opacity (static or keyed), mask, key, fades and a dissolve's alpha weigh the
+  mix, and outside the clip's picture (or its window) the composite is byte for byte. The scrubbed still uses the same chains
+  with its own placement (`still_overlay`); a title on a track composites like footage. **Colour**: blend modes are RGB, and the
+  conversions take the composite's own matrix as the build negotiates it (FFmpeg 6: untagged, BT.601 both ways; FFmpeg 9: the
+  negotiated tag both ways) — naming a matrix made FFmpeg 9 convert the whole composite into it at the last `overlay`; the
+  scaler is `neighbor` (bicubic bled 14 levels of chroma across the clip's edge). Rendered (`blend_rendered.rs`, `#[ignore]`d, 6.1
+  and 9.0): every mode at full and half opacity within 2.5 levels of `BlendMode::apply` over the composite's colours, the
+  composite outside the clip byte for byte, the graph run with `normal` equal to the plain `overlay` (byte for byte for flat
+  colours, 1 level for a smooth picture), a keyed opacity from 0 equal to the composite at its first frame, a moving zoom
+  blended over a growing area, a mask cutting the blend, the still equal to the export (0 levels). **Limits**: a 4:2:0 picture
+  whose pixel and block chroma make no RGB colour (sharp saturated edges) is clipped into the gamut (~25 levels at such
+  edges); FFmpeg 9 weighs the half-covered chroma column / row of an odd-sized layer its own way; the conversions run for the
+  whole composite, not only while the clip is on screen. The GPU compositor refuses it (`Unsupported::BlendMode`). Golden: the
+  appended `blend` family.
   **Speed ramps** (`Clip::speed_ramp`: keys of clip-local timeline time, speed and `linear` / `hold`; `model/speed_ramp.rs` is the
   map, `Clip::along` / `local_at_along` its two directions; `clip_timing/ramp.rs` is what the graph prints). Nothing reads
   `speed_mag()` for a ramped clip: the window, the tail, `picture_window`, the handle, the scrub, the plan, the cover and the

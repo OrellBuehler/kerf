@@ -203,6 +203,13 @@
   by needle, and structurally `speed-ramp-hold`, `speed-ramp-reversed`, `speed-ramp-tail` (a ramped outgoing clip under a
   transition: 124) and `still-speed-ramp` (a ramped clip on screen in a still). The still carries no sound and no `setpts`
   of a ramp (its `-ss` is the map's source time), so it has the one structural family.
+- **Blend modes** (`blend_for`; `engine-cli.md`, "Blend modes"), **appended, nothing re-blessed**: the 400 cases after the ramp ones
+  draw from the same generator (with the channel family's channels), then 60 % of the clips on video tracks get a mode other than
+  `normal` on dice of their own seeded by the case and the clip (footage, stills and titles alike). `git diff` of the four digest
+  files is **16 insertions, 0 deletions**, so the first 8400 per-case digests are the ones the commit before gave. Families `blend`,
+  `still-blend`, `preview-blend` (`blend=c0_mode=`) and the two FFmpeg names that differ from the mode's own, `blend-hardlight`
+  (overlay) and `blend-addition` (add). `parts_draw_as_whole` compares a blended clip's placement (its colour stage's `overlay`) and
+  its `blend` between a part and the whole export.
 - **Constant-power crossfades** (`afade …:curve=qsin` only on a fade that is wholly one half of a real
   pair: a dissolve or motion transition from an adjacent clip whose overlap plays different sound — not a
   fade up from black, not a dip, not a cut inside one take) re-blessed `export.txt` alone: 1304 of 6400

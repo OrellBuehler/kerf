@@ -14,6 +14,9 @@ internal error scopes (`Gpu::guarded`), anything uncaptured is logged and rememb
 draws, `GpuCaps::A0` plus `text`, `motion`, `fades`, `transitions`, `dip_white`, `keyed_zoom`, `keyed_opacity`, `keyed_color`, `mask`, `grade` (every kind, where `grade::measured()` says this FFmpeg's conversions are the model's: `Compositor::caps()` drops it otherwise) and the blur / sharpen / grayscale / invert / vignette / chroma key `effects` today, which `composite` / `render_plan` judge the plan by), and a lost device is tracked — every
 later call is `GpuError::DeviceLost` and the **owner builds a new `Gpu` and
 `Compositor`** (the device is not recreated behind the caller's back).
+**No compositor pass draws a blend mode**: a layer whose clip has one is refused by the plan (`Unsupported::BlendMode`,
+`core-render-plan.md`) under every cap, so its frames are FFmpeg's (`blend` in RGB through two placements and a conversion each way,
+`engine-cli.md`); there is no parity case because nothing is drawn. `PlanLayer.blend` is `Normal` in the fakes and fixtures.
 
 FFmpeg stays the decoder: `source::decode_layer` pipes one frame from the binary as
 `yuv4mpegpipe` 4:2:0 (the same `-ss` as the still graph), spawned through kerf-core's
