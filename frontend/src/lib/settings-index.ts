@@ -67,6 +67,7 @@ export const ENTRIES: readonly SettingEntry[] = [
 	e('snap-default', 'editing', 'Snapping at launch', 'snap', 'magnet', 'magnetic', 'edges', 'playhead', 'default'),
 	e('still-length', 'editing', 'Length of a still image', 'image', 'photo', 'picture', 'seconds', 'duration', 'default'),
 	e('title-length', 'editing', 'Length of a new title', 'text', 'caption', 'seconds', 'duration', 'default'),
+	e('ask-tags', 'editing', 'Ask for tags after importing', 'tag', 'tags', 'label', 'import', 'prompt', 'dialog', 'metadata', 'location', 'ask'),
 
 	e('proxy-size', 'preview', 'Preview proxies', 'proxy', 'size', '720', '1080', '1280', 'scrub', '4k', 'smooth', 'lightweight'),
 	e('preview-source', 'preview', 'Preview source', 'original', 'proxy', 'decode', 'auto'),

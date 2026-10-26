@@ -113,6 +113,10 @@ pub use model::{
     MAX_CHANNEL_VOLUME, MAX_DELIVERY_FPS, MAX_RAMP_TIME, MAX_SEED, MAX_SPEED, MAX_SPEED_KEYS, MAX_STABILIZE_ZOOM,
     MAX_SVG_OVERLAYS, MAX_SVG_SECONDS, MAX_TITLE_CLIPS, MIN_BPM, MIN_DELIVERY_FPS, MIN_EDIT_CLIP, MIN_SPEED, RELEASE_TAIL_S,
 };
+pub use model::{
+    dedupe_tags, group_by_key, normalize_key, same_tags, tags_match, Grouping, KeyGroup, Tag, TagCount, TagEdit, TagFilter,
+    TagKeyCount, TagSummary, MAX_ASSET_TAGS, MAX_TAG_KEY, MAX_TAG_VALUE,
+};
 pub use plan_caps::{DipWhy, EffectKinds, GpuCaps, GradeKinds, LayerRef, Unsupported};
 pub use plan_epoch::{bump_plan_epoch, plan_epoch};
 pub use planner::{Handover, PlanRequest, Planner, SpanPlan, SpanRun};
@@ -129,6 +133,9 @@ pub use project::{
     ThumbnailLayerSpec, ThumbnailResult, ThumbnailSpec, TitleClipPatch, TitleClipPlacement, TitleClipResult, TitleEdited,
     TitleTextForm, TitleTextInputs, Untranscribed, DEFAULT_HISTORY_LIMIT, MAX_CHANNEL_KEYS, MAX_SYNC_SECONDS, MUSIC_TRACK,
     SCHEMA_VERSION, STAGED_UNDO_DEPTH, SYNC_SAMPLE_RATE, VOICEOVER_TRACK,
+};
+pub use project::{
+    AssembleByTag, AssemblePlan, AssembleSummary, AssembledGroup, GroupTitle, PreparedAssemble, SortWithin, MAX_TAG_TITLE_SECONDS,
 };
 pub use proxy::{PreviewSource, ProxyInput, ProxyPhase, ProxySize, ProxyStatus, ProxyWait};
 pub use recovery::{Recoverable, RecoveryInfo};

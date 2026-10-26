@@ -72,6 +72,9 @@ pub struct Settings {
     /// Open the project that was open last when Kerf starts without one named on its
     /// command line. Off by default: a launch starts empty.
     pub reopen_last_project: bool,
+    /// Whether importing media offers to tag the new assets afterwards (`location: Cumbuco`, `jump`). On by
+    /// default; the prompt's own "don't ask again" switches it off. Only the interface reads it.
+    pub ask_tags_on_import: bool,
     /// The `.kerf` files opened or saved most recently, newest first, at most
     /// [`RECENT_MAX`]. Maintained by the app (`record_recent`, `recent`,
     /// `clear_recent`); a settings patch cannot write it.
@@ -147,6 +150,7 @@ impl Default for Settings {
             gpu_preview: false,
             time_display: TimeDisplay::default(),
             reopen_last_project: false,
+            ask_tags_on_import: true,
             recent_projects: Vec::new(),
             last_open_project: None,
             layout: None,
@@ -219,6 +223,7 @@ pub struct SettingsView {
     pub gpu_preview: bool,
     pub time_display: TimeDisplay,
     pub reopen_last_project: bool,
+    pub ask_tags_on_import: bool,
     pub recent_projects: Vec<String>,
     pub cpu_cores: usize,
     pub cpu_threads: usize,
@@ -250,6 +255,7 @@ impl SettingsView {
             gpu_preview: stored.gpu_preview,
             time_display: stored.time_display,
             reopen_last_project: stored.reopen_last_project,
+            ask_tags_on_import: stored.ask_tags_on_import,
             recent_projects: stored.recent_projects.clone(),
             cpu_cores: kerf_core::cpu_cores(),
             cpu_threads: kerf_core::cpu_threads(),
@@ -275,7 +281,7 @@ static FILE_LOCK: Mutex<()> = Mutex::new(());
 
 /// The keys a patch may carry — every field of [`Settings`] but `recent_projects`,
 /// which the app keeps itself.
-const KEYS: [&str; 18] = [
+const KEYS: [&str; 19] = [
     "cpu_percent",
     "auto_analysis",
     "proxy_size",
@@ -284,6 +290,7 @@ const KEYS: [&str; 18] = [
     "gpu_preview",
     "time_display",
     "reopen_last_project",
+    "ask_tags_on_import",
     "layout",
     "theme",
     "workspaces",
@@ -298,7 +305,7 @@ const KEYS: [&str; 18] = [
 
 /// Every key of the settings file this build understands: the patchable ones, the two the app
 /// keeps itself, and the retired `transcribe`. Any other key is kept as found ([`Settings::kept`]).
-const STORED_KEYS: [&str; 21] = [
+const STORED_KEYS: [&str; 22] = [
     "cpu_percent",
     "auto_analysis",
     "proxy_size",
@@ -307,6 +314,7 @@ const STORED_KEYS: [&str; 21] = [
     "gpu_preview",
     "time_display",
     "reopen_last_project",
+    "ask_tags_on_import",
     "layout",
     "theme",
     "workspaces",
@@ -804,6 +812,10 @@ mod tests {
         assert!(!s.gpu_preview, "the GPU preview is opt-in");
         assert_eq!(s.time_display, TimeDisplay::Timecode);
         assert!(!s.reopen_last_project, "a launch starts empty unless asked otherwise");
+        assert!(
+            s.ask_tags_on_import,
+            "an import offers to tag what it brought unless told not to"
+        );
         assert!(s.recent_projects.is_empty());
         assert!(s.layout.is_none());
         assert!(s.theme.is_none());
@@ -1053,6 +1065,7 @@ mod tests {
             gpu_preview: true,
             time_display: TimeDisplay::Seconds,
             reopen_last_project: true,
+            ask_tags_on_import: false,
             recent_projects: vec!["/a.kerf".to_string(), "/b.kerf".to_string()],
             last_open_project: Some("/a.kerf".to_string()),
             layout: Some(serde_json::json!({"grid": 1})),
@@ -1325,6 +1338,7 @@ mod tests {
             "time_display": "frames",
             "safe_areas": true,
             "reopen_last_project": "yes",
+            "ask_tags_on_import": "never",
             "auto_analysis": {"silence": 7},
             "recent_projects": ["/a.kerf", 3],
             "theme": {"name": "Mine"},
@@ -1337,6 +1351,7 @@ mod tests {
         assert_eq!(s.proxy_size, d.proxy_size);
         assert_eq!(s.time_display, TimeDisplay::Timecode, "an unknown enum name is the default");
         assert!(!s.reopen_last_project);
+        assert!(s.ask_tags_on_import, "a bad value is the default, which asks");
         assert_eq!(s.auto_analysis, d.auto_analysis, "a bad member costs the whole set, no more");
         assert!(s.recent_projects.is_empty());
         assert!(s.safe_areas, "a good neighbour is kept");
@@ -1723,14 +1738,20 @@ mod tests {
         let base = Settings::default();
         let merged = merge(
             &base,
-            &serde_json::json!({"time_display": "seconds", "reopen_last_project": true}),
+            &serde_json::json!({"time_display": "seconds", "reopen_last_project": true, "ask_tags_on_import": false}),
         )
         .unwrap();
         assert_eq!(merged.time_display, TimeDisplay::Seconds);
         assert!(merged.reopen_last_project);
+        assert!(!merged.ask_tags_on_import);
         let view = serde_json::to_value(SettingsView::current(&merged)).unwrap();
         assert_eq!(view["time_display"], "seconds");
         assert_eq!(view["reopen_last_project"], true);
+        assert_eq!(view["ask_tags_on_import"], false);
+        assert_eq!(
+            serde_json::to_value(SettingsView::current(&base)).unwrap()["ask_tags_on_import"],
+            true
+        );
         assert_eq!(view["recent_projects"], serde_json::json!([]));
         assert!(merge(&base, &serde_json::json!({"time_display": "ticks"})).is_err());
     }

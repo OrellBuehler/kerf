@@ -8,6 +8,7 @@ import { toSrt } from './transcript';
 import { editor, PREVIEW_READ_ONLY, PreviewReadOnly } from './state.svelte';
 import { ui } from './editor-ui.svelte';
 import { withLinkPartners } from './link-groups';
+import { appendedLine } from './tag-ui';
 import {
 	detachedNotice,
 	linkPlans,
@@ -353,21 +354,20 @@ export async function exportTranscriptSrt(assetId: string): Promise<void> {
 
 /** **Append all media to the timeline** (the library's menu): every asset, in library order, end to end — a picture
  *  on the first picture track and a sound on the first sound track, each after what is already there. One revision
- *  (`concatenate`), so one Undo. */
-export async function appendAllMedia(): Promise<void> {
+ *  (`concatenate`), so one Undo. With `ids` (the assets a tag filter shows) only those, in the order given. */
+export async function appendAllMedia(ids: readonly string[] = editor.assets.map((a) => a.id)): Promise<void> {
 	if (holdForPreview()) return;
-	const ids = editor.assets.map((a) => a.id);
 	if (ids.length === 0) {
 		toast.info('Import media first');
 		return;
 	}
 	try {
-		await editor.concatenate(ids);
+		await editor.concatenate([...ids]);
 	} catch (e) {
 		report(e);
 		return;
 	}
-	toast(ids.length === 1 ? 'Appended 1 file to the timeline' : `Appended ${ids.length} files to the timeline, in library order`, {
+	toast(appendedLine(ids.length, editor.assets.length), {
 		action: { label: 'Undo', onClick: () => void editor.undo() }
 	});
 }

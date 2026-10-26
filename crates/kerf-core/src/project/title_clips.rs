@@ -83,9 +83,23 @@ fn check_title_span(start: f64, duration: f64) -> Result<()> {
     Ok(())
 }
 
+/// Refuse one more title on the tracks past [`MAX_TITLE_CLIPS`].
+pub(super) fn check_title_room(timeline: &Timeline) -> Result<()> {
+    let titles = timeline
+        .tracks
+        .iter()
+        .flat_map(|t| &t.clips)
+        .filter(|c| c.is_generated())
+        .count();
+    if titles >= MAX_TITLE_CLIPS {
+        return Err(Error::InvalidArgument(too_many_titles()));
+    }
+    Ok(())
+}
+
 /// Put `clip` on the track `placement` names, or the lowest unlocked video track free over its span, or a
 /// new video track on top (named after the count, as `add_track` names one). Returns the track's id.
-fn place(timeline: &mut Timeline, track_id: Option<Uuid>, clip: Clip) -> Result<Uuid> {
+pub(super) fn place(timeline: &mut Timeline, track_id: Option<Uuid>, clip: Clip) -> Result<Uuid> {
     let (start, end) = (clip.timeline_start, clip.timeline_end());
     let free = |t: &Track| !t.locked && t.clips.iter().all(|c| c.timeline_end() <= start || c.timeline_start >= end);
     let tid = match track_id {
@@ -202,15 +216,7 @@ impl Project {
         // The new clip may not land on another clip of its track (checked after the ripple).
         self.edit_lanes.borrow_mut().push(clip_id);
         self.edit_timeline(&label, |timeline| {
-            let titles = timeline
-                .tracks
-                .iter()
-                .flat_map(|t| &t.clips)
-                .filter(|c| c.is_generated())
-                .count();
-            if titles >= MAX_TITLE_CLIPS {
-                return Err(Error::InvalidArgument(too_many_titles()));
-            }
+            check_title_room(timeline)?;
             also(self)?;
             let track_id = place(timeline, track_id, clip)?;
             let clip = timeline.clip(clip_id).cloned().ok_or(Error::ClipNotFound(clip_id))?;

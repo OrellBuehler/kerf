@@ -6,6 +6,11 @@
 // explorable without the desktop shell.
 
 import type {
+	AssembleByTag,
+	AssembleEdit,
+	AssembledGroup,
+	TagEdit,
+	TagSummary,
 	TranscriptQuery,
 	TranscriptSearch,
 	SuggestedFrame,
@@ -256,6 +261,7 @@ import {
 	templateImageValueOf,
 	templatePosterDev
 } from './template-dev';
+import { applyTagEdit, parseTag, planAssembleByTag, tagEditIsEmpty, tagSummary } from './tags';
 import { checkTitleSpan, isTitleClip, placeTitleClip, titleClip, titleOf } from './title-clips';
 import { CURVE_PRESETS, TEXT_ANIMATION_PRESETS } from './text-animation';
 import { convertTitleTextIn, setTitleTextAnimationIn, setTitleTextBoxIn } from './title-text';
@@ -366,6 +372,13 @@ function wantsMissing(): boolean {
 
 /** The harness assets whose "file" is gone. */
 const devMissing = new Set<string>(wantsMissing() ? [sampleAssets[1].id, sampleAssets[2].id] : []);
+
+// `?tags=1` in the browser harness: the interview and the b-roll arrive tagged, so the bin's chips, the tag filter
+// and `assembleByTag` (a Cumbuco section, then a Jeri one) are explorable without tagging by hand first.
+if (typeof window !== 'undefined' && new URLSearchParams(window.location.search).has('tags')) {
+	sampleAssets[0].tags = [parseTag('location: Cumbuco'), parseTag('rider: Orell'), parseTag('interview')];
+	sampleAssets[1].tags = [parseTag('location: Jeri'), parseTag('rider: Orell'), parseTag('jump')];
+}
 
 // The starter cut is the *detached-and-linked* shape linked A/V produces: the interview's
 // sound is its own clip on A1, linked to the picture on V1, whose own sound is muted
@@ -551,12 +564,12 @@ function devRestore(seq: number): Timeline {
 	const rev = devHistory.find((r) => r.seq === seq);
 	if (rev) {
 		// History does not bring removed media back (`Project::restore`): a step with a clip of an asset that
-		// is no longer in the library is refused, naming it.
+		// is no longer in the library is refused, naming it. A generated clip (a title) has no asset to miss.
 		const gone = [
 			...new Set(
 				rev.snapshot.tracks
 					.flatMap((t) => t.clips)
-					.filter((c) => !assetById(c.asset_id))
+					.filter((c) => !c.generator && !assetById(c.asset_id))
 					.map((c) => devRemovedNames.get(c.asset_id) ?? c.asset_id)
 			)
 		];
@@ -3235,6 +3248,112 @@ export async function setAssetProjection(
 	return invoke<Asset>('set_asset_projection', { assetId, projection });
 }
 
+// ---- asset tags --------------------------------------------------------------
+// A label on a whole asset (`location: Cumbuco`, `jump`). The desktop app asks the backend (`edit_asset_tags`,
+// `list_tags`, `assemble_by_tag`); the browser harness keeps the tags on its in-memory assets and runs the faithful
+// mirror in `tags.ts` (the same spelling, edits, grouping and refusals).
+
+/**
+ * Add, take off or replace tags on assets, all in one transaction: an unknown asset, or an edit that does not apply to
+ * one of them (an empty tag, past 64 tags), refuses the lot and changes nothing. The edit applies `remove_keys`, then
+ * `remove`, then `add`. Resolves to the assets as they are now. Not an edit of the cut, so no revision.
+ */
+export async function editAssetTags(assetIds: string[], edit: TagEdit): Promise<Asset[]> {
+	if (!inTauri()) {
+		if (assetIds.length === 0) throw new Error('invalid argument: name at least one asset to tag');
+		if (tagEditIsEmpty(edit)) throw new Error('invalid argument: nothing to change: give tags to add or remove');
+		const planned = [...new Set(assetIds)].map((id) => {
+			const asset = assetById(id);
+			if (!asset) throw new Error(`asset not found: ${id}`);
+			return { asset, tags: applyTagEdit(asset.tags ?? [], edit) };
+		});
+		for (const { asset, tags } of planned) {
+			if (tags.length > 0) asset.tags = tags;
+			else delete asset.tags;
+		}
+		return structuredClone(planned.map((p) => p.asset));
+	}
+	return invoke<Asset[]>('edit_asset_tags', { assetIds, edit });
+}
+
+/** Every tag in use across the library: the keys with their values and asset counts, and the plain tags. */
+export async function listTags(): Promise<TagSummary> {
+	if (!inTauri()) return tagSummary(sampleAssets.map((a) => a.tags ?? []));
+	return invoke<TagSummary>('list_tags');
+}
+
+/**
+ * Lay the library out at the end of the cut grouped by the value of one tag key (`location`: one section per spot), a
+ * title per group, as one edit. Whole assets, picture and sound; the groups run A to Z or in `order`. Resolves to the
+ * refreshed cut and the groups laid out in it; rejects when no asset matches.
+ */
+export async function assembleByTag(request: AssembleByTag): Promise<AssembleEdit> {
+	if (!inTauri()) return devAssembleByTag(request);
+	return invoke<AssembleEdit>('assemble_by_tag', { request });
+}
+
+/** `Project::apply_assemble_by_tag` over the harness cut: one revision, the titles ordinary title clips. */
+function devAssembleByTag(request: AssembleByTag): AssembleEdit {
+	const plan = planAssembleByTag(sampleAssets, request);
+	const env = devEnv(false, undefined);
+	let tl = structuredClone(devTimeline);
+	const kindOf = (a: Asset): Track['kind'] => (a.streams.some((s) => s.kind === 'video') ? 'video' : 'audio');
+	// From the end of the picture track when the plan has any picture, else of the audio track: a long bed does not push it out.
+	const picture = plan.groups.some((g) => g.assets.some((a) => kindOf(a) === 'video'));
+	let cursor = trackEnd(ops.defaultTrack(tl, picture ? 'video' : 'audio'));
+	// A sound alone goes on the first audio track with nothing over its span, else on a new one (`place_sound`).
+	const soundTrack = (at: number, seconds: number): string => {
+		const free = (t: Track) =>
+			t.kind === 'audio' && !t.locked && t.clips.every((c) => c.timeline_start + clipDuration(c) <= at || c.timeline_start >= at + seconds);
+		let track = tl.tracks.find(free);
+		if (!track) tl.tracks.push((track = { id: uid(), kind: 'audio', name: `A${tl.tracks.filter((t) => t.kind === 'audio').length + 1}`, clips: [] }));
+		return track.id;
+	};
+	const art = plan.title === 'card' ? 'fade_up' : 'lower_third';
+	const title = (value: string, at: number, seconds: number) => {
+		const clip = titleClip({ name: value, svg: svgPresetArt(art, { text: value }) }, at, seconds);
+		placeTitleClip(tl, clip, null);
+		return clip.id;
+	};
+	const clipIds: string[] = [];
+	const groups: AssembledGroup[] = [];
+	for (const group of plan.groups) {
+		const start = cursor;
+		let titleId: string | undefined;
+		const named = group.value !== null && plan.title !== 'none';
+		if (named && plan.title === 'card') {
+			titleId = title(group.value!, cursor, plan.title_seconds);
+			cursor += plan.title_seconds;
+		}
+		const first = cursor;
+		for (const asset of group.assets) {
+			const done = ops.addClip(tl, env, asset, kindOf(asset) === 'audio' ? soundTrack(cursor, asset.duration) : null, 0, asset.duration, cursor);
+			tl = done.timeline;
+			clipIds.push(done.result.id);
+			cursor = done.result.timeline_start + clipDuration(done.result);
+		}
+		if (named && plan.title === 'overlay') {
+			titleId = title(group.value!, first, Math.min(plan.title_seconds, group.assets[0].duration));
+		}
+		groups.push({
+			value: group.value,
+			asset_ids: group.assets.map((a) => a.id),
+			...(titleId ? { title_clip_id: titleId } : {}),
+			start,
+			end: cursor
+		});
+	}
+	devTimeline = tl;
+	const count = (n: number, noun: string) => `${n} ${noun}${n === 1 ? '' : 's'}`;
+	recordDev(`Assemble by ${plan.key} (${count(groups.length, 'group')}, ${count(clipIds.length, 'clip')})`);
+	return {
+		timeline: snapshot(),
+		groups,
+		clip_ids: clipIds,
+		...(plan.unmatched.length > 0 ? { unmatched: plan.unmatched } : {})
+	};
+}
+
 /** Aim a 360 clip's virtual camera. Unspecified fields are left unchanged. */
 export async function setReframe(clipId: string, patch: Partial<Reframe>): Promise<Timeline> {
 	if (!inTauri()) {
@@ -5493,6 +5612,7 @@ export async function getSettings(): Promise<SettingsView> {
 			gpu_preview: harnessSurface(),
 			time_display: readBrowserTimeDisplay(),
 			reopen_last_project: readBrowserFlag(REOPEN_KEY),
+			ask_tags_on_import: readBrowserFlag(ASK_TAGS_KEY, true),
 			recent_projects: harnessRecent(),
 			layout: readBrowserJson(LAYOUT_KEY),
 			theme: readBrowserJson(THEME_KEY),
@@ -5523,6 +5643,7 @@ export async function setSettings(patch: SettingsPatch): Promise<SettingsView> {
 			if (patch.safe_areas !== undefined) localStorage.setItem(SAFE_AREAS_KEY, patch.safe_areas ? '1' : '0');
 			if (patch.time_display !== undefined) localStorage.setItem(TIME_DISPLAY_KEY, patch.time_display);
 			if (patch.reopen_last_project !== undefined) localStorage.setItem(REOPEN_KEY, patch.reopen_last_project ? '1' : '0');
+			if (patch.ask_tags_on_import !== undefined) localStorage.setItem(ASK_TAGS_KEY, patch.ask_tags_on_import ? '1' : '0');
 			if ('layout' in patch) writeBrowserJson(LAYOUT_KEY, patch.layout);
 			if ('theme' in patch) writeBrowserJson(THEME_KEY, patch.theme);
 			if ('workspaces' in patch) writeBrowserJson(WORKSPACES_KEY, patch.workspaces);
@@ -5550,6 +5671,7 @@ const KEYBINDINGS_KEY = 'kerf.settings.keybindings';
 const EDITING_KEY = 'kerf.settings.editing';
 const TIME_DISPLAY_KEY = 'kerf.settings.timeDisplay';
 const REOPEN_KEY = 'kerf.settings.reopenLastProject';
+const ASK_TAGS_KEY = 'kerf.settings.askTagsOnImport';
 const MIN_CPU_PERCENT = 10;
 const DEFAULT_CPU_PERCENT = 75;
 
@@ -5615,11 +5737,13 @@ function readBrowserTimeDisplay(): TimeDisplay {
 	}
 }
 
-function readBrowserFlag(key: string): boolean {
+/** A remembered on/off setting; `fallback` is what a harness that never stored it answers. */
+function readBrowserFlag(key: string, fallback = false): boolean {
 	try {
-		return localStorage.getItem(key) === '1';
+		const stored = localStorage.getItem(key);
+		return stored === null ? fallback : stored === '1';
 	} catch {
-		return false;
+		return fallback;
 	}
 }
 
@@ -5673,7 +5797,8 @@ export async function resetSettings(): Promise<SettingsView> {
 				KEYBINDINGS_KEY,
 				EDITING_KEY,
 				TIME_DISPLAY_KEY,
-				REOPEN_KEY
+				REOPEN_KEY,
+				ASK_TAGS_KEY
 			]) {
 				localStorage.removeItem(key);
 			}
