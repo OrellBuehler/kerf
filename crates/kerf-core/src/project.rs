@@ -1684,10 +1684,10 @@ impl Project {
     /// lock before the ffmpeg decode runs. Always reads the original source —
     /// proxies are video-only.
     /// `effects` is the owning clip's audio chain, applied during the decode so
-    /// the monitor hears its EQ / compressor / gate instead of the dry source.
+    /// the monitor hears its EQ / compressor / gate / denoise instead of the dry source.
     /// The chain runs *before* the Web Audio engine's volume and fade envelope,
     /// where the export runs it after the clip gain — a difference only a
-    /// level-dependent effect (compressor, gate) can hear, and this is a preview
+    /// level-dependent effect (compressor, gate, denoise) can hear, and this is a preview
     /// monitor, not the export mix.
     pub fn decode_audio_pcm(
         asset: &Asset,
