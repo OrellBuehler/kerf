@@ -89,7 +89,9 @@
 //! a blend mode ([`blend_for`], on dice of its own seeded by the case and the clip, every mode but `normal`). The
 //! first 8400 per-case digests are the ones the commit before blend modes gave; 4 block lines were appended to
 //! each file, `parts.txt`'s too. Families `blend`, `still-blend`, `preview-blend` (`blend=c0_mode=`) and the two
-//! names that differ from the mode's own, `blend-hardlight` (overlay) and `blend-addition` (add).
+//! names that differ from the mode's own, `blend-hardlight` (overlay) and `blend-addition` (add). Its blocks
+//! (84–87) were re-blessed alone when the blend graph `select`ed the clip's window, named the composite's matrix
+//! and gave a blended clip alpha fades, transparent letterbox bars and a `black@0` rotation fill.
 //!
 //! **The export in parts has a file of its own** (`golden/parts.txt`, [`the_parts_argv_builders_produce_the_golden_digests`]):
 //! every case is planned with `segments::plan_export` under [`PARTS_LIMITS`] and the argv of every part and of the last pass is

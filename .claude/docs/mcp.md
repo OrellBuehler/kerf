@@ -159,8 +159,10 @@ lock is taken; the clip comes back. The nested curves / wheels are MCP-only mirr
 **Blend modes over MCP**: `set_blend_mode` (`clip_id`, `mode`: `normal`, `multiply`, `screen`, `overlay`, `hard_light`, `add`,
 `darken`, `lighten`, `difference`, `exclusion`; `BlendMode::parse` also takes `hard-light`, `linear dodge`, …, and an unknown name
 is `invalid_params` listing the modes) is `Project::set_blend_mode` (a clip on an audio track is refused; batchable; a `Set` in the
-`Clips` tool set). Its description says what each mode is for (screen a light leak shot on black, multiply a texture) and that
-opacity, mask, key and fades still weigh the mix; the server `instructions` name it beside `set_mask`; the clip comes back with
+`Clips` tool set). Its description says what each mode is for (screen a light leak shot on black, multiply a texture), that
+opacity, mask, key, fades and dips still weigh the mix (a blended clip's fades are alpha fades, `engine-cli.md`), that letterbox
+bars leave the lower tracks alone, and what it costs (several times a plain clip's work per frame while on screen; the GPU
+preview leaves its frames to FFmpeg); the server `instructions` name it beside `set_mask`; the clip comes back with
 `blend_mode` (absent at `normal`).
 **Per-property animation over MCP**: `set_property_keyframes` (`clip_id`, `prop`, `keys:
 [{time, value, easing?}]`; `[]` makes the number static again; the clip comes back) animates one number —

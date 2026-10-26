@@ -209,7 +209,9 @@
   files is **16 insertions, 0 deletions**, so the first 8400 per-case digests are the ones the commit before gave. Families `blend`,
   `still-blend`, `preview-blend` (`blend=c0_mode=`) and the two FFmpeg names that differ from the mode's own, `blend-hardlight`
   (overlay) and `blend-addition` (add). `parts_draw_as_whole` compares a blended clip's placement (its colour stage's `overlay`) and
-  its `blend` between a part and the whole export.
+  its `blend` between a part and the whole export (so the composite's matrix is decided over the whole timeline). Re-blessed
+  once, alone, when the blend chains `select`ed the clip's window, named the composite's matrix and gave a blended clip alpha
+  fades, transparent letterbox bars and a `black@0` rotation fill: blocks 84–87 of the four files and nothing else moved.
 - **Constant-power crossfades** (`afade …:curve=qsin` only on a fade that is wholly one half of a real
   pair: a dissolve or motion transition from an adjacent clip whose overlap plays different sound — not a
   fade up from black, not a dip, not a cut inside one take) re-blessed `export.txt` alone: 1304 of 6400

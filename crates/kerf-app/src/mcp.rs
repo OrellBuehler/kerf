@@ -3337,9 +3337,12 @@ impl KerfMcp {
                        lens flares, fire and smoke shot on black), add sums the two (a hotter glow), overlay and \
                        hard_light add contrast from the clip, darken / lighten keep the darker / lighter of the \
                        two, difference and exclusion invert where the clip is bright. \"normal\" goes back to \
-                       plain compositing. The clip's opacity, mask, chroma key and fades still decide how much of \
-                       the mix shows, and outside its picture the lower tracks are untouched; a clip with nothing \
-                       under it blends with black. Only a clip on a video track can blend. Check the result with \
+                       plain compositing. The clip's opacity, mask, chroma key, fades and dips still decide how much \
+                       of the mix shows (a fade or dip eases the mix in and out rather than going through black or \
+                       white), and outside its picture the lower tracks are untouched, letterbox bars included; a \
+                       clip with nothing under it blends with black. Only a clip on a video track can blend. A \
+                       blended clip costs the export several times a plain one's work per frame while it is on \
+                       screen, and the GPU preview draws its frames through FFmpeg. Check the result with \
                        preview_timeline."
     )]
     fn set_blend_mode(&self, Parameters(p): Parameters<SetBlendModeParams>) -> Result<String, McpError> {
