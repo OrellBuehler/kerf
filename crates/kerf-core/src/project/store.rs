@@ -126,6 +126,12 @@ const MIGRATIONS: &[Migration] = &[
         destructive: false,
         needed_to_read: true,
     },
+    Migration {
+        run: v15_to_v16,
+        needed: v15_to_v16_needed,
+        destructive: false,
+        needed_to_read: false,
+    },
 ];
 
 /// The schema this build writes and the newest it opens.
@@ -356,6 +362,18 @@ fn v14_to_v15(conn: &Connection) -> rusqlite::Result<()> {
 
 fn v14_to_v15_needed(conn: &Connection) -> bool {
     !has_column(conn, "assets", "tags")
+}
+
+/// v16: a clip's audio chain may hold a noise reduction (`AudioEffect::Denoise`, `{"type":"denoise",...}` in a clip's
+/// `audio` in the timeline JSON). It is a new variant an older build cannot read, and with it the whole timeline. A chain
+/// without one is written as it was, so a stored one is unchanged. Nothing in the file's tables changes; the step is the
+/// version that keeps an older build out, after the file is copied aside.
+fn v15_to_v16(_: &Connection) -> rusqlite::Result<()> {
+    Ok(())
+}
+
+fn v15_to_v16_needed(_: &Connection) -> bool {
+    true
 }
 
 /// The index (the version each upgrades from) of every step from `found` on that would change this file.

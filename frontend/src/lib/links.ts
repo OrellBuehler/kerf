@@ -67,9 +67,9 @@ import {
 	timelineToSource
 } from './speed-ramp';
 
-/** Whether an effect reacts to *level* (a compressor, a gate): a gain put ahead of it changes
+/** Whether an effect reacts to *level* (a compressor, a gate, a denoiser): a gain put ahead of it changes
  *  what it does (`AudioEffect::is_dynamic`). */
-const isDynamic = (e: AudioEffect) => e.type === 'compressor' || e.type === 'gate';
+const isDynamic = (e: AudioEffect) => e.type === 'compressor' || e.type === 'gate' || e.type === 'denoise';
 
 const reversed = isReversed;
 const endOf = (c: Clip) => c.timeline_start + clipDuration(c);

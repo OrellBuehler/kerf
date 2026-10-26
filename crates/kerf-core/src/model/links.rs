@@ -4161,7 +4161,7 @@ mod tests {
     }
 
     #[test]
-    fn a_compressor_or_gate_makes_detach_meet_the_same_fader_instead_of_folding_it() {
+    fn a_compressor_gate_or_denoise_makes_detach_meet_the_same_fader_instead_of_folding_it() {
         for dynamic in [
             AudioEffect::Compressor {
                 threshold_db: -18.0,
@@ -4171,6 +4171,11 @@ mod tests {
                 makeup_db: 0.0,
             },
             AudioEffect::Gate { threshold_db: -40.0 },
+            AudioEffect::Denoise {
+                reduction_db: 12.0,
+                floor_db: -50.0,
+                track_noise: false,
+            },
         ] {
             let mut c = compressed(0.8);
             c.audio = vec![dynamic];

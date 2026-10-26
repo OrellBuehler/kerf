@@ -28,8 +28,8 @@
   new clip's volume is `volume × picture fader ÷ audio fader` (a lane whose fader is at
   zero is never chosen, and the render check measures +0.00 dB through a V1 fader of 0.5
   into an A1 fader of 2.0) — **exact only while the clip's chain is linear**: folding the
-  fader into the volume moves the gain *ahead of* a compressor or gate
-  (`AudioEffect::is_dynamic`), which then reacts to a different level. So a clip with one
+  fader into the volume moves the gain *ahead of* a compressor, gate or denoise
+  (`AudioEffect::is_dynamic`; a denoiser's floor is an absolute level), which then reacts to a different level. So a clip with one
   goes to a lane whose fader **equals** the picture track's — an existing one with room,
   else a **new audio track at that fader**, there is no skip path — and its volume is left
   alone; filters and EQ commute with gain and still fold; the destination's **pan, duck flag and mute/solo** now decide
@@ -151,9 +151,9 @@
   `unlinked` / `own sound off|on`. `Project::sample()` seeds its interview sound
   detached-then-*unlinked*.
   **The browser harness is held to all of it by a differential corpus**: `project/linked_corpus.rs`
-  writes 114 edits (random J/L, mirrored and titled cuts, plus hand-made cases for every
+  writes 115 edits (random J/L, mirrored and titled cuts, plus hand-made cases for every
   rule above — both partners named, a cut's leftover and its lone resumed piece, a picture
-  victim, the 0.05 s floor, a lead lost at 0) with the answer `Project` gave — canonical timeline (no ids: clips an edit
+  victim, the 0.05 s floor, a lead lost at 0, detach under a compressor, gate or denoise) with the answer `Project` gave — canonical timeline (no ids: clips an edit
   creates have random ones), revision label, report or the exact refusal — to
   `frontend/src/lib/fixtures/links-corpus.json`; `links-corpus.test.ts` replays each through
   `link-ops.ts` (the pure mirror of `Project`'s ops and of `run_edit`, which `api.ts` now

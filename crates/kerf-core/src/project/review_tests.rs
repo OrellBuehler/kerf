@@ -700,6 +700,9 @@ fn audio_ranges() -> (Vec<AudioEffect>, Vec<AudioEffect>) {
         AudioEffect::Gate { threshold_db: -45.0 },
         AudioEffect::Gate { threshold_db: 0.0 },
         AudioEffect::Gate { threshold_db: -100.0 },
+        denoise(12.0, -50.0, false),
+        denoise(0.01, -80.0, true),
+        denoise(97.0, -20.0, false),
     ];
     let bad = vec![
         AudioEffect::Highpass { hz: 0.0 },
@@ -736,8 +739,21 @@ fn audio_ranges() -> (Vec<AudioEffect>, Vec<AudioEffect>) {
         AudioEffect::Gate {
             threshold_db: f64::NEG_INFINITY,
         },
+        denoise(0.0, -50.0, false),
+        denoise(97.5, -50.0, false),
+        denoise(12.0, -80.5, false),
+        denoise(12.0, -19.5, true),
+        denoise(f64::NAN, -50.0, false),
     ];
     (ok, bad)
+}
+
+fn denoise(reduction_db: f64, floor_db: f64, track_noise: bool) -> AudioEffect {
+    AudioEffect::Denoise {
+        reduction_db,
+        floor_db,
+        track_noise,
+    }
 }
 
 #[test]
@@ -760,6 +776,11 @@ fn audio_effects_are_held_to_ffmpegs_ranges_and_the_refusal_names_the_range() {
         .unwrap_err()
         .to_string();
     assert!(err.contains("-100..=0"), "{err}");
+    let err = p
+        .set_audio_effects(c1.id, vec![denoise(12.0, -10.0, false)])
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("floor_db") && err.contains("-80..=-20"), "{err}");
 }
 
 /// Every value the check accepts is one FFmpeg accepts, and the ones it refuses are the ones

@@ -5110,7 +5110,9 @@ export async function getFilmstrip(assetId: string): Promise<Filmstrip> {
  */
 /** Decode a clip's source window to raw mono PCM. Naming `clipId` decodes it
  *  through that clip's audio effect chain, so the monitor hears the EQ /
- *  compressor / gate the export will render. */
+ *  compressor / gate / denoise the export will render. The chain runs before the
+ *  clip's gain here and after it in the export: only a level-dependent effect
+ *  (compressor, gate, denoise) hears the difference. */
 export async function getAudio(
 	assetId: string,
 	start: number,

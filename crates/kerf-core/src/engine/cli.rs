@@ -8814,12 +8814,19 @@ fn chroma_filter(e: &VideoEffect) -> Option<String> {
 /// chain the export renders — the chain is only *described* once, here, so the
 /// two can't drift.
 pub fn audio_effects_filter(effects: &[AudioEffect]) -> Option<String> {
-    (!effects.is_empty()).then(|| effects.iter().map(audio_effect_filter).collect::<Vec<_>>().join(","))
+    (!effects.is_empty()).then(|| {
+        effects
+            .iter()
+            .map(|e| audio_effect_filter(e, None))
+            .collect::<Vec<_>>()
+            .join(",")
+    })
 }
 
 /// The filter for one audio effect. dB thresholds / make-up gain are converted to
-/// the linear units ffmpeg's dynamics filters expect.
-fn audio_effect_filter(e: &AudioEffect) -> String {
+/// the linear units ffmpeg's dynamics filters expect. `len` is the clip's length where the
+/// chain is the export's (a denoise on an `afftdn` that does not delay is cut to it).
+fn audio_effect_filter(e: &AudioEffect, len: Option<f64>) -> String {
     match e {
         AudioEffect::Highpass { hz } => format!("highpass=f={}", fnum(*hz)),
         AudioEffect::Lowpass { hz } => format!("lowpass=f={}", fnum(*hz)),
@@ -8846,6 +8853,11 @@ fn audio_effect_filter(e: &AudioEffect) -> String {
             fnum(db_to_linear(*makeup_db)),
         ),
         AudioEffect::Gate { threshold_db } => format!("agate=threshold={}", fnum(db_to_linear(*threshold_db))),
+        AudioEffect::Denoise {
+            reduction_db,
+            floor_db,
+            track_noise,
+        } => denoise_filter(*reduction_db, *floor_db, *track_noise, len),
     }
 }
 
@@ -10823,10 +10835,10 @@ fn audio_clip_tail(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, layout: &str, m
     } else {
         p.push(format!("volume={}", clip.volume));
     }
-    // Per-clip audio effects (EQ / compressor / gate / filters) in author order,
+    // Per-clip audio effects (EQ / compressor / gate / denoise / filters) in author order,
     // after the clip gain.
     for e in &clip.audio {
-        p.push(audio_effect_filter(e));
+        p.push(audio_effect_filter(e, Some(dur)));
     }
     // A fade that is wholly one half of a real crossfade pair (`ClipFx::afade_in_power` /
     // `tail_power`) is constant-power (`qsin`: sin in, cos out, so the summed power stays
@@ -11037,6 +11049,16 @@ pub use written::{measure_export, ExportReport, LoudnessTarget, WrittenAudio, Wr
 /// module so it reaches the private graph builders.
 mod levels;
 pub use levels::{mix_levels, stream_mix_pcm};
+
+/// A clip's noise reduction (`afftdn`), its delay taken back out where this ffmpeg has one.
+mod denoise;
+use denoise::denoise_filter;
+#[cfg(test)]
+use denoise::with_afftdn_delay;
+
+/// Noise reduction through the real `ffmpeg`: the sound keeps its sync and its length (`#[ignore]`d).
+#[cfg(test)]
+mod denoise_rendered;
 
 /// The golden argv oracle (see its docs): a child module so it reaches the
 /// private builders.

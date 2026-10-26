@@ -187,7 +187,7 @@ so the feature is **only** activated through these forwards — which is what ma
   `peaks::pump_pcm_cancellable`: killed after a stall of no audio, cancel polled every 100 ms.
   *Moment reads and probes* (`probe`, `run_frame_decode`, `audio_pcm`, the once-per-process
   capability probes `zscale_available` / `help_flags` / `alimiter_latency_available` /
-  `whisper::filter_available`) use `output_bounded` with a wall-clock limit (**300 s** for the
+  `afftdn_delays` / `whisper::filter_available`) use `output_bounded` with a wall-clock limit (**300 s** for the
   import probe — ffprobe prints nothing until it is done, so there is no stall to listen for, and a
   share that is slow to wake needs minutes, not seconds; 60 s capability, 120 s a frame, 60 s an
   audio window); a capability probe that times out reads as
@@ -957,10 +957,35 @@ so the feature is **only** activated through these forwards — which is what ma
   the extraction changed no argv byte: the golden oracle below is the proof, and the next
   change to these numbers has to go through it. Shared test fixtures (assets, streams,
   clips, tracks) live in `engine/test_support.rs`.
+  **Denoise** (`AudioEffect::Denoise`, `engine/cli/denoise.rs`) is `afftdn=nr=…:nf=…` (`:tn=1` only when the
+  floor is tracked). `afftdn` works on windows of three hops of `sample_rate / 80`; **since FFmpeg 5.1 its output
+  is the window two hops back, stamped with the input's time**: the sound comes out `2 * (sr / 80)` samples late
+  (25 ms at 48 kHz, 1102 samples at 44.1 kHz) and its last two hops are lost. **4.4 / 5.0 keep the time but not the
+  length**: a hop comes out only while a whole window is buffered and nothing is flushed, so `hop * floor(n / hop) -
+  2 * hop` samples come out (25–37 ms of tail lost, nothing under three hops) and the first two hops are a partial
+  overlap-add, ~15 dB down. `afftdn_delays()` (once per process: `ffmpeg -h filter=afftdn` lists `noise_reduction`, the
+  long names the rewrite added; a binary that will not run reads as delaying; `with_afftdn_delay` pins it in tests)
+  picks the wrap. Delaying: `asetpts=PTS-STARTPTS,apad=pad_dur=0.024995,afftdn=…,atrim=start=0.024995,asetpts=PTS-STARTPTS`,
+  rebased (`atrim`'s `start` reads timestamps, and the preview's `-ss` decode does not start at 0), padded and trimmed by
+  the delay; `0.024995` rounds to exactly the delay at 8, 12, 16, 24, 32, 44.1, 48 and 96 kHz (a sample off at 22.05,
+  88.2, 192). Not delaying: `asetpts=PTS-STARTPTS,adelay=delays=40:all=1,apad=pad_dur=0.04,afftdn=…,atrim=start=0.04:end=<len+0.04>,asetpts=PTS-STARTPTS`:
+  40 ms of silence at each end (more than three hops, a whole number of samples at every rate from 8 to 192 kHz, so
+  `adelay` and `atrim` cut the same samples) makes the head a full overlap-add and flushes the tail, and the clip's
+  length (`audio_effect_filter`'s `len`, `ClipTiming::duration`) cuts it back; the preview's `audio_effects_filter`
+  has no length and is cut by `audio_pcm`'s own `-t`. Only the delaying text is in the golden oracle (it is pinned
+  there); the other is unit-tested. It runs at the source's rate, after the tempo, like every clip effect.
+  `denoise_rendered` (`#[ignore]`d; run on 6.1.1, and on the 4.4.1 and 5.0.1 static builds via `KERF_FFMPEG` /
+  `KERF_FFPROBE`) holds the export (44.1 / 48 kHz, 1x / 1.5x, a clip with loud ends) and the preview decode to a lag
+  of **0** samples against the dry render, the same length (on 4.4 / 5.0 the clip's own: dry, 4.4's `atempo` runs a
+  few ms past it at 1.5x), the burst and the last 20 ms within 0.5 dB, the first 12 ms within 1.5 dB (6.1's filter
+  leaves them ~1 dB down while it adapts; 4.4 / 5.0 within 0.02 dB), the hiss down by > 10 dB (~21 dB on 6.1, 12–14 on
+  4.4 / 5.0), and the chain written for the other kind of filter to the delay the probe claims (+1199 / 1200 output
+  samples on 6.1, −1199 / 1200 on 4.4 / 5.0), so the probe is measured. It is level-dependent (`is_dynamic`): its
+  floor is an absolute level.
   The per-clip chains (`video_clip_chain` / `audio_clip_chain`) also realize
   each clip's **video effects** (`gblur`/`unsharp`/`hue`/`negate`/`vignette`, and
   `chromakey` which keeps alpha so a lower track shows through), **audio effects**
-  (`highpass`/`lowpass`/`equalizer`/`acompressor`/`agate`) and **transform keyframes**
+  (`highpass`/`lowpass`/`equalizer`/`acompressor`/`agate`/`afftdn`, the denoise above) and **transform keyframes**
   — animated zoom via `scale=eval=frame`, animated position via the `overlay` x/y
   expr, rotation via `rotate`, opacity via `geq` (all driven by piecewise-linear
   `keyframe_expr` over clip-local time). **An expression may nest about 100 levels** (libavutil's

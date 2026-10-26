@@ -45,7 +45,13 @@ export const AUDIO_EFFECT_PRESETS: EffectPreset<AudioEffect>[] = [
 		hint: 'Even out loud and quiet — 3:1 above −18 dB, with makeup gain',
 		effect: { type: 'compressor', threshold_db: -18, ratio: 3, attack_ms: 20, release_ms: 250, makeup_db: 6 }
 	},
-	{ key: 'gate', label: 'Gate', hint: 'Silence what falls under −45 dB', effect: { type: 'gate', threshold_db: -45 } }
+	{ key: 'gate', label: 'Gate', hint: 'Silence what falls under −45 dB', effect: { type: 'gate', threshold_db: -45 } },
+	{
+		key: 'denoise',
+		label: 'Denoise',
+		hint: 'Take hiss and room tone down — 12 dB off the noise under −50 dB',
+		effect: { type: 'denoise', reduction_db: 12, floor_db: -50, track_noise: false }
+	}
 ];
 
 /** The presets by key — what the Inspector's "Add effect" picker reads. */

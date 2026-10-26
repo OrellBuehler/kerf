@@ -49,8 +49,9 @@
   `KERF_GOLDEN_BLESS=1 cargo test -p kerf-core --no-default-features golden -- --nocapture`
   (exactly `1`): it rewrites **all three** files and says so, and `git diff` is the guard —
   only the files you meant to change should move. It is **machine-independent**: the
-  builders read the machine in six places and each is pinned (the sixth is the animated titles' cache
-  directory, `svg::raster::with_pinned_dir`) — the preview's
+  builders read the machine in seven places and each is pinned (the sixth is the animated titles' cache
+  directory, `svg::raster::with_pinned_dir`; the seventh `afftdn_delays()`, pinned by `with_afftdn_delay` to the
+  delaying filter of FFmpeg 5.1 on, the old spelling being unit-tested) — the preview's
   `decode_hwaccel()` (through `build_preview_args_with`), `zscale_available()` (a `cfg(test)`
   thread-local override; every HDR case is built both ways), `alimiter_latency_available()`
   (the same kind of override, `with_alimiter_latency`; every case is built with the option,
@@ -225,3 +226,10 @@
   zoom out under Contain, a moving zoom, a Cover clip of the frame's own shape that only moves or zooms out. The families split
   the graph on `;` and `,` **outside quotes, with a backslash escaping outside them** (`split_unquoted`): a keyed mask's `;`-separated
   statements and a title's `\'` would otherwise merge chains.
+- **Noise reduction** (`denoise_for`; `engine-cli.md`), **appended, nothing re-blessed**: the 400 cases after the speed-ramp
+  ones draw from the same generator (with the channel family's channels), then 70% of their clips get a `Denoise` anywhere in
+  their audio chain, on dice of their own seeded by the case and the clip (reduction 0.5..96 dB, floor −79..−21 dB, the floor
+  tracked a third of the time). The diff of the four digest files is **16 insertions, 0 deletions**, so the first 8400
+  per-case digests are the ones the commit before gave. Families `audio-denoise` (`afftdn=nr=`: 232 of the 400),
+  `audio-denoise-track` (`:tn=1`: 167) and `audio-denoise-delay` (`apad=pad_dur=0.024995,afftdn=`: 232, the wrap that takes
+  the delay out); the still and the preview carry no sound, so their four lines are the new cases' pictures.
