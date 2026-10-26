@@ -177,14 +177,18 @@
   its next write of the clip and the clip then plays at its constant speed, a different length; a clip with none is written as
   before, `run` a no-op, `needed` always, `needed_to_read` false (`a_v13_file_is_backed_up_stamped_v14_and_keeps_its_speed_ramps`);
   `persisted/timelines-v14.json` holds a clip on a ramp with a held segment.
-  v14→v15 is a JSON step for a **new field**, `Clip.blend_mode` (a blend mode, `core-model.md`): an older build drops it at
+  v14→v15 adds `assets.tags` (JSON `Tag` list, NULL for none; a probe-and-`ALTER`, `needed` exactly when the column is missing,
+  `needed_to_read` true) and changes the shape of `staged.assets`: a held-back `StagedAssetChange` may be a tag change
+  (`"tag_edit"` beside `"projection"`), which an older build would read as a projection change and so clear the asset's projection
+  on accept (`a_v14_file_gains_the_tags_column_and_keeps_a_backup`); no timeline JSON moves, so there is no `persisted/` file for v15.
+  v15→v16 is a JSON step for a **new field**, `Clip.blend_mode` (a blend mode, `core-model.md`): an older build drops it at
   its next write of the clip and the clip then composites as plain alpha-over; a clip at `normal` is written as before,
-  `run` a no-op, `needed` always, `needed_to_read` false (`a_v14_file_is_backed_up_stamped_v15_and_keeps_its_blend_modes`);
-  `persisted/timelines-v15.json` holds a screened clip. `Project::set_blend_mode(clip, mode)` is one revision ("Set blend
+  `run` a no-op, `needed` always, `needed_to_read` false (`a_v15_file_is_backed_up_stamped_v16_and_keeps_its_blend_modes`);
+  `persisted/timelines-v16.json` holds a screened clip. `Project::set_blend_mode(clip, mode)` is one revision ("Set blend
   mode"), refuses a clip on an audio track, and stages like any agent edit (`project/blend_tests.rs`).
-  The schema is at **v15** (`SCHEMA_VERSION`). `persist_tests` pins which steps a file has pending with
-  `store::pending_steps` (a legacy file that has every column: `[4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14]`). A step's `needed_to_read` says whether a build that
-  cannot write must still refuse a file lacking what it adds: true for the v1, v2 and v4 columns (the reads
+  The schema is at **v16** (`SCHEMA_VERSION`). `persist_tests` pins which steps a file has pending with
+  `store::pending_steps` (a legacy file that has every column: `[4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15]`). A step's `needed_to_read` says whether a build that
+  cannot write must still refuse a file lacking what it adds: true for the v1, v2, v4 and v15 columns (the reads
   name them), false for the `fonts` table (reads tolerate its absence), so a write-protected v2 project
   opens as it is. A new file is stamped `SCHEMA_VERSION`; a
   file newer than that is refused before anything is written (`Error::NewerProject`, "made by a newer
@@ -399,11 +403,12 @@
   `complete_task` leaves its task `ready`. Turned on mid-task, what already landed stays landed (it is in the history), the
   next agent edit opens a proposal (with no task: the claim opened none), and the agent's undo/redo/revert are refused again;
   `complete_task` then reads `ready`.
-  **Asset-level agent writes are staged too**: `set_asset_projection` as the agent records a
+  **Asset-level agent writes are staged too**: `set_asset_projection` and `edit_asset_tags` (below) as the agent record a
   `StagedAssetChange` in the proposal (the `staged.assets` column) instead of rewriting the
-  library, the agent's own `get_asset` / `list_assets` read through the pending changes (the
+  library, the agent's own `get_asset` / `list_assets` / `list_tags` read through the pending changes (the
   user's do not), and accepting writes them (no revision — the library is not in the edit
-  history); asking for what the library already has stages nothing.
+  history); asking for what the library already has stages nothing, and takes back an earlier ask.
+  One `stage_asset_changes(label, [(id, change?)])` writes any mix as one undoable step.
   **Undo inside a proposal**: every step pushes the previous state onto `staged_undo` (a table, so
   an edit writes one timeline copy, not twenty), bounded at `STAGED_UNDO_DEPTH` (20) and emptied
   with the proposal; `undo_staged()` pops one — returning its label and the proposal —
@@ -801,6 +806,34 @@
   dropped), so a span inside a silent title tail is refused (`range_past_the_sound`) rather than widened to the whole cut. At
   most `MAX_TITLE_CLIPS` (50) titles on tracks: `put_title` refuses the 51st, and the invariant net refuses an op (a split)
   that would make one.
+- **Asset tags** (`project/tags.rs`, tests in `tags_tests.rs`; the model is `core-model.md` "Asset tags"). `Asset.tags` is the
+  `assets.tags` JSON column (NULL when empty); a relink or a mark-as-360 rewrites the asset from the stored row, and importing
+  a file already in the library returns that asset (`insert_or_get_asset`), so tags survive both. `edit_asset_tags(ids, &TagEdit)
+  -> Vec<Asset>` resolves every asset and applies the edit to each before writing any (an unknown id, an invalid tag or the
+  65th tag refuses the lot), then writes in one transaction with `UPDATE assets SET tags` — no revision. As the agent with
+  review on or a proposal open it instead stages one `StagedAssetChange { id: "asset_tags:<asset id>", projection: null,
+  tag_edit: Some(edit), summary: "Tag clip.mp4: +location: Cumbuco, -jump" }` per asset. **The held change is a delta, not
+  a snapshot**: the agent's edits to the asset composed into one `TagEdit` (`TagEdit::then`: keys and removals add up, an add a
+  later edit takes off drops out), run over the asset's tags **as they are when it is read** (`TagEdit::apply_capped`) — by the
+  agent's `get_asset` / `list_assets` / `list_tags`, and at accept — so a tag the user added live in between is kept, and what
+  would take the asset past 64 tags is left off (the last adds first) rather than failing the accept. An edit that leaves the
+  agent's view as it is (same tags, same spelling, any order) stages nothing and pushes no undo step; one that brings the asset back
+  to what the library has withdraws its change. `list_tags() ->
+  TagSummary` and `list_assets_tagged(&[TagFilter])` read the agent's view. **`assemble_by_tag`** is three steps so the titles
+  are read with the lock released: `assemble_by_tag_inputs(&AssembleByTag) -> AssemblePlan` (under the lock: the agent's view
+  of the library filtered, sorted within by `imported_at` or name, grouped with `group_by_key`; no asset matching is an error),
+  `AssemblePlan::prepare() -> PreparedAssemble` (lock-free: each group's title is a `LowerThird` (overlay) or `FadeUp` (card)
+  preset rendered for the working timeline's frame and `SvgDoc::parse`d), `apply_assemble_by_tag(PreparedAssemble) ->
+  AssembleSummary` (one `edit_named` revision `Assemble by <key> (N groups, M clips)`, so ripple, the sync lock and an agent's
+  staging apply). `assemble_by_tag(req)` runs all three for a caller with no lock. Layout: the first clip starts at the end of
+  the picture track (the first unlocked video track) when the plan has any picture, else at the end of the first audio track,
+  so a long music bed on A1 does not push the picture out leaving black; a cursor then runs on across groups, so a
+  picture-and-sound asset is one clip with its own sound and a sound-only one follows on the first unlocked audio track free
+  over its span (a new `A{n}` when a bed is in the way). A **card** is a title clip of `title_seconds` placed first (on the lowest free video track, V1); an **overlay** is
+  one over `min(title_seconds, first clip)` of the group's first clip, placed after the clips so it lands on the lowest free
+  video track above them. The titles are title clips (`place`, `check_title_room`, the cap of 50 refuses the assembly whole)
+  whose preset was rendered once for its span: like custom artwork it is not retimed by a later trim. The untagged group has no
+  title. Assets with no stream, or no length, are skipped.
 - `analysis.rs` — transcription / scene / silence / rhythm are **pluggable traits**
   (`Transcriber`, `SceneDetector`, `SilenceDetector`, `RhythmAnalyzer`). Real impls
   now exist:

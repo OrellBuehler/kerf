@@ -124,6 +124,12 @@ const MIGRATIONS: &[Migration] = &[
         run: v14_to_v15,
         needed: v14_to_v15_needed,
         destructive: false,
+        needed_to_read: true,
+    },
+    Migration {
+        run: v15_to_v16,
+        needed: v15_to_v16_needed,
+        destructive: false,
         needed_to_read: false,
     },
 ];
@@ -342,16 +348,32 @@ fn v13_to_v14_needed(_: &Connection) -> bool {
     true
 }
 
-/// v15: a clip may carry a blend mode (`Clip.blend_mode`, `"blend_mode"` in the timeline JSON: `"multiply"`, `"screen"`,
+/// v15: an asset carries tags (`assets.tags`, JSON; NULL for none), and a proposal's held-back asset changes
+/// (`staged.assets`, JSON) may be a tag change (`"tags"` beside `"projection"`). An older build reads such a change as the
+/// projection change it knows and clears the asset's projection when the proposal is accepted, and its reads do not
+/// select the column. Every file an older build wrote lacks the column, so the step is needed exactly then (the file is
+/// copied aside first) and reads depend on it.
+fn v14_to_v15(conn: &Connection) -> rusqlite::Result<()> {
+    if !has_column(conn, "assets", "tags") {
+        conn.execute("ALTER TABLE assets ADD COLUMN tags TEXT", [])?;
+    }
+    Ok(())
+}
+
+fn v14_to_v15_needed(conn: &Connection) -> bool {
+    !has_column(conn, "assets", "tags")
+}
+
+/// v16: a clip may carry a blend mode (`Clip.blend_mode`, `"blend_mode"` in the timeline JSON: `"multiply"`, `"screen"`,
 /// ...). It is a new field an older build drops at its next write of the clip, and the clip then composites as plain
 /// alpha-over: a screened light leak covers the shot instead of lighting it. A clip at `normal` is written as it was, so
 /// a stored one is unchanged. Nothing in the file's tables changes; the step is the version that keeps an older build
 /// out, after the file is copied aside.
-fn v14_to_v15(_: &Connection) -> rusqlite::Result<()> {
+fn v15_to_v16(_: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-fn v14_to_v15_needed(_: &Connection) -> bool {
+fn v15_to_v16_needed(_: &Connection) -> bool {
     true
 }
 

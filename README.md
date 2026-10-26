@@ -161,12 +161,12 @@ Now ask the agent to work on the project you have open — _"skim the interview 
 the dead air, and drop in captions."_ It will claim a task, use the tools below, and hand
 back a reviewable result.
 
-### The tools (191)
+### The tools (194)
 
 <details>
 <summary><b>See / analyze</b></summary>
 
-`get_editing_guide` (how the tools fit together) · `list_assets` (`fields: "compact"` for a big library, `imported_after` for what an import added) · `import_asset` · `get_asset_metadata` · `analyze_asset` · `get_transcript` (lines with
+`get_editing_guide` (how the tools fit together) · `list_assets` (`fields: "compact"` for a big library, `imported_after` for what an import added, `tags` to filter by label) · `list_tags` (the labels in use) · `import_asset` · `get_asset_metadata` · `analyze_asset` · `get_transcript` (lines with
 their speakers; the timed words on request) · `get_cut_transcript` (what the cut says, in timeline time) · `speaker_ranges` · `find_filler_words` ·
 `search_transcripts` (where anything is said across the library, and whether the cut uses it) · `refine_transcript` ·
 `get_analysis_detail` · `get_timeline_state` · `timeline_summary` · `get_editor_context` (what the user has
@@ -189,7 +189,7 @@ the frame at full source detail. Also `get_waveform_range` · `analysis_status` 
 `remove` · `ripple_delete` · `cut_clip_range` · `duplicate_clips` · `set_clip_enabled` ·
 `add_track` · `remove_track` · `set_track_duck` · `set_track_muted` · `set_track_solo` ·
 `set_track_locked` · `add_marker` · `update_marker` · `remove_marker` · `remove_silence` ·
-`snap_to_beats` · `sync_clips_by_audio` · `smart_crop` · `extract_audio` · `concatenate` · `move_clips` · `remove_clips` ·
+`snap_to_beats` · `sync_clips_by_audio` · `smart_crop` · `extract_audio` · `concatenate` · `edit_asset_tags` (label assets, e.g. `location: Cumbuco`) · `assemble_by_tag` (a cut grouped by a label, one titled section per value) · `move_clips` · `remove_clips` ·
 `add_asset_audio` · `set_ripple_mode` · `plan_music_fit` · `fit_music` · `compose_music` (original music from a
 score, fitted to the cuts) ·
 `detach_audio` · `detach_audio_clips` · `reattach_audio` · `reattach_audio_clips` ·

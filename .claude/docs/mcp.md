@@ -721,6 +721,15 @@ the score is in the full entry and `get_asset_metadata`) and `source_missing` �
 (RFC 3339, strictly after) is how an agent finds what an import added: assets already carry `imported_at` (the column the list is ordered by, so no
 migration), the list is already oldest-import-first, and `newest_imported_at` (the whole library's, whatever the filter) is the baseline to take
 before importing and hand back afterwards; `total` and `offset` then count within the matches. A time that does not parse is `invalid_params`.
+**Tags.** `Asset.tags` shows in both views (`full` as the model's `[{key?, value}]`, `compact` as text, `location: Cumbuco` / `jump`, absent when
+none) and `tags: [TagFilter]` narrows `list_assets` (`AssetsQuery::tags`, checked up front so a bad term is `invalid_params`; applied after
+`newest_imported_at` is taken, so `total` / `offset` count within the matches like `imported_after`). `list_tags` (read-only; the agent's view, so
+its pending tags count) answers core's `TagSummary`. `edit_asset_tags { asset_ids, add?, remove?, remove_keys? }` is `edit()` around
+`Project::edit_asset_tags` (annotated `Set`: idempotent; with review on the change is a staged `asset_tags:<id>` entry that `staged_diff` lists under
+`asset_changes`, with it off it lands live; no revision either way) and answers `{assets: [{id, name, tags}]}`. `assemble_by_tag` takes core's
+`AssembleByTag` as its parameters (schema and field docs come from `kerf-core`) and is the `add_title_clip` shape: `assemble_by_tag_inputs` +
+`prepare` on the blocking pool as this session (titles drawn with the lock released), then `edit(apply_assemble_by_tag)`; one staged step, not
+batchable. Tags are objects, not `"key: value"` strings, in every argument; `edit_asset_tags`' `add` / `remove` entries refuse a member other than `key` and `value` (`TagArg`, `deny_unknown_fields`: `{"keys":…}` is `invalid_params`, not a plain tag), while the model's `Tag` stays lenient for what is stored. A staged `asset_tags:<id>` entry carries `tag_edit` (the agent's edits composed), not the list they made.
 `get_asset_metadata` and `analyze_asset` answer an `AnalysisSummary` (counts, totals,
 the first ~600 characters of the transcript); `get_transcript` and `get_analysis_detail` page the lists (`offset` / `limit`,
 `next_offset`, windows in source seconds; `get_transcript` also takes `speaker` and `words`: the lines carry their speaker label and the
@@ -751,7 +760,7 @@ Every tool, by purpose (a test pins that this list names each registered tool, a
 `### The tools (N)` heading and the site's `toolCount` in `site/hugo.toml` match the registered count — keep prose free of numbers):
 
 - **Project and library**: `project_info`, `save_project`, `save_project_as`, `open_project`, `new_project`, `list_assets`,
-  `missing_assets`, `get_asset_metadata`, `import_asset`, `set_asset_projection`, `list_fonts`.
+  `missing_assets`, `get_asset_metadata`, `import_asset`, `set_asset_projection`, `list_fonts`, `list_tags`, `edit_asset_tags`.
 - **Analysis and proxies**: `analyze_asset`, `analysis_status`, `get_transcript`, `get_cut_transcript`, `speaker_ranges`, `find_filler_words`,
   `search_transcripts`, `refine_transcript`, `get_analysis_detail`,
   `transcription_status`, `download_speech_model`, `set_speech_model`, `proxy_status`, `rebuild_proxy`, `delete_proxy`,
@@ -760,7 +769,7 @@ Every tool, by purpose (a test pins that this list names each registered tool, a
   `get_waveform`, `get_waveform_range`, `get_energy`, `get_levels`, `get_band_balance`, `platform_check`, `review_cut`.
 - **Editing the cut**: `cut_clip`, `add_clip_to_timeline`, `split_at`, `trim`, `reorder`, `move_clip`, `move_clips`,
   `ripple_delete`, `cut_clip_range`, `roll_edit`, `slip_clip`, `slide_clip`, `split_remove`, `split_remove_clips`, `remove`,
-  `remove_clips`, `duplicate_clips`, `concatenate`, `remove_silence`, `snap_to_beats`, `sync_clips_by_audio`, `smart_crop`, `add_track`,
+  `remove_clips`, `duplicate_clips`, `concatenate`, `assemble_by_tag`, `remove_silence`, `snap_to_beats`, `sync_clips_by_audio`, `smart_crop`, `add_track`,
   `remove_track`, `get_ripple_mode`, `set_ripple_mode`, `apply_edits`.
 - **Linked picture and sound**: `extract_audio`, `add_asset_audio`, `detach_audio`, `detach_audio_clips`, `reattach_audio`,
   `reattach_audio_clips`, `link_clips`, `unlink_clips`.

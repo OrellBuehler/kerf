@@ -52,6 +52,7 @@ fn asset(w: u32, h: u32) -> Asset {
         source_paths: Vec::new(),
         voiceover: None,
         music_score: None,
+        tags: Vec::new(),
     }
 }
 

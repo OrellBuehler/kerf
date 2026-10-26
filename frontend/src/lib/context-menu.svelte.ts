@@ -15,6 +15,8 @@ export type MenuItem =
 			label: string;
 			icon?: string;
 			shortcut?: string;
+			/** A muted fact on the right, in the shortcut's place (a count): not a key, so it is not drawn as one. */
+			meta?: string;
 			danger?: boolean;
 			disabled?: boolean;
 			/** Why a disabled item is disabled, said under its label — an item that cannot be

@@ -35,6 +35,8 @@ import {
 	Loader,
 	GitPullRequestArrow,
 	Check,
+	Tag,
+	Tags,
 	Crop,
 	ListPlus,
 	CornerDownLeft,
@@ -129,6 +131,9 @@ export const icons: Record<string, LucideIcon> = {
 	'loader': Loader,
 	'git-pull-request-arrow': GitPullRequestArrow,
 	'check': Check,
+	// Asset tags: a label on an asset, and the filter by it.
+	'tag': Tag,
+	'tags': Tags,
 	'crop': Crop,
 	'list-plus': ListPlus,
 	'corner-down-left': CornerDownLeft,
