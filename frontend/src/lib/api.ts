@@ -31,6 +31,7 @@ import type {
 	ClipCut,
 	ClipMove,
 	CutTranscript,
+	BlendMode,
 	Mask,
 	MissingAsset,
 	Color,
@@ -2622,6 +2623,22 @@ export async function setMask(clipId: string, mask: Mask | null): Promise<Timeli
 		return snapshot();
 	}
 	return invoke<Timeline>('set_mask', { clipId, mask });
+}
+
+/** Composite a clip onto the tracks below with a blend mode (`normal` is plain compositing). Only a clip on a
+ *  video track has a picture to blend (`Project::set_blend_mode`). */
+export async function setBlendMode(clipId: string, mode: BlendMode): Promise<Timeline> {
+	if (!inTauri()) {
+		const found = locate(devTimeline, clipId);
+		if (!found) throw new Error(`clip not found: ${clipId}`);
+		if (found[0].kind !== 'video') throw new Error('invalid argument: a blend mode applies to a clip on a video track');
+		const clip = found[0].clips[found[1]];
+		if (mode === 'normal') delete clip.blend_mode;
+		else clip.blend_mode = mode;
+		recordDev('Set blend mode');
+		return snapshot();
+	}
+	return invoke<Timeline>('set_blend_mode', { clipId, mode });
 }
 
 /** Replace a clip's curves, colour wheels and LUT. The backend checks a LUT file before it is set. */
