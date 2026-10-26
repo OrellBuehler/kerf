@@ -9,7 +9,17 @@
 	import Readiness from './Readiness.svelte';
 	import { editor } from '#lib/state.svelte';
 	import { ui } from '#lib/editor-ui.svelte';
-	import { confirmAction, inTauri, pathsExist, pickExportPath, hwEncoders, knownHwEncoders, revealPath } from '#lib/api';
+	import {
+		clipStabilizationStatus,
+		confirmAction,
+		inTauri,
+		pathsExist,
+		pickExportPath,
+		hwEncoders,
+		knownHwEncoders,
+		revealPath
+	} from '#lib/api';
+	import { unsteadyNote } from '#lib/stabilize';
 	import { overwriteCopy } from '#lib/confirm-copy';
 	import { exportTargets, filesToReplace } from '#lib/export-overwrite';
 	import { progressLine } from '#lib/export-progress';
@@ -150,6 +160,22 @@
 	const summary = $derived(buildSummary(opts, hasVideo, hasAudio));
 	const command = $derived(buildCommandPreview(opts, hasVideo, hasAudio, outputPath || undefined));
 	const showVideo = $derived(!info.audioOnly && hasVideo);
+	/** The stabilized clips that will export as shot (never measured, or measuring failed): said, not refused. */
+	let unsteady = $state<string | null>(null);
+	$effect(() => {
+		void editor.timeline;
+		let live = true;
+		clipStabilizationStatus()
+			.then((statuses) => {
+				if (live) unsteady = unsteadyNote(statuses);
+			})
+			.catch(() => {
+				if (live) unsteady = null;
+			});
+		return () => {
+			live = false;
+		};
+	});
 	const judged = $derived(judgeable(opts, editor.timeline));
 	// Shapes only mean something for a picture: an audio-only render ignores
 	// whatever the Deliver panel had ticked.
@@ -508,6 +534,9 @@
 		<!-- the platform check: a video export's only (not audio, a GIF or an empty cut), per file when several are written -->
 		{#if judged}
 			<Readiness frame={opts.resolution ?? null} range={useRange ? marks : null} />
+		{/if}
+		{#if showVideo && unsteady}
+			<p role="status" style="margin:8px 0 0;font-size:12px;line-height:1.5;color:var(--warning)">{unsteady}</p>
 		{/if}
 
 		<details bind:open={showAdvanced} style="margin-top:12px;border-top:var(--line-width) solid var(--border-default)">

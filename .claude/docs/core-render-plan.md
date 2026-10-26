@@ -50,7 +50,9 @@
   edge the caption was cut short at — and speech the default captions would cover now with no caption near it, in
   runs of `UNCAPTIONED_MIN_WORDS`, is footage added after captioning; one issue each; **`black_gap`** no visible clip
   on any video track (more than half a frame, not under a typed title or SVG title): a warning inside, a tip
-  after the last picture while sound runs on. The same kind at the same moment in the same footage (a picture and
+  after the last picture while sound runs on; **`unstabilized`** a stabilized clip that plays and exports as shot (its
+  status from `ReviewInputs.stabilization`, read from the analysis cache when the review runs: `missing`, `queued`,
+  `analyzing`, `failed` or `unsupported`), a warning over the clip naming `stabilize_clip`. The same kind at the same moment in the same footage (a picture and
   its sound doubled, a linked pair) merges into one issue naming every clip. Tests in `review.rs`.
 - `render_plan.rs` + `planner.rs` + `plan_caps.rs` — **what one frame is made of**,
   shared by every renderer. `RenderPlan::at(timeline, assets, opts, t, color)` is the

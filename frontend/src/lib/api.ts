@@ -5434,7 +5434,15 @@ export async function reviewCut(
 	checks?: ReviewCheck[] | null
 ): Promise<CutReview> {
 	if (!inTauri()) {
-		const all: ReviewCheck[] = ['flash_frame', 'mid_word_cut', 'hard_audio_cut', 'jump_cut', 'stale_captions', 'black_gap'];
+		const all: ReviewCheck[] = [
+			'flash_frame',
+			'mid_word_cut',
+			'hard_audio_cut',
+			'jump_cut',
+			'stale_captions',
+			'black_gap',
+			'unstabilized'
+		];
 		return {
 			issues: [],
 			counts_by_kind: {},

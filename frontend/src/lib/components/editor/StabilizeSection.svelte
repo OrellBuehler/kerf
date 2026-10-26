@@ -15,7 +15,16 @@
 	import { isCancelled, report } from '#lib/ops';
 	import { analyzeClipStabilization, cancelStabilization, clipStabilizationStatus, onStabilizeProgress } from '#lib/api';
 	import { PERCENT } from '#lib/slider-row';
-	import { canStabilize, DEFAULT_STABILIZE, stabilizeSummary, statusDetail, statusLabel, wantsAnalysis } from '#lib/stabilize';
+	import {
+		canStabilize,
+		DEFAULT_STABILIZE,
+		forgetStopped,
+		noteStopped,
+		stabilizeSummary,
+		statusDetail,
+		statusLabel,
+		wantsAnalysis
+	} from '#lib/stabilize';
 	import { MAX_STABILIZE_ZOOM } from '#lib/types';
 	import type { Asset, Clip, Stabilize, StabilizeStatus, Track } from '#lib/types';
 
@@ -62,9 +71,17 @@
 			if (s.state === 'ready' && status?.state !== 'ready') ui.refreshPreview();
 			if (id === clip.id) status = s;
 		} catch (e) {
-			if (!isCancelled(e)) report(e);
+			// A stopped analysis stays stopped: the panel does not start it again when the clip is trimmed or reselected.
+			if (isCancelled(e)) noteStopped(id);
+			else report(e);
 			await refresh(id);
 		}
+	}
+
+	/** The Analyze button: the user asks again, a stop before included. */
+	function analyzeAgain(id: string) {
+		forgetStopped(id);
+		void analyze(id);
 	}
 
 	// Where the clip stands, asked whenever what decides it changes: the clip, its setting, its window.
@@ -80,7 +97,7 @@
 			.then(([s]) => {
 				if (!live) return;
 				status = s ?? null;
-				if (s && wantsAnalysis(s) && !asked.has(key)) {
+				if (s && wantsAnalysis(s, id) && !asked.has(key)) {
 					asked.add(key);
 					void analyze(id);
 				}
@@ -152,9 +169,12 @@
 			<div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin:6px 0 4px">
 				<Badge tone={label.tone} dot={running}>{label.text}</Badge>
 				{#if running}
-					<Btn size="sm" variant="secondary" title={'Stop measuring the camera'} onclick={() => void cancelStabilization()}>Stop</Btn>
+					<Btn size="sm" variant="secondary" title={'Stop measuring the camera'} onclick={() => {
+						noteStopped(clip.id);
+						void cancelStabilization();
+					}}>Stop</Btn>
 				{:else if status?.state === 'missing' || status?.state === 'failed'}
-					<Btn size="sm" variant="secondary" pending={editor.locked} title={"Measure this clip's camera"} onclick={() => void analyze(clip.id)}
+					<Btn size="sm" variant="secondary" pending={editor.locked} title={"Measure this clip's camera"} onclick={() => analyzeAgain(clip.id)}
 						>Analyze</Btn
 					>
 				{/if}

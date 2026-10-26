@@ -566,7 +566,7 @@ async fn remove_asset(state: State<'_, AppState>, asset_id: String, force: Optio
         };
         // The disk, with the lock released: the proxies (and any build of them) and the waveform.
         kerf_core::proxy::delete(&removed.asset);
-        Project::forget_media_caches(std::path::Path::new(&removed.asset.path));
+        Project::forget_removed_caches(&removed);
         Ok(AssetRemoval { removed, timeline })
     })
     .await
@@ -605,9 +605,7 @@ async fn relink_asset(app: AppHandle, state: State<'_, AppState>, asset_id: Stri
             require_generation(&project, generation, "relinking")?;
             project.apply_relink_probed(asset_id, &probe).map_err(|e| e.to_string())?
         };
-        if relinked.previous_path != relinked.asset.path {
-            Project::forget_media_caches(std::path::Path::new(&relinked.previous_path));
-        }
+        Project::forget_relinked_caches(&relinked);
         // Frames drawn from the old file are of no use, and the new one wants its proxy.
         scrub.clear();
         spawn_proxy(&app, &relinked.asset);

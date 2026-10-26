@@ -574,13 +574,17 @@ struct StabilizeParams {
     #[schemars(description = "false stops stabilizing the clip (default true)")]
     enabled: Option<bool>,
     #[schemars(
-        description = "How much of the camera's movement is smoothed away, 0 to 1 (default 0.5): the radius of the smoothing of the camera's path, up to a second of frames either side. 0.3 keeps a deliberate walk's sway, 0.5 makes a hand-held walk steady, 1 holds a slow pan nearly still."
+        description = "How much of the camera's movement is smoothed away, 0 to 1: the radius of the smoothing of the camera's path, up to a second of frames either side. 0.3 keeps a deliberate walk's sway, 0.5 makes a hand-held walk steady, 1 holds a slow pan nearly still. Omitted keeps the clip's current strength (0.5 for a clip not yet stabilized)."
     )]
     strength: Option<f64>,
     #[schemars(
-        description = "Enlarge the picture by this many percent (0 to 30) to hide the edges the correction moves into view. Omitted is automatic: the least zoom that keeps them out of the clip's frames. A fixed small zoom keeps more of the frame but may show black at the edges on a strong shake."
+        description = "Enlarge the picture by this many percent (0 to 30) to hide the edges the correction moves into view. A fixed small zoom keeps more of the frame but may show black at the edges on a strong shake. Omitted keeps the clip's current zoom (automatic for a clip not yet stabilized); auto_zoom: true goes back to automatic."
     )]
     zoom: Option<f64>,
+    #[schemars(
+        description = "true goes back to the automatic zoom: the least that keeps the moved edges out of view over the measured footage. Not with zoom."
+    )]
+    auto_zoom: Option<bool>,
     #[schemars(
         description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result (or subscribe to kerf://jobs/{job_id}), stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
     )]
@@ -5203,15 +5207,32 @@ impl KerfMcp {
         context: RequestContext<RoleServer>,
     ) -> Result<String, McpError> {
         let clip_id = parse_arg("clip_id", &p.clip_id)?;
+        let auto_zoom = p.auto_zoom.unwrap_or(false);
+        if auto_zoom && p.zoom.is_some() {
+            return Err(McpError::invalid_params("give zoom or auto_zoom: true, not both", None));
+        }
+        // What is not named keeps what the clip has: a call that only changes the strength keeps a fixed zoom.
+        let current = lock_agent_as(&self.project, self.owner().as_deref())
+            .working_timeline()
+            .map_err(core_err)?
+            .clip(clip_id)
+            .ok_or_else(|| core_err(kerf_core::Error::ClipNotFound(clip_id)))?
+            .stabilize;
         let setting = p.enabled.unwrap_or(true).then(|| Stabilize {
-            strength: p.strength.unwrap_or(0.5),
-            zoom: p.zoom,
+            strength: p.strength.or(current.map(|c| c.strength)).unwrap_or(0.5),
+            zoom: if auto_zoom {
+                None
+            } else {
+                p.zoom.or(current.and_then(|c| c.zoom))
+            },
         });
         // The setting is the edit, checked here: a bad number or a clip that cannot be steadied is an
-        // error on the call, not a job that fails a moment later.
-        let clip = self.edit(|project| project.set_clip_stabilize(clip_id, setting).map_err(core_err))?;
+        // error on the call, not a job that fails a moment later. The setting it has already is none.
+        if setting != current {
+            self.edit(|project| project.set_clip_stabilize(clip_id, setting).map_err(core_err))?;
+        }
         if setting.is_none() {
-            return json(&serde_json::json!({ "clip_id": clip.id, "stabilize": null, "status": StabilizeStatus::Off }));
+            return json(&serde_json::json!({ "clip_id": clip_id, "stabilize": null, "status": StabilizeStatus::Off }));
         }
         let (me, owner) = (self.clone(), self.owner());
         // The GUI's Stop on a stabilization analysis ends an agent's too (`begin_stabilize`).
@@ -5833,7 +5854,8 @@ impl KerfMcp {
                        loudness_range_lu, peak_dbfs: the file's own, after the lossy encode), with the `target` of \
                        `options.loudness` and `true_peak_over_db` when the true peak is over that target's ceiling. A \
                        measurement that fails (or is stopped by cancel) says why in `report.problem` and does not fail \
-                       the export."
+                       the export. `warnings` (when there are any) names each stabilized clip that exported as shot, \
+                       its camera never measured or the measuring failed (stabilize_clip measures it)."
     )]
     async fn export(
         &self,
@@ -5862,13 +5884,24 @@ impl KerfMcp {
                 // Snapshot the timeline + assets under the lock, then render with the
                 // lock released so a long export doesn't freeze the GUI (or block other
                 // agent tools) for its whole duration.
-                let (timeline, assets) = {
+                let (timeline, assets, steady) = {
                     let project = lock_agent_as(&project, owner.as_deref());
                     (
                         project.working_timeline().map_err(core_err)?,
                         project.list_assets().map_err(core_err)?,
+                        project.stabilization_status_inputs(None).map_err(core_err)?,
                     )
                 };
+                // A stabilized clip whose camera was never measured exports as shot: not a reason to
+                // refuse the export, but said in its answer (read with the lock released).
+                let warnings: Vec<String> = kerf_core::unsteady_clips(
+                    &timeline,
+                    &Project::stabilization_statuses(&steady),
+                    timeline.export_span(opts.range.map(|r| (r.start, r.end))),
+                )
+                .iter()
+                .map(kerf_core::Unsteady::message)
+                .collect();
                 let mut on_progress = |progress: kerf_core::ExportProgress| {
                     run.progress(Some(progress.fraction), export_message(&progress));
                 };
@@ -5893,14 +5926,18 @@ impl KerfMcp {
                     // anyone is still holding its handle.
                     kerf_core::discard_partial(&output, before);
                 }
-                Ok((status, output, frame, report))
+                Ok((status, output, frame, report, warnings))
             })
             .await?;
             match status {
-                (kerf_core::RenderStatus::Completed, output, frame, report) => {
-                    json(&with_frame(serde_json::json!({ "output": output, "report": report }), frame))
+                (kerf_core::RenderStatus::Completed, output, frame, report, warnings) => {
+                    let mut answer = serde_json::json!({ "output": output, "report": report });
+                    if !warnings.is_empty() {
+                        answer["warnings"] = serde_json::json!(warnings);
+                    }
+                    json(&with_frame(answer, frame))
                 }
-                (kerf_core::RenderStatus::Cancelled, output, _, _) => Err(McpError::internal_error(
+                (kerf_core::RenderStatus::Cancelled, output, ..) => Err(McpError::internal_error(
                     format!("export cancelled; the partial file at {} was removed", output.display()),
                     None,
                 )),
@@ -6114,7 +6151,8 @@ impl KerfMcp {
                        word; needs a transcript), hard_audio_cut (sound meeting sound with no fade or crossfade, a likely \
                        click; needs silence analysis), jump_cut (the same shot resuming a moment later; a tip, it can be \
                        deliberate), stale_captions (generated captions no longer over the words spoken, or speech left \
-                       uncaptioned, after a later edit) and black_gap (no picture while the cut plays). Reads the cut you \
+                       uncaptioned, after a later edit), black_gap (no picture while the cut plays) and unstabilized (a \
+                       stabilized clip whose camera was never measured, or whose measuring failed: it exports as shot). Reads the cut you \
                        are building and the cached analysis; answers {issues: [{kind, severity, time, end?, clip_ids, \
                        message, fix}], counts_by_kind, checked, skipped: [{check, reason}]}, each `fix` naming the tools \
                        that address it. A picture and its linked sound report once. Run it with platform_check before \
@@ -10369,7 +10407,7 @@ mod tests {
         let tool = |name: &str| tools.iter().find(|t| t.name == name).unwrap_or_else(|| panic!("{name}"));
         let stabilize = tool("stabilize_clip");
         assert_eq!(stabilize.input_schema["required"], serde_json::json!(["clip_id"]));
-        for arg in ["enabled", "strength", "zoom", "background"] {
+        for arg in ["enabled", "strength", "zoom", "auto_zoom", "background"] {
             assert!(stabilize.input_schema["properties"].get(arg).is_some(), "{arg}");
         }
         let hints = stabilize.annotations.as_ref().unwrap();

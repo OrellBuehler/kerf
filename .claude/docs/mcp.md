@@ -224,15 +224,19 @@ timeline JSON, so `format.fps`. **`export` reports the frame it wrote**: `{outpu
 `delivery` / `footage`; an audio-only render has no picture and none of the four), and each `export_variants`
 output has the `width` / `height` / `fps` / `fps_source` of that file (`variant_frame`: `for_delivery` keeps the project's
 rate, `options.resolution` and `fit` are the variant's) beside `format`.
-`stabilize_clip { clip_id, enabled?, strength?, zoom?, background? }` (a long tool, `Set` in the `clips` set) is the edit
-first — `Project::set_clip_stabilize` through `edit()`, so it stages and a bad number or a clip that cannot be steadied (a
+`stabilize_clip { clip_id, enabled?, strength?, zoom?, auto_zoom?, background? }` (a long tool, `Set` in the `clips` set) is
+the edit first — what is not named keeps the clip's current value (a strength-only call keeps a fixed zoom; `auto_zoom: true`
+goes back to automatic, not with `zoom`), and a setting equal to the clip's is no edit (no `edit()`, no proposal opened);
+otherwise `Project::set_clip_stabilize` through `edit()`, so it stages and a bad number or a clip that cannot be steadied (a
 still, a title, a clip of sound, 360) is an error on the call — then the analysis: `stabilize_inputs` under `lock_agent_as`
 (the proposal's clip), `Project::analyze_stabilization` on the blocking pool with the lock released (stopped by the
 request, `cancel_job`, the GUI's Stop through `begin_stabilize`, or a replaced project), the status read back; it answers
 `{clip_id, stabilize, status}` (`enabled: false` answers at once with `off`, no analysis). `stabilization_status
 { clip_ids? }` (`Read`) is `stabilization_status_inputs` under the lock and `stabilization_statuses` off it: `off`,
 `unsupported`, `basic` (deshake, no vid.stab), `missing`, `queued`, `analyzing`, `failed`, `ready`. `get_timeline_state` shows
-the setting as the clip's `stabilize`.
+the setting as the clip's `stabilize`. `export` answers `warnings` (one line per stabilized clip in the exported span that
+exported as shot, `unsteady_clips` read with the lock released) when there are any, and `review_cut` has an `unstabilized`
+check.
 `smart_crop` frames each shot for the delivery frame (the server `instructions`
 pair it with `set_delivery_format`, since reshaping to 9:16 otherwise keeps
 whatever was in the middle). `export_variants` is the one-call multi-format
@@ -462,7 +466,7 @@ the thumbnails without their sources.
 `review_cut { range?, checks? }` is the other half of that step (the guide and `INSTRUCTIONS` name both): read-only,
 `Project::review_inputs` under `lock_agent_as` on `blocking`, the pure `kerf_core::review::review` after the lock is
 released (`core-render-plan.md`). `checks` are names (`flash_frame`, `mid_word_cut`, `hard_audio_cut`, `jump_cut`,
-`stale_captions`, `black_gap`; omitted or empty = all, an unknown one `invalid_params` listing them); the answer is
+`stale_captions`, `black_gap`, `unstabilized`; omitted or empty = all, an unknown one `invalid_params` listing them); the answer is
 compact `{issues: [{kind, severity, time, end?, clip_ids, message, fix}], counts_by_kind, checked, skipped: [{check,
 reason}]}` — a check whose analysis is missing (no transcript, no silence analysis, captions from elsewhere) is
 skipped with the reason and the `analyze_asset` step to run, never guessed.

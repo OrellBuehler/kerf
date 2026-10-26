@@ -41,7 +41,7 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::model::{Clip, Stabilize, MAX_STABILIZE_ZOOM};
+use crate::model::{Clip, Stabilize, Timeline, MAX_STABILIZE_ZOOM};
 
 /// The shape of a stored analysis; one of another number is analysed again.
 pub const ANALYSIS_VERSION: u32 = 1;
@@ -270,11 +270,16 @@ pub(crate) fn analysis_for(asset_id: Uuid, original: Option<&Path>, start: f64, 
         .find(|a| stamp.is_some() || *stamps.entry(a.source.clone()).or_insert_with(|| stamp_holds(&a.source)))
 }
 
-/// Whether the file a [`MotionAnalysis::source`] stamp names is still that file (its size and time).
-fn stamp_holds(stamp: &str) -> bool {
+/// The file a [`MotionAnalysis::source`] stamp (`path|len|mtime`) names.
+fn stamp_path(stamp: &str) -> Option<PathBuf> {
     let mut parts = stamp.rsplitn(3, '|');
     let (_, _, path) = (parts.next(), parts.next(), parts.next());
-    path.is_some_and(|p| crate::engine::source_key(Path::new(p)) == stamp)
+    path.map(PathBuf::from)
+}
+
+/// Whether the file a [`MotionAnalysis::source`] stamp names is still that file (its size and time).
+fn stamp_holds(stamp: &str) -> bool {
+    stamp_path(stamp).is_some_and(|p| crate::engine::source_key(&p) == stamp)
 }
 
 /// The vid.stab [`Slice`] a chain reading `clip` over the source `window` uses, or `None` when the
@@ -334,8 +339,12 @@ fn slice_file(asset_id: Uuid, fixes: &[[f64; 3]], sx: f64, sy: f64, span: (usize
     let _ = (asset_id, span);
     static PRUNED: std::sync::Once = std::sync::Once::new();
     PRUNED.call_once(|| {
-        if let Some(dir) = slices_dir() {
-            prune_slices(&dir, SystemTime::now());
+        // On a thread of its own: it stats the originals the analyses name, which a share that went
+        // away can take long to answer, and a graph waits on this call.
+        if let Some(root) = root_dir() {
+            let _ = std::thread::Builder::new()
+                .name("kerf-stabilize-prune".into())
+                .spawn(move || prune(&root, SystemTime::now()));
         }
     });
     let text = transforms_text(fixes, sx, sy);
@@ -360,11 +369,13 @@ fn slices_dir() -> Option<PathBuf> {
 }
 
 /// A directory the detect passes work in (their files have plain names, so no path is escaped
-/// into a filter): made fresh, removed by the caller.
+/// into a filter): made fresh — one a dead run of the same process id left is emptied first, so no
+/// stale `motions.trf` is read — and removed by the caller.
 pub(crate) fn work_dir() -> Option<PathBuf> {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = root_dir()?.join("work").join(format!("{}-{seq}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir)
 }
@@ -418,18 +429,70 @@ fn read_cached(path: &Path) -> Option<(SystemTime, Arc<MotionAnalysis>)> {
 /// A slice unused for this long is deleted on the first lookup of a run.
 const SLICE_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 60 * 60);
 
+/// A working directory older than this was left by a run that died.
+const WORK_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+/// An analysis of a file that is not there (a drive unplugged, a share gone) is kept this long.
+const ORPHAN_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(90 * 24 * 60 * 60);
+
+fn age(path: &Path, now: SystemTime) -> Option<std::time::Duration> {
+    let modified = std::fs::metadata(path).ok()?.modified().ok()?;
+    now.duration_since(modified).ok()
+}
+
+/// What the first lookup of a run tidies under `root`: slices unused for a week, working directories a
+/// dead run left, and analyses that no longer belong to their file (another version's, unreadable, of a
+/// file since replaced, or of one that has been missing for months).
+fn prune(root: &Path, now: SystemTime) {
+    prune_slices(&root.join("slices"), now);
+    for entry in std::fs::read_dir(root.join("work")).into_iter().flatten().flatten() {
+        if age(&entry.path(), now).is_some_and(|a| a > WORK_MAX_AGE) {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
+    for dir in std::fs::read_dir(root).into_iter().flatten().flatten() {
+        let dir = dir.path();
+        let named = dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| Uuid::parse_str(n).is_ok());
+        if !named || !dir.is_dir() {
+            continue;
+        }
+        prune_analyses(&dir, now);
+        let _ = std::fs::remove_dir(&dir);
+    }
+}
+
+/// [`prune`] for one asset's analyses.
+fn prune_analyses(dir: &Path, now: SystemTime) {
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let analysis = std::fs::read(&path)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<MotionAnalysis>(&b).ok())
+            .filter(MotionAnalysis::is_sound);
+        let stale = match analysis {
+            None => true,
+            Some(a) => match stamp_path(&a.source) {
+                Some(original) if original.exists() => !stamp_holds(&a.source),
+                _ => age(&path, now).is_some_and(|a| a > ORPHAN_MAX_AGE),
+            },
+        };
+        if stale {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
 fn prune_slices(dir: &Path, now: SystemTime) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
-        let old = entry
-            .metadata()
-            .ok()
-            .and_then(|m| m.modified().ok())
-            .and_then(|m| now.duration_since(m).ok())
-            .is_some_and(|age| age > SLICE_MAX_AGE);
-        if old {
+        if age(&entry.path(), now).is_some_and(|age| age > SLICE_MAX_AGE) {
             let _ = std::fs::remove_file(entry.path());
         }
     }
@@ -457,6 +520,63 @@ pub enum StabilizeStatus {
     Failed { reason: String },
     /// It is analysed: the preview and the export move every frame.
     Ready,
+}
+
+impl StabilizeStatus {
+    /// Why a stabilized clip in this state plays and exports as shot, or `None` when it is steadied
+    /// (`ready`, `basic`) or not meant to be (`off`).
+    pub fn unsteady_reason(&self) -> Option<String> {
+        match self {
+            StabilizeStatus::Off | StabilizeStatus::Basic | StabilizeStatus::Ready => None,
+            StabilizeStatus::Missing => Some("its camera has not been measured (or it was trimmed past what was)".into()),
+            StabilizeStatus::Queued | StabilizeStatus::Analyzing { .. } => Some("its camera is still being measured".into()),
+            StabilizeStatus::Failed { reason } => Some(format!("measuring its camera failed: {reason}")),
+            StabilizeStatus::Unsupported { reason } => Some(format!("it cannot be stabilized: {reason}")),
+        }
+    }
+}
+
+/// A stabilized clip of a cut that will play and export as shot: where it is and why.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct Unsteady {
+    pub clip_id: Uuid,
+    /// Timeline seconds the clip spans.
+    pub start: f64,
+    pub end: f64,
+    pub reason: String,
+}
+
+impl Unsteady {
+    /// The line an export or a review says about it.
+    pub fn message(&self) -> String {
+        format!(
+            "a stabilized clip at {:.2}s exports as shot: {} (stabilize_clip measures it)",
+            self.start, self.reason
+        )
+    }
+}
+
+/// The stabilized clips of `timeline` as it renders (muted tracks, disabled clips left out) that will
+/// play as shot, from their `statuses`, those that meet `span` (timeline seconds) when one is given.
+pub fn unsteady_clips(timeline: &Timeline, statuses: &[ClipStabilizeStatus], span: Option<(f64, f64)>) -> Vec<Unsteady> {
+    let rendered = timeline.for_render();
+    let mut out: Vec<Unsteady> = rendered
+        .tracks
+        .iter()
+        .flat_map(|t| &t.clips)
+        .filter_map(|clip| {
+            let reason = statuses.iter().find(|s| s.clip_id == clip.id)?.status.unsteady_reason()?;
+            let (start, end) = (clip.timeline_start, clip.timeline_end());
+            span.is_none_or(|(from, to)| end > from && start < to).then_some(Unsteady {
+                clip_id: clip.id,
+                start,
+                end,
+                reason,
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| a.start.total_cmp(&b.start));
+    out
 }
 
 /// One clip's [`StabilizeStatus`].
@@ -743,6 +863,42 @@ mod tests {
     }
 
     #[test]
+    fn pruning_drops_analyses_of_a_replaced_file_and_keeps_those_of_a_missing_one() {
+        let root = std::env::temp_dir().join(format!("kerf-stabilize-prune-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let asset = root.join(Uuid::from_u128(3).to_string());
+        std::fs::create_dir_all(&asset).unwrap();
+        std::fs::create_dir_all(root.join("work").join("1-0")).unwrap();
+        let media = root.join("clip.mp4");
+        std::fs::write(&media, b"one").unwrap();
+        let mut held = analysis();
+        held.source = crate::engine::source_key(&media);
+        let mut replaced = held.clone();
+        replaced.source = format!("{}|1|2", media.display());
+        let mut missing = held.clone();
+        missing.source = format!("{}|1|2", root.join("gone.mp4").display());
+        for (name, a) in [("held", &held), ("replaced", &replaced), ("missing", &missing)] {
+            std::fs::write(asset.join(format!("{name}.json")), serde_json::to_vec(a).unwrap()).unwrap();
+        }
+        std::fs::write(asset.join("garbage.json"), b"{").unwrap();
+        prune(&root, SystemTime::now());
+        let mut left: Vec<String> = std::fs::read_dir(&asset)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["held.json", "missing.json"]);
+        assert!(root.join("work").join("1-0").exists(), "a run may still be working in it");
+        // A day on, the working directory a dead run left is gone; months on, the missing file's analysis.
+        let later = SystemTime::now() + ORPHAN_MAX_AGE + std::time::Duration::from_secs(60);
+        prune(&root, later);
+        assert!(!root.join("work").join("1-0").exists());
+        assert!(asset.join("held.json").exists() && !asset.join("missing.json").exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn a_stamp_holds_while_the_file_it_names_is_unchanged() {
         let dir = std::env::temp_dir().join(format!("kerf-stamp-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
@@ -773,6 +929,40 @@ mod tests {
         );
         job_ended(clip, None);
         assert_eq!(job_status(clip), None);
+    }
+
+    #[test]
+    fn a_clip_that_will_play_as_shot_is_named_with_why_and_a_steadied_one_is_not() {
+        use crate::model::{StreamKind, Track};
+        let mut timeline = Timeline::default();
+        let mut track = Track::new(StreamKind::Video, "V9");
+        let (a, b, c) = (
+            Clip::new(Uuid::from_u128(1), 0.0, 2.0, 0.0),
+            Clip::new(Uuid::from_u128(1), 0.0, 2.0, 2.0),
+            Clip::new(Uuid::from_u128(1), 0.0, 2.0, 4.0),
+        );
+        track.clips = vec![a.clone(), b.clone(), c.clone()];
+        timeline.tracks.push(track);
+        let status = |clip: &Clip, status| ClipStabilizeStatus {
+            clip_id: clip.id,
+            status,
+        };
+        let statuses = [
+            status(&a, StabilizeStatus::Missing),
+            status(&b, StabilizeStatus::Ready),
+            status(
+                &c,
+                StabilizeStatus::Failed {
+                    reason: "no picture".into(),
+                },
+            ),
+        ];
+        let found = unsteady_clips(&timeline, &statuses, None);
+        assert_eq!(found.iter().map(|u| u.clip_id).collect::<Vec<_>>(), [a.id, c.id]);
+        assert!(found[1].message().contains("no picture") && found[1].message().contains("stabilize_clip"));
+        assert_eq!(unsteady_clips(&timeline, &statuses, Some((1.0, 3.0))).len(), 1);
+        assert!(StabilizeStatus::Basic.unsteady_reason().is_none());
+        assert!(StabilizeStatus::Queued.unsteady_reason().is_some());
     }
 
     #[test]

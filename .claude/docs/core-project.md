@@ -834,7 +834,8 @@
   whose preset was rendered once for its span: like custom artwork it is not retimed by a later trim. The untagged group has no
   title. Assets with no stream, or no length, are skipped.
 - **Stabilization** (`project/stabilize.rs`; the design is `crate::stabilize`, `engine-cli.md`). `set_clip_stabilize(clip,
-  Option<Stabilize>)` is one `Stabilize clip` / `Stop stabilizing clip` revision through `edit_timeline` (so it stages); the
+  Option<Stabilize>)` is one `Stabilize clip` / `Stop stabilizing clip` revision through `edit_timeline` (so it stages; the
+  setting the clip already has is no revision); the
   setting is `check`ed, and a clip on an audio track, a title, a still, a clip with no picture and 360 footage (a spherical
   asset or a reframed clip) are refused with why (`why_not_stabilized`); a locked track does not refuse it (a look). The
   analysis is the heavy-op split without an apply: `stabilize_inputs(clip)` under the lock (the working timeline's clip, its
@@ -844,7 +845,8 @@
   background lane and `stabilize::store`), so a trim or split inside the window needs no new analysis.
   `stabilization_status_inputs(ids?)` (the named clips, else every stabilized one) → static `stabilization_statuses`: `off`,
   `unsupported`, `basic` (no vid.stab: `deshake`), then this session's job (`queued`, `analyzing`), else `ready` when a stored
-  analysis of the original covers `source_in..source_out`, else the job's `failed`, else `missing`.
+  analysis of the original covers `source_in..source_out`, else the job's `failed`, else `missing`. `review_inputs` carries
+  `stabilization_status_inputs(None)`, and `review`'s `unstabilized` check reads the statuses with the lock released.
 - `analysis.rs` — transcription / scene / silence / rhythm are **pluggable traits**
   (`Transcriber`, `SceneDetector`, `SilenceDetector`, `RhythmAnalyzer`). Real impls
   now exist:

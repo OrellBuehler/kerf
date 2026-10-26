@@ -73,11 +73,11 @@ impl Project {
     /// with why. Like the rest of a clip's look it may change on a locked track. The analysis is the
     /// caller's to start ([`Project::stabilize_inputs`]); until it lands the clip plays as shot.
     pub fn set_clip_stabilize(&self, clip_id: Uuid, stabilize: Option<Stabilize>) -> Result<Clip> {
+        let timeline = self.working_timeline()?;
+        let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
+        let clip = &timeline.tracks[ti].clips[ci];
         if let Some(s) = &stabilize {
             s.check()?;
-            let timeline = self.working_timeline()?;
-            let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
-            let clip = &timeline.tracks[ti].clips[ci];
             let asset = if clip.is_generated() {
                 None
             } else {
@@ -86,6 +86,10 @@ impl Project {
             if let Some(why) = why_not_stabilized(clip, timeline.tracks[ti].kind, asset.as_ref()) {
                 return Err(Error::InvalidArgument(format!("cannot stabilize this clip: {why}")));
             }
+        }
+        // The setting it has already is no edit: no revision, and nothing for an agent to stage.
+        if clip.stabilize == stabilize {
+            return Ok(clip.clone());
         }
         let label = if stabilize.is_some() {
             "Stabilize clip"
@@ -297,9 +301,14 @@ mod tests {
         let history = project.history().unwrap();
         assert_eq!(history.len(), before + 1);
         assert_eq!(history.last().unwrap().label, "Stabilize clip");
+        // The same setting again is no revision.
+        project.set_clip_stabilize(clip, Some(Stabilize::default())).unwrap();
+        assert_eq!(project.history().unwrap().len(), before + 1);
         let off = project.set_clip_stabilize(clip, None).unwrap();
         assert_eq!(off.stabilize, None);
         assert_eq!(project.history().unwrap().last().unwrap().label, "Stop stabilizing clip");
+        project.set_clip_stabilize(clip, None).unwrap();
+        assert_eq!(project.history().unwrap().len(), before + 2);
     }
 
     #[test]

@@ -1,5 +1,15 @@
 import { describe, expect, test } from 'bun:test';
-import { canStabilize, DEFAULT_STABILIZE, stabilizeSummary, statusDetail, statusLabel, wantsAnalysis } from './stabilize';
+import {
+	canStabilize,
+	DEFAULT_STABILIZE,
+	forgetStopped,
+	noteStopped,
+	stabilizeSummary,
+	statusDetail,
+	statusLabel,
+	unsteadyNote,
+	wantsAnalysis
+} from './stabilize';
 import type { Asset, Clip, StabilizeStatus, Track } from './types';
 
 const clip = (patch: Partial<Clip> = {}): Clip => ({
@@ -58,6 +68,29 @@ describe('stabilization in the inspector', () => {
 		];
 		for (const [status, wanted] of states) expect(wantsAnalysis(status)).toBe(wanted);
 		expect(wantsAnalysis(null)).toBe(false);
+	});
+
+	test('an analysis the user stopped is not started again until they ask for it', () => {
+		const missing: StabilizeStatus = { state: 'missing' };
+		expect(wantsAnalysis(missing, 'k')).toBe(true);
+		noteStopped('k');
+		expect(wantsAnalysis(missing, 'k')).toBe(false);
+		expect(wantsAnalysis(missing, 'other')).toBe(true);
+		forgetStopped('k');
+		expect(wantsAnalysis(missing, 'k')).toBe(true);
+	});
+
+	test('the export dialog names the stabilized clips that will export as shot', () => {
+		expect(unsteadyNote([])).toBeNull();
+		expect(unsteadyNote([{ clip_id: 'a', state: 'ready' }, { clip_id: 'b', state: 'basic' }])).toBeNull();
+		expect(unsteadyNote([{ clip_id: 'a', state: 'missing' }])).toContain('1 stabilized clip exports as shot');
+		expect(unsteadyNote([{ clip_id: 'a', state: 'analyzing', fraction: 0.5 }])).toContain('still being measured');
+		const two = unsteadyNote([
+			{ clip_id: 'a', state: 'failed', reason: 'x' },
+			{ clip_id: 'b', state: 'missing' },
+			{ clip_id: 'c', state: 'ready' }
+		]);
+		expect(two).toContain('2 stabilized clips export as shot');
 	});
 
 	test('the summary names the strength and where it stands', () => {

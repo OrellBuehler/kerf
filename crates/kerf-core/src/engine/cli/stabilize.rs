@@ -293,7 +293,8 @@ pub(crate) fn measure_motion(
         return Err(Error::InvalidArgument("the window to measure is empty".into()));
     }
     let bin = ffmpeg_bin();
-    let lease = cpu::lease_priority_waiting(cpu::Priority::Background, &mut |_| progress(0.0), cancel)?;
+    // No progress while it waits for the slot: the job reads as queued until it measures.
+    let lease = cpu::lease_priority_waiting(cpu::Priority::Background, &mut |_| {}, cancel)?;
     if cancel() {
         return Err(Error::Cancelled);
     }
