@@ -22,8 +22,9 @@
 //! vid.stab's gaussian camera path does (pinned against it by an `#[ignore]`d render), and each
 //! graph hands `vidstabtransform` only the **absolute** corrections of the frames it reads
 //! (`relative=0:smoothing=0`, vid.stab's old transforms format, sub-pixel numbers), scaled to the
-//! frame size it decodes — a proxy's too. The zoom is fixed for the clip (the setting's, or the
-//! least that hides the edges over the clip's own frames), never vid.stab's per-stream optimum.
+//! frame size it decodes — a 4K original measured at 1920 wide, a proxy. The zoom is fixed for the
+//! clip (the setting's, or the least that hides the edges over the whole analysis, so a slice of the
+//! clip gets the same), never vid.stab's per-stream optimum.
 //!
 //! **Which frame is which.** vid.stab numbers frames from the first it is given, so the graph must
 //! know which frame of the analysis its stream opens on. It does not trust the seek for that: a
@@ -219,15 +220,22 @@ pub(crate) struct Slice {
     pub zoom: f64,
 }
 
-/// The size a stabilized clip's input decodes to and how it relates to what was measured.
+/// The size a stabilized clip's input decodes to (turned upright), which the corrections are scaled to.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct InputFrame {
     pub width: u32,
     pub height: u32,
 }
 
-/// The analysis of `asset_id`'s footage that covers `clip`'s source window, measured on `original`
-/// when that is known (the file the input reads; `None` for a proxy, which cannot be compared).
+/// The analysis of `asset_id`'s footage that covers the source window `[start, end)`, measured on
+/// `original` when that is known (the file the input reads). For a proxy (`None`) the analysis' own
+/// stamp is held to the file it names: the original must still be the file that was measured.
+///
+/// **Which one, when several cover it** (two clips of one file analysed apart): the one that starts
+/// earliest, then the one that ends latest, then the newest. A clip head-trimmed by a slice (a preview
+/// from the playhead, the second half of a split) keeps its end, so it picks what the whole clip picks
+/// and is corrected and zoomed alike; a window cut at both ends can pick another only when analyses of
+/// other clips overlap it.
 pub(crate) fn analysis_for(asset_id: Uuid, original: Option<&Path>, start: f64, end: f64) -> Option<Arc<MotionAnalysis>> {
     #[cfg(test)]
     if let Some(found) = pinned::analysis(asset_id) {
@@ -235,7 +243,7 @@ pub(crate) fn analysis_for(asset_id: Uuid, original: Option<&Path>, start: f64, 
     }
     let stamp = original.map(crate::engine::source_key);
     let dir = asset_dir(asset_id)?;
-    let mut best: Option<(SystemTime, Arc<MotionAnalysis>)> = None;
+    let mut found: Vec<(SystemTime, Arc<MotionAnalysis>)> = Vec::new();
     for entry in std::fs::read_dir(&dir).ok()?.flatten() {
         let path = entry.path();
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
@@ -247,23 +255,39 @@ pub(crate) fn analysis_for(asset_id: Uuid, original: Option<&Path>, start: f64, 
         if stamp.as_ref().is_some_and(|s| *s != analysis.source) || !analysis.covers(start, end) {
             continue;
         }
-        if best.as_ref().is_none_or(|(at, _)| modified > *at) {
-            best = Some((modified, analysis));
-        }
+        found.push((modified, analysis));
     }
-    best.map(|(_, a)| a)
+    found.sort_by(|(ma, a), (mb, b)| {
+        a.times[0]
+            .total_cmp(&b.times[0])
+            .then(b.times[b.times.len() - 1].total_cmp(&a.times[a.times.len() - 1]))
+            .then(mb.cmp(ma))
+    });
+    let mut stamps: HashMap<String, bool> = HashMap::new();
+    found
+        .into_iter()
+        .map(|(_, a)| a)
+        .find(|a| stamp.is_some() || *stamps.entry(a.source.clone()).or_insert_with(|| stamp_holds(&a.source)))
+}
+
+/// Whether the file a [`MotionAnalysis::source`] stamp names is still that file (its size and time).
+fn stamp_holds(stamp: &str) -> bool {
+    let mut parts = stamp.rsplitn(3, '|');
+    let (_, _, path) = (parts.next(), parts.next(), parts.next());
+    path.is_some_and(|p| crate::engine::source_key(Path::new(p)) == stamp)
 }
 
 /// The vid.stab [`Slice`] a chain reading `clip` over the source `window` uses, or `None` when the
 /// clip has no analysis covering it (it plays as shot until it is analysed). `input` is the frame
-/// size the chain decodes when that is not the size measured (a proxy's); `original` the file it
+/// size the chain decodes (the original's displayed size, or a proxy's): the corrections are in
+/// pixels of the frame measured (at most 1920 wide) and are scaled to it. `original` is the file it
 /// reads when that is the original.
 pub(crate) fn slice_for(
     clip: &Clip,
     setting: &Stabilize,
     window: (f64, f64),
     original: Option<&Path>,
-    input: Option<InputFrame>,
+    input: InputFrame,
 ) -> Option<Slice> {
     let setting = setting.normalized();
     let analysis = analysis_for(clip.asset_id, original, clip.source_in, clip.source_out)?;
@@ -277,18 +301,16 @@ pub(crate) fn slice_for(
     }
     let k1 = (analysis.first_at(window.1) + 1).min(analysis.times.len());
     let fixes = corrections(&analysis.motions, analysis.radius(setting.strength));
-    let zoom = setting.zoom.unwrap_or_else(|| {
-        // The clip's own frames, whatever window this chain reads: one zoom for the clip everywhere.
-        let lo = analysis.first_at(clip.source_in).min(fixes.len() - 1);
-        let hi = analysis.first_at(clip.source_out).clamp(lo + 1, fixes.len());
-        auto_zoom(&fixes[lo..hi], analysis.width, analysis.height)
-    });
-    let (sx, sy) = input.map_or((1.0, 1.0), |input| {
-        (
-            f64::from(input.width) / f64::from(analysis.width),
-            f64::from(input.height) / f64::from(analysis.height),
-        )
-    });
+    // Over the whole analysis (the clip's window when it was measured, and the margin), not the window
+    // this chain reads nor the clip's window now: a slice of the clip (a preview from the playhead, a
+    // range export, a split half) gets the zoom the whole clip gets.
+    let zoom = setting
+        .zoom
+        .unwrap_or_else(|| auto_zoom(&fixes, analysis.width, analysis.height));
+    let (sx, sy) = (
+        f64::from(input.width) / f64::from(analysis.width),
+        f64::from(input.height) / f64::from(analysis.height),
+    );
     let file = slice_file(clip.asset_id, &fixes[k0..k1.max(k0 + 1)], sx, sy, (k0, k1))?;
     Some(Slice {
         // Half a frame before the first, or nearer to it when the frame before is far off (a dropped
@@ -631,7 +653,7 @@ mod tests {
         clip.stabilize = Some(Stabilize::default());
         let analyses = HashMap::from([(id, Arc::new(analysis()))]);
         pinned::with(analyses, || {
-            let input = Some(InputFrame { width: 320, height: 180 });
+            let input = InputFrame { width: 320, height: 180 };
             let s = slice_for(&clip, &Stabilize::default(), (1.0, 3.1), None, input).unwrap();
             assert!((s.start - 0.98).abs() < 1e-9, "{s:?}");
             assert!(s.file.to_string_lossy().ends_with("-25-79-0.5000x0.5000.trf"), "{s:?}");
@@ -648,8 +670,90 @@ mod tests {
             assert!(slice_for(&long, &fixed, (1.0, 9.0), None, input).is_none());
         });
         pinned::with(HashMap::new(), || {
-            assert!(slice_for(&clip, &Stabilize::default(), (1.0, 3.0), None, None).is_none());
+            let input = InputFrame { width: 640, height: 360 };
+            assert!(slice_for(&clip, &Stabilize::default(), (1.0, 3.0), None, input).is_none());
         });
+    }
+
+    /// A camera that drifts more and more as it goes: no stretch of it is like another, so a zoom read
+    /// over the window a chain reads would differ from slice to slice.
+    fn drifting(seconds: f64, fps: f64, width: u32, height: u32) -> MotionAnalysis {
+        let n = (seconds * fps) as usize;
+        MotionAnalysis {
+            version: ANALYSIS_VERSION,
+            source: "pinned".into(),
+            width,
+            height,
+            times: (0..n).map(|k| k as f64 / fps).collect(),
+            motions: (0..n)
+                .map(|k| {
+                    let k = k as f64;
+                    let sway = if (k as usize) % 2 == 0 { 1.0 } else { -1.0 };
+                    [sway * (0.2 + k * k * 0.004), -sway * (0.1 + k * 0.03), 0.0]
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_slice_of_a_clip_gets_the_zoom_the_whole_clip_gets() {
+        use crate::model::{StreamKind, Timeline, Track};
+        let id = Uuid::from_u128(8);
+        let mut clip = Clip::new(id, 2.0, 8.0, 0.0);
+        clip.stabilize = Some(Stabilize::default());
+        let mut timeline = Timeline::default();
+        let mut track = Track::new(StreamKind::Video, "V1");
+        track.clips.push(clip.clone());
+        timeline.tracks.push(track);
+        let input = InputFrame {
+            width: 1280,
+            height: 720,
+        };
+        let analyses = HashMap::from([(id, Arc::new(drifting(10.0, 25.0, 1280, 720)))]);
+        pinned::with(analyses, || {
+            let whole = slice_for(&clip, &Stabilize::default(), (2.0, 8.0), None, input).unwrap();
+            // A preview from the playhead, a range export and the halves of a split read other windows.
+            for (from, to) in [(3.0, 6.0), (5.5, 6.0), (0.0, 4.0), (4.0, 6.0)] {
+                let sliced = timeline.slice(from, to);
+                let part = sliced.tracks.iter().flat_map(|t| &t.clips).next().unwrap();
+                let window = (part.source_in, part.source_out);
+                let got = slice_for(part, &Stabilize::default(), window, None, input).unwrap();
+                assert_eq!(got.zoom, whole.zoom, "{from}..{to}: {window:?}");
+            }
+            // Read over a part of the drift alone, the zoom would not be the same.
+            let fixes = corrections(&analysis_for(id, None, 2.0, 8.0).unwrap().motions, 13);
+            assert_ne!(auto_zoom(&fixes[50..100], 1280, 720), auto_zoom(&fixes, 1280, 720));
+        });
+    }
+
+    #[test]
+    fn a_4k_original_measured_at_1920_is_moved_twice_as_far() {
+        let id = Uuid::from_u128(9);
+        let mut clip = Clip::new(id, 1.0, 3.0, 0.0);
+        clip.stabilize = Some(Stabilize::default());
+        let analyses = HashMap::from([(id, Arc::new(pinned::shaky(4.0, 25.0, 1920, 1080)))]);
+        pinned::with(analyses, || {
+            let uhd = InputFrame {
+                width: 3840,
+                height: 2160,
+            };
+            let s = slice_for(&clip, &Stabilize::default(), (1.0, 3.0), None, uhd).unwrap();
+            assert!(s.file.to_string_lossy().ends_with("-2.0000x2.0000.trf"), "{s:?}");
+        });
+    }
+
+    #[test]
+    fn a_stamp_holds_while_the_file_it_names_is_unchanged() {
+        let dir = std::env::temp_dir().join(format!("kerf-stamp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a|b.mp4");
+        std::fs::write(&file, b"one").unwrap();
+        let stamp = crate::engine::source_key(&file);
+        assert!(stamp_holds(&stamp));
+        std::fs::write(&file, b"replaced").unwrap();
+        assert!(!stamp_holds(&stamp));
+        assert!(!stamp_holds("pinned"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

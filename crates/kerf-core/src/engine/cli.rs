@@ -9460,9 +9460,13 @@ fn video_clip_chain_stamped(
             p.push("trim=start_frame=1".to_string());
         }
         // A stabilized clip's correction is per source frame, so it goes before the frames are reversed
-        // or retimed; vid.stab's trim opens on the first frame its corrections are for.
+        // or retimed; vid.stab's trim opens on the first frame its corrections are for. An HDR clip is
+        // tone-mapped first, as a still and an SDR proxy are, so every graph steadies the same picture.
         let start = stab.and_then(Stabilizer::trim_start).unwrap_or(trim_start);
         p.push(format!("trim=start={}:end={}", start - seek, trim_end - seek));
+        if let Some(hdr) = fx.hdr.filter(|_| stab.is_some()) {
+            p.push(tonemap_filter(hdr));
+        }
         p.extend(stab.map(Stabilizer::filters));
         if clip.is_reversed() {
             p.push("reverse".to_string());
@@ -9663,7 +9667,8 @@ fn video_clip_chain_stamped(
     // frames that will never be shown, because the float RGB stage is by far the
     // most expensive step in the chain — and before any colour work, which is
     // meant to act on the SDR picture.
-    if let Some(hdr) = fx.hdr {
+    // (A stabilized clip was tone-mapped before it was steadied, above.)
+    if let Some(hdr) = fx.hdr.filter(|_| stab.is_none() || stamp.is_some()) {
         p.push(tonemap_filter(hdr));
     }
     // Color correction must run BEFORE any alpha plane is established: ffmpeg's `eq`

@@ -96,7 +96,13 @@ fn hostile_stabilization_logs_and_analyses_never_panic() {
         crate::stabilize::pinned::with(analyses, || {
             for window in [(0.1, 0.9), (0.0, 0.0), (0.5, 0.4), (-1.0, 99.0)] {
                 let setting = crate::model::Stabilize::default();
-                if let Some(s) = crate::stabilize::slice_for(&clip, &setting, window, None, None) {
+                if let Some(s) = crate::stabilize::slice_for(
+                    &clip,
+                    &setting,
+                    window,
+                    None,
+                    crate::stabilize::InputFrame { width: 560, height: 300 },
+                ) {
                     assert!(s.start.is_finite() && s.zoom.is_finite(), "{s:?}");
                 }
             }

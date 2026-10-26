@@ -139,7 +139,16 @@ pub(super) fn stabilizer(clip: &Clip, asset: Option<&Asset>, window: (f64, f64))
     let original = asset.streams.iter().find(|s| s.kind == StreamKind::Video);
     let proxy_frame = || proxy_frame(asset, original);
     if vidstab_available() {
-        let input = if proxy { Some(proxy_frame()?) } else { None };
+        // The corrections are in pixels of the frame measured (at most 1920 wide): scaled to the frame
+        // this input decodes, a 4K original's displayed size or a proxy's.
+        let input = if proxy {
+            proxy_frame()?
+        } else {
+            InputFrame {
+                width: original.and_then(|s| s.width)?,
+                height: original.and_then(|s| s.height)?,
+            }
+        };
         let file = (!proxy).then(|| Path::new(&asset.path));
         let slice = crate::stabilize::slice_for(clip, setting, window, file, input)?;
         return Some(Stabilizer::Vidstab(slice));
@@ -487,5 +496,74 @@ frame=    2 fps=0.0 q=-0.0 Lsize=N/A";
             assert!(s.filters().starts_with("deshake=rx="), "{s:?}");
             assert_eq!(s.trim_start(), None);
         });
+    }
+
+    /// The motion is measured at most 1920 wide, so a 4K original's frames are moved by twice the pixels
+    /// measured, as its proxy's are moved by its own share; an HD original by exactly what was measured.
+    #[test]
+    fn the_corrections_are_scaled_to_the_original_as_to_a_proxy() {
+        let mut uhd = av_asset(uuid::Uuid::from_u128(12), 20.0);
+        uhd.streams[0].width = Some(3840);
+        uhd.streams[0].height = Some(2160);
+        let hd = av_asset(uuid::Uuid::from_u128(13), 20.0);
+        let measured = Arc::new(crate::stabilize::pinned::shaky(10.0, 25.0, 1920, 1080));
+        let analyses = HashMap::from([(uhd.id, measured.clone()), (hd.id, measured)]);
+        let file = |asset: &Asset| {
+            let mut clip = Clip::new(asset.id, 1.0, 3.0, 0.0);
+            clip.stabilize = Some(Stabilize::default());
+            stabilizer(&clip, Some(asset), (1.0, 3.0)).unwrap().filters()
+        };
+        with_vidstab(true, || {
+            crate::stabilize::pinned::with(analyses, || {
+                assert!(file(&uhd).contains("-2.0000x2.0000.trf'"), "{}", file(&uhd));
+                assert!(file(&hd).contains("-1.0000x1.0000.trf'"), "{}", file(&hd));
+                let mut proxy = uhd.clone();
+                proxy.path = "/c/kerf/proxies/0123456789abcdef.mp4".into();
+                assert!(file(&proxy).contains("-0.6667x0.6667.trf'"), "{}", file(&proxy));
+            });
+        });
+    }
+
+    /// An HDR clip is tone-mapped once, before it is steadied, in the export as in the still.
+    #[test]
+    fn a_stabilized_hdr_clip_is_tone_mapped_before_it_is_steadied() {
+        let mut asset = av_asset(uuid::Uuid::from_u128(14), 20.0);
+        asset.streams[0].color_transfer = Some("arib-std-b67".into());
+        asset.streams[0].color_primaries = Some("bt2020".into());
+        let mut clip = Clip::new(asset.id, 1.0, 3.0, 0.0);
+        clip.stabilize = Some(Stabilize::default());
+        let timeline = single(vec![clip]);
+        let analyses = HashMap::from([(asset.id, Arc::new(crate::stabilize::pinned::shaky(10.0, 25.0, 1920, 1080)))]);
+        let opts = ExportOptions::default();
+        for vidstab in [true, false] {
+            with_zscale(true, || {
+                with_vidstab(vidstab, || {
+                    crate::stabilize::pinned::with(analyses.clone(), || {
+                        let export = build_export_args(&timeline, std::slice::from_ref(&asset), "/o.mp4", &opts)
+                            .unwrap()
+                            .join(" ");
+                        let still = build_still_args(
+                            &timeline,
+                            std::slice::from_ref(&asset),
+                            &opts,
+                            1.0,
+                            640,
+                            None,
+                            &StillOutput::RgbPipe,
+                        )
+                        .unwrap()
+                        .join(" ");
+                        let steady = if vidstab { "vidstabtransform=" } else { "deshake=" };
+                        for graph in [&export, &still] {
+                            assert_eq!(graph.matches("tonemap=tonemap").count(), 1, "{graph}");
+                            assert!(
+                                graph.find("tonemap=tonemap").unwrap() < graph.find(steady).unwrap(),
+                                "{graph}"
+                            );
+                        }
+                    });
+                })
+            });
+        }
     }
 }

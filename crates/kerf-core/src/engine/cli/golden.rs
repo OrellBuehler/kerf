@@ -89,11 +89,13 @@
 //! then have most of their clips of footage stabilized ([`stabilize_for`], on dice of its own seeded by
 //! the case and the clip: a strength, a fixed zoom now and then), every fourth case for an ffmpeg without
 //! vid.stab (`deshake`). The analyses are pinned ([`pinned`]: a made-up one per asset of the pool, over
-//! its whole length, and slice files named rather than written), so no disk and no libm reaches the argv.
-//! The first 8400 per-case digests are the ones the commit before stabilization gave; 4 block lines were
-//! appended to each file, `parts.txt`'s too. Families `stabilize-vidstab`, `stabilize-deshake`,
-//! `stabilize-proxy` / `stabilize-proxy-4k` (a padded proxy's slice, scaled to its size: a clip of footage
-//! with a twin reads it now and then) and their `still-` / `preview-` forms.
+//! its whole length, measured at most 1920 wide as the detect pass measures, and slice files named rather
+//! than written), so no disk and no libm reaches the argv. The first 8400 per-case digests are the ones
+//! the commit before stabilization gave; 4 block lines were appended to each file, `parts.txt`'s too.
+//! Families `stabilize-vidstab`, `stabilize-deshake`, `stabilize-proxy` (a padded proxy's slice, scaled to
+//! its size: a clip of footage with a twin reads it now and then), `stabilize-4k` (a 4K original's slice,
+//! scaled by 2 from the 1920 measured), `stabilize-hdr` (an HDR clip tone-mapped before it is steadied)
+//! and their `still-` / `preview-` forms.
 //!
 //! **The export in parts has a file of its own** (`golden/parts.txt`, [`the_parts_argv_builders_produce_the_golden_digests`]):
 //! every case is planned with `segments::plan_export` under [`PARTS_LIMITS`] and the argv of every part and of the last pass is
@@ -422,7 +424,9 @@ preview-speed-ramp-linear sqrt((
 stabilize-vidstab vidstabtransform=input='/kerf-test/stabilize/
 stabilize-deshake ,deshake=rx=
 stabilize-proxy -0.6667x0.6667.trf'
-stabilize-proxy-4k -0.3333x0.3333.trf'
+stabilize-4k -2.0000x2.0000.trf'
+stabilize-hdr format=yuv420p,vidstabtransform=
+still-stabilize-hdr format=yuv420p,vidstabtransform=
 still-stabilize-vidstab vidstabtransform=input='/kerf-test/stabilize/
 still-stabilize-deshake deshake=rx=
 preview-stabilize-vidstab vidstabtransform=input='/kerf-test/stabilize/
@@ -894,7 +898,8 @@ fn stabilize_for(tl: &mut Timeline, j: usize, assets: &[Asset]) {
 }
 
 /// The analyses a stabilized clip of the pool reads in the oracle: one made-up one per asset of
-/// footage (the padded proxies' twins too), over its whole length at its own size and rate.
+/// footage (the padded proxies' twins too), over its whole length at its own rate and at the size the
+/// detect pass measures (at most 1920 wide, so a 4K original's slice is scaled by 2).
 fn pinned_analyses() -> HashMap<Uuid, Arc<crate::stabilize::MotionAnalysis>> {
     static ANALYSES: std::sync::OnceLock<HashMap<Uuid, Arc<crate::stabilize::MotionAnalysis>>> = std::sync::OnceLock::new();
     ANALYSES
@@ -904,7 +909,11 @@ fn pinned_analyses() -> HashMap<Uuid, Arc<crate::stabilize::MotionAnalysis>> {
                 .filter(|a| !a.is_image())
                 .filter_map(|a| {
                     let v = a.streams.iter().find(|s| s.kind == StreamKind::Video)?;
-                    let made = crate::stabilize::pinned::shaky(a.duration, v.fps?, v.width?, v.height?);
+                    // Measured as the detect pass measures: at most 1920 wide, the height even.
+                    let (w, h) = (v.width?, v.height?);
+                    let mw = w.min(1920);
+                    let mh = ((f64::from(h) * f64::from(mw) / f64::from(w) / 2.0).round() as u32) * 2;
+                    let made = crate::stabilize::pinned::shaky(a.duration, v.fps?, mw, mh);
                     Some((a.id, Arc::new(made)))
                 })
                 .collect()
