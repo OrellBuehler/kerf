@@ -1623,7 +1623,7 @@ fn build(c: &Case, assets: &[Asset]) -> ([String; 3], Vec<String>) {
                 }
                 let (start, fps, width, quality, hw) = c.preview.clone();
                 text[2] += &repr(&build_preview_args_with(&c.timeline, assets, start, fps, width, quality, hw));
-            })
+            });
         });
     }
     if c.timeline.master.limiter {

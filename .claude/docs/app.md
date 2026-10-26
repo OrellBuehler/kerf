@@ -22,13 +22,14 @@ and the target is checked like an export's output (`check_output`: sources, prox
 `export_cancel`, `analysis_cancel`, `levels_cancel`, `voiceover_cancel`, `music_cancel` (`cancel_music` → `music cancelled`),
 `bands_cancel` (`cancel_band_balance` → `band balance cancelled`), `stems_cancel`, `model_cancel`
 (`cancel_model_download`), `cover_cancel` (`cancel_cover_export` → `cover export cancelled`), `smart_crop_cancel`
-(`cancel_smart_crop` → `smart crop cancelled`, progress as `smart-crop-progress { fraction }`) and `import_stop`
+(`cancel_smart_crop` → `smart crop cancelled`, progress as `smart-crop-progress { fraction }`), `stabilize_cancel`
+(`cancel_stabilization` → `stabilization cancelled`, progress as `stabilize-progress`, a `ClipStabilizeStatus`) and `import_stop`
 (`cancel_import` → `import cancelled`). A run calls `.begin()` and polls the closure it gets; `.stop()` ends every run
 begun before it and none begun after, so there is no flag to reset under a run about to start (a Stop pressed just
 before another run began used to be wiped by it) and a GUI Stop reaches the agent's run of the same job:
 `begin_analysis`, `begin_model_download`, `begin_import`, `begin_cover_export`, `begin_voiceover`, `begin_music`, `begin_stems`,
-`begin_smart_crop` and `begin_export` are what `mcp.rs` takes for `analyze_asset`, `download_speech_model`,
-`import_asset`, `export_cover`, `generate_voiceover`, `compose_music`, `separate_stems`, `smart_crop` and `export` / `export_variants`
+`begin_smart_crop`, `begin_stabilize` and `begin_export` are what `mcp.rs` takes for `analyze_asset`, `download_speech_model`,
+`import_asset`, `export_cover`, `generate_voiceover`, `compose_music`, `separate_stems`, `smart_crop`, `stabilize_clip` and `export` / `export_variants`
 (one `export_cancel` for both; a test pins that each `begin_*` listens to its own button and no other). **A replaced project stops its jobs**:
 `run_analysis`, voiceover, music, band balance, stems, smart crop and the export's framing pass fold "the generation moved" into their
 cancel (`stop_or_replaced` / `Throttled`: the generation is read under the lock at most twice a second), so the ffmpeg
@@ -203,6 +204,11 @@ builds and writes the file on the blocking pool —, `refine_transcript` (re-tim
 with MCP: lock released, background lane, `analysis-progress`, stopped by `cancel_analysis`; returns the
 analysis), `remove_silence`, `snap_to_beats`,
 `smart_crop` (frame each shot for the delivery frame),
+`set_clip_stabilize { clipId, stabilize: Stabilize | null }` (one `Stabilize clip` / `Stop stabilizing clip` revision; a still, a
+title, a clip of sound and 360 refused) / `analyze_clip_stabilization { clipId }` (inputs under the lock, the measurement on the
+blocking pool, `stabilize-progress` per tick and once at the end, answers the clip's `ClipStabilizeStatus`; nothing to do when an
+analysis covers the clip or there is no vid.stab) / `cancel_stabilization` / `clip_stabilization_status { clipIds? }` (the named
+clips or every stabilized one; reads the cache off the lock),
 `sync_clips_by_audio` (`referenceId`, `clipId`, `force?` → `{sync: AudioSync, timeline}`; heavy, the
 lock-free inputs → measure → apply split; a slot wait emits `audio-sync-progress`; a forced call for the
 plan last measured applies `AppState.last_sync` instead of decoding again — "Move anyway") /
@@ -419,7 +425,8 @@ comes back `ForbiddenUrl` and the "Release notes" button silently does nothing.
 `set_delivery_format`, `concatenate`, `remove_silence`, `snap_to_beats`, `smart_crop`, `cancel_smart_crop`;
 *linked A/V* `extract_audio`, `add_asset_audio`, `detach_audio`, `detach_audio_clips`, `reattach_audio`,
 `reattach_audio_clips`, `link_clips`, `unlink_clips`; *clip properties* `set_volume`, `set_fade`, `set_speed`, `set_speed_ramp`,
-`set_transform`, `set_transform_at`, `set_color`, `set_grade`, `inspect_lut`, `set_transition`, `set_mask`, `set_video_effects`, `set_audio_effects`, `set_keyframes`,
+`set_transform`, `set_transform_at`, `set_color`, `set_grade`, `inspect_lut`, `set_transition`, `set_mask`, `set_video_effects`, `set_audio_effects`,
+`set_clip_stabilize`, `analyze_clip_stabilization`, `cancel_stabilization`, `clip_stabilization_status`, `set_keyframes`,
 `add_keyframe`, `set_keyframe_easing`, `set_property_keyframes`, `set_property_tracks`, `copy_keyframes`, `clear_keyframes`, `set_reframe`,
 `clear_reframe`, `set_reframe_keyframes`, `add_reframe_keyframe`; *markers, text, titles, captions* `add_marker`,
 `update_marker`, `remove_marker`, `add_overlay`, `update_overlay`, `remove_overlay`, `set_overlay_keyframes`,

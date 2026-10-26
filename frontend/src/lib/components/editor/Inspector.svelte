@@ -11,6 +11,7 @@
 	import SliderRow from './SliderRow.svelte';
 	import GradeSections from './GradeSections.svelte';
 	import SpeedRamp from './SpeedRamp.svelte';
+	import StabilizeSection from './StabilizeSection.svelte';
 	import TemplateSection from './TemplateSection.svelte';
 	import TextSection from './TextSection.svelte';
 	import MediaChips from './MediaChips.svelte';
@@ -1646,6 +1647,8 @@
 				</InspectorSection>
 
 				<GradeSections {clip} />
+
+				<StabilizeSection {clip} {track} {asset} />
 
 			<InspectorSection title="Mask" summary={mask ? (mask.shape === 'rect' ? 'Rectangle' : 'Ellipse') : 'None'}>
 			<div style="display:flex;gap:5px;flex-wrap:wrap;align-items:center;margin-bottom:6px">

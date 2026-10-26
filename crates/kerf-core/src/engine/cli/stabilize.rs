@@ -280,7 +280,7 @@ pub(crate) fn measure_motion(
             "this FFmpeg has no vid.stab (libvidstab) to measure the camera with".into(),
         ));
     }
-    if !(end > start) || !start.is_finite() || !end.is_finite() {
+    if !start.is_finite() || !end.is_finite() || end <= start {
         return Err(Error::InvalidArgument("the window to measure is empty".into()));
     }
     let bin = ffmpeg_bin();

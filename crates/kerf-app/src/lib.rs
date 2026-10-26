@@ -30,12 +30,13 @@ use std::sync::{Arc, Mutex};
 use base64::Engine as _;
 use kerf_core::{
     Asset, AssetAnalysis, AudioEffect, CaptionFile, CaptionFormat, CaptionImportRequest, CaptionOptions, CaptionTimeBase,
-    ClipCut, ClipMove, Delivery, EditSource, ExportOptions, Filmstrip, FilmstripSheet, Fit, Grade, ImportOutcome, ImportSummary,
-    Keyframe, Levels, Mask, MissingAsset, Page, Project, Projection, Property, PropertyKey, PropertyTrack, ReframeKeyframe,
-    RelinkCheck, Relinked, RemovedAsset, Revision, SpeedKey, SplitSide, StagedEdit, StreamKind, SubsetApplied, SvgCheck,
-    SvgLayout, SvgOverlayPatch, SvgPresetInfo, SvgPresetKind, SvgPresetParams, SvgSource, Task, TemplateControl, TemplateLibrary,
-    TemplateList, TemplateSaveRequest, TemplateSaved, TextKeyframe, TimeRange, Timeline, TimelineDiff, TitleClipPatch,
-    TitleClipPlacement, TitleClipResult, TitleEdited, Transition, TransitionKind, VideoEffect, WaveformRange,
+    ClipCut, ClipMove, ClipStabilizeStatus, Delivery, EditSource, ExportOptions, Filmstrip, FilmstripSheet, Fit, Grade,
+    ImportOutcome, ImportSummary, Keyframe, Levels, Mask, MissingAsset, Page, Project, Projection, Property, PropertyKey,
+    PropertyTrack, ReframeKeyframe, RelinkCheck, Relinked, RemovedAsset, Revision, SpeedKey, SplitSide, Stabilize,
+    StabilizeStatus, StagedEdit, StreamKind, SubsetApplied, SvgCheck, SvgLayout, SvgOverlayPatch, SvgPresetInfo, SvgPresetKind,
+    SvgPresetParams, SvgSource, Task, TemplateControl, TemplateLibrary, TemplateList, TemplateSaveRequest, TemplateSaved,
+    TextKeyframe, TimeRange, Timeline, TimelineDiff, TitleClipPatch, TitleClipPlacement, TitleClipResult, TitleEdited,
+    Transition, TransitionKind, VideoEffect, WaveformRange,
 };
 
 use serde::Serialize;
@@ -78,6 +79,8 @@ struct AppState {
     cover_cancel: StopEpoch,
     /// Same, for the shots a smart crop is sampling (`cancel_smart_crop`).
     smart_crop_cancel: StopEpoch,
+    /// Same, for the cameras a stabilization analysis is measuring (`cancel_stabilization`).
+    stabilize_cancel: StopEpoch,
     /// Imports run side by side, so their stop (`cancel_import`) is a count rather than a
     /// flag: it ends every import that began before it and none that begin after.
     import_stop: StopEpoch,
@@ -203,6 +206,7 @@ impl AppState {
             model_cancel: StopEpoch::default(),
             cover_cancel: StopEpoch::default(),
             smart_crop_cancel: StopEpoch::default(),
+            stabilize_cancel: StopEpoch::default(),
             import_stop: StopEpoch::default(),
             main_window_shown,
             launch: Mutex::new(launch),
@@ -261,6 +265,12 @@ impl AppState {
         self.smart_crop_cancel.begin()
     }
 
+    /// A stabilization analysis is measuring; the closure says whether `cancel_stabilization` has been
+    /// pressed since. The GUI's analysis and an agent's `stabilize_clip` take one alike.
+    pub(crate) fn begin_stabilize(&self) -> impl Fn() -> bool + Send + Sync + 'static {
+        self.stabilize_cancel.begin()
+    }
+
     /// A render is starting (a single export or a multi-format one); the closure says whether
     /// `cancel_export` has been pressed since.
     pub(crate) fn begin_export(&self) -> impl Fn() -> bool + Send + Sync + 'static {
@@ -281,6 +291,7 @@ impl AppState {
             &self.model_cancel,
             &self.cover_cancel,
             &self.smart_crop_cancel,
+            &self.stabilize_cancel,
             &self.import_stop,
         ] {
             stop.stop();
@@ -4565,6 +4576,102 @@ fn cancel_smart_crop(state: State<'_, AppState>) {
     state.smart_crop_cancel.stop();
 }
 
+/// The error an abandoned stabilization analysis returns, for the webview to stay quiet on.
+const STABILIZE_CANCELLED: &str = "stabilization cancelled";
+
+/// `stabilize-progress`: where a clip's stabilization stands while it is analysed (its status, the
+/// fraction measured in it), and once more when the analysis ends.
+#[derive(Serialize, Clone)]
+struct StabilizeProgress {
+    #[serde(flatten)]
+    status: ClipStabilizeStatus,
+}
+
+/// Stabilize a clip (`stabilize`: strength and optional zoom) or stop (`null`), as one revision.
+/// A still, a title, a clip of sound and 360 footage are refused. The clip plays as shot until its
+/// analysis lands (`analyze_clip_stabilization`, which the Inspector starts).
+#[tauri::command(async)]
+fn set_clip_stabilize(state: State<'_, AppState>, clip_id: String, stabilize: Option<Stabilize>) -> CmdResult<Timeline> {
+    let id = id(&clip_id, "clip_id")?;
+    let project = state.project();
+    project.set_clip_stabilize(id, stabilize).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+/// Measure a stabilized clip's camera (vid.stab's first pass over its window of the original, in the
+/// background lane of the heavy-job queue) and keep it beside the footage; the preview and the export
+/// steady the clip from then on. Nothing to do where an analysis already covers it or this FFmpeg has
+/// no vid.stab (`deshake` needs none). Streams `stabilize-progress`; `cancel_stabilization` stops it,
+/// rejecting with `"stabilization cancelled"`. Answers the clip's status afterwards.
+#[tauri::command]
+async fn analyze_clip_stabilization(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    clip_id: String,
+) -> CmdResult<ClipStabilizeStatus> {
+    let clip = id(&clip_id, "clip_id")?;
+    let shared = state.project.clone();
+    let cancel = state.stabilize_cancel.begin();
+    blocking(move || {
+        let (job, generation) = {
+            let project = lock_user(&shared);
+            (
+                project.stabilize_inputs(clip).map_err(|e| e.to_string())?,
+                project.generation(),
+            )
+        };
+        let emit = |status: StabilizeStatus| {
+            let _ = app.emit(
+                "stabilize-progress",
+                StabilizeProgress {
+                    status: ClipStabilizeStatus { clip_id: clip, status },
+                },
+            );
+        };
+        emit(StabilizeStatus::Queued);
+        let stop = stop_or_replaced(cancel, &shared, generation);
+        let ran = Project::analyze_stabilization(&job, &mut |fraction| emit(StabilizeStatus::Analyzing { fraction }), &stop);
+        let inputs = lock_user(&shared)
+            .stabilization_status_inputs(Some(&[clip]))
+            .map_err(|e| e.to_string())?;
+        let status = Project::stabilization_statuses(&inputs).pop().ok_or("the clip is gone")?;
+        emit(status.status.clone());
+        match ran {
+            Ok(_) => Ok(status),
+            Err(kerf_core::Error::Cancelled) => Err(STABILIZE_CANCELLED.to_string()),
+            Err(e) => Err(e.to_string()),
+        }
+    })
+    .await
+}
+
+/// Stop the stabilization analyses in flight (if any).
+#[tauri::command(async)]
+fn cancel_stabilization(state: State<'_, AppState>) {
+    state.stabilize_cancel.stop();
+}
+
+/// Where each clip's stabilization stands: the named clips, or every stabilized one (`off`,
+/// `unsupported`, `basic` for `deshake`, `missing`, `queued`, `analyzing`, `failed`, `ready`). Reads the
+/// analyses kept on disk with the lock released.
+#[tauri::command]
+async fn clip_stabilization_status(
+    state: State<'_, AppState>,
+    clip_ids: Option<Vec<String>>,
+) -> CmdResult<Vec<ClipStabilizeStatus>> {
+    let ids = clip_ids
+        .map(|ids| ids.iter().map(|s| id(s, "clip_ids")).collect::<CmdResult<Vec<_>>>())
+        .transpose()?;
+    let shared = state.project.clone();
+    blocking(move || {
+        let inputs = lock_user(&shared)
+            .stabilization_status_inputs(ids.as_deref())
+            .map_err(|e| e.to_string())?;
+        Ok(Project::stabilization_statuses(&inputs))
+    })
+    .await
+}
+
 /// What syncing a clip by its sound found, and the timeline after it.
 #[derive(serde::Serialize)]
 struct SyncedByAudio {
@@ -5695,6 +5802,10 @@ pub fn run() {
             thumbnail_commands::export_thumbnail,
             thumbnail_commands::suggest_thumbnail_frames,
             cancel_smart_crop,
+            set_clip_stabilize,
+            analyze_clip_stabilization,
+            cancel_stabilization,
+            clip_stabilization_status,
             get_scopes,
             get_render_bar,
             platform_targets,
@@ -6535,11 +6646,12 @@ mod tests {
             Arc::new(kerf_core::ScrubFrames::new(kerf_core::ScrubConfig::default())),
         );
         type Running = Box<dyn Fn() -> bool>;
-        let jobs: [(&str, Running, &StopEpoch); 8] = [
+        let jobs: [(&str, Running, &StopEpoch); 9] = [
             ("voiceover", Box::new(state.begin_voiceover()), &state.voiceover_cancel),
             ("music", Box::new(state.begin_music()), &state.music_cancel),
             ("stems", Box::new(state.begin_stems()), &state.stems_cancel),
             ("smart crop", Box::new(state.begin_smart_crop()), &state.smart_crop_cancel),
+            ("stabilize", Box::new(state.begin_stabilize()), &state.stabilize_cancel),
             ("export", Box::new(state.begin_export()), &state.export_cancel),
             ("analysis", Box::new(state.begin_analysis()), &state.analysis_cancel),
             ("cover", Box::new(state.begin_cover_export()), &state.cover_cancel),

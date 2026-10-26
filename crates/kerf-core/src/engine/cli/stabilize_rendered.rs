@@ -128,6 +128,7 @@ fn measure(asset: &Asset) -> MotionAnalysis {
     measure_motion(Path::new(&asset.path), 0.0, SECONDS, 0.0, &mut |_| {}, &|| false).expect("measure the camera")
 }
 
+#[allow(clippy::print_stderr)]
 fn has_vidstab() -> bool {
     let ok = vidstab_available();
     if !ok {
@@ -310,7 +311,9 @@ fn still(timeline: &Timeline, assets: &[Asset], t: f64, width: u32) -> Vec<u8> {
         String::from_utf8_lossy(&run.stderr)
     );
     run.stdout
-        .chunks_exact(3)
+        .as_chunks::<3>()
+        .0
+        .iter()
         .map(|p| ((u32::from(p[0]) * 77 + u32::from(p[1]) * 150 + u32::from(p[2]) * 29) >> 8) as u8)
         .collect()
 }
@@ -360,7 +363,7 @@ fn the_still_is_the_exports_frame_and_a_half_size_proxy_is_moved_by_half() {
         strength: 1.0,
         zoom: None,
     });
-    let tl = single(vec![clip.clone()]);
+    let tl = single(vec![clip]);
     let plain = single(vec![make_clip(asset.id, 0.0, SECONDS, 0.0)]);
     with_analysis(&asset, &analysis, || {
         let frames = exported(&tl, std::slice::from_ref(&asset), &dir);

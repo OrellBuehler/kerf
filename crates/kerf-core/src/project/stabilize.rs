@@ -357,7 +357,7 @@ mod tests {
         assert_eq!(status_of(&input, true), StabilizeStatus::Off);
         let on = StabilizeStatusInput {
             stabilize: Some(Stabilize::default()),
-            ..input.clone()
+            ..input
         };
         assert_eq!(status_of(&on, false), StabilizeStatus::Basic);
         assert_eq!(status_of(&on, true), StabilizeStatus::Missing);

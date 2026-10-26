@@ -85,6 +85,7 @@ import {
 	setTrackDuck,
 	setMask,
 	setGrade,
+	setClipStabilize,
 	setTrackVolume,
 	setTrackPan,
 	setMasterVolume,
@@ -166,6 +167,7 @@ import type {
 	Keyframe,
 	Mask,
 	Grade,
+	Stabilize,
 	MusicFitReport,
 	Projection,
 	Property,
@@ -1168,6 +1170,10 @@ class EditorState {
 	}
 	setGrade(clipId: string, grade: Grade) {
 		return this.#apply(() => setGrade(clipId, grade));
+	}
+	/** Stabilize a clip (`null` stops); its analysis is the Inspector's to start. */
+	setClipStabilize(clipId: string, stabilize: Stabilize | null) {
+		return this.#apply(() => setClipStabilize(clipId, stabilize));
 	}
 	setTrackVolume(trackId: string, volume: number) {
 		return this.#apply(() => setTrackVolume(trackId, volume));

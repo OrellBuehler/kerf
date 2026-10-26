@@ -18,9 +18,10 @@ use base64::Engine as _;
 use kerf_core::{
     AudioEffect, CaptionFormat, CaptionImportRequest, CaptionOptions, CaptionStyle, CaptionTimeBase, ClipCut, ClipLut, ClipMove,
     CurvePoint, Curves, Delivery, EditSource, ExportOptions, Fit, Keyframe, Mask, MaskShape, Project, Projection, Property,
-    PropertyKey, PropertyTrack, ReframeKeyframe, Region, SpeedKey, SplitSide, StreamKind, SvgCheck, SvgDoc, SvgLayout,
-    SvgOverlay, SvgOverlayPatch, SvgOverlayResult, SvgPreset, SvgPresetKind, SvgPresetParams, SvgSource, TextKeyframe, TimeRange,
-    Timeline, TitleClipPatch, TitleClipPlacement, TitleClipResult, Transition, TransitionKind, VideoEffect, Wheel, Wheels,
+    PropertyKey, PropertyTrack, ReframeKeyframe, Region, SpeedKey, SplitSide, Stabilize, StabilizeStatus, StreamKind, SvgCheck,
+    SvgDoc, SvgLayout, SvgOverlay, SvgOverlayPatch, SvgOverlayResult, SvgPreset, SvgPresetKind, SvgPresetParams, SvgSource,
+    TextKeyframe, TimeRange, Timeline, TitleClipPatch, TitleClipPlacement, TitleClipResult, Transition, TransitionKind,
+    VideoEffect, Wheel, Wheels,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
@@ -564,6 +565,32 @@ struct SmartCropParams {
         description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result (or subscribe to kerf://jobs/{job_id}), stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
     )]
     background: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct StabilizeParams {
+    #[schemars(description = "UUID of the clip to stabilize: a clip of moving footage on a video track")]
+    clip_id: String,
+    #[schemars(description = "false stops stabilizing the clip (default true)")]
+    enabled: Option<bool>,
+    #[schemars(
+        description = "How much of the camera's movement is smoothed away, 0 to 1 (default 0.5): the radius of the smoothing of the camera's path, up to a second of frames either side. 0.3 keeps a deliberate walk's sway, 0.5 makes a hand-held walk steady, 1 holds a slow pan nearly still."
+    )]
+    strength: Option<f64>,
+    #[schemars(
+        description = "Enlarge the picture by this many percent (0 to 30) to hide the edges the correction moves into view. Omitted is automatic: the least zoom that keeps them out of the clip's frames. A fixed small zoom keeps more of the frame but may show black at the edges on a strong shake."
+    )]
+    zoom: Option<f64>,
+    #[schemars(
+        description = "Run as a background job: the call answers {job_id} at once and the work carries on; poll job_status for progress and the result (or subscribe to kerf://jobs/{job_id}), stop it with cancel_job. Default false: the call stays open until the work is done (send a progressToken for progress)."
+    )]
+    background: Option<bool>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct StabilizationStatusParams {
+    #[schemars(description = "UUIDs of the clips to report on; every stabilized clip when omitted")]
+    clip_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -5064,6 +5091,76 @@ impl KerfMcp {
     }
 
     #[tool(
+        description = "Stabilize a clip: take the shake of a hand-held camera out of its picture. Sets the clip's stabilization (an ordinary edit: it stages with your proposal and undoes like any other) and then measures the camera over the clip's footage (vid.stab's analysis of the original, a few seconds per second of 1080p; queued behind exports and proxies). Until the analysis lands the clip plays and exports as shot. The correction is per source frame, so speed, reverse and speed ramps keep it; trimming the clip within the footage measured keeps it, trimming past it needs this tool again (stabilization_status says `missing`). Where Kerf's FFmpeg has no vid.stab the clip is steadied by FFmpeg's simpler `deshake` instead, with no analysis (status `basic`). A still, a title, a clip on an audio track and 360 footage are refused. `enabled: false` stops stabilizing (no analysis). Pass `background: true` to run the analysis as a job. Returns the clip's `stabilize` setting and its `status`."
+    )]
+    async fn stabilize_clip(
+        &self,
+        Parameters(p): Parameters<StabilizeParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<String, McpError> {
+        let clip_id = parse_arg("clip_id", &p.clip_id)?;
+        let setting = p.enabled.unwrap_or(true).then(|| Stabilize {
+            strength: p.strength.unwrap_or(0.5),
+            zoom: p.zoom,
+        });
+        // The setting is the edit, checked here: a bad number or a clip that cannot be steadied is an
+        // error on the call, not a job that fails a moment later.
+        let clip = self.edit(|project| project.set_clip_stabilize(clip_id, setting).map_err(core_err))?;
+        if setting.is_none() {
+            return json(&serde_json::json!({ "clip_id": clip.id, "stabilize": null, "status": StabilizeStatus::Off }));
+        }
+        let (me, owner) = (self.clone(), self.owner());
+        // The GUI's Stop on a stabilization analysis ends an agent's too (`begin_stabilize`).
+        let gui_stop = self.app.state::<crate::AppState>().begin_stabilize();
+        self.long_tool("stabilize_clip", p.background, &context, move |run| async move {
+            let run = run.also_cancelled_by(gui_stop);
+            let project = me.project.clone();
+            let status = blocking(move || {
+                // Resolve under the lock, measure with it released (the clip's window of the original),
+                // read the status under it again: the analysis is a cache, nothing is applied.
+                let (job, generation) = {
+                    let project = lock_agent_as(&project, owner.as_deref());
+                    (project.stabilize_inputs(clip_id).map_err(core_err)?, project.generation())
+                };
+                let stop = crate::stop_or_replaced(|| run.cancelled(), &project, generation);
+                Project::analyze_stabilization(&job, &mut |f| run.progress(Some(f), "measuring the camera"), &stop)
+                    .map_err(core_err)?;
+                let inputs = lock_agent_as(&project, owner.as_deref())
+                    .stabilization_status_inputs(Some(&[clip_id]))
+                    .map_err(core_err)?;
+                Ok(Project::stabilization_statuses(&inputs).pop())
+            })
+            .await?;
+            me.changed();
+            json(&serde_json::json!({
+                "clip_id": clip_id,
+                "stabilize": setting,
+                "status": status.map(|s| s.status),
+            }))
+        })
+        .await
+    }
+
+    #[tool(
+        description = "Where each clip's stabilization stands (stabilize_clip): `off`, `unsupported` (with the reason), `basic` (steadied by FFmpeg's deshake: this FFmpeg has no vid.stab, no analysis needed), `missing` (not analysed, or trimmed past what was: it plays as shot until stabilize_clip runs again), `queued`, `analyzing` (with a fraction), `failed` (with the reason; it plays as shot) or `ready` (the preview and the export steady it). The named clips, or every stabilized clip of the timeline you see."
+    )]
+    async fn stabilization_status(&self, Parameters(p): Parameters<StabilizationStatusParams>) -> Result<String, McpError> {
+        let ids = p
+            .clip_ids
+            .map(|ids| ids.iter().map(|s| parse_arg("clip_ids", s)).collect::<Result<Vec<_>, _>>())
+            .transpose()?;
+        let (project, owner) = (self.project.clone(), self.owner());
+        let statuses = blocking(move || {
+            let inputs = lock_agent_as(&project, owner.as_deref())
+                .stabilization_status_inputs(ids.as_deref())
+                .map_err(core_err)?;
+            Ok(Project::stabilization_statuses(&inputs))
+        })
+        .await?;
+        json(&statuses)
+    }
+
+    #[tool(
         description = "Sync a clip to another by their sound: decodes both clips' audio, finds the offset where \
                        they match (GCC-PHAT cross-correlation, to a fraction of a millisecond) and moves the clip \
                        so the same moment lands at the same timeline time — a camera's scratch audio against the \
@@ -7059,7 +7156,8 @@ const EDITING_GUIDE: &str = "How to edit with Kerf. The user queues editing task
              with set_volume / set_fade (fade-in/out, e.g. to smooth hard cuts), \
              set_speed (one constant rate) or set_speed_ramp (slow motion or a speed-up that \
              eases in and out: keys of clip-local timeline seconds and speed, which retime the \
-             clip like set_speed and so ripple the same), set_transform (scale / position / rotation / opacity / \
+             clip like set_speed and so ripple the same), stabilize_clip (shaky hand-held footage made steady; \
+             it measures the camera first and plays as shot until then), set_transform (scale / position / rotation / opacity / \
              crop — picture-in-picture; set_transform_at for an animated clip, which keys \
              what is animated at a moment), set_color and set_transition (a fade \
              between scenes, a slide or push between the shots of a montage). \
@@ -10147,6 +10245,26 @@ mod tests {
         assert_eq!(sorted.len(), names.len(), "a tool is registered twice");
     }
 
+    /// Stabilizing names the clip and nothing else is required; reading where it stands changes nothing.
+    #[test]
+    fn stabilize_clip_takes_a_clip_and_optional_numbers_and_its_status_is_a_read() {
+        let tools = router().list_all();
+        let tool = |name: &str| tools.iter().find(|t| t.name == name).unwrap_or_else(|| panic!("{name}"));
+        let stabilize = tool("stabilize_clip");
+        assert_eq!(stabilize.input_schema["required"], serde_json::json!(["clip_id"]));
+        for arg in ["enabled", "strength", "zoom", "background"] {
+            assert!(stabilize.input_schema["properties"].get(arg).is_some(), "{arg}");
+        }
+        let hints = stabilize.annotations.as_ref().unwrap();
+        assert_eq!((hints.read_only_hint, hints.destructive_hint), (Some(false), Some(false)));
+        let status = tool("stabilization_status");
+        assert_eq!(status.annotations.as_ref().unwrap().read_only_hint, Some(true));
+        assert!(status
+            .input_schema
+            .get("required")
+            .is_none_or(|r| r.as_array().is_some_and(|r| r.is_empty())));
+    }
+
     #[test]
     fn exactly_the_long_tools_take_background() {
         let tools = router().list_all();
@@ -10168,6 +10286,7 @@ mod tests {
             "refine_transcript",
             "separate_stems",
             "smart_crop",
+            "stabilize_clip",
             "sync_clips_by_audio",
         ];
         long.sort_unstable();
