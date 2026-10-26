@@ -68,8 +68,8 @@ agent isn't scripting a black box; it drives the identical engine — and its ed
 | **Analysis & speech** | Silence and scene detection, an onset/**tempo** grid, EBU R128 loudness and speech-vs-music from one decode — plus **transcription in every build**, via FFmpeg's `whisper` filter or in-process whisper.cpp (models fetched on first use). |
 | **Cut to the beat** | The tempo grid is drawn on the ruler and snapped to while dragging, and `snap_to_beats` ripples a whole track's cuts onto it, retrimming each clip at its **outgoing** edge. |
 | **Stabilization** | Shaky hand-held footage made steady, per clip: vid.stab measures the camera once (a background analysis of the original, kept beside it), and the preview, every still, a proxy and the export move each source frame by the same correction — speed, reverse and ramps keep it. FFmpeg's `deshake` steps in where the FFmpeg has no vid.stab. |
-| **Effects, color & looks** | Per-clip video (`blur`/`sharpen`/`hue`/`negate`/`vignette`/`chromakey`) and audio (`highpass`/`lowpass`/`EQ`/`compressor`/`gate`) chains, transform + color grade, and one-click **Punchy / Warm / Cool / Faded / B&W** looks. |
-| **Transitions & masks** | Eleven transitions — crossfade, dip to black / white, **slide** and **push** in four directions — that borrow the outgoing clip's handle and degrade to a hard cut when there is none. **Masks** cut a clip to a feathered rectangle or ellipse so a lower track shows through: a blurred face is a duplicated shot above, blurred and masked. |
+| **Effects, color & looks** | Per-clip video (`blur`/`sharpen`/`hue`/`negate`/`vignette`/`chromakey`) and audio (`highpass`/`lowpass`/`EQ`/`compressor`/`gate`/`denoise`) chains, transform + color grade, and one-click **Punchy / Warm / Cool / Faded / B&W** looks. |
+| **Transitions & masks** | Eleven transitions — crossfade, dip to black / white, **slide** and **push** in four directions — that borrow the outgoing clip's handle and degrade to a hard cut when there is none. **Masks** cut a clip to a feathered rectangle or ellipse so a lower track shows through: a blurred face is a duplicated shot above, blurred and masked. **Blend modes** — multiply, screen, overlay, hard light, add, darken, lighten, difference, exclusion — composite a clip onto the tracks below instead of over them: a light leak screened onto the shot, a texture multiplied into it. |
 | **Keyframe animation** | Animated zoom, position, rotation and opacity via keyframes — linear, hold, ease in / out or a custom curve per key — the Transform panel auto-keyframes at the playhead. **Any one number can carry keys of its own**: a colour that warms over a shot, an opacity ramp that starts later than the zoom, the clip's volume swelling mid-clip. |
 | **360 reframing** | Cut a normal, flat shot out of **equirect or Insta360 dual-fisheye** footage: aim a virtual camera (yaw / pitch / roll / FOV) and **keyframe the pan**. An **Insta360 lens pair imports as one 360 asset** — Kerf stitches the two capture files into an equirect sphere once and caches it. Spherical sources are detected on import; anything unflagged can be marked by hand. |
 | **Titles & captions** | Text overlays / lower-thirds with their own keyframes, Title / Lower-third / Caption style presets, the system font list, and SRT export. **Captions follow the cut**: the transcript is projected through the clips that actually show its footage (trim / speed / reverse honored), so words you cut out get no caption — in a subtitle **Lines** style or the social **Word punch** style, one large word on the beat of the speech, fitted to the delivery frame. |
@@ -162,7 +162,7 @@ Now ask the agent to work on the project you have open — _"skim the interview 
 the dead air, and drop in captions."_ It will claim a task, use the tools below, and hand
 back a reviewable result.
 
-### The tools (195)
+### The tools (196)
 
 <details>
 <summary><b>See / analyze</b></summary>
@@ -201,7 +201,7 @@ score, fitted to the cuts) ·
 <summary><b>Style & animate</b></summary>
 
 `set_volume` · `set_fade` · `set_speed` · `set_speed_ramp` (slow motion / speed-up that eases) · `stabilize_clip` (take a hand-held camera's shake out) · `stabilization_status` · `set_transform` · `set_transform_at` · `set_color` ·
-`set_grade` (curves, colour wheels, a .cube LUT) · `set_transition` · `set_mask` · `set_video_effects` · `set_audio_effects` ·
+`set_grade` (curves, colour wheels, a .cube LUT) · `set_transition` · `set_mask` · `set_blend_mode` (multiply, screen, overlay, …) · `set_video_effects` · `set_audio_effects` ·
 `set_keyframes` · `add_keyframe` · `set_keyframe_easing` · `set_property_keyframes` · `set_property_tracks` · `copy_keyframes` · `clear_keyframes` · `set_reframe` · `clear_reframe` ·
 `set_reframe_keyframes` · `add_reframe_keyframe` · `set_track_volume` · `set_track_pan` ·
 `set_master_volume` · `set_master_limiter` · `set_master_true_peak` · `set_master_duck` ·

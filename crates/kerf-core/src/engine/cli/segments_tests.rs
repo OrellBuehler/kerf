@@ -597,11 +597,18 @@ pub(super) fn without_stamp(mut chain: Vec<String>, restarted: bool) -> Vec<Stri
 
 /// What a statement list says about how clip `flat` is laid over the canvas: its `overlay` filter.
 fn overlay_of(statements: &[&str], flat: usize) -> Option<String> {
-    let at = format!("][v{flat}]overlay");
-    statements
-        .iter()
-        .find(|l| l.contains(&at))
-        .map(|l| l[l.find("overlay").unwrap()..l.rfind('[').unwrap()].to_string())
+    let filter = |at: &str, name: &str| {
+        statements
+            .iter()
+            .find(|l| l.contains(at))
+            .map(|l| l[l.find(name).unwrap()..l.rfind('[').unwrap()].to_string())
+    };
+    // A blended clip is placed by the `overlay` of its colour stage (the alpha stage's is the same) and mixed by
+    // its `blend`.
+    filter(&format!("][v{flat}]overlay"), "overlay").or_else(|| {
+        let placed = filter(&format!("[bld{flat}lo]overlay"), "overlay")?;
+        Some(format!("{placed} {}", filter(&format!("[bld{flat}u]blend"), "blend")?))
+    })
 }
 
 /// Whether every clip a part draws has the chain, and the overlay, it has in the whole export's graph

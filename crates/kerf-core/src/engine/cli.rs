@@ -7847,6 +7847,28 @@ fn build_filter_complex_with(
         }
         let mut cur = "vbase".to_string();
         let last = video.len().wrapping_sub(1);
+        // The matrix a blended clip's composite is in: the bottom layer's, the first picture of the lowest
+        // video track that has one. Decided over the whole timeline, so a part names what the whole export does.
+        let mut first = 0;
+        let composite = timeline
+            .tracks
+            .iter()
+            .map(|track| {
+                let start = first;
+                first += track.clips.len();
+                (start, track)
+            })
+            .filter(|(_, track)| track.kind == StreamKind::Video)
+            .find_map(|(start, track)| {
+                track
+                    .clips
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, clip)| picture_of(clip).is_some())
+                    .min_by(|a, b| a.1.timeline_start.total_cmp(&b.1.timeline_start))
+                    .map(|(j, _)| start + j)
+            })
+            .and_then(|flat| composite_matrix(fx[flat].label_bt709, fx[flat].frame_matrix));
         for (n, (flat, input, clip)) in video.iter().enumerate() {
             let src = if vcount[*input] > 1 {
                 let k = vnext[*input];
@@ -7937,7 +7959,19 @@ fn build_filter_complex_with(
                     py = quote(format!("(H-h)/2+({py})*H"), motion.is_some()),
                 )
             };
-            chains.push(format!("[{cur}][v{flat}]{overlay}[{out}]"));
+            match clip.blend_mode.ffmpeg() {
+                None => chains.push(format!("[{cur}][v{flat}]{overlay}[{out}]")),
+                Some(mode) => {
+                    let window = format!("between(t,{start},{end})");
+                    let blend = Blend {
+                        mode,
+                        placement: &overlay,
+                        window: Some(&window),
+                        matrix: composite,
+                    };
+                    chains.extend(blend_chains(&cur, &format!("v{flat}"), &blend, &flat.to_string(), &out));
+                }
+            }
             cur = out;
         }
         if !svg.is_empty() {
@@ -8825,12 +8859,19 @@ fn chroma_filter(e: &VideoEffect) -> Option<String> {
 /// chain the export renders — the chain is only *described* once, here, so the
 /// two can't drift.
 pub fn audio_effects_filter(effects: &[AudioEffect]) -> Option<String> {
-    (!effects.is_empty()).then(|| effects.iter().map(audio_effect_filter).collect::<Vec<_>>().join(","))
+    (!effects.is_empty()).then(|| {
+        effects
+            .iter()
+            .map(|e| audio_effect_filter(e, None))
+            .collect::<Vec<_>>()
+            .join(",")
+    })
 }
 
 /// The filter for one audio effect. dB thresholds / make-up gain are converted to
-/// the linear units ffmpeg's dynamics filters expect.
-fn audio_effect_filter(e: &AudioEffect) -> String {
+/// the linear units ffmpeg's dynamics filters expect. `len` is the clip's length where the
+/// chain is the export's (a denoise on an `afftdn` that does not delay is cut to it).
+fn audio_effect_filter(e: &AudioEffect, len: Option<f64>) -> String {
     match e {
         AudioEffect::Highpass { hz } => format!("highpass=f={}", fnum(*hz)),
         AudioEffect::Lowpass { hz } => format!("lowpass=f={}", fnum(*hz)),
@@ -8857,6 +8898,11 @@ fn audio_effect_filter(e: &AudioEffect) -> String {
             fnum(db_to_linear(*makeup_db)),
         ),
         AudioEffect::Gate { threshold_db } => format!("agate=threshold={}", fnum(db_to_linear(*threshold_db))),
+        AudioEffect::Denoise {
+            reduction_db,
+            floor_db,
+            track_noise,
+        } => denoise_filter(*reduction_db, *floor_db, *track_noise, len),
     }
 }
 
@@ -9264,6 +9310,25 @@ fn fade_filter(step: &FadeStep) -> String {
     format!("fade=t={edge}:st={}:d={}{tint}", step.st, step.d)
 }
 
+/// The pad that letterboxes a picture fitted inside a `w`x`h` frame: opaque black, or transparent when `clear`
+/// (a blended clip's, [`keeps_clear_bars`]).
+fn letterbox_pad(w: u32, h: u32, clear: bool) -> String {
+    if clear {
+        format!("format=yuva420p,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=black@0")
+    } else {
+        format!("pad={w}:{h}:(ow-iw)/2:(oh-ih)/2")
+    }
+}
+
+/// A constant rotation by `degrees`. A blended clip's corners are filled with transparent black (`blended`):
+/// `none` leaves them as the zeroed buffer was allocated, with chroma 0, and the 2x2 chroma blocks across the
+/// picture's edge carry it into the RGB the blend works in (33 levels of luma off the plain overlay at that edge).
+fn static_rotate(degrees: f64, blended: bool) -> String {
+    let rad = degrees.to_radians();
+    let fill = if blended { "black@0" } else { "none" };
+    format!("rotate={rad}:fillcolor={fill}:ow=rotw({rad}):oh=roth({rad})")
+}
+
 /// The [`Fit::Blur`] fit of a picture into a `w`x`h` frame (pure): split in two, the
 /// picture scaled to fit (`decrease`, with `even` and the delivery's scaler flags `sf`, as
 /// the Contain fit) over a copy scaled to cover a thumbnail an eighth of the frame on each
@@ -9404,8 +9469,10 @@ fn video_clip_chain_stamped(
     // chroma key, or a crossfade dissolve.
     let transform_alpha =
         (!rotation_keyed && t.rotation != 0.0) || (!opacity_keyed && t.opacity < 1.0) || anim_rotation || anim_opacity || chroma;
-    let needs_alpha = transform_alpha || fx.xfade_in > 0.0 || clip.mask.is_some();
     let timing = ClipTiming::new(clip, fx);
+    // A blended clip's fades are alpha fades (`ClipTiming::fades`).
+    let needs_alpha =
+        transform_alpha || fx.xfade_in > 0.0 || clip.mask.is_some() || timing.fades().iter().any(|s| s.tint == FadeTint::Alpha);
     let dur = timing.duration();
     // A crossfade tail borrows unused source: forward clips extend past source_out,
     // reversed clips extend below source_in (reverse plays high->low, so the visible
@@ -9542,6 +9609,12 @@ fn video_clip_chain_stamped(
     // A keyframed clip is treated as non-identity so its picture is centered by
     // the overlay (not padded full-frame), and its zoom is re-evaluated per frame.
     let geom_identity = t.is_identity() && !anim;
+    let grade = grade_filters(&clip.grade, composite_matrix(fx.label_bt709, fx.frame_matrix));
+    // A blended clip's letterbox bars are transparent, so they leave the lower tracks alone.
+    let clear_bars = fmt.fit == Fit::Contain
+        && geom_identity
+        && keeps_clear_bars(!clip.blend_mode.is_normal(), tone_mapped, &clip.effects, &grade);
+    let needs_alpha = needs_alpha || clear_bars;
     // A reprojected picture and a title's pictures come out at the frame's own size: nothing hangs over it.
     // (A title is the clip that has no asset: a still an export in parts picks up at a cut is stamped too,
     // and keeps its own picture, whose size decides the order as it does in the whole export.)
@@ -9617,7 +9690,7 @@ fn video_clip_chain_stamped(
                 even = if tone_mapped { ":force_divisible_by=2" } else { "" }
             ));
             if geom_identity {
-                p.push(format!("pad={w}:{h}:(ow-iw)/2:(oh-ih)/2", w = fmt.width, h = fmt.height));
+                p.push(letterbox_pad(fmt.width, fmt.height, clear_bars));
             }
         }
         // Fill the frame and cut the overflow, so 16:9 footage delivered at 9:16
@@ -9673,17 +9746,16 @@ fn video_clip_chain_stamped(
     }
     // Color correction must run BEFORE any alpha plane is established: ffmpeg's `eq`
     // has no alpha-capable input format, so the graph would otherwise auto-insert a
-    // conversion that drops the alpha (silently disabling opacity / rotation).
+    // conversion that drops the alpha (silently disabling opacity / rotation). A blended clip's transparent
+    // letterbox bars are the exception: measured on 6.1 and 9.0, the alpha the pad gives survives `eq`, the
+    // grade's RGB filters and every effect but `vignette` (`keeps_clear_bars`).
     if clip.color_animated() {
         p.push(eq_filter_keyed(clip));
     } else if !clip.color.is_identity() {
         p.push(eq_filter(&clip.color));
     }
     // The LUT, the curves and the wheels, after the `eq` (see `grade`), before any alpha plane.
-    p.extend(grade_filters(
-        &clip.grade,
-        if fx.label_bt709 { Some("bt709") } else { fx.frame_matrix },
-    ));
+    p.extend(grade);
     // Color-space video effects (blur / sharpen / grayscale / invert / vignette),
     // applied in author order, before any alpha plane.
     for e in &clip.effects {
@@ -9740,8 +9812,7 @@ fn video_clip_chain_stamped(
             "rotate=a='({expr})*PI/180':fillcolor=black@0:ow='hypot(iw,ih)':oh='hypot(iw,ih)'"
         ));
     } else if !rotation_keyed && t.rotation != 0.0 {
-        let rad = t.rotation.to_radians();
-        p.push(format!("rotate={rad}:fillcolor=none:ow=rotw({rad}):oh=roth({rad})"));
+        p.push(static_rotate(t.rotation, !clip.blend_mode.is_normal()));
     }
     // `fade` reads the frame's pts, which `setpts` above already moved onto
     // the timeline, so a fade starts at the clip's timeline position and not
@@ -10472,6 +10543,8 @@ fn build_still_args_rendered(
     };
     let mut chains: Vec<String> = vec![format!("color=c=black:s={ow}x{oh}:d=0.1[base]")];
     let mut cur = "base".to_string();
+    // The matrix a blended clip's composite is in: the bottom layer's, as in the export.
+    let mut composite = None;
     for (n, layer) in active.iter().enumerate() {
         let (ac, clip) = (&layer.active, layer.active.clip);
         let tf = ac.transform();
@@ -10479,11 +10552,10 @@ fn build_still_args_rendered(
         let hdr = asset_of(clip.asset_id).and_then(|a| a.hdr());
         let tone = hdr.map(|h| format!("{},", tonemap_filter(h))).unwrap_or_default();
         let stream = asset_of(clip.asset_id).and_then(|a| a.streams.iter().find(|s| s.kind == StreamKind::Video));
-        let matrix = if layer.label_bt709 {
-            Some("bt709")
-        } else {
-            crate::model::frame_matrix(stream, hdr.is_some())
-        };
+        let matrix = composite_matrix(layer.label_bt709, crate::model::frame_matrix(stream, hdr.is_some()));
+        if n == 0 {
+            composite = matrix;
+        }
         let steady = stabs[n].as_ref().map(|s| format!("{},", s.filters())).unwrap_or_default();
         chains.push(format!(
             "[{n}:v]{tone}{steady}{chain}[v{n}]",
@@ -10528,14 +10600,27 @@ fn build_still_args_rendered(
                         asset_of(clip.asset_id).is_some_and(Asset::has_alpha)
                     ))
                 .then(|| format!("bf{n}"))
-                .as_deref()
+                .as_deref(),
+                StillBlend {
+                    blended: !clip.blend_mode.is_normal(),
+                    tone_mapped: hdr.is_some(),
+                },
             )
         ));
         let out = format!("ov{n}");
-        chains.push(format!(
-            "[{cur}][v{n}]{overlay}[{out}]",
-            overlay = still_overlay(&tf, layer.motion)
-        ));
+        let overlay = still_overlay(&tf, layer.motion);
+        match clip.blend_mode.ffmpeg() {
+            None => chains.push(format!("[{cur}][v{n}]{overlay}[{out}]")),
+            Some(mode) => {
+                let blend = Blend {
+                    mode,
+                    placement: &overlay,
+                    window: None,
+                    matrix: composite,
+                };
+                chains.extend(blend_chains(&cur, &format!("v{n}"), &blend, &n.to_string(), &out));
+            }
+        }
         cur = out;
     }
     // Titles over the clips, under the text, as in the export.
@@ -10606,6 +10691,9 @@ struct StillCanvas {
 /// and is `None` for a clip the export gives none ([`takes_blur_fill`]: an animated one, whose pose
 /// is not the plain fit even where it samples to it, a see-through one, a reframe, one of the
 /// frame's own shape), which is then placed as under Contain.
+///
+/// `blend` is what a blend mode changes in the chain, as in `video_clip_chain`: transparent letterbox bars
+/// ([`keeps_clear_bars`]) and rotated corners ([`static_rotate`]).
 #[allow(clippy::too_many_arguments)]
 fn still_clip_chain_graded(
     tf: &Transform,
@@ -10622,11 +10710,15 @@ fn still_clip_chain_graded(
     fades: &StillFades,
     label_bt709: bool,
     blur_label: Option<&str>,
+    blend: StillBlend,
 ) -> String {
     let StillCanvas { w: ow, h: oh, fit, sf } = canvas;
     let (ow, oh, fit) = (*ow, *oh, *fit);
+    let grade = grade_filters(grade, frame_matrix);
+    let letterboxed = tf.is_identity() && (fit == Fit::Contain || (fit == Fit::Blur && blur_label.is_none()));
+    let clear_bars = letterboxed && keeps_clear_bars(blend.blended, blend.tone_mapped, effects, &grade);
     let chroma = effects.iter().any(|e| e.produces_alpha());
-    let needs_alpha = (!tf.is_identity() && tf.needs_alpha()) || chroma || mask.is_some() || fades.needs_alpha();
+    let needs_alpha = (!tf.is_identity() && tf.needs_alpha()) || chroma || mask.is_some() || fades.needs_alpha() || clear_bars;
     let mut p: Vec<String> = Vec::new();
     if label_bt709 {
         p.push(BT709_LABEL.to_string());
@@ -10688,8 +10780,8 @@ fn still_clip_chain_graded(
         // Cover already fills the frame; padding it would be a no-op that still
         // costs a filter, so only the letterboxed path needs it (a blurred fill is the
         // frame; a clip that does not take one is letterboxed as under Contain).
-        if fit == Fit::Contain || (fit == Fit::Blur && blur_label.is_none()) {
-            p.push(format!("pad={ow}:{oh}:(ow-iw)/2:(oh-ih)/2"));
+        if letterboxed {
+            p.push(letterbox_pad(ow, oh, clear_bars));
         }
     } else if (tf.scale - 1.0).abs() > 1e-9 && order == FitOrder::Fitted {
         let zoom = zoom_scale(&tf.scale.to_string(), false, tf.scale < TINY_SCALE, false, sf);
@@ -10703,7 +10795,7 @@ fn still_clip_chain_graded(
     if !color.is_identity() {
         p.push(eq_filter(color));
     }
-    p.extend(grade_filters(grade, frame_matrix));
+    p.extend(grade);
     for e in effects {
         if let Some(f) = video_effect_filter(e) {
             p.push(f);
@@ -10724,8 +10816,7 @@ fn still_clip_chain_graded(
         p.push(format!("colorchannelmixer=aa={}", tf.opacity));
     }
     if tf.rotation != 0.0 {
-        let rad = tf.rotation.to_radians();
-        p.push(format!("rotate={rad}:fillcolor=none:ow=rotw({rad}):oh=roth({rad})"));
+        p.push(static_rotate(tf.rotation, blend.blended));
     }
     p.extend(fades.filters());
     if !fades.is_empty() && !needs_alpha && late_zoom.is_none() {
@@ -10775,7 +10866,17 @@ fn still_clip_chain(
         fades,
         label_bt709,
         Some("bf0"),
+        StillBlend::default(),
     )
+}
+
+/// What a blend mode changes in a still layer's chain ([`still_clip_chain_graded`]).
+#[derive(Clone, Copy, Debug, Default)]
+struct StillBlend {
+    /// The clip has a blend mode other than normal.
+    blended: bool,
+    /// Its picture is tone-mapped from HDR (which, in the export's chain, drops the alpha of clear bars).
+    tone_mapped: bool,
 }
 
 /// The `overlay` placement for a clip in a [`timeline_frame`] composite: a full
@@ -10859,10 +10960,10 @@ fn audio_clip_tail(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, layout: &str, m
     } else {
         p.push(format!("volume={}", clip.volume));
     }
-    // Per-clip audio effects (EQ / compressor / gate / filters) in author order,
+    // Per-clip audio effects (EQ / compressor / gate / denoise / filters) in author order,
     // after the clip gain.
     for e in &clip.audio {
-        p.push(audio_effect_filter(e));
+        p.push(audio_effect_filter(e, Some(dur)));
     }
     // A fade that is wholly one half of a real crossfade pair (`ClipFx::afade_in_power` /
     // `tail_power`) is constant-power (`qsin`: sin in, cos out, so the summed power stays
@@ -11074,6 +11175,16 @@ pub use written::{measure_export, ExportReport, LoudnessTarget, WrittenAudio, Wr
 mod levels;
 pub use levels::{mix_levels, stream_mix_pcm};
 
+/// A clip's noise reduction (`afftdn`), its delay taken back out where this ffmpeg has one.
+mod denoise;
+use denoise::denoise_filter;
+#[cfg(test)]
+use denoise::with_afftdn_delay;
+
+/// Noise reduction through the real `ffmpeg`: the sound keeps its sync and its length (`#[ignore]`d).
+#[cfg(test)]
+mod denoise_rendered;
+
 /// The golden argv oracle (see its docs): a child module so it reaches the
 /// private builders.
 #[cfg(test)]
@@ -11105,6 +11216,15 @@ use stabilize::{stabilizer, Stabilizer};
 /// Stabilization rendered by the real ffmpeg (`#[ignore]`d).
 #[cfg(test)]
 mod stabilize_rendered;
+
+/// A clip composited with a blend mode instead of alpha-over.
+mod blend;
+use blend::{blend_chains, composite_matrix, keeps_clear_bars, Blend};
+
+/// Blend modes through the real `ffmpeg`: the pixels of each mode, the composite outside the clip, and `normal`
+/// through the blend graph against the plain `overlay` (`#[ignore]`d).
+#[cfg(test)]
+mod blend_rendered;
 
 /// The filters of a clip's grade as the graph writes them, in chain order, for frames tagged `frame_matrix`
 /// (`None`: untagged): `lut3d`, `lutrgb`, `colorbalance`, and for a tagged picture the `scale` / `format` /
@@ -16463,6 +16583,37 @@ mod tests {
         let g = graph_of(&single(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]), &[asset]);
         assert!(!g.contains("geq="), "{g}");
         assert!(!g.contains("format=yuva420p"), "no mask, no alpha: {g}");
+    }
+
+    #[test]
+    fn a_blended_clip_fades_its_alpha_clears_its_bars_and_fills_its_corners() {
+        let square = test_asset(vec![video_stream(1080, 1080, 25.0)]);
+        let mut clip = make_clip(square.id, 0.0, 4.0, 0.0);
+        clip.fade_in = 1.0;
+        let plain = graph_of(&single(vec![clip.clone()]), std::slice::from_ref(&square));
+        assert!(plain.contains("pad=1920:1080:(ow-iw)/2:(oh-ih)/2,") && plain.contains("fade=t=in:st=0:d=1,"));
+        clip.blend_mode = crate::model::BlendMode::Multiply;
+        let g = graph_of(&single(vec![clip.clone()]), std::slice::from_ref(&square));
+        assert!(
+            g.contains("format=yuva420p,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black@0,"),
+            "{g}"
+        );
+        assert!(g.contains("fade=t=in:st=0:d=1:alpha=1"), "{g}");
+        assert!(
+            g.contains("select='between(t,0,4)'"),
+            "only the clip's window is blended: {g}"
+        );
+        // A vignette drops the alpha after the pad: the bars stay black.
+        clip.effects = vec![VideoEffect::Vignette];
+        let g = graph_of(&single(vec![clip.clone()]), std::slice::from_ref(&square));
+        assert!(
+            g.contains("pad=1920:1080:(ow-iw)/2:(oh-ih)/2,") && !g.contains("black@0"),
+            "{g}"
+        );
+        clip.effects.clear();
+        clip.transform.rotation = 10.0;
+        let g = graph_of(&single(vec![clip]), std::slice::from_ref(&square));
+        assert!(g.contains(":fillcolor=black@0:ow=rotw("), "{g}");
     }
 
     #[test]

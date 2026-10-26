@@ -29,14 +29,14 @@ use std::sync::{Arc, Mutex};
 
 use base64::Engine as _;
 use kerf_core::{
-    AssembleByTag, AssembleSummary, Asset, AssetAnalysis, AudioEffect, CaptionFile, CaptionFormat, CaptionImportRequest,
-    CaptionOptions, CaptionTimeBase, ClipCut, ClipMove, ClipStabilizeStatus, Delivery, EditSource, ExportOptions, Filmstrip,
-    FilmstripSheet, Fit, Grade, ImportOutcome, ImportSummary, Keyframe, Levels, Mask, MissingAsset, Page, Project, Projection,
-    Property, PropertyKey, PropertyTrack, ReframeKeyframe, RelinkCheck, Relinked, RemovedAsset, Revision, SpeedKey, SplitSide,
-    Stabilize, StabilizeStatus, StagedEdit, StreamKind, SubsetApplied, SvgCheck, SvgLayout, SvgOverlayPatch, SvgPresetInfo,
-    SvgPresetKind, SvgPresetParams, SvgSource, TagEdit, TagSummary, Task, TemplateControl, TemplateLibrary, TemplateList,
-    TemplateSaveRequest, TemplateSaved, TextKeyframe, TimeRange, Timeline, TimelineDiff, TitleClipPatch, TitleClipPlacement,
-    TitleClipResult, TitleEdited, Transition, TransitionKind, VideoEffect, WaveformRange,
+    AssembleByTag, AssembleSummary, Asset, AssetAnalysis, AudioEffect, BlendMode, CaptionFile, CaptionFormat,
+    CaptionImportRequest, CaptionOptions, CaptionTimeBase, ClipCut, ClipMove, ClipStabilizeStatus, Delivery, EditSource,
+    ExportOptions, Filmstrip, FilmstripSheet, Fit, Grade, ImportOutcome, ImportSummary, Keyframe, Levels, Mask, MissingAsset,
+    Page, Project, Projection, Property, PropertyKey, PropertyTrack, ReframeKeyframe, RelinkCheck, Relinked, RemovedAsset,
+    Revision, SpeedKey, SplitSide, Stabilize, StabilizeStatus, StagedEdit, StreamKind, SubsetApplied, SvgCheck, SvgLayout,
+    SvgOverlayPatch, SvgPresetInfo, SvgPresetKind, SvgPresetParams, SvgSource, TagEdit, TagSummary, Task, TemplateControl,
+    TemplateLibrary, TemplateList, TemplateSaveRequest, TemplateSaved, TextKeyframe, TimeRange, Timeline, TimelineDiff,
+    TitleClipPatch, TitleClipPlacement, TitleClipResult, TitleEdited, Transition, TransitionKind, VideoEffect, WaveformRange,
 };
 
 use serde::Serialize;
@@ -2351,6 +2351,15 @@ fn set_mask(state: State<'_, AppState>, clip_id: String, mask: Option<Mask>) -> 
     let id = id(&clip_id, "clip_id")?;
     let project = state.project();
     project.set_mask(id, mask).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+/// Composite a clip onto the tracks below with a blend mode (`normal` is plain alpha-over).
+#[tauri::command(async)]
+fn set_blend_mode(state: State<'_, AppState>, clip_id: String, mode: BlendMode) -> CmdResult<Timeline> {
+    let id = id(&clip_id, "clip_id")?;
+    let project = state.project();
+    project.set_blend_mode(id, mode).map_err(|e| e.to_string())?;
     project.timeline().map_err(|e| e.to_string())
 }
 
@@ -5730,6 +5739,7 @@ pub fn run() {
             set_color,
             set_transition,
             set_mask,
+            set_blend_mode,
             set_grade,
             inspect_lut,
             set_video_effects,

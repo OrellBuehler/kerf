@@ -525,6 +525,46 @@ frame=    2 fps=0.0 q=-0.0 Lsize=N/A";
         });
     }
 
+    /// A clip that is stabilized and blended is steadied in its own chain and then blended with the composite,
+    /// in the export as in the still.
+    #[test]
+    fn a_stabilized_clip_with_a_blend_mode_is_steadied_then_blended() {
+        let asset = av_asset(uuid::Uuid::from_u128(15), 20.0);
+        let mut clip = Clip::new(asset.id, 1.0, 3.0, 0.0);
+        clip.stabilize = Some(Stabilize::default());
+        clip.blend_mode = crate::model::BlendMode::Screen;
+        let base = Clip::new(asset.id, 5.0, 7.0, 0.0);
+        let timeline = timeline_of(vec![video_track(vec![base]), video_track(vec![clip])]);
+        let analyses = HashMap::from([(asset.id, Arc::new(crate::stabilize::pinned::shaky(10.0, 25.0, 1920, 1080)))]);
+        let opts = ExportOptions::default();
+        with_vidstab(true, || {
+            crate::stabilize::pinned::with(analyses, || {
+                let export = build_export_args(&timeline, std::slice::from_ref(&asset), "/o.mp4", &opts)
+                    .unwrap()
+                    .join(" ");
+                let still = build_still_args(
+                    &timeline,
+                    std::slice::from_ref(&asset),
+                    &opts,
+                    1.0,
+                    640,
+                    None,
+                    &StillOutput::RgbPipe,
+                )
+                .unwrap()
+                .join(" ");
+                for graph in [&export, &still] {
+                    let (steady, blend) = (
+                        graph.find("vidstabtransform=").unwrap(),
+                        graph.find("blend=c0_mode=screen").unwrap(),
+                    );
+                    assert!(steady < blend, "{graph}");
+                    assert_eq!(graph.matches("vidstabtransform=").count(), 1, "{graph}");
+                }
+            });
+        });
+    }
+
     /// An HDR clip is tone-mapped once, before it is steadied, in the export as in the still.
     #[test]
     fn a_stabilized_hdr_clip_is_tone_mapped_before_it_is_steadied() {

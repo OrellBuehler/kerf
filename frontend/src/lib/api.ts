@@ -36,6 +36,7 @@ import type {
 	ClipCut,
 	ClipMove,
 	CutTranscript,
+	BlendMode,
 	Mask,
 	MissingAsset,
 	Color,
@@ -2639,6 +2640,22 @@ export async function setMask(clipId: string, mask: Mask | null): Promise<Timeli
 	return invoke<Timeline>('set_mask', { clipId, mask });
 }
 
+/** Composite a clip onto the tracks below with a blend mode (`normal` is plain compositing). Only a clip on a
+ *  video track has a picture to blend (`Project::set_blend_mode`). */
+export async function setBlendMode(clipId: string, mode: BlendMode): Promise<Timeline> {
+	if (!inTauri()) {
+		const found = locate(devTimeline, clipId);
+		if (!found) throw new Error(`clip not found: ${clipId}`);
+		if (found[0].kind !== 'video') throw new Error('invalid argument: a blend mode applies to a clip on a video track');
+		const clip = found[0].clips[found[1]];
+		if (mode === 'normal') delete clip.blend_mode;
+		else clip.blend_mode = mode;
+		recordDev('Set blend mode');
+		return snapshot();
+	}
+	return invoke<Timeline>('set_blend_mode', { clipId, mode });
+}
+
 /** Replace a clip's curves, colour wheels and LUT. The backend checks a LUT file before it is set. */
 export async function setGrade(clipId: string, grade: Grade): Promise<Timeline> {
 	if (!inTauri()) {
@@ -5208,7 +5225,9 @@ export async function getFilmstrip(assetId: string): Promise<Filmstrip> {
  */
 /** Decode a clip's source window to raw mono PCM. Naming `clipId` decodes it
  *  through that clip's audio effect chain, so the monitor hears the EQ /
- *  compressor / gate the export will render. */
+ *  compressor / gate / denoise the export will render. The chain runs before the
+ *  clip's gain here and after it in the export: only a level-dependent effect
+ *  (compressor, gate, denoise) hears the difference. */
 export async function getAudio(
 	assetId: string,
 	start: number,

@@ -14,7 +14,7 @@
 use std::fmt;
 
 use crate::clip_timing::{FadeEdge, Rational};
-use crate::model::VideoEffect;
+use crate::model::{BlendMode, VideoEffect};
 use crate::render_plan::{YuvMatrix, MAX_AMPLIFIED_ERROR, MAX_SHRINK, MIN_TEXT_PX};
 
 /// A set of [`VideoEffect`] kinds: what a compositor draws one by one.
@@ -300,6 +300,9 @@ pub enum Unsupported {
     /// The layer's clip is stabilized: the export moves each of its frames by the clip's analysis
     /// (vid.stab's transform, or `deshake`), which no compositor pass draws.
     Stabilized(LayerRef),
+    /// The layer's clip composites with a blend mode: FFmpeg mixes it with the composite by `blend` in RGB, after a
+    /// conversion each way, which no compositor pass reproduces.
+    BlendMode(LayerRef, BlendMode),
     /// The layer plays on past its end, under the clip that replaces it.
     Tail(LayerRef),
     KeyedOpacity(LayerRef),
@@ -384,6 +387,7 @@ impl Unsupported {
             Self::FullRangeResized(..) => "full_range_resized",
             Self::SpeedRamp(_) => "speed_ramp",
             Self::Stabilized(_) => "stabilized",
+            Self::BlendMode(..) => "blend_mode",
             Self::Tail(_) => "tail",
             Self::KeyedOpacity(_) => "keyed_opacity",
             Self::KeyedColor(_) => "keyed_color",
@@ -481,6 +485,11 @@ impl fmt::Display for Unsupported {
                 f,
                 "{l}: a speed ramp (the export retimes its frames by an expression and picks among them, which the compositor does not reproduce)"
             ),
+            Self::BlendMode(l, mode) => write!(
+                f,
+                "{l}: the {} blend mode (FFmpeg mixes it with the composite by `blend` in RGB, which the compositor does not reproduce)",
+                mode.label().to_lowercase()
+            ),
             Self::Tail(l) => write!(f, "{l}: playing on past its end under a transition"),
             Self::KeyedOpacity(l) => write!(f, "{l}: keyframed opacity (a geq alpha written per frame, which no compositor pass draws or has a parity case for yet)"),
             Self::KeyedColor(l) => write!(
@@ -574,6 +583,14 @@ mod tests {
         assert_ne!(Unsupported::Text.kind(), Unsupported::TextBorder.kind());
         assert_eq!(Unsupported::MixedMatrices.kind(), "mixed_matrices");
         assert_eq!(Unsupported::SpeedRamp(layer(1, "a.mp4")).kind(), "speed_ramp");
+        assert_eq!(
+            Unsupported::BlendMode(layer(0, "a.mp4"), BlendMode::Multiply).kind(),
+            Unsupported::BlendMode(layer(2, "b.mov"), BlendMode::Screen).kind(),
+            "the mode is not part of the key"
+        );
+        assert!(Unsupported::BlendMode(layer(1, "a.mp4"), BlendMode::HardLight)
+            .to_string()
+            .starts_with("layer 1 (a.mp4): the hard light blend mode"));
         assert!(Unsupported::SpeedRamp(layer(1, "a.mp4"))
             .to_string()
             .starts_with("layer 1 (a.mp4): a speed ramp"));
@@ -604,6 +621,7 @@ mod tests {
             Unsupported::FullRangeResized(layer(0, ""), "an export frame").kind(),
             Unsupported::SpeedRamp(layer(0, "")).kind(),
             Unsupported::Stabilized(layer(0, "")).kind(),
+            Unsupported::BlendMode(layer(0, ""), BlendMode::Screen).kind(),
         ];
         for kind in kinds {
             assert!(

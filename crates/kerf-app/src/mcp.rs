@@ -16,12 +16,12 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 
 use base64::Engine as _;
 use kerf_core::{
-    AudioEffect, CaptionFormat, CaptionImportRequest, CaptionOptions, CaptionStyle, CaptionTimeBase, ClipCut, ClipLut, ClipMove,
-    CurvePoint, Curves, Delivery, EditSource, ExportOptions, Fit, Keyframe, Mask, MaskShape, Project, Projection, Property,
-    PropertyKey, PropertyTrack, ReframeKeyframe, Region, SpeedKey, SplitSide, Stabilize, StabilizeStatus, StreamKind, SvgCheck,
-    SvgDoc, SvgLayout, SvgOverlay, SvgOverlayPatch, SvgOverlayResult, SvgPreset, SvgPresetKind, SvgPresetParams, SvgSource, Tag,
-    TagEdit, TextKeyframe, TimeRange, Timeline, TitleClipPatch, TitleClipPlacement, TitleClipResult, Transition, TransitionKind,
-    VideoEffect, Wheel, Wheels,
+    AudioEffect, BlendMode, CaptionFormat, CaptionImportRequest, CaptionOptions, CaptionStyle, CaptionTimeBase, ClipCut, ClipLut,
+    ClipMove, CurvePoint, Curves, Delivery, EditSource, ExportOptions, Fit, Keyframe, Mask, MaskShape, Project, Projection,
+    Property, PropertyKey, PropertyTrack, ReframeKeyframe, Region, SpeedKey, SplitSide, Stabilize, StabilizeStatus, StreamKind,
+    SvgCheck, SvgDoc, SvgLayout, SvgOverlay, SvgOverlayPatch, SvgOverlayResult, SvgPreset, SvgPresetKind, SvgPresetParams,
+    SvgSource, Tag, TagEdit, TextKeyframe, TimeRange, Timeline, TitleClipPatch, TitleClipPlacement, TitleClipResult, Transition,
+    TransitionKind, VideoEffect, Wheel, Wheels,
 };
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{CallToolResult, ContentBlock, Implementation, ServerCapabilities, ServerConfig};
@@ -796,6 +796,16 @@ struct SetMaskParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SetBlendModeParams {
+    #[schemars(description = "UUID of the clip (on a video track) to blend")]
+    clip_id: String,
+    #[schemars(
+        description = "How the clip composites onto the tracks below: \"normal\" (plain, the default), \"multiply\", \"screen\", \"overlay\", \"hard_light\", \"add\" (linear dodge), \"darken\", \"lighten\", \"difference\" or \"exclusion\""
+    )]
+    mode: String,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct SetTrackVolumeParams {
     #[schemars(description = "UUID of the track to set the level of")]
     track_id: String,
@@ -1288,7 +1298,12 @@ struct AudioEffectsParams {
                        {\"type\":\"highpass\",\"hz\":80}, {\"type\":\"lowpass\",\"hz\":12000}, \
                        {\"type\":\"equalizer\",\"hz\":3000,\"width\":1000,\"gain_db\":3}, \
                        {\"type\":\"compressor\",\"threshold_db\":-18,\"ratio\":3,\"attack_ms\":20,\"release_ms\":250,\"makeup_db\":6}, \
-                       or {\"type\":\"gate\",\"threshold_db\":-40}. Pass [] to clear."
+                       {\"type\":\"gate\",\"threshold_db\":-40}, \
+                       or {\"type\":\"denoise\",\"reduction_db\":12,\"floor_db\":-50,\"track_noise\":false} \
+                       (spectral noise reduction: takes up to reduction_db, 0.01..97, off the hiss / hum under \
+                       floor_db, -80..-20 dBFS; start at -50, raise it toward -40 / -35 for a noisy room, and back \
+                       off if speech goes thin or watery — too high a floor eats the voice; track_noise lets the \
+                       filter follow a floor that moves). Pass [] to clear."
     )]
     effects: Vec<AudioEffect>,
 }
@@ -3389,6 +3404,38 @@ impl KerfMcp {
     }
 
     #[tool(
+        description = "Composite a clip onto the tracks BELOW it with a blend mode instead of laying it over \
+                       them: its colour is mixed with what is underneath, per pixel. multiply darkens (white \
+                       vanishes: paper textures, shadows, line art), screen lightens (black vanishes: light leaks, \
+                       lens flares, fire and smoke shot on black), add sums the two (a hotter glow), overlay and \
+                       hard_light add contrast from the clip, darken / lighten keep the darker / lighter of the \
+                       two, difference and exclusion invert where the clip is bright. \"normal\" goes back to \
+                       plain compositing. The clip's opacity, mask, chroma key, fades and dips still decide how much \
+                       of the mix shows (a fade or dip eases the mix in and out rather than going through black or \
+                       white), and outside its picture the lower tracks are untouched, letterbox bars included; a \
+                       clip with nothing under it blends with black. Only a clip on a video track can blend. A \
+                       blended clip costs the export several times a plain one's work per frame while it is on \
+                       screen, and the GPU preview draws its frames through FFmpeg. Check the result with \
+                       preview_timeline."
+    )]
+    fn set_blend_mode(&self, Parameters(p): Parameters<SetBlendModeParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::set_blend_mode_op(project, p))
+    }
+
+    fn set_blend_mode_op(project: &Project, p: SetBlendModeParams) -> Result<String, McpError> {
+        let clip_id = parse_arg("clip_id", &p.clip_id)?;
+        let mode = BlendMode::parse(&p.mode).ok_or_else(|| {
+            let known: Vec<&str> = BlendMode::ALL.iter().map(|m| m.as_str()).collect();
+            McpError::invalid_params(
+                format!("invalid blend mode '{}'; expected one of {}", p.mode, known.join(", ")),
+                None,
+            )
+        })?;
+        let clip = project.set_blend_mode(clip_id, mode).map_err(core_err)?;
+        json(&clip)
+    }
+
+    #[tool(
         description = "Set a track's fader — one linear gain riding every clip on the track, applied after \
                        each clip's own volume and effects. This is how a music bed is balanced against a \
                        voiceover: put the music on its own track and pull it to roughly 0.25-0.4 under \
@@ -3970,7 +4017,7 @@ impl KerfMcp {
     }
 
     #[tool(
-        description = "Replace a clip's audio effect chain (applied in order at export): highpass, lowpass, equalizer (parametric band), compressor (dynamics) or gate (noise gate). Pass an empty list to clear."
+        description = "Replace a clip's audio effect chain (applied in order at export): highpass, lowpass, equalizer (parametric band), compressor (dynamics), gate (noise gate) or denoise (spectral noise reduction for hiss, hum and room tone: put it after a highpass and before a compressor, which would lift the noise). Pass an empty list to clear."
     )]
     fn set_audio_effects(&self, Parameters(p): Parameters<AudioEffectsParams>) -> Result<String, McpError> {
         self.edit(|project| Self::set_audio_effects_op(project, p))
@@ -7314,8 +7361,10 @@ const EDITING_GUIDE: &str = "How to edit with Kerf. The user queues editing task
              track shows through), set_mask (cut a clip to a rectangle or ellipse so \
              a lower track shows through — with a duplicated, blurred copy above, \
              that is how a face or a number plate is blurred), \
+             set_blend_mode (screen a light leak or flare shot on black onto the shot \
+             below, multiply a texture into it), \
              set_audio_effects (highpass / lowpass / EQ / \
-             compressor / gate). Mix with set_track_volume — a music bed belongs \
+             compressor / gate / denoise). Mix with set_track_volume — a music bed belongs \
              on its own track pulled well under the speech (~0.3), which is most \
              of what makes a cut sound finished — plus set_track_duck to dip it \
              further under dialogue and set_track_pan to place it. Animate a clip \

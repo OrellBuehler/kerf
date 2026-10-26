@@ -343,6 +343,9 @@
   **A stabilized clip is refused** (`PlanTiming.stabilized` = `Clip::is_stabilized`, `Unsupported::Stabilized(layer)`, kind
   `stabilized`, Still and Motion alike): its frames are moved by vid.stab's transform or `deshake` in the chain, which no pass
   draws, so FFmpeg draws them (`a_stabilized_clip_is_refused_in_a_still_and_an_export_frame`).
+  **A blend mode is refused** (`PlanLayer.blend`, `Unsupported::BlendMode(layer, mode)`, kind `blend_mode`, Still and Motion alike,
+  for every cap): FFmpeg mixes the layer with the composite by `blend` in RGB after a conversion each way and two placements
+  (`engine-cli.md`, "Blend modes"), arithmetic no compositor pass reproduces, so the frame is FFmpeg's. `normal` refuses nothing.
   **A speed ramp is refused** (`PlanTiming.ramped`, `Unsupported::SpeedRamp(layer)`, kind `speed_ramp`, from `size_free_reasons` in a
   Still and a Motion plan alike, for every cap): the export retimes a ramped clip's frames with a `setpts` expression and lets `fps`
   pick among them (`engine-cli.md`, "Speed ramps"), a pick over a rate that moves which `frame_pick.rs` does not model, and a

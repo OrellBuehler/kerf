@@ -187,7 +187,7 @@ so the feature is **only** activated through these forwards — which is what ma
   `peaks::pump_pcm_cancellable`: killed after a stall of no audio, cancel polled every 100 ms.
   *Moment reads and probes* (`probe`, `run_frame_decode`, `audio_pcm`, the once-per-process
   capability probes `zscale_available` / `help_flags` / `alimiter_latency_available` /
-  `whisper::filter_available`) use `output_bounded` with a wall-clock limit (**300 s** for the
+  `afftdn_delays` / `whisper::filter_available`) use `output_bounded` with a wall-clock limit (**300 s** for the
   import probe — ffprobe prints nothing until it is done, so there is no stall to listen for, and a
   share that is slow to wake needs minutes, not seconds; 60 s capability, 120 s a frame, 60 s an
   audio window); a capability probe that times out reads as
@@ -957,10 +957,35 @@ so the feature is **only** activated through these forwards — which is what ma
   the extraction changed no argv byte: the golden oracle below is the proof, and the next
   change to these numbers has to go through it. Shared test fixtures (assets, streams,
   clips, tracks) live in `engine/test_support.rs`.
+  **Denoise** (`AudioEffect::Denoise`, `engine/cli/denoise.rs`) is `afftdn=nr=…:nf=…` (`:tn=1` only when the
+  floor is tracked). `afftdn` works on windows of three hops of `sample_rate / 80`; **since FFmpeg 5.1 its output
+  is the window two hops back, stamped with the input's time**: the sound comes out `2 * (sr / 80)` samples late
+  (25 ms at 48 kHz, 1102 samples at 44.1 kHz) and its last two hops are lost. **4.4 / 5.0 keep the time but not the
+  length**: a hop comes out only while a whole window is buffered and nothing is flushed, so `hop * floor(n / hop) -
+  2 * hop` samples come out (25–37 ms of tail lost, nothing under three hops) and the first two hops are a partial
+  overlap-add, ~15 dB down. `afftdn_delays()` (once per process: `ffmpeg -h filter=afftdn` lists `noise_reduction`, the
+  long names the rewrite added; a binary that will not run reads as delaying; `with_afftdn_delay` pins it in tests)
+  picks the wrap. Delaying: `asetpts=PTS-STARTPTS,apad=pad_dur=0.024995,afftdn=…,atrim=start=0.024995,asetpts=PTS-STARTPTS`,
+  rebased (`atrim`'s `start` reads timestamps, and the preview's `-ss` decode does not start at 0), padded and trimmed by
+  the delay; `0.024995` rounds to exactly the delay at 8, 12, 16, 24, 32, 44.1, 48 and 96 kHz (a sample off at 22.05,
+  88.2, 192). Not delaying: `asetpts=PTS-STARTPTS,adelay=delays=40:all=1,apad=pad_dur=0.04,afftdn=…,atrim=start=0.04:end=<len+0.04>,asetpts=PTS-STARTPTS`:
+  40 ms of silence at each end (more than three hops, a whole number of samples at every rate from 8 to 192 kHz, so
+  `adelay` and `atrim` cut the same samples) makes the head a full overlap-add and flushes the tail, and the clip's
+  length (`audio_effect_filter`'s `len`, `ClipTiming::duration`) cuts it back; the preview's `audio_effects_filter`
+  has no length and is cut by `audio_pcm`'s own `-t`. Only the delaying text is in the golden oracle (it is pinned
+  there); the other is unit-tested. It runs at the source's rate, after the tempo, like every clip effect.
+  `denoise_rendered` (`#[ignore]`d; run on 6.1.1, and on the 4.4.1 and 5.0.1 static builds via `KERF_FFMPEG` /
+  `KERF_FFPROBE`) holds the export (44.1 / 48 kHz, 1x / 1.5x, a clip with loud ends) and the preview decode to a lag
+  of **0** samples against the dry render, the same length (on 4.4 / 5.0 the clip's own: dry, 4.4's `atempo` runs a
+  few ms past it at 1.5x), the burst and the last 20 ms within 0.5 dB, the first 12 ms within 1.5 dB (6.1's filter
+  leaves them ~1 dB down while it adapts; 4.4 / 5.0 within 0.02 dB), the hiss down by > 10 dB (~21 dB on 6.1, 12–14 on
+  4.4 / 5.0), and the chain written for the other kind of filter to the delay the probe claims (+1199 / 1200 output
+  samples on 6.1, −1199 / 1200 on 4.4 / 5.0), so the probe is measured. It is level-dependent (`is_dynamic`): its
+  floor is an absolute level.
   The per-clip chains (`video_clip_chain` / `audio_clip_chain`) also realize
   each clip's **video effects** (`gblur`/`unsharp`/`hue`/`negate`/`vignette`, and
   `chromakey` which keeps alpha so a lower track shows through), **audio effects**
-  (`highpass`/`lowpass`/`equalizer`/`acompressor`/`agate`) and **transform keyframes**
+  (`highpass`/`lowpass`/`equalizer`/`acompressor`/`agate`/`afftdn`, the denoise above) and **transform keyframes**
   — animated zoom via `scale=eval=frame`, animated position via the `overlay` x/y
   expr, rotation via `rotate`, opacity via `geq` (all driven by piecewise-linear
   `keyframe_expr` over clip-local time). **An expression may nest about 100 levels** (libavutil's
@@ -1590,6 +1615,42 @@ decimated read misses) and a decimated frame (at most 480 x 270 samples) for the
 the peaks (a 64² vectorscope, cells with at least 1 % of the samples). A measurement, not a frame anyone waits to see:
 ungated by `cpu::lease`, but niced (`bg_command`) and thread-capped by the still's spawn-time tuning, supervised like every still (`output_supervised_sized`: `STILL_TIMEOUT`, the cancel, killed past either), at most
 `MAX_SCOPE_WIDTH` (3840) wide, the pipe read into a buffer sized from the frame (the `capacity` of `output_supervised_sized`, `output_bounded` takes one too). `scopes_of_a_rendered_frame` (`#[ignore]`d) holds a one-pixel clip through the real graph.
+  **Blend modes** (`Clip::blend_mode`, `engine/cli/blend.rs`; the module docs are the long form). A clip at `normal` keeps its
+  `[cur][v{flat}]overlay=…` byte for byte. Any other mode replaces that one statement with `blend_chains`: the composite is split
+  (`format=yuv420p` first, the 8-bit 4:2:0 every `overlay` composes in) into one copy that passes on to the last `overlay` and one
+  `select`ed to the clip's window (the `enable`'s own `between(t,…)`) and split three ways, so only the window's frames are
+  converted (1080p: ~30 ms a blended frame against ~3 for a plain `overlay`; outside the window a `split`); the still has one
+  frame and no `select`. The clip's pad is split and laid out as a whole
+  frame **twice by the very `overlay` the plain composite would use** (position, travel, per-frame zoom, `enable`): opaque
+  (`lutyuv=a=255`, which follows a per-frame size where a `format` would pin it) onto a copy, for its colour, and onto a copy made
+  transparent (`lutyuv=a=0`), `alphaextract`ed, for its alpha (one `overlay` onto a transparent canvas would mix the canvas's
+  chroma into a translucent layer); `alphamerge`, both frames to `gbrap` and `blend=c0_mode=M:c1_mode=M:c2_mode=M` (the clip on
+  top; `c3` left `normal` copies the clip's alpha), back to `yuva420p`, and a last `overlay` onto the untouched composite:
+  `composite·(1−α) + mode(clip, composite)·α`, so opacity (static or keyed), mask, key, fades and a dissolve's alpha weigh the
+  mix, and outside the clip's picture (or its window) the composite is byte for byte. **A blended clip's fades and dips are
+  alpha fades** (`ClipTiming::fades` makes every step `FadeTint::Alpha`, keeping its timing; the chain then establishes
+  `yuva420p` as for a dissolve): faded as colour, a multiplied clip went through black and a screened one through white. **Its
+  letterbox bars are transparent** (`letterbox_pad` with `keeps_clear_bars`: `format=yuva420p,pad=…:color=black@0` under
+  Contain) unless a filter after the pad drops the alpha — a tone-map, a grade given back to a tagged matrix
+  (`format=yuv444p…`), `vignette` — and then they stay black. **Its static rotation fills with `black@0`** (`static_rotate`), not
+  `none`, whose zeroed chroma put the rotated edge 33 levels of luma off. The scrubbed still uses the same chains with its own
+  placement (`still_overlay`) and the same fades, bars and fill (`StillBlend`); a title on a track composites like footage.
+  **Colour**: blend modes are RGB, and both conversions name the composite's matrix, the bottom layer's tag (`composite_matrix`:
+  BT.709 for a labelled layer, else `frame_matrix`), with `tv` range: FFmpeg 9 negotiates that tag anyway (so the composite
+  outside the clip stays byte for byte; naming another made it convert the whole composite at the last `overlay`), FFmpeg 6
+  carries the composite untagged and mixed BT.709 footage in BT.601's RGB (4 to 30 levels off). An untagged bottom layer names
+  nothing (BT.601 both ways). The scaler is `neighbor` (bicubic bled 14 levels of chroma across the clip's edge). Rendered
+  (`blend_rendered.rs`, `#[ignore]`d, 6.1 and 9.0): every mode at full and half opacity within 2.5 levels of `BlendMode::apply`
+  over the composite's colours, BT.709 footage within 1.5 through BT.709 and the still equal to it, the composite outside the
+  clip byte for byte and outside its window frame for frame, the graph run with `normal` equal to the plain `overlay` (byte for
+  byte for flat colours, 1 level for a smooth picture, a rotated picture's luma byte for byte), a fade / dip to black / dip to
+  white staying between the composite and the mix, a letterboxed clip's bars leaving the lower track byte for byte, a keyed
+  opacity from 0 equal to the composite at its first frame, a moving zoom blended over a growing area, a mask cutting the
+  blend, the still equal to the export (0 levels). **Limits**: a 4:2:0 picture whose pixel and block chroma make no RGB colour
+  (sharp saturated edges) is clipped into the gamut (~25 levels at such edges); along an edge that cuts a 2x2 chroma block (a
+  rotated clip's slant, an odd-sized layer's last column / row) the blend takes the block's chroma from one pixel where
+  `overlay` weighs it by the block's alpha (up to 80 levels of chroma in those blocks); the bars above stay black. The GPU
+  compositor refuses it (`Unsupported::BlendMode`). Golden: the appended `blend` family.
   **Speed ramps** (`Clip::speed_ramp`: keys of clip-local timeline time, speed and `linear` / `hold`; `model/speed_ramp.rs` is the
   map, `Clip::along` / `local_at_along` its two directions; `clip_timing/ramp.rs` is what the graph prints). Nothing reads
   `speed_mag()` for a ramped clip: the window, the tail, `picture_window`, the handle, the scrub, the plan, the cover and the

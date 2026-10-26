@@ -99,6 +99,7 @@ pub(super) const TOOLS: &[(&str, &str, Effect, ToolSet)] = &[
     ("remove_track", "Remove track", Edit, Core),
     ("set_track_duck", "Duck track", Set, Audio),
     ("set_mask", "Set mask", Set, Clips),
+    ("set_blend_mode", "Clip blend mode", Set, Clips),
     ("set_track_volume", "Track volume", Set, Audio),
     ("set_track_pan", "Track pan", Set, Audio),
     ("set_master_volume", "Master volume", Set, Audio),

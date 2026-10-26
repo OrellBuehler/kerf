@@ -414,7 +414,11 @@ release, Escape abandons via `beginDrag`; a click that only adds a point or puts
 a double-click, which undoes it, and a gesture that changes nothing writes nothing; three hue discs painted from `grade.ts`'s `wheelHue` with a lightness
 `SliderRow` each; a `.cube` picker, a Clear button and an intensity slider, with `inspect_lut` saying the size or why the
 file is not applied. Curves are drawn with `grade.ts`, the TS mirror of the engine's cubic; the preview shows the
-grade through FFmpeg because the GPU preview refuses a graded clip), **stabilize** (`StabilizeSection.svelte`, offered for
+grade through FFmpeg because the GPU preview refuses a graded clip), a **Blend** select under Opacity in the Transform
+section (`blend-modes.ts`: `BLEND_MODES`, the core's `BlendMode` ids, labels and a hint each shown by `use:tip`; one
+`set_blend_mode` on change, nothing written for the mode the clip has; `blendModeOf` reads an absent field as `normal`; the
+harness writes `normal` as no field and refuses a clip on an audio track, `blend-modes.test.ts`; the preview of a blended clip
+is FFmpeg's, as the GPU refuses it), **stabilize** (`StabilizeSection.svelte`, offered for
 moving footage on a video track only, `stabilize.ts`'s `canStabilize`: a switch, a strength `SliderRow`, an automatic-zoom
 switch and a zoom slider when it is off, each one `set_clip_stabilize`; a status badge and line from
 `clip_stabilization_status` and `stabilize-progress`; the panel starts `analyze_clip_stabilization` itself for a clip whose
@@ -1226,7 +1230,8 @@ number's `keyAtPlayhead`) read that clip. **A plain field** (`numRow`, a title's
 Transitions tab's length) is no different: its `change` comes with the blur, by when the selection has moved *and the field has been
 re-rendered with the new selection's value*, so reading either writes the other clip's number onto this one. `FieldEdits`
 (`field-edit.ts`) notes the scope on `focus` and the typed text on `input` and `compositionend`, and the commit takes both from there (`noteFocus` /
-`noteTyped` / `endEdit` in the Inspector); a select or a checkbox changes at once and only needs the scope. A bun test holds every
+`noteTyped` / `endEdit` in the Inspector); a select or a checkbox changes at once and only needs the scope (an effect's
+boolean parameter, denoise's `track_noise`, is a `CheckRow` with `pending`). A bun test holds every
 text and number input of the Inspector to this. Rest values are the model's
 `DEFAULT_TRANSFORM` / `DEFAULT_COLOR` / `DEFAULT_REFRAME` / `DEFAULT_MASK`. The Inspector's other rows (read-only values, plain number
 fields) share the label column and end where the sliders' numbers do, a field's unit (`s`) sitting in the keyframe slot. The ◇ is a 24 px `IconBtn` with a `diamond` icon (filled while a key sits at the playhead).

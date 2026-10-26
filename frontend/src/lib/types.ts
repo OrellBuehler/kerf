@@ -416,6 +416,20 @@ export interface LutInfo {
 
 export type MaskShape = 'rect' | 'ellipse';
 
+/** How a clip composites onto the tracks below. Mirrors `BlendMode` in crates/kerf-core/src/model.rs
+ *  (`blend-modes.ts` lists them for a picker). */
+export type BlendMode =
+	| 'normal'
+	| 'multiply'
+	| 'screen'
+	| 'overlay'
+	| 'hard_light'
+	| 'add'
+	| 'darken'
+	| 'lighten'
+	| 'difference'
+	| 'exclusion';
+
 /** A shape cut out of a clip: inside it the clip is kept, outside it goes
  *  transparent so a lower track shows through. Everything is a fraction of the
  *  rendered frame. Mirrors `Mask` in crates/kerf-core/src/model.rs. */
@@ -484,7 +498,8 @@ export type AudioEffect =
 			release_ms: number;
 			makeup_db: number;
 	  }
-	| { type: 'gate'; threshold_db: number };
+	| { type: 'gate'; threshold_db: number }
+	| { type: 'denoise'; reduction_db: number; floor_db: number; track_noise: boolean };
 
 /** How a keyframe travels to the next one (kerf-core's `Easing`); omitted is linear. */
 export type Easing =
@@ -1000,6 +1015,8 @@ export interface Clip {
 	transition_in?: Transition | null;
 	/** A shape cut out of this clip; absent is the whole frame. */
 	mask?: Mask | null;
+	/** How the clip composites onto the tracks below; absent is `normal` (the backend omits it). */
+	blend_mode?: BlendMode;
 	effects?: VideoEffect[];
 	audio?: AudioEffect[];
 	keyframes?: Keyframe[];

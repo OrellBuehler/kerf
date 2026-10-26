@@ -840,6 +840,10 @@ impl<'a> ClipTiming<'a> {
     /// whole when the outgoing one goes; one no longer than the delay is over before the picture
     /// comes, and has no step. A step of no length is left out: FFmpeg reads `d=0` as its
     /// default of 25 frames.
+    ///
+    /// A clip with a blend mode fades its alpha instead, keeping each fade's timing: the fade
+    /// weighs the mix, where a colour fade would multiply or screen a black or white frame
+    /// onto the composite.
     pub fn fades(&self) -> Vec<FadeStep> {
         let (clip, fx) = (self.clip, self.fx);
         let dur = self.duration();
@@ -879,7 +883,10 @@ impl<'a> ClipTiming<'a> {
             (fx.xfade_in, FadeEdge::In, FadeTint::Alpha),
         ] {
             if len > 0.0 {
-                let s = step(edge, tint, len);
+                let mut s = step(edge, tint, len);
+                if !clip.blend_mode.is_normal() {
+                    s.tint = FadeTint::Alpha;
+                }
                 if s.d > 0.0 {
                     steps.push(s);
                 }
@@ -1074,6 +1081,31 @@ mod tests {
         let tl = single(vec![long]);
         let fx = transition_fx(&tl, std::slice::from_ref(&asset));
         assert_eq!(timing(&tl, &fx, 0).fades(), vec![step(FadeEdge::Out, 5.0, 4.0)]);
+    }
+
+    #[test]
+    fn a_blended_clip_fades_its_alpha_on_the_same_timing() {
+        let asset = asset();
+        let mut clip = make_clip(asset.id, 0.0, 4.0, 5.0);
+        clip.fade_in = 0.5;
+        clip.fade_out = 1.0;
+        let colour = {
+            let tl = single(vec![clip.clone()]);
+            timing(&tl, &transition_fx(&tl, std::slice::from_ref(&asset)), 0).fades()
+        };
+        clip.blend_mode = crate::model::BlendMode::Multiply;
+        let tl = single(vec![clip]);
+        let alpha = timing(&tl, &transition_fx(&tl, std::slice::from_ref(&asset)), 0).fades();
+        assert_eq!(
+            alpha,
+            colour
+                .iter()
+                .map(|s| FadeStep {
+                    tint: FadeTint::Alpha,
+                    ..*s
+                })
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

@@ -86,6 +86,7 @@ import {
 	removeTrack,
 	setTrackDuck,
 	setMask,
+	setBlendMode,
 	setGrade,
 	setClipStabilize,
 	setTrackVolume,
@@ -167,6 +168,7 @@ import type {
 	ExportOptions,
 	Easing,
 	Keyframe,
+	BlendMode,
 	Mask,
 	Grade,
 	Stabilize,
@@ -1289,6 +1291,10 @@ class EditorState {
 	/** Cut a clip to a shape, or `null` to clear the mask. */
 	setMask(clipId: string, mask: Mask | null) {
 		return this.#apply(() => setMask(clipId, mask));
+	}
+	/** Composite a clip onto the tracks below with a blend mode. */
+	setBlendMode(clipId: string, mode: BlendMode) {
+		return this.#apply(() => setBlendMode(clipId, mode));
 	}
 	setGrade(clipId: string, grade: Grade) {
 		return this.#apply(() => setGrade(clipId, grade));
