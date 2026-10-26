@@ -227,6 +227,8 @@
 						<span style="flex:none;color:{item.disabled ? 'var(--text-disabled)' : 'var(--text-muted)'}"
 							><Kbd keys={item.shortcut} inherit /></span
 						>
+					{:else if item.meta}
+						<span style="flex:none;font-variant-numeric:tabular-nums;color:{item.disabled ? 'var(--text-disabled)' : 'var(--text-muted)'}">{item.meta}</span>
 					{/if}
 				</button>
 			{/if}

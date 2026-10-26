@@ -12,6 +12,7 @@
 	import ComposeMusicDialog from '#lib/components/editor/ComposeMusicDialog.svelte';
 	import FitMusicDialog from '#lib/components/editor/FitMusicDialog.svelte';
 	import StemsDialog from '#lib/components/editor/StemsDialog.svelte';
+	import TagDialog from '#lib/components/editor/TagDialog.svelte';
 	import SaveTemplateDialog from '#lib/components/editor/SaveTemplateDialog.svelte';
 	import ShortcutSheet from '#lib/components/editor/ShortcutSheet.svelte';
 	import RelinkDialog from '#lib/components/editor/RelinkDialog.svelte';
@@ -85,6 +86,7 @@
 	import { missingProjectMessage } from '#lib/launch';
 	import { recoveryCopy } from '#lib/recovery';
 	import { tip } from '#lib/tip';
+	import { filterByTags, tagsSignature } from '#lib/tag-ui';
 	import { CONFIRM, UNSAVED, leaveAfter, proceedAfter, type UnsavedCopy } from '#lib/confirm-copy';
 	import { changeIndex, changePoints, stepChange } from '#lib/staged-diff';
 	import { clampPlayhead, secondFrames, stepFrames } from '#lib/frames';
@@ -103,6 +105,7 @@
 			ui.fitMusicDialog !== null ||
 			ui.relinkDialog ||
 			ui.stemsDialog !== null ||
+			ui.tagDialog !== null ||
 			ui.saveTemplateDialog !== null ||
 			ui.shortcutSheet
 	);
@@ -114,6 +117,24 @@
 	$effect(() => {
 		void editor.assets.map((a) => a.id).join(',');
 		untrack(() => void mediaStatus.refresh());
+	});
+
+	// The tag vocabulary (the autocomplete, the bin's filter) follows the tags of the assets: read again when one is
+	// added, removed or renamed, by us or by an agent.
+	$effect(() => {
+		void tagsSignature(editor.assets);
+		untrack(() => void editor.refreshTagVocabulary());
+	});
+
+	// A tag filter that hides some of the selected assets takes them out of the selection, so "Tag 5 assets" never
+	// names more than the bin shows; a new project starts with no filter.
+	$effect(() => {
+		const visible = new Set(filterByTags(editor.assets, ui.tagFilter).map((a) => a.id));
+		untrack(() => editor.restrictAssetSelection(visible));
+	});
+	$effect(() => {
+		void editor.loadEpoch;
+		untrack(() => ui.setTagFilter([]));
 	});
 
 	// What the editor shows, for an agent's `get_editor_context` (throttled, `editor-context.ts`).
@@ -259,6 +280,7 @@
 		 *  remembered about the last one, and load the new project as an open does. */
 		async function onProjectReplaced() {
 			editor.selectedAssetId = null;
+			editor.selectedAssetIds = [];
 			editor.selectedClipId = null;
 			editor.selectedClipIds = [];
 			editor.selectedOverlayId = null;
@@ -620,7 +642,11 @@
 			// Whatever else Escape is for gets it first: a menu or the notification
 			// panel closing, a drag being abandoned (those stop the event; a dialog
 			// never gets here, the page is inert behind it).
-			if (!contextMenu.visible && !notifications.open) editor.clearSelection();
+			if (!contextMenu.visible && !notifications.open) {
+				editor.clearSelection();
+				// Several assets picked in the bin shrink to the one the Inspector is on.
+				editor.collapseAssetSelection();
+			}
 			// And it is never swallowed: it is how the browser backs out of things too.
 			return false;
 		},
@@ -893,6 +919,13 @@
 
 {#if ui.stemsDialog}
 	<StemsDialog assetId={ui.stemsDialog.assetId} clipId={ui.stemsDialog.clipId} onClose={() => ui.closeStems()} />
+{/if}
+
+{#if ui.tagDialog}
+	<!-- Keyed by the dialog's own number: the next one in the queue takes the place of the one that closed, afresh. -->
+	{#key ui.tagDialog.id}
+		<TagDialog assetIds={ui.tagDialog.assetIds} mode={ui.tagDialog.mode} onClose={() => ui.closeTagDialog()} />
+	{/key}
 {/if}
 
 {#if ui.saveTemplateDialog}

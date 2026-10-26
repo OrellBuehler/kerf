@@ -37,12 +37,14 @@ import {
 	detachAudio,
 	detachAudioClips,
 	extractAudio,
+	editAssetTags,
 	getAssetMetadata,
 	getHistory,
 	getRippleMode,
 	getTimeline,
 	importAsset,
 	listAssets,
+	listTags,
 	addTrack,
 	moveClip,
 	moveClips,
@@ -184,6 +186,8 @@ import type {
 	SvgOverlay,
 	SvgOverlayPatch,
 	SvgSource,
+	TagEdit,
+	TagSummary,
 	TemplateEdit,
 	TextAnimation,
 	TextBox,
@@ -208,7 +212,9 @@ import { trimRefusal } from './trim-tools';
 import { HISTORY_PAGE, redoable, undoable } from './paging';
 import { Generation, ReadOrder } from './generation';
 import { retimeKeyframes, withKeyframeAt } from './titles';
-import { normalize, pruneSelection, type PickMode } from './selection';
+import { normalize, pruneSelection, type PickMode, type Modifiers, type Selection } from './selection';
+import { collapsed, pickAsset as pickAssetSelection, restrictToVisible, selectionOf } from './bin-selection';
+import { tagsSignature } from './tag-ui';
 import { clickSelectLinked } from './link-ui';
 import { locateIndex, withLinkPartners } from './link-groups';
 
@@ -242,7 +248,16 @@ export class PreviewReadOnly extends EditRefused {
 class EditorState {
 	assets = $state<Asset[]>([]);
 	timeline = $state<Timeline>({ tracks: [] });
+	/** The asset the Inspector describes: the primary of `selectedAssetIds`. (A drag out of the bin takes the asset it
+	 *  began on, selected or not.) */
 	selectedAssetId = $state<string | null>(null);
+	/** The assets selected in the bin (Ctrl/Cmd-click toggles, Shift-click extends). Holds `selectedAssetId` when that is
+	 *  set; every way of changing the two goes through `select` / `pickAsset` / `selectAssets`. */
+	selectedAssetIds = $state<string[]>([]);
+	selectedAssetSet = $derived(new Set(this.selectedAssetIds));
+	/** Every tag in use in the library (`list_tags`), for the autocomplete and the bin's filter; read again whenever
+	 *  the tags of the assets change (`refreshTagVocabulary`). */
+	tagVocabulary = $state.raw<TagSummary>({ keys: [], plain: [] });
 	/** The clip the Inspector edits — the primary of the selection. */
 	selectedClipId = $state<string | null>(null);
 	/** The whole selection. Always contains `selectedClipId` when that is set;
@@ -341,6 +356,10 @@ class EditorState {
 	/** Sequence guard over `select()` — a slow metadata fetch for an earlier
 	 *  click must not overwrite a faster, newer one. */
 	#selectGen = new Generation();
+	/** Orders the reads of the library (`refreshAssets`): a local write advances it (`#setAssets`). */
+	#assetsGen = new Generation();
+	/** Orders the reads of the tag vocabulary (`refreshTagVocabulary`). */
+	#vocabOrder = new ReadOrder();
 
 	get selectedAsset(): Asset | undefined {
 		return this.assets.find((a) => a.id === this.selectedAssetId);
@@ -607,7 +626,7 @@ class EditorState {
 				projectPath(),
 				this.loadRippleMode()
 			]);
-			this.assets = assets;
+			this.#setAssets(assets);
 			this.#setTimeline(timeline);
 			this.history = history;
 			this.historyMore = history.length >= this.historyLimit;
@@ -630,6 +649,7 @@ class EditorState {
 	async newProject(): Promise<boolean> {
 		if (!(await apiNewProject())) return false; // running in the browser
 		this.selectedAssetId = null;
+		this.selectedAssetIds = [];
 		this.selectedClipId = null;
 		this.selectedClipIds = [];
 		this.selectedOverlayId = null;
@@ -643,6 +663,7 @@ class EditorState {
 		const path = await apiOpenProject(file);
 		if (path === null) return false; // cancelled, or running in the browser
 		this.selectedAssetId = null;
+		this.selectedAssetIds = [];
 		this.selectedClipId = null;
 		this.selectedClipIds = [];
 		this.selectedOverlayId = null;
@@ -656,6 +677,7 @@ class EditorState {
 		const path = await apiOpenRecent(file);
 		if (path === null) return false; // running in the browser
 		this.selectedAssetId = null;
+		this.selectedAssetIds = [];
 		this.selectedClipId = null;
 		this.selectedClipIds = [];
 		this.selectedOverlayId = null;
@@ -668,6 +690,7 @@ class EditorState {
 	async recoverProject(id: string): Promise<boolean> {
 		if (!(await apiRecoverProject(id))) return false;
 		this.selectedAssetId = null;
+		this.selectedAssetIds = [];
 		this.selectedClipId = null;
 		this.selectedClipIds = [];
 		this.selectedOverlayId = null;
@@ -689,9 +712,16 @@ class EditorState {
 		if (assetId === GENERATED_ASSET) {
 			this.#selectGen.advance();
 			this.selectedAssetId = null;
+			this.selectedAssetIds = [];
 			this.selectedMetadata = null;
 			return;
 		}
+		this.selectedAssetIds = [assetId];
+		await this.#describe(assetId);
+	}
+
+	/** Make `assetId` the one the Inspector describes and read its metadata; the set of selected assets is the caller's. */
+	async #describe(assetId: string) {
 		this.selectedAssetId = assetId;
 		const seq = this.#selectGen.advance();
 		try {
@@ -703,6 +733,47 @@ class EditorState {
 			if (!this.#selectGen.isCurrent(seq)) return;
 			this.selectedMetadata = null;
 		}
+	}
+
+	/** The bin's selection as a `Selection`: the assets and the primary. */
+	get assetSelection(): Selection {
+		return selectionOf(this.selectedAssetIds, this.selectedAssetId);
+	}
+
+	/** Select these assets, `selection.primary` being the one the Inspector describes (a primary that is already the
+	 *  Inspector's is not read again). */
+	async selectAssets(selection: Selection) {
+		this.selectedAssetIds = [...selection.ids];
+		if (selection.primary === this.selectedAssetId) return;
+		if (selection.primary === null) {
+			this.#selectGen.advance();
+			this.selectedAssetId = null;
+			this.selectedMetadata = null;
+			return;
+		}
+		await this.#describe(selection.primary);
+	}
+
+	/** A click on an asset of the bin: a plain click selects it alone, Ctrl/Cmd toggles it, Shift extends from the
+	 *  primary across `order` (the assets the bin shows, in order). */
+	pickAsset(assetId: string, mods: Modifiers, order: readonly string[]) {
+		const plain = !mods.shiftKey && !mods.ctrlKey && !mods.metaKey;
+		if (plain) return this.select(assetId);
+		return this.selectAssets(pickAssetSelection(this.assetSelection, assetId, mods, order));
+	}
+
+	/** Drop the assets from the selection that `visible` does not hold (the bin's filter hides them). */
+	restrictAssetSelection(visible: ReadonlySet<string>) {
+		const now = this.assetSelection;
+		const next = restrictToVisible(now, visible);
+		if (next !== now) void this.selectAssets(next);
+	}
+
+	/** Escape in the bin: a selection of several shrinks to its primary. Whether it had anything to do. */
+	collapseAssetSelection(): boolean {
+		if (this.selectedAssetIds.length < 2) return false;
+		this.selectedAssetIds = [...collapsed(this.assetSelection).ids];
+		return true;
 	}
 
 	async refreshTimeline() {
@@ -882,7 +953,7 @@ class EditorState {
 						// Both lens files of a 360 capture resolve to one stitched
 						// asset, so importing the pair must not list it twice.
 						if (!this.assets.some((a) => a.id === asset.id)) {
-							this.assets = [...this.assets, asset];
+							this.#setAssets([...this.assets, asset]);
 						}
 						return asset;
 					} catch (e) {
@@ -903,13 +974,67 @@ class EditorState {
 		}
 	}
 
+	/** Every write of `assets` goes through here, so a read of the library that began before it knows it is stale. */
+	#setAssets(next: Asset[]) {
+		this.#assetsGen.advance();
+		this.assets = next;
+	}
+
 	/** Re-read the asset list, for assets an agent brought in behind our back
-	 *  (a voiceover it generated). Left alone when nothing is new, so the bin
-	 *  does not re-render on every agent edit. */
+	 *  (a voiceover it generated) or tagged. Left alone when nothing is new, so the bin
+	 *  does not re-render on every agent edit. A read that a local write (a tag edit, an import) overtook is dropped:
+	 *  it would put the old tags back. */
 	async refreshAssets() {
+		const snapshot = this.#assetsGen.read();
 		const assets = await listAssets();
+		if (!this.#assetsGen.isCurrent(snapshot)) return;
 		const known = new Set(this.assets.map((a) => a.id));
-		if (assets.length !== known.size || assets.some((a) => !known.has(a.id))) this.assets = assets;
+		if (assets.length !== known.size || assets.some((a) => !known.has(a.id)) || tagsSignature(assets) !== tagsSignature(this.assets)) {
+			this.#setAssets(assets);
+			const here = new Set(assets.map((a) => a.id));
+			await this.#pruneAssetSelection((id) => here.has(id));
+		}
+	}
+
+	/** Take the assets that are gone out of the bin's selection. When the Inspector's own asset went, it passes to
+	 *  another selected one, or is cleared. */
+	async #pruneAssetSelection(exists: (id: string) => boolean) {
+		const kept = this.selectedAssetIds.filter(exists);
+		const primaryGone = this.selectedAssetId !== null && !exists(this.selectedAssetId);
+		if (kept.length === this.selectedAssetIds.length && !primaryGone) return;
+		this.selectedAssetIds = kept;
+		if (!primaryGone) return;
+		if (kept.length > 0) {
+			await this.selectAssets(normalize(kept, null));
+		} else {
+			this.#selectGen.advance();
+			this.selectedAssetId = null;
+			this.selectedMetadata = null;
+		}
+	}
+
+	/** Put tags on assets, take them off or replace a key's, all in one transaction (`edit_asset_tags`): the bin, the
+	 *  Inspector and the vocabulary follow at once. Not an edit of the cut, so no revision and no undo. */
+	async tagAssets(assetIds: readonly string[], edit: TagEdit): Promise<Asset[]> {
+		const done = await editAssetTags([...assetIds], edit);
+		const by = new Map(done.map((a) => [a.id, a]));
+		this.#setAssets(this.assets.map((a) => by.get(a.id) ?? a));
+		const meta = this.selectedMetadata;
+		const fresh = meta ? by.get(meta.asset.id) : undefined;
+		if (meta && fresh) this.selectedMetadata = { ...meta, asset: fresh };
+		return done;
+	}
+
+	/** Read the library's tag vocabulary again. Of the reads that come back the newest writes, and a failed one keeps
+	 *  what was there (`ReadOrder`). */
+	async refreshTagVocabulary() {
+		const ticket = this.#vocabOrder.begin();
+		try {
+			const vocab = await listTags();
+			if (this.#vocabOrder.land(ticket)) this.tagVocabulary = vocab;
+		} catch {
+			/* the autocomplete just has less to offer */
+		}
 	}
 
 	/** Take media out of the project: refused while a clip (or the proposal) uses it, unless `force`, which first
@@ -920,12 +1045,9 @@ class EditorState {
 			done = await removeAsset(assetId, force);
 			return done.timeline;
 		});
-		this.assets = this.assets.filter((a) => a.id !== assetId);
+		this.#setAssets(this.assets.filter((a) => a.id !== assetId));
 		delete this.analyses[assetId];
-		if (this.selectedAssetId === assetId) {
-			this.selectedAssetId = null;
-			this.selectedMetadata = null;
-		}
+		await this.#pruneAssetSelection((id) => id !== assetId);
 		return done;
 	}
 
@@ -933,7 +1055,7 @@ class EditorState {
 	 *  cut from it; its analysis stays only when the file is the old media moved. */
 	async relinkMedia(assetId: string, path: string): Promise<Relinked> {
 		const done = await relinkAsset(assetId, path);
-		this.assets = this.assets.map((a) => (a.id === assetId ? done.asset : a));
+		this.#setAssets(this.assets.map((a) => (a.id === assetId ? done.asset : a)));
 		if (!done.analysis_kept) delete this.analyses[assetId];
 		if (this.selectedAssetId === assetId) await this.select(assetId);
 		return done;
@@ -1295,7 +1417,7 @@ class EditorState {
 	/** Mark (or unmark) an asset as 360 footage; later cuts from it reframe. */
 	async setAssetProjection(assetId: string, projection: Projection | null) {
 		const asset = await setAssetProjection(assetId, projection);
-		this.assets = this.assets.map((a) => (a.id === asset.id ? asset : a));
+		this.#setAssets(this.assets.map((a) => (a.id === asset.id ? asset : a)));
 		if (this.selectedMetadata?.asset.id === asset.id) {
 			this.selectedMetadata = { ...this.selectedMetadata, asset };
 		}
@@ -1456,9 +1578,9 @@ class EditorState {
 		this.#busyCount++;
 		try {
 			const { asset, timeline } = await generateVoiceover(req);
-			this.assets = this.assets.some((a) => a.id === asset.id)
-				? this.assets.map((a) => (a.id === asset.id ? asset : a))
-				: [...this.assets, asset];
+			this.#setAssets(
+				this.assets.some((a) => a.id === asset.id) ? this.assets.map((a) => (a.id === asset.id ? asset : a)) : [...this.assets, asset]
+			);
 			this.#setTimeline(timeline);
 			await this.refreshHistory();
 			await this.select(asset.id);
@@ -1478,9 +1600,11 @@ class EditorState {
 		this.#busyCount++;
 		try {
 			const done = await composeMusic(req);
-			this.assets = this.assets.some((a) => a.id === done.asset.id)
-				? this.assets.map((a) => (a.id === done.asset.id ? done.asset : a))
-				: [...this.assets, done.asset];
+			this.#setAssets(
+				this.assets.some((a) => a.id === done.asset.id)
+					? this.assets.map((a) => (a.id === done.asset.id ? done.asset : a))
+					: [...this.assets, done.asset]
+			);
 			this.#setTimeline(done.timeline);
 			await this.refreshHistory();
 			this.selectClips([done.clip.id], done.clip.id);
@@ -1505,7 +1629,7 @@ class EditorState {
 			const { placed, timeline } = await separateStems(assetId, clipId);
 			const known = new Set(this.assets.map((a) => a.id));
 			const fresh = placed.assets.filter((a) => !known.has(a.id));
-			if (fresh.length > 0) this.assets = [...this.assets, ...fresh];
+			if (fresh.length > 0) this.#setAssets([...this.assets, ...fresh]);
 			if (clipId) {
 				this.#setTimeline(timeline);
 				await this.refreshHistory();

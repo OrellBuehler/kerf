@@ -186,6 +186,14 @@ pub(super) struct AssetLine {
     /// The source file is gone from disk. Absent otherwise.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     source_missing: bool,
+    /// The asset's tags as text, `location: Cumbuco` or `jump`. Absent when it has none.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    tags: Vec<String>,
+}
+
+/// Tags as text (`location: Cumbuco`, `jump`): how the compact listing and the answer of a tag edit show them.
+pub(super) fn tag_texts(tags: &[kerf_core::Tag]) -> Vec<String> {
+    tags.iter().map(ToString::to_string).collect()
 }
 
 /// `59.94005994` as `59.94`, `30.0` as `30`.
@@ -244,6 +252,7 @@ impl AssetLine {
             analysis_failed,
             music_score: asset.music_score.is_some(),
             source_missing: !std::path::Path::new(&asset.path).exists(),
+            tags: tag_texts(&asset.tags),
         }
     }
 }
@@ -275,10 +284,12 @@ pub(super) struct AssetsPage {
 }
 
 /// The page a `list_assets` call asked for.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub(super) struct AssetsQuery {
     fields: AssetFields,
     imported_after: Option<chrono::DateTime<chrono::Utc>>,
+    /// Terms every listed asset's tags must satisfy (checked and normalized).
+    tags: Vec<kerf_core::TagFilter>,
     offset: usize,
     limit: usize,
 }
@@ -303,10 +314,18 @@ impl ListAssetsParams {
                     .with_timezone(&chrono::Utc),
             ),
         };
+        let tags = self
+            .tags
+            .iter()
+            .flatten()
+            .map(kerf_core::TagFilter::checked)
+            .collect::<kerf_core::Result<Vec<_>>>()
+            .map_err(core_err)?;
         let (offset, limit) = page_of(self.offset, self.limit, DEFAULT_PAGE, MAX_PAGE);
         Ok(AssetsQuery {
             fields: self.fields.unwrap_or_default(),
             imported_after,
+            tags,
             offset,
             limit,
         })
@@ -327,6 +346,7 @@ pub(super) fn assets_page(
     if let Some(after) = query.imported_after {
         inputs.retain(|i| i.asset.imported_at > after);
     }
+    inputs.retain(|i| kerf_core::tags_match(&query.tags, &i.asset.tags));
     let total = inputs.len();
     let start = query.offset.min(total);
     let window = &inputs[start..];
@@ -953,6 +973,12 @@ pub(super) struct ListAssetsParams {
                        Assets come oldest import first; `offset` counts within the matches"
     )]
     imported_after: Option<String>,
+    #[schemars(
+        description = "Only the assets whose tags satisfy EVERY term. A term is {\"key\":\"location\",\"value\":\"Cumbuco\"} for that \
+                       tag, {\"key\":\"location\"} for any tag with that key, or {\"value\":\"jump\"} for the plain tag `jump` \
+                       (ignoring case). Combines with the other filters; `total` counts the matches"
+    )]
+    tags: Option<Vec<kerf_core::TagFilter>>,
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
@@ -1080,7 +1106,10 @@ impl KerfMcp {
                        done: \"all\", \"none\" or e.g. \"silence scenes\"; `analysis_running` and `analysis_failed` when any) and \
                        `music_score` (true: the score itself is in the whole entry and in get_asset_metadata) / `source_missing` when true. To find what an import added, take `newest_imported_at` from \
                        this tool before importing and pass it as `imported_after` afterwards: only the assets imported strictly \
-                       after that time come back. proxy_status and analysis_status give the same per asset in more detail; \
+                       after that time come back. An asset's `tags` (the labels on it, set with edit_asset_tags) are shown \
+                       when it has any — whole entry: `[{key, value}]`; compact: text such as `location: Cumbuco` or `jump` — \
+                       and `tags` terms narrow the list to the assets that carry them all (list_tags shows what is in use). \
+                       proxy_status and analysis_status give the same per asset in more detail; \
                        get_asset_metadata summarises what the analysis found."
     )]
     async fn list_assets(&self, Parameters(p): Parameters<ListAssetsParams>) -> Result<String, McpError> {
@@ -1106,6 +1135,20 @@ impl KerfMcp {
         })
         .await?;
         json(&page)
+    }
+
+    #[tool(
+        description = "List every tag in use on the assets: `keys` (each key with how many assets have it and its values, \
+                       each value with its asset count) for tags like `location: Cumbuco`, and `plain` for tags with no key \
+                       like `jump`, both A to Z. A tag is a label the user or you put on a whole asset \
+                       (edit_asset_tags); list_assets shows an asset's tags and takes `tags` terms to filter by them. Read \
+                       this before tagging, to reuse the spelling already in use, and before assemble_by_tag, to see which key \
+                       to group by and which values it will make sections of. It includes the tags your own staged \
+                       proposal holds back."
+    )]
+    pub(super) fn list_tags(&self) -> Result<String, McpError> {
+        let summary = self.lock().list_tags().map_err(core_err)?;
+        json(&summary)
     }
 
     #[tool(
@@ -2042,6 +2085,7 @@ mod tests {
             limit,
             fields,
             imported_after: imported_after.map(str::to_string),
+            tags: None,
         }
         .query()
         .unwrap()
@@ -2289,6 +2333,145 @@ mod tests {
         // No assets, no time.
         let (empty, _, _) = listed(&[], &statuses, &query(None, None, None, None));
         assert!(empty.get("newest_imported_at").is_none() && empty["total"] == 0);
+    }
+
+    /// The test library with `location` tags on its first six assets (Cumbuco, Jeri, Cumbuco, ...), a plain
+    /// `jump` on every other one, and a rider on the first.
+    fn tagged_library() -> Library {
+        let (mut inputs, statuses) = library(12, (2, 4));
+        for (n, input) in inputs.iter_mut().enumerate().take(6) {
+            let place = ["Cumbuco", "Jeri"][n % 2];
+            input
+                .asset
+                .tags
+                .push(kerf_core::Tag::parse(&format!("location: {place}")).unwrap());
+            if n % 2 == 0 {
+                input.asset.tags.push(kerf_core::Tag::parse("jump").unwrap());
+            }
+            if n == 0 {
+                input.asset.tags.push(kerf_core::Tag::parse("rider: Orell").unwrap());
+            }
+        }
+        (inputs, statuses)
+    }
+
+    fn tagged(terms: serde_json::Value, fields: Option<AssetFields>) -> AssetsQuery {
+        ListAssetsParams {
+            fields,
+            tags: Some(serde_json::from_value(terms).unwrap()),
+            ..Default::default()
+        }
+        .query()
+        .unwrap()
+    }
+
+    #[test]
+    fn tags_show_in_both_views_and_only_when_there_are_some() {
+        let (inputs, statuses) = tagged_library();
+        let (full, _, _) = listed(&inputs, &statuses, &query(None, None, None, None));
+        assert_eq!(
+            full["assets"][0]["tags"],
+            serde_json::json!([
+                {"key": "location", "value": "Cumbuco"},
+                {"value": "jump"},
+                {"key": "rider", "value": "Orell"}
+            ])
+        );
+        let (compact, text, _) = listed(&inputs, &statuses, &query(Some(AssetFields::Compact), None, None, None));
+        assert_eq!(
+            compact["assets"][0]["tags"],
+            serde_json::json!(["location: Cumbuco", "jump", "rider: Orell"])
+        );
+        for page in [&full, &compact] {
+            assert!(
+                page["assets"][7].get("tags").is_none(),
+                "an untagged asset says nothing: {}",
+                page["assets"][7]
+            );
+        }
+        let (plain, plain_text, _) = listed(&inputs[6..], &statuses, &query(Some(AssetFields::Compact), None, None, None));
+        assert!(!plain_text.contains("tags"), "{plain}");
+        assert!(text.len() > plain_text.len());
+    }
+
+    #[test]
+    fn tag_terms_narrow_the_listing_and_total_counts_the_matches() {
+        let (inputs, statuses) = tagged_library();
+        let compact = Some(AssetFields::Compact);
+        let (page, _, _) = listed(&inputs, &statuses, &tagged(serde_json::json!([{"key": "location"}]), compact));
+        assert_eq!(ids(&page), vec![0, 1, 2, 3, 4, 5]);
+        assert_eq!((page["total"].as_u64(), page["returned"].as_u64()), (Some(6), Some(6)));
+        let (page, _, _) = listed(
+            &inputs,
+            &statuses,
+            &tagged(serde_json::json!([{"key": "LOCATION", "value": "cumbuco"}]), compact),
+        );
+        assert_eq!(ids(&page), vec![0, 2, 4], "exact, ignoring case");
+        let (page, _, _) = listed(
+            &inputs,
+            &statuses,
+            &tagged(
+                serde_json::json!([{"key": "location", "value": "Cumbuco"}, {"value": "Jump"}]),
+                compact,
+            ),
+        );
+        assert_eq!(
+            ids(&page),
+            vec![0, 2, 4],
+            "every term has to hold; a value alone is a plain tag"
+        );
+        let (page, _, _) = listed(
+            &inputs,
+            &statuses,
+            &tagged(serde_json::json!([{"value": "jump"}, {"key": "rider"}]), None),
+        );
+        assert_eq!(ids(&page), vec![0]);
+        let (none, _, _) = listed(
+            &inputs,
+            &statuses,
+            &tagged(serde_json::json!([{"value": "Cumbuco"}]), compact),
+        );
+        assert_eq!(none["total"], 0, "Cumbuco is a location, not a plain tag");
+        assert_eq!(
+            none["newest_imported_at"], "2026-10-20T08:00:02.750Z",
+            "the library's newest, whatever the filter"
+        );
+        // Combined with the import time and paging, which count within the matches.
+        let after = Some("2026-10-20T08:00:00.250Z");
+        let q = ListAssetsParams {
+            fields: compact,
+            imported_after: after.map(str::to_string),
+            tags: Some(vec![kerf_core::TagFilter::parse("location:*").unwrap()]),
+            offset: Some(1),
+            limit: Some(2),
+        }
+        .query()
+        .unwrap();
+        let (page, _, _) = listed(&inputs, &statuses, &q);
+        assert_eq!(ids(&page), vec![3, 4]);
+        assert_eq!((page["total"].as_u64(), page["next_offset"].as_u64()), (Some(4), Some(3)));
+    }
+
+    #[test]
+    fn a_bad_tag_term_is_the_callers_mistake() {
+        for terms in [
+            serde_json::json!([{}]),
+            serde_json::json!([{"value": "  "}]),
+            serde_json::json!([{"key": ""}]),
+        ] {
+            let e = ListAssetsParams {
+                tags: Some(serde_json::from_value(terms.clone()).unwrap()),
+                ..Default::default()
+            }
+            .query()
+            .unwrap_err();
+            assert_eq!(e.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{terms}");
+        }
+        assert!(serde_json::from_value::<ListAssetsParams>(serde_json::json!({"tags": [{"keys": "x"}]})).is_err());
+        assert!(
+            serde_json::from_value::<ListAssetsParams>(serde_json::json!({"tags": ["location: Cumbuco"]})).is_err(),
+            "a term is an object"
+        );
     }
 
     #[test]

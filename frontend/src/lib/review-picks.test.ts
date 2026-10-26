@@ -30,6 +30,21 @@ describe('rows', () => {
 		expect(rows.map((r) => r.id)).toEqual(['clip_retrimmed:c1', 'overlay_added:t1', 'asset_projection:x']);
 		expect(rows[2].entry).toBeNull();
 	});
+
+	test('a tag change is a library row of its own: its summary is the line, never "mark as flat"', () => {
+		const rows = pickRows(
+			[],
+			[
+				{ id: 'asset_tags:x', asset_id: 'x', projection: null, tag_edit: { add: [{ key: 'location', value: 'Jeri' }] }, summary: 'Tag x.mp4: +location: Jeri' },
+				{ id: 'asset_projection:x', asset_id: 'x', projection: null, summary: 'Mark x.mp4 as flat (not 360)' }
+			]
+		);
+		expect(rows.map((r) => [r.id, r.summary])).toEqual([
+			['asset_tags:x', 'Tag x.mp4: +location: Jeri'],
+			['asset_projection:x', 'Mark x.mp4 as flat (not 360)']
+		]);
+		expect(rows.every((r) => r.entry === null)).toBe(true);
+	});
 });
 
 describe('picking', () => {
