@@ -109,6 +109,8 @@ import type {
 	SettingsPatch,
 	SettingsView,
 	SmartCropProgress,
+	Stabilize,
+	ClipStabilizeStatus,
 	SpeedKey,
 	SplitSide,
 	StagedEdit,
@@ -159,7 +161,7 @@ import type {
 } from './types';
 import { normalizeGrade } from './grade';
 import { unsavedChoice, type UnsavedChoice, type UnsavedCopy } from './confirm-copy';
-import { clipDuration, DEFAULT_COLOR, DEFAULT_REFRAME, DEFAULT_TRANSFORM } from './types';
+import { clipDuration, DEFAULT_COLOR, DEFAULT_REFRAME, DEFAULT_TRANSFORM, MAX_STABILIZE_ZOOM } from './types';
 import { alignCutsToBeats, beatGrid, defaultBeatTolerance } from './beats';
 import { claudeCodeCommand, clientUrl, genericJsonConfig } from './mcp-connect';
 import { fileTooLarge, importCaptionsInto, MAX_CAPTION_FILE_BYTES, parseFormat, resolveBase } from './caption-import';
@@ -4238,6 +4240,102 @@ export async function cancelSmartCrop(): Promise<void> {
 	return invoke<void>('cancel_smart_crop');
 }
 
+/** Stabilize a clip (`stabilize`: strength and optional zoom) or stop (`null`), as one revision. A still, a title, a clip of
+ *  sound and 360 footage are refused. The clip plays as shot until its analysis lands (`analyzeClipStabilization`). */
+export async function setClipStabilize(clipId: string, stabilize: Stabilize | null): Promise<Timeline> {
+	if (!inTauri()) {
+		const found = locate(devTimeline, clipId);
+		if (!found) throw new Error(`clip ${clipId} not found`);
+		const [track, at] = found;
+		const clip = track.clips[at];
+		if (stabilize) {
+			const why = harnessStabilizeRefusal(track.kind, clip);
+			if (why) throw new Error(`cannot stabilize this clip: ${why}`);
+			if (!(stabilize.strength >= 0 && stabilize.strength <= 1)) {
+				throw new Error(`stabilization strength must be between 0 and 1, not ${stabilize.strength}`);
+			}
+			if (stabilize.zoom != null && !(stabilize.zoom >= 0 && stabilize.zoom <= MAX_STABILIZE_ZOOM)) {
+				throw new Error(`stabilization zoom must be between 0 and ${MAX_STABILIZE_ZOOM} percent, not ${stabilize.zoom}`);
+			}
+			clip.stabilize = stabilize.zoom == null ? { strength: stabilize.strength } : { ...stabilize };
+		} else {
+			delete clip.stabilize;
+		}
+		devStabilized.delete(clipId);
+		recordDev(stabilize ? 'Stabilize clip' : 'Stop stabilizing clip');
+		return snapshot();
+	}
+	return invoke<Timeline>('set_clip_stabilize', { clipId, stabilize });
+}
+
+/** Why the harness's `setClipStabilize` refuses a clip, as the core does (`why_not_stabilized`); `null` when it can. */
+function harnessStabilizeRefusal(kind: string, clip: Clip): string | null {
+	if (kind !== 'video') return 'a clip on an audio track has no picture to steady';
+	if (clip.generator) return 'a title draws its own picture and has no camera to steady';
+	const asset = assetById(clip.asset_id);
+	if (!asset) return "the clip's media is not in the library";
+	const video = asset.streams.find((s) => s.kind === 'video');
+	if (!video) return 'the clip has no picture';
+	if (video.image) return 'a still image does not move';
+	if (asset.streams.some((s) => s.projection && s.projection !== 'flat') || clip.reframe) {
+		return '360 footage is not stabilized: its reframed camera is the framing';
+	}
+	return null;
+}
+
+/** The clips the harness has "analysed" (it has no decoder: an analysis there just lands). */
+const devStabilized = new Set<string>();
+
+/** Measure a stabilized clip's camera (the app runs vid.stab's first pass in the background lane) so the preview and the
+ *  export steady it. Progress arrives as `stabilize-progress` (`onStabilizeProgress`); `cancelStabilization` stops it,
+ *  rejecting with `stabilization cancelled`. Resolves with the clip's status. */
+export async function analyzeClipStabilization(clipId: string): Promise<ClipStabilizeStatus> {
+	if (!inTauri()) {
+		const found = locate(devTimeline, clipId);
+		if (!found) throw new Error(`clip ${clipId} not found`);
+		if (!found[0].clips[found[1]].stabilize) throw new Error('the clip is not stabilized: turn stabilization on first');
+		devStabilized.add(clipId);
+		const [status] = await clipStabilizationStatus([clipId]);
+		return status;
+	}
+	return invoke<ClipStabilizeStatus>('analyze_clip_stabilization', { clipId });
+}
+
+/** Stop the stabilization analyses in flight (if any). */
+export async function cancelStabilization(): Promise<void> {
+	if (!inTauri()) return;
+	return invoke<void>('cancel_stabilization');
+}
+
+/** Where each clip's stabilization stands: the named clips, or every stabilized one. */
+export async function clipStabilizationStatus(clipIds?: string[]): Promise<ClipStabilizeStatus[]> {
+	if (!inTauri()) {
+		const out: ClipStabilizeStatus[] = [];
+		for (const track of devTimeline.tracks) {
+			for (const clip of track.clips) {
+				if (clipIds ? !clipIds.includes(clip.id) : !clip.stabilize) continue;
+				const why = harnessStabilizeRefusal(track.kind, clip);
+				if (!clip.stabilize) out.push({ clip_id: clip.id, state: 'off' });
+				else if (why) out.push({ clip_id: clip.id, state: 'unsupported', reason: why });
+				else out.push({ clip_id: clip.id, state: devStabilized.has(clip.id) ? 'ready' : 'missing' });
+			}
+		}
+		if (clipIds) {
+			const missing = clipIds.find((id) => !out.some((s) => s.clip_id === id));
+			if (missing) throw new Error(`clip ${missing} not found`);
+		}
+		return out;
+	}
+	return invoke<ClipStabilizeStatus[]>('clip_stabilization_status', { clipIds });
+}
+
+/** Subscribe to `stabilize-progress` events: a clip's stabilization status while it is analysed. Returns an unlisten fn. */
+export async function onStabilizeProgress(cb: (p: ClipStabilizeStatus) => void): Promise<() => void> {
+	if (!inTauri()) return () => {};
+	const { listen } = await import('@tauri-apps/api/event');
+	return listen<ClipStabilizeStatus>('stabilize-progress', (e) => cb(e.payload));
+}
+
 /** Subscribe to `smart-crop-progress` events: the fraction of the shots sampled so far. Returns an unlisten fn. */
 export async function onSmartCropProgress(cb: (p: SmartCropProgress) => void): Promise<() => void> {
 	if (!inTauri()) return () => {};
@@ -5355,7 +5453,15 @@ export async function reviewCut(
 	checks?: ReviewCheck[] | null
 ): Promise<CutReview> {
 	if (!inTauri()) {
-		const all: ReviewCheck[] = ['flash_frame', 'mid_word_cut', 'hard_audio_cut', 'jump_cut', 'stale_captions', 'black_gap'];
+		const all: ReviewCheck[] = [
+			'flash_frame',
+			'mid_word_cut',
+			'hard_audio_cut',
+			'jump_cut',
+			'stale_captions',
+			'black_gap',
+			'unstabilized'
+		];
 		return {
 			issues: [],
 			counts_by_kind: {},

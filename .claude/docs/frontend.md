@@ -418,7 +418,14 @@ grade through FFmpeg because the GPU preview refuses a graded clip), a **Blend**
 section (`blend-modes.ts`: `BLEND_MODES`, the core's `BlendMode` ids, labels and a hint each shown by `use:tip`; one
 `set_blend_mode` on change, nothing written for the mode the clip has; `blendModeOf` reads an absent field as `normal`; the
 harness writes `normal` as no field and refuses a clip on an audio track, `blend-modes.test.ts`; the preview of a blended clip
-is FFmpeg's, as the GPU refuses it), **transition** (a grouped picker
+is FFmpeg's, as the GPU refuses it), **stabilize** (`StabilizeSection.svelte`, offered for
+moving footage on a video track only, `stabilize.ts`'s `canStabilize`: a switch, a strength `SliderRow`, an automatic-zoom
+switch and a zoom slider when it is off, each one `set_clip_stabilize`; a status badge and line from
+`clip_stabilization_status` and `stabilize-progress`; the panel starts `analyze_clip_stabilization` itself for a clip whose
+status is `missing`, once per clip, setting and window — never one the user stopped (`noteStopped`, until Analyze is pressed
+again) — and offers Analyze after a failure and Stop while it runs; the export dialog says how many stabilized clips will export
+as shot (`unsteadyNote` over `clip_stabilization_status`) without refusing the export; the harness
+keeps the backend's refusals and reads `missing` until its stand-in analysis lands), **transition** (a grouped picker
 over `src/lib/transitions.ts` — fade / slide / push, then a direction, because
 that is the order the choice is actually made and a flat list of eleven names
 hides it; its bun test pins the ids against `TransitionKind::ALL`), plus **video / audio

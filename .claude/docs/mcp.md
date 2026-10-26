@@ -232,6 +232,19 @@ timeline JSON, so `format.fps`. **`export` reports the frame it wrote**: `{outpu
 `delivery` / `footage`; an audio-only render has no picture and none of the four), and each `export_variants`
 output has the `width` / `height` / `fps` / `fps_source` of that file (`variant_frame`: `for_delivery` keeps the project's
 rate, `options.resolution` and `fit` are the variant's) beside `format`.
+`stabilize_clip { clip_id, enabled?, strength?, zoom?, auto_zoom?, background? }` (a long tool, `Set` in the `clips` set) is
+the edit first — what is not named keeps the clip's current value (a strength-only call keeps a fixed zoom; `auto_zoom: true`
+goes back to automatic, not with `zoom`), and a setting equal to the clip's is no edit (no `edit()`, no proposal opened);
+otherwise `Project::set_clip_stabilize` through `edit()`, so it stages and a bad number or a clip that cannot be steadied (a
+still, a title, a clip of sound, 360) is an error on the call — then the analysis: `stabilize_inputs` under `lock_agent_as`
+(the proposal's clip), `Project::analyze_stabilization` on the blocking pool with the lock released (stopped by the
+request, `cancel_job`, the GUI's Stop through `begin_stabilize`, or a replaced project), the status read back; it answers
+`{clip_id, stabilize, status}` (`enabled: false` answers at once with `off`, no analysis). `stabilization_status
+{ clip_ids? }` (`Read`) is `stabilization_status_inputs` under the lock and `stabilization_statuses` off it: `off`,
+`unsupported`, `basic` (deshake, no vid.stab), `missing`, `queued`, `analyzing`, `failed`, `ready`. `get_timeline_state` shows
+the setting as the clip's `stabilize`. `export` answers `warnings` (one line per stabilized clip in the exported span that
+exported as shot, `unsteady_clips` read with the lock released) when there are any, and `review_cut` has an `unstabilized`
+check.
 `smart_crop` frames each shot for the delivery frame (the server `instructions`
 pair it with `set_delivery_format`, since reshaping to 9:16 otherwise keeps
 whatever was in the middle). `export_variants` is the one-call multi-format
@@ -461,7 +474,7 @@ the thumbnails without their sources.
 `review_cut { range?, checks? }` is the other half of that step (the guide and `INSTRUCTIONS` name both): read-only,
 `Project::review_inputs` under `lock_agent_as` on `blocking`, the pure `kerf_core::review::review` after the lock is
 released (`core-render-plan.md`). `checks` are names (`flash_frame`, `mid_word_cut`, `hard_audio_cut`, `jump_cut`,
-`stale_captions`, `black_gap`; omitted or empty = all, an unknown one `invalid_params` listing them); the answer is
+`stale_captions`, `black_gap`, `unstabilized`; omitted or empty = all, an unknown one `invalid_params` listing them); the answer is
 compact `{issues: [{kind, severity, time, end?, clip_ids, message, fix}], counts_by_kind, checked, skipped: [{check,
 reason}]}` — a check whose analysis is missing (no transcript, no silence analysis, captions from elsewhere) is
 skipped with the reason and the `analyze_asset` step to run, never guessed.
@@ -636,16 +649,16 @@ Agent edits **stage** (`core-project.md`). The adapter's part:
 ## Background jobs (`mcp/jobs.rs`)
 
 `analyze_asset`, `export`, `export_variants`, `generate_voiceover`, `compose_music`, `separate_stems`, `download_speech_model`,
-`import_asset`, `smart_crop`, `refine_transcript` and `sync_clips_by_audio` take `background: true` and answer `{job_id}` at once; `job_status`, `cancel_job` and
+`import_asset`, `smart_crop`, `stabilize_clip`, `refine_transcript` and `sync_clips_by_audio` take `background: true` and answer `{job_id}` at once; `job_status`, `cancel_job` and
 `list_jobs` read and stop them (or subscribe to `kerf://jobs/{job_id}`, below). Each is written once against `jobs::Run` (`cancelled()` + `progress(fraction, message)`):
 a foreground call builds it from the request (`foreground`: the `ct` cancellation token and the `progressToken`, with a relay
 task that keeps progress monotonic), a background one from its record in `Jobs` (bounded: 8 running, 48 records, a finished
 job forgotten after an hour). `KerfMcp::long_tool` does the branching, so **argument validation stays in the tool body,
 before it** — a bad path or id is an error on the call, not a job that fails later. The GUI's Stop reaches the agent's run
 of the same job: `analyze_asset`, `refine_transcript` (the analysis Stop), `import_asset`, `download_speech_model`, `export_cover`, `generate_voiceover`,
-`compose_music`, `separate_stems`, `smart_crop`, `export` and `export_variants` poll the `StopEpoch` the GUI's own button trips
+`compose_music`, `separate_stems`, `smart_crop`, `stabilize_clip`, `export` and `export_variants` poll the `StopEpoch` the GUI's own button trips
 (`Run::also_cancelled_by(begin_analysis() / begin_import() / begin_model_download() / begin_cover_export() /
-begin_voiceover() / begin_music() / begin_stems() / begin_smart_crop() / begin_export())`; a Stop pressed before a run began does not end
+begin_voiceover() / begin_music() / begin_stems() / begin_smart_crop() / begin_stabilize() / begin_export())`; a Stop pressed before a run began does not end
 it, and a run begun after is not wiped by one), and the voiceover, music, stems, smart-crop and framing jobs also stop when the
 project is replaced (`stop_or_replaced`). `analyze_asset` also forwards the GUI's `analysis-progress` events for its asset
 to the client (`AnalysisProgressRelay`, through `Shell::listen`: Tauri's listener in the window, an in-process bus headless); `download_speech_model` emits `model-progress` like the GUI's own download.
@@ -774,7 +787,8 @@ Every tool, by purpose (a test pins that this list names each registered tool, a
 - **Linked picture and sound**: `extract_audio`, `add_asset_audio`, `detach_audio`, `detach_audio_clips`, `reattach_audio`,
   `reattach_audio_clips`, `link_clips`, `unlink_clips`.
 - **Clip look and sound**: `set_volume`, `set_fade`, `set_speed`, `set_speed_ramp`, `set_transform`, `set_transform_at`, `set_color`, `set_transition`,
-  `set_grade`, `set_video_effects`, `set_audio_effects`, `set_mask`, `set_blend_mode`, `set_clip_enabled`.
+  `set_grade`, `set_video_effects`, `set_audio_effects`, `set_mask`, `set_blend_mode`, `set_clip_enabled`, `stabilize_clip`,
+  `stabilization_status`.
 - **Keyframes and 360**: `set_keyframes`, `add_keyframe`, `set_keyframe_easing`, `set_property_keyframes`,
   `set_property_tracks`, `copy_keyframes`,
   `clear_keyframes`, `set_reframe`, `clear_reframe`, `set_reframe_keyframes`, `add_reframe_keyframe`.

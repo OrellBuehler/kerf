@@ -68,16 +68,20 @@ pub enum Check {
     StaleCaptions,
     /// No picture while the cut plays.
     BlackGap,
+    /// A stabilized clip that plays and exports as shot: its camera was never measured, or the
+    /// measuring failed.
+    Unstabilized,
 }
 
 impl Check {
-    pub const ALL: [Check; 6] = [
+    pub const ALL: [Check; 7] = [
         Check::FlashFrame,
         Check::MidWordCut,
         Check::HardAudioCut,
         Check::JumpCut,
         Check::StaleCaptions,
         Check::BlackGap,
+        Check::Unstabilized,
     ];
 
     pub fn name(self) -> &'static str {
@@ -88,6 +92,7 @@ impl Check {
             Check::JumpCut => "jump_cut",
             Check::StaleCaptions => "stale_captions",
             Check::BlackGap => "black_gap",
+            Check::Unstabilized => "unstabilized",
         }
     }
 
@@ -157,6 +162,9 @@ pub struct ReviewInputs {
     pub timeline: Timeline,
     pub assets: Vec<Asset>,
     pub analyses: HashMap<Uuid, AssetAnalysis>,
+    /// The stabilized clips, for [`Check::Unstabilized`]: where each stands is read from the
+    /// stabilization analyses kept beside the footage when the review runs (the lock released).
+    pub stabilization: Vec<crate::project::StabilizeStatusInput>,
 }
 
 /// Review the cut as it renders (muted tracks and disabled clips left out) at the rate an export
@@ -184,6 +192,11 @@ pub fn review(inputs: &ReviewInputs, range: Option<(f64, f64)>, checks: &[Check]
             Check::JumpCut => cut.jump_cuts(&mut issues),
             Check::StaleCaptions => cut.stale_captions(span, &mut issues),
             Check::BlackGap => cut.black_gaps(&mut issues),
+            Check::Unstabilized => {
+                let statuses = crate::Project::stabilization_statuses(&inputs.stabilization);
+                unstabilized(&inputs.timeline, &statuses, &mut issues);
+                Ok(())
+            }
         };
         match outcome {
             Ok(()) => checked.push(check),
@@ -238,6 +251,26 @@ fn merge_duplicates(issues: Vec<ReviewIssue>, assets_of: &HashMap<Uuid, Uuid>) -
         }
     }
     out
+}
+
+/// [`Check::Unstabilized`]: each stabilized clip whose `statuses` say it will play as shot.
+fn unstabilized(timeline: &Timeline, statuses: &[crate::stabilize::ClipStabilizeStatus], issues: &mut Vec<ReviewIssue>) {
+    for u in crate::stabilize::unsteady_clips(timeline, statuses, None) {
+        issues.push(ReviewIssue {
+            kind: Check::Unstabilized,
+            severity: Severity::Warning,
+            time: u.start,
+            end: Some(u.end),
+            clip_ids: vec![u.clip_id],
+            message: format!(
+                "This clip is set to be stabilized but plays and exports as shot: {}",
+                u.reason
+            ),
+            fix: "stabilize_clip (measures the camera; stabilization_status says where it stands), or \
+                  stabilize_clip with enabled: false to stop stabilizing it"
+                .into(),
+        });
+    }
 }
 
 fn secs(t: f64) -> String {
@@ -922,11 +955,39 @@ mod tests {
             timeline,
             assets,
             analyses: analyses.into_iter().map(|a| (a.asset_id, a)).collect(),
+            stabilization: Vec::new(),
         }
     }
 
     fn found(inputs: &ReviewInputs, check: Check) -> Vec<ReviewIssue> {
         review(inputs, None, &[check]).issues
+    }
+
+    /// A stabilized clip whose camera was never measured exports as shot: said, with the tool that
+    /// measures it. One that is steadied (or cannot be told apart from shot, without vid.stab) is not.
+    #[test]
+    fn a_stabilized_clip_with_no_analysis_is_flagged() {
+        let asset = av_asset(Uuid::from_u128(77), 10.0);
+        let mut clip = Clip::new(asset.id, 0.0, 3.0, 1.0);
+        clip.stabilize = Some(crate::model::Stabilize::default());
+        let mut r = inputs(on_v1(vec![clip.clone()]), vec![asset.clone()], vec![]);
+        r.stabilization = vec![crate::project::StabilizeStatusInput {
+            clip_id: clip.id,
+            stabilize: clip.stabilize,
+            unsupported: None,
+            asset_id: asset.id,
+            path: Some(std::path::PathBuf::from("/nowhere/kerf-review-unsteady.mp4")),
+            window: (0.0, 3.0),
+        }];
+        crate::engine::with_vidstab(true, || {
+            let issues = found(&r, Check::Unstabilized);
+            assert_eq!(issues.len(), 1, "{issues:?}");
+            assert_eq!((issues[0].time, issues[0].end), (1.0, Some(4.0)));
+            assert_eq!(issues[0].severity, Severity::Warning);
+            assert!(issues[0].fix.contains("stabilize_clip"), "{}", issues[0].fix);
+            assert!(review(&r, Some((0.0, 0.5)), &[Check::Unstabilized]).issues.is_empty());
+        });
+        crate::engine::with_vidstab(false, || assert!(found(&r, Check::Unstabilized).is_empty()));
     }
 
     fn on_v1(clips: Vec<Clip>) -> Timeline {

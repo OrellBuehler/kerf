@@ -1267,9 +1267,7 @@ impl Project {
         let old = self.relink_inputs(asset_id)?;
         let probe = Self::probe_relink(&old, new_path.as_ref(), &|| false)?;
         let done = self.apply_relink_probed(asset_id, &probe)?;
-        if done.previous_path != done.asset.path {
-            Self::forget_media_caches(Path::new(&done.previous_path));
-        }
+        Self::forget_relinked_caches(&done);
         Ok(done)
     }
 
@@ -1495,6 +1493,23 @@ impl Project {
             asset,
             clips_removed: live.len(),
         })
+    }
+
+    /// Delete what was cached for a removed asset: its stabilization analyses and what
+    /// [`Project::forget_media_caches`] deletes for its file. **Not under the project lock.**
+    pub fn forget_removed_caches(removed: &RemovedAsset) {
+        crate::stabilize::forget(removed.asset.id);
+        Self::forget_media_caches(Path::new(&removed.asset.path));
+    }
+
+    /// Delete what was cached for a relinked asset's old file: its stabilization analyses (measured on
+    /// a file the asset no longer is) and, when the path moved, the old path's proxies and waveform.
+    /// **Not under the project lock.**
+    pub fn forget_relinked_caches(relinked: &Relinked) {
+        crate::stabilize::forget(relinked.asset.id);
+        if relinked.previous_path != relinked.asset.path {
+            Self::forget_media_caches(Path::new(&relinked.previous_path));
+        }
     }
 
     /// Delete what was cached for a media file — its preview proxies and its waveform — now that
@@ -2158,6 +2173,7 @@ impl Project {
             }
         }
         Ok(crate::review::ReviewInputs {
+            stabilization: self.stabilization_status_inputs(None)?,
             timeline,
             assets: self.list_assets()?,
             analyses,
@@ -7852,6 +7868,8 @@ pub use tags::{
 };
 mod title_text;
 pub use title_text::{PreparedText, TitleTextForm, TitleTextInputs};
+mod stabilize;
+pub use stabilize::{StabilizeJob, StabilizeStatusInput};
 mod thumbnails;
 pub use thumbnails::{prepare_thumbnail, PreparedThumbnail, ThumbnailBase, ThumbnailLayerSpec, ThumbnailResult, ThumbnailSpec};
 

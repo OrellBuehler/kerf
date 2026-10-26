@@ -133,10 +133,15 @@ pub use cli::{
 #[cfg(test)]
 pub(crate) use cli::golden::sample_timelines;
 pub(crate) use cli::insta360_pair_name;
+pub(crate) use cli::measure_motion;
 #[cfg(test)]
 pub(crate) use cli::proxy_sidecar_path;
 pub(crate) use cli::proxy_video_info;
 pub(crate) use cli::render_geometry;
+pub(crate) use cli::source_key;
+pub use cli::vidstab_available;
+#[cfg(test)]
+pub(crate) use cli::with_vidstab;
 pub use cli::{
     composite_color_policy, export_seek_arg, ffmpeg_command, ffmpeg_path, fps_mode_flag, grade_filter_chain, limit_ffmpeg_args,
     source_is_indexed_container, text_raster_graph, text_still_filter, TextPart, TextRasterGraph,

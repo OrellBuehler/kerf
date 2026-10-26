@@ -114,6 +114,11 @@ fn hostile_stored_timelines_never_panic() {
         },
         SpeedKey::new(2.5, 2.0),
     ];
+    // And stabilized, so they land on its setting.
+    base.tracks[0].clips[0].stabilize = Some(kerf_core::Stabilize {
+        strength: 0.5,
+        zoom: Some(6.0),
+    });
     let json = serde_json::to_vec(&base).unwrap();
     assert_no_panic("stored timeline", &[&json], ROUNDS, |b| read_timeline(&base, b));
 }

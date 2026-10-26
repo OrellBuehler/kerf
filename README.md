@@ -67,6 +67,7 @@ agent isn't scripting a black box; it drives the identical engine — and its ed
 | **Ready to publish?** | `platform_check` judges the cut against Reels / Shorts / TikTok / Instagram / YouTube — length, shape, resolution, captions — and tells a **hard** limit (rejected) apart from a **reach** limit (accepted, then buried). Advisory only; nothing blocks an export. `review_cut` lints the editing itself — flash frames, cuts inside a word, sound cut into sound, jump cuts, captions a later edit left behind, black gaps — each with the tool that fixes it. **Cover frames** save at the full delivery resolution. |
 | **Analysis & speech** | Silence and scene detection, an onset/**tempo** grid, EBU R128 loudness and speech-vs-music from one decode — plus **transcription in every build**, via FFmpeg's `whisper` filter or in-process whisper.cpp (models fetched on first use). |
 | **Cut to the beat** | The tempo grid is drawn on the ruler and snapped to while dragging, and `snap_to_beats` ripples a whole track's cuts onto it, retrimming each clip at its **outgoing** edge. |
+| **Stabilization** | Shaky hand-held footage made steady, per clip: vid.stab measures the camera once (a background analysis of the original, kept beside it), and the preview, every still, a proxy and the export move each source frame by the same correction — speed, reverse and ramps keep it. FFmpeg's `deshake` steps in where the FFmpeg has no vid.stab. |
 | **Effects, color & looks** | Per-clip video (`blur`/`sharpen`/`hue`/`negate`/`vignette`/`chromakey`) and audio (`highpass`/`lowpass`/`EQ`/`compressor`/`gate`/`denoise`) chains, transform + color grade, and one-click **Punchy / Warm / Cool / Faded / B&W** looks. |
 | **Transitions & masks** | Eleven transitions — crossfade, dip to black / white, **slide** and **push** in four directions — that borrow the outgoing clip's handle and degrade to a hard cut when there is none. **Masks** cut a clip to a feathered rectangle or ellipse so a lower track shows through: a blurred face is a duplicated shot above, blurred and masked. **Blend modes** — multiply, screen, overlay, hard light, add, darken, lighten, difference, exclusion — composite a clip onto the tracks below instead of over them: a light leak screened onto the shot, a texture multiplied into it. |
 | **Keyframe animation** | Animated zoom, position, rotation and opacity via keyframes — linear, hold, ease in / out or a custom curve per key — the Transform panel auto-keyframes at the playhead. **Any one number can carry keys of its own**: a colour that warms over a shot, an opacity ramp that starts later than the zoom, the clip's volume swelling mid-clip. |
@@ -161,7 +162,7 @@ Now ask the agent to work on the project you have open — _"skim the interview 
 the dead air, and drop in captions."_ It will claim a task, use the tools below, and hand
 back a reviewable result.
 
-### The tools (194)
+### The tools (196)
 
 <details>
 <summary><b>See / analyze</b></summary>
@@ -199,7 +200,7 @@ score, fitted to the cuts) ·
 <details>
 <summary><b>Style & animate</b></summary>
 
-`set_volume` · `set_fade` · `set_speed` · `set_speed_ramp` (slow motion / speed-up that eases) · `set_transform` · `set_transform_at` · `set_color` ·
+`set_volume` · `set_fade` · `set_speed` · `set_speed_ramp` (slow motion / speed-up that eases) · `stabilize_clip` (take a hand-held camera's shake out) · `stabilization_status` · `set_transform` · `set_transform_at` · `set_color` ·
 `set_grade` (curves, colour wheels, a .cube LUT) · `set_transition` · `set_mask` · `set_blend_mode` (multiply, screen, overlay, …) · `set_video_effects` · `set_audio_effects` ·
 `set_keyframes` · `add_keyframe` · `set_keyframe_easing` · `set_property_keyframes` · `set_property_tracks` · `copy_keyframes` · `clear_keyframes` · `set_reframe` · `clear_reframe` ·
 `set_reframe_keyframes` · `add_reframe_keyframe` · `set_track_volume` · `set_track_pan` ·
@@ -214,7 +215,7 @@ score, fitted to the cuts) ·
 <details>
 <summary><b>Render & hand-off</b></summary>
 
-`export` · `export_capabilities` · `export_cover` · `add_thumbnail` · `update_thumbnail` · `remove_thumbnail` · `preview_thumbnail` · `export_thumbnail` · `suggest_thumbnail_frames` · `export_interchange` · `export_markers` · `platform_check` · `review_cut` (flash frames, cuts inside a word, clicks, jump cuts, stale captions, black gaps) · `get_levels` · `stage_edits` ·
+`export` · `export_capabilities` · `export_cover` · `add_thumbnail` · `update_thumbnail` · `remove_thumbnail` · `preview_thumbnail` · `export_thumbnail` · `suggest_thumbnail_frames` · `export_interchange` · `export_markers` · `platform_check` · `review_cut` (flash frames, cuts inside a word, clicks, jump cuts, stale captions, black gaps, stabilized clips not yet analysed) · `get_levels` · `stage_edits` ·
 `staged_diff` · `apply_staged_edits` · `discard_staged_edits` · `revision_diff` ·
 `list_tasks` · `add_task` · `claim_next_task` · `complete_task` · `fail_task` ·
 `resolve_task` · `remove_task` · `history` · `undo` · `redo` · `revert_to` ·
@@ -229,7 +230,7 @@ score, fitted to the cuts) ·
 `apply_staged_subset` · `proxy_status` · `rebuild_proxy` · `delete_proxy` ·
 `job_status` · `cancel_job` · `list_jobs` — the long tools
 (`export`, `export_variants`, `analyze_asset`, `generate_voiceover`, `compose_music`, `separate_stems`,
-`download_speech_model`, `import_asset`, `smart_crop`, `refine_transcript`, `sync_clips_by_audio`) take
+`download_speech_model`, `import_asset`, `smart_crop`, `stabilize_clip`, `refine_transcript`, `sync_clips_by_audio`) take
 `background: true` and answer a
 `job_id` at once. Instead of polling, an agent can subscribe to the resources `kerf://jobs/{job_id}`,
 `kerf://jobs`, `kerf://tasks` and `kerf://project`: the server pushes a resource-updated notification

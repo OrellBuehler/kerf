@@ -415,6 +415,19 @@ pub fn clip_seek(window_start: f64, lead: f64) -> f64 {
     }
 }
 
+/// The input-side seek of `clip` whose window starts at `window_start` ([`clip_seek`]): for a
+/// stabilized clip, [`SEEK_PAD`](crate::stabilize::SEEK_PAD) source frames earlier, so that its chain
+/// can trim between two frames of its analysis however the seek lands (`crate::stabilize`). Every
+/// other clip's seek is [`clip_seek`]'s exactly. The picture and the sound of a clip share the input,
+/// so both chains trim relative to this.
+pub fn clip_input_seek(clip: &Clip, fx: &ClipFx, window_start: f64) -> f64 {
+    if clip.is_stabilized() {
+        let frame = if fx.frame > 0.0 { fx.frame } else { UNKNOWN_FRAME };
+        return clip_seek(window_start - crate::stabilize::SEEK_PAD * frame, fx.lead);
+    }
+    clip_seek(window_start, fx.lead)
+}
+
 /// How long into its clip a late-starting source's first picture plays, in timeline
 /// seconds: `(lead - window start) / speed` for a forward clip whose window starts
 /// before it, else `0.0`. The chain's `setpts` puts the first frame it keeps at the

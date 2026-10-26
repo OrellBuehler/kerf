@@ -182,6 +182,8 @@ pub(super) const TOOLS: &[(&str, &str, Effect, ToolSet)] = &[
     ("export_markers", "Export markers", Destroy, Delivery),
     ("remove_silence", "Remove silence", Edit, Core),
     ("smart_crop", "Smart crop", Set, Delivery),
+    ("stabilize_clip", "Stabilize clip", Set, Clips),
+    ("stabilization_status", "Stabilization status", Read, Clips),
     ("snap_to_beats", "Snap cuts to beats", Edit, Music),
     ("get_music_structure", "Music structure", Read, Music),
     ("plan_music_fit", "Plan music fit", Read, Music),

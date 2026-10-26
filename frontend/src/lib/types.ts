@@ -1042,7 +1042,35 @@ export interface Clip {
 	/** What the clip draws when its picture is generated rather than cut from an asset: a title on a track
 	 *  (`asset_id` is then `GENERATED_ASSET` and the source is the title's own clock). Absent for footage. */
 	generator?: Generator | null;
+	/** Video stabilization: the camera's shake taken out of the picture once its analysis lands
+	 *  (`clipStabilizationStatus`). Absent when the clip is not stabilized (the backend omits it). */
+	stabilize?: Stabilize | null;
 }
+
+/** How strongly a clip is stabilized (`Stabilize`). */
+export interface Stabilize {
+	/** How much of the camera's movement is smoothed away, 0..1 (default 0.5). */
+	strength: number;
+	/** The picture enlarged by this many percent (0..30) to hide the moved edges; absent is automatic. */
+	zoom?: number | null;
+}
+
+/** The most a stabilized picture is enlarged, in percent (`MAX_STABILIZE_ZOOM`). */
+export const MAX_STABILIZE_ZOOM = 30;
+
+/** Where a clip's stabilization stands (`StabilizeStatus`, tagged by `state`). */
+export type StabilizeStatus =
+	| { state: 'off' }
+	| { state: 'unsupported'; reason: string }
+	| { state: 'basic' }
+	| { state: 'missing' }
+	| { state: 'queued' }
+	| { state: 'analyzing'; fraction: number }
+	| { state: 'failed'; reason: string }
+	| { state: 'ready' };
+
+/** One clip's stabilization status, as `clip_stabilization_status` and `stabilize-progress` carry it. */
+export type ClipStabilizeStatus = { clip_id: string } & StabilizeStatus;
 
 /** The `asset_id` of every generated clip: the nil UUID, which no asset has. */
 export const GENERATED_ASSET = '00000000-0000-0000-0000-000000000000';
@@ -1859,7 +1887,14 @@ export interface PlatformReport {
 }
 
 /** One check of the editing lint, and the `kind` of what it finds (`kerf_core::review::Check`). */
-export type ReviewCheck = 'flash_frame' | 'mid_word_cut' | 'hard_audio_cut' | 'jump_cut' | 'stale_captions' | 'black_gap';
+export type ReviewCheck =
+	| 'flash_frame'
+	| 'mid_word_cut'
+	| 'hard_audio_cut'
+	| 'jump_cut'
+	| 'stale_captions'
+	| 'black_gap'
+	| 'unstabilized';
 
 /** A defect in the cut (`kerf_core::ReviewIssue`), at timeline `time` (to `end` for a span), with the tools that fix it. */
 export interface ReviewIssue {

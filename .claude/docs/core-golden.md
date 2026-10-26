@@ -49,9 +49,10 @@
   `KERF_GOLDEN_BLESS=1 cargo test -p kerf-core --no-default-features golden -- --nocapture`
   (exactly `1`): it rewrites **all three** files and says so, and `git diff` is the guard —
   only the files you meant to change should move. It is **machine-independent**: the
-  builders read the machine in seven places and each is pinned (the sixth is the animated titles' cache
+  builders read the machine in nine places and each is pinned (the sixth is the animated titles' cache
   directory, `svg::raster::with_pinned_dir`; the seventh `afftdn_delays()`, pinned by `with_afftdn_delay` to the
-  delaying filter of FFmpeg 5.1 on, the old spelling being unit-tested) — the preview's
+  delaying filter of FFmpeg 5.1 on, the old spelling being unit-tested; the eighth and ninth are whether the ffmpeg has
+  vid.stab, `with_vidstab`, and the stabilization analyses on disk, `stabilize::pinned`) — the preview's
   `decode_hwaccel()` (through `build_preview_args_with`), `zscale_available()` (a `cfg(test)`
   thread-local override; every HDR case is built both ways), `alimiter_latency_available()`
   (the same kind of override, `with_alimiter_latency`; every case is built with the option,
@@ -241,3 +242,13 @@
   differ from the mode's own, `blend-hardlight` (overlay) and `blend-addition` (add). `parts_draw_as_whole` compares a blended
   clip's placement (its colour stage's `overlay`) and its `blend` between a part and the whole export (so the composite's matrix
   is decided over the whole timeline).
+- **Stabilization** (`stabilize_for`; `engine-cli.md`), **appended, nothing re-blessed**: the 400 cases after the blend-mode
+  ones (`STABILIZE_FIRST`, blocks 92–95, its dice on `6 << 40`) draw from the same generator and stabilize most clips of footage
+  on dice of their own (a strength, a fixed zoom on a third, now and then read through the asset's padded proxy twin); every
+  fourth case is built for an ffmpeg without vid.stab (`Case.vidstab`, `with_vidstab`). `pinned` hands over a made-up analysis
+  per pool asset, measured at most 1920 wide as the detect pass measures (`pinned_analyses`, plain arithmetic, no libm), and names
+  slice files instead of writing them (`/kerf-test/stabilize/<asset>-<k0>-<k1>-<scale>.trf`); the zoom in the argv is rounded to
+  a thousandth. `git diff origin/main` of the four digest files is 16 insertions, 0 deletions. Families `stabilize-vidstab`,
+  `stabilize-deshake`, `stabilize-proxy` (a proxy's slice scaled to 0.6667), `stabilize-4k` (a 4K original's, scaled by 2),
+  `stabilize-hdr` (tone-mapped before it is steadied) and their `still-` / `preview-` forms. The order of the appended families
+  is speed ramps, noise reduction (84–87), blend modes (88–91), stabilization (92–95).
