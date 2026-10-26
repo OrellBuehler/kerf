@@ -185,8 +185,13 @@
   build cannot read it, and with it the whole timeline; a chain without one is written as before, `run` a no-op, `needed` always,
   `needed_to_read` false (`a_v15_file_is_backed_up_stamped_v16_and_keeps_its_denoise`); `persisted/timelines-v16.json` holds a
   denoised clip with its floor tracked.
-  The schema is at **v16** (`SCHEMA_VERSION`). `persist_tests` pins which steps a file has pending with
-  `store::pending_steps` (a legacy file that has every column: `[4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15]`). A step's `needed_to_read` says whether a build that
+  v16→v17 is a JSON step for a **new field**, `Clip.blend_mode` (a blend mode, `core-model.md`): an older build drops it at
+  its next write of the clip and the clip then composites as plain alpha-over; a clip at `normal` is written as before,
+  `run` a no-op, `needed` always, `needed_to_read` false (`a_v16_file_is_backed_up_stamped_v17_and_keeps_its_blend_modes`);
+  `persisted/timelines-v17.json` holds a screened clip. `Project::set_blend_mode(clip, mode)` is one revision ("Set blend
+  mode"), refuses a clip on an audio track, and stages like any agent edit (`project/blend_tests.rs`).
+  The schema is at **v17** (`SCHEMA_VERSION`). `persist_tests` pins which steps a file has pending with
+  `store::pending_steps` (a legacy file that has every column: `[4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16]`). A step's `needed_to_read` says whether a build that
   cannot write must still refuse a file lacking what it adds: true for the v1, v2, v4 and v15 columns (the reads
   name them), false for the `fonts` table (reads tolerate its absence), so a write-protected v2 project
   opens as it is. A new file is stamped `SCHEMA_VERSION`; a

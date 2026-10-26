@@ -305,3 +305,45 @@ fn a_speed_ramp_is_written_at_its_average_speed_and_said_so() {
         .unwrap();
     assert!((scalar + 6.0 / 11.0).abs() < 1e-9, "{scalar}");
 }
+
+/// Neither format has a blend mode: the cut is written as it is, the report names the mode, and OTIO keeps it in
+/// metadata.kerf for Kerf to read back. A clip at normal adds no line.
+#[test]
+fn a_blend_mode_is_reported_and_kept_in_otio_metadata() {
+    use crate::model::BlendMode;
+    let a = asset(1, "/m/shot.mov", 100.0, false);
+    let plain = clip(11, &a, 0.0, 4.0, 0.0);
+    let mut screened = clip(12, &a, 10.0, 14.0, 4.0);
+    screened.blend_mode = BlendMode::Screen;
+    let tl = Timeline {
+        tracks: vec![track(101, StreamKind::Video, "V1", vec![plain.clone(), screened])],
+        ..Timeline::new()
+    };
+    let opts = InterchangeOptions {
+        rate: 24.0,
+        title: "blend".into(),
+        video_track: 0,
+    };
+    let (_, report) = export(InterchangeFormat::Edl, &tl, std::slice::from_ref(&a), &opts).unwrap();
+    let said = report.to_string();
+    assert!(
+        said.contains("warning: clip blend modes are not carried by an EDL\n"),
+        "{said}"
+    );
+    let (otio, report) = export(InterchangeFormat::Otio, &tl, std::slice::from_ref(&a), &opts).unwrap();
+    assert!(
+        report.to_string().contains("clip blend modes have no OTIO equivalent"),
+        "{report}"
+    );
+    let doc: serde_json::Value = serde_json::from_str(&otio).unwrap();
+    let clips = &doc["tracks"]["children"][0]["children"];
+    assert!(clips[0]["metadata"]["kerf"].get("blend_mode").is_none());
+    assert_eq!(clips[1]["metadata"]["kerf"]["blend_mode"], "screen");
+
+    let tl = Timeline {
+        tracks: vec![track(101, StreamKind::Video, "V1", vec![plain])],
+        ..Timeline::new()
+    };
+    let (_, report) = export(InterchangeFormat::Edl, &tl, std::slice::from_ref(&a), &opts).unwrap();
+    assert!(!report.to_string().contains("blend"), "{report}");
+}

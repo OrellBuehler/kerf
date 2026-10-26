@@ -51,7 +51,8 @@
 		volumeAnimated
 	} from '#lib/channels';
 	import { DEFAULT_TRANSITION_SECONDS, TRANSITION_GROUPS } from '#lib/transitions';
-	import type { Clip, Color, Mask, Projection, Property, Reframe, Transform, TransitionKind } from '#lib/types';
+	import { BLEND_MODES, blendModeOf } from '#lib/blend-modes';
+	import type { BlendMode, Clip, Color, Mask, Projection, Property, Reframe, Transform, TransitionKind } from '#lib/types';
 	import { toast } from '#lib/notifications.svelte';
 	import { colorDraft, fadeDraft, maskDraft, titleMoveDraft, titleSizeDraft, transformDraft } from '#lib/preview-draft';
 	import type { PreviewDraft } from '#lib/types';
@@ -1577,6 +1578,27 @@
 					setTf({ rotation: v }, at), undefined, liveTf((v) => ({ rotation: v })))}
 				{@render rangeRow('Opacity', tf.opacity, { min: 0, max: 1, step: 0.05, neutral: DEFAULT_TRANSFORM.opacity, ...PERCENT }, (v, at) =>
 					setTf({ opacity: v }, at), undefined, liveTf((v) => ({ opacity: v })))}
+				<label style={ROW_GRID}>
+					<span style="font-size:12px;color:var(--text-muted);white-space:nowrap">Blend</span>
+					<select
+						class="k-select"
+						value={blendModeOf(clip)}
+						use:tip={BLEND_MODES.find((m) => m.id === blendModeOf(clip))?.hint}
+						aria-label="Blend mode"
+						aria-disabled={editor.locked || undefined}
+						onmousedown={swallow}
+						onchange={(e) => {
+							if (editor.locked) return;
+							const mode = e.currentTarget.value as BlendMode;
+							if (mode !== blendModeOf(clip)) void run(() => editor.setBlendMode(clip.id, mode));
+						}}
+						style="grid-column:2 / 5"
+					>
+						{#each BLEND_MODES as m (m.id)}
+							<option value={m.id}>{m.label}</option>
+						{/each}
+					</select>
+				</label>
 				</InspectorSection>
 
 				<InspectorSection title="Framing" summary={[hasCrop && 'Cropped', cropAnimated(clip) && 'Crop motion'].filter(Boolean).join(' · ') || 'Full frame'}>

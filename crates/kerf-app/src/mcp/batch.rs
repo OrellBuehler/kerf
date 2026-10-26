@@ -43,7 +43,7 @@ pub struct EditOp {
     /// add_track, remove_track, extract_audio, add_asset_audio, detach_audio, detach_audio_clips,
     /// reattach_audio, reattach_audio_clips, link_clips, unlink_clips, set_volume, set_fade, set_speed,
     /// set_speed_ramp, set_transform, set_transform_at, set_color, set_grade (without a lut_path), set_transition,
-    /// set_video_effects, set_audio_effects, set_mask, set_clip_enabled, set_keyframes, add_keyframe,
+    /// set_video_effects, set_audio_effects, set_mask, set_blend_mode, set_clip_enabled, set_keyframes, add_keyframe,
     /// set_keyframe_easing, set_property_keyframes, set_property_tracks, copy_keyframes, clear_keyframes,
     /// set_reframe, clear_reframe, set_reframe_keyframes, add_reframe_keyframe, set_track_volume,
     /// set_track_pan, set_track_duck, set_track_muted, set_track_solo, set_track_locked, set_master_volume,
@@ -119,6 +119,7 @@ batchable! {
     set_video_effects => KerfMcp::set_video_effects_op,
     set_audio_effects => KerfMcp::set_audio_effects_op,
     set_mask => KerfMcp::set_mask_op,
+    set_blend_mode => KerfMcp::set_blend_mode_op,
     set_clip_enabled => KerfMcp::set_clip_enabled_op,
     set_keyframes => KerfMcp::set_keyframes_op,
     add_keyframe => KerfMcp::add_keyframe_op,
@@ -498,6 +499,43 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.message.contains("has not run yet"), "{}", err.message);
+    }
+
+    #[test]
+    fn a_blend_mode_batches_and_an_unknown_one_is_the_callers_to_fix() {
+        let (project, ids) = sample();
+        let out = apply(
+            &project,
+            json!({"ops": [{"tool": "set_blend_mode", "args": {"clip_id": ids[0], "mode": "screen"}}]}),
+        )
+        .unwrap();
+        assert_eq!(out["results"][0]["blend_mode"], "screen", "{out}");
+        let out = apply(
+            &project,
+            json!({"ops": [{"tool": "set_blend_mode", "args": {"clip_id": ids[0], "mode": "Hard light"}}]}),
+        )
+        .unwrap();
+        assert_eq!(
+            out["results"][0]["blend_mode"], "hard_light",
+            "a common spelling reads: {out}"
+        );
+        let out = apply(
+            &project,
+            json!({"ops": [{"tool": "set_blend_mode", "args": {"clip_id": ids[0], "mode": "normal"}}]}),
+        )
+        .unwrap();
+        assert!(out["results"][0].get("blend_mode").is_none(), "normal is the default: {out}");
+        let err = apply(
+            &project,
+            json!({"ops": [{"tool": "set_blend_mode", "args": {"clip_id": ids[0], "mode": "soft_light"}}]}),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{}", err.message);
+        assert!(
+            err.message.starts_with("op 0 (set_blend_mode)") && err.message.contains("multiply"),
+            "{}",
+            err.message
+        );
     }
 
     #[test]

@@ -120,7 +120,7 @@ pub(super) fn lut_filter(path: &Path) -> String {
 }
 
 /// `scale`'s name for a matrix tag.
-fn scale_matrix(tag: &str) -> &str {
+pub(super) fn scale_matrix(tag: &str) -> &str {
     match tag {
         "bt470bg" => "bt470",
         "bt2020nc" => "bt2020",

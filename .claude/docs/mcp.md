@@ -156,6 +156,14 @@ and the `ripple` descriptions that a ripple never moves a locked track and placi
 kept, the same `lut_path` without an intensity keeps the current one; a new LUT file is read and checked before the
 lock is taken; the clip comes back. The nested curves / wheels are MCP-only mirrors (`CurvesArg`, `WheelsArg`, …) with
 `deny_unknown_fields`, so `mastre` is refused; the persisted model stays lenient.
+**Blend modes over MCP**: `set_blend_mode` (`clip_id`, `mode`: `normal`, `multiply`, `screen`, `overlay`, `hard_light`, `add`,
+`darken`, `lighten`, `difference`, `exclusion`; `BlendMode::parse` also takes `hard-light`, `linear dodge`, …, and an unknown name
+is `invalid_params` listing the modes) is `Project::set_blend_mode` (a clip on an audio track is refused; batchable; a `Set` in the
+`Clips` tool set). Its description says what each mode is for (screen a light leak shot on black, multiply a texture), that
+opacity, mask, key, fades and dips still weigh the mix (a blended clip's fades are alpha fades, `engine-cli.md`), that letterbox
+bars leave the lower tracks alone, and what it costs (several times a plain clip's work per frame while on screen; the GPU
+preview leaves its frames to FFmpeg); the server `instructions` name it beside `set_mask`; the clip comes back with
+`blend_mode` (absent at `normal`).
 **Per-property animation over MCP**: `set_property_keyframes` (`clip_id`, `prop`, `keys:
 [{time, value, easing?}]`; `[]` makes the number static again; the clip comes back) animates one number —
 a transform number, a colour number, the clip's volume, a number of its mask (`mask_x` ... `mask_feather`; refused on a
@@ -766,7 +774,7 @@ Every tool, by purpose (a test pins that this list names each registered tool, a
 - **Linked picture and sound**: `extract_audio`, `add_asset_audio`, `detach_audio`, `detach_audio_clips`, `reattach_audio`,
   `reattach_audio_clips`, `link_clips`, `unlink_clips`.
 - **Clip look and sound**: `set_volume`, `set_fade`, `set_speed`, `set_speed_ramp`, `set_transform`, `set_transform_at`, `set_color`, `set_transition`,
-  `set_grade`, `set_video_effects`, `set_audio_effects`, `set_mask`, `set_clip_enabled`.
+  `set_grade`, `set_video_effects`, `set_audio_effects`, `set_mask`, `set_blend_mode`, `set_clip_enabled`.
 - **Keyframes and 360**: `set_keyframes`, `add_keyframe`, `set_keyframe_easing`, `set_property_keyframes`,
   `set_property_tracks`, `copy_keyframes`,
   `clear_keyframes`, `set_reframe`, `clear_reframe`, `set_reframe_keyframes`, `add_reframe_keyframe`.

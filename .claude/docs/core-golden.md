@@ -233,3 +233,11 @@
   per-case digests are the ones the commit before gave. Families `audio-denoise` (`afftdn=nr=`: 232 of the 400),
   `audio-denoise-track` (`:tn=1`: 167) and `audio-denoise-delay` (`apad=pad_dur=0.024995,afftdn=`: 232, the wrap that takes
   the delay out); the still and the preview carry no sound, so their four lines are the new cases' pictures.
+- **Blend modes** (`blend_for`; `engine-cli.md`, "Blend modes"), **appended, nothing re-blessed**: the 400 cases after the
+  noise-reduction ones draw from the same generator (with the channel family's channels), then 60 % of the clips on video tracks
+  get a mode other than `normal` on dice of their own (`5 << 40`, seeded by the case and the clip; footage, stills and titles
+  alike). The diff against main of the four digest files is **16 insertions, 0 deletions** (blocks 88–91), so the first 8800
+  per-case digests are main's. Families `blend`, `still-blend`, `preview-blend` (`blend=c0_mode=`) and the two FFmpeg names that
+  differ from the mode's own, `blend-hardlight` (overlay) and `blend-addition` (add). `parts_draw_as_whole` compares a blended
+  clip's placement (its colour stage's `overlay`) and its `blend` between a part and the whole export (so the composite's matrix
+  is decided over the whole timeline).

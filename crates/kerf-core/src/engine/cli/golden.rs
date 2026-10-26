@@ -91,6 +91,15 @@
 //! appended to each file, `parts.txt`'s too. Families `audio-denoise` (`afftdn=nr=`),
 //! `audio-denoise-track` (`:tn=1`) and `audio-denoise-delay` (the pad that leads the delay's trim).
 //!
+//! **The blend-mode family is appended the same way**: the [`BLEND_CASES`] after the noise-reduction ones draw from the
+//! same generator (with the channel family's channels) and then have some of their video clips composited with
+//! a blend mode ([`blend_for`], on dice of its own seeded by the case and the clip, every mode but `normal`). The
+//! first 8800 per-case digests are the ones the commit before blend modes gave; 4 block lines were appended to
+//! each file, `parts.txt`'s too. Families `blend`, `still-blend`, `preview-blend` (`blend=c0_mode=`) and the two
+//! names that differ from the mode's own, `blend-hardlight` (overlay) and `blend-addition` (add). Its blocks are
+//! 88–91: they were 84–87 until it was merged after the noise-reduction family, its dice on a seed of their own
+//! (`5 << 40`).
+//!
 //! **The export in parts has a file of its own** (`golden/parts.txt`, [`the_parts_argv_builders_produce_the_golden_digests`]):
 //! every case is planned with `segments::plan_export` under [`PARTS_LIMITS`] and the argv of every part and of the last pass is
 //! digested, so the three files above prove that a small export is unchanged and this one pins what a long one is made of.
@@ -172,7 +181,10 @@ const RAMP_FIRST: usize = MASK_CROP_FIRST + MASK_CROP_CASES;
 /// The noise-reduction cases appended after the speed-ramp ones (see the module docs).
 const DENOISE_CASES: usize = 400;
 const DENOISE_FIRST: usize = RAMP_FIRST + RAMP_CASES;
-const TOTAL: usize = DENOISE_FIRST + DENOISE_CASES;
+/// The blend-mode cases appended after the noise-reduction ones (see the module docs).
+const BLEND_CASES: usize = 400;
+const BLEND_FIRST: usize = DENOISE_FIRST + DENOISE_CASES;
+const TOTAL: usize = BLEND_FIRST + BLEND_CASES;
 const BLOCK: usize = 100;
 const MIN_PER_FAMILY: usize = 20;
 const KINDS: [&str; 3] = ["export", "still", "preview"];
@@ -416,6 +428,11 @@ preview-speed-ramp-linear sqrt((
 audio-denoise afftdn=nr=
 audio-denoise-track :tn=1
 audio-denoise-delay apad=pad_dur=0.024995,afftdn=
+blend blend=c0_mode=
+blend-hardlight blend=c0_mode=hardlight:
+blend-addition blend=c0_mode=addition:
+still-blend blend=c0_mode=
+preview-blend blend=c0_mode=
 ";
 
 // ---- a seeded generator --------------------------------------------------------
@@ -872,6 +889,21 @@ fn denoise_for(tl: &mut Timeline, j: usize) {
             track_noise: r.chance(0.33),
         };
         clip.audio.insert(at, denoise);
+    }
+}
+
+/// A blend mode on some of the video clips of the `j`-th blend case, on dice of its own seeded by the case and the
+/// clip (so the generator's are untouched): every mode but `normal`, footage, stills and titles alike.
+fn blend_for(tl: &mut Timeline, j: usize) {
+    let mut n = 0;
+    for track in tl.tracks.iter_mut().filter(|t| t.kind == StreamKind::Video) {
+        for clip in &mut track.clips {
+            n += 1;
+            let mut r = Rng::new((5 << 40) + (j as u64) * 64 + n as u64);
+            if r.chance(0.6) {
+                clip.blend_mode = r.pick(&crate::model::BlendMode::ALL[1..]);
+            }
+        }
     }
 }
 
@@ -1366,8 +1398,11 @@ fn case(i: usize, assets: &[Asset]) -> Case {
     if (RAMP_FIRST..DENOISE_FIRST).contains(&i) {
         ramp_for(&mut timeline, i - RAMP_FIRST, assets);
     }
-    if (DENOISE_FIRST..TOTAL).contains(&i) {
+    if (DENOISE_FIRST..BLEND_FIRST).contains(&i) {
         denoise_for(&mut timeline, i - DENOISE_FIRST);
+    }
+    if (BLEND_FIRST..TOTAL).contains(&i) {
+        blend_for(&mut timeline, i - BLEND_FIRST);
     }
     let dur = timeline.duration();
     let edges: Vec<f64> = (timeline.tracks.iter().flat_map(|t| &t.clips))

@@ -414,7 +414,11 @@ release, Escape abandons via `beginDrag`; a click that only adds a point or puts
 a double-click, which undoes it, and a gesture that changes nothing writes nothing; three hue discs painted from `grade.ts`'s `wheelHue` with a lightness
 `SliderRow` each; a `.cube` picker, a Clear button and an intensity slider, with `inspect_lut` saying the size or why the
 file is not applied. Curves are drawn with `grade.ts`, the TS mirror of the engine's cubic; the preview shows the
-grade through FFmpeg because the GPU preview refuses a graded clip), **transition** (a grouped picker
+grade through FFmpeg because the GPU preview refuses a graded clip), a **Blend** select under Opacity in the Transform
+section (`blend-modes.ts`: `BLEND_MODES`, the core's `BlendMode` ids, labels and a hint each shown by `use:tip`; one
+`set_blend_mode` on change, nothing written for the mode the clip has; `blendModeOf` reads an absent field as `normal`; the
+harness writes `normal` as no field and refuses a clip on an audio track, `blend-modes.test.ts`; the preview of a blended clip
+is FFmpeg's, as the GPU refuses it), **transition** (a grouped picker
 over `src/lib/transitions.ts` — fade / slide / push, then a direction, because
 that is the order the choice is actually made and a flat list of eleven names
 hides it; its bun test pins the ids against `TransitionKind::ALL`), plus **video / audio

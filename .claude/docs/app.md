@@ -140,6 +140,7 @@ outside 1..240), `remove_clip`, `remove_clips { clipIds, ripple? }`
 `set_speed`, `set_speed_ramp { clipId, keys, link? }` (a `SpeedKey[]` in clip-local timeline seconds, empty clears; the core op ripples
 and carries linked partners like `set_speed`, which replaces a ramp), `set_transform`, `set_transform_at { clipId, time, …transform fields }` (one revision: a keyed number keyed at
 `time`, the rest and the crop static — what a Preview handle drag writes), `set_color`, `set_transition`, `set_mask`,
+`set_blend_mode { clipId, mode }` (a `BlendMode`, snake_case; a clip on an audio track is refused),
 `set_grade { clipId, grade }` (curves / wheels / LUT; a LUT path the clip did not have is checked off the lock,
 `blocking`, so a curve edit on a clip whose LUT went missing still applies),
 `inspect_lut { path }` (→ `LutInfo {path, size, title}`, or why it is not a usable `.cube`),
@@ -426,7 +427,7 @@ comes back `ForbiddenUrl` and the "Release notes" button silently does nothing.
 `set_delivery_format`, `concatenate`, `remove_silence`, `snap_to_beats`, `smart_crop`, `cancel_smart_crop`;
 *linked A/V* `extract_audio`, `add_asset_audio`, `detach_audio`, `detach_audio_clips`, `reattach_audio`,
 `reattach_audio_clips`, `link_clips`, `unlink_clips`; *clip properties* `set_volume`, `set_fade`, `set_speed`, `set_speed_ramp`,
-`set_transform`, `set_transform_at`, `set_color`, `set_grade`, `inspect_lut`, `set_transition`, `set_mask`, `set_video_effects`, `set_audio_effects`, `set_keyframes`,
+`set_transform`, `set_transform_at`, `set_color`, `set_grade`, `inspect_lut`, `set_transition`, `set_mask`, `set_blend_mode`, `set_video_effects`, `set_audio_effects`, `set_keyframes`,
 `add_keyframe`, `set_keyframe_easing`, `set_property_keyframes`, `set_property_tracks`, `copy_keyframes`, `clear_keyframes`, `set_reframe`,
 `clear_reframe`, `set_reframe_keyframes`, `add_reframe_keyframe`; *markers, text, titles, captions* `add_marker`,
 `update_marker`, `remove_marker`, `add_overlay`, `update_overlay`, `remove_overlay`, `set_overlay_keyframes`,

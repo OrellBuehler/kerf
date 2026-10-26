@@ -298,6 +298,9 @@ pub(crate) fn clip_extras(clip: &Clip) -> Vec<&'static str> {
     if clip.mask.is_some() {
         out.push("masks");
     }
+    if !clip.blend_mode.is_normal() {
+        out.push("blend modes");
+    }
     if clip.reframe.is_some() {
         out.push("360 reframes");
     }
