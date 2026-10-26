@@ -515,7 +515,7 @@
   writes `NaN` as `null`, which a plain number field cannot read back, so one poisoned number would
   stop the project opening. The setters refuse non-finite input themselves with a message; the walk
   is the net under every op that computes a number.
-- **Blend modes** (`BlendMode` in `model.rs`). `Clip.blend_mode` (absent at `normal`, the default; schema v16) is how the
+- **Blend modes** (`BlendMode` in `model.rs`). `Clip.blend_mode` (absent at `normal`, the default; schema v17) is how the
   clip composites onto the tracks below: `normal`, `multiply`, `screen`, `overlay`, `hard_light`, `add` (linear dodge),
   `darken`, `lighten`, `difference`, `exclusion` — the separable modes FFmpeg's `blend` computes as the textbook defines them
   (its soft light, dodge, burn and subtract are other formulas and are not offered; an unknown name does not read).

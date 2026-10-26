@@ -49,8 +49,9 @@
   `KERF_GOLDEN_BLESS=1 cargo test -p kerf-core --no-default-features golden -- --nocapture`
   (exactly `1`): it rewrites **all three** files and says so, and `git diff` is the guard —
   only the files you meant to change should move. It is **machine-independent**: the
-  builders read the machine in six places and each is pinned (the sixth is the animated titles' cache
-  directory, `svg::raster::with_pinned_dir`) — the preview's
+  builders read the machine in seven places and each is pinned (the sixth is the animated titles' cache
+  directory, `svg::raster::with_pinned_dir`; the seventh `afftdn_delays()`, pinned by `with_afftdn_delay` to the
+  delaying filter of FFmpeg 5.1 on, the old spelling being unit-tested) — the preview's
   `decode_hwaccel()` (through `build_preview_args_with`), `zscale_available()` (a `cfg(test)`
   thread-local override; every HDR case is built both ways), `alimiter_latency_available()`
   (the same kind of override, `with_alimiter_latency`; every case is built with the option,
@@ -203,15 +204,6 @@
   by needle, and structurally `speed-ramp-hold`, `speed-ramp-reversed`, `speed-ramp-tail` (a ramped outgoing clip under a
   transition: 124) and `still-speed-ramp` (a ramped clip on screen in a still). The still carries no sound and no `setpts`
   of a ramp (its `-ss` is the map's source time), so it has the one structural family.
-- **Blend modes** (`blend_for`; `engine-cli.md`, "Blend modes"), **appended, nothing re-blessed**: the 400 cases after the ramp ones
-  draw from the same generator (with the channel family's channels), then 60 % of the clips on video tracks get a mode other than
-  `normal` on dice of their own seeded by the case and the clip (footage, stills and titles alike). `git diff` of the four digest
-  files is **16 insertions, 0 deletions**, so the first 8400 per-case digests are the ones the commit before gave. Families `blend`,
-  `still-blend`, `preview-blend` (`blend=c0_mode=`) and the two FFmpeg names that differ from the mode's own, `blend-hardlight`
-  (overlay) and `blend-addition` (add). `parts_draw_as_whole` compares a blended clip's placement (its colour stage's `overlay`) and
-  its `blend` between a part and the whole export (so the composite's matrix is decided over the whole timeline). Re-blessed
-  once, alone, when the blend chains `select`ed the clip's window, named the composite's matrix and gave a blended clip alpha
-  fades, transparent letterbox bars and a `black@0` rotation fill: blocks 84–87 of the four files and nothing else moved.
 - **Constant-power crossfades** (`afade …:curve=qsin` only on a fade that is wholly one half of a real
   pair: a dissolve or motion transition from an adjacent clip whose overlap plays different sound — not a
   fade up from black, not a dip, not a cut inside one take) re-blessed `export.txt` alone: 1304 of 6400
@@ -234,3 +226,18 @@
   zoom out under Contain, a moving zoom, a Cover clip of the frame's own shape that only moves or zooms out. The families split
   the graph on `;` and `,` **outside quotes, with a backslash escaping outside them** (`split_unquoted`): a keyed mask's `;`-separated
   statements and a title's `\'` would otherwise merge chains.
+- **Noise reduction** (`denoise_for`; `engine-cli.md`), **appended, nothing re-blessed**: the 400 cases after the speed-ramp
+  ones draw from the same generator (with the channel family's channels), then 70% of their clips get a `Denoise` anywhere in
+  their audio chain, on dice of their own seeded by the case and the clip (reduction 0.5..96 dB, floor −79..−21 dB, the floor
+  tracked a third of the time). The diff of the four digest files is **16 insertions, 0 deletions**, so the first 8400
+  per-case digests are the ones the commit before gave. Families `audio-denoise` (`afftdn=nr=`: 232 of the 400),
+  `audio-denoise-track` (`:tn=1`: 167) and `audio-denoise-delay` (`apad=pad_dur=0.024995,afftdn=`: 232, the wrap that takes
+  the delay out); the still and the preview carry no sound, so their four lines are the new cases' pictures.
+- **Blend modes** (`blend_for`; `engine-cli.md`, "Blend modes"), **appended, nothing re-blessed**: the 400 cases after the
+  noise-reduction ones draw from the same generator (with the channel family's channels), then 60 % of the clips on video tracks
+  get a mode other than `normal` on dice of their own (`5 << 40`, seeded by the case and the clip; footage, stills and titles
+  alike). The diff against main of the four digest files is **16 insertions, 0 deletions** (blocks 88–91), so the first 8800
+  per-case digests are main's. Families `blend`, `still-blend`, `preview-blend` (`blend=c0_mode=`) and the two FFmpeg names that
+  differ from the mode's own, `blend-hardlight` (overlay) and `blend-addition` (add). `parts_draw_as_whole` compares a blended
+  clip's placement (its colour stage's `overlay`) and its `blend` between a part and the whole export (so the composite's matrix
+  is decided over the whole timeline).

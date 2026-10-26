@@ -132,6 +132,12 @@ const MIGRATIONS: &[Migration] = &[
         destructive: false,
         needed_to_read: false,
     },
+    Migration {
+        run: v16_to_v17,
+        needed: v16_to_v17_needed,
+        destructive: false,
+        needed_to_read: false,
+    },
 ];
 
 /// The schema this build writes and the newest it opens.
@@ -364,16 +370,28 @@ fn v14_to_v15_needed(conn: &Connection) -> bool {
     !has_column(conn, "assets", "tags")
 }
 
-/// v16: a clip may carry a blend mode (`Clip.blend_mode`, `"blend_mode"` in the timeline JSON: `"multiply"`, `"screen"`,
-/// ...). It is a new field an older build drops at its next write of the clip, and the clip then composites as plain
-/// alpha-over: a screened light leak covers the shot instead of lighting it. A clip at `normal` is written as it was, so
-/// a stored one is unchanged. Nothing in the file's tables changes; the step is the version that keeps an older build
-/// out, after the file is copied aside.
+/// v16: a clip's audio chain may hold a noise reduction (`AudioEffect::Denoise`, `{"type":"denoise",...}` in a clip's
+/// `audio` in the timeline JSON). It is a new variant an older build cannot read, and with it the whole timeline. A chain
+/// without one is written as it was, so a stored one is unchanged. Nothing in the file's tables changes; the step is the
+/// version that keeps an older build out, after the file is copied aside.
 fn v15_to_v16(_: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
 fn v15_to_v16_needed(_: &Connection) -> bool {
+    true
+}
+
+/// v17: a clip may carry a blend mode (`Clip.blend_mode`, `"blend_mode"` in the timeline JSON: `"multiply"`, `"screen"`,
+/// ...). It is a new field an older build drops at its next write of the clip, and the clip then composites as plain
+/// alpha-over: a screened light leak covers the shot instead of lighting it. A clip at `normal` is written as it was, so
+/// a stored one is unchanged. Nothing in the file's tables changes; the step is the version that keeps an older build
+/// out, after the file is copied aside.
+fn v16_to_v17(_: &Connection) -> rusqlite::Result<()> {
+    Ok(())
+}
+
+fn v16_to_v17_needed(_: &Connection) -> bool {
     true
 }
 

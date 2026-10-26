@@ -1223,7 +1223,8 @@ number's `keyAtPlayhead`) read that clip. **A plain field** (`numRow`, a title's
 Transitions tab's length) is no different: its `change` comes with the blur, by when the selection has moved *and the field has been
 re-rendered with the new selection's value*, so reading either writes the other clip's number onto this one. `FieldEdits`
 (`field-edit.ts`) notes the scope on `focus` and the typed text on `input` and `compositionend`, and the commit takes both from there (`noteFocus` /
-`noteTyped` / `endEdit` in the Inspector); a select or a checkbox changes at once and only needs the scope. A bun test holds every
+`noteTyped` / `endEdit` in the Inspector); a select or a checkbox changes at once and only needs the scope (an effect's
+boolean parameter, denoise's `track_noise`, is a `CheckRow` with `pending`). A bun test holds every
 text and number input of the Inspector to this. Rest values are the model's
 `DEFAULT_TRANSFORM` / `DEFAULT_COLOR` / `DEFAULT_REFRAME` / `DEFAULT_MASK`. The Inspector's other rows (read-only values, plain number
 fields) share the label column and end where the sliders' numbers do, a field's unit (`s`) sitting in the keyframe slot. The ◇ is a 24 px `IconBtn` with a `diamond` icon (filled while a key sits at the playhead).

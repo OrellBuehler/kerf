@@ -31,6 +31,7 @@ describe('effect presets', () => {
 			makeup_db: 6
 		});
 		expect(AUDIO_FX.gate).toEqual({ type: 'gate', threshold_db: -45 });
+		expect(AUDIO_FX.denoise).toEqual({ type: 'denoise', reduction_db: 12, floor_db: -50, track_noise: false });
 	});
 
 	test('every preset says what it is and what it does', () => {

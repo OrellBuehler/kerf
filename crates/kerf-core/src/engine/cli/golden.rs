@@ -1,8 +1,8 @@
-//! The golden argv oracle: 8400 seeded timelines (4000, then 800 with a master bus, then 800
+//! The golden argv oracle: 8800 seeded timelines (4000, then 800 with a master bus, then 800
 //! with per-property channels, then 400 with an AMF or VAAPI encoder, then 400 with animated SVG
 //! titles, then 400 exported at several delivery frames in one run, then 400 with titles on tracks,
-//! then 400 with a blurred fill, then 400 with a keyed mask or crop, then 400 with speed ramps)
-//! whose ffmpeg argv must not move.
+//! then 400 with a blurred fill, then 400 with a keyed mask or crop, then 400 with speed ramps, then
+//! 400 with noise reduction) whose ffmpeg argv must not move.
 //!
 //! `build_export_args_phase`, `build_still_args` and `build_preview_args_with` are
 //! built for every case and their argv reduced to a digest, checked against three
@@ -84,25 +84,33 @@
 //! `speed-ramp-hold`, `speed-ramp-reversed`, `speed-ramp-tail` (a ramped outgoing clip under a
 //! transition) and `still-speed-ramp`.
 //!
-//! **The blend-mode family is appended the same way**: the [`BLEND_CASES`] after the ramp ones draw from the
+//! **The noise-reduction family is appended the same way**: the [`DENOISE_CASES`] after those draw
+//! from the same generator (with the channel family's channels) and then have a `Denoise` put into the
+//! audio chain of most of their clips ([`denoise_for`], on dice of its own seeded by the case and the
+//! clip). The first 8400 per-case digests are the ones the commit before it gave; 4 block lines were
+//! appended to each file, `parts.txt`'s too. Families `audio-denoise` (`afftdn=nr=`),
+//! `audio-denoise-track` (`:tn=1`) and `audio-denoise-delay` (the pad that leads the delay's trim).
+//!
+//! **The blend-mode family is appended the same way**: the [`BLEND_CASES`] after the noise-reduction ones draw from the
 //! same generator (with the channel family's channels) and then have some of their video clips composited with
 //! a blend mode ([`blend_for`], on dice of its own seeded by the case and the clip, every mode but `normal`). The
-//! first 8400 per-case digests are the ones the commit before blend modes gave; 4 block lines were appended to
+//! first 8800 per-case digests are the ones the commit before blend modes gave; 4 block lines were appended to
 //! each file, `parts.txt`'s too. Families `blend`, `still-blend`, `preview-blend` (`blend=c0_mode=`) and the two
-//! names that differ from the mode's own, `blend-hardlight` (overlay) and `blend-addition` (add). Its blocks
-//! (84–87) were re-blessed alone when the blend graph `select`ed the clip's window, named the composite's matrix
-//! and gave a blended clip alpha fades, transparent letterbox bars and a `black@0` rotation fill.
+//! names that differ from the mode's own, `blend-hardlight` (overlay) and `blend-addition` (add). Its blocks are
+//! 88–91: they were 84–87 until it was merged after the noise-reduction family, its dice on a seed of their own
+//! (`5 << 40`).
 //!
 //! **The export in parts has a file of its own** (`golden/parts.txt`, [`the_parts_argv_builders_produce_the_golden_digests`]):
 //! every case is planned with `segments::plan_export` under [`PARTS_LIMITS`] and the argv of every part and of the last pass is
 //! digested, so the three files above prove that a small export is unchanged and this one pins what a long one is made of.
 //!
-//! **Machine-independent by construction.** The builders read the machine in five
+//! **Machine-independent by construction.** The builders read the machine in six
 //! places, each pinned: the preview's decode acceleration (the
 //! `build_preview_args_with` seam), `zscale_available()` (`with_zscale`; a case
 //! holding HDR footage is built *both* ways), `alimiter_latency_available()`
 //! (`with_alimiter_latency`; every case is built with the option, and a case with the
-//! limiter on has its export argv appended once more without it), `drawtext`'s
+//! limiter on has its export argv appended once more without it), `afftdn_delays()`
+//! (`with_afftdn_delay`: every case is built as for an `afftdn` that delays, FFmpeg 5.1 on), `drawtext`'s
 //! font path (`with_pinned_default_font`: the shipped default that an overlay with no
 //! family gets, and the one family an overlay names, `PINNED_FAMILY`, are fixed paths, so
 //! neither this machine's cache directory nor its installed fonts reach the argv),
@@ -170,9 +178,12 @@ const MASK_CROP_FIRST: usize = BLUR_FIRST + BLUR_CASES;
 /// The speed-ramp cases appended after the keyed mask and crop ones (see the module docs).
 const RAMP_CASES: usize = 400;
 const RAMP_FIRST: usize = MASK_CROP_FIRST + MASK_CROP_CASES;
-/// The blend-mode cases appended after the speed-ramp ones (see the module docs).
+/// The noise-reduction cases appended after the speed-ramp ones (see the module docs).
+const DENOISE_CASES: usize = 400;
+const DENOISE_FIRST: usize = RAMP_FIRST + RAMP_CASES;
+/// The blend-mode cases appended after the noise-reduction ones (see the module docs).
 const BLEND_CASES: usize = 400;
-const BLEND_FIRST: usize = RAMP_FIRST + RAMP_CASES;
+const BLEND_FIRST: usize = DENOISE_FIRST + DENOISE_CASES;
 const TOTAL: usize = BLEND_FIRST + BLEND_CASES;
 const BLOCK: usize = 100;
 const MIN_PER_FAMILY: usize = 20;
@@ -414,6 +425,9 @@ speed-ramp-linear sqrt((
 speed-ramp-audio acrossfade=d=
 preview-speed-ramp setpts='st(0,
 preview-speed-ramp-linear sqrt((
+audio-denoise afftdn=nr=
+audio-denoise-track :tn=1
+audio-denoise-delay apad=pad_dur=0.024995,afftdn=
 blend blend=c0_mode=
 blend-hardlight blend=c0_mode=hardlight:
 blend-addition blend=c0_mode=addition:
@@ -857,6 +871,27 @@ fn ramp_for(tl: &mut Timeline, j: usize, assets: &[Asset]) {
     }
 }
 
+/// A noise reduction in the audio chain of most of the clips of the `j`-th denoise case, on dice of its
+/// own seeded by the case and the clip (so the generator's are untouched): anywhere in the chain the clip
+/// has, its reduction and floor across most of the filter's range, the floor tracked a third of the time.
+fn denoise_for(tl: &mut Timeline, j: usize) {
+    let mut n = 0;
+    for clip in tl.tracks.iter_mut().flat_map(|t| &mut t.clips) {
+        n += 1;
+        let mut r = Rng::new((4 << 40) + (j as u64) * 64 + n as u64);
+        if !r.chance(0.7) {
+            continue;
+        }
+        let at = r.below(clip.audio.len() + 1);
+        let denoise = AudioEffect::Denoise {
+            reduction_db: r.real(0.5, 96.0),
+            floor_db: r.real(-79.0, -21.0),
+            track_noise: r.chance(0.33),
+        };
+        clip.audio.insert(at, denoise);
+    }
+}
+
 /// A blend mode on some of the video clips of the `j`-th blend case, on dice of its own seeded by the case and the
 /// clip (so the generator's are untouched): every mode but `normal`, footage, stills and titles alike.
 fn blend_for(tl: &mut Timeline, j: usize) {
@@ -864,7 +899,7 @@ fn blend_for(tl: &mut Timeline, j: usize) {
     for track in tl.tracks.iter_mut().filter(|t| t.kind == StreamKind::Video) {
         for clip in &mut track.clips {
             n += 1;
-            let mut r = Rng::new((4 << 40) + (j as u64) * 64 + n as u64);
+            let mut r = Rng::new((5 << 40) + (j as u64) * 64 + n as u64);
             if r.chance(0.6) {
                 clip.blend_mode = r.pick(&crate::model::BlendMode::ALL[1..]);
             }
@@ -1360,8 +1395,11 @@ fn case(i: usize, assets: &[Asset]) -> Case {
     if (MASK_CROP_FIRST..RAMP_FIRST).contains(&i) {
         mask_crop_for(&mut timeline, i - MASK_CROP_FIRST);
     }
-    if (RAMP_FIRST..BLEND_FIRST).contains(&i) {
+    if (RAMP_FIRST..DENOISE_FIRST).contains(&i) {
         ramp_for(&mut timeline, i - RAMP_FIRST, assets);
+    }
+    if (DENOISE_FIRST..BLEND_FIRST).contains(&i) {
+        denoise_for(&mut timeline, i - DENOISE_FIRST);
     }
     if (BLEND_FIRST..TOTAL).contains(&i) {
         blend_for(&mut timeline, i - BLEND_FIRST);
@@ -1589,12 +1627,14 @@ fn build(c: &Case, assets: &[Asset]) -> ([String; 3], Vec<String>) {
     (text, transitions(c, assets))
 }
 
-/// `f` as if this ffmpeg did (or did not) have `zscale` and an `alimiter` with `latency`, and the
-/// shipped default font were at a fixed path.
+/// `f` as if this ffmpeg did (or did not) have `zscale` and an `alimiter` with `latency`, its `afftdn`
+/// delayed what it puts out, and the shipped default font were at a fixed path.
 fn pinned<R>(zscale: bool, latency: bool, f: impl FnOnce() -> R) -> R {
     with_zscale(zscale, || {
         with_alimiter_latency(latency, || {
-            crate::fonts::with_pinned_default_font(|| crate::svg::raster::with_pinned_dir("/kerf-test/svg", f))
+            with_afftdn_delay(true, || {
+                crate::fonts::with_pinned_default_font(|| crate::svg::raster::with_pinned_dir("/kerf-test/svg", f))
+            })
         })
     })
 }

@@ -498,7 +498,8 @@ export type AudioEffect =
 			release_ms: number;
 			makeup_db: number;
 	  }
-	| { type: 'gate'; threshold_db: number };
+	| { type: 'gate'; threshold_db: number }
+	| { type: 'denoise'; reduction_db: number; floor_db: number; track_noise: boolean };
 
 /** How a keyframe travels to the next one (kerf-core's `Easing`); omitted is linear. */
 export type Easing =

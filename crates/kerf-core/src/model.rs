@@ -1834,14 +1834,28 @@ pub enum AudioEffect {
     },
     /// Noise gate: silence audio below `threshold_db`.
     Gate { threshold_db: f64 },
+    /// Spectral noise reduction (FFmpeg's `afftdn`): take up to `reduction_db` off the noise
+    /// under `floor_db` (dBFS). With `track_noise` the filter follows the floor itself from
+    /// the `floor_db` it starts at, for a recording whose noise moves.
+    Denoise {
+        reduction_db: f64,
+        floor_db: f64,
+        #[serde(default)]
+        track_noise: bool,
+    },
 }
 
 impl AudioEffect {
-    /// Whether the effect reacts to *level* (a compressor, a gate): a gain put ahead of
-    /// it changes what it does, so the clip's level cannot be moved across it. Filters
-    /// and EQ are linear and commute with any gain.
+    /// Whether the effect reacts to *level* (a compressor, a gate, a denoiser): a gain put
+    /// ahead of it changes what it does, so the clip's level cannot be moved across it. A
+    /// denoiser's floor is an absolute level, so a gain moves the sound against it and changes
+    /// what is taken for noise (tracking the floor only follows it from where it starts).
+    /// Filters and EQ are linear and commute with any gain.
     pub fn is_dynamic(&self) -> bool {
-        matches!(self, AudioEffect::Compressor { .. } | AudioEffect::Gate { .. })
+        matches!(
+            self,
+            AudioEffect::Compressor { .. } | AudioEffect::Gate { .. } | AudioEffect::Denoise { .. }
+        )
     }
 
     /// Short name, for listing a chain in a diff or a log line.
@@ -1852,6 +1866,7 @@ impl AudioEffect {
             AudioEffect::Equalizer { .. } => "EQ",
             AudioEffect::Compressor { .. } => "compressor",
             AudioEffect::Gate { .. } => "gate",
+            AudioEffect::Denoise { .. } => "denoise",
         }
     }
 }
