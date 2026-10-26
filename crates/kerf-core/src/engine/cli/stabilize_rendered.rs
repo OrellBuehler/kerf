@@ -428,3 +428,108 @@ fn an_analysis_job_measures_keeps_and_is_found_again() {
     crate::stabilize::forget(asset.id);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `frames` of `W` x `H` as the means of their 4x4 blocks.
+fn blocks(frames: &[Vec<u8>]) -> Vec<Vec<u8>> {
+    frames
+        .iter()
+        .map(|f| {
+            (0..H / 4)
+                .flat_map(|by| (0..W / 4).map(move |bx| (by, bx)))
+                .map(|(by, bx)| {
+                    let sum: u32 = (0..16)
+                        .map(|i| u32::from(f[((by * 4 + i / 4) * W + bx * 4 + i % 4) as usize]))
+                        .sum();
+                    (sum / 16) as u8
+                })
+                .collect()
+        })
+        .collect()
+}
+
+/// An HDR clip is tone-mapped before it is steadied, in the export as in the still: the export still
+/// steadies it, and its frame is the still's.
+#[test]
+#[ignore = "drives the real ffmpeg"]
+fn a_stabilized_hdr_clip_is_tone_mapped_then_steadied_alike_in_the_export_and_the_still() {
+    if !has_vidstab() {
+        return;
+    }
+    let dir = scratch("hdr");
+    let sdr = shaky(&dir);
+    let path = dir.join("hlg.mp4");
+    let made = command(&ffmpeg_bin())
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-i", &sdr.path])
+        .args(["-c:v", "libx264", "-crf", "8", "-g", "15", "-pix_fmt", "yuv420p"])
+        .args([
+            "-color_primaries",
+            "bt2020",
+            "-color_trc",
+            "arib-std-b67",
+            "-colorspace",
+            "bt2020nc",
+        ])
+        .arg(&path)
+        .status_bounded()
+        .unwrap();
+    assert!(made.success());
+    let mut asset = sdr;
+    asset.id = uuid::Uuid::new_v4();
+    asset.path = path.to_string_lossy().into_owned();
+    asset.streams[0].color_primaries = Some("bt2020".into());
+    asset.streams[0].color_transfer = Some("arib-std-b67".into());
+    asset.streams[0].color_space = Some("bt2020nc".into());
+    assert!(asset.hdr().is_some());
+    let analysis = measure(&asset);
+    let assets = std::slice::from_ref(&asset);
+    let mut clip = make_clip(asset.id, 0.0, SECONDS, 0.0);
+    let shaken = exported(&single(vec![clip.clone()]), assets, &dir);
+    clip.stabilize = Some(Stabilize {
+        strength: 1.0,
+        zoom: None,
+    });
+    let tl = single(vec![clip]);
+    with_analysis(&asset, &analysis, || {
+        let args = build_export_args(&tl, assets, "unused.mkv", &options()).unwrap().join(" ");
+        assert_eq!(args.matches("format=yuv420p,vidstabtransform=").count(), 1, "{args}");
+        let steadied = exported(&tl, assets, &dir);
+        assert_eq!(steadied.len(), shaken.len());
+        // Read on 4x4 block means: the tone-map's error-diffusion dither lays a fresh pattern on every
+        // frame of moving footage, a level of noise per pixel that is not shake.
+        let (before, after) = (
+            jitter(&blocks(&shaken), W / 4, H / 4),
+            jitter(&blocks(&steadied), W / 4, H / 4),
+        );
+        assert!(
+            after < before * 0.3,
+            "the middle changes {after:.2} a frame, {before:.2} shaken"
+        );
+        // The still's RGB of an HDR clip is the composite's matrix and range, not the export's gray
+        // (`grade_rendered`), so the pictures are compared by correlation: where the picture sits is the question.
+        let corr = |a: &[u8], b: &[u8]| -> f64 {
+            let (a, b) = (middle(a, W, H), middle(b, W, H));
+            let n = a.len() as f64;
+            let (ma, mb) = (
+                a.iter().map(|&v| f64::from(v)).sum::<f64>() / n,
+                b.iter().map(|&v| f64::from(v)).sum::<f64>() / n,
+            );
+            let (mut ab, mut aa, mut bb) = (0.0, 0.0, 0.0);
+            for (x, y) in a.iter().zip(&b) {
+                let (x, y) = (f64::from(*x) - ma, f64::from(*y) - mb);
+                ab += x * y;
+                aa += x * x;
+                bb += y * y;
+            }
+            ab / (aa * bb).sqrt()
+        };
+        for k in [12usize, 61] {
+            let s = still(&tl, assets, k as f64 / 30.0, W);
+            let (steady, shook) = (corr(&s, &steadied[k]), corr(&s, &shaken[k]));
+            assert!(
+                steady > 0.95 && steady > shook,
+                "frame {k}: the still correlates {steady:.3} with the export's frame, {shook:.3} with the shaken one"
+            );
+        }
+    });
+    let _ = std::fs::remove_dir_all(&dir);
+}

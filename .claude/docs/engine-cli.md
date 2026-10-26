@@ -1679,7 +1679,10 @@ frame before it), never on a frame, so the first frame kept is the slice's first
 filter goes straight after that `trim`, before `reverse` and the retime, since the correction is per source frame (speed,
 reverse and ramps keep it). An HDR clip is **tone-mapped before it is steadied** in every graph: the export moves its
 tone-map from after `fps` to straight after the `trim` for a stabilized clip (at the source size, so dearer; the later one is
-left out), the still has always tone-mapped first, and a preview's SDR proxy was tone-mapped when it was encoded. A still seeks
+left out), the still has always tone-mapped first, and a preview's SDR proxy was tone-mapped when it was encoded; and a
+10-bit HDR picture reaches vid.stab's 8 bits only as SDR (steadied first, HLG / PQ would be cut to 8 bits before the
+tone-map, and band). The error-diffusion dither then lays a fresh pattern on each frame of the moving footage, a level of
+noise per pixel the render test reads past on 4x4 block means. A still seeks
 to the same midpoint and runs the one-line slice after its tone-map. A clip whose
 analysis does not cover it (or whose window opens before it) gets no filter and plays as shot; an image, a title and 360
 footage never do. *deshake*: `rx` / `ry` 16 to 64 (the filter takes multiples of 16) at about `0.5 % + 2.5 % × strength` of
@@ -1696,7 +1699,8 @@ the math and the slices (`stabilize.rs`), the argv and log parsing (`cli/stabili
 `cli/stabilize_rendered.rs` (`#[ignore]`d, real ffmpeg): Kerf's corrections against vid.stab's own two passes frame for frame
 (from the first frame and from the middle), a stabilized export forward / reversed / at 2× holding a shaken still pattern
 still, `deshake` steadying it without vid.stab, the still equal to the export's frame and a half-size proxy moved by half,
-and an analysis job measured, kept, found again and stopped. Unit tests pin a 4K original's slice scaled by 2, a slice of a
+an analysis job measured, kept, found again and stopped, and an HLG clip steadied in the export with the still placed as its
+frame (by correlation: the still's RGB of HDR footage is the composite's matrix). Unit tests pin a 4K original's slice scaled by 2, a slice of a
 clip zoomed as the whole clip (a drifting, non-periodic analysis), and the HDR tone-map ahead of the stabilizer.
 
 ## Thumbnails (`thumbnail.rs`)
