@@ -960,18 +960,28 @@ so the feature is **only** activated through these forwards — which is what ma
   **Denoise** (`AudioEffect::Denoise`, `engine/cli/denoise.rs`) is `afftdn=nr=…:nf=…` (`:tn=1` only when the
   floor is tracked). `afftdn` works on windows of three hops of `sample_rate / 80`; **since FFmpeg 5.1 its output
   is the window two hops back, stamped with the input's time**: the sound comes out `2 * (sr / 80)` samples late
-  (25 ms at 48 kHz, 1102 samples at 44.1 kHz) and its last two hops are lost. 4.4 / 5.0 waited for a whole window and
-  kept the time. `afftdn_delays()` (once per process: `ffmpeg -h filter=afftdn` lists `noise_reduction`, the long
-  names the rewrite added; a binary that will not run reads as delaying; `with_afftdn_delay` pins it in tests) decides
-  whether the filter is wrapped as `asetpts=PTS-STARTPTS,apad=pad_dur=0.024995,afftdn=…,atrim=start=0.024995,asetpts=PTS-STARTPTS`:
-  rebased (`atrim`'s `start` reads timestamps, and the preview's `-ss` decode does not start at 0), padded and
-  trimmed by the delay, so the clip keeps its length and its sync. `0.024995` rounds to exactly the delay at 8, 12,
-  16, 24, 32, 44.1, 48 and 96 kHz (a sample off at 22.05, 88.2, 192). It runs at the source's rate, after the tempo,
-  like every clip effect, and the preview's `audio_pcm` gets the same text. `denoise_rendered` (`#[ignore]`d) holds the
-  export (44.1 / 48 kHz, 1x / 1.5x) and the preview decode to a lag of **0** samples against the dry render, the
-  same length, the loud part within 0.5 dB, the hiss down by > 12 dB, and the chain *without* the wrap to the delay
-  the probe claims (1199 / 1200 output samples on 6.1), so the compensation is measured. It is level-dependent
-  (`is_dynamic`): its floor is an absolute level.
+  (25 ms at 48 kHz, 1102 samples at 44.1 kHz) and its last two hops are lost. **4.4 / 5.0 keep the time but not the
+  length**: a hop comes out only while a whole window is buffered and nothing is flushed, so `hop * floor(n / hop) -
+  2 * hop` samples come out (25–37 ms of tail lost, nothing under three hops) and the first two hops are a partial
+  overlap-add, ~15 dB down. `afftdn_delays()` (once per process: `ffmpeg -h filter=afftdn` lists `noise_reduction`, the
+  long names the rewrite added; a binary that will not run reads as delaying; `with_afftdn_delay` pins it in tests)
+  picks the wrap. Delaying: `asetpts=PTS-STARTPTS,apad=pad_dur=0.024995,afftdn=…,atrim=start=0.024995,asetpts=PTS-STARTPTS`,
+  rebased (`atrim`'s `start` reads timestamps, and the preview's `-ss` decode does not start at 0), padded and trimmed by
+  the delay; `0.024995` rounds to exactly the delay at 8, 12, 16, 24, 32, 44.1, 48 and 96 kHz (a sample off at 22.05,
+  88.2, 192). Not delaying: `asetpts=PTS-STARTPTS,adelay=delays=40:all=1,apad=pad_dur=0.04,afftdn=…,atrim=start=0.04:end=<len+0.04>,asetpts=PTS-STARTPTS`:
+  40 ms of silence at each end (more than three hops, a whole number of samples at every rate from 8 to 192 kHz, so
+  `adelay` and `atrim` cut the same samples) makes the head a full overlap-add and flushes the tail, and the clip's
+  length (`audio_effect_filter`'s `len`, `ClipTiming::duration`) cuts it back; the preview's `audio_effects_filter`
+  has no length and is cut by `audio_pcm`'s own `-t`. Only the delaying text is in the golden oracle (it is pinned
+  there); the other is unit-tested. It runs at the source's rate, after the tempo, like every clip effect.
+  `denoise_rendered` (`#[ignore]`d; run on 6.1.1, and on the 4.4.1 and 5.0.1 static builds via `KERF_FFMPEG` /
+  `KERF_FFPROBE`) holds the export (44.1 / 48 kHz, 1x / 1.5x, a clip with loud ends) and the preview decode to a lag
+  of **0** samples against the dry render, the same length (on 4.4 / 5.0 the clip's own: dry, 4.4's `atempo` runs a
+  few ms past it at 1.5x), the burst and the last 20 ms within 0.5 dB, the first 12 ms within 1.5 dB (6.1's filter
+  leaves them ~1 dB down while it adapts; 4.4 / 5.0 within 0.02 dB), the hiss down by > 10 dB (~21 dB on 6.1, 12–14 on
+  4.4 / 5.0), and the chain written for the other kind of filter to the delay the probe claims (+1199 / 1200 output
+  samples on 6.1, −1199 / 1200 on 4.4 / 5.0), so the probe is measured. It is level-dependent (`is_dynamic`): its
+  floor is an absolute level.
   The per-clip chains (`video_clip_chain` / `audio_clip_chain`) also realize
   each clip's **video effects** (`gblur`/`unsharp`/`hue`/`negate`/`vignette`, and
   `chromakey` which keeps alpha so a lower track shows through), **audio effects**

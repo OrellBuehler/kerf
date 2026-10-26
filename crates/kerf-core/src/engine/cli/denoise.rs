@@ -4,10 +4,16 @@
 //! `afftdn` works on windows of three hops of `sample_rate / 80` samples (integer division). Since
 //! FFmpeg 5.1 it puts out a hop for every hop it takes in, stamped with the input's time, but what it
 //! puts out is the window two hops back: the sound comes out `2 * (sample_rate / 80)` samples late
-//! (25 ms at 48 kHz, 1102 samples at 44.1 kHz) and its last two hops never come out. Before 5.1 (4.4,
-//! Ubuntu 22.04's, and 5.0) it waited for a whole window and put out its first hop, so the sound kept
-//! its time. Where it delays ([`afftdn_delays`]) the chain rebases the stream to zero, pads its end by
-//! the delay, denoises and cuts the delay off the head: the clip keeps its length and its sync.
+//! (25 ms at 48 kHz, 1102 samples at 44.1 kHz) and its last two hops never come out. Where it delays
+//! ([`afftdn_delays`]) the chain rebases the stream to zero, pads its end by the delay, denoises and
+//! cuts the delay off the head: the clip keeps its length and its sync.
+//!
+//! Before 5.1 (4.4, Ubuntu 22.04's, and 5.0) it puts a hop out only while it holds a whole window and
+//! has no flush at the end: the sound keeps its time, but it comes out `hop * floor(n / hop) - 2 * hop`
+//! samples long (nothing under three hops), and its first two hops are a partial overlap-add, about
+//! 15 dB down. So there the chain leads with [`LEAD`] of silence (`adelay`) and pads the end by as much,
+//! denoises, and cuts the lead off the head and the stream at the clip's length (`len`, when the
+//! caller knows it: the preview's decode is cut by its own `-t`). Measured on 4.4.1 and 5.0.1.
 
 use super::*;
 
@@ -15,6 +21,11 @@ use super::*;
 /// `atrim` and `apad` round it to the nearest sample, which is exactly `2 * (sample_rate / 80)`
 /// samples at 8, 12, 16, 24, 32, 44.1, 48 and 96 kHz (one sample off at 22.05, 88.2 and 192 kHz).
 const DELAY: &str = "0.024995";
+
+/// The silence a filter that does not delay is given at each end, in seconds: more than the three
+/// hops (37.5 ms) it needs, and a whole number of samples at every rate from 8 to 192 kHz, 11.025
+/// and 22.05 included, so `adelay` and `atrim` cut the same samples whichever way each rounds.
+const LEAD: f64 = 0.04;
 
 #[cfg(test)]
 thread_local! {
@@ -65,15 +76,21 @@ pub(super) fn afftdn_delays() -> bool {
 }
 
 /// The filters of one `Denoise`: `afftdn` with the reduction and the floor (`tn=1` only when the
-/// floor is tracked), wrapped in the rebase, pad and trim that take its delay back out where this
-/// ffmpeg has one.
-pub(super) fn denoise_filter(reduction_db: f64, floor_db: f64, track_noise: bool) -> String {
+/// floor is tracked), wrapped in the rebase, pad and trim that keep the sound's time and length on
+/// this ffmpeg (see the module docs). `len` is the clip's length in seconds where the chain is the
+/// export's; a filter that delays needs no length and its text does not hold one.
+pub(super) fn denoise_filter(reduction_db: f64, floor_db: f64, track_noise: bool, len: Option<f64>) -> String {
     let track = if track_noise { ":tn=1" } else { "" };
     let afftdn = format!("afftdn=nr={}:nf={}{track}", fnum(reduction_db), fnum(floor_db));
     if afftdn_delays() {
         format!("asetpts=PTS-STARTPTS,apad=pad_dur={DELAY},{afftdn},atrim=start={DELAY},asetpts=PTS-STARTPTS")
     } else {
-        afftdn
+        let (ms, lead) = (fnum(LEAD * 1000.0), fnum(LEAD));
+        let end = len.map(|l| format!(":end={}", fnum(l.max(0.0) + LEAD))).unwrap_or_default();
+        format!(
+            "asetpts=PTS-STARTPTS,adelay=delays={ms}:all=1,apad=pad_dur={lead},{afftdn},atrim=start={lead}{end},\
+             asetpts=PTS-STARTPTS"
+        )
     }
 }
 
@@ -101,22 +118,37 @@ mod tests {
             )
         );
         let chain = with_afftdn_delay(false, || audio_effects_filter(&[denoise(12.0, -50.0, false)]));
-        assert_eq!(chain.as_deref(), Some("afftdn=nr=12:nf=-50"));
+        assert_eq!(
+            chain.as_deref(),
+            Some(
+                "asetpts=PTS-STARTPTS,adelay=delays=40:all=1,apad=pad_dur=0.04,afftdn=nr=12:nf=-50,\
+                 atrim=start=0.04,asetpts=PTS-STARTPTS"
+            )
+        );
+    }
+
+    #[test]
+    fn a_filter_that_does_not_delay_is_cut_at_the_clips_length_and_one_that_does_ignores_it() {
+        let e = denoise(12.0, -50.0, false);
+        let old = with_afftdn_delay(false, || audio_effect_filter(&e, Some(2.5)));
+        assert!(old.contains(",atrim=start=0.04:end=2.54,"), "{old}");
+        let modern = with_afftdn_delay(true, || audio_effect_filter(&e, Some(2.5)));
+        assert_eq!(Some(modern), with_afftdn_delay(true, || audio_effects_filter(&[e])));
     }
 
     #[test]
     fn tracking_the_floor_is_spelled_only_when_it_is_on_and_the_chain_keeps_its_order() {
-        let chain = with_afftdn_delay(false, || {
+        let chain = with_afftdn_delay(true, || {
             audio_effects_filter(&[
                 AudioEffect::Highpass { hz: 80.0 },
                 denoise(20.5, -62.25, true),
                 AudioEffect::Gate { threshold_db: -40.0 },
             ])
-        });
-        assert_eq!(
-            chain.as_deref(),
-            Some("highpass=f=80,afftdn=nr=20.5:nf=-62.25:tn=1,agate=threshold=0.01")
-        );
+        })
+        .unwrap();
+        assert!(chain.starts_with("highpass=f=80,asetpts=PTS-STARTPTS,"), "{chain}");
+        assert!(chain.contains(",afftdn=nr=20.5:nf=-62.25:tn=1,"), "{chain}");
+        assert!(chain.ends_with(",asetpts=PTS-STARTPTS,agate=threshold=0.01"), "{chain}");
     }
 
     #[test]

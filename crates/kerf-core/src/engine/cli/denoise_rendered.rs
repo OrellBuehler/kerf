@@ -1,11 +1,12 @@
 //! A clip's noise reduction through the real `ffmpeg` (`#[ignore]`d): the denoised sound lands on
 //! the sample the dry one does, in the export and in the preview's decode, at 44.1 and 48 kHz and on a
-//! sped-up clip, keeps its length and its loud parts, and the hiss under it is taken down. The chain
-//! without the delay taken out is held to the delay the probe says this ffmpeg has, so the
-//! compensation is measured, not assumed.
+//! sped-up clip, keeps its length, its loud head and tail and its loud middle, and the hiss under it is
+//! taken down. The chain written for the other kind of `afftdn` is held to the delay the probe says this
+//! one has (late by it where the filter delays, early by it where it does not), so the probe is measured,
+//! not assumed.
 //!
 //! `cargo test -p kerf-core --no-default-features -- --ignored denoise_rendered`
-//! (`KERF_FFMPEG` / `KERF_FFPROBE` pick the build).
+//! (`KERF_FFMPEG` / `KERF_FFPROBE` pick the build: run it on a 4.4 or 5.0 too.)
 
 #![allow(clippy::print_stderr)] // what each case measured, for whoever runs the ignored ones
 
@@ -31,15 +32,15 @@ fn scratch(tag: &str) -> PathBuf {
     dir
 }
 
-/// Four seconds of mono hiss at -45 dBFS with a loud burst of noise at [`BURST`], at `rate`, probed
-/// like an import.
+/// Four seconds of mono hiss at -45 dBFS with a loud burst of noise at [`BURST`] and over the first
+/// 0.2 s and the last 0.1 s, at `rate`, probed like an import.
 fn source(dir: &Path, rate: u32) -> Asset {
     let path = dir.join(format!("hiss-{rate}.wav"));
     let (at, len) = BURST;
     let made = command(&ffmpeg_bin())
         .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i"])
         .arg(format!(
-            "aevalsrc='0.01*(random(0)*2-1)+if(between(t,{at},{end}),0.5*(random(1)*2-1),0)':s={rate}:d=4",
+            "aevalsrc='0.01*(random(0)*2-1)+if(lt(t,0.2)+between(t,{at},{end})+gt(t,3.9),0.5*(random(1)*2-1),0)':s={rate}:d=4",
             end = at + len
         ))
         .args(["-c:a", "pcm_s16le"])
@@ -116,7 +117,7 @@ fn a_denoised_clip_keeps_its_sync_and_its_length_and_loses_its_hiss() {
         let asset = source(&dir, rate);
         let assets = vec![asset.clone()];
         for speed in [1.0, 1.5] {
-            let mut clip = make_clip(asset.id, 0.5, 3.5, 0.25);
+            let mut clip = make_clip(asset.id, 0.0, 4.0, 0.25);
             clip.audio = vec![AudioEffect::Highpass { hz: 40.0 }];
             clip.speed = speed;
             let tag = format!("{rate}-{speed}");
@@ -128,7 +129,7 @@ fn a_denoised_clip_keeps_its_sync_and_its_length_and_loses_its_hiss() {
             );
             let wet_tl = timeline_of(vec![audio_track(vec![denoised(clip.clone(), false)])]);
             let wet = export_audio(&wet_tl, &assets, &dir, &format!("{tag}-wet"));
-            let plain = with_afftdn_delay(false, || export_audio(&wet_tl, &assets, &dir, &format!("{tag}-plain")));
+            let other = with_afftdn_delay(!delays, || export_audio(&wet_tl, &assets, &dir, &format!("{tag}-other")));
             let tracked = export_audio(
                 &timeline_of(vec![audio_track(vec![denoised(clip, true)])]),
                 &assets,
@@ -136,14 +137,15 @@ fn a_denoised_clip_keeps_its_sync_and_its_length_and_loses_its_hiss() {
                 &format!("{tag}-tracked"),
             );
 
-            let (wet_lag, tracked_lag, plain_lag) = (lag(&dry, &wet), lag(&dry, &tracked), lag(&dry, &plain));
-            let delay = if delays {
-                (2 * (rate / 80)) as f64 / f64::from(rate) * OUT as f64
-            } else {
-                0.0
-            };
-            // The burst on the timeline, and a stretch of hiss well after it.
-            let burst_at = 0.25 + (BURST.0 - 0.5) / speed;
+            let (wet_lag, tracked_lag, other_lag) = (lag(&dry, &wet), lag(&dry, &tracked), lag(&dry, &other));
+            let hops = (2 * (rate / 80)) as f64 / f64::from(rate) * OUT as f64;
+            let delay = if delays { hops } else { -hops };
+            // The burst on the timeline, a stretch of hiss well after it, and the loud ends of the clip.
+            let burst_at = 0.25 + BURST.0 / speed;
+            let end = 0.25 + 4.0 / speed;
+            let at = |t: f64| (t * OUT as f64) as usize;
+            let head = |s: &[f32]| rms_db(&s[at(0.25)..at(0.262)]);
+            let tail = |s: &[f32]| rms_db(&s[at(end - 0.02)..at(end)]);
             let burst = |s: &[f32]| {
                 let from = ((burst_at + 0.03) * OUT as f64) as usize;
                 rms_db(&s[from..from + (0.04 / speed * OUT as f64) as usize])
@@ -153,23 +155,34 @@ fn a_denoised_clip_keeps_its_sync_and_its_length_and_loses_its_hiss() {
                 rms_db(&s[from..from + OUT / 2])
             };
             eprintln!(
-                "{rate} Hz at {speed}x: lag {wet_lag} (tracked {tracked_lag}), uncompensated {plain_lag} \
-                 (delay {delay:.1}); burst {:.2} / {:.2} dB, hiss {:.2} -> {:.2} dB (tracked {:.2})",
+                "{rate} Hz at {speed}x: lag {wet_lag} (tracked {tracked_lag}), the other chain {other_lag} \
+                 (delay {delay:.1}); burst {:.2} / {:.2} dB, head {:.2} / {:.2}, tail {:.2} / {:.2}, \
+                 hiss {:.2} -> {:.2} dB (tracked {:.2})",
                 burst(&dry),
                 burst(&wet),
+                head(&dry),
+                head(&wet),
+                tail(&dry),
+                tail(&wet),
                 hiss(&dry),
                 hiss(&wet),
                 hiss(&tracked)
             );
-            assert_eq!(wet.len(), dry.len(), "{tag}: the clip keeps its length");
+            // Where the filter does not delay the chain is cut at the clip's length, which 4.4's `atempo`
+            // runs a few ms past when the sound is dry.
+            let length = if delays { dry.len() } else { at(end) };
+            assert_eq!(wet.len(), length, "{tag}: the clip keeps its length");
             assert_eq!(wet_lag, 0, "{tag}: the denoised sound lands where the dry one does");
             assert_eq!(tracked_lag, 0, "{tag}: and with the floor tracked");
             assert!(
-                (plain_lag as f64 - delay).abs() <= 1.0,
-                "{tag}: without the compensation the sound is {plain_lag} samples late, the probe says {delay:.1}"
+                (other_lag as f64 - delay).abs() <= 1.0,
+                "{tag}: the other chain is {other_lag} samples late, the probe says {delay:.1}"
             );
             assert!((burst(&dry) - burst(&wet)).abs() < 0.5, "{tag}: the loud part passes");
-            assert!(hiss(&wet) < hiss(&dry) - 12.0, "{tag}: the hiss is taken down");
+            assert!((head(&dry) - head(&wet)).abs() < 1.5, "{tag}: the head is not faded in");
+            assert!((tail(&dry) - tail(&wet)).abs() < 0.5, "{tag}: the tail is not lost");
+            // About 21 dB on 6.1, 12 to 14 on 4.4 and 5.0.
+            assert!(hiss(&wet) < hiss(&dry) - 10.0, "{tag}: the hiss is taken down");
             assert!(hiss(&tracked) < hiss(&dry), "{tag}: a tracked floor takes some down too");
         }
     }
