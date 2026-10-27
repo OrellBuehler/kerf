@@ -340,10 +340,10 @@ fn captioned_cuts_and_transitions_are_drawn_by_the_compositor_where_they_were_re
         );
     }
     // The tutorial: its push-ins are a moving zoom, and one clip adds a feathered mask and a blur to it.
-    // A still is drawn throughout once a zoom comes last and masks and blurs are drawn; an export frame of a
-    // push-in is placed at sub-pixel positions by the export's `perspective`, which no compositor pass draws.
-    let (_, before, after) = at("T3", "still");
-    assert!(before < 90.0 && (after - 100.0).abs() < 1e-9, "T3 still: {before} -> {after}");
-    let (_, _, after) = at("T3", "motion");
-    assert!(after < 20.0, "T3 motion: {after}");
+    // A push-in is placed at sub-pixel positions by FFmpeg's `perspective` (the export and the still
+    // alike), which no compositor pass draws: refused, the rest drawn.
+    for mode in ["still", "motion"] {
+        let (_, _, after) = at("T3", mode);
+        assert!(after > 10.0 && after < 20.0, "T3 {mode}: {after}");
+    }
 }

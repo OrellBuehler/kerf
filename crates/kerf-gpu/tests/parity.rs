@@ -125,9 +125,8 @@
 //!   at its size is drawn for every format.
 //! * **A moving zoom is the last stage of FFmpeg's chain** (the still and the export alike), so a
 //!   grade, effects, a mask and the clip's fades act on the picture at its fit size and are magnified
-//!   with it; the compositor draws that order (`a_moving_zoom_is_the_last_stage_of_the_still_too`,
-//!   `tests/motion_parity.rs`). The two it does not order that way, a rotation and an opacity below 1 in
-//!   front of the zoom, are refused (`refused/moving-zoom-behind-*`). A rotation and an opacity moving
+//!   with it, and the picture is then placed at sub-pixel positions by a `perspective`, which no pass draws:
+//!   refused (`KeyedPlacement`; `a_moving_zoom_is_the_last_stage_of_the_still_too`, `tests/motion_parity.rs`). A rotation and an opacity moving
 //!   over a zoom that holds are drawn (`time/keyframes+rotation+opacity`).
 //! * **Masks and effects** (`masks_cut_a_layer_to_a_shape`, `effects_are_drawn_as_their_filters_draw_them`,
 //!   `the_effect_filters_match_ffmpeg_plane_by_plane`): a mask's alpha is `geq`'s, blended per sample (luma)
@@ -1948,10 +1947,7 @@ fn source_time_speed_reverse_and_keyframes() {
     let tl = timeline(vec![vec![rev]], None);
     check("time/reversed", &tl, std::slice::from_ref(&m.testsrc), &[0.3, 1.1], STRICT);
 
-    // Keyframed transform: sampled at the same clip time by both renderers. The zoom moves and
-    // so does the position, with nothing in front of the zoom (a moving zoom is the *last*
-    // stage of FFmpeg's chain, so a grade, a rotation or a fade of opacity is applied to the
-    // picture at its fit size and magnified; the plan refuses that, see below).
+    // Keyframed transform: a zoom and a position that move are placed by FFmpeg's `perspective`, refused.
     let key = |time: f64, scale: f64, pos: (f64, f64), rotation: f64, opacity: f64| Keyframe {
         easing: Default::default(),
         time,
@@ -1964,17 +1960,11 @@ fn source_time_speed_reverse_and_keyframes() {
     let mut kf = clip(&m.testsrc, 0.0, 2.0, 0.5);
     kf.keyframes = vec![key(0.0, 1.0, (0.0, 0.0), 0.0, 1.0), key(1.5, 0.5, (0.2, -0.1), 0.0, 1.0)];
     let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![kf]], None);
-    check(
-        "time/keyframes",
-        &tl,
-        &[m.bars.clone(), m.testsrc.clone()],
-        &[0.5, 1.25, 2.0],
-        STRICT,
-    );
-    // The rotation and the opacity keyed too, over a zoom that holds still: both are sampled at
-    // the clip's time and the order is the one the GPU has.
+    check_placed("time/keyframes", &tl, &[m.bars.clone(), m.testsrc.clone()], &[0.5, 1.25, 2.0]);
+    // The rotation and the opacity keyed, over a zoom and a position that hold still: both are
+    // sampled at the clip's time and the order is the one the GPU has.
     let mut kf = clip(&m.testsrc, 0.0, 2.0, 0.5);
-    kf.keyframes = vec![key(0.0, 0.5, (0.0, 0.0), 0.0, 1.0), key(1.5, 0.5, (0.2, -0.1), 10.0, 0.6)];
+    kf.keyframes = vec![key(0.0, 0.5, (0.2, -0.1), 0.0, 1.0), key(1.5, 0.5, (0.2, -0.1), 10.0, 0.6)];
     let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![kf]], None);
     check(
         "time/keyframes+rotation+opacity",
@@ -2127,6 +2117,14 @@ fn busy_sources_are_held_to_the_scaler_not_to_a_flat_region() {
         &[0.1],
         BUSY,
     );
+}
+
+/// A moving zoom or position: FFmpeg's still places the picture at sub-pixel positions (a `perspective`, as
+/// the export does), which no compositor pass draws, so the plan refuses it at each of `times`.
+fn check_placed(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64]) {
+    for t in times {
+        check_refused(case, tl, assets, *t, Refusal::Plan("a moving zoom or position"));
+    }
 }
 
 /// What a refused frame must be refused for.
@@ -4436,9 +4434,9 @@ fn a_mask(shape: kerf_core::MaskShape, feather: f64, inverted: bool) -> kerf_cor
     }
 }
 
-/// The still runs a moving zoom as the last stage of the clip's chain, like the export, so what is in
-/// front of it (a grade, a mask, an effect, the clip's fades) acts at the fit size and is magnified.
-/// Held to FFmpeg's still, at several moments of the zoom.
+/// The still runs a moving zoom as the last stage of the clip's chain, like the export: the placement's
+/// `perspective`, after what is in front of it (a grade, a mask, an effect, the clip's fades). No
+/// compositor pass draws it, so every case is refused and FFmpeg renders it.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn a_moving_zoom_is_the_last_stage_of_the_still_too() {
@@ -4452,15 +4450,14 @@ fn a_moving_zoom_is_the_last_stage_of_the_still_too() {
         edit(&mut z);
         timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![z]], None)
     };
-    check("zoom/plain", &zooming(&|_| {}), &assets, &times, STRICT);
-    check(
+    check_placed("zoom/plain", &zooming(&|_| {}), &assets, &times);
+    check_placed(
         "zoom/out with position",
         &zooming(&|c| c.keyframes = zoom_keys(1.0, 0.6, (0.2, -0.1))),
         &assets,
         &times,
-        STRICT,
     );
-    check(
+    check_placed(
         "zoom+grade",
         &zooming(&|c| {
             c.color = Color {
@@ -4471,21 +4468,18 @@ fn a_moving_zoom_is_the_last_stage_of_the_still_too() {
         }),
         &assets,
         &times,
-        STRICT,
     );
-    check(
+    check_placed(
         "zoom+mask",
         &zooming(&|c| c.mask = Some(a_mask(kerf_core::MaskShape::Ellipse, 0.2, false))),
         &assets,
         &times,
-        STRICT,
     );
-    check(
+    check_placed(
         "zoom+mask rect inverted",
         &zooming(&|c| c.mask = Some(a_mask(kerf_core::MaskShape::Rect, 0.1, true))),
         &assets,
         &times,
-        STRICT,
     );
     for (name, effect) in [
         ("blur", E::Blur { sigma: 5.0 }),
@@ -4493,12 +4487,11 @@ fn a_moving_zoom_is_the_last_stage_of_the_still_too() {
         ("grayscale", E::Grayscale),
         ("invert", E::Invert),
     ] {
-        check(
+        check_placed(
             &format!("zoom+{name}"),
             &zooming(&|c| c.effects = vec![effect.clone()]),
             &assets,
             &times,
-            STRICT,
         );
     }
     // The tutorial's clip: a feathered mask over a blurred picture, in a Cover frame, zooming in.
@@ -4510,15 +4503,9 @@ fn a_moving_zoom_is_the_last_stage_of_the_still_too() {
         vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![z]],
         Some(Delivery::new(960, 540, Fit::Cover)),
     );
-    check("zoom+mask+blur cover", &tl, &assets, &times, STRICT);
+    check_placed("zoom+mask+blur cover", &tl, &assets, &times);
     // A fade-in running at the moment of the still: faded at the fit size, then zoomed.
-    check(
-        "zoom+fade-in",
-        &zooming(&|c| c.fade_in = 1.0),
-        &assets,
-        &[0.6, 0.9, 1.2],
-        STRICT,
-    );
+    check_placed("zoom+fade-in", &zooming(&|c| c.fade_in = 1.0), &assets, &[0.6, 0.9, 1.2]);
     // A dissolve into a zooming, masked clip.
     let out = clip(&m.bars, 0.0, 2.0, 0.0);
     let mut inc = clip(&m.testsrc, 0.0, 2.0, 1.0);
@@ -4529,7 +4516,7 @@ fn a_moving_zoom_is_the_last_stage_of_the_still_too() {
         duration: 0.6,
     });
     let tl = timeline(vec![vec![out, inc]], None);
-    check("zoom/dissolve+mask", &tl, &assets, &[1.1, 1.3, 1.5], STRICT);
+    check_placed("zoom/dissolve+mask", &tl, &assets, &[1.1, 1.3, 1.5]);
 }
 
 /// A mask in a still: the alpha `geq` writes, blended by `overlay` (luma per sample; chroma over the
