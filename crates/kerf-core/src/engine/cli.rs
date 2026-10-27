@@ -10920,12 +10920,14 @@ fn still_clip_chain_graded(
     }
     p.extend(late_zoom);
     if let Some((zoom, (px, py))) = placement {
+        // Always into `yuva420p` first: the still's opacity (`colorchannelmixer`) leaves an RGB picture, which
+        // the export's never is, and placing it in RGB put the conversion after the resample (4 levels off).
         let zoom = zoom.map(fnum);
         p.extend(placement_chain(
             zoom.as_deref(),
             (&fnum(px), &fnum(py)),
             (ow, oh),
-            needs_alpha,
+            false,
             false,
         ));
     }

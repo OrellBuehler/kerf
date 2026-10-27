@@ -146,7 +146,7 @@ jobs:
   # unit tests in `build` can only assert on argv. `downloads_a_real_model`
   # stays out: it pulls a whisper model over the network.
   #
-  # Two kinds of FFmpeg. `system` is the distro package (6.1 on ubuntu-latest) —
+  # Two kinds of FFmpeg. `system` is the distro package (6.1 on ubuntu-24.04, pinned: 26.04's is 8.0) —
   # the oldest thing a Linux user is likely to point Kerf at. `pinned` is the
   # exact build `scripts/fetch-ffmpeg.mjs` resolves for that OS — 9.0, what the
   # Windows installer ships, and the only place the FFmpeg 8+ code paths (the
@@ -160,7 +160,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-24.04
             ffmpeg: system
           - os: ubuntu-latest
             ffmpeg: pinned
