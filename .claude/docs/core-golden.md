@@ -106,6 +106,13 @@
   export, 750 still and 1550 preview cases differ. `zoom-keyed-last`, `alpha-kept` and
   `still-zoom-last` are structural families (read off how the chains *end*: the text of a moving
   zoom and of an alpha source's terminal format is the same `format=yuva420p`).
+- **A moving zoom or position placed at sub-pixel positions** (`placement_filters`; `engine-cli.md`) re-blessed
+  `export.txt`, `preview.txt` and `parts.txt` and left `still.txt` alone: 5383 export and 4177 preview cases of 9600
+  moved, **exactly** the structural families `placed` / `preview-placed` (a clip chain ending in the placement's `crop`
+  at `x='2*floor((iw-`; renamed from `zoom-keyed-last`), none outside them and none of them unmoved; `parts.txt` moved
+  4651 cases, all `placed`, the 732 `placed` ones that did not being the cases with no parts (one shared digest).
+  `chain_tails` now splits at unquoted `;` only (a reframe's `sendcmd` text holds them) and reads a multi-delivery
+  run's `d<n>_` labels; it had been missing both kinds of case.
 - **The still inside a transition** (fades, tails and travel drawn as the export draws them,
   `engine/cli/still_fx.rs`) re-blessed `still.txt` alone: 1577 of 5600 still cases moved, exactly the
   cases hitting the new `still-fade` (`settb=expr=`; plus `still-fade-alpha`, `still-fade-white`,

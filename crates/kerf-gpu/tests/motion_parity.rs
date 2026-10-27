@@ -780,6 +780,12 @@ fn check_motion(check: Check) -> (i32, i32) {
     (ys.max, uv.max)
 }
 
+/// A moving zoom or position: the export places the picture on the canvas at sub-pixel positions
+/// (a `perspective`), which no compositor pass draws, so its frames are refused.
+fn run_placed(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, secs: f64) {
+    refused(case, tl, assets, &at_fps(fps), upto(secs, fps), "a moving zoom or position");
+}
+
 /// A plan the compositor must refuse, for `reason`, at every frame of the range — with FFmpeg's
 /// export unaffected (the case builds it all the same, so the graph is known to render).
 fn refused(case: &str, tl: &Timeline, assets: &[Asset], opts: &ExportOptions, frames: Range<u64>, reason: &str) {
@@ -1577,16 +1583,8 @@ fn keyframed_position_and_rotation_in_an_export_frame() {
     let mut moving = clip(&m.testsrc, 0.5, 1.5, 0.0);
     moving.keyframes = vec![key(0.0, -0.25, 0.0), key(1.0, 0.25, 0.0)];
     let tl = timeline(vec![vec![under.clone()], vec![moving]], None);
-    run(
-        "keyed/position",
-        &tl,
-        &[m.black.clone(), m.testsrc.clone()],
-        30.0,
-        1.0,
-        SCALED,
-    );
-    // The easing of a segment is the polyline both renderers read (`Clip::transform_at`): eased,
-    // held and a bezier move the picture to the same pixels.
+    run_placed("keyed/position", &tl, &[m.black.clone(), m.testsrc.clone()], 30.0, 1.0);
+    // The easing of a segment is the polyline both renderers read (`Clip::transform_at`).
     for (name, easing) in [
         ("ease-in-out", kerf_core::Easing::EaseInOut),
         ("hold", kerf_core::Easing::Hold),
@@ -1617,13 +1615,12 @@ fn keyframed_position_and_rotation_in_an_export_frame() {
             "{name} must change the pose"
         );
         let tl = timeline(vec![vec![under.clone()], vec![eased]], None);
-        run(
+        run_placed(
             &format!("keyed/position {name}"),
             &tl,
             &[m.black.clone(), m.testsrc.clone()],
             30.0,
             1.0,
-            SCALED,
         );
     }
     let mut turning = clip(&m.smooth, 0.5, 1.5, 0.0);
@@ -1710,11 +1707,11 @@ fn a_keyed_opacity_is_the_geq_alpha_of_each_frame() {
         2.0,
         EXACT,
     );
-    // Scaled and moving: the scaler's level, as for any scaled layer.
+    // Scaled: the scaler's level, as for any scaled layer; moving, it is placed by the export's `perspective`.
     let mut pip = fading(&m.testsrc, vec![key(0.0, 0.2), key(1.0, 0.9)]);
     pip.transform.scale = 0.6;
     pip.set_property_keys(Property::PosX, vec![key(0.0, -0.2), key(1.0, 0.2)]);
-    run("keyed opacity/moving pip", &over_the_bars(pip), &assets, 30.0, 1.0, SCALED);
+    run_placed("keyed opacity/moving pip", &over_the_bars(pip), &assets, 30.0, 1.0);
     let mut odd = fading(&m.testsrc, vec![key(0.0, 0.5), key(1.0, 0.7)]);
     odd.transform.scale = 0.33;
     run("keyed opacity/odd 211x118", &over_the_bars(odd), &assets, 30.0, 1.0, SCALED);
@@ -2167,15 +2164,16 @@ fn a_keyed_colour_is_the_eq_of_each_frame() {
             c.set_property_keys(prop, linear_keys(lo, hi));
         }
     };
+    // (A picture-in-picture at a static offset: a moving one is placed by the export's `perspective`, refused.)
     let moving = |c: &mut Clip| {
         c.transform.scale = 0.6;
-        c.set_property_keys(Property::PosX, linear_keys(-0.2, 0.2));
+        c.transform.pos_x = 0.2;
     };
     let mut gentle_pip = clip(&m.testsrc, 0.5, 1.5, 0.0);
     gentle(&mut gentle_pip, 1.1);
     moving(&mut gentle_pip);
     run_colour(
-        "keyed colour/moving pip, gentle",
+        "keyed colour/pip, gentle",
         &over_the_bars(gentle_pip),
         &two,
         30.0,
@@ -2189,7 +2187,7 @@ fn a_keyed_colour_is_the_eq_of_each_frame() {
     gentle(&mut gentler_pip, 1.2);
     moving(&mut gentler_pip);
     run_grade_steep(
-        "keyed colour/moving pip, gamma to 1.2",
+        "keyed colour/pip, gamma to 1.2",
         &over_the_bars(gentler_pip),
         &two,
         1.0,
@@ -2200,7 +2198,7 @@ fn a_keyed_colour_is_the_eq_of_each_frame() {
     let mut steep_pip = colour_keyed(&m.testsrc, &all, &linear_keys);
     moving(&mut steep_pip);
     run_grade_steep(
-        "keyed colour/moving pip, steep",
+        "keyed colour/pip, steep",
         &over_the_bars(steep_pip),
         &two,
         1.0,
@@ -2301,7 +2299,7 @@ fn a_keyed_colour_is_the_eq_of_each_frame() {
         zoomed.set_property_keys(prop, linear_keys(colour_span(prop).0, colour_span(prop).1));
     }
     let tl = over_the_bars(zoomed);
-    run_colour("keyed colour/under a moving zoom", &tl, &two, 30.0, 1.0, 20, SCALED);
+    run_placed("keyed colour/under a moving zoom", &tl, &two, 30.0, 1.0);
 }
 
 /// A grade on a layer the scaler resizes: the scaler is a level off swscale's and the tables multiply that by their steepest
@@ -3017,10 +3015,11 @@ fn a_full_range_picture_is_drawn_as_the_ffmpeg_in_use_converts_its_range() {
 // ---- a moving zoom comes last; masks; effects -----------------------------------------------------
 //
 // The export runs a clip with a moving zoom as `crop, fit, setsar, fps, eq, effects, format=yuva420p,
-// mask, rotate, fades, scale eval=frame` (`video_clip_chain`): the zoom is the last stage, so the grade,
-// the effects, the mask and the fades act on the picture at its fit size and are magnified with it. The
-// compositor draws that order (`GpuCaps::keyed_zoom`); a rotation or an opacity below 1 in front of
-// the zoom is the one pair it does not, and is refused.
+// mask, rotate, fades`, then places the picture on the canvas at sub-pixel positions (`pad`, a per-frame
+// `perspective`, `crop`: `video_clip_chain`). No compositor pass draws that placement, so every export
+// frame of a moving zoom (or position) is refused (`KeyedPlacement`) and FFmpeg renders it; the cases
+// below hold the plan to that. (The compositor's zoom-last order, `GpuCaps::keyed_zoom`, is the scrubbed
+// still's, whose chain still ends in the zoom's `scale`.)
 
 fn zoom_key(time: f64, scale: f64, pos_x: f64, pos_y: f64) -> kerf_core::Keyframe {
     kerf_core::Keyframe {
@@ -3053,26 +3052,9 @@ fn mask_of(shape: kerf_core::MaskShape, feather: f64, inverted: bool) -> kerf_co
     }
 }
 
-/// Which frames of a one-second clip at 30 fps a montage is made of.
-const LOOK_ZOOM: [u64; 3] = [2, 14, 27];
-
-fn run_zoom(case: &str, tl: &Timeline, assets: &[Asset], limits: Limits) {
-    check_motion(Check {
-        case,
-        tl,
-        assets,
-        opts: at_fps(30.0),
-        frames: upto(1.0, 30.0),
-        limits,
-        look: &LOOK_ZOOM,
-        rotated: false,
-        refusing: None,
-    });
-}
-
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
-fn a_moving_zoom_is_drawn_as_the_export_draws_it() {
+fn a_moving_zoom_in_an_export_frame_is_refused() {
     let m = media();
     let assets = [m.bars.clone(), m.testsrc.clone()];
     // Zoom in (the picture grows past the frame) and out (the layer below shows around it).
@@ -3084,7 +3066,7 @@ fn a_moving_zoom_is_drawn_as_the_export_draws_it() {
             ],
             None,
         );
-        run_zoom(&format!("zoom/{name}"), &tl, &assets, SCALED);
+        run_placed(&format!("zoom/{name}"), &tl, &assets, 30.0, 1.0);
     }
     // The position moves with it, and the easing of the segment is the polyline both read.
     let tl = timeline(
@@ -3094,11 +3076,11 @@ fn a_moving_zoom_is_drawn_as_the_export_draws_it() {
         ],
         None,
     );
-    run_zoom("zoom/with position", &tl, &assets, SCALED);
+    run_placed("zoom/with position", &tl, &assets, 30.0, 1.0);
     let mut eased = zooming(&m.testsrc, 1.0, 1.7, (0.0, 0.0));
     eased.keyframes[0].easing = kerf_core::Easing::EaseInOut;
     let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![eased]], None);
-    run_zoom("zoom/eased", &tl, &assets, SCALED);
+    run_placed("zoom/eased", &tl, &assets, 30.0, 1.0);
     // Three keys: in, then out again.
     let mut back = zooming(&m.testsrc, 1.0, 1.5, (0.0, 0.0));
     back.keyframes = vec![
@@ -3107,51 +3089,45 @@ fn a_moving_zoom_is_drawn_as_the_export_draws_it() {
         zoom_key(1.0, 0.8, -0.1, 0.05),
     ];
     let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![back]], None);
-    run_zoom("zoom/three keys", &tl, &assets, SCALED);
+    run_placed("zoom/three keys", &tl, &assets, 30.0, 1.0);
     // A zoom that starts late on the timeline, speed 2, reversed.
     let mut late = zooming(&m.testsrc, 1.0, 1.4, (0.0, 0.0));
     late.timeline_start = 0.5;
     let tl = timeline(vec![vec![late]], None);
-    check_motion(Check {
-        case: "zoom/late start",
-        tl: &tl,
-        assets: &assets[1..],
-        opts: at_fps(30.0),
-        frames: 15..44,
-        limits: SCALED,
-        look: &[],
-        rotated: false,
-        refusing: None,
-    });
+    refused(
+        "zoom/late start",
+        &tl,
+        &assets[1..],
+        &at_fps(30.0),
+        15..44,
+        "a moving zoom or position",
+    );
     for (name, speed) in [("speed 2", 2.0), ("reversed", -1.0)] {
         let mut c = zooming(&m.testsrc, 1.0, 1.5, (0.0, 0.0));
         c.source_out = 2.5;
         c.speed = speed;
         c.keyframes = vec![zoom_key(0.0, 1.0, 0.0, 0.0), zoom_key(0.5, 1.5, 0.0, 0.0)];
         let tl = timeline(vec![vec![c]], None);
-        check_motion(Check {
-            case: &format!("zoom/{name}"),
-            tl: &tl,
-            assets: &assets[1..],
-            opts: at_fps(30.0),
-            frames: 0..14,
-            limits: SCALED,
-            look: &[],
-            rotated: false,
-            refusing: None,
-        });
+        refused(
+            &format!("zoom/{name}"),
+            &tl,
+            &assets[1..],
+            &at_fps(30.0),
+            0..14,
+            "a moving zoom or position",
+        );
     }
     // Cover into a frame the footage is scaled to: two scalers in cascade, the second one zooming.
     let tl = timeline(
         vec![vec![zooming(&m.testsrc, 1.0, 1.25, (-0.05, 0.0))]],
         Some(Delivery::new(960, 540, Fit::Cover)),
     );
-    run_zoom("zoom/cover 960x540", &tl, &assets[1..], CASCADED);
+    run_placed("zoom/cover 960x540", &tl, &assets[1..], 30.0, 1.0);
     let tl = timeline(
         vec![vec![zooming(&m.testsrc, 1.0, 1.3, (0.0, 0.0))]],
         Some(Delivery::new(360, 640, Fit::Cover)),
     );
-    run_zoom("zoom/cover 9:16", &tl, &assets[1..], CASCADED);
+    run_placed("zoom/cover 9:16", &tl, &assets[1..], 30.0, 1.0);
     // A still image is RGB: FFmpeg scales it in RGB, and any resize of such a picture is refused (the zoom
     // is one), whatever the frame does after it.
     let tl = timeline(vec![vec![zooming(&m.image, 1.0, 1.5, (0.0, 0.0))]], None);
@@ -3167,7 +3143,7 @@ fn a_moving_zoom_is_drawn_as_the_export_draws_it() {
 
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
-fn what_is_ahead_of_a_moving_zoom_is_drawn_at_the_fit_size_and_magnified() {
+fn a_moving_zoom_behind_a_grade_mask_fade_or_effect_is_refused() {
     let m = media();
     let assets = [m.bars.clone(), m.testsrc.clone()];
     let with = |edit: &dyn Fn(&mut Clip)| {
@@ -3184,13 +3160,13 @@ fn what_is_ahead_of_a_moving_zoom_is_drawn_at_the_fit_size_and_magnified() {
             ..Color::default()
         }
     });
-    run_zoom("zoom+grade", &tl, &assets, GRADED_SCALED);
+    run_placed("zoom+grade", &tl, &assets, 30.0, 1.0);
     // The clip's own fades: faded at the fit size, then zoomed.
     let tl = with(&|c| {
         c.fade_in = 0.4;
         c.fade_out = 0.4;
     });
-    run_zoom("zoom+fades", &tl, &assets, SCALED);
+    run_placed("zoom+fades", &tl, &assets, 30.0, 1.0);
     // A mask: the alpha plane is cut at the fit size and scaled with the zoom, so its edge grows soft.
     for (name, shape, feather, inverted) in [
         ("rect hard", kerf_core::MaskShape::Rect, 0.0, false),
@@ -3199,21 +3175,21 @@ fn what_is_ahead_of_a_moving_zoom_is_drawn_at_the_fit_size_and_magnified() {
         ("ellipse inverted", kerf_core::MaskShape::Ellipse, 0.1, true),
     ] {
         let tl = with(&|c| c.mask = Some(mask_of(shape, feather, inverted)));
-        run_zoom(&format!("zoom+mask {name}"), &tl, &assets, ZOOMED_MASK);
+        run_placed(&format!("zoom+mask {name}"), &tl, &assets, 30.0, 1.0);
     }
     // The effects: the tables are exact (the scaler's level is all there is); a blur carries the scaler's
     // level through its own. The fit scale ahead of the effects is the identity here, so a sharpen of any
     // amount is of the exact picture and only the zoom's scale follows it.
-    for (name, effect, limits) in [
-        ("blur", kerf_core::VideoEffect::Blur { sigma: 4.0 }, EFFECT_SCALED),
-        ("sharpen", kerf_core::VideoEffect::Sharpen { amount: 1.5 }, SCALED),
-        ("grayscale", kerf_core::VideoEffect::Grayscale, SCALED),
-        ("invert", kerf_core::VideoEffect::Invert, SCALED),
-        ("chroma key", key("green", 0.2, 0.2), ZOOMED_MASK),
-        ("vignette", kerf_core::VideoEffect::Vignette, SCALED),
+    for (name, effect) in [
+        ("blur", kerf_core::VideoEffect::Blur { sigma: 4.0 }),
+        ("sharpen", kerf_core::VideoEffect::Sharpen { amount: 1.5 }),
+        ("grayscale", kerf_core::VideoEffect::Grayscale),
+        ("invert", kerf_core::VideoEffect::Invert),
+        ("chroma key", key("green", 0.2, 0.2)),
+        ("vignette", kerf_core::VideoEffect::Vignette),
     ] {
         let tl = with(&|c| c.effects = vec![effect.clone()]);
-        run_zoom(&format!("zoom+{name}"), &tl, &assets, limits);
+        run_placed(&format!("zoom+{name}"), &tl, &assets, 30.0, 1.0);
     }
     // The tutorial's clip: a feathered mask over a blurred picture, zooming, in a Cover frame.
     let mut c = zooming(&m.testsrc, 1.0, 1.25, (-0.05, 0.0));
@@ -3223,7 +3199,7 @@ fn what_is_ahead_of_a_moving_zoom_is_drawn_at_the_fit_size_and_magnified() {
         vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]],
         Some(Delivery::new(960, 540, Fit::Cover)),
     );
-    run_zoom("zoom+mask+blur cover 960x540", &tl, &assets, EFFECT_SCALED);
+    run_placed("zoom+mask+blur cover 960x540", &tl, &assets, 30.0, 1.0);
     // Everything at once: grade, an effect, a mask, a fade-in.
     let tl = with(&|c| {
         c.color.contrast = 1.15;
@@ -3231,7 +3207,7 @@ fn what_is_ahead_of_a_moving_zoom_is_drawn_at_the_fit_size_and_magnified() {
         c.mask = Some(mask_of(kerf_core::MaskShape::Ellipse, 0.25, false));
         c.fade_in = 0.3;
     });
-    run_zoom("zoom+grade+effects+mask+fade", &tl, &assets, EFFECT_SCALED);
+    run_placed("zoom+grade+effects+mask+fade", &tl, &assets, 30.0, 1.0);
 }
 
 /// Blur's bound: `gblur` is floating point, and the x86 build runs its horizontal pass in AVX2 /
@@ -3251,18 +3227,9 @@ const EFFECT: Limits = Limits { y: 1, uv: 1 };
 /// `a_sharpen_that_amplifies_a_scale_or_a_blur_past_two_levels_is_refused`.
 const EFFECT_SCALED: Limits = Limits { y: 2, uv: 2 };
 
-/// Two scale stages in cascade, the fit scale and then the zoom: the first stage is a level off the
-/// second's input, an interpolation of a few such samples, and the zoom's own rounding is the second.
-const CASCADED: Limits = Limits { y: 2, uv: 2 };
-
-/// A soft mask edge on a zoomed picture: the zoom scales the picture (a level, the scaler's) *and* the
-/// mask's alpha plane (a level: swscale scales alpha like luma, identically — checked), and a sample on
-/// the edge has both, the alpha's weighted by how far the layer is from the one below (`s - d`).
-const ZOOMED_MASK: Limits = Limits { y: 2, uv: 2 };
-
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
-fn a_dissolve_into_a_moving_zoom_ramps_the_alpha_at_the_fit_size() {
+fn a_dissolve_dip_or_slide_into_a_moving_zoom_is_refused() {
     let m = media();
     let assets = [m.bars.clone(), m.testsrc.clone()];
     for (name, mask) in [
@@ -3278,17 +3245,7 @@ fn a_dissolve_into_a_moving_zoom_ramps_the_alpha_at_the_fit_size() {
         });
         inc.mask = mask;
         let tl = timeline(vec![vec![out, inc]], None);
-        check_motion(Check {
-            case: &format!("zoom/dissolve{name}"),
-            tl: &tl,
-            assets: &assets,
-            opts: at_fps(30.0),
-            frames: upto(2.0, 30.0),
-            limits: if mask.is_some() { ZOOMED_MASK } else { SCALED },
-            look: &[33, 40],
-            rotated: false,
-            refusing: None,
-        });
+        run_placed(&format!("zoom/dissolve{name}"), &tl, &assets, 30.0, 2.0);
     }
     // A slide in with a zoom, and a dip to black.
     for (name, kind) in [("dip", TransitionKind::DipToBlack), ("slide", TransitionKind::SlideLeft)] {
@@ -3297,17 +3254,7 @@ fn a_dissolve_into_a_moving_zoom_ramps_the_alpha_at_the_fit_size() {
         inc.keyframes = vec![zoom_key(0.0, 1.0, 0.0, 0.0), zoom_key(1.0, 1.4, 0.0, 0.0)];
         inc.transition_in = Some(Transition { kind, duration: 0.5 });
         let tl = timeline(vec![vec![out, inc]], None);
-        check_motion(Check {
-            case: &format!("zoom/{name}"),
-            tl: &tl,
-            assets: &assets,
-            opts: at_fps(30.0),
-            frames: upto(2.0, 30.0),
-            limits: SCALED,
-            look: &[33],
-            rotated: false,
-            refusing: None,
-        });
+        run_placed(&format!("zoom/{name}"), &tl, &assets, 30.0, 2.0);
     }
 }
 
@@ -3335,26 +3282,15 @@ fn a_moving_zoom_on_the_outgoing_clip_under_a_transition() {
         let mut inc = clip(&m.bars, 0.5, 1.5, 1.0);
         inc.transition_in = Some(Transition { kind, duration: 0.5 });
         let tl = timeline(vec![vec![out, inc]], None);
-        check_motion(Check {
-            case: &format!("zoom out/{name}"),
-            tl: &tl,
-            assets: &assets,
-            opts: at_fps(30.0),
-            frames: upto(2.0, 30.0),
-            limits: if mask.is_some() { ZOOMED_MASK } else { SCALED },
-            look: &[33, 40],
-            rotated: false,
-            refusing: None,
-        });
+        run_placed(&format!("zoom out/{name}"), &tl, &assets, 30.0, 2.0);
     }
 }
 
 /// A rotation, an opacity below 1 or a dip to white in front of a moving zoom is the order the compositor
 /// does not have: the rotated picture's alpha (or the RGB round trip) would have to be scaled with the zoom,
 /// and the zoom's `scale` takes the RGB frame `fade c=white` leaves and converts it in the same pass (up to
-/// 14 levels off a draw that scales the converted picture on 6.1.1, 3 on 9.0.2). It also checks the other
-/// way: while a keyed opacity still holds 1 the frames are drawn (and compared with the export), so a plan
-/// that refused all of them would not pass.
+/// 14 levels off a draw that scales the converted picture on 6.1.1, 3 on 9.0.2). (Every export frame of a
+/// moving zoom is refused for its placement as well.)
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn a_moving_zoom_behind_a_rotation_or_an_opacity_is_refused() {
@@ -3389,31 +3325,12 @@ fn a_moving_zoom_behind_a_rotation_or_an_opacity_is_refused() {
         },
     ];
     let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![fading]], None);
-    check_motion(Check {
-        case: "keyed opacity + moving zoom (curve holds 1, then falls)",
-        tl: &tl,
-        assets: &assets,
-        opts: at_fps(30.0),
-        frames: upto(1.0, 30.0),
-        limits: SCALED,
-        look: &LOOK_ZOOM,
-        rotated: false,
-        refusing: Some(&refusing(
-            "ZoomBehind(an opacity below 1)",
-            |u| matches!(u, Unsupported::ZoomBehind(_, w) if w.contains("opacity below 1")),
-        )),
-    });
-    // (The check above compares every frame the plan does not refuse; this is that there are some.)
-    let planner = Planner::new(&tl, &assets, &at_fps(30.0), PlanRequest::motion(policy())).expect("planner");
-    let drawn = upto(1.0, 30.0)
-        .filter(|k| {
-            let plan = planner.at_frame(*k).expect("plan");
-            plan.reasons(&compositor().caps(), plan.size(u32::MAX)).is_empty()
-        })
-        .count();
-    assert!(
-        drawn > 0,
-        "keyed opacity + moving zoom: no frame was drawn while the curve holds 1"
+    run_placed(
+        "keyed opacity + moving zoom (curve holds 1, then falls)",
+        &tl,
+        &assets,
+        30.0,
+        1.0,
     );
     let out = clip(&m.bars, 0.5, 1.5, 0.0);
     let mut inc = zooming(&m.testsrc, 1.0, 1.4, (0.0, 0.0));
@@ -4892,19 +4809,19 @@ fn a_graded_layer_is_keyed_in_opacity_and_position_over_another_and_its_fades_ar
     let mut c = graded(&heavy);
     c.set_property_keys(Property::Opacity, vec![key(0.1, 0.0), key(0.9, 1.0)]);
     run("grade/keyed opacity from nothing", &over(c), &assets, 30.0, 1.0, EXACT);
-    // A keyed position: the picture stays its own size and the overlay moves it, off the canvas' edge too.
+    // A keyed position that holds: the picture stays its own size and the overlay puts it off the canvas' edge.
+    let mut c = graded(&heavy);
+    c.set_property_keys(Property::PosX, vec![key(0.0, 0.3), key(1.0, 0.3)]);
+    c.set_property_keys(Property::PosY, vec![key(0.0, -0.2), key(1.0, -0.2)]);
+    run("grade/keyed position, held", &over(c), &assets, 30.0, 1.0, EXACT);
+    // One that moves is placed by the export's `perspective`, refused; with the opacity too.
     let mut c = graded(&heavy);
     c.set_property_keys(Property::PosX, vec![key(0.0, -0.1), key(1.0, 0.1)]);
-    run("grade/keyed position", &over(c), &assets, 30.0, 1.0, EXACT);
-    let mut c = graded(&heavy);
-    c.set_property_keys(Property::PosX, vec![key(0.0, 0.0), key(1.0, 0.3)]);
-    c.set_property_keys(Property::PosY, vec![key(0.0, 0.0), key(1.0, -0.2)]);
-    run("grade/keyed position, both axes", &over(c), &assets, 30.0, 1.0, EXACT);
-    // Both at once.
+    run_placed("grade/keyed position", &over(c), &assets, 30.0, 1.0);
     let mut c = graded(&heavy);
     c.set_property_keys(Property::Opacity, vec![key(0.0, 0.3), key(1.0, 0.9)]);
     c.set_property_keys(Property::PosX, vec![key(0.0, -0.1), key(1.0, 0.1)]);
-    run("grade/keyed opacity and position", &over(c), &assets, 30.0, 1.0, EXACT);
+    run_placed("grade/keyed opacity and position", &over(c), &assets, 30.0, 1.0);
 
     // Its own fade-in and fade-out, on a layer over another track: refused where they run, drawn after and before.
     let mut c = graded(&heavy);

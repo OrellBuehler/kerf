@@ -459,7 +459,7 @@ pub struct Animated {
     /// Some key is below full opacity (so the graph has a `geq` alpha).
     pub opacity: bool,
     /// The keys' scales differ ([`Clip::zoom_animated`]): the zoom moves. The export (and
-    /// the playback stream) then runs the clip's `scale eval=frame` **last**, after `fps`
+    /// the playback stream) then zooms **last** (the placement, [`Animated::places`]), after `fps`
     /// and after every effect, mask, `rotate` and fade, which act on the picture at its fit
     /// size and are magnified with it; the FFmpeg still orders a moving zoom the same way.
     /// A compositor that draws a moving zoom has to draw that order, not "zoom, then the
@@ -481,6 +481,11 @@ pub struct Animated {
     /// picture through its window with a `perspective` (bilinear, fixed-point), which no
     /// compositor pass draws, so every frame of it is refused.
     pub crop: bool,
+    /// The zoom or the position moves ([`Clip::placement_animated`]): the export (and the playback
+    /// stream) places the picture on the canvas with a `perspective` at sub-pixel positions, which no
+    /// compositor pass draws, so every export frame of it is refused. A still is the scrubbed
+    /// still's chain, a `scale` and an `overlay` at the sampled pose, and is drawn as ever.
+    pub places: bool,
 }
 
 /// What a clip's transitions and fades do to one layer at this frame, **per layer
@@ -1381,6 +1386,9 @@ impl RenderPlan {
             }
             if layer.animated.is_some_and(|a| a.crop) {
                 out.push(Unsupported::KeyedCrop(at()));
+            }
+            if self.mode == PlanMode::Motion && layer.animated.is_some_and(|a| a.places) {
+                out.push(Unsupported::KeyedPlacement(at()));
             }
             // The graph fits and zooms in one `scale` from the source; the compositor's geometry (and
             // `LayerGeometry`, which the Preview's handles are placed by) still fits to the frame and

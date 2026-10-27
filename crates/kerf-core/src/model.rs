@@ -3556,6 +3556,19 @@ impl Clip {
             .is_some_and(|first| keys.iter().any(|k| (k.value - first.value).abs() > 1e-9))
     }
 
+    /// True when the keyframes move the clip's zoom or its position: where the picture lands on
+    /// the canvas changes from frame to frame, by fractions of a pixel. The export then places it
+    /// with a sub-pixel resample (`video_clip_chain`'s `perspective`) instead of a per-frame
+    /// `scale` and `overlay` offsets, which step in whole (and, in 4:2:0, even) pixels.
+    pub fn placement_animated(&self) -> bool {
+        let moves = |prop: Property| {
+            let keys = self.property_keys(prop);
+            keys.first()
+                .is_some_and(|first| keys.iter().any(|k| (k.value - first.value).abs() > 1e-9))
+        };
+        moves(Property::Scale) || moves(Property::PosX) || moves(Property::PosY)
+    }
+
     /// The zoom the clip holds still at: its static scale, or the one value a keyed scale
     /// that never moves ([`Clip::zoom_animated`]) holds. `None` for a zoom that moves.
     pub fn held_scale(&self) -> Option<f64> {

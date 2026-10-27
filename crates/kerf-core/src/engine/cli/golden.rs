@@ -1788,8 +1788,8 @@ const STRUCTURAL: [&str; 48] = [
     "zoom-keyed-constant",
     "still-zoom-last",
     "alpha-source",
-    "zoom-keyed-last",
-    "preview-zoom-keyed-last",
+    "placed",
+    "preview-placed",
     "alpha-kept",
     "preview-alpha-kept",
     "master-nonfinite",
@@ -1875,27 +1875,31 @@ fn filters(s: &str) -> Vec<&str> {
     split_unquoted(s, ',')
 }
 
-/// How the clip chains of an export or preview graph end: `(zoom last, alpha kept)`. A chain
-/// ending `format=yuva420p` is either a moving zoom (the `scale ... eval=frame` right before
-/// it) or a source whose alpha channel the chain keeps; an ordinary one ends in the
-/// delivery's own format, or in whatever the last effect is.
+/// How the clip chains of an export or preview graph end: `(placed, alpha kept)`. A chain whose
+/// zoom or position moves ends in the placement's cut to the canvas (`crop` at
+/// `x='2*floor((iw-`, after its `perspective`); one ending `format=yuva420p` is a source whose
+/// alpha channel the chain keeps; an ordinary one ends in the delivery's own format, or in
+/// whatever the last effect is.
 fn chain_tails(graph: &str) -> (bool, bool) {
     let (mut zoom, mut alpha) = (false, false);
-    for segment in graph.split(';') {
+    for segment in split_unquoted(graph, ';') {
         let Some((head, label)) = segment.trim_end().rsplit_once('[') else {
             continue;
         };
+        // (A run that writes several deliveries prefixes each one's labels: `d1_v3`.)
+        let label = label
+            .strip_prefix('d')
+            .and_then(|l| l.split_once('_'))
+            .filter(|(n, _)| n.chars().all(|c| c.is_ascii_digit()))
+            .map_or(label, |(_, l)| l);
         if !(label.starts_with('v') && label.ends_with(']') && label[1..label.len() - 1].chars().all(|c| c.is_ascii_digit())) {
             continue;
         }
         let f = filters(head);
-        if f.last() == Some(&"format=yuva420p") && f.len() >= 2 {
-            let before = f[f.len() - 2];
-            if before.starts_with("scale=w=") && before.contains(":eval=frame") {
-                zoom = true;
-            } else {
-                alpha = true;
-            }
+        match f.last() {
+            Some(last) if last.starts_with("crop=w=") && last.contains(":x='2*floor((iw-") => zoom = true,
+            Some(&"format=yuva420p") => alpha = true,
+            _ => {}
         }
     }
     (zoom, alpha)
@@ -2128,8 +2132,8 @@ fn families(c: &Case, assets: &[Asset], text: &[String; 3], table: &[(&str, &str
         (bt709_preview, "preview-bt709-mix"),
         (still_transitions.0, "still-tail"),
         (still_transitions.1, "still-travel"),
-        (chain_tails(&flat[0]).0, "zoom-keyed-last"),
-        (chain_tails(&flat[2]).0, "preview-zoom-keyed-last"),
+        (chain_tails(&flat[0]).0, "placed"),
+        (chain_tails(&flat[2]).0, "preview-placed"),
         (zoom_folded(&flat[0]), "zoom-folded"),
         (zoom_folded(&flat[2]), "preview-zoom-folded"),
         (zoom_folded(&flat[1]), "still-zoom-folded"),

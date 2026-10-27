@@ -775,6 +775,9 @@ fn check(dir: &Path, case: &Case) -> Worst {
                 );
             }
             (None, None) => {}
+            // A placed picture is drawn at its own size, however small: under a pixel it is a
+            // fraction of one pixel's alpha, which `is_picture` does not count.
+            (Some(w), None) if clip.placement_animated() && w.x1 - w.x0 < 1.0 && w.y1 - w.y0 < 1.0 => {}
             (w, g) => panic!("{at}: the picture is {g:?}, transform_at says {w:?}"),
         }
         if case.blue {
@@ -816,6 +819,8 @@ fn check(dir: &Path, case: &Case) -> Worst {
                     );
                 }
                 (None, None) => {}
+                // The still keeps a picture under a pixel at one (4:2:0: two).
+                (None, Some(s)) if clip.placement_animated() && s.x1 - s.x0 <= 2.0 && s.y1 - s.y0 <= 2.0 => {}
                 (g, s) => panic!("{at}: the export's picture is {g:?}, the still's {s:?}"),
             }
             if case.blue {
@@ -1308,6 +1313,71 @@ fn a_clip_with_many_eased_keys_exports_and_plays_back() {
     let case = Case::new("many eased keys", many_eased_keys()).rotated();
     run_in(&dir, vec![Case::new("many eased keys", many_eased_keys()).rotated()]);
     playback_matches_transform_at(&dir, &case);
+    cleanup(&dir);
+}
+
+/// A slow Ken Burns on a photo moves by fractions of a pixel a frame, and the picture has to
+/// follow it smoothly: the zoom used to be a per-frame `scale` (whole-pixel sizes) and the
+/// position the overlay's offset (whole pixels, rounded down to even in 4:2:0), so a 3:2 still
+/// zoomed from 1.10 to 1.17 and panned from 0.02 to -0.02 of the frame over 3.5 s (eased, Cover,
+/// 50 fps: the reported case) moved in irregular one- and two-pixel steps. A white box on black,
+/// measured to a fraction of a pixel (the centroid of its luma), is where `transform_at` puts it
+/// on every output frame, and its motion has no steps.
+#[test]
+#[ignore = "needs the ffmpeg binary"]
+fn a_slow_zoom_and_pan_moves_by_fractions_of_a_pixel() {
+    let dir = scratch("ken-burns");
+    let path = dir.join("photo.png");
+    ffmpeg(&[
+        s("-f"),
+        s("lavfi"),
+        s("-i"),
+        s("color=c=black:s=600x400,drawbox=x=360:y=160:w=60:h=60:color=white:t=fill"),
+        s("-frames:v"),
+        s("1"),
+        path.to_string_lossy().into_owned(),
+    ]);
+    let mut photo = test_asset(vec![image_stream(600, 400)]);
+    photo.path = path.to_string_lossy().into_owned();
+    photo.duration = crate::model::DEFAULT_IMAGE_DURATION;
+    let mut clip = make_clip(photo.id, 0.0, 3.5, 0.0);
+    let key = |time, scale, pos_x, easing| Keyframe {
+        time,
+        scale,
+        pos_x,
+        pos_y: 0.0,
+        rotation: 0.0,
+        opacity: 1.0,
+        easing,
+    };
+    clip.keyframes = vec![key(0.0, 1.10, 0.02, Easing::EaseInOut), key(3.5, 1.17, -0.02, Easing::Linear)];
+    let timeline = timeline_of(vec![video_track(vec![clip.clone()])]);
+    let frames = export_frames(&timeline, &[photo], &options(("50", 50, 1), Fit::Cover), &dir, "ken-burns");
+    // The cover of the frame is 320 wide (600 x 400 at 8/15), so the box's centre is at 208.
+    let centre = 390.0 * f64::from(CW) / 600.0;
+    let mut xs = Vec::new();
+    for (k, frame) in frames.iter().enumerate().take(170) {
+        let tf = clip.transform_at(ffmpeg_frame_time(k as u64, 50, 1));
+        let (mut sum, mut moment) = (0.0, 0.0);
+        for y in 0..CH {
+            for x in 0..CW {
+                // (The black field reads 0 or 1 after the conversion to RGB, which is no part of the box.)
+                let v = f64::from((px(frame, x, y)[0] - 4).max(0));
+                sum += v;
+                moment += v * f64::from(x);
+            }
+        }
+        // A pixel's index is its left edge: the centre of the box is half a pixel to the right.
+        let got = moment / sum + 0.5;
+        let want = f64::from(CW) / 2.0 + tf.pos_x * f64::from(CW) + (centre - f64::from(CW) / 2.0) * tf.scale;
+        assert!(
+            (got - want).abs() < 0.1,
+            "frame {k}: the box is at {got:.3}, transform_at puts it at {want:.3}"
+        );
+        xs.push(got);
+    }
+    let steps = xs.windows(3).map(|w| (w[0] - 2.0 * w[1] + w[2]).abs()).fold(0.0, f64::max);
+    assert!(steps < 0.1, "the motion jumps by {steps:.3} px between frames");
     cleanup(&dir);
 }
 
