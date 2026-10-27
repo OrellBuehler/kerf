@@ -504,6 +504,18 @@ impl Clip {
         self.property_keys(Property::CropZoom).iter().any(|k| k.value > 1.0)
     }
 
+    /// Whether the picture moves on the frame: its zoom, its position or the animated crop changes
+    /// over the clip (a still with any of these is a Ken Burns move, which the export draws in one
+    /// resample of the picture, `engine::cli::still_motion`).
+    pub fn picture_moves(&self) -> bool {
+        let varies = |p: Property| {
+            let keys = self.property_keys(p);
+            keys.first()
+                .is_some_and(|f| keys.iter().any(|k| (k.value - f.value).abs() > 1e-9))
+        };
+        self.zoom_animated() || varies(Property::PosX) || varies(Property::PosY) || self.crop_animated()
+    }
+
     /// The clip's mask at `local` seconds from its start (normalized): every keyed number its
     /// curve's value, the rest the static mask's.
     pub fn mask_at(&self, local: f64) -> Option<Mask> {

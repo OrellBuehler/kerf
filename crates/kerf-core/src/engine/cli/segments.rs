@@ -267,9 +267,11 @@ pub(super) fn plan_parts(clips: &[PlanClip], frames: u64, limits: SegmentLimits)
 /// Whether a clip is a still image a part can restart at a cut (pure): its frames are made up, one
 /// picture at the export's rate, so picking it up at a frame is the same as having read it from its
 /// start — as long as nothing in its chain keeps a count across frames (a keyed crop's
-/// `perspective`, `vignette`'s dither) or plays it other than once through at its own pace.
-fn restartable(clip: &Clip, asset: Option<&Asset>, fx: &ClipFx) -> bool {
+/// `perspective` or a moving still's ([`StillMotion`]), `vignette`'s dither) or plays it other than
+/// once through at its own pace.
+fn restartable(clip: &Clip, asset: Option<&Asset>, fx: &ClipFx, motion: Option<&StillMotion>) -> bool {
     asset.is_some_and(|a| a.is_image())
+        && motion.is_none()
         && !clip.is_generated()
         && !clip.is_reversed()
         && (clip.speed_mag() - 1.0).abs() < 1e-9
@@ -333,7 +335,12 @@ pub(super) fn picture_clips(
                 input,
                 mpx,
                 source_per_frame: clip.mean_speed() * f64::from(rate.den) / f64::from(rate.num),
-                restart: restartable(clip, asset, &fx[this]),
+                restart: restartable(
+                    clip,
+                    asset,
+                    &fx[this],
+                    still_motion_for(clip, assets, fmt, &fx[this]).as_ref(),
+                ),
             });
         }
     }
@@ -736,6 +743,46 @@ impl Drop for PartsDir {
     }
 }
 
+/// What `part` of `plan` draws, for a failure to name (pure): its span of the cut, then each clip on
+/// it, the most pixels per frame first (a still the general chain draws is resampled whole for every
+/// frame; a moving still that `still_motion` draws, once).
+pub(super) fn part_drawing(plan: &PartsPlan, assets: &[Asset], part: &Part) -> String {
+    let fps = plan.rate.as_f64();
+    let clips: Vec<&Clip> = plan.cut.tracks.iter().flat_map(|t| t.clips.iter()).collect();
+    let mut drawn: Vec<(f64, String)> = plan
+        .clips
+        .iter()
+        .filter(|c| c.first < part.end() && c.last >= part.first)
+        .filter_map(|c| {
+            let clip = clips.get(c.flat)?;
+            let asset = assets.iter().find(|a| a.id == clip.asset_id);
+            let name = asset.map_or_else(|| "a title".to_string(), |a| a.name.clone());
+            let size = picture_size(asset);
+            let mpx = size.map_or(0.0, |(w, h)| f64::from(w) * f64::from(h) / 1e6);
+            let what = match (asset.is_some_and(Asset::is_image), size) {
+                (true, Some(_)) if still_motion_for(clip, assets, &plan.fmt, &plan.fx[c.flat]).is_some() => {
+                    format!("{mpx:.1} MP still, scaled once")
+                }
+                (true, Some(_)) => format!("{mpx:.1} MP still, resampled every frame"),
+                (false, Some((w, h))) => format!("{w}x{h}"),
+                (_, None) => "no picture size".to_string(),
+            };
+            Some((
+                mpx,
+                format!("{name} ({what}) at {:.2}-{:.2} s", clip.timeline_start, clip.timeline_end()),
+            ))
+        })
+        .collect();
+    drawn.sort_by(|a, b| b.0.total_cmp(&a.0));
+    let span = format!("{:.2}-{:.2} s", part.first as f64 / fps, part.end() as f64 / fps);
+    if drawn.is_empty() {
+        span
+    } else {
+        let names: Vec<String> = drawn.into_iter().map(|d| d.1).collect();
+        format!("{span}: {}", names.join(", "))
+    }
+}
+
 /// Render `plan`'s export part by part and write `output` (the single entry the render takes when
 /// [`plan_export`] says to). Holds the heavy-job lease from the first part to the last pass, so
 /// nothing queued gets in between. Returns [`RenderStatus::Cancelled`] when `cancel` trips.
@@ -791,7 +838,7 @@ pub(super) fn render_in_parts(
             encoding: false,
         };
         let mut rendered = 0u64;
-        let status = run_ffmpeg_progress_counted(
+        let ran = run_ffmpeg_progress_counted(
             &args,
             &[],
             &file,
@@ -815,7 +862,16 @@ pub(super) fn render_in_parts(
             },
             cancel,
             &mut rendered,
-        )?;
+        );
+        // A part that fails says what it was drawing, so a clip that is slow to draw has a name.
+        let status = ran.map_err(|e| match e {
+            Error::Engine(why) => Error::Engine(format!(
+                "part {} of {total} ({}): {why}",
+                i + 1,
+                part_drawing(plan, assets, part)
+            )),
+            other => other,
+        })?;
         if status == RenderStatus::Cancelled {
             return Ok(RenderStatus::Cancelled);
         }

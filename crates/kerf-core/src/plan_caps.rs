@@ -313,6 +313,8 @@ pub enum Unsupported {
     /// A keyframed crop (a `perspective` reading the picture through its window, in the export and
     /// the FFmpeg still alike).
     KeyedCrop(LayerRef),
+    /// A still image whose picture moves, drawn by FFmpeg in one `perspective` of a copy scaled once.
+    StillMotion(LayerRef),
     /// A keyframed zoom in an export frame, which FFmpeg draws as the last stage of the chain.
     KeyedZoom(LayerRef),
     /// A moving zoom with something in front of it that the compositor does not draw in FFmpeg's
@@ -393,6 +395,7 @@ impl Unsupported {
             Self::KeyedColor(_) => "keyed_color",
             Self::KeyedMask(_) => "keyed_mask",
             Self::KeyedCrop(_) => "keyed_crop",
+            Self::StillMotion(_) => "still_motion",
             Self::KeyedZoom(_) => "keyed_zoom",
             Self::ZoomBehind(..) => "zoom_behind",
             Self::FoldedFit(..) => "folded_fit",
@@ -503,6 +506,10 @@ impl fmt::Display for Unsupported {
             Self::KeyedCrop(l) => write!(
                 f,
                 "{l}: a keyframed crop (a perspective reading the picture through its window, which no compositor pass draws)"
+            ),
+            Self::StillMotion(l) => write!(
+                f,
+                "{l}: a still whose picture moves (FFmpeg draws its fit, zoom, position and crop in one perspective of a scaled copy, which no compositor pass draws)"
             ),
             Self::KeyedZoom(l) => write!(
                 f,

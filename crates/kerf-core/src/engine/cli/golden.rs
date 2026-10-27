@@ -114,6 +114,15 @@
 //! and their `still-` / `preview-` forms. Its blocks are 92–95, after the blend-mode family, its dice on a seed of their
 //! own (`6 << 40`).
 //!
+//! **The moving-still family is appended the same way**: the [`KEN_BURNS_CASES`] after the
+//! stabilization ones draw from the same generator (with the channel family's channels) and then have
+//! most of their still images moved ([`ken_burns_for`], on dice of its own seeded by the case and the
+//! clip, `7 << 40`): a keyed zoom with a pan, a held zoom with a pan, the animated crop, or both, the
+//! still's rotation, mask and spatial effects taken off so most are drawn by `still_motion`, and the first
+//! still of each case in the middle of its first moved still image ([`ken_burns_still`], no dice). Families
+//! `ken-burns`, `still-ken-burns`, `preview-ken-burns` and `ken-burns-scaled-once` (the copy scaled once,
+//! Lanczos by default). Its blocks are 96–99, after the stabilization family.
+//!
 //! **The export in parts has a file of its own** (`golden/parts.txt`, [`the_parts_argv_builders_produce_the_golden_digests`]):
 //! every case is planned with `segments::plan_export` under [`PARTS_LIMITS`] and the argv of every part and of the last pass is
 //! digested, so the three files above prove that a small export is unchanged and this one pins what a long one is made of.
@@ -204,7 +213,10 @@ const BLEND_FIRST: usize = DENOISE_FIRST + DENOISE_CASES;
 /// The stabilization cases appended after the blend-mode ones (see the module docs).
 const STABILIZE_CASES: usize = 400;
 const STABILIZE_FIRST: usize = BLEND_FIRST + BLEND_CASES;
-const TOTAL: usize = STABILIZE_FIRST + STABILIZE_CASES;
+/// The moving-still cases appended after the stabilization ones (see the module docs).
+const KEN_BURNS_CASES: usize = 400;
+const KEN_BURNS_FIRST: usize = STABILIZE_FIRST + STABILIZE_CASES;
+const TOTAL: usize = KEN_BURNS_FIRST + KEN_BURNS_CASES;
 const BLOCK: usize = 100;
 const MIN_PER_FAMILY: usize = 20;
 const KINDS: [&str; 3] = ["export", "still", "preview"];
@@ -287,8 +299,12 @@ clip-end-cut ,trim=end_pts=
 preview-clip-end-cut ,trim=end_pts=
 late-start-delay )/TB
 preview-late-start-delay )/TB
-image-input -loop 1 -framerate
-image-under-a-frame -t 0.0
+image-input :size=1,
+image-under-a-frame loop=loop=0:size=1
+ken-burns :interpolation=linear:eval=frame,crop=
+ken-burns-scaled-once :flags=lanczos,crop=
+still-ken-burns :interpolation=linear,crop=
+preview-ken-burns :interpolation=linear:eval=frame,crop=
 overlay drawtext=
 overlay-keyed alpha='
 overlay-percent \\%
@@ -965,6 +981,71 @@ fn stabilize_for(tl: &mut Timeline, j: usize, assets: &[Asset]) {
     }
 }
 
+/// A slow move on most of the still images of the `j`-th moving-still case, on dice of its own seeded by
+/// the case and the clip (`7 << 40`): a keyed zoom with a pan inside it, a held zoom with a pan, the
+/// animated crop, or a zoom and the crop together, with two or three keys and any easing; the still's
+/// rotation, mask and spatial effects taken off so most of them are the kind `still_motion` draws (some
+/// still pan out of the frame, or are not zoomed enough for a Contain fit, and keep the general chain).
+fn ken_burns_for(tl: &mut Timeline, j: usize, assets: &[Asset]) {
+    const EASINGS: [Easing; 4] = [Easing::Linear, Easing::EaseInOut, Easing::EaseIn, Easing::Hold];
+    let mut n = 0;
+    for track in tl.tracks.iter_mut().filter(|t| t.kind == StreamKind::Video) {
+        for clip in &mut track.clips {
+            n += 1;
+            let mut r = Rng::new((7 << 40) + (j as u64) * 64 + n as u64);
+            let still = assets.iter().any(|a| a.id == clip.asset_id && a.is_image());
+            if !still || clip.is_generated() || !r.chance(0.85) {
+                continue;
+            }
+            clip.transform.rotation = 0.0;
+            clip.set_property_keys(Property::Rotation, Vec::new());
+            clip.mask = None;
+            clip.effects.retain(|e| {
+                !matches!(
+                    e,
+                    VideoEffect::Blur { .. } | VideoEffect::Sharpen { .. } | VideoEffect::Vignette
+                )
+            });
+            let span = clip.duration();
+            let count = 2 + r.below(2);
+            let times: Vec<f64> = (0..count).map(|k| span * k as f64 / (count - 1) as f64).collect();
+            let keys = |r: &mut Rng, lo: f64, hi: f64| -> Vec<PropertyKey> {
+                times
+                    .iter()
+                    .map(|&time| PropertyKey {
+                        time,
+                        value: r.real(lo, hi),
+                        easing: r.pick(&EASINGS),
+                    })
+                    .collect()
+            };
+            let kind = r.below(4);
+            if kind != 2 {
+                let zoom = r.real(1.05, 1.6);
+                if kind == 1 {
+                    clip.set_property_keys(Property::Scale, Vec::new());
+                    clip.transform.scale = zoom;
+                } else {
+                    clip.set_property_keys(Property::Scale, keys(&mut r, 1.02, zoom));
+                }
+                // Inside the frame now and then past it (the general chain).
+                let reach = (zoom - 1.0) / 2.0 * if r.chance(0.8) { 0.9 } else { 2.0 };
+                clip.set_property_keys(Property::PosX, keys(&mut r, -reach, reach));
+                if r.chance(0.5) {
+                    clip.set_property_keys(Property::PosY, keys(&mut r, -reach, reach));
+                }
+            }
+            if kind >= 2 {
+                clip.set_property_keys(Property::CropZoom, keys(&mut r, 1.02, 1.6));
+                clip.set_property_keys(Property::CropX, keys(&mut r, -1.0, 1.0));
+                if r.chance(0.5) {
+                    clip.set_property_keys(Property::CropY, keys(&mut r, -1.0, 1.0));
+                }
+            }
+        }
+    }
+}
+
 /// The analyses a stabilized clip of the pool reads in the oracle: one made-up one per asset of
 /// footage (the padded proxies' twins too), over its whole length at its own rate and at the size the
 /// detect pass measures (at most 1920 wide, so a 4K original's slice is scaled by 2).
@@ -1485,11 +1566,14 @@ fn case(i: usize, assets: &[Asset]) -> Case {
     if (DENOISE_FIRST..BLEND_FIRST).contains(&i) {
         denoise_for(&mut timeline, i - DENOISE_FIRST);
     }
-    if (BLEND_FIRST..TOTAL).contains(&i) {
+    if (BLEND_FIRST..KEN_BURNS_FIRST).contains(&i) {
         blend_for(&mut timeline, i - BLEND_FIRST);
     }
-    if (STABILIZE_FIRST..TOTAL).contains(&i) {
+    if (STABILIZE_FIRST..KEN_BURNS_FIRST).contains(&i) {
         stabilize_for(&mut timeline, i - STABILIZE_FIRST, assets);
+    }
+    if (KEN_BURNS_FIRST..TOTAL).contains(&i) {
+        ken_burns_for(&mut timeline, i - KEN_BURNS_FIRST, assets);
     }
     let dur = timeline.duration();
     let edges: Vec<f64> = (timeline.tracks.iter().flat_map(|t| &t.clips))
@@ -1533,7 +1617,7 @@ fn case(i: usize, assets: &[Asset]) -> Case {
         timeline,
         opts,
         variants: Vec::new(),
-        vidstab: !(STABILIZE_FIRST..TOTAL).contains(&i) || (i - STABILIZE_FIRST) % 4 != 3,
+        vidstab: !(STABILIZE_FIRST..KEN_BURNS_FIRST).contains(&i) || (i - STABILIZE_FIRST) % 4 != 3,
     };
     if (SVG_FIRST..TOGETHER_FIRST).contains(&i) {
         svg_playhead(&mut c, i - SVG_FIRST);
@@ -1541,7 +1625,22 @@ fn case(i: usize, assets: &[Asset]) -> Case {
     if (TOGETHER_FIRST..TITLE_FIRST).contains(&i) {
         together_for(&mut c, i - TOGETHER_FIRST);
     }
+    if (KEN_BURNS_FIRST..TOTAL).contains(&i) {
+        ken_burns_still(&mut c, assets);
+    }
     c
+}
+
+/// The first still of a moving-still case, in the middle of its first moving still image (no dice), so
+/// the still builder draws one as often as the export does.
+fn ken_burns_still(c: &mut Case, assets: &[Asset]) {
+    let image = |id| assets.iter().any(|a: &Asset| a.id == id && a.is_image());
+    let moved = (c.timeline.tracks.iter().filter(|t| t.kind == StreamKind::Video))
+        .flat_map(|t| &t.clips)
+        .find(|clip| image(clip.asset_id) && clip.picture_moves());
+    if let Some(clip) = moved {
+        c.stills[0].0 = clip.timeline_start + clip.duration() / 2.0;
+    }
 }
 
 /// A variant of `/golden/out.mp4`, named as `ExportVariant::beside` names it but spelled out:

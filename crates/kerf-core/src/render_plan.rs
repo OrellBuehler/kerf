@@ -481,6 +481,10 @@ pub struct Animated {
     /// picture through its window with a `perspective` (bilinear, fixed-point), which no
     /// compositor pass draws, so every frame of it is refused.
     pub crop: bool,
+    /// A still image whose picture moves ([`Clip::picture_moves`]): the export and the FFmpeg still
+    /// draw its fit, zoom, position and crop in one `perspective` of a copy of the still scaled once
+    /// (`engine::cli::still_motion`), which no compositor pass draws, so it is refused.
+    pub still_motion: bool,
 }
 
 /// What a clip's transitions and fades do to one layer at this frame, **per layer
@@ -1381,6 +1385,9 @@ impl RenderPlan {
             }
             if layer.animated.is_some_and(|a| a.crop) {
                 out.push(Unsupported::KeyedCrop(at()));
+            }
+            if layer.animated.is_some_and(|a| a.still_motion) {
+                out.push(Unsupported::StillMotion(at()));
             }
             // The graph fits and zooms in one `scale` from the source; the compositor's geometry (and
             // `LayerGeometry`, which the Preview's handles are placed by) still fits to the frame and

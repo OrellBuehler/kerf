@@ -658,8 +658,14 @@ so the feature is **only** activated through these forwards — which is what ma
   `progress=` line (`out_time_us`, else `out_time_ms` — microseconds despite the name — else `out_time`;
   `N/A` is no position); a pass is held at 99 % until ffmpeg has exited (`finishing` from 99.8 %, the
   muxer closing the file); the time left is judged from the **first output** (`eta_secs`), not the spawn
-  (the first estimate used to read 1136 s). `EXPORT_STALL` also covers the silent start: a seek that needs
-  more than 300 s of decoding is killed as a stall. `render_variants` gives each file an equal share of what
+  (the first estimate used to read 1136 s). **`EXPORT_STALL` is judged on movement, not on lines**
+  (`run_progress_stalling`): a run is stopped after 300 s without one frame more or one later output position;
+  FFmpeg 7+ prints a block every `-stats_period` whatever the graph does, so a part stuck on a 45 MP still went
+  on "reporting" the same frame for hours. A slow run that moves is never stopped (fake-ffmpeg unit test). The
+  error says where it stuck (`stuck at frame N, T s of output` / `nothing written yet`), and a part that fails
+  is prefixed with what it draws (`part_drawing`: its span, then each clip with its picture size, most pixels a
+  frame first, a still marked `scaled once` or `resampled every frame`). It also covers the silent start: a
+  seek that needs more than 300 s of decoding is killed as a stall. `render_variants` gives each file an equal share of what
   metering left (`variants_eta` adds the files still to come to the time left). Not fixed: on FFmpeg 4.4.x
   a single-pass `loudnorm,aresample=<rate>` that reaches an encoder fails with `Cannot select channel
   layout for the link between filters Parsed_aresample … and format_out` (loudnorm leaves the layout
@@ -720,10 +726,11 @@ so the feature is **only** activated through these forwards — which is what ma
     run's chain, not an approximation of it. A footage clip is not cut through if that makes a part decode more than
     `preroll_s` (20 s) of source to drop it (a long clip under many short ones keeps the cut away: re-seeking a
     clip mid-way would have to know its first frame's timestamp, which `-ss` rebases away). A **still image** costs
-    nothing: its frames are made up, so a part restarts it (`Restart`: `-f image2 -pattern_type none -loop 1`,
-    `settb,setpts=N+k,trim=end_frame=n`, the end from `frame_pick::fps_span`, the model of the `fps` pick) at the
-    cut however long it has been on screen — unless something keeps a count across frames (a keyed crop's
-    `perspective`, `vignette`'s dither, speed, reverse), when it is read from its start like footage.
+    nothing: its frames are made up, so a part restarts it (`Restart`: `-f image2 -pattern_type none -framerate`,
+    `loop=loop=n-1:size=1,settb,setpts=N+k,trim=end_frame=n`, the end from `frame_pick::fps_span`, the model of the
+    `fps` pick) at the cut however long it has been on screen — unless something keeps a count across frames (a
+    keyed crop's or a moving still's `perspective`, `vignette`'s dither, speed, reverse), when it is read from its
+    start like footage.
   * **Time is the export's.** A part's canvas is frames `first..first+n` of the whole export's (`color=...:d=(n-0.5)/fps`,
     `setpts=N+first`: counted in frames, a half frame of slack in the duration so no rounding adds or drops
     one), the clips' chains come from `build_filter_complex_with` unchanged (given the **whole cut's** `ClipFx` table
@@ -1153,6 +1160,34 @@ so the feature is **only** activated through these forwards — which is what ma
   puts a box within 1 px of where the window of that moment says on **every** output frame, and on detailed
   content (`testsrc2`) every fifth frame is ≥ 50 dB PSNR and within 8 levels of the still (zoom, pan at a held
   zoom, on top of a static crop, speed 2, reversed, late and off the frame grid, a range export).
+  **A moving still** (`cli/still_motion.rs`, `StillMotion`, pure): a still image whose zoom, position or
+  animated crop moves (`Clip::picture_moves`) used to be drawn as footage: a keyed zoom a `scale eval=frame` to
+  whole pixels of the picture already fitted to the frame, placed by an `overlay` at whole pixels (a 7% zoom over
+  3.5 s grows by under a pixel a frame: 1-2 px steps, the centre wobbling as `(W-w)/2` changed parity, the 8K
+  detail thrown away by the fit), and a keyed crop a `perspective` at the source's 45 MP 4:4:4 a frame. Now,
+  where it draws what that chain would, the still is scaled **once** (ahead of the `loop`) to the smallest size
+  with a pixel for every frame pixel at the clip's greatest magnification (`HEADROOM` 2% over it; the delivery's
+  scaler, Lanczos when it names none), cut once (even steps) to what any frame reads, and every frame is one
+  `perspective` (`sense=source`, bilinear, `eval=frame`, its time from `in` behind a pinned `fps` as a keyed
+  crop's) mapping the frame onto the window of the fit, `transform_at`'s zoom and position and `crop_window_at`,
+  then `crop=W:H:0:0`: the frame comes out whole and is overlaid at the corner (a slide or push still moves it).
+  The scrubbed still runs the same filters with the numbers of its moment (`StillMotion::at`), the input gets
+  `-framerate` alone, a part reads it from its start (`restartable`), and the GPU plan refuses it
+  (`Unsupported::StillMotion`). **Eligibility** (`still_motion_for`, judged at the delivery frame over every
+  frame of the clip and the curves' points): an image, no rotation (static or keyed), mask, reframe, HDR,
+  blur / sharpen / vignette, a known size, the crop never wider than the picture, and the picture covering the
+  whole frame at every frame under the clip's own fit order (Cover's frame crop when `Fitted`); anything else,
+  a zoom out or a pan past the edge, keeps the general chain. **Measured on 6.1.1, 4 cores**
+  (`still_motion_rendered.rs`, `#[ignore]`d: an 8192x5464 4:4:4 JPEG of ~45 MB with grain and a box, 3.5 s at
+  50 fps, every frame's box edges measured sub-pixel against the model): before, a keyed zoom + pan was 660 ms a
+  frame at 1080p and 687 at 2160p, its edges off by 1.4 / 1.8 px with 1.95 px steps, a keyed crop 984 / 1021 ms a
+  frame, ~1 GB resident; now 21 ms / 73 ms a frame (a 3.5 s photo at 4K/50 in 13 s), 285 / 455 MB, every edge
+  within 0.08 px of the model and every frame's step within 0.09 px of the curve's (zoom + pan, held zoom + pan,
+  crop in, crop out). Not measured on 9.0 (none where it was written). A zoom range much wider than 2x reads the
+  copy at a step above 1 px at its widest frame (bilinear, some aliasing); the copy is not cached across runs.
+  Golden: the appended `ken-burns` family (`ken_burns_for`), `ken-burns`, `still-ken-burns`,
+  `preview-ken-burns`, `ken-burns-scaled-once`; the decode-once hold moved every case with a still in the
+  export, preview and parts files, and seven still cases that draw a moving still.
   **A keyed volume** is `asetnsamples=n=128:p=0,volume='…':eval=frame` placed *after* `atempo`, so its `t`
   is the clip's own playing time (checked at speed 0.5 / 2, reversed, late on the timeline, range
   export). `volume` holds one gain for a whole frame and decoders hand over 1024 samples (21 ms) — a fade
@@ -1405,10 +1440,16 @@ so the feature is **only** activated through these forwards — which is what ma
   region, not everything from `t=0`. **Still images** (PNG/JPEG/… — detected at
   probe time via `is_still_codec` + no audio + sub-second duration, flagged on the
   stream as `StreamInfo.image` and given `DEFAULT_IMAGE_DURATION` on import) are the
-  exception: a still has no source timeline, so its input is `-loop 1 -framerate
-  fps -t <window>` instead of `-ss`'d, and its in-graph `trim` stays absolute (seek
-  forced to 0); `frame_*`/`timeline_frame` likewise decode the single frame without
-  seeking. The **composited still's `-ss` is spelled to the microsecond**
+  exception: a still has no source timeline, so its input is its one frame (`-framerate fps`, no
+  `-ss`), **decoded once** and held at the head of its chain by `loop=loop=N-1:size=1` (`still_pictures`:
+  the N frames before the window's end that `-loop 1 -framerate fps -t <window>` gave, so the pixels
+  are the ones that gave), and its in-graph `trim` stays absolute (seek forced to 0). `-loop 1`
+  decoded the file again for every output frame: 0.8 s a frame for a 45 MP camera JPEG on 6.1 (50
+  frames of a static one at 4K went from 44 s to 3 s). `frame_*`/`timeline_frame` likewise decode the
+  single frame without seeking, and **a frame grab or a contact sheet at the start does not seek at
+  all** (`seek_unless_start`): on a JPEG still (the `image2` demuxer) any `-ss`, 0 included, makes
+  ffmpeg exit 0 having decoded nothing (6.1, 9.0), which `get_frame` / `skim_asset` reported as
+  "could not extract frame at 0.000s:" with no reason. The **composited still's `-ss` is spelled to the microsecond**
   (`kerf_core::seek_arg`, `{:.6}`, which `kerf-gpu`'s `decode_args` calls too): `-ss` is
   exact on a fine time base, and with a
   frame at 1.0006 s `-ss 1.0006` returns it where the old `{:.3}` spelling, `1.001`,
