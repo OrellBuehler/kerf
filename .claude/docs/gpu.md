@@ -643,6 +643,9 @@ a paused frame inside a transition is drawn like the file shows it — where the
 format=yuva420p, mask, rotate, fades, scale eval=frame` (`video_clip_chain`; `still_clip_chain(.., zoom_last)` for the still): everything
 before the zoom acts at the **fit size** and the zoom magnifies it (a blur grows, a hard mask edge softens).
 
+* **A moving zoom (or a moving position) is refused** (`KeyedPlacement`, no `GpuCaps::placement`): the export and the
+  FFmpeg still now place the picture with a sub-pixel `perspective` after that chain (`engine-cli.md`), which no pass
+  draws, so the zoom-last order below is not reached until one does. `motion_parity.rs`'s zoom cases hold the refusal.
 * The compositor draws that order (`LayerLook::zoom_last`: `animated.zooms` and two scale stages). Stage 0 is the fit scale with the `eq` tables in
   its vertical pass; the effects, the mask plane and the fades (`fs_fade`: Y, U, V and the alpha) run on the fit-size planes; **stage 1 scales four
   planes** (swscale scales alpha like luma, identically on both FFmpegs). A zoom that holds still keeps the old order.

@@ -15,11 +15,10 @@
 //! write, evaluated at the output frame's time, is the curve the plan samples. It does not say
 //! the graph reads each expression at that time, or that what follows a filter keeps up with
 //! it; that the *pictures* agree is `rendered.rs`'s and `keyed_zoom.rs`'s (every output frame of
-//! a keyed zoom against `transform_at`) and the parity harness's to say. (The zoom
-//! (`scale eval=frame`) used to be read at the *source* frame's time and not always shown at
-//! all, and a Motion plan still refuses a moving zoom, `Unsupported::KeyedZoom`: the export
-//! has since been fixed (`video_clip_chain` puts the zoom after `fps` and last), and lifting
-//! that refusal is for the compositor that would draw it.)
+//! a keyed zoom against `transform_at`) and the parity harness's to say. A moving zoom or
+//! position is the placement's `perspective` (`placement_filters`): its corners, evaluated at
+//! the frame `in` counts from the pinned `fps`, give the zoom and the centre the plan samples.
+//! (A Motion plan refuses such a layer, `Unsupported::KeyedPlacement`: no compositor draws it.)
 
 use std::f64::consts::PI;
 
@@ -167,6 +166,7 @@ impl Eval<'_> {
             ("lt", [a, b]) => flag(a < b),
             ("between", [x, lo, hi]) => flag(x >= lo && x <= hi),
             ("hypot", [a, b]) => a.hypot(*b),
+            ("floor", [a]) => a.floor(),
             _ => panic!("function `{name}/{}`", args.len()),
         }
     }
@@ -518,7 +518,43 @@ fn the_motion_plan_samples_the_curves_the_graphs_expressions_write_at_every_outp
                     // The overlay's position, truncated to the 4:2:0 grid the way `overlay` does.
                     let body = overlay_of(flat).split_once("]overlay=").unwrap().1.split('[').next().unwrap();
                     let opts = parse_options(body);
-                    if let Some(x) = opt(&opts, "x") {
+                    let chain = chain_of(flat);
+                    let clip = &tl.tracks[0].clips[flat];
+                    let tf = layer.transform;
+                    if clip.placement_animated() {
+                        // The chain's last stage placed the picture on a frame of the canvas' size,
+                        // which the overlay puts at the origin. `perspective` counts its frames from
+                        // the slot the pinned `fps` starts the clip at; its corners give the zoom and
+                        // the centre, at a box (`W` x `H`) of any size the canvas fits in.
+                        assert!(opt(&opts, "x").is_none(), "{at}: {body}");
+                        let start: f64 = opt(&options(chain, "fps").unwrap(), "start_time").unwrap().parse().unwrap();
+                        let (_, _, first) = keyed_crop_fps(fps, start);
+                        let p = all_options(chain, "perspective").pop().unwrap();
+                        let (bw, bh) = (w + 8.0, h + 4.0);
+                        let vars = [("in", (k as i64 - first + 1) as f64), ("W", bw), ("H", bh)];
+                        let axis = |a: &str, b: &str, size: f64, canvas: f64| {
+                            let (a, b) = (eval(opt(&p, a).unwrap(), &vars), eval(opt(&p, b).unwrap(), &vars));
+                            let zoom = size / (b - a);
+                            // The box column the picture's centre lands on, then the canvas' column.
+                            let at = (size / 2.0 - 0.5 - a) * zoom - 2.0 * ((size - canvas) / 4.0).floor();
+                            (zoom, (at + 0.5 - canvas / 2.0) / canvas)
+                        };
+                        let (zx, px) = axis("x0", "x1", bw, w);
+                        let (zy, py) = axis("y0", "y2", bh, h);
+                        let zoom = if clip.zoom_animated() { tf.scale } else { 1.0 };
+                        for (got, want, what) in [
+                            (zx, zoom, "zoom x"),
+                            (zy, zoom, "zoom y"),
+                            (px, tf.pos_x + layer.fx.motion.0, "x"),
+                            (py, tf.pos_y + layer.fx.motion.1, "y"),
+                        ] {
+                            assert!((got - want).abs() < 1e-9, "{at}: {what} {got} vs {want}");
+                        }
+                        if clip.zoom_animated() {
+                            zooms_checked += 1;
+                        }
+                        moved += 1;
+                    } else if let Some(x) = opt(&opts, "x") {
                         let vars = [
                             ("t", t),
                             ("W", w),
@@ -534,8 +570,6 @@ fn the_motion_plan_samples_the_curves_the_graphs_expressions_write_at_every_outp
                         // No `x` / `y`: an untouched, untravelled clip at the origin.
                         assert_eq!(geom.origin, (0, 0), "{at}");
                     }
-                    let chain = chain_of(flat);
-                    let tf = layer.transform;
                     // (`options` would give the first `scale`, the fit, which never has `eval`.)
                     if let Some(z) = all_options(chain, "scale")
                         .into_iter()

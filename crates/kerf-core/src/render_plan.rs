@@ -459,7 +459,7 @@ pub struct Animated {
     /// Some key is below full opacity (so the graph has a `geq` alpha).
     pub opacity: bool,
     /// The keys' scales differ ([`Clip::zoom_animated`]): the zoom moves. The export (and
-    /// the playback stream) then runs the clip's `scale eval=frame` **last**, after `fps`
+    /// the playback stream) then zooms **last** (the placement, [`Animated::places`]), after `fps`
     /// and after every effect, mask, `rotate` and fade, which act on the picture at its fit
     /// size and are magnified with it; the FFmpeg still orders a moving zoom the same way.
     /// A compositor that draws a moving zoom has to draw that order, not "zoom, then the
@@ -481,6 +481,10 @@ pub struct Animated {
     /// picture through its window with a `perspective` (bilinear, fixed-point), which no
     /// compositor pass draws, so every frame of it is refused.
     pub crop: bool,
+    /// The zoom or the position moves ([`Clip::placement_animated`]): the export, the playback stream
+    /// and the FFmpeg still place the picture on the canvas with a `perspective` at sub-pixel
+    /// positions, which no compositor pass draws, so every frame of it is refused.
+    pub places: bool,
 }
 
 /// What a clip's transitions and fades do to one layer at this frame, **per layer
@@ -1381,6 +1385,9 @@ impl RenderPlan {
             }
             if layer.animated.is_some_and(|a| a.crop) {
                 out.push(Unsupported::KeyedCrop(at()));
+            }
+            if layer.animated.is_some_and(|a| a.places) && !caps.placement {
+                out.push(Unsupported::KeyedPlacement(at()));
             }
             // The graph fits and zooms in one `scale` from the source; the compositor's geometry (and
             // `LayerGeometry`, which the Preview's handles are placed by) still fits to the frame and
@@ -2662,6 +2669,8 @@ mod tests {
         let caps = GpuCaps {
             mask: true,
             keyed_zoom: true,
+            // (What is ahead of a moving zoom, judged as if its placement were drawn.)
+            placement: true,
             fades: true,
             effects: EffectKinds::BLUR
                 .union(EffectKinds::SHARPEN)
@@ -3170,6 +3179,8 @@ mod tests {
                 .union(EffectKinds::GRAYSCALE)
                 .union(EffectKinds::INVERT),
             keyed_zoom: true,
+            // (What is ahead of a moving zoom, judged as if its placement were drawn.)
+            placement: true,
             ..GpuCaps::A0
         };
         let sharp = |amount: f64| VideoEffect::Sharpen { amount };
@@ -3267,6 +3278,8 @@ mod tests {
         let caps = GpuCaps {
             effects: EffectKinds::SHARPEN.union(EffectKinds::BLUR).union(EffectKinds::INVERT),
             keyed_zoom: true,
+            // (What is ahead of a moving zoom, judged as if its placement were drawn.)
+            placement: true,
             ..GpuCaps::A0
         };
         let grade = |brightness: f64, contrast: f64, saturation: f64, gamma: f64, temperature: f64| Color {

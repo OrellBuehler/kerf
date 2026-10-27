@@ -986,8 +986,8 @@ so the feature is **only** activated through these forwards — which is what ma
   each clip's **video effects** (`gblur`/`unsharp`/`hue`/`negate`/`vignette`, and
   `chromakey` which keeps alpha so a lower track shows through), **audio effects**
   (`highpass`/`lowpass`/`equalizer`/`acompressor`/`agate`/`afftdn`, the denoise above) and **transform keyframes**
-  — animated zoom via `scale=eval=frame`, animated position via the `overlay` x/y
-  expr, rotation via `rotate`, opacity via `geq` (all driven by piecewise-linear
+  — a moving zoom or position via the placement `perspective` (below), a held one via
+  `scale` and the `overlay` x/y, rotation via `rotate`, opacity via `geq` (all driven by piecewise-linear
   `keyframe_expr` over clip-local time). **An expression may nest about 100 levels** (libavutil's
   `av_expr_parse` stack: the whole text, each bracket and each function argument is one level; the
   next is `EMFILE`, which the filter reports as `Invalid argument` — the 101st on 4.4.2, a level
@@ -1016,9 +1016,8 @@ so the feature is **only** activated through these forwards — which is what ma
   opacity-only keys keep their chain, bar the rotation's fill below) `video_clip_chain` puts the zoom **last**: crop,
   fit, `setsar`, **`fps`**, tone-map, `eq`, effects, `format=yuva420p`, chroma key,
   mask / opacity `geq`, `rotate`, fades — all at the constant fit size — then the
-  `scale ... eval=frame`, then `format=yuva420p`, then `overlay`, which reads every
-  picture's own `w`/`h` per frame (`(W-w)/2` centres it as it grows) and takes the
-  yuva format natively, so nothing sits between. The zoom is therefore evaluated at the
+  zoom (it was a `scale ... eval=frame` feeding `overlay`, which centred each frame's own
+  `w`/`h`; it is now the placement below). The zoom is therefore evaluated at the
   **output** frame's time, on both FFmpegs. Two costs of that order, both bounded: an
   effect, mask or `rotate` now acts on the picture at fit size and the zoom magnifies the
   result (a blur grows with the zoom, as in an NLE's effect-then-motion order; a hard mask
@@ -1070,6 +1069,30 @@ so the feature is **only** activated through these forwards — which is what ma
   (no terminal format) kept the cut-out, and a moving zoom (terminal `yuva420p`) flipped it back;
   `ClipFx.alpha` (`Asset::has_alpha`: the probed pixel format of the first video stream is an
   alpha one; an unrecorded format is not) ends such a chain in `format=yuva420p`.
+  **A moving zoom or position is placed at sub-pixel positions** (`placement_filters`, when
+  `Clip::placement_animated()`: the keyed scale, `pos_x` or `pos_y` actually moves). The zoom as a
+  per-frame `scale` made whole-pixel sizes (`2*trunc(../2)` ahead of a tone-map) and the overlay's
+  `x`/`y` truncate and round down to even in 4:2:0 (`normalize_xy`), so a slow Ken Burns (a 3:2 still,
+  1.10 to 1.17 and a pan of 0.04 over 3.5 s at 50 fps, Cover) moved in irregular one- and two-pixel
+  steps: a box's centroid jumped 2.7 px between frames. The chain now ends `format=yuva420p` (unless
+  it has alpha already), `pad` (transparent `black@0`, centred, to at least the canvas and 2 px past
+  the picture: `perspective` clamps to the edge, so what it reads past the picture is clear),
+  `perspective=..:interpolation=linear:eval=frame` (corners: canvas pixel `X` reads the picture at
+  `(X + 0.5 - cx) / s + w/2 - 0.5`, `cx` the canvas centre plus the position and a slide / push's
+  travel), then `crop` to the canvas round the same centre; the overlay puts that at `0:0`. The pad's
+  and crop's offsets are even whole numbers (`2*ceil(..)`, `2*floor(..)`), so neither rounds and
+  `perspective`, which knows only its own size, computes the same window. Its time is
+  `perspective_time` off a pinned `fps` (`keyed_crop_fps`), as a keyed crop's. The centroid now
+  steps by < 0.1 px and sits within 0.05 px of `transform_at` (`keyed_zoom.rs`,
+  `a_slow_zoom_and_pan_moves_by_fractions_of_a_pixel`, which fails on the old chain); about the cost of
+  the old chain at 1080p. Bilinear: a strong zoom out aliases more than swscale's filter did, and a
+  zoom in is upsampled from the fit size as before (the source's detail past the fit is not used). A
+  picture under a pixel is drawn at its own size (no 1 px floor). A fade on a chain with no alpha plane
+  gets `format=<pix_fmt>` ahead of the placement, so it does not negotiate into the `yuva420p` after it
+  (where black is 0). **The scrubbed still runs the same placement** (`placement_chain` with the
+  sampled zoom, position and travel, no `eval=frame`; `still_clip_chain_graded(.., placement)`), so it
+  is the export's frame (`still_rendered.rs`'s dissolve into a zoom, 1 level). The shared builder is
+  `placement_chain`. A held zoom or position keeps its graph.
   **Per-property channels in the graph.** A clip's transform is built number by number from
   `Clip::is_keyed`, not from "is it animated": `video_clip_chain` writes a keyed scale as the
   `scale eval=frame` (last, when it moves), a keyed rotation as the `black@0`-filled `rotate`, a keyed
