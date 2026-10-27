@@ -31,6 +31,8 @@ const SLOW = 20_000;
 
 beforeEach(async () => {
 	await revertTo(0);
+	// The harness's ripple mode is a setting, not part of the history: another file can leave it on.
+	await setRippleMode(false);
 });
 
 /** A 24-bar tropical-house piece in A minor at 120 BPM: 48 s and a tail. */
