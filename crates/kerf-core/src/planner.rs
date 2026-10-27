@@ -324,6 +324,7 @@ impl Planner {
                         mask: clip.mask_animated(),
                         crop: clip.crop_animated(),
                         still_motion: clip.picture_moves() && facts.get(&clip.asset_id).is_some_and(|a| a.is_image),
+                        places: clip.placement_animated(),
                     },
                 ),
                 effects,
@@ -1715,6 +1716,7 @@ mod tests {
             dip_white: true,
             keyed_opacity: true,
             keyed_zoom: true,
+            placement: false,
             keyed_color: true,
             mask: true,
             text: true,
@@ -1931,6 +1933,7 @@ mod tests {
             dip_white: true,
             keyed_opacity: true,
             keyed_zoom: true,
+            placement: false,
             keyed_color: true,
             mask: true,
             text: true,
@@ -2007,6 +2010,28 @@ mod tests {
             u,
             Unsupported::KeyedZoom(_)
         )));
+        // A zoom or a position that moves is placed at sub-pixel positions by a `perspective` in the
+        // export and the still, which no compositor draws, whatever its caps; a position that holds
+        // is placed as ever.
+        let placement = |u: &Unsupported| matches!(u, Unsupported::KeyedPlacement(_));
+        let all = GpuCaps {
+            keyed_zoom: true,
+            ..GpuCaps::A0
+        };
+        assert!(animated.places);
+        assert!(has(&plan.reasons(&all, plan.size(u32::MAX)), placement));
+        let mut drifting = make_clip(assets[0].id, 0.0, 4.0, 0.0);
+        drifting.keyframes = vec![keyed(0.0, 1.0, -0.2), keyed(2.0, 1.0, 0.2)];
+        for (keys, mode, refused) in [
+            (drifting.keyframes.clone(), PlanMode::Motion, true),
+            (drifting.keyframes.clone(), PlanMode::Still, true),
+            (vec![keyed(0.0, 1.0, 0.2), keyed(2.0, 1.0, 0.2)], PlanMode::Motion, false),
+        ] {
+            let mut clip = drifting.clone();
+            clip.keyframes = keys;
+            let plan = planner(&single(vec![clip]), &assets, mode, &opts(30.0)).at_frame(15).unwrap();
+            assert_eq!(has(&plan.reasons(&all, plan.size(u32::MAX)), placement), refused, "{mode:?}");
+        }
         // A still runs a moving zoom last too, so it is drawn when nothing is in front of the
         // zoom (the order is then the one the compositor has) and refused when a grade, a
         // rotation or a fade of opacity is: those act on the picture before it is zoomed.
@@ -2397,6 +2422,7 @@ mod tests {
             dip_white: true,
             keyed_opacity: true,
             keyed_zoom: true,
+            placement: false,
             keyed_color: true,
             mask: true,
             text: true,

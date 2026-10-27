@@ -1885,10 +1885,10 @@ const STRUCTURAL: [&str; 48] = [
     "time-negative",
     "zoom-keyed",
     "zoom-keyed-constant",
-    "still-zoom-last",
+    "still-placed",
     "alpha-source",
-    "zoom-keyed-last",
-    "preview-zoom-keyed-last",
+    "placed",
+    "preview-placed",
     "alpha-kept",
     "preview-alpha-kept",
     "master-nonfinite",
@@ -1932,16 +1932,18 @@ fn expected(table: &[(&str, &str)]) -> Vec<String> {
     f
 }
 
-/// Whether a clip chain of the still graph **ends** in the zoom (`scale=iw*S:ih*S`): only a
-/// moving zoom is run last, every other clip zooms first and ends on `setsar` or later.
-fn still_zoom_last(still: &str) -> bool {
-    still.split(';').any(|segment| {
+/// Whether a clip chain of the still graph **ends** in the placement's cut to the canvas (`crop` at
+/// `x='2*floor((iw-`): a clip whose zoom or position moves is placed as the export places it.
+fn still_placed(still: &str) -> bool {
+    split_unquoted(still, ';').into_iter().any(|segment| {
         let Some((head, label)) = segment.trim_end().rsplit_once('[') else {
             return false;
         };
         label.starts_with('v')
             && label.ends_with(']')
-            && head.rsplit(',').next().is_some_and(|last| last.starts_with("scale=iw*"))
+            && filters(head)
+                .last()
+                .is_some_and(|last| last.starts_with("crop=w=") && last.contains(":x='2*floor((iw-"))
     })
 }
 
@@ -1974,27 +1976,31 @@ fn filters(s: &str) -> Vec<&str> {
     split_unquoted(s, ',')
 }
 
-/// How the clip chains of an export or preview graph end: `(zoom last, alpha kept)`. A chain
-/// ending `format=yuva420p` is either a moving zoom (the `scale ... eval=frame` right before
-/// it) or a source whose alpha channel the chain keeps; an ordinary one ends in the
-/// delivery's own format, or in whatever the last effect is.
+/// How the clip chains of an export or preview graph end: `(placed, alpha kept)`. A chain whose
+/// zoom or position moves ends in the placement's cut to the canvas (`crop` at
+/// `x='2*floor((iw-`, after its `perspective`); one ending `format=yuva420p` is a source whose
+/// alpha channel the chain keeps; an ordinary one ends in the delivery's own format, or in
+/// whatever the last effect is.
 fn chain_tails(graph: &str) -> (bool, bool) {
     let (mut zoom, mut alpha) = (false, false);
-    for segment in graph.split(';') {
+    for segment in split_unquoted(graph, ';') {
         let Some((head, label)) = segment.trim_end().rsplit_once('[') else {
             continue;
         };
+        // (A run that writes several deliveries prefixes each one's labels: `d1_v3`.)
+        let label = label
+            .strip_prefix('d')
+            .and_then(|l| l.split_once('_'))
+            .filter(|(n, _)| n.chars().all(|c| c.is_ascii_digit()))
+            .map_or(label, |(_, l)| l);
         if !(label.starts_with('v') && label.ends_with(']') && label[1..label.len() - 1].chars().all(|c| c.is_ascii_digit())) {
             continue;
         }
         let f = filters(head);
-        if f.last() == Some(&"format=yuva420p") && f.len() >= 2 {
-            let before = f[f.len() - 2];
-            if before.starts_with("scale=w=") && before.contains(":eval=frame") {
-                zoom = true;
-            } else {
-                alpha = true;
-            }
+        match f.last() {
+            Some(last) if last.starts_with("crop=w=") && last.contains(":x='2*floor((iw-") => zoom = true,
+            Some(&"format=yuva420p") => alpha = true,
+            _ => {}
         }
     }
     (zoom, alpha)
@@ -2163,7 +2169,7 @@ fn families(c: &Case, assets: &[Asset], text: &[String; 3], table: &[(&str, &str
         // the chain it always had, so both are covered.
         (clips().any(Clip::zoom_animated), "zoom-keyed"),
         (clips().any(|k| k.is_animated() && !k.zoom_animated()), "zoom-keyed-constant"),
-        (still_zoom_last(&flat[1]), "still-zoom-last"),
+        (still_placed(&flat[1]), "still-placed"),
         // Per-property channels: a transform with some numbers keyed and the rest static, a
         // number taken off the legacy bundle (keyed on its own, or held static), and a clip
         // that is animated in colour alone (its picture is placed as a static one).
@@ -2227,8 +2233,8 @@ fn families(c: &Case, assets: &[Asset], text: &[String; 3], table: &[(&str, &str
         (bt709_preview, "preview-bt709-mix"),
         (still_transitions.0, "still-tail"),
         (still_transitions.1, "still-travel"),
-        (chain_tails(&flat[0]).0, "zoom-keyed-last"),
-        (chain_tails(&flat[2]).0, "preview-zoom-keyed-last"),
+        (chain_tails(&flat[0]).0, "placed"),
+        (chain_tails(&flat[2]).0, "preview-placed"),
         (zoom_folded(&flat[0]), "zoom-folded"),
         (zoom_folded(&flat[2]), "preview-zoom-folded"),
         (zoom_folded(&flat[1]), "still-zoom-folded"),

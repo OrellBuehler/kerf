@@ -182,14 +182,14 @@ fn a_zoom_that_is_keyed_but_held_is_the_same_scale() {
     assert_eq!(held.fit_order(Fit::Contain, true), FitOrder::Folded);
     let c = chain(&held, Fit::Contain);
     assert!(
-        c.contains("scale=1080*2:1920*2:force_original_aspect_ratio=decrease,setsar=1") && !c.contains("eval=frame"),
+        c.contains("scale=1080*2:1920*2:force_original_aspect_ratio=decrease,setsar=1") && !c.contains("scale=w='"),
         "{c}"
     );
     // Held at or under 1 it keeps the per-frame scale it always had.
     let mut under = clip(1.0);
     under.keyframes = vec![key(0.0, 0.8, 0.0), key(2.0, 0.8, 0.1)];
     assert_eq!(under.fit_order(Fit::Contain, true), FitOrder::Fitted);
-    assert!(chain(&under, Fit::Contain).contains("eval=frame"));
+    assert!(chain(&under, Fit::Contain).contains("scale=w='iw*("));
 }
 
 #[test]
@@ -232,7 +232,7 @@ fn a_cover_clip_that_pans_is_scaled_to_cover_and_the_overlay_cuts_it() {
         c.contains("scale=1080*1.5:1920*1.5:force_original_aspect_ratio=increase,crop=w='iw-4*floor(max(0,iw-1960)/4)'"),
         "{c}"
     );
-    assert!(!c.contains("eval=frame"), "{c}");
+    assert!(!c.contains("scale=w='"), "{c}");
 }
 
 /// A slide or push brings the clip in from a frame away: the window it keeps has to hold what the
@@ -371,7 +371,7 @@ fn a_zoom_out_of_a_cover_clip_of_another_shape_is_the_whole_cover_zoomed() {
     assert_eq!(moving.fit_order(Fit::Cover, true), FitOrder::Fitted);
     let c = chain(&moving, Some((160, 120)));
     assert!(
-        c.contains("scale=320:180:force_original_aspect_ratio=increase,crop=320:180,") && !c.contains("floor("),
+        c.contains("scale=320:180:force_original_aspect_ratio=increase,crop=320:180,") && !c.contains("iw-4*floor("),
         "{c}"
     );
     // Footage of the frame's own shape has no overhang: it is cropped to the frame as it was.

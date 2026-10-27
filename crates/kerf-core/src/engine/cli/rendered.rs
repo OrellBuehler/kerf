@@ -556,10 +556,12 @@ fn a_keyframed_zoom_is_read_at_the_output_frame_and_nothing_after_it_holds_it_st
             .iter()
             .take(60)
             .map(|f| {
-                f[90 * 320 * 3..91 * 320 * 3]
-                    .chunks(3)
-                    .filter(|p| p[0] > 128 && p[1] < 100)
-                    .count()
+                // How much of the row is red: red and green have the same luma, so the edge is all
+                // chroma (half the resolution); its share of red is a fraction of a pixel of width.
+                // (Over the red the picture's centre reads, which the conversion to RGB leaves short of 255.)
+                let row = &f[90 * 320 * 3..91 * 320 * 3];
+                let red = f64::from(row[160 * 3]);
+                row.chunks(3).map(|p| f64::from(p[0]) / red).sum::<f64>()
             })
             .collect::<Vec<_>>()
     };
@@ -568,8 +570,8 @@ fn a_keyframed_zoom_is_read_at_the_output_frame_and_nothing_after_it_holds_it_st
         for (k, width) in w.iter().enumerate() {
             let want = 320.0 * (1.0 - 0.4 * ffmpeg_frame_time(k as u64, 30, 1));
             assert!(
-                (*width as f64 - want).abs() <= 2.0,
-                "{tag}: frame {k} is {width} px wide, the keys say {want:.1}: {w:?}"
+                (width - want).abs() <= 2.0,
+                "{tag}: frame {k} is {width:.1} px wide, the keys say {want:.1}: {w:?}"
             );
         }
         assert!(w.windows(2).all(|p| p[1] < p[0]), "{tag}: it shrinks on every frame: {w:?}");
