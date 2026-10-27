@@ -369,6 +369,10 @@
   that samples a keyed pose to the identity draws the plain fit (`Fitted`), as the still builder does; a moving zoom, a zoom out under Contain,
   a Cover clip of the frame's own shape that moves or zooms out (`cover_overflows`, judged from the decoded picture and the delivery
   canvas) and a masked or vignetted one stay `Fitted`, so a webcam PiP over a 16:9 cut keeps drawing (the coverage archetypes are 100%).
+  **A still image whose picture moves is refused** (`Animated.still_motion`, `Clip::picture_moves` on an image; kind
+  `still_motion`): the export, the stream and the FFmpeg still draw its fit, zoom, position and crop in one `perspective` of a
+  copy of the still scaled once (`engine-cli.md`, "A moving still"), which no compositor pass draws. The flag is on for any
+  moving still, the ones `still_motion` declines included (the GPU already refused a resized 4:4:4 or RGB still).
   `LayerGeometry` is **unchanged** (still fit-then-zoom: the compositor's order, and `layer-geometry.ts`, the Preview handles' port): a Contain
   zoom's picture is within a pixel or two of the file's, and for Cover the handles show the zoomed *frame* where the file now has the
   larger cover, cut by the canvas. Drawing these layers means a one-stage `LayerGeometry` (`scaled` = the folded box, `keep` = the centred

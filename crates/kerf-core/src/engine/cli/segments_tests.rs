@@ -320,6 +320,58 @@ fn a_part_graph_draws_its_clips_as_the_whole_graph_does() {
     assert_eq!(seen.len(), 24, "every clip is drawn by some part");
 }
 
+/// A part that fails says what it was drawing, the most pixels a frame first, so a clip that is
+/// slow to draw has a name: here a 45 MP still that moves (`still_motion` scales it once) over 4K
+/// footage, and a small logo the general chain resamples for every frame.
+#[test]
+fn a_part_that_fails_names_what_it_draws_heaviest_first() {
+    use crate::model::{Easing, Keyframe};
+    let mut a = uhd("/m/a.mp4");
+    a.name = "C086.MP4".into();
+    let mut l = logo("/m/logo.png");
+    l.name = "logo.png".into();
+    let mut photo = test_asset(vec![image_stream(8192, 5464)]);
+    photo.path = "/m/ORP_8469.jpg".into();
+    photo.name = "ORP_8469.jpg".into();
+    let assets = [a.clone(), l.clone(), photo.clone()];
+    let mut seq = sequence(&a, 30, 1.4);
+    let mut still = make_clip(photo.id, 0.0, 3.5, 0.5);
+    let key = |time, scale| Keyframe {
+        time,
+        scale,
+        pos_x: 0.0,
+        pos_y: 0.0,
+        rotation: 0.0,
+        opacity: 1.0,
+        easing: Easing::EaseInOut,
+    };
+    still.keyframes = vec![key(0.0, 1.06), key(3.5, 1.14)];
+    let mut overlay = make_clip(l.id, 0.0, 42.0, 0.0);
+    overlay.transform.scale = 0.2;
+    for (name, clip) in [("V2", still), ("V3", overlay)] {
+        seq.tracks.push(crate::model::Track {
+            clips: vec![clip],
+            ..crate::model::Track::new(StreamKind::Video, name)
+        });
+    }
+    let cover = ExportOptions {
+        fit: Fit::Cover,
+        ..opts()
+    };
+    let plan = plan_export(&seq, &assets, &cover, SEGMENT_LIMITS).expect("parts");
+    let said = part_drawing(&plan, &assets, &plan.parts[0]);
+    let at = |what: &str| said.find(what).unwrap_or_else(|| panic!("{what} in {said}"));
+    assert!(said.starts_with("0.00-"), "{said}");
+    assert!(
+        at("ORP_8469.jpg (44.8 MP still, scaled once) at 0.50-4.00 s") < at("C086.MP4 (3840x2160)"),
+        "{said}"
+    );
+    assert!(
+        at("C086.MP4") < at("logo.png (0.2 MP still, resampled every frame)"),
+        "{said}"
+    );
+}
+
 #[test]
 fn a_still_across_a_cut_is_picked_up_there() {
     let a = uhd("/m/a.mp4");
@@ -336,8 +388,13 @@ fn a_still_across_a_cut_is_picked_up_there() {
     assert!(plan.parts.len() > 3);
     // The first part reads the logo from its start, as the whole export does.
     let first = build_part_args(&plan, &assets, &opts(), &plan.parts[0], &[], "/tmp/p0.mkv", "-fps_mode").unwrap();
-    assert!(first.windows(2).any(|w| w == ["-loop", "1"]) && first.contains(&"-t".to_string()));
-    // A later one restarts it: the picture looped, numbered onto the frames it still has.
+    // (Decoded once, held by the chain's `loop`: no `-loop 1` decoding it again for every frame.)
+    assert!(
+        !first.contains(&"-loop".to_string()) && !first.contains(&"-t".to_string()),
+        "{first:?}"
+    );
+    assert!(graph_of(&first).contains(":size=1,trim=start=0:end="), "{}", graph_of(&first));
+    // A later one restarts it: the picture held, numbered onto the frames it still has.
     let part = plan.parts[2];
     let contents = part_contents(&plan, &part);
     let restart = contents.restarts.values().next().copied().expect("the logo is restarted");
@@ -348,12 +405,17 @@ fn a_still_across_a_cut_is_picked_up_there() {
         "it ends where the whole export's run of it does"
     );
     let args = build_part_args(&plan, &assets, &opts(), &part, &[], "/tmp/p2.mkv", "-fps_mode").unwrap();
-    assert!(args.windows(3).any(|w| w == ["-pattern_type", "none", "-loop"]), "{args:?}");
+    assert!(
+        args.windows(3).any(|w| w == ["-pattern_type", "none", "-framerate"]),
+        "{args:?}"
+    );
     let graph = graph_of(&args);
     assert!(
         graph.contains(&format!(
-            "settb=expr=1/50,setpts=N+{},trim=end_frame={}",
-            restart.frame, restart.count
+            "loop=loop={}:size=1,settb=expr=1/50,setpts=N+{},trim=end_frame={}",
+            restart.count - 1,
+            restart.frame,
+            restart.count
         )),
         "{graph}"
     );
@@ -583,11 +645,13 @@ pub(super) fn without_stamp(mut chain: Vec<String>, restarted: bool) -> Vec<Stri
         .iter()
         .map(String::as_str)
         .filter(|f| {
+            // A still's hold counts the pictures it keeps: the whole run's from its start, a part's
+            // from the cut.
             let stamp = if restarted {
                 f.starts_with("settb=expr=") || f.starts_with("setpts=N+") || f.starts_with("trim=end_frame=")
             } else {
                 f.starts_with("trim=start=") || f.starts_with("setpts=PTS-STARTPTS")
-            };
+            } || f.starts_with("loop=loop=");
             !stamp
         })
         .collect();

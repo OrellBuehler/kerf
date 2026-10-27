@@ -2476,11 +2476,12 @@ fn run_frame_decode(
     if !accurate {
         cmd.arg("-noaccurate_seek");
     }
-    cmd.arg("-ss")
-        .arg(format!("{time_secs:.3}"))
-        .arg("-i")
-        .arg(path)
-        .args(["-frames:v", "1", "-vf", vf]);
+    // No seek to the start: it reads the same first frame, and on a JPEG still (the `image2`
+    // demuxer) any `-ss`, 0 included, makes ffmpeg exit 0 having decoded nothing (6.1 and 9.0).
+    if let Some(at) = seek_unless_start(time_secs) {
+        cmd.arg("-ss").arg(at);
+    }
+    cmd.arg("-i").arg(path).args(["-frames:v", "1", "-vf", vf]);
     if let Some(q) = quality {
         cmd.args(["-q:v", q.to_string().as_str()]);
     }
@@ -2505,6 +2506,13 @@ fn run_frame_decode(
         )));
     }
     Ok(output.stdout)
+}
+
+/// The `-ss` a single-frame read or a sheet seeks with (`{:.3}`), or `None` at the start, which
+/// seeking to would only break a JPEG still: there `-ss 0` decodes no frame and ffmpeg still exits 0.
+fn seek_unless_start(at: f64) -> Option<String> {
+    let at = format!("{:.3}", at.max(0.0));
+    (at != "0.000").then_some(at)
 }
 
 /// [`contact_sheet_cancellable`] with nothing to cancel it.
@@ -2610,7 +2618,7 @@ fn build_contact_sheet_args(
     // HDR sources are tone-mapped per cell, after the downscale, before the tile.
     let tone = tonemap.map(|t| format!("{t},")).unwrap_or_default();
     // A head-padded proxy opens with a clone of its first frame, which the original has no
-    // counterpart for: read from the very start (a seek to 0.000 keeps it) it would take a
+    // counterpart for: read from the very start (no seek, which keeps it) it would take a
     // slot of its own and push every cell one over. Any later seek has skipped it already.
     let unpad = if start < 0.0005 && is_head_padded_proxy(path) {
         "trim=start_frame=1,"
@@ -2618,12 +2626,11 @@ fn build_contact_sheet_args(
         ""
     };
     let vf = format!("{unpad}fps={rate},scale={cell_width}:-2:flags=bilinear,{tone}tile={columns}x{rows}");
-    let args = vec![
-        "-hide_banner".to_string(),
-        "-loglevel".to_string(),
-        "error".to_string(),
-        "-ss".to_string(),
-        format!("{start:.3}"),
+    let mut args = vec!["-hide_banner".to_string(), "-loglevel".to_string(), "error".to_string()];
+    if let Some(at) = seek_unless_start(start) {
+        args.extend(["-ss".to_string(), at]);
+    }
+    args.extend([
         "-t".to_string(),
         format!("{window:.3}"),
         "-i".to_string(),
@@ -2639,7 +2646,7 @@ fn build_contact_sheet_args(
         "-vcodec".to_string(),
         "mjpeg".to_string(),
         "pipe:1".to_string(),
-    ];
+    ]);
     (args, times)
 }
 
@@ -5061,13 +5068,14 @@ fn push_inputs_scoped(
             continue;
         }
         let path = path_of(clip.asset_id).ok_or(Error::AssetNotFound(clip.asset_id))?;
-        let (start, end) = picture_window(clip, &fx[rep], fmt.fps);
+        let (start, _) = picture_window(clip, &fx[rep], fmt.fps);
         if let Some(restart) = scope.restarts.get(&rep) {
-            // A still picked up at a cut: the picture, looped, numbered onto the frames it still
-            // has (the way a held title is), where the whole export reads it from its own start.
+            // A still picked up at a cut: the picture, held (`loop` in its chain), numbered onto the
+            // frames it still has (the way a held title is), where the whole export reads it from
+            // its own start.
             let rate = Rational::from_fps(fmt.fps)
                 .ok_or_else(|| Error::Engine(format!("frame rate {} cannot restart a still", fmt.fps)))?;
-            args.extend(["-f", "image2", "-pattern_type", "none", "-loop", "1", "-framerate"].map(String::from));
+            args.extend(["-f", "image2", "-pattern_type", "none", "-framerate"].map(String::from));
             args.push(format!("{}", fmt.fps));
             plan.stamps[rep] = Some(svg_layer::ClipStamp {
                 num: rate.num,
@@ -5076,17 +5084,13 @@ fn push_inputs_scoped(
                 held: Some(restart.count),
             });
         } else if image_of(clip.asset_id) {
-            // A still has no timeline of its own: loop the single frame and read it
-            // for the clip's whole source window. The in-graph trim (with the seek
-            // forced to 0 for images) then carves the clip's duration out of it.
+            // A still has no timeline of its own: its one frame is decoded once and held by the
+            // chain's `loop` for the clip's whole source window (`still_pictures` of `end`), which
+            // the in-graph trim (the seek forced to 0 for images) carves the clip's duration out
+            // of. `-loop 1` decoded the file again for every frame: 0.8 s a frame of a 45 MP JPEG.
             // No `-ss` — seeking into a one-frame input decodes nothing.
-            args.push("-loop".to_string());
-            args.push("1".to_string());
             args.push("-framerate".to_string());
             args.push(format!("{}", fmt.fps));
-            args.push("-t".to_string());
-            // As long as the chain's trim reads it (`picture_window`).
-            args.push(format!("{}", end.max(1.0 / fmt.fps)));
         } else {
             // Hardware-accelerated decode for this input when requested. `-hwaccel`
             // is an input option (applies to the next `-i`), so it's emitted
@@ -7258,10 +7262,10 @@ struct Bar {
 /// has said nothing in the meantime.
 const CANCEL_POLL: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// How long an export may go without a single `-progress` line before it is
-/// treated as hung. ffmpeg reports every half second while it is working, even
-/// through a slow filter, so this is a deadlock, not a heavy render — the bound
-/// is generous because killing a render that was merely slow is the worse error.
+/// How long an export may go without moving — not one frame more, not one later output position
+/// in its `-progress` stream — before it is treated as hung ([`run_progress_stalling`]). A run that
+/// moves is never stopped, so the bound is generous: killing a render that was merely slow is the
+/// worse error.
 /// (It reports nothing while it opens the footage and decodes up to a range's start, so this is
 /// also the most a seek into a recording with no keyframes to land on may take.)
 const EXPORT_STALL: std::time::Duration = std::time::Duration::from_secs(300);
@@ -7356,6 +7360,39 @@ fn run_progress_counting(
     cancel: &dyn Fn() -> bool,
     frames: &mut u64,
 ) -> Result<RenderStatus> {
+    run_progress_stalling(
+        bin,
+        args,
+        sinks,
+        output,
+        bar,
+        resource,
+        progress,
+        cancel,
+        frames,
+        EXPORT_STALL,
+    )
+}
+
+/// [`run_progress_counting`] that gives up on a run that has not moved for `stall`
+/// ([`EXPORT_STALL`] in production): **moved** is a frame more or a later output position in the
+/// `-progress` stream, not a line. FFmpeg 7 and later print a block every `-stats_period` whatever
+/// the graph is doing, so a run whose graph had stopped (a 45 MP still decoded and resampled per
+/// frame under memory pressure) went on "reporting" the same frame for hours; a run that is slow
+/// but moving is never stopped, however slow.
+#[allow(clippy::too_many_arguments)]
+fn run_progress_stalling(
+    bin: &str,
+    args: &[String],
+    sinks: &[usize],
+    output: &Path,
+    bar: Bar,
+    resource: cpu::Resource,
+    progress: &mut dyn FnMut(ExportProgress),
+    cancel: &dyn Fn() -> bool,
+    frames: &mut u64,
+    stall: std::time::Duration,
+) -> Result<RenderStatus> {
     use std::io::{BufRead, BufReader, Read};
     use std::process::Stdio;
 
@@ -7444,9 +7481,16 @@ fn run_progress_counting(
     // The wall clock and the place on the bar at the first output: the rate (and so the time
     // left) is judged from there, not from the spawn.
     let mut first_output: Option<(Instant, f64)> = None;
-    let mut last_output = Instant::now();
+    // When the run last moved, and how far it had got: frames written, output seconds.
+    let mut last_moved = Instant::now();
+    let mut furthest = (0u64, f64::NEG_INFINITY);
     let mut last_beat = Instant::now();
     loop {
+        if last_moved.elapsed() > stall {
+            let _ = child.kill();
+            stalled = true;
+            break;
+        }
         let line = match rx.recv_timeout(CANCEL_POLL) {
             Ok(line) => line,
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -7454,11 +7498,6 @@ fn run_progress_counting(
                 if cancel() {
                     let _ = child.kill();
                     cancelled = true;
-                    break;
-                }
-                if last_output.elapsed() > EXPORT_STALL {
-                    let _ = child.kill();
-                    stalled = true;
                     break;
                 }
                 // ffmpeg prints no `-progress` block while it opens the footage and decodes up
@@ -7472,11 +7511,20 @@ fn run_progress_counting(
                 continue;
             }
         };
-        last_output = Instant::now();
         if let Some(n) = line.strip_prefix("frame=").and_then(|v| v.trim().parse::<u64>().ok()) {
             *frames = n;
+            if n > furthest.0 {
+                furthest.0 = n;
+                last_moved = Instant::now();
+            }
         }
         let block = reader.feed(&line);
+        if let Some(Block::Working(Some(position)) | Block::End(Some(position))) = block {
+            if position > furthest.1 {
+                furthest.1 = position;
+                last_moved = Instant::now();
+            }
+        }
         match block {
             // The output has been written to: its position against the length of the cut (the
             // output starts at 0 whatever the range's offset — the input seek rebases the
@@ -7516,9 +7564,14 @@ fn run_progress_counting(
     if stalled {
         let mut tail: Vec<&str> = stderr_text.lines().rev().take(20).collect();
         tail.reverse();
+        let at = if furthest.1.is_finite() {
+            format!(" (stuck at frame {}, {:.2} s of output)", furthest.0, furthest.1)
+        } else {
+            " (nothing written yet)".to_string()
+        };
         return Err(Error::Engine(format!(
-            "ffmpeg stopped reporting progress for {}s and was stopped: {}",
-            EXPORT_STALL.as_secs(),
+            "ffmpeg stopped reporting progress for {}s{at} and was stopped: {}",
+            stall.as_secs(),
             tail.join("\n").trim()
         )));
     }
@@ -7899,6 +7952,11 @@ fn build_filter_complex_with(
                     )
                 })
                 .flatten();
+            // A moving still is drawn into the whole frame, its position inside it.
+            let still_motion = stamp
+                .is_none()
+                .then(|| still_motion_for(clip, assets, fmt, &fx[*flat]))
+                .flatten();
             chains.push(format!(
                 "[{src}]{chain}[v{flat}]",
                 chain = video_clip_chain_stamped(
@@ -7909,6 +7967,7 @@ fn build_filter_complex_with(
                     stamp,
                     picture_of(clip),
                     stab.as_ref(),
+                    still_motion.as_ref(),
                     &format!("{instances}c{flat}")
                 )
             ));
@@ -7928,7 +7987,15 @@ fn build_filter_complex_with(
             // as the end of the filter unless the value is quoted. A plain static
             // offset has none, and stays unquoted.
             let quote = |v: String, dynamic: bool| if dynamic { format!("'{v}'") } else { v };
-            let overlay = if clip.placement_animated() {
+            let overlay = if still_motion.is_some() {
+                // The frame itself: only a slide or push moves it.
+                match &motion {
+                    Some((mx, my)) => format!(
+                        "overlay=x='(W-w)/2+({mx})*W':y='(H-h)/2+({my})*H':eof_action=pass:enable='between(t,{start},{end})'"
+                    ),
+                    None => format!("overlay=eof_action=pass:enable='between(t,{start},{end})'"),
+                }
+            } else if clip.placement_animated() {
                 // The chain's last stage placed the picture, travel included, on a frame of the
                 // canvas' size (`placement_filters`).
                 format!("overlay=eof_action=pass:enable='between(t,{start},{end})'")
@@ -9457,6 +9524,40 @@ fn picture_size(asset: Option<&Asset>) -> Option<(u32, u32)> {
     Some((stream.width?, stream.height?))
 }
 
+/// How many pictures of a still the export reads: those `-loop 1 -framerate fps -t end` gave, the
+/// ones before `end` on the `fps` grid.
+fn still_pictures(end: f64, fps: f64) -> u64 {
+    ((end.max(1.0 / fps) * fps - 1e-9).ceil() as u64).max(1)
+}
+
+/// The [`StillMotion`] plan of an export's clip (`None` for any clip it does not draw): a moving
+/// still image judged at the delivery frame on every frame it is drawn on (its length and the tail
+/// a transition keeps under the next clip), the curves' own points included.
+fn still_motion_for(clip: &Clip, assets: &[Asset], fmt: &ExportFormat, fx: &ClipFx) -> Option<StillMotion> {
+    let asset = assets.iter().find(|a| a.id == clip.asset_id);
+    if !asset.is_some_and(Asset::is_image) || clip.is_generated() || fx.hdr.is_some() || !clip.picture_moves() {
+        return None;
+    }
+    let length = ClipTiming::new(clip, fx).duration().max(0.0);
+    let step = 1.0 / fmt.fps;
+    // Every frame, or 4000 evenly over a very long clip (a polyline's extremes are its points).
+    let count = ((length / step).ceil() as usize).clamp(1, 4000);
+    let mut times: Vec<f64> = (0..=count).map(|k| length * k as f64 / count as f64).collect();
+    for p in Property::TRANSFORM
+        .iter()
+        .chain(&[Property::CropZoom, Property::CropX, Property::CropY])
+    {
+        times.extend(
+            clip.property_curve(*p)
+                .iter()
+                .map(|pt| pt.0)
+                .filter(|t| (0.0..=length).contains(t)),
+        );
+    }
+    let frame = (fmt.width, fmt.height);
+    StillMotion::new(clip, still_motion::displayed(asset), frame, frame, fmt.fit, &times)
+}
+
 /// The video filter chain for one clip (everything between its `[i:v]` input
 /// and its `[v{i}]` output): trim, optional reverse / crop / retime, 360
 /// reprojection, fit or transform geometry, color correction, per-clip video
@@ -9488,7 +9589,7 @@ fn picture_size(asset: Option<&Asset>) -> Option<(u32, u32)> {
 /// passes Contain for a clip that does not take it ([`takes_blur_fill`]).
 #[cfg(test)]
 fn video_clip_chain(clip: &Clip, fmt: &ExportFormat, fx: &ClipFx, is_image: bool, instance: &str) -> String {
-    video_clip_chain_stamped(clip, fmt, fx, is_image, None, None, None, instance)
+    video_clip_chain_stamped(clip, fmt, fx, is_image, None, None, None, None, instance)
 }
 
 /// [`video_clip_chain`] for a picture of a known size (`None`: not known, which a Cover clip's
@@ -9502,7 +9603,7 @@ fn video_clip_chain_of(
     picture: Option<(u32, u32)>,
     instance: &str,
 ) -> String {
-    video_clip_chain_stamped(clip, fmt, fx, is_image, None, picture, None, instance)
+    video_clip_chain_stamped(clip, fmt, fx, is_image, None, picture, None, None, instance)
 }
 
 /// [`video_clip_chain`] for a clip whose input may be a title's pictures: `stamp` puts them on the
@@ -9521,6 +9622,7 @@ fn video_clip_chain_stamped(
     stamp: Option<svg_layer::ClipStamp>,
     picture: Option<(u32, u32)>,
     stab: Option<&Stabilizer>,
+    still_motion: Option<&StillMotion>,
     instance: &str,
 ) -> String {
     let s = clip.speed_mag();
@@ -9543,7 +9645,8 @@ fn video_clip_chain_stamped(
     let zoom_keyed = clip.zoom_animated();
     // A zoom or a position that moves is placed on the canvas by the chain's last stage, at
     // sub-pixel positions (`placement_filters`), which counts its frames from a pinned `fps`.
-    let placed = clip.placement_animated();
+    // (A moving still is drawn into the frame by `still_motion` instead.)
+    let placed = clip.placement_animated() && still_motion.is_none();
     let chroma = clip.effects.iter().any(|e| e.produces_alpha());
     // Alpha is needed for static opacity/rotation, animated opacity/rotation, a
     // chroma key, or a crossfade dissolve.
@@ -9592,6 +9695,19 @@ fn video_clip_chain_stamped(
     if fx.label_bt709 {
         p.push(BT709_LABEL.to_string());
     }
+    // A still's one decoded picture is held for as many frames as `-loop 1 -t` used to decode,
+    // or as a part that picks it up at a cut keeps; a moving still's is scaled and cut once first
+    // (`still_motion`).
+    if is_image {
+        if let Some(sm) = still_motion {
+            p.push(sm.once(&fmt.scale_flags()));
+        }
+        let pictures = match stamp {
+            Some(stamp) => stamp.held.unwrap_or(1),
+            None => still_pictures(trim_end, fmt.fps),
+        };
+        p.push(format!("loop=loop={}:size=1", pictures.max(1) - 1));
+    }
     // A head-padded proxy opens with one clone of its first frame at time zero (see
     // [`build_proxy_args`]), which a seek skips — and a read from the start does
     // not. The original has no such frame: its first one is the real one, and the
@@ -9615,7 +9731,8 @@ fn video_clip_chain_stamped(
             p.push(tonemap_filter(hdr));
         }
         p.extend(stab.map(Stabilizer::filters));
-        if clip.is_reversed() {
+        // (A moving still's frames are one picture: reversing them changes nothing but the memory.)
+        if clip.is_reversed() && still_motion.is_none() {
             p.push("reverse".to_string());
         }
     }
@@ -9623,7 +9740,7 @@ fn video_clip_chain_stamped(
     // dual-fisheye frame mean nothing, and the user set them against the flat
     // picture they were looking at. `crop` reads no timestamps (its `iw`/`ih`
     // fractions are constants), so moving it past `setpts` is safe.
-    if reframe.is_none() {
+    if reframe.is_none() && still_motion.is_none() {
         p.extend(crop.clone());
     }
     // A keyed crop's `fps` pins its first frame where `setpts` puts it (see `keyed_crop_fps`).
@@ -9674,12 +9791,16 @@ fn video_clip_chain_stamped(
         ));
         p.extend(crop);
     }
-    if crop_keyed {
+    if crop_keyed || still_motion.is_some() {
         if reframe.is_none() {
             p.push(crop_fps.clone());
             p.extend(cut.clone());
         }
-        p.push(crop_remap_filter(clip, crop_rate, crop_first));
+        // A moving still's whole geometry, its static crop and fit included, is one `perspective`.
+        match still_motion {
+            Some(sm) => p.push(sm.each_frame(clip, crop_rate, crop_first)),
+            None => p.push(crop_remap_filter(clip, crop_rate, crop_first)),
+        }
     }
     let sf = fmt.scale_flags();
     // `zscale` (the tone-map, which follows the geometry) refuses a picture whose size is
@@ -9710,6 +9831,8 @@ fn video_clip_chain_stamped(
     );
     let held = clip.held_scale().unwrap_or(1.0);
     match fmt.fit {
+        // A moving still comes out of its `perspective` fitted, zoomed and at the frame's size.
+        _ if still_motion.is_some() => {}
         // The whole picture over a blurred copy of itself that covers the frame: a
         // full-size canvas, as the padded identity case is.
         Fit::Blur if geom_identity => p.push(blur_fill(
@@ -9786,7 +9909,7 @@ fn video_clip_chain_stamped(
         }
     }
     // A transformed clip's own zoom rides on top of that base fit.
-    if !geom_identity && order == FitOrder::Fitted {
+    if !geom_identity && order == FitOrder::Fitted && still_motion.is_none() {
         if scale_keyed {
             // A keyed zoom that holds still: re-evaluated every frame, at one size. One that
             // moves is the placement's, at the end of the chain.
@@ -9806,7 +9929,7 @@ fn video_clip_chain_stamped(
         }
     }
     p.push("setsar=1".to_string());
-    if reframe.is_none() && !crop_keyed {
+    if reframe.is_none() && !crop_keyed && still_motion.is_none() {
         if placed {
             p.push(crop_fps);
         } else {
@@ -10625,8 +10748,26 @@ fn build_still_args_rendered(
     let mut cur = "base".to_string();
     // The matrix a blended clip's composite is in: the bottom layer's, as in the export.
     let mut composite = None;
+    let fx = transition_fx(timeline, assets);
+    let clips: Vec<&Clip> = timeline.tracks.iter().flat_map(|t| t.clips.iter()).collect();
     for (n, layer) in active.iter().enumerate() {
         let (ac, clip) = (&layer.active, layer.active.clip);
+        // A still the export draws through `still_motion` is drawn through it here, at this moment.
+        let still_motion = clips
+            .iter()
+            .position(|c| std::ptr::eq(*c, clip))
+            .and_then(|flat| still_motion_for(clip, assets, &fmt, &fx[flat]))
+            .and_then(|_| {
+                StillMotion::new(
+                    clip,
+                    still_motion::displayed(asset_of(clip.asset_id)),
+                    (fmt.width, fmt.height),
+                    (ow, oh),
+                    fmt.fit,
+                    &[ac.local_time],
+                )
+            })
+            .map(|m| format!("{},{}", m.once(&canvas.sf), m.at(clip, ac.local_time)));
         let tf = ac.transform();
         let rf = clip.reframe_at(ac.local_time);
         let hdr = asset_of(clip.asset_id).and_then(|a| a.hdr());
@@ -10685,16 +10826,19 @@ fn build_still_args_rendered(
                     blended: !clip.blend_mode.is_normal(),
                     tone_mapped: hdr.is_some(),
                 },
-                clip.placement_animated().then(|| {
+                (still_motion.is_none() && clip.placement_animated()).then(|| {
                     (
                         clip.zoom_animated().then_some(tf.scale),
                         (tf.pos_x + layer.motion.0, tf.pos_y + layer.motion.1),
                     )
                 }),
+                still_motion.as_deref(),
             )
         ));
         let out = format!("ov{n}");
-        let overlay = if clip.placement_animated() {
+        let overlay = if still_motion.is_some() {
+            still_overlay(&Transform::default(), layer.motion)
+        } else if clip.placement_animated() {
             still_overlay(&Transform::default(), (0.0, 0.0))
         } else {
             still_overlay(&tf, layer.motion)
@@ -10807,11 +10951,13 @@ fn still_clip_chain_graded(
     blur_label: Option<&str>,
     blend: StillBlend,
     placement: Option<(Option<f64>, (f64, f64))>,
+    still_motion: Option<&str>,
 ) -> String {
     let StillCanvas { w: ow, h: oh, fit, sf } = canvas;
     let (ow, oh, fit) = (*ow, *oh, *fit);
     let grade = grade_filters(grade, frame_matrix);
-    let letterboxed = tf.is_identity() && (fit == Fit::Contain || (fit == Fit::Blur && blur_label.is_none()));
+    let letterboxed =
+        still_motion.is_none() && tf.is_identity() && (fit == Fit::Contain || (fit == Fit::Blur && blur_label.is_none()));
     let clear_bars = letterboxed && keeps_clear_bars(blend.blended, blend.tone_mapped, effects, &grade);
     let chroma = effects.iter().any(|e| e.produces_alpha());
     let needs_alpha = (!tf.is_identity() && tf.needs_alpha()) || chroma || mask.is_some() || fades.needs_alpha() || clear_bars;
@@ -10820,71 +10966,76 @@ fn still_clip_chain_graded(
         p.push(BT709_LABEL.to_string());
     }
     p.extend(["trim=end_frame=1".to_string(), "setpts=PTS-STARTPTS".to_string()]);
-    let crop = tf.has_crop().then(|| {
-        let cw = (1.0 - tf.crop_left - tf.crop_right).max(0.0);
-        let ch = (1.0 - tf.crop_top - tf.crop_bottom).max(0.0);
-        format!(
-            "crop=w=iw*{cw}:h=ih*{ch}:x=iw*{cl}:y=ih*{ct}",
-            cl = tf.crop_left,
-            ct = tf.crop_top
-        )
-    });
-    // Mirrors `video_clip_chain`: crop follows reprojection. There is no `setpts`
-    // to step around here, so one order serves both cases.
-    if let Some(r) = reframe {
-        p.push(reframe_filter(r, ow, oh, PREVIEW_INTERP, None));
-    }
-    p.extend(crop);
-    // A keyed crop's window at this moment, through the very `perspective` the export runs it
-    // with (`crop_remap_filter`), so the still is the file's frame.
-    p.extend(keyed_crop.map(|(side, x, y)| {
-        format!(
-            "perspective={}:interpolation=linear",
-            crop_corners(&fnum(side), &fnum(x), &fnum(y))
-        )
-    }));
-    // The same base fit `video_clip_chain` applies, so a Cover delivery crops in
-    // the scrubbed still exactly as it will in the file. Letterboxing here while
-    // the export cropped meant the one frame you look at while cutting was the
-    // one shape you were never going to ship.
-    // A pose the still samples to the identity is the plain fit, whatever the clip's chain in the
-    // export is (a keyed clip is never padded there).
-    let order = if tf.is_identity() { FitOrder::Fitted } else { order };
-    match fit {
-        Fit::Blur if tf.is_identity() && blur_label.is_some() => {
-            // The still tone-maps ahead of the chain: its picture is 8-bit SDR here.
-            p.push(blur_fill(ow, oh, "", sf, false, blur_label.unwrap_or_default()));
-        }
-        // The zoom in is the fit's own scale, as the export draws it.
-        Fit::Contain | Fit::Blur if order == FitOrder::Folded => {
-            p.push(fit_scale(ow, oh, tf.scale, "decrease", false, sf));
-        }
-        Fit::Contain | Fit::Blur => p.push(format!("scale={ow}:{oh}:force_original_aspect_ratio=decrease{sf}")),
-        // The cover of the frame times the zoom, whole: the overlay cuts what hangs over the canvas, as
-        // the export's does. (It does not bound the picture with the export's centred `crop`; one frame
-        // is cheap, and the crop shows nothing the canvas does not.)
-        Fit::Cover if order == FitOrder::Uncropped => {
-            p.push(fit_scale(ow, oh, tf.scale, "increase", false, sf));
-        }
-        Fit::Cover => {
-            p.push(format!("scale={ow}:{oh}:force_original_aspect_ratio=increase{sf}"));
-            p.push(format!("crop={ow}:{oh}"));
-        }
-    }
     let mut late_zoom: Option<String> = None;
-    if tf.is_identity() {
-        // Cover already fills the frame; padding it would be a no-op that still
-        // costs a filter, so only the letterboxed path needs it (a blurred fill is the
-        // frame; a clip that does not take one is letterboxed as under Contain).
-        if letterboxed {
-            p.push(letterbox_pad(ow, oh, clear_bars));
+    if let Some(geometry) = still_motion {
+        // A moving still: its whole geometry at this moment, as the export draws that frame.
+        p.push(geometry.to_string());
+    } else {
+        let crop = tf.has_crop().then(|| {
+            let cw = (1.0 - tf.crop_left - tf.crop_right).max(0.0);
+            let ch = (1.0 - tf.crop_top - tf.crop_bottom).max(0.0);
+            format!(
+                "crop=w=iw*{cw}:h=ih*{ch}:x=iw*{cl}:y=ih*{ct}",
+                cl = tf.crop_left,
+                ct = tf.crop_top
+            )
+        });
+        // Mirrors `video_clip_chain`: crop follows reprojection. There is no `setpts`
+        // to step around here, so one order serves both cases.
+        if let Some(r) = reframe {
+            p.push(reframe_filter(r, ow, oh, PREVIEW_INTERP, None));
         }
-    } else if (tf.scale - 1.0).abs() > 1e-9 && order == FitOrder::Fitted {
-        let zoom = zoom_scale(&tf.scale.to_string(), false, tf.scale < TINY_SCALE, false, sf);
-        if !zoom_last {
-            p.push(zoom);
-        } else if placement.is_none() {
-            late_zoom = Some(zoom);
+        p.extend(crop);
+        // A keyed crop's window at this moment, through the very `perspective` the export runs it
+        // with (`crop_remap_filter`), so the still is the file's frame.
+        p.extend(keyed_crop.map(|(side, x, y)| {
+            format!(
+                "perspective={}:interpolation=linear",
+                crop_corners(&fnum(side), &fnum(x), &fnum(y))
+            )
+        }));
+        // The same base fit `video_clip_chain` applies, so a Cover delivery crops in
+        // the scrubbed still exactly as it will in the file. Letterboxing here while
+        // the export cropped meant the one frame you look at while cutting was the
+        // one shape you were never going to ship.
+        // A pose the still samples to the identity is the plain fit, whatever the clip's chain in the
+        // export is (a keyed clip is never padded there).
+        let order = if tf.is_identity() { FitOrder::Fitted } else { order };
+        match fit {
+            Fit::Blur if tf.is_identity() && blur_label.is_some() => {
+                // The still tone-maps ahead of the chain: its picture is 8-bit SDR here.
+                p.push(blur_fill(ow, oh, "", sf, false, blur_label.unwrap_or_default()));
+            }
+            // The zoom in is the fit's own scale, as the export draws it.
+            Fit::Contain | Fit::Blur if order == FitOrder::Folded => {
+                p.push(fit_scale(ow, oh, tf.scale, "decrease", false, sf));
+            }
+            Fit::Contain | Fit::Blur => p.push(format!("scale={ow}:{oh}:force_original_aspect_ratio=decrease{sf}")),
+            // The cover of the frame times the zoom, whole: the overlay cuts what hangs over the canvas, as
+            // the export's does. (It does not bound the picture with the export's centred `crop`; one frame
+            // is cheap, and the crop shows nothing the canvas does not.)
+            Fit::Cover if order == FitOrder::Uncropped => {
+                p.push(fit_scale(ow, oh, tf.scale, "increase", false, sf));
+            }
+            Fit::Cover => {
+                p.push(format!("scale={ow}:{oh}:force_original_aspect_ratio=increase{sf}"));
+                p.push(format!("crop={ow}:{oh}"));
+            }
+        }
+        if tf.is_identity() {
+            // Cover already fills the frame; padding it would be a no-op that still
+            // costs a filter, so only the letterboxed path needs it (a blurred fill is the
+            // frame; a clip that does not take one is letterboxed as under Contain).
+            if letterboxed {
+                p.push(letterbox_pad(ow, oh, clear_bars));
+            }
+        } else if (tf.scale - 1.0).abs() > 1e-9 && order == FitOrder::Fitted {
+            let zoom = zoom_scale(&tf.scale.to_string(), false, tf.scale < TINY_SCALE, false, sf);
+            if !zoom_last {
+                p.push(zoom);
+            } else if placement.is_none() {
+                late_zoom = Some(zoom);
+            }
         }
     }
     p.push("setsar=1".to_string());
@@ -10975,6 +11126,7 @@ fn still_clip_chain(
         label_bt709,
         Some("bf0"),
         StillBlend::default(),
+        None,
         None,
     )
 }
@@ -11343,6 +11495,11 @@ pub fn grade_filter_chain(grade: &Grade, frame_matrix: Option<&str>) -> Vec<Stri
     grade_filters(grade, frame_matrix)
 }
 
+/// A still whose picture moves (keyed zoom, position, crop) drawn in one sub-pixel resample of a
+/// copy scaled once.
+mod still_motion;
+use still_motion::StillMotion;
+
 /// The still inside a fade, a dip, a dissolve, a slide or a push: its layers and their fades.
 mod still_fx;
 use still_fx::{still_layers, StillFades};
@@ -11473,6 +11630,11 @@ mod grade_rendered;
 /// Scene detection and contact sheets on a proxy against the original (`#[ignore]`d).
 #[cfg(test)]
 mod scenes_on_proxy;
+
+/// A 45 MP still with a slow keyed zoom, pan and crop, measured sub-pixel per output frame at
+/// 1080p50 and 2160p50, against time (`#[ignore]`d).
+#[cfg(test)]
+mod still_motion_rendered;
 
 #[cfg(test)]
 mod tests {
@@ -13341,6 +13503,62 @@ mod tests {
         assert_eq!(told, [Some("waiting for the preview proxy")]);
         release_tx.send(()).unwrap();
         proxy.join().unwrap();
+    }
+
+    /// The run that has stopped moving is stopped even while it goes on printing blocks (FFmpeg 7+
+    /// prints one every `-stats_period` whatever its graph does: the same frame, over and over), and
+    /// the error says where it was stuck; the run that moves slowly (a frame every 0.4 s against a
+    /// 1 s bound, the same block printed between) is never stopped. No ffmpeg needed.
+    #[cfg(unix)]
+    #[test]
+    fn a_run_that_stops_moving_is_stopped_and_a_slow_one_that_moves_is_not() {
+        use std::os::unix::fs::PermissionsExt;
+        let _serial = cpu::test_lock();
+        let dir = Scratch::new("stalls-like-ffmpeg");
+        let run = |name: &str, body: &str| {
+            let script = dir.join(name);
+            std::fs::write(&script, format!("#!/bin/sh\n{body}")).unwrap();
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let bar = Bar {
+                total: 10.0,
+                offset: 0.0,
+                width: 1.0,
+                start: Instant::now(),
+            };
+            let started = Instant::now();
+            let ran = run_progress_stalling(
+                script.to_str().unwrap(),
+                &[],
+                &[],
+                Path::new("/nonexistent/out.mp4"),
+                bar,
+                cpu::Resource::Cpu,
+                &mut |_| {},
+                &|| false,
+                &mut 0,
+                std::time::Duration::from_secs(1),
+            );
+            (ran, started.elapsed())
+        };
+        // Stuck at frame 12 (0.48 s written), saying so five times a second for 30 s.
+        let (ran, took) = run(
+            "stuck.sh",
+            "printf 'frame=12\\nout_time_us=480000\\nprogress=continue\\n'\n\
+             for i in $(seq 150); do printf 'frame=12\\nout_time_us=480000\\nprogress=continue\\n'; sleep 0.2; done\n",
+        );
+        let why = ran.unwrap_err().to_string();
+        assert!(took < std::time::Duration::from_secs(10), "stopped after {took:?}");
+        assert!(why.contains("stuck at frame 12, 0.48 s of output"), "{why}");
+        // A frame every 0.4 s, 3 s in all, with a repeated block between each: slow, but moving.
+        let (ran, _) = run(
+            "slow.sh",
+            "for n in 1 2 3 4 5 6 7; do\n\
+               printf \"frame=$n\\nout_time_us=${n}00000\\nprogress=continue\\n\"; sleep 0.2\n\
+               printf \"frame=$n\\nout_time_us=${n}00000\\nprogress=continue\\n\"; sleep 0.2\n\
+             done\n\
+             printf 'frame=8\\nout_time_us=800000\\nprogress=end\\n'\n",
+        );
+        assert_eq!(ran.unwrap(), RenderStatus::Completed);
     }
 
     /// A child that talks like `ffmpeg -progress` — a block with no output position yet (it is
@@ -15479,7 +15697,8 @@ mod tests {
         assert!((times[1] - 2.5).abs() < 1e-9);
         assert!((times[15] - 37.5).abs() < 1e-9);
         // Seek/limit to the window, sample with fps, scale cells, tile to one sheet.
-        assert!(joined.contains("-ss 0.000"));
+        // A sheet from the start does not seek: on a JPEG still any `-ss` decodes nothing.
+        assert!(!joined.contains("-ss"), "{joined}");
         assert!(joined.contains("-t 40.000"));
         assert!(joined.contains("fps=0.4")); // 16 / 40
         assert!(joined.contains("scale=240:-2"));
@@ -17518,7 +17737,7 @@ mod tests {
     }
 
     #[test]
-    fn a_still_image_is_looped_not_seeked() {
+    fn a_still_image_is_decoded_once_and_held_not_seeked() {
         let asset = img_asset(Uuid::new_v4());
         // A full-length still placed deep in the timeline (t=12) — a non-image
         // clip there would gain an `-ss`; a still must not.
@@ -17529,19 +17748,23 @@ mod tests {
             !args.contains(&"-ss".to_string()),
             "a still is looped, never seeked: {args:?}"
         );
-        let loop_pos = args.iter().position(|a| a == "-loop").expect("a -loop flag");
-        assert_eq!(args[loop_pos + 1], "1");
+        // One frame decoded, not `-loop 1` decoding the file again for every frame.
+        assert!(
+            !args.contains(&"-loop".to_string()) && !args.contains(&"-t".to_string()),
+            "{args:?}"
+        );
         assert!(
             args.contains(&"-framerate".to_string()),
-            "the looped still gets an input framerate"
+            "the held still gets an input framerate"
         );
-        // `-t` bounds how long the looped still is read: its source window end and the read past
-        // it (`picture_window`: a still's rate is unknown, a tenth of a second, and an output frame).
-        assert_eq!(flag_val(&args, "-t"), Some("5.133333333333333"));
         let i_pos = args.iter().position(|a| a == "-i").unwrap();
         assert_eq!(args[i_pos + 1], "/media/title.png");
-        // No seek to subtract, so the trim window stays absolute, positioned at t=12.
+        // The chain holds it for as long as its trim reads: its source window end and the read past
+        // it (`picture_window`: a still's rate is unknown, a tenth of a second, and an output frame),
+        // 5.1333 s at 30 fps, the 154 pictures `-loop 1 -t` gave.
         let filter = flag_val(&args, "-filter_complex").unwrap();
+        assert!(filter.contains("[0:v]loop=loop=153:size=1,trim="), "{filter}");
+        // No seek to subtract, so the trim window stays absolute, positioned at t=12.
         assert!(filter.contains("trim=start=0:end=5"), "{filter}");
         assert!(filter.contains("+12/TB"), "still composited at its timeline start: {filter}");
     }
@@ -17554,12 +17777,9 @@ mod tests {
         let timeline = single(vec![make_clip(asset.id, 1.0, 4.0, 0.0)]);
         let args = build_export_args(&timeline, &[asset], "/out/x.mp4", &ExportOptions::default()).unwrap();
         assert!(!args.contains(&"-ss".to_string()));
-        assert_eq!(
-            flag_val(&args, "-t"),
-            Some("4.133333333333333"),
-            "read the looped still past source_out"
-        );
         let filter = flag_val(&args, "-filter_complex").unwrap();
+        // Held past source_out: 4.1333 s at 30 fps.
+        assert!(filter.contains("loop=loop=123:size=1,"), "{filter}");
         assert!(filter.contains("trim=start=1:end=4"), "absolute, not seek-relative: {filter}");
     }
 

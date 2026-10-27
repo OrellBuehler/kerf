@@ -481,6 +481,10 @@ pub struct Animated {
     /// picture through its window with a `perspective` (bilinear, fixed-point), which no
     /// compositor pass draws, so every frame of it is refused.
     pub crop: bool,
+    /// A still image whose picture moves ([`Clip::picture_moves`]): the export and the FFmpeg still
+    /// draw its fit, zoom, position and crop in one `perspective` of a copy of the still scaled once
+    /// (`engine::cli::still_motion`), which no compositor pass draws, so it is refused.
+    pub still_motion: bool,
     /// The zoom or the position moves ([`Clip::placement_animated`]): the export, the playback stream
     /// and the FFmpeg still place the picture on the canvas with a `perspective` at sub-pixel
     /// positions, which no compositor pass draws, so every frame of it is refused.
@@ -1385,6 +1389,9 @@ impl RenderPlan {
             }
             if layer.animated.is_some_and(|a| a.crop) {
                 out.push(Unsupported::KeyedCrop(at()));
+            }
+            if layer.animated.is_some_and(|a| a.still_motion) {
+                out.push(Unsupported::StillMotion(at()));
             }
             if layer.animated.is_some_and(|a| a.places) && !caps.placement {
                 out.push(Unsupported::KeyedPlacement(at()));

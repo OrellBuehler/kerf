@@ -323,6 +323,7 @@ impl Planner {
                         color: clip.color_animated(),
                         mask: clip.mask_animated(),
                         crop: clip.crop_animated(),
+                        still_motion: clip.picture_moves() && facts.get(&clip.asset_id).is_some_and(|a| a.is_image),
                         places: clip.placement_animated(),
                     },
                 ),

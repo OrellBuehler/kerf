@@ -26,7 +26,7 @@ Most rules in these files exist because a bug already happened. They record *why
 
 | File | Covers |
 | --- | --- |
-| `.claude/docs/engine-cli.md` | `engine/cli.rs`: probe, proxies (head pad, sidecars), HW encode/decode, `cpu.rs` budget, export graph, master bus, levels, masks, keyframe expressions, keyed zoom order, 360/v360, Insta360 stitch, stills, playback stream, rotation, HDR tone-map, per-property channel graph (keyed colour / volume), grade (curves / LUTs / wheels), scopes, loudness and true-peak limiter, constant-power crossfades |
+| `.claude/docs/engine-cli.md` | `engine/cli.rs`: probe, proxies (head pad, sidecars), HW encode/decode, `cpu.rs` budget, export graph, stills (decoded once, moving stills), master bus, levels, masks, keyframe expressions, keyed zoom order, 360/v360, Insta360 stitch, stills, playback stream, rotation, HDR tone-map, per-property channel graph (keyed colour / volume), grade (curves / LUTs / wheels), scopes, loudness and true-peak limiter, constant-power crossfades |
 | `.claude/docs/engine-media.md` | `peaks.rs` waveforms, `filmstrip.rs`, libav backend, whisper transcription (word timings, VAD, speakers), audio sync, Kokoro TTS voiceover, optional cargo features |
 | `.claude/docs/core-model.md` | `model.rs`: clips, easing, transitions, captions, caption import, beats, diff, ripple, edit modes, per-property keyframe channels, markers / chapters, timecode, OTIO / EDL interchange, hostile-input tests |
 | `.claude/docs/core-links.md` | Linked A/V: detach/reattach, carried edits, sync lock, `run_edit`, the links corpus |
