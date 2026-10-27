@@ -1715,6 +1715,7 @@ mod tests {
             dip_white: true,
             keyed_opacity: true,
             keyed_zoom: true,
+            placement: false,
             keyed_color: true,
             mask: true,
             text: true,
@@ -1931,6 +1932,7 @@ mod tests {
             dip_white: true,
             keyed_opacity: true,
             keyed_zoom: true,
+            placement: false,
             keyed_color: true,
             mask: true,
             text: true,
@@ -2008,8 +2010,8 @@ mod tests {
             Unsupported::KeyedZoom(_)
         )));
         // A zoom or a position that moves is placed at sub-pixel positions by a `perspective` in the
-        // export, which no compositor draws, whatever its caps; a still is the scrubbed still's
-        // chain, and a position that holds is placed as ever.
+        // export and the still, which no compositor draws, whatever its caps; a position that holds
+        // is placed as ever.
         let placement = |u: &Unsupported| matches!(u, Unsupported::KeyedPlacement(_));
         let all = GpuCaps {
             keyed_zoom: true,
@@ -2021,7 +2023,7 @@ mod tests {
         drifting.keyframes = vec![keyed(0.0, 1.0, -0.2), keyed(2.0, 1.0, 0.2)];
         for (keys, mode, refused) in [
             (drifting.keyframes.clone(), PlanMode::Motion, true),
-            (drifting.keyframes.clone(), PlanMode::Still, false),
+            (drifting.keyframes.clone(), PlanMode::Still, true),
             (vec![keyed(0.0, 1.0, 0.2), keyed(2.0, 1.0, 0.2)], PlanMode::Motion, false),
         ] {
             let mut clip = drifting.clone();
@@ -2419,6 +2421,7 @@ mod tests {
             dip_white: true,
             keyed_opacity: true,
             keyed_zoom: true,
+            placement: false,
             keyed_color: true,
             mask: true,
             text: true,

@@ -481,10 +481,9 @@ pub struct Animated {
     /// picture through its window with a `perspective` (bilinear, fixed-point), which no
     /// compositor pass draws, so every frame of it is refused.
     pub crop: bool,
-    /// The zoom or the position moves ([`Clip::placement_animated`]): the export (and the playback
-    /// stream) places the picture on the canvas with a `perspective` at sub-pixel positions, which no
-    /// compositor pass draws, so every export frame of it is refused. A still is the scrubbed
-    /// still's chain, a `scale` and an `overlay` at the sampled pose, and is drawn as ever.
+    /// The zoom or the position moves ([`Clip::placement_animated`]): the export, the playback stream
+    /// and the FFmpeg still place the picture on the canvas with a `perspective` at sub-pixel
+    /// positions, which no compositor pass draws, so every frame of it is refused.
     pub places: bool,
 }
 
@@ -1387,7 +1386,7 @@ impl RenderPlan {
             if layer.animated.is_some_and(|a| a.crop) {
                 out.push(Unsupported::KeyedCrop(at()));
             }
-            if self.mode == PlanMode::Motion && layer.animated.is_some_and(|a| a.places) {
+            if layer.animated.is_some_and(|a| a.places) && !caps.placement {
                 out.push(Unsupported::KeyedPlacement(at()));
             }
             // The graph fits and zooms in one `scale` from the source; the compositor's geometry (and
@@ -2670,6 +2669,8 @@ mod tests {
         let caps = GpuCaps {
             mask: true,
             keyed_zoom: true,
+            // (What is ahead of a moving zoom, judged as if its placement were drawn.)
+            placement: true,
             fades: true,
             effects: EffectKinds::BLUR
                 .union(EffectKinds::SHARPEN)
@@ -3178,6 +3179,8 @@ mod tests {
                 .union(EffectKinds::GRAYSCALE)
                 .union(EffectKinds::INVERT),
             keyed_zoom: true,
+            // (What is ahead of a moving zoom, judged as if its placement were drawn.)
+            placement: true,
             ..GpuCaps::A0
         };
         let sharp = |amount: f64| VideoEffect::Sharpen { amount };
@@ -3275,6 +3278,8 @@ mod tests {
         let caps = GpuCaps {
             effects: EffectKinds::SHARPEN.union(EffectKinds::BLUR).union(EffectKinds::INVERT),
             keyed_zoom: true,
+            // (What is ahead of a moving zoom, judged as if its placement were drawn.)
+            placement: true,
             ..GpuCaps::A0
         };
         let grade = |brightness: f64, contrast: f64, saturation: f64, gamma: f64, temperature: f64| Color {

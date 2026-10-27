@@ -1786,7 +1786,7 @@ const STRUCTURAL: [&str; 48] = [
     "time-negative",
     "zoom-keyed",
     "zoom-keyed-constant",
-    "still-zoom-last",
+    "still-placed",
     "alpha-source",
     "placed",
     "preview-placed",
@@ -1833,16 +1833,18 @@ fn expected(table: &[(&str, &str)]) -> Vec<String> {
     f
 }
 
-/// Whether a clip chain of the still graph **ends** in the zoom (`scale=iw*S:ih*S`): only a
-/// moving zoom is run last, every other clip zooms first and ends on `setsar` or later.
-fn still_zoom_last(still: &str) -> bool {
-    still.split(';').any(|segment| {
+/// Whether a clip chain of the still graph **ends** in the placement's cut to the canvas (`crop` at
+/// `x='2*floor((iw-`): a clip whose zoom or position moves is placed as the export places it.
+fn still_placed(still: &str) -> bool {
+    split_unquoted(still, ';').into_iter().any(|segment| {
         let Some((head, label)) = segment.trim_end().rsplit_once('[') else {
             return false;
         };
         label.starts_with('v')
             && label.ends_with(']')
-            && head.rsplit(',').next().is_some_and(|last| last.starts_with("scale=iw*"))
+            && filters(head)
+                .last()
+                .is_some_and(|last| last.starts_with("crop=w=") && last.contains(":x='2*floor((iw-"))
     })
 }
 
@@ -2068,7 +2070,7 @@ fn families(c: &Case, assets: &[Asset], text: &[String; 3], table: &[(&str, &str
         // the chain it always had, so both are covered.
         (clips().any(Clip::zoom_animated), "zoom-keyed"),
         (clips().any(|k| k.is_animated() && !k.zoom_animated()), "zoom-keyed-constant"),
-        (still_zoom_last(&flat[1]), "still-zoom-last"),
+        (still_placed(&flat[1]), "still-placed"),
         // Per-property channels: a transform with some numbers keyed and the rest static, a
         // number taken off the legacy bundle (keyed on its own, or held static), and a clip
         // that is animated in colour alone (its picture is placed as a static one).

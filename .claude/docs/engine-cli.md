@@ -1087,8 +1087,12 @@ so the feature is **only** activated through these forwards — which is what ma
   `a_slow_zoom_and_pan_moves_by_fractions_of_a_pixel`, which fails on the old chain); about the cost of
   the old chain at 1080p. Bilinear: a strong zoom out aliases more than swscale's filter did, and a
   zoom in is upsampled from the fit size as before (the source's detail past the fit is not used). A
-  picture under a pixel is drawn at its own size (no 1 px floor); the scrubbed still is unchanged
-  (one frame cannot step) and within a pixel of the export. A held zoom or position keeps its graph.
+  picture under a pixel is drawn at its own size (no 1 px floor). A fade on a chain with no alpha plane
+  gets `format=<pix_fmt>` ahead of the placement, so it does not negotiate into the `yuva420p` after it
+  (where black is 0). **The scrubbed still runs the same placement** (`placement_chain` with the
+  sampled zoom, position and travel, no `eval=frame`; `still_clip_chain_graded(.., placement)`), so it
+  is the export's frame (`still_rendered.rs`'s dissolve into a zoom, 1 level). The shared builder is
+  `placement_chain`. A held zoom or position keeps its graph.
   **Per-property channels in the graph.** A clip's transform is built number by number from
   `Clip::is_keyed`, not from "is it animated": `video_clip_chain` writes a keyed scale as the
   `scale eval=frame` (last, when it moves), a keyed rotation as the `black@0`-filled `rotate`, a keyed

@@ -819,8 +819,6 @@ fn check(dir: &Path, case: &Case) -> Worst {
                     );
                 }
                 (None, None) => {}
-                // The still keeps a picture under a pixel at one (4:2:0: two).
-                (None, Some(s)) if clip.placement_animated() && s.x1 - s.x0 <= 2.0 && s.y1 - s.y0 <= 2.0 => {}
                 (g, s) => panic!("{at}: the export's picture is {g:?}, the still's {s:?}"),
             }
             if case.blue {

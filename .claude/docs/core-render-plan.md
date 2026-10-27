@@ -329,9 +329,9 @@
   export *and* the FFmpeg still read the picture through its window with `perspective` (fixed-point, bilinear),
   which no compositor pass draws, and the layer's transform keeps only the static crop. `Animated.mask` /
   `Animated.crop` say so. A **moving zoom or position** (`Animated.places`, `Clip::placement_animated`) is refused in
-  a Motion plan whatever the caps (`Unsupported::KeyedPlacement`): the export places the picture with a per-frame
-  `perspective` at sub-pixel positions (`engine-cli.md`), which no compositor pass draws; a still plan is the scrubbed
-  still's chain (`scale` and `overlay` at the sampled pose) and is judged as before. `Animated` is `Some` for a
+  both modes (`Unsupported::KeyedPlacement`) unless `GpuCaps::placement`, which no compositor sets: the export and the
+  FFmpeg still place the picture with a `perspective` at sub-pixel positions (`engine-cli.md`). Tests that judge what
+  is ahead of a moving zoom set the cap. `Animated` is `Some` for a
   keyed transform, colour, mask or crop and `Animated.keys` (`layer_geometry::Keyed {scale, rotation, rotates,
   opacity}`) says which transform numbers are keyed, because a clip keyed in part is not built like one
   keyed in full: a keyed zoom is a second `scale` even at 1, an unkeyed one is the static scale (a second

@@ -8464,16 +8464,9 @@ fn perspective_time(rate: Rational, first: i64) -> String {
 /// A per-frame `scale` makes whole-pixel sizes and the overlay's `x`/`y` truncate to even
 /// pixels in 4:2:0, so a slow zoom-pan (a still at 1.10 to 1.17 over 3.5 s) moved in irregular
 /// one- and two-pixel steps. Here every frame is a fixed lookup (`perspective`, `eval=frame`,
-/// as a keyed crop is drawn) and the size never changes.
-///
-/// The picture is padded with transparency (`black@0`), centred, to at least the canvas and two
-/// pixels past itself on every side, so what `perspective` reads past the picture (it clamps to
-/// the edge) is transparent; it is then cut to the canvas round the same centre. Both offsets are
-/// even whole numbers (`2*ceil(..)`, `2*floor(..)`), so neither `pad` nor `crop` rounds them, and
-/// `perspective` (which knows only its own frame size) computes the same window. Its corners map
-/// pixel centres: canvas pixel `X` reads the picture at `(X + 0.5 - cx) / s + w/2 - 0.5`, the
-/// centre `cx` being the frame's centre plus the position (and a slide / push's travel).
-/// `alpha`: the chain already has an alpha plane, so it needs no `format=yuva420p` first.
+/// as a keyed crop is drawn) and the size never changes. The keyed numbers are curves over the
+/// time of the frame `perspective` counts ([`perspective_time`]); the travel of a slide or push
+/// is added to the position. `alpha`: the chain already has an alpha plane.
 fn placement_filters(clip: &Clip, fx: &ClipFx, fmt: &ExportFormat, alpha: bool, rate: Rational, first: i64) -> Vec<String> {
     let t = perspective_time(rate, first);
     let start = clip.timeline_start;
@@ -8487,18 +8480,32 @@ fn placement_filters(clip: &Clip, fx: &ClipFx, fmt: &ExportFormat, alpha: bool, 
         px = format!("({px})+({})", curve(&keys.x));
         py = format!("({py})+({})", curve(&keys.y));
     }
-    let (cw, ch) = (fmt.width, fmt.height);
+    placement_chain(scale.as_deref(), (&px, &py), (fmt.width, fmt.height), alpha, true)
+}
+
+/// The filters of a placement ([`placement_filters`]; the scrubbed still's, with the numbers of its
+/// moment): the picture zoomed by `scale` (`None`: not at all) about its centre, moved to the
+/// canvas' centre plus `pos` (in canvas widths and heights), on a `canvas`-sized `yuva420p` frame.
+///
+/// The picture is padded with transparency (`black@0`), centred, to at least the canvas and two
+/// pixels past itself on every side, so what `perspective` reads past the picture (it clamps to
+/// the edge) is transparent; it is then cut to the canvas round the same centre. Both offsets are
+/// even whole numbers (`2*ceil(..)`, `2*floor(..)`), so neither `pad` nor `crop` rounds them, and
+/// `perspective` (which knows only its own frame size) computes the same window. Its corners map
+/// pixel centres: canvas pixel `X` reads the picture at `(X + 0.5 - cx) / s + w/2 - 0.5`.
+fn placement_chain(scale: Option<&str>, pos: (&str, &str), canvas: (u32, u32), alpha: bool, per_frame: bool) -> Vec<String> {
+    let (cw, ch) = canvas;
     // One axis: the picture position its output pixel `edge` (`0` or the frame's `W` / `H`) reads.
     let corner = |edge: &str, dim: &str, canvas: u32, pos: &str| {
         let centre = format!("{}+({pos})*{canvas}", fnum(f64::from(canvas) / 2.0));
         let off = format!("{edge}+0.5-2*floor(({dim}-{canvas})/4)-({centre})");
-        match &scale {
+        match scale {
             Some(s) => format!("({off})/({s})+{dim}/2-0.5"),
             None => format!("{off}+{dim}/2-0.5"),
         }
     };
-    let (x0, x1) = (corner("0", "W", cw, &px), corner("W", "W", cw, &px));
-    let (y0, y1) = (corner("0", "H", ch, &py), corner("H", "H", ch, &py));
+    let (x0, x1) = (corner("0", "W", cw, pos.0), corner("W", "W", cw, pos.0));
+    let (y0, y1) = (corner("0", "H", ch, pos.1), corner("H", "H", ch, pos.1));
     let mut p = Vec::new();
     if !alpha {
         p.push("format=yuva420p".to_string());
@@ -8510,7 +8517,8 @@ fn placement_filters(clip: &Clip, fx: &ClipFx, fmt: &ExportFormat, alpha: bool, 
         ),
         format!(
             "perspective=x0='{x0}':y0='{y0}':x1='{x1}':y1='{y0}':x2='{x0}':y2='{y1}':x3='{x1}':y3='{y1}':\
-             interpolation=linear:eval=frame"
+             interpolation=linear{}",
+            if per_frame { ":eval=frame" } else { "" }
         ),
         format!("crop=w={cw}:h={ch}:x='2*floor((iw-{cw})/4)':y='2*floor((ih-{ch})/4)'"),
     ]);
@@ -9897,7 +9905,12 @@ fn video_clip_chain_stamped(
     }
     if placed {
         // After `fps` (output frames) and after every filter that acts on the picture at its fit
-        // size; it ends in `yuva420p`, the format `overlay` takes, at the canvas' size.
+        // size; it ends in `yuva420p`, the format `overlay` takes, at the canvas' size. A fade on a
+        // chain with no alpha plane runs in the delivery's own format, as the terminal one keeps it
+        // (left to negotiation it would run in the `yuva420p` that follows, where black is 0).
+        if !needs_alpha && !fx.alpha && !timing.fades().is_empty() {
+            p.push(format!("format={}", fmt.pix_fmt));
+        }
         p.extend(placement_filters(clip, fx, fmt, needs_alpha, crop_rate, crop_first));
     } else if fx.alpha && !needs_alpha {
         // A source with an alpha channel keeps it to the overlay: the terminal pixel
@@ -10672,10 +10685,20 @@ fn build_still_args_rendered(
                     blended: !clip.blend_mode.is_normal(),
                     tone_mapped: hdr.is_some(),
                 },
+                clip.placement_animated().then(|| {
+                    (
+                        clip.zoom_animated().then_some(tf.scale),
+                        (tf.pos_x + layer.motion.0, tf.pos_y + layer.motion.1),
+                    )
+                }),
             )
         ));
         let out = format!("ov{n}");
-        let overlay = still_overlay(&tf, layer.motion);
+        let overlay = if clip.placement_animated() {
+            still_overlay(&Transform::default(), (0.0, 0.0))
+        } else {
+            still_overlay(&tf, layer.motion)
+        };
         match clip.blend_mode.ffmpeg() {
             None => chains.push(format!("[{cur}][v{n}]{overlay}[{out}]")),
             Some(mode) => {
@@ -10761,6 +10784,11 @@ struct StillCanvas {
 ///
 /// `blend` is what a blend mode changes in the chain, as in `video_clip_chain`: transparent letterbox bars
 /// ([`keeps_clear_bars`]) and rotated corners ([`static_rotate`]).
+///
+/// `placement` is a clip whose zoom or position moves ([`Clip::placement_animated`]): the zoom that
+/// moves (`None` when only the position does) and the position with any travel, at this moment. The
+/// chain then ends in the export's placement ([`placement_chain`], with these numbers), and the
+/// overlay puts its canvas-sized frame at the origin.
 #[allow(clippy::too_many_arguments)]
 fn still_clip_chain_graded(
     tf: &Transform,
@@ -10778,6 +10806,7 @@ fn still_clip_chain_graded(
     label_bt709: bool,
     blur_label: Option<&str>,
     blend: StillBlend,
+    placement: Option<(Option<f64>, (f64, f64))>,
 ) -> String {
     let StillCanvas { w: ow, h: oh, fit, sf } = canvas;
     let (ow, oh, fit) = (*ow, *oh, *fit);
@@ -10852,10 +10881,10 @@ fn still_clip_chain_graded(
         }
     } else if (tf.scale - 1.0).abs() > 1e-9 && order == FitOrder::Fitted {
         let zoom = zoom_scale(&tf.scale.to_string(), false, tf.scale < TINY_SCALE, false, sf);
-        if zoom_last {
-            late_zoom = Some(zoom);
-        } else {
+        if !zoom_last {
             p.push(zoom);
+        } else if placement.is_none() {
+            late_zoom = Some(zoom);
         }
     }
     p.push("setsar=1".to_string());
@@ -10890,6 +10919,16 @@ fn still_clip_chain_graded(
         p.push(format!("format={}", fades.terminal_format()));
     }
     p.extend(late_zoom);
+    if let Some((zoom, (px, py))) = placement {
+        let zoom = zoom.map(fnum);
+        p.extend(placement_chain(
+            zoom.as_deref(),
+            (&fnum(px), &fnum(py)),
+            (ow, oh),
+            needs_alpha,
+            false,
+        ));
+    }
     p.join(",")
 }
 
@@ -10934,6 +10973,7 @@ fn still_clip_chain(
         label_bt709,
         Some("bf0"),
         StillBlend::default(),
+        None,
     )
 }
 
@@ -14599,11 +14639,18 @@ mod tests {
             let graph = &args[args.iter().position(|a| a == "-filter_complex").unwrap() + 1];
             graph.split(';').find(|c| c.ends_with("[v0]")).unwrap().to_string()
         };
-        // 0.5 to 1.5 over two seconds is 1.25 at 1.5 s.
+        // 0.5 to 1.5 over two seconds is 1.25 at 1.5 s: the export's placement, at that zoom.
         let moving = chain_of(blurred(0.5, 1.5));
-        assert!(moving.ends_with(",scale=iw*1.25:ih*1.25[v0]"), "{moving}");
         assert!(
-            moving.find("gblur=").unwrap() < moving.find("scale=iw*1.25").unwrap(),
+            moving.ends_with(",crop=w=640:h=360:x='2*floor((iw-640)/4)':y='2*floor((ih-360)/4)'[v0]"),
+            "{moving}"
+        );
+        assert!(
+            moving.contains(")/(1.25)+W/2-0.5'") && !moving.contains("iw*1.25"),
+            "{moving}"
+        );
+        assert!(
+            moving.find("gblur=").unwrap() < moving.find("perspective=").unwrap(),
             "{moving}"
         );
         // Held at 1.25 the whole way: zoom first, as ever, and a zoom in under Contain is the fit's own scale.
@@ -15394,7 +15441,7 @@ mod tests {
         tl.tracks[0].clips[1].keyframes = vec![key(0.0, 0.5), key(2.0, 1.0)];
         let graph = still_args_at(&tl, &assets, 10.5).join(" ");
         let chain = graph.split("[v1]").next().unwrap().rsplit(';').next().unwrap().to_string();
-        let (fade, zoom) = (chain.find("fade=").unwrap(), chain.rfind("scale=iw*").unwrap());
+        let (fade, zoom) = (chain.find("fade=").unwrap(), chain.rfind("perspective=").unwrap());
         assert!(fade < zoom, "{chain}");
         assert!(!chain.contains("format=yuv420p"), "{chain}");
     }

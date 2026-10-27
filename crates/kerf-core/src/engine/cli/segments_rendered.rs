@@ -292,7 +292,8 @@ fn fixture(tag: &str) -> Fixture {
 fn render_whole(fx: &Fixture, opts: &ExportOptions, out: &Path) {
     let args = build_export_args(&fx.timeline, &fx.assets, out.to_str().unwrap(), opts).unwrap();
     let mut args = args;
-    externalize_filter_complex(&mut args, "whole").unwrap();
+    // (The script lives as long as its guard: dropped at once, it was gone before ffmpeg read it.)
+    let _script = externalize_filter_complex(&mut args, "whole").unwrap();
     run_ok(&args);
 }
 
