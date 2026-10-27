@@ -45,9 +45,14 @@ fn scratch() -> PathBuf {
     dir
 }
 
+/// Held while a shared input is made: the tests run in parallel, and on Windows a second `rename`
+/// onto the file another test has just made (and may be reading) is refused.
+static MAKING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// The 45 MP still (made once, kept across runs: it takes several seconds).
 fn still(dir: &Path) -> Asset {
     let path = dir.join("still-8192x5464-grain.jpg");
+    let _making = MAKING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if !path.exists() {
         let [x0, y0, x1, y1] = BOX_PX;
         let tmp = dir.join("still-tmp.jpg");
@@ -369,6 +374,7 @@ fn a_45mp_jpeg_still_gives_a_frame_and_a_contact_sheet() {
 /// A Canon-like 4K DCI 10-bit 4:2:2 HEVC clip at 100 fps with sound (`secs` long, made once).
 fn canon_like(dir: &Path, secs: u32) -> Asset {
     let path = dir.join(format!("canon-like-{secs}.mp4"));
+    let _making = MAKING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     if !path.exists() {
         let tmp = dir.join("canon-like-tmp.mp4");
         let made = command(&ffmpeg_bin())
