@@ -32,7 +32,7 @@ import type {
 	TagFilter,
 	TranscriptionStatus
 } from './types';
-import { autoSteps, counterKind, kindInfo, kindOfStage, missingSteps, stepCounter, stepWords, type StepCounter } from './analysis-steps';
+import { autoSteps, counterKind, joinsRun, kindInfo, kindOfStage, missingSteps, stepCounter, stepWords, type StepCounter } from './analysis-steps';
 import { mediaStatus } from './media-status.svelte';
 import { isLevelsCancelled, measureRange, type MeasureStamp } from './levels-view';
 import type { ExportDraft } from './export-draft';
@@ -594,12 +594,37 @@ class EditorUi {
 		}
 	}
 
+	/** The analysis pass in flight, if any: what it was asked for and when it ends. A pass is one at a time — it is
+	 *  ffmpeg-bound, the flags below (`analyzing`, `analyzingId`, the stage) are a single set, and the backend's stop
+	 *  is a single one — so a second request for the same footage joins it and any other waits its turn. */
+	#analysisRun: { assetId: string; steps: readonly AnalysisKind[] | undefined; done: Promise<boolean> } | null = null;
+
 	/** Analyze an asset, flagging `analyzing` while kerf-core works and following
 	 *  the streamed step reports. `steps` names the kinds to run (only those, merged into what
 	 *  is cached); without it the backend runs what Settings leaves switched on. Resolves
 	 *  false when the pass was stopped; a step that failed is reported here, once, and the
-	 *  others still landed. */
-	async runAnalysis(assetId: string, steps?: readonly AnalysisKind[]): Promise<boolean> {
+	 *  others still landed. **One pass at a time**: asked again for the asset being analyzed — from the
+	 *  Inspector, the bin, a quick edit in the Agent panel — with kinds the pass in flight is already
+	 *  running, this joins it (one transcription, not two, and the flag is cleared when it ends, not
+	 *  by whichever of two passes ends first); for kinds it is not running, or another asset, it waits for
+	 *  that pass and then runs. */
+	runAnalysis(assetId: string, steps?: readonly AnalysisKind[]): Promise<boolean> {
+		const run = this.#analysisRun;
+		if (run) {
+			if (run.assetId === assetId && joinsRun(run.steps, steps)) return run.done;
+			return run.done.then(
+				() => this.runAnalysis(assetId, steps),
+				() => this.runAnalysis(assetId, steps)
+			);
+		}
+		const done = this.#analyze(assetId, steps).finally(() => {
+			if (this.#analysisRun?.done === done) this.#analysisRun = null;
+		});
+		this.#analysisRun = { assetId, steps, done };
+		return done;
+	}
+
+	async #analyze(assetId: string, steps?: readonly AnalysisKind[]): Promise<boolean> {
 		this.analyzing = true;
 		this.analyzingId = assetId;
 		this.analysisStage = null;
@@ -660,6 +685,8 @@ class EditorUi {
 	/** Make sure the `needed` kinds are done for an asset, running only the ones that are not —
 	 *  what a quick edit does before it reads the result. */
 	async ensureAnalysis(assetId: string, needed: readonly AnalysisKind[]): Promise<void> {
+		// A pass in flight may be about to do it (the Inspector's Analyze, the bin): let it end, then ask what is still missing.
+		while (this.#analysisRun) await this.#analysisRun.done.catch(() => {});
 		const missing = missingSteps(mediaStatus.analysis(assetId), needed);
 		if (missing.length > 0) await this.runAnalysis(assetId, missing);
 	}

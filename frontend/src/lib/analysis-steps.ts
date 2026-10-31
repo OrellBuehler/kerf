@@ -236,6 +236,14 @@ export function missingSteps(status: AnalysisStatus | null | undefined, needed: 
 	return needed.filter((kind) => stateOf(status, kind) !== 'done');
 }
 
+/** Whether a request to analyze `asked` joins the pass in flight, which is running `running` (`undefined`: what Settings
+ *  leaves switched on, a set only the backend knows). It does when everything asked is already part of that pass; a
+ *  pass of the default set is only known to answer the same default question. */
+export function joinsRun(running: readonly AnalysisKind[] | undefined, asked: readonly AnalysisKind[] | undefined): boolean {
+	if (running === undefined) return asked === undefined;
+	return asked !== undefined && asked.every((k) => running.includes(k));
+}
+
 /** The kinds the quick edits in the agent panel need analysed first. */
 export const QUICK_EDIT_STEPS = {
 	/** Remove silences / assemble a rough cut read the silent spans. */
