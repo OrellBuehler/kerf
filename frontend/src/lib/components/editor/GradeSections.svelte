@@ -22,20 +22,22 @@
 		NEUTRAL_WHEELS,
 		WHEEL_RANGES,
 		addPoint,
+		curveEdit,
 		curveShape,
 		curvesSummary,
 		evalShape,
+		gradeWith,
+		lutEdit,
 		lutName,
 		lutSummary,
 		movePoint,
 		nearestPoint,
-		normalizeCurve,
 		normalizeGrade,
 		normalizeWheel,
+		wheelEdit,
 		wheelHue,
 		wheelRgb,
 		wheelsSummary,
-		withChannel,
 		type CurveChannel,
 		type WheelRange
 	} from '#lib/grade';
@@ -45,7 +47,11 @@
 
 	const grade = $derived(normalizeGrade(clip.grade));
 
-	async function write(clipId: string, next: Grade) {
+	/** Writes `next` to the clip the edit began on. It is built (`gradeWith`, `curveEdit`, …) from that clip's
+	 *  grade in the timeline *when it lands*, never from `grade` above: a typed intensity is committed by the
+	 *  click that selects another clip, a curve's second click is waited for, and a file dialog is awaited. */
+	async function write(clipId: string, next: Grade | null) {
+		if (!next) return;
 		try {
 			await editor.setGrade(clipId, next);
 		} catch (e) {
@@ -66,13 +72,13 @@
 	const CHANNEL_LABEL: Record<CurveChannel, string> = { master: 'Master', red: 'Red', green: 'Green', blue: 'Blue' };
 
 	let channel = $state<CurveChannel>('master');
-	/** The points of `channel` while a gesture moves them; `null` between gestures. */
-	let draft = $state.raw<CurvePoint[] | null>(null);
+	/** The points of `channel` of clip `id` while a gesture moves them; `null` between gestures. */
+	let draft = $state.raw<{ id: string; points: CurvePoint[] } | null>(null);
 	let canvas = $state<HTMLCanvasElement | null>(null);
 
 	const stored = (ch: CurveChannel) => grade.curves?.[ch] ?? [];
 	const shown = (ch: CurveChannel) => {
-		const pts = ch === channel && draft ? draft : stored(ch);
+		const pts = ch === channel && draft?.id === clip.id ? draft.points : stored(ch);
 		return pts.length ? pts : IDENTITY_POINTS;
 	};
 
@@ -148,14 +154,9 @@
 		return { x: (e.clientX - r.left) / r.width, y: 1 - (e.clientY - r.top) / r.height };
 	}
 
-	const sameCurve = (a: readonly CurvePoint[], b: readonly CurvePoint[]) =>
-		JSON.stringify(normalizeCurve(a)) === JSON.stringify(normalizeCurve(b));
-
 	/** Writes the channel's points, unless they are what the clip already has. */
-	function writeCurve(clipId: string, ch: CurveChannel, points: CurvePoint[]) {
-		if (sameCurve(points, stored(ch))) return Promise.resolve();
-		return write(clipId, { ...grade, curves: withChannel(grade.curves, ch, normalizeCurve(points)) });
-	}
+	const writeCurve = (clipId: string, ch: CurveChannel, points: CurvePoint[]) =>
+		write(clipId, curveEdit(editor.timeline, clipId, ch, points));
 
 	/** A click that only added a point (or put the puck down) waits this long for the second click
 	 *  of a double-click, which undoes it, so a double-click writes no edit and its opposite. */
@@ -199,17 +200,17 @@
 			index = next.index;
 			added = true;
 		}
-		draft = points;
+		draft = { id: clipId, points };
 		let moved = false;
 		const target = e.currentTarget as HTMLElement;
 		beginDrag(e, {
 			move(ev) {
 				moved = true;
 				const r = target.getBoundingClientRect();
-				draft = movePoint(points, index, (ev.clientX - r.left) / r.width, 1 - (ev.clientY - r.top) / r.height);
+				draft = { id: clipId, points: movePoint(points, index, (ev.clientX - r.left) / r.width, 1 - (ev.clientY - r.top) / r.height) };
 			},
 			async commit() {
-				const done = draft ?? points;
+				const done = (draft?.id === clipId ? draft.points : null) ?? points;
 				if (!moved && added) {
 					const mine = draft;
 					defer(`curve:${ch}`, () => {
@@ -230,6 +231,7 @@
 
 	/** A double-click or a right-click on a point takes it out. */
 	function removeAt(e: MouseEvent) {
+		const clipId = clip.id;
 		const pts = shown(channel);
 		const p = at(e);
 		const i = nearestPoint(pts, p.x, p.y, HIT);
@@ -238,7 +240,7 @@
 		e.stopPropagation();
 		settle(`curve:${channel}`);
 		draft = null;
-		void writeCurve(clip.id, channel, pts.filter((_, j) => j !== i));
+		void writeCurve(clipId, channel, pts.filter((_, j) => j !== i));
 	}
 
 	// ---- wheels ----------------------------------------------------------------
@@ -246,15 +248,12 @@
 	const WHEEL = 84;
 	const RANGE_LABEL: Record<WheelRange, string> = { shadows: 'Shadows', midtones: 'Midtones', highlights: 'Highlights' };
 	const wheels = $derived(grade.wheels ?? NEUTRAL_WHEELS);
-	let puck = $state.raw<{ range: WheelRange; wheel: Wheel } | null>(null);
-	const wheelOf = (r: WheelRange) => (puck?.range === r ? puck.wheel : wheels[r]);
+	let puck = $state.raw<{ id: string; range: WheelRange; wheel: Wheel } | null>(null);
+	const wheelOf = (r: WheelRange) => (puck?.id === clip.id && puck.range === r ? puck.wheel : wheels[r]);
 
-	function writeWheel(clipId: string, range: WheelRange, wheel: Wheel) {
-		const next = normalizeWheel(wheel);
-		const now = normalizeWheel(wheels[range]);
-		if (next.x === now.x && next.y === now.y && next.lightness === now.lightness) return Promise.resolve();
-		return write(clipId, { ...grade, wheels: { ...wheels, [range]: normalizeWheel(wheel) } });
-	}
+	/** Writes what `change` sets of one wheel (the puck's place, the lightness) over the clip's own wheel. */
+	const writeWheel = (clipId: string, range: WheelRange, change: Partial<Wheel>) =>
+		write(clipId, wheelEdit(editor.timeline, clipId, range, change));
 
 	/** The hue disc: each pixel the direction `colorbalance` pushes at that puck position. */
 	function paintDisc(el: HTMLCanvasElement) {
@@ -291,7 +290,7 @@
 		const base = wheels[range];
 		const place = (ev: PointerEvent) => {
 			const p = wheelPoint(el, ev);
-			puck = { range, wheel: normalizeWheel({ ...base, x: p.x, y: p.y }) };
+			puck = { id: clipId, range, wheel: normalizeWheel({ ...base, x: p.x, y: p.y }) };
 		};
 		settle(`wheel:${range}`);
 		place(e);
@@ -302,17 +301,17 @@
 				place(ev);
 			},
 			async commit() {
-				const done = puck?.wheel ?? base;
+				const done = puck?.id === clipId ? puck.wheel : base;
 				if (!moved) {
 					const mine = puck;
 					defer(`wheel:${range}`, () => {
-						void writeWheel(clipId, range, done).then(() => {
+						void writeWheel(clipId, range, { x: done.x, y: done.y }).then(() => {
 							if (puck === mine) puck = null;
 						});
 					});
 					return;
 				}
-				await writeWheel(clipId, range, done);
+				await writeWheel(clipId, range, { x: done.x, y: done.y });
 				puck = null;
 			},
 			abandon() {
@@ -350,7 +349,7 @@
 		const clipId = clip.id;
 		const path = await pickLutFile();
 		if (!path) return;
-		await write(clipId, { ...grade, lut: { path, intensity: grade.lut?.intensity ?? 1 } });
+		await write(clipId, lutEdit(editor.timeline, clipId, (lut) => ({ path, intensity: lut?.intensity ?? 1 })));
 	}
 </script>
 
@@ -398,7 +397,7 @@
 				ondblclick={() => {
 					settle(`wheel:${range}`);
 					puck = null;
-					void writeWheel(clip.id, range, { ...wheels[range], x: 0, y: 0 });
+					void writeWheel(clip.id, range, { x: 0, y: 0 });
 				}}
 			>
 				<canvas
@@ -422,7 +421,7 @@
 					spec={{ min: -1, max: 1, step: 0.01, neutral: 0, digits: 2 }}
 					scope={clip.id}
 					disabled={editor.locked}
-					onCommit={(v, clipId) => writeWheel(clipId, range, { ...w, lightness: v })}
+					onCommit={(v, clipId) => writeWheel(clipId, range, { lightness: v })}
 				/>
 			</div>
 		</div>
@@ -434,7 +433,7 @@
 			pending={editor.locked}
 			disabled={!grade.wheels}
 			title="Back to neutral wheels"
-			onclick={() => write(clip.id, { ...grade, wheels: null })}>Reset</Btn
+			onclick={() => write(clip.id, gradeWith(editor.timeline, clip.id, () => ({ wheels: null })))}>Reset</Btn
 		>
 	</div>
 </InspectorSection>
@@ -455,12 +454,12 @@
 			spec={{ min: 0, max: 1, step: 0.01, neutral: 1, ...PERCENT }}
 			scope={clip.id}
 			disabled={editor.locked}
-			onCommit={(v, clipId) => write(clipId, { ...grade, lut: grade.lut ? { ...grade.lut, intensity: v } : null })}
+			onCommit={(v, clipId) => write(clipId, lutEdit(editor.timeline, clipId, (lut) => (lut ? { ...lut, intensity: v } : null)))}
 		/>
 	{/if}
 	<div style="display:flex;gap:6px;margin:6px 0">
 		<Btn size="sm" pending={editor.locked} title="Look the clip up through a .cube 3D LUT" onclick={chooseLut}>Choose LUT…</Btn>
-		<Btn variant="ghost" size="sm" pending={editor.locked} disabled={!grade.lut} title="Remove the LUT" onclick={() => write(clip.id, { ...grade, lut: null })}
+		<Btn variant="ghost" size="sm" pending={editor.locked} disabled={!grade.lut} title="Remove the LUT" onclick={() => write(clip.id, lutEdit(editor.timeline, clip.id, () => null))}
 			>Clear</Btn
 		>
 	</div>
