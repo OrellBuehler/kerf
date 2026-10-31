@@ -43,3 +43,48 @@ describe('the grade sections write to the clip an edit began on', () => {
 		expect(source).toMatch(/puck\?\.id === clip\.id/);
 	});
 });
+
+/** The text of one `function name(` up to the next function at the same indent (or the end of the file). */
+function body(source: string, name: string): string {
+	const at = source.search(new RegExp(`(?:async )?function ${name}\\(`));
+	expect(at, name).toBeGreaterThanOrEqual(0);
+	const rest = source.slice(at + 1);
+	const next = rest.search(/\n\t(?:async )?function /);
+	return next < 0 ? rest : rest.slice(0, next);
+}
+
+describe('the title text section commits to the title and text a field took focus on', () => {
+	const source = code(read(`${EDITOR}TextSection.svelte`));
+
+	test('every number field notes its scope on focus and what was typed on input and composition', () => {
+		const inputs = source.match(/<input\b[\s\S]*?\/>/g) ?? [];
+		expect(inputs.length).toBe(3);
+		for (const tag of inputs) {
+			const name = tag.replace(/\s+/g, ' ').slice(0, 60);
+			expect(tag, name).toContain('onfocus={(e) => noteFocus(e, t)}');
+			expect(tag, name).toContain('oninput={noteTyped}');
+			expect(tag, name).toContain('oncompositionend={noteTyped}');
+		}
+		expect(source).toContain('new FieldEdits<Edit, HTMLInputElement>()');
+	});
+
+	test('a blur-time commit reads the scope and the typed text, then the text as the cut has it, never `o` or the row’s `t`', () => {
+		for (const name of ['commitWidth', 'commitTiming']) {
+			const fn = body(source, name);
+			expect(fn, name).toContain('edits.end(el, ');
+			// The one place the field’s own state is read is the fallback of `edits.end`; after it, only `at` and `typed`.
+			const rest = fn.replace(/[^\n]*edits\.end\(el, [^\n]*\n/, '');
+			expect(rest, name).not.toMatch(/\bo\.id\b|\bo\.name\b|\bel\.value\b(?!\s*=[^=])/);
+			expect(rest, name).toContain('textAt(at)');
+		}
+		for (const name of ['commit', 'setAnimation']) expect(body(source, name), name).not.toMatch(/\bo\.id\b|\bo\.name\b/);
+		// What the number is checked against is the animation of the text it began on, not the row’s.
+		expect(body(source, 'commitTiming')).toContain('const current = was?.text.animation');
+	});
+
+	test('what the title is called and what the engine is told are read before the await', () => {
+		const convert = body(source, 'convert');
+		expect(convert.indexOf('const { id, name } = o')).toBeLessThan(convert.indexOf('await editor.convertTitleText'));
+		expect(convert).not.toMatch(/convertTitleText\(o\.id/);
+	});
+});

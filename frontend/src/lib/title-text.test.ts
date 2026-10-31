@@ -6,6 +6,7 @@ import {
 	HARNESS_NOTE,
 	setTitleTextAnimationIn,
 	setTitleTextBoxIn,
+	titleTextAt,
 	titleTexts,
 	withTextAnimation,
 	withTextBox
@@ -169,5 +170,31 @@ describe('a text animation', () => {
 		expect(o?.svg).toContain('data-kerf-animate');
 		expect(warnings).toEqual([HARNESS_ANIMATION_NOTE]);
 		expect(setTitleTextAnimationIn(tl, 'o', 't', null).warnings).toEqual([]);
+	});
+});
+
+describe('the text a field began on', () => {
+	// Two titles with a text of the same id: the field of one is re-rendered with the other's value when the
+	// selection moves, and its commit must still be checked against, and sent to, the one it took focus on.
+	const overlay = (id: string, svg: string): SvgOverlay =>
+		({ id, name: id, svg, start: 0, end: 4, x: 0, y: 0, width: 1, height: 1, opacity: 1 }) as SvgOverlay;
+	const tl = {
+		tracks: [],
+		svg_overlays: [
+			overlay('a', doc('<text id="t" inline-size="80">A</text>')),
+			overlay('b', doc('<text id="t">B</text><text id="u">U</text>'))
+		]
+	} as unknown as Timeline;
+
+	test('is looked up by title and by text, as the timeline has them now', () => {
+		expect(titleTextAt(tl, 'a', 't')?.text.box).toEqual({ width: 80, fit: 'wrap' });
+		expect(titleTextAt(tl, 'b', 't')?.text.box).toEqual({ width: null, fit: 'wrap' });
+		expect(titleTextAt(tl, 'b', 'u')?.title.id).toBe('b');
+	});
+
+	test('is nothing for a title or a text that is gone', () => {
+		expect(titleTextAt(tl, 'gone', 't')).toBeNull();
+		expect(titleTextAt(tl, 'a', 'u')).toBeNull();
+		expect(titleTextAt({ tracks: [] }, 'a', 't')).toBeNull();
 	});
 });
