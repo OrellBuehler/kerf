@@ -87,7 +87,7 @@
 			items.push({ type: 'separator' });
 			items.push({ type: 'header', label: g.title, sub: g.assets === null ? undefined : `${g.assets} ${g.assets === 1 ? 'asset' : 'assets'}` });
 			for (const row of g.rows)
-				items.push({ label: row.label, icon: row.active ? 'check' : undefined, meta: String(row.assets), action: toggle(row.term) });
+				items.push({ label: row.label, role: 'check', checked: row.active, meta: String(row.assets), action: toggle(row.term) });
 		}
 		if (filtered) {
 			items.push({ type: 'separator' });

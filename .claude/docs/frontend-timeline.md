@@ -466,7 +466,10 @@ The **toolbar** is `ToolbarToggle`s (`frontend.md`, Shared components): tools | 
 zoom | snapping and Ripple | the three track heights and the overview | `+ V` / `+ A` and the delivery frame on the right,
 a rule between each group. Every one is 24 px high with a 24 px target at least, and lit the same way (amber outline
 and wash) — a tool, snapping (a magnet, `aria-pressed`), Ripple, the heights, the overview, a fade that is set, and the delivery
-frame once one is chosen (its label then carries the frame rate when it states one: `9:16 · 50 fps`). The track header's own S / L / DUCK toggles are not part of it.
+frame once one is chosen (its label then carries the frame rate when it states one: `9:16 · 50 fps`). The track header's own flags are not part of it: `TrackFlags.svelte`
+is five `IconBtn`s (DUCK, mute / hide, S, the padlock, remove) each **named for its track** ("Mute A1", "Hide V1", `track-flags.ts`) with the hover and pressed
+look of every icon button, `pending` (aria-disabled, press swallowed, focus kept) while an edit is in flight or a proposal is on screen — the tooltip then says
+why; the header's level and pan sliders and both "Add a title" buttons are `aria-disabled` the same way (a native `disabled` drops the keyboard focus).
 The **minimap** (`Minimap.svelte` over the pure `minimap.ts`; toolbar toggle, remembered; **hidden while
 the view already takes in 98 % of the cut** — `viewCoversCut`, so it costs its 37 px only once you are zoomed
 in, and the window fitted at open never shows it) is the whole cut on a 36 px strip: a block per clip per track row (runs too fine to tell apart

@@ -4,6 +4,8 @@
 	import Btn from './Btn.svelte';
 	import Badge from './Badge.svelte';
 	import ClipOverlays from './ClipOverlays.svelte';
+	import TrackFlags from './TrackFlags.svelte';
+	import IconBtn from './IconBtn.svelte';
 	import ClipFilmstrip from './ClipFilmstrip.svelte';
 	import ClipWaveform from './ClipWaveform.svelte';
 	import LaneBlocks from './LaneBlocks.svelte';
@@ -226,11 +228,6 @@
 	 *  rule the Mixer panel's strips follow too (`mixer-strips.ts`). */
 	const hasSound = (t: Track): boolean => trackHasSound(t, audibleAssets);
 
-	/** Shared look for the one-letter S / L track flags. */
-	const flagBtn = (on: boolean, accent: string) =>
-		`flex:none;font-family:var(--font-mono);font-size:12px;font-weight:600;line-height:1;min-width:26px;min-height:26px;padding:3px;border-radius:3px;cursor:pointer;` +
-		`border:var(--line-width) solid ${on ? accent : 'var(--border-strong)'};background:${on ? accent : 'transparent'};color:${on ? 'var(--text-on-accent)' : 'var(--text-muted)'}`;
-
 	/** A locked track refuses drag, trim and razor — the point of locking it. */
 	const isLocked = (trackId: string) => !!editor.timeline.tracks.find((t) => t.id === trackId)?.locked;
 
@@ -412,8 +409,9 @@
 	const heightItems = (t: Track): MenuItem[] =>
 		HEIGHT_PRESETS.map((p) => ({
 			label: `${PRESET_LABEL[p]} height`,
-			icon: ui.trackPreset(t.id) === p ? 'check' : undefined,
-			shortcut: `${PRESET_PX[p]} px`,
+			role: 'radio' as const,
+			checked: ui.trackPreset(t.id) === p,
+			meta: `${PRESET_PX[p]} px`,
 			action: () => ui.setTrackHeight(t.id, p)
 		}));
 
@@ -760,7 +758,8 @@
 			[
 				...DELIVERY_PRESETS.map((p) => ({
 					label: p.label === 'Source' ? 'Source shape' : `${p.label} — ${p.hint}`,
-					icon: p.id === delivery.id ? 'check' : undefined,
+					role: 'radio' as const,
+					checked: p.id === delivery.id,
 					action: () => void setDeliveryPreset(p.id)
 				})),
 				// With a frame set: how footage of another shape meets it (the project's fit ticked), and the
@@ -770,14 +769,16 @@
 							{ type: 'separator' as const },
 							...fitChoices(editor.timeline.format).map((c) => ({
 								label: c.label,
-								icon: c.checked ? 'check' : undefined,
+								role: 'radio' as const,
+								checked: c.checked,
 								action: () => void setDeliveryFit(c.fit)
 							})),
 							{ type: 'separator' as const },
 							{ type: 'header' as const, label: 'Frame rate', sub: 'Exports, playback and stills' },
 							...rateChoices(editor.timeline.format).map((c) => ({
 								label: c.fps == null ? 'Source rate' : `${c.label} fps`,
-								icon: c.checked ? 'check' : undefined,
+								role: 'radio' as const,
+								checked: c.checked,
 								action: () => void setDeliveryFps(c.fps)
 							}))
 						]
@@ -3175,18 +3176,19 @@
 			</div>
 			{#if titlesEmpty}
 				<!-- Nothing on the titles lane: a strip, and the whole of its header adds a title. -->
-				<button
+				<IconBtn
 					data-title-add
-					use:tip={settings.tip('Add a title at the playhead', 'title.add')}
+					title={settings.tip('Add a title at the playhead', 'title.add')}
 					aria-label="Add a title"
-					disabled={editor.busy}
+					pending={editor.busy}
 					onclick={addTitleHere}
-					style="display:flex;align-items:center;gap:6px;width:100%;height:{titleLaneH}px;box-sizing:border-box;padding:0 8px;border:none;border-bottom:1px solid var(--border-subtle);background:none;cursor:pointer;text-align:left;color:var(--text-muted);font-size:10px"
+					size={titleLaneH}
+					style="display:flex;align-items:center;justify-content:flex-start;gap:6px;width:100%;box-sizing:border-box;padding:0 8px;border:none;border-bottom:1px solid var(--border-subtle);border-radius:0;text-align:left;color:var(--text-muted);font-size:10px"
 				>
 					<span style="font-family:var(--font-mono);font-weight:600;color:var(--text-secondary);flex:none">T</span>
 					<span style="flex:1;min-width:0">Titles</span>
 					<Icon n="plus" s={10} />
-				</button>
+				</IconBtn>
 			{:else}
 			<div
 				style="height:{titleLaneH}px;border-bottom:1px solid var(--border-subtle);display:flex;align-items:center;gap:6px;padding:0 8px;overflow:hidden"
@@ -3195,13 +3197,14 @@
 				<span style="font-size:11px;color:var(--text-muted);flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
 					>Titles · {titleCount}</span
 				>
-				<button
-					use:tip={settings.tip('Add a title at the playhead', 'title.add')}
+				<IconBtn
+					size={26}
+					title={settings.tip('Add a title at the playhead', 'title.add')}
 					aria-label="Add a title"
-					disabled={editor.busy}
+					data-tone="quiet"
+					pending={editor.busy}
 					onclick={addTitleHere}
-					style="background:none;border:none;cursor:pointer;padding:0;min-width:26px;min-height:26px;flex:none;display:grid;place-items:center;color:var(--text-muted)"
-					><Icon n="plus" s={12} /></button
+					><Icon n="plus" s={12} /></IconBtn
 				>
 			</div>
 			{/if}
@@ -3233,63 +3236,7 @@
 					     speaker icon both already say the kind, and the row now carries
 					     mute / solo / lock / remove in a fixed-width column. -->
 					<span style="flex:1;min-width:0"></span>
-					{#if t.kind === 'audio'}
-						<button
-							use:tip={t.duck
-								? 'Ducking on — this track dips under the rest of the mix on export (the preview plays it at its fader)'
-								: 'Duck this track under the rest of the mix on export (the preview plays it at its fader)'}
-							aria-label="Toggle ducking"
-							onclick={() => void editor.setTrackDuck(t.id, !t.duck).catch(err)}
-							style="background:{t.duck ? 'var(--kerf-500)' : 'none'};border:var(--line-width) solid {t.duck
-								? 'var(--kerf-500)'
-								: 'var(--border-strong)'};border-radius:3px;cursor:pointer;color:{t.duck
-								? 'var(--text-on-accent)'
-								: 'var(--text-muted)'};font-size:12px;font-weight:600;min-height:26px;padding:2px 4px;flex:none"
-							>DUCK</button
-						>
-					{/if}
-					<button
-						use:tip={t.muted
-							? t.kind === 'video'
-								? 'Hidden — click to show'
-								: 'Muted — click to unmute'
-							: t.kind === 'video'
-								? 'Hide this track'
-								: 'Mute this track'}
-						aria-label="Toggle mute"
-						aria-pressed={!!t.muted}
-						onclick={() => void editor.setTrackMuted(t.id, !t.muted).catch(err)}
-						style="background:none;border:none;cursor:pointer;padding:0;min-width:26px;min-height:26px;flex:none;display:grid;place-items:center;color:{t.muted
-							? 'var(--red-500)'
-							: 'var(--text-muted)'}"
-						><Icon n={t.kind === 'video' ? (t.muted ? 'eye-off' : 'eye') : t.muted ? 'volume-x' : 'volume-2'} s={12} /></button
-					>
-					<button
-						use:tip={t.solo ? 'Soloed — click to clear' : 'Solo this track'}
-						aria-label="Toggle solo"
-						aria-pressed={!!t.solo}
-						onclick={() => void editor.setTrackSolo(t.id, !t.solo).catch(err)}
-						style={flagBtn(!!t.solo, 'var(--kerf-400)')}>S</button
-					>
-					<button
-						use:tip={t.locked ? 'Locked — click to unlock' : 'Lock this track against edits'}
-						aria-label="Toggle lock"
-						aria-pressed={!!t.locked}
-						onclick={() => void editor.setTrackLocked(t.id, !t.locked).catch(err)}
-						style="flex:none;display:grid;place-items:center;min-width:26px;min-height:26px;padding:3px;border-radius:3px;cursor:pointer;border:var(--line-width) solid {t.locked
-							? 'var(--text-secondary)'
-							: 'var(--border-strong)'};background:{t.locked ? 'var(--surface-active)' : 'transparent'};color:{t.locked
-							? 'var(--text-primary)'
-							: 'var(--text-muted)'}"
-						><Icon n={t.locked ? 'lock' : 'lock-open'} s={12} /></button
-					>
-					<button
-						use:tip={'Remove track'}
-						aria-label="Remove track"
-						onclick={() => onRemoveTrack(t)}
-						style="background:none;border:none;cursor:pointer;color:var(--text-muted);display:grid;place-items:center;padding:0;min-width:26px;min-height:26px;flex:none"
-						><Icon n="x" s={12} /></button
-					>
+					<TrackFlags track={t} onremove={onRemoveTrack} />
 				</div>
 					{#if hasSound(t) && ui.trackPx(t.id) >= MIXER_MIN_PX}
 						<!-- The mixer strip: a fader over every clip on the track, and its
@@ -3305,11 +3252,14 @@
 								max="1"
 								step="0.005"
 								value={gainToFader(t.volume ?? 1)}
-								disabled={editor.locked}
+								aria-disabled={editor.locked ? 'true' : undefined}
 								aria-label="{t.name} level"
 								use:tip={`Level ${gainLabel(t.volume ?? 1)} — double-click for unity`}
-								onchange={(e) => void editor.setTrackVolume(t.id, faderToGain(+e.currentTarget.value)).catch(err)}
-								ondblclick={() => void editor.setTrackVolume(t.id, 1).catch(err)}
+								onchange={(e) => {
+									if (editor.locked) return void (e.currentTarget.value = String(gainToFader(t.volume ?? 1)));
+									void editor.setTrackVolume(t.id, faderToGain(+e.currentTarget.value)).catch(err);
+								}}
+								ondblclick={() => !editor.locked && void editor.setTrackVolume(t.id, 1).catch(err)}
 								style="flex:1;min-width:0;height:20px;--slider-accent:var(--kerf-400);cursor:pointer"
 							/>
 							<input
@@ -3318,11 +3268,14 @@
 								max="1"
 								step="0.05"
 								value={t.pan ?? 0}
-								disabled={editor.locked}
+								aria-disabled={editor.locked ? 'true' : undefined}
 								aria-label="{t.name} pan"
 								use:tip={`Pan ${panLabel(t.pan ?? 0)} — double-click to centre`}
-								onchange={(e) => void editor.setTrackPan(t.id, +e.currentTarget.value).catch(err)}
-								ondblclick={() => void editor.setTrackPan(t.id, 0).catch(err)}
+								onchange={(e) => {
+									if (editor.locked) return void (e.currentTarget.value = String(t.pan ?? 0));
+									void editor.setTrackPan(t.id, +e.currentTarget.value).catch(err);
+								}}
+								ondblclick={() => !editor.locked && void editor.setTrackPan(t.id, 0).catch(err)}
 								style="width:48px;flex:none;height:20px;--slider-accent:var(--text-muted);cursor:pointer"
 							/>
 						</div>
@@ -3430,6 +3383,7 @@
 							<!-- svelte-ignore a11y_autofocus -->
 							<input
 								autofocus
+								aria-label="Marker name"
 								value={m.name}
 								onblur={(e) => commitRename(m, e.currentTarget.value)}
 								onkeydown={(e) => {

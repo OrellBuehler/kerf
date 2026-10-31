@@ -1362,7 +1362,10 @@ does not appear on a disabled control in engines that drop its pointer events (C
 **Context menus are keyboard menus** (`ContextMenu.svelte` over `menu-nav.ts`, shared with the menu bar's `stepFocus` / `typeahead`): it
 takes focus when it opens — the panel for a pointer, the first row when it was opened from the keyboard (the Menu key, Shift+F10, Enter
 on a button; judged from the invoker's `:focus-visible`) — ↓ ↑ wrap, Home / End jump, Enter / Space run, a letter jumps to the next row
-that starts with it, Escape closes and gives focus back to the invoker, Tab closes and goes on. Rows are roving-tabindex `menuitem`s; a disabled
+that starts with it, Escape closes and gives focus back to the invoker, Tab closes and goes on. Rows are roving-tabindex `menuitem`s — a row that is a *choice* (a track height, a delivery shape, a tag in the filter) says so with
+`MenuItem.role` (`'radio'` for one of a set, `'check'` for an on/off) and `checked`: `menuitemradio` / `menuitemcheckbox` with
+`aria-checked`, the tick drawn in the icon's place (`menu-roles.ts`), never an `icon: x ? 'check' : undefined` — and the header and
+fact rows are `role="presentation"`; a size or a count beside a row is its `meta`, never a typed `shortcut`; a disabled
 row is `aria-disabled`, not `disabled`, so it takes focus and says why; the lit row is one at a time (`:hover` and the keys' `:focus-visible`, the
 pointer moving focus to the row it is over). The capture-phase key handler keeps a menu's keys from reaching the page's shortcuts. An action that
 opens a dialog finds focus on the invoker, so the dialog's own focus return works. At 1366×768 an ArrowDown used to scroll the page and

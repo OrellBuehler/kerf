@@ -5,6 +5,7 @@
 	import { contextMenu } from '#lib/context-menu.svelte';
 	import type { MenuItem } from '#lib/context-menu.svelte';
 	import { contextRows } from '#lib/menu-items';
+	import { rowChecked, rowIcon, rowRole } from '#lib/menu-roles';
 	import { menuKey, rowFor, startRow } from '#lib/menu-nav';
 
 	/** The window this instance draws in. One is mounted in the editor window and one in
@@ -166,7 +167,7 @@
 			{#if item.type === 'separator'}
 				<div role="separator" style="height:var(--line-width);margin:4px 6px;background:var(--border-default)"></div>
 			{:else if item.type === 'header'}
-				<div style="padding:5px 8px 4px;min-width:0;max-width:300px">
+				<div role="presentation" style="padding:5px 8px 4px;min-width:0;max-width:300px">
 					<div
 						style="font-size:12px;font-weight:600;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
 					>
@@ -181,7 +182,7 @@
 					{/if}
 				</div>
 			{:else if item.type === 'info'}
-				<div style="padding:2px 8px;font-size:11px;line-height:16px;max-width:300px">
+				<div role="presentation" style="padding:2px 8px;font-size:11px;line-height:16px;max-width:300px">
 					<div style="display:flex;align-items:baseline;gap:12px">
 						<span style="flex:none;color:var(--text-muted)">{item.label}</span>
 						<span
@@ -197,7 +198,8 @@
 			{:else}
 				<button
 					type="button"
-					role="menuitem"
+					role={rowRole(item)}
+					aria-checked={rowChecked(item)}
 					class="k-mrow"
 					data-row={i}
 					data-danger={item.danger || undefined}
@@ -210,7 +212,7 @@
 					}}
 				>
 					<span style="width:15px;display:grid;place-items:center;flex:none;color:inherit">
-						{#if item.icon}<Icon n={item.icon} s={14} color="currentColor" />{/if}
+						{#if rowIcon(item)}<Icon n={rowIcon(item) as string} s={14} color="currentColor" />{/if}
 					</span>
 					<span style="flex:1;min-width:0">
 						{item.label}
