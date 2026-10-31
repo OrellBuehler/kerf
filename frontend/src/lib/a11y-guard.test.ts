@@ -251,7 +251,7 @@ describe('the agent panel does not lose or double what it was asked', () => {
 	});
 
 	test('a quick edit in flight keeps the others off (buttons and right-click) until it ends', () => {
-		expect(panel).toMatch(/if \(running !== null\) return;\s*running = p;\s*try \{\s*await carryOut\(p\);\s*\} finally \{\s*running = null;/);
+		expect(panel).toMatch(/if \(running !== null\) return;\s*running = p;\s*try \{\s*await runPreset\(p\);\s*\} finally \{\s*running = null;/);
 		expect(panel).toContain('pending={running !== null}');
 		expect(panel).toMatch(/disabled: disabled \|\| held \|\| running !== null/);
 	});

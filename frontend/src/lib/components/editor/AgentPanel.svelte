@@ -275,17 +275,18 @@
 		}
 	}
 
-	async function runPreset(p: string) {
+	/** A press on a quick edit: one at a time. */
+	async function startPreset(p: string) {
 		if (running !== null) return;
 		running = p;
 		try {
-			await carryOut(p);
+			await runPreset(p);
 		} finally {
 			running = null;
 		}
 	}
 
-	async function carryOut(p: string) {
+	async function runPreset(p: string) {
 		if (!isLocalPreset(p)) {
 			try {
 				await agent.add(p);
@@ -384,7 +385,7 @@
 					icon: 'list-plus',
 					disabled: disabled || held || running !== null,
 					reason: held ? QUICK_EDIT_HELD : running !== null ? RUNNING_WHY : undefined,
-					action: () => void runPreset(p)
+					action: () => void startPreset(p)
 				};
 			})
 		];
@@ -757,7 +758,7 @@
 										: running !== null && running !== p
 											? RUNNING_WHY
 											: { text: `${local ? 'Run now' : 'Queue for agent'}: ${p}`, detail: targetNote(p, target) }}
-									onclick={() => runPreset(p)}>{p}</Btn
+									onclick={() => startPreset(p)}>{p}</Btn
 								>
 							{/each}
 						{/each}
