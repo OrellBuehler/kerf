@@ -236,7 +236,8 @@ is red with its reason; a sound it cuts back to make room is drawn too and named
 revision's label says it afterwards) (`api-links.test.ts` holds it equal to the harness commit).
 Roll / slip / slide run `previewEdit(…, links)` over the `*Linked` edits and `*RangeLinked` clamps:
 partners are `partner`-role ghosts with a `trackId`, the readout says `· with A1`. `gestureReason` adds
-"or hold Alt to edit this clip on its own" to a refusal about linked clips. The clip menu and keymap share
+"or hold Alt to edit this clip on its own" to a refusal about linked clips (and `ALT_HINT`, `altToMoveAlone` say Option on a Mac: the key is named by
+`modLabel(platform, 'alt')`, and `keymap.test.ts` fails on `Alt-click` / `hold Alt` spelled by hand). The clip menu and keymap share
 `linkPlans` (`ops.ts`): **Detach audio** (⇧D; **one revision for the whole selection** via `detach_audio_clips`,
 the toast's Undo takes it back and names a skipped clip), **Reattach audio** (⇧⌘D; shown only where something is
 detached, greyed with the reason when unmuting would double the sound; **one revision for the whole

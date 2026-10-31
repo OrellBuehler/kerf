@@ -93,7 +93,7 @@ SvelteKit 3 / Svelte 5 **runes** (forced on in `vite.config.ts`). Two layout qui
   `SUPERSEDED_KERF_LIGHT` set to the current preset — name and shape kept — and
   leaves anything else alone; whenever Light's colors change again, the outgoing
   set goes on that list. `layout.css` is also the `tailwind.css` in `components.json`. Run
-  `bunx shadcn-svelte add <name>` to add primitives.
+  `bunx shadcn-svelte add <name>` to add primitives (`components/ui/` holds only the toaster, `sonner`: the other shadcn folders were never imported and are gone).
 
 The editor UI is implemented from the **Kerf design system** (claude.ai/design): an
 editor-grade workspace under `src/lib/components/editor/` — bespoke atoms (`Btn`,
@@ -1056,7 +1056,10 @@ Its **Deliver to** section is the multi-format export: shape chips (the
 named by shape (`variantPath`, the bun-tested mirror of
 `ExportVariant::beside`), a *Smart crop each shot for every shape* toggle, and a
 per-file row in the platform check judged at that file's frame (`platformCheck([w, h])`),
-in place of the single-file line — with shapes picked, the Scaling rows hide (each
+in place of the single-file line — **a custom size** (*Resolution › Custom…*) is two named fields, brought to what the engine takes by `editSide`
+(`export-size.ts`, bun-tested): whole, even — rounded *down*, as `Delivery::new` does —, `2..8192`, with the entry that was changed or refused said
+under the fields and the field showing what was kept; a blank keeps the old side rather than falling back to 1920. The dialog's explanatory lines are
+one `hint` snippet (left under their row; right-aligned divs and left paragraphs were both in use). With shapes picked, the Scaling rows hide (each
 delivery brings its own resolution and fit) and the button reads `Export N
 files`; `export-progress` then carries `variant` / `total`, and `together` when the files render in one
 pass (the default; `exportVariants`' `singlePass`), which the progress text shows as `3 at once ·`
@@ -1084,6 +1087,10 @@ The panel is **one status line** (`agentLine`: `Agent connected` / `No agent con
 disagree) with a **Connect** button that opens the setup card *under it* (the code rows wrap), then **review card → queue
 (ready first) → quick edits → history** (the setup card folds itself away when a proposal arrives — at 1280×720 it pushed the proposal off the screen), the **Apply / Preview / Discard row pinned under the scrolling list** (`data-review-actions`, the panel's own row between the scroll area and the composer, so it is on screen whatever the list holds), and a one-row **composer** (32 px; its hint line shows only when the panel is at least
 520 px tall — `showComposerHint` — and is the field's description otherwise). The sections share the overline-and-rule heading; Quick
+edits are one at a time (`running`: the buttons and the right-click rows go `aria-disabled` while one runs — an analysis does not raise
+`editor.busy`, so a second press used to transcribe twice and the first to finish cleared the shared `ui.analyzing`), a task that fails to queue
+comes back into the composer (`restoredDraft`; a line typed meanwhile stays), and the 5 s connection poll waits while the panel's own page is hidden
+(`documentOf`, so a panel in a window of its own is judged by that window) and polls again when it shows. Quick
 edits folds from a chevron in it, and its one legend line says what the two icons mean (`play` runs now, `list-plus` is queued). A task's badge is
 `STATUS_MAP`: queued neutral with a clock, working and ready the agent's cyan, **applied green, failed red with an alert icon**. Since it shares a tab group with the Inspector by default,
 `+page.svelte` brings it forward once when a proposal lands (`editor.staged`
@@ -1289,7 +1296,9 @@ refusal (the hand-over), and take the play back at once when asked (`ready`), so
 **`Modal`** is the shell of every dialog: the scrim (`--scrim` at 55 %, one `z-index` of 50 — a later sibling, the
 update dialog, stacks over an earlier), the panel (`--line-width` border, `--shadow-lg`), a header with an icon, the title (the
 dialog's accessible name, `aria-labelledby`) and a named close button (an `IconBtn`, `title="Close"`, an `x` icon), `trapFocus`,
-Escape, and an optional `footer` snippet drawn under a rule; the body is the dialog's own. What differs is props:
+Escape (`escapeCloses`: an Escape that cancels an IME composition, or the `keyCode` 229 a browser reports for a key that just ended one, is the
+IME's — `composing(e)`, in `modal.ts`, is what the agent composer's Enter, `TagInput` and the shortcut search ask too), and an optional `footer` snippet
+drawn under a rule; the body is the dialog's own. What differs is props:
 `width` / `height` (px, never wider than the window), `busy` (a run that cannot be walked away from: Escape, the scrim *and* the
 close button are off, and the button is gone), `dismissOnScrim` (off for a dialog holding typed input or chosen options),
 `initial` (a selector for the field that takes focus on open) and `rescue` (see below). The close rules are the pure
@@ -1331,8 +1340,10 @@ whether it is a tool, a mode (snapping is a pressed magnet, not a word that chan
 zoom), `square` a picture-only button. Its states are `.k-tt` in `controls.css`, which the veil leaves alone.
 **One control scale for the panels**: `Btn sm` is `--control-sm` (28 px; it was 30) beside every field, chip and tile in a panel.
 **`Chip`** (`.k-chip`) is for what is *on or off* among choices — `pressed` is required, so a chip never reads as an action; an action is
-a `Btn`, and a ghost `Btn` is a quiet one (the hover wash is the veil's). The dialogs that still draw a chip by hand use `chip()`
-(`chip.ts`), which has the same height, weight and radius. **`Tile`** (`.k-tile`) is a preset in a grid: one line, an ellipsis, the
+a `Btn`, and a ghost `Btn` is a quiet one (the hover wash is the veil's). **Settings' chips are `Chip`s too** (theme presets, Dark / Light,
+thumb style, the CPU budgets) and `ChoiceChips`' radios are `.k-chip` buttons: `.k-chip` draws `aria-pressed`, `aria-checked` and a static
+`aria-current` (the "Custom" theme, `data-static`, takes no pointer) alike, with hover, pressed and disabled looks — the inline `chip()` of
+`settings-ui.ts` had none, and is gone (`a11y-guard.test.ts` holds it). Dialogs that still draw a chip by hand use their own `chip()`, which has the same height, weight and radius. **`Tile`** (`.k-tile`) is a preset in a grid: one line, an ellipsis, the
 tooltip. **`Hint`** is the box that says why a tab's controls are off, the same in Effects, Transitions and Audio. **`CheckRow`**
 (`.k-check`) is a checkbox with its words, box first, the whole row the target. **`EmptyState`** is a panel with nothing to show: one icon,
 one line, one reason, optionally a button (the Inspector, the notification log, the Transcript and the dock's watermark, which offers
@@ -1368,7 +1379,7 @@ close the menu. A menu opened from the keyboard starts on its first *runnable* r
 source) is one tab stop (`tabStop`: the chosen chip if it can take focus, else the first that can — Preview source disables all but "Always original"
 while proxies are off) the arrows move through (`roving.ts`; selection follows focus, except Proxy size, where a choice rebuilds every proxy, so its
 arrows only move focus and Space / Enter choose); a chip that is on or off carries `aria-pressed`, the Settings rail `aria-current="page"`, and a button that is a picture or a glyph has a name
-(`a11y-guard.test.ts` scans the markup for each, and that the one focus rule lists `textarea`).
+(`a11y-guard.test.ts` scans the markup for each, that every `<input>` / `<textarea>` / `<select>` is named — inside a `<label>`, pointed at by one, or an `aria-label` — and that the one focus rule lists `textarea`).
 **Progress bars say what they know** (`ProgressBar.svelte`, `.k-progress` in `controls.css`): a `progressbar` with an accessible name that fills to its
 value, or — with none (a download of unknown size, a stage that reports nothing, an export waiting on its proxy) — sweeps a segment along the track
 rather than parking it at 30 %; under `prefers-reduced-motion` the whole track is tinted instead (`progress-guard.test.ts`). Its `flex` is `1 1 auto`: with `flex: 1` (basis 0) a bar under a label in a column — every run dialog — was drawn 0 px tall.
@@ -1376,8 +1387,8 @@ rather than parking it at 30 %; under `prefers-reduced-motion` the whole track i
 report needs, the same lines that are on screen.
 
 **Modals are modal.** Every dialog is a `Modal` (above), which uses the
-`trapFocus` action (`src/lib/modal.ts`: takes focus, wraps Tab, restores focus on
-close; Voiceover starts on its textarea via `initial`), and `+page.svelte` makes the app behind them `inert` and returns early from its global key handler while
+`trapFocus` action (`src/lib/modal.ts`: takes focus, wraps Tab over what Tab can land on — `tabbable`: a roving chip parked at `tabindex=-1` is not
+the last stop, a `<summary>` is one — restores focus on close; Voiceover starts on its textarea via `initial`), and `+page.svelte` makes the app behind them `inert` and returns early from its global key handler while
 any is open — Space / Delete / J-K-L / ⌘Z would
 otherwise edit the live project under a dialog; a file drop is ignored then too.
 Every shortcut — bare keys and ⌘ chords alike — stands down inside any text input /
@@ -1478,7 +1489,7 @@ focus, so a held Enter cannot answer it), per-row Reset — on offer whenever th
 chords in force differ from the defaults, and asking the same question when another
 action has since taken one (`applyReset`) — and Reset all, and a read-only list of the keys that are *not* rebindable (Esc
 abandoning drags and closing menus and dialogs, Tab, Enter / Space on a focused
-control, a widget's arrows, wheel and click modifiers). Focus goes back to a row
+control, a widget's arrows, wheel and click modifiers — `fixedKeys(platform)`, which names the modifiers as the platform's keyboard does: Command and Option on a Mac, Ctrl and Alt elsewhere). Focus goes back to a row
 after every change: focus left on the page behind a modal stops Escape closing it.
 **Presets** (`KEY_PRESETS` in `keymap.ts`): Kerf (the defaults), Premiere Pro, DaVinci Resolve and
 Final Cut Pro, each an override table over existing action ids (a `mac` table where the Mac's keys
