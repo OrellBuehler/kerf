@@ -93,7 +93,7 @@ SvelteKit 3 / Svelte 5 **runes** (forced on in `vite.config.ts`). Two layout qui
   `SUPERSEDED_KERF_LIGHT` set to the current preset — name and shape kept — and
   leaves anything else alone; whenever Light's colors change again, the outgoing
   set goes on that list. `layout.css` is also the `tailwind.css` in `components.json`. Run
-  `bunx shadcn-svelte add <name>` to add primitives (`components/ui/` holds only the toaster, `sonner`: the other shadcn folders were never imported and are gone).
+  `bunx shadcn-svelte add <name>` to add primitives (`components/ui/` holds only the toaster, `sonner`: the other shadcn folders were never imported and are gone, and `bits-ui`, `paneforge` and `tailwind-variants` left `package.json` with them — `shadcn-svelte add` brings back what a primitive needs).
 
 The editor UI is implemented from the **Kerf design system** (claude.ai/design): an
 editor-grade workspace under `src/lib/components/editor/` — bespoke atoms (`Btn`,
@@ -1057,7 +1057,7 @@ named by shape (`variantPath`, the bun-tested mirror of
 `ExportVariant::beside`), a *Smart crop each shot for every shape* toggle, and a
 per-file row in the platform check judged at that file's frame (`platformCheck([w, h])`),
 in place of the single-file line — **a custom size** (*Resolution › Custom…*) is two named fields, brought to what the engine takes by `editSide`
-(`export-size.ts`, bun-tested): whole, even — rounded *down*, as `Delivery::new` does —, `2..8192`, with the entry that was changed or refused said
+(`export-size.ts`, bun-tested): whole, even — rounded *down*, as `Delivery::new` does —, `2..16384` (the upper bound is the dialog's own policy, there to catch a mistyped digit and high enough for a 12K / 360° delivery; kerf-core has no cap), with the entry that was changed or refused said
 under the fields and the field showing what was kept; a blank keeps the old side rather than falling back to 1920. The dialog's explanatory lines are
 one `hint` snippet (left under their row; right-aligned divs and left paragraphs were both in use). With shapes picked, the Scaling rows hide (each
 delivery brings its own resolution and fit) and the button reads `Export N
@@ -1297,7 +1297,7 @@ refusal (the hand-over), and take the play back at once when asked (`ready`), so
 update dialog, stacks over an earlier), the panel (`--line-width` border, `--shadow-lg`), a header with an icon, the title (the
 dialog's accessible name, `aria-labelledby`) and a named close button (an `IconBtn`, `title="Close"`, an `x` icon), `trapFocus`,
 Escape (`escapeCloses`: an Escape that cancels an IME composition, or the `keyCode` 229 a browser reports for a key that just ended one, is the
-IME's — `composing(e)`, in `modal.ts`, is what the agent composer's Enter, `TagInput` and the shortcut search ask too), and an optional `footer` snippet
+IME's — `composing(e)`, in `modal.ts`, is what the agent composer's Enter, `TagInput` and the shortcut search ask too, and so does every other text field whose key handler acts on Enter or Escape — `a11y-guard.test.ts` scans for one that does not), and an optional `footer` snippet
 drawn under a rule; the body is the dialog's own. What differs is props:
 `width` / `height` (px, never wider than the window), `busy` (a run that cannot be walked away from: Escape, the scrim *and* the
 close button are off, and the button is gone), `dismissOnScrim` (off for a dialog holding typed input or chosen options),
