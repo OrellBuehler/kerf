@@ -364,7 +364,7 @@ fn rebase_head(keys: &[PropertyKey], by: f64) -> Vec<PropertyKey> {
 /// `key` put into `keys` ([`Clip::insert_keyframe`]'s rule): a key within a microsecond of one
 /// replaces it and keeps how that one leaves; one inside a segment splits it
 /// ([`Easing::split`]), so a hold stays held and a curve stays the same curve.
-fn upsert(keys: &mut Vec<PropertyKey>, mut key: PropertyKey) {
+pub(super) fn upsert(keys: &mut Vec<PropertyKey>, mut key: PropertyKey) {
     const SAME: f64 = 1e-6;
     by_time(keys);
     if let Some(old) = keys.iter().find(|k| (k.time - key.time).abs() <= SAME) {

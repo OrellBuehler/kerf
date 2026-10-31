@@ -7859,6 +7859,8 @@ mod exports;
 pub use exports::{DeliveryInputs, ExportedFile};
 mod batch;
 pub use batch::Batch;
+mod motion;
+pub use motion::MotionApplied;
 mod templates;
 mod title_clips;
 pub use title_clips::{TitleClipPatch, TitleClipPlacement, TitleClipResult, TitleEdited};
@@ -8089,6 +8091,10 @@ mod ramp_tests;
 /// Blend modes at the project level: one revision, carried by a split / duplicate / paste, stored, diffed.
 #[cfg(test)]
 mod blend_tests;
+
+/// Motion presets at the project level: one revision for several clips, staged, refused, undone.
+#[cfg(test)]
+mod motion_tests;
 
 /// The Rust half of the differential corpus the browser harness is replayed against.
 #[cfg(test)]

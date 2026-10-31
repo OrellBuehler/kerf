@@ -137,6 +137,32 @@
   curve read off the editor's reactive timeline is a proxy the harness's `structuredClone` refuses; both
   suites pin the same samples, head-cut keys and split beziers bit for bit), used by the harness, the
   Inspector's sampled pose and the preview's gain (`gainAutomation`).
+  **Motion presets (B8a, `model/motion.rs`)** are pure data that expand into the channels above — no render path, no stored
+  field, no migration, no golden change, so the export, the still and the GPU plan draw them as they draw typed keys
+  (`motion_presets_rendered.rs`, `#[ignore]`d, renders all 23 and holds the export to the still). `MotionPreset` (snake_case:
+  `fade_in`, `slide_in_from_left|right|top|bottom`, `zoom_in`, `pop_in`, `spin_in`, `drop_in`, the `fade_out` /
+  `slide_out_to_*` / `zoom_out` / `pop_out` / `spin_out` / `drop_out` exits, `pulse`, `wiggle`, `bounce`, `push_in`, `pull_out`;
+  a direction names where the picture comes *from* / goes *to*, unlike `TransitionKind`'s travel) is a row of the `SPECS`
+  table: kind, default span, a `Base` and per transform number keys `(at, x, easing)` — `at` the fraction of the window, `x` a
+  factor of the reference for scale / opacity and an offset for position (frame fractions) / rotation (degrees), neutral
+  = `Property::neutral`; every track runs `at` 0 to 1 and a bezier cannot overshoot, so an overshoot is its own key.
+  **The reference is the pose** (`Clip::property_at` sampled before writing): an entrance ends on the pose at the window's end
+  (`Base::End`), an exit starts from the pose at its start (`Start`), a pulse / wiggle / bounce rides the line between the two
+  edge poses (`Trend`: the clip's own motion goes on underneath); anchoring the edge a preset leaves neutral makes applying it
+  twice a no-op. **`Replace` is relative to the number's static value instead** (an entrance replacing a half-finished slide must
+  not park the clip where that slide was at the window's end). `Clip::apply_motion(preset, mode, at, duration, intensity)` is the
+  pure op (all or nothing): `at` is where the window starts (entrance / emphasis 0, an exit ends at the clip's end), `duration`
+  defaults to the preset's (`push_in` / `pull_out`: the rest of the clip) and **is clamped to the clip** (to what is left after
+  `at`; under `MIN_MOTION_SECONDS` = 0.01 refused), `intensity` 0.25..=2 scales how far every key departs (a scale never goes
+  under `TINY_SCALE`, an opacity stays in 0..=1). `Add` (the default) replaces the clip's keys of those numbers inside the window and
+  keeps the ones outside, splitting the eased segment an edge falls in (`upsert`, `Easing::split`; a hold stays held), so an
+  entrance, an exit and a key in the middle coexist and the preset applied last wins where windows meet; `Replace` writes exactly the
+  preset's keys for its numbers. A number the bundle drives detaches alone (`set_property_keys`). Add leaves the segment *into* a
+  mid-clip entrance as plain interpolation from the keys before it. `Project::apply_motion_preset(clip_ids, ..)` (`project/motion.rs`)
+  is one `edit_timeline` revision for every clip ("Apply motion preset Pop in (3 clips)"), all or nothing, a clip named twice once,
+  an audio-track clip refused, **a locked track not** (a lock guards layout; keyframes are look — `Timeline::ensure_editable`),
+  linked partners untouched, an agent's staged. `motion_presets()` lists id / label / kind / default duration / hint / numbers.
+  `fixtures/motion-presets-corpus.json` (`KERF_BLESS_CORPUS=1 … -- motion_corpus`) holds the table and 89 input → channels cases for the TS mirror.
   **`TransitionKind` is three families, and the family decides the render**: a
   **dip** (`DipToBlack` / `DipToWhite`) takes both sides through a solid colour
   either side of the cut, a **dissolve** (`Crossfade`) mixes them, and a

@@ -11619,6 +11619,11 @@ mod keyed_zoom;
 #[cfg(test)]
 mod keyed_channels;
 
+/// The motion presets (B8a) through the real `ffmpeg`: every preset renders, and the export agrees
+/// with the scrubbed still (`#[ignore]`d).
+#[cfg(test)]
+mod motion_presets_rendered;
+
 /// A keyed mask and a keyed crop against the pictures the export and the still render (`#[ignore]`d).
 #[cfg(test)]
 mod keyed_mask_crop;

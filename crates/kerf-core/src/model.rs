@@ -5331,6 +5331,7 @@ impl Timeline {
 }
 
 mod channels;
+mod motion;
 mod ramp_edit;
 #[cfg(test)]
 mod ramp_link_tests;
@@ -5340,6 +5341,10 @@ mod speed_ramp;
 mod stabilize;
 use channels::channel_changes;
 pub use channels::{key_polyline, Property, PropertyKey, PropertyTrack, MAX_CHANNEL_VOLUME};
+pub use motion::{
+    motion_presets, MotionKind, MotionMode, MotionPreset, MotionPresetInfo, MAX_MOTION_INTENSITY, MIN_MOTION_INTENSITY,
+    MIN_MOTION_SECONDS,
+};
 pub use ramp_edit::check_speed_ramp;
 pub use speed_ramp::{ramp_is_valid, RampEasing, SpeedKey, MAX_RAMP_TIME, MAX_SPEED_KEYS};
 pub use stabilize::{Stabilize, MAX_STABILIZE_ZOOM};
