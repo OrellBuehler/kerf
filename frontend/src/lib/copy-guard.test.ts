@@ -22,6 +22,7 @@ const state: MenuState = {
 	rippleMode: false,
 	snap: true,
 	minimap: true,
+	motionPath: true,
 	safeAreas: false,
 	hasFrame: true,
 	tool: 'pointer',

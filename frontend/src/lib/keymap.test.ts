@@ -1012,6 +1012,7 @@ describe('keys that act once per press', () => {
 			'marker.add',
 			// Commands with no key of their own, run from the menus: one press, one run.
 			'view.minimap',
+			'view.motionPath',
 			'view.safeAreas',
 			'workspace.edit',
 			'workspace.color',
