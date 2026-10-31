@@ -10,6 +10,8 @@ import {
 	limitNotice,
 	parseSeed,
 	rowName,
+	seedEntry,
+	seedOf,
 	tileTip,
 	withField,
 	withSeed
@@ -104,6 +106,27 @@ describe('the seed field', () => {
 	});
 });
 
+describe('a seed typed into a shake', () => {
+	test('is the seed of the row it began on that it is compared with', () => {
+		const a = { kind: 'shake', amount: 0.01, speed: 8, seed: 41, phase: 0 } as Behavior;
+		const b = { kind: 'shake', amount: 0.01, speed: 8, phase: 0 } as Behavior;
+		expect(seedOf(a)).toBe(41);
+		expect(seedOf(b)).toBe(0);
+		expect(seedOf(defaultBehavior('spin'))).toBe(0);
+		expect(seedOf(undefined)).toBe(0);
+	});
+
+	test('writes only a whole number that is not the seed the row already has', () => {
+		expect(seedEntry('42', 41)).toBe(42);
+		expect(seedEntry(' 0 ', 41)).toBe(0);
+		expect(seedEntry('41', 41)).toBeNull();
+		expect(seedEntry('0', 0)).toBeNull();
+		// Typed on one clip and committed after the selection moved: B's seed on screen must not decide whether A's changed.
+		expect(seedEntry('41', 99)).toBe(41);
+		for (const bad of ['', 'x', '-1', '1.5', String(MAX_SEED + 1)]) expect(seedEntry(bad, 7), bad).toBeNull();
+	});
+});
+
 describe('the words', () => {
 	test('a kind that is on the clip twice is numbered', () => {
 		const list = [defaultBehavior('sway'), defaultBehavior('shake'), defaultBehavior('sway')];
@@ -173,6 +196,13 @@ describe('the section and the tab', () => {
 		expect(section).toContain('editor.bakeBehaviors([id])');
 		expect(section).toContain('<SliderRow');
 		expect(section).toContain('onCommit={(v, row) => setField(row, f.key, v)}');
+		// The seed field is written to the row it took focus on, with the text typed into it, not the one drawn at its blur.
+		expect(section).toContain('new FieldEdits<Row, HTMLInputElement>()');
+		expect(section).toContain('seeds.focus(e.currentTarget, at)');
+		expect(section).toContain('seeds.input(e.currentTarget, e.currentTarget.value)');
+		expect(section).toContain('onchange={(e) => commitSeed(e.currentTarget, at, seed)}');
+		expect(section).toContain('seeds.end(el, { scope: at, text: el.value })');
+		expect(section).not.toMatch(/commitSeed\(e, at, seed\)/);
 		// The summary names the behaviours; the refusal of a bake is shown, not toasted away.
 		expect(section).toContain('summary={behaviorsSummary(list)}');
 		expect(section).toContain('role="alert"');
