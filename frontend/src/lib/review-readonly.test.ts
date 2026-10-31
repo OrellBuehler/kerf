@@ -113,6 +113,44 @@ describe('a pending control is pending whatever else its caller says', () => {
 		for (const name of ['patchTitle', 'patchSvg', 'setEasing']) expect(body(source, name), name).toContain('editor.locked');
 	});
 
+	test('Blend and Transition put their select back to the clip’s value when a change is refused, not leave it on the key that was pressed', () => {
+		const source = read(`${EDITOR}Inspector.svelte`);
+		const blend = source.slice(source.indexOf('aria-label="Blend mode"'), source.indexOf('{#each BLEND_MODES'));
+		expect(blend).toContain('if (editor.locked) return void (e.currentTarget.value = blendModeOf(clip));');
+		const transition = source.slice(source.indexOf('value={transition?.kind ?? \'\'}'), source.indexOf('<option value="">None</option>'));
+		expect(transition).toContain("if (editor.locked) return void (e.currentTarget.value = transition?.kind ?? '');");
+	});
+
+	test('every select of the Inspector has a name: its own label or the <label> around it', () => {
+		// (Comment lines dropped: one of them talks about a `<select>`.)
+		const source = read(`${EDITOR}Inspector.svelte`)
+			.split('\n')
+			.filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l))
+			.join('\n');
+		const unnamed: string[] = [];
+		for (const m of source.matchAll(/<select\b/g)) {
+			let depth = 0;
+			let end = m.index!;
+			for (; end < source.length; end++) {
+				const c = source[end];
+				if (c === '{') depth++;
+				else if (c === '}') depth--;
+				else if (c === '>' && depth === 0) break;
+			}
+			const tag = source.slice(m.index!, end + 1);
+			const before = source.slice(0, m.index!);
+			const wrapped = before.lastIndexOf('<label') > before.lastIndexOf('</label>');
+			if (!wrapped && !/aria-label/.test(tag)) unnamed.push(tag.replace(/\s+/g, ' ').slice(0, 80));
+		}
+		expect(unnamed).toEqual([]);
+	});
+
+	test('the thumbnail’s range and colour box put themselves back when a change gets through while the cut is held', () => {
+		const section = read(`${EDITOR}ThumbnailSection.svelte`);
+		expect(section).toContain("if (off) return void (e.currentTarget.value = String(axis === 'focus_x' ? current.focus_x : current.focus_y));");
+		expect(section).toContain("if (off) return void (e.currentTarget.value = swatchHex(layer.text?.color ?? ''));");
+	});
+
 	test('and the colour boxes, whose picker is swallowed but whose change is not, go through the same guard', () => {
 		const source = read(`${EDITOR}Inspector.svelte`);
 		const swatches = source.match(/<input\s+type="color"[\s\S]*?\/>/g) ?? [];

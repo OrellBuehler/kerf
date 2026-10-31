@@ -211,6 +211,7 @@
 					value={t.box.width ?? ''}
 					placeholder="No box"
 					readonly={editor.locked}
+					aria-disabled={editor.locked || undefined}
 					aria-label="{labelOf(t)}: box width"
 					onfocus={(e) => noteFocus(e, t)}
 					oninput={noteTyped}
@@ -259,6 +260,7 @@
 						step="0.1"
 						value={t.animation.delay}
 						readonly={editor.locked}
+						aria-disabled={editor.locked || undefined}
 						aria-label="{labelOf(t)}: animation delay in seconds"
 						use:tip={'Delay (s)'}
 						onfocus={(e) => noteFocus(e, t)}
@@ -274,6 +276,7 @@
 						step="0.1"
 						value={t.animation.duration}
 						readonly={editor.locked}
+						aria-disabled={editor.locked || undefined}
 						aria-label="{labelOf(t)}: animation duration in seconds"
 						use:tip={'Duration (s)'}
 						onfocus={(e) => noteFocus(e, t)}

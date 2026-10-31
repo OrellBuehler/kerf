@@ -829,6 +829,7 @@
 					<input
 						type="text"
 						value={v}
+						aria-label="{String(e.type).replace('_', ' ')} {k.replaceAll('_', ' ')}"
 						use:tip={k}
 						{...off}
 						onfocus={noteFocus}
@@ -848,6 +849,7 @@
 					<input
 						type="number"
 						value={v as number}
+						aria-label="{String(e.type).replace('_', ' ')} {k.replaceAll('_', ' ')}"
 						use:tip={k}
 						step="0.1"
 						{...off}
@@ -875,6 +877,7 @@
 	{/each}
 	<select
 		class="k-select"
+		aria-label="{title}: add an effect"
 		aria-disabled={editor.locked || undefined}
 		onmousedown={swallow}
 		onchange={(ev) => {
@@ -1265,8 +1268,8 @@
 				style="{FIELD};display:block;width:100%;height:auto;min-height:160px;resize:vertical;padding:8px 10px;font-family:var(--font-mono);font-size:11px;line-height:1.5;white-space:pre;overflow:auto"
 			></textarea>
 			<div style="display:flex;align-items:center;gap:7px;flex-wrap:wrap;margin-top:6px">
-				<Btn size="sm" variant="primary" disabled={!draftDirty || applying || editor.busy} onclick={() => void applySource()}>Apply</Btn>
-				<Btn size="sm" variant="ghost" disabled={!draftDirty || applying} onclick={revertSource}>Revert</Btn>
+				<Btn size="sm" variant="primary" disabled={!draftDirty} pending={applying || editor.locked} onclick={() => void applySource()}>Apply</Btn>
+				<Btn size="sm" variant="ghost" disabled={!draftDirty} pending={applying} onclick={revertSource}>Revert</Btn>
 				{#if draftDirty}<span style="font-size:12px;color:var(--text-muted)">Not applied yet</span>{/if}
 			</div>
 			{#if sourceError}
@@ -1605,7 +1608,8 @@
 						aria-disabled={editor.locked || undefined}
 						onmousedown={swallow}
 						onchange={(e) => {
-							if (editor.locked) return;
+							// A select that is only pending still takes the keys: put it back to what the clip has.
+							if (editor.locked) return void (e.currentTarget.value = blendModeOf(clip));
 							const mode = e.currentTarget.value as BlendMode;
 							if (mode !== blendModeOf(clip)) void run(() => editor.setBlendMode(clip.id, mode));
 						}}
@@ -1744,7 +1748,7 @@
 					aria-disabled={editor.locked || undefined}
 					onmousedown={swallow}
 						onchange={(e) => {
-						if (editor.locked) return;
+						if (editor.locked) return void (e.currentTarget.value = transition?.kind ?? '');
 						const k = e.currentTarget.value as '' | TransitionKind;
 						if (!k) void run(() => editor.setTransition(clip.id, null));
 						else void run(() => editor.setTransition(clip.id, { kind: k, duration: transition?.duration ?? DEFAULT_TRANSITION_SECONDS }));

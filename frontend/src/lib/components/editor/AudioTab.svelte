@@ -25,7 +25,9 @@
 				? 'This clip has no sound — select a clip with audio.'
 				: null
 	);
-	const off = $derived(reason !== null || editor.busy);
+	/** An edit is in flight, or the proposal is on screen: the presets ignore a press but keep focus (`pending`). A real
+	 *  reason — nothing selected, no sound — still switches them off (`disabled`). */
+	const hold = $derived(editor.locked);
 </script>
 
 <div style="flex:1;min-height:0;overflow-y:auto;padding:12px">
@@ -37,7 +39,8 @@
 	<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(96px,1fr));gap:6px">
 		{#each AUDIO_EFFECT_PRESETS as p (p.key)}
 			<Tile
-				disabled={off}
+				disabled={reason !== null}
+				pending={hold}
 				title={reason ?? p.hint}
 				onclick={() => clip && void attempt(() => editor.setAudioEffects(clip.id, [...effects, freshEffect(p)]))}
 			>
