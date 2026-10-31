@@ -58,18 +58,17 @@
 //!   `overlay` a full-canvas frame), so they are graded too and cover what is below.
 //! * **Scaler.** swscale's bicubic ([`sws`]): its filter tables ported from
 //!   `initFilter` — the integer weights, the window start truncated toward zero,
-//!   the border folding, the near-zero tap trimming — and its integer arithmetic
-//!   in the shader (15-bit horizontal intermediate clipped at the top, vertical
-//!   pass rounded at bit 19). A formula for "bicubic" is not enough: the table's
-//!   quirks show along every border, and busy footage shows them everywhere.
-//!   Planes are scaled independently at their own size and rounded to 8 bits
-//!   between stages, like FFmpeg's filters. The committed evidence is
-//!   `tests/parity.rs::the_scaler_matches_ffmpegs_scale_plane_by_plane`: every
-//!   plane within one level of `ffmpeg -vf scale` up to about 4:1, scaled down and
-//!   up, within two to three levels on 8:1 to 20:1 downscales of noise and test
-//!   patterns and within five at 40:1 (x86 swscale's vertical scaler is not
-//!   bit-exact with the C one this follows), identically on FFmpeg 6.1 and 9.0. A
-//!   shrink steeper than 40:1 ([`kerf_core::MAX_SHRINK`]) is not measured and is
+//!   the border folding, the near-zero tap trimming (kept in the padding of a SIMD build's
+//!   rows) — and its integer arithmetic in the shader (15-bit horizontal intermediate clipped at
+//!   the top, the vertical pass in the C arithmetic or in the x86 SIMD kernel's, whichever this
+//!   FFmpeg runs). A formula for "bicubic" is not enough: the table's quirks show along every border,
+//!   and busy footage shows them everywhere. Planes are scaled independently at their own size and
+//!   rounded to 8 bits between stages, like FFmpeg's filters. Which scaler a build is — the tables'
+//!   padding, the vertical kernel, and the algorithm an unflagged `scale` runs in a complex graph
+//!   (bilinear before FFmpeg 5) — is measured ([`scaler::kernels`]) and the committed evidence is
+//!   `tests/scaler.rs`: the model equals FFmpeg's `scale` sample for sample on both builds, 2:1 to
+//!   40:1, and the shader equals the model (`tests/parity.rs::the_scaler_matches_ffmpegs_scale_plane_by_plane`).
+//!   A shrink steeper than 40:1 ([`kerf_core::MAX_SHRINK`]) is not measured and is
 //!   refused. FFmpeg scales a picture in the format it has; the decode reduces it to
 //!   8-bit 4:2:0 first, which is the same picture only for 4:2:0 and gray: the chroma
 //!   of anything else is interpolated from different samples (a 2x enlargement of 4:4:4
@@ -140,6 +139,7 @@ pub mod compositor;
 pub mod cursor;
 pub mod effects;
 pub mod eq;
+pub mod fill;
 pub mod frame_cache;
 pub mod frame_source;
 pub mod gpu;
@@ -148,6 +148,7 @@ pub mod motion;
 pub mod present;
 pub mod roundtrip;
 pub mod router;
+pub mod scaler;
 pub mod selftest;
 pub mod showinfo;
 pub mod source;

@@ -435,6 +435,7 @@ impl Compositor {
         let filters = PlaneFilters {
             h: sws::bicubic(w, cw, sws::ONE_HORIZONTAL).ok_or_else(too_far)?,
             x86_start: vertical_start(&v) as u32,
+            c_rows: 1,
             v,
         };
         let u = self.scale_plane(enc, &full[1], stage, &filters, None);

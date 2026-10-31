@@ -168,7 +168,7 @@ impl Placement {
 /// `max(1, ...)` for it (`engine::cli::zoom_scale`) and the picture keeps a pixel.
 pub(crate) const TINY_SCALE: f64 = 0.01;
 
-fn lrint(d: f64) -> i64 {
+pub(crate) fn lrint(d: f64) -> i64 {
     d.round_ties_even() as i64
 }
 
@@ -183,7 +183,7 @@ pub fn ffmpeg_alpha(op: f64) -> u8 {
 }
 
 /// `av_rescale` for positive operands (`AV_ROUND_NEAR_INF`).
-fn av_rescale(a: i64, b: i64, c: i64) -> i64 {
+pub(crate) fn av_rescale(a: i64, b: i64, c: i64) -> i64 {
     (a * b + c / 2) / c
 }
 
@@ -191,7 +191,7 @@ fn av_rescale(a: i64, b: i64, c: i64) -> i64 {
 /// do to a position: `pad` only runs when there is one `scale`, which has converted
 /// the picture to 4:2:0 whatever format it started in, and `overlay` works on the
 /// 4:2:0 canvas.
-fn even(v: i64) -> i64 {
+pub(crate) fn even(v: i64) -> i64 {
     v & !1
 }
 

@@ -668,6 +668,15 @@ impl Planner {
                         crate::layer_geometry::cover_overflows(picture, canvas_size, &clip.transform),
                     )
                 };
+                let blur_fill = (self.canvas.fit == crate::model::Fit::Blur
+                    && crate::engine::blur_fill_clip(clip, planned.fx.alpha))
+                .then(|| {
+                    asset
+                        .original
+                        .as_ref()
+                        .and_then(|o| Some((o.width?, o.height?)))
+                        .unwrap_or((stream.width, stream.height))
+                });
                 layers.push(PlanLayer {
                     clip_id: clip.id,
                     asset_id: clip.asset_id,
@@ -704,6 +713,7 @@ impl Planner {
                     },
                     animated: planned.animated,
                     fit_order,
+                    blur_fill,
                     keyed_alpha: (motion && planned.animated.is_some_and(|a| a.opacity)).then(|| {
                         let pick = self.canvas.pick_fps;
                         let t = ffmpeg_frame_time(u64::try_from(frame).unwrap_or(0), pick.num, pick.den);
@@ -1726,6 +1736,8 @@ mod tests {
             hdr: true,
             effects: EffectKinds::ALL,
             grade: crate::plan_caps::GradeKinds::NONE,
+            exact_scaler: false,
+            blur_fill: false,
         };
         let holding = |edit: &dyn Fn(&mut Clip)| {
             let mut clip = make_clip(a.id, 0.0, 4.0, 0.0);
@@ -1944,6 +1956,8 @@ mod tests {
             hdr: true,
             effects: EffectKinds::ALL,
             grade: crate::plan_caps::GradeKinds::NONE,
+            exact_scaler: false,
+            blur_fill: false,
         };
         // (The overlay names the shipped default font, which a text pass can draw.)
         assert_eq!(plan.reasons(&all, size), vec![]);
@@ -1952,6 +1966,176 @@ mod tests {
         let mut unnamed = export;
         unnamed.overlays[0].font_file = None;
         assert_eq!(unnamed.reasons(&all, size), vec![Unsupported::TextWithoutFont]);
+    }
+
+    /// The blurred fill is decided per layer, from the clip (placed by the plain fit, not see-through: the same answer
+    /// as the graph's `takes_blur_fill`) and the render size (a picture that is the shape of the frame has no bars), and
+    /// a compositor that draws it is asked for what it cannot: another pixel format, an HDR picture, a shrink into the
+    /// thumbnail past what the scaler comparison reaches, a frame too small for the box blur.
+    #[test]
+    fn a_blurred_fill_is_judged_per_layer_and_by_the_render_size_and_refused_for_what_it_cannot_draw() {
+        let caps = GpuCaps {
+            blur_fill: true,
+            exact_scaler: true,
+            ..GpuCaps::A0
+        };
+        let blur = |w, h| ExportOptions {
+            resolution: Some((w, h)),
+            fit: Fit::Blur,
+            ..opts(30.0)
+        };
+        let why = |tl: &Timeline, a: &Asset, o: &ExportOptions, size: Option<(u32, u32)>, caps: &GpuCaps| {
+            let plan = planner(tl, std::slice::from_ref(a), PlanMode::Still, o).at_frame(15).unwrap();
+            plan.reasons(caps, size.unwrap_or_else(|| plan.size(u32::MAX)))
+        };
+        let a = asset();
+        let plain = single(vec![make_clip(a.id, 0.0, 4.0, 0.0)]);
+        // The layer's own answer: the shape of the picture the graph judges the frame by, when the clip takes the fill.
+        let plan = planner(&plain, std::slice::from_ref(&a), PlanMode::Still, &blur(1080, 1920))
+            .at_frame(15)
+            .unwrap();
+        assert_eq!(plan.layers[0].blur_fill, Some((1920, 1080)));
+        let plan = planner(&plain, std::slice::from_ref(&a), PlanMode::Still, &opts(30.0))
+            .at_frame(15)
+            .unwrap();
+        assert_eq!(plan.layers[0].blur_fill, None, "no fill unless the delivery fits over one");
+        // ... a clip placed by a transform, keyed, masked or see-through does not take it.
+        for (name, edit) in [
+            (
+                "zoomed",
+                Box::new(|c: &mut Clip| c.transform.scale = 0.5) as Box<dyn Fn(&mut Clip)>,
+            ),
+            ("moved", Box::new(|c: &mut Clip| c.transform.pos_x = 0.1)),
+            ("translucent", Box::new(|c: &mut Clip| c.transform.opacity = 0.5)),
+            (
+                "masked",
+                Box::new(|c: &mut Clip| {
+                    c.mask = Some(Mask {
+                        shape: crate::model::MaskShape::Rect,
+                        x: 0.5,
+                        y: 0.5,
+                        width: 0.5,
+                        height: 0.5,
+                        feather: 0.0,
+                        inverted: false,
+                    });
+                }),
+            ),
+            (
+                "keyed",
+                Box::new(|c: &mut Clip| c.keyframes = vec![keyed(0.0, 1.0, 0.0), keyed(1.0, 1.2, 0.0)]),
+            ),
+        ] {
+            let mut c = make_clip(a.id, 0.0, 4.0, 0.0);
+            edit(&mut c);
+            let plan = planner(&single(vec![c]), std::slice::from_ref(&a), PlanMode::Still, &blur(1080, 1920))
+                .at_frame(15)
+                .unwrap();
+            assert_eq!(plan.layers[0].blur_fill, None, "{name}");
+        }
+        // A colour keyed but no transform is still placed by the plain fit (the graph asks the clip's transform alone).
+        // The shape is judged at the render size: 1920x1080 in a frame of its own shape has nothing to fill.
+        let plan = planner(&plain, std::slice::from_ref(&a), PlanMode::Still, &blur(1920, 1080))
+            .at_frame(15)
+            .unwrap();
+        assert_eq!(plan.layers[0].blur_fill, Some((1920, 1080)));
+        assert!(plan.blur_fill(&plan.layers[0], (1920, 1080)).unwrap().is_none());
+        assert!(plan.blur_fill(&plan.layers[0], (540, 960)).unwrap().is_some());
+        assert!(!why(&plain, &a, &blur(1920, 1080), None, &GpuCaps::A0)
+            .iter()
+            .any(|u| matches!(u, Unsupported::BlurFill)));
+        // Without the pass, or without the exact scaler under it, a frame with bars to fill is refused once.
+        for caps in [
+            GpuCaps::A0,
+            GpuCaps {
+                blur_fill: true,
+                ..GpuCaps::A0
+            },
+            GpuCaps {
+                exact_scaler: true,
+                ..GpuCaps::A0
+            },
+        ] {
+            let refused = why(&plain, &a, &blur(1080, 1920), None, &caps);
+            assert_eq!(
+                refused.iter().filter(|u| matches!(u, Unsupported::BlurFill)).count(),
+                1,
+                "{refused:?}"
+            );
+        }
+        assert_eq!(why(&plain, &a, &blur(1080, 1920), None, &caps), vec![]);
+        // What a compositor with the pass cannot draw, by layer.
+        let layer_with = |pix: Option<&str>, edit: &dyn Fn(&mut Asset)| {
+            let mut a = asset();
+            a.streams[0].pix_fmt = pix.map(String::from);
+            edit(&mut a);
+            let tl = single(vec![make_clip(a.id, 0.0, 4.0, 0.0)]);
+            why(&tl, &a, &blur(1080, 1920), None, &caps)
+        };
+        let detail = |reasons: &[Unsupported]| {
+            reasons
+                .iter()
+                .filter_map(|u| match u {
+                    Unsupported::BlurFillWith(_, d) => Some(*d),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(detail(&layer_with(Some("yuv420p"), &|_| {})), Vec::<&str>::new());
+        for pix in [
+            "yuv422p",
+            "yuv444p",
+            "yuv420p10le",
+            "gray",
+            "rgb24",
+            "yuvj420p",
+            "nv12",
+            "yuv420p12le",
+        ] {
+            let d = detail(&layer_with(Some(pix), &|_| {}));
+            assert_eq!(d.len(), 1, "{pix}: {d:?}");
+            assert!(d[0].contains("not 8-bit `yuv420p`"), "{pix}: {d:?}");
+        }
+        assert_eq!(
+            detail(&layer_with(None, &|_| {})).len(),
+            1,
+            "an unrecorded format is not known to be 4:2:0"
+        );
+        let pc = detail(&layer_with(Some("yuv420p"), &|a| {
+            a.streams[0].color_range = Some("pc".into());
+        }));
+        assert!(pc.len() == 1 && pc[0].contains("full-range"), "{pc:?}");
+        // A shrink into the thumbnail past 40:1: a 4000-wide picture into a 1080x1920 frame's 134x240 (a cover of 427x240
+        // for a 16:9 picture: 9.4:1) is fine, a picture 40 times wider than its cover is not.
+        let wide = |w: u32, h: u32| {
+            let mut a = test_asset(vec![video_stream(w, h, 30.0)]);
+            a.streams[0].pix_fmt = Some("yuv420p".into());
+            let tl = single(vec![make_clip(a.id, 0.0, 4.0, 0.0)]);
+            why(&tl, &a, &blur(1080, 1920), None, &caps)
+        };
+        assert_eq!(detail(&wide(3840, 2160)), Vec::<&str>::new());
+        let steep = detail(&wide(20000, 11250));
+        assert!(steep.len() == 1 && steep[0].contains("40:1"), "{steep:?}");
+        // A frame too small for the box blur: 32x32's 4x4 thumbnail has 2-sample chroma lines.
+        let tiny = why(&plain, &a, &blur(32, 32), None, &caps);
+        assert!(
+            tiny.iter()
+                .any(|u| matches!(u, Unsupported::BlurFillWith(_, d) if d.contains("too small"))),
+            "{tiny:?}"
+        );
+        // An HDR picture is tone-mapped ahead of the fit and composes in 10 bits.
+        let mut hdr = asset();
+        hdr.streams[0].color_transfer = Some("arib-std-b67".into());
+        hdr.streams[0].color_primaries = Some("bt2020".into());
+        hdr.streams[0].color_space = Some("bt2020nc".into());
+        let tl = single(vec![make_clip(hdr.id, 0.0, 4.0, 0.0)]);
+        let reasons = why(&tl, &hdr, &blur(1080, 1920), None, &caps);
+        assert!(
+            reasons
+                .iter()
+                .any(|u| matches!(u, Unsupported::BlurFillWith(_, d) if d.contains("HDR"))),
+            "{reasons:?}"
+        );
     }
 
     #[test]
@@ -1991,15 +2175,56 @@ mod tests {
             ..opts(30.0)
         };
         assert!(has(&at(PlanMode::Motion, &gif), |u| matches!(u, Unsupported::Gif)));
-        // A blurred fill is FFmpeg's, in a still as in an export frame.
+        // A blurred fill is FFmpeg's until a compositor says it draws one (and has an exact scaler under it), in a still
+        // as in an export frame: for a clip placed by the plain fit, whose picture leaves bars. A keyed clip is
+        // placed with Contain's chain, whatever the delivery's fit, and is not refused for it.
         let blur = ExportOptions {
             resolution: Some((1080, 1920)),
             fit: Fit::Blur,
             ..opts(30.0)
         };
+        let plain = single(vec![make_clip(assets[0].id, 0.0, 4.0, 0.0)]);
         for mode in [PlanMode::Still, PlanMode::Motion] {
-            assert!(has(&at(mode, &blur), |u| matches!(u, Unsupported::BlurFill)));
-            assert!(!has(&at(mode, &opts(30.0)), |u| matches!(u, Unsupported::BlurFill)));
+            let fill = |tl: &_, o: &ExportOptions, caps: &GpuCaps| {
+                let plan = planner(tl, &assets, mode, o).at_frame(15).unwrap();
+                plan.reasons(caps, plan.size(u32::MAX))
+            };
+            assert!(has(&fill(&plain, &blur, &GpuCaps::A0), |u| matches!(
+                u,
+                Unsupported::BlurFill
+            )));
+            assert!(!has(&fill(&plain, &opts(30.0), &GpuCaps::A0), |u| matches!(
+                u,
+                Unsupported::BlurFill
+            )));
+            assert!(
+                !has(&at(mode, &blur), |u| matches!(u, Unsupported::BlurFill)),
+                "a keyed clip is placed as Contain"
+            );
+            // With the pass and the exact scaler under it the fill is drawn (the export frame has its own reasons).
+            let caps = GpuCaps {
+                blur_fill: true,
+                exact_scaler: true,
+                ..GpuCaps::A0
+            };
+            let drawn = fill(&plain, &blur, &caps);
+            assert!(
+                !has(&drawn, |u| matches!(u, Unsupported::BlurFill | Unsupported::BlurFillWith(..))),
+                "{drawn:?}"
+            );
+            // ... but not without the scaler being exact, nor for a fill that is not yet in the caps.
+            for caps in [
+                GpuCaps {
+                    blur_fill: true,
+                    ..GpuCaps::A0
+                },
+                GpuCaps {
+                    exact_scaler: true,
+                    ..GpuCaps::A0
+                },
+            ] {
+                assert!(has(&fill(&plain, &blur, &caps), |u| matches!(u, Unsupported::BlurFill)));
+            }
         }
         // A zoom that moves is the last stage of the export's chain (`keyed_zoom.rs`), which
         // the compositor does not order that way yet.
@@ -2562,6 +2787,8 @@ mod tests {
             hdr: true,
             effects: EffectKinds::ALL,
             grade: crate::plan_caps::GradeKinds::NONE,
+            exact_scaler: false,
+            blur_fill: false,
         };
         let keyed_clip = |a: &Asset| {
             let mut clip = make_clip(a.id, 0.0, 4.0, 1.0);

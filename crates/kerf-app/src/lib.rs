@@ -4791,10 +4791,16 @@ async fn get_render_bar(
         // The grade is in the GPU's caps once this FFmpeg's conversions are known to be the ones it draws, so a cut
         // with one asks (once per process, off the lock, like `kerf_gpu::prepare` does for a frame).
         let caps = enabled.then(|| {
-            if timeline.tracks.iter().flat_map(|t| &t.clips).any(|c| !c.grade.is_identity()) {
+            let graded = timeline.tracks.iter().flat_map(|t| &t.clips).any(|c| !c.grade.is_identity());
+            if graded {
                 let _ = kerf_gpu::grade::kernels();
             }
-            kerf_gpu::Compositor::caps_for(kerf_gpu::grade::measured())
+            // The scaler is exact in the caps once it is measured; the blurred fill and a resized graded layer are
+            // drawn only then.
+            if graded || timeline.format.as_ref().is_some_and(|f| f.fit == kerf_core::Fit::Blur) {
+                let _ = kerf_gpu::scaler::kernels();
+            }
+            kerf_gpu::Compositor::caps_for(kerf_gpu::grade::measured(), kerf_gpu::scaler::measured())
         });
         let req = kerf_core::render_bar::BarRequest {
             caps,

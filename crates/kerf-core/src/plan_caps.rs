@@ -146,6 +146,15 @@ pub struct GpuCaps {
     /// whatever the caps (`GradeWith`): a layer the scaler resizes, a letterbox, an odd picture, a format other
     /// than 8-bit limited-range `yuv420p`, video effects behind the grade, a running black or white fade and a moving zoom.
     pub grade: GradeKinds,
+    /// The compositor's scaler is swscale's **to the level** on this machine: the vertical kernel FFmpeg runs
+    /// (its x86 SIMD one or the C one) was measured and is the one the compositor draws with. Without it a resized
+    /// layer is a level from FFmpeg's (swscale's x86 kernel truncates every tap) and what that level would grow
+    /// into is refused: a resized layer under a grade, the blurred fill.
+    pub exact_scaler: bool,
+    /// The blurred fill of a `Fit::Blur` delivery ([`crate::blur_fill`]): the thumbnail chain scaled, box-blurred and
+    /// scaled back up behind the fitted picture. Needs [`GpuCaps::exact_scaler`] as well: the fill is two bilinear
+    /// scales and a blur of the picture, and the picture a bicubic one.
+    pub blur_fill: bool,
 }
 
 impl GpuCaps {
@@ -166,6 +175,8 @@ impl GpuCaps {
         hdr: false,
         effects: EffectKinds::NONE,
         grade: GradeKinds::NONE,
+        exact_scaler: false,
+        blur_fill: false,
     };
 }
 
@@ -238,9 +249,12 @@ pub enum Unsupported {
     Delivery(String),
     /// The delivery is a gif, which goes through a palette the compositor does not build.
     Gif,
-    /// The delivery fits footage over a blurred copy of itself ([`crate::model::Fit::Blur`]): FFmpeg's
-    /// `boxblur` on a thumbnail scaled back up, with no compositor pass or parity case yet.
+    /// The delivery fits footage over a blurred copy of itself ([`crate::model::Fit::Blur`]) and the compositor
+    /// does not draw the fill, or has no exact scaler under it (`GpuCaps::blur_fill`, `GpuCaps::exact_scaler`):
+    /// FFmpeg's `boxblur` on a thumbnail scaled back up.
     BlurFill,
+    /// A blurred fill the compositor draws in general but not for this layer or at this size (the detail says why).
+    BlurFillWith(LayerRef, &'static str),
     /// The canvas and each clip's `fps` filter parse the delivery rate to different rationals
     /// (`canvas`, `clips`), so a clip's frame slots are not the canvas's frames: the pick
     /// assumes one grid.
@@ -385,6 +399,7 @@ impl Unsupported {
             Self::Delivery(_) => "delivery",
             Self::Gif => "gif",
             Self::BlurFill => "blur_fill",
+            Self::BlurFillWith(..) => "blur_fill_with",
             Self::PickRate { .. } => "pick_rate",
             Self::Hdr(_) => "hdr",
             Self::AlphaPicture(..) => "alpha_picture",
@@ -451,7 +466,8 @@ impl fmt::Display for Unsupported {
             Self::Motion => f.write_str("the plan is of an export frame (motion mode), which the compositor does not draw yet"),
             Self::Delivery(pf) => write!(f, "the delivery is {pf}, and the compositor draws 8-bit 4:2:0 only"),
             Self::Gif => f.write_str("a gif delivery goes through a palette the compositor does not build"),
-            Self::BlurFill => f.write_str("the delivery fills the frame with a blurred copy of the footage, which the compositor does not draw"),
+            Self::BlurFill => f.write_str("the delivery fills the frame with a blurred copy of the footage, which this compositor does not draw (or draws without an exact scaler under it)"),
+            Self::BlurFillWith(l, why) => write!(f, "{l}: the blurred fill behind a picture that leaves bars is not drawn for {why}"),
             Self::PickRate { canvas, clips } => write!(
                 f,
                 "the delivery rate is {}/{} on the canvas and {}/{} on a clip's fps filter, which are different frame grids",
@@ -639,6 +655,7 @@ mod tests {
             Unsupported::Motion.kind(),
             Unsupported::Gif.kind(),
             Unsupported::BlurFill.kind(),
+            Unsupported::BlurFillWith(layer(0, ""), "an HDR picture").kind(),
             Unsupported::Text.kind(),
             Unsupported::TextWithoutFont.kind(),
             Unsupported::TextBorder.kind(),

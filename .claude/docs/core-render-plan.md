@@ -184,10 +184,15 @@
   before the source's first picture are `Early` (nothing drawn), as in the export.
   A rate whose canvas and `fps=` parses differ (`29.970029`) is refused in Motion
   (`Unsupported::PickRate`): the pick assumes one grid.
-  A blurred-fill delivery (`Fit::Blur`) is refused whenever a layer is on screen, still and motion
-  alike (`Unsupported::BlurFill`, `size_free_reasons`): the fill is FFmpeg's `boxblur` on a thumbnail
-  with no compositor pass or parity case. `LayerGeometry` places the picture as under `Contain`, and so
-  does its port (`layer-geometry.ts`, `croppable`: the corpus replays blurred cases).
+  A blurred-fill delivery (`Fit::Blur`) is judged **per layer and by the render size**: `PlanLayer::blur_fill` is `Some(picture)` for a clip
+  the fill suits (`engine::cli::blur_fill_clip`: identity transform, not keyed, no reframe, no mask, no alpha; the picture is the original's,
+  which the graph judges the shape by), `RenderPlan::blur_fill(layer, size)` resolves the thumbnail chain (`blur_fill::BlurFill`: the cover, the
+  crop, the radius) when that picture is not the frame's shape, and `reasons` asks a compositor with `caps.blur_fill` **and** `caps.exact_scaler`
+  for the layer that leaves bars (`geom.matte`): `Unsupported::BlurFill` without them (once a plan), `BlurFillWith(layer, why)` for a picture that is not
+  8-bit `yuv420p` (or never recorded), a full-range one, an HDR one, a thumbnail shrunk past 40:1 (`MAX_SHRINK`) or a frame whose chroma lines are
+  shorter than `2r + 1` (`BlurFill::resolve`). A clip the fill does not suit is placed by Contain's chain, byte for byte, and is not refused for the
+  delivery's fit. `LayerGeometry` still places the picture as under `Contain` (and so does its port, `layer-geometry.ts`, `croppable`: the corpus
+  replays blurred cases); the compositor makes the whole padded frame of it.
   **Traps for the `FrameSource` that will feed it** (A1b): `showinfo` pts under `-copyts
   -start_at_zero -ss` are already start-relative, so pass `start_us = 0`; use the decoder's
   best-effort timestamps (AVI has no frame pts); a streaming cursor needs `STARTPTS`, one

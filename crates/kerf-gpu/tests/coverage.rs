@@ -1006,7 +1006,8 @@ fn the_ledger_says_which_refusals_hold_the_compositor_back() {
     let policy = composite_color_policy();
     // The caps the app asks with: the grade is drawn only where this FFmpeg's conversions are the model's (one probe).
     let kernels = kerf_gpu::grade::kernels();
-    let caps = Compositor::caps_for(kernels);
+    let scaler = kerf_gpu::scaler::kernels();
+    let caps = Compositor::caps_for(kernels, scaler);
     let mut cuts = vec![];
     for (name, tl) in archetypes(media) {
         for (mode, request) in [("still", PlanRequest::still(policy)), ("motion", PlanRequest::motion(policy))] {
@@ -1032,7 +1033,7 @@ fn the_ledger_says_which_refusals_hold_the_compositor_back() {
         "kerf-gpu coverage ledger: the frames the compositor draws and what refuses the rest".to_string(),
         format!("ffmpeg: {version_line}"),
         format!("composite colour policy: {policy:?}"),
-        format!("grade kernels: {kernels:?} (caps: Compositor::caps_for(grade::kernels()), as the app asks)"),
+        format!("grade kernels: {kernels:?}, scaler: {scaler:?} (caps: Compositor::caps_for(grade::kernels(), scaler::kernels()), as the app asks)"),
         "plans: every output frame of every archetype over OriginalMedia at 540 px wide (the app's preview plans ProxyMedia at 960); nothing is rendered".to_string(),
         "archetypes: the review's T1 to T3 and the real-world T4 to T8 of tests/coverage.rs".to_string(),
     ];

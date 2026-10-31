@@ -541,7 +541,7 @@ fn this_ffmpeg_converts_as_the_model_does() {
     // What a plan is made from is the same answer, without running anything.
     assert_eq!(kerf_gpu::grade::measured(), kerf_gpu::grade::Kernels::Match);
     assert_eq!(
-        Compositor::caps_for(kerf_gpu::grade::measured()).grade,
+        Compositor::caps_for(kerf_gpu::grade::measured(), kerf_gpu::scaler::measured()).grade,
         kerf_core::GradeKinds::ALL
     );
 }

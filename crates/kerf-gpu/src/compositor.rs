@@ -57,7 +57,7 @@ use crate::roundtrip::{Rgb2Yuv, Yuv2Rgb};
 
 mod grade_passes;
 use crate::source::{chroma_size, decode_layers, YuvFrame};
-use crate::sws::{self, Filter};
+use crate::sws::{self, Filter, Scaler};
 use crate::text::{self, Blend, Raster, Source, TextAtlas};
 use grade_passes::{grade_geometry_refusal, GradeLook, GradePasses};
 use kerf_core::layer_geometry::{LayerGeometry, Rect, ScaleStage};
@@ -156,6 +156,10 @@ struct ResampleParams {
     taps: i32,
     /// The vertical pass's x86 kernel start constant, or 0 for the C arithmetic (`grade.rs`).
     x86: u32,
+    /// The first row of the scaled picture that swscale's C kernel computes (the last rows of a picture are not
+    /// handed to the SIMD one); only read when `x86` is set.
+    c_from: i32,
+    pad: [i32; 3],
 }
 
 #[repr(C)]
@@ -326,6 +330,9 @@ pub struct Compositor {
     /// Whether this FFmpeg's conversions to and from RGB are the ones the grade follows, when pinned
     /// ([`Compositor::with_grade_kernels`]); else measured ([`crate::grade::kernels`]).
     grade_kernels: Option<crate::grade::Kernels>,
+    /// Whether this FFmpeg's scaler is the model, when pinned ([`Compositor::with_scaler_kernels`]); else measured
+    /// ([`crate::scaler::kernels`]).
+    scaler_kernels: Option<crate::scaler::Kernels>,
     /// The threads FFmpeg's filter graph slices a frame into, when pinned ([`Compositor::with_graph_threads`]);
     /// else they are the graph's the frame stands in for ([`Compositor::graph_threads_for`]).
     graph_threads: Option<u32>,
@@ -339,6 +346,8 @@ struct PlaneOps {
     fade: wgpu::RenderPipeline,
     unsharp: wgpu::RenderPipeline,
     edge: wgpu::RenderPipeline,
+    /// One pass of `boxblur` (the blurred fill).
+    box_blur: wgpu::RenderPipeline,
     blur_layout: wgpu::BindGroupLayout,
     blur_h: wgpu::ComputePipeline,
     blur_v: wgpu::ComputePipeline,
@@ -607,6 +616,16 @@ struct Drawn<'a> {
     look: LayerLook,
     /// The frames the layer's chain has passed on before this one (`vignette`'s dither runs on from them).
     count: u64,
+    /// The blurred fill behind a picture that leaves bars (`Fit::Blur`): the thumbnail chain, drawn behind the picture.
+    fill: Option<FillDraw>,
+}
+
+/// The tables of a blurred fill's two scales: the picture to the thumbnail cover (cropped), and the blurred thumbnail
+/// back up to the frame, a set per plane.
+struct FillDraw {
+    fill: kerf_core::blur_fill::BlurFill,
+    down: [PlaneFilters; 3],
+    up: [PlaneFilters; 3],
 }
 
 /// What the `fade` filters of a layer's chain do at this frame, as the passes take them:
@@ -771,6 +790,9 @@ pub fn prepare(plan: &RenderPlan) {
     if plan.layers.iter().any(|l| !l.grade.is_identity()) {
         let _ = crate::grade::kernels();
     }
+    if !plan.layers.is_empty() {
+        let _ = crate::scaler::kernels();
+    }
 }
 
 impl Compositor {
@@ -796,16 +818,20 @@ impl Compositor {
     /// The combinations the plan names (`Unsupported`) stay FFmpeg's.
     /// Each later pass flips its bit beside the pass and its parity cases.
     pub fn caps(&self) -> GpuCaps {
-        Self::caps_for(self.grade_kernels.unwrap_or_else(crate::grade::measured))
+        Self::caps_for(
+            self.grade_kernels.unwrap_or_else(crate::grade::measured),
+            self.scaler_kernels.unwrap_or_else(crate::scaler::measured),
+        )
     }
 
-    /// [`Compositor::caps`] for a machine whose FFmpeg's conversions are `kernels`, without a device: the way a host that
-    /// has none to ask (the render bar) says what the GPU draws.
-    pub fn caps_for(kernels: crate::grade::Kernels) -> GpuCaps {
+    /// [`Compositor::caps`] for a machine whose FFmpeg's conversions are `kernels` and whose scaler is `scaler`, without
+    /// a device: the way a host that has none to ask (the render bar) says what the GPU draws.
+    pub fn caps_for(kernels: crate::grade::Kernels, scaler: crate::scaler::Kernels) -> GpuCaps {
         let mut caps = Self::CAPS;
         if kernels != crate::grade::Kernels::Match {
             caps.grade = GradeKinds::NONE;
         }
+        caps.exact_scaler = scaler.exact();
         caps
     }
 
@@ -822,6 +848,8 @@ impl Compositor {
         caps.keyed_opacity = true;
         caps.keyed_color = true;
         caps.mask = true;
+        caps.exact_scaler = true;
+        caps.blur_fill = true;
         caps.grade = GradeKinds::ALL;
         caps.effects = EffectKinds::BLUR
             .union(EffectKinds::SHARPEN)
@@ -848,6 +876,36 @@ impl Compositor {
     pub fn with_grade_kernels(mut self, kernels: crate::grade::Kernels) -> Self {
         self.grade_kernels = Some(kernels);
         self
+    }
+
+    /// Pin whether this FFmpeg's scaler is the model, and which vertical kernel it runs, instead of measuring the
+    /// ffmpeg this process runs ([`crate::scaler::kernels`], on the first resized layer unless [`prepare`] ran ahead of
+    /// it): for a host that knows its ffmpeg, and for tests. Anything but a match is drawn with the C kernel and
+    /// takes [`GpuCaps::exact_scaler`] out of [`Compositor::caps`].
+    #[must_use]
+    pub fn with_scaler_kernels(mut self, kernels: crate::scaler::Kernels) -> Self {
+        self.scaler_kernels = Some(kernels);
+        self
+    }
+
+    /// The tables of one plane of a scale stage: swscale's for `flag` (`None`: this build's default for an unflagged
+    /// `scale`), padded the way this FFmpeg's scaler pads them, and the vertical pass in the arithmetic it runs
+    /// ([`crate::scaler::kernels`]). `None` for a ratio swscale needs two passes for.
+    fn plane_filters(&self, flag: Option<Scaler>, ps: &PlaneStage, chroma: bool) -> Option<PlaneFilters> {
+        let model = self.scaler_kernels.unwrap_or_else(crate::scaler::kernels).model();
+        let scaler = model.scaler(flag);
+        let (align_h, align_v) = model.kernel.alignment();
+        let v = sws::table_aligned(scaler, ps.src.h, ps.scaled.1, sws::ONE_VERTICAL, align_v)?;
+        Some(PlaneFilters {
+            h: sws::table_aligned(scaler, ps.src.w, ps.scaled.0, sws::ONE_HORIZONTAL, align_h)?,
+            x86_start: if model.kernel.simd_vertical() && v.size > 1 {
+                crate::scaler::vertical_start(v.size) as u32
+            } else {
+                0
+            },
+            c_rows: if chroma { 1 } else { 2 },
+            v,
+        })
     }
 
     /// Draw `chromakey` as an FFmpeg filter graph of `threads` slice threads draws it, for every plan,
@@ -1128,6 +1186,7 @@ impl Compositor {
                 vignettes: VignetteMaps::default(),
                 geq_edge: None,
                 grade_kernels: None,
+                scaler_kernels: None,
                 key_terms: OnceLock::new(),
                 graph_threads: None,
             })
@@ -1180,6 +1239,7 @@ impl Compositor {
         let fade = render("ops fade", &ops_module, &layout, "fs_fade");
         let unsharp = render("ops unsharp", &ops_module, &layout, "fs_unsharp");
         let edge = render("ops edge", &ops_module, &layout, "fs_edge");
+        let box_blur = render("ops box blur", &ops_module, &layout, "fs_box");
 
         let entry = |binding: u32, ty: wgpu::BindingType, visibility: wgpu::ShaderStages| wgpu::BindGroupLayoutEntry {
             binding,
@@ -1278,6 +1338,7 @@ impl Compositor {
             fade,
             unsharp,
             edge,
+            box_blur,
             blur_layout,
             blur_h,
             blur_v,
@@ -1325,7 +1386,13 @@ impl Compositor {
     }
 
     fn upload(&self, label: &str, w: u32, h: u32, data: &[u8]) -> Plane {
-        let p = self.plane(label, w, h, PLANE_FORMAT, wgpu::TextureUsages::COPY_DST);
+        let p = self.plane(
+            label,
+            w,
+            h,
+            PLANE_FORMAT,
+            wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
+        );
         self.gpu.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &p.texture,
@@ -1517,7 +1584,7 @@ impl Compositor {
             keep.w,
             keep.h,
             PLANE_FORMAT,
-            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
         );
         let base = ResampleParams {
             src_off: [src.x as i32, src.y as i32],
@@ -1528,6 +1595,8 @@ impl Compositor {
             plane: 0,
             taps: filters.h.size as i32,
             x86: 0,
+            c_from: 0,
+            pad: [0; 3],
         };
         let (lut_view, lut_row) = lut.map_or((&self.identity_lut, 0), |(v, r)| (v, r));
         let bind = |params: ResampleParams, view: &wgpu::TextureView, taps: &wgpu::TextureView| {
@@ -1569,6 +1638,7 @@ impl Compositor {
                 plane: lut_row,
                 taps: filters.v.size as i32,
                 x86: filters.x86_start,
+                c_from: stage.scaled.1 as i32 - filters.c_rows as i32,
                 ..base
             },
             &mid.view,
@@ -1576,6 +1646,114 @@ impl Compositor {
         );
         self.pass(enc, &self.resample_v, &out.view, &v, Some(wgpu::Color::BLACK), None);
         out
+    }
+
+    /// The tables of a layer's blurred fill: the picture's scale to the thumbnail's cover (cropped to it) and the
+    /// thumbnail's scale back up to the frame, each plane's, `flags=bilinear` (the chain says so, whatever the
+    /// delivery's scaler). `None` for a ratio swscale needs two passes for.
+    fn fill_draw(&self, n: usize, fill: kerf_core::blur_fill::BlurFill) -> Result<FillDraw, GpuError> {
+        let too_far = || GpuError::Unsupported(format!("layer {n}: a scale ratio swscale needs two passes for"));
+        let (down, up) = Self::fill_stages(&fill);
+        let tables = |stage: &ScaleStage| -> Result<[PlaneFilters; 3], GpuError> {
+            let one = |chroma: bool| {
+                self.plane_filters(Some(Scaler::Bilinear), &plane_stage(stage, chroma), chroma)
+                    .ok_or_else(too_far)
+            };
+            Ok([one(false)?, one(true)?, one(true)?])
+        };
+        Ok(FillDraw {
+            down: tables(&down)?,
+            up: tables(&up)?,
+            fill,
+        })
+    }
+
+    /// The two scales of the fill: picture to the cover, cropped to the thumbnail, and thumbnail to the frame.
+    fn fill_stages(fill: &kerf_core::blur_fill::BlurFill) -> (ScaleStage, ScaleStage) {
+        let (tw, th) = fill.thumb();
+        (
+            ScaleStage {
+                src: Rect::whole(fill.source.0, fill.source.1),
+                scaled: fill.cover,
+                keep: fill.crop,
+            },
+            ScaleStage {
+                src: Rect::whole(tw, th),
+                scaled: fill.frame,
+                keep: Rect::whole(fill.frame.0, fill.frame.1),
+            },
+        )
+    }
+
+    /// `boxblur=r:2` on one plane: the blur along rows twice, then along columns twice, each pass `blur8` of the
+    /// filter (`planeops.wgsl`'s `fs_box`).
+    fn box_blur_plane(&self, enc: &mut wgpu::CommandEncoder, input: &Plane, radius: u32) -> Plane {
+        let length = 2 * radius as i32 + 1;
+        let inv = ((1 << 16) + length / 2) / length;
+        let mut current = input.clone();
+        for axis in [0u32, 0, 1, 1] {
+            let out = self.out_plane("box blur", &current);
+            let params = PlaneOpParams {
+                size: [current.w as i32, current.h as i32],
+                row: radius as i32,
+                amount: inv,
+                kind: axis,
+                black: 0,
+                f_in: 0,
+                f_out: 0,
+            };
+            let bind = self.ops_bind(&params, &current.view, &self.text.blank);
+            self.pass(enc, &self.ops.box_blur, &out.view, &bind, None, None);
+            current = out;
+        }
+        current
+    }
+
+    /// The frame of a blurred fill with the picture on it: per plane, the picture scaled to the thumbnail's cover
+    /// (bilinear) and cropped to it, blurred (`boxblur`), scaled up to the frame (bilinear, through `eq`'s tables
+    /// if the layer has them: the filter runs on the whole padded frame), and `overlay`'s copy of the fitted picture
+    /// (`picture`) on it at the position it centres it at. A chroma sample of the picture lands whole, the half
+    /// block of an odd picture's last column and row included.
+    fn blur_fill_planes(
+        &self,
+        enc: &mut wgpu::CommandEncoder,
+        source: &[Plane; 3],
+        picture: &[Plane; 3],
+        fill: &FillDraw,
+        geom: &LayerGeometry,
+        tables: Option<&wgpu::TextureView>,
+    ) -> [Plane; 3] {
+        let (down, up) = Self::fill_stages(&fill.fill);
+        let frame: [Plane; 3] = std::array::from_fn(|pi| {
+            let chroma = pi > 0;
+            let thumb = self.scale_plane(enc, &source[pi], plane_stage(&down, chroma), &fill.down[pi], None);
+            let blurred = self.box_blur_plane(enc, &thumb, fill.fill.radius);
+            let lut = tables.map(|t| (t, pi as u32));
+            self.scale_plane(enc, &blurred, plane_stage(&up, chroma), &fill.up[pi], lut)
+        });
+        for (pi, (picture, frame)) in picture.iter().zip(&frame).enumerate() {
+            let shift = u32::from(pi > 0);
+            enc.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &picture.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &frame.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: geom.picture_at.0 >> shift,
+                        y: geom.picture_at.1 >> shift,
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                extent(picture.w, picture.h),
+            );
+        }
+        frame
     }
 
     /// A bind group over one uniform and two textures for a pass of [`PlaneOps`].
@@ -2300,14 +2478,16 @@ impl Compositor {
                 let table = |chroma: bool| -> Result<PlaneFilters, GpuError> {
                     let ps = plane_stage(stage, chroma);
                     let too_far = || GpuError::Unsupported(format!("layer {n}: a scale ratio swscale needs two passes for"));
-                    Ok(PlaneFilters {
-                        h: sws::bicubic(ps.src.w, ps.scaled.0, sws::ONE_HORIZONTAL).ok_or_else(too_far)?,
-                        v: sws::bicubic(ps.src.h, ps.scaled.1, sws::ONE_VERTICAL).ok_or_else(too_far)?,
-                        x86_start: 0,
-                    })
+                    self.plane_filters(None, &ps, chroma).ok_or_else(too_far)
                 };
                 filters.push([table(false)?, table(true)?, table(true)?]);
             }
+            let fill = match plan.blur_fill(layer, size) {
+                // (A picture that fills the frame has no bars to fill: the overlay covers the whole fill.)
+                Ok(Some(fill)) if geom.matte => Some(self.fill_draw(n, fill)?),
+                Ok(_) => None,
+                Err(e) => return Err(GpuError::Unsupported(format!("layer {n}: {e}"))),
+            };
             let fades = LayerFades::of(plan, layer, &geom)?;
             let look = self.look_of(layer, &geom)?;
             // `fade` takes `rgb24` and runs on the picture the grade leaves in RGB (a dip to white is in the
@@ -2330,6 +2510,7 @@ impl Compositor {
                 fades,
                 look,
                 count,
+                fill,
             });
         }
         // FFmpeg rasterises what text there is, here, before the GPU is touched. No project lock is
@@ -2434,6 +2615,7 @@ impl Compositor {
             fades,
             look,
             count,
+            fill,
         } in drawn
         {
             let (cw, ch) = frame.chroma_size();
@@ -2458,11 +2640,29 @@ impl Compositor {
             // A moving zoom is the last stage of FFmpeg's chain: the fit scale, the grade, the effects, the
             // mask and the fades all act on the picture at its fit size, and the zoom scales the result.
             let before_zoom = if look.zoom_last { 1 } else { geom.stages.len() };
+            let source = planes.clone();
             let mut current = planes;
             for (si, stage) in geom.stages[..before_zoom].iter().enumerate() {
                 let lut = (si + 1 == before_zoom).then_some(tables.as_ref()).flatten();
                 current = self.scale_stage(&mut enc, &current, stage, &filters[si], lut);
             }
+            // A blurred fill is the frame behind the picture: the picture overlaid on it, and the layer is that whole
+            // frame from here on (a letterbox's bars, drawn as picture).
+            let filled;
+            let geom: &LayerGeometry = match fill {
+                Some(fill) => {
+                    current = self.blur_fill_planes(&mut enc, &source, &current, fill, geom, tables.as_ref());
+                    filled = LayerGeometry {
+                        picture: geom.layer,
+                        picture_at: (0, 0),
+                        picture_shows: geom.layer,
+                        matte: false,
+                        ..geom.clone()
+                    };
+                    &filled
+                }
+                None => geom,
+            };
             if let Some(grade) = &look.grade {
                 current = self.grade_planes(&mut enc, &current, grade)?;
             }
@@ -3191,6 +3391,9 @@ struct PlaneFilters {
     /// 0: the vertical pass is swscale's C arithmetic (the scaler of every layer); else the x86 kernel's start
     /// constant (the grade's 4:4:4 -> 4:2:0 chroma, `grade.rs`).
     x86_start: u32,
+    /// With `x86_start`: how many rows at the end of the scaled picture swscale hands to the C kernel (the last
+    /// two of luma, the last of chroma).
+    c_rows: u32,
 }
 
 /// A scale stage as one plane sees it. The chroma planes are half the size
@@ -3252,14 +3455,40 @@ mod tests {
     #[test]
     fn the_grade_is_in_the_caps_only_where_the_conversions_are_known_to_match() {
         use crate::grade::Kernels;
-        assert_eq!(Compositor::caps_for(Kernels::Match), Compositor::CAPS);
+        use crate::scaler::{Kernel, Kernels as Scaler, Model};
+        let simd = Scaler::Match(Model {
+            kernel: Kernel::X86,
+            default: crate::sws::Scaler::Bicubic,
+        });
+        assert_eq!(Compositor::caps_for(Kernels::Match, simd), Compositor::CAPS);
         assert_eq!(Compositor::CAPS.grade, GradeKinds::ALL);
         for kernels in [Kernels::Differs("a chain"), Kernels::Unknown] {
-            let caps = Compositor::caps_for(kernels);
+            let caps = Compositor::caps_for(kernels, simd);
             assert_eq!(caps.grade, GradeKinds::NONE, "{kernels:?}");
             let mut restored = caps;
             restored.grade = GradeKinds::ALL;
             assert_eq!(restored, Compositor::CAPS, "{kernels:?}: nothing else moves");
+        }
+    }
+
+    /// The scaler is exact in the caps only where it was measured to be swscale's (either kernel), and nothing else moves.
+    #[test]
+    fn the_exact_scaler_is_in_the_caps_only_where_the_scaler_is_known_to_match() {
+        use crate::grade::Kernels;
+        use crate::scaler::{Kernel, Kernels as Scaler, Model};
+        let model = |kernel| Model {
+            kernel,
+            default: crate::sws::Scaler::Bicubic,
+        };
+        for scaler in [Scaler::Match(model(Kernel::X86)), Scaler::Match(model(Kernel::C))] {
+            assert!(Compositor::caps_for(Kernels::Match, scaler).exact_scaler, "{scaler:?}");
+        }
+        for scaler in [Scaler::Differs, Scaler::Unknown] {
+            let caps = Compositor::caps_for(Kernels::Match, scaler);
+            assert!(!caps.exact_scaler, "{scaler:?}");
+            let mut restored = caps;
+            restored.exact_scaler = true;
+            assert_eq!(restored, Compositor::CAPS, "{scaler:?}: nothing else moves");
         }
     }
 

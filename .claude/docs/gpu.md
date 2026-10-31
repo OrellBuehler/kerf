@@ -11,7 +11,7 @@ Windows) and nothing may depend on an optional wgpu feature. **A GPU failure is 
 error, not a panic**: every unit of wgpu work runs in out-of-memory / validation /
 internal error scopes (`Gpu::guarded`), anything uncaptured is logged and remembered,
 `Compositor::new` and `composite` return `Result` (and `Compositor::caps()` says what it
-draws, `GpuCaps::A0` plus `text`, `motion`, `fades`, `transitions`, `dip_white`, `keyed_zoom`, `keyed_opacity`, `keyed_color`, `mask`, `grade` (every kind, where `grade::measured()` says this FFmpeg's conversions are the model's: `Compositor::caps()` drops it otherwise) and the blur / sharpen / grayscale / invert / vignette / chroma key `effects` today, which `composite` / `render_plan` judge the plan by), and a lost device is tracked — every
+draws, `GpuCaps::A0` plus `text`, `exact_scaler` (once `scaler::kernels()` measured this FFmpeg's scaler as the model), `blur_fill`, `motion`, `fades`, `transitions`, `dip_white`, `keyed_zoom`, `keyed_opacity`, `keyed_color`, `mask`, `grade` (every kind, where `grade::measured()` says this FFmpeg's conversions are the model's: `Compositor::caps()` drops it otherwise) and the blur / sharpen / grayscale / invert / vignette / chroma key `effects` today, which `composite` / `render_plan` judge the plan by), and a lost device is tracked — every
 later call is `GpuError::DeviceLost` and the **owner builds a new `Gpu` and
 `Compositor`** (the device is not recreated behind the caller's back).
 **No compositor pass draws a blend mode**: a layer whose clip has one is refused by the plan (`Unsupported::BlendMode`,
@@ -445,23 +445,45 @@ What the parity harness forced, all recorded in `kerf-gpu`'s docs and shaders:
   tables (the integer `process_c` path when gamma is 1, the `pow` table otherwise, its
   `float` clamping, truncation) and the test suite checks them byte for byte against
   FFmpeg. Kerf's "temperature" is a power function on the chroma planes.
-- **Scaler: swscale's bicubic, ported, not imitated** (`sws.rs`, `composite.wgsl`).
+- **Scaler: swscale's own, ported, and measured** (`sws.rs`, `scaler.rs`, `composite.wgsl`).
   swscale's filter *table* has quirks a formula misses — the window start truncated
   toward zero (so at the first pixels the tap at -1 is absent, not folded into pixel 0),
   right-edge folding, near-zero tap trimming, 14- / 12-bit weights normalized by error
-  diffusion, the 16.16 step — and the shader does its integer arithmetic (15-bit
-  horizontal intermediate clipped at the top, vertical pass rounded at bit 19). Planes
-  are scaled independently at their own size and rounded to 8 bits between stages (the
+  diffusion, the 16.16 step — and the shader does its integer arithmetic on them (15-bit
+  horizontal intermediate clipped at the top, vertical pass in one of two arithmetics, below).
+  Planes are scaled independently at their own size and rounded to 8 bits between stages (the
   fit scale and the transform's scale are two scalers in cascade). The first version
   used a bicubic *formula* and was wrong by up to 20 levels along the borders of busy
-  footage; the committed test
-  (`the_scaler_matches_ffmpegs_scale_plane_by_plane`, `Compositor::composite_yuv`)
-  compares planes with `ffmpeg -vf scale`: **within one level up to about 4:1** (noise and
-  checkerboard included, up and down), within 2-3 levels (mean under 0.6) on the 8:1 to
-  20:1 downscales of noise and test patterns and within 5 at 40:1 (x86 swscale's vertical
-  scaler is not bit-exact with the C one this follows), identically on FFmpeg 6.1 and 9.0.
-  **A shrink steeper than 40:1 (`MAX_SHRINK`) is refused by the plan** — a 58:1 shrink of
-  a 4K test pattern read 16 levels off in RGB. Scaling happens on the decoded 8-bit 4:2:0,
+  footage. **What a build's scaler is depends on the build, not the graph, and the compositor draws
+  the one this FFmpeg runs** (`scaler::kernels()`, measured once per process on the real `scale`,
+  like `grade::kernels()`; `Compositor::caps()` has `exact_scaler` once it matched):
+  * **The tables.** A SIMD build (x86 with MMX, NEON) rounds each filter's size up (4 horizontally,
+    2 vertically: `filterAlign`) and **keeps the original taps in the padding** — swscale only
+    *counts* the near-zero taps on the right as droppable and rounds that count up, copying the originals
+    unless `SWS_BITEXACT` — so the row is normalised with them and its weights are another's than the
+    C build's (`sws::table_aligned`; the old zero padding was a level off on 7.9:1 and steeper shrinks).
+  * **The vertical arithmetic.** C (`yuv2planeX_8_c`: `(64 << 12) + sum(c * s) >> 19`) or, on x86 with
+    SSE2 and default flags, `yuv2yuvX.asm`: `(c * s) >> 16` per tap (`pmulhw`: every tap truncates),
+    started from `(64 + 8 * (N - 1)) >> 4` with `N` the aligned tap count, `>> 3` — **except the last two
+    rows of luma and the last row of 4:2:0 chroma**, which `swscale.c` hands back to the C kernel
+    (`dstY >= dstH - 2`; slice threads do not matter, `dst_h` is the picture's). A single-tap axis is
+    `yuv2plane1`, `(s + 64) >> 7`, the same in both.
+  * **The algorithm an unflagged `scale` runs.** The product's graphs are complex ones, where the filter's
+    own default applies: bicubic since FFmpeg 5.0, **bilinear before it** (4.4's `scale` defaults to
+    `flags=bilinear`; only a simple `-vf` graph is handed the command line's bicubic). The probe tells
+    (`Model { kernel, default }`), so the 4.4.2 here draws every fit in bilinear, as it is rendered. Explicit
+    flags win (`blur_fill`'s thumbnail scales say `flags=bilinear`; a delivery's `scaler` names its own).
+  Held by `tests/scaler.rs` (`#[ignore]`d, ffmpeg only, no adapter): the scalar model
+  (`scaler::scale_plane`) equals FFmpeg's `scale` **sample for sample** on both builds over noise and a
+  smoother picture, both algorithms, 2:1 to 40:1 shrinks, odd outputs, enlargements and the blurred
+  fill's thumbnail and fill scales, at 1, 4 and 16 filter threads; and by the shader against the same
+  FFmpeg in `parity.rs`' `the_scaler_matches_ffmpegs_scale_plane_by_plane` (max 0 in every plane, 75 plane
+  results). The model is `Model::ASSUMED` (C, bicubic) while the probe is `Unknown`/`Differs`, which is
+  the compositor as it was: a level from an x86 FFmpeg's on a resized layer, and what would amplify that
+  level (a grade on a resized layer, the blurred fill) is refused (`caps.exact_scaler`). The arm64
+  `Aligned` model (SIMD tables, C arithmetic) is built from the source and **not measured**: the probe
+  decides there. **A shrink steeper than 40:1 (`MAX_SHRINK`) is still refused** — the test goes no further, and
+  past 63:1 swscale cascades two scalers. Scaling happens on the decoded 8-bit 4:2:0,
   which is why resizing any other format — enlarging, or shrinking even by 1.05-1.5x (FFmpeg
   scales its chroma from the full-resolution plane, the compositor from the averaged one;
   flat max 8-9, edges up to 32 levels) — is refused by the plan too.
@@ -769,6 +791,34 @@ included, and a graded layer in a stack that holds one where the composite's col
 * 4:2:2, 4:4:4, RGB and gray pictures (and 10-bit under `FixedBt601`) take every other effect and a mask at the plain source's own figures (max 3: the decode's rounding).
   Compute passes are core wgpu on every backend and the blur writes no storage texture: no optional feature.
 
+**The blurred fill** (`Fit::Blur`; `kerf_core::blur_fill`, `GpuCaps::blur_fill`, `compositor.rs` `blur_fill_planes`, `fill.rs`,
+`planeops.wgsl` `fs_box`). A clip placed by the plain fit whose picture is not the frame's shape sits over a copy of itself
+(`engine::cli::blur_fill`): `scale` to *cover* a thumbnail of `2*floor(w/16)` x `2*floor(h/16)` (at least 4x4) with `flags=bilinear`,
+`crop` about its centre (`lrint((in - out) / 2)` rounded down to even), `boxblur=r:2` (`r` a sixteenth of the smaller side, at least 1),
+`scale` back up to the frame (bilinear), and the picture's own fit `overlay`ed on it. The compositor draws it plane for plane, **0 differing
+samples**: the picture's planes through two bilinear scales on swscale's own tables and kernels (`scaler.rs`; the thumbnail is
+a 4.5:1 shrink and the fill an 8:1 enlargement on a 1080p frame, both exact in `tests/scaler.rs`), the blur as `blur8` writes it
+(a running sum with the line mirrored about its ends *including* the edge sample; the shader sums the whole window,
+`(sum * inv + 32768) >> 16`, `inv = (65536 + length/2) / length`, four passes a plane, `fill::box_blur` is the C port the
+tests hold to FFmpeg's), `eq`'s tables applied in the vertical pass that scales the fill up (the filter runs on the whole padded
+frame), and `overlay`'s copy of the fitted picture at its even position (a chroma sample lands whole, so the half block of an odd picture's
+last column and row is the picture's while the luma beside it is the fill's: a texture copy of the picture's planes into the fill's). The layer is then the whole frame
+with no matte (`geom.picture = geom.layer`), so fades, dissolves, slides and pushes act on it as on any padded frame.
+**Which layers**: `takes_blur_fill` is the clip's (identity transform, not keyed, no reframe, no mask, no alpha, no alpha-producing effect:
+`PlanLayer::blur_fill` carries the picture the graph judges the shape by, the original's) and the render size's (a picture of the frame's
+shape has nothing to fill: `RenderPlan::blur_fill(layer, size)`); every other clip is placed by Contain's chain, byte for byte, and is not
+refused for the delivery's fit. **Refused** (`Unsupported::BlurFill` without the pass or the exact scaler under it; `BlurFillWith` per layer):
+a picture that is not 8-bit `yuv420p` (FFmpeg scales and blurs the thumbnail in the picture's own format: drawn anyway, 10-bit Y 2 / UV 2, 4:4:4
+33 / 55, 4:2:2 0 / 27, gray 33 / 0), a full-range picture (raw samples: 14 to 18), an HDR one (it composes in 10 bits ahead of the tone-map), a thumbnail
+shrunk past 40:1, a frame whose chroma lines are shorter than the box (`2r + 1`: `boxblur` reads past them; FFmpeg 9 refuses to configure it at all)
+— and, by the letterbox rules that still hold, a blur, sharpen, vignette or chroma key on the padded frame (they would see the fill as picture), a grade,
+a dip to white. `tests/motion_parity.rs` (`a_blurred_fill_*`, 7 tests, 117 cases) holds the export's planes to `EXACT` on both FFmpegs: portrait / landscape /
+square, noise, hard edges, odd and 20:1 sources, frame sizes from 96x64 to 3840x2160 (radii 1 to 16), fades, dissolves, dips,
+the eight slides and pushes, over and under other tracks, `eq`, grayscale, a keyed colour, speed, reverse, a late source, every matrix (untagged, BT.709,
+`smpte170m`, `bt470bg`, BT.2020) and a `tv` flag. `tests/parity.rs` (`a_blurred_fill_is_drawn_as_the_still_draws_it`) holds the still exactly too, through
+`still_planes_differ`: the still's own `yuv444p` planes (`timeline_frame_yuv_cancellable`) against the compositor's composite put through the same
+conversion in a graph of the same kind — **an exact comparator for still plans** that the RGB one (edge band, PSNR) cannot be; it holds on both FFmpegs.
+
 **The clip's grade** (wheels = `colorbalance`, curves = `lutrgb`, a 3D LUT = `lut3d`; `grade.rs`, `shaders/grade.wgsl`, `compositor/grade_passes.rs`,
 `GpuCaps::grade`; not the `eq` colour above, which is a YUV operation). The grade's filters only take RGB, so FFmpeg converts the picture `yuv420p -> rgb24`, runs
 `lut3d`, `lutrgb`, `colorbalance` (that order) and converts it back. The compositor draws **the conversions as well as the filters, to the level**: a graded layer at its
@@ -836,8 +886,7 @@ included** (`target/parity/motion-report.txt`; montages `FFmpeg | GPU | diff x8`
 (testsrc2 with a frame counter, colour bars, a 25 fps clip, a still, a portrait one for a letterbox, noise in all three planes, a gradient for the rotated cases) and, for the
 format and range cases, `variants()` (10-bit, 4:4:4, 4:2:2, gray, an RGB PNG, MJPEG and a JPEG still, BT.709-tagged). Families: plain cuts and speeds at five rates, clip fades,
 dips, dissolves, the eight slides and pushes, keyed position / rotation, rotated and translucent layers on an alpha plane, and the coverage archetypes' montage and talking-head
-shapes. **Every sample equals the export's wherever a picture is drawn at its own size on 9.0.2 and 6.1.1 (max error 0)**; one level where the compositor scales a layer (the
-scaler's, `parity.rs`), two where it scales **and** grades, two inside a rotated layer (the band within 3 px of its edge, from the plan's geometry, is left out), and a dip to
+shapes. **Every sample equals the export's wherever a picture is drawn at its own size on 9.0.2 and 6.1.1 (max error 0)**; one level where the compositor scales a layer on a machine whose scaler is not measured exact (`scaler.rs`; 0 where it is), two where it scales **and** grades, two inside a rotated layer (the band within 3 px of its edge, from the plan's geometry, is left out), and a dip to
 white at two (`WHITE`; three of Y on BT.709, `WHITE_709`). **A grade at the picture's size is exact on both** (0 differing samples in the frames drawn of all but two of the 108 `grade/` rows: each part alone and the three together over six pictures, untagged, BT.709 and `smpte170m` / `bt470bg`, a crop, speed 2, an `eq` ahead of it (static and keyed), over another track, dissolving in and out, under a mask and a chroma key, a keyed opacity and a keyed position over another track, beside clips of its own matrix in either order, a labelled HD clip; rotated at one level and translucent at one level of chroma, which is those layers' own ladder). **A refusal case** (`run_refusing`) skips the frames the plan refuses for its reason, requires at least one, and
 holds **every other frame to the export** (a refusal wider than it has to be shows): the letterboxed / odd / resized / not-`yuv420p` dips to white, the fades on a translucent layer,
 the full-range pictures (`run_full_range`: drawn exactly under `FixedBt601`, refused under the negotiating policies), and the grades whose tables step past two on a layer the scaler resizes (`run_grade_steep`: a keyed ramp frame by frame; `a_grade_on_a_layer_the_scaler_resizes_is_drawn_while_its_tables_step_by_two_and_refused_past_it` holds the static ones drawn to **the step itself** on a luma ramp, hard edges and noise, and refuses the steeper). A mutation of the chroma constant by nine in 65536 fails the dips
@@ -864,7 +913,7 @@ a dissolve, dip, slide or push into a zooming clip and out of one) hold the boun
 | Bound (Y / UV) | Cases | Why |
 | --- | --- | --- |
 | 0 | a mask at the picture's size (20 of 27 mask rows), grayscale, invert, sharpen, a vignette (every frame of the run), a chroma key, a keyed opacity and a keyed colour (the fades and dissolve of each included) at the picture's size | integer arithmetic, reproduced |
-| 1 (`SCALED`) | a layer the compositor scales, a mask, a vignette or a keyed opacity on it, a one-stage zoom, a keyed colour before a moving zoom | swscale's x86 scaler is not bit-exact with the C arithmetic the shader follows |
+| 1 (`SCALED`; **0 where `scaler::kernels()` is a `Match`**, which `check_motion` holds them to) | a layer the compositor scales, a mask, a vignette or a keyed opacity on it, a one-stage zoom, a keyed colour before a moving zoom | on a machine whose scaler is not measured the compositor draws the C kernel, a level from an x86 swscale's; both FFmpegs of CI are measured and these are exact |
 | 1 (`EFFECT`) | a blur at the picture's size, and a blur then a vignette (measured 0: the vignette's factor is at most 1) | `gblur`'s SIMD summation order (above) |
 | 2 | a layer the compositor scales *and* makes translucent, no effect (`tests/playback.rs`, `play/pip/translucent and scaled`, measured Y 2 / UV 2 on both FFmpegs); `EFFECT_SCALED`: a blur, grayscale or invert on a scaled or translucent layer; a blur then a sharpen of at most 0.5 even unscaled and opaque (the blur's level times the gain); a sharpen of at most 0.5 after a scale. `CASCADED`: a zoom (the fit scale, then the zoom's). `ZOOMED_MASK`: a soft mask edge, or a chroma key's, on a zoomed picture (measured 2 / 2). Rotated, graded and scaled (`GRADED_SCALED`, a keyed or static grade whose tables step by at most 2, the rest refused: `GradeSteep`; measured 2 / 2), dip to white (Y three on BT.709, `WHITE_709`) | two of the causes above on one sample; the RGB kernel for white |
 

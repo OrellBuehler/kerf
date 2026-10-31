@@ -696,6 +696,12 @@ pub struct PlanLayer {
     /// `(int)(opacity(T) * 255)`, the curve evaluated in the expression's own arithmetic at the
     /// clip's `fps` time. `None` in a still plan, and for a clip whose opacity has no key below 1.
     pub keyed_alpha: Option<u8>,
+    /// The clip takes the delivery's blurred fill ([`Fit::Blur`]) wherever its picture does not fill the frame: set
+    /// when the canvas fits over a blurred copy and the clip is placed by the plain fit, not see-through
+    /// (`engine::cli::blur_fill_clip`). The size is the picture the graph judges the frame's shape by (the original's
+    /// displayed size, whichever file is decoded); whether the picture leaves bars is the render size's to say
+    /// ([`RenderPlan::blur_fill`]).
+    pub blur_fill: Option<(u32, u32)>,
     pub timing: PlanTiming,
 }
 
@@ -953,6 +959,18 @@ impl RenderPlan {
                     }
                 }
             };
+            // The blurred fill behind a picture that leaves bars: FFmpeg's thumbnail chain, drawn by the compositor
+            // where it can, to the level (`GpuCaps::blur_fill`, with an exact scaler under it).
+            if geom.matte {
+                if let Some(why) = self.blur_fill_refusal(caps, layer, size) {
+                    let layer_ref = self.layer_ref(n, layer);
+                    match why {
+                        Some(detail) => reasons.push(Unsupported::BlurFillWith(layer_ref, detail)),
+                        None if !reasons.contains(&Unsupported::BlurFill) => reasons.push(Unsupported::BlurFill),
+                        None => {}
+                    }
+                }
+            }
             // `pad` hands everything after it the whole padded frame, bars included. A pointwise
             // effect (a grade, grayscale, invert) is a table, and the bars go through it like the
             // picture, and a mask is cut from the whole padded frame (the compositor's layer is that
@@ -1196,11 +1214,8 @@ impl RenderPlan {
                 out.push(Unsupported::FullRangeCut);
             }
         }
-        // A blurred fill is FFmpeg's (`boxblur` on a thumbnail, scaled back up): refused, still and
-        // motion alike, wherever a layer is on screen (a frame of nothing but the canvas is drawn).
-        if self.canvas.fit == Fit::Blur && !self.layers.is_empty() {
-            out.push(Unsupported::BlurFill);
-        }
+        // (A blurred fill is judged per layer and by the render size, in `reasons`: whether a picture leaves bars to
+        // fill is the size's to say.)
         out.extend(self.pictureless.iter().cloned().map(Unsupported::NoPicture));
         for (n, layer) in self.layers.iter().enumerate() {
             let at = || LayerRef {
@@ -1624,6 +1639,56 @@ impl RenderPlan {
             )));
         }
         Ok(geom)
+    }
+
+    /// The thumbnail chain of `layer`'s blurred fill at render size `size`, when the layer takes one: the canvas fits
+    /// over a blurred copy, the clip is placed by the plain fit ([`PlanLayer::blur_fill`]) and its picture is not the
+    /// shape of the frame (the graph's own test, on the product of the sides). `Ok(None)` for a layer that does not,
+    /// `Err` for one the thumbnail or `boxblur` could not be run for as the sizes fall.
+    pub fn blur_fill(
+        &self,
+        layer: &PlanLayer,
+        size: (u32, u32),
+    ) -> std::result::Result<Option<crate::blur_fill::BlurFill>, crate::layer_geometry::GeometryError> {
+        let Some(shape) = layer.blur_fill.filter(|_| self.canvas.fit == Fit::Blur) else {
+            return Ok(None);
+        };
+        if !crate::engine::picture_has_other_shape(Some(shape), size) {
+            return Ok(None);
+        }
+        crate::blur_fill::BlurFill::resolve((layer.stream.width, layer.stream.height), size).map(Some)
+    }
+
+    /// Why `layer`'s blurred fill is not drawn by a compositor with `caps` (`None`: it is, or there is none to draw);
+    /// `Some(None)` is a compositor without the pass (or without the exact scaler under it), `Some(Some(detail))` the
+    /// layer or the sizes.
+    fn blur_fill_refusal(&self, caps: &GpuCaps, layer: &PlanLayer, size: (u32, u32)) -> Option<Option<&'static str>> {
+        let fill = match self.blur_fill(layer, size) {
+            Ok(Some(fill)) => fill,
+            Ok(None) => return None,
+            Err(_) => return Some(Some("a frame too small for the thumbnail's box blur")),
+        };
+        if !caps.blur_fill || !caps.exact_scaler {
+            return Some(None);
+        }
+        // `boxblur`, `scale` and `overlay` take the picture in its own format: the compositor's planes are the
+        // decode's 8-bit limited-range 4:2:0 (the fill of anything else is another picture), an HDR picture is
+        // tone-mapped ahead of the fit and composes in 10 bits.
+        if layer.hdr.is_some() {
+            return Some(Some("an HDR picture (the fill composes in 10 bits, ahead of the tone-map)"));
+        }
+        if layer.stream.pix_fmt.as_deref() != Some("yuv420p") {
+            return Some(Some(
+                "a picture that is not 8-bit `yuv420p` (the thumbnail is scaled and blurred in the picture's own format)",
+            ));
+        }
+        if layer.stream.maybe_full_range() {
+            return Some(Some("a full-range picture (FFmpeg scales and blurs its raw values)"));
+        }
+        if fill.source.0 > MAX_SHRINK * fill.cover.0 || fill.source.1 > MAX_SHRINK * fill.cover.1 {
+            return Some(Some("a picture shrunk past 40:1 into the thumbnail"));
+        }
+        None
     }
 
     /// [`RenderPlan::layer_geometry`] on the picture's own chroma grid (4:2:0 where it is not known), with no
