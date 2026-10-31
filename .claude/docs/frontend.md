@@ -923,7 +923,9 @@ track is off by default and the captions are otherwise burned in), `.srt` / `.vt
 a line saying how many chapter markers become chapters; with no captions in the cut all of these
 are reset to off. A sidecar that already exists comes back as a refusal naming it, which the
 dialog turns into a *Replace caption files?* confirmation and a rerun with `overwrite_sidecars`.
-**Markers** are edited in `MarkerDialog.svelte` (the marker's context menu, *Edit marker…*:
+**Markers** are edited in `MarkerDialog.svelte` (the marker's context menu, *Edit marker…*, `ui.openMarker(id)`; the
+page mounts it like every dialog, so it is inert-behind and not the timeline panel's — Enter saves, the footer Save being the form's
+submit button:
 name, Comment / Chapter, length, comment, one `update_marker` through `marker-edit.ts`, which
 sends only what changed); *Make it a chapter / a comment* flips the kind; a marker with a length
 draws its span under the ruler chip, and the tooltip names the kind, span and comment.
@@ -1378,7 +1380,8 @@ report needs, the same lines that are on screen.
 **Modals are modal.** Every dialog is a `Modal` (above), which uses the
 `trapFocus` action (`src/lib/modal.ts`: takes focus, wraps Tab, restores focus on
 close; Voiceover starts on its textarea via `initial`), and `+page.svelte` makes the app behind them `inert` and returns early from its global key handler while
-any is open — Space / Delete / J-K-L / ⌘Z would
+any is open (`ui.dialogOpen`: one getter over every dialog the page mounts from `ui`, which the menu bar reads too;
+`shared-components.test.ts` holds it to the page's `{#if ui.… }` dialogs and to every file that draws a `<Modal>` being imported by the page) — Space / Delete / J-K-L / ⌘Z would
 otherwise edit the live project under a dialog; a file drop is ignored then too.
 Every shortcut — bare keys and ⌘ chords alike — stands down inside any text input /
 textarea / select / contenteditable. **Focus survives a run and a menu.** A dialog whose footer

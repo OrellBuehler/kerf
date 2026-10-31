@@ -316,3 +316,46 @@ describe('ToolbarToggle', () => {
 		expect([...source.matchAll(/<button\b[^>]*>/g)].map((m) => m[0]).join(' ')).not.toMatch(/(background|color|border)[a-z-]*:/);
 	});
 });
+
+// A dialog is a modal of the whole app: the page mounts it, and the page's `inert` (the app behind, the
+// detached windows, the file drop, the shortcuts) is `ui.dialogOpen`. One mounted from a panel instead sat
+// under the dockview sashes, opened inside a popped-out window and left the app live behind its scrim.
+describe('every dialog is mounted by the page and counted as open', () => {
+	const page = read('routes/+page.svelte');
+	const uiSrc = read('lib/editor-ui.svelte.ts');
+	const getter = uiSrc.slice(uiSrc.indexOf('get dialogOpen()'), uiSrc.indexOf('openFitMusic('));
+
+	test('every file that draws a <Modal> is imported by the page', () => {
+		const users = uiSources(SRC)
+			.filter((f) => f.endsWith('.svelte') && /<Modal\b/.test(readFileSync(f, 'utf8')))
+			.map(posix)
+			.filter((f) => !f.endsWith('/Modal.svelte'));
+		expect(users.length).toBeGreaterThanOrEqual(DIALOGS.length);
+		for (const f of users) {
+			const name = f.slice(f.lastIndexOf('/') + 1);
+			expect(page, `${name} is not mounted by +page.svelte`).toContain(`/${name}'`);
+		}
+	});
+
+	test('the ui-owned ones are all in `ui.dialogOpen`, which makes the page inert and quiets the menus', () => {
+		const owned = [...page.matchAll(/\{#if ui\.(\w+)\}\s*(?:<!--[^>]*-->\s*)?(?:\{#key[^}]*\}\s*)?<\w*(?:Dialog|Sheet)\b/g)].map((m) => m[1]);
+		expect(owned.length).toBeGreaterThanOrEqual(10);
+		expect(owned).toContain('markerDialog');
+		for (const name of owned) expect(getter, name).toContain(`this.${name}`);
+		expect(page).toContain('ui.dialogOpen');
+		expect(read(`${EDITOR}MenuBar.svelte`)).toContain('ui.dialogOpen');
+	});
+
+	test('the marker dialog opens from the ui, not from the timeline panel', () => {
+		expect(read(`${EDITOR}Timeline.svelte`)).not.toContain('MarkerDialog');
+		expect(read(`${EDITOR}Timeline.svelte`)).toContain('ui.openMarker(m.id)');
+	});
+
+	test('Enter saves a marker: the footer Save is the form\u2019s submit button', () => {
+		const dialog = read(`${EDITOR}MarkerDialog.svelte`);
+		const id = /<form[^>]*\sid="([^"]+)"/.exec(dialog)![1];
+		expect(id).toBe('marker-form');
+		expect(dialog).toMatch(new RegExp(`type="submit"\\s+form="${id}"`));
+		expect(dialog).not.toMatch(/onclick=\{\(\) => void save\(\)\}/);
+	});
+});

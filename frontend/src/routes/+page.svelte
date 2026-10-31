@@ -14,6 +14,7 @@
 	import StemsDialog from '#lib/components/editor/StemsDialog.svelte';
 	import TagDialog from '#lib/components/editor/TagDialog.svelte';
 	import SaveTemplateDialog from '#lib/components/editor/SaveTemplateDialog.svelte';
+	import MarkerDialog from '#lib/components/editor/MarkerDialog.svelte';
 	import ShortcutSheet from '#lib/components/editor/ShortcutSheet.svelte';
 	import RelinkDialog from '#lib/components/editor/RelinkDialog.svelte';
 	import ContextMenu from '#lib/components/editor/ContextMenu.svelte';
@@ -96,20 +97,7 @@
 
 	/** Any modal on screen. The app behind it is `inert` and no editor shortcut
 	 *  may fire: Space / Delete / J-K-L would edit the live project under it. */
-	const modalOpen = $derived(
-		ui.exportDialog ||
-			settings.open ||
-			updater.dialogOpen ||
-			ui.voiceoverDialog !== null ||
-			ui.composeDialog !== null ||
-			ui.aboutDialog ||
-			ui.fitMusicDialog !== null ||
-			ui.relinkDialog ||
-			ui.stemsDialog !== null ||
-			ui.tagDialog !== null ||
-			ui.saveTemplateDialog !== null ||
-			ui.shortcutSheet
-	);
+	const modalOpen = $derived(ui.dialogOpen || settings.open || updater.dialogOpen);
 	/** True while files are hovering over the window, for the drop overlay. */
 	let dropHover = $state(false);
 
@@ -933,6 +921,10 @@
 
 {#if ui.saveTemplateDialog}
 	<SaveTemplateDialog overlayId={ui.saveTemplateDialog.overlayId} onClose={() => ui.closeSaveTemplate()} />
+{/if}
+
+{#if ui.markerDialog}
+	<MarkerDialog markerId={ui.markerDialog.markerId} onClose={() => ui.closeMarker()} />
 {/if}
 
 {#if updater.dialogOpen}

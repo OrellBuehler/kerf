@@ -11,7 +11,6 @@
 	import ToolbarToggle from './ToolbarToggle.svelte';
 	import Minimap from './Minimap.svelte';
 	import TimecodeField from './TimecodeField.svelte';
-	import MarkerDialog from './MarkerDialog.svelte';
 	import { markerTip } from '#lib/marker-edit';
 	import { toast } from '#lib/notifications.svelte';
 	import { ui, type Tool } from '#lib/editor-ui.svelte';
@@ -2704,7 +2703,6 @@
 	let markerDrag: { id: string; time: number } | null = $state(null);
 	let renaming = $state<string | null>(null);
 	/** The marker whose name, kind, length and comment are open in the dialog. */
-	let editingMarker = $state<string | null>(null);
 
 	const addMarkerHere = () => void addMarker();
 
@@ -2731,7 +2729,7 @@
 			{ label: 'Go to marker', icon: 'bookmark', action: () => ui.seek(m.time) },
 			...held([
 				{ label: 'Rename', action: () => (renaming = m.id) },
-				{ label: 'Edit marker…', icon: 'file-text', action: () => (editingMarker = m.id) },
+				{ label: 'Edit marker…', icon: 'file-text', action: () => ui.openMarker(m.id) },
 				{
 					label: m.kind === 'chapter' ? 'Make it a comment' : 'Make it a chapter',
 					action: () => void editor.updateMarker(m.id, { kind: m.kind === 'chapter' ? 'comment' : 'chapter' }).catch(err)
@@ -4064,10 +4062,6 @@
 		</div>
 	</div>
 </div>
-
-{#if editingMarker}
-	<MarkerDialog markerId={editingMarker} onClose={() => (editingMarker = null)} />
-{/if}
 
 <style>
 	/* A locked lane is hatched: the track header says so too, but a lane that looks like any other is
