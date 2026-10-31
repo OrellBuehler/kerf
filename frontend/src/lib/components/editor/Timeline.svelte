@@ -49,7 +49,8 @@
 	import { generatedCount, importMenuEntries, importableAssets } from '#lib/caption-import-ui';
 	import type { Clip, Marker, PreviewDraft, StreamKind, SvgOverlay, TextOverlay, Track } from '#lib/types';
 	import { moveDraft, trimDraft } from '#lib/preview-draft';
-	import { GENERATED_TITLE_FILL, SVG_TITLE_FILL, packRows, snapSpanStart, snapTime, trimSpan } from '#lib/titles';
+	import { GENERATED_TITLE_FILL, SVG_TITLE_FILL, packRows } from '#lib/titles';
+	import { markerDragStep, titleDragStep, type MarkerGrab } from '#lib/title-drag';
 	import { SVG_PRESETS, svgDisplayName, svgTooltip } from '#lib/svg-titles';
 	import { faderToGain, gainLabel, gainToFader, panLabel } from '#lib/mixer';
 	import { trackHasSound } from '#lib/mixer-strips';
@@ -1341,7 +1342,7 @@
 			return;
 		}
 		if (markerDrag) {
-			markerDrag = { ...markerDrag, time: rulerTime(e.clientX) };
+			markerDrag = { ...markerDrag, ...markerDragStep(markerDrag, { clientX: e.clientX, time: rulerTime(e.clientX), slopPx: DRAG_SLOP, fps }) };
 			return;
 		}
 		if (markDrag) {
@@ -1403,7 +1404,7 @@
 			const d = markerDrag;
 			markerDrag = null;
 			const m = editor.markers.find((x) => x.id === d.id);
-			if (m && Math.abs(m.time - d.time) > 1e-6) void editor.updateMarker(d.id, { time: d.time }).catch(err);
+			if (m && d.moved && Math.abs(m.time - d.time) > 1e-6) void editor.updateMarker(d.id, { time: d.time }).catch(err);
 			return;
 		}
 		if (markDrag) {
@@ -2496,11 +2497,14 @@
 		/** A text title or an animated SVG title: the same gesture, written by a different edit. */
 		kind: 'text' | 'svg';
 		mode: 'move' | 'l' | 'r';
+		/** The pointer's time at the press less the grabbed time (the start; the end for a right edge): the offset it holds the title by. */
 		grabSec: number;
 		origStart: number;
 		origEnd: number;
 		start: number;
 		end: number;
+		/** Where the pointer went down, px: a press is a drag once the pointer has travelled `DRAG_SLOP` from it. */
+		downX: number;
 		moved: boolean;
 	};
 	let titleDrag = $state<TitleDrag | null>(null);
@@ -2532,11 +2536,12 @@
 			id: o.id,
 			kind,
 			mode,
-			grabSec: laneTime(e.clientX, left) - o.start,
+			grabSec: laneTime(e.clientX, left) - (mode === 'r' ? o.end : o.start),
 			origStart: o.start,
 			origEnd: o.end,
 			start: o.start,
 			end: o.end,
+			downX: e.clientX,
 			moved: false
 		};
 		capturePointer(e);
@@ -2545,25 +2550,17 @@
 	function onTitleDragMove(e: PointerLike) {
 		const d = titleDrag;
 		if (!d) return;
-		const t = laneTime(e.clientX, titleLaneEl?.getBoundingClientRect().left ?? 0);
-		const pts = titleSnapPoints(d.id);
-		const threshold = 8 / pxPerSec;
-		let start: number;
-		let end: number;
-		if (d.mode === 'move') {
-			const dur = d.origEnd - d.origStart;
-			start = ui.snap ? snapSpanStart(t - d.grabSec, dur, pts, threshold) : Math.max(0, t - d.grabSec);
-			end = start + dur;
-		} else {
-			({ start, end } = trimSpan(d.origStart, d.origEnd, d.mode, ui.snap ? snapTime(t, pts, threshold) : t));
-		}
-		const eps = 2 / pxPerSec;
-		titleDrag = {
-			...d,
-			start,
-			end,
-			moved: d.moved || Math.abs(start - d.origStart) >= eps || Math.abs(end - d.origEnd) >= eps
-		};
+		// Judged on the pointer's travel, snapped only once it is a drag (`title-drag.ts`): a magnet within reach of a press
+		// that did not move must not turn a click into a re-time.
+		const step = titleDragStep(d, {
+			clientX: e.clientX,
+			time: laneTime(e.clientX, titleLaneEl?.getBoundingClientRect().left ?? 0),
+			slopPx: DRAG_SLOP,
+			snap: ui.snap,
+			points: d.moved || Math.abs(e.clientX - d.downX) >= DRAG_SLOP ? titleSnapPoints(d.id) : [],
+			threshold: 8 / pxPerSec
+		});
+		titleDrag = { ...d, ...step };
 	}
 
 	function onTitleDragUp() {
@@ -2571,6 +2568,7 @@
 		titleDrag = null;
 		if (!d) return;
 		if (!d.moved) return; // a plain click selected the title at the press and leaves the playhead alone
+		if (d.start === d.origStart && d.end === d.origEnd) return; // dragged out and back: nothing to write
 		// An edit that removed it under the drag (an undo, an agent) leaves nothing to write.
 		if (d.kind === 'svg' && !editor.svgOverlays.some((o) => o.id === d.id)) return;
 		// One edit either way: an animated title's update re-times a preset's artwork in the same revision.
@@ -2705,7 +2703,7 @@
 	// ---- markers --------------------------------------------------------------
 
 	/** Marker being dragged along the ruler, and the id being renamed inline. */
-	let markerDrag: { id: string; time: number } | null = $state(null);
+	let markerDrag: ({ id: string; time: number } & MarkerGrab) | null = $state(null);
 	let renaming = $state<string | null>(null);
 	/** The marker whose name, kind, length and comment are open in the dialog. */
 
@@ -2715,7 +2713,7 @@
 		if (e.button !== 0 || renaming === m.id) return;
 		e.stopPropagation();
 		if (holdForReview(e)) return;
-		markerDrag = { id: m.id, time: m.time };
+		markerDrag = { id: m.id, time: m.time, origTime: m.time, grabSec: rulerTime(e.clientX) - m.time, downX: e.clientX, moved: false };
 		capturePointer(e);
 	}
 

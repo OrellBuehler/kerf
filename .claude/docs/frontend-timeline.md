@@ -38,7 +38,10 @@ neighbour is placed by `startBefore` (the latest start whose `start + duration` 
 pass it, in the backend's own arithmetic; `tail - dur` is an ULP too high about as often
 as not). Whether a press became a drag is judged on pointer travel (3 px), never on the
 quantized position (one pixel is under a frame at high zoom), and an edge keeps the
-offset it was grabbed at. A razor cut keeps half a frame
+offset it was grabbed at. A title (text or animated) and a marker are held to the same rules (`title-drag.ts`
+`titleDragStep` / `markerDragStep`): nothing about them changes until the pointer has travelled past the slop — a magnet within
+reach of a press that never moved must not turn a click into a re-time —, a title's edge keeps its grab offset and snaps only
+once it is a drag, a marker lands on a frame of the cut, and a drag that ends where it began writes nothing. A razor cut keeps half a frame
 either side (`splitPoint`; a clip with no interior frame says so), the context menu's
 split quantizes the playhead (and shows no key: `C` is the Razor *tool*, and nothing splits at
 the playhead from the keyboard yet), and Escape / pointercancel / blur abandon a clip, edge or
