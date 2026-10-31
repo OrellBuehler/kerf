@@ -946,16 +946,35 @@ header prints the kernels' answer, and the grade is out of the caps where this F
 **if that variant alone were lifted** (the frames it is the only reason of), split into still and motion, and the archetypes it hits
 (`T3:sm` = still and motion), sorted by that gain; (c) the same by cause for the variants that bundle several (`effects/…`,
 `grade_with/…`, `dip_to_white/Resized`, `format_resize/<pix_fmt>`), with the cause's full text as the key; (d) the greedy order to lift
-them in with the drawn share after each (never `unplannable`); (e) the variants that still refuse a frame together after (d). It is
+them in with the drawn share after each (never `unplannable`); (e) the variants that still refuse a frame together after (d); (f) the
+variants no archetype hits, each with why when it is known (the compositor draws it under `Compositor::CAPS`; the user cannot build
+it; this FFmpeg's policy or grade probe takes it out of play). It is
 exact only because `RenderPlan::reasons` lists **every** cause of a layer (a refused geometry is judged on the picture's own chroma
 grid so the layer's other reasons still show; a grade on a letterboxed layer the scaler resizes is a `Matte` and a `GradeWith`). The
 composite colour policy decides some of it (`mixed_matrices`, `full_range_*`), so run it on both FFmpegs (`KERF_FFMPEG` /
 `KERF_FFPROBE`). It plans `OriginalMedia` at 540 px wide, where the app's preview plans `ProxyMedia` at 960, and it ranks what the
-archetypes reach: a variant none of them hits is absent, so add an archetype before trusting a zero. `coverage.rs` holds the
+archetypes reach: a variant none of them hits is absent from (b) and listed in (f), so a zero there is a fact about the archetypes,
+not about the plan (`every_variant()` / `ordinal()` fail to compile when `Unsupported` gains a variant). `coverage.rs` holds the
 review's T1 to T3 and five real-world shapes, T4 to T8 (generated sources, cached under `target/tmp/coverage-media` by a hash of the
 FFmpeg and its arguments): a 16:9 talking head with jump cuts, a title, lower thirds and a music bed; a phone vlog (1080x1920 clips in a
 16:9 canvas at 60 fps, BT.709 and BT.601 mixed, dissolved; T5b the same over `Fit::Blur`); a JPEG / PNG photo slideshow with Ken Burns
-keys and crossfades; a three-angle multicam cut with captions; 4K footage graded (eq, curves, wheels) into a 1080p canvas.
+keys and crossfades; a three-angle multicam cut with captions; 4K footage graded (eq, curves, wheels) into a 1080p canvas. **T9 to T24
+use every feature the editor offers that still refuses**, each a cut a user can build (`Extra` adds the sources a plan reads the
+format of: HLG / PQ / BT.2020 / 10-bit / ProRes 4:2:2 / ProRes 4444 / 4:4:4 / RGB / MJPEG `yuvj422p` / full-range H.264 and VP9 /
+GIF / indexed and RGBA PNG / EXR / equirect / SMPTE 240M / 29.97 / a green screen, tagged with `setparams` because FFmpeg 7 takes the
+encoder's tags from the frames): T9 blend modes (leaks, grain, flashes), T10 stabilize + speed ramps + reverse + shake, T11 keyed
+crop / mask / colour + motion presets, T12 face blur, spotlight, tilted and translucent masked PiPs, T13 green screen with a blur,
+vignette, grade, sharpen, mask, tilt, T14 a vertical `Contain` edit with effects on letterboxed, 4K and 4:2:2 shots, T15 a wedding
+from five camera formats with dips to white, LUT, curves and a punch-in, T16 HDR / BT.2020 / 10-bit travel, T17 alpha overlays
+(ProRes 4444, RGBA PNG, GIF, a palette PNG, an EXR), T18 bold captions with no bold face and a missing font, T19 SVG titles, title
+clips, a template and small text, T20 behaviours, T21 a 360 reframe and punch-ins, T22 a screen tutorial (4:4:4, RGB, full range,
+webcam bubble, a 4K thumbnail), T23a-e one teaser delivered as ProRes, GIF, lanczos, 10-bit and 29.970029 fps (planned with the
+`ExportOptions` they name), T24 SMPTE 240M / untagged / BT.2020 archive footage. Variants it cannot reach, and why: `motion`, `fade`,
+`travel`, `tail`, `keyed_opacity`, `keyed_color`, `keyed_zoom`, `mask`, `text` (drawn under `CAPS`), `no_picture` (the project keeps
+an audio-only asset off a video track), `text_without_font` (the shipped font cannot be written), `unmeasured_policy` (the probe
+cannot tell), and per build `grade` (kernels match) or `grade_with` (kernels differ), and under
+`FixedBt601` `mixed_matrices`, `matrix_unknown`, `rgb_in_stack`, `full_range_cut`, `graded_in_full_range_stack`. `text_border`
+needs an installed family without a bold face.
 
 **`tests/fate_corpus.rs`** (`#[ignore]`d, and `KERF_FATE=1`: CI's parity job runs every ignored test and this one needs a network, so
 without the variable it skips with a message; `ffmpeg`, `ffprobe`, `curl`, no adapter) is hostile input from FFmpeg's FATE sample

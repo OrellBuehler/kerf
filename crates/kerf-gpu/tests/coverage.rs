@@ -20,6 +20,15 @@
 //! the same over a blurred fill), a photo slideshow with Ken Burns moves and crossfades, a multicam
 //! cut with captions and a 4K source graded into a 1080p canvas. All sources are generated.
 //!
+//! T9 to T24 exist for the ledger below: between them they use every feature the editor offers that a compositor with
+//! [`kerf_gpu::Compositor::CAPS`] still refuses, in the cuts people make with it: blend modes (a music video), stabilized shots and speed
+//! ramps (an action cam), keyed crop / mask / colour / opacity / zoom and motion presets (an explainer), masks with feathers and
+//! effects (a face blur, a spotlight, a green screen, social looks), a grade on full-range, steep and 10-bit pictures, HDR / BT.2020 /
+//! untagged / unknown matrices, alpha pictures (ProRes 4444, PNG, GIF), 4:2:2 / 4:4:4 / RGB sources, text with a border, tiny text and
+//! a missing font, SVG titles, behaviours, a 360 reframe, folded and uncropped fits, zoom behind a grade, and the delivery formats
+//! (ProRes, GIF, a scaler, 10-bit, a pick rate). They are planned with the export options they name; T1 to T8 and the test above them
+//! are unchanged.
+//!
 //! `the_ledger_...` is the backlog of refusals, measured: for every output frame of every archetype, in both
 //! plan modes, whether the compositor draws it and, when it does not, which `Unsupported` variants refuse it,
 //! and so which one lifted alone would draw the most. It plans and renders nothing and writes
@@ -41,9 +50,12 @@ use kerf_core::model::{
     Color, CurvePoint, Curves, Fit, Keyframe, Mask, MaskShape, Transition, TransitionKind, VideoEffect, Wheel, Wheels,
 };
 use kerf_core::{
-    composite_color_policy, Asset, Clip, Delivery, ExportOptions, GpuCaps, OriginalMedia, PlanRequest, Planner, Project,
-    StreamKind, TextOverlay, Timeline, Track, Transform, Unsupported,
+    composite_color_policy, render_preset, Asset, Behavior, BlendMode, Clip, ClipLut, CompositeColorPolicy, Container, Delivery,
+    DipWhy, ExportOptions, FadeEdge, GpuCaps, MotionMode, MotionPreset, OriginalMedia, PlanRequest, Planner, Project, Projection,
+    Property, PropertyKey, PropertyTrack, Rational, Reframe, ReframeKeyframe, SpeedKey, Stabilize, StreamKind, SvgOverlay,
+    SvgPreset, SvgPresetKind, SvgPresetParams, TextOverlay, Timeline, TitleClip, Track, Transform, Unsupported, YuvMatrix,
 };
+use kerf_gpu::grade::Kernels;
 use kerf_gpu::Compositor;
 
 #[path = "common/child.rs"]
@@ -486,6 +498,1358 @@ fn real_world(m: &Media) -> Vec<(&'static str, Timeline)> {
         ),
     ));
     out
+}
+
+// ---------------------------------------------------------------------------------------------
+// T9 and on: what the editor offers that the compositor still refuses.
+
+/// More generated media, for T9 and on: the formats and tags real cameras, phones, drones, screen recorders and motion-graphics
+/// packs write, one short source each (what a plan reads is the picture's shape, rate, format and tags, not its length). Cached
+/// like [`media`]'s, keyed by the FFmpeg that made them and the arguments.
+struct Extra {
+    /// 1280x720 at 30000/1001, tagged BT.709: what a phone writes.
+    ntsc: Asset,
+    /// 1920x1080 at 30 fps, 10-bit HLG in BT.2020: an iPhone's HDR video.
+    hlg: Asset,
+    /// 1280x720 at 24 fps, 10-bit PQ (HDR10) in BT.2020.
+    pq: Asset,
+    /// 1280x720, 8-bit 4:2:0 with the BT.2020 matrix and an SDR transfer: a drone's wide-gamut SDR.
+    wide: Asset,
+    /// 1920x1080 at 30 fps, 10-bit 4:2:0 H.264 tagged BT.709: a mirrorless camera's.
+    deep: Asset,
+    /// 1920x1080 at 25 fps, ProRes 422 HQ (`yuv422p10le`): a cinema camera's.
+    prores: Asset,
+    /// 1280x720 at 30 fps, ProRes 4444 with an alpha channel: a motion-graphics lower third.
+    lower_third: Asset,
+    /// A 512x512 PNG with alpha: a logo.
+    logo: Asset,
+    /// A 320x240 animated GIF: a sticker.
+    sticker: Asset,
+    /// A 480x480 PNG with a 64-colour palette (`pal8`): an indexed-colour badge or screenshot.
+    badge: Asset,
+    /// A 640x360 OpenEXR still in 32-bit float planar RGB (`gbrpf32le`), which is not on the allow-list of known-opaque formats: a
+    /// render from a 3D or VFX package.
+    plate: Asset,
+    /// A 1920x1080 VP9 `.webm` flagged full range, which ffprobe names `yuv420p` (not `yuvj420p`): a browser's screen recording.
+    browser: Asset,
+    /// 1920x1080 at 30 fps, `yuv444p`: an OBS screen recording.
+    screen: Asset,
+    /// 1280x720 at 30 fps, RGB (`libx264rgb`): a lossless-colour screen capture.
+    capture: Asset,
+    /// 1280x720 at 30 fps, MJPEG `yuvj422p` in a `.mov`: a webcam.
+    webcam: Asset,
+    /// 1920x1080 at 30 fps, H.264 `yuvj420p` flagged full range: a recorder set to "full".
+    obs: Asset,
+    /// 1920x960 at 30 fps whose projection is set to equirectangular, as the Inspector's override (or spherical metadata) does.
+    equirect: Asset,
+    /// 1280x720 tagged with the SMPTE 240M matrix, which the compositor has no coefficients for: digitised archive footage.
+    archive: Asset,
+    /// 1920x1080 at 30 fps: a presenter-sized test pattern on a `0x00b140` green screen.
+    green: Asset,
+    /// A `.cube` 3D LUT.
+    lut: PathBuf,
+}
+
+impl Extra {
+    fn assets(&self) -> Vec<Asset> {
+        [
+            &self.ntsc,
+            &self.hlg,
+            &self.pq,
+            &self.wide,
+            &self.deep,
+            &self.prores,
+            &self.lower_third,
+            &self.logo,
+            &self.sticker,
+            &self.badge,
+            &self.plate,
+            &self.browser,
+            &self.screen,
+            &self.capture,
+            &self.webcam,
+            &self.obs,
+            &self.equirect,
+            &self.archive,
+            &self.green,
+        ]
+        .into_iter()
+        .cloned()
+        .collect()
+    }
+}
+
+/// A 2x2x2 `.cube` that warms the picture: the red index runs fastest.
+const WARM_CUBE: &str = "TITLE \"kerf coverage warm\"\nLUT_3D_SIZE 2\n0.0 0.0 0.0\n1.0 0.0 0.0\n0.0 1.0 0.0\n1.0 1.0 0.0\n\
+                         0.0 0.0 0.9\n1.0 0.0 0.9\n0.0 1.0 0.9\n1.0 1.0 0.9\n";
+
+fn extra() -> &'static Extra {
+    static X: OnceLock<Extra> = OnceLock::new();
+    X.get_or_init(|| {
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("coverage-media");
+        std::fs::create_dir_all(&dir).unwrap();
+        let lavfi = |pattern: &str, rate: &str, secs: u32| format!("{pattern}:rate={rate}:duration={secs}");
+        // Tags are set on the frames: FFmpeg 7 and later take the encoder's from them, and an output option does not win.
+        let tagged = |matrix: &str, primaries: &str, trc: &str| {
+            format!("setparams=colorspace={matrix}:color_primaries={primaries}:color_trc={trc}:range=tv")
+        };
+        let x264 = |name: &str, pattern: &str, rate: &str, secs: u32, pix: &str, vf: &str| {
+            make(
+                &dir,
+                name,
+                &["-f", "lavfi", "-i", &lavfi(pattern, rate, secs)],
+                &[
+                    "-vf",
+                    vf,
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-crf",
+                    "35",
+                    "-g",
+                    "30",
+                    "-pix_fmt",
+                    pix,
+                ],
+                &[],
+            )
+        };
+        let x265 = |name: &str, pattern: &str, rate: &str, secs: u32, vf: &str| {
+            make(
+                &dir,
+                name,
+                &["-f", "lavfi", "-i", &lavfi(pattern, rate, secs)],
+                &[
+                    "-vf",
+                    vf,
+                    "-c:v",
+                    "libx265",
+                    "-preset",
+                    "ultrafast",
+                    "-crf",
+                    "35",
+                    "-x265-params",
+                    "log-level=error",
+                    "-pix_fmt",
+                    "yuv420p10le",
+                    "-tag:v",
+                    "hvc1",
+                ],
+                &[],
+            )
+        };
+        let prores = |name: &str, pattern: &str, rate: &str, secs: u32, profile: &str, pix: &str| {
+            make(
+                &dir,
+                name,
+                &["-f", "lavfi", "-i", &lavfi(pattern, rate, secs)],
+                &[
+                    "-vf",
+                    &format!("format={pix}"),
+                    "-c:v",
+                    "prores_ks",
+                    "-profile:v",
+                    profile,
+                    "-pix_fmt",
+                    pix,
+                ],
+                &[],
+            )
+        };
+        let probe = |p: PathBuf| Project::probe_asset(&p).unwrap_or_else(|e| panic!("probe {}: {e}", p.display()));
+        let t709 = tagged("bt709", "bt709", "bt709");
+        let t2020 = |trc: &str| format!("format=yuv420p10le,{}", tagged("bt2020nc", "bt2020", trc));
+        let mut equirect = probe(x264(
+            "equirect.mp4",
+            "testsrc2=size=1920x960",
+            "30",
+            8,
+            "yuv420p",
+            "format=yuv420p",
+        ));
+        for s in equirect.streams.iter_mut().filter(|s| s.kind == StreamKind::Video) {
+            s.projection = Some(Projection::Equirect);
+        }
+        let lut = dir.join("warm.cube");
+        if !lut.exists() {
+            std::fs::write(&lut, WARM_CUBE).unwrap();
+        }
+        Extra {
+            ntsc: probe(x264("ntsc.mp4", "testsrc2=size=1280x720", "30000/1001", 8, "yuv420p", &t709)),
+            hlg: probe(x265("hlg.mp4", "testsrc2=size=1920x1080", "30", 6, &t2020("arib-std-b67"))),
+            pq: probe(x265("pq.mp4", "testsrc2=size=1280x720", "24", 5, &t2020("smpte2084"))),
+            wide: probe(x264(
+                "wide.mp4",
+                "testsrc2=size=1280x720",
+                "30",
+                6,
+                "yuv420p",
+                &tagged("bt2020nc", "bt2020", "bt709"),
+            )),
+            deep: probe(x264(
+                "deep.mp4",
+                "testsrc2=size=1920x1080",
+                "30",
+                6,
+                "yuv420p10le",
+                &format!("format=yuv420p10le,{t709}"),
+            )),
+            prores: probe(prores("prores.mov", "testsrc2=size=1920x1080", "25", 5, "3", "yuv422p10le")),
+            lower_third: probe(prores(
+                "lower-third.mov",
+                "testsrc2=size=1280x720",
+                "30",
+                4,
+                "4",
+                "yuva444p10le",
+            )),
+            logo: probe(make(
+                &dir,
+                "logo.png",
+                &["-f", "lavfi", "-i", "testsrc2=size=512x512:rate=1:duration=1"],
+                &["-frames:v", "1"],
+                &["-vf", "format=rgba"],
+            )),
+            sticker: probe(make(
+                &dir,
+                "sticker.gif",
+                &["-f", "lavfi", "-i", "testsrc2=size=320x240:rate=10:duration=3"],
+                &[],
+                &[],
+            )),
+            badge: probe(make(
+                &dir,
+                "badge.png",
+                &["-f", "lavfi", "-i", "testsrc2=size=480x480:rate=1:duration=1"],
+                &["-frames:v", "1"],
+                &["-vf", "split[a][b];[a]palettegen=max_colors=64[p];[b][p]paletteuse"],
+            )),
+            plate: probe(make(
+                &dir,
+                "plate.exr",
+                &["-f", "lavfi", "-i", "testsrc2=size=640x360:rate=1:duration=1"],
+                &["-frames:v", "1", "-c:v", "exr"],
+                &["-vf", "format=gbrpf32le"],
+            )),
+            browser: probe(make(
+                &dir,
+                "browser.webm",
+                &["-f", "lavfi", "-i", &lavfi("testsrc2=size=1920x1080", "30", 6)],
+                &[
+                    "-vf",
+                    "format=yuv420p,setparams=range=pc",
+                    "-c:v",
+                    "libvpx-vp9",
+                    "-deadline",
+                    "realtime",
+                    "-cpu-used",
+                    "8",
+                    "-crf",
+                    "40",
+                    "-b:v",
+                    "0",
+                    "-pix_fmt",
+                    "yuv420p",
+                ],
+                &[],
+            )),
+            screen: probe(x264(
+                "screen.mp4",
+                "testsrc2=size=1920x1080",
+                "30",
+                8,
+                "yuv444p",
+                "format=yuv444p",
+            )),
+            capture: probe(make(
+                &dir,
+                "capture.mp4",
+                &["-f", "lavfi", "-i", &lavfi("testsrc2=size=1280x720", "30", 8)],
+                &[
+                    "-c:v",
+                    "libx264rgb",
+                    "-preset",
+                    "ultrafast",
+                    "-crf",
+                    "35",
+                    "-g",
+                    "30",
+                    "-pix_fmt",
+                    "rgb24",
+                ],
+                &[],
+            )),
+            webcam: probe(make(
+                &dir,
+                "webcam.mov",
+                &["-f", "lavfi", "-i", &lavfi("testsrc2=size=1280x720", "30", 8)],
+                &["-c:v", "mjpeg", "-q:v", "5", "-pix_fmt", "yuvj422p"],
+                &[],
+            )),
+            obs: probe(make(
+                &dir,
+                "obs.mp4",
+                &["-f", "lavfi", "-i", &lavfi("testsrc2=size=1920x1080", "30", 8)],
+                &[
+                    "-vf",
+                    "scale=out_range=pc,format=yuvj420p",
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-crf",
+                    "35",
+                    "-g",
+                    "30",
+                    "-color_range",
+                    "pc",
+                ],
+                &[],
+            )),
+            equirect,
+            archive: probe(x264(
+                "archive.mp4",
+                "testsrc2=size=1280x720",
+                "30",
+                6,
+                "yuv420p",
+                "setparams=colorspace=smpte240m:range=tv",
+            )),
+            green: probe(make(
+                &dir,
+                "green.mp4",
+                &[
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &lavfi("color=c=0x00b140:size=1920x1080", "30", 8),
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    &lavfi("testsrc2=size=720x900", "30", 8),
+                ],
+                &[
+                    "-filter_complex",
+                    "[0:v][1:v]overlay=600:90,format=yuv420p",
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "ultrafast",
+                    "-crf",
+                    "35",
+                    "-g",
+                    "30",
+                    "-pix_fmt",
+                    "yuv420p",
+                ],
+                &[],
+            )),
+            lut,
+        }
+    })
+}
+
+/// An archetype: its name, the cut and the export options it is planned with (what the project's delivery does not state).
+type Archetype = (&'static str, Timeline, ExportOptions);
+
+/// `clip` after `edit` has changed it: a clip built in one expression.
+fn with(mut clip: Clip, edit: impl FnOnce(&mut Clip)) -> Clip {
+    edit(&mut clip);
+    clip
+}
+
+/// `clips` one after another from the first one's start: a ramp, a speed or a reverse changes a clip's length, so the starts are
+/// laid out from [`Clip::duration`].
+fn lay(mut clips: Vec<Clip>) -> Vec<Clip> {
+    let mut at = clips.first().map_or(0.0, |c| c.timeline_start);
+    for c in &mut clips {
+        c.timeline_start = at;
+        at += c.duration();
+    }
+    clips
+}
+
+/// The keys `(clip-local seconds, value)` of one property.
+fn channel(prop: Property, keys: &[(f64, f64)]) -> PropertyTrack {
+    PropertyTrack {
+        prop,
+        keys: keys.iter().map(|&(time, value)| PropertyKey::new(time, value)).collect(),
+    }
+}
+
+fn delivery(width: u32, height: u32, fit: Fit, fps: f64) -> Delivery {
+    Delivery::new(width, height, fit).with_fps(Some(fps)).expect("a rate")
+}
+
+fn music_bed(m: &Media, secs: f64) -> Track {
+    Track {
+        clips: vec![Clip::new(m.music.id, 0.0, secs, 0.0)],
+        ..Track::new(StreamKind::Audio, "A1")
+    }
+}
+
+fn transition(kind: TransitionKind, secs: f64) -> Option<Transition> {
+    Some(Transition { kind, duration: secs })
+}
+
+fn mask(shape: MaskShape, x: f64, y: f64, width: f64, height: f64, feather: f64) -> Mask {
+    Mask {
+        shape,
+        x,
+        y,
+        width,
+        height,
+        feather,
+        inverted: false,
+    }
+}
+
+/// A motion preset (an entrance, an exit, an emphasis) written into the clip's keys as the Inspector and the MCP tool do.
+fn motion(c: &mut Clip, preset: MotionPreset) {
+    c.apply_motion(preset, MotionMode::Add, None, None, None)
+        .expect("a preset the clip has room for");
+}
+
+/// A family installed here that has no bold face, so that a bold title in it is `drawtext` thickened with a border; `None` on a
+/// machine whose every font has one (then no archetype holds such a title).
+fn regular_only_family() -> Option<String> {
+    kerf_core::list_system_fonts()
+        .into_iter()
+        .find(|family| kerf_core::fonts::resolve_font_file(family, true).is_some_and(|(_, bold)| !bold))
+}
+
+/// Everything T9 and on: the features the editor offers and the compositor still refuses, in the cuts people make with them.
+fn extended(m: &Media, x: &Extra) -> Vec<Archetype> {
+    let mut out = vec![
+        blends(m),
+        action_cam(m, x),
+        explainer(m),
+        privacy(m),
+        green_screen(m, x),
+        social_looks(m, x),
+        wedding(m, x),
+        hdr_travel(m, x),
+        branded_overlays(m, x),
+        styled_text(m),
+        svg_titles(m),
+        behaviours(m, x),
+        sphere_and_punch_ins(m, x),
+        screen_tutorial(m, x),
+    ];
+    out.extend(delivery_variants(m));
+    out.push(archive_mix(m, x));
+    out
+}
+
+/// T9: a music video on one picture: light leaks, film grain, a shadow and beat flashes laid over it in every blend mode.
+fn blends(m: &Media) -> Archetype {
+    let v1 = lay((0..8u32)
+        .map(|i| {
+            with(clip(&m.base, f64::from(i % 5) * 2.0, 4.0, 0.0), |c| {
+                c.fade_in = if i == 0 { 0.5 } else { 0.0 };
+                c.fade_out = if i == 7 { 1.0 } else { 0.0 };
+            })
+        })
+        .collect());
+    let over = |a: &Asset, src_in: f64, start: f64, dur: f64, mode: BlendMode, opacity: f64| {
+        with(clip(a, src_in, dur, start), |c| {
+            c.blend_mode = mode;
+            c.transform.opacity = opacity;
+        })
+    };
+    let leaks = vec![
+        with(over(&m.side, 0.0, 4.0, 10.0, BlendMode::Screen, 0.6), |c| {
+            c.fade_in = 1.0;
+            c.fade_out = 1.0;
+        }),
+        over(&m.side, 12.0, 18.0, 8.0, BlendMode::HardLight, 0.8),
+    ];
+    let grain = vec![
+        over(&m.cams[1], 0.0, 0.0, 16.0, BlendMode::Overlay, 0.35),
+        over(&m.cams[1], 2.0, 16.0, 16.0, BlendMode::Overlay, 0.35),
+    ];
+    let shadow = vec![over(&m.cams[0], 0.0, 12.0, 14.0, BlendMode::Multiply, 1.0)];
+    let flashes = vec![
+        over(&m.cams[0], 5.0, 9.5, 0.5, BlendMode::Add, 1.0),
+        over(&m.cams[2], 5.0, 17.5, 0.5, BlendMode::Difference, 1.0),
+        over(&m.cams[0], 9.0, 25.5, 0.5, BlendMode::Exclusion, 0.8),
+        over(&m.cams[1], 9.0, 28.0, 0.5, BlendMode::Darken, 1.0),
+        over(&m.cams[2], 9.0, 30.0, 0.5, BlendMode::Lighten, 1.0),
+    ];
+    (
+        "T9  music video 16:9, leaks / grain / flashes in 10 blend modes",
+        timeline(
+            vec![
+                track(v1, "V1"),
+                track(leaks, "V2"),
+                track(grain, "V3"),
+                track(shadow, "V4"),
+                track(flashes, "V5"),
+            ],
+            vec![],
+            delivery(1920, 1080, Fit::Cover, 30.0),
+        ),
+        ExportOptions::default(),
+    )
+}
+
+/// T10: an action-cam edit: stabilized shots, speed ramps into slow motion and out, a time-lapse, a reverse, a flash through
+/// white, a push and a handheld shake on an impact.
+fn action_cam(m: &Media, x: &Extra) -> Archetype {
+    let ramp = |keys: &[(f64, f64)]| keys.iter().map(|&(t, s)| SpeedKey::new(t, s)).collect::<Vec<_>>();
+    let steady = |strength: f64, zoom: Option<f64>| Some(Stabilize { strength, zoom });
+    let clips = lay(vec![
+        with(clip(&m.cams[0], 2.0, 5.0, 0.0), |c| {
+            c.stabilize = steady(0.5, None);
+            c.fade_in = 0.4;
+        }),
+        with(clip(&x.ntsc, 0.0, 6.0, 0.0), |c| {
+            c.stabilize = steady(0.5, None);
+            c.speed_ramp = ramp(&[(0.0, 1.0), (1.5, 1.0), (2.5, 0.25), (4.0, 0.25), (5.0, 1.0)]);
+            c.transition_in = crossfade(0.5);
+        }),
+        with(clip(&m.cams[1], 0.0, 12.0, 0.0), |c| c.speed = 4.0),
+        with(clip(&m.cams[0], 8.0, 6.0, 0.0), |c| {
+            c.stabilize = steady(0.8, Some(8.0));
+            c.speed_ramp = ramp(&[(0.0, 1.0), (1.0, 3.0), (2.0, 3.0), (3.0, 1.0)]);
+            c.transition_in = transition(TransitionKind::DipToWhite, 0.5);
+        }),
+        with(clip(&x.ntsc, 0.0, 3.0, 0.0), |c| {
+            c.speed = -1.0;
+            c.transition_in = transition(TransitionKind::PushLeft, 0.4);
+        }),
+        with(clip(&m.cams[2], 4.0, 5.0, 0.0), |c| {
+            c.behaviors = vec![Behavior::Shake {
+                amount: 0.01,
+                speed: 6.0,
+                seed: 7,
+                phase: 0.0,
+            }];
+            c.fade_out = 1.0;
+        }),
+    ]);
+    let secs = clips.last().map_or(0.0, Clip::timeline_end);
+    (
+        "T10 action cam 16:9, stabilized, speed ramps, time-lapse, flash",
+        timeline(
+            vec![track(clips, "V1"), music_bed(m, secs)],
+            vec![],
+            delivery(1920, 1080, Fit::Cover, 30.0),
+        ),
+        ExportOptions::default(),
+    )
+}
+
+/// T11: an explainer whose shots are animated by keys: a zoom into a detail (the animated crop), a spotlight that travels (a keyed
+/// mask), a colour reveal (keyed colour), a spin-in (a motion preset) and a push-in, with a callout that pops in over them.
+fn explainer(m: &Media) -> Archetype {
+    let v1 = lay(vec![
+        with(clip(&m.base, 0.0, 8.0, 0.0), |c| {
+            c.channels = vec![
+                channel(Property::CropZoom, &[(0.0, 1.0), (6.0, 1.8)]),
+                channel(Property::CropX, &[(0.0, 0.0), (6.0, 0.6)]),
+                channel(Property::CropY, &[(0.0, 0.0), (6.0, -0.4)]),
+            ];
+        }),
+        with(clip(&m.cams[0], 2.0, 6.0, 0.0), |c| {
+            c.mask = Some(mask(MaskShape::Ellipse, 0.3, 0.5, 0.35, 0.5, 0.25));
+            c.channels = vec![channel(Property::MaskX, &[(0.0, 0.3), (5.0, 0.7)])];
+            c.fade_in = 0.4;
+        }),
+        with(clip(&m.side, 0.0, 6.0, 0.0), |c| {
+            c.channels = vec![
+                channel(Property::Saturation, &[(0.0, 0.0), (3.0, 1.0)]),
+                channel(Property::Brightness, &[(0.0, -0.3), (3.0, 0.0)]),
+            ];
+        }),
+        with(clip(&m.cams[1], 0.0, 6.0, 0.0), |c| motion(c, MotionPreset::SpinIn)),
+        with(clip(&m.base, 10.0, 8.0, 0.0), |c| {
+            c.keyframes = vec![key(0.0, 1.0, 0.0, 0.0), key(8.0, 1.25, -0.05, 0.0)];
+        }),
+    ]);
+    let callout = with(clip(&m.uhd, 0.0, 10.0, 6.0), |c| {
+        c.transform = Transform {
+            scale: 0.3,
+            pos_x: 0.3,
+            pos_y: -0.3,
+            ..Transform::default()
+        };
+        c.mask = Some(mask(MaskShape::Rect, 0.5, 0.5, 0.9, 0.9, 0.15));
+        motion(c, MotionPreset::PopIn);
+    });
+    (
+        "T11 explainer 16:9, keyed crop / mask / colour, spin-in, push-in",
+        timeline(
+            vec![track(v1, "V1"), track(vec![callout], "V2")],
+            vec![lower_third("Step by step", 3.0, 8.0)],
+            delivery(1920, 1080, Fit::Cover, 30.0),
+        ),
+        ExportOptions::default(),
+    )
+}
+
+/// T12: an interview with a face blurred (a blurred copy of the shot on the track above, masked to the face), a spotlight (the
+/// same shot in grey with an inverted mask), a tilted picture-in-picture in an ellipse and a translucent ghost of the other angle.
+fn privacy(m: &Media) -> Archetype {
+    let v1 = lay(vec![
+        clip(&m.cams[0], 0.0, 14.0, 0.0),
+        clip(&m.cams[1], 0.0, 12.0, 0.0),
+        clip(&m.cams[0], 3.0, 14.0, 0.0),
+    ]);
+    let v2 = vec![
+        with(clip(&m.cams[0], 0.0, 12.0, 1.0), |c| {
+            c.effects = vec![VideoEffect::Blur { sigma: 14.0 }];
+            c.mask = Some(mask(MaskShape::Ellipse, 0.5, 0.35, 0.2, 0.32, 0.35));
+        }),
+        with(clip(&m.cams[1], 0.0, 10.0, 15.0), |c| {
+            c.effects = vec![VideoEffect::Grayscale];
+            c.mask = Some(Mask {
+                inverted: true,
+                ..mask(MaskShape::Ellipse, 0.5, 0.5, 0.5, 0.7, 0.3)
+            });
+        }),
+        with(clip(&m.cams[2], 0.0, 10.0, 26.0), |c| {
+            c.transform = Transform {
+                scale: 0.35,
+                pos_x: 0.28,
+                pos_y: -0.25,
+                rotation: -4.0,
+                ..Transform::default()
+            };
+            c.mask = Some(mask(MaskShape::Ellipse, 0.5, 0.5, 0.9, 0.9, 0.1));
+        }),
+    ];
+    let v3 = vec![with(clip(&m.side, 0.0, 12.0, 4.0), |c| {
+        c.transform = Transform {
+            scale: 0.3,
+            pos_x: -0.3,
+            pos_y: -0.3,
+            opacity: 0.85,
+            ..Transform::default()
+        };
+        c.mask = Some(mask(MaskShape::Rect, 0.5, 0.5, 0.9, 0.9, 0.1));
+    })];
+    (
+        "T12 interview 16:9, face blur, spotlight, tilted PiP, masked ghost",
+        timeline(
+            vec![track(v1, "V1"), track(v2, "V2"), track(v3, "V3")],
+            captions(1.0, 38.0),
+            delivery(1920, 1080, Fit::Cover, 30.0),
+        ),
+        ExportOptions::default(),
+    )
+}
+
+/// T13: a presenter on a green screen over a backdrop: keyed plain, then with the edge softened, a vignette, a grade, a sharpen, a
+/// round mask, a little transparency and a tilt.
+fn green_screen(m: &Media, x: &Extra) -> Archetype {
+    let backdrop = lay((0..4u32).map(|i| clip(&m.side, f64::from(i) * 6.0, 8.0, 0.0)).collect());
+    let key = |more: Vec<VideoEffect>| {
+        let mut effects = vec![VideoEffect::ChromaKey {
+            color: "0x00b140".into(),
+            similarity: 0.25,
+            blend: 0.1,
+        }];
+        effects.extend(more);
+        effects
+    };
+    let presenter = |src_in: f64, edit: &dyn Fn(&mut Clip)| {
+        with(clip(&x.green, src_in, 4.0, 0.0), |c| {
+            c.transform.scale = 0.9;
+            edit(c);
+        })
+    };
+    let fg = lay(vec![
+        presenter(0.0, &|c| c.effects = key(vec![])),
+        presenter(1.0, &|c| c.effects = key(vec![VideoEffect::Blur { sigma: 1.5 }])),
+        presenter(2.0, &|c| c.effects = key(vec![VideoEffect::Vignette])),
+        presenter(3.0, &|c| {
+            c.effects = key(vec![]);
+            c.color = Color {
+                contrast: 1.15,
+                saturation: 1.2,
+                ..Color::default()
+            };
+        }),
+        presenter(0.0, &|c| c.effects = key(vec![VideoEffect::Sharpen { amount: 0.8 }])),
+        presenter(1.0, &|c| {
+            c.effects = key(vec![]);
+            c.mask = Some(mask(MaskShape::Ellipse, 0.5, 0.5, 0.7, 0.9, 0.2));
+        }),
+        presenter(2.0, &|c| {
+            c.effects = key(vec![]);
+            c.transform.opacity = 0.9;
+        }),
+        presenter(3.0, &|c| {
+            c.effects = key(vec![]);
+            c.transform.rotation = -3.0;
+        }),
+    ]);
+    (
+        "T13 green screen 16:9, key + blur / vignette / grade / mask / tilt",
+        timeline(
+            vec![track(backdrop, "V1"), track(fg, "V2")],
+            vec![lower_third("Dr. Ada Lovelace", 2.0, 8.0)],
+            delivery(1920, 1080, Fit::Contain, 30.0),
+        ),
+        ExportOptions::default(),
+    )
+}
+
+/// T14: a vertical social edit of landscape shots kept whole (`Contain`, bars above and below): a vignette, a blur, a sharpen, a
+/// grey flashback, an inverted glitch frame, and a 4K drone shot and a ProRes one given the same looks.
+fn social_looks(m: &Media, x: &Extra) -> Archetype {
+    let looks =
+        |a: &Asset, src_in: f64, dur: f64, effects: Vec<VideoEffect>| with(clip(a, src_in, dur, 0.0), |c| c.effects = effects);
+    let clips = lay(vec![
+        looks(&m.cams[0], 0.0, 4.0, vec![VideoEffect::Vignette]),
+        looks(&m.cams[2], 0.0, 3.0, vec![VideoEffect::Blur { sigma: 3.0 }]),
+        looks(&m.cams[0], 6.0, 4.0, vec![VideoEffect::Sharpen { amount: 1.2 }]),
+        looks(&m.base, 0.0, 4.0, vec![VideoEffect::Grayscale, VideoEffect::Vignette]),
+        looks(&m.cams[1], 0.0, 0.4, vec![VideoEffect::Invert]),
+        with(looks(&m.uhd, 0.0, 5.0, vec![VideoEffect::Sharpen { amount: 2.0 }]), |c| {
+            c.color = Color {
+                brightness: -0.1,
+                contrast: 2.4,
+                saturation: 2.2,
+                gamma: 0.6,
+                ..Color::default()
+            }
+        }),
+        looks(&x.prores, 0.0, 4.0, vec![VideoEffect::Vignette]),
+        looks(
+            &x.deep,
+            0.0,
+            4.0,
+            vec![VideoEffect::Sharpen { amount: 0.4 }, VideoEffect::Blur { sigma: 2.0 }],
+        ),
+        looks(&m.cams[2], 6.0, 3.0, vec![VideoEffect::Blur { sigma: 20.0 }]),
+    ]);
+    (
+        "T14 vertical social edit of 16:9 shots (Contain), looks and effects",
+        timeline(
+            vec![track(clips, "V1")],
+            captions(0.5, 30.0),
+            delivery(1080, 1920, Fit::Contain, 30.0),
+        ),
+        ExportOptions::default(),
+    )
+}
+
+/// T15: a wedding highlight from every camera in the room: ProRes 4:2:2, 10-bit H.264, photographs, a phone held upright and a 4K
+/// drone, warmed, curved and looked-up, joined by dips to white, dissolves and a slide, with a punch-in on the phone shot.
+fn wedding(m: &Media, x: &Extra) -> Archetype {
+    let warm = Color {
+        contrast: 1.1,
+        saturation: 1.1,
+        temperature: 0.15,
+        ..Color::default()
+    };
+    let curve = Curves {
+        master: [(0.0, 0.0), (0.4, 0.1), (0.6, 0.9), (1.0, 1.0)]
+            .map(|(x, y)| CurvePoint { x, y })
+            .to_vec(),
+        ..Curves::default()
+    };
+    let lut = ClipLut {
+        path: x.lut.display().to_string(),
+        intensity: 0.8,
+    };
+    let dip = transition(TransitionKind::DipToWhite, 0.8);
+    let clips = lay(vec![
+        with(clip(&x.prores, 0.0, 4.5, 0.0), |c| {
+            c.color = warm;
+            c.fade_in = 1.0;
+        }),
+        with(clip(&x.deep, 0.0, 5.0, 0.0), |c| {
+            c.grade.lut = Some(lut.clone());
+            c.transition_in = dip;
+        }),
+        with(clip(&m.photos[0], 0.0, 4.0, 0.0), |c| {
+            c.color = warm;
+            c.transition_in = crossfade(0.8);
+        }),
+        with(clip(&m.photos[1], 0.0, 4.0, 0.0), |c| {
+            c.grade.curves = Some(curve.clone());
+            c.transition_in = dip;
+        }),
+        with(clip(&m.phone709, 0.0, 5.0, 0.0), |c| {
+            c.transform.scale = 1.3;
+            c.color = warm;
+            c.transition_in = crossfade(0.8);
+        }),
+        with(clip(&m.uhd, 0.0, 5.0, 0.0), |c| {
+            c.color = Color {
+                contrast: 1.8,
+                saturation: 1.5,
+                gamma: 0.7,
+                ..Color::default()
+            };
+            c.transition_in = transition(TransitionKind::SlideLeft, 0.6);
+        }),
+        with(clip(&x.prores, 0.0, 4.5, 0.0), |c| {
+            c.grade.curves = Some(curve.clone());
+            c.transition_in = dip;
+        }),
+        with(clip(&x.deep, 1.0, 4.0, 0.0), |c| {
+            c.color = warm;
+            c.fade_out = 1.5;
+            c.transition_in = crossfade(0.8);
+        }),
+    ]);
+    let secs = clips.last().map_or(0.0, Clip::timeline_end);
+    (
+        "T15 wedding highlight 16:9, 5 camera formats, warm grade, dips to white",
+        timeline(
+            vec![track(clips, "V1"), music_bed(m, secs)],
+            vec![],
+            delivery(1920, 1080, Fit::Contain, 25.0),
+        ),
+        ExportOptions::default(),
+    )
+}
+
+/// T16: a travel vlog from an iPhone's HLG HDR, a PQ clip, a drone's BT.2020, a mirrorless camera's 10-bit and a BT.709 phone clip,
+/// dissolved into each other, the 10-bit shots graded.
+fn hdr_travel(m: &Media, x: &Extra) -> Archetype {
+    let clips = lay(vec![
+        with(clip(&x.hlg, 0.0, 5.5, 0.0), |c| c.fade_in = 0.5),
+        with(clip(&m.phone709, 0.0, 5.0, 0.0), |c| c.transition_in = crossfade(0.6)),
+        with(clip(&x.pq, 0.0, 4.5, 0.0), |c| c.transition_in = crossfade(0.6)),
+        with(clip(&x.wide, 0.0, 5.5, 0.0), |c| c.transition_in = crossfade(0.6)),
+        with(clip(&x.deep, 0.0, 5.5, 0.0), |c| {
+            c.color = Color {
+                contrast: 1.1,
+                saturation: 1.15,
+                ..Color::default()
+            };
+            c.transition_in = crossfade(0.6);
+        }),
+        with(clip(&x.hlg, 0.0, 5.5, 0.0), |c| c.transition_in = crossfade(0.6)),
+        with(clip(&x.ntsc, 0.0, 6.0, 0.0), |c| {
+            c.transition_in = crossfade(0.6);
+            c.fade_out = 1.0;
+        }),
+    ]);
+    let secs = clips.last().map_or(0.0, Clip::timeline_end);
+    (
+        "T16 travel vlog 16:9, HLG / PQ / BT.2020 / 10-bit / BT.709, dissolves",
+        timeline(
+            vec![track(clips, "V1"), music_bed(m, secs)],
+            vec![TextOverlay::new("Lofoten, 68.3 N", 1.0, 4.0)],
+            delivery(1920, 1080, Fit::Contain, 30.0),
+        ),
+        ExportOptions::default(),
+    )
+}
+
+/// T17: a branded cut: ProRes 4444 lower thirds with alpha, a PNG logo in a corner for the whole cut, a GIF sticker, an
+/// indexed-colour badge and a PNG that fades in over the footage.
+fn branded_overlays(m: &Media, x: &Extra) -> Archetype {
+    let v1 = lay((0..7u32).map(|i| clip(&m.base, f64::from(i % 4) * 3.0, 5.0, 0.0)).collect());
+    let v2: Vec<Clip> = (0..3u32)
+        .map(|i| clip(&x.lower_third, 0.0, 3.8, 3.0 + f64::from(i) * 11.0))
+        .collect();
+    let logo = with(Clip::new(x.logo.id, 0.0, 35.0, 0.0), |c| {
+        c.transform = Transform {
+            scale: 0.12,
+            pos_x: 0.42,
+            pos_y: -0.4,
+            opacity: 0.8,
+            ..Transform::default()
+        };
+    });
+    let stickers: Vec<Clip> = (0..2u32)
+        .map(|i| {
+            with(clip(&x.sticker, 0.0, 2.8, 8.0 + f64::from(i) * 14.0), |c| {
+                c.transform = Transform {
+                    scale: 0.2,
+                    pos_x: -0.35,
+                    pos_y: 0.25,
+                    rotation: 12.0,
+                    ..Transform::default()
+                };
+            })
+        })
+        .collect();
+    let end_card = with(Clip::new(x.logo.id, 0.0, 4.0, 31.0), |c| {
+        c.transform.scale = 0.5;
+        c.fade_in = 1.0;
+    });
+    let render = with(Clip::new(x.plate.id, 0.0, 6.0, 22.0), |c| {
+        c.transform = Transform {
+            scale: 0.4,
+            pos_x: -0.25,
+            pos_y: 0.2,
+            ..Transform::default()
+        };
+        c.fade_in = 0.5;
+    });
+    let badge = with(Clip::new(x.badge.id, 0.0, 10.0, 14.0), |c| {
+        c.transform = Transform {
+            scale: 0.18,
+            pos_x: 0.38,
+            pos_y: 0.3,
+            ..Transform::default()
+        };
+    });
+    (
+        "T17 branded cut 16:9, ProRes 4444 lower thirds, PNG logo, GIF sticker",
+        timeline(
+            vec![
+                track(v1, "V1"),
+                track(v2, "V2"),
+                track(vec![logo], "V3"),
+                track(stickers, "V4"),
+                track(vec![badge, end_card], "V5"),
+                track(vec![render], "V6"),
+            ],
+            vec![],
+            delivery(1920, 1080, Fit::Cover, 30.0),
+        ),
+        ExportOptions::default(),
+    )
+}
+
+/// T18: captions as the styled formats make them: bold in a typeface with no bold face (a border thickens it) and an animated title
+/// in a family that is not installed (the shipped font is drawn in its place).
+fn styled_text(m: &Media) -> Archetype {
+    let clips = lay((0..6u32).map(|i| clip(&m.base, f64::from(i) * 3.0, 6.0, 0.0)).collect());
+    let family = regular_only_family();
+    let mut overlays: Vec<TextOverlay> = captions(1.0, 34.0)
+        .into_iter()
+        .map(|mut o| {
+            o.bold = true;
+            o.font = family.clone();
+            o.size = 0.07;
+            o
+        })
+        .collect();
+    let mut title = TextOverlay::new("Summer sale", 2.0, 6.0);
+    title.font = Some("Comic Neue".into());
+    title.bold = true;
+    title.size = 0.12;
+    title.pos_y = 0.4;
+    title.keyframes = [(0.0, 0.45, 0.0), (0.5, 0.4, 1.0)]
+        .map(|(time, pos_y, opacity)| kerf_core::TextKeyframe {
+            time,
+            pos_x: 0.5,
+            pos_y,
+            opacity,
+        })
+        .to_vec();
+    overlays.push(title);
+    (
+        "T18 styled captions 9:16, bold without a bold face, missing font",
+        timeline(vec![track(clips, "V1")], overlays, delivery(1080, 1920, Fit::Cover, 30.0)),
+        ExportOptions::default(),
+    )
+}
+
+/// T19: an explainer with animated titles: the four SVG presets floating over the footage, a title clip on a track of its own and
+/// one made from a motion template, with a channel handle and small print too small for a mask to stand for.
+fn svg_titles(m: &Media) -> Archetype {
+    let frame = (1920, 1080);
+    let preset = |kind: SvgPresetKind, text: &str, subtitle: Option<&str>, start: f64, end: f64| {
+        let params = SvgPresetParams {
+            subtitle: subtitle.map(str::to_string),
+            ..SvgPresetParams::new(text)
+        };
+        SvgOverlay {
+            id: uuid::Uuid::new_v4(),
+            name: String::new(),
+            svg: render_preset(kind, &params, end - start, frame),
+            start,
+            end,
+            x: 0.0,
+            y: 0.0,
+            width: 1.0,
+            height: 1.0,
+            opacity: 1.0,
+            offset: 0.0,
+            preset: Some(SvgPreset { kind, params }),
+            template: None,
+        }
+    };
+    let clips = lay((0..7u32).map(|i| clip(&m.base, f64::from(i % 5) * 2.0, 6.0, 0.0)).collect());
+    let intro_params = SvgPresetParams::new("How it works");
+    let intro = Clip::title(
+        TitleClip {
+            name: "Intro".into(),
+            svg: render_preset(SvgPresetKind::FadeUp, &intro_params, 3.0, frame),
+            template: None,
+        },
+        0.0,
+        3.0,
+    );
+    let templated = Clip::title(
+        TitleClip {
+            name: "Lower third".into(),
+            svg: render_preset(SvgPresetKind::LowerThird, &SvgPresetParams::new("Chapter 2"), 4.0, frame),
+            template: Some(kerf_core::TemplateInstance {
+                template_id: "lower-third-bar".into(),
+                name: "Lower third".into(),
+                controls: Vec::new(),
+                values: Default::default(),
+            }),
+        },
+        36.0,
+        4.0,
+    );
+    // A channel handle in the corner and the small print: under 12 px at the 540 px a preview plans at.
+    let mut handle = TextOverlay::new("@kerf.studio", 0.0, 10.0);
+    handle.pos_x = 0.9;
+    handle.pos_y = 0.95;
+    handle.size = 0.03;
+    handle.color = "white@0.7".into();
+    let mut small_print = TextOverlay::new("*Results vary. Terms apply.", 26.0, 34.0);
+    small_print.pos_y = 0.92;
+    small_print.size = 0.025;
+    let mut timeline = timeline(
+        vec![track(clips, "V1"), track(vec![intro, templated], "V2")],
+        vec![handle, small_print],
+        delivery(1920, 1080, Fit::Cover, 30.0),
+    );
+    timeline.svg_overlays = vec![
+        preset(SvgPresetKind::FadeUp, "Step one", Some("Import your footage"), 5.0, 9.0),
+        preset(SvgPresetKind::LowerThird, "Ada Lovelace", Some("Engineer"), 12.0, 16.0),
+        preset(SvgPresetKind::Typewriter, "Cut what does not help", None, 20.0, 25.0),
+        preset(SvgPresetKind::WordPop, "Export", None, 30.0, 33.0),
+    ];
+    (
+        "T19 explainer 16:9, SVG titles, title clips, a template, small text",
+        timeline,
+        ExportOptions::default(),
+    )
+}
+
+/// T20: a social montage with life added by behaviours: a breathing photograph, a drifting one, a swaying shot, a handheld shake,
+/// a sticker that spins and a wiggling logo.
+fn behaviours(m: &Media, x: &Extra) -> Archetype {
+    let v1 = lay(vec![
+        with(Clip::new(m.photos[0].id, 0.0, 4.5, 0.0), |c| {
+            c.behaviors = vec![Behavior::Breathe {
+                amount: 0.04,
+                speed: 0.25,
+                phase: 0.0,
+            }];
+        }),
+        with(Clip::new(m.photos[1].id, 0.0, 4.5, 0.0), |c| {
+            c.behaviors = vec![Behavior::Drift {
+                speed: 0.01,
+                angle: 90.0,
+                phase: 0.0,
+            }];
+        }),
+        with(clip(&m.base, 0.0, 5.0, 0.0), |c| {
+            c.behaviors = vec![Behavior::Sway {
+                amount: 1.5,
+                speed: 0.3,
+                phase: 0.0,
+            }];
+        }),
+        with(Clip::new(m.photos[2].id, 0.0, 4.5, 0.0), |c| {
+            c.behaviors = vec![
+                Behavior::Breathe {
+                    amount: 0.03,
+                    speed: 0.2,
+                    phase: 0.5,
+                },
+                Behavior::Drift {
+                    speed: 0.008,
+                    angle: 0.0,
+                    phase: 0.0,
+                },
+            ];
+        }),
+        with(clip(&m.cams[2], 0.0, 5.0, 0.0), |c| {
+            c.behaviors = vec![Behavior::Shake {
+                amount: 0.006,
+                speed: 7.0,
+                seed: 4,
+                phase: 0.0,
+            }];
+        }),
+        clip(&m.cams[0], 0.0, 4.0, 0.0),
+    ]);
+    let v2 = vec![
+        with(clip(&x.sticker, 0.0, 2.8, 3.0), |c| {
+            c.transform = Transform {
+                scale: 0.25,
+                pos_x: 0.3,
+                pos_y: -0.25,
+                ..Transform::default()
+            };
+            c.behaviors = vec![Behavior::Spin { speed: 0.4, phase: 0.0 }];
+        }),
+        with(Clip::new(x.logo.id, 0.0, 6.0, 12.0), |c| {
+            c.transform = Transform {
+                scale: 0.15,
+                pos_x: -0.38,
+                pos_y: -0.35,
+                ..Transform::default()
+            };
+            motion(c, MotionPreset::Wiggle);
+        }),
+        with(clip(&x.sticker, 0.0, 2.8, 20.0), |c| {
+            c.transform = Transform {
+                scale: 0.25,
+                pos_x: -0.3,
+                pos_y: 0.2,
+                ..Transform::default()
+            };
+            motion(c, MotionPreset::Bounce);
+        }),
+    ];
+    (
+        "T20 social montage 16:9, breathe / drift / sway / shake / spin, presets",
+        timeline(
+            vec![track(v1, "V1"), track(v2, "V2")],
+            vec![],
+            delivery(1920, 1080, Fit::Cover, 30.0),
+        ),
+        ExportOptions::default(),
+    )
+}
+
+/// T21: a 360 clip reframed with a camera that pans, then punch-ins on ordinary footage: a static zoom and a pan under `Cover`, a
+/// zoom out, and moving zooms over a grade, a dip to white and a turn.
+fn sphere_and_punch_ins(m: &Media, x: &Extra) -> Archetype {
+    let pan = |from: f64, to: f64| Reframe {
+        keyframes: vec![
+            ReframeKeyframe {
+                time: 0.0,
+                yaw: from,
+                pitch: 0.0,
+                roll: 0.0,
+                fov: 100.0,
+            },
+            ReframeKeyframe {
+                time: 5.0,
+                yaw: to,
+                pitch: 5.0,
+                roll: 0.0,
+                fov: 90.0,
+            },
+        ],
+        ..Reframe::new(Projection::Equirect)
+    };
+    let push = |c: &mut Clip| c.keyframes = vec![key(0.0, 1.0, 0.0, 0.0), key(4.0, 1.2, 0.0, 0.0)];
+    let clips = lay(vec![
+        with(clip(&x.equirect, 0.0, 5.0, 0.0), |c| c.reframe = Some(pan(-60.0, 60.0))),
+        with(clip(&x.equirect, 2.0, 5.0, 0.0), |c| {
+            c.reframe = Some(Reframe::new(Projection::Equirect));
+            c.transition_in = crossfade(0.5);
+        }),
+        with(clip(&m.cams[0], 0.0, 4.0, 0.0), |c| {
+            c.transform.scale = 1.3;
+            c.transform.pos_x = -0.1;
+        }),
+        with(clip(&m.cams[1], 0.0, 4.0, 0.0), |c| c.transform.scale = 0.8),
+        with(clip(&m.cams[0], 6.0, 4.0, 0.0), |c| {
+            push(c);
+            c.grade.wheels = Some(Wheels {
+                shadows: Wheel {
+                    x: 0.1,
+                    y: -0.05,
+                    lightness: 0.1,
+                },
+                ..Wheels::default()
+            });
+        }),
+        with(clip(&m.cams[1], 6.0, 4.0, 0.0), |c| {
+            push(c);
+            c.transition_in = transition(TransitionKind::DipToWhite, 0.6);
+        }),
+        with(clip(&m.cams[2], 6.0, 4.0, 0.0), |c| {
+            push(c);
+            c.transform.rotation = 3.0;
+        }),
+        with(clip(&m.cams[0], 12.0, 4.0, 0.0), |c| {
+            push(c);
+            c.mask = Some(mask(MaskShape::Rect, 0.5, 0.5, 0.8, 0.8, 0.1));
+            c.effects = vec![VideoEffect::Vignette];
+        }),
+    ]);
+    (
+        "T21 360 reframe + punch-ins 16:9 (Cover), zoom / pan / zoom out / keyed",
+        timeline(vec![track(clips, "V1")], vec![], delivery(1920, 1080, Fit::Cover, 30.0)),
+        ExportOptions::default(),
+    )
+}
+
+/// T22: a screen-recording tutorial: OBS recordings in 4:4:4, an RGB capture, full-range ones (an OBS one and a browser's VP9),
+/// crops into regions of the screen, a webcam in a round bubble, a 4K thumbnail in a corner and a graded camera angle over a
+/// full-range recording.
+fn screen_tutorial(m: &Media, x: &Extra) -> Archetype {
+    let crop = |left: f64, right: f64, top: f64, bottom: f64| Transform {
+        crop_left: left,
+        crop_right: right,
+        crop_top: top,
+        crop_bottom: bottom,
+        ..Transform::default()
+    };
+    let v1 = lay(vec![
+        clip(&x.screen, 0.0, 7.5, 0.0),
+        with(clip(&x.screen, 0.0, 7.5, 0.0), |c| c.transform = crop(0.25, 0.25, 0.1, 0.4)),
+        with(clip(&x.capture, 0.0, 7.5, 0.0), |c| c.transform = crop(0.2, 0.2, 0.0, 0.3)),
+        with(clip(&x.obs, 0.0, 7.5, 0.0), |c| {
+            c.color = Color {
+                contrast: 1.1,
+                ..Color::default()
+            }
+        }),
+        with(clip(&x.browser, 0.0, 5.5, 0.0), |c| {
+            c.transition_in = crossfade(0.5);
+            c.fade_out = 0.5;
+        }),
+        with(clip(&x.screen, 0.0, 7.5, 0.0), |c| {
+            c.keyframes = vec![key(0.0, 1.0, 0.0, 0.0), key(7.5, 1.4, -0.1, -0.05)];
+        }),
+    ]);
+    let bubble = |start: f64| {
+        with(clip(&x.webcam, 0.0, 7.5, start), |c| {
+            c.transform = Transform {
+                scale: 0.22,
+                pos_x: 0.36,
+                pos_y: 0.3,
+                ..Transform::default()
+            };
+            c.mask = Some(mask(MaskShape::Ellipse, 0.5, 0.5, 0.56, 1.0, 0.1));
+        })
+    };
+    let v2 = vec![bubble(2.0), bubble(15.0), bubble(26.0)];
+    let thumbnail = with(clip(&m.uhd, 0.0, 8.0, 3.0), |c| {
+        c.transform = Transform {
+            scale: 0.07,
+            pos_x: -0.42,
+            pos_y: -0.4,
+            ..Transform::default()
+        };
+    });
+    // A camera angle in a corner, graded, over the RGB capture and then over the full-range recording.
+    let angle = |a: &Asset, start: f64| {
+        with(clip(a, 0.0, 7.5, start), |c| {
+            c.transform = Transform {
+                scale: 0.3,
+                pos_x: -0.3,
+                pos_y: 0.28,
+                ..Transform::default()
+            };
+            c.color = Color {
+                contrast: 1.1,
+                saturation: 1.1,
+                ..Color::default()
+            };
+        })
+    };
+    let angles = vec![angle(&x.ntsc, 15.0), angle(&m.cams[0], 22.5)];
+    (
+        "T22 screen tutorial 16:9 (Cover), 4:4:4 / RGB / full range, webcam bubble",
+        timeline(
+            vec![
+                track(v1, "V1"),
+                track(v2, "V2"),
+                track(vec![thumbnail], "V3"),
+                track(angles, "V4"),
+            ],
+            vec![lower_third("Open the settings", 4.0, 9.0), {
+                let mut hint = TextOverlay::new("Cmd + K", 12.0, 16.0);
+                hint.pos_y = 0.1;
+                hint.size = 0.03;
+                hint
+            }],
+            delivery(1920, 1080, Fit::Cover, 30.0),
+        ),
+        ExportOptions::default(),
+    )
+}
+
+/// T24: a family documentary from every era: digitised archive footage tagged SMPTE 240M, an untagged clip, a BT.2020 one and a
+/// phone's BT.709, some of it translucent over the next, dissolved into each other.
+fn archive_mix(m: &Media, x: &Extra) -> Archetype {
+    let clips = lay(vec![
+        with(clip(&x.archive, 0.0, 5.5, 0.0), |c| {
+            c.transform.opacity = 0.9;
+            c.fade_in = 0.6;
+        }),
+        with(clip(&m.base, 0.0, 5.0, 0.0), |c| c.transition_in = crossfade(0.8)),
+        with(clip(&x.archive, 0.0, 5.0, 0.0), |c| {
+            c.transform.opacity = 0.85;
+            c.transition_in = transition(TransitionKind::DipToBlack, 0.8);
+        }),
+        with(clip(&x.wide, 0.0, 5.0, 0.0), |c| c.transition_in = crossfade(0.8)),
+        with(clip(&x.ntsc, 0.0, 5.0, 0.0), |c| c.transition_in = crossfade(0.8)),
+        with(clip(&m.phone601, 0.0, 5.0, 0.0), |c| {
+            c.transition_in = crossfade(0.8);
+            c.fade_out = 1.2;
+        }),
+    ]);
+    (
+        "T24 family documentary 16:9, SMPTE 240M / untagged / BT.2020 / BT.709",
+        timeline(
+            vec![track(clips, "V1")],
+            vec![TextOverlay::new("1987 - 2026", 1.0, 5.0)],
+            delivery(1920, 1080, Fit::Contain, 30.0),
+        ),
+        ExportOptions::default(),
+    )
+}
+
+/// T23: one short teaser delivered five ways, which is what the export dialog's format choices change in a plan: a ProRes file, a
+/// GIF, a different scaler, a 10-bit file and a rate whose two parses in the graph are not the same fraction.
+fn delivery_variants(m: &Media) -> Vec<Archetype> {
+    let teaser = || {
+        let clips = lay((0..8u32).map(|i| clip(&m.base, f64::from(i % 6) * 2.0, 2.0, 0.0)).collect());
+        let mut clips = clips;
+        clips[0].fade_in = 0.4;
+        clips[7].fade_out = 0.6;
+        timeline(
+            vec![track(clips, "V1")],
+            vec![TextOverlay::new("Out now", 4.0, 8.0)],
+            delivery(1920, 1080, Fit::Cover, 30.0),
+        )
+    };
+    let with_options = |name: &'static str, options: ExportOptions| (name, teaser(), options);
+    vec![
+        with_options(
+            "T23a teaser delivered as ProRes 422 HQ (10-bit 4:2:2)",
+            ExportOptions {
+                video_codec: Some("prores_ks".into()),
+                ..ExportOptions::default()
+            },
+        ),
+        with_options(
+            "T23b teaser delivered as a 640 px GIF",
+            ExportOptions {
+                container: Container::Gif,
+                resolution: Some((640, 360)),
+                ..ExportOptions::default()
+            },
+        ),
+        with_options(
+            "T23c teaser delivered with the lanczos scaler",
+            ExportOptions {
+                scaler: Some("lanczos".into()),
+                ..ExportOptions::default()
+            },
+        ),
+        with_options(
+            "T23d teaser delivered as 10-bit 4:2:0",
+            ExportOptions {
+                pix_fmt: Some("yuv420p10le".into()),
+                ..ExportOptions::default()
+            },
+        ),
+        with_options(
+            "T23e teaser delivered at 29.970029 fps",
+            ExportOptions {
+                fps: Some(29.970_029),
+                ..ExportOptions::default()
+            },
+        ),
+    ]
 }
 
 /// How long an encode of one generated source may take: the longest (4K, 12 s) takes seconds, a loaded box minutes.
@@ -1002,16 +2366,23 @@ fn ffmpeg_version() -> &'static (String, String) {
 #[ignore = "needs ffmpeg"]
 fn the_ledger_says_which_refusals_hold_the_compositor_back() {
     let media = media();
-    let assets = media.assets();
+    let extra = extra();
+    let mut assets = media.assets();
+    assets.extend(extra.assets());
     let policy = composite_color_policy();
     // The caps the app asks with: the grade is drawn only where this FFmpeg's conversions are the model's (one probe).
     let kernels = kerf_gpu::grade::kernels();
     let caps = Compositor::caps_for(kernels);
     let mut cuts = vec![];
-    for (name, tl) in archetypes(media) {
+    // T1 to T8 are planned with the default export options; T9 and on say theirs (a ProRes file, a GIF, a scaler).
+    let mut every: Vec<Archetype> = archetypes(media)
+        .into_iter()
+        .map(|(name, tl)| (name, tl, ExportOptions::default()))
+        .collect();
+    every.extend(extended(media, extra));
+    for (name, tl, options) in every {
         for (mode, request) in [("still", PlanRequest::still(policy)), ("motion", PlanRequest::motion(policy))] {
-            let planner =
-                Planner::new(&tl, &assets, &ExportOptions::default(), request.with_media(&OriginalMedia)).expect("planner");
+            let planner = Planner::new(&tl, &assets, &options, request.with_media(&OriginalMedia)).expect("planner");
             let first = planner.at_frame(0).expect("a plan");
             let fps = first.canvas.fps;
             let frames = (tl.duration() * f64::from(fps.num) / f64::from(fps.den)).floor() as u64;
@@ -1034,9 +2405,10 @@ fn the_ledger_says_which_refusals_hold_the_compositor_back() {
         format!("composite colour policy: {policy:?}"),
         format!("grade kernels: {kernels:?} (caps: Compositor::caps_for(grade::kernels()), as the app asks)"),
         "plans: every output frame of every archetype over OriginalMedia at 540 px wide (the app's preview plans ProxyMedia at 960); nothing is rendered".to_string(),
-        "archetypes: the review's T1 to T3 and the real-world T4 to T8 of tests/coverage.rs".to_string(),
+        "archetypes: the review's T1 to T3, the real-world T4 to T8 and T9 to T24, which between them use every feature the editor offers that still refuses (tests/coverage.rs)".to_string(),
     ];
-    let text = render_ledger(&header, &cuts);
+    let mut text = render_ledger(&header, &cuts);
+    text.push_str(&unreached(&cuts, policy, kernels));
     eprintln!("{text}");
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).parent().unwrap().join("parity");
     std::fs::create_dir_all(&dir).unwrap();
@@ -1055,6 +2427,186 @@ fn the_ledger_says_which_refusals_hold_the_compositor_back() {
             cut.frames
         );
     }
+}
+
+/// One value of every [`Unsupported`] variant: the kinds the ledger can be asked about. [`ordinal`] is an exhaustive `match`, so a
+/// variant added to the enum does not compile here until it is given a number, and a test holds the numbers to this list.
+fn every_variant() -> Vec<Unsupported> {
+    let layer = layer_ref;
+    let rate = || Rational::new(30, 1).expect("a rate");
+    vec![
+        Unsupported::NoPicture(layer()),
+        Unsupported::Motion,
+        Unsupported::Delivery(String::new()),
+        Unsupported::Gif,
+        Unsupported::BlurFill,
+        Unsupported::PickRate {
+            canvas: rate(),
+            clips: rate(),
+        },
+        Unsupported::Hdr(layer()),
+        Unsupported::AlphaPicture(layer(), String::new()),
+        Unsupported::NotKnownOpaque(layer(), String::new()),
+        Unsupported::TranslucentMatrix(layer(), String::new()),
+        Unsupported::GradedFullRange(layer(), String::new()),
+        Unsupported::GradeSteep(layer(), 3),
+        Unsupported::Grade(layer(), ""),
+        Unsupported::GradeWith(layer(), ""),
+        Unsupported::Effects(layer(), ""),
+        Unsupported::Mask(layer()),
+        Unsupported::MaskWith(layer(), ""),
+        Unsupported::Matte(layer(), ""),
+        Unsupported::Reframe(layer()),
+        Unsupported::Fade(layer(), FadeEdge::In, false),
+        Unsupported::FadeOnTranslucent(layer()),
+        Unsupported::Travel(layer()),
+        Unsupported::DipToWhite(layer(), DipWhy::NoRoundTrip),
+        Unsupported::FullRangeNegotiated(layer()),
+        Unsupported::FullRangeCut,
+        Unsupported::FullRangeResized(layer(), ""),
+        Unsupported::SpeedRamp(layer()),
+        Unsupported::Stabilized(layer()),
+        Unsupported::BlendMode(layer(), BlendMode::Screen),
+        Unsupported::Tail(layer()),
+        Unsupported::KeyedOpacity(layer()),
+        Unsupported::KeyedColor(layer()),
+        Unsupported::KeyedMask(layer()),
+        Unsupported::KeyedCrop(layer()),
+        Unsupported::StillMotion(layer()),
+        Unsupported::KeyedZoom(layer()),
+        Unsupported::KeyedPlacement(layer()),
+        Unsupported::Behavior(layer()),
+        Unsupported::ZoomBehind(layer(), ""),
+        Unsupported::FoldedFit(layer(), ""),
+        Unsupported::Text,
+        Unsupported::TextWithoutFont,
+        Unsupported::TextBorder,
+        Unsupported::TextTooSmall(8),
+        Unsupported::Svg,
+        Unsupported::Scaler(String::new()),
+        Unsupported::MatrixUnknown(0),
+        Unsupported::MixedMatrices,
+        Unsupported::UnmeasuredPolicy(YuvMatrix::Bt709),
+        Unsupported::RgbInStack(YuvMatrix::Bt709),
+        Unsupported::GradedInFullRangeStack(0),
+        Unsupported::Shrink(0, (4, 4), (1, 1)),
+        Unsupported::FormatResize(0, (4, 4), (2, 2), String::new()),
+        Unsupported::Geometry(0, String::new()),
+    ]
+}
+
+/// A number for each variant, with no gaps: `match` has no wildcard, so adding a variant breaks this build until it has one.
+fn ordinal(u: &Unsupported) -> usize {
+    match u {
+        Unsupported::NoPicture(_) => 0,
+        Unsupported::Motion => 1,
+        Unsupported::Delivery(_) => 2,
+        Unsupported::Gif => 3,
+        Unsupported::BlurFill => 4,
+        Unsupported::PickRate { .. } => 5,
+        Unsupported::Hdr(_) => 6,
+        Unsupported::AlphaPicture(..) => 7,
+        Unsupported::NotKnownOpaque(..) => 8,
+        Unsupported::TranslucentMatrix(..) => 9,
+        Unsupported::GradedFullRange(..) => 10,
+        Unsupported::GradeSteep(..) => 11,
+        Unsupported::Grade(..) => 12,
+        Unsupported::GradeWith(..) => 13,
+        Unsupported::Effects(..) => 14,
+        Unsupported::Mask(_) => 15,
+        Unsupported::MaskWith(..) => 16,
+        Unsupported::Matte(..) => 17,
+        Unsupported::Reframe(_) => 18,
+        Unsupported::Fade(..) => 19,
+        Unsupported::FadeOnTranslucent(_) => 20,
+        Unsupported::Travel(_) => 21,
+        Unsupported::DipToWhite(..) => 22,
+        Unsupported::FullRangeNegotiated(_) => 23,
+        Unsupported::FullRangeCut => 24,
+        Unsupported::FullRangeResized(..) => 25,
+        Unsupported::SpeedRamp(_) => 26,
+        Unsupported::Stabilized(_) => 27,
+        Unsupported::BlendMode(..) => 28,
+        Unsupported::Tail(_) => 29,
+        Unsupported::KeyedOpacity(_) => 30,
+        Unsupported::KeyedColor(_) => 31,
+        Unsupported::KeyedMask(_) => 32,
+        Unsupported::KeyedCrop(_) => 33,
+        Unsupported::StillMotion(_) => 34,
+        Unsupported::KeyedZoom(_) => 35,
+        Unsupported::KeyedPlacement(_) => 36,
+        Unsupported::Behavior(_) => 37,
+        Unsupported::ZoomBehind(..) => 38,
+        Unsupported::FoldedFit(..) => 39,
+        Unsupported::Text => 40,
+        Unsupported::TextWithoutFont => 41,
+        Unsupported::TextBorder => 42,
+        Unsupported::TextTooSmall(_) => 43,
+        Unsupported::Svg => 44,
+        Unsupported::Scaler(_) => 45,
+        Unsupported::MatrixUnknown(_) => 46,
+        Unsupported::MixedMatrices => 47,
+        Unsupported::UnmeasuredPolicy(_) => 48,
+        Unsupported::RgbInStack(_) => 49,
+        Unsupported::GradedInFullRangeStack(_) => 50,
+        Unsupported::Shrink(..) => 51,
+        Unsupported::FormatResize(..) => 52,
+        Unsupported::Geometry(..) => 53,
+    }
+}
+
+/// Why no archetype can hit `kind` on this machine, when that is known: a refusal a compositor with `Compositor::CAPS` no longer
+/// makes, one nothing a user can build reaches, or one this FFmpeg's probes take out of play.
+fn why_unreached(kind: &str, policy: CompositeColorPolicy, kernels: Kernels) -> &'static str {
+    let negotiating = policy != CompositeColorPolicy::FixedBt601;
+    match kind {
+        "motion" | "fade" | "travel" | "tail" | "keyed_opacity" | "keyed_color" | "keyed_zoom" | "mask" | "text" => {
+            "drawn: Compositor::CAPS has the ability, so a plan never reports it"
+        }
+        "no_picture" => {
+            "unreachable: the project keeps an audio-only asset off a video track, and a probe states a video stream's size"
+        }
+        "text_without_font" => {
+            "unreachable: the shipped default font is written to disk (it fails only with no writable cache or temp directory)"
+        }
+        "unmeasured_policy" => {
+            "unreachable here: the composite colour policy was measured (Unknown only when the probe cannot tell)"
+        }
+        "grade" if kernels == Kernels::Match => "drawn: this FFmpeg's grade conversions are the model's",
+        "grade_with" if kernels != Kernels::Match => {
+            "not judged: this FFmpeg's grade conversions differ, so every grade is refused as `grade` first"
+        }
+        "mixed_matrices" | "matrix_unknown" | "rgb_in_stack" | "full_range_cut" | "graded_in_full_range_stack"
+            if !negotiating =>
+        {
+            "FixedBt601: this FFmpeg composites every stack as BT.601, so there is nothing to negotiate"
+        }
+        "text_border" if regular_only_family().is_none() => "no installed font family without a bold face",
+        _ => "no archetype builds it",
+    }
+}
+
+/// (f) The `Unsupported` variants no archetype hit, so that what the ledger cannot measure is stated rather than silent.
+fn unreached(cuts: &[Cut], policy: CompositeColorPolicy, kernels: Kernels) -> String {
+    let hit: BTreeSet<&str> = cuts
+        .iter()
+        .flat_map(|cut| cut.frames.iter().flat_map(|(why, _)| why.iter().map(|r| r.variant)))
+        .collect();
+    let mut kinds: Vec<&'static str> = every_variant().iter().map(Unsupported::kind).collect();
+    kinds.sort_unstable();
+    let missing: Vec<&str> = kinds.iter().copied().filter(|k| !hit.contains(k)).collect();
+    let mut out = String::new();
+    let _ = writeln!(
+        out,
+        "\n(f) the Unsupported variants no archetype hits: {} of {}, {} hit",
+        missing.len(),
+        kinds.len(),
+        kinds.len() - missing.len()
+    );
+    for kind in missing {
+        let _ = writeln!(out, "  {kind:<28} {}", why_unreached(kind, policy, kernels));
+    }
+    out
 }
 
 fn layer_ref() -> kerf_core::LayerRef {
@@ -1197,4 +2749,44 @@ fn an_unplannable_frame_is_never_lifted_and_what_is_left_lists_only_what_is_left
     let e = &text[at("(e)")..];
     assert!(e.contains("8 ") && e.contains("unplannable"), "{e}");
     assert!(!e.contains("text") && !e.contains("mask") && !e.contains(" + "), "{e}");
+}
+
+#[test]
+fn the_ledger_lists_every_unsupported_variant_once() {
+    let all = every_variant();
+    let mut numbers: Vec<usize> = all.iter().map(ordinal).collect();
+    numbers.sort_unstable();
+    assert_eq!(
+        numbers,
+        (0..numbers.len()).collect::<Vec<_>>(),
+        "every_variant() holds one value of each variant, numbered by ordinal()"
+    );
+    let kinds: BTreeSet<&str> = all.iter().map(Unsupported::kind).collect();
+    assert_eq!(kinds.len(), all.len(), "a kind names one variant");
+}
+
+#[test]
+fn a_variant_no_archetype_hits_is_listed_with_what_keeps_it_out_of_reach() {
+    let cuts = [cut("T9  x", "still", &[(&[], 10), (&[("blend_mode", "")], 5)])];
+    let text = unreached(&cuts, CompositeColorPolicy::FixedBt601, Kernels::Match);
+    assert!(text.contains("(f)") && text.contains("1 hit"), "{text}");
+    assert!(!text.contains("blend_mode "), "a variant that is hit is not listed:\n{text}");
+    let line = |kind: &str| {
+        text.lines()
+            .find(|l| l.trim_start().starts_with(kind))
+            .unwrap_or_else(|| panic!("no {kind} in\n{text}"))
+    };
+    assert!(line("fade").contains("drawn"), "{text}");
+    assert!(line("mixed_matrices").contains("FixedBt601"), "{text}");
+    assert!(line("grade ").contains("drawn"), "{text}");
+    assert!(line("behavior").contains("no archetype builds it"), "{text}");
+    let negotiated = unreached(&cuts, CompositeColorPolicy::BottomLayerTag, Kernels::Differs("a LUT"));
+    let line = |kind: &str| {
+        negotiated
+            .lines()
+            .find(|l| l.trim_start().starts_with(kind))
+            .unwrap_or_else(|| panic!("no {kind} in\n{negotiated}"))
+    };
+    assert!(line("mixed_matrices").contains("no archetype builds it"), "{negotiated}");
+    assert!(line("grade_with").contains("not judged"), "{negotiated}");
 }
