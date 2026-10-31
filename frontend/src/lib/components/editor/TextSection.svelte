@@ -150,6 +150,8 @@
 		const back = () => {
 			if (el.isConnected) el.value = shown.animation ? String(shown.animation[key]) : '';
 		};
+		// The field is drawn for another title by now: what was typed is not its value to show.
+		if (at.id !== o.id) back();
 		const was = textAt(at);
 		const current = was?.text.animation;
 		if (!was || !current) return back();
@@ -165,6 +167,8 @@
 
 	function commitWidth(el: HTMLInputElement, shown: TitleText) {
 		const { scope: at, text: typed } = edits.end(el, { scope: { id: o.id, element: shown.id }, text: el.value });
+		// The field is drawn for another title by now: what was typed is not its value to show.
+		if (at.id !== o.id) boxShown(el, shown);
 		const why = boxWidthRefusal(typed);
 		if (why) {
 			const was = textAt(at);

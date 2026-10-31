@@ -74,7 +74,9 @@ describe('the title text section commits to the title and text a field took focu
 			expect(fn, name).toContain('edits.end(el, ');
 			// The one place the field’s own state is read is the fallback of `edits.end`; after it, only `at` and `typed`.
 			const rest = fn.replace(/[^\n]*edits\.end\(el, [^\n]*\n/, '');
-			expect(rest, name).not.toMatch(/\bo\.id\b|\bo\.name\b|\bel\.value\b(?!\s*=[^=])/);
+			// (`at.id !== o.id` is the one comparison: a field drawn for another title by now shows that one's value again.)
+			expect(rest.replace('at.id !== o.id', ''), name).not.toMatch(/\bo\.id\b|\bo\.name\b|\bel\.value\b(?!\s*=[^=])/);
+			expect(rest, name).toContain('if (at.id !== o.id)');
 			expect(rest, name).toContain('textAt(at)');
 		}
 		for (const name of ['commit', 'setAnimation']) expect(body(source, name), name).not.toMatch(/\bo\.id\b|\bo\.name\b/);
