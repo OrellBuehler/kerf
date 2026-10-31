@@ -1,5 +1,24 @@
 const FOCUSABLE =
-	'a[href], button:not([disabled]), input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+	'a[href], button:not([disabled]), input:not([disabled]):not([type="hidden"]), select:not([disabled]), textarea:not([disabled]), summary, [tabindex]:not([tabindex="-1"])';
+
+/** Whether Tab can land on an element: not disabled, and not taken out of the order with a negative
+ *  `tabindex` — a roving group (the chips of `ChoiceChips`) keeps one tab stop and parks the rest at -1,
+ *  and counting them made the last chip "last", so Tab walked out of the dialog from the one before it. */
+export function tabbable(el: { tabIndex: number; disabled?: boolean }): boolean {
+	return el.tabIndex >= 0 && !el.disabled;
+}
+
+/** A key event of an input method editor that is still composing: the Enter that picks a candidate and the
+ *  Escape that cancels one belong to the composition, not to the dialog or the field. `keyCode` 229 is what a
+ *  browser that has already ended the composition (Safari) reports for that same key. */
+export function composing(e: { isComposing?: boolean; keyCode?: number }): boolean {
+	return !!e.isComposing || e.keyCode === 229;
+}
+
+/** Whether a key press closes a dialog: Escape, unless it is an input method's. */
+export function escapeCloses(e: { key: string; isComposing?: boolean; keyCode?: number }): boolean {
+	return e.key === 'Escape' && !composing(e);
+}
 
 /** Where focus goes when a dialog opened from the menu bar by keyboard closes: the entry that
  *  held it is gone and the page is `body`. The bar marks its tab stop only while keys are
@@ -70,7 +89,9 @@ export function trapFocus(node: HTMLElement, options: TrapOptions = {}) {
 
 	function onKeydown(e: KeyboardEvent) {
 		if (e.key !== 'Tab') return;
-		const items = [...node.querySelectorAll<HTMLElement>(FOCUSABLE)].filter((el) => el.offsetParent !== null);
+		const items = [...node.querySelectorAll<HTMLElement>(FOCUSABLE)].filter(
+			(el) => el.offsetParent !== null && tabbable(el as HTMLElement & { disabled?: boolean })
+		);
 		if (items.length === 0) {
 			e.preventDefault();
 			node.focus();

@@ -25,6 +25,7 @@
 		type KeyPresetId,
 		type Rebind
 	} from '#lib/keymap';
+	import { composing } from '#lib/modal';
 	import { tip } from '#lib/tip';
 
 	const platform = settings.platform;
@@ -203,7 +204,7 @@
 		if (e.key !== 'Escape') return;
 		// An Escape that cancels an IME composition is the IME's, not ours — and
 		// not the dialog's either.
-		if (e.isComposing) return e.stopPropagation();
+		if (composing(e)) return e.stopPropagation();
 		// A first Escape empties the search; the dialog's own Escape is the second.
 		if (query) {
 			query = '';

@@ -23,8 +23,10 @@
 	import { changeWord } from '#lib/proposal-ui';
 	import { QUICK_EDIT_HELD, cutAssets, cutSignature, heldWhilePreviewing, isLocalPreset, quickTarget, silenceOutcome, targetNote } from '#lib/quick-edits';
 	import { holdForPreview, report } from '#lib/ops';
+	import { composing } from '#lib/modal';
+	import { documentOf } from '#lib/realm';
 	import { STATUS_MAP, PRESETS } from './data';
-	import { agentLine, queueEmptyHint, queuedChipLegend, reviewOffNote, showComposerHint } from '#lib/agent-status';
+	import { agentLine, queueEmptyHint, queuedChipLegend, restoredDraft, reviewOffNote, showComposerHint } from '#lib/agent-status';
 	import type { DiffEntry, EditSource, McpConnectionInfo, Task, TaskStatus, Timeline, TimelineDiff } from '#lib/types';
 	import { tip } from '#lib/tip';
 
@@ -41,6 +43,13 @@
 	);
 
 	let draft = $state('');
+	/** The panel's root, to ask which window's page it is on. */
+	let rootEl = $state<HTMLElement | null>(null);
+	/** The quick edit being carried out. A second press while it runs would run it twice — two transcriptions of the
+	 *  same footage, the shared `ui.analyzing` cleared by whichever ends first — and `editor.busy` is not raised by an
+	 *  analysis, so the buttons wait on this. */
+	let running = $state<string | null>(null);
+	const RUNNING_WHY = 'Another quick edit is running';
 
 	// How to connect an agent: the local MCP endpoint + a ready-to-run Claude Code
 	// command. Loaded from the backend so the displayed URL honors KERF_MCP_ADDR.
@@ -68,7 +77,11 @@
 	let serverError = $state<string | null>(null);
 	$effect(() => {
 		let stop = false;
+		// A hidden page asks nothing: the poll goes on when it shows again. The page is the panel's own — a panel in
+		// a window of its own is on a page the editor window's `document` does not describe.
+		const doc = documentOf(rootEl);
 		const poll = async () => {
+			if (doc.hidden) return;
 			try {
 				const s = await agentStatus();
 				if (stop) return;
@@ -82,9 +95,11 @@
 		};
 		void poll();
 		const t = setInterval(() => void poll(), 5000);
+		doc.addEventListener('visibilitychange', poll);
 		return () => {
 			stop = true;
 			clearInterval(t);
+			doc.removeEventListener('visibilitychange', poll);
 		};
 	});
 
@@ -235,11 +250,14 @@
 			await agent.add(v);
 			toast.success(connected ? 'Task queued for your agent' : 'Task queued — waiting for an agent');
 		} catch (e) {
+			// What was typed is not lost with the failure; a new line typed meanwhile stays.
+			draft = restoredDraft(draft, v);
 			toast.error(e instanceof Error ? e.message : String(e));
 		}
 	}
 
 	function onInputKey(e: KeyboardEvent) {
+		if (composing(e)) return;
 		if (e.key === 'Enter' && !e.shiftKey) {
 			e.preventDefault();
 			void submit();
@@ -258,6 +276,16 @@
 	}
 
 	async function runPreset(p: string) {
+		if (running !== null) return;
+		running = p;
+		try {
+			await carryOut(p);
+		} finally {
+			running = null;
+		}
+	}
+
+	async function carryOut(p: string) {
 		if (!isLocalPreset(p)) {
 			try {
 				await agent.add(p);
@@ -354,8 +382,8 @@
 				return {
 					label: `${isLocalPreset(p) ? 'Run now' : 'Queue for agent'}: ${p}`,
 					icon: 'list-plus',
-					disabled: disabled || held,
-					reason: held ? QUICK_EDIT_HELD : undefined,
+					disabled: disabled || held || running !== null,
+					reason: held ? QUICK_EDIT_HELD : running !== null ? RUNNING_WHY : undefined,
 					action: () => void runPreset(p)
 				};
 			})
@@ -450,6 +478,7 @@
 
 <div
 	role="presentation"
+	bind:this={rootEl}
 	bind:clientHeight={panelHeight}
 	oncontextmenu={onAgentContextMenu}
 	style="flex:1;min-height:0;background:var(--surface-panel);display:flex;flex-direction:column;overflow:hidden"
@@ -719,11 +748,15 @@
 								<Btn
 									size="sm"
 									disabled={disabled || held}
-									icon={local ? 'play' : 'list-plus'}
+									pending={running !== null}
+									aria-busy={running === p}
+									icon={running === p ? 'loader' : local ? 'play' : 'list-plus'}
 									iconSize={12}
 									title={held
 										? QUICK_EDIT_HELD
-										: { text: `${local ? 'Run now' : 'Queue for agent'}: ${p}`, detail: targetNote(p, target) }}
+										: running !== null && running !== p
+											? RUNNING_WHY
+											: { text: `${local ? 'Run now' : 'Queue for agent'}: ${p}`, detail: targetNote(p, target) }}
 									onclick={() => runPreset(p)}>{p}</Btn
 								>
 							{/each}

@@ -223,3 +223,43 @@ describe('hit targets are 24 px at least', () => {
 		expect(log).not.toContain('width:20px;height:20px');
 	});
 });
+
+describe('a key that belongs to an input method is not ours', () => {
+	test('the dialog’s Escape, the agent composer’s Enter, the tag field and the shortcut search ask `composing` / `escapeCloses` first', () => {
+		expect(read(`${EDITOR}Modal.svelte`)).toContain('escapeCloses(e)');
+		for (const f of ['AgentPanel', 'TagInput', 'KeyboardSettings']) {
+			const src = read(`${EDITOR}${f}.svelte`);
+			expect(src, f).toContain('composing(e)');
+			expect(src, f).toContain("from '#lib/modal'");
+			// the raw flag alone misses the keyCode 229 a browser reports for the key that ended a composition
+			expect(src, f).not.toMatch(/\be\.isComposing\b/);
+		}
+	});
+
+	test('Tab in a dialog counts only what Tab can land on: roving chips at -1 are not its last stop, a <summary> is one', () => {
+		const modal = read('lib/modal.ts');
+		expect(modal).toMatch(/summary,/);
+		expect(modal).toContain('tabbable(');
+	});
+});
+
+describe('the agent panel does not lose or double what it was asked', () => {
+	const panel = read(`${EDITOR}AgentPanel.svelte`);
+
+	test('a task that failed to queue comes back into the composer', () => {
+		expect(panel).toMatch(/catch \(e\) \{\s*\/\/[^\n]*\n\s*draft = restoredDraft\(draft, v\);/);
+	});
+
+	test('a quick edit in flight keeps the others off (buttons and right-click) until it ends', () => {
+		expect(panel).toMatch(/if \(running !== null\) return;\s*running = p;\s*try \{\s*await carryOut\(p\);\s*\} finally \{\s*running = null;/);
+		expect(panel).toContain('pending={running !== null}');
+		expect(panel).toMatch(/disabled: disabled \|\| held \|\| running !== null/);
+	});
+
+	test('the five-second poll is skipped while the panel’s own page is hidden, and runs again when it shows', () => {
+		expect(panel).toContain('documentOf(rootEl)');
+		expect(panel).toMatch(/if \(doc\.hidden\) return;/);
+		expect(panel).toContain("doc.addEventListener('visibilitychange', poll)");
+		expect(panel).toContain("doc.removeEventListener('visibilitychange', poll)");
+	});
+});

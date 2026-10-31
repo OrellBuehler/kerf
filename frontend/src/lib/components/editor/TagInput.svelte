@@ -4,6 +4,7 @@
 	// then the values of the key typed, or the plain tags. Enter adds the highlighted suggestion, or else what is typed.
 	// The list is drawn in the flow, below the field: a dialog clips whatever hangs out of it.
 	import { editor } from '#lib/state.svelte';
+	import { composing } from '#lib/modal';
 	import { MAX_SUGGESTIONS, fillFor, parseTagInput, suggestTags, type Suggestion } from '#lib/tag-ui';
 	import type { Tag } from '#lib/types';
 
@@ -87,7 +88,7 @@
 	}
 
 	function onkeydown(e: KeyboardEvent) {
-		if (e.isComposing) return;
+		if (composing(e)) return;
 		if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
 			if (suggestions.length === 0) return;
 			e.preventDefault();

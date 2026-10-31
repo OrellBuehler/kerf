@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { focusLost, mayClose, returnTarget, scrimClick } from './modal';
+import { composing, escapeCloses, focusLost, mayClose, returnTarget, scrimClick, tabbable } from './modal';
 
 const control = (isConnected = true) => ({ isConnected, focus() {} });
 const body = { isConnected: true, focus() {} };
@@ -86,5 +86,57 @@ describe('scrimClick', () => {
 
 	test('a press inside that is released over the scrim is not: the click only lands there', () => {
 		expect(scrimClick(false, scrim, scrim)).toBe(false);
+	});
+});
+
+describe('escapeCloses', () => {
+	test('a plain Escape closes', () => {
+		expect(escapeCloses({ key: 'Escape' })).toBe(true);
+		expect(escapeCloses({ key: 'Escape', isComposing: false, keyCode: 27 })).toBe(true);
+	});
+
+	test('an Escape that cancels an IME composition is the IME’s, and so is the key that already ended it', () => {
+		expect(escapeCloses({ key: 'Escape', isComposing: true })).toBe(false);
+		expect(escapeCloses({ key: 'Escape', isComposing: false, keyCode: 229 })).toBe(false);
+	});
+
+	test('other keys never close it', () => {
+		expect(escapeCloses({ key: 'Enter' })).toBe(false);
+		expect(escapeCloses({ key: 'a' })).toBe(false);
+	});
+});
+
+describe('composing', () => {
+	test('is a composition in flight, or the keyCode 229 a browser reports for one just ended', () => {
+		expect(composing({ isComposing: true })).toBe(true);
+		expect(composing({ keyCode: 229 })).toBe(true);
+		expect(composing({ isComposing: false, keyCode: 13 })).toBe(false);
+		expect(composing({})).toBe(false);
+	});
+});
+
+describe('tabbable', () => {
+	test('a control in the tab order is', () => {
+		expect(tabbable({ tabIndex: 0 })).toBe(true);
+		expect(tabbable({ tabIndex: 3, disabled: false })).toBe(true);
+	});
+
+	test('a roving chip parked at tabindex -1 is not: Tab cannot land on it, so it is not the last stop', () => {
+		expect(tabbable({ tabIndex: -1 })).toBe(false);
+		expect(tabbable({ tabIndex: -2 })).toBe(false);
+	});
+
+	test('a disabled one is not, whatever its tabindex', () => {
+		expect(tabbable({ tabIndex: 0, disabled: true })).toBe(false);
+	});
+
+	test('the last stop of a dialog whose final chip group rests on one tab stop is that stop', () => {
+		const stops = [
+			{ id: 'name', tabIndex: 0 },
+			{ id: 'chip-a', tabIndex: -1 },
+			{ id: 'chip-b', tabIndex: 0 },
+			{ id: 'chip-c', tabIndex: -1 }
+		].filter(tabbable);
+		expect(stops.map((s) => s.id)).toEqual(['name', 'chip-b']);
 	});
 });

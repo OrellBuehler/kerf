@@ -7,7 +7,7 @@
 	import type { Snippet } from 'svelte';
 	import Icon from './Icon.svelte';
 	import IconBtn from './IconBtn.svelte';
-	import { mayClose, scrimClick, trapFocus, type CloseVia } from '#lib/modal';
+	import { escapeCloses, mayClose, scrimClick, trapFocus, type CloseVia } from '#lib/modal';
 
 	let {
 		title,
@@ -66,7 +66,7 @@
 		if (hit) close('scrim');
 	}}
 	onkeydown={(e) => {
-		if (e.key === 'Escape') close('escape');
+		if (escapeCloses(e)) close('escape');
 		e.stopPropagation();
 	}}
 	style="position:fixed;inset:0;z-index:50;background:color-mix(in srgb,var(--scrim) 55%,transparent);display:flex;align-items:center;justify-content:center;padding:24px"

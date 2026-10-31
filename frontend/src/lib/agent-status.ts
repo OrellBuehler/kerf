@@ -5,6 +5,13 @@
 import { badgeTip } from './proposal-ui';
 import type { StagedEdit } from './types';
 
+/** What the composer holds once a task failed to queue: what was typed, put back for another try. The field is
+ *  emptied before the call so a second Enter cannot queue it twice, and a line typed while the call was out
+ *  is the newer wish — it stays. */
+export function restoredDraft(current: string, submitted: string): string {
+	return current === '' ? submitted : current;
+}
+
 /** `12s ago`, `4m ago`, `2h ago`: how long since an agent last spoke to the endpoint. */
 export function ago(secs: number): string {
 	if (secs < 60) return `${Math.max(1, Math.round(secs))}s ago`;

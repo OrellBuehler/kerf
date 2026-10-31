@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { agentTabLabel, ago, agentLine, COMPOSER_HINT_MIN_HEIGHT, proposalIndicator, queueEmptyHint, queuedChipLegend, REVIEW_CHIP_COUNT_WIDTH, REVIEW_CHIP_FULL_WIDTH, reviewChipText, reviewOffNote, showComposerHint } from './agent-status';
+import { agentTabLabel, ago, agentLine, COMPOSER_HINT_MIN_HEIGHT, proposalIndicator, queueEmptyHint, queuedChipLegend, REVIEW_CHIP_COUNT_WIDTH, REVIEW_CHIP_FULL_WIDTH, restoredDraft, reviewChipText, reviewOffNote, showComposerHint } from './agent-status';
 import { CONFIRM } from './confirm-copy';
 import { STATUS_MAP } from './components/editor/data';
 import type { StagedEdit, TimelineDiff } from './types';
@@ -154,5 +154,15 @@ describe('what the panel says while review is off', () => {
 		const { message } = CONFIRM.agentReviewOff;
 		expect(message).toContain('tasks you queue');
 		expect(message).toContain('already waiting stays');
+	});
+});
+
+describe('restoredDraft', () => {
+	test('a task that failed to queue comes back into the empty composer', () => {
+		expect(restoredDraft('', 'cut the intro')).toBe('cut the intro');
+	});
+
+	test('a line typed while the call was out is the newer wish and stays', () => {
+		expect(restoredDraft('make it shorter', 'cut the intro')).toBe('make it shorter');
 	});
 });
