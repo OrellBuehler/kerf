@@ -1326,10 +1326,10 @@ re-rendered with the new selection's value*, so reading either writes the other 
 `noteTyped` / `endEdit` in the Inspector); a select or a checkbox changes at once and only needs the scope (an effect's
 boolean parameter, denoise's `track_noise`, is a `CheckRow` with `pending`). A bun test holds every
 text and number input of the Inspector to this, and the same rule holds in the sections that are not the Inspector's own file
-(`section-scope.test.ts` scans them): `TextSection`'s box width and animation delay / duration (`FieldEdits` records the title and
+(`section-scope.test.ts` scans them, `behavior-ui.test.ts` the seed field): `TextSection`'s box width and animation delay / duration (`FieldEdits` records the title and
 text id on focus, `titleTextAt` looks the text up by both in the cut as it is when the commit lands, and a field drawn for another
 title by then shows that title's value again), `BehaviorsSection`'s shake seed (the row `{id, index}` on focus, compared with
-`seedOf` that row's stored seed), `SfxShape` (its sliders take a `scope`, the clip in the Inspector and none in the Sound FX panel;
+`seedOf` that row's stored seed; Escape `drop`s the entry so a late `change` cannot write an abandoned seed), `SfxShape` (its sliders take a `scope`, the clip in the Inspector and none in the Sound FX panel;
 `SoundEffectSection.reshape(patch, clipId)` reads the sound by `soundOf(timeline, assets, clipId)`), and the custom SVG
 source's *Apply*, which shows its result (warnings, run length, the normalised source, or the error) only while the title it was applied on
 is still the selected one, and toasts a failure for another. Rest values are the model's

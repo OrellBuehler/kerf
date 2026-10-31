@@ -158,7 +158,7 @@
 		const n = Number(typed);
 		const why = typed.trim() === '' ? 'enter a number of seconds' : checkAnimation({ ...current, [key]: n });
 		if (why) {
-			report(new Error(`${labelOf(was.text, was.title.template)}: ${why}`));
+			report(new Error(`${labelOf(was.text, was.title.template ?? null)}: ${why}`));
 			return back();
 		}
 		if (n === current[key]) return back();
@@ -172,7 +172,7 @@
 		const why = boxWidthRefusal(typed);
 		if (why) {
 			const was = textAt(at);
-			report(new Error(`${was ? labelOf(was.text, was.title.template) : labelOf(shown)}: ${why}`));
+			report(new Error(`${was ? labelOf(was.text, was.title.template ?? null) : labelOf(shown)}: ${why}`));
 			boxShown(el, shown);
 			return;
 		}

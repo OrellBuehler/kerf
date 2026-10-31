@@ -84,6 +84,12 @@ describe('the title text section commits to the title and text a field took focu
 		expect(body(source, 'commitTiming')).toContain('const current = was?.text.animation');
 	});
 
+	test('a refusal names the text by the captured title’s own template, `null` when it has none, never the shown title’s', () => {
+		const calls = source.match(/labelOf\(was\.text, [^)]*\)/g) ?? [];
+		expect(calls.length).toBe(2);
+		for (const c of calls) expect(c).toBe('labelOf(was.text, was.title.template ?? null)');
+	});
+
 	test('what the title is called and what the engine is told are read before the await', () => {
 		const convert = body(source, 'convert');
 		expect(convert.indexOf('const { id, name } = o')).toBeLessThan(convert.indexOf('await editor.convertTitleText'));

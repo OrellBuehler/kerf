@@ -203,6 +203,8 @@ describe('the section and the tab', () => {
 		expect(section).toContain('onchange={(e) => commitSeed(e.currentTarget, at, seed)}');
 		expect(section).toContain('seeds.end(el, { scope: at, text: el.value })');
 		expect(section).not.toMatch(/commitSeed\(e, at, seed\)/);
+		// Escape abandons the typed seed: its entry is dropped before the field is put back and blurred.
+		expect(section).toMatch(/Escape'\) \{\s*seeds\.drop\(e\.currentTarget\);\s*e\.currentTarget\.value = String\(seed\);/);
 		// The summary names the behaviours; the refusal of a bake is shown, not toasted away.
 		expect(section).toContain('summary={behaviorsSummary(list)}');
 		expect(section).toContain('role="alert"');

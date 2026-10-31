@@ -204,6 +204,7 @@
 						onchange={(e) => commitSeed(e.currentTarget, at, seed)}
 						onkeydown={(e) => {
 							if (e.key === 'Escape') {
+								seeds.drop(e.currentTarget);
 								e.currentTarget.value = String(seed);
 								e.currentTarget.blur();
 								e.stopPropagation();
