@@ -141,3 +141,39 @@ describe('the sound effect section reshapes the clip a change began on', () => {
 		expect(fn).not.toMatch(/\bclip\.id\b|\bspec\b|\bowner\b(?! === who)/);
 	});
 });
+
+describe('a fader commit the engine refused puts the sound back', () => {
+	// `audio.liveTrack` / `liveMaster` move the gain while a fader is held, ahead of the write. A refusal (the proposal
+	// on screen is previewed read-only, the project is busy) used to leave the sound at the dragged level for good.
+	for (const [file, commits, sliders] of [
+		['MixerStrip', ['fadeCommit', 'panCommit'], 2],
+		['MasterStrip', ['fadeCommit', 'ceilingCommit'], 3]
+	] as const) {
+		const source = code(read(`${EDITOR}${file}.svelte`));
+
+		test(`${file}: every commit that follows a live move restores the mix in its catch`, () => {
+			expect(body(source, 'refused')).toContain('audio.restoreMix(editor.timeline)');
+			for (const name of commits) {
+				const fn = body(source, name);
+				const caught = fn.slice(fn.indexOf('catch (e)'));
+				expect(caught, name).toContain('refused(e)');
+				expect(caught, name).not.toMatch(/\berr\(e\)/);
+			}
+			// A strip that makes a live move has no catch that only reports.
+			if (/audio\.live(Track|Master)\(/.test(source)) {
+				for (const m of source.matchAll(/await editor\.set(Track(Volume|Pan)|Master(Volume|Limiter))\([^\n]*\n\s*\} catch \(e\) \{\n\s*(\w+)\(/g))
+					expect(m[4], m[0]).toBe('refused');
+			}
+		});
+
+		test(`${file}: its sliders do not move while a proposal is previewed`, () => {
+			expect(source.match(/disabled=\{editor\.previewingStaged\}/g)?.length, 'sliders').toBe(sliders);
+		});
+	}
+
+	test('the fader passes that on to its slider', () => {
+		const fader = code(read(`${EDITOR}FaderMeter.svelte`));
+		expect(fader).toContain('disabled = false,');
+		expect(fader).toMatch(/\{accent\}\s*\{disabled\}/);
+	});
+});
