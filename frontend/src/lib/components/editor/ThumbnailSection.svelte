@@ -3,6 +3,7 @@
 	// template) and never appear in it. Pick one, its frame (the playhead or a suggestion), its size, what of the
 	// video's own graphics the background keeps, and its layers; the preview is the engine's drawing of it, from
 	// the proxies. Every change is one `set_thumbnail` edit (a field on change, never per keystroke).
+	import { untrack } from 'svelte';
 	import Btn from './Btn.svelte';
 	import IconBtn from './IconBtn.svelte';
 	import Icon from './Icon.svelte';
@@ -67,7 +68,17 @@
 	$effect(() => {
 		const t = current;
 		void editor.timeline;
-		if (!t) return;
+		if (!t) {
+			// The last thumbnail was removed, perhaps mid-draw: the cleanup below has already ended that draw's say, so nothing
+			// would ever clear `drawing`, and the next thumbnail would open on the removed one's picture.
+			untrack(() => {
+				drawing = false;
+				previewError = null;
+				if (preview) URL.revokeObjectURL(preview);
+				preview = null;
+			});
+			return;
+		}
 		const key = JSON.stringify(t);
 		let gone = false;
 		const timer = setTimeout(async () => {
@@ -91,6 +102,11 @@
 			gone = true;
 			clearTimeout(timer);
 		};
+	});
+
+	// The picture on screen is a blob URL this section made: let go of it when the section goes.
+	$effect(() => () => {
+		if (preview) URL.revokeObjectURL(preview);
 	});
 
 	let suggestions = $state<SuggestedFrame[]>([]);
@@ -157,10 +173,23 @@
 			style="position:relative;width:100%;max-height:280px;aspect-ratio:{current.width} / {current.height};margin:0 auto;background:var(--surface-inset);border:var(--line-width) solid var(--border-subtle);border-radius:var(--radius-sm);overflow:hidden;display:flex;align-items:center;justify-content:center"
 		>
 			{#if preview}
-				<img src={preview} alt="Thumbnail “{current.name}”" style="width:100%;height:100%;object-fit:contain;opacity:{drawing ? 0.7 : 1}" />
-			{:else}
+				<img
+					src={preview}
+					alt="Thumbnail “{current.name}”"
+					style="width:100%;height:100%;object-fit:contain;opacity:{previewError ? 0.35 : drawing ? 0.7 : 1}"
+				/>
+			{/if}
+			{#if previewError}
+				<!-- A later failure is said over the last good picture, which is dimmed: it no longer shows what the thumbnail is. -->
+				<span
+					role="alert"
+					data-preview-error
+					style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;padding:8px;text-align:center;color:var(--danger);background:color-mix(in srgb, var(--surface-inset) 70%, transparent)"
+					>{previewError}</span
+				>
+			{:else if !preview}
 				<span style="padding:8px;text-align:center;color:var(--text-muted)"
-					>{previewError ?? (drawing ? 'Drawing…' : 'The thumbnail is drawn in the desktop app.')}</span
+					>{drawing ? 'Drawing…' : 'The thumbnail is drawn in the desktop app.'}</span
 				>
 			{/if}
 		</div>

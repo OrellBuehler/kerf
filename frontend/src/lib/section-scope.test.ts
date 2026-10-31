@@ -177,3 +177,30 @@ describe('a fader commit the engine refused puts the sound back', () => {
 		expect(fader).toMatch(/\{accent\}\s*\{disabled\}/);
 	});
 });
+
+describe('the thumbnail preview lets go of what it made and says what went wrong', () => {
+	const source = code(read(`${EDITOR}ThumbnailSection.svelte`));
+
+	test('the last picture’s blob URL is revoked when the section goes', () => {
+		expect(source).toMatch(/\$effect\(\(\) => \(\) => \{\s*if \(preview\) URL\.revokeObjectURL\(preview\);\s*\}\);/);
+		// And the one before it, whenever a newer one lands.
+		expect(source.match(/URL\.revokeObjectURL\(/g)?.length).toBeGreaterThanOrEqual(4);
+	});
+
+	test('removing the last thumbnail mid-draw ends the drawing and drops the picture, untracked', () => {
+		const at = source.indexOf('if (!t) {');
+		expect(at).toBeGreaterThan(0);
+		const branch = source.slice(at, source.indexOf('return;', at));
+		expect(branch).toContain('untrack(');
+		expect(branch).toContain('drawing = false');
+		expect(branch).toContain('preview = null');
+	});
+
+	test('a failure shows over a stale picture instead of hiding behind it', () => {
+		const box = source.slice(source.indexOf('data-testid="thumbnail-preview"'), source.indexOf('label style="display:flex;align-items:center;gap:8px"'));
+		// The error is not the `{:else}` of the picture.
+		expect(box).toMatch(/\{#if preview\}[\s\S]*?\{\/if\}\s*\{#if previewError\}/);
+		expect(box).toContain('role="alert"');
+		expect(box).toMatch(/opacity:\{previewError \? [\d.]+ :/);
+	});
+});
