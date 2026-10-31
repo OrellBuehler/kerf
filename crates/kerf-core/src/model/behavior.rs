@@ -23,8 +23,10 @@
 //! `amount` of a shake is the peak, in frame widths (x) and heights (y): the three weights sum to 1,
 //! so it never leaves `+- amount`. A breath's `amount` is held under 1 so a scale can never reach
 //! (or cross) zero. **`phase` is clip-local seconds** added to the clock, and a head move shifts it
-//! by the cut (`rebase_behaviors`), so a split, a trim, a roll or a range export carries on from
-//! the pose it left: the motion is a property of the footage, not of the clip's first frame.
+//! by the cut (`rebase_behaviors`), so a split, a split-and-remove, a roll or slide, a linked
+//! partner's trim or a range export carries on from the pose it left: the motion is a property of
+//! the footage, not of the clip's first frame. A plain `Project::trim` writes the source window
+//! without rebasing the keys, and keeps behaviours clip-local exactly like them.
 //!
 //! **One resolver.** `base_at` / `base_transform_at` are the pose *without* behaviours (keys or the
 //! static value) — what an edit that writes keys (a motion preset, a new keyframe, a rebase) must
@@ -36,6 +38,48 @@
 
 use super::*;
 use std::f64::consts::{PI, TAU};
+
+/// `sin` and `cos` of the model's arithmetic. They are the platform's libm, whose last digit differs
+/// between glibc builds, macOS, Windows and arm, so the golden oracle (`engine::cli::golden`) can
+/// ask a test build for results one unit in the last place off ([`with_libm_ulps`]) and show that no
+/// digest it blesses depends on that digit.
+fn sin(x: f64) -> f64 {
+    off_by_ulps(x.sin())
+}
+
+fn cos(x: f64) -> f64 {
+    off_by_ulps(x.cos())
+}
+
+#[cfg(not(test))]
+fn off_by_ulps(v: f64) -> f64 {
+    v
+}
+
+#[cfg(test)]
+thread_local! {
+    static ULPS: std::cell::Cell<i64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn off_by_ulps(v: f64) -> f64 {
+    let n = ULPS.get();
+    if n == 0 || !v.is_finite() || v == 0.0 {
+        v
+    } else {
+        f64::from_bits(v.to_bits().wrapping_add_signed(n))
+    }
+}
+
+/// Run `f` with every `sin` / `cos` of a behaviour on this thread landing `ulps` units in the last
+/// place away from the platform's (more magnitude for a positive count): another libm.
+#[cfg(test)]
+pub(crate) fn with_libm_ulps<T>(ulps: i64, f: impl FnOnce() -> T) -> T {
+    let before = ULPS.replace(ulps);
+    let out = f();
+    ULPS.set(before);
+    out
+}
 
 /// The most behaviours one clip carries.
 pub const MAX_BEHAVIORS: usize = 8;
@@ -360,17 +404,17 @@ impl Behavior {
         let u = local + self.phase();
         match *self {
             Behavior::Sway { amount, speed, .. } | Behavior::Breathe { amount, speed, .. } if self.drives(prop) => {
-                amount * (TAU * speed * u).sin()
+                amount * sin(TAU * speed * u)
             }
             Behavior::Spin { speed, .. } if self.drives(prop) => speed * 360.0 * u,
             Behavior::Drift { speed, angle, .. } => match prop {
-                Property::PosX => speed * (angle * PI / 180.0).cos() * u,
-                Property::PosY => speed * (angle * PI / 180.0).sin() * u,
+                Property::PosX => speed * cos(angle * PI / 180.0) * u,
+                Property::PosY => speed * sin(angle * PI / 180.0) * u,
                 _ => 0.0,
             },
             Behavior::Shake { amount, .. } => match self.waves(prop) {
                 Some([a, b, c]) => {
-                    let sine = |w: Wave| w.weight * (TAU * w.freq * u + w.phase).sin();
+                    let sine = |w: Wave| w.weight * sin(TAU * w.freq * u + w.phase);
                     amount * (sine(a) + sine(b) + sine(c))
                 }
                 None => 0.0,
@@ -386,8 +430,8 @@ impl Behavior {
         match *self {
             Behavior::Drift { speed, angle, phase } => {
                 let along = match prop {
-                    Property::PosX => (angle * PI / 180.0).cos().abs(),
-                    Property::PosY => (angle * PI / 180.0).sin().abs(),
+                    Property::PosX => cos(angle * PI / 180.0).abs(),
+                    Property::PosY => sin(angle * PI / 180.0).abs(),
                     _ => return 0.0,
                 };
                 speed.abs() * along * phase.abs().max((phase + horizon.max(0.0)).abs())
@@ -1517,6 +1561,39 @@ mod tests {
         })
     }
 
+    /// Where two JSON values differ, or `None`: the same shape and the same strings and integers, and
+    /// numbers within `1e-9` of each other (relative to the larger, or to 1 below that). The corpus holds
+    /// `sin` / `cos` of the platform's libm, which another one answers a unit in the last place away.
+    fn first_difference(path: &str, a: &serde_json::Value, b: &serde_json::Value) -> Option<String> {
+        use serde_json::Value;
+        match (a, b) {
+            (Value::Number(x), Value::Number(y)) if x.is_f64() || y.is_f64() => {
+                let (x, y) = (x.as_f64()?, y.as_f64()?);
+                ((x - y).abs() > 1e-9 * x.abs().max(y.abs()).max(1.0)).then(|| format!("{path}: {x} against {y}"))
+            }
+            (Value::Array(x), Value::Array(y)) => {
+                if x.len() != y.len() {
+                    return Some(format!("{path}: {} entries against {}", x.len(), y.len()));
+                }
+                x.iter()
+                    .zip(y)
+                    .enumerate()
+                    .find_map(|(i, (x, y))| first_difference(&format!("{path}[{i}]"), x, y))
+            }
+            (Value::Object(x), Value::Object(y)) => {
+                if x.keys().ne(y.keys()) {
+                    return Some(format!(
+                        "{path}: keys {:?} against {:?}",
+                        x.keys().collect::<Vec<_>>(),
+                        y.keys().collect::<Vec<_>>()
+                    ));
+                }
+                x.iter().find_map(|(k, x)| first_difference(&format!("{path}.{k}"), x, &y[k]))
+            }
+            _ => (a != b).then(|| format!("{path}: {a} against {b}")),
+        }
+    }
+
     #[test]
     fn behaviors_corpus_is_what_this_engine_writes() {
         let fresh = format!("{}\n", serde_json::to_string(&corpus()).expect("serializes"));
@@ -1527,10 +1604,46 @@ mod tests {
         let on_disk = std::fs::read_to_string(CORPUS_PATH)
             .expect("frontend/src/lib/fixtures/behaviors-corpus.json — generate it with KERF_BLESS_CORPUS=1")
             .replace("\r\n", "\n");
-        assert!(
-            on_disk == fresh,
-            "the behaviours corpus is stale: regenerate with KERF_BLESS_CORPUS=1 cargo test -p kerf-core \
-             --no-default-features -- behaviors_corpus, then run `bun test` — the replay says what the mirror has to follow"
+        let blessed: serde_json::Value = serde_json::from_str(&on_disk).expect("the corpus is JSON");
+        // Numerically, not byte for byte: the sines in it are the blessing machine's libm's.
+        if let Some(at) = first_difference("corpus", &blessed, &corpus()) {
+            panic!(
+                "the behaviours corpus is stale ({at}): regenerate with KERF_BLESS_CORPUS=1 cargo test -p kerf-core \
+                 --no-default-features -- behaviors_corpus, then run `bun test` — the replay says what the mirror has to follow"
+            );
+        }
+    }
+
+    #[test]
+    fn the_corpus_freshness_test_reads_numbers_to_a_tolerance_and_nothing_else_loosely() {
+        let blessed = corpus();
+        // Another libm: every sin / cos a few units in the last place off. The same corpus.
+        for ulps in [1, -1, 4] {
+            let other = with_libm_ulps(ulps, corpus);
+            assert_ne!(other, blessed, "the sines are in the corpus ({ulps:+} ulp)");
+            assert_eq!(first_difference("corpus", &blessed, &other), None, "{ulps:+} ulp");
+        }
+        // A real change is seen: a number off by a millionth, a count, a name, a missing key.
+        let moved = |edit: &dyn Fn(&mut serde_json::Value)| {
+            let mut v = blessed.clone();
+            edit(&mut v);
+            first_difference("corpus", &blessed, &v)
+        };
+        assert!(moved(&|v| v["limits"]["max_shake"] = serde_json::json!(0.250001)).is_some());
+        assert!(moved(&|v| v["limits"]["max_behaviors"] = serde_json::json!(9)).is_some());
+        assert!(moved(&|v| v["samples"][0]["name"] = serde_json::json!("other")).is_some());
+        assert!(moved(&|v| {
+            v["samples"].as_array_mut().unwrap().pop();
+        })
+        .is_some());
+        assert!(moved(&|v| {
+            v.as_object_mut().unwrap().remove("bake");
+        })
+        .is_some());
+        // And the blessed file is deterministic: written twice, the same text.
+        assert_eq!(
+            serde_json::to_string(&corpus()).unwrap(),
+            serde_json::to_string(&blessed).unwrap()
         );
     }
 

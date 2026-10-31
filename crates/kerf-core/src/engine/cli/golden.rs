@@ -131,7 +131,11 @@
 //! per-case digests are the ones the commit before behaviours gave; 4 block lines were appended to each file,
 //! `parts.txt`'s too. Structural families `behavior-sway`, `behavior-breathe`, `behavior-spin`, `behavior-drift`,
 //! `behavior-shake`, `behavior-on-keys`, `behavior-neutral`, `still-behavior` and `preview-behavior`. Its blocks
-//! are 100–103, after the moving-still family.
+//! are 100–103, after the moving-still family. **What of it is machine-independent:** the export, the preview and the
+//! parts print the behaviours as expression text (`sin(2*PI*..)`, no transcendental constant), so their argv is the
+//! same on every machine; the scrubbed *still* evaluates the pose at a moment and prints the numbers, which are the
+//! platform's `sin` / `cos`, so its text is digested through [`round_floats`] (10 significant digits) and
+//! [`behavior_digests_survive_another_libm`] shows it with the model's `sin` / `cos` a unit in the last place off.
 //!
 //! **The export in parts has a file of its own** (`golden/parts.txt`, [`the_parts_argv_builders_produce_the_golden_digests`]):
 //! every case is planned with `segments::plan_export` under [`PARTS_LIMITS`] and the argv of every part and of the last pass is
@@ -153,7 +157,9 @@
 //! compressor and gate thresholds go through `powf`, whose last digits differ between
 //! glibc builds (FMA or not), macOS, Windows and arm, so [`round_libm`] compares those
 //! numbers to 10 significant digits, which still pins the dB mapping (a ramp's `atempo` stages and read
-//! points are made without libm, `ramp::stage_tempo`, so they need no rounding). The digest files are
+//! points are made without libm, `ramp::stage_tempo`, so they need no rounding); a behaviour's `sin` /
+//! `cos` reach only the scrubbed still's numbers, which [`round_floats`] keeps to 10 significant digits
+//! for the behaviour family. The digest files are
 //! LF whatever the checkout (`.gitattributes`, and the comparison ignores `\r`).
 //!
 //! **Bless** after an intended argv change, from the repo root:
@@ -1062,8 +1068,9 @@ fn ken_burns_for(tl: &mut Timeline, j: usize, assets: &[Asset]) {
 
 /// Live behaviours on most clips of the `j`-th behaviour case, on dice of their own seeded by the case and
 /// the clip (`8 << 40`; the generator's are untouched): one to three of the five kinds, from fixed
-/// decimals (so the text is the same on every machine), footage, stills and titles alike; now and then
-/// one that moves nothing (amount 0), which the graph leaves out, and a phase a head trim would leave.
+/// decimals (so the export's expressions read the same on every machine; the scrubbed still's computed
+/// numbers go through [`round_floats`]), footage, stills and titles alike; now and then one that moves
+/// nothing (amount 0), which the graph leaves out, and a phase a head move would leave.
 fn behavior_for(tl: &mut Timeline, j: usize) {
     use crate::model::Behavior;
     let mut n = 0;
@@ -1600,6 +1607,9 @@ struct Case {
     variants: Vec<ExportVariant>,
     /// Whether the ffmpeg the case is built for has vid.stab (else a stabilized clip is `deshake`d).
     vidstab: bool,
+    /// Whether the scrubbed still's numbers are libm's (a live behaviour's `sin` / `cos` in the pose),
+    /// so its text is digested through [`round_floats`].
+    libm_stills: bool,
 }
 
 #[rustfmt::skip]
@@ -1692,6 +1702,7 @@ fn case(i: usize, assets: &[Asset]) -> Case {
         opts,
         variants: Vec::new(),
         vidstab: !(STABILIZE_FIRST..KEN_BURNS_FIRST).contains(&i) || (i - STABILIZE_FIRST) % 4 != 3,
+        libm_stills: i >= BEHAVIOR_FIRST,
     };
     if (SVG_FIRST..TOGETHER_FIRST).contains(&i) {
         svg_playhead(&mut c, i - SVG_FIRST);
@@ -1835,6 +1846,61 @@ fn round_libm(text: &str) -> String {
         rest = &tail[digits..];
     }
     out + rest
+}
+
+/// A text with every number in it (a run of digits, with a fraction when it has one) written to 10
+/// significant digits, and one below `1e-12` as `0`: for text whose numbers are the platform's `sin` /
+/// `cos` of a behaviour, which differ in the last digits between libms (and a value that is zero up to
+/// that noise may print as either sign, so the minus of a unary one goes with it). A changed formula
+/// moves the third digit, another libm only the seventeenth. The rest of the text is kept as it is.
+fn round_floats(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.char_indices().peekable();
+    while let Some((at, ch)) = chars.next() {
+        if !ch.is_ascii_digit() {
+            out.push(ch);
+            continue;
+        }
+        let mut end = at + 1;
+        let mut dot = false;
+        while let Some(&(i, c)) = chars.peek() {
+            let fraction = c == '.' && !dot && text[i + 1..].starts_with(|d: char| d.is_ascii_digit());
+            if !(c.is_ascii_digit() || fraction) {
+                break;
+            }
+            dot |= fraction;
+            end = i + c.len_utf8();
+            chars.next();
+        }
+        match text[at..end].parse::<f64>() {
+            Ok(v) if v < 1e-12 => {
+                let unary = out
+                    .strip_suffix('-')
+                    .is_some_and(|before| !before.ends_with(|p: char| p.is_ascii_alphanumeric() || p == ')'));
+                if unary {
+                    out.pop();
+                }
+                out.push('0');
+            }
+            Ok(v) => out += &format!("{v:.9e}"),
+            Err(_) => out += &text[at..end],
+        }
+    }
+    out
+}
+
+/// The text a case's `kind` (0 export, 1 still, 2 preview) is digested from.
+fn digested(c: &Case, kind: usize, text: &str) -> String {
+    if c.libm_stills && kind == 1 {
+        round_floats(text)
+    } else {
+        text.to_string()
+    }
+}
+
+/// The three digests of a case's built text.
+fn digests_of(c: &Case, text: &[String; 3]) -> [u64; 3] {
+    std::array::from_fn(|k| fnv1a(&digested(c, k, &text[k])))
 }
 
 fn repr(args: &Result<Vec<String>>) -> String {
@@ -2457,7 +2523,7 @@ fn run(i: usize, assets: &[Asset], table: &[(&str, &str)]) -> Done {
     let mut hit = families(&c, assets, &text, table, transitions);
     hit.sort();
     hit.dedup();
-    (text.each_ref().map(|t| fnv1a(t)), hit)
+    (digests_of(&c, &text), hit)
 }
 
 #[test]
@@ -2473,6 +2539,97 @@ fn round_libm_keeps_the_mapping_and_drops_the_last_digits() {
         round_libm("acompressor=threshold=0.001:ratio=4:makeup=1.2589254117941673 agate=threshold=0.01")
     );
     assert!(round_libm("a=threshold=0.5:b=1").contains("5.000000000e-1:b=1"));
+}
+
+#[test]
+fn round_floats_keeps_the_structure_and_drops_the_last_digits() {
+    let a = "rotate=-0.098765432101234567:ow=rotw(1.0760845213036123)*320,x0='0+0.5-(160+(-0.25341198350195926)*320)',-ss 12";
+    // A unit in the last place of two of the numbers, and a tiny one that came out with the other sign.
+    let b = "rotate=-0.09876543210123457:ow=rotw(1.0760845213036125)*320,x0='0+0.5-(160+(-0.2534119835019593)*320)',-ss 12";
+    assert_ne!(a, b);
+    assert_eq!(round_floats(a), round_floats(b));
+    // A different number, a different structure and a different integer are not hidden.
+    assert_ne!(
+        round_floats(a),
+        round_floats(&a.replace("1.0760845213036123", "1.0760845313036123"))
+    );
+    assert_ne!(round_floats(a), round_floats(&a.replace("rotate=", "rotat=")));
+    assert_ne!(round_floats(a), round_floats(&a.replace("-ss 12", "-ss 13")));
+    // Noise round zero: either sign, in a position a unary minus has; a binary one stays.
+    assert_eq!(
+        round_floats("(-0.00000000000000012)*3"),
+        round_floats("(0.00000000000000012)*3")
+    );
+    assert_eq!(round_floats("p=-0.00000000000000006123"), round_floats("p=0"));
+    assert_ne!(round_floats("a-0.5"), round_floats("a+0.5"));
+    assert_ne!(round_floats("(-0.5)"), round_floats("(0.5)"));
+    // Names with digits and a number cut off by a dot are read the same way each time.
+    assert!(round_floats("libx264 3.").starts_with("libx2.640000000e2 3.0"));
+}
+
+/// The scrubbed still of a live-behaviour case prints the pose a behaviour's `sin` / `cos` give, and
+/// those are the platform's libm, whose last digit is not the same on glibc with and without FMA, macOS,
+/// Windows and arm. Run the family with the model's `sin` / `cos` a few units in the last place away
+/// (the test build of `model::behavior` offers it): every digest the files hold, and the export's, the
+/// preview's and the parts' text itself, is the one the platform's own gives.
+#[test]
+fn behavior_digests_survive_another_libm() {
+    let assets = pool();
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get()).min(8);
+    let results: Vec<(Vec<String>, bool)> = std::thread::scope(|s| {
+        let workers: Vec<_> = (0..threads)
+            .map(|w| {
+                let assets = &assets;
+                s.spawn(move || {
+                    (BEHAVIOR_FIRST + w..TOTAL)
+                        .step_by(threads)
+                        .map(|i| {
+                            let c = case(i, assets);
+                            let built = |ulps: i64| {
+                                crate::model::with_libm_ulps(ulps, || (build(&c, assets).0, parts_text(&c, assets).0))
+                            };
+                            let (text, parts) = built(0);
+                            let digests = digests_of(&c, &text);
+                            let mut moved = Vec::new();
+                            let mut raw_moves = false;
+                            for ulps in [1, -1, 4] {
+                                let (other, other_parts) = built(ulps);
+                                let again = digests_of(&c, &other);
+                                raw_moves |= other[1] != text[1];
+                                for (what, same) in [
+                                    ("export", other[0] == text[0]),
+                                    ("preview", other[2] == text[2]),
+                                    ("parts", other_parts == parts),
+                                    ("export digest", again[0] == digests[0]),
+                                    ("still digest", again[1] == digests[1]),
+                                    ("preview digest", again[2] == digests[2]),
+                                ] {
+                                    if !same {
+                                        moved.push(format!("case {i}: the {what} moves with sin / cos {ulps:+} ulp"));
+                                    }
+                                }
+                            }
+                            (moved, raw_moves)
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        workers.into_iter().flat_map(|w| w.join().unwrap()).collect()
+    });
+    let moved: Vec<&String> = results.iter().flat_map(|(m, _)| m).collect();
+    assert!(
+        moved.is_empty(),
+        "{} moved, first: {:?}",
+        moved.len(),
+        &moved[..moved.len().min(6)]
+    );
+    // The control: the still's own text does read the last digit, so the rounding is what holds.
+    let raw = results.iter().filter(|(_, raw)| *raw).count();
+    assert!(
+        raw >= MIN_PER_FAMILY,
+        "only {raw} cases print a libm-derived number in the still"
+    );
 }
 
 /// Every export graph of the corpus reads back through `together::relabel` unchanged, and every

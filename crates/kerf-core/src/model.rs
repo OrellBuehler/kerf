@@ -5365,6 +5365,8 @@ mod ramp_link_tests;
 mod ramp_tests;
 mod speed_ramp;
 mod stabilize;
+#[cfg(test)]
+pub(crate) use behavior::with_libm_ulps;
 pub use behavior::{
     check_behaviors, shake_phase, Baked, Behavior, BehaviorKind, Wave, MAX_BEHAVIORS, MAX_BEHAVIOR_HZ, MAX_BEHAVIOR_PHASE,
     MAX_BREATHE, MAX_DRIFT, MAX_SHAKE, MAX_SPIN_TURNS, MAX_SWAY_DEGREES,
