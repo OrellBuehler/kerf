@@ -132,6 +132,15 @@
 	cursor: default;
 	opacity: 1;
 }
+/* A button whose work is running (`aria-busy`) shows its icon — the loader — turning, as `.kerf-spin` does elsewhere. */
+.k-btn[aria-busy='true'] > svg {
+	animation: kerf-spin-kf 0.9s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+	.k-btn[aria-busy='true'] > svg {
+		animation-duration: 1.8s;
+	}
+}
 
 /* ---------- IconBtn, the title bar's buttons, the library rail ---------- */
 
@@ -370,6 +379,16 @@
 	color: var(--text-disabled);
 	cursor: default;
 	opacity: 1;
+}
+/* An option that is chosen and cannot be changed (Auto while proxies are off) is still the chosen one: the accent
+   outline and a faint wash, dimmed, and the words a step down from primary. */
+.k-chip[aria-pressed='true']:disabled,
+.k-chip[aria-checked='true']:disabled,
+.k-chip[aria-pressed='true'][aria-disabled='true'],
+.k-chip[aria-checked='true'][aria-disabled='true'] {
+	border-color: color-mix(in srgb, var(--kerf-500) 55%, transparent);
+	background: color-mix(in srgb, var(--kerf-500) 10%, transparent);
+	color: var(--text-muted);
 }
 
 /* ---------- Tile: a preset in a grid ---------- */
