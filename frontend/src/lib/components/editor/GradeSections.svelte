@@ -74,6 +74,9 @@
 	let channel = $state<CurveChannel>('master');
 	/** The points of `channel` of clip `id` while a gesture moves them; `null` between gestures. */
 	let draft = $state.raw<{ id: string; points: CurvePoint[] } | null>(null);
+	/** The drag in hand, if any: a section taken down mid-gesture gives it up rather than let it commit later. */
+	let releaseDrag: (() => void) | null = null;
+	$effect(() => () => releaseDrag?.());
 	let canvas = $state<HTMLCanvasElement | null>(null);
 
 	const stored = (ch: CurveChannel) => grade.curves?.[ch] ?? [];
@@ -203,7 +206,7 @@
 		draft = { id: clipId, points };
 		let moved = false;
 		const target = e.currentTarget as HTMLElement;
-		beginDrag(e, {
+		releaseDrag = beginDrag(e, {
 			move(ev) {
 				moved = true;
 				const r = target.getBoundingClientRect();
@@ -295,7 +298,7 @@
 		settle(`wheel:${range}`);
 		place(e);
 		let moved = false;
-		beginDrag(e, {
+		releaseDrag = beginDrag(e, {
 			move(ev) {
 				moved = true;
 				place(ev);

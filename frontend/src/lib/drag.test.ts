@@ -198,10 +198,7 @@ describe('every drag a component starts is released as the component goes', () =
 		readdirSync(d, { withFileTypes: true }).flatMap((f) =>
 			f.isDirectory() ? svelte(join(d, f.name)) : f.name.endsWith('.svelte') ? [join(d, f.name)] : []
 		);
-	// GradeSections is the inspector group's file (its own pass owns the clip-by-id fix there).
-	const OWNED_ELSEWHERE = ['GradeSections.svelte'];
 	const users = svelte(dir)
-		.filter((f) => !OWNED_ELSEWHERE.some((n) => f.endsWith(n)))
 		.map((f) => ({ f, src: readFileSync(f, 'utf8') }))
 		.filter(({ src }) => /beginDrag\(/.test(src.replace(/^\s*(\/\/|\*|\/\*).*$/gm, '')));
 
