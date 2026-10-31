@@ -69,3 +69,13 @@ describe('the playhead goes exactly where it is asked to, or is put back exactly
 		expect(src).toContain("win.removeEventListener('lostpointercapture', lost);");
 	});
 });
+
+describe('a scene-cut mark is a time, not a pixel', () => {
+	test('the ruler draws sceneTimes keyed by the time, placed at t * pxPerSec', () => {
+		// Keyed by x, two clips of one asset in step (same x) throw each_key_duplicate, and every zoom rekeys all of them.
+		expect(src).toContain('sceneTimes(editor.timeline,');
+		expect(src).toContain('{#each sceneMarks as t (t)}');
+		expect(src).not.toContain('sceneXs');
+		expect(src).not.toMatch(/\{#each scene\w* as x \(x\)\}/);
+	});
+});

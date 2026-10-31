@@ -5,7 +5,9 @@ state** (ruler + tracks + clips positioned by `timeline_start`/duration at `ui.z
 px/sec + playhead), with scene markers / silence regions / **beat ticks** (the tempo grid
 of audio-track clips, confidence-gated, hidden when beats land closer than 4px — from
 `src/lib/beats.ts`, the TS mirror of the Rust beat math that the ruler, the drag
-snapping and the browser harness's alignment all share, unit-tested with `bun test`)
+snapping and the browser harness's alignment all share, unit-tested with `bun test`; the scene
+cuts are `scene-marks.ts` `sceneTimes` — seconds, de-duplicated, only the window in view, keyed by
+the time and not the pixel, since two clips of one asset laid in step share a cut)
 and **bar ticks** (`barGrid`, the mirror of `Timeline::bar_grid`: the same grid over the
 tempos' `downbeats`, which music with a fitted bar grid carries and speech does not; drawn
 taller and heavier than a beat, in the same `--beat-marker` token, and kept when the beats

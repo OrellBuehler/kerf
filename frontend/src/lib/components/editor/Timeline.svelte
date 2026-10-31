@@ -111,6 +111,7 @@
 	} from '#lib/timeline-cull';
 	import { clipDuration } from '#lib/types';
 	import { barGrid, beatGrid, beatPeriod, gridMagnets, sourceToTimeline } from '#lib/beats';
+	import { sceneTimes } from '#lib/scene-marks';
 	import { isRamped, meanSpeed } from '#lib/speed-ramp';
 	import { fmtSpeed, miniCurve, rampSummary } from '#lib/speed-ramp-edit';
 	import { NAME_CHIP_PCT, showsLabel } from '#lib/clip-label';
@@ -245,23 +246,6 @@
 	 * the clip's speed (and reverse direction). */
 	const srcToTimeline = sourceToTimeline;
 
-	const sceneXs = $derived.by(() => {
-		const xs: number[] = [];
-		for (const t of editor.timeline.tracks) {
-			if (t.kind !== 'video') continue;
-			for (const c of t.clips) {
-				const an = editor.analysisFor(c.asset_id);
-				if (!an) continue;
-				for (const sc of an.scene_changes) {
-					if (sc > c.source_in && sc < c.source_out) {
-						xs.push(srcToTimeline(c, sc) * pxPerSec);
-					}
-				}
-			}
-		}
-		return xs;
-	});
-
 	// ---- beat grid (tempo analysis → ruler ticks + snap targets) --------------
 
 	/** Hide (and stop snapping to) the grid when beats land closer than this, px. */
@@ -361,6 +345,9 @@
 
 	const grid = $derived(rulerGrid(pxPerSec, editor.fps));
 	const visibleSec = $derived([viewLo / pxPerSec, Math.min(viewHi, laneW) / pxPerSec] as const);
+	/** Detected scene cuts in view, in seconds: keyed by the time (two clips of one asset laid in step
+	 *  share a cut, and a zoom must not rekey a mark), placed at `t * pxPerSec`. */
+	const sceneMarks = $derived(sceneTimes(editor.timeline, (id) => editor.analysisFor(id)?.scene_changes, visibleSec));
 	/** The labelled (major) ticks. */
 	const ticks = $derived(ticksIn(visibleSec[0], visibleSec[1], grid.step));
 	/** A mark per frame, once a frame is wide enough to tell apart; they are then the minor ticks. */
@@ -3398,10 +3385,10 @@
 						>{tickLabel(t.k, grid, editor.fps, timeDisplay.mode)}</span
 					>
 				{/each}
-				{#each sceneXs as x (x)}
+				{#each sceneMarks as t (t)}
 					<span
 						use:tip={'Detected scene cut'}
-						style="position:absolute;left:{x}px;top:0;width:0;height:0;border-left:4px solid transparent;border-right:4px solid transparent;border-top:5px solid var(--scene-marker);transform:translateX(-50%)"
+						style="position:absolute;left:{t * pxPerSec}px;top:0;width:0;height:0;border-left:4px solid transparent;border-right:4px solid transparent;border-top:5px solid var(--scene-marker);transform:translateX(-50%)"
 					></span>
 				{/each}
 				{#each beatTimes as b (b)}
