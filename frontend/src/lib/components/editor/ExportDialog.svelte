@@ -476,9 +476,12 @@
 					<span aria-hidden="true" style="color:var(--text-muted)">×</span>
 					{@render sideField('Custom height in pixels', 1)}
 				</div>
-				{#if sizeNote}
-					<p id="export-size-note" role="status" style="font-size:12px;line-height:1.45;margin:0 0 6px;text-align:right;color:var(--warning)">{sizeNote}</p>
-				{/if}
+				<!-- Present before it has anything to say, so a screen reader announces the text when it arrives. -->
+				<p
+					id="export-size-note"
+					role="status"
+					style="font-size:12px;line-height:1.45;margin:{sizeNote ? '0 0 6px' : '0'};text-align:right;color:var(--warning)"
+				>{sizeNote ?? ''}</p>
 			{/if}
 			{#if opts.resolution}
 				{@render selectRow(
