@@ -35,6 +35,7 @@ use crate::model::{
     pix_fmt_is_high_bit, pix_fmt_layout, pix_fmt_subsampling, Asset, BlendMode, Clip, Color, FitOrder, Grade, Hdr, Mask,
     PixLayout, Projection, ResolvedReframe, StreamInfo, StreamKind, Subsampling, Timeline, Transform, VideoEffect,
 };
+use crate::perspective::{PlacementFrame, Pose};
 use crate::plan_caps::{DipWhy, EffectKinds, GpuCaps, GradeKinds, LayerRef, Unsupported};
 use crate::planner::{PlanRequest, Planner};
 use crate::ExportOptions;
@@ -953,6 +954,28 @@ impl RenderPlan {
                     }
                 }
             };
+            // The placement reads the picture through `pad` and `perspective`: an odd height is not the
+            // filters' (see `PlacementFrame::exact_for`), and a pose whose sample positions leave the
+            // fixed-point table's range is not either.
+            if caps.placement {
+                if let Some(pose) = self.pose(layer) {
+                    if !PlacementFrame::exact_for(geom.picture) {
+                        reasons.push(Unsupported::Geometry(
+                            n,
+                            format!(
+                                "an odd-height picture ({}x{}) under a placement (FFmpeg's pad keeps or loses its last row by how the graph allocated the frame, and the builds differ)",
+                                geom.picture.0, geom.picture.1
+                            ),
+                        ));
+                    } else if !PlacementFrame::new(geom.picture, size).reachable(&pose) {
+                        reasons.push(Unsupported::Geometry(
+                            n,
+                            "a placement whose sample positions leave the fixed-point range of FFmpeg's perspective filter"
+                                .into(),
+                        ));
+                    }
+                }
+            }
             // `pad` hands everything after it the whole padded frame, bars included. A pointwise
             // effect (a grade, grayscale, invert) is a table, and the bars go through it like the
             // picture, and a mask is cut from the whole padded frame (the compositor's layer is that
@@ -1007,9 +1030,7 @@ impl RenderPlan {
             // frame is drawn only while it stays within the two levels a scaled blur does: one sharpen of
             // at most 0.5, and no second one. A sharpen of nothing at `unsharp`'s 16-bit precision counts
             // for nothing; with no source upstream a sharpen is exact at any amount.
-            let zoom_last = layer.animated.is_some_and(|a| a.zooms) && geom.stages.len() == 2;
-            let before_effects = if zoom_last { 1 } else { geom.stages.len() };
-            let scaled = geom.stages[..before_effects].iter().any(|s| s.scaled != (s.src.w, s.src.h));
+            let scaled = geom.stages.iter().any(|s| s.scaled != (s.src.w, s.src.h));
             // The `eq` is next in the chain after those scales (the compositor applies its tables in the vertical
             // pass of the last of them), and they multiply the scaler's level: two pictures a level apart are, after
             // them, as far apart as the tables' steepest step between neighbouring entries (`eq::table_steps`,
@@ -1054,11 +1075,7 @@ impl RenderPlan {
             }
             // The key's window keeps what it last read where the picture ends; a picture under two samples a
             // side has no such row or column (the compositor's rule for it needs one).
-            let (pw, ph) = if zoom_last {
-                (geom.stages[0].keep.w, geom.stages[0].keep.h)
-            } else {
-                geom.picture
-            };
+            let (pw, ph) = geom.picture;
             if chroma_keyed && caps.effects.contains(EffectKinds::CHROMA_KEY) && (pw < 2 || ph < 2) {
                 reasons.push(Unsupported::Effects(
                     self.layer_ref(n, layer),
@@ -1415,7 +1432,22 @@ impl RenderPlan {
             if layer.animated.is_some_and(|a| a.places) && !caps.placement {
                 out.push(Unsupported::KeyedPlacement(at()));
             }
-            if layer.animated.is_some_and(|a| a.behaves) && !caps.behaviors {
+            if self.pose(layer).is_some() && caps.placement {
+                let fmt = stream.pix_fmt.clone().unwrap_or_else(|| "not recorded".to_string());
+                if !matches!(stream.layout(), Some(PixLayout::Yuv420 | PixLayout::Gray)) {
+                    out.push(Unsupported::PlacedFormat(at(), fmt));
+                } else if self.canvas.policy != CompositeColorPolicy::FixedBt601 && stream.maybe_full_range_in(self.canvas.policy)
+                {
+                    // Where the composite's range is negotiated along the graph (9.0.2), the range conversion inside
+                    // the chain's `format=yuva420p` is not the decode's: a full-range 8-bit or 10-bit 4:2:0 picture reads
+                    // up to 5 levels off in a still (3 to 5 on `yuvj420p`, 4 to 5 on 10-bit flagged `pc`); exact on 4.4.2.
+                    out.push(Unsupported::PlacedFormat(at(), format!("full-range {fmt}")));
+                }
+            }
+            // A live behaviour is drawn as the pose it gives (`PlanLayer::transform`) where that is a moving zoom or position
+            // (breathe, drift, shake: the placement draws them); one that turns the picture (sway, spin) is a rotation, which
+            // no compositor draws to the sample.
+            if layer.animated.is_some_and(|a| a.behaves && (!caps.behaviors || a.rotates)) {
                 out.push(Unsupported::Behavior(at()));
             }
             // The graph fits and zooms in one `scale` from the source; the compositor's geometry (and
@@ -1425,6 +1457,13 @@ impl RenderPlan {
                 FitOrder::Fitted => {}
                 FitOrder::Folded => out.push(Unsupported::FoldedFit(at(), "a zoom in under Contain")),
                 FitOrder::Uncropped => out.push(Unsupported::FoldedFit(at(), "a Cover clip that zooms or pans")),
+            }
+            if layer.animated.is_some_and(|a| a.places && !a.zooms && !a.still_motion) && caps.placement {
+                // A position that moves is placed after the same chain a moving zoom is: the grade, the
+                // rotation, the opacity and the dip to white are the ones the placement is not drawn behind.
+                if let Some(what) = self.zoom_order_refusal(layer, &ops) {
+                    out.push(Unsupported::ZoomBehind(at(), what));
+                }
             }
             if layer.animated.is_some_and(|a| a.zooms) {
                 if caps.keyed_zoom {
@@ -1653,7 +1692,26 @@ impl RenderPlan {
         Placement {
             keyframed: layer.animated.filter(|_| self.mode == PlanMode::Motion).and_then(|a| a.keys),
             offset: layer.fx.motion,
+            placed: layer
+                .animated
+                .filter(|a| a.places && !a.still_motion)
+                .map(|a| crate::layer_geometry::Placed { zoom: a.zooms }),
         }
+    }
+
+    /// Where the placement puts `layer`'s picture at this frame, for a clip whose zoom or position moves
+    /// ([`Animated::places`]; `None` for any other): the zoom if it is the one that moves (a held one is a
+    /// `scale` ahead of the placement), and the position the chain's expressions evaluate to with a slide's or
+    /// push's travel added, in canvas widths and heights — the numbers `engine::cli::placement_filters`
+    /// writes into the `perspective` corners.
+    pub fn pose(&self, layer: &PlanLayer) -> Option<Pose> {
+        // (A moving still image is drawn by its own graph, `Animated::still_motion`, not by this chain.)
+        let a = layer.animated.filter(|a| a.places && !a.still_motion)?;
+        let (mx, my) = layer.fx.motion;
+        Some(Pose {
+            scale: a.zooms.then_some(layer.transform.scale),
+            pos: (layer.transform.pos_x + mx, layer.transform.pos_y + my),
+        })
     }
 
     /// What the `tint` fades of `layer` leave of its picture at this plan's frame
@@ -2652,6 +2710,150 @@ mod tests {
             policy,
         )
         .unwrap()
+    }
+
+    /// The plan of a clip whose zoom (`zooming`) or position moves, judged by a compositor that draws the placement.
+    #[test]
+    fn a_placement_is_refused_for_what_it_is_not_held_to_and_drawn_otherwise() {
+        let key = |time: f64, scale: f64, pos_x: f64, rotation: f64, opacity: f64| Keyframe {
+            time,
+            scale,
+            pos_x,
+            pos_y: 0.0,
+            rotation,
+            opacity,
+            easing: Default::default(),
+        };
+        let caps = GpuCaps {
+            motion: true,
+            fades: true,
+            keyed_zoom: true,
+            placement: true,
+            ..GpuCaps::A0
+        };
+        let judge = |stream: StreamInfo, delivery: Option<Delivery>, edit: &dyn Fn(&mut Clip), t: f64| {
+            let plan = fading_plan_of(stream, delivery, CompositeColorPolicy::FixedBt601, |c| edit(c), t);
+            let size = plan.size(u32::MAX);
+            (plan.reasons(&caps, size), plan)
+        };
+        let zooming = |c: &mut Clip| c.keyframes = vec![key(0.0, 1.0, 0.0, 0.0, 1.0), key(8.0, 1.5, 0.1, 0.0, 1.0)];
+        let panning = |c: &mut Clip| c.keyframes = vec![key(0.0, 1.0, -0.1, 0.0, 1.0), key(8.0, 1.0, 0.1, 0.0, 1.0)];
+        // A zoom and a position that move are drawn; the plan carries the pose the placement draws.
+        for edit in [&zooming as &dyn Fn(&mut Clip), &panning] {
+            let (why, plan) = judge(video(640, 360), None, edit, 4.0);
+            assert!(why.is_empty(), "{why:?}");
+            let pose = plan.pose(&plan.layers[0]).expect("a pose");
+            assert_eq!(pose.pos.0, plan.layers[0].transform.pos_x);
+            assert_eq!(pose.scale.is_some(), plan.layers[0].animated.is_some_and(|a| a.zooms));
+        }
+        // ... and a clip that does not move has none.
+        let (_, plan) = judge(video(640, 360), None, &|_| {}, 4.0);
+        assert!(plan.pose(&plan.layers[0]).is_none());
+        // The geometry stops at the picture: the zoom is no `scale` stage, and a held zoom keeps its stage.
+        let (_, plan) = judge(video(640, 360), None, &zooming, 4.0);
+        let geom = plan.layer_geometry(&plan.layers[0], (640, 360)).unwrap();
+        assert_eq!(
+            (geom.stages.len(), geom.picture, geom.layer, geom.origin),
+            (1, (640, 360), (640, 360), (0, 0))
+        );
+        // An odd-height picture (a 640x203 picture in a 640x360 frame is not resized) is refused, an odd width is not.
+        let frame = Some(Delivery::new(640, 360, Fit::Contain));
+        let (why, _) = judge(video(640, 203), frame, &zooming, 4.0);
+        assert!(
+            matches!(why.as_slice(), [Unsupported::Geometry(_, w)] if w.contains("odd-height")),
+            "{why:?}"
+        );
+        let (why, _) = judge(video(203, 360), frame, &zooming, 4.0);
+        assert!(why.is_empty(), "{why:?}");
+        // Another pixel format than 4:2:0 or gray: refused, not recorded too.
+        for fmt in ["yuv444p", "yuv422p", "rgb24", "gbrp"] {
+            let mut stream = video(640, 360);
+            stream.pix_fmt = Some(fmt.into());
+            let (why, _) = judge(stream, None, &zooming, 4.0);
+            assert!(
+                why.iter().any(|u| matches!(u, Unsupported::PlacedFormat(_, f) if f == fmt)),
+                "{fmt}: {why:?}"
+            );
+        }
+        for fmt in ["yuv420p", "yuv420p10le", "gray"] {
+            let mut stream = video(640, 360);
+            stream.pix_fmt = Some(fmt.into());
+            let (why, _) = judge(stream, None, &zooming, 4.0);
+            assert!(
+                !why.iter().any(|u| matches!(u, Unsupported::PlacedFormat(..))),
+                "{fmt}: {why:?}"
+            );
+        }
+        let mut stream = video(640, 360);
+        stream.pix_fmt = None;
+        let (why, _) = judge(stream, None, &zooming, 4.0);
+        assert!(why.iter().any(|u| matches!(u, Unsupported::PlacedFormat(..))), "{why:?}");
+        // A picture that may be full range: refused where the composite's range is negotiated, drawn where it is not.
+        let mut stream = video(640, 360);
+        stream.pix_fmt = Some("yuvj420p".into());
+        for (policy, refused) in [
+            (CompositeColorPolicy::FixedBt601, false),
+            (CompositeColorPolicy::BottomLayerTag, true),
+            (CompositeColorPolicy::Unknown, true),
+        ] {
+            let plan = fading_plan_of(stream.clone(), None, policy, |c| zooming(c), 4.0);
+            let why = plan.reasons(&caps, plan.size(u32::MAX));
+            let placed = why
+                .iter()
+                .any(|u| matches!(u, Unsupported::PlacedFormat(_, f) if f.starts_with("full-range")));
+            assert_eq!(placed, refused, "{policy:?}: {why:?}");
+        }
+        // A pose out of the table's range.
+        let (why, _) = judge(
+            video(640, 360),
+            None,
+            &|c| c.keyframes = vec![key(0.0, 1.0, 0.0, 0.0, 1.0), key(8.0, 0.00001, 0.0, 0.0, 1.0)],
+            9.0,
+        );
+        assert!(
+            matches!(why.as_slice(), [Unsupported::Geometry(_, w)] if w.contains("fixed-point range")),
+            "{why:?}"
+        );
+        // A rotation, an opacity below 1 and a dip to white ahead of the placement: a moving position as much as a zoom.
+        let (why, _) = judge(
+            video(640, 360),
+            None,
+            &|c| c.keyframes = vec![key(0.0, 1.0, -0.1, 10.0, 1.0), key(8.0, 1.0, 0.1, 10.0, 1.0)],
+            4.0,
+        );
+        assert!(
+            matches!(why.as_slice(), [Unsupported::ZoomBehind(_, w)] if w.contains("rotation")),
+            "{why:?}"
+        );
+        let (why, _) = judge(
+            video(640, 360),
+            None,
+            &|c| c.keyframes = vec![key(0.0, 1.0, -0.1, 0.0, 0.5), key(8.0, 1.0, 0.1, 0.0, 0.5)],
+            4.0,
+        );
+        assert!(
+            matches!(why.as_slice(), [Unsupported::ZoomBehind(_, w)] if w.contains("opacity")),
+            "{why:?}"
+        );
+        // Without the ability every such layer is `KeyedPlacement` as before.
+        let plan = fading_plan(zooming, 4.0);
+        let why = plan.reasons(
+            &GpuCaps {
+                placement: false,
+                ..caps
+            },
+            plan.size(u32::MAX),
+        );
+        assert!(why.iter().any(|u| matches!(u, Unsupported::KeyedPlacement(_))), "{why:?}");
+        // A letterboxed picture at the identity pose in a still (frame 0 of a push-in that starts at 1): the still
+        // pads it to the whole frame before the placement.
+        let (why, _) = judge(video(480, 360), Some(Delivery::new(640, 360, Fit::Contain)), &zooming, 0.0);
+        assert!(
+            matches!(why.as_slice(), [Unsupported::Geometry(_, w)] if w.contains("letterboxed")),
+            "{why:?}"
+        );
+        let (why, _) = judge(video(480, 360), Some(Delivery::new(640, 360, Fit::Contain)), &zooming, 4.0);
+        assert!(why.is_empty(), "{why:?}");
     }
 
     #[test]

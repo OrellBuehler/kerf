@@ -11,7 +11,7 @@ Windows) and nothing may depend on an optional wgpu feature. **A GPU failure is 
 error, not a panic**: every unit of wgpu work runs in out-of-memory / validation /
 internal error scopes (`Gpu::guarded`), anything uncaptured is logged and remembered,
 `Compositor::new` and `composite` return `Result` (and `Compositor::caps()` says what it
-draws, `GpuCaps::A0` plus `text`, `motion`, `fades`, `transitions`, `dip_white`, `keyed_zoom`, `keyed_opacity`, `keyed_color`, `mask`, `grade` (every kind, where `grade::measured()` says this FFmpeg's conversions are the model's: `Compositor::caps()` drops it otherwise) and the blur / sharpen / grayscale / invert / vignette / chroma key `effects` today, which `composite` / `render_plan` judge the plan by), and a lost device is tracked — every
+draws, `GpuCaps::A0` plus `text`, `motion`, `fades`, `transitions`, `dip_white`, `keyed_zoom`, `placement`, `keyed_opacity`, `keyed_color`, `mask`, `grade` (every kind, where `grade::measured()` says this FFmpeg's conversions are the model's: `Compositor::caps()` drops it otherwise) and the blur / sharpen / grayscale / invert / vignette / chroma key `effects` today, which `composite` / `render_plan` judge the plan by), and a lost device is tracked — every
 later call is `GpuError::DeviceLost` and the **owner builds a new `Gpu` and
 `Compositor`** (the device is not recreated behind the caller's back).
 **No compositor pass draws a blend mode**: a layer whose clip has one is refused by the plan (`Unsupported::BlendMode`,
@@ -504,7 +504,7 @@ What the parity harness forced, all recorded in `kerf-gpu`'s docs and shaders:
   clip that zooms or pans over a cover that hangs over the frame, are one `scale` from the source to the frame times the zoom (and
   Cover no longer crops to the frame first), so the plan refuses them (`Unsupported::FoldedFit`, `core-render-plan.md`) and FFmpeg
   draws the frame. Zooms out under Contain (the PiP cascade: fit, then shrink) and everything with scale 1 and no pan are unchanged,
-  and so are the coverage archetypes (the tutorial's keyed push-ins were never part of it: they are `Unsupported::KeyedPlacement`, see the ledger below). The parity cases follow: `geometry/zoom-off-canvas` and `pip/cover-then-scale` are held
+  and so are the coverage archetypes (the tutorial's keyed push-ins were refused as `Unsupported::KeyedPlacement` until the placement pass, see the ledger below). The parity cases follow: `geometry/zoom-off-canvas` and `pip/cover-then-scale` are held
   as refusals (with `geometry/pan-off-canvas` and `pip/contain-then-scale` keeping what they drew), and the grid cases
   `cover-odd-*-then-scale` are refused the same way. **Not run where this was written (no Vulkan adapter, no lavapipe)**: the refusals
   are plan-level and unit-tested in kerf-core (`planner.rs`, `render_plan.rs`) and the coverage test ran; the adapter suites
@@ -643,18 +643,63 @@ a paused frame inside a transition is drawn like the file shows it — where the
 format=yuva420p, mask, rotate, fades, scale eval=frame` (`video_clip_chain`; `still_clip_chain(.., zoom_last)` for the still): everything
 before the zoom acts at the **fit size** and the zoom magnifies it (a blur grows, a hard mask edge softens).
 
-* **A moving zoom (or a moving position) is refused** (`KeyedPlacement`, no `GpuCaps::placement`): the export and the
-  FFmpeg still now place the picture with a sub-pixel `perspective` after that chain (`engine-cli.md`), which no pass
-  draws, so the zoom-last order below is not reached until one does. `motion_parity.rs`'s zoom cases hold the refusal.
-* **A clip with live behaviours is refused** (`Behavior`, no `GpuCaps::behaviors`; `core-render-plan.md`): sway / spin / breathe / drift / shake
-  are a formula of the clip's clock added to its pose, and the plan's `transform` is the exact pose they give at the frame (so a compositor
-  that draws a keyed rotation or placement could draw it), but no case in `motion_parity.rs` holds one, so no pass claims it. A sway or spin
-  is the keyed rotation below; a breath, drift or shake is also a moving position / zoom and is refused as above.
-* The compositor draws that order (`LayerLook::zoom_last`: `animated.zooms` and two scale stages). Stage 0 is the fit scale with the `eq` tables in
-  its vertical pass; the effects, the mask plane and the fades (`fs_fade`: Y, U, V and the alpha) run on the fit-size planes; **stage 1 scales four
-  planes** (swscale scales alpha like luma, identically on both FFmpegs). A zoom that holds still keeps the old order.
-* Refused whatever the caps (`ZoomBehind`): a rotation and an opacity below 1 (the rotated alpha and the RGB round trip would scale with the zoom), and
-  a dip to white (the zoom's `scale` takes the RGB frame the fade leaves and converts it in the same pass: up to 14 levels off on 6.1.1, 3 on 9.0.2).
+* **A moving zoom or position is drawn by the placement pass** (`GpuCaps::placement`; see "The placement" below): the export and the
+  FFmpeg still end such a clip's chain in `pad`, `perspective` and `crop`, and the compositor reproduces those after everything else
+  at the fit size. A layer is still refused (`ZoomBehind`) when a grade, a rotation, an opacity below 1 or a dip to white is ahead of
+  it, for a moving position as for a moving zoom, for an odd-height picture or a pose out of the table's range (`Geometry`), for a layer that is not
+  4:2:0 or gray, or may be full range where the composite's range is negotiated (`PlacedFormat`, below), and for a letterboxed picture at the identity pose in a
+  still (`Geometry`: the still pads it to the whole frame first, with opaque bars).
+* **Live behaviours** (`GpuCaps::behaviors`; `core-render-plan.md`): breathe, drift and shake are a formula of the clip's clock added to its pose, the plan's
+  `transform` is the exact pose they give at the frame (`Clip::transform_at`, the arithmetic of the graph's expressions, `sin` / `cos` included), and the
+  placement draws that pose: held exactly in export frames and stills (`behavior/*`: each alone, all three, over a keyed zoom). A sway or a spin turns the
+  picture (a keyed rotation, which no pass draws to the sample: the rotated edge is a stair in FFmpeg and a float sample here), so `Behavior` stays for them
+  whatever the caps.
+* The compositor draws that order (`LayerLook::placed`: `animated.places`, a geometry that ends at the fit-size picture). Stage 0 is the fit
+  scale with the `eq` tables in its vertical pass; the effects, the mask plane and the fades (`fs_fade`: Y, U, V and the alpha) run on the
+  fit-size planes; the placement then reads the four planes. A zoom that holds still keeps the old order (a `scale` ahead of the rest).
+* Refused whatever the caps (`ZoomBehind`): a grade, a rotation and an opacity below 1 (the placement would act on the rotated alpha, the RGB round
+  trip or the grade's conversions, none of which a case holds to FFmpeg's), and a dip to white (`fade c=white` converts the picture to RGB and back
+  around the fade; no case holds the placement behind it).
+
+**The placement** (`kerf_core::perspective`, `src/placement.rs`, `shaders/placement.wgsl`, `Compositor::place_planes`; `tests/placement.rs`).
+FFmpeg ends the chain of a clip whose zoom or position moves in `format=yuva420p, pad, perspective=interpolation=linear[:eval=frame], crop`
+(`engine::cli::placement_chain`, the export, the stream and the still alike), and every sample of that is integer or `f64` arithmetic that is
+reproduced exactly:
+
+* **`pad`** adds a margin of `2*ceil(max(0, cw-iw)/4)+2` samples on each side (so the canvas fits and two samples more), in `black@0`: Y 16, U = V = 128, alpha
+  0. Its output width and the picture it copies are rounded down to even (`ff_draw_round_to_sub`), the right border is drawn from the even width
+  (**an odd width loses its last column, on every build**), and `crop` takes the canvas from `2*floor((W-cw)/4)`. **An odd height is refused**
+  (`Geometry`): `pad` draws its bottom bar over the last row only when it pads in place, which depends on how the graph allocated the frame, and
+  the builds differ (`color=size=6x5` padded in place: 4 rows on 4.4.2, 5 on 9.0.2; copied, 3 of 3 on both).
+* **`perspective`** is `pv[x + y*w] = lrint(256 * (x0*x + x1*y + x2) / (x6*x + x7*y + x8))` for every pixel, in `f64`, from nine numbers built from the
+  four corners the expressions evaluate to (`PlacementFrame::corners`: `(edge + 0.5 - crop - centre) / s + dim/2 - 0.5` in the order the text writes it,
+  `centre = canvas/2 + pos*canvas`, `pos` the plan's pose plus a slide's or push's travel: `RenderPlan::pose`). The corners are an axis-aligned rectangle,
+  so `x6` and `x3` are exactly zero and `v` depends on the row alone; `x1` and `x7` are zero or **rounding noise** (`(x0 - x1) - x0 + x1` is not 0 in
+  `f64`), under which `u` is the column's unless the noise carries it across a rounding boundary. `PlacementMap::new` takes one table per axis
+  (`canvas.0 + canvas.1` entries) when the value at the window's first and last row, widened by 1e-6 + 1e-12 of itself, rounds to one integer, and
+  the filter's whole table, pixel by pixel (`PlacementMap::exact`), otherwise; unit tests hold the first to the second over 4000 random poses and the
+  structured ones whose positions can sit on a tie. A pose whose positions pass 2^21 samples (`lrint` leaves 32 bits) is refused in the plan.
+* **`resample_linear`** reads the entry of a sample's top-left luma pixel (chroma `>> 1`, no half-sample centring), splits it into a whole part and 8 bits of
+  fraction, and mixes four neighbours with integer weights, `(sub_v_inv * (sub_u_inv * a + sub_u * b) + sub_v * (...) + 2^15) >> 16`. The filter's two
+  edge branches each ignore the fraction of the axis they clamp; clamping each tap to the frame gives the same number (a clamped pair is one sample).
+  The alpha plane is resampled like luma, so the fringe where the picture meets the pad is a ramp of alpha *and* of Y towards 16.
+* **`PlacedFormat`** (kind `placed_format`): the chain converts the picture to `yuva420p` itself, at its head, where the compositor's decode converted it to 8-bit
+  limited-range 4:2:0 ahead of the graph. The two are the same arithmetic where the picture is already 4:2:0 (8 and 10 bit, any matrix tag, gray: held exactly on
+  both builds), and are not elsewhere: a **4:4:4 picture's chroma is 24 levels off on 4.4.2 and a 4:2:2 one's 16** (exact on 9.0.2: the standalone conversion and the
+  standalone placement are both exact on 4.4.2, so it is the export graph's own conversion that differs), **RGB** is the same family, and a **full-range** picture
+  (`yuvj420p`, 10-bit flagged `pc`, or one whose range is not recorded) is **3 to 5 levels off in a still on 9.0.2** (exact on 4.4.2). So 4:4:4, 4:2:2, RGB and
+  an unrecorded format are refused on every build, and a picture that may be full range where the composite's range is negotiated (`policy != FixedBt601`).
+* The compositor draws the four canvas-sized planes (Y, U, V, alpha) and hands them to `compose_exact` as a layer at the origin with a per-sample alpha,
+  `overlay`'s own integer blend. The fades (a clip's own, a dip to black, a dissolve's ramp on the alpha plane or on the opaque one `format=yuva420p` gives
+  a picture) run on the fit-size planes first, as in the chain; the mask is cut at the fit size and placed with the picture.
+* **Held to FFmpeg on both builds**: `tests/placement.rs` (`pad,perspective,crop` over noise with an alpha plane, 144 shapes and poses, every sample), the
+  shader against the model, `motion_parity.rs` (`zoom/*`, `position/*`, `shape/*`, `zoom+*`, the dissolves, dips, slides and pushes into and out of a
+  placed clip, 0 differing samples in every plane of every frame), and `parity.rs` (`a_moving_zoom_is_placed_as_the_still_places_it`: the compositor's planes
+  taken to RGB by FFmpeg itself against the still's PNG, `check_exact`, with a `control/plain` case that holds the harness to an unplaced layer). Where the
+  compositor's **scaler** is also in play ahead of the placement (a Cover fit that resizes, a held zoom that is a `scale`) the bound is the scaler's own
+  (`SCALED`, 1 level); the placement adds nothing to it. On this CPU the system 4.4.2's x86 swscale is further off the port than that at sharp edges
+  (22 levels on the test pattern at a 2:1 shrink, with or without a placement; the pinned 9.0.2 is within the level): a layer the compositor resizes is
+  not exact against that build, placed or not.
 
 **Masks.**
 
@@ -931,9 +976,10 @@ moving zoom frame against FFmpeg's still and export (`bench_a_mask_a_blur_and_a_
 `tests/coverage.rs` plans the review's archetypes (no decode, no adapter), still plans and export frames, and tells how many
 frames a compositor draws before and after fades and transitions (still plans: the captioned 9:16 talking head 96.0% to 100%, the
 same without captions 96.0% to 100%, the 16:9 montage with dissolves, dips and a slide 78.8% to 100%; export frames: 0% to 100% for those, since a Motion plan was
-refused whole). The tutorial with a webcam picture-in-picture is **16.7% in both modes** today: its keyed push-ins are
-`Unsupported::KeyedPlacement` (FFmpeg places the picture with `perspective` at sub-pixel positions, which no pass draws), the clip with a
-mask and a blur included (it is a keyed push-in too: the mask and the blur are drawn, the placement is not). **The readback is bounded**: the
+refused whole). The tutorial with a webcam picture-in-picture was 16.7% in both modes while its keyed push-ins were
+`Unsupported::KeyedPlacement`; with the placement pass it is **100% in both modes** (the clip with a mask and a blur included: the push-in
+is the placement, the mask and the blur are drawn at the fit size ahead of it), and the ledger's total goes from 64.6% to 75.6% of the 34200 sampled
+frames on 4.4.2 (63.7% to 74.7% on the pinned 9.0.2). **The readback is bounded**: the
 wait for the GPU to finish is `READBACK_TIMEOUT` (30 s), a `GpuError::Readback` rather
 than a caller blocked forever on a wedged device.
 

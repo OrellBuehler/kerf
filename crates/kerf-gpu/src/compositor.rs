@@ -61,6 +61,7 @@ use crate::sws::{self, Filter};
 use crate::text::{self, Blend, Raster, Source, TextAtlas};
 use grade_passes::{grade_geometry_refusal, GradeLook, GradePasses};
 use kerf_core::layer_geometry::{LayerGeometry, Rect, ScaleStage};
+use kerf_core::perspective::{PlacementFrame, PlacementMap, Tables};
 
 /// A rendered frame: tightly packed 8-bit RGBA, top row first.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -235,6 +236,23 @@ struct PlaneOpParams {
     f_out: u32,
 }
 
+/// `placement.wgsl`'s uniform: one plane of the placement.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+struct PlaceParams {
+    out_size: [i32; 2],
+    frame: [i32; 2],
+    margin: [i32; 2],
+    shows: [i32; 2],
+    canvas_w: i32,
+    sub: i32,
+    fill: i32,
+    pixels: i32,
+    flat: i32,
+    inside: i32,
+    pad: [i32; 2],
+}
+
 /// `blur.wgsl`'s uniform: `gblur`'s numbers for one plane.
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
@@ -348,6 +366,8 @@ struct PlaneOps {
     key: wgpu::RenderPipeline,
     vignette_layout: wgpu::BindGroupLayout,
     vignette: wgpu::RenderPipeline,
+    place_layout: wgpu::BindGroupLayout,
+    place: wgpu::RenderPipeline,
 }
 
 /// `vignette`'s factor map for one picture size ([`effects::vignette_map`], as `float` bits) on the GPU,
@@ -509,9 +529,9 @@ struct LayerLook {
     /// `geq` copies the planes through `lum` / `cb` / `cr` and, on a build that reads its last
     /// column and row one in, changes them: the planes' own last column and row are their neighbours'.
     mask_edge: bool,
-    /// A moving zoom comes last in FFmpeg's chain: everything above runs on the fit-size picture,
-    /// and the second scale stage zooms the result.
-    zoom_last: bool,
+    /// The layer's zoom or position moves, so the placement comes last in FFmpeg's chain: everything above
+    /// runs on the picture at its fit size, and the placement lays the result on the canvas.
+    placed: bool,
     /// `chromakey` after the effects: the last one's, as each writes the whole alpha plane from the
     /// chroma, which none of them changes.
     key: Option<effects::ChromaKeyOptions>,
@@ -605,6 +625,8 @@ struct Drawn<'a> {
     filters: Vec<[PlaneFilters; 3]>,
     fades: LayerFades,
     look: LayerLook,
+    /// Where the placement reads the picture, for a layer whose zoom or position moves.
+    placement: Option<PlacementMap>,
     /// The frames the layer's chain has passed on before this one (`vignette`'s dither runs on from them).
     count: u64,
 }
@@ -748,15 +770,10 @@ fn extent(w: u32, h: u32) -> wgpu::Extent3d {
     }
 }
 
-/// Whether a moving zoom comes last in this layer's chain, and the picture the effects, the mask and the grade act on:
-/// the fit-size one when it does (the zoom's `scale` follows them), else the layer's picture.
+/// Whether the placement comes last in this layer's chain, and the picture the effects, the mask and the grade
+/// act on: the one the chain makes before it (a placed layer's geometry ends there).
 fn effect_picture(layer: &kerf_core::PlanLayer, geom: &LayerGeometry) -> (bool, (u32, u32)) {
-    let zoom_last = layer.animated.is_some_and(|a| a.zooms) && geom.stages.len() == 2;
-    if zoom_last {
-        (true, (geom.stages[0].keep.w, geom.stages[0].keep.h))
-    } else {
-        (false, geom.picture)
-    }
+    (layer.animated.is_some_and(|a| a.places && !a.still_motion), geom.picture)
 }
 
 /// Do ahead of a frame what a plan needs measured and what takes a while: FFmpeg's `geq`, for a
@@ -781,7 +798,10 @@ impl Compositor {
     /// * `text`: titles and captions, FFmpeg's own `drawtext` raster blended here ([`crate::text`]);
     /// * `motion`, `fades`, `transitions`, `dip_white`: fades, dips, dissolves, slides and pushes, in
     ///   still plans and in export frames (`tests/motion_parity.rs`);
-    /// * `keyed_zoom`: a moving zoom drawn last, as FFmpeg's chain has it;
+    /// * `keyed_zoom`, `placement`: a moving zoom or position drawn last, as FFmpeg's chain has it: the rest of the
+    ///   chain at the fit size, then `pad`, `perspective` and `crop` ([`kerf_core::perspective`], `placement.wgsl`);
+    /// * `behaviors`: a live breath, drift or shake is the pose the plan evaluates, drawn by the same placement (a sway
+    ///   or a spin turns the picture, which no pass draws to the sample: still refused);
     /// * `keyed_opacity`: an export frame's `geq` alpha, the value the plan evaluates
     ///   ([`kerf_core::PlanLayer::keyed_alpha`]);
     /// * `keyed_color`: an export frame's `eq`, whose tables FFmpeg builds again for every frame from the
@@ -819,6 +839,8 @@ impl Compositor {
         caps.transitions = true;
         caps.dip_white = true;
         caps.keyed_zoom = true;
+        caps.placement = true;
+        caps.behaviors = true;
         caps.keyed_opacity = true;
         caps.keyed_color = true;
         caps.mask = true;
@@ -1272,6 +1294,20 @@ impl Compositor {
             source: wgpu::ShaderSource::Wgsl(include_str!("shaders/chromakey.wgsl").into()),
         });
         let key = render("chroma key", &key_module, &key_layout, "fs_key");
+        let place_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("placement"),
+            entries: &[
+                entry(0, uniform, wgpu::ShaderStages::FRAGMENT),
+                entry(1, texture, wgpu::ShaderStages::FRAGMENT),
+                entry(2, storage(true), wgpu::ShaderStages::FRAGMENT),
+                entry(3, storage(true), wgpu::ShaderStages::FRAGMENT),
+            ],
+        });
+        let place_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("kerf placement"),
+            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/placement.wgsl").into()),
+        });
+        let place = render("placement", &place_module, &place_layout, "fs_place");
         PlaneOps {
             layout,
             lut,
@@ -1287,6 +1323,8 @@ impl Compositor {
             vignette,
             key_layout,
             key,
+            place_layout,
+            place,
         }
     }
 
@@ -1944,23 +1982,190 @@ impl Compositor {
         })
     }
 
-    /// The alpha plane through a scale stage: scaled like luma (swscale's `yuva420p` alpha uses the
-    /// luma filters).
-    fn scale_alpha(&self, enc: &mut wgpu::CommandEncoder, alpha: &Plane, stage: &ScaleStage, filters: &PlaneFilters) -> Plane {
-        let ps = plane_stage(stage, false);
-        if ps.src == Rect::whole(alpha.w, alpha.h)
-            && ps.keep == Rect::whole(ps.src.w, ps.src.h)
-            && ps.scaled == (ps.src.w, ps.src.h)
-        {
-            return alpha.clone();
+    /// The placement pass on its own (`placement.wgsl`): `pic` placed by `map`, read back as the four canvas-sized
+    /// planes `overlay` is handed, so the shader can be compared with [`crate::placement::reference`] and the
+    /// filters themselves, with either table form.
+    pub fn place(&self, pic: &crate::placement::Picture, map: &PlacementMap) -> Result<crate::placement::Placed, GpuError> {
+        let (w, h) = pic.size;
+        let (cw, ch) = chroma_size(w, h);
+        let (ow, oh) = map.frame.canvas;
+        let ok = pic.y.len() == (w * h) as usize
+            && pic.u.len() == (cw * ch) as usize
+            && pic.v.len() == (cw * ch) as usize
+            && pic.a.is_none_or(|a| a.len() == (w * h) as usize)
+            && ow % 2 == 0
+            && oh % 2 == 0;
+        if !ok {
+            return Err(GpuError::Unsupported(format!(
+                "a {w}x{h} picture whose planes do not add up, or an odd {ow}x{oh} canvas"
+            )));
         }
-        self.scale_plane(enc, alpha, ps, filters, None)
+        let g = &self.gpu;
+        g.guarded("placing a picture", || {
+            let planes = [
+                self.upload("place y", w, h, pic.y),
+                self.upload("place u", cw, ch, pic.u),
+                self.upload("place v", cw, ch, pic.v),
+            ];
+            let alpha = pic.a.map(|a| self.upload("place a", w, h, a));
+            let mut enc = g.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("placement"),
+            });
+            let (placed, a) = self.place_planes(&mut enc, &planes, alpha.as_ref(), u32::from(pic.opaque), map)?;
+            let y = read_texels(g, enc, &placed[0].texture, ow, oh, 1)?.data;
+            let read = |plane: &Plane| {
+                let enc = g.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("placement readback"),
+                });
+                read_texels(g, enc, &plane.texture, plane.w, plane.h, 1).map(|f| f.data)
+            };
+            Ok(crate::placement::Placed {
+                y,
+                u: read(&placed[1])?,
+                v: read(&placed[2])?,
+                a: read(&a)?,
+            })
+        })
+    }
+
+    /// The placement of a layer whose zoom or position moves: the map of sample positions `perspective` builds
+    /// ([`PlacementMap`]), after the checks the plan makes and that a caller who did not ask gets as errors.
+    /// Nothing is drawn behind it that FFmpeg orders otherwise: a rotation, a translucent layer, a grade and a
+    /// dip to white are `ZoomBehind` in the plan.
+    fn placement_of(
+        &self,
+        plan: &RenderPlan,
+        layer: &kerf_core::PlanLayer,
+        geom: &LayerGeometry,
+        fades: &LayerFades,
+        look: &LayerLook,
+        size: (u32, u32),
+    ) -> Result<Option<PlacementMap>, GpuError> {
+        let Some(pose) = plan.pose(layer) else {
+            return Ok(None);
+        };
+        let unsupported = |what: String| GpuError::Unsupported(format!("layer {}: {what}", layer.name));
+        if geom.rotation.is_some() || geom.translucent || fades.alpha < 255 {
+            return Err(unsupported("a rotation or an opacity below 1 ahead of a placement".into()));
+        }
+        if look.grade.is_some() || fades.white_round_trip {
+            return Err(unsupported("a grade or a dip to white ahead of a placement".into()));
+        }
+        if geom.matte || !PlacementFrame::exact_for(geom.picture) {
+            return Err(unsupported(format!(
+                "a {}x{} picture under a placement, which is not the one FFmpeg's pad leaves",
+                geom.picture.0, geom.picture.1
+            )));
+        }
+        let map = PlacementMap::new(PlacementFrame::new(geom.picture, size), &pose).map_err(|e| unsupported(e.to_string()))?;
+        let bytes = match &map.tables {
+            Tables::Axes { u, v } => u.len() + v.len(),
+            Tables::Pixels { u, .. } => u.len(),
+        } as u64
+            * 4;
+        let limit = self.gpu.device.limits().max_storage_buffer_binding_size;
+        if bytes > limit {
+            return Err(unsupported(format!(
+                "a {}x{} placement table, over this device's {limit}-byte storage buffer",
+                size.0, size.1
+            )));
+        }
+        Ok(Some(map))
+    }
+
+    /// The placement: `pad`, `perspective` and `crop` over the picture's planes and its alpha (a plane, or the
+    /// uniform `inside` an opaque picture has), at the canvas' size. Returns Y, U, V and the alpha plane.
+    fn place_planes(
+        &self,
+        enc: &mut wgpu::CommandEncoder,
+        input: &[Plane; 3],
+        alpha: Option<&Plane>,
+        inside: u32,
+        map: &PlacementMap,
+    ) -> Result<([Plane; 3], Plane), GpuError> {
+        let device = &self.gpu.device;
+        let frame = &map.frame;
+        let (u, v, pixels) = match &map.tables {
+            Tables::Axes { u, v } => (u, v, 0),
+            Tables::Pixels { u, v } => (u, v, 1),
+        };
+        let table = |label: &str, t: &[i32]| {
+            device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some(label),
+                contents: bytemuck::cast_slice(t),
+                usage: wgpu::BufferUsages::STORAGE,
+            })
+        };
+        let (tu, tv) = (table("placement u", u), table("placement v", v));
+        let mut plane = |i: usize| -> Plane {
+            let sub = u32::from(i == 1 || i == 2);
+            let out = self.plane(
+                "placed",
+                frame.canvas.0 >> sub,
+                frame.canvas.1 >> sub,
+                PLANE_FORMAT,
+                wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            );
+            let src = match i {
+                3 => alpha.unwrap_or(&input[0]),
+                i => &input[i],
+            };
+            let params = PlaceParams {
+                out_size: [out.w as i32, out.h as i32],
+                frame: [(frame.frame.0 >> sub) as i32, (frame.frame.1 >> sub) as i32],
+                margin: [(frame.margin.0 >> sub) as i32, (frame.margin.1 >> sub) as i32],
+                shows: [(frame.picture.0 >> sub) as i32, (frame.picture.1 >> sub) as i32],
+                canvas_w: frame.canvas.0 as i32,
+                sub: sub as i32,
+                fill: [
+                    i32::from(crate::placement::PAD_Y),
+                    i32::from(crate::placement::PAD_C),
+                    i32::from(crate::placement::PAD_C),
+                    i32::from(crate::placement::PAD_A),
+                ][i],
+                pixels,
+                flat: i32::from(i == 3 && alpha.is_none()),
+                inside: inside as i32,
+                pad: [0; 2],
+            };
+            let buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("placement params"),
+                contents: bytemuck::bytes_of(&params),
+                usage: wgpu::BufferUsages::UNIFORM,
+            });
+            let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("placement"),
+                layout: &self.ops.place_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: wgpu::BindingResource::TextureView(&src.view),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: tu.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: tv.as_entire_binding(),
+                    },
+                ],
+            });
+            self.pass(enc, &self.ops.place, &out.view, &bind, None, None);
+            out
+        };
+        let planes = [plane(0), plane(1), plane(2)];
+        Ok((planes, plane(3)))
     }
 
     /// What happens to `layer`'s planes between the scaler and the blend, beyond its fades.
     fn look_of(&self, layer: &kerf_core::PlanLayer, geom: &LayerGeometry) -> Result<LayerLook, GpuError> {
         let unsupported = |what: String| GpuError::Unsupported(format!("layer {}: {what}", layer.name));
-        let (zoom_last, (pw, ph)) = effect_picture(layer, geom);
+        let (placed, (pw, ph)) = effect_picture(layer, geom);
         // The grade runs in RGB on the picture the chain has made, at its own size: FFmpeg carries it through
         // `rgb24` and back, and what is reproduced is that for a picture the scaler did not resize, with nothing
         // after the grade that sees the RGB (or, for a tagged picture, 4:4:4) frame (the plan refuses the rest;
@@ -2104,7 +2309,7 @@ impl Compositor {
             steps,
             mask,
             mask_edge,
-            zoom_last,
+            placed,
             key,
             grade,
         })
@@ -2310,6 +2515,7 @@ impl Compositor {
             }
             let fades = LayerFades::of(plan, layer, &geom)?;
             let look = self.look_of(layer, &geom)?;
+            let placement = self.placement_of(plan, layer, &geom, &fades, &look, size)?;
             // `fade` takes `rgb24` and runs on the picture the grade leaves in RGB (a dip to white is in the
             // chain for every frame of the clip, and converts the picture through RGB itself).
             if look.grade.is_some() && (fades.fade_in < FADE_FULL || fades.fade_out < FADE_FULL || fades.white_round_trip) {
@@ -2329,6 +2535,7 @@ impl Compositor {
                 filters,
                 fades,
                 look,
+                placement,
                 count,
             });
         }
@@ -2433,6 +2640,7 @@ impl Compositor {
             filters,
             fades,
             look,
+            placement,
             count,
         } in drawn
         {
@@ -2455,12 +2663,12 @@ impl Compositor {
                 [f32::from(t[0][16]), f32::from(t[1][128]), f32::from(t[2][128])]
             });
 
-            // A moving zoom is the last stage of FFmpeg's chain: the fit scale, the grade, the effects, the
-            // mask and the fades all act on the picture at its fit size, and the zoom scales the result.
-            let before_zoom = if look.zoom_last { 1 } else { geom.stages.len() };
+            // A moving zoom or position is the last stage of FFmpeg's chain: the fit scale, the grade, the effects,
+            // the mask and the fades all act on the picture at its fit size (a placed layer's geometry ends
+            // there), and the placement lays the result on the canvas.
             let mut current = planes;
-            for (si, stage) in geom.stages[..before_zoom].iter().enumerate() {
-                let lut = (si + 1 == before_zoom).then_some(tables.as_ref()).flatten();
+            for (si, stage) in geom.stages.iter().enumerate() {
+                let lut = (si + 1 == geom.stages.len()).then_some(tables.as_ref()).flatten();
                 current = self.scale_stage(&mut enc, &current, stage, &filters[si], lut);
             }
             if let Some(grade) = &look.grade {
@@ -2474,9 +2682,9 @@ impl Compositor {
                     Step::Vignette => self.vignette_planes(&mut enc, &current, *count),
                 };
             }
-            // (Where the zoom comes last the planes are shifted here, ahead of the zoom's scale; else
+            // (Where the placement comes last the planes are shifted here, ahead of it; else
             // the blend reads them one in from the layer's last column and row.)
-            if look.mask_edge && look.zoom_last {
+            if look.mask_edge && look.placed {
                 current = self.edge_planes(&mut enc, &current);
             }
             // The mask is the alpha plane (`geq` rewrites it); nothing else gives the layer one but the
@@ -2501,9 +2709,10 @@ impl Compositor {
                 let white = [fades.white_in, fades.white_out];
                 current = self.translucent_planes(&mut enc, &current, forward, plan.canvas.matrix, white)?;
             }
-            // What the blend pass still has to do about fades: all of them, unless the zoom is last.
+            // What the blend pass still has to do about fades: all of them, unless the placement is last.
             let mut fades = *fades;
-            if look.zoom_last {
+            let mut canvas_geom = None;
+            if let Some(map) = placement {
                 if fades.fade_in < FADE_FULL || fades.fade_out < FADE_FULL {
                     let [y, u, v] = &current;
                     current = [
@@ -2511,18 +2720,38 @@ impl Compositor {
                         self.fade_plane(&mut enc, u, 1, fades.black, fades.fade_in, fades.fade_out),
                         self.fade_plane(&mut enc, v, 1, fades.black, fades.fade_in, fades.fade_out),
                     ];
-                    fades.fade_in = FADE_FULL;
-                    fades.fade_out = FADE_FULL;
                 }
-                // (Without a mask the ramp scales a uniform alpha plane into the same uniform one: the
-                // blend pass applies it.)
-                if let (Some(a), true) = (&alpha, fades.ramp < FADE_FULL) {
-                    alpha = Some(self.fade_plane(&mut enc, a, 2, 0, fades.ramp, FADE_FULL));
-                    fades.ramp = FADE_FULL;
+                // The ramp acts on the alpha plane the picture has, or on the opaque one `format=yuva420p`
+                // gives it: a uniform value, `fade alpha=1`'s `(255 * factor + 2^15) >> 16`.
+                let mut inside = 255;
+                match &alpha {
+                    Some(a) if fades.ramp < FADE_FULL => {
+                        alpha = Some(self.fade_plane(&mut enc, a, 2, 0, fades.ramp, FADE_FULL));
+                    }
+                    None if fades.ramp < FADE_FULL => inside = (255 * fades.ramp + 32768) >> 16,
+                    _ => {}
                 }
-                current = self.scale_stage(&mut enc, &current, &geom.stages[1], &filters[1], None);
-                alpha = alpha.map(|a| self.scale_alpha(&mut enc, &a, &geom.stages[1], &filters[1][0]));
+                fades.fade_in = FADE_FULL;
+                fades.fade_out = FADE_FULL;
+                fades.ramp = FADE_FULL;
+                let (placed, a) = self.place_planes(&mut enc, &current, alpha.as_ref(), inside, map)?;
+                current = placed;
+                alpha = Some(a);
+                let canvas = map.frame.canvas;
+                canvas_geom = Some(LayerGeometry {
+                    stages: Vec::new(),
+                    picture: canvas,
+                    rotation: None,
+                    layer: canvas,
+                    picture_at: (0, 0),
+                    picture_shows: canvas,
+                    matte: false,
+                    origin: (0, 0),
+                    opacity: geom.opacity,
+                    translucent: false,
+                });
             }
+            let geom = canvas_geom.as_ref().unwrap_or(geom);
             let fades = &fades;
             let [py, pu, pv] = &current;
 
@@ -2552,7 +2781,7 @@ impl Compositor {
                 rotate,
                 tail: 0,
                 has_alpha: u32::from(alpha.is_some()),
-                edge: u32::from(look.mask_edge && !look.zoom_last),
+                edge: u32::from(look.mask_edge && !look.placed),
                 fade_in: fades.fade_in,
                 fade_out: fades.fade_out,
                 black: fades.black,

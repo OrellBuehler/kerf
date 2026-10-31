@@ -145,6 +145,7 @@ pub mod frame_source;
 pub mod gpu;
 pub mod grade;
 pub mod motion;
+pub mod placement;
 pub mod present;
 pub mod roundtrip;
 pub mod router;
@@ -161,6 +162,7 @@ pub use frame_source::{FrameSource, FrameSourceConfig, Hint, SourceStats};
 pub use gpu::{Gpu, GpuError, GpuOptions};
 /// FFmpeg's integer layer geometry (it lives in kerf-core: the plan needs it too).
 pub use kerf_core::layer_geometry as geometry;
+pub use kerf_core::perspective;
 pub use motion::{CursorFeed, MotionFrames, Opened};
 pub use present::{PixelRect, Presenter, Surround};
 pub use selftest::{parity_self_test, SelfTestError, SelfTestReport};

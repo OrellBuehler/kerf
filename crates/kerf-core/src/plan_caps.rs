@@ -120,13 +120,16 @@ pub struct GpuCaps {
     pub keyed_zoom: bool,
     /// A moving zoom or position placed at sub-pixel positions: FFmpeg ends the clip's chain in a
     /// `perspective` that lays the picture on a canvas-sized frame (bilinear, fixed-point; the export,
-    /// the playback stream and the still alike). No compositor draws it yet, so every frame of such a
-    /// layer is refused (`KeyedPlacement`); with it set, the rest of the layer is judged as ever.
+    /// the playback stream and the still alike). A compositor that sets it reproduces `pad`, `perspective`
+    /// and `crop` ([`crate::perspective`]) after the rest of the chain, which it draws at the fit size
+    /// (`keyed_zoom`); without it every frame of such a layer is refused (`KeyedPlacement`). With it set,
+    /// a grade, a rotation, an opacity below 1 and a dip to white ahead of the placement are still refused
+    /// (`ZoomBehind`), and so are an odd-height picture and a pose beyond the table's range (`Geometry`).
     pub placement: bool,
     /// Live behaviours (`Clip.behaviors`: a sway, breath, spin, drift or shake on top of the pose). The
     /// plan carries the exact pose they give at the frame's time, so a compositor that draws the pose
-    /// draws them; no compositor has a parity case for one yet, so every frame of such a layer is
-    /// refused (`Behavior`) until one sets this.
+    /// draws them; every frame of such a layer is refused (`Behavior`) until one sets this, and a sway or a
+    /// spin (which turns the picture: a rotation no compositor draws to the sample) is refused whatever the caps.
     pub behaviors: bool,
     /// Keyframed colour: FFmpeg writes the clip's `eq` per frame (`eval=frame`, an expression
     /// of the frame's time for each keyed number), which a compositor that sets this draws
@@ -332,6 +335,13 @@ pub enum Unsupported {
     /// A moving zoom or position: FFmpeg places the picture on the canvas with a `perspective` at
     /// sub-pixel positions (in the export and the still alike), which no compositor pass draws.
     KeyedPlacement(LayerRef),
+    /// A moving zoom or position on a picture that is not 4:2:0 or gray (the detail names its pixel format, or says it was
+    /// never recorded), or that may be full range where the composite's range is negotiated (the detail says `full-range`):
+    /// the placement chain converts it to `yuva420p` itself, in the graph, where the compositor's decode converted it to
+    /// 8-bit limited-range 4:2:0 ahead of it, and swscale's two paths agree on one FFmpeg and not on the other (the chroma
+    /// of a 4:4:4 picture 24 levels off on 4.4.2, a 4:2:2 one 16, exact on 9.0.2; a full-range picture 3 to 5 levels off in
+    /// a still on 9.0.2, exact on 4.4.2).
+    PlacedFormat(LayerRef, String),
     /// A clip with live behaviours (sway, breathe, spin, drift, shake): the pose each frame is a formula of
     /// the clip's clock added to its keys, which FFmpeg evaluates in the graph and no compositor has a
     /// parity case for.
@@ -417,6 +427,7 @@ impl Unsupported {
             Self::StillMotion(_) => "still_motion",
             Self::KeyedZoom(_) => "keyed_zoom",
             Self::KeyedPlacement(_) => "keyed_placement",
+            Self::PlacedFormat(..) => "placed_format",
             Self::Behavior(_) => "behavior",
             Self::ZoomBehind(..) => "zoom_behind",
             Self::FoldedFit(..) => "folded_fit",
@@ -538,15 +549,19 @@ impl fmt::Display for Unsupported {
             ),
             Self::KeyedPlacement(l) => write!(
                 f,
-                "{l}: a moving zoom or position (a perspective placing the picture at sub-pixel positions, which no compositor pass draws)"
+                "{l}: a moving zoom or position (a perspective placing the picture at sub-pixel positions, which this compositor does not draw)"
+            ),
+            Self::PlacedFormat(l, fmt) => write!(
+                f,
+                "{l}: a moving zoom or position on a {fmt} picture (the placement chain converts it to yuva420p itself, which is not the decode's conversion on every FFmpeg)"
             ),
             Self::Behavior(l) => write!(
                 f,
-                "{l}: live behaviours (a sway, breath, spin, drift or shake FFmpeg evaluates in the graph on top of the clip's keys; no compositor has a parity case for it)"
+                "{l}: live behaviours (a sway, breath, spin, drift or shake FFmpeg evaluates in the graph on top of the clip's keys; drawn only where the compositor says it draws them, and never one that turns the picture)"
             ),
             Self::ZoomBehind(l, what) => write!(
                 f,
-                "{l}: a moving zoom with {what} ahead of it (FFmpeg applies it at the fit size and magnifies the result)"
+                "{l}: a moving zoom or position with {what} ahead of it (FFmpeg applies it at the fit size and places the result)"
             ),
             Self::FoldedFit(l, what) => write!(
                 f,

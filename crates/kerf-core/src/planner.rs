@@ -2102,10 +2102,10 @@ mod tests {
     }
 
     /// A clip's live behaviours are part of the pose the plan carries (`transform_at`, the exact numbers the
-    /// graph's expressions give at that frame), and the flags say what chain the pose is drawn by — but no
-    /// compositor has a parity case for a pose that moves by a formula, so every frame of such a layer is
-    /// refused (`Unsupported::Behavior`) until `GpuCaps::behaviors`, in a still and in an export frame. A
-    /// behaviour that moves nothing is not live: it flags nothing and refuses nothing.
+    /// graph's expressions give at that frame), and the flags say what chain the pose is drawn by. Every frame of
+    /// such a layer is refused (`Unsupported::Behavior`) until `GpuCaps::behaviors`, in a still and in an export frame,
+    /// and a sway or a spin (a rotation) whatever the caps. A behaviour that moves nothing is not live: it flags nothing
+    /// and refuses nothing.
     #[test]
     fn live_behaviours_are_the_pose_the_plan_carries_and_are_refused_until_a_compositor_says_it_draws_them() {
         use crate::model::Behavior;
@@ -2195,8 +2195,9 @@ mod tests {
                     refused.contains(&"behavior"),
                     "{b:?} {mode:?}: no cap draws them yet: {refused:?}"
                 );
-                // With the bit set the pose is judged as any other: a sway and a spin are a keyed rotation, and
-                // the rest are placed at sub-pixel positions, which nothing draws either.
+                // With the bit set the pose is judged as any other: a sway and a spin turn the picture (a keyed rotation,
+                // which no compositor draws to the sample) and stay refused whatever the caps, and the rest are placed
+                // at sub-pixel positions, which the placement draws.
                 let drawn = kinds(
                     &plan,
                     &GpuCaps {
@@ -2204,9 +2205,31 @@ mod tests {
                         ..everything
                     },
                 );
-                assert_eq!(drawn.contains(&"keyed_placement"), places, "{b:?} {mode:?}: {drawn:?}");
-                assert!(!drawn.contains(&"behavior"), "{b:?} {mode:?}: {drawn:?}");
-                assert_eq!(drawn.len(), usize::from(places), "{b:?} {mode:?}: {drawn:?}");
+                if rotation {
+                    assert!(drawn.contains(&"behavior"), "{b:?} {mode:?}: {drawn:?}");
+                    let placed = kinds(
+                        &plan,
+                        &GpuCaps {
+                            behaviors: true,
+                            placement: true,
+                            ..everything
+                        },
+                    );
+                    assert!(placed.contains(&"behavior"), "{b:?} {mode:?}: {placed:?}");
+                } else {
+                    assert!(!drawn.contains(&"behavior"), "{b:?} {mode:?}: {drawn:?}");
+                    assert_eq!(drawn.contains(&"keyed_placement"), places, "{b:?} {mode:?}: {drawn:?}");
+                    assert_eq!(drawn.len(), usize::from(places), "{b:?} {mode:?}: {drawn:?}");
+                    let placed = kinds(
+                        &plan,
+                        &GpuCaps {
+                            behaviors: true,
+                            placement: true,
+                            ..everything
+                        },
+                    );
+                    assert!(placed.is_empty(), "{b:?} {mode:?}: {placed:?}");
+                }
             }
         }
         // A behaviour that moves nothing is not live, and a clip without any is as it was.

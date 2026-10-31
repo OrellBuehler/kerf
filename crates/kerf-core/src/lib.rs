@@ -25,6 +25,7 @@ pub mod mask_plane;
 pub mod media;
 pub mod model;
 pub mod paths;
+pub mod perspective;
 pub mod plan_caps;
 pub mod plan_epoch;
 pub mod planner;

@@ -555,6 +555,7 @@ fn before_transitions() -> GpuCaps {
 fn before_zoom_mask_effects() -> GpuCaps {
     let mut caps = Compositor::CAPS;
     caps.keyed_zoom = false;
+    caps.placement = false;
     caps.mask = false;
     caps.effects = kerf_core::EffectKinds::NONE;
     caps
@@ -656,10 +657,11 @@ fn captioned_cuts_and_transitions_are_drawn_by_the_compositor_where_they_were_re
     }
     // The tutorial: its push-ins are a moving zoom, and one clip adds a feathered mask and a blur to it.
     // A push-in is placed at sub-pixel positions by FFmpeg's `perspective` (the export and the still
-    // alike), which no compositor pass draws: refused, the rest drawn.
+    // alike), which the placement pass draws: the whole cut, the mask and the blur included.
     for mode in ["still", "motion"] {
-        let (_, _, after) = at("T3", mode);
-        assert!(after > 10.0 && after < 20.0, "T3 {mode}: {after}");
+        let (was, before, after) = at("T3", mode);
+        assert!(before < 20.0, "T3 {mode}: {before}");
+        assert!(was < 100.0 && (after - 100.0).abs() < 1e-9, "T3 {mode}: {was} -> {after}");
     }
 }
 

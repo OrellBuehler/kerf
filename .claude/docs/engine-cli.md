@@ -1099,7 +1099,9 @@ so the feature is **only** activated through these forwards — which is what ma
   (where black is 0). **The scrubbed still runs the same placement** (`placement_chain` with the
   sampled zoom, position and travel, no `eval=frame`; `still_clip_chain_graded(.., placement)`), so it
   is the export's frame (`still_rendered.rs`'s dissolve into a zoom, 1 level). The shared builder is
-  `placement_chain`. A held zoom or position keeps its graph.
+  `placement_chain`. A held zoom or position keeps its graph. **`kerf-gpu` draws this chain** (`gpu.md`, "The placement": the pad's sizes, the
+  corners the expressions evaluate to, the filter's matrix and its `lrint` table, the bilinear integer resample: 0 differing samples against both
+  FFmpegs); an odd-height picture, a 4:4:4 / 4:2:2 / RGB one, a grade, rotation, translucency or dip to white ahead of it stay FFmpeg's.
   **Per-property channels in the graph.** A clip's transform is built number by number from
   `Clip::is_keyed`, not from "is it animated": `video_clip_chain` writes a keyed scale as the
   `scale eval=frame` (last, when it moves), a keyed rotation as the `black@0`-filled `rotate`, a keyed

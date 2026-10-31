@@ -123,11 +123,12 @@
 //!   FFmpegs for busy chroma, so none is claimed
 //!   (`resizing_a_picture_ffmpeg_scales_in_another_format_is_refused`). A picture left
 //!   at its size is drawn for every format.
-//! * **A moving zoom is the last stage of FFmpeg's chain** (the still and the export alike), so a
-//!   grade, effects, a mask and the clip's fades act on the picture at its fit size and are magnified
-//!   with it, and the picture is then placed at sub-pixel positions by a `perspective`, which no pass draws:
-//!   refused (`KeyedPlacement`; `a_moving_zoom_is_the_last_stage_of_the_still_too`, `tests/motion_parity.rs`). A rotation and an opacity moving
-//!   over a zoom that holds are drawn (`time/keyframes+rotation+opacity`).
+//! * **A moving zoom or position is the last stage of FFmpeg's chain** (the still and the export alike), so a
+//!   grade, effects, a mask and the clip's fades act on the picture at its fit size, and the picture is then
+//!   placed at sub-pixel positions by `pad`, `perspective` and `crop`, which the compositor reproduces
+//!   (`kerf_core::perspective`): exact, 0 differing samples (`check_exact`, `a_moving_zoom_is_placed_as_the_still_places_it`
+//!   and `tests/motion_parity.rs`, `tests/placement.rs`). A rotation and an opacity moving over a zoom that holds
+//!   are drawn (`time/keyframes+rotation+opacity`); ahead of a placement they are refused (`ZoomBehind`).
 //! * **Masks and effects** (`masks_cut_a_layer_to_a_shape`, `effects_are_drawn_as_their_filters_draw_them`,
 //!   `the_effect_filters_match_ffmpeg_plane_by_plane`): a mask's alpha is `geq`'s, blended per sample (luma)
 //!   and over each 2x2 block's average (chroma) like `overlay`; grayscale, invert, sharpen and vignette are
@@ -146,9 +147,8 @@
 //!   row differ between the two FFmpegs (up to 224 levels of chroma at the bottom row of a frame whose picture
 //!   changes there). `kerf_core::geq_edge()` measures which the build in use does and the compositor draws
 //!   it, so the mask cases hold on both (`a_mask_hands_the_planes_on_as_the_geq_that_clamps_its_read_does`).
-//! * **A dip to white ahead of a moving zoom** is refused: the zoom's `scale` takes the RGB frame the fade
-//!   leaves and converts it in the same pass (up to 14 levels off a draw that scales the converted picture on
-//!   6.1.1, 3 on 9.0.2).
+//! * **A dip to white ahead of a moving zoom or position** is refused (`ZoomBehind`): the fade's RGB round
+//!   trip is not held to FFmpeg's with a placement behind it.
 //! * **A shrink steeper than 40:1** (`kerf_core::MAX_SHRINK`) is refused: past what
 //!   the scaler comparison measures, swscale's x86 vertical scaler drifts further
 //!   from the C arithmetic the shader follows (a 58:1 shrink of a 4K test pattern
@@ -573,15 +573,28 @@ fn media() -> &'static Media {
         // The display matrix is a container property: remux a landscape file.
         let landscape = video("landscape.mp4", "testsrc2=size=640x360:rate=30:duration=2");
         let rotated_path = dir.join("rotated.mp4");
-        ffmpeg(&[
-            "-display_rotation",
-            "90",
-            "-i",
-            landscape.to_str().unwrap(),
-            "-c",
-            "copy",
-            rotated_path.to_str().unwrap(),
-        ]);
+        // (FFmpeg before 6 has no `-display_rotation`: its way to say it is the `rotate` tag.)
+        let modern = Command::new(kerf_core::ffmpeg_path())
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-display_rotation", "90", "-i"])
+            .arg(&landscape)
+            .args(["-c", "copy"])
+            .arg(&rotated_path)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run ffmpeg")
+            .status
+            .success();
+        if !modern {
+            ffmpeg(&[
+                "-i",
+                landscape.to_str().unwrap(),
+                "-c",
+                "copy",
+                "-metadata:s:v:0",
+                "rotate=90",
+                rotated_path.to_str().unwrap(),
+            ]);
+        }
         let jpeg = dir.join("still.jpg");
         ffmpeg(&[
             "-f",
@@ -1081,6 +1094,116 @@ fn check_with(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], limits
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
     maxes
+}
+
+/// [`check`] with **no tolerance**: the compositor's planes (`composite_yuv`: before its own conversion, which is
+/// a level off swscale's by design) taken to RGB by FFmpeg itself, the conversion the still's PNG took, must be the
+/// still's PNG to the sample, every channel of every pixel. Chroma is replicated, not interpolated, by neither, so
+/// one differing plane sample shows in the RGB it reaches (the `control/*` cases hold the harness to that: planes
+/// the compositor draws equal to FFmpeg's, a layer at its own size, give an identical PNG).
+fn check_exact(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64]) {
+    use std::io::Write;
+    let opts = ExportOptions::default();
+    let scratch = Path::new(env!("CARGO_TARGET_TMPDIR")).join("parity-ref");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let slug: String = case
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let mut failures = Vec::new();
+    for &t in times {
+        let plan = RenderPlan::at(tl, assets, &opts, t, policy()).expect("plan");
+        let size = plan.size(u32::MAX);
+        let why = reasons(&plan, size);
+        assert!(
+            why.is_empty(),
+            "{case} @ {t}: the plan says the GPU cannot draw this at {size:?}: {why:?}"
+        );
+        let (w, h) = (size.0 as usize, size.1 as usize);
+        let ref_png = scratch.join(format!("{slug}-{t}.png"));
+        export_still(tl, assets, &opts, t, &ref_png, ImageFormat::Png, 0).expect("FFmpeg still");
+        let reference = ffmpeg(&[
+            "-i",
+            ref_png.to_str().unwrap(),
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "pipe:1",
+        ]);
+        let _ = std::fs::remove_file(&ref_png);
+        assert_eq!(reference.len(), w * h * 3, "{case} @ {t}: the reference is not {w}x{h}");
+        let frames = kerf_gpu::decode_layers(&plan.layers).expect("decode");
+        let planes = compositor()
+            .composite_yuv(&plan, &frames, size)
+            .unwrap_or_else(|e| panic!("{case} @ {t}: {e}"));
+        let matrix = match plan.canvas.matrix {
+            kerf_core::YuvMatrix::Bt601 => "bt601",
+            kerf_core::YuvMatrix::Bt709 => "bt709",
+            kerf_core::YuvMatrix::Bt2020 => "bt2020nc",
+        };
+        let mut child = Command::new(kerf_core::ffmpeg_path())
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuv420p",
+                "-s",
+            ])
+            .arg(format!("{w}x{h}"))
+            .args(["-i", "pipe:0", "-vf", &format!("scale=in_color_matrix={matrix}:in_range=tv")])
+            .args(["-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("run ffmpeg");
+        let mut stdin = child.stdin.take().unwrap();
+        let data: Vec<u8> = [&planes.y, &planes.u, &planes.v].into_iter().flatten().copied().collect();
+        let writer = std::thread::spawn(move || {
+            let _ = stdin.write_all(&data);
+        });
+        let out = child.wait_with_output().expect("ffmpeg output");
+        let _ = writer.join();
+        assert!(out.status.success(), "ffmpeg: {}", String::from_utf8_lossy(&out.stderr));
+        let got = out.stdout;
+        assert_eq!(got.len(), reference.len(), "{case} @ {t}");
+        let differing = got.iter().zip(&reference).filter(|(a, b)| a != b).count();
+        let max = got
+            .iter()
+            .zip(&reference)
+            .map(|(a, b)| (i32::from(*a) - i32::from(*b)).abs())
+            .max()
+            .unwrap_or(0);
+        let line = format!(
+            "{case:<28} t={t:<7} {w}x{h} layers={} exact: differing samples {differing} (max {max})",
+            plan.layers.len()
+        );
+        eprintln!("{line}");
+        report().lock().unwrap().insert(format!("{case} {t:08.4}"), line);
+        if differing != 0 {
+            let out_dir = target_dir().join("parity");
+            std::fs::create_dir_all(&out_dir).unwrap();
+            write_png(&out_dir.join(format!("{slug}-{t}-ref.png")), &reference, w, h);
+            write_png(&out_dir.join(format!("{slug}-{t}-gpu.png")), &got, w, h);
+            failures.push(format!(
+                "{case} @ {t}s: {differing} differing samples, max {max} (images in {})",
+                out_dir.display()
+            ));
+        }
+    }
+    write_report();
+    if std::env::var_os("KERF_PARITY_EXPLORE").is_some() {
+        for f in &failures {
+            eprintln!("WOULD FAIL: {f}");
+        }
+        return;
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
 fn write_report() {
@@ -1947,7 +2070,8 @@ fn source_time_speed_reverse_and_keyframes() {
     let tl = timeline(vec![vec![rev]], None);
     check("time/reversed", &tl, std::slice::from_ref(&m.testsrc), &[0.3, 1.1], STRICT);
 
-    // Keyframed transform: a zoom and a position that move are placed by FFmpeg's `perspective`, refused.
+    // Keyframed transform: a zoom and a position that move are placed by FFmpeg's `perspective`, which the compositor
+    // reproduces (no tolerance).
     let key = |time: f64, scale: f64, pos: (f64, f64), rotation: f64, opacity: f64| Keyframe {
         easing: Default::default(),
         time,
@@ -2120,11 +2244,9 @@ fn busy_sources_are_held_to_the_scaler_not_to_a_flat_region() {
 }
 
 /// A moving zoom or position: FFmpeg's still places the picture at sub-pixel positions (a `perspective`, as
-/// the export does), which no compositor pass draws, so the plan refuses it at each of `times`.
+/// the export does), which the compositor reproduces (`kerf_core::perspective`, `placement.wgsl`): exact.
 fn check_placed(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64]) {
-    for t in times {
-        check_refused(case, tl, assets, *t, Refusal::Plan("a moving zoom or position"));
-    }
+    check_exact(case, tl, assets, times);
 }
 
 /// What a refused frame must be refused for.
@@ -4435,11 +4557,13 @@ fn a_mask(shape: kerf_core::MaskShape, feather: f64, inverted: bool) -> kerf_cor
 }
 
 /// The still runs a moving zoom as the last stage of the clip's chain, like the export: the placement's
-/// `perspective`, after what is in front of it (a grade, a mask, an effect, the clip's fades). No
-/// compositor pass draws it, so every case is refused and FFmpeg renders it.
+/// `perspective`, after what is in front of it (a grade, a mask, an effect, the clip's fades). The compositor
+/// draws that order and reproduces the placement, so every case is exact (`check_exact`: the planes, taken to
+/// RGB by FFmpeg, are the still's PNG to the sample); only a blur, which is `gblur`'s float recursion that
+/// FFmpeg itself computes differently on an AVX2 build, and the scaler's own Cover fit are judged by `STRICT`.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
-fn a_moving_zoom_is_the_last_stage_of_the_still_too() {
+fn a_moving_zoom_is_placed_as_the_still_places_it() {
     use kerf_core::VideoEffect as E;
     let m = media();
     let assets = [m.bars.clone(), m.testsrc.clone()];
@@ -4450,6 +4574,13 @@ fn a_moving_zoom_is_the_last_stage_of_the_still_too() {
         edit(&mut z);
         timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![z]], None)
     };
+    // The harness itself: a layer drawn at its own size is the PNG exactly.
+    check_exact(
+        "control/plain",
+        &timeline(vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)]], None),
+        std::slice::from_ref(&m.testsrc),
+        &[0.5, 1.2],
+    );
     check_placed("zoom/plain", &zooming(&|_| {}), &assets, &times);
     check_placed(
         "zoom/out with position",
@@ -4482,7 +4613,6 @@ fn a_moving_zoom_is_the_last_stage_of_the_still_too() {
         &times,
     );
     for (name, effect) in [
-        ("blur", E::Blur { sigma: 5.0 }),
         ("sharpen", E::Sharpen { amount: 1.5 }),
         ("grayscale", E::Grayscale),
         ("invert", E::Invert),
@@ -4494,6 +4624,13 @@ fn a_moving_zoom_is_the_last_stage_of_the_still_too() {
             &times,
         );
     }
+    check(
+        "zoom+blur",
+        &zooming(&|c| c.effects = vec![E::Blur { sigma: 5.0 }]),
+        &assets,
+        &times,
+        STRICT,
+    );
     // The tutorial's clip: a feathered mask over a blurred picture, in a Cover frame, zooming in.
     let mut z = clip(&m.testsrc, 0.0, 2.0, 0.0);
     z.keyframes = zoom_keys(1.0, 1.25, (-0.05, 0.0));
@@ -4503,7 +4640,7 @@ fn a_moving_zoom_is_the_last_stage_of_the_still_too() {
         vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![z]],
         Some(Delivery::new(960, 540, Fit::Cover)),
     );
-    check_placed("zoom+mask+blur cover", &tl, &assets, &times);
+    check("zoom+mask+blur cover", &tl, &assets, &times, STRICT);
     // A fade-in running at the moment of the still: faded at the fit size, then zoomed.
     check_placed("zoom+fade-in", &zooming(&|c| c.fade_in = 1.0), &assets, &[0.6, 0.9, 1.2]);
     // A dissolve into a zooming, masked clip.
@@ -4517,6 +4654,194 @@ fn a_moving_zoom_is_the_last_stage_of_the_still_too() {
     });
     let tl = timeline(vec![vec![out, inc]], None);
     check_placed("zoom/dissolve+mask", &tl, &assets, &[1.1, 1.3, 1.5]);
+}
+
+/// Pictures of other shapes than the frame, at the size the fit leaves them (no resize, so no scaler): a 4:3 clip in a
+/// 16:9 frame (480x360) and a picture of an odd width (203x360, cut with `crop ... exact=1`: `testsrc2` makes even sides).
+fn shapes() -> &'static (Asset, Asset) {
+    static S: OnceLock<(Asset, Asset)> = OnceLock::new();
+    S.get_or_init(|| {
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("parity-media-shapes");
+        std::fs::create_dir_all(&dir).unwrap();
+        let make = |name: &str, source: &str, crop: &str| -> Asset {
+            let p = dir.join(name);
+            ffmpeg(&[
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("testsrc2=size={source}:rate=30:duration=2,{crop},setparams=colorspace=unknown:color_primaries=unknown:color_trc=unknown"),
+                "-c:v",
+                "ffv1",
+                "-pix_fmt",
+                "yuv420p",
+                p.to_str().unwrap(),
+            ]);
+            probed(&p)
+        };
+        (
+            make("pillar.mkv", "480x360", "null"),
+            make("odd-width.mkv", "204x360", "crop=w=203:h=360:x=0:y=0:exact=1"),
+        )
+    })
+}
+
+/// A moving zoom and position over a picture of another shape, and one of another format or colour tag, in a still:
+/// the placement is the same chain, and its pad, fringe and conversion are held exactly (`check_exact`). A 4:4:4 or 4:2:2
+/// picture is refused (`PlacedFormat`, `tests/motion_parity.rs`: swscale's in-graph conversion is not the decode's on 4.4.2),
+/// an odd height too (`pad` keeps or loses its last row by how the graph allocated the frame).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_placed_picture_of_another_shape_or_format_is_placed_as_the_still_places_it() {
+    let m = media();
+    let (pillar, odd_width) = shapes();
+    // (Not 0.5: the clip starts there, at the identity pose, and a letterboxed picture at the identity pose is padded to the
+    // whole frame by the still before the placement, which is refused: see below.)
+    let times = [0.8, 1.2, 1.75];
+    let over = |under: &Asset, asset: &Asset, from: f64, to: f64, pos: (f64, f64)| {
+        let mut z = clip(asset, 0.0, 2.0, 0.5);
+        z.keyframes = zoom_keys(from, to, pos);
+        (
+            timeline(vec![vec![clip(under, 0.0, 2.0, 0.0)], vec![z]], None),
+            [under.clone(), asset.clone()],
+        )
+    };
+    for (name, asset) in [("pillarboxed 480x360", pillar), ("odd width 203x360", odd_width)] {
+        for (case, from, to, pos) in [
+            ("zoom in", 1.0, 1.5, (0.0, 0.0)),
+            ("zoom out", 1.0, 0.6, (0.1, -0.05)),
+            ("pan", 1.0, 1.001, (-0.3, 0.2)),
+        ] {
+            let (tl, assets) = over(&m.bars, asset, from, to, pos);
+            check_placed(&format!("shape/{name}/{case}"), &tl, &assets, &times);
+        }
+        let (tl, assets) = over(&m.bars, asset, 1.0, 1.5, (0.0, 0.0));
+        check_refused(
+            &format!("shape/{name}/at the identity pose"),
+            &tl,
+            &assets,
+            0.5,
+            Refusal::Plan("a letterboxed picture at the identity pose"),
+        );
+    }
+    // The format, the range and the matrix tag: drawn where the plan draws them (what the composite colour policy
+    // refuses for the cut is refused), refused as `PlacedFormat` for another layout.
+    let times = [0.5, 1.0, 1.75];
+    let cases: [(&str, &Asset, &Asset); 9] = [
+        ("8-bit", &m.testsrc, &m.bars),
+        ("10-bit", &m.tenbit, &m.bars),
+        ("10-bit full range", &m.tenbit_pc, &m.bars),
+        ("gray", &m.gray, &m.bars),
+        ("full-range yuvj420p", &m.fullrange, &m.bars),
+        ("bt709 over bt709", &m.testsrc709, &m.bars709),
+        ("smpte170m", &m.testsrc170m, &m.bars),
+        ("bt470bg", &m.testsrc, &m.bars470bg),
+        ("bt2020 over bt2020", &m.testsrc2020, &m.bars2020),
+    ];
+    for (name, asset, under) in cases {
+        let (tl, assets) = over(under, asset, 1.0, 1.6, (0.0, 0.0));
+        let plan = RenderPlan::at(&tl, &assets, &ExportOptions::default(), 1.0, policy()).expect("plan");
+        let why = reasons(&plan, plan.size(u32::MAX));
+        let case = format!("format/{name}");
+        if why.is_empty() {
+            check_placed(&case, &tl, &assets, &times);
+        } else {
+            let policy_says = [
+                "holds a full-range picture",
+                "different YCbCr matrices",
+                "matrices",
+                "full-range",
+                "BT.2020",
+            ];
+            assert!(
+                why.iter().all(|w| policy_says.iter().any(|p| w.contains(p))),
+                "{case}: refused for something else: {why:?}"
+            );
+            eprintln!("{case}: refused for the composite colour policy of this FFmpeg: {why:?}");
+        }
+    }
+    for (name, asset) in [("yuv444p", &m.yuv444), ("yuv422p", &m.yuv422)] {
+        let (tl, assets) = over(&m.bars, asset, 1.0, 1.6, (0.0, 0.0));
+        check_refused(
+            &format!("format/{name}"),
+            &tl,
+            &assets,
+            1.0,
+            Refusal::Plan("a moving zoom or position on a"),
+        );
+    }
+    // A slide into a zooming clip, a position that moves alone, the travel of a push.
+    for (name, kind) in [("slide", TransitionKind::SlideLeft), ("push", TransitionKind::PushRight)] {
+        let out = clip(&m.bars, 0.0, 2.0, 0.0);
+        let mut inc = clip(&m.testsrc, 0.0, 2.0, 1.0);
+        inc.keyframes = zoom_keys(1.0, 1.4, (0.0, 0.0));
+        inc.transition_in = Some(Transition { kind, duration: 0.6 });
+        let tl = timeline(vec![vec![out, inc]], None);
+        check_placed(
+            &format!("transition/{name}"),
+            &tl,
+            &[m.bars.clone(), m.testsrc.clone()],
+            &[1.1, 1.3, 1.5],
+        );
+    }
+    let (mut moving, assets) = over(&m.bars, &m.testsrc, 1.0, 1.0, (0.0, 0.0));
+    moving.tracks[1].clips[0].keyframes = vec![
+        Keyframe {
+            easing: Default::default(),
+            time: 0.0,
+            scale: 1.0,
+            pos_x: -0.3,
+            pos_y: 0.1,
+            rotation: 0.0,
+            opacity: 1.0,
+        },
+        Keyframe {
+            easing: Default::default(),
+            time: 1.5,
+            scale: 1.0,
+            pos_x: 0.25,
+            pos_y: -0.15,
+            rotation: 0.0,
+            opacity: 1.0,
+        },
+    ];
+    check_placed("position/over bars", &moving, &assets, &times);
+}
+
+/// A live breath, drift or shake in a still: the pose the plan carries at the moment is what the still's graph prints, and
+/// the placement is the same pass.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn live_breath_drift_and_shake_are_placed_as_the_still_places_them() {
+    use kerf_core::Behavior as B;
+    let m = media();
+    let assets = [m.bars.clone(), m.testsrc.clone()];
+    let breathe = B::Breathe {
+        amount: 0.15,
+        speed: 1.3,
+        phase: 0.2,
+    };
+    let drift = B::Drift {
+        speed: 0.2,
+        angle: 30.0,
+        phase: 0.1,
+    };
+    let shake = B::Shake {
+        amount: 0.03,
+        speed: 2.5,
+        seed: 7,
+        phase: 0.0,
+    };
+    for (name, behaviors) in [
+        ("breathe", vec![breathe]),
+        ("drift", vec![drift]),
+        ("shake", vec![shake]),
+        ("all three", vec![breathe, drift, shake]),
+    ] {
+        let mut c = clip(&m.testsrc, 0.0, 2.0, 0.5);
+        c.behaviors = behaviors;
+        let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![c]], None);
+        check_placed(&format!("behavior/{name}"), &tl, &assets, &[0.6, 1.0, 1.37, 1.9]);
+    }
 }
 
 /// A mask in a still: the alpha `geq` writes, blended by `overlay` (luma per sample; chroma over the
