@@ -63,7 +63,7 @@
 	import { applyProposal, discardProposal } from '#lib/proposal-actions';
 	import { PREVIEW_READ_ONLY_REASON, proposalLine, touchedOnLive } from '#lib/proposal-ui';
 	import { displayTracks, opensAudioGroup } from '#lib/track-order';
-	import { NUDGE_QUIET_MS, nudgeFrames, nudgedStart } from '#lib/nudge';
+	import { NUDGE_QUIET_MS, nudgeFrames, nudgePlan } from '#lib/nudge';
 	import {
 		CUT_REACH_PX,
 		cutsOf,
@@ -448,9 +448,7 @@
 	const dragPlan = $derived.by((): MovePlan | null => {
 		const d = drag;
 		if (d?.moved) return planMove(drawnMoveTracks(editor.timeline), d.members, d.clipId, d.start, d.trackId, { links: !alt });
-		const n = nudge;
-		if (n && nudgeAt !== null) return planMove(drawnMoveTracks(editor.timeline), n.members, n.clipId, nudgeAt, n.trackId, { links: !n.alone });
-		return null;
+		return nudgeView?.plan ?? null;
 	});
 	/** A run of arrow-key nudges on a focused clip: drawn where the clip will land, as a drag is, and
 	 *  written as one edit once the keys go quiet (`nudge.ts`). */
@@ -469,10 +467,11 @@
 	};
 	let nudge = $state<Nudge | null>(null);
 	let nudgeTimer: ReturnType<typeof setTimeout> | null = null;
+	/** What the run would do (`nudgePlan`: from the run and the cut alone — never the drag's position, which a press that
+	 *  begins a drag while the keys are quiet would otherwise hand the run). */
+	const nudgeView = $derived.by(() => (nudge ? nudgePlan(editor.timeline, nudge, fps) : null));
 	/** Where the grabbed clip of the run would stand. */
-	const nudgeAt = $derived.by(() =>
-		nudge ? nudgedStart(nudge.origStart, nudge.dur, nudge.frames, clipEdges(nudge.trackId, nudge.members), fps) : null
-	);
+	const nudgeAt = $derived(nudgeView?.at ?? null);
 	/** Ghosts by the track each is on. */
 	function byTrack<G extends { trackId: string }>(ghosts: readonly G[]): Map<string, G[]> {
 		const m = new Map<string, G[]>();
@@ -597,6 +596,7 @@
 	function onEdgePointerDown(e: PointerEvent, c: Clip, t: Track, edge: 'l' | 'r') {
 		if (e.button !== 0 || ui.tool !== 'pointer') return; // the other tools own the clip body
 		if (t.locked) return;
+		settleNudge();
 		e.stopPropagation();
 		alt = e.altKey;
 		editor.selectClip(c.id, 'replace', e.altKey);
@@ -787,6 +787,7 @@
 
 	function onClipPointerDown(e: PointerEvent, c: Clip, t: Track) {
 		if (e.button !== 0) return;
+		settleNudge();
 		const lane = (e.currentTarget as HTMLElement).closest('[data-lane]') as HTMLElement | null;
 		const laneLeft = lane?.getBoundingClientRect().left ?? 0;
 		const mode = pickMode(e);
@@ -1241,13 +1242,19 @@
 		nudge = null;
 	}
 
+	/** A press is about to begin a gesture of its own: a run of nudges still waiting for its keys to go quiet is written
+	 *  first, as the run it is, so the press's drag or trim never stands in for it. */
+	function settleNudge() {
+		if (nudge && !nudge.writing) commitNudge();
+	}
+
 	/** Write the run as ONE move — the plan is the drag's own, so ripple-free placement, links and
 	 *  the lane checks are the same — and keep it drawn until the timeline has come back. */
 	function commitNudge() {
 		const n = nudge;
 		if (!n || n.writing) return;
 		clearNudgeTimer();
-		const plan = dragPlan;
+		const plan = nudgeView?.plan;
 		if (!plan || plan.noop) {
 			nudge = null;
 			return;
@@ -1556,6 +1563,7 @@
 	}
 
 	function beginTrimTool(e: PointerEvent, c: Clip, t: Track, laneLeft: number) {
+		settleNudge();
 		const tool = ui.tool as TrimTool;
 		alt = e.altKey;
 		const pressTime = laneTime(e.clientX, laneLeft);
@@ -1736,6 +1744,7 @@
 		if (e.button !== 0 || ui.tool !== 'pointer' || !empty) return;
 		const box = lanesEl?.getBoundingClientRect();
 		if (!box) return;
+		settleNudge();
 		const x = e.clientX - box.left;
 		const y = e.clientY - box.top;
 		marquee = {
@@ -2518,6 +2527,7 @@
 
 	function onTitlePointerDown(e: PointerEvent, o: TextOverlay | SvgOverlay, mode: 'move' | 'l' | 'r', kind: 'text' | 'svg' = 'text') {
 		if (e.button !== 0) return;
+		settleNudge();
 		e.stopPropagation();
 		if (kind === 'svg') editor.selectSvgOverlay(o.id);
 		else editor.selectOverlay(o.id);

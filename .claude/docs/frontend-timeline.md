@@ -330,7 +330,9 @@ wait names the clip, not the build's progress, which the bar is not asked again 
 **A clip with the keyboard focus nudges**: ← / → move it (and the selection it is part of) a frame, ⇧ a second, Alt leaves its
 linked partners (`nudge.ts`). A run of presses is one edit, written once the keys go quiet (450 ms), on Enter or when focus
 leaves; until then the clip is drawn where it will land as a drag is (the plan is `planMove`'s, so overlaps, locks and links
-are the drag's), Escape abandons it, and the undo key (`settings.actionFor(e) === 'edit.undo'`) during an unwritten run takes the
+are the drag's — `nudge.ts` `nudgePlan`, from the run and the cut alone, never the drag's pointer: a press on a clip, an edge,
+a title, the empty lanes or a roll / slip / slide tool writes a waiting run first, `settleNudge`, or the quiet timer would have
+written the drag's half-way position as the nudge), Escape abandons it, and the undo key (`settings.actionFor(e) === 'edit.undo'`) during an unwritten run takes the
 run back, not the edit before it (redo drops the run and goes on). A move the backend would refuse is said in a toast.
 **Track order is drawn, not stored**: the lanes and headers show the video group highest layer first, then the audio
 (`track-order.ts` `displayTracks`: V3, V2, V1, A1, A2 — a later video track composites on top, and now it is drawn on top), with

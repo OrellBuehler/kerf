@@ -5,6 +5,9 @@
  * yet; until then the clip is drawn where it will land, as a drag draws it. */
 
 import { frameIndex, frameTime, quantizeSpanStart } from './frames';
+import { drawnMoveTracks, planMove, type MovePlan } from './multi-move';
+import type { Timeline } from './types';
+import { clipDuration } from './types';
 
 /** How long the keys stay quiet before the run is written, ms. */
 export const NUDGE_QUIET_MS = 450;
@@ -26,4 +29,38 @@ export function nudgeFrames(key: string, shift: boolean, fps: number): number | 
 export function nudgedStart(origStart: number, dur: number, frames: number, edges: readonly number[], fps: number): number {
 	const to = frameTime(frameIndex(origStart, fps) + frames, fps);
 	return quantizeSpanStart(to, dur, { fps, welds: edges });
+}
+
+/** A run of nudges as the timeline holds it: the clip that has the keyboard, the clips that go with
+ *  it (the selection it is part of), where they stood and how many frames the keys have asked for. */
+export interface NudgeRun {
+	clipId: string;
+	trackId: string;
+	members: ReadonlySet<string>;
+	origStart: number;
+	dur: number;
+	frames: number;
+	/** Alt was down: the clip alone, its linked partners left where they are. */
+	alone: boolean;
+}
+
+/** The other clips' edges on a lane — the neighbours a nudge welds to. */
+export function laneEdges(timeline: Timeline, trackId: string, except: ReadonlySet<string>): number[] {
+	const out: number[] = [];
+	for (const c of timeline.tracks.find((t) => t.id === trackId)?.clips ?? []) {
+		if (!except.has(c.id)) out.push(c.timeline_start, c.timeline_start + clipDuration(c));
+	}
+	return out;
+}
+
+/**
+ * What a run of nudges would do, from the run and the cut alone: where the grabbed clip stands (`at`)
+ * and the drag's own plan for it (`planMove`: lanes, locks, links, overlaps), so the ghost and the one
+ * `move_clips` the run is written as are the same. It reads no pointer: a press that began a drag
+ * while the keys were still quiet must not be able to hand the run the drag's half-way position.
+ */
+export function nudgePlan(timeline: Timeline, run: NudgeRun, fps: number): { at: number; plan: MovePlan } {
+	const at = nudgedStart(run.origStart, run.dur, run.frames, laneEdges(timeline, run.trackId, run.members), fps);
+	const plan = planMove(drawnMoveTracks(timeline), run.members, run.clipId, at, run.trackId, { links: !run.alone });
+	return { at, plan };
 }
