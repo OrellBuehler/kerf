@@ -123,6 +123,11 @@ pub struct GpuCaps {
     /// the playback stream and the still alike). No compositor draws it yet, so every frame of such a
     /// layer is refused (`KeyedPlacement`); with it set, the rest of the layer is judged as ever.
     pub placement: bool,
+    /// Live behaviours (`Clip.behaviors`: a sway, breath, spin, drift or shake on top of the pose). The
+    /// plan carries the exact pose they give at the frame's time, so a compositor that draws the pose
+    /// draws them; no compositor has a parity case for one yet, so every frame of such a layer is
+    /// refused (`Behavior`) until one sets this.
+    pub behaviors: bool,
     /// Keyframed colour: FFmpeg writes the clip's `eq` per frame (`eval=frame`, an expression
     /// of the frame's time for each keyed number), which a compositor that sets this draws
     /// from the numbers an export frame's plan carries (`PlanLayer::color`: those expressions
@@ -153,6 +158,7 @@ impl GpuCaps {
         keyed_opacity: false,
         keyed_zoom: false,
         placement: false,
+        behaviors: false,
         keyed_color: false,
         mask: false,
         text: false,
@@ -326,6 +332,10 @@ pub enum Unsupported {
     /// A moving zoom or position: FFmpeg places the picture on the canvas with a `perspective` at
     /// sub-pixel positions (in the export and the still alike), which no compositor pass draws.
     KeyedPlacement(LayerRef),
+    /// A clip with live behaviours (sway, breathe, spin, drift, shake): the pose each frame is a formula of
+    /// the clip's clock added to its keys, which FFmpeg evaluates in the graph and no compositor has a
+    /// parity case for.
+    Behavior(LayerRef),
     /// A moving zoom with something in front of it that the compositor does not draw in FFmpeg's
     /// order (the detail says what): FFmpeg applies those to the picture at its fit size and
     /// magnifies the result.
@@ -407,6 +417,7 @@ impl Unsupported {
             Self::StillMotion(_) => "still_motion",
             Self::KeyedZoom(_) => "keyed_zoom",
             Self::KeyedPlacement(_) => "keyed_placement",
+            Self::Behavior(_) => "behavior",
             Self::ZoomBehind(..) => "zoom_behind",
             Self::FoldedFit(..) => "folded_fit",
             Self::Text => "text",
@@ -528,6 +539,10 @@ impl fmt::Display for Unsupported {
             Self::KeyedPlacement(l) => write!(
                 f,
                 "{l}: a moving zoom or position (a perspective placing the picture at sub-pixel positions, which no compositor pass draws)"
+            ),
+            Self::Behavior(l) => write!(
+                f,
+                "{l}: live behaviours (a sway, breath, spin, drift or shake FFmpeg evaluates in the graph on top of the clip's keys; no compositor has a parity case for it)"
             ),
             Self::ZoomBehind(l, what) => write!(
                 f,

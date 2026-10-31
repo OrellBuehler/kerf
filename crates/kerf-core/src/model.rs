@@ -3450,6 +3450,12 @@ pub struct Clip {
     /// file, for every clip that is not stabilized.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stabilize: Option<Stabilize>,
+    /// Procedural motion layered on the pose ([`Behavior`]): a sway, a breath, a spin, a drift or a
+    /// shake, each a closed-form function of clip-local time that is added to the clip's scale,
+    /// position or rotation on top of its static transform and its keys. Empty, and absent from the
+    /// file, for every clip that has none, so every stored timeline and every graph is byte-identical.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub behaviors: Vec<Behavior>,
 }
 
 fn yes() -> bool {
@@ -3499,6 +3505,7 @@ impl Clip {
             source_audio: true,
             generator: None,
             stabilize: None,
+            behaviors: Vec::new(),
         }
     }
 
@@ -3533,9 +3540,10 @@ impl Clip {
     }
 
     /// True when any number of the clip's transform is keyed (the bundle's keys or a
-    /// property's own track), i.e. the picture is animated.
+    /// property's own track) or moved by a live behaviour ([`Clip::behaves`]), i.e. the picture is
+    /// animated.
     pub fn is_animated(&self) -> bool {
-        Property::TRANSFORM.iter().any(|p| self.is_keyed(*p))
+        Property::TRANSFORM.iter().any(|p| self.is_driven(*p))
     }
 
     /// True when the keyframes move the clip's *scale*, i.e. the picture the
@@ -3554,6 +3562,7 @@ impl Clip {
         let keys = self.property_keys(Property::Scale);
         keys.first()
             .is_some_and(|first| keys.iter().any(|k| (k.value - first.value).abs() > 1e-9))
+            || self.behaves(Property::Scale)
     }
 
     /// True when the keyframes move the clip's zoom or its position: where the picture lands on
@@ -3566,7 +3575,12 @@ impl Clip {
             keys.first()
                 .is_some_and(|first| keys.iter().any(|k| (k.value - first.value).abs() > 1e-9))
         };
-        moves(Property::Scale) || moves(Property::PosX) || moves(Property::PosY)
+        moves(Property::Scale)
+            || moves(Property::PosX)
+            || moves(Property::PosY)
+            || self.behaves(Property::Scale)
+            || self.behaves(Property::PosX)
+            || self.behaves(Property::PosY)
     }
 
     /// The zoom the clip holds still at: its static scale, or the one value a keyed scale
@@ -3575,7 +3589,7 @@ impl Clip {
         if self.zoom_animated() {
             None
         } else if self.is_keyed(Property::Scale) {
-            Some(self.property_at(Property::Scale, 0.0))
+            Some(self.base_at(Property::Scale, 0.0))
         } else {
             Some(self.transform.scale)
         }
@@ -3624,8 +3638,15 @@ impl Clip {
 
     /// The furthest the picture is ever moved from the centre, as a fraction of the frame width
     /// and of its height: the static position, or the greatest value of a keyed one's curve (the
-    /// polyline every renderer draws, so its extremes are its points).
+    /// polyline every renderer draws, so its extremes are its points), and as far again as the
+    /// behaviours can throw it over the clip ([`Clip::pan_extent_over`]).
     pub fn pan_extent(&self) -> (f64, f64) {
+        self.pan_extent_over(self.duration())
+    }
+
+    /// [`Clip::pan_extent`] for a clip drawn over `horizon` seconds of its own clock (a clip kept
+    /// past its end under a transition is drawn longer than it is): a drift keeps moving.
+    pub fn pan_extent_over(&self, horizon: f64) -> (f64, f64) {
         let reach = |prop: Property| {
             if self.is_keyed(prop) {
                 self.property_curve(prop).iter().fold(0.0_f64, |m, p| m.max(p.1.abs()))
@@ -3633,7 +3654,8 @@ impl Clip {
                 self.static_value(prop).abs()
             }
         };
-        (reach(Property::PosX), reach(Property::PosY))
+        let (bx, by) = self.behavior_reach(horizon);
+        (reach(Property::PosX) + bx, reach(Property::PosY) + by)
     }
 
     /// The clip's keyframes sorted by time (the stored order is kept sorted by
@@ -3680,8 +3702,9 @@ impl Clip {
     /// Sample the (possibly animated) transform at `local` seconds from the
     /// clip's start: the static [`Transform`] with its animatable numbers
     /// (scale / position / rotation / opacity) overridden by the interpolated
-    /// value of every one that is keyed ([`Clip::property_at`]). Used by the still / preview
-    /// path, which cannot evaluate the export's per-frame expressions.
+    /// value of every one that is keyed ([`Clip::property_at`]), with the clip's live behaviours
+    /// applied on top. Used by the still / preview path, which cannot evaluate the export's per-frame
+    /// expressions. An edit that writes keys samples [`Clip::base_transform_at`] instead.
     pub fn transform_at(&self, local: f64) -> Transform {
         let mut t = self.transform;
         if !self.is_animated() {
@@ -3866,7 +3889,8 @@ impl Clip {
     fn rebase_animation(&mut self, by: f64) {
         if by > 0.0 {
             if !self.keyframes.is_empty() {
-                let pose = self.transform_at(by);
+                // (The keys' pose, not the behaviours': those carry on by their own clock, below.)
+                let pose = self.base_transform_at(by);
                 let mut kfs = vec![Keyframe::from_transform(0.0, &pose)];
                 // Cut inside an eased segment: the rest of it is kept exactly. A hold keeps
                 // holding to the next key; a curve's remaining pieces become plain keys (the
@@ -3922,6 +3946,7 @@ impl Clip {
         }
         if by != 0.0 {
             self.rebase_channels(by);
+            self.rebase_behaviors(by);
             self.rebase_ramp(by);
         }
     }
@@ -5330,6 +5355,7 @@ impl Timeline {
     }
 }
 
+mod behavior;
 mod channels;
 mod motion;
 mod ramp_edit;
@@ -5339,6 +5365,10 @@ mod ramp_link_tests;
 mod ramp_tests;
 mod speed_ramp;
 mod stabilize;
+pub use behavior::{
+    check_behaviors, shake_phase, Baked, Behavior, BehaviorKind, Wave, MAX_BEHAVIORS, MAX_BEHAVIOR_HZ, MAX_BEHAVIOR_PHASE,
+    MAX_BREATHE, MAX_DRIFT, MAX_SHAKE, MAX_SPIN_TURNS, MAX_SWAY_DEGREES,
+};
 use channels::channel_changes;
 pub use channels::{key_polyline, Property, PropertyKey, PropertyTrack, MAX_CHANNEL_VOLUME};
 pub use motion::{
@@ -6969,6 +6999,7 @@ fn clip_changes(before: &Clip, after: &Clip) -> Option<String> {
         }
     }
     parts.extend(channel_changes(before, after));
+    parts.extend(behavior::behavior_changes(before, after));
     parts.extend(reframe_changes(before.reframe.as_ref(), after.reframe.as_ref()));
     if before.mask != after.mask {
         parts.push(match &after.mask {

@@ -259,3 +259,13 @@
   `stabilize-deshake`, `stabilize-proxy` (a proxy's slice scaled to 0.6667), `stabilize-4k` (a 4K original's, scaled by 2),
   `stabilize-hdr` (tone-mapped before it is steadied) and their `still-` / `preview-` forms. The order of the appended families
   is speed ramps, noise reduction (84–87), blend modes (88–91), stabilization (92–95).
+- **Live behaviours** (`behavior_for`; `core-model.md`), **appended, nothing re-blessed**: the 400 cases after the moving-still ones
+  (`BEHAVIOR_FIRST`, blocks 100–103, its dice on `8 << 40`, seeded by the case and the clip) draw from the same generator (with the
+  channel family's channels) and give 75 % of the clips on video tracks one to three behaviours of the five kinds, from fixed decimals
+  (the text is the same on every machine), now and then one that moves nothing (amount 0, which the graph leaves out); the first still of
+  each case is in the middle of its first clip with a live behaviour (`behavior_still`, no dice). `git diff` of the four digest files
+  (`parts.txt` included) is **16 insertions, 0 deletions**, so the first 10000 per-case digests are the ones the commit before gave. Structural
+  families `behavior-sway`, `behavior-spin` (a live one of the kind and `rotate=a='` in the export), `behavior-breathe` (`)*(1+`),
+  `behavior-drift` (`*PI/180)*`), `behavior-shake` (`0.5*sin(2*PI*`), `behavior-on-keys` (a behaviour on a keyed number),
+  `behavior-neutral` (one that moves nothing is in the list and not in the argv), `still-behavior` and `preview-behavior`. The ken-burns
+  range now ends at `BEHAVIOR_FIRST` instead of `TOTAL`.

@@ -489,6 +489,12 @@ pub struct Animated {
     /// and the FFmpeg still place the picture on the canvas with a `perspective` at sub-pixel
     /// positions, which no compositor pass draws, so every frame of it is refused.
     pub places: bool,
+    /// The clip has a live behaviour ([`Clip::has_behaviors`]: a sway, breath, spin, drift or shake on
+    /// top of its pose). The plan samples the exact pose it draws ([`PlanLayer::transform`], the
+    /// behaviours included) and the other flags here say what the pose's chain is, but no compositor
+    /// has a parity case for a pose that moves by a formula, so every frame of such a layer is refused
+    /// (`Unsupported::Behavior`) until it sets `GpuCaps::behaviors`.
+    pub behaves: bool,
 }
 
 /// What a clip's transitions and fades do to one layer at this frame, **per layer
@@ -1395,6 +1401,9 @@ impl RenderPlan {
             }
             if layer.animated.is_some_and(|a| a.places) && !caps.placement {
                 out.push(Unsupported::KeyedPlacement(at()));
+            }
+            if layer.animated.is_some_and(|a| a.behaves) && !caps.behaviors {
+                out.push(Unsupported::Behavior(at()));
             }
             // The graph fits and zooms in one `scale` from the source; the compositor's geometry (and
             // `LayerGeometry`, which the Preview's handles are placed by) still fits to the frame and

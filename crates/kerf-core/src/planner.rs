@@ -312,12 +312,12 @@ impl Planner {
                 animated: (clip.is_animated() || clip.color_animated() || clip.mask_animated() || clip.crop_animated()).then(
                     || Animated {
                         keys: clip.is_animated().then(|| Keyed {
-                            scale: clip.is_keyed(Property::Scale),
-                            rotation: clip.is_keyed(Property::Rotation),
-                            rotates: clip.property_keys(Property::Rotation).iter().any(|k| k.value != 0.0),
+                            scale: clip.is_driven(Property::Scale),
+                            rotation: clip.is_driven(Property::Rotation),
+                            rotates: clip.rotation_turns(),
                             opacity: clip.is_keyed(Property::Opacity),
                         }),
-                        rotates: clip.property_keys(Property::Rotation).iter().any(|k| k.value != 0.0),
+                        rotates: clip.rotation_turns(),
                         opacity: clip.property_keys(Property::Opacity).iter().any(|k| k.value < 1.0),
                         zooms: clip.zoom_animated(),
                         color: clip.color_animated(),
@@ -325,6 +325,7 @@ impl Planner {
                         crop: clip.crop_animated(),
                         still_motion: clip.picture_moves() && facts.get(&clip.asset_id).is_some_and(|a| a.is_image),
                         places: clip.placement_animated(),
+                        behaves: clip.has_behaviors(),
                     },
                 ),
                 effects,
@@ -1717,6 +1718,7 @@ mod tests {
             keyed_opacity: true,
             keyed_zoom: true,
             placement: false,
+            behaviors: false,
             keyed_color: true,
             mask: true,
             text: true,
@@ -1934,6 +1936,7 @@ mod tests {
             keyed_opacity: true,
             keyed_zoom: true,
             placement: false,
+            behaviors: false,
             keyed_color: true,
             mask: true,
             text: true,
@@ -2096,6 +2099,134 @@ mod tests {
         };
         let plan = planner(&tl, &assets, PlanMode::Motion, &opts(30.0)).at_frame(15).unwrap();
         assert!(plan.reasons(&caps, plan.size(u32::MAX)).is_empty());
+    }
+
+    /// A clip's live behaviours are part of the pose the plan carries (`transform_at`, the exact numbers the
+    /// graph's expressions give at that frame), and the flags say what chain the pose is drawn by — but no
+    /// compositor has a parity case for a pose that moves by a formula, so every frame of such a layer is
+    /// refused (`Unsupported::Behavior`) until `GpuCaps::behaviors`, in a still and in an export frame. A
+    /// behaviour that moves nothing is not live: it flags nothing and refuses nothing.
+    #[test]
+    fn live_behaviours_are_the_pose_the_plan_carries_and_are_refused_until_a_compositor_says_it_draws_them() {
+        use crate::model::Behavior;
+        let a = asset();
+        let assets = [a];
+        let sway = Behavior::Sway {
+            amount: 8.0,
+            speed: 0.5,
+            phase: 0.0,
+        };
+        let breathe = Behavior::Breathe {
+            amount: 0.2,
+            speed: 1.0,
+            phase: 0.0,
+        };
+        let spin = Behavior::Spin { speed: 0.1, phase: 0.0 };
+        let drift = Behavior::Drift {
+            speed: 0.05,
+            angle: 30.0,
+            phase: 0.0,
+        };
+        let shake = Behavior::Shake {
+            amount: 0.02,
+            speed: 3.0,
+            seed: 5,
+            phase: 0.0,
+        };
+        // Everything a compositor can say it draws, so that only the behaviour (and the placement) is left.
+        let everything = GpuCaps {
+            motion: true,
+            fades: true,
+            transitions: true,
+            dip_white: true,
+            keyed_opacity: true,
+            keyed_zoom: true,
+            keyed_color: true,
+            mask: true,
+            ..GpuCaps::A0
+        };
+        let kinds = |plan: &RenderPlan, caps: &GpuCaps| -> Vec<&'static str> {
+            plan.reasons(caps, plan.size(u32::MAX))
+                .iter()
+                .map(Unsupported::kind)
+                .collect()
+        };
+        // (behaviour, scale driven, rotation driven, zoom moves, picture placed, what is left of the refusals)
+        for (b, scale, rotation, zooms, places) in [
+            (sway, false, true, false, false),
+            (spin, false, true, false, false),
+            (breathe, true, false, true, true),
+            (drift, false, false, false, true),
+            (shake, false, false, false, true),
+        ] {
+            let mut clip = make_clip(assets[0].id, 0.0, 4.0, 1.0);
+            clip.behaviors = vec![b];
+            let tl = single(vec![clip.clone()]);
+            for mode in [PlanMode::Motion, PlanMode::Still] {
+                let plan = planner(&tl, &assets, mode, &opts(30.0)).at_frame(48).unwrap();
+                let t = plan.layers[0].clip_time;
+                assert!(t > 0.4, "{t}");
+                let layer = &plan.layers[0];
+                assert_eq!(
+                    layer.transform,
+                    clip.transform_at(t),
+                    "{b:?} {mode:?}: the pose is the behaviours'"
+                );
+                assert_ne!(layer.transform, clip.base_transform_at(t), "{b:?}: and not the keys' alone");
+                let animated = layer.animated.expect("a behaviour animates the layer");
+                assert!(animated.behaves, "{b:?}");
+                let keys = animated.keys.expect("the transform is animated");
+                assert_eq!(
+                    (
+                        keys.scale,
+                        keys.rotation,
+                        keys.rotates,
+                        keys.opacity,
+                        animated.zooms,
+                        animated.places
+                    ),
+                    (scale, rotation, rotation, false, zooms, places),
+                    "{b:?} {mode:?}"
+                );
+                let refused = kinds(&plan, &GpuCaps::A0);
+                assert!(refused.contains(&"behavior"), "{b:?} {mode:?}: {refused:?}");
+                let refused = kinds(&plan, &everything);
+                assert!(
+                    refused.contains(&"behavior"),
+                    "{b:?} {mode:?}: no cap draws them yet: {refused:?}"
+                );
+                // With the bit set the pose is judged as any other: a sway and a spin are a keyed rotation, and
+                // the rest are placed at sub-pixel positions, which nothing draws either.
+                let drawn = kinds(
+                    &plan,
+                    &GpuCaps {
+                        behaviors: true,
+                        ..everything
+                    },
+                );
+                assert_eq!(drawn.contains(&"keyed_placement"), places, "{b:?} {mode:?}: {drawn:?}");
+                assert!(!drawn.contains(&"behavior"), "{b:?} {mode:?}: {drawn:?}");
+                assert_eq!(drawn.len(), usize::from(places), "{b:?} {mode:?}: {drawn:?}");
+            }
+        }
+        // A behaviour that moves nothing is not live, and a clip without any is as it was.
+        let mut idle = make_clip(assets[0].id, 0.0, 4.0, 1.0);
+        idle.behaviors = vec![
+            Behavior::Sway {
+                amount: 0.0,
+                speed: 1.0,
+                phase: 0.0,
+            },
+            Behavior::Spin { speed: 0.0, phase: 2.0 },
+        ];
+        for clip in [idle, make_clip(assets[0].id, 0.0, 4.0, 1.0)] {
+            let plan = planner(&single(vec![clip.clone()]), &assets, PlanMode::Motion, &opts(30.0))
+                .at_frame(45)
+                .unwrap();
+            assert!(plan.layers[0].animated.is_none(), "nothing is animated");
+            assert_eq!(plan.layers[0].transform, clip.transform);
+            assert!(!kinds(&plan, &everything).contains(&"behavior"));
+        }
     }
 
     /// The graph takes a zoom in from the source in the fit's own `scale` (`FitOrder::Folded`); the
@@ -2423,6 +2554,7 @@ mod tests {
             keyed_opacity: true,
             keyed_zoom: true,
             placement: false,
+            behaviors: false,
             keyed_color: true,
             mask: true,
             text: true,

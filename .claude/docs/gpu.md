@@ -646,6 +646,10 @@ before the zoom acts at the **fit size** and the zoom magnifies it (a blur grows
 * **A moving zoom (or a moving position) is refused** (`KeyedPlacement`, no `GpuCaps::placement`): the export and the
   FFmpeg still now place the picture with a sub-pixel `perspective` after that chain (`engine-cli.md`), which no pass
   draws, so the zoom-last order below is not reached until one does. `motion_parity.rs`'s zoom cases hold the refusal.
+* **A clip with live behaviours is refused** (`Behavior`, no `GpuCaps::behaviors`; `core-render-plan.md`): sway / spin / breathe / drift / shake
+  are a formula of the clip's clock added to its pose, and the plan's `transform` is the exact pose they give at the frame (so a compositor
+  that draws a keyed rotation or placement could draw it), but no case in `motion_parity.rs` holds one, so no pass claims it. A sway or spin
+  is the keyed rotation below; a breath, drift or shake is also a moving position / zoom and is refused as above.
 * The compositor draws that order (`LayerLook::zoom_last`: `animated.zooms` and two scale stages). Stage 0 is the fit scale with the `eq` tables in
   its vertical pass; the effects, the mask plane and the fades (`fs_fade`: Y, U, V and the alpha) run on the fit-size planes; **stage 1 scales four
   planes** (swscale scales alpha like luma, identically on both FFmpegs). A zoom that holds still keeps the old order.

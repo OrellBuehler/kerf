@@ -144,6 +144,12 @@ const MIGRATIONS: &[Migration] = &[
         destructive: false,
         needed_to_read: false,
     },
+    Migration {
+        run: v18_to_v19,
+        needed: v18_to_v19_needed,
+        destructive: false,
+        needed_to_read: false,
+    },
 ];
 
 /// The schema this build writes and the newest it opens.
@@ -411,6 +417,19 @@ fn v17_to_v18(_: &Connection) -> rusqlite::Result<()> {
 }
 
 fn v17_to_v18_needed(_: &Connection) -> bool {
+    true
+}
+
+/// v19: a clip may carry live behaviours (`Clip.behaviors`, `"behaviors"` in the timeline JSON: a list of
+/// `{"kind":"sway"|"breathe"|"spin"|"drift"|"shake", ...}`). It is a new field an older build drops at its next write of
+/// the clip, which then plays still where it swayed or shook, with nothing to say why. A clip without any is written as
+/// it was, so a stored one is unchanged. Nothing in the file's tables changes; the step is the version that keeps an
+/// older build out, after the file is copied aside.
+fn v18_to_v19(_: &Connection) -> rusqlite::Result<()> {
+    Ok(())
+}
+
+fn v18_to_v19_needed(_: &Connection) -> bool {
     true
 }
 

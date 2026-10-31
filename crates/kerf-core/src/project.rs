@@ -6125,7 +6125,7 @@ impl Project {
         self.edit_timeline("Add keyframe", move |timeline| {
             let (ti, ci) = timeline.locate(clip_id).ok_or(Error::ClipNotFound(clip_id))?;
             let clip = &mut timeline.tracks[ti].clips[ci];
-            let mut kf = Keyframe::from_transform(time, &clip.transform_at(time));
+            let mut kf = Keyframe::from_transform(time, &clip.base_transform_at(time));
             if let Some(v) = scale {
                 kf.scale = v;
             }
@@ -7859,6 +7859,8 @@ mod exports;
 pub use exports::{DeliveryInputs, ExportedFile};
 mod batch;
 pub use batch::Batch;
+mod behavior;
+pub use behavior::BakedClip;
 mod motion;
 pub use motion::MotionApplied;
 mod templates;
@@ -8093,6 +8095,8 @@ mod ramp_tests;
 mod blend_tests;
 
 /// Motion presets at the project level: one revision for several clips, staged, refused, undone.
+#[cfg(test)]
+mod behavior_tests;
 #[cfg(test)]
 mod motion_tests;
 

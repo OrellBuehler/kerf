@@ -28,6 +28,7 @@ enum Rule {
     ClipFade,
     ClipTransition,
     ClipKeyframe,
+    ClipBehavior,
     ClipGenerated,
     TitleClipCount,
     OverlayTwice,
@@ -201,6 +202,9 @@ fn clip_violations(c: &Clip) -> Vec<(Rule, &'static str)> {
     if c.keyframes.iter().any(|k| !k.time.is_finite()) {
         out.push((Rule::ClipKeyframe, "has a keyframe at a time that is not a number"));
     }
+    if c.behaviors.len() > super::MAX_BEHAVIORS {
+        out.push((Rule::ClipBehavior, "has more behaviours than a clip can carry"));
+    }
     out
 }
 
@@ -298,6 +302,20 @@ mod tests {
         for (why, keys) in bad {
             rejects(why, |t| first(t).speed_ramp = keys);
         }
+    }
+
+    #[test]
+    fn a_clip_with_more_behaviours_than_it_can_carry_is_refused() {
+        use crate::model::{Behavior, MAX_BEHAVIORS};
+        let sway = Behavior::Sway {
+            amount: 5.0,
+            speed: 1.0,
+            phase: 0.0,
+        };
+        let mut t = timeline();
+        first(&mut t).behaviors = vec![sway; MAX_BEHAVIORS];
+        t.check().unwrap();
+        rejects("too many behaviours", |t| first(t).behaviors = vec![sway; MAX_BEHAVIORS + 1]);
     }
 
     #[test]

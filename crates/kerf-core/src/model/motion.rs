@@ -14,8 +14,9 @@
 //! `at` 1, so the window is whole for every property the preset touches. A bezier easing is held to the
 //! unit square (no overshoot), so an overshoot is its own key.
 //!
-//! **Relative to the pose.** The reference is what the clip does now ([`Clip::property_at`], sampled
-//! before anything is written): an entrance ends on the pose at the window's end ([`Base::End`]), an
+//! **Relative to the pose.** The reference is what the clip's keys do now ([`Clip::base_at`], sampled
+//! before anything is written; a live behaviour rides on top of the result and is not written into the
+//! keys, `behavior.rs`): an entrance ends on the pose at the window's end ([`Base::End`]), an
 //! exit starts from the pose at its start ([`Base::Start`]), and a pulse, wiggle or bounce rides the
 //! straight line between the two edge poses ([`Base::Trend`]: the clip's own motion goes on underneath).
 //! A slide in onto a scaled, positioned clip lands on that clip's own framing. Anchoring the edge a
@@ -606,7 +607,7 @@ fn preset_keys(
 ) -> Result<Vec<PropertyKey>> {
     let (start, end) = window;
     let pose = |at: f64| match mode {
-        MotionMode::Add => clip.property_at(t.prop, at),
+        MotionMode::Add => clip.base_at(t.prop, at),
         MotionMode::Replace => clip.static_value(t.prop),
     };
     let (pose_start, pose_end) = (pose(start), pose(end));
@@ -642,7 +643,7 @@ fn merged(clip: &Clip, prop: Property, mut fresh: Vec<PropertyKey>) -> Vec<Prope
     let (start, end) = (fresh[0].time, fresh[fresh.len() - 1].time);
     let mut keys = existing;
     for edge in [start, end] {
-        upsert(&mut keys, PropertyKey::new(edge, clip.property_at(prop, edge)));
+        upsert(&mut keys, PropertyKey::new(edge, clip.base_at(prop, edge)));
     }
     let leaving = keys
         .iter()

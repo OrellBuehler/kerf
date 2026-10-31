@@ -123,6 +123,16 @@
 //! `ken-burns`, `still-ken-burns`, `preview-ken-burns` and `ken-burns-scaled-once` (the copy scaled once,
 //! Lanczos by default). Its blocks are 96–99, after the stabilization family.
 //!
+//! **The live-behaviour family is appended the same way**: the [`BEHAVIOR_CASES`] after the moving-still ones
+//! draw from the same generator (with the channel family's channels) and then give most of their clips on video
+//! tracks one to three behaviours ([`behavior_for`], on dice of its own seeded by the case and the clip, `8 << 40`):
+//! sway, breathe, spin, drift and shake from fixed decimals, now and then one that moves nothing, and the first
+//! still of each case in the middle of its first clip with a live one ([`behavior_still`], no dice). The first 10000
+//! per-case digests are the ones the commit before behaviours gave; 4 block lines were appended to each file,
+//! `parts.txt`'s too. Structural families `behavior-sway`, `behavior-breathe`, `behavior-spin`, `behavior-drift`,
+//! `behavior-shake`, `behavior-on-keys`, `behavior-neutral`, `still-behavior` and `preview-behavior`. Its blocks
+//! are 100–103, after the moving-still family.
+//!
 //! **The export in parts has a file of its own** (`golden/parts.txt`, [`the_parts_argv_builders_produce_the_golden_digests`]):
 //! every case is planned with `segments::plan_export` under [`PARTS_LIMITS`] and the argv of every part and of the last pass is
 //! digested, so the three files above prove that a small export is unchanged and this one pins what a long one is made of.
@@ -175,6 +185,7 @@ use chrono::{TimeZone, Utc};
 use uuid::Uuid;
 
 use super::*;
+use crate::model::BehaviorKind;
 use crate::model::{
     Easing, Keyframe, MasterBus, Property, PropertyKey, RampEasing, SpeedKey, TextKeyframe, Track, Transition, TransitionKind,
 };
@@ -216,7 +227,10 @@ const STABILIZE_FIRST: usize = BLEND_FIRST + BLEND_CASES;
 /// The moving-still cases appended after the stabilization ones (see the module docs).
 const KEN_BURNS_CASES: usize = 400;
 const KEN_BURNS_FIRST: usize = STABILIZE_FIRST + STABILIZE_CASES;
-const TOTAL: usize = KEN_BURNS_FIRST + KEN_BURNS_CASES;
+/// The live-behaviour cases appended after the moving-still ones (see the module docs).
+const BEHAVIOR_CASES: usize = 400;
+const BEHAVIOR_FIRST: usize = KEN_BURNS_FIRST + KEN_BURNS_CASES;
+const TOTAL: usize = BEHAVIOR_FIRST + BEHAVIOR_CASES;
 const BLOCK: usize = 100;
 const MIN_PER_FAMILY: usize = 20;
 const KINDS: [&str; 3] = ["export", "still", "preview"];
@@ -1046,6 +1060,63 @@ fn ken_burns_for(tl: &mut Timeline, j: usize, assets: &[Asset]) {
     }
 }
 
+/// Live behaviours on most clips of the `j`-th behaviour case, on dice of their own seeded by the case and
+/// the clip (`8 << 40`; the generator's are untouched): one to three of the five kinds, from fixed
+/// decimals (so the text is the same on every machine), footage, stills and titles alike; now and then
+/// one that moves nothing (amount 0), which the graph leaves out, and a phase a head trim would leave.
+fn behavior_for(tl: &mut Timeline, j: usize) {
+    use crate::model::Behavior;
+    let mut n = 0;
+    for track in tl.tracks.iter_mut().filter(|t| t.kind == StreamKind::Video) {
+        for clip in &mut track.clips {
+            n += 1;
+            let mut r = Rng::new((8 << 40) + (j as u64) * 64 + n as u64);
+            if !r.chance(0.75) {
+                continue;
+            }
+            for _ in 0..1 + r.below(3) {
+                let phase = if r.chance(0.3) { r.pick(&[0.2, -0.35, 1.75]) } else { 0.0 };
+                let b = match r.below(5) {
+                    0 => Behavior::Sway {
+                        amount: r.pick(&[1.5, 3.0, 7.5, 12.0]),
+                        speed: r.pick(&[0.25, 0.5, 1.3]),
+                        phase,
+                    },
+                    1 => Behavior::Breathe {
+                        amount: r.pick(&[0.03, 0.08, 0.2]),
+                        speed: r.pick(&[0.4, 1.0]),
+                        phase,
+                    },
+                    2 => Behavior::Spin {
+                        speed: r.pick(&[-0.1, 0.05, 0.25]),
+                        phase,
+                    },
+                    3 => Behavior::Drift {
+                        speed: r.pick(&[0.01, -0.03, 0.08]),
+                        angle: r.pick(&[0.0, 45.0, -120.0, 90.0]),
+                        phase,
+                    },
+                    _ => Behavior::Shake {
+                        amount: r.pick(&[0.005, 0.012, 0.03]),
+                        speed: r.pick(&[2.0, 5.0]),
+                        seed: r.below(1000) as u32,
+                        phase,
+                    },
+                };
+                clip.behaviors.push(if r.chance(0.05) {
+                    Behavior::Sway {
+                        amount: 0.0,
+                        speed: 1.0,
+                        phase,
+                    }
+                } else {
+                    b
+                });
+            }
+        }
+    }
+}
+
 /// The analyses a stabilized clip of the pool reads in the oracle: one made-up one per asset of
 /// footage (the padded proxies' twins too), over its whole length at its own rate and at the size the
 /// detect pass measures (at most 1920 wide, so a 4K original's slice is scaled by 2).
@@ -1572,8 +1643,11 @@ fn case(i: usize, assets: &[Asset]) -> Case {
     if (STABILIZE_FIRST..KEN_BURNS_FIRST).contains(&i) {
         stabilize_for(&mut timeline, i - STABILIZE_FIRST, assets);
     }
-    if (KEN_BURNS_FIRST..TOTAL).contains(&i) {
+    if (KEN_BURNS_FIRST..BEHAVIOR_FIRST).contains(&i) {
         ken_burns_for(&mut timeline, i - KEN_BURNS_FIRST, assets);
+    }
+    if (BEHAVIOR_FIRST..TOTAL).contains(&i) {
+        behavior_for(&mut timeline, i - BEHAVIOR_FIRST);
     }
     let dur = timeline.duration();
     let edges: Vec<f64> = (timeline.tracks.iter().flat_map(|t| &t.clips))
@@ -1625,10 +1699,24 @@ fn case(i: usize, assets: &[Asset]) -> Case {
     if (TOGETHER_FIRST..TITLE_FIRST).contains(&i) {
         together_for(&mut c, i - TOGETHER_FIRST);
     }
-    if (KEN_BURNS_FIRST..TOTAL).contains(&i) {
+    if (KEN_BURNS_FIRST..BEHAVIOR_FIRST).contains(&i) {
         ken_burns_still(&mut c, assets);
     }
+    if (BEHAVIOR_FIRST..TOTAL).contains(&i) {
+        behavior_still(&mut c);
+    }
     c
+}
+
+/// The first still of a live-behaviour case, in the middle of its first clip with a live behaviour (no
+/// dice), so the still builder draws one as often as the export does.
+fn behavior_still(c: &mut Case) {
+    let lively = (c.timeline.tracks.iter().filter(|t| t.kind == StreamKind::Video))
+        .flat_map(|t| &t.clips)
+        .find(|clip| clip.has_behaviors());
+    if let Some(clip) = lively {
+        c.stills[0].0 = clip.timeline_start + clip.duration() / 2.0;
+    }
 }
 
 /// The first still of a moving-still case, in the middle of its first moving still image (no dice), so
@@ -1866,8 +1954,13 @@ fn transitions(c: &Case, assets: &[Asset]) -> Vec<String> {
     out
 }
 
+/// Whether some clip of the case has a live behaviour of `kind`.
+fn lively<'a, I: Iterator<Item = &'a Clip>>(clips: &dyn Fn() -> I, kind: BehaviorKind) -> bool {
+    clips().any(|k| k.live_behaviors().iter().any(|b| b.kind() == kind))
+}
+
 /// The families that come from the case's structure rather than from argv text.
-const STRUCTURAL: [&str; 48] = [
+const STRUCTURAL: [&str; 57] = [
     "speed-ramp-hold",
     "speed-ramp-reversed",
     "speed-ramp-tail",
@@ -1916,6 +2009,15 @@ const STRUCTURAL: [&str; 48] = [
     "cover-uncropped",
     "preview-cover-uncropped",
     "still-cover-uncropped",
+    "behavior-sway",
+    "behavior-breathe",
+    "behavior-spin",
+    "behavior-drift",
+    "behavior-shake",
+    "behavior-on-keys",
+    "behavior-neutral",
+    "still-behavior",
+    "preview-behavior",
 ];
 
 fn expected(table: &[(&str, &str)]) -> Vec<String> {
@@ -2241,6 +2343,47 @@ fn families(c: &Case, assets: &[Asset], text: &[String; 3], table: &[(&str, &str
         (cover_uncropped(&flat[0], true), "cover-uncropped"),
         (cover_uncropped(&flat[2], true), "preview-cover-uncropped"),
         (cover_uncropped(&flat[1], false), "still-cover-uncropped"),
+        // Live behaviours: the kind, written onto the number it moves (the text it leaves in the export), on
+        // top of keys, one that moves nothing and so leaves nothing, and in a still and in the stream.
+        (
+            lively(&clips, BehaviorKind::Sway) && flat[0].contains("rotate=a='"),
+            "behavior-sway",
+        ),
+        (
+            lively(&clips, BehaviorKind::Spin) && flat[0].contains("rotate=a='"),
+            "behavior-spin",
+        ),
+        (
+            lively(&clips, BehaviorKind::Breathe) && flat[0].contains(")*(1+"),
+            "behavior-breathe",
+        ),
+        (
+            lively(&clips, BehaviorKind::Drift) && flat[0].contains("*PI/180)*"),
+            "behavior-drift",
+        ),
+        (
+            lively(&clips, BehaviorKind::Shake) && flat[0].contains("0.5*sin(2*PI*"),
+            "behavior-shake",
+        ),
+        (
+            clips().any(|k| Property::TRANSFORM.iter().any(|p| k.is_keyed(*p) && k.behaves(*p))),
+            "behavior-on-keys",
+        ),
+        (
+            clips().any(|k| !k.behaviors.is_empty() && !k.has_behaviors()),
+            "behavior-neutral",
+        ),
+        (
+            c.stills
+                .iter()
+                .any(|(t, _)| layers(*t).iter().any(|l| l.active.clip.has_behaviors())),
+            "still-behavior",
+        ),
+        (
+            clips().any(|k| k.has_behaviors())
+                && (flat[2].contains("sin(2*PI*") || flat[2].contains("*PI/180)*") || flat[2].contains("*(t-")),
+            "preview-behavior",
+        ),
         (chain_tails(&flat[0]).1, "alpha-kept"),
         (chain_tails(&flat[2]).1, "preview-alpha-kept"),
         // Speed ramps: a hold among the keys, a ramp played backwards, one with a transition's tail

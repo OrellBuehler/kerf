@@ -8003,10 +8003,8 @@ fn build_filter_complex_with(
                 // Animated picture position: per-frame overlay x / y expressions.
                 // The eased polyline `transform_at` reads too (one curve for every renderer);
                 // an axis that is not keyed is its static offset.
-                let xs = curve_or_static(clip, Property::PosX);
-                let ys = curve_or_static(clip, Property::PosY);
-                let px = keyframe_expr(&xs, "t", clip.timeline_start);
-                let py = keyframe_expr(&ys, "t", clip.timeline_start);
+                let px = driven_expr(clip, Property::PosX, "t");
+                let py = driven_expr(clip, Property::PosY, "t");
                 let (px, py) = match &motion {
                     Some((mx, my)) => (format!("({px})+({mx})"), format!("({py})+({my})")),
                     None => (px, py),
@@ -8538,11 +8536,8 @@ fn placement_filters(clip: &Clip, fx: &ClipFx, fmt: &ExportFormat, alpha: bool, 
     let t = perspective_time(rate, first);
     let start = clip.timeline_start;
     let curve = |pts: &[(f64, f64)]| keyframe_expr(pts, &t, start);
-    let scale = clip.zoom_animated().then(|| curve(&clip.property_curve(Property::Scale)));
-    let (mut px, mut py) = (
-        curve(&curve_or_static(clip, Property::PosX)),
-        curve(&curve_or_static(clip, Property::PosY)),
-    );
+    let scale = clip.zoom_animated().then(|| driven_expr(clip, Property::Scale, &t));
+    let (mut px, mut py) = (driven_expr(clip, Property::PosX, &t), driven_expr(clip, Property::PosY, &t));
     if let Some(keys) = ClipTiming::new(clip, fx).motion_keys() {
         px = format!("({px})+({})", curve(&keys.x));
         py = format!("({py})+({})", curve(&keys.y));
@@ -9540,8 +9535,15 @@ fn still_motion_for(clip: &Clip, assets: &[Asset], fmt: &ExportFormat, fx: &Clip
     }
     let length = ClipTiming::new(clip, fx).duration().max(0.0);
     let step = 1.0 / fmt.fps;
-    // Every frame, or 4000 evenly over a very long clip (a polyline's extremes are its points).
-    let count = ((length / step).ceil() as usize).clamp(1, 4000);
+    // Every frame, or 4000 evenly over a very long clip (a polyline's extremes are its points). A
+    // behaviour's extremes are between the points, so there every frame is judged, or the clip is
+    // left to the general chain.
+    let frames = (length / step).ceil() as usize;
+    let cap = if clip.has_behaviors() { 20_000 } else { 4000 };
+    if frames > cap && clip.has_behaviors() {
+        return None;
+    }
+    let count = frames.clamp(1, cap);
     let mut times: Vec<f64> = (0..=count).map(|k| length * k as f64 / count as f64).collect();
     for p in Property::TRANSFORM
         .iter()
@@ -9634,10 +9636,11 @@ fn video_clip_chain_stamped(
     // the geometry; a clip with per-property channels keys only some, and the rest are built
     // from its static transform as an unkeyed clip's are. Rotation / opacity additionally
     // need an alpha plane.
-    let scale_keyed = clip.is_keyed(Property::Scale);
-    let rotation_keyed = clip.is_keyed(Property::Rotation);
+    // (A live behaviour makes a number an expression of time as a key does: `Clip::is_driven`.)
+    let scale_keyed = clip.is_driven(Property::Scale);
+    let rotation_keyed = clip.is_driven(Property::Rotation);
     let opacity_keyed = clip.is_keyed(Property::Opacity);
-    let anim_rotation = clip.property_keys(Property::Rotation).iter().any(|k| k.value != 0.0);
+    let anim_rotation = clip.rotation_turns();
     let anim_opacity = clip.property_keys(Property::Opacity).iter().any(|k| k.value < 1.0);
     // A zoom that really moves: the picture changes size per frame, so its `scale`
     // goes last (see above). A keyed clip whose scale holds still keeps the chain
@@ -9861,7 +9864,8 @@ fn video_clip_chain_stamped(
             } else {
                 Rotated::No
             };
-            let (mut px, mut py) = clip.pan_extent();
+            // (A drift keeps moving while the clip plays on under a transition: judge its whole window.)
+            let (mut px, mut py) = clip.pan_extent_over(timing.window().1 - clip.timeline_start);
             if let Some(travel) = timing.motion_keys() {
                 let reach = |pts: &[(f64, f64)]| pts.iter().fold(0.0_f64, |m, p| m.max(p.1.abs()));
                 px += reach(&travel.x);
@@ -9914,7 +9918,7 @@ fn video_clip_chain_stamped(
             // A keyed zoom that holds still: re-evaluated every frame, at one size. One that
             // moves is the placement's, at the end of the chain.
             if !zoom_keyed {
-                let expr = keyframe_expr(&clip.property_curve(Property::Scale), "t", clip.timeline_start);
+                let expr = driven_expr(clip, Property::Scale, "t");
                 let tiny = clip.property_keys(Property::Scale).iter().any(|k| k.value < TINY_SCALE);
                 p.push(zoom_scale(&expr, true, tiny, tone_mapped, &sf));
             }
@@ -10009,7 +10013,7 @@ fn video_clip_chain_stamped(
     // in every buffer it reuses, and the picture grows into the union of every
     // pose it has had (the "erratic" rotation, on 6.1 and 9.0 alike).
     if anim_rotation {
-        let expr = keyframe_expr(&clip.property_curve(Property::Rotation), "t", clip.timeline_start);
+        let expr = driven_expr(clip, Property::Rotation, "t");
         p.push(format!(
             "rotate=a='({expr})*PI/180':fillcolor=black@0:ow='hypot(iw,ih)':oh='hypot(iw,ih)'"
         ));
@@ -11495,6 +11499,11 @@ pub fn grade_filter_chain(grade: &Grade, frame_matrix: Option<&str>) -> Vec<Stri
     grade_filters(grade, frame_matrix)
 }
 
+/// A clip's live behaviours (sway, breathe, spin, drift, shake) written onto the expressions of its
+/// transform numbers.
+mod behavior;
+use behavior::driven_expr;
+
 /// A still whose picture moves (keyed zoom, position, crop) drawn in one sub-pixel resample of a
 /// copy scaled once.
 mod still_motion;
@@ -11613,6 +11622,11 @@ mod alimiter_corpus;
 /// against `transform_at` and the scrubbed still (`#[ignore]`d).
 #[cfg(test)]
 mod keyed_zoom;
+
+/// Live behaviours (sway, breathe, spin, drift, shake) against the pictures the export, the scrubbed still
+/// and the playback stream render (`#[ignore]`d).
+#[cfg(test)]
+mod behavior_rendered;
 
 /// Per-property channels — a keyed colour and a keyed volume — against the pictures and samples
 /// the export renders (`#[ignore]`d).

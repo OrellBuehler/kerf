@@ -295,6 +295,9 @@ pub(crate) fn clip_extras(clip: &Clip) -> Vec<&'static str> {
     if !clip.channels.is_empty() {
         out.push("animated properties");
     }
+    if !clip.behaviors.is_empty() {
+        out.push("behaviours");
+    }
     if clip.mask.is_some() {
         out.push("masks");
     }

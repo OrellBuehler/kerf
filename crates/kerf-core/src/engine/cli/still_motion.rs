@@ -79,8 +79,8 @@ impl StillMotion {
         times: &[f64],
     ) -> Option<Self> {
         let t = &clip.transform;
-        let still_angle = !clip.is_keyed(Property::Rotation) && t.rotation != 0.0;
-        let turns = clip.property_keys(Property::Rotation).iter().any(|k| k.value != 0.0);
+        let still_angle = !clip.is_driven(Property::Rotation) && t.rotation != 0.0;
+        let turns = clip.rotation_turns();
         let spatial = clip.effects.iter().any(|e| {
             matches!(
                 e,
@@ -257,13 +257,7 @@ impl StillMotion {
             a => format!("in-{}", -a),
         };
         let t = format!("(({frame})*{}/{})", rate.den, rate.num);
-        let n = |p: Property| {
-            if clip.is_keyed(p) {
-                keyframe_expr(&clip.property_curve(p), &t, clip.timeline_start)
-            } else {
-                fnum(clip.static_value(p))
-            }
-        };
+        let n = |p: Property| driven_expr(clip, p, &t);
         let pose = self.pose(clip, &n);
         format!(
             "perspective={}:interpolation=linear:eval=frame,{}",
