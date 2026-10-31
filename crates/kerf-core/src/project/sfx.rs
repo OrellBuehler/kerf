@@ -14,7 +14,7 @@
 //! * **Audition.** [`Project::preview_sound_effect`]: a render and nothing else.
 //! * **Suggest.** [`Project::suggest_sound_effects_inputs`] (under the lock) → the pure
 //!   [`crate::model::suggest_sound_effects`]: where the working cut would take an effect, as placements
-//!   [`Project::add_sound_effects`] takes as they are. A read.
+//!   `add_sound_effects` takes as they are. A read.
 //!
 //! A placement says where the effect's *hit* goes (`at`); the clip starts that much earlier
 //! ([`crate::model::sfx_anchor_s`]). Effects overlap often (a riser into an impact), so with no
@@ -31,8 +31,8 @@ use super::{Project, SFX_TRACK};
 use crate::engine;
 use crate::error::{Error, Result};
 use crate::model::{
-    sfx_anchor_s, suggest_sound_effects, Asset, Clip, SfxSpec, SfxSuggestInputs, SfxSuggestRequest, SfxSuggestion, StreamKind,
-    Timeline, Track, MIN_SFX_CLIP_S,
+    sfx_anchor_s, sfx_span, suggest_sound_effects, Asset, Clip, SfxSpec, SfxSuggestInputs, SfxSuggestRequest, SfxSuggestion,
+    StreamKind, Timeline, Track, MIN_SFX_CLIP_S,
 };
 
 fn invalid(msg: impl Into<String>) -> Error {
@@ -152,23 +152,18 @@ fn stand_in(spec: &SfxSpec) -> Asset {
     }
 }
 
-/// Where a render of `len` seconds starts so its hit point lands on `at`, and how much of its head
-/// is cut off to keep the clip from starting before 0: `(timeline_start, source_in)`.
+/// Where a render of `len` seconds starts so its hit lands on `at`, and how much of its head is cut off
+/// to keep the clip from starting before 0: `(timeline_start, source_in)` ([`crate::model::sfx_span`]).
 fn span_for(spec: &SfxSpec, len: f64, at: f64) -> Result<(f64, f64)> {
-    let anchor = sfx_anchor_s(spec, len);
-    let start = at - anchor;
-    if start >= 0.0 {
-        return Ok((start, 0.0));
-    }
-    let left = len + start;
-    if left < MIN_SFX_CLIP_S {
-        return Err(invalid(format!(
+    sfx_span(spec, len, at).ok_or_else(|| {
+        let anchor = sfx_anchor_s(spec, len);
+        // Rounded up to the hundredth the message shows, so the time it names is one that lands.
+        let earliest = (((anchor - len + MIN_SFX_CLIP_S) * 100.0 - 1e-6).ceil() / 100.0).max(0.0);
+        invalid(format!(
             "its hit is {anchor:.2} s into its {len:.2} s, so it cannot land at {at:.2} s with the start of the timeline in the way; \
-             place it at {:.2} s or later",
-            (anchor - len + MIN_SFX_CLIP_S).max(0.0)
-        )));
-    }
-    Ok((0.0, -start))
+             place it at {earliest:.2} s or later",
+        ))
+    })
 }
 
 /// A clip for `asset` with its hit at `at`: [`Clip::for_asset`] over the render, cut at 0 when it
@@ -409,10 +404,11 @@ impl Project {
         Ok(assets)
     }
 
-    /// Render `spec` for auditioning and say where the WAV is: no edit, no asset. The same spec is the
-    /// same file as the one placing it would use.
+    /// Render `spec` for auditioning and say where the WAV is: no edit, no asset. The same audio as the
+    /// one placing it would use, written to the cache directory and pruned there, not to the data
+    /// directory where the effects of a project live.
     pub fn preview_sound_effect(spec: &SfxSpec, cancel: &dyn Fn() -> bool) -> Result<PathBuf> {
-        engine::sfx::synthesize(spec, cancel)
+        engine::sfx::preview(spec, cancel)
     }
 
     /// Land rendered effects: store the assets (the same render is the same asset) and put every clip
@@ -425,8 +421,14 @@ impl Project {
         if assets.len() != plan.effects.len() {
             return Err(invalid("there must be one rendered asset for each planned effect"));
         }
-        if assets.iter().any(|a| a.sound_effect.is_none()) {
-            return Err(invalid("that asset was not synthesized as a sound effect"));
+        if let Some((i, effect)) = plan
+            .effects
+            .iter()
+            .enumerate()
+            .find(|(i, e)| assets[*i].sound_effect.as_ref() != Some(&e.spec))
+        {
+            let at = format!("effects[{i}] ({})", effect.spec.kind.name());
+            return Err(invalid(format!("{at}: that asset is not the render of the planned effect")));
         }
         let ids: Vec<Uuid> = plan.effects.iter().map(|_| Uuid::new_v4()).collect();
         self.edit_lanes.borrow_mut().extend(ids.iter().copied());
@@ -445,9 +447,9 @@ impl Project {
         })
     }
 
-    /// Check, render and place `placements` in one go, for a caller that holds `&self` for the whole
-    /// of it (the render takes milliseconds, but a caller that shares the project behind a lock should
-    /// use the three steps and render with it released).
+    /// Check, render and place `placements` in one go, with `&self` held for the whole of it: for tests.
+    /// A caller that shares the project behind a lock uses the three steps and renders with it released.
+    #[cfg(test)]
     pub fn add_sound_effects(&self, placements: &[SfxPlacement]) -> Result<Vec<Clip>> {
         let plan = self.sound_effects_inputs(placements)?;
         let assets = Self::synthesize_sound_effects(&plan, &|| false)?;
@@ -516,8 +518,9 @@ impl Project {
         })
     }
 
-    /// Reshape effect clip `clip_id` in one go (render with `&self` held): see
+    /// Reshape effect clip `clip_id` in one go (render with `&self` held), for tests: see
     /// [`Project::update_sound_effect_inputs`] and [`Project::apply_sound_effect_update`].
+    #[cfg(test)]
     pub fn update_sound_effect(&self, clip_id: Uuid, spec: &SfxSpec, volume_db: Option<f64>) -> Result<Clip> {
         let update = self.update_sound_effect_inputs(clip_id, spec, volume_db)?;
         let asset = Self::synthesize_sound_effect(&update.spec, &|| false)?;
@@ -546,7 +549,7 @@ impl Project {
     }
 
     /// Suggest sound effects for the working cut ([`crate::model::suggest_sound_effects`]): a read, so
-    /// no revision. Each suggestion's placement is what [`Project::add_sound_effects`] takes.
+    /// no revision. Each suggestion's placement is what `add_sound_effects` takes.
     pub fn suggest_sound_effects(&self, request: &SfxSuggestRequest) -> Result<Vec<SfxSuggestion>> {
         suggest_sound_effects(&self.suggest_sound_effects_inputs()?, request)
     }

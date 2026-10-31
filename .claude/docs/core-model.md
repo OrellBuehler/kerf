@@ -184,7 +184,7 @@
   source and timeline start twice (a picture still sounding beside its sound) is kept once, first in
   track order. A reversed clip's words keep their order with times running down.
   `Project::cut_transcript_inputs` / `CutTranscriptInputs::read` split it around the lock and name the
-  `untranscribed` audible assets (an audio stream, no done transcript).
+  `untranscribed` audible assets (an audio stream, no done transcript; a synthesized sound effect is never listed, it has no speech).
   **`CaptionStyle` is the look**, and one decision rather than four:
   `Lines` (4 words / 28 chars, 5% of frame height, low in the frame) is the
   subtitle shape a line is *read* in; `WordPunch` (one word, 11%, higher, bold)
@@ -543,14 +543,15 @@
   shot's length over 1–5 s + 0.10 for a new shot — other footage, or a detected scene change between the windows; scene changes
   inside one clip's window, 0.3 s clear of its edges, are cuts at ≤ 0.40). A cut is a join of two adjacent pictures on a video
   track that is not a continuation of the same shot (`review`'s `head_source` / `tail_source` / `pace_gap`), not a title, and not
-  hidden by an opaque full-frame clip on a higher video track. **Density**: spacing subtle 4 s / balanced 2 s / punchy 1 s;
+  hidden by an opaque full-frame clip on a higher video track; a seamless split is no cut, but one whose second half is a punch-in
+  (the `punch_in` rule above) still is: it gets the punch, never a plain cut. **Density**: spacing subtle 4 s / balanced 2 s / punchy 1 s;
   cuts and punch-ins need both shots ≥ 1.5 s at balanced and do not count at subtle. What cannot be suggested is dropped **before**
   thinning so it holds nothing back: a moment within 0.25 s of an effect clip already on the timeline (an asset with `sound_effect`,
   any track, its span widened — a riser ending there counts), a part with no kind the request's `categories` / `kinds` allow
   (**each source has preferred kinds and fallbacks**: cut whoosh/swoosh, then swipe; transition swoosh, then whoosh/swipe; pop, then
   bubble/click/ding; punch, then thud/impact; riser, then reverse swell; impact, then boom/thud/punch — so `kinds: ["swipe"]` turns
   cuts into swipes, and `categories: ["impact"]` keeps the impact of a drop and loses its riser) and a part `add_sound_effects`
-  would refuse (`lands`: a head cut off at 0 must leave `MIN_SFX_CLIP_S`, shared with `span_for`). Thinning keeps markers, then the
+  would refuse (`lands` asks `model::sfx::span`, the rule `span_for` places by: a start under 10 ms before 0 is put at 0 whole, a deeper head cut must leave `MIN_SFX_CLIP_S`). Thinning keeps markers, then the
   highest scores (ties: earlier, then source order); at most `MAX_SFX_PER_CALL` effects survive. Survivors are in time order and
   get the kind **alternating** within (source, part) and a **seed** that is the running index, so no two are one render; the gain is
   −3 dB, **−8 dB** when a transcribed word of a clip that plays its own sound (not music, not an effect) is under the moment

@@ -465,6 +465,28 @@ pub fn anchor_s(spec: &SfxSpec, rendered_len: f64) -> f64 {
 
 /// The least of an effect that may be left on the timeline when its start is cut off at 0, seconds.
 pub const MIN_SFX_CLIP_S: f64 = 0.02;
+/// How far before 0 an effect's start may fall and still be put *at* 0, its hit landing that late,
+/// instead of having its head cut off, seconds. A transient is its first few milliseconds: cutting
+/// them (and fading in over the cut so it does not click) would take the hit itself.
+pub const SFX_HEAD_SNAP_S: f64 = 0.010;
+
+/// Where a render of `len` seconds starts so that its hit lands on `at`, and how much of its head is
+/// cut off to keep the clip from starting before 0: `(timeline_start, source_in)`. A start less than
+/// [`SFX_HEAD_SNAP_S`] before 0 is moved to 0 untouched (the hit lands that late); a deeper one cuts
+/// the head, which must leave [`MIN_SFX_CLIP_S`] of sound (compared with a tolerance, so a render
+/// that leaves exactly that, to the last bit of a sum, still lands). `None` is a hit that cannot land.
+/// The one rule of the placement and of the suggestions that must not be refused by it.
+pub(crate) fn span(spec: &SfxSpec, len: f64, at: f64) -> Option<(f64, f64)> {
+    const EPS: f64 = 1e-9;
+    let start = at - anchor_s(spec, len);
+    if start >= 0.0 {
+        return Some((start, 0.0));
+    }
+    if -start < SFX_HEAD_SNAP_S {
+        return Some((0.0, 0.0));
+    }
+    (len + start >= MIN_SFX_CLIP_S - EPS).then_some((0.0, -start))
+}
 /// The default `intensity`.
 pub const DEFAULT_SFX_INTENSITY: f64 = 0.7;
 /// The default `tail`.
@@ -573,11 +595,15 @@ impl SfxSpec {
         ((wanted * 1000.0).round() / 1000.0).clamp(preset.min_duration_s, preset.max_duration_s)
     }
 
-    /// The same spec with its duration spelled out: what is rendered, hashed and stored on the
-    /// asset, so two specs that render alike are one spec.
+    /// The same spec with its duration spelled out and no negative zero: what is rendered, hashed and
+    /// stored on the asset, so two specs that render alike are one spec. (`-0.0` is `0.0` to the sound
+    /// and to `==`, but not to the JSON the file is named by.)
     pub fn resolved(&self) -> SfxSpec {
         SfxSpec {
             duration_s: Some(self.resolved_duration_s()),
+            pitch: self.pitch + 0.0,
+            intensity: self.intensity + 0.0,
+            tail: self.tail + 0.0,
             ..self.clone()
         }
     }

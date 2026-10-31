@@ -7038,7 +7038,10 @@ impl Project {
                     transcripts.insert(asset_id, analysis.transcript);
                 }
                 None => {
-                    if let Some(asset) = self.stored_asset(asset_id)?.filter(Asset::has_audio) {
+                    if let Some(asset) = self
+                        .stored_asset(asset_id)?
+                        .filter(|a| a.has_audio() && a.sound_effect.is_none())
+                    {
                         untranscribed.push(Untranscribed {
                             asset_id,
                             name: asset.name,
@@ -8435,6 +8438,24 @@ mod tests {
         assert!(cut.lines.iter().all(|l| l.asset_id == vo.id));
         assert_eq!(cut.untranscribed.len(), 1);
         assert_eq!((cut.untranscribed[0].asset_id, cut.untranscribed[0].clips), (music.id, 1));
+    }
+
+    #[test]
+    fn a_synthesized_sound_effect_is_not_listed_as_untranscribed() {
+        let project = Project::open_in_memory().unwrap();
+        let music = asset_with("/music.wav", vec![aud_stream()]);
+        let mut effect = asset_with("/fx/whoosh.wav", vec![aud_stream()]);
+        effect.sound_effect = Some(crate::model::SfxSpec::new(crate::model::SfxKind::Whoosh));
+        project.insert_asset(&music).unwrap();
+        project.insert_asset(&effect).unwrap();
+        project.add_clip_to_timeline(music.id, None, 0.0, 3.0, Some(0.0)).unwrap();
+        project.add_clip_to_timeline(effect.id, None, 0.0, 1.0, Some(3.0)).unwrap();
+        let cut = project.cut_transcript().unwrap();
+        assert_eq!(
+            cut.untranscribed.iter().map(|u| u.asset_id).collect::<Vec<_>>(),
+            [music.id],
+            "an effect has no speech to transcribe"
+        );
     }
 
     #[test]

@@ -45,6 +45,12 @@ pub fn output_dir() -> Option<PathBuf> {
     Some(dirs::data_dir()?.join("kerf").join("sfx"))
 }
 
+/// Where auditions are written: the *cache* directory, since a preview is made again on demand
+/// and nothing keeps it (see [`preview_in`]).
+pub fn preview_dir() -> Option<PathBuf> {
+    Some(dirs::cache_dir()?.join("kerf").join("sfx-preview"))
+}
+
 /// The file `spec` renders to in `dir`: named by a hash of the renderer version and the spec with its
 /// length spelled out, so two specs that sound alike are one file.
 pub fn output_path_in(dir: &Path, spec: &SfxSpec) -> Result<PathBuf> {
@@ -1304,13 +1310,24 @@ pub fn render(spec: &SfxSpec) -> Vec<[f32; 2]> {
 
 static PARTS: AtomicU64 = AtomicU64::new(0);
 
+/// The size of the WAV a render of `spec` is, bytes: the 44-byte header and 16-bit stereo frames.
+fn wav_len(spec: &SfxSpec) -> u64 {
+    44 + 4 * (spec.resolved_duration_s() * SR).round() as u64
+}
+
+/// Whether `path` holds a whole render of `spec`: a WAV of exactly the size its length makes, so a
+/// file a crash or a full disk cut short is rendered again, not reused.
+fn complete(path: &Path, spec: &SfxSpec) -> bool {
+    std::fs::metadata(path).is_ok_and(|m| m.len() == wav_len(spec)) && finished(path)
+}
+
 /// Render `spec` to a WAV in `dir` (see [`output_path_in`]) unless it is there already, and say
 /// where. Checks the spec first and `cancel` before the work and the write; writes through
 /// `.part` and a rename, so a cancel or a crash leaves no half file.
 pub fn synthesize_in(dir: &Path, spec: &SfxSpec, cancel: &dyn Fn() -> bool) -> Result<PathBuf> {
     spec.validate()?;
     let path = output_path_in(dir, spec)?;
-    if finished(&path) {
+    if complete(&path, spec) {
         return Ok(path);
     }
     if cancel() {
@@ -1345,6 +1362,64 @@ pub fn synthesize_in(dir: &Path, spec: &SfxSpec, cancel: &dyn Fn() -> bool) -> R
 pub fn synthesize(spec: &SfxSpec, cancel: &dyn Fn() -> bool) -> Result<PathBuf> {
     let dir = output_dir().ok_or_else(|| Error::Engine("no data directory for sound effects".into()))?;
     synthesize_in(&dir, spec, cancel)
+}
+
+/// How many auditions [`preview_in`] keeps.
+const PREVIEWS_KEPT: usize = 32;
+/// A `.part` file this old is a crashed write's (a render takes milliseconds), seconds.
+const STALE_PART_S: u64 = 10 * 60;
+
+/// The files in a preview folder to delete: every `.part` older than [`STALE_PART_S`], then all but
+/// the `keep` most recently used WAVs. Pure; `files` is `(path, last used)`.
+fn preview_prune_plan(mut files: Vec<(PathBuf, std::time::SystemTime)>, now: std::time::SystemTime, keep: usize) -> Vec<PathBuf> {
+    let is_part = |p: &Path| p.extension().is_some_and(|e| e == "part");
+    let (parts, mut wavs): (Vec<_>, Vec<_>) = files.drain(..).partition(|(p, _)| is_part(p));
+    wavs.sort_by_key(|(_, used)| std::cmp::Reverse(*used));
+    let stale = parts
+        .into_iter()
+        .filter(|(_, used)| now.duration_since(*used).is_ok_and(|age| age.as_secs() > STALE_PART_S));
+    stale.chain(wavs.into_iter().skip(keep)).map(|(p, _)| p).collect()
+}
+
+/// Delete what [`preview_prune_plan`] names in `dir`. Failing to is not fatal.
+fn prune_previews(dir: &Path, keep: usize) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let files = entries
+        .flatten()
+        .filter(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with("sfx-") && (name.ends_with(".wav") || name.ends_with(".part"))
+        })
+        .filter_map(|e| {
+            let meta = e.metadata().ok().filter(std::fs::Metadata::is_file)?;
+            Some((e.path(), meta.modified().ok()?))
+        })
+        .collect();
+    for path in preview_prune_plan(files, std::time::SystemTime::now(), keep) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// Render `spec` for auditioning into `dir` ([`synthesize_in`]), mark it used and keep only the
+/// [`PREVIEWS_KEPT`] latest auditions there: a preview is never an asset, so it is not kept like one.
+pub fn preview_in(dir: &Path, spec: &SfxSpec, cancel: &dyn Fn() -> bool) -> Result<PathBuf> {
+    let path = synthesize_in(dir, spec, cancel)?;
+    let _ = std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .and_then(|f| f.set_modified(std::time::SystemTime::now()));
+    prune_previews(dir, PREVIEWS_KEPT);
+    Ok(path)
+}
+
+/// An audition of `spec` in the cache directory (`<cache>/kerf/sfx-preview/`): the same audio as
+/// [`synthesize`] makes, in a folder that is pruned, so auditioning leaves nothing behind for good.
+pub fn preview(spec: &SfxSpec, cancel: &dyn Fn() -> bool) -> Result<PathBuf> {
+    let dir = preview_dir().ok_or_else(|| Error::Engine("no cache directory for sound effect previews".into()))?;
+    preview_in(&dir, spec, cancel)
 }
 
 #[cfg(test)]
@@ -1889,6 +1964,147 @@ mod tests {
         assert_eq!(std::fs::read(twin).unwrap(), bytes);
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&dir2).ok();
+    }
+
+    #[test]
+    fn a_render_is_exactly_the_size_its_length_says() {
+        for kind in SfxKind::ALL {
+            let preset = kind.preset();
+            for duration_s in [None, Some(preset.min_duration_s), Some(preset.min_duration_s + 0.0123)] {
+                let s = SfxSpec {
+                    duration_s,
+                    ..spec(kind)
+                };
+                assert_eq!(
+                    44 + 4 * render(&s).len() as u64,
+                    wav_len(&s),
+                    "{kind:?} {duration_s:?}: a cache hit needs the size to be knowable without rendering"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_file_cut_short_is_rendered_again_not_reused() {
+        let dir = scratch();
+        let s = SfxSpec {
+            duration_s: Some(0.3),
+            ..spec(SfxKind::Click)
+        };
+        let path = synthesize_in(&dir, &s, &|| false).unwrap();
+        let whole = std::fs::read(&path).unwrap();
+        assert_eq!(whole.len() as u64, wav_len(&s));
+        for cut in [1, 4, 5_000] {
+            let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+            file.set_len(whole.len() as u64 - cut).unwrap();
+            drop(file);
+            assert!(!complete(&path, &s), "{cut} bytes short");
+            assert_eq!(synthesize_in(&dir, &s, &|| false).unwrap(), path);
+            assert_eq!(
+                std::fs::read(&path).unwrap(),
+                whole,
+                "{cut} bytes short: rendered again, whole"
+            );
+        }
+        let mut longer = whole;
+        longer.push(0);
+        std::fs::write(&path, longer).unwrap();
+        assert!(!complete(&path, &s), "and not one byte too many");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_negative_zero_is_the_same_file_as_a_zero() {
+        let dir = Path::new("/x");
+        let base = spec(SfxKind::Whoosh);
+        let pairs = [
+            (
+                SfxSpec {
+                    pitch: -0.0,
+                    ..base.clone()
+                },
+                SfxSpec {
+                    pitch: 0.0,
+                    ..base.clone()
+                },
+            ),
+            (
+                SfxSpec {
+                    intensity: -0.0,
+                    ..base.clone()
+                },
+                SfxSpec {
+                    intensity: 0.0,
+                    ..base.clone()
+                },
+            ),
+            (
+                SfxSpec {
+                    tail: -0.0,
+                    ..base.clone()
+                },
+                SfxSpec { tail: 0.0, ..base },
+            ),
+        ];
+        for (negative, zero) in pairs {
+            assert_eq!(output_path_in(dir, &negative).unwrap(), output_path_in(dir, &zero).unwrap());
+            assert_eq!(
+                serde_json::to_string(&negative.resolved()).unwrap(),
+                serde_json::to_string(&zero.resolved()).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn previews_keep_the_latest_few_and_drop_stale_part_files() {
+        use std::time::{Duration, SystemTime};
+        let now = SystemTime::now();
+        let ago = |s: u64| now - Duration::from_secs(s);
+        let files = vec![
+            (PathBuf::from("a.wav"), ago(50)),
+            (PathBuf::from("b.wav"), ago(10)),
+            (PathBuf::from("c.wav"), ago(30)),
+            (PathBuf::from("old.1.part"), ago(STALE_PART_S + 5)),
+            (PathBuf::from("live.2.part"), ago(1)),
+        ];
+        let mut gone = preview_prune_plan(files, now, 2);
+        gone.sort();
+        assert_eq!(gone, [PathBuf::from("a.wav"), PathBuf::from("old.1.part")]);
+        assert!(preview_prune_plan(vec![(PathBuf::from("a.wav"), ago(5))], now, 2).is_empty());
+
+        let dir = scratch();
+        let first = SfxSpec {
+            duration_s: Some(0.05),
+            ..spec(SfxKind::Click)
+        };
+        let first_path = preview_in(&dir, &first, &|| false).unwrap();
+        let stale = dir.join("sfx-0000000000000000.1.2.part");
+        std::fs::write(&stale, b"RIFF").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&stale)
+            .unwrap()
+            .set_modified(ago(STALE_PART_S + 60))
+            .unwrap();
+        let live = dir.join("sfx-0000000000000000.3.4.part");
+        std::fs::write(&live, b"RIFF").unwrap();
+        let mut last = first_path.clone();
+        for seed in 1..=(PREVIEWS_KEPT as u64 + 8) {
+            last = preview_in(&dir, &SfxSpec { seed, ..first.clone() }, &|| false).unwrap();
+        }
+        let wavs = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().extension().is_some_and(|x| x == "wav"))
+            .count();
+        assert_eq!(wavs, PREVIEWS_KEPT, "only the latest auditions stay");
+        assert!(last.exists(), "the one just made is never the one dropped");
+        assert!(!first_path.exists(), "the oldest went");
+        assert!(
+            !stale.exists() && live.exists(),
+            "a crashed write's leftover goes, a live one stays"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

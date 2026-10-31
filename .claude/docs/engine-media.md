@@ -340,7 +340,7 @@ riding the sweep, a low body and a band-limited hiss, and a constant-power pan t
 thud / punch** are a sub sine whose pitch falls (`drop_sine`, driven through `tanh` so a phone speaker still hears its harmonics) under
 a mid thump and an octave, a noise burst whose low-pass closes, a crack, a rumble (brown noise) and, for the boom, debris grains.
 **Riser / downlifter** are noise and a four-voice detuned saw stack climbing (falling) together while the filters open (close); the
-riser ends on its peak after a 6 ms fade, the downlifter starts on a thump. **Reverse swell** is a crash and a pad rendered forwards
+riser ends on its peak after a 6 ms end fade, the downlifter starts on a thump (and gets the same 6 ms end fade). **Reverse swell** is a crash and a pad rendered forwards
 with a long reverb and then reversed (it is the one kind that always has some reverb). The UI kinds are a falling-pitch sine pop, a
 resonant-noise click (and a faint release click), a bell of six inharmonic partials with a twin a hair off each (ding; notify is two of
 them a fifth apart), rising water blips (a count that follows the length and `intensity`) and seeded keystrokes (typewriter). The textures
@@ -350,15 +350,21 @@ mechanical clicks (shutter) and a lub-dub pair that repeats when it is long (hea
 multiplies every frequency by 2^(st/12), `tail` is the reverb's level and time: a Freeverb-style bank of eight damped combs and four
 all-pass diffusers a side, each comb's feedback set from its own length so the room rings `rt60` seconds, fed a mono sum high-passed per
 kind so a sub does not turn to mud (`WET_NORM` brings white noise in to about the level of white noise out). A gentle 14 kHz low-pass
-keeps the noise layers from a digital hiss. **Order**: dry layers, 14 kHz low-pass, reverb, the fades in the natural direction (1 ms in,
-`8 %` of the length out, 6 ms for a riser), then the reverse(s), then `master`: non-finite samples zeroed, unity peak, a `tanh` at knee 1,
+keeps the noise layers from a digital hiss. **Order**: dry layers, 14 kHz low-pass, reverb, the fades in the natural direction (0.5 ms in;
+out `8 %` of the length clamped to 10–120 ms, 6 ms for a riser or a downlifter), then the reverse(s), then `master`: non-finite samples zeroed, unity peak, a `tanh` at knee 1,
 and the peak set to **exactly −1 dBFS + the kind's `level_db`** (so a reversed render is the same render played backwards, to the sample, and an
 impact's end fade becomes a swell into its hit). Out-of-range numbers are clamped, never trusted: `render` is total. Output is **16-bit
 WAV with the same seeded triangular dither** as music (`compose::write_wav16`) in the data dir (`<data>/kerf/sfx/sfx-<hash>.wav`, the
-only copy; the hash is of the renderer version and the **resolved** spec's JSON, so the same spec is a cache hit and the same asset);
+only copy; the hash is of the renderer version and the **resolved** spec's JSON, so the same spec is a cache hit and the same asset —
+`resolved()` also turns a `-0.0` pitch / intensity / tail into `0.0`, which `==` and the sound cannot tell apart but the JSON can). A file
+is a cache hit only when it is a WAV of **exactly** `44 + 4 × frames` bytes (`wav_len`, `complete`; compose's `finished` only checks
+the header and `> 44`), so one a crash or a full disk cut short is rendered again;
 `synthesize(spec, cancel) -> PathBuf` validates, checks cancel before the render and before the write, writes through a per-call
 `.part` (process id and a counter, so two threads on one spec cannot trample each other) and a rename, and takes no `cpu::lease` and
-never the project lock (a render is milliseconds). `synthesize_in(dir, …)` is the same into another folder (what the tests use). Tests
+never the project lock (a render is milliseconds). `synthesize_in(dir, …)` is the same into another folder (what the tests use). **Auditions** (`preview(spec, cancel)`, behind
+`Project::preview_sound_effect`) are the same bytes written to the *cache* dir (`<cache>/kerf/sfx-preview/`, `preview_in(dir, …)`),
+marked used on each call and pruned after it: the 32 most recently used WAVs stay, a `.part` older than ten minutes (a crashed write's)
+goes (`preview_prune_plan`, pure) — an audition is never an asset, so it must not pile up in the data dir beside the real effects. Tests
 render every kind (length, finite, peak at its level, no DC, click-free edges both ways), pin determinism and that a seed changes every
 kind, that reverse mirrors, that extreme numbers stay finite and at level, that each hit lands at its anchor, that a riser builds and a
 downlifter falls, that intensity brightens and pitch moves a bell an octave, that a tail rings, that a pass travels left to right and

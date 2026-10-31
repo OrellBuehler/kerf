@@ -8,7 +8,7 @@ use super::linked_tests::{asset, stream};
 use super::*;
 use crate::model::{
     sfx_anchor_s, AssetAnalysis, EditSource, SfxDensity, SfxKind, SfxSource, SfxSpec, SfxSuggestRequest, TranscriptSegment,
-    Transition, TransitionKind, Word,
+    Transition, TransitionKind, Word, SFX_HEAD_SNAP_S,
 };
 
 fn spec(kind: SfxKind) -> SfxSpec {
@@ -407,6 +407,134 @@ fn a_hit_before_the_start_of_the_timeline_is_cut_not_moved() {
     project.sound_effects_inputs(&[reversed]).unwrap();
 }
 
+#[test]
+fn placing_refuses_an_asset_that_is_not_the_render_of_its_planned_effect() {
+    let project = Project::open_in_memory().unwrap();
+    let plan = project
+        .sound_effects_inputs(&[at(SfxKind::Whoosh, 5.0), at(SfxKind::Pop, 8.0)])
+        .unwrap();
+    let (whoosh, pop) = (rendered(&plan.effects[0].spec), rendered(&plan.effects[1].spec));
+    let reseeded = rendered(&SfxSpec {
+        seed: 9,
+        ..plan.effects[0].spec.clone()
+    });
+    let mut plain = whoosh.clone();
+    plain.sound_effect = None;
+    for (assets, bad) in [
+        (vec![pop.clone(), whoosh.clone()], "effects[0] (whoosh)"),
+        (vec![whoosh.clone(), reseeded], "effects[1] (pop)"),
+        (vec![plain, pop.clone()], "effects[0] (whoosh)"),
+    ] {
+        let e = project.place_sound_effects(&assets, &plan).unwrap_err().to_string();
+        assert!(e.contains(bad) && e.contains("not the render"), "{e}");
+    }
+    assert!(project.list_assets().unwrap().is_empty(), "a refused batch stores nothing");
+    assert_eq!(lanes(&project), vec![]);
+    assert_eq!(project.place_sound_effects(&[whoosh, pop], &plan).unwrap().len(), 2);
+}
+
+#[test]
+fn the_time_a_refusal_names_is_a_time_that_lands() {
+    let project = Project::open_in_memory().unwrap();
+    for length in [4.0, 4.1, 4.37, 5.123, 6.0, 7.777, 11.999] {
+        for reverse in [false, true] {
+            let mut p = at(SfxKind::Riser, 0.02);
+            p.spec.duration_s = Some(length);
+            p.spec.reverse = reverse;
+            if !reverse {
+                project
+                    .sound_effects_inputs(&[p.clone()])
+                    .unwrap_or_else(|e| panic!("a riser of {length} s ending at 0.02 s leaves 0.02 s of sound: {e}"));
+            }
+            p.at = 0.0;
+            let Err(e) = project.sound_effects_inputs(&[p.clone()]) else {
+                continue;
+            };
+            let e = e.to_string();
+            let named: f64 = e
+                .split("place it at ")
+                .nth(1)
+                .and_then(|rest| rest.split(' ').next())
+                .and_then(|t| t.parse().ok())
+                .unwrap_or_else(|| panic!("{e}"));
+            p.at = named;
+            project
+                .sound_effects_inputs(&[p])
+                .unwrap_or_else(|e2| panic!("{named} s was named for a {length} s riser (reverse {reverse}) but: {e2}"));
+        }
+    }
+    for kind in [SfxKind::Pop, SfxKind::Click, SfxKind::Impact] {
+        let mut p = at(kind, 0.0);
+        p.spec.reverse = true;
+        let Err(e) = project.sound_effects_inputs(&[p.clone()]) else {
+            continue;
+        };
+        let named: f64 = e
+            .to_string()
+            .split("place it at ")
+            .nth(1)
+            .unwrap()
+            .split(' ')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        p.at = named;
+        project
+            .sound_effects_inputs(&[p])
+            .unwrap_or_else(|e| panic!("{kind:?} at {named}: {e}"));
+    }
+}
+
+#[test]
+fn a_hit_a_few_milliseconds_before_zero_is_put_at_zero_late_not_trimmed() {
+    let project = Project::open_in_memory().unwrap();
+    // An impact's transient is 4 ms in: asked for at 0 it starts at 0 whole, its hit 4 ms late.
+    let impact = add(&project, &[at(SfxKind::Impact, 0.0)]).unwrap().remove(0);
+    assert_eq!(
+        (impact.timeline_start, impact.source_in, impact.fade_in),
+        (0.0, 0.0, 0.0),
+        "{impact:?}"
+    );
+    let asset = project.get_asset(impact.asset_id).unwrap().unwrap();
+    assert_eq!(impact.source_out, asset.duration, "the whole render plays");
+    let hit = impact.source_to_timeline(sfx_anchor_s(asset.sound_effect.as_ref().unwrap(), asset.duration));
+    assert!((hit - 0.004).abs() < 1e-9, "the hit is {hit} s");
+
+    // Under 10 ms before 0 is not cut, whatever the kind; over it is, with the fade over the cut.
+    let anchor = |kind: SfxKind| sfx_anchor_s(&spec(kind).resolved(), spec(kind).resolved_duration_s());
+    let whoosh = anchor(SfxKind::Whoosh);
+    let near = add(&project, &[at(SfxKind::Whoosh, whoosh - 0.009)]).unwrap().remove(0);
+    assert_eq!(
+        (near.timeline_start, near.source_in, near.fade_in),
+        (0.0, 0.0, 0.0),
+        "{near:?}"
+    );
+    let far = add(&project, &[at(SfxKind::Whoosh, whoosh - 0.012)]).unwrap().remove(0);
+    assert_eq!(far.timeline_start, 0.0);
+    assert!((far.source_in - 0.012).abs() < 1e-9, "{far:?}");
+    assert!(
+        far.fade_in > 0.0 && far.fade_in <= 0.004,
+        "the cut head is faded: {}",
+        far.fade_in
+    );
+
+    // A reshape of the snapped effect asks the same rule, and its hit stays where it now is.
+    let update = project
+        .update_sound_effect_inputs(
+            impact.id,
+            &SfxSpec {
+                duration_s: Some(2.0),
+                ..spec(SfxKind::Impact)
+            },
+            None,
+        )
+        .unwrap();
+    assert!((update.anchor_at - 0.004).abs() < 1e-9);
+    let new = project.apply_sound_effect_update(&rendered(&update.spec), &update).unwrap();
+    assert_eq!((new.timeline_start, new.source_in, new.fade_in), (0.0, 0.0, 0.0), "{new:?}");
+}
+
 /// A whoosh at 10 s on the effects lane, quieter than it came, with a fade-out.
 fn whoosh_at_ten(project: &Project) -> Clip {
     let mut p = at(SfxKind::Whoosh, 10.0);
@@ -783,10 +911,15 @@ fn sound_effects_are_rendered_probed_placed_and_reshaped_for_real() {
     assert_eq!(clips.len(), 3);
     let preview = Project::preview_sound_effect(&plan.effects[0].spec, &|| false).unwrap();
     assert_eq!(
-        preview.to_string_lossy(),
-        assets[0].path,
-        "an audition is the file the effect would use"
+        std::fs::read(&preview).unwrap(),
+        std::fs::read(&assets[0].path).unwrap(),
+        "an audition is the audio the effect would use"
     );
+    assert!(
+        preview.starts_with(crate::engine::sfx::preview_dir().unwrap()),
+        "in the cache, not beside the effects: {preview:?}"
+    );
+    std::fs::remove_file(&preview).ok();
 
     let new = project
         .update_sound_effect(
@@ -882,7 +1015,11 @@ fn suggestions_are_placements_add_sound_effects_takes_as_they_are() {
     for (clip, s) in clips.iter().zip(&suggestions) {
         let asset = project.get_asset(clip.asset_id).unwrap().unwrap();
         let hit = clip.source_to_timeline(sfx_anchor_s(asset.sound_effect.as_ref().unwrap(), asset.duration));
-        assert!((hit - s.placement.at).abs() < 1e-9, "{s:?} landed at {hit}");
+        let late = hit - s.placement.at;
+        assert!(
+            late.abs() < 1e-9 || (clip.timeline_start == 0.0 && (0.0..SFX_HEAD_SNAP_S).contains(&late)),
+            "{s:?} landed at {hit}"
+        );
     }
     assert_eq!(labels(&project).last().unwrap(), "Add sound effects");
 

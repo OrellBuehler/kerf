@@ -507,8 +507,11 @@
   the wire; `deny_unknown_fields` cannot be combined with `flatten`, so `Deserialize` takes `at` / `volume_db` / `track_id` and hands the
   rest to `SfxSpec` (which refuses an unknown field and names it). **`at` is where the effect's hit point lands** (`model::sfx_anchor_s`:
   a whoosh's peak, an impact's first transient, a riser's end; `reverse` mirrors it), so the clip starts `anchor` earlier; a start
-  before 0 is **cut off the head** (`source_in`, with a 4 ms fade-in) rather than moved, and a hit that would leave under 20 ms of
-  sound is refused naming the time it can land. `sound_effects_inputs(&[SfxPlacement]) -> SfxPlan` under the lock: 1..=256
+  before 0 is **cut off the head** (`source_in`, with a 4 ms fade-in) rather than moved — unless it is under 10 ms before 0
+  (`SFX_HEAD_SNAP_S`), when the clip starts at 0 whole and the hit lands that late (a transient is its first milliseconds; the cut
+  and the fade over it would take it) — and a hit that would leave under 20 ms of sound is refused naming the time it can land
+  (rounded **up** to the hundredth it shows, and compared within 1e-9, so the time named is accepted). `model::sfx::span` is
+  that one rule: `span_for` places by it and the suggestions' `lands` asks it. `sound_effects_inputs(&[SfxPlacement]) -> SfxPlan` under the lock: 1..=256
   placements, each spec valid (the error says `effects[i] (kind): …`), `at` finite and ≥ 0, `volume_db` −60..=12, a named track an
   existing **unlocked audio** track — all against the **working timeline** — and **last the placement is rehearsed**
   (`check_sfx_fits`: stand-in assets of the renders' lengths through the same `put_sound_effects`, then `ripple_lanes` when
@@ -516,7 +519,8 @@
   is refused with edit_timeline's words before anything renders; the plan spells every spec out (`SfxSpec::resolved`: the length in
   whole milliseconds, clamped to the kind's range) and defaults the gain. → static `synthesize_sound_effects(&plan, cancel) ->
   Vec<Asset>` (lock released; one render, probe and asset per distinct spec; named `SFX: Whoosh`; `synthesize_sound_effect` for one) →
-  `place_sound_effects(&assets, &plan) -> Vec<Clip>` under the lock: the assets are stored **inside** the `edit_timeline` closure (a
+  `place_sound_effects(&assets, &plan) -> Vec<Clip>` under the lock: each asset must be the render of its planned spec (the same
+  check as `apply_sound_effect_update`'s, naming `effects[i] (kind)`); the assets are stored **inside** the `edit_timeline` closure (a
   refused placement stores nothing, an agent's stages with its assets landing at once) and the whole batch is **one** `Add sound
   effects` revision (`Add sound effect` for one). **Lanes**: with no `track_id` an effect goes on the first **unlocked** audio track
   named `FX` (`SFX_TRACK`), `FX 2`, `FX 3`… (in that numeric order) whose clips leave `[start, end)` free — touching is not an
@@ -529,9 +533,9 @@
   slowed clip is read right), the id, gain (unless `volume_db` is given), fades, audio effects and keys, and plays the whole new render
   at normal speed (trim and speed reset, as `Recompose music` does); it goes through `edit_timeline`, so ripple applies and without it
   a longer render that would run into the next clip is refused with nothing stored (the inputs rehearse it too).
-  `preview_sound_effect(spec, cancel) -> PathBuf` is the audition: a render and no edit. `add_sound_effects` and `update_sound_effect`
-  run the three steps for a caller that holds `&self` for the whole of it (tests, a local script); the surfaces render with the lock
-  released. An `#[ignore]`d test drives the real engine and ffprobe end to end.
+  `preview_sound_effect(spec, cancel) -> PathBuf` is the audition: a render and no edit, written to the pruned *cache* dir
+  (`engine-media.md`), not beside the effects in the data dir. `add_sound_effects` and `update_sound_effect` run the three steps with
+  `&self` held for the whole of it and are `#[cfg(test)]`; the surfaces render with the lock released. An `#[ignore]`d test drives the real engine and ffprobe end to end.
   **Suggestions**: `suggest_sound_effects_inputs() -> SfxSuggestInputs` (under the lock: the **working timeline**, so an agent sees its
   own proposal, every asset, and the cached `AssetAnalysis` of the assets the cut uses — scene changes, transcript words, music
   structure; nothing is analysed) → pure `model::suggest_sound_effects(&inputs, &SfxSuggestRequest)`; `suggest_sound_effects(&req)`
@@ -945,7 +949,9 @@
   (`transcript::search`, `engine-media.md`): the assets in library order, each one's analysis row as the stored JSON
   (unparsed — parsing is most of the cost) and the working timeline; an unknown id is `AssetNotFound`. **What a request runs** is `resolve_steps(asset, requested)`: a file with no audio is
   not asked for silence, loudness, rhythm or speech (silent b-roll used to get a failed transcript
-  chip and an error toast on every import), a still has nothing to analyze, and an empty answer is
+  chip and an error toast on every import), a synthesized sound effect (`Asset.sound_effect`) keeps only silence and loudness
+  (`AnalysisKind::fits_effect`: whisper would invent words over a whoosh, and it has no picture or beat), a still has nothing to
+  analyze, and an empty answer is
   an `InvalidArgument` that says why (everything switched off; a silent file asked for its speech)
   rather than an empty run. `analyze_asset_steps` runs in the background lane of the heavy-job queue
   (`engine-cli.md`), announces `waiting`, can be stopped while queued, and hands the patch so far to

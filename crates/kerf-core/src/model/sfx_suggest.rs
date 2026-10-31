@@ -19,8 +19,8 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use super::{
-    fmt_time, sfx_anchor_s, Asset, AssetAnalysis, AudioClass, Clip, HitKind, MusicAnalysis, SectionKind, SfxCategory, SfxKind,
-    SfxSpec, StreamKind, SvgOverlay, SvgPresetKind, TimeRange, Timeline, Transition, MIN_SFX_CLIP_S,
+    fmt_time, sfx_span, Asset, AssetAnalysis, AudioClass, Clip, HitKind, MusicAnalysis, SectionKind, SfxCategory, SfxKind,
+    SfxSpec, StreamKind, SvgOverlay, SvgPresetKind, TimeRange, Timeline, Transition,
 };
 use crate::error::{Error, Result};
 use crate::project::{SfxPlacement, MAX_SFX_PER_CALL};
@@ -313,11 +313,9 @@ fn moment(at: f64, source: SfxSource, score: f64, parts: Vec<Part>) -> Moment {
 }
 
 /// Whether an effect of `spec` can be put with its hit at `at` without `add_sound_effects` refusing it:
-/// the same rule as the placement's (a head cut off at 0 must leave [`MIN_SFX_CLIP_S`] of sound).
+/// the placement's own rule ([`sfx_span`]: a head cut off at 0 must leave `MIN_SFX_CLIP_S` of sound).
 fn lands(spec: &SfxSpec, at: f64) -> bool {
-    let len = spec.resolved_duration_s();
-    let start = at - sfx_anchor_s(spec, len);
-    start >= 0.0 || len + start >= MIN_SFX_CLIP_S
+    sfx_span(spec, spec.resolved_duration_s(), at).is_some()
 }
 
 /// A name for a person from an asset or title name: whitespace collapsed, control characters gone,
@@ -527,7 +525,7 @@ impl<'a> Reading<'a> {
                     continue;
                 }
                 let Some(min_shot) = min_shot else { continue };
-                if a.is_generated() || b.is_generated() || self.continues(a, b) {
+                if a.is_generated() || b.is_generated() || (self.continues(a, b) && !self.punches_in(a, b)) {
                     continue;
                 }
                 let shot = a.duration().min(b.duration());
@@ -543,17 +541,22 @@ impl<'a> Reading<'a> {
         }
     }
 
-    /// The hard cut from `a` to `b`: a punch-in when it is the same shot at a new scale, else a cut.
-    fn cut(&self, a: &Clip, b: &Clip, shot: f64) -> Moment {
-        let at = b.timeline_start;
-        let same = a.asset_id == b.asset_id;
-        if same
+    /// Whether `b` is the same footage as `a` at a new scale, neither clip keyed: a punch-in (or out),
+    /// whether or not the footage plays straight on.
+    fn punches_in(&self, a: &Clip, b: &Clip) -> bool {
+        a.asset_id == b.asset_id
             && self.footage(a)
             && self.footage(b)
             && scale_jump(a, b) >= PUNCH_IN_SCALE
             && !a.is_animated()
             && !b.is_animated()
-        {
+    }
+
+    /// The hard cut from `a` to `b`: a punch-in when it is the same shot at a new scale, else a cut.
+    fn cut(&self, a: &Clip, b: &Clip, shot: f64) -> Moment {
+        let at = b.timeline_start;
+        let same = a.asset_id == b.asset_id;
+        if self.punches_in(a, b) {
             let (from, to) = (a.transform.scale, b.transform.scale);
             let reason = format!(
                 "{} on {} at {} ({:.0}% to {:.0}%)",
@@ -1029,6 +1032,7 @@ pub fn suggest(inputs: &SfxSuggestInputs, request: &SfxSuggestRequest) -> Result
 mod tests {
     use super::*;
     use crate::engine::test_support::{audio_stream, av_asset, test_asset, timeline_of, video_track};
+    use crate::model::sfx_anchor_s;
     use crate::model::{
         AudioClassification, BeatGrid, Marker, MusicScore, MusicStyle, ScoreHit, ScoreSection, SvgOverlay, SvgPreset,
         SvgPresetParams, TextOverlay, TitleClip, Track, TranscriptSegment, TransitionKind, Word,
@@ -1395,6 +1399,41 @@ mod tests {
     }
 
     #[test]
+    fn a_seamless_split_with_the_second_half_scaled_up_is_a_punch_in_but_never_a_plain_cut() {
+        let a = asset("talk.mp4");
+        let split = |scale: f64, keyed: bool| {
+            let first = shot(&a, 0.0, 5.0, 0.0);
+            let mut second = shot(&a, 5.0, 11.0, 5.0);
+            second.transform.scale = scale;
+            if keyed {
+                second.keyframes.push(crate::model::Keyframe::from_transform(
+                    0.0,
+                    &crate::model::Transform::default(),
+                ));
+            }
+            inputs(timeline_of(vec![video_track(vec![first, second])]), &[&a])
+        };
+        let out = ask(&split(1.15, false), SfxDensity::Balanced);
+        assert_eq!(out.len(), 1, "{out:?}");
+        assert_eq!(
+            (out[0].source, out[0].placement.spec.kind, out[0].placement.at),
+            (SfxSource::PunchIn, SfxKind::Punch, 5.0)
+        );
+        assert_eq!(out[0].reason, "Punch-in on talk.mp4 at 0:05.0 (100% to 115%)");
+        assert!(ask(&split(1.15, false), SfxDensity::Subtle).is_empty());
+        let small = ask(&split(1.0 + PUNCH_IN_SCALE / 2.0, false), SfxDensity::Balanced);
+        assert!(small.is_empty(), "a small change in a seamless split is no cut: {small:?}");
+        let keyed = ask(&split(1.15, true), SfxDensity::Balanced);
+        assert!(keyed.is_empty(), "a keyed zoom is neither a punch-in nor a cut: {keyed:?}");
+        let mut short = split(1.15, false);
+        short.timeline.tracks[0].clips[1].source_out = 6.0;
+        assert!(
+            ask(&short, SfxDensity::Balanced).is_empty(),
+            "a shot under 1.5 s is too short at balanced"
+        );
+    }
+
+    #[test]
     fn a_cut_under_a_full_frame_cutaway_is_not_seen_and_one_under_a_pip_is() {
         let (a, b, c) = (asset("a.mp4"), asset("b.mp4"), asset("c.mp4"));
         let cutaway = |edit: fn(&mut Clip)| {
@@ -1670,6 +1709,26 @@ mod tests {
         let mut t = Timeline::new();
         t.markers = vec![marker(5.0, "sfx:whoosh"), marker(8.0, "sfx:pop")];
         assert_eq!(kinds(&suggest(&inputs(t, &[]), &only).unwrap()), [SfxKind::Pop]);
+    }
+
+    #[test]
+    fn an_effect_lands_where_the_placement_accepts_it_to_the_last_bit() {
+        for length in [4.0, 4.1, 4.37, 5.123, 7.777, 11.999] {
+            let riser = SfxSpec {
+                duration_s: Some(length),
+                ..SfxSpec::new(SfxKind::Riser)
+            };
+            assert!(
+                lands(&riser, 0.02),
+                "a {length} s riser ending at 0.02 s leaves 0.02 s of sound"
+            );
+            assert!(!lands(&riser, 0.019), "but not 0.019 s of it");
+        }
+        let impact = SfxSpec::new(SfxKind::Impact);
+        assert!(lands(&impact, 0.0), "a transient a few ms in starts at 0, late");
+        let whoosh = SfxSpec::new(SfxKind::Whoosh);
+        let anchor = sfx_anchor_s(&whoosh, whoosh.resolved_duration_s());
+        assert!(lands(&whoosh, anchor - 0.009) && lands(&whoosh, anchor - 0.012));
     }
 
     #[test]

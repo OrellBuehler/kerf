@@ -1035,6 +1035,12 @@ impl AnalysisKind {
         self != AnalysisKind::Scenes
     }
 
+    /// Whether the step has anything to find in a synthesized sound effect: only its silence and
+    /// loudness. It has no picture to cut, no beat to read and no words to hear.
+    pub fn fits_effect(self) -> bool {
+        matches!(self, AnalysisKind::Silence | AnalysisKind::Loudness)
+    }
+
     /// The wire name (`silence`, `scenes`, `loudness`, `rhythm`, `transcript`).
     pub fn name(self) -> &'static str {
         match self {
@@ -5388,9 +5394,10 @@ pub use score::{
 pub(crate) use score::{sample_song, style_shares};
 
 mod sfx;
+pub(crate) use sfx::span as sfx_span;
 pub use sfx::{
     anchor_s as sfx_anchor_s, catalogue as sfx_catalogue, SfxAnchor, SfxCategory, SfxKind, SfxPreset, SfxSpec,
-    DEFAULT_SFX_INTENSITY, DEFAULT_SFX_TAIL, MAX_SFX_PITCH, MIN_SFX_CLIP_S,
+    DEFAULT_SFX_INTENSITY, DEFAULT_SFX_TAIL, MAX_SFX_PITCH, MIN_SFX_CLIP_S, SFX_HEAD_SNAP_S,
 };
 
 mod sfx_suggest;
