@@ -43,7 +43,8 @@
   sound on both sides by silence analysis (`EDGE_SILENCE_MARGIN`); pairs without it are not guessed — all unjudged is
   `skipped`, some is one tip counting them; **`jump_cut`** (tip) one asset's footage resuming on a video lane more than a
   frame and at most `JUMP_MAX_SOURCE_GAP` (8 s) later with no transition, no scene change between and no reframing
-  (`PUNCH_IN_SCALE`, a move, crop, keyed transform or other 360 view); **`stale_captions`** — the model keeps no
+  (`PUNCH_IN_SCALE`, a move, crop, keyed transform or other 360 view; a live behaviour, a shake or a breath, is a look laid
+  over the same framing and does not count, `reframed` reads the clips' keys, not `is_animated`); **`stale_captions`** — the model keeps no
   options or revision stamp for captions, so it compares words: a generated caption whose words appear as a run in
   the cut's transcripts (else it is imported or foreign and not compared; none are → `skipped`) is stale when fewer
   than `CAPTION_MATCH` of its words are spoken within `CAPTION_SLACK` (0.6 s) of it — reaching further past a clip

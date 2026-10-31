@@ -9533,7 +9533,8 @@ fn still_motion_for(clip: &Clip, assets: &[Asset], fmt: &ExportFormat, fx: &Clip
     if !asset.is_some_and(Asset::is_image) || clip.is_generated() || fx.hdr.is_some() || !clip.picture_moves() {
         return None;
     }
-    let length = ClipTiming::new(clip, fx).duration().max(0.0);
+    let timing = ClipTiming::new(clip, fx);
+    let length = timing.duration().max(0.0);
     let step = 1.0 / fmt.fps;
     // Every frame, or 4000 evenly over a very long clip (a polyline's extremes are its points). A
     // behaviour's extremes are between the points, so there every frame is judged, or the clip is
@@ -9544,7 +9545,17 @@ fn still_motion_for(clip: &Clip, assets: &[Asset], fmt: &ExportFormat, fx: &Clip
         return None;
     }
     let count = frames.clamp(1, cap);
-    let mut times: Vec<f64> = (0..=count).map(|k| length * k as f64 / count as f64).collect();
+    let mut times: Vec<f64> = if clip.has_behaviors() {
+        // The frames the export evaluates the pose at: output frame `slot + k` of the delivery's own
+        // grid (`each_frame`), `slot` the one `fps` pins the clip's first picture to, at the clip's
+        // clock (`t - timeline_start`) — not `length / count` apart from the clip's first instant, which
+        // for a clip that does not start on a frame reads a fast shake's peaks a fraction of a frame off.
+        let (_, rate, slot) = keyed_crop_fps(fmt.fps, clip.timeline_start + timing.picture_delay());
+        let at = |k: usize| (slot + k as i64) as f64 * rate.den as f64 / rate.num as f64 - clip.timeline_start;
+        (0..=count + 1).map(at).chain([0.0, length]).collect()
+    } else {
+        (0..=count).map(|k| length * k as f64 / count as f64).collect()
+    };
     for p in Property::TRANSFORM
         .iter()
         .chain(&[Property::CropZoom, Property::CropX, Property::CropY])

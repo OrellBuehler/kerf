@@ -10,8 +10,9 @@
 //! **The text is the model's arithmetic, operation for operation** ([`Behavior::term`]): the same
 //! constants in the same order, so `eval(text) == term` to the last bit apart from the libm
 //! `sin` / `cos` of the machine that runs the filter. Nothing transcendental is computed to write
-//! the text (`cos(angle*PI/180)` is left to the filter, not printed as a number), which is what
-//! keeps the golden digests the same on every machine.
+//! the text (`cos(angle*PI/180)` is left to the filter, not printed as a number), so the export's and
+//! the stream's expressions read the same on every machine. (The scrubbed still is not text of that
+//! kind: it evaluates the pose at a moment and prints the numbers, which are this machine's libm's.)
 //!
 //! Time is the clip's clock: `(t-<timeline_start>)`, as the keys read it (`t` for `overlay` /
 //! `rotate` / `scale`, the frame counter's time for a `perspective`), plus the behaviour's `phase`.
@@ -374,6 +375,111 @@ mod tests {
                 assert!(!quoted);
             }
         }
+    }
+
+    /// The window of the picture a moving still keeps, `(x, y, w, h)`, read from the `crop` it is cut to.
+    fn window(m: &StillMotion) -> (u32, u32, u32, u32) {
+        let once = m.once("");
+        let numbers: Vec<u32> = once
+            .rsplit("crop=")
+            .next()
+            .unwrap()
+            .split(':')
+            .map(|n| n.parse().unwrap())
+            .collect();
+        (numbers[2], numbers[3], numbers[0], numbers[1])
+    }
+
+    fn holds(outer: (u32, u32, u32, u32), inner: (u32, u32, u32, u32)) -> bool {
+        outer.0 <= inner.0
+            && outer.1 <= inner.1
+            && outer.0 + outer.2 >= inner.0 + inner.2
+            && outer.1 + outer.3 >= inner.1 + inner.3
+    }
+
+    /// A shake's peaks are between a clip's evenly spaced samples, and the export evaluates the pose at
+    /// the delivery's frames (`slot + k` of its grid, less the clip's start), not `length / count` from
+    /// the clip's first instant: a clip that does not start on a frame read a fast shake a fraction of a
+    /// frame off, so the window kept for the moving still could be a few pixels short of a frame it draws.
+    #[test]
+    fn a_moving_still_is_judged_at_the_frames_the_export_draws() {
+        use crate::engine::test_support::img_asset;
+        let asset = img_asset(Uuid::new_v4());
+        let fmt = ExportFormat {
+            fit: Fit::Cover,
+            ..ExportFormat::default()
+        };
+        let frame = (fmt.width, fmt.height);
+        let fx = ClipFx::default();
+        let mut worse = 0;
+        for start in [0.0, 0.017, 0.5, 1.0 / 3.0 + 0.011, 2.9, 7.123] {
+            let mut clip = Clip::new(asset.id, 0.0, 4.0, start);
+            clip.transform.scale = 1.4;
+            clip.behaviors = vec![Behavior::Shake {
+                amount: 0.06,
+                speed: 9.0,
+                seed: 3,
+                phase: 0.0,
+            }];
+            let plan = still_motion_for(&clip, std::slice::from_ref(&asset), &fmt, &fx).expect("the move is drawn by the route");
+
+            // The pose at every frame the export draws the clip on: the grid's frames from the one `fps`
+            // pins the first picture to, `ceil(length * fps)` of them.
+            let first = (start * fmt.fps).round() as i64;
+            let drawn: Vec<f64> = (0..(4.0_f64 * fmt.fps).ceil() as i64)
+                .map(|k| (first + k) as f64 / fmt.fps - start)
+                .collect();
+            let exact = StillMotion::new(&clip, still_motion::displayed(Some(&asset)), frame, frame, fmt.fit, &drawn).unwrap();
+            assert!(
+                holds(window(&plan), window(&exact)),
+                "starting at {start}: the window {:?} is short of {:?}",
+                window(&plan),
+                window(&exact)
+            );
+
+            // The even samples this replaced (a clip starting on a frame is read the same either way).
+            let count = (4.0_f64 * fmt.fps).ceil() as usize;
+            let even: Vec<f64> = (0..=count).map(|k| 4.0 * k as f64 / count as f64).collect();
+            let old = StillMotion::new(&clip, still_motion::displayed(Some(&asset)), frame, frame, fmt.fit, &even).unwrap();
+            if !holds(window(&old), window(&exact)) {
+                worse += 1;
+            }
+        }
+        assert!(
+            worse >= 2,
+            "the even samples fall short of a frame the export draws for only {worse} starts"
+        );
+    }
+
+    /// A clip without behaviours keeps the samples it always had (no digest moved): its extremes are its curve's points.
+    #[test]
+    fn a_keyed_moving_still_keeps_its_even_samples() {
+        use crate::engine::test_support::img_asset;
+        let asset = img_asset(Uuid::new_v4());
+        let fmt = ExportFormat {
+            fit: Fit::Cover,
+            ..ExportFormat::default()
+        };
+        let frame = (fmt.width, fmt.height);
+        let mut clip = Clip::new(asset.id, 0.0, 4.0, 0.017);
+        clip.set_property_keys(Property::Scale, vec![PropertyKey::new(0.0, 1.1), PropertyKey::new(4.0, 1.4)]);
+        clip.set_property_keys(
+            Property::PosX,
+            vec![PropertyKey::new(0.0, -0.04), PropertyKey::new(4.0, 0.04)],
+        );
+        let plan = still_motion_for(&clip, std::slice::from_ref(&asset), &fmt, &ClipFx::default()).unwrap();
+        let count = 120;
+        let mut even: Vec<f64> = (0..=count).map(|k| 4.0 * f64::from(k) / f64::from(count)).collect();
+        for p in Property::TRANSFORM {
+            even.extend(
+                clip.property_curve(p)
+                    .iter()
+                    .map(|pt| pt.0)
+                    .filter(|t| (0.0..=4.0).contains(t)),
+            );
+        }
+        let want = StillMotion::new(&clip, still_motion::displayed(Some(&asset)), frame, frame, fmt.fit, &even).unwrap();
+        assert_eq!(plan, want);
     }
 
     /// The reason for closed forms: a two-minute shake is a few hundred characters of graph, where the same

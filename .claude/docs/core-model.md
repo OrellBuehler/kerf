@@ -169,8 +169,8 @@
   MAX_BREATHE` = 0.9 so a scale can never reach 0 and no clamp is needed), `spin {speed, phase}` (rotation `+= speed * 360 * u`, turns a
   second, signed), `drift {speed, angle, phase}` (position `+= speed * u * (cos, sin)` of `angle` degrees, x in frame widths and y in
   heights a second, 90 is down) and `shake {amount, speed, seed, phase}` (position `+= amount * (0.5 sin + 0.3 sin + 0.2 sin)` per axis,
-  three fixed multiples of `speed` per axis, phases from `seed` by a `u32` integer hash with no libm so the golden text is the same on
-  every machine; peak `amount` of the frame, position only, never opacity / colour / mask / crop). `u = local + phase`, **local is the
+  three fixed multiples of `speed` per axis, phases from `seed` by a `u32` integer hash with no libm, so the export's expression text
+  prints no transcendental constant (`sin` / `cos` are left to the filter); peak `amount` of the frame, position only, never opacity / colour / mask / crop). `u = local + phase`, **local is the
   clip-local timeline clock the keys read**, so speed and reverse change nothing. Ranges (`MAX_SWAY_DEGREES` 180, `MAX_BEHAVIOR_HZ` 30,
   `MAX_SPIN_TURNS` 10, `MAX_DRIFT` 5, `MAX_SHAKE` 0.25, `|phase| <= 1e6`) are **refused on write** (`Behavior::check`, `check_behaviors`) and **held
   on read** (`Behavior::sanitized`: a hand-edited file or a NaN cannot reach a filter); one that moves nothing (amount or speed 0) is not
@@ -184,17 +184,21 @@
   behaviours takes the same moving-zoom / sub-pixel-placement / keyed-rotation chains a keyed one does. **A head move shifts `phase`
   by the cut** (`rebase_behaviors`, run by `rebase_animation` beside the bundle, the channels and the ramp), so a split, `Timeline::slice`
   (range export, the playback hand-over), split-and-remove, a roll / slide and a linked partner's trim carry the motion on from where
-  it was; `Project::trim`, which writes the source window without rebasing keys, leaves behaviours clip-local like keys. A split keeps them
-  on both halves. `Clip::bake_behaviors(fps, max_keys)` samples the combined result into `Linear` keys of the numbers they move at the
+  it was; a plain `Project::trim`, which writes the source window without rebasing keys, leaves behaviours clip-local like keys (the
+  module doc says so too). A split keeps them on both halves. `Clip::bake_behaviors(fps, max_keys)` samples the combined result into `Linear` keys of the numbers they move at the
   frame grid of `fps` (`k / fps - timeline_start`, plus 0 and the clip's end), folds the base keys in, clears the behaviours, and is
   exact at those frames (a line between them); it **refuses** past `max_keys` (`MAX_CHANNEL_KEYS`: about 33 s at 30 fps) rather than thin.
   `copy_keyframes` and `clear_keyframes` do not touch behaviours (a look of their own); the diff says "behaviours: sway added, shake
-  removed / changed / retimed" (a phase-only change, which a head trim makes, is "retimed"); `Rule::ClipBehavior` refuses more than 8; an
+  removed / changed / retimed" (a phase-only change, which a head move makes, is "retimed"); `Rule::ClipBehavior` refuses more than 8; an
   interchange export lists them as "behaviours" (OTIO keeps the clip whole in `metadata.kerf`). `Project::set_behaviors(ids, list)` (one
   revision for every clip, an empty list clears, a clip on an audio track refuses the lot, a lock and linked partners do not matter) and
   `Project::bake_behaviors(ids, fps)` (default: the delivery's rate, else the footage's, else 30) are the ops (`project/behavior.rs`).
   `fixtures/behaviors-corpus.json` (`KERF_BLESS_CORPUS=1 … -- behaviors_corpus`) holds the limits, the shake table, seed phases,
   resolver vectors (base and picture at times, flags), the held / refused numbers, rebase vectors and bake vectors for the TS mirror.
+  Its numbers are the blessing machine's libm's `sin` / `cos`, so the freshness test compares them **numerically** (`1e-9` relative,
+  to 1 below that; shape, strings and integers exactly), not byte for byte; the file is still written deterministically. In test builds
+  `with_libm_ulps(n, f)` runs `f` with every behaviour `sin` / `cos` `n` units in the last place off — another libm — which the corpus
+  and the golden oracle use to show they do not read that digit.
   **`TransitionKind` is three families, and the family decides the render**: a
   **dip** (`DipToBlack` / `DipToWhite`) takes both sides through a solid colour
   either side of the cut, a **dissolve** (`Crossfade`) mixes them, and a

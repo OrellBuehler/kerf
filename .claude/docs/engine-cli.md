@@ -1117,12 +1117,17 @@ so the feature is **only** activated through these forwards — which is what ma
   position, over the `perspective` frame counter), the held-keyed `zoom_scale`, the keyed `rotate`, and `still_motion`'s pose; a number no
   behaviour moves comes out as `keyframe_expr` always did, so a clip without behaviours is byte-identical (the golden digests of the first
   10000 cases did not move) and **a behaviour that moves nothing is left out**. The text is the model's arithmetic operation for operation
-  (`Behavior::term`), with nothing transcendental printed as a number (`cos(angle*PI/180)` is left to the filter), so it is the same on every
-  machine and `sweep`'s evaluator (`sin` / `cos` added) holds it to `property_at` at every time (`the_text_is_the_models_arithmetic_at_every_time`).
+  (`Behavior::term`), with nothing transcendental printed as a number (`cos(angle*PI/180)` is left to the filter), so the **export's and
+  the stream's expression text** is the same on every machine (the one libm-dependent output is the **scrubbed still**, which evaluates
+  the pose at a moment and prints its numbers; and the whole-pixel sizes of the cover crop and the moving-still window, which come from
+  the behaviours' `cos` / `sin` reach through a `ceil` and an epsilon, can in principle step on a boundary) and `sweep`'s evaluator (`sin` / `cos` added) holds it to `property_at` at every time (`the_text_is_the_models_arithmetic_at_every_time`).
   The chain is chosen by `Clip::is_driven` / `rotation_turns`, not `is_keyed`: sway and spin take the `black@0`-filled `hypot` `rotate`;
   breathe, drift and shake the moving-zoom / sub-pixel placement (zoom last), a still image the moving-still route when it covers the frame
-  at every frame (`still_motion_for` judges **every** frame of a clip with behaviours, a sinusoid's extremes being between points, and leaves
-  one of over 20000 frames to the general chain). Terms add a few levels to the curve's (a 13-key eased tree plus all five kinds stays well
+  at every frame (`still_motion_for` judges **every** frame of a clip with behaviours, a sinusoid's extremes being between points, at the
+  times the export evaluates the pose at: output frame `slot + k` of the delivery's grid, `slot` from `keyed_crop_fps` as `each_frame`
+  reads it, less the clip's start — not `length / count` from its first instant, which for a clip that does not start on a frame read a
+  fast shake's peaks off by up to 14 % of its amplitude; a clip without behaviours keeps the even samples and the curve points, so no
+  earlier digest moved — and leaves one of over 20000 frames to the general chain). Terms add a few levels to the curve's (a 13-key eased tree plus all five kinds stays well
   under libavutil's 100: tested with `eval`, which enforces the limit, and rendered), and a two-minute shake is a few hundred characters
   of graph (a sampled one is 3600 keys a number; Windows caps a command line at 32 K). `behavior_rendered.rs` (`#[ignore]`d, 6.1.1) holds
   every output frame to `transform_at` and every eighth to the scrubbed still for each kind alone and together, on keys, at 1.5x / 0.5x
