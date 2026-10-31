@@ -66,7 +66,7 @@ impl ToolSet {
             ToolSet::Clips => "Speed, transform, colour and grade, effects, masks, linked picture and sound",
             ToolSet::Keyframes => "Keyframes, per-property animation and 360 reframing",
             ToolSet::Titles => "Text overlays, SVG titles and templates, captions, markers, fonts",
-            ToolSet::Audio => "Track and master mix, ducking, loudness and band balance, voiceover",
+            ToolSet::Audio => "Track and master mix, ducking, loudness and band balance, voiceover, sound effects",
             ToolSet::Music => "Music structure, fitting and composing music, stems, snapping cuts to beats",
             ToolSet::Delivery => "Delivery format, smart crop, export, variants, cover, captions and interchange files",
             ToolSet::Tasks => "The user's task queue",

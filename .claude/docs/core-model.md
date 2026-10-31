@@ -164,7 +164,7 @@
   linked partners untouched, an agent's staged. `motion_presets()` lists id / label / kind / default duration / hint / numbers.
   `fixtures/motion-presets-corpus.json` (`KERF_BLESS_CORPUS=1 … -- motion_corpus`) holds the table and 89 input → channels cases for the TS mirror.
   **Live behaviours (B8b, `model/behavior.rs`)** are procedural motion layered on a clip's pose: `Clip.behaviors: Vec<Behavior>`
-  (absent from the file when empty; schema v19), at most `MAX_BEHAVIORS` = 8, JSON tagged by `kind` — `sway {amount, speed, phase}`
+  (absent from the file when empty; schema v20), at most `MAX_BEHAVIORS` = 8, JSON tagged by `kind` — `sway {amount, speed, phase}`
   (rotation `+= amount * sin(2 pi speed u)`, degrees, Hz), `breathe {amount, speed, phase}` (scale `*= 1 + amount * sin(..)`, `amount <=
   MAX_BREATHE` = 0.9 so a scale can never reach 0 and no clamp is needed), `spin {speed, phase}` (rotation `+= speed * 360 * u`, turns a
   second, signed), `drift {speed, angle, phase}` (position `+= speed * u * (cos, sin)` of `angle` degrees, x in frame widths and y in
@@ -246,7 +246,7 @@
   source and timeline start twice (a picture still sounding beside its sound) is kept once, first in
   track order. A reversed clip's words keep their order with times running down.
   `Project::cut_transcript_inputs` / `CutTranscriptInputs::read` split it around the lock and name the
-  `untranscribed` audible assets (an audio stream, no done transcript).
+  `untranscribed` audible assets (an audio stream, no done transcript; a synthesized sound effect is never listed, it has no speech).
   **`CaptionStyle` is the look**, and one decision rather than four:
   `Lines` (4 words / 28 chars, 5% of frame height, low in the frame) is the
   subtitle shape a line is *read* in; `WordPunch` (one word, 11%, higher, bold)
@@ -569,6 +569,57 @@
   that would cut the piece short of an impact at 80 s settles on the slower tempo that keeps it); the hits added stop at
   `MAX_HITS` (a note in the report says how many were left out) and the score returned is `validate()`d. The report lists every cut's
   `before` / `after` reading (on beat, on downbeat, offset) and the counts.
+- **Sound effects** (`model/sfx.rs`, pure + unit-tested; re-exported from `model` as `sfx_catalogue` / `sfx_anchor_s` beside the
+  types): an `SfxSpec` is `{kind, duration_s?, pitch, intensity, tail, reverse, seed}` and `{"kind":"whoosh"}` alone is valid
+  (`pitch` 0, `intensity` 0.7, `tail` 0.3, `seed` 0); it rides on `Asset.sound_effect`, which is what lets an effect be reshaped
+  (`engine-media.md` has the synthesis, `core-project.md` the placement). It refuses an unknown field (`deny_unknown_fields`),
+  `validate()` names the bad one (`duration_s` > 0 and finite; `pitch` ±12 semitones; `intensity`, `tail` 0..=1; `seed` ≤ `MAX_SEED`,
+  the music seed's 2^53 − 1). **`SfxKind`** has 21 kinds in five **`SfxCategory`**s — transition: `whoosh`, `swoosh`, `swipe`; impact:
+  `impact`, `boom`, `thud`, `punch`; build: `riser`, `downlifter`, `reverse_swell`; ui: `pop`, `click`, `ding`, `notify`, `bubble`,
+  `typewriter`; texture: `glitch`, `tape_stop`, `record_scratch`, `shutter`, `heartbeat` — and `catalogue()` is the static table, one
+  `SfxPreset` per kind in `SfxKind::ALL` order: label, category, a description of what it sounds like and where it belongs, default /
+  min / max length, `anchor` and `level_db`. **`resolved_duration_s()`** is `duration_s` or the default, held to whole milliseconds and
+  **clamped** to the kind's range (not refused: a 10 s whoosh is 3 s), and `resolved()` spells it out — that spec is what is rendered,
+  hashed and stored, so the default length spelled out is the spec that says nothing. **The anchor is the hit point**
+  (`SfxAnchor`): `hit {seconds}` (a transient a few ms in: impacts, pops, clicks, dings, …), `peak {fraction}` (a whoosh's peak, 55 %
+  in; swoosh 45 %, swipe 40 %) or `end` (riser, reverse swell); `anchor_s(spec, rendered_len)` is that in seconds, and `reverse`
+  mirrors it (`len − anchor`: a reversed impact ends on its hit). The synthesis builds its sounds on the same anchors, and a test
+  pins that the loudest part of each kind is where its anchor says. `level_db` (≤ 0) is the file's peak below the −1 dBFS every render is
+  scaled to (impacts 0, thud / punch −4 / −1, transitions −2.5 … −3, builds −3 … −4, UI −6 … −7, textures −2.5 … −6), set from the
+  loudest 100 ms (RMS) and the momentary loudness (K-weighted, 400 ms) of each kind so they sit together in a mix and not by their peaks:
+  boom and impact are the loudest, the sustained builds and passes a dB or two under them.
+- **Sound-effect suggestions** (`model/sfx_suggest.rs`, pure; `suggest_sound_effects(&SfxSuggestInputs, &SfxSuggestRequest) ->
+  Vec<SfxSuggestion>`, inputs resolved by `Project::suggest_sound_effects_inputs`). Each **moment** in the picture comes from one
+  `SfxSource` and has a score: `marker` 1.0 (a marker named `sfx:<kind>` — case, spaces and dashes forgiven, an unknown kind ignored —
+  or a bare `sfx`, an impact; **pinned**: never thinned away, it thins what is near it), `music_drop` 0.90–0.95 (a `Drop` section of a
+  composed score, read from `section_spans()`, through the clip's window and speed; analysed music — only audio classified `Music` ≥
+  0.5 — 0.55–0.85 at a 4-bar boundary where the mean chroma of the four bars either side is ≥ 0.25 apart, cosine; a **riser** of two
+  bars, 1.5–4 s and never longer than the time before it, ending on the moment, **and** an **impact** on it; no riser when under 1 s of
+  music precedes it, when the drop follows a `Build` (the build ends in its own riser) or when the score has a `Riser`/`Whoosh` hit
+  there, no impact where it has an `Impact`/`Dropout` hit), `opening` 0.80 (punchy only: an impact on the first picture), `title` 0.75
+  (text overlays that are not captions and last ≥ 0.3 s: **swipe** when centred at 60 % of the frame height or lower, else **pop**
+  up to 32 characters, else swipe; SVG overlays by preset — lower third swipes, typewriter types, word pop pops, other artwork by
+  where it sits; title clips by name), `transition` 0.70 (a swoosh as long as the transition, centred on it: a dissolve or motion
+  transition runs from the cut for `min(duration, both shots)`, a dip half either side), `punch_in` 0.65 (the same footage across a
+  cut with `review::scale_jump` ≥ `PUNCH_IN_SCALE`, neither clip keyed: a punch), `cut` ≤ 0.60 (0.35 + up to 0.15 by the shorter
+  shot's length over 1–5 s + 0.10 for a new shot — other footage, or a detected scene change between the windows; scene changes
+  inside one clip's window, 0.3 s clear of its edges, are cuts at ≤ 0.40). A cut is a join of two adjacent pictures on a video
+  track that is not a continuation of the same shot (`review`'s `head_source` / `tail_source` / `pace_gap`), not a title, and not
+  hidden by an opaque full-frame clip on a higher video track; a seamless split is no cut, but one whose second half is a punch-in
+  (the `punch_in` rule above) still is: it gets the punch, never a plain cut. **Density**: spacing subtle 4 s / balanced 2 s / punchy 1 s;
+  cuts and punch-ins need both shots ≥ 1.5 s at balanced and do not count at subtle. What cannot be suggested is dropped **before**
+  thinning so it holds nothing back: a moment within 0.25 s of an effect clip already on the timeline (an asset with `sound_effect`,
+  any track, its span widened — a riser ending there counts), a part with no kind the request's `categories` / `kinds` allow
+  (**each source has preferred kinds and fallbacks**: cut whoosh/swoosh, then swipe; transition swoosh, then whoosh/swipe; pop, then
+  bubble/click/ding; punch, then thud/impact; riser, then reverse swell; impact, then boom/thud/punch — so `kinds: ["swipe"]` turns
+  cuts into swipes, and `categories: ["impact"]` keeps the impact of a drop and loses its riser) and a part `add_sound_effects`
+  would refuse (`lands` asks `model::sfx::span`, the rule `span_for` places by: a start under 10 ms before 0 is put at 0 whole, a deeper head cut must leave `MIN_SFX_CLIP_S`). Thinning keeps markers, then the
+  highest scores (ties: earlier, then source order); at most `MAX_SFX_PER_CALL` effects survive. Survivors are in time order and
+  get the kind **alternating** within (source, part) and a **seed** that is the running index, so no two are one render; the gain is
+  −3 dB, **−8 dB** when a transcribed word of a clip that plays its own sound (not music, not an effect) is under the moment
+  (words ≤ 0.35 s apart are one stretch; 0.1 s slack). `range` (half-open) filters the answer of the **whole** cut, so a range holds
+  exactly what the whole call puts there. `at`, scores are rounded to the millisecond / 3 decimals. A property test (random
+  cuts, filters and ranges) pins sorted, spaced, valid, placeable, deterministic.
 - **Limits that keep a project loadable.** A clip's speed is `MIN_SPEED..=MAX_SPEED`
   (0.01×..100×, either sign; so is every key of a speed ramp) — `set_speed` and the ratio `set_speed_linked` hands each partner
   both hold it (the audio tempo is one `atempo` step per doubling). `Mask::normalized` maps a

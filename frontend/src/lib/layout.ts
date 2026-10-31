@@ -15,7 +15,7 @@ export const POPOUT_URL = '/popout.html';
  *  a reason to trust a hand-edited file to be reasonable. */
 export const MAX_POPOUTS = 9;
 
-export const PANEL_IDS = ['library', 'preview', 'timeline', 'inspector', 'agent', 'deliver', 'mixer', 'scopes', 'keyframes'] as const;
+export const PANEL_IDS = ['library', 'preview', 'timeline', 'inspector', 'agent', 'deliver', 'mixer', 'sfx', 'scopes', 'keyframes'] as const;
 export type PanelId = (typeof PANEL_IDS)[number];
 
 /** The width of the library's icon rail. The panel's registry minimum, so a
@@ -47,6 +47,9 @@ export const PANELS: Record<PanelId, PanelSpec> = {
 	// A strip is ~84 px wide and the master another ~130: two tracks and the master
 	// fit in 340 px, and a third scrolls. Tall enough for a fader to have travel.
 	mixer: { title: 'Mixer', minimumWidth: 340, minimumHeight: 230, defaultWidth: 460 },
+	// A grid of three tiles across, the search and the category chips over it; the shape controls scroll under the grid
+	// until the panel is wide enough to put them beside it.
+	sfx: { title: 'Sound FX', minimumWidth: 300, minimumHeight: 220, defaultWidth: 460 },
 	// A scope reads at a couple of hundred pixels; the readout under it needs the width.
 	scopes: { title: 'Scopes', minimumWidth: 240, minimumHeight: 200, defaultWidth: 340 },
 	// The dope sheet: a label column and enough of a time axis to drag a key along.
@@ -149,7 +152,7 @@ export const PRESET_LAYOUTS: Record<WorkspaceId, SerializedDockview> = {
 		[
 			leaf('library', ['library'], 240),
 			leaf('preview', ['preview'], 470),
-			leaf('mixer', ['mixer'], 430),
+			leaf('mixer', ['mixer', 'sfx'], 430),
 			leaf('inspector', ['inspector', 'agent'], 300)
 		],
 		344
@@ -584,10 +587,10 @@ export function presetPanelIds(id: WorkspaceId): PanelId[] {
 
 /** What a layout stored before layouts recorded it was offered: the panels of
  *  each preset as they stood when that was the only kind there was — every
- *  preset as it is now, bar the mixer Audio gained, the scopes Color did and the
- *  dope sheet Motion did. */
+ *  preset as it is now, bar the mixer and the Sound FX panel Audio gained, the
+ *  scopes Color did and the dope sheet Motion did. */
 export const UNSTAMPED_OFFERED: Record<WorkspaceId, PanelId[]> = Object.fromEntries(
-	WORKSPACE_IDS.map((id) => [id, presetPanelIds(id).filter((p) => p !== 'mixer' && p !== 'scopes' && p !== 'keyframes')])
+	WORKSPACE_IDS.map((id) => [id, presetPanelIds(id).filter((p) => p !== 'mixer' && p !== 'sfx' && p !== 'scopes' && p !== 'keyframes')])
 ) as Record<WorkspaceId, PanelId[]>;
 
 /** Presets as an earlier build shipped them, for the ones that changed shape

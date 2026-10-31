@@ -526,6 +526,11 @@ pub struct Asset {
     /// again replaces the clip's audio; the asset's bar and tempo analysis is written from it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub music_score: Option<MusicScore>,
+    /// The spec this audio was synthesized from, when Kerf made it (`add_sound_effects`) rather
+    /// than the user importing it. `None` for ordinary media. Reshaping the effect renders a new
+    /// one from an edited spec and swaps the clip's audio.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sound_effect: Option<SfxSpec>,
     /// The labels on the asset (`location: Cumbuco`, `jump`), for finding it and for building a cut by
     /// a key. Set with [`crate::Project::edit_asset_tags`], never by probing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1028,6 +1033,12 @@ impl AnalysisKind {
     /// sound has none of it to find — and nothing to fail on.
     pub fn needs_audio(self) -> bool {
         self != AnalysisKind::Scenes
+    }
+
+    /// Whether the step has anything to find in a synthesized sound effect: only its silence and
+    /// loudness. It has no picture to cut, no beat to read and no words to hear.
+    pub fn fits_effect(self) -> bool {
+        matches!(self, AnalysisKind::Silence | AnalysisKind::Loudness)
     }
 
     /// The wire name (`silence`, `scenes`, `loudness`, `rhythm`, `transcript`).
@@ -5419,6 +5430,18 @@ pub use score::{
 #[cfg(test)]
 pub(crate) use score::{sample_song, style_shares};
 
+mod sfx;
+pub(crate) use sfx::span as sfx_span;
+pub use sfx::{
+    anchor_s as sfx_anchor_s, catalogue as sfx_catalogue, SfxAnchor, SfxCategory, SfxKind, SfxPreset, SfxSpec,
+    DEFAULT_SFX_INTENSITY, DEFAULT_SFX_TAIL, MAX_SFX_PITCH, MIN_SFX_CLIP_S, SFX_HEAD_SNAP_S,
+};
+
+mod sfx_suggest;
+pub use sfx_suggest::{
+    suggest as suggest_sound_effects, SfxDensity, SfxSource, SfxSuggestInputs, SfxSuggestRequest, SfxSuggestion,
+};
+
 mod music_fit;
 pub use music_fit::{
     music_fit_clips, plan_music_fit, to_samples, MusicFit, MusicFitReport, MusicSegment, FIT_FADE_S, MAX_FIT_BARS,
@@ -8040,6 +8063,7 @@ mod tests {
             source_paths: Vec::new(),
             voiceover: None,
             music_score: None,
+            sound_effect: None,
             tags: Vec::new(),
         };
         assert_eq!(asset.hdr(), Some(Hdr::Hlg));

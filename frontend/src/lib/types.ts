@@ -56,6 +56,9 @@ export interface Asset {
 	/** Set on composed music: the score it was rendered from, which is what "edit and compose
 	 *  again" starts from. Absent for ordinary media. */
 	music_score?: MusicScore;
+	/** Set on a synthesized sound effect: the spec it was rendered from, which is what "reshape it" starts from
+	 *  (`updateSoundEffect`). Absent for ordinary media. */
+	sound_effect?: SfxSpec;
 	/** The labels on the asset (`location: Cumbuco`, `jump`), for finding it and for building a cut by a key.
 	 *  Set with `editAssetTags`, never by probing. Absent when it has none. */
 	tags?: Tag[];
@@ -2279,6 +2282,131 @@ export interface MusicProgress {
 	fraction: number | null;
 	/** A short note, e.g. `12 MB / 32 MB`, `12 of 90 s`, or why a render is waiting. */
 	detail: string | null;
+}
+
+// ---- sound effects (kerf_core::{SfxSpec, SfxPreset, SfxPlacement, SfxSuggestion}) ----------------
+
+/** What an effect is, by role in an edit (`kerf_core::SfxCategory`, snake_case on the wire). */
+export type SfxCategory = 'transition' | 'impact' | 'build' | 'ui' | 'texture';
+
+/** Which sound (`kerf_core::SfxKind`, snake_case on the wire): the catalogue has one row for each. */
+export type SfxKind =
+	| 'whoosh'
+	| 'swoosh'
+	| 'swipe'
+	| 'impact'
+	| 'boom'
+	| 'thud'
+	| 'punch'
+	| 'riser'
+	| 'downlifter'
+	| 'reverse_swell'
+	| 'pop'
+	| 'click'
+	| 'ding'
+	| 'notify'
+	| 'bubble'
+	| 'typewriter'
+	| 'glitch'
+	| 'tape_stop'
+	| 'record_scratch'
+	| 'shutter'
+	| 'heartbeat';
+
+/** What to synthesize, as the backend writes it (an asset's `sound_effect`): every field but `duration_s`, which is
+ *  absent for the kind's own length. */
+export interface SfxSpec {
+	kind: SfxKind;
+	/** How long the render is, seconds; absent is the kind's default. Clamped to the kind's range, held to whole milliseconds. */
+	duration_s?: number;
+	/** Semitones, -12 to 12 (default 0). */
+	pitch: number;
+	/** 0 to 1 (default 0.7): brightness, aggression and density. */
+	intensity: number;
+	/** 0 to 1 (default 0.3): how much reverb / echo rings after the sound. */
+	tail: number;
+	/** Played backwards: a swell into the hit. The hit point mirrors. */
+	reverse: boolean;
+	/** Varies the noise and the details; the same spec and seed are the same audio. 0 to 2^53 - 1. */
+	seed: number;
+}
+
+/** A spec as a caller may write it: `{ kind: 'whoosh' }` alone is one, and the backend fills what is left out. */
+export type SfxSpecInput = Pick<SfxSpec, 'kind'> & Partial<Omit<SfxSpec, 'kind'>>;
+
+/** Where an effect's hit point is (`kerf_core::SfxAnchor`, tagged by `type`). */
+export type SfxAnchor =
+	| { type: 'hit'; seconds: number }
+	| { type: 'peak'; fraction: number }
+	| { type: 'end' };
+
+/** One row of the catalogue (`sfx_catalogue`). */
+export interface SfxPreset {
+	kind: SfxKind;
+	label: string;
+	category: SfxCategory;
+	/** What it sounds like and where it belongs in an edit. */
+	description: string;
+	default_duration_s: number;
+	min_duration_s: number;
+	max_duration_s: number;
+	/** The hit point, before `reverse` mirrors it. */
+	anchor: SfxAnchor;
+	/** How far below the common peak the kind is meant to sit, dB (0 or less). */
+	level_db: number;
+}
+
+/** One effect to place (`kerf_core::SfxPlacement`): a spec's fields flat, with where its hit lands. A key it does
+ *  not have is an error naming it. */
+export interface SfxPlacement extends SfxSpecInput {
+	/** Where the effect's hit point lands on the timeline, seconds: a whoosh's peak, an impact's first transient, a
+	 *  riser's end. The clip starts that much earlier (cut off at 0 when that would be before the start). */
+	at: number;
+	/** The clip's gain, dB (-60 to 12; default 0). */
+	volume_db?: number;
+	/** The audio track to put it on; absent, the first `FX` lane with room (`FX 2`, … made when none fits). */
+	track_id?: string;
+}
+
+/** How many effects to suggest (`kerf_core::SfxDensity`). */
+export type SfxDensity = 'subtle' | 'balanced' | 'punchy';
+
+/** The picture event a suggestion is for (`kerf_core::SfxSource`). */
+export type SfxSource = 'cut' | 'transition' | 'title' | 'punch_in' | 'music_drop' | 'marker' | 'opening';
+
+/** What to suggest (`kerf_core::SfxSuggestRequest`); `{}` is the whole cut at balanced density. A key it does not
+ *  have is an error naming it. */
+export interface SfxSuggestRequest {
+	/** Only suggestions whose hit falls in `[start, end)`, timeline seconds. */
+	range?: TimeRange;
+	density?: SfxDensity;
+	/** Only effects of these categories; with `kinds`, an effect of either list is kept. */
+	categories?: SfxCategory[];
+	kinds?: SfxKind[];
+}
+
+/** One effect worth adding (`kerf_core::SfxSuggestion`). */
+export interface SfxSuggestion {
+	/** Exactly what `addSoundEffects` takes: the kind, its seed, where its hit lands and the gain (lower over speech).
+	 *  Never names a track. */
+	placement: SfxPlacement;
+	source: SfxSource;
+	/** Why, as a sentence: `Cut from interview.mp4 to broll.mp4 at 0:12.5`. */
+	reason: string;
+	/** 0 to 1: how much the moment wants a sound. */
+	score: number;
+}
+
+/** What `add_sound_effects` answers: the clips placed, in the order asked, and the refreshed timeline. */
+export interface SfxAdded {
+	clips: Clip[];
+	timeline: Timeline;
+}
+
+/** What `update_sound_effect` answers: the clip as it stands and the refreshed timeline. */
+export interface SfxUpdated {
+	clip: Clip;
+	timeline: Timeline;
 }
 
 // ---- band balance (kerf_core::BandBalance, `get_band_balance`) -----------------------------

@@ -228,6 +228,7 @@ impl Project {
             source_paths: Vec::new(),
             voiceover: None,
             music_score: None,
+            sound_effect: None,
             tags: Vec::new(),
         };
         let clip_id = req.replace_clip_id.unwrap_or_else(Uuid::new_v4);

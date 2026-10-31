@@ -1537,6 +1537,7 @@ fn probe_composite_red(ffmpeg: &str, ffprobe: &str, tag_bt709: bool, deadline: I
         source_paths: Vec::new(),
         voiceover: None,
         music_score: None,
+        sound_effect: None,
         tags: Vec::new(),
     };
     let timeline = Timeline {
@@ -15966,6 +15967,7 @@ mod tests {
             source_paths: Vec::new(),
             voiceover: None,
             music_score: None,
+            sound_effect: None,
             tags: Vec::new(),
         };
         let timeline = single(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]);
@@ -16010,6 +16012,7 @@ mod tests {
             source_paths: Vec::new(),
             voiceover: None,
             music_score: None,
+            sound_effect: None,
             tags: Vec::new(),
         };
         let a2 = Asset {
@@ -16022,6 +16025,7 @@ mod tests {
             source_paths: Vec::new(),
             voiceover: None,
             music_score: None,
+            sound_effect: None,
             tags: Vec::new(),
         };
         let timeline = single(vec![make_clip(a1.id, 0.0, 20.0, 0.0), make_clip(a2.id, 0.0, 10.0, 20.0)]);
@@ -16053,6 +16057,7 @@ mod tests {
             source_paths: Vec::new(),
             voiceover: None,
             music_score: None,
+            sound_effect: None,
             tags: Vec::new(),
         };
         let timeline = single(vec![make_clip(video_only.id, 0.0, 5.0, 0.0)]);
@@ -16083,6 +16088,7 @@ mod tests {
             source_paths: Vec::new(),
             voiceover: None,
             music_score: None,
+            sound_effect: None,
             tags: Vec::new(),
         };
         let timeline = single(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]);
@@ -16116,6 +16122,7 @@ mod tests {
             source_paths: Vec::new(),
             voiceover: None,
             music_score: None,
+            sound_effect: None,
             tags: Vec::new(),
         };
         let timeline = single(vec![make_clip(asset.id, 0.0, 10.0, 0.0)]);
@@ -16157,6 +16164,7 @@ mod tests {
             source_paths: Vec::new(),
             voiceover: None,
             music_score: None,
+            sound_effect: None,
             tags: Vec::new(),
         }
     }
@@ -21638,6 +21646,7 @@ mod tests {
                 source_paths: Vec::new(),
                 voiceover: None,
                 music_score: None,
+                sound_effect: None,
                 tags: Vec::new(),
             };
             let timeline = Timeline {

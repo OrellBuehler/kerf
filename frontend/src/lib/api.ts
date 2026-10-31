@@ -80,6 +80,13 @@ import type {
 	MusicFit,
 	MusicFitted,
 	MusicProgress,
+	SfxAdded,
+	SfxPlacement,
+	SfxPreset,
+	SfxSpecInput,
+	SfxSuggestRequest,
+	SfxSuggestion,
+	SfxUpdated,
 	MusicStatus,
 	ComposeRequest,
 	ComposeResult,
@@ -221,6 +228,20 @@ import {
 	validateScore
 } from './music-score';
 import { musicBed, musicStart, putMusic, rehearseMusic } from './music-place';
+import {
+	SFX_CATALOGUE,
+	checkSfxPlacements,
+	checkSfxSpec,
+	checkSfxSuggestRequest,
+	planSoundEffectUpdate,
+	planSoundEffects,
+	putSoundEffects,
+	replaceEffect,
+	sfxAsset,
+	sfxHitAt,
+	sfxSpecProblem,
+	suggestSoundEffects as harnessSuggestSoundEffects
+} from './sfx';
 import { checkBandRequest, checkComposeRequest } from './music-wire';
 import { balanceNotes, checkSections, equalWindows, phraseWindows, clipWindows, synthBalance } from './band-balance';
 import { sampleMusicAnalysis, SAMPLE_MUSIC_DURATION } from './sample-music';
@@ -2134,6 +2155,108 @@ export async function onMusicProgress(cb: (p: MusicProgress) => void): Promise<(
 	}
 	const { listen } = await import('@tauri-apps/api/event');
 	return listen<MusicProgress>('music-progress', (e) => cb(e.payload));
+}
+
+// ---- sound effects --------------------------------------------------------------
+// Effects are synthesized by the backend (milliseconds, no download, the same spec the same audio) and placed on `FX`
+// audio tracks with their **hit** on the time asked: `at` is where a whoosh peaks, an impact lands, a riser ends — the clip
+// starts earlier. The harness synthesizes nothing: it places stand-in assets of the right length by the same rules
+// (`sfx.ts`), so the panels, the lanes and the anchor rule are explorable, and Audition is silent.
+
+/** What an effect abandoned because its project was replaced rejects with, for the page to stay quiet on. */
+export const SFX_CANCELLED = 'sound effect cancelled';
+
+/** Every sound effect Kerf can make, one row per kind: label, category, what it sounds like, the lengths it may have, where
+ *  its hit point is and how loud it sits. The harness has a copy of the Rust table (`sfx.ts`, pinned to it by a test). */
+export async function sfxCatalogue(): Promise<SfxPreset[]> {
+	if (!inTauri()) return structuredClone([...SFX_CATALOGUE]);
+	return invoke<SfxPreset[]>('sfx_catalogue');
+}
+
+/** `spec` rendered for auditioning, as the bytes of a 48 kHz stereo 16-bit WAV for `decodeAudioData`: no edit, no asset, and
+ *  the same spec is the same audio that placing it would use (in a cache file of its own, not among the project's effects).
+ *  `null` in the browser harness, which synthesizes nothing. */
+export async function previewSoundEffect(spec: SfxSpecInput): Promise<ArrayBuffer | null> {
+	if (!inTauri()) {
+		checkSfxSpec(spec);
+		const bad = sfxSpecProblem(spec);
+		if (bad) throw new Error(`invalid argument: ${bad}`);
+		return null;
+	}
+	return invoke<ArrayBuffer>('preview_sound_effect', { spec });
+}
+
+/** Render `placements` and put them on the timeline as **one** revision: each clip's hit at its `at`, on the first `FX` lane
+ *  with room unless it names a track (`FX 2`, … are made when none fits). `ripple` forces ripple on or off for the call.
+ *  Answers the clips in the order asked and the refreshed timeline. Everything is checked before anything is made: a refusal
+ *  names the effect (`effects[2] (riser): …`) and changes nothing. */
+export async function addSoundEffects(placements: SfxPlacement[], ripple?: boolean): Promise<SfxAdded> {
+	if (!inTauri()) {
+		checkSfxPlacements(placements);
+		const on = ripple ?? devRippleMode;
+		const plan = planSoundEffects(devTimeline, placements, on, uid);
+		// The same spec is the same render and the same asset, stored only once the placement has gone through.
+		const fresh: Asset[] = [];
+		const assets = plan.map((e) => {
+			const made = sfxAsset(e.spec, uid);
+			const known = sampleAssets.find((a) => a.path === made.path) ?? fresh.find((a) => a.path === made.path);
+			if (known) return known;
+			fresh.push(made);
+			return made;
+		});
+		const ids = plan.map(() => uid());
+		const done = runEdit(devTimeline, { ripple: on, links: devLinks(undefined), lanes: ids }, (scratch) =>
+			putSoundEffects(scratch, assets, plan, ids, uid)
+		);
+		sampleAssets.push(...fresh);
+		devTimeline = done.timeline;
+		recordDev(plan.length === 1 ? 'Add sound effect' : 'Add sound effects');
+		return { clips: done.result, timeline: snapshot() };
+	}
+	return invoke<SfxAdded>('add_sound_effects', { placements, ripple });
+}
+
+/** Render the effect on `clipId` again from `spec` — the whole spec: what it leaves out is back at its default — and swap
+ *  the clip's audio, keeping its id, its gain (unless `volumeDb` says another), fades, effects and the timeline position of
+ *  its **hit**. One revision; refused for a clip that is not a synthesized sound effect. */
+export async function updateSoundEffect(clipId: string, spec: SfxSpecInput, volumeDb?: number, ripple?: boolean): Promise<SfxUpdated> {
+	if (!inTauri()) {
+		checkSfxSpec(spec);
+		const on = ripple ?? devRippleMode;
+		const plan = planSoundEffectUpdate(devTimeline, clipId, spec, volumeDb, assetById, on);
+		const made = sfxAsset(plan.spec, uid);
+		const known = sampleAssets.find((a) => a.path === made.path);
+		const asset = known ?? made;
+		let clip!: Clip;
+		const done = runEdit(devTimeline, { ripple: on, links: devLinks(undefined), lanes: [clipId] }, (scratch) => {
+			// The hit goes back where it is in the clip as it stands now.
+			const found = locate(scratch, clipId);
+			if (!found) throw new Error(`clip not found: ${clipId}`);
+			const current = found[0].clips[found[1]];
+			const old = assetById(current.asset_id);
+			if (!old?.sound_effect) {
+				throw new Error('invalid argument: that clip is not a sound effect: only a clip of a synthesized sound effect can be reshaped');
+			}
+			const hit = sfxHitAt(current, { duration: old.duration, sound_effect: old.sound_effect });
+			clip = replaceEffect(scratch, clipId, asset, plan.spec, plan.volume_db, hit);
+		});
+		if (!known) sampleAssets.push(made);
+		devTimeline = done.timeline;
+		recordDev('Edit sound effect');
+		return { clip, timeline: snapshot() };
+	}
+	return invoke<SfxUpdated>('update_sound_effect', { clipId, spec, volumeDb, ripple });
+}
+
+/** Where the working cut would take a sound effect — its cuts, transitions, titles, punch-ins, drops in the music and `sfx`
+ *  markers — as placements `addSoundEffects` takes as they are, sorted by time. A read. The harness reads the sample cut
+ *  with a copy of the rules (`sfx.ts`). */
+export async function suggestSoundEffects(request: SfxSuggestRequest = {}): Promise<SfxSuggestion[]> {
+	if (!inTauri()) {
+		checkSfxSuggestRequest(request);
+		return harnessSuggestSoundEffects({ timeline: devTimeline, assets: sampleAssets, analyses: sampleAnalysis }, request);
+	}
+	return invoke<SfxSuggestion[]>('suggest_sound_effects', { request });
 }
 
 // ---- band balance ---------------------------------------------------------------
@@ -5642,7 +5765,7 @@ const HARNESS_TOOL_SETS: McpToolSet[] = [
 	{ name: 'clips', description: 'Speed, transform, colour and grade, effects, masks, linked picture and sound', tools: 17 },
 	{ name: 'keyframes', description: 'Keyframes, per-property animation and 360 reframing', tools: 12 },
 	{ name: 'titles', description: 'Text overlays, SVG titles and templates, captions, markers, fonts', tools: 32 },
-	{ name: 'audio', description: 'Track and master mix, ducking, loudness and band balance, voiceover', tools: 13 },
+	{ name: 'audio', description: 'Track and master mix, ducking, loudness and band balance, voiceover, sound effects', tools: 17 },
 	{ name: 'music', description: 'Music structure, fitting and composing music, stems, snapping cuts to beats', tools: 8 },
 	{ name: 'delivery', description: 'Delivery format, smart crop, export, variants, cover, captions and interchange files', tools: 16 },
 	{ name: 'tasks', description: "The user's task queue", tools: 7 },

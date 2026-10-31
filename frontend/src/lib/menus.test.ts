@@ -153,6 +153,7 @@ describe('Edit', () => {
 			'edit.selectAll',
 			'title.add',
 			'title.generateCaptions',
+			'sfx.add',
 			'tool.rippleMode',
 			'tool.snap',
 			'app.keyboard'
@@ -178,6 +179,13 @@ describe('Edit', () => {
 			expect('disabled' in e && e.disabled, label).toBe(true);
 			expect('reason' in e && e.reason, label).toBe('Select a clip first');
 		}
+	});
+
+	test('a sound effect is added at the playhead from here, and is held while a proposal is previewed', () => {
+		const entry = find(menu('edit').items, 'Add sound effect at playhead');
+		expect('disabled' in entry && entry.disabled).toBeFalsy();
+		const held = find(menu('edit', { previewing: true }).items, 'Add sound effect at playhead');
+		expect('disabled' in held && held.disabled).toBe(true);
 	});
 
 	test('a title can always be added; captions wait for a clip on the cut', () => {

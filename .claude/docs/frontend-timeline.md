@@ -305,6 +305,11 @@ click would land on. It also **cannot stand past the end of the cut**: an effect
 the point (`laneAt`, `[data-lane]`) for the ghost, and the release calls `ui.assetDropTarget` (`onLaneDrop`, one
 `editor.add`). Escape, pointercancel and blur abandon it. It works within one window: a bin in a popout does not drop
 onto the main window's lanes.
+A **sound effect** from the Sound FX panel drops the same way (`ui.dndSfx`, `ui.sfxDropTarget`, `onSfxDrop`) but only on an audio lane, and what lands
+is its *hit*: the pointer's time snapped to the playhead, a cut between pictures, a beat or bar or a clip edge of the lane, the clip starting
+earlier by how far in its hit is (`dropGhostFor`; the ghost is red where it cannot land or would overlap — with ripple on, running into the
+front of a clip is a drop that pushes it, and only starting inside one is red — and a red one is refused on release, in words) — one
+`addSoundEffects` with the lane's `track_id`. A panel popped out into a window does not drag.
 The playhead's *head* lives in the sticky ruler, so it stays when the tracks scroll vertically.
 **The render bar** (`RenderBar.svelte`, `render-bar.ts`) is a 3 px strip along the ruler's top edge saying how the
 Preview will play each span, from `get_render_bar` (`kerf_core::render_bar`: the cut planned as a play session from

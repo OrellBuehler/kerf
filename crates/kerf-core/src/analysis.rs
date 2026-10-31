@@ -909,7 +909,9 @@ pub fn default_kinds() -> Vec<AnalysisKind> {
 /// The steps a request for `requested` (the [`default_kinds`] when `None`) actually runs on
 /// `asset`: a file with no audio has none of silence, loudness, rhythm or speech to find, so
 /// those are left out rather than run to nothing or fail, and a still image has nothing to
-/// analyze at all. An empty answer is an error that says why — a caller that names no steps
+/// analyze at all. A synthesized sound effect has no picture, no rhythm worth reading and no
+/// speech (whisper would only hallucinate words over a whoosh), so it keeps silence and loudness
+/// only. An empty answer is an error that says why — a caller that names no steps
 /// while everything is switched off, or one that asks a silent file for its speech, is told,
 /// not handed an empty result.
 pub fn resolve_steps(asset: &Asset, requested: Option<&[AnalysisKind]>) -> Result<Vec<AnalysisKind>> {
@@ -921,25 +923,35 @@ pub fn resolve_steps(asset: &Asset, requested: Option<&[AnalysisKind]>) -> Resul
     }
     let wanted = requested.map(<[AnalysisKind]>::to_vec).unwrap_or_else(default_kinds);
     let has_audio = asset.has_audio();
+    let effect = asset.sound_effect.is_some();
     let kinds: Vec<AnalysisKind> = AnalysisKind::ALL
         .into_iter()
-        .filter(|k| wanted.contains(k) && (has_audio || !k.needs_audio()))
+        .filter(|k| wanted.contains(k) && (has_audio || !k.needs_audio()) && !(effect && !k.fits_effect()))
         .collect();
     if !kinds.is_empty() {
         return Ok(kinds);
     }
+    let named = || {
+        AnalysisKind::ALL
+            .into_iter()
+            .filter(|k| wanted.contains(k))
+            .map(|k| k.name())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
     Err(Error::InvalidArgument(if wanted.is_empty() {
         "no analysis steps to run: every analysis is switched off in Settings › Analysis (name steps — silence, scenes, loudness, rhythm, transcript — to run them anyway)".to_string()
+    } else if effect {
+        format!(
+            "{} is a synthesized sound effect, so {} cannot run on it; only silence and loudness apply",
+            asset.name,
+            named()
+        )
     } else {
         format!(
             "{} has no audio, so {} cannot run on it; only scene detection applies",
             asset.name,
-            AnalysisKind::ALL
-                .into_iter()
-                .filter(|k| wanted.contains(k))
-                .map(|k| k.name())
-                .collect::<Vec<_>>()
-                .join(", ")
+            named()
         )
     }))
 }
@@ -1632,6 +1644,31 @@ mod tests {
         assert!(
             err.contains("switched off in Settings") && err.contains("name steps"),
             "{err}"
+        );
+    }
+
+    #[test]
+    fn a_synthesized_sound_effect_keeps_silence_and_loudness_only() {
+        let _gate = crate::engine::cpu::test_lock();
+        let mut effect = crate::engine::test_support::test_asset(vec![crate::engine::test_support::audio_stream(48_000, 2)]);
+        effect.sound_effect = Some(crate::model::SfxSpec::new(crate::model::SfxKind::Whoosh));
+        assert_eq!(
+            resolve_steps(&effect, Some(&AnalysisKind::ALL)).unwrap(),
+            [AnalysisKind::Silence, AnalysisKind::Loudness],
+            "no speech to hear (whisper would invent words over a whoosh), no picture, no beat"
+        );
+        let err = resolve_steps(&effect, Some(&[AnalysisKind::Transcript, AnalysisKind::Scenes]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("synthesized sound effect") && err.contains("scenes, transcript"),
+            "{err}"
+        );
+        effect.sound_effect = None;
+        assert_eq!(
+            resolve_steps(&effect, Some(&AnalysisKind::ALL)).unwrap().len(),
+            AnalysisKind::ALL.len(),
+            "ordinary audio keeps every step"
         );
     }
 

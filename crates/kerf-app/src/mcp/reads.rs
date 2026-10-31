@@ -183,6 +183,10 @@ pub(super) struct AssetLine {
     /// Absent otherwise.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     music_score: bool,
+    /// The audio is a synthesized sound effect (`add_sound_effects`): its kind (`whoosh`); the spec is
+    /// in the full listing. Absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sound_effect: Option<&'static str>,
     /// The source file is gone from disk. Absent otherwise.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     source_missing: bool,
@@ -251,6 +255,7 @@ impl AssetLine {
             analysis_running: kinds_in(status, kerf_core::AnalysisState::Running).join(" "),
             analysis_failed,
             music_score: asset.music_score.is_some(),
+            sound_effect: asset.sound_effect.as_ref().map(|spec| spec.kind.name()),
             source_missing: !std::path::Path::new(&asset.path).exists(),
             tags: tag_texts(&asset.tags),
         }
@@ -708,6 +713,74 @@ pub(super) fn timeline_brief(timeline: &Timeline) -> serde_json::Value {
     brief
 }
 
+// ---- sound effects -------------------------------------------------------------
+
+/// Where an effect's hit point is, in words: what `list_sound_effects` says beside the anchor.
+pub(super) fn sfx_hit_words(anchor: &kerf_core::SfxAnchor) -> String {
+    match *anchor {
+        kerf_core::SfxAnchor::Hit { seconds } if seconds <= 0.0 => "the very start of the sound".to_string(),
+        kerf_core::SfxAnchor::Hit { seconds } => format!("a transient {:.0} ms into the sound", seconds * 1000.0),
+        kerf_core::SfxAnchor::Peak { fraction } => format!("the peak, {:.0} % of the way through the sound", fraction * 100.0),
+        kerf_core::SfxAnchor::End => "the very end: the sound builds to the hit".to_string(),
+    }
+}
+
+fn round_to(value: f64, places: i32) -> f64 {
+    let scale = 10f64.powi(places);
+    (value * scale).round() / scale
+}
+
+/// The lane (id and name) clip `clip_id` is on in `timeline`; a clip that is not there gets a nil id and no name.
+pub(super) fn sfx_lane(timeline: &Timeline, clip_id: uuid::Uuid) -> (uuid::Uuid, String) {
+    timeline
+        .locate(clip_id)
+        .map(|(ti, _)| (timeline.tracks[ti].id, timeline.tracks[ti].name.clone()))
+        .unwrap_or_default()
+}
+
+/// One effect clip as the sound-effect tools answer it: the clip and its lane, the sound, and where its
+/// hit really lands (`at`, from core: a start a few milliseconds before 0 is put at 0 and its hit is
+/// that much later than asked) beside where the clip starts and ends. `lane` is the lane's id and name.
+pub(super) fn sfx_clip_row(
+    placed: &kerf_core::SfxPlaced,
+    lane: &(uuid::Uuid, String),
+    spec: &kerf_core::SfxSpec,
+) -> serde_json::Value {
+    let clip = &placed.clip;
+    serde_json::json!({
+        "clip_id": clip.id,
+        "asset_id": clip.asset_id,
+        "track_id": lane.0,
+        "track_name": lane.1,
+        "kind": spec.kind.name(),
+        "at": round_to(placed.hit, 3),
+        "start": round_to(clip.timeline_start, 3),
+        "end": round_to(clip.timeline_end(), 3),
+        "volume_db": round_to(20.0 * f64::from(clip.volume).max(1e-6).log10(), 2),
+        "spec": spec,
+    })
+}
+
+/// What `add_sound_effects` answers: a row per effect in the order asked, each with the lane it landed on
+/// in `timeline`, and the assets the clips play **as stored** (the same render put on twice is one asset),
+/// once each.
+pub(super) fn sfx_answer(plan: &kerf_core::SfxPlan, placed: &[kerf_core::SfxPlaced], timeline: &Timeline) -> serde_json::Value {
+    let rows: Vec<serde_json::Value> = plan
+        .effects
+        .iter()
+        .zip(placed)
+        .map(|(effect, p)| sfx_clip_row(p, &sfx_lane(timeline, p.clip.id), &effect.spec))
+        .collect();
+    let mut seen = std::collections::HashSet::new();
+    let assets: Vec<serde_json::Value> = placed
+        .iter()
+        .map(|p| &p.asset)
+        .filter(|a| seen.insert(a.id))
+        .map(|a| serde_json::json!({ "id": a.id, "name": a.name, "duration": round_to(a.duration, 3) }))
+        .collect();
+    serde_json::json!({ "clips": rows, "assets": assets })
+}
+
 /// One medium the cut uses that is not in a good state for previewing.
 #[derive(Debug, Serialize, PartialEq)]
 pub(super) struct MediaNote {
@@ -963,7 +1036,7 @@ pub(super) struct ListAssetsParams {
     #[schemars(
         description = "`full` (default): each asset whole — every probed stream, a voiceover's script, a music score — about 1 KB \
                        apiece. `compact`: one short line each (id, name, duration, media = picture format / audio, imported_at, \
-                       proxy state, analysis, and `music_score` / `source_missing` when true), about a quarter of the size: use it to \
+                       proxy state, analysis, and `music_score` / `sound_effect` / `source_missing` when set), about a quarter of the size: use it to \
                        find an asset in a big library"
     )]
     fields: Option<AssetFields>,
@@ -1096,7 +1169,7 @@ impl KerfMcp {
                        the whole library was imported) and `assets`. A page is at most `limit` assets (default 100, at most 500) \
                        and about 20,000 characters, so a big library comes in several pages: follow `next_offset`. By default \
                        each asset is shown whole, about 1 KB apiece: its probed streams, `source_missing` (the file is gone \
-                       from disk — set only when true), `music_score` (set when the audio was composed with compose_music), \
+                       from disk — set only when true), `music_score` (set when the audio was composed with compose_music), `sound_effect` (set when it is a synthesized effect: its spec, the one update_sound_effect starts from), \
                        `proxy` (the preview proxy: `state` is ready, building with `fraction` and `eta_secs`, queued, missing, \
                        failed with a `reason`, off, or not_needed; until it is ready previews decode the original and are \
                        slower — export is not affected) and `analysis` (per kind — silence, scenes, loudness, rhythm, \
@@ -1104,7 +1177,7 @@ impl KerfMcp {
                        `fields: \"compact\"`: one short line per asset — `id`, `name`, `duration`, `media` (\"3840x2160@59.94\", \
                        \"audio\", \"4000x3000 still\"), `imported_at`, `proxy` (just its state), `analysis` (the kinds that are \
                        done: \"all\", \"none\" or e.g. \"silence scenes\"; `analysis_running` and `analysis_failed` when any) and \
-                       `music_score` (true: the score itself is in the whole entry and in get_asset_metadata) / `source_missing` when true. To find what an import added, take `newest_imported_at` from \
+                       `music_score` (true: the score itself is in the whole entry and in get_asset_metadata) / `sound_effect` (the effect's kind, `whoosh`) / `source_missing` when set. To find what an import added, take `newest_imported_at` from \
                        this tool before importing and pass it as `imported_after` afterwards: only the assets imported strictly \
                        after that time come back. An asset's `tags` (the labels on it, set with edit_asset_tags) are shown \
                        when it has any — whole entry: `[{key, value}]`; compact: text such as `location: Cumbuco` or `jump` — \
@@ -2177,6 +2250,83 @@ mod tests {
             .filter(|a| a.get("music_score").is_some());
         assert_eq!(scored.count(), 6);
         assert!(text.len() / 66 < 260, "{} characters a line", text.len() / 66);
+    }
+
+    /// A synthesized effect is said in the compact line as its kind and shown whole with its spec; the
+    /// answers of the sound-effect tools round the times and name the lane of each clip.
+    #[test]
+    fn a_sound_effect_is_said_by_its_kind_and_the_answers_name_the_lane() {
+        let mut asset = library_asset(1, (1, 4));
+        asset.name = "SFX: Riser".to_string();
+        asset.streams.truncate(2);
+        let spec = kerf_core::SfxSpec::new(kerf_core::SfxKind::Riser).resolved();
+        asset.sound_effect = Some(spec.clone());
+        let line = serde_json::to_value(AssetLine::new(&asset, &proxy(asset.id, ProxyPhase::Ready), &done(5))).unwrap();
+        assert_eq!(line["sound_effect"], "riser");
+        assert!(line.get("music_score").is_none(), "{line}");
+        let full = serde_json::to_value(AssetEntry::new(&asset, &proxy(asset.id, ProxyPhase::Ready), &done(5))).unwrap();
+        assert_eq!(full["sound_effect"]["kind"], "riser");
+        assert_eq!(full["sound_effect"]["duration_s"], 3.0);
+        let plain = library_asset(2, (1, 4));
+        let line = serde_json::to_value(AssetLine::new(&plain, &proxy(plain.id, ProxyPhase::Ready), &done(5))).unwrap();
+        assert!(line.get("sound_effect").is_none(), "set only for an effect: {line}");
+
+        let mut clip = kerf_core::Clip::for_asset(&asset, 0.0, 3.0, 1.2345678);
+        clip.volume = 10f64.powf(-8.0 / 20.0) as f32;
+        let mut lane = kerf_core::Track::new(kerf_core::StreamKind::Audio, "FX 2".to_string());
+        lane.clips.push(clip.clone());
+        let timeline = Timeline {
+            tracks: vec![lane],
+            ..Timeline::default()
+        };
+        let plan = kerf_core::SfxPlan {
+            effects: vec![
+                kerf_core::PlannedSfx {
+                    spec: spec.clone(),
+                    at: 4.2345678,
+                    volume_db: -8.0,
+                    track_id: None,
+                },
+                kerf_core::PlannedSfx {
+                    spec,
+                    at: 4.2345678,
+                    volume_db: -8.0,
+                    track_id: None,
+                },
+            ],
+        };
+        // Core says where the hit really is; the answer does not recompute it from the plan.
+        let placed = |hit: f64| kerf_core::SfxPlaced {
+            clip: clip.clone(),
+            asset: asset.clone(),
+            hit,
+        };
+        let answer = sfx_answer(&plan, &[placed(4.2345678), placed(4.239)], &timeline);
+        let row = &answer["clips"][0];
+        assert_eq!(
+            (row["kind"].as_str(), row["track_name"].as_str(), row["clip_id"].as_str()),
+            (Some("riser"), Some("FX 2"), Some(clip.id.to_string().as_str()))
+        );
+        assert_eq!(
+            (row["at"].as_f64(), row["start"].as_f64(), row["end"].as_f64()),
+            (Some(4.235), Some(1.235), Some(4.235))
+        );
+        assert_eq!(
+            answer["clips"][1]["at"].as_f64(),
+            Some(4.239),
+            "the hit core reports, not the time asked for"
+        );
+        assert_eq!(row["volume_db"].as_f64(), Some(-8.0));
+        assert_eq!(row["spec"]["kind"], "riser");
+        assert_eq!(answer["assets"].as_array().unwrap().len(), 1, "the same render once");
+        assert_eq!(answer["assets"][0]["name"], "SFX: Riser");
+        assert_eq!(answer["assets"][0]["id"], serde_json::json!(asset.id));
+        assert_eq!(sfx_lane(&timeline, uuid::Uuid::new_v4()), (Uuid::nil(), String::new()));
+
+        assert!(sfx_hit_words(&kerf_core::SfxAnchor::End).contains("end"));
+        assert!(sfx_hit_words(&kerf_core::SfxAnchor::Peak { fraction: 0.55 }).contains("55 %"));
+        assert!(sfx_hit_words(&kerf_core::SfxAnchor::Hit { seconds: 0.004 }).contains("4 ms"));
+        assert!(sfx_hit_words(&kerf_core::SfxAnchor::Hit { seconds: 0.0 }).contains("start"));
     }
 
     #[test]

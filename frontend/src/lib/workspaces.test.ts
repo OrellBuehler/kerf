@@ -396,6 +396,27 @@ const viewList = (layout: any): string[] => {
 	const visit = (n: any): string[] => (n.type === 'leaf' ? n.data.views : n.data.flatMap(visit));
 	return visit(layout.grid.root);
 };
+/** The Audio preset as the build before the Sound FX panel shipped it: the mixer alone in its group. */
+const audioBeforeSoundFx = () => {
+	const l = clone(PRESET_LAYOUTS.audio);
+	const visit = (n: any) => {
+		if (n.type === 'leaf') n.data.views = n.data.views.filter((v: string) => v !== 'sfx');
+		else n.data.forEach(visit);
+	};
+	visit(l.grid.root);
+	delete l.panels.sfx;
+	return l;
+};
+/** That arrangement with a sash dragged: the user's own. */
+const arrangedAudioBeforeSoundFx = () => {
+	const l = audioBeforeSoundFx();
+	l.grid.root.data[0].data[0].size += 50;
+	l.grid.root.data[0].data[1].size -= 50;
+	return l;
+};
+/** The panels that build's Audio opened, as it stamped a layout with them. */
+const OFFERED_BEFORE_SOUND_FX = ['library', 'preview', 'mixer', 'inspector', 'agent', 'timeline'];
+
 /** An Audio arrangement from before the mixer, which the user had changed. */
 const arrangedAudioWithoutMixer = () => {
 	const l = clone(EARLIER_PRESETS.audio);
@@ -421,9 +442,9 @@ describe('a layout saved before the mixer', () => {
 		const mine = arrangedAudioWithoutMixer();
 		const read = readWorkspaces({ layouts: { audio: mine } });
 		const audio = read.state.layouts.audio!;
-		expect(read.adopted).toEqual([{ workspace: 'audio', panels: ['mixer'] }]);
+		expect(read.adopted).toEqual([{ workspace: 'audio', panels: ['mixer', 'sfx'] }]);
 		expect(read.changed).toBe(true);
-		expect(viewList(audio)).toEqual(['library', 'preview', 'mixer', 'inspector', 'agent', 'timeline']);
+		expect(viewList(audio)).toEqual(['library', 'preview', 'mixer', 'sfx', 'inspector', 'agent', 'timeline']);
 		expect(audio.grid.root).not.toEqual(mine.grid.root);
 		// What they had keeps its proportions (their wide library against the preview),
 		// and their timeline is as tall as it was.
@@ -466,7 +487,66 @@ describe('a layout saved before the mixer', () => {
 			offered: { audio: ['library', 'preview', 'timeline', 'inspector', 'agent'] }
 		});
 		expect(viewList(read.state.layouts.audio)).toContain('mixer');
-		expect(read.adopted).toEqual([{ workspace: 'audio', panels: ['mixer'] }]);
+		expect(read.adopted).toEqual([{ workspace: 'audio', panels: ['mixer', 'sfx'] }]);
+	});
+
+	test('a layout stamped with the mixer but not the Sound FX panel is given that panel as a tab of the mixer’s group, and keeps the rest', () => {
+		const mine = arrangedAudioBeforeSoundFx();
+		const read = readWorkspaces({ layouts: { audio: mine }, offered: { audio: OFFERED_BEFORE_SOUND_FX } });
+		const audio = read.state.layouts.audio!;
+		expect(read.adopted).toEqual([{ workspace: 'audio', panels: ['sfx'] }]);
+		expect(read.changed).toBe(true);
+		expect(viewList(audio)).toEqual(['library', 'preview', 'mixer', 'sfx', 'inspector', 'agent', 'timeline']);
+		// Tabbed: no group was cut into the row, so nothing they sized moved.
+		expect(sameArrangement(audio, mine)).toBe(false);
+		const row = (audio.grid.root as any).data[0].data;
+		expect(row.map((n: any) => n.size)).toEqual((mine.grid.root as any).data[0].data.map((n: any) => n.size));
+		expect(row[2].data.views).toEqual(['mixer', 'sfx']);
+		expect((audio.grid.root as any).data[1].size).toBe((mine.grid.root as any).data[1].size);
+		// Recorded against today's preset, so it happens once; and the user is told, in the words of the other panels.
+		expect(read.state.offered.audio).toEqual(presetPanelIds('audio'));
+		expect(describeAdopted(read.adopted)!.message).toBe('Audio workspace gained the Sound FX panel');
+		expect(sanitizeLayout(clone(audio))).toEqual(audio);
+		const again = readWorkspaces(clone(read.state));
+		expect(again.changed).toBe(false);
+		expect(again.adopted).toEqual([]);
+	});
+
+	test('a Sound FX panel the user closed stays closed: the layout was offered it', () => {
+		const mine = nudged('audio');
+		const noSfx = clone(mine);
+		const visit = (n: any) => {
+			if (n.type === 'leaf') n.data.views = n.data.views.filter((v: string) => v !== 'sfx');
+			else n.data.forEach(visit);
+		};
+		visit(noSfx.grid.root);
+		delete noSfx.panels.sfx;
+		const read = readWorkspaces({ layouts: { audio: noSfx }, offered: { audio: presetPanelIds('audio') } });
+		expect(viewList(read.state.layouts.audio)).not.toContain('sfx');
+		expect(read.adopted).toEqual([]);
+		expect(read.changed).toBe(false);
+	});
+
+	test('with the mixer closed the Sound FX panel is put beside the preview, where the mixer’s group was', () => {
+		const mine = arrangedAudioBeforeSoundFx();
+		const row = mine.grid.root.data[0].data;
+		const at = row.findIndex((n: any) => n.data.views[0] === 'mixer');
+		const [gone] = row.splice(at, 1);
+		row[at - 1].size += gone.size;
+		delete mine.panels.mixer;
+		const read = readWorkspaces({ layouts: { audio: mine }, offered: { audio: OFFERED_BEFORE_SOUND_FX } });
+		expect(read.adopted).toEqual([{ workspace: 'audio', panels: ['sfx'] }]);
+		const audio = read.state.layouts.audio!;
+		expect(viewList(audio)).toEqual(['library', 'preview', 'sfx', 'inspector', 'agent', 'timeline']);
+		expect(viewList(audio)).not.toContain('mixer');
+	});
+
+	test('no other workspace is given a Sound FX panel', () => {
+		for (const id of WORKSPACE_IDS.filter((w) => w !== 'audio')) {
+			const read = readWorkspaces({ layouts: { [id]: nudged(id) }, offered: { [id]: presetPanelIds(id) } });
+			expect(viewList(read.state.layouts[id]!)).not.toContain('sfx');
+			expect(read.adopted).toEqual([]);
+		}
 	});
 
 	test('a mixer the user opened themselves is not opened twice', () => {
@@ -505,6 +585,7 @@ describe('a layout saved before the mixer', () => {
 		for (const offered of ['x', 7, { 0: 'a' }, null]) {
 			const read = readWorkspaces({ layouts: { audio: mine }, offered: { audio: offered } });
 			expect(viewList(read.state.layouts.audio)).toContain('mixer');
+			expect(viewList(read.state.layouts.audio)).toContain('sfx');
 		}
 		// Names that are not panels are dropped from a stamp, not trusted.
 		const read = readWorkspaces({ layouts: { audio: nudged('audio') }, offered: { audio: ['library', 'bogus', 7] } });
@@ -544,6 +625,17 @@ describe('what the user is told', () => {
 	test('one workspace gaining one panel is said plainly', () => {
 		const note = describeAdopted([{ workspace: 'audio', panels: ['mixer'] }])!;
 		expect(note.message).toBe('Audio workspace gained the Mixer panel');
+		expect(note.description).toContain('Resetting the workspace restores its default');
+	});
+
+	test('two panels gained by one workspace are said together', () => {
+		const note = describeAdopted([{ workspace: 'audio', panels: ['mixer', 'sfx'] }])!;
+		expect(note.message).toBe('Audio workspace gained the Mixer and Sound FX panels');
+	});
+
+	test('the Sound FX panel gained on its own is said in the words the mixer was', () => {
+		const note = describeAdopted([{ workspace: 'audio', panels: ['sfx'] }])!;
+		expect(note.message).toBe('Audio workspace gained the Sound FX panel');
 		expect(note.description).toContain('Resetting the workspace restores its default');
 	});
 
@@ -638,7 +730,7 @@ describe('a workspace with panels in windows of their own', () => {
 		expect(r.added).toEqual([]);
 		const gridViews = (n: any): string[] => (n.type === 'leaf' ? n.data.views : n.data.flatMap(gridViews));
 		expect(gridViews(r.layout!.grid.root)).not.toContain('mixer');
-		expect(r.layout!.popoutGroups?.[0].data?.views).toEqual(['mixer']);
+		expect(r.layout!.popoutGroups?.[0].data?.views).toEqual(['mixer', 'sfx']);
 	});
 
 	test('is a different arrangement from the preset, so it is not dropped as a copy of one', () => {

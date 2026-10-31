@@ -148,6 +148,12 @@ const MIGRATIONS: &[Migration] = &[
         run: v18_to_v19,
         needed: v18_to_v19_needed,
         destructive: false,
+        needed_to_read: true,
+    },
+    Migration {
+        run: v19_to_v20,
+        needed: v19_to_v20_needed,
+        destructive: false,
         needed_to_read: false,
     },
 ];
@@ -420,16 +426,32 @@ fn v17_to_v18_needed(_: &Connection) -> bool {
     true
 }
 
-/// v19: a clip may carry live behaviours (`Clip.behaviors`, `"behaviors"` in the timeline JSON: a list of
+/// v19: an asset remembers the spec a sound effect was synthesized from (`assets.sound_effect`, JSON; NULL for none), which is
+/// what lets the effect be reshaped and rendered again. Audio a build without sound effects wrote has none; an older build
+/// would drop the field at its next write of the asset, and its reads do not select the column. Every file an older build
+/// wrote lacks the column, so the step is needed exactly then (the file is copied aside first) and reads depend on it. No
+/// timeline JSON moves: the effects sit on ordinary audio tracks as ordinary clips.
+fn v18_to_v19(conn: &Connection) -> rusqlite::Result<()> {
+    if !has_column(conn, "assets", "sound_effect") {
+        conn.execute("ALTER TABLE assets ADD COLUMN sound_effect TEXT", [])?;
+    }
+    Ok(())
+}
+
+fn v18_to_v19_needed(conn: &Connection) -> bool {
+    !has_column(conn, "assets", "sound_effect")
+}
+
+/// v20: a clip may carry live behaviours (`Clip.behaviors`, `"behaviors"` in the timeline JSON: a list of
 /// `{"kind":"sway"|"breathe"|"spin"|"drift"|"shake", ...}`). It is a new field an older build drops at its next write of
 /// the clip, which then plays still where it swayed or shook, with nothing to say why. A clip without any is written as
 /// it was, so a stored one is unchanged. Nothing in the file's tables changes; the step is the version that keeps an
 /// older build out, after the file is copied aside.
-fn v18_to_v19(_: &Connection) -> rusqlite::Result<()> {
+fn v19_to_v20(_: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-fn v18_to_v19_needed(_: &Connection) -> bool {
+fn v19_to_v20_needed(_: &Connection) -> bool {
     true
 }
 

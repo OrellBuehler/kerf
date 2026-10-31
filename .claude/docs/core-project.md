@@ -194,14 +194,18 @@
   of the clip, which then plays shaken; a clip with none is written as before, `run` a no-op, `needed` always,
   `needed_to_read` false (`a_v17_file_is_backed_up_stamped_v18_and_keeps_its_stabilized_clip`); the analysis is a cache
   beside the footage, not in the file; `persisted/timelines-v18.json` holds a stabilized clip with a fixed zoom.
-  v18→v19 is a JSON step for a **new field**, `Clip.behaviors` (live behaviours, `core-model.md`): an older build drops it at its next
+  v18→v19 adds `assets.sound_effect` (JSON `SfxSpec`, NULL for none; a probe-and-`ALTER` like `music_score`, `needed` exactly when
+  the column is missing, `needed_to_read` true since `ASSET_COLUMNS` selects it): an older build would drop the spec at its next
+  write of the asset and could no longer reshape the effect (`a_v18_file_gains_the_sound_effect_column_and_keeps_a_backup`); the
+  effects sit on ordinary audio tracks as ordinary clips, so no timeline JSON moves and there is no `persisted/` file for v19.
+  v19→v20 is a JSON step for a **new field**, `Clip.behaviors` (live behaviours, `core-model.md`): an older build drops it at its next
   write of the clip, which then stops swaying or shaking; a clip with none is written as before, `run` a no-op, `needed` always,
-  `needed_to_read` false (`a_v18_file_is_backed_up_stamped_v19_and_keeps_its_behaviours`); `persisted/timelines-v19.json` holds a clip with
+  `needed_to_read` false (`a_v19_file_is_backed_up_stamped_v20_and_keeps_its_behaviours`); `persisted/timelines-v20.json` holds a clip with
   a sway and a seeded shake. `Project::set_behaviors` ("Set behaviours" / "Clear behaviours") and `bake_behaviors` ("Bake behaviours") are one
   revision each, all or nothing, and stage like any agent edit (`project/behavior_tests.rs`).
-  The schema is at **v19** (`SCHEMA_VERSION`). `persist_tests` pins which steps a file has pending with
-  `store::pending_steps` (a legacy file that has every column: `[4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 18]`). A step's `needed_to_read` says whether a build that
-  cannot write must still refuse a file lacking what it adds: true for the v1, v2, v4 and v15 columns (the reads
+  The schema is at **v20** (`SCHEMA_VERSION`). `persist_tests` pins which steps a file has pending with
+  `store::pending_steps` (a legacy file that has every column: `[4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 19]`). A step's `needed_to_read` says whether a build that
+  cannot write must still refuse a file lacking what it adds: true for the v1, v2, v4, v15 and v19 columns (the reads
   name them), false for the `fonts` table (reads tolerate its absence), so a write-protected v2 project
   opens as it is. A new file is stamped `SCHEMA_VERSION`; a
   file newer than that is refused before anything is written (`Error::NewerProject`, "made by a newer
@@ -503,6 +507,45 @@
   `overall` and `notes` (a heavy low end, a thin mid range, a dull top, a loudness swing, a window that is bassier than the
   whole). `analysis.rs` serves a composed asset's rhythm from `ScoreRhythm` (below the providers) instead of
   `FfmpegRhythmAnalyzer`.
+  **Sound effects** (`project/sfx.rs`, tests in `sfx_tests.rs`; the split again): an asset carries **`Asset.sound_effect`**
+  (`SfxSpec`, a `sound_effect` JSON column, schema v19). `SfxPlacement {spec (flattened), at, volume_db?, track_id?}` is flat on
+  the wire; `deny_unknown_fields` cannot be combined with `flatten`, so `Deserialize` takes `at` / `volume_db` / `track_id` and hands the
+  rest to `SfxSpec` (which refuses an unknown field and names it). **`at` is where the effect's hit point lands** (`model::sfx_anchor_s`:
+  a whoosh's peak, an impact's first transient, a riser's end; `reverse` mirrors it), so the clip starts `anchor` earlier; a start
+  before 0 is **cut off the head** (`source_in`, with a 4 ms fade-in) rather than moved — unless it is under 10 ms before 0
+  (`SFX_HEAD_SNAP_S`), when the clip starts at 0 whole and the hit lands that late (a transient is its first milliseconds; the cut
+  and the fade over it would take it) — and a hit that would leave under 20 ms of sound is refused naming the time it can land
+  (rounded **up** to the hundredth it shows, and compared within 1e-9, so the time named is accepted). `model::sfx::span` is
+  that one rule: `span_for` places by it and the suggestions' `lands` asks it. `sound_effects_inputs(&[SfxPlacement]) -> SfxPlan` under the lock: 1..=256
+  placements, each spec valid (the error says `effects[i] (kind): …`), `at` finite and ≥ 0, `volume_db` −60..=12, a named track an
+  existing **unlocked audio** track — all against the **working timeline** — and **last the placement is rehearsed**
+  (`check_sfx_fits`: stand-in assets of the renders' lengths through the same `put_sound_effects`, then `ripple_lanes` when
+  `ripple_active()` and `check_own_lanes`, the music rehearsal's shape), so a clip that would land on another clip of its named track
+  is refused with edit_timeline's words before anything renders; the plan spells every spec out (`SfxSpec::resolved`: the length in
+  whole milliseconds, clamped to the kind's range) and defaults the gain. → static `synthesize_sound_effects(&plan, cancel) ->
+  Vec<Asset>` (lock released; one render, probe and asset per distinct spec; named `SFX: Whoosh`; `synthesize_sound_effect` for one) →
+  `place_sound_effects(&assets, &plan) -> Vec<SfxPlaced>` under the lock (`SfxPlaced {clip, asset, hit}`: the clip, the asset it plays **as stored** — the same render put on twice is one row, so this is the first placement's, not the fresh copy a caller rendered — and the timeline second its **hit really falls on**, read through `Clip::source_to_timeline`, which is `at` except that a start under `SFX_HEAD_SNAP_S` before 0 is put at 0 and the hit lands that much later; `apply_sound_effect_update` returns the same): each asset must be the render of its planned spec (the same
+  check as `apply_sound_effect_update`'s, naming `effects[i] (kind)`); the assets are stored **inside** the `edit_timeline` closure (a
+  refused placement stores nothing, an agent's stages with its assets landing at once) and the whole batch is **one** `Add sound
+  effects` revision (`Add sound effect` for one). **Lanes**: with no `track_id` an effect goes on the first **unlocked** audio track
+  named `FX` (`SFX_TRACK`), `FX 2`, `FX 3`… (in that numeric order) whose clips leave `[start, end)` free — touching is not an
+  overlap, the effects placed earlier in the same batch count — and otherwise on a new audio track at the end of the list named
+  with the first number no audio track has (a locked `FX` is skipped, never used). The batch is placed in the order given, so the
+  lanes depend on it (suggestions are sorted by time). `update_sound_effect_inputs(clip, &spec, volume_db?) -> SfxUpdate` → static
+  `synthesize_sound_effect` → `apply_sound_effect_update(&asset, &update)` is the reshape: the clip is on an unlocked audio track and
+  its asset has a `sound_effect` (else "that clip is not a sound effect"); one `Edit sound effect` revision keeps the **hit point's
+  timeline position** (read from the clip as it stands when the swap is made, through `Clip::source_to_timeline`, so a trimmed or
+  slowed clip is read right), the id, gain (unless `volume_db` is given), fades, audio effects and keys, and plays the whole new render
+  at normal speed (trim and speed reset, as `Recompose music` does); it goes through `edit_timeline`, so ripple applies and without it
+  a longer render that would run into the next clip is refused with nothing stored (the inputs rehearse it too).
+  `preview_sound_effect(spec, cancel) -> PathBuf` is the audition: a render and no edit, written to the pruned *cache* dir
+  (`engine-media.md`), not beside the effects in the data dir. `add_sound_effects` and `update_sound_effect` run the three steps with
+  `&self` held for the whole of it and are `#[cfg(test)]`; the surfaces render with the lock released. An `#[ignore]`d test drives the real engine and ffprobe end to end.
+  **Suggestions**: `suggest_sound_effects_inputs() -> SfxSuggestInputs` (under the lock: the **working timeline**, so an agent sees its
+  own proposal, every asset, and the cached `AssetAnalysis` of the assets the cut uses — scene changes, transcript words, music
+  structure; nothing is analysed) → pure `model::suggest_sound_effects(&inputs, &SfxSuggestRequest)`; `suggest_sound_effects(&req)`
+  does both. A read: no revision. Each `SfxSuggestion.placement` is an `SfxPlacement` as `add_sound_effects` takes it (no `track_id`:
+  the lanes allocate, so a riser and its impact land on `FX` and `FX 2`), and a test feeds them back. The rules are in `core-model.md`.
   `separate_stems_media(asset, progress, cancel)` (static, lock released) separates and
   probes the four stems; `place_stems(source, stems, clip?)` stores them (reusing
   imported ones) and, with a clip, lays each on a new audio track named after it at the
@@ -911,7 +954,9 @@
   (`transcript::search`, `engine-media.md`): the assets in library order, each one's analysis row as the stored JSON
   (unparsed — parsing is most of the cost) and the working timeline; an unknown id is `AssetNotFound`. **What a request runs** is `resolve_steps(asset, requested)`: a file with no audio is
   not asked for silence, loudness, rhythm or speech (silent b-roll used to get a failed transcript
-  chip and an error toast on every import), a still has nothing to analyze, and an empty answer is
+  chip and an error toast on every import), a synthesized sound effect (`Asset.sound_effect`) keeps only silence and loudness
+  (`AnalysisKind::fits_effect`: whisper would invent words over a whoosh, and it has no picture or beat), a still has nothing to
+  analyze, and an empty answer is
   an `InvalidArgument` that says why (everything switched off; a silent file asked for its speech)
   rather than an empty run. `analyze_asset_steps` runs in the background lane of the heavy-job queue
   (`engine-cli.md`), announces `waiting`, can be stopped while queued, and hands the patch so far to

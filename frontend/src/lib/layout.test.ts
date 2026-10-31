@@ -10,6 +10,7 @@ import {
 	UNSTAMPED_OFFERED,
 	WORKSPACE_IDS,
 	insertPanel,
+	isPanelId,
 	openPanelIds,
 	panelState,
 	popoutViews,
@@ -75,11 +76,19 @@ describe('presets', () => {
 	});
 
 	test('Audio docks the mixer between the preview and the inspector, and no other workspace opens it', () => {
-		expect(openPanelIds(PRESET_LAYOUTS.audio).sort()).toEqual(['agent', 'inspector', 'library', 'mixer', 'preview', 'timeline']);
-		expect(group(PRESET_LAYOUTS.audio, 'mixer').views).toEqual(['mixer']);
+		expect(openPanelIds(PRESET_LAYOUTS.audio).sort()).toEqual(['agent', 'inspector', 'library', 'mixer', 'preview', 'sfx', 'timeline']);
+		expect(group(PRESET_LAYOUTS.audio, 'mixer').views[0]).toBe('mixer');
 		const row = (PRESET_LAYOUTS.audio.grid.root as any).data[0].data.map((n: any) => n.data.views[0]);
 		expect(row).toEqual(['library', 'preview', 'mixer', 'inspector']);
 		for (const id of WORKSPACE_IDS.filter((w) => w !== 'audio')) expect(viewsOf(PRESET_LAYOUTS[id])).not.toContain('mixer');
+	});
+
+	test('Audio tabs the Sound FX panel with the mixer, so the picture and the full-width timeline keep their room, and no other workspace opens it', () => {
+		expect(group(PRESET_LAYOUTS.audio, 'mixer').views).toEqual(['mixer', 'sfx']);
+		expect(group(PRESET_LAYOUTS.audio, 'mixer').activeView).toBe('mixer');
+		const root = PRESET_LAYOUTS.audio.grid.root as any;
+		expect(root.data[1].data.views).toEqual(['timeline']);
+		for (const id of WORKSPACE_IDS.filter((w) => w !== 'audio')) expect(viewsOf(PRESET_LAYOUTS[id])).not.toContain('sfx');
 	});
 
 	test('Color docks the scopes beside the preview', () => {
@@ -110,6 +119,14 @@ describe('the registry', () => {
 		for (const id of PANEL_IDS) expect(PANELS[id].title.length).toBeGreaterThan(0);
 		expect(PANELS.library.minimumWidth).toBe(LIBRARY_RAIL_WIDTH);
 		expect(PANELS.deliver.minimumWidth).toBeGreaterThan(0);
+	});
+
+	test('the Sound FX panel is called that, and its minimum fits a grid two tiles across and the controls under it', () => {
+		expect(PANELS.sfx.title).toBe('Sound FX');
+		expect(PANELS.sfx.minimumWidth).toBeGreaterThanOrEqual(280);
+		expect(PANELS.sfx.minimumHeight).toBeGreaterThanOrEqual(200);
+		expect(PANELS.sfx.defaultWidth).toBeGreaterThan(PANELS.sfx.minimumWidth!);
+		expect(isPanelId('sfx')).toBe(true);
 	});
 
 	test('the mixer has a title and a minimum a strip and the master fit in', () => {
@@ -572,14 +589,19 @@ const rowSizes = (raw: any, id: string): number[] => {
 };
 
 describe('what a preset offers', () => {
-	test('is the panels it opens, and the mixer is Audio’s alone', () => {
-		expect(presetPanelIds('audio').sort()).toEqual(['agent', 'inspector', 'library', 'mixer', 'preview', 'timeline']);
-		for (const id of WORKSPACE_IDS.filter((w) => w !== 'audio')) expect(presetPanelIds(id)).not.toContain('mixer');
+	test('is the panels it opens, and the mixer and the Sound FX panel are Audio’s alone', () => {
+		expect(presetPanelIds('audio').sort()).toEqual(['agent', 'inspector', 'library', 'mixer', 'preview', 'sfx', 'timeline']);
+		for (const id of WORKSPACE_IDS.filter((w) => w !== 'audio')) {
+			expect(presetPanelIds(id)).not.toContain('mixer');
+			expect(presetPanelIds(id)).not.toContain('sfx');
+		}
 	});
 
-	test('a layout stored before the record is taken to have been offered every panel but the mixer, the scopes and the dope sheet', () => {
+	test('a layout stored before the record is taken to have been offered every panel but the mixer, the Sound FX panel, the scopes and the dope sheet', () => {
 		for (const id of WORKSPACE_IDS) {
-			expect(UNSTAMPED_OFFERED[id]).toEqual(presetPanelIds(id).filter((p) => p !== 'mixer' && p !== 'scopes' && p !== 'keyframes'));
+			expect(UNSTAMPED_OFFERED[id]).toEqual(
+				presetPanelIds(id).filter((p) => p !== 'mixer' && p !== 'sfx' && p !== 'scopes' && p !== 'keyframes')
+			);
 		}
 	});
 
@@ -630,7 +652,7 @@ describe('insertPanel', () => {
 	});
 
 	test('the mixer goes between the preview and the inspector and takes its share from the row', () => {
-		const without = closed(PRESET_LAYOUTS.audio, 'mixer');
+		const without = closed(closed(PRESET_LAYOUTS.audio, 'mixer'), 'sfx');
 		const before = rowSizes(without, 'preview');
 		const back = insertPanel(without, 'mixer', PRESET_LAYOUTS.audio)!;
 		const row = (back.grid.root as any).data[0].data.map((n: any) => n.data.views[0]);
@@ -641,7 +663,7 @@ describe('insertPanel', () => {
 	});
 
 	test('a layout the user arranged keeps its arrangement; the panel takes a proportional share', () => {
-		const mine = closed(PRESET_LAYOUTS.audio, 'mixer');
+		const mine = closed(closed(PRESET_LAYOUTS.audio, 'mixer'), 'sfx');
 		const row = mine.grid.root.data[0].data;
 		row[0].size = 380; // a wide library
 		row[1].size = 330;
@@ -665,7 +687,7 @@ describe('insertPanel', () => {
 		// Only the preview and the timeline are left.
 		let mine = PRESET_LAYOUTS.audio as any;
 		for (const p of ['library', 'inspector', 'agent']) mine = closed(mine, p);
-		mine = closed(mine, 'mixer');
+		mine = closed(closed(mine, 'mixer'), 'sfx');
 		const back = insertPanel(mine, 'agent', PRESET_LAYOUTS.audio)!;
 		// The nearest neighbour in the preset is the mixer's row; with the mixer gone too,
 		// the agent finds the preview next in line.
@@ -676,7 +698,7 @@ describe('insertPanel', () => {
 	test('a row that runs the other way is not cut into: the panel is tabbed with the preview instead', () => {
 		// The preview stacked over the timeline, nothing beside it.
 		let mine = PRESET_LAYOUTS.audio as any;
-		for (const p of ['library', 'inspector', 'agent', 'mixer']) mine = closed(mine, p);
+		for (const p of ['library', 'inspector', 'agent', 'mixer', 'sfx']) mine = closed(mine, p);
 		mine = clone(mine);
 		mine.grid.root.data = [mine.grid.root.data[0].data[0], mine.grid.root.data[1]];
 		const clean = sanitizeLayout(clone(mine))!;
@@ -685,6 +707,26 @@ describe('insertPanel', () => {
 		const back = insertPanel(clean, 'mixer', PRESET_LAYOUTS.audio)!;
 		expect(group(back, 'preview').views).toEqual(['preview', 'mixer']);
 		expect(sanitizeLayout(clone(back))).toEqual(back);
+	});
+
+	test('the Sound FX panel is tabbed back with the mixer, after it', () => {
+		const back = insertPanel(closed(PRESET_LAYOUTS.audio, 'sfx'), 'sfx', PRESET_LAYOUTS.audio)!;
+		expect(group(back, 'mixer').views).toEqual(['mixer', 'sfx']);
+		expect(sameArrangement(back, PRESET_LAYOUTS.audio, 0.003)).toBe(true);
+	});
+
+	test('with the mixer closed the Sound FX panel takes the mixer’s place in the row, under the group name the preset gives it', () => {
+		const without = closed(closed(PRESET_LAYOUTS.audio, 'mixer'), 'sfx');
+		const back = insertPanel(without, 'sfx', PRESET_LAYOUTS.audio)!;
+		const row = (back.grid.root as any).data[0].data.map((n: any) => n.data.views[0]);
+		expect(row).toEqual(['library', 'preview', 'sfx', 'inspector']);
+		const sizes = rowSizes(back, 'mixer');
+		expect(sizes[2]).toBeGreaterThanOrEqual(PANELS.sfx.minimumWidth!);
+		expect(sanitizeLayout(clone(back))).toEqual(back);
+	});
+
+	test('the earlier Audio preset has no Sound FX panel either', () => {
+		expect(openPanelIds(EARLIER_PRESETS.audio!)).not.toContain('sfx');
 	});
 
 	test('a panel already there is left where it is', () => {
@@ -698,7 +740,7 @@ describe('insertPanel', () => {
 	});
 
 	test('a new group never reuses a group id that is taken', () => {
-		const without = closed(PRESET_LAYOUTS.audio, 'mixer');
+		const without = closed(closed(PRESET_LAYOUTS.audio, 'mixer'), 'sfx');
 		// Someone else's group is called "mixer".
 		(without.grid.root.data[1] as any).data.id = 'mixer';
 		const back = insertPanel(without, 'mixer', PRESET_LAYOUTS.audio)!;

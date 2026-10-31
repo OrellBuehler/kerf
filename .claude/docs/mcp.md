@@ -474,6 +474,35 @@ core `BandBalance` (windows, `overall`, `windows_from`, `notes`). The descriptio
 write a score — styles, section kinds and what each does to the arrangement, chord names and roman numerals, the hit
 kinds in **music** seconds, align's rules, recomposing — and a test pins that they do. The guide routes a music
 request compose_music (align to the cuts) → fit_music → duck → get_levels / get_band_balance.
+**Sound effects** (`mcp.rs`, answers shaped in `reads::sfx_*`; the core is `project/sfx.rs`, `core-project.md`): `list_sound_effects` (read-only; the
+catalogue as `SfxPreset` rows plus a `hit` in words, the spec `defaults` and the `lanes` note), `add_sound_effects { effects:
+[SfxPlacement], ripple? }`, `update_sound_effect { clip_id, kind, …spec, volume_db?, ripple? }` and `suggest_sound_effects { range?, density?,
+categories?, kinds? }` (read-only; **the core's `SfxSuggestRequest` is its parameter struct**, so its schema and field docs come from
+kerf-core). All four are in the `audio` set. **A placement is flat** — `{kind, at, duration_s?, pitch?, intensity?, tail?, reverse?, seed?, volume_db?,
+track_id?}` — and `at` is where the effect's **hit** lands, not where its clip starts (a whoosh's peak, an impact's first transient, a riser's
+end): the `effects` doc, the tool description and the guide all say so, and so does the `hit` text of `list_sound_effects`. An unknown field is an
+error naming it (`SfxPlacement` has a hand-written `Deserialize` because `deny_unknown_fields` does not survive `flatten`; **`UpdateSoundEffectParams`
+does the same** around `SfxSpec`, so `{"clip_id":…,"kind":…,"pitc":2}` is refused, not ignored). `update_sound_effect` takes the **whole** spec
+(what it leaves out is back at its default, not at what the clip has; the answer of `add_sound_effects` and `list_assets`' `sound_effect` show the
+current one) and keeps the clip's id, gain, fades, effects and the position of its **hit**. They are the `compose_music` shape without the job:
+`sound_effects_inputs` / `update_sound_effect_inputs` run **before anything renders** under `lock_agent_edit` and `with_ripple(p.ripple, …)` (a bad
+spec, time, gain, track, a clip in the way of a named track or a head that cannot land is `invalid_params` naming `effects[i] (kind)`; a proposal
+another session owns refuses here), the render runs on the blocking pool with the lock released (`synthesize_sound_effects`, stopped by the
+request's `ct` and by a replaced project, `stop_or_replaced`), and landing it is `KerfMcp::edit` (so `project-changed` is emitted after the lock is
+released) around `place_sound_effects` / `apply_sound_effect_update` and `require_generation`. The assets land at once, the clips stage as **one**
+revision (`Add sound effects`). Rendering takes milliseconds, so there is no `background` and no progress; `add_sound_effects_now` /
+`update_sound_effect_now` take the cancel as a closure so a test can drive them without a request. The answer is `{clips: [{clip_id, asset_id,
+track_id, track_name, kind, at, start, end, volume_db, spec}], assets: [{id, name, duration}]}` in the order asked (the lane is read from the
+working timeline after placing, so `FX 2` shows where a riser went). It is built from core's `SfxPlaced` (`reads::sfx_answer`): `at` is the hit **core
+read from the placed clip** — an impact asked for at 0 starts there and is heard at 0.004 — not the time asked for, and `assets` are the rows the clips
+play **as stored**, so adding the same effect twice names one asset id that `list_assets` has, never the fresh copy a second render made; `update_sound_effect`
+answers one such row (core's `SfxPlaced` too). `list_sound_effects` carries `max_pitch_semitones`, and the counts its texts state (`21 kinds`) are pinned to
+`SfxKind::ALL` by tests. **There is no MCP tool that previews a sound**: auditioning is the GUI's `preview_sound_effect` (a model does not hear), on purpose. `suggest_sound_effects` answers `{density, count, suggestions: [{placement, source, reason, score}], next}` from the
+working cut (`suggest_sound_effects_inputs` under `lock_agent_as`, the pure `suggest_sound_effects` with it released): each `placement` is an element
+of `effects` as it stands, and a test feeds them back through `sound_effects_inputs`. Hints: `add_sound_effects` is `Edit` (not idempotent, no
+download, so not `Generate`), `update_sound_effect` `Set`, the other two `Read`. The **`sound_design { density?, range? }`** prompt is suggest →
+review → add → `get_levels` / `get_band_balance`, and the guide has a paragraph after the music one (`the_guide_and_the_prompt_route_a_sound_effect_request_…`
+pins its order). `list_assets` shows an effect asset's `sound_effect` (the spec in the full view, the kind in the compact line).
 `set_master_volume` / `set_master_limiter` / `set_master_true_peak` are staged edits like any other;
 `get_levels` (`range?`, `loudnorm?`) measures the working timeline (the proposal) and takes
 `context.ct` as its cancel, and the guide (`EDITING_GUIDE`, pinned by a
@@ -604,7 +633,7 @@ one edit each, and its multi-clip edits have their own commands.
 
 **Prompts.** `get_info` advertises `prompts`; `list_prompts` / `get_prompt` (written by hand, not rmcp's prompt macros)
 serve `prompts::list` / `prompts::get`: `rough_cut_from_transcript { assets?, target_length?, brief? }`, `podcast_cleanup
-{ asset?, loudness? }` (its voice chain is highpass, denoise, compressor, gate, in that order), `social_reel { platform, length?, aspect? }`, `music_bed { music?, style? }` and `deliver { output?,
+{ asset?, loudness? }` (its voice chain is highpass, denoise, compressor, gate, in that order), `social_reel { platform, length?, aspect? }`, `music_bed { music?, style? }`, `sound_design { density?, range? }` and `deliver { output?,
 platform? }` — the guide's workflows as a numbered step list in one user message (Claude Code offers them as
 `/mcp__kerf__<name>`). Each step is the guide's own rule (staging, captions last, `get_ripple_mode` first, platform_check
 and get_levels before done, export reads the proposal), not new behaviour. A prompt names its tools in **backticks** and only
@@ -824,6 +853,7 @@ Every tool, by purpose (a test pins that this list names each registered tool, a
 - **Mix and music**: `set_track_volume`, `set_track_pan`, `set_track_duck`, `set_track_muted`, `set_track_solo`,
   `set_track_locked`, `set_master_volume`, `set_master_limiter`, `set_master_true_peak`, `set_master_duck`, `plan_music_fit`, `fit_music`,
   `compose_music`, `music_status`, `separate_stems`, `stems_status`.
+- **Sound effects**: `list_sound_effects`, `suggest_sound_effects`, `add_sound_effects`, `update_sound_effect`.
 - **Titles, captions, markers, frame**: `add_overlay`, `update_overlay`, `remove_overlay`, `set_overlay_keyframes`,
   `add_svg_overlay`, `update_svg_overlay`, `remove_svg_overlay`, `add_title_clip`, `update_title_clip`, `list_svg_presets`, `validate_svg`, `preview_svg_overlay`,
   `preview_svg_preset`, `list_templates`, `save_template`, `apply_template`, `set_template_values`, `set_title_text_box`,

@@ -70,6 +70,7 @@ pub(crate) fn test_asset(streams: Vec<StreamInfo>) -> Asset {
         source_paths: Vec::new(),
         voiceover: None,
         music_score: None,
+        sound_effect: None,
         tags: Vec::new(),
     }
 }
@@ -220,6 +221,7 @@ pub(crate) fn av_asset(id: Uuid, duration: f64) -> Asset {
         source_paths: Vec::new(),
         voiceover: None,
         music_score: None,
+        sound_effect: None,
         tags: Vec::new(),
     }
 }
@@ -236,6 +238,7 @@ pub(crate) fn img_asset(id: Uuid) -> Asset {
         source_paths: Vec::new(),
         voiceover: None,
         music_score: None,
+        sound_effect: None,
         tags: Vec::new(),
     }
 }

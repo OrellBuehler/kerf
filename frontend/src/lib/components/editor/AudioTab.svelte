@@ -9,6 +9,7 @@
 	import Hint from './Hint.svelte';
 	import { editor } from '#lib/state.svelte';
 	import { ui } from '#lib/editor-ui.svelte';
+	import { workspace } from '#lib/workspace.svelte';
 	import { AUDIO_EFFECT_PRESETS, effectLabel, freshEffect } from '#lib/effect-presets';
 	import { attempt } from '#lib/ops';
 
@@ -79,4 +80,13 @@
 		Write a chord progression and Kerf plays it onto the M track — it can fit the tempo to the cuts in the same step.
 	</div>
 	<Btn size="sm" variant="secondary" icon="music" pending={editor.locked} onclick={() => ui.openCompose()}>Compose music…</Btn>
+
+	<div class="k-overline" style="margin:14px 0 7px">Sound effects</div>
+	<div style="font-size:12px;color:var(--text-muted);line-height:1.45;margin-bottom:8px">
+		Whooshes, impacts, risers and UI sounds made on the spot — hear one, shape it and put its hit on the playhead, or let Kerf
+		find the moments of the cut that want one.
+	</div>
+	<Btn size="sm" variant="secondary" icon="zap" data-testid="open-sound-fx" onclick={() => workspace.show('sfx')}
+		>{workspace.isOpen('sfx') ? 'Show Sound FX' : 'Open Sound FX'}</Btn
+	>
 </div>

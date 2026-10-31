@@ -278,7 +278,7 @@ fn secs(t: f64) -> String {
 }
 
 /// Where a clip's first frame comes from in its source.
-fn head_source(c: &Clip) -> f64 {
+pub(crate) fn head_source(c: &Clip) -> f64 {
     if c.is_reversed() {
         c.source_out
     } else {
@@ -287,7 +287,7 @@ fn head_source(c: &Clip) -> f64 {
 }
 
 /// Where a clip's last frame comes from in its source.
-fn tail_source(c: &Clip) -> f64 {
+pub(crate) fn tail_source(c: &Clip) -> f64 {
     if c.is_reversed() {
         c.source_in
     } else {
@@ -298,7 +298,7 @@ fn tail_source(c: &Clip) -> f64 {
 /// How far apart the speeds of two neighbouring clips are where they meet: the difference of their
 /// speeds, or, when either changes its rate over its length, of the speeds at the cut (a clip that plays
 /// the other way round is infinitely far).
-fn pace_gap(a: &Clip, b: &Clip) -> f64 {
+pub(crate) fn pace_gap(a: &Clip, b: &Clip) -> f64 {
     if !a.is_ramped() && !b.is_ramped() {
         return (a.speed - b.speed).abs();
     }
@@ -888,13 +888,19 @@ fn word_at(segments: &[TranscriptSegment], t: f64) -> Option<(String, f64, f64, 
         })
 }
 
+/// How far the picture's scale changes across a cut, as a fraction of the outgoing clip's:
+/// [`PUNCH_IN_SCALE`] or more is a punch-in.
+pub(crate) fn scale_jump(a: &Clip, b: &Clip) -> f64 {
+    (a.transform.scale - b.transform.scale).abs() / a.transform.scale.abs().max(1e-6)
+}
+
 /// Whether the framing changes across a cut — a punch-in, a move, a keyed zoom or a new 360
 /// view — which is how a jump cut is made deliberate. A live behaviour (a shake, a breath) is a
 /// look laid over the same framing, not a new one, so only the clips' keys count.
 fn reframed(a: &Clip, b: &Clip) -> bool {
     let keyed = |c: &Clip| Property::TRANSFORM.iter().any(|p| c.is_keyed(*p));
     let (ta, tb) = (&a.transform, &b.transform);
-    let scale = (ta.scale - tb.scale).abs() / ta.scale.abs().max(1e-6);
+    let scale = scale_jump(a, b);
     let moved = [
         (ta.pos_x, tb.pos_x),
         (ta.pos_y, tb.pos_y),

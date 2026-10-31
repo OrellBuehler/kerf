@@ -1010,6 +1010,7 @@ describe('keys that act once per press', () => {
 			'playback.shuttleForward',
 			'playback.goToTimecode',
 			'marker.add',
+			'sfx.add',
 			// Commands with no key of their own, run from the menus: one press, one run.
 			'view.minimap',
 			'view.motionPath',
@@ -1142,6 +1143,7 @@ describe('no key is hard-coded outside the registry', () => {
 			'lib/components/editor/SettingsAgent.svelte',
 			'lib/components/editor/SettingsDialog.svelte',
 			'lib/components/editor/SliderRow.svelte',
+			'lib/components/editor/SoundFx.svelte',
 			'lib/components/editor/SpeedRamp.svelte',
 			'lib/components/editor/TagInput.svelte',
 			'lib/components/editor/TemplateSection.svelte',

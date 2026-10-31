@@ -28,6 +28,7 @@ fn asset(n: u128, path: &str, duration: f64, image: bool) -> Asset {
         source_paths: Vec::new(),
         voiceover: None,
         music_score: None,
+        sound_effect: None,
         tags: Vec::new(),
     }
 }
