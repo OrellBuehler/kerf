@@ -160,6 +160,9 @@ class EditorUi {
 	relinkDialog = $state(false);
 	/** The read-only shortcut cheat sheet (`?`, Help › Keyboard shortcuts). */
 	shortcutSheet = $state(false);
+	/** The Edit-marker dialog: `null` while closed, else the marker it edits. The page mounts it (like every dialog), so it
+	 *  is a modal of the whole app and not of the panel the right-click came from. */
+	markerDialog = $state<{ markerId: string } | null>(null);
 	/** The options the export dialog was last closed on, for the session (`export-draft.ts`). */
 	exportDraft = $state.raw<ExportDraft | null>(null);
 	/** The delivery shapes (ids from `DELIVERY_PRESETS`) ticked for a multi-format
@@ -379,6 +382,34 @@ class EditorUi {
 
 	closeSaveTemplate() {
 		this.saveTemplateDialog = null;
+	}
+
+	openMarker(markerId: string) {
+		this.markerDialog = { markerId };
+	}
+
+	closeMarker() {
+		this.markerDialog = null;
+	}
+
+	/** Any of the dialogs the page mounts from this state is open (Settings and the updater's are the page's own to add).
+	 *  The app behind a modal is inert, no editor shortcut fires and the menus are put away — so a dialog missing here is
+	 *  one the user can click past, drop files under and edit the live project beside. `shared-components.test.ts` holds
+	 *  it to every `{#if ui.… }` dialog the page mounts. */
+	get dialogOpen(): boolean {
+		return (
+			this.exportDialog ||
+			this.voiceoverDialog !== null ||
+			this.composeDialog !== null ||
+			this.aboutDialog ||
+			this.fitMusicDialog !== null ||
+			this.relinkDialog ||
+			this.stemsDialog !== null ||
+			this.tagDialog !== null ||
+			this.saveTemplateDialog !== null ||
+			this.markerDialog !== null ||
+			this.shortcutSheet
+		);
 	}
 
 	openFitMusic(clipId: string) {

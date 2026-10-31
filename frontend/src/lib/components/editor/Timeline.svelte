@@ -4,6 +4,8 @@
 	import Btn from './Btn.svelte';
 	import Badge from './Badge.svelte';
 	import ClipOverlays from './ClipOverlays.svelte';
+	import TrackFlags from './TrackFlags.svelte';
+	import IconBtn from './IconBtn.svelte';
 	import ClipFilmstrip from './ClipFilmstrip.svelte';
 	import ClipWaveform from './ClipWaveform.svelte';
 	import LaneBlocks from './LaneBlocks.svelte';
@@ -11,7 +13,6 @@
 	import ToolbarToggle from './ToolbarToggle.svelte';
 	import Minimap from './Minimap.svelte';
 	import TimecodeField from './TimecodeField.svelte';
-	import MarkerDialog from './MarkerDialog.svelte';
 	import { markerTip } from '#lib/marker-edit';
 	import { toast } from '#lib/notifications.svelte';
 	import { ui, type Tool } from '#lib/editor-ui.svelte';
@@ -39,6 +40,7 @@
 		selectionLinkPlans,
 		splitSelection,
 		trimSelection,
+		undoToast,
 		unlinkSelection
 	} from '#lib/ops';
 	import { addAnimatedTitle, addCustomSvgTitle, addTitleHere, dropCaptions, importCaptionFile, makeCaptions } from '#lib/title-actions';
@@ -49,7 +51,8 @@
 	import { generatedCount, importMenuEntries, importableAssets } from '#lib/caption-import-ui';
 	import type { Clip, Marker, PreviewDraft, StreamKind, SvgOverlay, TextOverlay, Track } from '#lib/types';
 	import { moveDraft, trimDraft } from '#lib/preview-draft';
-	import { GENERATED_TITLE_FILL, SVG_TITLE_FILL, packRows, snapSpanStart, snapTime, trimSpan } from '#lib/titles';
+	import { GENERATED_TITLE_FILL, SVG_TITLE_FILL, packRows } from '#lib/titles';
+	import { markerDragStep, titleDragStep, type MarkerGrab } from '#lib/title-drag';
 	import { SVG_PRESETS, svgDisplayName, svgTooltip } from '#lib/svg-titles';
 	import { faderToGain, gainLabel, gainToFader, panLabel } from '#lib/mixer';
 	import { trackHasSound } from '#lib/mixer-strips';
@@ -64,7 +67,7 @@
 	import { applyProposal, discardProposal } from '#lib/proposal-actions';
 	import { PREVIEW_READ_ONLY_REASON, proposalLine, touchedOnLive } from '#lib/proposal-ui';
 	import { displayTracks, opensAudioGroup } from '#lib/track-order';
-	import { NUDGE_QUIET_MS, nudgeFrames, nudgedStart } from '#lib/nudge';
+	import { NUDGE_QUIET_MS, nudgeFrames, nudgePlan } from '#lib/nudge';
 	import {
 		CUT_REACH_PX,
 		cutsOf,
@@ -111,6 +114,7 @@
 	} from '#lib/timeline-cull';
 	import { clipDuration } from '#lib/types';
 	import { barGrid, beatGrid, beatPeriod, gridMagnets, sourceToTimeline } from '#lib/beats';
+	import { sceneTimes } from '#lib/scene-marks';
 	import { isRamped, meanSpeed } from '#lib/speed-ramp';
 	import { fmtSpeed, miniCurve, rampSummary } from '#lib/speed-ramp-edit';
 	import { NAME_CHIP_PCT, showsLabel } from '#lib/clip-label';
@@ -224,11 +228,6 @@
 	 *  rule the Mixer panel's strips follow too (`mixer-strips.ts`). */
 	const hasSound = (t: Track): boolean => trackHasSound(t, audibleAssets);
 
-	/** Shared look for the one-letter S / L track flags. */
-	const flagBtn = (on: boolean, accent: string) =>
-		`flex:none;font-family:var(--font-mono);font-size:12px;font-weight:600;line-height:1;min-width:26px;min-height:26px;padding:3px;border-radius:3px;cursor:pointer;` +
-		`border:var(--line-width) solid ${on ? accent : 'var(--border-strong)'};background:${on ? accent : 'transparent'};color:${on ? 'var(--text-on-accent)' : 'var(--text-muted)'}`;
-
 	/** A locked track refuses drag, trim and razor — the point of locking it. */
 	const isLocked = (trackId: string) => !!editor.timeline.tracks.find((t) => t.id === trackId)?.locked;
 
@@ -244,23 +243,6 @@
 	/** Timeline-seconds position of a source-time point inside a clip, honoring
 	 * the clip's speed (and reverse direction). */
 	const srcToTimeline = sourceToTimeline;
-
-	const sceneXs = $derived.by(() => {
-		const xs: number[] = [];
-		for (const t of editor.timeline.tracks) {
-			if (t.kind !== 'video') continue;
-			for (const c of t.clips) {
-				const an = editor.analysisFor(c.asset_id);
-				if (!an) continue;
-				for (const sc of an.scene_changes) {
-					if (sc > c.source_in && sc < c.source_out) {
-						xs.push(srcToTimeline(c, sc) * pxPerSec);
-					}
-				}
-			}
-		}
-		return xs;
-	});
 
 	// ---- beat grid (tempo analysis → ruler ticks + snap targets) --------------
 
@@ -343,6 +325,9 @@
 		return () => ro.disconnect();
 	});
 
+	/** The overview strip has a gesture in hand: it stays mounted even if the view it makes takes in the whole cut. */
+	let minimapHeld = $state(false);
+
 	$effect(() => {
 		ui.timelineView = { start: scrollX / pxPerSec, end: (scrollX + viewW) / pxPerSec };
 	});
@@ -361,6 +346,9 @@
 
 	const grid = $derived(rulerGrid(pxPerSec, editor.fps));
 	const visibleSec = $derived([viewLo / pxPerSec, Math.min(viewHi, laneW) / pxPerSec] as const);
+	/** Detected scene cuts in view, in seconds: keyed by the time (two clips of one asset laid in step
+	 *  share a cut, and a zoom must not rekey a mark), placed at `t * pxPerSec`. */
+	const sceneMarks = $derived(sceneTimes(editor.timeline, (id) => editor.analysisFor(id)?.scene_changes, visibleSec));
 	/** The labelled (major) ticks. */
 	const ticks = $derived(ticksIn(visibleSec[0], visibleSec[1], grid.step));
 	/** A mark per frame, once a frame is wide enough to tell apart; they are then the minor ticks. */
@@ -421,8 +409,9 @@
 	const heightItems = (t: Track): MenuItem[] =>
 		HEIGHT_PRESETS.map((p) => ({
 			label: `${PRESET_LABEL[p]} height`,
-			icon: ui.trackPreset(t.id) === p ? 'check' : undefined,
-			shortcut: `${PRESET_PX[p]} px`,
+			role: 'radio' as const,
+			checked: ui.trackPreset(t.id) === p,
+			meta: `${PRESET_PX[p]} px`,
 			action: () => ui.setTrackHeight(t.id, p)
 		}));
 
@@ -459,9 +448,7 @@
 	const dragPlan = $derived.by((): MovePlan | null => {
 		const d = drag;
 		if (d?.moved) return planMove(drawnMoveTracks(editor.timeline), d.members, d.clipId, d.start, d.trackId, { links: !alt });
-		const n = nudge;
-		if (n && nudgeAt !== null) return planMove(drawnMoveTracks(editor.timeline), n.members, n.clipId, nudgeAt, n.trackId, { links: !n.alone });
-		return null;
+		return nudgeView?.plan ?? null;
 	});
 	/** A run of arrow-key nudges on a focused clip: drawn where the clip will land, as a drag is, and
 	 *  written as one edit once the keys go quiet (`nudge.ts`). */
@@ -480,10 +467,11 @@
 	};
 	let nudge = $state<Nudge | null>(null);
 	let nudgeTimer: ReturnType<typeof setTimeout> | null = null;
+	/** What the run would do (`nudgePlan`: from the run and the cut alone — never the drag's position, which a press that
+	 *  begins a drag while the keys are quiet would otherwise hand the run). */
+	const nudgeView = $derived.by(() => (nudge ? nudgePlan(editor.timeline, nudge, fps) : null));
 	/** Where the grabbed clip of the run would stand. */
-	const nudgeAt = $derived.by(() =>
-		nudge ? nudgedStart(nudge.origStart, nudge.dur, nudge.frames, clipEdges(nudge.trackId, nudge.members), fps) : null
-	);
+	const nudgeAt = $derived(nudgeView?.at ?? null);
 	/** Ghosts by the track each is on. */
 	function byTrack<G extends { trackId: string }>(ghosts: readonly G[]): Map<string, G[]> {
 		const m = new Map<string, G[]>();
@@ -608,6 +596,7 @@
 	function onEdgePointerDown(e: PointerEvent, c: Clip, t: Track, edge: 'l' | 'r') {
 		if (e.button !== 0 || ui.tool !== 'pointer') return; // the other tools own the clip body
 		if (t.locked) return;
+		settleNudge();
 		e.stopPropagation();
 		alt = e.altKey;
 		editor.selectClip(c.id, 'replace', e.altKey);
@@ -769,7 +758,8 @@
 			[
 				...DELIVERY_PRESETS.map((p) => ({
 					label: p.label === 'Source' ? 'Source shape' : `${p.label} — ${p.hint}`,
-					icon: p.id === delivery.id ? 'check' : undefined,
+					role: 'radio' as const,
+					checked: p.id === delivery.id,
 					action: () => void setDeliveryPreset(p.id)
 				})),
 				// With a frame set: how footage of another shape meets it (the project's fit ticked), and the
@@ -779,14 +769,16 @@
 							{ type: 'separator' as const },
 							...fitChoices(editor.timeline.format).map((c) => ({
 								label: c.label,
-								icon: c.checked ? 'check' : undefined,
+								role: 'radio' as const,
+								checked: c.checked,
 								action: () => void setDeliveryFit(c.fit)
 							})),
 							{ type: 'separator' as const },
 							{ type: 'header' as const, label: 'Frame rate', sub: 'Exports, playback and stills' },
 							...rateChoices(editor.timeline.format).map((c) => ({
 								label: c.fps == null ? 'Source rate' : `${c.label} fps`,
-								icon: c.checked ? 'check' : undefined,
+								role: 'radio' as const,
+								checked: c.checked,
 								action: () => void setDeliveryFps(c.fps)
 							}))
 						]
@@ -798,6 +790,7 @@
 
 	function onClipPointerDown(e: PointerEvent, c: Clip, t: Track) {
 		if (e.button !== 0) return;
+		settleNudge();
 		const lane = (e.currentTarget as HTMLElement).closest('[data-lane]') as HTMLElement | null;
 		const laneLeft = lane?.getBoundingClientRect().left ?? 0;
 		const mode = pickMode(e);
@@ -1252,13 +1245,19 @@
 		nudge = null;
 	}
 
+	/** A press is about to begin a gesture of its own: a run of nudges still waiting for its keys to go quiet is written
+	 *  first, as the run it is, so the press's drag or trim never stands in for it. */
+	function settleNudge() {
+		if (nudge && !nudge.writing) commitNudge();
+	}
+
 	/** Write the run as ONE move — the plan is the drag's own, so ripple-free placement, links and
 	 *  the lane checks are the same — and keep it drawn until the timeline has come back. */
 	function commitNudge() {
 		const n = nudge;
 		if (!n || n.writing) return;
 		clearNudgeTimer();
-		const plan = dragPlan;
+		const plan = nudgeView?.plan;
 		if (!plan || plan.noop) {
 			nudge = null;
 			return;
@@ -1344,7 +1343,7 @@
 			return;
 		}
 		if (markerDrag) {
-			markerDrag = { ...markerDrag, time: rulerTime(e.clientX) };
+			markerDrag = { ...markerDrag, ...markerDragStep(markerDrag, { clientX: e.clientX, time: rulerTime(e.clientX), slopPx: DRAG_SLOP, fps }) };
 			return;
 		}
 		if (markDrag) {
@@ -1406,7 +1405,7 @@
 			const d = markerDrag;
 			markerDrag = null;
 			const m = editor.markers.find((x) => x.id === d.id);
-			if (m && Math.abs(m.time - d.time) > 1e-6) void editor.updateMarker(d.id, { time: d.time }).catch(err);
+			if (m && d.moved && Math.abs(m.time - d.time) > 1e-6) void editor.updateMarker(d.id, { time: d.time }).catch(err);
 			return;
 		}
 		if (markDrag) {
@@ -1567,6 +1566,7 @@
 	}
 
 	function beginTrimTool(e: PointerEvent, c: Clip, t: Track, laneLeft: number) {
+		settleNudge();
 		const tool = ui.tool as TrimTool;
 		alt = e.altKey;
 		const pressTime = laneTime(e.clientX, laneLeft);
@@ -1747,6 +1747,7 @@
 		if (e.button !== 0 || ui.tool !== 'pointer' || !empty) return;
 		const box = lanesEl?.getBoundingClientRect();
 		if (!box) return;
+		settleNudge();
 		const x = e.clientX - box.left;
 		const y = e.clientY - box.top;
 		marquee = {
@@ -1958,9 +1959,7 @@
 		void editor
 			.removeTrack(t.id)
 			.then(() =>
-				toast(`Removed track ${t.name}`, {
-					action: { label: 'Undo', onClick: () => void editor.undo() }
-				})
+				undoToast(`Removed track ${t.name}`)
 			)
 			.catch(err);
 
@@ -2027,9 +2026,7 @@
 		}
 		void (ripple ? editor.rippleDelete(id) : editor.remove(id))
 			.then(() =>
-				toast('Clip removed', {
-					action: { label: 'Undo', onClick: () => void editor.undo() }
-				})
+				undoToast('Clip removed')
 			)
 			.catch(err);
 	}
@@ -2038,9 +2035,7 @@
 	function removeAlone(id: string, ripple: boolean) {
 		void (ripple ? editor.rippleDelete(id, false) : editor.remove(id, false))
 			.then(() =>
-				toast('Clip removed — its linked clips stay', {
-					action: { label: 'Undo', onClick: () => void editor.undo() }
-				})
+				undoToast('Clip removed — its linked clips stay')
 			)
 			.catch(err);
 	}
@@ -2503,11 +2498,14 @@
 		/** A text title or an animated SVG title: the same gesture, written by a different edit. */
 		kind: 'text' | 'svg';
 		mode: 'move' | 'l' | 'r';
+		/** The pointer's time at the press less the grabbed time (the start; the end for a right edge): the offset it holds the title by. */
 		grabSec: number;
 		origStart: number;
 		origEnd: number;
 		start: number;
 		end: number;
+		/** Where the pointer went down, px: a press is a drag once the pointer has travelled `DRAG_SLOP` from it. */
+		downX: number;
 		moved: boolean;
 	};
 	let titleDrag = $state<TitleDrag | null>(null);
@@ -2529,6 +2527,7 @@
 
 	function onTitlePointerDown(e: PointerEvent, o: TextOverlay | SvgOverlay, mode: 'move' | 'l' | 'r', kind: 'text' | 'svg' = 'text') {
 		if (e.button !== 0) return;
+		settleNudge();
 		e.stopPropagation();
 		if (kind === 'svg') editor.selectSvgOverlay(o.id);
 		else editor.selectOverlay(o.id);
@@ -2538,11 +2537,12 @@
 			id: o.id,
 			kind,
 			mode,
-			grabSec: laneTime(e.clientX, left) - o.start,
+			grabSec: laneTime(e.clientX, left) - (mode === 'r' ? o.end : o.start),
 			origStart: o.start,
 			origEnd: o.end,
 			start: o.start,
 			end: o.end,
+			downX: e.clientX,
 			moved: false
 		};
 		capturePointer(e);
@@ -2551,25 +2551,17 @@
 	function onTitleDragMove(e: PointerLike) {
 		const d = titleDrag;
 		if (!d) return;
-		const t = laneTime(e.clientX, titleLaneEl?.getBoundingClientRect().left ?? 0);
-		const pts = titleSnapPoints(d.id);
-		const threshold = 8 / pxPerSec;
-		let start: number;
-		let end: number;
-		if (d.mode === 'move') {
-			const dur = d.origEnd - d.origStart;
-			start = ui.snap ? snapSpanStart(t - d.grabSec, dur, pts, threshold) : Math.max(0, t - d.grabSec);
-			end = start + dur;
-		} else {
-			({ start, end } = trimSpan(d.origStart, d.origEnd, d.mode, ui.snap ? snapTime(t, pts, threshold) : t));
-		}
-		const eps = 2 / pxPerSec;
-		titleDrag = {
-			...d,
-			start,
-			end,
-			moved: d.moved || Math.abs(start - d.origStart) >= eps || Math.abs(end - d.origEnd) >= eps
-		};
+		// Judged on the pointer's travel, snapped only once it is a drag (`title-drag.ts`): a magnet within reach of a press
+		// that did not move must not turn a click into a re-time.
+		const step = titleDragStep(d, {
+			clientX: e.clientX,
+			time: laneTime(e.clientX, titleLaneEl?.getBoundingClientRect().left ?? 0),
+			slopPx: DRAG_SLOP,
+			snap: ui.snap,
+			points: d.moved || Math.abs(e.clientX - d.downX) >= DRAG_SLOP ? titleSnapPoints(d.id) : [],
+			threshold: 8 / pxPerSec
+		});
+		titleDrag = { ...d, ...step };
 	}
 
 	function onTitleDragUp() {
@@ -2577,6 +2569,7 @@
 		titleDrag = null;
 		if (!d) return;
 		if (!d.moved) return; // a plain click selected the title at the press and leaves the playhead alone
+		if (d.start === d.origStart && d.end === d.origEnd) return; // dragged out and back: nothing to write
 		// An edit that removed it under the drag (an undo, an agent) leaves nothing to write.
 		if (d.kind === 'svg' && !editor.svgOverlays.some((o) => o.id === d.id)) return;
 		// One edit either way: an animated title's update re-times a preset's artwork in the same revision.
@@ -2711,10 +2704,9 @@
 	// ---- markers --------------------------------------------------------------
 
 	/** Marker being dragged along the ruler, and the id being renamed inline. */
-	let markerDrag: { id: string; time: number } | null = $state(null);
+	let markerDrag: ({ id: string; time: number } & MarkerGrab) | null = $state(null);
 	let renaming = $state<string | null>(null);
 	/** The marker whose name, kind, length and comment are open in the dialog. */
-	let editingMarker = $state<string | null>(null);
 
 	const addMarkerHere = () => void addMarker();
 
@@ -2722,7 +2714,7 @@
 		if (e.button !== 0 || renaming === m.id) return;
 		e.stopPropagation();
 		if (holdForReview(e)) return;
-		markerDrag = { id: m.id, time: m.time };
+		markerDrag = { id: m.id, time: m.time, origTime: m.time, grabSec: rulerTime(e.clientX) - m.time, downX: e.clientX, moved: false };
 		capturePointer(e);
 	}
 
@@ -2741,7 +2733,7 @@
 			{ label: 'Go to marker', icon: 'bookmark', action: () => ui.seek(m.time) },
 			...held([
 				{ label: 'Rename', action: () => (renaming = m.id) },
-				{ label: 'Edit marker…', icon: 'file-text', action: () => (editingMarker = m.id) },
+				{ label: 'Edit marker…', icon: 'file-text', action: () => ui.openMarker(m.id) },
 				{
 					label: m.kind === 'chapter' ? 'Make it a comment' : 'Make it a chapter',
 					action: () => void editor.updateMarker(m.id, { kind: m.kind === 'chapter' ? 'comment' : 'chapter' }).catch(err)
@@ -3100,7 +3092,7 @@
 	     buttons and the zoom / fit / shuttle keys, and the playhead's follow) — a
 	     second focusable widget with partial parity would be more to learn than
 	     to use. Its toggle in the toolbar stays labelled. -->
-	{#if ui.minimap && hasClips && !viewCoversCut({ scrollLeft: scrollX, viewW, pxPerSec }, editor.duration)}
+	{#if ui.minimap && hasClips && (minimapHeld || !viewCoversCut({ scrollLeft: scrollX, viewW, pxPerSec }, editor.duration))}
 		<div
 			aria-hidden="true"
 			style="display:flex;flex:none;border-bottom:var(--line-width) solid var(--border-subtle);background:var(--surface-app)"
@@ -3119,6 +3111,7 @@
 				time={ui.time}
 				markIn={ui.markIn}
 				markOut={ui.markOut}
+				bind:held={minimapHeld}
 				onview={applyView}
 				onseek={(t) => ui.seek(t)}
 			/>
@@ -3183,18 +3176,19 @@
 			</div>
 			{#if titlesEmpty}
 				<!-- Nothing on the titles lane: a strip, and the whole of its header adds a title. -->
-				<button
+				<IconBtn
 					data-title-add
-					use:tip={settings.tip('Add a title at the playhead', 'title.add')}
+					title={settings.tip('Add a title at the playhead', 'title.add')}
 					aria-label="Add a title"
-					disabled={editor.busy}
+					pending={editor.busy}
 					onclick={addTitleHere}
-					style="display:flex;align-items:center;gap:6px;width:100%;height:{titleLaneH}px;box-sizing:border-box;padding:0 8px;border:none;border-bottom:1px solid var(--border-subtle);background:none;cursor:pointer;text-align:left;color:var(--text-muted);font-size:10px"
+					size={titleLaneH}
+					style="display:flex;align-items:center;justify-content:flex-start;gap:6px;width:100%;box-sizing:border-box;padding:0 8px;border:none;border-bottom:1px solid var(--border-subtle);border-radius:0;text-align:left;color:var(--text-muted);font-size:10px"
 				>
 					<span style="font-family:var(--font-mono);font-weight:600;color:var(--text-secondary);flex:none">T</span>
 					<span style="flex:1;min-width:0">Titles</span>
 					<Icon n="plus" s={10} />
-				</button>
+				</IconBtn>
 			{:else}
 			<div
 				style="height:{titleLaneH}px;border-bottom:1px solid var(--border-subtle);display:flex;align-items:center;gap:6px;padding:0 8px;overflow:hidden"
@@ -3203,13 +3197,14 @@
 				<span style="font-size:11px;color:var(--text-muted);flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis"
 					>Titles · {titleCount}</span
 				>
-				<button
-					use:tip={settings.tip('Add a title at the playhead', 'title.add')}
+				<IconBtn
+					size={26}
+					title={settings.tip('Add a title at the playhead', 'title.add')}
 					aria-label="Add a title"
-					disabled={editor.busy}
+					data-tone="quiet"
+					pending={editor.busy}
 					onclick={addTitleHere}
-					style="background:none;border:none;cursor:pointer;padding:0;min-width:26px;min-height:26px;flex:none;display:grid;place-items:center;color:var(--text-muted)"
-					><Icon n="plus" s={12} /></button
+					><Icon n="plus" s={12} /></IconBtn
 				>
 			</div>
 			{/if}
@@ -3241,63 +3236,7 @@
 					     speaker icon both already say the kind, and the row now carries
 					     mute / solo / lock / remove in a fixed-width column. -->
 					<span style="flex:1;min-width:0"></span>
-					{#if t.kind === 'audio'}
-						<button
-							use:tip={t.duck
-								? 'Ducking on — this track dips under the rest of the mix on export (the preview plays it at its fader)'
-								: 'Duck this track under the rest of the mix on export (the preview plays it at its fader)'}
-							aria-label="Toggle ducking"
-							onclick={() => void editor.setTrackDuck(t.id, !t.duck).catch(err)}
-							style="background:{t.duck ? 'var(--kerf-500)' : 'none'};border:var(--line-width) solid {t.duck
-								? 'var(--kerf-500)'
-								: 'var(--border-strong)'};border-radius:3px;cursor:pointer;color:{t.duck
-								? 'var(--text-on-accent)'
-								: 'var(--text-muted)'};font-size:12px;font-weight:600;min-height:26px;padding:2px 4px;flex:none"
-							>DUCK</button
-						>
-					{/if}
-					<button
-						use:tip={t.muted
-							? t.kind === 'video'
-								? 'Hidden — click to show'
-								: 'Muted — click to unmute'
-							: t.kind === 'video'
-								? 'Hide this track'
-								: 'Mute this track'}
-						aria-label="Toggle mute"
-						aria-pressed={!!t.muted}
-						onclick={() => void editor.setTrackMuted(t.id, !t.muted).catch(err)}
-						style="background:none;border:none;cursor:pointer;padding:0;min-width:26px;min-height:26px;flex:none;display:grid;place-items:center;color:{t.muted
-							? 'var(--red-500)'
-							: 'var(--text-muted)'}"
-						><Icon n={t.kind === 'video' ? (t.muted ? 'eye-off' : 'eye') : t.muted ? 'volume-x' : 'volume-2'} s={12} /></button
-					>
-					<button
-						use:tip={t.solo ? 'Soloed — click to clear' : 'Solo this track'}
-						aria-label="Toggle solo"
-						aria-pressed={!!t.solo}
-						onclick={() => void editor.setTrackSolo(t.id, !t.solo).catch(err)}
-						style={flagBtn(!!t.solo, 'var(--kerf-400)')}>S</button
-					>
-					<button
-						use:tip={t.locked ? 'Locked — click to unlock' : 'Lock this track against edits'}
-						aria-label="Toggle lock"
-						aria-pressed={!!t.locked}
-						onclick={() => void editor.setTrackLocked(t.id, !t.locked).catch(err)}
-						style="flex:none;display:grid;place-items:center;min-width:26px;min-height:26px;padding:3px;border-radius:3px;cursor:pointer;border:var(--line-width) solid {t.locked
-							? 'var(--text-secondary)'
-							: 'var(--border-strong)'};background:{t.locked ? 'var(--surface-active)' : 'transparent'};color:{t.locked
-							? 'var(--text-primary)'
-							: 'var(--text-muted)'}"
-						><Icon n={t.locked ? 'lock' : 'lock-open'} s={12} /></button
-					>
-					<button
-						use:tip={'Remove track'}
-						aria-label="Remove track"
-						onclick={() => onRemoveTrack(t)}
-						style="background:none;border:none;cursor:pointer;color:var(--text-muted);display:grid;place-items:center;padding:0;min-width:26px;min-height:26px;flex:none"
-						><Icon n="x" s={12} /></button
-					>
+					<TrackFlags track={t} onremove={onRemoveTrack} />
 				</div>
 					{#if hasSound(t) && ui.trackPx(t.id) >= MIXER_MIN_PX}
 						<!-- The mixer strip: a fader over every clip on the track, and its
@@ -3313,11 +3252,14 @@
 								max="1"
 								step="0.005"
 								value={gainToFader(t.volume ?? 1)}
-								disabled={editor.locked}
+								aria-disabled={editor.locked ? 'true' : undefined}
 								aria-label="{t.name} level"
 								use:tip={`Level ${gainLabel(t.volume ?? 1)} — double-click for unity`}
-								onchange={(e) => void editor.setTrackVolume(t.id, faderToGain(+e.currentTarget.value)).catch(err)}
-								ondblclick={() => void editor.setTrackVolume(t.id, 1).catch(err)}
+								onchange={(e) => {
+									if (editor.locked) return void (e.currentTarget.value = String(gainToFader(t.volume ?? 1)));
+									void editor.setTrackVolume(t.id, faderToGain(+e.currentTarget.value)).catch(err);
+								}}
+								ondblclick={() => !editor.locked && void editor.setTrackVolume(t.id, 1).catch(err)}
 								style="flex:1;min-width:0;height:20px;--slider-accent:var(--kerf-400);cursor:pointer"
 							/>
 							<input
@@ -3326,11 +3268,14 @@
 								max="1"
 								step="0.05"
 								value={t.pan ?? 0}
-								disabled={editor.locked}
+								aria-disabled={editor.locked ? 'true' : undefined}
 								aria-label="{t.name} pan"
 								use:tip={`Pan ${panLabel(t.pan ?? 0)} — double-click to centre`}
-								onchange={(e) => void editor.setTrackPan(t.id, +e.currentTarget.value).catch(err)}
-								ondblclick={() => void editor.setTrackPan(t.id, 0).catch(err)}
+								onchange={(e) => {
+									if (editor.locked) return void (e.currentTarget.value = String(t.pan ?? 0));
+									void editor.setTrackPan(t.id, +e.currentTarget.value).catch(err);
+								}}
+								ondblclick={() => !editor.locked && void editor.setTrackPan(t.id, 0).catch(err)}
 								style="width:48px;flex:none;height:20px;--slider-accent:var(--text-muted);cursor:pointer"
 							/>
 						</div>
@@ -3398,10 +3343,10 @@
 						>{tickLabel(t.k, grid, editor.fps, timeDisplay.mode)}</span
 					>
 				{/each}
-				{#each sceneXs as x (x)}
+				{#each sceneMarks as t (t)}
 					<span
 						use:tip={'Detected scene cut'}
-						style="position:absolute;left:{x}px;top:0;width:0;height:0;border-left:4px solid transparent;border-right:4px solid transparent;border-top:5px solid var(--scene-marker);transform:translateX(-50%)"
+						style="position:absolute;left:{t * pxPerSec}px;top:0;width:0;height:0;border-left:4px solid transparent;border-right:4px solid transparent;border-top:5px solid var(--scene-marker);transform:translateX(-50%)"
 					></span>
 				{/each}
 				{#each beatTimes as b (b)}
@@ -3438,6 +3383,7 @@
 							<!-- svelte-ignore a11y_autofocus -->
 							<input
 								autofocus
+								aria-label="Marker name"
 								value={m.name}
 								onblur={(e) => commitRename(m, e.currentTarget.value)}
 								onkeydown={(e) => {
@@ -4073,10 +4019,6 @@
 		</div>
 	</div>
 </div>
-
-{#if editingMarker}
-	<MarkerDialog markerId={editingMarker} onClose={() => (editingMarker = null)} />
-{/if}
 
 <style>
 	/* A locked lane is hatched: the track header says so too, but a lane that looks like any other is

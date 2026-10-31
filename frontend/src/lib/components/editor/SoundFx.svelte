@@ -34,7 +34,10 @@
 	// read that failed would be asked for again, and again. (`onMount` is untracked.) A sound still playing is for a panel that is gone.
 	onMount(() => {
 		void sfxPanel.load();
-		return () => sfxPanel.stop();
+		return () => {
+			sfxPanel.stop();
+			releaseDrag?.();
+		};
 	});
 
 	const visible = $derived(sfxPanel.visible);
@@ -88,6 +91,8 @@
 	/** A tile drag just ended: the click that follows its release is not a pick. It is only the click that is waiting right behind
 	 *  the release, so it is let go of a moment later, whether or not one came (a cancelled pointer sends none). */
 	let dragged = false;
+	/** The drag in hand, if any: a panel taken down mid-gesture gives it up (below, with the audition) rather than let it commit later. */
+	let releaseDrag: (() => void) | null = null;
 	let undragged: ReturnType<typeof setTimeout> | null = null;
 	const SLOP = 4;
 	const CLICK_AFTER_DRAG_MS = 60;
@@ -123,7 +128,7 @@
 			ui.dndPoint = null;
 		};
 		// The pointer is the tile's until it is let go; the lanes find the drop by where it is (`ui.dndPoint`), as a bin drag does.
-		beginDrag(e, {
+		releaseDrag = beginDrag(e, {
 			move(m) {
 				if (!active) {
 					if (Math.hypot(m.clientX - x0, m.clientY - y0) < SLOP) return;

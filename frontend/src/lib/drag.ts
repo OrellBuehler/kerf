@@ -9,7 +9,16 @@
  *    missed — over a native dialog, outside the webview). Nothing is written.
  * Whichever happens, the listeners are gone and the capture released, and a later
  * event of the same gesture is ignored. It returns a function that abandons it
- * from outside (the clip it belongs to was removed mid-drag). */
+ * from outside (the clip it belongs to was removed mid-drag).
+ *
+ * Every listener is on the window (capture phase, filtered by `pointerId`), none on the
+ * element: a gesture must outlive the element it began on. A removed element is sent
+ * no more events and loses its capture (the browser fires `lostpointercapture` at the
+ * document), so listeners on it would leave the gesture's Escape / blur hooks installed,
+ * swallowing the next Escape, with nothing ever to end it. The window sees the release,
+ * the cancel and the lost capture wherever the pointer is, and runs before any handler
+ * of the page, as the element's own listener did. A caller whose element can go while the
+ * gesture is held also keeps the returned function and calls it on teardown. */
 
 import { windowOf } from './realm';
 
@@ -42,16 +51,17 @@ export function beginDrag(e: PointerEvent, h: DragHandlers, env: DragEnv = { win
 	const finish = (then: () => void) => {
 		if (done) return;
 		done = true;
-		el.removeEventListener('pointermove', onMove as EventListener);
-		el.removeEventListener('pointerup', onUp as EventListener);
-		el.removeEventListener('pointercancel', onCancel as EventListener);
-		el.removeEventListener('lostpointercapture', onLost as EventListener);
-		env.window.removeEventListener('keydown', onKey as EventListener, true);
-		env.window.removeEventListener('blur', onBlur);
+		const w = env.window;
+		w.removeEventListener('pointermove', onMove as EventListener, true);
+		w.removeEventListener('pointerup', onUp as EventListener, true);
+		w.removeEventListener('pointercancel', onCancel as EventListener, true);
+		w.removeEventListener('lostpointercapture', onLost as EventListener, true);
+		w.removeEventListener('keydown', onKey as EventListener, true);
+		w.removeEventListener('blur', onBlur);
 		try {
 			el.releasePointerCapture(id);
 		} catch {
-			// already released
+			// already released, or the element is gone
 		}
 		then();
 	};
@@ -82,11 +92,12 @@ export function beginDrag(e: PointerEvent, h: DragHandlers, env: DragEnv = { win
 		abandon();
 	}
 
-	el.addEventListener('pointermove', onMove as EventListener);
-	el.addEventListener('pointerup', onUp as EventListener);
-	el.addEventListener('pointercancel', onCancel as EventListener);
-	el.addEventListener('lostpointercapture', onLost as EventListener);
-	env.window.addEventListener('keydown', onKey as EventListener, true);
-	env.window.addEventListener('blur', onBlur);
+	const w = env.window;
+	w.addEventListener('pointermove', onMove as EventListener, true);
+	w.addEventListener('pointerup', onUp as EventListener, true);
+	w.addEventListener('pointercancel', onCancel as EventListener, true);
+	w.addEventListener('lostpointercapture', onLost as EventListener, true);
+	w.addEventListener('keydown', onKey as EventListener, true);
+	w.addEventListener('blur', onBlur);
 	return abandon;
 }

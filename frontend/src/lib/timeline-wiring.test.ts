@@ -24,7 +24,9 @@ describe('the timeline draws one track order', () => {
 
 	test('a group move is planned over the lanes as drawn, so "up" is the same way for every kind', () => {
 		expect(src).not.toMatch(/planMove\(moveTracks\(/);
-		expect(src.match(/planMove\(drawnMoveTracks\(/g)).toHaveLength(3);
+		// the drag's, and the drop's re-plan at release; an arrow-key nudge's is `nudgePlan`'s, over the same lanes
+		expect(src.match(/planMove\(drawnMoveTracks\(/g)).toHaveLength(2);
+		expect(readFileSync(join(import.meta.dir, 'nudge.ts'), 'utf8')).toContain('planMove(drawnMoveTracks(timeline)');
 	});
 });
 
@@ -67,5 +69,31 @@ describe('the playhead goes exactly where it is asked to, or is put back exactly
 	test('autoscroll stops when the pointer loses its capture', () => {
 		expect(src).toContain("win.addEventListener('lostpointercapture', lost);");
 		expect(src).toContain("win.removeEventListener('lostpointercapture', lost);");
+	});
+});
+
+describe('a scene-cut mark is a time, not a pixel', () => {
+	test('the ruler draws sceneTimes keyed by the time, placed at t * pxPerSec', () => {
+		// Keyed by x, two clips of one asset in step (same x) throw each_key_duplicate, and every zoom rekeys all of them.
+		expect(src).toContain('sceneTimes(editor.timeline,');
+		expect(src).toContain('{#each sceneMarks as t (t)}');
+		expect(src).not.toContain('sceneXs');
+		expect(src).not.toMatch(/\{#each scene\w* as x \(x\)\}/);
+	});
+});
+
+describe('a pending arrow-key nudge is settled by the next press, from the run alone', () => {
+	test('every press that begins a gesture writes the waiting run first', () => {
+		for (const fn of ['onClipPointerDown', 'onEdgePointerDown', 'onTitlePointerDown', 'onCanvasPointerDown', 'beginTrimTool']) {
+			expect(bodyOf(fn), fn).toContain('settleNudge();');
+		}
+		expect(bodyOf('settleNudge')).toContain('if (nudge && !nudge.writing) commitNudge();');
+	});
+
+	test('the run is written from nudgePlan, never from the drag\u2019s plan', () => {
+		const body = bodyOf('commitNudge');
+		expect(body).toContain('nudgeView?.plan');
+		expect(body).not.toContain('dragPlan');
+		expect(src).toContain('const nudgeView = $derived.by(() => (nudge ? nudgePlan(editor.timeline, nudge, fps) : null));');
 	});
 });

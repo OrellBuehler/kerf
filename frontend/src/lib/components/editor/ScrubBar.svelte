@@ -18,6 +18,9 @@
 	let { duration, empty }: { duration: number; empty: boolean } = $props();
 
 	let held = $state(false);
+	/** The drag in hand, if any: a component taken down mid-gesture gives it up rather than let it commit later. */
+	let releaseDrag: (() => void) | null = null;
+	$effect(() => () => releaseDrag?.());
 	const at = $derived(empty ? 0 : scrubFraction(ui.time, duration));
 	const range = $derived(scrubRange(ui.markIn, ui.markOut, duration));
 	/** The markers on the cut, as ticks along the rail. */
@@ -69,7 +72,7 @@
 		};
 		held = true;
 		ui.seek(timeAt(e));
-		beginDrag(e, {
+		releaseDrag = beginDrag(e, {
 			move: (ev) => seek.push(timeAt(ev)),
 			commit: (ev) => {
 				seek.cancel();

@@ -85,6 +85,9 @@
 		committing: boolean;
 	};
 	let drag = $state<Drag | null>(null);
+	/** The drag in hand, if any: a component taken down mid-gesture gives it up rather than let it commit later. */
+	let releaseDrag: (() => void) | null = null;
+	$effect(() => () => releaseDrag?.());
 	let rootEl = $state<HTMLElement | null>(null);
 	let cssWidth = $state(0);
 
@@ -160,7 +163,7 @@
 			committing: false
 		};
 		drag = d;
-		beginDrag(e, {
+		releaseDrag = beginDrag(e, {
 			move(ev) {
 				if (!d.moved && Math.hypot(ev.clientX - from[0], ev.clientY - from[1]) < TRAVEL) return;
 				const snap = { on: ui.snap !== ev.altKey, targets, threshold: 6 * k };

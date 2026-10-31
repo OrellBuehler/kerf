@@ -5,7 +5,9 @@ state** (ruler + tracks + clips positioned by `timeline_start`/duration at `ui.z
 px/sec + playhead), with scene markers / silence regions / **beat ticks** (the tempo grid
 of audio-track clips, confidence-gated, hidden when beats land closer than 4px — from
 `src/lib/beats.ts`, the TS mirror of the Rust beat math that the ruler, the drag
-snapping and the browser harness's alignment all share, unit-tested with `bun test`)
+snapping and the browser harness's alignment all share, unit-tested with `bun test`; the scene
+cuts are `scene-marks.ts` `sceneTimes` — seconds, de-duplicated, only the window in view, keyed by
+the time and not the pixel, since two clips of one asset laid in step share a cut)
 and **bar ticks** (`barGrid`, the mirror of `Timeline::bar_grid`: the same grid over the
 tempos' `downbeats`, which music with a fitted bar grid carries and speech does not; drawn
 taller and heavier than a beat, in the same `--beat-marker` token, and kept when the beats
@@ -36,7 +38,10 @@ neighbour is placed by `startBefore` (the latest start whose `start + duration` 
 pass it, in the backend's own arithmetic; `tail - dur` is an ULP too high about as often
 as not). Whether a press became a drag is judged on pointer travel (3 px), never on the
 quantized position (one pixel is under a frame at high zoom), and an edge keeps the
-offset it was grabbed at. A razor cut keeps half a frame
+offset it was grabbed at. A title (text or animated) and a marker are held to the same rules (`title-drag.ts`
+`titleDragStep` / `markerDragStep`): nothing about them changes until the pointer has travelled past the slop — a magnet within
+reach of a press that never moved must not turn a click into a re-time —, a title's edge keeps its grab offset and snaps only
+once it is a drag, a marker lands on a frame of the cut, and a drag that ends where it began writes nothing. A razor cut keeps half a frame
 either side (`splitPoint`; a clip with no interior frame says so), the context menu's
 split quantizes the playhead (and shows no key: `C` is the Razor *tool*, and nothing splits at
 the playhead from the keyboard yet), and Escape / pointercancel / blur abandon a clip, edge or
@@ -329,7 +334,9 @@ wait names the clip, not the build's progress, which the bar is not asked again 
 **A clip with the keyboard focus nudges**: ← / → move it (and the selection it is part of) a frame, ⇧ a second, Alt leaves its
 linked partners (`nudge.ts`). A run of presses is one edit, written once the keys go quiet (450 ms), on Enter or when focus
 leaves; until then the clip is drawn where it will land as a drag is (the plan is `planMove`'s, so overlaps, locks and links
-are the drag's), Escape abandons it, and the undo key (`settings.actionFor(e) === 'edit.undo'`) during an unwritten run takes the
+are the drag's — `nudge.ts` `nudgePlan`, from the run and the cut alone, never the drag's pointer: a press on a clip, an edge,
+a title, the empty lanes or a roll / slip / slide tool writes a waiting run first, `settleNudge`, or the quiet timer would have
+written the drag's half-way position as the nudge), Escape abandons it, and the undo key (`settings.actionFor(e) === 'edit.undo'`) during an unwritten run takes the
 run back, not the edit before it (redo drops the run and goes on). A move the backend would refuse is said in a toast.
 **Track order is drawn, not stored**: the lanes and headers show the video group highest layer first, then the audio
 (`track-order.ts` `displayTracks`: V3, V2, V1, A1, A2 — a later video track composites on top, and now it is drawn on top), with
@@ -460,7 +467,10 @@ The **toolbar** is `ToolbarToggle`s (`frontend.md`, Shared components): tools | 
 zoom | snapping and Ripple | the three track heights and the overview | `+ V` / `+ A` and the delivery frame on the right,
 a rule between each group. Every one is 24 px high with a 24 px target at least, and lit the same way (amber outline
 and wash) — a tool, snapping (a magnet, `aria-pressed`), Ripple, the heights, the overview, a fade that is set, and the delivery
-frame once one is chosen (its label then carries the frame rate when it states one: `9:16 · 50 fps`). The track header's own S / L / DUCK toggles are not part of it.
+frame once one is chosen (its label then carries the frame rate when it states one: `9:16 · 50 fps`). The track header's own flags are not part of it: `TrackFlags.svelte`
+is five `IconBtn`s (DUCK, mute / hide, S, the padlock, remove) each **named for its track** ("Mute A1", "Hide V1", `track-flags.ts`) with the hover and pressed
+look of every icon button, `pending` (aria-disabled, press swallowed, focus kept) while an edit is in flight or a proposal is on screen — the tooltip then says
+why; the header's level and pan sliders and both "Add a title" buttons are `aria-disabled` the same way (a native `disabled` drops the keyboard focus).
 The **minimap** (`Minimap.svelte` over the pure `minimap.ts`; toolbar toggle, remembered; **hidden while
 the view already takes in 98 % of the cut** — `viewCoversCut`, so it costs its 37 px only once you are zoomed
 in, and the window fitted at open never shows it) is the whole cut on a 36 px strip: a block per clip per track row (runs too fine to tell apart
@@ -470,7 +480,9 @@ ways (`windowRect` view -> box, `targetForRect` box -> view). Drag the body to s
 is kept *exactly*, not re-derived from a box widened to its 8 px minimum), drag an edge to
 zoom (the other edge stays put, even after the zoom was clamped), press the bare strip to jump
 there (and keep dragging), double-click to move the playhead. Gestures are absolute from the
-press, Escape restores the view, and the timeline applies the result like a wheel zoom
+press, Escape restores the view, the strip stays mounted while a gesture holds it (`held`; an edge
+dragged out can zoom the view to cover the cut, which would otherwise unmount it mid-drag), one that
+ends because the strip went (toggled off, an empty cut) stops without moving the view, and the timeline applies the result like a wheel zoom
 (`pendingScroll`). `rowLayout` always fits the strip (the gap gives first, then 1 px rows,
 then fractional rows), and the strip is `aria-hidden` on purpose: the timeline's own keys
 (scroll, zoom, ⇧Z, J/K/L) are the accessible path.
@@ -491,7 +503,9 @@ also parts from a waveform of its own colour. The top 14 px of a clip is the han
 alone and the line's travel stays below it; the edge strips and the line's grab band do
 not overlap; nothing is hit-testable until the clip is hovered or selected, nor under the
 razor, nor on a locked track (keyframes still seek). Every gesture is `drag.ts`'s
-`beginDrag` (pointer capture; Escape / cancel / lost capture / blur abandon), shows its
+`beginDrag` (pointer capture; Escape / cancel / lost capture / blur abandon — all heard on the **window**, filtered by `pointerId`,
+never on the element, so a gesture outlives the element it began on, and a component that can go while one is held keeps the
+returned function and calls it from `$effect(() => () => …)`; `drag.test.ts` scans `components/` for it), shows its
 value live (the waveform follows the volume line) and writes **one** edit on release,
 holding the live value until that edit settles. The ruler renders **in/out marks**
 (`I`/`O` set at the playhead, `⇧I`/`⇧O` clear) that drive range export. Transport is

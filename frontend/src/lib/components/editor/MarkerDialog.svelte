@@ -29,8 +29,8 @@
 
 	const result = $derived(marker ? markerPatch(marker, { name, kind, durationText, comment }) : null);
 
-	async function save(e?: SubmitEvent) {
-		e?.preventDefault();
+	async function save(e: SubmitEvent) {
+		e.preventDefault();
 		if (!marker || !result || 'error' in result) return;
 		if (Object.keys(result.patch).length === 0) return onClose();
 		saving = true;
@@ -95,7 +95,7 @@
 		<div style="padding:12px 16px;display:flex;align-items:center;gap:8px">
 			<div style="flex:1"></div>
 			<Btn variant="ghost" size="md" disabled={saving} onclick={onClose}>Cancel</Btn>
-			<Btn variant="primary" size="md" icon="bookmark" data-rescue onclick={() => void save()} disabled={!result || 'error' in result || saving}>
+			<Btn variant="primary" size="md" icon="bookmark" data-rescue type="submit" form="marker-form" disabled={!result || 'error' in result || saving}>
 				Save
 			</Btn>
 		</div>

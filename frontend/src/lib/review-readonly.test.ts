@@ -69,7 +69,9 @@ describe('the keys and menus that edit stop before they plan, copy or ask', () =
 		for (const label of ["'Undo'", "'Redo'"]) expect(tl).toContain(label);
 		expect(tl).toContain('!editor.canUndo || editor.previewingStaged');
 		expect(tl).toContain('!editor.canRedo || editor.previewingStaged');
-		expect(tl.match(/disabled=\{editor\.locked\}/g)?.length).toBeGreaterThanOrEqual(2);
+		// the faders stay focusable (a native `disabled` drops focus): aria-disabled, and a change that arrives anyway is put back
+		expect(tl.match(/aria-disabled=\{editor\.locked \? 'true' : undefined\}/g)?.length).toBeGreaterThanOrEqual(2);
+		expect(read(`${EDITOR}TrackFlags.svelte`)).toContain('const pending = $derived(editor.locked);');
 		expect(body(tl, 'onLaneDrop')).toContain('editor.previewingStaged');
 	});
 

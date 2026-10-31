@@ -15,8 +15,13 @@ export type MenuItem =
 			label: string;
 			icon?: string;
 			shortcut?: string;
-			/** A muted fact on the right, in the shortcut's place (a count): not a key, so it is not drawn as one. */
+			/** A muted fact on the right, in the shortcut's place (a count, a size): not a key, so it is not drawn as one. */
 			meta?: string;
+			/** The row is a choice, not an action: `check` is on or off by itself, `radio` is one of a set of which one is on.
+			 *  Announced as such (`menuitemcheckbox` / `menuitemradio`, `aria-checked`) and drawn with a tick in the icon's place
+			 *  while `checked` — an icon alone says nothing to a screen reader. `checked` without a `role` is a `check`. */
+			role?: 'check' | 'radio';
+			checked?: boolean;
 			danger?: boolean;
 			disabled?: boolean;
 			/** Why a disabled item is disabled, said under its label — an item that cannot be
@@ -25,7 +30,7 @@ export type MenuItem =
 			action: () => void;
 	  }
 	| { type: 'separator' }
-	/** A non-interactive title row: what the menu is about. */
+	/** A non-interactive title row: what the menu is about (drawn with `role="presentation"`: it is not a menu item). */
 	| { type: 'header'; label: string; sub?: string }
 	/** A non-interactive fact row (`label` left, `value` right, mono). */
 	| { type: 'info'; label: string; value: string; title?: string };

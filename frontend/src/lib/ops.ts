@@ -55,6 +55,45 @@ export function holdForPreview(): boolean {
 	return true;
 }
 
+/** The revision the project stands at, or `undefined` where the history cannot say (not loaded; the browser's has one). */
+function headSeq(): number | undefined {
+	return editor.history.find((r) => r.current)?.seq;
+}
+
+/** What a toast's Undo says when other edits have come since. */
+export const UNDO_MOVED_ON = 'Other edits have been made since — step back with Edit > Undo, or from the History list in the Agent panel';
+
+/**
+ * The Undo button of a toast about an edit that has just landed. It takes back **that** edit — and only while it is still
+ * the latest: a toast outlives the edit (several seconds, and the log's bell), and a plain undo would take back whatever
+ * came after it instead, with the toast's words about something else. Called when the edit's promise has resolved, so
+ * the history already shows it (`#apply` re-reads it); once the project has moved on the button says so and does nothing.
+ * `steps` is how many revisions the toast's action made (a split of several clips is one each).
+ */
+export function undoAction(steps = 1): { label: string; onClick: () => void } {
+	const at = headSeq();
+	return {
+		label: 'Undo',
+		onClick: () => {
+			if (headSeq() !== at) {
+				toast.warning(UNDO_MOVED_ON);
+				return;
+			}
+			void (async () => {
+				for (let i = 0; i < steps; i++) await editor.undo();
+			})().catch(report);
+		}
+	};
+}
+
+/** A toast with the Undo of the edit just made (`undoAction`). */
+export function undoToast(message: string, level: 'note' | 'success' | 'info' = 'note', steps = 1): void {
+	const action = undoAction(steps);
+	if (level === 'success') toast.success(message, { action });
+	else if (level === 'info') toast.info(message, { action });
+	else toast(message, { action });
+}
+
 /** Await `op`, turning a rejection into a toast (`report`). Never throws. */
 export async function attempt(op: () => Promise<unknown>): Promise<void> {
 	try {
@@ -75,7 +114,7 @@ export async function deleteSelection(ripple: boolean): Promise<void> {
 			if (skipped > 0) toast.error(lockedNotice(skipped));
 			return;
 		}
-		toast(removalNotice(removed, skipped, ripple), { action: { label: 'Undo', onClick: () => void editor.undo() } });
+		toast(removalNotice(removed, skipped, ripple), { action: undoAction() });
 	} catch (e) {
 		report(e);
 	}
@@ -94,7 +133,7 @@ export async function cutSelection(): Promise<void> {
 			if (skipped > 0) toast.error(lockedNotice(skipped));
 			return;
 		}
-		toast(cutNotice(removed, skipped), { action: { label: 'Undo', onClick: () => void editor.undo() } });
+		toast(cutNotice(removed, skipped), { action: undoAction() });
 	} catch (e) {
 		report(e);
 	}
@@ -173,7 +212,7 @@ export async function addMarker(): Promise<void> {
 	if (holdForPreview()) return;
 	try {
 		await editor.addMarkerAtPlayhead(ui.time);
-		toast('Marker added', { action: { label: 'Undo', onClick: () => void editor.undo() } });
+		toast('Marker added', { action: undoAction() });
 	} catch (e) {
 		report(e);
 	}
@@ -231,16 +270,7 @@ export async function splitSelection(): Promise<void> {
 		if (done === 0) return;
 	}
 	const n = done;
-	toast(splitDone(n), {
-		action: {
-			label: 'Undo',
-			onClick: () => {
-				void (async () => {
-					for (let i = 0; i < n; i++) await editor.undo();
-				})().catch(report);
-			}
-		}
-	});
+	toast(splitDone(n), { action: undoAction(n) });
 	if (plan.problems.length > 0) toast.warning(splitNotice({ ...plan, splits: [] }, selected.length));
 }
 
@@ -275,7 +305,7 @@ export async function keyEdit(tool: KeyTool, dir: 1 | -1): Promise<void> {
 		return;
 	}
 	if (cutAt !== null) ui.seek(cutAt);
-	toast(result.note ?? keyEditDone(tool, dir), { action: { label: 'Undo', onClick: () => void editor.undo() } });
+	toast(result.note ?? keyEditDone(tool, dir), { action: undoAction() });
 }
 
 // ---- linked A/V: detach, reattach, link, unlink --------------------------------------
@@ -309,7 +339,7 @@ export async function detachSelection(): Promise<void> {
 	// The sound that was just made is part of the pictures' link group: select it with them.
 	editor.selectClips(withLinkPartners(editor.timeline, [...plan.ids]), editor.selectedClipId);
 	const note = result.skipped.length > 0 ? `${detachedNotice(result.detached)} — ${result.skipped.length} skipped (${result.skipped[0].reason})` : detachedNotice(result.detached);
-	toast(note, { action: { label: 'Undo', onClick: () => void editor.undo() } });
+	toast(note, { action: undoAction() });
 }
 
 /** **Reattach audio** (⇧⌘D, the clip menu): the linked audio clip goes and the picture
@@ -328,7 +358,7 @@ export async function reattachSelection(): Promise<void> {
 		report(e);
 		return;
 	}
-	toast(reattachedNotice(plan.ids.length), { action: { label: 'Undo', onClick: () => void editor.undo() } });
+	toast(reattachedNotice(plan.ids.length), { action: undoAction() });
 }
 
 /** **Link** the selected clips (⌘L, the clip menu): one clip per track, a move / trim / split
@@ -346,7 +376,7 @@ export async function linkSelection(): Promise<void> {
 		report(e);
 		return;
 	}
-	toast(linkedNotice(plan.ids.length), { action: { label: 'Undo', onClick: () => void editor.undo() } });
+	toast(linkedNotice(plan.ids.length), { action: undoAction() });
 }
 
 /** **Unlink** the selected clips (⇧⌘L, the clip menu): each leaves its group. */
@@ -363,7 +393,7 @@ export async function unlinkSelection(): Promise<void> {
 		report(e);
 		return;
 	}
-	toast(unlinkedNotice(plan.ids.length), { action: { label: 'Undo', onClick: () => void editor.undo() } });
+	toast(unlinkedNotice(plan.ids.length), { action: undoAction() });
 }
 
 // ---- things the engine could always do and the interface did not reach ------------------------------
@@ -416,9 +446,7 @@ export async function appendAllMedia(ids: readonly string[] = editor.assets.map(
 		report(e);
 		return;
 	}
-	toast(appendedLine(ids.length, editor.assets.length), {
-		action: { label: 'Undo', onClick: () => void editor.undo() }
-	});
+	toast(appendedLine(ids.length, editor.assets.length), { action: undoAction() });
 }
 
 /** **Copy keyframes** (the clip menu, the Inspector's Animation section): remember the clip whose animation is to be
@@ -453,5 +481,5 @@ export async function pasteKeyframesOnto(clipId: string): Promise<void> {
 		report(e);
 		return;
 	}
-	toast(`Pasted the ${propsPhrase(props)} animation`, { action: { label: 'Undo', onClick: () => void editor.undo() } });
+	toast(`Pasted the ${propsPhrase(props)} animation`, { action: undoAction() });
 }

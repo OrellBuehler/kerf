@@ -11,7 +11,7 @@ import { editor, PreviewReadOnly } from './state.svelte';
 import { ui } from './editor-ui.svelte';
 import { toast } from './notifications.svelte';
 import { failure, tidyReason } from './failure-copy';
-import { report } from './ops';
+import { report, undoAction } from './ops';
 import { Auditioner } from './sfx-audition';
 import { SFX_KINDS, defaultSfxSpec } from './sfx';
 import {
@@ -242,7 +242,7 @@ class SfxPanelState {
 		try {
 			const done = await editor.addSoundEffects(placements);
 			const only = placements.length === 1 ? this.catalogue.find((p) => p.kind === placements[0].kind)?.label : undefined;
-			toast.success(addedLine(done.clips.length, only), { action: { label: 'Undo', onClick: () => void editor.undo() } });
+			toast.success(addedLine(done.clips.length, only), { action: undoAction() });
 			return true;
 		} catch (e) {
 			if (isSfxCancelled(e)) return false;

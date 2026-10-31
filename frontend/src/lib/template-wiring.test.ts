@@ -99,7 +99,8 @@ describe('the Save as template dialog', () => {
 	test('is mounted once, by the page, and puts the app behind it out of reach', () => {
 		const page = read('routes/+page.svelte');
 		expect(page).toContain('<SaveTemplateDialog overlayId={ui.saveTemplateDialog.overlayId}');
-		expect(page).toContain('ui.saveTemplateDialog !== null');
+		expect(page).toContain('ui.dialogOpen');
+		expect(read('lib/editor-ui.svelte.ts')).toContain('this.saveTemplateDialog !== null');
 	});
 
 	test('Enter saves: the footer Save is the form’s submit button, and no button in the form submits it', () => {

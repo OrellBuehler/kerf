@@ -11,7 +11,10 @@
 	 * that the timeline answers a frame late cannot drift. The timeline owns the
 	 * scroller, so a gesture ends in `onview` with the scroll and zoom it wants and
 	 * the timeline applies them (a zoom change needs the lane re-widened first).
-	 * Escape / pointercancel / blur put the view back as the press found it. */
+	 * Escape / pointercancel / blur put the view back as the press found it. The timeline hides
+	 * the strip once the view takes in the whole cut, which a zoom made from this very strip can
+	 * bring about mid-gesture — so it stays (`held`) until the gesture is over, and one that is
+	 * ended by the strip going (toggled off, the cut emptied) just stops, without moving the view. */
 	import { beginDrag } from '#lib/drag';
 	import { clipDuration, type Track } from '#lib/types';
 	import {
@@ -43,6 +46,7 @@
 		time,
 		markIn,
 		markOut,
+		held = $bindable(false),
 		onview,
 		onseek
 	}: {
@@ -56,6 +60,8 @@
 		time: number;
 		markIn: number | null;
 		markOut: number | null;
+		/** A gesture is in hand: the timeline keeps the strip mounted until it ends. */
+		held?: boolean;
 		/** Ask the timeline to scroll / zoom to this. */
 		onview: (target: Target) => void;
 		/** Move the playhead (a double-click on the strip). */
@@ -68,6 +74,13 @@
 	let strip = $state<HTMLElement | null>(null);
 	let width = $state(0);
 	let gesture = $state<Hit | null>(null);
+	/** Gives up the gesture in hand; called as the strip goes, when its `abandon` must not move the view. */
+	let release: (() => void) | null = null;
+	let leaving = false;
+	$effect(() => () => {
+		leaving = true;
+		release?.();
+	});
 
 	const geo = $derived<MapGeo>({ span: mapSpan(duration), width: Math.max(width, 1) });
 	const view = $derived<View>({ scrollLeft, viewW, pxPerSec });
@@ -106,8 +119,9 @@
 			grab = r.w / 2;
 		}
 		gesture = hit;
+		held = true;
 		e.preventDefault();
-		beginDrag(e, {
+		release = beginDrag(e, {
 			move(ev) {
 				const px = xOf(ev);
 				if (hit === 'body') onview(moveTo(start, g, px - grab));
@@ -116,10 +130,12 @@
 			},
 			commit() {
 				gesture = null;
+				held = false;
 			},
 			abandon() {
 				gesture = null;
-				onview(home);
+				held = false;
+				if (!leaving) onview(home);
 			}
 		});
 	}
