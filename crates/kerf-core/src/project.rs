@@ -7873,7 +7873,7 @@ pub use music::{
 mod sfx;
 #[cfg(test)]
 mod sfx_tests;
-pub use sfx::{PlannedSfx, SfxPlacement, SfxPlan, SfxUpdate, MAX_SFX_GAIN_DB, MAX_SFX_PER_CALL, MIN_SFX_GAIN_DB};
+pub use sfx::{PlannedSfx, SfxPlaced, SfxPlacement, SfxPlan, SfxUpdate, MAX_SFX_GAIN_DB, MAX_SFX_PER_CALL, MIN_SFX_GAIN_DB};
 mod audio_sync;
 pub use audio_sync::{AudioSync, AudioSyncMeasure, AudioSyncPlan, SyncSide, MAX_SYNC_SECONDS, SYNC_SAMPLE_RATE};
 mod store;

@@ -1618,8 +1618,9 @@ fn sfx_catalogue() -> Vec<kerf_core::SfxPreset> {
 
 /// `spec` rendered for auditioning, as the bytes of its 48 kHz stereo 16-bit WAV (the page decodes
 /// them with Web Audio: the CSP has no `media-src`, so a path the page could load does not exist).
-/// No edit and no asset; the same spec is the same file that placing it would use. A render takes
-/// milliseconds and never touches the project.
+/// No edit and no asset; the same spec is the same audio that placing it would use, in a file of its own
+/// in the cache folder (which is pruned), not among the project's effects. A render takes milliseconds and
+/// never touches the project. The GUI's alone: an agent does not hear, so there is no MCP tool for it.
 #[tauri::command]
 async fn preview_sound_effect(spec: kerf_core::SfxSpec) -> CmdResult<tauri::ipc::Response> {
     let wav = blocking(move || {
@@ -1668,7 +1669,10 @@ async fn add_sound_effects(
         }
         let clips = project
             .with_ripple(ripple, |project| project.place_sound_effects(&assets, &plan))
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|placed| placed.clip)
+            .collect();
         let timeline = project.timeline().map_err(|e| e.to_string())?;
         Ok(SfxAdded { clips, timeline })
     })
@@ -1716,7 +1720,8 @@ async fn update_sound_effect(
         }
         let clip = project
             .with_ripple(ripple, |project| project.apply_sound_effect_update(&asset, &update))
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| e.to_string())?
+            .clip;
         let timeline = project.timeline().map_err(|e| e.to_string())?;
         Ok(SfxUpdated { clip, timeline })
     })

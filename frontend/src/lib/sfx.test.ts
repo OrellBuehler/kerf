@@ -2,11 +2,26 @@ import { describe, expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import {
+	DEFAULT_SFX_INTENSITY,
+	DEFAULT_SFX_TAIL,
 	MAX_SEED,
+	MAX_SFX_GAIN_DB,
+	MAX_SFX_PER_CALL,
+	MAX_SFX_PITCH,
 	MIN_SFX_CLIP_S,
+	MIN_SFX_GAIN_DB,
+	MIN_SHOT_S,
+	PUNCH_IN_SCALE,
 	SFX_CATALOGUE,
 	SFX_CATEGORIES,
+	SFX_DENSITIES,
+	SFX_HEAD_SNAP_S,
 	SFX_KINDS,
+	SFX_SOURCES,
+	SFX_SPEC_FIELDS,
+	SPACING_S,
+	SUGGEST_CONSTANTS,
+	TRIM_FADE_S,
 	checkSfxPlacements,
 	checkSfxSpec,
 	checkSfxSuggestRequest,
@@ -110,6 +125,71 @@ describe('the catalogue', () => {
 			expect(row.level_db).toBeLessThanOrEqual(0);
 		}
 		expect(SFX_CATEGORIES.every((c) => SFX_CATALOGUE.some((p) => p.category === c.name))).toBe(true);
+	});
+});
+
+// ---- the behaviour constants, read out of the Rust ---------------------------------------------
+
+const rustSource = (path: string) => readFileSync(join(import.meta.dir, '../../../crates/kerf-core/src', path), 'utf8');
+const SFX_PROJECT = rustSource('project/sfx.rs');
+const SFX_SUGGEST = rustSource('model/sfx_suggest.rs');
+
+/** The value of `const NAME: T = …;` in `source`, with the one expression form the constants use besides a literal. */
+function rustConst(source: string, name: string): number {
+	const m = new RegExp(String.raw`const ${name}: \w+ = ([^;]+);`).exec(source);
+	if (!m) throw new Error(`no const ${name}`);
+	const value = m[1].trim();
+	const shifted = /^\(1 << (\d+)\) - 1$/.exec(value);
+	return shifted ? 2 ** Number(shifted[1]) - 1 : Number(value.replace(/_/g, ''));
+}
+
+/** The variants of the enum `name` in `source`, snake_case, in declaration order. */
+function rustVariants(source: string, name: string): string[] {
+	const body = source.slice(source.indexOf(`pub enum ${name} {`)).split('\n}\n')[0];
+	return [...body.matchAll(/^    ([A-Z]\w+),?$/gm)].map((m) => snake(m[1]));
+}
+
+describe('the behaviour constants are the Rust ones', () => {
+	test('placing: the snap, the least of a head, the fade, the batch size and the gain range', () => {
+		const model = rustSource('model/sfx.rs');
+		expect(SFX_HEAD_SNAP_S).toBe(rustConst(model, 'SFX_HEAD_SNAP_S'));
+		expect(MIN_SFX_CLIP_S).toBe(rustConst(model, 'MIN_SFX_CLIP_S'));
+		expect(MAX_SFX_PITCH).toBe(rustConst(model, 'MAX_SFX_PITCH'));
+		expect(DEFAULT_SFX_INTENSITY).toBe(rustConst(model, 'DEFAULT_SFX_INTENSITY'));
+		expect(DEFAULT_SFX_TAIL).toBe(rustConst(model, 'DEFAULT_SFX_TAIL'));
+		expect(TRIM_FADE_S).toBe(rustConst(SFX_PROJECT, 'TRIM_FADE_S'));
+		expect(MAX_SFX_PER_CALL).toBe(rustConst(SFX_PROJECT, 'MAX_SFX_PER_CALL'));
+		expect(MIN_SFX_GAIN_DB).toBe(rustConst(SFX_PROJECT, 'MIN_SFX_GAIN_DB'));
+		expect(MAX_SFX_GAIN_DB).toBe(rustConst(SFX_PROJECT, 'MAX_SFX_GAIN_DB'));
+		expect(MAX_SEED).toBe(rustConst(rustSource('model/score.rs'), 'MAX_SEED'));
+		expect(SFX_PROJECT).toContain('TRIM_FADE_S.min(clip.duration() / 2.0)');
+	});
+
+	test('suggesting: the thresholds, the punch-in scale and the lane name', () => {
+		expect(PUNCH_IN_SCALE).toBe(rustConst(rustSource('review.rs'), 'PUNCH_IN_SCALE'));
+		for (const [name, value] of Object.entries(SUGGEST_CONSTANTS)) {
+			expect(value as number).toBe(rustConst(SFX_SUGGEST, name));
+		}
+		expect(Object.keys(SUGGEST_CONSTANTS).length).toBe(14);
+		expect(rustSource('project.rs')).toContain('pub const SFX_TRACK: &str = "FX";');
+	});
+
+	test('the densities, their spacing and the shortest shot a cut is suggested on', () => {
+		expect(rustVariants(SFX_SUGGEST, 'SfxDensity')).toEqual([...SFX_DENSITIES]);
+		const arms = (fn: string): (string | null)[][] => {
+			const body = SFX_SUGGEST.slice(SFX_SUGGEST.indexOf(`pub fn ${fn}(`)).split('\n    }\n')[0];
+			return [...body.matchAll(/SfxDensity::(\w+) => (None|Some\(([\d.]+)\)|([\d.]+)),/g)].map((m) => [snake(m[1]), m[3] ?? m[4] ?? null]);
+		};
+		expect(arms('spacing_s')).toEqual(SFX_DENSITIES.map((d): (string | null)[] => [d, SPACING_S[d].toFixed(1)]));
+		expect(arms('min_shot_s')).toEqual(SFX_DENSITIES.map((d): (string | null)[] => [d, MIN_SHOT_S[d] === null ? null : MIN_SHOT_S[d]!.toFixed(1)]));
+	});
+
+	test('the sources break a tie in the order of the Rust enum, and a spec is written in the order of its struct', () => {
+		expect(rustVariants(SFX_SUGGEST, 'SfxSource')).toEqual([...SFX_SOURCES]);
+		const struct = RUST.slice(RUST.indexOf('pub struct SfxSpec {')).split('\n}\n')[0];
+		expect([...struct.matchAll(/^    pub (\w+):/gm)].map((m) => m[1])).toEqual([...SFX_SPEC_FIELDS]);
+		expect(Object.keys(resolveSfxSpec({ kind: 'pop' }))).toEqual([...SFX_SPEC_FIELDS]);
+		expect(Object.keys(defaultSfxSpec('pop'))).toEqual(SFX_SPEC_FIELDS.filter((f) => f !== 'duration_s'));
 	});
 });
 
@@ -269,6 +349,38 @@ describe('placing effects', () => {
 		expect(snapped.fade_in).toBe(0);
 		expect(() => add(emptyCut(), [at('riser', 0.01, { duration_s: 3 })])).toThrow(/effects\[0\] \(riser\): its hit is 3\.00 s into its 3\.00 s.*place it at 0\.02 s or later/);
 		expect(MIN_SFX_CLIP_S).toBe(0.02);
+	});
+
+	test('the snap boundary: a start 9.9 ms before 0 is put at 0, 10.1 ms before 0 has its head cut', () => {
+		const anchor = sfxAnchor({ kind: 'whoosh' }, 1);
+		expect(sfxSpan({ kind: 'whoosh' }, 1, anchor - 0.0099)).toEqual([0, 0]);
+		const cut = sfxSpan({ kind: 'whoosh' }, 1, anchor - 0.0101)!;
+		expect(cut[0]).toBe(0);
+		expect(cut[1]).toBeCloseTo(0.0101, 9);
+		// Exactly at the snap it is already cut: the rule is "less than".
+		expect(sfxSpan({ kind: 'whoosh' }, 1, anchor - SFX_HEAD_SNAP_S)![1]).toBeGreaterThan(0);
+		// The effect that comes of it: hit late, nothing cut, nothing faded; or cut and faded.
+		const [late] = add(emptyCut(), [at('whoosh', anchor - 0.0099)]);
+		expect([late.timeline_start, late.source_in, late.fade_in]).toEqual([0, 0, 0]);
+		const [cutHead] = add(emptyCut(), [at('whoosh', anchor - 0.0101)]);
+		expect(cutHead.source_in).toBeCloseTo(0.0101, 9);
+		expect(cutHead.fade_in).toBeCloseTo(TRIM_FADE_S, 9);
+	});
+
+	test('lands to the last bit: a riser that leaves exactly the least of its sound is placed, a hair less is not', () => {
+		// `an_effect_lands_where_the_placement_accepts_it_to_the_last_bit`
+		for (const length of [4, 4.1, 4.37, 5.123, 7.777, 11.999]) {
+			const riser = { kind: 'riser' as const, duration_s: length };
+			const len = resolvedDuration(riser);
+			expect(sfxSpan(riser, len, 0.02)).not.toBeNull();
+			expect(sfxSpan(riser, len, 0.019)).toBeNull();
+			expect(() => planSoundEffects(emptyCut(), [at('riser', 0.02, { duration_s: length })], false, newId)).not.toThrow();
+			expect(() => planSoundEffects(emptyCut(), [at('riser', 0.019, { duration_s: length })], false, newId)).toThrow('place it at 0.02 s or later');
+		}
+		expect(sfxSpan({ kind: 'impact' }, 1.6, 0)).not.toBeNull();
+		const whoosh = sfxAnchor({ kind: 'whoosh' }, 1);
+		expect(sfxSpan({ kind: 'whoosh' }, 1, whoosh - 0.009)).not.toBeNull();
+		expect(sfxSpan({ kind: 'whoosh' }, 1, whoosh - 0.012)).not.toBeNull();
 	});
 
 	test('the gain is the clip’s volume', () => {

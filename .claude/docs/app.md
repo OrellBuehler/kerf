@@ -117,7 +117,7 @@ with the request's own `track_id` / `at` / `replace_clip_id` as given (a refused
 the whole bed of `replace_clip_id`, empty when a clip was added) plus the refreshed `timeline`; both emit `music-progress` — the voiceover's payload, stages `download_soundfont`,
 `waiting`, `render` — and `cancel_music` rejects `music cancelled`), sound effects (`sfx_catalogue` → the core's `SfxPreset` rows;
 `preview_sound_effect { spec }` → the **bytes of the rendered WAV** via `tauri::ipc::Response`, not a path: the CSP has no `media-src` and the
-app registers no asset protocol, so the page decodes them with Web Audio like `get_audio`'s PCM; no edit, no asset, the project is not touched;
+app registers no asset protocol, so the page decodes them with Web Audio like `get_audio`'s PCM; no edit, no asset, the project is not touched; the same audio placing it would use, from a file of its own in the pruned cache folder; **GUI-only on purpose** (no MCP twin: an agent does not hear);
 `add_sound_effects { placements, ripple? }` → `{clips, timeline}`: `sound_effects_inputs` under the lock and `with_ripple`, the render with it released
 (`synthesize_sound_effects`, stopped only by a replaced project — it takes milliseconds, so there is no cancel command or progress event), then
 `place_sound_effects` under `with_ripple` as **one** `Add sound effects` revision; `update_sound_effect { clipId, spec, volumeDb?, ripple? }` → `{clip, timeline}`

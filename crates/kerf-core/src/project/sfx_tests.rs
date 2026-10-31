@@ -42,7 +42,11 @@ fn rendered(spec: &SfxSpec) -> Asset {
 fn add(project: &Project, placements: &[SfxPlacement]) -> Result<Vec<Clip>> {
     let plan = project.sound_effects_inputs(placements)?;
     let assets: Vec<Asset> = plan.effects.iter().map(|e| rendered(&e.spec)).collect();
-    project.place_sound_effects(&assets, &plan)
+    Ok(project
+        .place_sound_effects(&assets, &plan)?
+        .into_iter()
+        .map(|placed| placed.clip)
+        .collect())
 }
 
 fn lanes(project: &Project) -> Vec<(String, usize)> {
@@ -262,10 +266,10 @@ fn a_named_track_must_be_an_unlocked_audio_track_with_room() {
     assert!(e.contains("would overlap another clip on Sting"), "{e}");
     // ... and with ripple on, an effect that lands on footage pushes it along.
     let pushed = project
-        .with_ripple(Some(true), |p| {
+        .with_ripple(Some(true), |p| -> Result<Vec<Clip>> {
             let plan = p.sound_effects_inputs(&[named(audio.id, 9.6)])?;
             let assets = vec![rendered(&plan.effects[0].spec)];
-            p.place_sound_effects(&assets, &plan)
+            Ok(p.place_sound_effects(&assets, &plan)?.into_iter().map(|x| x.clip).collect())
         })
         .unwrap();
     let timeline = project.timeline().unwrap();
@@ -487,6 +491,60 @@ fn the_time_a_refusal_names_is_a_time_that_lands() {
 }
 
 #[test]
+fn a_placed_effect_says_the_hit_it_really_has_and_the_asset_it_plays_as_stored() {
+    let project = Project::open_in_memory().unwrap();
+    // Asked for at 0, an impact starts at 0 whole and its hit is 4 ms late; a whoosh at 0.2 s has its head
+    // cut and its hit where it was asked for; one in the clear is exactly there.
+    let plan = project
+        .sound_effects_inputs(&[
+            at(SfxKind::Impact, 0.0),
+            at(SfxKind::Whoosh, 0.2),
+            at(SfxKind::Pop, 5.0),
+            at(SfxKind::Riser, 9.0),
+        ])
+        .unwrap();
+    let assets: Vec<Asset> = plan.effects.iter().map(|e| rendered(&e.spec)).collect();
+    let placed = project.place_sound_effects(&assets, &plan).unwrap();
+    let hits: Vec<f64> = placed.iter().map(|p| p.hit).collect();
+    for (hit, want) in hits.iter().zip([0.004, 0.2, 5.0, 9.0]) {
+        assert!((hit - want).abs() < 1e-9, "{hits:?}");
+    }
+    for p in &placed {
+        assert_eq!(p.clip.asset_id, p.asset.id, "the clip plays the asset it reports");
+        let stored = project.get_asset(p.asset.id).unwrap().expect("which is the stored row");
+        assert_eq!(
+            (stored.path, stored.sound_effect),
+            (p.asset.path.clone(), p.asset.sound_effect.clone())
+        );
+    }
+
+    // The same effect rendered again is one file and one asset: the fresh copy's id is never reported.
+    let again = project.sound_effects_inputs(&[at(SfxKind::Pop, 7.0)]).unwrap();
+    let fresh = rendered(&again.effects[0].spec);
+    assert_ne!(fresh.id, placed[2].asset.id);
+    let second = project.place_sound_effects(&[fresh], &again).unwrap();
+    assert_eq!(second[0].asset.id, placed[2].asset.id);
+    assert_eq!(second[0].clip.asset_id, placed[2].asset.id);
+    assert_eq!(project.list_assets().unwrap().len(), 4);
+
+    // A reshape reports the same: the stored asset and the hit as it now is.
+    let update = project
+        .update_sound_effect_inputs(
+            placed[0].clip.id,
+            &SfxSpec {
+                duration_s: Some(2.0),
+                ..spec(SfxKind::Impact)
+            },
+            None,
+        )
+        .unwrap();
+    let swapped = project.apply_sound_effect_update(&rendered(&update.spec), &update).unwrap();
+    assert_eq!(swapped.clip.asset_id, swapped.asset.id);
+    assert_eq!(project.get_asset(swapped.asset.id).unwrap().unwrap().path, swapped.asset.path);
+    assert!((swapped.hit - 0.004).abs() < 1e-9, "{}", swapped.hit);
+}
+
+#[test]
 fn a_hit_a_few_milliseconds_before_zero_is_put_at_zero_late_not_trimmed() {
     let project = Project::open_in_memory().unwrap();
     // An impact's transient is 4 ms in: asked for at 0 it starts at 0 whole, its hit 4 ms late.
@@ -531,7 +589,10 @@ fn a_hit_a_few_milliseconds_before_zero_is_put_at_zero_late_not_trimmed() {
         )
         .unwrap();
     assert!((update.anchor_at - 0.004).abs() < 1e-9);
-    let new = project.apply_sound_effect_update(&rendered(&update.spec), &update).unwrap();
+    let new = project
+        .apply_sound_effect_update(&rendered(&update.spec), &update)
+        .unwrap()
+        .clip;
     assert_eq!((new.timeline_start, new.source_in, new.fade_in), (0.0, 0.0, 0.0), "{new:?}");
 }
 
@@ -546,7 +607,7 @@ fn whoosh_at_ten(project: &Project) -> Clip {
 
 fn reshape(project: &Project, clip: Uuid, spec: &SfxSpec, volume_db: Option<f64>) -> Result<Clip> {
     let update = project.update_sound_effect_inputs(clip, spec, volume_db)?;
-    project.apply_sound_effect_update(&rendered(&update.spec), &update)
+    Ok(project.apply_sound_effect_update(&rendered(&update.spec), &update)?.clip)
 }
 
 #[test]
@@ -563,7 +624,10 @@ fn reshaping_an_effect_keeps_its_hit_gain_and_fades() {
     };
     let update = project.update_sound_effect_inputs(old.id, &longer, None).unwrap();
     assert!((update.anchor_at - 10.0).abs() < 1e-9);
-    let new = project.apply_sound_effect_update(&rendered(&update.spec), &update).unwrap();
+    let new = project
+        .apply_sound_effect_update(&rendered(&update.spec), &update)
+        .unwrap()
+        .clip;
 
     assert_eq!(new.id, old.id, "the same clip");
     assert_ne!(new.asset_id, old.asset_id);
@@ -907,7 +971,12 @@ fn sound_effects_are_rendered_probed_placed_and_reshaped_for_real() {
             .expect("an audio stream");
         assert_eq!((audio.sample_rate, audio.channels), (Some(48_000), Some(2)));
     }
-    let clips = project.place_sound_effects(&assets, &plan).unwrap();
+    let clips: Vec<Clip> = project
+        .place_sound_effects(&assets, &plan)
+        .unwrap()
+        .into_iter()
+        .map(|placed| placed.clip)
+        .collect();
     assert_eq!(clips.len(), 3);
     let preview = Project::preview_sound_effect(&plan.effects[0].spec, &|| false).unwrap();
     assert_eq!(

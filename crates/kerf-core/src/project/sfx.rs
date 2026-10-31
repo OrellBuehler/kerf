@@ -133,6 +133,28 @@ pub struct SfxUpdate {
     pub anchor_at: f64,
 }
 
+/// An effect as it landed on the timeline: its clip, the asset the clip plays **as stored** and the
+/// timeline second its hit really falls on.
+///
+/// The asset is the project's own row: the same render put on twice is one file and one asset, so it
+/// is the one the first placement stored, not the fresh copy a caller rendered the second time. The
+/// hit is read from the clip (the render's hit point through the clip's own mapping), so it is where
+/// the effect is heard: the `at` that was asked for, except that a start a few milliseconds before 0
+/// is put at 0 ([`crate::model::SFX_HEAD_SNAP_S`]) and its hit lands that much later.
+#[derive(Debug, Clone, Serialize)]
+pub struct SfxPlaced {
+    pub clip: Clip,
+    pub asset: Asset,
+    /// Where on the timeline the hit point is, seconds.
+    pub hit: f64,
+}
+
+/// `clip`, which plays `asset` (a render of `spec`), with the asset and where its hit falls.
+fn placed(clip: Clip, asset: Asset, spec: &SfxSpec) -> SfxPlaced {
+    let hit = clip.source_to_timeline(sfx_anchor_s(spec, asset.duration));
+    SfxPlaced { clip, asset, hit }
+}
+
 // ---- placing -------------------------------------------------------------------------------
 
 /// A stand-in for the render of `spec`: the length it will have, nothing rendered or probed.
@@ -375,7 +397,7 @@ impl Project {
         let path = engine::sfx::synthesize(spec, cancel)?;
         let spec = spec.resolved();
         tracing::info!(path = %path.display(), kind = spec.kind.name(), "synthesized sound effect");
-        let mut asset = Self::probe_asset(&path)?;
+        let mut asset = Self::probe_asset_with(&path, cancel)?;
         asset.name = spec.title();
         asset.sound_effect = Some(spec);
         Ok(asset)
@@ -417,7 +439,7 @@ impl Project {
     /// clip in the way, a hit that cannot land) stores nothing; an agent's edit stages through
     /// `edit_timeline` — the assets land at once, the placement waits. Each effect goes where
     /// [`SfxPlacement`] says: a named track, or the first `FX` lane with room.
-    pub fn place_sound_effects(&self, assets: &[Asset], plan: &SfxPlan) -> Result<Vec<Clip>> {
+    pub fn place_sound_effects(&self, assets: &[Asset], plan: &SfxPlan) -> Result<Vec<SfxPlaced>> {
         if assets.len() != plan.effects.len() {
             return Err(invalid("there must be one rendered asset for each planned effect"));
         }
@@ -443,7 +465,13 @@ impl Project {
                 .iter()
                 .map(|a| self.insert_or_get_asset(a))
                 .collect::<Result<Vec<_>>>()?;
-            put_sound_effects(timeline, &stored, plan, &ids)
+            let clips = put_sound_effects(timeline, &stored, plan, &ids)?;
+            Ok(clips
+                .into_iter()
+                .zip(stored)
+                .zip(&plan.effects)
+                .map(|((clip, asset), effect)| placed(clip, asset, &effect.spec))
+                .collect())
         })
     }
 
@@ -453,7 +481,11 @@ impl Project {
     pub fn add_sound_effects(&self, placements: &[SfxPlacement]) -> Result<Vec<Clip>> {
         let plan = self.sound_effects_inputs(placements)?;
         let assets = Self::synthesize_sound_effects(&plan, &|| false)?;
-        self.place_sound_effects(&assets, &plan)
+        Ok(self
+            .place_sound_effects(&assets, &plan)?
+            .into_iter()
+            .map(|p| p.clip)
+            .collect())
     }
 
     /// Check a reshape under the lock: the clip is on an unlocked audio track and its asset was
@@ -505,7 +537,7 @@ impl Project {
     /// keys, and plays the whole render at normal speed. It goes through `edit_timeline`, so ripple
     /// applies as to any edit and without it a longer render that would run into the next clip is
     /// refused with nothing stored or changed.
-    pub fn apply_sound_effect_update(&self, asset: &Asset, update: &SfxUpdate) -> Result<Clip> {
+    pub fn apply_sound_effect_update(&self, asset: &Asset, update: &SfxUpdate) -> Result<SfxPlaced> {
         if asset.sound_effect.as_ref() != Some(&update.spec) {
             return Err(invalid("that asset is not the render of the edited effect"));
         }
@@ -514,7 +546,8 @@ impl Project {
             let (ti, ci) = timeline.locate(update.clip_id).ok_or(Error::ClipNotFound(update.clip_id))?;
             let anchor_at = self.effect_anchor_at(&timeline.tracks[ti].clips[ci])?.0;
             let stored = self.insert_or_get_asset(asset)?;
-            replace_effect(timeline, update.clip_id, &stored, &update.spec, update.volume_db, anchor_at)
+            let clip = replace_effect(timeline, update.clip_id, &stored, &update.spec, update.volume_db, anchor_at)?;
+            Ok(placed(clip, stored, &update.spec))
         })
     }
 
@@ -524,7 +557,7 @@ impl Project {
     pub fn update_sound_effect(&self, clip_id: Uuid, spec: &SfxSpec, volume_db: Option<f64>) -> Result<Clip> {
         let update = self.update_sound_effect_inputs(clip_id, spec, volume_db)?;
         let asset = Self::synthesize_sound_effect(&update.spec, &|| false)?;
-        self.apply_sound_effect_update(&asset, &update)
+        Ok(self.apply_sound_effect_update(&asset, &update)?.clip)
     }
 
     /// What suggesting sound effects reads, under the lock: the **working timeline** (an agent's staged

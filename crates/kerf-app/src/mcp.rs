@@ -4997,7 +4997,7 @@ impl KerfMcp {
                 "seed": 0,
                 "volume_db": 0.0,
             },
-            "pitch_semitones": kerf_core::MAX_SFX_PITCH,
+            "max_pitch_semitones": kerf_core::MAX_SFX_PITCH,
             "lanes": "Effects go on the audio tracks named FX, FX 2, FX 3, … (made when needed) unless track_id says another.",
         }))
     }
@@ -7101,16 +7101,14 @@ impl KerfMcp {
             let assets = Project::synthesize_sound_effects(&plan, &stop).map_err(core_err)?;
             // Landing it is an edit of the cut, so it goes into the proposal; the webview is told
             // once the lock is released.
-            let (clips, tracks) = me.edit(|project| {
+            me.edit(|project| {
                 require_generation(project, generation, "the sound effects were being made")?;
-                let clips = project
+                let placed = project
                     .with_ripple(ripple, |project| project.place_sound_effects(&assets, &plan))
                     .map_err(core_err)?;
                 let timeline = project.working_timeline().map_err(core_err)?;
-                let lanes = lanes_of(&timeline, &clips);
-                Ok((clips, lanes))
-            })?;
-            Ok(reads::sfx_answer(&plan, &assets, &clips, &tracks))
+                Ok(reads::sfx_answer(&plan, &placed, &timeline))
+            })
         })
         .await?;
         json(&placed)
@@ -7139,18 +7137,18 @@ impl KerfMcp {
         let done = blocking(move || {
             let stop = crate::stop_or_replaced(cancel, &me.project, generation);
             let asset = Project::synthesize_sound_effect(&update.spec, &stop).map_err(core_err)?;
-            let (clip, tracks) = me.edit(|project| {
+            me.edit(|project| {
                 require_generation(project, generation, "the sound effect was being made")?;
-                let clip = project
+                let placed = project
                     .with_ripple(ripple, |project| project.apply_sound_effect_update(&asset, &update))
                     .map_err(core_err)?;
                 let timeline = project.working_timeline().map_err(core_err)?;
-                let tracks = lanes_of(&timeline, std::slice::from_ref(&clip));
-                Ok((clip, tracks))
-            })?;
-            // Where the hit is now: the clip's own mapping of the render's hit, trim and all.
-            let hit = clip.source_to_timeline(kerf_core::sfx_anchor_s(&update.spec, asset.duration));
-            Ok(reads::sfx_clip_row(&clip, &tracks[0], &update.spec, hit))
+                Ok(reads::sfx_clip_row(
+                    &placed,
+                    &reads::sfx_lane(&timeline, placed.clip.id),
+                    &update.spec,
+                ))
+            })
         })
         .await?;
         json(&done)
@@ -8102,19 +8100,6 @@ fn core_err(e: kerf_core::Error) -> McpError {
         // A database, io, ffmpeg or engine failure is ours, not the caller's.
         other => McpError::internal_error(other.to_string(), None),
     }
-}
-
-/// The lane (id and name) each of `clips` is on in `timeline`; a clip that is not there gets a nil id and no name.
-fn lanes_of(timeline: &kerf_core::Timeline, clips: &[kerf_core::Clip]) -> Vec<(Uuid, String)> {
-    clips
-        .iter()
-        .map(|clip| {
-            timeline
-                .locate(clip.id)
-                .map(|(ti, _)| (timeline.tracks[ti].id, timeline.tracks[ti].name.clone()))
-                .unwrap_or_default()
-        })
-        .collect()
 }
 
 /// The project the call was made on is gone: the user opened or started another while `doing`
@@ -10047,6 +10032,19 @@ mod tests {
         }
 
         let list = text("list_sound_effects");
+        // The count the text states is the catalogue's.
+        let stated = |text: &str, noun: &str| -> usize {
+            let at = text
+                .find(&format!(" {noun}"))
+                .unwrap_or_else(|| panic!("no `{noun}` in {text}"));
+            text[..at]
+                .rsplit(' ')
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap_or_else(|_| panic!("no count before `{noun}`"))
+        };
+        assert_eq!(stated(&list, "kinds"), kerf_core::SfxKind::ALL.len());
         for kind in kerf_core::SfxKind::ALL {
             assert!(list.contains(kind.name()), "list_sound_effects should name {}", kind.name());
         }
@@ -10302,6 +10300,7 @@ mod tests {
         assert!(riser["hit"].as_str().unwrap().contains("end"), "{riser}");
         let impact = rows.iter().find(|r| r["kind"] == "impact").unwrap();
         assert!(impact["hit"].as_str().unwrap().contains("4 ms"), "{impact}");
+        assert_eq!(list["max_pitch_semitones"], kerf_core::MAX_SFX_PITCH);
         assert_eq!(list["defaults"]["intensity"], 0.7);
         assert_eq!(list["defaults"]["tail"], 0.3);
     }
@@ -10394,8 +10393,90 @@ mod tests {
         for needle in ["HIT", "ENDS on it", "FX, FX 2", "staged", "sfx:<kind>", "ONE call", "-8 dB"] {
             assert!(text.contains(needle), "the guide should mention {needle}");
         }
+        let said = text
+            .split("each of the ")
+            .nth(1)
+            .and_then(|t| t.split(' ').next())
+            .and_then(|n| n.parse::<usize>().ok());
+        assert_eq!(
+            said,
+            Some(kerf_core::SfxKind::ALL.len()),
+            "the guide's count of sounds is the catalogue's"
+        );
         assert!(super::INSTRUCTIONS.contains("sound effects") && super::INSTRUCTIONS.contains("sound_design"));
         assert!(text.contains("sound_design"));
+    }
+
+    /// The add answer is read from what core stored and placed: an effect asked for a few milliseconds before 0
+    /// is heard that much later and says so, and the same render put on twice is one asset whose id is the
+    /// stored one, not the fresh copy the second call rendered.
+    #[test]
+    fn the_add_answer_reports_the_hit_it_has_and_the_assets_as_stored() {
+        let (_server, shared) = headless_server();
+        let project = shared.lock().unwrap();
+        let stand_in = |spec: &kerf_core::SfxSpec| -> kerf_core::Asset {
+            serde_json::from_value(serde_json::json!({
+                "id": uuid::Uuid::new_v4(),
+                "path": format!("/fx/{}-{}.wav", spec.kind.name(), spec.seed),
+                "name": spec.title(),
+                "duration": spec.resolved_duration_s(),
+                "streams": [{ "index": 0, "kind": "audio", "codec": "pcm_s16le", "sample_rate": 48000, "channels": 2 }],
+                "imported_at": "2026-01-01T00:00:00Z",
+                "sound_effect": spec,
+            }))
+            .unwrap()
+        };
+        let add = |effects: serde_json::Value| {
+            let p: super::AddSoundEffectsParams = serde_json::from_value(serde_json::json!({ "effects": effects })).unwrap();
+            let plan = project.sound_effects_inputs(&p.effects).unwrap();
+            let assets: Vec<kerf_core::Asset> = plan.effects.iter().map(|e| stand_in(&e.spec)).collect();
+            let placed = project.place_sound_effects(&assets, &plan).unwrap();
+            let timeline = project.working_timeline().unwrap();
+            super::reads::sfx_answer(&plan, &placed, &timeline)
+        };
+
+        let first = add(serde_json::json!([
+            {"kind": "impact", "at": 0},
+            {"kind": "whoosh", "at": 0.2},
+            {"kind": "pop", "at": 5}
+        ]));
+        let at = |answer: &serde_json::Value, i: usize| answer["clips"][i]["at"].as_f64().unwrap();
+        assert_eq!(
+            at(&first, 0),
+            0.004,
+            "an impact asked for at 0 starts there and hits 4 ms later"
+        );
+        assert_eq!(at(&first, 1), 0.2, "a cut head still hits where it was asked");
+        assert_eq!(at(&first, 2), 5.0);
+        assert_eq!(first["clips"][0]["start"].as_f64(), Some(0.0));
+
+        // The same pop twice, and once more in a second call: one asset, and it is the stored one.
+        let again = add(serde_json::json!([{"kind": "pop", "at": 8}, {"kind": "pop", "at": 9}]));
+        let stored = project.list_assets().unwrap();
+        for answer in [&first, &again] {
+            let used: Vec<&str> = answer["clips"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c["asset_id"].as_str().unwrap())
+                .collect();
+            for asset in answer["assets"].as_array().unwrap() {
+                let id = asset["id"].as_str().unwrap();
+                assert!(used.contains(&id), "{id} is no clip's asset: {answer}");
+                assert!(
+                    stored.iter().any(|a| a.id.to_string() == id),
+                    "{id} is not in the library: {answer}"
+                );
+            }
+            assert!(used.iter().all(|id| stored.iter().any(|a| a.id.to_string() == *id)));
+        }
+        assert_eq!(again["assets"].as_array().unwrap().len(), 1, "{again}");
+        assert_eq!(
+            again["assets"][0]["id"], first["clips"][2]["asset_id"],
+            "the pop stored by the first call"
+        );
+        assert_eq!(again["clips"][0]["asset_id"], again["clips"][1]["asset_id"]);
+        assert_eq!(stored.len(), 3);
     }
 
     /// Everything wrong with a sound-effect call is found before anything renders: the caller's
@@ -10580,6 +10661,39 @@ mod tests {
             .unwrap_err();
         assert_eq!(e.code, rmcp::model::ErrorCode::INVALID_PARAMS);
         assert_eq!(changed.load(Ordering::Relaxed), 2);
+
+        // An impact asked for at 0 starts there and is heard 4 ms later; the same effect added twice is one stored
+        // asset, and every id the answer names is the clips' and the library's.
+        let twice = answer(
+            server
+                .add_sound_effects_now(
+                    serde_json::from_value(serde_json::json!({
+                        "effects": [{"kind": "impact", "at": 0, "seed": 41}, {"kind": "impact", "at": 3, "seed": 41}]
+                    }))
+                    .unwrap(),
+                    || false,
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(twice["clips"][0]["at"].as_f64(), Some(0.004), "{twice}");
+        assert_eq!(twice["clips"][1]["at"].as_f64(), Some(3.0), "{twice}");
+        assert_eq!(twice["assets"].as_array().unwrap().len(), 1, "{twice}");
+        assert_eq!(twice["assets"][0]["id"], twice["clips"][0]["asset_id"]);
+        assert_eq!(twice["clips"][0]["asset_id"], twice["clips"][1]["asset_id"]);
+        let library = shared.lock().unwrap().list_assets().unwrap();
+        assert!(library.iter().any(|a| serde_json::json!(a.id) == twice["assets"][0]["id"]));
+        // Again, in another call: the stored asset comes back, not a fresh id.
+        let thrice = answer(
+            server
+                .add_sound_effects_now(
+                    serde_json::from_value(serde_json::json!({"effects": [{"kind": "impact", "at": 6, "seed": 41}]})).unwrap(),
+                    || false,
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(thrice["assets"][0]["id"], twice["assets"][0]["id"], "{thrice}");
     }
 
     /// An agent with no way to load media can only rearrange what it was handed.

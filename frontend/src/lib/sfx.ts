@@ -412,10 +412,14 @@ export function sfxAsset(spec: SfxSpecInput, newId: () => string): Asset {
 
 // ---- what the wire refuses -----------------------------------------------------------------
 
-const SPEC_FIELDS = ['kind', 'duration_s', 'pitch', 'intensity', 'tail', 'reverse', 'seed'] as const;
+/** The spec's fields in declaration order (`SfxSpec`): the order serde meets them in, and the order a stored spec is hashed in. */
+export const SFX_SPEC_FIELDS = ['kind', 'duration_s', 'pitch', 'intensity', 'tail', 'reverse', 'seed'] as const;
+const SPEC_FIELDS = SFX_SPEC_FIELDS;
 const PLACEMENT_EXTRA = ['at', 'volume_db', 'track_id'] as const;
 const SUGGEST_FIELDS = ['range', 'density', 'categories', 'kinds'] as const;
-const DENSITIES: readonly SfxDensity[] = ['subtle', 'balanced', 'punchy'];
+/** The densities in the order of `SfxDensity::ALL`. */
+export const SFX_DENSITIES: readonly SfxDensity[] = ['subtle', 'balanced', 'punchy'];
+const DENSITIES = SFX_DENSITIES;
 
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === 'object' && v !== null && !Array.isArray(v);
 
@@ -749,10 +753,30 @@ const SECTION_NOVELTY = 0.25;
 const MUSIC_CONFIDENCE = 0.5;
 const MUSIC_EDGE_S = 0.5;
 
-const SPACING_S: Record<SfxDensity, number> = { subtle: 4, balanced: 2, punchy: 1 };
+/** The suggester's thresholds under their Rust names (`model/sfx_suggest.rs`); `sfx.test.ts` pins them to it. */
+export const SUGGEST_CONSTANTS = {
+	COVER_S,
+	CLEAR_GAIN_DB,
+	SPEECH_GAIN_DB,
+	SPEECH_GAP_S,
+	SPEECH_SLACK_S,
+	MIN_TITLE_S,
+	SHORT_TITLE_CHARS,
+	LOWER_THIRD_Y,
+	MIN_LEAD_IN_S,
+	HIT_NEAR_S,
+	SECTION_BARS,
+	SECTION_NOVELTY,
+	MUSIC_CONFIDENCE,
+	MUSIC_EDGE_S
+} as const;
+
+export const SPACING_S: Record<SfxDensity, number> = { subtle: 4, balanced: 2, punchy: 1 };
 /** The shortest shot a cut is suggested on, or null when cuts are not suggested. */
-const MIN_SHOT_S: Record<SfxDensity, number | null> = { subtle: null, balanced: 1.5, punchy: 0 };
-const SOURCES: readonly SfxSource[] = ['cut', 'transition', 'title', 'punch_in', 'music_drop', 'marker', 'opening'];
+export const MIN_SHOT_S: Record<SfxDensity, number | null> = { subtle: null, balanced: 1.5, punchy: 0 };
+/** The sources in the order of `SfxSource::ALL`, which breaks a tie between two moments. */
+export const SFX_SOURCES: readonly SfxSource[] = ['cut', 'transition', 'title', 'punch_in', 'music_drop', 'marker', 'opening'];
+const SOURCES = SFX_SOURCES;
 
 /** The kinds that can serve a part: the preferred ones, else the fallbacks. */
 interface Choices {

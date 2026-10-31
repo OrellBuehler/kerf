@@ -730,22 +730,30 @@ fn round_to(value: f64, places: i32) -> f64 {
     (value * scale).round() / scale
 }
 
+/// The lane (id and name) clip `clip_id` is on in `timeline`; a clip that is not there gets a nil id and no name.
+pub(super) fn sfx_lane(timeline: &Timeline, clip_id: uuid::Uuid) -> (uuid::Uuid, String) {
+    timeline
+        .locate(clip_id)
+        .map(|(ti, _)| (timeline.tracks[ti].id, timeline.tracks[ti].name.clone()))
+        .unwrap_or_default()
+}
+
 /// One effect clip as the sound-effect tools answer it: the clip and its lane, the sound, and where its
-/// hit lands (`at`, timeline seconds) beside where the clip starts and ends. `track` is the lane's id
-/// and name.
+/// hit really lands (`at`, from core: a start a few milliseconds before 0 is put at 0 and its hit is
+/// that much later than asked) beside where the clip starts and ends. `lane` is the lane's id and name.
 pub(super) fn sfx_clip_row(
-    clip: &kerf_core::Clip,
-    track: &(uuid::Uuid, String),
+    placed: &kerf_core::SfxPlaced,
+    lane: &(uuid::Uuid, String),
     spec: &kerf_core::SfxSpec,
-    at: f64,
 ) -> serde_json::Value {
+    let clip = &placed.clip;
     serde_json::json!({
         "clip_id": clip.id,
         "asset_id": clip.asset_id,
-        "track_id": track.0,
-        "track_name": track.1,
+        "track_id": lane.0,
+        "track_name": lane.1,
         "kind": spec.kind.name(),
-        "at": round_to(at, 3),
+        "at": round_to(placed.hit, 3),
         "start": round_to(clip.timeline_start, 3),
         "end": round_to(clip.timeline_end(), 3),
         "volume_db": round_to(20.0 * f64::from(clip.volume).max(1e-6).log10(), 2),
@@ -753,24 +761,20 @@ pub(super) fn sfx_clip_row(
     })
 }
 
-/// What `add_sound_effects` answers: a row per effect in the order asked (`clips` are what was placed,
-/// `tracks` the lane of each) and the assets they were rendered into, once each.
-pub(super) fn sfx_answer(
-    plan: &kerf_core::SfxPlan,
-    assets: &[Asset],
-    clips: &[kerf_core::Clip],
-    tracks: &[(uuid::Uuid, String)],
-) -> serde_json::Value {
+/// What `add_sound_effects` answers: a row per effect in the order asked, each with the lane it landed on
+/// in `timeline`, and the assets the clips play **as stored** (the same render put on twice is one asset),
+/// once each.
+pub(super) fn sfx_answer(plan: &kerf_core::SfxPlan, placed: &[kerf_core::SfxPlaced], timeline: &Timeline) -> serde_json::Value {
     let rows: Vec<serde_json::Value> = plan
         .effects
         .iter()
-        .zip(clips)
-        .zip(tracks)
-        .map(|((effect, clip), track)| sfx_clip_row(clip, track, &effect.spec, effect.at))
+        .zip(placed)
+        .map(|(effect, p)| sfx_clip_row(p, &sfx_lane(timeline, p.clip.id), &effect.spec))
         .collect();
     let mut seen = std::collections::HashSet::new();
-    let assets: Vec<serde_json::Value> = assets
+    let assets: Vec<serde_json::Value> = placed
         .iter()
+        .map(|p| &p.asset)
         .filter(|a| seen.insert(a.id))
         .map(|a| serde_json::json!({ "id": a.id, "name": a.name, "duration": round_to(a.duration, 3) }))
         .collect();
@@ -2269,16 +2273,35 @@ mod tests {
 
         let mut clip = kerf_core::Clip::for_asset(&asset, 0.0, 3.0, 1.2345678);
         clip.volume = 10f64.powf(-8.0 / 20.0) as f32;
-        let plan = kerf_core::SfxPlan {
-            effects: vec![kerf_core::PlannedSfx {
-                spec,
-                at: 4.2345678,
-                volume_db: -8.0,
-                track_id: None,
-            }],
+        let mut lane = kerf_core::Track::new(kerf_core::StreamKind::Audio, "FX 2".to_string());
+        lane.clips.push(clip.clone());
+        let timeline = Timeline {
+            tracks: vec![lane],
+            ..Timeline::default()
         };
-        let lane = (Uuid::from_u128(7), "FX 2".to_string());
-        let answer = sfx_answer(&plan, &[asset.clone(), asset], std::slice::from_ref(&clip), &[lane]);
+        let plan = kerf_core::SfxPlan {
+            effects: vec![
+                kerf_core::PlannedSfx {
+                    spec: spec.clone(),
+                    at: 4.2345678,
+                    volume_db: -8.0,
+                    track_id: None,
+                },
+                kerf_core::PlannedSfx {
+                    spec,
+                    at: 4.2345678,
+                    volume_db: -8.0,
+                    track_id: None,
+                },
+            ],
+        };
+        // Core says where the hit really is; the answer does not recompute it from the plan.
+        let placed = |hit: f64| kerf_core::SfxPlaced {
+            clip: clip.clone(),
+            asset: asset.clone(),
+            hit,
+        };
+        let answer = sfx_answer(&plan, &[placed(4.2345678), placed(4.239)], &timeline);
         let row = &answer["clips"][0];
         assert_eq!(
             (row["kind"].as_str(), row["track_name"].as_str(), row["clip_id"].as_str()),
@@ -2288,10 +2311,17 @@ mod tests {
             (row["at"].as_f64(), row["start"].as_f64(), row["end"].as_f64()),
             (Some(4.235), Some(1.235), Some(4.235))
         );
+        assert_eq!(
+            answer["clips"][1]["at"].as_f64(),
+            Some(4.239),
+            "the hit core reports, not the time asked for"
+        );
         assert_eq!(row["volume_db"].as_f64(), Some(-8.0));
         assert_eq!(row["spec"]["kind"], "riser");
         assert_eq!(answer["assets"].as_array().unwrap().len(), 1, "the same render once");
         assert_eq!(answer["assets"][0]["name"], "SFX: Riser");
+        assert_eq!(answer["assets"][0]["id"], serde_json::json!(asset.id));
+        assert_eq!(sfx_lane(&timeline, uuid::Uuid::new_v4()), (Uuid::nil(), String::new()));
 
         assert!(sfx_hit_words(&kerf_core::SfxAnchor::End).contains("end"));
         assert!(sfx_hit_words(&kerf_core::SfxAnchor::Peak { fraction: 0.55 }).contains("55 %"));

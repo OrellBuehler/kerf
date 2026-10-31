@@ -519,7 +519,7 @@
   is refused with edit_timeline's words before anything renders; the plan spells every spec out (`SfxSpec::resolved`: the length in
   whole milliseconds, clamped to the kind's range) and defaults the gain. → static `synthesize_sound_effects(&plan, cancel) ->
   Vec<Asset>` (lock released; one render, probe and asset per distinct spec; named `SFX: Whoosh`; `synthesize_sound_effect` for one) →
-  `place_sound_effects(&assets, &plan) -> Vec<Clip>` under the lock: each asset must be the render of its planned spec (the same
+  `place_sound_effects(&assets, &plan) -> Vec<SfxPlaced>` under the lock (`SfxPlaced {clip, asset, hit}`: the clip, the asset it plays **as stored** — the same render put on twice is one row, so this is the first placement's, not the fresh copy a caller rendered — and the timeline second its **hit really falls on**, read through `Clip::source_to_timeline`, which is `at` except that a start under `SFX_HEAD_SNAP_S` before 0 is put at 0 and the hit lands that much later; `apply_sound_effect_update` returns the same): each asset must be the render of its planned spec (the same
   check as `apply_sound_effect_update`'s, naming `effects[i] (kind)`); the assets are stored **inside** the `edit_timeline` closure (a
   refused placement stores nothing, an agent's stages with its assets landing at once) and the whole batch is **one** `Add sound
   effects` revision (`Add sound effect` for one). **Lanes**: with no `track_id` an effect goes on the first **unlocked** audio track

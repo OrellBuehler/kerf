@@ -2135,7 +2135,8 @@ export async function sfxCatalogue(): Promise<SfxPreset[]> {
 }
 
 /** `spec` rendered for auditioning, as the bytes of a 48 kHz stereo 16-bit WAV for `decodeAudioData`: no edit, no asset, and
- *  the same spec is the file that placing it would use. `null` in the browser harness, which synthesizes nothing. */
+ *  the same spec is the same audio that placing it would use (in a cache file of its own, not among the project's effects).
+ *  `null` in the browser harness, which synthesizes nothing. */
 export async function previewSoundEffect(spec: SfxSpecInput): Promise<ArrayBuffer | null> {
 	if (!inTauri()) {
 		checkSfxSpec(spec);

@@ -464,8 +464,11 @@ released) around `place_sound_effects` / `apply_sound_effect_update` and `requir
 revision (`Add sound effects`). Rendering takes milliseconds, so there is no `background` and no progress; `add_sound_effects_now` /
 `update_sound_effect_now` take the cancel as a closure so a test can drive them without a request. The answer is `{clips: [{clip_id, asset_id,
 track_id, track_name, kind, at, start, end, volume_db, spec}], assets: [{id, name, duration}]}` in the order asked (the lane is read from the
-working timeline after placing, so `FX 2` shows where a riser went), and `update_sound_effect` answers one such row with `at` read from the clip
-(trim and speed included). `suggest_sound_effects` answers `{density, count, suggestions: [{placement, source, reason, score}], next}` from the
+working timeline after placing, so `FX 2` shows where a riser went). It is built from core's `SfxPlaced` (`reads::sfx_answer`): `at` is the hit **core
+read from the placed clip** — an impact asked for at 0 starts there and is heard at 0.004 — not the time asked for, and `assets` are the rows the clips
+play **as stored**, so adding the same effect twice names one asset id that `list_assets` has, never the fresh copy a second render made; `update_sound_effect`
+answers one such row (core's `SfxPlaced` too). `list_sound_effects` carries `max_pitch_semitones`, and the counts its texts state (`21 kinds`) are pinned to
+`SfxKind::ALL` by tests. **There is no MCP tool that previews a sound**: auditioning is the GUI's `preview_sound_effect` (a model does not hear), on purpose. `suggest_sound_effects` answers `{density, count, suggestions: [{placement, source, reason, score}], next}` from the
 working cut (`suggest_sound_effects_inputs` under `lock_agent_as`, the pure `suggest_sound_effects` with it released): each `placement` is an element
 of `effects` as it stands, and a test feeds them back through `sound_effects_inputs`. Hints: `add_sound_effects` is `Edit` (not idempotent, no
 download, so not `Generate`), `update_sound_effect` `Set`, the other two `Read`. The **`sound_design { density?, range? }`** prompt is suggest →
