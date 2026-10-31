@@ -9,6 +9,7 @@
 	import { editor } from '#lib/state.svelte';
 	import { cancelStems, onStemsProgress, stemsStatus } from '#lib/api';
 	import { toast } from '#lib/notifications.svelte';
+	import { undoAction } from '#lib/ops';
 	import { failure } from '#lib/failure-copy';
 	import { timeDisplay } from '#lib/time-display.svelte';
 	import type { StemsProgress, StemsStatus } from '#lib/types';
@@ -63,7 +64,7 @@
 			const placed = await editor.separateStems(assetId, clipId ?? undefined);
 			toast.success(
 				describeStems(name, placed),
-				clipId ? { action: { label: 'Undo', onClick: () => void editor.undo() } } : undefined
+				clipId ? { action: undoAction() } : undefined
 			);
 			onClose();
 		} catch (e) {

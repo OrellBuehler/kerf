@@ -18,6 +18,7 @@ import {
 	type LinkPlans
 } from './link-ui';
 import { toast } from './notifications.svelte';
+import { headStamp, undoVerdict } from './undo-toast';
 import { cutNotice, lockedNotice, removalNotice } from './removal';
 import { planPlayheadTrim, trimNotice } from './trim-tools';
 import { keyEditDone, planKeyEdit, planPlayheadSplit, splitDone, splitNotice, type KeyTool } from './key-edits';
@@ -55,28 +56,28 @@ export function holdForPreview(): boolean {
 	return true;
 }
 
-/** The revision the project stands at, or `undefined` where the history cannot say (not loaded; the browser's has one). */
-function headSeq(): number | undefined {
-	return editor.history.find((r) => r.current)?.seq;
-}
-
 /** What a toast's Undo says when other edits have come since. */
 export const UNDO_MOVED_ON = 'Other edits have been made since — step back with Edit > Undo, or from the History list in the Agent panel';
+/** ...and when the edit it was about has already been undone (an Edit > Undo would take back something else). */
+export const UNDO_ALREADY = 'That edit has already been undone';
 
 /**
  * The Undo button of a toast about an edit that has just landed. It takes back **that** edit — and only while it is still
  * the latest: a toast outlives the edit (several seconds, and the log's bell), and a plain undo would take back whatever
  * came after it instead, with the toast's words about something else. Called when the edit's promise has resolved, so
- * the history already shows it (`#apply` re-reads it); once the project has moved on the button says so and does nothing.
+ * the history already shows it (`#apply` re-reads it). The edit is remembered as its revision's `seq` *and* `created_at`
+ * (`undo-toast.ts`: a number alone is reused once an undone edit's redo branch is dropped); once the project has moved on
+ * the button says so — or that the edit is already undone — and does nothing.
  * `steps` is how many revisions the toast's action made (a split of several clips is one each).
  */
 export function undoAction(steps = 1): { label: string; onClick: () => void } {
-	const at = headSeq();
+	const at = headStamp(editor.history);
 	return {
 		label: 'Undo',
 		onClick: () => {
-			if (headSeq() !== at) {
-				toast.warning(UNDO_MOVED_ON);
+			const verdict = undoVerdict(at, editor.history);
+			if (verdict !== 'undo') {
+				toast.warning(verdict === 'undone' ? UNDO_ALREADY : UNDO_MOVED_ON);
 				return;
 			}
 			void (async () => {

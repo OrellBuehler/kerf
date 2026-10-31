@@ -18,7 +18,7 @@
 	import { cancelMusic, musicStatus, onMusicProgress } from '#lib/api';
 	import { toast } from '#lib/notifications.svelte';
 	import { failure } from '#lib/failure-copy';
-	import { report } from '#lib/ops';
+	import { report, undoAction } from '#lib/ops';
 	import { timeDisplay } from '#lib/time-display.svelte';
 	import { PREVIEW_READ_ONLY_REASON } from '#lib/proposal-ui';
 	import { PERCENT } from '#lib/slider-row';
@@ -138,7 +138,7 @@
 			const done = await editor.composeMusic(
 				composeRequest(form, choices, { replaceClipId: replaceId, at: place === 'playhead' ? ui.time : undefined })
 			);
-			toast.success(describeComposed(done), { action: { label: 'Undo', onClick: () => void editor.undo() } });
+			toast.success(describeComposed(done), { action: undoAction() });
 			// Show the piece where it landed, unless the playhead is already inside it.
 			const at = revealAt(ui.time, done.clip.timeline_start, clipDuration(done.clip));
 			if (at !== null) ui.seek(at, { snap: 'up' });

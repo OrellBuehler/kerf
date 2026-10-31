@@ -13,7 +13,7 @@
 	import { editor } from '#lib/state.svelte';
 	import { mediaStatus } from '#lib/media-status.svelte';
 	import { toast } from '#lib/notifications.svelte';
-	import { exportTranscriptSrt, report } from '#lib/ops';
+	import { exportTranscriptSrt, report, undoAction } from '#lib/ops';
 	import { activeLineIndex, speakersOf, srcToTimeline, transcriptLines, type TxLine } from '#lib/transcript';
 	import { tip } from '#lib/tip';
 
@@ -57,7 +57,7 @@
 		try {
 			await editor.cutRange(l.clip.id, l.cut.start, l.cut.end);
 			toast('Line cut from timeline', {
-				action: { label: 'Undo', onClick: () => void editor.undo() }
+				action: undoAction()
 			});
 		} catch (e) {
 			report(e);

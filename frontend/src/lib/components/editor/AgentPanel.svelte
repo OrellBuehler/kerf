@@ -22,7 +22,7 @@
 	import { applyLabel, comingAlong, groupState, keepPresent, pickLine, pickRows, toggled, toggledGroup } from '#lib/review-picks';
 	import { changeWord } from '#lib/proposal-ui';
 	import { QUICK_EDIT_HELD, cutAssets, cutSignature, heldWhilePreviewing, isLocalPreset, quickTarget, silenceOutcome, targetNote } from '#lib/quick-edits';
-	import { holdForPreview, report } from '#lib/ops';
+	import { holdForPreview, report, undoAction } from '#lib/ops';
 	import { composing } from '#lib/modal';
 	import { documentOf } from '#lib/realm';
 	import { STATUS_MAP, PRESETS } from './data';
@@ -45,9 +45,9 @@
 	let draft = $state('');
 	/** The panel's root, to ask which window's page it is on. */
 	let rootEl = $state<HTMLElement | null>(null);
-	/** The quick edit being carried out. A second press while it runs would run it twice — two transcriptions of the
-	 *  same footage, the shared `ui.analyzing` cleared by whichever ends first — and `editor.busy` is not raised by an
-	 *  analysis, so the buttons wait on this. */
+	/** The quick edit being carried out. A second press while it runs would run it twice, and `editor.busy` is not raised
+	 *  by an analysis, so the buttons wait on this. (The analysis itself is one pass at a time: `ui.runAnalysis` joins the
+	 *  pass in flight, so the Inspector's Analyze beside it does not start a second transcription either.) */
 	let running = $state<string | null>(null);
 	const RUNNING_WHY = 'Another quick edit is running';
 
@@ -338,7 +338,7 @@
 				await editor.generateCaptions();
 				const n = (editor.timeline.overlays ?? []).filter((o) => o.generated).length;
 				toast.success(`Captioned the cut — ${n} line${n === 1 ? '' : 's'}`, {
-					action: { label: 'Undo', onClick: () => void editor.undo() }
+					action: undoAction()
 				});
 				await record(p);
 			} else if (p === 'Frame for the delivery') {
@@ -347,7 +347,7 @@
 				// already fills it.
 				await editor.smartCrop();
 				toast.success('Framed every shot for the delivery frame', {
-					action: { label: 'Undo', onClick: () => void editor.undo() }
+					action: undoAction()
 				});
 				await record(p);
 			}

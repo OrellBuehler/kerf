@@ -11,7 +11,7 @@
 	import { editor } from '#lib/state.svelte';
 	import { mediaStatus } from '#lib/media-status.svelte';
 	import { analyzeSubmenuItem } from '#lib/analyze-menu';
-	import { appendAllMedia, exportTranscriptSrt, report } from '#lib/ops';
+	import { appendAllMedia, exportTranscriptSrt, report, undoAction } from '#lib/ops';
 		import { proxyActions } from '#lib/proxy-info';
 	import { deleteProxy, rebuildProxy } from '#lib/api';
 	import { contextMenu } from '#lib/context-menu.svelte';
@@ -189,7 +189,7 @@
 							.addAssetAudio(asset.id)
 							.then(() =>
 								toast.success(`Added the audio of ${asset.name}`, {
-									action: { label: 'Undo', onClick: () => void editor.undo() }
+									action: undoAction()
 								})
 							)
 							.catch(err);
@@ -201,7 +201,7 @@
 							toast.success(
 								`Detached audio from ${done.detached} ${done.detached === 1 ? 'clip' : 'clips'}` +
 									(done.skipped.length > 0 ? ` — ${done.skipped.length} skipped (${done.skipped[0].reason})` : ''),
-								{ action: { label: 'Undo', onClick: () => void editor.undo() } }
+								{ action: undoAction() }
 							)
 						)
 						.catch(err);

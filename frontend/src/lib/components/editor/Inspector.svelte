@@ -29,7 +29,7 @@
 	import { MAX_GAIN } from '#lib/mixer';
 	import { AUDIO_FX, VIDEO_FX } from '#lib/effect-presets';
 	import { applySvgSource, changePreset, convertToCustom, svgPresetInfos } from '#lib/title-actions';
-	import { copyKeyframesOf, pasteKeyframesOnto, report } from '#lib/ops';
+	import { copyKeyframesOf, pasteKeyframesOnto, report, undoAction } from '#lib/ops';
 	import { keyframeOffer } from '#lib/keyframe-copy';
 	import { SVG_PRESETS, svgDisplayName, takesParam } from '#lib/svg-titles';
 	import { untrack } from 'svelte';
@@ -661,7 +661,7 @@
 	async function runUndoable(message: string, op: () => Promise<unknown>) {
 		try {
 			await op();
-			toast(message, { action: { label: 'Undo', onClick: () => void editor.undo() } });
+			toast(message, { action: undoAction() });
 		} catch (e) {
 			report(e);
 		}

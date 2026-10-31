@@ -49,6 +49,7 @@
 		report,
 		splitSelection,
 		trimSelection,
+		undoAction,
 		unlinkSelection
 	} from '#lib/ops';
 	import { allowsRepeat, type ActionId } from '#lib/keymap';
@@ -197,7 +198,7 @@
 		// not worth an interruption) and offer it in the title bar / dialog.
 		const unlisteners: Array<() => void> = [];
 		// An edit the backend (or the preview) refused is reported by whoever asked for it — a toast. One that
-		// nobody caught (`void editor.undo()` from a toast's button) is said here, so a refusal is never silent
+		// nobody caught (a bare `void editor.something()`) is said here, so a refusal is never silent
 		// and never said twice.
 		const onRefusal = (ev: PromiseRejectionEvent) => {
 			if (!(ev.reason instanceof EditRefused)) return;
@@ -557,13 +558,13 @@
 			if (holdForPreview()) return;
 			void editor
 				.removeOverlay(editor.selectedOverlayId)
-				.then(() => toast('Title removed', { action: { label: 'Undo', onClick: () => void editor.undo() } }))
+				.then(() => toast('Title removed', { action: undoAction() }))
 				.catch(report);
 		} else if (editor.selectedSvgOverlayId) {
 			if (holdForPreview()) return;
 			void editor
 				.removeSvgOverlay(editor.selectedSvgOverlayId)
-				.then(() => toast('Animated title removed', { action: { label: 'Undo', onClick: () => void editor.undo() } }))
+				.then(() => toast('Animated title removed', { action: undoAction() }))
 				.catch(report);
 		} else if (editor.selectedClipIds.length > 0) {
 			void deleteSelection(ripple);

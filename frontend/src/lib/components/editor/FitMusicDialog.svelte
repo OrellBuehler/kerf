@@ -11,7 +11,7 @@
 	import { planMusicFit } from '#lib/api';
 	import { toast } from '#lib/notifications.svelte';
 	import { timeDisplay } from '#lib/time-display.svelte';
-	import { report } from '#lib/ops';
+	import { report, undoAction } from '#lib/ops';
 	import { describeFit, describeRemainder, fitVerdict, musicSummary, parseTarget } from '#lib/music-ui';
 	import type { MusicFit } from '#lib/types';
 	import { tip } from '#lib/tip';
@@ -89,7 +89,7 @@
 		applying = true;
 		try {
 			const report = await editor.fitMusic(clipId, custom ? parseTarget(customText) : null, fadeOut);
-			toast.success(describeFit(report, (s) => timeDisplay.fmt(s)), { action: { label: 'Undo', onClick: () => void editor.undo() } });
+			toast.success(describeFit(report, (s) => timeDisplay.fmt(s)), { action: undoAction() });
 			onClose();
 		} catch (e) {
 			report(e);
