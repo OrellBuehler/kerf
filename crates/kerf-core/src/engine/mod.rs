@@ -105,6 +105,9 @@ pub mod tts;
 // Composing music: a score rendered through a SoundFont synthesizer (rustysynth), mixed in Rust.
 pub mod compose;
 
+// Sound effects: whooshes, impacts, risers and UI sounds synthesized in pure Rust, cached as WAVs.
+pub mod sfx;
+
 // Band balance: where a stretch of sound keeps its energy (six bands per window).
 pub mod bands;
 

@@ -1,4 +1,4 @@
-# Engine: waveforms, filmstrips, libav, transcription, voiceover, composing, band balance
+# Engine: waveforms, filmstrips, libav, transcription, voiceover, composing, sound effects, band balance
 
 - `peaks.rs` (always compiled, CLI only) is what the timeline draws a clip's **waveform**
   from, and it answers a different question than `waveform` (N peaks for a whole
@@ -327,6 +327,44 @@ more than 1.5 points + 25 % from its `shares`, printing the gain to move — plu
 set `KERF_COMPOSE_DUMP=<dir>` to keep the WAVs) and check that the beat tracker, which knows nothing of the
 score, finds the score's tempo and sits on its eighth grid within 20 ms (it may lock to the off-beat hats of a
 four-on-the-floor beat, which is why the music's analysis is written from the score).
+
+**Sound effects** (`engine/sfx.rs`, always compiled, no cargo feature, no download, no licence): every `SfxKind`
+(`core-model.md`) is **synthesized in pure Rust** and `render(spec) -> Vec<[f32; 2]>` is a pure function of the spec and
+`RENDERER_VERSION` (bumped when what a spec sounds like changes), 48 kHz stereo, exactly `resolved_duration_s` long (the reverb tail
+rings *inside* that length). The parts: a seeded xorshift64\* generator (splitmix64 start, one fork per layer and side, so a seed
+changes the details, never the structure), white / pink (Kellet) / brown noise, poly-BLEP sine / saw / square oscillators whose phase
+integrates a moving pitch, and a Zavalishin trapezoidal **state-variable filter** that stays stable under a cutoff moved every sample
+(the heart of the sweeps). **Whoosh / swoosh / swipe** are one `pass`: pink noise through a band-pass whose centre climbs to the peak
+(at the preset's anchor fraction) and falls away on a smoothstep, a filter per side a few percent apart for width, a narrow whistle
+riding the sweep, a low body and a band-limited hiss, and a constant-power pan that travels left to right with it. **Impact / boom /
+thud / punch** are a sub sine whose pitch falls (`drop_sine`, driven through `tanh` so a phone speaker still hears its harmonics) under
+a mid thump and an octave, a noise burst whose low-pass closes, a crack, a rumble (brown noise) and, for the boom, debris grains.
+**Riser / downlifter** are noise and a four-voice detuned saw stack climbing (falling) together while the filters open (close); the
+riser ends on its peak after a 6 ms fade, the downlifter starts on a thump. **Reverse swell** is a crash and a pad rendered forwards
+with a long reverb and then reversed (it is the one kind that always has some reverb). The UI kinds are a falling-pitch sine pop, a
+resonant-noise click (and a faint release click), a bell of six inharmonic partials with a twin a hair off each (ding; notify is two of
+them a fifth apart), rising water blips (a count that follows the length and `intensity`) and seeded keystrokes (typewriter). The textures
+are a stutter of beeps, noise bursts, gaps and repeated slices through a sample-hold and bit crusher (glitch), a saw chord and hiss
+whose speed falls to zero with a wobble (tape stop), a looped saw bed read at a back-and-forth head velocity (record scratch), two
+mechanical clicks (shutter) and a lub-dub pair that repeats when it is long (heartbeat). `intensity` brightens and drives, `pitch`
+multiplies every frequency by 2^(st/12), `tail` is the reverb's level and time: a Freeverb-style bank of eight damped combs and four
+all-pass diffusers a side, each comb's feedback set from its own length so the room rings `rt60` seconds, fed a mono sum high-passed per
+kind so a sub does not turn to mud (`WET_NORM` brings white noise in to about the level of white noise out). A gentle 14 kHz low-pass
+keeps the noise layers from a digital hiss. **Order**: dry layers, 14 kHz low-pass, reverb, the fades in the natural direction (1 ms in,
+`8 %` of the length out, 6 ms for a riser), then the reverse(s), then `master`: non-finite samples zeroed, unity peak, a `tanh` at knee 1,
+and the peak set to **exactly −1 dBFS + the kind's `level_db`** (so a reversed render is the same render played backwards, to the sample, and an
+impact's end fade becomes a swell into its hit). Out-of-range numbers are clamped, never trusted: `render` is total. Output is **16-bit
+WAV with the same seeded triangular dither** as music (`compose::write_wav16`) in the data dir (`<data>/kerf/sfx/sfx-<hash>.wav`, the
+only copy; the hash is of the renderer version and the **resolved** spec's JSON, so the same spec is a cache hit and the same asset);
+`synthesize(spec, cancel) -> PathBuf` validates, checks cancel before the render and before the write, writes through a per-call
+`.part` (process id and a counter, so two threads on one spec cannot trample each other) and a rename, and takes no `cpu::lease` and
+never the project lock (a render is milliseconds). `synthesize_in(dir, …)` is the same into another folder (what the tests use). Tests
+render every kind (length, finite, peak at its level, no DC, click-free edges both ways), pin determinism and that a seed changes every
+kind, that reverse mirrors, that extreme numbers stay finite and at level, that each hit lands at its anchor, that a riser builds and a
+downlifter falls, that intensity brightens and pitch moves a bell an octave, that a tail rings, that a pass travels left to right and
+the WAV bytes. `KERF_SFX_DUMP=<dir> cargo test -p kerf-core --no-default-features dump_to_listen` writes every kind and a few
+variations there to listen to or to look at (`ffmpeg -i x.wav -lavfi showspectrumpic=s=800x260:legend=1:fscale=lin` — its `fscale=log`
+and `start` / `stop` mislabel the axis on ffmpeg 6.1; resample with `-ar` to zoom the lows).
 
 **Band balance** (`engine/bands.rs`, always compiled, pure DSP + a decode): `BandMeter` / `band_balance`
 measure **windows** — RMS, the K-weighted loudness of BS.1770 (two biquads; ungated, so a window of a

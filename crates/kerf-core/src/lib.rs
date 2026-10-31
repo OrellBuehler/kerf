@@ -117,6 +117,10 @@ pub use model::{
     dedupe_tags, group_by_key, normalize_key, same_tags, tags_match, Grouping, KeyGroup, Tag, TagCount, TagEdit, TagFilter,
     TagKeyCount, TagSummary, MAX_ASSET_TAGS, MAX_TAG_KEY, MAX_TAG_VALUE,
 };
+pub use model::{
+    sfx_anchor_s, sfx_catalogue, SfxAnchor, SfxCategory, SfxKind, SfxPreset, SfxSpec, DEFAULT_SFX_INTENSITY, DEFAULT_SFX_TAIL,
+    MAX_SFX_PITCH,
+};
 pub use plan_caps::{DipWhy, EffectKinds, GpuCaps, GradeKinds, LayerRef, Unsupported};
 pub use plan_epoch::{bump_plan_epoch, plan_epoch};
 pub use planner::{Handover, PlanRequest, Planner, SpanPlan, SpanRun};
@@ -128,11 +132,12 @@ pub use play_plan::{PlayAhead, PlayCut, PlayRefusal};
 pub use project::{
     AlignTo, AudioSync, AudioSyncMeasure, AudioSyncPlan, BandBalance, BandBalanceRequest, BandPlan, BandSource, Batch,
     ComposePlan, ComposeRequest, Composed, CutTranscript, CutTranscriptInputs, DeliveryInputs, ExportedFile, FramingPlan,
-    MissingAsset, Page, PreparedText, Project, RelinkCheck, Relinked, RemovedAsset, ScoreAlign, SmartCropJob, SmartCropPlan,
-    StabilizeJob, StabilizeStatusInput, StemsPlaced, SubsetApplied, SvgChecked, SvgLayout, SvgOverlayResult, SvgSource, SyncSide,
-    ThumbnailLayerSpec, ThumbnailResult, ThumbnailSpec, TitleClipPatch, TitleClipPlacement, TitleClipResult, TitleEdited,
-    TitleTextForm, TitleTextInputs, Untranscribed, DEFAULT_HISTORY_LIMIT, MAX_CHANNEL_KEYS, MAX_SYNC_SECONDS, MUSIC_TRACK,
-    SCHEMA_VERSION, STAGED_UNDO_DEPTH, SYNC_SAMPLE_RATE, VOICEOVER_TRACK,
+    MissingAsset, Page, PlannedSfx, PreparedText, Project, RelinkCheck, Relinked, RemovedAsset, ScoreAlign, SfxPlacement,
+    SfxPlan, SfxUpdate, SmartCropJob, SmartCropPlan, StabilizeJob, StabilizeStatusInput, StemsPlaced, SubsetApplied, SvgChecked,
+    SvgLayout, SvgOverlayResult, SvgSource, SyncSide, ThumbnailLayerSpec, ThumbnailResult, ThumbnailSpec, TitleClipPatch,
+    TitleClipPlacement, TitleClipResult, TitleEdited, TitleTextForm, TitleTextInputs, Untranscribed, DEFAULT_HISTORY_LIMIT,
+    MAX_CHANNEL_KEYS, MAX_SFX_GAIN_DB, MAX_SFX_PER_CALL, MAX_SYNC_SECONDS, MIN_SFX_GAIN_DB, MUSIC_TRACK, SCHEMA_VERSION,
+    SFX_TRACK, STAGED_UNDO_DEPTH, SYNC_SAMPLE_RATE, VOICEOVER_TRACK,
 };
 pub use project::{
     AssembleByTag, AssemblePlan, AssembleSummary, AssembledGroup, GroupTitle, PreparedAssemble, SortWithin, MAX_TAG_TITLE_SECONDS,

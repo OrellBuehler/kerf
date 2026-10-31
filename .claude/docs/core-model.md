@@ -507,6 +507,25 @@
   that would cut the piece short of an impact at 80 s settles on the slower tempo that keeps it); the hits added stop at
   `MAX_HITS` (a note in the report says how many were left out) and the score returned is `validate()`d. The report lists every cut's
   `before` / `after` reading (on beat, on downbeat, offset) and the counts.
+- **Sound effects** (`model/sfx.rs`, pure + unit-tested; re-exported from `model` as `sfx_catalogue` / `sfx_anchor_s` beside the
+  types): an `SfxSpec` is `{kind, duration_s?, pitch, intensity, tail, reverse, seed}` and `{"kind":"whoosh"}` alone is valid
+  (`pitch` 0, `intensity` 0.7, `tail` 0.3, `seed` 0); it rides on `Asset.sound_effect`, which is what lets an effect be reshaped
+  (`engine-media.md` has the synthesis, `core-project.md` the placement). It refuses an unknown field (`deny_unknown_fields`),
+  `validate()` names the bad one (`duration_s` > 0 and finite; `pitch` ±12 semitones; `intensity`, `tail` 0..=1; `seed` ≤ `MAX_SEED`,
+  the music seed's 2^53 − 1). **`SfxKind`** has 21 kinds in five **`SfxCategory`**s — transition: `whoosh`, `swoosh`, `swipe`; impact:
+  `impact`, `boom`, `thud`, `punch`; build: `riser`, `downlifter`, `reverse_swell`; ui: `pop`, `click`, `ding`, `notify`, `bubble`,
+  `typewriter`; texture: `glitch`, `tape_stop`, `record_scratch`, `shutter`, `heartbeat` — and `catalogue()` is the static table, one
+  `SfxPreset` per kind in `SfxKind::ALL` order: label, category, a description of what it sounds like and where it belongs, default /
+  min / max length, `anchor` and `level_db`. **`resolved_duration_s()`** is `duration_s` or the default, held to whole milliseconds and
+  **clamped** to the kind's range (not refused: a 10 s whoosh is 3 s), and `resolved()` spells it out — that spec is what is rendered,
+  hashed and stored, so the default length spelled out is the spec that says nothing. **The anchor is the hit point**
+  (`SfxAnchor`): `hit {seconds}` (a transient a few ms in: impacts, pops, clicks, dings, …), `peak {fraction}` (a whoosh's peak, 55 %
+  in; swoosh 45 %, swipe 40 %) or `end` (riser, reverse swell); `anchor_s(spec, rendered_len)` is that in seconds, and `reverse`
+  mirrors it (`len − anchor`: a reversed impact ends on its hit). The synthesis builds its sounds on the same anchors, and a test
+  pins that the loudest part of each kind is where its anchor says. `level_db` (≤ 0) is the file's peak below the −1 dBFS every render is
+  scaled to (impacts 0, thud / punch −4 / −1, transitions −2.5 … −3, builds −3 … −4, UI −6 … −7, textures −2.5 … −6), set from the
+  loudest 100 ms (RMS) and the momentary loudness (K-weighted, 400 ms) of each kind so they sit together in a mix and not by their peaks:
+  boom and impact are the loudest, the sustained builds and passes a dB or two under them.
 - **Limits that keep a project loadable.** A clip's speed is `MIN_SPEED..=MAX_SPEED`
   (0.01×..100×, either sign; so is every key of a speed ramp) — `set_speed` and the ratio `set_speed_linked` hands each partner
   both hold it (the audio tempo is one `atempo` step per doubling). `Mask::normalized` maps a

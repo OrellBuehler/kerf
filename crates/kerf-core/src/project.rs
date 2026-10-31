@@ -189,7 +189,10 @@ CREATE TABLE IF NOT EXISTS assets (
     -- user brought. Added to older files by the v2 to v3 migration (`store.rs`).
     music_score  TEXT,
     -- JSON array of the asset's `Tag`s; NULL for none. Added to older files by the v14 to v15 migration.
-    tags         TEXT
+    tags         TEXT,
+    -- JSON `SfxSpec` for a sound effect Kerf synthesized; NULL for media the user brought. Added to
+    -- older files by the v18 to v19 migration (`store.rs`).
+    sound_effect TEXT
 );
 
 CREATE TABLE IF NOT EXISTS analysis (
@@ -268,6 +271,10 @@ pub const VOICEOVER_TRACK: &str = "VO";
 
 /// The audio track [`Project::place_music`] puts composed music on by default.
 pub const MUSIC_TRACK: &str = "M";
+
+/// The audio track [`Project::place_sound_effects`] puts sound effects on by default (`FX`, then `FX 2`,
+/// `FX 3`… for the ones that overlap an earlier one).
+pub const SFX_TRACK: &str = "FX";
 
 /// An asset name for a voiceover: its script's opening words.
 fn voiceover_name(text: &str) -> String {
@@ -1091,6 +1098,7 @@ impl Project {
             source_paths: Vec::new(),
             voiceover: None,
             music_score: None,
+            sound_effect: None,
             tags: Vec::new(),
         })
     }
@@ -1102,8 +1110,8 @@ impl Project {
     /// used to throw away its transcript, silence map and rhythm.
     pub fn insert_asset(&self, asset: &Asset) -> Result<()> {
         self.conn.execute(
-            "INSERT INTO assets (id, path, name, duration, streams, imported_at, source_paths, voiceover, music_score, tags)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            "INSERT INTO assets (id, path, name, duration, streams, imported_at, source_paths, voiceover, music_score, tags, sound_effect)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(id) DO UPDATE SET
                  path = excluded.path,
                  name = excluded.name,
@@ -1113,7 +1121,8 @@ impl Project {
                  source_paths = excluded.source_paths,
                  voiceover = excluded.voiceover,
                  music_score = excluded.music_score,
-                 tags = excluded.tags",
+                 tags = excluded.tags,
+                 sound_effect = excluded.sound_effect",
             params![
                 asset.id.to_string(),
                 asset.path,
@@ -1129,6 +1138,7 @@ impl Project {
                 asset.voiceover.as_ref().map(serde_json::to_string).transpose()?,
                 asset.music_score.as_ref().map(serde_json::to_string).transpose()?,
                 tags_column(&asset.tags)?,
+                asset.sound_effect.as_ref().map(serde_json::to_string).transpose()?,
             ],
         )?;
         Ok(())
@@ -5938,6 +5948,7 @@ impl Project {
             source_paths: Vec::new(),
             voiceover: None,
             music_score: None,
+            sound_effect: None,
             tags: Vec::new(),
         };
 
@@ -5969,6 +5980,7 @@ impl Project {
             source_paths: Vec::new(),
             voiceover: None,
             music_score: None,
+            sound_effect: None,
             tags: Vec::new(),
         };
 
@@ -7725,7 +7737,8 @@ fn row_to_task(
 }
 
 /// The `assets` columns every asset read selects, in [`read_asset_row`]'s order.
-const ASSET_COLUMNS: &str = "id, path, name, duration, streams, imported_at, source_paths, voiceover, music_score, tags";
+const ASSET_COLUMNS: &str =
+    "id, path, name, duration, streams, imported_at, source_paths, voiceover, music_score, tags, sound_effect";
 
 /// An `assets` row as stored, JSON columns still serialized.
 struct AssetRow {
@@ -7739,6 +7752,7 @@ struct AssetRow {
     voiceover: Option<String>,
     music_score: Option<String>,
     tags: Option<String>,
+    sound_effect: Option<String>,
 }
 
 fn read_asset_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRow> {
@@ -7753,6 +7767,7 @@ fn read_asset_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AssetRow> {
         voiceover: row.get(7)?,
         music_score: row.get(8)?,
         tags: row.get(9)?,
+        sound_effect: row.get(10)?,
     })
 }
 
@@ -7779,6 +7794,7 @@ fn row_to_asset(row: AssetRow) -> Result<Asset> {
         },
         voiceover: row.voiceover.map(|json| serde_json::from_str(&json)).transpose()?,
         music_score: row.music_score.map(|json| serde_json::from_str(&json)).transpose()?,
+        sound_effect: row.sound_effect.map(|json| serde_json::from_str(&json)).transpose()?,
         tags: match row.tags {
             Some(json) => serde_json::from_str(&json)?,
             None => Vec::new(),
@@ -7851,6 +7867,10 @@ mod music_tests;
 pub use music::{
     AlignTo, BandBalance, BandBalanceRequest, BandPlan, BandSource, ComposePlan, ComposeRequest, Composed, ScoreAlign,
 };
+mod sfx;
+#[cfg(test)]
+mod sfx_tests;
+pub use sfx::{PlannedSfx, SfxPlacement, SfxPlan, SfxUpdate, MAX_SFX_GAIN_DB, MAX_SFX_PER_CALL, MIN_SFX_GAIN_DB};
 mod audio_sync;
 pub use audio_sync::{AudioSync, AudioSyncMeasure, AudioSyncPlan, SyncSide, MAX_SYNC_SECONDS, SYNC_SAMPLE_RATE};
 mod store;
@@ -8477,6 +8497,7 @@ mod tests {
             source_paths: Vec::new(),
             voiceover: None,
             music_score: None,
+            sound_effect: None,
             tags: Vec::new(),
         }
     }
@@ -9414,6 +9435,7 @@ mod tests {
             source_paths: Vec::new(),
             voiceover: None,
             music_score: None,
+            sound_effect: None,
             tags: Vec::new(),
         };
         project.insert_asset(&asset).unwrap();
@@ -10933,6 +10955,7 @@ mod tests {
             source_paths: Vec::new(),
             voiceover: None,
             music_score: None,
+            sound_effect: None,
             tags: Vec::new(),
         };
         project.insert_asset(&asset).unwrap();
@@ -10983,6 +11006,7 @@ mod tests {
             source_paths: Vec::new(),
             voiceover: None,
             music_score: None,
+            sound_effect: None,
             tags: Vec::new(),
         };
         project.insert_asset(&asset).unwrap();
@@ -11049,6 +11073,7 @@ mod tests {
             source_paths: Vec::new(),
             voiceover: None,
             music_score: None,
+            sound_effect: None,
             tags: Vec::new(),
         };
         let id = asset.id;
@@ -11161,6 +11186,7 @@ mod tests {
             source_paths: Vec::new(),
             voiceover: None,
             music_score: None,
+            sound_effect: None,
             tags: Vec::new(),
         };
         project.insert_asset(&asset).unwrap();
@@ -11228,6 +11254,7 @@ mod tests {
             source_paths: Vec::new(),
             voiceover: None,
             music_score: None,
+            sound_effect: None,
             tags: Vec::new(),
         };
         project.insert_asset(&asset).unwrap();

@@ -194,9 +194,13 @@
   of the clip, which then plays shaken; a clip with none is written as before, `run` a no-op, `needed` always,
   `needed_to_read` false (`a_v17_file_is_backed_up_stamped_v18_and_keeps_its_stabilized_clip`); the analysis is a cache
   beside the footage, not in the file; `persisted/timelines-v18.json` holds a stabilized clip with a fixed zoom.
-  The schema is at **v18** (`SCHEMA_VERSION`). `persist_tests` pins which steps a file has pending with
+  v18→v19 adds `assets.sound_effect` (JSON `SfxSpec`, NULL for none; a probe-and-`ALTER` like `music_score`, `needed` exactly when
+  the column is missing, `needed_to_read` true since `ASSET_COLUMNS` selects it): an older build would drop the spec at its next
+  write of the asset and could no longer reshape the effect (`a_v18_file_gains_the_sound_effect_column_and_keeps_a_backup`); the
+  effects sit on ordinary audio tracks as ordinary clips, so no timeline JSON moves and there is no `persisted/` file for v19.
+  The schema is at **v19** (`SCHEMA_VERSION`). `persist_tests` pins which steps a file has pending with
   `store::pending_steps` (a legacy file that has every column: `[4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17]`). A step's `needed_to_read` says whether a build that
-  cannot write must still refuse a file lacking what it adds: true for the v1, v2, v4 and v15 columns (the reads
+  cannot write must still refuse a file lacking what it adds: true for the v1, v2, v4, v15 and v19 columns (the reads
   name them), false for the `fonts` table (reads tolerate its absence), so a write-protected v2 project
   opens as it is. A new file is stamped `SCHEMA_VERSION`; a
   file newer than that is refused before anything is written (`Error::NewerProject`, "made by a newer
@@ -498,6 +502,36 @@
   `overall` and `notes` (a heavy low end, a thin mid range, a dull top, a loudness swing, a window that is bassier than the
   whole). `analysis.rs` serves a composed asset's rhythm from `ScoreRhythm` (below the providers) instead of
   `FfmpegRhythmAnalyzer`.
+  **Sound effects** (`project/sfx.rs`, tests in `sfx_tests.rs`; the split again): an asset carries **`Asset.sound_effect`**
+  (`SfxSpec`, a `sound_effect` JSON column, schema v19). `SfxPlacement {spec (flattened), at, volume_db?, track_id?}` is flat on
+  the wire; `deny_unknown_fields` cannot be combined with `flatten`, so `Deserialize` takes `at` / `volume_db` / `track_id` and hands the
+  rest to `SfxSpec` (which refuses an unknown field and names it). **`at` is where the effect's hit point lands** (`model::sfx_anchor_s`:
+  a whoosh's peak, an impact's first transient, a riser's end; `reverse` mirrors it), so the clip starts `anchor` earlier; a start
+  before 0 is **cut off the head** (`source_in`, with a 4 ms fade-in) rather than moved, and a hit that would leave under 20 ms of
+  sound is refused naming the time it can land. `sound_effects_inputs(&[SfxPlacement]) -> SfxPlan` under the lock: 1..=256
+  placements, each spec valid (the error says `effects[i] (kind): …`), `at` finite and ≥ 0, `volume_db` −60..=12, a named track an
+  existing **unlocked audio** track — all against the **working timeline** — and **last the placement is rehearsed**
+  (`check_sfx_fits`: stand-in assets of the renders' lengths through the same `put_sound_effects`, then `ripple_lanes` when
+  `ripple_active()` and `check_own_lanes`, the music rehearsal's shape), so a clip that would land on another clip of its named track
+  is refused with edit_timeline's words before anything renders; the plan spells every spec out (`SfxSpec::resolved`: the length in
+  whole milliseconds, clamped to the kind's range) and defaults the gain. → static `synthesize_sound_effects(&plan, cancel) ->
+  Vec<Asset>` (lock released; one render, probe and asset per distinct spec; named `SFX: Whoosh`; `synthesize_sound_effect` for one) →
+  `place_sound_effects(&assets, &plan) -> Vec<Clip>` under the lock: the assets are stored **inside** the `edit_timeline` closure (a
+  refused placement stores nothing, an agent's stages with its assets landing at once) and the whole batch is **one** `Add sound
+  effects` revision (`Add sound effect` for one). **Lanes**: with no `track_id` an effect goes on the first **unlocked** audio track
+  named `FX` (`SFX_TRACK`), `FX 2`, `FX 3`… (in that numeric order) whose clips leave `[start, end)` free — touching is not an
+  overlap, the effects placed earlier in the same batch count — and otherwise on a new audio track at the end of the list named
+  with the first number no audio track has (a locked `FX` is skipped, never used). The batch is placed in the order given, so the
+  lanes depend on it (suggestions are sorted by time). `update_sound_effect_inputs(clip, &spec, volume_db?) -> SfxUpdate` → static
+  `synthesize_sound_effect` → `apply_sound_effect_update(&asset, &update)` is the reshape: the clip is on an unlocked audio track and
+  its asset has a `sound_effect` (else "that clip is not a sound effect"); one `Edit sound effect` revision keeps the **hit point's
+  timeline position** (read from the clip as it stands when the swap is made, through `Clip::source_to_timeline`, so a trimmed or
+  slowed clip is read right), the id, gain (unless `volume_db` is given), fades, audio effects and keys, and plays the whole new render
+  at normal speed (trim and speed reset, as `Recompose music` does); it goes through `edit_timeline`, so ripple applies and without it
+  a longer render that would run into the next clip is refused with nothing stored (the inputs rehearse it too).
+  `preview_sound_effect(spec, cancel) -> PathBuf` is the audition: a render and no edit. `add_sound_effects` and `update_sound_effect`
+  run the three steps for a caller that holds `&self` for the whole of it (tests, a local script); the surfaces render with the lock
+  released. An `#[ignore]`d test drives the real engine and ffprobe end to end.
   `separate_stems_media(asset, progress, cancel)` (static, lock released) separates and
   probes the four stems; `place_stems(source, stems, clip?)` stores them (reusing
   imported ones) and, with a clip, lays each on a new audio track named after it at the
