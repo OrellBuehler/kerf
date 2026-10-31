@@ -73,3 +73,25 @@ Plan: `.claude/plans/gpu-exact-parity.md`. Newest entries last.
 - **P2 placement implemented:** `vf_perspective` port (no SIMD on either build), `GpuCaps::placement`
   on; T3 tutorial 16.7 % -> 100 %. Refused: odd picture height (`pad` keeps or wipes the odd row by
   buffer sharing), entries within 2^-44 of a rounding half (FMA guard).
+
+## Wave A results
+
+- **P2 placement fix round (b71b7a4):** review F1–F5 fixed. The FMA-guard claim was measured: range exports of a
+  10 min cut stay within 0.27 of the guard, but a 1 h cut with a fast pose reaches 1.64. The docs now say so (full
+  exports and stills are exact to the bit). NTSC rates were added to the sweep. All checks pass on both builds.
+- **P1 rotate fix round (71d88a6):**
+  - the TS mirror refuses past the caps (corpus +3);
+  - known-answer tests come from a compiled `vf_rotate.c`;
+  - `filled` comes from `BlendMode::clears_rotated_corners`;
+  - the self-test has a rotate frame;
+  - `RotateFaded` is one frame narrower (the first changed frame is exact over 20 runs);
+  - the fringe test's vacuous 45° case was replaced with 40°.
+- **D1 parity checker: FAIL** (tests at 2a53e6e). All three failures are gaps the plan leaves open, not caused by
+  the flag:
+  - gray resize: up to 21 levels off, because the range conversion and the resize run in a different order;
+  - 10-bit 4:2:0 resize on 6.1.1: Y 2 / UV 1;
+  - an even crop of a 4:4:4 / 4:2:2 / 4:4:0 / RGB source: the edge chroma line is up to 23 levels off;
+  - the probe cannot see a decode-vs-graph thread-count difference (6.1.1: bgr24 and 10/12-bit).
+  
+  The central claim holds: a `+bitexact` resize equals the C path at every CPU level and thread count (26,916
+  outputs). Many scaled rows now measure 0. A fix round is running with these plus the review findings.
