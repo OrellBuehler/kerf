@@ -160,6 +160,22 @@ describe('a chip that is on or off says which', () => {
 	});
 });
 
+describe('the settings dialog’s chips are the shared chip', () => {
+	test('no inline-styled `chip()` is left in the settings: a chip is `<Chip>` or `.k-chip`, with hover and pressed states', () => {
+		expect(read('lib/settings-ui.ts')).not.toMatch(/export const chip\b/);
+		const offenders = svelteFiles.filter((f) => /import \{[^}]*\bchip\b[^}]*\} from '#lib\/settings-ui'/.test(read(f)));
+		expect(offenders).toEqual([]);
+		expect(read(`${EDITOR}ChoiceChips.svelte`)).toContain('class="k-chip"');
+		for (const f of ['SettingsAppearance', 'SettingsPerformance']) expect(read(`${EDITOR}${f}.svelte`), f).toContain('<Chip');
+	});
+
+	test('the one chip rule draws a radio (`aria-checked`) as it draws a toggle (`aria-pressed`)', () => {
+		const css = read('lib/styles/controls.css');
+		for (const state of ['aria-pressed', 'aria-checked', 'aria-current'])
+			expect(css, state).toContain(`.k-chip[${state}='true']`);
+	});
+});
+
 describe('the settings rail says where you are', () => {
 	test('it is a named nav, and the open section is aria-current', () => {
 		const settings = read(`${EDITOR}SettingsDialog.svelte`);

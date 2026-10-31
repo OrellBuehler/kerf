@@ -343,16 +343,25 @@
 	background: var(--surface-active);
 	color: var(--text-primary);
 }
-.k-chip[aria-pressed='true'] {
+.k-chip[aria-pressed='true'],
+.k-chip[aria-checked='true'],
+.k-chip[aria-current='true'] {
 	border-color: var(--kerf-500);
 	background: color-mix(in srgb, var(--kerf-500) 22%, transparent);
 	color: var(--text-primary);
 }
-.k-chip[aria-pressed='true']:hover:not(:disabled) {
+.k-chip[aria-pressed='true']:hover:not(:disabled),
+.k-chip[aria-checked='true']:hover:not(:disabled) {
 	background: color-mix(in srgb, var(--kerf-500) 32%, transparent);
 }
-.k-chip[aria-pressed='true']:active:not(:disabled) {
+.k-chip[aria-pressed='true']:active:not(:disabled),
+.k-chip[aria-checked='true']:active:not(:disabled) {
 	background: color-mix(in srgb, var(--kerf-500) 42%, transparent);
+}
+/* A state that is shown and not chosen (the theme being "Custom"): drawn as the on chip, taking no pointer. */
+.k-chip[data-static] {
+	pointer-events: none;
+	cursor: default;
 }
 .k-chip:disabled,
 .k-chip[aria-disabled='true'] {

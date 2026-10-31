@@ -160,7 +160,7 @@ function barsLine(file: PlatformReport, project: PlatformReport | null): Verdict
 	const many = barred.length > 1;
 	const lead = shape === '9:16' ? `${names} ${many ? 'are' : 'is'} vertical (9:16).` : `${names} ${many ? 'take' : 'takes'} ${shape}.`;
 	const fix = VARIANT_PRESETS.some((p) => p.label === shape)
-		? ` Tick ${shape} under Deliver to to export ${SHAPE_NOUN[shape] ? `a ${SHAPE_NOUN[shape]}` : 'that'} version.`
+		? ` Tick ${shape} under “Deliver to” to export ${SHAPE_NOUN[shape] ? `a ${SHAPE_NOUN[shape]}` : 'that'} version.`
 		: '';
 	return { level: 'warning', text: `${lead} This ${ratioLabel(fw, fh)} cut would be letterboxed.${fix}` };
 }
@@ -183,7 +183,7 @@ function singleFile(file: PlatformReport, project: PlatformReport | null): Verdi
 		)}.`;
 	else if (!aimed.length) text += ' No platform here takes this shape without bars.';
 	if (unmet.length && !bars)
-		text += ` Tick a shape under Deliver to for ${list(unmet, 'or')}.`;
+		text += ` Tick a shape under “Deliver to” for ${list(unmet, 'or')}.`;
 
 	return {
 		shape: null,

@@ -4,7 +4,6 @@
 	// proxy): the arrows only move focus and Space / Enter choose.
 	import { roving } from '#lib/roving';
 	import { tabStop } from '#lib/menu-nav';
-	import { chip } from '#lib/settings-ui';
 	import { tip } from '#lib/tip';
 
 	let {
@@ -38,7 +37,7 @@
 			use:tip={o.hint}
 			disabled={o.disabled}
 			onclick={() => onpick(o.value)}
-			style="{chip(o.value === value)};{o.disabled ? 'opacity:.45;cursor:not-allowed' : ''}">{o.label}</button
+			class="k-chip">{o.label}</button
 		>
 	{/each}
 </div>

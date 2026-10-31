@@ -1,8 +1,7 @@
 <script lang="ts">
 	import SettingRow from './SettingRow.svelte';
+	import Chip from './Chip.svelte';
 	import { settings, CPU_PRESETS } from '#lib/settings.svelte';
-	import { chip } from '#lib/settings-ui';
-	import { tip } from '#lib/tip';
 
 	const cores = $derived(settings.cpuCores);
 	const threads = $derived(settings.cpuThreads);
@@ -21,15 +20,7 @@
 	{/snippet}
 	<div role="group" aria-label="CPU budgets" style="display:flex;flex-wrap:wrap;gap:6px">
 		{#each CPU_PRESETS as p (p.id)}
-			<button
-				type="button"
-				use:tip={p.hint}
-				aria-pressed={percent === p.percent}
-				onclick={() => settings.setCpuPercent(p.percent)}
-				style={chip(percent === p.percent)}
-			>
-				{p.label}
-			</button>
+			<Chip title={p.hint} pressed={percent === p.percent} onclick={() => settings.setCpuPercent(p.percent)}>{p.label}</Chip>
 		{/each}
 	</div>
 

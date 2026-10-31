@@ -81,7 +81,7 @@ describe('the default 16:9 export, no shape ticked', () => {
 		expect(v.groups[0].lines).toEqual([
 			{
 				level: 'note',
-				text: 'This cut is 1920×1080 (16:9) and 0:20 long. Fine for YouTube and the web. Tick a shape under Deliver to for Reels, Shorts or TikTok.'
+				text: 'This cut is 1920×1080 (16:9) and 0:20 long. Fine for YouTube and the web. Tick a shape under “Deliver to” for Reels, Shorts or TikTok.'
 			}
 		]);
 	});
@@ -152,7 +152,7 @@ describe('the default 16:9 export, no shape ticked', () => {
 	test('a low resolution is a folded tip, not a warning', () => {
 		const v = verdict({ file: rep(1280, 720) });
 		expect(levels(v)).toEqual(['note']);
-		expect(texts(v)[0]).toBe('This cut is 1280×720 (16:9) and 0:20 long. Fine for YouTube and the web. Tick a shape under Deliver to for Reels, Shorts or TikTok.');
+		expect(texts(v)[0]).toBe('This cut is 1280×720 (16:9) and 0:20 long. Fine for YouTube and the web. Tick a shape under “Deliver to” for Reels, Shorts or TikTok.');
 		expect(v.tips).toEqual([
 			'1280×720 is below the size YouTube is made for (1920×1080); the platform will upscale it and it will look soft.'
 		]);
@@ -165,7 +165,7 @@ describe('a project already cut for a shape, no shape ticked', () => {
 		expect(v.groups[0].lines).toEqual([
 			{
 				level: 'note',
-				text: 'This cut is 1080×1080 (1:1) and 0:20 long. Fine for YouTube Shorts and Instagram feed. Tick a shape under Deliver to for Reels or TikTok.'
+				text: 'This cut is 1080×1080 (1:1) and 0:20 long. Fine for YouTube Shorts and Instagram feed. Tick a shape under “Deliver to” for Reels or TikTok.'
 			}
 		]);
 		expect(texts(v).join(' ')).not.toMatch(/letterbox|toolbar/i);
@@ -184,7 +184,7 @@ describe('a project already cut for a shape, no shape ticked', () => {
 	test('a 4:5 cut is fine for the feed and Shorts, and suggests the vertical feeds', () => {
 		const v = verdict({ file: rep(1080, 1350) });
 		expect(texts(v)).toEqual([
-			'This cut is 1080×1350 (4:5) and 0:20 long. Fine for YouTube Shorts and Instagram feed. Tick a shape under Deliver to for Reels or TikTok.'
+			'This cut is 1080×1350 (4:5) and 0:20 long. Fine for YouTube Shorts and Instagram feed. Tick a shape under “Deliver to” for Reels or TikTok.'
 		]);
 	});
 
@@ -193,7 +193,7 @@ describe('a project already cut for a shape, no shape ticked', () => {
 		expect(v.groups[0].lines).toEqual([
 			{
 				level: 'note',
-				text: 'This cut is 1440×1080 (4:3) and 0:20 long. No platform here takes this shape without bars. Tick a shape under Deliver to for Reels, Shorts or TikTok.'
+				text: 'This cut is 1440×1080 (4:3) and 0:20 long. No platform here takes this shape without bars. Tick a shape under “Deliver to” for Reels, Shorts or TikTok.'
 			}
 		]);
 	});
@@ -309,7 +309,7 @@ describe('a project cut for a shape, exported wider', () => {
 		expect(warn).toEqual([
 			{
 				level: 'warning',
-				text: 'Instagram Reels, YouTube Shorts and TikTok are vertical (9:16). This 16:9 cut would be letterboxed. Tick 9:16 under Deliver to to export a vertical version.'
+				text: 'Instagram Reels, YouTube Shorts and TikTok are vertical (9:16). This 16:9 cut would be letterboxed. Tick 9:16 under “Deliver to” to export a vertical version.'
 			}
 		]);
 	});
@@ -327,7 +327,7 @@ describe('a project cut for a shape, exported wider', () => {
 		const v = verdict({ file: rep(1920, 1080), project: rep(1080, 1080) });
 		expect(v.groups[0].lines.at(-1)).toEqual({
 			level: 'warning',
-			text: 'YouTube Shorts and Instagram feed take 1:1. This 16:9 cut would be letterboxed. Tick 1:1 under Deliver to to export a square version.'
+			text: 'YouTube Shorts and Instagram feed take 1:1. This 16:9 cut would be letterboxed. Tick 1:1 under “Deliver to” to export a square version.'
 		});
 	});
 
@@ -344,7 +344,7 @@ describe('a project cut for a shape, exported wider', () => {
 	test('a wider shape that some of the platforms still take names only the ones it bars', () => {
 		const v = verdict({ file: rep(1080, 1350), project: vertical });
 		expect(v.groups[0].lines.at(-1)?.text).toBe(
-			'Instagram Reels and TikTok are vertical (9:16). This 4:5 cut would be letterboxed. Tick 9:16 under Deliver to to export a vertical version.'
+			'Instagram Reels and TikTok are vertical (9:16). This 4:5 cut would be letterboxed. Tick 9:16 under “Deliver to” to export a vertical version.'
 		);
 	});
 

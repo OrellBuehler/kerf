@@ -1,10 +1,11 @@
 <script lang="ts">
 	import SettingRow from './SettingRow.svelte';
 	import Btn from './Btn.svelte';
+	import Chip from './Chip.svelte';
 	import { settings } from '#lib/settings.svelte';
 	import { useFilter } from '#lib/settings-filter';
 	import { colorGroupId } from '#lib/settings-index';
-	import { chip, OVERLINE } from '#lib/settings-ui';
+	import { OVERLINE } from '#lib/settings-ui';
 	import { COLOR_GROUPS, PRESETS, PRESET_IDS, SHAPE_TOKENS, THUMB_STYLES } from '#lib/theme';
 	import { tip } from '#lib/tip';
 
@@ -15,12 +16,10 @@
 <SettingRow id="theme" label="Theme" hint="Every color and line the editor draws with. Changing one makes the theme custom." stacked>
 	<div role="group" aria-label="Theme presets" style="display:flex;flex-wrap:wrap;gap:6px;align-items:center">
 		{#each PRESET_IDS as id (id)}
-			<button type="button" onclick={() => settings.applyPreset(id)} aria-pressed={themePreset === id} style={chip(themePreset === id)}>
-				{PRESETS[id].name}
-			</button>
+			<Chip pressed={themePreset === id} onclick={() => settings.applyPreset(id)}>{PRESETS[id].name}</Chip>
 		{/each}
 		{#if themePreset === 'custom'}
-			<span style={chip(true)}>Custom</span>
+			<span class="k-chip" data-static aria-current="true">Custom</span>
 		{/if}
 	</div>
 	<div style="margin-top:10px;display:flex;gap:10px;align-items:center">
@@ -31,18 +30,8 @@
 			onchange={(e) => settings.setThemeName(e.currentTarget.value)}
 			style="flex:1;min-width:0;height:28px;padding:0 8px;background:var(--surface-inset);color:var(--text-primary);border:var(--line-width) solid var(--border-default);border-radius:var(--radius-sm);font-size:12px"
 		/>
-		<button
-			type="button"
-			onclick={() => settings.setScheme('dark')}
-			aria-pressed={settings.theme.scheme === 'dark'}
-			style={chip(settings.theme.scheme === 'dark')}>Dark</button
-		>
-		<button
-			type="button"
-			onclick={() => settings.setScheme('light')}
-			aria-pressed={settings.theme.scheme === 'light'}
-			style={chip(settings.theme.scheme === 'light')}>Light</button
-		>
+		<Chip pressed={settings.theme.scheme === 'dark'} onclick={() => settings.setScheme('dark')}>Dark</Chip>
+		<Chip pressed={settings.theme.scheme === 'light'} onclick={() => settings.setScheme('light')}>Light</Chip>
 	</div>
 </SettingRow>
 
@@ -78,12 +67,7 @@
 			<div style="display:flex;align-items:center;gap:10px;height:32px;font-size:12px;color:var(--text-secondary)">
 				<span style="width:130px;flex:none">Thumb style</span>
 				{#each THUMB_STYLES as ts (ts.id)}
-					<button
-						type="button"
-						onclick={() => settings.setThumbStyle(ts.id)}
-						aria-pressed={settings.theme.shape['slider-thumb-style'] === ts.id}
-						style={chip(settings.theme.shape['slider-thumb-style'] === ts.id)}>{ts.label}</button
-					>
+					<Chip pressed={settings.theme.shape['slider-thumb-style'] === ts.id} onclick={() => settings.setThumbStyle(ts.id)}>{ts.label}</Chip>
 				{/each}
 			</div>
 		</div>
