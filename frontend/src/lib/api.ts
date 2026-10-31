@@ -416,7 +416,38 @@ const sampleTimeline: Timeline = {
 					source_audio: false,
 					link_id: SAMPLE_LINK
 				},
-				{ id: 'c2', asset_id: sampleAssets[1].id, source_in: 0, source_out: 8, timeline_start: 12.5, volume: 1, fade_in: 0.5, fade_out: 0.5 }
+				// The b-roll drifts across the frame as a picture-in-picture: position keyed on its own tracks, at moments
+				// that differ per axis, so the Preview's motion path (dots on the union, eased spacing) has something to draw.
+				{
+					id: 'c2',
+					asset_id: sampleAssets[1].id,
+					source_in: 0,
+					source_out: 8,
+					timeline_start: 12.5,
+					volume: 1,
+					fade_in: 0.5,
+					fade_out: 0.5,
+					transform: { ...DEFAULT_TRANSFORM, scale: 0.4 },
+					channels: [
+						{
+							prop: 'pos_x',
+							keys: [
+								{ time: 0, value: -0.3, easing: 'ease_in_out' },
+								{ time: 3, value: 0.05, easing: 'ease_out' },
+								{ time: 8, value: 0.3 }
+							]
+						},
+						{
+							prop: 'pos_y',
+							keys: [
+								{ time: 0, value: 0.22, easing: 'ease_in_out' },
+								{ time: 2, value: -0.12, easing: 'ease_in_out' },
+								{ time: 5.5, value: 0.15 },
+								{ time: 8, value: -0.08 }
+							]
+						}
+					]
+				}
 			]
 		},
 		{

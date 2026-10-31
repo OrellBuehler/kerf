@@ -66,6 +66,7 @@
 		rippleMode: editor.rippleMode,
 		snap: ui.snap,
 		minimap: ui.minimap,
+		motionPath: ui.motionPath,
 		safeAreas: settings.safeAreas,
 		hasFrame: !!editor.timeline.format,
 		tool: ui.tool,

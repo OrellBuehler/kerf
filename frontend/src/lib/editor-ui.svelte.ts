@@ -40,6 +40,7 @@ import type { ComposePrefill } from './compose-form';
 import type { TrimMonitor, TrimTool } from './trim-tools';
 import { ZOOM_DEFAULT, stepZoom } from './zoom';
 import { seekTime, stepPoint, type SeekOptions } from './frames';
+import { loadMotionPath, saveMotionPath } from './motion-path';
 import {
 	heightOf,
 	heightPx,
@@ -240,6 +241,8 @@ class EditorUi {
 	heights = $state<TrackHeights>(loadHeights());
 	/** Whether the minimap strip over the timeline is shown (also remembered). */
 	minimap = $state(loadMinimap());
+	/** Whether the selected clip's motion path is drawn over the Preview (on by default, also remembered). */
+	motionPath = $state(loadMotionPath());
 	/** Bumped when a preview proxy finishes generating, to nudge the preview into
 	 *  re-decoding the current frame (now served from the fast all-intra proxy). */
 	previewEpoch = $state(0);
@@ -420,6 +423,11 @@ class EditorUi {
 	toggleMinimap() {
 		this.minimap = !this.minimap;
 		saveMinimap(this.minimap);
+	}
+
+	toggleMotionPath() {
+		this.motionPath = !this.motionPath;
+		saveMotionPath(this.motionPath);
 	}
 
 	/** One step in (`1`) or out (`-1`) on the zoom; the timeline holds the playhead still. */

@@ -335,7 +335,7 @@ an icon** (a ragged icon column read as a rendering bug), only the check column 
 key beside an entry is `Kbd` (`.k-kbd`, `accel.ts`: 11 px mono, muted, a punctuation key in a small
 keycap, an arrow a size larger) — the same look as the context menus and the tooltips. **Every entry names a keymap action**
 (`file.importCaptions`, `file.saveCover`, `app.quit`, `tool.snap` — default `S` —,
-`view.minimap`, `view.safeAreas`, `workspace.<id>`, `window.resetWorkspace` /
+`view.minimap`, `view.motionPath`, `view.safeAreas`, `workspace.<id>`, `window.resetWorkspace` /
 `resetAllWorkspaces`, `app.keyboard` / `checkUpdate` / `releases` / `logs` / `about`
 were added, the new ones unbound by default so a build never takes a key) and runs
 the page's own `run` handler for it, so a menu and its shortcut are one piece of
@@ -665,6 +665,37 @@ The handles count as page overlays for `routePreview` (`handles`), so on an X11 
 to the JPEG while they show (a click on the surface itself never reaches the page there: select the clip in the timeline);
 under a transparent webview they draw over the surface. Not done: separate X / Y scale (the model has one `scale`; it
 needs a model, export-graph and GPU change), a live GPU picture during the drag (A3).
+
+**The motion path** (`MotionPath.svelte`, mounted beside the handles with the same `active` — so hidden while playing, streaming,
+previewing a proposal or in the trim monitor — pure math in `motion-path.ts`; **View › Motion path**, `view.motionPath`, no
+default key, `ui.motionPath`, on by default and remembered in `localStorage` like the overview strip). While **one** picture is
+selected under the playhead, not on a locked track, and its position is keyed (`pos_x` or `pos_y`, a track or the legacy bundle:
+`positionKeyed` over `channels.ts`' resolver) the Preview draws where its centre goes over the clip's whole duration: the eased
+polyline of both numbers (`propertyCurve`, the curve every renderer draws; a hold is the straight jump) sampled every frame (every
+few on a long clip, `MAX_SAMPLES`), in the canvas the handles use. A position is a fraction of the frame from its centre, and
+`PathFrame.shift` adds what the integer geometry does to the box's centre at the playhead (overlay's even rounding, a letterbox's
+odd pixel) so the path meets the transform box exactly there and stays smooth elsewhere. **A position key is the union of the two
+numbers' key times** (a dot each, `pathKeys`; the number with no key at that moment is read off its curve); the key within a
+frame of the playhead is the lit one (`hereKey`). Tick marks across the path at equal steps of time (`pathTicks`, a frame
+apart, or every few on a long clip) make the easing visible as spacing: close where the clip is slow, wide where it is fast; none
+at a dot or where it stands still. **Click a dot** seeks to the key (exactly; a key at the clip's very end goes to its last
+frame, still inside the clip: `seekTarget`). **Drag a dot** moves that key (`dragKey`: `movePose` of the transform handles on a
+point, so the same snapping — frame edges and centre lines, the title-safe box and chrome while the guides are drawn, the other
+pictures, 6 px, **Alt** inverts, the timeline's snap toggle — and **Shift** to one axis; snapped and written in the frame's own
+units, so a centre line is position 0 and not the playhead's rounding), one `set_property_tracks` edit on release
+(`moveKeyTracks`), nothing written for a drag that moves nothing, Escape / pointercancel / lost capture / blur abandon it
+(`beginDrag`). While held the path and dots redraw from the clip as the edit would leave it (`withTracks`, the resolver's
+replace-a-track rule), with the transform handles' snap guides and readout; the transform box itself settles on release. Only
+the numbers that moved are written: a number with a key there takes the value (how it leaves kept; a key it had none at splits
+the segment, `upsertKey`), a number the legacy bundle drives is **detached alone** (its track appears, the other four numbers
+stay in the bundle), and a number **nobody keys** that a free drag moves is keyed at every position key, holding its value
+everywhere but the dragged one, with the other number's easing, so the rest of the path stays put (Shift keeps it unkeyed).
+Dragging a dot that is a key of one number only moves the neighbouring dots that are keys of the other number too, as their
+value is read off the changed curve. **Double-click the path** keys every keyed position number at the nearest frame of the
+cut (`nearestOnPath`, `snapKeyTime`, `addKeyTracks`: the value its curve has there, splitting the segment, so the shape stays)
+in one edit; a number that is not keyed stays so. The dots are buttons named `Position key at <time>` (Enter / Space seek).
+The path counts as a page overlay for `routePreview` like the handles. The harness's starter cut moves the b-roll clip
+(position keyed on both numbers at different moments, scale 40 %) so the path is there to see.
 
 
 **The delivery frame has a frame rate** (`Delivery.fps`, optional, 1..240): what exports, the playback and the stills default
