@@ -3,6 +3,7 @@ import { linkClips } from './link-groups';
 import { detachAudio as detach } from './links';
 import {
 	ALT_HINT,
+	altHint,
 	clickSelectLinked,
 	gestureReason,
 	linkBadge,
@@ -375,5 +376,24 @@ describe('gestureReason', () => {
 			'that edit would leave the linked clips on V1 and A1 out of step with each other — unlink them first if they are meant to part (or hold Alt to edit this clip on its own)'
 		);
 		expect(gestureReason('track V1 is locked')).toBe('track V1 is locked');
+	});
+});
+
+describe('the Alt key, named as the keyboard names it', () => {
+	test('a Mac says Option in the shared hint, everywhere else Alt', () => {
+		expect(altHint('other')).toBe(
+			'Alt-click selects just this clip; Alt-drag, Alt-trim and Alt-razor edit it on its own, leaving its linked clips where they are.'
+		);
+		expect(altHint('mac')).toBe(
+			'Option-click selects just this clip; Option-drag, Option-trim and Option-razor edit it on its own, leaving its linked clips where they are.'
+		);
+		expect(ALT_HINT).toBe(altHint());
+	});
+
+	test('a refusal worded for a gesture says which key to hold', () => {
+		const refusal = 'a linked clip is on locked track A1 — unlock it first';
+		expect(gestureReason(refusal, 'mac')).toBe(`${refusal} (or hold Option to edit this clip on its own)`);
+		expect(gestureReason(refusal, 'other')).toBe(`${refusal} (or hold Alt to edit this clip on its own)`);
+		expect(gestureReason('track V1 is locked', 'mac')).toBe('track V1 is locked');
 	});
 });

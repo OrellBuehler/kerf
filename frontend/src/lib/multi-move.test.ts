@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { withLinkedMoves } from './links';
 import { moveClips } from './multi-edit';
-import { drawnMoveTracks, moveTracks, planMove, type MoveTrack } from './multi-move';
+import { altToMoveAlone, drawnMoveTracks, moveTracks, planMove, type MoveTrack } from './multi-move';
 import type { Clip, StreamKind, Timeline, Track } from './types';
 import { clipDuration } from './types';
 
@@ -643,3 +643,10 @@ function linkedPartners(tl: Timeline, id: string): string[] {
 	const l = tl.tracks.flatMap((t) => t.clips).find((c) => c.id === id)?.link_id;
 	return l ? tl.tracks.flatMap((t) => t.clips).filter((c) => c.link_id === l && c.id !== id).map((c) => c.id) : [];
 }
+
+describe('the key that moves a clip on its own', () => {
+	test('is Option on a Mac and Alt elsewhere', () => {
+		expect(altToMoveAlone('mac')).toBe('hold Option to move this clip on its own');
+		expect(altToMoveAlone('other')).toBe('hold Alt to move this clip on its own');
+	});
+});

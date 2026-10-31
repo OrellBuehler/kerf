@@ -33,6 +33,7 @@
  * partners are the backend's to add, exactly as it will. */
 
 import { formatTime } from './diff';
+import { detectPlatform, modLabel, type Platform } from './keymap';
 import { DIFF_EPS, spansOverlap } from './ripple';
 import { displayTracks } from './track-order';
 import type { ClipMove, StreamKind, Timeline } from './types';
@@ -122,7 +123,8 @@ const refuse = (reason: string, ghosts: Ghost[], delta = 0, laneShift = 0, links
 });
 
 /** Said after a refusal that comes from a partner, so the way round it is not a mystery. */
-const ALT_TO_MOVE_ALONE = 'hold Alt to move this clip on its own';
+export const altToMoveAlone = (platform: Platform = detectPlatform()): string =>
+	`hold ${modLabel(platform, 'alt')} to move this clip on its own`;
 
 /**
  * Plan dragging `memberIds` — the grabbed clip among them — so the grabbed clip
@@ -224,10 +226,10 @@ export function planMove(
 				let start = c.start + delta;
 				if (start < 0 && start > -DIFF_EPS) start = 0;
 				if (tracks[ti].locked && reason === null) {
-					reason = `A linked clip is on locked track ${tracks[ti].name} — unlock it, or ${ALT_TO_MOVE_ALONE}`;
+					reason = `A linked clip is on locked track ${tracks[ti].name} — unlock it, or ${altToMoveAlone()}`;
 				}
 				if (start < 0 && reason === null) {
-					reason = `Moving that far would take its linked clip on ${tracks[ti].name} before the beginning of the timeline — ${ALT_TO_MOVE_ALONE}`;
+					reason = `Moving that far would take its linked clip on ${tracks[ti].name} before the beginning of the timeline — ${altToMoveAlone()}`;
 				}
 				landed.push({ id: pid, from: ti, to: ti, start, dur: c.dur, carried: true });
 				ghosts.push({ clipId: pid, trackId: tracks[ti].id, start: Math.max(0, start), dur: c.dur, carried: true });
@@ -249,7 +251,7 @@ export function planMove(
 			if (staying || other) {
 				reason = `The clips would overlap on track ${tracks[l.to].name} at ${formatTime(l.start)}`;
 				// A carried partner is the cause when it is on the lane that overlaps: say how to leave it behind.
-				if (l.carried || other?.carried) reason += ` — ${ALT_TO_MOVE_ALONE}`;
+				if (l.carried || other?.carried) reason += ` — ${altToMoveAlone()}`;
 				break;
 			}
 		}

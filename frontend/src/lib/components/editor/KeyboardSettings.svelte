@@ -10,7 +10,7 @@
 	import Btn from './Btn.svelte';
 	import { settings } from '#lib/settings.svelte';
 	import {
-		FIXED_KEYS,
+		fixedKeys,
 		GROUPS,
 		KEY_PRESETS,
 		actionDef,
@@ -499,7 +499,7 @@
 				These work the same everywhere and cannot be changed.
 			</p>
 			<ul style="list-style:none;margin:0;padding:0">
-				{#each FIXED_KEYS as f (f.keys)}
+				{#each fixedKeys(platform) as f (f.keys)}
 					<li
 						style="display:flex;align-items:center;gap:10px;min-height:28px;border-bottom:var(--line-width) solid var(--border-subtle);font-size:12px;color:var(--text-secondary)"
 					>

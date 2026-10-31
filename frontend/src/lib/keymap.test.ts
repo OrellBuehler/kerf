@@ -16,6 +16,7 @@ import {
 	differsFromDefault,
 	displayChord,
 	emptyOverrides,
+	fixedKeys,
 	filterActions,
 	findCollisions,
 	formatChord,
@@ -1098,21 +1099,50 @@ describe('no key is hard-coded outside the registry', () => {
 		expect(offenders).toEqual([]);
 	});
 
+	// A modifier glyph, a `Ctrl +` / `Cmd +` / `Alt +` hint, or a `(R)` / `(Space)` hint inside a string,
+	// in code that is not a comment, is a key being printed by hand. A pointer gesture (a wheel turn, a
+	// click) is no exception: its modifier is `settings.modLabel`, which says Command on a Mac and Ctrl
+	// elsewhere — "⌘/Ctrl + wheel" printed a Mac glyph on Windows. Prose that names a modifier —
+	// `Alt-click`, `Shift + drag`, `hold Alt` — is the same thing printed by hand: on a Mac the key is
+	// Option, and `modLabel(platform, …)` is what knows.
+	const printed =
+		/[⌘⇧⌥⌃]|['"`][^'"`\n]*\((?:[A-Z]|Space|Del|Esc|Enter)\)|['"`][^'"`\n]*\b(?:Ctrl|Cmd|Command|Option|Alt)\s*\+|\b(?:Alt|Shift|Ctrl|Cmd|Option)(?:\s*[+-]|\s+(?:click|drag))|\bhold (?:Alt|Shift|Ctrl)/;
+	const printing = (source: string, at: (i: number) => string) =>
+		source
+			.split('\n')
+			.map((line, i) => ({ line, at: at(i + 1) }))
+			.filter(({ line }) => !/^\s*(\/\/|\*|\/\*|<!--)/.test(line) && printed.test(line))
+			.map(({ at }) => at);
+
 	test('tooltips and labels do not spell one either', () => {
-		// A modifier glyph, a `Ctrl +` / `Cmd +` / `Alt +` hint, or a `(R)` / `(Space)` hint inside a string,
-		// in code that is not a comment, is a key being printed by hand. A pointer gesture (a wheel turn, a
-		// click) is no exception: its modifier is `settings.modLabel`, which says Command on a Mac and Ctrl
-		// elsewhere — "⌘/Ctrl + wheel" printed a Mac glyph on Windows.
-		const printed =
-			/[⌘⇧⌥⌃]|['"`][^'"`\n]*\((?:[A-Z]|Space|Del|Esc|Enter)\)|['"`][^'"`\n]*\b(?:Ctrl|Cmd|Command|Option|Alt)\s*\+/;
-		const offenders = files.flatMap((f) =>
-			readFileSync(f, 'utf8')
-				.split('\n')
-				.map((line, i) => ({ line, at: `${f.slice(SRC.length + 1)}:${i + 1}` }))
-				.filter(({ line }) => !/^\s*(\/\/|\*|\/\*|<!--)/.test(line) && printed.test(line))
-				.map(({ at }) => at)
-		);
+		const offenders = files.flatMap((f) => printing(readFileSync(f, 'utf8'), (n) => `${f.slice(SRC.length + 1)}:${n}`));
 		expect(offenders).toEqual([]);
+	});
+
+	test('the guard sees the forms that said Alt on a Mac', () => {
+		for (const line of [
+			"const hint = 'Alt-click selects just this clip';",
+			"const why = `${message} (or hold Alt to edit this clip on its own)`;",
+			"const a = 'hold Alt to move this clip on its own';",
+			"{ keys: 'Shift / Ctrl/⌘ + click', does: 'x' }",
+			"tip: 'Ctrl + wheel zooms'",
+			"title: 'Option-drag copies'",
+			"label: 'Shift + drag'"
+		])
+			expect(printed.test(line), line).toBe(true);
+		for (const line of [
+			"tip: `${settings.modLabel('alt')}-click selects`",
+			"const why = `hold ${modLabel(platform, 'alt')} to move`;"
+		])
+			expect(printed.test(line), line).toBe(false);
+	});
+
+	test('the fixed keys the settings list prints are built from the platform’s modifier names', () => {
+		const keymap = readFileSync(join(SRC, 'lib/keymap.ts'), 'utf8');
+		const start = keymap.indexOf('export function fixedKeys');
+		const body = keymap.slice(start, keymap.indexOf('\n}\n', start));
+		expect(body.length).toBeGreaterThan(200);
+		expect(printing(body, (n) => `keymap.ts fixedKeys +${n}`)).toEqual([]);
 	});
 
 	test('only the page’s dispatcher and the recorder read the keyboard for a shortcut', () => {
@@ -1186,5 +1216,23 @@ describe('modifiers in prose', () => {
 			expect(source, f).toContain("settings.modLabel('alt')");
 			expect(source, f).not.toMatch(/[,(]\s*Alt\s/);
 		}
+	});
+});
+
+describe('fixedKeys', () => {
+	test('name the modifiers as the platform’s keyboard does: Option and Command on a Mac', () => {
+		const keys = (platform: 'mac' | 'other') => fixedKeys(platform).map((f) => f.keys);
+		expect(keys('other')).toContain('Ctrl + wheel');
+		expect(keys('other')).toContain('Shift / Ctrl + click');
+		expect(keys('other')).toContain('Alt, or F10');
+		expect(keys('mac')).toContain('Command + wheel');
+		expect(keys('mac')).toContain('Shift / Command + click');
+		expect(keys('mac')).toContain('Option, or F10');
+	});
+
+	test('the same rows everywhere, with the nudge and the focus line worded for the platform', () => {
+		expect(fixedKeys('mac').length).toBe(fixedKeys('other').length);
+		expect(fixedKeys('mac').find((f) => f.keys === '← → on a focused clip')?.does).toContain('Shift: a second');
+		expect(fixedKeys('mac').find((f) => f.keys === 'Tab')?.does).toBe('Moves focus (Shift+Tab moves back)');
 	});
 });

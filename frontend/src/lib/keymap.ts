@@ -789,16 +789,20 @@ export function allowsRepeat(id: string, actions: readonly ActionDef[] = ACTIONS
 
 /** Keys that mean the same thing everywhere and are not rebindable — shown
  *  read-only in the settings list so the layering is not a mystery. */
-export const FIXED_KEYS: readonly { keys: string; does: string }[] = [
-	{ keys: 'Esc', does: 'Abandons a drag, closes the open menu, panel or dialog' },
-	{ keys: 'Tab', does: 'Moves focus (Shift+Tab moves back)' },
-	{ keys: 'Enter / Space', does: 'Activates the focused button, tab or menu item' },
-	{ keys: 'Alt, or F10', does: 'Focuses the menu bar; ← → move along it, ↓ opens a menu, Esc closes it' },
-	{ keys: '← → ↑ ↓', does: 'Operate a focused slider, panel tab or list' },
-	{ keys: 'Ctrl/⌘ + wheel', does: 'Zooms the timeline at the pointer' },
-	{ keys: 'Shift / Ctrl/⌘ + click', does: 'Extends or toggles the clip selection' },
-	{ keys: '← → on a focused clip', does: 'Nudges it a frame (Shift: a second); a run of presses is one edit' }
-];
+export function fixedKeys(platform: Platform): readonly { keys: string; does: string }[] {
+	const primary = modLabel(platform, 'primary');
+	const shift = modLabel(platform, 'shift');
+	return [
+		{ keys: 'Esc', does: 'Abandons a drag, closes the open menu, panel or dialog' },
+		{ keys: 'Tab', does: `Moves focus (${shift}+Tab moves back)` },
+		{ keys: 'Enter / Space', does: 'Activates the focused button, tab or menu item' },
+		{ keys: `${modLabel(platform, 'alt')}, or F10`, does: 'Focuses the menu bar; ← → move along it, ↓ opens a menu, Esc closes it' },
+		{ keys: '← → ↑ ↓', does: 'Operate a focused slider, panel tab or list' },
+		{ keys: `${primary} + wheel`, does: 'Zooms the timeline at the pointer' },
+		{ keys: `${shift} / ${primary} + click`, does: 'Extends or toggles the clip selection' },
+		{ keys: '← → on a focused clip', does: `Nudges it a frame (${shift}: a second); a run of presses is one edit` }
+	];
+}
 
 // ---- bindings ----------------------------------------------------------------
 

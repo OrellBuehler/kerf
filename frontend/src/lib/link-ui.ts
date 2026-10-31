@@ -12,14 +12,19 @@
 // `unlinkClips`), so a menu item is never offered that the backend would refuse for a
 // reason this could have said first.
 
+import { detectPlatform, modLabel, type Platform } from './keymap';
 import { linkPartners, locateIndex, planLink, planUnlink, withLinkPartners } from './link-groups';
 import { soundAlreadyPlaying } from './links';
 import { clickSelect, marqueeSelect, normalize, type MarqueeMode, type PickMode, type Selection } from './selection';
 import type { Clip, StreamKind, Timeline } from './types';
 
-/** What the tooltips say about Alt — one sentence, so the badge, the toolbar and the menu agree. */
-export const ALT_HINT =
-	'Alt-click selects just this clip; Alt-drag, Alt-trim and Alt-razor edit it on its own, leaving its linked clips where they are.';
+/** What the tooltips say about the Alt key — one sentence, so the badge, the toolbar and the menu agree. The key is
+ *  named as the platform's keyboard names it: Option on a Mac. */
+export function altHint(platform: Platform = detectPlatform()): string {
+	const alt = modLabel(platform, 'alt');
+	return `${alt}-click selects just this clip; ${alt}-drag, ${alt}-trim and ${alt}-razor edit it on its own, leaving its linked clips where they are.`;
+}
+export const ALT_HINT = altHint();
 
 const capital = (s: string) => s.charAt(0).toUpperCase() + s.slice(1);
 /** A backend refusal as a sentence for a menu line (`invalid argument: ` is the transport's, not the user's). */
@@ -29,8 +34,8 @@ export const reasonOf = (e: unknown): string =>
 /** A backend refusal worded for a *gesture*: where the refusal is about linked clips, the
  *  user holds Alt to edit this clip on its own (`link: false` for a caller with no Alt).
  *  The refusals are the backend's own words, shared with the agent that has no Alt. */
-export const gestureReason = (message: string): string =>
-	/linked/.test(message) ? `${message} (or hold Alt to edit this clip on its own)` : message;
+export const gestureReason = (message: string, platform: Platform = detectPlatform()): string =>
+	/linked/.test(message) ? `${message} (or hold ${modLabel(platform, 'alt')} to edit this clip on its own)` : message;
 
 // ---- selection --------------------------------------------------------------------
 

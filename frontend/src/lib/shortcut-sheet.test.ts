@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test';
-import { ACTIONS, FIXED_KEYS, emptyOverrides, resolveBindings, setActionChords, parseChord } from './keymap';
+import { ACTIONS, emptyOverrides, fixedKeys, resolveBindings, setActionChords, parseChord } from './keymap';
 import { shortcutSheet, unboundLine } from './shortcut-sheet';
 
 describe('the shortcut cheat sheet', () => {
@@ -40,7 +40,7 @@ describe('the shortcut cheat sheet', () => {
 	});
 
 	test('carries the fixed keys, which cannot be rebound', () => {
-		expect(sheet.fixed).toBe(FIXED_KEYS);
+		expect(sheet.fixed).toEqual(fixedKeys('other'));
 	});
 
 	test('the line about the keyless actions', () => {

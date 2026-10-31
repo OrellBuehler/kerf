@@ -3,7 +3,7 @@
 // the actions that have no key (a sheet is for finding the key; the actions without one are in the menus and,
 // to give them one, in the Keyboard settings, which is where rebinding lives and this does not).
 
-import { ACTIONS, FIXED_KEYS, GROUPS, displayChord, plainLabel, type ActionDef, type Bindings, type Platform } from './keymap';
+import { ACTIONS, GROUPS, displayChord, fixedKeys, plainLabel, type ActionDef, type Bindings, type Platform } from './keymap';
 
 export interface SheetRow {
 	id: string;
@@ -38,7 +38,7 @@ export function shortcutSheet(bindings: Bindings, platform: Platform, actions: r
 		}
 		return { id: g.id, label: g.label, rows };
 	}).filter((g) => g.rows.length > 0);
-	return { groups, fixed: FIXED_KEYS, unbound };
+	return { groups, fixed: fixedKeys(platform), unbound };
 }
 
 /** `3 more actions have no shortcut`, or nothing when every one has. */
