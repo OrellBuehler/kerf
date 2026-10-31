@@ -120,6 +120,24 @@ const PROMPTS: &[Def] = &[
         text: music_bed,
     },
     Def {
+        name: "sound_design",
+        title: "Sound design",
+        description: "Put whooshes on the cuts, pops on titles and risers into drops: suggest where, review, add, check the mix.",
+        args: &[
+            Arg {
+                name: "density",
+                description: "How many: subtle (transitions, titles, drops), balanced (adds the cuts; default) or punchy (every cut and the opening)",
+                required: false,
+            },
+            Arg {
+                name: "range",
+                description: "Only part of the cut, as start-end in seconds, e.g. 0-30; omitted, the whole cut",
+                required: false,
+            },
+        ],
+        text: sound_design,
+    },
+    Def {
         name: "deliver",
         title: "Deliver",
         description: "Final checks on the cut (gaps, frame rate, platform, loudness, captions), then export.",
@@ -257,6 +275,31 @@ fn music_bed(args: &Args) -> String {
          range with speech: music heavy in mid / high_mid fights the voice; fix with `set_audio_effects` or a lower \
          fader.\n\
          5. `staged_diff` shows what you hand over."
+    )
+}
+
+fn sound_design(args: &Args) -> String {
+    let density = args.or("density", "balanced");
+    let range = match args.get("range") {
+        Some(r) => format!(" Only {r} seconds of the cut: pass range {{start, end}} to `suggest_sound_effects`."),
+        None => String::new(),
+    };
+    format!(
+        "Add sound effects to the cut: whooshes on the cuts, pops on titles, a riser into a drop, at {density} \
+         density.{range}\n\n\
+         1. Settle the picture first, since a later edit moves the cuts. {GUIDE_FIRST}\n\
+         2. `analyze_asset` the footage where it is not analysed yet (steps scenes, transcript and rhythm): speech lowers \
+         the effects under it and music drops get a riser. `list_sound_effects` says what each of the sounds is for.\n\
+         3. `suggest_sound_effects` with density \"{density}\" (and range, categories or kinds to narrow it). It adds \
+         nothing; each suggestion says what the moment is and why.\n\
+         4. Review the list: keep the moments that help the story, drop the ones that crowd a line of speech or repeat, \
+         and change a kind, a gain (volume_db) or a seed where the first sound is not right. Each placement is \
+         exactly what `add_sound_effects` takes, and its \"at\" is where the HIT lands, not where the clip starts.\n\
+         5. `add_sound_effects` with the placements you kept: one call, one edit, on the FX tracks.\n\
+         6. Check the mix: `get_levels` (about -14 LUFS for social, true peak under -1 dBTP) and, over a stretch of \
+         speech, `get_band_balance`; effects that cover a word get a lower fader with `set_volume`, or a new \
+         spec with `update_sound_effect`. `preview_timeline` at a few effects shows the picture they sit on.\n\
+         7. `staged_diff` shows what you hand over; say which moments got a sound and why."
     )
 }
 
@@ -404,6 +447,7 @@ mod tests {
                 "podcast_cleanup",
                 "social_reel",
                 "music_bed",
+                "sound_design",
                 "deliver"
             ]
         );
@@ -430,6 +474,18 @@ mod tests {
         let social = text_of(&get("social_reel", Some(&object(&[("platform", "Reels")]))).unwrap());
         let captions = social.find("generate_captions").unwrap();
         assert!(captions > social.find("smart_crop").unwrap() && captions < social.find("platform_check").unwrap());
+    }
+
+    #[test]
+    fn sound_design_suggests_then_adds_then_checks_the_mix() {
+        let design = text_of(&get("sound_design", Some(&object(&[("density", "punchy"), ("range", "0-30")]))).unwrap());
+        assert!(design.contains("punchy density") && design.contains("\"punchy\"") && design.contains("0-30"));
+        let whole = text_of(&get("sound_design", None).unwrap());
+        assert!(whole.contains("balanced") && !whole.contains("Only "), "{whole}");
+        let at = |needle: &str| whole.find(needle).unwrap_or_else(|| panic!("{needle}"));
+        let (suggest, add, levels) = (at("`suggest_sound_effects`"), at("`add_sound_effects`"), at("`get_levels`"));
+        assert!(suggest < add && add < levels, "suggest, review, add, check the mix");
+        assert!(whole.contains("HIT"));
     }
 
     #[test]

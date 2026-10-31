@@ -115,7 +115,14 @@ the render, as the project's ripple flag decides), renders with the lock release
 with the request's own `track_id` / `at` / `replace_clip_id` as given (a refused placement stores nothing), answering the
 `Composed` fields flattened (`asset`, `clip`, `score` as rendered, `align`, `replaced`: the ids of the clips replaced —
 the whole bed of `replace_clip_id`, empty when a clip was added) plus the refreshed `timeline`; both emit `music-progress` — the voiceover's payload, stages `download_soundfont`,
-`waiting`, `render` — and `cancel_music` rejects `music cancelled`), band balance (`get_band_balance { request }`, a core
+`waiting`, `render` — and `cancel_music` rejects `music cancelled`), sound effects (`sfx_catalogue` → the core's `SfxPreset` rows;
+`preview_sound_effect { spec }` → the **bytes of the rendered WAV** via `tauri::ipc::Response`, not a path: the CSP has no `media-src` and the
+app registers no asset protocol, so the page decodes them with Web Audio like `get_audio`'s PCM; no edit, no asset, the project is not touched;
+`add_sound_effects { placements, ripple? }` → `{clips, timeline}`: `sound_effects_inputs` under the lock and `with_ripple`, the render with it released
+(`synthesize_sound_effects`, stopped only by a replaced project — it takes milliseconds, so there is no cancel command or progress event), then
+`place_sound_effects` under `with_ripple` as **one** `Add sound effects` revision; `update_sound_effect { clipId, spec, volumeDb?, ripple? }` → `{clip, timeline}`
+(the whole spec; the hit point stays); `suggest_sound_effects { request }` → `SfxSuggestion[]`, a read of the live cut; a replaced project rejects
+`sound effect cancelled`), band balance (`get_band_balance { request }`, a core
 `BandBalanceRequest`, answering `BandBalance`; the decode runs with the lock released and `cancel_band_balance` rejects
 `band balance cancelled`), every editing
 op (`cut_clip`, `add_clip`, `split_clip`, `trim_clip` (optional `timeline_start` so a
@@ -422,7 +429,8 @@ comes back `ForbiddenUrl` and the "Release notes" button silently does nothing.
 `paths_exist`, `set_asset_projection`, `edit_asset_tags`, `list_tags`, `assemble_by_tag`; *analysis, proxies, transcription* `analyze_asset`, `cancel_analysis`, `analysis_statuses`,
 `proxy_statuses`, `rebuild_proxy`, `delete_proxy`, `transcription_status`, `set_speech_model`, `download_speech_model`,
 `cancel_model_download`; *voiceover, music, stems, mixing* `voiceover_status`, `prepare_voiceover`, `generate_voiceover`,
-`cancel_voiceover`, `music_status`, `prepare_music`, `compose_music`, `cancel_music`, `get_band_balance`,
+`cancel_voiceover`, `music_status`, `prepare_music`, `compose_music`, `cancel_music`, `sfx_catalogue`, `preview_sound_effect`,
+`add_sound_effects`, `update_sound_effect`, `suggest_sound_effects`, `get_band_balance`,
 `cancel_band_balance`, `stems_status`, `separate_stems`, `cancel_stems`, `get_levels`, `cancel_levels`, `plan_music_fit`,
 `fit_music`, `set_track_volume`, `set_track_pan`, `set_master_volume`, `set_master_limiter`, `set_master_true_peak`,
 `set_master_duck`, `sync_clips_by_audio`, `cancel_audio_sync`;
