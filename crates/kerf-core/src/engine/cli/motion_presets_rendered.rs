@@ -77,6 +77,8 @@ fn export_frames(timeline: &Timeline, assets: &[Asset], dir: &Path, tag: &str) -
         .map(String::from),
     );
     args.push(out.to_string_lossy().into_owned());
+    // The export spills a long graph to a script file; a preset's eased keys outgrow Windows' 32 K command line.
+    let _script = externalize_filter_complex(&mut args, tag).unwrap();
     let run = command(&ffmpeg_bin()).args(&args).stdin(Stdio::null()).output().unwrap();
     assert!(
         run.status.success(),
