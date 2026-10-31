@@ -164,8 +164,9 @@
 		{/if}
 
 		<div style="display:flex;flex-direction:column;gap:5px">
-			<span style={labelCss}>Script</span>
+			<label for="voiceover-script" style={labelCss}>Script</label>
 			<textarea
+				id="voiceover-script"
 				bind:value={text}
 				rows="7"
 				placeholder="Write what the voice should say. A blank line makes a longer pause."

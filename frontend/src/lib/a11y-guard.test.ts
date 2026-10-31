@@ -263,3 +263,62 @@ describe('the agent panel does not lose or double what it was asked', () => {
 		expect(panel).toContain("doc.removeEventListener('visibilitychange', poll)");
 	});
 });
+
+describe('a field has a name', () => {
+	/** Files that still hold an unnamed field, and how many: the count may fall, never rise. */
+	const UNLABELLED_ALLOWED: Record<string, number> = {
+		'lib/components/editor/Timeline.svelte': 1,
+		'lib/components/editor/Inspector.svelte': 1
+	};
+
+	/** The `<input>`, `<textarea>` and `<select>` of a component that nothing names: not inside a `<label>`, no
+	 *  `<label for>` pointing at its id, no aria-label / aria-labelledby, no `use:tip` (which names an unnamed
+	 *  control), and not hidden. A spread may carry any of them, so it passes. */
+	function unnamedFields(file: string): string[] {
+		const source = read(file);
+		const text = (a: { value: unknown } | undefined) =>
+			Array.isArray(a?.value) ? (a!.value as { data?: string }[]).map((t) => t.data ?? '{}').join('') : null;
+		const labelled = new Set<string>();
+		const fields: { node: Node; inLabel: boolean }[] = [];
+		const walk = (n: unknown, inLabel: boolean) => {
+			if (!n || typeof n !== 'object') return;
+			if (Array.isArray(n)) return n.forEach((x) => walk(x, inLabel));
+			const node = n as Node;
+			let within = inLabel;
+			if (node.type === 'RegularElement') {
+				if (node.name === 'label') {
+					within = true;
+					const target = text(attr(node, 'for') as { value: unknown } | undefined);
+					if (target) labelled.add(target);
+				}
+				if (node.name === 'input' || node.name === 'textarea' || node.name === 'select') fields.push({ node, inLabel });
+			}
+			for (const k of Object.keys(node)) if (k !== 'parent') walk(node[k], within);
+		};
+		walk(parse(source, { modern: true }).fragment, false);
+		const out: string[] = [];
+		for (const { node, inLabel } of fields) {
+			if (inLabel || hasAttr(node, 'aria-label') || hasAttr(node, 'aria-labelledby') || directive(node, 'tip')) continue;
+			if (text(attr(node, 'type') as { value: unknown } | undefined) === 'hidden') continue;
+			const id = text(attr(node, 'id') as { value: unknown } | undefined);
+			if (id && labelled.has(id)) continue;
+			out.push(`${file}:${source.slice(0, node.start).split('\n').length}  <${node.name}> has no name`);
+		}
+		return out;
+	}
+
+	test('every input, textarea and select is inside a label, pointed at by one, or carries an aria-label', () => {
+		const offenders: string[] = [];
+		for (const file of svelteFiles) {
+			const found = unnamedFields(file);
+			if (found.length > (UNLABELLED_ALLOWED[file] ?? 0)) offenders.push(...found);
+		}
+		expect(offenders).toEqual([]);
+	});
+
+	test('the export dialog’s custom size and the voiceover script are named', () => {
+		expect(unnamedFields(`${EDITOR}ExportDialog.svelte`)).toEqual([]);
+		expect(unnamedFields(`${EDITOR}VoiceoverDialog.svelte`)).toEqual([]);
+		expect(read(`${EDITOR}ExportDialog.svelte`)).toMatch(/aria-label=\{label\}/);
+	});
+});

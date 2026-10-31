@@ -29,6 +29,7 @@
 	import { timeDisplay } from '#lib/time-display.svelte';
 	import { frameKey, restoreDraft } from '#lib/export-draft';
 	import { judgeable } from '#lib/platform-verdict';
+	import { MAX_SIDE, MIN_SIDE, editSide } from '#lib/export-size';
 	import type { RowSpec } from '#lib/slider-row';
 	import type { Container, ExportOptions, ExportReport, Fit, RateControl, SubtitleFormat } from '#lib/types';
 	import { exportedLine, failure } from '#lib/failure-copy';
@@ -199,6 +200,7 @@
 		opts = applyPreset(id, hwCodecs);
 		activePreset = id;
 		customRes = false;
+		sizeNote = null;
 	}
 	function swapExt(path: string, ext: string): string {
 		return path.replace(/\.[^./\\]+$/, '') + '.' + ext;
@@ -231,11 +233,26 @@
 	// ...and its frame rate: what an unset one resolves to.
 	const projectRate = $derived(editor.timeline.format?.fps ?? null);
 
+	const CUSTOM_START: [number, number] = [1920, 1080];
+	/** What the last custom size entry was changed to (or refused for), said under the fields. */
+	let sizeNote = $state<string | null>(null);
+	/** Take a side from its field: whole, even and in range, with the field showing what was kept. */
+	function setSide(axis: 0 | 1, input: HTMLInputElement) {
+		const size: [number, number] = [...(opts.resolution ?? CUSTOM_START)];
+		const out = editSide(input.value, size[axis]);
+		input.value = String(out.value);
+		sizeNote = out.note;
+		if (out.value === size[axis] && opts.resolution) return;
+		size[axis] = out.value;
+		patch({ resolution: size });
+	}
+
 	function resValue(): string {
 		if (customRes) return 'custom';
 		return opts.resolution ? `${opts.resolution[0]}x${opts.resolution[1]}` : 'source';
 	}
 	function setRes(v: string) {
+		sizeNote = null;
 		if (v === 'custom') {
 			customRes = true;
 			if (!opts.resolution) patch({ resolution: [1920, 1080] });
@@ -347,6 +364,25 @@
 	</label>
 {/snippet}
 
+{#snippet sideField(label: string, axis: 0 | 1)}
+	<input
+		type="number"
+		min={MIN_SIDE}
+		max={MAX_SIDE}
+		step="2"
+		aria-label={label}
+		aria-invalid={sizeNote !== null}
+		aria-describedby={sizeNote ? 'export-size-note' : undefined}
+		value={(opts.resolution ?? CUSTOM_START)[axis]}
+		onchange={(e) => setSide(axis, e.currentTarget)}
+		style="{inputCss};width:90px;text-align:right"
+	/>
+{/snippet}
+
+{#snippet hint(text: string, indent = 0)}
+	<p style="font-size:12px;color:var(--text-muted);margin:2px 0 6px;line-height:1.45;padding-left:{indent}px">{text}</p>
+{/snippet}
+
 {#snippet toggleRow(label: string, checked: boolean, onChange: (v: boolean) => void)}
 	<label style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:4px 0">
 		<span style="font-size:12px;color:var(--text-muted)">{label}</span>
@@ -387,9 +423,7 @@
 			false,
 			presetsByGroup(presets).map((g) => ({ group: g.group, items: g.presets.map((p) => ({ value: p.id, label: p.label })) }))
 		)}
-		<p style="font-size:12px;color:var(--text-muted);margin:2px 0 4px;line-height:1.45">
-			{presets.find((p) => p.id === activePreset)?.description ?? 'Your own settings — pick a preset to start over from one.'}
-		</p>
+		{@render hint(presets.find((p) => p.id === activePreset)?.description ?? 'Your own settings — pick a preset to start over from one.')}
 		<!-- destination -->
 		{@render secHead('Destination')}
 		<div style="display:flex;align-items:center;gap:8px;padding:4px 0">
@@ -418,9 +452,7 @@
 		{#if showVideo}
 			{@render secHead('Picture')}
 			{#if variantFormats.length}
-				<div style="font-size:12px;color:var(--text-muted);padding:4px 0">
-					Resolution and fit come from each delivery frame below.
-				</div>
+				{@render hint('Resolution and fit come from each delivery frame below.')}
 			{:else}
 			{@render selectRow(
 				'Resolution',
@@ -437,30 +469,17 @@
 				setRes
 			)}
 			{#if !opts.resolution && projectFrame}
-				<div style="font-size:12px;color:var(--text-muted);padding:0 0 6px;text-align:right">
-					Renders the frame you have been cutting in. Pick a size to override it here only.
-				</div>
+				{@render hint('Renders the frame you have been cutting in. Pick a size to override it here only.')}
 			{/if}
 			{#if customRes}
 				<div style="display:flex;align-items:center;gap:8px;padding:4px 0;justify-content:flex-end">
-					<input
-						type="number"
-						min="2"
-						step="2"
-						value={opts.resolution?.[0] ?? 1920}
-						onchange={(e) => patch({ resolution: [parseInt(e.currentTarget.value) || 1920, opts.resolution?.[1] ?? 1080] })}
-						style="{inputCss};width:90px;text-align:right"
-					/>
-					<span style="color:var(--text-muted)">×</span>
-					<input
-						type="number"
-						min="2"
-						step="2"
-						value={opts.resolution?.[1] ?? 1080}
-						onchange={(e) => patch({ resolution: [opts.resolution?.[0] ?? 1920, parseInt(e.currentTarget.value) || 1080] })}
-						style="{inputCss};width:90px;text-align:right"
-					/>
+					{@render sideField('Custom width in pixels', 0)}
+					<span aria-hidden="true" style="color:var(--text-muted)">×</span>
+					{@render sideField('Custom height in pixels', 1)}
 				</div>
+				{#if sizeNote}
+					<p id="export-size-note" role="status" style="font-size:12px;line-height:1.45;margin:0 0 6px;text-align:right;color:var(--warning)">{sizeNote}</p>
+				{/if}
 			{/if}
 			{#if opts.resolution}
 				{@render selectRow(
@@ -469,9 +488,7 @@
 					FITS.map((f) => ({ value: f.id, label: f.label })),
 					(v) => patch({ fit: v as Fit })
 				)}
-				<div style="font-size:12px;color:var(--text-muted);padding:0 0 6px;text-align:right">
-					{FITS.find((f) => f.id === (opts.fit ?? 'contain'))?.hint}
-				</div>
+				{@render hint(FITS.find((f) => f.id === (opts.fit ?? 'contain'))?.hint ?? '')}
 			{/if}
 			{/if}
 			{@render selectRow(
@@ -481,9 +498,7 @@
 				(v) => patch({ fps: v === 'source' ? null : parseFloat(v) })
 			)}
 			{#if !opts.fps && projectRate}
-				<div style="font-size:12px;color:var(--text-muted);padding:0 0 6px;text-align:right">
-					Renders at the delivery frame’s rate. Pick a rate to override it here only.
-				</div>
+				{@render hint('Renders at the delivery frame’s rate. Pick a rate to override it here only.')}
 			{/if}
 			{#if qualityOptions.length}
 				{@render selectRow(
@@ -497,11 +512,11 @@
 						if (v !== 'custom') patch({ rate_control: 'crf', crf: Number(v) });
 					}
 				)}
-				<p style="font-size:12px;color:var(--text-muted);margin:2px 0 0;line-height:1.45">Higher quality keeps more detail and makes a larger file.</p>
+				{@render hint('Higher quality keeps more detail and makes a larger file.')}
 			{:else if opts.video_codec === 'gif'}
-				<p style="font-size:12px;color:var(--text-muted);margin:2px 0 0">GIF quality follows the picture size and the palette settings in Advanced.</p>
+				{@render hint('GIF quality follows the picture size and the palette settings in Advanced.')}
 			{:else}
-				<p style="font-size:12px;color:var(--text-muted);margin:2px 0 0">This preset is a mastering format. Its profile is in Advanced.</p>
+				{@render hint('This preset is a mastering format. Its profile is in Advanced.')}
 			{/if}
 		{/if}
 		{#if showAudio}
@@ -514,14 +529,14 @@
 					LOUDNESS_TARGETS.map((t) => ({ value: t.id, label: t.label })),
 					(v) => patch(withLoudness(opts, v as LoudnessChoice))
 				)}
-				<p style="font-size:12px;color:var(--text-muted);margin:2px 0 0;line-height:1.45">{loudnessHint}</p>
+				{@render hint(loudnessHint)}
 				{#if loudness !== 'off'}
 					{@render toggleRow('Keep the dynamics', !!opts.loudness_static, (v) => patch({ loudness_static: v }))}
-					<p style="font-size:12px;color:var(--text-muted);margin:2px 0 0;line-height:1.45">
-						{opts.loudness_static
+					{@render hint(
+						opts.loudness_static
 							? 'Measures the mix first, then moves it by one gain and holds the true peak with a limiter — quiet and loud passages keep their distance. The export takes a little longer.'
-							: 'Off, the level is evened out as it plays (loudnorm), which narrows the gap between quiet and loud passages.'}
-					</p>
+							: 'Off, the level is evened out as it plays (loudnorm), which narrows the gap between quiet and loud passages.'
+					)}
 				{/if}
 			{/if}
 		{/if}
@@ -576,7 +591,7 @@
 					(v) => patch({ prores_profile: Number(v) })
 				)}
 			{:else if opts.video_codec === 'gif'}
-				<div style="font-size:12px;color:var(--text-muted);padding:4px 0">Quality is set by the palette and the resolution / fps below.</div>
+				{@render hint('Quality is set by the palette and the resolution / fps below.')}
 			{:else}
 				<!-- rate control segmented -->
 				<div style="display:flex;align-items:center;gap:8px;padding:4px 0">
@@ -601,14 +616,14 @@
 					{@render sliderRow('Quality (CRF)', opts.crf ?? vc.crf[2], { min: vc.crf[0], max: vc.crf[1], step: 1, digits: 0, neutral: vc.crf[2] }, (v) =>
 						patch({ crf: Math.round(v) })
 					)}
-					<div style="font-size:12px;color:var(--text-muted);padding:0 0 2px 98px">lower = higher quality &amp; larger file</div>
+					{@render hint('Lower means higher quality and a larger file.', 98)}
 				{:else if opts.rate_control === 'bitrate' || opts.rate_control === 'two_pass'}
 					{@render textRow('Target bitrate', opts.video_bitrate ?? '', 'e.g. 8M', (v) => patch({ video_bitrate: v }))}
 					{#if opts.rate_control === 'two_pass'}
-						<div style="font-size:12px;color:var(--text-muted);padding:0 0 2px 0">Two passes ≈ double the render time.</div>
+						{@render hint('Two passes ≈ double the render time.')}
 					{/if}
 				{:else if opts.rate_control === 'lossless'}
-					<div style="font-size:12px;color:var(--text-muted);padding:4px 0">Mathematically lossless — very large files.</div>
+					{@render hint('Mathematically lossless — very large files.')}
 				{/if}
 
 				{#if vc?.presets}
@@ -684,7 +699,7 @@
 						patch({ flac_compression: Math.round(v) })
 					)}
 				{:else}
-					<div style="font-size:12px;color:var(--text-muted);padding:4px 0">Uncompressed / lossless — no bitrate.</div>
+					{@render hint('Uncompressed / lossless — no bitrate.')}
 				{/if}
 				{@render selectRow(
 					'Sample rate',
@@ -729,18 +744,14 @@
 					{@render toggleRow('Embed captions as a subtitle track', !!opts.embed_captions, (v) => patch({ embed_captions: v }))}
 				{/if}
 				{@render toggleRow('Keep captions out of the picture', !!opts.skip_burned_captions, (v) => patch({ skip_burned_captions: v }))}
-				<div style="font-size:12px;color:var(--text-muted);padding:2px 0 4px;line-height:1.4">
-					Captions are drawn into the picture unless this is on. An embedded track is off until the viewer turns it
-					on, so with both a player shows the captions once; keep them out of the picture to deliver them only as a
-					track or a file.
-				</div>
+				{@render hint(
+					'Captions are drawn into the picture unless this is on. An embedded track is off until the viewer turns it on, so with both a player shows the captions once; keep them out of the picture to deliver them only as a track or a file.'
+				)}
 				{@render toggleRow('Write .srt beside the export', sidecar('srt'), (v) => toggleSidecar('srt', v))}
 				{@render toggleRow('Write .vtt beside the export', sidecar('vtt'), (v) => toggleSidecar('vtt', v))}
 			{/if}
 			{#if chapterCount > 0 && carriesChapters(opts.container)}
-				<div style="font-size:12px;color:var(--text-muted);padding:4px 0">
-					{chapterCount === 1 ? '1 chapter marker becomes' : `${chapterCount} chapter markers become`} the file's chapters.
-				</div>
+				{@render hint(`${chapterCount === 1 ? '1 chapter marker becomes' : `${chapterCount} chapter markers become`} the file's chapters.`)}
 			{/if}
 		{/if}
 
