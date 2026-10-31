@@ -1152,7 +1152,7 @@ impl RenderPlan {
             }
         }
         // `drawtext`'s `fontsize` is the frame's height times the overlay's size, rounded.
-        if caps.text {
+        if caps.text && !caps.text_sequence {
             let smallest = self
                 .overlays
                 .iter()

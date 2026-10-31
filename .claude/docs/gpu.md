@@ -562,13 +562,13 @@ the same shader blends on the RGB picture and `composite_yuv` refuses such a pla
 translucent colours, BT.709 and BT.2020, escapes, Cyrillic, missing glyphs, every size 3 to 24 px, a synthetic-bold border at 10 to 100 px (sentences, tight pairs, ligatures, translucent, boxed,
 at the edges, at eight quarter-pixel phases) and four installed faces (DejaVu Sans / Serif, Ubuntu, Ubuntu Mono; plain and bold at 11 to 40 px) — each asserting the
 sequence was recovered (`Raster::exact`), not the sum drawn. `the_text_pass_is_the_reference_blend_plane_by_plane` holds the shader to the reference on the compositor's own planes
-(0 differing samples, 9 frames, 5 overlays, among them a border); `motion_parity` holds the export's own planes to the compositor's for a
-thickened bold over a fade, moving and boxed (0 differing samples in 4 cases of 60 frames, `sum_fallbacks` unchanged); the `text/` parity cases hold the whole picture to the still, each against
+(0 differing samples, 9 frames, 6 overlays, among them a border and 9 px print); `motion_parity` holds the export's own planes to the compositor's for small print and a
+thickened bold over a fade, sliding and fading (0 differing samples in 8 cases of 60 frames, `sum_fallbacks` unchanged); the `text/` parity cases hold the whole picture to the still, each against
 the same picture without the text, as before. (The earlier allowances, two glyph-edge pixels at 0.1 s, 12 px text and the full-range pictures on 9.0, are the same in the picture and not in the planes.)
 
-*Refusals.* The plan (`Unsupported::Text*`) no longer refuses a **bold request in a font with no bold face** (`TextBorder`) when the caps have
-`text_sequence`, which `Compositor::caps` sets once `text::model()` knows the build's layout; on a build that is neither layout it stays refused and a text the plan draws is
-the one mask of the sum, as before (`Raster::exact` false, `text::sum_fallbacks`). A **font under 12 px** (`TextTooSmall`) is refused still: the sequence reproduces it (`tests/text.rs`, 3 to 24 px, 0 differing samples) but no compositor parity case holds it yet. What `seq::sequence` cannot reproduce exactly is `GpuError::Unsupported` for the frame (FFmpeg draws it); where the
+*Refusals.* The plan (`Unsupported::Text*`) no longer refuses a **bold request in a font with no bold face** (`TextBorder`) nor a **font under 12 px** (`TextTooSmall`) when the caps have
+`text_sequence`, which `Compositor::caps` sets once `text::model()` knows the build's layout; on a build that is neither layout both stay refused and a text the plan draws is
+the one mask of the sum, as before (`Raster::exact` false, `text::sum_fallbacks`). What `seq::sequence` cannot reproduce exactly is `GpuError::Unsupported` for the frame (FFmpeg draws it); where the
 old mask was exact enough (no border, 12 px and up) the sum is blended instead and counted. A rasterisation that fails (or a colour FFmpeg cannot read) is `GpuError::Unsupported` for the
 frame. **Colour fonts**: `drawtext` loads glyphs without `FT_LOAD_COLOR` and has no BGRA path — a CBDT font (Noto Color Emoji) is a hard
 error on 6.1.1 (a segfault) and 9.0.2 at every size, so there is no colour glyph to draw as a silhouette; a COLR font is drawn by
@@ -942,9 +942,9 @@ format unrecorded, a translucent odd layer, a moving zoom behind a rotation, an 
 each of which FFmpeg still renders (and a fade to black or white on a translucent layer, a dip to white on a rotated, letterboxed, odd, resized or non-`yuv420p` layer or beside a black fade, a fade on a full-range picture under FFmpeg 9), **transitions** (`transition/`, `transition-kind/`, `fade/`: every kind and a clip's own fades in a still, see
 above), **a moving zoom last, masks and effects** (`zoom/`, `zoom+mask/`, `mask/`, `effect/`, and `effect-planes/`: the blur, sharpen, tables and vignette plane by plane against the real filters, all sizes), and **text** (the `text/` family: the app's title and
 caption styles, positions and edges, boxes, colours, sizes, keyframed and overlapping overlays, escapes, installed fonts,
-over every kind of picture, with no layer, and the text it must refuse, each held to the same picture without the text; see
+over every kind of picture, with no layer, small print and a thickened bold, and the text it must refuse, each held to the same picture without the text; see
 "Text" above). The table
-holds 822 rows on FFmpeg 6.1.1 (775 on the pinned 9.0.2 the Windows and macOS bundles ship, where the mixed-tag stacks are asserted refused instead of compared; CI runs the harness without `--nocapture`, so it keeps no report); on 6.1.1 152 rows are `text/`, its
+held 822 rows on FFmpeg 6.1.1 before the small-print and synthetic-bold cases (775 on the pinned 9.0.2 the Windows and macOS bundles ship, where the mixed-tag stacks are asserted refused instead of compared; CI runs the harness without `--nocapture`, so it keeps no report); on 6.1.1 152 rows are `text/`, its
 controls included, 191 the transitions, fades and dips and 184 the zoom, mask, effect and chroma key cases, plus the plane-level scaler (75), effect (108) and chroma key alpha (12) runs, all passing strictly. A failing case writes the reference, GPU and diff images to `target/parity/`
 (`KERF_PARITY_KEEP=1` keeps them for passing ones; `KERF_PARITY_EXPLORE=1` prints
 everything and fails nothing); every run writes `target/parity/report.txt`. The tests of a binary run in parallel on one compositor, so a fixture they share is written once and renamed into place (`tests/common`, `write_fixture`: the grades' `.cube` files): `std::fs::write` truncates first, and a plan or an FFmpeg that read the file in that window found it empty ("no LUT_3D_SIZE"), left the LUT out and drew the frame without it (one frame of `grade/keyed position` at Y 11 / UV 8, intermittent in CI, while FFmpeg's export and the GPU were each deterministic).
@@ -997,9 +997,9 @@ webcam bubble, a 4K thumbnail), T23a-e one teaser delivered as ProRes, GIF, lanc
 `travel`, `tail`, `keyed_opacity`, `keyed_color`, `keyed_zoom`, `mask`, `text` (drawn under `CAPS`), `no_picture` (the project keeps
 an audio-only asset off a video track), `text_without_font` (the shipped font cannot be written), `unmeasured_policy` (the probe
 cannot tell), and per build `grade` (kernels match) or `grade_with` (kernels differ), and under
-`FixedBt601` `mixed_matrices`, `matrix_unknown`, `rgb_in_stack`, `full_range_cut`, `graded_in_full_range_stack`; `text_border`
-is drawn once `text::model()` has probed this FFmpeg's `drawtext` (the header prints the layout, `Compositor::caps_with(kernels, layout)`;
-it needs an installed family without a bold face to be built at all).
+`FixedBt601` `mixed_matrices`, `matrix_unknown`, `rgb_in_stack`, `full_range_cut`, `graded_in_full_range_stack`; `text_border` and `text_too_small`
+are drawn once `text::model()` has probed this FFmpeg's `drawtext` (the header prints the layout, `Compositor::caps_with(kernels, layout)`;
+`text_border` needs an installed family without a bold face to be built at all).
 
 **`tests/fate_corpus.rs`** (`#[ignore]`d, and `KERF_FATE=1`: CI's parity job runs every ignored test and this one needs a network, so
 without the variable it skips with a message; `ffmpeg`, `ffprobe`, `curl`, no adapter) is hostile input from FFmpeg's FATE sample

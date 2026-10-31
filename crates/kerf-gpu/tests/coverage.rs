@@ -2589,10 +2589,7 @@ fn why_unreached(
         {
             "FixedBt601: this FFmpeg composites every stack as BT.601, so there is nothing to negotiate"
         }
-        "text_border" if layout.is_some() && regular_only_family().is_none() => {
-            "no installed font family without a bold face (drawn where one is: this FFmpeg's `drawtext` layout is one the compositor takes apart)"
-        }
-        "text_border" if layout.is_some() => {
+        "text_border" | "text_too_small" if layout.is_some() => {
             "drawn: this FFmpeg's `drawtext` layout is one the compositor takes apart (text::model), so the bitmaps are blended in turn"
         }
         "text_border" if regular_only_family().is_none() => "no installed font family without a bold face",

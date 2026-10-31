@@ -469,12 +469,12 @@
     timeline's overlay at the same time) and `text_raster_graph` the graph the compositor rasterises it with (same options and
     position, white on black in `rgb24`, parts `Glyphs` — a synthetic border drawn white in it — and `Box`); `text_piece_filter` /
     `TextPiece` is one piece of the same look (a prefix of the text, one glyph unit, a box) with the caller's colours and position, and
-    `text_as_drawn` the characters `drawtext` is given: what the compositor measures and takes the bitmaps apart with. Refused: `Text` (no `caps.text`), `TextWithoutFont`,
-    **`TextTooSmall(px)`** (the smallest overlay's `fontsize`, `round(height * size)`, under `MIN_TEXT_PX` = 12, judged at the render size by `reasons`, not the size-free half:
-    3 to 11 px text is bitmaps sharing samples all along the line) and, **only without `caps.text_sequence`** (a compositor that blends the glyph bitmaps in turn, as `drawtext` does,
-    sets it where it can take this build's layout apart, `gpu.md`), **`TextBorder`** (`synthetic_bold`: a bold request in a font with no bold face — only a *named* family; the
-    default has one: its bitmaps overlap along every letter gap, where the blend of their sum is not the blends in turn). With it the border is drawn, and what the compositor
-    cannot reproduce exactly (a tab, a glyph unit it cannot take apart) is refused by the render (`GpuError::Unsupported`), not the plan.
+    `text_as_drawn` the characters `drawtext` is given: what the compositor measures and takes the bitmaps apart with. Refused: `Text` (no `caps.text`), `TextWithoutFont`, and
+    **only without `caps.text_sequence`** (a compositor that blends the glyph bitmaps in turn, as `drawtext` does, sets it where it can take this build's layout apart,
+    `gpu.md`): **`TextBorder`** (`synthetic_bold`: a bold request in a font with no bold face — only a *named* family; the default has one: its bitmaps overlap along every
+    letter gap, where the blend of their sum is not the blends in turn) and **`TextTooSmall(px)`** (the smallest overlay's `fontsize`, `round(height * size)`, under
+    `MIN_TEXT_PX` = 12, judged at the render size by `reasons`, not the size-free half: 3 to 11 px text is bitmaps sharing samples all along the line). With it both are drawn,
+    and what the compositor cannot reproduce exactly (a tab, a glyph unit it cannot take apart) is refused by the render (`GpuError::Unsupported`), not the plan.
   - **Animated SVG titles** (`Timeline.svg_overlays`): resvg draws them and FFmpeg overlays the pictures, so no compositor pass draws one and
     none ever will without a parity case. The `Planner` keeps their windows and `RenderPlan.svg` (`Vec<Uuid>`) names the ones on screen at a frame,
     live like a text overlay (`start <= t < end` in a Still, `<= end` in Motion: the graph's `between`); `reasons` pushes **`Unsupported::Svg`**

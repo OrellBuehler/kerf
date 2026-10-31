@@ -1579,8 +1579,9 @@ fn regular_only_family() -> Option<String> {
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn text_whose_bitmaps_share_samples_in_an_export_frame() {
     // `drawtext` blends each glyph bitmap in turn: a synthetic-bold border's bitmaps overlap along every
-    // letter gap. The export's own planes are held to the compositor's, to the level, over video, inside
-    // fades and with a moving title.
+    // letter gap and print under 12 px shares samples (and chroma blocks) all along the line. The export's
+    // own planes are held to the compositor's, to the level, over video, inside fades and with a moving
+    // title.
     let m = media();
     let one = std::slice::from_ref(&m.testsrc);
     let summed = kerf_gpu::text::sum_fallbacks();
@@ -1596,6 +1597,26 @@ fn text_whose_bitmaps_share_samples_in_an_export_frame() {
         pos_y,
         opacity,
     };
+    // Print and a channel handle, 5 to 11 px at the 360 px the clip is.
+    for (name, size, bg) in [
+        ("print 5 px", 5.0, None),
+        ("print 9 px", 9.0, None),
+        ("handle 11 px, boxed", 11.0, Some("black@0.5")),
+    ] {
+        let mut tl = base();
+        let mut o = kerf_core::TextOverlay::new("@kerf.studio  *Results vary. Terms apply.", 0.2, 1.8);
+        (o.size, o.pos_x, o.pos_y, o.bg) = (size / 360.0, 0.37, 0.93, bg.map(String::from));
+        o.color = "white@0.8".into();
+        tl.overlays.push(o);
+        run(&format!("text/{name}, over a fade"), &tl, one, 30.0, 2.0, EXACT);
+    }
+    // A caption fading in and sliding up, small and thickened.
+    let mut tl = base();
+    let mut o = kerf_core::TextOverlay::new("Sliding, fading: fi ffi", 0.1, 1.9);
+    o.size = 10.0 / 360.0;
+    o.keyframes = vec![key(0.0, 0.9, 0.0), key(0.5, 0.8, 1.0), key(1.7, 0.8, 1.0)];
+    tl.overlays.push(o);
+    run("text/small, sliding and fading", &tl, one, 30.0, 2.0, EXACT);
     match regular_only_family() {
         None => eprintln!("SKIPPED the synthetic-bold export cases: every installed family has a bold face"),
         Some(family) => {

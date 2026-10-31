@@ -2983,14 +2983,14 @@ mod tests {
         assert_eq!(small.reasons(&mask_only, size), vec![Unsupported::TextTooSmall(11)]);
         small.overlays[0].size = 11.6 / f64::from(h);
         assert!(small.reasons(&mask_only, size).is_empty());
-        // A compositor that blends the bitmaps in turn (`text_sequence`) draws the border (the small text stays refused).
+        // A compositor that blends the bitmaps in turn (`text_sequence`) draws both.
         assert!(
             thick.reasons(&sequence, size).is_empty(),
             "{:?}",
             thick.reasons(&sequence, size)
         );
         small.overlays[0].size = 11.4 / f64::from(h);
-        assert_eq!(small.reasons(&sequence, size), vec![Unsupported::TextTooSmall(11)]);
+        assert!(small.reasons(&sequence, size).is_empty());
     }
 
     #[test]

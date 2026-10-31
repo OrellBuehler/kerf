@@ -4096,6 +4096,30 @@ fn regular_only_family() -> Option<String> {
 
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn small_print_is_drawn_as_ffmpeg_draws_it() {
+    // Under 12 px every glyph bitmap shares samples (and 2x2 chroma blocks) with its neighbours, and
+    // `drawtext` blends them in turn: the compositor blends the same bitmaps in the same order, so the
+    // picture is `drawtext`'s to the sample (`tests/text.rs` and the plane-level case) and the whole
+    // frame is the control's within the usual conversion bias.
+    let m = media();
+    let one = std::slice::from_ref(&m.testsrc);
+    for px in [4.0, 7.0, 9.0, 11.0, 12.0] {
+        let mut o = overlay("*Results vary. Terms apply. @kerf.studio", 0.0, 2.0);
+        (o.size, o.pos_x, o.pos_y) = (px / 360.0, 0.37, 0.94);
+        o.color = "white@0.7".into();
+        let tl = with_text(timeline(vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)]], None), vec![o]);
+        let plan = RenderPlan::at(&tl, one, &ExportOptions::default(), 0.5, policy()).expect("plan");
+        assert!(reasons(&plan, plan.size(u32::MAX)).is_empty(), "{px} px is drawn");
+        check_text(&format!("text/small-{px}px"), &tl, one, &[0.5]);
+        let mut boxed = overlay("Cmd + K", 0.0, 2.0);
+        (boxed.size, boxed.pos_x, boxed.pos_y, boxed.bg) = (px / 360.0, 0.5, 0.1, Some("black@0.5".into()));
+        let tl = with_text(timeline(vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)]], None), vec![boxed]);
+        check_text(&format!("text/small-{px}px-boxed"), &tl, one, &[0.5]);
+    }
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn bold_in_a_face_with_no_bold_is_drawn_as_ffmpeg_draws_it() {
     let Some(family) = regular_only_family() else {
         eprintln!("SKIPPED the synthetic-bold cases: every installed family has a bold face (the plane-level case still runs)");
@@ -4155,10 +4179,13 @@ fn the_text_pass_is_the_reference_blend_plane_by_plane() {
             opacity: 1.0,
         },
     ];
-    // One the plan used to refuse, whose bitmaps share samples and chroma blocks: a thickened bold (given the
-    // border the plan would give a face with no bold).
+    // The two the plan used to refuse, whose bitmaps share samples and chroma blocks: a thickened bold
+    // (named below, and given the border the plan would give a face with no bold) and print under 12 px.
     let mut bold = overlay("Bold without a bold face, fi ffi", 0.0, 2.0);
     (bold.size, bold.pos_x, bold.pos_y, bold.bg) = (0.08, 0.5, 0.78, Some("black@0.4".into()));
+    let mut print = overlay("*Results vary. Terms apply. @kerf.studio", 0.0, 2.0);
+    (print.size, print.pos_x, print.pos_y) = (0.027, 0.31, 0.95);
+    print.color = "white@0.7".into();
     for (name, asset) in [
         ("testsrc2", &m.testsrc),
         ("bt709 bars", &m.bars709),
@@ -4166,7 +4193,14 @@ fn the_text_pass_is_the_reference_blend_plane_by_plane() {
     ] {
         let tl = with_text(
             timeline(vec![vec![clip(asset, 0.0, 2.0, 0.0)]], None),
-            vec![title.clone(), caption.clone(), solid.clone(), fading.clone(), bold.clone()],
+            vec![
+                title.clone(),
+                caption.clone(),
+                solid.clone(),
+                fading.clone(),
+                bold.clone(),
+                print.clone(),
+            ],
         );
         for t in [0.2, 0.6, 1.4] {
             let mut plan =
@@ -4224,38 +4258,33 @@ fn text_the_gpu_cannot_reproduce_is_refused() {
     let mut plan = RenderPlan::at(&tl, assets, &ExportOptions::default(), 0.5, policy()).expect("plan");
     let size = plan.size(u32::MAX);
     assert!(reasons(&plan, size).is_empty(), "the control is drawn");
-    // Bold in a face with no bold (the plan marks it) was refused for as long as text was one mask of the
-    // sum of the glyphs' bitmaps; `drawtext` blends them in turn, and so does the compositor now
-    // (`text_sequence`), on a build whose layout it can take apart (all but a machine whose FFmpeg is neither
-    // of the two it knows: the caps then say so and the plan refuses it again).
+    // Bold in a face with no bold (the plan marks it) and print under 12 px were refused for as long as
+    // text was one mask of the sum of the glyphs' bitmaps; `drawtext` blends them in turn, and so does the
+    // compositor now (`text_sequence`), on a build whose layout it can take apart (all but a machine whose
+    // FFmpeg is neither of the two it knows: the caps then say so and the plan refuses both again).
     let with_sequence = compositor().caps().text_sequence;
     plan.overlays[0].synthetic_bold = true;
     assert_eq!(reasons(&plan, size).is_empty(), with_sequence, "{:?}", reasons(&plan, size));
+    plan.overlays[0].size = 0.03;
+    assert_eq!(reasons(&plan, size).is_empty(), with_sequence, "{:?}", reasons(&plan, size));
     if with_sequence {
-        compositor().render_plan(&plan, size).expect("a bold with a border is drawn");
+        compositor()
+            .render_plan(&plan, size)
+            .expect("a 11 px bold with a border is drawn");
     } else {
         let why = reasons(&plan, size).join("; ");
-        assert!(why.contains("no bold face"), "{why}");
+        assert!(why.contains("no bold face") && why.contains("11 px font"), "{why}");
         let err = compositor().render_plan(&plan, size).expect_err("the render should refuse");
         assert!(matches!(err, kerf_gpu::GpuError::Unsupported(_)), "{err}");
     }
     plan.overlays[0].synthetic_bold = false;
-    // Text under 12 px is all shared pixels: refused (this step).
-    plan.overlays[0].size = 0.03;
-    let why = reasons(&plan, size).join("; ");
-    assert!(why.contains("11 px font"), "{why}");
-    let err = compositor().render_plan(&plan, size).expect_err("the render should refuse");
-    assert!(
-        matches!(&err, kerf_gpu::GpuError::Unsupported(w) if w.contains("11 px font")),
-        "{err}"
-    );
     plan.overlays[0].size = 0.034;
     assert!(reasons(&plan, size).is_empty(), "12 px and up is drawn");
     // A font file the plan cannot name (the default could not be written): FFmpeg's own default font.
     plan.overlays[0].font_file = None;
     let why = reasons(&plan, size).join("; ");
     assert!(why.contains("no font file"), "{why}");
-    eprintln!("refused/text: small text, no font file; border drawn: {with_sequence}");
+    eprintln!("refused/text: no font file; border and small text drawn: {with_sequence}");
 }
 
 #[test]
