@@ -51,3 +51,12 @@ Plan: `.claude/plans/gpu-exact-parity.md`. Newest entries last.
   orientation (`Landscape_5.jpg`) and the 9.0.2 clean-aperture crop are "draws" in the plan but
   refused at runtime (the ledger over-counts them); bare H.264 gives no frame at `-ss 0`;
   `gray16le` JPEG draws without a parity case.
+- **D1 final: `+bitexact`, not `+accurate_rnd+bitexact`, on every scale taking the delivery's scaler
+  flags.** `bitexact` alone makes 4:2:0 resizes equal the C path on every scaler and CPU level and leaves
+  same-size scales on the unscaled path (byte-identical for rgb24, argb, gbrp, yuva420p, 10-bit, nv12);
+  `accurate_rnd` moved same-size yuv420p -> rgb24 by up to 108. No resize gating: previews of proxied clips
+  scale at sizes the builder cannot know. Non-4:2:0 sources (RGB / 4:4:4 / 4:2:2) converted inside the fit
+  scale stay CPU-dependent with either flag set (1 level): matched per machine by a runtime probe, refused
+  where it differs.
+- **WP-RGB (D4) implemented:** Still rows exact in RGB 23 -> 524 / 783 (6.1.1), 19 -> 481 / 734 (9.0.2);
+  the conversion alone is 0 of 179 M samples on both builds. New refusal `StillCanvas` (< 10 rows).
