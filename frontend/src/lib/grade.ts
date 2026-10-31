@@ -2,7 +2,8 @@
  * editor draws the curve the export renders and the wheels say the numbers `colorbalance` gets.
  * Keep the two in step: `grade.test.ts` replays the Rust tests and pins the same numbers. */
 
-import type { ClipLut, CurvePoint, Curves, Grade, Wheel, Wheels } from './types';
+import { clipById } from './link-groups';
+import type { ClipLut, CurvePoint, Curves, Grade, Timeline, Wheel, Wheels } from './types';
 
 /** The most points one curve may have. */
 export const MAX_CURVE_POINTS = 16;
@@ -261,4 +262,45 @@ export function nearestPoint(points: readonly CurvePoint[], x: number, y: number
 /** The curves with one channel's points replaced. */
 export function withChannel(curves: Curves | null | undefined, channel: CurveChannel, points: CurvePoint[]): Curves {
 	return { ...(curves ?? {}), [channel]: points };
+}
+
+// ---- writing a grade to the clip an edit began on ----------------------------
+
+/** The grade to write for clip `clipId`: its grade *as the timeline has it now*, normalised, with `patch`
+ *  laid over it. A grade field commits on a blur, a release or a timer, and by then the selection may have
+ *  moved and the section been re-rendered with another clip's grade — building the next grade from what the
+ *  panel shows would write that clip's curves, wheels and LUT onto this one. `patch` returns what changes
+ *  (`null` for nothing); the result is `null` too when there is nothing to write or the clip is gone. */
+export function gradeWith(timeline: Timeline, clipId: string, patch: (grade: Grade) => Partial<Grade> | null): Grade | null {
+	const clip = clipById(timeline, clipId);
+	if (!clip) return null;
+	const grade = normalizeGrade(clip.grade);
+	const change = patch(grade);
+	return change ? { ...grade, ...change } : null;
+}
+
+const sameCurve = (a: readonly CurvePoint[], b: readonly CurvePoint[]) =>
+	JSON.stringify(normalizeCurve(a)) === JSON.stringify(normalizeCurve(b));
+
+/** One channel's points replaced; `null` when they are what the clip already has. */
+export function curveEdit(timeline: Timeline, clipId: string, channel: CurveChannel, points: readonly CurvePoint[]): Grade | null {
+	return gradeWith(timeline, clipId, (g) =>
+		sameCurve(points, g.curves?.[channel] ?? []) ? null : { curves: withChannel(g.curves, channel, normalizeCurve(points)) }
+	);
+}
+
+/** One range's wheel with `change` laid over what the clip has; `null` when that leaves it where it is. */
+export function wheelEdit(timeline: Timeline, clipId: string, range: WheelRange, change: Partial<Wheel>): Grade | null {
+	return gradeWith(timeline, clipId, (g) => {
+		const wheels = g.wheels ?? NEUTRAL_WHEELS;
+		const now = normalizeWheel(wheels[range]);
+		const next = normalizeWheel({ ...wheels[range], ...change });
+		if (next.x === now.x && next.y === now.y && next.lightness === now.lightness) return null;
+		return { wheels: { ...wheels, [range]: next } };
+	});
+}
+
+/** The LUT replaced by `next(what the clip has)`. */
+export function lutEdit(timeline: Timeline, clipId: string, next: (lut: ClipLut | null) => ClipLut | null): Grade | null {
+	return gradeWith(timeline, clipId, (g) => ({ lut: next(g.lut ?? null) }));
 }

@@ -2,9 +2,12 @@ import { describe, expect, test } from 'bun:test';
 import {
 	MAX_CURVE_POINTS,
 	applyCurves,
+	curveEdit,
 	curveShape,
 	evalShape,
 	gradeIsIdentity,
+	gradeWith,
+	lutEdit,
 	lutName,
 	addPoint,
 	movePoint,
@@ -12,10 +15,11 @@ import {
 	normalizeCurve,
 	normalizeGrade,
 	normalizeWheel,
+	wheelEdit,
 	wheelNeutral,
 	wheelRgb
 } from './grade';
-import type { CurvePoint } from './types';
+import type { Clip, CurvePoint, Grade, Timeline } from './types';
 
 // The Rust tests of `model/grade.rs`, replayed: the editor draws the curve the export renders.
 
@@ -119,5 +123,108 @@ describe('the curve editor', () => {
 	test('the nearest point in reach is the one picked', () => {
 		expect(nearestPoint(base, 0.48, 0.52, 0.05)).toBe(1);
 		expect(nearestPoint(base, 0.3, 0.3, 0.05)).toBe(-1);
+	});
+});
+
+// ---- an edit goes to the clip it began on --------------------------------------
+
+describe('writing a grade to the clip an edit began on', () => {
+	// Clip A is graded one way, clip B another. A field of A commits after the selection has moved to B
+	// (a typed LUT intensity is written by the blur the click on B causes), so the grade must be built
+	// from A's own, never from what the panel shows (B's).
+	const wheel = (x: number, y: number, lightness = 0) => ({ x, y, lightness });
+	const gradeA: Grade = {
+		curves: { master: pts([[0, 0.1], [1, 1]]) },
+		wheels: { shadows: wheel(0.2, 0.1), midtones: wheel(0, 0), highlights: wheel(0, 0) },
+		lut: { path: '/luts/a.cube', intensity: 0.5 }
+	};
+	const gradeB: Grade = {
+		curves: { red: pts([[0, 0], [0.5, 0.8], [1, 1]]) },
+		wheels: { shadows: wheel(-0.5, 0.4), midtones: wheel(0.3, 0.3), highlights: wheel(0, 0, 0.2) }
+	};
+	const mk = (id: string, grade?: Grade): Clip => ({
+		id,
+		asset_id: 'a',
+		source_in: 0,
+		source_out: 4,
+		timeline_start: 0,
+		volume: 1,
+		fade_in: 0,
+		fade_out: 0,
+		grade
+	});
+	const timeline = (): Timeline => ({
+		tracks: [
+			{ id: 't', kind: 'video', name: 'V1', clips: [mk('a', gradeA), mk('b', gradeB), mk('plain')] }
+		]
+	});
+
+	test('the grade is the clip’s own, normalised, with the patch laid over it', () => {
+		const g = gradeWith(timeline(), 'a', () => ({ wheels: null }));
+		expect(g).toEqual({ curves: normalizeGrade(gradeA).curves, lut: { path: '/luts/a.cube', intensity: 0.5 }, wheels: null });
+		// A clip with no grade starts from nothing.
+		expect(gradeWith(timeline(), 'plain', () => ({ lut: { path: '/l.cube', intensity: 1 } }))).toEqual({ lut: { path: '/l.cube', intensity: 1 } });
+	});
+
+	test('a clip that is gone, or a patch with nothing to say, writes nothing', () => {
+		expect(gradeWith(timeline(), 'gone', () => ({ wheels: null }))).toBeNull();
+		expect(gradeWith(timeline(), 'a', () => null)).toBeNull();
+	});
+
+	test('a LUT intensity typed on A and committed after B is selected leaves B’s grade out of A', () => {
+		const next = lutEdit(timeline(), 'a', (lut) => (lut ? { ...lut, intensity: 0.8 } : null));
+		expect(next?.lut).toEqual({ path: '/luts/a.cube', intensity: 0.8 });
+		expect(next?.curves).toEqual(normalizeGrade(gradeA).curves);
+		expect(next?.wheels).toEqual(normalizeGrade(gradeA).wheels);
+		expect(JSON.stringify(next)).not.toContain('"red"');
+		// Clearing it, and choosing a file, keep the rest too.
+		expect(lutEdit(timeline(), 'a', () => null)).toEqual({ ...normalizeGrade(gradeA), lut: null });
+		expect(lutEdit(timeline(), 'a', (lut) => ({ path: '/luts/new.cube', intensity: lut?.intensity ?? 1 }))?.lut).toEqual({
+			path: '/luts/new.cube',
+			intensity: 0.5
+		});
+		// B has no LUT: a file chosen on B starts at full strength and does not take A's.
+		expect(lutEdit(timeline(), 'b', (lut) => ({ path: '/luts/new.cube', intensity: lut?.intensity ?? 1 }))?.lut).toEqual({
+			path: '/luts/new.cube',
+			intensity: 1
+		});
+	});
+
+	test('a curve is written onto the clip it began on, and nothing when that clip already has it', () => {
+		const tl = timeline();
+		const next = curveEdit(tl, 'a', 'green', pts([[0, 0], [0.5, 0.7], [1, 1]]));
+		expect(next?.curves?.green).toEqual(pts([[0, 0], [0.5, 0.7], [1, 1]]));
+		expect(next?.curves?.master).toEqual(pts([[0, 0.1], [1, 1]]));
+		expect(next?.curves?.red).toBeUndefined();
+		expect(next?.lut).toEqual({ path: '/luts/a.cube', intensity: 0.5 });
+		// A's own master curve again: nothing to write. B's red curve is B's.
+		expect(curveEdit(tl, 'a', 'master', pts([[0, 0.1], [1, 1]]))).toBeNull();
+		expect(curveEdit(tl, 'a', 'red', pts([[0, 0], [0.5, 0.8], [1, 1]]))).not.toBeNull();
+		expect(curveEdit(tl, 'b', 'red', pts([[0, 0], [0.5, 0.8], [1, 1]]))).toBeNull();
+		// Straightening a channel the clip does not curve is not an edit; one it does is.
+		expect(curveEdit(tl, 'a', 'blue', [])).toBeNull();
+		expect(curveEdit(tl, 'a', 'master', [])?.curves?.master).toEqual([]);
+	});
+
+	test('a wheel keeps the clip’s other wheels and the parts of it that were not moved', () => {
+		const tl = timeline();
+		// The lightness slider of A's shadows, released after B was selected: A's puck stays where it was.
+		const light = wheelEdit(tl, 'a', 'shadows', { lightness: 0.4 });
+		expect(light?.wheels?.shadows).toEqual(wheel(0.2, 0.1, 0.4));
+		expect(light?.wheels?.midtones).toEqual(wheel(0, 0));
+		expect(light?.curves).toEqual(normalizeGrade(gradeA).curves);
+		expect(light?.lut).toEqual({ path: '/luts/a.cube', intensity: 0.5 });
+		// A puck moved on B's midtones: B's lightness, not A's, stays.
+		const puck = wheelEdit(tl, 'b', 'highlights', { x: 0.5, y: -0.5 });
+		expect(puck?.wheels?.highlights).toEqual(wheel(0.5, -0.5, 0.2));
+		expect(puck?.wheels?.shadows).toEqual(wheel(-0.5, 0.4));
+		// Where the wheel already is writes nothing; a clip with no wheels starts from neutral ones.
+		expect(wheelEdit(tl, 'a', 'shadows', { x: 0.2, y: 0.1 })).toBeNull();
+		expect(wheelEdit(tl, 'plain', 'midtones', { x: 0, y: 0 })).toBeNull();
+		expect(wheelEdit(tl, 'plain', 'midtones', { x: 0.3 })?.wheels).toEqual({
+			shadows: wheel(0, 0),
+			midtones: wheel(0.3, 0),
+			highlights: wheel(0, 0)
+		});
 	});
 });

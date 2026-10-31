@@ -23,6 +23,12 @@ export class FieldEdits<S, F extends object = HTMLElement> {
 		if (edit) edit.text = text;
 	}
 
+	/** The edit was abandoned (Escape put the field back): nothing typed, and no scope, is left for a late `change` — one WebKit
+	 *  may still fire on the blur — to write. `end` then reads the field as it is, like one that was never focused. */
+	drop(field: F): void {
+		this.#by.delete(field);
+	}
+
 	/** The field committed. `now` stands in for whatever was not seen: a field that was never focused
 	 *  first, or a checkbox or a select, which have no typed text and change at once. */
 	end(field: F, now: FieldEntry<S>): FieldEntry<S> {

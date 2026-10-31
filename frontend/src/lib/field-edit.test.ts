@@ -21,6 +21,16 @@ describe('FieldEdits', () => {
 		expect(edits.end(f, { scope: 'clip-a', text: 'Arial' })).toEqual({ scope: 'clip-a', text: 'Arial' });
 	});
 
+	test('an abandoned edit leaves nothing for a late commit: the field is read as it is', () => {
+		const edits = new FieldEdits<string, object>();
+		const f = field();
+		edits.focus(f, 'clip-a');
+		edits.input(f, '99');
+		edits.drop(f);
+		// Escape put the field back to what it showed (clip B's by now); a `change` that still comes reads that.
+		expect(edits.end(f, { scope: 'clip-b', text: '0.5' })).toEqual({ scope: 'clip-b', text: '0.5' });
+	});
+
 	test('a field that was never focused is read as it is now', () => {
 		const edits = new FieldEdits<string, object>();
 		const f = field();

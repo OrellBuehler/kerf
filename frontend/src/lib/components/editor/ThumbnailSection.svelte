@@ -3,6 +3,7 @@
 	// template) and never appear in it. Pick one, its frame (the playhead or a suggestion), its size, what of the
 	// video's own graphics the background keeps, and its layers; the preview is the engine's drawing of it, from
 	// the proxies. Every change is one `set_thumbnail` edit (a field on change, never per keystroke).
+	import { untrack } from 'svelte';
 	import Btn from './Btn.svelte';
 	import IconBtn from './IconBtn.svelte';
 	import Icon from './Icon.svelte';
@@ -23,6 +24,12 @@
 	let chosen = $state<string | null>(null);
 	const current = $derived(thumbnails.find((t) => t.id === chosen) ?? thumbnails[0] ?? null);
 	const off = $derived(editor.locked || editor.busy);
+	/** A range, a colour box and a select have no read-only, and a native `disabled` would drop the keyboard focus an edit in
+	 *  flight began in: while the cut is held, the press that would open or move one is swallowed and `aria-disabled` says why;
+	 *  a change that gets through anyway (a touch drag, an arrow key: it fires `change` per step) is put back by its handler. */
+	const swallow = (e: Event) => {
+		if (off) e.preventDefault();
+	};
 
 	const GRAPHICS: { value: VideoGraphics; label: string }[] = [
 		{ value: 'titles', label: 'Titles, no captions' },
@@ -67,7 +74,17 @@
 	$effect(() => {
 		const t = current;
 		void editor.timeline;
-		if (!t) return;
+		if (!t) {
+			// The last thumbnail was removed, perhaps mid-draw: the cleanup below has already ended that draw's say, so nothing
+			// would ever clear `drawing`, and the next thumbnail would open on the removed one's picture.
+			untrack(() => {
+				drawing = false;
+				previewError = null;
+				if (preview) URL.revokeObjectURL(preview);
+				preview = null;
+			});
+			return;
+		}
 		const key = JSON.stringify(t);
 		let gone = false;
 		const timer = setTimeout(async () => {
@@ -91,6 +108,11 @@
 			gone = true;
 			clearTimeout(timer);
 		};
+	});
+
+	// The picture on screen is a blob URL this section made: let go of it when the section goes.
+	$effect(() => () => {
+		if (preview) URL.revokeObjectURL(preview);
 	});
 
 	let suggestions = $state<SuggestedFrame[]>([]);
@@ -157,10 +179,23 @@
 			style="position:relative;width:100%;max-height:280px;aspect-ratio:{current.width} / {current.height};margin:0 auto;background:var(--surface-inset);border:var(--line-width) solid var(--border-subtle);border-radius:var(--radius-sm);overflow:hidden;display:flex;align-items:center;justify-content:center"
 		>
 			{#if preview}
-				<img src={preview} alt="Thumbnail “{current.name}”" style="width:100%;height:100%;object-fit:contain;opacity:{drawing ? 0.7 : 1}" />
-			{:else}
+				<img
+					src={preview}
+					alt="Thumbnail “{current.name}”"
+					style="width:100%;height:100%;object-fit:contain;opacity:{previewError ? 0.35 : drawing ? 0.7 : 1}"
+				/>
+			{/if}
+			{#if previewError}
+				<!-- A later failure is said over the last good picture, which is dimmed: it no longer shows what the thumbnail is. -->
+				<span
+					role="alert"
+					data-preview-error
+					style="position:absolute;inset:0;display:flex;align-items:center;justify-content:center;padding:8px;text-align:center;color:var(--danger);background:color-mix(in srgb, var(--surface-inset) 70%, transparent)"
+					>{previewError}</span
+				>
+			{:else if !preview}
 				<span style="padding:8px;text-align:center;color:var(--text-muted)"
-					>{previewError ?? (drawing ? 'Drawing…' : 'The thumbnail is drawn in the desktop app.')}</span
+					>{drawing ? 'Drawing…' : 'The thumbnail is drawn in the desktop app.'}</span
 				>
 			{/if}
 		</div>
@@ -172,6 +207,7 @@
 				style="flex:1"
 				value={current.name}
 				readonly={editor.locked}
+				aria-disabled={editor.locked || undefined}
 				onchange={(e) => change({ name: e.currentTarget.value })}
 			/>
 		</label>
@@ -233,8 +269,12 @@
 					style="flex:1"
 					aria-label="Where the crop is centred, {axis === 'focus_x' ? 'across' : 'down'} the frame"
 					value={axis === 'focus_x' ? current.focus_x : current.focus_y}
-					disabled={editor.locked}
-					onchange={(e) => change({ [axis]: Number(e.currentTarget.value) })}
+					aria-disabled={off || undefined}
+					onmousedown={swallow}
+					onchange={(e) => {
+						if (off) return void (e.currentTarget.value = String(axis === 'focus_x' ? current.focus_x : current.focus_y));
+						void change({ [axis]: Number(e.currentTarget.value) });
+					}}
 				/>
 			</label>
 		{/each}
@@ -258,6 +298,7 @@
 						aria-label="Headline"
 						value={layer.text.text}
 						readonly={editor.locked}
+						aria-disabled={editor.locked || undefined}
 						onchange={(e) => retext(layer, { text: e.currentTarget.value })}
 					></textarea>
 					<div style="display:flex;align-items:center;gap:6px">
@@ -268,14 +309,19 @@
 							aria-label="Subtitle"
 							value={layer.text.subtitle ?? ''}
 							readonly={editor.locked}
+							aria-disabled={editor.locked || undefined}
 							onchange={(e) => retext(layer, { subtitle: e.currentTarget.value })}
 						/>
 						<input
 							type="color"
 							aria-label="Headline colour"
 							value={swatchHex(layer.text.color)}
-							disabled={editor.locked}
-							onchange={(e) => retext(layer, { color: e.currentTarget.value })}
+							aria-disabled={off || undefined}
+							onclick={swallow}
+							onchange={(e) => {
+								if (off) return void (e.currentTarget.value = swatchHex(layer.text?.color ?? ''));
+								retext(layer, { color: e.currentTarget.value });
+							}}
 						/>
 					</div>
 				{:else if layer.template}
@@ -287,6 +333,7 @@
 								style="flex:1"
 								value={layer.template.values[c.id] ?? ''}
 								readonly={editor.locked}
+								aria-disabled={editor.locked || undefined}
 								onchange={(e) => editLayer(layer, { values: { [c.id]: e.currentTarget.value } })}
 							/>
 						</label>
@@ -308,11 +355,12 @@
 					style="flex:1"
 					aria-label="Add a template layer"
 					value=""
-					disabled={off}
+					aria-disabled={off || undefined}
+					onmousedown={swallow}
 					onchange={(e) => {
 						const id = e.currentTarget.value;
 						e.currentTarget.value = '';
-						if (id) void addLayer({ template_id: id, x: 0, y: 0, width: 1, height: 1 });
+						if (id && !off) void addLayer({ template_id: id, x: 0, y: 0, width: 1, height: 1 });
 					}}
 				>
 					<option value="">Add a template…</option>

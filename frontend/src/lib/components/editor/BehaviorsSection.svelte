@@ -13,6 +13,7 @@
 	import IconBtn from './IconBtn.svelte';
 	import Icon from './Icon.svelte';
 	import { editor } from '#lib/state.svelte';
+	import { FieldEdits } from '#lib/field-edit';
 	import { contextMenu } from '#lib/context-menu.svelte';
 	import { toast } from '#lib/notifications.svelte';
 	import { tip } from '#lib/tip';
@@ -24,8 +25,9 @@
 		bakeTip,
 		behaviorFields,
 		fieldValue,
-		parseSeed,
 		rowName,
+		seedEntry,
+		seedOf,
 		withField,
 		withSeed,
 		type FieldKey
@@ -114,11 +116,20 @@
 		}
 	}
 
-	/** The seed field takes whole numbers; anything else goes back to the seed it held. */
-	function commitSeed(e: Event & { currentTarget: HTMLInputElement }, at: Row, seed: number) {
-		const v = parseSeed(e.currentTarget.value);
-		e.currentTarget.value = String(v ?? seed);
-		if (v !== undefined && v !== seed) void setSeed(at, v);
+	/** What a seed field is editing: the row it took focus on and what was typed. Its `change` comes with the blur, and the
+	 *  click that blurs it is often the one that selects another clip: by then `clip` is that clip and the field has been
+	 *  re-rendered with its seed (`FieldEdits`). */
+	const seeds = new FieldEdits<Row, HTMLInputElement>();
+
+	/** The seed field takes whole numbers; anything else goes back to the seed it held. The seed is written to the row the
+	 *  field took focus on and compared with that row's own, as the timeline has it now; `at` and `seed` are the row the
+	 *  field is drawn for, which is what it shows afterwards. */
+	function commitSeed(el: HTMLInputElement, at: Row, seed: number) {
+		const { scope: began, text } = seeds.end(el, { scope: at, text: el.value });
+		const entry = seedEntry(text, seedOf(behaviorsOf(began.id)[began.index]));
+		const here = began.id === at.id && began.index === at.index;
+		el.value = String(entry !== null && here ? entry : seed);
+		if (entry !== null) void setSeed(began, entry);
 	}
 </script>
 
@@ -188,9 +199,12 @@
 						value={seed}
 						readonly={editor.locked}
 						aria-disabled={editor.locked || undefined}
-						onchange={(e) => commitSeed(e, at, seed)}
+						onfocus={(e) => seeds.focus(e.currentTarget, at)}
+						oninput={(e) => seeds.input(e.currentTarget, e.currentTarget.value)}
+						onchange={(e) => commitSeed(e.currentTarget, at, seed)}
 						onkeydown={(e) => {
 							if (e.key === 'Escape') {
+								seeds.drop(e.currentTarget);
 								e.currentTarget.value = String(seed);
 								e.currentTarget.blur();
 								e.stopPropagation();

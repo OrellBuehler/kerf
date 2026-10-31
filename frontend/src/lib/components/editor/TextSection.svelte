@@ -10,13 +10,14 @@
 	import Btn from './Btn.svelte';
 	import { onMount } from 'svelte';
 	import { editor } from '#lib/state.svelte';
+	import { FieldEdits } from '#lib/field-edit';
 	import { listTextAnimationCurves, listTextAnimationPresets } from '#lib/api';
 	import { tip } from '#lib/tip';
 	import { CURVE_PRESETS, TEXT_ANIMATION_PRESETS, checkAnimation, curveIdOf, hasMotion, presetOf, withMotionCurve } from '#lib/text-animation';
 	import { holdForPreview, report } from '#lib/ops';
 	import { say } from '#lib/template-actions';
 	import { appliedLine } from '#lib/template-ui';
-	import { boxWidthRefusal, isOutlined, titleTexts, type TitleText } from '#lib/title-text';
+	import { boxWidthRefusal, isOutlined, titleTextAt, titleTexts, type TitleText } from '#lib/title-text';
 	import type {
 		AnimationCurvePreset,
 		TemplateInstance,
@@ -50,23 +51,41 @@
 	let converting = $state(false);
 
 	/** What a text is called here: the label of a template control that sets it, else its id. */
-	const labelOf = (t: TitleText): string =>
-		o.template?.controls.find((c) => c.kind === 'text' && c.targets.some((x) => x.element === t.id))?.label ?? `#${t.id}`;
+	const labelOf = (t: TitleText, template: TemplateInstance | null | undefined = o.template): string =>
+		template?.controls.find((c) => c.kind === 'text' && c.targets.some((x) => x.element === t.id))?.label ?? `#${t.id}`;
 
-	/** A box field committed: one edit when the box changed, else the field shows the box again. */
-	async function commit(el: HTMLInputElement | HTMLSelectElement, t: TitleText, change: Partial<TextBox>) {
-		const id = o.id;
-		const name = o.name;
-		const back = () => {
-			if (!el.isConnected) return;
-			el.value = el instanceof HTMLSelectElement ? t.box.fit : t.box.width === null ? '' : String(t.box.width);
-		};
-		const next: TextBox = { ...t.box, ...change };
-		if (next.width === t.box.width && (next.fit === t.box.fit || next.width === null)) return back();
+	/** What a field is editing: the title and the text it took focus on, and what was typed into it. A box or a
+	 *  timing field commits with its blur, and the click that blurs it is often the one that selects another title:
+	 *  by then `o` is that title and the field has been re-rendered with its value (`FieldEdits`). */
+	interface Edit {
+		id: string;
+		element: string;
+	}
+	const edits = new FieldEdits<Edit, HTMLInputElement>();
+	const noteFocus = (e: { currentTarget: HTMLInputElement }, t: TitleText) => edits.focus(e.currentTarget, { id: o.id, element: t.id });
+	const noteTyped = (e: { currentTarget: HTMLInputElement }) => edits.input(e.currentTarget, e.currentTarget.value);
+
+	/** The text `at` names as the cut has it now (the title may have been edited, or gone, since the field took focus). */
+	const textAt = (at: Edit) => titleTextAt(editor.timeline, at.id, at.element);
+
+	/** The box field shows `t`'s box: the text as it is drawn now, i.e. the selection's. */
+	const boxShown = (el: HTMLInputElement | HTMLSelectElement, t: TitleText) => {
+		if (el.isConnected) el.value = el instanceof HTMLSelectElement ? t.box.fit : t.box.width === null ? '' : String(t.box.width);
+	};
+
+	/** A box field committed, to the text `at` it began on: one edit when the box changed, else the field shows the box again.
+	 *  `shown` is the text the field is drawn for now, which is what it goes back to. */
+	async function commit(el: HTMLInputElement | HTMLSelectElement, at: Edit, shown: TitleText, change: Partial<TextBox>) {
+		const back = () => boxShown(el, shown);
+		const was = textAt(at);
+		if (!was) return back();
+		const { title, text } = was;
+		const next: TextBox = { ...text.box, ...change };
+		if (next.width === text.box.width && (next.fit === text.box.fit || next.width === null)) return back();
 		if (editor.locked || editor.busy || holdForPreview()) return back();
 		try {
-			const edit = await editor.setTitleTextBox(id, t.id, next);
-			const line = appliedLine(name, edit.warnings);
+			const edit = await editor.setTitleTextBox(at.id, at.element, next);
+			const line = appliedLine(title.name, edit.warnings);
 			if (line) say(line);
 		} catch (e) {
 			report(e);
@@ -77,13 +96,12 @@
 	/** What the animation select shows for a text: a preset's id, `custom` for one of its own, `` for none. */
 	const choiceOf = (t: TitleText): string => (t.animation ? (presetOf(t.animation) ?? 'custom') : '');
 
-	/** An animation (or none) stored as one edit; `back` puts the field back to the cut when it is refused. */
-	async function setAnimation(t: TitleText, next: TextAnimation | null, back: () => void) {
+	/** An animation (or none) stored as one edit on the text `at` began on; `back` puts the field back to the cut when it is refused. */
+	async function setAnimation(at: Edit, next: TextAnimation | null, back: () => void) {
 		if (editor.locked || editor.busy || holdForPreview()) return back();
-		const id = o.id;
-		const name = o.name;
+		const name = editor.titleById(at.id)?.name ?? 'This title';
 		try {
-			const edit = await editor.setTitleTextAnimation(id, t.id, next);
+			const edit = await editor.setTitleTextAnimation(at.id, at.element, next);
 			const line = appliedLine(name, edit.warnings);
 			if (line) say(line);
 		} catch (e) {
@@ -92,6 +110,7 @@
 		}
 	}
 
+	// A select changes the moment it is picked, so the title it shows is the one it edits.
 	function chooseAnimation(el: HTMLSelectElement, t: TitleText) {
 		const back = () => {
 			if (el.isConnected) el.value = choiceOf(t);
@@ -100,7 +119,7 @@
 		if (picked === choiceOf(t) || picked === 'custom') return back();
 		const next = picked === '' ? null : (presets.find((p) => p.id === picked)?.animation ?? null);
 		if (picked !== '' && !next) return back();
-		void setAnimation(t, next, back);
+		void setAnimation({ id: o.id, element: t.id }, next, back);
 	}
 
 	/** What the curve select shows for a text: a curve preset's id, `custom` for one of its own or a mix. */
@@ -121,42 +140,52 @@
 			report(e);
 			return back();
 		}
-		void setAnimation(t, next, back);
+		void setAnimation({ id: o.id, element: t.id }, next, back);
 	}
 
-	/** The delay or the duration committed: one edit when it changed and is one an animation may have. */
-	function commitTiming(el: HTMLInputElement, t: TitleText, key: 'delay' | 'duration') {
-		const current = t.animation;
-		if (!current) return;
+	/** The delay or the duration committed: one edit when it changed and is one an animation may have. It goes to the
+	 *  text it took focus on, with what was typed, and is checked against that text's animation as the cut has it now. */
+	function commitTiming(el: HTMLInputElement, shown: TitleText, key: 'delay' | 'duration') {
+		const { scope: at, text: typed } = edits.end(el, { scope: { id: o.id, element: shown.id }, text: el.value });
 		const back = () => {
-			if (el.isConnected) el.value = String(current[key]);
+			if (el.isConnected) el.value = shown.animation ? String(shown.animation[key]) : '';
 		};
-		const n = Number(el.value);
-		const why = el.value.trim() === '' ? 'enter a number of seconds' : checkAnimation({ ...current, [key]: n });
+		// The field is drawn for another title by now: what was typed is not its value to show.
+		if (at.id !== o.id) back();
+		const was = textAt(at);
+		const current = was?.text.animation;
+		if (!was || !current) return back();
+		const n = Number(typed);
+		const why = typed.trim() === '' ? 'enter a number of seconds' : checkAnimation({ ...current, [key]: n });
 		if (why) {
-			report(new Error(`${labelOf(t)}: ${why}`));
+			report(new Error(`${labelOf(was.text, was.title.template ?? null)}: ${why}`));
 			return back();
 		}
 		if (n === current[key]) return back();
-		void setAnimation(t, { ...current, [key]: n }, back);
+		void setAnimation(at, { ...current, [key]: n }, back);
 	}
 
-	function commitWidth(el: HTMLInputElement, t: TitleText) {
-		const why = boxWidthRefusal(el.value);
+	function commitWidth(el: HTMLInputElement, shown: TitleText) {
+		const { scope: at, text: typed } = edits.end(el, { scope: { id: o.id, element: shown.id }, text: el.value });
+		// The field is drawn for another title by now: what was typed is not its value to show.
+		if (at.id !== o.id) boxShown(el, shown);
+		const why = boxWidthRefusal(typed);
 		if (why) {
-			report(new Error(`${labelOf(t)}: ${why}`));
-			el.value = t.box.width === null ? '' : String(t.box.width);
+			const was = textAt(at);
+			report(new Error(`${was ? labelOf(was.text, was.title.template ?? null) : labelOf(shown)}: ${why}`));
+			boxShown(el, shown);
 			return;
 		}
-		void commit(el, t, { width: el.value.trim() === '' ? null : Number(el.value) });
+		void commit(el, at, shown, { width: typed.trim() === '' ? null : Number(typed) });
 	}
 
 	async function convert(form: TitleTextForm) {
 		if (editor.locked || converting || holdForPreview()) return;
 		converting = true;
+		const { id, name } = o;
 		try {
-			const edit = await editor.convertTitleText(o.id, form);
-			const line = appliedLine(o.name, edit.warnings);
+			const edit = await editor.convertTitleText(id, form);
+			const line = appliedLine(name, edit.warnings);
 			if (line) say(line);
 		} catch (e) {
 			report(e);
@@ -186,7 +215,11 @@
 					value={t.box.width ?? ''}
 					placeholder="No box"
 					readonly={editor.locked}
+					aria-disabled={editor.locked || undefined}
 					aria-label="{labelOf(t)}: box width"
+					onfocus={(e) => noteFocus(e, t)}
+					oninput={noteTyped}
+					oncompositionend={noteTyped}
 					onchange={(e) => commitWidth(e.currentTarget, t)}
 					style="{field};width:96px;font-family:var(--font-mono);text-align:right"
 				/>
@@ -196,7 +229,7 @@
 					aria-label="{labelOf(t)}: fit"
 					disabled={t.box.width === null}
 					aria-disabled={editor.locked || undefined}
-					onchange={(e) => void commit(e.currentTarget, t, { fit: e.currentTarget.value as TextFit })}
+					onchange={(e) => void commit(e.currentTarget, { id: o.id, element: t.id }, t, { fit: e.currentTarget.value as TextFit })}
 				>
 					{#each FITS as f (f.value)}
 						<option value={f.value}>{f.label}</option>
@@ -231,8 +264,12 @@
 						step="0.1"
 						value={t.animation.delay}
 						readonly={editor.locked}
+						aria-disabled={editor.locked || undefined}
 						aria-label="{labelOf(t)}: animation delay in seconds"
 						use:tip={'Delay (s)'}
+						onfocus={(e) => noteFocus(e, t)}
+						oninput={noteTyped}
+						oncompositionend={noteTyped}
 						onchange={(e) => commitTiming(e.currentTarget, t, 'delay')}
 						style="{field};width:64px;font-family:var(--font-mono);text-align:right"
 					/>
@@ -243,8 +280,12 @@
 						step="0.1"
 						value={t.animation.duration}
 						readonly={editor.locked}
+						aria-disabled={editor.locked || undefined}
 						aria-label="{labelOf(t)}: animation duration in seconds"
 						use:tip={'Duration (s)'}
+						onfocus={(e) => noteFocus(e, t)}
+						oninput={noteTyped}
+						oncompositionend={noteTyped}
 						onchange={(e) => commitTiming(e.currentTarget, t, 'duration')}
 						style="{field};width:64px;font-family:var(--font-mono);text-align:right"
 					/>

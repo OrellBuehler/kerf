@@ -16,7 +16,9 @@ import {
 	sfxSpan,
 	SFX_CATALOGUE
 } from './sfx';
+import { clipById } from './link-groups';
 import type {
+	Asset,
 	SfxAnchor,
 	SfxCategory,
 	SfxDensity,
@@ -26,7 +28,8 @@ import type {
 	SfxSource,
 	SfxSpec,
 	SfxSuggestRequest,
-	SfxSuggestion
+	SfxSuggestion,
+	Timeline
 } from './types';
 
 // ---- how a tile looks ----------------------------------------------------------------------
@@ -270,6 +273,14 @@ export const GAIN_SPEC: RowSpec = {
 };
 
 const clamp = (v: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, v));
+
+/** The synthesized sound clip `clipId` plays as the cut and the library have it now, or `null` (the clip is gone, or is not
+ *  one). The Inspector's section reshapes the clip an edit began on, which is not the one selected by the time a typed
+ *  number is committed on its blur. */
+export function soundOf(timeline: Timeline, assets: readonly Pick<Asset, 'id' | 'sound_effect'>[], clipId: string): SfxSpec | null {
+	const clip = clipById(timeline, clipId);
+	return (clip && assets.find((a) => a.id === clip.asset_id)?.sound_effect) || null;
+}
 
 /** `spec` with `patch` written over it, every number held to what the engine accepts (`SfxSpec::validate`), so no slider or
  *  typed entry can make a spec the backend refuses. The length is held to the kind's own range. */

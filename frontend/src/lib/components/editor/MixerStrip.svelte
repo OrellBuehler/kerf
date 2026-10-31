@@ -45,6 +45,13 @@
 
 	const err = report;
 
+	/** A commit the engine refused (a proposal is on screen, the project is busy) leaves the sound where the drag put it:
+	 *  `audio.liveTrack` moved the gain ahead of the write, so a refusal puts the whole mix back to what the cut says. */
+	function refused(e: unknown) {
+		err(e);
+		audio.restoreMix(editor.timeline);
+	}
+
 	// ---- the fader ----------------------------------------------------------
 	function fadePreview(v: number) {
 		faderPreview = v;
@@ -55,7 +62,7 @@
 		try {
 			await editor.setTrackVolume(strip.id, v);
 		} catch (e) {
-			err(e);
+			refused(e);
 		} finally {
 			faderPreview = null;
 		}
@@ -82,7 +89,7 @@
 		try {
 			await editor.setTrackPan(strip.id, v);
 		} catch (e) {
-			err(e);
+			refused(e);
 		} finally {
 			panPreview = null;
 		}
@@ -160,6 +167,7 @@
 			detent={0.5}
 			fillFrom={0.5}
 			accent="var(--text-muted)"
+			disabled={editor.previewingStaged}
 			onpreview={panMove}
 			oncommit={panCommit}
 			oncancel={panCancel}
@@ -172,6 +180,7 @@
 		value={volume}
 		meter={meter}
 		name={strip.name}
+		disabled={editor.previewingStaged}
 		onpreview={fadePreview}
 		oncommit={fadeCommit}
 		oncancel={fadeCancel}

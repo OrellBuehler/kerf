@@ -28,6 +28,7 @@
 		name,
 		unityNote = '0 dB',
 		accent = 'var(--kerf-400)',
+		disabled = false,
 		onpreview,
 		oncommit,
 		oncancel,
@@ -43,6 +44,8 @@
 		name: string;
 		unityNote?: string;
 		accent?: string;
+		/** The fader does not move (a proposal is on screen). */
+		disabled?: boolean;
 		onpreview?: (v: number) => void;
 		oncommit?: (v: number) => unknown;
 		oncancel?: () => void;
@@ -78,6 +81,7 @@
 		{tip}
 		{ticks}
 		{accent}
+		{disabled}
 		{onpreview}
 		{oncommit}
 		{oncancel}

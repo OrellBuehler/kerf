@@ -42,6 +42,7 @@ import {
 	shapeLine,
 	shapeSummary,
 	sketchOf,
+	soundOf,
 	sourceLabel,
 	stampOf,
 	suggestRequest,
@@ -585,5 +586,29 @@ describe('auto sound design', () => {
 		expect(stampOf(3, '/a.kerf')).not.toBe(stampOf(4, '/a.kerf'));
 		expect(stampOf(3, '/a.kerf')).not.toBe(stampOf(3, '/b.kerf'));
 		expect(stampOf(null, null)).toBe('#');
+	});
+});
+
+describe('the sound a clip plays', () => {
+	// The Inspector's section reshapes the clip a typed number began on, which is not the one selected by the time it commits.
+	const whoosh = { ...defaultSfxSpec('whoosh'), pitch: 3 };
+	const clip = (id: string, asset_id: string): Clip =>
+		({ id, asset_id, source_in: 0, source_out: 1, timeline_start: 0, volume: 1, fade_in: 0, fade_out: 0 }) as Clip;
+	const timeline = {
+		tracks: [{ id: 't', kind: 'audio', name: 'A1', clips: [clip('a', 'sfx'), clip('b', 'music'), clip('c', 'gone')] }]
+	} as unknown as Timeline;
+	const assets = [
+		{ id: 'sfx', sound_effect: whoosh },
+		{ id: 'music', sound_effect: undefined }
+	];
+
+	test('is the spec of the clip’s own asset, whichever clip is selected', () => {
+		expect(soundOf(timeline, assets, 'a')).toEqual(whoosh);
+	});
+
+	test('is nothing for a clip that is gone, that is not a synthesized sound, or whose asset is gone', () => {
+		expect(soundOf(timeline, assets, 'nope')).toBeNull();
+		expect(soundOf(timeline, assets, 'b')).toBeNull();
+		expect(soundOf(timeline, assets, 'c')).toBeNull();
 	});
 });

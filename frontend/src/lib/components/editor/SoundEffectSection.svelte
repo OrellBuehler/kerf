@@ -10,7 +10,7 @@
 	import { editor, PreviewReadOnly } from '#lib/state.svelte';
 	import { ui } from '#lib/editor-ui.svelte';
 	import { sfxPanel } from '#lib/sfx-panel.svelte';
-	import { hueOf, isSfxCancelled, knownPreset, patchSpec, prettyKind } from '#lib/sfx-panel';
+	import { hueOf, isSfxCancelled, knownPreset, patchSpec, prettyKind, soundOf } from '#lib/sfx-panel';
 	import { toast } from '#lib/notifications.svelte';
 	import { failure } from '#lib/failure-copy';
 	import { report } from '#lib/ops';
@@ -37,14 +37,17 @@
 	let gone = false;
 	onDestroy(() => (gone = true));
 
-	async function reshape(patch: Partial<SfxSpec>): Promise<boolean> {
-		if (!spec) return false;
-		const next = patchSpec(spec, patch);
-		const who = owner;
+	/** Reshapes clip `clipId` — the one the change began on, which is not the one selected when a typed number is written on
+	 *  its blur — from the sound it has now, and hears the result only while that clip is still the one being looked at. */
+	async function reshape(patch: Partial<SfxSpec>, clipId: string): Promise<boolean> {
+		const now = soundOf(editor.timeline, editor.assets, clipId);
+		if (!now) return false;
+		const next = patchSpec(now, patch);
+		const who = `clip:${clipId}` as const;
 		// From the press, before the write is awaited: the audio output may start only from a gesture.
 		sfxPanel.prime();
 		try {
-			await editor.updateSoundEffect(clip.id, next);
+			await editor.updateSoundEffect(clipId, next);
 		} catch (e) {
 			if (isSfxCancelled(e)) return false;
 			if (e instanceof PreviewReadOnly) report(e);
@@ -66,7 +69,7 @@
 	<div data-testid="sound-effect-section">
 		<div class="env"><SfxSketch {preset} hue={hueOf(preset.category)} reverse={spec.reverse} height={30} label="Shape of {preset.label} over its length; the dashed line is where its hit lands" /></div>
 		<div style="margin-top:6px">
-			<SfxShape {spec} {preset} disabled={editor.locked} onchange={reshape} />
+			<SfxShape {spec} {preset} scope={clip.id} disabled={editor.locked} onchange={reshape} />
 		</div>
 		<div style="margin-top:10px;display:flex;gap:8px;align-items:center">
 			<Btn

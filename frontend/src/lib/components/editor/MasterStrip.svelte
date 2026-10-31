@@ -94,6 +94,13 @@
 
 	const err = report;
 
+	/** A commit the engine refused (a proposal is on screen, the project is busy) leaves the sound where the drag put it:
+	 *  `audio.liveMaster` moved the bus ahead of the write, so a refusal puts the whole mix back to what the cut says. */
+	function refused(e: unknown) {
+		err(e);
+		audio.restoreMix(editor.timeline);
+	}
+
 	/** Which limiter the preview plays, kept as the engine learns it. */
 	let limiterKind = $state(audio.limiterKind());
 	$effect(() => audio.onLimiterKind((kind) => (limiterKind = kind)));
@@ -109,7 +116,7 @@
 		try {
 			await editor.setMasterVolume(v);
 		} catch (e) {
-			err(e);
+			refused(e);
 		} finally {
 			faderPreview = null;
 		}
@@ -142,7 +149,7 @@
 		try {
 			await editor.setMasterLimiter(master.limiter, v);
 		} catch (e) {
-			err(e);
+			refused(e);
 		} finally {
 			ceilingPreview = null;
 		}
@@ -236,6 +243,7 @@
 						)}. {LIMITER_NOTE}"
 						detent={ceilingToPos(MASTER_DEFAULT_CEILING_DB)}
 						accent="var(--text-muted)"
+						disabled={editor.previewingStaged}
 						onpreview={ceilingMove}
 						oncommit={ceilingCommit}
 						oncancel={ceilingCancel}
@@ -284,6 +292,7 @@
 							tip={`Speech gate depth ${duckLabel(depth)} — how far a ducked track drops while the rest of the mix speaks. Drag, or ← → to nudge ${DUCK_STEP.normal} dB (${settings.modLabel('shift')} ${DUCK_STEP.coarse}); double-click for ${duckLabel(DUCK_DEFAULT_DEPTH_DB)}. ${DUCK_NOTE}`}
 							detent={duckToPos(DUCK_DEFAULT_DEPTH_DB)}
 							accent="var(--text-muted)"
+							disabled={editor.previewingStaged}
 							onpreview={(v) => (duckPreview = v)}
 							oncommit={duckCommit}
 							oncancel={() => (duckPreview = null)}
@@ -303,6 +312,7 @@
 		maxGain={MASTER_MAX_VOLUME}
 		meter={meter}
 		name="Master"
+		disabled={editor.previewingStaged}
 		onpreview={fadePreview}
 		oncommit={fadeCommit}
 		oncancel={fadeCancel}

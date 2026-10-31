@@ -4,7 +4,7 @@
  * read and edit; `outline-corpus.test.ts` replays what kerf-core wrote down. A text's box (`inline-size`, and
  * `data-kerf-fit="shrink"`) is read off the start tag, which an outlined text keeps. The browser harness cannot set
  * text as outlines: it writes the box and says so. */
-import { findTitle, titleOf } from './title-clips';
+import { findTitle, titleOf, type TitleRef } from './title-clips';
 import { ANIMATE_MARK, animationJson, checkAnimation, parseAnimation } from './text-animation';
 import type { Clip, SvgOverlay, TextAnimation, TextBox, TextFit, Timeline, TitleTextForm } from './types';
 
@@ -201,6 +201,15 @@ export function titleTexts(svg: string): TitleText[] {
 		}
 	}
 	return out.filter((t) => seen.get(t.id) === 1);
+}
+
+/** The text `element` of title `id` as the timeline has it now, and the title it is in; `null` when either is gone.
+ *  A box or timing field commits with its blur, by when the selection has moved: its edit is checked against, and sent
+ *  to, the title and text it took focus on, not the one the panel shows. */
+export function titleTextAt(timeline: Timeline, id: string, element: string): { title: TitleRef; text: TitleText } | null {
+	const title = findTitle(timeline, id);
+	const text = title && titleTexts(title.svg).find((t) => t.id === element);
+	return title && text ? { title, text } : null;
 }
 
 /** Why a typed box width cannot be one, or `null` (empty is no box). */

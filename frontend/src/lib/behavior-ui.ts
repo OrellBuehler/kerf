@@ -115,6 +115,15 @@ export function parseSeed(text: string): number | undefined {
 	return v <= MAX_SEED ? v : undefined;
 }
 
+/** A shake's seed (an absent one is 0); 0 for a behaviour that has none, or none at all. */
+export const seedOf = (b: Behavior | undefined): number => (b?.kind === 'shake' ? (b.seed ?? 0) : 0);
+
+/** What a typed seed asks to write over `stored`: the new seed, or `null` when it is no entry or the seed it already is. */
+export function seedEntry(text: string, stored: number): number | null {
+	const v = parseSeed(text);
+	return v === undefined || v === stored ? null : v;
+}
+
 /** A row's name, with a number when its kind is on the clip more than once: "Sway", "Sway 2". */
 export function rowName(list: readonly Behavior[], index: number): string {
 	const kind = list[index].kind;

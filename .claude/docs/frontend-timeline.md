@@ -546,7 +546,11 @@ at the same place on both. `MixSlider` gives every fader and pan the same gestur
 `slider-gesture.ts`: one edit per drag, written on release, and a run of arrow-key
 nudges written once it goes quiet (or on Enter / blur). Escape abandons a gesture,
 double-click resets, and Ctrl+Z during an unwritten run takes the run back rather than
-undoing the edit before it.
+undoing the edit before it. A fader, a pan and the master's ceiling move the sound *ahead of the write*
+(`audio.liveTrack` / `liveMaster`), so a commit the engine refuses (`PreviewReadOnly`, a busy project) reports and then
+`audio.restoreMix(editor.timeline)`s — the catch used to leave the gain at the dragged level — and the strips' sliders are
+`disabled` (`FaderMeter` forwards it to `MixSlider`) while `editor.previewingStaged`, so a proposal on screen is not mixed
+by accident (`section-scope.test.ts`).
 
 The meters are **measured**. `audio.ts` routes each track through a bus gain and its
 pan legs, then a stereo pair of `AnalyserNode`s, into a master gain. That feeds the
