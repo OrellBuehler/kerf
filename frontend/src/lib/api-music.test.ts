@@ -1,11 +1,17 @@
-import { beforeEach, describe, expect, test } from 'bun:test';
-import { addClip, addTrack, fitMusic, getAssetMetadata, getHistory, listAssets, planMusicFit, revertTo, undo } from './api';
+import { beforeAll, beforeEach, describe, expect, test } from 'bun:test';
+import { addClip, addTrack, fitMusic, getAssetMetadata, getHistory, listAssets, planMusicFit, removeAsset, revertTo, undo } from './api';
 import { clipDuration } from './types';
 
 // Under bun there is no Tauri, so these drive the browser harness's fit: the sample song in the
 // library (audio only, with a bar grid) put on a track of its own under the sample picture. The
 // planner underneath is `music-fit.ts`, tested against the Rust cases; what is checked here is the
 // bridge — the contract of `plan_music_fit` / `fit_music` — and the harness's state around it.
+
+// The harness library is module state shared by every test file in the run: a song composed by another
+// file (`api-compose.test.ts`) stays in it, with a bar grid of its own.
+beforeAll(async () => {
+	for (const a of await listAssets()) if (a.music_score) await removeAsset(a.id, true);
+});
 
 beforeEach(async () => {
 	await revertTo(0);
