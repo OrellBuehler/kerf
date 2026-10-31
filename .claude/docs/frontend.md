@@ -1351,7 +1351,9 @@ A plain `<input type=range>` (Settings, the timeline zoom) gets an 18 px hit box
 of button — the amber outline and wash (`kerf-400` border, `kerf-300` on `selection-fill`, a pair the contrast guard holds to 4.5:1)
 whether it is a tool, a mode (snapping is a pressed magnet, not a word that changes width), a view or a menu with something chosen.
 `pressed` is a toggle (announced as one), `on` lights without announcing, neither is an action; `bare` is no outline while idle (tools,
-zoom), `square` a picture-only button. Its states are `.k-tt` in `controls.css`, which the veil leaves alone.
+zoom), `square` a picture-only button. Its states are `.k-tt` in `controls.css`, which the veil leaves alone. A tool that edits the cut
+takes **`pending`** (`aria-disabled`, the press swallowed, drawn off and not hovered, still focusable) while a proposal is on screen, as the
+other atoms do; `disabled` is for a real reason (no clips to fit, nothing to undo).
 **One control scale for the panels**: `Btn sm` is `--control-sm` (28 px; it was 30) beside every field, chip and tile in a panel.
 **`Chip`** (`.k-chip`) is for what is *on or off* among choices — `pressed` is required, so a chip never reads as an action; an action is
 a `Btn`, and a ghost `Btn` is a quiet one (the hover wash is the veil's). **Settings' chips are `Chip`s too** (theme presets, Dark / Light,
@@ -1465,9 +1467,11 @@ not`) — and a finished file is named by its file, `Exported cut-1x1.mp4` with 
 deliberately *not* replayable — a toast's "Undo" action is dropped rather than kept,
 since an hour later it would undo whatever the newest revision is, not the edit the
 notice was about. Even on screen a toast's Undo is `ops.ts` `undoAction` / `undoToast`: it remembers the revision
-the edit left the project at and takes it back only while that is still the latest — otherwise it takes nothing back
-and says to use Edit > Undo or the History list (`ops-undo.test.ts`; a toast built with a bare `editor.undo()` is
-the bug). It is also why the failure paths that used to reject into nothing
+the edit left the project at — its revision's `seq` **and** `created_at` (`undo-toast.ts` `undoVerdict`: recording an
+edit drops the redo branch and takes `head + 1`, so edit → Undo → another edit reuses the number) — and takes it back only
+while that is still the latest. Otherwise it takes nothing back: edits on top of it say to use Edit > Undo or the History list,
+and an edit already undone says so (Edit > Undo would take back an unrelated one). `ops-undo.test.ts` scans all of `src/` — a
+toast built with a bare `editor.undo()` is the bug. It is also why the failure paths that used to reject into nothing
 (`fetchSpeechModel`, `analyzeQueue`'s per-asset catch, the media bin's `runAnalysis`
 calls) now report: a notice that is never raised cannot be recovered from a log.
 
@@ -1772,7 +1776,10 @@ call the backend and apply the returned `Timeline`) and `src/lib/editor-ui.svelt
 (`export const ui` — chrome state, playhead/zoom/playback, and `analyzeQueue` /
 `runAnalysis(id, steps?)` / `stopAnalysis`: a batch analyzes **one asset at a time** — each pass is
 ffmpeg-bound, so running them together only makes each slower — and stopping drops
-the whole rest of the queue. `analyzeImported(ids, auto)` is what an import calls: nothing when the
+the whole rest of the queue. **One pass at a time from any surface**: `runAnalysis` asked again for the asset being analyzed with
+kinds the pass in flight is already running (`joinsRun`) returns that pass (one transcription, `ui.analyzing` cleared when it ends and
+not by whichever of two ends first; a stop or a failure reaches every joiner); other kinds or another asset wait for it
+and then run, and `ensureAnalysis` waits for the pass in flight before asking what is still missing (`ui-analysis-join.test.ts`). `analyzeImported(ids, auto)` is what an import calls: nothing when the
 master is off, else per asset only the kinds that are on and **not already done** (`autoSteps`; a
 re-imported file redoes nothing, a failed kind is retried, transcript needs a backend), and
 `ensureAnalysis(id, needed)` is what the Agent panel's quick edits call (`autoSteps` also skips what a file
