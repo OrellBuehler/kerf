@@ -348,3 +348,52 @@ fn a_blend_mode_is_reported_and_kept_in_otio_metadata() {
     let (_, report) = export(InterchangeFormat::Edl, &tl, std::slice::from_ref(&a), &opts).unwrap();
     assert!(!report.to_string().contains("blend"), "{report}");
 }
+
+/// Neither format has live behaviours: the cut is written as it is, the report names them, and OTIO keeps them in
+/// metadata.kerf for Kerf to read back. A clip with none adds no line.
+#[test]
+fn live_behaviors_are_reported_and_kept_in_otio_metadata() {
+    use crate::model::Behavior;
+    let a = asset(1, "/m/shot.mov", 100.0, false);
+    let plain = clip(11, &a, 0.0, 4.0, 0.0);
+    let mut lively = clip(12, &a, 10.0, 14.0, 4.0);
+    lively.behaviors = vec![Behavior::Shake {
+        amount: 0.01,
+        speed: 3.0,
+        seed: 5,
+        phase: 0.0,
+    }];
+    let tl = Timeline {
+        tracks: vec![track(101, StreamKind::Video, "V1", vec![plain.clone(), lively])],
+        ..Timeline::new()
+    };
+    let opts = InterchangeOptions {
+        rate: 24.0,
+        title: "behaviors".into(),
+        video_track: 0,
+    };
+    let (_, report) = export(InterchangeFormat::Edl, &tl, std::slice::from_ref(&a), &opts).unwrap();
+    assert!(
+        report
+            .to_string()
+            .contains("warning: clip behaviours are not carried by an EDL\n"),
+        "{report}"
+    );
+    let (otio, report) = export(InterchangeFormat::Otio, &tl, std::slice::from_ref(&a), &opts).unwrap();
+    assert!(
+        report.to_string().contains("clip behaviours have no OTIO equivalent"),
+        "{report}"
+    );
+    let doc: serde_json::Value = serde_json::from_str(&otio).unwrap();
+    let clips = &doc["tracks"]["children"][0]["children"];
+    assert!(clips[0]["metadata"]["kerf"].get("behaviors").is_none());
+    assert_eq!(clips[1]["metadata"]["kerf"]["behaviors"][0]["kind"], "shake");
+    assert_eq!(clips[1]["metadata"]["kerf"]["behaviors"][0]["seed"], 5);
+
+    let tl = Timeline {
+        tracks: vec![track(101, StreamKind::Video, "V1", vec![plain])],
+        ..Timeline::new()
+    };
+    let (_, report) = export(InterchangeFormat::Edl, &tl, std::slice::from_ref(&a), &opts).unwrap();
+    assert!(!report.to_string().contains("behaviour"), "{report}");
+}

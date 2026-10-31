@@ -1,7 +1,7 @@
 // Central editor state (Svelte 5 runes).
 
 import { duplicateBlocked, pastePlacements } from './track-locks';
-import type { AudioDetached, Placement } from './api';
+import type { AudioDetached, MotionOptions, Placement } from './api';
 import {
 	addClip,
 	addKeyframe,
@@ -65,6 +65,9 @@ import {
 	setPropertyKeyframes,
 	setPropertyTracks,
 	copyKeyframes,
+	applyMotionPreset as apiApplyMotionPreset,
+	setBehaviors as apiSetBehaviors,
+	bakeBehaviors as apiBakeBehaviors,
 	setAssetProjection,
 	setReframe,
 	setReframeKeyframes,
@@ -210,6 +213,10 @@ import type {
 	VoiceoverRequest,
 	ComposeRequest,
 	ComposeResult,
+	MotionPreset,
+	MotionWindow,
+	BakeReport,
+	Behavior,
 	SfxAdded,
 	SfxPlacement,
 	SfxSpecInput,
@@ -1425,6 +1432,35 @@ class EditorState {
 	/** Copy the animation of `props` (all keyed ones when empty) to another clip, `offset` later. */
 	copyKeyframes(fromClipId: string, toClipId: string, props: Property[] = [], offset = 0) {
 		return this.#apply(() => copyKeyframes(fromClipId, toClipId, props, offset));
+	}
+	/** Write a motion preset (an entrance, an exit or an emphasis) into several clips as **one** revision, all or
+	 *  nothing; resolves to the window each clip got, which a `duration` longer than the clip clamps. */
+	async applyMotionPreset(clipIds: string[], preset: MotionPreset, options: MotionOptions = {}): Promise<MotionWindow[]> {
+		let applied!: MotionWindow[];
+		await this.#apply(() =>
+			apiApplyMotionPreset(clipIds, preset, options).then((r) => {
+				applied = r.applied;
+				return r.timeline;
+			})
+		);
+		return applied;
+	}
+	/** Give several clips the live behaviours `behaviors` as their whole list, as **one** revision, all or nothing; an
+	 *  empty list clears them. */
+	setBehaviors(clipIds: string[], behaviors: Behavior[]) {
+		return this.#apply(() => apiSetBehaviors(clipIds, behaviors));
+	}
+	/** Sample the behaviours of several clips into keys and clear them, as **one** revision, all or nothing; resolves
+	 *  to what was written per clip. */
+	async bakeBehaviors(clipIds: string[], fps?: number): Promise<BakeReport[]> {
+		let baked!: BakeReport[];
+		await this.#apply(() =>
+			apiBakeBehaviors(clipIds, fps).then((r) => {
+				baked = r.baked;
+				return r.timeline;
+			})
+		);
+		return baked;
 	}
 	clearKeyframes(clipId: string) {
 		return this.#apply(() => clearKeyframes(clipId));

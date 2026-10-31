@@ -21,7 +21,10 @@ import { toast } from './notifications.svelte';
 import { cutNotice, lockedNotice, removalNotice } from './removal';
 import { planPlayheadTrim, trimNotice } from './trim-tools';
 import { keyEditDone, planKeyEdit, planPlayheadSplit, splitDone, splitNotice, type KeyTool } from './key-edits';
-import type { SplitSide } from './types';
+import { clampedNotice, motionOptions, motionReason, motionTargets } from './motion-ui';
+import { additions, limitNotice } from './behavior-ui';
+import { randomSeed } from './behaviors';
+import type { BehaviorKind, MotionPreset, SplitSide } from './types';
 
 export function errorMessage(e: unknown): string {
 	return e instanceof Error ? e.message : String(e);
@@ -114,6 +117,52 @@ export async function duplicateClips(): Promise<void> {
 	try {
 		const n = await editor.duplicateSelection();
 		if (n) toast(n === 1 ? 'Clip duplicated' : `${n} clips duplicated`);
+	} catch (e) {
+		report(e);
+	}
+}
+
+/** Write a motion preset into the selected picture clips (the Motion tab) as one edit, in the mode, length and
+ *  strength the tab holds (`ui.motion*`). A sound among the selected is left alone (a linked picture's partner is
+ *  selected with it); the one thing said afterwards is a window the clip cut short. */
+export async function applyMotion(preset: MotionPreset): Promise<void> {
+	if (holdForPreview()) return;
+	const selected = editor.selectedClips;
+	const reason = motionReason(editor.timeline, selected);
+	if (reason) {
+		toast.info(reason);
+		return;
+	}
+	const { motionMode: mode, motionLength: length, motionIntensity: intensity } = ui;
+	try {
+		const ids = motionTargets(editor.timeline, selected).map((c) => c.id);
+		const applied = await editor.applyMotionPreset(ids, preset, motionOptions(mode, length, intensity));
+		const note = clampedNotice(preset, applied, length);
+		if (note) toast.info(note);
+	} catch (e) {
+		report(e);
+	}
+}
+
+/** Add a behaviour of `kind`, with its starting numbers, to the selected picture clips (the Motion tab): each keeps
+ *  the behaviours it has and gets the new one last. Clips that carry the same list are one edit (the usual case:
+ *  none have any); a clip already at the limit refuses the lot, as the backend would, and says so. */
+export async function addBehavior(kind: BehaviorKind): Promise<void> {
+	if (holdForPreview()) return;
+	const selected = editor.selectedClips;
+	const reason = motionReason(editor.timeline, selected);
+	if (reason) {
+		toast.info(reason);
+		return;
+	}
+	const targets = motionTargets(editor.timeline, selected);
+	const { full, groups } = additions(targets, kind, randomSeed());
+	if (full.length > 0) {
+		toast.info(limitNotice(full, targets.length));
+		return;
+	}
+	try {
+		for (const g of groups) await editor.setBehaviors(g.ids, g.list);
 	} catch (e) {
 		report(e);
 	}

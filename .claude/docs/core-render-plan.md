@@ -43,7 +43,8 @@
   sound on both sides by silence analysis (`EDGE_SILENCE_MARGIN`); pairs without it are not guessed — all unjudged is
   `skipped`, some is one tip counting them; **`jump_cut`** (tip) one asset's footage resuming on a video lane more than a
   frame and at most `JUMP_MAX_SOURCE_GAP` (8 s) later with no transition, no scene change between and no reframing
-  (`PUNCH_IN_SCALE`, a move, crop, keyed transform or other 360 view); **`stale_captions`** — the model keeps no
+  (`PUNCH_IN_SCALE`, a move, crop, keyed transform or other 360 view; a live behaviour, a shake or a breath, is a look laid
+  over the same framing and does not count, `reframed` reads the clips' keys, not `is_animated`); **`stale_captions`** — the model keeps no
   options or revision stamp for captions, so it compares words: a generated caption whose words appear as a run in
   the cut's transcripts (else it is imported or foreign and not compared; none are → `skipped`) is stale when fewer
   than `CAPTION_MATCH` of its words are spoken within `CAPTION_SLACK` (0.6 s) of it — reaching further past a clip
@@ -343,6 +344,15 @@
   `Placement::keyframed` carries that (`Keyed::all(rotates)` is the legacy bundle), a colour-only clip is
   placed as a static one, and the sweep holds origin, zoom, turn, opacity and grade of the new cuts to the
   evaluated graph.
+  **Live behaviours** (`Clip.behaviors`, `core-model.md`) are in the plan as the pose they give: `PlanLayer.transform` is
+  `Clip::transform_at` (the formulas included, the exact numbers the graph's expressions evaluate at that frame) and `Animated` is built
+  from `is_driven` / `rotation_turns` / `zoom_animated` / `placement_animated`, so a sway or spin is a keyed rotation (`Keyed.rotation` /
+  `rotates`), a breath a moving zoom (`zooms`) and a drift, shake or breath `places` (`KeyedPlacement`, no cap). `Animated.behaves`
+  (`Clip::has_behaviors`; a behaviour that moves nothing is not live) makes **every frame refused** in a Still and a Motion plan,
+  `Unsupported::Behavior(layer)` (kind `behavior`), until `GpuCaps::behaviors`, which no compositor sets: the pose is exact, but no
+  compositor has a parity case for a pose that moves by a formula, so the plan does not claim it. With the bit set the pose is judged as any
+  other, and `live_behaviours_are_the_pose_the_plan_carries_and_are_refused_until_a_compositor_says_it_draws_them` pins that for a sway
+  and a spin nothing else refuses and for the rest only `KeyedPlacement` does.
   **A stabilized clip is refused** (`PlanTiming.stabilized` = `Clip::is_stabilized`, `Unsupported::Stabilized(layer)`, kind
   `stabilized`, Still and Motion alike): its frames are moved by vid.stab's transform or `deshake` in the chain, which no pass
   draws, so FFmpeg draws them (`a_stabilized_clip_is_refused_in_a_still_and_an_export_frame`).

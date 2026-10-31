@@ -65,7 +65,9 @@
   compressor / gate numbers to 10 significant digits; the generator seeds dB values known to
   differ, so a run under `GLIBC_TUNABLES=glibc.cpu.hwcaps=-FMA,-FMA4` fails without it; a speed ramp's `atempo` stages
   and advance are computed without libm at the source, `clip_timing/ramp.rs::stage_tempo`, since `round_libm` keeps only the
-  compressor / gate numbers). The
+  compressor / gate numbers; **a behaviour's `sin` / `cos` are libm too**, but reach only the scrubbed still's printed numbers, so the
+  behaviour family's still text is digested through `round_floats`, every number to 10 significant digits and below `1e-12` as `0`, a
+  unary minus going with it; `Case.libm_stills`, set for the cases from `BEHAVIOR_FIRST` on, so the first 10000 digests are untouched). The
   digests are identical blessed with `KERF_HWACCEL` unset, `none` and `auto`. A coverage
   table (`family needle` lines, plus the branch `transition_fx` took and a few structural
   tags) fails the test if a family hits fewer than 20 cases — the generator stopped covering
@@ -259,3 +261,18 @@
   `stabilize-deshake`, `stabilize-proxy` (a proxy's slice scaled to 0.6667), `stabilize-4k` (a 4K original's, scaled by 2),
   `stabilize-hdr` (tone-mapped before it is steadied) and their `still-` / `preview-` forms. The order of the appended families
   is speed ramps, noise reduction (84–87), blend modes (88–91), stabilization (92–95).
+- **Live behaviours** (`behavior_for`; `core-model.md`), **appended, nothing re-blessed**: the 400 cases after the moving-still ones
+  (`BEHAVIOR_FIRST`, blocks 100–103, its dice on `8 << 40`, seeded by the case and the clip) draw from the same generator (with the
+  channel family's channels) and give 75 % of the clips on video tracks one to three behaviours of the five kinds, from fixed decimals
+  (so the export's, the preview's and the parts' expression text is the same on every machine: it prints no transcendental constant; the
+  scrubbed still prints the pose's numbers, the platform's `sin` / `cos`, so its digest goes through `round_floats`), now and then one that
+  moves nothing (amount 0, which the graph leaves out); the first still of
+  each case is in the middle of its first clip with a live behaviour (`behavior_still`, no dice). `behavior_digests_survive_another_libm`
+  builds every case with the model's `sin` / `cos` 1, -1 and 4 units in the last place off (`with_libm_ulps`, test builds) and holds the
+  four texts' digests (and the export, preview and parts text itself) to the platform's, with the raw still text as the control that does
+  move. `git diff` of the four digest files
+  (`parts.txt` included) is **16 insertions, 0 deletions**, so the first 10000 per-case digests are the ones the commit before gave. Structural
+  families `behavior-sway`, `behavior-spin` (a live one of the kind and `rotate=a='` in the export), `behavior-breathe` (`)*(1+`),
+  `behavior-drift` (`*PI/180)*`), `behavior-shake` (`0.5*sin(2*PI*`), `behavior-on-keys` (a behaviour on a keyed number),
+  `behavior-neutral` (one that moves nothing is in the list and not in the argv), `still-behavior` and `preview-behavior`. The ken-burns
+  range now ends at `BEHAVIOR_FIRST` instead of `TOTAL`.

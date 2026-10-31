@@ -705,6 +705,15 @@ const ACTION_LIST = [
 	{ id: 'view.zoomFit', label: 'Zoom to fit', group: 'view', context: 'global', defaults: ['Shift+Z'] },
 	{ id: 'view.minimap', repeat: false, label: 'Show / hide the overview strip', group: 'view', context: 'global', defaults: [] },
 	{
+		id: 'view.motionPath',
+		repeat: false,
+		label: 'Show / hide the motion path',
+		group: 'view',
+		context: 'global',
+		defaults: [],
+		hint: 'Draws where the selected clip’s position goes over the Preview, with a dot on each position key to drag. Only drawn while the clip’s position is keyed.'
+	},
+	{
 		id: 'view.safeAreas',
 		repeat: false,
 		label: 'Show / hide the safe-area guides',

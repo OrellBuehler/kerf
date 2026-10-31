@@ -3,9 +3,13 @@
  * box is `layer-geometry.ts`'s port of the engine's own integer geometry, so a handle sits on the
  * edge the file has. Gestures work in canvas pixels and answer the transform numbers they change;
  * snapping, the 90° detent and the Shift constraints are here, the pointer plumbing is
- * `TransformHandles.svelte`'s. One edit is written per gesture, on release (`set_transform_at`). */
+ * `TransformHandles.svelte`'s. One edit is written per gesture, on release (`set_transform_at`).
+ *
+ * A clip's live behaviours (a sway, a shake, ...) move the picture, so the box is drawn **at the picture** (the pose
+ * with the behaviours on top, where the frame on screen has it) and the gesture is worked out there, but what is
+ * written is the pose they ride on (`toBase`): a drag moves the pose, and the behaviour goes on moving it. */
 
-import { isKeyed, keyTime, transformAt } from './channels';
+import { baseTransformAt, isDriven, keyTime, transformAt } from './channels';
 import { pixFmtSubsampling, resolveLayer, resolveLayerAnyGrid, YUV420, type LayerGeometry, type Resolved } from './layer-geometry';
 import { trackRenders } from './levels';
 import { clipDuration, DEFAULT_TRANSFORM, type Asset, type Clip, type Fit, type Timeline, type Transform } from './types';
@@ -58,7 +62,11 @@ export interface Layer {
 	local: number;
 	src: [number, number];
 	grid: [number, number] | null;
+	/** The picture: the pose with the clip's live behaviours on top, which the box is drawn at. */
 	pose: Transform;
+	/** The pose without behaviours (`baseTransformAt`): what a drag writes into (see `toBase`). The same numbers as
+	 *  `pose` for a clip without behaviours. */
+	base: Transform;
 	geometry: LayerGeometry;
 	box: Box;
 }
@@ -98,9 +106,10 @@ export function layersAt(timeline: Timeline, assets: readonly Asset[], canvas: C
 		const grid = v.pix_fmt ? pixFmtSubsampling(v.pix_fmt) : null;
 		const local = keyTime(clip, time);
 		const pose = { ...DEFAULT_TRANSFORM, ...transformAt(clip, local) };
+		const base = { ...DEFAULT_TRANSFORM, ...baseTransformAt(clip, local) };
 		const geometry = geometryOf(src, grid, canvas, pose);
 		if (!geometry) continue;
-		out.push({ clip, local, src, grid, pose, geometry, box: pictureBox(geometry) });
+		out.push({ clip, local, src, grid, pose, base, geometry, box: pictureBox(geometry) });
 	}
 	return out;
 }
@@ -311,10 +320,10 @@ export const MIN_CROP_LEFT = 0.02;
 
 /** Whether the edges of this layer can be cropped where it is drawn: a Contain or blurred fit (a
  *  Cover fit shows a frame-shaped window of the picture whatever the crop, so its edges are not the crop's),
- *  and a position, scale and rotation that are not keyed (the crop is one number for the whole
- *  clip, and keeping the picture still while it changes moves those). */
+ *  and a position, scale and rotation that neither are keyed nor are moved by a live behaviour (the crop is one
+ *  number for the whole clip, and keeping the picture still while it changes moves those). */
 export function croppable(clip: Clip, canvas: Canvas): boolean {
-	return canvas.fit !== 'cover' && !(['scale', 'pos_x', 'pos_y', 'rotation'] as const).some((p) => isKeyed(clip, p));
+	return canvas.fit !== 'cover' && !(['scale', 'pos_x', 'pos_y', 'rotation'] as const).some((p) => isDriven(clip, p));
 }
 
 /** The contain fit's ideal factor for a `w`×`h` window: canvas px per source px. */
@@ -381,6 +390,21 @@ export function cropPose(start: Transform, layer: Pick<Layer, 'src' | 'box' | 'g
 	if (edge === 'top') patch.crop_top = fix('crop_top', crop.top);
 	if (edge === 'bottom') patch.crop_bottom = fix('crop_bottom', crop.bottom);
 	return { patch, guides };
+}
+
+/** A patch worked out against the picture (the box on screen, live behaviours included) as the numbers to write: a
+ *  behaviour rides on top of the pose, so the pose that puts the picture where the pointer took it is the target less
+ *  what the behaviour adds at this moment (a position and a rotation are offset by it, the zoom is divided by the
+ *  factor a breath multiplies it by). A clip without behaviours has the same pose and picture, and the patch is
+ *  returned as it was. */
+export function toBase(layer: Pick<Layer, 'pose' | 'base'>, patch: Partial<Transform>): Partial<Transform> {
+	const out: Partial<Transform> = { ...patch };
+	for (const k of ['pos_x', 'pos_y', 'rotation'] as const) {
+		const v = patch[k];
+		if (v !== undefined) out[k] = fix(k, v - (layer.pose[k] - layer.base[k]));
+	}
+	if (patch.scale !== undefined && layer.pose.scale > 0) out.scale = fix('scale', patch.scale * (layer.base.scale / layer.pose.scale));
+	return out;
 }
 
 /** Only what the gesture changed, against the pose it started from rounded as the gesture writes

@@ -7,6 +7,7 @@
 	import ScrubBar from './ScrubBar.svelte';
 	import TrimMonitor from './TrimMonitor.svelte';
 	import TransformHandles from './TransformHandles.svelte';
+	import MotionPath from './MotionPath.svelte';
 	import { ui } from '#lib/editor-ui.svelte';
 	import { settings } from '#lib/settings.svelte';
 	import { editor } from '#lib/state.svelte';
@@ -668,6 +669,7 @@
 	// playing, while a proposal is previewed and while the trim monitor stands in for the picture.
 	const handlesActive = $derived(!empty && !ui.playing && !streaming && !editor.previewingStaged && !ui.trimMonitor);
 	let handlesShown = $state(false);
+	let pathShown = $state(false);
 
 	// ---- the GPU preview: how the frame is produced, and where the surface is ------------
 	//
@@ -694,7 +696,7 @@
 			streaming: streaming && !returning,
 			empty,
 			titlesShown: titlesHere.length > 0 || svgBox !== null,
-			handles: handlesShown,
+			handles: handlesShown || pathShown,
 			trimMonitor: !!ui.trimMonitor,
 			guides: showGuides,
 			covered
@@ -1300,6 +1302,7 @@
 					</div>
 				{/if}
 				<TransformHandles active={handlesActive} frameAspect={aspect} chrome={showGuides ? CHROME : null} bind:shown={handlesShown} />
+				<MotionPath active={handlesActive} frameAspect={aspect} chrome={showGuides ? CHROME : null} bind:shown={pathShown} />
 				<!-- Titles under the playhead, as boxes over where the engine draws them.
 				     The text is transparent (the picture already has it) except while
 				     it is being dragged, when the box carries a ghost of it. -->

@@ -137,6 +137,68 @@
   curve read off the editor's reactive timeline is a proxy the harness's `structuredClone` refuses; both
   suites pin the same samples, head-cut keys and split beziers bit for bit), used by the harness, the
   Inspector's sampled pose and the preview's gain (`gainAutomation`).
+  **Motion presets (B8a, `model/motion.rs`)** are pure data that expand into the channels above — no render path, no stored
+  field, no migration, no golden change, so the export, the still and the GPU plan draw them as they draw typed keys
+  (`motion_presets_rendered.rs`, `#[ignore]`d, renders all 23 and holds the export to the still). `MotionPreset` (snake_case:
+  `fade_in`, `slide_in_from_left|right|top|bottom`, `zoom_in`, `pop_in`, `spin_in`, `drop_in`, the `fade_out` /
+  `slide_out_to_*` / `zoom_out` / `pop_out` / `spin_out` / `drop_out` exits, `pulse`, `wiggle`, `bounce`, `push_in`, `pull_out`;
+  a direction names where the picture comes *from* / goes *to*, unlike `TransitionKind`'s travel) is a row of the `SPECS`
+  table: kind, default span, a `Base` and per transform number keys `(at, x, easing)` — `at` the fraction of the window, `x` a
+  factor of the reference for scale / opacity and an offset for position (frame fractions) / rotation (degrees), neutral
+  = `Property::neutral`; every track runs `at` 0 to 1 and a bezier cannot overshoot, so an overshoot is its own key.
+  **The reference is the pose** (`Clip::property_at` sampled before writing): an entrance ends on the pose at the window's end
+  (`Base::End`), an exit starts from the pose at its start (`Start`), a pulse / wiggle / bounce rides the line between the two
+  edge poses (`Trend`: the clip's own motion goes on underneath); anchoring the edge a preset leaves neutral makes applying it
+  twice a no-op. **`Replace` is relative to the number's static value instead** (an entrance replacing a half-finished slide must
+  not park the clip where that slide was at the window's end). `Clip::apply_motion(preset, mode, at, duration, intensity)` is the
+  pure op (all or nothing): `at` is where the window starts (entrance / emphasis 0, an exit ends at the clip's end), `duration`
+  defaults to the preset's (`push_in` / `pull_out`: the rest of the clip) and **is clamped to the clip** (to what is left after
+  `at`; under `MIN_MOTION_SECONDS` = 0.01 refused), `intensity` 0.25..=2 scales how far every key departs (a scale never goes
+  under `TINY_SCALE`, an opacity stays in 0..=1). `Add` (the default) replaces the clip's keys of those numbers inside the window and
+  keeps the ones outside, splitting the eased segment an edge falls in (`upsert`, `Easing::split`; a hold stays held), so an
+  entrance, an exit and a key in the middle coexist and the preset applied last wins where windows meet; `Replace` writes exactly the
+  preset's keys for its numbers. A number the bundle drives detaches alone (`set_property_keys`). Add leaves the segment *into* a
+  mid-clip entrance as plain interpolation from the keys before it. `Project::apply_motion_preset(clip_ids, ..)` (`project/motion.rs`)
+  is one `edit_timeline` revision for every clip ("Apply motion preset Pop in (3 clips)"), all or nothing, a clip named twice once,
+  an audio-track clip refused, **a locked track not** (a lock guards layout; keyframes are look — `Timeline::ensure_editable`),
+  linked partners untouched, an agent's staged. `motion_presets()` lists id / label / kind / default duration / hint / numbers.
+  `fixtures/motion-presets-corpus.json` (`KERF_BLESS_CORPUS=1 … -- motion_corpus`) holds the table and 89 input → channels cases for the TS mirror.
+  **Live behaviours (B8b, `model/behavior.rs`)** are procedural motion layered on a clip's pose: `Clip.behaviors: Vec<Behavior>`
+  (absent from the file when empty; schema v20), at most `MAX_BEHAVIORS` = 8, JSON tagged by `kind` — `sway {amount, speed, phase}`
+  (rotation `+= amount * sin(2 pi speed u)`, degrees, Hz), `breathe {amount, speed, phase}` (scale `*= 1 + amount * sin(..)`, `amount <=
+  MAX_BREATHE` = 0.9 so a scale can never reach 0 and no clamp is needed), `spin {speed, phase}` (rotation `+= speed * 360 * u`, turns a
+  second, signed), `drift {speed, angle, phase}` (position `+= speed * u * (cos, sin)` of `angle` degrees, x in frame widths and y in
+  heights a second, 90 is down) and `shake {amount, speed, seed, phase}` (position `+= amount * (0.5 sin + 0.3 sin + 0.2 sin)` per axis,
+  three fixed multiples of `speed` per axis, phases from `seed` by a `u32` integer hash with no libm, so the export's expression text
+  prints no transcendental constant (`sin` / `cos` are left to the filter); peak `amount` of the frame, position only, never opacity / colour / mask / crop). `u = local + phase`, **local is the
+  clip-local timeline clock the keys read**, so speed and reverse change nothing. Ranges (`MAX_SWAY_DEGREES` 180, `MAX_BEHAVIOR_HZ` 30,
+  `MAX_SPIN_TURNS` 10, `MAX_DRIFT` 5, `MAX_SHAKE` 0.25, `|phase| <= 1e6`) are **refused on write** (`Behavior::check`, `check_behaviors`) and **held
+  on read** (`Behavior::sanitized`: a hand-edited file or a NaN cannot reach a filter); one that moves nothing (amount or speed 0) is not
+  *live* (`is_neutral`) and changes nothing, flags and graph included. **One resolver, two views**: `Clip::property_at` / `transform_at`
+  are the picture (`base_at` + `behaved`: the zoom multiplies, the rest add, in list order, which is the order of the export's text),
+  `base_at` / `base_transform_at` the pose **without** behaviours — what every edit that writes keys samples (`rebase_animation`,
+  `pose_transform`, `add_keyframe`, motion presets, bake), or the wobble would be written into the keys and added again. The flags are
+  views of it: `is_driven(prop)` = keyed or moved by a behaviour (what the chain is built from), `is_animated` / `zoom_animated`
+  (breathe) / `placement_animated` (breathe, drift, shake) / `picture_moves` / `rotation_turns` (sway, spin) include them, and
+  `pan_extent_over(horizon)` adds the behaviours' reach (a drift keeps moving on a transition's tail), so a held-pose clip with only
+  behaviours takes the same moving-zoom / sub-pixel-placement / keyed-rotation chains a keyed one does. **A head move shifts `phase`
+  by the cut** (`rebase_behaviors`, run by `rebase_animation` beside the bundle, the channels and the ramp), so a split, `Timeline::slice`
+  (range export, the playback hand-over), split-and-remove, a roll / slide and a linked partner's trim carry the motion on from where
+  it was; a plain `Project::trim`, which writes the source window without rebasing keys, leaves behaviours clip-local like keys (the
+  module doc says so too). A split keeps them on both halves. `Clip::bake_behaviors(fps, max_keys)` samples the combined result into `Linear` keys of the numbers they move at the
+  frame grid of `fps` (`k / fps - timeline_start`, plus 0 and the clip's end), folds the base keys in, clears the behaviours, and is
+  exact at those frames (a line between them); it **refuses** past `max_keys` (`MAX_CHANNEL_KEYS`: about 33 s at 30 fps) rather than thin.
+  `copy_keyframes` and `clear_keyframes` do not touch behaviours (a look of their own); the diff says "behaviours: sway added, shake
+  removed / changed / retimed" (a phase-only change, which a head move makes, is "retimed"); `Rule::ClipBehavior` refuses more than 8; an
+  interchange export lists them as "behaviours" (OTIO keeps the clip whole in `metadata.kerf`). `Project::set_behaviors(ids, list)` (one
+  revision for every clip, an empty list clears, a clip on an audio track refuses the lot, a lock and linked partners do not matter) and
+  `Project::bake_behaviors(ids, fps)` (default: the delivery's rate, else the footage's, else 30) are the ops (`project/behavior.rs`).
+  `fixtures/behaviors-corpus.json` (`KERF_BLESS_CORPUS=1 … -- behaviors_corpus`) holds the limits, the shake table, seed phases,
+  resolver vectors (base and picture at times, flags), the held / refused numbers, rebase vectors and bake vectors for the TS mirror.
+  Its numbers are the blessing machine's libm's `sin` / `cos`, so the freshness test compares them **numerically** (`1e-9` relative,
+  to 1 below that; shape, strings and integers exactly), not byte for byte; the file is still written deterministically. In test builds
+  `with_libm_ulps(n, f)` runs `f` with every behaviour `sin` / `cos` `n` units in the last place off — another libm — which the corpus
+  and the golden oracle use to show they do not read that digit.
   **`TransitionKind` is three families, and the family decides the render**: a
   **dip** (`DipToBlack` / `DipToWhite`) takes both sides through a solid colour
   either side of the cut, a **dissolve** (`Crossfade`) mixes them, and a

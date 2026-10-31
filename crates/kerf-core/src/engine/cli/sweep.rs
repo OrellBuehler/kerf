@@ -42,7 +42,7 @@ struct Eval<'a> {
 /// the filter reports as `Invalid argument`.
 const NESTING_LIMIT: usize = 100;
 
-fn eval(src: &str, vars: &[(&str, f64)]) -> f64 {
+pub(super) fn eval(src: &str, vars: &[(&str, f64)]) -> f64 {
     let mut e = Eval {
         s: src.as_bytes(),
         i: 0,
@@ -167,6 +167,8 @@ impl Eval<'_> {
             ("between", [x, lo, hi]) => flag(x >= lo && x <= hi),
             ("hypot", [a, b]) => a.hypot(*b),
             ("floor", [a]) => a.floor(),
+            ("sin", [a]) => a.sin(),
+            ("cos", [a]) => a.cos(),
             _ => panic!("function `{name}/{}`", args.len()),
         }
     }
@@ -432,6 +434,70 @@ fn cuts(asset: &crate::model::Asset) -> Vec<(&'static str, Timeline)> {
     );
     taken.transform.scale = 1.1;
     taken.set_property_keys(Property::Scale, vec![]);
+    // Live behaviours: the rotation ones (a keyed `rotate`), the placed ones (the `perspective`), and all five
+    // on a clip with keys of its own, off the frame grid.
+    use crate::model::Behavior;
+    let mut swaying = make_clip(a, 3.0, 7.0, 0.5);
+    swaying.transform.rotation = 6.0;
+    swaying.behaviors = vec![
+        Behavior::Sway {
+            amount: 11.0,
+            speed: 0.7,
+            phase: 0.0,
+        },
+        Behavior::Spin {
+            speed: -0.08,
+            phase: 0.4,
+        },
+    ];
+    let mut wobbling = make_clip(a, 3.0, 7.0, 0.5);
+    wobbling.transform.scale = 0.9;
+    wobbling.behaviors = vec![
+        Behavior::Breathe {
+            amount: 0.15,
+            speed: 0.9,
+            phase: 0.0,
+        },
+        Behavior::Drift {
+            speed: 0.03,
+            angle: 40.0,
+            phase: -0.3,
+        },
+        Behavior::Shake {
+            amount: 0.015,
+            speed: 3.5,
+            seed: 77,
+            phase: 0.0,
+        },
+    ];
+    let mut lively = pushed_clip_for_bundle(a);
+    lively.set_property_keys(
+        Property::Rotation,
+        vec![key(0.0, -20.0, Easing::Linear), key(3.1, 35.0, Easing::EaseInOut)],
+    );
+    lively.behaviors = vec![
+        Behavior::Sway {
+            amount: 6.0,
+            speed: 1.1,
+            phase: 0.25,
+        },
+        Behavior::Breathe {
+            amount: 0.1,
+            speed: 0.6,
+            phase: 0.0,
+        },
+        Behavior::Drift {
+            speed: -0.02,
+            angle: 200.0,
+            phase: 0.0,
+        },
+        Behavior::Shake {
+            amount: 0.01,
+            speed: 2.0,
+            seed: 5,
+            phase: 0.0,
+        },
+    ];
     let mut cuts = vec![
         ("animated clip and title", animated),
         ("slide onto a static offset", pair(slid)),
@@ -445,6 +511,15 @@ fn cuts(asset: &crate::model::Asset) -> Vec<(&'static str, Timeline)> {
         ("zoom keyed alone", timeline_of(vec![video_track(vec![zooming])])),
         ("rotation keyed alone", timeline_of(vec![video_track(vec![turning])])),
         ("numbers taken off the bundle", timeline_of(vec![video_track(vec![taken])])),
+        (
+            "behaviours that turn the picture",
+            timeline_of(vec![video_track(vec![swaying])]),
+        ),
+        (
+            "behaviours that place the picture",
+            timeline_of(vec![video_track(vec![wobbling])]),
+        ),
+        ("behaviours on keys", timeline_of(vec![video_track(vec![lively])])),
     ];
     for (_, tl) in &mut cuts {
         tl.format = Some(crate::model::Delivery::new(360, 640, Fit::Contain));
@@ -465,12 +540,15 @@ fn pushed_clip_for_bundle(asset: uuid::Uuid) -> Clip {
 }
 
 /// The cuts that key single numbers of a clip (see `cuts`), other than the colour: that one takes all five rates.
-const CHANNEL_CUTS: [&str; 5] = [
+const CHANNEL_CUTS: [&str; 8] = [
     "opacity keyed alone",
     "position keyed alone",
     "zoom keyed alone",
     "rotation keyed alone",
     "numbers taken off the bundle",
+    "behaviours that turn the picture",
+    "behaviours that place the picture",
+    "behaviours on keys",
 ];
 
 /// How many (layer, frame) pairs of the sweep carry a zoom expression to evaluate.
@@ -520,6 +598,12 @@ fn the_motion_plan_samples_the_curves_the_graphs_expressions_write_at_every_outp
                     let opts = parse_options(body);
                     let chain = chain_of(flat);
                     let clip = &tl.tracks[0].clips[flat];
+                    // A candidate frame before the clip's first picture is drawn with nothing (the overlay passes
+                    // the base through), and the plan samples the clip at its first moment where a behaviour's
+                    // expression reads the clock before it: they part there and nowhere a picture is.
+                    if clip.has_behaviors() && t < clip.timeline_start {
+                        continue;
+                    }
                     let tf = layer.transform;
                     if clip.placement_animated() {
                         // The chain's last stage placed the picture on a frame of the canvas' size,
@@ -531,7 +615,7 @@ fn the_motion_plan_samples_the_curves_the_graphs_expressions_write_at_every_outp
                         let (_, _, first) = keyed_crop_fps(fps, start);
                         let p = all_options(chain, "perspective").pop().unwrap();
                         let (bw, bh) = (w + 8.0, h + 4.0);
-                        let vars = [("in", (k as i64 - first + 1) as f64), ("W", bw), ("H", bh)];
+                        let vars = [("in", (k as i64 - first + 1) as f64), ("W", bw), ("H", bh), ("PI", PI)];
                         let axis = |a: &str, b: &str, size: f64, canvas: f64| {
                             let (a, b) = (eval(opt(&p, a).unwrap(), &vars), eval(opt(&p, b).unwrap(), &vars));
                             let zoom = size / (b - a);
@@ -561,6 +645,7 @@ fn the_motion_plan_samples_the_curves_the_graphs_expressions_write_at_every_outp
                             ("H", h),
                             ("w", f64::from(geom.layer.0)),
                             ("h", f64::from(geom.layer.1)),
+                            ("PI", PI),
                         ];
                         let y = opt(&opts, "y").unwrap();
                         let place = |expr: &str| (eval(expr, &vars) as i64 & !1) as i32;

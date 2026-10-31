@@ -1048,6 +1048,9 @@ export interface Clip {
 	/** Video stabilization: the camera's shake taken out of the picture once its analysis lands
 	 *  (`clipStabilizationStatus`). Absent when the clip is not stabilized (the backend omits it). */
 	stabilize?: Stabilize | null;
+	/** Live behaviours (`Behavior`): procedural motion on top of the pose and its keys, in list order. Absent when
+	 *  the clip has none (the backend omits it); at most `MAX_BEHAVIORS`. */
+	behaviors?: Behavior[];
 }
 
 /** How strongly a clip is stabilized (`Stabilize`). */
@@ -2643,6 +2646,134 @@ export interface AudioDetached {
 	timeline: Timeline;
 	detached: number;
 	skipped: { clip_id: string; reason: string }[];
+}
+
+// ---- Motion presets (B8a) -------------------------------------------------------
+
+/** What a motion preset does in a clip's life (`MotionKind`). */
+export type MotionKind = 'entrance' | 'exit' | 'emphasis';
+
+/** How a preset meets the keys the clip already has (`MotionMode`): `add` (the default) replaces the clip's keys of
+ *  those numbers inside the window and keeps the ones outside; `replace` gives them exactly the preset's keys. */
+export type MotionMode = 'replace' | 'add';
+
+/** A motion preset's wire name (`MotionPreset`): a direction names where the picture comes from / goes to. */
+export type MotionPreset =
+	| 'fade_in'
+	| 'slide_in_from_left'
+	| 'slide_in_from_right'
+	| 'slide_in_from_top'
+	| 'slide_in_from_bottom'
+	| 'zoom_in'
+	| 'pop_in'
+	| 'spin_in'
+	| 'drop_in'
+	| 'fade_out'
+	| 'slide_out_to_left'
+	| 'slide_out_to_right'
+	| 'slide_out_to_top'
+	| 'slide_out_to_bottom'
+	| 'zoom_out'
+	| 'pop_out'
+	| 'spin_out'
+	| 'drop_out'
+	| 'pulse'
+	| 'wiggle'
+	| 'bounce'
+	| 'push_in'
+	| 'pull_out';
+
+/** One preset as the picker lists it (`MotionPresetInfo`). */
+export interface MotionPresetInfo {
+	id: MotionPreset;
+	label: string;
+	kind: MotionKind;
+	/** Seconds; absent for a preset that fills the rest of the clip (`push_in`, `pull_out`). */
+	default_duration?: number;
+	hint: string;
+	/** The numbers it keys. */
+	properties: Property[];
+}
+
+/** A clip a preset was written into and the window it covers, seconds from the clip's start (`MotionApplied`). The
+ *  Tauri command answers the slimmer `MotionWindow`: the clip is already in the timeline it returns. */
+export interface MotionApplied {
+	clip: Clip;
+	start: number;
+	end: number;
+}
+
+/** The window a preset was written over on one clip, seconds from the clip's start (the clamped one). */
+export interface MotionWindow {
+	clip_id: string;
+	start: number;
+	end: number;
+}
+
+/** What applying a preset did: the refreshed timeline and the window each clip got (`MotionApplication`). */
+export interface MotionApplication {
+	timeline: Timeline;
+	applied: MotionWindow[];
+}
+
+// ---- Live behaviours (B8b) ---------------------------------------------------
+
+/** What a behaviour does (`BehaviorKind`, the `kind` tag). */
+export type BehaviorKind = 'sway' | 'breathe' | 'spin' | 'drift' | 'shake';
+
+/** One live behaviour of a clip (`Behavior`, tagged by `kind`). `phase` is clip-local seconds added to the clock
+ *  (a head cut shifts it, so the motion carries on); `seed` and `angle` default to 0 when absent. */
+export type Behavior =
+	/** Rotation `+= amount * sin(2 pi speed u)`: `amount` degrees each way (0..180), `speed` Hz (0..30). */
+	| { kind: 'sway'; amount: number; speed: number; phase?: number }
+	/** Scale `*= 1 + amount * sin(2 pi speed u)`: `amount` a fraction of the zoom (0..0.9), `speed` Hz (0..30). */
+	| { kind: 'breathe'; amount: number; speed: number; phase?: number }
+	/** Rotation `+= speed * 360 * u`: `speed` turns a second, signed (-10..10). */
+	| { kind: 'spin'; speed: number; phase?: number }
+	/** Position `+= speed * u * (cos angle, sin angle)`: `speed` frame widths / heights a second, signed (-5..5);
+	 *  `angle` degrees from the right, 90 is down. */
+	| { kind: 'drift'; speed: number; angle?: number; phase?: number }
+	/** Position `+=` three sines per axis: `amount` of the frame (0..0.25), `speed` Hz (0..30), the same `seed` the
+	 *  same shake. */
+	| { kind: 'shake'; amount: number; speed: number; seed?: number; phase?: number };
+
+/** The limits of `Behavior`, the core's (`MAX_BEHAVIORS` and the rest): a write past one is refused, a stored
+ *  number past one is read held to it. */
+export const MAX_BEHAVIORS = 8;
+export const MAX_BEHAVIOR_HZ = 30;
+export const MAX_SWAY_DEGREES = 180;
+export const MAX_BREATHE = 0.9;
+export const MAX_SPIN_TURNS = 10;
+export const MAX_DRIFT = 5;
+export const MAX_SHAKE = 0.25;
+export const MAX_BEHAVIOR_PHASE = 1_000_000;
+
+/** What baking a clip's behaviours into keys wrote (`Baked`). */
+export interface Baked {
+	/** The numbers that now carry keys. */
+	properties: Property[];
+	/** Keys written to each. */
+	keys: number;
+	/** The frame rate they were sampled at. */
+	fps: number;
+}
+
+/** A clip a bake wrote keys into and what it wrote (`BakedClip`). The Tauri command answers the slimmer
+ *  `BakeReport`: the clip is already in the timeline it returns. */
+export interface BakedClip {
+	clip: Clip;
+	baked: Baked;
+}
+
+/** What a bake did to one clip, as the Tauri command reports it (`BakeReport`). */
+export interface BakeReport extends Baked {
+	clip_id: string;
+}
+
+/** What baking did: the refreshed timeline and what was written per clip (`BakeApplication`). */
+export interface BakeApplication {
+	timeline: Timeline;
+	baked: BakeReport[];
 }
 
 // ---- GPU preview (A2) -------------------------------------------------------

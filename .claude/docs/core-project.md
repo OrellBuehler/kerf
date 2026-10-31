@@ -198,8 +198,13 @@
   the column is missing, `needed_to_read` true since `ASSET_COLUMNS` selects it): an older build would drop the spec at its next
   write of the asset and could no longer reshape the effect (`a_v18_file_gains_the_sound_effect_column_and_keeps_a_backup`); the
   effects sit on ordinary audio tracks as ordinary clips, so no timeline JSON moves and there is no `persisted/` file for v19.
-  The schema is at **v19** (`SCHEMA_VERSION`). `persist_tests` pins which steps a file has pending with
-  `store::pending_steps` (a legacy file that has every column: `[4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17]`). A step's `needed_to_read` says whether a build that
+  v19→v20 is a JSON step for a **new field**, `Clip.behaviors` (live behaviours, `core-model.md`): an older build drops it at its next
+  write of the clip, which then stops swaying or shaking; a clip with none is written as before, `run` a no-op, `needed` always,
+  `needed_to_read` false (`a_v19_file_is_backed_up_stamped_v20_and_keeps_its_behaviours`); `persisted/timelines-v20.json` holds a clip with
+  a sway and a seeded shake. `Project::set_behaviors` ("Set behaviours" / "Clear behaviours") and `bake_behaviors` ("Bake behaviours") are one
+  revision each, all or nothing, and stage like any agent edit (`project/behavior_tests.rs`).
+  The schema is at **v20** (`SCHEMA_VERSION`). `persist_tests` pins which steps a file has pending with
+  `store::pending_steps` (a legacy file that has every column: `[4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 15, 16, 17, 19]`). A step's `needed_to_read` says whether a build that
   cannot write must still refuse a file lacking what it adds: true for the v1, v2, v4, v15 and v19 columns (the reads
   name them), false for the `fonts` table (reads tolerate its absence), so a write-protected v2 project
   opens as it is. A new file is stamped `SCHEMA_VERSION`; a

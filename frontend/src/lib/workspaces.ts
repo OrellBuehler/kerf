@@ -38,7 +38,7 @@ export { WORKSPACE_IDS, isWorkspaceId, type WorkspaceId };
 
 // ---- the library rail ------------------------------------------------------
 
-export const LIBRARY_TABS = ['media', 'titles', 'effects', 'transitions', 'audio', 'transcript'] as const;
+export const LIBRARY_TABS = ['media', 'titles', 'effects', 'transitions', 'motion', 'audio', 'transcript'] as const;
 export type LibraryTab = (typeof LIBRARY_TABS)[number];
 
 export interface LibraryTabSpec {
@@ -55,6 +55,7 @@ export const LIBRARY_TAB_SPECS: LibraryTabSpec[] = [
 	{ id: 'titles', label: 'Titles', icon: 'type', hint: 'Titles, lower thirds and captions' },
 	{ id: 'effects', label: 'Effects', icon: 'sparkles', hint: 'Color looks and video effects for the selected clip' },
 	{ id: 'transitions', label: 'Transitions', icon: 'blend', hint: 'Fades, slides and pushes into the selected clip' },
+	{ id: 'motion', label: 'Motion', icon: 'move', hint: 'Entrances, exits and emphases for the selected clips' },
 	{ id: 'audio', label: 'Audio', icon: 'audio-waveform', hint: 'Audio effects and voiceover' },
 	{ id: 'transcript', label: 'Transcript', icon: 'file-text', hint: 'The transcript — click a line to seek, × to cut it' }
 ];
@@ -85,7 +86,7 @@ export const WORKSPACE_SPECS: WorkspaceSpec[] = [
 	{ id: 'edit', label: 'Edit', hint: 'Cut and arrange — library, preview, inspector and a full-width timeline', libraryTab: 'media' },
 	{ id: 'color', label: 'Color', hint: 'Grade the picture — the preview as large as it gets, controls beside it', libraryTab: 'effects' },
 	{ id: 'audio', label: 'Audio', hint: 'Work on sound — the mixer beside the picture, the timeline under it for the waveforms', libraryTab: 'audio' },
-	{ id: 'motion', label: 'Motion', hint: 'Titles, transitions and keyframes — preview, a wide inspector and the timeline', libraryTab: 'titles' },
+	{ id: 'motion', label: 'Motion', hint: 'Motion presets, titles, transitions and keyframes — preview, a wide inspector and the timeline', libraryTab: 'motion' },
 	{ id: 'deliver', label: 'Deliver', hint: 'Check where the cut is going and export it', libraryTab: 'media' }
 ];
 

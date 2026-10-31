@@ -1013,6 +1013,7 @@ describe('keys that act once per press', () => {
 			'sfx.add',
 			// Commands with no key of their own, run from the menus: one press, one run.
 			'view.minimap',
+			'view.motionPath',
 			'view.safeAreas',
 			'workspace.edit',
 			'workspace.color',
@@ -1124,6 +1125,7 @@ describe('no key is hard-coded outside the registry', () => {
 		// listed so a new one is a decision.
 		expect(handlers).toEqual([
 			'lib/components/editor/AgentPanel.svelte',
+			'lib/components/editor/BehaviorsSection.svelte',
 			'lib/components/editor/ContextMenu.svelte',
 			'lib/components/editor/DopeGraph.svelte',
 			'lib/components/editor/DopeSheet.svelte',

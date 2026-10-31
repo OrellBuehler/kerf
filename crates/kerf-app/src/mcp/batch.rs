@@ -44,7 +44,8 @@ pub struct EditOp {
     /// reattach_audio, reattach_audio_clips, link_clips, unlink_clips, set_volume, set_fade, set_speed,
     /// set_speed_ramp, set_transform, set_transform_at, set_color, set_grade (without a lut_path), set_transition,
     /// set_video_effects, set_audio_effects, set_mask, set_blend_mode, set_clip_enabled, set_keyframes, add_keyframe,
-    /// set_keyframe_easing, set_property_keyframes, set_property_tracks, copy_keyframes, clear_keyframes,
+    /// set_keyframe_easing, set_property_keyframes, set_property_tracks, copy_keyframes, apply_motion_preset,
+    /// set_behaviors, bake_behaviors, clear_keyframes,
     /// set_reframe, clear_reframe, set_reframe_keyframes, add_reframe_keyframe, set_track_volume,
     /// set_track_pan, set_track_duck, set_track_muted, set_track_solo, set_track_locked, set_master_volume,
     /// set_master_limiter, set_master_true_peak, set_master_duck, fit_music, add_overlay, update_overlay,
@@ -127,6 +128,9 @@ batchable! {
     set_property_keyframes => KerfMcp::set_property_keyframes_op,
     set_property_tracks => KerfMcp::set_property_tracks_op,
     copy_keyframes => KerfMcp::copy_keyframes_op,
+    apply_motion_preset => KerfMcp::apply_motion_preset_op,
+    set_behaviors => KerfMcp::set_behaviors_op,
+    bake_behaviors => KerfMcp::bake_behaviors_op,
     clear_keyframes => KerfMcp::clear_keyframes_op,
     set_reframe => KerfMcp::set_reframe_op,
     clear_reframe => KerfMcp::clear_reframe_op,
@@ -499,6 +503,90 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.message.contains("has not run yet"), "{}", err.message);
+    }
+
+    #[test]
+    fn motion_presets_batch_as_one_step_with_the_window_each_clip_got() {
+        let (project, ids) = sample();
+        let out = apply(
+            &project,
+            json!({"ops": [
+                {"tool": "apply_motion_preset", "args": {"clip_ids": [ids[0]], "preset": "fade_in"}},
+                {"tool": "apply_motion_preset", "args": {"clip_ids": [ids[0]], "preset": "slide_out_to_left", "duration": 0.4}},
+                {"tool": "apply_motion_preset", "args": {"clip_ids": [ids[0]], "preset": "push_in", "mode": "replace"}},
+            ], "label": "Animate the open"}),
+        )
+        .unwrap();
+        assert_eq!(out["ops"], 3);
+        assert_eq!(out["results"][0]["applied"][0]["clip_id"], ids[0].as_str());
+        assert_eq!(out["results"][0]["applied"][0]["start"], 0.0);
+        assert_eq!(out["results"][0]["applied"][0]["end"], 0.5);
+        let length = project.lock().unwrap().timeline().unwrap().tracks[0].clips[0].duration();
+        assert_eq!(
+            out["results"][1]["applied"][0]["end"], length,
+            "the exit ends on the clip's end"
+        );
+        assert_eq!(out["results"][2]["mode"], "replace");
+        assert_eq!(proposal_steps(&project), Some(1), "one staged step for the three");
+        let err = apply(
+            &project,
+            json!({"ops": [{"tool": "apply_motion_preset", "args": {"clip_ids": [ids[0]], "preset": "pulse", "intensity": 9.0}}]}),
+        )
+        .unwrap_err();
+        assert!(
+            err.message
+                .starts_with("op 0 (apply_motion_preset): invalid argument: intensity must be within"),
+            "{}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn behaviors_batch_with_a_bake_as_one_step() {
+        let (project, ids) = sample();
+        let out = apply(
+            &project,
+            json!({"ops": [
+                {"tool": "set_behaviors", "args": {"clip_ids": [ids[0]], "behaviors": [
+                    {"kind": "sway", "amount": 4.0, "speed": 0.5},
+                    {"kind": "shake", "amount": 0.01, "speed": 6.0, "seed": 3},
+                ]}},
+                {"tool": "set_behaviors", "args": {"clip_ids": [ids[0]], "behaviors": [
+                    {"kind": "spin", "speed": 0.1},
+                ]}},
+                {"tool": "bake_behaviors", "args": {"clip_ids": [ids[0]], "fps": 10.0}},
+            ], "label": "Spin it, then key it"}),
+        )
+        .unwrap();
+        assert_eq!(out["ops"], 3);
+        assert_eq!(out["results"][0]["clips"][0]["behaviors"].as_array().unwrap().len(), 2);
+        assert_eq!(out["results"][1]["clips"][0]["behaviors"][0]["kind"], "spin");
+        assert_eq!(out["results"][2]["baked"][0]["properties"], json!(["rotation"]));
+        assert_eq!(out["results"][2]["baked"][0]["fps"], 10.0);
+        assert_eq!(proposal_steps(&project), Some(1), "one staged step for the three");
+        let staged = project.lock().unwrap().staged_timeline().unwrap().unwrap();
+        let clip = staged.clip(ids[0].parse().unwrap()).unwrap();
+        assert!(clip.behaviors.is_empty() && !clip.property_keys(kerf_core::Property::Rotation).is_empty());
+
+        let err = apply(
+            &project,
+            json!({"ops": [{"tool": "set_behaviors", "args": {"clip_ids": [ids[0]], "behaviors": [
+                {"kind": "sway", "amount": 400.0, "speed": 1.0},
+            ]}}]}),
+        )
+        .unwrap_err();
+        assert!(
+            err.message
+                .starts_with("op 0 (set_behaviors): invalid argument: sway amount must be"),
+            "{}",
+            err.message
+        );
+        let err = apply(
+            &project,
+            json!({"ops": [{"tool": "bake_behaviors", "args": {"clip_ids": [ids[0]]}}]}),
+        )
+        .unwrap_err();
+        assert!(err.message.contains("no behaviours to bake"), "{}", err.message);
     }
 
     #[test]

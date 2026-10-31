@@ -91,6 +91,7 @@ import {
 	ChevronUp,
 	CodeXml,
 	Orbit,
+	Move,
 	Ellipsis,
 	LayoutTemplate,
 	Wind,
@@ -218,6 +219,7 @@ export const icons: Record<string, LucideIcon> = {
 	'chevron-up': ChevronUp,
 	// Animated SVG titles: motion on the titles lane, and the source a custom one is written in.
 	'orbit': Orbit,
+	'move': Move,
 	'code-xml': CodeXml,
 	// Motion templates: the library's kind of title, and the menu on a card.
 	'layout-template': LayoutTemplate,

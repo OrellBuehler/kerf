@@ -138,7 +138,7 @@ racing writes could leave the older on disk; bun-tested). `workspace.svelte.ts`
 is the runes singleton: `switchTo` keeps the arrangement being left, swaps the
 layout and shows the library tab that workspace last had (each remembers its own;
 until one is picked it is the workspace's tool: Color → Effects, Audio → Audio,
-Motion → Titles — titles are added there, not in the Inspector —, Edit and Deliver → Media; a tab the user picked
+Motion → Motion (it was Titles; titles are added in their own tab, not in the Inspector), Edit and Deliver → Media; a tab the user picked
 in a workspace is stored and kept, only the unpicked default moved), and **touches no project state**
 — cut, selection, playhead and playback are `editor` / `ui` and survive (dockview
 rebuilds the panels, so a panel's own scroll starts over). **A layout is written
@@ -197,7 +197,7 @@ decoded thumbnails live in `thumbnails.ts` rather than the component — the lib
 remounts it on every tab switch, unfold and workspace switch, and each remount
 used to decode every asset again; it keeps answers, including "no frame", but not
 a failed decode, which is retried on the next mount), Titles (`TitlesControls`), Effects (color looks +
-video effects), Transitions (the grouped picker), Audio (audio effects + the
+video effects), Transitions (the grouped picker), Motion (the presets below), Audio (audio effects + the
 voiceover and music entry points), Transcript (`TranscriptPanel`). **The Media tab's header is the one place for the count and the
 ways in**: `MEDIA · 3` (`MEDIA · 3 of 12` under a tag filter) with the tag-filter, music, voiceover and import buttons (`importMedia`, `import-media.ts`; the import tooltip carries
 `file.import`'s key from the keymap) — the bin used to stack the dock tab, `MEDIA` and `3 ASSETS`. **A bin row is
@@ -335,7 +335,7 @@ an icon** (a ragged icon column read as a rendering bug), only the check column 
 key beside an entry is `Kbd` (`.k-kbd`, `accel.ts`: 11 px mono, muted, a punctuation key in a small
 keycap, an arrow a size larger) — the same look as the context menus and the tooltips. **Every entry names a keymap action**
 (`file.importCaptions`, `file.saveCover`, `app.quit`, `tool.snap` — default `S` —,
-`view.minimap`, `view.safeAreas`, `workspace.<id>`, `window.resetWorkspace` /
+`view.minimap`, `view.motionPath`, `view.safeAreas`, `workspace.<id>`, `window.resetWorkspace` /
 `resetAllWorkspaces`, `app.keyboard` / `checkUpdate` / `releases` / `logs` / `about`
 were added, the new ones unbound by default so a build never takes a key) and runs
 the page's own `run` handler for it, so a menu and its shortcut are one piece of
@@ -418,7 +418,19 @@ grade through FFmpeg because the GPU preview refuses a graded clip), a **Blend**
 section (`blend-modes.ts`: `BLEND_MODES`, the core's `BlendMode` ids, labels and a hint each shown by `use:tip`; one
 `set_blend_mode` on change, nothing written for the mode the clip has; `blendModeOf` reads an absent field as `normal`; the
 harness writes `normal` as no field and refuses a clip on an audio track, `blend-modes.test.ts`; the preview of a blended clip
-is FFmpeg's, as the GPU refuses it), **stabilize** (`StabilizeSection.svelte`, offered for
+is FFmpeg's, as the GPU refuses it), **behaviours** (`BehaviorsSection.svelte`, B8b, right after Transform: **Add** opens a menu of
+the five kinds (`ADD_CHOICES`: sway, breathe, spin, drift, shake, each with its starting numbers) and appends one at those numbers
+(a shake with a random seed); **Bake** turns them into keys at the delivery rate, and a refusal (nothing to bake, a clip too long for
+its keys) is shown in the section as an alert, not toasted; one group per behaviour, named "Sway" / "Sway 2" (`rowName`), with an
+x to remove it, `SliderRow`s for its numbers (`behavior-ui.ts` `behaviorFields`: the slider travel is the useful stretch and a typed
+entry goes on to the core's limit — 180° of sway, 30 Hz, 90 % of breath, 10 turns a second, 5 frames a second, 25 % of shake — in
+units a person has: °/s for a spin, %/s of the frame for a drift) and **Phase**, plus a seed field and a "another shake" button on a
+shake. The section's summary names them in order (`behaviorsSummary`: "Sway · Shake", "Sway ×2", "None"). Every write replaces the clip's
+**whole list** with one `set_behaviors` edit, read from the timeline as it is when the gesture *ends* with only that row's number
+changed (so a slider released after the selection moved still lands on its clip); a slider is one edit on release and Escape,
+pointercancel and blur abandon it (`SliderRow`); the seed field commits on Enter / blur and Escape puts it back. A clip carries at most
+8; Add is off at the limit. The preview shows the clip through FFmpeg (the GPU preview refuses a behaviour), so it moves),
+**stabilize** (`StabilizeSection.svelte`, offered for
 moving footage on a video track only, `stabilize.ts`'s `canStabilize`: a switch, a strength `SliderRow`, an automatic-zoom
 switch and a zoom slider when it is off, each one `set_clip_stabilize`; a status badge and line from
 `clip_stabilization_status` and `stabilize-progress`; the panel starts `analyze_clip_stabilization` itself for a clip whose
@@ -643,7 +655,7 @@ reframe) gets a box drawn **where the export puts it**: the canvas is `renderCan
 delivery frame, else the first picture of the rendered cut, even sides, the delivery's fit), the box is
 `layer-geometry.ts`, a faithful port of kerf-core's `layer_geometry.rs` (crop / fit / second scale / rotate / overlay
 rounding, chroma grids, `pix_fmt_subsampling`) replayed against a Rust-written corpus (`core-render-plan.md`), at the
-clip's pose at the playhead (`transformAt`). A translucent picture of odd size, which the engine's geometry refuses for its
+clip's picture at the playhead (`transformAt`, live behaviours included; a drag writes the pose under them, see below). A translucent picture of odd size, which the engine's geometry refuses for its
 pixels (FFmpeg's RGB round trip), is boxed as if opaque: opacity moves nothing; only a picture nothing draws (an empty
 crop) has no box. (A zoom in under Contain, and a Cover clip that zooms or pans, are one `scale` from the source in the file now
 (`engine-cli.md`, "A zoom is part of the fit"): the port still places fit-then-zoom, within a pixel or two for Contain and, for
@@ -665,6 +677,82 @@ The handles count as page overlays for `routePreview` (`handles`), so on an X11 
 to the JPEG while they show (a click on the surface itself never reaches the page there: select the clip in the timeline);
 under a transparent webview they draw over the surface. Not done: separate X / Y scale (the model has one `scale`; it
 needs a model, export-graph and GPU change), a live GPU picture during the drag (A3).
+
+**Motion presets** (B8a) are the library's **Motion** tab (`MotionTab.svelte`, rail icon `move`, between Transitions and Audio; the Motion
+workspace opens on it), a tab of its own rather than a group in Effects because it is a third kind of thing a click writes (keys on the
+transform numbers, which neither a look nor an effect chain nor a transition is), has options of its own, and 23 tiles would have swamped
+Effects. Three groups, **Entrance / Exit / Emphasis** (`MOTION_GROUPS` in `motion-ui.ts`), each preset a `Tile` named by its label with the
+hint, the length and where it lands in its tooltip (`presetTip`); the list is `listMotionPresets()` (the backend's, the page's
+`motionPresets()` until it answers). A click is `applyMotion(preset)` (`ops.ts`) — one `apply_motion_preset` edit for every selected
+**picture** clip (`motionTargets`: a clip on an audio track is left out, since the core would refuse the whole call, and a linked picture
+is selected with its sound), through `holdForPreview` and `report` like any edit; the tiles are off with a `Hint` saying why when nothing
+or only sounds are selected (`motionReason`). The options above the tiles are `ui.motionMode` (Add, the default: keeps the clip's own
+animation outside the window; Replace), `ui.motionLength` (a text field, blank = the preset's own, `parseMotionLength`; an exit still ends at the clip's end)
+and `ui.motionIntensity` (a `SliderRow`, 0.25 to 2); they outlive the tab and are what every click sends (`motionOptions` leaves the
+defaults out). A **fourth group, Behaviours** (B8b), is five tiles (Sway, Breathe, Spin, Drift, Shake): a click is `addBehavior(kind)`
+(`ops.ts`) — the kind at its starting numbers appended to each selected **picture** clip's behaviours, through `holdForPreview` and
+`report`, off with the same reason as the presets; Mode, Length and Strength are the presets' and do not apply. Clips that carry the same
+list are **one** `set_behaviors` edit (the usual case, none having any); clips that differ (`additions` groups them by list) are one edit per
+distinct list, since the command replaces one list on all its clips; a clip already at 8 refuses the lot with a notice, as the backend would. The one thing said afterwards, in a toast, is a window a clip cut short (`clampedNotice`, from the windows the command
+returns). The clip's context menu has **Motion presets…** (not a submenu: context menus are flat lists) which opens the panel, the tab and
+the rail. The browser harness runs the same presets through `motion-presets.ts` (a port of kerf-core's table, window rules and
+`apply_motion`, replayed bit for bit over `fixtures/motion-presets-corpus.json` by `motion-presets.test.ts`, which also holds the labels and
+hints to the Rust table) and records `Apply motion preset Pop in (3 clips)` as one revision.
+
+**Live behaviours in the TS mirror** (B8b). `behaviors.ts` is the faithful port of `model/behavior.rs` (the five closed forms, `u32`
+seed hash with `Math.imul`, limits, `sanitized` / `isNeutral` / `behaviorProblem`, `shifted` / `rebaseBehaviors`); `behavior-ops.ts` of
+`Clip::bake_behaviors` and `Project::set_behaviors` / `bake_behaviors` (the harness's `set_behaviors` / `bake_behaviors`, with the
+backend's labels, refusals and all-or-nothing); both are replayed over `fixtures/behaviors-corpus.json` (written by kerf-core) by
+`behaviors.test.ts`: limits, shake table, seed phases, base and picture poses at moments of 12 clips plus the flags built on them, what is
+held and what is refused, rebase vectors (via `rebaseAnimation`) and bake vectors with the exact words of the refusals (a pose is read
+to a billionth: Rust's `sin` and V8's differ by an ulp). **The resolver has the core's two views**: `channels.ts` `propertyAt` /
+`transformAt` are the *picture* (keys or the static value, behaviours on top), `baseAt` / `baseTransformAt` the *pose* without them, and
+`isDriven` / `transformAnimated` (keyed or behaved) are `Clip::is_driven` / `is_animated` while `transformKeyed` is the keys alone (what
+routes an Inspector edit). **Every edit that writes keys samples the base**: `poseTransform`, the harness's `addKeyframe`,
+`motion-presets.ts`, `rebaseAnimation` (which also shifts each behaviour's `phase` by the cut) and `motion-path.ts` (which reads
+`propertyCurve` / `staticValue` and never the picture). The Inspector's Transform sliders and their keyed writes show and write the
+base too, so a sway does not make the numbers swim.
+
+**Behaviours in the Preview.** The transform box is drawn **at the picture** (`layersAt`: `Layer.pose` is `transformAt`, behaviours
+included, so the box follows the wobble exactly as the frame does; `Layer.base` is the pose they ride on), the gesture is worked
+out there (the ghost follows the pointer), and what is written is `toBase(layer, patch)`: a position and a rotation less what the
+behaviours add at the playhead, a zoom divided by the factor a breath multiplies it by — a drag moves the pose and the behaviour
+goes on moving it. The readout shows the pose's numbers, as the Inspector does; a clip a behaviour moves is not cropped in place
+(`croppable` counts `isDriven`). **The motion path draws the base keyed path**: its curve, dots and ticks are the keys' (a behaviour is
+not a key and has no dot), the frame's shift is still the geometry's rounding only (it is made from the picture's pose, since the box
+is), so the box visibly leaves the path by what the behaviours add; a drag of a dot writes keyed numbers with no wobble in them. A clip
+with only behaviours and no position keys has no path.
+
+**The motion path** (`MotionPath.svelte`, mounted beside the handles with the same `active` — so hidden while playing, streaming,
+previewing a proposal or in the trim monitor — pure math in `motion-path.ts`; **View › Motion path**, `view.motionPath`, no
+default key, `ui.motionPath`, on by default and remembered in `localStorage` like the overview strip). While **one** picture is
+selected under the playhead, not on a locked track, and its position is keyed (`pos_x` or `pos_y`, a track or the legacy bundle:
+`positionKeyed` over `channels.ts`' resolver) the Preview draws where its centre goes over the clip's whole duration: the eased
+polyline of both numbers (`propertyCurve`, the curve every renderer draws; a hold is the straight jump) sampled every frame (every
+few on a long clip, `MAX_SAMPLES`), in the canvas the handles use. A position is a fraction of the frame from its centre, and
+`PathFrame.shift` adds what the integer geometry does to the box's centre at the playhead (overlay's even rounding, a letterbox's
+odd pixel) so the path meets the transform box exactly there and stays smooth elsewhere. **A position key is the union of the two
+numbers' key times** (a dot each, `pathKeys`; the number with no key at that moment is read off its curve); the key within a
+frame of the playhead is the lit one (`hereKey`). Tick marks across the path at equal steps of time (`pathTicks`, a frame
+apart, or every few on a long clip) make the easing visible as spacing: close where the clip is slow, wide where it is fast; none
+at a dot or where it stands still. **Click a dot** seeks to the key (exactly; a key at the clip's very end goes to its last
+frame, still inside the clip: `seekTarget`). **Drag a dot** moves that key (`dragKey`: `movePose` of the transform handles on a
+point, so the same snapping — frame edges and centre lines, the title-safe box and chrome while the guides are drawn, the other
+pictures, 6 px, **Alt** inverts, the timeline's snap toggle — and **Shift** to one axis; snapped and written in the frame's own
+units, so a centre line is position 0 and not the playhead's rounding), one `set_property_tracks` edit on release
+(`moveKeyTracks`), nothing written for a drag that moves nothing, Escape / pointercancel / lost capture / blur abandon it
+(`beginDrag`). While held the path and dots redraw from the clip as the edit would leave it (`withTracks`, the resolver's
+replace-a-track rule), with the transform handles' snap guides and readout; the transform box itself settles on release. Only
+the numbers that moved are written: a number with a key there takes the value (how it leaves kept; a key it had none at splits
+the segment, `upsertKey`), a number the legacy bundle drives is **detached alone** (its track appears, the other four numbers
+stay in the bundle), and a number **nobody keys** that a free drag moves is keyed at every position key, holding its value
+everywhere but the dragged one, with the other number's easing, so the rest of the path stays put (Shift keeps it unkeyed).
+Dragging a dot that is a key of one number only moves the neighbouring dots that are keys of the other number too, as their
+value is read off the changed curve. **Double-click the path** keys every keyed position number at the nearest frame of the
+cut (`nearestOnPath`, `snapKeyTime`, `addKeyTracks`: the value its curve has there, splitting the segment, so the shape stays)
+in one edit; a number that is not keyed stays so. The dots are buttons named `Position key at <time>` (Enter / Space seek).
+The path counts as a page overlay for `routePreview` like the handles. The harness's starter cut moves the b-roll clip
+(position keyed on both numbers at different moments, scale 40 %) so the path is there to see.
 
 
 **The delivery frame has a frame rate** (`Delivery.fps`, optional, 1..240): what exports, the playback and the stills default

@@ -151,7 +151,7 @@ export function editable(v: number, s: RowSpec): string {
 	return display(v, s).toFixed(s.digits ?? 2);
 }
 
-const ENTRY = /^([+-]?(?:\d+\.?\d*|\.\d+))\s*(%|°|×|x|s)?$/i;
+const ENTRY = /^([+-]?(?:\d+\.?\d*|\.\d+))\s*(%|°|×|x|s|hz)?$/i;
 
 /** A typed entry as a value, or `null` for something that is not a number. The unit may be
  *  left off or written; it is shown units that are typed (50 in a percentage field is 50 %), and

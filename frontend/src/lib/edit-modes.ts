@@ -22,7 +22,8 @@
 // follows the project's ripple mode like any trim.
 
 import { curve, EASE_STEPS } from './easing';
-import { rebaseChannels, transformAt } from './channels';
+import { baseTransformAt, rebaseChannels } from './channels';
+import { rebaseBehaviors } from './behaviors';
 import { formatTime } from './diff';
 import { invalid, locateIndex, samePace, unlockedPartners } from './link-groups';
 import { toFixedEven } from './format-fixed';
@@ -228,11 +229,12 @@ function startAfter(clips: readonly Clip[], end: number, skip: readonly number[]
  *  keyframes are clip-local, so they ride with the content. Shortened from the front
  *  (`by > 0`) the pose the clip now opens on is pinned as a key at 0 and later keys
  *  shift back; pulled earlier (`by < 0`) every key shifts later. A speed ramp's keys
- *  are the same kind of clip-local time (`rebaseRamp`). */
+ *  are the same kind of clip-local time (`rebaseRamp`), and a behaviour's `phase` moves by the cut. */
 export function rebaseAnimation(clip: Clip, by: number) {
 	if (by > 0) {
 		if (clip.keyframes?.length) {
-			const pose = transformAt(clip, by);
+			// The keys' pose, not the behaviours': those carry on by their own clock (`rebaseBehaviors`).
+			const pose = baseTransformAt(clip, by);
 			const pinned: Keyframe = {
 				time: 0,
 				scale: pose.scale,
@@ -282,8 +284,10 @@ export function rebaseAnimation(clip: Clip, by: number) {
 		for (const k of clip.keyframes ?? []) k.time -= by;
 		for (const k of clip.reframe?.keyframes ?? []) k.time -= by;
 	}
-	// Per-property channels ride with the content too (`Clip::rebase_channels`), and so does a speed ramp.
+	// Per-property channels ride with the content too (`Clip::rebase_channels`), and so do the live behaviours
+	// (their phase shifts by the cut: `Clip::rebase_behaviors`) and a speed ramp.
 	rebaseChannels(clip, by);
+	rebaseBehaviors(clip, by);
 	rebaseRamp(clip, by);
 }
 

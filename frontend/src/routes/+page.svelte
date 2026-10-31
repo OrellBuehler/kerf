@@ -724,6 +724,7 @@
 		'view.zoomOut': () => ui.zoomBy(-1),
 		'view.zoomFit': () => ui.zoomToFit(),
 		'view.minimap': () => ui.toggleMinimap(),
+		'view.motionPath': () => ui.toggleMotionPath(),
 		'view.safeAreas': () => void settings.setSafeAreas(!settings.safeAreas),
 
 		'workspace.edit': () => workspace.switchTo('edit'),

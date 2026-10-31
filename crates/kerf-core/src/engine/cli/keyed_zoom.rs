@@ -32,29 +32,29 @@ use crate::engine::test_support::{image_stream, make_clip, test_asset, timeline_
 use crate::model::{Asset, Clip, Easing, FitOrder, Keyframe, Mask, MaskShape, Transition, TransitionKind, VideoEffect};
 
 /// The export frame.
-const CW: u32 = 320;
-const CH: u32 = 180;
+pub(super) const CW: u32 = 320;
+pub(super) const CH: u32 = 180;
 /// The source picture: 4:3, so that `Contain` pillarboxes it and `Cover` crops it, a
 /// red field with a blue box (`BOX`, in source pixels) dead centre. Every edge is even,
 /// so 4:2:0 chroma puts them exactly where they are drawn.
-const SW: u32 = 160;
-const SH: u32 = 120;
-const BOX: [f64; 4] = [60.0, 44.0, 100.0, 76.0];
+pub(super) const SW: u32 = 160;
+pub(super) const SH: u32 = 120;
+pub(super) const BOX: [f64; 4] = [60.0, 44.0, 100.0, 76.0];
 /// The base the keyed clip is composited over.
-const GREEN: [i32; 3] = [0, 128, 0];
+pub(super) const GREEN: [i32; 3] = [0, 128, 0];
 
 /// `(the text the graph carries, numerator, denominator)`, as in `rendered.rs`.
-type Rate = (&'static str, u32, u32);
-const R30: Rate = ("30", 30, 1);
-const RATES: [Rate; 5] = [("24", 24, 1), ("25", 25, 1), ("29.97", 2997, 100), R30, ("60", 60, 1)];
+pub(super) type Rate = (&'static str, u32, u32);
+pub(super) const R30: Rate = ("30", 30, 1);
+pub(super) const RATES: [Rate; 5] = [("24", 24, 1), ("25", 25, 1), ("29.97", 2997, 100), R30, ("60", 60, 1)];
 
-fn scratch(tag: &str) -> PathBuf {
+pub(super) fn scratch(tag: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("kerf-keyed-zoom-{tag}-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("temp dir");
     dir
 }
 
-fn ffmpeg(args: &[String]) {
+pub(super) fn ffmpeg(args: &[String]) {
     let made = command(&ffmpeg_bin())
         .args(["-hide_banner", "-loglevel", "error", "-y"])
         .args(args)
@@ -63,7 +63,7 @@ fn ffmpeg(args: &[String]) {
     assert!(made.success(), "ffmpeg {args:?}");
 }
 
-fn s(v: &str) -> String {
+pub(super) fn s(v: &str) -> String {
     v.to_string()
 }
 
@@ -247,7 +247,7 @@ fn green(dir: &Path, fps: &str, secs: f64) -> Asset {
     asset
 }
 
-fn options(rate: Rate, fit: Fit) -> ExportOptions {
+pub(super) fn options(rate: Rate, fit: Fit) -> ExportOptions {
     ExportOptions {
         resolution: Some((CW, CH)),
         fps: Some(rate.0.parse().unwrap()),
@@ -256,12 +256,12 @@ fn options(rate: Rate, fit: Fit) -> ExportOptions {
     }
 }
 
-fn frames_of(raw: &[u8]) -> Vec<Vec<u8>> {
+pub(super) fn frames_of(raw: &[u8]) -> Vec<Vec<u8>> {
     raw.chunks((CW * CH * 3) as usize).map(<[u8]>::to_vec).collect()
 }
 
 /// The export graph of `timeline`, one `CW`x`CH` rgb24 frame per output frame.
-fn export_frames(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions, dir: &Path, tag: &str) -> Vec<Vec<u8>> {
+pub(super) fn export_frames(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions, dir: &Path, tag: &str) -> Vec<Vec<u8>> {
     let out = dir.join(format!("{tag}.rgb"));
     let mut args = build_export_args(timeline, assets, "unused.mkv", opts).unwrap();
     // Keep the inputs and the graph; replace the encoder and the sink with raw frames.
@@ -299,7 +299,7 @@ fn export_frames(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions, di
 
 /// The scrubbed still of `timeline` at `t`: what the editor shows while cutting, and
 /// the picture the export has to agree with.
-fn still_frame(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions, t: f64) -> Vec<u8> {
+pub(super) fn still_frame(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions, t: f64) -> Vec<u8> {
     let args = build_still_args(timeline, assets, opts, t, CW, None, &StillOutput::RgbPipe).unwrap();
     let run = command(&ffmpeg_bin()).args(&args).stdin(Stdio::null()).output().unwrap();
     assert!(
@@ -316,15 +316,15 @@ fn still_frame(timeline: &Timeline, assets: &[Asset], opts: &ExportOptions, t: f
 
 /// A rectangle in frame pixels, edges rather than pixel indices (`x1`, `y1` exclusive).
 #[derive(Clone, Copy, Debug)]
-struct Rect {
-    x0: f64,
-    y0: f64,
-    x1: f64,
-    y1: f64,
+pub(super) struct Rect {
+    pub(super) x0: f64,
+    pub(super) y0: f64,
+    pub(super) x1: f64,
+    pub(super) y1: f64,
 }
 
 impl Rect {
-    fn clipped(self) -> Option<Rect> {
+    pub(super) fn clipped(self) -> Option<Rect> {
         let r = Rect {
             x0: self.x0.max(0.0),
             y0: self.y0.max(0.0),
@@ -335,13 +335,13 @@ impl Rect {
     }
 
     /// The largest disagreement between two rectangles' edges.
-    fn off_by(self, other: Rect) -> f64 {
+    pub(super) fn off_by(self, other: Rect) -> f64 {
         [self.x0 - other.x0, self.y0 - other.y0, self.x1 - other.x1, self.y1 - other.y1]
             .iter()
             .fold(0.0, |m: f64, d| m.max(d.abs()))
     }
 
-    fn width(self) -> f64 {
+    pub(super) fn width(self) -> f64 {
         self.x1 - self.x0
     }
 }
@@ -352,18 +352,18 @@ fn px(frame: &[u8], x: u32, y: u32) -> [i32; 3] {
 }
 
 /// Anything that is not the green base.
-fn is_picture(p: [i32; 3]) -> bool {
+pub(super) fn is_picture(p: [i32; 3]) -> bool {
     p.iter().zip(GREEN).map(|(a, b)| (a - b).abs()).max().unwrap() > 40
 }
 
 /// The blue box, at any opacity over green: blue above red is the half-way point of an
 /// edge between the two (both fade by the same factor), and blue above green keeps the
 /// dim green the chroma subsampling leaves on the corner of a rotated edge out of it.
-fn is_blue(p: [i32; 3]) -> bool {
+pub(super) fn is_blue(p: [i32; 3]) -> bool {
     p[2] > p[0] + 4 && p[2] > p[1]
 }
 
-fn bbox(frame: &[u8], hit: fn([i32; 3]) -> bool) -> Option<Rect> {
+pub(super) fn bbox(frame: &[u8], hit: fn([i32; 3]) -> bool) -> Option<Rect> {
     let (mut x0, mut y0, mut x1, mut y1) = (u32::MAX, u32::MAX, 0, 0);
     let mut any = false;
     for y in 0..CH {
@@ -383,7 +383,7 @@ fn bbox(frame: &[u8], hit: fn([i32; 3]) -> bool) -> Option<Rect> {
 }
 
 /// How opaque the blue box reads: its blue channel over the middle of the box as found.
-fn opacity_at(frame: &[u8], blue: Rect) -> f64 {
+pub(super) fn opacity_at(frame: &[u8], blue: Rect) -> f64 {
     let (cx, cy) = (((blue.x0 + blue.x1) / 2.0) as u32, ((blue.y0 + blue.y1) / 2.0) as u32);
     let mut sum = 0.0;
     for (dx, dy) in [(0, 0), (1, 0), (0, 1), (1, 1)] {
@@ -395,17 +395,17 @@ fn opacity_at(frame: &[u8], blue: Rect) -> f64 {
 // ---- what `transform_at` says -------------------------------------------------
 
 /// Where the picture, the blue box and the opacity are meant to be at one moment.
-struct Expected {
-    picture: Option<Rect>,
-    blue: Option<Rect>,
-    opacity: f64,
+pub(super) struct Expected {
+    pub(super) picture: Option<Rect>,
+    pub(super) blue: Option<Rect>,
+    pub(super) opacity: f64,
 }
 
 /// The geometry of `clip` at `local` seconds, from `Clip::transform_at` alone (and the order
 /// `Clip::fit_order` fits and zooms in): crop the source, fit it into the frame, zoom it about its
 /// centre, cut it with the mask, rotate it about its centre, put that centre at the frame's centre
 /// plus the offset.
-fn expected(clip: &Clip, local: f64, fit: Fit, clear_left: bool) -> Expected {
+pub(super) fn expected(clip: &Clip, local: f64, fit: Fit, clear_left: bool) -> Expected {
     let tf = clip.transform_at(local);
     let (sw, sh) = (f64::from(SW), f64::from(SH));
     let (cw, ch) = (f64::from(CW), f64::from(CH));
@@ -545,7 +545,7 @@ fn the_expected_picture_of_a_zoomed_out_cover_clip_follows_its_fit_order() {
 /// The keyframes every case zooms with: in past the frame's edge, then out to a
 /// quarter of it — both directions, so a size pinned to the first frame (small) and
 /// one pinned to the biggest are both caught.
-fn zoom_keys() -> Vec<Keyframe> {
+pub(super) fn zoom_keys() -> Vec<Keyframe> {
     let key = |time, scale| Keyframe {
         time,
         scale,
@@ -559,7 +559,7 @@ fn zoom_keys() -> Vec<Keyframe> {
 }
 
 /// `zoom_keys` plus the other animated channels, each on its own switch.
-fn keys(position: bool, rotation: bool, opacity: bool) -> Vec<Keyframe> {
+pub(super) fn keys(position: bool, rotation: bool, opacity: bool) -> Vec<Keyframe> {
     let mut k = zoom_keys();
     if position {
         for (key, x) in k.iter_mut().zip([-0.25, 0.25, -0.1]) {
@@ -582,7 +582,7 @@ fn keys(position: bool, rotation: bool, opacity: bool) -> Vec<Keyframe> {
 
 /// What the keyed clip is cut from.
 #[derive(Clone, Copy)]
-enum Source {
+pub(super) enum Source {
     /// The two-tone clip at this frame rate (the text the graph carries).
     Video(&'static str),
     /// The same picture as a still image.
@@ -597,38 +597,38 @@ enum Source {
 
 impl Source {
     /// The left half of the picture is cut out.
-    fn clear_left(self) -> bool {
+    pub(super) fn clear_left(self) -> bool {
         matches!(self, Source::AlphaStill | Source::AlphaVideo(_))
     }
 }
 
 /// One keyed clip over the green base, and what to hold it to.
-struct Case {
-    name: String,
-    keys: Vec<Keyframe>,
+pub(super) struct Case {
+    pub(super) name: String,
+    pub(super) keys: Vec<Keyframe>,
     /// Static decoration of the clip: crop, mask, effects, grade, speed.
-    decorate: Box<dyn Fn(&mut Clip)>,
-    fit: Fit,
-    rate: Rate,
-    source: Source,
+    pub(super) decorate: Box<dyn Fn(&mut Clip)>,
+    pub(super) fit: Fit,
+    pub(super) rate: Rate,
+    pub(super) source: Source,
     /// Seconds on the timeline the clip is shown for, and where it starts.
-    shown: f64,
-    start: f64,
+    pub(super) shown: f64,
+    pub(super) start: f64,
     /// Whether the blue box survives the case's effects and can be measured.
-    blue: bool,
+    pub(super) blue: bool,
     /// Whether the picture's opacity is the keyed one (a fade darkens the colour instead).
-    opacity: bool,
+    pub(super) opacity: bool,
     /// The most an edge may be off by, in pixels.
-    tolerance: f64,
+    pub(super) tolerance: f64,
     /// Export only this span of the timeline (`ExportOptions::range`).
-    range: Option<(f64, f64)>,
+    pub(super) range: Option<(f64, f64)>,
     /// A clip of the same footage ahead of the keyed one, and the transition the keyed
     /// clip comes in with; its frames are measured once the transition is over.
-    transition: Option<Transition>,
+    pub(super) transition: Option<Transition>,
 }
 
 impl Case {
-    fn new(name: impl Into<String>, keys: Vec<Keyframe>) -> Self {
+    pub(super) fn new(name: impl Into<String>, keys: Vec<Keyframe>) -> Self {
         Case {
             name: name.into(),
             keys,
@@ -646,55 +646,55 @@ impl Case {
         }
     }
 
-    fn decorated(mut self, f: impl Fn(&mut Clip) + 'static) -> Self {
+    pub(super) fn decorated(mut self, f: impl Fn(&mut Clip) + 'static) -> Self {
         self.decorate = Box::new(f);
         self
     }
 
-    fn fit(mut self, fit: Fit) -> Self {
+    pub(super) fn fit(mut self, fit: Fit) -> Self {
         self.fit = fit;
         self
     }
 
-    fn rotated(mut self) -> Self {
+    pub(super) fn rotated(mut self) -> Self {
         // A rotated edge is soft and its bounding box one more pixel of antialiasing out.
         self.tolerance = self.tolerance.max(4.5);
         self
     }
 
-    fn tolerance(mut self, px: f64) -> Self {
+    pub(super) fn tolerance(mut self, px: f64) -> Self {
         self.tolerance = px;
         self
     }
 
-    fn without_blue(mut self) -> Self {
+    pub(super) fn without_blue(mut self) -> Self {
         self.blue = false;
         self
     }
 
-    fn without_opacity(mut self) -> Self {
+    pub(super) fn without_opacity(mut self) -> Self {
         self.opacity = false;
         self
     }
 
-    fn from(mut self, source: Source) -> Self {
+    pub(super) fn from(mut self, source: Source) -> Self {
         self.source = source;
         self
     }
 
-    fn ranged(mut self, start: f64, end: f64) -> Self {
+    pub(super) fn ranged(mut self, start: f64, end: f64) -> Self {
         self.range = Some((start, end));
         self
     }
 
-    fn coming_in_with(mut self, kind: TransitionKind, duration: f64) -> Self {
+    pub(super) fn coming_in_with(mut self, kind: TransitionKind, duration: f64) -> Self {
         self.transition = Some(Transition { kind, duration });
         self.start = 1.5;
         self
     }
 
     /// The timeline: the green base, and the keyed clip on the track above.
-    fn timeline(&self, dir: &Path) -> (Timeline, Vec<Asset>) {
+    pub(super) fn timeline(&self, dir: &Path) -> (Timeline, Vec<Asset>) {
         let fps = self.rate.0;
         let total = self.start + self.shown + 0.5;
         let base = green(dir, fps, total + 1.0);
@@ -731,10 +731,10 @@ impl Case {
 
 /// What a run measured, for the report.
 #[derive(Default)]
-struct Worst {
-    against_transform: f64,
-    against_still: f64,
-    frames: usize,
+pub(super) struct Worst {
+    pub(super) against_transform: f64,
+    pub(super) against_still: f64,
+    pub(super) frames: usize,
 }
 
 /// Render `case` and hold every output frame of the keyed clip to `transform_at` and
@@ -841,13 +841,13 @@ fn check(dir: &Path, case: &Case) -> Worst {
     worst
 }
 
-fn run_all(tag: &str, cases: Vec<Case>) {
+pub(super) fn run_all(tag: &str, cases: Vec<Case>) {
     let dir = scratch(tag);
     run_in(&dir, cases);
     cleanup(&dir);
 }
 
-fn run_in(dir: &Path, cases: Vec<Case>) {
+pub(super) fn run_in(dir: &Path, cases: Vec<Case>) {
     let mut report = Vec::new();
     for case in &cases {
         let w = check(dir, case);
@@ -860,7 +860,7 @@ fn run_in(dir: &Path, cases: Vec<Case>) {
 }
 
 /// Remove a test's scratch directory, unless `KERF_ZOOM_KEEP` asks to look at what it rendered.
-fn cleanup(dir: &Path) {
+pub(super) fn cleanup(dir: &Path) {
     if std::env::var_os("KERF_ZOOM_KEEP").is_none() {
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -868,7 +868,7 @@ fn cleanup(dir: &Path) {
 
 /// A diagnostic line under `KERF_ZOOM_VERBOSE`, for the measurements worth a second look.
 #[allow(clippy::print_stderr)]
-fn verbose(interesting: bool, line: &str) {
+pub(super) fn verbose(interesting: bool, line: &str) {
     if interesting && std::env::var_os("KERF_ZOOM_VERBOSE").is_some() {
         eprintln!("{line}");
     }
@@ -885,7 +885,7 @@ fn ffmpeg_version() -> String {
 }
 
 #[allow(clippy::print_stderr)]
-fn report_lines(lines: &[String]) {
+pub(super) fn report_lines(lines: &[String]) {
     eprintln!("[{}]", ffmpeg_version());
     for l in lines {
         eprintln!("{l}");
@@ -1209,7 +1209,7 @@ fn the_playback_stream_zooms_too() {
 }
 
 /// Stream `case`'s keyed clip through `stream_preview` and hold what comes out to `transform_at`.
-fn playback_matches_transform_at(dir: &Path, case: &Case) {
+pub(super) fn playback_matches_transform_at(dir: &Path, case: &Case) {
     let (timeline, assets) = case.timeline(dir);
     let clip = timeline.tracks[1].clips[0].clone();
 
@@ -1282,7 +1282,7 @@ fn playback_matches_transform_at(dir: &Path, case: &Case) {
 
 /// Thirteen keys 0.2 s apart on every animated channel, each easing into the next: the
 /// polyline is ~145 points per channel.
-fn many_eased_keys() -> Vec<Keyframe> {
+pub(super) fn many_eased_keys() -> Vec<Keyframe> {
     let easings = [Easing::EaseInOut, Easing::EaseOut, Easing::EaseIn, Easing::Linear];
     (0..13)
         .map(|i| {

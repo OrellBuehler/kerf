@@ -62,6 +62,12 @@ import type {
 	ModelProgress,
 	Easing,
 	Keyframe,
+	BakeApplication,
+	Behavior,
+	MotionApplication,
+	MotionMode,
+	MotionPreset,
+	MotionPresetInfo,
 	Property,
 	PropertyKey,
 	PropertyTrack,
@@ -187,8 +193,10 @@ import {
 	propertyLabel,
 	setPropertyEasing,
 	setPropertyKeys,
-	transformAt
+	baseTransformAt
 } from './channels';
+import { applyMotionPreset as applyMotionPresetLocal, motionPresets } from './motion-presets';
+import { bakeBehaviorsOn, setBehaviors as setBehaviorsLocal } from './behavior-ops';
 import { formatTime as fmtTime } from './diff';
 import {
 	rollEdit as rollEditLocal,
@@ -437,7 +445,38 @@ const sampleTimeline: Timeline = {
 					source_audio: false,
 					link_id: SAMPLE_LINK
 				},
-				{ id: 'c2', asset_id: sampleAssets[1].id, source_in: 0, source_out: 8, timeline_start: 12.5, volume: 1, fade_in: 0.5, fade_out: 0.5 }
+				// The b-roll drifts across the frame as a picture-in-picture: position keyed on its own tracks, at moments
+				// that differ per axis, so the Preview's motion path (dots on the union, eased spacing) has something to draw.
+				{
+					id: 'c2',
+					asset_id: sampleAssets[1].id,
+					source_in: 0,
+					source_out: 8,
+					timeline_start: 12.5,
+					volume: 1,
+					fade_in: 0.5,
+					fade_out: 0.5,
+					transform: { ...DEFAULT_TRANSFORM, scale: 0.4 },
+					channels: [
+						{
+							prop: 'pos_x',
+							keys: [
+								{ time: 0, value: -0.3, easing: 'ease_in_out' },
+								{ time: 3, value: 0.05, easing: 'ease_out' },
+								{ time: 8, value: 0.3 }
+							]
+						},
+						{
+							prop: 'pos_y',
+							keys: [
+								{ time: 0, value: 0.22, easing: 'ease_in_out' },
+								{ time: 2, value: -0.12, easing: 'ease_in_out' },
+								{ time: 5.5, value: 0.15 },
+								{ time: 8, value: -0.08 }
+							]
+						}
+					]
+				}
 			]
 		},
 		{
@@ -3212,9 +3251,9 @@ export async function addKeyframe(
 		const found = locate(devTimeline, clipId);
 		if (found) {
 			const clip = found[0].clips[found[1]];
-			// The clip's present pose there (`transform_at`), whichever of the bundle and the
-			// numbers' own tracks drives each number.
-			const tf = transformAt(clip, time);
+			// The clip's present pose there (`base_transform_at`: behaviours ride on top and are not written into
+			// keys), whichever of the bundle and the numbers' own tracks drives each number.
+			const tf = baseTransformAt(clip, time);
 			const base: Keyframe = {
 				time,
 				scale: tf.scale,
@@ -3357,6 +3396,66 @@ export async function copyKeyframes(
 		return snapshot();
 	}
 	return invoke<Timeline>('copy_keyframes', { fromClipId, toClipId, props, offset });
+}
+
+/** The motion presets, entrances first, then exits, then emphases (`list_motion_presets`). */
+export async function listMotionPresets(): Promise<MotionPresetInfo[]> {
+	if (!inTauri()) return motionPresets();
+	return invoke<MotionPresetInfo[]>('list_motion_presets');
+}
+
+/** How a preset is written. Everything is optional: `mode` defaults to `add`, `at` to where the preset's kind
+ *  starts (the clip's start, or for an exit `duration` before its end), `duration` to the preset's own (clamped to
+ *  the clip), `intensity` to 1 (0.25 to 2). */
+export interface MotionOptions {
+	mode?: MotionMode;
+	at?: number;
+	duration?: number;
+	intensity?: number;
+}
+
+/** Write a motion preset into the animation of several clips as **one** revision, all or nothing
+ *  (`apply_motion_preset`); resolves to the timeline and the window each clip got, which a `duration` longer than
+ *  the clip clamps. Rejects an audio clip, an unknown clip or a number out of range, changing nothing. */
+export async function applyMotionPreset(
+	clipIds: string[],
+	preset: MotionPreset,
+	options: MotionOptions = {}
+): Promise<MotionApplication> {
+	if (!inTauri()) {
+		const done = devRun((tl) =>
+			applyMotionPresetLocal(tl, clipIds, preset, options.mode, options.at, options.duration, options.intensity)
+		);
+		return { timeline: snapshot(), applied: done.map((m) => ({ clip_id: m.clip.id, start: m.start, end: m.end })) };
+	}
+	return invoke<MotionApplication>('apply_motion_preset', { clipIds, preset, ...options });
+}
+
+/** Give several clips the live behaviours `behaviors` (sway, breathe, spin, drift, shake) as their whole list, as
+ *  **one** revision, all or nothing; an empty list clears them (`set_behaviors`). They ride on top of the clip's pose
+ *  and keys. Rejects an audio clip, an unknown clip, more than `MAX_BEHAVIORS` or a number out of range, changing
+ *  nothing. */
+export async function setBehaviors(clipIds: string[], behaviors: Behavior[]): Promise<Timeline> {
+	if (!inTauri()) {
+		devRun((tl) => setBehaviorsLocal(tl, clipIds, behaviors));
+		return snapshot();
+	}
+	return invoke<Timeline>('set_behaviors', { clipIds, behaviors });
+}
+
+/** Sample the behaviours of several clips into keys of the numbers they move and clear them, as **one** revision,
+ *  all or nothing (`bake_behaviors`). `fps` defaults to the delivery's rate, else the footage's, else 30. Rejects a
+ *  clip with no behaviours, or one a bake would put more than 1000 keys a number on (the message says how long a
+ *  piece can be), changing nothing. */
+export async function bakeBehaviors(clipIds: string[], fps?: number): Promise<BakeApplication> {
+	if (!inTauri()) {
+		const done = devRun((tl) => bakeBehaviorsOn(tl, sampleAssets, clipIds, fps));
+		return {
+			timeline: snapshot(),
+			baked: done.map((b) => ({ clip_id: b.clip.id, properties: b.baked.properties, keys: b.baked.keys, fps: b.baked.fps }))
+		};
+	}
+	return invoke<BakeApplication>('bake_behaviors', { clipIds, fps });
 }
 
 export async function clearKeyframes(clipId: string): Promise<Timeline> {

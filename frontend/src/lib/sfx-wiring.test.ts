@@ -44,6 +44,7 @@ describe('the panel is a dock panel', () => {
 			snap: true,
 			minimap: true,
 			safeAreas: false,
+			motionPath: true,
 			hasFrame: true,
 			tool: 'pointer',
 			delivery: 'source',

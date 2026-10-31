@@ -27,6 +27,7 @@ import type {
 	CaptionTimeBase,
 	Levels,
 	ModelProgress,
+	MotionMode,
 	PreviewDraft,
 	TagFilter,
 	TranscriptionStatus
@@ -41,6 +42,7 @@ import type { SfxDrag } from './sfx-panel';
 import type { TrimMonitor, TrimTool } from './trim-tools';
 import { ZOOM_DEFAULT, stepZoom } from './zoom';
 import { seekTime, stepPoint, type SeekOptions } from './frames';
+import { loadMotionPath, saveMotionPath } from './motion-path';
 import {
 	heightOf,
 	heightPx,
@@ -173,6 +175,13 @@ class EditorUi {
 	 *  every time a sentence happened to be short. Set in the library's Titles tab;
 	 *  the titles lane's menu and Edit › Generate captions generate in it too. */
 	captionStyle = $state<CaptionStyle>('lines');
+	/** How the Motion tab and the clip menu write a motion preset: `add` keeps the clip's own animation outside the
+	 *  preset's window, `replace` gives its numbers exactly the preset's keys; `motionLength` is the window in
+	 *  seconds (`null`: the preset's own) and `motionIntensity` how far it departs from the clip's pose (0.25 to 2).
+	 *  Held here so they outlive the tab. */
+	motionMode = $state<MotionMode>('add');
+	motionLength = $state<number | null>(null);
+	motionIntensity = $state(1);
 	/** The animated SVG title whose source the Inspector should open and focus: set when *Custom SVG…* makes
 	 *  one (or a lane menu asks to edit it), cleared by the Inspector once it has taken the focus. */
 	svgSourceFocus = $state<string | null>(null);
@@ -245,6 +254,8 @@ class EditorUi {
 	heights = $state<TrackHeights>(loadHeights());
 	/** Whether the minimap strip over the timeline is shown (also remembered). */
 	minimap = $state(loadMinimap());
+	/** Whether the selected clip's motion path is drawn over the Preview (on by default, also remembered). */
+	motionPath = $state(loadMotionPath());
 	/** Bumped when a preview proxy finishes generating, to nudge the preview into
 	 *  re-decoding the current frame (now served from the fast all-intra proxy). */
 	previewEpoch = $state(0);
@@ -425,6 +436,11 @@ class EditorUi {
 	toggleMinimap() {
 		this.minimap = !this.minimap;
 		saveMinimap(this.minimap);
+	}
+
+	toggleMotionPath() {
+		this.motionPath = !this.motionPath;
+		saveMotionPath(this.motionPath);
 	}
 
 	/** One step in (`1`) or out (`-1`) on the zoom; the timeline holds the playhead still. */

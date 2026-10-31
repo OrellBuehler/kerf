@@ -17,6 +17,7 @@
 	import { ui, type Tool } from '#lib/editor-ui.svelte';
 	import { editor } from '#lib/state.svelte';
 	import { settings } from '#lib/settings.svelte';
+	import { workspace } from '#lib/workspace.svelte';
 	import { contextMenu } from '#lib/context-menu.svelte';
 	import { documentOf, resizeObserverFor, windowOf } from '#lib/realm';
 	import { onWindow } from '#lib/window-events';
@@ -2254,6 +2255,13 @@
 					: []),
 				...(fit.show || stems.show || compose.show ? [{ type: 'separator' } satisfies MenuItem] : []),
 				{
+					label: 'Motion presets…',
+					icon: 'move',
+					disabled: t.kind === 'audio',
+					reason: t.kind === 'audio' ? 'A sound has no picture to move' : undefined,
+					action: openMotionTab
+				},
+				{
 					label: 'Copy keyframes',
 					icon: 'diamond',
 					disabled: kf.copy.disabled,
@@ -2297,6 +2305,14 @@
 				})
 			])
 		]);
+	}
+
+	/** The clip menu's way into the presets: the library's Motion tab (the panel brought back and the rail unfolded
+	 *  when it was closed or folded), where the mode, length and strength are. */
+	function openMotionTab() {
+		workspace.show('library');
+		settings.setLibraryTab('motion');
+		settings.setLibraryCollapsed(false);
 	}
 
 	const onLaneContextMenu = (e: MouseEvent, t: Track) => contextMenu.show(e, trackItems(t));

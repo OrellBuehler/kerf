@@ -17,7 +17,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use crate::error::{Error, Result};
-use crate::model::{AnalysisKind, Asset, AssetAnalysis, Clip, StreamKind, Timeline, TranscriptSegment};
+use crate::model::{AnalysisKind, Asset, AssetAnalysis, Clip, Property, StreamKind, Timeline, TranscriptSegment};
 use crate::platform::Severity;
 use crate::transcript::words_of;
 
@@ -895,8 +895,10 @@ pub(crate) fn scale_jump(a: &Clip, b: &Clip) -> f64 {
 }
 
 /// Whether the framing changes across a cut — a punch-in, a move, a keyed zoom or a new 360
-/// view — which is how a jump cut is made deliberate.
+/// view — which is how a jump cut is made deliberate. A live behaviour (a shake, a breath) is a
+/// look laid over the same framing, not a new one, so only the clips' keys count.
 fn reframed(a: &Clip, b: &Clip) -> bool {
+    let keyed = |c: &Clip| Property::TRANSFORM.iter().any(|p| c.is_keyed(*p));
     let (ta, tb) = (&a.transform, &b.transform);
     let scale = scale_jump(a, b);
     let moved = [
@@ -910,13 +912,7 @@ fn reframed(a: &Clip, b: &Clip) -> bool {
     ]
     .iter()
     .any(|(x, y)| (x - y).abs() > 0.01);
-    scale >= PUNCH_IN_SCALE
-        || moved
-        || a.is_animated()
-        || b.is_animated()
-        || a.crop_animated()
-        || b.crop_animated()
-        || a.reframe != b.reframe
+    scale >= PUNCH_IN_SCALE || moved || keyed(a) || keyed(b) || a.crop_animated() || b.crop_animated() || a.reframe != b.reframe
 }
 
 #[cfg(test)]
@@ -1283,6 +1279,59 @@ mod tests {
         let img = img_asset(Uuid::new_v4());
         let t = on_v1(vec![Clip::new(img.id, 0.0, 2.0, 0.0), Clip::new(img.id, 3.0, 5.0, 2.0)]);
         assert!(found(&inputs(t, vec![img], vec![]), Check::JumpCut).is_empty());
+    }
+
+    #[test]
+    fn a_keyed_reframe_makes_a_jump_cut_deliberate_and_a_live_behaviour_does_not() {
+        use crate::model::{Behavior, PropertyKey};
+        let a = av_asset(Uuid::new_v4(), 100.0);
+        let cut = |dress: &dyn Fn(&mut Clip, &mut Clip)| {
+            let mut first = Clip::new(a.id, 10.0, 12.0, 0.0);
+            let mut second = Clip::new(a.id, 13.0, 15.0, 2.0);
+            dress(&mut first, &mut second);
+            found(&inputs(on_v1(vec![first, second]), vec![a.clone()], vec![]), Check::JumpCut)
+        };
+        assert_eq!(cut(&|_, _| {}).len(), 1);
+        let shake = Behavior::Shake {
+            amount: 0.02,
+            speed: 3.0,
+            seed: 7,
+            phase: 0.0,
+        };
+        let breathe = Behavior::Breathe {
+            amount: 0.1,
+            speed: 0.5,
+            phase: 0.0,
+        };
+        let drift = Behavior::Drift {
+            speed: 0.01,
+            angle: 30.0,
+            phase: 0.0,
+        };
+        for look in [shake, breathe, drift] {
+            assert_eq!(cut(&|x, _| x.behaviors = vec![look]).len(), 1, "{look:?} on the first side");
+            assert_eq!(cut(&|_, y| y.behaviors = vec![look]).len(), 1, "{look:?} on the second side");
+            assert_eq!(
+                cut(&|x, y| (x.behaviors, y.behaviors) = (vec![look], vec![look])).len(),
+                1,
+                "{look:?} on both"
+            );
+        }
+        let keyed = |prop: Property| {
+            move |c: &mut Clip| c.set_property_keys(prop, vec![PropertyKey::new(0.0, 1.0), PropertyKey::new(1.0, 1.2)])
+        };
+        for prop in [Property::Scale, Property::PosX, Property::Rotation] {
+            assert!(cut(&|x, _| keyed(prop)(x)).is_empty(), "{prop:?} keyed on the first side");
+            assert!(cut(&|_, y| keyed(prop)(y)).is_empty(), "{prop:?} keyed on the second side");
+            assert!(
+                cut(&|_, y| {
+                    keyed(prop)(y);
+                    y.behaviors = vec![shake];
+                })
+                .is_empty(),
+                "{prop:?} keyed under a shake"
+            );
+        }
     }
 
     #[test]

@@ -12,6 +12,7 @@
 	import GradeSections from './GradeSections.svelte';
 	import SpeedRamp from './SpeedRamp.svelte';
 	import StabilizeSection from './StabilizeSection.svelte';
+	import BehaviorsSection from './BehaviorsSection.svelte';
 	import TemplateSection from './TemplateSection.svelte';
 	import TextSection from './TextSection.svelte';
 	import MediaChips from './MediaChips.svelte';
@@ -40,14 +41,15 @@
 		cropAnimated,
 		CROP_PROPERTIES,
 		colorAt,
+		baseAt,
+		baseTransformAt,
 		isKeyed,
 		maskAt,
 		MAX_CROP_ZOOM,
 		keyTime,
 		propertyAt,
 		propertyKeys,
-		transformAnimated,
-		transformAt,
+		transformKeyed,
 		upsertKey,
 		volumeAnimated
 	} from '#lib/channels';
@@ -240,8 +242,10 @@
 	/** Seconds into the selected clip at the playhead (clip-local, what keys are in). */
 	const localTime = $derived(clip ? keyTime(clip, ui.time) : 0);
 	// Every keyed number as the eased polyline the export draws, whichever of the legacy bundle and
-	// the numbers' own tracks drives it (`transformAt`).
-	const tf = $derived(clip ? transformAt(clip, localTime) : { ...DEFAULT_TRANSFORM });
+	// the numbers' own tracks drives it (`baseTransformAt`). The pose **without** the live behaviours: they ride on
+	// top (the Behaviours section), and what these sliders write is the pose, so a sway does not make the numbers
+	// swim, and a keyed number's value is not written back with the wobble added a second time.
+	const tf = $derived(clip ? baseTransformAt(clip, localTime) : { ...DEFAULT_TRANSFORM });
 	const ANIM_KEYS = new Set(['scale', 'pos_x', 'pos_y', 'rotation', 'opacity']);
 	/** Route a transform edit: a keyframe at the playhead when animated, else the
 	 *  static transform. Crop (not animatable) always edits the static transform. */
@@ -251,7 +255,7 @@
 		const animatable = Object.keys(patch).every((k) => ANIM_KEYS.has(k));
 		if (c.keyframes?.length && animatable) {
 			return run(() => editor.addKeyframe(c.id, keyTime(c, at.time), patch as Record<string, number>));
-		} else if (animatable && transformAnimated(c)) {
+		} else if (animatable && transformKeyed(c)) {
 			// Numbers keyed on their own (no whole-transform keys): a key at the playhead for each
 			// of those, the static transform for the rest.
 			const keyed = (Object.keys(patch) as (keyof Transform)[]).filter((k) => isKeyed(c, k as Property));
@@ -278,7 +282,7 @@
 		if (keys.some((k) => Math.abs(k.time - localTime) <= 0.02)) {
 			void run(() => editor.setPropertyKeyframes(c.id, prop, keys.filter((k) => Math.abs(k.time - localTime) > 0.02)));
 		} else {
-			void run(() => keyAtPlayhead(c, prop, propertyAt(c, prop, localTime)));
+			void run(() => keyAtPlayhead(c, prop, baseAt(c, prop, localTime)));
 		}
 	}
 	/** Right-click on a ◇: step to the previous or next key of that number, key it here, or take its keys out. */
@@ -1609,6 +1613,8 @@
 					</select>
 				</label>
 				</InspectorSection>
+
+				<BehaviorsSection {clip} />
 
 				<InspectorSection title="Framing" summary={[hasCrop && 'Cropped', cropAnimated(clip) && 'Crop motion'].filter(Boolean).join(' · ') || 'Full frame'}>
 				<div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:6px">

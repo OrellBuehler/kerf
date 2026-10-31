@@ -15,6 +15,7 @@ import {
 	scalePose,
 	snapTargets,
 	sweep,
+	toBase,
 	topLayerAt,
 	type Canvas,
 	type Snapping
@@ -262,4 +263,60 @@ test('readouts', () => {
 	expect(readout('move', tf({ pos_x: 0.125, pos_y: -0.05 }))).toBe('x 12.5% · y -5%');
 	expect(readout('rotate', tf({ rotation: 44.96 }))).toBe('45°');
 	expect(readout('crop', tf({ crop_right: 0.2 }), 'right')).toBe('crop right 20%');
+});
+
+describe('live behaviours: the box is at the picture, a drag writes the pose', () => {
+	const assets = [asset('a', 1920, 1080)];
+	// A quarter-turn of a 1 Hz sway at 0.25 s: the picture is 5° off the pose it rides on.
+	const swaying: Clip = {
+		...clip('s', 'a', 0, { scale: 0.5, pos_x: 0.1, rotation: 10 }),
+		behaviors: [
+			{ kind: 'sway', amount: 5, speed: 1 },
+			{ kind: 'breathe', amount: 0.2, speed: 1 },
+			{ kind: 'drift', speed: 0.1, angle: 90 }
+		]
+	};
+	const at = 0.25;
+	const [layer] = layersAt({ tracks: [track('v1', [swaying])] }, assets, W169, at);
+
+	test('the layer has the picture and the pose it rides on', () => {
+		expect(layer.base).toMatchObject({ scale: 0.5, pos_x: 0.1, pos_y: 0, rotation: 10 });
+		expect(layer.pose.rotation).toBeCloseTo(15, 9);
+		expect(layer.pose.scale).toBeCloseTo(0.5 * 1.2, 9);
+		expect(layer.pose.pos_y).toBeCloseTo(0.025, 9);
+		expect(layer.pose.pos_x).toBeCloseTo(0.1, 9);
+		expect(layer.box.angle).toBeCloseTo((15 * Math.PI) / 180, 9);
+		const plain = layersAt({ tracks: [track('v1', [clip('p', 'a', 0, { scale: 0.5, pos_x: 0.1, rotation: 10 })])] }, assets, W169, at)[0];
+		expect(plain.base).toEqual(plain.pose);
+	});
+
+	test('what is written puts the picture where the pointer took it, the behaviours on top', () => {
+		// Drag the picture 96 px right and 54 px down: the position moves by a twentieth of the frame each way.
+		const moved = movePose(layer.pose, layer.box, 96, 54, W169, off).patch;
+		expect(moved.pos_x).toBeCloseTo(0.15, 4);
+		const written = toBase(layer, moved);
+		expect(written.pos_x).toBeCloseTo(0.15, 4);
+		expect(written.pos_y).toBeCloseTo(0.05, 4);
+		const after: Clip = { ...swaying, transform: { ...swaying.transform!, ...written } };
+		const [next] = layersAt({ tracks: [track('v1', [after])] }, assets, W169, at);
+		expect(next.pose.pos_x).toBeCloseTo(moved.pos_x!, 3);
+		expect(next.pose.pos_y).toBeCloseTo(moved.pos_y!, 3);
+		// A turn and a zoom the same way.
+		const turned = toBase(layer, rotatePose(layer.pose, 20, false).patch);
+		expect(turned.rotation).toBeCloseTo(10 + 20, 2);
+		const grown = toBase(layer, { scale: 0.9 });
+		expect(grown.scale).toBeCloseTo(0.9 / 1.2, 4);
+	});
+
+	test('without behaviours a patch is written as it was', () => {
+		const plain = layersAt({ tracks: [track('v1', [clip('p', 'a', 0, { scale: 0.5, pos_x: 0.1 })])] }, assets, W169, at)[0];
+		const patch = { pos_x: 0.2, pos_y: -0.05, rotation: 7, scale: 0.7, crop_left: 0.1 };
+		expect(toBase(plain, patch)).toEqual(patch);
+	});
+
+	test('a clip a behaviour moves is not cropped in place', () => {
+		expect(croppable(clip('c', 'a'), W169)).toBe(true);
+		expect(croppable({ ...clip('c', 'a'), behaviors: [{ kind: 'sway', amount: 5, speed: 1 }] }, W169)).toBe(false);
+		expect(croppable({ ...clip('c', 'a'), behaviors: [{ kind: 'sway', amount: 0, speed: 1 }] }, W169), 'one that moves nothing is not live').toBe(true);
+	});
 });

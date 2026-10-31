@@ -74,6 +74,7 @@ export interface MenuState {
 	rippleMode: boolean;
 	snap: boolean;
 	minimap: boolean;
+	motionPath: boolean;
 	safeAreas: boolean;
 	/** The project is cut for a delivery frame (the safe-area guides need one). */
 	hasFrame: boolean;
@@ -280,6 +281,7 @@ export function buildMenus(s: MenuState): MenuDef[] {
 				)
 			},
 			act('view.minimap', { role: 'check', checked: s.minimap, label: 'Overview strip' }),
+			act('view.motionPath', { role: 'check', checked: s.motionPath, label: 'Motion path' }),
 			act('view.safeAreas', {
 				role: 'check',
 				checked: s.safeAreas,

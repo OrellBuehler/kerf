@@ -364,7 +364,7 @@ fn rebase_head(keys: &[PropertyKey], by: f64) -> Vec<PropertyKey> {
 /// `key` put into `keys` ([`Clip::insert_keyframe`]'s rule): a key within a microsecond of one
 /// replaces it and keeps how that one leaves; one inside a segment splits it
 /// ([`Easing::split`]), so a hold stays held and a curve stays the same curve.
-fn upsert(keys: &mut Vec<PropertyKey>, mut key: PropertyKey) {
+pub(super) fn upsert(keys: &mut Vec<PropertyKey>, mut key: PropertyKey) {
     const SAME: f64 = 1e-6;
     by_time(keys);
     if let Some(old) = keys.iter().find(|k| (k.time - key.time).abs() <= SAME) {
@@ -454,9 +454,11 @@ impl Clip {
         }
     }
 
-    /// `prop` at `local` seconds from the clip's start: its curve, else its static value.
+    /// `prop` at `local` seconds from the clip's start: its curve, else its static value, with the
+    /// clip's live behaviours applied on top ([`Clip::behaved`]) — the value the picture is drawn
+    /// with. An edit that writes keys samples [`Clip::base_at`], the pose without them.
     pub fn property_at(&self, prop: Property, local: f64) -> f64 {
-        interpolate(&self.property_curve(prop), local).unwrap_or_else(|| self.static_value(prop))
+        self.behaved(prop, self.base_at(prop, local), local)
     }
 
     /// Whether any colour number is keyed (so the clip's `eq` is written per frame).
@@ -513,7 +515,12 @@ impl Clip {
             keys.first()
                 .is_some_and(|f| keys.iter().any(|k| (k.value - f.value).abs() > 1e-9))
         };
-        self.zoom_animated() || varies(Property::PosX) || varies(Property::PosY) || self.crop_animated()
+        self.zoom_animated()
+            || varies(Property::PosX)
+            || varies(Property::PosY)
+            || self.behaves(Property::PosX)
+            || self.behaves(Property::PosY)
+            || self.crop_animated()
     }
 
     /// The clip's mask at `local` seconds from its start (normalized): every keyed number its
@@ -633,7 +640,7 @@ impl Clip {
             .filter(|(p, _)| self.channel(*p).is_none() && self.is_keyed(*p))
             .collect();
         if !bundled.is_empty() {
-            let mut kf = Keyframe::from_transform(time, &self.transform_at(time));
+            let mut kf = Keyframe::from_transform(time, &self.base_transform_at(time));
             for (p, v) in &bundled {
                 match p {
                     Property::Scale => kf.scale = *v,

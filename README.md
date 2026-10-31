@@ -162,7 +162,7 @@ Now ask the agent to work on the project you have open — _"skim the interview 
 the dead air, and drop in captions."_ It will claim a task, use the tools below, and hand
 back a reviewable result.
 
-### The tools (200)
+### The tools (204)
 
 <details>
 <summary><b>See / analyze</b></summary>
@@ -205,7 +205,7 @@ the picture) · `update_sound_effect` ·
 
 `set_volume` · `set_fade` · `set_speed` · `set_speed_ramp` (slow motion / speed-up that eases) · `stabilize_clip` (take a hand-held camera's shake out) · `stabilization_status` · `set_transform` · `set_transform_at` · `set_color` ·
 `set_grade` (curves, colour wheels, a .cube LUT) · `set_transition` · `set_mask` · `set_blend_mode` (multiply, screen, overlay, …) · `set_video_effects` · `set_audio_effects` ·
-`set_keyframes` · `add_keyframe` · `set_keyframe_easing` · `set_property_keyframes` · `set_property_tracks` · `copy_keyframes` · `clear_keyframes` · `set_reframe` · `clear_reframe` ·
+`set_keyframes` · `add_keyframe` · `set_keyframe_easing` · `set_property_keyframes` · `set_property_tracks` · `copy_keyframes` · `apply_motion_preset` (an entrance, exit or emphasis such as `pop_in`, `slide_out_to_left`, `pulse`) · `list_motion_presets` · `set_behaviors` (live sway, breathe, spin, drift and shake riding on a clip's pose) · `bake_behaviors` (turn them into keys) · `clear_keyframes` · `set_reframe` · `clear_reframe` ·
 `set_reframe_keyframes` · `add_reframe_keyframe` · `set_track_volume` · `set_track_pan` ·
 `set_master_volume` · `set_master_limiter` · `set_master_true_peak` · `set_master_duck` ·
 `add_overlay` · `update_overlay` · `remove_overlay` · `set_overlay_keyframes` ·

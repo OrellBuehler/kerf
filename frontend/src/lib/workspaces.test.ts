@@ -67,7 +67,7 @@ describe('the workspace and tab lists', () => {
 
 	test('a spec for every library tab, in rail order', () => {
 		expect(LIBRARY_TAB_SPECS.map((t) => t.id)).toEqual([...LIBRARY_TABS]);
-		expect(LIBRARY_TABS).toEqual(['media', 'titles', 'effects', 'transitions', 'audio', 'transcript']);
+		expect(LIBRARY_TABS).toEqual(['media', 'titles', 'effects', 'transitions', 'motion', 'audio', 'transcript']);
 	});
 
 	test('the tab and workspace icons exist in the icon registry', () => {
@@ -81,7 +81,7 @@ describe('the workspace and tab lists', () => {
 			['edit', 'media'],
 			['color', 'effects'],
 			['audio', 'audio'],
-			['motion', 'titles'],
+			['motion', 'motion'],
 			['deliver', 'media']
 		]);
 	});
@@ -259,7 +259,13 @@ describe('the library tab per workspace', () => {
 		const state = defaultWorkspaces();
 		expect(libraryTabFor(state, 'edit')).toBe('media');
 		expect(libraryTabFor(state, 'color')).toBe('effects');
-		expect(libraryTabFor(state, 'motion')).toBe('titles');
+		expect(libraryTabFor(state, 'motion')).toBe('motion');
+	});
+
+	test('a Titles pick made in Motion before it had a tab of its own still stands', () => {
+		const stored = parseWorkspaces({ library: { tabs: { motion: 'titles' }, collapsed: false } });
+		expect(libraryTabFor(stored, 'motion')).toBe('titles');
+		expect(libraryTabFor(defaultWorkspaces(), 'motion')).toBe('motion');
 	});
 
 	test('a pick sticks to its workspace and moves no other', () => {
