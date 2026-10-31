@@ -1438,7 +1438,10 @@ and then says why — `Export failed — Permission denied (os error 13)` (`fail
 not`) — and a finished file is named by its file, `Exported cut-1x1.mp4` with *Show in folder*. The log is
 deliberately *not* replayable — a toast's "Undo" action is dropped rather than kept,
 since an hour later it would undo whatever the newest revision is, not the edit the
-notice was about. It is also why the failure paths that used to reject into nothing
+notice was about. Even on screen a toast's Undo is `ops.ts` `undoAction` / `undoToast`: it remembers the revision
+the edit left the project at and takes it back only while that is still the latest — otherwise it takes nothing back
+and says to use Edit > Undo or the History list (`ops-undo.test.ts`; a toast built with a bare `editor.undo()` is
+the bug). It is also why the failure paths that used to reject into nothing
 (`fetchSpeechModel`, `analyzeQueue`'s per-asset catch, the media bin's `runAnalysis`
 calls) now report: a notice that is never raised cannot be recovered from a log.
 

@@ -38,6 +38,7 @@
 		selectionLinkPlans,
 		splitSelection,
 		trimSelection,
+		undoToast,
 		unlinkSelection
 	} from '#lib/ops';
 	import { addAnimatedTitle, addCustomSvgTitle, addTitleHere, dropCaptions, importCaptionFile, makeCaptions } from '#lib/title-actions';
@@ -1956,9 +1957,7 @@
 		void editor
 			.removeTrack(t.id)
 			.then(() =>
-				toast(`Removed track ${t.name}`, {
-					action: { label: 'Undo', onClick: () => void editor.undo() }
-				})
+				undoToast(`Removed track ${t.name}`)
 			)
 			.catch(err);
 
@@ -2025,9 +2024,7 @@
 		}
 		void (ripple ? editor.rippleDelete(id) : editor.remove(id))
 			.then(() =>
-				toast('Clip removed', {
-					action: { label: 'Undo', onClick: () => void editor.undo() }
-				})
+				undoToast('Clip removed')
 			)
 			.catch(err);
 	}
@@ -2036,9 +2033,7 @@
 	function removeAlone(id: string, ripple: boolean) {
 		void (ripple ? editor.rippleDelete(id, false) : editor.remove(id, false))
 			.then(() =>
-				toast('Clip removed — its linked clips stay', {
-					action: { label: 'Undo', onClick: () => void editor.undo() }
-				})
+				undoToast('Clip removed — its linked clips stay')
 			)
 			.catch(err);
 	}

@@ -86,7 +86,8 @@ describe('the panel writes nothing until Add', () => {
 	test('adding goes through the one editor call, as one edit, and says what it did', () => {
 		expect(calls(state, 'editor.addSoundEffects')).toBe(1);
 		expect(state).toContain('toast.success(addedLine(');
-		expect(state).toContain("label: 'Undo'");
+		// the Undo is the one that takes back this edit, and only while it is the latest (`ops.ts` `undoAction`)
+		expect(state).toContain('{ action: undoAction() }');
 	});
 
 	test('add at the playhead lands the hit on it, and the keyboard and the double-click add the same way', () => {
