@@ -174,6 +174,18 @@ sheet's gestures; a number twice or none at all is refused; each track is `Prope
 `deny_unknown_fields`, since the model's `PropertyTrack` reads a misspelt `keys` as none and would make the number static), `copy_keyframes` (`from_clip_id`, `to_clip_id`,
 `props?`, `offset?`) gives another clip the same
 animation, and `set_keyframe_easing` takes an optional `prop`; the server `instructions` mention them.
+**Motion presets over MCP** (`apply_motion_preset` + `list_motion_presets`; the pure op is kerf-core's `model/motion.rs`, `core-model.md`):
+`apply_motion_preset { clip_ids, preset, mode?, at?, duration?, intensity? }` writes an entrance, exit or emphasis into
+every clip as **one** revision (`Project::apply_motion_preset`: all or nothing, a clip named twice once, an audio-track
+clip refuses the lot, a locked track does not; staged for an agent like any edit) and answers `{preset, mode, applied:
+[{clip_id, start, end}]}` — the window each clip got, in seconds from its start, because a `duration` longer than the clip is
+**clamped**, not refused (the model checks `end - start`). The description lists the 23 ids by kind (a test holds the list
+and the kinds to `motion_presets()`) and says what the schema docs repeat: relative to the clip's own pose, `add` (default)
+merges into the keys inside the window and keeps the outside, `replace` replaces those numbers' keys, `at` / `duration` /
+`intensity` (0.25 to 2). `list_motion_presets` (read) is the catalogue as `motion_presets()` serves it (id, label, kind,
+`default_duration` absent for `push_in` / `pull_out`, hint, numbers keyed): a separate tool, as `list_svg_presets` and
+`list_text_animation_presets` are. Both are in the `keyframes` set (`hints.rs`; `apply_motion_preset` is `Set`:
+applying a preset twice is a no-op), `apply_motion_preset` is batchable in `apply_edits`, and the `instructions` and the guide name it.
 `set_transform_at` (`clip_id`, `time`, any transform field) poses a clip at a moment of it in one edit without the
 agent first working out what is animated: a keyed number gets a key at `time` (bundle or own track, whichever drives
 it), the rest and the crop are static (`Clip::pose_transform`); it is what the Preview's handles write.
@@ -790,7 +802,7 @@ Every tool, by purpose (a test pins that this list names each registered tool, a
   `set_grade`, `set_video_effects`, `set_audio_effects`, `set_mask`, `set_blend_mode`, `set_clip_enabled`, `stabilize_clip`,
   `stabilization_status`.
 - **Keyframes and 360**: `set_keyframes`, `add_keyframe`, `set_keyframe_easing`, `set_property_keyframes`,
-  `set_property_tracks`, `copy_keyframes`,
+  `set_property_tracks`, `copy_keyframes`, `apply_motion_preset`, `list_motion_presets`,
   `clear_keyframes`, `set_reframe`, `clear_reframe`, `set_reframe_keyframes`, `add_reframe_keyframe`.
 - **Mix and music**: `set_track_volume`, `set_track_pan`, `set_track_duck`, `set_track_muted`, `set_track_solo`,
   `set_track_locked`, `set_master_volume`, `set_master_limiter`, `set_master_true_peak`, `set_master_duck`, `plan_music_fit`, `fit_music`,

@@ -2517,6 +2517,74 @@ export interface AudioDetached {
 	skipped: { clip_id: string; reason: string }[];
 }
 
+// ---- Motion presets (B8a) -------------------------------------------------------
+
+/** What a motion preset does in a clip's life (`MotionKind`). */
+export type MotionKind = 'entrance' | 'exit' | 'emphasis';
+
+/** How a preset meets the keys the clip already has (`MotionMode`): `add` (the default) replaces the clip's keys of
+ *  those numbers inside the window and keeps the ones outside; `replace` gives them exactly the preset's keys. */
+export type MotionMode = 'replace' | 'add';
+
+/** A motion preset's wire name (`MotionPreset`): a direction names where the picture comes from / goes to. */
+export type MotionPreset =
+	| 'fade_in'
+	| 'slide_in_from_left'
+	| 'slide_in_from_right'
+	| 'slide_in_from_top'
+	| 'slide_in_from_bottom'
+	| 'zoom_in'
+	| 'pop_in'
+	| 'spin_in'
+	| 'drop_in'
+	| 'fade_out'
+	| 'slide_out_to_left'
+	| 'slide_out_to_right'
+	| 'slide_out_to_top'
+	| 'slide_out_to_bottom'
+	| 'zoom_out'
+	| 'pop_out'
+	| 'spin_out'
+	| 'drop_out'
+	| 'pulse'
+	| 'wiggle'
+	| 'bounce'
+	| 'push_in'
+	| 'pull_out';
+
+/** One preset as the picker lists it (`MotionPresetInfo`). */
+export interface MotionPresetInfo {
+	id: MotionPreset;
+	label: string;
+	kind: MotionKind;
+	/** Seconds; absent for a preset that fills the rest of the clip (`push_in`, `pull_out`). */
+	default_duration?: number;
+	hint: string;
+	/** The numbers it keys. */
+	properties: Property[];
+}
+
+/** A clip a preset was written into and the window it covers, seconds from the clip's start (`MotionApplied`). The
+ *  Tauri command answers the slimmer `MotionWindow`: the clip is already in the timeline it returns. */
+export interface MotionApplied {
+	clip: Clip;
+	start: number;
+	end: number;
+}
+
+/** The window a preset was written over on one clip, seconds from the clip's start (the clamped one). */
+export interface MotionWindow {
+	clip_id: string;
+	start: number;
+	end: number;
+}
+
+/** What applying a preset did: the refreshed timeline and the window each clip got (`MotionApplication`). */
+export interface MotionApplication {
+	timeline: Timeline;
+	applied: MotionWindow[];
+}
+
 // ---- GPU preview (A2) -------------------------------------------------------
 
 /** What the GPU preview is doing on this machine (`GpuPreviewStatus` in

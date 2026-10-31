@@ -2499,6 +2499,59 @@ fn copy_keyframes(
     project.timeline().map_err(|e| e.to_string())
 }
 
+/// One clip a motion preset was written into, and the window it covers (seconds from the clip's start).
+#[derive(serde::Serialize)]
+struct MotionWindow {
+    clip_id: Uuid,
+    start: f64,
+    end: f64,
+}
+
+/// What applying a motion preset did: the refreshed timeline and, per clip, the window used (a `duration`
+/// longer than the clip is clamped to it).
+#[derive(serde::Serialize)]
+struct MotionApplication {
+    timeline: Timeline,
+    applied: Vec<MotionWindow>,
+}
+
+/// Write a motion preset (an entrance, an exit or an emphasis) into the animation of several clips as one
+/// revision, all or nothing. `mode` defaults to `add`; `at`, `duration` and `intensity` to the preset's own.
+#[tauri::command(async)]
+fn apply_motion_preset(
+    state: State<'_, AppState>,
+    clip_ids: Vec<String>,
+    preset: kerf_core::MotionPreset,
+    mode: Option<kerf_core::MotionMode>,
+    at: Option<f64>,
+    duration: Option<f64>,
+    intensity: Option<f64>,
+) -> CmdResult<MotionApplication> {
+    let ids = ids(&clip_ids, "clip_ids")?;
+    let project = state.project();
+    let done = project
+        .apply_motion_preset(&ids, preset, mode.unwrap_or_default(), at, duration, intensity)
+        .map_err(|e| e.to_string())?;
+    Ok(MotionApplication {
+        timeline: project.timeline().map_err(|e| e.to_string())?,
+        applied: done
+            .into_iter()
+            .map(|m| MotionWindow {
+                clip_id: m.clip.id,
+                start: m.start,
+                end: m.end,
+            })
+            .collect(),
+    })
+}
+
+/// The motion presets a user can apply (`fade_in`, `slide_out_to_left`, `pulse`, ...), entrances first, then
+/// exits, then emphases. Needs no project.
+#[tauri::command(async)]
+fn list_motion_presets() -> Vec<kerf_core::MotionPresetInfo> {
+    kerf_core::motion_presets()
+}
+
 #[tauri::command(async)]
 fn clear_keyframes(state: State<'_, AppState>, clip_id: String) -> CmdResult<Timeline> {
     let id = id(&clip_id, "clip_id")?;
@@ -5750,6 +5803,8 @@ pub fn run() {
             set_property_keyframes,
             set_property_tracks,
             copy_keyframes,
+            apply_motion_preset,
+            list_motion_presets,
             clear_keyframes,
             set_reframe,
             set_asset_projection,

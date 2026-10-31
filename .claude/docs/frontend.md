@@ -138,7 +138,7 @@ racing writes could leave the older on disk; bun-tested). `workspace.svelte.ts`
 is the runes singleton: `switchTo` keeps the arrangement being left, swaps the
 layout and shows the library tab that workspace last had (each remembers its own;
 until one is picked it is the workspace's tool: Color → Effects, Audio → Audio,
-Motion → Titles — titles are added there, not in the Inspector —, Edit and Deliver → Media; a tab the user picked
+Motion → Motion (it was Titles; titles are added in their own tab, not in the Inspector), Edit and Deliver → Media; a tab the user picked
 in a workspace is stored and kept, only the unpicked default moved), and **touches no project state**
 — cut, selection, playhead and playback are `editor` / `ui` and survive (dockview
 rebuilds the panels, so a panel's own scroll starts over). **A layout is written
@@ -197,7 +197,7 @@ decoded thumbnails live in `thumbnails.ts` rather than the component — the lib
 remounts it on every tab switch, unfold and workspace switch, and each remount
 used to decode every asset again; it keeps answers, including "no frame", but not
 a failed decode, which is retried on the next mount), Titles (`TitlesControls`), Effects (color looks +
-video effects), Transitions (the grouped picker), Audio (audio effects + the
+video effects), Transitions (the grouped picker), Motion (the presets below), Audio (audio effects + the
 voiceover and music entry points), Transcript (`TranscriptPanel`). **The Media tab's header is the one place for the count and the
 ways in**: `MEDIA · 3` (`MEDIA · 3 of 12` under a tag filter) with the tag-filter, music, voiceover and import buttons (`importMedia`, `import-media.ts`; the import tooltip carries
 `file.import`'s key from the keymap) — the bin used to stack the dock tab, `MEDIA` and `3 ASSETS`. **A bin row is
@@ -665,6 +665,23 @@ The handles count as page overlays for `routePreview` (`handles`), so on an X11 
 to the JPEG while they show (a click on the surface itself never reaches the page there: select the clip in the timeline);
 under a transparent webview they draw over the surface. Not done: separate X / Y scale (the model has one `scale`; it
 needs a model, export-graph and GPU change), a live GPU picture during the drag (A3).
+
+**Motion presets** (B8a) are the library's **Motion** tab (`MotionTab.svelte`, rail icon `move`, between Transitions and Audio; the Motion
+workspace opens on it), a tab of its own rather than a group in Effects because it is a third kind of thing a click writes (keys on the
+transform numbers, which neither a look nor an effect chain nor a transition is), has options of its own, and 23 tiles would have swamped
+Effects. Three groups, **Entrance / Exit / Emphasis** (`MOTION_GROUPS` in `motion-ui.ts`), each preset a `Tile` named by its label with the
+hint, the length and where it lands in its tooltip (`presetTip`); the list is `listMotionPresets()` (the backend's, the page's
+`motionPresets()` until it answers). A click is `applyMotion(preset)` (`ops.ts`) — one `apply_motion_preset` edit for every selected
+**picture** clip (`motionTargets`: a clip on an audio track is left out, since the core would refuse the whole call, and a linked picture
+is selected with its sound), through `holdForPreview` and `report` like any edit; the tiles are off with a `Hint` saying why when nothing
+or only sounds are selected (`motionReason`). The options above the tiles are `ui.motionMode` (Add, the default: keeps the clip's own
+animation outside the window; Replace), `ui.motionLength` (a text field, blank = the preset's own, `parseMotionLength`; an exit still ends at the clip's end)
+and `ui.motionIntensity` (a `SliderRow`, 0.25 to 2); they outlive the tab and are what every click sends (`motionOptions` leaves the
+defaults out). The one thing said afterwards, in a toast, is a window a clip cut short (`clampedNotice`, from the windows the command
+returns). The clip's context menu has **Motion presets…** (not a submenu: context menus are flat lists) which opens the panel, the tab and
+the rail. The browser harness runs the same presets through `motion-presets.ts` (a port of kerf-core's table, window rules and
+`apply_motion`, replayed bit for bit over `fixtures/motion-presets-corpus.json` by `motion-presets.test.ts`, which also holds the labels and
+hints to the Rust table) and records `Apply motion preset Pop in (3 clips)` as one revision.
 
 **The motion path** (`MotionPath.svelte`, mounted beside the handles with the same `active` — so hidden while playing, streaming,
 previewing a proposal or in the trim monitor — pure math in `motion-path.ts`; **View › Motion path**, `view.motionPath`, no

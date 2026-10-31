@@ -27,6 +27,7 @@ import type {
 	CaptionTimeBase,
 	Levels,
 	ModelProgress,
+	MotionMode,
 	PreviewDraft,
 	TagFilter,
 	TranscriptionStatus
@@ -169,6 +170,13 @@ class EditorUi {
 	 *  every time a sentence happened to be short. Set in the library's Titles tab;
 	 *  the titles lane's menu and Edit › Generate captions generate in it too. */
 	captionStyle = $state<CaptionStyle>('lines');
+	/** How the Motion tab and the clip menu write a motion preset: `add` keeps the clip's own animation outside the
+	 *  preset's window, `replace` gives its numbers exactly the preset's keys; `motionLength` is the window in
+	 *  seconds (`null`: the preset's own) and `motionIntensity` how far it departs from the clip's pose (0.25 to 2).
+	 *  Held here so they outlive the tab. */
+	motionMode = $state<MotionMode>('add');
+	motionLength = $state<number | null>(null);
+	motionIntensity = $state(1);
 	/** The animated SVG title whose source the Inspector should open and focus: set when *Custom SVG…* makes
 	 *  one (or a lane menu asks to edit it), cleared by the Inspector once it has taken the focus. */
 	svgSourceFocus = $state<string | null>(null);

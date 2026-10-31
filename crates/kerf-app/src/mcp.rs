@@ -1525,6 +1525,43 @@ struct CopyKeyframesParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct MotionPresetParams {
+    #[schemars(
+        description = "UUIDs of the picture clips to animate (a clip on an audio track refuses the whole call); a \
+                       clip named twice counts once"
+    )]
+    clip_ids: Vec<String>,
+    #[schemars(description = "The preset, by id (list_motion_presets says what each does and how long it runs)")]
+    preset: kerf_core::MotionPreset,
+    #[schemars(
+        description = "\"add\" (default) merges into the clip's animation: its keys of the numbers the preset \
+                       drives that fall inside the window are replaced, the ones outside stay, so an entrance, an \
+                       exit and a mid-clip pulse can coexist (where two windows overlap the one applied last wins). \
+                       \"replace\" gives those numbers exactly the preset's keys; the clip's other numbers are \
+                       untouched either way"
+    )]
+    mode: Option<kerf_core::MotionMode>,
+    #[schemars(
+        description = "Where the window starts, in seconds from the clip's start. Default: 0 for an entrance or an \
+                       emphasis; an exit ends at the clip's end (it starts `duration` before it). Give it to put an \
+                       emphasis or an entrance mid-clip"
+    )]
+    at: Option<f64>,
+    #[schemars(
+        description = "How long the window is, in seconds (at least 0.01). Default: the preset's own (push_in and \
+                       pull_out: the rest of the clip). Longer than the clip allows, it is clamped to what is left, \
+                       not refused: a 0.5 s fade on a 0.3 s clip is a 0.3 s fade"
+    )]
+    duration: Option<f64>,
+    #[schemars(
+        description = "How far the motion departs from the clip's own pose, 0.25 to 2 (default 1): 0.5 slides, \
+                       turns or grows half as far, 2 twice as far. A scale never goes to nothing and an opacity \
+                       stays in 0..1"
+    )]
+    intensity: Option<f64>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct SetKeyframeEasingParams {
     #[schemars(description = "UUID of the clip")]
     clip_id: String,
@@ -4136,6 +4173,54 @@ impl KerfMcp {
             .copy_keyframes(from, to, &p.props.unwrap_or_default(), p.offset.unwrap_or(0.0))
             .map_err(core_err)?;
         json(&out)
+    }
+
+    #[tool(
+        description = "List the motion presets apply_motion_preset takes by `id`, in the order entrances, exits, \
+                       emphases: each with its label, `kind`, `default_duration` in seconds (absent for push_in and \
+                       pull_out, which fill the rest of the clip), a `hint` saying what it looks like and the \
+                       `properties` (scale, pos_x, pos_y, rotation, opacity) it keys."
+    )]
+    fn list_motion_presets(&self) -> Result<String, McpError> {
+        json(&kerf_core::motion_presets())
+    }
+
+    #[tool(
+        description = "Give clips a ready-made motion in one call, written as eased keyframes on scale / position / \
+                       rotation / opacity. ENTRANCES: fade_in, slide_in_from_left, slide_in_from_right, \
+                       slide_in_from_top, slide_in_from_bottom, zoom_in, pop_in, spin_in, drop_in. EXITS: fade_out, \
+                       slide_out_to_left, slide_out_to_right, slide_out_to_top, slide_out_to_bottom, zoom_out, \
+                       pop_out, spin_out, drop_out. EMPHASES: pulse, wiggle, bounce, push_in (a slow zoom in over the \
+                       whole clip), pull_out. A direction names where the picture comes from (slide_in_from_left) or \
+                       goes to (slide_out_to_left). It is relative to the clip's own pose: an entrance ends on the \
+                       clip's own scale, position, rotation and opacity, an exit starts from them, an emphasis rides \
+                       on top, so it suits a clip that is already zoomed or positioned. Entrances and emphases start at \
+                       the clip's start, exits end at its end (`at` moves the window). mode `add` (default) merges into \
+                       the clip's existing keys inside the window and keeps the ones outside, so a fade_in, a fade_out \
+                       and a mid-clip pulse coexist; `replace` replaces those numbers' keys. `duration` is clamped to \
+                       the clip, so check the window each clip got in the result. One revision for all clips, all or \
+                       nothing; a clip on an audio track is refused. Returns `applied`: per clip, its `clip_id` and the \
+                       `start` / `end` of the window used, in seconds from the clip's start."
+    )]
+    fn apply_motion_preset(&self, Parameters(p): Parameters<MotionPresetParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::apply_motion_preset_op(project, p))
+    }
+
+    fn apply_motion_preset_op(project: &Project, p: MotionPresetParams) -> Result<String, McpError> {
+        let ids = p
+            .clip_ids
+            .iter()
+            .map(|s| parse_arg("clip_ids", s))
+            .collect::<Result<Vec<Uuid>, _>>()?;
+        let mode = p.mode.unwrap_or_default();
+        let done = project
+            .apply_motion_preset(&ids, p.preset, mode, p.at, p.duration, p.intensity)
+            .map_err(core_err)?;
+        let applied: Vec<serde_json::Value> = done
+            .iter()
+            .map(|m| serde_json::json!({"clip_id": m.clip.id, "start": m.start, "end": m.end}))
+            .collect();
+        json(&serde_json::json!({"preset": p.preset, "mode": mode, "applied": applied}))
     }
 
     #[tool(
@@ -7240,8 +7325,9 @@ const INSTRUCTIONS: &str = "Kerf is the video editor open on this computer, and 
              have selected and where the playhead and marks are. Look at the footage with skim_asset \
              (a contact sheet), get_frame and preview_timeline (the cut you have built) before and after \
              you edit, and at a whole assembled cut with skim_timeline. Cut with split / trim / move_clip / remove / ripple_delete, then polish with \
-             set_volume, set_fade, set_transition, set_transform, set_color, add_overlay and \
-             generate_captions (caption last, once the cut is settled). A plan of several edits runs as \
+             set_volume, set_fade, set_transition, set_transform, set_color, apply_motion_preset (an \
+             entrance, exit or emphasis such as pop_in or slide_out_to_left, on top of the clip's own pose), \
+             add_overlay and generate_captions (caption last, once the cut is settled). A plan of several edits runs as \
              one apply_edits call: one step, all or nothing, and dry_run previews it. Before you call a cut done, run \
              platform_check and review_cut, and get_levels for anything going to social; export renders it to an \
              absolute path. \
@@ -7377,7 +7463,15 @@ const EDITING_GUIDE: &str = "How to edit with Kerf. The user queues editing task
              over a shot, an opacity ramp that starts later than the zoom, the clip's \
              volume swelling or ducking mid-clip, a mask that moves, a crop that pushes \
              in or pans (crop_zoom / crop_x / crop_y) — and copy_keyframes gives another \
-             clip the same animation. 360 footage (Insta360 \
+             clip the same animation. For the usual moves skip the keys: apply_motion_preset gives \
+             clips an entrance (fade_in, slide_in_from_left, zoom_in, pop_in, drop_in, ...), an exit \
+             (fade_out, slide_out_to_right, zoom_out, ...) or an emphasis (pulse, wiggle, bounce, \
+             push_in, a slow Ken Burns zoom) in one edit (list_motion_presets says what each does). \
+             It is relative to the clip's own pose, so it suits a clip already scaled or positioned; \
+             entrances start at the clip's start, exits end at its end, `at` and `duration` move and \
+             size the window (clamped to the clip: read the window each clip got back), and mode add \
+             (default) keeps the clip's other keys outside the window so a fade_in, a fade_out and a \
+             mid-clip pulse coexist, while replace overwrites those numbers' keys. 360 footage (Insta360 \
              .insv, equirect exports) is detected on import and clips cut from it \
              are reframed to an ordinary rectilinear shot automatically: aim the \
              virtual camera with set_reframe (yaw / pitch / roll / field of view) \
@@ -11445,6 +11539,296 @@ mod tests {
             crate::lock_user(&shared).staged().unwrap().unwrap().asset_changes.len(),
             3,
             "and holds nothing back"
+        );
+    }
+
+    #[test]
+    fn the_motion_tools_say_what_they_take_and_name_every_preset() {
+        let tools = router().list_all();
+        let tool = |name: &str| {
+            tools
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("`{name}` is registered"))
+        };
+        let required = |name: &str| -> Vec<String> {
+            let mut r: Vec<String> = tool(name)
+                .input_schema
+                .get("required")
+                .and_then(|r| r.as_array())
+                .map(|r| r.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            r.sort();
+            r
+        };
+        assert_eq!(required("apply_motion_preset"), ["clip_ids", "preset"]);
+        assert!(required("list_motion_presets").is_empty());
+
+        let description = |name: &str| tool(name).description.as_deref().unwrap_or_default().to_string();
+        let apply = description("apply_motion_preset");
+        let (_, rest) = apply.split_once("ENTRANCES:").expect("the presets are listed by kind");
+        let (entrances, rest) = rest.split_once("EXITS:").expect("the presets are listed by kind");
+        let (exits, rest) = rest.split_once("EMPHASES:").expect("the presets are listed by kind");
+        let (emphases, _) = rest
+            .split_once("A direction names")
+            .expect("the list ends where the rules begin");
+        for info in kerf_core::motion_presets() {
+            for (listed, kind) in [
+                (entrances, kerf_core::MotionKind::Entrance),
+                (exits, kerf_core::MotionKind::Exit),
+                (emphases, kerf_core::MotionKind::Emphasis),
+            ] {
+                assert_eq!(
+                    listed.contains(info.id.as_str()),
+                    info.kind == kind,
+                    "`{}` is listed under the wrong kind (or not at all): {apply}",
+                    info.id.as_str()
+                );
+            }
+        }
+        let both = apply.clone() + &description("list_motion_presets");
+        for needle in [
+            "own pose",
+            "`add`",
+            "`replace`",
+            "clamped",
+            "all or nothing",
+            "audio track",
+            "`start` / `end`",
+            "default_duration",
+        ] {
+            assert!(both.contains(needle), "the motion tools do not say `{needle}`: {both}");
+        }
+        let schema = serde_json::to_string(&tool("apply_motion_preset").input_schema).unwrap();
+        for needle in [
+            "slide_in_from_left",
+            "drop_out",
+            "replace",
+            "0.25 to 2",
+            "clamped",
+            "list_motion_presets",
+        ] {
+            assert!(schema.contains(needle), "the schema does not say `{needle}`: {schema}");
+        }
+
+        let hint = |name: &str| tool(name).annotations.clone().unwrap();
+        assert_eq!(hint("list_motion_presets").read_only_hint, Some(true));
+        let apply_hint = hint("apply_motion_preset");
+        assert_eq!(
+            (
+                apply_hint.read_only_hint,
+                apply_hint.destructive_hint,
+                apply_hint.idempotent_hint
+            ),
+            (Some(false), Some(false), Some(true)),
+            "a staged, undoable edit that applying twice does not repeat"
+        );
+        for name in ["apply_motion_preset", "list_motion_presets"] {
+            assert_eq!(
+                super::toolsets::set_of(name),
+                Some(super::toolsets::ToolSet::Keyframes),
+                "{name}"
+            );
+        }
+
+        assert!(super::INSTRUCTIONS.contains("apply_motion_preset"));
+        assert!(super::INSTRUCTIONS.len() <= 3500, "{} characters", super::INSTRUCTIONS.len());
+        for needle in ["apply_motion_preset", "list_motion_presets", "own pose", "mode add"] {
+            assert!(super::EDITING_GUIDE.contains(needle), "the guide does not say `{needle}`");
+        }
+
+        let parse = |v: serde_json::Value| serde_json::from_value::<super::MotionPresetParams>(v);
+        let ok = parse(serde_json::json!({"clip_ids": ["c"], "preset": "slide_out_to_left", "mode": "replace"})).unwrap();
+        assert_eq!(ok.preset, kerf_core::MotionPreset::SlideOutToLeft);
+        assert_eq!(ok.mode, Some(kerf_core::MotionMode::Replace));
+        for bad in [
+            serde_json::json!({"clip_ids": ["c"], "preset": "slide_in_left"}),
+            serde_json::json!({"clip_ids": ["c"], "preset": "fade_in", "mode": "merge"}),
+            serde_json::json!({"preset": "fade_in"}),
+        ] {
+            assert!(parse(bad.clone()).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn list_motion_presets_answers_what_the_picker_lists() {
+        let (server, _) = headless_server();
+        let listed = answer(server.list_motion_presets().unwrap());
+        let list = listed.as_array().unwrap();
+        assert_eq!(list.len(), kerf_core::MotionPreset::ALL.len());
+        assert_eq!(list[0]["id"], "fade_in");
+        assert_eq!(list[0]["kind"], "entrance");
+        assert_eq!(list[6]["default_duration"], 0.5);
+        let push = list.iter().find(|p| p["id"] == "push_in").unwrap();
+        assert!(push.get("default_duration").is_none());
+        assert_eq!(
+            listed,
+            serde_json::to_value(kerf_core::motion_presets()).unwrap(),
+            "the tool and the Tauri command list the same presets"
+        );
+    }
+
+    /// The agent animates clips with a preset: with review on it is held back as a proposal (the live cut
+    /// is untouched), the agent's own reads see it, the webview is told once per edit, the window each clip
+    /// got comes back clamped, and a refused call changes nothing and says so as the caller's mistake.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_agent_applies_a_motion_preset_and_it_stages() {
+        use rmcp::model::ErrorCode;
+        let (server, shared) = headless_server();
+        let (long, short, voice) = {
+            let project = shared.lock().unwrap();
+            let video = footage(&project, "a.mp4", 60.0, "2026-01-01T00:00:00Z");
+            let long = project.add_clip_to_timeline(video.id, None, 0.0, 10.0, Some(0.0)).unwrap();
+            let short = project.add_clip_to_timeline(video.id, None, 20.0, 20.25, Some(10.0)).unwrap();
+            let sound: kerf_core::Asset = serde_json::from_value(serde_json::json!({
+                "id": uuid::Uuid::new_v4(), "path": "/footage/voice.wav", "name": "voice.wav", "duration": 5.0,
+                "streams": [{ "index": 0, "kind": "audio", "codec": "pcm_s16le", "sample_rate": 48000, "channels": 2 }],
+                "imported_at": "2026-01-01T00:00:02Z",
+            }))
+            .unwrap();
+            project.insert_or_get_asset(&sound).unwrap();
+            let voice = project.add_clip_to_timeline(sound.id, None, 0.0, 5.0, Some(0.0)).unwrap();
+            (long, short, voice)
+        };
+        let changed = std::sync::Arc::new(AtomicI64::new(0));
+        {
+            let changed = changed.clone();
+            server.app.listen("project-changed", move |_| {
+                changed.fetch_add(1, Ordering::Relaxed);
+            });
+        }
+        let params = |ids: Vec<String>, preset, mode, at, duration, intensity| super::MotionPresetParams {
+            clip_ids: ids,
+            preset,
+            mode,
+            at,
+            duration,
+            intensity,
+        };
+        let ids = vec![long.id.to_string(), short.id.to_string()];
+
+        let done = answer(
+            server
+                .apply_motion_preset(Parameters(params(
+                    ids.clone(),
+                    kerf_core::MotionPreset::FadeIn,
+                    None,
+                    None,
+                    None,
+                    None,
+                )))
+                .unwrap(),
+        );
+        assert_eq!(
+            (done["preset"].as_str(), done["mode"].as_str()),
+            (Some("fade_in"), Some("add"))
+        );
+        let windows = done["applied"].as_array().unwrap();
+        assert_eq!(windows[0]["clip_id"], long.id.to_string());
+        assert_eq!(
+            (windows[0]["start"].as_f64(), windows[0]["end"].as_f64()),
+            (Some(0.0), Some(0.5))
+        );
+        assert_eq!(
+            (windows[1]["start"].as_f64(), windows[1]["end"].as_f64()),
+            (Some(0.0), Some(0.25)),
+            "the half second fade is clamped to the quarter second clip, and the result says so"
+        );
+        assert_eq!(changed.load(Ordering::Relaxed), 1, "the webview is told after the edit");
+
+        // The exit reads the proposal: it merges into the entrance the first call staged.
+        server
+            .apply_motion_preset(Parameters(params(
+                vec![long.id.to_string()],
+                kerf_core::MotionPreset::FadeOut,
+                Some(kerf_core::MotionMode::Add),
+                None,
+                Some(1.0),
+                None,
+            )))
+            .unwrap();
+        {
+            let user = crate::lock_user(&shared);
+            let live = user.timeline().unwrap();
+            assert!(
+                live.clip(long.id).unwrap().channels.is_empty(),
+                "the live cut is the user's until they accept"
+            );
+            let proposed = user
+                .staged_timeline()
+                .unwrap()
+                .expect("the preset is held back as a proposal");
+            let keys: Vec<(f64, f64)> = proposed
+                .clip(long.id)
+                .unwrap()
+                .property_keys(kerf_core::Property::Opacity)
+                .iter()
+                .map(|k| (k.time, k.value))
+                .collect();
+            assert_eq!(keys, [(0.0, 0.0), (0.5, 1.0), (9.0, 1.0), (10.0, 0.0)]);
+            assert!(user.staged().unwrap().is_some());
+        }
+        assert_eq!(changed.load(Ordering::Relaxed), 2);
+
+        // Mistakes are the caller's, and leave nothing behind.
+        let before = changed.load(Ordering::Relaxed);
+        let staged_before = serde_json::to_value(crate::lock_user(&shared).staged_timeline().unwrap()).unwrap();
+        for (name, call) in [
+            (
+                "not an id",
+                params(vec!["a.mp4".into()], kerf_core::MotionPreset::Pulse, None, None, None, None),
+            ),
+            (
+                "a clip that is not there",
+                params(
+                    vec![long.id.to_string(), uuid::Uuid::new_v4().to_string()],
+                    kerf_core::MotionPreset::Pulse,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            ),
+            (
+                "nothing named",
+                params(vec![], kerf_core::MotionPreset::Pulse, None, None, None, None),
+            ),
+            (
+                "a sound",
+                params(
+                    vec![long.id.to_string(), voice.id.to_string()],
+                    kerf_core::MotionPreset::Pulse,
+                    None,
+                    None,
+                    None,
+                    None,
+                ),
+            ),
+            (
+                "a window of nothing",
+                params(ids.clone(), kerf_core::MotionPreset::Pulse, None, None, Some(0.0), None),
+            ),
+            (
+                "an intensity past the top",
+                params(ids.clone(), kerf_core::MotionPreset::Pulse, None, None, None, Some(5.0)),
+            ),
+            (
+                "a start past the clip",
+                params(ids, kerf_core::MotionPreset::Pulse, None, Some(99.0), None, None),
+            ),
+        ] {
+            let err = server.apply_motion_preset(Parameters(call)).unwrap_err();
+            assert_eq!(err.code, ErrorCode::INVALID_PARAMS, "{name}: {}", err.message);
+        }
+        assert_eq!(
+            changed.load(Ordering::Relaxed),
+            before,
+            "a refused call tells the webview nothing"
+        );
+        assert_eq!(
+            serde_json::to_value(crate::lock_user(&shared).staged_timeline().unwrap()).unwrap(),
+            staged_before,
+            "and changes nothing in the proposal"
         );
     }
 }

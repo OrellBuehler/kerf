@@ -1,6 +1,6 @@
 <script lang="ts">
 	// The library: everything you pull *into* the cut, behind one icon rail —
-	// Media, Titles, Effects, Transitions, Audio and the Transcript. It replaces
+	// Media, Titles, Effects, Transitions, Motion, Audio and the Transcript. It replaces
 	// the old Media | Transcript tab group. Clicking the active icon folds the
 	// content away and leaves the rail alone (the panel then gives its width
 	// back); clicking any icon opens it again. Which tab and whether it is folded
@@ -14,6 +14,7 @@
 	import TitlesControls from './TitlesControls.svelte';
 	import EffectsTab from './EffectsTab.svelte';
 	import TransitionsTab from './TransitionsTab.svelte';
+	import MotionTab from './MotionTab.svelte';
 	import AudioTab from './AudioTab.svelte';
 	import TranscriptPanel from './TranscriptPanel.svelte';
 	import { settings } from '#lib/settings.svelte';
@@ -323,6 +324,8 @@
 				<EffectsTab />
 			{:else if tab === 'transitions'}
 				<TransitionsTab />
+			{:else if tab === 'motion'}
+				<MotionTab />
 			{:else if tab === 'audio'}
 				<AudioTab />
 			{:else}

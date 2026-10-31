@@ -62,6 +62,10 @@ import type {
 	ModelProgress,
 	Easing,
 	Keyframe,
+	MotionApplication,
+	MotionMode,
+	MotionPreset,
+	MotionPresetInfo,
 	Property,
 	PropertyKey,
 	PropertyTrack,
@@ -182,6 +186,7 @@ import {
 	setPropertyKeys,
 	transformAt
 } from './channels';
+import { applyMotionPreset as applyMotionPresetLocal, motionPresets } from './motion-presets';
 import { formatTime as fmtTime } from './diff';
 import {
 	rollEdit as rollEditLocal,
@@ -3265,6 +3270,39 @@ export async function copyKeyframes(
 		return snapshot();
 	}
 	return invoke<Timeline>('copy_keyframes', { fromClipId, toClipId, props, offset });
+}
+
+/** The motion presets, entrances first, then exits, then emphases (`list_motion_presets`). */
+export async function listMotionPresets(): Promise<MotionPresetInfo[]> {
+	if (!inTauri()) return motionPresets();
+	return invoke<MotionPresetInfo[]>('list_motion_presets');
+}
+
+/** How a preset is written. Everything is optional: `mode` defaults to `add`, `at` to where the preset's kind
+ *  starts (the clip's start, or for an exit `duration` before its end), `duration` to the preset's own (clamped to
+ *  the clip), `intensity` to 1 (0.25 to 2). */
+export interface MotionOptions {
+	mode?: MotionMode;
+	at?: number;
+	duration?: number;
+	intensity?: number;
+}
+
+/** Write a motion preset into the animation of several clips as **one** revision, all or nothing
+ *  (`apply_motion_preset`); resolves to the timeline and the window each clip got, which a `duration` longer than
+ *  the clip clamps. Rejects an audio clip, an unknown clip or a number out of range, changing nothing. */
+export async function applyMotionPreset(
+	clipIds: string[],
+	preset: MotionPreset,
+	options: MotionOptions = {}
+): Promise<MotionApplication> {
+	if (!inTauri()) {
+		const done = devRun((tl) =>
+			applyMotionPresetLocal(tl, clipIds, preset, options.mode, options.at, options.duration, options.intensity)
+		);
+		return { timeline: snapshot(), applied: done.map((m) => ({ clip_id: m.clip.id, start: m.start, end: m.end })) };
+	}
+	return invoke<MotionApplication>('apply_motion_preset', { clipIds, preset, ...options });
 }
 
 export async function clearKeyframes(clipId: string): Promise<Timeline> {
