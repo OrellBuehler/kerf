@@ -38,6 +38,7 @@ pub(super) fn asset(path: &str, duration: f64, streams: Vec<StreamInfo>) -> Asse
         source_paths: Vec::new(),
         voiceover: None,
         music_score: None,
+        sound_effect: None,
         tags: Vec::new(),
     }
 }

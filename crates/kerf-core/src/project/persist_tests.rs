@@ -255,7 +255,7 @@ fn a_v2_file_is_backed_up_once_then_gets_the_fonts_table() {
     let path = dir.join("cut.kerf");
     edited(2).0.save_as(&path).unwrap();
     make_v2(&path);
-    assert_eq!(SCHEMA_VERSION, 18);
+    assert_eq!(SCHEMA_VERSION, 19);
     assert!(!has_fonts_table(&path));
 
     let project = Project::open(&path).unwrap();
@@ -316,14 +316,14 @@ fn a_file_from_before_every_step_gets_each() {
         .unwrap()
         .execute_batch(
             "DROP TABLE fonts; ALTER TABLE staged DROP COLUMN owner; ALTER TABLE staged DROP COLUMN assets; \
-             ALTER TABLE assets DROP COLUMN tags;",
+             ALTER TABLE assets DROP COLUMN tags; ALTER TABLE assets DROP COLUMN sound_effect;",
         )
         .unwrap();
     drop(Project::open(&path).unwrap());
     assert_eq!(version_of(&path), SCHEMA_VERSION);
     assert!(has_fonts_table(&path));
     let conn = Connection::open(&path).unwrap();
-    assert!(conn.prepare("SELECT voiceover, tags FROM assets").is_ok());
+    assert!(conn.prepare("SELECT voiceover, tags, sound_effect FROM assets").is_ok());
     assert!(conn.prepare("SELECT owner, assets FROM staged").is_ok());
     assert_eq!(version_of(&dir.join("cut (schema v0 backup).kerf")), 0);
     std::fs::remove_dir_all(&dir).ok();
@@ -1040,6 +1040,52 @@ fn a_v17_file_is_backed_up_stamped_v18_and_keeps_its_stabilized_clip() {
         17,
         "an older build drops the setting, so the file as it was is kept"
     );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A sound effect keeps the spec it was made from, and a file stored before v19 has none. The file is copied aside, since an
+/// older build drops the spec at its next write of the asset (the effect can no longer be reshaped) and its reads do not
+/// select the column; a build that cannot write refuses a file without it.
+#[test]
+fn a_v18_file_gains_the_sound_effect_column_and_keeps_a_backup() {
+    let dir = scratch();
+    let path = dir.join("cut.kerf");
+    edited(1).0.save_as(&path).unwrap();
+    {
+        let conn = Connection::open(&path).unwrap();
+        conn.pragma_update(None, "user_version", 18).unwrap();
+        conn.execute_batch("ALTER TABLE assets DROP COLUMN sound_effect").unwrap();
+        assert_eq!(store::pending_steps(&conn, 18), vec![18]);
+    }
+
+    let uri = format!("file:{}?mode=ro", path.display());
+    let err = Project::open(&uri).err().expect("reading an asset needs the column");
+    assert!(err.to_string().contains("read-only"), "{err}");
+
+    let project = Project::open(&path).unwrap();
+    assert_eq!(version_of(&path), SCHEMA_VERSION);
+    assert_eq!(version_of(&schema_backup_path(&path, 18)), 18, "the file as it was is kept");
+    // The asset that was there reads back with no spec, and an effect can now be stored.
+    assert!(project.list_assets().unwrap()[0].sound_effect.is_none());
+    let mut effect = asset("/fx/a.wav", 1.0, vec![stream(StreamKind::Audio)]);
+    let mut spec = crate::model::SfxSpec::new(crate::model::SfxKind::Riser);
+    spec.pitch = -5.0;
+    spec.seed = 77;
+    effect.sound_effect = Some(spec.resolved());
+    project.insert_asset(&effect).unwrap();
+    drop(project);
+    let back = Project::open(&path)
+        .unwrap()
+        .list_assets()
+        .unwrap()
+        .into_iter()
+        .find(|a| a.id == effect.id)
+        .unwrap();
+    assert_eq!(back.sound_effect, effect.sound_effect);
+    // Already there: opening again changes nothing and makes no second backup.
+    let files = std::fs::read_dir(&dir).unwrap().count();
+    drop(Project::open(&path).unwrap());
+    assert_eq!(std::fs::read_dir(&dir).unwrap().count(), files);
     std::fs::remove_dir_all(&dir).ok();
 }
 

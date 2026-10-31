@@ -144,6 +144,7 @@ impl Rig {
             source_paths: Vec::new(),
             voiceover: None,
             music_score: None,
+            sound_effect: None,
             tags: Vec::new(),
         };
         Self { dir, asset }

@@ -272,6 +272,62 @@ struct ComposeMusicParams {
     background: Option<bool>,
 }
 
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct AddSoundEffectsParams {
+    #[schemars(
+        description = "The effects to add, 1 to 256, each {kind, at, ...}: `kind` is a sound from list_sound_effects; `at` is the timeline second the effect's HIT lands on — a whoosh's peak (about halfway through it), an impact's first transient, the END of a riser — so put `at` on the picture event (the cut, the title's first frame, the drop) and the clip starts earlier by itself (a start less than 10 ms before 0 is put at 0 and the hit lands that late; a deeper one has its head cut off, with a 4 ms fade-in; an effect that would keep under 20 ms of sound is refused with the earliest time it can land). Optional per effect: duration_s (clamped to the kind's range), pitch (semitones, -12 to 12), intensity (0-1, default 0.7: brightness and aggression), tail (0-1, default 0.3: reverb / echo after the sound), reverse (play it backwards; the hit mirrors to the end), seed (a different integer is a different take of the same sound, 0 to 9007199254740991 — vary it down a run of cuts so they do not repeat), volume_db (the clip's gain, -60 to 12, default 0; levels are already balanced per kind, so a click sits quieter than a boom; under speech about -8, in the clear about -3), track_id. Without a track_id an effect goes on the first unlocked audio track named FX (then FX 2, FX 3, …) where it overlaps no clip, and a new lane is made when none fits, so effects that overlap (a riser into its impact) are fine. With track_id it must be an unlocked audio track with room for it. An unknown or misspelled field is an error naming it. suggest_sound_effects' `placement` objects are exactly this shape: pass them as they are."
+    )]
+    effects: Vec<kerf_core::SfxPlacement>,
+    #[schemars(
+        description = "Ripple override for placing the clips, and for the check made before anything renders. Omitted, the project's ripple mode applies (get_ripple_mode). It matters only for an effect placed on a named track (track_id) on top of other clips: with ripple on they are pushed later (a start inside a clip is still refused, ripple never splits a clip); with it off the request is refused. Effects on the FX lanes never need it: a lane with no room is skipped and a new one made. Ripple is an attempt: it never moves a locked track (placing ON one is refused)."
+    )]
+    ripple: Option<bool>,
+}
+
+#[derive(Debug, schemars::JsonSchema)]
+struct UpdateSoundEffectParams {
+    #[schemars(
+        description = "UUID of the effect's clip on the timeline (add_sound_effects' answer has it as `clip_id`). Refused for a clip that is not a synthesized sound effect, or on a locked or video track."
+    )]
+    clip_id: String,
+    #[serde(flatten)]
+    spec: kerf_core::SfxSpec,
+    #[schemars(
+        description = "The clip's new gain in dB, -60 to 12. Omitted, the clip keeps the gain it has (the fader, not the render, so a changed kind does not change how loud it sits)."
+    )]
+    volume_db: Option<f64>,
+    #[schemars(
+        description = "Ripple override. Omitted, the project's ripple mode applies (get_ripple_mode). It matters when the new render is longer and would run into the next clip of its track: with ripple on the later clips are pushed, with it off the request is refused before anything is rendered or changed."
+    )]
+    ripple: Option<bool>,
+}
+
+impl<'de> serde::Deserialize<'de> for UpdateSoundEffectParams {
+    fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        // `deny_unknown_fields` does not work through `flatten`, so the spec's own fields are handed
+        // to `SfxSpec` (which refuses an unknown one, naming it) once the call's are taken, as
+        // `SfxPlacement` does.
+        #[derive(serde::Deserialize)]
+        struct Wire {
+            clip_id: String,
+            #[serde(default)]
+            volume_db: Option<f64>,
+            #[serde(default)]
+            ripple: Option<bool>,
+            #[serde(flatten)]
+            spec: serde_json::Map<String, serde_json::Value>,
+        }
+        let wire = Wire::deserialize(de)?;
+        let spec = kerf_core::SfxSpec::deserialize(serde_json::Value::Object(wire.spec)).map_err(serde::de::Error::custom)?;
+        Ok(Self {
+            clip_id: wire.clip_id,
+            spec,
+            volume_db: wire.volume_db,
+            ripple: wire.ripple,
+        })
+    }
+}
+
 #[derive(Debug, Default, serde::Deserialize, schemars::JsonSchema)]
 struct CaptionParams {
     #[schemars(
@@ -4920,6 +4976,84 @@ impl KerfMcp {
     }
 
     #[tool(
+        description = "The sound effects Kerf can make, for add_sound_effects: 21 kinds in five categories, each with what it sounds like and where it belongs in an edit, the lengths it may have (`duration_s` is clamped to min..max), where its HIT is and how loud it sits. Transition (whoosh, swoosh, swipe): the move between two shots. Impact (impact, boom, thud, punch): a hit on a moment. Build (riser, downlifter, reverse_swell): tension that climbs to a moment or falls away from one. Ui (pop, click, ding, notify, bubble, typewriter): small sounds for a title or an on-screen thing appearing. Texture (glitch, tape_stop, record_scratch, shutter, heartbeat): colour and character. Every effect has a hit point (`anchor`, and `hit` says it in words): the moment that should land on the picture event — a whoosh peaks part-way through, an impact hits within milliseconds of its start, a riser builds to its very end; `reverse` mirrors it. Kerf synthesizes them itself (nothing to download, no licence, rendered in milliseconds), so the same spec is always the same audio. `level_db` is how far below the others' common peak the kind is meant to sit. Also answers the defaults of the spec fields every effect takes."
+    )]
+    fn list_sound_effects(&self) -> Result<String, McpError> {
+        let effects: Vec<serde_json::Value> = kerf_core::sfx_catalogue()
+            .iter()
+            .map(|preset| {
+                let mut row = serde_json::to_value(preset).unwrap_or_default();
+                row["hit"] = serde_json::json!(reads::sfx_hit_words(&preset.anchor));
+                row
+            })
+            .collect();
+        json(&serde_json::json!({
+            "effects": effects,
+            "defaults": {
+                "pitch": 0.0,
+                "intensity": kerf_core::DEFAULT_SFX_INTENSITY,
+                "tail": kerf_core::DEFAULT_SFX_TAIL,
+                "reverse": false,
+                "seed": 0,
+                "volume_db": 0.0,
+            },
+            "max_pitch_semitones": kerf_core::MAX_SFX_PITCH,
+            "lanes": "Effects go on the audio tracks named FX, FX 2, FX 3, … (made when needed) unless track_id says another.",
+        }))
+    }
+
+    #[tool(
+        description = "Make sound effects and put them on the timeline in one edit: whooshes on cuts, pops on titles, a riser into a drop, an impact on a reveal. Each of `effects` is {kind, at, …}: `kind` from list_sound_effects, `at` the timeline second the effect's HIT lands on (a whoosh's peak, an impact's first transient, the END of a riser) — Kerf starts the clip earlier by itself, so `at` is the cut or the title's first frame, never the clip's start. The effects are synthesized in milliseconds (nothing to download; the same spec is the same audio), and with no track_id each lands on the first unlocked audio track named FX, FX 2, … where it fits — a new lane is made when none does, so overlapping effects are fine. suggest_sound_effects finds the moments and its `placement` objects are exactly what this takes (cut the picture first, since a later edit moves the cuts); to choose by hand, list_sound_effects says what each sound is for. Everything is checked before anything renders, under the ripple in force, and a refusal names the effect (`effects[2] (riser): …`) and changes nothing; at most 256 per call. The audio lands in the library at once; placing the clips is an ordinary edit, ONE revision, STAGED in your proposal while the user's review is on. Afterwards get_levels (effects sit at their own level, about -3 dB in the clear and -8 dB under speech when suggested) and, to change one, update_sound_effect. Returns {clips: [{clip_id, asset_id, track_id, track_name, kind, at, start, end, volume_db, spec}], assets: [{id, name, duration}]} in the order asked."
+    )]
+    async fn add_sound_effects(
+        &self,
+        Parameters(p): Parameters<AddSoundEffectsParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<String, McpError> {
+        let cancel = context.ct.clone();
+        self.add_sound_effects_now(p, move || cancel.is_cancelled()).await
+    }
+
+    #[tool(
+        description = "Change a sound effect already on the timeline: render it again from a new spec and swap the clip's audio. The clip keeps its id, its gain (unless volume_db is given), fades and audio effects, and the timeline position of its HIT (a whoosh's peak, an impact's first transient, a riser's end) — not its start — so a longer, shorter or different version still lands on the same picture moment. Give the WHOLE spec: `kind` plus any of duration_s, pitch, intensity, tail, reverse, seed; what you leave out goes back to its default, not to what the clip has now (add_sound_effects' answer and list_assets' `sound_effect` show the current spec), and a new `kind` swaps a whoosh for a swoosh. The clip's trim and speed are reset to the whole render at normal speed. Refused before anything renders: a clip that is not a synthesized sound effect, a locked track, a render that would run into the next clip of its lane (with ripple on it pushes the later clips; pass ripple to override), and a hit that cannot land. One revision, STAGED in your proposal while the user's review is on. Returns {clip_id, asset_id, track_id, track_name, kind, at (where the hit is), start, end, volume_db, spec}."
+    )]
+    async fn update_sound_effect(
+        &self,
+        Parameters(p): Parameters<UpdateSoundEffectParams>,
+        context: RequestContext<RoleServer>,
+    ) -> Result<String, McpError> {
+        let cancel = context.ct.clone();
+        self.update_sound_effect_now(p, move || cancel.is_cancelled()).await
+    }
+
+    #[tool(
+        description = "Where sound effects would work in the cut you are building. Reads the working timeline (your staged edits included) and the analysis already cached, and answers placements sorted by time: a whoosh or swoosh on each hard cut between two pictures (the kinds and seeds alternate down a run of cuts), a swoosh across a dissolve or other transition, a pop or swipe as a title appears, a punch on a jump-cut punch-in, a riser ending on a drop in the music with an impact on it, the kind a marker named `sfx:<kind>` (or `sfx`) asks for, and with density punchy an impact on the first picture. density: subtle (transitions, titles, drops and markers; at least 4 s apart), balanced (the default; adds the cuts between shots of 1.5 s and longer; 2 s apart) or punchy (every cut and the opening; 1 s apart). A moment within 0.25 s of an effect already on the timeline is skipped, so running it again after add_sound_effects suggests only what is left. Each suggestion is {placement, source, reason, score}: `placement` is exactly an element of add_sound_effects' `effects` (kind, seed, `at` — where the hit lands — and volume_db, about -3 dB, or -8 dB where someone is speaking; no track, the FX lanes allocate), `source` is cut, transition, title, punch_in, music_drop, marker or opening, `reason` says in a sentence what the sound is for and `score` (0 to 1) how much the moment wants one. `categories` and `kinds` limit the sounds (an effect of either list stays), `range` {start, end} keeps the hits inside that span of the whole cut's suggestions. It adds nothing: look the list over, drop what you do not want, change a kind or a gain, then pass the placements to add_sound_effects. Suggest after the cut is settled, since a later edit moves the cuts; footage that has not been analysed suggests less (analyze_asset scenes and transcript for the picture and speech, rhythm for music)."
+    )]
+    async fn suggest_sound_effects(
+        &self,
+        Parameters(request): Parameters<kerf_core::SfxSuggestRequest>,
+    ) -> Result<String, McpError> {
+        let (project, owner) = (self.project.clone(), self.owner());
+        let suggestions = blocking(move || {
+            request.check().map_err(core_err)?;
+            // Resolved under the lock, thought about with it released.
+            let inputs = lock_agent_as(&project, owner.as_deref())
+                .suggest_sound_effects_inputs()
+                .map_err(core_err)?;
+            let suggestions = kerf_core::suggest_sound_effects(&inputs, &request).map_err(core_err)?;
+            Ok((request.density, suggestions))
+        })
+        .await?;
+        let (density, suggestions) = suggestions;
+        json(&serde_json::json!({
+            "density": density.name(),
+            "count": suggestions.len(),
+            "suggestions": suggestions,
+            "next": "Pass the `placement` of the ones you want as `effects` of add_sound_effects.",
+        }))
+    }
+
+    #[tool(
         description = "Whether stem separation is ready on this machine: whether the ONNX runtime and the ~170 MB Demucs model still have to be downloaded, and the stems it makes."
     )]
     fn stems_status(&self) -> Result<String, McpError> {
@@ -6939,6 +7073,87 @@ impl KerfMcp {
 }
 
 impl KerfMcp {
+    /// `add_sound_effects` with its cancellation as a closure (the request's token, or a test's).
+    async fn add_sound_effects_now(
+        &self,
+        p: AddSoundEffectsParams,
+        cancel: impl Fn() -> bool + Send + 'static,
+    ) -> Result<String, McpError> {
+        let owner = self.owner();
+        // Checked now, before anything renders and under the ripple this call will have: every spec,
+        // time, gain and track, and a rehearsal of the placement (landing on another clip of a named
+        // track is refused as `edit_timeline` refuses it). A proposal another session owns refuses
+        // here too. What changes while it renders is checked again when the clips are placed, and a
+        // refusal there stores nothing.
+        let (plan, generation) = {
+            let project = lock_agent_edit(&self.project, owner.as_deref())?;
+            (
+                project
+                    .with_ripple(p.ripple, |project| project.sound_effects_inputs(&p.effects))
+                    .map_err(core_err)?,
+                project.generation(),
+            )
+        };
+        let (me, ripple) = (self.clone(), p.ripple);
+        let placed = blocking(move || {
+            let stop = crate::stop_or_replaced(cancel, &me.project, generation);
+            // Rendered with the project lock released.
+            let assets = Project::synthesize_sound_effects(&plan, &stop).map_err(core_err)?;
+            // Landing it is an edit of the cut, so it goes into the proposal; the webview is told
+            // once the lock is released.
+            me.edit(|project| {
+                require_generation(project, generation, "the sound effects were being made")?;
+                let placed = project
+                    .with_ripple(ripple, |project| project.place_sound_effects(&assets, &plan))
+                    .map_err(core_err)?;
+                let timeline = project.working_timeline().map_err(core_err)?;
+                Ok(reads::sfx_answer(&plan, &placed, &timeline))
+            })
+        })
+        .await?;
+        json(&placed)
+    }
+
+    /// `update_sound_effect` with its cancellation as a closure.
+    async fn update_sound_effect_now(
+        &self,
+        p: UpdateSoundEffectParams,
+        cancel: impl Fn() -> bool + Send + 'static,
+    ) -> Result<String, McpError> {
+        let clip_id = parse_arg("clip_id", &p.clip_id)?;
+        let owner = self.owner();
+        let (update, generation) = {
+            let project = lock_agent_edit(&self.project, owner.as_deref())?;
+            (
+                project
+                    .with_ripple(p.ripple, |project| {
+                        project.update_sound_effect_inputs(clip_id, &p.spec, p.volume_db)
+                    })
+                    .map_err(core_err)?,
+                project.generation(),
+            )
+        };
+        let (me, ripple) = (self.clone(), p.ripple);
+        let done = blocking(move || {
+            let stop = crate::stop_or_replaced(cancel, &me.project, generation);
+            let asset = Project::synthesize_sound_effect(&update.spec, &stop).map_err(core_err)?;
+            me.edit(|project| {
+                require_generation(project, generation, "the sound effect was being made")?;
+                let placed = project
+                    .with_ripple(ripple, |project| project.apply_sound_effect_update(&asset, &update))
+                    .map_err(core_err)?;
+                let timeline = project.working_timeline().map_err(core_err)?;
+                Ok(reads::sfx_clip_row(
+                    &placed,
+                    &reads::sfx_lane(&timeline, placed.clip.id),
+                    &update.spec,
+                ))
+            })
+        })
+        .await?;
+        json(&done)
+    }
+
     /// Refuse any of `paths` as a place to write: the source of an asset, a capture file, a proxy,
     /// the project's own file. What the project holds is read under the lock; canonicalising and
     /// comparing the paths — filesystem calls, slow on a share that went away — happen on the
@@ -7227,11 +7442,11 @@ fn server_identity() -> Implementation {
 /// so this stays a short routing note and the whole workflow is `EDITING_GUIDE`.
 const INSTRUCTIONS: &str = "Kerf is the video editor open on this computer, and the user watches what you do \
              in its window. Use these tools for any video or audio work (cutting, titles, captions, \
-             music, voiceover, reframing, export) instead of running ffmpeg or writing scripts: an edit \
+             music, sound effects, voiceover, reframing, export) instead of running ffmpeg or writing scripts: an edit \
              made here lands in the user's timeline, stays editable, is reviewed by them, and nothing is \
              re-encoded until export. Call get_editing_guide once before your first edit: it explains \
              how the tools fit together (ripple mode, linked picture and sound, captions, titles and \
-             templates, music, voiceover, delivery formats, loudness, jobs) and what a refusal means. \
+             templates, music, sound effects, voiceover, delivery formats, loudness, jobs) and what a refusal means. \
              The loop: claim_next_task takes the user's oldest queued task (list_tasks shows the queue). \
              See what is there with list_assets / get_timeline_state (import_asset adds a file by its \
              absolute path) and analyze_asset (silence, scenes, transcript, loudness, beats); \
@@ -7259,7 +7474,7 @@ const INSTRUCTIONS: &str = "Kerf is the video editor open on this computer, and 
              Long tools (analyze_asset, export, compose_music, generate_voiceover, smart_crop, ...) take \
              `background: true` and answer a job_id at once; follow it with job_status or subscribe to \
              kerf://jobs/{job_id}. \
-             The prompts (rough_cut_from_transcript, podcast_cleanup, social_reel, music_bed, deliver) are \
+             The prompts (rough_cut_from_transcript, podcast_cleanup, social_reel, music_bed, sound_design, deliver) are \
              these workflows as steps. A client may connect with ?tools=core,titles on the URL to list \
              fewer tools; get_editing_guide then names the sets left out.";
 
@@ -7581,7 +7796,20 @@ const EDITING_GUIDE: &str = "How to edit with Kerf. The user queues editing task
              then get_levels for the loudness and get_band_balance to see \
              whether its low end or mids fight the voice. To change it, edit \
              the score (list_assets shows it as music_score) and compose again \
-             with replace_clip_id. Call export to render, and export_cover to \
+             with replace_clip_id. For sound effects — whooshes on cuts, pops on \
+             titles, a riser into a drop, an impact on a reveal — settle the cut, \
+             then suggest_sound_effects reads it (cuts, transitions, titles, punch-ins, \
+             drops in the music, markers named sfx:<kind>; density subtle, balanced or \
+             punchy) and answers placements that add_sound_effects takes as they are: \
+             drop the ones you do not want, change a kind or a volume_db, add the rest in \
+             ONE call. list_sound_effects says what each of the 21 sounds is for. `at` is where \
+             the effect's HIT lands, not where its clip starts: a whoosh peaks part-way \
+             in, an impact starts on it, a riser ENDS on it, and Kerf starts the clip \
+             earlier for you. Effects are synthesized (nothing to download; the same spec \
+             is the same audio), go on FX, FX 2 … audio tracks (a new lane when they \
+             overlap), and are staged like any edit. Then get_levels: suggested ones sit \
+             about -3 dB, and -8 dB under speech. update_sound_effect re-renders one from a \
+             whole new spec with its hit where it was. Call export to render, and export_cover to \
              write a plain frame of the video as its cover. A thumbnail with \
              graphics of its own (a headline, a template, a logo the video \
              never shows) comes once the cut is final: suggest_thumbnail_frames \
@@ -7592,7 +7820,7 @@ const EDITING_GUIDE: &str = "How to edit with Kerf. The user queues editing task
              export_markers / export_cover / export_thumbnail / export_variants all take an \
              absolute local output path and refuse to overwrite a file that's \
              already there unless you pass overwrite=true. \
-             The server's prompts — rough_cut_from_transcript, podcast_cleanup, social_reel, music_bed and \
+             The server's prompts — rough_cut_from_transcript, podcast_cleanup, social_reel, music_bed, sound_design and \
              deliver — are these workflows as numbered steps the user can start. A connection may list only \
              some tool sets (`?tools=core,titles` on the server URL; the sets are core, analysis, clips, \
              keyframes, titles, audio, music, delivery, tasks and project), and this guide then ends by \
@@ -8723,6 +8951,8 @@ mod tests {
             "split_remove_clips",
             "generate_voiceover",
             "compose_music",
+            "add_sound_effects",
+            "update_sound_effect",
         ] {
             let (properties, required) = schema(name);
             assert!(properties.contains_key("ripple"), "`{name}` should take `ripple`");
@@ -9767,6 +9997,703 @@ mod tests {
             .and_then(|t| t.split(')').next())
             .unwrap_or_default();
         assert!(long.contains("compose_music"), "it is a long tool: {long}");
+    }
+
+    // ---- sound effects ---------------------------------------------------------------------
+
+    const SFX_TOOLS: [&str; 4] = [
+        "list_sound_effects",
+        "add_sound_effects",
+        "update_sound_effect",
+        "suggest_sound_effects",
+    ];
+
+    /// An agent that has never seen the GUI picks sounds, times, gains and lanes from the tools alone:
+    /// the descriptions and schemas carry the kinds, the anchor rule, density, the FX lanes, staging and
+    /// the limits, and the tools are on the surface in the `audio` set with the hints a client acts on.
+    #[test]
+    fn the_sound_effect_tools_say_what_a_model_needs_and_are_on_the_surface() {
+        let tools = router().list_all();
+        let tool = |name: &str| {
+            tools
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("`{name}` is registered"))
+        };
+        let text = |name: &str| tool(name).description.as_deref().unwrap_or_default().to_string();
+        let both = |name: &str| text(name) + &serde_json::to_string(&tool(name).input_schema).unwrap();
+        for name in SFX_TOOLS {
+            assert_eq!(super::toolsets::set_of(name).map(|s| s.name()), Some("audio"), "{name}");
+            assert!(
+                text(name).len() <= 3000,
+                "{name}'s description is {} characters",
+                text(name).len()
+            );
+        }
+
+        let list = text("list_sound_effects");
+        // The count the text states is the catalogue's.
+        let stated = |text: &str, noun: &str| -> usize {
+            let at = text
+                .find(&format!(" {noun}"))
+                .unwrap_or_else(|| panic!("no `{noun}` in {text}"));
+            text[..at]
+                .rsplit(' ')
+                .next()
+                .unwrap()
+                .parse()
+                .unwrap_or_else(|_| panic!("no count before `{noun}`"))
+        };
+        assert_eq!(stated(&list, "kinds"), kerf_core::SfxKind::ALL.len());
+        for kind in kerf_core::SfxKind::ALL {
+            assert!(list.contains(kind.name()), "list_sound_effects should name {}", kind.name());
+        }
+        for category in kerf_core::SfxCategory::ALL {
+            assert!(list.to_lowercase().contains(category.name()), "{}", category.name());
+        }
+        for needle in ["hit", "anchor", "level_db", "duration_s", "reverse", "no licence"] {
+            assert!(list.contains(needle), "list_sound_effects should mention {needle}");
+        }
+
+        let add = both("add_sound_effects");
+        for needle in [
+            "HIT",
+            "`at`",
+            "peak",
+            "END of a riser",
+            "suggest_sound_effects",
+            "list_sound_effects",
+            "FX 2",
+            "new lane",
+            "STAGED",
+            "ONE revision",
+            "256",
+            "effects[2]",
+            "volume_db",
+            "-8",
+            "seed",
+            "9007199254740991",
+            "pitch",
+            "intensity",
+            "tail",
+            "reverse",
+            "track_id",
+            "ripple",
+            "get_levels",
+            "update_sound_effect",
+            "misspelled",
+            "20 ms",
+        ] {
+            assert!(add.contains(needle), "add_sound_effects should mention {needle}");
+        }
+        assert_eq!(
+            tool("add_sound_effects").input_schema["required"],
+            serde_json::json!(["effects"])
+        );
+        assert!(tool("add_sound_effects").input_schema["properties"].get("ripple").is_some());
+        assert!(
+            tool("add_sound_effects").input_schema["properties"]
+                .get("background")
+                .is_none(),
+            "rendering takes milliseconds: no background job"
+        );
+
+        let update = tool("update_sound_effect");
+        let properties = update.input_schema["properties"].as_object().unwrap();
+        for field in [
+            "clip_id",
+            "kind",
+            "duration_s",
+            "pitch",
+            "intensity",
+            "tail",
+            "reverse",
+            "seed",
+            "volume_db",
+            "ripple",
+        ] {
+            assert!(properties.contains_key(field), "update_sound_effect takes {field}");
+        }
+        let required: Vec<&str> = update.input_schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|v| v.as_str())
+            .collect();
+        assert!(required.contains(&"clip_id") && required.contains(&"kind"), "{required:?}");
+        let update = both("update_sound_effect");
+        for needle in [
+            "WHOLE spec",
+            "HIT",
+            "default",
+            "not a synthesized sound effect",
+            "ripple",
+            "STAGED",
+        ] {
+            assert!(update.contains(needle), "update_sound_effect should mention {needle}");
+        }
+
+        let suggest = both("suggest_sound_effects");
+        for needle in [
+            "subtle",
+            "balanced",
+            "punchy",
+            "placement",
+            "exactly an element of add_sound_effects",
+            "no track",
+            "0.25 s",
+            "sfx:<kind>",
+            "punch_in",
+            "music_drop",
+            "-8 dB",
+            "adds nothing",
+            "range",
+            "categories",
+            "kinds",
+        ] {
+            assert!(suggest.contains(needle), "suggest_sound_effects should mention {needle}");
+        }
+        assert!(tool("suggest_sound_effects")
+            .input_schema
+            .get("required")
+            .is_none_or(|r| r.as_array().is_some_and(Vec::is_empty)));
+        for field in ["range", "density", "categories", "kinds"] {
+            assert!(
+                tool("suggest_sound_effects").input_schema["properties"].get(field).is_some(),
+                "suggest_sound_effects takes {field}"
+            );
+        }
+
+        let hints = |name: &str| tool(name).annotations.clone().unwrap();
+        for read in ["list_sound_effects", "suggest_sound_effects"] {
+            assert_eq!(hints(read).read_only_hint, Some(true), "{read}");
+        }
+        for edit in ["add_sound_effects", "update_sound_effect"] {
+            let a = hints(edit);
+            assert_eq!((a.read_only_hint, a.destructive_hint), (Some(false), Some(false)), "{edit}");
+        }
+        assert_eq!(hints("update_sound_effect").idempotent_hint, Some(true));
+        assert_eq!(hints("add_sound_effects").idempotent_hint, Some(false));
+    }
+
+    /// What a model sends for a placement parses, a misspelled field is an error that names it, and
+    /// the arguments of a reshape are flat like a placement's.
+    #[test]
+    fn sound_effect_calls_parse_and_a_misspelled_field_is_refused() {
+        let p: super::AddSoundEffectsParams = serde_json::from_value(serde_json::json!({
+            "effects": [
+                {"kind": "whoosh", "at": 12.5},
+                {"kind": "riser", "at": 20, "duration_s": 3, "pitch": -2, "intensity": 0.5, "tail": 0.1,
+                 "reverse": false, "seed": 9007199254740991u64, "volume_db": -6, "track_id": uuid::Uuid::nil()},
+            ],
+            "ripple": false,
+        }))
+        .unwrap();
+        assert_eq!((p.effects.len(), p.ripple), (2, Some(false)));
+        assert_eq!(p.effects[0].spec, kerf_core::SfxSpec::new(kerf_core::SfxKind::Whoosh));
+        assert_eq!(
+            (p.effects[1].volume_db, p.effects[1].spec.seed),
+            (Some(-6.0), 9007199254740991)
+        );
+
+        let typo = |effect: serde_json::Value| {
+            serde_json::from_value::<super::AddSoundEffectsParams>(serde_json::json!({ "effects": [effect] }))
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        };
+        assert!(typo(serde_json::json!({"kind": "whoosh", "at": 1, "pitc": 2}))
+            .unwrap_err()
+            .contains("unknown field `pitc`"));
+        assert!(typo(serde_json::json!({"kind": "zap", "at": 1})).is_err());
+        assert!(typo(serde_json::json!({"kind": "whoosh"})).unwrap_err().contains("at"));
+
+        let id = uuid::Uuid::new_v4().to_string();
+        let u: super::UpdateSoundEffectParams = serde_json::from_value(serde_json::json!({
+            "clip_id": id, "kind": "swoosh", "pitch": 2, "reverse": true, "seed": 5, "volume_db": -4, "ripple": true,
+        }))
+        .unwrap();
+        assert_eq!(
+            (u.spec.kind, u.spec.pitch, u.spec.reverse, u.spec.seed),
+            (kerf_core::SfxKind::Swoosh, 2.0, true, 5)
+        );
+        assert_eq!((u.volume_db, u.ripple, u.spec.intensity), (Some(-4.0), Some(true), 0.7));
+        assert!(serde_json::from_value::<super::UpdateSoundEffectParams>(
+            serde_json::json!({"clip_id": id, "kind": "swoosh", "pitc": 2})
+        )
+        .is_err());
+        assert!(serde_json::from_value::<super::UpdateSoundEffectParams>(serde_json::json!({"clip_id": id})).is_err());
+
+        // The server's own check, on the schema, names the argument too.
+        let e = reject_unknown_arguments(&call(
+            "update_sound_effect",
+            serde_json::json!({"clip_id": id, "kind": "swoosh", "pitc": 2}),
+        ))
+        .unwrap_err();
+        assert!(e.message.contains("pitc"), "{}", e.message);
+        assert!(reject_unknown_arguments(&call(
+            "update_sound_effect",
+            serde_json::json!({"clip_id": id, "kind": "swoosh", "pitch": 2, "volume_db": -3})
+        ))
+        .is_ok());
+        let e = reject_unknown_arguments(&call(
+            "suggest_sound_effects",
+            serde_json::json!({"density": "punchy", "dense": 1}),
+        ))
+        .unwrap_err();
+        assert!(e.message.contains("dense"), "{}", e.message);
+        let bad_density = serde_json::from_value::<kerf_core::SfxSuggestRequest>(serde_json::json!({"density": "loud"}));
+        assert!(bad_density.is_err());
+    }
+
+    /// A caller's mistake in a sound effect is the caller's: `invalid_params`, naming the effect.
+    #[test]
+    fn a_bad_sound_effect_is_the_callers_mistake() {
+        let (_server, shared) = headless_server();
+        let project = shared.lock().unwrap();
+        let bad = |effect: serde_json::Value| {
+            let p: super::AddSoundEffectsParams = serde_json::from_value(serde_json::json!({ "effects": [effect] })).unwrap();
+            core_err(project.sound_effects_inputs(&p.effects).unwrap_err())
+        };
+        let e = bad(serde_json::json!({"kind": "riser", "at": 4, "pitch": 40}));
+        assert_eq!(e.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert!(
+            e.message.contains("effects[0] (riser)") && e.message.contains("pitch"),
+            "{}",
+            e.message
+        );
+        let e = bad(serde_json::json!({"kind": "pop", "at": -1}));
+        assert_eq!(e.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        let e = bad(serde_json::json!({"kind": "pop", "at": 1, "track_id": uuid::Uuid::new_v4()}));
+        assert_eq!(e.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        let none = project.sound_effects_inputs(&[]).unwrap_err();
+        assert_eq!(core_err(none).code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    }
+
+    /// `list_sound_effects` answers the whole catalogue with the hit point in words.
+    #[test]
+    fn list_sound_effects_answers_the_catalogue_with_its_hit_points() {
+        let (server, _) = headless_server();
+        let list = answer(server.list_sound_effects().unwrap());
+        let rows = list["effects"].as_array().unwrap();
+        assert_eq!(rows.len(), kerf_core::SfxKind::ALL.len());
+        for (row, kind) in rows.iter().zip(kerf_core::SfxKind::ALL) {
+            assert_eq!(row["kind"], kind.name());
+            for field in [
+                "label",
+                "category",
+                "description",
+                "default_duration_s",
+                "min_duration_s",
+                "max_duration_s",
+                "anchor",
+                "hit",
+                "level_db",
+            ] {
+                assert!(row.get(field).is_some(), "{} lacks {field}", kind.name());
+            }
+        }
+        let whoosh = &rows[0];
+        assert_eq!(whoosh["anchor"], serde_json::json!({"type": "peak", "fraction": 0.55}));
+        assert!(whoosh["hit"].as_str().unwrap().contains("55 %"), "{whoosh}");
+        let riser = rows.iter().find(|r| r["kind"] == "riser").unwrap();
+        assert_eq!(riser["anchor"], serde_json::json!({"type": "end"}));
+        assert!(riser["hit"].as_str().unwrap().contains("end"), "{riser}");
+        let impact = rows.iter().find(|r| r["kind"] == "impact").unwrap();
+        assert!(impact["hit"].as_str().unwrap().contains("4 ms"), "{impact}");
+        assert_eq!(list["max_pitch_semitones"], kerf_core::MAX_SFX_PITCH);
+        assert_eq!(list["defaults"]["intensity"], 0.7);
+        assert_eq!(list["defaults"]["tail"], 0.3);
+    }
+
+    /// The suggestions an agent gets are read from its working cut, and their placements go to
+    /// `add_sound_effects` as they are.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn suggestions_come_from_the_cut_and_their_placements_are_what_add_takes() {
+        let (server, shared) = headless_server();
+        {
+            let project = shared.lock().unwrap();
+            let a = footage(&project, "a.mp4", 10.0, "2026-01-01T00:00:00Z");
+            let b = footage(&project, "b.mp4", 8.0, "2026-01-01T00:00:01Z");
+            project.cut_clip(a.id, 0.0, 6.0).unwrap();
+            project.cut_clip(b.id, 0.0, 4.0).unwrap();
+        }
+        let suggested = answer(
+            server
+                .suggest_sound_effects(Parameters(kerf_core::SfxSuggestRequest::default()))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(suggested["density"], "balanced");
+        let list = suggested["suggestions"].as_array().unwrap();
+        assert_eq!(suggested["count"], list.len());
+        let cut = list
+            .iter()
+            .find(|s| s["source"] == "cut")
+            .unwrap_or_else(|| panic!("a cut at 6 s is suggested: {suggested}"));
+        assert_eq!(cut["placement"]["at"], 6.0);
+        assert!(cut["reason"].as_str().unwrap().contains("a.mp4"), "{cut}");
+        assert!(suggested["next"].as_str().unwrap().contains("add_sound_effects"));
+
+        // Every placement is an element of `effects` as it stands, and the plan checks.
+        let effects: Vec<serde_json::Value> = list.iter().map(|s| s["placement"].clone()).collect();
+        let p: super::AddSoundEffectsParams = serde_json::from_value(serde_json::json!({ "effects": effects })).unwrap();
+        let plan = shared.lock().unwrap().sound_effects_inputs(&p.effects).unwrap();
+        assert_eq!(plan.effects.len(), list.len());
+
+        // A range narrows it, and a bad one is the caller's mistake.
+        let after = answer(
+            server
+                .suggest_sound_effects(Parameters(kerf_core::SfxSuggestRequest {
+                    range: Some(kerf_core::TimeRange { start: 7.0, end: 9.0 }),
+                    ..Default::default()
+                }))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(after["count"], 0, "{after}");
+        let e = server
+            .suggest_sound_effects(Parameters(kerf_core::SfxSuggestRequest {
+                range: Some(kerf_core::TimeRange { start: 5.0, end: 2.0 }),
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    }
+
+    /// The guide routes a sound-effect request suggest → add → levels, and the instructions name it.
+    #[test]
+    fn the_guide_and_the_prompt_route_a_sound_effect_request_through_suggest_and_add() {
+        let text = super::EDITING_GUIDE;
+        let at = |needle: &str| {
+            text.find(needle)
+                .unwrap_or_else(|| panic!("the guide should mention {needle}"))
+        };
+        let suggest = at("suggest_sound_effects reads it");
+        let add = text[suggest..]
+            .find("add_sound_effects takes")
+            .map(|i| i + suggest)
+            .expect("add after suggest");
+        let list = text[suggest..]
+            .find("list_sound_effects says")
+            .map(|i| i + suggest)
+            .expect("list");
+        let levels = text[suggest..]
+            .find("get_levels")
+            .map(|i| i + suggest)
+            .expect("get_levels after the effects");
+        let update = text[suggest..]
+            .find("update_sound_effect")
+            .map(|i| i + suggest)
+            .expect("update");
+        assert!(
+            suggest < add && add < list && list < levels && levels < update,
+            "the order of the flow"
+        );
+        for needle in ["HIT", "ENDS on it", "FX, FX 2", "staged", "sfx:<kind>", "ONE call", "-8 dB"] {
+            assert!(text.contains(needle), "the guide should mention {needle}");
+        }
+        let said = text
+            .split("each of the ")
+            .nth(1)
+            .and_then(|t| t.split(' ').next())
+            .and_then(|n| n.parse::<usize>().ok());
+        assert_eq!(
+            said,
+            Some(kerf_core::SfxKind::ALL.len()),
+            "the guide's count of sounds is the catalogue's"
+        );
+        assert!(super::INSTRUCTIONS.contains("sound effects") && super::INSTRUCTIONS.contains("sound_design"));
+        assert!(text.contains("sound_design"));
+    }
+
+    /// The add answer is read from what core stored and placed: an effect asked for a few milliseconds before 0
+    /// is heard that much later and says so, and the same render put on twice is one asset whose id is the
+    /// stored one, not the fresh copy the second call rendered.
+    #[test]
+    fn the_add_answer_reports_the_hit_it_has_and_the_assets_as_stored() {
+        let (_server, shared) = headless_server();
+        let project = shared.lock().unwrap();
+        let stand_in = |spec: &kerf_core::SfxSpec| -> kerf_core::Asset {
+            serde_json::from_value(serde_json::json!({
+                "id": uuid::Uuid::new_v4(),
+                "path": format!("/fx/{}-{}.wav", spec.kind.name(), spec.seed),
+                "name": spec.title(),
+                "duration": spec.resolved_duration_s(),
+                "streams": [{ "index": 0, "kind": "audio", "codec": "pcm_s16le", "sample_rate": 48000, "channels": 2 }],
+                "imported_at": "2026-01-01T00:00:00Z",
+                "sound_effect": spec,
+            }))
+            .unwrap()
+        };
+        let add = |effects: serde_json::Value| {
+            let p: super::AddSoundEffectsParams = serde_json::from_value(serde_json::json!({ "effects": effects })).unwrap();
+            let plan = project.sound_effects_inputs(&p.effects).unwrap();
+            let assets: Vec<kerf_core::Asset> = plan.effects.iter().map(|e| stand_in(&e.spec)).collect();
+            let placed = project.place_sound_effects(&assets, &plan).unwrap();
+            let timeline = project.working_timeline().unwrap();
+            super::reads::sfx_answer(&plan, &placed, &timeline)
+        };
+
+        let first = add(serde_json::json!([
+            {"kind": "impact", "at": 0},
+            {"kind": "whoosh", "at": 0.2},
+            {"kind": "pop", "at": 5}
+        ]));
+        let at = |answer: &serde_json::Value, i: usize| answer["clips"][i]["at"].as_f64().unwrap();
+        assert_eq!(
+            at(&first, 0),
+            0.004,
+            "an impact asked for at 0 starts there and hits 4 ms later"
+        );
+        assert_eq!(at(&first, 1), 0.2, "a cut head still hits where it was asked");
+        assert_eq!(at(&first, 2), 5.0);
+        assert_eq!(first["clips"][0]["start"].as_f64(), Some(0.0));
+
+        // The same pop twice, and once more in a second call: one asset, and it is the stored one.
+        let again = add(serde_json::json!([{"kind": "pop", "at": 8}, {"kind": "pop", "at": 9}]));
+        let stored = project.list_assets().unwrap();
+        for answer in [&first, &again] {
+            let used: Vec<&str> = answer["clips"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c["asset_id"].as_str().unwrap())
+                .collect();
+            for asset in answer["assets"].as_array().unwrap() {
+                let id = asset["id"].as_str().unwrap();
+                assert!(used.contains(&id), "{id} is no clip's asset: {answer}");
+                assert!(
+                    stored.iter().any(|a| a.id.to_string() == id),
+                    "{id} is not in the library: {answer}"
+                );
+            }
+            assert!(used.iter().all(|id| stored.iter().any(|a| a.id.to_string() == *id)));
+        }
+        assert_eq!(again["assets"].as_array().unwrap().len(), 1, "{again}");
+        assert_eq!(
+            again["assets"][0]["id"], first["clips"][2]["asset_id"],
+            "the pop stored by the first call"
+        );
+        assert_eq!(again["clips"][0]["asset_id"], again["clips"][1]["asset_id"]);
+        assert_eq!(stored.len(), 3);
+    }
+
+    /// Everything wrong with a sound-effect call is found before anything renders: the caller's
+    /// mistake, naming the effect, with nothing staged or stored and the webview not told.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_sound_effect_call_changes_nothing_and_tells_no_one() {
+        use rmcp::model::ErrorCode;
+        let (server, shared) = headless_server();
+        let changed = std::sync::Arc::new(AtomicI64::new(0));
+        {
+            let changed = changed.clone();
+            server.app.listen("project-changed", move |_| {
+                changed.fetch_add(1, Ordering::Relaxed);
+            });
+        }
+        let params = |effects: serde_json::Value| {
+            serde_json::from_value::<super::AddSoundEffectsParams>(serde_json::json!({ "effects": effects })).unwrap()
+        };
+        let e = server
+            .add_sound_effects_now(
+                params(serde_json::json!([{"kind": "whoosh", "at": 3}, {"kind": "riser", "at": -2}])),
+                || false,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, ErrorCode::INVALID_PARAMS);
+        assert!(e.message.contains("effects[1] (riser)"), "{}", e.message);
+        let e = server
+            .add_sound_effects_now(params(serde_json::json!([])), || false)
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, ErrorCode::INVALID_PARAMS);
+        let e = server
+            .update_sound_effect_now(
+                serde_json::from_value(serde_json::json!({"clip_id": uuid::Uuid::new_v4(), "kind": "pop"})).unwrap(),
+                || false,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, ErrorCode::INVALID_PARAMS);
+        let e = server
+            .update_sound_effect_now(
+                serde_json::from_value(serde_json::json!({"clip_id": "nope", "kind": "pop"})).unwrap(),
+                || false,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, ErrorCode::INVALID_PARAMS);
+        assert!(e.message.contains("clip_id"), "{}", e.message);
+        assert_eq!(changed.load(Ordering::Relaxed), 0);
+        let user = crate::lock_user(&shared);
+        assert!(user.staged().unwrap().is_none() && user.list_assets().unwrap().is_empty());
+        assert!(user.timeline().unwrap().tracks.iter().all(|t| t.clips.is_empty()));
+    }
+
+    /// The real thing, through the tools an agent calls: effects are rendered, probed and staged on
+    /// the FX lanes with their hits where asked (a riser and the impact it builds to overlap, so they
+    /// take two lanes), the webview is told once per edit, the live cut is untouched, and a reshape keeps
+    /// the hit where it was. `cargo test -p kerf-app --no-default-features -- --ignored sound_effects`.
+    #[ignore = "renders with the real engine and probes with ffprobe"]
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_agent_adds_and_reshapes_sound_effects_under_review_with_the_real_engine() {
+        let (server, shared) = headless_server();
+        let changed = std::sync::Arc::new(AtomicI64::new(0));
+        {
+            let changed = changed.clone();
+            server.app.listen("project-changed", move |_| {
+                changed.fetch_add(1, Ordering::Relaxed);
+            });
+        }
+        {
+            let project = shared.lock().unwrap();
+            let a = footage(&project, "a.mp4", 10.0, "2026-01-01T00:00:00Z");
+            let b = footage(&project, "b.mp4", 8.0, "2026-01-01T00:00:01Z");
+            project.cut_clip(a.id, 0.0, 6.0).unwrap();
+            project.cut_clip(b.id, 0.0, 6.0).unwrap();
+        }
+        let suggested = answer(
+            server
+                .suggest_sound_effects(Parameters(kerf_core::SfxSuggestRequest {
+                    density: kerf_core::SfxDensity::Punchy,
+                    ..Default::default()
+                }))
+                .await
+                .unwrap(),
+        );
+        let effects: Vec<serde_json::Value> = suggested["suggestions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["placement"].clone())
+            .collect();
+        assert!(effects.len() >= 2, "the opening and the cut: {suggested}");
+        let mut effects = effects;
+        effects.push(serde_json::json!({"kind": "riser", "at": 6.0, "duration_s": 2.0}));
+        effects.push(serde_json::json!({"kind": "impact", "at": 6.0, "volume_db": -3}));
+
+        let done = answer(
+            server
+                .add_sound_effects_now(
+                    serde_json::from_value(serde_json::json!({ "effects": effects })).unwrap(),
+                    || false,
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(changed.load(Ordering::Relaxed), 1, "the webview is told once for the batch");
+        let rows = done["clips"].as_array().unwrap();
+        assert_eq!(rows.len(), effects.len());
+        let riser = rows.iter().find(|r| r["kind"] == "riser").unwrap();
+        let impact = rows.iter().rev().find(|r| r["kind"] == "impact").unwrap();
+        assert_eq!((riser["at"].as_f64(), impact["at"].as_f64()), (Some(6.0), Some(6.0)));
+        assert!(
+            (riser["end"].as_f64().unwrap() - 6.0).abs() < 1e-6,
+            "a riser ends on its hit: {riser}"
+        );
+        assert_ne!(riser["track_name"], impact["track_name"], "they overlap: two lanes");
+        assert!(rows.iter().all(|r| r["track_name"].as_str().unwrap().starts_with("FX")));
+        assert!(done["assets"].as_array().unwrap().len() >= 2);
+
+        {
+            let user = crate::lock_user(&shared);
+            assert!(
+                user.timeline().unwrap().tracks.iter().all(|t| !t.name.starts_with("FX")),
+                "staged, not live"
+            );
+            let proposed = user.staged_timeline().unwrap().expect("the effects are in the proposal");
+            assert_eq!(
+                proposed
+                    .tracks
+                    .iter()
+                    .filter(|t| t.name.starts_with("FX"))
+                    .flat_map(|t| &t.clips)
+                    .count(),
+                effects.len()
+            );
+        }
+        let library = shared.lock().unwrap().list_assets().unwrap();
+        let rendered = library
+            .iter()
+            .find(|a| {
+                a.sound_effect
+                    .as_ref()
+                    .is_some_and(|spec| spec.kind == kerf_core::SfxKind::Riser)
+            })
+            .expect("the riser is in the library");
+        assert_eq!(rendered.name, "SFX: Riser");
+        assert_eq!(rendered.primary_kind(), kerf_core::StreamKind::Audio);
+        assert!((rendered.duration - 2.0).abs() < 0.01, "{}", rendered.duration);
+
+        // Reshaped: a longer, lower riser still ends on 6 s.
+        let reshaped = answer(
+            server
+                .update_sound_effect_now(
+                    serde_json::from_value(serde_json::json!({
+                        "clip_id": riser["clip_id"], "kind": "riser", "duration_s": 3.0, "pitch": -5, "volume_db": -9,
+                    }))
+                    .unwrap(),
+                    || false,
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(changed.load(Ordering::Relaxed), 2);
+        assert!((reshaped["at"].as_f64().unwrap() - 6.0).abs() < 1e-6, "{reshaped}");
+        assert!((reshaped["end"].as_f64().unwrap() - 6.0).abs() < 1e-6 && reshaped["start"].as_f64().unwrap() < 3.1);
+        assert_eq!(reshaped["clip_id"], riser["clip_id"]);
+        assert_eq!(reshaped["volume_db"].as_f64(), Some(-9.0));
+        assert_eq!(reshaped["spec"]["pitch"].as_f64(), Some(-5.0));
+
+        // Not an effect: refused, and nothing more is said to the webview.
+        let video_clip = {
+            let user = crate::lock_user(&shared);
+            user.staged_timeline().unwrap().unwrap().tracks[0].clips[0].id
+        };
+        let e = server
+            .update_sound_effect_now(
+                serde_json::from_value(serde_json::json!({"clip_id": video_clip, "kind": "pop"})).unwrap(),
+                || false,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(e.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        assert_eq!(changed.load(Ordering::Relaxed), 2);
+
+        // An impact asked for at 0 starts there and is heard 4 ms later; the same effect added twice is one stored
+        // asset, and every id the answer names is the clips' and the library's.
+        let twice = answer(
+            server
+                .add_sound_effects_now(
+                    serde_json::from_value(serde_json::json!({
+                        "effects": [{"kind": "impact", "at": 0, "seed": 41}, {"kind": "impact", "at": 3, "seed": 41}]
+                    }))
+                    .unwrap(),
+                    || false,
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(twice["clips"][0]["at"].as_f64(), Some(0.004), "{twice}");
+        assert_eq!(twice["clips"][1]["at"].as_f64(), Some(3.0), "{twice}");
+        assert_eq!(twice["assets"].as_array().unwrap().len(), 1, "{twice}");
+        assert_eq!(twice["assets"][0]["id"], twice["clips"][0]["asset_id"]);
+        assert_eq!(twice["clips"][0]["asset_id"], twice["clips"][1]["asset_id"]);
+        let library = shared.lock().unwrap().list_assets().unwrap();
+        assert!(library.iter().any(|a| serde_json::json!(a.id) == twice["assets"][0]["id"]));
+        // Again, in another call: the stored asset comes back, not a fresh id.
+        let thrice = answer(
+            server
+                .add_sound_effects_now(
+                    serde_json::from_value(serde_json::json!({"effects": [{"kind": "impact", "at": 6, "seed": 41}]})).unwrap(),
+                    || false,
+                )
+                .await
+                .unwrap(),
+        );
+        assert_eq!(thrice["assets"][0]["id"], twice["assets"][0]["id"], "{thrice}");
     }
 
     /// An agent with no way to load media can only rearrange what it was handed.

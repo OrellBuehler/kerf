@@ -1510,6 +1510,7 @@ mod tests {
             source_paths: Vec::new(),
             voiceover: None,
             music_score: None,
+            sound_effect: None,
             tags: Vec::new(),
         }
     }

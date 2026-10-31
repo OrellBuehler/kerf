@@ -549,6 +549,7 @@ mod tests {
             source_paths: Vec::new(),
             voiceover: None,
             music_score: None,
+            sound_effect: None,
             tags: Vec::new(),
         };
         let mut clip = Clip::new(asset.id, 0.0, 10.0, 0.0);

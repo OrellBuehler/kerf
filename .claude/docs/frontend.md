@@ -1594,6 +1594,24 @@ clip's level / fade-in / effects / keys and the last one's fade-out (`Composed.r
 the core's words. `getBandBalance` picks its windows as `project/music.rs` does and words its
 `notes` as `balance_notes` (`band-balance.ts`) but the measurement itself is made up (in a browser it takes
 ~0.6 s and honours Stop; under bun it is at once). `api-compose.test.ts` drives the bridge.
+**Sound effects bridge** (`api.ts`; the Sound FX panel itself is separate). `sfxCatalogue()` → `SfxPreset[]`, `previewSoundEffect(spec)` →
+the **bytes of the WAV** for `decodeAudioData` (the CSP has no `media-src` and there is no asset protocol; `null` in the harness, which
+synthesizes nothing), `addSoundEffects(placements, ripple?)` → `{clips, timeline}`, `updateSoundEffect(clipId, spec, volumeDb?, ripple?)` →
+`{clip, timeline}` (the **whole** spec: what it leaves out is back at its default) and `suggestSoundEffects(request?)` → `SfxSuggestion[]`
+(a read; each `placement` goes to `addSoundEffects` as it is). A placement is a spec's fields flat plus `at` — **where the hit lands**, not where
+the clip starts (a whoosh peaks 55 % in, an impact starts on it, a riser ends on it) — and `volume_db?` / `track_id?`; the types are `SfxSpec`
+(what the backend writes: every field but `duration_s`), `SfxSpecInput` (what a caller may write: `{kind}` alone is one) and `SfxPlacement`;
+`Asset.sound_effect` marks an effect's asset. `sfx.ts` is the harness's half and is pure: `SFX_CATALOGUE` is a **copy of the Rust table**
+(`sfx.test.ts` parses `model/sfx.rs` and fails when a row, the kind order or a category label differs), `sfxAnchor` / `resolvedDuration` /
+`sfxSpecProblem` the spec rules in the engine's words, `checkSfxPlacements` / `checkSfxSpec` / `checkSfxSuggestRequest` serde's refusals
+(`unknown field …, expected one of …`), `planSoundEffects` / `putSoundEffects` / `rehearseSoundEffects` / `replaceEffect` /
+`planSoundEffectUpdate` the placement of `project/sfx.rs` (the `FX`, `FX 2` … lanes where a span fits and a locked one is skipped, a start under
+`SFX_HEAD_SNAP_S` before 0 put at 0, a deeper one cut off the head with a 4 ms fade-in, one under `MIN_SFX_CLIP_S` left refused naming the
+time it can land, the rehearsal before anything is stored) and `suggestSoundEffects` a **lossy** mirror of `model/sfx_suggest.rs` (cuts,
+transitions, punch-ins, titles, composed drops, analysed section changes, markers named `sfx:<kind>`, the opening, the density spacing and
+thinning, the lower gain over speech; not the scene changes inside a clip nor the cover of a higher track). Under `bun run dev` an add places
+stand-in assets of the right length (the same spec is the same asset by path), in one `Add sound effects` revision that ripples like any
+other (`runEdit` with the clips as lanes) and stores the assets only once the placement went through. `api-sfx.test.ts` drives the bridge.
 **The Compose music dialog** (`ComposeMusicDialog`, `ui.composeDialog`, `ui.openCompose(prefill?)`, inert-behind like
 the voiceover's) is the voiceover's arrangement: `musicStatus` first, saying what the first piece downloads
 (`soundfontNote`), then `music-progress` stages (`musicStageLabel`) under a **Cancel** (`cancelMusic`; `music cancelled`

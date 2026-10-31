@@ -144,6 +144,12 @@ const MIGRATIONS: &[Migration] = &[
         destructive: false,
         needed_to_read: false,
     },
+    Migration {
+        run: v18_to_v19,
+        needed: v18_to_v19_needed,
+        destructive: false,
+        needed_to_read: true,
+    },
 ];
 
 /// The schema this build writes and the newest it opens.
@@ -412,6 +418,22 @@ fn v17_to_v18(_: &Connection) -> rusqlite::Result<()> {
 
 fn v17_to_v18_needed(_: &Connection) -> bool {
     true
+}
+
+/// v19: an asset remembers the spec a sound effect was synthesized from (`assets.sound_effect`, JSON; NULL for none), which is
+/// what lets the effect be reshaped and rendered again. Audio a build without sound effects wrote has none; an older build
+/// would drop the field at its next write of the asset, and its reads do not select the column. Every file an older build
+/// wrote lacks the column, so the step is needed exactly then (the file is copied aside first) and reads depend on it. No
+/// timeline JSON moves: the effects sit on ordinary audio tracks as ordinary clips.
+fn v18_to_v19(conn: &Connection) -> rusqlite::Result<()> {
+    if !has_column(conn, "assets", "sound_effect") {
+        conn.execute("ALTER TABLE assets ADD COLUMN sound_effect TEXT", [])?;
+    }
+    Ok(())
+}
+
+fn v18_to_v19_needed(conn: &Connection) -> bool {
+    !has_column(conn, "assets", "sound_effect")
 }
 
 /// The index (the version each upgrades from) of every step from `found` on that would change this file.

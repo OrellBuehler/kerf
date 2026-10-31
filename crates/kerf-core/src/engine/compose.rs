@@ -593,7 +593,7 @@ pub struct Rendered {
     pub cached: bool,
 }
 
-fn finished(path: &Path) -> bool {
+pub(super) fn finished(path: &Path) -> bool {
     let mut head = [0u8; 12];
     std::fs::metadata(path).is_ok_and(|m| m.len() > 44)
         && std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut head)).is_ok()
