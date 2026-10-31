@@ -701,7 +701,7 @@
 		},
 
 		'marker.add': () => void addMarker(),
-		'sfx.add': () => void sfxPanel.load().then(() => sfxPanel.addDraft()),
+		'sfx.add': () => void sfxPanel.addFromShortcut(),
 		'marker.prev': () => ui.gotoMarker(-1),
 		'marker.next': () => ui.gotoMarker(1),
 		'review.prevChange': () => stepReview(-1),

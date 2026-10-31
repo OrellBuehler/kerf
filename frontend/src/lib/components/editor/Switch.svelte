@@ -8,6 +8,7 @@
 		id = undefined,
 		text = undefined,
 		disabled = false,
+		pending = false,
 		testid = undefined,
 		onchange
 	}: {
@@ -18,6 +19,8 @@
 		id?: string;
 		text?: string;
 		disabled?: boolean;
+		/** An edit is in flight: the box ignores a press but keeps keyboard focus, which `disabled` would drop (see `Btn`). */
+		pending?: boolean;
 		testid?: string;
 		/** The new state, and the box itself (to put back when the change is refused). */
 		onchange: (checked: boolean, box: HTMLInputElement) => void;
@@ -38,7 +41,14 @@
 		data-testid={testid}
 		{checked}
 		{disabled}
-		onchange={(e) => onchange(e.currentTarget.checked, e.currentTarget)}
+		aria-disabled={pending ? 'true' : undefined}
+		onclick={(e) => {
+			// A box flips as it is pressed; an edit in flight holds it where it was.
+			if (pending) e.preventDefault();
+		}}
+		onchange={(e) => {
+			if (!pending) onchange(e.currentTarget.checked, e.currentTarget);
+		}}
 		style="accent-color:var(--kerf-500);cursor:inherit;width:16px;height:16px;margin:0"
 	/>
 	{#if text}{text}{/if}

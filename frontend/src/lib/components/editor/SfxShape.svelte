@@ -46,7 +46,7 @@
 		<SliderRow label="Gain" value={gain} spec={GAIN_SPEC} {disabled} reserve={false} onCommit={(v) => ongain(v)} />
 	{/if}
 	<div style="display:flex;align-items:center;gap:8px;margin-top:4px;min-height:var(--control-sm)">
-		<Switch checked={reverse} label="Reverse" text="Reverse" {disabled} onchange={flip} />
+		<Switch checked={reverse} label="Reverse" text="Reverse" pending={disabled} onchange={flip} />
 		<span style="flex:1"></span>
 		<span data-testid="sfx-seed" style="font-family:var(--font-mono);font-size:var(--text-xs);color:var(--text-muted)" aria-label="Take {spec.seed}">#{spec.seed}</span>
 		<Btn

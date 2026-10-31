@@ -7,6 +7,13 @@ import {
 	DENSITY_OPTIONS,
 	dragOf,
 	dropGhostFor,
+	dropRefusal,
+	ghostLabel,
+	glyphOf,
+	hueOf,
+	knownPreset,
+	prettyKind,
+	sfxDropHit,
 	GAIN_SPEC,
 	INTENSITY_SPEC,
 	PITCH_SPEC,
@@ -42,9 +49,9 @@ import {
 	togglePick,
 	undoLine
 } from './sfx-panel';
-import { MAX_SEED, SFX_CATALOGUE, SFX_CATEGORIES, SFX_KINDS, defaultSfxSpec, resolvedDuration, sfxPreset } from './sfx';
+import { MAX_SEED, SFX_CATALOGUE, SFX_CATEGORIES, SFX_KINDS, defaultSfxSpec, planSoundEffects, resolvedDuration, sfxPreset } from './sfx';
 import { fromPos, readout, toPos } from './slider-row';
-import type { SfxKind, SfxSuggestion } from './types';
+import type { Clip, SfxKind, SfxSuggestion, Timeline } from './types';
 
 const preset = (kind: SfxKind) => sfxPreset(kind);
 
@@ -381,6 +388,37 @@ describe('a tile dragged over a lane', () => {
 		expect(dropGhostFor(whoosh, 0.55 - 0.005, []).ok).toBe(true);
 	});
 
+	test('with ripple on, running into the front of a clip is a drop that pushes it along, not a refusal', () => {
+		const lane: [number, number][] = [[2, 4]];
+		// Starts at 1.5 and ends at 2.5: the clip at 2 begins after it, so ripple moves that clip clear.
+		const pushed = dropGhostFor(whoosh, 2.05, lane, true);
+		expect(pushed).toMatchObject({ ok: true, pushes: true });
+		expect(pushed.reason).toBeUndefined();
+		// A clip that starts together with the effect is pushed too.
+		expect(dropGhostFor(whoosh, 2.55, lane, true)).toMatchObject({ ok: true, pushes: true });
+		expect(dropGhostFor(whoosh, 5, lane, true)).toEqual({ start: 5 - 0.55, dur: 1, ok: true });
+		expect(ghostLabel(whoosh, pushed)).toBe('Whoosh · pushes the clips after it');
+		expect(ghostLabel(whoosh, dropGhostFor(whoosh, 5, lane, true))).toBe('Whoosh');
+		// Starting inside a clip there is nothing to push that clip with, ripple or not.
+		const inside = dropGhostFor(whoosh, 3, lane, true);
+		expect(inside).toMatchObject({ ok: false, reason: 'inside' });
+		expect(dropRefusal(inside)).toContain('cannot start inside another clip');
+		expect(dropGhostFor(whoosh, 4.3, lane, true)).toMatchObject({ ok: false, reason: 'inside' });
+		// A hit that cannot land is not helped by ripple: there is nowhere to push to.
+		expect(dropGhostFor(riser, 0.005, [], true)).toMatchObject({ ok: false, reason: 'start' });
+	});
+
+	test('with ripple off an overlap is refused as one, and a hit too near the start as that, each in its own words', () => {
+		const lane: [number, number][] = [[2, 4]];
+		const clash = dropGhostFor(whoosh, 3, lane, false);
+		expect(clash).toMatchObject({ ok: false, reason: 'overlap' });
+		expect(dropRefusal(clash)).toBe('Drop into free space — a clip would overlap another here');
+		const early = dropGhostFor(riser, 0.005, []);
+		expect(early).toMatchObject({ ok: false, reason: 'start' });
+		expect(dropRefusal(early)).toContain('too close to the start');
+		expect(dropRefusal(dropGhostFor(whoosh, 5, lane))).toBeNull();
+	});
+
 	test('is red where another clip is in the way, and only there', () => {
 		const lane: [number, number][] = [[2, 4]];
 		expect(dropGhostFor(whoosh, 5, lane).ok).toBe(true);
@@ -388,6 +426,92 @@ describe('a tile dragged over a lane', () => {
 		expect(dropGhostFor(whoosh, 4.5, lane).ok).toBe(false);
 		expect(dropGhostFor(whoosh, 4.55, lane).ok).toBe(true);
 		expect(dropGhostFor(whoosh, 2.5, lane).ok).toBe(false);
+	});
+});
+
+describe('the ghost agrees with what the add would do', () => {
+	const piece = (id: string, start: number, len: number): Clip => ({
+		id,
+		asset_id: 'a',
+		source_in: 0,
+		source_out: len,
+		timeline_start: start,
+		volume: 1,
+		fade_in: 0,
+		fade_out: 0
+	});
+	let n = 0;
+	const newId = () => `x-${++n}`;
+	const lane = (clips: Clip[]): Timeline => ({
+		tracks: [{ id: 'A1', kind: 'audio', name: 'A1', clips }]
+	});
+	const spans = (clips: Clip[]): [number, number][] => clips.map((c) => [c.timeline_start, c.timeline_start + (c.source_out - c.source_in)]);
+	const refused = (tl: Timeline, hit: number, ripple: boolean) => {
+		try {
+			planSoundEffects(tl, [{ kind: 'whoosh', at: hit, track_id: 'A1' }], ripple, newId);
+			return false;
+		} catch {
+			return true;
+		}
+	};
+
+	test('for a hit before, inside, across the front of, after and clear of a clip, with ripple off and on', () => {
+		const clips = [piece('c1', 2, 2), piece('c2', 6, 1)];
+		const tl = lane(clips);
+		const drag = dragOf(defaultSfxSpec('whoosh'), 0, 'Whoosh');
+		for (const ripple of [false, true]) {
+			for (const hit of [0.7, 1.2, 2.05, 2.6, 3, 3.9, 4.2, 4.8, 5.6, 6.2, 7.4, 9]) {
+				const ghost = dropGhostFor(drag, hit, spans(clips), ripple);
+				expect(!ghost.ok, `hit ${hit}, ripple ${ripple}`).toBe(refused(tl, hit, ripple));
+			}
+		}
+	});
+});
+
+describe('where a dropped sound’s hit lands', () => {
+	const base = { fps: 30, snap: true, playhead: 8, grid: [4, 6], cuts: [12.15], edges: [20], threshold: 0.15 };
+
+	test('is the nearest magnet within reach: the playhead, a beat, a cut between pictures or a clip edge', () => {
+		expect(sfxDropHit(8.1, base)).toBe(8);
+		expect(sfxDropHit(6.05, base)).toBe(6);
+		expect(sfxDropHit(12.2, base)).toBe(12.15);
+		expect(sfxDropHit(19.9, base)).toBe(20);
+		expect(sfxDropHit(0.1, base)).toBe(0);
+	});
+
+	test('out of reach it is the nearest frame, and with snapping off a magnet is nothing', () => {
+		expect(sfxDropHit(10.02, base)).toBeCloseTo(10 + 1 / 30, 9);
+		expect(sfxDropHit(8.1, { ...base, snap: false })).toBeCloseTo(8.1, 1);
+		expect(sfxDropHit(8.1, { ...base, snap: false }) * 30).toBeCloseTo(Math.round(8.1 * 30), 9);
+	});
+
+	test('a frame that falls on a clip edge is that edge exactly, magnet or not', () => {
+		expect(sfxDropHit(20.01, { ...base, snap: false, threshold: 0, edges: [20 + 1e-12] })).toBe(20 + 1e-12);
+	});
+});
+
+describe('a kind this build does not know', () => {
+	test('has a plain glyph, no hue and a readable name, and no preset', () => {
+		expect(glyphOf('laser_zap' as SfxKind)).toBe('audio-waveform');
+		expect(hueOf(null)).toBe('var(--text-muted)');
+		expect(hueOf('laser' as never)).toBe('var(--text-muted)');
+		expect(prettyKind('laser_zap')).toBe('Laser zap');
+		expect(prettyKind('')).toBe('Sound effect');
+		expect(knownPreset('laser_zap')).toBeNull();
+		expect(knownPreset('whoosh')?.label).toBe('Whoosh');
+	});
+
+	test('is sketched as a plain swell instead of throwing', () => {
+		const env = envelopeOf('laser_zap' as SfxKind);
+		expect(env).toHaveLength(64);
+		expect(Math.max(...env)).toBeCloseTo(1, 9);
+		expect(sketchOf({ kind: 'laser_zap' as SfxKind, anchor: { type: 'hit', seconds: 0 }, default_duration_s: 1 }, 100, 20).d.startsWith('M')).toBe(true);
+	});
+
+	test('a suggestion for one is a row all the same, and its summary is a word', () => {
+		const rows = suggestionRows([{ placement: { kind: 'laser_zap' as SfxKind, at: 3 }, source: 'cut', reason: 'Cut', score: 0.4 }]);
+		expect(rows[0]).toMatchObject({ kind: 'laser_zap', label: 'Laser zap', category: null });
+		expect(shapeSummary({ ...defaultSfxSpec('whoosh'), kind: 'laser_zap' as SfxKind })).toBe('Unknown kind');
 	});
 });
 

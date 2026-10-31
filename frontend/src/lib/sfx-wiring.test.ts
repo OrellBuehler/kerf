@@ -12,6 +12,7 @@ import { PANELS } from './layout';
 const read = (path: string) => readFileSync(join(import.meta.dir, path), 'utf8');
 const panel = read('components/editor/SoundFx.svelte');
 const shape = read('components/editor/SfxShape.svelte');
+const switchBox = read('components/editor/Switch.svelte');
 const auto = read('components/editor/SfxAuto.svelte');
 const tile = read('components/editor/SfxTile.svelte');
 const section = read('components/editor/SoundEffectSection.svelte');
@@ -121,7 +122,7 @@ describe('auto sound design', () => {
 	test('a find is a read: no edit is made and a newer one overtakes an older', () => {
 		const find = state.slice(state.indexOf('async find()'), state.indexOf('toggle(index'));
 		expect(find).toContain('suggestSoundEffects(');
-		expect(find).not.toContain('editor.');
+		expect(find).not.toMatch(/editor\.(add|update|apply)/);
 		expect(find).toContain('ticket !== this.#findTicket');
 	});
 
@@ -188,5 +189,74 @@ describe('the library and the keyboard', () => {
 		expect(allowsRepeat('sfx.add')).toBe(false);
 		expect(page).toContain("'sfx.add':");
 		expect(panel).toContain("settings.shortcut('sfx.add')");
+	});
+});
+
+describe('what a failing, a slow or a late thing may not do', () => {
+	test('the panel reads the catalogue when it appears, not from an effect that would ask again each time its state moved', () => {
+		expect(panel).toContain('onMount(() => {');
+		expect(panel).toContain('void sfxPanel.load();');
+		expect(panel).not.toContain('$effect(');
+		expect(state).toContain('return (this.#loading ??=');
+	});
+
+	test('the key waits for the catalogue and says so when there is nothing to add', () => {
+		expect(page).toContain("'sfx.add': () => void sfxPanel.addFromShortcut()");
+		const key = state.slice(state.indexOf('async addFromShortcut()'));
+		expect(key.slice(0, 400)).toContain('await this.load();');
+		expect(key.slice(0, 400)).toContain('toast.error(');
+	});
+
+	test('the audio output is asked for from the press, before the render is awaited, and a late answer is not played for a clip that is gone', () => {
+		const audition = state.slice(state.indexOf('async auditionSpec('), state.indexOf('audition(): Promise<void>'));
+		expect(audition.indexOf('this.prime()')).toBeGreaterThan(-1);
+		expect(audition.indexOf('this.prime()')).toBeLessThan(audition.indexOf('await previewSoundEffect'));
+		const reshape = section.slice(section.indexOf('async function reshape('));
+		expect(reshape.indexOf('sfxPanel.prime()')).toBeGreaterThan(-1);
+		expect(reshape.indexOf('sfxPanel.prime()')).toBeLessThan(reshape.indexOf('await editor.updateSoundEffect'));
+		expect(reshape).toContain('!gone && owner === who && !ui.playing');
+		expect(section).toContain('onDestroy(() => (gone = true));');
+	});
+
+	test('a switch or a button that is waiting on a write keeps the keyboard focus a disabled one would drop', () => {
+		expect(shape).toContain('<Switch checked={reverse} label="Reverse" text="Reverse" pending={disabled}');
+		expect(switchBox).toContain("aria-disabled={pending ? 'true' : undefined}");
+		expect(switchBox).toContain('if (pending) e.preventDefault();');
+	});
+
+	test('after the ticked moments are added the keyboard goes to Find moments, not nowhere', () => {
+		expect(auto).toContain("section?.querySelector<HTMLElement>('[data-testid=\"sfx-find\"]')?.focus();");
+		expect(auto).toContain('await sfxPanel.addPicked()');
+	});
+
+	test('moments are not found on a proposal being previewed', () => {
+		expect(auto).toContain('editor.previewingStaged');
+		expect(auto).toContain('pending={sfxPanel.finding || findWhy !== null}');
+		expect(state).toContain('if (this.finding || editor.previewingStaged) return;');
+	});
+
+	test('a panel in a window of its own does not drag to the main window’s lanes', () => {
+		expect(panel).toContain("popout.isDetached('sfx')");
+		expect(panel).toContain('if (e.button !== 0 || cannotDrag) return;');
+		expect(panel).toContain("cannotDrag ? '' : ' · drag onto an audio track'");
+	});
+
+	test('the click behind a drag’s release is not a pick, and the flag does not outlive it', () => {
+		expect(panel).toContain('setTimeout(() => (dragged = false), CLICK_AFTER_DRAG_MS)');
+		const abandon = panel.slice(panel.indexOf('abandon() {'));
+		expect(abandon.slice(0, 80)).not.toContain('dragged');
+	});
+
+	test('the timeline refuses a red drop in words, and with ripple on lets an overlap push instead', () => {
+		expect(timeline).toContain('dropGhostFor(s, at, others, editor.rippleMode)');
+		expect(timeline).toContain('const refusal = dropRefusal(g);');
+		expect(timeline).toContain('toast.error(refusal);');
+		expect(timeline).toContain('sfxDropHit(time, {');
+	});
+
+	test('a sound of a kind this build does not know is a sentence, not an error', () => {
+		expect(section).toContain('data-testid="sound-effect-unknown"');
+		expect(section).toContain('knownPreset(spec.kind)');
+		expect(inspector).toContain('shapeSummary(asset.sound_effect)');
 	});
 });

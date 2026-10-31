@@ -11,6 +11,7 @@
 	import EmptyState from './EmptyState.svelte';
 	import ProgressBar from './ProgressBar.svelte';
 	import SectionHead from './SectionHead.svelte';
+	import { tick } from 'svelte';
 	import { editor } from '#lib/state.svelte';
 	import { sfxPanel } from '#lib/sfx-panel.svelte';
 	import { timeDisplay } from '#lib/time-display.svelte';
@@ -24,10 +25,22 @@
 	const blocked = $derived(sfxPanel.blocked);
 	/** Why Add is off, in a line (also its tooltip); null when it can go. */
 	const why = $derived(blocked ?? (stale ? 'The cut changed since — find the moments again' : picked === 0 ? 'Tick at least one moment' : null));
+	/** Why Find moments is off, or null: a proposal being previewed is not the cut the moments would be read from. */
+	const findWhy = $derived(editor.previewingStaged ? 'Exit the proposal preview first — moments are found on your cut' : empty ? 'Add clips to the timeline first' : null);
+
+	let section = $state<HTMLElement | null>(null);
+
+	/** Add what is ticked, and — the list and its button being gone — leave the keyboard on Find moments rather than nowhere. */
+	async function addPicked() {
+		if (!(await sfxPanel.addPicked())) return;
+		await tick();
+		section?.querySelector<HTMLElement>('[data-testid="sfx-find"]')?.focus();
+	}
+
 	const gain = (db: number) => `${db > 0 ? '+' : ''}${db} dB`;
 </script>
 
-<section aria-label="Auto sound design" data-testid="sfx-auto">
+<section bind:this={section} aria-label="Auto sound design" data-testid="sfx-auto">
 	<SectionHead label="Auto sound design" />
 	<p class="lede">
 		Kerf looks through the cut for moments that want a sound — cuts, titles, punch-ins, drops in the music, markers named
@@ -47,8 +60,8 @@
 		<Btn
 			variant="secondary"
 			icon="wand-sparkles"
-			pending={sfxPanel.finding || empty}
-			title={empty ? 'Add clips to the timeline first' : sfxPanel.found ? 'Look through the cut again' : 'Look through the cut for moments that want a sound'}
+			pending={sfxPanel.finding || findWhy !== null}
+			title={findWhy ?? (sfxPanel.found ? 'Look through the cut again' : 'Look through the cut for moments that want a sound')}
 			data-testid="sfx-find"
 			onclick={() => void sfxPanel.find()}>{sfxPanel.finding ? 'Looking…' : sfxPanel.found ? 'Find again' : 'Find moments'}</Btn
 		>
@@ -85,7 +98,7 @@
 					pending={why !== null || editor.locked}
 					title={why ?? 'Add the ticked effects to the timeline as one edit'}
 					data-testid="sfx-add-picked"
-					onclick={() => void sfxPanel.addPicked()}>{addLabel(picked)}</Btn
+					onclick={() => void addPicked()}>{addLabel(picked)}</Btn
 				>
 			</div>
 			<ul class="list" class:stale aria-label="Suggested sound effects" data-testid="sfx-suggestions">

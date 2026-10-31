@@ -8,6 +8,7 @@
 	// added without the controls going out of sight under the grid. Nothing reaches the cut until Add — a slider only moves
 	// the draft the audition renders. The state is `sfxPanel`'s (a workspace switch rebuilds this panel and must not lose
 	// the pick or a list of moments); the rules are `sfx-panel.ts`'s.
+	import { onMount } from 'svelte';
 	import Btn from './Btn.svelte';
 	import IconBtn from './IconBtn.svelte';
 	import Icon from './Icon.svelte';
@@ -22,14 +23,16 @@
 	import { ui } from '#lib/editor-ui.svelte';
 	import { settings } from '#lib/settings.svelte';
 	import { sfxPanel } from '#lib/sfx-panel.svelte';
+	import { popout } from '#lib/popout.svelte';
 	import { beginDrag } from '#lib/drag';
 	import { CATEGORY_OPTIONS, anchorNote, glyphOf, gridStep, hueOf, noMatchLine, shapeLine } from '#lib/sfx-panel';
 	import { timeDisplay } from '#lib/time-display.svelte';
 	import type { SfxPreset } from '#lib/types';
 
-	$effect(() => {
+	// Once, when the panel appears — not an effect: reading the catalogue reads and writes the state an effect would then track, and a
+	// read that failed would be asked for again, and again. (`onMount` is untracked.) A sound still playing is for a panel that is gone.
+	onMount(() => {
 		void sfxPanel.load();
-		// A sound still playing is for a panel that is gone.
 		return () => sfxPanel.stop();
 	});
 
@@ -81,9 +84,22 @@
 	}
 
 	// ---- picking, and dragging to a lane --------------------------------------------------------------------
-	/** A tile drag just ended: the click that follows its release is not a pick. */
+	/** A tile drag just ended: the click that follows its release is not a pick. It is only the click that is waiting right behind
+	 *  the release, so it is let go of a moment later, whether or not one came (a cancelled pointer sends none). */
 	let dragged = false;
+	let undragged: ReturnType<typeof setTimeout> | null = null;
 	const SLOP = 4;
+	const CLICK_AFTER_DRAG_MS = 60;
+
+	function afterDrag() {
+		dragged = true;
+		if (undragged) clearTimeout(undragged);
+		undragged = setTimeout(() => (dragged = false), CLICK_AFTER_DRAG_MS);
+	}
+
+	/** In a window of its own the panel cannot reach the timeline's lanes: its pointer is that window's, and a drop would be read
+	 *  against the wrong window's lanes. There the sound is added at the playhead, as from the keyboard. */
+	const cannotDrag = $derived(popout.isDetached('sfx'));
 
 	function pick(p: SfxPreset) {
 		if (dragged) {
@@ -95,7 +111,7 @@
 
 	function onTileDown(e: PointerEvent, p: SfxPreset) {
 		dragged = false;
-		if (e.button !== 0) return;
+		if (e.button !== 0 || cannotDrag) return;
 		const [x0, y0] = [e.clientX, e.clientY];
 		const root = document.documentElement;
 		const cursor = root.style.cursor;
@@ -124,12 +140,11 @@
 				const payload = ui.dndSfx;
 				end();
 				if (!active || !payload) return;
-				dragged = true;
+				afterDrag();
 				ui.sfxDropTarget?.(payload, u.clientX, u.clientY);
 			},
 			abandon() {
 				end();
-				if (active) dragged = true;
 			}
 		});
 	}
@@ -199,7 +214,9 @@
 							/>
 						{/each}
 					</div>
-					<p class="hint">Click to hear · Enter or double-click to add at the playhead · drag onto an audio track</p>
+					<p class="hint">
+						Click to hear · Enter or double-click to add at the playhead{cannotDrag ? '' : ' · drag onto an audio track'}
+					</p>
 				{/if}
 			</div>
 

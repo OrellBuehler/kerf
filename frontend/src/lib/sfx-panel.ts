@@ -3,6 +3,7 @@
 // suggestions with its picks. The panel (`SoundFx.svelte`), its state (`sfx-panel.svelte.ts`) and the Inspector's Sound
 // effect section only wire these to the screen.
 
+import { quantizeTime } from './frames';
 import { PERCENT, SECONDS, type RowSpec } from './slider-row';
 import {
 	MAX_SEED,
@@ -12,8 +13,8 @@ import {
 	SFX_CATEGORIES,
 	resolvedDuration,
 	sfxAnchor,
-	sfxPreset,
-	sfxSpan
+	sfxSpan,
+	SFX_CATALOGUE
 } from './sfx';
 import type {
 	SfxAnchor,
@@ -64,8 +65,20 @@ export const CATEGORY_HUES: Record<SfxCategory, string> = {
 	texture: 'var(--blue-500)'
 };
 
-export const glyphOf = (kind: SfxKind): string => SFX_GLYPHS[kind];
-export const hueOf = (category: SfxCategory): string => CATEGORY_HUES[category];
+/** The glyph of a kind, and a plain waveform for one this build has not heard of (a project from a newer Kerf). */
+export const glyphOf = (kind: SfxKind): string => SFX_GLYPHS[kind] ?? 'audio-waveform';
+/** The hue of a category; the muted text colour for none. */
+export const hueOf = (category: SfxCategory | null | undefined): string => (category ? (CATEGORY_HUES[category] ?? 'var(--text-muted)') : 'var(--text-muted)');
+
+/** The catalogue row of a kind, or null for one this build does not know — a clip made by a newer Kerf, whose sound this build
+ *  can still play but not describe or reshape. */
+export const knownPreset = (kind: string): SfxPreset | null => SFX_CATALOGUE.find((p) => p.kind === kind) ?? null;
+
+/** `reverse_swell` as a person reads it: `Reverse swell`. */
+export const prettyKind = (kind: string): string => {
+	const text = kind.replace(/[_-]+/g, ' ').trim();
+	return text ? text.charAt(0).toUpperCase() + text.slice(1) : 'Sound effect';
+};
 
 /** The chips over the grid: everything, then each category as the engine names it. */
 export type CategoryFilter = SfxCategory | 'all';
@@ -149,9 +162,12 @@ const ENVELOPES: Record<SfxKind, Env> = {
 	heartbeat: taps([0.04, 0.2, 0.56, 0.72], 0.05, [1, 0.72, 0.9, 0.66])
 };
 
+/** What a kind this build does not know is sketched as: a single swell. */
+const GENERIC_ENVELOPE: Env = swell(0.5, 0.25);
+
 /** The points of a sound's envelope: `n` samples of 0 to 1 over its length. */
 export function envelopeOf(kind: SfxKind, n = 64, reverse = false): number[] {
-	const f = ENVELOPES[kind];
+	const f = ENVELOPES[kind] ?? GENERIC_ENVELOPE;
 	const raw = Array.from({ length: n }, (_, i) => {
 		const j = reverse ? n - 1 - i : i;
 		return Math.max(0, f(n > 1 ? j / (n - 1) : 0));
@@ -285,8 +301,10 @@ export function shapeChanges(spec: SfxSpec): string[] {
 	return out;
 }
 
-/** What the spec has been moved off — `1.50 s · +3 st · Tail 60%` — for a summary line; `Defaults` when nothing. */
-export function shapeSummary(spec: SfxSpec, preset: Pick<SfxPreset, 'default_duration_s'> = sfxPreset(spec.kind)): string {
+/** What the spec has been moved off — `1.50 s · +3 st · Tail 60%` — for a summary line; `Defaults` when nothing, and a plain
+ *  word for a kind this build does not know. */
+export function shapeSummary(spec: SfxSpec, preset: Pick<SfxPreset, 'default_duration_s'> | null = knownPreset(spec.kind)): string {
+	if (!preset) return 'Unknown kind';
 	const out: string[] = [];
 	const len = resolvedDuration(spec);
 	if (Math.abs(len - preset.default_duration_s) > 0.0005) out.push(`${len.toFixed(2)} s`);
@@ -340,6 +358,10 @@ export interface DropGhost {
 	start: number;
 	dur: number;
 	ok: boolean;
+	/** Why it cannot land (`ok` is false): the hit too close to the start of the timeline, or another clip in the way. */
+	reason?: 'start' | 'overlap' | 'inside';
+	/** It overlaps clips that ripple will push along: it lands, and moves them. */
+	pushes?: boolean;
 }
 
 /** The payload a tile drag carries (`ui.dndSfx`): the spec to place and its length, so the lanes can draw the ghost before the
@@ -356,13 +378,56 @@ export const dragOf = (spec: SfxSpec, gainDb: number, label: string): SfxDrag =>
 
 /** Where a dragged sound would sit on a lane if its hit were dropped at `hit` (`sfxSpan`, the placement's own rule: the clip
  *  starts earlier by how far in its hit is, and a start before 0 cuts the head off), and whether it fits among `others`, the
- *  `[start, end)` of the clips already there. A hit that cannot land at all is drawn where it would be, `ok: false`. */
-export function dropGhostFor(drag: SfxDrag, hit: number, others: readonly (readonly [number, number])[]): DropGhost {
+ *  `[start, end)` of the clips already there. With `ripple` on, an add pushes along the clips that start at or after its own
+ *  start (`ripple_lanes`: "adds a clip onto footage that was there"), so an effect that only runs into the *front* of clips is a
+ *  drop that `pushes` them; one that starts inside a clip has nothing to push that clip with and is refused as before. A hit that
+ *  cannot land at all is drawn where it would be, `ok: false`. */
+export function dropGhostFor(drag: SfxDrag, hit: number, others: readonly (readonly [number, number])[], ripple = false): DropGhost {
 	const span = sfxSpan(drag.spec, drag.duration, hit);
-	if (!span) return { start: 0, dur: Math.max(drag.duration - sfxAnchor(drag.spec, drag.duration) + hit, 0.02), ok: false };
+	if (!span) {
+		return { start: 0, dur: Math.max(drag.duration - sfxAnchor(drag.spec, drag.duration) + hit, 0.02), ok: false, reason: 'start' };
+	}
 	const [start, cut] = span;
 	const dur = drag.duration - cut;
-	return { start, dur, ok: !others.some(([s, e]) => start < e - 1e-9 && s < start + dur - 1e-9) };
+	const hits = others.filter(([s, e]) => start < e - 1e-9 && s < start + dur - 1e-9);
+	if (hits.length === 0) return { start, dur, ok: true };
+	if (!ripple) return { start, dur, ok: false, reason: 'overlap' };
+	// Under ripple, whatever begins at or after the effect is pushed clear of it; whatever begins before it stays where it is.
+	return hits.some(([s]) => s < start - 1e-9) ? { start, dur, ok: false, reason: 'inside' } : { start, dur, ok: true, pushes: true };
+}
+
+/** What a refused drop says, or null when it lands. */
+export function dropRefusal(ghost: DropGhost): string | null {
+	if (ghost.ok) return null;
+	if (ghost.reason === 'start') return 'Its hit is too close to the start of the timeline for the sound to land there — drop it later';
+	if (ghost.reason === 'inside') return 'A sound cannot start inside another clip, even with ripple on — drop it in free space, or before the clip it should push';
+	return 'Drop into free space — a clip would overlap another here';
+}
+
+/** What a dragged sound's ghost is labelled: its name, and that it pushes what is after it when it will. */
+export const ghostLabel = (drag: Pick<SfxDrag, 'label'>, ghost: DropGhost): string => (ghost.pushes ? `${drag.label} · pushes the clips after it` : drag.label);
+
+/** Where the hit of a dropped sound lands for a pointer at `time` on a lane: the nearest magnet within `threshold` — the start,
+ *  the playhead, a bar or beat (`grid`), a cut between pictures, a clip edge of the lane — when snapping is on, else the nearest
+ *  frame; a frame that lands on a clip edge is that edge exactly. */
+export function sfxDropHit(
+	time: number,
+	o: {
+		fps: number;
+		snap: boolean;
+		playhead: number;
+		grid: readonly number[];
+		cuts: readonly number[];
+		edges: readonly number[];
+		threshold: number;
+	}
+): number {
+	return quantizeTime(time, {
+		fps: o.fps,
+		magnets: o.snap ? [0, o.playhead, ...o.grid, ...o.cuts, ...o.edges] : [],
+		threshold: o.threshold,
+		welds: o.edges
+	});
 }
 
 // ---- auto sound design ---------------------------------------------------------------------------------
@@ -394,7 +459,7 @@ export interface SuggestionRow {
 	index: number;
 	kind: SfxKind;
 	label: string;
-	category: SfxCategory;
+	category: SfxCategory | null;
 	source: string;
 	/** Where the hit lands, seconds. */
 	at: number;
@@ -408,8 +473,8 @@ export function suggestionRows(suggestions: readonly SfxSuggestion[]): Suggestio
 	return suggestions.map((s, index) => ({
 		index,
 		kind: s.placement.kind,
-		label: sfxPreset(s.placement.kind).label,
-		category: sfxPreset(s.placement.kind).category,
+		label: knownPreset(s.placement.kind)?.label ?? prettyKind(s.placement.kind),
+		category: knownPreset(s.placement.kind)?.category ?? null,
 		source: sourceLabel(s.source),
 		at: s.placement.at,
 		reason: s.reason,

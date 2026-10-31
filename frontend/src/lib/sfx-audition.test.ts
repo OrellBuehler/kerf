@@ -21,7 +21,7 @@ class FakeSource implements PlayerSource {
 	}
 }
 
-function fake(opts: { state?: string; decode?: (b: ArrayBuffer) => Promise<unknown> } = {}) {
+function fake(opts: { state?: string; decode?: (b: ArrayBuffer) => Promise<unknown>; resume?: () => Promise<void>; wait?: number } = {}) {
 	const sources: FakeSource[] = [];
 	const ctx: PlayerContext & { made: number; resumed: number } = {
 		state: opts.state ?? 'running',
@@ -30,6 +30,7 @@ function fake(opts: { state?: string; decode?: (b: ArrayBuffer) => Promise<unkno
 		resumed: 0,
 		async resume() {
 			this.resumed++;
+			if (opts.resume) return opts.resume();
 			this.state = 'running';
 		},
 		decodeAudioData: opts.decode ?? (async (b) => ({ decoded: b.byteLength })),
@@ -43,7 +44,7 @@ function fake(opts: { state?: string; decode?: (b: ArrayBuffer) => Promise<unkno
 	const player = new Auditioner(() => {
 		made++;
 		return ctx;
-	});
+	}, opts.wait);
 	const seen: AuditionState[] = [];
 	player.onchange = (s) => seen.push(s);
 	return { player, ctx, sources, seen, made: () => made };
@@ -151,5 +152,57 @@ describe('the auditioner', () => {
 		const { player, made } = fake();
 		player.stop();
 		expect(made()).toBe(0);
+	});
+
+	test('prime makes the context and asks it to run at once, before anything is decoded, and only the once', async () => {
+		const { player, ctx, made } = fake({ state: 'suspended' });
+		player.prime();
+		expect(made()).toBe(1);
+		expect(ctx.resumed).toBe(1);
+		await Promise.resolve();
+		expect(ctx.state).toBe('running');
+		player.prime();
+		expect(made()).toBe(1);
+		expect(ctx.resumed).toBe(1);
+		await player.play(bytes());
+		expect(made()).toBe(1);
+		expect(player.state).toBe('playing');
+	});
+
+	test('prime on a platform with no audio says nothing, and play says why', async () => {
+		const player = new Auditioner(() => {
+			throw new Error('AudioContext is not defined');
+		});
+		expect(() => player.prime()).not.toThrow();
+		await expect(player.play(bytes())).rejects.toThrow('AudioContext is not defined');
+		expect(player.state).toBe('idle');
+	});
+
+	test('a resume that is never answered does not hold the render up for ever: it gives up and says so', async () => {
+		const { player, sources } = fake({ state: 'suspended', resume: () => new Promise<void>(() => {}), wait: 15 });
+		const started = Date.now();
+		await expect(player.play(bytes())).rejects.toThrow('audio output would not start');
+		expect(Date.now() - started).toBeLessThan(1000);
+		expect(sources).toHaveLength(0);
+		expect(player.state).toBe('idle');
+	});
+
+	test('a context that comes back while the sound decodes plays it, however late the resume answers', async () => {
+		let answer!: () => void;
+		const ctxState = fake({
+			state: 'suspended',
+			resume: () =>
+				new Promise<void>((r) => {
+					answer = r;
+				}),
+			wait: 500
+		});
+		const pending = ctxState.player.play(bytes());
+		await Promise.resolve();
+		ctxState.ctx.state = 'running';
+		answer();
+		await pending;
+		expect(ctxState.player.state).toBe('playing');
+		expect(ctxState.sources).toHaveLength(1);
 	});
 });

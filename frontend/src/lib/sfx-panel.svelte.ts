@@ -13,7 +13,7 @@ import { toast } from './notifications.svelte';
 import { failure, tidyReason } from './failure-copy';
 import { report } from './ops';
 import { Auditioner } from './sfx-audition';
-import { defaultSfxSpec } from './sfx';
+import { SFX_KINDS, defaultSfxSpec } from './sfx';
 import {
 	addedLine,
 	dragOf,
@@ -75,6 +75,7 @@ class SfxPanelState {
 	#noteTimer: ReturnType<typeof setTimeout> | null = null;
 	#ticket = 0;
 	#findTicket = 0;
+	#loading: Promise<void> | null = null;
 
 	constructor() {
 		this.#player.onchange = (s) => {
@@ -111,12 +112,22 @@ class SfxPanelState {
 
 	// ---- the catalogue
 
-	async load(): Promise<void> {
-		if (this.status === 'loading' || this.status === 'ready') return;
+	/** Read the catalogue, once: a second call while it is being read answers when that one does, and one after it has been read
+	 *  answers at once. A read that failed is tried again by the next call — which is the user's (Try again, a key), never a
+	 *  panel's own effect, so a failing backend is asked once and not for ever. */
+	load(): Promise<void> {
+		if (this.status === 'ready') return Promise.resolve();
+		return (this.#loading ??= this.#read().finally(() => {
+			this.#loading = null;
+		}));
+	}
+
+	async #read(): Promise<void> {
 		this.status = 'loading';
 		this.loadError = null;
 		try {
-			this.catalogue = await sfxCatalogue();
+			// Only kinds this build can draw, shape and place: its table is pinned to the engine's, so this drops nothing it ships.
+			this.catalogue = (await sfxCatalogue()).filter((p) => (SFX_KINDS as readonly string[]).includes(p.kind));
 			this.status = 'ready';
 			if (this.kind === null && this.catalogue.length > 0) this.select(this.catalogue[0].kind, { audition: false });
 		} catch (e) {
@@ -157,6 +168,8 @@ class SfxPanelState {
 
 	/** Render `spec` and play it, as `owner`. Anything playing is replaced; a render that a newer press overtook is dropped. */
 	async auditionSpec(spec: SfxSpecInput, owner: AuditionOwner): Promise<void> {
+		// Before anything is awaited: the press that asked is the gesture a webview lets the audio start from.
+		this.prime();
 		const ticket = ++this.#ticket;
 		this.owner = owner;
 		this.rendering = true;
@@ -189,6 +202,11 @@ class SfxPanelState {
 
 	audition(): Promise<void> {
 		return this.spec ? this.auditionSpec(this.spec, 'panel') : Promise.resolve();
+	}
+
+	/** Get the audio output ready from a press (see `Auditioner.prime`); the Inspector calls it before its own await. */
+	prime(): void {
+		this.#player.prime();
 	}
 
 	/** What the last audition by `owner` has to say (the harness cannot make a sound), or null. */
@@ -239,7 +257,8 @@ class SfxPanelState {
 		return this.spec ? this.add([placementOf(this.spec, at, this.gainDb, trackId)]) : Promise.resolve(false);
 	}
 
-	/** A preset at its defaults, with its hit on `at`: the grid's double-click and Enter. Also selects it. */
+	/** The preset `kind`, picked, with its hit on `at` (the playhead): the grid's double-click and Enter. A kind that was not the
+	 *  pick comes at its defaults; the one that was comes as it has been shaped. */
 	async addKind(kind: SfxKind, at: number = ui.time): Promise<boolean> {
 		this.select(kind, { audition: false });
 		return this.addDraft(at);
@@ -258,7 +277,8 @@ class SfxPanelState {
 	// ---- auto sound design
 
 	async find(): Promise<void> {
-		if (this.finding) return;
+		// A proposal being previewed is not the cut moments are read from.
+		if (this.finding || editor.previewingStaged) return;
 		const ticket = ++this.#findTicket;
 		this.finding = true;
 		this.findError = null;
@@ -296,13 +316,25 @@ class SfxPanelState {
 	}
 
 	/** Add the ticked moments as one edit. The list was made on the cut as it was, so it goes; the notice stays. */
-	async addPicked(): Promise<void> {
-		if (!this.found || this.stale) return;
+	async addPicked(): Promise<boolean> {
+		if (!this.found || this.stale) return false;
 		const placements = pickedPlacements(this.found, this.picks);
-		if (!(await this.add(placements))) return;
+		if (!(await this.add(placements))) return false;
 		this.lastAdded = placements.length;
 		this.found = null;
 		this.picks = pickNone();
+		return true;
+	}
+
+	/** The `sfx.add` key and menu entry: add the picked sound at the playhead, waiting for the catalogue if it is still being read
+	 *  (or reading it again if that failed), and saying so if there is no sound to add. */
+	async addFromShortcut(): Promise<void> {
+		await this.load();
+		if (!this.spec) {
+			toast.error(this.loadError ?? "Couldn't load the sound effects");
+			return;
+		}
+		await this.addDraft();
 	}
 
 	/** Seek the playhead to a moment. */
