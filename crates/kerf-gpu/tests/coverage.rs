@@ -20,9 +20,9 @@
 //! the same over a blurred fill), a photo slideshow with Ken Burns moves and crossfades, a multicam
 //! cut with captions and a 4K source graded into a 1080p canvas. All sources are generated.
 //!
-//! `the_ledger_...` is the backlog metric of the bit-exact parity plan (branch `plan/gpu-exact-parity`):
-//! for every output frame of every archetype, in both plan modes, whether the compositor draws it and,
-//! when it does not, which `Unsupported` variants refuse it. It plans and renders nothing and writes
+//! `the_ledger_...` is the backlog of refusals, measured: for every output frame of every archetype, in both
+//! plan modes, whether the compositor draws it and, when it does not, which `Unsupported` variants refuse it,
+//! and so which one lifted alone would draw the most. It plans and renders nothing and writes
 //! `target/parity/ledger.txt` (and `ledger-<ffmpeg version>.txt`, so the two builds keep their own):
 //!
 //! ```text
@@ -34,7 +34,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::OnceLock;
 
 use kerf_core::model::{
@@ -45,6 +45,9 @@ use kerf_core::{
     StreamKind, TextOverlay, Timeline, Track, Transform, Unsupported,
 };
 use kerf_gpu::Compositor;
+
+#[path = "common/child.rs"]
+mod child;
 
 fn clip(a: &Asset, src_in: f64, dur: f64, start: f64) -> Clip {
     let src_in = src_in.min((a.duration - dur - 0.1).max(0.0));
@@ -485,23 +488,43 @@ fn real_world(m: &Media) -> Vec<(&'static str, Timeline)> {
     out
 }
 
-/// `name` in `dir`, made by FFmpeg from `input` and `encode` (then `extra`) unless an earlier run left it:
-/// written under another name and renamed, so a run that was killed leaves nothing a later one trusts.
+/// How long an encode of one generated source may take: the longest (4K, 12 s) takes seconds, a loaded box minutes.
+const MAKE_LIMIT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// FNV-1a over the parts (each ended by a zero byte): the name of a cache directory, which has to be the same in every run
+/// and need not be secret.
+fn fingerprint(parts: &[&str]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for part in parts {
+        for byte in part.bytes().chain([0]) {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0100_0000_01b3);
+        }
+    }
+    hash
+}
+
+/// `name` made by FFmpeg from `input` and `encode` (then `extra`) in a directory of `dir` named for those arguments and for the
+/// FFmpeg that runs them (its path and `-version`), unless an earlier run with the same left it: another encode, or another
+/// build, is another file. Written under another name and renamed, so a run that was killed leaves nothing a later one trusts.
 fn make(dir: &Path, name: &str, input: &[&str], encode: &[&str], extra: &[&str]) -> PathBuf {
+    let ffmpeg = kerf_core::ffmpeg_path();
+    let mut parts: Vec<&str> = vec![name, ffmpeg.as_str(), ffmpeg_version().0.as_str()];
+    parts.extend(input.iter().chain(encode).chain(extra));
+    let dir = dir.join(format!("{:016x}", fingerprint(&parts)));
+    std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(name);
     if path.metadata().is_ok_and(|m| m.len() > 0) {
         return path;
     }
     let tmp = dir.join(format!("part-{}-{name}", std::process::id()));
-    let out = Command::new(kerf_core::ffmpeg_path())
-        .args(["-hide_banner", "-loglevel", "error", "-y"])
+    let mut cmd = Command::new(&ffmpeg);
+    cmd.args(["-hide_banner", "-loglevel", "error", "-y"])
         .args(input)
         .args(encode)
         .args(extra)
-        .arg(&tmp)
-        .stdin(Stdio::null())
-        .output()
-        .expect("run ffmpeg");
+        .arg(&tmp);
+    let out = child::output_within(cmd, MAKE_LIMIT).unwrap_or_else(|e| panic!("{name}: ffmpeg {e}"));
     assert!(out.status.success(), "{name}: {}", String::from_utf8_lossy(&out.stderr));
     std::fs::rename(&tmp, &path).unwrap();
     path
@@ -654,23 +677,25 @@ struct Reason {
 /// A frame the planner could not plan at all (a clip whose asset is gone): never drawn, whatever the caps.
 const UNPLANNABLE: &str = "unplannable";
 
-fn short(s: &str) -> String {
+/// `s` on one line, at most `max` characters: for a table's column. Never for a key (two causes that differ late in a long
+/// message are two causes).
+fn column(s: &str, max: usize) -> String {
     let s: String = s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
-    if s.chars().count() <= 64 {
+    if s.chars().count() <= max {
         s
     } else {
-        format!("{}...", s.chars().take(61).collect::<String>())
+        format!("{}...", s.chars().take(max.saturating_sub(3)).collect::<String>())
     }
 }
 
 fn reason(u: &Unsupported) -> Reason {
     let variant = u.kind();
     let cause: Option<String> = match u {
-        Unsupported::Delivery(s) | Unsupported::Scaler(s) | Unsupported::Geometry(_, s) => Some(short(s)),
+        Unsupported::Delivery(s) | Unsupported::Scaler(s) | Unsupported::Geometry(_, s) => Some(s.clone()),
         Unsupported::AlphaPicture(_, s)
         | Unsupported::NotKnownOpaque(_, s)
         | Unsupported::TranslucentMatrix(_, s)
-        | Unsupported::GradedFullRange(_, s) => Some(short(s)),
+        | Unsupported::GradedFullRange(_, s) => Some(s.clone()),
         Unsupported::FormatResize(_, _, _, pix_fmt) => Some(pix_fmt.clone()),
         Unsupported::Effects(_, s)
         | Unsupported::Grade(_, s)
@@ -679,7 +704,7 @@ fn reason(u: &Unsupported) -> Reason {
         | Unsupported::Matte(_, s)
         | Unsupported::ZoomBehind(_, s)
         | Unsupported::FoldedFit(_, s)
-        | Unsupported::FullRangeResized(_, s) => Some(short(s)),
+        | Unsupported::FullRangeResized(_, s) => Some(s.to_string()),
         Unsupported::DipToWhite(_, why) => Some(format!("{why:?}").split('(').next().unwrap_or_default().to_string()),
         Unsupported::Fade(_, edge, dissolve) => Some(format!("{edge:?} {}", if *dissolve { "dissolve" } else { "step" })),
         Unsupported::BlendMode(_, mode) => Some(format!("{mode:?}")),
@@ -803,7 +828,7 @@ fn ranking(title: &str, rows: &BTreeMap<String, Tally>, total: u64, out: &mut St
             out,
             "  {:>2}  {:<72} {:>8} {:>5.1}%  {:>8} {:>5.1}% {:>8} {:>8}  {}",
             i + 1,
-            name,
+            column(name, 72),
             t.refused,
             pct(t.refused, total),
             t.only,
@@ -836,7 +861,7 @@ fn render_ledger(header: &[String], cuts: &[Cut]) -> String {
         let _ = writeln!(
             out,
             "  {:<68} {:<6} {:>8} {:>8} {:>8} {:>6.1}%",
-            short(&cut.name),
+            column(&cut.name, 66),
             cut.mode,
             sampled,
             drawn,
@@ -904,7 +929,12 @@ fn render_ledger(header: &[String], cuts: &[Cut]) -> String {
                 *gains.entry(**only).or_default() += n;
             }
         }
-        let Some((best, gain)) = gains.into_iter().max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(a.0))) else {
+        // A frame the planner could not plan is not made drawable by lifting anything.
+        let Some((best, gain)) = gains
+            .into_iter()
+            .filter(|(variant, _)| *variant != UNPLANNABLE)
+            .max_by(|a, b| a.1.cmp(&b.1).then(b.0.cmp(a.0)))
+        else {
             break;
         };
         lifted.insert(best);
@@ -920,16 +950,19 @@ fn render_ledger(header: &[String], cuts: &[Cut]) -> String {
     }
     let _ = writeln!(out);
 
-    // (e) what is left needs two variants lifted together.
-    let mut left: Vec<(String, u64)> = sets
-        .iter()
-        .filter(|(set, _)| set.iter().filter(|v| !lifted.contains(**v)).count() > 0)
-        .map(|(set, n)| (set.iter().copied().collect::<Vec<_>>().join(" + "), *n))
-        .collect();
+    // (e) what is left: the variants that still refuse a frame together, the ones (d) lifted left out.
+    let mut left: BTreeMap<String, u64> = BTreeMap::new();
+    for (set, n) in &sets {
+        let rest: Vec<&str> = set.iter().copied().filter(|v| !lifted.contains(v)).collect();
+        if !rest.is_empty() {
+            *left.entry(rest.join(" + ")).or_default() += n;
+        }
+    }
+    let mut left: Vec<(String, u64)> = left.into_iter().collect();
     left.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
     let _ = writeln!(
         out,
-        "(e) frames still refused after (d): {} ({:.1}%), by the variants that refuse them together",
+        "(e) frames still refused after (d): {} ({:.1}%), by the variants that still refuse them together",
         total - now,
         pct(total - now, total)
     );
@@ -940,28 +973,29 @@ fn render_ledger(header: &[String], cuts: &[Cut]) -> String {
 }
 
 /// The first line `ffmpeg -version` prints (`ffmpeg version 6.1.1-3ubuntu5 ...`) and the number in it (`6.1.1`), which
-/// names the ledger's file so each build keeps its own. Only a file name: nothing is decided by it.
-fn ffmpeg_version() -> (String, String) {
-    let out = Command::new(kerf_core::ffmpeg_path())
-        .arg("-version")
-        .stdin(Stdio::null())
-        .output()
-        .expect("run ffmpeg");
-    let line = String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .next()
-        .unwrap_or("ffmpeg")
-        .to_string();
-    let number: String = line
-        .split_whitespace()
-        .nth(2)
-        .unwrap_or("")
-        .trim_start_matches(|c: char| !c.is_ascii_digit())
-        .chars()
-        .take_while(|c| c.is_ascii_digit() || *c == '.')
-        .collect();
-    let number = if number.is_empty() { "unknown".to_string() } else { number };
-    (line, number)
+/// names the ledger's file so each build keeps its own. Only a file name and a cache key: nothing is decided by it.
+fn ffmpeg_version() -> &'static (String, String) {
+    static V: OnceLock<(String, String)> = OnceLock::new();
+    V.get_or_init(|| {
+        let mut cmd = Command::new(kerf_core::ffmpeg_path());
+        cmd.arg("-version");
+        let out = child::output_within(cmd, std::time::Duration::from_secs(60)).expect("ffmpeg -version");
+        let line = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .next()
+            .unwrap_or("ffmpeg")
+            .to_string();
+        let number: String = line
+            .split_whitespace()
+            .nth(2)
+            .unwrap_or("")
+            .trim_start_matches(|c: char| !c.is_ascii_digit())
+            .chars()
+            .take_while(|c| c.is_ascii_digit() || *c == '.')
+            .collect();
+        let number = if number.is_empty() { "unknown".to_string() } else { number };
+        (line, number)
+    })
 }
 
 #[test]
@@ -970,7 +1004,9 @@ fn the_ledger_says_which_refusals_hold_the_compositor_back() {
     let media = media();
     let assets = media.assets();
     let policy = composite_color_policy();
-    let caps = Compositor::CAPS;
+    // The caps the app asks with: the grade is drawn only where this FFmpeg's conversions are the model's (one probe).
+    let kernels = kerf_gpu::grade::kernels();
+    let caps = Compositor::caps_for(kernels);
     let mut cuts = vec![];
     for (name, tl) in archetypes(media) {
         for (mode, request) in [("still", PlanRequest::still(policy)), ("motion", PlanRequest::motion(policy))] {
@@ -996,7 +1032,8 @@ fn the_ledger_says_which_refusals_hold_the_compositor_back() {
         "kerf-gpu coverage ledger: the frames the compositor draws and what refuses the rest".to_string(),
         format!("ffmpeg: {version_line}"),
         format!("composite colour policy: {policy:?}"),
-        "caps: Compositor::CAPS; every output frame of every archetype is planned (540 px wide), nothing is rendered".to_string(),
+        format!("grade kernels: {kernels:?} (caps: Compositor::caps_for(grade::kernels()), as the app asks)"),
+        "plans: every output frame of every archetype over OriginalMedia at 540 px wide (the app's preview plans ProxyMedia at 960); nothing is rendered".to_string(),
         "archetypes: the review's T1 to T3 and the real-world T4 to T8 of tests/coverage.rs".to_string(),
     ];
     let text = render_ledger(&header, &cuts);
@@ -1064,11 +1101,16 @@ fn a_reason_is_named_by_its_variant_and_the_cause_a_variant_bundles() {
     assert_eq!(r.detail, "dip_to_white/OddSize");
     let r = reason(&Unsupported::FormatResize(1, (4, 4), (2, 2), "yuv422p".into()));
     assert_eq!(r.detail, "format_resize/yuv422p");
+    // A key is never cut: causes that differ late in a long message are two causes. A table's column is.
     let long = "x".repeat(300);
-    assert_eq!(
-        reason(&Unsupported::Scaler(long)).detail.chars().count(),
-        "scaler/".len() + 64
+    let late = format!("{}y", "x".repeat(300));
+    assert_eq!(reason(&Unsupported::Scaler(long.clone())).detail, format!("scaler/{long}"));
+    assert_ne!(
+        reason(&Unsupported::Scaler(long)).detail,
+        reason(&Unsupported::Scaler(late)).detail
     );
+    assert_eq!(column(&"x".repeat(300), 72).chars().count(), 72);
+    assert_eq!(column("a\nb", 72), "a b");
     // Two layers refused for the same cause are one reason.
     let (a, b) = (
         reason(&Unsupported::Mask(layer_ref())),
@@ -1128,4 +1170,31 @@ fn the_ledger_ranks_by_the_frames_a_variant_alone_would_draw() {
     // (a): 40 + 100 drawn of 100 + 104 sampled.
     let both = text.lines().find(|l| l.contains("both")).expect("the total");
     assert!(both.contains("204") && both.contains("140") && both.contains("64"), "{both}");
+}
+
+#[test]
+fn an_unplannable_frame_is_never_lifted_and_what_is_left_lists_only_what_is_left() {
+    // 24 frames: 10 drawn; 5 unplannable; 3 unplannable and `text`; 4 `mask` and `text`; 2 `mask` alone.
+    let a = cut(
+        "T9  x",
+        "still",
+        &[
+            (&[], 10),
+            (&[("unplannable", "")], 5),
+            (&[("text", ""), ("unplannable", "")], 3),
+            (&[("mask", ""), ("text", "")], 4),
+            (&[("mask", "")], 2),
+        ],
+    );
+    let text = render_ledger(&["header".to_string()], &[a]);
+    let at = |needle: &str| text.find(needle).unwrap_or_else(|| panic!("no {needle:?} in\n{text}"));
+    let d = &text[at("(d)")..at("(e)")];
+    assert!(
+        d.find("mask").unwrap() < d.find("text").unwrap() && !d.contains("unplannable"),
+        "{d}"
+    );
+    assert!(d.trim_end().ends_with("66.7%"), "{d}");
+    let e = &text[at("(e)")..];
+    assert!(e.contains("8 ") && e.contains("unplannable"), "{e}");
+    assert!(!e.contains("text") && !e.contains("mask") && !e.contains(" + "), "{e}");
 }

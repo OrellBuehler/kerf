@@ -392,7 +392,11 @@
   `EffectKinds` bitset; today `GpuCaps::A0` plus every one of them but `reframe`, `hdr`
   with every effect kind and every grade kind), and **`RenderPlan::reasons(&caps,
   size)` is a pure function of the plan's fields** returning `Unsupported` values whose
-  `Display` is the message the plan has always given — nothing is decided while planning,
+  `Display` is the message the plan has always given and which lists **every** cause of a refusal, not the first (a layer whose
+  geometry is refused still gets its other reasons, judged on the picture's own chroma grid; a grade on a letterboxed layer
+  the scaler resizes is a `Matte` and a `GradeWith`; a dip to white lists each of `Letterboxed`, `OddSize` and `Resized` that
+  applies): the ledger in `gpu.md` ranks reasons by the frames lifting one alone would draw, which is only true if none hides
+  behind another; whether a frame is drawn is `reasons().is_empty()` as before — nothing is decided while planning,
   so one plan answers for any caps and an A5 pass is a flip beside the pass and its parity
   cases. A Motion plan is refused as a whole until `caps.motion`, and in Motion a moving
   keyframed zoom is refused until `caps.keyed_zoom` (`KeyedZoom`: the export draws it last, at the output

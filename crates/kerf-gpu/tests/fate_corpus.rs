@@ -1,7 +1,7 @@
 //! FFmpeg's FATE sample corpus as hostile input for everything that reads a file on the GPU path: the
 //! probe, the one-shot decode (`decode_layer`), the `FrameSource` (routes, runs, the frame cache) and a
 //! `FrameCursor` (the export's picks). The samples are the odd files the codecs' own tests are made
-//! of: odd and tiny sizes, 4:2:2 / 4:4:4 / 4:4:0, 10 and 12 bit, gray, alpha (VP8, ProRes 4444, PNG), `yuvj`,
+//! of: odd and tiny sizes, 4:2:2 / 4:4:4 / 4:4:0, 10 bit, a 16-bit gray JPEG, gray, alpha (ProRes 4444, PNG, GIF), `yuvj`,
 //! interlaced, a display matrix, a stream that changes size or format part-way, a timestamp that starts
 //! below zero, container oddities (AVI, FLV, IVF, OBU, elementary streams) and files cut short.
 //!
@@ -13,11 +13,13 @@
 //! one build lacks a codec.
 //!
 //! The samples are **downloaded** from <https://fate-suite.ffmpeg.org/> into `target/fate-suite/` (a few MB,
-//! kept between runs) and never committed: the suite's files carry mixed licences. `#[ignore]`d (needs
-//! `ffmpeg`, `ffprobe`, `curl` and a network); run with
+//! kept between runs, no checksums: they are inputs to be survived, not references) and never committed: the
+//! suite's files carry mixed licences. `#[ignore]`d (needs `ffmpeg`, `ffprobe`, `curl` and a network) **and**
+//! `KERF_FATE=1`: an `--ignored` run that is not asking for the network (CI's parity job runs every ignored test)
+//! skips it with a message. Run with
 //!
 //! ```text
-//! cargo test -p kerf-gpu --no-default-features --test fate_corpus -- --ignored --nocapture
+//! KERF_FATE=1 cargo test -p kerf-gpu --no-default-features --test fate_corpus -- --ignored --nocapture
 //! ```
 //!
 //! (`KERF_FFMPEG` / `KERF_FFPROBE` for another build.) No adapter is needed: this is the read side only.
@@ -27,7 +29,7 @@
 use std::fmt::Write as _;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -37,11 +39,16 @@ use kerf_core::{
 };
 use kerf_gpu::{decode_layer, Compositor, CursorConfig, FrameSource, FrameSourceConfig, Hint, YuvFrame};
 
+#[path = "common/child.rs"]
+mod child;
+
 const BASE: &str = "https://fate-suite.ffmpeg.org/";
 
-/// How long one file may take in all, probe to cursor. The decode kills a child after 30 s itself, so a file past
-/// this is a hang in our code (or a machine that is not keeping up: run it again alone).
-const BOUND: Duration = Duration::from_secs(240);
+/// How long one file may take in all, probe to cursor: more than its stages may take one after the other, each of which
+/// is bounded in its own right (`ffprobe` 300 s; the one-shot decode 30 s at three times; the frame source 30 s at three
+/// times and two probes of 20 s; the cursor 30 s to its first frame and 15 s for each of six more: 640 s), so a file past
+/// this is a hang in a stage whose bound did not hold.
+const BOUND: Duration = Duration::from_secs(900);
 
 /// The sample files: path under the suite's root, and what is odd about it.
 const SAMPLES: &[(&str, &str)] = &[
@@ -52,6 +59,7 @@ const SAMPLES: &[(&str, &str)] = &[
     ),
     ("vp9-test-vectors/vp91-2-04-yuv444.webm", "4:4:4 8 bit"),
     ("vp9-test-vectors/vp91-2-04-yuv422.webm", "4:2:2 8 bit"),
+    ("vp9-test-vectors/vp91-2-04-yuv440.webm", "4:4:0 8 bit"),
     ("vp9-test-vectors/vp93-2-20-10bit-yuv422.webm", "4:2:2 10 bit"),
     (
         "vp9-test-vectors/vp90-2-05-resize.ivf",
@@ -62,14 +70,17 @@ const SAMPLES: &[(&str, &str)] = &[
         "h264/reinit-large_420_8-to-small_420_8.h264",
         "the stream restarts at another size",
     ),
-    ("prores/gray.mov", "gray ProRes"),
+    ("prores/gray.mov", "ProRes 4:2:2 10 bit, a gray picture"),
     ("prores/prores4444_with_transparency.mov", "ProRes 4444 with alpha"),
-    ("vp8_alpha/vp8_video_with_alpha.webm", "VP8 with an alpha plane"),
+    (
+        "vp8_alpha/vp8_video_with_alpha.webm",
+        "VP8 with an alpha plane (probes as plain yuv420p)",
+    ),
     ("mov/displaymatrix.mov", "a display matrix (rotated by a tag)"),
     ("mov/moviedispmat.mp4", "a display matrix in an mp4"),
     ("mov/mov_neg_first_pts_discard.mov", "the first timestamp is below zero"),
     ("jpg/Landscape_5.jpg", "a JPEG (yuvj, EXIF orientation)"),
-    ("jpg/12bpp.jpg", "a 12 bit JPEG"),
+    ("jpg/12bpp.jpg", "a 12 bpp JPEG, probed as gray16le"),
     ("png1/lena-rgba.png", "a PNG with alpha"),
     ("png1/lena-gray8.png", "a gray PNG"),
     ("dv/dvcprohd_1080i50.mov", "interlaced DVCPRO HD"),
@@ -115,24 +126,25 @@ fn fetch(rel: &str) -> PathBuf {
         path.file_name().unwrap().to_string_lossy()
     ));
     // The proxy of a sandbox or a flaky link cuts a transfer short now and then (curl 18): a few tries.
-    let mut last = String::new();
+    let (mut done, mut last) = (false, String::new());
     for _ in 0..4 {
-        let out = Command::new("curl")
-            .args(["--fail", "--silent", "--show-error", "--location", "--proto", "=https"])
+        let mut curl = Command::new("curl");
+        curl.args(["--fail", "--silent", "--show-error", "--location"])
+            .args(["--proto", "=https", "--proto-redir", "=https"])
             .args(["--connect-timeout", "30", "--max-time", "300", "--output"])
             .arg(&part)
-            .arg(format!("{BASE}{rel}"))
-            .stdin(Stdio::null())
-            .output()
-            .expect("run curl");
-        if out.status.success() && part.metadata().is_ok_and(|m| m.len() > 0) {
-            last.clear();
-            break;
+            .arg(format!("{BASE}{rel}"));
+        match child::output_within(curl, Duration::from_secs(330)) {
+            Ok(out) if out.status.success() && part.metadata().is_ok_and(|m| m.len() > 0) => {
+                done = true;
+                break;
+            }
+            Ok(out) => last = format!("{}: {}", out.status, String::from_utf8_lossy(&out.stderr)),
+            Err(e) => last = format!("curl {e}"),
         }
-        last = String::from_utf8_lossy(&out.stderr).into_owned();
         let _ = std::fs::remove_file(&part);
     }
-    assert!(last.is_empty(), "download {BASE}{rel}: {last}");
+    assert!(done, "download {BASE}{rel} failed: {last}");
     std::fs::rename(&part, &path).unwrap();
     path
 }
@@ -484,11 +496,9 @@ fn bounded(path: &Path) -> Outcome {
 }
 
 fn ffmpeg_version() -> String {
-    let out = Command::new(kerf_core::ffmpeg_path())
-        .arg("-version")
-        .stdin(Stdio::null())
-        .output()
-        .expect("run ffmpeg");
+    let mut cmd = Command::new(kerf_core::ffmpeg_path());
+    cmd.arg("-version");
+    let out = child::output_within(cmd, Duration::from_secs(60)).expect("ffmpeg -version");
     String::from_utf8_lossy(&out.stdout)
         .lines()
         .next()
@@ -497,8 +507,12 @@ fn ffmpeg_version() -> String {
 }
 
 #[test]
-#[ignore = "needs ffmpeg, ffprobe, curl and a network"]
+#[ignore = "needs ffmpeg, ffprobe, curl, a network and KERF_FATE=1"]
 fn every_fate_sample_decodes_at_the_probed_size_or_fails_with_an_error() {
+    if std::env::var("KERF_FATE").as_deref() != Ok("1") {
+        eprintln!("skipped: this downloads about 8 MB from {BASE} into target/fate-suite/; set KERF_FATE=1 to run it");
+        return;
+    }
     let mut files: Vec<(PathBuf, String)> = SAMPLES.iter().map(|(rel, what)| (fetch(rel), (*what).to_string())).collect();
     for (rel, keep) in TRUNCATED {
         let name = Path::new(rel).file_name().unwrap().to_string_lossy().into_owned();
@@ -639,4 +653,19 @@ fn a_cut_file_keeps_its_head_and_loses_a_few_bytes_of_the_cut() {
     assert_eq!(bytes.len(), 493);
     assert!(bytes.iter().enumerate().all(|(i, b)| *b == (i % 256) as u8));
     assert_eq!(cut.parent().unwrap().file_name().unwrap(), "truncated");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_child_that_outlasts_its_time_is_killed_and_an_error() {
+    let started = Instant::now();
+    let mut slow = Command::new("sleep");
+    slow.arg("30");
+    let err = child::output_within(slow, Duration::from_millis(200)).unwrap_err();
+    assert!(err.contains("killed"), "{err}");
+    assert!(started.elapsed() < Duration::from_secs(10), "{:?}", started.elapsed());
+    let mut quick = Command::new("echo");
+    quick.arg("hi");
+    let out = child::output_within(quick, Duration::from_secs(30)).unwrap();
+    assert!(out.status.success() && out.stdout.starts_with(b"hi"), "{out:?}");
 }
