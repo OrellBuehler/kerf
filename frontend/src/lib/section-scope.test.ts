@@ -88,3 +88,21 @@ describe('the title text section commits to the title and text a field took focu
 		expect(convert).not.toMatch(/convertTitleText\(o\.id/);
 	});
 });
+
+describe('the custom SVG source box applies to the title it was applied on', () => {
+	const fn = body(code(read(`${EDITOR}Inspector.svelte`)), 'applySource');
+
+	test('the result is shown only while that title is still selected, after the await and in the catch', () => {
+		const wait = fn.indexOf('await applySvgSource(o.id, draft)');
+		expect(wait).toBeGreaterThan(0);
+		const after = fn.slice(wait);
+		const guard = 'svgTitle?.id !== o.id';
+		const first = after.indexOf(guard);
+		expect(first, 'after the await').toBeGreaterThan(0);
+		expect(first).toBeLessThan(after.indexOf('sourceWarnings = check.warnings'));
+		expect(first).toBeLessThan(after.indexOf('draft = check.svg'));
+		const caught = after.slice(after.indexOf('catch (e)'));
+		expect(caught.indexOf(guard), 'in the catch').toBeGreaterThan(0);
+		expect(caught.indexOf(guard)).toBeLessThan(caught.indexOf('sourceError ='));
+	});
+});

@@ -506,10 +506,14 @@
 		sourceError = null;
 		try {
 			const check = await applySvgSource(o.id, draft);
+			// The selection may have moved to another title while this one was applied: the box, the warnings and
+			// the run length are now that title's, and its draft is its own.
+			if (svgTitle?.id !== o.id) return;
 			sourceWarnings = check.warnings;
 			sourceRuns = check.natural_duration;
 			draft = check.svg;
 		} catch (e) {
+			if (svgTitle?.id !== o.id) return report(new Error(`${svgDisplayName(o)}: ${e instanceof Error ? e.message : String(e)}`));
 			sourceError = e instanceof Error ? e.message : String(e);
 			sourceWarnings = [];
 		} finally {
