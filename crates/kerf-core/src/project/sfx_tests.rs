@@ -1067,7 +1067,8 @@ fn suggestions_are_placements_add_sound_effects_takes_as_they_are() {
             SfxSource::Transition,
             SfxSource::Marker
         ],
-        "{suggestions:#?}"
+        "{:?}",
+        suggestions.iter().map(|s| &s.reason).collect::<Vec<_>>()
     );
     assert_eq!(project.history().unwrap().len(), history, "asking is a read: no revision");
 
