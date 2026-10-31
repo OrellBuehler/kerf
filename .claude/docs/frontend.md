@@ -101,12 +101,12 @@ editor-grade workspace under `src/lib/components/editor/` — bespoke atoms (`Bt
 and `StatusBar` as fixed chrome around a **dockable workspace** (`Workspace.svelte`, composed by
 `routes/+page.svelte`). The workspace is `dockview` (the vanilla package; its
 `--dv-*` variables are mapped onto Kerf tokens in `styles/dockview-kerf.css` so
-it follows the theme) hosting nine panels — `LibraryPanel`, `Preview`, `Timeline`,
-`Inspector`, `AgentPanel`, `DeliverPanel`, `Mixer`, `Scopes`, `DopeSheet` (*Keyframes*) — each a Svelte component
+it follows the theme) hosting ten panels — `LibraryPanel`, `Preview`, `Timeline`,
+`Inspector`, `AgentPanel`, `DeliverPanel`, `Mixer`, `SoundFx`, `Scopes`, `DopeSheet` (*Keyframes*) — each a Svelte component
 `mount`ed into a dockview content element, so every panel is resizable by its
 sash, movable by its tab (drop zones on any group edge, or tabbed into a group)
 and closable; the **Window** menu reopens one (the library left of the
-preview, the deliver panel and the mixer right of it, the rest beside the active
+preview, the deliver panel, the mixer and the Sound FX panel right of it, the rest beside the active
 group) or resets the workspace. **Workspaces** — Edit / Color / Audio / Motion / Deliver,
 toggle buttons in the **title bar** (`WorkspaceTabs`, the centre of a three-column
 grid so they stay on the centre line; `aria-pressed`, since there is no tabpanel
@@ -156,17 +156,17 @@ and leaves none. **A stored layout is a snapshot, so each one is stored with the
 panels its preset offered when it was saved** (`offered`, written by
 `withLayout`; `readWorkspaces` / `adoptPanels` bring each one up to the preset of
 the running build as it is read). A panel the preset opens now that the layout was
-never offered and does not hold is new to it — the mixer in Audio, which a layout
-saved before it would otherwise never get — and `insertPanel` (`layout.ts`, pure)
+never offered and does not hold is new to it — the mixer in Audio, and later the Sound FX panel (tabbed with the mixer, so
+the picture and the full-width timeline keep their room), which a layout saved before them would otherwise never get — and `insertPanel` (`layout.ts`, pure)
 puts it where the preset does, reliably and in order: tabbed with the panels it
 shares a group with in the preset; else in a group of its own beside the nearest
 panel it sits next to there, taking the share the preset gives it out of that row
 (only when the row runs the same way); else as a tab beside the preview. A layout
-is never reset to make room, a notice says what was added (`describeAdopted`), and
+is never reset to make room, a notice says what was added (`describeAdopted`: `Audio workspace gained the Sound FX panel`; two at once are `the Mixer and Sound FX panels`), and
 the result is written back once. A panel the layout *was* offered and lacks was
 closed by the user and stays closed. A layout stored before the record is taken to
 have been offered `UNSTAMPED_OFFERED` (the presets of that time: all but the
-mixer); if it is only a copy of today's preset — the build that wrote every
+mixer and the Sound FX panel); if it is only a copy of today's preset — the build that wrote every
 workspace the user merely visited left one for each — or of the earlier Audio
 preset (`EARLIER_PRESETS`, checked with `sameArrangement`), it is dropped and the
 workspace is its preset, today's. **Reset workspace** (`workspace.reset()`,
@@ -1594,7 +1594,7 @@ clip's level / fade-in / effects / keys and the last one's fade-out (`Composed.r
 the core's words. `getBandBalance` picks its windows as `project/music.rs` does and words its
 `notes` as `balance_notes` (`band-balance.ts`) but the measurement itself is made up (in a browser it takes
 ~0.6 s and honours Stop; under bun it is at once). `api-compose.test.ts` drives the bridge.
-**Sound effects bridge** (`api.ts`; the Sound FX panel itself is separate). `sfxCatalogue()` → `SfxPreset[]`, `previewSoundEffect(spec)` →
+**Sound effects bridge** (`api.ts`; the panel that uses it is *Sound FX panel*, below). `sfxCatalogue()` → `SfxPreset[]`, `previewSoundEffect(spec)` →
 the **bytes of the WAV** for `decodeAudioData` (the CSP has no `media-src` and there is no asset protocol; `null` in the harness, which
 synthesizes nothing), `addSoundEffects(placements, ripple?)` → `{clips, timeline}`, `updateSoundEffect(clipId, spec, volumeDb?, ripple?)` →
 `{clip, timeline}` (the **whole** spec: what it leaves out is back at its default) and `suggestSoundEffects(request?)` → `SfxSuggestion[]`
@@ -1922,3 +1922,67 @@ decode: one request in flight, the newest playhead and cut asked for once it lan
 paused and every 2 s while playing, nothing while the panel is hidden. Colours are the `--scope-*` tokens (derived from
 the theme's bases in `kerf-tokens.css`; the parade's blue is the theme's own `blue-500`), resolved again on a theme
 change. The harness answers colour bars (`harnessScopes`).
+
+## Sound FX panel
+
+`SoundFx.svelte`, dock id `sfx`, title **Sound FX** (minimum 300 × 220), a tab of the mixer's group in the Audio preset (a layout saved
+before it is given it there by the same migration as the mixer; `UNSTAMPED_OFFERED` leaves it out) and in the Window menu. Its state is the
+singleton `sfxPanel` (`sfx-panel.svelte.ts`: the catalogue, search and category, the picked kind and its draft spec, gain, the audition, the
+auto-design list and its ticks) because a workspace switch rebuilds the panel. The catalogue is read **once, from `onMount`** (never an
+`$effect`: reading it reads and writes the state an effect would track, and a failing backend would be asked again for ever); `load()` shares
+the read in flight and a failed read waits for **Try again** or the next press of `sfx.add`. A kind this build's table does not know is left
+out of the grid, shown with a plain glyph and sketch in a suggestion row, and in the Inspector is a sentence (it plays; it cannot be reshaped); the rules are `sfx-panel.ts` (pure, bun-tested), the sounds
+are `sfx.ts`'s catalogue and spec rules, the bridge is `api.ts`' (see *Sound effects bridge*).
+
+**Library.** A search (every word must be in the name, kind, category or description; Escape clears it) and `ChoiceChips` for All /
+Transitions / Impacts / Builds / UI / Textures over a grid of `SfxTile`s (a `Tile` made taller; the grid is a `role=listbox`, one tab stop,
+arrows / Home / End move focus by what is drawn per row — `gridStep`). A tile is a glyph (`SFX_GLYPHS`, an `icons.ts` key), the name and an
+envelope **sketch** (`sketchOf`: a mirrored path from a small per-kind envelope — nothing is rendered and nothing is random — with a
+dashed tick at the hit point, mirrored by Reverse), drawn in the category's theme token (`CATEGORY_HUES`). Click picks and auditions;
+Enter or a double-click adds at the playhead; a drag past 4 px (`beginDrag`, so Escape, `pointercancel`, a lost capture and a blur abandon
+it, and the click that ends it is not a pick) carries it onto the timeline: `ui.dndSfx` + `ui.dndPoint` (the bin's pointer drag, not
+HTML5 drag-and-drop) and `ui.sfxDropTarget`, set by `Timeline.svelte`, which draws a ghost over an **audio** lane only (`dropGhostFor`,
+`sfxSpan`'s rule: the clip starts earlier by how far in its hit is) with the hit snapped (`sfxDropHit`) to the playhead, a cut between
+pictures, a beat or bar, or a clip edge of the lane, and on release calls `sfxPanel.dropOn(trackId, at)` — one `addSoundEffects` with
+`track_id`. A video lane takes nothing (a notice says so). **Red** is a drop the core would refuse, and it is refused on release in words
+(`dropRefusal`, like the bin's) before the engine is asked: a hit too near the start, or — ripple off — any overlap; with **ripple on** an
+add pushes along the clips that start at or after its own start, so an effect that only runs into the front of a clip is drawn as a
+drop that *pushes the clips after it*, and only one that starts *inside* a clip is red (`sfx-panel.test.ts` holds the ghost to the
+harness's own rehearsal of the add, `planSoundEffects`, in both modes; the sync lock is not weighed, so pushing a clip that is linked to a
+picture can still be refused by the engine, in its words, as a toast). A panel in a window of its own does not drag at all
+(`popout.isDetached('sfx')`: its pointer is that window's, a drop would be read against the wrong lanes) — there a sound is added at the
+playhead; the click that ends a drag is not a pick (a flag cleared 60 ms later, so a cancelled pointer cannot leave it set).
+
+**Shape.** `SfxShape` (shared with the Inspector): Length (the kind's min..max), Pitch (±12 st), Intensity, Tail, optional Gain (dB),
+Reverse, Variation (`nextSeed`) — `SliderRow`s, so a drag is one change on release and Escape drops it. In the panel a change goes to the
+**draft** only; nothing is written to the cut until Add, and a released slider re-auditions. **Audition** (`previewSoundEffect` → the WAV's
+bytes → `Auditioner` in `sfx-audition.ts`: its own `AudioContext`, one sound at a time, a second press or a new sound stops the old, a
+newer render overtakes an older; the harness answers `null` and the panel says so quietly). The context is made and asked to run
+**synchronously from the press** (`Auditioner.prime`, before the render is awaited — a webview lets audio start only from a gesture, and
+a context first made after the await can stay suspended, so the first audition was silent); a `resume()` that is never answered is given
+up on after 750 ms with a toast instead of holding `rendering`, and the Inspector primes before its own write is awaited and **Add at playhead** live in a bar pinned
+under the panel's scroll, with the picked sound's length and changes (`shapeLine`) and the anchor note (`anchorNote`: which part lands on
+the playhead and how long before it the clip starts). `sfx.add` (keymap, unbound by default, `repeat: false`, also in the Edit menu) runs the same add — it waits for the catalogue
+if that is still being read, reads it again if that failed and says so (`addFromShortcut`) — and its key is in the button's tooltip. Add is off for `editor.locked` (an edit in flight or a proposal being previewed; the tooltip says which) and a
+refusal is a `Couldn't add the sound effect — …` toast (`PreviewReadOnly` a notice, `SFX_CANCELLED` silence). It adds through
+`editor.addSoundEffects` (`#apply`, then the bin is re-read **before** the cut shows the clips, so nothing points at an asset the bin lacks)
+and selects the placed clips; the toast offers Undo.
+
+**Auto sound design** (`SfxAuto`): density chips (Subtle / Balanced / Punchy, each saying what it counts) and a category, **Find moments**
+(`suggestSoundEffects`, a read; a newer find overtakes an older; off with nothing on the timeline and while a proposal is previewed,
+since moments are read from the live cut) → working (`ProgressBar`), error
+(`EmptyState` + Try again + a toast), empty (`nothingFoundLine`) or a list of rows (time as the user's timecode, kind glyph, kind, source,
+gain, the reason, a checkbox, and a jump button that seeks the playhead). Everything is ticked at first; All / None; **Add N effects** is
+one `addSoundEffects` with the ticked placements as the engine suggested them. A list belongs to the cut it was found on (`stampOf` of the
+current revision, path and load): after any edit it says *out of date*, is dimmed and cannot be added until found again; after an add it
+is cleared, says what was added, and focus goes to Find moments (the button it was on is gone).
+
+**Inspector.** A clip whose asset has `sound_effect` gets a *Sound effect* section (`SoundEffectSection`: the sketch, the same `SfxShape`
+without Gain — the level is the Volume section's — and Audition). A slider commits **one** `editor.updateSoundEffect(clipId, wholeSpec)` on
+release (a switch or Variation when pressed): the clip's asset is swapped in place, the hit, fades, effects and level stay, one
+`Edit sound effect` revision; the section is off while `editor.locked` (its switch and buttons are `pending`/`aria-disabled`, so they keep keyboard focus; `Switch` has the
+same `pending` as `Btn`), keeps its focus across the swap, and plays the result unless the cut is playing or the section has gone (the
+clip was deselected while the write was in flight). **Library.** The Audio tab has a *Sound effects* block whose button opens or shows the panel (`workspace.show('sfx')`).
+Tests: `sfx-panel.test.ts` (glyphs, sketches, filtering, grid keys, sliders, patching, placements, the drop ghost, auto-design rules),
+`sfx-audition.test.ts`, `sfx-panel-state.test.ts` (the catalogue read, the key, finding), `sfx-wiring.test.ts` (what is written and when), `layout.test.ts` / `workspaces.test.ts` (the preset, the migration
+and the notice).

@@ -13,6 +13,7 @@
 	import AgentPanel from './AgentPanel.svelte';
 	import DeliverPanel from './DeliverPanel.svelte';
 	import Mixer from './Mixer.svelte';
+	import SoundFx from './SoundFx.svelte';
 	import Scopes from './Scopes.svelte';
 	import DopeSheet from './DopeSheet.svelte';
 	import DockEmpty from './DockEmpty.svelte';
@@ -32,6 +33,7 @@
 		agent: AgentPanel,
 		deliver: DeliverPanel,
 		mixer: Mixer,
+		sfx: SoundFx,
 		scopes: Scopes,
 		keyframes: DopeSheet
 	};

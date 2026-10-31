@@ -54,6 +54,8 @@
 	import { trackHasSound } from '#lib/mixer-strips';
 	import { clampEdge, quantizeSpanStart, quantizeTime, splitPoint, startBefore, trimEdit } from '#lib/frames';
 	import { beginDrag } from '#lib/drag';
+	import { sfxPanel } from '#lib/sfx-panel.svelte';
+	import { dropGhostFor, dropRefusal, ghostLabel, sfxDropHit, type DropGhost, type SfxDrag } from '#lib/sfx-panel';
 	import { createAutoscroll, followScroll, liveEnd, type ScrollRegion } from '#lib/autoscroll';
 	import { magnetList, markAt, snapLines, type Magnet, type SnapLine } from '#lib/snap';
 	import { cutReadout, moveReadout, trimEdgeMonitor, trimEdgeReadout, trimLimitWhy } from '#lib/gesture-readout';
@@ -1151,7 +1153,7 @@
 			}
 		}
 		const drop = dropGhost;
-		if (drop) return snapLines([drop.start, drop.start + drop.dur], magnetsOn(drop.trackId, ''));
+		if (drop) return snapLines(drop.hit !== undefined ? [drop.hit] : [drop.start, drop.start + drop.dur], magnetsOn(drop.trackId, ''));
 		return [];
 	});
 
@@ -1817,7 +1819,7 @@
 	// The bin drags with pointer events (`ui.dndPoint`) and calls `ui.assetDropTarget` on release; the lane
 	// under the pointer is found by hit-testing, since the pointer stays over the bin's own element.
 
-	let dropGhost = $state<{ trackId: string; start: number; dur: number; ok: boolean } | null>(null);
+	let dropGhost = $state<{ trackId: string; start: number; dur: number; ok: boolean; hit?: number; label?: string; reason?: DropGhost['reason']; pushes?: boolean } | null>(null);
 
 	function dropStart(x: number, lane: HTMLElement, t: Track, dur: number): number {
 		return snapStart(laneTime(x, lane.getBoundingClientRect().left), t.id, '', dur);
@@ -1841,6 +1843,11 @@
 	$effect(() => {
 		const a = ui.dndAsset;
 		const p = ui.dndPoint;
+		const sfx = ui.dndSfx;
+		if (sfx && p) {
+			dropGhost = sfxGhostAt(sfx, p.x, p.y);
+			return;
+		}
 		const hit = a && p ? laneAt(p.x, p.y) : null;
 		if (!a || !p || !hit || a.kind !== hit.t.kind || hit.t.locked || editor.previewingStaged) {
 			dropGhost = null; // wrong-kind track: not a drop target
@@ -1875,6 +1882,71 @@
 		ui.assetDropTarget = onLaneDrop;
 		return () => {
 			if (ui.assetDropTarget === onLaneDrop) ui.assetDropTarget = null;
+		};
+	});
+
+	// ---- drop a sound effect from the Sound FX panel onto an audio track -------------------------------------
+	// The same pointer drag (`ui.dndSfx` / `ui.dndPoint`), but what lands is the sound's *hit*: it is put on the time under the
+	// pointer, snapped to the playhead, a cut of the picture, a beat or a clip edge, and the clip starts earlier by how far in its
+	// hit is. The lane's own clips are what it may not overlap; only an audio track takes it.
+
+	/** The time a sound's hit lands at for a pointer at `x` over `lane` (`sfxDropHit`): the nearest magnet within reach — the start,
+	 *  the playhead, a bar or beat, a cut between pictures, a clip edge of the lane — when snapping is on, else the nearest frame. */
+	function sfxHitAt(x: number, lane: HTMLElement, t: Track): number {
+		const time = laneTime(x, lane.getBoundingClientRect().left);
+		return sfxDropHit(time, {
+			fps,
+			snap: ui.snap,
+			playhead: ui.time,
+			grid: gridMagnets(time, [0], beatTimes, barTimes, 8 / pxPerSec),
+			cuts: editor.timeline.tracks.filter((k) => k.kind === 'video').flatMap((k) => cutsOf(k).map((c) => c.time)),
+			edges: clipEdges(t.id, ''),
+			threshold: 8 / pxPerSec
+		});
+	}
+
+	/** Where the sound dragged to (`x`, `y`) would land, and whether it may: only on an unlocked audio lane, and — with ripple off —
+	 *  not over another clip (with it on, the clips after it are pushed along, as the add itself does). Null off such a lane. */
+	function sfxGhostAt(s: SfxDrag, x: number, y: number): typeof dropGhost {
+		const hit = laneAt(x, y);
+		if (!hit || hit.t.kind !== 'audio' || hit.t.locked || editor.previewingStaged) return null;
+		const at = sfxHitAt(x, hit.lane, hit.t);
+		const others = hit.t.clips.map((c): [number, number] => [c.timeline_start, c.timeline_start + clipDuration(c)]);
+		const g = dropGhostFor(s, at, others, editor.rippleMode);
+		return { ...g, trackId: hit.t.id, hit: at, label: ghostLabel(s, g) };
+	}
+
+	function onSfxDrop(s: SfxDrag, x: number, y: number) {
+		dropGhost = null;
+		const hit = laneAt(x, y);
+		if (!hit) return;
+		if (hit.t.kind !== 'audio') {
+			toast.info('Drop a sound effect on an audio track');
+			return;
+		}
+		if (editor.previewingStaged) {
+			holdForPreview();
+			return;
+		}
+		if (hit.t.locked) {
+			toast.error(`Track ${hit.t.name} is locked`);
+			return;
+		}
+		// What the ghost showed is what is decided: a red one is refused here, in words, before anything is asked of the engine.
+		const g = sfxGhostAt(s, x, y);
+		if (!g) return;
+		const refusal = dropRefusal(g);
+		if (refusal) {
+			toast.error(refusal);
+			return;
+		}
+		void sfxPanel.dropOn(hit.t.id, g.hit ?? sfxHitAt(x, hit.lane, hit.t));
+	}
+
+	$effect(() => {
+		ui.sfxDropTarget = onSfxDrop;
+		return () => {
+			if (ui.sfxDropTarget === onSfxDrop) ui.sfxDropTarget = null;
 		};
 	});
 
@@ -3908,7 +3980,21 @@
 								: 'var(--red-500)'};border-radius:2px;background:{dropGhost.ok
 								? 'var(--selection-fill)'
 								: 'var(--danger-surface)'};pointer-events:none;z-index:25"
-						></div>
+						>
+							{#if dropGhost.hit !== undefined}
+								<span
+									style="position:absolute;left:{Math.max(0, (dropGhost.hit - dropGhost.start) * pxPerSec - 1)}px;top:0;bottom:0;width:2px;background:{dropGhost.ok
+										? 'var(--kerf-400)'
+										: 'var(--red-500)'}"
+								></span>
+								{#if dropGhost.label}
+									<span
+										style="position:absolute;left:5px;top:50%;transform:translateY(-50%);max-width:calc(100% - 10px);overflow:hidden;white-space:nowrap;text-overflow:ellipsis;font-size:var(--text-xs);font-weight:500;color:var(--text-primary)"
+										>{dropGhost.label}</span
+									>
+								{/if}
+							{/if}
+						</div>
 					{/if}
 				</div>
 			{/each}

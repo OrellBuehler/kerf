@@ -37,6 +37,7 @@ import { isLevelsCancelled, measureRange, type MeasureStamp } from './levels-vie
 import type { ExportDraft } from './export-draft';
 import type { VoiceoverPrefill } from './voiceover';
 import type { ComposePrefill } from './compose-form';
+import type { SfxDrag } from './sfx-panel';
 import type { TrimMonitor, TrimTool } from './trim-tools';
 import { ZOOM_DEFAULT, stepZoom } from './zoom';
 import { seekTime, stepPoint, type SeekOptions } from './frames';
@@ -99,6 +100,10 @@ class EditorUi {
 	/** The timeline's drop handler, set while one is mounted; the bin calls it on release. */
 	assetDropTarget: ((asset: { id: string; kind: 'video' | 'audio'; duration: number }, x: number, y: number) => void) | null =
 		null;
+	/** The sound effect being dragged out of the Sound FX panel, while a drag is in flight (it shares `dndPoint`). */
+	dndSfx = $state.raw<SfxDrag | null>(null);
+	/** The timeline's drop handler for it, set while one is mounted; the panel calls it on release. */
+	sfxDropTarget: ((drag: SfxDrag, x: number, y: number) => void) | null = null;
 	/** Whether an analysis pass is currently running. */
 	analyzing = $state(false);
 	/** The asset currently being analyzed (so the bin badges the right one). */

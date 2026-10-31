@@ -92,7 +92,30 @@ import {
 	CodeXml,
 	Orbit,
 	Ellipsis,
-	LayoutTemplate
+	LayoutTemplate,
+	Wind,
+	Feather,
+	ChevronsRight,
+	Zap,
+	Bomb,
+	Drum,
+	Hammer,
+	TrendingUp,
+	TrendingDown,
+	Rewind,
+	Sparkle,
+	MousePointerClick,
+	BellRing,
+	Bubbles,
+	Tv,
+	CassetteTape,
+	Disc3,
+	Camera,
+	HeartPulse,
+	Dices,
+	CircleStop,
+	WandSparkles,
+	Crosshair
 } from '@lucide/svelte';
 
 /* Keyed by the names the design uses (kebab or PascalCase, as authored). */
@@ -198,7 +221,31 @@ export const icons: Record<string, LucideIcon> = {
 	'code-xml': CodeXml,
 	// Motion templates: the library's kind of title, and the menu on a card.
 	'layout-template': LayoutTemplate,
-	'ellipsis': Ellipsis
+	'ellipsis': Ellipsis,
+	// Sound effects: one glyph for each kind (`sfx-panel.ts`), and the panel's own controls.
+	'wind': Wind,
+	'feather': Feather,
+	'chevrons-right': ChevronsRight,
+	'zap': Zap,
+	'bomb': Bomb,
+	'drum': Drum,
+	'hammer': Hammer,
+	'trending-up': TrendingUp,
+	'trending-down': TrendingDown,
+	'rewind': Rewind,
+	'sparkle': Sparkle,
+	'mouse-pointer-click': MousePointerClick,
+	'bell-ring': BellRing,
+	'bubbles': Bubbles,
+	'tv': Tv,
+	'cassette-tape': CassetteTape,
+	'disc-3': Disc3,
+	'camera': Camera,
+	'heart-pulse': HeartPulse,
+	'dices': Dices,
+	'circle-stop': CircleStop,
+	'wand-sparkles': WandSparkles,
+	'crosshair': Crosshair
 };
 
 export type IconName = keyof typeof icons;

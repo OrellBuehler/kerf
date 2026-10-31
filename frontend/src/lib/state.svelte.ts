@@ -140,6 +140,8 @@ import {
 	trimClip,
 	generateVoiceover,
 	composeMusic,
+	addSoundEffects,
+	updateSoundEffect,
 	separateStems,
 	undo as apiUndo
 } from './api';
@@ -207,7 +209,11 @@ import type {
 	VideoEffect,
 	VoiceoverRequest,
 	ComposeRequest,
-	ComposeResult
+	ComposeResult,
+	SfxAdded,
+	SfxPlacement,
+	SfxSpecInput,
+	SfxUpdated
 } from './types';
 import { clipDuration, GENERATED_ASSET } from './types';
 import { findTitle, type TitleRef } from './title-clips';
@@ -1625,6 +1631,38 @@ class EditorState {
 		} finally {
 			this.#busyCount--;
 		}
+	}
+	/**
+	 * Synthesize sound effects and put each with its hit on the time it names, on the first `FX` lane with room or the track
+	 * it names: one `Add sound effects` revision, then the placed clips are selected. A refusal names the effect and changes
+	 * nothing; a project replaced meanwhile rejects with `SFX_CANCELLED` (say nothing).
+	 */
+	async addSoundEffects(placements: SfxPlacement[]): Promise<SfxAdded> {
+		let added!: SfxAdded;
+		await this.#apply(async () => {
+			added = await addSoundEffects(placements);
+			// The renders are assets of the project now, and the clips refer to them: the bin hears of them before the
+			// cut shows the clips, so nothing on screen points at an asset it does not have.
+			await this.refreshAssets().catch(() => {});
+			return added.timeline;
+		});
+		this.selectClips(added.clips.map((c) => c.id), added.clips[0]?.id ?? null);
+		return added;
+	}
+	/**
+	 * Render the sound effect on `clipId` again from `spec` (the whole spec) and swap the clip's audio, keeping its place by the
+	 * hit, its fades and effects: one `Edit sound effect` revision. `volumeDb` sets the gain too.
+	 */
+	async updateSoundEffect(clipId: string, spec: SfxSpecInput, volumeDb?: number): Promise<SfxUpdated> {
+		let updated!: SfxUpdated;
+		await this.#apply(async () => {
+			updated = await updateSoundEffect(clipId, spec, volumeDb);
+			// The clip now plays the new render: the Inspector reads its asset, so it must be in the bin by the time the
+			// cut shows the swap, or the section would vanish and come back (and take the focus with it).
+			await this.refreshAssets().catch(() => {});
+			return updated.timeline;
+		});
+		return updated;
 	}
 	/**
 	 * Split an asset's sound into drums / bass / other / vocals (Demucs). The four stems join the
