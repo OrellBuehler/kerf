@@ -476,7 +476,8 @@
     `MIN_TEXT_PX` = 12, judged at the render size by `reasons`, not the size-free half: 3 to 11 px text is bitmaps sharing samples all along the line). With it both are drawn,
     and what the compositor cannot reproduce exactly (a tab, a glyph unit it cannot take apart) is refused by the render (`GpuError::Unsupported`), not the plan.
   - **Animated SVG titles** (`Timeline.svg_overlays`): resvg draws them and FFmpeg overlays the pictures, so no compositor pass draws one and
-    none ever will without a parity case. The `Planner` keeps their windows and `RenderPlan.svg` (`Vec<Uuid>`) names the ones on screen at a frame,
+    none ever will without a parity case (measured, not built: `gpu.md` "Animated SVG titles" — ffmpeg's own conversion of the PNG plus `overlay`'s arithmetic is
+    the overlay to the sample on both builds; what is missing is the plan carrying the picture and a compositor pass). The `Planner` keeps their windows and `RenderPlan.svg` (`Vec<Uuid>`) names the ones on screen at a frame,
     live like a text overlay (`start <= t < end` in a Still, `<= end` in Motion: the graph's `between`); `reasons` pushes **`Unsupported::Svg`**
     (`kind` `svg`, "an animated SVG title is on screen") for any plan that names one, whatever the caps, so the frame — and a `PlayCut` scan
     that reaches it — falls back to FFmpeg. The plan carries no geometry or artwork: nothing draws from it.

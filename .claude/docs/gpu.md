@@ -580,6 +580,19 @@ a text of over 160 characters, a tab, and a glyph unit that shapes into several 
 (`s->x` a double, a bitmap per quarter pixel, `ascent` and `text_h` ceilings of 26.6 values, the clip window above); 4.4.2's `drawbox color=red` writes 254 on `rgb24` (`tests/text.rs`
 `colours_parse_as_ffmpeg_reads_them` fails there for that alone, and not on 9.0.2).
 
+**Animated SVG titles (not drawn; what drawing one takes, measured).** ffmpeg never sees an SVG: `svg_layer.rs` draws each title with resvg into a straight-alpha RGBA PNG (`encode_frame_png`)
+and the graph `overlay`s it (`[cur][N:v]overlay=x:y`; an export adds `settb`/`setpts`, `eof_action=pass` and `enable='between(t,start,end)'`). The same resvg draws the same pixels in the compositor's
+process, so nothing of the artwork is a parity question. The rest is `overlay`'s: on a `yuv420p` composite it takes the picture as `yuva420p`, converted by an auto-inserted `scale`, and blends
+with `vf_overlay.c`'s `blend_plane` (identical in 4.4.2 and 9.0.2: `FAST_DIV255(d*(255-a) + s*a)` per sample, `a` the picture's alpha for luma and, for chroma, the 2x2 average
+`(a+a+a+a)>>2` — at the last chroma column or row `(alpha_v + alpha_h)>>1` of what there is). `tests/svg_overlay.rs` holds this to the real `overlay`: **the planes ffmpeg converts the PNG to inside a
+`-filter_complex` graph of the same build, blended with that arithmetic, are the overlay's output with 0 of 9216 samples differing, on 4.4.2 and 9.0.2** (four random pictures with every alpha, at (0,0) and two even offsets) — so a compositor
+needs no model of swscale (RGB to YUV coefficients, the 2:1 vertical chroma filter, the x86 kernels): as text asks ffmpeg for the glyph bitmaps, it asks for the planes of each picture (cached by its digest) and blends. The trap
+the test records: a *simple* graph (`-vf format=yuva420p`) converts differently on 4.4.2 (87 to 1472 of 9216 samples away; the complex graph's auto-inserted scaler is not the simple graph's there), so the conversion must be asked of a `-filter_complex` graph.
+What stands between this and a drawn title is plumbing, not exactness: `RenderPlan.svg` is only ids — the plan has to carry each picture's rectangle, opacity, the document's clock and which picture of the sequence the frame shows (`svg_layer::seq_of`'s
+`Layout`: Held or Frames, `first_picture`, `doc_t0`, Still against Motion windows); the layer path's `compose_exact` has to take an unscaled picture with an external alpha plane (`ComposeParams` is built from a layer's geometry, and an odd
+rectangle is the translucent-odd-layer case it already refuses); and a **title clip** is not an overlay but a clip chain (fit, fades and transitions on an alpha picture, then `overlay` over the lower tracks), which is the `alpha_picture` capability the ledger counts apart. T19's floating presets are
+full-frame, even rectangles (480 of its 690 refused frames); its title clips are the other 210.
+
 **The runtime self-test** (`selftest.rs`, `parity_self_test(&Arc<Gpu>)`). Parity is proven in CI on two FFmpeg
 builds and one software adapter; a user has a third FFmpeg and a real GPU, so the first use of the GPU path
 (the app: `app.md`) draws up to four small frames on the compositor and through that machine's own FFmpeg and holds
