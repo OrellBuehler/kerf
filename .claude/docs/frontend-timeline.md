@@ -471,7 +471,9 @@ ways (`windowRect` view -> box, `targetForRect` box -> view). Drag the body to s
 is kept *exactly*, not re-derived from a box widened to its 8 px minimum), drag an edge to
 zoom (the other edge stays put, even after the zoom was clamped), press the bare strip to jump
 there (and keep dragging), double-click to move the playhead. Gestures are absolute from the
-press, Escape restores the view, and the timeline applies the result like a wheel zoom
+press, Escape restores the view, the strip stays mounted while a gesture holds it (`held`; an edge
+dragged out can zoom the view to cover the cut, which would otherwise unmount it mid-drag), one that
+ends because the strip went (toggled off, an empty cut) stops without moving the view, and the timeline applies the result like a wheel zoom
 (`pendingScroll`). `rowLayout` always fits the strip (the gap gives first, then 1 px rows,
 then fractional rows), and the strip is `aria-hidden` on purpose: the timeline's own keys
 (scroll, zoom, ⇧Z, J/K/L) are the accessible path.
@@ -492,7 +494,9 @@ also parts from a waveform of its own colour. The top 14 px of a clip is the han
 alone and the line's travel stays below it; the edge strips and the line's grab band do
 not overlap; nothing is hit-testable until the clip is hovered or selected, nor under the
 razor, nor on a locked track (keyframes still seek). Every gesture is `drag.ts`'s
-`beginDrag` (pointer capture; Escape / cancel / lost capture / blur abandon), shows its
+`beginDrag` (pointer capture; Escape / cancel / lost capture / blur abandon — all heard on the **window**, filtered by `pointerId`,
+never on the element, so a gesture outlives the element it began on, and a component that can go while one is held keeps the
+returned function and calls it from `$effect(() => () => …)`; `drag.test.ts` scans `components/` for it), shows its
 value live (the waveform follows the volume line) and writes **one** edit on release,
 holding the live value until that edit settles. The ruler renders **in/out marks**
 (`I`/`O` set at the playhead, `⇧I`/`⇧O` clear) that drive range export. Transport is

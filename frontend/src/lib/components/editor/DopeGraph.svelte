@@ -80,6 +80,9 @@
 
 	type Drag = { seg: Segment; which: Handle; easing: Easing; moved: boolean };
 	let drag = $state<Drag | null>(null);
+	/** The drag in hand, if any: a component taken down mid-gesture gives it up rather than let it commit later. */
+	let releaseDrag: (() => void) | null = null;
+	$effect(() => () => releaseDrag?.());
 
 	/** The rows with the handle drag's ghost on the active one. */
 	const drawn = $derived.by((): DopeRow[] => {
@@ -119,7 +122,7 @@
 		const y0 = e.clientY;
 		let d: Drag = { seg, which, easing: seg.easing, moved: false };
 		drag = d;
-		beginDrag(e, {
+		releaseDrag = beginDrag(e, {
 			move(ev) {
 				if (!d.moved && Math.hypot(ev.clientX - x0, ev.clientY - y0) < TRAVEL_PX) return;
 				d = { ...d, moved: true, easing: dragHandle(seg, which, timeAt(axis, xIn(ev)), valueAt(v, yIn(ev))) };

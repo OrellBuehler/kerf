@@ -103,6 +103,9 @@
 	type Move = { kind: 'move'; clipId: string; base: KeyRef[]; grabbed: number; x0: number; moved: boolean; dt: number; alt: boolean };
 	type Marquee = { kind: 'marquee'; base: KeyRef[]; x0: number; y0: number; x1: number; y1: number; moved: boolean };
 	let gesture = $state<Move | Marquee | null>(null);
+	/** The drag in hand, if any: a component taken down mid-gesture gives it up rather than let it commit later. */
+	let releaseDrag: (() => void) | null = null;
+	$effect(() => () => releaseDrag?.());
 	/** A gesture's edit while it is being written: shown until it settles. */
 	let writing = $state.raw<{ clipId: string; edit: DopeEdit } | null>(null);
 
@@ -232,7 +235,7 @@
 		const c = clip;
 		let g: Move = { kind: 'move', clipId: c.id, base, grabbed: time, x0: xIn(e), moved: false, dt: 0, alt: e.altKey };
 		gesture = g;
-		beginDrag(e, {
+		releaseDrag = beginDrag(e, {
 			move(ev) {
 				const x = xIn(ev);
 				if (!g.moved && Math.abs(x - g.x0) < TRAVEL_PX) return;
@@ -275,7 +278,7 @@
 		const y0 = yIn(e);
 		let g: Marquee = { kind: 'marquee', base: additive ? live : [], x0, y0, x1: x0, y1: y0, moved: false };
 		gesture = g;
-		beginDrag(e, {
+		releaseDrag = beginDrag(e, {
 			move(ev) {
 				const x1 = xIn(ev);
 				const y1 = yIn(ev);
@@ -319,7 +322,7 @@
 		const was = ui.time;
 		const go = (ev: PointerEvent) => ui.seek(start + clampTime(timeAt(axis, xIn(ev))));
 		go(e);
-		beginDrag(e, {
+		releaseDrag = beginDrag(e, {
 			move: go,
 			commit() {},
 			abandon() {

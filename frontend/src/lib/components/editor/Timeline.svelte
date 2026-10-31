@@ -327,6 +327,9 @@
 		return () => ro.disconnect();
 	});
 
+	/** The overview strip has a gesture in hand: it stays mounted even if the view it makes takes in the whole cut. */
+	let minimapHeld = $state(false);
+
 	$effect(() => {
 		ui.timelineView = { start: scrollX / pxPerSec, end: (scrollX + viewW) / pxPerSec };
 	});
@@ -3087,7 +3090,7 @@
 	     buttons and the zoom / fit / shuttle keys, and the playhead's follow) — a
 	     second focusable widget with partial parity would be more to learn than
 	     to use. Its toggle in the toolbar stays labelled. -->
-	{#if ui.minimap && hasClips && !viewCoversCut({ scrollLeft: scrollX, viewW, pxPerSec }, editor.duration)}
+	{#if ui.minimap && hasClips && (minimapHeld || !viewCoversCut({ scrollLeft: scrollX, viewW, pxPerSec }, editor.duration))}
 		<div
 			aria-hidden="true"
 			style="display:flex;flex:none;border-bottom:var(--line-width) solid var(--border-subtle);background:var(--surface-app)"
@@ -3106,6 +3109,7 @@
 				time={ui.time}
 				markIn={ui.markIn}
 				markOut={ui.markOut}
+				bind:held={minimapHeld}
 				onview={applyView}
 				onseek={(t) => ui.seek(t)}
 			/>

@@ -76,6 +76,9 @@
 	/** The keys while a drag moves one (its ghost), with the axes it began on — held, so the graph does not
 	 *  rescale under the pointer; `null` between gestures. */
 	let drag = $state.raw<{ keys: SpeedKey[]; span: number; range: [number, number] } | null>(null);
+	/** The drag in hand, if any: a component taken down mid-gesture gives it up rather than let it commit later. */
+	let releaseDrag: (() => void) | null = null;
+	$effect(() => () => releaseDrag?.());
 
 	const stored = $derived(keysOf(clip));
 	const ramped = $derived(stored.length > 0);
@@ -127,7 +130,7 @@
 		const held = { span, range };
 		const [x0, y0] = [e.clientX, e.clientY];
 		let moved = false;
-		beginDrag(e, {
+		releaseDrag = beginDrag(e, {
 			move(ev) {
 				if (!moved && Math.hypot(ev.clientX - x0, ev.clientY - y0) < TRAVEL_PX) return;
 				moved = true;
