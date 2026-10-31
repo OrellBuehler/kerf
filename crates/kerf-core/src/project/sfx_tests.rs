@@ -6,7 +6,10 @@
 
 use super::linked_tests::{asset, stream};
 use super::*;
-use crate::model::{sfx_anchor_s, EditSource, SfxKind, SfxSpec};
+use crate::model::{
+    sfx_anchor_s, AssetAnalysis, EditSource, SfxDensity, SfxKind, SfxSource, SfxSpec, SfxSuggestRequest, TranscriptSegment,
+    Transition, TransitionKind, Word,
+};
 
 fn spec(kind: SfxKind) -> SfxSpec {
     SfxSpec::new(kind)
@@ -801,6 +804,229 @@ fn sound_effects_are_rendered_probed_placed_and_reshaped_for_real() {
         "the hit stayed on 12 s: {new:?}"
     );
     for asset in project.list_assets().unwrap() {
+        std::fs::remove_file(&asset.path).ok();
+    }
+}
+
+// ---- suggestions -----------------------------------------------------------------------------
+
+/// A project cut from three 60 s shots on V1 (a cut at 5 s, a dissolve into the third at 12 s), a title, and
+/// markers: one on a riser too close to the start of the timeline and one for a pop.
+fn suggesting_project() -> Project {
+    let project = Project::open_in_memory().unwrap();
+    let make = |name: &str| {
+        let mut a = asset(
+            &format!("/{name}.mp4"),
+            60.0,
+            vec![stream(StreamKind::Video), stream(StreamKind::Audio)],
+        );
+        a.name = format!("{name}.mp4");
+        project.insert_asset(&a).unwrap();
+        a
+    };
+    let (a, b, c) = (make("interview"), make("broll"), make("outro"));
+    project.add_clip_to_timeline(a.id, None, 0.0, 5.0, Some(0.0)).unwrap();
+    project.add_clip_to_timeline(b.id, None, 0.0, 7.0, Some(5.0)).unwrap();
+    let third = project.add_clip_to_timeline(c.id, None, 0.0, 8.0, Some(12.0)).unwrap();
+    project
+        .set_transition(
+            third.id,
+            Some(Transition {
+                kind: TransitionKind::Crossfade,
+                duration: 1.0,
+            }),
+        )
+        .unwrap();
+    project.add_overlay("Jane Doe".to_string(), 6.0, 9.0).unwrap();
+    project.add_marker(0.01, "sfx:riser".to_string(), None).unwrap();
+    project.add_marker(16.0, "sfx:pop".to_string(), None).unwrap();
+    project
+}
+
+fn punchy() -> SfxSuggestRequest {
+    SfxSuggestRequest {
+        density: SfxDensity::Punchy,
+        ..SfxSuggestRequest::default()
+    }
+}
+
+#[test]
+fn suggestions_are_placements_add_sound_effects_takes_as_they_are() {
+    let project = suggesting_project();
+    let history = project.history().unwrap().len();
+    let suggestions = project.suggest_sound_effects(&punchy()).unwrap();
+    let sources: Vec<SfxSource> = suggestions.iter().map(|s| s.source).collect();
+    assert_eq!(
+        sources,
+        [
+            SfxSource::Opening,
+            SfxSource::Cut,
+            SfxSource::Title,
+            SfxSource::Transition,
+            SfxSource::Marker
+        ],
+        "{suggestions:#?}"
+    );
+    assert_eq!(project.history().unwrap().len(), history, "asking is a read: no revision");
+
+    // Every placement is accepted on the same timeline, whatever lanes they have to spread over, with
+    // ripple on or off.
+    let placements: Vec<SfxPlacement> = suggestions.iter().map(|s| s.placement.clone()).collect();
+    for ripple in [false, true] {
+        project
+            .with_ripple(Some(ripple), |p| p.sound_effects_inputs(&placements))
+            .unwrap_or_else(|e| panic!("ripple {ripple}: {e}"));
+    }
+    let clips = add(&project, &placements).unwrap();
+    assert_eq!(clips.len(), suggestions.len());
+    for (clip, s) in clips.iter().zip(&suggestions) {
+        let asset = project.get_asset(clip.asset_id).unwrap().unwrap();
+        let hit = clip.source_to_timeline(sfx_anchor_s(asset.sound_effect.as_ref().unwrap(), asset.duration));
+        assert!((hit - s.placement.at).abs() < 1e-9, "{s:?} landed at {hit}");
+    }
+    assert_eq!(labels(&project).last().unwrap(), "Add sound effects");
+
+    // What is covered now is not suggested again.
+    let timeline = project.working_timeline().unwrap();
+    let covered: Vec<(f64, f64)> = timeline
+        .tracks
+        .iter()
+        .flat_map(|t| t.clips.iter())
+        .filter(|c| {
+            project
+                .get_asset(c.asset_id)
+                .unwrap()
+                .is_some_and(|a| a.sound_effect.is_some())
+        })
+        .map(|c| (c.timeline_start, c.timeline_end()))
+        .collect();
+    assert_eq!(covered.len(), clips.len());
+    let again = project.suggest_sound_effects(&punchy()).unwrap();
+    for s in &again {
+        assert!(
+            covered
+                .iter()
+                .all(|&(start, end)| s.placement.at < start - 0.25 || s.placement.at > end + 0.25),
+            "{s:?} is already covered"
+        );
+    }
+    assert!(again.len() < suggestions.len());
+    // ... and the second batch places too.
+    if !again.is_empty() {
+        add(&project, &again.iter().map(|s| s.placement.clone()).collect::<Vec<_>>()).unwrap();
+    }
+}
+
+#[test]
+fn a_riser_marker_too_close_to_the_start_is_not_suggested_and_one_with_room_is() {
+    let project = suggesting_project();
+    let times: Vec<(SfxKind, f64)> = project
+        .suggest_sound_effects(&punchy())
+        .unwrap()
+        .iter()
+        .map(|s| (s.placement.spec.kind, s.placement.at))
+        .collect();
+    assert!(!times.contains(&(SfxKind::Riser, 0.01)), "{times:?}");
+    assert!(
+        project.sound_effects_inputs(&[at(SfxKind::Riser, 0.01)]).is_err(),
+        "and the placement would refuse it"
+    );
+    project.add_marker(0.5, "sfx:riser".to_string(), None).unwrap();
+    let suggestions = project.suggest_sound_effects(&punchy()).unwrap();
+    let placements: Vec<SfxPlacement> = suggestions.iter().map(|s| s.placement.clone()).collect();
+    assert!(placements.iter().any(|p| p.spec.kind == SfxKind::Riser && p.at == 0.5));
+    let clips = add(&project, &placements).unwrap();
+    let riser = clips
+        .iter()
+        .find(|c| c.timeline_start == 0.0 && c.source_in > 0.0)
+        .expect("the riser is cut at 0");
+    assert!((riser.duration() - 0.5).abs() < 1e-9, "{riser:?}");
+}
+
+#[test]
+fn suggestions_read_the_working_timeline_and_the_cached_transcript() {
+    let mut project = suggesting_project();
+    let timeline = project.timeline().unwrap();
+    let interview = project.get_asset(timeline.tracks[0].clips[0].asset_id).unwrap().unwrap();
+    let words = vec![
+        Word {
+            text: " and".to_string(),
+            start: 4.6,
+            end: 4.8,
+            ..Word::default()
+        },
+        Word {
+            text: " then".to_string(),
+            start: 4.85,
+            end: 5.3,
+            ..Word::default()
+        },
+    ];
+    project
+        .set_analysis(&AssetAnalysis {
+            asset_id: interview.id,
+            transcript: vec![TranscriptSegment {
+                start: 4.6,
+                end: 5.3,
+                text: "and then".to_string(),
+                words,
+                speaker: None,
+            }],
+            ..AssetAnalysis::default()
+        })
+        .unwrap();
+    let gain_at = |project: &Project, t: f64| {
+        project
+            .suggest_sound_effects(&punchy())
+            .unwrap()
+            .into_iter()
+            .find(|s| s.placement.at == t)
+            .map(|s| s.placement.volume_db)
+    };
+    assert_eq!(gain_at(&project, 5.0), Some(Some(-8.0)), "the cut at 5 s is under the voice");
+    assert_eq!(gain_at(&project, 16.0), Some(Some(-3.0)));
+
+    // An agent's staged cut is what an agent is suggested for; the live cut is what the user is.
+    project.set_actor(EditSource::Agent);
+    let outro = project
+        .list_assets()
+        .unwrap()
+        .into_iter()
+        .find(|a| a.name == "outro.mp4")
+        .unwrap();
+    project.add_clip_to_timeline(outro.id, None, 20.0, 30.0, Some(20.0)).unwrap();
+    project.add_marker(22.0, "sfx:ding".to_string(), None).unwrap();
+    let staged: Vec<f64> = project
+        .suggest_sound_effects(&punchy())
+        .unwrap()
+        .iter()
+        .map(|s| s.placement.at)
+        .collect();
+    assert!(staged.contains(&20.0) && staged.contains(&22.0), "{staged:?}");
+    project.set_actor(EditSource::User);
+    let live: Vec<f64> = project
+        .suggest_sound_effects(&punchy())
+        .unwrap()
+        .iter()
+        .map(|s| s.placement.at)
+        .collect();
+    assert!(!live.contains(&20.0) && !live.contains(&22.0), "{live:?}");
+}
+
+#[test]
+#[ignore = "renders with the real engine and probes with ffprobe"]
+fn suggested_effects_are_rendered_and_placed_for_real() {
+    let project = suggesting_project();
+    let suggestions = project.suggest_sound_effects(&punchy()).unwrap();
+    let placements: Vec<SfxPlacement> = suggestions.iter().map(|s| s.placement.clone()).collect();
+    let clips = project.add_sound_effects(&placements).unwrap();
+    assert_eq!(clips.len(), suggestions.len());
+    for (clip, s) in clips.iter().zip(&suggestions) {
+        let asset = project.get_asset(clip.asset_id).unwrap().unwrap();
+        let hit = clip.source_to_timeline(sfx_anchor_s(asset.sound_effect.as_ref().unwrap(), asset.duration));
+        assert!((hit - s.placement.at).abs() < 0.01, "{s:?} landed at {hit}");
+    }
+    for asset in project.list_assets().unwrap().iter().filter(|a| a.sound_effect.is_some()) {
         std::fs::remove_file(&asset.path).ok();
     }
 }

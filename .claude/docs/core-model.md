@@ -526,6 +526,37 @@
   scaled to (impacts 0, thud / punch −4 / −1, transitions −2.5 … −3, builds −3 … −4, UI −6 … −7, textures −2.5 … −6), set from the
   loudest 100 ms (RMS) and the momentary loudness (K-weighted, 400 ms) of each kind so they sit together in a mix and not by their peaks:
   boom and impact are the loudest, the sustained builds and passes a dB or two under them.
+- **Sound-effect suggestions** (`model/sfx_suggest.rs`, pure; `suggest_sound_effects(&SfxSuggestInputs, &SfxSuggestRequest) ->
+  Vec<SfxSuggestion>`, inputs resolved by `Project::suggest_sound_effects_inputs`). Each **moment** in the picture comes from one
+  `SfxSource` and has a score: `marker` 1.0 (a marker named `sfx:<kind>` — case, spaces and dashes forgiven, an unknown kind ignored —
+  or a bare `sfx`, an impact; **pinned**: never thinned away, it thins what is near it), `music_drop` 0.90–0.95 (a `Drop` section of a
+  composed score, read from `section_spans()`, through the clip's window and speed; analysed music — only audio classified `Music` ≥
+  0.5 — 0.55–0.85 at a 4-bar boundary where the mean chroma of the four bars either side is ≥ 0.25 apart, cosine; a **riser** of two
+  bars, 1.5–4 s and never longer than the time before it, ending on the moment, **and** an **impact** on it; no riser when under 1 s of
+  music precedes it, when the drop follows a `Build` (the build ends in its own riser) or when the score has a `Riser`/`Whoosh` hit
+  there, no impact where it has an `Impact`/`Dropout` hit), `opening` 0.80 (punchy only: an impact on the first picture), `title` 0.75
+  (text overlays that are not captions and last ≥ 0.3 s: **swipe** when centred at 60 % of the frame height or lower, else **pop**
+  up to 32 characters, else swipe; SVG overlays by preset — lower third swipes, typewriter types, word pop pops, other artwork by
+  where it sits; title clips by name), `transition` 0.70 (a swoosh as long as the transition, centred on it: a dissolve or motion
+  transition runs from the cut for `min(duration, both shots)`, a dip half either side), `punch_in` 0.65 (the same footage across a
+  cut with `review::scale_jump` ≥ `PUNCH_IN_SCALE`, neither clip keyed: a punch), `cut` ≤ 0.60 (0.35 + up to 0.15 by the shorter
+  shot's length over 1–5 s + 0.10 for a new shot — other footage, or a detected scene change between the windows; scene changes
+  inside one clip's window, 0.3 s clear of its edges, are cuts at ≤ 0.40). A cut is a join of two adjacent pictures on a video
+  track that is not a continuation of the same shot (`review`'s `head_source` / `tail_source` / `pace_gap`), not a title, and not
+  hidden by an opaque full-frame clip on a higher video track. **Density**: spacing subtle 4 s / balanced 2 s / punchy 1 s;
+  cuts and punch-ins need both shots ≥ 1.5 s at balanced and do not count at subtle. What cannot be suggested is dropped **before**
+  thinning so it holds nothing back: a moment within 0.25 s of an effect clip already on the timeline (an asset with `sound_effect`,
+  any track, its span widened — a riser ending there counts), a part with no kind the request's `categories` / `kinds` allow
+  (**each source has preferred kinds and fallbacks**: cut whoosh/swoosh, then swipe; transition swoosh, then whoosh/swipe; pop, then
+  bubble/click/ding; punch, then thud/impact; riser, then reverse swell; impact, then boom/thud/punch — so `kinds: ["swipe"]` turns
+  cuts into swipes, and `categories: ["impact"]` keeps the impact of a drop and loses its riser) and a part `add_sound_effects`
+  would refuse (`lands`: a head cut off at 0 must leave `MIN_SFX_CLIP_S`, shared with `span_for`). Thinning keeps markers, then the
+  highest scores (ties: earlier, then source order); at most `MAX_SFX_PER_CALL` effects survive. Survivors are in time order and
+  get the kind **alternating** within (source, part) and a **seed** that is the running index, so no two are one render; the gain is
+  −3 dB, **−8 dB** when a transcribed word of a clip that plays its own sound (not music, not an effect) is under the moment
+  (words ≤ 0.35 s apart are one stretch; 0.1 s slack). `range` (half-open) filters the answer of the **whole** cut, so a range holds
+  exactly what the whole call puts there. `at`, scores are rounded to the millisecond / 3 decimals. A property test (random
+  cuts, filters and ranges) pins sorted, spaced, valid, placeable, deterministic.
 - **Limits that keep a project loadable.** A clip's speed is `MIN_SPEED..=MAX_SPEED`
   (0.01×..100×, either sign; so is every key of a speed ramp) — `set_speed` and the ratio `set_speed_linked` hands each partner
   both hold it (the audio tempo is one `atempo` step per doubling). `Mask::normalized` maps a

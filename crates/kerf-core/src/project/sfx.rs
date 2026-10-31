@@ -12,12 +12,16 @@
 //!   [`Project::apply_sound_effect_update`]: the same effect rendered again from an edited spec
 //!   takes its clip's place with its **hit point** where it was.
 //! * **Audition.** [`Project::preview_sound_effect`]: a render and nothing else.
+//! * **Suggest.** [`Project::suggest_sound_effects_inputs`] (under the lock) → the pure
+//!   [`crate::model::suggest_sound_effects`]: where the working cut would take an effect, as placements
+//!   [`Project::add_sound_effects`] takes as they are. A read.
 //!
 //! A placement says where the effect's *hit* goes (`at`); the clip starts that much earlier
 //! ([`crate::model::sfx_anchor_s`]). Effects overlap often (a riser into an impact), so with no
 //! `track_id` each goes on the first audio lane named `FX`, `FX 2`, `FX 3`… where it fits, and a new
 //! lane is made when none does.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Deserializer, Serialize};
@@ -26,7 +30,10 @@ use uuid::Uuid;
 use super::{Project, SFX_TRACK};
 use crate::engine;
 use crate::error::{Error, Result};
-use crate::model::{sfx_anchor_s, Asset, Clip, SfxSpec, StreamKind, Timeline, Track};
+use crate::model::{
+    sfx_anchor_s, suggest_sound_effects, Asset, Clip, SfxSpec, SfxSuggestInputs, SfxSuggestRequest, SfxSuggestion, StreamKind,
+    Timeline, Track, MIN_SFX_CLIP_S,
+};
 
 fn invalid(msg: impl Into<String>) -> Error {
     Error::InvalidArgument(msg.into())
@@ -45,8 +52,6 @@ pub const MAX_SFX_PER_CALL: usize = 256;
 /// The quietest and the loudest a placement's gain may be, dB (the fader's range).
 pub const MIN_SFX_GAIN_DB: f64 = -60.0;
 pub const MAX_SFX_GAIN_DB: f64 = 12.0;
-/// The least of an effect that may be left on the timeline when its start is cut off at 0, seconds.
-const MIN_SFX_CLIP_S: f64 = 0.02;
 /// The fade a head cut off at the start of the timeline gets, so it does not click, seconds.
 const TRIM_FADE_S: f64 = 0.004;
 
@@ -517,5 +522,32 @@ impl Project {
         let update = self.update_sound_effect_inputs(clip_id, spec, volume_db)?;
         let asset = Self::synthesize_sound_effect(&update.spec, &|| false)?;
         self.apply_sound_effect_update(&asset, &update)
+    }
+
+    /// What suggesting sound effects reads, under the lock: the **working timeline** (an agent's staged
+    /// cut included, so it sees its own proposal), the assets and the cached analysis of the assets the
+    /// timeline uses. Nothing is analysed here; footage that has not been analysed simply suggests less.
+    pub fn suggest_sound_effects_inputs(&self) -> Result<SfxSuggestInputs> {
+        let timeline = self.working_timeline()?;
+        let mut analyses = HashMap::new();
+        for clip in timeline.tracks.iter().flat_map(|t| t.clips.iter()) {
+            if analyses.contains_key(&clip.asset_id) {
+                continue;
+            }
+            if let Some(analysis) = self.get_analysis(clip.asset_id)? {
+                analyses.insert(clip.asset_id, analysis);
+            }
+        }
+        Ok(SfxSuggestInputs {
+            assets: self.list_assets()?,
+            timeline,
+            analyses,
+        })
+    }
+
+    /// Suggest sound effects for the working cut ([`crate::model::suggest_sound_effects`]): a read, so
+    /// no revision. Each suggestion's placement is what [`Project::add_sound_effects`] takes.
+    pub fn suggest_sound_effects(&self, request: &SfxSuggestRequest) -> Result<Vec<SfxSuggestion>> {
+        suggest_sound_effects(&self.suggest_sound_effects_inputs()?, request)
     }
 }

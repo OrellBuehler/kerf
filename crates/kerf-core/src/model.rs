@@ -5390,7 +5390,12 @@ pub(crate) use score::{sample_song, style_shares};
 mod sfx;
 pub use sfx::{
     anchor_s as sfx_anchor_s, catalogue as sfx_catalogue, SfxAnchor, SfxCategory, SfxKind, SfxPreset, SfxSpec,
-    DEFAULT_SFX_INTENSITY, DEFAULT_SFX_TAIL, MAX_SFX_PITCH,
+    DEFAULT_SFX_INTENSITY, DEFAULT_SFX_TAIL, MAX_SFX_PITCH, MIN_SFX_CLIP_S,
+};
+
+mod sfx_suggest;
+pub use sfx_suggest::{
+    suggest as suggest_sound_effects, SfxDensity, SfxSource, SfxSuggestInputs, SfxSuggestRequest, SfxSuggestion,
 };
 
 mod music_fit;

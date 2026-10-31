@@ -532,6 +532,11 @@
   `preview_sound_effect(spec, cancel) -> PathBuf` is the audition: a render and no edit. `add_sound_effects` and `update_sound_effect`
   run the three steps for a caller that holds `&self` for the whole of it (tests, a local script); the surfaces render with the lock
   released. An `#[ignore]`d test drives the real engine and ffprobe end to end.
+  **Suggestions**: `suggest_sound_effects_inputs() -> SfxSuggestInputs` (under the lock: the **working timeline**, so an agent sees its
+  own proposal, every asset, and the cached `AssetAnalysis` of the assets the cut uses — scene changes, transcript words, music
+  structure; nothing is analysed) → pure `model::suggest_sound_effects(&inputs, &SfxSuggestRequest)`; `suggest_sound_effects(&req)`
+  does both. A read: no revision. Each `SfxSuggestion.placement` is an `SfxPlacement` as `add_sound_effects` takes it (no `track_id`:
+  the lanes allocate, so a riser and its impact land on `FX` and `FX 2`), and a test feeds them back. The rules are in `core-model.md`.
   `separate_stems_media(asset, progress, cancel)` (static, lock released) separates and
   probes the four stems; `place_stems(source, stems, clip?)` stores them (reusing
   imported ones) and, with a clip, lays each on a new audio track named after it at the

@@ -118,8 +118,8 @@ pub use model::{
     TagKeyCount, TagSummary, MAX_ASSET_TAGS, MAX_TAG_KEY, MAX_TAG_VALUE,
 };
 pub use model::{
-    sfx_anchor_s, sfx_catalogue, SfxAnchor, SfxCategory, SfxKind, SfxPreset, SfxSpec, DEFAULT_SFX_INTENSITY, DEFAULT_SFX_TAIL,
-    MAX_SFX_PITCH,
+    sfx_anchor_s, sfx_catalogue, suggest_sound_effects, SfxAnchor, SfxCategory, SfxDensity, SfxKind, SfxPreset, SfxSource,
+    SfxSpec, SfxSuggestInputs, SfxSuggestRequest, SfxSuggestion, DEFAULT_SFX_INTENSITY, DEFAULT_SFX_TAIL, MAX_SFX_PITCH,
 };
 pub use plan_caps::{DipWhy, EffectKinds, GpuCaps, GradeKinds, LayerRef, Unsupported};
 pub use plan_epoch::{bump_plan_epoch, plan_epoch};

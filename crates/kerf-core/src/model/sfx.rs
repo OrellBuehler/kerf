@@ -463,6 +463,8 @@ pub fn anchor_s(spec: &SfxSpec, rendered_len: f64) -> f64 {
     }
 }
 
+/// The least of an effect that may be left on the timeline when its start is cut off at 0, seconds.
+pub const MIN_SFX_CLIP_S: f64 = 0.02;
 /// The default `intensity`.
 pub const DEFAULT_SFX_INTENSITY: f64 = 0.7;
 /// The default `tail`.
