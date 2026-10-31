@@ -77,7 +77,9 @@
 	import { FieldEdits } from '#lib/field-edit';
 	import { tip } from '#lib/tip';
 	import ComposedMusic from './ComposedMusic.svelte';
+	import SoundEffectSection from './SoundEffectSection.svelte';
 	import { scoreTitle } from '#lib/music-score';
+	import { shapeSummary } from '#lib/sfx-panel';
 	import { titleName, titleOf } from '#lib/title-clips';
 	import { isOutlined, textForm } from '#lib/title-text';
 
@@ -1406,6 +1408,12 @@
 				if (c) void run(() => trimChecked(c.id, undefined, v));
 			})}
 			</InspectorSection>
+
+			{#if asset?.sound_effect}
+				<InspectorSection title="Sound effect" summary={shapeSummary(asset.sound_effect)} open>
+				<SoundEffectSection {asset} {clip} />
+				</InspectorSection>
+			{/if}
 
 			{#if asset?.music_score}
 				<InspectorSection title="Composed music" summary={scoreTitle(asset.music_score)} open>

@@ -668,6 +668,15 @@ const ACTION_LIST = [
 	},
 
 	{ id: 'marker.add', repeat: false, label: 'Add marker at playhead', group: 'markers', context: 'global', defaults: ['M'] },
+	{
+		id: 'sfx.add',
+		repeat: false,
+		label: 'Add sound effect at playhead',
+		group: 'edit',
+		context: 'global',
+		defaults: [],
+		hint: 'Adds the sound picked in the Sound FX panel, shaped as it is there, with its hit on the playhead.'
+	},
 	{ id: 'marker.prev', label: 'Previous marker', group: 'markers', context: 'global', defaults: [','] },
 	{ id: 'marker.next', label: 'Next marker', group: 'markers', context: 'global', defaults: ['.'] },
 	{

@@ -29,6 +29,7 @@
 	import { settings } from '#lib/settings.svelte';
 	import { mediaStatus } from '#lib/media-status.svelte';
 	import { workspace } from '#lib/workspace.svelte';
+	import { sfxPanel } from '#lib/sfx-panel.svelte';
 	import { resetAllWorkspacesAsked } from '#lib/workspace-actions';
 	import { popout } from '#lib/popout.svelte';
 	import { windows } from '#lib/windows.svelte';
@@ -700,6 +701,7 @@
 		},
 
 		'marker.add': () => void addMarker(),
+		'sfx.add': () => void sfxPanel.load().then(() => sfxPanel.addDraft()),
 		'marker.prev': () => ui.gotoMarker(-1),
 		'marker.next': () => ui.gotoMarker(1),
 		'review.prevChange': () => stepReview(-1),

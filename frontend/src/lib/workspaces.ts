@@ -248,7 +248,9 @@ export function describeAdopted(adopted: Adopted[]): { message: string; descript
 	const panels = (a: Adopted) => a.panels.map((p) => PANELS[p].title).join(' and ');
 	const one = adopted.length === 1;
 	return {
-		message: one ? `${title(adopted[0].workspace)} workspace gained the ${panels(adopted[0])} panel` : 'Workspaces gained new panels',
+		message: one
+			? `${title(adopted[0].workspace)} workspace gained the ${panels(adopted[0])} panel${adopted[0].panels.length > 1 ? 's' : ''}`
+			: 'Workspaces gained new panels',
 		description: `${one ? '' : `${adopted.map((a) => `${title(a.workspace)}: ${panels(a)}`).join('; ')}. `}New in this version, put where the default arrangement has ${one ? 'it' : 'them'}; the rest of your arrangement is kept. Resetting the workspace restores its default.`
 	};
 }
