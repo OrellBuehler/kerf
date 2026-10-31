@@ -2,6 +2,7 @@
 	// Agent: whether an AI agent may connect (the embedded MCP server), where, with what token, and whether its
 	// edits wait for the user's review. Every control writes through `setMcpSettings`; the listener restarts by
 	// itself when the address or the switch moves, and what comes back is what is in force.
+	import { composing } from '#lib/modal';
 	import SettingRow from './SettingRow.svelte';
 	import McpConnect from './McpConnect.svelte';
 	import Switch from './Switch.svelte';
@@ -204,7 +205,7 @@
 				type="text"
 				bind:value={addr}
 				oninput={() => (addrDirty = true)}
-				onkeydown={(e) => e.key === 'Enter' && void applyAddr()}
+				onkeydown={(e) => e.key === 'Enter' && !composing(e) && void applyAddr()}
 				placeholder="127.0.0.1:7777"
 				aria-label="Server address"
 				aria-invalid={problem ? 'true' : undefined}

@@ -5,6 +5,7 @@
 	// per keystroke. A change made while another edit runs keeps what was typed and is made when that edit is done.
 	// A custom title instead offers to be kept as a template. The
 	// artwork stays the engine's: nothing here edits the SVG, and a picture is shown only as an <img> data URL.
+	import { composing } from '#lib/modal';
 	import { untrack } from 'svelte';
 	import InspectorSection from './InspectorSection.svelte';
 	import Btn from './Btn.svelte';
@@ -209,7 +210,7 @@
 						oninput={noteTyped}
 						oncompositionend={noteTyped}
 						onblur={(e) => write(e.currentTarget, c)}
-						onkeydown={(e) => e.key === 'Enter' && write(e.currentTarget, c)}
+						onkeydown={(e) => e.key === 'Enter' && !composing(e) && write(e.currentTarget, c)}
 						style="{field};width:110px;font-family:var(--font-mono);text-align:right"
 					/>
 				{:else if c.kind === 'font'}

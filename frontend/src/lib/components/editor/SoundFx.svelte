@@ -8,6 +8,7 @@
 	// added without the controls going out of sight under the grid. Nothing reaches the cut until Add — a slider only moves
 	// the draft the audition renders. The state is `sfxPanel`'s (a workspace switch rebuilds this panel and must not lose
 	// the pick or a list of moments); the rules are `sfx-panel.ts`'s.
+	import { composing } from '#lib/modal';
 	import { onMount } from 'svelte';
 	import Btn from './Btn.svelte';
 	import IconBtn from './IconBtn.svelte';
@@ -76,7 +77,7 @@
 	}
 
 	function onSearchKey(e: KeyboardEvent) {
-		if (e.key === 'Escape' && sfxPanel.query) {
+		if (e.key === 'Escape' && !composing(e) && sfxPanel.query) {
 			e.preventDefault();
 			e.stopPropagation();
 			clearSearch();

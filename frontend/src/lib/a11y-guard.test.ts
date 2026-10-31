@@ -174,6 +174,20 @@ describe('the settings dialog’s chips are the shared chip', () => {
 		for (const state of ['aria-pressed', 'aria-checked', 'aria-current'])
 			expect(css, state).toContain(`.k-chip[${state}='true']`);
 	});
+
+	test('a chosen option that cannot be changed keeps its accent: the disabled look does not win over the checked one', () => {
+		const css = read('lib/styles/controls.css');
+		for (const state of ['aria-pressed', 'aria-checked']) {
+			expect(css, state).toContain(`.k-chip[${state}='true']:disabled`);
+			expect(css, state).toContain(`.k-chip[${state}='true'][aria-disabled='true']`);
+		}
+		const rule = /\.k-chip\[aria-pressed='true'\]:disabled,[\s\S]*?\{([^}]*)\}/.exec(css)![1];
+		expect(rule).toContain('var(--kerf-500)');
+	});
+
+	test('a busy button turns its loader icon', () => {
+		expect(read('lib/styles/controls.css')).toMatch(/\.k-btn\[aria-busy='true'\] > svg \{\s*animation: kerf-spin-kf/);
+	});
 });
 
 describe('the settings rail says where you are', () => {
@@ -241,9 +255,81 @@ describe('hit targets are 24 px at least', () => {
 });
 
 describe('a key that belongs to an input method is not ours', () => {
-	test('the dialog’s Escape, the agent composer’s Enter, the tag field and the shortcut search ask `composing` / `escapeCloses` first', () => {
+	/** The text of a handler: inline, or the body of the function of that name in the component's script. */
+	function handlerText(source: string, value: unknown): string {
+		const tag = Array.isArray(value) ? (value[0] as { expression?: Node }) : (value as { expression?: Node });
+		const expr = tag?.expression;
+		if (!expr) return '';
+		const text = source.slice(expr.start, expr.end);
+		if (expr.type !== 'Identifier') return text;
+		const at = new RegExp(`(?:function\\s+${text}\\b|(?:const|let)\\s+${text}\\s*=)`).exec(source);
+		if (!at) return '';
+		const open = source.indexOf('{', source.indexOf(')', at.index));
+		let depth = 0;
+		for (let i = open; i < source.length; i++) {
+			if (source[i] === '{') depth++;
+			else if (source[i] === '}' && --depth === 0) return source.slice(open, i + 1);
+		}
+		return source.slice(open);
+	}
+
+	/** The text fields of a component whose key handler acts on Enter or Escape without asking `composing(e)` first. */
+	function imeUnsafe(file: string): string[] {
+		return elements(file).flatMap(({ node, source, at }) => {
+			if (node.type !== 'RegularElement' || (node.name !== 'input' && node.name !== 'textarea')) return [];
+			return (node.attributes ?? [])
+				.filter((a) => a.type === 'Attribute' && /^on(keydown|keyup|keypress)$/.test(a.name))
+				.filter((a) => {
+					const text = handlerText(source, a.value);
+					return /['"](?:Enter|Escape)['"]/.test(text) && !/\bcomposing\(/.test(text);
+				})
+				.map(() => `${at}  <${node.name}> acts on Enter / Escape without \`composing(e)\``);
+		});
+	}
+
+	/** Files that still hold such a field, and how many: the count may fall, never rise. */
+	const IME_UNGUARDED_ALLOWED: Record<string, number> = {
+		'lib/components/editor/Timeline.svelte': 1,
+		'lib/components/editor/BehaviorsSection.svelte': 1
+	};
+
+	test('every text field that acts on Enter or Escape asks `composing` first', () => {
+		const offenders: string[] = [];
+		for (const file of svelteFiles) {
+			const found = imeUnsafe(file);
+			if (found.length > (IME_UNGUARDED_ALLOWED[file] ?? 0)) offenders.push(...found);
+		}
+		expect(offenders).toEqual([]);
+	});
+
+	test('the scan reads an inline handler and a named one, and sees a handler without the check', () => {
+		const unsafe = '<script>function onKey(e) { if (e.key === \'Enter\') go(); }</script>\n<input onkeydown={onKey} />';
+		const safe = '<script>function onKey(e) { if (composing(e)) return; if (e.key === \'Enter\') go(); }</script>\n<input onkeydown={onKey} />';
+		const inline = '<input onkeydown={(e) => e.key === \'Escape\' && clear()} />';
+		const fields = (source: string) => {
+			const out: string[] = [];
+			const walk = (n: unknown) => {
+				if (!n || typeof n !== 'object') return;
+				if (Array.isArray(n)) return n.forEach(walk);
+				const node = n as Node;
+				if (node.type === 'RegularElement' && node.name === 'input') {
+					const a = attr(node, 'onkeydown') as { value: unknown };
+					const text = handlerText(source, a.value);
+					if (/['"](?:Enter|Escape)['"]/.test(text) && !/\bcomposing\(/.test(text)) out.push('unsafe');
+				}
+				for (const k of Object.keys(node)) if (k !== 'parent') walk(node[k]);
+			};
+			walk(parse(source, { modern: true }).fragment);
+			return out;
+		};
+		expect(fields(unsafe)).toEqual(['unsafe']);
+		expect(fields(safe)).toEqual([]);
+		expect(fields(inline)).toEqual(['unsafe']);
+	});
+
+	test('the dialog’s Escape and the agent composer, tag field and shortcut search use the shared helpers', () => {
 		expect(read(`${EDITOR}Modal.svelte`)).toContain('escapeCloses(e)');
-		for (const f of ['AgentPanel', 'TagInput', 'KeyboardSettings']) {
+		for (const f of ['AgentPanel', 'TagInput', 'KeyboardSettings', 'SettingsDialog', 'SoundFx']) {
 			const src = read(`${EDITOR}${f}.svelte`);
 			expect(src, f).toContain('composing(e)');
 			expect(src, f).toContain("from '#lib/modal'");

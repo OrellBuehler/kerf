@@ -2,6 +2,7 @@
 	// Kerf's preferences, as a section rail and a panel — and a search box that turns the panel into every setting
 	// that answers it, grouped by section (`settings-index.ts` holds the words; each row hides itself unless the
 	// search lets it through). The sections are components of their own, so the next preference is a row.
+	import { composing } from '#lib/modal';
 	import { untrack } from 'svelte';
 	import Icon from './Icon.svelte';
 	import Modal from './Modal.svelte';
@@ -92,7 +93,7 @@
 					autocomplete="off"
 					onkeydown={(e) => {
 						// Escape clears the search first and closes the dialog only when there is none.
-						if (e.key === 'Escape' && query) {
+						if (e.key === 'Escape' && !composing(e) && query) {
 							e.stopPropagation();
 							clear();
 						}

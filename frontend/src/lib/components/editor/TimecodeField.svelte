@@ -4,6 +4,7 @@
 	// `1:00:00` a minute, `+15` fifteen frames on, `-1.00` a second back. Enter goes there; Escape, Tab
 	// or a click elsewhere leaves the playhead where it was. In seconds mode (`timeDisplay`) it reads and
 	// takes seconds (`12.5`, `0:12.5`, `1:05`), and `+15` / `-1.00` still move by frames.
+	import { composing } from '#lib/modal';
 	import { ui } from '#lib/editor-ui.svelte';
 	import { editor } from '#lib/state.svelte';
 	import { settings } from '#lib/settings.svelte';
@@ -67,6 +68,7 @@
 
 	function onkeydown(e: KeyboardEvent) {
 		fresh = false;
+		if (composing(e)) return;
 		if (e.key === 'Enter') {
 			e.preventDefault();
 			commit();

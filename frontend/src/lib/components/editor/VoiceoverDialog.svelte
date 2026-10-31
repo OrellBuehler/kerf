@@ -2,6 +2,7 @@
 	// Write a script, pick a voice, and Kerf speaks it onto the VO track — captions
 	// and all. The first use downloads the voice model, so the dialog says so up
 	// front and then names each stage as it runs.
+	import { composing } from '#lib/modal';
 	import { untrack } from 'svelte';
 	import Modal from './Modal.svelte';
 	import Btn from './Btn.svelte';
@@ -171,7 +172,7 @@
 				rows="7"
 				placeholder="Write what the voice should say. A blank line makes a longer pause."
 				onkeydown={(e) => {
-					if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) {
+					if (e.key === 'Enter' && (e.metaKey || e.ctrlKey) && !composing(e)) {
 						e.preventDefault();
 						void generate();
 					}

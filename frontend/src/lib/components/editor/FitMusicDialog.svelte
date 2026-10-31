@@ -3,6 +3,7 @@
 	// (`plan_music_fit`) — intro and ending kept, phrases repeated or dropped between — and this
 	// shows it before it is made: target against achieved length, the splices it takes and what is
 	// left over. Apply writes it as clips on the original file (`fit_music`), one revision.
+	import { composing } from '#lib/modal';
 	import { tick } from 'svelte';
 	import Modal from './Modal.svelte';
 	import Btn from './Btn.svelte';
@@ -138,7 +139,7 @@
 					aria-label="Length in seconds"
 					bind:value={customText}
 					onkeydown={(e) => {
-						if (e.key === 'Enter') {
+						if (e.key === 'Enter' && !composing(e)) {
 							e.preventDefault();
 							void apply();
 						}

@@ -12,6 +12,7 @@
 	// `onLive` hears the value while a drag or a run of keys goes on, and `null` once its write has landed, it
 	// was abandoned or the row went away mid-gesture (an undo took its clip): the Inspector draws the frame of
 	// the gesture with it (the GPU preview's draft), as this row's (`owner`), so one row never clears another's.
+	import { composing } from '#lib/modal';
 	import type { Snippet } from 'svelte';
 	import MixSlider from './MixSlider.svelte';
 	import {
@@ -130,6 +131,7 @@
 		if (entry.kind === 'commit') void write(entry.value, from.scope);
 	}
 	function typed(e: KeyboardEvent & { currentTarget: HTMLInputElement }) {
+		if (composing(e)) return;
 		if (e.key === 'Enter') {
 			e.currentTarget.blur();
 		} else if (e.key === 'Escape' && dirty) {
