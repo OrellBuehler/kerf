@@ -2372,7 +2372,10 @@ fn the_ledger_says_which_refusals_hold_the_compositor_back() {
     let policy = composite_color_policy();
     // The caps the app asks with: the grade is drawn only where this FFmpeg's conversions are the model's (one probe).
     let kernels = kerf_gpu::grade::kernels();
-    let caps = Compositor::caps_for(kernels);
+    // ... and text whose glyph bitmaps share samples (a synthetic-bold border, a font under 12 px) only where this FFmpeg's
+    // `drawtext` lays text out in a way the compositor can take apart (one probe).
+    let layout = kerf_gpu::text::model();
+    let caps = Compositor::caps_with(kernels, layout);
     let mut cuts = vec![];
     // T1 to T8 are planned with the default export options; T9 and on say theirs (a ProRes file, a GIF, a scaler).
     let mut every: Vec<Archetype> = archetypes(media)
@@ -2403,12 +2406,12 @@ fn the_ledger_says_which_refusals_hold_the_compositor_back() {
         "kerf-gpu coverage ledger: the frames the compositor draws and what refuses the rest".to_string(),
         format!("ffmpeg: {version_line}"),
         format!("composite colour policy: {policy:?}"),
-        format!("grade kernels: {kernels:?} (caps: Compositor::caps_for(grade::kernels()), as the app asks)"),
+        format!("grade kernels: {kernels:?}; text layout: {layout:?} (caps: Compositor::caps_for(grade::kernels()) once text::model() has probed, as the app asks)"),
         "plans: every output frame of every archetype over OriginalMedia at 540 px wide (the app's preview plans ProxyMedia at 960); nothing is rendered".to_string(),
         "archetypes: the review's T1 to T3, the real-world T4 to T8 and T9 to T24, which between them use every feature the editor offers that still refuses (tests/coverage.rs)".to_string(),
     ];
     let mut text = render_ledger(&header, &cuts);
-    text.push_str(&unreached(&cuts, policy, kernels));
+    text.push_str(&unreached(&cuts, policy, kernels, layout));
     eprintln!("{text}");
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).parent().unwrap().join("parity");
     std::fs::create_dir_all(&dir).unwrap();
@@ -2557,7 +2560,12 @@ fn ordinal(u: &Unsupported) -> usize {
 
 /// Why no archetype can hit `kind` on this machine, when that is known: a refusal a compositor with `Compositor::CAPS` no longer
 /// makes, one nothing a user can build reaches, or one this FFmpeg's probes take out of play.
-fn why_unreached(kind: &str, policy: CompositeColorPolicy, kernels: Kernels) -> &'static str {
+fn why_unreached(
+    kind: &str,
+    policy: CompositeColorPolicy,
+    kernels: Kernels,
+    layout: Option<kerf_gpu::text::Model>,
+) -> &'static str {
     let negotiating = policy != CompositeColorPolicy::FixedBt601;
     match kind {
         "motion" | "fade" | "travel" | "tail" | "keyed_opacity" | "keyed_color" | "keyed_zoom" | "mask" | "text" => {
@@ -2581,13 +2589,19 @@ fn why_unreached(kind: &str, policy: CompositeColorPolicy, kernels: Kernels) -> 
         {
             "FixedBt601: this FFmpeg composites every stack as BT.601, so there is nothing to negotiate"
         }
+        "text_border" if layout.is_some() && regular_only_family().is_none() => {
+            "no installed font family without a bold face (drawn where one is: this FFmpeg's `drawtext` layout is one the compositor takes apart)"
+        }
+        "text_border" if layout.is_some() => {
+            "drawn: this FFmpeg's `drawtext` layout is one the compositor takes apart (text::model), so the bitmaps are blended in turn"
+        }
         "text_border" if regular_only_family().is_none() => "no installed font family without a bold face",
         _ => "no archetype builds it",
     }
 }
 
 /// (f) The `Unsupported` variants no archetype hit, so that what the ledger cannot measure is stated rather than silent.
-fn unreached(cuts: &[Cut], policy: CompositeColorPolicy, kernels: Kernels) -> String {
+fn unreached(cuts: &[Cut], policy: CompositeColorPolicy, kernels: Kernels, layout: Option<kerf_gpu::text::Model>) -> String {
     let hit: BTreeSet<&str> = cuts
         .iter()
         .flat_map(|cut| cut.frames.iter().flat_map(|(why, _)| why.iter().map(|r| r.variant)))
@@ -2604,7 +2618,7 @@ fn unreached(cuts: &[Cut], policy: CompositeColorPolicy, kernels: Kernels) -> St
         kinds.len() - missing.len()
     );
     for kind in missing {
-        let _ = writeln!(out, "  {kind:<28} {}", why_unreached(kind, policy, kernels));
+        let _ = writeln!(out, "  {kind:<28} {}", why_unreached(kind, policy, kernels, layout));
     }
     out
 }
@@ -2768,7 +2782,7 @@ fn the_ledger_lists_every_unsupported_variant_once() {
 #[test]
 fn a_variant_no_archetype_hits_is_listed_with_what_keeps_it_out_of_reach() {
     let cuts = [cut("T9  x", "still", &[(&[], 10), (&[("blend_mode", "")], 5)])];
-    let text = unreached(&cuts, CompositeColorPolicy::FixedBt601, Kernels::Match);
+    let text = unreached(&cuts, CompositeColorPolicy::FixedBt601, Kernels::Match, None);
     assert!(text.contains("(f)") && text.contains("1 hit"), "{text}");
     assert!(!text.contains("blend_mode "), "a variant that is hit is not listed:\n{text}");
     let line = |kind: &str| {
@@ -2780,7 +2794,7 @@ fn a_variant_no_archetype_hits_is_listed_with_what_keeps_it_out_of_reach() {
     assert!(line("mixed_matrices").contains("FixedBt601"), "{text}");
     assert!(line("grade ").contains("drawn"), "{text}");
     assert!(line("behavior").contains("no archetype builds it"), "{text}");
-    let negotiated = unreached(&cuts, CompositeColorPolicy::BottomLayerTag, Kernels::Differs("a LUT"));
+    let negotiated = unreached(&cuts, CompositeColorPolicy::BottomLayerTag, Kernels::Differs("a LUT"), None);
     let line = |kind: &str| {
         negotiated
             .lines()

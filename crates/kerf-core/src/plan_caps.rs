@@ -138,6 +138,13 @@ pub struct GpuCaps {
     /// rotated layer and on one below full opacity (`MaskWith`).
     pub mask: bool,
     pub text: bool,
+    /// Text drawn as the sequence of glyph bitmaps `drawtext` blends, each in turn, rather than as one mask
+    /// of their sum: what a synthetic-bold border and a font under [`MIN_TEXT_PX`] pixels need, since
+    /// their bitmaps share samples (and 2x2 chroma blocks), where blending the sum is not blending the
+    /// bitmaps. A compositor sets it only where it can take this build's `drawtext` apart (and then
+    /// refuses, per text, what it cannot reproduce exactly); without it the plan refuses
+    /// `TextBorder` and `TextTooSmall`. Needs `text`.
+    pub text_sequence: bool,
     pub reframe: bool,
     pub hdr: bool,
     pub effects: EffectKinds,
@@ -162,6 +169,7 @@ impl GpuCaps {
         keyed_color: false,
         mask: false,
         text: false,
+        text_sequence: false,
         reframe: false,
         hdr: false,
         effects: EffectKinds::NONE,

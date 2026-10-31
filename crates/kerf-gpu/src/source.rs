@@ -260,7 +260,18 @@ fn run_ffmpeg(args: &[String], cap: usize) -> Result<Vec<u8>, RunError> {
 
 /// Run `cmd`, capturing stdout up to `cap` bytes and a tail of stderr; kill the
 /// child when it writes more than `cap` or runs past `timeout`.
-pub(crate) fn run_child(mut cmd: std::process::Command, cap: usize, timeout: Duration) -> Result<Vec<u8>, RunError> {
+pub(crate) fn run_child(cmd: std::process::Command, cap: usize, timeout: Duration) -> Result<Vec<u8>, RunError> {
+    run_child_logged(cmd, cap, STDERR_CAP, timeout).map(|(stdout, _)| stdout)
+}
+
+/// [`run_child`] that also returns the child's stderr, up to `err_cap` bytes (what a `-loglevel debug`
+/// run is asked for).
+pub(crate) fn run_child_logged(
+    mut cmd: std::process::Command,
+    cap: usize,
+    err_cap: usize,
+    timeout: Duration,
+) -> Result<(Vec<u8>, Vec<u8>), RunError> {
     let bin = cmd.get_program().to_string_lossy().into_owned();
     let mut child = cmd
         .stdin(Stdio::null())
@@ -276,7 +287,7 @@ pub(crate) fn run_child(mut cmd: std::process::Command, cap: usize, timeout: Dur
     let overflow = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&overflow);
     let out = std::thread::spawn(move || read_capped(stdout, cap, Some(&flag)));
-    let err = std::thread::spawn(move || read_capped(stderr, STDERR_CAP, None));
+    let err = std::thread::spawn(move || read_capped(stderr, err_cap, None));
 
     let deadline = Instant::now() + timeout;
     let outcome = loop {
@@ -301,7 +312,7 @@ pub(crate) fn run_child(mut cmd: std::process::Command, cap: usize, timeout: Dur
     let stdout = out.join().unwrap_or_default();
     let stderr = err.join().unwrap_or_default();
     match outcome {
-        Ok(status) if status.success() && !overflow.load(Ordering::Relaxed) => Ok(stdout),
+        Ok(status) if status.success() && !overflow.load(Ordering::Relaxed) => Ok((stdout, stderr)),
         Ok(_) if overflow.load(Ordering::Relaxed) => Err(RunError::Overflow),
         Ok(status) => {
             let tail = String::from_utf8_lossy(&stderr);

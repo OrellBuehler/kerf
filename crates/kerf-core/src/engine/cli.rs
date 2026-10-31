@@ -9071,17 +9071,14 @@ fn audio_effect_filter(e: &AudioEffect, len: Option<f64>) -> String {
 /// argv at all ("nul byte found in provided data" — every preview and export would fail to spawn until
 /// the title was found and deleted) and the rest (ESC, the C1 block) draw as nothing useful.
 fn escape_drawtext(s: &str, expansion: bool) -> String {
+    escape_drawtext_with(s, expansion, false)
+}
+
+/// [`escape_drawtext`] that can keep line feeds as line breaks (`lines`), for the compositor's
+/// measuring graphs, which draw one prefix of a title per line.
+fn escape_drawtext_with(s: &str, expansion: bool, lines: bool) -> String {
     let blank = |c: char| matches!(c, ' ' | '\t');
-    let mut clean = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        match c {
-            '\r' if chars.peek() == Some(&'\n') => {}
-            '\n' | '\r' | '\u{2028}' | '\u{2029}' => clean.push(' '),
-            c if c.is_control() && !blank(c) => {}
-            c => clean.push(c),
-        }
-    }
+    let clean = clean_drawtext(s, lines);
     let expanded = if expansion {
         clean.replace('\\', "\\\\").replace('%', "\\%")
     } else {
@@ -9104,6 +9101,30 @@ fn escape_drawtext(s: &str, expansion: bool) -> String {
         }
     }
     option.replace('\'', "'\\''")
+}
+
+/// The text `drawtext` is given for `s`, before any escaping: what [`escape_drawtext`] keeps of it (a line
+/// break is a blank, or a break of its own with `lines`; control characters other than tab are dropped).
+fn clean_drawtext(s: &str, lines: bool) -> String {
+    let blank = |c: char| matches!(c, ' ' | '\t');
+    let mut clean = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\n' if lines => clean.push('\n'),
+            '\r' if chars.peek() == Some(&'\n') => {}
+            '\n' | '\r' | '\u{2028}' | '\u{2029}' => clean.push(' '),
+            c if c.is_control() && !blank(c) => {}
+            c => clean.push(c),
+        }
+    }
+    clean
+}
+
+/// The characters `drawtext` draws for an overlay's text, in order: the text the compositor measures
+/// and rasterises piece by piece ([`text_piece_filter`]).
+pub fn text_as_drawn(s: &str) -> String {
+    clean_drawtext(s, false)
 }
 
 /// [`escape_drawtext`] for `text=`.
@@ -9244,6 +9265,55 @@ pub fn text_still_filter(t: &crate::render_plan::PlanText, frame_h: u32) -> Stri
     format!("drawtext={}", parts.join(":"))
 }
 
+/// One piece of an overlay's `drawtext`, drawn on its own: a string of it, in colours of the caller's
+/// choosing. The compositor measures and rasterises text a piece at a time (the prefixes of a title, the
+/// glyph units of its dictionary) and reads what `drawtext` makes of each; the options are the overlay's
+/// own ([`TextLook`]: size, font, border, box) so a piece is laid out and drawn as the overlay is.
+#[derive(Debug, Clone, Copy)]
+pub struct TextPiece<'a> {
+    /// What to draw (cleaned and escaped here, [`text_as_drawn`]).
+    pub text: &'a str,
+    /// Keep line feeds in `text` as the line breaks they are (one prefix per line), rather than blanks.
+    pub lines: bool,
+    /// The glyphs' colour.
+    pub font: &'a str,
+    /// The border's colour, drawn only when the overlay has a synthetic-bold border.
+    pub border: Option<&'a str>,
+    /// A box behind the text: its colour and its `boxborderw`.
+    pub boxed: Option<(&'a str, u32)>,
+}
+
+/// The `drawtext` of `piece` in the look of the overlay `t` on a frame `frame_h` high, followed by
+/// `extra` options (the position, `y_align`, ...): `drawtext=<options>`, to put in a graph.
+pub fn text_piece_filter(t: &crate::render_plan::PlanText, frame_h: u32, piece: &TextPiece<'_>, extra: &[&str]) -> String {
+    let fontsize = (f64::from(frame_h) * t.size).round().max(1.0);
+    let mut parts = vec![
+        format!("text='{}'", escape_drawtext_with(piece.text, true, piece.lines)),
+        format!("fontsize={}", fnum(fontsize)),
+        format!("fontcolor={}", piece.font),
+    ];
+    if let Some(path) = t.font_file.as_deref() {
+        parts.push(format!("fontfile='{}'", escape_drawtext_path(&path.to_string_lossy())));
+    }
+    if let (true, Some(border)) = (t.synthetic_bold, piece.border) {
+        parts.push(format!("borderw={TEXT_BORDER_W}"));
+        parts.push(format!("bordercolor={border}"));
+    }
+    if let Some((colour, border)) = piece.boxed {
+        parts.push("box=1".to_string());
+        parts.push(format!("boxcolor={colour}"));
+        parts.push(format!("boxborderw={border}"));
+    }
+    parts.extend(extra.iter().map(|e| (*e).to_string()));
+    format!("drawtext={}", parts.join(":"))
+}
+
+/// The width of the border a synthetic-bold overlay draws, in pixels.
+pub const TEXT_BORDER_PX: u32 = TEXT_BORDER_W;
+
+/// The padding of the box behind an overlay's text, in pixels.
+pub const TEXT_BOX_PX: u32 = TEXT_BOX_BORDER_W;
+
 /// The parts [`text_raster_graph`] draws, in the order they are stacked in its one output picture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TextPart {
@@ -9275,8 +9345,9 @@ pub struct TextRasterGraph {
 /// the blend of 255 over 0 at coverage `m` is exactly `m` (a gray or YUV canvas would write 235 on
 /// an FFmpeg that ignores the range tag, as 6.1 does). What a part leaves out is drawn invisibly
 /// (`@0`), never omitted, so `drawtext` clips to the region the still does: its clip rectangle
-/// grows with the box and with the border. A synthetic-bold border is not a part: it is
-/// invisible here, and the plan refuses a frame that has one (`Unsupported::TextBorder`).
+/// grows with the box and with the border. A synthetic-bold border is part of the glyphs' picture,
+/// drawn white in the same pass `drawtext` draws it in; the compositor takes the picture of the passes
+/// as the check of the bitmaps it blends one by one, not as the mask it blends.
 pub fn text_raster_graph(t: &crate::render_plan::PlanText, size: (u32, u32)) -> TextRasterGraph {
     let (w, h) = size;
     let look = TextLook {
@@ -9297,11 +9368,11 @@ pub fn text_raster_graph(t: &crate::render_plan::PlanText, size: (u32, u32)) -> 
     let draws: Vec<String> = parts
         .iter()
         .map(|part| {
-            let (font, boxed) = match part {
-                TextPart::Glyphs => (SHOWN, HIDDEN),
-                TextPart::Box => (HIDDEN, SHOWN),
+            let (font, border, boxed) = match part {
+                TextPart::Glyphs => (SHOWN, SHOWN, HIDDEN),
+                TextPart::Box => (HIDDEN, HIDDEN, SHOWN),
             };
-            let options = look.options_coloured(f64::from(h), font, HIDDEN, Some(boxed));
+            let options = look.options_coloured(f64::from(h), font, border, Some(boxed));
             format!("drawtext={}:{at},extractplanes=r", options.join(":"))
         })
         .collect();
@@ -15425,6 +15496,51 @@ mod tests {
     }
 
     #[test]
+    fn a_piece_of_a_text_is_drawn_in_the_look_of_its_overlay() {
+        use crate::render_plan::PlanText;
+        let t = PlanText {
+            id: uuid::Uuid::nil(),
+            text: "ignored".into(),
+            size: 0.06,
+            pos: (0.5, 0.82),
+            alpha: 1.0,
+            color: "yellow".into(),
+            bg: None,
+            font_file: Some("/fonts/A b.ttf".into()),
+            synthetic_bold: true,
+        };
+        let piece = |text, lines, border, boxed| TextPiece {
+            text,
+            lines,
+            font: "white",
+            border,
+            boxed,
+        };
+        // The overlay's size, font and border; the piece's text and colours; then the caller's options.
+        assert_eq!(
+            text_piece_filter(&t, 960, &piece("a:b", false, Some("white@0"), None), &["x=0", "y=ascent"]),
+            "drawtext=text='a\\:b':fontsize=58:fontcolor=white:fontfile='/fonts/A b.ttf':borderw=2:bordercolor=white@0:x=0:y=ascent"
+        );
+        // The border is the overlay's: none to draw, none drawn, whatever the piece asks.
+        let mut plain = t.clone();
+        plain.synthetic_bold = false;
+        let f = text_piece_filter(&plain, 960, &piece("ab", false, Some("white"), None), &[]);
+        assert!(!f.contains("borderw"), "{f}");
+        let f = text_piece_filter(&t, 960, &piece("ab", false, None, None), &[]);
+        assert!(!f.contains("borderw"), "a piece may leave the border out: {f}");
+        let f = text_piece_filter(&t, 960, &piece("ab", false, None, Some(("white@0", 24))), &[]);
+        assert!(f.ends_with("box=1:boxcolor=white@0:boxborderw=24"), "{f}");
+        // A line break is a blank, unless the piece is lines (a prefix per line, as the measure asks).
+        let f = text_piece_filter(&t, 960, &piece("a\nab", false, None, None), &[]);
+        assert!(f.contains("text='a ab'"), "{f}");
+        let f = text_piece_filter(&t, 960, &piece("a\nab", true, None, None), &[]);
+        assert!(f.contains("text='a\nab'"), "{f}");
+        // ...and what `drawtext` draws of a text is what the escape keeps of it.
+        assert_eq!(text_as_drawn("a\r\nb\u{2028}c\u{7}d\te"), "a b cd\te");
+        assert_eq!(text_as_drawn("50% off: it's"), "50% off: it's", "escaping is not cleaning");
+    }
+
+    #[test]
     fn the_raster_graph_is_the_stills_drawtext_with_each_part_in_white() {
         use crate::render_plan::PlanText;
         let mut t = PlanText {
@@ -15458,7 +15574,7 @@ mod tests {
             "{still}"
         );
         // A box adds a part; what a part does not draw is invisible, not left out (drawtext's clip
-        // rectangle grows with the box and the border), a synthetic border included.
+        // rectangle grows with the box and the border). A synthetic border is part of the glyphs' picture.
         t.bg = Some("black@0.5".into());
         t.synthetic_bold = true;
         let full = text_raster_graph(&t, (540, 960));
@@ -15468,9 +15584,9 @@ mod tests {
             f.contains("split=2[a0][a1];") && f.ends_with("[p0][p1]vstack=inputs=2[o]"),
             "{f}"
         );
-        for (branch, font, boxed) in [("[a0]", "white", "white@0"), ("[a1]", "white@0", "white")] {
+        for (branch, font, border, boxed) in [("[a0]", "white", "white", "white@0"), ("[a1]", "white@0", "white@0", "white")] {
             let want = format!(
-                "fontcolor={font}:fontfile='/fonts/A b.ttf':borderw=2:bordercolor=white@0:box=1:boxcolor={boxed}:boxborderw=12:x="
+                "fontcolor={font}:fontfile='/fonts/A b.ttf':borderw=2:bordercolor={border}:box=1:boxcolor={boxed}:boxborderw=12:x="
             );
             let part = f.split(';').find(|p| p.starts_with(branch)).unwrap();
             assert!(part.contains(&want), "{part}");

@@ -1722,6 +1722,7 @@ mod tests {
             keyed_color: true,
             mask: true,
             text: true,
+            text_sequence: true,
             reframe: true,
             hdr: true,
             effects: EffectKinds::ALL,
@@ -1940,6 +1941,7 @@ mod tests {
             keyed_color: true,
             mask: true,
             text: true,
+            text_sequence: true,
             reframe: true,
             hdr: true,
             effects: EffectKinds::ALL,
@@ -2558,6 +2560,7 @@ mod tests {
             keyed_color: true,
             mask: true,
             text: true,
+            text_sequence: true,
             reframe: true,
             hdr: true,
             effects: EffectKinds::ALL,
@@ -2958,23 +2961,36 @@ mod tests {
             Some(std::path::Path::new("/kerf-test/fonts/PinnedSans-Regular.ttf"))
         );
         assert!(named.synthetic_bold);
-        // ...which a text pass cannot reproduce: the border's glyph bitmaps overlap and are blended in turn.
+        // ...which a text pass that blends one mask for the whole text cannot reproduce: the border's glyph bitmaps
+        // overlap and `drawtext` blends them in turn.
         let mut thick = export.at_frame(30).unwrap();
         thick.overlays[0] = named;
-        let drawn = GpuCaps {
+        let mask_only = GpuCaps {
             motion: true,
             text: true,
             ..GpuCaps::A0
         };
+        let sequence = GpuCaps {
+            text_sequence: true,
+            ..mask_only
+        };
         let size = thick.size(u32::MAX);
-        assert_eq!(thick.reasons(&drawn, size), vec![Unsupported::TextBorder]);
+        assert_eq!(thick.reasons(&mask_only, size), vec![Unsupported::TextBorder]);
         // ...and so is text whose glyph bitmaps share too many pixels: a font height under 12 px.
         let mut small = export.at_frame(30).unwrap();
         let (_, h) = small.size(u32::MAX);
         small.overlays[0].size = 11.4 / f64::from(h);
-        assert_eq!(small.reasons(&drawn, size), vec![Unsupported::TextTooSmall(11)]);
+        assert_eq!(small.reasons(&mask_only, size), vec![Unsupported::TextTooSmall(11)]);
         small.overlays[0].size = 11.6 / f64::from(h);
-        assert!(small.reasons(&drawn, size).is_empty());
+        assert!(small.reasons(&mask_only, size).is_empty());
+        // A compositor that blends the bitmaps in turn (`text_sequence`) draws the border (the small text stays refused).
+        assert!(
+            thick.reasons(&sequence, size).is_empty(),
+            "{:?}",
+            thick.reasons(&sequence, size)
+        );
+        small.overlays[0].size = 11.4 / f64::from(h);
+        assert_eq!(small.reasons(&sequence, size), vec![Unsupported::TextTooSmall(11)]);
     }
 
     #[test]

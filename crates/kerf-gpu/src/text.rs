@@ -2,15 +2,14 @@
 //!
 //! `drawtext` is layout (shaping, kerning, hinting, the quarter-pixel phase a glyph is rendered
 //! at) and a blend, and only the blend is arithmetic a shader can copy exactly. So the layout is
-//! never redone here: for each distinct overlay state one `ffmpeg` run draws the overlay's own
-//! `drawtext` on a black canvas **at the size and position the still draws it**
-//! ([`kerf_core::text_raster_graph`]) and its coverage comes back as 8-bit masks — one for the
-//! glyphs and one for the box — which are cached
-//! ([`TextAtlas`]) and blended by `text.wgsl` with `ff_blend_mask` / `ff_blend_rectangle`'s own
-//! integer arithmetic. The text is then exactly where the still has it, on whatever FFmpeg build
-//! this machine has (6.1 and 9.0 lay text out differently, and each is matched by itself).
+//! never redone here: FFmpeg's own `drawtext` is asked for the **bitmap of every glyph** (and of its
+//! synthetic-bold border) and for where each lands ([`seq`]), the overlay's box comes as a rectangle
+//! ([`rasterize`], [`kerf_core::text_raster_graph`]), and `text.wgsl` blends them with
+//! `ff_blend_mask` / `ff_blend_rectangle`'s own integer arithmetic, a bitmap at a time in
+//! `drawtext`'s order. The text is then exactly where the still has it, on whatever FFmpeg build this
+//! machine has (4.4 and 9.0 lay text out differently, and each is matched by itself).
 //!
-//! **What the blend is** (libavfilter `drawutils.c`, identical in 6.1.1 and 9.0.2):
+//! **What the blend is** (libavfilter `drawutils.c`, identical in 4.4.2, 6.1.1 and 9.0.2):
 //!
 //! * a plane sample `d` blends to `((K - a) * d + a * s) >> 24` with `K = 0x1010101`, `s` the
 //!   colour's component in that plane and `a` the blend's alpha;
@@ -24,15 +23,18 @@
 //!   is read with), limited range, `+ 0.5` and truncation; the alpha `(a * s) / 255` with `s` the
 //!   overlay's opacity `256 * alpha` truncated, or 255.
 //!
-//! Where it differs from FFmpeg, and by how much: `drawtext` blends **each glyph's bitmap in
-//! turn**, a mask here is the picture of all of them, so a pixel two glyph bitmaps both touch is
-//! one blend here and two there. For the glyphs themselves that is only rounding (kerned pairs of
-//! Latin text, opaque or translucent, are bit-identical on 6.1.1 and 9.0.2; the outlines of a
-//! missing glyph's box differ by a level at a sample or two), and it is why the **synthetic-bold
-//! border** is not drawn: neighbouring borders overlap along whole letter gaps, and a chroma sample
-//! that averages their sum instead of blending them in turn is up to 33 levels off. The plan
-//! refuses such a frame (`Unsupported::TextBorder`; it takes a named font with no bold face, and
-//! the shipped default has one).
+//! **Why a bitmap at a time**: `drawtext` blends **each glyph's bitmap in turn** — a synthetic-bold
+//! border's, every glyph's, and then every glyph's fill — and a pixel (or a 2x2 chroma block, where each
+//! bitmap's own average is blended) that two bitmaps touch is two blends there. One mask of their sum
+//! is one blend, and is the same only while no two meet: never along the letter gaps of a thickened
+//! bold (up to 33 levels of chroma off), never in 3 to 11 px text (up to 10), and at 12 px and up
+//! still a level or two at a sample here and there. The sequence is kept whole: [`Raster::sequence`]
+//! holds the bitmaps in order and [`Layers`] flattens them for the shader — per sample the coverage of
+//! each bitmap that touches it, in order, which is all a sample's blends depend on.
+//!
+//! Where this build's layout is not one [`seq`] can take apart ([`model`]), a text the plan still draws
+//! (no border, 12 px and up) is the one mask of the sum as before, `exact` false and counted by
+//! [`sum_fallbacks`]; the caps say so (`GpuCaps::text_sequence`) and the plan refuses the rest.
 //!
 //! **A frame with no layer** is drawn in RGB by FFmpeg (the black base goes to `drawtext` and on
 //! to the PNG without ever being YUV), so there the blend is on the RGB picture, three full
@@ -47,6 +49,10 @@ use kerf_core::{PlanText, TextPart, TextRasterGraph, YuvMatrix};
 
 use crate::gpu::GpuError;
 use crate::source::{run_child, RunError};
+
+mod seq;
+
+pub use seq::{measured_model, model, Model};
 
 /// How long one rasterisation may take before `ffmpeg` is killed: one frame of a black canvas is a
 /// few tens of milliseconds, and the caller may be holding the preview's render lock.
@@ -324,18 +330,18 @@ pub struct Rect {
     pub h: i32,
 }
 
-/// One part's coverage, trimmed to its bounding box: `data` is `w` x `h` bytes, row after row, and
-/// `(x, y)` is where its top left is on the canvas.
+/// A bitmap `drawtext` blends: coverage trimmed to its bounding box, `data` being `w` x `h` bytes, row
+/// after row, and `(x, y)` where its top left is on the canvas.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Coverage {
-    pub x: u32,
-    pub y: u32,
+pub struct Bitmap {
+    pub x: i32,
+    pub y: i32,
     pub w: u32,
     pub h: u32,
     pub data: Vec<u8>,
 }
 
-impl Coverage {
+impl Bitmap {
     /// The coverage at canvas pixel `(x, y)`; 0 outside the box.
     pub fn at(&self, x: i64, y: i64) -> u32 {
         let (dx, dy) = (x - i64::from(self.x), y - i64::from(self.y));
@@ -347,64 +353,86 @@ impl Coverage {
 
     fn rect(&self) -> Rect {
         Rect {
-            x: self.x as i32,
-            y: self.y as i32,
+            x: self.x,
+            y: self.y,
             w: self.w as i32,
             h: self.h as i32,
         }
     }
 }
 
-/// What `drawtext` drew for an overlay, as masks: see the module docs. Parts the overlay does not
-/// have, and parts that came out empty (nothing on the canvas), are `None`.
+/// What `drawtext` drew for an overlay: the bitmaps it blends for the glyphs, in the order it blends
+/// them, and the box. Parts the overlay does not have, and parts that came out empty (nothing on the
+/// canvas), are empty or `None`.
 pub struct Raster {
-    pub glyphs: Option<Coverage>,
+    /// The glyph bitmaps in `drawtext`'s order (a synthetic-bold border's, then the fill's), each
+    /// blended in turn: `exact`. Or, where this build's layout is not known ([`model`]) and the text
+    /// is one a single mask stands for, one bitmap of their sum.
+    pub sequence: Vec<Bitmap>,
+    /// `sequence` is `drawtext`'s own, bitmap for bitmap, rather than the sum of them.
+    pub exact: bool,
     /// The box: where `drawtext` filled one on the canvas.
     pub boxed: Option<Rect>,
-    /// The masks as textures, made by the first frame that draws them.
+    /// `sequence` as layers for the shader, made by the first frame that draws it.
+    layers: OnceLock<Option<Layers>>,
+    /// The layers as textures, made by the first frame that draws them.
     pub(crate) uploaded: OnceLock<UploadedMasks>,
 }
 
 impl std::fmt::Debug for Raster {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Raster")
-            .field("glyphs", &self.glyphs.as_ref().map(Coverage::rect))
+            .field("bitmaps", &self.sequence.len())
+            .field("exact", &self.exact)
             .field("boxed", &self.boxed)
             .finish_non_exhaustive()
     }
 }
 
-/// A mask on the GPU.
-pub(crate) struct UploadedMask {
-    pub(crate) view: wgpu::TextureView,
-    _texture: wgpu::Texture,
+/// One group of up to four layers of glyph coverage on the GPU: the coverage of the first, second,
+/// third, fourth bitmap to touch each sample, in `RGBA`.
+pub(crate) struct UploadedPass {
+    pub(crate) luma: wgpu::TextureView,
+    pub(crate) chroma: wgpu::TextureView,
+    _textures: [wgpu::Texture; 2],
 }
 
+/// The glyph bitmaps of an overlay as the shader reads them ([`Layers`]).
 pub(crate) struct UploadedMasks {
-    pub(crate) glyphs: Option<UploadedMask>,
-}
-
-impl UploadedMask {
-    pub(crate) fn new(texture: wgpu::Texture) -> Self {
-        Self {
-            view: texture.create_view(&wgpu::TextureViewDescriptor::default()),
-            _texture: texture,
-        }
-    }
+    /// The luma region on the canvas: `x`, `y` (even), `w`, `h`.
+    pub(crate) region: [i32; 4],
+    pub(crate) passes: Vec<UploadedPass>,
 }
 
 impl Raster {
-    /// What it holds, for the atlas's budget.
-    fn bytes(&self) -> usize {
-        std::mem::size_of::<Self>() + self.glyphs.iter().map(|c| c.data.len() * 2).sum::<usize>()
+    /// The glyph bitmaps as the shader reads them on a `w` x `h` canvas; `None` when there are none.
+    /// Refused if some sample is touched by more bitmaps than [`MAX_LAYERS`].
+    pub fn layers(&self, w: u32, h: u32) -> Result<Option<&Layers>, GpuError> {
+        if self.sequence.is_empty() {
+            return Ok(None);
+        }
+        match self.layers.get_or_init(|| Layers::of(&self.sequence, w, h)) {
+            Some(layers) => Ok(Some(layers)),
+            None => Err(GpuError::Unsupported(format!(
+                "a text with over {MAX_LAYERS} glyph bitmaps on one sample"
+            ))),
+        }
     }
 
-    /// The masks cut out of `parts` (each `w` x `h`, in the order `graph.parts` names).
+    /// What it holds, for the atlas's budget.
+    fn bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.sequence.iter().map(|b| b.data.len() * 3 + 64).sum::<usize>()
+    }
+
+    /// The masks cut out of `parts` (each `w` x `h`, in the order `graph.parts` names): the glyphs'
+    /// picture as one bitmap (`exact` is false until a sequence replaces it) and the box.
     fn from_parts(graph: &TextRasterGraph, planes: &[u8]) -> Result<Self, GpuError> {
         let (w, h) = (graph.size.0 as usize, graph.size.1 as usize);
         let mut raster = Raster {
-            glyphs: None,
+            sequence: Vec::new(),
+            exact: false,
             boxed: None,
+            layers: OnceLock::new(),
             uploaded: OnceLock::new(),
         };
         for (part, plane) in graph.parts.iter().zip(planes.chunks_exact(w * h)) {
@@ -418,13 +446,13 @@ impl Raster {
                     for row in y0..y1 {
                         data.extend_from_slice(&plane[row * w + x0..row * w + x1]);
                     }
-                    raster.glyphs = Some(Coverage {
-                        x: x0 as u32,
-                        y: y0 as u32,
+                    raster.sequence = vec![Bitmap {
+                        x: x0 as i32,
+                        y: y0 as i32,
                         w: bw as u32,
                         h: bh as u32,
                         data,
-                    });
+                    }];
                 }
                 TextPart::Box => {
                     // A box is a rectangle of full coverage; anything else is not what this reads.
@@ -442,6 +470,141 @@ impl Raster {
             }
         }
         Ok(raster)
+    }
+}
+
+/// The glyph bitmaps flattened for the shader. The blend of a bitmap is arithmetic on the sample it
+/// lands on, so the bitmaps that touch one sample must be blended in order there — and only there:
+/// per sample, the coverage of each bitmap that touches it, in order; per 2x2 block of a 4:2:0 chroma
+/// plane, the average (`sum >> 2`) of each bitmap's own four samples, in order. The shader blends the
+/// layers one after the other, a bitmap's zero coverage being no change at all.
+pub struct Layers {
+    /// The region of the canvas the layers cover: `x`, `y` even, `w` x `h` luma samples.
+    pub region: [i32; 4],
+    /// Four layers to a pass: luma `w * h * 4` bytes, chroma `ceil(w / 2) * ceil(h / 2) * 4`.
+    pub passes: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+/// The most layers a sample may carry before the text is refused: eight passes of four.
+pub const MAX_LAYERS: usize = 32;
+
+impl Layers {
+    /// The layers of `sequence` on a `w` x `h` canvas; `None` if it is empty or too deep.
+    pub fn of(sequence: &[Bitmap], w: u32, h: u32) -> Option<Layers> {
+        let region = touched_by(sequence, w, h)?;
+        let (rx, ry) = (region.0 as i32, region.1 as i32);
+        let (rw, rh) = ((region.2 - region.0) as usize, (region.3 - region.1) as usize);
+        let (cw, ch) = (rw.div_ceil(2), rh.div_ceil(2));
+        let mut luma_depth = vec![0u8; rw * rh];
+        let mut luma: Vec<Vec<u8>> = Vec::new();
+        let mut chroma_depth = vec![0u8; cw * ch];
+        let mut chroma: Vec<Vec<u8>> = Vec::new();
+        for b in sequence {
+            for row in 0..b.h as i32 {
+                for col in 0..b.w as i32 {
+                    let v = b.data[(row as usize) * b.w as usize + col as usize];
+                    if v == 0 {
+                        continue;
+                    }
+                    let i = ((b.y + row - ry) as usize) * rw + (b.x + col - rx) as usize;
+                    let l = luma_depth[i] as usize;
+                    luma_depth[i] += 1;
+                    if l >= MAX_LAYERS {
+                        return None;
+                    }
+                    if luma.len() <= l {
+                        luma.push(vec![0; rw * rh]);
+                    }
+                    luma[l][i] = v;
+                }
+            }
+            // The blocks this bitmap touches, each with the average of its own four samples.
+            let (bx0, bx1) = ((b.x - rx) >> 1, (b.x + b.w as i32 - 1 - rx) >> 1);
+            let (by0, by1) = ((b.y - ry) >> 1, (b.y + b.h as i32 - 1 - ry) >> 1);
+            for by in by0..=by1 {
+                for bx in bx0..=bx1 {
+                    let (x, y) = (i64::from(rx) + 2 * i64::from(bx), i64::from(ry) + 2 * i64::from(by));
+                    let t = b.at(x, y) + b.at(x + 1, y) + b.at(x, y + 1) + b.at(x + 1, y + 1);
+                    let avg = (t >> 2) as u8;
+                    if avg == 0 {
+                        continue;
+                    }
+                    let i = (by as usize) * cw + bx as usize;
+                    let l = chroma_depth[i] as usize;
+                    chroma_depth[i] += 1;
+                    if l >= MAX_LAYERS {
+                        return None;
+                    }
+                    if chroma.len() <= l {
+                        chroma.push(vec![0; cw * ch]);
+                    }
+                    chroma[l][i] = avg;
+                }
+            }
+        }
+        let depth = luma.len().max(chroma.len());
+        let pack = |layers: &[Vec<u8>], pass: usize, n: usize| {
+            let mut out = vec![0u8; n * 4];
+            for k in 0..4 {
+                if let Some(layer) = layers.get(pass * 4 + k) {
+                    for (i, v) in layer.iter().enumerate() {
+                        out[i * 4 + k] = *v;
+                    }
+                }
+            }
+            out
+        };
+        let passes = (0..depth.div_ceil(4))
+            .map(|p| (pack(&luma, p, rw * rh), pack(&chroma, p, cw * ch)))
+            .collect();
+        Some(Layers {
+            region: [rx, ry, rw as i32, rh as i32],
+            passes,
+        })
+    }
+
+    /// The layers as textures of `gpu`.
+    pub(crate) fn upload(&self, gpu: &crate::gpu::Gpu) -> UploadedMasks {
+        use wgpu::util::DeviceExt;
+        let [_, _, w, h] = self.region;
+        let make = |label: &str, w: i32, h: i32, data: &[u8]| {
+            gpu.device.create_texture_with_data(
+                &gpu.queue,
+                &wgpu::TextureDescriptor {
+                    label: Some(label),
+                    size: wgpu::Extent3d {
+                        width: w.max(1) as u32,
+                        height: h.max(1) as u32,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: wgpu::TextureDimension::D2,
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    usage: wgpu::TextureUsages::TEXTURE_BINDING,
+                    view_formats: &[],
+                },
+                wgpu::util::TextureDataOrder::LayerMajor,
+                data,
+            )
+        };
+        let passes = self
+            .passes
+            .iter()
+            .map(|(luma, chroma)| {
+                let luma = make("text luma layers", w, h, luma);
+                let chroma = make("text chroma layers", (w + 1) / 2, (h + 1) / 2, chroma);
+                UploadedPass {
+                    luma: luma.create_view(&wgpu::TextureViewDescriptor::default()),
+                    chroma: chroma.create_view(&wgpu::TextureViewDescriptor::default()),
+                    _textures: [luma, chroma],
+                }
+            })
+            .collect();
+        UploadedMasks {
+            region: self.region,
+            passes,
+        }
     }
 }
 
@@ -510,7 +673,7 @@ pub fn blends(text: &PlanText, raster: &Raster, matrix: YuvMatrix, rgb: bool) ->
     let a = u32::from(rgba[3]) * opacity / 255;
     if a > 0 {
         let alpha = (0x10307 * a + 3) >> 8;
-        if raster.glyphs.is_some() {
+        if !raster.sequence.is_empty() {
             out.push(Blend {
                 source: Source::Glyphs,
                 colour: colour(rgba),
@@ -532,18 +695,26 @@ pub struct Planes<'a> {
     pub planes: [&'a mut [u8]; 3],
 }
 
-fn mix(dst: u8, alpha: u32, src: u8) -> u8 {
+pub(crate) fn mix(dst: u8, alpha: u32, src: u8) -> u8 {
     ((u64::from(UNIT - alpha) * u64::from(dst) + u64::from(alpha) * u64::from(src)) >> 24) as u8
 }
 
-/// `ff_blend_mask`, on one [`Blend`] of a mask: the scalar reference of `text.wgsl` and the check
-/// of both against `drawtext`.
-pub fn blend_coverage(pic: &mut Planes, mask: &Coverage, colour: [u8; 3], alpha: u32) {
-    let (w, h) = (pic.w, pic.h);
-    for y in 0..h {
-        for x in 0..w {
-            let a = mask.at(x as i64, y as i64) * alpha;
-            let i = y * w + x;
+/// `ff_blend_mask`, for one bitmap: the scalar reference of `text.wgsl` and the check of both against
+/// `drawtext`. Only the samples the bitmap and the chroma blocks it touches are visited.
+pub fn blend_coverage(pic: &mut Planes, mask: &Bitmap, colour: [u8; 3], alpha: u32) {
+    let (w, h) = (pic.w as i64, pic.h as i64);
+    let (x0, y0) = (i64::from(mask.x).max(0), i64::from(mask.y).max(0));
+    let (x1, y1) = (
+        (i64::from(mask.x) + i64::from(mask.w)).min(w),
+        (i64::from(mask.y) + i64::from(mask.h)).min(h),
+    );
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    for y in y0..y1 {
+        for x in x0..x1 {
+            let a = mask.at(x, y) * alpha;
+            let i = (y * w + x) as usize;
             if pic.subsampled {
                 pic.planes[0][i] = mix(pic.planes[0][i], a, colour[0]);
             } else {
@@ -557,12 +728,12 @@ pub fn blend_coverage(pic: &mut Planes, mask: &Coverage, colour: [u8; 3], alpha:
         return;
     }
     let cw = w / 2;
-    for cy in 0..h / 2 {
-        for cx in 0..cw {
-            let (x, y) = ((cx * 2) as i64, (cy * 2) as i64);
+    for cy in (y0 / 2)..=((y1 - 1) / 2).min(h / 2 - 1) {
+        for cx in (x0 / 2)..=((x1 - 1) / 2).min(cw - 1) {
+            let (x, y) = (cx * 2, cy * 2);
             let t = mask.at(x, y) + mask.at(x + 1, y) + mask.at(x, y + 1) + mask.at(x + 1, y + 1);
             let a = (t >> 2) * alpha;
-            let i = cy * cw + cx;
+            let i = (cy * cw + cx) as usize;
             for (plane, c) in pic.planes.iter_mut().zip(colour).skip(1) {
                 plane[i] = mix(plane[i], a, c);
             }
@@ -618,7 +789,7 @@ pub fn blend_all(pic: &mut Planes, raster: &Raster, blends: &[Blend]) {
         match b.source {
             Source::Box(rect) => blend_rect(pic, rect, b.colour, b.alpha),
             Source::Glyphs => {
-                if let Some(mask) = &raster.glyphs {
+                for mask in &raster.sequence {
                     blend_coverage(pic, mask, b.colour, b.alpha);
                 }
             }
@@ -631,21 +802,42 @@ pub fn blend_all(pic: &mut Planes, raster: &Raster, blends: &[Blend]) {
 pub fn touched(raster: &Raster, blends: &[Blend], w: u32, h: u32) -> Option<(u32, u32, u32, u32)> {
     let mut region: Option<(i64, i64, i64, i64)> = None;
     for b in blends {
-        let r = match b.source {
-            Source::Box(rect) => rect,
-            Source::Glyphs => raster.glyphs.as_ref()?.rect(),
+        let rects: Vec<Rect> = match b.source {
+            Source::Box(rect) => vec![rect],
+            Source::Glyphs => raster.sequence.iter().map(Bitmap::rect).collect(),
         };
-        let (x0, y0) = (i64::from(r.x), i64::from(r.y));
-        let (x1, y1) = (x0 + i64::from(r.w), y0 + i64::from(r.h));
+        for r in rects {
+            let (x0, y0) = (i64::from(r.x), i64::from(r.y));
+            let (x1, y1) = (x0 + i64::from(r.w), y0 + i64::from(r.h));
+            region = Some(match region {
+                None => (x0, y0, x1, y1),
+                Some((a, b, c, d)) => (a.min(x0), b.min(y0), c.max(x1), d.max(y1)),
+            });
+        }
+    }
+    widen(region?, w, h)
+}
+
+/// A region widened to whole chroma blocks and clipped to a `w` x `h` canvas.
+fn widen(region: (i64, i64, i64, i64), w: u32, h: u32) -> Option<(u32, u32, u32, u32)> {
+    let (x0, y0, x1, y1) = region;
+    let (x0, y0) = (x0.max(0) & !1, y0.max(0) & !1);
+    let (x1, y1) = ((x1.min(i64::from(w)) + 1) & !1, (y1.min(i64::from(h)) + 1) & !1);
+    (x1 > x0 && y1 > y0).then_some((x0 as u32, y0 as u32, x1.min(i64::from(w)) as u32, y1.min(i64::from(h)) as u32))
+}
+
+/// The region of a canvas the bitmaps of `sequence` cover, as [`touched`] gives one.
+fn touched_by(sequence: &[Bitmap], w: u32, h: u32) -> Option<(u32, u32, u32, u32)> {
+    let mut region: Option<(i64, i64, i64, i64)> = None;
+    for b in sequence {
+        let (x0, y0) = (i64::from(b.x), i64::from(b.y));
+        let (x1, y1) = (x0 + i64::from(b.w), y0 + i64::from(b.h));
         region = Some(match region {
             None => (x0, y0, x1, y1),
             Some((a, b, c, d)) => (a.min(x0), b.min(y0), c.max(x1), d.max(y1)),
         });
     }
-    let (x0, y0, x1, y1) = region?;
-    let (x0, y0) = (x0.max(0) & !1, y0.max(0) & !1);
-    let (x1, y1) = ((x1.min(i64::from(w)) + 1) & !1, (y1.min(i64::from(h)) + 1) & !1);
-    (x1 > x0 && y1 > y0).then_some((x0 as u32, y0 as u32, x1.min(i64::from(w)) as u32, y1.min(i64::from(h)) as u32))
+    widen(region?, w, h)
 }
 
 // ---- rasterising --------------------------------------------------------------
@@ -654,6 +846,53 @@ pub fn touched(raster: &Raster, blends: &[Blend], w: u32, h: u32) -> Option<(u32
 /// killed after [`RASTER_TIMEOUT`]; callers are on a blocking thread and hold no project lock (they may
 /// hold their own render lock, which waits this long on a first-seen state).
 pub fn rasterize(graph: &TextRasterGraph) -> Result<Raster, GpuError> {
+    Raster::from_parts(graph, &run_graph(graph)?)
+}
+
+static SUM_FALLBACKS: AtomicU64 = AtomicU64::new(0);
+
+/// How many texts were blended as the sum of their bitmaps, for want of the sequence ([`raster`]): zero
+/// everywhere the tests look.
+pub fn sum_fallbacks() -> u64 {
+    SUM_FALLBACKS.load(Ordering::Relaxed)
+}
+
+/// What the compositor blends for the overlay `t` on a `size` canvas: FFmpeg's own sequence of glyph
+/// bitmaps ([`seq`]) where this build's layout is one it can take apart, proven to be the picture
+/// `drawtext` draws, else the sum of them as one bitmap. A text the sequence could not be recovered for
+/// is refused unless one mask stands for it exactly enough (no border, [`kerf_core::MIN_TEXT_PX`] and up;
+/// the plan refuses the rest when [`model`] is `None`). Blocking: a handful of `ffmpeg` runs the first
+/// time a text is seen.
+pub fn raster(t: &PlanText, size: (u32, u32)) -> Result<Raster, GpuError> {
+    let graph = kerf_core::text_raster_graph(t, size);
+    let planes = run_graph(&graph)?;
+    let mut raster = Raster::from_parts(&graph, &planes)?;
+    let (w, h) = (size.0 as usize, size.1 as usize);
+    let single = graph
+        .parts
+        .iter()
+        .position(|p| *p == TextPart::Glyphs)
+        .map(|i| &planes[i * w * h..(i + 1) * w * h]);
+    let Some(ink) = single else {
+        return Ok(raster);
+    };
+    let sums_are_enough = !t.synthetic_bold && (f64::from(size.1) * t.size).round() >= f64::from(kerf_core::MIN_TEXT_PX);
+    match seq::sequence(t, size, ink) {
+        Ok(sequence) => {
+            raster.sequence = sequence;
+            raster.exact = true;
+        }
+        Err(e) if sums_are_enough => {
+            SUM_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+            tracing::debug!("text: {e}; blending the sum of its bitmaps");
+        }
+        Err(e) => return Err(e),
+    }
+    Ok(raster)
+}
+
+/// Run `graph` and read its parts back, stacked.
+fn run_graph(graph: &TextRasterGraph) -> Result<Vec<u8>, GpuError> {
     let (w, h) = graph.size;
     let plane = (w as usize).checked_mul(h as usize);
     let want = plane.and_then(|p| p.checked_mul(graph.parts.len()));
@@ -704,7 +943,7 @@ pub fn rasterize(graph: &TextRasterGraph) -> Result<Raster, GpuError> {
             graph.parts.len()
         )));
     }
-    Raster::from_parts(graph, &out)
+    Ok(out)
 }
 
 // ---- the atlas -----------------------------------------------------------------
@@ -907,8 +1146,8 @@ impl TextAtlas {
 mod tests {
     use super::*;
 
-    fn coverage(x: u32, y: u32, w: u32, h: u32, v: u8) -> Coverage {
-        Coverage {
+    fn coverage(x: i32, y: i32, w: u32, h: u32, v: u8) -> Bitmap {
+        Bitmap {
             x,
             y,
             w,
@@ -917,10 +1156,12 @@ mod tests {
         }
     }
 
-    fn raster(glyphs: Option<Coverage>, boxed: Option<Rect>) -> Raster {
+    fn raster(glyphs: Option<Bitmap>, boxed: Option<Rect>) -> Raster {
         Raster {
-            glyphs,
+            sequence: glyphs.into_iter().collect(),
+            exact: false,
             boxed,
+            layers: OnceLock::new(),
             uploaded: OnceLock::new(),
         }
     }
@@ -1188,7 +1429,8 @@ mod tests {
         }
         let planes: Vec<u8> = glyphs.iter().chain(&boxed).copied().collect();
         let r = Raster::from_parts(&graph(vec![TextPart::Glyphs, TextPart::Box], 8, 6), &planes).unwrap();
-        let g = r.glyphs.as_ref().unwrap();
+        assert_eq!(r.sequence.len(), 1);
+        let g = &r.sequence[0];
         assert_eq!((g.x, g.y, g.w, g.h), (3, 2, 4, 3));
         assert_eq!(g.at(3, 2), 200);
         assert_eq!(g.at(6, 4), 9);
@@ -1196,7 +1438,7 @@ mod tests {
         assert_eq!(r.boxed, Some(Rect { x: 2, y: 1, w: 5, h: 4 }));
         // A part with nothing in it is not there.
         let empty = Raster::from_parts(&graph(vec![TextPart::Glyphs], 8, 6), &vec![0u8; w * h]).unwrap();
-        assert!(empty.glyphs.is_none() && empty.boxed.is_none());
+        assert!(empty.sequence.is_empty() && empty.boxed.is_none());
         // A box with a hole in it (or an antialiased edge) is not what this reads.
         let mut holed = boxed.clone();
         holed[2 * w + 3] = 100;
@@ -1342,5 +1584,123 @@ mod tests {
             size: (100, 100),
         };
         assert!(matches!(rasterize(&long), Err(GpuError::Unsupported(_))));
+    }
+
+    #[test]
+    fn layers_hold_each_bitmaps_coverage_per_sample_and_its_own_average_per_block_in_order() {
+        // Three bitmaps meet on sample (4, 4); the second also on its own, two samples to the right.
+        let a = Bitmap {
+            x: 3,
+            y: 3,
+            w: 2,
+            h: 2,
+            data: vec![10, 20, 30, 40],
+        };
+        let b = Bitmap {
+            x: 4,
+            y: 4,
+            w: 3,
+            h: 1,
+            data: vec![100, 0, 200],
+        };
+        let c = Bitmap {
+            x: 4,
+            y: 4,
+            w: 1,
+            h: 1,
+            data: vec![7],
+        };
+        let layers = Layers::of(&[a, b, c], 16, 16).unwrap();
+        // The region is whole chroma blocks: x 2..8, y 2..6.
+        assert_eq!(layers.region, [2, 2, 6, 4]);
+        assert_eq!(layers.passes.len(), 1);
+        let (luma, chroma) = &layers.passes[0];
+        let at = |x: usize, y: usize| &luma[((y - 2) * 6 + (x - 2)) * 4..((y - 2) * 6 + (x - 2)) * 4 + 4];
+        assert_eq!(at(3, 3), [10, 0, 0, 0]);
+        assert_eq!(at(4, 3), [20, 0, 0, 0]);
+        assert_eq!(at(4, 4), [40, 100, 7, 0], "a, b, c in the order they are blended");
+        assert_eq!(
+            at(6, 4),
+            [200, 0, 0, 0],
+            "b alone there: the first layer is the first bitmap to touch the sample"
+        );
+        assert_eq!(at(5, 4), [0, 0, 0, 0]);
+        // Chroma: block (1, 1) is canvas samples 4..6 x 4..6; a's own sum there is 40 (one sample) >> 2.
+        let block = |bx: usize, by: usize| &chroma[(by * 3 + bx) * 4..(by * 3 + bx) * 4 + 4];
+        assert_eq!(block(1, 1), [10, 25, 1, 0], "a: (40 >> 2), b: (100 + 0) >> 2, c: 7 >> 2");
+        assert_eq!(block(0, 0), [2, 0, 0, 0], "the one sample of a in the block, 10 >> 2");
+    }
+
+    #[test]
+    fn the_blend_of_layers_is_the_blend_of_the_bitmaps_in_turn() {
+        // The same bitmaps blended onto a picture sample by sample (the reference) and chained through
+        // the layers the shader reads: what the shader does, in integers, against `blend_coverage`.
+        let seq: Vec<Bitmap> = (0..7)
+            .map(|i| Bitmap {
+                x: 3 + i,
+                y: 2 + (i % 3),
+                w: 5,
+                h: 4,
+                data: (0..20).map(|k| ((k * 37 + i as usize * 11) % 256) as u8).collect(),
+            })
+            .collect();
+        let (w, h) = (20usize, 12usize);
+        let fill = |seed: usize| -> Vec<u8> { (0..w * h).map(|i| ((i * 7 + seed) % 251) as u8).collect() };
+        let (mut y, u, v) = (fill(1), fill(2), fill(3));
+        let (y0, u0, v0) = (y.clone(), u.clone(), v.clone());
+        // `u` and `v` are planes of the full size here (the reference reads chroma at the half-size grid).
+        let (mut cu, mut cv) = (u[..w * h / 4].to_vec(), v[..w * h / 4].to_vec());
+        let colour = [200, 60, 170];
+        let alpha = (0x10307 * 200 + 3) >> 8;
+        {
+            let mut pic = Planes {
+                w,
+                h,
+                subsampled: true,
+                planes: [&mut y, &mut cu, &mut cv],
+            };
+            for b in &seq {
+                blend_coverage(&mut pic, b, colour, alpha);
+            }
+        }
+        let layers = Layers::of(&seq, w as u32, h as u32).unwrap();
+        let [rx, ry, rw, rh] = layers.region;
+        let chain = |mut d: u8, layer: &[u8], c: u8| {
+            for v in layer {
+                d = mix(d, u32::from(*v) * alpha, c);
+            }
+            d
+        };
+        let mut want_y = y0;
+        let mut want_u = u0[..w * h / 4].to_vec();
+        let mut want_v = v0[..w * h / 4].to_vec();
+        for (luma, chroma) in &layers.passes {
+            for py in 0..rh as usize {
+                for px in 0..rw as usize {
+                    let i = (py + ry as usize) * w + px + rx as usize;
+                    want_y[i] = chain(want_y[i], &luma[(py * rw as usize + px) * 4..][..4], colour[0]);
+                }
+            }
+            let cw = (rw as usize).div_ceil(2);
+            for py in 0..(rh as usize).div_ceil(2) {
+                for px in 0..cw {
+                    let i = (py + ry as usize / 2) * (w / 2) + px + rx as usize / 2;
+                    let l = &chroma[(py * cw + px) * 4..][..4];
+                    want_u[i] = chain(want_u[i], l, colour[1]);
+                    want_v[i] = chain(want_v[i], l, colour[2]);
+                }
+            }
+        }
+        assert_eq!((y, cu, cv), (want_y, want_u, want_v));
+        let _ = (u, v);
+    }
+
+    #[test]
+    fn a_text_with_too_many_bitmaps_on_one_sample_is_refused_not_cut() {
+        let seq: Vec<Bitmap> = (0..=MAX_LAYERS).map(|_| coverage(0, 0, 2, 2, 9)).collect();
+        assert!(Layers::of(&seq, 8, 8).is_none());
+        let seq: Vec<Bitmap> = (0..MAX_LAYERS).map(|_| coverage(0, 0, 2, 2, 9)).collect();
+        assert_eq!(Layers::of(&seq, 8, 8).unwrap().passes.len(), MAX_LAYERS / 4);
+        assert!(Layers::of(&[], 8, 8).is_none());
     }
 }

@@ -1456,7 +1456,7 @@ impl RenderPlan {
                 if self.overlays.iter().any(|o| o.font_file.is_none()) {
                     out.push(Unsupported::TextWithoutFont);
                 }
-                if self.overlays.iter().any(|o| o.synthetic_bold) {
+                if !caps.text_sequence && self.overlays.iter().any(|o| o.synthetic_bold) {
                     out.push(Unsupported::TextBorder);
                 }
             }

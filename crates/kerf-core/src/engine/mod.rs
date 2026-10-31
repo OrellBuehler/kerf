@@ -147,7 +147,8 @@ pub use cli::vidstab_available;
 pub(crate) use cli::with_vidstab;
 pub use cli::{
     composite_color_policy, export_seek_arg, ffmpeg_command, ffmpeg_path, fps_mode_flag, grade_filter_chain, limit_ffmpeg_args,
-    source_is_indexed_container, text_raster_graph, text_still_filter, TextPart, TextRasterGraph,
+    source_is_indexed_container, text_as_drawn, text_piece_filter, text_raster_graph, text_still_filter, TextPart, TextPiece,
+    TextRasterGraph, TEXT_BORDER_PX, TEXT_BOX_PX,
 };
 pub(crate) use cli::{keyed_color_value, keyframe_value, proxy_fidelity, ProxyFidelity};
 pub use colors::color_rgb;
