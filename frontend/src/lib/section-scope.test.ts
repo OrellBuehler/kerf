@@ -44,13 +44,13 @@ describe('the grade sections write to the clip an edit began on', () => {
 	});
 });
 
-/** The text of one `function name(` up to the next function at the same indent (or the end of the file). */
+/** The text of one `function name(` up to the next function at the same indent (or the end of the script). */
 function body(source: string, name: string): string {
 	const at = source.search(new RegExp(`(?:async )?function ${name}\\(`));
 	expect(at, name).toBeGreaterThanOrEqual(0);
-	const rest = source.slice(at + 1);
-	const next = rest.search(/\n\t(?:async )?function /);
-	return next < 0 ? rest : rest.slice(0, next);
+	const rest = source.slice(at).split('\n</script>')[0];
+	const next = rest.slice(1).search(/\n\t(?:async )?function /);
+	return next < 0 ? rest : rest.slice(0, next + 1);
 }
 
 describe('the title text section commits to the title and text a field took focus on', () => {
@@ -104,5 +104,40 @@ describe('the custom SVG source box applies to the title it was applied on', () 
 		const caught = after.slice(after.indexOf('catch (e)'));
 		expect(caught.indexOf(guard), 'in the catch').toBeGreaterThan(0);
 		expect(caught.indexOf(guard)).toBeLessThan(caught.indexOf('sourceError ='));
+	});
+});
+
+describe('the sound effect section reshapes the clip a change began on', () => {
+	const shape = code(read(`${EDITOR}SfxShape.svelte`));
+	const section = code(read(`${EDITOR}SoundEffectSection.svelte`));
+	const panel = code(read(`${EDITOR}SoundFx.svelte`));
+
+	test('every slider of the shape hands back its scope, and a switch or a take is pressed on the scope it has', () => {
+		const rows = shape.match(/<SliderRow\b[^\n]*/g) ?? [];
+		expect(rows.length).toBe(5);
+		// Length, Pitch, Intensity and Tail change the spec; Gain is the panel’s own (the clip has a Volume section).
+		const specRows = rows.filter((r) => /onchange\(/.test(r));
+		expect(specRows.length).toBe(4);
+		for (const r of specRows) {
+			expect(r).toContain('scope={scope as S}');
+			expect(r).toMatch(/onCommit=\{\(v, at\) => onchange\(\{ \w+: v \}, at\)\}/);
+		}
+		expect(shape).toContain('generics="S = undefined"');
+		expect(shape).toContain('onchange({ reverse: checked }, scope as S)');
+		expect(shape).toContain('onchange({ seed: nextSeed(spec.seed) }, scope as S)');
+	});
+
+	test('the Inspector’s section passes the clip; the Sound FX panel has none to pass', () => {
+		expect(section).toContain('scope={clip.id}');
+		expect(panel).not.toMatch(/<SfxShape[^>]*\bscope=/);
+	});
+
+	test('a reshape reads the sound and the clip by the id it was handed, never the section’s props', () => {
+		const fn = body(section, 'reshape');
+		expect(fn).toContain('async function reshape(patch: Partial<SfxSpec>, clipId: string)');
+		expect(fn).toContain('soundOf(editor.timeline, editor.assets, clipId)');
+		expect(fn).toContain('editor.updateSoundEffect(clipId, next)');
+		expect(fn).toContain('const who = `clip:${clipId}`');
+		expect(fn).not.toMatch(/\bclip\.id\b|\bspec\b|\bowner\b(?! === who)/);
 	});
 });
