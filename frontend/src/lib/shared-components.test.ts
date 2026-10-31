@@ -302,9 +302,10 @@ describe('ToolbarToggle', () => {
 	});
 
 	test('it reacts to the pointer and has a disabled look of its own', () => {
-		expect(css).toMatch(/\.k-tt:hover:not\(:disabled\)\s*\{/);
-		expect(css).toMatch(/\.k-tt:active:not\(:disabled\)\s*\{/);
-		const off = /\.k-tt:disabled\s*\{([^}]*)\}/.exec(css);
+		// (`:not([aria-disabled='true'])` too: a `pending` toolbar button is off without being `:disabled`)
+		expect(css).toMatch(/\.k-tt:hover:not\(:disabled\)(?::not\(\[aria-disabled='true'\]\))?\s*\{/);
+		expect(css).toMatch(/\.k-tt:active:not\(:disabled\)(?::not\(\[aria-disabled='true'\]\))?\s*\{/);
+		const off = /\.k-tt:disabled,\s*\.k-tt\[aria-disabled='true'\]\s*\{([^}]*)\}/.exec(css);
 		expect(off![1]).toContain('color: var(--text-disabled)');
 		expect(off![1]).toContain('opacity: 1');
 		// …and the veil that plain buttons get leaves it alone, or it would be drawn over twice.

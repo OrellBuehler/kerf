@@ -29,17 +29,17 @@ function tags(source: string, names: string[]): string[] {
 
 describe('a control that is busy keeps focus', () => {
 	test('the atoms take `pending`, render aria-disabled, and ignore the press', () => {
-		for (const file of ['Btn', 'IconBtn', 'Chip', 'Tile', 'CheckRow']) {
+		for (const file of ['Btn', 'IconBtn', 'Chip', 'Tile', 'CheckRow', 'ToolbarToggle']) {
 			const source = read(`${EDITOR}${file}.svelte`);
 			expect(source, file).toContain('pending');
 			expect(source, file).toContain("aria-disabled={pending ?");
 		}
-		for (const file of ['Btn', 'IconBtn', 'Chip', 'Tile']) expect(read(`${EDITOR}${file}.svelte`), file).toContain('if (pending) return;');
+		for (const file of ['Btn', 'IconBtn', 'Chip', 'Tile', 'ToolbarToggle']) expect(read(`${EDITOR}${file}.svelte`), file).toContain('if (pending) return;');
 	});
 
 	test('a pending control is drawn off by the same rules as a disabled one, and not hovered', () => {
 		const css = read('lib/styles/controls.css');
-		for (const cls of ['k-ibtn', 'k-chip', 'k-tile']) {
+		for (const cls of ['k-ibtn', 'k-chip', 'k-tile', 'k-tt']) {
 			expect(css, cls).toContain(`.${cls}[aria-disabled='true']`);
 			expect(css, cls).toContain(`.${cls}:hover:not(:disabled):not([aria-disabled='true'])`);
 		}
@@ -60,10 +60,8 @@ describe('a control that is busy keeps focus', () => {
 		// The native elements and the atoms whose `disabled` is the DOM's. (`SliderRow`, `SfxShape` and `MixSlider` take a
 		// `disabled` of their own that is read-only + aria-disabled, so `disabled={editor.locked}` on one is right.)
 		const natives = ['button', 'input', 'select', 'textarea', 'Btn', 'IconBtn', 'Chip', 'Tile', 'ToolbarToggle', 'CheckRow', 'Switch'];
-		// The timeline's track header and its "Add a title" still do (UI-21, the timeline's own pass).
-		const later = new Set(['lib/components/editor/Timeline.svelte']);
 		const found: string[] = [];
-		for (const file of uiSources().filter((f) => f.endsWith('.svelte') && !later.has(posix(f)))) {
+		for (const file of uiSources().filter((f) => f.endsWith('.svelte'))) {
 			for (const tag of tags(readFileSync(file, 'utf8'), natives)) {
 				if (/(?<![-\w])disabled=\{[^}]*editor\.(busy|locked|previewingStaged)/.test(tag)) found.push(`${posix(file)}: ${tag.replace(/\s+/g, ' ').slice(0, 90)}`);
 			}

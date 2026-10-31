@@ -281,11 +281,11 @@
 	border-color: transparent;
 	color: var(--text-secondary);
 }
-.k-tt:hover:not(:disabled) {
+.k-tt:hover:not(:disabled):not([aria-disabled='true']) {
 	background: var(--surface-hover);
 	color: var(--text-primary);
 }
-.k-tt:active:not(:disabled) {
+.k-tt:active:not(:disabled):not([aria-disabled='true']) {
 	background: var(--surface-active);
 	color: var(--text-primary);
 }
@@ -294,17 +294,18 @@
 	border-color: var(--kerf-400);
 	color: var(--kerf-300);
 }
-.k-tt[data-on]:hover:not(:disabled) {
+.k-tt[data-on]:hover:not(:disabled):not([aria-disabled='true']) {
 	background: var(--selection-fill);
 	color: var(--kerf-300);
 	box-shadow: var(--hover-fill);
 }
-.k-tt[data-on]:active:not(:disabled) {
+.k-tt[data-on]:active:not(:disabled):not([aria-disabled='true']) {
 	background: var(--selection-fill);
 	color: var(--kerf-300);
 	box-shadow: var(--press-fill);
 }
-.k-tt:disabled {
+.k-tt:disabled,
+.k-tt[aria-disabled='true'] {
 	background: transparent;
 	border-color: var(--border-subtle);
 	color: var(--text-disabled);
@@ -312,7 +313,8 @@
 	cursor: default;
 	opacity: 1;
 }
-.k-tt[data-bare]:disabled {
+.k-tt[data-bare]:disabled,
+.k-tt[data-bare][aria-disabled='true'] {
 	border-color: transparent;
 }
 

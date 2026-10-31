@@ -57,21 +57,17 @@ describe('the timeline’s track headers', () => {
 			expect(b).toMatch(/aria-label=\{copy\.\w+\.name\}/);
 		}
 		expect(flags).toContain('const pending = $derived(editor.locked);');
-		expect(flags).not.toMatch(/\sdisabled=/);
 	});
 
-	test('the header’s controls never switch to native disabled for an edit in flight, which drops the focus', () => {
-		expect(timeline).not.toMatch(/\sdisabled=\{editor\.(busy|locked)/);
-		// the two sliders stay focusable: aria-disabled, and a change that arrives anyway puts the value back
+	test('the header’s two sliders put the value back when a change arrives while an edit is in flight', () => {
+		// (that nothing here is natively `disabled`, and that the rename field is named, are `pending-controls` / `a11y-guard`'s)
 		expect(timeline.match(/aria-disabled=\{editor\.locked \? 'true' : undefined\}/g)).toHaveLength(2);
 		expect(timeline).toContain('if (editor.locked) return void (e.currentTarget.value = String(gainToFader(t.volume ?? 1)));');
 		expect(timeline).toContain('if (editor.locked) return void (e.currentTarget.value = String(t.pan ?? 0));');
-		// both "Add a title" buttons
-		expect(timeline.match(/aria-label="Add a title"/g)).toHaveLength(2);
-		expect(timeline.match(/pending=\{editor\.busy\}/g)).toHaveLength(2);
 	});
 
-	test('the marker’s rename field has a name', () => {
-		expect(timeline).toMatch(/<input\s+autofocus\s+aria-label="Marker name"/);
+	test('both "Add a title" buttons are pending, not disabled, while an edit is in flight', () => {
+		expect(timeline.match(/aria-label="Add a title"/g)).toHaveLength(2);
+		expect(timeline.match(/pending=\{editor\.busy\}/g)).toHaveLength(2);
 	});
 });

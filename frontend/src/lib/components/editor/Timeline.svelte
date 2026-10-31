@@ -53,6 +53,7 @@
 	import { moveDraft, trimDraft } from '#lib/preview-draft';
 	import { GENERATED_TITLE_FILL, SVG_TITLE_FILL, packRows } from '#lib/titles';
 	import { markerDragStep, titleDragStep, type MarkerGrab } from '#lib/title-drag';
+	import { composing } from '#lib/modal';
 	import { SVG_PRESETS, svgDisplayName, svgTooltip } from '#lib/svg-titles';
 	import { faderToGain, gainLabel, gainToFader, panLabel } from '#lib/mixer';
 	import { trackHasSound } from '#lib/mixer-strips';
@@ -2706,7 +2707,6 @@
 	/** Marker being dragged along the ruler, and the id being renamed inline. */
 	let markerDrag: ({ id: string; time: number } & MarkerGrab) | null = $state(null);
 	let renaming = $state<string | null>(null);
-	/** The marker whose name, kind, length and comment are open in the dialog. */
 
 	const addMarkerHere = () => void addMarker();
 
@@ -2958,14 +2958,14 @@
 					title={editor.previewingStaged ? PREVIEW_READ_ONLY_REASON : `Toggle a ${FADE_DEFAULT}s fade-in on the selected clip`}
 					label="Fade in"
 					pressed={sc.fade_in > 0}
-					disabled={editor.previewingStaged}
+					pending={editor.previewingStaged}
 					onclick={toggleFadeIn}>in</ToolbarToggle
 				>
 				<ToolbarToggle
 					title={editor.previewingStaged ? PREVIEW_READ_ONLY_REASON : `Toggle a ${FADE_DEFAULT}s fade-out on the selected clip`}
 					label="Fade out"
 					pressed={sc.fade_out > 0}
-					disabled={editor.previewingStaged}
+					pending={editor.previewingStaged}
 					onclick={toggleFadeOut}>out</ToolbarToggle
 				>
 			</span>
@@ -3062,12 +3062,12 @@
 			<span style="display:inline-flex;align-items:center;gap:6px">
 				<ToolbarToggle
 					title={editor.previewingStaged ? PREVIEW_READ_ONLY_REASON : 'Add a video track'}
-					disabled={editor.previewingStaged}
+					pending={editor.previewingStaged}
 					onclick={() => onAddTrack('video')}>+ V</ToolbarToggle
 				>
 				<ToolbarToggle
 					title={editor.previewingStaged ? PREVIEW_READ_ONLY_REASON : 'Add an audio track'}
-					disabled={editor.previewingStaged}
+					pending={editor.previewingStaged}
 					onclick={() => onAddTrack('audio')}>+ A</ToolbarToggle
 				>
 				<!-- The frame the cut is made for: the preview is this shape, and so is the export. -->
@@ -3078,7 +3078,7 @@
 					icon="crop"
 					iconSize={12}
 					on={!!delivery.format}
-					disabled={editor.previewingStaged}
+					pending={editor.previewingStaged}
 					aria-haspopup="menu"
 					onclick={pickDelivery}>{deliveryLabel(editor.timeline.format)}</ToolbarToggle
 				>
@@ -3387,9 +3387,10 @@
 								value={m.name}
 								onblur={(e) => commitRename(m, e.currentTarget.value)}
 								onkeydown={(e) => {
+									e.stopPropagation();
+									if (composing(e)) return; // the Enter / Escape of an input method's candidate is not ours
 									if (e.key === 'Enter') e.currentTarget.blur();
 									else if (e.key === 'Escape') renaming = null;
-									e.stopPropagation();
 								}}
 								style="position:relative;flex:none;margin-left:3px;width:96px;font-size:var(--text-2xs);padding:1px 3px;border-radius:3px;border:var(--line-width) solid {accent};background:var(--surface-inset);color:var(--text-primary)"
 							/>

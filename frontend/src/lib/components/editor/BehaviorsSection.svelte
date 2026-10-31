@@ -17,6 +17,7 @@
 	import { contextMenu } from '#lib/context-menu.svelte';
 	import { toast } from '#lib/notifications.svelte';
 	import { tip } from '#lib/tip';
+	import { composing } from '#lib/modal';
 	import { errorMessage, report } from '#lib/ops';
 	import { BEHAVIOR_HINTS, behaviorsSummary, defaultBehavior, randomSeed } from '#lib/behaviors';
 	import { propsPhrase } from '#lib/keyframe-copy';
@@ -203,6 +204,7 @@
 						oninput={(e) => seeds.input(e.currentTarget, e.currentTarget.value)}
 						onchange={(e) => commitSeed(e.currentTarget, at, seed)}
 						onkeydown={(e) => {
+							if (composing(e)) return;
 							if (e.key === 'Escape') {
 								seeds.drop(e.currentTarget);
 								e.currentTarget.value = String(seed);

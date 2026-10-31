@@ -18,6 +18,7 @@
 		bare = false,
 		square = undefined,
 		disabled = false,
+		pending = false,
 		onclick,
 		children = undefined,
 		...rest
@@ -37,6 +38,8 @@
 		/** 24 px each way, for a button whose content is a picture; by default one with no children. */
 		square?: boolean;
 		disabled?: boolean;
+		/** An edit is in flight, or a proposal is on screen: off to the eye and the click, but still focusable (see `Btn`). */
+		pending?: boolean;
 		onclick?: (e: MouseEvent) => void;
 		/** Text beside the icon (or a picture of its own, with `square`). */
 		children?: Snippet;
@@ -56,8 +59,12 @@
 	data-bare={bare || undefined}
 	data-square={(square ?? !children) ? '' : undefined}
 	{disabled}
-	{onclick}
+	onclick={(e: MouseEvent) => {
+		if (pending) return;
+		onclick?.(e);
+	}}
 	{...rest}
+	aria-disabled={pending ? 'true' : (rest['aria-disabled'] as boolean | 'true' | 'false' | undefined)}
 >
 	{#if icon}<Icon n={icon} s={iconSize} />{/if}
 	{@render children?.()}

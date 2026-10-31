@@ -288,10 +288,7 @@ describe('a key that belongs to an input method is not ours', () => {
 	}
 
 	/** Files that still hold such a field, and how many: the count may fall, never rise. */
-	const IME_UNGUARDED_ALLOWED: Record<string, number> = {
-		'lib/components/editor/Timeline.svelte': 1,
-		'lib/components/editor/BehaviorsSection.svelte': 1
-	};
+	const IME_UNGUARDED_ALLOWED: Record<string, number> = {};
 
 	test('every text field that acts on Enter or Escape asks `composing` first', () => {
 		const offenders: string[] = [];
@@ -368,10 +365,7 @@ describe('the agent panel does not lose or double what it was asked', () => {
 
 describe('a field has a name', () => {
 	/** Files that still hold an unnamed field, and how many: the count may fall, never rise. */
-	const UNLABELLED_ALLOWED: Record<string, number> = {
-		'lib/components/editor/Timeline.svelte': 1,
-		'lib/components/editor/Inspector.svelte': 1
-	};
+	const UNLABELLED_ALLOWED: Record<string, number> = {};
 
 	/** The `<input>`, `<textarea>` and `<select>` of a component that nothing names: not inside a `<label>`, no
 	 *  `<label for>` pointing at its id, no aria-label / aria-labelledby, no `use:tip` (which names an unnamed
