@@ -1,10 +1,12 @@
 // The width and height typed into the export dialog's "Custom…" size. The backend takes `Option<(u32, u32)>`, so a
 // negative or fractional entry is a serde error rather than a size, and the delivery frame (`Delivery::new` in
 // kerf-core) is `max(2)` and rounded down to even — 4:2:0 video has no odd side. An entry is brought to that here and
-// the field says what it did, instead of exporting at 1920 because `parseInt` of "" is NaN.
+// the field says what it did, instead of exporting at 1920 because `parseInt` of "" is NaN. The upper bound is this
+// dialog's own policy, not the engine's (kerf-core has no cap): high enough for a 12K / 360° delivery (11520), low
+// enough that a mistyped extra digit is caught before it asks FFmpeg for a gigapixel frame.
 
 export const MIN_SIDE = 2;
-export const MAX_SIDE = 8192;
+export const MAX_SIDE = 16384;
 
 export interface SideEdit {
 	/** The side to use: always a whole, even number in `MIN_SIDE..=MAX_SIDE`. */

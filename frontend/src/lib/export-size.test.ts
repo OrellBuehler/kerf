@@ -17,6 +17,11 @@ describe('editSide', () => {
 		}
 	});
 
+	test('a 12K / 360 delivery side is not clamped: the cap is the dialog’s, not the engine’s', () => {
+		expect(editSide('11520', 1080)).toEqual({ value: 11520, note: null });
+		expect(MAX_SIDE).toBeGreaterThanOrEqual(11520);
+	});
+
 	test('a size past the range is the largest', () => {
 		const out = editSide('99999', 1080);
 		expect(out.value).toBe(MAX_SIDE);
