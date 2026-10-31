@@ -371,7 +371,6 @@
 		max={MAX_SIDE}
 		step="2"
 		aria-label={label}
-		aria-invalid={sizeNote !== null}
 		aria-describedby={sizeNote ? 'export-size-note' : undefined}
 		value={(opts.resolution ?? CUSTOM_START)[axis]}
 		onchange={(e) => setSide(axis, e.currentTarget)}
