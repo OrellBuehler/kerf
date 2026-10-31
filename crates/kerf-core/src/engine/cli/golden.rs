@@ -2553,7 +2553,7 @@ fn round_floats_keeps_the_structure_and_drops_the_last_digits() {
         round_floats(a),
         round_floats(&a.replace("1.0760845213036123", "1.0760845313036123"))
     );
-    assert_ne!(round_floats(a), round_floats(&a.replace("rotate=", "rotat=")));
+    assert_ne!(round_floats(a), round_floats(&a.replace("rotate=", "rotatx=")));
     assert_ne!(round_floats(a), round_floats(&a.replace("-ss 12", "-ss 13")));
     // Noise round zero: either sign, in a position a unary minus has; a binary one stays.
     assert_eq!(
