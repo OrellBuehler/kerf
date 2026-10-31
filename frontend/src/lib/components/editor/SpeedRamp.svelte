@@ -8,6 +8,7 @@
 	// A write that changes nothing is not sent, and one on a clip that starts after a linked partner goes through
 	// the earliest partner (`planRampWrite`), so the partner's own keys before this clip's start survive.
 	// Keys are clip-local timeline seconds, like the engine's (`speed-ramp.ts` is the map they mean).
+	import { untrack } from 'svelte';
 	import Btn from './Btn.svelte';
 	import Chip from './Chip.svelte';
 	import SectionHead from './SectionHead.svelte';
@@ -73,25 +74,34 @@
 
 	/** The key the readout and the easing / delete buttons are about. */
 	let sel = $state<number | null>(null);
+	// The Inspector does not remount this per clip: another clip selected (a background job picks its result) has
+	// other keys, and "key 2" of the last one is nothing of its.
+	$effect(() => {
+		void clip.id;
+		untrack(() => (sel = null));
+	});
 	/** The keys while a drag moves one (its ghost), with the axes it began on — held, so the graph does not
-	 *  rescale under the pointer; `null` between gestures. */
-	let drag = $state.raw<{ keys: SpeedKey[]; span: number; range: [number, number] } | null>(null);
+	 *  rescale under the pointer, and until the edit it makes has landed, so the curve does not flick back to the old
+	 *  keys for the round trip; `null` between gestures. It is the pressed clip's: `clipId`. */
+	let drag = $state.raw<{ clipId: string; keys: SpeedKey[]; span: number; range: [number, number] } | null>(null);
+	/** The ghost, while it is the clip on show's. */
+	const live = $derived(drag && drag.clipId === clip.id ? drag : null);
 	/** The drag in hand, if any: a component taken down mid-gesture gives it up rather than let it commit later. */
 	let releaseDrag: (() => void) | null = null;
 	$effect(() => () => releaseDrag?.());
 
 	const stored = $derived(keysOf(clip));
 	const ramped = $derived(stored.length > 0);
-	const keys = $derived(drag?.keys ?? stored);
+	const keys = $derived(live?.keys ?? stored);
 	const constant = $derived(speedMag(clip));
 	/** What the graph draws: the ramp, or the constant speed as a level line (no handles). */
 	const curve = $derived<SpeedKey[]>(keys.length ? keys : [{ time: 0, speed: constant }]);
-	const span = $derived(drag?.span ?? timeSpan(clip, stored));
-	const range = $derived(drag?.range ?? speedRange(curve));
+	const span = $derived(live?.span ?? timeSpan(clip, stored));
+	const range = $derived(live?.range ?? speedRange(curve));
 	const sAxis = $derived<SpeedAxis>({ lo: range[0], hi: range[1], height, pad: PAD_Y });
 	const tAxis = $derived<TimeAxis>({ span, width, pad: PAD_X });
 	const ticks = $derived(speedTicks(sAxis));
-	const length = $derived(clipDuration(drag ? { ...clip, speed_ramp: drag.keys } : clip));
+	const length = $derived(clipDuration(live ? { ...clip, speed_ramp: live.keys } : clip));
 	const was = $derived(clipDuration(clip));
 	const local = $derived(ui.time - clip.timeline_start);
 	const atPlayhead = $derived(local >= 0 && local <= span);
@@ -106,9 +116,11 @@
 	const keyName = (k: SpeedKey, i: number) =>
 		`Speed key ${i + 1} of ${keys.length}: ${fmtSpeed(k.speed)} at ${timeDisplay.fmt(clip.timeline_start + k.time)}${k.easing === 'hold' ? ', holds' : ''}`;
 
-	async function write(next: SpeedKey[], then?: () => void) {
-		if (off) return;
-		const plan = planRampWrite(editor.timeline, clip.id, next);
+	/** Write `next` as the ramp of clip `id` — the one the gesture was begun on, not whichever the Inspector shows by the
+	 *  time it lands. */
+	async function write(next: SpeedKey[], then?: () => void, id: string = clip.id) {
+		if (editor.locked || (id === clip.id && lockedWhy)) return;
+		const plan = planRampWrite(editor.timeline, id, next);
 		if (!plan) return;
 		try {
 			await editor.setSpeedRamp(plan.clipId, plan.keys);
@@ -126,6 +138,7 @@
 		if (e.button !== 0) return;
 		sel = i;
 		if (off) return;
+		const id = clip.id;
 		const begin = stored.map((k) => ({ ...k }));
 		const held = { span, range };
 		const [x0, y0] = [e.clientX, e.clientY];
@@ -136,12 +149,16 @@
 				moved = true;
 				const at = { span: held.span, width: tAxis.width, pad: PAD_X };
 				const next = moveKey(begin, i, frame(timeAtX(at, xIn(ev))), speedAtY({ lo: held.range[0], hi: held.range[1], height, pad: PAD_Y }, yIn(ev)), held.span);
-				drag = { keys: next, ...held };
+				drag = { clipId: id, keys: next, ...held };
 			},
 			commit() {
 				const d = drag;
-				drag = null;
-				if (moved && d && !sameKeys(d.keys, begin)) void write(d.keys);
+				if (moved && d && !sameKeys(d.keys, begin)) {
+					// Held until the edit has landed (or been refused), then the stored keys are the truth.
+					void write(d.keys, undefined, id).finally(() => {
+						if (drag === d) drag = null;
+					});
+				} else drag = null;
 			},
 			abandon() {
 				drag = null;
@@ -177,7 +194,10 @@
 			toast.info(full ? `A ramp holds at most ${MAX_SPEED_KEYS} keys` : 'There is a key there already');
 			return;
 		}
-		void write(next, () => (sel = next.findIndex((k) => k.time === t)));
+		const id = clip.id;
+		void write(next, () => {
+			if (clip.id === id) sel = next.findIndex((k) => k.time === t);
+		});
 	}
 
 	const addAtPlayhead = () => addAt(Math.min(Math.max(local, 0), was));
@@ -222,7 +242,7 @@
 			{#if span > was + 1e-9}
 				<rect class="past" x={xOfTime(tAxis, was)} y="0" width={Math.max(0, xOfTime(tAxis, span) - xOfTime(tAxis, was))} height="100%" />
 			{/if}
-			<path class="curve" class:implied={!ramped && !drag} d={path} />
+			<path class="curve" class:implied={!ramped && !live} d={path} />
 			{#if atPlayhead}
 				<line class="head" x1={xOfTime(tAxis, local)} x2={xOfTime(tAxis, local)} y1="0" y2="100%" />
 			{/if}
@@ -230,7 +250,7 @@
 		{#each ticks as v (v)}
 			<span class="vlabel" style="top:{yOfSpeed(sAxis, v)}px" aria-hidden="true">{speedLabel(v)}</span>
 		{/each}
-		{#if ramped || drag}
+		{#if ramped || live}
 			{#each keys as k, i (i)}
 				<button
 					type="button"
