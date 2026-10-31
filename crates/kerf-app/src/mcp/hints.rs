@@ -139,6 +139,8 @@ pub(super) const TOOLS: &[(&str, &str, Effect, ToolSet)] = &[
     ("copy_keyframes", "Copy keyframes", Set, Keyframes),
     ("list_motion_presets", "List motion presets", Read, Keyframes),
     ("apply_motion_preset", "Apply motion preset", Set, Keyframes),
+    ("set_behaviors", "Set behaviours", Set, Keyframes),
+    ("bake_behaviors", "Bake behaviours", Edit, Keyframes),
     ("clear_keyframes", "Clear keyframes", Set, Keyframes),
     ("set_reframe", "Aim 360 camera", Set, Keyframes),
     ("set_asset_projection", "Asset projection", Set, Keyframes),

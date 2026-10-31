@@ -24,6 +24,7 @@
 		scalePose,
 		snapTargets,
 		sweep,
+		toBase,
 		topLayerAt,
 		type Box,
 		type Chrome,
@@ -37,7 +38,9 @@
 	// picture selects its clip (the topmost one under the pointer). Nothing is written while the
 	// pointer is down — the box is a ghost of the pose, drawn exactly where the export will place it —
 	// and one `set_transform_at` lands on release: a key at the playhead for a number that is keyed,
-	// its static value otherwise. Escape, pointercancel, a lost capture or a blur abandon the gesture.
+	// its static value otherwise. Escape, pointercancel, a lost capture or a blur abandon the gesture. A clip with live
+	// behaviours (a sway, a shake) is drawn at its picture, wobble included, and the gesture is worked out there; what
+	// is written is the pose the behaviours ride on (`toBase`).
 
 	let {
 		active,
@@ -188,7 +191,8 @@
 		const d = drag;
 		if (!d || d.committing) return;
 		release();
-		const patch = d.moved ? changed(d.layer.pose, d.patch) : {};
+		// Worked out at the picture, written as the pose the clip's behaviours ride on (`toBase`).
+		const patch = d.moved ? toBase(d.layer, changed(d.layer.pose, d.patch)) : {};
 		if (Object.keys(patch).length === 0) {
 			drag = null;
 			return;
@@ -299,7 +303,7 @@
 				<span
 					data-transform-readout
 					style="position:absolute;left:{live.pointer[0] + 14}px;top:{live.pointer[1] + 14}px;padding:1px 6px;border-radius:var(--radius-sm);font-size:10px;font-weight:600;font-family:var(--font-mono);white-space:nowrap;pointer-events:none;color:var(--text-on-video);background:color-mix(in srgb,var(--scrim) 70%,transparent)"
-					>{readout(live.kind, { ...live.layer.pose, ...live.patch }, live.edge)}{keyedHere ? ' · key' : ''}</span
+					>{readout(live.kind, { ...live.layer.base, ...toBase(live.layer, live.patch) }, live.edge)}{keyedHere ? ' · key' : ''}</span
 				>
 			{/if}
 		{/if}

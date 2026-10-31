@@ -186,6 +186,23 @@ merges into the keys inside the window and keeps the outside, `replace` replaces
 `default_duration` absent for `push_in` / `pull_out`, hint, numbers keyed): a separate tool, as `list_svg_presets` and
 `list_text_animation_presets` are. Both are in the `keyframes` set (`hints.rs`; `apply_motion_preset` is `Set`:
 applying a preset twice is a no-op), `apply_motion_preset` is batchable in `apply_edits`, and the `instructions` and the guide name it.
+**Live behaviours over MCP** (`set_behaviors` + `bake_behaviors`; the pure model is kerf-core's `model/behavior.rs` and `project/behavior.rs`,
+`core-model.md`): `set_behaviors { clip_ids, behaviors }` gives each clip the list as **its whole list** (replacing, `[]` clears; at most 8) in
+one revision (`Project::set_behaviors`: all or nothing, a clip named twice once, an audio-track clip refuses the lot, a locked track does not;
+staged for an agent like any edit) and answers `{clips: [{clip_id, behaviors}]}`. A behaviour is JSON tagged by `kind` — `sway {amount: degrees,
+speed: Hz}`, `breathe {amount: fraction, speed: Hz}`, `spin {speed: turns/s, signed}`, `drift {speed: frames/s, signed, angle: degrees, 0 = right,
+90 = down}`, `shake {amount: frame fraction, speed: Hz, seed}`, each with `phase` (seconds, default 0) — and a number past its limit
+(`MAX_SWAY_DEGREES` 180, `MAX_BEHAVIOR_HZ` 30, `MAX_BREATHE` 0.9, `MAX_SPIN_TURNS` 10, `MAX_DRIFT` 5, `MAX_SHAKE` 0.25) refuses the call as
+`invalid_params`; the **schema description of `behaviors` carries every one of those limits** (a test holds it to the core's constants), so a
+model need not learn them from a refusal. The tool description says what an agent must know: behaviours **ride on top of the clip's pose and
+keys** (a later `set_transform_at` / `add_keyframe` / motion preset writes the pose without them), only scale, position and rotation move, they
+**export exactly** as a short expression (not keys, so length costs nothing), a split or range export carries the motion on, the GPU preview
+**falls back to FFmpeg** for a clip with them, and the list replaces (read it first: `get_timeline_state` shows `behaviors` on a clip, being plain
+serde of the clip). `bake_behaviors { clip_ids, fps? }` samples the combined motion into linear keys on the numbers they move at the frame grid
+(default: the delivery's rate, else the footage's, else 30) and clears them, one revision, answering `{baked: [{clip_id, properties, keys, fps}]}`; a
+clip with none, or one a bake would put past 1000 keys a number on (about 33 s at 30 fps), refuses the call with the core's "split the clip" message.
+Both are in the `keyframes` set (`hints.rs`: `set_behaviors` is `Set`, a list replaced by itself is the same cut; `bake_behaviors` is `Edit`, which claims
+no idempotence), both batch in `apply_edits` (so `set_behaviors` then `bake_behaviors` is one step), and the `instructions` (one clause) and the guide name them.
 `set_transform_at` (`clip_id`, `time`, any transform field) poses a clip at a moment of it in one edit without the
 agent first working out what is animated: a keyed number gets a key at `time` (bundle or own track, whichever drives
 it), the rest and the crop are static (`Clip::pose_transform`); it is what the Preview's handles write.
@@ -802,7 +819,7 @@ Every tool, by purpose (a test pins that this list names each registered tool, a
   `set_grade`, `set_video_effects`, `set_audio_effects`, `set_mask`, `set_blend_mode`, `set_clip_enabled`, `stabilize_clip`,
   `stabilization_status`.
 - **Keyframes and 360**: `set_keyframes`, `add_keyframe`, `set_keyframe_easing`, `set_property_keyframes`,
-  `set_property_tracks`, `copy_keyframes`, `apply_motion_preset`, `list_motion_presets`,
+  `set_property_tracks`, `copy_keyframes`, `apply_motion_preset`, `list_motion_presets`, `set_behaviors`, `bake_behaviors`,
   `clear_keyframes`, `set_reframe`, `clear_reframe`, `set_reframe_keyframes`, `add_reframe_keyframe`.
 - **Mix and music**: `set_track_volume`, `set_track_pan`, `set_track_duck`, `set_track_muted`, `set_track_solo`,
   `set_track_locked`, `set_master_volume`, `set_master_limiter`, `set_master_true_peak`, `set_master_duck`, `plan_music_fit`, `fit_music`,

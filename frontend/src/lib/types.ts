@@ -1045,6 +1045,9 @@ export interface Clip {
 	/** Video stabilization: the camera's shake taken out of the picture once its analysis lands
 	 *  (`clipStabilizationStatus`). Absent when the clip is not stabilized (the backend omits it). */
 	stabilize?: Stabilize | null;
+	/** Live behaviours (`Behavior`): procedural motion on top of the pose and its keys, in list order. Absent when
+	 *  the clip has none (the backend omits it); at most `MAX_BEHAVIORS`. */
+	behaviors?: Behavior[];
 }
 
 /** How strongly a clip is stabilized (`Stabilize`). */
@@ -2583,6 +2586,66 @@ export interface MotionWindow {
 export interface MotionApplication {
 	timeline: Timeline;
 	applied: MotionWindow[];
+}
+
+// ---- Live behaviours (B8b) ---------------------------------------------------
+
+/** What a behaviour does (`BehaviorKind`, the `kind` tag). */
+export type BehaviorKind = 'sway' | 'breathe' | 'spin' | 'drift' | 'shake';
+
+/** One live behaviour of a clip (`Behavior`, tagged by `kind`). `phase` is clip-local seconds added to the clock
+ *  (a head cut shifts it, so the motion carries on); `seed` and `angle` default to 0 when absent. */
+export type Behavior =
+	/** Rotation `+= amount * sin(2 pi speed u)`: `amount` degrees each way (0..180), `speed` Hz (0..30). */
+	| { kind: 'sway'; amount: number; speed: number; phase?: number }
+	/** Scale `*= 1 + amount * sin(2 pi speed u)`: `amount` a fraction of the zoom (0..0.9), `speed` Hz (0..30). */
+	| { kind: 'breathe'; amount: number; speed: number; phase?: number }
+	/** Rotation `+= speed * 360 * u`: `speed` turns a second, signed (-10..10). */
+	| { kind: 'spin'; speed: number; phase?: number }
+	/** Position `+= speed * u * (cos angle, sin angle)`: `speed` frame widths / heights a second, signed (-5..5);
+	 *  `angle` degrees from the right, 90 is down. */
+	| { kind: 'drift'; speed: number; angle?: number; phase?: number }
+	/** Position `+=` three sines per axis: `amount` of the frame (0..0.25), `speed` Hz (0..30), the same `seed` the
+	 *  same shake. */
+	| { kind: 'shake'; amount: number; speed: number; seed?: number; phase?: number };
+
+/** The limits of `Behavior`, the core's (`MAX_BEHAVIORS` and the rest): a write past one is refused, a stored
+ *  number past one is read held to it. */
+export const MAX_BEHAVIORS = 8;
+export const MAX_BEHAVIOR_HZ = 30;
+export const MAX_SWAY_DEGREES = 180;
+export const MAX_BREATHE = 0.9;
+export const MAX_SPIN_TURNS = 10;
+export const MAX_DRIFT = 5;
+export const MAX_SHAKE = 0.25;
+export const MAX_BEHAVIOR_PHASE = 1_000_000;
+
+/** What baking a clip's behaviours into keys wrote (`Baked`). */
+export interface Baked {
+	/** The numbers that now carry keys. */
+	properties: Property[];
+	/** Keys written to each. */
+	keys: number;
+	/** The frame rate they were sampled at. */
+	fps: number;
+}
+
+/** A clip a bake wrote keys into and what it wrote (`BakedClip`). The Tauri command answers the slimmer
+ *  `BakeReport`: the clip is already in the timeline it returns. */
+export interface BakedClip {
+	clip: Clip;
+	baked: Baked;
+}
+
+/** What a bake did to one clip, as the Tauri command reports it (`BakeReport`). */
+export interface BakeReport extends Baked {
+	clip_id: string;
+}
+
+/** What baking did: the refreshed timeline and what was written per clip (`BakeApplication`). */
+export interface BakeApplication {
+	timeline: Timeline;
+	baked: BakeReport[];
 }
 
 // ---- GPU preview (A2) -------------------------------------------------------

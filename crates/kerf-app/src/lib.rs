@@ -2552,6 +2552,54 @@ fn list_motion_presets() -> Vec<kerf_core::MotionPresetInfo> {
     kerf_core::motion_presets()
 }
 
+/// Replace the live behaviours (sway, breathe, spin, drift, shake) of several clips with one list as one
+/// revision, all or nothing; an empty list clears them. They ride on top of the clip's pose and keys.
+#[tauri::command(async)]
+fn set_behaviors(state: State<'_, AppState>, clip_ids: Vec<String>, behaviors: Vec<kerf_core::Behavior>) -> CmdResult<Timeline> {
+    let ids = ids(&clip_ids, "clip_ids")?;
+    let project = state.project();
+    project.set_behaviors(&ids, behaviors).map_err(|e| e.to_string())?;
+    project.timeline().map_err(|e| e.to_string())
+}
+
+/// What baking behaviours into keys did to one clip: the numbers that now carry keys, how many each, and the
+/// frame rate they sit on.
+#[derive(serde::Serialize)]
+struct BakeReport {
+    clip_id: Uuid,
+    properties: Vec<Property>,
+    keys: usize,
+    fps: f64,
+}
+
+/// What a bake did: the refreshed timeline and, per clip, what was written.
+#[derive(serde::Serialize)]
+struct BakeApplication {
+    timeline: Timeline,
+    baked: Vec<BakeReport>,
+}
+
+/// Sample the behaviours of several clips into keys of the numbers they move and clear them, as one
+/// revision, all or nothing. `fps` defaults to the delivery's rate, else the footage's, else 30.
+#[tauri::command(async)]
+fn bake_behaviors(state: State<'_, AppState>, clip_ids: Vec<String>, fps: Option<f64>) -> CmdResult<BakeApplication> {
+    let ids = ids(&clip_ids, "clip_ids")?;
+    let project = state.project();
+    let done = project.bake_behaviors(&ids, fps).map_err(|e| e.to_string())?;
+    Ok(BakeApplication {
+        timeline: project.timeline().map_err(|e| e.to_string())?,
+        baked: done
+            .into_iter()
+            .map(|b| BakeReport {
+                clip_id: b.clip.id,
+                properties: b.baked.properties,
+                keys: b.baked.keys,
+                fps: b.baked.fps,
+            })
+            .collect(),
+    })
+}
+
 #[tauri::command(async)]
 fn clear_keyframes(state: State<'_, AppState>, clip_id: String) -> CmdResult<Timeline> {
     let id = id(&clip_id, "clip_id")?;
@@ -5805,6 +5853,8 @@ pub fn run() {
             copy_keyframes,
             apply_motion_preset,
             list_motion_presets,
+            set_behaviors,
+            bake_behaviors,
             clear_keyframes,
             set_reframe,
             set_asset_projection,

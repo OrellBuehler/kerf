@@ -27,7 +27,7 @@ import {
 	withTracks,
 	type PathFrame
 } from './motion-path';
-import { propertyAt, propertyKeys, setPropertyKeys, transformAt } from './channels';
+import { baseAt, propertyAt, propertyKeys, setPropertyKeys, transformAt } from './channels';
 import { geometryOf, pictureBox, snapTargets, type Canvas, type Snapping } from './transform-handles';
 import { DEFAULT_TRANSFORM, type Clip, type Keyframe, type PropertyKey } from './types';
 
@@ -548,5 +548,45 @@ describe('the view toggle is remembered', () => {
 		delete (globalThis as unknown as { localStorage?: unknown }).localStorage;
 		expect(loadMotionPath()).toBe(true);
 		expect(() => saveMotionPath(false)).not.toThrow();
+	});
+});
+
+describe('live behaviours ride on the picture, not on the keyed path', () => {
+	const shaking = (): Clip => ({ ...moving(), behaviors: [{ kind: 'shake', amount: 0.05, speed: 6, seed: 3 }, { kind: 'drift', speed: 0.1, angle: 0 }] });
+
+	test('the path and its dots are the keyed base, whatever the behaviours add', () => {
+		const plain = moving();
+		const c = shaking();
+		expect(propertyAt(c, 'pos_x', 1.3)).not.toBeCloseTo(baseAt(c, 'pos_x', 1.3), 3);
+		expect(pathKeys(c, frame, 4)).toEqual(pathKeys(plain, frame, 4));
+		expect(samplePath(c, frame, 4, FPS)).toEqual(samplePath(plain, frame, 4, FPS));
+		expect(keyTimes(c, 4)).toEqual(keyTimes(plain, 4));
+	});
+
+	test('a dot dragged is written as the keyed number, with no wobble in it', () => {
+		const plain = moving();
+		const c = shaking();
+		const times = keyTimes(c, 4);
+		const from = pathKeys(c, frame, 4)[2];
+		const got = dragKey(c, from, frame, 192, -108, noSnap, false, times);
+		expect(got.tracks).toEqual(dragKey(plain, from, frame, 192, -108, noSnap, false, times).tracks);
+		expect(got.pos.pos_x).toBeCloseTo(baseAt(plain, 'pos_x', 2) + 0.1, 4);
+		expect(addKeyTracks(c, 1.5)).toEqual(addKeyTracks(plain, 1.5));
+	});
+
+	test('the frame is made at the picture, so the shift stays the geometry’s rounding and the path stays on the keys', () => {
+		const c: Canvas = { width: 360, height: 640, fit: 'contain' };
+		const clipAt = shaking();
+		const t = 1.3;
+		const pose = { ...DEFAULT_TRANSFORM, ...transformAt(clipAt, t) };
+		const box = pictureBox(geometryOf([640, 360], [1, 1], c, pose)!);
+		const f = pathFrame(c, box, pose);
+		// What the geometry rounds is a pixel or two; the behaviours' offset is tens of pixels, and must not be in it.
+		expect(Math.abs(f.shift.x)).toBeLessThan(2);
+		expect(Math.abs(f.shift.y)).toBeLessThan(2);
+		expect(Math.abs(pose.pos_x - baseAt(clipAt, 'pos_x', t)) * c.width).toBeGreaterThan(10);
+		const onPath = pathAt(clipAt, f)(t);
+		expect(onPath.x).toBeCloseTo(centreOf(f, baseAt(clipAt, 'pos_x', t), baseAt(clipAt, 'pos_y', t)).x, 9);
+		expect(Math.abs(onPath.x - box.cx), 'the box has left the keyed path by the behaviours').toBeGreaterThan(1);
 	});
 });

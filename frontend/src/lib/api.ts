@@ -62,6 +62,8 @@ import type {
 	ModelProgress,
 	Easing,
 	Keyframe,
+	BakeApplication,
+	Behavior,
 	MotionApplication,
 	MotionMode,
 	MotionPreset,
@@ -184,9 +186,10 @@ import {
 	propertyLabel,
 	setPropertyEasing,
 	setPropertyKeys,
-	transformAt
+	baseTransformAt
 } from './channels';
 import { applyMotionPreset as applyMotionPresetLocal, motionPresets } from './motion-presets';
+import { bakeBehaviorsOn, setBehaviors as setBehaviorsLocal } from './behavior-ops';
 import { formatTime as fmtTime } from './diff';
 import {
 	rollEdit as rollEditLocal,
@@ -3125,9 +3128,9 @@ export async function addKeyframe(
 		const found = locate(devTimeline, clipId);
 		if (found) {
 			const clip = found[0].clips[found[1]];
-			// The clip's present pose there (`transform_at`), whichever of the bundle and the
-			// numbers' own tracks drives each number.
-			const tf = transformAt(clip, time);
+			// The clip's present pose there (`base_transform_at`: behaviours ride on top and are not written into
+			// keys), whichever of the bundle and the numbers' own tracks drives each number.
+			const tf = baseTransformAt(clip, time);
 			const base: Keyframe = {
 				time,
 				scale: tf.scale,
@@ -3303,6 +3306,33 @@ export async function applyMotionPreset(
 		return { timeline: snapshot(), applied: done.map((m) => ({ clip_id: m.clip.id, start: m.start, end: m.end })) };
 	}
 	return invoke<MotionApplication>('apply_motion_preset', { clipIds, preset, ...options });
+}
+
+/** Give several clips the live behaviours `behaviors` (sway, breathe, spin, drift, shake) as their whole list, as
+ *  **one** revision, all or nothing; an empty list clears them (`set_behaviors`). They ride on top of the clip's pose
+ *  and keys. Rejects an audio clip, an unknown clip, more than `MAX_BEHAVIORS` or a number out of range, changing
+ *  nothing. */
+export async function setBehaviors(clipIds: string[], behaviors: Behavior[]): Promise<Timeline> {
+	if (!inTauri()) {
+		devRun((tl) => setBehaviorsLocal(tl, clipIds, behaviors));
+		return snapshot();
+	}
+	return invoke<Timeline>('set_behaviors', { clipIds, behaviors });
+}
+
+/** Sample the behaviours of several clips into keys of the numbers they move and clear them, as **one** revision,
+ *  all or nothing (`bake_behaviors`). `fps` defaults to the delivery's rate, else the footage's, else 30. Rejects a
+ *  clip with no behaviours, or one a bake would put more than 1000 keys a number on (the message says how long a
+ *  piece can be), changing nothing. */
+export async function bakeBehaviors(clipIds: string[], fps?: number): Promise<BakeApplication> {
+	if (!inTauri()) {
+		const done = devRun((tl) => bakeBehaviorsOn(tl, sampleAssets, clipIds, fps));
+		return {
+			timeline: snapshot(),
+			baked: done.map((b) => ({ clip_id: b.clip.id, properties: b.baked.properties, keys: b.baked.keys, fps: b.baked.fps }))
+		};
+	}
+	return invoke<BakeApplication>('bake_behaviors', { clipIds, fps });
 }
 
 export async function clearKeyframes(clipId: string): Promise<Timeline> {

@@ -66,6 +66,8 @@ import {
 	setPropertyTracks,
 	copyKeyframes,
 	applyMotionPreset as apiApplyMotionPreset,
+	setBehaviors as apiSetBehaviors,
+	bakeBehaviors as apiBakeBehaviors,
 	setAssetProjection,
 	setReframe,
 	setReframeKeyframes,
@@ -210,7 +212,9 @@ import type {
 	ComposeRequest,
 	ComposeResult,
 	MotionPreset,
-	MotionWindow
+	MotionWindow,
+	BakeReport,
+	Behavior
 } from './types';
 import { clipDuration, GENERATED_ASSET } from './types';
 import { findTitle, type TitleRef } from './title-clips';
@@ -1434,6 +1438,23 @@ class EditorState {
 			})
 		);
 		return applied;
+	}
+	/** Give several clips the live behaviours `behaviors` as their whole list, as **one** revision, all or nothing; an
+	 *  empty list clears them. */
+	setBehaviors(clipIds: string[], behaviors: Behavior[]) {
+		return this.#apply(() => apiSetBehaviors(clipIds, behaviors));
+	}
+	/** Sample the behaviours of several clips into keys and clear them, as **one** revision, all or nothing; resolves
+	 *  to what was written per clip. */
+	async bakeBehaviors(clipIds: string[], fps?: number): Promise<BakeReport[]> {
+		let baked!: BakeReport[];
+		await this.#apply(() =>
+			apiBakeBehaviors(clipIds, fps).then((r) => {
+				baked = r.baked;
+				return r.timeline;
+			})
+		);
+		return baked;
 	}
 	clearKeyframes(clipId: string) {
 		return this.#apply(() => clearKeyframes(clipId));

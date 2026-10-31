@@ -2,7 +2,10 @@
 	// The library's Motion tab: ready-made entrances, exits and emphases for the clips selected on the timeline.
 	// A preset is written as ordinary keyframes on the clip's scale / position / rotation / opacity (relative to the
 	// pose it already has), so the Inspector's keyframe rows, the dope sheet and the motion path show and tune what a
-	// click wrote; nothing here owns a value. One click is one edit for every selected picture clip.
+	// click wrote; nothing here owns a value. One click is one edit for every selected picture clip. The fourth group,
+	// Behaviours, is not keys: a sway, a breath, a spin, a drift or a shake that stays live on top of the pose and
+	// its keys, added with its starting numbers (the Inspector's Behaviours section tunes them) — Mode, Length and
+	// Strength above are the presets' and do not apply.
 	import { onMount } from 'svelte';
 	import Hint from './Hint.svelte';
 	import Tile from './Tile.svelte';
@@ -22,7 +25,9 @@
 	} from '#lib/motion-ui';
 	import { MAX_MOTION_INTENSITY, MIN_MOTION_INTENSITY, motionPresets } from '#lib/motion-presets';
 	import { TIMES } from '#lib/slider-row';
-	import { applyMotion, report } from '#lib/ops';
+	import { addBehavior, applyMotion, report } from '#lib/ops';
+	import { BEHAVIOR_HINTS } from '#lib/behaviors';
+	import { ADD_CHOICES, tileTip } from '#lib/behavior-ui';
 	import type { MotionMode, MotionPresetInfo } from '#lib/types';
 
 	// The table the page ships until the backend's own answers (the two are the same list).
@@ -118,8 +123,32 @@
 		</div>
 	{/each}
 
+	<div class="k-overline" style="margin:16px 0 3px">Behaviours</div>
+	<div style="font-size:12px;color:var(--text-muted);margin-bottom:7px">
+		Motion that goes on all clip long, on top of its pose and keys
+	</div>
+	<div
+		role="group"
+		aria-label="Behaviours"
+		style="display:grid;grid-template-columns:repeat(auto-fill,minmax(104px,1fr));gap:6px"
+	>
+		{#each ADD_CHOICES as c (c.kind)}
+			<Tile
+				disabled={off}
+				pending={hold}
+				title={tileTip(c.kind, BEHAVIOR_HINTS[c.kind], reason)}
+				data-testid="behavior-{c.kind}"
+				style="height:auto;min-height:var(--control-sm);padding-block:4px;white-space:normal;line-height:1.25"
+				onclick={() => void addBehavior(c.kind)}
+			>
+				{c.label}
+			</Tile>
+		{/each}
+	</div>
+
 	<div style="font-size:12px;color:var(--text-muted);line-height:1.45;margin-top:16px">
 		A preset is relative to the clip’s own scale, position and opacity. Add keeps the rest of its animation; Replace
-		starts the numbers a preset moves afresh. Tune the keys in the Inspector.
+		starts the numbers a preset moves afresh. Tune the keys in the Inspector. A behaviour is not keyed: it stays live,
+		adds to the pose, and is tuned (or baked into keys) in the Inspector’s Behaviours section.
 	</div>
 </div>

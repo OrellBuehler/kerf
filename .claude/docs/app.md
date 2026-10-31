@@ -155,6 +155,10 @@ static) / `set_property_tracks { clipId, tracks }` (several numbers' keys in one
 every clip as one revision, all or nothing; answers `MotionApplication` `{timeline, applied: [{clip_id, start, end}]}`, the window each
 clip got, which a `duration` longer than the clip clamps — the Motion tab toasts only that) / `list_motion_presets` (stateless;
 `motion_presets()`: id, label, kind, `default_duration`, hint, numbers keyed),
+`set_behaviors { clipIds, behaviors }` (live sway / breathe / spin / drift / shake as the clips' whole list, `[]` clears; one revision, all or
+nothing, an audio-track clip refuses the lot; answers the `Timeline`) / `bake_behaviors { clipIds, fps? }` (the combined motion sampled into keys
+at the frame grid and the behaviours cleared; answers `BakeApplication` `{timeline, baked: [{clip_id, properties, keys, fps}]}`, or the core's
+refusal text for a clip with none / one too long for its keys, which the Inspector shows under its Bake button),
 `set_reframe` / `clear_reframe` / `set_reframe_keyframes` / `add_reframe_keyframe`,
 `set_asset_projection` (asset-level 360 mark; returns the `Asset`),
 `edit_asset_tags { assetIds, edit }` (`edit` is a `TagEdit` `{add?, remove?, remove_keys?}`: one transaction, no revision; answers the `Asset`s as they now are) /
@@ -439,7 +443,7 @@ comes back `ForbiddenUrl` and the "Release notes" button silently does nothing.
 `reattach_audio_clips`, `link_clips`, `unlink_clips`; *clip properties* `set_volume`, `set_fade`, `set_speed`, `set_speed_ramp`,
 `set_transform`, `set_transform_at`, `set_color`, `set_grade`, `inspect_lut`, `set_transition`, `set_mask`, `set_blend_mode`, `set_video_effects`, `set_audio_effects`,
 `set_clip_stabilize`, `analyze_clip_stabilization`, `cancel_stabilization`, `clip_stabilization_status`, `set_keyframes`,
-`add_keyframe`, `set_keyframe_easing`, `set_property_keyframes`, `set_property_tracks`, `copy_keyframes`, `apply_motion_preset`, `list_motion_presets`, `clear_keyframes`, `set_reframe`,
+`add_keyframe`, `set_keyframe_easing`, `set_property_keyframes`, `set_property_tracks`, `copy_keyframes`, `apply_motion_preset`, `list_motion_presets`, `set_behaviors`, `bake_behaviors`, `clear_keyframes`, `set_reframe`,
 `clear_reframe`, `set_reframe_keyframes`, `add_reframe_keyframe`; *markers, text, titles, captions* `add_marker`,
 `update_marker`, `remove_marker`, `add_overlay`, `update_overlay`, `remove_overlay`, `set_overlay_keyframes`,
 `add_svg_overlay`, `update_svg_overlay`, `remove_svg_overlay`, `validate_svg`, `list_svg_presets`,

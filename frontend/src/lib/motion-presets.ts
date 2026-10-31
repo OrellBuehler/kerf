@@ -6,13 +6,13 @@
  *
  * Each preset is a row: a kind, a default span, a `base` and, per number, keys `(at, x, easing)` — `at` the
  * fraction of the window, `x` a factor of the reference for scale and opacity and an offset for position
- * (frame fractions) and rotation (degrees). The reference is the clip's pose (`propertyAt`, sampled before
- * anything is written): an entrance ends on the pose at the window's end, an exit starts from the pose at its
- * start, an emphasis rides the line between the two edge poses. `replace` is relative to the number's static
- * value instead. `fixtures/motion-presets-corpus.json` (written by kerf-core) pins every number
+ * (frame fractions) and rotation (degrees). The reference is the clip's pose (`baseAt`: its keys, sampled before
+ * anything is written; a live behaviour rides on top of them and is not written into them): an entrance ends on
+ * the pose at the window's end, an exit starts from the pose at its start, an emphasis rides the line between the
+ * two edge poses. `replace` is relative to the number's static value instead. `fixtures/motion-presets-corpus.json` (written by kerf-core) pins every number
  * (`motion-presets.test.ts`).
  */
-import { clampProperty, propertyAt, propertyKeys, propertyLabel, propertyKeysProblem, propertyProblem, setPropertyKeys, staticValue, upsertKey } from './channels';
+import { baseAt, clampProperty, propertyKeys, propertyLabel, propertyKeysProblem, propertyProblem, setPropertyKeys, staticValue, upsertKey } from './channels';
 import { TINY_SCALE } from './layer-geometry';
 import { clipDuration } from './speed-ramp';
 import type { Edited } from './link-ops';
@@ -249,7 +249,7 @@ function presetKeys(
 	mode: MotionMode
 ): PropertyKey[] {
 	const [start, end] = window;
-	const pose = (at: number) => (mode === 'add' ? propertyAt(clip, t.prop, at) : staticValue(clip, t.prop));
+	const pose = (at: number) => (mode === 'add' ? baseAt(clip, t.prop, at) : staticValue(clip, t.prop));
 	const [poseStart, poseEnd] = [pose(start), pose(end)];
 	const last = t.keys.length - 1;
 	return t.keys.map((key, i) => {
@@ -268,7 +268,7 @@ function merged(clip: Clip, prop: Property, fresh: PropertyKey[]): PropertyKey[]
 	if (existing.length === 0) return fresh;
 	const [start, end] = [fresh[0].time, fresh[fresh.length - 1].time];
 	let keys = existing;
-	for (const edge of [start, end]) keys = upsertKey(keys, { time: edge, value: propertyAt(clip, prop, edge) });
+	for (const edge of [start, end]) keys = upsertKey(keys, { time: edge, value: baseAt(clip, prop, edge) });
 	fresh[fresh.length - 1].easing = keys.find((k) => Math.abs(k.time - end) <= SAME)?.easing ?? 'linear';
 	return [...keys.filter((k) => k.time < start - SAME), ...fresh, ...keys.filter((k) => k.time > end + SAME)];
 }

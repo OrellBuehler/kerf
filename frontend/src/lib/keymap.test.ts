@@ -1124,6 +1124,7 @@ describe('no key is hard-coded outside the registry', () => {
 		// listed so a new one is a decision.
 		expect(handlers).toEqual([
 			'lib/components/editor/AgentPanel.svelte',
+			'lib/components/editor/BehaviorsSection.svelte',
 			'lib/components/editor/ContextMenu.svelte',
 			'lib/components/editor/DopeGraph.svelte',
 			'lib/components/editor/DopeSheet.svelte',

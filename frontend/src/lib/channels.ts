@@ -1,7 +1,9 @@
 /**
  * Per-property keyframe channels: the faithful TS mirror of kerf-core's `model/channels.rs`
  * (`Property`, `PropertyTrack`, `Clip::property_keys` / `property_curve` / `property_at`,
- * `color_at`, `volume_at`, `mask_at`, `crop_window_at`, `upsert`, `rebase_head`).
+ * `color_at`, `volume_at`, `mask_at`, `crop_window_at`, `upsert`, `rebase_head`). Two views of a transform
+ * number, as in the core: `propertyAt` / `transformAt` are the picture (live behaviours, `behaviors.ts`, on top of
+ * the keys) and `baseAt` / `baseTransformAt` the pose without them, which every edit that writes keys samples.
  * Any one number of a clip — a transform number, a colour number, the clip's volume, a number of
  * its mask or the animated crop (a zoom and a pan, see `cropWindowAt`) — can have keys of its own;
  * a number with a track is
@@ -11,11 +13,13 @@
  * against the Rust tests (`channels.test.ts`).
  */
 import { easedPoints, splitEasing, EASE_STEPS, curve, insertKeyframe } from './easing';
+import { behavedValue, behaves as behavesBy } from './behaviors';
 import type { Clip, Color, Easing, Keyframe, Mask, Property, PropertyKey, PropertyTrack, Transform } from './types';
 import { DEFAULT_COLOR, DEFAULT_TRANSFORM } from './types';
 
 /** What the samplers read of a clip: a gain clip (`audio-mix.ts`) carries no transform. */
-export type Animatable = Pick<Clip, 'volume' | 'channels' | 'keyframes' | 'transform' | 'color'> & Partial<Pick<Clip, 'mask'>>;
+export type Animatable = Pick<Clip, 'volume' | 'channels' | 'keyframes' | 'transform' | 'color'> &
+	Partial<Pick<Clip, 'mask' | 'behaviors'>>;
 
 export const PROPERTIES: readonly Property[] = [
 	'scale',
@@ -291,13 +295,31 @@ export function normalizedMask(m: Mask): Mask {
 	};
 }
 
-/** `prop` at `local` seconds from the clip's start: its curve, else its static value. */
-export function propertyAt(clip: Animatable, prop: Property, local: number): number {
+/** `prop` at `local` seconds from the clip's start **without** behaviours: its curve, else its static value
+ *  (`Clip::base_at`). What an edit that writes keys must sample, or a behaviour would be written into the keys and
+ *  then added a second time. */
+export function baseAt(clip: Animatable, prop: Property, local: number): number {
 	return interpolate(propertyCurve(clip, prop), local) ?? staticValue(clip, prop);
 }
 
-/** Whether any transform number is keyed (`Clip::is_animated`). */
-export const transformAnimated = (clip: Animatable) => TRANSFORM_PROPERTIES.some((p) => isKeyed(clip, p));
+/** Whether a live behaviour moves `prop` (`Clip::behaves`; only a transform number can be). */
+export const behaves = (clip: Animatable, prop: Property): boolean => isTransformProperty(prop) && behavesBy(clip.behaviors, prop);
+
+/** `prop` at `local` seconds from the clip's start: the picture, i.e. its curve (else its static value) with the
+ *  clip's live behaviours applied on top (`Clip::property_at`). */
+export function propertyAt(clip: Animatable, prop: Property, local: number): number {
+	const base = baseAt(clip, prop, local);
+	return isTransformProperty(prop) ? behavedValue(clip.behaviors, prop, base, local) : base;
+}
+
+/** Whether `prop` is an expression of time in the graph: it has keys, or a behaviour moves it (`Clip::is_driven`). */
+export const isDriven = (clip: Animatable, prop: Property): boolean => isKeyed(clip, prop) || behaves(clip, prop);
+
+/** Whether any transform number is keyed: the keys alone, a behaviour not counted. What routes an edit of a number
+ *  (a key at the playhead, or the static value). */
+export const transformKeyed = (clip: Animatable) => TRANSFORM_PROPERTIES.some((p) => isKeyed(clip, p));
+/** Whether any transform number is keyed or moved by a live behaviour (`Clip::is_animated`). */
+export const transformAnimated = (clip: Animatable) => TRANSFORM_PROPERTIES.some((p) => isDriven(clip, p));
 /** Whether any colour number is keyed (`Clip::color_animated`). */
 export const colorAnimated = (clip: Animatable) => COLOR_PROPERTIES.some((p) => isKeyed(clip, p));
 /** Whether the clip's volume is keyed (`Clip::volume_animated`). */
@@ -308,7 +330,8 @@ export const volumeAnimated = (clip: Animatable) => isKeyed(clip, 'volume');
  *  the old value; every keyed write uses this, so the Inspector and the handles hit the same key. */
 export const keyTime = (clip: { timeline_start: number }, playhead: number) => Math.max(0, playhead - clip.timeline_start);
 
-/** The clip's static transform with every keyed number sampled at `local` (`Clip::transform_at`). */
+/** The clip's static transform with every keyed number sampled at `local` and the live behaviours applied on top:
+ *  the picture (`Clip::transform_at`). An edit that writes keys samples `baseTransformAt` instead. */
 export function transformAt(clip: Animatable, local: number): Transform {
 	const t: Transform = { ...DEFAULT_TRANSFORM, ...(clip.transform ?? {}) };
 	if (!transformAnimated(clip)) return t;
@@ -319,6 +342,46 @@ export function transformAt(clip: Animatable, local: number): Transform {
 	t.opacity = propertyAt(clip, 'opacity', local);
 	return t;
 }
+
+/** [`transformAt`] without behaviours: the pose the keys (or the static transform) give
+ *  (`Clip::base_transform_at`). What the Inspector's sliders show and every key-writing edit samples. */
+export function baseTransformAt(clip: Animatable, local: number): Transform {
+	const t: Transform = { ...DEFAULT_TRANSFORM, ...(clip.transform ?? {}) };
+	if (!transformKeyed(clip)) return t;
+	t.scale = baseAt(clip, 'scale', local);
+	t.pos_x = baseAt(clip, 'pos_x', local);
+	t.pos_y = baseAt(clip, 'pos_y', local);
+	t.rotation = baseAt(clip, 'rotation', local);
+	t.opacity = baseAt(clip, 'opacity', local);
+	return t;
+}
+
+/** Whether the keyed values of `prop` differ from its first key's (the test `zoom_animated` and its kin use). */
+function keysVary(clip: Animatable, prop: Property): boolean {
+	const keys = propertyKeys(clip, prop);
+	return keys.length > 0 && keys.some((k) => Math.abs(k.value - keys[0].value) > 1e-9);
+}
+
+/** Whether the zoom moves: a keyed scale that varies, or a breath (`Clip::zoom_animated`). */
+export const zoomAnimated = (clip: Animatable) => keysVary(clip, 'scale') || behaves(clip, 'scale');
+
+/** Whether the zoom or the position moves, so the picture lands elsewhere from frame to frame
+ *  (`Clip::placement_animated`). */
+export const placementAnimated = (clip: Animatable) =>
+	keysVary(clip, 'scale') ||
+	keysVary(clip, 'pos_x') ||
+	keysVary(clip, 'pos_y') ||
+	behaves(clip, 'scale') ||
+	behaves(clip, 'pos_x') ||
+	behaves(clip, 'pos_y');
+
+/** Whether the picture moves on the frame: its zoom, its position or the animated crop changes
+ *  (`Clip::picture_moves`). */
+export const pictureMoves = (clip: Animatable) =>
+	zoomAnimated(clip) || keysVary(clip, 'pos_x') || keysVary(clip, 'pos_y') || behaves(clip, 'pos_x') || behaves(clip, 'pos_y') || cropAnimated(clip);
+
+/** Whether the picture can be turned: a rotation key off zero, or a behaviour that rotates (`Clip::rotation_turns`). */
+export const rotationTurns = (clip: Animatable) => propertyKeys(clip, 'rotation').some((k) => k.value !== 0) || behaves(clip, 'rotation');
 
 /** The clip's colour with every keyed number sampled at `local` (`Clip::color_at`). */
 export function colorAt(clip: Animatable, local: number): Color {
@@ -501,7 +564,8 @@ export function clearTransformAnimation(clip: Clip) {
 
 /** Pose the transform as it should read `time` seconds into the clip (`Clip::pose_transform`): a
  *  keyed number gets a key there — in its own track when it has one, else in the bundle (the rest
- *  of the bundle at its sampled values) — and every other number, the crop always, its static value. */
+ *  of the bundle at its sampled values, **without** behaviours: they ride on top, they are not the pose) — and
+ *  every other number, the crop always, its static value. */
 export function poseTransform(clip: Clip, time: number, patch: Partial<Transform>) {
 	const numbers = TRANSFORM_PROPERTIES.filter((p) => patch[p as keyof Transform] !== undefined).map(
 		(p) => [p, patch[p as keyof Transform] as number] as const
@@ -509,7 +573,7 @@ export function poseTransform(clip: Clip, time: number, patch: Partial<Transform
 	const tracked = (p: Property) => (channelOf(clip, p)?.keys.length ?? 0) > 0;
 	const bundled = numbers.filter(([p]) => !channelOf(clip, p) && isKeyed(clip, p));
 	if (bundled.length) {
-		const tf = transformAt(clip, time);
+		const tf = baseTransformAt(clip, time);
 		const key: Keyframe = { time, scale: tf.scale, pos_x: tf.pos_x, pos_y: tf.pos_y, rotation: tf.rotation, opacity: tf.opacity };
 		for (const [p, v] of bundled) key[p as 'scale'] = v;
 		clip.keyframes = insertKeyframe(clip.keyframes ?? [], key);

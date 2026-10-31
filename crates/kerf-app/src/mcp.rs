@@ -1562,6 +1562,41 @@ struct MotionPresetParams {
 }
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct SetBehaviorsParams {
+    #[schemars(
+        description = "UUIDs of the picture clips to give these behaviours (a clip on an audio track refuses the \
+                       whole call); a clip named twice counts once"
+    )]
+    clip_ids: Vec<String>,
+    #[schemars(
+        description = "The clip's whole list of behaviours, at most 8, replacing what each clip has; [] clears them. \
+                       Each is tagged by `kind`: sway {amount: degrees 0..180 each way, speed: Hz 0..30}; breathe \
+                       {amount: fraction of the zoom 0..0.9, speed: Hz 0..30}; spin {speed: turns a second -10..10, \
+                       negative turns the other way}; drift {speed: frame widths (heights) a second -5..5, angle: \
+                       degrees from the right, 90 is straight down (default 0)}; shake {amount: frame fraction \
+                       0..0.25, speed: Hz 0..30, seed: integer (default 0), the same seed is the same shake}. Every \
+                       kind takes `phase`, seconds added to the clip's clock (default 0). A number outside its range \
+                       refuses the call; one at 0 (an amount or a speed) is kept but moves nothing"
+    )]
+    behaviors: Vec<kerf_core::Behavior>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+struct BakeBehaviorsParams {
+    #[schemars(
+        description = "UUIDs of the picture clips to bake (a clip with no behaviours, or one a bake would put too many \
+                       keys on, refuses the whole call and says which); a clip named twice counts once"
+    )]
+    clip_ids: Vec<String>,
+    #[schemars(
+        description = "The frame rate to sample at, 1 to 1000. Default: the delivery format's rate, else the first \
+                       picture's footage, else 30. Match the rate you export at: a bake is exact on those frames and a \
+                       straight line between them"
+    )]
+    fps: Option<f64>,
+}
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 struct SetKeyframeEasingParams {
     #[schemars(description = "UUID of the clip")]
     clip_id: String,
@@ -2850,7 +2885,8 @@ impl KerfMcp {
                        A template title's source is shown with its text as `<text>` (it is drawn as glyph outlines, \
                        which are left out); set its text with set_template_values. A clip with `speed_ramp` keys \
                        (set_speed_ramp) plays at a rate that changes over its length; its `speed` then only gives the \
-                       direction. timeline_summary is much smaller (durations, gaps, proxies); preview_svg_overlay shows how a title looks."
+                       direction. A clip with `behaviors` (set_behaviors) has live sway / breathe / spin / drift / shake on top of its pose. \
+                       timeline_summary is much smaller (durations, gaps, proxies); preview_svg_overlay shows how a title looks."
     )]
     fn get_timeline_state(&self, Parameters(p): Parameters<TimelineStateParams>) -> Result<String, McpError> {
         let mut timeline = self.lock().working_timeline().map_err(core_err)?;
@@ -4221,6 +4257,77 @@ impl KerfMcp {
             .map(|m| serde_json::json!({"clip_id": m.clip.id, "start": m.start, "end": m.end}))
             .collect();
         json(&serde_json::json!({"preset": p.preset, "mode": mode, "applied": applied}))
+    }
+
+    #[tool(
+        description = "Give clips live behaviours: procedural motion that rides on top of the clip's pose and its \
+                       keyframes and never has to be keyed. sway rocks the picture (rotation, `amount` degrees each way \
+                       at `speed` Hz); breathe pulses the zoom (`amount` as a fraction of the scale, at most 0.9, \
+                       `speed` Hz); spin turns it steadily (`speed` turns a second, negative the other way); drift \
+                       slides it steadily (`speed` frame widths / heights a second along `angle` degrees from the \
+                       right, 90 is down); shake is a handheld jitter (`amount` of the frame, at most 0.25, at `speed` \
+                       Hz, `seed` picks which shake and the same seed is the same shake everywhere). Each takes `phase`, \
+                       seconds added to the clip's clock. The list REPLACES what each clip has (read it first with \
+                       get_timeline_state: `behaviors` on the clip), at most 8, and [] clears them; several of a kind add \
+                       up. Only scale, position and rotation move, never opacity, colour, mask or crop. Behaviours \
+                       export exactly as shown (a short expression, not keys), a split or a range export carries the motion \
+                       on from where it was, and a later key edit (set_transform_at, add_keyframe, a motion \
+                       preset) writes the pose without them. The GPU preview falls back to FFmpeg for a clip with \
+                       them. One revision for all clips, all or nothing; a clip on an audio track is refused. To make \
+                       the motion editable as keys, bake_behaviors. Returns each clip's `clip_id` and `behaviors`."
+    )]
+    fn set_behaviors(&self, Parameters(p): Parameters<SetBehaviorsParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::set_behaviors_op(project, p))
+    }
+
+    fn set_behaviors_op(project: &Project, p: SetBehaviorsParams) -> Result<String, McpError> {
+        let ids = p
+            .clip_ids
+            .iter()
+            .map(|s| parse_arg("clip_ids", s))
+            .collect::<Result<Vec<Uuid>, _>>()?;
+        let done = project.set_behaviors(&ids, p.behaviors).map_err(core_err)?;
+        let clips: Vec<serde_json::Value> = done
+            .iter()
+            .map(|c| serde_json::json!({"clip_id": c.id, "behaviors": c.behaviors}))
+            .collect();
+        json(&serde_json::json!({ "clips": clips }))
+    }
+
+    #[tool(
+        description = "Turn clips' live behaviours (set_behaviors) into ordinary keyframes and clear the behaviours: \
+                       the combined motion (the clip's own keys with the behaviours on top) is sampled at every frame of \
+                       an `fps` grid into linear keys on scale, position and rotation, so it can then be edited, eased or \
+                       retimed like any animation. Exact at those frames and a straight line between them, so bake at \
+                       the rate you export at. A clip holds at most 1000 keys a number (about 33 s at 30 fps): a longer \
+                       clip is refused with a message saying how long a piece can be (split it first) or keep the \
+                       behaviour live, which costs the export nothing. A clip with no behaviours is refused. One \
+                       revision for all clips, all or nothing. Returns per clip its `clip_id`, the `properties` that now \
+                       carry keys, the `keys` written to each and the `fps`."
+    )]
+    fn bake_behaviors(&self, Parameters(p): Parameters<BakeBehaviorsParams>) -> Result<String, McpError> {
+        self.edit(|project| Self::bake_behaviors_op(project, p))
+    }
+
+    fn bake_behaviors_op(project: &Project, p: BakeBehaviorsParams) -> Result<String, McpError> {
+        let ids = p
+            .clip_ids
+            .iter()
+            .map(|s| parse_arg("clip_ids", s))
+            .collect::<Result<Vec<Uuid>, _>>()?;
+        let done = project.bake_behaviors(&ids, p.fps).map_err(core_err)?;
+        let baked: Vec<serde_json::Value> = done
+            .iter()
+            .map(|b| {
+                serde_json::json!({
+                    "clip_id": b.clip.id,
+                    "properties": b.baked.properties,
+                    "keys": b.baked.keys,
+                    "fps": b.baked.fps,
+                })
+            })
+            .collect();
+        json(&serde_json::json!({ "baked": baked }))
     }
 
     #[tool(
@@ -7327,6 +7434,7 @@ const INSTRUCTIONS: &str = "Kerf is the video editor open on this computer, and 
              you edit, and at a whole assembled cut with skim_timeline. Cut with split / trim / move_clip / remove / ripple_delete, then polish with \
              set_volume, set_fade, set_transition, set_transform, set_color, apply_motion_preset (an \
              entrance, exit or emphasis such as pop_in or slide_out_to_left, on top of the clip's own pose), \
+             set_behaviors (a live sway, breath, spin, drift or shake that never needs keys), \
              add_overlay and generate_captions (caption last, once the cut is settled). A plan of several edits runs as \
              one apply_edits call: one step, all or nothing, and dry_run previews it. Before you call a cut done, run \
              platform_check and review_cut, and get_levels for anything going to social; export renders it to an \
@@ -7471,7 +7579,15 @@ const EDITING_GUIDE: &str = "How to edit with Kerf. The user queues editing task
              entrances start at the clip's start, exits end at its end, `at` and `duration` move and \
              size the window (clamped to the clip: read the window each clip got back), and mode add \
              (default) keeps the clip's other keys outside the window so a fade_in, a fade_out and a \
-             mid-clip pulse coexist, while replace overwrites those numbers' keys. 360 footage (Insta360 \
+             mid-clip pulse coexist, while replace overwrites those numbers' keys. For motion that just \
+             goes on (a gentle sway, a breathing zoom, a steady spin or drift, a handheld shake) use \
+             set_behaviors instead of keys: sway, breathe, spin, drift and shake ride on top of the clip's \
+             pose and keys, each a few numbers (amount, speed in Hz or turns a second, phase), up to 8 \
+             a clip, export exactly and cost nothing however long the clip is; the list you send REPLACES \
+             the clip's (the clip's `behaviors` in get_timeline_state), [] clears it. Key edits write the \
+             pose without them. bake_behaviors turns them into keys (about 33 s of a clip at 30 fps at most) \
+             when you want to edit the motion itself. The GPU preview draws a clip with them through FFmpeg. \
+             360 footage (Insta360 \
              .insv, equirect exports) is detected on import and clips cut from it \
              are reframed to an ordinary rectilinear shot automatically: aim the \
              virtual camera with set_reframe (yaw / pitch / roll / field of view) \
@@ -11829,6 +11945,360 @@ mod tests {
             serde_json::to_value(crate::lock_user(&shared).staged_timeline().unwrap()).unwrap(),
             staged_before,
             "and changes nothing in the proposal"
+        );
+    }
+
+    #[test]
+    fn the_behavior_tools_say_what_they_take_and_how_far() {
+        let tools = router().list_all();
+        let tool = |name: &str| {
+            tools
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("`{name}` is registered"))
+        };
+        let required = |name: &str| -> Vec<String> {
+            let mut r: Vec<String> = tool(name)
+                .input_schema
+                .get("required")
+                .and_then(|r| r.as_array())
+                .map(|r| r.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            r.sort();
+            r
+        };
+        assert_eq!(required("set_behaviors"), ["behaviors", "clip_ids"]);
+        assert_eq!(required("bake_behaviors"), ["clip_ids"]);
+
+        let description = |name: &str| tool(name).description.as_deref().unwrap_or_default().to_string();
+        let set = description("set_behaviors");
+        for kind in kerf_core::BehaviorKind::wire_names() {
+            assert!(set.contains(kind), "the description does not name `{kind}`: {set}");
+        }
+        for needle in [
+            "on top of the clip's pose",
+            "REPLACES",
+            "at most 8",
+            "[] clears",
+            "never opacity",
+            "export exactly",
+            "GPU preview falls back to FFmpeg",
+            "all or nothing",
+            "audio track",
+            "bake_behaviors",
+            "get_timeline_state",
+        ] {
+            assert!(set.contains(needle), "set_behaviors does not say `{needle}`: {set}");
+        }
+        let bake = description("bake_behaviors");
+        for needle in [
+            "keyframes",
+            "every frame",
+            "1000 keys",
+            "split it first",
+            "no behaviours is refused",
+            "all or nothing",
+        ] {
+            assert!(bake.contains(needle), "bake_behaviors does not say `{needle}`: {bake}");
+        }
+        // The schema carries every limit the core enforces, so a model need not learn them from a refusal.
+        let schema = serde_json::to_string(&tool("set_behaviors").input_schema).unwrap();
+        for limit in [
+            kerf_core::MAX_SWAY_DEGREES,
+            kerf_core::MAX_BEHAVIOR_HZ,
+            kerf_core::MAX_BREATHE,
+            kerf_core::MAX_SPIN_TURNS,
+            kerf_core::MAX_DRIFT,
+            kerf_core::MAX_SHAKE,
+        ] {
+            let said = format!("{limit}");
+            assert!(
+                schema.contains(&format!("..{said}")) || schema.contains(&format!(" {said}")),
+                "the schema does not say the limit {said}: {schema}"
+            );
+        }
+        assert!(schema.contains(&format!("at most {}", kerf_core::MAX_BEHAVIORS)), "{schema}");
+        assert!(schema.contains("90 is straight down"), "{schema}");
+        assert!(schema.contains("same seed is the same shake"), "{schema}");
+
+        let hint = |name: &str| tool(name).annotations.clone().unwrap();
+        let set_hint = hint("set_behaviors");
+        assert_eq!(
+            (set_hint.read_only_hint, set_hint.destructive_hint, set_hint.idempotent_hint),
+            (Some(false), Some(false), Some(true)),
+            "a list replaced by the same list is the same cut"
+        );
+        let bake_hint = hint("bake_behaviors");
+        assert_eq!(
+            (
+                bake_hint.read_only_hint,
+                bake_hint.destructive_hint,
+                bake_hint.idempotent_hint
+            ),
+            (Some(false), Some(false), Some(false)),
+            "a staged, undoable edit that does not claim to repeat harmlessly"
+        );
+        for name in ["set_behaviors", "bake_behaviors"] {
+            assert_eq!(
+                super::toolsets::set_of(name),
+                Some(super::toolsets::ToolSet::Keyframes),
+                "{name}"
+            );
+            assert!(super::batch::BATCHABLE.contains(&name), "{name} batches in apply_edits");
+        }
+
+        assert!(super::INSTRUCTIONS.contains("set_behaviors"));
+        assert!(super::INSTRUCTIONS.len() <= 3500, "{} characters", super::INSTRUCTIONS.len());
+        for needle in [
+            "set_behaviors",
+            "bake_behaviors",
+            "REPLACES",
+            "Key edits write the pose without them",
+            "GPU preview draws a clip with them through FFmpeg",
+        ] {
+            assert!(super::EDITING_GUIDE.contains(needle), "the guide does not say `{needle}`");
+        }
+        assert!(description("get_timeline_state").contains("`behaviors`"));
+
+        let parse = |v: serde_json::Value| serde_json::from_value::<super::SetBehaviorsParams>(v);
+        let ok = parse(serde_json::json!({
+            "clip_ids": ["c"],
+            "behaviors": [
+                {"kind": "sway", "amount": 5, "speed": 0.5},
+                {"kind": "shake", "amount": 0.01, "speed": 8, "seed": 7},
+                {"kind": "drift", "speed": 0.02},
+            ],
+        }))
+        .unwrap();
+        assert_eq!(ok.behaviors.len(), 3);
+        assert_eq!(
+            ok.behaviors[2],
+            kerf_core::Behavior::Drift {
+                speed: 0.02,
+                angle: 0.0,
+                phase: 0.0
+            },
+            "angle and phase default to 0"
+        );
+        for bad in [
+            serde_json::json!({"clip_ids": ["c"], "behaviors": [{"kind": "wobble", "amount": 1}]}),
+            serde_json::json!({"clip_ids": ["c"], "behaviors": [{"kind": "sway", "speed": 1}]}),
+            serde_json::json!({"clip_ids": ["c"]}),
+            serde_json::json!({"behaviors": []}),
+        ] {
+            assert!(parse(bad.clone()).is_err(), "{bad}");
+        }
+    }
+
+    /// The agent gives a clip behaviours: with review on they are held back as a proposal (the live cut is
+    /// untouched), the agent's own reads show them on the clip, the webview is told once per edit, and a
+    /// refused call changes nothing and says so as the caller's mistake. A bake turns them into keys.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_agent_sets_and_bakes_behaviors_and_it_stages() {
+        use rmcp::model::ErrorCode;
+        let (server, shared) = headless_server();
+        let (clip, other, long, voice) = {
+            let project = shared.lock().unwrap();
+            let video = footage(&project, "a.mp4", 120.0, "2026-01-01T00:00:00Z");
+            let clip = project.add_clip_to_timeline(video.id, None, 0.0, 10.0, Some(0.0)).unwrap();
+            let other = project.add_clip_to_timeline(video.id, None, 20.0, 24.0, Some(10.0)).unwrap();
+            let long = project.add_clip_to_timeline(video.id, None, 30.0, 80.0, Some(14.0)).unwrap();
+            let sound: kerf_core::Asset = serde_json::from_value(serde_json::json!({
+                "id": uuid::Uuid::new_v4(), "path": "/footage/voice.wav", "name": "voice.wav", "duration": 5.0,
+                "streams": [{ "index": 0, "kind": "audio", "codec": "pcm_s16le", "sample_rate": 48000, "channels": 2 }],
+                "imported_at": "2026-01-01T00:00:02Z",
+            }))
+            .unwrap();
+            project.insert_or_get_asset(&sound).unwrap();
+            let voice = project.add_clip_to_timeline(sound.id, None, 0.0, 5.0, Some(0.0)).unwrap();
+            (clip, other, long, voice)
+        };
+        let changed = std::sync::Arc::new(AtomicI64::new(0));
+        {
+            let changed = changed.clone();
+            server.app.listen("project-changed", move |_| {
+                changed.fetch_add(1, Ordering::Relaxed);
+            });
+        }
+        let set = |ids: Vec<String>, behaviors: serde_json::Value| super::SetBehaviorsParams {
+            clip_ids: ids,
+            behaviors: serde_json::from_value(behaviors).unwrap(),
+        };
+        let sway = serde_json::json!({"kind": "sway", "amount": 5.0, "speed": 0.5});
+        let shake = serde_json::json!({"kind": "shake", "amount": 0.01, "speed": 8.0, "seed": 7});
+
+        let done = answer(
+            server
+                .set_behaviors(Parameters(set(
+                    vec![clip.id.to_string(), other.id.to_string()],
+                    serde_json::json!([sway, shake]),
+                )))
+                .unwrap(),
+        );
+        let clips = done["clips"].as_array().unwrap();
+        assert_eq!(clips.len(), 2);
+        assert_eq!(clips[0]["clip_id"], clip.id.to_string());
+        assert_eq!(
+            clips[0]["behaviors"][0],
+            serde_json::json!({"kind": "sway", "amount": 5.0, "speed": 0.5, "phase": 0.0})
+        );
+        assert_eq!(clips[0]["behaviors"][1]["seed"], 7);
+        assert_eq!(changed.load(Ordering::Relaxed), 1, "the webview is told after the edit");
+        {
+            let user = crate::lock_user(&shared);
+            assert!(
+                user.timeline().unwrap().clip(clip.id).unwrap().behaviors.is_empty(),
+                "the live cut is the user's until they accept"
+            );
+            let proposed = user
+                .staged_timeline()
+                .unwrap()
+                .expect("the behaviours are held back as a proposal");
+            assert_eq!(proposed.clip(clip.id).unwrap().behaviors.len(), 2);
+            assert_eq!(proposed.clip(other.id).unwrap().behaviors.len(), 2);
+        }
+
+        // The agent's own read of the cut shows them on the clip, which is how it reads the list it replaces.
+        let state = answer(
+            server
+                .get_timeline_state(Parameters(
+                    serde_json::from_value::<super::TimelineStateParams>(serde_json::json!({})).unwrap(),
+                ))
+                .unwrap(),
+        );
+        let seen = state["tracks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|t| t["clips"].as_array().unwrap().iter())
+            .find(|c| c["id"] == clip.id.to_string())
+            .expect("the clip is in the state");
+        assert_eq!(seen["behaviors"][0]["kind"], "sway");
+        assert_eq!(seen["behaviors"][1]["kind"], "shake");
+
+        // A shorter list replaces the longer; [] clears.
+        server
+            .set_behaviors(Parameters(set(vec![other.id.to_string()], serde_json::json!([sway]))))
+            .unwrap();
+        server
+            .set_behaviors(Parameters(set(vec![other.id.to_string()], serde_json::json!([]))))
+            .unwrap();
+        {
+            let user = crate::lock_user(&shared);
+            let proposed = user.staged_timeline().unwrap().unwrap();
+            assert!(proposed.clip(other.id).unwrap().behaviors.is_empty());
+            assert_eq!(proposed.clip(clip.id).unwrap().behaviors.len(), 2);
+        }
+        assert_eq!(changed.load(Ordering::Relaxed), 3);
+
+        // Mistakes are the caller's, and leave nothing behind.
+        let before = changed.load(Ordering::Relaxed);
+        let staged_before = serde_json::to_value(crate::lock_user(&shared).staged_timeline().unwrap()).unwrap();
+        let nine = serde_json::Value::Array(vec![sway.clone(); kerf_core::MAX_BEHAVIORS + 1]);
+        for (name, call) in [
+            ("not an id", set(vec!["a.mp4".into()], serde_json::json!([sway]))),
+            (
+                "a clip that is not there",
+                set(
+                    vec![clip.id.to_string(), uuid::Uuid::new_v4().to_string()],
+                    serde_json::json!([sway]),
+                ),
+            ),
+            ("nothing named", set(vec![], serde_json::json!([sway]))),
+            (
+                "a sound",
+                set(vec![clip.id.to_string(), voice.id.to_string()], serde_json::json!([sway])),
+            ),
+            (
+                "a sway past its angle",
+                set(
+                    vec![clip.id.to_string()],
+                    serde_json::json!([{"kind": "sway", "amount": 181.0, "speed": 1.0}]),
+                ),
+            ),
+            (
+                "a breath that would reach nothing",
+                set(
+                    vec![clip.id.to_string()],
+                    serde_json::json!([{"kind": "breathe", "amount": 0.95, "speed": 1.0}]),
+                ),
+            ),
+            (
+                "a speed past thirty hertz",
+                set(
+                    vec![clip.id.to_string()],
+                    serde_json::json!([{"kind": "shake", "amount": 0.01, "speed": 31.0}]),
+                ),
+            ),
+            ("more than a clip carries", set(vec![clip.id.to_string()], nine)),
+        ] {
+            let err = server.set_behaviors(Parameters(call)).unwrap_err();
+            assert_eq!(err.code, ErrorCode::INVALID_PARAMS, "{name}: {}", err.message);
+        }
+        assert_eq!(
+            changed.load(Ordering::Relaxed),
+            before,
+            "a refused call tells the webview nothing"
+        );
+        assert_eq!(
+            serde_json::to_value(crate::lock_user(&shared).staged_timeline().unwrap()).unwrap(),
+            staged_before,
+            "and changes nothing in the proposal"
+        );
+
+        // Baking: the motion becomes keys on the numbers it moved, at the frame grid, and the behaviours go.
+        let bake = |ids: Vec<String>, fps| super::BakeBehaviorsParams { clip_ids: ids, fps };
+        let baked = answer(
+            server
+                .bake_behaviors(Parameters(bake(vec![clip.id.to_string()], Some(24.0))))
+                .unwrap(),
+        );
+        let report = &baked["baked"][0];
+        assert_eq!(report["clip_id"], clip.id.to_string());
+        assert_eq!(report["fps"], 24.0);
+        assert_eq!(
+            report["properties"],
+            serde_json::json!(["pos_x", "pos_y", "rotation"]),
+            "a sway turns it, a shake moves it"
+        );
+        assert_eq!(report["keys"], 241, "a key a frame of a 10 s clip at 24 fps, and its end");
+        {
+            let user = crate::lock_user(&shared);
+            let proposed = user.staged_timeline().unwrap().unwrap();
+            let c = proposed.clip(clip.id).unwrap();
+            assert!(c.behaviors.is_empty());
+            assert_eq!(c.property_keys(kerf_core::Property::Rotation).len(), 241);
+        }
+        for (name, call) in [
+            ("a clip with none left", bake(vec![clip.id.to_string()], None)),
+            ("a rate past the top", bake(vec![clip.id.to_string()], Some(5000.0))),
+        ] {
+            let err = server.bake_behaviors(Parameters(call)).unwrap_err();
+            assert_eq!(err.code, ErrorCode::INVALID_PARAMS, "{name}: {}", err.message);
+        }
+        server
+            .set_behaviors(Parameters(set(vec![long.id.to_string()], serde_json::json!([sway]))))
+            .unwrap();
+        let err = server
+            .bake_behaviors(Parameters(bake(vec![long.id.to_string()], Some(30.0))))
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::INVALID_PARAMS);
+        assert!(
+            err.message.contains("split the clip"),
+            "the refusal says what to do about it: {}",
+            err.message
+        );
+        assert_eq!(
+            crate::lock_user(&shared)
+                .staged_timeline()
+                .unwrap()
+                .unwrap()
+                .clip(long.id)
+                .unwrap()
+                .behaviors
+                .len(),
+            1,
+            "a refused bake keeps the behaviours"
         );
     }
 }
