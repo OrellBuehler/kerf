@@ -60,3 +60,16 @@ Plan: `.claude/plans/gpu-exact-parity.md`. Newest entries last.
   where it differs.
 - **WP-RGB (D4) implemented:** Still rows exact in RGB 23 -> 524 / 783 (6.1.1), 19 -> 481 / 734 (9.0.2);
   the conversion alone is 0 of 179 M samples on both builds. New refusal `StillCanvas` (< 10 rows).
+- **#256 merged** (ledger, FATE corpus, parity agent; `reasons()` now lists every cause).
+- **D1 follow-up:** the five non-4:2:0 cases were the decode, not the compositor: the GPU decode now
+  converts with the graph's own `scale` flags and a `convert::converts()` probe (Match / Differs /
+  Unknown per format family) gates them (`Unsupported::FormatConvert`). Match on both builds here.
+- **WP-RGB checker: FAIL on 9.0.2** — a full-range bottom layer under `BottomLayerTag` is converted
+  as full range by FFmpeg 9 (raw bytes kept), limited by the GPU: up to 31 levels. 6.1.1 exact.
+  Conversion alone: 0 of 503 M samples (whole YUV cube, 5 tags), slice threads irrelevant.
+- **P1 rotate implemented:** `vf_rotate` integer port, exact vs `-cpuflags 0` on both builds;
+  band / `ROTATED` deleted; refused: `RotateTranslucent` (argb turn at box size), `RotateFaded`
+  (`fade` rewrites `rotate`'s pooled buffer; on 9.0.2 which buffer returns is a race).
+- **P2 placement implemented:** `vf_perspective` port (no SIMD on either build), `GpuCaps::placement`
+  on; T3 tutorial 16.7 % -> 100 %. Refused: odd picture height (`pad` keeps or wipes the odd row by
+  buffer sharing), entries within 2^-44 of a rounding half (FMA guard).
