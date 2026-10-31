@@ -42,3 +42,12 @@ Plan: `.claude/plans/gpu-exact-parity.md`. Newest entries last.
 - A real GPU (not lavapipe): the self-test passes bit-exact.
 
 ## Log
+- **Ledger (WP0.3, 6.1.1): 64.6 % of 34,200 sampled frames drawn** (9.0.2: 63.7 %). Lift order by
+  frames gained alone: `blur_fill` 11.2 %, `keyed_placement` 11.0 %, `grade_with` 5.3 %, then
+  `still_motion` / `full_range_resized` / `geometry` (jointly refused, T6 slideshow). 9.0.2 adds
+  `mixed_matrices` (T5 vlog). The archetypes reach only 7 (10) variants: speed ramps, blend modes,
+  HDR, text borders etc. are invisible until archetypes hit them.
+- **FATE corpus (WP0.4):** 25 samples, no panic / hang / wrong size on both builds. Open: EXIF
+  orientation (`Landscape_5.jpg`) and the 9.0.2 clean-aperture crop are "draws" in the plan but
+  refused at runtime (the ledger over-counts them); bare H.264 gives no frame at `-ss 0`;
+  `gray16le` JPEG draws without a parity case.
