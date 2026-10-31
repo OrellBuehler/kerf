@@ -504,7 +504,7 @@ What the parity harness forced, all recorded in `kerf-gpu`'s docs and shaders:
   clip that zooms or pans over a cover that hangs over the frame, are one `scale` from the source to the frame times the zoom (and
   Cover no longer crops to the frame first), so the plan refuses them (`Unsupported::FoldedFit`, `core-render-plan.md`) and FFmpeg
   draws the frame. Zooms out under Contain (the PiP cascade: fit, then shrink) and everything with scale 1 and no pan are unchanged,
-  and so are the coverage archetypes (100%). The parity cases follow: `geometry/zoom-off-canvas` and `pip/cover-then-scale` are held
+  and so are the coverage archetypes (the tutorial's keyed push-ins were never part of it: they are `Unsupported::KeyedPlacement`, see the ledger below). The parity cases follow: `geometry/zoom-off-canvas` and `pip/cover-then-scale` are held
   as refusals (with `geometry/pan-off-canvas` and `pip/contain-then-scale` keeping what they drew), and the grid cases
   `cover-odd-*-then-scale` are refused the same way. **Not run where this was written (no Vulkan adapter, no lavapipe)**: the refusals
   are plan-level and unit-tested in kerf-core (`planner.rs`, `render_plan.rs`) and the coverage test ran; the adapter suites
@@ -931,14 +931,58 @@ moving zoom frame against FFmpeg's still and export (`bench_a_mask_a_blur_and_a_
 `tests/coverage.rs` plans the review's archetypes (no decode, no adapter), still plans and export frames, and tells how many
 frames a compositor draws before and after fades and transitions (still plans: the captioned 9:16 talking head 96.0% to 100%, the
 same without captions 96.0% to 100%, the 16:9 montage with dissolves, dips and a slide 78.8% to 100%; export frames: 0% to 100% for those, since a Motion plan was
-refused whole; the tutorial with a webcam picture-in-picture is 83.3% as a still, and 0% to 16.6% as export frames, where its keyed push-ins, the mask and the blur were what was left, and **100% in both** with a moving zoom drawn last, masks and the blur: one more column for GPU-6). **The readback is bounded**: the
+refused whole). The tutorial with a webcam picture-in-picture is **16.7% in both modes** today: its keyed push-ins are
+`Unsupported::KeyedPlacement` (FFmpeg places the picture with `perspective` at sub-pixel positions, which no pass draws), the clip with a
+mask and a blur included (it is a keyed push-in too: the mask and the blur are drawn, the placement is not). **The readback is bounded**: the
 wait for the GPU to finish is `READBACK_TIMEOUT` (30 s), a `GpuError::Readback` rather
 than a caller blocked forever on a wedged device.
+
+**The ledger** (`tests/coverage.rs`, `the_ledger_says_which_refusals_hold_the_compositor_back`) measures which refusals hold the
+compositor back. Plan-only (no decode, no adapter, nothing rendered), it asks `RenderPlan::reasons` for every output frame of every
+archetype, as a still plan and as an export frame, under the caps the app asks with (`Compositor::caps_for(grade::kernels())`: the
+header prints the kernels' answer, and the grade is out of the caps where this FFmpeg's conversions are not the model's), and writes
+`target/parity/ledger.txt` and `ledger-<ffmpeg version>.txt`: (a) frames sampled / drawn / refused per archetype; (b) per
+`Unsupported` variant (`Unsupported::kind()`; a frame the planner cannot plan is `unplannable`) the frames it refuses, the frames drawn
+**if that variant alone were lifted** (the frames it is the only reason of), split into still and motion, and the archetypes it hits
+(`T3:sm` = still and motion), sorted by that gain; (c) the same by cause for the variants that bundle several (`effects/…`,
+`grade_with/…`, `dip_to_white/Resized`, `format_resize/<pix_fmt>`), with the cause's full text as the key; (d) the greedy order to lift
+them in with the drawn share after each (never `unplannable`); (e) the variants that still refuse a frame together after (d). It is
+exact only because `RenderPlan::reasons` lists **every** cause of a layer (a refused geometry is judged on the picture's own chroma
+grid so the layer's other reasons still show; a grade on a letterboxed layer the scaler resizes is a `Matte` and a `GradeWith`). The
+composite colour policy decides some of it (`mixed_matrices`, `full_range_*`), so run it on both FFmpegs (`KERF_FFMPEG` /
+`KERF_FFPROBE`). It plans `OriginalMedia` at 540 px wide, where the app's preview plans `ProxyMedia` at 960, and it ranks what the
+archetypes reach: a variant none of them hits is absent, so add an archetype before trusting a zero. `coverage.rs` holds the
+review's T1 to T3 and five real-world shapes, T4 to T8 (generated sources, cached under `target/tmp/coverage-media` by a hash of the
+FFmpeg and its arguments): a 16:9 talking head with jump cuts, a title, lower thirds and a music bed; a phone vlog (1080x1920 clips in a
+16:9 canvas at 60 fps, BT.709 and BT.601 mixed, dissolved; T5b the same over `Fit::Blur`); a JPEG / PNG photo slideshow with Ken Burns
+keys and crossfades; a three-angle multicam cut with captions; 4K footage graded (eq, curves, wheels) into a 1080p canvas.
+
+**`tests/fate_corpus.rs`** (`#[ignore]`d, and `KERF_FATE=1`: CI's parity job runs every ignored test and this one needs a network, so
+without the variable it skips with a message; `ffmpeg`, `ffprobe`, `curl`, no adapter) is hostile input from FFmpeg's FATE sample
+suite: 26 files (8 MB) downloaded from `https://fate-suite.ffmpeg.org/` into `target/fate-suite/` (kept between runs, no checksums,
+**never committed**: mixed licences) plus four cut short, covering odd and tiny sizes, 4:2:2 / 4:4:4 / 4:4:0 / 10 bit, a 16-bit gray
+JPEG and a gray PNG, alpha (ProRes 4444, PNG, GIF; the VP8 webm probes as plain `yuv420p`), `yuvj`, interlaced, a display matrix, a
+stream that changes size part-way, a negative first timestamp and AVI / FLV / IVF / OBU / elementary-stream containers. Each file goes
+through the probe, a plan, `decode_layer`, `FrameSource::frame` at three times (start, middle, past the end) and a `FrameCursor` over
+the first output frames, on a thread bounded to 900 s (more than its stages' own timeouts add up to) with its panic caught. The
+contract: **a frame at the probed size with consistent planes (and the frame source's equal to the one-shot's), or an error**; never a
+panic or a hang. What each stage did is printed and written to `target/parity/fate-corpus-<ffmpeg version>.txt` (a codec one build lacks
+is a finding, not a failure). It found no panic or hang; it shows that the plan cannot see what only the decode can (a JPEG with an EXIF
+orientation probes 200x300 and decodes 300x200, FFmpeg 9 applies a MOV clean aperture the probe's size does not: both are refused by the
+size check, so FFmpeg draws them), that a bare H.264 stream answers `-ss 0.000000` with no frame on FFmpeg itself, and that a 16-bit gray
+JPEG is a picture the plan draws (`gray16le` is on the allow-list) with no parity case.
+
+**Every GPU change is judged by the `parity` agent** (`.claude/agents/parity.md`, after the implementer and the verifier, before
+the reviewer): it reads the C source of the filters for both FFmpeg builds, writes its own adversarial cases (tests only, never
+`src/`, a shader or the implementer's cases), runs them on both builds, mutation-checks the new arithmetic, draws each refusal anyway
+to see it is necessary, and reports the ledger and `coverage.rs` delta.
 
 ```bash
 cargo test -p kerf-gpu --no-default-features -- --ignored        # needs ffmpeg + an adapter
 KERF_GPU_ADAPTER=hardware cargo test -p kerf-gpu --no-default-features -- --ignored   # the machine's GPU
 KERF_BENCH=1 cargo test -p kerf-gpu --no-default-features --release -- --ignored --nocapture bench
 cargo test -p kerf-gpu --no-default-features --test coverage -- --ignored --nocapture   # frames drawn vs refused, per archetype
+cargo test -p kerf-gpu --no-default-features --test coverage -- --ignored --nocapture ledger   # target/parity/ledger.txt: what refuses them
+KERF_FATE=1 cargo test -p kerf-gpu --no-default-features --test fate_corpus -- --ignored --nocapture   # FATE samples (downloads into target/fate-suite/)
 cargo test -p kerf-gpu --no-default-features --test motion_parity -- --ignored --nocapture   # the export's frames vs the compositor's, plane for plane
 ```

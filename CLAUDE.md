@@ -41,7 +41,8 @@ Most rules in these files exist because a bug already happened. They record *why
 | `.claude/docs/frontend-timeline.md` | The timeline: gestures, frame quantizing, ripple/selection/group moves/zoom, roll/slip/slide, linked A/V UI, waveforms, filmstrips, track heights, minimap, clip overlays |
 
 Project subagents in `.claude/agents/`: `engine`, `frontend`, `surface` (wire a core op
-into Tauri command + MCP tool + api.ts), `gpu`, and read-only `reviewer` / `verifier`.
+into Tauri command + MCP tool + api.ts), `gpu`, `parity` (independent GPU / FFmpeg parity
+checker: edits tests only, judges every GPU change), and read-only `reviewer` / `verifier`.
 
 ## The `ffmpeg` feature — read this first
 

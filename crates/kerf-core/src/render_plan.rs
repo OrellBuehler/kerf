@@ -932,7 +932,10 @@ impl RenderPlan {
     /// ([`RenderPlan::size`]) exactly — empty when it can. A **pure function of the
     /// plan's fields**: nothing was decided while planning, so the same plan answers
     /// for every [`GpuCaps`], and a refusal is a value ([`Unsupported`]) whose
-    /// `Display` is the message. Ask it before decoding anything.
+    /// `Display` is the message. Ask it before decoding anything. **Every** cause is listed, not the
+    /// first that was found (a backlog of refusals ranks them by what lifting one alone would draw): a
+    /// layer whose geometry is refused still gets its other reasons, judged on the picture's own chroma
+    /// grid, and a grade on a letterboxed layer the scaler resizes is a `Matte` and a `GradeWith`.
     pub fn reasons(&self, caps: &GpuCaps, size: (u32, u32)) -> Vec<Unsupported> {
         let mut reasons = self.size_free_reasons(caps);
         for (n, layer) in self.layers.iter().enumerate() {
@@ -940,7 +943,14 @@ impl RenderPlan {
                 Ok(g) => g,
                 Err(e) => {
                     reasons.push(Unsupported::Geometry(n, e.to_string()));
-                    continue;
+                    // The frame is refused whatever follows. The layer's other reasons are still listed, judged
+                    // on the geometry of the picture's own chroma grid (4:2:0 where it is not known), so that a
+                    // ranking of reasons sees what else refuses the layer once this one is lifted. A geometry
+                    // that cannot be made on any grid leaves nothing to judge them by.
+                    match self.native_grid_geometry(layer, size) {
+                        Some(g) => g,
+                        None => continue,
+                    }
                 }
             };
             // `pad` hands everything after it the whole padded frame, bars included. A pointwise
@@ -967,14 +977,17 @@ impl RenderPlan {
             // picture's in the conversion back), an odd side makes the conversions read past the line.
             if !layer.grade.is_identity() && grade_refusal(&layer.grade, caps).is_none() {
                 let at = || self.layer_ref(n, layer);
+                // Every cause is listed, not the first: lifting one must show the next.
                 if geom.matte {
                     reasons.push(Unsupported::Matte(at(), "a grade"));
-                } else if geom.stages.iter().any(|s| s.scaled != (s.src.w, s.src.h)) {
+                }
+                if geom.stages.iter().any(|s| s.scaled != (s.src.w, s.src.h)) {
                     reasons.push(Unsupported::GradeWith(
                         at(),
                         "on a layer the compositor's scaler resizes (its one-level difference from swscale's grows to 3 or 4 levels through the RGB conversions)",
                     ));
-                } else if geom.picture.0 % 2 == 1 || geom.picture.1 % 2 == 1 {
+                }
+                if geom.picture.0 % 2 == 1 || geom.picture.1 % 2 == 1 {
                     reasons.push(Unsupported::GradeWith(
                         at(),
                         "on a picture with an odd side (swscale's conversions to and from RGB read past the line)",
@@ -1085,16 +1098,16 @@ impl RenderPlan {
             // with chroma interpolated from other samples than the compositor's scale-then-convert
             // (a half-size layer reads Y 19, UV 28 off at the picture's sharp edges; a crop is exact).
             if caps.dip_white && self.white_round_trip(layer) {
-                let why = if geom.matte {
-                    Some(DipWhy::Letterboxed)
-                } else if geom.picture.0 % 2 == 1 || geom.picture.1 % 2 == 1 {
-                    Some(DipWhy::OddSize(geom.picture.0, geom.picture.1))
-                } else if geom.stages.iter().any(|s| s.scaled != (s.src.w, s.src.h)) {
-                    Some(DipWhy::Resized)
-                } else {
-                    None
-                };
-                if let Some(why) = why {
+                let resized = geom.stages.iter().any(|s| s.scaled != (s.src.w, s.src.h));
+                let odd = geom.picture.0 % 2 == 1 || geom.picture.1 % 2 == 1;
+                for why in [
+                    geom.matte.then_some(DipWhy::Letterboxed),
+                    odd.then_some(DipWhy::OddSize(geom.picture.0, geom.picture.1)),
+                    resized.then_some(DipWhy::Resized),
+                ]
+                .into_iter()
+                .flatten()
+                {
                     reasons.push(Unsupported::DipToWhite(
                         LayerRef {
                             index: n,
@@ -1611,6 +1624,15 @@ impl RenderPlan {
             )));
         }
         Ok(geom)
+    }
+
+    /// [`RenderPlan::layer_geometry`] on the picture's own chroma grid (4:2:0 where it is not known), with no
+    /// check that the compositor's 4:2:0 planes can place it: what [`RenderPlan::reasons`] judges a layer's
+    /// other reasons by once the geometry itself is refused. `None` where no grid gives a geometry.
+    fn native_grid_geometry(&self, layer: &PlanLayer, size: (u32, u32)) -> Option<LayerGeometry> {
+        let src = (layer.stream.width, layer.stream.height);
+        let grid = layer.stream.subsampling().unwrap_or(Subsampling::YUV420);
+        LayerGeometry::resolve_with(src, size, self.canvas.fit, &layer.transform, grid, self.placement(layer)).ok()
     }
 
     /// Whether the A0 compositor draws this frame exactly when rendered at `size`.
@@ -2454,6 +2476,111 @@ mod tests {
         // what is asserted is that nothing about the crop is.)
         let why = planned(None, (0.0, 0.0));
         assert!(!why.iter().any(|r| r.contains("rounds differently")), "{why:?}");
+    }
+
+    /// `reasons` lists every cause of a refusal, not the first it finds: a ranking of refusals by the frames that lifting
+    /// one alone would draw is only true if none hides behind another. The decision is the same either way (a frame with
+    /// any reason is refused, and the first reason of each of these was already one).
+    #[test]
+    fn every_cause_of_a_refusal_is_listed_and_a_refused_geometry_hides_none() {
+        use crate::model::{Wheel, Wheels};
+        let all = GpuCaps {
+            motion: true,
+            fades: true,
+            transitions: true,
+            dip_white: true,
+            keyed_zoom: true,
+            effects: EffectKinds::ALL,
+            grade: GradeKinds::ALL,
+            ..GpuCaps::A0
+        };
+        // An RGB picture cropped between two 4:2:0 chroma samples (its geometry is refused) and fitted into a smaller
+        // frame (a resize of a picture FFmpeg scales in its own format, refused for itself).
+        let rgb = |edit: &dyn Fn(&mut Clip)| {
+            let mut v = video(640, 360);
+            v.pix_fmt = Some("rgb24".into());
+            let plan = fading_plan_of(
+                v,
+                Some(Delivery::new(320, 180, Fit::Contain)),
+                CompositeColorPolicy::FixedBt601,
+                |c| {
+                    c.transform.crop_left = 11.0 / 640.0;
+                    c.transform.crop_top = 7.0 / 360.0;
+                    edit(c);
+                },
+                0.5,
+            );
+            plan.reasons(&all, plan.size(u32::MAX))
+        };
+        let geometry = |u: &Unsupported| matches!(u, Unsupported::Geometry(0, m) if m.contains("4:2:0 chroma samples"));
+        let format_resize = |u: &Unsupported| matches!(u, Unsupported::FormatResize(0, _, _, f) if f == "rgb24");
+        let why = rgb(&|_| {});
+        assert!(why.iter().any(geometry) && why.iter().any(format_resize), "{why:?}");
+        // ... and a grade on it, and a dip to white: the checks that need the geometry run on the picture's own grid.
+        let why = rgb(&|c| {
+            c.grade.wheels = Some(Wheels {
+                midtones: Wheel {
+                    x: 0.2,
+                    y: 0.1,
+                    lightness: 0.05,
+                },
+                ..Wheels::default()
+            });
+            c.transition_in = Some(Transition {
+                kind: TransitionKind::DipToWhite,
+                duration: 2.0,
+            });
+        });
+        assert!(why.iter().any(geometry) && why.iter().any(format_resize), "{why:?}");
+        assert!(
+            why.iter()
+                .any(|u| matches!(u, Unsupported::GradeWith(_, m) if m.contains("resizes"))),
+            "{why:?}"
+        );
+        assert!(
+            why.iter().any(|u| matches!(u, Unsupported::DipToWhite(_, DipWhy::Resized))),
+            "{why:?}"
+        );
+        // A picture whose crop is whole on every grid has no `Geometry` and the same other reasons.
+        let mut v = video(640, 360);
+        v.pix_fmt = Some("rgb24".into());
+        let plain = fading_plan_of(
+            v,
+            Some(Delivery::new(320, 180, Fit::Contain)),
+            CompositeColorPolicy::FixedBt601,
+            |_| {},
+            0.5,
+        );
+        let plain = plain.reasons(&all, plain.size(u32::MAX));
+        assert!(matches!(plain.as_slice(), [Unsupported::FormatResize(..)]), "{plain:?}");
+        // A grade on a letterboxed layer the scaler resizes is a Matte and a GradeWith, not the first alone.
+        let grade = Grade {
+            wheels: Some(Wheels {
+                midtones: Wheel {
+                    x: 0.2,
+                    y: 0.1,
+                    lightness: 0.05,
+                },
+                ..Wheels::default()
+            }),
+            ..Grade::default()
+        };
+        let p = fading_plan_of(
+            video(360, 640),
+            Some(Delivery::new(640, 360, Fit::Contain)),
+            CompositeColorPolicy::FixedBt601,
+            |c| c.grade = grade.clone(),
+            0.5,
+        );
+        let why = p.reasons(&all, p.size(u32::MAX));
+        assert!(why.iter().any(|u| matches!(u, Unsupported::Matte(_, "a grade"))), "{why:?}");
+        assert!(
+            why.iter()
+                .any(|u| matches!(u, Unsupported::GradeWith(_, m) if m.contains("resizes"))),
+            "{why:?}"
+        );
+        // The decision is the one the first reason made: refused with them, refused without.
+        assert!(!p.gpu_supported_at(p.size(u32::MAX)));
     }
 
     #[test]
@@ -3738,7 +3865,15 @@ mod tests {
             "resizes",
         );
         let w = why(video(360, 640), Some(Delivery::new(640, 360, Fit::Contain)), &|_| {}, 0.5);
-        assert!(matches!(w.as_slice(), [Unsupported::Matte(_, "a grade")]), "{w:?}");
+        // (The bars are a matte, and the portrait picture is resized into the frame, and its width is odd: all three.)
+        assert!(
+            matches!(
+                w.as_slice(),
+                [Unsupported::Matte(_, "a grade"), Unsupported::GradeWith(_, resized), Unsupported::GradeWith(_, odd)]
+                    if resized.contains("resizes") && odd.contains("odd side")
+            ),
+            "{w:?}"
+        );
         // ... where a crop the canvas is cut to is not a resize, and an odd picture is (a canvas that is odd is the only way here).
         let mut plan = fading_plan_of(
             video(641, 361),
@@ -3819,6 +3954,17 @@ mod tests {
                 "{what:?}: {w:?}"
             );
         };
+        let dipped_all = |w: Vec<Unsupported>, whys: &[DipWhy]| {
+            let got: Vec<&DipWhy> = w
+                .iter()
+                .filter_map(|u| match u {
+                    Unsupported::DipToWhite(_, why) => Some(why),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(got, whys.iter().collect::<Vec<_>>(), "{w:?}");
+            assert_eq!(got.len(), w.len(), "{w:?}");
+        };
         dipped(why(tagged("bt2020nc"), None, 0.5), DipWhy::Matrix);
         // Every other format was measured 9 to 21 levels off the round trip: RGB (a PNG), 10-bit,
         // 4:4:4, 4:2:2, gray and full range, and one whose format was never recorded.
@@ -3837,7 +3983,11 @@ mod tests {
         // A letterboxed picture: FFmpeg pads before the round trip, so the bars whiten as well.
         let portrait = video(360, 640);
         let delivery = Some(Delivery::new(640, 360, Fit::Contain));
-        dipped(why(portrait.clone(), delivery, 0.5), DipWhy::Letterboxed);
+        // (Padded bars, a width that comes out odd, and a resize: each its own reason, in that order.)
+        dipped_all(
+            why(portrait.clone(), delivery, 0.5),
+            &[DipWhy::Letterboxed, DipWhy::OddSize(203, 360), DipWhy::Resized],
+        );
         // ... but not in a still once the fade is over: no round trip is in its chain then.
         assert!(why(portrait.clone(), delivery, 5.0).is_empty());
         let plan = fading_plan_of(portrait, delivery, CompositeColorPolicy::FixedBt601, |_| {}, 0.5);
@@ -3857,7 +4007,10 @@ mod tests {
             );
             plan.reasons(&all, plan.size(u32::MAX))
         };
-        dipped(on_layer(&|c| c.transform.scale = 0.4985), DipWhy::OddSize(319, 179));
+        dipped_all(
+            on_layer(&|c| c.transform.scale = 0.4985),
+            &[DipWhy::OddSize(319, 179), DipWhy::Resized],
+        );
         // A layer the scaler resizes, whatever the ratio: the scale filter converts to RGB itself.
         dipped(on_layer(&|c| c.transform.scale = 0.5), DipWhy::Resized);
         let enlarged = fading_plan_of(
