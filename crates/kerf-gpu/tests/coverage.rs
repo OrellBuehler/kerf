@@ -2071,7 +2071,7 @@ fn reason(u: &Unsupported) -> Reason {
         | Unsupported::FullRangeResized(_, s) => Some(s.to_string()),
         Unsupported::DipToWhite(_, why) => Some(format!("{why:?}").split('(').next().unwrap_or_default().to_string()),
         Unsupported::Fade(_, edge, dissolve) => Some(format!("{edge:?} {}", if *dissolve { "dissolve" } else { "step" })),
-        Unsupported::BlendMode(_, mode) => Some(format!("{mode:?}")),
+        Unsupported::BlendMode(_, _, why) => Some(why.to_string()),
         Unsupported::UnmeasuredPolicy(m) | Unsupported::RgbInStack(m) => Some(format!("{m:?}")),
         _ => None,
     };
@@ -2372,7 +2372,14 @@ fn the_ledger_says_which_refusals_hold_the_compositor_back() {
     let policy = composite_color_policy();
     // The caps the app asks with: the grade is drawn only where this FFmpeg's conversions are the model's (one probe).
     let kernels = kerf_gpu::grade::kernels();
-    let caps = Compositor::caps_for(kernels);
+    // ...and the blend modes where this FFmpeg's blend chain is the model's (a probe; `KERF_LEDGER_BLEND_OFF=1` asks as if
+    // it had matched none, which is the ledger of a build that draws no blend: the "before" of a blend change).
+    let blend = if std::env::var_os("KERF_LEDGER_BLEND_OFF").is_some() {
+        [kerf_core::BlendKinds::NONE; 2]
+    } else {
+        kerf_gpu::blend::kernels()
+    };
+    let caps = Compositor::caps_with(kernels, blend);
     let mut cuts = vec![];
     // T1 to T8 are planned with the default export options; T9 and on say theirs (a ProRes file, a GIF, a scaler).
     let mut every: Vec<Archetype> = archetypes(media)
@@ -2404,6 +2411,7 @@ fn the_ledger_says_which_refusals_hold_the_compositor_back() {
         format!("ffmpeg: {version_line}"),
         format!("composite colour policy: {policy:?}"),
         format!("grade kernels: {kernels:?} (caps: Compositor::caps_for(grade::kernels()), as the app asks)"),
+        format!("blend kernels [BT.601, BT.709]: {blend:?}"),
         "plans: every output frame of every archetype over OriginalMedia at 540 px wide (the app's preview plans ProxyMedia at 960); nothing is rendered".to_string(),
         "archetypes: the review's T1 to T3, the real-world T4 to T8 and T9 to T24, which between them use every feature the editor offers that still refuses (tests/coverage.rs)".to_string(),
     ];
@@ -2466,7 +2474,7 @@ fn every_variant() -> Vec<Unsupported> {
         Unsupported::FullRangeResized(layer(), ""),
         Unsupported::SpeedRamp(layer()),
         Unsupported::Stabilized(layer()),
-        Unsupported::BlendMode(layer(), BlendMode::Screen),
+        Unsupported::BlendMode(layer(), BlendMode::Screen, ""),
         Unsupported::Tail(layer()),
         Unsupported::KeyedOpacity(layer()),
         Unsupported::KeyedColor(layer()),

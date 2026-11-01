@@ -44,7 +44,8 @@ use std::time::{Duration, Instant};
 
 use bytemuck::{Pod, Zeroable};
 use kerf_core::{
-    EffectKinds, FadeEdge, FadeTint, GeqEdge, GpuCaps, GradeKinds, Mask, MaskShape, RenderPlan, VideoEffect, YuvMatrix, FADE_FULL,
+    BlendKinds, EffectKinds, FadeEdge, FadeTint, GeqEdge, GpuCaps, GradeKinds, Mask, MaskShape, RenderPlan, VideoEffect,
+    YuvMatrix, FADE_FULL,
 };
 use wgpu::util::DeviceExt;
 
@@ -55,10 +56,12 @@ use crate::gpu::{Gpu, GpuError};
 use crate::motion::MotionFrames;
 use crate::roundtrip::{Rgb2Yuv, Yuv2Rgb};
 
+mod blend_passes;
 mod grade_passes;
 use crate::source::{chroma_size, decode_layers, YuvFrame};
 use crate::sws::{self, Filter};
 use crate::text::{self, Blend, Raster, Source, TextAtlas};
+use blend_passes::{BlendLayer, BlendPasses, BlendScratch};
 use grade_passes::{grade_geometry_refusal, GradeLook, GradePasses};
 use kerf_core::layer_geometry::{LayerGeometry, Rect, ScaleStage};
 
@@ -313,6 +316,8 @@ pub struct Compositor {
     rt_v_layout: wgpu::BindGroupLayout,
     /// The grade's passes (`grade.wgsl`).
     grade: GradePasses,
+    /// A blended clip's passes (`blend.wgsl`).
+    blend: BlendPasses,
     /// A 256x3 table that changes nothing, bound when a layer has no `eq`.
     identity_lut: wgpu::TextureView,
     text: TextPass,
@@ -326,6 +331,9 @@ pub struct Compositor {
     /// Whether this FFmpeg's conversions to and from RGB are the ones the grade follows, when pinned
     /// ([`Compositor::with_grade_kernels`]); else measured ([`crate::grade::kernels`]).
     grade_kernels: Option<crate::grade::Kernels>,
+    /// The blend modes this FFmpeg draws as the model does, per matrix, when pinned ([`Compositor::with_blend_kinds`]); else measured
+    /// ([`crate::blend::kernels`]).
+    blend_kinds: Option<[BlendKinds; 2]>,
     /// The threads FFmpeg's filter graph slices a frame into, when pinned ([`Compositor::with_graph_threads`]);
     /// else they are the graph's the frame stands in for ([`Compositor::graph_threads_for`]).
     graph_threads: Option<u32>,
@@ -622,6 +630,8 @@ struct LayerFades {
     black: u32,
     alpha: u32,
     ramp: u32,
+    /// The ramp of a blended clip's fade-out (its fades are alpha fades, in and out).
+    ramp_out: u32,
     white_in: u32,
     white_out: u32,
     white_round_trip: bool,
@@ -639,25 +649,21 @@ impl LayerFades {
                 .keyed_alpha
                 .map_or_else(|| (geom.opacity * 255.0).round().clamp(0.0, 255.0) as u32, u32::from),
             ramp: FADE_FULL,
+            ramp_out: FADE_FULL,
             white_in: FADE_FULL,
             white_out: FADE_FULL,
             white_round_trip: false,
         };
         let motion = plan.mode == kerf_core::PlanMode::Motion;
-        let mut seen = [false; 5];
+        let mut seen = [false; 6];
         for op in plan.fade_ops(layer) {
             let (slot, which) = match (op.tint, op.edge) {
                 (FadeTint::Black, FadeEdge::In) => (&mut fades.fade_in, 0),
                 (FadeTint::Black, FadeEdge::Out) => (&mut fades.fade_out, 1),
                 (FadeTint::Alpha, FadeEdge::In) => (&mut fades.ramp, 2),
+                (FadeTint::Alpha, FadeEdge::Out) => (&mut fades.ramp_out, 5),
                 (FadeTint::White, FadeEdge::In) => (&mut fades.white_in, 3),
                 (FadeTint::White, FadeEdge::Out) => (&mut fades.white_out, 4),
-                (tint, edge) => {
-                    return Err(GpuError::Unsupported(format!(
-                        "layer {}: a {tint:?} fade-{edge:?}, which the compositor does not draw",
-                        layer.name
-                    )))
-                }
             };
             if std::mem::replace(&mut seen[which], true) {
                 return Err(GpuError::Unsupported(format!(
@@ -676,7 +682,7 @@ impl LayerFades {
             // alpha there, and the conversion to `yuva420p` that follows scales it by 256/255: the ramp
             // comes ahead of that scale, not after it. (A black or white fade there would fade the
             // colours too, which the plan refuses.)
-            if fades.fade_in < FADE_FULL || fades.fade_out < FADE_FULL || fades.white_round_trip {
+            if fades.fade_in < FADE_FULL || fades.fade_out < FADE_FULL || fades.ramp_out < FADE_FULL || fades.white_round_trip {
                 return Err(GpuError::Unsupported(format!(
                     "layer {}: a fade to black or white on a layer below full opacity",
                     layer.name
@@ -708,7 +714,7 @@ impl LayerFades {
 
     /// The layer's alpha is below 255 somewhere: the hardware's blend is not FFmpeg's, the integer one is.
     fn blends(&self) -> bool {
-        self.alpha < 255 || self.ramp < FADE_FULL
+        self.alpha < 255 || self.ramp < FADE_FULL || self.ramp_out < FADE_FULL
     }
 }
 
@@ -771,6 +777,9 @@ pub fn prepare(plan: &RenderPlan) {
     if plan.layers.iter().any(|l| !l.grade.is_identity()) {
         let _ = crate::grade::kernels();
     }
+    if plan.layers.iter().any(|l| !l.blend.is_normal()) {
+        let _ = crate::blend::kernels();
+    }
 }
 
 impl Compositor {
@@ -796,21 +805,31 @@ impl Compositor {
     /// The combinations the plan names (`Unsupported`) stay FFmpeg's.
     /// Each later pass flips its bit beside the pass and its parity cases.
     pub fn caps(&self) -> GpuCaps {
-        Self::caps_for(self.grade_kernels.unwrap_or_else(crate::grade::measured))
+        Self::caps_with(
+            self.grade_kernels.unwrap_or_else(crate::grade::measured),
+            self.blend_kinds.unwrap_or_else(crate::blend::measured),
+        )
     }
 
     /// [`Compositor::caps`] for a machine whose FFmpeg's conversions are `kernels`, without a device: the way a host that
     /// has none to ask (the render bar) says what the GPU draws.
     pub fn caps_for(kernels: crate::grade::Kernels) -> GpuCaps {
+        Self::caps_with(kernels, crate::blend::measured())
+    }
+
+    /// [`Compositor::caps_for`] with the blend modes this FFmpeg draws as the model does (per matrix, `[BT.601, BT.709]`): only the
+    /// modes both matrices agree on are in the caps, which are not about one matrix.
+    pub fn caps_with(kernels: crate::grade::Kernels, blend: [BlendKinds; 2]) -> GpuCaps {
         let mut caps = Self::CAPS;
         if kernels != crate::grade::Kernels::Match {
             caps.grade = GradeKinds::NONE;
         }
+        caps.blend = blend[0].intersection(blend[1]);
         caps
     }
 
     /// What any compositor of this build draws, without a device and **assuming** the measured things match
-    /// (the grade's conversions: [`Compositor::caps`] is this less the grade where they do not).
+    /// (the grade's conversions and the blend chain: [`Compositor::caps`] is this less what they do not).
     pub const CAPS: GpuCaps = {
         let mut caps = GpuCaps::A0;
         caps.text = true;
@@ -823,6 +842,7 @@ impl Compositor {
         caps.keyed_color = true;
         caps.mask = true;
         caps.grade = GradeKinds::ALL;
+        caps.blend = BlendKinds::ALL;
         caps.effects = EffectKinds::BLUR
             .union(EffectKinds::SHARPEN)
             .union(EffectKinds::GRAYSCALE)
@@ -847,6 +867,15 @@ impl Compositor {
     #[must_use]
     pub fn with_grade_kernels(mut self, kernels: crate::grade::Kernels) -> Self {
         self.grade_kernels = Some(kernels);
+        self
+    }
+
+    /// Pin which blend modes this FFmpeg draws as the model does (per matrix, `[BT.601, BT.709]`), instead of measuring the ffmpeg this
+    /// process runs ([`crate::blend::kernels`], on the first blended plan unless [`prepare`] ran ahead of it): for a host that knows
+    /// its ffmpeg, and for tests.
+    #[must_use]
+    pub fn with_blend_kinds(mut self, kinds: [BlendKinds; 2]) -> Self {
+        self.blend_kinds = Some(kinds);
         self
     }
 
@@ -1034,6 +1063,7 @@ impl Compositor {
             let rt_chroma_v = rt_pipeline("rt chroma v", &rt_v_layout, "fs_chroma_v", PLANE_FORMAT);
 
             let grade = GradePasses::new(&g, &rt_shader, &convert_layout, &rt_v_layout);
+            let blend = BlendPasses::new(&g);
 
             let identity: Vec<u8> = (0..3).flat_map(|_| 0..=255u8).collect();
             let identity_lut = Self::lut_texture(&g, &identity);
@@ -1115,6 +1145,7 @@ impl Compositor {
                 rt_chroma_v,
                 rt_v_layout,
                 grade,
+                blend,
                 identity_lut,
                 text: TextPass {
                     layout: text_layout,
@@ -1128,6 +1159,7 @@ impl Compositor {
                 vignettes: VignetteMaps::default(),
                 geq_edge: None,
                 grade_kernels: None,
+                blend_kinds: None,
                 key_terms: OnceLock::new(),
                 graph_threads: None,
             })
@@ -2449,6 +2481,8 @@ impl Compositor {
 
         // The canvas as it was before a layer that blends, made once the first one needs it.
         let mut before: Option<Plane> = None;
+        // The planes a layer with a blend mode works in, made by the first one.
+        let mut blend_scratch: Option<BlendScratch> = None;
         // The graph's slice threads, read once per draw, by the first layer that is keyed.
         let graph_threads = std::cell::OnceCell::new();
         for Drawn {
@@ -2608,6 +2642,43 @@ impl Compositor {
             let tx1 = (past_x + i64::from(odd.0)).min(i64::from(ow));
             let ty1 = (past_y + i64::from(odd.1)).min(i64::from(oh));
             let (rx1, ry1) = if tail { (tx1.max(x1), ty1.max(y1)) } else { (x1, y1) };
+
+            // A layer with a blend mode is the clip laid on the canvas, mixed with it in RGB and laid back by its alpha
+            // (`blend.wgsl`). The plan refuses what the chain is not exact for; the pass's own guards say the same.
+            if !layer.blend.is_normal() {
+                let matrix = plan.blend_matrix().ok_or_else(|| {
+                    GpuError::Unsupported(format!("layer {}: a blend in a composite matrix with no tables", layer.name))
+                })?;
+                if geom.matte
+                    || rotate != 0
+                    || geom.translucent
+                    || geom.stages.iter().any(|s| s.scaled != (s.src.w, s.src.h))
+                    || ow % 2 == 1
+                    || oh % 2 == 1
+                {
+                    return Err(GpuError::Unsupported(format!(
+                        "layer {}: a blend mode on a letterboxed, rotated, translucent or resized layer, or an odd frame",
+                        layer.name
+                    )));
+                }
+                self.blend_layer(
+                    &mut enc,
+                    &canvas,
+                    &mut blend_scratch,
+                    &BlendLayer {
+                        mode: layer.blend,
+                        tables: crate::blend::Tables::new(matrix),
+                        params,
+                        views,
+                        alpha_plane: alpha.as_ref(),
+                        area: (x0 as u32, y0 as u32, x1 as u32, y1 as u32),
+                        tail: tail.then_some((tx1 as u32, ty1 as u32)),
+                        fades: *fades,
+                        canvas: (ow, oh),
+                    },
+                )?;
+                continue;
+            }
 
             // A layer that blends reads the canvas as it stands, and a pass cannot read what it writes:
             // the region it touches is copied aside first.
@@ -3279,16 +3350,32 @@ mod tests {
     /// before anything is decoded for it), and the rest of the caps are the build's either way.
     #[test]
     fn the_grade_is_in_the_caps_only_where_the_conversions_are_known_to_match() {
+        use crate::blend::all_modes;
         use crate::grade::Kernels;
-        assert_eq!(Compositor::caps_for(Kernels::Match), Compositor::CAPS);
+        assert_eq!(Compositor::caps_with(Kernels::Match, all_modes()), Compositor::CAPS);
         assert_eq!(Compositor::CAPS.grade, GradeKinds::ALL);
         for kernels in [Kernels::Differs("a chain"), Kernels::Unknown] {
-            let caps = Compositor::caps_for(kernels);
+            let caps = Compositor::caps_with(kernels, all_modes());
             assert_eq!(caps.grade, GradeKinds::NONE, "{kernels:?}");
             let mut restored = caps;
             restored.grade = GradeKinds::ALL;
             assert_eq!(restored, Compositor::CAPS, "{kernels:?}: nothing else moves");
         }
+    }
+
+    /// The blend modes are in the caps as far as this FFmpeg's blend chain was measured to be the model's, in **both** matrices (the
+    /// caps are not about one), and nothing before it was measured.
+    #[test]
+    fn a_blend_mode_is_in_the_caps_only_where_both_matrices_were_measured_to_match() {
+        use crate::grade::Kernels;
+        use kerf_core::BlendMode;
+        let screen = BlendKinds::of(BlendMode::Screen);
+        let add = BlendKinds::of(BlendMode::Add);
+        let caps = |blend| Compositor::caps_with(Kernels::Match, blend).blend;
+        assert_eq!(caps([BlendKinds::NONE; 2]), BlendKinds::NONE);
+        assert_eq!(caps([BlendKinds::ALL; 2]), BlendKinds::ALL);
+        assert_eq!(caps([screen.union(add), screen]), screen);
+        assert_eq!(caps([BlendKinds::ALL, BlendKinds::NONE]), BlendKinds::NONE);
     }
 
     #[test]

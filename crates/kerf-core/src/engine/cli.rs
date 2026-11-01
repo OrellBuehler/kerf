@@ -11496,7 +11496,10 @@ mod stabilize_rendered;
 
 /// A clip composited with a blend mode instead of alpha-over.
 mod blend;
+/// The tag a blend chain names for its composite (the bottom layer's): the planner mirrors it in `PlanCanvas::blend_tag`.
+pub(crate) use blend::composite_matrix as blend_composite_tag;
 use blend::{blend_chains, composite_matrix, keeps_clear_bars, Blend};
+pub use blend::{blend_colour_graph, blend_probe_graph};
 
 /// Blend modes through the real `ffmpeg`: the pixels of each mode, the composite outside the clip, and `normal`
 /// through the blend graph against the plain `overlay` (`#[ignore]`d).
@@ -17007,6 +17010,99 @@ mod tests {
         clip.transform.rotation = 10.0;
         let g = graph_of(&single(vec![clip]), std::slice::from_ref(&square));
         assert!(g.contains(":fillcolor=black@0:ow=rotw("), "{g}");
+    }
+
+    /// What the blend chains name for the composite is what the plan says they do (`PlanCanvas::blend_tag`), which the GPU draws the
+    /// blend in: the bottom layer's tag (the first picture of the lowest video track, wherever the cut is looked at from), BT.709 for
+    /// untagged HD beside a tagged input, nothing for an untagged one.
+    #[test]
+    fn the_matrix_a_blend_names_is_the_plans_blend_tag() {
+        use crate::planner::{PlanRequest, Planner};
+        use crate::render_plan::{CompositeColorPolicy, PlanMode};
+        let tagged = |w: u32, h: u32, tag: Option<&str>| {
+            let mut stream = video_stream(w, h, 25.0);
+            stream.pix_fmt = Some("yuv420p".into());
+            stream.color_space = tag.map(str::to_string);
+            test_asset(vec![stream])
+        };
+        let blended = |asset: &Asset, start: f64| {
+            let mut c = make_clip(asset.id, 0.0, 4.0, start);
+            c.blend_mode = crate::model::BlendMode::Screen;
+            c
+        };
+        let named = |graph: &str| -> Option<String> {
+            graph
+                .split("in_color_matrix=")
+                .nth(1)
+                .map(|rest| rest.split(':').next().unwrap_or_default().to_string())
+        };
+        let (untagged_sd, bt709, ntsc, untagged_hd) = (
+            tagged(640, 480, None),
+            tagged(1920, 1080, Some("bt709")),
+            tagged(640, 480, Some("smpte170m")),
+            tagged(1920, 1080, None),
+        );
+        for (name, bottom, top, tag, graph_names) in [
+            ("untagged SD", &untagged_sd, &untagged_sd, None, None),
+            ("bt709", &bt709, &bt709, Some("bt709"), Some("bt709")),
+            ("smpte170m", &ntsc, &ntsc, Some("smpte170m"), Some("smpte170m")),
+            // Untagged HD beside a clip that names a matrix is labelled BT.709 by the graph.
+            (
+                "an untagged HD bottom beside a tagged one",
+                &untagged_hd,
+                &bt709,
+                Some("bt709"),
+                Some("bt709"),
+            ),
+            (
+                "a tagged bottom under an untagged one",
+                &bt709,
+                &untagged_sd,
+                Some("bt709"),
+                Some("bt709"),
+            ),
+        ] {
+            let tl = timeline_of(vec![
+                video_track(vec![make_clip(bottom.id, 0.0, 4.0, 0.0)]),
+                video_track(vec![blended(top, 0.0)]),
+            ]);
+            let assets = [bottom.clone(), top.clone()];
+            let graph = graph_of(&tl, &assets);
+            assert_eq!(named(&graph).as_deref(), graph_names, "{name}: {graph}");
+            for mode in [PlanMode::Motion, PlanMode::Still] {
+                let planner = Planner::new(
+                    &tl,
+                    &assets,
+                    &ExportOptions::default(),
+                    PlanRequest {
+                        mode,
+                        ..PlanRequest::still(CompositeColorPolicy::FixedBt601)
+                    },
+                )
+                .expect("planner");
+                let plan = planner.at(1.0).expect("plan");
+                assert_eq!(plan.canvas.blend_tag, tag, "{name} {mode:?}");
+            }
+        }
+        // The first picture of the lowest video track: a clip that starts later in the track's list but earlier on the timeline.
+        let tl = timeline_of(vec![video_track(vec![
+            blended(&untagged_sd, 5.0),
+            make_clip(bt709.id, 0.0, 4.0, 0.0),
+        ])]);
+        let assets = [untagged_sd, bt709];
+        let graph = graph_of(&tl, &assets);
+        assert_eq!(named(&graph).as_deref(), Some("bt709"), "{graph}");
+        let plan = Planner::new(
+            &tl,
+            &assets,
+            &ExportOptions::default(),
+            PlanRequest {
+                mode: PlanMode::Motion,
+                ..PlanRequest::still(CompositeColorPolicy::FixedBt601)
+            },
+        )
+        .expect("planner");
+        assert_eq!(plan.canvas().blend_tag, Some("bt709"));
     }
 
     #[test]

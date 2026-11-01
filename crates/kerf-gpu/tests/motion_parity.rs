@@ -54,12 +54,28 @@ fn gpu() -> Arc<Gpu> {
         .clone()
 }
 
+thread_local! {
+    /// A case that draws with every blend mode in the caps, whatever this FFmpeg's probe said ([`forced_blends`]).
+    static FORCED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn compositor() -> &'static Compositor {
     static C: OnceLock<Compositor> = OnceLock::new();
+    static FORCING: OnceLock<Compositor> = OnceLock::new();
+    if FORCED.with(std::cell::Cell::get) {
+        return FORCING.get_or_init(|| {
+            let _ = kerf_gpu::grade::kernels();
+            Compositor::new(gpu())
+                .expect("a compositor")
+                .with_blend_kinds(kerf_gpu::blend::all_modes())
+        });
+    }
     C.get_or_init(|| {
         // The grade is in the caps once this FFmpeg's conversions are known to be the model's (the app's `prepare` asks
         // ahead of a frame): the harness measures them once, up front, and its grade cases hold the answer to `Match`.
         let _ = kerf_gpu::grade::kernels();
+        // ...and the blend chain's, which the blend modes are in the caps by.
+        let _ = kerf_gpu::blend::kernels();
         Compositor::new(gpu()).expect("a compositor")
     })
 }
@@ -4954,4 +4970,313 @@ fn a_graded_clip_beside_a_clip_of_its_own_matrix_is_drawn_in_either_order() {
     let assets = [m.bars.clone(), v.testsrc170m.clone()];
     let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0), g]], None);
     run("grade/smpte170m after untagged", &tl, &assets, 30.0, 2.0, EXACT);
+}
+
+// ---- blend modes ---------------------------------------------------------------------------
+
+/// Run `body` with the compositor that has every blend mode in its caps, however this FFmpeg's probe went.
+fn forced_blends(body: impl FnOnce()) {
+    FORCED.with(|f| f.set(true));
+    body();
+    FORCED.with(|f| f.set(false));
+}
+
+/// A blend case: drawn and compared exactly where this FFmpeg's chain is the model's (`blend::kernels`); where the probe refused
+/// the build (FFmpeg 4.4's `overlay` loses the alpha rows of a clip above the frame when it runs on several threads) the plan must
+/// refuse every frame, FFmpeg draws them, and the case is drawn anyway with the caps forced (`forced_ok`: unless the clip is above
+/// the frame's top edge, which is the bug) to hold the arithmetic itself to the export's planes.
+fn blend_run(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, secs: f64, forced_ok: bool) {
+    if compositor().caps().blend == kerf_core::BlendKinds::ALL {
+        return run(case, tl, assets, fps, secs, EXACT);
+    }
+    refused(
+        case,
+        tl,
+        assets,
+        &at_fps(fps),
+        upto(secs, fps),
+        "no compositor pass draws this mode",
+    );
+    if forced_ok {
+        forced_blends(|| run(&format!("{case} (forced)"), tl, assets, fps, secs, EXACT));
+    }
+}
+
+const BLEND_MODES: [kerf_core::BlendMode; 9] = {
+    use kerf_core::BlendMode::*;
+    [
+        Multiply, Screen, Overlay, HardLight, Add, Darken, Lighten, Difference, Exclusion,
+    ]
+};
+
+/// A blended clip is FFmpeg's `blend` in RGB between two conversions (`engine/cli/blend.rs`), drawn in integers
+/// (`src/blend.rs`, held to the filters over every value by `tests/blend_kernels.rs`): every mode, every picture (the
+/// noise has every Y, U, V combination, clipped RGB included), exact.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn every_blend_mode_is_drawn_as_the_chain_draws_it() {
+    let m = media();
+    for mode in BLEND_MODES {
+        let (tl, assets) = over_bars(m, &|c| c.blend_mode = mode);
+        blend_run(&format!("blend/{mode:?}"), &tl, &assets, 30.0, 0.5, true);
+        // The other way round: the bars on the test pattern.
+        let mut top = clip(&m.bars, 0.5, 1.5, 0.0);
+        top.blend_mode = mode;
+        blend_run(
+            &format!("blend/{mode:?} bars over testsrc"),
+            &timeline(vec![vec![clip(&m.testsrc, 0.5, 1.5, 0.0)], vec![top]], None),
+            &[m.testsrc.clone(), m.bars.clone()],
+            30.0,
+            0.5,
+            true,
+        );
+        // Noise over a smooth picture, and a smooth picture over noise: the clip's colour and the composite's are
+        // out of gamut in both directions, and every sample is another triple.
+        let mut noise = clip(&m.noise, 0.5, 1.5, 0.0);
+        noise.blend_mode = mode;
+        blend_run(
+            &format!("blend/{mode:?} noise over smooth"),
+            &timeline(vec![vec![clip(&m.smooth, 0.5, 1.5, 0.0)], vec![noise]], None),
+            &[m.smooth.clone(), m.noise.clone()],
+            30.0,
+            0.4,
+            true,
+        );
+        let mut smooth = clip(&m.smooth, 0.5, 1.5, 0.0);
+        smooth.blend_mode = mode;
+        blend_run(
+            &format!("blend/{mode:?} smooth over noise"),
+            &timeline(vec![vec![clip(&m.noise, 0.5, 1.5, 0.0)], vec![smooth]], None),
+            &[m.noise.clone(), m.smooth.clone()],
+            30.0,
+            0.4,
+            true,
+        );
+    }
+}
+
+/// A blended clip's alpha is `overlay`'s on the last step: its opacity (keyed: a `geq`), a mask's, a chroma key's, its fades
+/// (alpha fades in and out: a multiplied clip must not go through black) and a dissolve's ramp weigh the mix, per luma sample
+/// and per 2x2 block of chroma, exact.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_blended_clip_is_laid_by_its_own_alpha() {
+    use kerf_core::{BlendMode, Easing, Property, PropertyKey};
+    let m = media();
+    for mode in [
+        BlendMode::Multiply,
+        BlendMode::Screen,
+        BlendMode::Overlay,
+        BlendMode::Difference,
+    ] {
+        let label = |what: &str| format!("blend/{mode:?} {what}");
+        // The clip's own fades, in and out.
+        let (tl, assets) = over_bars(m, &|c| {
+            c.blend_mode = mode;
+            c.fade_in = 0.4;
+            c.fade_out = 0.4;
+        });
+        blend_run(&label("fades"), &tl, &assets, 30.0, 1.0, true);
+        // A keyed opacity: a `geq` alpha, colours untouched.
+        for (name, keys) in [
+            ("linear", vec![PropertyKey::new(0.0, 1.0), PropertyKey::new(1.0, 0.2)]),
+            (
+                "from nothing, eased",
+                vec![
+                    PropertyKey {
+                        time: 0.1,
+                        value: 0.0,
+                        easing: Easing::EaseInOut,
+                    },
+                    PropertyKey::new(0.9, 1.0),
+                ],
+            ),
+        ] {
+            let (tl, assets) = over_bars(m, &|c| {
+                c.blend_mode = mode;
+                c.set_property_keys(Property::Opacity, keys.clone());
+            });
+            blend_run(&label(&format!("keyed opacity {name}")), &tl, &assets, 30.0, 1.0, true);
+        }
+        // A mask is an alpha plane (`geq`), a feathered one has every level.
+        let (tl, assets) = over_bars(m, &|c| {
+            c.blend_mode = mode;
+            c.mask = Some(mask_of(kerf_core::MaskShape::Ellipse, 0.3, false));
+        });
+        blend_run(&label("masked"), &tl, &assets, 30.0, 0.5, true);
+        let (tl, assets) = over_bars(m, &|c| {
+            c.blend_mode = mode;
+            c.mask = Some(mask_of(kerf_core::MaskShape::Rect, 0.2, true));
+            c.fade_in = 0.3;
+        });
+        blend_run(&label("inverted mask and a fade"), &tl, &assets, 30.0, 0.8, true);
+        // A chroma key is the other source of alpha.
+        let (tl, assets) = over_bars(m, &|c| {
+            c.blend_mode = mode;
+            c.effects = vec![key("green", 0.15, 0.1)];
+        });
+        blend_run(&label("keyed"), &tl, &assets, 30.0, 0.5, true);
+        // Into a dissolve: the incoming blended clip's alpha is the ramp, the outgoing one is plain.
+        let out = clip(&m.bars, 0.5, 1.5, 0.0);
+        let mut inc = clip(&m.testsrc, 0.5, 1.5, 1.0);
+        inc.blend_mode = mode;
+        inc.transition_in = Some(Transition {
+            kind: TransitionKind::Crossfade,
+            duration: 0.5,
+        });
+        blend_run(
+            &label("dissolving in"),
+            &timeline(vec![vec![out, inc]], None),
+            &[m.bars.clone(), m.testsrc.clone()],
+            30.0,
+            2.0,
+            true,
+        );
+    }
+}
+
+/// Where a blended clip lies: moved and partly off the frame, with nothing below it, over two layers, over another blended clip,
+/// part of the time; then on BT.709 and BT.601-tagged footage, where the chain names the composite's matrix.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_blended_clip_is_laid_where_it_lies() {
+    use kerf_core::BlendMode;
+    let m = media();
+    let v = variants();
+    for mode in [BlendMode::Multiply, BlendMode::HardLight, BlendMode::Exclusion] {
+        let label = |what: &str| format!("blend/{mode:?} {what}");
+        for (name, x, y) in [
+            ("moved", 0.2, -0.1),
+            ("moved off the frame", -0.45, 0.4),
+            ("moved by odd pixels", 0.0123, 0.0071),
+        ] {
+            let (tl, assets) = over_bars(m, &|c| {
+                c.blend_mode = mode;
+                c.transform.pos_x = x;
+                c.transform.pos_y = y;
+            });
+            blend_run(&label(name), &tl, &assets, 30.0, 0.5, y >= 0.0);
+        }
+        // Nothing below: the composite is the black canvas.
+        let mut alone = clip(&m.testsrc, 0.5, 1.5, 0.0);
+        alone.blend_mode = mode;
+        blend_run(
+            &label("over nothing"),
+            &timeline(vec![vec![alone]], None),
+            std::slice::from_ref(&m.testsrc),
+            30.0,
+            0.5,
+            true,
+        );
+        // A blended clip over a blended one, over the plain bars; and the plain clip over the lot.
+        let mut mid = clip(&m.testsrc, 0.5, 1.5, 0.0);
+        mid.blend_mode = mode;
+        let mut top = clip(&m.noise, 0.5, 1.5, 0.0);
+        top.blend_mode = BlendMode::Screen;
+        let plain = clip(&m.edges, 0.5, 1.5, 0.0);
+        blend_run(
+            &label("two blended clips over bars"),
+            &timeline(
+                vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![mid.clone()], vec![top.clone()]],
+                None,
+            ),
+            &[m.bars.clone(), m.testsrc.clone(), m.noise.clone()],
+            30.0,
+            0.5,
+            true,
+        );
+        let mut late = mid.clone();
+        late.timeline_start = 0.4;
+        blend_run(
+            &label("starting late, with a plain clip over it"),
+            &timeline(vec![vec![clip(&m.bars, 0.5, 2.0, 0.0)], vec![late], vec![plain]], None),
+            &[m.bars.clone(), m.testsrc.clone(), m.edges.clone()],
+            30.0,
+            1.2,
+            true,
+        );
+        // The composite's matrix is the bottom layer's tag: BT.709 and BT.601-tagged footage convert in theirs.
+        for (name, base, top) in [
+            ("bt709", &v.bars709, &v.testsrc709),
+            ("smpte170m", &v.testsrc170m, &v.testsrc170m),
+            ("bt470bg", &v.bars470bg, &v.testsrc470bg),
+        ] {
+            let mut c = clip(top, 0.5, 1.5, 0.0);
+            c.blend_mode = mode;
+            blend_run(
+                &label(&format!("on {name} footage")),
+                &timeline(vec![vec![clip(base, 0.5, 1.5, 0.0)], vec![c]], None),
+                &[base.clone(), top.clone()],
+                30.0,
+                0.5,
+                true,
+            );
+        }
+    }
+}
+
+/// What the chain is not exact for is refused, in the plan, and FFmpeg draws it: a layer the compositor scales (the scaler's level
+/// is not swscale's and the blend carries it into the composite), a rotated one (a fixed-point edge), one below full opacity (the RGB
+/// round trip's chroma is a level off), a letterboxed one (its bars are transparent in the blend), an RGB picture (the decode's 4:2:0
+/// is a few levels from the graph's conversion).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn what_a_blend_is_not_exact_for_is_refused() {
+    use kerf_core::BlendMode;
+    let m = media();
+    let v = variants();
+    let blended = |asset: &Asset, start: f64, secs: f64, edit: &dyn Fn(&mut Clip)| {
+        let mut c = clip(asset, start, start + secs, 0.0);
+        c.blend_mode = BlendMode::Multiply;
+        edit(&mut c);
+        c
+    };
+    let over_bars = |top: Clip, asset: &Asset| {
+        (
+            timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![top]], None),
+            [m.bars.clone(), asset.clone()],
+        )
+    };
+    for (name, reason, top, asset) in [
+        (
+            "scaled",
+            "scaler resizes",
+            blended(&m.testsrc, 0.5, 1.0, &|c| c.transform.scale = 0.6),
+            &m.testsrc,
+        ),
+        (
+            "rotated",
+            "rotated layer",
+            blended(&m.testsrc, 0.5, 1.0, &|c| c.transform.rotation = 12.0),
+            &m.testsrc,
+        ),
+        (
+            "translucent",
+            "below full opacity",
+            blended(&m.testsrc, 0.5, 1.0, &|c| c.transform.opacity = 0.6),
+            &m.testsrc,
+        ),
+        (
+            "letterboxed",
+            "letterboxed layer",
+            blended(&m.portrait, 0.5, 1.0, &|_| {}),
+            &m.portrait,
+        ),
+        (
+            "an RGB picture",
+            "RGB picture",
+            blended(&v.rgb_png, 0.0, 1.0, &|_| {}),
+            &v.rgb_png,
+        ),
+    ] {
+        let (tl, assets) = over_bars(top, asset);
+        refused(
+            &format!("blend/refused {name}"),
+            &tl,
+            &assets,
+            &at_fps(30.0),
+            upto(0.5, 30.0),
+            reason,
+        );
+    }
 }

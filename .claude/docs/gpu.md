@@ -11,12 +11,12 @@ Windows) and nothing may depend on an optional wgpu feature. **A GPU failure is 
 error, not a panic**: every unit of wgpu work runs in out-of-memory / validation /
 internal error scopes (`Gpu::guarded`), anything uncaptured is logged and remembered,
 `Compositor::new` and `composite` return `Result` (and `Compositor::caps()` says what it
-draws, `GpuCaps::A0` plus `text`, `motion`, `fades`, `transitions`, `dip_white`, `keyed_zoom`, `keyed_opacity`, `keyed_color`, `mask`, `grade` (every kind, where `grade::measured()` says this FFmpeg's conversions are the model's: `Compositor::caps()` drops it otherwise) and the blur / sharpen / grayscale / invert / vignette / chroma key `effects` today, which `composite` / `render_plan` judge the plan by), and a lost device is tracked — every
+draws, `GpuCaps::A0` plus `text`, `motion`, `fades`, `transitions`, `dip_white`, `keyed_zoom`, `keyed_opacity`, `keyed_color`, `mask`, `grade` (every kind, where `grade::measured()` says this FFmpeg's conversions are the model's: `Compositor::caps()` drops it otherwise), `blend` (the modes `blend::measured()` says this FFmpeg draws as the model does, both matrices) and the blur / sharpen / grayscale / invert / vignette / chroma key `effects` today, which `composite` / `render_plan` judge the plan by), and a lost device is tracked — every
 later call is `GpuError::DeviceLost` and the **owner builds a new `Gpu` and
 `Compositor`** (the device is not recreated behind the caller's back).
-**No compositor pass draws a blend mode**: a layer whose clip has one is refused by the plan (`Unsupported::BlendMode`,
-`core-render-plan.md`) under every cap, so its frames are FFmpeg's (`blend` in RGB through two placements and a conversion each way,
-`engine-cli.md`); there is no parity case because nothing is drawn. `PlanLayer.blend` is `Normal` in the fakes and fixtures.
+**A blend mode is drawn** (`GpuCaps::blend`, below: "Blend modes") for a layer at its own size, upright, opaque and not letterboxed, over an even frame, and
+where `blend::kernels()` says this FFmpeg's chain is the model's; every other blended layer is refused by the plan (`Unsupported::BlendMode(layer, mode, cause)`,
+`core-render-plan.md`) and FFmpeg draws it. `PlanLayer.blend` is `Normal` in the fakes and fixtures.
 
 FFmpeg stays the decoder: `source::decode_layer` pipes one frame from the binary as
 `yuv4mpegpipe` 4:2:0 (the same `-ss` as the still graph), spawned through kerf-core's
@@ -772,6 +772,35 @@ included, and a graded layer in a stack that holds one where the composite's col
   its chroma at 128, the compositor's planes would go to 127).
 * 4:2:2, 4:4:4, RGB and gray pictures (and 10-bit under `FixedBt601`) take every other effect and a mask at the plain source's own figures (max 3: the decode's rounding).
   Compute passes are core wgpu on every backend and the blur writes no storage texture: no optional feature.
+
+**Blend modes** (`blend.rs`, `shaders/blend.wgsl`, `compositor/blend_passes.rs`, `GpuCaps::blend`, `tests/blend_kernels.rs`; the export graph is `engine-cli.md`, "Blend modes").
+FFmpeg lays the clip opaque on a copy of the composite (`cc`), its alpha plane alone (`aa`), `alphamerge`s, converts both frames to `gbrap` and back to `yuva420p` with
+`scale=flags=neighbor` and mixes them with `blend` in RGB, then `overlay`s the result onto the untouched composite. **Everything after the placement is reproduced in
+integers, to the level**, and each stage was found by measuring and held to the filter over every value, **identically on 4.4.2, 6.1.1 and 9.0.2**:
+* **Into RGB** is `yuv2gbrp_full_X_c`, the C path (no SIMD exists for planar RGB out; **`gbrp` is another path with other arithmetic, `gbrap` is the chain's**): chroma repeated 2x2,
+  `(Y*512 - 8192) * 9539 + 2^21` and the chroma terms in **32-bit integers that wrap** (a saturated blue overflows and is clipped to 0 by the wrap, not to 255), clipped to 30 bits, `>> 22`;
+  swscale's own coefficients (`Tables::new`: BT.601 `9539 13075 -6660 -3209 16525`). All 16.7 million (Y, U, V), both matrices, the frame with and without an alpha plane.
+* **The mode** is `vf_blend.c`'s `int` expression, clip on top (kerf's `Overlay` is FFmpeg's `hardlight`, `HardLight` its `overlay`); the x86 SIMD ones (SSE2 / AVX2, taken at opacity 1)
+  are those expressions (`multiply`'s `(x + 1 + ((x + 1) >> 8)) >> 8` is `x / 255`): every pair of values, all nine modes.
+* **Out of RGB** is `planar_rgb_to_y` / `_uv` and swscale's `fill_rgb2yuv_table` (BT.601's literals): luma `(((ry r + gy g + by b + 0x80100) >> 9) + 32) >> 6`, and **chroma from the bottom row of each
+  2x2 block, the sum of its two pixels** (`((ru R + gu G + bu B + 0x800200) >> 10) + 32) >> 6`): `neighbor` is a point sample, but RGB sources are read halved horizontally and the point lands on the odd row.
+* **`lutyuv=a=255`, which lays the clip opaque, is `clipval`**: the clip's Y is held to 16..235 and U, V to 16..240 (noise showed it: 17 % of the samples a few levels off).
+  The compositor does the same to the clip's samples inside its rectangle and to the chroma blocks it touches (`clip_colours`); the composite outside the clip is not clamped.
+* **The last `overlay`** weighs the mix by the clip's alpha per luma sample and per chroma block (`blend255`; the block's alpha is the average of its four, a last column ignoring its own second luma column:
+  `chroma_alpha`), over the canvas's chroma size. The alpha is the layer's own: opacity (static is refused, below), a keyed one, a mask or a key's plane, and **its fades, which are alpha fades both in and out**
+  (`LayerFades::ramp` / `ramp_out`: a multiplied clip must not go through black), a dissolve's ramp. Outside the clip's rectangle it is 0.
+* **The matrix is the one the graph names**, not the composite's (`PlanCanvas::blend_tag`: the bottom layer's tag over the whole cut for an export, over the layers on screen for a still; BT.709 for a labelled one; none = BT.601;
+  `blend_matrix()`): BT.601 and BT.709 have tables; BT.2020, `fcc` and `smpte240m` are refused.
+The passes: copy the canvas region (whole 2x2 blocks) to `before` and `laid`, draw the clip opaque onto `laid` with the plain layer's own pass (so its place, odd edges and chroma blocks are the plain layer's), then `fs_blend_rgb`
+(both frames to RGB, the mode, RGB out) and `fs_blend_over` (back to 4:2:0 and the integer blend onto the canvas by the alpha). `Compositor::blend_planes` runs the passes alone on planes the caller made.
+**Does this FFmpeg do that?** `blend::kernels()` (once per process, off every lock, `prepare` asks) runs the export's own chain text (`kerf_core::blend_colour_graph`, `blend_probe_graph`) on noise, per mode and per matrix,
+and a clip placed by the export's `overlay` at the frame's edges, and keeps the modes that came back as `blend::reference` computes them; `caps.blend` is those the two matrices agree on, and nothing until it has run.
+**FFmpeg 4.4.2's probe fails, and that is a real bug of that build**: its `overlay` slices the alpha plane of a clip placed above the frame's top edge wrongly when it runs on several threads (the alpha loses rows: the blend does nothing; Y 212 off), so on 4.4.2 every blend is refused,
+and the parity cases there check the refusal and then draw with the caps forced (`forced_blends`, `blend_check`) to hold the arithmetic to the export's planes for the clips not above the edge.
+*Refused* (`BlendMode` with its cause; every cause is listed): a layer the compositor's scaler resizes (the scaler's level is not swscale's and the blend carries it into the composite), a rotated one (a fixed-point edge), one below full
+opacity (the RGB round trip's chroma is a level off), a letterboxed one (its bars are transparent in the blend), an RGB picture (the decode's 4:2:0 is Y 3 / UV 11 off the graph's `format=yuva420p` on 4.4.2), an odd frame, a matrix with no tables, a mode the probe refused.
+**The ledger's T9 stays refused** (1920 frames, 9.0.2: `blend_mode/on a layer below full opacity` and `blend_mode/on a layer the compositor's scaler resizes` hit every frame, the mode itself none): its overlays are translucent and, planned at the preview's 540 px, resized. Lifting them is an exact scaler (a blended clip at the render size's own picture is drawn today) and an exact RGB round trip. Parity: `motion_parity` (`blend/...`: every mode over the bars and the test pattern both ways, over noise both ways, fades, keyed opacity, masks, a key, a dissolve, moved / off the frame / odd positions, over nothing,
+two blended clips, a late start under a plain clip, BT.709 / `smpte170m` / `bt470bg` footage; **all 0 differing samples in every plane**) and `parity` (the stills at `STRICT`: PSNR >= 46 dB, max 3, the PNG conversion's own rounding).
 
 **The clip's grade** (wheels = `colorbalance`, curves = `lutrgb`, a 3D LUT = `lut3d`; `grade.rs`, `shaders/grade.wgsl`, `compositor/grade_passes.rs`,
 `GpuCaps::grade`; not the `eq` colour above, which is a YUV operation). The grade's filters only take RGB, so FFmpeg converts the picture `yuv420p -> rgb24`, runs

@@ -136,6 +136,7 @@
 //! layer shows, and how much of the file a cursor must have read to know, is `kerf-core`'s
 //! (`Pick::progress`).
 
+pub mod blend;
 pub mod compositor;
 pub mod cursor;
 pub mod effects;

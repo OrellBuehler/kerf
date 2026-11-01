@@ -310,12 +310,28 @@ fn gpu() -> Arc<Gpu> {
         .clone()
 }
 
+thread_local! {
+    /// A case that draws with every blend mode in the caps, whatever this FFmpeg's probe said ([`blend_check`]).
+    static FORCED_BLENDS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn compositor() -> &'static Compositor {
     static C: OnceLock<Compositor> = OnceLock::new();
+    static FORCING: OnceLock<Compositor> = OnceLock::new();
+    if FORCED_BLENDS.with(std::cell::Cell::get) {
+        return FORCING.get_or_init(|| {
+            let _ = kerf_gpu::grade::kernels();
+            Compositor::new(gpu())
+                .expect("a compositor")
+                .with_blend_kinds(kerf_gpu::blend::all_modes())
+        });
+    }
     C.get_or_init(|| {
         // The grade is in the caps once this FFmpeg's conversions are known to be the model's (the app's `prepare` asks
         // ahead of a frame): the harness measures them once, up front, and its grade cases hold the answer to `Match`.
         let _ = kerf_gpu::grade::kernels();
+        // ...and the blend chain's, which the blend modes are in the caps by.
+        let _ = kerf_gpu::blend::kernels();
         Compositor::new(gpu()).expect("a compositor")
     })
 }
@@ -573,15 +589,26 @@ fn media() -> &'static Media {
         // The display matrix is a container property: remux a landscape file.
         let landscape = video("landscape.mp4", "testsrc2=size=640x360:rate=30:duration=2");
         let rotated_path = dir.join("rotated.mp4");
-        ffmpeg(&[
-            "-display_rotation",
-            "90",
-            "-i",
-            landscape.to_str().unwrap(),
-            "-c",
-            "copy",
-            rotated_path.to_str().unwrap(),
-        ]);
+        // (`-display_rotation` is FFmpeg 5's; before it the same matrix is the stream's `rotate` tag.)
+        let display = Command::new(kerf_core::ffmpeg_path())
+            .args(["-hide_banner", "-loglevel", "error", "-y", "-display_rotation", "90", "-i"])
+            .arg(&landscape)
+            .args(["-c", "copy"])
+            .arg(&rotated_path)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run ffmpeg");
+        if !display.status.success() {
+            ffmpeg(&[
+                "-i",
+                landscape.to_str().unwrap(),
+                "-c",
+                "copy",
+                "-metadata:s:v:0",
+                "rotate=90",
+                rotated_path.to_str().unwrap(),
+            ]);
+        }
         let jpeg = dir.join("still.jpg");
         ffmpeg(&[
             "-f",
@@ -6719,4 +6746,139 @@ fn what_the_compositor_does_not_draw_of_a_grade_is_refused() {
     // The same clip past its fade is drawn.
     let (tl, assets) = one(&m.testsrc, &|c| c.fade_in = 0.3);
     check("grade/after its fade-in", &tl, &assets, &[1.0], STRICT);
+}
+
+/// A blend case: held to the still where this FFmpeg's chain is the model's (`blend::kernels`); where the probe refused the build
+/// (FFmpeg 4.4's `overlay` loses the alpha rows of a clip above the frame's top edge when it runs on several threads) the plan must
+/// refuse every time and the case is drawn anyway with the caps forced, to hold the arithmetic itself to the still.
+fn blend_check(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], limits: Limits) {
+    if compositor().caps().blend == kerf_core::BlendKinds::ALL {
+        return check(case, tl, assets, times, limits);
+    }
+    for &t in times {
+        let plan = RenderPlan::at(tl, assets, &ExportOptions::default(), t, policy()).expect("plan");
+        let why = reasons(&plan, plan.size(u32::MAX));
+        assert!(
+            why.iter().any(|w| w.contains("no compositor pass draws this mode")),
+            "{case} @ {t}: a blend the probe refused is refused by the plan: {why:?}"
+        );
+    }
+    FORCED_BLENDS.with(|f| f.set(true));
+    check(&format!("{case} (forced)"), tl, assets, times, limits);
+    FORCED_BLENDS.with(|f| f.set(false));
+}
+
+/// A blend mode is FFmpeg's `blend` in RGB between two conversions (`engine/cli/blend.rs`), drawn in integers (`src/blend.rs`; held to
+/// the filters over every value in `tests/blend_kernels.rs` and to the export's planes sample for sample in `tests/motion_parity.rs`).
+/// The still's PNG is converted by swscale and the compositor's frame by its shader, so these hold the whole frame to `STRICT`, as
+/// every still is: every mode over the bars and the test pattern, the noise (every Y, U, V), a clip with its fades running, a mask and a
+/// key, a moved one, and on BT.709 / BT.601-tagged footage, where the chain names the composite's matrix.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn blend_modes_are_drawn_as_the_still_draws_them() {
+    use kerf_core::BlendMode;
+    let m = media();
+    let blended = |asset: &Asset, mode: BlendMode, edit: &dyn Fn(&mut Clip)| {
+        let mut c = clip(asset, 0.0, 2.0, 0.0);
+        c.blend_mode = mode;
+        edit(&mut c);
+        c
+    };
+    for mode in [
+        BlendMode::Multiply,
+        BlendMode::Screen,
+        BlendMode::Overlay,
+        BlendMode::HardLight,
+        BlendMode::Add,
+        BlendMode::Darken,
+        BlendMode::Lighten,
+        BlendMode::Difference,
+        BlendMode::Exclusion,
+    ] {
+        let over = |top: Clip, base: &Asset, with: &Asset| {
+            (
+                timeline(vec![vec![clip(base, 0.0, 2.0, 0.0)], vec![top]], None),
+                [base.clone(), with.clone()],
+            )
+        };
+        let (tl, assets) = over(blended(&m.testsrc, mode, &|_| {}), &m.bars, &m.testsrc);
+        blend_check(&format!("blend/{mode:?}"), &tl, &assets, &[0.5, 1.3], STRICT);
+        let (tl, assets) = over(blended(&m.bars, mode, &|_| {}), &m.testsrc, &m.bars);
+        blend_check(&format!("blend/{mode:?} bars over testsrc"), &tl, &assets, &[0.5], STRICT);
+        let (tl, assets) = over(blended(&m.noise, mode, &|_| {}), &m.gradient, &m.noise);
+        blend_check(&format!("blend/{mode:?} noise over a gradient"), &tl, &assets, &[0.1], BUSY);
+        let (tl, assets) = over(blended(&m.testsrc, mode, &|c| c.fade_in = 1.0), &m.bars, &m.testsrc);
+        blend_check(&format!("blend/{mode:?} fading in"), &tl, &assets, &[0.4], STRICT);
+        let (tl, assets) = over(
+            blended(&m.testsrc, mode, &|c| {
+                c.mask = Some(a_mask(kerf_core::MaskShape::Ellipse, 0.3, false));
+            }),
+            &m.bars,
+            &m.testsrc,
+        );
+        blend_check(&format!("blend/{mode:?} masked"), &tl, &assets, &[0.5], STRICT);
+        let (tl, assets) = over(
+            blended(&m.testsrc, mode, &|c| {
+                c.transform.pos_x = 0.2;
+                c.transform.pos_y = 0.1;
+            }),
+            &m.bars,
+            &m.testsrc,
+        );
+        blend_check(&format!("blend/{mode:?} moved"), &tl, &assets, &[0.5], STRICT);
+        for (name, base, top) in [
+            ("bt709", &m.bars709, &m.testsrc709),
+            ("smpte170m", &m.testsrc170m, &m.testsrc170m),
+            ("bt470bg", &m.bars470bg, &m.testsrc170m),
+        ] {
+            let (tl, assets) = over(blended(top, mode, &|_| {}), base, top);
+            blend_check(&format!("blend/{mode:?} on {name} footage"), &tl, &assets, &[0.5], STRICT);
+        }
+    }
+}
+
+/// What the chain is not exact for is refused in a still as in an export frame, and FFmpeg draws it.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn what_a_blend_is_not_exact_for_is_refused_in_a_still() {
+    use kerf_core::BlendMode;
+    let m = media();
+    type Edit = Box<dyn Fn(&mut Clip)>;
+    let edits: [(&str, &str, Edit); 3] = [
+        ("scaled", "scaler resizes", Box::new(|c| c.transform.scale = 0.6)),
+        ("rotated", "rotated layer", Box::new(|c| c.transform.rotation = 12.0)),
+        ("translucent", "below full opacity", Box::new(|c| c.transform.opacity = 0.6)),
+    ];
+    for (name, reason, edit) in &edits {
+        let mut c = clip(&m.testsrc, 0.0, 2.0, 0.0);
+        c.blend_mode = BlendMode::Multiply;
+        edit(&mut c);
+        let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![c]], None);
+        let plan = RenderPlan::at(
+            &tl,
+            &[m.bars.clone(), m.testsrc.clone()],
+            &ExportOptions::default(),
+            0.5,
+            policy(),
+        )
+        .expect("plan");
+        let why = reasons(&plan, plan.size(u32::MAX));
+        assert!(
+            why.iter().any(|w| w.contains(reason)),
+            "blend/{name}: refused for `{reason}`: {why:?}"
+        );
+    }
+    let mut c = clip(&m.portrait, 0.0, 2.0, 0.0);
+    c.blend_mode = BlendMode::Multiply;
+    let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![c]], None);
+    let plan = RenderPlan::at(
+        &tl,
+        &[m.bars.clone(), m.portrait.clone()],
+        &ExportOptions::default(),
+        0.5,
+        policy(),
+    )
+    .expect("plan");
+    let why = reasons(&plan, plan.size(u32::MAX));
+    assert!(why.iter().any(|w| w.contains("letterboxed layer")), "{why:?}");
 }

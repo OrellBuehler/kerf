@@ -4794,6 +4794,15 @@ async fn get_render_bar(
             if timeline.tracks.iter().flat_map(|t| &t.clips).any(|c| !c.grade.is_identity()) {
                 let _ = kerf_gpu::grade::kernels();
             }
+            // ...and so are the blend modes, where this FFmpeg's blend chain is the one it draws.
+            if timeline
+                .tracks
+                .iter()
+                .flat_map(|t| &t.clips)
+                .any(|c| !c.blend_mode.is_normal())
+            {
+                let _ = kerf_gpu::blend::kernels();
+            }
             kerf_gpu::Compositor::caps_for(kerf_gpu::grade::measured())
         });
         let req = kerf_core::render_bar::BarRequest {

@@ -52,6 +52,48 @@ impl EffectKinds {
     }
 }
 
+/// A set of [`BlendMode`]s: the modes a compositor draws one by one (`Normal` is plain alpha-over, always drawn).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BlendKinds(u16);
+
+impl BlendKinds {
+    pub const NONE: Self = Self(0);
+    pub const ALL: Self = Self(0b1_1111_1111);
+
+    /// The kind of one mode; none for `Normal`.
+    pub const fn of(mode: BlendMode) -> Self {
+        match mode {
+            BlendMode::Normal => Self(0),
+            BlendMode::Multiply => Self(1),
+            BlendMode::Screen => Self(1 << 1),
+            BlendMode::Overlay => Self(1 << 2),
+            BlendMode::HardLight => Self(1 << 3),
+            BlendMode::Add => Self(1 << 4),
+            BlendMode::Darken => Self(1 << 5),
+            BlendMode::Lighten => Self(1 << 6),
+            BlendMode::Difference => Self(1 << 7),
+            BlendMode::Exclusion => Self(1 << 8),
+        }
+    }
+
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// The kinds of both.
+    pub const fn intersection(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+
+    pub const fn without(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+}
+
 /// A set of the parts of a clip's [`Grade`](crate::model::Grade): what a compositor draws one by one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct GradeKinds(u8);
@@ -146,6 +188,11 @@ pub struct GpuCaps {
     /// whatever the caps (`GradeWith`): a layer the scaler resizes, a letterbox, an odd picture, a format other
     /// than 8-bit limited-range `yuv420p`, video effects behind the grade, a running black or white fade and a moving zoom.
     pub grade: GradeKinds,
+    /// The blend modes drawn: FFmpeg mixes a blended clip with the composite by `blend` in RGB, through a conversion
+    /// each way, and a compositor that sets a mode reproduces that chain to the level on this FFmpeg. Refused whatever
+    /// the caps (`BlendMode` with its cause): a layer the compositor scales or turns, a letterbox, an opacity
+    /// below 1 (the RGB round trip), a composite matrix other than BT.601 or BT.709, an odd render size.
+    pub blend: BlendKinds,
 }
 
 impl GpuCaps {
@@ -166,6 +213,7 @@ impl GpuCaps {
         hdr: false,
         effects: EffectKinds::NONE,
         grade: GradeKinds::NONE,
+        blend: BlendKinds::NONE,
     };
 }
 
@@ -313,8 +361,9 @@ pub enum Unsupported {
     /// (vid.stab's transform, or `deshake`), which no compositor pass draws.
     Stabilized(LayerRef),
     /// The layer's clip composites with a blend mode: FFmpeg mixes it with the composite by `blend` in RGB, after a
-    /// conversion each way, which no compositor pass reproduces.
-    BlendMode(LayerRef, BlendMode),
+    /// conversion each way. The compositor draws the mode's chain (`GpuCaps::blend`) on a layer at its own size, opaque
+    /// and upright, over an even frame; the string is what keeps this one from being drawn.
+    BlendMode(LayerRef, BlendMode, &'static str),
     /// The layer plays on past its end, under the clip that replaces it.
     Tail(LayerRef),
     KeyedOpacity(LayerRef),
@@ -509,9 +558,9 @@ impl fmt::Display for Unsupported {
                 f,
                 "{l}: a speed ramp (the export retimes its frames by an expression and picks among them, which the compositor does not reproduce)"
             ),
-            Self::BlendMode(l, mode) => write!(
+            Self::BlendMode(l, mode, why) => write!(
                 f,
-                "{l}: the {} blend mode (FFmpeg mixes it with the composite by `blend` in RGB, which the compositor does not reproduce)",
+                "{l}: the {} blend mode (FFmpeg mixes it with the composite by `blend` in RGB): {why}",
                 mode.label().to_lowercase()
             ),
             Self::Tail(l) => write!(f, "{l}: playing on past its end under a transition"),
@@ -620,13 +669,15 @@ mod tests {
         assert_eq!(Unsupported::MixedMatrices.kind(), "mixed_matrices");
         assert_eq!(Unsupported::SpeedRamp(layer(1, "a.mp4")).kind(), "speed_ramp");
         assert_eq!(
-            Unsupported::BlendMode(layer(0, "a.mp4"), BlendMode::Multiply).kind(),
-            Unsupported::BlendMode(layer(2, "b.mov"), BlendMode::Screen).kind(),
+            Unsupported::BlendMode(layer(0, "a.mp4"), BlendMode::Multiply, "a").kind(),
+            Unsupported::BlendMode(layer(2, "b.mov"), BlendMode::Screen, "b").kind(),
             "the mode is not part of the key"
         );
-        assert!(Unsupported::BlendMode(layer(1, "a.mp4"), BlendMode::HardLight)
-            .to_string()
-            .starts_with("layer 1 (a.mp4): the hard light blend mode"));
+        assert!(
+            Unsupported::BlendMode(layer(1, "a.mp4"), BlendMode::HardLight, "a rotated layer")
+                .to_string()
+                .starts_with("layer 1 (a.mp4): the hard light blend mode")
+        );
         assert!(Unsupported::SpeedRamp(layer(1, "a.mp4"))
             .to_string()
             .starts_with("layer 1 (a.mp4): a speed ramp"));
@@ -657,7 +708,7 @@ mod tests {
             Unsupported::FullRangeResized(layer(0, ""), "an export frame").kind(),
             Unsupported::SpeedRamp(layer(0, "")).kind(),
             Unsupported::Stabilized(layer(0, "")).kind(),
-            Unsupported::BlendMode(layer(0, ""), BlendMode::Screen).kind(),
+            Unsupported::BlendMode(layer(0, ""), BlendMode::Screen, "a rotated layer").kind(),
         ];
         for kind in kinds {
             assert!(

@@ -356,9 +356,12 @@
   **A stabilized clip is refused** (`PlanTiming.stabilized` = `Clip::is_stabilized`, `Unsupported::Stabilized(layer)`, kind
   `stabilized`, Still and Motion alike): its frames are moved by vid.stab's transform or `deshake` in the chain, which no pass
   draws, so FFmpeg draws them (`a_stabilized_clip_is_refused_in_a_still_and_an_export_frame`).
-  **A blend mode is refused** (`PlanLayer.blend`, `Unsupported::BlendMode(layer, mode)`, kind `blend_mode`, Still and Motion alike,
-  for every cap): FFmpeg mixes the layer with the composite by `blend` in RGB after a conversion each way and two placements
-  (`engine-cli.md`, "Blend modes"), arithmetic no compositor pass reproduces, so the frame is FFmpeg's. `normal` refuses nothing.
+  **A blend mode** (`PlanLayer.blend`, `Unsupported::BlendMode(layer, mode, cause)`, kind `blend_mode`, Still and Motion alike): FFmpeg mixes the layer with the composite by `blend` in RGB after
+  a conversion each way and two placements (`engine-cli.md`, "Blend modes"). The compositor draws the modes in `GpuCaps::blend` (`BlendKinds`; `kerf-gpu`'s probe says which this FFmpeg matches, `gpu.md`, "Blend modes"),
+  and every cause that keeps a layer from being drawn is its own reason with the cause as the string, so the ledger ranks them: the mode not in the caps (`size_free_reasons`), a composite matrix with no tables
+  (`RenderPlan::blend_matrix`, from `PlanCanvas::blend_tag`: the tag the graph's blend chains name, the bottom layer's over the whole cut for an export, over the layers on screen for a still, decided in the planner
+  and checked against the graph's text), an RGB picture, and from `reasons(size)` a layer the scaler resizes, a rotated one, a letterboxed one (`geom.matte`), one below full opacity (`geom.translucent`) and an odd frame size.
+  `normal` refuses nothing (`a_blend_is_drawn_where_the_chain_is_exact_and_each_cause_that_it_is_not_is_listed`, `the_matrix_a_blend_names_is_the_plans_blend_tag`).
   **A speed ramp is refused** (`PlanTiming.ramped`, `Unsupported::SpeedRamp(layer)`, kind `speed_ramp`, from `size_free_reasons` in a
   Still and a Motion plan alike, for every cap): the export retimes a ramped clip's frames with a `setpts` expression and lets `fps`
   pick among them (`engine-cli.md`, "Speed ramps"), a pick over a rate that moves which `frame_pick.rs` does not model, and a

@@ -1740,7 +1740,9 @@ ungated by `cpu::lease`, but niced (`bg_command`) and thread-capped by the still
   (sharp saturated edges) is clipped into the gamut (~25 levels at such edges); along an edge that cuts a 2x2 chroma block (a
   rotated clip's slant, an odd-sized layer's last column / row) the blend takes the block's chroma from one pixel where
   `overlay` weighs it by the block's alpha (up to 80 levels of chroma in those blocks); the bars above stay black. The GPU
-  compositor refuses it (`Unsupported::BlendMode`). Golden: the appended `blend` family.
+  compositor draws it where it is exact (`gpu.md`, "Blend modes"; `colour_chains` / `blend_colour_graph` / `blend_probe_graph` are the text its probe runs,
+  `composite_matrix` is mirrored by `PlanCanvas::blend_tag`): the colour half of the chain is integer arithmetic held to the filters over every value, **`lutyuv=a=255` is `clipval`**
+  (the clip's Y held to 16..235, U and V to 16..240), and `gbrp` is another swscale path than the chain's `gbrap`. Golden: the appended `blend` family.
   **Speed ramps** (`Clip::speed_ramp`: keys of clip-local timeline time, speed and `linear` / `hold`; `model/speed_ramp.rs` is the
   map, `Clip::along` / `local_at_along` its two directions; `clip_timing/ramp.rs` is what the graph prints). Nothing reads
   `speed_mag()` for a ramped clip: the window, the tail, `picture_window`, the handle, the scrub, the plan, the cover and the

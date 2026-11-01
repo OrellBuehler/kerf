@@ -35,7 +35,7 @@ use crate::model::{
     pix_fmt_is_high_bit, pix_fmt_layout, pix_fmt_subsampling, Asset, BlendMode, Clip, Color, FitOrder, Grade, Hdr, Mask,
     PixLayout, Projection, ResolvedReframe, StreamInfo, StreamKind, Subsampling, Timeline, Transform, VideoEffect,
 };
-use crate::plan_caps::{DipWhy, EffectKinds, GpuCaps, GradeKinds, LayerRef, Unsupported};
+use crate::plan_caps::{BlendKinds, DipWhy, EffectKinds, GpuCaps, GradeKinds, LayerRef, Unsupported};
 use crate::planner::{PlanRequest, Planner};
 use crate::ExportOptions;
 
@@ -285,6 +285,12 @@ pub struct PlanCanvas {
     /// is not decided by the layers on screen with it ([`composite_matrix`] judges those). Always `false` in a
     /// Still plan, whose graph is the layers on screen.
     pub mixed_matrices_cut: bool,
+    /// The matrix tag the graph's **blend chains** name for their conversions into RGB and back (`engine::blend_chains`):
+    /// the bottom layer's tag, BT.709 for a layer the graph labels so, `None` for an untagged one (which names nothing:
+    /// BT.601 on every build). Decided over the whole cut for a [`PlanMode::Motion`] plan (the lowest video track's
+    /// first picture) and over the layers on screen for a Still (the graph is those). It is the matrix the blend is drawn
+    /// in, whatever the composite's own is ([`PlanCanvas::matrix`]).
+    pub blend_tag: Option<&'static str>,
 }
 
 /// What the compositor needs to know about a layer's source picture.
@@ -1071,6 +1077,31 @@ impl RenderPlan {
                     "a sharpen after a scale or a blur: it amplifies their one-level difference from FFmpeg's by 1 + 2|amount| and rounds up a level more with each further sharpen, past two levels",
                 ));
             }
+            // A blended layer is drawn on what the compositor draws exactly: its own picture at its own size, upright
+            // and opaque, over an even frame (the conversions are 4:2:0 pairs). The scaler's level is not swscale's (a
+            // level on the colour, which the blend carries into the composite), a rotation's edge is a fixed-point
+            // sample, a letterbox's bars are transparent in the blend and opaque in the compositor, and an opacity
+            // below 1 takes the RGB round trip, whose chroma is a level off.
+            if !layer.blend.is_normal() {
+                let why = |w: &'static str| Unsupported::BlendMode(self.layer_ref(n, layer), layer.blend, w);
+                if geom.stages.iter().any(|s| s.scaled != (s.src.w, s.src.h)) {
+                    reasons.push(why("on a layer the compositor's scaler resizes (its level is not swscale's)"));
+                }
+                if geom.rotation.is_some() {
+                    reasons.push(why("on a rotated layer (the edge is a fixed-point sample)"));
+                }
+                if geom.matte {
+                    reasons.push(why("on a letterboxed layer (its bars are transparent in the blend)"));
+                }
+                if geom.translucent {
+                    reasons.push(why(
+                        "on a layer below full opacity (the RGB round trip's chroma is a level off)",
+                    ));
+                }
+                if size.0 % 2 == 1 || size.1 % 2 == 1 {
+                    reasons.push(why("on a frame with an odd side (the conversions work on 2x2 chroma blocks)"));
+                }
+            }
             // FFmpeg scales a picture in the format it has; the compositor scales the
             // 8-bit 4:2:0 a decode reduces it to, which is the same picture only when
             // that is what it already was (or gray, which has no chroma). For anything
@@ -1220,9 +1251,32 @@ impl RenderPlan {
                 out.push(Unsupported::Stabilized(at()));
             }
             // A blend mode is FFmpeg's `blend` over the composite in RGB, through two placements and a conversion
-            // each way (`engine::blend_chains`): no compositor pass draws it, and refusing is the exact answer.
+            // each way (`engine::blend_chains`): drawn for the modes in `caps.blend`, in the matrix the graph names
+            // (`blend_matrix`), at the level only where the rest of the chain is exact: see the other causes in `reasons`.
             if !layer.blend.is_normal() {
-                out.push(Unsupported::BlendMode(at(), layer.blend));
+                if !caps.blend.contains(BlendKinds::of(layer.blend)) {
+                    out.push(Unsupported::BlendMode(
+                        at(),
+                        layer.blend,
+                        "no compositor pass draws this mode on this FFmpeg",
+                    ));
+                }
+                if self.blend_matrix().is_none() {
+                    out.push(Unsupported::BlendMode(
+                        at(),
+                        layer.blend,
+                        "the composite's matrix is not BT.601 or BT.709, the two the conversions are reproduced for",
+                    ));
+                }
+                // An RGB picture reaches the graph as RGB and is converted by `format=yuva420p`, where the compositor has the decode's
+                // 4:2:0: a few levels apart (measured Y 3, UV 11), and a blend carries them through.
+                if layer.stream.layout() == Some(PixLayout::Rgb) {
+                    out.push(Unsupported::BlendMode(
+                        at(),
+                        layer.blend,
+                        "an RGB picture (the graph converts it, the decode's 4:2:0 is a few levels off)",
+                    ));
+                }
             }
             if layer.hdr.is_some() && !caps.hdr {
                 out.push(Unsupported::Hdr(at()));
@@ -1720,6 +1774,17 @@ impl RenderPlan {
             || layer.mask.is_some()
             || layer.effects.iter().any(|e| e.produces_alpha())
             || layer.fx.fades.iter().any(|s| s.tint == FadeTint::Alpha)
+    }
+
+    /// The matrix a blended clip's conversions into RGB and back are made in ([`PlanCanvas::blend_tag`]): BT.601 for an untagged
+    /// bottom layer and the `smpte170m` / `bt470bg` tags, BT.709 for the tag or the graph's label; `None` for any other
+    /// (BT.2020, `fcc`, `smpte240m`), which the blend has no measured tables for.
+    pub fn blend_matrix(&self) -> Option<YuvMatrix> {
+        match self.canvas.blend_tag {
+            None | Some("smpte170m" | "bt470bg") => Some(YuvMatrix::Bt601),
+            Some("bt709") => Some(YuvMatrix::Bt709),
+            Some(_) => None,
+        }
     }
 
     /// The size a render of this plan at `max_width` comes out — what the FFmpeg

@@ -387,6 +387,25 @@ impl Planner {
             });
             matrices.next().is_some_and(|first| matrices.any(|m| m != first))
         };
+        // The matrix a blended clip's conversions name: the bottom layer's of the cut (the lowest video track's first
+        // picture, as `build_filter_complex` picks it). A Still plan decides it over the layers on screen instead.
+        let blend_tag = if req.mode == PlanMode::Motion {
+            let has_picture = |c: &&PlannedClip| c.asset.as_ref().is_some_and(|a| a.stream.is_some());
+            clips
+                .iter()
+                .filter(has_picture)
+                .map(|c| c.track)
+                .min()
+                .and_then(|track| {
+                    clips.iter().filter(has_picture).filter(|c| c.track == track).min_by(|a, b| {
+                        let start = |c: &PlannedClip| rendered.tracks[c.track].clips[c.index].timeline_start;
+                        start(a).total_cmp(&start(b))
+                    })
+                })
+                .and_then(|c| crate::engine::blend_composite_tag(c.fx.label_bt709, c.fx.frame_matrix))
+        } else {
+            None
+        };
         Ok(Self {
             mode: req.mode,
             canvas: PlanCanvas {
@@ -402,6 +421,7 @@ impl Planner {
                 gif: opts.container == Container::Gif,
                 full_range_cut,
                 mixed_matrices_cut,
+                blend_tag,
             },
             rendered,
             clips,
@@ -765,6 +785,19 @@ impl Planner {
             frame,
             canvas: PlanCanvas {
                 matrix,
+                // A still's graph is the layers on screen: its blends name the bottom one's tag.
+                blend_tag: if motion {
+                    self.canvas.blend_tag
+                } else {
+                    layers.first().and_then(|l| {
+                        let tag = if l.hdr.is_some() {
+                            Some("bt709")
+                        } else {
+                            crate::model::frame_matrix_tag(l.stream.color_space.as_deref(), l.stream.pix_fmt.as_deref())
+                        };
+                        crate::engine::blend_composite_tag(l.stream.label_bt709, tag)
+                    })
+                },
                 ..self.canvas.clone()
             },
             layers,
@@ -1726,6 +1759,7 @@ mod tests {
             hdr: true,
             effects: EffectKinds::ALL,
             grade: crate::plan_caps::GradeKinds::NONE,
+            blend: crate::plan_caps::BlendKinds::NONE,
         };
         let holding = |edit: &dyn Fn(&mut Clip)| {
             let mut clip = make_clip(a.id, 0.0, 4.0, 0.0);
@@ -1944,6 +1978,7 @@ mod tests {
             hdr: true,
             effects: EffectKinds::ALL,
             grade: crate::plan_caps::GradeKinds::NONE,
+            blend: crate::plan_caps::BlendKinds::NONE,
         };
         // (The overlay names the shipped default font, which a text pass can draw.)
         assert_eq!(plan.reasons(&all, size), vec![]);
@@ -2562,6 +2597,7 @@ mod tests {
             hdr: true,
             effects: EffectKinds::ALL,
             grade: crate::plan_caps::GradeKinds::NONE,
+            blend: crate::plan_caps::BlendKinds::NONE,
         };
         let keyed_clip = |a: &Asset| {
             let mut clip = make_clip(a.id, 0.0, 4.0, 1.0);
@@ -3234,6 +3270,98 @@ mod tests {
         .at(1.0)
         .unwrap();
         assert!(!plan.size_free_reasons(&caps).iter().any(|u| u.kind() == "blend_mode"));
+    }
+
+    #[test]
+    fn a_blend_is_drawn_where_the_chain_is_exact_and_each_cause_that_it_is_not_is_listed() {
+        use crate::model::BlendMode;
+        use crate::plan_caps::{BlendKinds, GpuCaps};
+        let a = asset();
+        let caps = GpuCaps {
+            blend: BlendKinds::ALL,
+            ..GpuCaps::A0
+        };
+        let why_for = |edit: &dyn Fn(&mut Clip), assets: &[Asset], size: (u32, u32)| {
+            let mut top = make_clip(a.id, 0.0, 4.0, 0.0);
+            top.blend_mode = BlendMode::HardLight;
+            edit(&mut top);
+            let tl = timeline_of(vec![
+                video_track(vec![make_clip(a.id, 0.0, 4.0, 0.0)]),
+                video_track(vec![top]),
+            ]);
+            let plan = planner(&tl, assets, PlanMode::Still, &opts(30.0)).at(1.0).unwrap();
+            plan.reasons(&caps, size)
+                .into_iter()
+                .filter(|u| u.kind() == "blend_mode")
+                .map(|u| u.to_string())
+                .collect::<Vec<_>>()
+        };
+        let one = std::slice::from_ref(&a);
+        let size = (1920, 1080);
+        // A clip at its own size, upright and opaque, over an even frame: drawn, every mode in the caps.
+        assert_eq!(why_for(&|_| {}, one, size), Vec::<String>::new());
+        // Its own alpha (keyed opacity, a mask) is no cause: the alpha plane is what the last overlay weighs the mix by.
+        assert!(why_for(&|c| c.mask = Some(crate::model::Mask::default()), one, size).is_empty());
+        // Each of what the chain is not exact for names itself.
+        let has = |why: &[String], cause: &str| why.iter().any(|w| w.contains(cause));
+        assert!(has(&why_for(&|c| c.transform.scale = 0.6, one, size), "scaler resizes"));
+        assert!(has(&why_for(&|c| c.transform.rotation = 10.0, one, size), "rotated layer"));
+        assert!(has(&why_for(&|c| c.transform.opacity = 0.5, one, size), "below full opacity"));
+        assert!(has(&why_for(&|_| {}, one, (1919, 1080)), "odd side"));
+        // A mode that is not in the caps (the probe did not match this FFmpeg) is refused by the plan alone.
+        let mut top = make_clip(a.id, 0.0, 4.0, 0.0);
+        top.blend_mode = BlendMode::Screen;
+        let tl = timeline_of(vec![
+            video_track(vec![make_clip(a.id, 0.0, 4.0, 0.0)]),
+            video_track(vec![top]),
+        ]);
+        let plan = planner(&tl, one, PlanMode::Still, &opts(30.0)).at(1.0).unwrap();
+        let without = GpuCaps {
+            blend: BlendKinds::ALL.without(BlendKinds::of(BlendMode::Screen)),
+            ..caps
+        };
+        assert!(plan.reasons(&caps, size).iter().all(|u| u.kind() != "blend_mode"));
+        assert!(plan
+            .reasons(&without, size)
+            .iter()
+            .any(|u| u.to_string().contains("no compositor pass draws this mode")));
+        // An RGB picture is converted by the graph where the compositor has the decode's 4:2:0.
+        let mut rgb = asset();
+        rgb.streams[0].pix_fmt = Some("rgb24".into());
+        let both = [a.clone(), rgb.clone()];
+        let mut top = make_clip(rgb.id, 0.0, 4.0, 0.0);
+        top.blend_mode = BlendMode::Screen;
+        let tl = timeline_of(vec![
+            video_track(vec![make_clip(a.id, 0.0, 4.0, 0.0)]),
+            video_track(vec![top]),
+        ]);
+        let plan = planner(&tl, &both, PlanMode::Still, &opts(30.0)).at(1.0).unwrap();
+        assert!(plan
+            .size_free_reasons(&caps)
+            .iter()
+            .any(|u| u.to_string().contains("an RGB picture")));
+    }
+
+    #[test]
+    fn the_matrix_a_blend_is_drawn_in_is_the_graphs_and_only_601_and_709_have_tables() {
+        use crate::render_plan::YuvMatrix;
+        let a = asset();
+        let tl = single(vec![make_clip(a.id, 0.0, 4.0, 0.0)]);
+        let mut plan = planner(&tl, std::slice::from_ref(&a), PlanMode::Still, &opts(30.0))
+            .at(1.0)
+            .unwrap();
+        for (tag, matrix) in [
+            (None, Some(YuvMatrix::Bt601)),
+            (Some("smpte170m"), Some(YuvMatrix::Bt601)),
+            (Some("bt470bg"), Some(YuvMatrix::Bt601)),
+            (Some("bt709"), Some(YuvMatrix::Bt709)),
+            (Some("bt2020nc"), None),
+            (Some("smpte240m"), None),
+            (Some("fcc"), None),
+        ] {
+            plan.canvas.blend_tag = tag;
+            assert_eq!(plan.blend_matrix(), matrix, "{tag:?}");
+        }
     }
 
     #[test]
