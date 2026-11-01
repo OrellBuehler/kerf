@@ -44,7 +44,7 @@
 //! resolution channels and the colour as written.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, UNIX_EPOCH};
 
@@ -463,9 +463,11 @@ impl Raster {
         }
     }
 
-    /// What it holds, for the atlas's budget.
+    /// What it holds, for the atlas's budget: the bitmaps, the dense layers made from them and the textures
+    /// the first frame makes of those (as many bytes again, on the GPU).
     fn bytes(&self) -> usize {
-        std::mem::size_of::<Self>() + self.sequence.iter().map(|b| b.data.len() * 3 + 64).sum::<usize>()
+        let layers = self.layers.get().and_then(Option::as_ref).map_or(0, Layers::bytes);
+        std::mem::size_of::<Self>() + self.sequence.iter().map(|b| b.data.len() * 3 + 64).sum::<usize>() + layers * 2
     }
 
     /// The masks cut out of `parts` (each `w` x `h`, in the order `graph.parts` names): the glyphs'
@@ -606,6 +608,11 @@ impl Layers {
             region: [rx, ry, rw as i32, rh as i32],
             passes,
         })
+    }
+
+    /// The bytes of every layer.
+    pub fn bytes(&self) -> usize {
+        self.passes.iter().map(|(luma, chroma)| luma.len() + chroma.len()).sum()
     }
 
     /// The layers as textures of `gpu`.
@@ -915,14 +922,35 @@ pub fn sum_fallbacks() -> u64 {
 /// `ffmpeg` runs the first time a text is seen.
 pub fn raster(t: &PlanText, size: (u32, u32)) -> Result<Raster, GpuError> {
     let graph = kerf_core::text_raster_graph(t, size);
-    let build = seq::build().ok_or_else(|| {
-        GpuError::Unsupported("this FFmpeg's text layout or colour conversion is not one the compositor knows".into())
-    })?;
     if let Some(why) = kerf_core::text_sequence_limit(&t.text, Some(seq::font_px(t, size.1))) {
         return Err(GpuError::Unsupported(why));
     }
-    let planes = run_graph(&graph)?;
-    let mut raster = Raster::from_parts(&graph, &planes)?;
+    // A text whose bitmaps were not reproduced (a face with positioned glyphs, a script the shaper
+    // reorders) is refused again and again by a scrub, and the atlas drops a failure: the verdict is
+    // kept here, keyed as the atlas is, and asked before FFmpeg is.
+    let refused = refusal_key(t, &graph);
+    if let Some(e) = seq::remembered(&refused) {
+        return Err(e);
+    }
+    let build = seq::build().ok_or_else(|| {
+        GpuError::Unsupported("this FFmpeg's text layout or colour conversion is not one the compositor knows".into())
+    })?;
+    rasterise(t, size, &graph, build.colour).inspect_err(|e| {
+        if matches!(e, GpuError::Unsupported(_)) {
+            seq::remember(refused, e);
+        }
+    })
+}
+
+/// What a refusal of `t` is remembered under: what makes two rasterisations the same ([`Key`]).
+fn refusal_key(t: &PlanText, graph: &TextRasterGraph) -> String {
+    format!("raster|{:?}", Key::new(graph, t.font_file.as_deref()))
+}
+
+/// [`raster`] once the build is known and the text may be tried.
+fn rasterise(t: &PlanText, size: (u32, u32), graph: &TextRasterGraph, colour: ColourModel) -> Result<Raster, GpuError> {
+    let planes = run_graph(graph)?;
+    let mut raster = Raster::from_parts(graph, &planes)?;
     let (w, h) = (size.0 as usize, size.1 as usize);
     let ink = graph
         .parts
@@ -932,7 +960,11 @@ pub fn raster(t: &PlanText, size: (u32, u32)) -> Result<Raster, GpuError> {
         .ok_or_else(|| GpuError::Unsupported("the text has no glyph part".into()))?;
     raster.sequence = seq::sequence(t, size, ink)?;
     raster.exact = true;
-    raster.colour = build.colour;
+    raster.colour = colour;
+    // Made now, not by the first frame, so that the atlas charges what the entry will hold.
+    if !raster.sequence.is_empty() {
+        let _ = raster.layers.set(Layers::of(&raster.sequence, size.0, size.1));
+    }
     Ok(raster)
 }
 
@@ -1024,6 +1056,8 @@ impl Key {
 struct Slot {
     raster: Mutex<Option<Arc<Raster>>>,
     used: AtomicU64,
+    /// What the atlas charged for the raster when it was filled (what it gives back when it is dropped).
+    charged: AtomicUsize,
 }
 
 #[derive(Default)]
@@ -1093,6 +1127,7 @@ impl TextAtlas {
                     Arc::new(Slot {
                         raster: Mutex::new(None),
                         used: AtomicU64::new(0),
+                        charged: AtomicUsize::new(0),
                     })
                 })
                 .clone();
@@ -1118,8 +1153,10 @@ impl TextAtlas {
         };
         *held = Some(Arc::clone(&made));
         drop(held);
+        let charged = made.bytes();
+        slot.charged.store(charged, Ordering::Relaxed);
         let mut inner = locked(&self.inner);
-        inner.bytes += made.bytes();
+        inner.bytes += charged;
         self.evict(&mut inner, &key);
         Ok(made)
     }
@@ -1172,9 +1209,7 @@ impl TextAtlas {
                 return;
             };
             if let Some(slot) = inner.slots.remove(&victim) {
-                if let Some(raster) = locked(&slot.raster).as_ref() {
-                    inner.bytes = inner.bytes.saturating_sub(raster.bytes());
-                }
+                inner.bytes = inner.bytes.saturating_sub(slot.charged.load(Ordering::Relaxed));
             }
         }
     }
@@ -1550,6 +1585,51 @@ mod tests {
         atlas.get(key(2), || panic!("held")).unwrap();
         assert_eq!(atlas.runs(), 3);
         assert_eq!(atlas.held().0, 2);
+    }
+
+    #[test]
+    fn a_refused_text_is_not_rasterised_again_until_the_refusal_is_forgotten() {
+        let t = text("white", None, 1.0);
+        let size = (320, 180);
+        let graph = kerf_core::text_raster_graph(&t, size);
+        seq::remember(
+            refusal_key(&t, &graph),
+            &GpuError::Unsupported("glyphs it cannot place".into()),
+        );
+        // Answered from the memory: no FFmpeg is asked, so even a machine with none says the same.
+        let e = super::raster(&t, size).unwrap_err();
+        assert!(
+            matches!(&e, GpuError::Unsupported(w) if w.contains("glyphs it cannot place") && w.contains("not tried again")),
+            "{e}"
+        );
+        // ... and another text is not that one.
+        let mut other = text("white", None, 1.0);
+        other.text = "another".into();
+        assert!(seq::remembered(&refusal_key(&other, &kerf_core::text_raster_graph(&other, size))).is_none());
+    }
+
+    #[test]
+    fn an_entry_is_charged_its_layers_and_their_textures_and_gives_back_what_it_was_charged() {
+        let plain = raster(Some(coverage(0, 0, 40, 10, 255)), None);
+        let layered = raster(Some(coverage(0, 0, 40, 10, 255)), None);
+        let dense = layered.layers(64, 64).unwrap().expect("layers").bytes();
+        assert!(dense >= 40 * 10 * 4, "{dense}");
+        assert_eq!(
+            layered.bytes(),
+            plain.bytes() + 2 * dense,
+            "the layers and the textures made from them are in the charge"
+        );
+        // What was charged on the way in is what goes on the way out, whatever the entry grew to since.
+        let atlas = TextAtlas::with_limits(1, usize::MAX);
+        let held = atlas
+            .get(key(1), || Ok(raster(Some(coverage(0, 0, 40, 10, 255)), None)))
+            .unwrap();
+        let before = atlas.held().1;
+        held.layers(64, 64).unwrap();
+        atlas.get(key(2), || made(100)).unwrap();
+        let (n, after) = atlas.held();
+        assert_eq!(n, 1, "the first went");
+        assert_eq!(after, made(100).unwrap().bytes(), "and its charge ({before}) went with it");
     }
 
     #[test]

@@ -543,11 +543,18 @@ fn remembered_within(key: &str, memory: Duration) -> Option<GpuError> {
     (at.elapsed() < memory).then(|| unsupported(format!("{why} (not tried again yet)")))
 }
 
-fn remembered(key: &str) -> Option<GpuError> {
+/// Whether a refusal was earned lately for `key` (anything a caller would otherwise run FFmpeg to find out).
+pub(super) fn remembered(key: &str) -> Option<GpuError> {
     remembered_within(key, FAILURE_MEMORY)
 }
 
-fn remember(key: String, e: &GpuError) {
+/// Remember the refusal `e` for `key`, so that it is not run again for a while. Only refusals are remembered: an
+/// error that is not one (a decode failing, a lost device) is not a verdict on the text.
+pub(super) fn remember(key: String, e: &GpuError) {
+    let why = match e {
+        GpuError::Unsupported(why) => why.clone(),
+        other => other.to_string(),
+    };
     let mut held = locked(failures());
     if held.len() >= 256 {
         held.retain(|_, (at, _)| at.elapsed() < FAILURE_MEMORY);
@@ -555,7 +562,7 @@ fn remember(key: String, e: &GpuError) {
             held.clear();
         }
     }
-    held.insert(key, (Instant::now(), e.to_string()));
+    held.insert(key, (Instant::now(), why));
 }
 
 /// The box `drawtext` draws behind the whole text with its top left at `(0, ascent)`: the text's

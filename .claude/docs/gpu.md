@@ -556,7 +556,8 @@ off its link, 6.1's uses BT.601, which `FixedBt601` already says; limited range,
 truncated), not asked of FFmpeg. Passes ping-pong between two canvases that agree outside the region the overlays can touch
 (box, then glyph layers, one scissored pass each). The mask (`Raster::boxed`) is still one rectangle FFmpeg draws once per state
 (`rasterize`, killed at `RASTER_TIMEOUT` 5 s, `limit_frame_args`); a mask is cached in `TextAtlas` (key: graph text, font file length + mtime, `ffmpeg` path; 256 states /
-48 MiB, LRU; a state wanted by several frames runs once; a failure is not remembered; textures are made by the first frame that
+48 MiB, LRU, each state charged its bitmaps, its dense layers and, again, the textures made from them, the charge kept per slot and given back as it was; a state wanted by several frames runs once; the atlas
+drops a failure, so `text::raster` keeps a *refusal* (anything `Unsupported`: a proof that did not match, a face FFmpeg could not open, a timeout) for 30 s under the atlas key, asked before the first `ffmpeg` of the rasterisation, so a scrub over Arial Narrow, a script face or RTL text spawns nothing per frame (`tests/text_refusal_memory.rs`: a wrapper darkens the first run's picture so the proof refuses, then counts the runs of three more asks: none) — an animated position is a new key per frame, and the measure and dictionary behind it are remembered by text and size alone; textures are made by the first frame that
 draws one). A drag's frame (`render_draft_texture_with`, the app's draft frames) is drawn exactly as any other, but a title state the
 atlas does not hold is a pose of the drag (a new one per pointer move, never drawn again): it is made into a second atlas of 4 states /
 16 MiB (`TextAtlas::get_drafted`, `peek`), so a drag never pushes the cut's own titles out. `prepare_text` blocks on those processes for a first-seen state, so the caller must hold no lock the UI needs while it renders
