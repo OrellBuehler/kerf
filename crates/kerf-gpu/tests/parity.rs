@@ -7362,7 +7362,10 @@ fn exact_if_drawn_as(tl: &Timeline, assets: &[Asset], told: &[Asset], t: f64) ->
     let (w, h) = (size.0 as usize, size.1 as usize);
     let scratch = Path::new(env!("CARGO_TARGET_TMPDIR")).join("parity-ref");
     std::fs::create_dir_all(&scratch).unwrap();
-    let ref_png = scratch.join(format!("checker-anyway-{t}.png"));
+    // (A name of its own per call: the tests that draw frames anyway run side by side.)
+    static CALLS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let call = CALLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let ref_png = scratch.join(format!("checker-anyway-{}-{call}-{t}.png", std::process::id()));
     export_still(tl, assets, &opts, t, &ref_png, ImageFormat::Png, 0).expect("FFmpeg still");
     let reference = ffmpeg(&[
         "-i",
@@ -7420,8 +7423,9 @@ fn exact_if_drawn_as(tl: &Timeline, assets: &[Asset], told: &[Asset], t: f64) ->
     Ok((differing, max))
 }
 
-/// The still's refusals of a placement, drawn anyway (see `checker_a_refusals_drawn_anyway` in `motion_parity.rs`: the scratch
-/// patch and `KERF_CHECKER_ANYWAY`). Prints one line per case; judges nothing.
+/// The still's refusals of a placement that are left, drawn anyway (see `checker_a_refusals_drawn_anyway` in `motion_parity.rs`:
+/// the scratch patch and `KERF_CHECKER_ANYWAY`): a rotation, an opacity below 1, a letterboxed picture at the identity pose.
+/// Prints one line per case; judges nothing.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough); the plan-level refusals need KERF_CHECKER_ANYWAY and the scratch patch"]
 fn checker_a_stills_refusals_drawn_anyway() {
@@ -7447,39 +7451,7 @@ fn checker_a_stills_refusals_drawn_anyway() {
         }
     };
     show("plain zoom (control)", &moving(&|_| {}), &assets);
-    for (name, grade) in [
-        (
-            "grade wheels",
-            kerf_core::Grade {
-                wheels: Some(kerf_core::Wheels {
-                    midtones: kerf_core::Wheel {
-                        x: 0.3,
-                        y: -0.2,
-                        lightness: 0.1,
-                    },
-                    ..kerf_core::Wheels::default()
-                }),
-                ..kerf_core::Grade::default()
-            },
-        ),
-        (
-            "grade curves",
-            kerf_core::Grade {
-                curves: Some(kerf_core::Curves {
-                    master: vec![
-                        kerf_core::CurvePoint { x: 0.0, y: 0.03 },
-                        kerf_core::CurvePoint { x: 0.25, y: 0.15 },
-                        kerf_core::CurvePoint { x: 0.75, y: 0.85 },
-                        kerf_core::CurvePoint { x: 1.0, y: 0.98 },
-                    ],
-                    ..kerf_core::Curves::default()
-                }),
-                ..kerf_core::Grade::default()
-            },
-        ),
-    ] {
-        show(name, &moving(&|c| c.grade = grade.clone()), &assets);
-    }
+    // (A grade ahead of the placement is not a refusal any more: `checker_a_a_grade_ahead_of_a_placement_is_the_exports`.)
     show(
         "rotation 8",
         &moving(&|c| c.keyframes.iter_mut().for_each(|k| k.rotation = 8.0)),
@@ -7562,9 +7534,8 @@ fn checker_a_stills_placed_formats_drawn_anyway() {
         }
         a
     };
+    // (4:4:4 and 4:2:2 are not here: lifted, and refused only when flagged full range, which the chroma test holds.)
     for (name, asset) in [
-        ("yuv444p", &m.yuv444),
-        ("yuv422p", &m.yuv422),
         ("full-range yuvj420p", &m.fullrange),
         ("10-bit tagged full range", &m.tenbit_pc),
         ("10-bit", &m.tenbit),
@@ -7703,4 +7674,268 @@ fn checker_a_stills_of_4_4_4_and_4_2_2_under_a_placement_are_the_stills_or_refus
         }
     }
     assert!(fails.is_empty(), "drawn and not the still's: {}", fails.join("; "));
+}
+
+/// A file written for the range tests: `codec` and `flags` as ffmpeg takes them, the picture `testsrc2` at `size`, `vf` after it.
+fn range_file(dir: &Path, name: &str, size: &str, vf: &str, pix: &str, codec: &[&str], flags: &[&str]) -> Asset {
+    let p = dir.join(name);
+    let graph = format!(
+        "testsrc2=size={size}:rate=30:duration=2{vf},setparams=colorspace=unknown:color_primaries=unknown:color_trc=unknown"
+    );
+    let mut args = vec!["-f", "lavfi", "-i", graph.as_str()];
+    args.extend_from_slice(codec);
+    args.extend_from_slice(&["-pix_fmt", pix]);
+    args.extend_from_slice(flags);
+    args.push(p.to_str().unwrap());
+    ffmpeg(&args);
+    probed(&p)
+}
+
+/// An asset probed before the range flag was recorded: the same file, `color_range` None.
+fn silent_about_range(a: &Asset) -> Asset {
+    let mut a = a.clone();
+    for s in &mut a.streams {
+        s.color_range = None;
+    }
+    a
+}
+
+/// A moving zoom over bars, the picture the asset, at the instants the range tests look at.
+fn zoomed_over_bars(asset: &Asset, bars: &Asset) -> Timeline {
+    let mut z = clip(asset, 0.0, 2.0, 0.5);
+    z.keyframes = zoom_keys(1.0, 1.6, (0.1, 0.0));
+    timeline(vec![vec![clip(bars, 0.0, 2.0, 0.0)], vec![z]], None)
+}
+
+/// An asset that does not say its range (`color_range` None, probed before the flag was recorded) under a placement, where the
+/// composite's range is negotiated (9.0.2): the compositor asks the file. A file that says `pc` is refused, a file that says
+/// `tv` or nothing is drawn and is the still, to the sample; where the range is not negotiated (6.1.1) every one of them is
+/// drawn. Over 4:2:0, 4:2:2, 4:4:4, gray, 10-bit, H.264 and FFV1.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_a_stills_an_asset_silent_about_its_range_is_asked_of_its_file() {
+    let m = media();
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-a-range");
+    std::fs::create_dir_all(&dir).unwrap();
+    let negotiated = policy() != CompositeColorPolicy::FixedBt601;
+    eprintln!("composite colour policy: {:?}", policy());
+    let ffv1 = ["-c:v", "ffv1"];
+    let x264 = ["-c:v", "libx264", "-preset", "ultrafast", "-qp", "0", "-g", "10"];
+    // (name, file, the file says full range)
+    let cases: Vec<(&str, Asset, bool)> = vec![
+        (
+            "yuv420p pc",
+            range_file(&dir, "a420pc.mkv", "640x360", "", "yuv420p", &ffv1, &["-color_range", "pc"]),
+            true,
+        ),
+        (
+            "yuv420p tv",
+            range_file(&dir, "a420tv.mkv", "640x360", "", "yuv420p", &ffv1, &["-color_range", "tv"]),
+            false,
+        ),
+        (
+            "yuv420p untagged",
+            range_file(&dir, "a420.mkv", "640x360", "", "yuv420p", &ffv1, &[]),
+            false,
+        ),
+        (
+            "yuv422p pc",
+            range_file(&dir, "a422pc.mkv", "640x360", "", "yuv422p", &ffv1, &["-color_range", "pc"]),
+            true,
+        ),
+        (
+            "yuv422p tv",
+            range_file(&dir, "a422tv.mkv", "640x360", "", "yuv422p", &ffv1, &["-color_range", "tv"]),
+            false,
+        ),
+        (
+            "yuv444p pc",
+            range_file(&dir, "a444pc.mkv", "640x360", "", "yuv444p", &ffv1, &["-color_range", "pc"]),
+            true,
+        ),
+        (
+            "yuv444p tv",
+            range_file(&dir, "a444tv.mkv", "640x360", "", "yuv444p", &ffv1, &["-color_range", "tv"]),
+            false,
+        ),
+        (
+            "yuv444p untagged",
+            range_file(&dir, "a444.mkv", "640x360", "", "yuv444p", &ffv1, &[]),
+            false,
+        ),
+        (
+            "yuv444p pc, odd width",
+            range_file(
+                &dir,
+                "a444odd.mkv",
+                "204x360",
+                ",crop=w=203:h=360:x=0:y=0:exact=1",
+                "yuv444p",
+                &ffv1,
+                &["-color_range", "pc"],
+            ),
+            true,
+        ),
+        (
+            "gray pc",
+            range_file(&dir, "agraypc.mkv", "640x360", "", "gray", &ffv1, &["-color_range", "pc"]),
+            true,
+        ),
+        (
+            "yuv420p10le pc",
+            range_file(
+                &dir,
+                "a10pc.mkv",
+                "640x360",
+                "",
+                "yuv420p10le",
+                &ffv1,
+                &["-color_range", "pc"],
+            ),
+            true,
+        ),
+        (
+            "h264 yuv420p untagged",
+            range_file(&dir, "h264.mp4", "640x360", "", "yuv420p", &x264, &[]),
+            false,
+        ),
+        (
+            "h264 yuv420p, the stream (VUI) says full range, the container does not",
+            range_file(
+                &dir,
+                "h264vui.mp4",
+                "640x360",
+                "",
+                "yuv420p",
+                &x264,
+                &["-bsf:v", "h264_metadata=video_full_range_flag=1"],
+            ),
+            true,
+        ),
+        (
+            "h264 yuvj420p",
+            range_file(&dir, "h264j.mp4", "640x360", "", "yuvj420p", &x264, &[]),
+            true,
+        ),
+    ];
+    let mut fails = Vec::new();
+    for (name, truth_asset, says_pc) in cases {
+        let v = truth_asset.streams.iter().find(|s| s.kind == StreamKind::Video).unwrap();
+        eprintln!(
+            "checker/a/range {name}: probed pix_fmt {:?} color_range {:?}; the source's own flag: {:?}",
+            v.pix_fmt,
+            v.color_range,
+            kerf_core::source_is_full_range(Path::new(&truth_asset.path))
+        );
+        if kerf_core::source_is_full_range(Path::new(&truth_asset.path)) != Some(says_pc) {
+            fails.push(format!(
+                "{name}: the render-time probe says {:?}, not {says_pc}",
+                kerf_core::source_is_full_range(Path::new(&truth_asset.path))
+            ));
+        }
+        let tl = zoomed_over_bars(&truth_asset, &m.bars);
+        let truth = [m.bars.clone(), truth_asset.clone()];
+        let told = [m.bars.clone(), silent_about_range(&truth_asset)];
+        for t in [0.8, 1.5] {
+            match exact_if_drawn_as(&tl, &truth, &told, t) {
+                Ok((0, _)) => {
+                    eprintln!("   t={t}: drawn, exact");
+                    if negotiated && says_pc {
+                        fails.push(format!(
+                            "{name} @ {t}: a full-range file was drawn (exact, but it must be refused)"
+                        ));
+                    }
+                }
+                Ok((n, max)) => {
+                    eprintln!("   t={t}: drawn, {n} samples differ (max {max})");
+                    fails.push(format!("{name} @ {t}: drawn and {n} samples differ (max {max})"));
+                }
+                Err(e) => {
+                    eprintln!("   t={t}: refused: {}", e.chars().take(120).collect::<String>());
+                    if !negotiated || !says_pc {
+                        fails.push(format!(
+                            "{name} @ {t}: refused where it should be drawn: {}",
+                            e.chars().take(160).collect::<String>()
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    assert!(fails.is_empty(), "{}", fails.join("\n"));
+}
+
+/// The same file when the asset says what the file says: a flagged one is refused by the plan, an unflagged one is drawn. And a
+/// file whose container and stream disagree: H.264 whose VUI says limited range under a container that says full (a `colr`
+/// atom written by the muxer), and the reverse, with the asset as `probe_asset` made it.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_a_stills_a_file_whose_stream_and_container_disagree_on_the_range() {
+    let m = media();
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-a-range-split");
+    std::fs::create_dir_all(&dir).unwrap();
+    let negotiated = policy() != CompositeColorPolicy::FixedBt601;
+    let x264 = ["-c:v", "libx264", "-preset", "ultrafast", "-qp", "0", "-g", "10"];
+    // Both say limited / both say full (the encoder writes the VUI and the muxer the container's tag), then the stream's VUI is
+    // rewritten on a stream copy (`h264_metadata`) so that the two disagree, either way round.
+    let tv = range_file(&dir, "tv.mp4", "640x360", "", "yuv420p", &x264, &["-color_range", "tv"]);
+    let pc = range_file(&dir, "pc.mp4", "640x360", "", "yuv420p", &x264, &["-color_range", "pc"]);
+    let remux = |src: &Asset, name: &str, flags: &[&str]| -> Asset {
+        let out = dir.join(name);
+        let mut args = vec!["-i", src.path.as_str(), "-c", "copy"];
+        args.extend_from_slice(flags);
+        args.push(out.to_str().unwrap());
+        ffmpeg(&args);
+        probed(&out)
+    };
+    let cases = [
+        ("both limited", tv.clone()),
+        ("both full", pc.clone()),
+        (
+            "container full, VUI limited",
+            remux(&pc, "pc-vui-tv.mp4", &["-bsf:v", "h264_metadata=video_full_range_flag=0"]),
+        ),
+        (
+            "container limited, VUI full",
+            remux(&tv, "tv-vui-pc.mp4", &["-bsf:v", "h264_metadata=video_full_range_flag=1"]),
+        ),
+        (
+            "container full, VUI limited, mkv",
+            remux(&pc, "pc-vui-tv.mkv", &["-bsf:v", "h264_metadata=video_full_range_flag=0"]),
+        ),
+        (
+            "container limited, VUI full, mkv",
+            remux(&tv, "tv-vui-pc.mkv", &["-bsf:v", "h264_metadata=video_full_range_flag=1"]),
+        ),
+    ];
+    let mut fails = Vec::new();
+    for (name, asset) in cases {
+        let v = asset.streams.iter().find(|s| s.kind == StreamKind::Video).unwrap();
+        eprintln!(
+            "checker/a/range {name}: probed pix_fmt {:?} color_range {:?}; the source's own flag: {:?}",
+            v.pix_fmt,
+            v.color_range,
+            kerf_core::source_is_full_range(Path::new(&asset.path))
+        );
+        let tl = zoomed_over_bars(&asset, &m.bars);
+        let truth = [m.bars.clone(), asset.clone()];
+        for (told_name, told) in [
+            ("as probed", truth.clone()),
+            ("range not recorded", [m.bars.clone(), silent_about_range(&asset)]),
+        ] {
+            for t in [0.8, 1.5] {
+                match exact_if_drawn_as(&tl, &truth, &told, t) {
+                    Ok((0, _)) => eprintln!("   {told_name} t={t}: drawn, exact"),
+                    Ok((n, max)) => {
+                        eprintln!("   {told_name} t={t}: drawn, {n} samples differ (max {max})");
+                        if negotiated {
+                            fails.push(format!("{name}, {told_name} @ {t}: drawn and {n} samples differ (max {max})"));
+                        }
+                    }
+                    Err(e) => eprintln!("   {told_name} t={t}: refused: {}", e.chars().take(110).collect::<String>()),
+                }
+            }
+        }
+    }
+    assert!(fails.is_empty(), "{}", fails.join("\n"));
 }

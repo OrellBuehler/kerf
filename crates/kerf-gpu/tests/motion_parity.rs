@@ -6160,7 +6160,7 @@ fn checker_a_two_moving_clips_through_every_transition_are_placed_as_the_export_
     checker_all("transitions between moving clips", fails);
 }
 
-/// Every refusal of the placement, drawn anyway: the frame the plan refuses is planned and drawn all the same and compared
+/// The refusals of the placement that are left, drawn anyway: the frame the plan refuses is planned and drawn all the same and compared
 /// with the export. A refusal is *necessary* when the drawn frame is not the export's; one that would have been exact is a
 /// refusal wider than it has to be. The refusals that live in the plan's judgement of the cut need the compositor to be
 /// built without them (a scratch patch, `KERF_CHECKER_ANYWAY`: the plan's `reasons` of those kinds are dropped and the
@@ -6172,7 +6172,6 @@ fn checker_a_refusals_drawn_anyway() {
     let m = media();
     let sh = shapes();
     let v = variants();
-    let g = grades();
     let assets = [m.bars.clone(), m.testsrc.clone()];
     let patched = std::env::var_os("KERF_CHECKER_ANYWAY").is_some();
     let mut report = Vec::new();
@@ -6218,21 +6217,8 @@ fn checker_a_refusals_drawn_anyway() {
             checker_motion(&format!("checker/a/anyway {name}"), &tl, assets, 30.0, 0..30, true),
         );
     };
-    // ZoomBehind: a grade, a rotation, an opacity below 1, a dip to white ahead of the placement.
-    for (n, (gname, grade)) in g.iter().enumerate() {
-        run(
-            &format!("grade `{gname}` + zoom"),
-            moving(&|c| c.grade = grade.clone()),
-            &assets,
-        );
-        if n < 3 {
-            run(
-                &format!("grade `{gname}` + pan"),
-                panning(&|c| c.grade = grade.clone()),
-                &assets,
-            );
-        }
-    }
+    // ZoomBehind: a rotation, an opacity below 1, a dip to white ahead of the placement. (A grade is not one any more:
+    // `checker_a_a_grade_ahead_of_a_placement_is_the_exports`.)
     // (The keys carry the rotation and the opacity: a keyed clip's transform is its keys'.)
     run(
         "rotation 8 + zoom",
@@ -6299,11 +6285,9 @@ fn checker_a_refusals_drawn_anyway() {
         }
         a
     };
-    for (name, asset) in [
-        ("yuv444p", &v.yuv444),
-        ("yuv422p", &v.yuv422),
-        ("full-range yuvj420p", &v.mjpeg),
-    ] {
+    // (4:4:4 and 4:2:2 are not refusals any more, bar the full-range ones: `checker_a_4_4_4_and_4_2_2_under_a_placement_*`.)
+    {
+        let (name, asset) = ("full-range yuvj420p", &v.mjpeg);
         let tl = timeline(
             vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![zooming(asset, 1.0, 1.6, (0.0, 0.0))]],
             None,
@@ -6907,19 +6891,38 @@ fn checker_a_4_4_4_and_4_2_2_under_a_placement_are_the_exports_or_refused() {
 
 /// An export in parts (the decode budget forced to a tenth of a megapixel, so the span is cut and each part opens the clips on
 /// screen for it): the frames of the export are the plan's. (A ranged export is not here: the planner takes its range applied
-/// by the caller, so the harness would be comparing different frames.)
+/// by the caller, so the harness would be comparing different frames.) The budget is an environment variable, so the case runs
+/// itself again as a child process with it set, and the other cases of the suite keep their single run.
 #[test]
-#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough); sets KERF_EXPORT_PARTS: run it alone"]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn checker_a_a_placed_clip_in_an_export_in_parts() {
+    let parts_dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-a-parts");
+    if std::env::var_os("KERF_EXPORT_PARTS").is_none() {
+        let _ = std::fs::remove_dir_all(&parts_dir);
+        let out = Command::new(std::env::current_exe().expect("this test binary"))
+            .args([
+                "--ignored",
+                "--exact",
+                "--nocapture",
+                "checker_a_a_placed_clip_in_an_export_in_parts",
+            ])
+            .env("KERF_EXPORT_PARTS", "0.1")
+            .env("KERF_SEGMENT_DIR", &parts_dir)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run the case again with the parts budget");
+        eprint!("{}", String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success(), "the export in parts differs from the plan");
+        assert!(
+            parts_dir.exists(),
+            "the export was not cut into parts (no segment directory was made)"
+        );
+        return;
+    }
     let m = media();
     let assets = [m.bars.clone(), m.testsrc.clone()];
     let mut fails = Vec::new();
-    let parts_dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-a-parts");
-    let _ = std::fs::remove_dir_all(&parts_dir);
-    std::env::set_var("KERF_SEGMENT_DIR", &parts_dir);
     // In parts: several placed clips back to back, so the cuts land between them and inside them.
-    // SAFETY of the env var: this test is run alone (see the ignore reason), nothing else reads it meanwhile.
-    std::env::set_var("KERF_EXPORT_PARTS", "0.1");
     for fps in [30.0f64, 24.0] {
         let mut clips = Vec::new();
         for (i, (from, to)) in [(0.0, 0.7), (0.7, 1.4), (1.4, 2.1)].into_iter().enumerate() {
@@ -6941,11 +6944,5 @@ fn checker_a_a_placed_clip_in_an_export_in_parts() {
             fails.push(format!("{name}: refused {:?}", seen.refused.first()));
         }
     }
-    std::env::remove_var("KERF_EXPORT_PARTS");
-    std::env::remove_var("KERF_SEGMENT_DIR");
-    assert!(
-        parts_dir.exists(),
-        "the export was not cut into parts (no segment directory was made)"
-    );
     checker_all("an export in parts", fails);
 }
