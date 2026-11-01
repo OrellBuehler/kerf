@@ -2061,6 +2061,23 @@ impl Compositor {
         if fades.white_round_trip {
             return Err(unsupported("a dip to white ahead of a placement".into()));
         }
+        // Where the composite's range is negotiated (9.0.2) a full-range picture is read 3 to 8 levels off behind the placement
+        // (`PlacedFormat`), and a layer whose asset was probed before the range flag was recorded (`color_range` `None`) may be
+        // one: the plan cannot know, the file can say. A probe that cannot tell is a refusal, never a guess.
+        if plan.canvas.policy != kerf_core::CompositeColorPolicy::FixedBt601 && layer.stream.color_range.is_none() {
+            match kerf_core::source_is_full_range(std::path::Path::new(&layer.path)) {
+                Some(false) => {}
+                Some(true) => return Err(unsupported(
+                    "a full-range picture its asset did not record, under a placement where the composite's range is negotiated"
+                        .into(),
+                )),
+                None => {
+                    return Err(unsupported(
+                        "a picture whose range the asset did not record and the file would not say, under a placement".into(),
+                    ))
+                }
+            }
+        }
         if geom.matte || !PlacementFrame::exact_for(geom.picture) {
             return Err(unsupported(format!(
                 "a {}x{} picture under a placement, which is not the one FFmpeg's pad leaves",

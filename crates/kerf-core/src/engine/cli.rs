@@ -1627,6 +1627,9 @@ pub(crate) struct SourceTraits {
     /// are not (their timestamps are measured or guessed and their seeks land on a later
     /// keyframe), and neither is a file whose format the probe did not name.
     pub indexed: bool,
+    /// The stream is flagged full range (`color_range=pc`): what the file says, which an asset probed before the
+    /// flag was recorded does not (`PlanStream::color_range`, `None`).
+    pub full_range: bool,
     /// The stream's codec and chroma format, for the one thing a decode that is handed a bare
     /// path has to ask of them: whether to request a hardware decoder (`decode_policy`).
     pub codec: Codec,
@@ -1668,6 +1671,13 @@ pub(crate) fn source_traits(path: &Path) -> Option<SourceTraits> {
         .get(path, || probe_source_traits(&ffprobe_bin(), path, SOURCE_PROBE_TIMEOUT))
 }
 
+/// Whether the first video stream of the file at `path` is flagged full range, **as the file says** (one cached `ffprobe`,
+/// [`source_traits`]): what a plan that was made from an asset probed before the flag was recorded cannot know. `None`
+/// when the probe could not tell (it failed, or outlasted its timeout). It spawns a process: not under a lock.
+pub fn source_is_full_range(path: &Path) -> Option<bool> {
+    source_traits(path).map(|t| t.full_range)
+}
+
 /// One `ffprobe` of `path`, killed after `timeout`.
 fn probe_source_traits(ffprobe: &str, path: &Path, timeout: std::time::Duration) -> Option<SourceTraits> {
     let mut cmd = command(ffprobe);
@@ -1677,7 +1687,7 @@ fn probe_source_traits(ffprobe: &str, path: &Path, timeout: std::time::Duration)
         "-select_streams",
         "v:0",
         "-show_entries",
-        "stream=color_transfer,start_time,codec_name,pix_fmt:format=start_time,format_name",
+        "stream=color_transfer,color_range,start_time,codec_name,pix_fmt:format=start_time,format_name",
     ])
     // JSON rather than `csv`/`default`: the stream and the format both have a
     // `start_time`, and a file with side data (a phone's display matrix) makes
@@ -1737,6 +1747,7 @@ fn parse_source_traits(json: &str) -> SourceTraits {
         hdr,
         lead,
         indexed,
+        full_range: text("color_range") == "pc",
         codec: Codec::from_name(text("codec_name")),
         chroma: Chroma::from_pix_fmt(text("pix_fmt")),
         bits: pix_fmt_bits_420(text("pix_fmt")),
@@ -12040,6 +12051,12 @@ mod tests {
         let plain = parse_source_traits(r#"{"streams":[{"color_transfer":"bt709"}],"format":{"start_time":"0.000000"}}"#);
         assert_eq!(plain, SourceTraits::default());
         assert_eq!(parse_source_traits(r#"{"streams":[],"format":{}}"#), SourceTraits::default());
+        // The file's own range flag, which an asset probed before it was recorded does not hold.
+        assert!(parse_source_traits(r#"{"streams":[{"color_range":"pc"}],"format":{}}"#).full_range);
+        for tag in ["tv", "unknown", ""] {
+            let json = format!(r#"{{"streams":[{{"color_range":"{tag}"}}],"format":{{}}}}"#);
+            assert!(!parse_source_traits(&json).full_range, "{tag:?}");
+        }
         assert_eq!(parse_source_traits("not json"), SourceTraits::default());
         // A transport stream (a camcorder's .mts / .m2ts) is reported as having no
         // lead whatever its streams' starts say: a padded proxy cannot fix it, so it

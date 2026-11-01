@@ -1437,15 +1437,16 @@ impl RenderPlan {
                 // 8-bit planar 4:4:4 and 4:2:2, limited range: converted in the graph as the decode converts them where a
                 // compositor measured that (`GpuCaps::placed_chroma`).
                 let planar = matches!(fmt.to_ascii_lowercase().as_str(), "yuv444p" | "yuv422p");
-                if !matches!(stream.layout(), Some(PixLayout::Yuv420 | PixLayout::Gray)) {
-                    if !(caps.placed_chroma && planar) {
-                        out.push(Unsupported::PlacedFormat(at(), fmt));
-                    }
+                let other_layout = !matches!(stream.layout(), Some(PixLayout::Yuv420 | PixLayout::Gray));
+                if other_layout && !(caps.placed_chroma && planar) {
+                    out.push(Unsupported::PlacedFormat(at(), fmt));
                 } else if self.canvas.policy != CompositeColorPolicy::FixedBt601 && stream.maybe_full_range_in(self.canvas.policy)
                 {
                     // Where the composite's range is negotiated along the graph (9.0.2), the range conversion inside
                     // the chain's `format=yuva420p` is not the decode's: a full-range 8-bit or 10-bit 4:2:0 picture reads
-                    // up to 5 levels off in a still (3 to 5 on `yuvj420p`, 4 to 5 on 10-bit flagged `pc`); exact on 4.4.2.
+                    // up to 5 levels off in a still (3 to 5 on `yuvj420p`, 4 to 5 on 10-bit flagged `pc`), a full-range
+                    // 4:4:4 or 4:2:2 one 5 to 8; exact on 4.4.2. The check is the layout's own and the lifted 4:4:4 /
+                    // 4:2:2 are not exempt from it.
                     out.push(Unsupported::PlacedFormat(at(), format!("full-range {fmt}")));
                 }
             }
@@ -2805,6 +2806,30 @@ mod tests {
         stream.pix_fmt = None;
         let (why, _) = judge(stream, None, &zooming, 4.0);
         assert!(why.iter().any(|u| matches!(u, Unsupported::PlacedFormat(..))), "{why:?}");
+        // The lifted 4:4:4 and 4:2:2 are not exempt from it: flagged full range they are refused where the range is negotiated.
+        for fmt in ["yuv444p", "yuv422p"] {
+            let mut stream = video(640, 360);
+            stream.pix_fmt = Some(fmt.into());
+            stream.color_range = Some("pc".into());
+            for (policy, refused) in [
+                (CompositeColorPolicy::FixedBt601, false),
+                (CompositeColorPolicy::BottomLayerTag, true),
+                (CompositeColorPolicy::Unknown, true),
+            ] {
+                let plan = fading_plan_of(stream.clone(), None, policy, |c| zooming(c), 4.0);
+                let why = plan.reasons(
+                    &GpuCaps {
+                        placed_chroma: true,
+                        ..caps
+                    },
+                    plan.size(u32::MAX),
+                );
+                let placed = why
+                    .iter()
+                    .any(|u| matches!(u, Unsupported::PlacedFormat(_, f) if f.starts_with("full-range")));
+                assert_eq!(placed, refused, "{fmt} {policy:?}: {why:?}");
+            }
+        }
         // A picture that may be full range: refused where the composite's range is negotiated, drawn where it is not.
         let mut stream = video(640, 360);
         stream.pix_fmt = Some("yuvj420p".into());
