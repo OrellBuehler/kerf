@@ -18,10 +18,11 @@ struct BlendParams {
     mode: u32,
     has_alpha: u32,
     alpha: u32,
-    ramp_in: u32,
-    ramp_out: u32,
     /// The clip's colours are held to the legal range (`lutyuv`'s `clipval`): set for a clip laid by the draw, not for pictures given whole.
     legal: u32,
+    pad: [u32; 2],
+    /// The clip's `fade alpha=1` factors in the order the chain runs them (`blend.wgsl`).
+    ramps: [u32; 8],
 }
 
 /// The pipelines of a blended layer.
@@ -237,9 +238,9 @@ impl Compositor {
             mode,
             has_alpha: u32::from(job.alpha_plane.is_some()),
             alpha: job.fades.alpha,
-            ramp_in: job.fades.ramp,
-            ramp_out: job.fades.ramp_out,
             legal: 1,
+            pad: [0; 2],
+            ramps: job.fades.ramps,
         };
         self.blend_mix(enc, canvas, scratch, &blend, job.alpha_plane, (rx0, ry0, rx1, ry1));
         Ok(())
@@ -327,9 +328,9 @@ impl Compositor {
                 mode,
                 has_alpha: 1,
                 alpha: 255,
-                ramp_in: FADE_FULL,
-                ramp_out: FADE_FULL,
                 legal: 0,
+                pad: [0; 2],
+                ramps: [FADE_FULL; 8],
             };
             let mut enc = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("kerf blend planes"),

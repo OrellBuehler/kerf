@@ -5342,10 +5342,24 @@ fn what_a_blend_is_not_exact_for_is_refused() {
             &m.portrait,
         ),
         (
-            "an RGB picture",
-            "RGB picture",
-            blended(&v.rgb_png, 0.0, 1.0, &|_| {}),
-            &v.rgb_png,
+            "a graded clip",
+            "a grade under a blend",
+            blended(&m.testsrc, 0.5, 1.0, &|c| {
+                c.grade.wheels = Some(kerf_core::Wheels {
+                    shadows: kerf_core::Wheel {
+                        x: 0.3,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                });
+            }),
+            &m.testsrc,
+        ),
+        (
+            "a rotation that is not a quarter turn",
+            "rotated layer",
+            blended(&m.testsrc, 0.5, 1.0, &|c| c.transform.rotation = 91.0),
+            &m.testsrc,
         ),
     ] {
         let (tl, assets) = over_bars(top, asset);
@@ -5356,6 +5370,21 @@ fn what_a_blend_is_not_exact_for_is_refused() {
             &at_fps(30.0),
             upto(0.5, 30.0),
             reason,
+        );
+    }
+    // An RGB picture is refused where the probe found the graph's `format=yuva420p` is not the decode's conversion (FFmpeg 4.4's is), and
+    // drawn exactly where it is (6.1, 9.0).
+    let (tl, assets) = over_bars(blended(&v.rgb_png, 0.0, 1.0, &|_| {}), &v.rgb_png);
+    if compositor().caps().blend_extras.contains(kerf_core::BlendExtras::RGB_PICTURE) {
+        blend_run("blend/an RGB picture", &tl, &assets, 30.0, 0.5, true);
+    } else {
+        refused(
+            "blend/refused an RGB picture",
+            &tl,
+            &assets,
+            &at_fps(30.0),
+            upto(0.5, 30.0),
+            "RGB picture",
         );
     }
 }
@@ -6845,4 +6874,105 @@ fn checker_e_a_dissolve_that_overlaps_the_fade_out_of_a_blended_clip() {
         }
     }
     assert!(failures.is_empty(), "{failures:?}");
+}
+
+/// A quarter turn lands on whole samples (the `rotate` filter's fixed-point sample is exact there): a blended clip turned by 90, 180 or 270
+/// degrees is drawn exactly, moved and not, over the bars and over noise.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_blended_clip_turned_a_quarter_is_laid_where_it_lies() {
+    use kerf_core::BlendMode;
+    let m = media();
+    for mode in [BlendMode::Multiply, BlendMode::Overlay, BlendMode::Difference] {
+        for turn in [90.0, 180.0, 270.0] {
+            for (name, asset, x) in [
+                ("testsrc", &m.testsrc, 0.0),
+                ("noise", &m.noise, 0.0),
+                ("testsrc moved", &m.testsrc, 0.2),
+            ] {
+                let mut c = clip(asset, 0.5, 1.5, 0.0);
+                c.blend_mode = mode;
+                c.transform.rotation = turn;
+                c.transform.pos_x = x;
+                blend_run(
+                    &format!("blend/{mode:?} {name} turned {turn}"),
+                    &timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None),
+                    &[m.bars.clone(), asset.clone()],
+                    30.0,
+                    0.4,
+                    // (A quarter turn upright puts the clip's box above the frame's top edge, the 4.4 overlay bug the probe found.)
+                    turn == 180.0,
+                );
+            }
+        }
+    }
+}
+
+/// A BT.2020 composite is drawn where the probe matched it in every mode (`BlendExtras::BT2020`), refused where it did not.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_blend_on_bt2020_footage_is_drawn_where_the_probe_matched() {
+    use kerf_core::BlendMode;
+    let bottom = ce_tagged("bars", "bt2020nc", "smptehdbars");
+    let top = ce_tagged("testsrc", "bt2020nc", "testsrc2");
+    for mode in [
+        BlendMode::Multiply,
+        BlendMode::Screen,
+        BlendMode::Overlay,
+        BlendMode::Difference,
+    ] {
+        let (tl, assets) = ce_stack(&bottom, &top, &|c| c.blend_mode = mode);
+        let case = format!("blend/{mode:?} on bt2020 footage");
+        if compositor().caps().blend_extras.contains(kerf_core::BlendExtras::BT2020) {
+            blend_run(&case, &tl, &assets, 30.0, 0.5, true);
+        } else {
+            refused(&case, &tl, &assets, &at_fps(30.0), upto(0.5, 30.0), "BT.2020");
+        }
+    }
+}
+
+/// A blended clip's fades are alpha fades run in the order the chain has them (the clip's own, a dip's halves, then a dissolve's ramp):
+/// a fade-in beside a crossfade on one edge is two steps and a dissolve that overlaps the fade-out ramps after it.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_blended_clips_fades_run_in_the_chains_order() {
+    use kerf_core::BlendMode;
+    let m = media();
+    for mode in [BlendMode::Multiply, BlendMode::Screen] {
+        let assets = [m.bars.clone(), m.testsrc.clone()];
+        // A fade-in and a crossfade into the same clip.
+        let mut inc = clip(&m.testsrc, 0.5, 1.5, 1.0);
+        inc.blend_mode = mode;
+        inc.fade_in = 0.4;
+        inc.transition_in = Some(Transition {
+            kind: TransitionKind::Crossfade,
+            duration: 0.6,
+        });
+        blend_run(
+            &format!("blend/{mode:?} fade-in and crossfade on one edge"),
+            &timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0), inc]], None),
+            &assets,
+            30.0,
+            2.0,
+            true,
+        );
+        // A dissolve into a clip whose fade-out is already running.
+        for (fade_out, dissolve) in [(0.6, 0.6), (0.9, 0.3)] {
+            let mut inc = clip(&m.testsrc, 0.5, 1.5, 0.7);
+            inc.blend_mode = mode;
+            inc.fade_out = fade_out;
+            inc.transition_in = Some(Transition {
+                kind: TransitionKind::Crossfade,
+                duration: dissolve,
+            });
+            blend_run(
+                &format!("blend/{mode:?} dissolve {dissolve}s with a fade-out of {fade_out}s"),
+                &timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0), inc]], None),
+                &assets,
+                30.0,
+                1.65,
+                true,
+            );
+        }
+    }
 }

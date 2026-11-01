@@ -16,9 +16,10 @@ struct P {
     mode: u32,
     has_alpha: u32,     // 1: the clip's alpha is a plane (a mask, a key), bound as `atex`
     alpha: u32,         // the clip's alpha (0..255) before the ramps
-    ramp_in: u32,       // `fade alpha=1`'s integer factors (65535: not running)
-    ramp_out: u32,
     legal: u32,         // 1: the clip's colours are held to the legal range (`lutyuv`'s `clipval`), as the chain does before it is laid
+    pad0: u32,
+    pad1: u32,
+    ramps: array<vec4<u32>, 2>, // the clip's `fade alpha=1` factors, in the order the chain runs them (65535: not running)
 }
 
 @group(0) @binding(0) var<uniform> p: P;
@@ -133,8 +134,8 @@ fn blend255(d: i32, s: i32, a: i32) -> i32 {
     return ((d * (255 - a) + s * a + 128) * 257) >> 16u;
 }
 
-// The clip's alpha at canvas pixel `o`: the layer's own (a uniform, or the mask's plane), then the clips's `fade alpha=1`
-// ramps, in the order the chain runs them; 0 where the clip is not (`overlay` of a transparent canvas).
+// The clip's alpha at canvas pixel `o`: the layer's own (a uniform, or the mask's plane), then the clip's `fade alpha=1`
+// steps, each its own rounding, in the order the chain runs them; 0 where the clip is not (`overlay` of a transparent canvas).
 fn alpha_at(o: vec2<i32>) -> i32 {
     let l = o - p.origin;
     if (l.x < 0 || l.y < 0 || l.x >= p.layer.x || l.y >= p.layer.y) {
@@ -144,11 +145,11 @@ fn alpha_at(o: vec2<i32>) -> i32 {
     if (p.has_alpha != 0u) {
         a = i32(round(textureLoad(atex, l, 0).r * 255.0));
     }
-    if (p.ramp_in < 65535u) {
-        a = ((a * i32(p.ramp_in)) + 32768) >> 16u;
-    }
-    if (p.ramp_out < 65535u) {
-        a = ((a * i32(p.ramp_out)) + 32768) >> 16u;
+    for (var i = 0u; i < 8u; i = i + 1u) {
+        let r = p.ramps[i / 4u][i % 4u];
+        if (r < 65535u) {
+            a = ((a * i32(r)) + 32768) >> 16u;
+        }
     }
     return a;
 }

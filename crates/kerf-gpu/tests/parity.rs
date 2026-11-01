@@ -6909,6 +6909,15 @@ fn blend_modes_are_drawn_as_the_still_draws_them() {
             &m.testsrc,
         );
         blend_check(&format!("blend/{mode:?} moved"), &tl, &assets, &[0.5], STRICT);
+        // A quarter turn lands on whole samples (`rotate` is exact there): drawn, and refused at any other angle.
+        for turn in [90.0, 180.0] {
+            let (tl, assets) = over(
+                blended(&m.testsrc, mode, &|c| c.transform.rotation = turn),
+                &m.bars,
+                &m.testsrc,
+            );
+            blend_check(&format!("blend/{mode:?} turned {turn}"), &tl, &assets, &[0.5], STRICT);
+        }
         for (name, base, top) in [
             ("bt709", &m.bars709, &m.testsrc709),
             ("smpte170m", &m.testsrc170m, &m.testsrc170m),

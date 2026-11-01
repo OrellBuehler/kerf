@@ -37,7 +37,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
-use kerf_core::{BlendKinds, BlendMode, YuvMatrix};
+use kerf_core::{BlendExtras, BlendKinds, BlendMode, YuvMatrix};
 
 /// swscale's integer tables for one matrix, limited range YCbCr to full range RGB and back.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -328,10 +328,22 @@ const MODES: [BlendMode; 9] = [
 ];
 
 /// The matrices the probe tries: what `blend_chains` names for a composite that is untagged (BT.601 by default) or tagged.
-const MATRICES: [(YuvMatrix, Option<&str>); 2] = [(YuvMatrix::Bt601, None), (YuvMatrix::Bt709, Some("bt709"))];
+const MATRICES: [(YuvMatrix, Option<&str>); 3] = [
+    (YuvMatrix::Bt601, None),
+    (YuvMatrix::Bt709, Some("bt709")),
+    (YuvMatrix::Bt2020, Some("bt2020nc")),
+];
+
+/// What the probe found out about this FFmpeg: the modes drawn as the model does in BT.601 and BT.709, and the extras (BT.2020 with every mode,
+/// RGB pictures).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Found {
+    kinds: [BlendKinds; 2],
+    extras: BlendExtras,
+}
 
 struct State {
-    measured: Option<[BlendKinds; 2]>,
+    measured: Option<Found>,
     failures: u32,
     retry_at: Option<Instant>,
 }
@@ -346,18 +358,21 @@ fn lock() -> std::sync::MutexGuard<'static, State> {
     STATE.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// The modes this FFmpeg draws as the model does, **per matrix**: `[BT.601, BT.709]` (BT.2020 stacks are refused). The first call runs the probe (a few
-/// short `ffmpeg` children, bounded), on a blocking thread, ahead of the frame that needs it ([`crate::prepare`]); the
-/// answer is kept for good. A probe that could not run (`None` in the cache) is retried after a backoff and until then
-/// draws nothing.
-pub fn kernels() -> [BlendKinds; 2] {
+/// What this FFmpeg draws as the model does, once probed: kept for good. The first call runs the probe (a few short `ffmpeg`
+/// children, bounded), on a blocking thread, ahead of the frame that needs it ([`crate::prepare`]). A probe that could not run is retried
+/// after a backoff and until then draws nothing.
+fn found() -> Found {
+    let nothing = Found {
+        kinds: [BlendKinds::NONE; 2],
+        extras: BlendExtras::NONE,
+    };
     {
         let s = lock();
         if let Some(k) = s.measured {
             return k;
         }
         if s.retry_at.is_some_and(|t| Instant::now() < t) {
-            return [BlendKinds::NONE; 2];
+            return nothing;
         }
     }
     let measured = measure();
@@ -366,15 +381,15 @@ pub fn kernels() -> [BlendKinds; 2] {
         return k;
     }
     match measured {
-        Some(kinds) => {
-            if kinds.iter().any(|k| *k != BlendKinds::ALL) {
+        Some(found) => {
+            if found.kinds.iter().any(|k| *k != BlendKinds::ALL) {
                 tracing::warn!(
-                    ?kinds,
+                    ?found,
                     "this FFmpeg's blend chain is not the one the GPU follows for some modes; they are drawn by FFmpeg"
                 );
             }
-            s.measured = Some(kinds);
-            kinds
+            s.measured = Some(found);
+            found
         }
         None => {
             s.failures += 1;
@@ -385,14 +400,30 @@ pub fn kernels() -> [BlendKinds; 2] {
                 retry_in_secs = wait.as_secs(),
                 "could not measure FFmpeg's blend chain; blended layers are not drawn on the GPU until it can"
             );
-            [BlendKinds::NONE; 2]
+            nothing
         }
     }
 }
 
+/// The modes this FFmpeg draws as the model does, **per matrix**: `[BT.601, BT.709]`. Probes on the first call ([`found`]).
+pub fn kernels() -> [BlendKinds; 2] {
+    found().kinds
+}
+
+/// What else this FFmpeg draws as the model does: a BT.2020 composite (every mode and the placement, with the tables of
+/// `Tables::new`) and RGB pictures (`format=yuva420p` is the decode's conversion). Probes on the first call.
+pub fn extras() -> BlendExtras {
+    found().extras
+}
+
 /// What is known without running anything: [`kernels`]'s answer once there is one, else nothing.
 pub fn measured() -> [BlendKinds; 2] {
-    lock().measured.unwrap_or([BlendKinds::NONE; 2])
+    lock().measured.map_or([BlendKinds::NONE; 2], |f| f.kinds)
+}
+
+/// [`extras`] without running anything.
+pub fn measured_extras() -> BlendExtras {
+    lock().measured.map_or(BlendExtras::NONE, |f| f.extras)
 }
 
 /// Pins for tests and for a host that knows its FFmpeg: every mode on every matrix.
@@ -537,7 +568,7 @@ struct Job {
     want: Planes,
 }
 
-fn measure() -> Option<[BlendKinds; 2]> {
+fn measure() -> Option<Found> {
     let dir = ProbeDir::new().ok()?;
     let (w, h) = PROBE;
     let (base, laid, alpha) = probe_pictures();
@@ -639,7 +670,7 @@ fn measure() -> Option<[BlendKinds; 2]> {
             .collect();
         runs.into_iter().map(|run| run.join().ok().flatten()).collect()
     });
-    let mut kinds = [BlendKinds::ALL; 2];
+    let mut kinds = [BlendKinds::ALL; 3];
     let mut unknown = false;
     for (job, out) in jobs.iter().zip(&outputs) {
         let Some(got) = out.as_deref().and_then(|o| Planes::from_frame(o, w, h)) else {
@@ -653,8 +684,70 @@ fn measure() -> Option<[BlendKinds; 2]> {
             };
         }
     }
+    // RGB pictures: the graph's conversion against the decode's.
+    let rgb = measure_rgb(&dir.0);
+    let mut extras = BlendExtras::NONE;
+    if kinds[2] == BlendKinds::ALL {
+        extras = extras.union(BlendExtras::BT2020);
+    }
+    match rgb {
+        // (Only on a build whose chain matched: FFmpeg 4.4's blended RGB picture is Y 3 / UV 11 off the decode's even though its conversion
+        // of noise is the decode's, a difference this probe does not see, and its chain does not match anyway.)
+        Some(true) => {
+            if kinds[0] == BlendKinds::ALL && kinds[1] == BlendKinds::ALL {
+                extras = extras.union(BlendExtras::RGB_PICTURE);
+            }
+        }
+        Some(false) => {}
+        None => unknown = true,
+    }
     // A difference is conclusive wherever the rest stands; a child that did not answer is not.
-    (!unknown || kinds.iter().any(|k| *k != BlendKinds::ALL)).then_some(kinds)
+    let conclusive = kinds.iter().any(|k| *k != BlendKinds::ALL) || rgb == Some(false);
+    (!unknown || conclusive).then_some(Found {
+        kinds: [kinds[0], kinds[1]],
+        extras,
+    })
+}
+
+/// Whether this FFmpeg's `format=yuva420p` of an RGB picture (what a blended clip's chain does) is the conversion the decode makes of it
+/// (`scale=out_range=tv`, then 4:2:0: `source::decode_args`), on noise: the same planes on FFmpeg 6.1 and 9.0, a few levels apart on 4.4.
+/// `None` when a child did not answer.
+fn measure_rgb(dir: &std::path::Path) -> Option<bool> {
+    let (w, h) = PROBE;
+    let rgb = Noise(0x0bad_cafe_dead_beef).bytes(w * h * 3);
+    let path = dir.join("rgb.raw");
+    std::fs::write(&path, rgb).ok()?;
+    let run = |filter: &str, pix_fmt: &str, len: usize| {
+        let mut args: Vec<String> = ["-hide_banner", "-loglevel", "error", "-nostdin"].map(String::from).to_vec();
+        args.extend(["-f", "rawvideo", "-pix_fmt", "rgb24", "-s", &format!("{w}x{h}"), "-i"].map(String::from));
+        args.push(path.to_string_lossy().into_owned());
+        args.extend(
+            [
+                "-vf",
+                filter,
+                "-frames:v",
+                "1",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                pix_fmt,
+                "pipe:1",
+            ]
+            .map(String::from),
+        );
+        kerf_core::limit_frame_args(&mut args, 2);
+        let mut cmd = kerf_core::ffmpeg_command();
+        cmd.args(&args);
+        crate::source::run_child(cmd, len + 1, PROBE_TIMEOUT).ok()
+    };
+    let frame = w * h * 3 / 2;
+    let (decoded, graphed) = std::thread::scope(|scope| {
+        let a = scope.spawn(|| run("scale=out_range=tv", "yuv420p", frame));
+        let b = scope.spawn(|| run("format=yuva420p", "yuva420p", w * h * 5 / 2));
+        (a.join().ok().flatten(), b.join().ok().flatten())
+    });
+    let (decoded, graphed) = (decoded?, graphed?);
+    (decoded.len() == frame && graphed.len() == w * h * 5 / 2).then(|| decoded[..] == graphed[..frame])
 }
 
 #[cfg(test)]

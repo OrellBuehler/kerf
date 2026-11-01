@@ -126,7 +126,7 @@ pub use model::{
     sfx_anchor_s, sfx_catalogue, suggest_sound_effects, SfxAnchor, SfxCategory, SfxDensity, SfxKind, SfxPreset, SfxSource,
     SfxSpec, SfxSuggestInputs, SfxSuggestRequest, SfxSuggestion, DEFAULT_SFX_INTENSITY, DEFAULT_SFX_TAIL, MAX_SFX_PITCH,
 };
-pub use plan_caps::{BlendKinds, DipWhy, EffectKinds, GpuCaps, GradeKinds, LayerRef, Unsupported};
+pub use plan_caps::{BlendExtras, BlendKinds, DipWhy, EffectKinds, GpuCaps, GradeKinds, LayerRef, Unsupported};
 pub use plan_epoch::{bump_plan_epoch, plan_epoch};
 pub use planner::{Handover, PlanRequest, Planner, SpanPlan, SpanRun};
 pub use platform::{
@@ -150,8 +150,8 @@ pub use project::{
 pub use proxy::{PreviewSource, ProxyInput, ProxyPhase, ProxySize, ProxyStatus, ProxyWait};
 pub use recovery::{Recoverable, RecoveryInfo};
 pub use render_plan::{
-    Animated, CompositeColorPolicy, FadeOp, GradeRoute, LayerFx, PlanCanvas, PlanLayer, PlanMode, PlanReframe, PlanSource,
-    PlanStream, PlanText, PlanTiming, ReframeInterp, RenderPlan, YuvMatrix, MAX_AMPLIFIED_ERROR, MAX_SHRINK,
+    is_quarter_turn, Animated, CompositeColorPolicy, FadeOp, GradeRoute, LayerFx, PlanCanvas, PlanLayer, PlanMode, PlanReframe,
+    PlanSource, PlanStream, PlanText, PlanTiming, ReframeInterp, RenderPlan, YuvMatrix, MAX_AMPLIFIED_ERROR, MAX_SHRINK,
 };
 pub use review::{Check as ReviewCheck, CutReview, ReviewInputs, ReviewIssue, SkippedCheck};
 pub use stabilize::{unsteady_clips, ClipStabilizeStatus, StabilizeStatus, Unsteady};

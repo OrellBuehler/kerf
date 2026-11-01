@@ -1760,6 +1760,7 @@ mod tests {
             effects: EffectKinds::ALL,
             grade: crate::plan_caps::GradeKinds::NONE,
             blend: crate::plan_caps::BlendKinds::NONE,
+            blend_extras: crate::plan_caps::BlendExtras::NONE,
         };
         let holding = |edit: &dyn Fn(&mut Clip)| {
             let mut clip = make_clip(a.id, 0.0, 4.0, 0.0);
@@ -1979,6 +1980,7 @@ mod tests {
             effects: EffectKinds::ALL,
             grade: crate::plan_caps::GradeKinds::NONE,
             blend: crate::plan_caps::BlendKinds::NONE,
+            blend_extras: crate::plan_caps::BlendExtras::NONE,
         };
         // (The overlay names the shipped default font, which a text pass can draw.)
         assert_eq!(plan.reasons(&all, size), vec![]);
@@ -2598,6 +2600,7 @@ mod tests {
             effects: EffectKinds::ALL,
             grade: crate::plan_caps::GradeKinds::NONE,
             blend: crate::plan_caps::BlendKinds::NONE,
+            blend_extras: crate::plan_caps::BlendExtras::NONE,
         };
         let keyed_clip = |a: &Asset| {
             let mut clip = make_clip(a.id, 0.0, 4.0, 1.0);
@@ -3330,7 +3333,25 @@ mod tests {
         assert!(has(&why_for(&|c| c.transform.scale = 0.6, one, size), "scaler resizes"));
         assert!(has(&why_for(&|c| c.transform.rotation = 10.0, one, size), "rotated layer"));
         assert!(has(&why_for(&|c| c.transform.opacity = 0.5, one, size), "below full opacity"));
-        assert!(has(&why_for(&|_| {}, one, (1919, 1080)), "odd side"));
+        // A quarter turn lands on whole samples and is drawn; any other angle is a fixed-point edge.
+        for turn in [90.0, 180.0, 270.0, -90.0] {
+            assert!(why_for(&|c| c.transform.rotation = turn, one, size).is_empty(), "{turn}");
+        }
+        assert!(has(&why_for(&|c| c.transform.rotation = 91.0, one, size), "rotated layer"));
+        // A grade runs its RGB round trip on `yuva420p` under a blend, which the grade's model is not.
+        let graded = |c: &mut Clip| {
+            c.grade = crate::model::Grade {
+                wheels: Some(crate::model::Wheels {
+                    shadows: crate::model::Wheel {
+                        x: 0.3,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }
+        };
+        assert!(has(&why_for(&graded, one, size), "a grade under a blend"));
         // A mode that is not in the caps (the probe did not match this FFmpeg) is refused by the plan alone.
         let mut top = make_clip(a.id, 0.0, 4.0, 0.0);
         top.blend_mode = BlendMode::Screen;
@@ -3366,7 +3387,7 @@ mod tests {
     }
 
     #[test]
-    fn the_matrix_a_blend_is_drawn_in_is_the_graphs_and_only_601_and_709_have_tables() {
+    fn the_matrix_a_blend_is_drawn_in_is_the_graphs_and_fcc_and_240m_have_no_tables() {
         use crate::render_plan::YuvMatrix;
         let a = asset();
         let tl = single(vec![make_clip(a.id, 0.0, 4.0, 0.0)]);
@@ -3378,7 +3399,7 @@ mod tests {
             (Some("smpte170m"), Some(YuvMatrix::Bt601)),
             (Some("bt470bg"), Some(YuvMatrix::Bt601)),
             (Some("bt709"), Some(YuvMatrix::Bt709)),
-            (Some("bt2020nc"), None),
+            (Some("bt2020nc"), Some(YuvMatrix::Bt2020)),
             (Some("smpte240m"), None),
             (Some("fcc"), None),
         ] {

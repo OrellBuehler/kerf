@@ -360,7 +360,8 @@
   a conversion each way and two placements (`engine-cli.md`, "Blend modes"). The compositor draws the modes in `GpuCaps::blend` (`BlendKinds`; `kerf-gpu`'s probe says which this FFmpeg matches, `gpu.md`, "Blend modes"),
   and every cause that keeps a layer from being drawn is its own reason with the cause as the string, so the ledger ranks them: the mode not in the caps (`size_free_reasons`), a composite matrix with no tables
   (`RenderPlan::blend_matrix`, from `PlanCanvas::blend_tag`: the tag the graph's blend chains name, the bottom layer's over the whole cut for an export, over the layers on screen for a still, decided in the planner
-  and checked against the graph's text), an RGB picture, and from `reasons(size)` a layer the scaler resizes, a rotated one, a letterboxed one (`geom.matte`), one below full opacity (`geom.translucent`) and an odd frame size.
+  and checked against the graph's text; BT.2020 needs `caps.blend_extras` `BT2020`), an RGB picture (unless `RGB_PICTURE`), a graded clip (its RGB round trip is on `yuva420p` under a blend), and from `reasons(size)` a layer the scaler resizes,
+  a rotated one that is not a quarter turn (`is_quarter_turn`) or has a keyed rotation, a letterboxed one (`geom.matte`) and one below full opacity (`geom.translucent`).
   `normal` refuses nothing (`a_blend_is_drawn_where_the_chain_is_exact_and_each_cause_that_it_is_not_is_listed`, `the_matrix_a_blend_names_is_the_plans_blend_tag`).
   **A speed ramp is refused** (`PlanTiming.ramped`, `Unsupported::SpeedRamp(layer)`, kind `speed_ramp`, from `size_free_reasons` in a
   Still and a Motion plan alike, for every cap): the export retimes a ramped clip's frames with a `setpts` expression and lets `fps`

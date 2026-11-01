@@ -22,8 +22,8 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, OnceLock};
 
-use kerf_core::{BlendKinds, BlendMode, YuvMatrix};
-use kerf_gpu::blend::{channel, kernels, reference, Planes, Tables};
+use kerf_core::{BlendExtras, BlendKinds, BlendMode, YuvMatrix};
+use kerf_gpu::blend::{channel, extras as extras_found, kernels, reference, Planes, Tables};
 use kerf_gpu::{Compositor, Gpu, GpuOptions};
 
 const MODES: [BlendMode; 9] = [
@@ -107,7 +107,7 @@ fn the_conversion_into_rgb_is_swscales_for_every_value() {
         } else {
             [&y[..], &u[..], &v[..]].concat()
         };
-        for matrix in [YuvMatrix::Bt601, YuvMatrix::Bt709] {
+        for matrix in [YuvMatrix::Bt601, YuvMatrix::Bt709, YuvMatrix::Bt2020] {
             let vf = format!(
                 "scale=flags=neighbor:in_color_matrix={}:in_range=tv,format=gbrap",
                 tag(matrix)
@@ -181,7 +181,7 @@ fn the_conversion_out_of_rgb_is_swscales_for_every_value() {
         noisy.1[i] = (n >> 8) as u8;
         noisy.2[i] = (n >> 16) as u8;
     }
-    for matrix in [YuvMatrix::Bt601, YuvMatrix::Bt709] {
+    for matrix in [YuvMatrix::Bt601, YuvMatrix::Bt709, YuvMatrix::Bt2020] {
         let tables = Tables::new(matrix);
         let vf = format!(
             "scale=flags=neighbor:out_color_matrix={}:out_range=tv,format=yuv420p",
@@ -313,15 +313,24 @@ fn the_whole_chain_is_the_model_on_noise_in_every_mode_and_matrix() {
     // `blend::kernels` runs the export's own text on noise and compares it with `reference`: every mode, both matrices, and the
     // clip placed by the export's `overlay`. FFmpeg 4.4's `overlay` slices a clip above the frame's top edge wrongly on several
     // threads (its alpha plane loses rows), so there the answer is that nothing matches, which is the refusal that build needs.
-    let want = if ffmpeg_major().is_some_and(|major| major < 5) {
-        [BlendKinds::NONE; 2]
+    let old = ffmpeg_major().is_some_and(|major| major < 5);
+    let (want, extras) = if old {
+        ([BlendKinds::NONE; 2], BlendExtras::NONE)
     } else {
-        [BlendKinds::ALL; 2]
+        ([BlendKinds::ALL; 2], BlendExtras::ALL)
     };
     assert_eq!(
         kernels(),
         want,
         "the modes whose chain came back as the model computes it, [BT.601, BT.709] (ffmpeg {})",
+        kerf_core::ffmpeg_path()
+    );
+    // ...and what else: BT.2020 with every mode and the placement, and RGB pictures (`format=yuva420p` is the decode's conversion; FFmpeg
+    // 4.4's is not, and its placement is the bug above).
+    assert_eq!(
+        extras_found(),
+        extras,
+        "BT.2020 and RGB pictures (ffmpeg {})",
         kerf_core::ffmpeg_path()
     );
 }
@@ -359,7 +368,7 @@ fn the_compositors_passes_are_the_model_on_noise() {
                 _ => rng.next() as u8,
             })
             .collect();
-        for matrix in [YuvMatrix::Bt601, YuvMatrix::Bt709] {
+        for matrix in [YuvMatrix::Bt601, YuvMatrix::Bt709, YuvMatrix::Bt2020] {
             for mode in MODES {
                 let want = reference(mode, matrix, &base, &laid, &alpha);
                 let got = compositor

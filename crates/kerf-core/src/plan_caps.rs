@@ -94,6 +94,28 @@ impl BlendKinds {
     }
 }
 
+/// What a compositor draws of a blend beyond the modes ([`BlendKinds`]), each a fact about the FFmpeg it ran against that a probe
+/// measured: pictures that are RGB (the graph's `format=yuva420p` is the decode's conversion on this build) and a BT.2020 composite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BlendExtras(u8);
+
+impl BlendExtras {
+    pub const NONE: Self = Self(0);
+    /// An RGB picture under a blend: the graph converts it to `yuva420p`, the compositor has the decode's 4:2:0.
+    pub const RGB_PICTURE: Self = Self(1);
+    /// A composite whose conversions name BT.2020.
+    pub const BT2020: Self = Self(1 << 1);
+    pub const ALL: Self = Self(0b11);
+
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+
 /// A set of the parts of a clip's [`Grade`](crate::model::Grade): what a compositor draws one by one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct GradeKinds(u8);
@@ -198,6 +220,8 @@ pub struct GpuCaps {
     /// the caps (`BlendMode` with its cause): a layer the compositor scales or turns, a letterbox, an opacity
     /// below 1 (the RGB round trip), a composite matrix other than BT.601 or BT.709, an odd render size.
     pub blend: BlendKinds,
+    /// What a blend is drawn for beyond its modes: RGB pictures and a BT.2020 composite (`BlendExtras`).
+    pub blend_extras: BlendExtras,
 }
 
 impl GpuCaps {
@@ -219,6 +243,7 @@ impl GpuCaps {
         effects: EffectKinds::NONE,
         grade: GradeKinds::NONE,
         blend: BlendKinds::NONE,
+        blend_extras: BlendExtras::NONE,
     };
 }
 

@@ -35,7 +35,7 @@ use crate::model::{
     pix_fmt_is_high_bit, pix_fmt_layout, pix_fmt_subsampling, Asset, BlendMode, Clip, Color, FitOrder, Grade, Hdr, Mask,
     PixLayout, Projection, ResolvedReframe, StreamInfo, StreamKind, Subsampling, Timeline, Transform, VideoEffect,
 };
-use crate::plan_caps::{BlendKinds, DipWhy, EffectKinds, GpuCaps, GradeKinds, LayerRef, Unsupported};
+use crate::plan_caps::{BlendExtras, BlendKinds, DipWhy, EffectKinds, GpuCaps, GradeKinds, LayerRef, Unsupported};
 use crate::planner::{PlanRequest, Planner};
 use crate::ExportOptions;
 
@@ -858,6 +858,12 @@ fn effect_refusal(effect: &VideoEffect, caps: &GpuCaps) -> Option<&'static str> 
     }
 }
 
+/// Whether a clockwise `angle` in radians is a quarter turn, half a turn or three quarters (or none): the `rotate` filter lands on whole samples.
+pub fn is_quarter_turn(angle: f64) -> bool {
+    let quarters = angle / std::f64::consts::FRAC_PI_2;
+    (quarters - quarters.round()).abs() < 1e-9
+}
+
 /// The worst-case error, in levels, the plan allows a one-level difference from FFmpeg's upstream (the
 /// compositor's scaler, a blur's summation order) to grow to through what is drawn after it: the steepest step
 /// of a grade's tables (`eq::table_steps`) and the sharpens (which start it at one, or at the grade's step).
@@ -1079,7 +1085,12 @@ impl RenderPlan {
                 if geom.stages.iter().any(|s| s.scaled != (s.src.w, s.src.h)) {
                     reasons.push(why("on a layer the compositor's scaler resizes (its level is not swscale's)"));
                 }
-                if geom.rotation.is_some() {
+                // A turn of exactly a quarter lands on whole samples (the `rotate` filter's fixed-point sample is exact there); any
+                // other angle has an edge that is a fixed-point sample against the compositor's float one, and a keyed rotation
+                // is another box.
+                if geom.rotation.is_some_and(|r| !is_quarter_turn(r.angle))
+                    || (self.mode == PlanMode::Motion && layer.animated.is_some_and(|a| a.rotates))
+                {
                     reasons.push(why("on a rotated layer (the edge is a fixed-point sample)"));
                 }
                 if geom.matte {
@@ -1089,9 +1100,6 @@ impl RenderPlan {
                     reasons.push(why(
                         "on a layer below full opacity (the RGB round trip's chroma is a level off)",
                     ));
-                }
-                if size.0 % 2 == 1 || size.1 % 2 == 1 {
-                    reasons.push(why("on a frame with an odd side (the conversions work on 2x2 chroma blocks)"));
                 }
             }
             // FFmpeg scales a picture in the format it has; the compositor scales the
@@ -1252,20 +1260,39 @@ impl RenderPlan {
                         "no compositor pass draws this mode on this FFmpeg",
                     ));
                 }
-                if self.blend_matrix().is_none() {
-                    out.push(Unsupported::BlendMode(
+                match self.blend_matrix() {
+                    None => out.push(Unsupported::BlendMode(
                         at(),
                         layer.blend,
-                        "the composite's matrix is not BT.601 or BT.709, the two the conversions are reproduced for",
-                    ));
+                        "the composite's matrix is not BT.601, BT.709 or BT.2020, the ones the conversions are reproduced for",
+                    )),
+                    Some(YuvMatrix::Bt2020) if !caps.blend_extras.contains(BlendExtras::BT2020) => {
+                        out.push(Unsupported::BlendMode(
+                            at(),
+                            layer.blend,
+                            "a BT.2020 composite (not measured to be the model's on this FFmpeg)",
+                        ));
+                    }
+                    Some(_) => {}
                 }
                 // An RGB picture reaches the graph as RGB and is converted by `format=yuva420p`, where the compositor has the decode's
-                // 4:2:0: a few levels apart (measured Y 3, UV 11), and a blend carries them through.
-                if layer.stream.layout() == Some(PixLayout::Rgb) {
+                // 4:2:0: the same picture on the builds where the probe says so (FFmpeg 4.4's is Y 3 / UV 11 off, and its chain does not match), and a blend carries a
+                // difference through.
+                if layer.stream.layout() == Some(PixLayout::Rgb) && !caps.blend_extras.contains(BlendExtras::RGB_PICTURE) {
                     out.push(Unsupported::BlendMode(
                         at(),
                         layer.blend,
-                        "an RGB picture (the graph converts it, the decode's 4:2:0 is a few levels off)",
+                        "an RGB picture (the graph converts it, and this FFmpeg's conversion is not the decode's 4:2:0)",
+                    ));
+                }
+                // A blended clip's chain puts `format=yuva420p` (and the transparent bars' `pad`) ahead of the grade, so FFmpeg's RGB
+                // filters run `yuva420p -> argb -> yuva420p` where the grade's model is the `yuv420p -> rgb24` path: another conversion
+                // each way (Y 11 / UV 9 off, every case).
+                if !layer.grade.is_identity() {
+                    out.push(Unsupported::BlendMode(
+                        at(),
+                        layer.blend,
+                        "a grade under a blend (its RGB round trip runs on yuva420p there, another conversion than the grade's model)",
                     ));
                 }
             }
@@ -1766,11 +1793,12 @@ impl RenderPlan {
 
     /// The matrix a blended clip's conversions into RGB and back are made in ([`PlanCanvas::blend_tag`]): BT.601 for an untagged
     /// bottom layer and the `smpte170m` / `bt470bg` tags, BT.709 for the tag or the graph's label; `None` for any other
-    /// (BT.2020, `fcc`, `smpte240m`), which the blend has no measured tables for.
+    /// (`fcc`, `smpte240m`), which the blend has no tables for; BT.2020 has them, in the caps where this FFmpeg was measured to match (`BlendExtras`).
     pub fn blend_matrix(&self) -> Option<YuvMatrix> {
         match self.canvas.blend_tag {
             None | Some("smpte170m" | "bt470bg") => Some(YuvMatrix::Bt601),
             Some("bt709") => Some(YuvMatrix::Bt709),
+            Some("bt2020nc") => Some(YuvMatrix::Bt2020),
             Some(_) => None,
         }
     }

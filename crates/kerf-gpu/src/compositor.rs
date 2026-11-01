@@ -44,8 +44,8 @@ use std::time::{Duration, Instant};
 
 use bytemuck::{Pod, Zeroable};
 use kerf_core::{
-    BlendKinds, EffectKinds, FadeEdge, FadeTint, GeqEdge, GpuCaps, GradeKinds, Mask, MaskShape, RenderPlan, VideoEffect,
-    YuvMatrix, FADE_FULL,
+    BlendExtras, BlendKinds, EffectKinds, FadeEdge, FadeTint, GeqEdge, GpuCaps, GradeKinds, Mask, MaskShape, RenderPlan,
+    VideoEffect, YuvMatrix, FADE_FULL,
 };
 use wgpu::util::DeviceExt;
 
@@ -279,6 +279,9 @@ struct Plane {
 
 /// How long a frame may take to come back from the GPU before the render gives up.
 const READBACK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How many alpha fades a blended clip's chain can run: its fade-in and fade-out, a dip's halves and a dissolve's ramp are five.
+const BLEND_RAMPS: usize = 8;
 
 const PLANE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 const MID_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
@@ -630,8 +633,9 @@ struct LayerFades {
     black: u32,
     alpha: u32,
     ramp: u32,
-    /// The ramp of a blended clip's fade-out (its fades are alpha fades, in and out).
-    ramp_out: u32,
+    /// A blended clip's fades, which are all alpha fades (in, out, dips and a dissolve's ramp alike): the integer factors in the order the
+    /// chain runs them, [`FADE_FULL`] for the unused (`blend.wgsl`).
+    ramps: [u32; BLEND_RAMPS],
     white_in: u32,
     white_out: u32,
     white_round_trip: bool,
@@ -649,21 +653,41 @@ impl LayerFades {
                 .keyed_alpha
                 .map_or_else(|| (geom.opacity * 255.0).round().clamp(0.0, 255.0) as u32, u32::from),
             ramp: FADE_FULL,
-            ramp_out: FADE_FULL,
+            ramps: [FADE_FULL; BLEND_RAMPS],
             white_in: FADE_FULL,
             white_out: FADE_FULL,
             white_round_trip: false,
         };
         let motion = plan.mode == kerf_core::PlanMode::Motion;
-        let mut seen = [false; 6];
+        let blended = !layer.blend.is_normal();
+        let mut ramps = 0;
+        let mut seen = [false; 5];
         for op in plan.fade_ops(layer) {
+            // A blended clip fades its alpha, whatever the fade: each step is a `fade alpha=1` of its own, run in the order the chain has
+            // them (the clip's fade-in and fade-out, a dip's halves, then a dissolve's ramp), each rounding on its own.
+            if blended {
+                if op.tint != FadeTint::Alpha || ramps == BLEND_RAMPS {
+                    return Err(GpuError::Unsupported(format!(
+                        "layer {}: a {:?} fade on a blended clip, or more fades than its alpha runs",
+                        layer.name, op.tint
+                    )));
+                }
+                fades.ramps[ramps] = op.factor;
+                ramps += 1;
+                continue;
+            }
             let (slot, which) = match (op.tint, op.edge) {
                 (FadeTint::Black, FadeEdge::In) => (&mut fades.fade_in, 0),
                 (FadeTint::Black, FadeEdge::Out) => (&mut fades.fade_out, 1),
                 (FadeTint::Alpha, FadeEdge::In) => (&mut fades.ramp, 2),
-                (FadeTint::Alpha, FadeEdge::Out) => (&mut fades.ramp_out, 5),
                 (FadeTint::White, FadeEdge::In) => (&mut fades.white_in, 3),
                 (FadeTint::White, FadeEdge::Out) => (&mut fades.white_out, 4),
+                (FadeTint::Alpha, FadeEdge::Out) => {
+                    return Err(GpuError::Unsupported(format!(
+                        "layer {}: an alpha fade-out, which only a blended clip has",
+                        layer.name
+                    )))
+                }
             };
             if std::mem::replace(&mut seen[which], true) {
                 return Err(GpuError::Unsupported(format!(
@@ -682,7 +706,7 @@ impl LayerFades {
             // alpha there, and the conversion to `yuva420p` that follows scales it by 256/255: the ramp
             // comes ahead of that scale, not after it. (A black or white fade there would fade the
             // colours too, which the plan refuses.)
-            if fades.fade_in < FADE_FULL || fades.fade_out < FADE_FULL || fades.ramp_out < FADE_FULL || fades.white_round_trip {
+            if fades.fade_in < FADE_FULL || fades.fade_out < FADE_FULL || fades.white_round_trip {
                 return Err(GpuError::Unsupported(format!(
                     "layer {}: a fade to black or white on a layer below full opacity",
                     layer.name
@@ -714,7 +738,7 @@ impl LayerFades {
 
     /// The layer's alpha is below 255 somewhere: the hardware's blend is not FFmpeg's, the integer one is.
     fn blends(&self) -> bool {
-        self.alpha < 255 || self.ramp < FADE_FULL || self.ramp_out < FADE_FULL
+        self.alpha < 255 || self.ramp < FADE_FULL || self.ramps.iter().any(|r| *r < FADE_FULL)
     }
 }
 
@@ -814,20 +838,35 @@ impl Compositor {
             self.grade_kernels.unwrap_or_else(crate::grade::measured),
             crate::text::measured_model(),
             self.blend_kinds.unwrap_or_else(crate::blend::measured),
+            if self.blend_kinds.is_some() {
+                BlendExtras::ALL
+            } else {
+                crate::blend::measured_extras()
+            },
         )
     }
 
     /// [`Compositor::caps`] for a machine whose FFmpeg's conversions are `kernels`, without a device: the way a host that
     /// has none to ask (the render bar) says what the GPU draws.
     pub fn caps_for(kernels: crate::grade::Kernels) -> GpuCaps {
-        Self::caps_with(kernels, crate::text::measured_model(), crate::blend::measured())
+        Self::caps_with(
+            kernels,
+            crate::text::measured_model(),
+            crate::blend::measured(),
+            crate::blend::measured_extras(),
+        )
     }
 
     /// [`Compositor::caps_for`] for a machine whose `drawtext` lays text out as `text` and converts its
     /// colours in a way the compositor knows (`None`: in no way it does, or not probed yet): without that no
     /// text is drawn, it stays FFmpeg's. `blend` are the blend modes this FFmpeg draws as the model does (per matrix,
     /// `[BT.601, BT.709]`): only the modes both matrices agree on are in the caps, which are not about one matrix.
-    pub fn caps_with(kernels: crate::grade::Kernels, text: Option<crate::text::Model>, blend: [BlendKinds; 2]) -> GpuCaps {
+    pub fn caps_with(
+        kernels: crate::grade::Kernels,
+        text: Option<crate::text::Model>,
+        blend: [BlendKinds; 2],
+        extras: BlendExtras,
+    ) -> GpuCaps {
         let mut caps = Self::CAPS;
         if kernels != crate::grade::Kernels::Match {
             caps.grade = GradeKinds::NONE;
@@ -836,6 +875,7 @@ impl Compositor {
             caps.text = false;
         }
         caps.blend = blend[0].intersection(blend[1]);
+        caps.blend_extras = extras;
         caps
     }
 
@@ -854,6 +894,7 @@ impl Compositor {
         caps.mask = true;
         caps.grade = GradeKinds::ALL;
         caps.blend = BlendKinds::ALL;
+        caps.blend_extras = BlendExtras::ALL;
         caps.effects = EffectKinds::BLUR
             .union(EffectKinds::SHARPEN)
             .union(EffectKinds::GRAYSCALE)
@@ -881,7 +922,7 @@ impl Compositor {
         self
     }
 
-    /// Pin which blend modes this FFmpeg draws as the model does (per matrix, `[BT.601, BT.709]`), instead of measuring the ffmpeg this
+    /// Pin which blend modes this FFmpeg draws as the model does (per matrix, `[BT.601, BT.709]`; the extras, BT.2020 and RGB pictures, are all pinned on), instead of measuring the ffmpeg this
     /// process runs ([`crate::blend::kernels`], on the first blended plan unless [`prepare`] ran ahead of it): for a host that knows
     /// its ffmpeg, and for tests.
     #[must_use]
@@ -2662,15 +2703,15 @@ impl Compositor {
                 let matrix = plan.blend_matrix().ok_or_else(|| {
                     GpuError::Unsupported(format!("layer {}: a blend in a composite matrix with no tables", layer.name))
                 })?;
+                // (The plan says the same: a quarter turn is drawn, any other angle is a fixed-point edge. An odd frame is refused by
+                // `composite_texts` for every plan.)
                 if geom.matte
-                    || rotate != 0
+                    || geom.rotation.is_some_and(|r| !kerf_core::is_quarter_turn(r.angle))
                     || geom.translucent
                     || geom.stages.iter().any(|s| s.scaled != (s.src.w, s.src.h))
-                    || ow % 2 == 1
-                    || oh % 2 == 1
                 {
                     return Err(GpuError::Unsupported(format!(
-                        "layer {}: a blend mode on a letterboxed, rotated, translucent or resized layer, or an odd frame",
+                        "layer {}: a blend mode on a letterboxed, rotated, translucent or resized layer",
                         layer.name
                     )));
                 }
@@ -3369,10 +3410,13 @@ mod tests {
         use crate::grade::Kernels;
         use crate::text::Model;
         let layout = Some(Model::Shaped);
-        assert_eq!(Compositor::caps_with(Kernels::Match, layout, all_modes()), Compositor::CAPS);
+        assert_eq!(
+            Compositor::caps_with(Kernels::Match, layout, all_modes(), BlendExtras::ALL),
+            Compositor::CAPS
+        );
         assert_eq!(Compositor::CAPS.grade, GradeKinds::ALL);
         for kernels in [Kernels::Differs("a chain"), Kernels::Unknown] {
-            let caps = Compositor::caps_with(kernels, layout, all_modes());
+            let caps = Compositor::caps_with(kernels, layout, all_modes(), BlendExtras::ALL);
             assert_eq!(caps.grade, GradeKinds::NONE, "{kernels:?}");
             let mut restored = caps;
             restored.grade = GradeKinds::ALL;
@@ -3389,7 +3433,7 @@ mod tests {
         use kerf_core::BlendMode;
         let screen = BlendKinds::of(BlendMode::Screen);
         let add = BlendKinds::of(BlendMode::Add);
-        let caps = |blend| Compositor::caps_with(Kernels::Match, Some(Model::Shaped), blend).blend;
+        let caps = |blend| Compositor::caps_with(Kernels::Match, Some(Model::Shaped), blend, BlendExtras::ALL).blend;
         assert_eq!(caps([BlendKinds::NONE; 2]), BlendKinds::NONE);
         assert_eq!(caps([BlendKinds::ALL; 2]), BlendKinds::ALL);
         assert_eq!(caps([screen.union(add), screen]), screen);
@@ -3406,12 +3450,12 @@ mod tests {
         const { assert!(Compositor::CAPS.text) };
         for layout in [Some(Model::Shaped), Some(Model::Legacy)] {
             assert_eq!(
-                Compositor::caps_with(Kernels::Match, layout, crate::blend::all_modes()),
+                Compositor::caps_with(Kernels::Match, layout, crate::blend::all_modes(), BlendExtras::ALL),
                 Compositor::CAPS,
                 "{layout:?}"
             );
         }
-        let unknown = Compositor::caps_with(Kernels::Match, None, crate::blend::all_modes());
+        let unknown = Compositor::caps_with(Kernels::Match, None, crate::blend::all_modes(), BlendExtras::ALL);
         assert!(!unknown.text);
         let mut restored = unknown;
         restored.text = true;

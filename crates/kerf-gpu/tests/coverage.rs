@@ -2377,12 +2377,18 @@ fn the_ledger_says_which_refusals_hold_the_compositor_back() {
     let layout = kerf_gpu::text::model();
     // ...and the blend modes where this FFmpeg's blend chain is the model's (a probe; `KERF_LEDGER_BLEND_OFF=1` asks as if
     // it had matched none, which is the ledger of a build that draws no blend: the "before" of a blend change).
-    let blend = if std::env::var_os("KERF_LEDGER_BLEND_OFF").is_some() {
+    let off = std::env::var_os("KERF_LEDGER_BLEND_OFF").is_some();
+    let blend = if off {
         [kerf_core::BlendKinds::NONE; 2]
     } else {
         kerf_gpu::blend::kernels()
     };
-    let caps = Compositor::caps_with(kernels, layout, blend);
+    let extras = if off {
+        kerf_core::BlendExtras::NONE
+    } else {
+        kerf_gpu::blend::extras()
+    };
+    let caps = Compositor::caps_with(kernels, layout, blend, extras);
     let mut cuts = vec![];
     // T1 to T8 are planned with the default export options; T9 and on say theirs (a ProRes file, a GIF, a scaler).
     let mut every: Vec<Archetype> = archetypes(media)
@@ -2414,7 +2420,7 @@ fn the_ledger_says_which_refusals_hold_the_compositor_back() {
         format!("ffmpeg: {version_line}"),
         format!("composite colour policy: {policy:?}"),
         format!("grade kernels: {kernels:?}; text layout: {layout:?} (caps: Compositor::caps_for(grade::kernels()) once text::model() has probed, as the app asks)"),
-        format!("blend kernels [BT.601, BT.709]: {blend:?}"),
+        format!("blend kernels [BT.601, BT.709]: {blend:?}; extras (BT.2020, RGB pictures): {extras:?}"),
         "plans: every output frame of every archetype over OriginalMedia at 540 px wide (the app's preview plans ProxyMedia at 960); nothing is rendered".to_string(),
         "archetypes: the review's T1 to T3, the real-world T4 to T8 and T9 to T24, which between them use every feature the editor offers that still refuses (tests/coverage.rs)".to_string(),
     ];
