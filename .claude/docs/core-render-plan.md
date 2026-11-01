@@ -303,7 +303,8 @@
   picture FFmpeg negotiates), a fade to black or white running on it (a clip's own `fade_in` / `fade_out` is one on any track; a dissolve's alpha ramp is not), a dip to white,
   **a cut that mixes colour matrices** under a negotiating policy (`PlanCanvas::mixed_matrices_cut`: a Motion plan's cut holds video inputs of more than one `PlanStream::matrix()`, the BT.709 label included; FFmpeg 9 converts the grade's way back into the bottom layer's matrix
   on every frame of the clip, whether or not the two are on screen together), a layer the compositor's scaler resizes
-  (the scaler's one-level difference becomes 3 or 4 through the conversions, past the bound of 2), an odd side (swscale reads
+  unless `caps.exact_scaler` and an `eq` precedes the grade (`RenderPlan::eq_in_chain`: without one the fit `scale` converts to RGB in the same pass;
+  without the exact scaler the scaler's one-level difference becomes 3 or 4 through the conversions, past the bound of 2), an odd side (swscale reads
   past the line), and in `reasons` the geometry ones `Matte(layer, "a grade")` (a letterbox: the bars are part of the frame the
   grade sees) and `ZoomBehind(.., "a grade")` (a moving zoom last: its `scale` converts the RGB in one pass). `RenderPlan::graded()`
   includes a grade, so the full-range refusals (`GradedFullRange`, `GradedInFullRangeStack`) judge it too. `kerf_core::baked_lut`
@@ -321,8 +322,8 @@
   tables from the layer's colour each frame, as for a static grade. **A keyed `eq` is in the chain on every frame of the
   clip**, neutral numbers or not, so the refusals about grading a picture (`GradedFullRange`, `GradedInFullRangeStack`) judge
   `RenderPlan::graded(layer)` — a colour that is not the identity, or in a Motion plan any keyed colour — and a full-range clip
-  is refused on the frames where the curve passes through neutral too. **A grade on a layer the scaler resizes is judged by its tables**
-  (`Unsupported::GradeSteep`, from `reasons(size)`, static grades and each frame of a keyed one alike): the compositor's scaler is a
+  is refused on the frames where the curve passes through neutral too. **On a compositor without `caps.exact_scaler`, a grade on a layer the scaler resizes is judged by its tables**
+  (`Unsupported::GradeSteep`, from `reasons(size)`, static grades and each frame of a keyed one alike; with it, never): the compositor's scaler is a
   level from swscale's and `eq` maps two values a level apart to `eq::table_steps(&layer.color)` apart (`kerf_core::eq`: the port of `eq`'s
   tables, shared with the compositor; the steepest step between neighbouring entries of the Y, U and V tables of that colour, the whole table, a
   black point parked above 0 included), so a frame whose steepest step is past `MAX_AMPLIFIED_ERROR` (2) is FFmpeg's. The geometry is the

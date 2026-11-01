@@ -2343,18 +2343,19 @@ fn a_keyed_colour_is_the_eq_of_each_frame() {
     run_placed("keyed colour/under a moving zoom", &tl, &two, 30.0, 1.0);
 }
 
-/// A grade on a layer the scaler resizes: the scaler is a level off swscale's and the tables multiply that by their steepest
-/// step (`eq::table_steps`), so a frame is drawn while that step is at most two and FFmpeg's past it (`GradeSteep`), static
-/// grades included. The drawn ones are held to **the step itself** (the bound the plan judged them by) on sources that look at
-/// every table entry: noise, a luma ramp, and hard 16 / 235 edges whose scaled overshoot reaches the bottom of the range. The
-/// refused ones are the grades measured far past it with the refusal bypassed (noise, edges and the ramp, Y / UV off the export:
-/// gamma 1.3 3 / 1, 1.4 4 / 1, 2 6 / 1; contrast 3 3 / 1; contrast 1.8 and gamma 2 12 / 1, with a brightness of 0.3 19 / 1;
-/// saturation 3 1 / 3), here refused on every frame with the export rendering them.
+/// `eq`'s tables on a layer the scaler resizes. The scaler used to be a level off swscale's and the tables multiplied that by their
+/// steepest step (`eq::table_steps`), so a frame was drawn while that step was at most two and FFmpeg's past it (`GradeSteep`), static
+/// grades included. Where the scaler is measured to be swscale's to the level (both FFmpegs of CI on x86-64: `scaler::kernels()`)
+/// there is no level to multiply and **every grade is drawn to the level, whatever its tables step**: held on sources that look at
+/// every table entry (noise, a luma ramp, hard 16 / 235 edges whose scaled overshoot reaches the bottom of the range) with the grades
+/// that measured 3 to 19 levels off the export before (gamma 1.3 3 / 1, 1.4 4 / 1, 2 6 / 1; contrast 3 3 / 1; contrast 1.8 and gamma 2
+/// 12 / 1, with a brightness of 0.3 19 / 1; saturation 3 1 / 3).
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
-fn a_grade_on_a_layer_the_scaler_resizes_is_drawn_while_its_tables_step_by_two_and_refused_past_it() {
+fn eq_tables_of_any_step_are_the_export_on_a_layer_the_scaler_resizes() {
     use kerf_core::eq::table_steps;
     let m = media();
+    assert!(kerf_gpu::scaler::kernels().exact(), "this FFmpeg's scaler is not the model");
     let grade = |brightness: f64, contrast: f64, saturation: f64, gamma: f64, temperature: f64| Color {
         brightness,
         contrast,
@@ -2372,14 +2373,29 @@ fn a_grade_on_a_layer_the_scaler_resizes_is_drawn_while_its_tables_step_by_two_a
         )
     };
     let (noise, edges, ramp) = (("noise", &m.noise), ("edges", &m.edges), ("ramp", &m.ramp));
+    let mut steepest = 0;
     for (name, color, sources) in [
         // Fixed point: contrast steps by its ceiling and a brightness has no cliff.
         ("brightness 0.3", grade(0.3, 1.0, 1.0, 1.0, 0.0), vec![ramp, edges]),
         ("contrast 2", grade(0.0, 2.0, 1.0, 1.0, 0.0), vec![ramp, edges]),
-        // The pow table: a gamma above 1 steepens toward black (2 at 1.2); a brightness that lifts the dark end off the
-        // table's cliff takes the steepness away again (gamma 2, step 1).
+        ("contrast 3", grade(0.0, 3.0, 1.0, 1.0, 0.0), vec![ramp, edges, noise]),
+        // The pow table: a gamma above 1 steepens toward black; a brightness that lifts the dark end off the table's cliff
+        // takes the steepness away again (gamma 2, step 1).
         ("gamma 1.2", grade(0.0, 1.0, 1.0, 1.2, 0.0), vec![ramp, edges, noise]),
+        ("gamma 1.3", grade(0.0, 1.0, 1.0, 1.3, 0.0), vec![ramp, edges, noise]),
+        ("gamma 1.4", grade(0.0, 1.0, 1.0, 1.4, 0.0), vec![ramp, edges, noise]),
+        ("gamma 2", grade(0.0, 1.0, 1.0, 2.0, 0.0), vec![ramp, edges, noise]),
         ("gamma 0.5", grade(0.0, 1.0, 1.0, 0.5, 0.0), vec![ramp]),
+        (
+            "brightness -0.3 and gamma 1.5",
+            grade(-0.3, 1.0, 1.0, 1.5, 0.0),
+            vec![ramp, edges],
+        ),
+        (
+            "contrast 1.8 and gamma 2",
+            grade(0.0, 1.8, 1.0, 2.0, 0.0),
+            vec![ramp, edges, noise],
+        ),
         (
             "brightness 0.3 and gamma 2",
             grade(0.3, 1.0, 1.0, 2.0, 0.0),
@@ -2387,15 +2403,16 @@ fn a_grade_on_a_layer_the_scaler_resizes_is_drawn_while_its_tables_step_by_two_a
         ),
         // Chroma: saturation is the tables' contrast, a temperature a power of the chroma.
         ("saturation 2", grade(0.0, 1.0, 2.0, 1.0, 0.0), vec![noise, ramp]),
+        ("saturation 3", grade(0.0, 1.0, 3.0, 1.0, 0.0), vec![noise, ramp]),
         ("temperature 1", grade(0.0, 1.0, 1.0, 1.0, 1.0), vec![noise]),
+        (
+            "the far end of every range",
+            grade(0.3, 1.8, 2.0, 2.0, 1.0),
+            vec![ramp, edges, noise],
+        ),
     ] {
         let [y, u, v] = table_steps(&color);
-        assert!(y.max(u).max(v) <= 2, "{name}: steps {y}/{u}/{v} are past what is drawn");
-        let limits = Limits {
-            y: y as i32,
-            uv: u.max(v) as i32,
-            scaler_only: false,
-        };
+        steepest = steepest.max(y.max(u).max(v));
         for (source, asset) in sources {
             let (tl, assets) = pip(asset, color);
             run(
@@ -2404,30 +2421,15 @@ fn a_grade_on_a_layer_the_scaler_resizes_is_drawn_while_its_tables_step_by_two_a
                 &assets,
                 30.0,
                 0.4,
-                limits,
+                EXACT,
             );
         }
     }
-    // Past two, every frame is FFmpeg's. The dark end by gamma (the first table entry above 0 steps by 256 * (1/255)^(1/gamma)),
-    // by a brightness that parks the black point above 0 under a gamma, by contrast, by saturation, and at the far end of every range.
-    for (name, color) in [
-        ("gamma 1.3", grade(0.0, 1.0, 1.0, 1.3, 0.0)),
-        ("gamma 1.4", grade(0.0, 1.0, 1.0, 1.4, 0.0)),
-        ("gamma 2", grade(0.0, 1.0, 1.0, 2.0, 0.0)),
-        ("brightness -0.3 and gamma 1.5", grade(-0.3, 1.0, 1.0, 1.5, 0.0)),
-        ("contrast 3", grade(0.0, 3.0, 1.0, 1.0, 0.0)),
-        ("contrast 1.8 and gamma 2", grade(0.0, 1.8, 1.0, 2.0, 0.0)),
-        ("saturation 3", grade(0.0, 1.0, 3.0, 1.0, 0.0)),
-        ("the far end of every range", grade(0.3, 1.8, 2.0, 2.0, 1.0)),
-    ] {
-        let steps = table_steps(&color);
-        assert!(steps.into_iter().max().unwrap() > 2, "{name}: {steps:?}");
-        let (tl, assets) = pip(&m.ramp, color);
-        let case = format!("static colour/pip, {name}, refused");
-        assert_eq!(grade_steep_split(&tl, &assets, 30.0, 0.4), (12, 0), "{case}");
-        run_refusing(&case, &tl, &assets, 30.0, 0.4, GRADED_SCALED, &grade_steep_refused());
-    }
-    // The same far end at the picture's size is exact (nothing is resized): drawn, to the level.
+    assert!(
+        steepest > 2,
+        "the cases must reach tables the plan used to refuse (steepest {steepest})"
+    );
+    // The same far end at the picture's size is exact (nothing is resized).
     let mut alone = clip(&m.ramp, 0.5, 1.5, 0.0);
     alone.color = grade(0.3, 1.8, 2.0, 2.0, 1.0);
     run(
@@ -2438,6 +2440,206 @@ fn a_grade_on_a_layer_the_scaler_resizes_is_drawn_while_its_tables_step_by_two_a
         0.4,
         EXACT,
     );
+}
+
+/// A clip's grade (LUT, curves, wheels) on a layer the scaler resizes, **with an `eq` ahead of it**: the picture the conversions to RGB
+/// and back read is the exact scaler's, so the whole is the export's to the level — a picture-in-picture, an enlargement, a shrink, a
+/// Cover crop, noise, a picture tagged BT.709 (through 4:4:4 on the way back) — the T8 shape of `tests/coverage.rs` (a 2:1 shrink under
+/// contrast, saturation and warmth, curves and wheels). Without an `eq` FFmpeg's format negotiation has the fit `scale` output RGB
+/// itself (the filters between it and the grade pass any format and the grade asks for RGB), which scales and converts in one pass from
+/// chroma the compositor has already scaled: refused, and shown necessary by drawing the frame anyway.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_grade_on_a_layer_the_scaler_resizes_is_the_export_where_an_eq_precedes_it() {
+    let m = media();
+    let v = variants();
+    assert!(kerf_gpu::scaler::kernels().exact(), "this FFmpeg's scaler is not the model");
+    let all = grades();
+    let eq = Color {
+        contrast: 1.08,
+        saturation: 1.15,
+        temperature: 0.1,
+        ..Color::default()
+    };
+    // Every part of the grade and their sums, picture-in-picture over another track.
+    for (name, grade) in &all {
+        let mut c = clip(&m.testsrc, 0.5, 1.5, 0.0);
+        c.transform.scale = 0.6;
+        c.grade = grade.clone();
+        c.color = eq;
+        let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None);
+        run(
+            &format!("grade/pip with eq, {name}"),
+            &tl,
+            &[m.bars.clone(), m.testsrc.clone()],
+            30.0,
+            0.4,
+            EXACT,
+        );
+    }
+    let heavy = &all[8].1;
+    let alone = |asset: &Asset, delivery: Option<Delivery>, edit: &dyn Fn(&mut Clip)| {
+        let mut c = clip(asset, 0.5, 1.5, 0.0);
+        c.grade = heavy.clone();
+        c.color = eq;
+        edit(&mut c);
+        (timeline(vec![vec![c]], delivery), vec![asset.clone()])
+    };
+    // The shapes of a resize.
+    for (name, delivery) in [
+        ("enlarged to 960x540", Delivery::new(960, 540, Fit::Contain)),
+        ("shrunk to 320x180 (the 2:1 of T8)", Delivery::new(320, 180, Fit::Contain)),
+        ("shrunk to 160x90", Delivery::new(160, 90, Fit::Contain)),
+        ("cover into 360x640", Delivery::new(360, 640, Fit::Cover)),
+        ("cover into 480x270", Delivery::new(480, 270, Fit::Cover)),
+        ("enlarged cover into 1280x720", Delivery::new(1280, 720, Fit::Cover)),
+    ] {
+        let (tl, assets) = alone(&m.testsrc, Some(delivery), &|_| {});
+        run(&format!("grade/{name} with eq"), &tl, &assets, 30.0, 0.4, EXACT);
+    }
+    let (tl, assets) = alone(&m.noise, Some(Delivery::new(960, 540, Fit::Contain)), &|_| {});
+    run("grade/noise enlarged with eq", &tl, &assets, 30.0, 0.4, EXACT);
+    let (tl, assets) = alone(&m.noise, Some(Delivery::new(320, 180, Fit::Contain)), &|_| {});
+    run("grade/noise shrunk with eq", &tl, &assets, 30.0, 0.4, EXACT);
+    let (tl, assets) = alone(&m.edges, Some(Delivery::new(320, 180, Fit::Contain)), &|_| {});
+    run("grade/hard edges shrunk with eq", &tl, &assets, 30.0, 0.4, EXACT);
+    // After the eq's own keys, at speed 2, cropped, over another track, dissolving in and out.
+    let (tl, assets) = alone(&m.testsrc, Some(Delivery::new(320, 180, Fit::Contain)), &|c| c.speed = 2.0);
+    run("grade/shrunk at speed 2 with eq", &tl, &assets, 30.0, 0.4, EXACT);
+    let (tl, assets) = alone(&m.testsrc, None, &|c| {
+        c.transform.scale = 0.75;
+        c.transform.crop_left = 0.125;
+        c.transform.crop_right = 0.125;
+    });
+    run("grade/cropped and shrunk with eq", &tl, &assets, 30.0, 0.4, EXACT);
+    let mut keyed = colour_keyed(
+        &m.testsrc,
+        &[kerf_core::Property::Brightness, kerf_core::Property::Saturation],
+        &linear_keys,
+    );
+    keyed.transform.scale = 0.6;
+    keyed.grade = heavy.clone();
+    let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![keyed]], None);
+    run_colour(
+        "grade/pip under a keyed eq",
+        &tl,
+        &[m.bars.clone(), m.testsrc.clone()],
+        30.0,
+        1.0,
+        10,
+        EXACT,
+    );
+    for (name, kind) in [("in", TransitionKind::Crossfade), ("dip", TransitionKind::DipToBlack)] {
+        let mut from = clip(&m.testsrc, 0.5, 1.5, 0.0);
+        from.grade = heavy.clone();
+        from.color = eq;
+        let mut to = clip(&m.testsrc, 1.0, 2.0, 1.0);
+        to.grade = heavy.clone();
+        to.color = eq;
+        to.transition_in = Some(Transition { kind, duration: 0.6 });
+        let tl = timeline(vec![vec![from, to]], Some(Delivery::new(320, 180, Fit::Contain)));
+        let case = format!("grade/shrunk, dissolving {name}, with eq");
+        if kind == TransitionKind::DipToBlack {
+            // A fade to black running on a graded layer is FFmpeg's (the grade leaves RGB the fade runs on).
+            run_refusing(
+                &case,
+                &tl,
+                std::slice::from_ref(&m.testsrc),
+                30.0,
+                2.0,
+                EXACT,
+                &refusing("GradeWith", |u| matches!(u, Unsupported::GradeWith(..))),
+            );
+        } else {
+            run(&case, &tl, std::slice::from_ref(&m.testsrc), 30.0, 2.0, EXACT);
+        }
+    }
+    // A picture tagged BT.709 goes back to 4:2:0 through 4:4:4; a stack of its own matrix.
+    let mut c = clip(&v.testsrc709, 0.5, 1.5, 0.0);
+    c.transform.scale = 0.6;
+    c.grade = heavy.clone();
+    c.color = eq;
+    let tl = timeline(vec![vec![clip(&v.bars709, 0.5, 1.5, 0.0)], vec![c]], None);
+    run(
+        "grade/pip with eq, bt709",
+        &tl,
+        &[v.bars709.clone(), v.testsrc709.clone()],
+        30.0,
+        0.4,
+        EXACT,
+    );
+    // Refused: no eq between the fit scale and the grade; a letterbox (the bars are the picture the grade sees).
+    let no_eq = |asset: &Asset, delivery: Option<Delivery>, scale: f64| {
+        let mut c = clip(asset, 0.5, 1.5, 0.0);
+        c.grade = heavy.clone();
+        c.transform.scale = scale;
+        (timeline(vec![vec![c]], delivery), vec![asset.clone()])
+    };
+    let no_eq_refused = refusing(
+        "GradeWith (no eq)",
+        |u| matches!(u, Unsupported::GradeWith(_, w) if w.contains("no `eq`")),
+    );
+    for (name, delivery, scale) in [
+        ("pip", None, 0.6),
+        ("enlarged", Some(Delivery::new(960, 540, Fit::Contain)), 1.0),
+        ("shrunk", Some(Delivery::new(320, 180, Fit::Contain)), 1.0),
+    ] {
+        let (tl, assets) = no_eq(&m.testsrc, delivery, scale);
+        run_refusing(
+            &format!("grade/{name}, no eq"),
+            &tl,
+            &assets,
+            30.0,
+            0.4,
+            EXACT,
+            &no_eq_refused,
+        );
+        // The refusal is needed: the same frames drawn anyway (the plan is told an `eq` of no effect stands there) are not the export's.
+        let mut lied = tl.clone();
+        for c in lied.tracks.iter_mut().flat_map(|t| &mut t.clips) {
+            c.color.brightness = 1e-6;
+        }
+        let (dy, duv) = drawn_anyway_planes(&format!("grade/{name}, no eq"), &tl, &lied, &assets);
+        assert!(dy > 0 || duv > 0, "grade/{name}, no eq: the refusal is not needed");
+    }
+    let (tl, assets) = alone(&m.portrait, Some(Delivery::new(640, 360, Fit::Contain)), &|_| {});
+    run_refusing(
+        "grade/letterbox with eq",
+        &tl,
+        &assets,
+        30.0,
+        0.4,
+        EXACT,
+        &refusing("Matte", |u| matches!(u, Unsupported::Matte(..))),
+    );
+}
+
+/// The planes the compositor draws for `lied` (whose plan has no refusal) against the export of `real`: how far a refused frame's
+/// drawing is from FFmpeg's. Nine frames at 30 fps.
+fn drawn_anyway_planes(case: &str, real: &Timeline, lied: &Timeline, assets: &[Asset]) -> (i32, i32) {
+    let opts = at_fps(30.0);
+    let slug: String = case
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let played = export(&format!("anyway-{slug}"), real, assets, &opts);
+    let planner = Planner::new(lied, assets, &opts, PlanRequest::motion(policy())).expect("planner");
+    let size = (played.w as u32, played.h as u32);
+    let mut motion = MotionFrames::new(frame_source());
+    let (mut y, mut uv) = (0, 0);
+    for k in 0..9u64 {
+        let plan = planner.at_frame(k).expect("plan");
+        let picture = motion.frames(&plan).unwrap_or_else(|e| panic!("{case}: frame {k}: {e}"));
+        let drawn = compositor()
+            .composite_yuv_counted(&plan, &picture, motion.counts(), size)
+            .unwrap_or_else(|e| panic!("{case}: frame {k}: {e}"));
+        let want = played.planes(k as usize);
+        let got = planes_of(&drawn);
+        y = y.max(PlaneStats::of(want[0], got[0]).max);
+        uv = uv.max(PlaneStats::of(want[1], got[1]).max.max(PlaneStats::of(want[2], got[2]).max));
+    }
+    eprintln!("{case:<44} drawn anyway: Y max {y}, UV max {uv}");
+    (y, uv)
 }
 
 /// The colour is graded in the picture the chain has made 4:2:0 and 8-bit by then, so a keyed colour is exact

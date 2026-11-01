@@ -1000,10 +1000,17 @@ impl RenderPlan {
                     reasons.push(Unsupported::Matte(at(), "a grade"));
                 }
                 if geom.stages.iter().any(|s| s.scaled != (s.src.w, s.src.h)) {
-                    reasons.push(Unsupported::GradeWith(
-                        at(),
-                        "on a layer the compositor's scaler resizes (its one-level difference from swscale's grows to 3 or 4 levels through the RGB conversions)",
-                    ));
+                    if !caps.exact_scaler {
+                        reasons.push(Unsupported::GradeWith(
+                            at(),
+                            "on a layer the compositor's scaler resizes (its one-level difference from swscale's grows to 3 or 4 levels through the RGB conversions)",
+                        ));
+                    } else if !self.eq_in_chain(layer) {
+                        reasons.push(Unsupported::GradeWith(
+                            at(),
+                            "on a layer the scaler resizes with no `eq` ahead of the grade (the fit `scale` converts to RGB in the same pass, from chroma the compositor has already scaled)",
+                        ));
+                    }
                 }
                 if geom.picture.0 % 2 == 1 || geom.picture.1 % 2 == 1 {
                     reasons.push(Unsupported::GradeWith(
@@ -1040,7 +1047,8 @@ impl RenderPlan {
             // the luma step is where a sharpen after the grade starts its own worst case from, below.
             let steps = if scaled { eq::table_steps(&layer.color) } else { [1; 3] };
             let steepest = steps.into_iter().max().unwrap_or(1);
-            if steepest > MAX_AMPLIFIED_ERROR {
+            // (Where the scaler is exact there is no level for the tables to multiply: no refusal for how steep they are.)
+            if steepest > MAX_AMPLIFIED_ERROR && !caps.exact_scaler {
                 reasons.push(Unsupported::GradeSteep(self.layer_ref(n, layer), steepest));
             }
             let mut err = if scaled { f64::from(steps[0]).max(1.0) } else { 0.0 };
@@ -1517,6 +1525,15 @@ impl RenderPlan {
         !layer.color.is_identity()
             || !layer.grade.is_identity()
             || (self.mode == PlanMode::Motion && layer.animated.is_some_and(|a| a.color))
+    }
+
+    /// Whether an `eq` sits in the layer's chain, after the fit `scale` and ahead of the grade: it takes planar YCbCr
+    /// only, which stops the format negotiation there. (Without one the fit `scale`, the filters that pass any format
+    /// along and the grade's `lut3d` / `lutrgb` / `colorbalance` — RGB only — agree on RGB for the scale's output,
+    /// which scales and converts in one pass, from chroma another way than scale-then-convert.) A colour that is not
+    /// the identity writes one; an export frame's **keyed** colour writes it on every frame.
+    pub fn eq_in_chain(&self, layer: &PlanLayer) -> bool {
+        !layer.color.is_identity() || (self.mode == PlanMode::Motion && layer.animated.is_some_and(|a| a.color))
     }
 
     /// Why a compositor that draws this layer's grade parts still does not draw its chain. FFmpeg's grade
@@ -3703,6 +3720,103 @@ mod tests {
                 _ => assert!(why.is_empty(), "{e:?}: {why:?}"),
             }
         }
+    }
+
+    /// Where the compositor's scaler is measured to be swscale's (`caps.exact_scaler`) there is no level for a grade or an `eq` table to
+    /// multiply: a graded layer the scaler resizes is drawn when an `eq` stands between the fit `scale` and the grade (without one the
+    /// fit `scale` converts to RGB itself, in the same pass), and the steepness of the tables is no refusal. Without the exact scaler
+    /// every one of them is refused as before.
+    #[test]
+    fn where_the_scaler_is_exact_a_graded_resized_layer_is_drawn_when_an_eq_precedes_the_grade() {
+        use crate::model::{CurvePoint, Curves};
+        let caps = |exact: bool| GpuCaps {
+            motion: true,
+            fades: true,
+            transitions: true,
+            grade: GradeKinds::ALL,
+            exact_scaler: exact,
+            ..GpuCaps::A0
+        };
+        let curves = Grade {
+            curves: Some(Curves {
+                master: vec![CurvePoint { x: 0.0, y: 0.1 }, CurvePoint { x: 1.0, y: 0.9 }],
+                ..Curves::default()
+            }),
+            ..Grade::default()
+        };
+        let eq = Color {
+            contrast: 1.08,
+            saturation: 1.15,
+            ..Color::default()
+        };
+        let steep = Color {
+            contrast: 1.8,
+            gamma: 2.0,
+            ..Color::default()
+        };
+        let video = |w: u32, h: u32| StreamInfo {
+            pix_fmt: Some("yuv420p".into()),
+            ..crate::engine::test_support::video_stream(w, h, 30.0)
+        };
+        let why = |exact: bool, delivery: Option<Delivery>, edit: &dyn Fn(&mut Clip)| {
+            let plan = fading_plan_of(video(640, 360), delivery, CompositeColorPolicy::FixedBt601, |c| edit(c), 0.5);
+            plan.reasons(&caps(exact), plan.size(u32::MAX))
+        };
+        let pip = |color: Color, grade: &Grade| {
+            let (color, grade) = (color, grade.clone());
+            move |c: &mut Clip| {
+                c.transform.scale = 0.6;
+                c.color = color;
+                c.grade = grade.clone();
+            }
+        };
+        let resizes = |w: &[Unsupported]| {
+            w.iter()
+                .filter(|u| matches!(u, Unsupported::GradeWith(_, m) if m.contains("resizes")))
+                .count()
+        };
+        // Not exact: refused whatever stands ahead of the grade.
+        for color in [eq, Color::default()] {
+            let w = why(false, None, &pip(color, &curves));
+            assert_eq!(resizes(&w), 1, "{w:?}");
+        }
+        // Exact: drawn with an eq ahead of it, refused for the missing eq without one.
+        assert_eq!(why(true, None, &pip(eq, &curves)), vec![]);
+        let w = why(true, None, &pip(Color::default(), &curves));
+        assert_eq!(resizes(&w), 1, "{w:?}");
+        assert!(
+            w.iter()
+                .any(|u| matches!(u, Unsupported::GradeWith(_, m) if m.contains("no `eq`"))),
+            "{w:?}"
+        );
+        // An enlargement and a Cover crop are resizes the same way; a layer at its own size needs no eq.
+        let enlarged = Some(Delivery::new(960, 540, Fit::Contain));
+        assert_eq!(
+            why(true, enlarged, &|c| {
+                c.color = eq;
+                c.grade = curves.clone();
+            }),
+            vec![]
+        );
+        assert_eq!(resizes(&why(true, enlarged, &|c| c.grade = curves.clone())), 1);
+        assert_eq!(why(true, None, &|c| c.grade = curves.clone()), vec![]);
+        // The steepness of an eq on a resized layer: refused past two without the exact scaler, drawn with it.
+        let w = why(false, None, &|c| {
+            c.transform.scale = 0.6;
+            c.color = steep;
+        });
+        assert!(w.iter().any(|u| matches!(u, Unsupported::GradeSteep(..))), "{w:?}");
+        let w = why(true, None, &|c| {
+            c.transform.scale = 0.6;
+            c.color = steep;
+        });
+        assert_eq!(w, vec![]);
+        // (A letterbox is still a matte the grade sees.)
+        let w = why(true, Some(Delivery::new(1280, 360, Fit::Contain)), &|c| {
+            c.color = eq;
+            c.grade = curves.clone();
+        });
+        assert!(w.iter().any(|u| matches!(u, Unsupported::Matte(_, "a grade"))), "{w:?}");
     }
 
     /// The grade's chain, judged: what the compositor reproduces (8-bit limited-range `yuv420p` at an even size

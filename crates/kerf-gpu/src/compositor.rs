@@ -2136,7 +2136,7 @@ impl Compositor {
     }
 
     /// What happens to `layer`'s planes between the scaler and the blend, beyond its fades.
-    fn look_of(&self, layer: &kerf_core::PlanLayer, geom: &LayerGeometry) -> Result<LayerLook, GpuError> {
+    fn look_of(&self, layer: &kerf_core::PlanLayer, geom: &LayerGeometry, resize_ok: bool) -> Result<LayerLook, GpuError> {
         let unsupported = |what: String| GpuError::Unsupported(format!("layer {}: {what}", layer.name));
         let (zoom_last, (pw, ph)) = effect_picture(layer, geom);
         // The grade runs in RGB on the picture the chain has made, at its own size: FFmpeg carries it through
@@ -2145,7 +2145,7 @@ impl Compositor {
         // so does this, for a caller that did not ask it).
         let grade = self.grade_look(layer)?;
         if grade.is_some() {
-            if let Some(why) = grade_geometry_refusal(layer, geom) {
+            if let Some(why) = grade_geometry_refusal(layer, geom, resize_ok) {
                 return Err(unsupported(why));
             }
         }
@@ -2489,7 +2489,10 @@ impl Compositor {
                 Err(e) => return Err(GpuError::Unsupported(format!("layer {n}: {e}"))),
             };
             let fades = LayerFades::of(plan, layer, &geom)?;
-            let look = self.look_of(layer, &geom)?;
+            // A graded layer the scaler resizes is the export's where the scaler is exact and an `eq` sits between the
+            // fit scale and the grade (the plan says the same: `RenderPlan::reasons`).
+            let resize_ok = self.scaler_kernels.unwrap_or_else(crate::scaler::kernels).exact() && plan.eq_in_chain(layer);
+            let look = self.look_of(layer, &geom, resize_ok)?;
             // `fade` takes `rgb24` and runs on the picture the grade leaves in RGB (a dip to white is in the
             // chain for every frame of the clip, and converts the picture through RGB itself).
             if look.grade.is_some() && (fades.fade_in < FADE_FULL || fades.fade_out < FADE_FULL || fades.white_round_trip) {

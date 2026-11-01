@@ -1796,16 +1796,18 @@ fn colour_adjustments() {
     );
 }
 
-/// The scaler is a level from swscale's and `eq` maps two values a level apart to values its tables' steepest step apart, so
-/// on a layer the compositor scales a grade whose tables step past two (`eq::table_steps`, `MAX_AMPLIFIED_ERROR`) is FFmpeg's:
-/// `GradeSteep`, in a still as in an export frame (`motion_parity.rs` holds the frames drawn inside the bound to the level, and
-/// the keyed ramps frame by frame). Contrast and saturation past 2, a gamma past about 1.2, a black point parked above 0 under a
-/// gamma above 1 (a negative brightness, or a contrast), at the far ends of every range. The same grades at the picture's own size are
-/// exact and drawn, and so is a gentle one on the scaled layer.
+/// The scaler used to be a level from swscale's and `eq` maps two values a level apart to values its tables' steepest step apart
+/// (`eq::table_steps`), so on a layer the compositor scales a grade whose tables step past two was FFmpeg's (`GradeSteep`). Where the
+/// scaler is measured to be swscale's to the level (`caps.exact_scaler`, both FFmpegs of CI), there is no level to multiply: the
+/// tables are exact at any step, drawn on the scaled layer to the level in a still as in an export frame (`motion_parity.rs`). Contrast
+/// and saturation past 2, a gamma past about 1.2, a black point parked above 0 under a gamma above 1, the far ends of every range;
+/// on a picture-in-picture, a letterboxed layer and a Cover fit. (Refused on a compositor whose scaler is not measured exact: the plan's
+/// unit tests, `a_grade_whose_tables_amplify_the_scalers_level_past_two_is_refused_on_a_layer_it_resizes`.)
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
-fn a_grade_whose_tables_amplify_the_scalers_level_past_two_is_refused_on_a_layer_it_resizes() {
+fn eq_tables_of_any_step_are_drawn_on_a_layer_the_scaler_resizes() {
     let m = media();
+    assert!(kerf_gpu::scaler::kernels().exact(), "this FFmpeg's scaler is not the model");
     let grade = |brightness: f64, contrast: f64, saturation: f64, gamma: f64, temperature: f64| Color {
         brightness,
         contrast,
@@ -1813,7 +1815,6 @@ fn a_grade_whose_tables_amplify_the_scalers_level_past_two_is_refused_on_a_layer
         gamma,
         temperature,
     };
-    let reason = || Refusal::Plan("colour correction whose tables step");
     let shifted = Transform {
         scale: 0.6,
         pos_x: 0.1,
@@ -1835,9 +1836,12 @@ fn a_grade_whose_tables_amplify_the_scalers_level_past_two_is_refused_on_a_layer
         ("brightness -0.3 and gamma 1.5", grade(-0.3, 1.0, 1.0, 1.5, 0.0)),
         ("contrast 1.8 and gamma 2", grade(0.0, 1.8, 1.0, 2.0, 0.0)),
         ("the far end of every range", grade(0.3, 1.8, 2.0, 2.0, 1.0)),
+        // (Gentle ones, which were drawn before.)
+        ("contrast 2", grade(0.0, 2.0, 1.0, 1.0, 0.0)),
+        ("gamma 1.2", grade(0.0, 1.0, 1.0, 1.2, 0.0)),
     ];
     for (name, color) in steep {
-        check_refused(&format!("refused/steep-grade-pip-{name}"), &pip(color), &under, 0.5, reason());
+        check_exact(&format!("colour/pip, {name}"), &pip(color), &under, &[0.5], STRICT);
     }
     // A letterboxed layer (the portrait picture shrunk into a landscape frame, the bars in the picture the `eq` sees) and a
     // layer scaled by the fit alone.
@@ -1847,42 +1851,149 @@ fn a_grade_whose_tables_amplify_the_scalers_level_past_two_is_refused_on_a_layer
         timeline(vec![vec![c]], Some(Delivery::new(640, 360, Fit::Contain)))
     };
     for (name, color) in steep {
-        check_refused(
-            &format!("refused/steep-grade-letterbox-{name}"),
+        check_exact(
+            &format!("colour/letterbox, {name}"),
             &boxed(color),
             std::slice::from_ref(&m.portrait),
-            0.5,
-            reason(),
+            &[0.5],
+            STRICT,
         );
     }
-    let mut cover = clip(&m.testsrc, 0.0, 2.0, 0.0);
-    cover.color = grade(0.0, 1.8, 1.0, 2.0, 0.0);
-    check_refused(
-        "refused/steep-grade-cover-fit",
-        &timeline(vec![vec![cover]], Some(Delivery::new(360, 640, Fit::Cover))),
-        std::slice::from_ref(&m.testsrc),
-        0.5,
-        reason(),
+    for (name, color) in [
+        ("contrast 1.8 and gamma 2", grade(0.0, 1.8, 1.0, 2.0, 0.0)),
+        ("saturation 3", grade(0.0, 1.0, 3.0, 1.0, 0.0)),
+    ] {
+        let mut cover = clip(&m.testsrc, 0.0, 2.0, 0.0);
+        cover.color = color;
+        check_exact(
+            &format!("colour/cover fit, {name}"),
+            &timeline(vec![vec![cover]], Some(Delivery::new(360, 640, Fit::Cover))),
+            std::slice::from_ref(&m.testsrc),
+            &[0.5],
+            STRICT,
+        );
+    }
+    // Busy pictures, where every table entry is looked at.
+    let mut noisy = clip(&m.noise, 0.0, 0.2, 0.0);
+    noisy.color = grade(0.0, 1.8, 2.0, 2.0, 0.5);
+    check_exact(
+        "colour/noise, enlarged, the far end of every range",
+        &timeline(vec![vec![noisy]], Some(Delivery::new(960, 540, Fit::Contain))),
+        std::slice::from_ref(&m.noise),
+        &[0.1],
+        BUSY,
     );
     // A layer the compositor does not resize: the tables are exact at any step.
     let mut alone = clip(&m.testsrc, 0.0, 2.0, 0.0);
     alone.color = grade(0.3, 1.8, 2.0, 2.0, 1.0);
-    check(
+    check_exact(
         "colour/the far end of every range at the picture's size",
         &timeline(vec![vec![alone]], None),
         std::slice::from_ref(&m.testsrc),
         &[0.5],
         STRICT,
     );
-    // ... and a grade that steps by two at most is drawn on the scaled layer.
-    for (name, color) in [
-        ("contrast 2", grade(0.0, 2.0, 1.0, 1.0, 0.0)),
-        ("saturation 2", grade(0.0, 1.0, 2.0, 1.0, 0.0)),
-        ("gamma 1.2", grade(0.0, 1.0, 1.0, 1.2, 0.0)),
-        ("brightness 0.3 and gamma 2", grade(0.3, 1.0, 1.0, 2.0, 0.0)),
-    ] {
-        check(&format!("colour/pip, {name}"), &pip(color), &under, &[0.5], STRICT);
+}
+
+/// A clip's grade on a layer the scaler resizes: the picture goes `yuv420p -> rgb24` through the x86 kernel, the grade, and back; with the
+/// scaler exact (`eq_tables_of_any_step_are_drawn_on_a_layer_the_scaler_resizes`) the picture it converts is FFmpeg's to the level, so the
+/// whole is — **when an `eq` sits between the fit `scale` and the grade**. Without one the format negotiation lets the fit `scale` output
+/// RGB itself (the filters between pass any format along, the grade's RGB-only filters ask for it), scaling and converting in one pass from
+/// chroma the compositor has already scaled: refused, with FFmpeg rendering it. A picture-in-picture, an enlargement, a shrink, a Cover fit.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_grade_on_a_layer_the_scaler_resizes_is_the_still_where_an_eq_precedes_it() {
+    let m = media();
+    assert!(kerf_gpu::scaler::kernels().exact(), "this FFmpeg's scaler is not the model");
+    let all = grades();
+    let eq = Color {
+        contrast: 1.08,
+        saturation: 1.15,
+        temperature: 0.1,
+        ..Color::default()
+    };
+    let pip = |asset: &Asset, grade: &kerf_core::Grade, color: Color, scale: f64| {
+        let mut c = clip(asset, 0.0, 2.0, 0.0);
+        c.transform.scale = scale;
+        c.grade = grade.clone();
+        c.color = color;
+        (
+            timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![c]], None),
+            vec![m.bars.clone(), asset.clone()],
+        )
+    };
+    for (name, grade) in &all {
+        let (tl, assets) = pip(&m.testsrc, grade, eq, 0.6);
+        check_exact(&format!("grade/pip with eq, {name}"), &tl, &assets, &[0.5], STRICT);
     }
+    let heavy = &all[5].1;
+    // The shapes: half size, enlarged, shrunk, a Cover crop, a tagged picture (through 4:4:4 on the way back).
+    for (name, delivery) in [
+        ("enlarged to 960x540", Delivery::new(960, 540, Fit::Contain)),
+        ("shrunk to 320x180", Delivery::new(320, 180, Fit::Contain)),
+        ("cover into 360x640", Delivery::new(360, 640, Fit::Cover)),
+        ("cover into 640x360", Delivery::new(640, 360, Fit::Cover)),
+    ] {
+        let mut c = clip(&m.testsrc, 0.0, 2.0, 0.0);
+        c.grade = heavy.clone();
+        c.color = eq;
+        check_exact(
+            &format!("grade/{name} with eq"),
+            &timeline(vec![vec![c]], Some(delivery)),
+            std::slice::from_ref(&m.testsrc),
+            &[0.5],
+            STRICT,
+        );
+    }
+    for (source, asset) in [
+        ("testsrc709", &m.testsrc709),
+        ("testsrc170m", &m.testsrc170m),
+        ("bars470bg", &m.bars470bg),
+    ] {
+        let (tl, assets) = pip(asset, heavy, eq, 0.6);
+        // (A stack of one matrix under FFmpeg 9: the bars beside it must be of its matrix.)
+        if policy() == CompositeColorPolicy::FixedBt601 || source == "testsrc170m" || source == "bars470bg" {
+            check_exact(&format!("grade/pip with eq, {source}"), &tl, &assets, &[0.5], STRICT);
+        }
+    }
+    // Busy: noise enlarged.
+    let mut c = clip(&m.noise, 0.0, 0.2, 0.0);
+    c.grade = heavy.clone();
+    c.color = eq;
+    check_exact(
+        "grade/noise enlarged with eq",
+        &timeline(vec![vec![c]], Some(Delivery::new(960, 540, Fit::Contain))),
+        std::slice::from_ref(&m.noise),
+        &[0.1],
+        BUSY,
+    );
+    // Without an `eq` the fit scale converts to RGB itself: refused.
+    for (name, scale, delivery) in [
+        ("pip", 0.6, None),
+        ("enlarged", 1.0, Some(Delivery::new(960, 540, Fit::Contain))),
+    ] {
+        let mut c = clip(&m.testsrc, 0.0, 2.0, 0.0);
+        c.transform.scale = scale;
+        c.grade = heavy.clone();
+        check_refused(
+            &format!("grade/{name}, no eq"),
+            &timeline(vec![vec![c]], delivery),
+            std::slice::from_ref(&m.testsrc),
+            0.5,
+            Refusal::Plan("no `eq` ahead of the grade"),
+        );
+    }
+    // A letterbox is still a matte the grade would see.
+    let mut c = clip(&m.portrait, 0.0, 2.0, 0.0);
+    c.grade = heavy.clone();
+    c.color = eq;
+    check_refused(
+        "grade/letterbox with eq",
+        &timeline(vec![vec![c]], Some(Delivery::new(640, 360, Fit::Contain))),
+        std::slice::from_ref(&m.portrait),
+        0.5,
+        Refusal::Plan("letterbox"),
+    );
 }
 
 #[test]
@@ -6758,18 +6869,8 @@ fn what_the_compositor_does_not_draw_of_a_grade_is_refused() {
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn a_blurred_fill_is_drawn_as_the_still_draws_it() {
     let m = media();
-    // Every drawn case is held twice: through the RGB conversion with the harness's bounds, and exact — the still's own
-    // `yuv444p` planes against the compositor's composite put through the same conversion (`still_planes_differ`).
-    let check = |case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], limits: Limits| {
-        check(case, tl, assets, times, limits);
-        for &t in times {
-            assert_eq!(
-                still_planes_differ(tl, assets, t),
-                (0, 0),
-                "{case} @ {t}: the composite is not the still's"
-            );
-        }
-    };
+    // Every drawn case is held twice: through the RGB conversion with the harness's bounds, and exact (`check_exact`).
+    let check = check_exact;
     let blur = |w, h| Some(Delivery::new(w, h, Fit::Blur));
     let alone = |a: &Asset, w, h| timeline(vec![vec![clip(a, 0.0, 2.0, 0.0)]], blur(w, h));
     let one = |a: &Asset| std::slice::from_ref(a).to_vec();
@@ -6972,6 +7073,20 @@ fn a_blurred_fill_is_drawn_as_the_still_draws_it() {
         &[0.5],
         STRICT,
     );
+}
+
+/// [`check`] and, for each time, exactly: the still's own `yuv444p` planes against the compositor's composite put through the same
+/// conversion ([`still_planes_differ`]), no differing sample. For the cases whose claim is *exact*, which the RGB comparison's
+/// edge band and PSNR cannot make.
+fn check_exact(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], limits: Limits) {
+    check(case, tl, assets, times, limits);
+    for &t in times {
+        assert_eq!(
+            still_planes_differ(tl, assets, t),
+            (0, 0),
+            "{case} @ {t}: the composite is not the still's"
+        );
+    }
 }
 
 /// The still, exact: its `yuv444p` planes (`timeline_frame_yuv_cancellable`: the composite's samples with the one conversion
