@@ -2483,8 +2483,7 @@ fn every_variant() -> Vec<Unsupported> {
         Unsupported::FoldedFit(layer(), ""),
         Unsupported::Text,
         Unsupported::TextWithoutFont,
-        Unsupported::TextBorder,
-        Unsupported::TextTooSmall(8),
+        Unsupported::TextSequence(String::new()),
         Unsupported::Svg,
         Unsupported::Scaler(String::new()),
         Unsupported::MatrixUnknown(0),
@@ -2543,18 +2542,17 @@ fn ordinal(u: &Unsupported) -> usize {
         Unsupported::FoldedFit(..) => 39,
         Unsupported::Text => 40,
         Unsupported::TextWithoutFont => 41,
-        Unsupported::TextBorder => 42,
-        Unsupported::TextTooSmall(_) => 43,
-        Unsupported::Svg => 44,
-        Unsupported::Scaler(_) => 45,
-        Unsupported::MatrixUnknown(_) => 46,
-        Unsupported::MixedMatrices => 47,
-        Unsupported::UnmeasuredPolicy(_) => 48,
-        Unsupported::RgbInStack(_) => 49,
-        Unsupported::GradedInFullRangeStack(_) => 50,
-        Unsupported::Shrink(..) => 51,
-        Unsupported::FormatResize(..) => 52,
-        Unsupported::Geometry(..) => 53,
+        Unsupported::TextSequence(_) => 42,
+        Unsupported::Svg => 43,
+        Unsupported::Scaler(_) => 44,
+        Unsupported::MatrixUnknown(_) => 45,
+        Unsupported::MixedMatrices => 46,
+        Unsupported::UnmeasuredPolicy(_) => 47,
+        Unsupported::RgbInStack(_) => 48,
+        Unsupported::GradedInFullRangeStack(_) => 49,
+        Unsupported::Shrink(..) => 50,
+        Unsupported::FormatResize(..) => 51,
+        Unsupported::Geometry(..) => 52,
     }
 }
 
@@ -2589,10 +2587,9 @@ fn why_unreached(
         {
             "FixedBt601: this FFmpeg composites every stack as BT.601, so there is nothing to negotiate"
         }
-        "text_border" | "text_too_small" if layout.is_some() => {
-            "drawn: this FFmpeg's `drawtext` layout is one the compositor takes apart (text::model), so the bitmaps are blended in turn"
+        "text_sequence" if layout.is_some() => {
+            "no archetype builds it (a tab, over 160 characters, a text too wide to measure): the rest of text is drawn once this FFmpeg's `drawtext` is one the compositor takes apart (text::model)"
         }
-        "text_border" if regular_only_family().is_none() => "no installed font family without a bold face",
         _ => "no archetype builds it",
     }
 }

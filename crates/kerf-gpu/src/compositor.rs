@@ -810,16 +810,16 @@ impl Compositor {
         Self::caps_with(kernels, crate::text::measured_model())
     }
 
-    /// [`Compositor::caps_for`] for a machine whose `drawtext` lays text out as `text` (or in no way the
-    /// compositor can take apart: `None`): without that, text whose glyph bitmaps share samples (a
-    /// synthetic-bold border, a font under 12 px) stays FFmpeg's.
+    /// [`Compositor::caps_for`] for a machine whose `drawtext` lays text out as `text` and converts its
+    /// colours in a way the compositor knows (`None`: in no way it does, or not probed yet): without that no
+    /// text is drawn, it stays FFmpeg's.
     pub fn caps_with(kernels: crate::grade::Kernels, text: Option<crate::text::Model>) -> GpuCaps {
         let mut caps = Self::CAPS;
         if kernels != crate::grade::Kernels::Match {
             caps.grade = GradeKinds::NONE;
         }
         if text.is_none() {
-            caps.text_sequence = false;
+            caps.text = false;
         }
         caps
     }
@@ -829,7 +829,6 @@ impl Compositor {
     pub const CAPS: GpuCaps = {
         let mut caps = GpuCaps::A0;
         caps.text = true;
-        caps.text_sequence = true;
         caps.motion = true;
         caps.fades = true;
         caps.transitions = true;
@@ -3283,21 +3282,21 @@ mod tests {
         }
     }
 
-    /// Text whose glyph bitmaps share samples is in the caps only where `drawtext`'s layout is one the
-    /// compositor can take apart: a layout it does not know, a probe that has not run or could not tell, leave it
-    /// out (the plan then refuses a synthetic-bold border and a font under 12 px), and the rest of the caps are the build's.
+    /// Text is in the caps only where `drawtext`'s layout and colour conversion are ones the compositor
+    /// knows: a build it does not know, a probe that has not run or could not tell, leave it out (every text frame
+    /// is FFmpeg's), and the rest of the caps are the build's either way.
     #[test]
-    fn text_in_sequence_is_in_the_caps_only_where_the_layout_is_known() {
+    fn text_is_in_the_caps_only_where_the_build_is_known() {
         use crate::grade::Kernels;
         use crate::text::Model;
-        const { assert!(Compositor::CAPS.text && Compositor::CAPS.text_sequence) };
+        const { assert!(Compositor::CAPS.text) };
         for layout in [Some(Model::Shaped), Some(Model::Legacy)] {
             assert_eq!(Compositor::caps_with(Kernels::Match, layout), Compositor::CAPS, "{layout:?}");
         }
         let unknown = Compositor::caps_with(Kernels::Match, None);
-        assert!(unknown.text && !unknown.text_sequence);
+        assert!(!unknown.text);
         let mut restored = unknown;
-        restored.text_sequence = true;
+        restored.text = true;
         assert_eq!(restored, Compositor::CAPS, "nothing else moves");
     }
 

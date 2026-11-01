@@ -512,7 +512,7 @@ What the parity harness forced, all recorded in `kerf-gpu`'s docs and shaders:
   `LayerGeometry` (`scaled` = the folded box, `keep` = the centred window a Cover clip keeps), the TS port and corpus
   following, and a parity case per shape on both FFmpegs.
 
-**Text: FFmpeg rasterises, the compositor blends** (`text.rs`, `text/seq.rs`, `shaders/text.wgsl`, `GpuCaps::text` and `text_sequence`).
+**Text: FFmpeg rasterises, the compositor blends** (`text.rs`, `text/seq.rs`, `shaders/text.wgsl`, `GpuCaps::text`).
 
 *Design.* `drawtext` is layout (shaping, kerning, hinting, the quarter-pixel phase of each glyph bitmap) and a blend; only
 the blend is arithmetic a shader can copy, so the layout is never redone. **`drawtext` blends each glyph's bitmap in turn**
@@ -521,10 +521,12 @@ two bitmaps touch is two blends there: one mask of their sum is the same only wh
 letter gaps of a border (33 levels of chroma) nor in 3 to 11 px text (10), and a level or two at a few samples at 12 px and up
 (measured with the sum on 9.0.2: 1 to 5 samples at 12 to 19 px, 1 to 2 in a missing glyph's box). So `text::raster(t, size)` recovers the
 **sequence of bitmaps** from FFmpeg itself (`text/seq.rs`), and the compositor blends them in order:
-(1) `measure` (cached per build, font file, size, text): the pen of every glyph unit and the box — *Shaped* (FFmpeg 7+, HarfBuzz; 9.0.2): the debug log of
+(1) `measure` (cached per build, font file, size, text; a run that failed is not tried again for 30 s): the pen of every glyph unit and the box — *Shaped* (HarfBuzz: 6.1.1 and 9.0.2 measured): the debug log of
 one multi-line `drawtext` with a prefix of the text per line (`Line: k -- glyphs count: g - width64: w - offset_right64: r`: a unit starts where
-`g` grows, a ligature (Geist shapes `fi`, `ff`, `->`) is a unit of several characters, and its pen is `w - r`, 26.6 exactly); *Legacy* (4.4.2 and kin,
-whole pixels): the width of the one-row box of every prefix less that of the character alone; both read the text's box drawn at `y=ascent` for `text_w`, `text_h`, `ascent`.
+`g` grows, a ligature (Geist shapes `fi`, `ff`, `->`) is a unit of several characters, and its pen is `w - r`, 26.6 exactly). The lines are told apart by what they say and not by whose they are
+(6.1.1 prints `[drawtext @ …]` whatever the instance is called, 9.0.2 `[drawtext@name @ …]`): the log is cut at each `Line: 0` and the group of exactly `n` lines numbered `0..n` is the instance's (the box probe logs
+a group of its own), none or two that differ is a refusal. *Legacy* (4.4.2, whole pixels): the width of the one-row box of every prefix less that of the character alone, **one run** (a script file when the graph is long, `kerf_core::spill_long_graph`);
+both read the text's box drawn at `y=ascent` for `text_w`, `text_h`, `ascent`.
 (2) `dictionary` (cached per glyph unit): each unit drawn alone, fill and border, at the four quarter-pixel phases (4 frames of `x=X0+mod(n,4)/4`,
 `y_align=baseline`, `y` = the phase) and where its bitmap lands against the pen and the baseline. **A shaped `drawtext` clips every bitmap to the text's box grown
 by `bb`** (a pixel more than the border, the box padding with a box), and a unit's bitmap overhangs its advance (the hook of an `f`): the dictionary is drawn
@@ -537,10 +539,14 @@ phases it can be are tried, likeliest first, each against (4).
 differently in context, a tab, a glyph that touches the edge of its dictionary cell, a font whose bitmaps do not reproduce, all end here.
 `Layers::of` flattens the sequence for the shader: per luma sample the coverage of each bitmap that touches it, in order (RGBA, four layers a pass), per chroma block each
 bitmap's own `sum >> 2`, in order; `text.wgsl` blends the layers one after the other (a bitmap's zero is `((K - 0) * d + 0) >> 24 = d`, no change), so a sample costs what it
-has bitmaps on it. The first sight of a state costs a few `ffmpeg` runs (measure, dictionary, the picture): 130 to 330 ms at 960 px in a debug build on lavapipe; the measure and the
-dictionary are shared by every position of the same text, so a title sliding in costs one run a frame as before. `text::model()` probes which layout the build has (the debug log of
-a two-letter `drawtext`: `width64` is Shaped, `text_w` Legacy; neither is `None`, retried after 30 s); `prepare(plan)` asks it ahead of a frame with text, `Compositor::caps` only reads the answer
-(`text::measured_model`).
+has bitmaps on it. The first sight of a state costs a few `ffmpeg` runs (measure, dictionary, the picture): 130 to 330 ms at 960 px in a debug build on lavapipe for a caption of a few dozen glyphs, and 1 to 2 s on 4.4.2 for 120 to 150 *distinct*
+glyphs (the measure is an instance of `drawtext` per row, each opens the font: 0.5 to 1.2 s of it); the measure and the
+dictionary are shared by every position of the same text, so a title sliding in costs one run a frame as before. A run is waited for 5 s and 25 ms an instance of `drawtext` it holds (20 s at most): one that does not finish is a refusal. `text::model()` probes which layout the build has (the debug log of
+a two-letter `drawtext`: `width64` is Shaped, `text_w` Legacy; neither is `None`, retried after 30 s) **and how it converts the text's colour** (`text::build()`: `Build { layout, colour }`);
+`prepare(plan)` asks it ahead of a frame with text, `Compositor::caps` only reads the answer (`text::measured_build`) and has `caps.text` only for a build it knows, so on any other every text frame is FFmpeg's.
+*Colour:* 6.1.1 and 9.0.2 convert in floating point (`draw_color`, the matrix' coefficients); **4.4.2 in libavutil's fixed-point `RGB_TO_Y_CCIR` macros** (10 bits, BT.601 whatever the tag; `draw_color_ccir`), a level off in Y for some colours
+(Aqua, Cyan, Ivory, LemonChiffon, Lime, MediumPurple, SkyBlue of the 140 names; 12 of the 83 the checker draws; lime at 0.5 opacity). The probe draws boxes in 14 colours the two give different planes for and compares each plane with what
+each model predicts for the blend of the box over the canvas; a build that matches neither has no text drawn on it. (`Raster::colour` carries the model to `blends`, which refuses the fixed-point one for a matrix other than BT.601.)
 The blend is `drawutils.c`'s integer arithmetic (the same in 4.4.2, 6.1.1 and 9.0.2), in u32:
 `((K - a) * d + a * s) >> 24` (`K = 0x1010101`), `a` = coverage x `(0x10307 * alpha + 3) >> 8` for luma and the 2x2 coverage sum
 `>> 2` for 4:2:0 chroma (a block sticking out of the bitmap counts only what is in it), `0x10203 * alpha + 2` for the box (half per
@@ -558,27 +564,30 @@ atlas does not hold is a pose of the drag (a new one per pointer move, never dra
 the same shader blends on the RGB picture and `composite_yuv` refuses such a plan rather than return planes without its text.
 
 *Verification.* `tests/text.rs` holds the sequence blended by the scalar reference (`blend_coverage` / `blend_rect`) to `drawtext`'s own `yuv420p` planes
-**sample for sample, 0 differing, on both FFmpegs** (4.4.2 Legacy and 9.0.2 Shaped): plain, boxed, odd offsets, edges, corners, wholly outside, opacity 0 to 0.99, hex / named /
-translucent colours, BT.709 and BT.2020, escapes, Cyrillic, missing glyphs, every size 3 to 24 px, a synthetic-bold border at 10 to 100 px (sentences, tight pairs, ligatures, translucent, boxed,
+**sample for sample, 0 differing and no allowance, on all three FFmpegs** (4.4.2 Legacy, 6.1.1 and 9.0.2 Shaped): plain, boxed, odd offsets, edges, corners, wholly outside, opacity 0 to 0.99, hex / named /
+translucent colours, BT.709 and BT.2020, escapes, Cyrillic, missing glyphs (their outline boxes were 1 to 2 samples off as a sum), every size 3 to 24 px, a synthetic-bold border at 10 to 100 px (sentences, tight pairs, ligatures, translucent, boxed,
 at the edges, at eight quarter-pixel phases) and four installed faces (DejaVu Sans / Serif, Ubuntu, Ubuntu Mono; plain and bold at 11 to 40 px) — each asserting the
-sequence was recovered (`Raster::exact`), not the sum drawn. `the_text_pass_is_the_reference_blend_plane_by_plane` holds the shader to the reference on the compositor's own planes
+sequence was recovered (`Raster::exact`). `text_checker.rs` and `motion_text_checker.rs` are an independent check of the same (16 and 2 tests: tabs, long texts, shapers that do not give a glyph a character, 22 installed faces, colours, sizes, canvases,
+positions, first sight): every case exact or refused, none drawn as a sum. `the_text_pass_is_the_reference_blend_plane_by_plane` holds the shader to the reference on the compositor's own planes
 (0 differing samples, 9 frames, 6 overlays, among them a border and 9 px print); `motion_parity` holds the export's own planes to the compositor's for small print and a
-thickened bold over a fade, sliding and fading (0 differing samples in 8 cases of 60 frames, `sum_fallbacks` unchanged); the `text/` parity cases hold the whole picture to the still, each against
-the same picture without the text, as before. (The earlier allowances, two glyph-edge pixels at 0.1 s, 12 px text and the full-range pictures on 9.0, are the same in the picture and not in the planes.)
+thickened bold over a fade, sliding and fading (0 differing samples in 8 cases of 60 frames); the `text/` parity cases hold the whole picture to the still, each against
+the same picture without the text, as before.
 
-*Refusals.* The plan (`Unsupported::Text*`) no longer refuses a **bold request in a font with no bold face** (`TextBorder`) nor a **font under 12 px** (`TextTooSmall`) when the caps have
-`text_sequence`, which `Compositor::caps` sets once `text::model()` knows the build's layout; on a build that is neither layout both stay refused and a text the plan draws is
-the one mask of the sum, as before (`Raster::exact` false, `text::sum_fallbacks`). What `seq::sequence` cannot reproduce exactly is `GpuError::Unsupported` for the frame (FFmpeg draws it); where the
-old mask was exact enough (no border, 12 px and up) the sum is blended instead and counted. A rasterisation that fails (or a colour FFmpeg cannot read) is `GpuError::Unsupported` for the
-frame. **Colour fonts**: `drawtext` loads glyphs without `FT_LOAD_COLOR` and has no BGRA path — a CBDT font (Noto Color Emoji) is a hard
+*Refusals.* **Nothing is drawn that is not proven**: the one mask of the sum, which `raster` once blended where the sequence could not be recovered for a large plain text, was up to 30 levels off exactly there
+(a tab, over 160 characters, a canvas too wide to measure, a glyph that does not shape one to a unit, Arabic and Hebrew, faces whose bitmaps overhang) and is gone; `text::rasterize` still makes it, for a test to measure, and `sum_fallbacks()` is 0.
+The plan refuses what it can tell (`Unsupported::TextSequence`, kind `text_sequence`: `kerf_core::text_sequence_limit` — a tab, over `MAX_SEQUENCE_CHARS` (160) characters, a text too wide for `MAX_MEASURE_SIDE`) and, without `caps.text`
+(a build whose layout or colour conversion the probe does not know, or has not run on), refuses every text (`Unsupported::Text`); a border (`TextBorder`) and print under 12 px (`TextTooSmall`) are no longer refusals of any kind.
+The render refuses the rest (`GpuError::Unsupported`: FFmpeg draws the frame): `seq::sequence` must reproduce the picture exactly; a run that fails, times out or writes too much; a face whose bitmaps touch the edge of the dictionary's cell
+(a script's swashes reach an em left of the pen and half an em above the ascent: the cell is 1 em left, 1.8 above, 1 below). Measured with the checker's 22 faces: Windows script and display faces are refused at many sizes
+(Segoe Script, Forte, Brush Script, Gabriola, Lucida Handwriting), and **Arial Narrow's Latin text on the shaped builds**, whose proof fails from the first glyph that follows a kerned space (A, T, f): suspected to be a GPOS placement (`x_offset`) that the debug log does not carry
+(pens are `width64 - advance`, the offset moves the bitmap and not the pen). Right-to-left text is refused on all three builds (4.4.2 reorders the whole string with fribidi; the shaped builds join and reorder). **Colour fonts**: `drawtext` loads glyphs without `FT_LOAD_COLOR` and has no BGRA path — a CBDT font (Noto Color Emoji) is a hard
 error on 6.1.1 (a segfault) and 9.0.2 at every size, so there is no colour glyph to draw as a silhouette; a COLR font is drawn by
-`drawtext` itself as monochrome outlines and the mask is exactly that (sbix and COLR were not available to test). Known costs, not fixed:
+`drawtext` itself as monochrome outlines and the bitmaps are exactly that (sbix and COLR were not available to test). Known costs, not fixed:
 the atlas key holds the sampled position at full precision, so a **keyframed slide-in rasterises per frame** (quantising it risks
-exactness), though its measure and dictionary are shared; a Windows profile path with non-ASCII characters reaches `fontfile` through FreeType's narrow open (not run on Windows);
-a text of over 160 characters, a tab, and a glyph unit that shapes into several glyphs are not taken apart. Over a full-range picture on 9.0 (text drawn in full range, converted last) the picture is within 2 levels of the control: drawn.
-**Builds differ**: 4.4.2 lays text out in whole pixels (`s->x`, `s->y` are ints, bitmaps rendered once at the origin, no clip window, `FT_Get_Kerning` of the `kern` table only), 9.0.2 in 26.6 with HarfBuzz
-(`s->x` a double, a bitmap per quarter pixel, `ascent` and `text_h` ceilings of 26.6 values, the clip window above); 4.4.2's `drawbox color=red` writes 254 on `rgb24` (`tests/text.rs`
-`colours_parse_as_ffmpeg_reads_them` fails there for that alone, and not on 9.0.2).
+exactness), though its measure and dictionary are shared; a Windows profile path with non-ASCII characters reaches `fontfile` through FreeType's narrow open (not run on Windows). Over a full-range picture on 9.0 (text drawn in full range, converted last) the picture is within 2 levels of the control: drawn.
+**Builds differ**: 4.4.2 lays text out in whole pixels (`s->x`, `s->y` are ints, bitmaps rendered once at the origin, no clip window, `FT_Get_Kerning` of the `kern` table only) and converts colours in fixed point; 6.1.1 and 9.0.2 in 26.6 with HarfBuzz
+(`s->x` a double, a bitmap per quarter pixel, `ascent` and `text_h` ceilings of 26.6 values, the clip window above) and in floating point; 6.1.1 already has the HarfBuzz layout (it was taken for the legacy one until a build was run) and 4.4.2's `drawbox color=red` writes 254 on `rgb24`
+(`colours_parse_as_ffmpeg_reads_them` reads colours through the `color` source for that reason).
 
 **Animated SVG titles (not drawn; what drawing one takes, measured).** ffmpeg never sees an SVG: `svg_layer.rs` draws each title with resvg into a straight-alpha RGBA PNG (`encode_frame_png`)
 and the graph `overlay`s it (`[cur][N:v]overlay=x:y`; an export adds `settb`/`setpts`, `eof_action=pass` and `enable='between(t,start,end)'`). The same resvg draws the same pixels in the compositor's
@@ -1010,9 +1019,8 @@ webcam bubble, a 4K thumbnail), T23a-e one teaser delivered as ProRes, GIF, lanc
 `travel`, `tail`, `keyed_opacity`, `keyed_color`, `keyed_zoom`, `mask`, `text` (drawn under `CAPS`), `no_picture` (the project keeps
 an audio-only asset off a video track), `text_without_font` (the shipped font cannot be written), `unmeasured_policy` (the probe
 cannot tell), and per build `grade` (kernels match) or `grade_with` (kernels differ), and under
-`FixedBt601` `mixed_matrices`, `matrix_unknown`, `rgb_in_stack`, `full_range_cut`, `graded_in_full_range_stack`; `text_border` and `text_too_small`
-are drawn once `text::model()` has probed this FFmpeg's `drawtext` (the header prints the layout, `Compositor::caps_with(kernels, layout)`;
-`text_border` needs an installed family without a bold face to be built at all).
+`FixedBt601` `mixed_matrices`, `matrix_unknown`, `rgb_in_stack`, `full_range_cut`, `graded_in_full_range_stack`, and `text_sequence` (a tab, over 160 characters or a canvas too wide to measure: no
+archetype has one; text itself is drawn once `text::build()` has probed this FFmpeg's `drawtext`, the header prints the layout, `Compositor::caps_with(kernels, layout)`).
 
 **`tests/fate_corpus.rs`** (`#[ignore]`d, and `KERF_FATE=1`: CI's parity job runs every ignored test and this one needs a network, so
 without the variable it skips with a message; `ffmpeg`, `ffprobe`, `curl`, no adapter) is hostile input from FFmpeg's FATE sample

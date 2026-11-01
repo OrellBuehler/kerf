@@ -4258,33 +4258,33 @@ fn text_the_gpu_cannot_reproduce_is_refused() {
     let mut plan = RenderPlan::at(&tl, assets, &ExportOptions::default(), 0.5, policy()).expect("plan");
     let size = plan.size(u32::MAX);
     assert!(reasons(&plan, size).is_empty(), "the control is drawn");
-    // Bold in a face with no bold (the plan marks it) and print under 12 px were refused for as long as
-    // text was one mask of the sum of the glyphs' bitmaps; `drawtext` blends them in turn, and so does the
-    // compositor now (`text_sequence`), on a build whose layout it can take apart (all but a machine whose
-    // FFmpeg is neither of the two it knows: the caps then say so and the plan refuses both again).
-    let with_sequence = compositor().caps().text_sequence;
+    // Bold in a face with no bold (the plan marks it) and print under 12 px were refused for as long as text
+    // was one mask of the sum of the glyphs' bitmaps; `drawtext` blends them in turn, and so does the
+    // compositor now, on a build whose `drawtext` it can take apart (`caps.text`).
+    assert!(compositor().caps().text, "this FFmpeg's drawtext is one the compositor knows");
     plan.overlays[0].synthetic_bold = true;
-    assert_eq!(reasons(&plan, size).is_empty(), with_sequence, "{:?}", reasons(&plan, size));
-    plan.overlays[0].size = 0.03;
-    assert_eq!(reasons(&plan, size).is_empty(), with_sequence, "{:?}", reasons(&plan, size));
-    if with_sequence {
-        compositor()
-            .render_plan(&plan, size)
-            .expect("a 11 px bold with a border is drawn");
-    } else {
-        let why = reasons(&plan, size).join("; ");
-        assert!(why.contains("no bold face") && why.contains("11 px font"), "{why}");
-        let err = compositor().render_plan(&plan, size).expect_err("the render should refuse");
-        assert!(matches!(err, kerf_gpu::GpuError::Unsupported(_)), "{err}");
-    }
+    assert!(reasons(&plan, size).is_empty(), "{:?}", reasons(&plan, size));
+    compositor().render_plan(&plan, size).expect("a bold with a border is drawn");
     plan.overlays[0].synthetic_bold = false;
+    plan.overlays[0].size = 0.03;
+    assert!(reasons(&plan, size).is_empty(), "{:?}", reasons(&plan, size));
+    compositor().render_plan(&plan, size).expect("an 11 px text is drawn");
     plan.overlays[0].size = 0.034;
-    assert!(reasons(&plan, size).is_empty(), "12 px and up is drawn");
+    // What the plan can tell cannot be taken apart is FFmpeg's: a tab, and a text of over 160 characters.
+    let text = plan.overlays[0].text.clone();
+    plan.overlays[0].text = "a\ttab".into();
+    let why = reasons(&plan, size).join("; ");
+    assert!(why.contains("a tab in the text"), "{why}");
+    plan.overlays[0].text = "word ".repeat(40);
+    let why = reasons(&plan, size).join("; ");
+    assert!(why.contains("200 characters of text"), "{why}");
+    plan.overlays[0].text = text;
+    assert!(reasons(&plan, size).is_empty(), "the control is drawn again");
     // A font file the plan cannot name (the default could not be written): FFmpeg's own default font.
     plan.overlays[0].font_file = None;
     let why = reasons(&plan, size).join("; ");
     assert!(why.contains("no font file"), "{why}");
-    eprintln!("refused/text: no font file; border and small text drawn: {with_sequence}");
+    eprintln!("refused/text: a tab, a long text, no font file; border and small text drawn");
 }
 
 #[test]

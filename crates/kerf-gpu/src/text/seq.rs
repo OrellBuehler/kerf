@@ -23,21 +23,23 @@
 //! is trusted: a sequence is returned only if blending it onto black gives, sample for sample, the
 //! picture FFmpeg drew for the same overlay at the same place.
 //!
-//! **Two layouts**, told apart by what the build says about itself ([`model`]):
+//! **Two layouts**, told apart by what the build says about itself ([`build`]):
 //!
-//! * [`Model::Shaped`] (HarfBuzz; measured on 9.0.2, which the Windows and macOS bundles ship): glyphs are
-//!   shaped per line, positions are 26.6 fixed point and a glyph's bitmap is rendered at the quarter pixel its position falls on. The debug
-//!   log of a multi-line `drawtext` gives the shaped width of every prefix of the text and the advance
-//!   of its last glyph, which is each glyph's pen; the baseline is `(int)(y * 64 + ascender)`, and the
-//!   ascender's fraction is not told, so the (at most five) quarter-pixel phases it can be are tried
+//! * [`Model::Shaped`] (HarfBuzz; measured on 6.1.1 and 9.0.2, which the Windows and macOS bundles ship): glyphs are
+//!   shaped per line, positions are 26.6 fixed point and a glyph's bitmap is rendered at the quarter pixel its
+//!   position falls on. The debug log of a multi-line `drawtext` gives the shaped width of every prefix of the text
+//!   and the advance of its last glyph, which is each glyph's pen; the baseline is `(int)(y * 64 + ascender)`, and
+//!   the ascender's fraction is not told, so the (at most five) quarter-pixel phases it can be are tried
 //!   against the picture. Ligatures are units of several characters.
-//! * [`Model::Legacy`] (no shaper; measured on 4.4.2; a build before the HarfBuzz rewrite of `drawtext` is
-//!   expected to be the same, and is judged by the proof below, not run here): one glyph per character, whole pixels, kerning from the `kern` table; the box of every
-//!   prefix of the text gives each glyph's pen.
+//! * [`Model::Legacy`] (no shaper; measured on 4.4.2): one glyph per character, whole pixels, kerning from the `kern`
+//!   table; the box of every prefix of the text gives each glyph's pen.
 //!
-//! A build that is neither (or a text this does not understand: tabs, glyphs that shape into
-//! something other than one glyph per unit, a font whose bitmaps touch the edge of their cell) is not
-//! handled, and the caller refuses the frame.
+//! and one of two **colour conversions** ([`ColourModel`]; 4.4.2's is fixed point), told by the same probe.
+//!
+//! A build that is none of these (or a text this does not understand: tabs, glyphs that shape into something
+//! other than one glyph per unit, a glyph whose placement is not its pen (a GPOS offset), a font whose bitmaps touch
+//! the edge of their cell, a run that timed out) is not handled: the caller refuses the frame, and FFmpeg draws it.
+//! **Nothing is returned that was not proven.**
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock, PoisonError};
@@ -45,9 +47,10 @@ use std::time::{Duration, Instant};
 
 use kerf_core::{PlanText, TextPiece};
 
-use super::{Bitmap, RASTER_TIMEOUT};
+use super::{Bitmap, ColourModel, RASTER_TIMEOUT};
 use crate::gpu::GpuError;
 use crate::source::{run_child_logged, RunError};
+use kerf_core::YuvMatrix;
 
 /// How this build of FFmpeg lays `drawtext` text out.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,22 +64,30 @@ pub enum Model {
 /// The most debug log read from a measuring run: a few dozen lines of ours among FFmpeg's own.
 const LOG_CAP: usize = 4 << 20;
 
-/// What a graph handed to `ffmpeg` as one argument may be: the 32 767 characters a Windows command line
-/// allows, less the rest of the arguments.
+/// What a graph that must stay in argv may be (one with a line feed in a quoted value: the shaped measure;
+/// the rest go through a script file when they are long, [`kerf_core::spill_long_graph`]): the 32 767
+/// characters a Windows command line allows, less the rest of the arguments.
 const MAX_GRAPH: usize = 24 << 10;
 
-/// The most characters of a text measured and drawn piece by piece.
-const MAX_CHARS: usize = 160;
+/// The most instances of `drawtext` one run holds (two per character of the longest text, and the box).
+const MAX_INSTANCES: usize = 2 * kerf_core::MAX_SEQUENCE_CHARS + 8;
 
 /// The most bytes one dictionary run may read back.
 const MAX_DICTIONARY_BYTES: usize = 48 << 20;
+
+/// How long a run of `ffmpeg` may take besides the [`RASTER_TIMEOUT`] it always has: per instance of `drawtext`
+/// in its graph (each opens the font), up to [`MAX_RUN`]. A run that is still going then is a refusal.
+const PER_INSTANCE: Duration = Duration::from_millis(25);
+
+/// The longest a run of `ffmpeg` is waited for.
+const MAX_RUN: Duration = Duration::from_secs(20);
 
 /// The margin of the invisible box a dictionary unit is drawn in, in pixels: the clip window of a
 /// shaped `drawtext` is the text's box grown by it.
 const WINDOW_MARGIN: u32 = 24;
 
-/// How many glyph units one dictionary run draws (half as many with a border, which draws each twice).
-const UNITS_PER_RUN: usize = 40;
+/// The most glyph units one dictionary run draws.
+const UNITS_PER_RUN: usize = 400;
 
 fn locked<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(PoisonError::into_inner)
@@ -86,18 +97,27 @@ fn unsupported(why: impl Into<String>) -> GpuError {
     GpuError::Unsupported(why.into())
 }
 
-// ---- which layout ----------------------------------------------------------------
+// ---- which build -------------------------------------------------------------------
+
+/// What this process's FFmpeg does with text that the compositor has to match: how `drawtext` lays it out
+/// and how it converts its colour.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Build {
+    pub layout: Model,
+    pub colour: ColourModel,
+}
 
 /// How long a probe that could not tell is believed.
 const RETRY_AFTER: Duration = Duration::from_secs(30);
 
-static ANSWER: Mutex<Option<(Instant, Option<Model>)>> = Mutex::new(None);
+static ANSWER: Mutex<Option<(Instant, Option<Build>)>> = Mutex::new(None);
 
-/// The layout of this process's FFmpeg, probed once (a run of a few milliseconds that reads the debug
-/// log of `drawtext`); `None` when it is neither layout or the probe could not run (retried after
-/// [`RETRY_AFTER`]). Blocks on the first call: callers are on blocking threads, off the render lock
-/// ([`crate::prepare`] asks ahead of the frame that needs it).
-pub fn model() -> Option<Model> {
+/// The layout and colour conversion of this process's FFmpeg, probed once (a few runs of a few
+/// milliseconds: the debug log of `drawtext`, and boxes of colours that the two conversions give different
+/// planes for); `None` when it is neither layout, or converts colours in neither way, or the probe could not
+/// run (retried after [`RETRY_AFTER`]): no text is drawn on such a build. Blocks on the first call: callers
+/// are on blocking threads, off the render lock ([`crate::prepare`] asks ahead of the frame that needs it).
+pub fn build() -> Option<Build> {
     {
         let held = locked(&ANSWER);
         if let Some((at, answer)) = *held {
@@ -106,20 +126,30 @@ pub fn model() -> Option<Model> {
             }
         }
     }
-    let answer = probe_model();
+    let answer = probe_build();
     *locked(&ANSWER) = Some((Instant::now(), answer));
     answer
 }
 
-/// What is known without running anything: the probed layout, else `None` (not probed yet, or a probe that
+/// [`build`]'s layout.
+pub fn model() -> Option<Model> {
+    build().map(|b| b.layout)
+}
+
+/// What is known without running anything: the probed build, else `None` (not probed yet, or a probe that
 /// could not tell). What a plan's caps are made from ([`crate::Compositor::caps`]): a plan does not wait for a probe.
-pub fn measured_model() -> Option<Model> {
+pub fn measured_build() -> Option<Build> {
     locked(&ANSWER).and_then(|(_, answer)| answer)
 }
 
-fn probe_model() -> Option<Model> {
-    let font = kerf_core::fonts::default_font_file(false)?;
-    let sample = PlanText {
+/// [`measured_build`]'s layout.
+pub fn measured_model() -> Option<Model> {
+    measured_build().map(|b| b.layout)
+}
+
+/// A text for the probes to hang their `drawtext`s on.
+fn sample_text(font: std::path::PathBuf) -> PlanText {
+    PlanText {
         id: uuid::Uuid::nil(),
         text: "ab".into(),
         size: 0.3,
@@ -129,9 +159,21 @@ fn probe_model() -> Option<Model> {
         bg: None,
         font_file: Some(font),
         synthetic_bold: false,
-    };
+    }
+}
+
+fn probe_build() -> Option<Build> {
+    let font = kerf_core::fonts::default_font_file(false)?;
+    let sample = sample_text(font);
+    Some(Build {
+        layout: probe_layout(&sample)?,
+        colour: probe_colour(&sample)?,
+    })
+}
+
+fn probe_layout(sample: &PlanText) -> Option<Model> {
     let filter = kerf_core::text_piece_filter(
-        &sample,
+        sample,
         64,
         &TextPiece {
             text: "ab",
@@ -143,8 +185,7 @@ fn probe_model() -> Option<Model> {
         &["x=0", "y=0"],
     );
     let graph = format!("color=c=black:s=64x64:r=1:d=1,format=rgb24,{filter}[o]");
-    let mut args = args_for(&graph, &[("o", false)], true);
-    let (_, log) = run(&mut args, 1 << 10).ok()?;
+    let (_, log) = run_graph(&graph, &[("o", None)], true, 1, 1 << 10, 1, false).ok()?;
     if log
         .lines()
         .any(|l| l.contains("Line:") && l.contains("width64:") && l.contains("glyphs count:"))
@@ -152,6 +193,95 @@ fn probe_model() -> Option<Model> {
         Some(Model::Shaped)
     } else if log.lines().any(|l| l.contains("text_w:") && l.contains("text_h:")) {
         Some(Model::Legacy)
+    } else {
+        None
+    }
+}
+
+/// The colours the probe draws: the named colours the two conversions give different planes for, then
+/// colours from a fixed pseudo-random walk of RGB where they differ, fourteen in all.
+pub(super) fn probe_colours() -> Vec<[u8; 3]> {
+    let differs = |rgb: &[u8; 3]| super::draw_color(*rgb, YuvMatrix::Bt601) != super::draw_color_ccir(*rgb);
+    let mut out: Vec<[u8; 3]> = super::COLOR_NAMES.iter().map(|(_, rgb)| *rgb).filter(differs).collect();
+    let mut state = 0x2545_f491_u32;
+    while out.len() < PROBE_COLOURS {
+        state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        let rgb = [(state >> 24) as u8, (state >> 16) as u8, (state >> 8) as u8];
+        if differs(&rgb) && !out.contains(&rgb) {
+            out.push(rgb);
+        }
+    }
+    out.truncate(PROBE_COLOURS);
+    out
+}
+
+/// How many colours the colour probe draws.
+const PROBE_COLOURS: usize = 14;
+
+/// Which conversion `drawtext` makes of a colour, told by drawing boxes in colours the two disagree on
+/// ([`draw_color`] against [`draw_color_ccir`]: a level off in Y for a few of the named colours and one in
+/// twenty of the rest) and comparing the planes with what each conversion predicts for the blend of the box over the canvas. A build
+/// that matches neither is not one text is drawn on.
+fn probe_colour(sample: &PlanText) -> Option<ColourModel> {
+    const TILE: usize = 96;
+    let asked: Vec<([u8; 3], String)> = probe_colours()
+        .into_iter()
+        .map(|rgb| (rgb, format!("#{:02x}{:02x}{:02x}", rgb[0], rgb[1], rgb[2])))
+        .collect();
+    let n = asked.len();
+    let outs: String = (0..n).map(|i| format!("[c{i}]")).collect();
+    let branches: Vec<String> = asked
+        .iter()
+        .enumerate()
+        .map(|(i, (_, hex))| {
+            let filter = kerf_core::text_piece_filter(
+                sample,
+                TILE as u32,
+                &TextPiece {
+                    text: "x",
+                    lines: false,
+                    font: HIDDEN,
+                    border: None,
+                    boxed: Some((hex, 20)),
+                },
+                &["x=22", "y=22"],
+            );
+            format!("[c{i}]{filter}[t{i}]")
+        })
+        .collect();
+    let stacked: String = (0..n).map(|i| format!("[t{i}]")).collect();
+    let graph = format!(
+        "color=c=black:s={TILE}x{TILE}:r=1:d=1,format=yuv420p,split={n}{outs};{};{stacked}vstack=inputs={n}[o]",
+        branches.join(";")
+    );
+    let (planes, _) = run_graph_pix(&graph, "yuv420p", n * TILE * TILE * 3 / 2, n).ok()?;
+    let (ys, cs) = (n * TILE * TILE, n * TILE * TILE / 4);
+    if planes.len() != ys + 2 * cs {
+        return None;
+    }
+    // A tile's untouched corner is the canvas the box was blended over, a point inside the box the result.
+    let at = |plane: usize, i: usize, x: usize, y: usize| match plane {
+        0 => planes[(i * TILE + y) * TILE + x],
+        p => planes[ys + (p - 1) * cs + (i * TILE / 2 + y / 2) * (TILE / 2) + x / 2],
+    };
+    // The box is blended in with `ff_blend_rectangle`'s alpha for an opaque colour.
+    let alpha = 0x10203 * 255 + 2;
+    let matches = |model: ColourModel| {
+        asked.iter().enumerate().all(|(i, (rgb, _))| {
+            let Some(want) = super::draw_color_with(model, *rgb, YuvMatrix::Bt601) else {
+                return false;
+            };
+            (0..3).all(|p| {
+                let before = at(p, i, TILE - 2, TILE - 2);
+                at(p, i, 24, 24) == super::mix(before, alpha, want[p])
+            })
+        })
+    };
+    // Float first: it is the one the builds that draw text for most users have.
+    if matches(ColourModel::Float) {
+        Some(ColourModel::Float)
+    } else if matches(ColourModel::Ccir) {
+        Some(ColourModel::Ccir)
     } else {
         None
     }
@@ -275,15 +405,16 @@ fn measures() -> &'static Mutex<Lru<Measure>> {
 }
 
 /// The pixel size of the font an overlay is drawn in on a frame `frame_h` high.
-fn font_px(t: &PlanText, frame_h: u32) -> u32 {
+pub(super) fn font_px(t: &PlanText, frame_h: u32) -> u32 {
     (f64::from(frame_h) * t.size).round().max(1.0) as u32
 }
 
-/// A canvas a text of `n` characters at `px` fits on, for measuring.
+/// A canvas a text of `n` characters at `px` fits on, for measuring ([`kerf_core::text_sequence_limit`] has
+/// refused the text that does not fit [`kerf_core::MAX_MEASURE_SIDE`]).
 fn probe_canvas(px: u32, n: usize) -> Result<(u32, u32), GpuError> {
     let w = (f64::from(px) * 1.8 * n as f64).ceil() + 64.0;
     let h = f64::from(px) * 3.0 + 64.0;
-    if w > 16_384.0 || h > 16_384.0 {
+    if w > kerf_core::MAX_MEASURE_SIDE || h > kerf_core::MAX_MEASURE_SIDE {
         return Err(unsupported(format!(
             "a {px} px text of {n} characters is too large to measure"
         )));
@@ -294,9 +425,34 @@ fn probe_canvas(px: u32, n: usize) -> Result<(u32, u32), GpuError> {
 const SHOWN: &str = "white";
 const HIDDEN: &str = "white@0";
 
-/// The arguments of a run of `graph`: the debug log (`debug`: what the measure reads) or only errors, and
-/// one output per `(label, raw)`, a gray picture on the pipe or nothing.
-fn args_for(graph: &str, outputs: &[(&str, bool)], debug: bool) -> Vec<String> {
+/// Run `graph` and read its outputs, `(label, pix_fmt)`: a raw picture on the pipe in that format, or
+/// (`None`) nothing. `debug` asks for the debug log, which a measure reads; `frames` is how many frames each
+/// output takes; `cap` how many bytes may come back; `work` how many instances of `drawtext` the graph
+/// holds, which sets how long it is waited for; `spill` moves a graph too long for argv into a script
+/// file (not one with a line feed in a quoted value). A run that does not finish, or writes more than
+/// `cap`, is `GpuError::Unsupported`: FFmpeg draws that frame.
+fn run_graph(
+    graph: &str,
+    outputs: &[(&str, Option<&str>)],
+    debug: bool,
+    frames: usize,
+    cap: usize,
+    work: usize,
+    spill: bool,
+) -> Result<(Vec<u8>, String), GpuError> {
+    let timeout = (RASTER_TIMEOUT + PER_INSTANCE * work.min(MAX_INSTANCES) as u32).min(MAX_RUN);
+    run_graph_within(timeout, graph, outputs, debug, frames, cap, spill)
+}
+
+fn run_graph_within(
+    timeout: Duration,
+    graph: &str,
+    outputs: &[(&str, Option<&str>)],
+    debug: bool,
+    frames: usize,
+    cap: usize,
+    spill: bool,
+) -> Result<(Vec<u8>, String), GpuError> {
     let mut args: Vec<String> = ["-hide_banner", "-nostats", "-nostdin", "-loglevel"]
         .iter()
         .map(|s| (*s).to_string())
@@ -304,29 +460,38 @@ fn args_for(graph: &str, outputs: &[(&str, bool)], debug: bool) -> Vec<String> {
     args.push(if debug { "debug" } else { "error" }.into());
     args.push("-filter_complex".into());
     args.push(graph.to_string());
-    for (label, raw) in outputs {
+    for (label, pix_fmt) in outputs {
         args.push("-map".into());
         args.push(format!("[{label}]"));
         args.push("-frames:v".into());
-        args.push("1".into());
-        if *raw {
-            args.extend(["-f", "rawvideo", "-pix_fmt", "gray", "pipe:1"].map(String::from));
-        } else {
-            args.extend(["-f", "null", "-"].map(String::from));
+        args.push(frames.to_string());
+        match pix_fmt {
+            Some(fmt) => args.extend(["-f", "rawvideo", "-pix_fmt", fmt, "pipe:1"].map(String::from)),
+            None => args.extend(["-f", "null", "-"].map(String::from)),
         }
     }
-    args
-}
-
-fn run(args: &mut Vec<String>, cap: usize) -> Result<(Vec<u8>, String), GpuError> {
-    kerf_core::limit_frame_args(args, 1);
+    kerf_core::limit_frame_args(&mut args, 1);
+    let _script = if spill {
+        Some(
+            kerf_core::spill_long_graph(&mut args, "text")
+                .map_err(|e| unsupported(format!("could not write the text's graph: {e}")))?,
+        )
+    } else {
+        None
+    };
     let mut cmd = kerf_core::ffmpeg_command();
     cmd.args(args.iter());
-    let (out, log) = run_child_logged(cmd, cap, LOG_CAP, RASTER_TIMEOUT).map_err(|e| match e {
-        RunError::Overflow => GpuError::Decode("a text run wrote more than its canvas".into()),
+    let (out, log) = run_child_logged(cmd, cap, LOG_CAP, timeout).map_err(|e| match e {
+        RunError::Overflow => unsupported("a text run wrote more than its canvas"),
         RunError::Failed(why) => unsupported(format!("FFmpeg could not measure the text: {why}")),
     })?;
     Ok((out, String::from_utf8_lossy(&log).into_owned()))
+}
+
+/// [`run_graph`] for one picture out, `[o]`, in `pix_fmt`, over `frames` frames.
+fn run_graph_pix(graph: &str, pix_fmt: &str, cap: usize, frames: usize) -> Result<(Vec<u8>, String), GpuError> {
+    let _ = frames;
+    run_graph(graph, &[("o", Some(pix_fmt))], false, 1, cap, 16, false)
 }
 
 /// The number after `key` in `line`.
@@ -342,12 +507,55 @@ fn measure(t: &PlanText, frame_h: u32, chars: &[char], model: Model) -> Result<A
     if let Some(m) = locked(measures()).get(&key) {
         return Ok(m);
     }
-    let made = Arc::new(match model {
-        Model::Shaped => measure_shaped(t, frame_h, chars)?,
-        Model::Legacy => measure_legacy(t, frame_h, chars)?,
-    });
+    let failed = format!("measure|{key}");
+    if let Some(e) = remembered(&failed) {
+        return Err(e);
+    }
+    let made = match model {
+        Model::Shaped => measure_shaped(t, frame_h, chars),
+        Model::Legacy => measure_legacy(t, frame_h, chars),
+    };
+    let made = match made {
+        Ok(m) => Arc::new(m),
+        Err(e) => {
+            remember(failed, &e);
+            return Err(e);
+        }
+    };
     locked(measures()).put(key, std::mem::size_of::<Measure>() + made.units.len() * 48, Arc::clone(&made));
     Ok(made)
+}
+
+/// How long a run that failed is not tried again: a font on a slow disk, a machine under load, a text no
+/// measure can take apart. Every frame of a title would otherwise wait out the same timeout, under the
+/// render lock.
+const FAILURE_MEMORY: Duration = Duration::from_secs(30);
+
+fn failures() -> &'static Mutex<HashMap<String, (Instant, String)>> {
+    static F: OnceLock<Mutex<HashMap<String, (Instant, String)>>> = OnceLock::new();
+    F.get_or_init(Default::default)
+}
+
+/// The refusal a run earned less than `memory` ago, if it did.
+fn remembered_within(key: &str, memory: Duration) -> Option<GpuError> {
+    let held = locked(failures());
+    let (at, why) = held.get(key)?;
+    (at.elapsed() < memory).then(|| unsupported(format!("{why} (not tried again yet)")))
+}
+
+fn remembered(key: &str) -> Option<GpuError> {
+    remembered_within(key, FAILURE_MEMORY)
+}
+
+fn remember(key: String, e: &GpuError) {
+    let mut held = locked(failures());
+    if held.len() >= 256 {
+        held.retain(|_, (at, _)| at.elapsed() < FAILURE_MEMORY);
+        if held.len() >= 256 {
+            held.clear();
+        }
+    }
+    held.insert(key, (Instant::now(), e.to_string()));
 }
 
 /// The box `drawtext` draws behind the whole text with its top left at `(0, ascent)`: the text's
@@ -379,8 +587,7 @@ fn measure_shaped(t: &PlanText, frame_h: u32, chars: &[char]) -> Result<Measure,
             boxed: None,
         },
         &["x=0", "y=0"],
-    )
-    .replacen("drawtext=", "drawtext@kerfmeasure=", 1);
+    );
     let boxed = kerf_core::text_piece_filter(
         t,
         frame_h,
@@ -399,31 +606,20 @@ fn measure_shaped(t: &PlanText, frame_h: u32, chars: &[char]) -> Result<Measure,
     if graph.len() > MAX_GRAPH {
         return Err(unsupported("a text too long to measure"));
     }
-    let mut args = args_for(&graph, &[("l", false), ("b", true)], true);
-    let (plane, log) = run(&mut args, (pw * ph) as usize)?;
+    let (plane, log) = run_graph(
+        &graph,
+        &[("l", None), ("b", Some("gray"))],
+        true,
+        1,
+        (pw * ph) as usize,
+        2,
+        false,
+    )?;
     if plane.len() != (pw * ph) as usize {
-        return Err(GpuError::Decode("the text's box came back at the wrong size".into()));
+        return Err(unsupported("the text's box came back at the wrong size"));
     }
     let (text_w, text_h, ascent) = read_box(&plane, pw as usize, ph as usize)?;
-
-    // One log line per prefix: `Line: k -- glyphs count: g - width64: w - offset_left64: l - offset_right64: r)`.
-    let rows: Vec<(i32, i32, i32)> = log
-        .lines()
-        .filter(|l| l.contains("drawtext@kerfmeasure") && l.contains("width64:"))
-        .filter_map(|l| {
-            Some((
-                field(l, "glyphs count:")?,
-                field(l, "width64:")?,
-                field(l, "offset_right64:")?,
-            ))
-        })
-        .collect();
-    if rows.len() != n {
-        return Err(unsupported(format!(
-            "FFmpeg logged {} lines for {n} prefixes of the text",
-            rows.len()
-        )));
-    }
+    let rows = shaped_rows(&log, n)?;
     let units = units_of(chars, &rows)?;
     if (rows[n - 1].1 + 63) / 64 != text_w {
         return Err(unsupported("the text's width and its box disagree"));
@@ -434,6 +630,52 @@ fn measure_shaped(t: &PlanText, frame_h: u32, chars: &[char]) -> Result<Measure,
         ascent,
         units,
     })
+}
+
+/// The log lines of the shaper for a text of `n` prefixes, `(glyph count, width64, last advance64)` each:
+/// `Line: k -- glyphs count: g - width64: w - offset_left64: l - offset_right64: r)`. The lines are told
+/// apart by what they say and not by whose they are (a build prints `[drawtext @ 0x…]` whatever the
+/// instance is called, another `[drawtext@name @ 0x…]`): each `drawtext` that draws logs its lines, from
+/// `Line: 0` on, together, so the log is cut at every `Line: 0`, and the group of `n` lines numbered
+/// `0..n` is the multi-line instance's. (The box probe logs a group of its own: one line, the whole
+/// text, which for `n = 1` is the same line.) No such group, or two that differ, is a refusal.
+fn shaped_rows(log: &str, n: usize) -> Result<Vec<(i32, i32, i32)>, GpuError> {
+    let mut groups: Vec<Vec<(i32, i32, i32)>> = Vec::new();
+    let mut next = 0;
+    for l in log.lines().filter(|l| l.contains("width64:")) {
+        let (Some(k), Some(g), Some(w), Some(r)) = (
+            field(l, "Line:"),
+            field(l, "glyphs count:"),
+            field(l, "width64:"),
+            field(l, "offset_right64:"),
+        ) else {
+            continue;
+        };
+        if k == 0 {
+            groups.push(Vec::new());
+            next = 0;
+        }
+        if k != next {
+            // A line out of order: that group is not one `drawtext` drew.
+            next = -1;
+        }
+        if let Some(group) = groups.last_mut() {
+            if next >= 0 {
+                group.push((g, w, r));
+                next += 1;
+            }
+        }
+    }
+    let mut whole = groups.into_iter().filter(|g| g.len() == n);
+    let rows = whole.next().ok_or_else(|| {
+        unsupported(format!(
+            "FFmpeg logged no group of {n} lines for the {n} prefixes of the text"
+        ))
+    })?;
+    if whole.any(|other| other != rows) {
+        return Err(unsupported("FFmpeg logged two different shapings of the text"));
+    }
+    Ok(rows)
 }
 
 /// The glyph units of `chars` from the shaper's log, one `(glyph count, width64, last advance64)` per
@@ -498,61 +740,40 @@ fn measure_legacy(t: &PlanText, frame_h: u32, chars: &[char]) -> Result<Measure,
         .filter(|k| !blank(chars[*k]))
         .map(|k| (k, ask(chars[..=k].iter().collect()), ask(chars[k].to_string())))
         .collect();
-    let mut widths: Vec<i32> = Vec::with_capacity(asked.len());
-    let mut whole: Option<(i32, i32, i32)> = None;
-    let mut from = 0;
-    while from < asked.len() || whole.is_none() {
-        // As many strings as the graph's length allows; the first run also draws the whole text's box at
-        // `ascent`, for its width and height and the baseline.
-        let mut take = 0;
-        let mut size = 0;
-        while from + take < asked.len() && (take == 0 || size < MAX_GRAPH * 3 / 4) {
-            size += asked[from + take].len() + 240;
-            take += 1;
-        }
-        let with_box = whole.is_none();
-        // `vstack` wants two inputs at least: a lone string is asked twice.
-        let rows = if with_box { take } else { take.max(2) };
-        let inputs = rows + usize::from(with_box);
-        let outs: String = (0..inputs).map(|i| format!("[m{i}]")).collect();
-        let mut branches: Vec<String> = (0..rows)
-            .map(|i| {
-                let text = &asked[from + i.min(take.saturating_sub(1))];
-                format!("[m{i}]{},crop={pw}:1:0:0,extractplanes=r[r{i}]", box_of(text, "x=0:y=0"))
-            })
-            .collect();
-        if with_box {
-            branches.push(format!("[m{rows}]{},extractplanes=r[r{rows}]", box_of(&full, AT_ASCENT)));
-        }
-        let stacked: String = (0..inputs).map(|i| format!("[r{i}]")).collect();
-        let graph = format!(
-            "color=c=black:s={pw}x{ph}:r=1:d=1,format=rgb24,split={inputs}{outs};{};{stacked}vstack=inputs={inputs}[o]",
-            branches.join(";")
-        );
-        if graph.len() > MAX_GRAPH {
-            return Err(unsupported("a text too long to measure"));
-        }
-        let want = pw as usize * (rows + if with_box { ph as usize } else { 0 });
-        let mut args = args_for(&graph, &[("o", true)], false);
-        let (out, _) = run(&mut args, want)?;
-        if out.len() != want {
-            return Err(GpuError::Decode("the text's widths came back short".into()));
-        }
-        for row in out.chunks_exact(pw as usize).take(take) {
-            let w = row.iter().take_while(|v| **v != 0).count();
-            if row[w..].iter().any(|v| *v != 0) {
-                return Err(unsupported("a text's box was not one piece"));
-            }
-            widths.push(w as i32);
-        }
-        if with_box {
-            whole = Some(read_box(&out[pw as usize * rows..], pw as usize, ph as usize)?);
-        }
-        from += take;
+    // One run holds every row and the whole text's box at `ascent` (its width and height, and the baseline):
+    // a graph of an instance of `drawtext` per row, which goes through a script file when it is long.
+    if asked.is_empty() {
+        return Err(unsupported("a text with nothing to measure"));
     }
-    let Some((text_w, text_h, ascent)) = whole else {
-        return Err(unsupported("the text could not be measured"));
-    };
+    let rows = asked.len().max(2);
+    let inputs = rows + 1;
+    let outs: String = (0..inputs).map(|i| format!("[m{i}]")).collect();
+    let mut branches: Vec<String> = (0..rows)
+        .map(|i| {
+            let text = &asked[i.min(asked.len().saturating_sub(1))];
+            format!("[m{i}]{},crop={pw}:1:0:0,extractplanes=r[r{i}]", box_of(text, "x=0:y=0"))
+        })
+        .collect();
+    branches.push(format!("[m{rows}]{},extractplanes=r[r{rows}]", box_of(&full, AT_ASCENT)));
+    let stacked: String = (0..inputs).map(|i| format!("[r{i}]")).collect();
+    let graph = format!(
+        "color=c=black:s={pw}x{ph}:r=1:d=1,format=rgb24,split={inputs}{outs};{};{stacked}vstack=inputs={inputs}[o]",
+        branches.join(";")
+    );
+    let want = pw as usize * (rows + ph as usize);
+    let (out, _) = run_graph(&graph, &[("o", Some("gray"))], false, 1, want, inputs, true)?;
+    if out.len() != want {
+        return Err(unsupported("the text's widths came back short"));
+    }
+    let mut widths: Vec<i32> = Vec::with_capacity(asked.len());
+    for row in out.chunks_exact(pw as usize).take(asked.len()) {
+        let w = row.iter().take_while(|v| **v != 0).count();
+        if row[w..].iter().any(|v| *v != 0) {
+            return Err(unsupported("a text's box was not one piece"));
+        }
+        widths.push(w as i32);
+    }
+    let (text_w, text_h, ascent) = read_box(&out[pw as usize * rows..], pw as usize, ph as usize)?;
     let mut pens: HashMap<usize, i32> = HashMap::new();
     for (k, prefix, own) in &wanted {
         let (w, a) = (widths[*prefix], widths[*own]);
@@ -620,12 +841,15 @@ struct Cell {
 }
 
 fn cell(px: u32, chars: usize) -> Cell {
+    // Room for what a face puts outside its em box: a script's swashes reach a whole em to the left of the
+    // pen and a half above the ascent, its descenders a half below; a bitmap that still touches the edge of
+    // its cell is refused ([`shape_of`]).
     let s = f64::from(px);
-    let x0 = (s * 0.6).ceil() as i32 + 8;
-    let y0 = (s * 1.25).ceil() as i32 + 8;
+    let x0 = s.ceil() as i32 + 8;
+    let y0 = (s * 1.8).ceil() as i32 + 8;
     Cell {
-        w: (f64::from(x0) + s * 1.4 * chars as f64).ceil() as u32 + 8,
-        h: (f64::from(y0) + s * 0.6).ceil() as u32 + 8,
+        w: (f64::from(x0) + s * 1.6 * chars as f64).ceil() as u32 + 8,
+        h: (f64::from(y0) + s).ceil() as u32 + 8,
         x0,
         y0,
     }
@@ -652,8 +876,26 @@ fn dictionary(
             None => missing.push(u),
         }
     }
-    for chunk in missing.chunks(UNITS_PER_RUN / (1 + usize::from(t.synthetic_bold))) {
-        let drawn = draw_dictionary(t, frame_h, model, qy, chunk)?;
+    // As many units to a run as the bytes it reads back allow: a cell is `cell(px, 1)` big (a ligature's is wider).
+    let c = cell(px, 1);
+    let per_unit =
+        c.w as usize * c.h as usize * 2 * (1 + usize::from(t.synthetic_bold)) * if model == Model::Shaped { 4 } else { 1 };
+    let per_run = (MAX_DICTIONARY_BYTES / per_unit.max(1)).clamp(1, UNITS_PER_RUN);
+    for chunk in missing.chunks(per_run) {
+        let failed = format!(
+            "dictionary|{base}|{}",
+            chunk.iter().map(|u| u.as_str()).collect::<Vec<_>>().join("\u{1}")
+        );
+        if let Some(e) = remembered(&failed) {
+            return Err(e);
+        }
+        let drawn = match draw_dictionary(t, frame_h, model, qy, chunk) {
+            Ok(d) => d,
+            Err(e) => {
+                remember(failed, &e);
+                return Err(e);
+            }
+        };
         for (u, entry) in chunk.iter().zip(drawn) {
             let entry = Arc::new(entry);
             locked(dictionaries()).put(format!("{base}|{u}"), entry.bytes(), Arc::clone(&entry));
@@ -736,17 +978,9 @@ fn draw_dictionary(t: &PlanText, frame_h: u32, model: Model, qy: i32, units: &[&
         c.h,
         branches.join(";")
     );
-    if graph.len() > MAX_GRAPH {
-        return Err(unsupported("a dictionary graph too long for one run"));
-    }
-    let mut args = args_for(&graph, &[("o", true)], false);
-    // `-frames:v 1` from `args_for` is one frame; a phase sweep wants all of them.
-    if let Some(at) = args.iter().position(|a| a == "-frames:v") {
-        args[at + 1] = frames.to_string();
-    }
-    let (out, _) = run(&mut args, frame_bytes * frames)?;
+    let (out, _) = run_graph(&graph, &[("o", Some("gray"))], false, frames, frame_bytes * frames, k, true)?;
     if out.len() != frame_bytes * frames {
-        return Err(GpuError::Decode(format!(
+        return Err(unsupported(format!(
             "{} bytes of dictionary for {} expected",
             out.len(),
             frame_bytes * frames
@@ -866,11 +1100,8 @@ pub(super) fn sequence(t: &PlanText, size: (u32, u32), ink: &[u8]) -> Result<Vec
     let model = model().ok_or_else(|| unsupported("this FFmpeg's text layout is not one the compositor knows"))?;
     let drawn = kerf_core::text_as_drawn(&t.text);
     let chars: Vec<char> = drawn.chars().collect();
-    if chars.contains(&'\t') {
-        return Err(unsupported("a tab in the text"));
-    }
-    if chars.len() > MAX_CHARS {
-        return Err(unsupported("a text too long to take apart"));
+    if let Some(why) = kerf_core::text_sequence_limit(&t.text, Some(font_px(t, size.1))) {
+        return Err(unsupported(why));
     }
     let (w, h) = (size.0 as i32, size.1 as i32);
     if chars.iter().all(|c| blank(*c)) {
@@ -898,7 +1129,7 @@ pub(super) fn sequence(t: &PlanText, size: (u32, u32), ink: &[u8]) -> Result<Vec
     }
     let (wu, hu) = (w as usize, h as usize);
     if ink.len() != wu * hu {
-        return Err(GpuError::Decode("the text's picture is not the canvas".into()));
+        return Err(unsupported("the text's picture is not the canvas"));
     }
     match model {
         Model::Legacy => {
@@ -1072,6 +1303,44 @@ mod tests {
     }
 
     #[test]
+    fn the_shapers_lines_are_found_whoever_logs_them() {
+        let line = |who: &str, k: i32, g: i32, w: i32| {
+            format!("[{who} @ 0x55]   Line: {k} -- glyphs count: {g} - width64: {w} - offset_left64: 9 - offset_right64: {w})")
+        };
+        let prefixes = |who: &str| -> Vec<String> { (0..3).map(|k| line(who, k, k + 1, 100 * (k + 1))).collect() };
+        let want = vec![(1, 100, 100), (2, 200, 200), (3, 300, 300)];
+        // 9.0.2 names the instance, 6.1.1 does not; the box probe logs a line of its own, before or after.
+        for who in ["drawtext@kerfmeasure", "drawtext", "Parsed_drawtext_4"] {
+            let own = prefixes(who);
+            let boxed = line("Parsed_drawtext_5", 0, 3, 300);
+            for log in [
+                [own.clone(), vec![boxed.clone()]].concat().join("\n"),
+                [vec![boxed.clone()], own.clone()].concat().join("\n"),
+                format!("noise\n{}\nmore noise\n{}", own.join("\nxx\n"), boxed),
+            ] {
+                assert_eq!(shaped_rows(&log, 3).unwrap(), want, "{who}");
+            }
+        }
+        // One prefix: the instance and the box log the same line, and either will do.
+        assert_eq!(
+            shaped_rows(&[line("drawtext", 0, 1, 77), line("drawtext", 0, 1, 77)].join("\n"), 1).unwrap(),
+            vec![(1, 77, 77)]
+        );
+        // The wrong number of lines, lines out of order, or two shapings that differ: refused, never guessed.
+        assert!(shaped_rows(&prefixes("drawtext").join("\n"), 4).is_err());
+        assert!(shaped_rows("nothing logged", 1).is_err());
+        let out_of_order = [
+            line("drawtext", 0, 1, 1),
+            line("drawtext", 2, 3, 3),
+            line("drawtext", 1, 2, 2),
+        ]
+        .join("\n");
+        assert!(shaped_rows(&out_of_order, 3).is_err());
+        let differ = [line("drawtext", 0, 1, 77), line("drawtext", 0, 2, 99)].join("\n");
+        assert!(shaped_rows(&differ, 1).is_err());
+    }
+
+    #[test]
     fn a_unit_starts_where_the_glyph_count_grows_and_its_pen_is_its_last_glyphs_start() {
         // "off": the second `f` joins the first (a ligature, as Geist shapes it), then an `i`.
         let rows = [(1, 2200, 2200), (2, 3602, 1517), (2, 4708, 2623), (3, 5491, 937)];
@@ -1128,6 +1397,57 @@ mod tests {
         assert!(two > one && two < 254, "{one} {two}");
         // A bitmap off the canvas is not drawn.
         assert_eq!(on_black(&[bitmap(5, 5, 2, 2, 255)], 3, 3), vec![0; 9]);
+    }
+
+    #[test]
+    #[ignore = "needs ffmpeg"]
+    fn a_run_that_does_not_finish_or_writes_too_much_is_a_refusal() {
+        // A source that never ends, written to a null output: the deadline kills it, and the text is FFmpeg's.
+        let endless = "testsrc=s=64x64:r=1000000:d=100000[o]";
+        let started = Instant::now();
+        let err = run_graph_within(
+            Duration::from_millis(300),
+            endless,
+            &[("o", None)],
+            false,
+            100_000_000,
+            1 << 10,
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&err, GpuError::Unsupported(w) if w.contains("did not finish")),
+            "{err}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+        // More bytes than the canvas holds: killed, and refused as well.
+        let err = run_graph_within(
+            RASTER_TIMEOUT,
+            "testsrc=s=64x64:r=30:d=10[o]",
+            &[("o", Some("gray"))],
+            false,
+            300,
+            100,
+            false,
+        )
+        .unwrap_err();
+        assert!(matches!(err, GpuError::Unsupported(_)), "{err}");
+        // How long a run is waited for grows with the instances it holds, and stops.
+        assert_eq!(RASTER_TIMEOUT + PER_INSTANCE * 40, Duration::from_millis(6000));
+        assert!(RASTER_TIMEOUT + PER_INSTANCE * MAX_INSTANCES as u32 <= MAX_RUN * 2);
+    }
+
+    #[test]
+    fn a_failed_run_is_not_tried_again_until_it_is_forgotten() {
+        let key = "test|failure memory";
+        assert!(remembered_within(key, Duration::from_secs(60)).is_none());
+        remember(key.to_string(), &unsupported("FFmpeg could not measure the text: timed out"));
+        let e = remembered_within(key, Duration::from_secs(60)).expect("remembered");
+        assert!(
+            matches!(&e, GpuError::Unsupported(w) if w.contains("timed out") && w.contains("not tried again")),
+            "{e}"
+        );
+        assert!(remembered_within(key, Duration::ZERO).is_none(), "and forgotten");
     }
 
     #[test]

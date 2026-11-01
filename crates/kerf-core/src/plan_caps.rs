@@ -15,7 +15,7 @@ use std::fmt;
 
 use crate::clip_timing::{FadeEdge, Rational};
 use crate::model::{BlendMode, VideoEffect};
-use crate::render_plan::{YuvMatrix, MAX_AMPLIFIED_ERROR, MAX_SHRINK, MIN_TEXT_PX};
+use crate::render_plan::{YuvMatrix, MAX_AMPLIFIED_ERROR, MAX_SHRINK};
 
 /// A set of [`VideoEffect`] kinds: what a compositor draws one by one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -137,14 +137,12 @@ pub struct GpuCaps {
     /// A mask (`geq` rewriting the alpha plane): drawn as a per-sample alpha. Still refused on a
     /// rotated layer and on one below full opacity (`MaskWith`).
     pub mask: bool,
+    /// Text overlays: drawn as the glyph bitmaps `drawtext` blends, each in turn (their sum is not their
+    /// blends: a synthetic-bold border's bitmaps overlap along every letter gap, small print shares samples
+    /// all along the line). A compositor sets it only where it can take this build's `drawtext` apart and
+    /// knows how it converts colours; the plan then still refuses the texts it can tell are beyond that
+    /// ([`Unsupported::TextSequence`]) and the render refuses, per text, what it cannot reproduce exactly.
     pub text: bool,
-    /// Text drawn as the sequence of glyph bitmaps `drawtext` blends, each in turn, rather than as one mask
-    /// of their sum: what a synthetic-bold border and a font under [`MIN_TEXT_PX`] pixels need, since
-    /// their bitmaps share samples (and 2x2 chroma blocks), where blending the sum is not blending the
-    /// bitmaps. A compositor sets it only where it can take this build's `drawtext` apart (and then
-    /// refuses, per text, what it cannot reproduce exactly); without it the plan refuses
-    /// `TextBorder` and `TextTooSmall`. Needs `text`.
-    pub text_sequence: bool,
     pub reframe: bool,
     pub hdr: bool,
     pub effects: EffectKinds,
@@ -169,7 +167,6 @@ impl GpuCaps {
         keyed_color: false,
         mask: false,
         text: false,
-        text_sequence: false,
         reframe: false,
         hdr: false,
         effects: EffectKinds::NONE,
@@ -357,13 +354,12 @@ pub enum Unsupported {
     /// A live text overlay names no font file the compositor can draw with (the shipped default font
     /// could not be written to disk).
     TextWithoutFont,
-    /// A live text overlay is bold in a font with no bold face, which `drawtext` thickens with a
-    /// same-colour border: each glyph's border bitmap is blended in turn and they overlap, which
-    /// a compositor that has only their sum cannot reproduce (up to 33 levels of chroma at those pixels).
-    TextBorder,
-    /// A live text overlay is drawn in a font under [`MIN_TEXT_PX`] pixels (the smallest, in pixels):
-    /// glyph bitmaps share too many pixels for one mask to stand for them.
-    TextTooSmall(u32),
+    /// A live text overlay cannot be taken apart into the glyph bitmaps `drawtext` blends in turn, which is
+    /// all a compositor can reproduce of it exactly (their sum is not their blends: up to 33 levels of chroma at
+    /// the pixels two share): what the plan can tell ([`crate::text_sequence_limit`], the reason): a tab,
+    /// more than [`crate::MAX_SEQUENCE_CHARS`] characters, a text too wide to measure. What only the render
+    /// can see (a glyph that does not shape one to a unit, a face whose bitmaps overhang) is its refusal.
+    TextSequence(String),
     /// An animated SVG title is on screen: resvg draws it and FFmpeg overlays its pictures.
     Svg,
     Scaler(String),
@@ -430,8 +426,7 @@ impl Unsupported {
             Self::FoldedFit(..) => "folded_fit",
             Self::Text => "text",
             Self::TextWithoutFont => "text_without_font",
-            Self::TextBorder => "text_border",
-            Self::TextTooSmall(_) => "text_too_small",
+            Self::TextSequence(_) => "text_sequence",
             Self::Svg => "svg",
             Self::Scaler(_) => "scaler",
             Self::MatrixUnknown(_) => "matrix_unknown",
@@ -562,12 +557,9 @@ impl fmt::Display for Unsupported {
             ),
             Self::Text => f.write_str("a text overlay is live"),
             Self::TextWithoutFont => f.write_str("a text overlay names no font file to draw with"),
-            Self::TextTooSmall(px) => write!(
+            Self::TextSequence(why) => write!(
                 f,
-                "a text overlay in a {px} px font, under the {MIN_TEXT_PX} px whose glyph bitmaps a mask stands for exactly"
-            ),
-            Self::TextBorder => f.write_str(
-                "a bold text overlay in a font with no bold face, which drawtext thickens with an overlapping border",
+                "a text overlay the compositor cannot take apart into the glyph bitmaps drawtext blends in turn: {why}"
             ),
             Self::Svg => f.write_str("an animated SVG title is on screen"),
             Self::Scaler(s) => write!(f, "scaler '{s}'"),
@@ -622,9 +614,12 @@ mod tests {
             Unsupported::Mask(layer(0, "a.mp4")).kind(),
             Unsupported::Mask(layer(3, "b.mov")).kind()
         );
-        assert_eq!(Unsupported::TextTooSmall(8).kind(), Unsupported::TextTooSmall(11).kind());
+        assert_eq!(
+            Unsupported::TextSequence("a tab".into()).kind(),
+            Unsupported::TextSequence("200 characters".into()).kind()
+        );
         assert_eq!(Unsupported::Shrink(0, (4000, 2000), (50, 20)).kind(), "shrink");
-        assert_ne!(Unsupported::Text.kind(), Unsupported::TextBorder.kind());
+        assert_ne!(Unsupported::Text.kind(), Unsupported::TextSequence(String::new()).kind());
         assert_eq!(Unsupported::MixedMatrices.kind(), "mixed_matrices");
         assert_eq!(Unsupported::SpeedRamp(layer(1, "a.mp4")).kind(), "speed_ramp");
         assert_eq!(
@@ -649,7 +644,7 @@ mod tests {
             Unsupported::BlurFill.kind(),
             Unsupported::Text.kind(),
             Unsupported::TextWithoutFont.kind(),
-            Unsupported::TextBorder.kind(),
+            Unsupported::TextSequence(String::new()).kind(),
             Unsupported::Svg.kind(),
             Unsupported::Hdr(layer(0, "")).kind(),
             Unsupported::Effects(layer(0, ""), "a blur").kind(),

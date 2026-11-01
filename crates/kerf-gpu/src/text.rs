@@ -32,9 +32,12 @@
 //! holds the bitmaps in order and [`Layers`] flattens them for the shader — per sample the coverage of
 //! each bitmap that touches it, in order, which is all a sample's blends depend on.
 //!
-//! Where this build's layout is not one [`seq`] can take apart ([`model`]), a text the plan still draws
-//! (no border, 12 px and up) is the one mask of the sum as before, `exact` false and counted by
-//! [`sum_fallbacks`]; the caps say so (`GpuCaps::text_sequence`) and the plan refuses the rest.
+//! **Nothing is drawn that is not proven.** A text whose bitmaps cannot be taken apart and proven (a build
+//! whose layout or colour conversion is not one [`seq`] knows, a tab, a glyph that does not shape one to a
+//! unit, a face whose bitmaps overhang, a run that timed out) is refused, and FFmpeg draws the frame: the
+//! sum of the bitmaps as one mask, which an earlier version blended where the sequence failed and the text
+//! was large and plain, was off by up to 30 levels in those cases and is gone ([`rasterize`] still makes it,
+//! for a test to measure).
 //!
 //! **A frame with no layer** is drawn in RGB by FFmpeg (the black base goes to `drawtext` and on
 //! to the PNG without ever being YUV), so there the blend is on the RGB picture, three full
@@ -52,7 +55,7 @@ use crate::source::{run_child, RunError};
 
 mod seq;
 
-pub use seq::{measured_model, model, Model};
+pub use seq::{build, measured_build, measured_model, model, Build, Model};
 
 /// How long one rasterisation may take before `ffmpeg` is killed: one frame of a black canvas is a
 /// few tens of milliseconds, and the caller may be holding the preview's render lock.
@@ -83,7 +86,7 @@ pub const UNIT: u32 = 0x0101_0101;
 // ---- colours -----------------------------------------------------------------
 
 /// `av_parse_color`'s named colours (libavutil `parseutils.c`, the same 140 in 6.1.1 and 9.0.2).
-const COLOR_NAMES: [(&str, [u8; 3]); 140] = [
+pub(super) const COLOR_NAMES: [(&str, [u8; 3]); 140] = [
     ("AliceBlue", [0xF0, 0xF8, 0xFF]),
     ("AntiqueWhite", [0xFA, 0xEB, 0xD7]),
     ("Aqua", [0x00, 0xFF, 0xFF]),
@@ -308,6 +311,45 @@ pub fn draw_color(rgb: [u8; 3], matrix: YuvMatrix) -> [u8; 3] {
     out
 }
 
+/// How a build of FFmpeg converts the RGB colour of a text to the composite's YUV (`ff_draw_color`):
+/// told by [`build`]'s probe, never by a version.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColourModel {
+    /// Floating point from the matrix' coefficients ([`draw_color`]): FFmpeg 6.1 and 9.0.
+    Float,
+    /// libavutil's fixed-point `RGB_TO_Y_CCIR` macros, BT.601 whatever the picture is tagged
+    /// ([`draw_color_ccir`]): FFmpeg 4.4.
+    Ccir,
+}
+
+/// `ff_draw_color` as a build with fixed-point colour conversion does it (`libavutil/colorspace.h`,
+/// `RGB_TO_Y_CCIR` and `RGB_TO_U_CCIR`, `RGB_TO_V_CCIR`, `SCALEBITS` 10): BT.601, limited range, rounded
+/// in 10 bits, which is 1 in Y off the float conversion for one colour in seven.
+pub fn draw_color_ccir(rgb: [u8; 3]) -> [u8; 3] {
+    let fix = |x: f64| (x * 1024.0 + 0.5) as i32;
+    let [r, g, b] = rgb.map(i32::from);
+    let half = 512;
+    let y =
+        (fix(0.299 * 219.0 / 255.0) * r + fix(0.587 * 219.0 / 255.0) * g + fix(0.114 * 219.0 / 255.0) * b + (half + (16 << 10)))
+            >> 10;
+    let u = ((-fix(0.16874 * 224.0 / 255.0) * r - fix(0.33126 * 224.0 / 255.0) * g + fix(0.5 * 224.0 / 255.0) * b + half - 1)
+        >> 10)
+        + 128;
+    let v = ((fix(0.5 * 224.0 / 255.0) * r - fix(0.41869 * 224.0 / 255.0) * g - fix(0.08131 * 224.0 / 255.0) * b + half - 1)
+        >> 10)
+        + 128;
+    [y, u, v].map(|c| c.clamp(0, 255) as u8)
+}
+
+/// `ff_draw_color` as `model` does it. The fixed-point conversion knows one matrix: a picture in another is
+/// not converted the way that build converts it (`None`).
+pub fn draw_color_with(model: ColourModel, rgb: [u8; 3], matrix: YuvMatrix) -> Option<[u8; 3]> {
+    match model {
+        ColourModel::Float => Some(draw_color(rgb, matrix)),
+        ColourModel::Ccir => (matrix == YuvMatrix::Bt601).then(|| draw_color_ccir(rgb)),
+    }
+}
+
 /// `drawtext`'s opacity: `alpha` as the expression gave it, `256 * alpha` truncated below 1.
 pub fn opacity_byte(alpha: f64) -> u32 {
     if alpha.is_nan() || alpha >= 1.0 {
@@ -369,8 +411,10 @@ pub struct Raster {
     /// blended in turn: `exact`. Or, where this build's layout is not known ([`model`]) and the text
     /// is one a single mask stands for, one bitmap of their sum.
     pub sequence: Vec<Bitmap>,
-    /// `sequence` is `drawtext`'s own, bitmap for bitmap, rather than the sum of them.
+    /// `sequence` is `drawtext`'s own, bitmap for bitmap, rather than the sum of them ([`rasterize`]).
     pub exact: bool,
+    /// How this build converts the text's colour (`ff_draw_color`), which the blends are made with.
+    pub colour: ColourModel,
     /// The box: where `drawtext` filled one on the canvas.
     pub boxed: Option<Rect>,
     /// `sequence` as layers for the shader, made by the first frame that draws it.
@@ -431,6 +475,7 @@ impl Raster {
         let mut raster = Raster {
             sequence: Vec::new(),
             exact: false,
+            colour: ColourModel::Float,
             boxed: None,
             layers: OnceLock::new(),
             uploaded: OnceLock::new(),
@@ -648,11 +693,14 @@ pub struct Blend {
 /// The blends that draw `text` from its `raster`, in `drawtext`'s order. `rgb` is a picture that is
 /// RGB rather than composite YUV (a frame with no layer); `matrix` is the composite's.
 pub fn blends(text: &PlanText, raster: &Raster, matrix: YuvMatrix, rgb: bool) -> Result<Vec<Blend>, GpuError> {
-    let colour = |rgba: [u8; 4]| {
+    let colour = |rgba: [u8; 4]| -> Result<[u8; 3], GpuError> {
+        let rgb3 = [rgba[0], rgba[1], rgba[2]];
         if rgb {
-            [rgba[0], rgba[1], rgba[2]]
+            Ok(rgb3)
         } else {
-            draw_color([rgba[0], rgba[1], rgba[2]], matrix)
+            draw_color_with(raster.colour, rgb3, matrix).ok_or_else(|| {
+                GpuError::Unsupported(format!("this FFmpeg converts a text colour in BT.601 only, not {matrix:?}"))
+            })
         }
     };
     let refused = |what: &str, s: &str| GpuError::Unsupported(format!("{what} colour {s:?} is not one FFmpeg reads"));
@@ -664,7 +712,7 @@ pub fn blends(text: &PlanText, raster: &Raster, matrix: YuvMatrix, rgb: bool) ->
         if a > 0 {
             out.push(Blend {
                 source: Source::Box(rect),
-                colour: colour(rgba),
+                colour: colour(rgba)?,
                 alpha: 0x10203 * a + 2,
             });
         }
@@ -676,7 +724,7 @@ pub fn blends(text: &PlanText, raster: &Raster, matrix: YuvMatrix, rgb: bool) ->
         if !raster.sequence.is_empty() {
             out.push(Blend {
                 source: Source::Glyphs,
-                colour: colour(rgba),
+                colour: colour(rgba)?,
                 alpha,
             });
         }
@@ -842,52 +890,49 @@ fn touched_by(sequence: &[Bitmap], w: u32, h: u32) -> Option<(u32, u32, u32, u32
 
 // ---- rasterising --------------------------------------------------------------
 
-/// Draw `graph` with FFmpeg and read the masks back. Blocking: a process of tens of milliseconds,
-/// killed after [`RASTER_TIMEOUT`]; callers are on a blocking thread and hold no project lock (they may
-/// hold their own render lock, which waits this long on a first-seen state).
+/// Draw `graph` with FFmpeg and read the masks back as they come: the glyphs as **one** bitmap, the
+/// picture all of them leave, which is not what `drawtext` blends (it blends each in turn: [`raster`]).
+/// The compositor never draws this; it is what a test asks to measure how far the sum is from `drawtext`.
+/// Blocking: a process of tens of milliseconds, killed after [`RASTER_TIMEOUT`].
 pub fn rasterize(graph: &TextRasterGraph) -> Result<Raster, GpuError> {
-    Raster::from_parts(graph, &run_graph(graph)?)
+    let mut raster = Raster::from_parts(graph, &run_graph(graph)?)?;
+    raster.colour = seq::measured_build().map_or(ColourModel::Float, |b| b.colour);
+    Ok(raster)
 }
 
-static SUM_FALLBACKS: AtomicU64 = AtomicU64::new(0);
-
-/// How many texts were blended as the sum of their bitmaps, for want of the sequence ([`raster`]): zero
-/// everywhere the tests look.
+/// How many texts were blended as the sum of their bitmaps for want of the sequence: none, ever. A text
+/// whose bitmaps cannot be taken apart and proven is refused ([`raster`]), so FFmpeg draws it. Kept so
+/// that a harness can assert it.
 pub fn sum_fallbacks() -> u64 {
-    SUM_FALLBACKS.load(Ordering::Relaxed)
+    0
 }
 
 /// What the compositor blends for the overlay `t` on a `size` canvas: FFmpeg's own sequence of glyph
-/// bitmaps ([`seq`]) where this build's layout is one it can take apart, proven to be the picture
-/// `drawtext` draws, else the sum of them as one bitmap. A text the sequence could not be recovered for
-/// is refused unless one mask stands for it exactly enough (no border, [`kerf_core::MIN_TEXT_PX`] and up;
-/// the plan refuses the rest when [`model`] is `None`). Blocking: a handful of `ffmpeg` runs the first
-/// time a text is seen.
+/// bitmaps ([`seq`]), proven to be the picture `drawtext` draws, sample for sample, or an error: a text the
+/// sequence cannot be recovered for (a tab, a glyph that does not shape one to a unit, a face whose
+/// bitmaps overhang the dictionary's cell, a build whose layout or colour conversion is unknown, a run
+/// that timed out) is `GpuError::Unsupported`, and FFmpeg draws the frame. Blocking: a handful of
+/// `ffmpeg` runs the first time a text is seen.
 pub fn raster(t: &PlanText, size: (u32, u32)) -> Result<Raster, GpuError> {
     let graph = kerf_core::text_raster_graph(t, size);
+    let build = seq::build().ok_or_else(|| {
+        GpuError::Unsupported("this FFmpeg's text layout or colour conversion is not one the compositor knows".into())
+    })?;
+    if let Some(why) = kerf_core::text_sequence_limit(&t.text, Some(seq::font_px(t, size.1))) {
+        return Err(GpuError::Unsupported(why));
+    }
     let planes = run_graph(&graph)?;
     let mut raster = Raster::from_parts(&graph, &planes)?;
     let (w, h) = (size.0 as usize, size.1 as usize);
-    let single = graph
+    let ink = graph
         .parts
         .iter()
         .position(|p| *p == TextPart::Glyphs)
-        .map(|i| &planes[i * w * h..(i + 1) * w * h]);
-    let Some(ink) = single else {
-        return Ok(raster);
-    };
-    let sums_are_enough = !t.synthetic_bold && (f64::from(size.1) * t.size).round() >= f64::from(kerf_core::MIN_TEXT_PX);
-    match seq::sequence(t, size, ink) {
-        Ok(sequence) => {
-            raster.sequence = sequence;
-            raster.exact = true;
-        }
-        Err(e) if sums_are_enough => {
-            SUM_FALLBACKS.fetch_add(1, Ordering::Relaxed);
-            tracing::debug!("text: {e}; blending the sum of its bitmaps");
-        }
-        Err(e) => return Err(e),
-    }
+        .map(|i| &planes[i * w * h..(i + 1) * w * h])
+        .ok_or_else(|| GpuError::Unsupported("the text has no glyph part".into()))?;
+    raster.sequence = seq::sequence(t, size, ink)?;
+    raster.exact = true;
+    raster.colour = build.colour;
     Ok(raster)
 }
 
@@ -1160,6 +1205,7 @@ mod tests {
         Raster {
             sequence: glyphs.into_iter().collect(),
             exact: false,
+            colour: ColourModel::Float,
             boxed,
             layers: OnceLock::new(),
             uploaded: OnceLock::new(),
@@ -1229,6 +1275,38 @@ mod tests {
         assert_ne!(
             draw_color([255, 204, 0], YuvMatrix::Bt709),
             draw_color([255, 204, 0], YuvMatrix::Bt601)
+        );
+    }
+
+    #[test]
+    fn the_fixed_point_colour_conversion_is_libavutils_and_differs_from_the_float_one_on_enough_colours_to_tell_a_build_by() {
+        // `RGB_TO_Y_CCIR` and the chroma macros of libavutil/colorspace.h, BT.601 limited range.
+        assert_eq!(draw_color_ccir([0, 0, 0]), [16, 128, 128]);
+        assert_eq!(draw_color_ccir([255, 255, 255]), [235, 128, 128]);
+        assert_eq!(draw_color_ccir([0, 0, 255])[1], 240);
+        assert_eq!(draw_color_ccir([255, 0, 0])[2], 240);
+        // The float conversion and this one are the same but for a level in a few colours: the probe draws
+        // those, and needs enough of them that a build cannot match by luck.
+        let apart: Vec<&str> = COLOR_NAMES
+            .iter()
+            .filter(|(_, rgb)| draw_color(*rgb, YuvMatrix::Bt601) != draw_color_ccir(*rgb))
+            .map(|(name, _)| *name)
+            .collect();
+        assert!(apart.len() >= 5, "{apart:?}");
+        let probe = seq::probe_colours();
+        assert_eq!(probe.len(), 14);
+        assert!(probe
+            .iter()
+            .all(|rgb| draw_color(*rgb, YuvMatrix::Bt601) != draw_color_ccir(*rgb)));
+        for (_, rgb) in COLOR_NAMES {
+            let (a, b) = (draw_color(rgb, YuvMatrix::Bt601), draw_color_ccir(rgb));
+            assert!(a.iter().zip(b).all(|(x, y)| x.abs_diff(y) <= 1), "{rgb:?}: {a:?} {b:?}");
+        }
+        // The fixed-point conversion knows one matrix.
+        assert!(draw_color_with(ColourModel::Ccir, [1, 2, 3], YuvMatrix::Bt709).is_none());
+        assert_eq!(
+            draw_color_with(ColourModel::Float, [1, 2, 3], YuvMatrix::Bt709),
+            Some(draw_color([1, 2, 3], YuvMatrix::Bt709))
         );
     }
 

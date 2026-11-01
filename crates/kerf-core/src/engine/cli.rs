@@ -9127,6 +9127,47 @@ pub fn text_as_drawn(s: &str) -> String {
     clean_drawtext(s, false)
 }
 
+/// The most characters of a text the compositor takes apart bitmap by bitmap (the measuring graph holds
+/// a prefix of it per line); more is FFmpeg's.
+pub const MAX_SEQUENCE_CHARS: usize = 160;
+
+/// The largest side, in pixels, of the canvas a text is measured on.
+pub const MAX_MEASURE_SIDE: f64 = 16_384.0;
+
+/// Why a text cannot be taken apart into the bitmaps `drawtext` blends, when that can be told before
+/// anything is run: a tab (`drawtext` lays it out by its own tab stops), more than [`MAX_SEQUENCE_CHARS`]
+/// characters, and, once the size is known (`px`, the font's pixel height), a text too wide to be measured
+/// on a canvas of [`MAX_MEASURE_SIDE`] pixels. Everything else the compositor cannot take apart (a glyph that
+/// does not shape one to a unit, a face whose bitmaps overhang the dictionary's cell) only the render can see.
+pub fn text_sequence_limit(text: &str, px: Option<u32>) -> Option<String> {
+    let drawn = text_as_drawn(text);
+    if drawn.contains('\t') {
+        return Some("a tab in the text".to_string());
+    }
+    let n = drawn.chars().count();
+    if n > MAX_SEQUENCE_CHARS {
+        return Some(format!("{n} characters of text (over {MAX_SEQUENCE_CHARS})"));
+    }
+    let px = f64::from(px?);
+    if px * 1.8 * n as f64 + 64.0 > MAX_MEASURE_SIDE || px * 3.0 + 64.0 > MAX_MEASURE_SIDE {
+        return Some(format!("{n} characters at {px} px are too wide to measure"));
+    }
+    None
+}
+
+/// A filtergraph given to `ffmpeg` in a script file, because it was too long for the command line; the
+/// file is removed when this is dropped.
+pub struct GraphFile(#[allow(dead_code)] GraphScript);
+
+/// Move the `-filter_complex` graph of `args` into a script file if it is too long to pass in argv (the
+/// engine's own rule, [`GRAPH_ARG_MAX`]), pointing `ffmpeg` at it with the spelling this build takes.
+/// Nothing moves otherwise. For a long graph of a caller outside the engine (the compositor measures a text
+/// with an instance of `drawtext` per prefix); a graph that holds a line feed in a quoted value is better left
+/// in argv.
+pub fn spill_long_graph(args: &mut [String], tag: &str) -> Result<GraphFile> {
+    externalize_filter_complex(args, tag).map(GraphFile)
+}
+
 /// [`escape_drawtext`] for `text=`.
 fn escape_drawtext_text(s: &str) -> String {
     escape_drawtext(s, true)
