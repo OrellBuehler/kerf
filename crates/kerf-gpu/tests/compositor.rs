@@ -19,8 +19,12 @@ fn gpu() -> std::sync::Arc<Gpu> {
     Gpu::new(GpuOptions::for_tests()).expect("a GPU adapter (install mesa-vulkan-drivers for lavapipe)")
 }
 
+/// (The scaler is pinned as the model: nothing here runs FFmpeg to measure it, and a compositor whose scaler is not known to be
+/// swscale's refuses every resized layer.)
 fn compositor() -> Compositor {
-    Compositor::new(gpu()).expect("a compositor")
+    Compositor::new(gpu())
+        .expect("a compositor")
+        .with_scaler_kernels(kerf_gpu::scaler::Kernels::Match(kerf_gpu::scaler::Model::ASSUMED))
 }
 
 fn asset(w: u32, h: u32) -> Asset {

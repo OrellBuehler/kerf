@@ -18,9 +18,8 @@
 //! The two renderers are not bit-identical, and the harness says where. The
 //! scaler is swscale's own tables in swscale's integer arithmetic and agrees with
 //! `ffmpeg -vf scale` to one level on every plane up to about 4:1, to two or
-//! three levels on 8:1 to 20:1 downscales and to five at 40:1 (the steepest the plan
-//! accepts)
-//! (`the_scaler_matches_ffmpegs_scale_plane_by_plane`); `eq` is byte-exact; an
+//! three levels on 8:1 to 20:1 downscales and to five at 40:1 (the steepest this ladder
+//! measures; the plan goes on to 63:1) (`the_scaler_matches_ffmpegs_scale_plane_by_plane`); `eq` is byte-exact; an
 //! opaque layer's blend is FFmpeg's in YUV. What remains is a hard coloured edge
 //! landing on a different pixel (chroma is averaged over 2x2 in one's alpha blend
 //! and per pixel in the other's, a rotated edge is stepped in one and sits at a
@@ -149,10 +148,8 @@
 //! * **A dip to white ahead of a moving zoom** is refused: the zoom's `scale` takes the RGB frame the fade
 //!   leaves and converts it in the same pass (up to 14 levels off a draw that scales the converted picture on
 //!   6.1.1, 3 on 9.0.2).
-//! * **A shrink steeper than 40:1** (`kerf_core::MAX_SHRINK`) is refused: past what
-//!   the scaler comparison measures, swscale's x86 vertical scaler drifts further
-//!   from the C arithmetic the shader follows (a 58:1 shrink of a 4K test pattern
-//!   read 16 levels off in RGB).
+//! * **A shrink steeper than 63:1** (`kerf_core::MAX_SHRINK`) is refused: past it swscale
+//!   cascades a second scaler, which the model does not follow (it has no table there).
 //! * **A rotated edge** is a fixed-point stair-step in FFmpeg and a float sample
 //!   here; the interior agrees to a level. FFmpeg's own `rotate` also leaves a few
 //!   green pixels along the edge of a neutral layer (chroma it never wrote); the
@@ -235,7 +232,7 @@ const FLAT_SHARE_MIN: f64 = 0.5;
 /// differently from the C arithmetic this follows: measured 2-3 on noise and test
 /// patterns at 8:1 to 20:1 and up to 5 at 40:1, identically on FFmpeg 6.1.1 and
 /// 9.0.2, so those are the bounds there (`SCALER_MAX_EXTREME`, `SCALER_MAX_STEEP`)
-/// and it is claimed no further: the plan refuses a steeper shrink than 40:1.
+/// and it is claimed no further: the plan refuses a steeper shrink than 63:1.
 /// The mean bounds are what the one-level differences add up to: smooth footage
 /// (measured <= 0.06) is almost exact; on a checkerboard — 219 levels of
 /// contrast per pixel — x86 FFmpeg's non-bit-exact vertical scaler is a level
@@ -249,7 +246,7 @@ const SCALER_BUSY_MEAN: f64 = 0.75;
 /// every output sample on dozens of inputs (measured at most 0.52, on a 20:1
 /// shrink of the test pattern).
 const SCALER_EXTREME_MEAN: f64 = 0.6;
-/// A shrink of 32:1 up to the 40:1 the plan stops at (`kerf_core::MAX_SHRINK`):
+/// A shrink of 32:1 up to 40:1 (the plan goes on to `kerf_core::MAX_SHRINK`, 63:1, on the exact scaler):
 /// noise reads up to 5 levels off a plane, 0.85 on average.
 const SCALER_MAX_STEEP: i32 = 5;
 const SCALER_STEEP_MEAN: f64 = 1.0;
@@ -3087,8 +3084,14 @@ fn a_clip_past_the_end_of_its_footage_draws_nothing_like_ffmpeg() {
 /// layer (`check_converted`) and not for the rest (a translucent or graded layer, an RGB picture: the case holds the
 /// refusal, with FFmpeg rendering it).
 fn check_mixed(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], reason: &'static str) {
+    check_mixed_with(case, tl, assets, times, reason, STRICT);
+}
+
+/// [`check_mixed`] with the `limits` of the layer the case is about where the stack is drawn as it is (a turned layer's:
+/// [`ROTATED`]).
+fn check_mixed_with(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], reason: &'static str, limits: Limits) {
     match policy() {
-        CompositeColorPolicy::FixedBt601 => check(case, tl, assets, times, STRICT),
+        CompositeColorPolicy::FixedBt601 => check(case, tl, assets, times, limits),
         CompositeColorPolicy::BottomLayerTag => {
             check_refused(&format!("{case} (negotiated)"), tl, assets, times[0], Refusal::Plan(reason));
         }
@@ -3301,9 +3304,7 @@ fn layers_of_another_matrix_are_converted_into_the_bottom_ones() {
         )
     };
     let (tl, assets) = over(m.testsrc.clone(), &|c| c.transform.opacity = 0.6);
-    if policy() == CompositeColorPolicy::BottomLayerTag {
-        check_mixed("convert/translucent", &tl, &assets, &[0.5], "opacity below 1");
-    }
+    check_mixed_with("convert/translucent", &tl, &assets, &[0.5], "opacity below 1", STRICT);
     let (tl, assets) = over(m.testsrc.clone(), &|c| {
         c.color = Color {
             contrast: 1.2,
@@ -3311,12 +3312,33 @@ fn layers_of_another_matrix_are_converted_into_the_bottom_ones() {
         }
     });
     check_mixed("convert/colour corrected", &tl, &assets, &[0.5], "colour correction");
-    let (tl, assets) = over(m.testsrc.clone(), &|c| c.effects = vec![kerf_core::VideoEffect::Invert]);
+    let (tl, assets) = over(m.testsrc.clone(), &|c| {
+        c.effects = vec![kerf_core::VideoEffect::Blur { sigma: 2.0 }];
+    });
     check_mixed("convert/effect", &tl, &assets, &[0.5], "video effect");
-    let (tl, assets) = over(m.testsrc.clone(), &|c| c.transform.rotation = 10.0);
-    if policy() == CompositeColorPolicy::BottomLayerTag {
-        check_mixed("convert/rotated", &tl, &assets, &[0.5], "rotation");
+    // A pointwise effect is a table the scale applies ahead of the conversion, in an export (`motion_parity.rs`); a still's chain has no
+    // converter of its own after it, and its composite is not the conversion of the effect's picture: refused there.
+    for (name, effect) in [
+        ("invert", kerf_core::VideoEffect::Invert),
+        ("grayscale", kerf_core::VideoEffect::Grayscale),
+    ] {
+        let (tl, assets) = over(m.testsrc.clone(), &|c| c.effects = vec![effect.clone()]);
+        check_mixed(
+            &format!("convert/{name} on the converted layer"),
+            &tl,
+            &assets,
+            &[0.5],
+            "video effect",
+        );
     }
+    // (A still's `scale` takes a 4:2:2 or 4:4:4 picture to 4:2:0 and into the composite's matrix in one pass: refused there; the
+    // export's conversion is held in `motion_parity.rs`.)
+    for (name, picture) in [("4:4:4", &m.yuv444), ("4:2:2", &m.yuv422)] {
+        let (tl, assets) = over(picture.clone(), &|_| {});
+        check_mixed(&format!("convert/{name} over 709"), &tl, &assets, &[0.5], "in a still");
+    }
+    let (tl, assets) = over(m.testsrc.clone(), &|c| c.transform.rotation = 10.0);
+    check_mixed_with("convert/rotated", &tl, &assets, &[0.5], "rotation", ROTATED);
     let (tl, assets) = over(m.testsrc.clone(), &|c| {
         c.mask = Some(a_mask(kerf_core::MaskShape::Ellipse, 0.1, false));
     });
@@ -4878,14 +4900,14 @@ fn the_scaler_matches_ffmpegs_scale_plane_by_plane() {
             }
         }
     }
-    // Past the steepest shrink measured (`MAX_SHRINK`, 40:1) the plan declines and
-    // FFmpeg draws it.
+    // Past the steepest shrink the model is held to (`MAX_SHRINK`, 63:1: swscale needs a second scaler from 64:1) the plan declines and
+    // FFmpeg draws it. (1280x720 into 20x11 is 64:1.)
     let tl = timeline(
         vec![vec![clip(&m.noise_hd, 0.0, m.noise_hd.duration, 0.0)]],
-        Some(Delivery::new(30, 16, Fit::Contain)),
+        Some(Delivery::new(20, 12, Fit::Contain)),
     );
     check_refused(
-        "shrink/noise-hd-past-40:1",
+        "shrink/noise-hd-past-63:1",
         &tl,
         std::slice::from_ref(&m.noise_hd),
         0.05,

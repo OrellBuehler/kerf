@@ -870,6 +870,7 @@ impl Compositor {
             caps.grade = GradeKinds::NONE;
         }
         caps.exact_scaler = scaler.exact();
+        caps.scaler_approximate = !scaler.exact();
         // The conversion's way in is the grade's kernel too: the conversion is in the caps where both are measured.
         caps.matrix_convert = convert.converts() && kernels == crate::grade::Kernels::Match;
         if text.is_none() {
@@ -1799,9 +1800,9 @@ impl Compositor {
                 "until this FFmpeg's conversions to and from RGB are known to match",
             ));
         }
-        if plan.mode == kerf_core::PlanMode::Motion && plan.canvas.other_alpha_in_cut {
+        if plan.mode == kerf_core::PlanMode::Motion && plan.canvas.unread_decider_in_cut {
             return Err(unsupported(
-                "in a cut with a masked, rotated or translucent clip (which clip decides the matrix there is not measured)",
+                "in a cut whose deciding clip is not read (a blend mode, or a clip on the alpha plane with a colour correction, a grade or an effect)",
             ));
         }
         if let Some(why) = plan.convert_refusal(layer) {
@@ -1815,10 +1816,15 @@ impl Compositor {
             ));
         }
         let off_grid = |(w, h): (u32, u32)| w % 2 != 0 || h % 2 != 0;
-        if off_grid(geom.picture) || off_grid(geom.layer) || (geom.matte && off_grid(geom.picture_at)) || geom.rotation.is_some()
+        let filled = layer.blur_fill.is_some() && geom.matte;
+        let effect_on_bars = geom.matte && !filled && !layer.effects.is_empty();
+        if off_grid(geom.layer)
+            || (!filled && (off_grid(geom.picture) || (geom.matte && off_grid(geom.picture_at))))
+            || effect_on_bars
+            || geom.rotation.is_some()
         {
             return Err(unsupported(
-                "on a picture of odd size, or whose bars meet it off the 4:2:0 grid",
+                "on a picture of odd size, whose bars meet it off the 4:2:0 grid or carry an effect",
             ));
         }
         Ok(Some(Converted { from }))
@@ -2588,12 +2594,20 @@ impl Compositor {
             }
             // swscale's tables for every plane of every stage; a ratio it would
             // need two scalers for is FFmpeg's to render.
+            // A delivery that names its scaler (`flags=bicubic` on every fit and zoom `scale`) is that scaler, whatever this build's
+            // unflagged `scale` defaults to; the plan refuses any other name.
+            let named = plan
+                .canvas
+                .scaler
+                .as_deref()
+                .filter(|s| s.eq_ignore_ascii_case("bicubic"))
+                .map(|_| Scaler::Bicubic);
             let mut filters = Vec::with_capacity(geom.stages.len());
             for stage in &geom.stages {
                 let table = |chroma: bool| -> Result<PlaneFilters, GpuError> {
                     let ps = plane_stage(stage, chroma);
                     let too_far = || GpuError::Unsupported(format!("layer {n}: a scale ratio swscale needs two passes for"));
-                    self.plane_filters(None, &ps, chroma).ok_or_else(too_far)
+                    self.plane_filters(named, &ps, chroma).ok_or_else(too_far)
                 };
                 filters.push([table(false)?, table(true)?, table(true)?]);
             }
@@ -3642,6 +3656,7 @@ mod tests {
             assert!(!caps.exact_scaler, "{scaler:?}");
             let mut restored = caps;
             restored.exact_scaler = true;
+            restored.scaler_approximate = false;
             assert_eq!(restored, Compositor::CAPS, "{scaler:?}: nothing else moves");
         }
     }

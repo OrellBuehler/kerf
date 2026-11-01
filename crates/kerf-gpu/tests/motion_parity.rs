@@ -5693,8 +5693,69 @@ fn layers_of_another_matrix_are_converted_into_the_bottom_ones() {
     quick.speed = 2.0;
     let tl = timeline(vec![vec![clip(&v.testsrc709, 0.5, 1.5, 0.0), quick]], None);
     run("convert/speed 2", &tl, &assets, 30.0, 2.0, EXACT);
-    // What the conversion does not cover keeps the frame FFmpeg's, in every frame of the converted clip: a colour correction ahead of
-    // the conversion, an opacity, an effect, a picture of odd size, a keyed number (the clip is on a `scale eval=frame`).
+    // Drawn, converted, with what comes before the conversion in the chain: a pointwise effect (a table the scale applies), a 4:2:2 or
+    // 4:4:4 picture (the decode makes the 4:2:0 a `format=yuv420p` makes of it), a plain layer over a blurred fill (the whole filled
+    // frame is converted).
+    for (name, effect) in [
+        ("invert", kerf_core::VideoEffect::Invert),
+        ("grayscale", kerf_core::VideoEffect::Grayscale),
+    ] {
+        let mut c = clip(&m.testsrc, 0.5, 1.5, 1.0);
+        c.effects = vec![effect];
+        let tl = timeline(vec![vec![clip(&v.testsrc709, 0.5, 1.5, 0.0), c]], None);
+        run(
+            &format!("convert/{name} on the converted clip"),
+            &tl,
+            &assets,
+            30.0,
+            2.0,
+            EXACT,
+        );
+    }
+    for (name, picture) in [("4:4:4", &v.yuv444), ("4:2:2", &v.yuv422)] {
+        let tl = timeline(
+            vec![vec![clip(&v.testsrc709, 0.5, 1.5, 0.0), clip(picture, 0.5, 1.5, 1.0)]],
+            None,
+        );
+        run(
+            &format!("convert/{name} after a 709 clip"),
+            &tl,
+            &[v.testsrc709.clone(), picture.clone()],
+            30.0,
+            2.0,
+            EXACT,
+        );
+        let tl = timeline(
+            vec![vec![clip(&v.testsrc709, 0.5, 1.5, 0.0)], vec![clip(picture, 0.5, 1.5, 0.0)]],
+            None,
+        );
+        run(
+            &format!("convert/{name} over a 709 clip"),
+            &tl,
+            &[v.testsrc709.clone(), picture.clone()],
+            30.0,
+            1.0,
+            EXACT,
+        );
+    }
+    let blurred = Some(Delivery::new(960, 540, Fit::Blur));
+    for (name, first, second) in [
+        ("phone 709 then phone 601", &x.portrait709, &x.portrait601),
+        ("phone 601 then phone 709", &x.portrait601, &x.portrait709),
+    ] {
+        let tl = timeline(vec![vec![clip(first, 0.5, 1.5, 0.0), clip(second, 0.5, 1.5, 1.0)]], blurred);
+        run(
+            &format!("convert/{name}, over a blurred fill"),
+            &tl,
+            &[first.clone(), second.clone()],
+            30.0,
+            2.0,
+            EXACT,
+        );
+    }
+    // What the conversion does not cover keeps the frame FFmpeg's, in every frame of the cut: a colour correction (its `eq` may carry a
+    // converter ahead of the overlay), an opacity or a rotation (an RGB round trip, a `rotate`: a clip so put on the alpha plane may
+    // be the one that decides the composite's matrix, and which it is has not been measured: the deciding clip is not read), an effect.
     type Edit<'a> = &'a dyn Fn(&mut Clip);
     let cases: [(&str, Edit); 4] = [
         ("colour correction", &|c| {
@@ -5704,7 +5765,9 @@ fn layers_of_another_matrix_are_converted_into_the_bottom_ones() {
             }
         }),
         ("an opacity", &|c| c.transform.opacity = 0.6),
-        ("an effect", &|c| c.effects = vec![kerf_core::VideoEffect::Invert]),
+        ("an effect", &|c| {
+            c.effects = vec![kerf_core::VideoEffect::Blur { sigma: 2.0 }];
+        }),
         ("a rotation", &|c| c.transform.rotation = 10.0),
     ];
     for (name, edit) in cases {
@@ -5714,10 +5777,14 @@ fn layers_of_another_matrix_are_converted_into_the_bottom_ones() {
         let case = format!("convert/refused: {name}");
         if negotiates {
             run_refusing(&case, &tl, &assets, 30.0, 2.0, EXACT, &matrix_conversion_refused());
-        } else if !matches!(name, "an opacity" | "a rotation") {
-            // (Under a fixed matrix nothing is converted and these are drawn as they are; a translucent or turned layer has its own
-            // bounds there, `TRANSLUCENT` and `ROTATED`, held by the cases of those layers.)
-            run(&case, &tl, &assets, 30.0, 2.0, SCALED);
+        } else {
+            // (Under a fixed matrix nothing is converted and these are drawn as they are, a translucent or turned layer at the
+            // ladder of its own: `TRANSLUCENT`, and `ROTATED` with the band at its edge left out.)
+            match name {
+                "an opacity" => run(&case, &tl, &assets, 30.0, 2.0, TRANSLUCENT),
+                "a rotation" => run_rotated(&case, &tl, &assets, 30.0, 2.0, ROTATED),
+                _ => run(&case, &tl, &assets, 30.0, 2.0, SCALED),
+            }
         }
     }
     let _ = one(&m.testsrc);
@@ -6187,26 +6254,19 @@ fn a_blurred_fill_in_every_matrix_and_range() {
         let tl = timeline(vec![vec![clip(a, 0.5, 1.5, 0.0)]], frame);
         run(&format!("blur/{name}"), &tl, std::slice::from_ref(a), 30.0, 0.5, EXACT);
     }
-    // A BT.709 clip beside an untagged one: one matrix under FFmpeg 6, two under FFmpeg 9 (the planes the graph writes
-    // convert the second into the first's matrix; a layer over a blurred fill is not converted here, so the plan refuses it and FFmpeg draws it).
-    let tl = timeline(
-        vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![clip(&v.testsrc709, 0.5, 1.5, 0.0)]],
-        frame,
-    );
-    let assets = [m.bars.clone(), v.testsrc709.clone()];
-    match policy() {
-        CompositeColorPolicy::FixedBt601 => run("blur/709 over untagged", &tl, &assets, 30.0, 0.5, EXACT),
-        _ => run_refusing(
-            "blur/709 over untagged",
-            &tl,
-            &assets,
-            30.0,
-            0.5,
-            EXACT,
-            &refusing("MixedMatrices", |u| {
-                matches!(u, Unsupported::MixedMatrices | Unsupported::MixedMatricesWith(..))
-            }),
-        ),
+    // A BT.709 clip beside an untagged one: one matrix under FFmpeg 6, two under FFmpeg 9, where the layer of the other matrix is
+    // converted into the first clip's after the whole frame (the fill included: a plain layer over a blurred fill is converted
+    // with its fill, `FixedBt601` draws both as they are), in either order.
+    for (name, first, second) in [
+        ("709 over untagged", &m.bars, &v.testsrc709),
+        ("untagged over 709", &v.testsrc709, &m.bars),
+    ] {
+        let tl = timeline(
+            vec![vec![clip(first, 0.5, 1.5, 0.0)], vec![clip(second, 0.5, 1.5, 0.0)]],
+            frame,
+        );
+        let assets = [first.clone(), second.clone()];
+        run(&format!("blur/{name}"), &tl, &assets, 30.0, 0.5, EXACT);
     }
 }
 
@@ -6306,23 +6366,17 @@ fn a_blurred_fill_is_refused_where_it_is_not_the_exports() {
             "blur/{name}: the refusal is not needed: the frames drawn anyway are the export's"
         );
     }
-    // A thumbnail the picture is shrunk into past 40:1 (360x640 into an 8x14 cover, 45:1), which the scaler comparison does
-    // not reach.
+    // A thumbnail the picture is shrunk into at 45:1 (360x640 into an 8x14 cover): past the 40:1 the plan used to stop at, and
+    // drawn since the scaler comparison went on to 63:1.
     for (w, h) in [(64, 64), (64, 96)] {
         let tl = timeline(vec![vec![clip(&m.portrait, 0.5, 1.5, 0.0)]], blurred(w, h));
-        let planner = Planner::new(
+        run(
+            &format!("blur/portrait in {w}x{h} (a 45:1 thumbnail)"),
             &tl,
             std::slice::from_ref(&m.portrait),
-            &at_fps(30.0),
-            PlanRequest::motion(policy()),
-        )
-        .expect("planner");
-        let plan = planner.at_frame(3).expect("plan");
-        let why = plan.reasons(&compositor().caps(), plan.size(u32::MAX));
-        assert!(
-            why.iter()
-                .any(|u| matches!(u, Unsupported::BlurFillWith(_, w) if w.contains("40:1"))),
-            "blur/portrait in {w}x{h}: {why:?}"
+            30.0,
+            0.5,
+            EXACT,
         );
     }
     // A frame too small for the thumbnail's box blur (a 4x4 thumbnail has 2-sample chroma lines; the box reads past them).

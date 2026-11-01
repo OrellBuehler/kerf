@@ -142,7 +142,7 @@ fn this_ffmpegs_scaler_is_the_model() {
 fn the_scaler_model_is_ffmpegs_sample_for_sample() {
     let model = model();
     let mut failures = Vec::new();
-    // Shrinks from 1280x720 (2:1 to 40:1), odd outputs, and enlargements, noise and a smoother picture, both scalers.
+    // Shrinks from 1280x720 (2:1 to 63:1, the plan's `MAX_SHRINK`), odd outputs, and enlargements, noise and a smoother picture, both scalers.
     let sizes: &[(usize, usize)] = &[
         (640, 360),
         (853, 480),
@@ -155,6 +155,10 @@ fn the_scaler_model_is_ffmpegs_sample_for_sample() {
         (64, 36),
         (41, 23),
         (40, 22),
+        (31, 17),
+        (26, 15),
+        (21, 12),
+        (21, 13),
         (32, 18),
         (1920, 1080),
         (1281, 721),

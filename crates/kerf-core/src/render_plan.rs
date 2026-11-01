@@ -204,14 +204,11 @@ pub enum CompositeColorPolicy {
     Unknown,
 }
 
-/// The steepest shrink of one scale stage the compositor claims to match: swscale's
-/// vertical scaler on x86 is not bit-exact with the C arithmetic the compositor
-/// follows, and the difference grows with the number of input samples per output
-/// one — one level up to about 4:1, two to three up to 20:1, up to five at 40:1
-/// (`the_scaler_matches_ffmpegs_scale_plane_by_plane`). Past it the figure is not
-/// measured (a 58:1 shrink of a 4K test pattern reads 16 levels off in RGB), so the
-/// frame goes through FFmpeg.
-pub const MAX_SHRINK: u32 = 40;
+/// The steepest shrink of one scale stage the compositor draws: swscale builds a filter table up to 63:1 (a table for a shrink
+/// of 64:1 or more would need a second scaler, which `table_aligned` does not make), and the scalar model and the shader are
+/// held to it sample for sample over every ratio up to there (`tests/scaler.rs`, `tests/parity.rs`). Past it the frame goes
+/// through FFmpeg.
+pub const MAX_SHRINK: u32 = 63;
 
 /// Which graph a plan describes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -278,18 +275,29 @@ pub struct PlanCanvas {
     /// Still plan, whose graph is the layers on screen.
     pub mixed_matrices_cut: bool,
     /// A [`PlanMode::Motion`] plan's cut of mixed matrices under [`CompositeColorPolicy::BottomLayerTag`]: the matrix FFmpeg 9
-    /// makes the composite's for every frame of the cut, which is the **first clip on an alpha plane**'s (a clip entering
-    /// through a dissolve), and the graph's first clip's when there is none; the other clips are converted into it wherever
-    /// they are on the timeline (measured on 9.0.2, in either order, over BT.601, BT.709 and BT.2020, with three clips in every
-    /// combination of plain and dissolving). `None` outside such a cut, and in one whose deciding clip is no YCbCr picture of
-    /// a known matrix (then [`Unsupported::MixedMatrices`] refuses every frame).
+    /// makes the composite's for every frame of the cut. Read from FFmpeg 9's format negotiation (`avfiltergraph.c`: the colour
+    /// space lists of an `overlay`'s pads are one list, a `scale` has two, and each list is reduced to the single value its filter's
+    /// input holds, filters in the order the graph was written, the converters it inserts coming after every one of them) and
+    /// measured on 9.0.2 with real files (three clips in every combination, either matrix): a clip whose chain already ends in
+    /// `yuva420p`, the format `overlay`'s second input takes, with nothing in it forcing a converter, needs none before the overlay,
+    /// and its fit `scale` makes the composite's matrix its own tag; every other clip gets a converter `scale` whose input is its tag
+    /// and whose output is the composite's. So the composite takes the tag of **the first such clip**, in the order the graph writes its
+    /// chains (a track's clips in start-time order, tracks in list order), else of the first clip; a clip tagged otherwise is converted
+    /// into it once, wherever it is on the timeline: by its converter after the chain, or inside its fit `scale` where it is on the
+    /// plane. `None` outside such a cut, and in one whose deciding clip is no YCbCr picture of a known matrix (then
+    /// [`Unsupported::MixedMatrices`] refuses every frame).
     pub cut_matrix: Option<YuvMatrix>,
-    /// A [`PlanMode::Motion`] plan's cut holds a clip whose chain is on an alpha plane for a reason other than a dissolve it
-    /// enters through (a mask, a rotation, an opacity below 1, a chroma key), wherever on the timeline. A dissolving clip is on
-    /// the plane too and the negotiation takes the first such clip's matrix (see [`PlanCanvas::cut_matrix`]), measured for
-    /// that case only: where the plane comes from a mask or a rotation the same rule is not checked, and a cut of mixed
-    /// matrices holding such a clip is [`Unsupported::MixedMatrices`] in every frame.
-    pub other_alpha_in_cut: bool,
+    /// A [`PlanMode::Motion`] plan's cut holds a clip with a blend mode (`blend` is another filter, in RGB, with its own
+    /// negotiation), or a clip on the alpha plane whose chain carries something that may put a converter into it (an opacity
+    /// below 1, whose RGB round trip is one, a rotation, a mask, a chroma key, a colour correction, a grade, an effect, a tone map,
+    /// a reprojection, a fade a placed chain runs on `yuv420p` first: only a dissolve, a keyed zoom or position and a source with
+    /// an alpha channel are measured to leave none), wherever on the timeline. Which clip decides the composite's matrix ([`PlanCanvas::cut_matrix`]) was not read for such a cut, and a cut of
+    /// mixed matrices holding one is [`Unsupported::MixedMatrices`] in every frame.
+    pub unread_decider_in_cut: bool,
+    /// A [`PlanMode::Motion`] plan's cut holds a YCbCr clip whose matrix is known and is not BT.601, wherever on the timeline.
+    /// FFmpeg 9 takes an RGB picture into YCbCr with the **cut's** matrix, so a frame of the picture alone is converted with that
+    /// one, where the stack on screen says BT.601: an RGB picture in such a cut is [`Unsupported::RgbInStack`] in every frame.
+    pub cut_non_601: bool,
 }
 
 /// What the compositor needs to know about a layer's source picture.
@@ -976,6 +984,10 @@ impl RenderPlan {
                     }
                 }
             }
+            // A scaler that is not measured to be swscale's draws a resized layer a level off: not exact, so FFmpeg's.
+            if caps.scaler_approximate && geom.stages.iter().any(|s| s.scaled != (s.src.w, s.src.h)) {
+                reasons.push(Unsupported::ScalerApproximate(self.layer_ref(n, layer)));
+            }
             // A layer converted into the composite's matrix is converted on a 4:2:0 grid: an odd side reads past the line, and
             // bars that meet the picture off the grid share a chroma block with it (the conversion averages a 2x2 block).
             if self.canvas.policy == CompositeColorPolicy::BottomLayerTag
@@ -998,14 +1010,20 @@ impl RenderPlan {
                     ));
                 }
                 let off_grid = |(w, h): (u32, u32)| w % 2 != 0 || h % 2 != 0;
-                if off_grid(geom.picture)
-                    || off_grid(geom.layer)
-                    || (geom.matte && off_grid(geom.picture_at))
+                // Over a blurred fill the converted picture is the whole filled frame (its size is the layer's); else it is the picture,
+                // whose 2x2 blocks never share a sample with the bars only when it and its offset are even.
+                let filled = layer.blur_fill.is_some() && geom.matte;
+                // The bars of a letterbox are black, which no matrix changes, unless a pointwise effect has been through them (invert
+                // makes them 239, 127, 127): converted with the picture they would have to be materialized.
+                let effect_on_bars = geom.matte && !filled && !layer.effects.is_empty();
+                if off_grid(geom.layer)
+                    || (!filled && (off_grid(geom.picture) || (geom.matte && off_grid(geom.picture_at))))
+                    || effect_on_bars
                     || geom.rotation.is_some()
                 {
                     reasons.push(Unsupported::MixedMatricesWith(
                         self.layer_ref(n, layer),
-                        "a picture of odd size, or whose bars meet it off the 4:2:0 grid",
+                        "a picture of odd size, whose bars meet it off the 4:2:0 grid or carry an effect",
                     ));
                 }
             }
@@ -1608,12 +1626,12 @@ impl RenderPlan {
         }
         why.retain(|u| !matches!(u, Unsupported::MixedMatrices | Unsupported::RgbInStack(_)));
         let composite = self.canvas.matrix;
-        if self.layers.iter().any(|l| l.stream.is_rgb()) && composite != YuvMatrix::Bt601 {
+        if self.layers.iter().any(|l| l.stream.is_rgb()) && (composite != YuvMatrix::Bt601 || self.canvas.cut_non_601) {
             why.push(Unsupported::RgbInStack(composite));
         }
         if self.mode == PlanMode::Motion
             && self.canvas.mixed_matrices_cut
-            && (self.canvas.cut_matrix.is_none() || self.canvas.other_alpha_in_cut)
+            && (self.canvas.cut_matrix.is_none() || self.canvas.unread_decider_in_cut)
         {
             why.push(Unsupported::MixedMatrices);
         }
@@ -1650,22 +1668,38 @@ impl RenderPlan {
     /// before it, or whose own format the conversion would change, stays FFmpeg's.
     pub fn convert_refusal(&self, layer: &PlanLayer) -> Option<&'static str> {
         let motion = self.mode == PlanMode::Motion;
-        if layer.stream.pix_fmt.as_deref() != Some("yuv420p") || layer.is_image {
-            Some("a picture that is not 8-bit 4:2:0 yuv420p video")
+        // (A 4:2:2 or 4:4:4 picture reaches the conversion as the 4:2:0 the decode makes of it, the way a `format=yuv420p` ahead of
+        // the converter does: measured exact beside the plain ones.)
+        if !matches!(layer.stream.pix_fmt.as_deref(), Some("yuv420p" | "yuv422p" | "yuv444p")) || layer.is_image {
+            Some("a picture that is not 8-bit 4:2:0, 4:2:2 or 4:4:4 yuv video")
+        } else if !motion && layer.stream.pix_fmt.as_deref() != Some("yuv420p") {
+            // (A still has no `format` ahead of the overlay: the fit `scale` takes the picture to 4:2:0 and into the composite's matrix in
+            // one pass, through RGB from the 4:4:4 samples.)
+            Some("a 4:2:2 or 4:4:4 picture in a still (its scale converts the format and the matrix in one pass)")
         } else if layer.stream.maybe_full_range_in(self.canvas.policy) {
             Some("a picture that may be full range")
         } else if !layer.grade.is_identity() {
             Some("a grade (its way back converts the picture into the bottom layer's matrix itself)")
-        } else if !layer.effects.is_empty() {
-            Some("a video effect")
+        } else if layer
+            .effects
+            .iter()
+            .any(|e| !motion || !matches!(e, VideoEffect::Invert | VideoEffect::Grayscale))
+        {
+            // (Invert and grayscale are tables the export's fit `scale` applies ahead of the converter `scale`; a still's chain has
+            // no such converter, and its composite is not the conversion of the effect's picture: measured, 470555 samples differ.)
+            Some("a video effect other than invert and grayscale in an export")
         } else if layer.mask.is_some() {
             Some("a mask")
         } else if layer.transform.rotation != 0.0 || layer.transform.opacity < 1.0 || layer.keyed_alpha.is_some() {
             Some("a rotation or an opacity below 1 (an alpha plane the conversion also reads)")
         } else if !layer.color.is_identity() || self.eq_in_chain(layer) {
             Some("colour correction")
-        } else if layer.hdr.is_some() || layer.reframe.is_some() || layer.projection.is_some() || layer.blur_fill.is_some() {
-            Some("an HDR, reframed, 360 or blurred-fill picture")
+        } else if layer.hdr.is_some() || layer.reframe.is_some() || layer.projection.is_some() {
+            Some("an HDR, reframed or 360 picture")
+        } else if layer.blur_fill.is_some() && self.on_alpha_plane(layer) {
+            // (A plain layer over a blurred fill is converted after the whole frame, fill included. A dissolving one has its fill's two
+            // scales tied to the composite's colour space, which convert inside themselves.)
+            Some("a blurred fill behind a layer that dissolves")
         } else if motion && layer.animated.is_some() {
             Some("a keyed number")
         } else if self.white_round_trip(layer) || self.through_rgba(layer) {
@@ -1824,7 +1858,7 @@ impl RenderPlan {
             return Some(Some("a full-range picture (FFmpeg scales and blurs its raw values)"));
         }
         if fill.source.0 > MAX_SHRINK * fill.cover.0 || fill.source.1 > MAX_SHRINK * fill.cover.1 {
-            return Some(Some("a picture shrunk past 40:1 into the thumbnail"));
+            return Some(Some("a picture shrunk past 63:1 into the thumbnail"));
         }
         None
     }
@@ -2444,13 +2478,27 @@ mod tests {
             p.reasons(&GpuCaps::A0, p.size(u32::MAX)).as_slice(),
             [Unsupported::MixedMatricesWith(_, "a compositor with no measured conversion")]
         ));
+        // 4:2:2 and 4:4:4 reach an export's conversion as the 4:2:0 the decode makes of them (drawn: `motion_parity.rs`); a still's `scale`
+        // converts them and the matrix in one pass.
+        for fmt in ["yuv422p", "yuv444p"] {
+            let p = stack(B, &[("yuv420p", Some("bt709")), (fmt, None)]);
+            assert!(
+                matches!(why(&p).as_slice(), [Unsupported::MixedMatricesWith(_, d)] if d.contains("in a still")),
+                "{fmt}: {:?}",
+                why(&p)
+            );
+        }
         // What the conversion does not cover keeps the frame FFmpeg's: another format, a grade, an effect, an opacity.
-        let p = stack(B, &[("yuv420p", Some("bt709")), ("yuv444p", None)]);
-        assert!(
-            matches!(why(&p).as_slice(), [Unsupported::MixedMatricesWith(_, d)] if d.contains("yuv420p")),
-            "{:?}",
-            why(&p)
-        );
+        for fmt in ["yuv420p10le", "gray", "yuvj420p"] {
+            let p = stack(B, &[("yuv420p", Some("bt709")), (fmt, None)]);
+            assert!(
+                why(&p).iter().any(
+                    |u| matches!(u, Unsupported::MixedMatricesWith(_, d) if d.contains("yuv video") || d.contains("full range"))
+                ),
+                "{fmt}: {:?}",
+                why(&p)
+            );
+        }
         let mut p = stack(B, &[("yuv420p", Some("bt709")), ("yuv420p", None)]);
         p.layers[1].transform.opacity = 0.5;
         assert!(
@@ -2459,7 +2507,7 @@ mod tests {
             why(&p)
         );
         let mut p = stack(B, &[("yuv420p", Some("bt709")), ("yuv420p", None)]);
-        p.layers[1].effects = vec![VideoEffect::Invert];
+        p.layers[1].effects = vec![VideoEffect::Blur { sigma: 2.0 }];
         assert!(
             why(&p)
                 .iter()
@@ -2467,6 +2515,25 @@ mod tests {
             "{:?}",
             why(&p)
         );
+        // Invert and grayscale are tables the export's scale applies ahead of the conversion: drawn there; a still's chain has no
+        // converter of its own after them, and its composite is not the conversion of the effect's picture.
+        for effect in [VideoEffect::Invert, VideoEffect::Grayscale] {
+            let mut p = stack(B, &[("yuv420p", Some("bt709")), ("yuv420p", None)]);
+            p.layers[1].effects = vec![effect];
+            assert!(
+                why(&p)
+                    .iter()
+                    .any(|u| matches!(u, Unsupported::MixedMatricesWith(_, d) if d.contains("effect"))),
+                "{:?}",
+                why(&p)
+            );
+            p.mode = PlanMode::Motion;
+            assert!(
+                why(&p).iter().all(|u| !matches!(u, Unsupported::MixedMatricesWith(..))),
+                "{:?}",
+                why(&p)
+            );
+        }
         // A grade on any layer of a stack of mixed matrices, the unconverted bottom one included.
         {
             use crate::model::{CurvePoint, Curves};
@@ -2641,10 +2708,12 @@ mod tests {
         assert!(!p.gpu_supported_at(p.size(u32::MAX)));
         assert!(p.gpu_supported_at(p.size(640)));
         // A shrink steeper than the scaler comparison covers is FFmpeg's: 640 px to
-        // 13 is past 40:1, 640 px to 19 is not.
-        let p = with_fmt(Some("yuv420p"), 0.02, 1.0);
+        // 6 is past 63:1, 640 px to 12 (53:1) and 19 are not.
+        let p = with_fmt(Some("yuv420p"), 0.01, 1.0);
         let why = p.unsupported_reasons_at(p.size(u32::MAX));
-        assert!(why.iter().any(|r| r.contains("steeper than the 40:1")), "{why:?}");
+        assert!(why.iter().any(|r| r.contains("steeper than the 63:1")), "{why:?}");
+        let p = with_fmt(Some("yuv420p"), 0.02, 1.0);
+        assert!(p.gpu_supported_at(p.size(u32::MAX)));
         let p = with_fmt(Some("yuv420p"), 0.03, 1.0);
         assert!(p.gpu_supported_at(p.size(u32::MAX)));
         // A translucent layer of odd size, at the size it is rendered.

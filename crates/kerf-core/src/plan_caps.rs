@@ -166,6 +166,10 @@ pub struct GpuCaps {
     /// plane), **measured** on this FFmpeg's graph (`kerf_gpu::convert`). Without it a stack or a cut of mixed matrices is
     /// FFmpeg's.
     pub matrix_convert: bool,
+    /// The compositor's scaler is **not** measured to be swscale's (a probe that found it differs, could not tell, or has not run):
+    /// it draws a resized layer a level from FFmpeg's, which the exact rule does not allow, so the plan refuses every layer that a
+    /// scale resizes ([`Unsupported::ScalerApproximate`]). [`GpuCaps::A0`] leaves it off: what A0 draws, it draws as it always did.
+    pub scaler_approximate: bool,
 }
 
 impl GpuCaps {
@@ -189,6 +193,7 @@ impl GpuCaps {
         exact_scaler: false,
         blur_fill: false,
         matrix_convert: false,
+        scaler_approximate: false,
     };
 }
 
@@ -390,6 +395,9 @@ pub enum Unsupported {
     /// A layer whose matrix is not the composite's (FFmpeg 9 converts it into the bottom layer's) that the compositor
     /// does not convert in this chain (the detail says why), or has no measured conversion for (`GpuCaps::matrix_convert`).
     MixedMatricesWith(LayerRef, &'static str),
+    /// A layer a scale resizes, where the compositor's scaler is not known to be swscale's to the level
+    /// ([`GpuCaps::scaler_approximate`]).
+    ScalerApproximate(LayerRef),
     /// The composite colour policy could not be measured and the stack is not BT.601.
     UnmeasuredPolicy(YuvMatrix),
     RgbInStack(YuvMatrix),
@@ -455,7 +463,9 @@ impl Unsupported {
             Self::Svg => "svg",
             Self::Scaler(_) => "scaler",
             Self::MatrixUnknown(_) => "matrix_unknown",
-            Self::MixedMatrices | Self::MixedMatricesWith(..) => "mixed_matrices",
+            Self::MixedMatrices => "mixed_matrices",
+            Self::MixedMatricesWith(..) => "mixed_matrices_with",
+            Self::ScalerApproximate(_) => "scaler_approximate",
             Self::UnmeasuredPolicy(_) => "unmeasured_policy",
             Self::RgbInStack(_) => "rgb_in_stack",
             Self::GradedInFullRangeStack(_) => "graded_in_full_range_stack",
@@ -596,6 +606,10 @@ impl fmt::Display for Unsupported {
             Self::MixedMatrices => f.write_str(
                 "layers tagged with different YCbCr matrices: FFmpeg converts them into the bottom layer's, which is not reproduced",
             ),
+            Self::ScalerApproximate(l) => write!(
+                f,
+                "{l}: resized by a scale, and this compositor's scaler is not measured to be swscale's (it draws the picture a level off)"
+            ),
             Self::MixedMatricesWith(l, why) => write!(
                 f,
                 "{l}: a colour matrix other than the composite's, which FFmpeg converts into the bottom layer's and the compositor does not for {why}"
@@ -651,6 +665,10 @@ mod tests {
         assert_eq!(Unsupported::Shrink(0, (4000, 2000), (50, 20)).kind(), "shrink");
         assert_ne!(Unsupported::Text.kind(), Unsupported::TextSequence(String::new()).kind());
         assert_eq!(Unsupported::MixedMatrices.kind(), "mixed_matrices");
+        assert_eq!(
+            Unsupported::MixedMatricesWith(layer(0, ""), "an opacity below 1").kind(),
+            "mixed_matrices_with"
+        );
         assert_eq!(Unsupported::SpeedRamp(layer(1, "a.mp4")).kind(), "speed_ramp");
         assert_eq!(
             Unsupported::BlendMode(layer(0, "a.mp4"), BlendMode::Multiply).kind(),

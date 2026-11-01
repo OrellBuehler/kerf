@@ -2498,6 +2498,7 @@ fn every_variant() -> Vec<Unsupported> {
         Unsupported::Geometry(0, String::new()),
         Unsupported::BlurFillWith(layer(), ""),
         Unsupported::MixedMatricesWith(layer(), ""),
+        Unsupported::ScalerApproximate(layer()),
     ]
 }
 
@@ -2559,6 +2560,7 @@ fn ordinal(u: &Unsupported) -> usize {
         Unsupported::Geometry(..) => 52,
         Unsupported::BlurFillWith(..) => 53,
         Unsupported::MixedMatricesWith(..) => 54,
+        Unsupported::ScalerApproximate(..) => 55,
     }
 }
 
@@ -2588,7 +2590,12 @@ fn why_unreached(
         "grade_with" if kernels != Kernels::Match => {
             "not judged: this FFmpeg's grade conversions differ, so every grade is refused as `grade` first"
         }
-        "mixed_matrices" | "matrix_unknown" | "rgb_in_stack" | "full_range_cut" | "graded_in_full_range_stack"
+        "mixed_matrices"
+        | "mixed_matrices_with"
+        | "matrix_unknown"
+        | "rgb_in_stack"
+        | "full_range_cut"
+        | "graded_in_full_range_stack"
             if !negotiating =>
         {
             "FixedBt601: this FFmpeg composites every stack as BT.601, so there is nothing to negotiate"

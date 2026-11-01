@@ -4795,11 +4795,9 @@ async fn get_render_bar(
             if graded {
                 let _ = kerf_gpu::grade::kernels();
             }
-            // The scaler is exact in the caps once it is measured; the blurred fill and a resized graded layer are
-            // drawn only then.
-            if graded || timeline.format.as_ref().is_some_and(|f| f.fit == kerf_core::Fit::Blur) {
-                let _ = kerf_gpu::scaler::kernels();
-            }
+            // The scaler is exact in the caps once it is measured, and a resized layer is drawn only then (a scaler
+            // that is not known to be swscale's draws it a level off): any cut may resize one.
+            let _ = kerf_gpu::scaler::kernels();
             // A layer of another matrix than the bottom's is converted into it by FFmpeg 9 and drawn only where that
             // conversion is measured to be the one the GPU follows (the policy is already known here).
             if kerf_core::composite_color_policy() == kerf_core::CompositeColorPolicy::BottomLayerTag {

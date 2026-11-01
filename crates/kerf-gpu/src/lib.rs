@@ -67,9 +67,8 @@
 //!   padding, the vertical kernel, and the algorithm an unflagged `scale` runs in a complex graph
 //!   (bilinear before FFmpeg 5) — is measured ([`scaler::kernels`]) and the committed evidence is
 //!   `tests/scaler.rs`: the model equals FFmpeg's `scale` sample for sample on both builds, 2:1 to
-//!   40:1, and the shader equals the model (`tests/parity.rs::the_scaler_matches_ffmpegs_scale_plane_by_plane`).
-//!   A shrink steeper than 40:1 ([`kerf_core::MAX_SHRINK`]) is not measured and is
-//!   refused. FFmpeg scales a picture in the format it has; the decode reduces it to
+//!   63:1, and the shader equals the model (`tests/parity.rs::the_scaler_matches_ffmpegs_scale_plane_by_plane`).
+//!   A shrink steeper than 63:1 ([`kerf_core::MAX_SHRINK`]; swscale needs a second scaler from 64:1) is refused. FFmpeg scales a picture in the format it has; the decode reduces it to
 //!   8-bit 4:2:0 first, which is the same picture only for 4:2:0 and gray: the chroma
 //!   of anything else is interpolated from different samples (a 2x enlargement of 4:4:4
 //!   is 27 levels off, of RGB 69, and a shrink as mild as 1.05x to 1.5x reads flat max

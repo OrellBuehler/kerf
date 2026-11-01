@@ -21,7 +21,7 @@
 //! (the fit `scale`, `pad`) made: a resized layer is scaled **then** converted (measured: 0 of 10240 luma samples differ
 //! with the order the other way round at 9931). A still's graph has no `format`, and its last `scale` converts the matrix in
 //! the same pass as its resize, which is not this. **Whose matrix is the composite's** is the chain's, not the frame's: the
-//! first clip on an alpha plane (a clip entering through a dissolve: `format=yuva420p`), else the first clip, and every clip
+//! first clip on an alpha plane (a clip entering through a dissolve, a keyed zoom or position, or a source with an alpha channel: nothing in its chain forces a converter), else the first clip, and every clip
 //! of another matrix is converted into it once, wherever on the timeline ([`kerf_core::PlanCanvas::cut_matrix`], measured
 //! with three clips in every combination of plain and dissolving). A **dissolving** clip's chain ends in `format=yuva420p`
 //! and its last `scale` converts the matrix itself in the same pass as its resize, as in a still: such a clip is converted by
