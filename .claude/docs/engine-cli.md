@@ -62,7 +62,7 @@ so the feature is **only** activated through these forwards — which is what ma
   (`is_head_padded_proxy`, pure) instead of a flag on `Asset` beside the swapped
   path. `source_traits` is the one cached ffprobe per file that answers HDR, the
   lead, the container and the range flag (`source_is_full_range`: `None` for an `ffprobe` that exits 0 and prints
-  nothing that describes a file, so an asset that did not record its range is never read as limited on no evidence;
+  nothing that describes a file, so an asset that did not record its range is never read as limited on no evidence (such an answer is a **failed probe**: `probe_source_traits` returns `None`, which the cache remembers for the failure backoff and then asks again, instead of caching the neutral traits of an ordinary file for good);
   `source_is_full_range_known` is the same answer from the cache alone, `ProbeCache::peek`, which spawns and waits on
   nothing, for a render: each file's slot is an `RwLock`, a probe holds the write side, so only a probe in progress makes a peek miss, never another reader) — killed after 20 s, one probe however many threads ask, a failure
   remembered 60 s like `proxy_video_info`'s (`engine/source_probe.rs`'s `ProbeCache`, which the
@@ -1469,7 +1469,8 @@ so the feature is **only** activated through these forwards — which is what ma
   whole command line at 32767 — so `externalize_filter_complex` spills anything
   over `GRAPH_ARG_MAX` to a temp file, passed via `-filter_complex_script` or,
   where FFmpeg 8 removed that option, the `-/filter_complex <file>` form that
-  replaced it (`graph_script_flag` probes `-h full` once per process). The
+  replaced it (`graph_script_flag` probes `-h full` once per process). `GRAPH_ARG_MAX` and `spill_long_graph` are `pub`: the compositor's
+  child processes that carry a long graph use them (the text sequences, and every probe's `Budget::ffmpeg`, `gpu.md`). The
   still path samples `Clip::reframe_at` to a constant `v360` instead, and
   `export_format` ignores a reframed clip's source dimensions so a 5760x2880
   capture does not become the deliverable size.

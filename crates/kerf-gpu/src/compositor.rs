@@ -779,6 +779,14 @@ fn effect_picture(layer: &kerf_core::PlanLayer, geom: &LayerGeometry) -> (bool, 
     (layer.animated.is_some_and(|a| a.places && !a.still_motion), geom.picture)
 }
 
+/// The caps of a host that asks the files of a plan ahead of it ([`prepare`], [`prepare_ahead`] and [`prepare_ranges`] do):
+/// the plan then reads the cache of the placed files' ranges ([`GpuCaps::file_range`]). [`Compositor::caps`], the compositor's own
+/// entry points and [`Compositor::CAPS`] (a pure statement of what it can draw) judge without it.
+fn asking(mut caps: GpuCaps) -> GpuCaps {
+    caps.file_range = true;
+    caps
+}
+
 /// Do ahead of a frame what a plan needs measured and what takes a while: FFmpeg's `geq`, for a
 /// plan with a mask or a keyed opacity (the export's `geq`), and its conversions to and from RGB, for a plan with a
 /// grade ([`crate::grade::kernels`]; fifteen short child processes at once, once per process: the grade is in the caps only once it is known to match)
@@ -818,10 +826,26 @@ fn prepare_placement(plan: &RenderPlan) {
     {
         let _ = crate::conversion::conversion();
     }
-    if plan.canvas.policy != kerf_core::CompositeColorPolicy::FixedBt601 {
-        for layer in placed.iter().filter(|l| l.stream.color_range.is_none()) {
-            let _ = kerf_core::source_is_full_range(std::path::Path::new(&layer.path));
-        }
+    prepare_ranges(plan);
+}
+
+/// Ask the files of a plan's placed layers for their range, where the composite's range is negotiated and the asset did not
+/// record it (`kerf_core::source_is_full_range`: one `ffprobe` a file, remembered), so that what reads the answer without
+/// spawning anything finds it: the render (`placement_of`'s check at draw time) and the plan itself for a host that asks
+/// ahead ([`kerf_core::GpuCaps::file_range`]: [`Compositor::session_caps`] sets it), which is what lets a session, the render bar and
+/// a hand-over refuse a full-range file, or one that would not say, before the frame instead of during it. [`prepare`] does
+/// this with the rest; the render bar, which measures its caps itself and needs only this, calls it on its plans
+/// ([`kerf_core::BarRequest::ask`]). Call it from a blocking thread, off any lock: it may wait for a probe, bounded.
+pub fn prepare_ranges(plan: &RenderPlan) {
+    if plan.canvas.policy == kerf_core::CompositeColorPolicy::FixedBt601 {
+        return;
+    }
+    for layer in plan
+        .layers
+        .iter()
+        .filter(|l| plan.pose(l).is_some() && l.stream.color_range.is_none())
+    {
+        let _ = kerf_core::source_is_full_range(std::path::Path::new(&layer.path));
     }
 }
 
@@ -875,6 +899,16 @@ impl Compositor {
         )
     }
 
+    /// [`Compositor::caps`] for judging a **span** (a play session's `PlayCut::ahead` and `resume`, a primer) rather than a frame
+    /// the compositor is about to draw: the plan then also reads the cache of the files' ranges ([`GpuCaps::file_range`]) and
+    /// refuses a placed layer whose file is full range or has not said, which the draw-time check would refuse a frame into
+    /// the session. The host asks the files first ([`prepare_ahead`], [`prepare`], [`prepare_ranges`]). [`Compositor::caps`]
+    /// is the same without it, as the compositor's own entry points judge a plan (the decode is what asks the file for the
+    /// frame it draws, [`crate::frame_source::warm_range`]).
+    pub fn session_caps(&self) -> GpuCaps {
+        asking(self.caps())
+    }
+
     /// [`Compositor::caps`] for a machine whose FFmpeg's conversions are `kernels`, without a device: the way a host that
     /// has none to ask (the render bar) says what the GPU draws.
     pub fn caps_for(kernels: crate::grade::Kernels) -> GpuCaps {
@@ -886,6 +920,11 @@ impl Compositor {
     /// text is drawn, it stays FFmpeg's.
     pub fn caps_with(kernels: crate::grade::Kernels, text: Option<crate::text::Model>) -> GpuCaps {
         Self::caps_measured(kernels, text, crate::placement_probe::measured())
+    }
+
+    /// [`Compositor::caps_for`] for judging spans ([`Compositor::session_caps`]): the render bar's.
+    pub fn session_caps_for(kernels: crate::grade::Kernels) -> GpuCaps {
+        asking(Self::caps_for(kernels))
     }
 
     /// [`Compositor::caps_with`] for a machine whose `pad`, `perspective` and `crop` place a picture as `placement` says

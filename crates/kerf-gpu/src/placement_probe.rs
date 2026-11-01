@@ -20,27 +20,34 @@
 //!   ([`kerf_core::placement_probe_motion`]): the count's origin, `eval=frame` re-evaluating, and the machine's
 //!   `sin` and `cos` against the app's.
 //!
-//! A probe that could not tell (FFmpeg would not run, timed out, wrote the wrong amount) is [`Placement::Unknown`]: it is
-//! asked again after a backoff and nothing placed is drawn until it answers.
+//! A probe that could not tell (FFmpeg would not run, timed out, wrote the wrong amount, ran out of its one deadline) is
+//! [`Placement::Unknown`]: it is asked again after a backoff and nothing placed is drawn until it answers. **One probe runs
+//! at a time** whoever asks (the render bar, a frame's [`crate::prepare`], a play session's primer, the self-test: the others
+//! wait for it and take its answer, [`crate::measure`]), **inside one deadline** ([`TIMING`]) however many children it
+//! takes, and each child's graph stays under the engine's argv rule ([`kerf_core::GRAPH_ARG_MAX`]: the poses of a shape are
+//! stacked in as many runs as that takes, not in one 31 KB command line next to Windows' 32,767).
 
 use std::fmt::Write as _;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use kerf_core::perspective::{PlacementFrame, PlacementMap, Pose};
 
-use crate::measure::{self, Slot, Verdict};
+use crate::measure::{self, Budget, Probe, Timing, Verdict};
 use crate::placement::{reference, Picture, Placed};
 
 /// What the probe found: [`Verdict::Match`] (the chain places a picture as the model does, in every case),
 /// [`Verdict::Differs`] (it does not: the detail names the first case) or [`Verdict::Unknown`].
 pub type Placement = Verdict;
 
-/// One FFmpeg run.
-const LIMIT: Duration = Duration::from_secs(20);
-const BACKOFF: Duration = Duration::from_secs(30);
+/// One FFmpeg run is bounded at 20 s, the whole probe (a few dozen runs of tens of milliseconds) at 45 s, and a probe that
+/// could not tell is not asked again before 30 s.
+const TIMING: Timing = Timing {
+    backoff: Duration::from_secs(30),
+    overall: Duration::from_secs(45),
+    per_run: Duration::from_secs(20),
+};
 
-static STATE: Mutex<Slot> = Mutex::new(Slot::new());
+static STATE: Probe = Probe::new();
 
 /// What is known without running anything: the measured answer, else [`Placement::Unknown`] (not measured yet, backing off
 /// after a probe that could not tell, or held back by a self-test). What the compositor's caps are made from.
@@ -48,17 +55,20 @@ pub fn measured() -> Placement {
     measure::known(&STATE)
 }
 
-/// The answer, measured on the first call: about ten short `ffmpeg` children, one after the other (tens of milliseconds
-/// each, each bounded by 20 s), with no lock held — a blocking thread's, ahead of the frame that needs it
-/// ([`crate::prepare`]). `Unknown` is not remembered but for a backoff.
+/// The answer, measured on the first call: a few dozen short `ffmpeg` children, one after the other (tens of milliseconds
+/// each, each bounded by 20 s, all of them by 45 s), with no lock held — a blocking thread's, ahead of the frame that needs it
+/// ([`crate::prepare`]). A caller that arrives while the probe runs waits for it (no longer than its deadline) and takes its
+/// answer. `Unknown` is not remembered but for a backoff.
 pub fn placement() -> Placement {
-    measure::cached(&STATE, Instant::now(), BACKOFF, probe)
+    measure::cached(&STATE, Instant::now(), TIMING, probe)
 }
 
-/// [`placement`] for the runtime self-test, which draws a placed frame only on a `Match`. An `Unknown` here holds the placement
-/// back for the process until a self-test that can tell has run, so the frames the GPU draws are never ones its check skipped.
+/// [`placement`] for the runtime self-test, which draws a placed frame only on a `Match`. A probe that cannot tell is run once
+/// more after the backoff (and an earlier failure's backoff is waited out, not taken for the answer); one that cannot tell
+/// then either holds the placement back for the process until a self-test that can tell has run, so the frames the GPU draws
+/// are never ones its check skipped.
 pub(crate) fn placement_for_selftest() -> Placement {
-    measure::checked(&STATE, Instant::now(), BACKOFF, probe)
+    measure::checked(&STATE, TIMING, probe)
 }
 
 /// A deterministic generator.
@@ -185,11 +195,11 @@ fn num(x: f64) -> String {
     format!("{x}")
 }
 
-fn probe() -> Verdict {
+fn probe(budget: &Budget) -> Verdict {
     let mut rng = Lcg(0x0070_6c61_6365);
     for (canvas, input, full) in SHAPES {
         let noise = Noise::new(&mut rng, input);
-        match stacked(&noise, canvas, &poses(canvas, full)) {
+        match stacked(budget, &noise, canvas, &poses(canvas, full)) {
             Ok(None) => {}
             Ok(Some(why)) => return Verdict::Differs(why),
             Err(why) => {
@@ -200,7 +210,7 @@ fn probe() -> Verdict {
     }
     for (canvas, input) in [((64, 36), (64, 36)), ((64, 36), (40, 24)), ((66, 40), (65, 40))] {
         let noise = Noise::new(&mut rng, input);
-        match in_motion(&noise, canvas) {
+        match in_motion(budget, &noise, canvas) {
             Ok(None) => {}
             Ok(Some(why)) => return Verdict::Differs(why),
             Err(why) => {
@@ -212,57 +222,110 @@ fn probe() -> Verdict {
     Verdict::Match
 }
 
-/// The first differing case of every pose of `cases` on one picture, in one run: the picture is split once per case, each
-/// branch placed by that case's chain, and the results laid side by side in one frame. `Ok(None)`: all equal.
-/// `Err` when FFmpeg would not run or wrote something else than was asked.
-fn stacked(noise: &Noise, canvas: (u32, u32), cases: &[Case]) -> Result<Option<String>, String> {
-    let n = cases.len();
+/// The first differing case of every pose of `cases` on one picture, stacked into as few runs as the argv rule allows
+/// ([`runs`]): in a run the picture is split once per case, each branch placed by that case's chain, and the results laid
+/// side by side in one frame. `Ok(None)`: all equal. `Err` when FFmpeg would not run or wrote something else than was asked.
+fn stacked(budget: &Budget, noise: &Noise, canvas: (u32, u32), cases: &[Case]) -> Result<Option<String>, String> {
+    let chains = chains(cases, canvas);
+    for run in runs(&chains) {
+        if let Some(why) = stack_run(budget, noise, canvas, &cases[run.clone()], &chains[run])? {
+            return Ok(Some(why));
+        }
+    }
+    Ok(None)
+}
+
+/// The placement chain of each case, as the engine writes it.
+fn chains(cases: &[Case], canvas: (u32, u32)) -> Vec<String> {
+    cases
+        .iter()
+        .map(|c| {
+            let scale = c.pose.scale.map(num);
+            kerf_core::placement_probe_chain(
+                scale.as_deref(),
+                (&num(c.pose.pos.0), &num(c.pose.pos.1)),
+                canvas,
+                c.per_frame,
+            )
+        })
+        .collect()
+}
+
+/// The graph that places one picture by each of `chains` and stacks the results side by side.
+fn stack_graph(chains: &[String]) -> String {
+    let n = chains.len();
     let mut graph = format!("[0:v]split={n}");
     for i in 0..n {
         let _ = write!(graph, "[s{i}]");
     }
     graph.push(';');
-    for (i, c) in cases.iter().enumerate() {
-        let scale = c.pose.scale.map(num);
-        let chain = kerf_core::placement_probe_chain(
-            scale.as_deref(),
-            (&num(c.pose.pos.0), &num(c.pose.pos.1)),
-            canvas,
-            c.per_frame,
-        );
+    for (i, chain) in chains.iter().enumerate() {
         let _ = write!(graph, "[s{i}]{chain}[o{i}];");
     }
     for i in 0..n {
         let _ = write!(graph, "[o{i}]");
     }
     let _ = write!(graph, "hstack=inputs={n}[out]");
+    graph
+}
+
+/// The cases cut into runs (ranges of them, in order) whose graph each stays within the engine's argv rule
+/// ([`kerf_core::GRAPH_ARG_MAX`]): the chain of a pose is some 700 bytes and a shape has forty of them, 31 KB of command line
+/// in one run, a kilobyte short of what Windows allows a process. A chain that is over the rule alone is a run of its own
+/// (the run spills it to a file, [`Budget::ffmpeg`]).
+fn runs(chains: &[String]) -> Vec<std::ops::Range<usize>> {
+    let mut out = Vec::new();
+    let mut start = 0;
+    for end in 1..=chains.len() {
+        let next_fits = end == chains.len() || stack_graph(&chains[start..=end]).len() <= kerf_core::GRAPH_ARG_MAX;
+        if !next_fits {
+            out.push(start..end);
+            start = end;
+        }
+    }
+    if start < chains.len() {
+        out.push(start..chains.len());
+    }
+    out
+}
+
+/// One run of [`stacked`]: `cases` and their `chains`.
+fn stack_run(
+    budget: &Budget,
+    noise: &Noise,
+    canvas: (u32, u32),
+    cases: &[Case],
+    chains: &[String],
+) -> Result<Option<String>, String> {
+    let n = cases.len();
+    let graph = stack_graph(chains);
     let size = format!("{}x{}", noise.size.0, noise.size.1);
-    let out = measure::ffmpeg(
-        &[
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "yuva420p",
-            "-s",
-            &size,
-            "-i",
-            "pipe:0",
-            "-filter_complex",
-            &graph,
-            "-map",
-            "[out]",
-            "-frames:v",
-            "1",
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "yuva420p",
-            "pipe:1",
-        ],
-        noise.raw(),
-        LIMIT,
-    )
-    .ok_or("ffmpeg did not place the probe's pictures")?;
+    let out = budget
+        .ffmpeg(
+            &[
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuva420p",
+                "-s",
+                &size,
+                "-i",
+                "pipe:0",
+                "-filter_complex",
+                &graph,
+                "-map",
+                "[out]",
+                "-frames:v",
+                "1",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuva420p",
+                "pipe:1",
+            ],
+            noise.raw(),
+        )
+        .ok_or("ffmpeg did not place the probe's pictures")?;
     let (cw, ch) = (canvas.0 as usize, canvas.1 as usize);
     let (sw, chroma_w, chroma_h) = (cw * n, cw * n / 2, ch / 2);
     let want = sw * ch * 2 + 2 * chroma_w * chroma_h;
@@ -286,7 +349,7 @@ fn stacked(noise: &Noise, canvas: (u32, u32), cases: &[Case]) -> Result<Option<S
 
 /// The frames of a moving, behaving placement, as the export writes it over `perspective`'s frame count, against what the plan
 /// evaluates for them.
-fn in_motion(noise: &Noise, canvas: (u32, u32)) -> Result<Option<String>, String> {
+fn in_motion(budget: &Budget, noise: &Noise, canvas: (u32, u32)) -> Result<Option<String>, String> {
     let motion = kerf_core::placement_probe_motion(MOTION_FRAMES);
     let chain = kerf_core::placement_probe_chain(Some(&motion.scale), (&motion.pos.0, &motion.pos.1), canvas, true);
     let size = format!("{}x{}", noise.size.0, noise.size.1);
@@ -296,32 +359,32 @@ fn in_motion(noise: &Noise, canvas: (u32, u32)) -> Result<Option<String>, String
         input.extend_from_slice(&one);
     }
     let frames = MOTION_FRAMES.to_string();
-    let out = measure::ffmpeg(
-        &[
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "yuva420p",
-            "-framerate",
-            "30",
-            "-s",
-            &size,
-            "-i",
-            "pipe:0",
-            "-vf",
-            &chain,
-            "-frames:v",
-            &frames,
-            "-f",
-            "rawvideo",
-            "-pix_fmt",
-            "yuva420p",
-            "pipe:1",
-        ],
-        input,
-        LIMIT,
-    )
-    .ok_or("ffmpeg did not place the probe's moving picture")?;
+    let out = budget
+        .ffmpeg(
+            &[
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuva420p",
+                "-framerate",
+                "30",
+                "-s",
+                &size,
+                "-i",
+                "pipe:0",
+                "-vf",
+                &chain,
+                "-frames:v",
+                &frames,
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuva420p",
+                "pipe:1",
+            ],
+            input,
+        )
+        .ok_or("ffmpeg did not place the probe's moving picture")?;
     let (cw, ch) = (canvas.0 as usize, canvas.1 as usize);
     let each = cw * ch * 2 + 2 * (cw / 2) * (ch / 2);
     if out.len() != each * MOTION_FRAMES as usize {
@@ -462,6 +525,50 @@ mod tests {
         assert_eq!(got.a, &one[cw * ch + 2 * (cw / 2) * (ch / 2)..]);
     }
 
+    /// Every graph the probe hands FFmpeg stays within the engine's argv rule, so that no run of it is a 31 KB command line, and
+    /// the runs of a shape cover its poses once each, in order.
+    #[test]
+    fn no_run_of_the_probe_is_a_command_line_over_the_engines_argv_rule() {
+        let mut most = 0;
+        let mut runs_in_all = 0;
+        for (canvas, _, full) in SHAPES {
+            let cases = poses(canvas, full);
+            let chains = chains(&cases, canvas);
+            let cut = runs(&chains);
+            runs_in_all += cut.len();
+            let covered: Vec<usize> = cut.iter().flat_map(|r| r.clone()).collect();
+            assert_eq!(
+                covered,
+                (0..cases.len()).collect::<Vec<_>>(),
+                "{canvas:?}: every pose once, in order"
+            );
+            for run in cut {
+                let graph = stack_graph(&chains[run.clone()]);
+                assert!(
+                    graph.len() <= kerf_core::GRAPH_ARG_MAX,
+                    "{canvas:?} {run:?}: a {}-byte graph",
+                    graph.len()
+                );
+                assert!(graph.contains("perspective"), "the export's own chain");
+                most = most.max(graph.len());
+            }
+        }
+        // (The poses were one 31 KB graph per shape; the motion probe's `-vf` chain is one pose.)
+        assert!(
+            most > kerf_core::GRAPH_ARG_MAX / 2,
+            "the runs are not cut finer than they need to be: {most}"
+        );
+        assert!(runs_in_all < 40, "{runs_in_all} runs");
+        let motion = kerf_core::placement_probe_motion(MOTION_FRAMES);
+        let chain = kerf_core::placement_probe_chain(Some(&motion.scale), (&motion.pos.0, &motion.pos.1), (64, 36), true);
+        assert!(chain.len() < kerf_core::GRAPH_ARG_MAX, "{} bytes", chain.len());
+        // A chain over the rule alone is a run of its own, and the others are packed around it.
+        let big = vec!["x".repeat(kerf_core::GRAPH_ARG_MAX + 1)];
+        assert_eq!(runs(&big), vec![0..1]);
+        let mixed = vec!["a".to_string(), "x".repeat(kerf_core::GRAPH_ARG_MAX + 1), "b".to_string()];
+        assert_eq!(runs(&mixed), vec![0..1, 1..2, 2..3]);
+    }
+
     /// Every pose the probe tries is one the model takes, so that "the model refuses it" is never what a `Differs` says.
     #[test]
     fn every_pose_the_probe_tries_is_one_the_model_draws() {
@@ -496,12 +603,12 @@ mod tests {
     #[allow(clippy::print_stderr)]
     fn this_ffmpeg_places_a_picture_as_the_model_does_or_the_probe_says_where_not() {
         let started = Instant::now();
-        let first = probe();
+        let first = probe(&Budget::new(&TIMING));
         eprintln!(
             "placement probe: {first:?} in {:.0} ms",
             started.elapsed().as_secs_f64() * 1e3
         );
         assert_ne!(first, Verdict::Unknown, "the probe could not run");
-        assert_eq!(first, probe());
+        assert_eq!(first, probe(&Budget::new(&TIMING)));
     }
 }

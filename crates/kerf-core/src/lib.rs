@@ -89,9 +89,9 @@ pub use engine::{
     PlacementProbeMotion, PlaybackParams, PlaybackRequest, PreviewFrame, RateControl, Region, RenderStatus, ScrubConfig,
     ScrubFrames, ScrubStats, SheetCell, SheetClip, SpeechModelInfo, StemsStatus, StyleInfo, TextPart, TextPiece, TextRasterGraph,
     VariantProgress, VariantsRun, VoiceInfo, VoiceoverStatus, WaveformLevel, WaveformPyramid, WaveformRange, WindowBalance,
-    WrittenAudio, WrittenVideo, DEFAULT_SPEECH_MODEL, DEFAULT_VOICE, FILMSTRIP_HEIGHT, MAX_FILMSTRIP_FRAMES, MAX_MEASURE_SIDE,
-    MAX_SEQUENCE_CHARS, MAX_STREAM_FPS, MAX_STREAM_WIDTH, MAX_VOICE_SPEED, MAX_WAVEFORM_BUCKETS, MIN_STREAM_FPS,
-    MIN_STREAM_WIDTH, MIN_VOICE_SPEED, STEM_NAMES, TEXT_BORDER_PX, TEXT_BOX_PX,
+    WrittenAudio, WrittenVideo, DEFAULT_SPEECH_MODEL, DEFAULT_VOICE, FILMSTRIP_HEIGHT, GRAPH_ARG_MAX, MAX_FILMSTRIP_FRAMES,
+    MAX_MEASURE_SIDE, MAX_SEQUENCE_CHARS, MAX_STREAM_FPS, MAX_STREAM_WIDTH, MAX_VOICE_SPEED, MAX_WAVEFORM_BUCKETS,
+    MIN_STREAM_FPS, MIN_STREAM_WIDTH, MIN_VOICE_SPEED, STEM_NAMES, TEXT_BORDER_PX, TEXT_BOX_PX,
 };
 pub use error::{Error, Result};
 pub use fonts::list_system_fonts;

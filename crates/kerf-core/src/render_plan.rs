@@ -1444,6 +1444,25 @@ impl RenderPlan {
                     // 4:4:4 or 4:2:2 one 5 to 8; exact on 4.4.2. The check is the layout's own and the lifted 4:4:4 /
                     // 4:2:2 are not exempt from it.
                     out.push(Unsupported::PlacedFormat(at(), format!("full-range {fmt}")));
+                } else if caps.file_range
+                    && self.canvas.policy != CompositeColorPolicy::FixedBt601
+                    && stream.color_range.is_none()
+                {
+                    // An asset probed before the range flag was recorded: only its file can say, and a host that asks the
+                    // file ahead (`GpuCaps::file_range`) has left the answer in the cache. Full range, or no answer (a probe that
+                    // failed or has not run), is what the compositor refuses at draw time, so a session, the render bar and a
+                    // hand-over see it before the frame instead of a frame into the play.
+                    match crate::engine::source_is_full_range_known(std::path::Path::new(&layer.path)) {
+                        Some(false) => {}
+                        Some(true) => out.push(Unsupported::PlacedFormat(
+                            at(),
+                            format!("full-range {fmt} (its file flags color_range=pc; its asset did not record it)"),
+                        )),
+                        None => out.push(Unsupported::PlacedFormat(
+                            at(),
+                            format!("{fmt} of a range its asset did not record and its file has not said (not asked ahead, or would not say)"),
+                        )),
+                    }
                 }
             }
             // A live behaviour is drawn as the pose it gives (`PlanLayer::transform`) where that is a moving zoom or position
@@ -1461,8 +1480,9 @@ impl RenderPlan {
                 FitOrder::Uncropped => out.push(Unsupported::FoldedFit(at(), "a Cover clip that zooms or pans")),
             }
             if layer.animated.is_some_and(|a| a.places && !a.zooms && !a.still_motion) && caps.placement {
-                // A position that moves is placed after the same chain a moving zoom is: the grade, the
-                // rotation, the opacity and the dip to white are the ones the placement is not drawn behind.
+                // A position that moves is placed after the same chain a moving zoom is: the rotation, the opacity and
+                // the dip to white are the ones the placement is not drawn behind (a grade is: it hands the placement
+                // its 4:2:0 planes).
                 if let Some(what) = self.zoom_order_refusal(layer, &ops) {
                     out.push(Unsupported::ZoomBehind(at(), what));
                 }
@@ -1470,9 +1490,10 @@ impl RenderPlan {
             if layer.animated.is_some_and(|a| a.zooms) {
                 if caps.keyed_zoom {
                     // The compositor draws a grade, the effects and the mask it draws, and the fades
-                    // at the fit size and zooms after them. A rotation and an opacity below 1 are
-                    // the two it does not order that way: the rotated picture's alpha and the RGB
-                    // round trip would both have to be scaled with the zoom.
+                    // at the fit size and places the picture after them. A rotation, an opacity below 1 and a dip to
+                    // white are what it does not draw ahead of the placement: the placement would act on the rotated
+                    // alpha plane, on the RGB round trip's or on the RGB frame the fade leaves, and no case holds
+                    // any of them to FFmpeg's.
                     if let Some(what) = self.zoom_order_refusal(layer, &ops) {
                         out.push(Unsupported::ZoomBehind(at(), what));
                     }
@@ -1549,7 +1570,8 @@ impl RenderPlan {
     /// filter's). All of it is reproduced for the one picture it was measured on, 8-bit limited-range
     /// `yuv420p` at an even size, and only where nothing between the grade and the next 4:2:0 conversion
     /// sees the RGB (or 4:4:4) picture: a video effect or a black or white fade there runs on it in the format
-    /// FFmpeg negotiates, and a moving zoom's `scale` converts it in the same pass.
+    /// FFmpeg negotiates. (A moving zoom or position after the grade is not in the way: the placement reads the 4:2:0
+    /// planes the grade hands on, and every grade is exact behind it.)
     fn grade_chain_refusal(&self, layer: &PlanLayer, ops: &[FadeOp]) -> Option<&'static str> {
         if layer.stream.pix_fmt.as_deref() != Some("yuv420p") {
             Some("on a picture that is not 8-bit 4:2:0 yuv420p (FFmpeg grades it in the format it negotiates for that picture)")
@@ -1587,10 +1609,10 @@ impl RenderPlan {
     }
 
     /// What is ahead of a moving zoom or position that a compositor with `keyed_zoom` still does not draw: a
-    /// rotation and an opacity below 1 (their alpha plane and RGB round trip would be scaled with
-    /// the zoom), and a dip to white (the zoom's `scale` takes the RGB frame `fade c=white` leaves
-    /// and converts it to 4:2:0 in the same pass, which neither FFmpeg 6.1 nor 9.0 does as a scale of
-    /// the converted picture: up to 14 levels off on 6.1, 3 on 9.0). A grade is not here: the placement reads the
+    /// rotation and an opacity below 1 (the placement would act on the rotated alpha plane or on the RGB round
+    /// trip's, neither of which a case holds to FFmpeg's), and a dip to white (the placement chain's
+    /// `format=yuva420p` takes the RGB frame `fade c=white` leaves and converts it to 4:2:0 in the same pass, which neither FFmpeg 6.1 nor
+    /// 9.0 does as a conversion of the converted picture: up to 14 levels off on 6.1, 3 on 9.0). A grade is not here: the placement reads the
     /// 4:2:0 planes the grade hands on, and every grade (wheels, curves, LUTs of 17, 33 and 2 points, all three)
     /// is exact behind it on 6.1.1 and 9.0.2, in an export frame and in a still.
     fn zoom_order_refusal(&self, layer: &PlanLayer, ops: &[FadeOp]) -> Option<&'static str> {
@@ -2709,6 +2731,85 @@ mod tests {
             policy,
         )
         .unwrap()
+    }
+
+    /// A placed layer whose asset did not record its range, where the composite's range is negotiated: the plan reads the
+    /// cache only for a host that asks the file ahead (`GpuCaps::file_range`), and then refuses a file that is full range or
+    /// that has not said, so a session, the render bar and a hand-over see what the compositor would refuse at draw time.
+    #[test]
+    fn a_placed_layer_with_no_recorded_range_is_judged_by_the_files_answer_only_where_the_host_asks_it() {
+        let key = |time: f64, scale: f64| Keyframe {
+            time,
+            scale,
+            pos_x: 0.0,
+            pos_y: 0.0,
+            rotation: 0.0,
+            opacity: 1.0,
+            easing: Default::default(),
+        };
+        let caps = GpuCaps {
+            motion: true,
+            fades: true,
+            keyed_zoom: true,
+            placement: true,
+            ..GpuCaps::A0
+        };
+        let asking = GpuCaps {
+            file_range: true,
+            ..caps
+        };
+        let plan_of = |name: &str, recorded: Option<&str>, policy: CompositeColorPolicy| {
+            let mut stream = video(640, 360);
+            stream.color_range = recorded.map(String::from);
+            let a = asset(name, 20.0, vec![stream]);
+            let mut clip = Clip::new(a.id, 0.0, 10.0, 0.0);
+            clip.keyframes = vec![key(0.0, 1.0), key(8.0, 1.5)];
+            let plan = RenderPlan::at(
+                &timeline(vec![vec![clip]]),
+                std::slice::from_ref(&a),
+                &ExportOptions {
+                    fps: Some(30.0),
+                    ..ExportOptions::default()
+                },
+                4.0,
+                policy,
+            )
+            .unwrap();
+            let path = std::path::PathBuf::from(&plan.layers[0].path);
+            (plan, path)
+        };
+        let asked = |plan: &RenderPlan, caps: &GpuCaps| {
+            plan.reasons(caps, plan.size(u32::MAX))
+                .into_iter()
+                .filter_map(|u| match u {
+                    Unsupported::PlacedFormat(_, why) => Some(why),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let negotiating = CompositeColorPolicy::BottomLayerTag;
+        // A file nobody asked: a pure plan does not mind, a host that asks does not draw it.
+        let (cold, _) = plan_of("range-cold", None, negotiating);
+        assert!(asked(&cold, &caps).is_empty());
+        let why = asked(&cold, &asking);
+        assert!(matches!(why.as_slice(), [w] if w.contains("has not said")), "{why:?}");
+        // A file that said limited is drawn; one that said full range is not.
+        let (limited, path) = plan_of("range-limited", None, negotiating);
+        crate::engine::seed_source_range(&path, false);
+        assert!(asked(&limited, &asking).is_empty());
+        let (full, path) = plan_of("range-full", None, negotiating);
+        crate::engine::seed_source_range(&path, true);
+        let why = asked(&full, &asking);
+        assert!(
+            matches!(why.as_slice(), [w] if w.starts_with("full-range") && w.contains("did not record")),
+            "{why:?}"
+        );
+        assert!(asked(&full, &caps).is_empty(), "and only for a host that asks");
+        // Where the composite's range is fixed, or the asset recorded it, the file is not asked about.
+        let (fixed, _) = plan_of("range-fixed", None, CompositeColorPolicy::FixedBt601);
+        assert!(asked(&fixed, &asking).is_empty());
+        let (recorded, _) = plan_of("range-recorded", Some("tv"), negotiating);
+        assert!(asked(&recorded, &asking).is_empty());
     }
 
     /// The plan of a clip whose zoom (`zooming`) or position moves, judged by a compositor that draws the placement.

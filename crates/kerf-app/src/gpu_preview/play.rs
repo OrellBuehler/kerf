@@ -663,7 +663,7 @@ impl GpuPreview {
             .plan(t)
             .map_err(|e| one("no_plan", format!("no plan for the first frame: {e}")))?;
         let (_, size) = self.sized(technique, &bounds, &drawing.host, &first).map_err(|r| vec![r])?;
-        let caps = drawing.compositor.caps();
+        let caps = drawing.compositor.session_caps();
         // All or nothing: a frame in the next few seconds that the GPU does not draw is the stream's
         // for the whole session, not a switch of renderer partway through it.
         if let Some(ahead) = cut.ahead(t, HORIZON, size, &caps) {
@@ -787,7 +787,7 @@ impl GpuPreview {
             Ok(size) => size,
             Err(why) => return not(vec![Reason::new("no_plan", why)]),
         };
-        let caps = drawing.compositor.caps();
+        let caps = drawing.compositor.session_caps();
         let info = |ahead: Option<AheadInfo>, resume: Option<f64>| PlayInfo {
             session: key.session,
             start: cut.start(),
@@ -899,7 +899,7 @@ impl GpuPreview {
             Ok(sized) => sized,
             Err(reason) => return stream(reason, session),
         };
-        let caps = drawing.compositor.caps();
+        let caps = drawing.compositor.session_caps();
         let ahead = session.ahead(t, size, &caps);
         // The frame asked for is at or past the first one the GPU does not draw (the page's hand-over was
         // late, or this is a frame of a reversed clip or a moving title): it is not attempted.

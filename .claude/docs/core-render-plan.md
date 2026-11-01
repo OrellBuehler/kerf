@@ -134,6 +134,12 @@
   clip's start, the output frame, the `fps=` rational, and whether a padded proxy's clone is
   dropped) — and `Pick::select(&SourceFrames { pts, time_base, start_us })` is the reference
   that names an index among a file's frames (ticks, as `ffprobe` / `showinfo` state them).
+  **No tick arithmetic can wrap or panic**, whatever a file or a clip brings (pts and the container's start at the ends of the
+  `i64`, a last duration of `i64::MAX`, an in-point of 1e300 seconds that saturates the seek): every difference of timestamps
+  goes through `diff`, every sum through `sum` (saturating; the seek and the container's start are summed exactly in an `i128`
+  and clamped), and a sum that fits is the plain operator's, so a pick over timestamps that overflow nothing is what it always
+  was (`checker_a_gates`: 300,000 random picks at the ends of the integers and of the floats, no panic, and `fps_pick`,
+  `Pick::select`, `progress` over the whole file, `output_index` and `fps_span` agree).
   **The `fps` pick is arithmetic, not the formula the A1 design measured** (last frame with
   `pts < ws + s*((k+1/2)/fps - start)`, which is right to first order): `-ss` shifts the
   timestamps by the seek rounded to a *tick*, `trim` keeps `[lo, hi)` after both ends are cut
@@ -254,6 +260,9 @@
   encoded by state and kind into `BarSpan { start, end, state: gpu | stream | stall, kind, reason }`; `caps: None` is
   the GPU preview off (only stalls), `waits` the Proxy-only proxy waits; a frame with no layer and no title is no span,
   a cut with no video none at all, a rate outside 1..60 fps the stream's (`frontend-timeline.md` has the semantics).
+  `BarRequest::ask` is the host's hook, called with a frame's plan before it is judged when the layers on screen are not the
+  previous frame's (and only with `caps`): what it measures or asks of a file for the plan to read from a cache, which for the GPU
+  preview is `kerf_gpu::prepare_ranges` (a placed layer's range, below).
   **`PlayCut`** (`play_plan.rs`, pure) is the cut a compositor that **plays** draws, which is what
   `stream_preview` plays: a `PlanMode::Motion` planner over `Timeline::slice(start, ..)`, so the clips'
   `fps` picks, fades and dissolves are the export's of that slice. `start` is a frame of the project's
@@ -347,6 +356,7 @@
   moving zoom's; a grade is drawn behind it), for an odd-height picture (`Geometry`: `pad` keeps or loses its last row by how the graph allocated the
   frame, and the builds differ), for a letterboxed picture at the identity pose in a still (the still pads it to the whole
   frame first, with opaque bars), for a picture that is not 4:2:0 or gray (`PlacedFormat`: the chain converts it to `yuva420p` itself, which is the decode's conversion only where the `scale` filter defaults to the same scaler: 24 levels of chroma off on 4:4:4 and 16 on 4:2:2 on 4.4.2, exact on 6.1.1 and 9.0.2, so planar 4:4:4 / 4:2:2 are drawn where `GpuCaps::placed_chroma` says the probe measured a match), for a moving still image (`StillMotion`'s own graph: no placement checks apply), and for a pose whose positions leave the table's range (`PlacementFrame::reachable`).
+  **Where the composite's range is negotiated, a placed layer whose asset did not record its range** (`color_range` `None`: probed before the flag was kept) **is judged by its file** for a host that asks the files ahead (`GpuCaps::file_range`, which the compositor's `session_caps()` sets and `GpuCaps::A0` and `Compositor::caps()` do not, so a plan judged without it stays a pure function of its inputs): `reasons` reads `source_is_full_range_known` (the cache alone: it spawns and waits on nothing) and refuses (`PlacedFormat`) a file that is full range or that has not said (never asked, being asked, failed, nothing usable), which is what the compositor's draw-time check refuses, seen by `PlayCut::ahead` / `resume`, a primer and the render bar before the frame instead of a frame into a session (`gpu.md`).
   `Animated` is `Some` for a
   keyed transform, colour, mask or crop and `Animated.keys` (`layer_geometry::Keyed {scale, rotation, rotates,
   opacity}`) says which transform numbers are keyed, because a clip keyed in part is not built like one
@@ -427,8 +437,9 @@
   mask, a chroma key or a moving zoom is judged by is the layer's `keyed_alpha < 255` as well as the sampled opacity (`mask_refusal`,
   `zoom_order_refusal`), and **a chroma key under a keyed opacity is refused for the clip** (`Effects`, every frame of it: `geq` reads the
   key's alpha plane, one in at the edge on 6.1). **With `keyed_zoom` the plan still refuses a rotation, an opacity below 1 and a dip to white in front of a moving
-  zoom** (`ZoomBehind(layer, what)`, Still and Motion alike: the rotated alpha plane and the RGB round trip would have to be scaled
-  with the zoom), and without it a Still refuses a grade, rotation, opacity, mask or effect in front of one. The old API stays: `gpu_supported()` / `unsupported_reasons()` (an owned
+  zoom** (`ZoomBehind(layer, what)`, Still and Motion alike: the placement would act on the rotated alpha plane, on the RGB round trip's
+  or on the RGB frame a dip to white leaves, and no case holds any of them to FFmpeg's; a grade is not here, it is drawn ahead of the placement),
+  and without it a Still refuses a grade, rotation, opacity, mask or effect in front of one. The old API stays: `gpu_supported()` / `unsupported_reasons()` (an owned
   `Vec<String>`) / `unsupported_reasons_at(size)` / `gpu_supported_at(size)` are
   `reasons(&GpuCaps::A0, ..)`: a plan is refused while a fade step is live, a layer
   travels or a tail window is open — exactly, where A0 refused the whole

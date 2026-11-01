@@ -320,7 +320,7 @@ impl GpuPreview {
         let (_, size) = self.sized(technique, bounds, &drawing.host, &first).map_err(|r| r.text)?;
         // The probes the caps are made of, for every frame of the horizon (this runs off the render lock).
         kerf_gpu::prepare_ahead(&cut, t, HORIZON);
-        if let Some(ahead) = cut.ahead(t, HORIZON, size, &drawing.compositor.caps()) {
+        if let Some(ahead) = cut.ahead(t, HORIZON, size, &drawing.compositor.session_caps()) {
             return Err(format!("{} (at {:.2} s)", ahead.why, ahead.at));
         }
         let motion = MotionFrames::with_config(Arc::clone(&drawing.source), play_config());

@@ -114,10 +114,11 @@ pub struct GpuCaps {
     pub keyed_opacity: bool,
     /// Keyframed zoom: FFmpeg runs it as the last stage of the clip's chain (see
     /// `Animated`), so a compositor that sets this draws the grade, the effects, the mask and the
-    /// fades at the fit size first and the zoom after them. A rotation, or an opacity below 1,
-    /// in front of a moving zoom is refused whatever the caps (`ZoomBehind`): both would have to
-    /// be scaled with it. This is the order only; the zoom itself is drawn by the placement
-    /// ([`GpuCaps::placement`]), without which a moving zoom is refused (`KeyedPlacement`).
+    /// fades at the fit size first and the zoom after them. A rotation, an opacity below 1 and a dip to white
+    /// in front of a moving zoom are refused whatever the caps (`ZoomBehind`): the placement would act on the rotated
+    /// alpha plane, on the RGB round trip's or on the RGB frame `fade c=white` leaves, and no case holds any of them to
+    /// FFmpeg's (a grade is not here: it is drawn ahead of the placement). This is the order only; the zoom itself is drawn
+    /// by the placement ([`GpuCaps::placement`]), without which a moving zoom is refused (`KeyedPlacement`).
     pub keyed_zoom: bool,
     /// A moving zoom or position placed at sub-pixel positions: FFmpeg ends the clip's chain in a
     /// `perspective` that lays the picture on a canvas-sized frame (bilinear, fixed-point; the export,
@@ -137,6 +138,14 @@ pub struct GpuCaps {
     /// is bilinear: 24 levels of chroma off on 4:4:4, 16 on 4:2:2), so a compositor sets this only where it **measured**
     /// that the two conversions agree on the FFmpeg in use; without it such a layer is refused (`PlacedFormat`).
     pub placed_chroma: bool,
+    /// The host asks a placed layer's file for its range ahead of the plans it judges (`kerf_gpu::prepare`,
+    /// `prepare_ahead`, the render bar's hook: the compositor's `session_caps` set this), so the plan may read what that left in the cache
+    /// ([`source_is_full_range_known`](crate::source_is_full_range_known)): where the composite's range is negotiated, a placed
+    /// layer whose asset did not record its range is refused (`PlacedFormat`) when the file is full range **or has not said**,
+    /// instead of that being found out at draw time, a frame into a session. It reads the cache, never a file; **a plan
+    /// judged without it is a pure function of its inputs** (every other host, every test), and the compositor's own entry
+    /// points leave it off because its decode is what asks the file for the frame it draws.
+    pub file_range: bool,
     /// Live behaviours (`Clip.behaviors`: a sway, breath, spin, drift or shake on top of the pose). The
     /// plan carries the exact pose they give at the frame's time, so a compositor that draws the pose
     /// draws them; every frame of such a layer is refused (`Behavior`) until one sets this (it is the placement's,
@@ -164,7 +173,8 @@ pub struct GpuCaps {
     /// The parts of a clip's grade (wheels, curves, a 3D LUT) drawn: FFmpeg carries the picture through RGB
     /// for them, and a compositor that sets a part reproduces that round trip and the filter. Still refused
     /// whatever the caps (`GradeWith`): a layer the scaler resizes, a letterbox, an odd picture, a format other
-    /// than 8-bit limited-range `yuv420p`, video effects behind the grade, a running black or white fade and a moving zoom.
+    /// than 8-bit limited-range `yuv420p`, video effects behind the grade and a running black or white fade. (A moving zoom
+    /// or position after the grade is drawn: the placement reads the planes the grade hands on.)
     pub grade: GradeKinds,
 }
 
@@ -179,6 +189,7 @@ impl GpuCaps {
         keyed_zoom: false,
         placement: false,
         placed_chroma: false,
+        file_range: false,
         behaviors: false,
         keyed_color: false,
         mask: false,

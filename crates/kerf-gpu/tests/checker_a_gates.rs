@@ -947,7 +947,6 @@ fn checker_a_frame_pick_with_hostile_clip_numbers_neither_panics_nor_wanders() {
 /// duration. Not numbers FFmpeg can be compared at (its own `int64_t` arithmetic overflows there), so the pick is asked only
 /// to be a frame of the file or none, the same however it is asked, and no panic.
 #[test]
-#[ignore = "fails today: frame_pick.rs still overflows its i64 sums at pts, container start and last duration at the ends; remove this when it saturates them"]
 fn checker_a_frame_pick_with_timestamps_at_the_ends_of_the_integers_neither_panics_nor_wanders() {
     let sweep = hostile_sweep(true, false, 300_000);
     report("timestamps at the ends of the integers", &sweep);
@@ -968,7 +967,6 @@ fn checker_a_frame_pick_with_timestamps_at_the_ends_of_the_integers_neither_pani
 /// The clip's in-point and the file's lead at the ends of the floats too (a source in-point of 9.2e12 seconds, 1e300): the
 /// seek then saturates at the end of the `i64` and every sum with the container's start or a timestamp is past it.
 #[test]
-#[ignore = "fails today: frame_pick.rs still overflows seek_shift and the window's differences at a saturated seek; remove this when it saturates them"]
 fn checker_a_frame_pick_with_an_in_point_at_the_ends_of_the_floats_neither_panics_nor_wanders() {
     let sweep = hostile_sweep(false, true, 300_000);
     report("in-point and lead at the ends", &sweep);

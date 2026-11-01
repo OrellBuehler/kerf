@@ -75,7 +75,7 @@ impl<T: Copy> ProbeCache<T> {
         Self::retrying(SOURCE_PROBE_RETRY)
     }
 
-    fn retrying(retry: Duration) -> Self {
+    pub(super) fn retrying(retry: Duration) -> Self {
         Self {
             files: Mutex::new(HashMap::new()),
             retry,

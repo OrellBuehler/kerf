@@ -1672,8 +1672,9 @@ fn luma_plane_pix_fmt(name: &str) -> bool {
 
 /// [`SourceTraits`] of the file at `path`, probed once per file and cached against the file's
 /// size and modified time. One `ffprobe`, killed after [`SOURCE_PROBE_TIMEOUT`]; `None` when the
-/// probe itself fails or outlasts it, and the failure is remembered for a minute (a broken or
-/// hung `ffprobe` is not respawned by every frame that asks), then retried.
+/// probe itself fails, outlasts it or exits 0 with an answer that describes no file (nothing usable on its
+/// output), and the failure is remembered for a minute (a broken or hung `ffprobe` is not respawned by every
+/// frame that asks), then retried.
 ///
 /// It spawns a process: not under a lock.
 pub(crate) fn source_traits(path: &Path) -> Option<SourceTraits> {
@@ -1699,6 +1700,17 @@ pub fn source_is_full_range_known(path: &Path) -> Option<bool> {
 
 fn full_range_of(traits: SourceTraits) -> Option<bool> {
     traits.described.then_some(traits.full_range)
+}
+
+/// Make the cache hold `full_range` for `path` (a test seeds what a probe of a file would have left).
+#[cfg(test)]
+pub(crate) fn seed_source_range(path: &Path, full_range: bool) {
+    let traits = SourceTraits {
+        described: true,
+        full_range,
+        ..SourceTraits::default()
+    };
+    let _ = source_traits_cache().get(path, || Some(traits));
 }
 
 fn source_traits_cache() -> &'static ProbeCache<SourceTraits> {
@@ -1728,7 +1740,10 @@ fn probe_source_traits(ffprobe: &str, path: &Path, timeout: std::time::Duration)
     .args(["-of", "json"])
     .arg(path);
     let output = run_piped_until(&mut cmd, Vec::new(), Instant::now() + timeout)?;
-    Some(parse_source_traits(&String::from_utf8_lossy(&output)))
+    let traits = parse_source_traits(&String::from_utf8_lossy(&output));
+    // (An `ffprobe` that exits 0 and prints nothing usable has told nothing: that is a failed probe, retried after the
+    // failure backoff, and not the neutral traits of an ordinary file remembered for good.)
+    traits.described.then_some(traits)
 }
 
 /// The pure half of [`source_traits`]: read the probe's JSON. Anything missing
@@ -7171,7 +7186,7 @@ impl Drop for PassLogs {
 /// (`MAX_ARG_STRLEN`) and Windows caps the whole command line at 32767
 /// characters, which is about ten seconds of animation. The threshold sits well
 /// below both, since spilling to a file costs nothing.
-const GRAPH_ARG_MAX: usize = 8192;
+pub const GRAPH_ARG_MAX: usize = 8192;
 
 /// Index of the `-filter_complex` *value* when it is too long to pass in argv.
 fn oversized_graph_index(args: &[String]) -> Option<usize> {
@@ -12337,6 +12352,40 @@ mod tests {
             source_is_full_range_known(Path::new("/no/such/file/was/asked/about.mkv")),
             None
         );
+    }
+
+    /// A probe whose output describes no file is a failed probe (`None`: the cache retries it after the failure backoff), not the
+    /// neutral traits of an ordinary file remembered for good.
+    #[cfg(unix)]
+    #[test]
+    fn a_probe_that_said_nothing_usable_is_a_failure_and_not_remembered_as_an_answer() {
+        let ask =
+            |ffprobe: &str| probe_source_traits(ffprobe, Path::new("/no/such/file.mkv"), std::time::Duration::from_secs(10));
+        // Exits 0 with nothing; exits 0 with its own arguments (which are no JSON); does not run at all.
+        assert_eq!(ask("true"), None);
+        assert_eq!(ask("echo"), None);
+        assert_eq!(ask("/no/such/ffprobe"), None);
+        let cache = ProbeCache::<SourceTraits>::retrying(std::time::Duration::from_secs(3600));
+        let path = Path::new("/no/such/file.mkv");
+        let mut asked = 0;
+        for _ in 0..3 {
+            assert_eq!(
+                cache.get(path, || {
+                    asked += 1;
+                    ask("true")
+                }),
+                None
+            );
+        }
+        assert_eq!(asked, 1, "a failure is remembered inside the backoff");
+        let retrying = ProbeCache::<SourceTraits>::retrying(std::time::Duration::ZERO);
+        for _ in 0..3 {
+            let _ = retrying.get(path, || {
+                asked += 1;
+                ask("true")
+            });
+        }
+        assert_eq!(asked, 4, "and asked again after it, not kept as an answer");
     }
 
     /// A hung `ffprobe` is killed at the timeout and a failing one is no answer, where
