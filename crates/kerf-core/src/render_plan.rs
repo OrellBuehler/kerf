@@ -984,6 +984,25 @@ impl RenderPlan {
                     }
                 }
             }
+            // `pad` of a picture with an odd height that `scale` forwarded untouched (the decoder's frame as it is), placed at the
+            // frame's origin: with room in the buffer `pad` fills the bottom bar in place from the even-rounded height and the odd
+            // last row goes, and with none it copies the picture and the row stays. Which one it is the decoder's and the frame's
+            // (measured on 9.0.2: FFV1 keeps the row, ffvhuff drops it), so the plan cannot say. A picture off the origin is
+            // always copied, and a resampled one always padded in place (its odd row is dropped: `picture_shows`).
+            if geom.matte
+                && geom.picture_at == (0, 0)
+                && geom.picture.1 % 2 == 1
+                && geom.picture_shows.1 == geom.picture.1
+                && !matches!(self.blur_fill(layer, size), Ok(Some(_)))
+            {
+                reasons.push(Unsupported::Geometry(
+                    n,
+                    format!(
+                        "pad of a {}x{} picture with an odd height at the frame's origin, which `pad` fills in place (the odd last row goes) or copies (it stays) as the decoder's frame allows",
+                        geom.picture.0, geom.picture.1
+                    ),
+                ));
+            }
             // A scaler that is not measured to be swscale's draws a resized layer a level off: not exact, so FFmpeg's.
             if caps.scaler_approximate && geom.stages.iter().any(|s| s.scaled != (s.src.w, s.src.h)) {
                 reasons.push(Unsupported::ScalerApproximate(self.layer_ref(n, layer)));
@@ -1155,8 +1174,7 @@ impl RenderPlan {
             }
             // FFmpeg scales a picture in the format it has; the compositor scales the
             // 8-bit 4:2:0 a decode reduces it to, which is the same picture only when
-            // that is what it already was (or gray, which has no chroma). For anything
-            // else the chroma is interpolated from different samples — FFmpeg's real
+            // that is what it already was. For anything else the chroma is interpolated from different samples — FFmpeg's real
             // ones, the compositor's already averaged away: a 2x enlargement of 4:4:4
             // is 27 levels off, of RGB 69, and a shrink as mild as 1.05-1.5x still
             // reads flat max 8-9 (4:2:2 at 0.9x is over the limit) and 32 levels on
@@ -1222,9 +1240,17 @@ impl RenderPlan {
                     ));
                 }
             }
+            // The exact scaler is proven for planar 8-bit 4:2:0 only. A 10-bit picture is scaled by FFmpeg at 10 bits and dithered
+            // once at the end (off by one in Y, U and V on 6.1.1), and a gray one has its luma scaled in `gray` and converted after
+            // (Y up to 10 off over half the plane on 9.0.2): neither is the 8-bit 4:2:0 the decode hands the compositor, and
+            // semi-planar `nv12` has no case at all.
             let resizing = geom.stages.iter().find(|s| s.scaled != (s.src.w, s.src.h));
-            if let Some(stage) = resizing.filter(|_| !matches!(layer.stream.layout(), Some(PixLayout::Yuv420 | PixLayout::Gray)))
-            {
+            let eight_bit_420 = layer
+                .stream
+                .pix_fmt
+                .as_deref()
+                .is_some_and(|f| matches!(f.to_ascii_lowercase().as_str(), "yuv420p" | "yuvj420p"));
+            if let Some(stage) = resizing.filter(|_| !eight_bit_420) {
                 reasons.push(Unsupported::FormatResize(
                     n,
                     (stage.src.w, stage.src.h),
@@ -2661,12 +2687,16 @@ mod tests {
             plan(&tl, std::slice::from_ref(&a), 1.0)
         };
         // Resizing a picture FFmpeg scales in another format is refused — enlarging
-        // and shrinking alike, a mild shrink included; 4:2:0 and gray are not, and
-        // neither is a picture left at its size, whatever the format.
+        // and shrinking alike, a mild shrink included, and 10-bit 4:2:0 and gray with them (the exact scaler is
+        // proven for 8-bit 4:2:0 only); a picture left at its size is not, whatever the format.
         for (fmt, scale, refused) in [
             ("yuv420p", 2.0, false),
-            ("yuv420p10le", 2.0, false),
-            ("gray", 2.0, false),
+            ("yuvj420p", 2.0, false),
+            ("yuv420p10le", 2.0, true),
+            ("gray", 2.0, true),
+            ("gray10le", 2.0, true),
+            ("nv12", 2.0, true),
+            ("p010le", 0.9, true),
             ("yuv444p", 1.5, true),
             ("yuv422p", 2.0, true),
             ("bgr0", 2.0, true),
@@ -2678,8 +2708,10 @@ mod tests {
             ("yuv422p", 0.9, true),
             ("rgb24", 0.5, true),
             ("yuv420p", 0.5, false),
-            ("yuv420p10le", 0.9, false),
-            ("gray", 0.5, false),
+            ("yuv420p10le", 0.9, true),
+            ("gray", 0.5, true),
+            ("gray", 1.0, false),
+            ("yuv420p10le", 1.0, false),
         ] {
             let p = with_fmt(Some(fmt), scale, 1.0);
             let why = p.unsupported_reasons_at(p.size(u32::MAX));
@@ -2722,6 +2754,42 @@ mod tests {
         assert!(why.iter().any(|r| r.contains("odd size")), "{why:?}");
         let p = with_fmt(Some("yuv420p"), 0.5, 0.5);
         assert!(p.gpu_supported_at(p.size(u32::MAX)));
+    }
+
+    #[test]
+    fn pad_of_an_odd_picture_at_the_frames_origin_is_refused() {
+        let pad = |w: u32, h: u32, frame: (u32, u32)| {
+            let p = fading_plan_of(
+                video(w, h),
+                Some(Delivery::new(frame.0, frame.1, Fit::Contain)),
+                CompositeColorPolicy::FixedBt601,
+                |_| {},
+                0.5,
+            );
+            p.unsupported_reasons_at(p.size(u32::MAX))
+        };
+        // One row short of the frame, at the origin, scale forwarding the decoder's frame: `pad` fills in place or copies as the
+        // decoder's buffer allows, and the odd last row goes or stays with it.
+        for (w, h, frame) in [(64, 35, (64, 36)), (96, 53, (96, 54)), (96, 51, (96, 52))] {
+            let why = pad(w, h, frame);
+            assert!(
+                matches!(why.as_slice(), [r] if r.contains("pad of a") && r.contains("odd height")),
+                "{w}x{h}: {why:?}"
+            );
+        }
+        // Off the origin `pad` always copies; resampled it always pads in place (a 62x35 picture is fitted to 64x36); an even
+        // picture has no odd row.
+        for (w, h, frame) in [
+            (62, 35, (64, 36)),
+            (64, 5, (64, 36)),
+            (64, 31, (64, 36)),
+            (64, 34, (64, 36)),
+            (640, 360, (360, 640)),
+            (64, 36, (64, 36)),
+        ] {
+            let why = pad(w, h, frame);
+            assert!(why.is_empty(), "{w}x{h}: {why:?}");
+        }
     }
 
     #[test]

@@ -564,15 +564,18 @@
     `layer-geometry.ts`, places the Preview's transform handles and replays `layer_geometry/corpus.rs`'s
     `fixtures/layer-geometry-corpus.json` — regenerate with `KERF_BLESS_CORPUS=1 cargo test -p kerf-core
     --no-default-features -- layer_geometry_corpus` after an intended rounding change): a
-    translucent layer of odd size, **resizing a picture that is not 8/10-bit
-    4:2:0 or gray** (any scale stage that changes its size, in either direction) —
+    translucent layer of odd size, **resizing a picture that is not planar 8-bit
+    4:2:0 (`yuv420p` / `yuvj420p`)** (any scale stage that changes its size, in either direction; 10-bit 4:2:0 and gray included: FFmpeg scales 10 bits and
+    dithers once at the end, off by one in Y, U and V on 6.1.1, and a gray luma in `gray`, up to 10 levels off over half the plane on 9.0.2 — `FormatResize`) —
     FFmpeg scales in the format the picture has, the decode reduces it to 8-bit 4:2:0
     first, and the chroma is then interpolated from different samples: enlarging was
     4:4:4 x1.5 27 levels off, 4:2:2 x2 17, BGR0 x2 51, PNG RGB x2 69, and even a shrink
     as mild as 1.05-1.5x reads flat max 8-9 (4:2:2 at 0.9x is over the limit) with
     edges up to 32 levels. No band of ratios is measured strictly inside the limits on
     both FFmpegs for busy chroma, so none is claimed; a picture left at its size is
-    drawn for every format — and **a crop of a picture whose chroma is finer than
+    drawn for every format — **a `pad` of a picture with an odd height that `scale` forwarded untouched, placed at the frame's origin** (one row short of the
+    frame: `Geometry`; `vf_pad.c` pads in place when the decoder's frame is writable and has room, and the odd last row goes, and copies it
+    otherwise, so the outcome is the decoder's and the plan cannot say — measured on 9.0.2: FFV1 keeps the row, ffvhuff drops it; 6.1.1 kept it in every file tried, and the refusal is on every build) — and **a crop of a picture whose chroma is finer than
     4:2:0's**. Where a position rounds
     depends on where in the graph it is (`RenderPlan::layer_geometry`): the first
     `crop` runs on the picture as decoded and rounds to its **native** chroma grid

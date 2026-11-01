@@ -307,8 +307,12 @@ impl Planner {
             let placed = clip.placement_animated();
             let tied = needs_alpha || placed || fx.alpha;
             // What may put a converter into a chain on the plane: the filters before `format=yuva420p` that take no alpha (`eq`, the
-            // grade's RGB filters, an effect), a tone map, a reprojection, and a fade a placed chain runs on `yuv420p` first.
+            // grade's RGB filters, an effect), a tone map, a reprojection, a fade a placed chain runs on `yuv420p` first, and a dip
+            // to white on either side (`fade c=white` runs on RGB: measured on 9.0.2, an alpha-source or dissolving clip that dips
+            // to white is not the one whose tag decides, and the cut's every sample moved).
             let extras = unmeasured_route
+                || fx.white_in > 0.0
+                || fx.white_out > 0.0
                 || !clip.color.is_identity()
                 || clip.color_animated()
                 || !clip.grade.is_identity()
@@ -1691,6 +1695,41 @@ mod tests {
             }
         };
         assert!(cut_of(&[(&bt709, false), (&untagged, false)], &corrected, 5).1);
+        // A dip to white runs `fade c=white` on RGB, so a converter sits in the chain of a clip on the plane that carries one (either
+        // side of the cut): such a clip may not be the one whose tag decides, and the cut is not read. Plain clips dipping are unaffected.
+        let dipping = |i: usize, c: &mut Clip| {
+            if i == 1 {
+                c.transition_in = Some(Transition {
+                    kind: TransitionKind::DipToWhite,
+                    duration: 0.4,
+                });
+            }
+        };
+        for frame in [5, 40, 70] {
+            for clips in [
+                [(&alpha601, false), (&untagged, false)],
+                [(&untagged, false), (&alpha601, false)],
+            ] {
+                assert!(cut_of(&clips, &dipping, frame).1, "{frame}");
+                assert!(!cut_of(&clips, &none, frame).1, "{frame}");
+            }
+            assert!(!cut_of(&[(&bt709, false), (&untagged, false)], &dipping, frame).1, "{frame}");
+        }
+        // A dissolving clip that dips to white on its way out is the same: it is tied and carries the fade.
+        let dissolving_then_dipping = |i: usize, c: &mut Clip| {
+            if i > 0 {
+                c.transition_in = Some(Transition {
+                    kind: if i == 1 {
+                        TransitionKind::Crossfade
+                    } else {
+                        TransitionKind::DipToWhite
+                    },
+                    duration: 0.4,
+                });
+            }
+        };
+        let three = [(&bt709, false), (&untagged, false), (&bt709, false)];
+        assert!(cut_of(&three, &dissolving_then_dipping, 5).1);
         // The export visits a track's clips in start-time order: stored later-first, the earlier clip decides.
         let swapped = |i: usize, c: &mut Clip| c.timeline_start = if i == 0 { 1.0 } else { 0.0 };
         for frame in [5, 40] {

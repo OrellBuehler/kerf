@@ -633,7 +633,7 @@ impl fmt::Display for Unsupported {
             ),
             Self::FormatResize(n, from, to, pf) => write!(
                 f,
-                "layer {n}: scales a {}x{} picture to {}x{}, and its format ({pf}) is not 8/10-bit 4:2:0 or gray, which FFmpeg scales in its own format",
+                "layer {n}: scales a {}x{} picture to {}x{}, and its format ({pf}) is not planar 8-bit 4:2:0, the only format the exact scaler is proven for (FFmpeg scales the others in their own format)",
                 from.0, from.1, to.0, to.1
             ),
             Self::Geometry(n, why) => write!(f, "layer {n}: {why}"),
