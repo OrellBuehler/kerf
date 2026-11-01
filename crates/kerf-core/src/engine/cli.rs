@@ -9328,21 +9328,29 @@ pub struct TextPiece<'a> {
 /// `extra` options (the position, `y_align`, ...): `drawtext=<options>`, to put in a graph.
 pub fn text_piece_filter(t: &crate::render_plan::PlanText, frame_h: u32, piece: &TextPiece<'_>, extra: &[&str]) -> String {
     let fontsize = (f64::from(frame_h) * t.size).round().max(1.0);
+    // The colours are spliced unquoted: every one goes through `safe_color`, which leaves a colour ffmpeg parses
+    // as it is (the argv is the same) and cannot be made to carry an option of its own. The callers' are
+    // constants and probed hex, so an invalid one is a bug: loud in a test, an invisible colour otherwise
+    // (and the picture it makes is not the one `drawtext` draws, which the compositor's proof refuses).
+    let colour = |c: &str| {
+        debug_assert!(valid_color(c), "a text piece colour ffmpeg may not parse: {c:?}");
+        safe_color(c, "white@0").to_string()
+    };
     let mut parts = vec![
         format!("text='{}'", escape_drawtext_with(piece.text, true, piece.lines)),
         format!("fontsize={}", fnum(fontsize)),
-        format!("fontcolor={}", piece.font),
+        format!("fontcolor={}", colour(piece.font)),
     ];
     if let Some(path) = t.font_file.as_deref() {
         parts.push(format!("fontfile='{}'", escape_drawtext_path(&path.to_string_lossy())));
     }
     if let (true, Some(border)) = (t.synthetic_bold, piece.border) {
         parts.push(format!("borderw={TEXT_BORDER_W}"));
-        parts.push(format!("bordercolor={border}"));
+        parts.push(format!("bordercolor={}", colour(border)));
     }
-    if let Some((colour, border)) = piece.boxed {
+    if let Some((box_colour, border)) = piece.boxed {
         parts.push("box=1".to_string());
-        parts.push(format!("boxcolor={colour}"));
+        parts.push(format!("boxcolor={}", colour(box_colour)));
         parts.push(format!("boxborderw={border}"));
     }
     parts.extend(extra.iter().map(|e| (*e).to_string()));
@@ -15579,6 +15587,32 @@ mod tests {
         // ...and what `drawtext` draws of a text is what the escape keeps of it.
         assert_eq!(text_as_drawn("a\r\nb\u{2028}c\u{7}d\te"), "a b cd\te");
         assert_eq!(text_as_drawn("50% off: it's"), "50% off: it's", "escaping is not cleaning");
+    }
+
+    #[test]
+    #[cfg(debug_assertions)]
+    #[should_panic(expected = "a text piece colour")]
+    fn a_piece_colour_that_could_carry_an_option_is_a_bug_in_the_caller() {
+        use crate::render_plan::PlanText;
+        let t = PlanText {
+            id: uuid::Uuid::nil(),
+            text: "x".into(),
+            size: 0.06,
+            pos: (0.5, 0.5),
+            alpha: 1.0,
+            color: "white".into(),
+            bg: None,
+            font_file: None,
+            synthetic_bold: false,
+        };
+        let piece = TextPiece {
+            text: "x",
+            lines: false,
+            font: "white:fontsize=1",
+            border: None,
+            boxed: None,
+        };
+        let _ = text_piece_filter(&t, 960, &piece, &[]);
     }
 
     #[test]

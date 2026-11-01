@@ -381,7 +381,7 @@ pub enum Unsupported {
 
 impl Unsupported {
     /// What kind of refusal this is, without the layer names and numbers its message carries: a
-    /// stable key to count refusals by (`mixed_matrices`, `text_too_small`, …).
+    /// stable key to count refusals by (`mixed_matrices`, `text_sequence`, …).
     pub fn kind(&self) -> &'static str {
         match self {
             Self::NoPicture(_) => "no_picture",

@@ -2347,17 +2347,19 @@ impl Compositor {
                 count,
             });
         }
-        // FFmpeg rasterises what text there is, here, before the GPU is touched. No project lock is
-        // held, but the caller's render lock is (the app's preview holds `RenderState` across a render,
-        // decode included): the wait for a first-seen caption is one process, bounded by RASTER_TIMEOUT.
+        // FFmpeg rasterises what text there is, here, before the GPU is touched. Neither the project lock nor
+        // the app's render lock is held (a frame draws with what it took under the lock, off it); a
+        // first-seen caption is several `ffmpeg` processes (the picture, the measure, the dictionary), each
+        // killed at its own timeout, and what failed is not tried again for a while.
         let texts = self.prepare_text(plan, size, texts)?;
         self.gpu
             .guarded("compositing a frame", || self.draw(plan, &drawn, &texts, size, output))
     }
 
     /// Every overlay of the frame rasterised (or served from the atlas) and turned into the blends
-    /// that draw it. Blocks for one `ffmpeg` process (at most `RASTER_TIMEOUT`) the first time a state
-    /// is seen, so a caller holding a lock across a render holds it that long.
+    /// that draw it. Blocks for several `ffmpeg` processes the first time a state is seen (the picture,
+    /// the measure of the glyphs and the glyphs themselves, each at most a run timeout of 20 s at the
+    /// outside), so this is for a blocking thread, with no lock held that anything else waits on.
     fn prepare_text(&self, plan: &RenderPlan, size: (u32, u32), texts: Texts) -> Result<Vec<PreparedText>, GpuError> {
         let limit = self.gpu.device.limits().max_texture_dimension_2d;
         plan.overlays

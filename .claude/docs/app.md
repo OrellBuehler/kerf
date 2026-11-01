@@ -251,7 +251,7 @@ and no `blob:`; core serializes the geometry without pixels) and **no MCP tool**
 `get_timeline_frame` (the composited still at a time; see Scrubbed frames below),
 `get_scopes` (`kerf_core::scopes` of the export's still at a time, from the originals: the summary and the grids asked
 for; the MCP tool of the same name) / `get_render_bar` (`kerf_core::render_bar` over the working cut, for the GPU
-preview's caps when the setting is on (`Compositor::caps_for(grade::measured())`: the grade is in them once this FFmpeg's conversions are known to be the ones the GPU draws, which a cut with a graded clip asks for first, on the command's blocking thread), the proxy waits and the measured colour policy; GUI-only, see
+preview's caps when the setting is on (`Compositor::caps_for(grade::measured())`: the grade is in them once this FFmpeg's conversions are known to be the ones the GPU draws, which a cut with a graded clip asks for first, and a cut with text probes `drawtext` (`text::model()`: its layout and colour conversion, without which `caps.text` is false), on the command's blocking thread), the proxy waits and the measured colour policy; GUI-only, see
 `frontend-timeline.md`),
 detached panels (`popout_expect` / `popout_cancel` / `popout_focus` / `popout_move` / `close_popout`, see Detached panels below; GUI-only, no MCP tool),
 `start_playback { playback_id, start, fps?, max_width?, on_frame }` / `stop_playback` — streamed
