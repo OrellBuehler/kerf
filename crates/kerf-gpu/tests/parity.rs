@@ -6882,3 +6882,76 @@ fn what_a_blend_is_not_exact_for_is_refused_in_a_still() {
     let why = reasons(&plan, plan.size(u32::MAX));
     assert!(why.iter().any(|w| w.contains("letterboxed layer")), "{why:?}");
 }
+
+// ==== checker/e: blend modes in a still (independent of the implementer's cases) =======================================
+
+/// A still's graph is the layers on screen: the matrix its blend names is the bottom one's **there**, not the cut's. A cut whose layers change tag half
+/// way (BT.709 bars and a BT.709 blended clip, then untagged ones) looked at in each half; the PNG's own conversion is what keeps the comparison at
+/// `STRICT` (a wrong matrix is tens of levels in `difference`).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_a_still_names_the_matrix_of_the_layers_on_screen() {
+    use kerf_core::BlendMode;
+    let m = media();
+    for mode in [
+        BlendMode::Difference,
+        BlendMode::Multiply,
+        BlendMode::Screen,
+        BlendMode::Exclusion,
+    ] {
+        for (name, first, second, top_first, top_second) in [
+            ("709 then untagged", &m.bars709, &m.bars, &m.testsrc709, &m.testsrc),
+            ("untagged then 709", &m.bars, &m.bars709, &m.testsrc, &m.testsrc709),
+            ("709 then 470bg", &m.bars709, &m.bars470bg, &m.testsrc709, &m.testsrc170m),
+            ("470bg then untagged", &m.bars470bg, &m.bars, &m.testsrc170m, &m.testsrc),
+        ] {
+            let blended = |asset: &Asset, start: f64| {
+                let mut c = clip(asset, 0.0, 1.0, start);
+                c.blend_mode = mode;
+                c
+            };
+            let tl = timeline(
+                vec![
+                    vec![clip(first, 0.0, 1.0, 0.0), clip(second, 0.0, 1.0, 1.0)],
+                    vec![blended(top_first, 0.0), blended(top_second, 1.0)],
+                ],
+                None,
+            );
+            blend_check(
+                &format!("checker/e/still {mode:?} {name}"),
+                &tl,
+                &[first.clone(), second.clone(), top_first.clone(), top_second.clone()],
+                &[0.4, 1.4],
+                STRICT,
+            );
+        }
+    }
+}
+
+/// A still of a blended clip with the others a still can hold: a late start (nothing blended yet, then the clip), a clip ending before the
+/// cut does, two blended clips, and the clip's alpha from a key and a fade.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_a_still_of_a_blended_clip_among_others() {
+    use kerf_core::BlendMode;
+    let m = media();
+    let assets = [m.bars.clone(), m.testsrc.clone(), m.noise.clone()];
+    let mut late = clip(&m.testsrc, 0.0, 1.0, 0.8);
+    late.blend_mode = BlendMode::Screen;
+    let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![late]], None);
+    blend_check("checker/e/still late blended clip", &tl, &assets, &[0.3, 0.9, 1.7], STRICT);
+    let mut a = clip(&m.testsrc, 0.0, 2.0, 0.0);
+    a.blend_mode = BlendMode::Overlay;
+    let mut b = clip(&m.noise, 0.0, 2.0, 0.0);
+    b.blend_mode = BlendMode::Difference;
+    b.fade_in = 0.5;
+    b.effects = vec![a_key("green", 0.2, 0.3)];
+    let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![a], vec![b]], None);
+    blend_check(
+        "checker/e/still two blended clips, a key and a fade",
+        &tl,
+        &assets,
+        &[0.1, 0.25, 1.2],
+        BUSY,
+    );
+}

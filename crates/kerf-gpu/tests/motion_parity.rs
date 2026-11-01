@@ -5280,3 +5280,1490 @@ fn what_a_blend_is_not_exact_for_is_refused() {
         );
     }
 }
+
+// ==== checker/e: blend modes, checked independently of the implementer's cases ======================================
+//
+// Every case below is drawn through `blend_run`: where this FFmpeg's blend chain is the model's the compositor's frames
+// are compared with the export's planes at zero tolerance, and where the probe refused the build (FFmpeg 4.4) the plan must
+// refuse every frame and the arithmetic is held to the export with the caps forced.
+
+/// A cut of `bottom` (the composite) with `top` blended over it on a second track; `edit` decides what the blended clip carries.
+fn ce_stack(bottom: &Asset, top: &Asset, edit: &dyn Fn(&mut Clip)) -> (Timeline, Vec<Asset>) {
+    let mut c = clip(top, 0.5, 1.5, 0.0);
+    edit(&mut c);
+    (
+        timeline(vec![vec![clip(bottom, 0.5, 1.5, 0.0)], vec![c]], None),
+        vec![bottom.clone(), top.clone()],
+    )
+}
+
+/// A blended clip as large as the frame at every pixel offset that matters on a 640x360 frame: next to each edge and corner, on the
+/// half way lines, on and off the frame, odd offsets (`overlay` floors them to even) and offsets a hair short of the float.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_a_blended_clip_at_every_edge_offset() {
+    let m = media();
+    #[rustfmt::skip]
+    let offsets: [(f64, f64); 32] = [
+        (1.0, 0.0), (-1.0, 0.0), (2.0, 0.0), (3.0, 0.0), (-2.0, 0.0), (-3.0, 0.0),
+        (638.0, 0.0), (639.0, 0.0), (640.0, 0.0), (-638.0, 0.0), (-639.0, 0.0), (-640.0, 0.0),
+        (0.0, 1.0), (0.0, -1.0), (0.0, 3.0), (0.0, -3.0), (0.0, 358.0), (0.0, 359.0), (0.0, 360.0),
+        (0.0, -358.0), (0.0, -359.0), (0.0, -360.0),
+        (318.0, 178.0), (-318.0, -178.0), (319.0, 179.0), (-321.0, 181.0), (637.0, 357.0), (-637.0, -357.0),
+        (639.0, 359.0), (-639.0, -359.0), (7.0, 5.0), (-7.0, -5.0),
+    ];
+    let tops = [("testsrc", &m.testsrc), ("noise", &m.noise), ("edges", &m.edges)];
+    let bottoms = [&m.bars, &m.smooth, &m.testsrc];
+    for (i, (dx, dy)) in offsets.iter().enumerate() {
+        for (k, mode) in BLEND_MODES.iter().enumerate() {
+            // Every mode at the first dozen offsets, a third of them at the rest.
+            if i >= 12 && (k + i) % 3 != 0 {
+                continue;
+            }
+            let (name, top) = tops[(i + k) % 3];
+            let bottom = bottoms[(i + 2 * k) % 3];
+            let (tl, assets) = ce_stack(bottom, top, &|c| {
+                c.blend_mode = *mode;
+                c.transform.pos_x = dx / 640.0;
+                c.transform.pos_y = dy / 360.0;
+            });
+            ce_blend_run(
+                &format!("checker/e/offset {dx},{dy} {mode:?} {name}"),
+                &tl,
+                &assets,
+                30.0,
+                0.4,
+                *dy >= 0.0,
+            );
+        }
+    }
+}
+
+/// The alpha a blended clip lays its mix by: fades of a frame and of the whole clip, overlapping fades, an opacity key that holds, steps and
+/// sits at either end, masks of every shape and feather, a chroma key with every similarity and blend, and several at once.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_alpha_extremes_of_a_blended_clip() {
+    use kerf_core::{BlendMode, Easing, Property, PropertyKey};
+    let m = media();
+    let modes = [
+        BlendMode::Screen,
+        BlendMode::Exclusion,
+        BlendMode::Multiply,
+        BlendMode::HardLight,
+        BlendMode::Difference,
+    ];
+    for (n, mode) in modes.into_iter().enumerate() {
+        let label = |what: &str| format!("checker/e/{mode:?} {what}");
+        let go = |what: &str, secs: f64, edit: &dyn Fn(&mut Clip)| {
+            let (tl, assets) = ce_stack(&m.bars, &m.testsrc, &|c| {
+                c.blend_mode = mode;
+                edit(c);
+            });
+            ce_blend_run(&label(what), &tl, &assets, 30.0, secs, true);
+        };
+        // Fades: one frame, less than a frame, the whole clip, both at once and overlapping.
+        for (fi, fo) in [
+            (0.034, 0.0),
+            (0.0, 0.034),
+            (0.01, 0.01),
+            (1.0, 0.0),
+            (0.0, 1.0),
+            (0.7, 0.7),
+            (1.0, 1.0),
+            (0.3, 0.5),
+        ] {
+            go(&format!("fade {fi}/{fo}"), 1.0, &|c| {
+                c.fade_in = fi;
+                c.fade_out = fo;
+            });
+        }
+        // The opacity key at its extremes.
+        for (what, keys) in [
+            ("opacity 1 to 0", vec![PropertyKey::new(0.0, 1.0), PropertyKey::new(1.0, 0.0)]),
+            ("opacity 0 to 1", vec![PropertyKey::new(0.0, 0.0), PropertyKey::new(1.0, 1.0)]),
+            (
+                "opacity held at 0.5",
+                vec![PropertyKey::new(0.0, 0.5), PropertyKey::new(1.0, 0.5)],
+            ),
+            (
+                "opacity stepping",
+                vec![
+                    PropertyKey {
+                        time: 0.0,
+                        value: 0.9,
+                        easing: Easing::Hold,
+                    },
+                    PropertyKey {
+                        time: 0.3,
+                        value: 0.1,
+                        easing: Easing::Hold,
+                    },
+                    PropertyKey::new(0.7, 1.0),
+                ],
+            ),
+            (
+                "opacity eased near 1",
+                vec![
+                    PropertyKey {
+                        time: 0.0,
+                        value: 0.996,
+                        easing: Easing::EaseOut,
+                    },
+                    PropertyKey::new(1.0, 0.004),
+                ],
+            ),
+            (
+                "opacity bezier",
+                vec![
+                    PropertyKey {
+                        time: 0.0,
+                        value: 0.2,
+                        easing: Easing::Bezier {
+                            x1: 0.9,
+                            y1: 0.0,
+                            x2: 0.1,
+                            y2: 1.0,
+                        },
+                    },
+                    PropertyKey::new(1.0, 0.8),
+                ],
+            ),
+        ] {
+            go(what, 1.0, &|c| c.set_property_keys(Property::Opacity, keys.clone()));
+        }
+        // Masks: every shape and feather, inverted, off centre.
+        for (shape, feather, inverted) in [
+            (kerf_core::MaskShape::Rect, 0.0, false),
+            (kerf_core::MaskShape::Ellipse, 0.0, false),
+            (kerf_core::MaskShape::Rect, 1.0, false),
+            (kerf_core::MaskShape::Ellipse, 1.0, true),
+            (kerf_core::MaskShape::Ellipse, 0.05, true),
+            (kerf_core::MaskShape::Rect, 0.5, true),
+        ] {
+            go(&format!("mask {shape:?} {feather} {inverted}"), 0.4, &|c| {
+                c.mask = Some(mask_of(shape, feather, inverted));
+            });
+        }
+        let off_centre = kerf_core::Mask {
+            shape: kerf_core::MaskShape::Ellipse,
+            x: 0.9,
+            y: 0.1,
+            width: 0.7,
+            height: 0.5,
+            feather: 0.3,
+            inverted: false,
+        };
+        go("mask off centre", 0.4, &|c| c.mask = Some(off_centre.clone()));
+        // Chroma keys: similarity and blend at 0, middle and 1, three colours.
+        for (colour, similarity, blend) in [
+            ("green", 0.01, 0.0),
+            ("green", 0.3, 0.2),
+            ("green", 1.0, 1.0),
+            ("0xff0000", 0.4, 0.5),
+            ("blue", 0.25, 0.0),
+            ("0x808080", 0.5, 0.05),
+        ] {
+            go(&format!("key {colour} {similarity}/{blend}"), 0.4, &|c| {
+                c.effects = vec![key(colour, similarity, blend)];
+            });
+        }
+        // Everything at once: a key, a mask, a keyed opacity, both fades.
+        go("key, mask, keyed opacity and fades", 1.0, &|c| {
+            c.effects = vec![key("green", 0.3, 0.3)];
+            c.mask = Some(mask_of(kerf_core::MaskShape::Ellipse, 0.4, true));
+            c.set_property_keys(
+                Property::Opacity,
+                vec![PropertyKey::new(0.0, 0.3), PropertyKey::new(1.0, 1.0)],
+            );
+            c.fade_in = 0.3;
+            c.fade_out = 0.3;
+        });
+        // A mask and a fade on a clip that is moved, partly off the frame.
+        go("moved mask and fade", 0.8, &|c| {
+            c.transform.pos_x = 0.31;
+            c.transform.pos_y = 0.27;
+            c.mask = Some(mask_of(kerf_core::MaskShape::Rect, 0.3, false));
+            c.fade_in = 0.4;
+        });
+        let _ = n;
+    }
+}
+
+/// A blended clip into and out of every transition, as the incoming clip and as the outgoing one, at durations of a frame to a clip:
+/// the fades a transition adds are alpha fades on a blended clip, and the slides and pushes move it.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_a_blended_clip_in_every_transition() {
+    use kerf_core::BlendMode;
+    let m = media();
+    let kinds = [
+        TransitionKind::Crossfade,
+        TransitionKind::DipToBlack,
+        // (DipToWhite is left out: the plain dip is not exact at the base commit either, `WHITE`.)
+        TransitionKind::SlideLeft,
+        TransitionKind::SlideRight,
+        TransitionKind::SlideUp,
+        TransitionKind::SlideDown,
+        TransitionKind::PushLeft,
+        TransitionKind::PushRight,
+        TransitionKind::PushUp,
+        TransitionKind::PushDown,
+    ];
+    let modes = [
+        BlendMode::Multiply,
+        BlendMode::Screen,
+        BlendMode::Overlay,
+        BlendMode::Difference,
+    ];
+    for (i, kind) in kinds.into_iter().enumerate() {
+        for (j, secs) in [0.034, 0.2, 0.5, 1.0].into_iter().enumerate() {
+            let mode = modes[(i + j) % modes.len()];
+            // Incoming, blended.
+            let out = clip(&m.bars, 0.5, 1.5, 0.0);
+            let mut inc = clip(&m.testsrc, 0.5, 1.5, 1.0);
+            inc.blend_mode = mode;
+            inc.transition_in = Some(Transition { kind, duration: secs });
+            // The slide / push travels from off the frame above (SlideDown, PushDown) or the left: a clip above the frame's top
+            // edge is where FFmpeg 4.4's overlay drops the alpha rows.
+            let above = matches!(kind, TransitionKind::SlideDown | TransitionKind::PushDown);
+            ce_blend_run(
+                &format!("checker/e/incoming {kind:?} {secs}s {mode:?}"),
+                &timeline(vec![vec![out, inc]], None),
+                &[m.bars.clone(), m.testsrc.clone()],
+                30.0,
+                2.0,
+                !above,
+            );
+            // Outgoing, blended: the cut's second clip plain, entering by the transition over the blended one's tail.
+            let mut out = clip(&m.testsrc, 0.5, 1.5, 0.0);
+            out.blend_mode = mode;
+            let mut inc = clip(&m.bars, 0.5, 1.5, 1.0);
+            inc.transition_in = Some(Transition { kind, duration: secs });
+            // (Over a plain clip underneath so that the blend has a composite that is not black.)
+            let under = clip(&m.smooth, 0.5, 2.5, 0.0);
+            ce_blend_run(
+                &format!("checker/e/outgoing {kind:?} {secs}s {mode:?}"),
+                &timeline(vec![vec![under], vec![out, inc]], None),
+                &[m.smooth.clone(), m.testsrc.clone(), m.bars.clone()],
+                30.0,
+                2.0,
+                true,
+            );
+        }
+    }
+    // Two blended clips back to back through every fade a transition makes (a dip to white is an alpha fade on a blended clip, so
+    // this is exact where a plain clip's dip is not).
+    for (i, kind) in [
+        TransitionKind::Crossfade,
+        TransitionKind::DipToBlack,
+        TransitionKind::DipToWhite,
+        TransitionKind::SlideLeft,
+        TransitionKind::PushUp,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for secs in [0.2, 0.6] {
+            let mut out = clip(&m.testsrc, 0.5, 1.5, 0.0);
+            out.blend_mode = modes[i % modes.len()];
+            let mut inc = clip(&m.noise, 0.5, 1.5, 1.0);
+            inc.blend_mode = modes[(i + 1) % modes.len()];
+            inc.transition_in = Some(Transition { kind, duration: secs });
+            ce_blend_run(
+                &format!("checker/e/two blended clips through {kind:?} {secs}s"),
+                &timeline(vec![vec![clip(&m.bars, 0.5, 2.5, 0.0)], vec![out, inc]], None),
+                &[m.bars.clone(), m.testsrc.clone(), m.noise.clone()],
+                30.0,
+                2.0,
+                true,
+            );
+        }
+    }
+    // A clip's own fade-in together with a transition's: two alpha fades on the same edge. (All three are run, then judged.)
+    let mut doubled: Vec<String> = Vec::new();
+    for (what, kind, fade_in) in [
+        ("a fade-in and a dissolve", TransitionKind::Crossfade, 0.3),
+        ("a fade-in and a dip to black", TransitionKind::DipToBlack, 0.3),
+        ("a fade-in and a dip to white", TransitionKind::DipToWhite, 0.3),
+    ] {
+        // (The outgoing clip is blended too, so that no plain clip's dip to white, which is not exact at the base commit, is in the frame.)
+        let mut out = clip(&m.bars, 0.5, 1.5, 0.0);
+        out.blend_mode = BlendMode::Multiply;
+        let mut inc = clip(&m.testsrc, 0.5, 1.5, 1.0);
+        inc.blend_mode = BlendMode::Screen;
+        inc.fade_in = fade_in;
+        inc.transition_in = Some(Transition { kind, duration: 0.5 });
+        let tl = timeline(vec![vec![clip(&m.smooth, 0.5, 2.5, 0.0)], vec![out, inc]], None);
+        let assets = [m.smooth.clone(), m.bars.clone(), m.testsrc.clone()];
+        let scan = ce_scan(
+            &format!("checker/e/{what}"),
+            &tl,
+            &assets,
+            &at_fps(30.0),
+            upto(2.0, 30.0),
+            false,
+        );
+        eprintln!("{}", scan.line(&format!("checker/e/{what}")));
+        if !scan.exact() {
+            doubled.push(format!(
+                "{what}: drawn {}, Y differ {}, UV differ {}, guards {:?}",
+                scan.drawn, scan.y.differing, scan.uv.differing, scan.guards
+            ));
+        }
+    }
+    assert!(
+        doubled.is_empty(),
+        "the plan lets these through and the compositor cannot draw them (or draws them wrong): {doubled:?}"
+    );
+}
+
+/// How a blended clip stands to the others: over and under blended and plain clips, ending before the composite does, starting late, with gaps
+/// between blended clips on a track and between frames of its window, at times between two output frames.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_a_blended_clip_among_other_clips() {
+    use kerf_core::BlendMode;
+    let m = media();
+    // The blended clip ends well before the composite does: nothing may be blended after it, in the export either.
+    for (i, mode) in BLEND_MODES.iter().enumerate() {
+        let mut top = clip(&m.testsrc, 0.5, 1.0, 0.25);
+        top.blend_mode = *mode;
+        ce_blend_run(
+            &format!("checker/e/{mode:?} ends before the composite"),
+            &timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![top]], None),
+            &[m.bars.clone(), m.testsrc.clone()],
+            30.0,
+            2.0,
+            true,
+        );
+        // Two blended clips on one track with a gap between them, over a plain clip that plays through.
+        let mut a = clip(&m.testsrc, 0.5, 1.0, 0.1);
+        a.blend_mode = *mode;
+        let mut b = clip(&m.noise, 0.5, 1.0, 0.9 + 0.01 * i as f64);
+        b.blend_mode = BLEND_MODES[(i + 4) % 9];
+        ce_blend_run(
+            &format!("checker/e/{mode:?} then another with a gap"),
+            &timeline(vec![vec![clip(&m.smooth, 0.0, 2.0, 0.0)], vec![a, b]], None),
+            &[m.smooth.clone(), m.testsrc.clone(), m.noise.clone()],
+            30.0,
+            1.8,
+            true,
+        );
+    }
+    // Start and end between two output frames.
+    for start in [0.0166, 0.0334, 0.05, 0.1, 0.3333, 0.34] {
+        let mut top = clip(&m.testsrc, 0.5, 1.0, start);
+        top.blend_mode = BlendMode::Exclusion;
+        ce_blend_run(
+            &format!("checker/e/starting at {start}"),
+            &timeline(vec![vec![clip(&m.bars, 0.0, 1.5, 0.0)], vec![top]], None),
+            &[m.bars.clone(), m.testsrc.clone()],
+            30.0,
+            1.2,
+            true,
+        );
+    }
+    // Pairs of blended clips, one over the other over bars.
+    for (i, a) in BLEND_MODES.iter().enumerate() {
+        for b in [BLEND_MODES[(i + 3) % 9], BLEND_MODES[(i + 5) % 9]] {
+            let mut lower = clip(&m.testsrc, 0.5, 1.5, 0.0);
+            lower.blend_mode = *a;
+            let mut upper = clip(&m.noise, 0.5, 1.5, 0.0);
+            upper.blend_mode = b;
+            ce_blend_run(
+                &format!("checker/e/{a:?} under {b:?}"),
+                &timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![lower], vec![upper]], None),
+                &[m.bars.clone(), m.testsrc.clone(), m.noise.clone()],
+                30.0,
+                0.4,
+                true,
+            );
+        }
+    }
+    // A blended clip under a plain clip that dissolves in over it, and over a clip that is itself dissolving.
+    for mode in [BlendMode::Screen, BlendMode::Difference] {
+        let mut blended = clip(&m.testsrc, 0.5, 1.5, 0.0);
+        blended.blend_mode = mode;
+        let mut plain = clip(&m.edges, 0.5, 1.5, 0.0);
+        plain.transition_in = None;
+        plain.fade_in = 0.5;
+        ce_blend_run(
+            &format!("checker/e/{mode:?} under a plain clip fading in"),
+            &timeline(
+                vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![blended.clone()], vec![plain]],
+                None,
+            ),
+            &[m.bars.clone(), m.testsrc.clone(), m.edges.clone()],
+            30.0,
+            1.0,
+            true,
+        );
+        let out = clip(&m.bars, 0.5, 1.5, 0.0);
+        let mut inc = clip(&m.smooth, 0.5, 1.5, 1.0);
+        inc.transition_in = Some(Transition {
+            kind: TransitionKind::Crossfade,
+            duration: 0.6,
+        });
+        let mut over = clip(&m.noise, 0.5, 2.5, 0.0);
+        over.blend_mode = mode;
+        ce_blend_run(
+            &format!("checker/e/{mode:?} over a dissolve"),
+            &timeline(vec![vec![out, inc], vec![over]], None),
+            &[m.bars.clone(), m.smooth.clone(), m.noise.clone()],
+            30.0,
+            2.0,
+            true,
+        );
+    }
+    // A blended clip alone on the bottom track, a plain clip over it.
+    let mut bottom = clip(&m.testsrc, 0.5, 1.5, 0.0);
+    bottom.blend_mode = BlendMode::Multiply;
+    ce_blend_run(
+        "checker/e/blended at the bottom, a plain clip over it",
+        &timeline(vec![vec![bottom], vec![clip(&m.edges, 0.5, 1.0, 0.2)]], None),
+        &[m.testsrc.clone(), m.edges.clone()],
+        30.0,
+        1.0,
+        true,
+    );
+}
+
+/// The matrix the chain names is the bottom layer's tag: every pairing of untagged, BT.709, `smpte170m` and `bt470bg` footage, the labelled
+/// untagged HD, and a few modes each; and the tags the plan has no tables for must be refused.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_the_matrix_of_the_bottom_layer_names_the_chain() {
+    use kerf_core::BlendMode;
+    let m = media();
+    let v = variants();
+    let bottoms = [("untagged", &m.bars), ("bt709", &v.bars709), ("bt470bg", &v.bars470bg)];
+    let tops = [
+        ("untagged", &m.testsrc),
+        ("bt709", &v.testsrc709),
+        ("smpte170m", &v.testsrc170m),
+        ("bt470bg", &v.testsrc470bg),
+    ];
+    for (i, (bname, bottom)) in bottoms.iter().enumerate() {
+        for (j, (tname, top)) in tops.iter().enumerate() {
+            for mode in [
+                BlendMode::Multiply,
+                BlendMode::Difference,
+                BlendMode::Overlay,
+                BlendMode::Screen,
+            ] {
+                if (i + j + mode.label().len()) % 2 == 1 {
+                    continue;
+                }
+                let (tl, assets) = ce_stack(bottom, top, &|c| c.blend_mode = mode);
+                ce_blend_run(
+                    &format!("checker/e/{mode:?} {tname} over {bname}"),
+                    &tl,
+                    &assets,
+                    30.0,
+                    0.4,
+                    true,
+                );
+            }
+        }
+    }
+    // Untagged HD is labelled BT.709 by a graph that holds a clip that names a matrix.
+    let h = hd_pair();
+    for (bname, bottom, tname, top) in [
+        ("untagged HD", &h.untagged, "tagged HD", &h.phone),
+        ("tagged HD", &h.phone, "untagged HD", &h.untagged),
+        ("untagged HD", &h.untagged, "untagged HD", &h.untagged),
+        ("tagged HD", &h.phone, "tagged HD", &h.phone),
+    ] {
+        for mode in [BlendMode::Difference, BlendMode::Exclusion] {
+            let mut c = clip(top, 0.5, 1.5, 0.0);
+            c.blend_mode = mode;
+            ce_blend_run(
+                &format!("checker/e/{mode:?} {tname} over {bname}"),
+                &timeline(vec![vec![clip(bottom, 0.5, 1.5, 0.0)], vec![c]], None),
+                &[bottom.clone(), top.clone()],
+                30.0,
+                0.3,
+                true,
+            );
+        }
+    }
+}
+
+/// Footage of other pixel formats and ranges as the blended clip: the graph converts it to `yuva420p` where the compositor has the decode's
+/// 4:2:0, so each is drawn exactly or refused.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_a_blended_clip_of_another_pixel_format_or_range() {
+    use kerf_core::BlendMode;
+    let m = media();
+    let v = variants();
+    let r = range_media();
+    for (name, asset) in [
+        ("10-bit", &v.tenbit),
+        ("10-bit full range", &v.tenbit_pc),
+        ("4:4:4", &v.yuv444),
+        ("4:2:2", &v.yuv422),
+        ("gray", &v.gray),
+        ("yuvj420p mjpeg", &v.mjpeg),
+        ("yuvj420p still", &v.jpeg),
+        ("yuv420p flagged pc", &r.pc),
+        ("yuv420p flagged pc gradient", &r.pc_gradient),
+        ("yuv420p flagged tv", &r.tv),
+        ("yuv420p unflagged", &r.unflagged),
+        ("rgb png", &v.rgb_png),
+        ("rgb noise png", &ce_rgb_noise()),
+    ] {
+        for mode in [BlendMode::Multiply, BlendMode::Difference] {
+            // The picture as the blended clip, over the bars; and under a blended testsrc.
+            let mut top = clip(asset, 0.0, 1.0, 0.0);
+            top.blend_mode = mode;
+            ce_blend_run(
+                &format!("checker/e/{mode:?} {name} over bars"),
+                &timeline(vec![vec![clip(&m.bars, 0.0, 1.0, 0.0)], vec![top]], None),
+                &[m.bars.clone(), asset.clone()],
+                30.0,
+                0.4,
+                true,
+            );
+            let mut top = clip(&m.testsrc, 0.0, 1.0, 0.0);
+            top.blend_mode = mode;
+            ce_blend_run(
+                &format!("checker/e/{mode:?} testsrc over {name}"),
+                &timeline(vec![vec![clip(asset, 0.0, 1.0, 0.0)], vec![top]], None),
+                &[asset.clone(), m.testsrc.clone()],
+                30.0,
+                0.4,
+                true,
+            );
+        }
+    }
+}
+
+/// What the clip carries before the blend: colour correction, effects, a grade, a speed, a reverse, a 25 fps source on a 30 fps cut, a late source.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_what_a_blended_clip_carries_before_the_blend() {
+    use kerf_core::{BlendMode, VideoEffect as E};
+    let m = media();
+    for (n, mode) in [BlendMode::Multiply, BlendMode::Screen, BlendMode::Overlay]
+        .into_iter()
+        .enumerate()
+    {
+        let label = |what: &str| format!("checker/e/{mode:?} {what}");
+        let go = |what: &str, top: &Asset, edit: &dyn Fn(&mut Clip), secs: f64| {
+            let (tl, assets) = ce_stack(&m.bars, top, &|c| {
+                c.blend_mode = mode;
+                edit(c);
+            });
+            ce_blend_run(&label(what), &tl, &assets, 30.0, secs, true);
+        };
+        for (what, color) in [
+            (
+                "brightness",
+                kerf_core::Color {
+                    brightness: 0.15,
+                    ..Default::default()
+                },
+            ),
+            (
+                "contrast and saturation",
+                kerf_core::Color {
+                    contrast: 1.4,
+                    saturation: 0.3,
+                    ..Default::default()
+                },
+            ),
+            (
+                "gamma and temperature",
+                kerf_core::Color {
+                    gamma: 1.6,
+                    temperature: 0.4,
+                    ..Default::default()
+                },
+            ),
+        ] {
+            go(what, &m.testsrc, &|c| c.color = color.clone(), 0.4);
+        }
+        for (what, effects) in [
+            ("grayscale", vec![E::Grayscale]),
+            ("invert", vec![E::Invert]),
+            ("vignette", vec![E::Vignette]),
+            ("sharpen", vec![E::Sharpen { amount: 1.0 }]),
+            ("grayscale and invert", vec![E::Grayscale, E::Invert]),
+            ("vignette and a key", vec![E::Vignette, key("green", 0.3, 0.2)]),
+        ] {
+            go(what, &m.testsrc, &|c| c.effects = effects.clone(), 0.4);
+        }
+        // (A grade has its own test: `checker_e_a_graded_clip_under_a_blend`.)
+        for speed in [0.25, 0.5, 2.0, 3.0, -1.0, -2.0] {
+            go(&format!("speed {speed}"), &m.testsrc, &|c| c.speed = speed, 0.8);
+        }
+        go("a 25 fps source", &m.testsrc25, &|_| {}, 0.8);
+        go("a late source", &m.late, &|_| {}, 0.6);
+        go(
+            "a source offset between frames",
+            &m.testsrc,
+            &|c| {
+                c.source_in = 0.51;
+                c.source_out = 1.51;
+            },
+            0.6,
+        );
+        let _ = n;
+    }
+}
+
+/// Frames of sizes that are no multiple of a vector, a block or a thread count; the blended clip as large as the frame, moved by a few pixels.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_frames_of_other_sizes() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-e-sizes");
+    std::fs::create_dir_all(&dir).unwrap();
+    let sizes = [
+        (642, 362),
+        (322, 182),
+        (194, 110),
+        (130, 66),
+        (98, 50),
+        (66, 34),
+        (34, 18),
+        (18, 10),
+        (16, 16),
+        (10, 6),
+        (6, 4),
+        (2, 2),
+        (320, 180),
+        (1280, 720),
+    ];
+    for (n, (w, h)) in sizes.into_iter().enumerate() {
+        let make = |name: &str, seed: u32| -> Asset {
+            let p = dir.join(format!("{name}-{w}x{h}.mp4"));
+            ffmpeg(&[
+                "-f",
+                "lavfi",
+                "-i",
+                &format!(
+                    "nullsrc=size={w}x{h}:rate=30:duration=2,format=yuv420p,geq=lum='random({seed})*255':cb='random({})*255':cr='random({})*255',setparams=colorspace=unknown:color_primaries=unknown:color_trc=unknown",
+                    seed + 1,
+                    seed + 2
+                ),
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-qp",
+                "0",
+                "-g",
+                "10",
+                "-pix_fmt",
+                "yuv420p",
+                p.to_str().unwrap(),
+            ]);
+            probed(&p)
+        };
+        let (bottom, top) = (make("bottom", 1), make("top", 7));
+        let smooth = {
+            let p = dir.join(format!("smooth-{w}x{h}.mp4"));
+            ffmpeg(&[
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("gradients=size={w}x{h}:rate=30:duration=2:c0=0xd03020:c1=0x2040e0:nb_colors=2:seed=5:speed=0.00001,format=yuv420p,setparams=colorspace=unknown:color_primaries=unknown:color_trc=unknown"),
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-qp",
+                "0",
+                "-g",
+                "10",
+                "-pix_fmt",
+                "yuv420p",
+                p.to_str().unwrap(),
+            ]);
+            probed(&p)
+        };
+        for (k, mode) in BLEND_MODES.iter().enumerate() {
+            if w * h > 100_000 && k % 3 != 0 {
+                continue;
+            }
+            for (name, below, over) in [("noise over noise", &bottom, &top), ("smooth over noise", &bottom, &smooth)] {
+                let mut c = clip(over, 0.2, 1.0, 0.0);
+                c.blend_mode = *mode;
+                ce_blend_run(
+                    &format!("checker/e/{w}x{h} {mode:?} {name}"),
+                    &timeline(vec![vec![clip(below, 0.2, 1.0, 0.0)], vec![c]], None),
+                    &[below.clone(), over.clone()],
+                    30.0,
+                    0.3,
+                    true,
+                );
+            }
+        }
+        // Moved by a few pixels, two ways: the chroma blocks the clip touches at its edges.
+        for (dx, dy) in [(2i32, 2i32), (-2, 2), (4, 0), (0, -4)] {
+            if w < 8 || h < 8 {
+                continue;
+            }
+            let mut c = clip(&top, 0.2, 1.0, 0.0);
+            c.blend_mode = BLEND_MODES[(n + dx.unsigned_abs() as usize) % 9];
+            c.transform.pos_x = f64::from(dx) / w as f64;
+            c.transform.pos_y = f64::from(dy) / h as f64;
+            ce_blend_run(
+                &format!("checker/e/{w}x{h} moved {dx},{dy}"),
+                &timeline(vec![vec![clip(&bottom, 0.2, 1.0, 0.0)], vec![c]], None),
+                &[bottom.clone(), top.clone()],
+                30.0,
+                0.3,
+                dy >= 0,
+            );
+        }
+    }
+}
+
+/// Fits: a clip that shares a delivery frame of its own shape is the plain fit; one that does not is refused (a letterbox, a cover that crops).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_a_blended_clip_in_a_delivery_frame_of_another_shape() {
+    let m = media();
+    for (name, w, h, fit) in [
+        ("same shape, contain", 640, 360, Fit::Contain),
+        ("same shape, cover", 640, 360, Fit::Cover),
+        ("same shape, blur", 640, 360, Fit::Blur),
+        ("9:16 contain", 360, 640, Fit::Contain),
+        ("9:16 cover", 360, 640, Fit::Cover),
+        ("9:16 blur", 360, 640, Fit::Blur),
+        ("square cover", 360, 360, Fit::Cover),
+    ] {
+        let mut top = clip(&m.testsrc, 0.5, 1.5, 0.0);
+        top.blend_mode = kerf_core::BlendMode::Multiply;
+        let tl = timeline(
+            vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![top]],
+            Some(Delivery::new(w, h, fit)),
+        );
+        let assets = [m.bars.clone(), m.testsrc.clone()];
+        // Whatever the plan lets through must be exact; what it refuses is FFmpeg's.
+        let planner = Planner::new(&tl, &assets, &at_fps(30.0), PlanRequest::motion(policy())).expect("planner");
+        let plan = planner.at_frame(3).expect("plan");
+        let size = (plan.canvas.width, plan.canvas.height);
+        let why = plan.reasons(&compositor().caps(), size);
+        let blend_refusals = why.iter().filter(|u| u.kind() == "blend_mode").count();
+        let others = why.iter().filter(|u| u.kind() != "blend_mode").count();
+        eprintln!("checker/e/fit {name}: {size:?}, {blend_refusals} blend refusals, {others} others: {why:?}");
+        if why.is_empty() {
+            ce_blend_run(&format!("checker/e/fit {name}"), &tl, &assets, 30.0, 0.4, true);
+        }
+    }
+    // A cover that only crops (the frame shares a side with the picture), panned by a position so that the layer hangs over the frame's edges:
+    // a layer larger than the canvas, unscaled.
+    for (n, (w, h)) in [(480, 360), (318, 360), (640, 200), (640, 358), (360, 360)]
+        .into_iter()
+        .enumerate()
+    {
+        for (k, (px, py)) in [(0.0, 0.0), (0.1, 0.0), (-0.1, 0.0), (0.0, 0.1), (0.0, -0.1), (0.05, 0.03)]
+            .into_iter()
+            .enumerate()
+        {
+            let mut top = clip(&m.testsrc, 0.5, 1.5, 0.0);
+            top.blend_mode = BLEND_MODES[(n + k) % 9];
+            top.transform.pos_x = px;
+            top.transform.pos_y = py;
+            let tl = timeline(
+                vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![top]],
+                Some(Delivery::new(w, h, Fit::Cover)),
+            );
+            let assets = [m.bars.clone(), m.testsrc.clone()];
+            ce_blend_run(
+                &format!("checker/e/cover {w}x{h} panned {px},{py}"),
+                &tl,
+                &assets,
+                30.0,
+                0.4,
+                py >= 0.0,
+            );
+        }
+    }
+}
+
+// ---- checker/e: a scan that tells a refusal from a difference ----------------------------------------------------
+
+/// What a scan of a cut's frames found: those the plan refuses (FFmpeg draws them), those the compositor drew and the samples that differ.
+#[derive(Default)]
+struct CeScan {
+    frames: usize,
+    drawn: usize,
+    refused: BTreeMap<String, usize>,
+    /// Frames the compositor itself would not draw (its own guards, past the plan's).
+    guards: BTreeMap<String, usize>,
+    y: PlaneStats,
+    uv: PlaneStats,
+    /// The first differing sample: (frame, plane, x, y).
+    first: Option<(u64, usize, usize, usize)>,
+    bad_frames: Vec<u64>,
+}
+
+impl CeScan {
+    fn exact(&self) -> bool {
+        self.y.differing == 0 && self.uv.differing == 0 && self.guards.is_empty()
+    }
+
+    fn line(&self, case: &str) -> String {
+        format!(
+            "{case:<60} frames {:>3} drawn {:>3} refused {:>3} {:?} guards {:?} | Y differ {:>7} max {:>2} | UV differ {:>7} max {:>2} | first {:?}",
+            self.frames,
+            self.drawn,
+            self.refused.values().sum::<usize>(),
+            self.refused.keys().map(|k| k.chars().take(60).collect::<String>()).collect::<Vec<_>>(),
+            self.guards.keys().map(|k| k.chars().take(70).collect::<String>()).collect::<Vec<_>>(),
+            self.y.differing,
+            self.y.max,
+            self.uv.differing,
+            self.uv.max,
+            self.first
+        )
+    }
+}
+
+fn ce_first_diff(a: &[u8], b: &[u8], w: usize) -> Option<(usize, usize)> {
+    a.iter().zip(b).position(|(x, y)| x != y).map(|i| (i % w, i / w))
+}
+
+/// Plan every frame of the cut, draw those the plan lets through and compare them with the export's planes. With `anyway` the
+/// plan's reasons are ignored and every frame is drawn (the compositor's own guards still stand, and are counted).
+fn ce_scan(case: &str, tl: &Timeline, assets: &[Asset], opts: &ExportOptions, frames: Range<u64>, anyway: bool) -> CeScan {
+    let slug: String = case
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let played = export(&slug, tl, assets, opts);
+    assert!(
+        played.count() as u64 >= frames.end,
+        "{case}: the export has {} frames, the case looks at {}",
+        played.count(),
+        frames.end
+    );
+    let planner = Planner::new(tl, assets, opts, PlanRequest::motion(policy())).expect("planner");
+    let size = (played.w as u32, played.h as u32);
+    let mut motion = MotionFrames::new(frame_source());
+    let mut scan = CeScan::default();
+    for k in frames {
+        scan.frames += 1;
+        let plan = planner.at_frame(k).expect("plan");
+        assert_eq!((plan.canvas.width, plan.canvas.height), (played.w as u32, played.h as u32));
+        let why = plan.reasons(&compositor().caps(), size);
+        if !anyway && !why.is_empty() {
+            for u in &why {
+                *scan.refused.entry(u.to_string()).or_default() += 1;
+            }
+            continue;
+        }
+        let picture = match motion.frames(&plan) {
+            Ok(p) => p,
+            Err(e) => {
+                *scan.guards.entry(format!("frames: {e}")).or_default() += 1;
+                continue;
+            }
+        };
+        let drawn = match compositor().composite_yuv_counted(&plan, &picture, motion.counts(), size) {
+            Ok(d) => d,
+            Err(e) => {
+                *scan.guards.entry(e.to_string()).or_default() += 1;
+                continue;
+            }
+        };
+        scan.drawn += 1;
+        let want = played.planes(k as usize);
+        let got = planes_of(&drawn);
+        let (y, u, v) = (
+            PlaneStats::of(want[0], got[0]),
+            PlaneStats::of(want[1], got[1]),
+            PlaneStats::of(want[2], got[2]),
+        );
+        if scan.first.is_none() {
+            for (p, w) in [(0, played.w), (1, played.w / 2), (2, played.w / 2)] {
+                if let Some((x, y)) = ce_first_diff(want[p], got[p], w) {
+                    scan.first = Some((k, p, x, y));
+                    break;
+                }
+            }
+        }
+        if y.differing + u.differing + v.differing > 0 {
+            scan.bad_frames.push(k);
+            if scan.bad_frames.len() <= 2 {
+                montage(case, k, &played, &plan, &picture, motion.counts());
+            }
+        }
+        scan.y.add(y);
+        let mut uv = u;
+        uv.add(v);
+        scan.uv.add(uv);
+    }
+    scan
+}
+
+/// The frames the plan lets through are the export's, to the sample; the others are FFmpeg's. A case that nothing draws says so.
+fn ce_exact_or_refused(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, secs: f64) -> CeScan {
+    let scan = ce_scan(case, tl, assets, &at_fps(fps), upto(secs, fps), false);
+    eprintln!("{}", scan.line(case));
+    assert!(
+        scan.exact(),
+        "{case}: {} frames drawn, Y {} samples differ (max {}), UV {} (max {}), first {:?}, frames {:?}; guards {:?} (montages in target/parity/motion)",
+        scan.drawn,
+        scan.y.differing,
+        scan.y.max,
+        scan.uv.differing,
+        scan.uv.max,
+        scan.first,
+        &scan.bad_frames[..scan.bad_frames.len().min(8)],
+        scan.guards
+    );
+    scan
+}
+
+/// [`blend_run`] for a case whose frames the plan may refuse for a reason of its own (a picture it never draws): drawn exactly or refused.
+fn ce_blend_run(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, secs: f64, forced_ok: bool) {
+    ce_exact_or_refused(case, tl, assets, fps, secs);
+    if compositor().caps().blend != kerf_core::BlendKinds::ALL && forced_ok {
+        forced_blends(|| {
+            ce_exact_or_refused(&format!("{case} (forced)"), tl, assets, fps, secs);
+        });
+    }
+}
+
+// ---- checker/e: the settle before a blur ---------------------------------------------------------------------------
+
+/// FNV-1a of a drawn frame, to compare runs (a serial rasteriser's and a threaded one's) across processes.
+fn ce_hash(planes: [&[u8]; 3]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for p in planes {
+        for b in p {
+            h = (h ^ u64::from(*b)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    h
+}
+
+/// A blur reads what the passes before it drew: the same frame drawn again and again is the same frame, whatever pass came before the blur
+/// (the slowest one in front is where a software rasteriser let the compute pass read half-drawn rows). The hash of each frame is printed so that
+/// a run with `LP_NUM_THREADS=0` (a serial rasteriser, which has no race) can be held to the threaded one's.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_a_blur_after_other_passes_draws_the_same_frame_every_time() {
+    use kerf_core::VideoEffect as E;
+    let m = media();
+    let cases: Vec<(&str, f64, Vec<E>)> = vec![
+        (
+            "sharpen 0.5 then blur on a pip",
+            0.6,
+            vec![E::Sharpen { amount: 0.5 }, E::Blur { sigma: 3.0 }],
+        ),
+        (
+            "sharpen 2.5 then blur",
+            1.0,
+            vec![E::Sharpen { amount: 2.5 }, E::Blur { sigma: 3.0 }],
+        ),
+        (
+            "sharpen 1 then blur 8",
+            1.0,
+            vec![E::Sharpen { amount: 1.0 }, E::Blur { sigma: 8.0 }],
+        ),
+        ("blur on a pip", 0.6, vec![E::Blur { sigma: 3.0 }]),
+        ("blur then blur", 1.0, vec![E::Blur { sigma: 2.0 }, E::Blur { sigma: 3.0 }]),
+        (
+            "blur then sharpen 0.5 on a pip",
+            0.6,
+            vec![E::Blur { sigma: 3.0 }, E::Sharpen { amount: 0.5 }],
+        ),
+        (
+            "invert then blur then grayscale",
+            1.0,
+            vec![E::Invert, E::Blur { sigma: 2.5 }, E::Grayscale],
+        ),
+        ("vignette then blur", 1.0, vec![E::Vignette, E::Blur { sigma: 2.5 }]),
+        (
+            "grayscale, sharpen, blur, invert",
+            1.0,
+            vec![E::Grayscale, E::Sharpen { amount: 1.0 }, E::Blur { sigma: 2.0 }, E::Invert],
+        ),
+        ("blur after a key", 1.0, vec![key("green", 0.2, 0.2), E::Blur { sigma: 3.0 }]),
+    ];
+    let mut unstable: Vec<String> = Vec::new();
+    for (name, scale, effects) in cases {
+        let (tl, assets) = over_bars(m, &|c| {
+            c.transform.scale = scale;
+            c.transform.pos_x = if scale < 1.0 { 0.15 } else { 0.0 };
+            c.effects = effects.clone();
+        });
+        let opts = at_fps(30.0);
+        let planner = Planner::new(&tl, &assets, &opts, PlanRequest::motion(policy())).expect("planner");
+        let plan = planner.at_frame(6).expect("plan");
+        let size = (plan.canvas.width, plan.canvas.height);
+        let why = plan.reasons(&compositor().caps(), size);
+        if !why.is_empty() {
+            eprintln!("checker/e/p0 {name}: refused by the plan ({why:?}), not drawn");
+            continue;
+        }
+        let played = export(&format!("ce-p0-{}", name.replace(' ', "_")), &tl, &assets, &opts);
+        let mut motion = MotionFrames::new(frame_source());
+        let picture = motion.frames(&plan).expect("frames");
+        let mut first: Option<Vec<u8>> = None;
+        let mut varying = 0;
+        for round in 0..12 {
+            let drawn = compositor()
+                .composite_yuv_counted(&plan, &picture, motion.counts(), size)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            let bytes: Vec<u8> = planes_of(&drawn).concat();
+            match &first {
+                None => first = Some(bytes),
+                Some(f) => {
+                    if *f != bytes {
+                        varying += 1;
+                        eprintln!("checker/e/p0 {name}: draw {round} is not the first draw");
+                    }
+                }
+            }
+        }
+        let last = compositor()
+            .composite_yuv_counted(&plan, &picture, motion.counts(), size)
+            .unwrap();
+        let got = planes_of(&last);
+        let want = played.planes(6);
+        let (y, u, v) = (
+            PlaneStats::of(want[0], got[0]),
+            PlaneStats::of(want[1], got[1]),
+            PlaneStats::of(want[2], got[2]),
+        );
+        eprintln!(
+            "checker/e/p0 {name:<36} hash {:016x} | vs FFmpeg Y differ {:>6} max {} UV differ {:>6} max {} | draws unlike the first: {varying}",
+            ce_hash(got),
+            y.differing,
+            y.max,
+            u.differing + v.differing,
+            u.max.max(v.max)
+        );
+        if varying > 0 {
+            unstable.push(format!("{name}: {varying} of 12 draws unlike the first"));
+        }
+    }
+    assert!(
+        unstable.is_empty(),
+        "the same plan drawn twelve times gave different frames: {unstable:?}"
+    );
+}
+
+// ---- checker/e: a refusal is necessary only if drawing the frame anyway is not exact -----------------------------------------
+
+/// A clip tagged `tag` as its colour matrix (the test pattern, lossless).
+fn ce_tagged(name: &str, tag: &str, pattern: &str) -> Asset {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-e-tagged");
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join(format!("{name}-{tag}.mp4"));
+    ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        &format!("{pattern}=size=640x360:rate=30:duration=4,format=yuv420p,setparams=colorspace={tag}:color_primaries=bt709:color_trc=bt709"),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-qp",
+        "0",
+        "-g",
+        "10",
+        "-colorspace",
+        tag,
+        "-pix_fmt",
+        "yuv420p",
+        p.to_str().unwrap(),
+    ]);
+    probed(&p)
+}
+
+/// Every refusal the blend adds or keeps, drawn anyway (the plan's reasons ignored, so with the compositor's own guards lifted by a scratch
+/// patch): a refusal that is not needed would draw exactly. Without the patch the compositor's guards stand and the case says so. The
+/// cases whose frames are exact when drawn are the refusals wider than they have to be.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_each_refused_blend_is_refused_for_a_reason() {
+    use kerf_core::BlendMode;
+    let m = media();
+    let v = variants();
+    let mut cases: Vec<(String, Timeline, Vec<Asset>)> = Vec::new();
+    let rgb_noise = ce_rgb_noise();
+    for mode in [BlendMode::Multiply, BlendMode::Screen, BlendMode::Difference] {
+        let mut add = |name: &str, bottom: &Asset, top: &Asset, edit: &dyn Fn(&mut Clip)| {
+            let (tl, assets) = ce_stack(bottom, top, &|c| {
+                c.blend_mode = mode;
+                edit(c);
+            });
+            cases.push((format!("{name} {mode:?}"), tl, assets));
+        };
+        add("scaled down 0.6", &m.bars, &m.testsrc, &|c| c.transform.scale = 0.6);
+        add("scaled down 0.5 moved", &m.bars, &m.noise, &|c| {
+            c.transform.scale = 0.5;
+            c.transform.pos_x = 0.25;
+            c.transform.pos_y = 0.25;
+        });
+        add("scaled up 1.25", &m.bars, &m.testsrc, &|c| c.transform.scale = 1.25);
+        add("scaled smooth", &m.bars, &m.smooth, &|c| c.transform.scale = 0.7);
+        add("rotated 12", &m.bars, &m.smooth, &|c| c.transform.rotation = 12.0);
+        add("rotated 90", &m.bars, &m.smooth, &|c| c.transform.rotation = 90.0);
+        add("opacity 0.6", &m.bars, &m.testsrc, &|c| c.transform.opacity = 0.6);
+        add("opacity 0.97", &m.bars, &m.noise, &|c| c.transform.opacity = 0.97);
+        add("opacity 0.6 flat", &m.bars, &m.black, &|c| c.transform.opacity = 0.6);
+        add("letterboxed portrait", &m.bars, &m.portrait, &|_| {});
+        add("rgb picture", &m.bars, &v.rgb_png, &|_| {});
+        add("rgb noise picture", &m.bars, &rgb_noise, &|_| {});
+        add("rgb picture, bars below", &v.rgb_png, &m.bars, &|_| {});
+        add("rotated 90 noise", &m.bars, &m.noise, &|c| c.transform.rotation = 90.0);
+        add("rotated 180 smooth", &m.bars, &m.smooth, &|c| c.transform.rotation = 180.0);
+        add("rotated 270 noise", &m.bars, &m.noise, &|c| c.transform.rotation = 270.0);
+        add("rotated 90 moved", &m.bars, &m.noise, &|c| {
+            c.transform.rotation = 90.0;
+            c.transform.pos_x = 0.2;
+        });
+    }
+    for tag in ["bt2020nc", "fcc", "smpte240m"] {
+        let bottom = ce_tagged("bars", tag, "smptehdbars");
+        let top = ce_tagged("testsrc", tag, "testsrc2");
+        for mode in [BlendMode::Multiply, BlendMode::Difference] {
+            let (tl, assets) = ce_stack(&bottom, &top, &|c| c.blend_mode = mode);
+            cases.push((format!("matrix {tag} {mode:?}"), tl, assets));
+        }
+        // The same matrix on the top clip only, over untagged footage (the bottom layer names it: untagged).
+        let (tl, assets) = ce_stack(&m.bars, &top, &|c| c.blend_mode = BlendMode::Multiply);
+        cases.push((format!("matrix {tag} on top of untagged"), tl, assets));
+        let (tl, assets) = ce_stack(&bottom, &m.testsrc, &|c| c.blend_mode = BlendMode::Multiply);
+        cases.push((format!("untagged on top of {tag}"), tl, assets));
+    }
+    let mut necessary = Vec::new();
+    let mut wider = Vec::new();
+    for (name, tl, assets) in &cases {
+        let case = format!("checker/e/anyway {name}");
+        let planner = Planner::new(tl, assets, &at_fps(30.0), PlanRequest::motion(policy())).expect("planner");
+        let plan = planner.at_frame(3).expect("plan");
+        let size = (plan.canvas.width, plan.canvas.height);
+        let blend_why: Vec<String> = plan
+            .reasons(&Compositor::CAPS, size)
+            .iter()
+            .filter(|u| u.kind() == "blend_mode")
+            .map(ToString::to_string)
+            .collect();
+        let scan = ce_scan(&case, tl, assets, &at_fps(30.0), 0..12, true);
+        eprintln!(
+            "{}\n    plan: {:?}",
+            scan.line(&case),
+            blend_why
+                .iter()
+                .map(|w| w.split("): ").last().unwrap_or("").to_string())
+                .collect::<Vec<_>>()
+        );
+        if blend_why.is_empty() {
+            eprintln!("    (the plan does not refuse this one with every mode in the caps)");
+            continue;
+        }
+        if scan.exact() && scan.drawn > 0 {
+            wider.push(name.clone());
+        } else {
+            necessary.push(name.clone());
+        }
+    }
+    eprintln!("refusals confirmed necessary ({}): {necessary:?}", necessary.len());
+    eprintln!("refusals that drew EXACTLY anyway ({}): {wider:?}", wider.len());
+    assert!(wider.is_empty(), "refusals wider than they have to be: {wider:?}");
+}
+
+/// A graded clip under a blend, held beside the same clip plain and with a keyed alpha: the grade's RGB round trip ends in a conversion to
+/// `yuva420p` when the clip needs an alpha plane (a blended clip always does: its bars are transparent), where a plain clip's ends in `yuv420p`.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_a_graded_clip_under_a_blend() {
+    use kerf_core::{BlendMode, Property, PropertyKey};
+    let m = media();
+    let mut findings = Vec::new();
+    for (gname, grade) in grades() {
+        for (sname, asset) in [("testsrc", &m.testsrc), ("noise", &m.noise), ("bars", &m.bars)] {
+            let variants: [(&str, Box<dyn Fn(&mut Clip)>); 4] = [
+                ("plain", Box::new(|_| {})),
+                (
+                    "keyed alpha",
+                    Box::new(|c| {
+                        c.set_property_keys(
+                            Property::Opacity,
+                            vec![PropertyKey::new(0.0, 1.0), PropertyKey::new(1.0, 0.5)],
+                        )
+                    }),
+                ),
+                ("multiply", Box::new(|c| c.blend_mode = BlendMode::Multiply)),
+                ("difference", Box::new(|c| c.blend_mode = BlendMode::Difference)),
+            ];
+            for (vname, edit) in variants {
+                let (tl, assets) = ce_stack(&m.bars, asset, &|c| {
+                    c.grade = grade.clone();
+                    edit(c);
+                });
+                let case = format!("checker/e/graded {gname} {sname} {vname}");
+                let scan = ce_scan(&case, &tl, &assets, &at_fps(30.0), 0..6, false);
+                eprintln!("{}", scan.line(&case));
+                if vname.contains("multiply") || vname.contains("difference") {
+                    if scan.drawn > 0 && !scan.exact() {
+                        findings.push(case);
+                    }
+                }
+            }
+        }
+    }
+    assert!(findings.is_empty(), "graded blended clips drawn but not exact: {findings:?}");
+}
+
+/// Where a graded blended clip goes wrong: FFmpeg's own plain graded clip (laid by hand in the legal range, as `lutyuv=a=255` does) put through the model
+/// is compared with FFmpeg's blended export. If they agree, the chain is the model's and it is the compositor's laid clip that is not FFmpeg's.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_a_graded_blend_is_the_model_of_the_plain_graded_clip() {
+    use kerf_core::{BlendMode, YuvMatrix};
+    use kerf_gpu::blend::{reference, Planes};
+    let m = media();
+    let grades = grades();
+    let (gname, grade) = grades.first().cloned().expect("a grade");
+    for (sname, asset) in [("testsrc", &m.testsrc), ("noise", &m.noise)] {
+        let grab = |slug: &str, edit: &dyn Fn(&mut Clip), top: bool| {
+            let (tl, assets) = if top {
+                ce_stack(&m.bars, asset, &|c| {
+                    c.grade = grade.clone();
+                    edit(c);
+                })
+            } else {
+                (timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)]], None), vec![m.bars.clone()])
+            };
+            export(&format!("ce-diag-{slug}-{sname}"), &tl, &assets, &at_fps(30.0))
+        };
+        let plain = grab("plain", &|_| {}, true);
+        let bottom = grab("bottom", &|_| {}, false);
+        let blended = grab("blend", &|c| c.blend_mode = BlendMode::Multiply, true);
+        let (w, h) = (plain.w, plain.h);
+        for k in [0usize, 5] {
+            let planes = |p: &Played| {
+                let [y, u, v] = p.planes(k);
+                Planes {
+                    w,
+                    h,
+                    y: y.to_vec(),
+                    u: u.to_vec(),
+                    v: v.to_vec(),
+                }
+            };
+            let (mut laid, base, got) = (planes(&plain), planes(&bottom), planes(&blended));
+            // `lutyuv=a=255`'s `clipval`: luma 16..235, chroma 16..240.
+            laid.y.iter_mut().for_each(|v| *v = (*v).clamp(16, 235));
+            laid.u.iter_mut().for_each(|v| *v = (*v).clamp(16, 240));
+            laid.v.iter_mut().for_each(|v| *v = (*v).clamp(16, 240));
+            let want = reference(BlendMode::Multiply, YuvMatrix::Bt601, &base, &laid, &vec![255u8; w * h]);
+            let stats = |a: &[u8], b: &[u8]| PlaneStats::of(a, b);
+            let (y, u, v) = (stats(&want.y, &got.y), stats(&want.u, &got.u), stats(&want.v, &got.v));
+            eprintln!(
+                "checker/e/diag {gname} {sname} frame {k}: model(bottom, plain graded clip) vs FFmpeg's blend: Y differ {} max {} | UV differ {} max {}",
+                y.differing,
+                y.max,
+                u.differing + v.differing,
+                u.max.max(v.max)
+            );
+            let below = |p: &Planes| p.y.iter().filter(|v| **v < 16 || **v > 235).count();
+            let raw = planes(&plain);
+            eprintln!("    plain graded clip: {} luma samples outside 16..235", below(&raw));
+        }
+    }
+}
+
+/// The matrix the chain names is the bottom layer's of what is rendered: a hidden (muted) track, a track that is not the lowest one soloed, and a
+/// disabled clip do not take part, in the export or in the plan.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_a_hidden_or_disabled_bottom_clip_does_not_name_the_matrix() {
+    use kerf_core::BlendMode;
+    let m = media();
+    let v = variants();
+    for mode in [BlendMode::Difference, BlendMode::Multiply] {
+        // A muted track of BT.709 footage under the cut: untagged footage is the bottom layer that is rendered.
+        let mut blended = clip(&m.testsrc, 0.5, 1.5, 0.0);
+        blended.blend_mode = mode;
+        let mut tl = timeline(
+            vec![
+                vec![clip(&v.bars709, 0.5, 1.5, 0.0)],
+                vec![clip(&m.bars, 0.5, 1.5, 0.0)],
+                vec![blended.clone()],
+            ],
+            None,
+        );
+        tl.tracks[0].muted = true;
+        ce_blend_run(
+            &format!("checker/e/{mode:?} under a muted BT.709 track"),
+            &tl,
+            &[v.bars709.clone(), m.bars.clone(), m.testsrc.clone()],
+            30.0,
+            0.4,
+            true,
+        );
+        // The same with the BT.709 clip disabled, on the lowest track.
+        let mut disabled = clip(&v.bars709, 0.5, 1.5, 0.0);
+        disabled.enabled = false;
+        let tl = timeline(
+            vec![vec![disabled], vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![blended.clone()]],
+            None,
+        );
+        ce_blend_run(
+            &format!("checker/e/{mode:?} under a disabled BT.709 clip"),
+            &tl,
+            &[v.bars709.clone(), m.bars.clone(), m.testsrc.clone()],
+            30.0,
+            0.4,
+            true,
+        );
+        // The BT.709 footage is on the lowest track but starts later than the untagged clip of the same track.
+        let tl = timeline(
+            vec![
+                vec![clip(&v.bars709, 0.5, 1.5, 0.5), clip(&m.bars, 0.5, 1.0, 0.0)],
+                vec![blended.clone()],
+            ],
+            None,
+        );
+        ce_blend_run(
+            &format!("checker/e/{mode:?} over a track whose first picture is untagged but listed second"),
+            &tl,
+            &[v.bars709.clone(), m.bars.clone(), m.testsrc.clone()],
+            30.0,
+            1.0,
+            true,
+        );
+    }
+}
+
+/// The blended clip's window on cuts at other frame rates, a clip starting and ending between two frames of each.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_a_blended_clip_window_at_other_frame_rates() {
+    let m = media();
+    for (i, fps) in [24.0, 25.0, 60.0, 23.976, 29.97, 12.0].into_iter().enumerate() {
+        for (j, (start, len)) in [(0.1, 0.7), (0.0333, 0.5), (0.2, 0.2501), (0.0, 1.0)].into_iter().enumerate() {
+            let mode = BLEND_MODES[(i + j) % 9];
+            let mut top = clip(&m.testsrc, 0.5, 0.5 + len, start);
+            top.blend_mode = mode;
+            top.fade_in = 0.05;
+            ce_blend_run(
+                &format!("checker/e/{fps} fps {mode:?} from {start} for {len}"),
+                &timeline(vec![vec![clip(&m.bars, 0.0, 1.5, 0.0)], vec![top]], None),
+                &[m.bars.clone(), m.testsrc.clone()],
+                fps,
+                1.2,
+                true,
+            );
+        }
+    }
+}
+
+/// A 640x360 PNG of per-sample RGB noise (a still image in `rgb24`): every R, G, B triple.
+fn ce_rgb_noise() -> Asset {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-e-rgb");
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join("noise.png");
+    ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "nullsrc=size=640x360:rate=1:duration=1,format=gbrp,geq=r='random(1)*255':g='random(2)*255':b='random(3)*255'",
+        "-frames:v",
+        "1",
+        "-pix_fmt",
+        "rgb24",
+        p.to_str().unwrap(),
+    ]);
+    probed(&p)
+}
+
+/// A dissolve into a blended clip that is already fading out: the two alpha ramps are rounded one after the other, and the chain applies the
+/// fade-out first and the dissolve's after it (`ClipTiming::fades`: fade in, fade out, dips, dissolve), where the ramps' order is part of the
+/// answer to the level. (With a feathered mask as well its alpha plane has every level.)
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_a_dissolve_that_overlaps_the_fade_out_of_a_blended_clip() {
+    use kerf_core::BlendMode;
+    let m = media();
+    let mut failures: Vec<String> = Vec::new();
+    for (fade_out, dissolve, masked) in [
+        (0.6, 0.6, false),
+        (0.3, 0.8, false),
+        (0.9, 0.2, false),
+        (0.6, 0.6, true),
+        (0.9, 0.3, true),
+        (0.3, 0.9, true),
+    ] {
+        let out = clip(&m.bars, 0.5, 1.5, 0.0);
+        let mut inc = clip(&m.testsrc, 0.5, 1.5, 0.7);
+        inc.blend_mode = BlendMode::Screen;
+        inc.fade_out = fade_out;
+        if masked {
+            inc.mask = Some(mask_of(kerf_core::MaskShape::Ellipse, 1.0, false));
+        }
+        inc.transition_in = Some(Transition {
+            kind: TransitionKind::Crossfade,
+            duration: dissolve,
+        });
+        let case = format!(
+            "checker/e/dissolve {dissolve}s with a fade-out of {fade_out}s{}",
+            if masked { " and a feathered mask" } else { "" }
+        );
+        let tl = timeline(vec![vec![out, inc]], None);
+        let assets = [m.bars.clone(), m.testsrc.clone()];
+        let scan = ce_scan(&case, &tl, &assets, &at_fps(30.0), upto(1.65, 30.0), false);
+        eprintln!("{}", scan.line(&case));
+        if !scan.exact() {
+            failures.push(format!(
+                "{case}: Y {} differ (max {}), UV {} (max {}), first {:?}, frames {:?}",
+                scan.y.differing,
+                scan.y.max,
+                scan.uv.differing,
+                scan.uv.max,
+                scan.first,
+                &scan.bad_frames[..scan.bad_frames.len().min(8)]
+            ));
+        }
+    }
+    // The same with a dip to white (an alpha ramp on a blended clip, last in the chain's order like the dissolve's), the outgoing clip blended
+    // too so that no plain clip's dip to white (not exact at the base commit) is in the frame.
+    for (fade_out, dip, masked) in [(0.6, 0.6, false), (0.9, 0.3, true)] {
+        let mut out = clip(&m.bars, 0.5, 1.5, 0.0);
+        out.blend_mode = BlendMode::Multiply;
+        let mut inc = clip(&m.testsrc, 0.5, 1.5, 0.7);
+        inc.blend_mode = BlendMode::Screen;
+        inc.fade_out = fade_out;
+        if masked {
+            inc.mask = Some(mask_of(kerf_core::MaskShape::Ellipse, 1.0, false));
+        }
+        inc.transition_in = Some(Transition {
+            kind: TransitionKind::DipToWhite,
+            duration: dip,
+        });
+        let case = format!(
+            "checker/e/dip to white {dip}s with a fade-out of {fade_out}s{}",
+            if masked { " and a feathered mask" } else { "" }
+        );
+        let tl = timeline(vec![vec![clip(&m.smooth, 0.5, 2.5, 0.0)], vec![out, inc]], None);
+        let assets = [m.smooth.clone(), m.bars.clone(), m.testsrc.clone()];
+        let scan = ce_scan(&case, &tl, &assets, &at_fps(30.0), upto(1.65, 30.0), false);
+        eprintln!("{}", scan.line(&case));
+        if !scan.exact() {
+            failures.push(format!(
+                "{case}: Y {} differ (max {}), UV {} (max {}), first {:?}, frames {:?}",
+                scan.y.differing,
+                scan.y.max,
+                scan.uv.differing,
+                scan.uv.max,
+                scan.first,
+                &scan.bad_frames[..scan.bad_frames.len().min(8)]
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:?}");
+}
