@@ -151,14 +151,13 @@ impl GradePasses {
 /// Why a layer whose grade is drawn cannot be drawn at this geometry, or `None`: the grade runs in RGB on the picture the
 /// chain has made, at its own size, and what is reproduced is FFmpeg's round trip for a picture the scaler did not
 /// resize, with nothing after the grade that sees the RGB (or, for a tagged picture, 4:4:4) frame. The plan refuses
-/// all of these first (`RenderPlan::reasons`: `Matte`, `GradeWith`, `ZoomBehind`); this is the render's own check,
+/// all of these first (`RenderPlan::reasons`: `Matte`, `GradeWith`); this is the render's own check,
 /// for a caller that did not ask.
 pub(super) fn grade_geometry_refusal(layer: &kerf_core::PlanLayer, geom: &LayerGeometry) -> Option<String> {
-    let (zoom_last, (pw, ph)) = effect_picture(layer, geom);
+    // (A placed layer's geometry ends at the picture the grade acts on: the placement reads the planes it hands on.)
+    let (_, (pw, ph)) = effect_picture(layer, geom);
     if geom.matte {
         Some("a grade on a letterboxed picture".into())
-    } else if zoom_last {
-        Some("a grade before a moving zoom".into())
     } else if geom.stages.iter().any(|s| s.scaled != (s.src.w, s.src.h)) {
         Some("a grade on a layer the scaler resizes".into())
     } else if pw % 2 != 0 || ph % 2 != 0 {
@@ -635,13 +634,6 @@ mod tests {
                 Box::new(|c| c.effects = vec![kerf_core::VideoEffect::Blur { sigma: 2.0 }]),
                 "video effects",
             ),
-            (
-                "a moving zoom last",
-                (640, 360),
-                None,
-                Box::new(|c| c.keyframes = vec![zoom(0.0, 1.0), zoom(4.0, 1.4)]),
-                "moving zoom",
-            ),
         ]
     }
 
@@ -658,10 +650,13 @@ mod tests {
             }];
         });
         assert_eq!(grade_geometry_refusal(&p.layers[0], &geometry(&p)), None);
+        // A moving zoom behind the grade: the placement reads the planes the grade hands on, so the grade acts on the fit-size picture.
+        let p = plan(640, 360, None, |c| c.keyframes = vec![zoom(0.0, 1.0), zoom(4.0, 1.4)]);
+        assert_eq!(grade_geometry_refusal(&p.layers[0], &geometry(&p)), None);
     }
 
     #[test]
-    fn a_letterbox_a_resize_an_effect_and_a_zoom_last_are_each_refused_at_the_render() {
+    fn a_letterbox_a_resize_and_an_effect_are_each_refused_at_the_render() {
         for (name, (w, h), delivery, edit, word) in refused() {
             let p = plan(w, h, delivery, |c| edit(c));
             let why = grade_geometry_refusal(&p.layers[0], &geometry(&p)).unwrap_or_else(|| panic!("{name}: drawn"));

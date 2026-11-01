@@ -123,9 +123,16 @@ pub struct GpuCaps {
     /// the playback stream and the still alike). A compositor that sets it reproduces `pad`, `perspective`
     /// and `crop` ([`crate::perspective`]) after the rest of the chain, which it draws at the fit size
     /// (`keyed_zoom`); without it every frame of such a layer is refused (`KeyedPlacement`). With it set,
-    /// a grade, a rotation, an opacity below 1 and a dip to white ahead of the placement are still refused
-    /// (`ZoomBehind`), and so are an odd-height picture and a pose beyond the table's range (`Geometry`).
+    /// a rotation, an opacity below 1 and a dip to white ahead of the placement are still refused
+    /// (`ZoomBehind`), and so are an odd-height picture and a pose beyond the table's range (`Geometry`); a grade
+    /// ahead of it is drawn where the compositor draws the grade (`grade`).
     pub placement: bool,
+    /// A 4:4:4 or 4:2:2 (8-bit, planar, limited range) picture under a placement: the placement chain converts it to
+    /// `yuva420p` in the graph, and the compositor's decode converted it to 4:2:0 ahead of it. They are the same arithmetic
+    /// where this FFmpeg's `scale` filter defaults to the scaler the decode uses and not where it does not (4.4.2's default
+    /// is bilinear: 24 levels of chroma off on 4:4:4, 16 on 4:2:2), so a compositor sets this only where it **measured**
+    /// that the two conversions agree on the FFmpeg in use; without it such a layer is refused (`PlacedFormat`).
+    pub placed_chroma: bool,
     /// Live behaviours (`Clip.behaviors`: a sway, breath, spin, drift or shake on top of the pose). The
     /// plan carries the exact pose they give at the frame's time, so a compositor that draws the pose
     /// draws them; every frame of such a layer is refused (`Behavior`) until one sets this, and a sway or a
@@ -161,6 +168,7 @@ impl GpuCaps {
         keyed_opacity: false,
         keyed_zoom: false,
         placement: false,
+        placed_chroma: false,
         behaviors: false,
         keyed_color: false,
         mask: false,

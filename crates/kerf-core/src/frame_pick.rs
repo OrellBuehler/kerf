@@ -34,6 +34,15 @@
 //!    it: at a clip's closing edge **the clip is drawn or not by this rule**, not by the
 //!    overlay's `enable`.
 //!
+//! **A clip whose chain pins its `fps`** (`fps=fps=R:start_time=S`: a moving zoom or position, a keyed crop, a moving
+//! still: [`FpsPick::pinned`]) is another rounding. With `start_time` the filter rounds each input time **relative to
+//! the start** — `slot = round_us(S, fps) + round((pts - round_us(S, tb)) * rate)`, both offsets rounded half away from
+//! zero from the whole microseconds `S` truncates to — which is not `round(pts * rate)` wherever the two
+//! roundings fall on different sides of a tie (a 30 fps clip at 24, 25, 48, 50 or 12 fps; a start that is not on a
+//! tick of the stream). The first frame is also shown from the offset on, whatever its own slot (`next_pts` starts
+//! there, and a frame is put out for each slot from it), and the stream's **end** is not offset at all (`update_eof_pts`
+//! rounds the status's pts on its own).
+//!
 //! The time base matters — `start/TB` truncates to a tick, which turns the exact tie of a
 //! frame-aligned clip at speed 2 (a source frame precisely half a slot away) into one side
 //! or the other — so a [`SourceFrames`] carries it. What the rule leaves out is the part of
@@ -129,6 +138,10 @@ pub struct FpsPick {
     /// [module](self)) and the chain does not seek. This is the `color=r=` parse of the
     /// delivery rate (`PlanCanvas::fps`), which `-framerate` shares.
     pub image: Option<Rational>,
+    /// The chain pins its `fps` to the clip's start (`fps=...:start_time=S`, `S` the clip's start plus the
+    /// [`picture_delay`] of a late first picture): a moving zoom or position (the placement), a keyed crop and a
+    /// moving still. See the [module](self).
+    pub pinned: bool,
 }
 
 impl Pick {
@@ -259,6 +272,8 @@ struct Run {
     unit: bool,
     time_base: Rational,
     fps: Rational,
+    /// `fps`'s `start_time` offsets, `(in_pts_off, out_pts_off)`, when the chain pins it.
+    pin: Option<(i64, i64)>,
     /// The slot the stream ends at: where the end of the trimmed window lands, retimed, or the
     /// chain's cut at the clip's end ([`end_frame`]), whichever is first. No output frame is at
     /// or past it.
@@ -266,21 +281,51 @@ struct Run {
 }
 
 impl Run {
-    /// The slot of the frame at `rel` ticks (relative to the seek): `setpts` in doubles,
-    /// truncated (`D2TS` is an `(int64_t)` cast), then `fps`'s rounding to its own ticks.
-    fn slot(&self, rel: i64) -> i64 {
+    /// `setpts`'s result for the frame at `rel` ticks (relative to the seek): in doubles, truncated
+    /// (`D2TS` is an `(int64_t)` cast).
+    fn stamp(&self, rel: i64) -> i64 {
         let d = (rel - self.first) as f64;
         let t = if self.unit {
             d + self.offset
         } else {
             d / self.speed + self.offset
         };
+        t.trunc() as i64
+    }
+
+    /// `fps`'s rounding of `ticks` of the stream's time base to its own ticks, half away from zero.
+    fn to_slots(&self, ticks: i64) -> i64 {
         let (tb, fps) = (self.time_base, self.fps);
         rescale_near(
-            i128::from(t.trunc() as i64),
+            i128::from(ticks),
             i128::from(tb.num) * i128::from(fps.num),
             i128::from(tb.den) * i128::from(fps.den),
         ) as i64
+    }
+
+    /// The slot of the frame at `rel` ticks (relative to the seek): `setpts`, then `fps`'s rounding to its own
+    /// ticks — relative to the pinned start when the chain pins it (`out_off + round(pts - in_off)`).
+    fn slot(&self, rel: i64) -> i64 {
+        let t = self.stamp(rel);
+        match self.pin {
+            Some((in_off, out_off)) => out_off + self.to_slots(t - in_off),
+            None => self.to_slots(t),
+        }
+    }
+
+    /// The slot of the frame at `rel` ticks as the stream's **end** reads it: `fps` rounds the status's pts on its
+    /// own (`update_eof_pts`), with no offset, pinned or not.
+    fn end_slot(&self, rel: i64) -> i64 {
+        self.to_slots(self.stamp(rel))
+    }
+
+    /// The first output frame: the pinned start, else the first frame's own slot. (A pinned `fps` shows its first frame
+    /// from `out_off` on, whatever that frame's slot.)
+    fn first_slot(&self, first_frame_rel: i64) -> i64 {
+        match self.pin {
+            Some((_, out_off)) => out_off,
+            None => self.slot(first_frame_rel),
+        }
     }
 }
 
@@ -349,9 +394,23 @@ fn run(pick: &FpsPick, frames: &Frames) -> Option<Run> {
         unit: (pick.speed - 1.0).abs() < 1e-9,
         time_base: tb,
         fps: pick.fps,
+        pin: None,
         end: 0,
     };
-    run.end = run.slot(beyond).min(end_frame(pick.end, pick.fps));
+    if pick.pinned {
+        // `first_pts = start_time * AV_TIME_BASE`, truncated to whole microseconds, rescaled to each side's ticks.
+        let micros = (start(pick) * 1e6) as i64;
+        let to = |num: i128, den: i128| rescale_near(i128::from(micros), num, den) as i64;
+        run.pin = Some((
+            to(i128::from(tb.den), 1_000_000 * i128::from(tb.num)),
+            to(i128::from(pick.fps.num), 1_000_000 * i128::from(pick.fps.den)),
+        ));
+    }
+    // The status ends the stream at `end_slot`, unoffset; the last frame's own slot, which a pinned `fps` has offset, can
+    // lie past it (the filter acknowledges the status only with one frame left buffered, so the frame before the last
+    // is put out until the last one's slot has come, and that one ends the stream). An unpinned frame's slot never does.
+    let last = run.slot(frames.pts(to - 1) - shift);
+    run.end = run.end_slot(beyond).max(last).min(end_frame(pick.end, pick.fps));
     Some(run)
 }
 
@@ -403,7 +462,7 @@ pub fn fps_pick(pick: &FpsPick, src: &SourceFrames) -> Option<usize> {
 pub fn fps_span(pick: &FpsPick, src: &SourceFrames) -> Option<(i64, i64)> {
     let frames = frames_of(pick, src);
     let run = run(pick, &frames)?;
-    let first = run.slot(frames.pts(run.kept.start) - run.shift);
+    let first = run.first_slot(frames.pts(run.kept.start) - run.shift);
     Some((first, run.end))
 }
 
@@ -434,7 +493,7 @@ fn frames_of<'a>(pick: &FpsPick, src: &'a SourceFrames<'a>) -> Frames<'a> {
 fn fps_output_index(pick: &FpsPick, src: &SourceFrames) -> Option<u64> {
     let frames = frames_of(pick, src);
     let run = run(pick, &frames)?;
-    let first = run.slot(frames.pts(run.kept.start) - run.shift);
+    let first = run.first_slot(frames.pts(run.kept.start) - run.shift);
     let k = i64::try_from(pick.frame).ok()?;
     u64::try_from(k.checked_sub(first)?).ok()
 }
@@ -456,13 +515,14 @@ fn place(pick: &FpsPick, frames: &Frames, run: &Run) -> Placed {
     let n = run.kept.len();
     let slot = |j: usize| run.slot(frames.pts(run.kept.start + j) - run.shift);
     // Output order is file order, or the reverse of it carrying the forward timestamps.
-    if k < slot(0) {
+    if k < run.first_slot(frames.pts(run.kept.start) - run.shift) {
         return Placed::Early;
     }
     if k >= run.end {
         return Placed::Late;
     }
-    let j = slots_through(n, k, slot) - 1;
+    // (A pinned `fps` shows the first frame from its start on, even where that frame's own slot is later.)
+    let j = slots_through(n, k, slot).max(1) - 1;
     Placed::At(run.kept.start + if pick.reverse { n - 1 - j } else { j })
 }
 
@@ -632,6 +692,7 @@ mod tests {
             drop_first: false,
             lead: 0.0,
             image: None,
+            pinned: false,
         }
     }
 
@@ -643,6 +704,147 @@ mod tests {
             last_duration: 0,
         };
         (0..16).map(|k| fps_pick(&FpsPick { frame: k, ..*p }, &src)).collect()
+    }
+
+    /// `vf_fps.c`'s state machine, step by step (`config_props`, `read_frame`, `write_frame`, `update_eof_pts`), over frames
+    /// already stamped by `setpts` (`stamps`, in the input's time base `tb`): what each output tick shows, as an index
+    /// into `stamps`, from the first tick put out through the last. No offsets unless `start_us` (the whole microseconds
+    /// `start_time * 1e6` truncates to) is given: `next_pts` starts at the first frame's slot then.
+    fn simulate_fps(stamps: &[i64], tb: Rational, fps: Rational, start_us: Option<i64>, status: i64) -> (i64, Vec<usize>) {
+        let near = |a: i64, b: i128, c: i128| rescale_near(i128::from(a), b, c) as i64;
+        let (to_out, to_us) = (
+            |a: i64| {
+                near(
+                    a,
+                    i128::from(tb.num) * i128::from(fps.num),
+                    i128::from(tb.den) * i128::from(fps.den),
+                )
+            },
+            |a: i64| near(a, i128::from(tb.den), 1_000_000 * i128::from(tb.num)),
+        );
+        let _ = to_us;
+        let (in_off, out_off) = match start_us {
+            Some(us) => (
+                near(us, i128::from(tb.den), 1_000_000 * i128::from(tb.num)),
+                near(us, i128::from(fps.num), 1_000_000 * i128::from(fps.den)),
+            ),
+            None => (0, 0),
+        };
+        let slots: Vec<i64> = stamps.iter().map(|&p| out_off + to_out(p - in_off)).collect();
+        // (No `eof_action=pass`: the status is rounded like any frame, and carries no offsets.)
+        let status_pts = to_out(status);
+        let mut next = if start_us.is_some() { out_off } else { slots[0] };
+        let first = next;
+        let (mut cur, mut out) = (0usize, Vec::new());
+        loop {
+            let last = cur + 1 == slots.len();
+            if !last && slots[cur + 1] <= next {
+                cur += 1;
+            } else if last && status_pts <= next {
+                break;
+            } else {
+                out.push(cur);
+                next += 1;
+            }
+        }
+        (first, out)
+    }
+
+    /// A pinned `fps` (`fps=R:start_time=S`) rounds relative to the start, shows its first frame from the start on and ends
+    /// where the stream's status says: held to a step-by-step run of `vf_fps.c` over rates, starts and speeds that fall on
+    /// ties (30 fps footage at 24, 25, 48, 50 and 12; starts off the tick), and unlike the plain pick wherever they differ.
+    #[test]
+    fn a_pinned_fps_is_the_filter_with_start_time_and_not_the_plain_pick() {
+        let mut differs = 0;
+        let mut compared = 0;
+        for (tb, step) in [
+            (Rational { num: 1, den: 15_360 }, 512i64),
+            (Rational { num: 1, den: 90_000 }, 3000),
+            (Rational { num: 1, den: 1000 }, 33),
+            (Rational { num: 1, den: 30 }, 1),
+        ] {
+            let pts: Vec<i64> = (0..60).map(|i| i * step).collect();
+            for fps in [
+                (24, 1),
+                (25, 1),
+                (48, 1),
+                (50, 1),
+                (12, 1),
+                (24_000, 1001),
+                (30_000, 1001),
+                (30, 1),
+                (60, 1),
+            ] {
+                for start in [0.0, 0.37, 1.013, 0.52, 2.0, 0.0333] {
+                    for speed in [1.0, 2.0, 0.5, 1.5] {
+                        let rate = Rational::new(fps.0, fps.1).unwrap();
+                        let base = FpsPick {
+                            pinned: true,
+                            ..pick((0.0, 100.0), start, speed, false, fps, 0)
+                        };
+                        let src = SourceFrames {
+                            pts: &pts,
+                            time_base: tb,
+                            start_us: 0,
+                            last_duration: step,
+                        };
+                        let frames = frames_of(&base, &src);
+                        let r = run(&base, &frames).expect("a run");
+                        // The stamps `setpts` writes and the status the stream ends with, as the pick reads them.
+                        let stamps: Vec<i64> = pts.iter().map(|&p| r.stamp(p)).collect();
+                        let beyond = pts[pts.len() - 1] + step;
+                        let status = r.stamp(beyond);
+                        let micros = (start * 1e6) as i64;
+                        let (first, shows) = simulate_fps(&stamps, tb, rate, Some(micros), status);
+                        let plain = FpsPick { pinned: false, ..base };
+                        for (k, want) in shows.iter().enumerate() {
+                            let frame = u64::try_from(first).unwrap() + k as u64;
+                            let got = fps_pick(&FpsPick { frame, ..base }, &src);
+                            assert_eq!(
+                                got,
+                                Some(*want),
+                                "tb {tb:?} step {step} @{fps:?} start {start} speed {speed}: output {frame}"
+                            );
+                            compared += 1;
+                            if fps_pick(&FpsPick { frame, ..plain }, &src) != got {
+                                differs += 1;
+                            }
+                        }
+                        // Nothing before the start, nothing from the end on.
+                        if first > 0 {
+                            assert_eq!(
+                                fps_pick(
+                                    &FpsPick {
+                                        frame: first as u64 - 1,
+                                        ..base
+                                    },
+                                    &src
+                                ),
+                                None
+                            );
+                        }
+                        let end = first + shows.len() as i64;
+                        assert_eq!(
+                            fps_pick(
+                                &FpsPick {
+                                    frame: end as u64,
+                                    ..base
+                                },
+                                &src
+                            ),
+                            None
+                        );
+                        assert_eq!(fps_span(&base, &src), Some((first, end)));
+                    }
+                }
+            }
+        }
+        // (The end cut `end_frame(pick.end)` is out of reach here: `end` is infinite.)
+        assert!(compared > 10_000, "{compared}");
+        assert!(
+            differs > 100,
+            "the plain pick must be the wrong one somewhere: {differs} of {compared}"
+        );
     }
 
     #[test]
@@ -707,6 +909,7 @@ mod tests {
         assert_eq!(pick((0.0, 1.0), 0.0, 1.0, false, (30, 1), 0).seek_arg(), None);
         let image = FpsPick {
             image: Some(Rational::new(30, 1).unwrap()),
+            pinned: false,
             ..pick((2.0, 3.0), 0.0, 1.0, false, (30, 1), 0)
         };
         assert_eq!(image.seek_arg(), None);
@@ -891,6 +1094,7 @@ mod tests {
         let still = |window: (f64, f64), start: f64, speed: f64, k: u64| {
             let p = FpsPick {
                 image: Some(rate),
+                pinned: false,
                 ..pick(window, start, speed, false, (30, 1), k)
             };
             fps_pick(&p, &SourceFrames::NONE)
@@ -1166,6 +1370,7 @@ mod tests {
         let still = |k| {
             Pick::Fps(FpsPick {
                 image: Some(rate),
+                pinned: false,
                 ..pick((0.0, 1.0), 0.0, 1.0, false, (30, 1), k)
             })
         };
@@ -1191,6 +1396,7 @@ mod tests {
         let late = |k| {
             Pick::Fps(FpsPick {
                 image: Some(rate),
+                pinned: false,
                 ..pick((0.0, 1.0), 1.0, 1.0, false, (30, 1), k)
             })
         };
@@ -1219,6 +1425,7 @@ mod tests {
         assert_eq!(
             FpsPick {
                 image: Some(rate),
+                pinned: false,
                 ..pick((0.0, 1.0), 0.0, 1.0, false, (30, 1), 0)
             }
             .seek(),
@@ -1300,6 +1507,7 @@ mod tests {
                 drop_first: rnd(6) == 0,
                 lead: 0.0,
                 image: None,
+                pinned: rnd(2) == 0,
             };
             let full = SourceFrames {
                 pts: &pts,

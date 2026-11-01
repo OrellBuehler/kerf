@@ -788,6 +788,13 @@ pub fn prepare(plan: &RenderPlan) {
     if plan.layers.iter().any(|l| !l.grade.is_identity()) {
         let _ = crate::grade::kernels();
     }
+    if plan
+        .layers
+        .iter()
+        .any(|l| plan.pose(l).is_some() && matches!(l.stream.pix_fmt.as_deref(), Some("yuv444p" | "yuv422p")))
+    {
+        let _ = crate::conversion::conversion();
+    }
 }
 
 impl Compositor {
@@ -800,6 +807,8 @@ impl Compositor {
     ///   still plans and in export frames (`tests/motion_parity.rs`);
     /// * `keyed_zoom`, `placement`: a moving zoom or position drawn last, as FFmpeg's chain has it: the rest of the
     ///   chain at the fit size, then `pad`, `perspective` and `crop` ([`kerf_core::perspective`], `placement.wgsl`);
+    /// * `placed_chroma`: a 4:4:4 or 4:2:2 picture under a placement, **where this FFmpeg's `scale` converts it in a graph as the
+    ///   decode does** ([`crate::conversion`], measured: not in [`Compositor::CAPS`]);
     /// * `behaviors`: a live breath, drift or shake is the pose the plan evaluates, drawn by the same placement (a sway
     ///   or a spin turns the picture, which no pass draws to the sample: still refused);
     /// * `keyed_opacity`: an export frame's `geq` alpha, the value the plan evaluates
@@ -826,6 +835,8 @@ impl Compositor {
         if kernels != crate::grade::Kernels::Match {
             caps.grade = GradeKinds::NONE;
         }
+        // (Only what has been measured: [`prepare`] asks ahead of a plan that needs it.)
+        caps.placed_chroma = crate::conversion::measured() == crate::conversion::Conversion::Match;
         caps
     }
 
@@ -2030,7 +2041,7 @@ impl Compositor {
 
     /// The placement of a layer whose zoom or position moves: the map of sample positions `perspective` builds
     /// ([`PlacementMap`]), after the checks the plan makes and that a caller who did not ask gets as errors.
-    /// Nothing is drawn behind it that FFmpeg orders otherwise: a rotation, a translucent layer, a grade and a
+    /// Nothing is drawn behind it that FFmpeg orders otherwise: a rotation, a translucent layer and a
     /// dip to white are `ZoomBehind` in the plan.
     fn placement_of(
         &self,
@@ -2038,7 +2049,6 @@ impl Compositor {
         layer: &kerf_core::PlanLayer,
         geom: &LayerGeometry,
         fades: &LayerFades,
-        look: &LayerLook,
         size: (u32, u32),
     ) -> Result<Option<PlacementMap>, GpuError> {
         let Some(pose) = plan.pose(layer) else {
@@ -2048,8 +2058,8 @@ impl Compositor {
         if geom.rotation.is_some() || geom.translucent || fades.alpha < 255 {
             return Err(unsupported("a rotation or an opacity below 1 ahead of a placement".into()));
         }
-        if look.grade.is_some() || fades.white_round_trip {
-            return Err(unsupported("a grade or a dip to white ahead of a placement".into()));
+        if fades.white_round_trip {
+            return Err(unsupported("a dip to white ahead of a placement".into()));
         }
         if geom.matte || !PlacementFrame::exact_for(geom.picture) {
             return Err(unsupported(format!(
@@ -2515,7 +2525,7 @@ impl Compositor {
             }
             let fades = LayerFades::of(plan, layer, &geom)?;
             let look = self.look_of(layer, &geom)?;
-            let placement = self.placement_of(plan, layer, &geom, &fades, &look, size)?;
+            let placement = self.placement_of(plan, layer, &geom, &fades, size)?;
             // `fade` takes `rgb24` and runs on the picture the grade leaves in RGB (a dip to white is in the
             // chain for every frame of the clip, and converts the picture through RGB itself).
             if look.grade.is_some() && (fades.fade_in < FADE_FULL || fades.fade_out < FADE_FULL || fades.white_round_trip) {

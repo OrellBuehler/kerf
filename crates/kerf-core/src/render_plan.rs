@@ -1434,8 +1434,13 @@ impl RenderPlan {
             }
             if self.pose(layer).is_some() && caps.placement {
                 let fmt = stream.pix_fmt.clone().unwrap_or_else(|| "not recorded".to_string());
+                // 8-bit planar 4:4:4 and 4:2:2, limited range: converted in the graph as the decode converts them where a
+                // compositor measured that (`GpuCaps::placed_chroma`).
+                let planar = matches!(fmt.to_ascii_lowercase().as_str(), "yuv444p" | "yuv422p");
                 if !matches!(stream.layout(), Some(PixLayout::Yuv420 | PixLayout::Gray)) {
-                    out.push(Unsupported::PlacedFormat(at(), fmt));
+                    if !(caps.placed_chroma && planar) {
+                        out.push(Unsupported::PlacedFormat(at(), fmt));
+                    }
                 } else if self.canvas.policy != CompositeColorPolicy::FixedBt601 && stream.maybe_full_range_in(self.canvas.policy)
                 {
                     // Where the composite's range is negotiated along the graph (9.0.2), the range conversion inside
@@ -1587,17 +1592,17 @@ impl RenderPlan {
         }
     }
 
-    /// What is ahead of a moving zoom that a compositor with `keyed_zoom` still does not draw: a
+    /// What is ahead of a moving zoom or position that a compositor with `keyed_zoom` still does not draw: a
     /// rotation and an opacity below 1 (their alpha plane and RGB round trip would be scaled with
     /// the zoom), and a dip to white (the zoom's `scale` takes the RGB frame `fade c=white` leaves
     /// and converts it to 4:2:0 in the same pass, which neither FFmpeg 6.1 nor 9.0 does as a scale of
-    /// the converted picture: up to 14 levels off on 6.1, 3 on 9.0).
+    /// the converted picture: up to 14 levels off on 6.1, 3 on 9.0). A grade is not here: the placement reads the
+    /// 4:2:0 planes the grade hands on, and every grade (wheels, curves, LUTs of 17, 33 and 2 points, all three)
+    /// is exact behind it on 6.1.1 and 9.0.2, in an export frame and in a still.
     fn zoom_order_refusal(&self, layer: &PlanLayer, ops: &[FadeOp]) -> Option<&'static str> {
         let rotated =
             layer.transform.rotation != 0.0 || (self.mode == PlanMode::Motion && layer.animated.is_some_and(|a| a.rotates));
-        if !layer.grade.is_identity() {
-            Some("a grade")
-        } else if rotated {
+        if rotated {
             Some("a rotation")
         } else if layer.transform.opacity < 1.0 || layer.keyed_alpha.is_some_and(|a| a < 255) {
             Some("an opacity below 1")
@@ -2769,11 +2774,23 @@ mod tests {
         for fmt in ["yuv444p", "yuv422p", "rgb24", "gbrp"] {
             let mut stream = video(640, 360);
             stream.pix_fmt = Some(fmt.into());
-            let (why, _) = judge(stream, None, &zooming, 4.0);
+            let (why, _) = judge(stream.clone(), None, &zooming, 4.0);
             assert!(
                 why.iter().any(|u| matches!(u, Unsupported::PlacedFormat(_, f) if f == fmt)),
                 "{fmt}: {why:?}"
             );
+            // Where the compositor measured that the graph converts planar 4:4:4 and 4:2:2 as the decode does, those two are
+            // drawn; RGB and the rest of the family are not (not measured).
+            let plan = fading_plan_of(stream, None, CompositeColorPolicy::FixedBt601, |c| zooming(c), 4.0);
+            let why = plan.reasons(
+                &GpuCaps {
+                    placed_chroma: true,
+                    ..caps
+                },
+                plan.size(u32::MAX),
+            );
+            let refused = why.iter().any(|u| matches!(u, Unsupported::PlacedFormat(..)));
+            assert_eq!(refused, !matches!(fmt, "yuv444p" | "yuv422p"), "{fmt}: {why:?}");
         }
         for fmt in ["yuv420p", "yuv420p10le", "gray"] {
             let mut stream = video(640, 360);
@@ -4052,7 +4069,8 @@ mod tests {
             &|c| c.keyframes = vec![key(0.0, 1.0), key(4.0, 1.5)],
             0.5,
         );
-        assert!(w.iter().any(|u| matches!(u, Unsupported::ZoomBehind(_, "a grade"))), "{w:?}");
+        // (A grade ahead of a moving zoom is drawn: the placement reads the planes the grade hands on, exact behind every grade.)
+        assert!(!w.iter().any(|u| matches!(u, Unsupported::ZoomBehind(..))), "{w:?}");
         // The geometry: a resize (whatever the ratio), a letterbox, an odd picture.
         with(why(video(640, 360), None, &|c| c.transform.scale = 0.5, 0.5), "resizes");
         // (A zoom in is the fit's own resample, which the plan refuses for itself: `FoldedFit`.)

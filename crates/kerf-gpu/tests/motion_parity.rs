@@ -60,6 +60,8 @@ fn compositor() -> &'static Compositor {
         // The grade is in the caps once this FFmpeg's conversions are known to be the model's (the app's `prepare` asks
         // ahead of a frame): the harness measures them once, up front, and its grade cases hold the answer to `Match`.
         let _ = kerf_gpu::grade::kernels();
+        // ... and whether this FFmpeg converts a 4:4:4 / 4:2:2 picture in a graph as the decode does (a placed one).
+        let _ = kerf_gpu::conversion::conversion();
         Compositor::new(gpu()).expect("a compositor")
     })
 }
@@ -3350,17 +3352,22 @@ fn a_placed_picture_is_drawn_for_the_formats_both_conversions_agree_on() {
             refused(&case, &tl, &assets, &at_fps(30.0), upto(1.0, 30.0), &why[0]);
         }
     }
-    // 4:4:4, 4:2:2: refused on every build, FFmpeg renders them.
+    // 4:4:4, 4:2:2: drawn where the probe says this FFmpeg converts them in a graph as the decode does (6.1.1, 9.0.2: exact),
+    // refused where it does not (4.4.2's `scale` defaults to bilinear: chroma 24 and 16 levels off), FFmpeg renders them.
     for (name, asset) in [("yuv444p", &v.yuv444), ("yuv422p", &v.yuv422)] {
         let (tl, assets) = zoom_over(&m.bars, asset);
-        refused(
-            &format!("format/{name}"),
-            &tl,
-            &assets,
-            &at_fps(30.0),
-            upto(1.0, 30.0),
-            "a moving zoom or position on a",
-        );
+        if compositor().caps().placed_chroma {
+            run_placed(&format!("format/{name}"), &tl, &assets, 30.0, 1.0);
+        } else {
+            refused(
+                &format!("format/{name}"),
+                &tl,
+                &assets,
+                &at_fps(30.0),
+                upto(1.0, 30.0),
+                "a moving zoom or position on a",
+            );
+        }
     }
 }
 
@@ -5012,11 +5019,11 @@ fn what_the_compositor_does_not_draw_of_a_grade_is_refused() {
         0..60,
         "fade to black or white",
     );
-    // A moving zoom behind the grade.
+    // A moving zoom behind the grade: the placement reads the 4:2:0 planes the grade hands on.
     let (tl, a) = one(&m.testsrc, &|c| {
         c.keyframes = vec![zoom_key(0.0, 1.0, 0.0, 0.0), zoom_key(1.0, 1.4, 0.0, 0.0)];
     });
-    refused("grade/moving zoom", &tl, &a, &at, frames.clone(), "a grade");
+    run_range("grade/moving zoom", &tl, &a, 30.0, frames.clone(), EXACT);
     // A matrix with no measured round trip.
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("motion-media-grade");
     std::fs::create_dir_all(&dir).unwrap();
@@ -5106,18 +5113,11 @@ fn a_graded_layer_is_keyed_in_opacity_and_position_over_another_and_its_fades_ar
     c.set_property_keys(Property::PosX, vec![key(0.0, 0.3), key(1.0, 0.3)]);
     c.set_property_keys(Property::PosY, vec![key(0.0, -0.2), key(1.0, -0.2)]);
     run("grade/keyed position, held", &over(c), &assets, 30.0, 1.0, EXACT);
-    // One that moves is placed by the export's `perspective` after the grade, whose RGB round trip the placement
-    // is not drawn behind (`ZoomBehind`); with the opacity too.
+    // One that moves is placed by the export's `perspective` after the grade: the placement reads the planes the grade
+    // hands on, exact; with a keyed opacity below 1 it is the alpha plane's RGB round trip that is not drawn behind it.
     let mut c = graded(&heavy);
     c.set_property_keys(Property::PosX, vec![key(0.0, -0.1), key(1.0, 0.1)]);
-    refused(
-        "grade/keyed position",
-        &over(c),
-        &assets,
-        &at_fps(30.0),
-        upto(1.0, 30.0),
-        "a grade",
-    );
+    run_placed("grade/keyed position", &over(c), &assets, 30.0, 1.0);
     let mut c = graded(&heavy);
     c.set_property_keys(Property::Opacity, vec![key(0.0, 0.3), key(1.0, 0.9)]);
     c.set_property_keys(Property::PosX, vec![key(0.0, -0.1), key(1.0, 0.1)]);
@@ -5127,7 +5127,7 @@ fn a_graded_layer_is_keyed_in_opacity_and_position_over_another_and_its_fades_ar
         &assets,
         &at_fps(30.0),
         upto(1.0, 30.0),
-        "a grade",
+        "an opacity below 1",
     );
 
     // Its own fade-in and fade-out, on a layer over another track: refused where they run, drawn after and before.

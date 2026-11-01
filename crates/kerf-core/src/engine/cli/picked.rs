@@ -570,6 +570,85 @@ fn the_fps_pick_is_the_frame_the_export_renders_at_the_end_of_the_file_and_in_ti
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A clip whose zoom or position moves ends its chain in the placement, and its `fps` is pinned to the clip's start
+/// (`fps=fps=R:start_time=S`, `keyed_crop_fps`): the filter then rounds each input time **relative to the start** and puts the
+/// first frame out from the start on, which is not the plain `round(pts * rate)` where the two fall either side of a tie
+/// (30 fps footage at 24, 25, 48, 50 and 12; a start off the stream's ticks). The pick of a pinned clip
+/// (`FpsPick::pinned`) is held to the frames the export draws, over the rates, starts, speeds and seeks where that matters. The
+/// zoom moves by a millionth, so the picture stays on its samples and its barcode reads as it is.
+#[test]
+#[ignore = "needs the ffmpeg and ffprobe binaries"]
+fn the_fps_pick_is_the_frame_the_export_renders_for_a_clip_whose_fps_is_pinned_to_its_start() {
+    let dir = scratch("pick-pinned");
+    let filler = filler(&dir);
+    let sources = [
+        ("30", numbered(&dir, "30", 4, MP4)),
+        ("24", numbered(&dir, "24", 4, MP4)),
+        ("25", numbered(&dir, "25", 4, MP4)),
+        ("29.97", numbered(&dir, "29.97", 4, MP4)),
+        ("10", numbered(&dir, "10", 4, MP4)),
+    ];
+    let key = |time: f64, scale: f64| crate::model::Keyframe {
+        time,
+        scale,
+        pos_x: 0.0,
+        pos_y: 0.0,
+        rotation: 0.0,
+        opacity: 1.0,
+        easing: Default::default(),
+    };
+    let (mut drawn, mut bad, mut n) = (0, Vec::new(), 0);
+    for (name, src) in &sources {
+        for export in ["24", "25", "30", "48", "50", "12", "29.97"] {
+            let fps: f64 = export.parse().unwrap();
+            // (start, speed, seek): off the output grid, off the stream's ticks, slowed, sped up, reversed, seeked.
+            for (start, speed, seek) in [
+                (0.37, 1.0, 0.0),
+                (1.013, 1.0, 0.3),
+                (0.52, 1.0, 0.0),
+                (0.37, 2.0, 0.0),
+                (0.4, 0.5, 0.35),
+                (0.37, -1.0, 0.0),
+                (6.0 / fps, 1.0, 0.0),
+            ] {
+                let (mut timeline, clip) = timeline_of_clip(&src.asset, &filler, seek, 1.0, speed, start);
+                timeline.tracks[1].clips[0].keyframes = vec![key(0.0, 1.0), key(1.0, 1.000_001)];
+                let assets = [src.asset.clone(), filler.clone()];
+                let found = compare(
+                    &timeline,
+                    clip,
+                    &assets,
+                    &assets,
+                    None,
+                    Some(Path::new(&src.asset.path)),
+                    &src.numbers,
+                    fps,
+                    &dir,
+                    &format!("p{n}"),
+                    H / 2,
+                );
+                n += 1;
+                drawn += found.drawn;
+                if !found.wrong.is_empty() {
+                    bad.push(format!(
+                        "{name} fps source -> {export} fps export, speed {speed}, start {start}, seek {seek}: {} of {} frames differ, first (frame, rendered, planned) {:?}",
+                        found.wrong.len(),
+                        found.drawn,
+                        &found.wrong[..found.wrong.len().min(4)]
+                    ));
+                }
+            }
+        }
+    }
+    eprintln!(
+        "{n} pinned clips, {drawn} drawn frames compared, {} clips with a mismatch",
+        bad.len()
+    );
+    assert!(drawn > n, "the clips must be drawn");
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// A clip that plays on under a dissolve (its `tail`: the window `trim` is given reaches past
 /// the clip's end, forward, or below its start, reversed) is drawn by the same rule, with the
 /// longer window. The incoming clip is a black one at half size, so along the top of the frame

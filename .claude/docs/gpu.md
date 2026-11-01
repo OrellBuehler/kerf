@@ -645,10 +645,13 @@ before the zoom acts at the **fit size** and the zoom magnifies it (a blur grows
 
 * **A moving zoom or position is drawn by the placement pass** (`GpuCaps::placement`; see "The placement" below): the export and the
   FFmpeg still end such a clip's chain in `pad`, `perspective` and `crop`, and the compositor reproduces those after everything else
-  at the fit size. A layer is still refused (`ZoomBehind`) when a grade, a rotation, an opacity below 1 or a dip to white is ahead of
+  at the fit size. A layer is still refused (`ZoomBehind`) when a rotation, an opacity below 1 or a dip to white is ahead of
   it, for a moving position as for a moving zoom, for an odd-height picture or a pose out of the table's range (`Geometry`), for a layer that is not
-  4:2:0 or gray, or may be full range where the composite's range is negotiated (`PlacedFormat`, below), and for a letterboxed picture at the identity pose in a
-  still (`Geometry`: the still pads it to the whole frame first, with opaque bars).
+  4:2:0 or gray (unless the probe says the graph converts 4:4:4 and 4:2:2 as the decode does: `GpuCaps::placed_chroma`), or may be full range where the
+  composite's range is negotiated (`PlacedFormat`, below), and for a letterboxed picture at the identity pose in a still (`Geometry`: the still pads it to
+  the whole frame first, with opaque bars). **A grade ahead of the placement is drawn** (where the compositor draws the grade at all: `GpuCaps::grade`, which
+  the conversion probe gates): all twelve grades of the harness (wheels, curves, LUTs of 17, 33 and 2 points, all three) are exact behind a moving zoom and a
+  moving position on 6.1.1 and 9.0.2, in an export frame and in a still.
 * **Live behaviours** (`GpuCaps::behaviors`; `core-render-plan.md`): breathe, drift and shake are a formula of the clip's clock added to its pose, the plan's
   `transform` is the exact pose they give at the frame (`Clip::transform_at`, the arithmetic of the graph's expressions, `sin` / `cos` included), and the
   placement draws that pose: held exactly in export frames and stills (`behavior/*`: each alone, all three, over a keyed zoom). A sway or a spin turns the
@@ -657,8 +660,8 @@ before the zoom acts at the **fit size** and the zoom magnifies it (a blur grows
 * The compositor draws that order (`LayerLook::placed`: `animated.places`, a geometry that ends at the fit-size picture). Stage 0 is the fit
   scale with the `eq` tables in its vertical pass; the effects, the mask plane and the fades (`fs_fade`: Y, U, V and the alpha) run on the
   fit-size planes; the placement then reads the four planes. A zoom that holds still keeps the old order (a `scale` ahead of the rest).
-* Refused whatever the caps (`ZoomBehind`): a grade, a rotation and an opacity below 1 (the placement would act on the rotated alpha, the RGB round
-  trip or the grade's conversions, none of which a case holds to FFmpeg's), and a dip to white (`fade c=white` converts the picture to RGB and back
+* Refused whatever the caps (`ZoomBehind`): a rotation and an opacity below 1 (the placement would act on the rotated alpha or the RGB round
+  trip, neither of which a case holds to FFmpeg's), and a dip to white (`fade c=white` converts the picture to RGB and back
   around the fade; no case holds the placement behind it).
 
 **The placement** (`kerf_core::perspective`, `src/placement.rs`, `shaders/placement.wgsl`, `Compositor::place_planes`; `tests/placement.rs`).
@@ -685,10 +688,25 @@ reproduced exactly:
   The alpha plane is resampled like luma, so the fringe where the picture meets the pad is a ramp of alpha *and* of Y towards 16.
 * **`PlacedFormat`** (kind `placed_format`): the chain converts the picture to `yuva420p` itself, at its head, where the compositor's decode converted it to 8-bit
   limited-range 4:2:0 ahead of the graph. The two are the same arithmetic where the picture is already 4:2:0 (8 and 10 bit, any matrix tag, gray: held exactly on
-  both builds), and are not elsewhere: a **4:4:4 picture's chroma is 24 levels off on 4.4.2 and a 4:2:2 one's 16** (exact on 9.0.2: the standalone conversion and the
-  standalone placement are both exact on 4.4.2, so it is the export graph's own conversion that differs), **RGB** is the same family, and a **full-range** picture
-  (`yuvj420p`, 10-bit flagged `pc`, or one whose range is not recorded) is **3 to 5 levels off in a still on 9.0.2** (exact on 4.4.2). So 4:4:4, 4:2:2, RGB and
-  an unrecorded format are refused on every build, and a picture that may be full range where the composite's range is negotiated (`policy != FixedBt601`).
+  both builds), and are not elsewhere: a **4:4:4 picture's chroma is 24 levels off on 4.4.2 and a 4:2:2 one's 16**, exact on 6.1.1 and 9.0.2. The cause is the `scale`
+  filter's own default: **4.4.2's `flags` default is `bilinear`** (`vf_scale.c`; 6.1.1's is empty, which is swscale's bicubic), and the graph's conversion is that
+  filter's where the decode's is the CLI's simple graph, bicubic (the standalone conversion and the standalone placement are both exact on 4.4.2). So **the
+  4:4:4 / 4:2:2 refusal is lifted by a measurement, not a version** (`kerf_gpu::conversion`, `GpuCaps::placed_chroma`, set by `Compositor::caps()` once the probe
+  has said `Match`): one tiny `testsrc2` picture of each format through the decode's conversion and through the graph's (`scale ... , format=yuva420p`, the
+  chain's own head), compared plane by plane; `Differs` (4.4.2: 774 samples, max 20) or `Unknown` (FFmpeg would not run: retried after a backoff, never cached)
+  leaves them refused. `prepare(plan)` runs it ahead of a plan with such a layer. Only 8-bit planar `yuv444p` and `yuv422p` are lifted: **RGB** and the rest of the
+  family (4:4:0, 4:1:1, 12 bit, packed) were not measured and stay refused. A **full-range** picture (`yuvj420p`, 10-bit flagged `pc`, or one whose range is not
+  recorded) is **3 to 5 levels off in a still on 9.0.2** (exact on 4.4.2) and stays refused where the composite's range is negotiated (`policy != FixedBt601`).
+  (The same default is the likeliest cause of the compositor's scaler being up to 29 levels off swscale on 4.4.2: it follows bicubic.)
+* **Which frame is drawn** (`FpsPick::pinned`, `frame_pick.rs`): a placed clip's chain pins its `fps` (`fps=fps=R:start_time=S`, `keyed_crop_fps`), and with
+  `start_time` the filter rounds each input time **relative to the start**: `slot = round_us(S, fps) + round((pts - round_us(S, tb)) * rate)`, both offsets rounded
+  half away from zero from the microseconds `S * 1e6` truncates to (`vf_fps.c` `config_props`, `read_frame`), shows its first frame from the offset on whatever that
+  frame's own slot (`next_pts` starts there), and ends the stream at the status's own rounding (`update_eof_pts`, no offsets) or at the last frame's offset slot,
+  whichever is later (the status is acknowledged only with one frame left buffered, so the frame before the last is put out until the last one's slot has come). The
+  plain pick (`round(pts * rate)`) differs on every tie: 30 fps footage at 24, 25, 48, 50 or 12 fps, or a start off the stream's ticks (at 24 fps, `start_time=0.37`
+  against `fps=24` after `setpts=PTS-STARTPTS+0.37/TB`: output ticks 10, 14, 18, 22, 26, 30). The unit test runs `vf_fps.c`'s state machine step by step over 4 time
+  bases, 9 rates, 6 starts and 4 speeds, and the rendered one (`picked.rs`, `the_fps_pick_is_the_frame_the_export_renders_for_a_clip_whose_fps_is_pinned_to_its_start`:
+  245 clips, 5 sources x 7 rates x 7 starts / speeds / seeks, through the real export graph) holds it to 6.1.1 and 9.0.2.
 * The compositor draws the four canvas-sized planes (Y, U, V, alpha) and hands them to `compose_exact` as a layer at the origin with a per-sample alpha,
   `overlay`'s own integer blend. The fades (a clip's own, a dip to black, a dissolve's ramp on the alpha plane or on the opaque one `format=yuva420p` gives
   a picture) run on the fit-size planes first, as in the chain; the mask is cut at the fit size and placed with the picture.

@@ -316,6 +316,8 @@ fn compositor() -> &'static Compositor {
         // The grade is in the caps once this FFmpeg's conversions are known to be the model's (the app's `prepare` asks
         // ahead of a frame): the harness measures them once, up front, and its grade cases hold the answer to `Match`.
         let _ = kerf_gpu::grade::kernels();
+        // ... and whether this FFmpeg converts a 4:4:4 / 4:2:2 picture in a graph as the decode does (a placed one).
+        let _ = kerf_gpu::conversion::conversion();
         Compositor::new(gpu()).expect("a compositor")
     })
 }
@@ -4759,15 +4761,20 @@ fn a_placed_picture_of_another_shape_or_format_is_placed_as_the_still_places_it(
             eprintln!("{case}: refused for the composite colour policy of this FFmpeg: {why:?}");
         }
     }
+    // 4:4:4 and 4:2:2: drawn where this FFmpeg converts them in a graph as the decode does (the probe), refused where it does not.
     for (name, asset) in [("yuv444p", &m.yuv444), ("yuv422p", &m.yuv422)] {
         let (tl, assets) = over(&m.bars, asset, 1.0, 1.6, (0.0, 0.0));
-        check_refused(
-            &format!("format/{name}"),
-            &tl,
-            &assets,
-            1.0,
-            Refusal::Plan("a moving zoom or position on a"),
-        );
+        if compositor().caps().placed_chroma {
+            check_placed(&format!("format/{name}"), &tl, &assets, &times);
+        } else {
+            check_refused(
+                &format!("format/{name}"),
+                &tl,
+                &assets,
+                1.0,
+                Refusal::Plan("a moving zoom or position on a"),
+            );
+        }
     }
     // A slide into a zooming clip, a position that moves alone, the travel of a push.
     for (name, kind) in [("slide", TransitionKind::SlideLeft), ("push", TransitionKind::PushRight)] {
@@ -7032,17 +7039,15 @@ fn what_the_compositor_does_not_draw_of_a_grade_is_refused() {
         assets.push(m.bars.clone());
         refuse(name, (tl, assets), t, "fade to black or white");
     }
-    refuse(
-        "moving zoom",
-        one(&m.testsrc, &|c| {
-            c.keyframes = zoom_keys(1.0, 1.4, (0.0, 0.0));
-        }),
-        0.5,
-        "a grade",
-    );
+    // (A moving zoom behind a grade is drawn: `grade/moving zoom`, below.)
     // The same clip past its fade is drawn.
     let (tl, assets) = one(&m.testsrc, &|c| c.fade_in = 0.3);
     check("grade/after its fade-in", &tl, &assets, &[1.0], STRICT);
+    // A moving zoom or position placed behind the grade: the placement reads the 4:2:0 planes the grade hands on.
+    let (tl, assets) = one(&m.testsrc, &|c| {
+        c.keyframes = zoom_keys(1.0, 1.4, (0.0, 0.0));
+    });
+    check_exact("grade/moving zoom", &tl, &assets, &[0.8, 1.2, 1.9]);
 }
 
 // ---- checker/a: keyed placement in a still, cases the implementer did not write ----------------------------

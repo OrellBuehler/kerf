@@ -644,6 +644,9 @@ impl Planner {
                             && clip_seek(planned.source_window.0, planned.fx.lead) == 0.0,
                         lead: planned.fx.lead,
                         image: asset.is_image.then_some(self.canvas.fps),
+                        // The chain pins its `fps` to the clip's start for a moving zoom or position (the placement),
+                        // a keyed crop and a moving still (`keyed_crop_fps`).
+                        pinned: planned.animated.is_some_and(|a| a.places || a.crop || a.still_motion),
                     })
                 } else if asset.is_image {
                     Pick::AtOrAfter(0.0)
@@ -1718,6 +1721,7 @@ mod tests {
             keyed_opacity: true,
             keyed_zoom: true,
             placement: false,
+            placed_chroma: false,
             behaviors: false,
             keyed_color: true,
             mask: true,
@@ -1936,6 +1940,7 @@ mod tests {
             keyed_opacity: true,
             keyed_zoom: true,
             placement: false,
+            placed_chroma: false,
             behaviors: false,
             keyed_color: true,
             mask: true,
@@ -2577,6 +2582,7 @@ mod tests {
             keyed_opacity: true,
             keyed_zoom: true,
             placement: false,
+            placed_chroma: false,
             behaviors: false,
             keyed_color: true,
             mask: true,
@@ -3096,6 +3102,7 @@ mod tests {
             drop_first: false,
             lead: 0.0,
             image: None,
+            pinned: false,
         };
         assert_eq!(export.layers[0].pick, Pick::Fps(want));
         // A still image is a run of frames made up from the delivery rate (`-loop 1 -framerate`).

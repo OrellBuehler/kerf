@@ -152,7 +152,10 @@
   probe has no rate, plus one output frame at its speed; a still's `-t` with it) and **is cut at
   `end_frame`** (`trim=end_pts=` after `fps`: the first output frame at or after its end, tail
   included, with a millionth of a frame of slack). `FpsPick.window` is the picture window and
-  `FpsPick.end` that end; the run ends at the earlier of the two. A clip is drawn on every frame
+  `FpsPick.end` that end; the run ends at the earlier of the two. **`FpsPick.pinned`** is a chain whose `fps` is pinned to the clip's start
+  (`fps=fps=R:start_time=S`: a moving zoom or position, a keyed crop, a moving still): `start_time` makes the filter round each input time relative to the
+  start, put the first frame out from it and end the stream at the later of the status's rounding and the last frame's offset slot (`gpu.md`, "Which frame is drawn"),
+  which is not the plain `round(pts * rate)` on a tie — the plan sets it from `Animated` (`places || crop || still_motion`). A clip is drawn on every frame
   from its first frame's slot up to the one before its end's, an equal-rate end is not drawn,
   and the frame on a mid-frame end shows the nearest source frame, never one more than half an
   output frame past the clip's own length. A reversed clip keeps its window (its read past the end
@@ -300,7 +303,7 @@
   on every frame of the clip, whether or not the two are on screen together), a layer the compositor's scaler resizes
   (the scaler's one-level difference becomes 3 or 4 through the conversions, past the bound of 2), an odd side (swscale reads
   past the line), and in `reasons` the geometry ones `Matte(layer, "a grade")` (a letterbox: the bars are part of the frame the
-  grade sees) and `ZoomBehind(.., "a grade")` (a moving zoom or position last: not held to FFmpeg's, the placement behind the grade's conversions). `RenderPlan::graded()`
+  grade sees). (A moving zoom or position behind the grade is drawn: the placement reads the 4:2:0 planes the grade hands on.) `RenderPlan::graded()`
   includes a grade, so the full-range refusals (`GradedFullRange`, `GradedInFullRangeStack`) judge it too. `kerf_core::baked_lut`
   gives a compositor the LUT's table with its intensity applied (`Lut3d::at_intensity`, the same numbers `to_cube` writes,
   four cached by path / length / mtime), `grade_filter_chain` the filters the engine writes for it, and `frame_matrix_tag` the
@@ -336,10 +339,10 @@
   matrix and table of sample positions: `RenderPlan::pose` is the zoom, the position and a slide's travel it is drawn from;
   `LayerGeometry` of such a layer ends at the picture the chain makes before it, `Placement::placed`, with no zoom stage when
   the zoom is the one that moves). With the cap the rest of the layer is judged as ever, and a placed layer is refused when
-  a grade, a rotation, an opacity below 1 or a dip to white is ahead of it (`ZoomBehind`, the moving position's as much as the
-  moving zoom's), for an odd-height picture (`Geometry`: `pad` keeps or loses its last row by how the graph allocated the
+  a rotation, an opacity below 1 or a dip to white is ahead of it (`ZoomBehind`, the moving position's as much as the
+  moving zoom's; a grade is drawn behind it), for an odd-height picture (`Geometry`: `pad` keeps or loses its last row by how the graph allocated the
   frame, and the builds differ), for a letterboxed picture at the identity pose in a still (the still pads it to the whole
-  frame first, with opaque bars), for a picture that is not 4:2:0 or gray (`PlacedFormat`: the chain converts it to `yuva420p` itself, which is not the decode's conversion on 4.4.2: 24 levels of chroma off on 4:4:4, 16 on 4:2:2; exact on 9.0.2), for a moving still image (`StillMotion`'s own graph: no placement checks apply), and for a pose whose positions leave the table's range (`PlacementFrame::reachable`).
+  frame first, with opaque bars), for a picture that is not 4:2:0 or gray (`PlacedFormat`: the chain converts it to `yuva420p` itself, which is the decode's conversion only where the `scale` filter defaults to the same scaler: 24 levels of chroma off on 4:4:4 and 16 on 4:2:2 on 4.4.2, exact on 6.1.1 and 9.0.2, so planar 4:4:4 / 4:2:2 are drawn where `GpuCaps::placed_chroma` says the probe measured a match), for a moving still image (`StillMotion`'s own graph: no placement checks apply), and for a pose whose positions leave the table's range (`PlacementFrame::reachable`).
   `Animated` is `Some` for a
   keyed transform, colour, mask or crop and `Animated.keys` (`layer_geometry::Keyed {scale, rotation, rotates,
   opacity}`) says which transform numbers are keyed, because a clip keyed in part is not built like one
