@@ -488,6 +488,9 @@ fn sweep_try(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, secs: f64) -
                 .find(|l| l.contains("Invalid") || l.contains("Error"))
                 .unwrap_or("export failed");
             eprintln!("{case:<58} FFmpeg cannot render it: {first}");
+            if std::env::var_os("KERF_CHECKER_VERBOSE").is_some() {
+                eprintln!("{e}");
+            }
             None
         }
     }
@@ -1638,6 +1641,18 @@ fn checker_b_scaler_model_against_ffmpeg_at_the_extremes() {
 /// The still's own `yuv444p` planes against the compositor's composite put through the same conversion: the number of
 /// differing samples and the largest difference (the comparator `tests/parity.rs` makes for still plans, copied here).
 fn still_planes_differ(plan: &kerf_core::RenderPlan, tl: &Timeline, assets: &[Asset], t: f64) -> (usize, i32) {
+    let (_, _, want, got) = still_planes(plan, tl, assets, t);
+    let (mut n, mut max) = (0, 0);
+    for (a, b) in got.iter().zip(&want) {
+        let d = (i32::from(*a) - i32::from(*b)).abs();
+        n += usize::from(d != 0);
+        max = max.max(d);
+    }
+    (n, max)
+}
+
+/// The still's `yuv444p` planes (`want`) and the compositor's composite put through the same conversion (`got`), with the size.
+fn still_planes(plan: &kerf_core::RenderPlan, tl: &Timeline, assets: &[Asset], t: f64) -> (u32, u32, Vec<u8>, Vec<u8>) {
     use std::io::Write;
     let opts = ExportOptions::default();
     let size = plan.size(u32::MAX);
@@ -1689,13 +1704,7 @@ fn still_planes_differ(plan: &kerf_core::RenderPlan, tl: &Timeline, assets: &[As
     let _ = writer.join();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     assert_eq!(out.stdout.len(), want.len());
-    let (mut n, mut max) = (0, 0);
-    for (a, b) in out.stdout.iter().zip(&want) {
-        let d = (i32::from(*a) - i32::from(*b)).abs();
-        n += usize::from(d != 0);
-        max = max.max(d);
-    }
-    (n, max)
+    (w, h, want, out.stdout)
 }
 
 #[derive(Default, Debug)]
@@ -5340,6 +5349,16 @@ fn checker_b_r2_pad_odd_pictures_in_other_widths_and_formats() {
     fam.finish("pad odd pictures in other widths and formats");
 }
 
+/// One frame of `plan` drawn at `size`, or why the compositor will not (a frame the plan refuses is FFmpeg's: a diagnostic then has
+/// nothing of the GPU's to print, unless a run with `KERF_CHECKER_ALLOW` and the scratch patch lets it draw).
+fn drawn_or_refused(plan: &kerf_core::RenderPlan, size: (u32, u32)) -> Result<kerf_gpu::YuvFrame, String> {
+    let mut motion = MotionFrames::new(frame_source());
+    let picture = motion.frames(plan).map_err(|e| e.to_string())?;
+    compositor()
+        .composite_yuv_counted(plan, &picture, motion.counts(), size)
+        .map_err(|e| e.to_string())
+}
+
 /// Diagnostic for the odd last row: prints the rows around the picture's edge of FFmpeg's export and of the GPU's frame.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
@@ -5371,16 +5390,18 @@ fn checker_b_r2_pad_rows_at_the_picture_edge() {
         let planner = Planner::new(&tl, std::slice::from_ref(&a), &opts, PlanRequest::motion(policy())).unwrap();
         let plan = planner.at_frame(0).unwrap();
         let size = (played.w as u32, played.h as u32);
-        let mut motion = MotionFrames::new(frame_source());
-        let picture = motion.frames(&plan).unwrap();
-        let drawn = compositor()
-            .composite_yuv_counted(&plan, &picture, motion.counts(), size)
-            .unwrap();
         let want = played.planes(0);
         eprintln!(
             "{sw}x{sh} in {fw}x{fh}: reasons {:?}",
             plan.reasons(&compositor().caps(), size)
         );
+        let drawn = match drawn_or_refused(&plan, size) {
+            Ok(drawn) => drawn,
+            Err(e) => {
+                eprintln!("  refused, nothing of the GPU's to print: {e}");
+                continue;
+            }
+        };
         let w = played.w;
         for y in (0..played.h).filter(|y| *y + 6 >= sh as usize + (fh as usize - sh as usize) / 2 && *y < played.h) {
             eprintln!(
@@ -5433,11 +5454,13 @@ fn checker_b_r2_pad_64x35_is_repeatable() {
         let want = played.planes(k as usize);
         let mut results = Vec::new();
         for _ in 0..6 {
-            let mut motion = MotionFrames::new(frame_source());
-            let picture = motion.frames(&plan).unwrap();
-            let drawn = compositor()
-                .composite_yuv_counted(&plan, &picture, motion.counts(), size)
-                .unwrap();
+            let drawn = match drawn_or_refused(&plan, size) {
+                Ok(drawn) => drawn,
+                Err(e) => {
+                    summary.push(format!("frame {k}: refused ({e})"));
+                    break;
+                }
+            };
             let row34_gpu = drawn.y[34 * 64..35 * 64].to_vec();
             let row34_ffmpeg = want[0][34 * 64..35 * 64].to_vec();
             results.push(diff_plane(want[0], &drawn.y, 64).differing);
@@ -5450,7 +5473,1487 @@ fn checker_b_r2_pad_64x35_is_repeatable() {
                 );
             }
         }
-        summary.push(format!("frame {k}: differing Y samples over 6 draws {results:?}"));
+        if results.len() == 6 {
+            summary.push(format!("frame {k}: differing Y samples over 6 draws {results:?}"));
+        }
     }
     eprintln!("{}", summary.join("\n"));
+}
+
+/// Diagnostic: where a gray odd-by-odd picture letterboxed differs from the export.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_b_r2_pad_gray_where_it_differs() {
+    for (pix, sw, sh, fw, fh) in [
+        ("gray", 63u32, 35u32, 64u32, 36u32),
+        ("gray", 9, 35, 64, 36),
+        ("gray", 63, 36, 64, 36),
+    ] {
+        let a = scratch_media("graydiag", pix, sw, sh);
+        let tl = timeline(vec![vec![clip(&a, 0.0, 0.3, 0.0)]], Some(Delivery::new(fw, fh, Fit::Contain)));
+        let opts = at_fps(30.0);
+        let played = export(&format!("padgray-{sw}x{sh}"), &tl, std::slice::from_ref(&a), &opts);
+        let planner = Planner::new(&tl, std::slice::from_ref(&a), &opts, PlanRequest::motion(policy())).unwrap();
+        let plan = planner.at_frame(0).unwrap();
+        let size = (played.w as u32, played.h as u32);
+        let want = played.planes(0);
+        let w = played.w;
+        eprintln!(
+            "{pix} {sw}x{sh} in {fw}x{fh}: reasons {:?}",
+            plan.reasons(&compositor().caps(), size)
+        );
+        let drawn = match drawn_or_refused(&plan, size) {
+            Ok(drawn) => drawn,
+            Err(e) => {
+                eprintln!("  refused, nothing of the GPU's to print: {e}");
+                continue;
+            }
+        };
+        let mut rows = Vec::new();
+        for y in 0..played.h {
+            let n = (0..w).filter(|x| want[0][y * w + x] != drawn.y[y * w + x]).count();
+            if n > 0 {
+                let x = (0..w).find(|x| want[0][y * w + x] != drawn.y[y * w + x]).unwrap();
+                rows.push(format!(
+                    "row {y}: {n} differ, first x {x}: ffmpeg {} gpu {}",
+                    want[0][y * w + x],
+                    drawn.y[y * w + x]
+                ));
+            }
+        }
+        eprintln!("  {}", rows.join("\n  "));
+        eprintln!("  U/V planes differ: {} {}", want[1] != &drawn.u[..], want[2] != &drawn.v[..]);
+        eprintln!("  first row ffmpeg {:?}", &want[0][..12.min(w)]);
+        eprintln!("  first row gpu    {:?}", &drawn.y[..12.min(w)]);
+    }
+}
+
+/// Gray and 10-bit 4:2:0 pictures are refused when resized (`FormatResize`: the exact scaler is proven for planar 8-bit 4:2:0
+/// only; FFmpeg scales a gray picture in gray and converts to 4:2:0 after, and a 10-bit one in 10 bits and dithers once at the
+/// end). Every frame of every case is FFmpeg's: none is drawn, and each is refused for the format.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_b_r2_resized_gray_and_ten_bit_pictures() {
+    let mut fam = Family::default();
+    for (pix, sw, sh) in [
+        ("gray", 640u32, 360u32),
+        ("gray", 320, 180),
+        ("gray", 63, 35),
+        ("yuv420p10le", 640, 360),
+        ("yuv420p10le", 320, 180),
+        ("yuv420p10le", 63, 35),
+    ] {
+        let a = formats_sized(pix, sw, sh);
+        for (label, tl) in resize_cuts(&a) {
+            let case = format!("checker/b/r2/resized {pix} {sw}x{sh} {label}");
+            if let Some(out) = sweep_try(&case, &tl, std::slice::from_ref(&a), 30.0, 0.3) {
+                refused_for_format_resize(&mut fam, &case, &out);
+            }
+        }
+    }
+    fam.finish_refusing("resized gray and 10-bit pictures are refused");
+}
+
+/// The cuts that make the plan resize a clip: a picture-in-picture, a letterbox, a cover, a zoom and an enlargement.
+fn resize_cuts(a: &Asset) -> Vec<(&'static str, Timeline)> {
+    vec![
+        (
+            "pip 0.5",
+            timeline(vec![vec![pip(clip(a, 0.0, 0.3, 0.0), 0.5, 0.1, 0.1)]], None),
+        ),
+        (
+            "contain 256x144",
+            timeline(
+                vec![vec![clip(a, 0.0, 0.3, 0.0)]],
+                Some(Delivery::new(256, 144, Fit::Contain)),
+            ),
+        ),
+        (
+            "cover 180x320",
+            timeline(vec![vec![clip(a, 0.0, 0.3, 0.0)]], Some(Delivery::new(180, 320, Fit::Cover))),
+        ),
+        (
+            "zoom 1.3",
+            timeline(
+                vec![vec![{
+                    let mut c = clip(a, 0.0, 0.3, 0.0);
+                    c.transform.scale = 1.3;
+                    c
+                }]],
+                None,
+            ),
+        ),
+        (
+            "enlarge into 800x450",
+            timeline(
+                vec![vec![clip(a, 0.0, 0.3, 0.0)]],
+                Some(Delivery::new(800, 450, Fit::Contain)),
+            ),
+        ),
+    ]
+}
+
+/// The reason `FormatResize` gives, as the plan spells it.
+const FORMAT_RESIZE: &str = "not planar 8-bit 4:2:0";
+
+/// A case whose every frame must be refused for the picture's format (a run that patched the refusal out to draw the frames
+/// anyway only reports what they would have been, in the sweep's line).
+fn refused_for_format_resize(fam: &mut Family, case: &str, out: &Outcome) {
+    fam.cases += 1;
+    fam.drawn += out.drawn;
+    fam.refused += out.refused;
+    if patched_out() {
+        return;
+    }
+    if out.drawn != 0 || out.refused_for(FORMAT_RESIZE) != out.frames {
+        fam.failures.push(format!(
+            "{case}: {} of {} frames drawn, {} refused for the format (every frame must be refused for it): {:?}",
+            out.drawn,
+            out.frames,
+            out.refused_for(FORMAT_RESIZE),
+            out.reasons
+        ));
+    }
+}
+
+/// Noise in `pix` at `w` x `h` under a scratch name of the caller's own (`family`), so that no other family's test writes or
+/// reads the file: FFV1 in Matroska, written to a temporary name and renamed under a lock.
+fn scratch_media(family: &str, pix: &str, w: u32, h: u32) -> Asset {
+    static WRITING: Mutex<()> = Mutex::new(());
+    let _writing = WRITING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("checker-b-media-{}", build_key()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("{family}-{pix}-{w}x{h}.mkv"));
+    if !path.exists() {
+        let base = if pix == "gray" || pix.starts_with("yuv420p1") || pix == "p010le" || pix == "nv12" {
+            "yuv420p"
+        } else {
+            pix
+        };
+        let lavfi = format!(
+            "nullsrc=size={w}x{h}:rate=30:duration=0.5,format={base},geq=lum='random(1)*255':cb='random(2)*255':cr='random(3)*255'"
+        );
+        let tmp = dir.join(format!("{family}-{pix}-{w}x{h}.tmp.mkv"));
+        ffmpeg(&[
+            "-f",
+            "lavfi",
+            "-i",
+            &lavfi,
+            "-c:v",
+            "ffv1",
+            "-pix_fmt",
+            pix,
+            tmp.to_str().unwrap(),
+        ]);
+        std::fs::rename(&tmp, &path).unwrap();
+    }
+    probed(&path)
+}
+
+/// Noise in `pix` at `w` x `h` (FFV1 in Matroska).
+fn formats_sized(pix: &str, w: u32, h: u32) -> Asset {
+    scratch_media("sized", pix, w, h)
+}
+
+/// A clip on the alpha plane (a source with an alpha channel, a crossfade in, a keyed position) that also carries a white fade
+/// (a dip to white into it, or out of it into the next clip): `fade c=white` works on RGB, so a converter sits in the chain and
+/// the clip is not the one that decides. Found by the wide fuzz (seed 2041 of `c`): an alpha source with a dip to white in.
+/// The dip's own ladder (3 levels, `DIP_LADDER`) is allowed for the dip's frames; a whole-plane mismatch is a wrong matrix.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_b_r2_decider_on_the_plane_with_a_white_fade() {
+    const DIP_LADDER: i32 = 3;
+    let mut fam = Family::default();
+    let mut ladder_failures = Vec::new();
+    for (t1, t2, t3) in [
+        (Tag::None, Tag::Bt709, Tag::None),
+        (Tag::Bt709, Tag::None, Tag::Bt709),
+        (Tag::None, Tag::Bt709, Tag::Bt709),
+        (Tag::Bt709, Tag::None, Tag::None),
+        (Tag::None, Tag::Bt709, Tag::Bt2020),
+    ] {
+        let p1 = media(320, 180, Pat::Edges, t1);
+        let p3 = media(320, 180, Pat::Noise, t3);
+        let alpha2 = alpha_media(320, 180, t2);
+        let plain2 = media(320, 180, Pat::Test, t2);
+        let mut cases: Vec<(String, Timeline, Vec<Asset>)> = Vec::new();
+        // 1. the alpha source dips to white in
+        cases.push((
+            "alpha source dipping to white in".into(),
+            timeline(
+                vec![vec![
+                    clip(&p1, 0.5, 1.2, 0.0),
+                    dissolve_into(clip(&alpha2, 0.5, 1.2, 0.7), TransitionKind::DipToWhite, 0.3),
+                ]],
+                None,
+            ),
+            dedup(&[&p1, &alpha2]),
+        ));
+        // 2. the alpha source is the one before a dip to white
+        cases.push((
+            "alpha source before a dip to white".into(),
+            timeline(
+                vec![vec![
+                    clip(&p1, 0.5, 1.2, 0.0),
+                    clip(&alpha2, 0.5, 1.2, 0.7),
+                    dissolve_into(clip(&p3, 0.5, 1.2, 1.4), TransitionKind::DipToWhite, 0.3),
+                ]],
+                None,
+            ),
+            dedup(&[&p1, &alpha2, &p3]),
+        ));
+        // 3. a crossfade-in clip before a dip to white
+        cases.push((
+            "crossfade clip before a dip to white".into(),
+            timeline(
+                vec![vec![
+                    clip(&p1, 0.5, 1.2, 0.0),
+                    dissolve_into(clip(&plain2, 0.5, 1.2, 0.7), TransitionKind::Crossfade, 0.3),
+                    dissolve_into(clip(&p3, 0.5, 1.2, 1.4), TransitionKind::DipToWhite, 0.3),
+                ]],
+                None,
+            ),
+            dedup(&[&p1, &plain2, &p3]),
+        ));
+        // 4. a keyed position before a dip to white
+        cases.push((
+            "keyed position before a dip to white".into(),
+            timeline(
+                vec![vec![
+                    clip(&p1, 0.5, 1.2, 0.0),
+                    {
+                        let mut c = clip(&plain2, 0.5, 1.2, 0.7);
+                        c.keyframes = vec![zoom_key(0.0, 1.0, 0.0, 0.0), zoom_key(0.7, 1.0, 0.1, 0.05)];
+                        c
+                    },
+                    dissolve_into(clip(&p3, 0.5, 1.2, 1.4), TransitionKind::DipToWhite, 0.3),
+                ]],
+                None,
+            ),
+            dedup(&[&p1, &plain2, &p3]),
+        ));
+        // 5. the alpha source dips to white in and out
+        cases.push((
+            "alpha source between two dips to white".into(),
+            timeline(
+                vec![vec![
+                    clip(&p1, 0.5, 1.2, 0.0),
+                    dissolve_into(clip(&alpha2, 0.5, 1.2, 0.7), TransitionKind::DipToWhite, 0.3),
+                    dissolve_into(clip(&p3, 0.5, 1.2, 1.4), TransitionKind::DipToWhite, 0.3),
+                ]],
+                None,
+            ),
+            dedup(&[&p1, &alpha2, &p3]),
+        ));
+        // 6. the alpha source dips to white in, two plain clips ahead of it (so the frames before the dip show a clip that is
+        // neither the outgoing one nor the dissolving one)
+        cases.push((
+            "alpha source dipping to white in after two plain clips".into(),
+            timeline(
+                vec![vec![
+                    clip(&p1, 0.5, 1.2, 0.0),
+                    clip(&p3, 0.5, 1.2, 0.7),
+                    dissolve_into(clip(&alpha2, 0.5, 1.2, 1.4), TransitionKind::DipToWhite, 0.3),
+                ]],
+                None,
+            ),
+            dedup(&[&p1, &p3, &alpha2]),
+        ));
+        // 7. the same with a crossfade clip dipping in
+        cases.push((
+            "a dip to white two clips after a crossfade one".into(),
+            timeline(
+                vec![vec![
+                    clip(&p1, 0.5, 1.2, 0.0),
+                    dissolve_into(clip(&plain2, 0.5, 1.2, 0.7), TransitionKind::Crossfade, 0.3),
+                    clip(&p3, 0.5, 1.2, 1.4),
+                    dissolve_into(clip(&p1, 1.2, 1.9, 2.1), TransitionKind::DipToWhite, 0.3),
+                ]],
+                None,
+            ),
+            dedup(&[&p1, &plain2, &p3]),
+        ));
+        for (name, tl, assets) in cases {
+            let case = format!("checker/b/r2/whitefade {name} {t1:?}/{t2:?}/{t3:?}");
+            if let Some(out) = sweep_try(&case, &tl, &assets, 15.0, 2.8) {
+                // The ladder of a dip is a few levels over a plane; a wrong matrix is tens of levels over all of it.
+                let gross = out
+                    .bad
+                    .iter()
+                    .flat_map(|b| (0..3).map(move |i| (b.planes[i].max, b.planes[i].differing * 100 / b.len[i].max(1))))
+                    .filter(|&(max, percent)| max > DIP_LADDER && percent > 4)
+                    .max();
+                if let Some((max, percent)) = gross {
+                    ladder_failures.push(format!(
+                        "{case}: drawn frames differ by up to {max} levels over {percent} % of a plane"
+                    ));
+                }
+                fam.add_known_ladder(&case, &out);
+            }
+        }
+    }
+    fam.failures.extend(ladder_failures);
+    fam.finish("the deciding clip with a white fade");
+}
+
+/// The clip that decides, followed by a clip that enters through each kind of transition: the outgoing side of a dissolve, a dip
+/// to black, a slide and a push (the outgoing clip moves away, or keeps its tail under the next) is a part of its chain too.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_b_r2_decider_outgoing_transitions() {
+    let mut cases: Vec<(String, Timeline, Vec<Asset>)> = Vec::new();
+    for route in [
+        Route::Crossfade,
+        Route::KeyedPos,
+        Route::AlphaSource,
+        Route::HeldKey,
+        Route::Plain,
+    ] {
+        for kind in [
+            TransitionKind::Crossfade,
+            TransitionKind::DipToBlack,
+            TransitionKind::SlideLeft,
+            TransitionKind::SlideDown,
+            TransitionKind::PushUp,
+            TransitionKind::PushRight,
+        ] {
+            for (t1, t2, t3) in [
+                (Tag::None, Tag::Bt709, Tag::None),
+                (Tag::Bt709, Tag::None, Tag::Bt709),
+                (Tag::None, Tag::Bt709, Tag::Bt2020),
+            ] {
+                let (a, aa) = routed(Route::Plain, t1, Pat::Edges, 0.0);
+                let (x, ax) = routed(route, t2, Pat::Noise, 0.7);
+                let (y, ay) = routed(Route::Plain, t3, Pat::Test, 1.4);
+                let y = dissolve_into(y, kind, 0.3);
+                cases.push((
+                    format!("{route:?} {t2:?} then {kind:?} into {t3:?} after {t1:?}"),
+                    timeline(vec![vec![a, x, y]], None),
+                    dedup(&[&aa, &ax, &ay]),
+                ));
+            }
+        }
+    }
+    run_family("decider with the outgoing side of a transition", cases, 15.0, 2.1);
+}
+
+/// A caption over a cut of mixed matrices: the text is drawn after the overlay chain, on whichever matrix the cut's deciding clip
+/// sets (the frames before that clip, converted into it, carry the text in it too). Coloured text and a box, over the plain and the
+/// dissolving arrangement, in both tag orders.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_b_r2_text_over_a_cut_of_mixed_matrices() {
+    let mut cases: Vec<(String, Timeline, Vec<Asset>)> = Vec::new();
+    for (ta, tb) in [(Tag::None, Tag::Bt709), (Tag::Bt709, Tag::None), (Tag::Bt709, Tag::Bt2020)] {
+        for route in [Route::Plain, Route::Crossfade, Route::AlphaSource, Route::KeyedPos] {
+            let (a, aa) = routed(Route::Plain, ta, Pat::Test, 0.0);
+            let (b, ab) = routed(route, tb, Pat::Edges, 0.7);
+            let mut tl = timeline(vec![vec![a, b]], None);
+            for (i, (color, bg)) in [("red", None), ("yellow", Some("blue@0.6")), ("#20c0ff", Some("black"))]
+                .into_iter()
+                .enumerate()
+            {
+                let mut t = kerf_core::TextOverlay::new(format!("caption {i}"), 0.1 + 0.4 * i as f64, 0.5 + 0.4 * i as f64);
+                t.color = color.to_string();
+                t.bg = bg.map(str::to_string);
+                t.pos_y = 0.2 + 0.3 * i as f64;
+                tl.overlays.push(t);
+            }
+            cases.push((format!("{route:?} {tb:?} after {ta:?}"), tl, dedup(&[&aa, &ab])));
+        }
+    }
+    run_family("text over a cut of mixed matrices", cases, 15.0, 1.4);
+}
+
+/// The routes onto the alpha plane with the other things a chain can hold that are not read as a converter: a keyed crop, a speed
+/// ramp, a keyed zoom held beside a static one, a source with a different frame rate, a head trim into the picture, in both orders.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_b_r2_decider_route_with_keyed_crop_ramp_and_rates() {
+    let mut cases: Vec<(String, Timeline, Vec<Asset>)> = Vec::new();
+    let channel = |prop: kerf_core::Property, a: f64, b: f64| kerf_core::PropertyTrack {
+        prop,
+        keys: [(0.0, a), (0.7, b)]
+            .iter()
+            .map(|&(t, v)| kerf_core::PropertyKey::new(t, v))
+            .collect(),
+    };
+    for route in [Route::Crossfade, Route::KeyedPos, Route::AlphaSource] {
+        for modifier in [
+            "keyed crop",
+            "keyed crop x",
+            "speed ramp",
+            "scale channel held",
+            "keyed mask-free opacity at 1",
+            "late in point",
+        ] {
+            for (ta, tb) in [(Tag::None, Tag::Bt709), (Tag::Bt709, Tag::None)] {
+                for first in [false, true] {
+                    let (mut m, am) = routed(route, tb, Pat::Noise, if first { 0.0 } else { 0.7 });
+                    match modifier {
+                        "keyed crop" => m.channels.push(channel(kerf_core::Property::CropZoom, 1.0, 1.5)),
+                        "keyed crop x" => {
+                            m.channels.push(channel(kerf_core::Property::CropZoom, 1.4, 1.4));
+                            m.channels.push(channel(kerf_core::Property::CropX, -0.5, 0.5));
+                        }
+                        "speed ramp" => {
+                            m.speed_ramp = vec![kerf_core::SpeedKey::new(0.0, 1.0), kerf_core::SpeedKey::new(0.7, 1.6)];
+                        }
+                        "scale channel held" => m.channels.push(channel(kerf_core::Property::Scale, 0.9, 0.9)),
+                        "keyed mask-free opacity at 1" => m.channels.push(channel(kerf_core::Property::Opacity, 1.0, 1.0)),
+                        _ => {
+                            m.source_in = 2.0;
+                            m.source_out = 2.7;
+                        }
+                    }
+                    let (other, ao) = routed(Route::Plain, ta, Pat::Edges, if first { 0.7 } else { 0.0 });
+                    let clips = if first { vec![m, other] } else { vec![other, m] };
+                    cases.push((
+                        format!(
+                            "{route:?} {tb:?} {} with {modifier} vs plain {ta:?}",
+                            if first { "first" } else { "second" }
+                        ),
+                        timeline(vec![clips], None),
+                        dedup(&[&am, &ao]),
+                    ));
+                }
+            }
+        }
+    }
+    run_family("decider routes with keyed crop, ramp and trims", cases, 15.0, 1.4);
+}
+
+// ---- round three: resized gray / ten-bit pictures, a white fade on a tied clip, the odd-height pad at the origin ------------
+
+/// The reason the odd-height pad at the frame's origin gives, as the plan spells it.
+const ODD_ORIGIN: &str = "odd height at the frame's origin";
+
+/// The reason a cut whose deciding clip is unread gives.
+const MIXED: &str = "layers tagged with different YCbCr matrices";
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Want {
+    /// Every frame of the case carries the reason.
+    Refused,
+    /// No frame of the case carries it.
+    NotRefused,
+    /// Reported, not judged.
+    Either,
+}
+
+/// Holds a case to whether the plan gives `needle` among its refusals (a run that patched the refusal out is judging the
+/// refusal's necessity: the sweep's own line carries that).
+fn expect_refusal(fam: &mut Family, case: &str, out: &Outcome, needle: &str, want: Want) {
+    if patched_out() {
+        return;
+    }
+    let n = out.refused_for(needle);
+    let wrong = match want {
+        Want::Refused => n < out.frames,
+        Want::NotRefused => n != 0,
+        Want::Either => false,
+    };
+    if wrong {
+        fam.failures.push(format!(
+            "{case}: {n} of {} frames refused for \"{needle}\", expected {want:?} ({:?})",
+            out.frames, out.reasons
+        ));
+    }
+}
+
+/// `w` x `h` noise made with `codec` (FFmpeg `args`, container `ext`) in `pix`, at `rate` frames per second, under a name of the
+/// round's own; `None` where this FFmpeg cannot make it.
+fn codec_media(codec: &str, args: &[&str], ext: &str, pix: &str, w: u32, h: u32, rate: u32) -> Option<Asset> {
+    static WRITING: Mutex<()> = Mutex::new(());
+    let _writing = WRITING.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!("checker-b-media-{}", build_key()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("r3-{codec}-{pix}-{w}x{h}-{rate}.{ext}"));
+    if !path.exists() {
+        let lavfi = format!(
+            "nullsrc=size={w}x{h}:rate={rate}:duration=0.6,format=yuv420p,geq=lum='random(1)*255':cb='random(2)*255':cr='random(3)*255'"
+        );
+        let tmp = dir.join(format!("r3-{codec}-{pix}-{w}x{h}-{rate}.tmp.{ext}"));
+        let mut cmd = vec!["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i", &lavfi];
+        cmd.extend_from_slice(args);
+        cmd.extend_from_slice(&["-pix_fmt", pix, tmp.to_str().unwrap()]);
+        // (An encoder that never finishes — libvpx on an odd height was seen to — is killed, and the picture is not made.)
+        let mut child = Command::new(kerf_core::ffmpeg_path())
+            .args(&cmd)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .ok()?;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        let ok = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status.success(),
+                Ok(None) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(50)),
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break false;
+                }
+            }
+        };
+        if !ok {
+            let _ = std::fs::remove_file(&tmp);
+            return None;
+        }
+        std::fs::rename(&tmp, &path).unwrap();
+    }
+    Some(probed(&path))
+}
+
+/// `run`, or `None` for a file the frame source will not seek into (a codec this FFmpeg does not flag keyframes for).
+fn guarded<T>(case: &str, run: impl FnOnce() -> T) -> Option<T> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+        Ok(out) => Some(out),
+        Err(e) => {
+            let text = e
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| e.downcast_ref::<&str>().map(ToString::to_string))
+                .unwrap_or_default();
+            if text.contains("does not decode from a keyframe") {
+                eprintln!("{case}: the frame source will not seek into this file; skipped");
+                None
+            } else {
+                std::panic::resume_unwind(e)
+            }
+        }
+    }
+}
+
+/// [`sweep_try`] for a file the frame source may not seek into: skipped.
+fn sweep_guarded(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, secs: f64) -> Option<Outcome> {
+    guarded(case, || sweep_try(case, tl, assets, fps, secs)).flatten()
+}
+
+type Codec = (&'static str, Vec<&'static str>, &'static str);
+
+fn r3_codecs() -> Vec<Codec> {
+    vec![
+        ("ffv1", vec!["-c:v", "ffv1"], "mkv"),
+        ("ffv1s4", vec!["-c:v", "ffv1", "-slices", "4"], "mkv"),
+        ("ffvhuff", vec!["-c:v", "ffvhuff"], "mkv"),
+        ("rawvideo", vec!["-c:v", "rawvideo"], "mkv"),
+        ("utvideo", vec!["-c:v", "utvideo"], "mkv"),
+        ("magicyuv", vec!["-c:v", "magicyuv"], "mkv"),
+        ("vp9", vec!["-c:v", "libvpx-vp9", "-lossless", "1"], "webm"),
+        ("mpeg4", vec!["-c:v", "mpeg4", "-q:v", "1"], "mkv"),
+    ]
+}
+
+/// A picture of `sw` x `sh` from every decoder, delivered at `fw` x `fh`: the case list, the refusal expected of the plan, and
+/// every drawn frame held to the export. Returns how many cases were judged.
+fn pad_cases(fam: &mut Family, family: &str, codecs: &[Codec], sizes: &[(u32, u32, u32, u32)], want: Want) -> usize {
+    let mut judged = 0;
+    for (codec, args, ext) in codecs {
+        for &(sw, sh, fw, fh) in sizes {
+            let Some(a) = codec_media(codec, args, ext, "yuv420p", sw, sh, 30) else {
+                eprintln!("{codec} {sw}x{sh}: this FFmpeg cannot make it");
+                continue;
+            };
+            let tl = timeline(vec![vec![clip(&a, 0.0, 0.3, 0.0)]], Some(Delivery::new(fw, fh, Fit::Contain)));
+            let case = format!("checker/b/r3/{family} {codec} {sw}x{sh} in {fw}x{fh}");
+            if let Some(out) = sweep_guarded(&case, &tl, std::slice::from_ref(&a), 30.0, 0.3) {
+                judged += 1;
+                fam.add(&case, &out);
+                expect_refusal(fam, &case, &out, ODD_ORIGIN, want);
+            }
+        }
+    }
+    judged
+}
+
+/// The odd-height pad at the origin: a 4:2:0 picture one or three rows short of the frame, at the frame's width, sits at the
+/// frame's origin and `pad` fills the bottom bar in place (the odd row goes) or copies (it stays) as the decoder's buffer allows.
+/// Every decoder, five sizes: every frame is refused for it, and a frame that is drawn is the export's.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_b_r3_pad_odd_height_at_the_origin_is_refused_from_every_decoder() {
+    let mut fam = Family::default();
+    let judged = pad_cases(
+        &mut fam,
+        "pad origin",
+        &r3_codecs(),
+        &[
+            (64, 35, 64, 36),
+            (64, 33, 64, 36),
+            (96, 53, 96, 54),
+            (96, 51, 96, 54),
+            (128, 71, 128, 72),
+            (64, 39, 64, 40),
+            (64, 37, 64, 40),
+        ],
+        Want::Refused,
+    );
+    assert!(judged > 14, "too few cases could be made: {judged}");
+    fam.finish_refusing("odd-height pad at the origin, every decoder");
+}
+
+/// What the new condition must leave alone: a picture off the origin (the gap to the frame is 5 rows or more, so `pad` has a
+/// top offset and always copies), an even picture, and a resampled one (`scale` wrote a fresh buffer; its odd row is dropped
+/// either way). Not refused for it, and every drawn frame is exact.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_b_r3_pad_off_the_origin_resampled_and_even_pictures_are_not_refused_for_it() {
+    let mut fam = Family::default();
+    let codecs: Vec<Codec> = r3_codecs()
+        .into_iter()
+        .filter(|(c, ..)| ["ffv1", "ffvhuff", "rawvideo", "utvideo", "vp9", "magicyuv"].contains(c))
+        .collect();
+    let judged = pad_cases(
+        &mut fam,
+        "pad off origin",
+        &codecs,
+        &[
+            (64, 31, 64, 36),
+            (64, 29, 64, 36),
+            (64, 35, 64, 40),
+            (64, 13, 64, 36),
+            (64, 5, 64, 36),
+            (64, 34, 64, 36),
+            (64, 36, 64, 36),
+            (62, 35, 64, 36),
+            (60, 35, 64, 36),
+            (50, 27, 64, 36),
+            (100, 55, 64, 36),
+            (63, 35, 64, 36),
+            (65, 35, 64, 36),
+            (65, 37, 64, 36),
+            (96, 52, 96, 54),
+        ],
+        Want::NotRefused,
+    );
+    assert!(judged > 40, "too few cases could be made: {judged}");
+    fam.finish("odd pictures off the origin, resampled or even");
+}
+
+/// The refusal's three conditions one by one, on one decoder (FFV1 and ffvhuff, which are the two buffer behaviours): a blurred
+/// fill, a cover, a delivery of the picture's own size, 4:2:2 / 4:4:4 / gray / RGB sources (`scale` converts them: resampled),
+/// a 24 and a 60 fps source (the `fps` filter clones the frames it repeats).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_b_r3_pad_odd_height_fits_formats_and_rates() {
+    let mut fam = Family::default();
+    let mut judged = 0;
+    for (codec, args, ext) in r3_codecs().into_iter().filter(|(c, ..)| *c == "ffv1" || *c == "ffvhuff") {
+        // (A blurred fill the compositor cannot draw — a frame too small for the thumbnail's box blur, under 96 wide — leaves the
+        // rule standing; one it draws is not the pad's picture alone, and the rule must not refuse it.)
+        let fits = |fw: u32| -> [(&str, Fit, Want); 3] {
+            [
+                ("contain", Fit::Contain, Want::Refused),
+                ("blur", Fit::Blur, if fw >= 96 { Want::NotRefused } else { Want::Either }),
+                ("cover", Fit::Cover, Want::NotRefused),
+            ]
+        };
+        for (sw, sh, fw, fh) in [
+            (64, 35, 64, 36),
+            (96, 51, 96, 54),
+            (64, 33, 64, 36),
+            (320, 179, 320, 180),
+            (640, 359, 640, 360),
+            (320, 177, 320, 180),
+        ] {
+            let Some(a) = codec_media(codec, &args, ext, "yuv420p", sw, sh, 30) else {
+                continue;
+            };
+            for (label, fit, want) in fits(fw) {
+                let tl = timeline(vec![vec![clip(&a, 0.0, 0.3, 0.0)]], Some(Delivery::new(fw, fh, fit)));
+                let case = format!("checker/b/r3/pad fit {label} {codec} {sw}x{sh} in {fw}x{fh}");
+                if let Some(out) = sweep_guarded(&case, &tl, std::slice::from_ref(&a), 30.0, 0.3) {
+                    judged += 1;
+                    fam.add(&case, &out);
+                    expect_refusal(&mut fam, &case, &out, ODD_ORIGIN, want);
+                }
+            }
+            let tl = timeline(vec![vec![clip(&a, 0.0, 0.3, 0.0)]], None);
+            let case = format!("checker/b/r3/pad no delivery {codec} {sw}x{sh}");
+            if let Some(out) = sweep_guarded(&case, &tl, std::slice::from_ref(&a), 30.0, 0.3) {
+                judged += 1;
+                fam.add(&case, &out);
+                expect_refusal(&mut fam, &case, &out, ODD_ORIGIN, Want::NotRefused);
+            }
+        }
+        for pix in ["yuv422p", "yuv444p", "gray", "gbrp"] {
+            for (sw, sh, fw, fh) in [(64, 35, 64, 36), (64, 33, 64, 36), (63, 35, 64, 36)] {
+                let Some(a) = codec_media(codec, &args, ext, pix, sw, sh, 30) else {
+                    continue;
+                };
+                let tl = timeline(vec![vec![clip(&a, 0.0, 0.3, 0.0)]], Some(Delivery::new(fw, fh, Fit::Contain)));
+                let case = format!("checker/b/r3/pad format {pix} {codec} {sw}x{sh} in {fw}x{fh}");
+                if let Some(out) = sweep_guarded(&case, &tl, std::slice::from_ref(&a), 30.0, 0.3) {
+                    judged += 1;
+                    fam.add(&case, &out);
+                    expect_refusal(&mut fam, &case, &out, ODD_ORIGIN, Want::NotRefused);
+                }
+            }
+        }
+        for rate in [24u32, 60] {
+            for (sw, sh, fw, fh) in [(64, 35, 64, 36), (64, 33, 64, 36), (64, 31, 64, 36)] {
+                let Some(a) = codec_media(codec, &args, ext, "yuv420p", sw, sh, rate) else {
+                    continue;
+                };
+                let tl = timeline(vec![vec![clip(&a, 0.0, 0.4, 0.0)]], Some(Delivery::new(fw, fh, Fit::Contain)));
+                let case = format!("checker/b/r3/pad rate {rate} {codec} {sw}x{sh} in {fw}x{fh}");
+                if let Some(out) = sweep_guarded(&case, &tl, std::slice::from_ref(&a), 30.0, 0.4) {
+                    judged += 1;
+                    fam.add(&case, &out);
+                    let want = if sh == 31 { Want::NotRefused } else { Want::Refused };
+                    expect_refusal(&mut fam, &case, &out, ODD_ORIGIN, want);
+                }
+            }
+        }
+    }
+    assert!(judged > 40, "too few cases could be made: {judged}");
+    fam.finish("odd-height pad: fits, formats, rates");
+}
+
+/// The odd picture at the origin inside the things a clip can carry: its own fades, a dissolve, a dip, a slide, a colour
+/// correction, an effect, a speed, a crop, a rotation, an opacity, a mask, a position, a pip, over a base track and under one.
+/// Whatever the plan draws is the export's (the odd-origin refusal needs no other reason to stand).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_b_r3_pad_odd_height_at_the_origin_inside_other_clip_features() {
+    use kerf_core::VideoEffect as E;
+    let mut fam = Family::default();
+    let mut judged = 0;
+    let mask = kerf_core::Mask {
+        shape: kerf_core::MaskShape::Rect,
+        x: 0.5,
+        y: 0.5,
+        width: 0.6,
+        height: 0.6,
+        feather: 0.0,
+        inverted: false,
+    };
+    let eq = Color {
+        contrast: 1.2,
+        saturation: 1.1,
+        ..Color::default()
+    };
+    for (codec, args, ext) in r3_codecs().into_iter().filter(|(c, ..)| *c == "ffv1" || *c == "ffvhuff") {
+        let Some(a) = codec_media(codec, &args, ext, "yuv420p", 64, 35, 30) else {
+            continue;
+        };
+        let Some(b) = codec_media(codec, &args, ext, "yuv420p", 64, 33, 30) else {
+            continue;
+        };
+        let even = media(64, 36, Pat::Test, Tag::None);
+        let frame = Some(Delivery::new(64, 36, Fit::Contain));
+        type Edit<'a> = Box<dyn Fn(&mut Clip) + 'a>;
+        let edits: Vec<(&str, Edit)> = vec![
+            ("fade_in", Box::new(|c| c.fade_in = 0.15)),
+            ("fade_out", Box::new(|c| c.fade_out = 0.15)),
+            ("eq", Box::new(move |c| c.color = eq)),
+            ("invert", Box::new(|c| c.effects = vec![E::Invert])),
+            ("blur", Box::new(|c| c.effects = vec![E::Blur { sigma: 1.5 }])),
+            ("grayscale", Box::new(|c| c.effects = vec![E::Grayscale])),
+            (
+                "speed 2",
+                Box::new(|c| {
+                    c.speed = 2.0;
+                    c.source_out = c.source_in + 0.6;
+                }),
+            ),
+            ("reverse", Box::new(|c| c.speed = -1.0)),
+            (
+                "crop",
+                Box::new(|c| {
+                    c.transform.crop_left = 0.1;
+                    c.transform.crop_bottom = 0.1;
+                }),
+            ),
+            ("rotation", Box::new(|c| c.transform.rotation = 8.0)),
+            ("opacity", Box::new(|c| c.transform.opacity = 0.6)),
+            ("mask", Box::new(move |c| c.mask = Some(mask))),
+            ("position", Box::new(|c| c.transform.pos_x = 0.1)),
+            ("pip", Box::new(|c| *c = pip(c.clone(), 0.5, 0.1, 0.1))),
+            (
+                "keyed position",
+                Box::new(|c| c.keyframes = vec![zoom_key(0.0, 1.0, 0.0, 0.0), zoom_key(0.4, 1.0, 0.1, 0.05)]),
+            ),
+        ];
+        for (label, edit) in &edits {
+            let mut c = clip(&a, 0.0, 0.4, 0.0);
+            edit(&mut c);
+            let tl = timeline(vec![vec![c]], frame);
+            let case = format!("checker/b/r3/pad inside {label} {codec} 64x35");
+            if let Some(out) = sweep_guarded(&case, &tl, std::slice::from_ref(&a), 30.0, 0.4) {
+                judged += 1;
+                if *label == "rotation" {
+                    // (A rotated layer's edge has the base's own ladder, the same for an even picture the size of the frame:
+                    // `checker_b_r3_rotation_of_odd_height_pictures_is_no_worse_than_an_even_one`.)
+                    fam.add_known_ladder(&case, &out);
+                } else {
+                    fam.add(&case, &out);
+                }
+            }
+        }
+        for kind in [
+            TransitionKind::Crossfade,
+            TransitionKind::DipToBlack,
+            TransitionKind::DipToWhite,
+            TransitionKind::SlideLeft,
+            TransitionKind::PushUp,
+        ] {
+            for (label, first, second) in [
+                ("odd then odd", &a, &b),
+                ("odd then even", &a, &even),
+                ("even then odd", &even, &a),
+            ] {
+                let tl = timeline(
+                    vec![vec![
+                        clip(first, 0.0, 0.4, 0.0),
+                        dissolve_into(clip(second, 0.0, 0.4, 0.4), kind, 0.2),
+                    ]],
+                    frame,
+                );
+                let case = format!("checker/b/r3/pad transition {kind:?} {label} {codec}");
+                let assets = dedup(&[first, second]);
+                if let Some(out) = sweep_guarded(&case, &tl, &assets, 30.0, 0.8) {
+                    judged += 1;
+                    if kind == TransitionKind::DipToWhite {
+                        let worst = out.bad.iter().flat_map(|b| b.planes.iter().map(|p| p.max)).max().unwrap_or(0);
+                        if worst > 3 {
+                            fam.failures.push(format!(
+                                "{case}: a dip to white's ladder is 3 levels, drawn frames differ by {worst}"
+                            ));
+                        }
+                        fam.add_known_ladder(&case, &out);
+                    } else {
+                        fam.add(&case, &out);
+                    }
+                }
+            }
+        }
+        for (label, tracks) in [
+            (
+                "odd over even",
+                vec![vec![clip(&even, 0.0, 0.4, 0.0)], vec![clip(&a, 0.0, 0.4, 0.0)]],
+            ),
+            (
+                "even over odd",
+                vec![vec![clip(&a, 0.0, 0.4, 0.0)], vec![clip(&even, 0.0, 0.4, 0.0)]],
+            ),
+            (
+                "odd pip over odd",
+                vec![
+                    vec![clip(&a, 0.0, 0.4, 0.0)],
+                    vec![pip(clip(&b, 0.0, 0.4, 0.0), 0.5, 0.2, 0.2)],
+                ],
+            ),
+        ] {
+            let tl = timeline(tracks, frame);
+            let case = format!("checker/b/r3/pad stacked {label} {codec}");
+            let assets = dedup(&[&a, &b, &even]);
+            if let Some(out) = sweep_guarded(&case, &tl, &assets, 30.0, 0.4) {
+                judged += 1;
+                fam.add(&case, &out);
+            }
+        }
+    }
+    assert!(judged > 40, "too few cases could be made: {judged}");
+    fam.finish("odd-height pad at the origin inside other clip features");
+}
+
+/// Planar 8-bit 4:2:0 is the only format the exact scaler resizes: `yuv420p` and `yuvj420p` (full-range x264) still draw,
+/// in every cut that resizes, odd pictures included. Not refused for the format, and every drawn frame exact.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_b_r3_resized_planar_8bit_420_is_still_drawn_exactly() {
+    let mut fam = Family::default();
+    let mut drawn_plain = 0;
+    for (pix, codec, args, ext) in [
+        ("yuv420p", "ffv1", vec!["-c:v", "ffv1"], "mkv"),
+        ("yuv420p", "ffvhuff", vec!["-c:v", "ffvhuff"], "mkv"),
+        (
+            "yuvj420p",
+            "x264j",
+            vec!["-c:v", "libx264", "-preset", "ultrafast", "-qp", "0", "-g", "10"],
+            "mp4",
+        ),
+    ] {
+        for (sw, sh) in [(640u32, 360u32), (320, 180), (64, 36), (63, 35), (90, 160)] {
+            let Some(a) = codec_media(codec, &args, ext, pix, sw, sh, 30) else {
+                continue;
+            };
+            for (label, tl) in resize_cuts(&a) {
+                let case = format!("checker/b/r3/resized {pix} {codec} {sw}x{sh} {label}");
+                if let Some(out) = sweep_guarded(&case, &tl, std::slice::from_ref(&a), 30.0, 0.3) {
+                    fam.add(&case, &out);
+                    expect_refusal(&mut fam, &case, &out, FORMAT_RESIZE, Want::NotRefused);
+                    if pix == "yuv420p" {
+                        drawn_plain += out.drawn;
+                    }
+                }
+            }
+        }
+    }
+    assert!(drawn_plain > 0 || patched_out(), "no resized yuv420p frame was drawn");
+    fam.finish_refusing("resized planar 8-bit 4:2:0");
+}
+
+/// Everything else that is resized is FFmpeg's: gray (8 and 10-bit), 9 / 10 / 12-bit 4:2:0, semi-planar `nv12`, 4:2:2, 4:4:4,
+/// 4:4:0, planar RGB. None is drawn; each frame is refused for the format.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_b_r3_resized_other_formats_stay_refused() {
+    let mut fam = Family::default();
+    let mut judged = 0;
+    for (pix, codec, args, ext) in [
+        ("gray", "ffv1", vec!["-c:v", "ffv1"], "mkv"),
+        ("gray10le", "ffv1", vec!["-c:v", "ffv1"], "mkv"),
+        ("yuv420p9le", "ffv1", vec!["-c:v", "ffv1"], "mkv"),
+        ("yuv420p10le", "ffv1", vec!["-c:v", "ffv1"], "mkv"),
+        ("yuv420p12le", "ffv1", vec!["-c:v", "ffv1"], "mkv"),
+        ("nv12", "rawvideo", vec!["-c:v", "rawvideo"], "mkv"),
+        ("yuv422p", "ffv1", vec!["-c:v", "ffv1"], "mkv"),
+        ("yuv444p", "ffv1", vec!["-c:v", "ffv1"], "mkv"),
+        ("yuv440p", "ffv1", vec!["-c:v", "ffv1"], "mkv"),
+        ("gbrp", "ffv1", vec!["-c:v", "ffv1"], "mkv"),
+    ] {
+        for (sw, sh) in [(320u32, 180u32), (63, 35)] {
+            let Some(a) = codec_media(codec, &args, ext, pix, sw, sh, 30) else {
+                eprintln!("{pix} {sw}x{sh}: this FFmpeg cannot make it");
+                continue;
+            };
+            let seen = a.streams.iter().find_map(|s| s.pix_fmt.clone()).unwrap_or_default();
+            eprintln!("{pix} {sw}x{sh}: probed as {seen}");
+            for (label, tl) in resize_cuts(&a) {
+                let case = format!("checker/b/r3/resized {pix} {sw}x{sh} {label}");
+                if let Some(out) = sweep_guarded(&case, &tl, std::slice::from_ref(&a), 30.0, 0.3) {
+                    judged += 1;
+                    refused_for_format_resize(&mut fam, &case, &out);
+                }
+            }
+        }
+    }
+    assert!(judged > 50, "too few cases could be made: {judged}");
+    fam.finish_refusing("resized other formats are refused");
+}
+
+/// The same pictures left at their size (an even one: the default canvas rounds an odd one down, which resizes it) are not
+/// refused for the format: drawn frames are exact (gray and 10-bit are converted on the way in, not resized).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_b_r3_unresized_gray_and_ten_bit_pictures_are_not_refused_for_the_format() {
+    let mut fam = Family::default();
+    let mut judged = 0;
+    for pix in ["gray", "gray10le", "yuv420p10le", "yuv422p", "yuv444p"] {
+        for (sw, sh) in [(320u32, 180u32), (64, 36), (90, 160)] {
+            let Some(a) = codec_media("ffv1", &["-c:v", "ffv1"], "mkv", pix, sw, sh, 30) else {
+                continue;
+            };
+            let tl = timeline(vec![vec![clip(&a, 0.0, 0.3, 0.0)]], None);
+            let case = format!("checker/b/r3/unresized {pix} {sw}x{sh}");
+            if let Some(out) = sweep_guarded(&case, &tl, std::slice::from_ref(&a), 30.0, 0.3) {
+                judged += 1;
+                fam.add(&case, &out);
+                expect_refusal(&mut fam, &case, &out, FORMAT_RESIZE, Want::NotRefused);
+            }
+        }
+    }
+    assert!(judged > 10, "too few cases could be made: {judged}");
+    fam.finish_refusing("unresized gray and ten-bit pictures");
+}
+
+/// The format check reads the probe's pixel-format string: which strings let a resize through (`yuv420p`, `yuvj420p`, in any
+/// case), and which do not (the rest, and a stream whose format was never recorded). No export: the plan alone.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_b_r3_format_resize_follows_the_probed_pixel_format_string() {
+    let base = media(320, 180, Pat::Test, Tag::None);
+    let opts = at_fps(30.0);
+    let mut wrong = Vec::new();
+    for (pix, resizes) in [
+        (Some("yuv420p"), true),
+        (Some("yuvj420p"), true),
+        (Some("YUV420P"), true),
+        (Some("YuvJ420p"), true),
+        (Some("gray"), false),
+        (Some("gray8"), false),
+        (Some("gray10le"), false),
+        (Some("gray12le"), false),
+        (Some("yuv420p9le"), false),
+        (Some("yuv420p10le"), false),
+        (Some("yuv420p10be"), false),
+        (Some("yuv420p12le"), false),
+        (Some("yuv420p16le"), false),
+        (Some("nv12"), false),
+        (Some("nv21"), false),
+        (Some("p010le"), false),
+        (Some("p016le"), false),
+        (Some("yuv422p"), false),
+        (Some("yuv444p"), false),
+        (Some("yuva420p"), false),
+        (Some("rgb24"), false),
+        (Some("bgr0"), false),
+        (Some("pal8"), false),
+        (Some(""), false),
+        (None, false),
+    ] {
+        let mut asset = base.clone();
+        for s in &mut asset.streams {
+            if s.kind == StreamKind::Video {
+                s.pix_fmt = pix.map(str::to_string);
+            }
+        }
+        for (label, tl) in resize_cuts(&asset) {
+            let planner = Planner::new(&tl, std::slice::from_ref(&asset), &opts, PlanRequest::motion(policy())).expect("planner");
+            let plan = planner.at_frame(2).expect("plan");
+            let why = plan.reasons(&compositor().caps(), plan.size(u32::MAX));
+            let refused = why.iter().any(|r| r.to_string().contains(FORMAT_RESIZE));
+            if refused == resizes {
+                wrong.push(format!(
+                    "{pix:?} {label}: {} for the format, expected {}",
+                    if refused { "refused" } else { "not refused" },
+                    if resizes { "let through" } else { "refused" }
+                ));
+            }
+        }
+    }
+    assert!(wrong.is_empty(), "{}", wrong.join("\n"));
+}
+
+/// Holds a case that holds a dip to white to the export: a dip to white has the base's ladder on every frame of the graph (the
+/// RGB round trip's stage: `checker_b_r2_dip_to_white_in_the_cut_leaves_the_clips_before_it_exact`, the same figures for equal
+/// and for different matrices), so no frame of such a cut differs by more than 3 levels; a wrong matrix moves every sample of
+/// the cut by tens. The frames outside the dip's own are counted (`windows`, seconds, a frame either side).
+fn judge_dips(fam: &mut Family, case: &str, out: &Outcome, fps: f64, windows: &[(f64, f64)]) {
+    fam.cases += 1;
+    fam.drawn += out.drawn;
+    fam.refused += out.refused;
+    let inside = |k: u64| {
+        let t = k as f64 / fps;
+        windows.iter().any(|&(lo, hi)| t >= lo - 1.5 / fps && t <= hi + 1.5 / fps)
+    };
+    for b in &out.bad {
+        let worst = b.planes.iter().map(|p| p.max).max().unwrap_or(0);
+        if worst > 3 {
+            fam.failures.push(format!(
+                "{case}: frame {} ({} a dip): Y {} (max {}, first {:?}) U {} (max {}, first {:?}) V {} (max {}, first {:?})",
+                b.frame,
+                if inside(b.frame) { "inside" } else { "outside" },
+                b.planes[0].differing,
+                b.planes[0].max,
+                b.planes[0].first,
+                b.planes[1].differing,
+                b.planes[1].max,
+                b.planes[1].first,
+                b.planes[2].differing,
+                b.planes[2].max,
+                b.planes[2].first
+            ));
+        }
+    }
+    if !out.bad.is_empty() {
+        let outside = out.bad.iter().filter(|b| !inside(b.frame)).count();
+        eprintln!(
+            "   dip ladder (the base's, at most 3): {case}: {} of {} drawn frames, {outside} outside the dip",
+            out.bad.len(),
+            out.drawn
+        );
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WhiteShape {
+    AlphaDipIn,
+    AlphaDipOut,
+    AlphaDipBoth,
+    CrossfadeDipOut,
+    KeyedDipIn,
+    KeyedDipOut,
+    KeyedDipBoth,
+    AlphaFirstDipOut,
+    AlphaAfterTwoPlainDipIn,
+    DipOnTheFirstAlpha,
+    CleanThenAlphaDip,
+    AlphaDipThenCrossfade,
+    StackedAlphaDip,
+    PlainDipIn,
+    PlainDipOut,
+    PlainDipBoth,
+    PipDipIn,
+}
+
+const WHITE_SHAPES: [WhiteShape; 17] = [
+    WhiteShape::AlphaDipIn,
+    WhiteShape::AlphaDipOut,
+    WhiteShape::AlphaDipBoth,
+    WhiteShape::CrossfadeDipOut,
+    WhiteShape::KeyedDipIn,
+    WhiteShape::KeyedDipOut,
+    WhiteShape::KeyedDipBoth,
+    WhiteShape::AlphaFirstDipOut,
+    WhiteShape::AlphaAfterTwoPlainDipIn,
+    WhiteShape::DipOnTheFirstAlpha,
+    WhiteShape::CleanThenAlphaDip,
+    WhiteShape::AlphaDipThenCrossfade,
+    WhiteShape::StackedAlphaDip,
+    WhiteShape::PlainDipIn,
+    WhiteShape::PlainDipOut,
+    WhiteShape::PlainDipBoth,
+    WhiteShape::PipDipIn,
+];
+
+impl WhiteShape {
+    /// Whether a clip on the alpha plane carries the dip (the clip that would decide is unread).
+    fn unread_decider(self) -> Option<bool> {
+        match self {
+            Self::PlainDipIn | Self::PlainDipOut | Self::PlainDipBoth | Self::PipDipIn => Some(false),
+            Self::CleanThenAlphaDip => None,
+            _ => Some(true),
+        }
+    }
+}
+
+/// The cut, its assets, the dip windows (seconds) and the tags it uses.
+type WhiteCut = (Timeline, Vec<Asset>, Vec<(f64, f64)>, Vec<Tag>);
+
+/// A cut of one dip shape in tags `t`, the dip lasting `d`.
+fn white_cut(shape: WhiteShape, t: [Tag; 3], d: f64) -> WhiteCut {
+    use WhiteShape as S;
+    let dip = |c: Clip| dissolve_into(c, TransitionKind::DipToWhite, d);
+    let window = |at: f64| (at - d / 2.0, at + d / 2.0);
+    let (p1, a1) = routed(Route::Plain, t[0], Pat::Edges, 0.0);
+    let (p2, a2) = routed(Route::Plain, t[1], Pat::Noise, 0.7);
+    let (p3, a3) = routed(Route::Plain, t[2], Pat::Test, 1.4);
+    let (al1, aa1) = routed(Route::AlphaSource, t[0], Pat::Edges, 0.0);
+    let (al2, aa2) = routed(Route::AlphaSource, t[1], Pat::Noise, 0.7);
+    let (al3, aa3) = routed(Route::AlphaSource, t[2], Pat::Test, 1.4);
+    let (x2, ax2) = routed(Route::Crossfade, t[1], Pat::Noise, 0.7);
+    let (x3, ax3) = routed(Route::Crossfade, t[2], Pat::Test, 1.4);
+    let (k2, ak2) = routed(Route::KeyedPos, t[1], Pat::Noise, 0.7);
+    let (pip2, apip2) = routed(Route::Pip, t[1], Pat::Noise, 0.7);
+    let first = |tl: Vec<Vec<Clip>>, assets: &[&Asset], windows: Vec<(f64, f64)>, used: usize| {
+        (timeline(tl, None), dedup(assets), windows, t[..used].to_vec())
+    };
+    match shape {
+        S::AlphaDipIn => first(vec![vec![p1, dip(al2)]], &[&a1, &aa2], vec![window(0.7)], 2),
+        S::AlphaDipOut => first(vec![vec![p1, al2, dip(p3)]], &[&a1, &aa2, &a3], vec![window(1.4)], 3),
+        S::AlphaDipBoth => first(
+            vec![vec![p1, dip(al2), dip(p3)]],
+            &[&a1, &aa2, &a3],
+            vec![window(0.7), window(1.4)],
+            3,
+        ),
+        S::CrossfadeDipOut => first(vec![vec![p1, x2, dip(p3)]], &[&a1, &ax2, &a3], vec![window(1.4)], 3),
+        S::KeyedDipIn => first(vec![vec![p1, dip(k2)]], &[&a1, &ak2], vec![window(0.7)], 2),
+        S::KeyedDipOut => first(vec![vec![p1, k2, dip(p3)]], &[&a1, &ak2, &a3], vec![window(1.4)], 3),
+        S::KeyedDipBoth => first(
+            vec![vec![p1, dip(k2), dip(p3)]],
+            &[&a1, &ak2, &a3],
+            vec![window(0.7), window(1.4)],
+            3,
+        ),
+        S::AlphaFirstDipOut => first(vec![vec![al1, dip(p2)]], &[&aa1, &a2], vec![window(0.7)], 2),
+        S::AlphaAfterTwoPlainDipIn => first(vec![vec![p1, p2, dip(al3)]], &[&a1, &a2, &aa3], vec![window(1.4)], 3),
+        S::DipOnTheFirstAlpha => first(vec![vec![dip(al1), p2]], &[&aa1, &a2], vec![window(0.0)], 2),
+        S::CleanThenAlphaDip => first(vec![vec![al1, p2, dip(al3)]], &[&aa1, &a2, &aa3], vec![window(1.4)], 3),
+        S::AlphaDipThenCrossfade => first(vec![vec![p1, dip(al2), x3]], &[&a1, &aa2, &ax3], vec![window(0.7)], 3),
+        S::StackedAlphaDip => {
+            let (mut over, ao) = routed(Route::AlphaSource, t[1], Pat::Noise, 0.35);
+            over = pip(dip(over), 0.6, 0.15, -0.1);
+            first(vec![vec![p1, p3], vec![over]], &[&a1, &a3, &ao], vec![window(0.35)], 3)
+        }
+        S::PlainDipIn => first(vec![vec![p1, dip(p2)]], &[&a1, &a2], vec![window(0.7)], 2),
+        S::PlainDipOut => first(vec![vec![p1, p2, dip(p3)]], &[&a1, &a2, &a3], vec![window(1.4)], 3),
+        S::PlainDipBoth => first(
+            vec![vec![p1, dip(p2), dip(p3)]],
+            &[&a1, &a2, &a3],
+            vec![window(0.7), window(1.4)],
+            3,
+        ),
+        S::PipDipIn => first(vec![vec![p1, dip(pip2)]], &[&a1, &apip2], vec![window(0.7)], 2),
+    }
+}
+
+/// A clip that is tied to the alpha plane and dips to white on either side (`white_in` / `white_out`) may carry a converter in
+/// its chain (`fade c=white` runs on RGB), so on a build that negotiates (9.0.2) it is not the one whose tag decides the cut's
+/// matrix, and a cut of mixed matrices holding one is refused. Plain clips that dip stay drawn. Both fade directions, an alpha
+/// source, a dissolving clip, a keyed position, a pip, three-clip cuts, the dip at the head, a short and a long dip, over every
+/// tag arrangement. Outside the dips' own frames every drawn frame is exact.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_b_r3_white_fade_on_tied_clips_is_not_a_decider() {
+    let tag_sets = [
+        [Tag::None, Tag::Bt709, Tag::None],
+        [Tag::Bt709, Tag::None, Tag::Bt709],
+        [Tag::None, Tag::Bt709, Tag::Bt709],
+        [Tag::Bt709, Tag::None, Tag::None],
+        [Tag::None, Tag::Bt709, Tag::Bt2020],
+        [Tag::Bt709, Tag::Bt2020, Tag::None],
+        [Tag::Bt709, Tag::Bt709, Tag::Bt709],
+    ];
+    let mut fam = Family::default();
+    let mut refused_cuts = 0;
+    for tags in tag_sets {
+        for shape in WHITE_SHAPES {
+            let durations: &[f64] = match shape {
+                WhiteShape::AlphaDipIn | WhiteShape::AlphaDipOut | WhiteShape::CrossfadeDipOut => &[0.3, 0.08, 1.4],
+                _ => &[0.3],
+            };
+            for &d in durations {
+                let (tl, assets, windows, used) = white_cut(shape, tags, d);
+                let case = format!("checker/b/r3/whitefade {shape:?} d{d} {tags:?}");
+                let Some(out) = sweep_try(&case, &tl, &assets, 15.0, 2.1) else {
+                    continue;
+                };
+                judge_dips(&mut fam, &case, &out, 15.0, &windows);
+                let mixed = used.iter().any(|&u| !same_matrix(u, used[0]));
+                let want = match (negotiates() && mixed, shape.unread_decider()) {
+                    (true, Some(true)) => Want::Refused,
+                    (true, Some(false)) => Want::NotRefused,
+                    _ => Want::Either,
+                };
+                expect_refusal(&mut fam, &case, &out, MIXED, want);
+                if out.refused_for(MIXED) > 0 {
+                    refused_cuts += 1;
+                }
+            }
+        }
+    }
+    eprintln!("== cuts refused as mixed: {refused_cuts}");
+    fam.finish("white fade on tied clips");
+}
+
+/// A rotation of an odd-height picture next to the same rotation of an even one: a rotated layer's edge has the base's own ladder
+/// (chroma at the turned edge; figures below, the same for an even picture the size of the frame), so this holds the odd heights to
+/// the even control's figures and to no more than the ladder's bounds, and nothing else moves.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_b_r3_rotation_of_odd_height_pictures_is_no_worse_than_an_even_one() {
+    let mut fam = Family::default();
+    let mut judged = 0;
+    let mut worst_by_degrees: BTreeMap<String, (i32, i32)> = BTreeMap::new();
+    let mut odd: Vec<(String, String, i32, i32)> = Vec::new();
+    for (codec, args, ext) in r3_codecs().into_iter().filter(|(c, ..)| *c == "ffv1" || *c == "ffvhuff") {
+        for (sw, sh, fw, fh) in [
+            (64, 36, 64, 36),
+            (64, 34, 64, 36),
+            (64, 35, 64, 36),
+            (64, 33, 64, 36),
+            (64, 31, 64, 36),
+        ] {
+            let Some(a) = codec_media(codec, &args, ext, "yuv420p", sw, sh, 30) else {
+                continue;
+            };
+            for degrees in [8.0, 45.0, 90.0, -3.0] {
+                let mut c = clip(&a, 0.0, 0.4, 0.0);
+                c.transform.rotation = degrees;
+                let tl = timeline(vec![vec![c]], Some(Delivery::new(fw, fh, Fit::Contain)));
+                let case = format!("checker/b/r3/rotation {degrees} {codec} {sw}x{sh} in {fw}x{fh}");
+                let Some(out) = sweep_guarded(&case, &tl, std::slice::from_ref(&a), 30.0, 0.4) else {
+                    continue;
+                };
+                judged += 1;
+                fam.add_known_ladder(&case, &out);
+                let y = out.bad.iter().map(|b| b.planes[0].max).max().unwrap_or(0);
+                let uv = out
+                    .bad
+                    .iter()
+                    .flat_map(|b| [b.planes[1].max, b.planes[2].max])
+                    .max()
+                    .unwrap_or(0);
+                if sh % 2 == 0 {
+                    let e = worst_by_degrees.entry(format!("{degrees}")).or_insert((0, 0));
+                    *e = (e.0.max(y), e.1.max(uv));
+                } else {
+                    odd.push((format!("{degrees}"), case, y, uv));
+                }
+            }
+        }
+    }
+    for (degrees, case, y, uv) in odd {
+        let (ey, euv) = worst_by_degrees.get(&degrees).copied().unwrap_or((0, 0));
+        if y > ey.max(1) || uv > euv.max(100) {
+            fam.failures
+                .push(format!("{case}: Y max {y} UV max {uv}, the even control's {ey} / {euv}"));
+        }
+    }
+    assert!(judged >= 16, "too few cases could be made: {judged}");
+    fam.finish("rotation of odd-height pictures");
+}
+
+/// A Still plan of an odd-height picture at the frame's width, from the gap that leaves it at the origin (1 and 3 rows: refused)
+/// to the gaps that leave it off it (5 rows and more), and the even neighbours. Whatever the plan draws is the still's.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_b_r3_stills_of_odd_height_pictures_by_gap() {
+    let mut fam = Family::default();
+    let mut judged = 0;
+    for (codec, args, ext) in r3_codecs().into_iter().filter(|(c, ..)| *c == "ffv1" || *c == "ffvhuff") {
+        for (sw, sh, fw, fh) in [
+            (64, 36, 64, 36),
+            (64, 35, 64, 36),
+            (64, 34, 64, 36),
+            (64, 33, 64, 36),
+            (64, 32, 64, 36),
+            (64, 31, 64, 36),
+            (64, 30, 64, 36),
+            (64, 29, 64, 36),
+            (64, 27, 64, 36),
+            (64, 13, 64, 36),
+            (64, 5, 64, 36),
+            (64, 31, 64, 40),
+            (64, 33, 64, 40),
+            (62, 35, 64, 36),
+        ] {
+            let Some(a) = codec_media(codec, &args, ext, "yuv420p", sw, sh, 30) else {
+                continue;
+            };
+            let tl = timeline(vec![vec![clip(&a, 0.0, 0.5, 0.0)]], Some(Delivery::new(fw, fh, Fit::Contain)));
+            let case = format!("checker/b/r3/still gap {codec} {sw}x{sh} in {fw}x{fh}");
+            let times = [0.0, 0.1, 0.2, 0.3];
+            let Some(out) = guarded(&case, || still_sweep(&case, &tl, std::slice::from_ref(&a), &times)) else {
+                continue;
+            };
+            judged += 1;
+            fam.add_still(&case, &out);
+            let at_origin = sw == fw && sh % 2 == 1 && fh - sh <= 3;
+            let n: usize = out
+                .reasons
+                .iter()
+                .filter(|(r, _)| r.contains(ODD_ORIGIN))
+                .map(|(_, n)| n)
+                .sum();
+            if !patched_out() && ((at_origin && n != times.len()) || (!at_origin && n != 0)) {
+                fam.failures.push(format!(
+                    "{case}: {n} of {} stills refused for the odd-height pad, expected {}",
+                    times.len(),
+                    if at_origin { "all" } else { "none" }
+                ));
+            }
+        }
+    }
+    assert!(judged > 20, "too few cases could be made: {judged}");
+    fam.finish("stills of odd-height pictures by gap");
+}
+
+/// Diagnostic: where a still of an odd-height picture off the origin differs from the still's own planes.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_b_r3_diag_still_gap_rows() {
+    let (codec, args, ext) = r3_codecs().remove(0);
+    for (sw, sh, fw, fh) in [(64, 5, 64, 36), (64, 31, 64, 36), (64, 30, 64, 36), (64, 31, 64, 40)] {
+        let a = codec_media(codec, &args, ext, "yuv420p", sw, sh, 30).unwrap();
+        let tl = timeline(vec![vec![clip(&a, 0.0, 0.5, 0.0)]], Some(Delivery::new(fw, fh, Fit::Contain)));
+        let plan = kerf_core::RenderPlan::at(&tl, std::slice::from_ref(&a), &ExportOptions::default(), 0.1, policy()).unwrap();
+        let (w, h, want, got) = still_planes(&plan, &tl, std::slice::from_ref(&a), 0.1);
+        let (w, h) = (w as usize, h as usize);
+        eprintln!("== {sw}x{sh} in {fw}x{fh}: still {w}x{h}");
+        for (name, plane) in ["Y", "U", "V"].iter().enumerate() {
+            let mut rows = Vec::new();
+            for y in 0..h {
+                let n = (0..w)
+                    .filter(|x| want[name * w * h + y * w + x] != got[name * w * h + y * w + x])
+                    .count();
+                if n > 0 {
+                    rows.push(format!("{y}:{n}"));
+                }
+            }
+            eprintln!("  {plane}: rows with differences (row:count) {}", rows.join(" "));
+        }
+        if let Some(y) = (0..h).find(|y| (0..w).any(|x| want[y * w + x] != got[y * w + x])) {
+            eprintln!(
+                "  first differing Y row {y}: still {:?} gpu {:?}",
+                &want[y * w..y * w + 8],
+                &got[y * w..y * w + 8]
+            );
+        }
+    }
+}
+
+/// The black fades on a clip that is tied to the alpha plane (the other half of the white fade's question: which fades put a
+/// converter into a tied chain): a clip's own fade in or out, a dip to black into it or out of it, on an alpha source, a
+/// dissolving clip and a keyed position, in cuts of mixed matrices. No ladder here: every drawn frame is the export's.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_b_r3_black_fades_on_tied_clips() {
+    let dip = |c: Clip| dissolve_into(c, TransitionKind::DipToBlack, 0.3);
+    let mut fam = Family::default();
+    for t in [
+        [Tag::None, Tag::Bt709, Tag::None],
+        [Tag::Bt709, Tag::None, Tag::Bt709],
+        [Tag::None, Tag::Bt709, Tag::Bt2020],
+    ] {
+        let (p1, a1) = routed(Route::Plain, t[0], Pat::Edges, 0.0);
+        let (p3, a3) = routed(Route::Plain, t[2], Pat::Test, 1.4);
+        let mut cases: Vec<(String, Timeline, Vec<Asset>)> = Vec::new();
+        for route in [Route::AlphaSource, Route::Crossfade, Route::KeyedPos, Route::Pip] {
+            let (r2, a2) = routed(route, t[1], Pat::Noise, 0.7);
+            let with = |f: &dyn Fn(Clip) -> Clip| f(r2.clone());
+            let shapes: Vec<(&str, Vec<Clip>)> = vec![
+                (
+                    "fade_in",
+                    vec![
+                        p1.clone(),
+                        with(&|mut c| {
+                            c.fade_in = 0.3;
+                            c
+                        }),
+                    ],
+                ),
+                (
+                    "fade_out",
+                    vec![
+                        p1.clone(),
+                        with(&|mut c| {
+                            c.fade_out = 0.3;
+                            c
+                        }),
+                    ],
+                ),
+                (
+                    "fade_in and out",
+                    vec![
+                        p1.clone(),
+                        with(&|mut c| {
+                            c.fade_in = 0.2;
+                            c.fade_out = 0.2;
+                            c
+                        }),
+                    ],
+                ),
+                ("dip black out", vec![p1.clone(), r2.clone(), dip(p3.clone())]),
+                (
+                    "fade_out then plain",
+                    vec![
+                        p1.clone(),
+                        with(&|mut c| {
+                            c.fade_out = 0.3;
+                            c
+                        }),
+                        p3.clone(),
+                    ],
+                ),
+            ];
+            for (label, clips) in shapes {
+                cases.push((
+                    format!("{route:?} {label} {t:?}"),
+                    timeline(vec![clips], None),
+                    dedup(&[&a1, &a2, &a3]),
+                ));
+            }
+            if route != Route::Crossfade {
+                cases.push((
+                    format!("{route:?} dip black in {t:?}"),
+                    timeline(vec![vec![p1.clone(), dip(r2.clone())]], None),
+                    dedup(&[&a1, &a2]),
+                ));
+            }
+        }
+        for (name, tl, assets) in cases {
+            let case = format!("checker/b/r3/blackfade {name}");
+            if let Some(out) = sweep_try(&case, &tl, &assets, 15.0, 2.1) {
+                fam.add(&case, &out);
+            }
+        }
+    }
+    fam.finish("black fades on tied clips");
 }
