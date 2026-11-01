@@ -333,7 +333,11 @@
   export *and* the FFmpeg still read the picture through its window with `perspective` (fixed-point, bilinear),
   which no compositor pass draws, and the layer's transform keeps only the static crop. `Animated.mask` /
   `Animated.crop` say so. A **moving zoom or position** (`Animated.places`, `Clip::placement_animated`) is refused in
-  both modes (`Unsupported::KeyedPlacement`) unless `GpuCaps::placement`, which `kerf-gpu` sets: the export and the
+  both modes (`Unsupported::KeyedPlacement`) unless `GpuCaps::placement`, which `kerf-gpu` sets **only once a probe of the FFmpeg in
+  use has found that its `pad`, `perspective` and `crop` place a picture as `kerf_core::perspective` does** (`kerf_gpu::placement_probe`, which runs
+  `engine::placement_probe_chain`, the export's own filter text, and `placement_probe_motion`, a keyed zoom and position with a breath,
+  a drift and a shake over `perspective`'s frame count, against `Clip::transform_at`; `behaviors` goes with it; a probe that cannot tell is `Unknown`
+  and refuses): the export and the
   FFmpeg still place the picture with `pad`, `perspective` and `crop` at sub-pixel positions (`engine-cli.md`), which
   `kerf_core::perspective` reproduces (the frames `pad` and `crop` make, the corners the expressions evaluate to, the filter's
   matrix and table of sample positions: `RenderPlan::pose` is the zoom, the position and a slide's travel it is drawn from;

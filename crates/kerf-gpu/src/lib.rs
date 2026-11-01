@@ -111,6 +111,13 @@
 //!   ([`kerf_core::RenderPlan::reasons`]). [`grade::kernels`] measures that this machine's FFmpeg
 //!   converts that way (it does not on another CPU's SIMD), chain by chain, and until it says so
 //!   [`Compositor::caps`] has no grade in it.
+//! * **A moving zoom or position is drawn only where this FFmpeg is measured to place a picture as the
+//!   model does.** [`placement_probe::placement`] runs the export's own `pad`, `perspective` and `crop`
+//!   text on tiny frames (and a keyed, breathing, drifting, shaking move over `perspective`'s frame count)
+//!   and holds every plane to [`placement`]'s model with no tolerance; until it says `Match` ([`Compositor::caps`])
+//!   there is no `placement` or `behaviors` in the caps, and a probe that could not tell is `Unknown`, which
+//!   refuses. Probes run ahead of a frame ([`prepare`], [`prepare_ahead`]), on a blocking thread off any
+//!   lock, bounded, with a backoff ([`conversion`] and the file's range flag alike); the render never spawns.
 //! * **What the GPU does not draw is refused, loudly.** Per frame the plan says no
 //!   ([`kerf_core::RenderPlan::gpu_supported_at`], which also takes the render size:
 //!   a resize of a picture whose chroma is not 4:2:0, a translucent layer of
@@ -145,8 +152,10 @@ pub mod frame_cache;
 pub mod frame_source;
 pub mod gpu;
 pub mod grade;
+mod measure;
 pub mod motion;
 pub mod placement;
+pub mod placement_probe;
 pub mod present;
 pub mod roundtrip;
 pub mod router;
@@ -157,7 +166,7 @@ pub mod sws;
 pub mod text;
 pub mod y4m;
 
-pub use compositor::{prepare, Compositor, RenderTimings, RenderedFrame, RgbaFrame};
+pub use compositor::{prepare, prepare_ahead, Compositor, RenderTimings, RenderedFrame, RgbaFrame};
 pub use cursor::{CursorConfig, FrameCursor};
 pub use frame_source::{FrameSource, FrameSourceConfig, Hint, SourceStats};
 pub use gpu::{Gpu, GpuError, GpuOptions};

@@ -33,7 +33,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
-use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError, RwLock, TryLockError};
 use std::time::{Duration, Instant};
 
 use super::cli::{command, ffprobe_bin, run_piped_until, source_key};
@@ -53,9 +53,20 @@ enum Found<T> {
     Failed(Instant),
 }
 
+/// What a [`Found`] settles for the next asker.
+enum Settled<T> {
+    Answer(T),
+    Failed,
+    Probe,
+}
+
 /// One probe's answer per file, however many threads ask at once. See the [module](self).
+///
+/// Each file's answer sits behind a `RwLock`: a probe holds the write side for as long as it runs (the other askers for the
+/// file wait on it, a probe being bounded), and everything that merely reads an answer ([`ProbeCache::get`] on a hit,
+/// [`ProbeCache::peek`]) shares the read side, so two readers never make each other miss.
 pub(super) struct ProbeCache<T> {
-    files: Mutex<HashMap<String, Arc<Mutex<Found<T>>>>>,
+    files: Mutex<HashMap<String, Arc<RwLock<Found<T>>>>>,
     retry: Duration,
 }
 
@@ -75,19 +86,22 @@ impl<T: Copy> ProbeCache<T> {
     /// remembered, else `probe()`'s — run once, with every other caller for the same file waiting
     /// for it (a probe is bounded, so the wait is) instead of spawning its own.
     pub(super) fn get(&self, path: &Path, probe: impl FnOnce() -> Option<T>) -> Option<T> {
+        let key = source_key(path);
         let slot = {
             let mut files = self.files.lock().unwrap_or_else(PoisonError::into_inner);
-            Arc::clone(
-                files
-                    .entry(source_key(path))
-                    .or_insert_with(|| Arc::new(Mutex::new(Found::Unknown))),
-            )
+            Arc::clone(files.entry(key).or_insert_with(|| Arc::new(RwLock::new(Found::Unknown))))
         };
-        let mut found = slot.lock().unwrap_or_else(PoisonError::into_inner);
-        match *found {
-            Found::Known(answer) => return Some(answer),
-            Found::Failed(at) if at.elapsed() < self.retry => return None,
-            _ => {}
+        match self.settled(&slot.read().unwrap_or_else(PoisonError::into_inner)) {
+            Settled::Answer(answer) => return Some(answer),
+            Settled::Failed => return None,
+            Settled::Probe => {}
+        }
+        let mut found = slot.write().unwrap_or_else(PoisonError::into_inner);
+        // (Another caller may have probed while this one waited for the write side.)
+        match self.settled(&found) {
+            Settled::Answer(answer) => return Some(answer),
+            Settled::Failed => return None,
+            Settled::Probe => {}
         }
         let probed = probe();
         *found = match probed {
@@ -95,6 +109,35 @@ impl<T: Copy> ProbeCache<T> {
             None => Found::Failed(Instant::now()),
         };
         probed
+    }
+
+    /// What `found` already says: an answer, a failure still remembered, or that the file is to be probed.
+    fn settled(&self, found: &Found<T>) -> Settled<T> {
+        match *found {
+            Found::Known(answer) => Settled::Answer(answer),
+            Found::Failed(at) if at.elapsed() < self.retry => Settled::Failed,
+            _ => Settled::Probe,
+        }
+    }
+
+    /// The remembered answer for the file at `path`, **without probing**: `None` for a file not asked about yet, one whose
+    /// probe is running right now (nothing waits for it) and one whose probe failed. It spawns nothing and waits for no
+    /// probe, and **readers do not make it miss**: only a probe in progress does. So a render may ask it.
+    pub(super) fn peek(&self, path: &Path) -> Option<T> {
+        let key = source_key(path);
+        let slot = {
+            let files = self.files.lock().unwrap_or_else(PoisonError::into_inner);
+            Arc::clone(files.get(&key)?)
+        };
+        let found = match slot.try_read() {
+            Ok(found) => found,
+            Err(TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(TryLockError::WouldBlock) => return None,
+        };
+        match *found {
+            Found::Known(answer) => Some(answer),
+            _ => None,
+        }
     }
 }
 
@@ -366,6 +409,55 @@ mod tests {
         // No sync sample at all is a "no" the file earns, not a failure.
         let flagless = probe_seek_points(|_, _, _| Some(packets_json(1, 20).replace("K__", "___")));
         assert_eq!(flagless, Some(false));
+    }
+
+    /// `peek` is what a render may ask: it finds an answer the cache holds and nothing else — never a probe, never a wait.
+    #[test]
+    fn a_peek_finds_an_answer_and_never_probes_or_waits() {
+        let dir = std::env::temp_dir().join(format!("kerf-probe-peek-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.bin");
+        std::fs::write(&file, b"x").unwrap();
+        let cache: ProbeCache<u32> = ProbeCache::retrying(Duration::from_secs(60));
+        // A file nobody asked about: nothing.
+        assert_eq!(cache.peek(&file), None);
+        // A failure is not an answer.
+        assert_eq!(cache.get(&file, || None), None);
+        assert_eq!(cache.peek(&file), None);
+        // While a probe of the file runs, the peek does not wait for it: it has nothing to say yet.
+        let other = dir.join("b.bin");
+        std::fs::write(&other, b"xy").unwrap();
+        std::thread::scope(|scope| {
+            let (started, started_rx) = std::sync::mpsc::channel::<()>();
+            let (release, release_rx) = std::sync::mpsc::channel::<()>();
+            let (cache, other) = (&cache, &other);
+            let running = scope.spawn(move || {
+                cache.get(other, || {
+                    started.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Some(5)
+                })
+            });
+            started_rx.recv().unwrap();
+            let t = Instant::now();
+            assert_eq!(cache.peek(other), None, "the probe is still running");
+            assert!(t.elapsed() < Duration::from_secs(1));
+            release.send(()).unwrap();
+            assert_eq!(running.join().unwrap(), Some(5));
+        });
+        // Once there is an answer the peek finds it, for good, and a replaced file has none.
+        assert_eq!(cache.peek(&other), Some(5));
+        assert_eq!(cache.peek(&other), Some(5));
+        // Readers do not make each other miss: with another thread in the middle of reading the answer (a hit, or a peek of
+        // its own, preempted there), a peek still finds it.
+        let slot = Arc::clone(cache.files.lock().unwrap().get(&source_key(&other)).expect("the file's slot"));
+        let reading = slot.read().unwrap();
+        assert_eq!(cache.peek(&other), Some(5), "a reader made the peek miss");
+        assert_eq!(cache.get(&other, || panic!("probed a known file")), Some(5));
+        drop(reading);
+        std::fs::write(&other, b"changed").unwrap();
+        assert_eq!(cache.peek(&other), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

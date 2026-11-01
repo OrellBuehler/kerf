@@ -2377,6 +2377,11 @@ fn the_ledger_says_which_refusals_hold_the_compositor_back() {
     // ... and text whose glyph bitmaps share samples (a synthetic-bold border, a font under 12 px) only where this FFmpeg's
     // `drawtext` lays text out in a way the compositor can take apart (one probe).
     let layout = kerf_gpu::text::model();
+    // ... and a moving zoom or position only where this FFmpeg's `pad`, `perspective` and `crop` place a picture as the model does
+    // (the placement probe), a 4:4:4 or 4:2:2 picture under it only where its graph converts it as the decode does (the
+    // conversion probe).
+    let placement = kerf_gpu::placement_probe::placement();
+    let conversion = kerf_gpu::conversion::conversion();
     let caps = Compositor::caps_with(kernels, layout);
     let mut cuts = vec![];
     // T1 to T8 are planned with the default export options; T9 and on say theirs (a ProRes file, a GIF, a scaler).
@@ -2408,7 +2413,7 @@ fn the_ledger_says_which_refusals_hold_the_compositor_back() {
         "kerf-gpu coverage ledger: the frames the compositor draws and what refuses the rest".to_string(),
         format!("ffmpeg: {version_line}"),
         format!("composite colour policy: {policy:?}"),
-        format!("grade kernels: {kernels:?}; text layout: {layout:?} (caps: Compositor::caps_for(grade::kernels()) once text::model() has probed, as the app asks)"),
+        format!("grade kernels: {kernels:?}; text layout: {layout:?}; placement: {placement:?}; planar conversion: {conversion:?} (caps: Compositor::caps_for(grade::kernels()) once text::model(), placement_probe::placement() and conversion::conversion() have probed, as the app asks)"),
         "plans: every output frame of every archetype over OriginalMedia at 540 px wide (the app's preview plans ProxyMedia at 960); nothing is rendered".to_string(),
         "archetypes: the review's T1 to T3, the real-world T4 to T8 and T9 to T24, which between them use every feature the editor offers that still refuses (tests/coverage.rs)".to_string(),
     ];
@@ -2572,6 +2577,9 @@ fn why_unreached(
     match kind {
         "motion" | "fade" | "travel" | "tail" | "keyed_opacity" | "keyed_color" | "keyed_zoom" | "mask" | "text" => {
             "drawn: Compositor::CAPS has the ability, so a plan never reports it"
+        }
+        "keyed_placement" if kerf_gpu::placement_probe::measured() == kerf_gpu::placement_probe::Placement::Match => {
+            "drawn: this FFmpeg places a picture as the model does (placement_probe), so a plan never reports it"
         }
         "no_picture" => {
             "unreachable: the project keeps an audio-only asset off a video track, and a probe states a video stream's size"

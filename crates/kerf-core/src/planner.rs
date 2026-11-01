@@ -2019,8 +2019,8 @@ mod tests {
             Unsupported::KeyedZoom(_)
         )));
         // A zoom or a position that moves is placed at sub-pixel positions by a `perspective` in the
-        // export and the still, which no compositor draws, whatever its caps; a position that holds
-        // is placed as ever.
+        // export and the still, which a plan refuses (`KeyedPlacement`) unless the caps say the compositor draws
+        // that; a position that holds is placed as ever.
         let placement = |u: &Unsupported| matches!(u, Unsupported::KeyedPlacement(_));
         let all = GpuCaps {
             keyed_zoom: true,

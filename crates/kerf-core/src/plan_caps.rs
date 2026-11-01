@@ -116,13 +116,17 @@ pub struct GpuCaps {
     /// `Animated`), so a compositor that sets this draws the grade, the effects, the mask and the
     /// fades at the fit size first and the zoom after them. A rotation, or an opacity below 1,
     /// in front of a moving zoom is refused whatever the caps (`ZoomBehind`): both would have to
-    /// be scaled with it.
+    /// be scaled with it. This is the order only; the zoom itself is drawn by the placement
+    /// ([`GpuCaps::placement`]), without which a moving zoom is refused (`KeyedPlacement`).
     pub keyed_zoom: bool,
     /// A moving zoom or position placed at sub-pixel positions: FFmpeg ends the clip's chain in a
     /// `perspective` that lays the picture on a canvas-sized frame (bilinear, fixed-point; the export,
     /// the playback stream and the still alike). A compositor that sets it reproduces `pad`, `perspective`
     /// and `crop` ([`crate::perspective`]) after the rest of the chain, which it draws at the fit size
-    /// (`keyed_zoom`); without it every frame of such a layer is refused (`KeyedPlacement`). With it set,
+    /// (`keyed_zoom`); without it every frame of such a layer is refused (`KeyedPlacement`). **A compositor sets it
+    /// only where it measured that this FFmpeg's `pad`, `perspective` and `crop` place a picture as its model does**
+    /// (a build with another rounding in any of them would be drawn wrong, sample for sample, on every moving zoom).
+    /// With it set,
     /// a rotation, an opacity below 1 and a dip to white ahead of the placement are still refused
     /// (`ZoomBehind`), and so are an odd-height picture and a pose beyond the table's range (`Geometry`); a grade
     /// ahead of it is drawn where the compositor draws the grade (`grade`).
@@ -135,7 +139,8 @@ pub struct GpuCaps {
     pub placed_chroma: bool,
     /// Live behaviours (`Clip.behaviors`: a sway, breath, spin, drift or shake on top of the pose). The
     /// plan carries the exact pose they give at the frame's time, so a compositor that draws the pose
-    /// draws them; every frame of such a layer is refused (`Behavior`) until one sets this, and a sway or a
+    /// draws them; every frame of such a layer is refused (`Behavior`) until one sets this (it is the placement's,
+    /// measured with it, and the `sin` and `cos` of the filter's machine are part of what is measured), and a sway or a
     /// spin (which turns the picture: a rotation no compositor draws to the sample) is refused whatever the caps.
     pub behaviors: bool,
     /// Keyframed colour: FFmpeg writes the clip's `eq` per frame (`eval=frame`, an expression
@@ -346,7 +351,9 @@ pub enum Unsupported {
     /// A keyframed zoom in an export frame, which FFmpeg draws as the last stage of the chain.
     KeyedZoom(LayerRef),
     /// A moving zoom or position: FFmpeg places the picture on the canvas with a `perspective` at
-    /// sub-pixel positions (in the export and the still alike), which no compositor pass draws.
+    /// sub-pixel positions (in the export and the still alike), which a compositor draws only where it sets
+    /// `GpuCaps::placement` (`pad`, `perspective` and `crop`, reproduced to the sample, and **measured** against the
+    /// FFmpeg in use: the flag is not set where that measurement found a difference or could not tell).
     KeyedPlacement(LayerRef),
     /// A moving zoom or position on a picture that is not 4:2:0 or gray (the detail names its pixel format, or says it was
     /// never recorded), or that may be full range where the composite's range is negotiated (the detail says `full-range`):
@@ -356,8 +363,9 @@ pub enum Unsupported {
     /// a still on 9.0.2, exact on 4.4.2).
     PlacedFormat(LayerRef, String),
     /// A clip with live behaviours (sway, breathe, spin, drift, shake): the pose each frame is a formula of
-    /// the clip's clock added to its keys, which FFmpeg evaluates in the graph and no compositor has a
-    /// parity case for.
+    /// the clip's clock added to its keys, which FFmpeg evaluates in the graph. A breath, a drift and a shake are the
+    /// pose the placement draws (`GpuCaps::behaviors`, measured with it); a sway and a spin turn the picture, which
+    /// no compositor draws to the sample, so they are refused whatever the caps.
     Behavior(LayerRef),
     /// A moving zoom with something in front of it that the compositor does not draw in FFmpeg's
     /// order (the detail says what): FFmpeg applies those to the picture at its fit size and
@@ -560,7 +568,7 @@ impl fmt::Display for Unsupported {
             ),
             Self::KeyedPlacement(l) => write!(
                 f,
-                "{l}: a moving zoom or position (a perspective placing the picture at sub-pixel positions, which this compositor does not draw)"
+                "{l}: a moving zoom or position (a perspective placing the picture at sub-pixel positions, which this compositor draws only where this FFmpeg's pad, perspective and crop were measured to place a picture as its model does)"
             ),
             Self::PlacedFormat(l, fmt) => write!(
                 f,

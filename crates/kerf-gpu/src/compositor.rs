@@ -344,6 +344,9 @@ pub struct Compositor {
     /// Whether this FFmpeg's conversions to and from RGB are the ones the grade follows, when pinned
     /// ([`Compositor::with_grade_kernels`]); else measured ([`crate::grade::kernels`]).
     grade_kernels: Option<crate::grade::Kernels>,
+    /// Whether this FFmpeg places a picture as the model does, when a host pinned it
+    /// ([`Compositor::with_placement`]); else measured ([`crate::placement_probe::measured`]).
+    placement: Option<crate::placement_probe::Placement>,
     /// The threads FFmpeg's filter graph slices a frame into, when pinned ([`Compositor::with_graph_threads`]);
     /// else they are the graph's the frame stands in for ([`Compositor::graph_threads_for`]).
     graph_threads: Option<u32>,
@@ -790,15 +793,50 @@ pub fn prepare(plan: &RenderPlan) {
     if plan.layers.iter().any(|l| !l.grade.is_identity()) {
         let _ = crate::grade::kernels();
     }
-    if plan
-        .layers
+    prepare_placement(plan);
+    if !plan.overlays.is_empty() {
+        let _ = crate::text::model();
+    }
+}
+
+/// [`prepare`] for what a moving zoom or position needs: whether this FFmpeg's `pad`, `perspective` and `crop` place a
+/// picture as the model does ([`crate::placement_probe`]: `GpuCaps::placement` and `behaviors` are set only once it is
+/// known to be a match); for a 4:4:4 or 4:2:2 picture, whether its graph converts it as the decode does
+/// ([`crate::conversion`]: `placed_chroma`); and, where the composite's range is negotiated, the range of a file whose asset
+/// did not record it (`kerf_core::source_is_full_range`: one `ffprobe` a file, remembered), so that the render, which never
+/// spawns a process, finds the answer in the cache. Each is cached for the process: a plan without a placed layer
+/// asks for none of it, and one that has asks a cache.
+fn prepare_placement(plan: &RenderPlan) {
+    let placed: Vec<&kerf_core::PlanLayer> = plan.layers.iter().filter(|l| plan.pose(l).is_some()).collect();
+    if placed.is_empty() {
+        return;
+    }
+    let _ = crate::placement_probe::placement();
+    if placed
         .iter()
-        .any(|l| plan.pose(l).is_some() && matches!(l.stream.pix_fmt.as_deref(), Some("yuv444p" | "yuv422p")))
+        .any(|l| matches!(l.stream.pix_fmt.as_deref(), Some("yuv444p" | "yuv422p")))
     {
         let _ = crate::conversion::conversion();
     }
-    if !plan.overlays.is_empty() {
-        let _ = crate::text::model();
+    if plan.canvas.policy != kerf_core::CompositeColorPolicy::FixedBt601 {
+        for layer in placed.iter().filter(|l| l.stream.color_range.is_none()) {
+            let _ = kerf_core::source_is_full_range(std::path::Path::new(&layer.path));
+        }
+    }
+}
+
+/// [`prepare`] over every frame of a play's horizon: the layers a session will draw within `horizon` seconds of `from`, for
+/// the probes that decide the caps ([`prepare_placement`]) — a clip that comes in a second after the playhead is measured
+/// for before the session begins, not by the first frame it is on. Plans each frame once (a few hundred microseconds each,
+/// as the horizon scan after it does). Call it from a blocking thread, off any lock, before reading
+/// [`Compositor::caps`].
+pub fn prepare_ahead(cut: &kerf_core::PlayCut, from: f64, horizon: f64) {
+    let first = cut.frame_at(from);
+    let last = cut.frame_at(from + horizon.max(0.0)).max(first);
+    for k in first..=last {
+        if let Ok(plan) = cut.at_frame(k) {
+            prepare(&plan);
+        }
     }
 }
 
@@ -830,7 +868,11 @@ impl Compositor {
     /// The combinations the plan names (`Unsupported`) stay FFmpeg's.
     /// Each later pass flips its bit beside the pass and its parity cases.
     pub fn caps(&self) -> GpuCaps {
-        Self::caps_for(self.grade_kernels.unwrap_or_else(crate::grade::measured))
+        Self::caps_measured(
+            self.grade_kernels.unwrap_or_else(crate::grade::measured),
+            crate::text::measured_model(),
+            self.placement.clone().unwrap_or_else(crate::placement_probe::measured),
+        )
     }
 
     /// [`Compositor::caps`] for a machine whose FFmpeg's conversions are `kernels`, without a device: the way a host that
@@ -843,11 +885,26 @@ impl Compositor {
     /// colours in a way the compositor knows (`None`: in no way it does, or not probed yet): without that no
     /// text is drawn, it stays FFmpeg's.
     pub fn caps_with(kernels: crate::grade::Kernels, text: Option<crate::text::Model>) -> GpuCaps {
+        Self::caps_measured(kernels, text, crate::placement_probe::measured())
+    }
+
+    /// [`Compositor::caps_with`] for a machine whose `pad`, `perspective` and `crop` place a picture as `placement` says
+    /// ([`crate::placement_probe`]); the moving zoom and position, and the behaviours drawn by it, are in the caps only on
+    /// a `Match`.
+    fn caps_measured(
+        kernels: crate::grade::Kernels,
+        text: Option<crate::text::Model>,
+        placement: crate::placement_probe::Placement,
+    ) -> GpuCaps {
         let mut caps = Self::CAPS;
         if kernels != crate::grade::Kernels::Match {
             caps.grade = GradeKinds::NONE;
         }
         // (Only what has been measured: [`prepare`] asks ahead of a plan that needs it.)
+        if placement != crate::placement_probe::Placement::Match {
+            caps.placement = false;
+            caps.behaviors = false;
+        }
         caps.placed_chroma = crate::conversion::measured() == crate::conversion::Conversion::Match;
         if text.is_none() {
             caps.text = false;
@@ -895,6 +952,15 @@ impl Compositor {
     #[must_use]
     pub fn with_grade_kernels(mut self, kernels: crate::grade::Kernels) -> Self {
         self.grade_kernels = Some(kernels);
+        self
+    }
+
+    /// Pin whether this FFmpeg places a picture as the model does, instead of measuring the ffmpeg this process runs
+    /// ([`crate::placement_probe::placement`], on the first moving zoom unless [`prepare`] ran ahead of it): for a host that
+    /// knows its ffmpeg, and for tests. Anything but `Match` takes the moving zoom and position out of [`Compositor::caps`].
+    #[must_use]
+    pub fn with_placement(mut self, placement: crate::placement_probe::Placement) -> Self {
+        self.placement = Some(placement);
         self
     }
 
@@ -1176,6 +1242,7 @@ impl Compositor {
                 vignettes: VignetteMaps::default(),
                 geq_edge: None,
                 grade_kernels: None,
+                placement: None,
                 key_terms: OnceLock::new(),
                 graph_threads: None,
             })
@@ -2079,8 +2146,10 @@ impl Compositor {
         // Where the composite's range is negotiated (9.0.2) a full-range picture is read 3 to 8 levels off behind the placement
         // (`PlacedFormat`), and a layer whose asset was probed before the range flag was recorded (`color_range` `None`) may be
         // one: the plan cannot know, the file can say. A probe that cannot tell is a refusal, never a guess.
+        // The render never spawns a process: the answer is the one [`prepare`] asked the file for ahead of it, and a file it
+        // has no answer for (not asked, still being asked, or the probe failed) is refused like one that would not say.
         if plan.canvas.policy != kerf_core::CompositeColorPolicy::FixedBt601 && layer.stream.color_range.is_none() {
-            match kerf_core::source_is_full_range(std::path::Path::new(&layer.path)) {
+            match kerf_core::source_is_full_range_known(std::path::Path::new(&layer.path)) {
                 Some(false) => {}
                 Some(true) => return Err(unsupported(
                     "a full-range picture its asset did not record, under a placement where the composite's range is negotiated"
@@ -2088,7 +2157,8 @@ impl Compositor {
                 )),
                 None => {
                     return Err(unsupported(
-                        "a picture whose range the asset did not record and the file would not say, under a placement".into(),
+                        "a picture whose range the asset did not record and the file would not say (or was not asked ahead of the render), under a placement"
+                            .into(),
                     ))
                 }
             }
@@ -2398,7 +2468,11 @@ impl Compositor {
     /// compared with FFmpeg's planes directly, without a conversion in between.
     /// A plan with overlays and no layer is `Unsupported`: its text is blended in RGB, and
     /// returning the black planes without it would be a frame that silently lacks its text.
+    ///
+    /// (Like [`Compositor::render_plan`] this one-shot entry, for a test or a diagnostic that has no [`prepare`] ahead of it,
+    /// asks for what a placed layer needs measured; the shared and counted variants a host drives never spawn a process.)
     pub fn composite_yuv(&self, plan: &RenderPlan, frames: &[Option<YuvFrame>], size: (u32, u32)) -> Result<YuvFrame, GpuError> {
+        prepare_placement(plan);
         self.yuv_planes(plan, frames, Counts::None, size)
     }
 
@@ -3174,6 +3248,8 @@ impl Compositor {
     /// Decode every layer of `plan` through FFmpeg and composite them at `size`,
     /// timing the two halves apart.
     pub fn render_plan(&self, plan: &RenderPlan, size: (u32, u32)) -> Result<(RgbaFrame, RenderTimings), GpuError> {
+        // (The one-shot entry has no host to have called [`prepare`] ahead of it: it asks for what a moving zoom needs measured.)
+        prepare_placement(plan);
         let reasons = plan.reasons(&self.caps(), size);
         if !reasons.is_empty() {
             return Err(GpuError::Unsupported(join_reasons(&reasons)));
@@ -3503,6 +3579,7 @@ fn plane_stage(stage: &ScaleStage, chroma: bool) -> PlaneStage {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::placement_probe::Placement;
 
     fn mask(x: f64) -> Mask {
         Mask {
@@ -3529,15 +3606,45 @@ mod tests {
         use crate::grade::Kernels;
         use crate::text::Model;
         let layout = Some(Model::Shaped);
-        assert_eq!(Compositor::caps_with(Kernels::Match, layout), Compositor::CAPS);
+        let caps_with = |kernels, layout| Compositor::caps_measured(kernels, layout, Placement::Match);
+        assert_eq!(caps_with(Kernels::Match, layout), Compositor::CAPS);
         assert_eq!(Compositor::CAPS.grade, GradeKinds::ALL);
         for kernels in [Kernels::Differs("a chain"), Kernels::Unknown] {
-            let caps = Compositor::caps_with(kernels, layout);
+            let caps = caps_with(kernels, layout);
             assert_eq!(caps.grade, GradeKinds::NONE, "{kernels:?}");
             let mut restored = caps;
             restored.grade = GradeKinds::ALL;
             assert_eq!(restored, Compositor::CAPS, "{kernels:?}: nothing else moves");
         }
+    }
+
+    /// The moving zoom and position, and the behaviours drawn by them, are in the caps only where this FFmpeg's `pad`,
+    /// `perspective` and `crop` are known to place a picture as the model does: a probe that found a difference, one that
+    /// could not tell and one that has not run all leave them out (every moving zoom is then FFmpeg's, refused up front),
+    /// and nothing else moves with them.
+    #[test]
+    fn the_placement_is_in_the_caps_only_where_this_ffmpeg_is_known_to_place_as_the_model_does() {
+        use crate::grade::Kernels;
+        use crate::text::Model;
+        let layout = Some(Model::Shaped);
+        const { assert!(Compositor::CAPS.placement && Compositor::CAPS.behaviors) };
+        assert_eq!(
+            Compositor::caps_measured(Kernels::Match, layout, Placement::Match),
+            Compositor::CAPS
+        );
+        for placement in [Placement::Differs("64x32 <- 64x32: 3 samples".into()), Placement::Unknown] {
+            let caps = Compositor::caps_measured(Kernels::Match, layout, placement.clone());
+            assert!(!caps.placement && !caps.behaviors, "{placement:?}");
+            let mut restored = caps;
+            restored.placement = true;
+            restored.behaviors = true;
+            assert_eq!(restored, Compositor::CAPS, "{placement:?}: nothing else moves");
+        }
+        // What the process has measured is what `caps_with` reads (nothing, in a unit test: not a match).
+        assert_eq!(
+            Compositor::caps_with(Kernels::Match, layout).placement,
+            crate::placement_probe::measured() == Placement::Match
+        );
     }
 
     /// Text is in the caps only where `drawtext`'s layout and colour conversion are ones the compositor
@@ -3548,10 +3655,11 @@ mod tests {
         use crate::grade::Kernels;
         use crate::text::Model;
         const { assert!(Compositor::CAPS.text) };
+        let caps_with = |kernels, layout| Compositor::caps_measured(kernels, layout, Placement::Match);
         for layout in [Some(Model::Shaped), Some(Model::Legacy)] {
-            assert_eq!(Compositor::caps_with(Kernels::Match, layout), Compositor::CAPS, "{layout:?}");
+            assert_eq!(caps_with(Kernels::Match, layout), Compositor::CAPS, "{layout:?}");
         }
-        let unknown = Compositor::caps_with(Kernels::Match, None);
+        let unknown = caps_with(Kernels::Match, None);
         assert!(!unknown.text);
         let mut restored = unknown;
         restored.text = true;

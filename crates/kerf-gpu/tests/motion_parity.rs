@@ -62,6 +62,8 @@ fn compositor() -> &'static Compositor {
         let _ = kerf_gpu::grade::kernels();
         // ... and whether this FFmpeg converts a 4:4:4 / 4:2:2 picture in a graph as the decode does (a placed one).
         let _ = kerf_gpu::conversion::conversion();
+        // ... and whether this FFmpeg places a picture as the model does (the moving zoom and position are in the caps only then).
+        let _ = kerf_gpu::placement_probe::placement();
         // ... and so is the layout of its `drawtext`, which decides whether text whose bitmaps share samples is drawn.
         let _ = kerf_gpu::text::model();
         Compositor::new(gpu()).expect("a compositor")
@@ -194,6 +196,11 @@ fn media() -> &'static Media {
         // GOP, four seconds so that a clip cut from the middle has a handle either side for a tail.
         let video = |name: &str, lavfi: &str| -> PathBuf {
             let p = dir.join(name);
+            // Written beside it and renamed over it: `checker_a_a_placed_clip_in_an_export_in_parts` runs this binary again,
+            // whose `media()` makes these files while the sibling tests read them, and a file rewritten in place is seen
+            // truncated and half-written, then with the size and time of nothing that was probed (a rename leaves a reader
+            // the file it opened and gives the next one the whole new one).
+            let part = dir.join(format!("{name}.{}.part.mp4", std::process::id()));
             ffmpeg(&[
                 "-f",
                 "lavfi",
@@ -209,8 +216,9 @@ fn media() -> &'static Media {
                 "10",
                 "-pix_fmt",
                 "yuv420p",
-                p.to_str().unwrap(),
+                part.to_str().unwrap(),
             ]);
+            std::fs::rename(&part, &p).expect("move the finished clip into place");
             p
         };
         let untagged = "setparams=colorspace=unknown:color_primaries=unknown:color_trc=unknown";

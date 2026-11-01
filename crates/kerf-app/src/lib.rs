@@ -4798,6 +4798,12 @@ async fn get_render_bar(
             if !timeline.overlays.is_empty() {
                 let _ = kerf_gpu::text::model();
             }
+            // ...and whether this FFmpeg places a picture as the model does (a moving zoom or position is in the caps only then),
+            // and converts a 4:4:4 / 4:2:2 one as the decode does (such a picture under it).
+            if timeline.tracks.iter().flat_map(|t| &t.clips).any(|c| c.placement_animated()) {
+                let _ = kerf_gpu::placement_probe::placement();
+                let _ = kerf_gpu::conversion::conversion();
+            }
             kerf_gpu::Compositor::caps_for(kerf_gpu::grade::measured())
         });
         let req = kerf_core::render_bar::BarRequest {

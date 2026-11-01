@@ -61,9 +61,15 @@ so the feature is **only** activated through these forwards — which is what ma
   that it is padded is a fact about the *file*, so it travels in the name
   (`is_head_padded_proxy`, pure) instead of a flag on `Asset` beside the swapped
   path. `source_traits` is the one cached ffprobe per file that answers HDR, the
-  lead and the container — killed after 20 s, one probe however many threads ask, a failure
+  lead, the container and the range flag (`source_is_full_range`: `None` for an `ffprobe` that exits 0 and prints
+  nothing that describes a file, so an asset that did not record its range is never read as limited on no evidence;
+  `source_is_full_range_known` is the same answer from the cache alone, `ProbeCache::peek`, which spawns and waits on
+  nothing, for a render: each file's slot is an `RwLock`, a probe holds the write side, so only a probe in progress makes a peek miss, never another reader) — killed after 20 s, one probe however many threads ask, a failure
   remembered 60 s like `proxy_video_info`'s (`engine/source_probe.rs`'s `ProbeCache`, which the
-  GPU frame source's seek-point probe sits behind too). **An encode reads it once**
+  GPU frame source's seek-point probe sits behind too). `run_piped_until` is the bounded child every such probe runs
+  in (`pub`: the compositor's probes use it too): killed at the deadline, and **no thread a child's descendant can keep
+  alive is joined** (a wrapper that does not `exec` holds the pipes past the kill and past its own exit; the output is waited
+  for no longer than the deadline plus a 250 ms grace). **An encode reads it once**
   (`generate_proxy_with` takes the traits first and gives them to `proxy_path_for`, the tone-map and the pad): a
   second reading, after a wait in the proxy lane, could answer otherwise once a failed probe's minute had passed,
   and write a plain picture under the tone-mapped or padded name (or the other way round) and keep it for good. The clone is a frame the original has no counterpart

@@ -651,6 +651,10 @@ impl GpuPreview {
             None => {
                 let cut = PlayCut::new(&inputs.timeline, &inputs.assets, t, (self.policy)(), &ProxyMedia)
                     .map_err(|e| one("no_plan", format!("no plan to play from here: {e}")))?;
+                // What the caps below are made of (a placed layer's probes, a graded one's) is measured here, on this blocking
+                // thread, for every frame the session will look at: a first Play over a 4:4:4 clip is not declined for a probe
+                // nobody ran.
+                kerf_gpu::prepare_ahead(&cut, t, HORIZON);
                 let motion = MotionFrames::with_config(Arc::clone(&drawing.source), play_config());
                 (Arc::new(cut), motion, false)
             }
@@ -773,6 +777,8 @@ impl GpuPreview {
             Ok(cut) => cut,
             Err(e) => return not(vec![Reason::new("no_plan", format!("no plan to play from here: {e}"))]),
         };
+        // (As a session's start: the probes the caps are made of, for every frame the scan below looks at.)
+        kerf_gpu::prepare_ahead(&cut, t, REACH + HORIZON + RESUME_SLACK);
         let size = match cut.plan(t).map_err(|e| e.to_string()).and_then(|first| {
             self.sized(technique, &bounds, &drawing.host, &first)
                 .map(|(_, size)| size)
