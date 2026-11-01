@@ -105,7 +105,9 @@ fn canvas(w: usize, h: usize, tag: Tag, then: &str) -> Picture {
 fn base_picture(w: usize, h: usize, tag: Tag) -> Picture {
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
-    static BASES: OnceLock<Mutex<HashMap<(usize, usize, u8), std::sync::Arc<Picture>>>> = OnceLock::new();
+    // (width, height, tag) -> the plain canvas
+    type Bases = Mutex<HashMap<(usize, usize, u8), std::sync::Arc<Picture>>>;
+    static BASES: OnceLock<Bases> = OnceLock::new();
     let key = (w, h, tag as u8);
     let cached = BASES.get_or_init(Default::default).lock().unwrap().get(&key).cloned();
     let pic = cached.unwrap_or_else(|| {
@@ -1057,4 +1059,320 @@ fn checker_d_the_shipped_font_is_taken_apart_on_this_build() {
         kerf_core::ffmpeg_path()
     );
     l.finish("shipped font");
+}
+
+// ---- round two: the sequence is proven or refused. Hunt for a draw that is not exact. ---------------------------
+
+impl Ledger {
+    fn merge(&mut self, other: Ledger) {
+        self.wrong.extend(other.wrong);
+        self.sequence += other.sequence;
+        self.sum += other.sum;
+        self.refused += other.refused;
+        self.sum_exact += other.sum_exact;
+        if other.slowest.0 > self.slowest.0 {
+            self.slowest = other.slowest;
+        }
+    }
+}
+
+/// Every font file under the usual directories that `drawtext` opens, one path per file.
+fn every_font_file() -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    for dir in ["/usr/share/fonts/truetype", "/mnt/c/Windows/Fonts"] {
+        let mut stack = vec![PathBuf::from(dir)];
+        while let Some(d) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&d) else { continue };
+            for e in entries.flatten() {
+                let p = e.path();
+                if p.is_dir() {
+                    stack.push(p);
+                } else if p
+                    .extension()
+                    .and_then(|x| x.to_str())
+                    .is_some_and(|x| x.eq_ignore_ascii_case("ttf") || x.eq_ignore_ascii_case("otf"))
+                    && !p.to_string_lossy().contains(['\'', ':', ' ', '\\'])
+                {
+                    found.push(p);
+                }
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// Does `drawtext` draw with this file at all (it refuses bitmap-only and some collection files)?
+fn drawtext_opens(face: &Path, px: f64) -> bool {
+    let graph = format!(
+        "color=c=black:s=64x64:d=1:r=1,drawtext=text=ab:fontsize={px}:fontcolor=white:fontfile='{}'",
+        face.display()
+    );
+    Command::new(kerf_core::ffmpeg_path())
+        .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-f", "lavfi", "-i", &graph])
+        .args(["-frames:v", "1", "-f", "null", "-"])
+        .stdin(Stdio::null())
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+/// Does `drawtext` itself draw this case (it refuses some faces at some sizes)?
+fn reference_draws(c: &Case) -> bool {
+    let (w, h) = c.canvas;
+    let graph = format!(
+        "testsrc2=s={w}x{h}:d=1:r=1,format=yuv420p,{}[o]",
+        kerf_core::text_still_filter(&c.plan_text(), h as u32)
+    );
+    Command::new(kerf_core::ffmpeg_path())
+        .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-filter_complex", &graph])
+        .args(["-map", "[o]", "-frames:v", "1", "-f", "null", "-"])
+        .stdin(Stdio::null())
+        .output()
+        .is_ok_and(|o| o.status.success())
+}
+
+#[test]
+#[ignore = "needs ffmpeg"]
+fn checker_d_every_installed_font_file_taken_apart_exactly_or_refused() {
+    // Whatever a user can name: kerning in GPOS, mark positioning, joining forms, ligatures, swashes, colour
+    // glyphs. A text is `drawtext`'s to the sample or it is refused; a refusal is not a failure.
+    let strings: [(&str, String, f64, bool); 5] = [
+        ("latin", "Hamburgefonstiv, Ay Te Wa fi ffi fl -> 1/2".into(), 15.0, false),
+        ("rtl", "Hello \u{0645}\u{0631}\u{062d}\u{0628}\u{0627} \u{05e9}\u{05dc}\u{05d5}\u{05dd} World".into(), 17.0, false),
+        ("marks", "e\u{301}a\u{308}o\u{302} \u{05e9}\u{05b8}\u{05c1}\u{05dc}\u{05d5}\u{05b9}\u{05dd} Ay".into(), 20.0, false),
+        ("indic", "\u{0915}\u{094d}\u{0937} \u{0928}\u{092e}\u{0938}\u{094d}\u{0924}\u{0947} \u{0e2a}\u{0e27}\u{0e31}\u{0e2a}\u{0e14}\u{0e35}".into(), 18.0, false),
+        ("border", "Hamburgefonstiv fi ffi Ay Te".into(), 22.0, true),
+    ];
+    let faces: Vec<PathBuf> = every_font_file().into_iter().filter(|f| drawtext_opens(f, 16.0)).collect();
+    eprintln!("{} font files drawtext opens", faces.len());
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let total = std::sync::Mutex::new(Ledger::default());
+    std::thread::scope(|s| {
+        for _ in 0..3 {
+            s.spawn(|| {
+                let mut l = Ledger::default();
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let Some(face) = faces.get(i) else { break };
+                    for (kind, text, px, bold) in &strings {
+                        let mut c = Case::new(format!("{} {kind} {px}px", face_name(face)), text, *px).font(face);
+                        if *bold {
+                            c = c.bold();
+                        }
+                        // FFmpeg's own errors (a strike of bitmaps at this size, a symbol face with no space glyph):
+                        // nothing to compare with.
+                        if !reference_draws(&c) {
+                            continue;
+                        }
+                        l.run(&c);
+                    }
+                }
+                total.lock().unwrap().merge(l);
+            });
+        }
+    });
+    total.into_inner().unwrap().finish("every font file");
+}
+
+#[test]
+#[ignore = "needs ffmpeg"]
+fn checker_d_the_colour_model_the_build_has_is_drawtexts_for_thousands_of_colours() {
+    // The compositor probes whether `ff_draw_color` is float or fixed point and converts every colour by that
+    // model. Boxes of 3000 colours (corners, grays, a pseudo-random walk) are drawn by `drawtext` on a black
+    // canvas in each tag; the planes must be the model's conversion of the colour, exactly.
+    let Some(build) = text::build() else {
+        panic!(
+            "{}: the compositor knows neither this build's layout nor its colours",
+            kerf_core::ffmpeg_path()
+        );
+    };
+    eprintln!("{}: {:?}", kerf_core::ffmpeg_path(), build);
+    let mut colours: Vec<[u8; 3]> = Vec::new();
+    for r in [0u8, 255] {
+        for g in [0u8, 255] {
+            for b in [0u8, 255] {
+                colours.push([r, g, b]);
+            }
+        }
+    }
+    for v in (0..=255u8).step_by(5) {
+        colours.push([v, v, v]);
+    }
+    let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+    while colours.len() < 3000 {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        colours.push([seed as u8, (seed >> 8) as u8, (seed >> 16) as u8]);
+    }
+    const TILE: usize = 64;
+    const COLS: usize = 20;
+    const PER_GRAPH: usize = 300;
+    let mut wrong: Vec<String> = Vec::new();
+    for tag in [Tag::None, Tag::Bt709, Tag::Bt2020] {
+        for chunk in colours.chunks(PER_GRAPH) {
+            let rows = chunk.len().div_ceil(COLS);
+            let (w, h) = (COLS * TILE, rows * TILE);
+            let sample = PlanText {
+                id: uuid::Uuid::nil(),
+                text: "x".into(),
+                size: 16.0 / h as f64,
+                pos: (0.0, 0.0),
+                alpha: 1.0,
+                color: "white".into(),
+                bg: None,
+                font_file: kerf_core::fonts::default_font_file(false),
+                synthetic_bold: false,
+            };
+            let draws: Vec<String> = chunk
+                .iter()
+                .enumerate()
+                .map(|(i, c)| {
+                    let (x, y) = ((i % COLS) * TILE + 12, (i / COLS) * TILE + 12);
+                    kerf_core::text_piece_filter(
+                        &sample,
+                        h as u32,
+                        &kerf_core::TextPiece {
+                            text: "x",
+                            lines: false,
+                            font: "white@0",
+                            border: None,
+                            boxed: Some((&format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2]), 8)),
+                        },
+                        &[&format!("x={x}"), &format!("y={y}")],
+                    )
+                })
+                .collect();
+            let graph = format!(
+                "color=c=black:s={w}x{h}:r=1:d=1,format=yuv420p{},{}[o]",
+                tag.filter(),
+                draws.join(",")
+            );
+            let raw = ffmpeg(&[
+                "-filter_complex",
+                &graph,
+                "-map",
+                "[o]",
+                "-frames:v",
+                "1",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuv420p",
+                "-",
+            ]);
+            let (ys, cs) = (w * h, w * h / 4);
+            assert_eq!(raw.len(), ys + 2 * cs);
+            for (i, c) in chunk.iter().enumerate() {
+                let (px, py) = ((i % COLS) * TILE + 14, (i / COLS) * TILE + 14);
+                let got = [
+                    raw[py * w + px],
+                    raw[ys + (py / 2) * (w / 2) + px / 2],
+                    raw[ys + cs + (py / 2) * (w / 2) + px / 2],
+                ];
+                let Some(want) = text::draw_color_with(build.colour, *c, tag.matrix()) else {
+                    wrong.push(format!("{tag:?}: no conversion modelled for {c:?}"));
+                    continue;
+                };
+                if got != want {
+                    wrong.push(format!(
+                        "{tag:?} {c:?}: drawtext made {got:?}, the model {:?} makes {want:?}",
+                        build.colour
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} of {} conversions differ:\n{}",
+        wrong.len(),
+        colours.len() * 3,
+        wrong[..wrong.len().min(20)].join("\n")
+    );
+}
+
+#[test]
+fn checker_d_the_fixed_point_colour_conversion_is_libavutils_for_every_one_of_the_16_million_colours() {
+    // FNV-1a over (Y, U, V) of every (r, g, b) in r, g, b order, from libavutil's own `RGB_TO_Y_CCIR` /
+    // `RGB_TO_U_CCIR` / `RGB_TO_V_CCIR` (n4.4.2 and n6.1.1 `libavutil/colorspace.h`, identical), compiled
+    // with `gcc -O2 -I <ffmpeg>` and a loop over all colours: 0x1a05042583ea00b3.
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for r in 0..=255u8 {
+        for g in 0..=255u8 {
+            for b in 0..=255u8 {
+                for c in text::draw_color_ccir([r, g, b]) {
+                    h ^= u64::from(c);
+                    h = h.wrapping_mul(0x0000_0100_0000_01b3);
+                }
+            }
+        }
+    }
+    assert_eq!(h, 0x1a05_0425_83ea_00b3, "the fixed-point conversion is not libavutil's");
+}
+
+#[test]
+#[ignore = "needs ffmpeg"]
+fn checker_d_oversized_text_blank_text_and_every_kind_of_space() {
+    let mut l = Ledger::default();
+    // Glyphs larger than the picture, at the corners and past them: the clip window and the dictionary's cell.
+    for px in [150.0, 200.0, 360.0, 480.0, 720.0] {
+        for text in ["Ag", "WAVE"] {
+            for (x, y) in [(0.5, 0.5), (0.1, 0.9), (0.9, 0.1), (1.2, 0.5)] {
+                for (bold, bg) in [(false, None), (true, Some("black@0.5"))] {
+                    let mut c = Case::new(format!("{text} {px}px at ({x}, {y}) {bold} {}", bg.is_some()), text, px).at(x, y);
+                    if bold {
+                        c = c.bold();
+                    }
+                    if let Some(bg) = bg {
+                        c = c.boxed(bg);
+                    }
+                    l.run(&c);
+                }
+            }
+        }
+    }
+    // Spaces `char::is_whitespace` knows and a font may or may not have a glyph for (drawn as its .notdef box).
+    let spaces = [
+        '\u{00a0}', '\u{1680}', '\u{2000}', '\u{2002}', '\u{2003}', '\u{2007}', '\u{2009}', '\u{200a}', '\u{202f}', '\u{205f}',
+        '\u{3000}', '\u{200b}', '\u{2060}', '\u{feff}', '\u{00ad}', '\u{180e}', '\u{0085}', '\u{000b}', '\u{000c}',
+    ];
+    for c in spaces {
+        for px in [8.0, 18.0, 40.0] {
+            l.run(&Case::new(
+                format!("space U+{:04X} {px}px", c as u32),
+                format!("A{c}B Ay{c}{c}Te"),
+                px,
+            ));
+            l.run(
+                &Case::new(format!("space U+{:04X} {px}px boxed bold", c as u32), format!("{c}A{c}"), px)
+                    .boxed("black@0.5")
+                    .bold(),
+            );
+        }
+    }
+    // Text that is only blanks, with and without the box behind it.
+    for text in [" ", "   ", "\u{a0}", "\u{3000}", "\u{200b}", "\r\n", "\u{2028}"] {
+        for bg in [None, Some("black@0.5")] {
+            for px in [9.0, 24.0] {
+                let mut c = Case::new(format!("blank {:?} {px}px {}", text, bg.is_some()), text, px);
+                if let Some(bg) = bg {
+                    c = c.boxed(bg);
+                }
+                l.run(&c);
+            }
+        }
+    }
+    // Control characters `drawtext` is never given, and line breaks it is given as blanks.
+    for text in [
+        "x\u{7}y\u{1b}z Ay",
+        "line one\nline two\r\nthree\rfour",
+        "a\u{2028}b\u{2029}c",
+        "\u{0}Nul\u{0}Te",
+    ] {
+        for px in [10.0, 22.0] {
+            l.run(&Case::new(format!("control {text:?} {px}px"), text, px));
+        }
+    }
+    l.finish("oversized, blank, spaces");
 }

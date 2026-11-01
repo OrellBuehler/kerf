@@ -53,35 +53,62 @@ fn ffmpeg(args: &[&str]) -> Vec<u8> {
     out.stdout
 }
 
+/// A lossless 640x360 30 fps H.264 file of the test pattern, `vf` after it (a tag, a range), under `name`.
+fn media(name: &str, vf: &str, extra: &[&str]) -> Asset {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-d-media");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(name);
+    let lavfi = format!("testsrc2=size=640x360:rate=30:duration=4,{vf}");
+    let mut args = vec![
+        "-f",
+        "lavfi",
+        "-i",
+        lavfi.as_str(),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-qp",
+        "0",
+        "-g",
+        "10",
+    ];
+    args.extend_from_slice(extra);
+    args.extend(["-pix_fmt", "yuv420p", path.to_str().unwrap()]);
+    ffmpeg(&args);
+    Project::probe_asset(&path).expect("probe")
+}
+
 fn source() -> &'static Asset {
     static A: OnceLock<Asset> = OnceLock::new();
     A.get_or_init(|| {
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-d-media");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("testsrc.mp4");
-        ffmpeg(&[
-            "-f",
-            "lavfi",
-            "-i",
-            "testsrc2=size=640x360:rate=30:duration=4,setparams=colorspace=unknown:color_primaries=unknown:color_trc=unknown",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "ultrafast",
-            "-qp",
-            "0",
-            "-g",
-            "10",
-            "-pix_fmt",
-            "yuv420p",
-            path.to_str().unwrap(),
-        ]);
-        Project::probe_asset(&path).expect("probe")
+        media(
+            "testsrc.mp4",
+            "setparams=colorspace=unknown:color_primaries=unknown:color_trc=unknown",
+            &[],
+        )
     })
 }
 
-fn timeline() -> Timeline {
-    let a = source();
+/// The pattern flagged full range (`pc`) in the stream: FFmpeg's `drawtext` then draws in full range.
+fn source_full_range() -> &'static Asset {
+    static A: OnceLock<Asset> = OnceLock::new();
+    A.get_or_init(|| media("fullrange.mp4", "setparams=range=pc", &["-color_range", "pc"]))
+}
+
+/// The pattern tagged BT.709, which a negotiating FFmpeg (9) composites in.
+fn source_709() -> &'static Asset {
+    static A: OnceLock<Asset> = OnceLock::new();
+    A.get_or_init(|| {
+        media(
+            "bt709.mp4",
+            "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709:range=tv",
+            &["-colorspace", "bt709", "-color_primaries", "bt709", "-color_trc", "bt709"],
+        )
+    })
+}
+
+fn timeline_of(a: &Asset) -> Timeline {
     Timeline {
         tracks: vec![Track {
             clips: vec![Clip::new(a.id, 0.0, 2.0, 0.0)],
@@ -152,8 +179,7 @@ fn planes_of(f: &YuvFrame) -> [&[u8]; 3] {
 }
 
 /// `(drawn, refused, differing samples, worst)` over the frames `looked` of the export of `tl`.
-fn frames(case: &str, tl: &Timeline, looked: &[u64]) -> (usize, usize, usize, i32) {
-    let assets = std::slice::from_ref(source());
+fn frames(case: &str, tl: &Timeline, assets: &[Asset], looked: &[u64]) -> (usize, usize, usize, i32) {
     let slug: String = case
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
@@ -219,6 +245,7 @@ struct Spec {
     bold: bool,
     font: Option<String>,
     pos: (f64, f64),
+    color: Option<String>,
 }
 
 /// A family installed here with no bold face (a bold request in it is `drawtext` thickened with a border).
@@ -236,21 +263,29 @@ fn spec(name: impl Into<String>, text: impl Into<String>, px: f64) -> Spec {
         bold: false,
         font: None,
         pos: (0.37, 0.6),
+        color: None,
     }
 }
 
 /// Run every spec; a drawn frame that differs is a failure; returns the report of the wrong ones.
 fn judge(specs: Vec<Spec>) -> Vec<String> {
+    judge_over(source(), specs)
+}
+
+fn judge_over(asset: &Asset, specs: Vec<Spec>) -> Vec<String> {
     let looked = [12u64, 20, 30, 45];
     let mut wrong = Vec::new();
     for s in specs {
-        let mut tl = timeline();
+        let mut tl = timeline_of(asset);
         let mut o = kerf_core::TextOverlay::new(&s.text, 0.2, 1.8);
         (o.size, o.pos_x, o.pos_y) = (s.px / 360.0, s.pos.0, s.pos.1);
         o.bold = s.bold;
         o.font = s.font.clone();
+        if let Some(c) = &s.color {
+            o.color = c.clone();
+        }
         tl.overlays.push(o);
-        let (drawn, _, differing, worst) = frames(&format!("checker/d/{}", s.name), &tl, &looked);
+        let (drawn, _, differing, worst) = frames(&format!("checker/d/{}", s.name), &tl, std::slice::from_ref(asset), &looked);
         if drawn > 0 && differing > 0 {
             wrong.push(format!(
                 "{}: {differing} samples differ from the export's in drawn frames, worst {worst}",
@@ -292,6 +327,66 @@ fn checker_d_ordinary_text_of_every_size_in_an_export_frame() {
             let mut s = spec(format!("bold-in-{family} {px}px"), "Hello, World. Ay Te Wa fi ffi", px);
             (s.bold, s.font) = (true, Some(family.clone()));
             specs.push(s);
+        }
+    }
+    let wrong = judge(specs);
+    assert!(
+        wrong.is_empty(),
+        "drawn frames that are not the export's:\n{}",
+        wrong.join("\n")
+    );
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_d_text_over_a_full_range_picture_and_a_709_tagged_one() {
+    // `drawtext` converts a text colour in the range and matrix of the picture it draws on (9.0 reads them off
+    // its link). Whatever the plan draws over such a picture must be the export's, or be refused.
+    let mut wrong = Vec::new();
+    for (name, asset) in [("full range", source_full_range()), ("bt709", source_709())] {
+        let mut specs = Vec::new();
+        for px in [5.0, 11.0, 14.0, 24.0, 60.0] {
+            let mut s = spec(format!("{name} {px}px"), "Hello, World. Ay Te Wa fi ffi", px);
+            s.color = Some("#ffcc00@0.7".into());
+            specs.push(s);
+        }
+        if let Some(family) = regular_only_family() {
+            let mut s = spec(format!("{name} border"), "Bold, thickened: fi ffi Ay", 20.0);
+            (s.bold, s.font) = (true, Some(family));
+            specs.push(s);
+        }
+        wrong.extend(judge_over(asset, specs));
+    }
+    assert!(
+        wrong.is_empty(),
+        "drawn frames that are not the export's:\n{}",
+        wrong.join("\n")
+    );
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_d_scripts_marks_and_keyframes_in_an_export_frame() {
+    // Right-to-left joins, marks that GPOS positions, a box, a fade and a slide: each drawn frame is the export's.
+    let mut specs = Vec::new();
+    for family in ["DejaVu Sans", "DejaVu Serif", "Ubuntu"] {
+        for (kind, text) in [
+            (
+                "arabic",
+                "\u{0645}\u{0631}\u{062d}\u{0628}\u{0627} \u{0628}\u{0627}\u{0644}\u{0639}\u{0627}\u{0644}\u{0645}",
+            ),
+            (
+                "hebrew",
+                "\u{05e9}\u{05b8}\u{05c1}\u{05dc}\u{05d5}\u{05b9}\u{05dd} \u{05e2}\u{05d5}\u{05dc}\u{05dd}",
+            ),
+            ("marks", "e\u{301}a\u{308}o\u{302} Ay Te Wa"),
+            ("mixed", "Hello \u{0645}\u{0631}\u{062d}\u{0628}\u{0627} World 123"),
+        ] {
+            for px in [11.0, 17.0, 28.0] {
+                let mut s = spec(format!("{family} {kind} {px}px"), text, px);
+                s.font = Some(family.to_string());
+                specs.push(s);
+            }
         }
     }
     let wrong = judge(specs);
