@@ -535,7 +535,9 @@ fn a_border_on_an_rgb_picture_is_blended_per_sample_in_all_three_channels() {
             "rgb24",
             "-",
         ]);
-        (0..3).map(|c| raw.chunks_exact(3).map(|p| p[c]).collect()).collect()
+        (0..3)
+            .map(|c| raw.as_chunks::<3>().0.iter().map(|p| p[c]).collect())
+            .collect()
     };
     let [r, g, b] = &mut base[..] else { unreachable!() };
     let mut pic = Planes {

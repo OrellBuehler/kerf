@@ -2590,9 +2590,12 @@ impl Compositor {
                     Step::Vignette => self.vignette_planes(&mut enc, &current, *count),
                 };
             }
-            // (Where the zoom comes last the planes are shifted here, ahead of the zoom's scale; else
-            // the blend reads them one in from the layer's last column and row.)
-            if look.mask_edge && look.zoom_last {
+            // (Where the zoom comes last, or the layer is turned, the planes are shifted here, ahead of the zoom's scale
+            // or the turn: `geq` runs on the picture before either, so the row and column it replaces land on whatever
+            // edge of the turned box the turn gives them. Else the blend reads them one in from the layer's last
+            // column and row.)
+            let shifted_here = look.mask_edge && (look.zoom_last || geom.rotation.is_some());
+            if shifted_here {
                 current = self.edge_planes(&mut enc, &current);
             }
             // The mask is the alpha plane (`geq` rewrites it); nothing else gives the layer one but the
@@ -2668,7 +2671,7 @@ impl Compositor {
                 rotate,
                 tail: 0,
                 has_alpha: u32::from(alpha.is_some()),
-                edge: u32::from(look.mask_edge && !look.zoom_last),
+                edge: u32::from(look.mask_edge && !shifted_here),
                 fade_in: fades.fade_in,
                 fade_out: fades.fade_out,
                 black: fades.black,

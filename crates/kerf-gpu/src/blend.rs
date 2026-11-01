@@ -557,20 +557,111 @@ fn placed_graph(mode: BlendMode, tag: Option<&str>, (x, y): (i32, i32)) -> Optio
     ))
 }
 
+/// What a child of the probe is a probe of.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Probes {
+    /// A mode of the colour chain.
+    Mode(BlendMode),
+    /// The clip placed by the export's own `overlay` (which holds for every mode).
+    Placement,
+    /// An RGB picture through the whole chain (its `format=yuva420p` is the conversion the decode makes of it).
+    RgbPicture,
+}
+
+/// What a child's output must come back as.
+enum Want {
+    Planes(Planes),
+    /// The model's blend of the planes the decode makes of the RGB clip (the probe's one more child, [`decode_rgb`]), laid at `place` over `base` in
+    /// BT.601 (an RGB picture is refused in any other stack).
+    Decoded {
+        mode: BlendMode,
+        base: Planes,
+        place: (i32, i32),
+    },
+}
+
 /// One child of the probe: a graph, the pictures it reads, and the picture it must come back as.
 struct Job {
     /// The matrix (an index of [`MATRICES`]) it is a probe of.
     matrix: usize,
-    /// A mode of the colour chain, or `None` for a placement (which holds for every mode).
-    mode: Option<BlendMode>,
+    probes: Probes,
     graph: String,
     inputs: Vec<(&'static str, &'static str, (usize, usize))>,
-    want: Planes,
+    want: Want,
 }
+
+/// What the probe made of its children's answers.
+struct Verdict {
+    found: Found,
+    /// Some child did not answer (it timed out, failed to run, or came back in no shape of a picture): what it probes is **not measured**, so it
+    /// is out of `found`, and the probe is not kept (it is retried after a backoff, and until then nothing is drawn).
+    unanswered: bool,
+}
+
+impl Verdict {
+    /// What the process keeps: a probe every child of which answered. One with an unanswered child is not kept (a transient timeout must not
+    /// switch a mode off for the process's life, nor a half-measured answer on), and until the retry [`found`] draws nothing.
+    fn kept(self) -> Option<Found> {
+        (!self.unanswered).then_some(self.found)
+    }
+}
+
+/// What the children's `outputs` (`None`: no answer) say about this FFmpeg, job by job. A child that came back as another picture than the
+/// model's, **and one that did not come back**, take what they probe out: only a measured match keeps a mode (Unknown never draws). `decoded` is the
+/// decode's frame of the RGB clip.
+fn judge(jobs: &[Job], outputs: &[Option<Vec<u8>>], decoded: Option<&[u8]>) -> Verdict {
+    let (w, h) = PROBE;
+    let clip = decoded.and_then(|d| Planes::from_frame(d, CLIP.0, CLIP.1));
+    let mut kinds = [BlendKinds::ALL; 3];
+    let mut rgb = true;
+    let mut unanswered = false;
+    for (job, out) in jobs.iter().zip(outputs) {
+        let want = match &job.want {
+            Want::Planes(p) => Some(std::borrow::Cow::Borrowed(p)),
+            Want::Decoded { mode, base, place } => clip.as_ref().map(|clip| {
+                // (An RGB picture has no alpha: `format=yuva420p` gives it a full one.)
+                let (laid, plane_alpha) = lay(base, clip, &[255; CLIP.0 * CLIP.1], place.0, place.1);
+                std::borrow::Cow::Owned(reference(*mode, YuvMatrix::Bt601, base, &laid, &plane_alpha))
+            }),
+        };
+        let got = out.as_deref().and_then(|o| Planes::from_frame(o, w, h));
+        let matched = match (want, got) {
+            (Some(want), Some(got)) => *want == got,
+            _ => {
+                unanswered = true;
+                false
+            }
+        };
+        if !matched {
+            match job.probes {
+                Probes::Mode(mode) => kinds[job.matrix] = kinds[job.matrix].without(BlendKinds::of(mode)),
+                Probes::Placement => kinds[job.matrix] = BlendKinds::NONE,
+                Probes::RgbPicture => rgb = false,
+            }
+        }
+    }
+    let mut extras = BlendExtras::NONE;
+    if kinds[2] == BlendKinds::ALL {
+        extras = extras.union(BlendExtras::BT2020);
+    }
+    // (Only on a build whose chain matched in the matrices an RGB picture is drawn in: an RGB picture's conversion rides on the same chain.)
+    if rgb && kinds[0] == BlendKinds::ALL && kinds[1] == BlendKinds::ALL {
+        extras = extras.union(BlendExtras::RGB_PICTURE);
+    }
+    Verdict {
+        found: Found {
+            kinds: [kinds[0], kinds[1]],
+            extras,
+        },
+        unanswered,
+    }
+}
+
+/// The RGB clip the probe lays, noise, and the place it lays it at: inside the frame, so that nothing but the conversion is in question.
+const RGB_PLACE: (i32, i32) = PLACES[5];
 
 fn measure() -> Option<Found> {
     let dir = ProbeDir::new().ok()?;
-    let (w, h) = PROBE;
     let (base, laid, alpha) = probe_pictures();
     let mut noise = Noise(0x1234_5678_9abc_def1);
     let clip = Planes {
@@ -581,11 +672,13 @@ fn measure() -> Option<Found> {
         v: noise.bytes(CLIP.0 * CLIP.1 / 4),
     };
     let clip_alpha = probe_alpha(&mut noise, CLIP.0 * CLIP.1);
+    let rgb_clip = Noise(0x0bad_cafe_dead_beef).bytes(CLIP.0 * CLIP.1 * 3);
     let files = [
         ("laid.yuv", laid.to_frame()),
         ("alpha.gray", alpha.clone()),
         ("base.yuv", base.to_frame()),
         ("clip.yuva", [clip.to_frame(), clip_alpha.clone()].concat()),
+        ("clip.rgb", rgb_clip),
     ];
     for (name, data) in &files {
         std::fs::write(dir.0.join(name), data).ok()?;
@@ -596,14 +689,14 @@ fn measure() -> Option<Found> {
             let Some(graph) = graph(mode, *tag) else { continue };
             jobs.push(Job {
                 matrix: mi,
-                mode: Some(mode),
+                probes: Probes::Mode(mode),
                 graph,
                 inputs: vec![
                     ("laid.yuv", "yuv420p", PROBE),
                     ("alpha.gray", "gray", PROBE),
                     ("base.yuv", "yuv420p", PROBE),
                 ],
-                want: reference(mode, *matrix, &base, &laid, &alpha),
+                want: Want::Planes(reference(mode, *matrix, &base, &laid, &alpha)),
             });
         }
         // The clip placed by the export's own `overlay` (a frame with an alpha plane laid on one that has none, and its alpha laid on a
@@ -617,19 +710,48 @@ fn measure() -> Option<Found> {
             let (laid, plane_alpha) = lay(&base, &clip, &clip_alpha, place.0, place.1);
             jobs.push(Job {
                 matrix: mi,
-                mode: None,
+                probes: Probes::Placement,
                 graph,
                 inputs: vec![("base.yuv", "yuv420p", PROBE), ("clip.yuva", "yuva420p", CLIP)],
-                want: reference(mode, *matrix, &base, &laid, &plane_alpha),
+                want: Want::Planes(reference(mode, *matrix, &base, &laid, &plane_alpha)),
             });
         }
     }
-    let share = jobs.len();
-    let outputs: Vec<Option<Vec<u8>>> = std::thread::scope(|scope| {
+    // An RGB picture through the whole chain, as the export has it (`format=yuva420p` is the chain's own first step): the compositor draws the
+    // planes the decode makes of such a picture, so the chain must come back as the model's blend of those.
+    let mode = BlendMode::Multiply;
+    jobs.push(Job {
+        matrix: 0,
+        probes: Probes::RgbPicture,
+        graph: placed_graph(mode, None, RGB_PLACE)?,
+        inputs: vec![("base.yuv", "yuv420p", PROBE), ("clip.rgb", "rgb24", CLIP)],
+        want: Want::Decoded {
+            mode,
+            base,
+            place: RGB_PLACE,
+        },
+    });
+    let deadline = Instant::now() + PROBE_TIMEOUT;
+    let (outputs, decoded) = run_jobs(&jobs, &dir.0, deadline);
+    let verdict = judge(&jobs, &outputs, decoded.as_deref());
+    if verdict.unanswered {
+        tracing::warn!(
+            found = ?verdict.found,
+            "a child of FFmpeg's blend probe did not answer; what it probes is not drawn, and the probe is retried"
+        );
+    }
+    verdict.kept()
+}
+
+/// Run the probe's children side by side, all of them bounded by `deadline`: each job's output, and the decode's frame of the RGB clip
+/// (`scale=out_range=tv` then 4:2:0, what `source::decode_args` makes of it).
+fn run_jobs(jobs: &[Job], dir: &std::path::Path, deadline: Instant) -> (Vec<Option<Vec<u8>>>, Option<Vec<u8>>) {
+    let (w, h) = PROBE;
+    let share = jobs.len() + 1;
+    std::thread::scope(|scope| {
         let runs: Vec<_> = jobs
             .iter()
             .map(|job| {
-                let dir = &dir.0;
                 scope.spawn(move || {
                     let mut args: Vec<String> = ["-hide_banner", "-loglevel", "error", "-nostdin"].map(String::from).to_vec();
                     for (name, pix, (iw, ih)) in &job.inputs {
@@ -652,7 +774,7 @@ fn measure() -> Option<Found> {
                         .map(String::from),
                     );
                     kerf_core::limit_frame_args(&mut args, share);
-                    if job.mode.is_none() {
+                    if matches!(job.probes, Probes::Placement | Probes::RgbPicture) {
                         // FFmpeg 4.4's `overlay` slices a clip above the frame's top edge wrongly when it runs on several threads
                         // (its alpha plane loses rows), as an export's graph does: the placement is probed with them.
                         for flag in ["-filter_threads", "-filter_complex_threads"] {
@@ -664,90 +786,81 @@ fn measure() -> Option<Found> {
                     }
                     let mut cmd = kerf_core::ffmpeg_command();
                     cmd.args(&args);
-                    crate::source::run_child(cmd, w * h * 3 / 2 + 1, PROBE_TIMEOUT).ok()
+                    run_bounded(cmd, w * h * 3 / 2 + 1, deadline)
                 })
             })
             .collect();
-        runs.into_iter().map(|run| run.join().ok().flatten()).collect()
-    });
-    let mut kinds = [BlendKinds::ALL; 3];
-    let mut unknown = false;
-    for (job, out) in jobs.iter().zip(&outputs) {
-        let Some(got) = out.as_deref().and_then(|o| Planes::from_frame(o, w, h)) else {
-            unknown = true;
-            continue;
-        };
-        if got != job.want {
-            kinds[job.matrix] = match job.mode {
-                Some(mode) => kinds[job.matrix].without(BlendKinds::of(mode)),
-                None => BlendKinds::NONE,
-            };
-        }
-    }
-    // RGB pictures: the graph's conversion against the decode's.
-    let rgb = measure_rgb(&dir.0);
-    let mut extras = BlendExtras::NONE;
-    if kinds[2] == BlendKinds::ALL {
-        extras = extras.union(BlendExtras::BT2020);
-    }
-    match rgb {
-        // (Only on a build whose chain matched: FFmpeg 4.4's blended RGB picture is Y 3 / UV 11 off the decode's even though its conversion
-        // of noise is the decode's, a difference this probe does not see, and its chain does not match anyway.)
-        Some(true) => {
-            if kinds[0] == BlendKinds::ALL && kinds[1] == BlendKinds::ALL {
-                extras = extras.union(BlendExtras::RGB_PICTURE);
-            }
-        }
-        Some(false) => {}
-        None => unknown = true,
-    }
-    // A difference is conclusive wherever the rest stands; a child that did not answer is not.
-    let conclusive = kinds.iter().any(|k| *k != BlendKinds::ALL) || rgb == Some(false);
-    (!unknown || conclusive).then_some(Found {
-        kinds: [kinds[0], kinds[1]],
-        extras,
+        let decode = scope.spawn(move || decode_rgb(dir, share, deadline));
+        (
+            runs.into_iter().map(|run| run.join().ok().flatten()).collect(),
+            decode.join().ok().flatten(),
+        )
     })
 }
 
-/// Whether this FFmpeg's `format=yuva420p` of an RGB picture (what a blended clip's chain does) is the conversion the decode makes of it
-/// (`scale=out_range=tv`, then 4:2:0: `source::decode_args`), on noise: the same planes on FFmpeg 6.1 and 9.0, a few levels apart on 4.4.
-/// `None` when a child did not answer.
-fn measure_rgb(dir: &std::path::Path) -> Option<bool> {
-    let (w, h) = PROBE;
-    let rgb = Noise(0x0bad_cafe_dead_beef).bytes(w * h * 3);
-    let path = dir.join("rgb.raw");
-    std::fs::write(&path, rgb).ok()?;
-    let run = |filter: &str, pix_fmt: &str, len: usize| {
-        let mut args: Vec<String> = ["-hide_banner", "-loglevel", "error", "-nostdin"].map(String::from).to_vec();
-        args.extend(["-f", "rawvideo", "-pix_fmt", "rgb24", "-s", &format!("{w}x{h}"), "-i"].map(String::from));
-        args.push(path.to_string_lossy().into_owned());
-        args.extend(
-            [
-                "-vf",
-                filter,
-                "-frames:v",
-                "1",
-                "-f",
-                "rawvideo",
-                "-pix_fmt",
-                pix_fmt,
-                "pipe:1",
-            ]
-            .map(String::from),
-        );
-        kerf_core::limit_frame_args(&mut args, 2);
-        let mut cmd = kerf_core::ffmpeg_command();
-        cmd.args(&args);
-        crate::source::run_child(cmd, len + 1, PROBE_TIMEOUT).ok()
+/// The decode's frame of the probe's RGB clip: `scale=out_range=tv` (the filter `source::decode_args` runs) into 4:2:0.
+fn decode_rgb(dir: &std::path::Path, share: usize, deadline: Instant) -> Option<Vec<u8>> {
+    let (cw, ch) = CLIP;
+    let mut args: Vec<String> = ["-hide_banner", "-loglevel", "error", "-nostdin"].map(String::from).to_vec();
+    args.extend(["-f", "rawvideo", "-pix_fmt", "rgb24", "-s", &format!("{cw}x{ch}"), "-i"].map(String::from));
+    args.push(dir.join("clip.rgb").to_string_lossy().into_owned());
+    args.extend(
+        [
+            "-vf",
+            "scale=out_range=tv",
+            "-frames:v",
+            "1",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "yuv420p",
+            "pipe:1",
+        ]
+        .map(String::from),
+    );
+    kerf_core::limit_frame_args(&mut args, share);
+    let mut cmd = kerf_core::ffmpeg_command();
+    cmd.args(&args);
+    run_bounded(cmd, cw * ch * 3 / 2 + 1, deadline)
+}
+
+/// Run `cmd` and read its stdout (at most `cap` bytes) until it exits or `deadline` passes. `None` when it fails, writes more than `cap` or is
+/// late. A late child is killed and its output is **never joined on**: the reader is a detached thread that ends when the pipe does (a wrapper
+/// script's grandchild may hold the pipe past the kill), so a wedged FFmpeg cannot hold the probe, and the caller waiting on it, past the deadline.
+fn run_bounded(mut cmd: std::process::Command, cap: usize, deadline: Instant) -> Option<Vec<u8>> {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let Some(stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return None;
     };
-    let frame = w * h * 3 / 2;
-    let (decoded, graphed) = std::thread::scope(|scope| {
-        let a = scope.spawn(|| run("scale=out_range=tv", "yuv420p", frame));
-        let b = scope.spawn(|| run("format=yuva420p", "yuva420p", w * h * 5 / 2));
-        (a.join().ok().flatten(), b.join().ok().flatten())
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        // (One byte past the cap says it was exceeded; the pipe is closed with the reader, which ends a child that writes on.)
+        let mut out = Vec::new();
+        let _ = stdout.take(cap as u64 + 1).read_to_end(&mut out);
+        let _ = tx.send(out);
     });
-    let (decoded, graphed) = (decoded?, graphed?);
-    (decoded.len() == frame && graphed.len() == w * h * 5 / 2).then(|| decoded[..] == graphed[..frame])
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(2)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    let out = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())).ok()?;
+    (status.success() && out.len() <= cap).then_some(out)
 }
 
 #[cfg(test)]
@@ -851,5 +964,221 @@ mod tests {
         );
         assert!(g.contains("in_color_matrix=bt709:in_range=tv"), "{g}");
         assert!(graph(BlendMode::Normal, None).is_none());
+    }
+
+    /// A child's answer: the model's picture for `mode`, as the filter writes it.
+    fn answer(mode: BlendMode) -> Vec<u8> {
+        let (base, laid, alpha) = probe_pictures();
+        reference(mode, YuvMatrix::Bt601, &base, &laid, &alpha).to_frame()
+    }
+
+    fn mode_job(matrix: usize, mode: BlendMode) -> Job {
+        let (base, laid, alpha) = probe_pictures();
+        Job {
+            matrix,
+            probes: Probes::Mode(mode),
+            graph: String::new(),
+            inputs: Vec::new(),
+            want: Want::Planes(reference(mode, YuvMatrix::Bt601, &base, &laid, &alpha)),
+        }
+    }
+
+    #[test]
+    fn a_child_that_did_not_answer_takes_its_mode_out_whatever_the_others_say() {
+        use BlendMode::*;
+        let jobs = [
+            mode_job(0, Multiply),
+            mode_job(0, Screen),
+            mode_job(0, Darken),
+            mode_job(0, Lighten),
+            mode_job(1, Multiply),
+        ];
+        let off_by_a_level = off_by_a_level_of(Darken);
+        let outputs = [
+            Some(answer(Multiply)),
+            // Screen: timed out, spawned nothing, or died.
+            None,
+            // Darken: a picture that is not the model's, which is conclusive for Darken alone.
+            Some(off_by_a_level),
+            // Lighten: an answer in no shape of a frame.
+            Some(vec![0; 10]),
+            Some(answer(Multiply)),
+        ];
+        let verdict = judge(&jobs, &outputs, None);
+        assert!(verdict.unanswered);
+        assert_eq!(
+            verdict.found.kinds[0],
+            BlendKinds::ALL
+                .without(BlendKinds::of(Screen))
+                .without(BlendKinds::of(Darken))
+                .without(BlendKinds::of(Lighten)),
+            "an unanswered mode is not drawn because a different one differed"
+        );
+        assert_eq!(verdict.found.kinds[1], BlendKinds::ALL, "the other matrix's answer stands");
+        assert_eq!(verdict.kept(), None, "a probe with a child missing is retried, not kept");
+        // Every child answering right keeps it.
+        let right = [
+            Some(answer(Multiply)),
+            Some(answer(Screen)),
+            Some(answer(Darken)),
+            Some(answer(Lighten)),
+            Some(answer(Multiply)),
+        ];
+        let kept = judge(&jobs, &right, None).kept().expect("every child answered");
+        assert_eq!(kept.kinds, [BlendKinds::ALL; 2]);
+        // One that differs but answered is kept: a measured difference is an answer.
+        let mut wrong = right;
+        wrong[1] = Some(off_by_a_level_of(Screen));
+        let kept = judge(&jobs, &wrong, None).kept().expect("every child answered");
+        assert_eq!(kept.kinds[0], BlendKinds::ALL.without(BlendKinds::of(Screen)));
+    }
+
+    fn off_by_a_level_of(mode: BlendMode) -> Vec<u8> {
+        let mut a = answer(mode);
+        a[3] ^= 1;
+        a
+    }
+
+    #[test]
+    fn a_placement_that_did_not_answer_takes_the_whole_matrix_out() {
+        let (base, laid, alpha) = probe_pictures();
+        let jobs = [
+            mode_job(0, BlendMode::Multiply),
+            Job {
+                matrix: 0,
+                probes: Probes::Placement,
+                graph: String::new(),
+                inputs: Vec::new(),
+                want: Want::Planes(reference(BlendMode::Multiply, YuvMatrix::Bt601, &base, &laid, &alpha)),
+            },
+            mode_job(2, BlendMode::Multiply),
+        ];
+        let outputs = [Some(answer(BlendMode::Multiply)), None, Some(answer(BlendMode::Multiply))];
+        let verdict = judge(&jobs, &outputs, None);
+        assert!(verdict.unanswered);
+        assert_eq!(verdict.found.kinds[0], BlendKinds::NONE);
+        assert!(!verdict.found.extras.contains(BlendExtras::RGB_PICTURE));
+    }
+
+    fn rgb_job(base: &Planes) -> Job {
+        Job {
+            matrix: 0,
+            probes: Probes::RgbPicture,
+            graph: String::new(),
+            inputs: Vec::new(),
+            want: Want::Decoded {
+                mode: BlendMode::Multiply,
+                base: base.clone(),
+                place: RGB_PLACE,
+            },
+        }
+    }
+
+    #[test]
+    fn an_rgb_picture_is_in_the_extras_only_when_the_chain_came_back_as_the_blend_of_the_decodes_planes() {
+        let (base, ..) = probe_pictures();
+        let mut noise = Noise(7);
+        let decoded = Planes {
+            w: CLIP.0,
+            h: CLIP.1,
+            y: noise.bytes(CLIP.0 * CLIP.1),
+            u: noise.bytes(CLIP.0 * CLIP.1 / 4),
+            v: noise.bytes(CLIP.0 * CLIP.1 / 4),
+        };
+        let (laid, plane_alpha) = lay(&base, &decoded, &[255; CLIP.0 * CLIP.1], RGB_PLACE.0, RGB_PLACE.1);
+        let model = reference(BlendMode::Multiply, YuvMatrix::Bt601, &base, &laid, &plane_alpha);
+        let jobs = [rgb_job(&base)];
+        let frame = decoded.to_frame();
+        // The chain's frame is the model's: drawn.
+        let verdict = judge(&jobs, &[Some(model.to_frame())], Some(&frame));
+        assert!(!verdict.unanswered);
+        assert!(verdict.found.extras.contains(BlendExtras::RGB_PICTURE));
+        // A level of chroma off (FFmpeg 4.4's blended RGB picture): measured, and not drawn.
+        let mut off = model.clone();
+        off.u[5] ^= 1;
+        let verdict = judge(&jobs, &[Some(off.to_frame())], Some(&frame));
+        assert!(!verdict.unanswered);
+        assert!(!verdict.found.extras.contains(BlendExtras::RGB_PICTURE));
+        // The chain did not answer, or the decode did not: not measured, not drawn, not kept.
+        for (chain, decode) in [(None, Some(&frame[..])), (Some(model.to_frame()), None)] {
+            let verdict = judge(&jobs, &[chain], decode);
+            assert!(verdict.unanswered);
+            assert!(!verdict.found.extras.contains(BlendExtras::RGB_PICTURE));
+            assert_eq!(verdict.kept(), None);
+        }
+    }
+
+    #[test]
+    fn the_probe_runs_the_exports_chain_on_an_rgb_clip() {
+        let g = placed_graph(BlendMode::Multiply, None, RGB_PLACE).expect("a mode");
+        // The clip arrives as RGB and the chain's own first step converts it.
+        assert!(g.contains("[1:v]format=yuva420p[clip]"), "{g}");
+        assert!(g.contains("blend=c0_mode=multiply"), "{g}");
+    }
+
+    #[test]
+    #[ignore = "needs ffmpeg"]
+    #[allow(clippy::print_stderr)]
+    fn this_ffmpegs_probe_answers_in_time_and_what_it_found() {
+        let started = Instant::now();
+        let found = measure();
+        eprintln!(
+            "blend probe on {}: {found:?} in {:?}",
+            kerf_core::ffmpeg_path(),
+            started.elapsed()
+        );
+        assert!(found.is_some(), "a child of the probe did not answer");
+        assert!(started.elapsed() < PROBE_TIMEOUT + Duration::from_secs(5));
+    }
+
+    #[cfg(unix)]
+    mod bounded {
+        use super::*;
+        use std::process::Command;
+
+        fn sh(script: &str) -> Command {
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", script]);
+            cmd
+        }
+
+        #[test]
+        fn a_child_that_answers_is_read() {
+            let soon = Instant::now() + Duration::from_secs(20);
+            assert_eq!(run_bounded(sh("printf abc"), 16, soon), Some(b"abc".to_vec()));
+            assert_eq!(
+                run_bounded(sh("printf abc; exit 1"), 16, soon),
+                None,
+                "a failure is no answer"
+            );
+            assert_eq!(
+                run_bounded(sh("printf abcdef"), 5, soon),
+                None,
+                "more than the cap is no answer"
+            );
+            assert_eq!(run_bounded(sh("printf abcde"), 5, soon), Some(b"abcde".to_vec()));
+        }
+
+        #[test]
+        fn a_child_that_is_late_is_killed_and_nothing_waits_on_its_pipe() {
+            let started = Instant::now();
+            assert_eq!(run_bounded(sh("sleep 30"), 16, started + Duration::from_millis(200)), None);
+            // A wrapper's grandchild keeps the pipe open past the kill (as a script around ffmpeg would): the reader is not joined.
+            assert_eq!(
+                run_bounded(sh("sleep 3 & wait"), 16, started + Duration::from_millis(200)),
+                None
+            );
+            assert!(
+                started.elapsed() < Duration::from_millis(2500),
+                "the probe waited {:?} on a pipe that a killed child's grandchild held",
+                started.elapsed()
+            );
+        }
+
+        #[test]
+        fn a_child_that_will_not_start_is_no_answer() {
+            let cmd = Command::new("/nonexistent/kerf-gpu-probe-ffmpeg");
+            assert_eq!(run_bounded(cmd, 16, Instant::now() + Duration::from_secs(5)), None);
+        }
     }
 }

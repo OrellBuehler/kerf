@@ -1863,6 +1863,52 @@ fn a_keyed_opacity_is_the_geq_alpha_of_each_frame() {
     );
 }
 
+/// The `geq` that writes a keyed opacity runs on the picture **before** the `rotate`, and on a build whose `geq` reads a plane's last column and
+/// row one in (FFmpeg 6.1) the row and the column it replaces land on whatever edge of the turned box the turn gives them: the bottom row of a
+/// picture turned a quarter lands on the left column, the last column of a half turn on the first. A picture with detail at its edges (the test
+/// pattern, over the bars) turned by every quarter, alone and moved; held to the export to the sample, and a turn that is not a quarter to the
+/// rotated layer's bound. (A clip with a blend mode is `checker_e_a_turned_blended_clip_with_a_keyed_opacity`'s.)
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_keyed_opacity_on_a_turned_layer_is_shifted_before_the_turn() {
+    use kerf_core::{Property, PropertyKey};
+    let m = media();
+    let assets = [m.bars.clone(), m.testsrc.clone()];
+    let turned = |angle: f64, at: (f64, f64)| {
+        let mut c = clip(&m.testsrc, 0.5, 1.5, 0.0);
+        c.set_property_keys(
+            Property::Opacity,
+            vec![PropertyKey::new(0.0, 1.0), PropertyKey::new(1.0, 0.2)],
+        );
+        c.transform.rotation = angle;
+        c.transform.pos_x = at.0;
+        c.transform.pos_y = at.1;
+        timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None)
+    };
+    for angle in [90.0, 180.0, 270.0, -90.0, 450.0] {
+        for at in [(0.0, 0.0), (0.2, 0.1)] {
+            run(
+                &format!("keyed opacity/turned {angle} at {at:?}"),
+                &turned(angle, at),
+                &assets,
+                30.0,
+                1.0,
+                EXACT,
+            );
+        }
+    }
+    for angle in [12.0, -30.0, 100.0] {
+        run_rotated(
+            &format!("keyed opacity/rotated {angle} over detail"),
+            &turned(angle, (0.0, 0.0)),
+            &assets,
+            30.0,
+            1.0,
+            ROTATED,
+        );
+    }
+}
+
 // ---- a keyed colour: `eq eval=frame` builds its tables again for every frame ------------------------------------
 //
 // A keyed colour number is a quoted expression of the frame's time in the clip's `eq`, which FFmpeg evaluates

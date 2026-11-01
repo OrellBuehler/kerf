@@ -414,7 +414,9 @@
   and draws it like a static one) and for a curve that never leaves 1 (no `geq`). That `geq` is the mask's too, so the opacity a
   mask, a chroma key or a moving zoom is judged by is the layer's `keyed_alpha < 255` as well as the sampled opacity (`mask_refusal`,
   `zoom_order_refusal`), and **a chroma key under a keyed opacity is refused for the clip** (`Effects`, every frame of it: `geq` reads the
-  key's alpha plane, one in at the edge on 6.1). **With `keyed_zoom` the plan still refuses a rotation, an opacity below 1 and a dip to white in front of a moving
+  key's alpha plane, one in at the edge on 6.1). **A keyed opacity on a turned layer is not refused**: that `geq` runs ahead of the `rotate`, so on 6.1 the
+  row and column it replaces land on the turned box's other edges, and the compositor shifts the picture's planes before the turn (`gpu.md`), exact at every quarter on both builds
+  (a plain layer's chroma was up to 128 off on 6.1.1 before; the plan had let it through). **With `keyed_zoom` the plan still refuses a rotation, an opacity below 1 and a dip to white in front of a moving
   zoom** (`ZoomBehind(layer, what)`, Still and Motion alike: the rotated alpha plane and the RGB round trip would have to be scaled
   with the zoom), and without it a Still refuses a grade, rotation, opacity, mask or effect in front of one. The old API stays: `gpu_supported()` / `unsupported_reasons()` (an owned
   `Vec<String>`) / `unsupported_reasons_at(size)` / `gpu_supported_at(size)` are
