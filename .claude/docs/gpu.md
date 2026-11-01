@@ -512,49 +512,96 @@ What the parity harness forced, all recorded in `kerf-gpu`'s docs and shaders:
   `LayerGeometry` (`scaled` = the folded box, `keep` = the centred window a Cover clip keeps), the TS port and corpus
   following, and a parity case per shape on both FFmpegs.
 
-**Text: FFmpeg rasterises, the compositor blends** (`text.rs`, `shaders/text.wgsl`, `GpuCaps::text`).
+**Text: FFmpeg rasterises, the compositor blends** (`text.rs`, `text/seq.rs`, `shaders/text.wgsl`, `GpuCaps::text`).
 
 *Design.* `drawtext` is layout (shaping, kerning, hinting, the quarter-pixel phase of each glyph bitmap) and a blend; only
-the blend is arithmetic a shader can copy, so the layout is never redone. For each distinct overlay state `rasterize` runs
-**one `ffmpeg`** (`kerf_core::text_raster_graph`, `limit_frame_args`, killed at `RASTER_TIMEOUT` 5 s) that draws the overlay's own
-`drawtext` (the still's options and `x=(w*px-text_w/2)` expressions) **at the render size and the sampled position**, since a glyph
-is rendered at the quarter-pixel phase of a fractional position. It draws white on black in `rgb24` (255 over 0 at coverage `m` is
-exactly `m`; a gray or YUV canvas writes 235 on 6.1), once for the glyphs and once, fontcolor `@0`, for the box, and reads the red
-planes. A mask is trimmed and cached in `TextAtlas` (key: graph text, font file length + mtime, `ffmpeg` path; 256 states /
-48 MiB, LRU; a state wanted by several frames runs once; a failure is not remembered; textures are made by the first frame that
-draws one). A drag's frame (`render_draft_texture_with`, the app's draft frames) is drawn exactly as any other, but a title state the
-atlas does not hold is a pose of the drag (a new one per pointer move, never drawn again): it is made into a second atlas of 4 states /
-16 MiB (`TextAtlas::get_drafted`, `peek`), so a drag never pushes the cut's own titles out. `prepare_text` blocks on that process for a first-seen state, so the caller must hold no lock the UI needs while it renders
-(the app's frame holds neither the project lock nor its render lock then, `app.md`). The pass is `drawutils.c`'s integer arithmetic (the same in 6.1.1 and 9.0.2), in u32:
+the blend is arithmetic a shader can copy, so the layout is never redone. **`drawtext` blends each glyph's bitmap in turn**
+(a synthetic-bold border's first, then the fills), and a sample, or a 2x2 chroma block (each bitmap's own `sum >> 2` is blended), that
+two bitmaps touch is two blends there: one mask of their sum is the same only while no two meet, which is never along the
+letter gaps of a border (33 levels of chroma) nor in 3 to 11 px text (10), and a level or two at a few samples at 12 px and up
+(measured with the sum on 9.0.2: 1 to 5 samples at 12 to 19 px, 1 to 2 in a missing glyph's box). So `text::raster(t, size)` recovers the
+**sequence of bitmaps** from FFmpeg itself (`text/seq.rs`), and the compositor blends them in order:
+(1) `measure` (cached per build, font file, size, text; a run that failed is not tried again for 30 s): the pen of every glyph unit and the box — *Shaped* (HarfBuzz: 6.1.1 and 9.0.2 measured): the debug log of
+one multi-line `drawtext` with a prefix of the text per line (`Line: k -- glyphs count: g - width64: w - offset_right64: r`: a unit starts where
+`g` grows, a ligature (Geist shapes `fi`, `ff`, `->`) is a unit of several characters, and its pen is `w - r`, 26.6 exactly). The lines are told apart by what they say and not by whose they are
+(6.1.1 prints `[drawtext @ …]` whatever the instance is called, 9.0.2 `[drawtext@name @ …]`): the log is cut at each `Line: 0` and the group of exactly `n` lines numbered `0..n` is the instance's (the box probe logs
+a group of its own), none or two that differ is a refusal. *Legacy* (4.4.2, whole pixels): the width of the one-row box of every prefix less that of the character alone, **one run** (a script file when the graph is long, `kerf_core::spill_long_graph`);
+both read the text's box drawn at `y=ascent` for `text_w`, `text_h`, `ascent`.
+(2) `dictionary` (cached per glyph unit): each unit drawn alone, fill and border, at the four quarter-pixel phases (4 frames of `x=X0+mod(n,4)/4`,
+`y_align=baseline`, `y` = the phase) and where its bitmap lands against the pen and the baseline. **A shaped `drawtext` clips every bitmap to the text's box grown
+by `bb`** (a pixel more than the border, the box padding with a box), and a unit's bitmap overhangs its advance (the hook of an `f`): the dictionary is drawn
+in an invisible box with a wide margin or the hook would be cut in it and not in the middle of a text (found with DejaVu Serif 11 px, 1 sample).
+(3) placement: `x64 = (int)((w*px - text_w/2) * 64)` (the graph's own expression, evaluated in doubles), a glyph's quarter-pixel phase is `((x64+pen64) >> 4) & 3`, the baseline
+is `(int)(y*64 + offset_top64)` where `offset_top64` is the tallest glyph's top in 26.6, which only its pixel (`ascent`) is told: the (at most five) quarter-pixel
+phases it can be are tried, likeliest first, each against (4).
+(4) **proof**: the sequence blended in turn onto black must equal, sample for sample, the white-on-black picture FFmpeg drew for the same overlay at the same place
+(`text_raster_graph`'s `Glyphs` part, border visible), else the text is refused (`GpuError::Unsupported`). Nothing of the layout is trusted — a ligature the shaper forms
+differently in context, a tab, a glyph that touches the edge of its dictionary cell, a font whose bitmaps do not reproduce, all end here.
+`Layers::of` flattens the sequence for the shader: per luma sample the coverage of each bitmap that touches it, in order (RGBA, four layers a pass), per chroma block each
+bitmap's own `sum >> 2`, in order; `text.wgsl` blends the layers one after the other (a bitmap's zero is `((K - 0) * d + 0) >> 24 = d`, no change), so a sample costs what it
+has bitmaps on it. The first sight of a state costs a few `ffmpeg` runs (measure, dictionary, the picture): 130 to 330 ms at 960 px in a debug build on lavapipe for a caption of a few dozen glyphs, and 1 to 2 s on 4.4.2 for 120 to 150 *distinct*
+glyphs (the measure is an instance of `drawtext` per row, each opens the font: 0.5 to 1.2 s of it); the measure and the
+dictionary are shared by every position of the same text, so a title sliding in costs one run a frame as before. A run is waited for 5 s and 25 ms an instance of `drawtext` it holds (20 s at most): one that does not finish is a refusal. `text::model()` probes which layout the build has (the debug log of
+a two-letter `drawtext`: `width64` is Shaped, `text_w` Legacy; neither is `None`, retried after 30 s) **and how it converts the text's colour** (`text::build()`: `Build { layout, colour }`);
+`prepare(plan)` asks it ahead of a frame with text, `Compositor::caps` only reads the answer (`text::measured_build`) and has `caps.text` only for a build it knows, so on any other every text frame is FFmpeg's.
+*Colour:* 6.1.1 and 9.0.2 convert in floating point (`draw_color`, the matrix' coefficients); **4.4.2 in libavutil's fixed-point `RGB_TO_Y_CCIR` macros** (10 bits, BT.601 whatever the tag; `draw_color_ccir`), a level off in Y for some colours
+(Aqua, Cyan, Ivory, LemonChiffon, Lime, MediumPurple, SkyBlue of the 140 names; 12 of the 83 the checker draws; lime at 0.5 opacity). The probe draws boxes in 14 colours the two give different planes for and compares each plane with what
+each model predicts for the blend of the box over the canvas; a build that matches neither has no text drawn on it. (`Raster::colour` carries the model to `blends`, which refuses the fixed-point one for a matrix other than BT.601.)
+The blend is `drawutils.c`'s integer arithmetic (the same in 4.4.2, 6.1.1 and 9.0.2), in u32:
 `((K - a) * d + a * s) >> 24` (`K = 0x1010101`), `a` = coverage x `(0x10307 * alpha + 3) >> 8` for luma and the 2x2 coverage sum
-`>> 2` for 4:2:0 chroma (a block sticking out of the mask counts only what is in it), `0x10203 * alpha + 2` for the box (half per
+`>> 2` for 4:2:0 chroma (a block sticking out of the bitmap counts only what is in it), `0x10203 * alpha + 2` for the box (half per
 missing row or column at an odd edge); `s` is `ff_draw_color` in the composite's matrix (`PlanCanvas.matrix`: 9.0's `drawtext` reads it
 off its link, 6.1's uses BT.601, which `FixedBt601` already says; limited range, `+ 0.5`, truncated) and the colour's alpha is
 `(a * 256·opacity) / 255`. Colours are parsed as `av_parse_color` does (`parse_color`: 140 names, `#` / `0x` hex with alpha, `@alpha`
 truncated), not asked of FFmpeg. Passes ping-pong between two canvases that agree outside the region the overlays can touch
-(box, then glyphs, one scissored pass each). **A frame with no layer is drawn in RGB** (FFmpeg never makes the black base YUV), so
+(box, then glyph layers, one scissored pass each). The mask (`Raster::boxed`) is still one rectangle FFmpeg draws once per state
+(`rasterize`, killed at `RASTER_TIMEOUT` 5 s, `limit_frame_args`); a mask is cached in `TextAtlas` (key: graph text, font file length + mtime, `ffmpeg` path; 256 states /
+48 MiB, LRU, each state charged its bitmaps, its dense layers and, again, the textures made from them, the charge kept per slot and given back as it was; a state wanted by several frames runs once; the atlas
+drops a failure, so `text::raster` keeps a *refusal* (anything `Unsupported`: a proof that did not match, a face FFmpeg could not open, a timeout) for 30 s under the atlas key, asked before the first `ffmpeg` of the rasterisation, so a scrub over Arial Narrow, a script face or RTL text spawns nothing per frame (`tests/text_refusal_memory.rs`: a wrapper darkens the first run's picture so the proof refuses, then counts the runs of three more asks: none) — an animated position is a new key per frame, and the measure and dictionary behind it are remembered by text and size alone; textures are made by the first frame that
+draws one). A drag's frame (`render_draft_texture_with`, the app's draft frames) is drawn exactly as any other, but a title state the
+atlas does not hold is a pose of the drag (a new one per pointer move, never drawn again): it is made into a second atlas of 4 states /
+16 MiB (`TextAtlas::get_drafted`, `peek`), so a drag never pushes the cut's own titles out. `prepare_text` blocks on those processes for a first-seen state, so the caller must hold no lock the UI needs while it renders
+(the app's frame holds neither the project lock nor its render lock then, `app.md`). **A frame with no layer is drawn in RGB** (FFmpeg never makes the black base YUV), so
 the same shader blends on the RGB picture and `composite_yuv` refuses such a plan rather than return planes without its text.
 
-*Verification.* `tests/text.rs` holds the scalar reference (`blend_coverage` / `blend_rect`) to `drawtext`'s own `yuv420p` planes
-**sample for sample** on both FFmpegs (plain, boxed, odd offsets, edges, corners, wholly outside, opacity 0 to 0.99, hex / named /
-translucent colours, BT.709 and BT.2020, escapes, Cyrillic, missing glyphs); `the_text_pass_is_the_reference_blend_plane_by_plane`
-holds the shader to the reference on the compositor's own planes (0 differing samples, 9 frames, 4 overlays); the `text/` parity
-cases hold the whole picture to the still, each against the same picture without the text: no allowance, but two glyph-edge
-pixels of the lower third at 0.1 s (+1, YUV -> RGB error near the gamut edge over saturated green), 12 px text (+2) and
-full-range pictures on 9.0 (+2, a known model difference: text drawn in full range, converted last), each with its reason at the case.
+*Verification.* `tests/text.rs` holds the sequence blended by the scalar reference (`blend_coverage` / `blend_rect`) to `drawtext`'s own `yuv420p` planes
+**sample for sample, 0 differing and no allowance, on all three FFmpegs** (4.4.2 Legacy, 6.1.1 and 9.0.2 Shaped): plain, boxed, odd offsets, edges, corners, wholly outside, opacity 0 to 0.99, hex / named /
+translucent colours, BT.709 and BT.2020, escapes, Cyrillic, missing glyphs (their outline boxes were 1 to 2 samples off as a sum), every size 3 to 24 px, a synthetic-bold border at 10 to 100 px (sentences, tight pairs, ligatures, translucent, boxed,
+at the edges, at eight quarter-pixel phases) and four installed faces (DejaVu Sans / Serif, Ubuntu, Ubuntu Mono; plain and bold at 11 to 40 px) — each asserting the
+sequence was recovered (`Raster::exact`). `text_checker.rs` and `motion_text_checker.rs` are an independent check of the same (20 and 4 tests, plus `text_timeout.rs`: tabs, long texts, shapers that do not give a glyph a character, 22 named faces and a sweep of every installed font file, colours, sizes, canvases,
+positions, first sight): every case exact or refused, none drawn as a sum. `the_text_pass_is_the_reference_blend_plane_by_plane` holds the shader to the reference on the compositor's own planes
+(0 differing samples, 9 frames, 6 overlays, among them a border and 9 px print); `motion_parity` holds the export's own planes to the compositor's for small print and a
+thickened bold over a fade, sliding and fading (0 differing samples in 8 cases of 60 frames); the `text/` parity cases hold the whole picture to the still, each against
+the same picture without the text, as before.
 
-*Refusals* (the plan, `Unsupported::Text*`). A **font under 12 px** (`MIN_TEXT_PX`): `drawtext` blends each glyph bitmap in turn
-and the mask is all of them, so a pixel two glyphs share is one blend here and two there. Ordinary text is exact (Latin kerned
-pairs 0 samples, a missing glyph's box 1 to 2 samples by a level), but 3 to 11 px text is all shared pixels (up to 7 levels of
-chroma). A **bold request in a font with no bold face** (`TextBorder`): `drawtext` thickens it with a same-colour border whose
-bitmaps overlap along every letter gap (33 levels of chroma there); the shipped default has a real bold, so neither a title nor a
-caption in it is ever refused for it. A rasterisation that fails (or a colour FFmpeg cannot read) is `GpuError::Unsupported` for the
-frame. **Colour fonts**: `drawtext` loads glyphs without `FT_LOAD_COLOR` and has no BGRA path — a CBDT font (Noto Color Emoji) is a hard
+*Refusals.* **Nothing is drawn that is not proven**: the one mask of the sum, which `raster` once blended where the sequence could not be recovered for a large plain text, was up to 30 levels off exactly there
+(a tab, over 160 characters, a canvas too wide to measure, a glyph that does not shape one to a unit, Arabic and Hebrew, faces whose bitmaps overhang) and is gone; `text::rasterize` still makes it, for a test to measure, and `sum_fallbacks()` is 0.
+The plan refuses what it can tell (`Unsupported::TextSequence`, kind `text_sequence`: `kerf_core::text_sequence_limit` — a tab, over `MAX_SEQUENCE_CHARS` (160) characters, a text too wide for `MAX_MEASURE_SIDE`) and, without `caps.text`
+(a build whose layout or colour conversion the probe does not know, or has not run on), refuses every text (`Unsupported::Text`); a border (`TextBorder`) and print under 12 px (`TextTooSmall`) are no longer refusals of any kind.
+The render refuses the rest (`GpuError::Unsupported`: FFmpeg draws the frame): `seq::sequence` must reproduce the picture exactly; a run that fails, times out or writes too much; a face whose bitmaps touch the edge of the dictionary's cell
+(a script's swashes reach an em left of the pen and half an em above the ascent: the cell is 1 em left, 1.8 above, 1 below). Measured with the checker's 22 faces: Windows script and display faces are refused at many sizes
+(Segoe Script, Forte, Brush Script, Gabriola, Lucida Handwriting), and **Arial Narrow's Latin text on the shaped builds**, whose proof fails from the first glyph that follows a kerned space (A, T, f): suspected to be a GPOS placement (`x_offset`) that the debug log does not carry
+(pens are `width64 - advance`, the offset moves the bitmap and not the pen). Right-to-left text is refused on all three builds (4.4.2 reorders the whole string with fribidi; the shaped builds join and reorder). **Colour fonts**: `drawtext` loads glyphs without `FT_LOAD_COLOR` and has no BGRA path — a CBDT font (Noto Color Emoji) is a hard
 error on 6.1.1 (a segfault) and 9.0.2 at every size, so there is no colour glyph to draw as a silhouette; a COLR font is drawn by
-`drawtext` itself as monochrome outlines and the mask is exactly that (sbix and COLR were not available to test). Known costs, not fixed:
+`drawtext` itself as monochrome outlines and the bitmaps are exactly that (sbix and COLR were not available to test). Known costs, not fixed:
 the atlas key holds the sampled position at full precision, so a **keyframed slide-in rasterises per frame** (quantising it risks
-exactness); a Windows profile path with non-ASCII characters reaches `fontfile` through FreeType's narrow open (not run on Windows).
-Over a full-range picture on 9.0 (text drawn in full range, converted last) the picture is within 2 levels of the control: drawn.
+exactness), though its measure and dictionary are shared; a Windows profile path with non-ASCII characters reaches `fontfile` through FreeType's narrow open (not run on Windows). Over a full-range picture on 9.0 (text drawn in full range, converted last) the picture is within 2 levels of the control: drawn.
+**Builds differ**: 4.4.2 lays text out in whole pixels (`s->x`, `s->y` are ints, bitmaps rendered once at the origin, no clip window, `FT_Get_Kerning` of the `kern` table only) and converts colours in fixed point; 6.1.1 and 9.0.2 in 26.6 with HarfBuzz
+(`s->x` a double, a bitmap per quarter pixel, `ascent` and `text_h` ceilings of 26.6 values, the clip window above) and in floating point; 6.1.1 already has the HarfBuzz layout (it was taken for the legacy one until a build was run) and 4.4.2's `drawbox color=red` writes 254 on `rgb24`
+(`colours_parse_as_ffmpeg_reads_them` reads colours through the `color` source for that reason).
+
+**Animated SVG titles (not drawn; what drawing one takes, measured).** ffmpeg never sees an SVG: `svg_layer.rs` draws each title with resvg into a straight-alpha RGBA PNG (`encode_frame_png`)
+and the graph `overlay`s it (`[cur][N:v]overlay=x:y`; an export adds `settb`/`setpts`, `eof_action=pass` and `enable='between(t,start,end)'`). The same resvg draws the same pixels in the compositor's
+process, so nothing of the artwork is a parity question. The rest is `overlay`'s: on a `yuv420p` composite it takes the picture as `yuva420p`, converted by an auto-inserted `scale`, and blends
+with `vf_overlay.c`'s `blend_plane` (identical in 4.4.2 and 9.0.2: `FAST_DIV255(d*(255-a) + s*a)` per sample, `a` the picture's alpha for luma and, for chroma, the 2x2 average
+`(a+a+a+a)>>2` — at the last chroma column or row `(alpha_v + alpha_h)>>1` of what there is). `tests/svg_overlay.rs` holds this to the real `overlay`: **the planes ffmpeg converts the PNG to inside a
+`-filter_complex` graph of the same build, blended with that arithmetic, are the overlay's output with 0 of 9216 samples differing, on 4.4.2 and 9.0.2** (four random pictures with every alpha, at (0,0) and two even offsets) — so a compositor
+needs no model of swscale (RGB to YUV coefficients, the 2:1 vertical chroma filter, the x86 kernels): as text asks ffmpeg for the glyph bitmaps, it asks for the planes of each picture (cached by its digest) and blends. The trap
+the test records: a *simple* graph (`-vf format=yuva420p`) converts differently on 4.4.2 (87 to 1472 of 9216 samples away; the complex graph's auto-inserted scaler is not the simple graph's there), so the conversion must be asked of a `-filter_complex` graph.
+What stands between this and a drawn title is plumbing, not exactness: `RenderPlan.svg` is only ids — the plan has to carry each picture's rectangle, opacity, the document's clock and which picture of the sequence the frame shows (`svg_layer::seq_of`'s
+`Layout`: Held or Frames, `first_picture`, `doc_t0`, Still against Motion windows); the layer path's `compose_exact` has to take an unscaled picture with an external alpha plane (`ComposeParams` is built from a layer's geometry, and an odd
+rectangle is the translucent-odd-layer case it already refuses); and a **title clip** is not an overlay but a clip chain (fit, fades and transitions on an alpha picture, then `overlay` over the lower tracks), which is the `alpha_picture` capability the ledger counts apart. T19's floating presets are
+full-frame, even rectangles (480 of its 690 refused frames); its title clips are the other 210.
 
 **The runtime self-test** (`selftest.rs`, `parity_self_test(&Arc<Gpu>)`). Parity is proven in CI on two FFmpeg
 builds and one software adapter; a user has a third FFmpeg and a real GPU, so the first use of the GPU path
@@ -951,9 +998,9 @@ format unrecorded, a translucent odd layer, a moving zoom behind a rotation, an 
 each of which FFmpeg still renders (and a fade to black or white on a translucent layer, a dip to white on a rotated, letterboxed, odd, resized or non-`yuv420p` layer or beside a black fade, a fade on a full-range picture under FFmpeg 9), **transitions** (`transition/`, `transition-kind/`, `fade/`: every kind and a clip's own fades in a still, see
 above), **a moving zoom last, masks and effects** (`zoom/`, `zoom+mask/`, `mask/`, `effect/`, and `effect-planes/`: the blur, sharpen, tables and vignette plane by plane against the real filters, all sizes), and **text** (the `text/` family: the app's title and
 caption styles, positions and edges, boxes, colours, sizes, keyframed and overlapping overlays, escapes, installed fonts,
-over every kind of picture, with no layer, and the text it must refuse, each held to the same picture without the text; see
+over every kind of picture, with no layer, small print and a thickened bold, and the text it must refuse, each held to the same picture without the text; see
 "Text" above). The table
-holds 822 rows on FFmpeg 6.1.1 (775 on the pinned 9.0.2 the Windows and macOS bundles ship, where the mixed-tag stacks are asserted refused instead of compared; CI runs the harness without `--nocapture`, so it keeps no report); on 6.1.1 152 rows are `text/`, its
+held 822 rows on FFmpeg 6.1.1 before the small-print and synthetic-bold cases (775 on the pinned 9.0.2 the Windows and macOS bundles ship, where the mixed-tag stacks are asserted refused instead of compared; CI runs the harness without `--nocapture`, so it keeps no report); on 6.1.1 152 rows are `text/`, its
 controls included, 191 the transitions, fades and dips and 184 the zoom, mask, effect and chroma key cases, plus the plane-level scaler (75), effect (108) and chroma key alpha (12) runs, all passing strictly. A failing case writes the reference, GPU and diff images to `target/parity/`
 (`KERF_PARITY_KEEP=1` keeps them for passing ones; `KERF_PARITY_EXPLORE=1` prints
 everything and fails nothing); every run writes `target/parity/report.txt`. The tests of a binary run in parallel on one compositor, so a fixture they share is written once and renamed into place (`tests/common`, `write_fixture`: the grades' `.cube` files): `std::fs::write` truncates first, and a plan or an FFmpeg that read the file in that window found it empty ("no LUT_3D_SIZE"), left the LUT out and drew the frame without it (one frame of `grade/keyed position` at Y 11 / UV 8, intermittent in CI, while FFmpeg's export and the GPU were each deterministic).
@@ -1006,8 +1053,8 @@ webcam bubble, a 4K thumbnail), T23a-e one teaser delivered as ProRes, GIF, lanc
 `travel`, `tail`, `keyed_opacity`, `keyed_color`, `keyed_zoom`, `mask`, `text` (drawn under `CAPS`), `no_picture` (the project keeps
 an audio-only asset off a video track), `text_without_font` (the shipped font cannot be written), `unmeasured_policy` (the probe
 cannot tell), and per build `grade` (kernels match) or `grade_with` (kernels differ), and under
-`FixedBt601` `mixed_matrices`, `matrix_unknown`, `rgb_in_stack`, `full_range_cut`, `graded_in_full_range_stack`. `text_border`
-needs an installed family without a bold face.
+`FixedBt601` `mixed_matrices`, `matrix_unknown`, `rgb_in_stack`, `full_range_cut`, `graded_in_full_range_stack`, and `text_sequence` (a tab, over 160 characters or a canvas too wide to measure: no
+archetype has one; text itself is drawn once `text::build()` has probed this FFmpeg's `drawtext`, the header prints the layout, `Compositor::caps_with(kernels, layout)`).
 
 **`tests/fate_corpus.rs`** (`#[ignore]`d, and `KERF_FATE=1`: CI's parity job runs every ignored test and this one needs a network, so
 without the variable it skips with a message; `ffmpeg`, `ffprobe`, `curl`, no adapter) is hostile input from FFmpeg's FATE sample
