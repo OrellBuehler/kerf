@@ -4632,6 +4632,7 @@ fn effects_are_drawn_as_their_filters_draw_them() {
             vec![E::Sharpen { amount: 1.0 }, E::Grayscale, E::Blur { sigma: 2.0 }, E::Invert],
         ),
         ("vignette-chain", vec![E::Invert, E::Vignette, E::Blur { sigma: 2.0 }]),
+        ("sharpen-blur", vec![E::Sharpen { amount: 2.5 }, E::Blur { sigma: 3.0 }]),
     ] {
         for (asset, label) in [(&m.testsrc, "testsrc2"), (&m.bars, "bars")] {
             let mut c = clip(asset, 0.0, 2.0, 0.0);

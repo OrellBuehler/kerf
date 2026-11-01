@@ -1606,6 +1606,31 @@ impl Compositor {
         })
     }
 
+    /// Wait for everything recorded so far to have run, on a software adapter, before a compute pass reads
+    /// what a render pass wrote: Mesa 23.2's lavapipe starts the dispatch while its rasteriser threads are
+    /// still drawing the texture the dispatch reads (wgpu's barrier is there, the driver does not wait for
+    /// it): a blur after a sharpen, the slowest pass in front of it, read half-drawn rows (Y off by up to
+    /// 210, differently on every run, and exact with `LP_NUM_THREADS=0`). The blur is the compositor's one
+    /// compute pass. A hardware adapter honours the barrier and is never stalled here.
+    fn settle(&self, enc: &mut wgpu::CommandEncoder) -> Result<(), GpuError> {
+        if !self.gpu.is_software() {
+            return Ok(());
+        }
+        let next = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("kerf composite"),
+        });
+        let done = std::mem::replace(enc, next);
+        self.gpu.queue.submit(Some(done.finish()));
+        self.gpu
+            .device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(READBACK_TIMEOUT),
+            })
+            .map_err(|e| GpuError::Readback(format!("the GPU did not finish within {} s: {e}", READBACK_TIMEOUT.as_secs())))?;
+        Ok(())
+    }
+
     /// A new 8-bit plane of the size of `like`, to render into.
     fn out_plane(&self, label: &str, like: &Plane) -> Plane {
         self.plane(
@@ -2469,7 +2494,10 @@ impl Compositor {
             for step in &look.steps {
                 current = match step {
                     Step::Table(rows) => self.table_planes(&mut enc, &current, rows),
-                    Step::Blur(g) => self.blur_planes(&mut enc, &current, g),
+                    Step::Blur(g) => {
+                        self.settle(&mut enc)?;
+                        self.blur_planes(&mut enc, &current, g)
+                    }
                     Step::Sharpen(amount) => self.sharpen_planes(&mut enc, &current, *amount),
                     Step::Vignette => self.vignette_planes(&mut enc, &current, *count),
                 };

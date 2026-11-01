@@ -726,7 +726,11 @@ included, and a graded layer in a stack that holds one where the composite's col
 * **Blur** is `gblur` (`blur.wgsl`): the first-order recursive Gaussian in `float` (right, left, down, up; one compute invocation per row and column),
   then `postscale`, clip and `lrintf`, each plane at its own size. It is **not bit-exact and cannot be**: FFmpeg's x86 build runs the horizontal pass
   in AVX2 / AVX-512 with another association of the same sums and an FMA, so its answer depends on the CPU by the last bits of a `float`, which `lrintf`
-  turns into a level where a value sits on a half. Measured on 9.0.2: 0 to 59 samples in 3.2 million a level off, none more.
+  turns into a level where a value sits on a half. Measured on 9.0.2: 0 to 59 samples in 3.2 million a level off, none more. **The blur is the compositor's one compute pass, and on a
+  software adapter it waits for the render passes before it** (`Compositor::settle`: submit, wait): Mesa 23.2's lavapipe starts a dispatch while its rasteriser threads
+  are still drawing the texture it reads, whatever barrier wgpu records, so a blur straight after a sharpen (the slowest pass) blurred half-drawn rows
+  (Y up to 210 off, a different frame on every run: the `effect/sharpen 0.5 then blur on a pip` case, on every lane's baseline; exact with `LP_NUM_THREADS=0`, which is how it was found).
+  A hardware adapter is never stalled.
 * **Vignette** is `vignette` with its defaults (`vignette.wgsl`, `effects.rs`): a factor per luma sample, `cos(angle * d / dmax)^4` in `double` stored
   as `float` (each axis offset truncated to an integer; the angle is `PI/5` **as a `float`**: `av_clipf` clips it, and the `double` angle puts the
   factor a `float` step high on some samples, a level where the sum sits a few millionths over an integer: 7 samples in 3.5 million, found by the

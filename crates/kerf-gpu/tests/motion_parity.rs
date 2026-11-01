@@ -3602,6 +3602,18 @@ fn effects_are_drawn_as_their_filters_draw_them() {
             vec![E::Sharpen { amount: 1.0 }, E::Sharpen { amount: 2.0 }],
             EXACT,
         ),
+        // A blur straight after the sharpen, the slowest pass to draw in front of it: the compute pass that
+        // runs the blur must read the finished sharpen (`Compositor::settle`: lavapipe 23.2 did not wait).
+        (
+            "sharpen 2.5 then blur",
+            vec![E::Sharpen { amount: 2.5 }, E::Blur { sigma: 3.0 }],
+            EFFECT,
+        ),
+        (
+            "sharpen 0.5 then blur",
+            vec![E::Sharpen { amount: 0.5 }, E::Blur { sigma: 3.0 }],
+            EFFECT,
+        ),
         (
             "sharpen, gray, blur, invert",
             vec![E::Sharpen { amount: 1.0 }, E::Grayscale, E::Blur { sigma: 2.0 }, E::Invert],
