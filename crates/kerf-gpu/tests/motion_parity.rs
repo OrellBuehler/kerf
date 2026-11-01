@@ -5562,7 +5562,7 @@ fn checker_e_alpha_extremes_of_a_blended_clip() {
             feather: 0.3,
             inverted: false,
         };
-        go("mask off centre", 0.4, &|c| c.mask = Some(off_centre.clone()));
+        go("mask off centre", 0.4, &|c| c.mask = Some(off_centre));
         // Chroma keys: similarity and blend at 0, middle and 1, three colours.
         for (colour, similarity, blend) in [
             ("green", 0.01, 0.0),
@@ -5991,7 +5991,7 @@ fn checker_e_what_a_blended_clip_carries_before_the_blend() {
                 },
             ),
         ] {
-            go(what, &m.testsrc, &|c| c.color = color.clone(), 0.4);
+            go(what, &m.testsrc, &|c| c.color = color, 0.4);
         }
         for (what, effects) in [
             ("grayscale", vec![E::Grayscale]),
@@ -6489,6 +6489,65 @@ fn ce_tagged(name: &str, tag: &str, pattern: &str) -> Asset {
     probed(&p)
 }
 
+/// The refusals the first pass found wider than they had to be, now lifted (`checker_e_each_refused_blend_is_refused_for_a_reason` holds the ones
+/// that stay): a quarter turn, an RGB picture and a BT.2020 composite. Each must be **drawn**, every frame and to the sample, where the caps
+/// say this FFmpeg draws it (the quarter turn with the blend modes, RGB and BT.2020 with `caps.blend_extras`), and refused on every frame where
+/// they do not.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_the_lifted_blend_refusals_draw_exactly() {
+    use kerf_core::{BlendExtras, BlendMode};
+    let m = media();
+    let v = variants();
+    let caps = compositor().caps();
+    let modes_on = caps.blend == kerf_core::BlendKinds::ALL;
+    let rgb_on = modes_on && caps.blend_extras.contains(BlendExtras::RGB_PICTURE);
+    let bt2020_on = modes_on && caps.blend_extras.contains(BlendExtras::BT2020);
+    eprintln!("checker/e/lifted: modes {modes_on}, RGB pictures {rgb_on}, BT.2020 {bt2020_on}");
+    let rgb_noise = ce_rgb_noise();
+    let mut failures: Vec<String> = Vec::new();
+    for mode in [BlendMode::Multiply, BlendMode::Screen, BlendMode::Difference] {
+        let mut add = |name: &str, bottom: &Asset, top: &Asset, draws: bool, edit: &dyn Fn(&mut Clip)| {
+            let (tl, assets) = ce_stack(bottom, top, &|c| {
+                c.blend_mode = mode;
+                edit(c);
+            });
+            ce_check(
+                &format!("checker/e/lifted {name} {mode:?}"),
+                &tl,
+                &assets,
+                30.0,
+                0.4,
+                false,
+                Some(draws),
+                &mut failures,
+            );
+        };
+        add("rotated 90", &m.bars, &m.smooth, modes_on, &|c| c.transform.rotation = 90.0);
+        add("rotated 90 noise", &m.bars, &m.noise, modes_on, &|c| {
+            c.transform.rotation = 90.0;
+        });
+        add("rotated 180 smooth", &m.bars, &m.smooth, modes_on, &|c| {
+            c.transform.rotation = 180.0;
+        });
+        add("rotated 270 noise", &m.bars, &m.noise, modes_on, &|c| {
+            c.transform.rotation = 270.0;
+        });
+        add("rotated 90 moved", &m.bars, &m.noise, modes_on, &|c| {
+            c.transform.rotation = 90.0;
+            c.transform.pos_x = 0.2;
+        });
+        add("rgb picture", &m.bars, &v.rgb_png, rgb_on, &|_| {});
+        add("rgb noise picture", &m.bars, &rgb_noise, rgb_on, &|_| {});
+        // (The picture is the composite here, a plain layer: only the modes have to be in the caps.)
+        add("rgb picture, bars blended over it", &v.rgb_png, &m.bars, modes_on, &|_| {});
+        let bottom = ce_tagged("bars", "bt2020nc", "smptehdbars");
+        let top = ce_tagged("testsrc", "bt2020nc", "testsrc2");
+        add("bt2020nc footage", &bottom, &top, bt2020_on, &|_| {});
+    }
+    assert!(failures.is_empty(), "{} cases: {failures:#?}", failures.len());
+}
+
 /// Every refusal the blend adds or keeps, drawn anyway (the plan's reasons ignored, so with the compositor's own guards lifted by a scratch
 /// patch): a refusal that is not needed would draw exactly. Without the patch the compositor's guards stand and the case says so. The
 /// cases whose frames are exact when drawn are the refusals wider than they have to be.
@@ -6497,9 +6556,7 @@ fn ce_tagged(name: &str, tag: &str, pattern: &str) -> Asset {
 fn checker_e_each_refused_blend_is_refused_for_a_reason() {
     use kerf_core::BlendMode;
     let m = media();
-    let v = variants();
     let mut cases: Vec<(String, Timeline, Vec<Asset>)> = Vec::new();
-    let rgb_noise = ce_rgb_noise();
     for mode in [BlendMode::Multiply, BlendMode::Screen, BlendMode::Difference] {
         let mut add = |name: &str, bottom: &Asset, top: &Asset, edit: &dyn Fn(&mut Clip)| {
             let (tl, assets) = ce_stack(bottom, top, &|c| {
@@ -6517,23 +6574,27 @@ fn checker_e_each_refused_blend_is_refused_for_a_reason() {
         add("scaled up 1.25", &m.bars, &m.testsrc, &|c| c.transform.scale = 1.25);
         add("scaled smooth", &m.bars, &m.smooth, &|c| c.transform.scale = 0.7);
         add("rotated 12", &m.bars, &m.smooth, &|c| c.transform.rotation = 12.0);
-        add("rotated 90", &m.bars, &m.smooth, &|c| c.transform.rotation = 90.0);
         add("opacity 0.6", &m.bars, &m.testsrc, &|c| c.transform.opacity = 0.6);
         add("opacity 0.97", &m.bars, &m.noise, &|c| c.transform.opacity = 0.97);
         add("opacity 0.6 flat", &m.bars, &m.black, &|c| c.transform.opacity = 0.6);
         add("letterboxed portrait", &m.bars, &m.portrait, &|_| {});
-        add("rgb picture", &m.bars, &v.rgb_png, &|_| {});
-        add("rgb noise picture", &m.bars, &rgb_noise, &|_| {});
-        add("rgb picture, bars below", &v.rgb_png, &m.bars, &|_| {});
-        add("rotated 90 noise", &m.bars, &m.noise, &|c| c.transform.rotation = 90.0);
-        add("rotated 180 smooth", &m.bars, &m.smooth, &|c| c.transform.rotation = 180.0);
-        add("rotated 270 noise", &m.bars, &m.noise, &|c| c.transform.rotation = 270.0);
-        add("rotated 90 moved", &m.bars, &m.noise, &|c| {
-            c.transform.rotation = 90.0;
-            c.transform.pos_x = 0.2;
+        // (A rotation that is not a quarter turn, one a key moves, and a grade, which stay refused; the quarter turns, RGB pictures and BT.2020 are
+        // lifted and held to FFmpeg in `checker_e_the_lifted_blend_refusals_draw_exactly`.)
+        add("rotated 91", &m.bars, &m.noise, &|c| c.transform.rotation = 91.0);
+        add("rotated by a key through 90", &m.bars, &m.noise, &|c| {
+            c.set_property_keys(
+                kerf_core::Property::Rotation,
+                vec![kerf_core::PropertyKey::new(0.0, 0.0), kerf_core::PropertyKey::new(1.0, 90.0)],
+            );
+        });
+        add("graded", &m.bars, &m.testsrc, &|c| {
+            c.grade = grades().remove(0).1;
+        });
+        add("graded noise", &m.bars, &m.noise, &|c| {
+            c.grade = grades().remove(3).1;
         });
     }
-    for tag in ["bt2020nc", "fcc", "smpte240m"] {
+    for tag in ["fcc", "smpte240m"] {
         let bottom = ce_tagged("bars", tag, "smptehdbars");
         let top = ce_tagged("testsrc", tag, "testsrc2");
         for mode in [BlendMode::Multiply, BlendMode::Difference] {
@@ -6583,8 +6644,13 @@ fn checker_e_each_refused_blend_is_refused_for_a_reason() {
     assert!(wider.is_empty(), "refusals wider than they have to be: {wider:?}");
 }
 
+/// A clip edit, to be applied to a blended clip in a case.
+type ClipEdit = Box<dyn Fn(&mut Clip)>;
+
 /// A graded clip under a blend, held beside the same clip plain and with a keyed alpha: the grade's RGB round trip ends in a conversion to
-/// `yuva420p` when the clip needs an alpha plane (a blended clip always does: its bars are transparent), where a plain clip's ends in `yuv420p`.
+/// `yuva420p` when the clip needs an alpha plane (a blended clip always does: its bars are transparent), where a plain clip's ends in `yuv420p`,
+/// and FFmpeg's RGB filters run `yuva420p -> argb -> yuva420p` there, which the grade's model is not. Plain and keyed-alpha clips are drawn exactly;
+/// under a blend every frame is refused by the plan (the cause is named), and none is drawn inexactly.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn checker_e_a_graded_clip_under_a_blend() {
@@ -6593,7 +6659,7 @@ fn checker_e_a_graded_clip_under_a_blend() {
     let mut findings = Vec::new();
     for (gname, grade) in grades() {
         for (sname, asset) in [("testsrc", &m.testsrc), ("noise", &m.noise), ("bars", &m.bars)] {
-            let variants: [(&str, Box<dyn Fn(&mut Clip)>); 4] = [
+            let variants: [(&str, ClipEdit); 4] = [
                 ("plain", Box::new(|_| {})),
                 (
                     "keyed alpha",
@@ -6601,7 +6667,7 @@ fn checker_e_a_graded_clip_under_a_blend() {
                         c.set_property_keys(
                             Property::Opacity,
                             vec![PropertyKey::new(0.0, 1.0), PropertyKey::new(1.0, 0.5)],
-                        )
+                        );
                     }),
                 ),
                 ("multiply", Box::new(|c| c.blend_mode = BlendMode::Multiply)),
@@ -6615,15 +6681,25 @@ fn checker_e_a_graded_clip_under_a_blend() {
                 let case = format!("checker/e/graded {gname} {sname} {vname}");
                 let scan = ce_scan(&case, &tl, &assets, &at_fps(30.0), 0..6, false);
                 eprintln!("{}", scan.line(&case));
-                if vname.contains("multiply") || vname.contains("difference") {
-                    if scan.drawn > 0 && !scan.exact() {
-                        findings.push(case);
+                let blended = vname == "multiply" || vname == "difference";
+                if !scan.exact() {
+                    findings.push(format!("{case}: drawn {} and not exact", scan.drawn));
+                } else if blended {
+                    let named = scan.refused.keys().any(|k| k.contains("a grade under a blend"));
+                    if scan.drawn > 0 || !named {
+                        findings.push(format!(
+                            "{case}: drawn {} frames, refused {:?}",
+                            scan.drawn,
+                            scan.refused.keys()
+                        ));
                     }
+                } else if scan.drawn == 0 {
+                    findings.push(format!("{case}: nothing drawn, refused {:?}", scan.refused.keys()));
                 }
             }
         }
     }
-    assert!(findings.is_empty(), "graded blended clips drawn but not exact: {findings:?}");
+    assert!(findings.is_empty(), "graded clips: {findings:?}");
 }
 
 /// Where a graded blended clip goes wrong: FFmpeg's own plain graded clip (laid by hand in the legal range, as `lutyuv=a=255` does) put through the model
@@ -6975,4 +7051,1058 @@ fn a_blended_clips_fades_run_in_the_chains_order() {
             );
         }
     }
+}
+
+// ==== checker/e, second pass: the fades' order, quarter turns, RGB pictures and BT.2020 =====================================
+
+impl CeScan {
+    /// What a case wanted of its scan, or `None` when it holds. `draws`: `Some(true)` every frame drawn and exact, `Some(false)` none drawn
+    /// (the plan refuses them all), `None` exact wherever drawn.
+    fn verdict(&self, draws: Option<bool>) -> Option<String> {
+        if !self.exact() {
+            return Some(format!(
+                "drawn {} of {}: Y {} differ (max {}), UV {} (max {}), first {:?}, frames {:?}, guards {:?}",
+                self.drawn,
+                self.frames,
+                self.y.differing,
+                self.y.max,
+                self.uv.differing,
+                self.uv.max,
+                self.first,
+                &self.bad_frames[..self.bad_frames.len().min(8)],
+                self.guards
+            ));
+        }
+        match draws {
+            Some(true) if self.drawn != self.frames => Some(format!(
+                "drawn {} of {} frames, refused {:?}",
+                self.drawn,
+                self.frames,
+                self.refused.keys().collect::<Vec<_>>()
+            )),
+            Some(false) if self.drawn != 0 => Some(format!("drawn {} frames of a case that should be refused", self.drawn)),
+            _ => None,
+        }
+    }
+}
+
+/// [`ce_scan`] of a cut, the verdict kept (a case never stops the test) and, where this FFmpeg's blend chain was refused (4.4), the same cut
+/// with the caps forced (`forced_ok`) held to the export too.
+#[allow(clippy::too_many_arguments)]
+fn ce_check(
+    case: &str,
+    tl: &Timeline,
+    assets: &[Asset],
+    fps: f64,
+    secs: f64,
+    forced_ok: bool,
+    draws: Option<bool>,
+    failures: &mut Vec<String>,
+) -> CeScan {
+    let scan = ce_scan(case, tl, assets, &at_fps(fps), upto(secs, fps), false);
+    eprintln!("{}", scan.line(case));
+    if let Some(why) = scan.verdict(draws) {
+        failures.push(format!("{case}: {why}"));
+    }
+    if forced_ok && compositor().caps().blend != kerf_core::BlendKinds::ALL {
+        forced_blends(|| {
+            let name = format!("{case} (forced)");
+            let forced = ce_scan(&name, tl, assets, &at_fps(fps), upto(secs, fps), false);
+            eprintln!("{}", forced.line(&name));
+            if let Some(why) = forced.verdict(None) {
+                failures.push(format!("{name}: {why}"));
+            }
+        });
+    }
+    scan
+}
+
+/// The blended clips of a chain through the fades the chain stacks on one clip: its own fade-in and fade-out (a dip to black adds to them), a
+/// dip to white's halves and a dissolve's ramp. They are alpha fades run one after another, each rounding for itself, so the order is part of the
+/// answer: this holds the compositor to it with up to four running on a frame, 1-frame and half-frame ramps, ramps that begin and end on
+/// a frame, and a feathered mask that gives the alpha plane every level.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_a_blended_clips_fades_stack_in_the_chains_order() {
+    use kerf_core::BlendMode;
+    let m = media();
+    let kinds = [
+        TransitionKind::Crossfade,
+        TransitionKind::DipToBlack,
+        TransitionKind::DipToWhite,
+        TransitionKind::SlideLeft,
+        TransitionKind::PushRight,
+    ];
+    let frame = 1.0 / 30.0;
+    // (fade-in, fade-out, the transition into the clip, the transition out of it), in seconds.
+    let timings: [(f64, f64, f64, f64); 7] = [
+        (0.5, 0.5, 0.8, 0.8),
+        (frame, frame, frame, frame),
+        (frame / 2.0, frame / 2.0, frame / 2.0, frame / 2.0),
+        (2.0 * frame, 2.0 * frame, 2.0 * frame, 2.0 * frame),
+        (10.0 * frame, 10.0 * frame, 10.0 * frame, 10.0 * frame),
+        (1.0, 1.0, 0.5, 0.5),
+        (0.7, 0.7, 0.45, 0.45),
+    ];
+    let modes = [
+        BlendMode::Screen,
+        BlendMode::Multiply,
+        BlendMode::Difference,
+        BlendMode::Overlay,
+        BlendMode::Exclusion,
+    ];
+    let mut failures: Vec<String> = Vec::new();
+    // Three blended clips in a row over the bars: the middle one has a fade at each end and a transition at each end.
+    let cut =
+        |kind_in: TransitionKind, kind_out: TransitionKind, (fi, fo, din, dout): (f64, f64, f64, f64), mask: bool, n: usize| {
+            let mut first = clip(&m.noise, 0.5, 1.0, 0.0);
+            first.blend_mode = modes[n % 5];
+            let mut mid = clip(&m.testsrc, 0.5, 1.5, 0.5);
+            mid.blend_mode = modes[(n + 1) % 5];
+            mid.fade_in = fi;
+            mid.fade_out = fo;
+            mid.transition_in = Some(Transition {
+                kind: kind_in,
+                duration: din,
+            });
+            if mask {
+                mid.mask = Some(mask_of(kerf_core::MaskShape::Ellipse, 1.0, false));
+            }
+            let mut last = clip(&m.edges, 0.5, 1.2, 1.5);
+            last.blend_mode = modes[(n + 2) % 5];
+            last.transition_in = Some(Transition {
+                kind: kind_out,
+                duration: dout,
+            });
+            (
+                timeline(vec![vec![clip(&m.bars, 0.0, 3.0, 0.0)], vec![first, mid, last]], None),
+                vec![m.bars.clone(), m.noise.clone(), m.testsrc.clone(), m.edges.clone()],
+            )
+        };
+    let mut n = 0;
+    for kin in kinds {
+        for kout in kinds {
+            let timing = timings[n % timings.len()];
+            let (tl, assets) = cut(kin, kout, timing, n % 3 == 1, n);
+            let up = matches!(kin, TransitionKind::SlideDown | TransitionKind::PushDown)
+                || matches!(kout, TransitionKind::SlideDown | TransitionKind::PushDown);
+            ce_check(
+                &format!("checker/e/ramps in {kin:?} out {kout:?} {timing:.3?}"),
+                &tl,
+                &assets,
+                30.0,
+                2.2,
+                !up,
+                None,
+                &mut failures,
+            );
+            n += 1;
+        }
+    }
+    // The slides and pushes the first loop leaves out, in and out of the clip, with its fades.
+    for (i, kind) in [
+        TransitionKind::SlideRight,
+        TransitionKind::SlideUp,
+        TransitionKind::SlideDown,
+        TransitionKind::PushLeft,
+        TransitionKind::PushUp,
+        TransitionKind::PushDown,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (other, timing) = if i % 2 == 0 {
+            (TransitionKind::DipToWhite, timings[0])
+        } else {
+            (TransitionKind::Crossfade, timings[6])
+        };
+        let up = matches!(kind, TransitionKind::SlideDown | TransitionKind::PushDown);
+        for (kin, kout) in [(kind, other), (other, kind)] {
+            let (tl, assets) = cut(kin, kout, timing, i % 2 == 1, i + 3);
+            ce_check(
+                &format!("checker/e/ramps in {kin:?} out {kout:?} {timing:.3?}"),
+                &tl,
+                &assets,
+                30.0,
+                2.2,
+                !up,
+                None,
+                &mut failures,
+            );
+        }
+    }
+    // Every timing against a dissolve into the clip and a dip to white out of it, and the other way round, with and without the mask.
+    for (i, timing) in timings.into_iter().enumerate() {
+        for (kin, kout) in [
+            (TransitionKind::Crossfade, TransitionKind::DipToWhite),
+            (TransitionKind::DipToWhite, TransitionKind::Crossfade),
+            (TransitionKind::DipToWhite, TransitionKind::DipToWhite),
+        ] {
+            let (tl, assets) = cut(kin, kout, timing, i % 2 == 0, i + 7);
+            ce_check(
+                &format!("checker/e/ramps {kin:?} / {kout:?} {timing:.3?} masked {}", i % 2 == 0),
+                &tl,
+                &assets,
+                30.0,
+                2.2,
+                true,
+                None,
+                &mut failures,
+            );
+        }
+    }
+    // A clip that starts, and whose fades start and end, on whole frames and between them.
+    for (start, fi, fo) in [
+        (5.0 * frame, 6.0 * frame, 6.0 * frame),
+        (5.4 * frame, 6.5 * frame, 6.5 * frame),
+        (0.0, 1.0, 1.0),
+        (frame, frame, frame),
+    ] {
+        let mut top = clip(&m.testsrc, 0.5, 1.5, start);
+        top.blend_mode = BlendMode::Screen;
+        top.fade_in = fi;
+        top.fade_out = fo;
+        top.mask = Some(mask_of(kerf_core::MaskShape::Rect, 1.0, false));
+        ce_check(
+            &format!("checker/e/fades {fi:.4}/{fo:.4} from {start:.4}"),
+            &timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![top]], None),
+            &[m.bars.clone(), m.testsrc.clone()],
+            30.0,
+            1.9,
+            true,
+            None,
+            &mut failures,
+        );
+    }
+    assert!(failures.is_empty(), "{} cases: {failures:#?}", failures.len());
+}
+
+/// A blended clip can run as many alpha fades as its chain has (five); a plan with more than the compositor's eight is refused at the draw, not
+/// drawn with some of them dropped. (No cut makes more than five: `ClipTiming::fades` is bounded, which the first half checks on the busiest
+/// clip.)
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_more_fades_than_a_blend_runs_are_refused_not_drawn() {
+    use kerf_core::{BlendMode, FadeEdge, FadeStep, FadeTint};
+    let m = media();
+    // The busiest clip a cut can make: both own fades, a dip to white into it and another out of it, and a dissolve on the next.
+    let mut first = clip(&m.noise, 0.5, 1.0, 0.0);
+    first.blend_mode = BlendMode::Screen;
+    let mut mid = clip(&m.testsrc, 0.5, 1.5, 0.5);
+    mid.blend_mode = BlendMode::Screen;
+    mid.fade_in = 0.6;
+    mid.fade_out = 0.6;
+    mid.transition_in = Some(Transition {
+        kind: TransitionKind::DipToWhite,
+        duration: 0.8,
+    });
+    let mut last = clip(&m.edges, 0.5, 1.2, 1.5);
+    last.blend_mode = BlendMode::Screen;
+    last.transition_in = Some(Transition {
+        kind: TransitionKind::DipToWhite,
+        duration: 0.8,
+    });
+    let tl = timeline(vec![vec![clip(&m.bars, 0.0, 3.0, 0.0)], vec![first, mid, last]], None);
+    let assets = [m.bars.clone(), m.noise.clone(), m.testsrc.clone(), m.edges.clone()];
+    let opts = at_fps(30.0);
+    let planner = Planner::new(&tl, &assets, &opts, PlanRequest::motion(policy())).expect("planner");
+    let busiest = (0..90u64)
+        .map(|k| {
+            planner
+                .at_frame(k)
+                .expect("plan")
+                .layers
+                .iter()
+                .map(|l| l.fx.fades.len())
+                .max()
+                .unwrap_or(0)
+        })
+        .max()
+        .unwrap_or(0);
+    eprintln!("checker/e/ramps: the busiest layer of the cut has {busiest} fades");
+    assert!(busiest <= 5, "a clip's chain has at most five fades, the cut made {busiest}");
+    // The same frame with the fades of the blended layer multiplied: up to eight are drawn, nine and more are an error.
+    let k = 20;
+    let size = {
+        let plan = planner.at_frame(k).expect("plan");
+        (plan.canvas.width, plan.canvas.height)
+    };
+    let mut verdicts: Vec<(usize, String)> = Vec::new();
+    let inject = |verdicts: &mut Vec<(usize, String)>| {
+        for total in [1usize, 5, 8, 9, 12, 40] {
+            let mut plan = planner.at_frame(k).expect("plan");
+            let top = plan.layers.len() - 1;
+            let step = FadeStep {
+                edge: FadeEdge::In,
+                tint: FadeTint::Alpha,
+                st: 0.0,
+                d: 1.0,
+            };
+            plan.layers[top].fx.fades = vec![step; total];
+            let mut motion = MotionFrames::new(frame_source());
+            let picture = motion.frames(&plan).expect("frames");
+            let drawn = compositor().composite_yuv_counted(&plan, &picture, motion.counts(), size);
+            verdicts.push((
+                total,
+                match &drawn {
+                    Ok(_) => "drawn".to_string(),
+                    Err(kerf_gpu::GpuError::Unsupported(why)) => format!("refused: {}", why.chars().take(90).collect::<String>()),
+                    Err(other) => format!("ERROR {other}"),
+                },
+            ));
+        }
+    };
+    // (Where the probe refused this FFmpeg's chain the caps are forced, or every draw would be refused for that.)
+    if compositor().caps().blend == kerf_core::BlendKinds::ALL {
+        inject(&mut verdicts);
+    } else {
+        forced_blends(|| inject(&mut verdicts));
+    }
+    eprintln!("checker/e/ramps: fades injected into a blended layer: {verdicts:?}");
+    for (total, verdict) in &verdicts {
+        if *total <= 8 {
+            assert_eq!(verdict, "drawn", "{total} fades");
+        } else {
+            assert!(
+                verdict.starts_with("refused"),
+                "{total} fades are not drawn with some dropped: {verdict}"
+            );
+        }
+    }
+}
+
+/// A clip of `w`x`h` noise (lossless, untagged) and a smooth gradient of the same size, for the cuts of a frame of that shape.
+fn ce_sized(w: u32, h: u32) -> (Asset, Asset) {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-e-turn");
+    std::fs::create_dir_all(&dir).unwrap();
+    let make = |name: &str, lavfi: String| -> Asset {
+        let p = dir.join(format!("{name}-{w}x{h}.mp4"));
+        ffmpeg(&[
+            "-f",
+            "lavfi",
+            "-i",
+            &format!("{lavfi},setparams=colorspace=unknown:color_primaries=unknown:color_trc=unknown"),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-qp",
+            "0",
+            "-g",
+            "10",
+            "-pix_fmt",
+            "yuv420p",
+            p.to_str().unwrap(),
+        ]);
+        probed(&p)
+    };
+    (
+        make(
+            "noise",
+            format!("nullsrc=size={w}x{h}:rate=30:duration=2,format=yuv420p,geq=lum='random(1)*255':cb='random(2)*255':cr='random(3)*255'"),
+        ),
+        make(
+            "smooth",
+            format!("gradients=size={w}x{h}:rate=30:duration=2:c0=0xd03020:c1=0x2040e0:nb_colors=2:seed=5:speed=0.00001,format=yuv420p"),
+        ),
+    )
+}
+
+/// A blended clip turned by a multiple of a quarter turn lands on whole samples (`rotate`'s fast path at 90, 180 and 270 degrees, its general one
+/// at the others), and its box swaps sides, so it hangs over the frame's edges: held to the export on frames of several shapes, moved and off the
+/// frame, with a mask, fades, a dissolve, a key and a keyed opacity; and what is not a quarter turn, or is turned by a key, is refused.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_a_blended_clip_turned_by_quarter_turns() {
+    use kerf_core::{BlendMode, Property, PropertyKey};
+    let m = media();
+    let mut failures: Vec<String> = Vec::new();
+    let angles = [
+        90.0, 180.0, 270.0, -90.0, -180.0, -270.0, 360.0, 450.0, 540.0, 630.0, 720.0, -360.0, -450.0,
+    ];
+    let places = [(0.0, 0.0), (0.2, 0.1), (-0.45, 0.4), (0.0123, 0.0071)];
+    let mut n = 0;
+    for angle in angles {
+        for (px, py) in places {
+            let mut c = clip(&m.noise, 0.5, 1.5, 0.0);
+            c.blend_mode = BLEND_MODES[n % 9];
+            c.transform.rotation = angle;
+            c.transform.pos_x = px;
+            c.transform.pos_y = py;
+            n += 1;
+            // (A turned box hangs over the frame's top edge, where FFmpeg 4.4's overlay drops the alpha rows.)
+            let above = (angle.rem_euclid(180.0) - 90.0).abs() < 1.0 || py < 0.0;
+            ce_check(
+                &format!("checker/e/turned {angle} at {px},{py} {:?}", c.blend_mode),
+                &timeline(vec![vec![clip(&m.smooth, 0.5, 1.5, 0.0)], vec![c]], None),
+                &[m.smooth.clone(), m.noise.clone()],
+                30.0,
+                0.4,
+                !above,
+                None,
+                &mut failures,
+            );
+        }
+    }
+    // Frames of other shapes, taller than wide and wider than tall, small and not a multiple of four: the turned box swaps sides.
+    for (w, h) in [
+        (130, 66),
+        (66, 130),
+        (322, 182),
+        (182, 322),
+        (98, 50),
+        (50, 98),
+        (34, 18),
+        (18, 34),
+        (10, 6),
+        (6, 10),
+        (2, 2),
+        (4, 2),
+    ] {
+        let (noise, smooth) = ce_sized(w, h);
+        for (k, angle) in [90.0, 180.0, 270.0, -90.0, 450.0].into_iter().enumerate() {
+            for (px, py) in [(0.0, 0.0), (0.1, 0.2)] {
+                let mut c = clip(&noise, 0.2, 1.0, 0.0);
+                c.blend_mode = BLEND_MODES[(n + k) % 9];
+                c.transform.rotation = angle;
+                c.transform.pos_x = px;
+                c.transform.pos_y = py;
+                n += 1;
+                ce_check(
+                    &format!("checker/e/{w}x{h} turned {angle} at {px},{py} {:?}", c.blend_mode),
+                    &timeline(vec![vec![clip(&smooth, 0.2, 1.0, 0.0)], vec![c]], None),
+                    &[smooth.clone(), noise.clone()],
+                    30.0,
+                    0.3,
+                    false,
+                    None,
+                    &mut failures,
+                );
+            }
+        }
+    }
+    // A turned clip with an alpha of its own, at the angles the fast path takes and one it does not.
+    for angle in [90.0, 180.0, -90.0, 450.0] {
+        let go = |k: usize, what: &str, edit: &dyn Fn(&mut Clip), secs: f64, failures: &mut Vec<String>| {
+            let mut c = clip(&m.testsrc, 0.5, 1.5, 0.0);
+            c.blend_mode = BLEND_MODES[k % 9];
+            c.transform.rotation = angle;
+            edit(&mut c);
+            ce_check(
+                &format!("checker/e/turned {angle} {what} {:?}", c.blend_mode),
+                &timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None),
+                &[m.bars.clone(), m.testsrc.clone()],
+                30.0,
+                secs,
+                false,
+                None,
+                failures,
+            );
+        };
+        go(
+            n,
+            "with an ellipse mask",
+            &|c| c.mask = Some(mask_of(kerf_core::MaskShape::Ellipse, 0.3, false)),
+            0.4,
+            &mut failures,
+        );
+        n += 1;
+        go(
+            n,
+            "with an inverted rect mask",
+            &|c| c.mask = Some(mask_of(kerf_core::MaskShape::Rect, 1.0, true)),
+            0.4,
+            &mut failures,
+        );
+        n += 1;
+        go(
+            n,
+            "with fades",
+            &|c| {
+                c.fade_in = 0.4;
+                c.fade_out = 0.4;
+            },
+            1.0,
+            &mut failures,
+        );
+        n += 1;
+        go(
+            n,
+            "with fades, a mask and a position",
+            &|c| {
+                c.fade_in = 0.3;
+                c.fade_out = 0.5;
+                c.mask = Some(mask_of(kerf_core::MaskShape::Ellipse, 1.0, false));
+                c.transform.pos_x = -0.3;
+                c.transform.pos_y = 0.3;
+            },
+            1.0,
+            &mut failures,
+        );
+        n += 1;
+        go(
+            n,
+            "with a keyed opacity",
+            &|c| {
+                c.set_property_keys(
+                    Property::Opacity,
+                    vec![PropertyKey::new(0.0, 1.0), PropertyKey::new(1.0, 0.2)],
+                );
+            },
+            1.0,
+            &mut failures,
+        );
+        n += 1;
+        go(
+            n,
+            "with a chroma key",
+            &|c| c.effects = vec![key("green", 0.3, 0.2)],
+            0.4,
+            &mut failures,
+        );
+        n += 1;
+        go(
+            n,
+            "with a mask moved off the frame",
+            &|c| {
+                c.transform.pos_x = 0.4;
+                c.transform.pos_y = -0.4;
+                c.mask = Some(mask_of(kerf_core::MaskShape::Rect, 0.3, false));
+            },
+            0.4,
+            &mut failures,
+        );
+        n += 1;
+    }
+    // Into a dissolve and over a plain clip, and two turned blended clips.
+    for angle in [90.0, 270.0] {
+        let out = clip(&m.bars, 0.5, 1.5, 0.0);
+        let mut inc = clip(&m.testsrc, 0.5, 1.5, 1.0);
+        inc.blend_mode = BlendMode::Screen;
+        inc.transform.rotation = angle;
+        inc.transition_in = Some(Transition {
+            kind: TransitionKind::Crossfade,
+            duration: 0.5,
+        });
+        ce_check(
+            &format!("checker/e/turned {angle} dissolving in"),
+            &timeline(vec![vec![out, inc]], None),
+            &[m.bars.clone(), m.testsrc.clone()],
+            30.0,
+            2.0,
+            false,
+            None,
+            &mut failures,
+        );
+        let mut lower = clip(&m.testsrc, 0.5, 1.5, 0.0);
+        lower.blend_mode = BlendMode::Multiply;
+        lower.transform.rotation = angle;
+        let mut upper = clip(&m.noise, 0.5, 1.5, 0.0);
+        upper.blend_mode = BlendMode::Difference;
+        upper.transform.rotation = 180.0;
+        ce_check(
+            &format!("checker/e/two turned blended clips {angle}/180"),
+            &timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![lower], vec![upper]], None),
+            &[m.bars.clone(), m.testsrc.clone(), m.noise.clone()],
+            30.0,
+            0.4,
+            false,
+            None,
+            &mut failures,
+        );
+    }
+    // A mask on a turned layer is refused by the plan (its `geq` runs on the picture, before the turn), on every frame, at every quarter.
+    for angle in [90.0, 180.0, 270.0, -90.0] {
+        let mut c = clip(&m.testsrc, 0.5, 1.5, 0.0);
+        c.blend_mode = BlendMode::Screen;
+        c.transform.rotation = angle;
+        c.mask = Some(mask_of(kerf_core::MaskShape::Ellipse, 0.3, false));
+        ce_check(
+            &format!("checker/e/turned {angle} with a mask is refused"),
+            &timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None),
+            &[m.bars.clone(), m.testsrc.clone()],
+            30.0,
+            0.4,
+            false,
+            Some(false),
+            &mut failures,
+        );
+    }
+    // Angles a hair off a quarter turn: within `is_quarter_turn`'s tolerance (and the `rotate` fast path's, `FLT_EPSILON` radians) they are drawn
+    // exactly or refused, never drawn wrong.
+    for angle in [
+        90.000_000_01,
+        -90.000_000_01,
+        180.000_000_01,
+        89.999_999_99,
+        450.000_000_01,
+        270.000_000_01,
+    ] {
+        let mut c = clip(&m.noise, 0.5, 1.5, 0.0);
+        c.blend_mode = BLEND_MODES[n % 9];
+        n += 1;
+        c.transform.rotation = angle;
+        ce_check(
+            &format!("checker/e/turned {angle:.9} {:?}", c.blend_mode),
+            &timeline(vec![vec![clip(&m.smooth, 0.5, 1.5, 0.0)], vec![c]], None),
+            &[m.smooth.clone(), m.noise.clone()],
+            30.0,
+            0.4,
+            false,
+            None,
+            &mut failures,
+        );
+    }
+    // What is not a quarter turn is refused, a rotation a key moves is refused (even one that passes through 90), and a quarter turn off by less
+    // than the filter's own tolerance (`FLT_EPSILON` radians) is not.
+    for (what, angle) in [
+        ("91", 91.0),
+        ("89.99", 89.99),
+        ("90.00001", 90.00001),
+        ("45", 45.0),
+        ("0.001", 0.001),
+    ] {
+        let mut c = clip(&m.noise, 0.5, 1.5, 0.0);
+        c.blend_mode = BlendMode::Multiply;
+        c.transform.rotation = angle;
+        ce_check(
+            &format!("checker/e/turned {what}"),
+            &timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None),
+            &[m.bars.clone(), m.noise.clone()],
+            30.0,
+            0.4,
+            false,
+            Some(false),
+            &mut failures,
+        );
+    }
+    for (what, keys) in [
+        ("0 to 90", vec![PropertyKey::new(0.0, 0.0), PropertyKey::new(1.0, 90.0)]),
+        ("90 to 180", vec![PropertyKey::new(0.0, 90.0), PropertyKey::new(1.0, 180.0)]),
+        ("90 held", vec![PropertyKey::new(0.0, 90.0), PropertyKey::new(1.0, 90.0)]),
+    ] {
+        let mut c = clip(&m.noise, 0.5, 1.5, 0.0);
+        c.blend_mode = BlendMode::Multiply;
+        c.set_property_keys(Property::Rotation, keys);
+        ce_check(
+            &format!("checker/e/rotation keyed {what}"),
+            &timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None),
+            &[m.bars.clone(), m.noise.clone()],
+            30.0,
+            0.8,
+            false,
+            None,
+            &mut failures,
+        );
+    }
+    // A source of odd sides (the compositor's scaler resizes it into the frame; any turn of it is refused or exact).
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-e-turn");
+    std::fs::create_dir_all(&dir).unwrap();
+    let odd = dir.join("odd-321x181.mkv");
+    ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        "nullsrc=size=321x181:rate=30:duration=2,format=yuv420p,geq=lum='random(1)*255':cb='random(2)*255':cr='random(3)*255'",
+        "-c:v",
+        "ffv1",
+        "-pix_fmt",
+        "yuv420p",
+        odd.to_str().unwrap(),
+    ]);
+    let odd = probed(&odd);
+    for angle in [90.0, 180.0] {
+        let mut c = clip(&odd, 0.2, 1.0, 0.0);
+        c.blend_mode = BlendMode::Screen;
+        c.transform.rotation = angle;
+        ce_check(
+            &format!("checker/e/odd source turned {angle}"),
+            &timeline(vec![vec![clip(&m.bars, 0.2, 1.0, 0.0)], vec![c]], None),
+            &[m.bars.clone(), odd.clone()],
+            30.0,
+            0.3,
+            false,
+            None,
+            &mut failures,
+        );
+    }
+    assert!(failures.is_empty(), "{} cases: {failures:#?}", failures.len());
+}
+
+/// A 640x360 clip of `source` (an lavfi chain ending in `yuv420p`), lossless and tagged with the matrix, primaries and transfer given.
+fn ce_tagged_src(name: &str, matrix: &str, primaries: &str, trc: &str, source: &str) -> Asset {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-e-tagged");
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join(format!("{name}-{matrix}-{trc}.mp4"));
+    ffmpeg(&[
+        "-f",
+        "lavfi",
+        "-i",
+        &format!("{source},setparams=colorspace={matrix}:color_primaries={primaries}:color_trc={trc}"),
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-qp",
+        "0",
+        "-g",
+        "10",
+        "-colorspace",
+        matrix,
+        "-color_primaries",
+        primaries,
+        "-color_trc",
+        trc,
+        "-pix_fmt",
+        "yuv420p",
+        p.to_str().unwrap(),
+    ]);
+    probed(&p)
+}
+
+/// RGB pictures: still images and videos whose pixel format is RGB, so that the graph's `format=yuva420p` converts them where the compositor
+/// has the decode's conversion. Noise (every triple), saturated and nearly saturated colours, a gradient, 16-bit, gray and a picture with an
+/// alpha plane (which the plan refuses for its own reasons).
+fn ce_rgb_pictures() -> Vec<(&'static str, Asset)> {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-e-rgb");
+    std::fs::create_dir_all(&dir).unwrap();
+    let still = |name: &str, lavfi: &str, pix: &str| -> Asset {
+        let p = dir.join(name);
+        ffmpeg(&[
+            "-f",
+            "lavfi",
+            "-i",
+            lavfi,
+            "-frames:v",
+            "1",
+            "-pix_fmt",
+            pix,
+            p.to_str().unwrap(),
+        ]);
+        probed(&p)
+    };
+    let video = |name: &str, lavfi: &str, pix: &str| -> Asset {
+        let p = dir.join(name);
+        ffmpeg(&[
+            "-f",
+            "lavfi",
+            "-i",
+            lavfi,
+            "-c:v",
+            "ffv1",
+            "-pix_fmt",
+            pix,
+            p.to_str().unwrap(),
+        ]);
+        probed(&p)
+    };
+    let planar = "nullsrc=size=640x360:rate=30:duration=2,format=gbrp";
+    let noise = "geq=r='random(1)*255':g='random(2)*255':b='random(3)*255'";
+    let sat = "geq=r='if(lt(mod(X,24),8),255,if(lt(mod(X,24),16),254,1))':g='if(lt(mod(Y,24),8),255,if(lt(mod(Y,24),16),254,1))':b='if(lt(mod(X+Y,24),12),255,0)'";
+    vec![
+        ("rgb noise png", still("noise.png", &format!("{planar},{noise}"), "rgb24")),
+        (
+            "rgb saturated png",
+            still("saturated.png", &format!("{planar},{sat}"), "rgb24"),
+        ),
+        (
+            "rgb gradient png",
+            still(
+                "gradient.png",
+                &format!("{planar},geq=r='X*255/W':g='Y*255/H':b='(X+Y)*255/(W+H)'"),
+                "rgb24",
+            ),
+        ),
+        (
+            "rgb 16-bit png",
+            still("sixteen.png", &format!("{planar},{noise}"), "rgb48be"),
+        ),
+        (
+            "gray png",
+            still("gray.png", &format!("{planar},{noise},format=gray"), "gray"),
+        ),
+        (
+            "rgba png",
+            still(
+                "alpha.png",
+                &format!("{planar},{noise},format=gbrap,geq=r='r(X,Y)':g='g(X,Y)':b='b(X,Y)':a='mod(X*2,256)'"),
+                "rgba",
+            ),
+        ),
+        ("rgb24 video", video("rgb24.mkv", &format!("{planar},{noise}"), "rgb24")),
+        ("gbrp video", video("gbrp.mkv", &format!("{planar},{sat}"), "gbrp")),
+    ]
+}
+
+/// RGB pictures under a blend: the graph converts them with `format=yuva420p` where the compositor has the decode's `scale=out_range=tv`, and
+/// the probe says whether this FFmpeg's two are the same picture (`caps.blend_extras`). Every picture is held to the export over untagged and
+/// BT.709 footage, under and over, moved, with an alpha of its own and in a dissolve; where the caps say RGB pictures are drawn the plain
+/// ones must be (all frames, exact), where they do not every frame must be refused.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_rgb_pictures_under_a_blend() {
+    use kerf_core::{BlendExtras, BlendMode};
+    let m = media();
+    let v = variants();
+    let on = compositor().caps().blend_extras.contains(BlendExtras::RGB_PICTURE);
+    let drawn_blends = compositor().caps().blend == kerf_core::BlendKinds::ALL;
+    eprintln!("checker/e/rgb: caps say RGB pictures are drawn: {on}");
+    let mut pictures = ce_rgb_pictures();
+    pictures.push(("rgb testsrc png", v.rgb_png.clone()));
+    let mut failures: Vec<String> = Vec::new();
+    for (i, (name, picture)) in pictures.iter().enumerate() {
+        let plain_rgb = matches!(
+            *name,
+            "rgb noise png" | "rgb saturated png" | "rgb gradient png" | "rgb testsrc png" | "rgb24 video"
+        );
+        for (k, mode) in [
+            BlendMode::Multiply,
+            BlendMode::Difference,
+            BlendMode::Screen,
+            BlendMode::Overlay,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut top = clip(picture, 0.0, 1.0, 0.0);
+            top.blend_mode = mode;
+            // The picture over bars (untagged): where the caps say so, drawn.
+            let want = (plain_rgb && drawn_blends).then_some(on);
+            ce_check(
+                &format!("checker/e/rgb {name} over bars {mode:?}"),
+                &timeline(vec![vec![clip(&m.bars, 0.0, 1.0, 0.0)], vec![top.clone()]], None),
+                &[m.bars.clone(), picture.clone()],
+                30.0,
+                0.4,
+                true,
+                if k == 0 { want } else { None },
+                &mut failures,
+            );
+            if k > 1 {
+                continue;
+            }
+            // Over BT.709 footage (the composite is converted in BT.709, the picture's RGB is converted by the graph's own default).
+            ce_check(
+                &format!("checker/e/rgb {name} over bt709 bars {mode:?}"),
+                &timeline(vec![vec![clip(&v.bars709, 0.0, 1.0, 0.0)], vec![top.clone()]], None),
+                &[v.bars709.clone(), picture.clone()],
+                30.0,
+                0.4,
+                true,
+                None,
+                &mut failures,
+            );
+            // Under a blended clip: the RGB picture is the composite.
+            let mut over = clip(&m.testsrc, 0.0, 1.0, 0.0);
+            over.blend_mode = mode;
+            ce_check(
+                &format!("checker/e/rgb testsrc over {name} {mode:?}"),
+                &timeline(vec![vec![clip(picture, 0.0, 1.0, 0.0)], vec![over]], None),
+                &[picture.clone(), m.testsrc.clone()],
+                30.0,
+                0.4,
+                true,
+                None,
+                &mut failures,
+            );
+        }
+        // Its own alpha: a mask and fades, moved, and into a dissolve.
+        let mut top = clip(picture, 0.0, 1.0, 0.0);
+        top.blend_mode = BLEND_MODES[(i * 2 + 1) % 9];
+        top.fade_in = 0.3;
+        top.fade_out = 0.3;
+        top.mask = Some(mask_of(kerf_core::MaskShape::Ellipse, 0.5, false));
+        top.transform.pos_x = 0.15;
+        top.transform.pos_y = 0.1;
+        ce_check(
+            &format!("checker/e/rgb {name} masked, faded and moved"),
+            &timeline(vec![vec![clip(&m.bars, 0.0, 1.0, 0.0)], vec![top]], None),
+            &[m.bars.clone(), picture.clone()],
+            30.0,
+            0.9,
+            true,
+            None,
+            &mut failures,
+        );
+        let mut inc = clip(picture, 0.0, 1.0, 1.0);
+        inc.blend_mode = BLEND_MODES[(i * 2 + 4) % 9];
+        inc.transition_in = Some(Transition {
+            kind: TransitionKind::Crossfade,
+            duration: 0.5,
+        });
+        ce_check(
+            &format!("checker/e/rgb {name} dissolving in"),
+            &timeline(
+                vec![vec![clip(&m.bars, 0.0, 1.0, 0.0), clip(&m.testsrc, 0.5, 1.5, 1.0)], vec![inc]],
+                None,
+            ),
+            &[m.bars.clone(), m.testsrc.clone(), picture.clone()],
+            30.0,
+            1.9,
+            true,
+            None,
+            &mut failures,
+        );
+    }
+    // A stack of two RGB pictures, one blended over the other, over a plain one.
+    let (a, b) = (&pictures[0].1, &pictures[1].1);
+    let mut lower = clip(a, 0.0, 1.0, 0.0);
+    lower.blend_mode = BlendMode::Exclusion;
+    let mut upper = clip(b, 0.0, 1.0, 0.0);
+    upper.blend_mode = BlendMode::HardLight;
+    ce_check(
+        "checker/e/rgb two blended pictures over a picture",
+        &timeline(
+            vec![vec![clip(&pictures[2].1, 0.0, 1.0, 0.0)], vec![lower], vec![upper]],
+            None,
+        ),
+        &[pictures[2].1.clone(), a.clone(), b.clone()],
+        30.0,
+        0.4,
+        true,
+        None,
+        &mut failures,
+    );
+    assert!(failures.is_empty(), "{} cases: {failures:#?}", failures.len());
+}
+
+/// A BT.2020 composite: the chain names `bt2020` and the compositor has the tables; the probe says whether this FFmpeg's chain is the model's with
+/// them (`caps.blend_extras`). Held to the export with noise (blue overflows at other values than in BT.601), saturated colours and smooth pictures,
+/// the `nc` tag (FFmpeg 9 cannot export a `bt2020c` cut at all), SDR and PQ, and 2020 beside untagged and BT.709 footage; where the caps say BT.2020 is drawn a 2020 pair must be.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_a_bt2020_composite_under_a_blend() {
+    use kerf_core::{BlendExtras, BlendMode};
+    let m = media();
+    let v = variants();
+    let on = compositor().caps().blend_extras.contains(BlendExtras::BT2020);
+    let all = compositor().caps().blend == kerf_core::BlendKinds::ALL;
+    eprintln!("checker/e/2020: caps say BT.2020 is drawn: {on}");
+    let tag = |name: &str, matrix: &str, trc: &str, source: &str| {
+        let prim = if trc == "smpte2084" { "bt2020" } else { "bt709" };
+        ce_tagged_src(name, matrix, prim, trc, source)
+    };
+    let size = "size=640x360:rate=30:duration=4";
+    let bars_src = format!("smptehdbars={size},format=yuv420p");
+    let test_src = format!("testsrc2={size},format=yuv420p");
+    let noise_src = format!("nullsrc={size},format=yuv420p,geq=lum='random(1)*255':cb='random(2)*255':cr='random(3)*255'");
+    let smooth_src = format!(
+        "gradients={size}:c0=0xd03020:c1=0x2040e0:c2=0x30c060:nb_colors=3:seed=11:x0=0:y0=0:x1=640:y1=360:speed=0.00001,format=yuv420p"
+    );
+    // Blues and nearly-blues: the corner of the YUV cube where the 32-bit sums wrap.
+    let blue_src = format!("nullsrc={size},format=yuv420p,geq=lum='160+random(1)*95':cb='200+random(2)*55':cr='random(3)*80'");
+    let nc = "bt709";
+    let bars = tag("bars", "bt2020nc", nc, &bars_src);
+    let test = tag("testsrc", "bt2020nc", nc, &test_src);
+    let noise = tag("noise", "bt2020nc", nc, &noise_src);
+    let smooth = tag("smooth", "bt2020nc", nc, &smooth_src);
+    let blue = tag("blue", "bt2020nc", nc, &blue_src);
+    let pq_bars = tag("bars", "bt2020nc", "smpte2084", &bars_src);
+    let pq_test = tag("testsrc", "bt2020nc", "smpte2084", &test_src);
+    let mut failures: Vec<String> = Vec::new();
+    let run =
+        |name: &str, bottom: &Asset, top: &Asset, draws: Option<bool>, edit: &dyn Fn(&mut Clip), failures: &mut Vec<String>| {
+            let mut c = clip(top, 0.5, 1.5, 0.0);
+            edit(&mut c);
+            ce_check(
+                &format!("checker/e/2020 {name} {:?}", c.blend_mode),
+                &timeline(vec![vec![clip(bottom, 0.5, 1.5, 0.0)], vec![c]], None),
+                &[bottom.clone(), top.clone()],
+                30.0,
+                0.4,
+                false,
+                draws,
+                failures,
+            );
+        };
+    for (k, mode) in BLEND_MODES.into_iter().enumerate() {
+        // Pairs of 2020 footage: drawn where the caps say so, for every mode.
+        let want = (all && on).then_some(true);
+        run(
+            "testsrc over bars",
+            &bars,
+            &test,
+            want,
+            &|c| c.blend_mode = mode,
+            &mut failures,
+        );
+        run(
+            "noise over smooth",
+            &smooth,
+            &noise,
+            want,
+            &|c| c.blend_mode = mode,
+            &mut failures,
+        );
+        run(
+            "blues over noise",
+            &noise,
+            &blue,
+            want,
+            &|c| c.blend_mode = mode,
+            &mut failures,
+        );
+        run(
+            "noise over blues",
+            &blue,
+            &noise,
+            want,
+            &|c| c.blend_mode = mode,
+            &mut failures,
+        );
+        if k % 3 == 0 {
+            run("PQ pair", &pq_bars, &pq_test, None, &|c| c.blend_mode = mode, &mut failures);
+            run(
+                "2020 over untagged",
+                &m.bars,
+                &test,
+                None,
+                &|c| c.blend_mode = mode,
+                &mut failures,
+            );
+            run(
+                "untagged over 2020",
+                &bars,
+                &m.testsrc,
+                None,
+                &|c| c.blend_mode = mode,
+                &mut failures,
+            );
+            run(
+                "2020 over bt709",
+                &v.bars709,
+                &test,
+                None,
+                &|c| c.blend_mode = mode,
+                &mut failures,
+            );
+            run(
+                "bt709 over 2020",
+                &bars,
+                &v.testsrc709,
+                None,
+                &|c| c.blend_mode = mode,
+                &mut failures,
+            );
+        }
+    }
+    // With an alpha of its own: fades, a mask and a position.
+    for mode in [BlendMode::Screen, BlendMode::Difference] {
+        run(
+            "noise faded, masked and moved",
+            &smooth,
+            &noise,
+            None,
+            &|c| {
+                c.blend_mode = mode;
+                c.fade_in = 0.2;
+                c.fade_out = 0.2;
+                c.mask = Some(mask_of(kerf_core::MaskShape::Ellipse, 0.5, true));
+                c.transform.pos_x = -0.2;
+                c.transform.pos_y = 0.1;
+            },
+            &mut failures,
+        );
+    }
+    assert!(failures.is_empty(), "{} cases: {failures:#?}", failures.len());
 }

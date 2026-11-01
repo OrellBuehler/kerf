@@ -136,7 +136,9 @@ fn alpha_plane(rng: &mut Lcg, kind: AlphaKind, w: usize, h: usize) -> Vec<u8> {
         AlphaKind::Edges => (0..w * h)
             .map(|i| [1u8, 254, 128, 127, 3, 252, 85, 170][(i * 5 + i / w) % 8])
             .collect(),
-        AlphaKind::Binary => (0..w * h).map(|i| if (i % w + i / w) % 3 == 0 { 0 } else { 255 }).collect(),
+        AlphaKind::Binary => (0..w * h)
+            .map(|i| if (i % w + i / w).is_multiple_of(3) { 0 } else { 255 })
+            .collect(),
     }
 }
 
@@ -293,11 +295,12 @@ fn report(name: &str, tally: Tally) {
     );
 }
 
-const TAGS: [(Option<&str>, YuvMatrix); 4] = [
+const TAGS: [(Option<&str>, YuvMatrix); 5] = [
     (None, YuvMatrix::Bt601),
     (Some("bt709"), YuvMatrix::Bt709),
     (Some("smpte170m"), YuvMatrix::Bt601),
     (Some("bt470bg"), YuvMatrix::Bt601),
+    (Some("bt2020nc"), YuvMatrix::Bt2020),
 ];
 
 /// Every mode, both matrices, a clip of any size at any position (on and off every edge, odd positions that `overlay` floors),
@@ -358,7 +361,7 @@ fn checker_e_the_chain_does_not_depend_on_the_filter_thread_count() {
         for threads in [1usize, 2, 3, 4, 5, 6, 7, 8, 9, 11, 12, 15, 16] {
             let mode = MODES[round % MODES.len()];
             round += 1;
-            let (tag, matrix) = TAGS[round % 2];
+            let (tag, matrix) = TAGS[[0, 1, 4][round % 3]];
             let s = Scenario {
                 base: (bw, bh),
                 clip: (bw - 2, bh - 2),
@@ -391,7 +394,7 @@ fn checker_e_every_placement_of_a_clip_on_a_tiny_frame() {
                 for y in -(ch as i32) - 1..=bh as i32 + 1 {
                     // Three modes and two matrices rotating through the placements keeps the count down.
                     let mode = MODES[round % MODES.len()];
-                    let (tag, matrix) = TAGS[(round / 7) % 2];
+                    let (tag, matrix) = TAGS[[0, 1, 4][(round / 7) % 3]];
                     round += 1;
                     if (x + y).rem_euclid(3) != 0 && round % 4 != 0 {
                         continue;
