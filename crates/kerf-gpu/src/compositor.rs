@@ -791,7 +791,9 @@ fn effect_picture(layer: &kerf_core::PlanLayer, geom: &LayerGeometry) -> (bool, 
 
 /// Do ahead of a frame what a plan needs measured and what takes a while: FFmpeg's `geq`, for a
 /// plan with a mask or a keyed opacity (the export's `geq`), and its conversions to and from RGB, for a plan with a
-/// grade ([`crate::grade::kernels`]; fifteen short child processes at once, once per process: the grade is in the caps only once it is known to match).
+/// grade ([`crate::grade::kernels`]; fifteen short child processes at once, once per process: the grade is in the caps only once it is known to match)
+/// and `drawtext`'s layout for a plan with text ([`crate::text::model`]: one short child process, once per process: text whose glyph bitmaps share
+/// samples is in the caps only once the layout is one the compositor can take apart).
 /// Call it from a blocking thread **off the render lock**, with the plan in hand, so the first such
 /// frame does not pay for it under the lock; a compositor pinned with [`Compositor::with_geq_edge`] needs none of it.
 pub fn prepare(plan: &RenderPlan) {
@@ -811,6 +813,9 @@ pub fn prepare(plan: &RenderPlan) {
             .any(|l| l.stream.matrix().is_some_and(|m| m != plan.canvas.matrix))
     {
         let _ = crate::convert::kernels();
+    }
+    if !plan.overlays.is_empty() {
+        let _ = crate::text::model();
     }
 }
 
@@ -844,9 +849,22 @@ impl Compositor {
         )
     }
 
-    /// [`Compositor::caps`] for a machine whose FFmpeg's conversions are `kernels` and whose scaler is `scaler`, without
-    /// a device: the way a host that has none to ask (the render bar) says what the GPU draws.
+    /// [`Compositor::caps`] for a machine whose FFmpeg's conversions are `kernels`, whose scaler is `scaler` and whose conversion
+    /// between colour matrices is `convert`, without a device: the way a host that has none to ask (the render bar) says what the
+    /// GPU draws.
     pub fn caps_for(kernels: crate::grade::Kernels, scaler: crate::scaler::Kernels, convert: crate::convert::Kernels) -> GpuCaps {
+        Self::caps_with(kernels, scaler, convert, crate::text::measured_model())
+    }
+
+    /// [`Compositor::caps_for`] for a machine whose `drawtext` lays text out as `text` and converts its
+    /// colours in a way the compositor knows (`None`: in no way it does, or not probed yet): without that no
+    /// text is drawn, it stays FFmpeg's.
+    pub fn caps_with(
+        kernels: crate::grade::Kernels,
+        scaler: crate::scaler::Kernels,
+        convert: crate::convert::Kernels,
+        text: Option<crate::text::Model>,
+    ) -> GpuCaps {
         let mut caps = Self::CAPS;
         if kernels != crate::grade::Kernels::Match {
             caps.grade = GradeKinds::NONE;
@@ -854,6 +872,9 @@ impl Compositor {
         caps.exact_scaler = scaler.exact();
         // The conversion's way in is the grade's kernel too: the conversion is in the caps where both are measured.
         caps.matrix_convert = convert.converts() && kernels == crate::grade::Kernels::Match;
+        if text.is_none() {
+            caps.text = false;
+        }
         caps
     }
 
@@ -1136,7 +1157,7 @@ impl Compositor {
             });
             let text_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("text"),
-                entries: &[uniform_entry(0), texture_entry(1), texture_entry(2)],
+                entries: &[uniform_entry(0), texture_entry(1), texture_entry(2), texture_entry(3)],
             });
             let text_pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("text"),
@@ -1173,17 +1194,17 @@ impl Compositor {
                 .create_texture_with_data(
                     &g.queue,
                     &wgpu::TextureDescriptor {
-                        label: Some("text blank mask"),
+                        label: Some("text blank layers"),
                         size: extent(1, 1),
                         mip_level_count: 1,
                         sample_count: 1,
                         dimension: wgpu::TextureDimension::D2,
-                        format: PLANE_FORMAT,
+                        format: CANVAS_FORMAT,
                         usage: wgpu::TextureUsages::TEXTURE_BINDING,
                         view_formats: &[],
                     },
                     wgpu::util::TextureDataOrder::LayerMajor,
-                    &[0],
+                    &[0, 0, 0, 0],
                 )
                 .create_view(&wgpu::TextureViewDescriptor::default());
             let ops = Self::plane_ops(device);
@@ -2612,17 +2633,19 @@ impl Compositor {
                 converted,
             });
         }
-        // FFmpeg rasterises what text there is, here, before the GPU is touched. No project lock is
-        // held, but the caller's render lock is (the app's preview holds `RenderState` across a render,
-        // decode included): the wait for a first-seen caption is one process, bounded by RASTER_TIMEOUT.
+        // FFmpeg rasterises what text there is, here, before the GPU is touched. Neither the project lock nor
+        // the app's render lock is held (a frame draws with what it took under the lock, off it); a
+        // first-seen caption is several `ffmpeg` processes (the picture, the measure, the dictionary), each
+        // killed at its own timeout, and what failed is not tried again for a while.
         let texts = self.prepare_text(plan, size, texts)?;
         self.gpu
             .guarded("compositing a frame", || self.draw(plan, &drawn, &texts, size, output))
     }
 
     /// Every overlay of the frame rasterised (or served from the atlas) and turned into the blends
-    /// that draw it. Blocks for one `ffmpeg` process (at most `RASTER_TIMEOUT`) the first time a state
-    /// is seen, so a caller holding a lock across a render holds it that long.
+    /// that draw it. Blocks for several `ffmpeg` processes the first time a state is seen (the picture,
+    /// the measure of the glyphs and the glyphs themselves, each at most a run timeout of 20 s at the
+    /// outside), so this is for a blocking thread, with no lock held that anything else waits on.
     fn prepare_text(&self, plan: &RenderPlan, size: (u32, u32), texts: Texts) -> Result<Vec<PreparedText>, GpuError> {
         let limit = self.gpu.device.limits().max_texture_dimension_2d;
         plan.overlays
@@ -2630,16 +2653,16 @@ impl Compositor {
             .map(|t| {
                 let graph = kerf_core::text_raster_graph(t, size);
                 let key = text::Key::new(&graph, t.font_file.as_deref());
-                let make = || text::rasterize(&graph);
+                let make = || text::raster(t, size);
                 let raster = match texts {
                     Texts::Cut => self.text.atlas.get(key, make)?,
                     Texts::Draft => self.text.atlas.get_drafted(&self.text.drafts, key, make)?,
                 };
-                if let Some(mask) = &raster.glyphs {
-                    if mask.w > limit || mask.h > limit {
+                if let Some(layers) = raster.layers(size.0, size.1)? {
+                    let [_, _, w, h] = layers.region;
+                    if w.max(h) as u32 > limit {
                         return Err(GpuError::Unsupported(format!(
-                            "a {}x{} text mask is over this device's {limit}px texture limit",
-                            mask.w, mask.h
+                            "a {w}x{h} text mask is over this device's {limit}px texture limit"
                         )));
                     }
                 }
@@ -3066,67 +3089,69 @@ impl Compositor {
         let device = &self.gpu.device;
         let (mut from, mut to) = (cur, other);
         for t in texts {
-            let masks = t.raster.uploaded.get_or_init(|| text::UploadedMasks {
-                glyphs: t
-                    .raster
-                    .glyphs
-                    .as_ref()
-                    .map(|m| text::UploadedMask::new(self.upload("text glyphs", m.w, m.h, &m.data).texture)),
-            });
+            let masks = t
+                .raster
+                .layers(w, h)?
+                .map(|layers| t.raster.uploaded.get_or_init(|| layers.upload(&self.gpu)));
             for b in &t.blends {
-                let (kind, area, mask_view) = match b.source {
-                    Source::Box(r) => (1, [r.x, r.y, r.w, r.h], &self.text.blank),
+                // A box is one pass; the glyphs are one per four bitmaps deep.
+                let mut draws: Vec<([i32; 4], u32, &wgpu::TextureView, &wgpu::TextureView)> = Vec::new();
+                match b.source {
+                    Source::Box(r) => draws.push(([r.x, r.y, r.w, r.h], 1, &self.text.blank, &self.text.blank)),
                     Source::Glyphs => {
-                        let (Some(mask), Some(uploaded)) = (&t.raster.glyphs, &masks.glyphs) else {
-                            continue;
-                        };
-                        (
-                            0,
-                            [mask.x as i32, mask.y as i32, mask.w as i32, mask.h as i32],
-                            &uploaded.view,
-                        )
+                        if let Some(masks) = masks {
+                            for p in &masks.passes {
+                                draws.push((masks.region, 0, &p.luma, &p.chroma));
+                            }
+                        }
                     }
-                };
-                let params = TextParams {
-                    colour: [u32::from(b.colour[0]), u32::from(b.colour[1]), u32::from(b.colour[2]), 0],
-                    area,
-                    alpha: b.alpha,
-                    kind,
-                    rgb: u32::from(rgb),
-                    pad: 0,
-                };
-                let buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("text params"),
-                    contents: bytemuck::bytes_of(&params),
-                    usage: wgpu::BufferUsages::UNIFORM,
-                });
-                let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: Some("text"),
-                    layout: &self.text.layout,
-                    entries: &[
-                        wgpu::BindGroupEntry {
-                            binding: 0,
-                            resource: buf.as_entire_binding(),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 1,
-                            resource: wgpu::BindingResource::TextureView(&from.view),
-                        },
-                        wgpu::BindGroupEntry {
-                            binding: 2,
-                            resource: wgpu::BindingResource::TextureView(mask_view),
-                        },
-                    ],
-                });
-                self.pass(
-                    enc,
-                    &self.text.pipeline,
-                    &to.view,
-                    &bind,
-                    None,
-                    Some((x0, y0, x1 - x0, y1 - y0)),
-                );
-                std::mem::swap(&mut from, &mut to);
+                }
+                for (area, kind, luma, chroma) in draws {
+                    let params = TextParams {
+                        colour: [u32::from(b.colour[0]), u32::from(b.colour[1]), u32::from(b.colour[2]), 0],
+                        area,
+                        alpha: b.alpha,
+                        kind,
+                        rgb: u32::from(rgb),
+                        pad: 0,
+                    };
+                    let buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("text params"),
+                        contents: bytemuck::bytes_of(&params),
+                        usage: wgpu::BufferUsages::UNIFORM,
+                    });
+                    let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("text"),
+                        layout: &self.text.layout,
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: wgpu::BindingResource::TextureView(&from.view),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: wgpu::BindingResource::TextureView(luma),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: wgpu::BindingResource::TextureView(chroma),
+                            },
+                        ],
+                    });
+                    self.pass(
+                        enc,
+                        &self.text.pipeline,
+                        &to.view,
+                        &bind,
+                        None,
+                        Some((x0, y0, x1 - x0, y1 - y0)),
+                    );
+                    std::mem::swap(&mut from, &mut to);
+                }
             }
         }
         Ok(from)
@@ -3562,15 +3587,20 @@ mod tests {
     fn the_grade_is_in_the_caps_only_where_the_conversions_are_known_to_match() {
         use crate::grade::Kernels;
         use crate::scaler::{Kernel, Kernels as Scaler, Model};
+        use crate::text::Model as Layout;
         let simd = Scaler::Match(Model {
             kernel: Kernel::X86,
             default: crate::sws::Scaler::Bicubic,
         });
         let converts = crate::convert::Kernels::Match;
-        assert_eq!(Compositor::caps_for(Kernels::Match, simd, converts), Compositor::CAPS);
+        let layout = Some(Layout::Shaped);
+        assert_eq!(
+            Compositor::caps_with(Kernels::Match, simd, converts, layout),
+            Compositor::CAPS
+        );
         assert_eq!(Compositor::CAPS.grade, GradeKinds::ALL);
         for kernels in [Kernels::Differs("a chain"), Kernels::Unknown] {
-            let caps = Compositor::caps_for(kernels, simd, converts);
+            let caps = Compositor::caps_with(kernels, simd, converts, layout);
             assert_eq!(caps.grade, GradeKinds::NONE, "{kernels:?}");
             // (The conversion between matrices reads RGB through the grade's kernel: it goes with it.)
             assert!(!caps.matrix_convert, "{kernels:?}");
@@ -3592,12 +3622,23 @@ mod tests {
         };
         for scaler in [Scaler::Match(model(Kernel::X86)), Scaler::Match(model(Kernel::C))] {
             assert!(
-                Compositor::caps_for(Kernels::Match, scaler, crate::convert::Kernels::Match).exact_scaler,
+                Compositor::caps_with(
+                    Kernels::Match,
+                    scaler,
+                    crate::convert::Kernels::Match,
+                    Some(crate::text::Model::Shaped)
+                )
+                .exact_scaler,
                 "{scaler:?}"
             );
         }
         for scaler in [Scaler::Differs, Scaler::Unknown] {
-            let caps = Compositor::caps_for(Kernels::Match, scaler, crate::convert::Kernels::Match);
+            let caps = Compositor::caps_with(
+                Kernels::Match,
+                scaler,
+                crate::convert::Kernels::Match,
+                Some(crate::text::Model::Shaped),
+            );
             assert!(!caps.exact_scaler, "{scaler:?}");
             let mut restored = caps;
             restored.exact_scaler = true;
@@ -3615,14 +3656,42 @@ mod tests {
             kernel: Kernel::X86,
             default: crate::sws::Scaler::Bicubic,
         });
-        assert!(Compositor::caps_for(Kernels::Match, simd, Convert::Match).matrix_convert);
+        assert!(Compositor::caps_with(Kernels::Match, simd, Convert::Match, Some(crate::text::Model::Shaped)).matrix_convert);
         for convert in [Convert::Differs("an opaque picture"), Convert::Unknown] {
-            let caps = Compositor::caps_for(Kernels::Match, simd, convert);
+            let caps = Compositor::caps_with(Kernels::Match, simd, convert, Some(crate::text::Model::Shaped));
             assert!(!caps.matrix_convert, "{convert:?}");
             let mut restored = caps;
             restored.matrix_convert = true;
             assert_eq!(restored, Compositor::CAPS, "{convert:?}: nothing else moves");
         }
+    }
+
+    /// Text is in the caps only where `drawtext`'s layout and colour conversion are ones the compositor
+    /// knows: a build it does not know, a probe that has not run or could not tell, leave it out (every text frame
+    /// is FFmpeg's), and the rest of the caps are the build's either way.
+    #[test]
+    fn text_is_in_the_caps_only_where_the_build_is_known() {
+        use crate::grade::Kernels;
+        use crate::scaler::Kernels as Scaler;
+        use crate::text::Model;
+        const { assert!(Compositor::CAPS.text) };
+        let simd = Scaler::Match(crate::scaler::Model {
+            kernel: crate::scaler::Kernel::X86,
+            default: crate::sws::Scaler::Bicubic,
+        });
+        let converts = crate::convert::Kernels::Match;
+        for layout in [Some(Model::Shaped), Some(Model::Legacy)] {
+            assert_eq!(
+                Compositor::caps_with(Kernels::Match, simd, converts, layout),
+                Compositor::CAPS,
+                "{layout:?}"
+            );
+        }
+        let unknown = Compositor::caps_with(Kernels::Match, simd, converts, None);
+        assert!(!unknown.text);
+        let mut restored = unknown;
+        restored.text = true;
+        assert_eq!(restored, Compositor::CAPS, "nothing else moves");
     }
 
     #[test]

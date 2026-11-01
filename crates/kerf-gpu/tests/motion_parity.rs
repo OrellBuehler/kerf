@@ -62,6 +62,8 @@ fn compositor() -> &'static Compositor {
         let _ = kerf_gpu::grade::kernels();
         let _ = kerf_gpu::scaler::kernels();
         let _ = kerf_gpu::convert::kernels();
+        // ... and so is the layout of its `drawtext`, which decides whether text whose bitmaps share samples is drawn.
+        let _ = kerf_gpu::text::model();
         Compositor::new(gpu()).expect("a compositor")
     })
 }
@@ -1606,6 +1608,83 @@ fn the_shapes_of_a_real_cut_are_drawn_as_the_export_draws_them() {
     title.bg = Some("black@0.5".into());
     tl.overlays.push(title);
     run("text/over a dissolve", &tl, &assets, 30.0, 2.0, EXACT);
+}
+
+/// A family installed here with no bold face (a bold request in it is `drawtext` thickened with a border).
+fn regular_only_family() -> Option<String> {
+    kerf_core::list_system_fonts()
+        .into_iter()
+        .find(|family| kerf_core::fonts::resolve_font_file(family, true).is_some_and(|(_, bold)| !bold))
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn text_whose_bitmaps_share_samples_in_an_export_frame() {
+    // `drawtext` blends each glyph bitmap in turn: a synthetic-bold border's bitmaps overlap along every
+    // letter gap and print under 12 px shares samples (and chroma blocks) all along the line. The export's
+    // own planes are held to the compositor's, to the level, over video, inside fades and with a moving
+    // title.
+    let m = media();
+    let one = std::slice::from_ref(&m.testsrc);
+    let summed = kerf_gpu::text::sum_fallbacks();
+    let base = || {
+        let mut c = clip(&m.testsrc, 0.0, 2.0, 0.0);
+        c.fade_in = 0.4;
+        c.fade_out = 0.4;
+        timeline(vec![vec![c]], None)
+    };
+    let key = |time: f64, pos_y: f64, opacity: f64| kerf_core::TextKeyframe {
+        time,
+        pos_x: 0.5,
+        pos_y,
+        opacity,
+    };
+    // Print and a channel handle, 5 to 11 px at the 360 px the clip is.
+    for (name, size, bg) in [
+        ("print 5 px", 5.0, None),
+        ("print 9 px", 9.0, None),
+        ("handle 11 px, boxed", 11.0, Some("black@0.5")),
+    ] {
+        let mut tl = base();
+        let mut o = kerf_core::TextOverlay::new("@kerf.studio  *Results vary. Terms apply.", 0.2, 1.8);
+        (o.size, o.pos_x, o.pos_y, o.bg) = (size / 360.0, 0.37, 0.93, bg.map(String::from));
+        o.color = "white@0.8".into();
+        tl.overlays.push(o);
+        run(&format!("text/{name}, over a fade"), &tl, one, 30.0, 2.0, EXACT);
+    }
+    // A caption fading in and sliding up, small and thickened.
+    let mut tl = base();
+    let mut o = kerf_core::TextOverlay::new("Sliding, fading: fi ffi", 0.1, 1.9);
+    o.size = 10.0 / 360.0;
+    o.keyframes = vec![key(0.0, 0.9, 0.0), key(0.5, 0.8, 1.0), key(1.7, 0.8, 1.0)];
+    tl.overlays.push(o);
+    run("text/small, sliding and fading", &tl, one, 30.0, 2.0, EXACT);
+    match regular_only_family() {
+        None => eprintln!("SKIPPED the synthetic-bold export cases: every installed family has a bold face"),
+        Some(family) => {
+            for (name, size, bg, moving) in [
+                ("caption", 0.07, None, false),
+                ("boxed", 0.06, Some("black@0.5"), false),
+                ("title", 0.14, None, false),
+                ("moving", 0.08, Some("white@0.4"), true),
+            ] {
+                let mut tl = base();
+                let mut o = kerf_core::TextOverlay::new("Bold, thickened with a border: fi ffi Ay", 0.2, 1.8);
+                (o.bold, o.font, o.size, o.pos_y, o.bg) = (true, Some(family.clone()), size, 0.6, bg.map(String::from));
+                if moving {
+                    o.keyframes = vec![key(0.0, 0.9, 0.0), key(0.4, 0.5, 1.0), key(1.6, 0.4, 1.0)];
+                }
+                tl.overlays.push(o);
+                run(&format!("text/bold-border {name}, over a fade"), &tl, one, 30.0, 2.0, EXACT);
+            }
+            eprintln!("synthetic bold in {family}");
+        }
+    }
+    assert_eq!(
+        kerf_gpu::text::sum_fallbacks(),
+        summed,
+        "a text was blended as the sum of its bitmaps"
+    );
 }
 
 #[test]

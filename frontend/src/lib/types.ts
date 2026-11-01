@@ -2802,7 +2802,7 @@ export interface GpuPreviewStatus {
 /** One kind of reason a preview frame went through FFmpeg, counted over the session
  *  (`RefusalCount` in `gpu_preview/diagnostics.rs`). */
 export interface GpuRefusalCount {
-	/** A stable key (`mask`, `mixed_matrices`, `text_too_small`, `self_test_pending`, …). */
+	/** A stable key (`mask`, `mixed_matrices`, `text_sequence`, `self_test_pending`, …). */
 	kind: string;
 	count: number;
 	/** The first message of this kind seen this session. */

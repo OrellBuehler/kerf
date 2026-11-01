@@ -4806,6 +4806,10 @@ async fn get_render_bar(
                 let _ = kerf_gpu::grade::kernels();
                 let _ = kerf_gpu::convert::kernels();
             }
+            // ...and so is the layout of this FFmpeg's `drawtext`, for a cut with text.
+            if !timeline.overlays.is_empty() {
+                let _ = kerf_gpu::text::model();
+            }
             kerf_gpu::Compositor::caps_for(
                 kerf_gpu::grade::measured(),
                 kerf_gpu::scaler::measured(),
