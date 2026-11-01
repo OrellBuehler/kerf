@@ -258,9 +258,20 @@ fn run_ffmpeg(args: &[String], cap: usize) -> Result<Vec<u8>, RunError> {
     run_child(cmd, cap, DECODE_TIMEOUT)
 }
 
-/// Run `cmd`, capturing stdout up to `cap` bytes and a tail of stderr; kill the
+/// Run `cmd`, capturing stdout up to `cap` bytes and the first [`STDERR_CAP`] bytes of stderr; kill the
 /// child when it writes more than `cap` or runs past `timeout`.
-pub(crate) fn run_child(mut cmd: std::process::Command, cap: usize, timeout: Duration) -> Result<Vec<u8>, RunError> {
+pub(crate) fn run_child(cmd: std::process::Command, cap: usize, timeout: Duration) -> Result<Vec<u8>, RunError> {
+    run_child_logged(cmd, cap, STDERR_CAP, timeout).map(|(stdout, _)| stdout)
+}
+
+/// [`run_child`] that also returns the child's stderr, its first `err_cap` bytes (what a `-loglevel debug`
+/// run is asked for) on success; a failure carries only the last [`FAILURE_MESSAGE_BYTES`] of what was read.
+pub(crate) fn run_child_logged(
+    mut cmd: std::process::Command,
+    cap: usize,
+    err_cap: usize,
+    timeout: Duration,
+) -> Result<(Vec<u8>, Vec<u8>), RunError> {
     let bin = cmd.get_program().to_string_lossy().into_owned();
     let mut child = cmd
         .stdin(Stdio::null())
@@ -276,7 +287,7 @@ pub(crate) fn run_child(mut cmd: std::process::Command, cap: usize, timeout: Dur
     let overflow = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&overflow);
     let out = std::thread::spawn(move || read_capped(stdout, cap, Some(&flag)));
-    let err = std::thread::spawn(move || read_capped(stderr, STDERR_CAP, None));
+    let err = std::thread::spawn(move || read_capped(stderr, err_cap, None));
 
     let deadline = Instant::now() + timeout;
     let outcome = loop {
@@ -301,13 +312,28 @@ pub(crate) fn run_child(mut cmd: std::process::Command, cap: usize, timeout: Dur
     let stdout = out.join().unwrap_or_default();
     let stderr = err.join().unwrap_or_default();
     match outcome {
-        Ok(status) if status.success() && !overflow.load(Ordering::Relaxed) => Ok(stdout),
+        Ok(status) if status.success() && !overflow.load(Ordering::Relaxed) => Ok((stdout, stderr)),
         Ok(_) if overflow.load(Ordering::Relaxed) => Err(RunError::Overflow),
-        Ok(status) => {
-            let tail = String::from_utf8_lossy(&stderr);
-            Err(RunError::Failed(format!("{status}: {}", tail.trim())))
-        }
+        Ok(status) => Err(RunError::Failed(format!("{status}: {}", failure_tail(&stderr)))),
         Err(e) => Err(e),
+    }
+}
+
+/// How much of a failed run's stderr goes into the error: a `-loglevel debug` run is asked for megabytes of it,
+/// and an error message is carried, logged and shown.
+const FAILURE_MESSAGE_BYTES: usize = 8192;
+
+/// The last [`FAILURE_MESSAGE_BYTES`] of `stderr` as text (what FFmpeg said last is what it failed on), marked
+/// when it is not all of it.
+fn failure_tail(stderr: &[u8]) -> String {
+    let cut = stderr.len().saturating_sub(FAILURE_MESSAGE_BYTES);
+    let tail = String::from_utf8_lossy(&stderr[cut..]);
+    // A cut can land inside a character: the replacement character for its tail goes.
+    let tail = if cut > 0 { tail.trim_start_matches('\u{FFFD}') } else { &tail };
+    if cut > 0 {
+        format!("...{}", tail.trim())
+    } else {
+        tail.trim().to_string()
     }
 }
 
@@ -411,6 +437,25 @@ mod tests {
     use super::*;
     use kerf_core::{Color, LayerFx, Pick, PlanSource, PlanStream, PlanTiming, Transform};
     use uuid::Uuid;
+
+    #[test]
+    fn a_failures_message_is_the_last_of_the_log_and_not_all_of_it() {
+        assert_eq!(failure_tail(b"  Error opening filters!\n"), "Error opening filters!");
+        // A debug log of megabytes: only its end, and cut on a character.
+        let mut log = "x".repeat(4 << 20).into_bytes();
+        log.extend("ä".repeat(10).as_bytes());
+        log.extend(b"\nthe last thing FFmpeg said");
+        let said = failure_tail(&log);
+        assert!(said.len() <= FAILURE_MESSAGE_BYTES + 8, "{} bytes", said.len());
+        assert!(
+            said.starts_with("...") && said.ends_with("the last thing FFmpeg said"),
+            "{said:?}"
+        );
+        let mut odd = vec![b'x'; 100];
+        odd.extend("ä".repeat(FAILURE_MESSAGE_BYTES).as_bytes());
+        odd.push(b'x');
+        assert!(!failure_tail(&odd).contains('\u{FFFD}'), "the cut lands inside a character");
+    }
 
     fn layer(is_image: bool) -> PlanLayer {
         PlanLayer {

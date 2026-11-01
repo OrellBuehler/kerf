@@ -470,7 +470,7 @@
   layer with no known picture size, a shrink steeper than `MAX_SHRINK` (40:1, the
   steepest the scaler comparison measures), and the classes below. Pure + unit-tested
   like the rest of the timeline math. **`Unsupported::kind()`** names a refusal without its layer
-  names and numbers (`mask`, `mixed_matrices`, `text_too_small`, …; an exhaustive `match`, so a new
+  names and numbers (`mask`, `mixed_matrices`, `text_sequence`, …; an exhaustive `match`, so a new
   variant must choose one): the key the GPU preview counts refusals by (`app.md`).
   - **Text** (`caps.text`, which `kerf-gpu`'s compositor sets: FFmpeg rasterises `drawtext`, the compositor blends it —
     `gpu.md`). The font is **always a file the plan can name**: `fonts::resolve_text_font` (the installed family the overlay
@@ -479,12 +479,16 @@
     `fontfile=` — `TextWithoutFont` is only the case where the default could not be written. `kerf_core::text_still_filter(&PlanText, h)`
     is the `drawtext` the still draws for a plan's overlay (a test holds it byte-equal to `drawtext_still` over the
     timeline's overlay at the same time) and `text_raster_graph` the graph the compositor rasterises it with (same options and
-    position, white on black in `rgb24`, parts `Glyphs` and `Box`). Refused: `Text` (no `caps.text`), `TextWithoutFont`,
-    **`TextBorder`** (`synthetic_bold`: a bold request in a font with no bold face — only a *named* family; the default has one) and
-    **`TextTooSmall(px)`** (the smallest overlay's `fontsize`, `round(height * size)`, under `MIN_TEXT_PX` = 12, judged at the
-    render size by `reasons`, not the size-free half).
+    position, white on black in `rgb24`, parts `Glyphs` — a synthetic border drawn white in it — and `Box`); `text_piece_filter` /
+    `TextPiece` is one piece of the same look (a prefix of the text, one glyph unit, a box) with the caller's colours and position, and
+    `text_as_drawn` the characters `drawtext` is given: what the compositor measures and takes the bitmaps apart with. Refused: `Text` (no `caps.text`: a compositor sets it only for a build whose `drawtext` it can take apart
+    glyph bitmap by glyph bitmap, as `drawtext` blends them, and whose colour conversion it knows, `gpu.md`), `TextWithoutFont`, and **`TextSequence(why)`** (kind `text_sequence`: `text_sequence_limit` — a tab, over
+    `MAX_SEQUENCE_CHARS` = 160 characters, a text too wide for `MAX_MEASURE_SIDE` = 16 384 px of measuring canvas at the render size; judged by `reasons`, the width at the size). A synthetic-bold border (its bitmaps overlap along every letter gap) and print
+    under 12 px (its bitmaps share samples all along the line) are not refusals: one mask of their sum is not their blends in turn, so they are blended in turn, and what the compositor cannot then reproduce exactly (a glyph that does not shape one to a unit,
+    a face whose bitmaps overhang) is refused by the render (`GpuError::Unsupported`), not the plan.
   - **Animated SVG titles** (`Timeline.svg_overlays`): resvg draws them and FFmpeg overlays the pictures, so no compositor pass draws one and
-    none ever will without a parity case. The `Planner` keeps their windows and `RenderPlan.svg` (`Vec<Uuid>`) names the ones on screen at a frame,
+    none ever will without a parity case (measured, not built: `gpu.md` "Animated SVG titles" — ffmpeg's own conversion of the PNG plus `overlay`'s arithmetic is
+    the overlay to the sample on both builds; what is missing is the plan carrying the picture and a compositor pass). The `Planner` keeps their windows and `RenderPlan.svg` (`Vec<Uuid>`) names the ones on screen at a frame,
     live like a text overlay (`start <= t < end` in a Still, `<= end` in Motion: the graph's `between`); `reasons` pushes **`Unsupported::Svg`**
     (`kind` `svg`, "an animated SVG title is on screen") for any plan that names one, whatever the caps, so the frame — and a `PlayCut` scan
     that reaches it — falls back to FFmpeg. The plan carries no geometry or artwork: nothing draws from it.

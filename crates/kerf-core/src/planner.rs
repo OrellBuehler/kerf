@@ -2987,7 +2987,8 @@ mod tests {
             Some(std::path::Path::new("/kerf-test/fonts/PinnedSans-Regular.ttf"))
         );
         assert!(named.synthetic_bold);
-        // ...which a text pass cannot reproduce: the border's glyph bitmaps overlap and are blended in turn.
+        // ...which a text pass that blends the glyph bitmaps in turn, as `drawtext` does, draws: a thickened border
+        // and print under 12 px included (one mask of their sum is not their blends).
         let mut thick = export.at_frame(30).unwrap();
         thick.overlays[0] = named;
         let drawn = GpuCaps {
@@ -2996,14 +2997,36 @@ mod tests {
             ..GpuCaps::A0
         };
         let size = thick.size(u32::MAX);
-        assert_eq!(thick.reasons(&drawn, size), vec![Unsupported::TextBorder]);
-        // ...and so is text whose glyph bitmaps share too many pixels: a font height under 12 px.
+        assert!(thick.reasons(&drawn, size).is_empty(), "{:?}", thick.reasons(&drawn, size));
         let mut small = export.at_frame(30).unwrap();
         let (_, h) = small.size(u32::MAX);
-        small.overlays[0].size = 11.4 / f64::from(h);
-        assert_eq!(small.reasons(&drawn, size), vec![Unsupported::TextTooSmall(11)]);
-        small.overlays[0].size = 11.6 / f64::from(h);
-        assert!(small.reasons(&drawn, size).is_empty());
+        small.overlays[0].size = 4.4 / f64::from(h);
+        assert!(small.reasons(&drawn, size).is_empty(), "{:?}", small.reasons(&drawn, size));
+        // Without it no text is drawn at all.
+        let none = GpuCaps { text: false, ..drawn };
+        assert_eq!(small.reasons(&none, size), vec![Unsupported::Text]);
+        // What the plan can tell cannot be taken apart: a tab, a text of over 160 characters, one too wide to
+        // measure.
+        let mut odd = export.at_frame(30).unwrap();
+        odd.overlays[0].text = "a\tb".into();
+        assert_eq!(
+            odd.reasons(&drawn, size),
+            vec![Unsupported::TextSequence("a tab in the text".into())]
+        );
+        odd.overlays[0].text = "x".repeat(161);
+        assert_eq!(
+            odd.reasons(&drawn, size),
+            vec![Unsupported::TextSequence("161 characters of text (over 160)".into())]
+        );
+        odd.overlays[0].text = "x".repeat(160);
+        odd.overlays[0].size = 0.03;
+        assert!(odd.reasons(&drawn, size).is_empty(), "160 characters at 16 px");
+        odd.overlays[0].size = 0.2;
+        let why = odd.reasons(&drawn, size);
+        assert!(
+            matches!(why.as_slice(), [Unsupported::TextSequence(w)] if w.contains("too wide to measure")),
+            "{why:?}"
+        );
     }
 
     #[test]
