@@ -266,6 +266,10 @@ impl Planner {
         // matrix: over every clip of this cut, decided from the originals (a Still plan decides
         // over the layers on screen instead, in `plan`).
         let labels = graph_bt709_labels(&rendered, originals);
+        // The clips of the cut whose chain is on an alpha plane: by a dissolve they enter through (`dissolving`), or by a mask,
+        // a rotation, an opacity below 1, a chroma key (`other_alpha_in_cut`: see `PlanCanvas::other_alpha_in_cut`).
+        let mut other_alpha_in_cut = false;
+        let mut dissolving: Vec<bool> = Vec::new();
         for (flat, (ti, ci, clip, fx)) in clips_with_fx(&rendered, assets).enumerate() {
             if rendered.tracks[ti].kind != StreamKind::Video {
                 continue;
@@ -275,6 +279,16 @@ impl Planner {
                 ..fx
             };
             let timing = ClipTiming::new(clip, &fx);
+            other_alpha_in_cut |= clip.transform.rotation != 0.0
+                || clip.transform.opacity < 1.0
+                || clip.mask.is_some()
+                || clip.mask_animated()
+                || clip.effects.iter().any(VideoEffect::produces_alpha)
+                || clip.rotation_turns()
+                || clip.is_driven(Property::Rotation)
+                || clip.is_keyed(Property::Opacity)
+                || clip.property_keys(Property::Opacity).iter().any(|k| k.value < 1.0);
+            dissolving.push(timing.fades().iter().any(|s| s.tint == crate::clip_timing::FadeTint::Alpha));
             let effects = clip
                 .effects
                 .iter()
@@ -387,6 +401,25 @@ impl Planner {
             });
             matrices.next().is_some_and(|first| matrices.any(|m| m != first))
         };
+        // FFmpeg 9 negotiates the matrix of the whole overlay chain: measured on 9.0.2 (real files, three clips in every
+        // combination of plain and dissolving, either matrix), it is the **first clip on an alpha plane**'s, and the first
+        // clip's when none is, and every clip tagged otherwise is converted into it once, wherever it is on the timeline.
+        // (A dissolve's `format=yuva420p` puts the clip on the plane; an RGB image or a clip never probed has no known matrix.)
+        let cut_matrix = (mixed_matrices_cut && req.color == CompositeColorPolicy::BottomLayerTag)
+            .then(|| {
+                let negotiating = dissolving
+                    .iter()
+                    .position(|d| *d)
+                    .and_then(|i| clips.get(i))
+                    .or(clips.first())?;
+                let mut stream = negotiating.asset.as_ref()?.stream.clone()?;
+                stream.label_bt709 = negotiating.fx.label_bt709;
+                if stream.is_rgb() {
+                    return None;
+                }
+                stream.matrix()
+            })
+            .flatten();
         Ok(Self {
             mode: req.mode,
             canvas: PlanCanvas {
@@ -402,6 +435,8 @@ impl Planner {
                 gif: opts.container == Container::Gif,
                 full_range_cut,
                 mixed_matrices_cut,
+                cut_matrix,
+                other_alpha_in_cut: req.mode == PlanMode::Motion && other_alpha_in_cut,
             },
             rendered,
             clips,
@@ -736,7 +771,10 @@ impl Planner {
                 layer.stream.label_bt709 = label;
             }
         }
-        let matrix = composite_matrix(&layers, self.canvas.policy).0;
+        let matrix = self
+            .canvas
+            .cut_matrix
+            .unwrap_or_else(|| composite_matrix(&layers, self.canvas.policy).0);
         let overlays = self
             .overlays
             .iter()
@@ -1448,6 +1486,71 @@ mod tests {
     /// (FFmpeg 9) on frames where the two are not on screen together too, so the cut says it
     /// (`mixed_matrices_cut`), and a grade (whose way back is that conversion) is refused in it under a
     /// negotiating policy.
+    /// FFmpeg 9 makes the matrix of the first clip **on an alpha plane** the composite's for the whole cut (a clip entering
+    /// through a dissolve is on one), the first clip's when there is none: the plan's `cut_matrix`, in every frame.
+    #[test]
+    fn the_cuts_matrix_is_the_first_dissolving_clips_else_the_first_clips() {
+        use crate::model::{Transition, TransitionKind};
+        let sd = |tag: Option<&str>| {
+            let mut a = asset();
+            (a.streams[0].width, a.streams[0].height) = (Some(640), Some(360));
+            a.streams[0].color_space = tag.map(Into::into);
+            a
+        };
+        let (bt709, untagged, bt2020) = (sd(Some("bt709")), sd(None), sd(Some("bt2020nc")));
+        let assets = [bt709.clone(), untagged.clone(), bt2020.clone()];
+        let matrix = |clips: &[(&Asset, bool)], frame: u64, policy: CompositeColorPolicy| {
+            let track: Vec<Clip> = clips
+                .iter()
+                .enumerate()
+                .map(|(i, (a, dissolving))| {
+                    let mut c = make_clip(a.id, 0.0, 1.0, i as f64);
+                    if *dissolving {
+                        c.transition_in = Some(Transition {
+                            kind: TransitionKind::Crossfade,
+                            duration: 0.4,
+                        });
+                    }
+                    c
+                })
+                .collect();
+            let planner = Planner::new(&single(track), &assets, &opts(30.0), PlanRequest::motion(policy)).unwrap();
+            let plan = planner.at_frame(frame).unwrap();
+            (plan.canvas.cut_matrix, plan.canvas.matrix, plan.canvas.other_alpha_in_cut)
+        };
+        let bt = CompositeColorPolicy::BottomLayerTag;
+        let (m709, m601) = (YuvMatrix::Bt709, YuvMatrix::Bt601);
+        // No dissolve: the first clip's, in the frames of every clip (a lone later clip is converted into it).
+        for frame in [5, 40, 70] {
+            assert_eq!(
+                matrix(&[(&bt709, false), (&untagged, false), (&bt709, false)], frame, bt),
+                (Some(m709), m709, false)
+            );
+            assert_eq!(matrix(&[(&untagged, false), (&bt709, false)], frame, bt).0, Some(m601));
+        }
+        // A dissolving clip decides, wherever it is: the first one, whatever follows.
+        for frame in [5, 40, 70] {
+            assert_eq!(
+                matrix(&[(&bt709, false), (&untagged, true), (&bt709, true)], frame, bt),
+                (Some(m601), m601, false)
+            );
+            assert_eq!(
+                matrix(&[(&untagged, false), (&bt709, true), (&bt2020, true)], frame, bt).1,
+                m709
+            );
+            assert_eq!(
+                matrix(&[(&bt709, false), (&bt709, true), (&untagged, false)], frame, bt).1,
+                m709
+            );
+        }
+        // One matrix, or FFmpeg 6: nothing to decide.
+        assert_eq!(matrix(&[(&bt709, false), (&bt709, true)], 10, bt).0, None);
+        assert_eq!(
+            matrix(&[(&bt709, false), (&untagged, true)], 10, CompositeColorPolicy::FixedBt601).0,
+            None
+        );
+    }
+
     #[test]
     fn a_cut_that_mixes_colour_matrices_refuses_a_grade_in_every_frame_of_it_under_ffmpeg_9() {
         use crate::model::{Grade, Wheel, Wheels};
@@ -1738,6 +1841,7 @@ mod tests {
             grade: crate::plan_caps::GradeKinds::NONE,
             exact_scaler: false,
             blur_fill: false,
+            matrix_convert: false,
         };
         let holding = |edit: &dyn Fn(&mut Clip)| {
             let mut clip = make_clip(a.id, 0.0, 4.0, 0.0);
@@ -1958,6 +2062,7 @@ mod tests {
             grade: crate::plan_caps::GradeKinds::NONE,
             exact_scaler: false,
             blur_fill: false,
+            matrix_convert: false,
         };
         // (The overlay names the shipped default font, which a text pass can draw.)
         assert_eq!(plan.reasons(&all, size), vec![]);
@@ -2789,6 +2894,7 @@ mod tests {
             grade: crate::plan_caps::GradeKinds::NONE,
             exact_scaler: false,
             blur_fill: false,
+            matrix_convert: false,
         };
         let keyed_clip = |a: &Asset| {
             let mut clip = make_clip(a.id, 0.0, 4.0, 1.0);

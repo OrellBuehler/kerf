@@ -333,6 +333,9 @@ pub struct Compositor {
     /// Whether this FFmpeg's scaler is the model, when pinned ([`Compositor::with_scaler_kernels`]); else measured
     /// ([`crate::scaler::kernels`]).
     scaler_kernels: Option<crate::scaler::Kernels>,
+    /// Whether this FFmpeg converts a layer into the composite's matrix as the model does, when pinned
+    /// ([`Compositor::with_convert_kernels`]); else measured ([`crate::convert::kernels`]).
+    convert_kernels: Option<crate::convert::Kernels>,
     /// The threads FFmpeg's filter graph slices a frame into, when pinned ([`Compositor::with_graph_threads`]);
     /// else they are the graph's the frame stands in for ([`Compositor::graph_threads_for`]).
     graph_threads: Option<u32>,
@@ -618,6 +621,14 @@ struct Drawn<'a> {
     count: u64,
     /// The blurred fill behind a picture that leaves bars (`Fit::Blur`): the thumbnail chain, drawn behind the picture.
     fill: Option<FillDraw>,
+    /// The layer's matrix is not the composite's and FFmpeg 9 converts it into it before the overlay.
+    converted: Option<Converted>,
+}
+
+/// A layer FFmpeg 9 takes from its own YCbCr matrix into the composite's (`crate::convert`): the matrix it is from.
+#[derive(Debug, Clone, Copy)]
+struct Converted {
+    from: YuvMatrix,
 }
 
 /// The tables of a blurred fill's two scales: the picture to the thumbnail cover (cropped), and the blurred thumbnail
@@ -793,6 +804,14 @@ pub fn prepare(plan: &RenderPlan) {
     if !plan.layers.is_empty() {
         let _ = crate::scaler::kernels();
     }
+    if plan.canvas.policy == kerf_core::CompositeColorPolicy::BottomLayerTag
+        && plan
+            .layers
+            .iter()
+            .any(|l| l.stream.matrix().is_some_and(|m| m != plan.canvas.matrix))
+    {
+        let _ = crate::convert::kernels();
+    }
 }
 
 impl Compositor {
@@ -821,17 +840,20 @@ impl Compositor {
         Self::caps_for(
             self.grade_kernels.unwrap_or_else(crate::grade::measured),
             self.scaler_kernels.unwrap_or_else(crate::scaler::measured),
+            self.convert_kernels.unwrap_or_else(crate::convert::measured),
         )
     }
 
     /// [`Compositor::caps`] for a machine whose FFmpeg's conversions are `kernels` and whose scaler is `scaler`, without
     /// a device: the way a host that has none to ask (the render bar) says what the GPU draws.
-    pub fn caps_for(kernels: crate::grade::Kernels, scaler: crate::scaler::Kernels) -> GpuCaps {
+    pub fn caps_for(kernels: crate::grade::Kernels, scaler: crate::scaler::Kernels, convert: crate::convert::Kernels) -> GpuCaps {
         let mut caps = Self::CAPS;
         if kernels != crate::grade::Kernels::Match {
             caps.grade = GradeKinds::NONE;
         }
         caps.exact_scaler = scaler.exact();
+        // The conversion's way in is the grade's kernel too: the conversion is in the caps where both are measured.
+        caps.matrix_convert = convert.converts() && kernels == crate::grade::Kernels::Match;
         caps
     }
 
@@ -850,6 +872,7 @@ impl Compositor {
         caps.mask = true;
         caps.exact_scaler = true;
         caps.blur_fill = true;
+        caps.matrix_convert = true;
         caps.grade = GradeKinds::ALL;
         caps.effects = EffectKinds::BLUR
             .union(EffectKinds::SHARPEN)
@@ -885,6 +908,16 @@ impl Compositor {
     #[must_use]
     pub fn with_scaler_kernels(mut self, kernels: crate::scaler::Kernels) -> Self {
         self.scaler_kernels = Some(kernels);
+        self
+    }
+
+    /// Pin whether this FFmpeg converts a layer into the composite's matrix as the model does, instead of measuring
+    /// the ffmpeg this process runs ([`crate::convert::kernels`], on the first mixed-matrices plan unless [`prepare`] ran
+    /// ahead of it): for a host that knows its ffmpeg, and for tests. Anything but `Match` takes
+    /// [`GpuCaps::matrix_convert`] out of [`Compositor::caps`].
+    #[must_use]
+    pub fn with_convert_kernels(mut self, kernels: crate::convert::Kernels) -> Self {
+        self.convert_kernels = Some(kernels);
         self
     }
 
@@ -1187,6 +1220,7 @@ impl Compositor {
                 geq_edge: None,
                 grade_kernels: None,
                 scaler_kernels: None,
+                convert_kernels: None,
                 key_terms: OnceLock::new(),
                 graph_threads: None,
             })
@@ -1707,6 +1741,66 @@ impl Compositor {
             current = out;
         }
         current
+    }
+
+    /// Whether, and how, FFmpeg 9 converts this layer into the composite's matrix, or why this compositor will not draw it.
+    /// The plan has judged the same (`RenderPlan::reasons`, `convert_refusal`); these are the render's own guards.
+    fn converted_of(
+        &self,
+        plan: &RenderPlan,
+        layer: &kerf_core::PlanLayer,
+        geom: &LayerGeometry,
+    ) -> Result<Option<Converted>, GpuError> {
+        if plan.canvas.policy != kerf_core::CompositeColorPolicy::BottomLayerTag || layer.stream.is_rgb() {
+            return Ok(None);
+        }
+        let Some(from) = layer.stream.matrix().filter(|m| *m != plan.canvas.matrix) else {
+            return Ok(None);
+        };
+        let unsupported = |what: &str| {
+            GpuError::Unsupported(format!(
+                "layer {}: a conversion from {from:?} into the composite's {:?} {what}",
+                layer.name, plan.canvas.matrix
+            ))
+        };
+        match self.convert_kernels.unwrap_or_else(crate::convert::kernels) {
+            crate::convert::Kernels::Match => {}
+            crate::convert::Kernels::Differs(why) => {
+                return Err(unsupported(&format!(
+                    "because this FFmpeg's conversion is not the one the compositor follows ({why})"
+                )))
+            }
+            crate::convert::Kernels::Unknown => return Err(unsupported("until this FFmpeg's conversion can be measured")),
+        }
+        // The conversion's way in is the grade's kernel.
+        if self.grade_kernels.unwrap_or_else(crate::grade::kernels) != crate::grade::Kernels::Match {
+            return Err(unsupported(
+                "until this FFmpeg's conversions to and from RGB are known to match",
+            ));
+        }
+        if plan.mode == kerf_core::PlanMode::Motion && plan.canvas.other_alpha_in_cut {
+            return Err(unsupported(
+                "in a cut with a masked, rotated or translucent clip (which clip decides the matrix there is not measured)",
+            ));
+        }
+        if let Some(why) = plan.convert_refusal(layer) {
+            return Err(unsupported(&format!("for {why}")));
+        }
+        if (plan.mode == kerf_core::PlanMode::Still || plan.on_alpha_plane(layer))
+            && geom.stages.last().is_some_and(|s| s.scaled != (s.src.w, s.src.h))
+        {
+            return Err(unsupported(
+                "on a layer whose last scale resizes it in a still or while it dissolves (that scale converts the matrix in the same pass)",
+            ));
+        }
+        let off_grid = |(w, h): (u32, u32)| w % 2 != 0 || h % 2 != 0;
+        if off_grid(geom.picture) || off_grid(geom.layer) || (geom.matte && off_grid(geom.picture_at)) || geom.rotation.is_some()
+        {
+            return Err(unsupported(
+                "on a picture of odd size, or whose bars meet it off the 4:2:0 grid",
+            ));
+        }
+        Ok(Some(Converted { from }))
     }
 
     /// The frame of a blurred fill with the picture on it: per plane, the picture scaled to the thumbnail's cover
@@ -2500,6 +2594,7 @@ impl Compositor {
                     "layer {n}: a fade to black or white running on a graded layer (FFmpeg fades the RGB picture the grade leaves)"
                 )));
             }
+            let converted = self.converted_of(plan, layer, &geom)?;
             let count = if look.steps.iter().any(|s| matches!(s, Step::Vignette)) {
                 layer_count(plan, n, counts)?
             } else {
@@ -2514,6 +2609,7 @@ impl Compositor {
                 look,
                 count,
                 fill,
+                converted,
             });
         }
         // FFmpeg rasterises what text there is, here, before the GPU is touched. No project lock is
@@ -2619,6 +2715,7 @@ impl Compositor {
             look,
             count,
             fill,
+            converted,
         } in drawn
         {
             let (cw, ch) = frame.chroma_size();
@@ -2668,6 +2765,12 @@ impl Compositor {
             };
             if let Some(grade) = &look.grade {
                 current = self.grade_planes(&mut enc, &current, grade)?;
+            }
+            // A layer of another matrix than the composite's is converted into it after the chain's last scale and
+            // `pad`, ahead of its `format` (so a dissolve's alpha plane, which that `format` adds, is not touched): on the
+            // picture, alone, whose 2x2 blocks never share a sample with the bars (black in every matrix).
+            if let Some(c) = converted {
+                current = self.convert_matrix(&mut enc, &current, c.from, plan.canvas.matrix)?;
             }
             for step in &look.steps {
                 current = match step {
@@ -3463,13 +3566,17 @@ mod tests {
             kernel: Kernel::X86,
             default: crate::sws::Scaler::Bicubic,
         });
-        assert_eq!(Compositor::caps_for(Kernels::Match, simd), Compositor::CAPS);
+        let converts = crate::convert::Kernels::Match;
+        assert_eq!(Compositor::caps_for(Kernels::Match, simd, converts), Compositor::CAPS);
         assert_eq!(Compositor::CAPS.grade, GradeKinds::ALL);
         for kernels in [Kernels::Differs("a chain"), Kernels::Unknown] {
-            let caps = Compositor::caps_for(kernels, simd);
+            let caps = Compositor::caps_for(kernels, simd, converts);
             assert_eq!(caps.grade, GradeKinds::NONE, "{kernels:?}");
+            // (The conversion between matrices reads RGB through the grade's kernel: it goes with it.)
+            assert!(!caps.matrix_convert, "{kernels:?}");
             let mut restored = caps;
             restored.grade = GradeKinds::ALL;
+            restored.matrix_convert = true;
             assert_eq!(restored, Compositor::CAPS, "{kernels:?}: nothing else moves");
         }
     }
@@ -3484,14 +3591,37 @@ mod tests {
             default: crate::sws::Scaler::Bicubic,
         };
         for scaler in [Scaler::Match(model(Kernel::X86)), Scaler::Match(model(Kernel::C))] {
-            assert!(Compositor::caps_for(Kernels::Match, scaler).exact_scaler, "{scaler:?}");
+            assert!(
+                Compositor::caps_for(Kernels::Match, scaler, crate::convert::Kernels::Match).exact_scaler,
+                "{scaler:?}"
+            );
         }
         for scaler in [Scaler::Differs, Scaler::Unknown] {
-            let caps = Compositor::caps_for(Kernels::Match, scaler);
+            let caps = Compositor::caps_for(Kernels::Match, scaler, crate::convert::Kernels::Match);
             assert!(!caps.exact_scaler, "{scaler:?}");
             let mut restored = caps;
             restored.exact_scaler = true;
             assert_eq!(restored, Compositor::CAPS, "{scaler:?}: nothing else moves");
+        }
+    }
+
+    /// The conversion between matrices is in the caps only where it was measured to be swscale's, and nothing else moves.
+    #[test]
+    fn the_matrix_conversion_is_in_the_caps_only_where_it_is_known_to_match() {
+        use crate::convert::Kernels as Convert;
+        use crate::grade::Kernels;
+        use crate::scaler::{Kernel, Kernels as Scaler, Model};
+        let simd = Scaler::Match(Model {
+            kernel: Kernel::X86,
+            default: crate::sws::Scaler::Bicubic,
+        });
+        assert!(Compositor::caps_for(Kernels::Match, simd, Convert::Match).matrix_convert);
+        for convert in [Convert::Differs("an opaque picture"), Convert::Unknown] {
+            let caps = Compositor::caps_for(Kernels::Match, simd, convert);
+            assert!(!caps.matrix_convert, "{convert:?}");
+            let mut restored = caps;
+            restored.matrix_convert = true;
+            assert_eq!(restored, Compositor::CAPS, "{convert:?}: nothing else moves");
         }
     }
 

@@ -317,6 +317,7 @@ fn compositor() -> &'static Compositor {
         // ahead of a frame): the harness measures them once, up front, and its grade cases hold the answer to `Match`.
         let _ = kerf_gpu::grade::kernels();
         let _ = kerf_gpu::scaler::kernels();
+        let _ = kerf_gpu::convert::kernels();
         Compositor::new(gpu()).expect("a compositor")
     })
 }
@@ -3077,17 +3078,285 @@ fn a_clip_past_the_end_of_its_footage_draws_nothing_like_ffmpeg() {
     check("clamped-end/nothing-drawn", &tl, &assets, &[1.99, 3.0], STRICT);
 }
 
-/// A stack whose layers carry different YCbCr matrices (or an RGB picture in a stack
-/// that is not BT.601). Under a fixed-matrix FFmpeg nothing converts them and the
-/// compositor draws it like any other; under one that negotiates the matrix across
-/// the overlay chain, FFmpeg converts every layer into the bottom layer's with an
-/// arithmetic the compositor does not reproduce (measured: 15-30 levels off), so the
-/// plan refuses it — and the case holds the refusal, with FFmpeg rendering it.
+/// A stack whose layers carry different YCbCr matrices (or an RGB picture in a stack that is not BT.601) that the compositor
+/// cannot take into the bottom layer's matrix. Under a fixed-matrix FFmpeg nothing converts them and the compositor draws
+/// it like any other; under one that negotiates the matrix across the overlay chain, FFmpeg converts every layer into
+/// the bottom layer's by swscale's two-step conversion through RGB, which the compositor reproduces for a plain opaque
+/// layer (`check_converted`) and not for the rest (a translucent or graded layer, an RGB picture: the case holds the
+/// refusal, with FFmpeg rendering it).
 fn check_mixed(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], reason: &'static str) {
     match policy() {
         CompositeColorPolicy::FixedBt601 => check(case, tl, assets, times, STRICT),
         CompositeColorPolicy::BottomLayerTag => {
             check_refused(&format!("{case} (negotiated)"), tl, assets, times[0], Refusal::Plan(reason));
+        }
+        CompositeColorPolicy::Unknown => unreachable!("policy() never answers Unknown"),
+    }
+}
+
+/// A stack whose layers carry different YCbCr matrices that the compositor draws: under a fixed-matrix FFmpeg as every
+/// stack, under one that negotiates the matrix across the overlay chain each layer of another matrix than the bottom's
+/// is converted into it (`kerf_gpu::convert`), and the composite is exactly the still's.
+fn check_converted(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64]) {
+    check_converted_with(case, tl, assets, times, STRICT);
+}
+
+/// [`check_converted`] with the harness's `limits` for the RGB comparison (the planes are exact whatever they are).
+fn check_converted_with(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], limits: Limits) {
+    match policy() {
+        CompositeColorPolicy::FixedBt601 => check(case, tl, assets, times, limits),
+        CompositeColorPolicy::BottomLayerTag => check_exact(&format!("{case} (converted)"), tl, assets, times, limits),
+        CompositeColorPolicy::Unknown => unreachable!("policy() never answers Unknown"),
+    }
+}
+
+/// A layer whose matrix is not the bottom layer's is converted into it by FFmpeg 9 (swscale's two-step conversion through RGB,
+/// `kerf_gpu::convert`), and drawn exactly where the picture the chain made is not resized by the chain's last `scale`: every
+/// pair of BT.601 / BT.709 / BT.2020 in either order, dissolving in and out, on busy pictures, at several times; a layer a `scale`
+/// resizes (a picture-in-picture, a shrink, an enlargement, a Cover crop, a letterbox) is refused in a still (`check_resized`). The
+/// stills hold the stack on screen as the graph (the bottom layer's tag is the composite's). What the conversion does not
+/// cover is refused, each with FFmpeg rendering it (`check_mixed`): translucent, graded, an `eq` ahead of it, a fade to black running
+/// on it, an RGB picture, a picture of odd size. Under a fixed-matrix FFmpeg none of it converts and all of it is drawn as it is.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn layers_of_another_matrix_are_converted_into_the_bottom_ones() {
+    let m = media();
+    let pip = |a: &Asset| {
+        let mut c = clip(a, 0.0, 2.0, 0.0);
+        c.transform = Transform {
+            scale: 0.5,
+            pos_x: 0.2,
+            pos_y: -0.1,
+            ..Transform::default()
+        };
+        c
+    };
+    // Every pair of matrices of the untagged (BT.601), BT.709 and BT.2020 pictures, both ways round; whole frame over whole frame
+    // (the top covers the bottom: the frame is the top layer as converted), then a picture-in-picture (refused in a still).
+    let matrices: [(&str, &Asset, &Asset); 3] = [
+        ("601", &m.testsrc, &m.gradient),
+        ("709", &m.testsrc709, &m.gradient709),
+        ("2020", &m.testsrc2020, &m.gradient2020),
+    ];
+    for (bn, bottom, _) in &matrices {
+        for (tn, top, _) in &matrices {
+            if bn == tn {
+                continue;
+            }
+            let assets = [(*bottom).clone(), (*top).clone()];
+            let tl = timeline(vec![vec![clip(bottom, 0.0, 2.0, 0.0)], vec![clip(top, 0.0, 2.0, 0.0)]], None);
+            check_converted(&format!("convert/{tn} over {bn}, whole frame"), &tl, &assets, &[0.5, 1.5]);
+            let tl = timeline(vec![vec![clip(bottom, 0.0, 2.0, 0.0)], vec![pip(top)]], None);
+            check_resized(&format!("convert/{tn} over {bn}, pip"), &tl, &assets, 0.5);
+        }
+    }
+    // BT.601's coefficients under a tag (`smpte170m`) are the same matrix as no tag: nothing to convert in either order, and a
+    // BT.709 clip over it is converted into it.
+    let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![pip(&m.testsrc170m)]], None);
+    check_converted(
+        "convert/170m over untagged (one matrix)",
+        &tl,
+        &[m.bars.clone(), m.testsrc170m.clone()],
+        &[0.5],
+    );
+    let tl = timeline(
+        vec![
+            vec![clip(&m.testsrc170m, 0.0, 2.0, 0.0)],
+            vec![clip(&m.testsrc709, 0.0, 2.0, 0.0)],
+        ],
+        None,
+    );
+    check_converted(
+        "convert/709 over 170m",
+        &tl,
+        &[m.testsrc170m.clone(), m.testsrc709.clone()],
+        &[0.5],
+    );
+    // Three layers, two of them converted, one of them of the bottom's matrix.
+    let tl = timeline(
+        vec![
+            vec![clip(&m.gradient709, 0.0, 2.0, 0.0)],
+            vec![pip(&m.testsrc)],
+            vec![{
+                let mut c = pip(&m.bars709);
+                c.transform.pos_x = -0.25;
+                c
+            }],
+            vec![{
+                let mut c = pip(&m.testsrc2020);
+                c.transform.pos_x = -0.1;
+                c.transform.pos_y = 0.3;
+                c.transform.scale = 0.4;
+                c
+            }],
+        ],
+        None,
+    );
+    check_resized(
+        "convert/three over a bottom, two converted",
+        &tl,
+        &[
+            m.gradient709.clone(),
+            m.testsrc.clone(),
+            m.bars709.clone(),
+            m.testsrc2020.clone(),
+        ],
+        0.5,
+    );
+    // The canvas's size and the picture's: shrunk, enlarged, letterboxed, Cover: refused in a still, the last scale resizes.
+    for (name, delivery) in [
+        ("shrunk", Delivery::new(320, 180, Fit::Contain)),
+        ("enlarged", Delivery::new(960, 540, Fit::Contain)),
+        ("cover", Delivery::new(360, 640, Fit::Cover)),
+    ] {
+        let tl = timeline(
+            vec![
+                vec![clip(&m.gradient709, 0.0, 2.0, 0.0)],
+                vec![clip(&m.testsrc, 0.0, 2.0, 0.0)],
+            ],
+            Some(delivery),
+        );
+        check_resized(
+            &format!("convert/untagged over 709, {name}"),
+            &tl,
+            &[m.gradient709.clone(), m.testsrc.clone()],
+            0.5,
+        );
+    }
+    // Letterboxed: a landscape picture on a portrait canvas, bars above and below it.
+    let tl = timeline(
+        vec![
+            vec![clip(&m.gradient709, 0.0, 2.0, 0.0)],
+            vec![clip(&m.testsrc, 0.0, 2.0, 0.0)],
+        ],
+        Some(Delivery::new(320, 640, Fit::Contain)),
+    );
+    check_resized(
+        "convert/untagged letterboxed over 709",
+        &tl,
+        &[m.gradient709.clone(), m.testsrc.clone()],
+        0.5,
+    );
+    // Busy: per-pixel noise (every Y, U, V and the clipped RGB), and the 1-px checkerboard, converted from a tag to another.
+    let tl = timeline(
+        vec![vec![clip(&m.gradient709, 0.0, 0.2, 0.0)], vec![clip(&m.noise, 0.0, 0.2, 0.0)]],
+        None,
+    );
+    check_converted_with(
+        "convert/noise over 709",
+        &tl,
+        &[m.gradient709.clone(), m.noise.clone()],
+        &[0.1],
+        BUSY,
+    );
+    let tl = timeline(
+        vec![
+            vec![clip(&m.gradient2020, 0.0, 0.2, 0.0)],
+            vec![clip(&m.checker, 0.0, 0.2, 0.0)],
+        ],
+        None,
+    );
+    check_converted_with(
+        "convert/checkerboard over 2020",
+        &tl,
+        &[m.gradient2020.clone(), m.checker.clone()],
+        &[0.1],
+        BUSY,
+    );
+    // A dissolve between clips of two matrices, at the start, the middle and the end of the ramp and after it (the dissolving
+    // clip is converted ahead of its alpha plane, which the ramp scales).
+    for (name, from, to) in [
+        ("709 into untagged", &m.testsrc709, &m.testsrc),
+        ("untagged into 709", &m.testsrc, &m.testsrc709),
+        ("2020 into 709", &m.testsrc2020, &m.testsrc709),
+    ] {
+        for kind in [
+            TransitionKind::Crossfade,
+            TransitionKind::SlideLeft,
+            TransitionKind::DipToBlack,
+        ] {
+            let mut incoming = clip(to, 0.0, 1.5, 1.0);
+            incoming.transition_in = Some(Transition { kind, duration: 0.6 });
+            let tl = timeline(vec![vec![clip(from, 0.0, 1.5, 0.0), incoming]], None);
+            let assets = [from.clone(), to.clone()];
+            let case = format!("convert/{name} through {kind:?}");
+            // A dip to black fades the incoming picture to black before the conversion: refused while it runs.
+            if kind == TransitionKind::DipToBlack && policy() == CompositeColorPolicy::BottomLayerTag {
+                check_refused(&case, &tl, &assets, 1.1, Refusal::Plan("fade to black running"));
+                check_converted(&case, &tl, &assets, &[0.5, 2.0]);
+            } else {
+                check_converted(&case, &tl, &assets, &[0.5, 1.1, 1.3, 1.5, 2.0]);
+            }
+        }
+    }
+    // Refused: what the conversion does not cover (FFmpeg draws the frame; under a fixed matrix the layers are drawn as they are).
+    let over = |top: Asset, edit: &dyn Fn(&mut Clip)| {
+        let mut c = clip(&top, 0.0, 2.0, 0.0);
+        edit(&mut c);
+        (
+            timeline(vec![vec![clip(&m.bars709, 0.0, 2.0, 0.0)], vec![c]], None),
+            vec![m.bars709.clone(), top],
+        )
+    };
+    let (tl, assets) = over(m.testsrc.clone(), &|c| c.transform.opacity = 0.6);
+    if policy() == CompositeColorPolicy::BottomLayerTag {
+        check_mixed("convert/translucent", &tl, &assets, &[0.5], "opacity below 1");
+    }
+    let (tl, assets) = over(m.testsrc.clone(), &|c| {
+        c.color = Color {
+            contrast: 1.2,
+            ..Color::default()
+        }
+    });
+    check_mixed("convert/colour corrected", &tl, &assets, &[0.5], "colour correction");
+    let (tl, assets) = over(m.testsrc.clone(), &|c| c.effects = vec![kerf_core::VideoEffect::Invert]);
+    check_mixed("convert/effect", &tl, &assets, &[0.5], "video effect");
+    let (tl, assets) = over(m.testsrc.clone(), &|c| c.transform.rotation = 10.0);
+    if policy() == CompositeColorPolicy::BottomLayerTag {
+        check_mixed("convert/rotated", &tl, &assets, &[0.5], "rotation");
+    }
+    let (tl, assets) = over(m.testsrc.clone(), &|c| {
+        c.mask = Some(a_mask(kerf_core::MaskShape::Ellipse, 0.1, false));
+    });
+    check_mixed("convert/masked", &tl, &assets, &[0.5], "mask");
+    let (tl, assets) = over(m.odd.clone(), &|_| {});
+    check_mixed("convert/odd size", &tl, &assets, &[0.5], "odd size");
+    let (tl, assets) = over(m.png640.clone(), &|_| {});
+    check_mixed("convert/rgb png over 709", &tl, &assets, &[0.5], "RGB picture");
+    // A fade to black running on the converted clip: FFmpeg fades the picture first. At the clip's start (running), then after.
+    let mut faded = clip(&m.testsrc, 0.0, 2.0, 0.0);
+    faded.fade_in = 0.6;
+    let tl = timeline(vec![vec![clip(&m.bars709, 0.0, 2.0, 0.0)], vec![faded]], None);
+    let assets = [m.bars709.clone(), m.testsrc.clone()];
+    if policy() == CompositeColorPolicy::BottomLayerTag {
+        check_refused(
+            "convert/fade-in running",
+            &tl,
+            &assets,
+            0.2,
+            Refusal::Plan("fade to black running"),
+        );
+    }
+    check_converted("convert/fade-in finished", &tl, &assets, &[1.0]);
+}
+
+/// A layer of another matrix than the bottom's whose last `scale` resizes it, in a still: the graph has no `format` ahead of
+/// the overlay, so the `scale` converts the matrix itself, in the same pass as the resize (swscale scales and converts to
+/// `bgr24` at the destination size, then `ff_rgb24toyv12`), which is not the conversion of the picture the resize made
+/// (measured: 47398 of 230400 luma samples differ on a half-size picture-in-picture). The case holds the refusal, with
+/// FFmpeg rendering it; under a fixed-matrix FFmpeg the layers are drawn as they are. (An export's chain ends in `format`,
+/// and its layers are converted by a `scale` of their own after it: `motion_parity.rs`.)
+fn check_resized(case: &str, tl: &Timeline, assets: &[Asset], t: f64) {
+    match policy() {
+        CompositeColorPolicy::FixedBt601 => check(case, tl, assets, &[t], STRICT),
+        CompositeColorPolicy::BottomLayerTag => {
+            check_refused(
+                &format!("{case} (negotiated)"),
+                tl,
+                assets,
+                t,
+                Refusal::Plan("last scale resizes it"),
+            );
         }
         CompositeColorPolicy::Unknown => unreachable!("policy() never answers Unknown"),
     }
@@ -3143,7 +3412,7 @@ fn the_composite_follows_the_matrix_ffmpeg_negotiates() {
         &[0.5],
         STRICT,
     );
-    // Mixed tags, any order: refused under negotiation.
+    // Mixed tags, any order: a picture-in-picture is scaled by the chain's last `scale`, which converts the matrix in the same pass: refused in a still.
     for (name, base, top) in [
         ("matrix/mixed-709-over-untagged", &m.gradient, &m.testsrc709),
         ("matrix/mixed-untagged-over-709", &m.gradient709, &m.testsrc),
@@ -3151,7 +3420,7 @@ fn the_composite_follows_the_matrix_ffmpeg_negotiates() {
         ("matrix/mixed-2020-over-709", &m.gradient709, &m.testsrc2020),
     ] {
         let tl = timeline(vec![vec![clip(base, 0.0, 2.0, 0.0)], vec![pip(top)]], None);
-        check_mixed(name, &tl, &[base.clone(), top.clone()], &[0.5], "different YCbCr matrices");
+        check_resized(name, &tl, &[base.clone(), top.clone()], 0.5);
     }
     // An RGB picture (a PNG, at its own size: it is under the pip, since resizing an
     // RGB picture is refused) among untagged layers is nothing special; among tagged
@@ -3222,7 +3491,7 @@ fn translucent_layers_take_the_round_trip_with_the_right_matrices() {
         &tl,
         &[m.bars709.clone(), m.testsrc.clone()],
         &[0.5],
-        "different YCbCr matrices",
+        "other than the composite's",
     );
     let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![fade(&m.testsrc709, 0.5)]], None);
     check_mixed(
@@ -3230,7 +3499,7 @@ fn translucent_layers_take_the_round_trip_with_the_right_matrices() {
         &tl,
         &[m.bars.clone(), m.testsrc709.clone()],
         &[0.5],
-        "different YCbCr matrices",
+        "other than the composite's",
     );
     // Formats that are not 8-bit 4:2:0 take the same round trip (FFmpeg converts
     // them to yuva420p first; so does the decode).
@@ -5761,7 +6030,7 @@ fn footage_that_is_not_untagged_hd_is_left_as_it_is_and_the_other_matrices_stay_
     ] {
         let (tl, assets) = hd_stack(base, top, 1.0);
         assert!(labelled_layers(&tl, &assets, 0.5).iter().all(|l| !l), "{name}");
-        check_mixed(name, &tl, &assets, &[0.5], "different YCbCr matrices");
+        check_resized(name, &tl, &assets, 0.5);
     }
     // Untagged HD beside footage tagged BT.601 is labelled BT.709 (a stated matrix is a matrix): the
     // stack is mixed now, where FFmpeg read both alike before. It is drawn where the composite is fixed.
@@ -5772,7 +6041,7 @@ fn footage_that_is_not_untagged_hd_is_left_as_it_is_and_the_other_matrices_stay_
     ] {
         let (tl, assets) = hd_stack(base, top, 1.0);
         assert!(labelled_layers(&tl, &assets, 0.5).iter().any(|l| *l), "{name}");
-        check_mixed(name, &tl, &assets, &[0.5], "different YCbCr matrices");
+        check_resized(name, &tl, &assets, 0.5);
     }
     // A PNG logo is RGB: never labelled, and it names no YCbCr matrix. At the canvas's own size (an RGB
     // picture is not resized) it is BT.601 with untagged HD, under it or translucent over it: drawn. In a
@@ -5983,7 +6252,7 @@ fn the_previews_proxies_stack_as_their_originals_do() {
     // An SD proxy is as it was, and beside a BT.709 proxy is refused where the matrix is negotiated.
     let sd = proxies.of(h.get("detail/sd-untagged"));
     let (tl, assets) = hd_stack(&phone, &sd, 1.0);
-    check_mixed("proxy/sd-untagged-over-709", &tl, &assets, &[0.5], "different YCbCr matrices");
+    check_resized("proxy/sd-untagged-over-709", &tl, &assets, 0.5);
     let (tl, assets) = hd_stack(&untagged, &sd, 1.0);
     check("proxy/sd-untagged-over-untagged-hd", &tl, &assets, &[0.5], STRICT);
 }
@@ -6712,7 +6981,7 @@ fn a_grade_is_drawn_as_the_still_draws_it() {
         &tl,
         &[m.bars709.clone(), m.testsrc.clone()],
         &[0.5],
-        "different YCbCr matrices",
+        "other than the composite's",
     );
     let tl = timeline(vec![vec![over.clone()], vec![clip(&m.testsrc709, 0.0, 2.0, 0.0)]], None);
     check_mixed(
@@ -6720,7 +6989,7 @@ fn a_grade_is_drawn_as_the_still_draws_it() {
         &tl,
         &[m.testsrc.clone(), m.testsrc709.clone()],
         &[0.5],
-        "different YCbCr matrices",
+        "other than the composite's",
     );
     let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![over]], None);
     check(
@@ -7079,7 +7348,6 @@ fn a_blurred_fill_is_drawn_as_the_still_draws_it() {
 /// conversion ([`still_planes_differ`]), no differing sample. For the cases whose claim is *exact*, which the RGB comparison's
 /// edge band and PSNR cannot make.
 fn check_exact(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], limits: Limits) {
-    check(case, tl, assets, times, limits);
     for &t in times {
         assert_eq!(
             still_planes_differ(tl, assets, t),
@@ -7087,6 +7355,7 @@ fn check_exact(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], limit
             "{case} @ {t}: the composite is not the still's"
         );
     }
+    check(case, tl, assets, times, limits);
 }
 
 /// The still, exact: its `yuv444p` planes (`timeline_frame_yuv_cancellable`: the composite's samples with the one conversion

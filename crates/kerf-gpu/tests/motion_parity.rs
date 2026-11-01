@@ -61,6 +61,7 @@ fn compositor() -> &'static Compositor {
         // ahead of a frame): the harness measures them once, up front, and its grade cases hold the answer to `Match`.
         let _ = kerf_gpu::grade::kernels();
         let _ = kerf_gpu::scaler::kernels();
+        let _ = kerf_gpu::convert::kernels();
         Compositor::new(gpu()).expect("a compositor")
     })
 }
@@ -1889,9 +1890,15 @@ fn grade_steep_split(tl: &Timeline, assets: &[Asset], fps: f64, secs: f64) -> (u
 }
 
 /// [`run_refusing`] for a grade whose tables step past two on some frames of a layer the scaler resizes: those frames are
-/// FFmpeg's and the others are held to the export at `limits`. `refused` is how many frames that is (`None`: some, not all).
+/// FFmpeg's and the others are held to the export at `limits` (on a machine whose scaler is not measured exact; where it is, every frame is drawn and exact). `refused` is how many frames that is (`None`: some, not all).
 fn run_grade_steep(case: &str, tl: &Timeline, assets: &[Asset], secs: f64, limits: Limits, refused: Option<usize>) {
     let (n, drawn) = grade_steep_split(tl, assets, 30.0, secs);
+    // Where the scaler is measured to be swscale's there is no level for the tables to multiply: every frame is drawn, to the level.
+    if kerf_gpu::scaler::kernels().exact() {
+        assert_eq!(n, 0, "{case}: {n} frames refused for GradeSteep with an exact scaler");
+        run(case, tl, assets, 30.0, secs, EXACT);
+        return;
+    }
     match refused {
         Some(want) => assert_eq!(n, want, "{case}: {n} frames refused, {drawn} drawn"),
         None => assert!(n > 0 && drawn > 0, "{case}: {n} frames refused, {drawn} drawn"),
@@ -5200,6 +5207,443 @@ fn a_graded_clip_beside_a_clip_of_its_own_matrix_is_drawn_in_either_order() {
     run("grade/smpte170m after untagged", &tl, &assets, 30.0, 2.0, EXACT);
 }
 
+// ---- layers of another matrix than the bottom's -----------------------------------------------------------
+//
+// FFmpeg 9 makes the first clip of the graph's tag the composite's for the whole cut and converts every clip of another
+// matrix into it, wherever on the timeline the two are: swscale's two-step conversion through RGB, a `scale` of its own after
+// the chain's last `format` (`kerf_gpu::convert`, probed). The compositor converts the picture the chain has made (after
+// the fit `scale` and `pad`, so a phone clip shrunk into a landscape frame is scaled, then converted) and the planes are the
+// export's to the level: no case here has a bound above `EXACT`. Under a fixed-matrix FFmpeg nothing converts, and the same
+// cases are the layers drawn as they are.
+
+/// Footage tagged and untagged for the conversion cases: a phone-shaped pair (540x960, 960x540 canvas: the picture
+/// 304 wide, the bars 328 each side), tagged BT.709 and `smpte170m`, and per-pixel noise tagged BT.709. Lossless H.264.
+struct MatrixMedia {
+    portrait709: Asset,
+    portrait601: Asset,
+    noise709: Asset,
+    wide709: Asset,
+    wide601: Asset,
+}
+
+fn matrix_media() -> &'static MatrixMedia {
+    static M: OnceLock<MatrixMedia> = OnceLock::new();
+    M.get_or_init(|| {
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("motion-media-matrix");
+        std::fs::create_dir_all(&dir).unwrap();
+        let make = |name: &str, lavfi: &str| -> Asset {
+            let p = dir.join(name);
+            ffmpeg(&[
+                "-f",
+                "lavfi",
+                "-i",
+                lavfi,
+                "-c:v",
+                "libx264",
+                "-preset",
+                "ultrafast",
+                "-qp",
+                "0",
+                "-g",
+                "10",
+                "-pix_fmt",
+                "yuv420p",
+                p.to_str().unwrap(),
+            ]);
+            probed(&p)
+        };
+        let bt709 = "setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709";
+        // (BT.601 by a tag: an untagged picture this size would be labelled BT.709 by the graph beside a tagged one, and be
+        // the bottom's matrix, with nothing to convert.)
+        let smpte170m = "setparams=colorspace=smpte170m:color_primaries=smpte170m:color_trc=smpte170m";
+        let noise = "nullsrc=size=640x360:rate=30:duration=4,format=yuv420p,geq=lum='random(1)*255':cb='random(2)*255':cr='random(3)*255'";
+        MatrixMedia {
+            portrait709: make("portrait709.mp4", &format!("testsrc2=size=540x960:rate=30:duration=4,{bt709}")),
+            portrait601: make("portrait601.mp4", &format!("testsrc2=size=540x960:rate=30:duration=4,{smpte170m}")),
+            noise709: make("noise709.mp4", &format!("{noise},{bt709}")),
+            wide709: make("wide709.mp4", &format!("smptehdbars=size=960x540:rate=30:duration=4,{bt709}")),
+            wide601: make("wide601.mp4", &format!("smptehdbars=size=960x540:rate=30:duration=4,{smpte170m}")),
+        }
+    })
+}
+
+/// A layer the conversion does not cover (`MixedMatricesWith`), or a cut it does not cover at all (`MixedMatrices`: a clip on an
+/// alpha plane in it, an opacity or a rotation among them).
+fn matrix_conversion_refused() -> Refusing {
+    refusing("MixedMatrices(With)", |u| {
+        matches!(u, Unsupported::MixedMatrices | Unsupported::MixedMatricesWith(..))
+    })
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn layers_of_another_matrix_are_converted_into_the_bottom_ones() {
+    use CompositeColorPolicy::FixedBt601;
+    let m = media();
+    let v = variants();
+    let b = blur_media();
+    let x = matrix_media();
+    let negotiates = policy() != FixedBt601;
+    let one = |a: &Asset| std::slice::from_ref(a).to_vec();
+    // Two clips back to back on one track, every order of the matrices: the first clip's tag is the composite's for the
+    // whole cut, so the second is converted in its own second, and the first is as it is.
+    let pairs: [(&str, &Asset, &Asset); 8] = [
+        ("709 then untagged", &v.testsrc709, &m.testsrc),
+        ("untagged then 709", &m.testsrc, &v.testsrc709),
+        ("709 then 2020", &v.testsrc709, &b.bt2020),
+        ("2020 then 709", &b.bt2020, &v.testsrc709),
+        ("untagged then 2020", &m.testsrc, &b.bt2020),
+        ("smpte170m then 709", &v.testsrc170m, &v.testsrc709),
+        ("709 then smpte170m", &v.testsrc709, &v.testsrc170m),
+        ("709 then bt470bg", &v.testsrc709, &v.testsrc470bg),
+    ];
+    for (name, first, second) in pairs {
+        let tl = timeline(vec![vec![clip(first, 0.5, 1.5, 0.0), clip(second, 0.5, 1.5, 1.0)]], None);
+        run(
+            &format!("convert/{name}"),
+            &tl,
+            &[first.clone(), second.clone()],
+            30.0,
+            2.0,
+            EXACT,
+        );
+    }
+    // One matrix is not a mix (BT.601's coefficients under a tag, untagged beside it): nothing converted, drawn as ever.
+    let tl = timeline(
+        vec![vec![clip(&m.testsrc, 0.5, 1.5, 0.0), clip(&v.testsrc170m, 0.5, 1.5, 1.0)]],
+        None,
+    );
+    run(
+        "convert/untagged then smpte170m",
+        &tl,
+        &[m.testsrc.clone(), v.testsrc170m.clone()],
+        30.0,
+        2.0,
+        EXACT,
+    );
+    // Busy: every Y, U, V and the clipped RGB, converted from a tag to another.
+    let tl = timeline(
+        vec![vec![clip(&x.noise709, 0.5, 1.5, 0.0), clip(&m.noise, 0.5, 1.5, 1.0)]],
+        None,
+    );
+    run(
+        "convert/noise, 709 then untagged",
+        &tl,
+        &[x.noise709.clone(), m.noise.clone()],
+        30.0,
+        2.0,
+        EXACT,
+    );
+    // A clip over another track, whole frame and shrunk (a picture-in-picture: the picture is scaled, then converted), over a
+    // bottom layer of the other matrix and under one.
+    for (name, bottom, top) in [
+        ("untagged pip over 709", &v.bars709, &m.testsrc),
+        ("709 pip over untagged", &m.bars, &v.testsrc709),
+        ("2020 pip over 709", &v.bars709, &b.bt2020),
+    ] {
+        let mut pip = clip(top, 0.5, 1.5, 0.0);
+        pip.transform.scale = 0.5;
+        pip.transform.pos_x = 0.2;
+        pip.transform.pos_y = -0.1;
+        let tl = timeline(vec![vec![clip(bottom, 0.5, 1.5, 0.0)], vec![pip]], None);
+        run(
+            &format!("convert/{name}"),
+            &tl,
+            &[bottom.clone(), top.clone()],
+            30.0,
+            1.0,
+            EXACT,
+        );
+        let tl = timeline(vec![vec![clip(bottom, 0.5, 1.5, 0.0)], vec![clip(top, 0.5, 1.5, 0.0)]], None);
+        run(
+            &format!("convert/{}, whole frame", name.replace("pip", "layer")),
+            &tl,
+            &[bottom.clone(), top.clone()],
+            30.0,
+            1.0,
+            EXACT,
+        );
+    }
+    // The graph's order, not the timeline's: the bottom track's clip is later than the upper track's, so for the first second the
+    // clip alone on screen is of the other matrix than the composite's, and converted all the same.
+    for (name, bottom, top) in [
+        ("709 bottom, untagged first", &v.testsrc709, &m.testsrc),
+        ("untagged bottom, 709 first", &m.testsrc, &v.testsrc709),
+    ] {
+        let tl = timeline(vec![vec![clip(bottom, 0.5, 1.5, 1.0)], vec![clip(top, 0.5, 1.5, 0.0)]], None);
+        run(
+            &format!("convert/{name}"),
+            &tl,
+            &[bottom.clone(), top.clone()],
+            30.0,
+            2.0,
+            EXACT,
+        );
+    }
+    // A phone clip shrunk into a landscape frame (bars at the sides, the picture scaled and then converted), in a sequence
+    // of the two matrices, and over a wide clip of the other.
+    let landscape = Some(Delivery::new(960, 540, Fit::Contain));
+    for (name, first, second) in [
+        ("phone 709 then phone 601", &x.portrait709, &x.portrait601),
+        ("phone 601 then phone 709", &x.portrait601, &x.portrait709),
+    ] {
+        let tl = timeline(vec![vec![clip(first, 0.5, 1.5, 0.0), clip(second, 0.5, 1.5, 1.0)]], landscape);
+        run(
+            &format!("convert/{name}, letterboxed"),
+            &tl,
+            &[first.clone(), second.clone()],
+            30.0,
+            2.0,
+            EXACT,
+        );
+    }
+    let tl = timeline(
+        vec![
+            vec![clip(&x.wide709, 0.5, 1.5, 0.0)],
+            vec![clip(&x.portrait601, 0.5, 1.5, 0.0)],
+        ],
+        landscape,
+    );
+    run(
+        "convert/phone 601 over wide 709",
+        &tl,
+        &[x.wide709.clone(), x.portrait601.clone()],
+        30.0,
+        1.0,
+        EXACT,
+    );
+    let tl = timeline(
+        vec![
+            vec![clip(&x.wide601, 0.5, 1.5, 0.0)],
+            vec![clip(&x.portrait709, 0.5, 1.5, 0.0)],
+        ],
+        landscape,
+    );
+    run(
+        "convert/phone 709 over wide 601",
+        &tl,
+        &[x.wide601.clone(), x.portrait709.clone()],
+        30.0,
+        1.0,
+        EXACT,
+    );
+    // Dissolving into a clip of the other matrix, the way a phone vlog does. The incoming clip is on an alpha plane
+    // (`format=yuva420p`, the alpha `fade`), which makes it the one that decides the composite's matrix (the first such clip's):
+    // the **bottom** clip's frames are converted into the dissolving clip's matrix (a plain clip: drawn), and the dissolving clip itself is not. The slides
+    // and the pushes place the incoming clip with `overlay`'s own expressions on a plain picture, and the dip to black fades it ahead
+    // of the conversion: refused while the fade runs.
+    for (name, first, second) in [
+        ("709 into 601", &x.portrait709, &x.portrait601),
+        ("601 into 709", &x.portrait601, &x.portrait709),
+    ] {
+        let assets = [first.clone(), second.clone()];
+        let mut incoming = clip(second, 0.5, 1.5, 1.0);
+        incoming.transition_in = Some(Transition {
+            kind: TransitionKind::Crossfade,
+            duration: 0.6,
+        });
+        let tl = timeline(vec![vec![clip(first, 0.5, 1.5, 0.0), incoming]], landscape);
+        run(
+            &format!("convert/{name} through Crossfade, letterboxed"),
+            &tl,
+            &assets,
+            30.0,
+            2.0,
+            EXACT,
+        );
+        for kind in [TransitionKind::SlideLeft, TransitionKind::PushUp] {
+            let mut incoming = clip(second, 0.5, 1.5, 1.0);
+            incoming.transition_in = Some(Transition { kind, duration: 0.6 });
+            let tl = timeline(vec![vec![clip(first, 0.5, 1.5, 0.0), incoming]], landscape);
+            run(
+                &format!("convert/{name} through {kind:?}, letterboxed"),
+                &tl,
+                &assets,
+                30.0,
+                2.0,
+                EXACT,
+            );
+        }
+        let mut incoming = clip(second, 0.5, 1.5, 1.0);
+        incoming.transition_in = Some(Transition {
+            kind: TransitionKind::DipToBlack,
+            duration: 0.6,
+        });
+        let tl = timeline(vec![vec![clip(first, 0.5, 1.5, 0.0), incoming]], landscape);
+        let case = format!("convert/{name} through DipToBlack, letterboxed");
+        if negotiates {
+            run_refusing(&case, &tl, &assets, 30.0, 2.0, EXACT, &matrix_conversion_refused());
+        } else {
+            run(&case, &tl, &assets, 30.0, 2.0, EXACT);
+        }
+    }
+    // The chain of a phone vlog: four clips of alternating matrices, each dissolving into the one before, and every combination of
+    // plain and dissolving over three clips. The first dissolving clip decides the matrix (BT.601 in the vlog), the others are
+    // converted into it once, wherever they are. A plain clip is converted by a `scale` of its own after its chain and drawn to
+    // the level; a **dissolving clip's chain ends in `format=yuva420p`, and its last `scale` converts the matrix itself, in one
+    // pass with its resize** (measured on 9.0.2: a shrunk phone clip is 22 % of its luma off, up to 17 levels, when the
+    // conversion is done after the resize instead): a dissolving clip to be converted that the chain resizes is FFmpeg's, one it
+    // does not (a picture of the canvas's size) is drawn.
+    let crossfade = |mut c: Clip| {
+        c.transition_in = Some(Transition {
+            kind: TransitionKind::Crossfade,
+            duration: 0.4,
+        });
+        c
+    };
+    let sequence = |clips: &[(&Asset, bool)], delivery: Option<Delivery>| {
+        let track: Vec<Clip> = clips
+            .iter()
+            .enumerate()
+            .map(|(i, (a, dissolving))| {
+                let c = clip(a, 0.5, 1.5, i as f64);
+                if *dissolving {
+                    crossfade(c)
+                } else {
+                    c
+                }
+            })
+            .collect();
+        let mut assets: Vec<Asset> = vec![];
+        for (a, _) in clips {
+            if !assets.iter().any(|b| b.id == a.id) {
+                assets.push((*a).clone());
+            }
+        }
+        (timeline(vec![track], delivery), assets)
+    };
+    let (p709, p601) = (&x.portrait709, &x.portrait601);
+    // (name, clips, whether a dissolving clip is converted: FFmpeg's frames while it is on screen)
+    type Chain<'a> = (&'a str, Vec<(&'a Asset, bool)>, bool);
+    let chains: [Chain; 7] = [
+        (
+            "vlog of four, every one dissolving",
+            vec![(p709, false), (p601, true), (p709, true), (p601, true)],
+            true,
+        ),
+        (
+            "709, 601 dissolving, 709 plain",
+            vec![(p709, false), (p601, true), (p709, false)],
+            false,
+        ),
+        (
+            "709, 601 dissolving, 709 dissolving",
+            vec![(p709, false), (p601, true), (p709, true)],
+            true,
+        ),
+        (
+            "709, 709 dissolving, 601 plain",
+            vec![(p709, false), (p709, true), (p601, false)],
+            false,
+        ),
+        (
+            "709, 709 plain, 601 dissolving",
+            vec![(p709, false), (p709, false), (p601, true)],
+            false,
+        ),
+        (
+            "601, 709 dissolving, 601 dissolving",
+            vec![(p601, false), (p709, true), (p601, true)],
+            true,
+        ),
+        (
+            "709, 601 plain, 601 dissolving",
+            vec![(p709, false), (p601, false), (p601, true)],
+            false,
+        ),
+    ];
+    for (name, clips, converts_a_dissolve) in &chains {
+        let (tl, assets) = sequence(clips, landscape);
+        let secs = clips.len() as f64;
+        let case = format!("convert/chain: {name}");
+        if *converts_a_dissolve && negotiates {
+            run_refusing(&case, &tl, &assets, 30.0, secs, EXACT, &matrix_conversion_refused());
+        } else {
+            run(&case, &tl, &assets, 30.0, secs, EXACT);
+        }
+    }
+    // The same chains of pictures of the canvas's size (the chain does not resize them): a dissolving clip that is converted is
+    // converted as a plain one is, and all of it is drawn.
+    let (w709, w2020, w601) = (&v.testsrc709, &b.bt2020, &m.testsrc);
+    for (name, clips) in [
+        (
+            "unscaled: 709, 601 dissolving, 709 dissolving",
+            vec![(w709, false), (w601, true), (w709, true)],
+        ),
+        (
+            "unscaled: 709, 2020 dissolving, 601 dissolving, 709 plain",
+            vec![(w709, false), (w2020, true), (w601, true), (w709, false)],
+        ),
+    ] {
+        let (tl, assets) = sequence(&clips, None);
+        run(
+            &format!("convert/chain: {name}"),
+            &tl,
+            &assets,
+            30.0,
+            clips.len() as f64,
+            EXACT,
+        );
+    }
+    // The clip's own fade-in on the converted clip is a fade to black ahead of the conversion: refused while it runs, drawn after.
+    let mut faded = clip(&m.testsrc, 0.5, 1.5, 1.0);
+    faded.fade_in = 0.4;
+    let tl = timeline(vec![vec![clip(&v.testsrc709, 0.5, 1.5, 0.0), faded]], None);
+    let assets = [v.testsrc709.clone(), m.testsrc.clone()];
+    if negotiates {
+        run_refusing(
+            "convert/fade-in on the converted clip",
+            &tl,
+            &assets,
+            30.0,
+            2.0,
+            EXACT,
+            &matrix_conversion_refused(),
+        );
+    } else {
+        run("convert/fade-in on the converted clip", &tl, &assets, 30.0, 2.0, EXACT);
+    }
+    // ... and on the bottom clip, which is not converted: drawn throughout.
+    let mut faded = clip(&v.testsrc709, 0.5, 1.5, 0.0);
+    faded.fade_in = 0.4;
+    faded.fade_out = 0.4;
+    let tl = timeline(vec![vec![faded, clip(&m.testsrc, 0.5, 1.5, 1.0)]], None);
+    run("convert/fade-in and out on the bottom clip", &tl, &assets, 30.0, 2.0, EXACT);
+    // Speed does not matter to the conversion.
+    let mut quick = clip(&m.testsrc, 0.5, 2.5, 1.0);
+    quick.speed = 2.0;
+    let tl = timeline(vec![vec![clip(&v.testsrc709, 0.5, 1.5, 0.0), quick]], None);
+    run("convert/speed 2", &tl, &assets, 30.0, 2.0, EXACT);
+    // What the conversion does not cover keeps the frame FFmpeg's, in every frame of the converted clip: a colour correction ahead of
+    // the conversion, an opacity, an effect, a picture of odd size, a keyed number (the clip is on a `scale eval=frame`).
+    type Edit<'a> = &'a dyn Fn(&mut Clip);
+    let cases: [(&str, Edit); 4] = [
+        ("colour correction", &|c| {
+            c.color = Color {
+                contrast: 1.2,
+                ..Color::default()
+            }
+        }),
+        ("an opacity", &|c| c.transform.opacity = 0.6),
+        ("an effect", &|c| c.effects = vec![kerf_core::VideoEffect::Invert]),
+        ("a rotation", &|c| c.transform.rotation = 10.0),
+    ];
+    for (name, edit) in cases {
+        let mut c = clip(&m.testsrc, 0.5, 1.5, 1.0);
+        edit(&mut c);
+        let tl = timeline(vec![vec![clip(&v.testsrc709, 0.5, 1.5, 0.0), c]], None);
+        let case = format!("convert/refused: {name}");
+        if negotiates {
+            run_refusing(&case, &tl, &assets, 30.0, 2.0, EXACT, &matrix_conversion_refused());
+        } else if !matches!(name, "an opacity" | "a rotation") {
+            // (Under a fixed matrix nothing is converted and these are drawn as they are; a translucent or turned layer has its own
+            // bounds there, `TRANSLUCENT` and `ROTATED`, held by the cases of those layers.)
+            run(&case, &tl, &assets, 30.0, 2.0, SCALED);
+        }
+    }
+    let _ = one(&m.testsrc);
+}
+
 // ---- the blurred fill (`Fit::Blur`) -------------------------------------------------------------------
 //
 // A clip placed by the plain fit whose picture is not the frame's shape sits over a copy of itself, blurred: the
@@ -5665,7 +6109,7 @@ fn a_blurred_fill_in_every_matrix_and_range() {
         run(&format!("blur/{name}"), &tl, std::slice::from_ref(a), 30.0, 0.5, EXACT);
     }
     // A BT.709 clip beside an untagged one: one matrix under FFmpeg 6, two under FFmpeg 9 (the planes the graph writes
-    // convert the second into the first's matrix, which the plan refuses and FFmpeg draws).
+    // convert the second into the first's matrix; a layer over a blurred fill is not converted here, so the plan refuses it and FFmpeg draws it).
     let tl = timeline(
         vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![clip(&v.testsrc709, 0.5, 1.5, 0.0)]],
         frame,
@@ -5680,7 +6124,9 @@ fn a_blurred_fill_in_every_matrix_and_range() {
             30.0,
             0.5,
             EXACT,
-            &refusing("MixedMatrices", |u| matches!(u, Unsupported::MixedMatrices)),
+            &refusing("MixedMatrices", |u| {
+                matches!(u, Unsupported::MixedMatrices | Unsupported::MixedMatricesWith(..))
+            }),
         ),
     }
 }

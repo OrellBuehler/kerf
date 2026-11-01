@@ -285,6 +285,19 @@ pub struct PlanCanvas {
     /// is not decided by the layers on screen with it ([`composite_matrix`] judges those). Always `false` in a
     /// Still plan, whose graph is the layers on screen.
     pub mixed_matrices_cut: bool,
+    /// A [`PlanMode::Motion`] plan's cut of mixed matrices under [`CompositeColorPolicy::BottomLayerTag`]: the matrix FFmpeg 9
+    /// makes the composite's for every frame of the cut, which is the **first clip on an alpha plane**'s (a clip entering
+    /// through a dissolve), and the graph's first clip's when there is none; the other clips are converted into it wherever
+    /// they are on the timeline (measured on 9.0.2, in either order, over BT.601, BT.709 and BT.2020, with three clips in every
+    /// combination of plain and dissolving). `None` outside such a cut, and in one whose deciding clip is no YCbCr picture of
+    /// a known matrix (then [`Unsupported::MixedMatrices`] refuses every frame).
+    pub cut_matrix: Option<YuvMatrix>,
+    /// A [`PlanMode::Motion`] plan's cut holds a clip whose chain is on an alpha plane for a reason other than a dissolve it
+    /// enters through (a mask, a rotation, an opacity below 1, a chroma key), wherever on the timeline. A dissolving clip is on
+    /// the plane too and the negotiation takes the first such clip's matrix (see [`PlanCanvas::cut_matrix`]), measured for
+    /// that case only: where the plane comes from a mask or a rotation the same rule is not checked, and a cut of mixed
+    /// matrices holding such a clip is [`Unsupported::MixedMatrices`] in every frame.
+    pub other_alpha_in_cut: bool,
 }
 
 /// What the compositor needs to know about a layer's source picture.
@@ -971,6 +984,39 @@ impl RenderPlan {
                     }
                 }
             }
+            // A layer converted into the composite's matrix is converted on a 4:2:0 grid: an odd side reads past the line, and
+            // bars that meet the picture off the grid share a chroma block with it (the conversion averages a 2x2 block).
+            if self.canvas.policy == CompositeColorPolicy::BottomLayerTag
+                && caps.matrix_convert
+                && !layer.stream.is_rgb()
+                && layer.stream.matrix().is_some_and(|m| m != self.canvas.matrix)
+                && self.convert_refusal(layer).is_none()
+            {
+                // A still's graph has no `format` ahead of the overlay, and a dissolving clip's chain ends in `format=yuva420p`
+                // (an alpha plane): the conversion is made by the chain's last `scale` itself, in one pass with the resize, which is
+                // not the conversion of the picture it made (measured on 9.0.2: 47398 of 230400 luma samples differ on a half-size
+                // picture-in-picture; a dissolving phone clip shrunk into a landscape frame, 22 % of the luma, up to 17 levels). A plain
+                // export chain ends in `format=yuv420p` and the conversion is a `scale` of its own after the chain.
+                if (self.mode == PlanMode::Still || self.on_alpha_plane(layer))
+                    && geom.stages.last().is_some_and(|s| s.scaled != (s.src.w, s.src.h))
+                {
+                    reasons.push(Unsupported::MixedMatricesWith(
+                        self.layer_ref(n, layer),
+                        "a layer whose last scale resizes it in a still or while it dissolves (the scale converts the matrix in the same pass)",
+                    ));
+                }
+                let off_grid = |(w, h): (u32, u32)| w % 2 != 0 || h % 2 != 0;
+                if off_grid(geom.picture)
+                    || off_grid(geom.layer)
+                    || (geom.matte && off_grid(geom.picture_at))
+                    || geom.rotation.is_some()
+                {
+                    reasons.push(Unsupported::MixedMatricesWith(
+                        self.layer_ref(n, layer),
+                        "a picture of odd size, or whose bars meet it off the 4:2:0 grid",
+                    ));
+                }
+            }
             // `pad` hands everything after it the whole padded frame, bars included. A pointwise
             // effect (a grade, grayscale, invert) is a table, and the bars go through it like the
             // picture, and a mask is cut from the whole padded frame (the compositor's layer is that
@@ -1493,7 +1539,7 @@ impl RenderPlan {
             out.push(Unsupported::Scaler(s.to_string()));
         }
         let policy = self.canvas.policy;
-        out.extend(composite_matrix(&self.layers, policy).1);
+        out.extend(self.matrix_reasons(caps));
         // FFmpeg 9 negotiates the *range* along the overlay chain as it does the matrix:
         // the bottom layer's decides, and a graded layer above a full-range picture is
         // 40 to 44 dB off (a limited-range clip over a limited-range one is exact). Where
@@ -1555,6 +1601,93 @@ impl RenderPlan {
             Some("while a fade to black or white runs on it (FFmpeg fades the RGB picture the grade leaves)")
         } else if self.canvas.mixed_matrices_cut && self.canvas.policy != CompositeColorPolicy::FixedBt601 {
             Some("in a cut that mixes colour matrices (FFmpeg 9 converts the picture the grade leaves into the bottom layer's matrix inside the graph, on every frame of the clip, not only where the two are on screen together)")
+        } else {
+            None
+        }
+    }
+
+    /// What keeps a compositor with `caps` from drawing the stack's colour: [`composite_matrix`]'s reasons, less the
+    /// mixed matrices of FFmpeg 9 ([`CompositeColorPolicy::BottomLayerTag`]) that it converts — every layer whose matrix is not
+    /// the composite's ([`PlanCanvas::matrix`]: the bottom layer's tag, or in a cut the first clip's) goes through
+    /// swscale's two-step conversion into it, which the compositor reproduces for a plain opaque `yuv420p` picture
+    /// (and a dissolving one), measured on this FFmpeg's graph (`GpuCaps::matrix_convert`) and refused for the rest
+    /// ([`RenderPlan::convert_refusal`]).
+    fn matrix_reasons(&self, caps: &GpuCaps) -> Vec<Unsupported> {
+        let policy = self.canvas.policy;
+        let (_, mut why) = composite_matrix(&self.layers, policy);
+        if policy != CompositeColorPolicy::BottomLayerTag {
+            return why;
+        }
+        why.retain(|u| !matches!(u, Unsupported::MixedMatrices | Unsupported::RgbInStack(_)));
+        let composite = self.canvas.matrix;
+        if self.layers.iter().any(|l| l.stream.is_rgb()) && composite != YuvMatrix::Bt601 {
+            why.push(Unsupported::RgbInStack(composite));
+        }
+        if self.mode == PlanMode::Motion
+            && self.canvas.mixed_matrices_cut
+            && (self.canvas.cut_matrix.is_none() || self.canvas.other_alpha_in_cut)
+        {
+            why.push(Unsupported::MixedMatrices);
+        }
+        let converting = |l: &PlanLayer| !l.stream.is_rgb() && l.stream.matrix().is_some_and(|m| m != composite);
+        let any_converted = self.layers.iter().any(converting);
+        for (n, layer) in self.layers.iter().enumerate() {
+            // A grade in a stack of mixed matrices, wherever it is: its chain is the RGB filters and the way back, and what the
+            // negotiation makes of the stack's matrix around it is not measured (an untagged graded clip under a BT.709 one is
+            // 686205 luma samples off the conversion of the layer above it alone).
+            if any_converted && !layer.grade.is_identity() && !converting(layer) {
+                why.push(Unsupported::MixedMatricesWith(
+                    self.layer_ref(n, layer),
+                    "a grade in a stack of mixed matrices",
+                ));
+            }
+            if !converting(layer) {
+                continue;
+            }
+            let at = self.layer_ref(n, layer);
+            if !caps.matrix_convert {
+                why.push(Unsupported::MixedMatricesWith(at, "a compositor with no measured conversion"));
+            } else if let Some(detail) = self.convert_refusal(layer) {
+                why.push(Unsupported::MixedMatricesWith(at, detail));
+            }
+        }
+        why
+    }
+
+    /// Why a layer whose matrix is not the composite's cannot be converted into it by the compositor, or `None`. FFmpeg 9
+    /// puts a `scale` between the layer's chain and the overlay, after the chain's last `format`, and swscale converts a
+    /// `yuv420p` picture through `bgr24` with the source's matrix and back with the destination's (or, on an alpha
+    /// plane, `bgra` and the generic scaler); what is reproduced is that conversion of an opaque (or dissolving) 8-bit
+    /// limited-range picture at the size the chain has made it. Anything else of the chain that touches the picture
+    /// before it, or whose own format the conversion would change, stays FFmpeg's.
+    pub fn convert_refusal(&self, layer: &PlanLayer) -> Option<&'static str> {
+        let motion = self.mode == PlanMode::Motion;
+        if layer.stream.pix_fmt.as_deref() != Some("yuv420p") || layer.is_image {
+            Some("a picture that is not 8-bit 4:2:0 yuv420p video")
+        } else if layer.stream.maybe_full_range_in(self.canvas.policy) {
+            Some("a picture that may be full range")
+        } else if !layer.grade.is_identity() {
+            Some("a grade (its way back converts the picture into the bottom layer's matrix itself)")
+        } else if !layer.effects.is_empty() {
+            Some("a video effect")
+        } else if layer.mask.is_some() {
+            Some("a mask")
+        } else if layer.transform.rotation != 0.0 || layer.transform.opacity < 1.0 || layer.keyed_alpha.is_some() {
+            Some("a rotation or an opacity below 1 (an alpha plane the conversion also reads)")
+        } else if !layer.color.is_identity() || self.eq_in_chain(layer) {
+            Some("colour correction")
+        } else if layer.hdr.is_some() || layer.reframe.is_some() || layer.projection.is_some() || layer.blur_fill.is_some() {
+            Some("an HDR, reframed, 360 or blurred-fill picture")
+        } else if motion && layer.animated.is_some() {
+            Some("a keyed number")
+        } else if self.white_round_trip(layer) || self.through_rgba(layer) {
+            Some("a dip to white")
+        } else if self
+            .fade_ops(layer)
+            .iter()
+            .any(|o| o.tint != FadeTint::Alpha && o.factor < FADE_FULL)
+        {
+            Some("a fade to black running on it (FFmpeg fades the picture before the conversion)")
         } else {
             None
         }
@@ -2263,8 +2396,8 @@ mod tests {
     #[test]
     fn under_negotiation_layers_that_disagree_are_refused_not_converted_wrong() {
         use CompositeColorPolicy::BottomLayerTag as B;
-        // FFmpeg 9 converts the top into the bottom's matrix with arithmetic the
-        // compositor does not reproduce — in either order, and for 601 vs untagged
+        // FFmpeg 9 converts the top into the bottom's matrix with arithmetic a compositor without
+        // `GpuCaps::matrix_convert` does not reproduce — in either order, and for 601 vs untagged
         // there is nothing to convert.
         for layers in [
             [("yuv420p", Some("bt709")), ("yuv420p", None)],
@@ -2273,7 +2406,10 @@ mod tests {
         ] {
             let p = stack(B, &layers);
             assert!(!p.gpu_supported(), "{layers:?}");
-            assert!(p.unsupported_reasons().iter().any(|r| r.contains("different YCbCr matrices")));
+            assert!(p
+                .unsupported_reasons()
+                .iter()
+                .any(|r| r.contains("other than the composite's")));
         }
         let p = stack(B, &[("yuv420p", None), ("yuv420p", Some("smpte170m"))]);
         assert!(p.gpu_supported(), "{:?}", p.unsupported_reasons());
@@ -2288,6 +2424,87 @@ mod tests {
         assert!(p.unsupported_reasons().iter().any(|r| r.contains("RGB picture")));
         let p = stack(B, &[("rgb24", None), ("yuv420p", Some("bt709"))]);
         assert!(p.unsupported_reasons().iter().any(|r| r.contains("RGB picture")));
+    }
+
+    /// Where the compositor's conversion is measured (`GpuCaps::matrix_convert`), a layer whose matrix is not the bottom's
+    /// is drawn if it is a plain opaque `yuv420p` picture of even size, and refused for what the conversion does not
+    /// cover, each with its own detail.
+    #[test]
+    fn where_the_conversion_is_measured_a_plain_layer_of_another_matrix_is_converted() {
+        use CompositeColorPolicy::BottomLayerTag as B;
+        let caps = GpuCaps {
+            matrix_convert: true,
+            ..GpuCaps::A0
+        };
+        let why = |p: &RenderPlan| p.reasons(&caps, p.size(u32::MAX));
+        // Either order, any pair of matrices: drawn, the composite following the bottom layer's tag.
+        for (layers, bottom) in [
+            ([("yuv420p", Some("bt709")), ("yuv420p", None)], YuvMatrix::Bt709),
+            ([("yuv420p", None), ("yuv420p", Some("bt709"))], YuvMatrix::Bt601),
+            ([("yuv420p", Some("bt709")), ("yuv420p", Some("bt2020nc"))], YuvMatrix::Bt709),
+            (
+                [("yuv420p", Some("bt2020nc")), ("yuv420p", Some("smpte170m"))],
+                YuvMatrix::Bt2020,
+            ),
+        ] {
+            let p = stack(B, &layers);
+            assert_eq!((p.canvas.matrix, why(&p)), (bottom, vec![]), "{layers:?}");
+        }
+        // A compositor with no conversion refuses them (the A0 caps).
+        let p = stack(B, &[("yuv420p", Some("bt709")), ("yuv420p", None)]);
+        assert!(matches!(
+            p.reasons(&GpuCaps::A0, p.size(u32::MAX)).as_slice(),
+            [Unsupported::MixedMatricesWith(_, "a compositor with no measured conversion")]
+        ));
+        // What the conversion does not cover keeps the frame FFmpeg's: another format, a grade, an effect, an opacity.
+        let p = stack(B, &[("yuv420p", Some("bt709")), ("yuv444p", None)]);
+        assert!(
+            matches!(why(&p).as_slice(), [Unsupported::MixedMatricesWith(_, d)] if d.contains("yuv420p")),
+            "{:?}",
+            why(&p)
+        );
+        let mut p = stack(B, &[("yuv420p", Some("bt709")), ("yuv420p", None)]);
+        p.layers[1].transform.opacity = 0.5;
+        assert!(
+            matches!(why(&p).as_slice(), [Unsupported::MixedMatricesWith(_, d)] if d.contains("opacity")),
+            "{:?}",
+            why(&p)
+        );
+        let mut p = stack(B, &[("yuv420p", Some("bt709")), ("yuv420p", None)]);
+        p.layers[1].effects = vec![VideoEffect::Invert];
+        assert!(
+            why(&p)
+                .iter()
+                .any(|u| matches!(u, Unsupported::MixedMatricesWith(_, d) if d.contains("effect"))),
+            "{:?}",
+            why(&p)
+        );
+        // A grade on any layer of a stack of mixed matrices, the unconverted bottom one included.
+        {
+            use crate::model::{CurvePoint, Curves};
+            let mut p = stack(B, &[("yuv420p", None), ("yuv420p", Some("bt709"))]);
+            p.layers[0].grade = Grade {
+                curves: Some(Curves {
+                    master: vec![CurvePoint { x: 0.0, y: 0.1 }, CurvePoint { x: 1.0, y: 0.9 }],
+                    ..Curves::default()
+                }),
+                ..Grade::default()
+            };
+            assert!(
+                why(&p)
+                    .iter()
+                    .any(|u| matches!(u, Unsupported::MixedMatricesWith(_, d) if d.contains("grade in a stack"))),
+                "{:?}",
+                why(&p)
+            );
+        }
+        // The layer of the bottom's own matrix needs no conversion whatever else it does.
+        let mut p = stack(B, &[("yuv420p", Some("bt709")), ("yuv420p", Some("bt709"))]);
+        p.layers[1].effects = vec![VideoEffect::Invert];
+        assert!(why(&p).iter().all(|u| !matches!(u, Unsupported::MixedMatricesWith(..))));
+        // An RGB picture in a stack that is not BT.601 is refused as it was; the composite follows the bottom layer's tag.
+        let p = stack(B, &[("yuv420p", Some("bt709")), ("rgb24", None)]);
+        assert!(why(&p).iter().any(|u| matches!(u, Unsupported::RgbInStack(YuvMatrix::Bt709))));
     }
 
     #[test]

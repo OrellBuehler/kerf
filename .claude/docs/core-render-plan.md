@@ -279,13 +279,12 @@
   layer's `origin`, travel and all, a title's position and `between`, five frame rates)
   — parsing `enable=` back out of the graph would only restate what the builder printed.
   It checks the *grammar* at the output frame's time, not the graph's clock (that the zoom is
-  read at the output frame's time and shown is `keyed_zoom.rs`'s, above). **A7 concern**: a Motion
-  plan decides the composite's matrix per frame from the layers on it
-  (`composite_matrix`), while FFmpeg 9 negotiates colourspace across the whole graph, so
-  over a cut whose bottom layer changes the matrix the export converts with is not the
-  one a frame's own layers suggest — **measured** (9.0.2, `gpu.md`): an untagged 640x360 clip after a BT.709 one is up to 31 levels of Y and 18 of UV off the compositor's plain copy on every frame of the clip,
-  and a BT.709 clip after an untagged one 22 and 12. `PlanCanvas::mixed_matrices_cut` is the cut-level fact; only a graded layer is refused by it so far (`GradeWith`), ungraded layers of such a cut
-  are still drawn per frame — to be fixed before the GPU encodes an export.
+  read at the output frame's time and shown is `keyed_zoom.rs`'s, above). **A7 concern, fixed**: a Motion
+  plan used to decide the composite's matrix per frame from the layers on it (`composite_matrix`), while FFmpeg 9 negotiates colourspace across the
+  whole graph — the first clip's tag is the composite's for the cut and every clip of another matrix is converted into it wherever it is on the
+  timeline, so a lone clip of another matrix was drawn as a plain copy up to 31 levels of Y and 18 of UV off (9.0.2, measured). `PlanCanvas::cut_matrix`
+  is now the cut's matrix (under `BottomLayerTag`, in a cut of mixed matrices) and the layers of another matrix are converted (`MixedMatricesWith`, `matrix_reasons`);
+  `PlanCanvas::mixed_matrices_cut` is still the cut-level fact the graded layer is refused by (`GradeWith`).
   **The mask's alpha is shared too**: `kerf_core::mask_alpha_plane(&Mask, w, h)` is `mask_filter`'s `geq` evaluated in `f64` and
   truncated as `geq` stores it (`engine::cli::rendered`, `a_mask_plane_is_the_geq_planes_sample_for_sample`: 21 million samples equal on both
   FFmpegs), at the size of the picture the `geq` sees — `LayerGeometry::picture`, or the fit-size `stages[0].keep` when a moving zoom
@@ -514,11 +513,18 @@
     blocking thread. The policy is an *input* to `RenderPlan::at`, so tests pin any of
     the three without an FFmpeg. Under `BottomLayerTag` a stack whose
     layers share one matrix class (BT.709, BT.2020, BT.601 — `smpte170m`, `bt470bg`
-    and untagged are one class) is drawn with that matrix; **mixed matrices, an
-    unknown one, and an RGB picture in a stack that is not BT.601 are refused**,
-    because FFmpeg converts the other layers into the bottom layer's matrix with an
-    arithmetic that was not reproduced (float and fixed-point models of it were off by
-    up to 26 levels). `PlanCanvas.matrix` is the result; `PlanStream::matrix` is the
+    and untagged are one class) is drawn with that matrix; **an unknown one and an RGB picture in a stack that is not BT.601 are refused**.
+    **Mixed matrices** are FFmpeg's conversion of the other layers into the bottom layer's (swscale through RGB; float and
+    fixed-point models of it were off by up to 26 levels), now reproduced (`gpu.md`, `convert.rs`) for a plain layer: `matrix_reasons`
+    keeps `MixedMatricesWith(layer, why)` (kind `mixed_matrices`) for a layer whose matrix is not `PlanCanvas.matrix` and that
+    `RenderPlan::convert_refusal` does not clear (a grade, an effect, a mask, a rotation or opacity, `eq`, a keyed number, a format
+    other than 8-bit limited-range `yuv420p` video, a running fade to black or a dip to white, an odd size or bars off the 4:2:0
+    grid, and in a **still** or while a layer **dissolves** a layer whose last `scale` resizes it: neither chain has a plain `format` ahead of the overlay,
+    so that scale converts in the same pass), and for a caps without `matrix_convert`. **In a Motion plan the composite's matrix is the
+    cut's**: `PlanCanvas::cut_matrix` is the first clip on an alpha plane's (a dissolve it enters through), else the first clip's —
+    FFmpeg 9's negotiation, measured with three clips in every combination — for every frame, so a lone clip of
+    another matrix is converted wherever it is on the timeline (a cut whose deciding clip is RGB or of no known matrix, or that holds a masked, rotated or
+    translucent clip — `PlanCanvas::other_alpha_in_cut`, whose rule is not measured — is `MixedMatrices` in every frame). `PlanCanvas.matrix` is the result; `PlanStream::matrix` is the
     one a translucent layer is taken out of YUV with.
     **The graph's BT.709 label is mirrored** (`PlanStream::label_bt709`, `engine-cli.md`): an untagged HD YCbCr layer that
     shares the export graph with an input naming a matrix is BT.709 to the plan exactly when the graph labels it, under

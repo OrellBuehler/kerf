@@ -42,6 +42,9 @@ pub(super) struct GradePasses {
     lut3d: wgpu::RenderPipeline,
     plane444: wgpu::RenderPipeline,
     chroma_v: wgpu::RenderPipeline,
+    /// `ff_rgb24toyv12`'s luma and chroma (a layer converted into the composite's matrix, `convert_matrix`).
+    luma24: wgpu::RenderPipeline,
+    chroma24: wgpu::RenderPipeline,
     /// The LUTs uploaded, the newest last: a clip's frames are drawn through the same table.
     luts: Mutex<Vec<(Arc<BakedLut>, Arc<GpuLut>)>>,
     /// `src / 255.0f` for every byte, for `colorbalance`.
@@ -140,6 +143,8 @@ impl GradePasses {
             lut3d: pipeline("grade lut3d", &shader, &lut_layout, "fs_lut3d", CANVAS_FORMAT),
             plane444: pipeline("grade plane 444", rt_shader, convert_layout, "fs_plane444", PLANE_FORMAT),
             chroma_v: pipeline("grade chroma v", rt_shader, rt_v_layout, "fs_chroma_v_x86", PLANE_FORMAT),
+            luma24: pipeline("convert luma 24", rt_shader, convert_layout, "fs_luma24", PLANE_FORMAT),
+            chroma24: pipeline("convert chroma 24", rt_shader, convert_layout, "fs_chroma24", PLANE_FORMAT),
             layout,
             lut_layout,
             luts: Mutex::new(Vec::new()),
@@ -307,7 +312,7 @@ impl Compositor {
         input: &[Plane; 3],
         grade: &GradeLook,
     ) -> Result<[Plane; 3], GpuError> {
-        let [py, pu, pv] = input;
+        let [py, pu, _] = input;
         let (w, h) = (py.w, py.h);
         let (cw, ch) = (pu.w, pu.h);
         if w % 2 != 0 || h % 2 != 0 || (cw, ch) != (w / 2, h / 2) {
@@ -317,21 +322,14 @@ impl Compositor {
         }
         let stages = &grade.stages;
         let passes = &self.grade;
-        let kernel = X86Kernel::new(stages.route.matrix);
-        let mut params = GradeParams {
-            k: [kernel.y, kernel.vr, kernel.ub, kernel.vg],
-            k2: [kernel.ug, kernel.y_offset, grade.lut.as_ref().map_or(0, |l| l.size), 0],
-            bal: [[0.0; 4]; 3],
-        };
+        let mut params = Self::kernel_params(stages.route.matrix, grade.lut.as_ref().map_or(0, |l| l.size));
         if let Some(b) = &stages.balance {
             for (c, row) in params.bal.iter_mut().enumerate() {
                 *row = [b.params[c * 3], b.params[c * 3 + 1], b.params[c * 3 + 2], 0.0];
             }
         }
         let rgb_target = |label: &str| self.plane(label, w, h, CANVAS_FORMAT, wgpu::TextureUsages::RENDER_ATTACHMENT);
-        let mut rgb = rgb_target("grade rgb");
-        let bind = self.grade_bind(&passes.layout, &params, &[(1, &py.view), (2, &pu.view), (3, &pv.view)]);
-        self.pass(enc, &passes.rgb, &rgb.view, &bind, None, None);
+        let mut rgb = self.rgb_of(enc, input, &params);
 
         if let (Some(table), Some(lut)) = (&stages.lut, &grade.lut) {
             debug_assert_eq!(table.size as i32, lut.size);
@@ -364,21 +362,11 @@ impl Compositor {
         }
 
         // The way back.
+        if !stages.route.via_444 {
+            return self.untagged_back(enc, &rgb, stages.route.matrix);
+        }
         let back = Rgb2Yuv::new(stages.route.matrix);
-        let rt = RoundTripParams {
-            k: [0; 4],
-            m: [0; 4],
-            ky: [back.ry, back.gy, back.by, 0],
-            ku: [back.ru, back.gu, back.bu, 0],
-            kv: [back.rv, back.gv, back.bv, 0],
-            size: [w as i32, h as i32],
-            csize: [cw as i32, ch as i32],
-            channel: 0,
-            taps: 0,
-            white: [0; 2],
-            start: 0,
-            pad: [0; 3],
-        };
+        let rt = Self::back_params(&back, w, h);
         let plane_out = |label: &str, pw: u32, ph: u32| {
             self.plane(
                 label,
@@ -388,34 +376,6 @@ impl Compositor {
                 wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             )
         };
-        if !stages.route.via_444 {
-            let luma = plane_out("grade y", w, h);
-            let bind = self.rt_bind(&self.convert_layout, &rt, &[&rgb.view]);
-            self.pass(enc, &self.rt_luma, &luma.view, &bind, None, None);
-            let inter = self.plane("grade chroma", cw, h, CHROMA_FORMAT, wgpu::TextureUsages::RENDER_ATTACHMENT);
-            self.pass(enc, &self.rt_chroma_h, &inter.view, &bind, None, None);
-            let filter = sws::bicubic(h, ch, sws::ONE_VERTICAL)
-                .ok_or_else(|| GpuError::Unsupported("a picture too tall for the chroma filter".into()))?;
-            let taps = self.filter_texture(&filter);
-            let start = vertical_start(&filter);
-            let mut chroma = Vec::with_capacity(2);
-            for channel in 0..2 {
-                let p = RoundTripParams {
-                    channel,
-                    taps: filter.size as i32,
-                    start,
-                    ..rt
-                };
-                let plane = plane_out("grade chroma plane", cw, ch);
-                let bind = self.rt_bind(&self.rt_v_layout, &p, &[&inter.view, &taps]);
-                self.pass(enc, &passes.chroma_v, &plane.view, &bind, None, None);
-                chroma.push(plane);
-            }
-            let (Some(v), Some(u)) = (chroma.pop(), chroma.pop()) else {
-                unreachable!("two chroma planes")
-            };
-            return Ok([luma, u, v]);
-        }
 
         // Tagged: 4:4:4 first, by the grade's own `scale`, then the next filter's 2:1 scale of the chroma.
         let full: Vec<Plane> = (0..3)
@@ -445,6 +405,124 @@ impl Compositor {
         let v = self.scale_plane(enc, &full[2], stage, &filters, None);
         let mut full = full;
         let luma = full.swap_remove(0);
+        Ok([luma, u, v])
+    }
+}
+
+impl Compositor {
+    /// `grade.wgsl`'s uniform for swscale's x86 `yuv420p -> rgb24` kernel with `matrix`'s coefficients.
+    fn kernel_params(matrix: YuvMatrix, lut_size: i32) -> GradeParams {
+        let kernel = X86Kernel::new(matrix);
+        GradeParams {
+            k: [kernel.y, kernel.vr, kernel.ub, kernel.vg],
+            k2: [kernel.ug, kernel.y_offset, lut_size, 0],
+            bal: [[0.0; 4]; 3],
+        }
+    }
+
+    /// The picture's planes taken to `rgb24` by the kernel `params` names.
+    fn rgb_of(&self, enc: &mut wgpu::CommandEncoder, input: &[Plane; 3], params: &GradeParams) -> Plane {
+        let [py, pu, pv] = input;
+        let rgb = self.plane("grade rgb", py.w, py.h, CANVAS_FORMAT, wgpu::TextureUsages::RENDER_ATTACHMENT);
+        let bind = self.grade_bind(&self.grade.layout, params, &[(1, &py.view), (2, &pu.view), (3, &pv.view)]);
+        self.pass(enc, &self.grade.rgb, &rgb.view, &bind, None, None);
+        rgb
+    }
+
+    /// `roundtrip.wgsl`'s uniform for the way back from RGB with `back`'s coefficients, over a `w` x `h` picture.
+    fn back_params(back: &Rgb2Yuv, w: u32, h: u32) -> RoundTripParams {
+        RoundTripParams {
+            k: [0; 4],
+            m: [0; 4],
+            ky: [back.ry, back.gy, back.by, 0],
+            ku: [back.ru, back.gu, back.bu, 0],
+            kv: [back.rv, back.gv, back.bv, 0],
+            size: [w as i32, h as i32],
+            csize: [(w / 2) as i32, (h / 2) as i32],
+            channel: 0,
+            taps: 0,
+            white: [0; 2],
+            start: 0,
+            pad: [0; 3],
+        }
+    }
+
+    /// An 8-bit plane to render into and copy from.
+    fn back_plane(&self, label: &str, w: u32, h: u32) -> Plane {
+        self.plane(
+            label,
+            w,
+            h,
+            PLANE_FORMAT,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        )
+    }
+
+    /// `rgb24 -> yuv420p` straight back, as the generic scaler does it for a picture with no converter of its own (the
+    /// way back of an untagged picture's grade, and of a picture on an alpha plane): luma per pixel, chroma from
+    /// horizontal pairs in 15 bits and swscale's x86 vertical kernel over them.
+    fn untagged_back(&self, enc: &mut wgpu::CommandEncoder, rgb: &Plane, matrix: YuvMatrix) -> Result<[Plane; 3], GpuError> {
+        let (w, h) = (rgb.w, rgb.h);
+        let (cw, ch) = (w / 2, h / 2);
+        let rt = Self::back_params(&Rgb2Yuv::new(matrix), w, h);
+        let luma = self.back_plane("grade y", w, h);
+        let bind = self.rt_bind(&self.convert_layout, &rt, &[&rgb.view]);
+        self.pass(enc, &self.rt_luma, &luma.view, &bind, None, None);
+        let inter = self.plane("grade chroma", cw, h, CHROMA_FORMAT, wgpu::TextureUsages::RENDER_ATTACHMENT);
+        self.pass(enc, &self.rt_chroma_h, &inter.view, &bind, None, None);
+        let filter = sws::bicubic(h, ch, sws::ONE_VERTICAL)
+            .ok_or_else(|| GpuError::Unsupported("a picture too tall for the chroma filter".into()))?;
+        let taps = self.filter_texture(&filter);
+        let start = vertical_start(&filter);
+        let mut chroma = Vec::with_capacity(2);
+        for channel in 0..2 {
+            let p = RoundTripParams {
+                channel,
+                taps: filter.size as i32,
+                start,
+                ..rt
+            };
+            let plane = self.back_plane("grade chroma plane", cw, ch);
+            let bind = self.rt_bind(&self.rt_v_layout, &p, &[&inter.view, &taps]);
+            self.pass(enc, &self.grade.chroma_v, &plane.view, &bind, None, None);
+            chroma.push(plane);
+        }
+        let (Some(v), Some(u)) = (chroma.pop(), chroma.pop()) else {
+            unreachable!("two chroma planes")
+        };
+        Ok([luma, u, v])
+    }
+
+    /// A layer's picture taken from the matrix `from` to the composite's `to` the way FFmpeg 9's auto-inserted `scale`
+    /// does ([`crate::convert`]): through RGB by swscale's x86 kernel, and back by `ff_rgb24toyv12`. `input` is the
+    /// picture as the chain made it (even sides); the plan sees to the rest.
+    pub(super) fn convert_matrix(
+        &self,
+        enc: &mut wgpu::CommandEncoder,
+        input: &[Plane; 3],
+        from: YuvMatrix,
+        to: YuvMatrix,
+    ) -> Result<[Plane; 3], GpuError> {
+        let [py, pu, _] = input;
+        let (w, h) = (py.w, py.h);
+        if w % 2 != 0 || h % 2 != 0 || (pu.w, pu.h) != (w / 2, h / 2) {
+            return Err(GpuError::Unsupported(format!(
+                "a conversion between colour matrices of a {w}x{h} picture (it needs even sides)"
+            )));
+        }
+        let rgb = self.rgb_of(enc, input, &Self::kernel_params(from, 0));
+        let rt = Self::back_params(&Rgb2Yuv::new(to), w, h);
+        let luma = self.back_plane("convert y", w, h);
+        let bind = self.rt_bind(&self.convert_layout, &rt, &[&rgb.view]);
+        self.pass(enc, &self.grade.luma24, &luma.view, &bind, None, None);
+        let mut chroma = |channel: i32| {
+            let plane = self.back_plane("convert chroma", w / 2, h / 2);
+            let bind = self.rt_bind(&self.convert_layout, &RoundTripParams { channel, ..rt }, &[&rgb.view]);
+            self.pass(enc, &self.grade.chroma24, &plane.view, &bind, None, None);
+            plane
+        };
+        let u = chroma(0);
+        let v = chroma(1);
         Ok([luma, u, v])
     }
 }
@@ -482,6 +560,45 @@ impl Compositor {
             let idle = || {
                 gpu.device
                     .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("grade") })
+            };
+            let u = read_texels(gpu, idle(), &u.texture, cw, ch, 1)?.data;
+            let v = read_texels(gpu, idle(), &v.texture, cw, ch, 1)?.data;
+            Ok(YuvFrame {
+                width: w,
+                height: h,
+                y: luma,
+                u,
+                v,
+            })
+        })
+    }
+}
+
+impl Compositor {
+    /// A picture's planes taken from `from` to `to` on the GPU, read back: what the compositor draws of a layer FFmpeg 9
+    /// converts into the composite's matrix, before anything else of its chain — for the plane-level comparison with
+    /// [`crate::convert::change_matrix`] (`tests/convert.rs`).
+    pub fn convert_yuv(&self, frame: &YuvFrame, from: YuvMatrix, to: YuvMatrix) -> Result<YuvFrame, GpuError> {
+        let (w, h) = (frame.width, frame.height);
+        if !frame.is_consistent() || w % 2 != 0 || h % 2 != 0 {
+            return Err(GpuError::Unsupported(format!("a conversion of a {w}x{h} frame")));
+        }
+        let (cw, ch) = chroma_size(w, h);
+        let planes = [
+            self.upload("convert y", w, h, &frame.y),
+            self.upload("convert u", cw, ch, &frame.u),
+            self.upload("convert v", cw, ch, &frame.v),
+        ];
+        let gpu = &self.gpu;
+        gpu.guarded("converting a picture", || {
+            let mut enc = gpu
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("convert") });
+            let [y, u, v] = self.convert_matrix(&mut enc, &planes, from, to)?;
+            let luma = read_texels(gpu, enc, &y.texture, w, h, 1)?.data;
+            let idle = || {
+                gpu.device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("convert") })
             };
             let u = read_texels(gpu, idle(), &u.texture, cw, ch, 1)?.data;
             let v = read_texels(gpu, idle(), &v.texture, cw, ch, 1)?.data;

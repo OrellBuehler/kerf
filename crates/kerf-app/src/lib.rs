@@ -4800,7 +4800,17 @@ async fn get_render_bar(
             if graded || timeline.format.as_ref().is_some_and(|f| f.fit == kerf_core::Fit::Blur) {
                 let _ = kerf_gpu::scaler::kernels();
             }
-            kerf_gpu::Compositor::caps_for(kerf_gpu::grade::measured(), kerf_gpu::scaler::measured())
+            // A layer of another matrix than the bottom's is converted into it by FFmpeg 9 and drawn only where that
+            // conversion is measured to be the one the GPU follows (the policy is already known here).
+            if kerf_core::composite_color_policy() == kerf_core::CompositeColorPolicy::BottomLayerTag {
+                let _ = kerf_gpu::grade::kernels();
+                let _ = kerf_gpu::convert::kernels();
+            }
+            kerf_gpu::Compositor::caps_for(
+                kerf_gpu::grade::measured(),
+                kerf_gpu::scaler::measured(),
+                kerf_gpu::convert::measured(),
+            )
         });
         let req = kerf_core::render_bar::BarRequest {
             caps,

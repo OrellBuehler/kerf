@@ -155,6 +155,12 @@ pub struct GpuCaps {
     /// scaled back up behind the fitted picture. Needs [`GpuCaps::exact_scaler`] as well: the fill is two bilinear
     /// scales and a blur of the picture, and the picture a bicubic one.
     pub blur_fill: bool,
+    /// The compositor takes a layer into the composite's colour matrix the way FFmpeg 9 does where a stack or a cut
+    /// holds pictures of more than one ([`crate::render_plan::CompositeColorPolicy::BottomLayerTag`]): swscale's two-step conversion through
+    /// RGB (its x86 `yuv420p -> bgr24` kernel, then `ff_rgb24toyv12`, or the generic scaler for a picture on an alpha
+    /// plane), **measured** on this FFmpeg's graph (`kerf_gpu::convert`). Without it a stack or a cut of mixed matrices is
+    /// FFmpeg's.
+    pub matrix_convert: bool,
 }
 
 impl GpuCaps {
@@ -177,6 +183,7 @@ impl GpuCaps {
         grade: GradeKinds::NONE,
         exact_scaler: false,
         blur_fill: false,
+        matrix_convert: false,
     };
 }
 
@@ -376,6 +383,9 @@ pub enum Unsupported {
     /// The layer's colour matrix is unknown while the composite takes its matrix from the tags.
     MatrixUnknown(usize),
     MixedMatrices,
+    /// A layer whose matrix is not the composite's (FFmpeg 9 converts it into the bottom layer's) that the compositor
+    /// does not convert in this chain (the detail says why), or has no measured conversion for (`GpuCaps::matrix_convert`).
+    MixedMatricesWith(LayerRef, &'static str),
     /// The composite colour policy could not be measured and the stack is not BT.601.
     UnmeasuredPolicy(YuvMatrix),
     RgbInStack(YuvMatrix),
@@ -442,7 +452,7 @@ impl Unsupported {
             Self::Svg => "svg",
             Self::Scaler(_) => "scaler",
             Self::MatrixUnknown(_) => "matrix_unknown",
-            Self::MixedMatrices => "mixed_matrices",
+            Self::MixedMatrices | Self::MixedMatricesWith(..) => "mixed_matrices",
             Self::UnmeasuredPolicy(_) => "unmeasured_policy",
             Self::RgbInStack(_) => "rgb_in_stack",
             Self::GradedInFullRangeStack(_) => "graded_in_full_range_stack",
@@ -585,6 +595,10 @@ impl fmt::Display for Unsupported {
             ),
             Self::MixedMatrices => f.write_str(
                 "layers tagged with different YCbCr matrices: FFmpeg converts them into the bottom layer's, which is not reproduced",
+            ),
+            Self::MixedMatricesWith(l, why) => write!(
+                f,
+                "{l}: a colour matrix other than the composite's, which FFmpeg converts into the bottom layer's and the compositor does not for {why}"
             ),
             Self::UnmeasuredPolicy(m) => write!(
                 f,

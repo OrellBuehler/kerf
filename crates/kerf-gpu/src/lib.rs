@@ -136,6 +136,7 @@
 //! (`Pick::progress`).
 
 pub mod compositor;
+pub mod convert;
 pub mod cursor;
 pub mod effects;
 pub mod eq;
