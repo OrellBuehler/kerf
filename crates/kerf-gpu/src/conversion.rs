@@ -9,72 +9,37 @@
 //! would be drawn from the wrong chroma. The probe renders a small picture of each format both ways and compares the
 //! planes; `GpuCaps::placed_chroma` is set only on a `Match`.
 
-use std::io::Read;
-use std::process::Stdio;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-/// What the probe found.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Conversion {
-    /// The graph's conversion is the decode's, for 4:4:4 and for 4:2:2.
-    Match,
-    /// It is not (the detail says where).
-    Differs(String),
-    /// Not known: not measured yet, FFmpeg would not run or timed out (asked again after a backoff).
-    Unknown,
-}
+use crate::measure::{self, Slot, Verdict};
+
+/// What the probe found: [`Verdict::Match`] (the graph's conversion is the decode's, for 4:4:4 and for 4:2:2),
+/// [`Verdict::Differs`] (it is not: the detail says where) or [`Verdict::Unknown`] (not measured yet, FFmpeg would not run
+/// or timed out: asked again after a backoff).
+pub type Conversion = Verdict;
 
 const PROBE: (u32, u32) = (64, 36);
 const LIMIT: Duration = Duration::from_secs(20);
 const BACKOFF: Duration = Duration::from_secs(30);
 
-struct State {
-    measured: Option<Conversion>,
-    retry_at: Option<Instant>,
-}
-
-fn state() -> &'static Mutex<State> {
-    static S: OnceLock<Mutex<State>> = OnceLock::new();
-    S.get_or_init(|| {
-        Mutex::new(State {
-            measured: None,
-            retry_at: None,
-        })
-    })
-}
-
-fn lock() -> std::sync::MutexGuard<'static, State> {
-    state().lock().unwrap_or_else(std::sync::PoisonError::into_inner)
-}
+static STATE: Mutex<Slot> = Mutex::new(Slot::new());
 
 /// What is known without running anything: the measured answer, else [`Conversion::Unknown`].
 pub fn measured() -> Conversion {
-    lock().measured.clone().unwrap_or(Conversion::Unknown)
+    measure::known(&STATE)
 }
 
 /// The answer, measured on the first call (a few short child processes: call it from a blocking thread, off any lock;
-/// [`crate::prepare`] does, ahead of a plan that needs it). `Unknown` is not remembered: the probe is run again after a
-/// backoff.
+/// [`crate::prepare`] does, ahead of a plan that needs it). `Unknown` is not remembered but for a backoff, inside which the
+/// probe is not run again.
 pub fn conversion() -> Conversion {
-    let now = Instant::now();
-    {
-        let s = lock();
-        if let Some(known) = &s.measured {
-            return known.clone();
-        }
-        if s.retry_at.is_some_and(|t| t > now) {
-            return Conversion::Unknown;
-        }
-    }
-    let found = probe();
-    let mut s = lock();
-    if found == Conversion::Unknown {
-        s.retry_at = Some(Instant::now() + BACKOFF);
-    } else {
-        s.measured = Some(found.clone());
-    }
-    found
+    conversion_in(&STATE, Instant::now(), probe)
+}
+
+/// [`conversion`] over a given memory, clock and probe: the state machine without the child processes.
+fn conversion_in(state: &Mutex<Slot>, now: Instant, probe: impl FnOnce() -> Conversion) -> Conversion {
+    measure::cached(state, now, BACKOFF, probe)
 }
 
 /// The picture: `testsrc2` (hard colour edges, a gradient, a counter), in the format asked for.
@@ -83,36 +48,9 @@ fn source(format: &str) -> String {
     format!("testsrc2=size={w}x{h}:rate=1:duration=1,format={format}")
 }
 
-/// One FFmpeg run, its raw stdout, or `None` when it would not run, failed or took too long (killed).
+/// One FFmpeg run, its raw stdout, or `None` when it would not run, failed or took too long (killed, and not waited for).
 fn run(args: &[&str]) -> Option<Vec<u8>> {
-    let mut child = kerf_core::ffmpeg_command()
-        .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y"])
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    let mut out = child.stdout.take()?;
-    let reader = std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        let _ = out.read_to_end(&mut buf);
-        buf
-    });
-    let deadline = Instant::now() + LIMIT;
-    let status = loop {
-        match child.try_wait() {
-            Ok(Some(s)) => break Some(s),
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(5)),
-            _ => {
-                let _ = child.kill();
-                let _ = child.wait();
-                break None;
-            }
-        }
-    };
-    let buf = reader.join().ok()?;
-    status.filter(|s| s.success()).map(|_| buf)
+    measure::ffmpeg(args, Vec::new(), LIMIT)
 }
 
 fn probe() -> Conversion {
@@ -182,6 +120,35 @@ fn probe() -> Conversion {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The memory of the probe: a probe that could not tell is asked again after the backoff (30 s) and not before, and
+    /// what it finds, a match or a difference, is kept for good (`measured()` reads it, nothing runs again).
+    #[test]
+    fn an_unknown_is_asked_again_after_thirty_seconds_and_a_match_or_a_difference_is_kept() {
+        assert_eq!(BACKOFF, Duration::from_secs(30));
+        let state = Mutex::new(Slot::new());
+        let t0 = Instant::now();
+        assert_eq!(measure::known(&state), Conversion::Unknown, "nothing measured yet");
+        assert_eq!(conversion_in(&state, t0, || Conversion::Unknown), Conversion::Unknown);
+        // Inside the backoff the probe does not run, and a probe that would now succeed is not asked.
+        let inside = t0 + Duration::from_secs(29);
+        assert_eq!(
+            conversion_in(&state, inside, || panic!("probed inside the backoff")),
+            Conversion::Unknown
+        );
+        assert_eq!(measure::known(&state), Conversion::Unknown);
+        // After it, it is, and what it finds is kept.
+        let after = Instant::now() + BACKOFF + Duration::from_secs(1);
+        let differs = Conversion::Differs("yuv444p: 3 samples".into());
+        assert_eq!(conversion_in(&state, after, || differs.clone()), differs);
+        assert_eq!(measure::known(&state), differs);
+        assert_eq!(conversion_in(&state, after, || panic!("measured twice")), differs);
+        // A match is kept the same way.
+        let state = Mutex::new(Slot::new());
+        assert_eq!(conversion_in(&state, t0, || Conversion::Match), Conversion::Match);
+        assert_eq!(measure::known(&state), Conversion::Match);
+        assert_eq!(conversion_in(&state, after, || panic!("measured twice")), Conversion::Match);
+    }
 
     /// The probe itself, on the FFmpeg in use (`#[ignore]`d: it needs one). It must be able to tell: it answers `Match` or
     /// `Differs` (never `Unknown`), and says the same twice.

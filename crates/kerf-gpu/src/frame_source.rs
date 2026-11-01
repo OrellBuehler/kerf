@@ -1119,6 +1119,12 @@ impl FrameSource {
                 return Err(GpuError::Unsupported(format!("{}: {why}", layer.path)));
             }
         }
+        // The file's range, for an asset that did not record it: the compositor's placement asks the cache for it (a render
+        // never spawns a process), so a session's check, which already probed the file's traits, makes sure it is there. (For
+        // a file of a container's kind that is a cache hit; a still image is one probe.)
+        if layer.stream.color_range.is_none() {
+            let _ = kerf_core::source_is_full_range(Path::new(&layer.path));
+        }
         Ok(())
     }
 

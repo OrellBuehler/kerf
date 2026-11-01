@@ -1159,7 +1159,7 @@ fn measure_composite_color_policy(ffmpeg: &str, ffprobe: &str, timeout: std::tim
 /// cannot wedge the caller; on a timeout those threads are left to finish on
 /// their own (a wrapper script that spawned the real ffmpeg keeps the pipe open
 /// past the kill, and the caller must not wait for it).
-pub(super) fn run_piped_until(cmd: &mut Command, input: Vec<u8>, deadline: Instant) -> Option<Vec<u8>> {
+pub fn run_piped_until(cmd: &mut Command, input: Vec<u8>, deadline: Instant) -> Option<Vec<u8>> {
     use std::io::{Read, Write};
     let mut child = cmd
         .stdin(Stdio::piped())
@@ -1630,6 +1630,10 @@ pub(crate) struct SourceTraits {
     /// The stream is flagged full range (`color_range=pc`): what the file says, which an asset probed before the
     /// flag was recorded does not (`PlanStream::color_range`, `None`).
     pub full_range: bool,
+    /// The probe's answer described a file (JSON with a `streams` list and a `format`): without that every other field is
+    /// the neutral value of an ordinary file, not something the file said (`ffprobe` can exit 0 and print nothing usable). A
+    /// file that has no video stream is described all the same (its `streams` list is empty).
+    pub described: bool,
     /// The stream's codec and chroma format, for the one thing a decode that is handed a bare
     /// path has to ask of them: whether to request a hardware decoder (`decode_policy`).
     pub codec: Codec,
@@ -1665,17 +1669,38 @@ fn luma_plane_pix_fmt(name: &str) -> bool {
 ///
 /// It spawns a process: not under a lock.
 pub(crate) fn source_traits(path: &Path) -> Option<SourceTraits> {
-    static CACHE: OnceLock<ProbeCache<SourceTraits>> = OnceLock::new();
-    CACHE
-        .get_or_init(ProbeCache::new)
-        .get(path, || probe_source_traits(&ffprobe_bin(), path, SOURCE_PROBE_TIMEOUT))
+    source_traits_cache().get(path, || probe_source_traits(&ffprobe_bin(), path, SOURCE_PROBE_TIMEOUT))
 }
 
 /// Whether the first video stream of the file at `path` is flagged full range, **as the file says** (one cached `ffprobe`,
 /// [`source_traits`]): what a plan that was made from an asset probed before the flag was recorded cannot know. `None`
-/// when the probe could not tell (it failed, or outlasted its timeout). It spawns a process: not under a lock.
+/// when the probe could not tell: it failed, outlasted its timeout, or exited 0 with an answer that describes no file (nothing
+/// usable on its output). A file the probe read that has no video stream is not full range: there is no picture to be. It
+/// spawns a process: not under a lock.
 pub fn source_is_full_range(path: &Path) -> Option<bool> {
-    source_traits(path).map(|t| t.full_range)
+    full_range_of(source_traits(path)?)
+}
+
+/// [`source_is_full_range`] **from what is already known**: the answer a probe of this file left (this one's, or any
+/// other read of the file's [`SourceTraits`]: the HDR, the lead, the container), `None` while there is none (not asked,
+/// being asked, failed, or no video stream). It never spawns and never waits, so a render may ask it; whoever
+/// wants it answered asks [`source_is_full_range`] ahead, off the render's path.
+pub fn source_is_full_range_known(path: &Path) -> Option<bool> {
+    full_range_of(source_traits_known(path)?)
+}
+
+fn full_range_of(traits: SourceTraits) -> Option<bool> {
+    traits.described.then_some(traits.full_range)
+}
+
+fn source_traits_cache() -> &'static ProbeCache<SourceTraits> {
+    static CACHE: OnceLock<ProbeCache<SourceTraits>> = OnceLock::new();
+    CACHE.get_or_init(ProbeCache::new)
+}
+
+/// What [`source_traits`] has remembered of the file, without probing it.
+fn source_traits_known(path: &Path) -> Option<SourceTraits> {
+    source_traits_cache().peek(path)
 }
 
 /// One `ffprobe` of `path`, killed after `timeout`.
@@ -1748,6 +1773,7 @@ fn parse_source_traits(json: &str) -> SourceTraits {
         lead,
         indexed,
         full_range: text("color_range") == "pc",
+        described: v.get("streams").is_some_and(|s| s.is_array()) && v.get("format").is_some_and(|f| f.is_object()),
         codec: Codec::from_name(text("codec_name")),
         chroma: Chroma::from_pix_fmt(text("pix_fmt")),
         bits: pix_fmt_bits_420(text("pix_fmt")),
@@ -8599,6 +8625,75 @@ fn placement_chain(scale: Option<&str>, pos: (&str, &str), canvas: (u32, u32), a
     p
 }
 
+/// The placement chain **as the export and the still write it** (`per_frame`: the export's `eval=frame`), for the
+/// compositor's probe of what this machine's `pad`, `perspective` and `crop` do with it: the text is
+/// [`placement_chain`]'s, joined, so a probe measures the filters the graph really holds and cannot drift from them.
+pub fn placement_probe_chain(scale: Option<&str>, pos: (&str, &str), canvas: (u32, u32), per_frame: bool) -> String {
+    placement_chain(scale, pos, canvas, false, per_frame).join(",")
+}
+
+/// A moving placement as the export writes it, and the numbers the plan evaluates for it ([`placement_probe_motion`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlacementProbeMotion {
+    /// The zoom's expression over `in` (the frame count `perspective` has), the position's two.
+    pub scale: String,
+    pub pos: (String, String),
+    /// What the plan evaluates for frame `in = k + 1` (index `k`): the zoom and the position.
+    pub poses: Vec<(f64, (f64, f64))>,
+}
+
+/// A clip whose zoom and position are keyed and which breathes, drifts and shakes at 30 fps, as
+/// [`placement_filters`] writes it (the same [`driven_expr`] over the same `in`-time) and as the plan evaluates it
+/// ([`Clip::transform_at`]) for the first `frames` frames of the graph. What the compositor's probe measures
+/// the filters against: the expression's `sin` and `cos` are the machine's libm's, the plan's the app's.
+pub fn placement_probe_motion(frames: u32) -> PlacementProbeMotion {
+    use crate::model::{Behavior, PropertyKey};
+    let rate = Rational { num: 30, den: 1 };
+    let mut clip = Clip::new(uuid::Uuid::nil(), 0.0, 10.0, 0.0);
+    clip.set_property_keys(
+        Property::Scale,
+        vec![
+            PropertyKey::new(0.0, 1.1),
+            PropertyKey::new(0.2, 2.3),
+            PropertyKey::new(0.4, 0.7),
+        ],
+    );
+    clip.set_property_keys(Property::PosX, vec![PropertyKey::new(0.0, -0.2), PropertyKey::new(0.3, 0.15)]);
+    clip.set_property_keys(Property::PosY, vec![PropertyKey::new(0.0, 0.1), PropertyKey::new(0.3, -0.25)]);
+    clip.behaviors = vec![
+        Behavior::Breathe {
+            amount: 0.12,
+            speed: 0.8,
+            phase: 1.25,
+        },
+        Behavior::Drift {
+            speed: 0.15,
+            angle: -33.0,
+            phase: 0.5,
+        },
+        Behavior::Shake {
+            amount: 0.013,
+            speed: 3.1,
+            seed: 4_000_000_001,
+            phase: 0.5,
+        },
+    ];
+    let t = perspective_time(rate, 0);
+    let poses = (0..frames)
+        .map(|k| {
+            // The graph's `((in-1)*den/num)`, in the filter's own double arithmetic.
+            let local = (f64::from(k) * f64::from(rate.den)) / f64::from(rate.num);
+            let at = clip.transform_at(local);
+            (at.scale, (at.pos_x, at.pos_y))
+        })
+        .collect();
+    PlacementProbeMotion {
+        scale: driven_expr(&clip, Property::Scale, &t),
+        pos: (driven_expr(&clip, Property::PosX, &t), driven_expr(&clip, Property::PosY, &t)),
+        poses,
+    }
+}
+
 /// The 0..1 "keep" expression at the heart of [`mask_filter`], separated out so
 /// a clip with both a mask and keyframed opacity can fold the two into one
 /// `geq` pass instead of paying the per-pixel cost twice.
@@ -12169,8 +12264,12 @@ mod tests {
         assert_eq!((pq.hdr, pq.lead), (Some(Hdr::Pq), 0.0));
         // `N/A` is left out by ffprobe's JSON writer; an unknown transfer is SDR.
         let plain = parse_source_traits(r#"{"streams":[{"color_transfer":"bt709"}],"format":{"start_time":"0.000000"}}"#);
-        assert_eq!(plain, SourceTraits::default());
-        assert_eq!(parse_source_traits(r#"{"streams":[],"format":{}}"#), SourceTraits::default());
+        let described = SourceTraits {
+            described: true,
+            ..SourceTraits::default()
+        };
+        assert_eq!(plain, described);
+        assert_eq!(parse_source_traits(r#"{"streams":[],"format":{}}"#), described);
         // The file's own range flag, which an asset probed before it was recorded does not hold.
         assert!(parse_source_traits(r#"{"streams":[{"color_range":"pc"}],"format":{}}"#).full_range);
         for tag in ["tv", "unknown", ""] {
@@ -12186,6 +12285,50 @@ mod tests {
         let mp4 =
             r#"{"streams":[{"start_time":"1.521333"}],"format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","start_time":"1.4"}}"#;
         assert!((parse_source_traits(mp4).lead - 0.121333).abs() < 1e-9);
+    }
+
+    /// The range a file says, as the compositor asks for it: `None` for an answer that describes no file (an `ffprobe` that exits 0
+    /// and prints nothing usable is not "limited range"), the flag for one that does, and "not full range" for a file the probe
+    /// read that has no video stream at all.
+    #[test]
+    fn a_files_range_is_unknown_when_the_probe_said_nothing_usable() {
+        let range = |json: &str| full_range_of(parse_source_traits(json));
+        for unusable in [
+            "",
+            "\n",
+            "not json",
+            "{}",
+            "[]",
+            "null",
+            r#"{"streams":null,"format":{}}"#,
+            r#"{"streams":{},"format":{}}"#,
+            r#"{"streams":[{"color_range":"pc"}]}"#,
+            r#"{"streams":[{"color_range":"pc"}],"format":null}"#,
+            r#"{"format":{"format_name":"matroska,webm"}}"#,
+            r#"{"programs":[]}"#,
+        ] {
+            assert_eq!(range(unusable), None, "{unusable:?}");
+        }
+        assert_eq!(range(r#"{"streams":[{"color_range":"pc"}],"format":{}}"#), Some(true));
+        assert_eq!(
+            range(r#"{"streams":[{"color_range":"tv"}],"format":{"format_name":"mov,mp4"}}"#),
+            Some(false)
+        );
+        assert_eq!(
+            range(r#"{"streams":[{}],"format":{}}"#),
+            Some(false),
+            "a stream that says nothing of its range"
+        );
+        // A wav or an mp3: read, and with no picture in it (what the picture would be is not a question it has an answer to).
+        assert_eq!(
+            range(r#"{"programs":[],"streams":[],"format":{"format_name":"wav","start_time":"0.000000"}}"#),
+            Some(false)
+        );
+        // (A probe cached for a file serves both questions: `peek` finds it, and a file never asked about has none.)
+        assert_eq!(
+            source_is_full_range_known(Path::new("/no/such/file/was/asked/about.mkv")),
+            None
+        );
     }
 
     /// A hung `ffprobe` is killed at the timeout and a failing one is no answer, where

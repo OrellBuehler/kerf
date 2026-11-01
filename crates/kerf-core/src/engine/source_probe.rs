@@ -96,6 +96,25 @@ impl<T: Copy> ProbeCache<T> {
         };
         probed
     }
+
+    /// The remembered answer for the file at `path`, **without probing**: `None` for a file not asked about yet, one whose
+    /// probe is running right now (nothing waits for it) and one whose probe failed. It spawns nothing and blocks on nothing,
+    /// so a render may ask it.
+    pub(super) fn peek(&self, path: &Path) -> Option<T> {
+        let slot = {
+            let files = self.files.lock().unwrap_or_else(PoisonError::into_inner);
+            Arc::clone(files.get(&source_key(path))?)
+        };
+        let found = match slot.try_lock() {
+            Ok(found) => found,
+            Err(std::sync::TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(std::sync::TryLockError::WouldBlock) => return None,
+        };
+        match *found {
+            Found::Known(answer) => Some(answer),
+            _ => None,
+        }
+    }
 }
 
 /// Whether a seek into the file at `path` is a decode from a keyframe: every one of the first
@@ -366,6 +385,48 @@ mod tests {
         // No sync sample at all is a "no" the file earns, not a failure.
         let flagless = probe_seek_points(|_, _, _| Some(packets_json(1, 20).replace("K__", "___")));
         assert_eq!(flagless, Some(false));
+    }
+
+    /// `peek` is what a render may ask: it finds an answer the cache holds and nothing else — never a probe, never a wait.
+    #[test]
+    fn a_peek_finds_an_answer_and_never_probes_or_waits() {
+        let dir = std::env::temp_dir().join(format!("kerf-probe-peek-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.bin");
+        std::fs::write(&file, b"x").unwrap();
+        let cache: ProbeCache<u32> = ProbeCache::retrying(Duration::from_secs(60));
+        // A file nobody asked about: nothing.
+        assert_eq!(cache.peek(&file), None);
+        // A failure is not an answer.
+        assert_eq!(cache.get(&file, || None), None);
+        assert_eq!(cache.peek(&file), None);
+        // While a probe of the file runs, the peek does not wait for it: it has nothing to say yet.
+        let other = dir.join("b.bin");
+        std::fs::write(&other, b"xy").unwrap();
+        std::thread::scope(|scope| {
+            let (started, started_rx) = std::sync::mpsc::channel::<()>();
+            let (release, release_rx) = std::sync::mpsc::channel::<()>();
+            let (cache, other) = (&cache, &other);
+            let running = scope.spawn(move || {
+                cache.get(other, || {
+                    started.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Some(5)
+                })
+            });
+            started_rx.recv().unwrap();
+            let t = Instant::now();
+            assert_eq!(cache.peek(&other), None, "the probe is still running");
+            assert!(t.elapsed() < Duration::from_secs(1));
+            release.send(()).unwrap();
+            assert_eq!(running.join().unwrap(), Some(5));
+        });
+        // Once there is an answer the peek finds it, for good, and a replaced file has none.
+        assert_eq!(cache.peek(&other), Some(5));
+        assert_eq!(cache.peek(&other), Some(5));
+        std::fs::write(&other, b"changed").unwrap();
+        assert_eq!(cache.peek(&other), None);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

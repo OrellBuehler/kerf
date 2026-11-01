@@ -457,7 +457,8 @@ pub struct Animated {
     /// size and are magnified with it; the FFmpeg still orders a moving zoom the same way.
     /// A compositor that draws a moving zoom has to draw that order, not "zoom, then the
     /// rest" as it does a constant one, so a moving zoom in an export frame is refused until
-    /// it says it does (`GpuCaps::keyed_zoom`), and in a still when something follows it.
+    /// it says it does (`GpuCaps::keyed_zoom`), and in a still when something follows it. The
+    /// zoom itself is [`Animated::places`], drawn by a compositor that sets `GpuCaps::placement`.
     pub zooms: bool,
     /// Some colour number is keyed: the export's `eq` is written per frame (`eval=frame`),
     /// off a colour sampled at the frame's time. A still plan samples it too and draws that
@@ -480,13 +481,17 @@ pub struct Animated {
     pub still_motion: bool,
     /// The zoom or the position moves ([`Clip::placement_animated`]): the export, the playback stream
     /// and the FFmpeg still place the picture on the canvas with a `perspective` at sub-pixel
-    /// positions, which no compositor pass draws, so every frame of it is refused.
+    /// positions (`pad`, `perspective`, `crop`: [`crate::perspective`]). A compositor that sets
+    /// `GpuCaps::placement` reproduces that to the sample ([`RenderPlan::pose`] is the pose it draws); without it
+    /// every frame of such a layer is refused (`Unsupported::KeyedPlacement`).
     pub places: bool,
     /// The clip has a live behaviour ([`Clip::has_behaviors`]: a sway, breath, spin, drift or shake on
     /// top of its pose). The plan samples the exact pose it draws ([`PlanLayer::transform`], the
-    /// behaviours included) and the other flags here say what the pose's chain is, but no compositor
-    /// has a parity case for a pose that moves by a formula, so every frame of such a layer is refused
-    /// (`Unsupported::Behavior`) until it sets `GpuCaps::behaviors`.
+    /// behaviours included) and the other flags here say what the pose's chain is. A breath, a drift and
+    /// a shake move the zoom or the position, which the placement draws, so a compositor with
+    /// `GpuCaps::behaviors` takes them; one that turns the picture (a sway, a spin: [`Animated::rotates`]) is a rotation,
+    /// which no pass draws to the sample. Every frame of a layer that a compositor does not take is refused
+    /// (`Unsupported::Behavior`).
     pub behaves: bool,
 }
 

@@ -62,6 +62,8 @@ fn compositor() -> &'static Compositor {
         let _ = kerf_gpu::grade::kernels();
         // ... and whether this FFmpeg converts a 4:4:4 / 4:2:2 picture in a graph as the decode does (a placed one).
         let _ = kerf_gpu::conversion::conversion();
+        // ... and whether this FFmpeg places a picture as the model does (the moving zoom and position are in the caps only then).
+        let _ = kerf_gpu::placement_probe::placement();
         // ... and so is the layout of its `drawtext`, which decides whether text whose bitmaps share samples is drawn.
         let _ = kerf_gpu::text::model();
         Compositor::new(gpu()).expect("a compositor")

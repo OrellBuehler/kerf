@@ -308,7 +308,9 @@ impl Run {
     fn slot(&self, rel: i64) -> i64 {
         let t = self.stamp(rel);
         match self.pin {
-            Some((in_off, out_off)) => out_off + self.to_slots(t - in_off),
+            // (Saturating: a start past about 1e12 seconds pins `in_off` at the end of the integers, and the sum of two
+            // of those is no slot of any frame, only a number that must not wrap or panic.)
+            Some((in_off, out_off)) => out_off.saturating_add(self.to_slots(t.saturating_sub(in_off))),
             None => self.to_slots(t),
         }
     }
@@ -400,7 +402,11 @@ fn run(pick: &FpsPick, frames: &Frames) -> Option<Run> {
     if pick.pinned {
         // `first_pts = start_time * AV_TIME_BASE`, truncated to whole microseconds, rescaled to each side's ticks.
         let micros = (start(pick) * 1e6) as i64;
-        let to = |num: i128, den: i128| rescale_near(i128::from(micros), num, den) as i64;
+        // (Clamped: a start whose microseconds fill an `i64`, in a finer time base, is more ticks than an `i64` holds.)
+        let to = |num: i128, den: i128| {
+            let ticks = rescale_near(i128::from(micros), num, den);
+            i64::try_from(ticks).unwrap_or(if ticks < 0 { i64::MIN } else { i64::MAX })
+        };
         run.pin = Some((
             to(i128::from(tb.den), 1_000_000 * i128::from(tb.num)),
             to(i128::from(pick.fps.num), 1_000_000 * i128::from(pick.fps.den)),
@@ -845,6 +851,46 @@ mod tests {
             differs > 100,
             "the plain pick must be the wrong one somewhere: {differs} of {compared}"
         );
+    }
+
+    /// A start no clip has (past the 9.2e12 seconds whose microseconds fit an `i64`, or not a number) pins `fps` at the
+    /// end of the integers, in a time base fine enough for that to be more ticks than an `i64` holds: the pick is some frame
+    /// or none, and never an overflow.
+    #[test]
+    fn a_hostile_start_pins_the_pick_without_overflowing() {
+        // Footage whose timestamps start below zero too, in time bases from the coarse to the nanosecond.
+        for (den, first) in [(90_000u32, 0i64), (1_000_000, -5), (1_000_000_000, -3), (1_000_000_000, 7)] {
+            let step = i64::from(den / 30);
+            let pts: Vec<i64> = (0..60).map(|i| first + i * step).collect();
+            let src = SourceFrames {
+                pts: &pts,
+                time_base: Rational { num: 1, den },
+                start_us: 0,
+                last_duration: step,
+            };
+            for start in [
+                1e12,
+                9.2e12,
+                1e13,
+                1e15,
+                1e300,
+                f64::MAX,
+                f64::INFINITY,
+                f64::NAN,
+                -1e13,
+                f64::NEG_INFINITY,
+            ] {
+                for frame in [0, 1, 29, 59, 1000] {
+                    let p = FpsPick {
+                        frame,
+                        pinned: true,
+                        ..pick((0.0, 100.0), start, 1.0, false, (30, 1), 0)
+                    };
+                    let _ = fps_pick(&p, &src);
+                    let _ = fps_span(&p, &src);
+                }
+            }
+        }
     }
 
     #[test]
