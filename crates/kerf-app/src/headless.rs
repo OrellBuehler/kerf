@@ -28,11 +28,13 @@ const EXIT_INTERRUPTED: i32 = 130;
 const USAGE: &str = "\
 kerf-app --headless [options]
 
-Run Kerf's MCP server with no window. Prints one JSON line on stdout once it listens;
-logs go to stderr. Stops on SIGINT / SIGTERM.
+Run Kerf's MCP server with no window. Prints one JSON line on stdout once it listens
+(with --stdio, stdout is the protocol's alone); logs go to stderr. Stops on SIGINT / SIGTERM.
 
   --project PATH.kerf      open an existing project (default: a new untitled one)
   --new-project PATH.kerf  create a project file and open it (refused if it exists)
+  --stdio                  speak MCP on stdin / stdout to the one client that started this process,
+                           with no port and no token; it stops when stdin closes
   --mcp-addr HOST:PORT     where to listen (default: KERF_MCP_ADDR, the setting, 127.0.0.1:7777;
                            port 0 picks a free one)
   --data-dir DIR           keep settings, logs and recovery files in DIR instead of the app's own
@@ -55,6 +57,7 @@ enum ProjectArg {
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Args {
     project: Option<ProjectArg>,
+    stdio: bool,
     mcp_addr: Option<String>,
     data_dir: Option<PathBuf>,
     token_file: Option<PathBuf>,
@@ -117,6 +120,7 @@ fn parse(argv: &[String], cwd: &Path) -> Result<Option<Args>, String> {
         match flag {
             "--headless" => switch(&mut true)?,
             "-h" | "--help" => switch(&mut args.help)?,
+            "--stdio" => switch(&mut args.stdio)?,
             "--show-token" => switch(&mut args.show_token)?,
             "--review" => switch(&mut args.review)?,
             "--proxies" => switch(&mut args.proxies)?,
@@ -190,12 +194,20 @@ pub(crate) fn main(argv: &[String], bundled_ffmpeg: &[(&'static str, PathBuf)]) 
             return code;
         }
     };
+    // Before anything is spawned: from here on a child process that prints does so on stderr.
+    let protocol = match args.stdio.then(protocol_stdout).transpose() {
+        Ok(protocol) => protocol,
+        Err(e) => {
+            say(&format!("kerf-app: cannot take stdout for --stdio: {e}"));
+            return EXIT_FAILURE;
+        }
+    };
     crate::init_logging(data.as_ref().map(|d| d.join("logs")), true);
     crate::install_panic_hook();
     for (var, path) in bundled_ffmpeg {
         tracing::info!(%var, path = %path.display(), "using bundled FFmpeg binary");
     }
-    match run(&args, token, config, data) {
+    match run(&args, token, protocol, config, data) {
         Ok(code) => code,
         Err(Exit(code, message)) => {
             tracing::error!("{message}");
@@ -220,6 +232,20 @@ fn check_args(args: &Args) -> Result<Option<String>, Exit> {
             return Err(usage(format!("{} already exists (--project opens it)", path.display())));
         }
         _ => {}
+    }
+    if args.stdio {
+        let listening = [
+            ("--mcp-addr", args.mcp_addr.is_some()),
+            ("--token-file", args.token_file.is_some()),
+            ("--show-token", args.show_token),
+        ];
+        if let Some((flag, _)) = listening.iter().find(|(_, given)| *given) {
+            return Err(usage(format!(
+                "{flag} is for a server that listens; --stdio has no port and no token"
+            )));
+        }
+        // The client that started the process is the only one that can reach it.
+        return Ok(None);
     }
     if let Some(path) = args.token_file.as_deref().filter(|p| p.is_dir()) {
         return Err(usage(format!("--token-file {} is a directory", path.display())));
@@ -253,7 +279,33 @@ fn dirs_for(data_dir: Option<&Path>) -> Result<(Option<PathBuf>, Option<PathBuf>
     }
 }
 
-fn run(args: &Args, token: Option<String>, config: Option<PathBuf>, data: Option<PathBuf>) -> Result<i32, Exit> {
+/// The real stdout for the protocol to write to, with fd 1 pointed at stderr from now on: a child
+/// process or a library that prints cannot put a stray line into the client's stream.
+fn protocol_stdout() -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsFd;
+        let protocol = std::io::stdout().as_fd().try_clone_to_owned()?;
+        // SAFETY: both descriptors are this process's own and open; nothing has written to fd 1 yet.
+        if unsafe { libc::dup2(libc::STDERR_FILENO, libc::STDOUT_FILENO) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(protocol.into())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsHandle;
+        Ok(std::io::stdout().as_handle().try_clone_to_owned()?.into())
+    }
+}
+
+fn run(
+    args: &Args,
+    token: Option<String>,
+    protocol: Option<std::fs::File>,
+    config: Option<PathBuf>,
+    data: Option<PathBuf>,
+) -> Result<i32, Exit> {
     let failed = |e: kerf_core::Error| Exit(EXIT_FAILURE, e.to_string());
     let project = match &args.project {
         Some(ProjectArg::Open(path) | ProjectArg::Create(path)) => Project::open(path).map_err(failed)?,
@@ -290,11 +342,13 @@ fn run(args: &Args, token: Option<String>, config: Option<PathBuf>, data: Option
         (None, Some(_)) => "settings",
         (None, None) => "generated",
     };
-    mcp::set_overrides(mcp::Overrides {
-        addr: args.mcp_addr.clone(),
-        token,
-    });
-    mcp::start(shell.clone(), project.clone());
+    if !args.stdio {
+        mcp::set_overrides(mcp::Overrides {
+            addr: args.mcp_addr.clone(),
+            token,
+        });
+        mcp::start(shell.clone(), project.clone());
+    }
     // Nobody is there to review: the agent's edits land live unless `--review` asks otherwise. For
     // this run only; the stored switch is the desktop app's.
     if !args.review {
@@ -306,9 +360,38 @@ fn run(args: &Args, token: Option<String>, config: Option<PathBuf>, data: Option
         data_dir = %data.as_deref().map(|d| d.display().to_string()).unwrap_or_default(),
         project = %lock_user(&project).path().map(|p| p.display().to_string()).unwrap_or_default(),
         review = settings::agent_review(),
+        stdio = args.stdio,
         "kerf starting headless"
     );
-    tauri::async_runtime::block_on(serve(args, &shell, &project, token_source))
+    match protocol {
+        Some(protocol) => tauri::async_runtime::block_on(serve_stdio(protocol, &shell, &project)),
+        None => tauri::async_runtime::block_on(serve(args, &shell, &project, token_source)),
+    }
+}
+
+/// Serve the client on stdin / stdout until it closes stdin or a signal arrives.
+async fn serve_stdio(protocol: std::fs::File, shell: &Shell, project: &Arc<Mutex<Project>>) -> Result<i32, Exit> {
+    use rmcp::ServiceExt;
+    let mut signals = Signals::new().map_err(|e| Exit(EXIT_FAILURE, format!("cannot listen for signals: {e}")))?;
+    let transport = (tokio::io::stdin(), tokio::fs::File::from_std(protocol));
+    let running = Box::pin(mcp::KerfMcp::new(project.clone(), shell.clone()).serve(transport))
+        .await
+        .map_err(|e| Exit(EXIT_FAILURE, format!("the client did not start an MCP session on stdin: {e}")))?;
+    let cancel = running.cancellation_token();
+    tauri::async_runtime::spawn(async move {
+        signals.next().await;
+        tracing::info!("signal received; shutting down (a second one exits at once)");
+        cancel.cancel();
+        signals.next().await;
+        tracing::warn!("second signal; exiting without waiting");
+        std::process::exit(EXIT_INTERRUPTED);
+    });
+    match running.waiting().await {
+        Ok(reason) => tracing::info!(?reason, "the stdio session ended"),
+        Err(e) => tracing::warn!("the stdio session ended: {e}"),
+    }
+    shutdown(shell, project).await;
+    Ok(0)
 }
 
 async fn serve(args: &Args, shell: &Shell, project: &Arc<Mutex<Project>>, token_source: &str) -> Result<i32, Exit> {
@@ -465,6 +548,7 @@ mod tests {
             args,
             Args {
                 project: Some(ProjectArg::Open(PathBuf::from("/work/cut.kerf"))),
+                stdio: false,
                 mcp_addr: Some("127.0.0.1:0".to_string()),
                 data_dir: Some(PathBuf::from("/tmp/kerf")),
                 token_file: Some(PathBuf::from("/work/token")),
@@ -522,6 +606,31 @@ mod tests {
         });
         assert!(dir_as_file.is_err_and(|Exit(code, _)| code == EXIT_USAGE));
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stdio_takes_no_listening_flags_and_no_token() {
+        let args = parsed(&["--headless", "--stdio", "--review"]).unwrap().unwrap();
+        assert!(args.stdio && args.review);
+        assert!(parsed(&["--headless", "--stdio=yes"]).unwrap_err().contains("takes no value"));
+        for extra in [
+            &["--mcp-addr", "127.0.0.1:0"][..],
+            &["--token-file", "token"],
+            &["--show-token"],
+        ] {
+            let args = parsed(&[&["--headless", "--stdio"][..], extra].concat()).unwrap().unwrap();
+            let Err(Exit(code, message)) = check_args(&args) else {
+                panic!("{extra:?} with --stdio was accepted");
+            };
+            assert_eq!(code, EXIT_USAGE);
+            assert!(message.contains(extra[0]) && message.contains("--stdio"), "{message}");
+        }
+        let args = parsed(&["--headless", "--stdio"]).unwrap().unwrap();
+        assert!(check_args(&args).is_ok_and(|token| token.is_none()), "no token over stdio");
+        let missing = parsed(&["--headless", "--stdio", "--project", "/nowhere/missing.kerf"])
+            .unwrap()
+            .unwrap();
+        assert!(check_args(&missing).is_err(), "the project is still checked");
     }
 
     #[cfg(unix)]

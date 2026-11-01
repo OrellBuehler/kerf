@@ -40,6 +40,9 @@ switch changes (`settings::update` → `settings_changed`; sessions on the old l
 `mcpServers` JSON snippet, and `tool_sets` (name, description, tool count: Prompts and tool sets, below);
 `regenerate_mcp_token` and `set_mcp_settings` (only `mcp_*` and `agent_review`) are the other two commands.
 It shares the **same** `Arc<Mutex<Project>>` the Tauri commands hold, so the agent edits the project the user has open.
+**`kerf-app --headless --stdio`** is the one other transport: a single `KerfMcp::new` served over stdin / stdout, none of
+the listener, token, origin or `Host` checks (the client that spawned the process is the only one that can reach it), no
+`http::request::Parts` — so no session id (`owner()` is `None`) and no `?tools=` (every tool is listed). See `app.md`.
 **The app around the server is a `Shell`** (`shell.rs`): `KerfMcp.app` is `Shell::Gui(AppHandle)` or
 `Shell::Headless`, whose inherent `emit` / `state` / `try_state` / `listen` / `unlisten` mirror Tauri's, so tools write
 `self.app.emit(…)` and `self.app.state::<crate::AppState>()` either way (not `tauri::Emitter::emit(&app, …)` or

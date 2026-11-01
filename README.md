@@ -158,6 +158,41 @@ KERF_MCP_TOKEN=<32+ chars> kerf-app --headless --mcp-addr 127.0.0.1:7777 [--proj
 It prints one JSON line on stdout once it listens and stops on SIGINT / SIGTERM; edits land live
 unless `--review`. `kerf-app --headless --help` lists the flags (`--data-dir`, `--token-file`, …).
 
+`--stdio` speaks MCP on stdin / stdout instead — no port, no token — so a client can start Kerf
+itself and it stops when the client does:
+
+```json
+{
+  "mcpServers": {
+    "kerf": { "type": "stdio", "command": "kerf-app", "args": ["--headless", "--stdio"] }
+  }
+}
+```
+
+### In a Claude Code cloud session
+
+Kerf can run inside a [Claude Code on the web](https://claude.ai/code) session (or a scheduled
+routine) for a repository that holds your footage:
+
+1. In the cloud environment's **setup script**, install Kerf and FFmpeg (the result is cached
+   between sessions):
+
+   ```bash
+   curl -fsSL https://raw.githubusercontent.com/OrellBuehler/kerf/main/scripts/cloud-setup.sh | bash
+   ```
+
+   `KERF_VERSION=0.30.0` pins a release and `KERF_SHA256` checks the package.
+2. Commit the `.mcp.json` above to the repository. Add `"--project", "cut.kerf"` to the args to open
+   a project you committed; without it the agent starts an untitled one and saves it with
+   `save_project_as`.
+3. Transcription, voiceover and stem models download from Hugging Face, which the default
+   **Trusted** network level does not reach: set the environment's network to **Custom** with the
+   default list plus `huggingface.co` and `*.hf.co` (or **Full**).
+
+Media comes from the repository (Git LFS for anything big) or a URL the network allows; exports
+leave the session the same way, committed and pushed. The sandbox has about 4 CPUs, 16 GB of RAM and
+30 GB of disk, and edits land live (`--review` stages them for a later look in the desktop app).
+
 Now ask the agent to work on the project you have open — _"skim the interview clip, cut
 the dead air, and drop in captions."_ It will claim a task, use the tools below, and hand
 back a reviewable result.

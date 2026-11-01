@@ -1,5 +1,6 @@
 //! `kerf-app --headless` as a process: it starts with no display, listens on the port it reports,
-//! answers MCP over HTTP behind the token, and stops cleanly on SIGTERM.
+//! answers MCP over HTTP behind the token, and stops cleanly on SIGTERM. With `--stdio` it speaks
+//! MCP on stdin / stdout instead and stops when stdin closes.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -168,4 +169,99 @@ fn a_headless_run_serves_mcp_with_no_display_and_stops_on_sigterm() {
         assert_eq!(kept, 1, "the untitled project with a marker is kept for recovery");
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+#[test]
+fn a_stdio_run_speaks_mcp_on_stdin_and_stdout_and_stops_when_stdin_closes() {
+    let dir = std::env::temp_dir().join(format!("kerf-headless-stdio-it-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let log = std::fs::File::create(dir.join("stderr.log")).unwrap();
+    let mut child = Running(
+        Command::new(env!("CARGO_BIN_EXE_kerf-app"))
+            .args(["--headless", "--stdio", "--data-dir"])
+            .arg(&dir)
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
+            .env_remove("KERF_MCP_TOKEN")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(log)
+            .spawn()
+            .expect("spawn kerf-app"),
+    );
+    let stderr = || std::fs::read_to_string(dir.join("stderr.log")).unwrap_or_default();
+
+    let stdout = child.0.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let mut stdin = child.0.stdin.take().unwrap();
+    let mut send = |message: &str| {
+        stdin.write_all(message.as_bytes()).unwrap();
+        stdin.write_all(b"\n").unwrap();
+        stdin.flush().unwrap();
+    };
+    let answer = |id: u32| loop {
+        let line = rx
+            .recv_timeout(Duration::from_secs(120))
+            .unwrap_or_else(|_| panic!("no answer to {id}; stderr:\n{}", stderr()));
+        let message: serde_json::Value =
+            serde_json::from_str(&line).unwrap_or_else(|e| panic!("stdout carries only the protocol, got {line:?}: {e}"));
+        if message["id"] == id {
+            break message;
+        }
+    };
+
+    send(INITIALIZE);
+    let init = answer(1);
+    assert_eq!(
+        init["result"]["serverInfo"]["name"].as_str().map(|n| n.is_empty()),
+        Some(false),
+        "{init}"
+    );
+    send(INITIALIZED);
+    let mut call = |id: u32, tool: &str, arguments: serde_json::Value| {
+        send(
+            &serde_json::json!({
+                "jsonrpc": "2.0", "id": id, "method": "tools/call",
+                "params": { "name": tool, "arguments": arguments },
+            })
+            .to_string(),
+        );
+        let reply = answer(id);
+        assert_ne!(reply["result"]["isError"], true, "{tool}: {reply}");
+        reply["result"]["content"][0]["text"].as_str().unwrap_or_default().to_string()
+    };
+    assert!(call(2, "project_info", serde_json::json!({})).contains(r#""in_memory":true"#));
+    call(3, "add_marker", serde_json::json!({ "time": 1.5, "name": "stdio-mark" }));
+    assert!(call(4, "get_timeline_state", serde_json::json!({})).contains("stdio-mark"));
+
+    drop(stdin);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(status) = child.0.try_wait().unwrap() {
+            break status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "still running after stdin closed; stderr:\n{}",
+            stderr()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(status.code(), Some(0), "stderr:\n{}", stderr());
+    let kept = std::fs::read_dir(dir.join("recovery")).map_or(0, |d| d.count());
+    assert_eq!(kept, 1, "the untitled project with a marker is kept for recovery");
+    assert!(
+        std::fs::read_to_string(dir.join("settings.json")).map_or(true, |s| !s.contains("mcp_token\":\"")),
+        "no token is made for a run that listens nowhere"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -80,3 +80,7 @@ x11rb.workspace = true
 raw-window-handle.workspace = true
 # The process's own Xlib display (`gpu_preview::x11::display`), opened through libX11 at runtime.
 libloading = "0.9"
+
+# `--headless --stdio` points fd 1 at stderr once the protocol has its own copy (`dup2`).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

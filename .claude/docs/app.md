@@ -59,7 +59,17 @@ the settings file. SIGINT / SIGTERM (Ctrl+C on Windows): the listener closes (`m
 Stop, proxies and agent jobs are cancelled and waited for up to 10 s, `recovery::on_exit` keeps an untitled project with work
 (its directory logged); a second signal exits 130. Exit codes: 0 stopped by a signal, 1 failure, 2 usage, 3 not listening.
 Release Windows builds are `windows_subsystem = "windows"`: pipes work, an interactive console shows nothing.
-`tests/headless.rs` drives the real binary (no `DISPLAY`): ready line, 401 / 200 / 202, two tools, SIGTERM → 0.
+**`--stdio`** serves one `KerfMcp` over stdin / stdout (rmcp `transport-io`) instead of starting the listener: no port,
+no token (`--mcp-addr` / `--token-file` / `--show-token` are refused, `KERF_MCP_TOKEN` ignored), no ready line, and the
+run ends with exit 0 when the client closes stdin (a signal cancels the service the same way), then the same
+`shutdown`. Before logging or any thread starts, `protocol_stdout` dups fd 1 for the protocol and `dup2`s stderr onto
+fd 1, so an ffmpeg child or a library that prints cannot corrupt the stream. No session id: the agent is `owner()`
+`None`. Made for a client that spawns the server itself — a Claude Code cloud session, where `scripts/cloud-setup.sh`
+installs the release `.deb` and Ubuntu's FFmpeg in the environment's setup script (README, "In a Claude Code cloud
+session"); an HTTP server there would have to be up before the client's three connect retries and is lost when the VM
+pauses, a stdio one is restarted by the client.
+`tests/headless.rs` drives the real binary (no `DISPLAY`): ready line, 401 / 200 / 202, two tools, SIGTERM → 0; and
+over `--stdio` (every stdout line is protocol): initialize, three tools, stdin closed → 0 with the untitled work kept.
 
 **Process start.** `use_bundled_ffmpeg()` sets `KERF_FFMPEG` / `KERF_FFPROBE` and is the **first statement of `run()`**,
 before the runtime, the webview or any thread exists (`set_var` races every concurrent read of the environment);

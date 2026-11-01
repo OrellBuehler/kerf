@@ -7189,7 +7189,7 @@ impl KerfMcp {
 }
 
 impl KerfMcp {
-    fn new(project: Arc<Mutex<Project>>, app: Shell) -> Self {
+    pub(crate) fn new(project: Arc<Mutex<Project>>, app: Shell) -> Self {
         Self {
             project,
             app,
