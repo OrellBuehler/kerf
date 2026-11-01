@@ -5309,8 +5309,11 @@ struct Seen {
     /// Frames the plan (or, under `anyway`, the compositor) refused, with the first reason.
     refused: Vec<(u64, String)>,
     /// Frames whose planes differ from the export's: `(frame, plane, differing samples, max difference, first (x, y))`.
-    off: Vec<(u64, &'static str, usize, i32, (usize, usize))>,
+    off: Vec<Off>,
 }
+
+/// A plane that differs: `(frame, plane, differing samples, max difference, first (x, y))`.
+type Off = (u64, &'static str, usize, i32, (usize, usize));
 
 impl Seen {
     fn line(&self, case: &str) -> String {
@@ -5346,11 +5349,24 @@ fn checker_motion_as(
     frames: Range<u64>,
     anyway: bool,
 ) -> Seen {
+    checker_motion_with(case, tl, assets, plan_assets, &at_fps(fps), frames, anyway)
+}
+
+/// [`checker_motion_as`] with the export's options (a range, a rate).
+fn checker_motion_with(
+    case: &str,
+    tl: &Timeline,
+    assets: &[Asset],
+    plan_assets: &[Asset],
+    opts: &ExportOptions,
+    frames: Range<u64>,
+    anyway: bool,
+) -> Seen {
     let slug: String = case
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect();
-    let opts = at_fps(fps);
+    let opts = opts.clone();
     let played = export(&slug, tl, assets, &opts);
     assert!(
         played.count() as u64 >= frames.end,
@@ -5973,7 +5989,7 @@ fn checker_a_cropped_and_fitted_pictures_are_placed_as_the_export_places_them() 
         );
         // The position alone moves (the zoom holds): the same picture, a different pose.
         let mut p = clip(&m.testsrc, 0.5, 1.5, 0.0);
-        p.transform = z.transform.clone();
+        p.transform = z.transform;
         p.keyframes = vec![zoom_key(0.0, 1.0, -0.2, 0.1), zoom_key(1.0, 1.0, 0.2, -0.1)];
         expect(
             &format!("{name}, a pan"),
@@ -6246,7 +6262,6 @@ fn checker_a_refusals_drawn_anyway() {
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn checker_a_matrices_and_the_709_label_are_placed_as_the_export_places_them() {
-    let m = media();
     let c = checker_media();
     let h = hd_pair();
     let mut fails = Vec::new();
@@ -6384,4 +6399,474 @@ fn checker_a_keyed_colour_and_mask_ahead_of_a_moving_zoom() {
     c.set_property_keys(Property::CropZoom, linear_keys(1.0, 1.5));
     run("keyed crop + zoom (refused)", c, Some("crop"));
     checker_all("keyed colour and mask", fails);
+}
+
+// ---- checker/a, second round: what the fix lifted ----------------------------------------------------------------
+//
+// d4a8fdaa pins the frame pick of a placed clip to `fps ... start_time`, lifts the refusal of a grade ahead of a placement, and
+// lifts 4:4:4 and 4:2:2 behind a probe of this FFmpeg's `scale`. Hunts for a frame that is drawn and is not the export's.
+
+/// Every grade of `grades()` ahead of a moving zoom or position, and the grade beside what else a layer carries: a mask, a
+/// key, a keyed colour, a fade, a dissolve, a tagged picture, other shapes and formats. A frame the plan draws is the export's to
+/// the sample; one it refuses is listed.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_a_a_grade_ahead_of_a_placement_is_the_exports() {
+    use kerf_core::{Property, PropertyKey};
+    let m = media();
+    let v = variants();
+    let sh = shapes();
+    let g = grades();
+    let assets = [m.bars.clone(), m.testsrc.clone()];
+    let mut fails = Vec::new();
+    let mut drawn_total = 0;
+    let mut run = |name: &str, tl: Timeline, assets: &[Asset], must_draw: bool| {
+        let seen = checker_motion(&format!("checker/a/grade {name}"), &tl, assets, 30.0, 0..30, false);
+        drawn_total += seen.drawn;
+        if let Some(o) = seen.off.first() {
+            fails.push(format!(
+                "{name}: frame {} plane {}: {} samples differ (max {}, first at {:?})",
+                o.0, o.1, o.2, o.3, o.4
+            ));
+        }
+        if must_draw && seen.drawn == 0 {
+            fails.push(format!("{name}: nothing was drawn: {:?}", seen.refused.first()));
+        }
+    };
+    let over = |c: Clip| timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None);
+    let moving = |edit: &dyn Fn(&mut Clip)| {
+        let mut c = zooming(&m.testsrc, 1.0, 1.5, (0.1, -0.05));
+        edit(&mut c);
+        c
+    };
+    let panning = |edit: &dyn Fn(&mut Clip)| {
+        let mut c = clip(&m.testsrc, 0.5, 1.5, 0.0);
+        c.keyframes = vec![zoom_key(0.0, 1.0, -0.2, 0.1), zoom_key(1.0, 1.0, 0.2, -0.1)];
+        edit(&mut c);
+        c
+    };
+    for (gname, grade) in &g {
+        run(
+            &format!("`{gname}` + zoom"),
+            over(moving(&|c| c.grade = grade.clone())),
+            &assets,
+            true,
+        );
+    }
+    for (gname, grade) in [&g[1], &g[3], &g[8]] {
+        let with = |name: &str, c: Clip, run: &mut RunFn| {
+            run(&format!("`{gname}` + {name}"), over(c), &assets, false);
+        };
+        let mut r = |n: &str, tl: Timeline, a: &[Asset], d: bool| run(n, tl, a, d);
+        with("pan", panning(&|c| c.grade = grade.clone()), &mut r);
+        with(
+            "feathered mask",
+            moving(&|c| {
+                c.grade = grade.clone();
+                c.mask = Some(mask_of(kerf_core::MaskShape::Ellipse, 0.25, false));
+            }),
+            &mut r,
+        );
+        with(
+            "chroma key",
+            moving(&|c| {
+                c.grade = grade.clone();
+                c.effects = vec![key("green", 0.2, 0.2)];
+            }),
+            &mut r,
+        );
+        with(
+            "keyed brightness",
+            moving(&|c| {
+                c.grade = grade.clone();
+                c.set_property_keys(Property::Brightness, linear_keys(-0.2, 0.2));
+            }),
+            &mut r,
+        );
+        with(
+            "static colour",
+            moving(&|c| {
+                c.grade = grade.clone();
+                c.color.contrast = 1.2;
+                c.color.saturation = 1.1;
+            }),
+            &mut r,
+        );
+        with(
+            "fade-in",
+            moving(&|c| {
+                c.grade = grade.clone();
+                c.fade_in = 0.4;
+            }),
+            &mut r,
+        );
+        with(
+            "fade-out",
+            moving(&|c| {
+                c.grade = grade.clone();
+                c.fade_out = 0.4;
+            }),
+            &mut r,
+        );
+        with(
+            "effect (grayscale)",
+            moving(&|c| {
+                c.grade = grade.clone();
+                c.effects = vec![kerf_core::VideoEffect::Grayscale];
+            }),
+            &mut r,
+        );
+        with(
+            "keyed mask",
+            moving(&|c| {
+                c.grade = grade.clone();
+                c.mask = Some(mask_of(kerf_core::MaskShape::Rect, 0.0, false));
+                c.set_property_keys(Property::MaskX, vec![PropertyKey::new(0.0, 0.3), PropertyKey::new(1.0, 0.7)]);
+            }),
+            &mut r,
+        );
+        // Dissolved in over another clip, and out of one.
+        let mut out = clip(&m.bars, 0.5, 1.5, 0.0);
+        out.keyframes = vec![zoom_key(0.0, 1.0, 0.0, 0.0), zoom_key(1.0, 1.3, 0.0, 0.0)];
+        let mut inc = moving(&|c| c.grade = grade.clone());
+        inc.timeline_start = 1.0;
+        inc.transition_in = Some(Transition {
+            kind: TransitionKind::Crossfade,
+            duration: 0.5,
+        });
+        run(
+            &format!("`{gname}` + dissolve in"),
+            timeline(vec![vec![out, inc]], None),
+            &assets,
+            false,
+        );
+        // Another layer over it.
+        let mut top = clip(&m.bars, 0.5, 1.5, 0.0);
+        top.mask = Some(mask_of(kerf_core::MaskShape::Ellipse, 0.3, true));
+        run(
+            &format!("`{gname}` + a layer over it"),
+            timeline(vec![vec![over_clip(m, &g, grade)], vec![top]], None),
+            &assets,
+            false,
+        );
+        // Pictures of other shapes, tags and formats.
+        for (name, a, under) in [
+            ("bt709 tagged", &v.testsrc709, &v.bars709),
+            ("smpte170m tagged", &v.testsrc170m, &m.bars),
+            ("10-bit", &v.tenbit, &m.bars),
+            ("gray", &v.gray, &m.bars),
+            ("pillarboxed 480x360", &sh.pillar, &m.bars),
+            ("odd width 203x360", &sh.odd_width, &m.bars),
+            ("10-bit tagged tv", &sh.tenbit_tv, &m.bars),
+        ] {
+            let mut c = zooming(a, 1.0, 1.5, (0.1, -0.05));
+            c.grade = grade.clone();
+            let tl = timeline(vec![vec![clip(under, 0.5, 1.5, 0.0)], vec![c]], None);
+            run(&format!("`{gname}` + {name}"), tl, &[under.clone(), a.clone()], false);
+        }
+        // Cropped (odd width, odd offset), and a delivery frame of another shape.
+        let mut c = moving(&|c| c.grade = grade.clone());
+        c.transform.crop_right = 0.0013;
+        run(&format!("`{gname}` + crop to 639 wide"), over(c), &assets, false);
+        let mut c = moving(&|c| c.grade = grade.clone());
+        c.transform.crop_left = 0.003;
+        run(&format!("`{gname}` + crop from x 1"), over(c), &assets, false);
+        let tl = timeline(
+            vec![vec![moving(&|c| c.grade = grade.clone())]],
+            Some(Delivery::new(640, 480, Fit::Contain)),
+        );
+        run(&format!("`{gname}` + letterboxed in 640x480"), tl, &assets[1..], false);
+    }
+    eprintln!("grade ahead of a placement: {drawn_total} frames drawn");
+    checker_all("a grade ahead of a placement", fails);
+}
+
+/// What a case of the grade hunt is run with: a name, a cut, its assets and whether something must be drawn.
+type RunFn<'a> = dyn FnMut(&str, Timeline, &[Asset], bool) + 'a;
+
+/// (A helper for the case above: a plain grey-graded clip that another layer is laid over.)
+fn over_clip(m: &Media, g: &[(&'static str, kerf_core::Grade)], grade: &kerf_core::Grade) -> Clip {
+    let _ = g;
+    let mut c = zooming(&m.testsrc, 1.0, 1.4, (0.0, 0.05));
+    c.grade = grade.clone();
+    c
+}
+
+/// 4:4:4 and 4:2:2 under a placement, once the probe says this FFmpeg converts them in a graph as the decode does: the sizes,
+/// tags and containers the probe's 64x36 picture is not (odd widths, a pillarbox, tagged pictures, 4:4:4 from x264), and the
+/// formats it must leave refused (10-bit, `yuvj`, 4:4:0, RGB, an alpha plane).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_a_4_4_4_and_4_2_2_under_a_placement_are_the_exports_or_refused() {
+    let m = media();
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-a-chroma");
+    std::fs::create_dir_all(&dir).unwrap();
+    let make = |name: &str, size: &str, vf: &str, pix: &str, codec: &[&str], flags: &[&str]| -> Option<Asset> {
+        let p = dir.join(name);
+        let (w, h) = size.split_once('x').unwrap();
+        let source = format!("{}x{}", w.parse::<u32>().unwrap().next_multiple_of(2), h);
+        let graph = format!("testsrc2=size={source}:rate=30:duration=4{vf},setparams=colorspace=unknown:color_primaries=unknown:color_trc=unknown");
+        let mut args = vec![
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            graph.as_str(),
+        ];
+        args.extend_from_slice(codec);
+        args.extend_from_slice(&["-pix_fmt", pix]);
+        args.extend_from_slice(flags);
+        args.push(p.to_str().unwrap());
+        let ok = Command::new(kerf_core::ffmpeg_path())
+            .args(&args)
+            .stdin(Stdio::null())
+            .output()
+            .ok()?
+            .status
+            .success();
+        ok.then(|| probed(&p))
+    };
+    let ffv1 = ["-c:v", "ffv1"];
+    let x264 = [
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-qp",
+        "0",
+        "-g",
+        "10",
+        "-profile:v",
+        "high444",
+    ];
+    let odd = ",crop=w=203:h=360:x=0:y=0:exact=1";
+    // (name, asset, drawn expected when the probe matches)
+    let mut cases: Vec<(&str, Option<Asset>, bool)> = vec![
+        (
+            "yuv444p 640x360",
+            make("a444.mkv", "640x360", "", "yuv444p", &ffv1, &[]),
+            true,
+        ),
+        (
+            "yuv422p 640x360",
+            make("a422.mkv", "640x360", "", "yuv422p", &ffv1, &[]),
+            true,
+        ),
+        (
+            "yuv444p 203x360 odd width",
+            make("b444.mkv", "203x360", odd, "yuv444p", &ffv1, &[]),
+            true,
+        ),
+        (
+            "yuv422p 203x360 odd width",
+            make("b422.mkv", "203x360", odd, "yuv422p", &ffv1, &[]),
+            true,
+        ),
+        (
+            "yuv444p 480x360 pillarbox",
+            make("c444.mkv", "480x360", "", "yuv444p", &ffv1, &[]),
+            true,
+        ),
+        (
+            "yuv422p 480x360 pillarbox",
+            make("c422.mkv", "480x360", "", "yuv422p", &ffv1, &[]),
+            true,
+        ),
+        (
+            "yuv444p 640x356",
+            make("d444.mkv", "640x356", "", "yuv444p", &ffv1, &[]),
+            true,
+        ),
+        (
+            "yuv422p 639x360",
+            make(
+                "e422.mkv",
+                "640x360",
+                ",crop=w=639:h=360:x=0:y=0:exact=1",
+                "yuv422p",
+                &ffv1,
+                &[],
+            ),
+            true,
+        ),
+        (
+            "yuv444p x264 high444 mp4",
+            make("f444.mp4", "640x360", "", "yuv444p", &x264, &[]),
+            true,
+        ),
+        (
+            "yuv444p tagged bt709",
+            make(
+                "g444.mkv",
+                "640x360",
+                ",setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709",
+                "yuv444p",
+                &ffv1,
+                &[],
+            ),
+            true,
+        ),
+        (
+            "yuv422p tagged bt2020",
+            make(
+                "h422.mkv",
+                "640x360",
+                ",setparams=colorspace=bt2020nc:color_primaries=bt2020:color_trc=bt2020-10",
+                "yuv422p",
+                &ffv1,
+                &[],
+            ),
+            true,
+        ),
+        (
+            "yuv444p tagged tv",
+            make("i444.mkv", "640x360", "", "yuv444p", &ffv1, &["-color_range", "tv"]),
+            true,
+        ),
+        (
+            "yuv444p10le",
+            make("j444.mkv", "640x360", "", "yuv444p10le", &ffv1, &[]),
+            false,
+        ),
+        (
+            "yuv422p10le",
+            make("k422.mkv", "640x360", "", "yuv422p10le", &ffv1, &[]),
+            false,
+        ),
+        (
+            "yuvj444p (mjpeg)",
+            make(
+                "l444.mkv",
+                "640x360",
+                "",
+                "yuvj444p",
+                &["-c:v", "mjpeg", "-qscale:v", "1"],
+                &[],
+            ),
+            false,
+        ),
+        (
+            "yuvj422p (mjpeg)",
+            make(
+                "l422.mkv",
+                "640x360",
+                "",
+                "yuvj422p",
+                &["-c:v", "mjpeg", "-qscale:v", "1"],
+                &[],
+            ),
+            false,
+        ),
+        ("yuv440p", make("m440.mkv", "640x360", "", "yuv440p", &ffv1, &[]), false),
+        ("yuva444p", make("n444.mkv", "640x360", "", "yuva444p", &ffv1, &[]), false),
+        ("gbrp", make("o.mkv", "640x360", "", "gbrp", &ffv1, &[]), false),
+    ];
+    let mut fails = Vec::new();
+    for (name, asset, drawn_expected) in cases.drain(..) {
+        let Some(asset) = asset else {
+            eprintln!("checker/a/chroma {name}: skipped (this ffmpeg cannot write it)");
+            continue;
+        };
+        let tl = timeline(
+            vec![
+                vec![clip(&m.bars, 0.5, 1.5, 0.0)],
+                vec![zooming(&asset, 1.0, 1.6, (0.1, 0.0))],
+            ],
+            None,
+        );
+        let assets = [m.bars.clone(), asset.clone()];
+        let seen = checker_motion(&format!("checker/a/chroma {name}"), &tl, &assets, 30.0, 0..30, false);
+        if let Some(o) = seen.off.first() {
+            fails.push(format!(
+                "{name}: frame {} plane {}: {} samples differ (max {}, first at {:?})",
+                o.0, o.1, o.2, o.3, o.4
+            ));
+        }
+        if drawn_expected != (seen.drawn > 0) && compositor().caps().placed_chroma {
+            let why = seen.refused.first().map(|r| r.1.as_str()).unwrap_or("");
+            fails.push(format!(
+                "{name}: expected {}, drawn {} refused {}: {why}",
+                if drawn_expected { "drawn" } else { "refused" },
+                seen.drawn,
+                seen.refused.len()
+            ));
+        }
+    }
+    // Flagged full range (the plan may draw or refuse it, by the composite's range policy: a drawn frame must be the export's).
+    for (name, asset) in [
+        (
+            "yuv444p flagged pc",
+            make("p444.mkv", "640x360", "", "yuv444p", &ffv1, &["-color_range", "pc"]),
+        ),
+        (
+            "yuv422p flagged pc",
+            make("p422.mkv", "640x360", "", "yuv422p", &ffv1, &["-color_range", "pc"]),
+        ),
+    ] {
+        let Some(asset) = asset else { continue };
+        let tl = timeline(
+            vec![
+                vec![clip(&m.bars, 0.5, 1.5, 0.0)],
+                vec![zooming(&asset, 1.0, 1.6, (0.1, 0.0))],
+            ],
+            None,
+        );
+        let assets = [m.bars.clone(), asset.clone()];
+        let seen = checker_motion(&format!("checker/a/chroma {name}"), &tl, &assets, 30.0, 0..30, false);
+        if let Some(o) = seen.off.first() {
+            fails.push(format!(
+                "{name}: frame {} plane {}: {} samples differ (max {}, first at {:?})",
+                o.0, o.1, o.2, o.3, o.4
+            ));
+        }
+    }
+    checker_all("4:4:4 and 4:2:2 under a placement", fails);
+}
+
+/// An export in parts (the decode budget forced to a tenth of a megapixel, so the span is cut and each part opens the clips on
+/// screen for it): the frames of the export are the plan's. (A ranged export is not here: the planner takes its range applied
+/// by the caller, so the harness would be comparing different frames.)
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough); sets KERF_EXPORT_PARTS: run it alone"]
+fn checker_a_a_placed_clip_in_an_export_in_parts() {
+    let m = media();
+    let assets = [m.bars.clone(), m.testsrc.clone()];
+    let mut fails = Vec::new();
+    let parts_dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-a-parts");
+    let _ = std::fs::remove_dir_all(&parts_dir);
+    std::env::set_var("KERF_SEGMENT_DIR", &parts_dir);
+    // In parts: several placed clips back to back, so the cuts land between them and inside them.
+    // SAFETY of the env var: this test is run alone (see the ignore reason), nothing else reads it meanwhile.
+    std::env::set_var("KERF_EXPORT_PARTS", "0.1");
+    for fps in [30.0f64, 24.0] {
+        let mut clips = Vec::new();
+        for (i, (from, to)) in [(0.0, 0.7), (0.7, 1.4), (1.4, 2.1)].into_iter().enumerate() {
+            let mut c = clip(&m.testsrc, 0.3 * i as f64, 0.3 * i as f64 + 0.7, from);
+            c.keyframes = vec![zoom_key(0.0, 1.0, 0.0, 0.0), zoom_key(0.7, 1.5, 0.1 * i as f64, 0.0)];
+            let _ = to;
+            clips.push(c);
+        }
+        let tl = timeline(vec![vec![clip(&m.bars, 0.0, 3.0, 0.0)], clips], None);
+        let name = format!("parts @{fps}");
+        let seen = checker_motion(&format!("checker/a/{name}"), &tl, &assets, fps, 0..(2.0 * fps) as u64, false);
+        if let Some(o) = seen.off.first() {
+            fails.push(format!(
+                "{name}: frame {} plane {}: {} samples differ (max {}, first at {:?})",
+                o.0, o.1, o.2, o.3, o.4
+            ));
+        }
+        if !seen.refused.is_empty() {
+            fails.push(format!("{name}: refused {:?}", seen.refused.first()));
+        }
+    }
+    std::env::remove_var("KERF_EXPORT_PARTS");
+    std::env::remove_var("KERF_SEGMENT_DIR");
+    assert!(
+        parts_dir.exists(),
+        "the export was not cut into parts (no segment directory was made)"
+    );
+    checker_all("an export in parts", fails);
 }

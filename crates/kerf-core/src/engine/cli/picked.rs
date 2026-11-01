@@ -965,3 +965,485 @@ fn proxy_late_video_start_picks_what_the_preview_graph_renders() {
     assert_eq!(padded_seen, 2);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---- checker/a: the pinned `fps` pick, held to the export by sweeps the implementer did not write -----------------
+//
+// A clip whose zoom or position moves has `fps=fps=R:start_time=S` in its chain (`FpsPick::pinned`). These render clips that
+// number themselves through the real export graph, as the sweeps above do, but with the clip pinned and its start put
+// where the two roundings part: starts off the output grid and off the stream's ticks, the NTSC rationals, other containers
+// and time bases, a variable rate, the ends of a file and of a window, a late-starting picture, a clip that plays on under a
+// dissolve, speeds either way.
+
+fn checker_key(time: f64, scale: f64) -> crate::model::Keyframe {
+    crate::model::Keyframe {
+        time,
+        scale,
+        pos_x: 0.0,
+        pos_y: 0.0,
+        rotation: 0.0,
+        opacity: 1.0,
+        easing: Default::default(),
+    }
+}
+
+/// One pinned clip to check.
+struct Pin<'a> {
+    label: String,
+    src: &'a Source,
+    export: &'a str,
+    seek: f64,
+    secs: f64,
+    speed: f64,
+    start: f64,
+}
+
+/// Render and compare every clip, each with a zoom that moves by a millionth (so the picture keeps its samples and its barcode
+/// reads as it is); returns the clips that differ, and fails if the plan does not call a clip's pick pinned.
+fn pinned_sweep(dir: &Path, filler: &Asset, specs: &[Pin]) -> (usize, Vec<String>) {
+    let (mut drawn, mut bad) = (0, Vec::new());
+    for (n, s) in specs.iter().enumerate() {
+        let fps: f64 = s.export.parse().unwrap();
+        let (mut timeline, clip) = timeline_of_clip(&s.src.asset, filler, s.seek, s.secs, s.speed, s.start);
+        timeline.tracks[1].clips[0].keyframes = vec![checker_key(0.0, 1.0), checker_key(1.0, 1.000_001)];
+        let assets = [s.src.asset.clone(), filler.clone()];
+        let found = compare(
+            &timeline,
+            clip,
+            &assets,
+            &assets,
+            None,
+            Some(Path::new(&s.src.asset.path)),
+            &s.src.numbers,
+            fps,
+            dir,
+            &format!("pin{n}"),
+            H / 2,
+        );
+        let planner = Planner::new(
+            &timeline,
+            &assets,
+            &export_options(fps),
+            PlanRequest::motion(CompositeColorPolicy::FixedBt601),
+        )
+        .expect("plan");
+        let (from, to) = ((s.start * fps) as u64, ((s.start + s.secs) * fps).ceil() as u64 + 3);
+        let pinned = (from..to).any(|k| {
+            planner
+                .at_frame(k)
+                .expect("plan")
+                .layers
+                .iter()
+                .any(|l| l.clip_id == clip && matches!(&l.pick, crate::frame_pick::Pick::Fps(p) if p.pinned))
+        });
+        assert!(pinned, "{}: the plan does not pin this clip's pick", s.label);
+        drawn += found.drawn;
+        if !found.wrong.is_empty() {
+            bad.push(format!(
+                "{}: {} of {} frames differ, first (frame, rendered, planned) {:?}",
+                s.label,
+                found.wrong.len(),
+                found.drawn,
+                &found.wrong[..found.wrong.len().min(4)]
+            ));
+        }
+    }
+    (drawn, bad)
+}
+
+fn checker_report(what: &str, total: usize, drawn: usize, bad: &[String]) {
+    eprintln!(
+        "{what}: {total} pinned clips, {drawn} drawn frames compared, {} clips with a mismatch",
+        bad.len()
+    );
+    for b in bad.iter().take(30) {
+        eprintln!("  {b}");
+    }
+    assert!(drawn > total, "the clips must be drawn");
+    assert!(
+        bad.is_empty(),
+        "{what}: {} of {total} clips differ, first: {}",
+        bad.len(),
+        bad[0]
+    );
+}
+
+/// Other containers and time bases, a variable rate, NTSC rationals on both sides, speeds either way, starts that are not
+/// on the output grid or the stream's ticks.
+#[test]
+#[ignore = "needs the ffmpeg and ffprobe binaries"]
+fn checker_a_the_pinned_pick_over_containers_rates_starts_and_speeds() {
+    let dir = scratch("checker-pin-containers");
+    let filler = filler(&dir);
+    let mkv = Kind { vfr: false, ext: "mkv" };
+    let ts = Kind { vfr: false, ext: "ts" };
+    let vfr = Kind { vfr: true, ext: "mp4" };
+    let vfr_mkv = Kind { vfr: true, ext: "mkv" };
+    let sources = [
+        ("30 mp4", numbered(&dir, "30", 4, MP4)),
+        ("30 mkv", numbered(&dir, "30", 4, mkv)),
+        ("29.97 mkv", numbered(&dir, "29.97", 4, mkv)),
+        ("25 ts", numbered(&dir, "25", 4, ts)),
+        ("30 vfr", numbered(&dir, "30", 4, vfr)),
+        ("30 vfr mkv", numbered(&dir, "30", 4, vfr_mkv)),
+        ("59.94 mp4", numbered(&dir, "59.94", 4, MP4)),
+        ("23.976 mp4", numbered(&dir, "23.976", 4, MP4)),
+        ("24 mp4", numbered(&dir, "24", 4, MP4)),
+    ];
+    let starts = [
+        0.37,
+        1.013,
+        0.52,
+        1.0 / 3.0,
+        0.0333,
+        2.499_999,
+        0.999_999,
+        7.0 / 59.94,
+        1.1,
+        0.123_456_789,
+    ];
+    let seeks = [0.0, 0.5, 1.0, 0.35];
+    let mut specs = Vec::new();
+    for (name, src) in &sources {
+        for export in ["30", "24", "29.97", "25", "50", "59.94", "48", "23.976", "12", "60"] {
+            for speed in [1.0, 2.0, 0.5, 1.5, -1.0, -2.0, -0.5] {
+                let n = specs.len();
+                let (start, seek) = (starts[n % starts.len()], seeks[n % seeks.len()]);
+                specs.push(Pin {
+                    label: format!("{name} -> {export} fps, speed {speed}, start {start}, seek {seek}"),
+                    src,
+                    export,
+                    seek,
+                    secs: 0.9,
+                    speed,
+                    start,
+                });
+            }
+        }
+    }
+    let (drawn, bad) = pinned_sweep(&dir, &filler, &specs);
+    checker_report("containers, rates, starts, speeds", specs.len(), drawn, &bad);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The ends of a file and of a window, with the clip pinned: a clip that plays to the end of its footage, a window of one frame
+/// and of two, forward, reversed and slowed, a start near the end of the source.
+#[test]
+#[ignore = "needs the ffmpeg and ffprobe binaries"]
+fn checker_a_the_pinned_pick_at_the_end_of_the_file_and_in_tiny_windows() {
+    let dir = scratch("checker-pin-ends");
+    let filler = filler(&dir);
+    let mkv = Kind { vfr: false, ext: "mkv" };
+    let vfr_mkv = Kind { vfr: true, ext: "mkv" };
+    let sources = [
+        ("10", numbered(&dir, "10", 4, MP4)),
+        ("30", numbered(&dir, "30", 4, MP4)),
+        ("30 mkv", numbered(&dir, "30", 4, mkv)),
+        ("29.97 mkv", numbered(&dir, "29.97", 4, mkv)),
+        ("30 vfr mkv", numbered(&dir, "30", 4, vfr_mkv)),
+    ];
+    let starts = [0.37, 1.013, 0.52, 0.3, 2.0 / 3.0];
+    let mut specs = Vec::new();
+    for (name, src) in &sources {
+        for export in ["24", "59.94", "25", "30"] {
+            for speed in [1.0, 0.5, 2.0] {
+                for reverse in [false, true] {
+                    let signed = if reverse { -speed } else { speed };
+                    let duration = src.asset.duration;
+                    let n = specs.len();
+                    let start = starts[n % starts.len()];
+                    specs.push(Pin {
+                        label: label(name, export, speed, reverse, start, duration - 0.8, 0.8 / speed) + " (to the end)",
+                        src,
+                        export,
+                        seek: duration - 0.8,
+                        secs: 0.8 / speed,
+                        speed: signed,
+                        start,
+                    });
+                    for frames in [1.0, 2.0, 3.0] {
+                        let window = frames / src.asset.streams[0].fps.unwrap();
+                        for seek in [1.0, duration - window] {
+                            let n = specs.len();
+                            let start = starts[n % starts.len()];
+                            specs.push(Pin {
+                                label: label(name, export, speed, reverse, start, seek, window / speed) + " (tiny)",
+                                src,
+                                export,
+                                seek,
+                                secs: window / speed,
+                                speed: signed,
+                                start,
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+    let (drawn, bad) = pinned_sweep(&dir, &filler, &specs);
+    checker_report("ends and tiny windows", specs.len(), drawn, &bad);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A late-starting picture (the clip's pinned start is its start plus the picture's delay).
+#[test]
+#[ignore = "needs the ffmpeg and ffprobe binaries"]
+fn checker_a_the_pinned_pick_of_a_late_starting_picture() {
+    let dir = scratch("checker-pin-late");
+    let filler = filler(&dir);
+    let mut specs_owned = Vec::new();
+    for (i, lead) in [0.08, 0.37, 1.5].into_iter().enumerate() {
+        let Some(source) = late_numbered(&dir, &format!("late{i}.mp4"), lead) else {
+            eprintln!("skipped: this ffmpeg cannot make the late-starting test clip");
+            return;
+        };
+        specs_owned.push((lead, source));
+    }
+    let starts = [0.37, 1.013, 0.2, 0.3333];
+    let mut specs = Vec::new();
+    for (lead, src) in &specs_owned {
+        for export in ["30", "24", "25", "29.97", "50"] {
+            for (seek, speed) in [
+                (0.0, 1.0),
+                (0.0, -1.0),
+                (0.2, 1.0),
+                (1.0, 1.0),
+                (0.35, 0.5),
+                (0.0, 2.0),
+                (1.0, -2.0),
+            ] {
+                let n = specs.len();
+                let start = starts[n % starts.len()];
+                specs.push(Pin {
+                    label: format!("lead {lead} -> {export} fps, speed {speed}, start {start}, seek {seek}"),
+                    src,
+                    export,
+                    seek,
+                    secs: 0.9,
+                    speed,
+                    start,
+                });
+            }
+        }
+    }
+    let (drawn, bad) = pinned_sweep(&dir, &filler, &specs);
+    checker_report("late-starting pictures", specs.len(), drawn, &bad);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A pinned clip that plays on under a dissolve (its `tail`), forward and reversed, at odd starts.
+#[test]
+#[ignore = "needs the ffmpeg and ffprobe binaries"]
+fn checker_a_the_pinned_pick_follows_a_clip_playing_on_under_a_dissolve() {
+    let dir = scratch("checker-pin-tail");
+    let filler = filler(&dir);
+    let src = numbered(&dir, "30", 4, MP4);
+    let (mut drawn, mut tails, mut bad, mut total) = (0, 0, Vec::new(), 0);
+    for export in ["30", "29.97", "24", "25", "50"] {
+        let fps: f64 = export.parse().unwrap();
+        for speed in [1.0, 0.5, 2.0, -1.0, -0.5, -2.0] {
+            for start in [0.37, 6.5 / fps, 1.013] {
+                let (mut timeline, outgoing) = timeline_of_clip(&src.asset, &filler, 1.0, 1.0, speed, start);
+                timeline.tracks[1].clips[0].keyframes = vec![checker_key(0.0, 1.0), checker_key(1.0, 1.000_001)];
+                let mut incoming = make_clip(filler.id, 0.0, 2.0, start + 1.0);
+                incoming.transform.scale = 0.5;
+                incoming.transition_in = Some(crate::model::Transition {
+                    kind: crate::model::TransitionKind::Crossfade,
+                    duration: 0.6,
+                });
+                timeline.tracks[1].clips.push(incoming);
+                timeline.tracks[0].clips[0].source_out = start + 4.0;
+                let assets = [src.asset.clone(), filler.clone()];
+                let tag = format!("ptail-{export}-{speed}-{start}");
+                let found = compare(
+                    &timeline,
+                    outgoing,
+                    &assets,
+                    &assets,
+                    None,
+                    Some(Path::new(&src.asset.path)),
+                    &src.numbers,
+                    fps,
+                    &dir,
+                    &tag,
+                    2,
+                );
+                drawn += found.drawn;
+                total += 1;
+                let planner = Planner::new(
+                    &timeline,
+                    &assets,
+                    &export_options(fps),
+                    PlanRequest::motion(CompositeColorPolicy::FixedBt601),
+                )
+                .unwrap();
+                tails += usize::from(
+                    (0..(start * fps) as u64 + 3 * fps as u64)
+                        .any(|k| planner.at_frame(k).unwrap().layers.iter().any(|l| l.fx.tail)),
+                );
+                if !found.wrong.is_empty() {
+                    bad.push(format!(
+                        "{export} fps, speed {speed}, start {start}: {} of {} frames differ, first {:?}",
+                        found.wrong.len(),
+                        found.drawn,
+                        &found.wrong[..found.wrong.len().min(4)]
+                    ));
+                }
+            }
+        }
+    }
+    eprintln!(
+        "{drawn} frames compared, {tails} clips with a tail, {} of {total} with a mismatch",
+        bad.len()
+    );
+    for b in bad.iter().take(20) {
+        eprintln!("  {b}");
+    }
+    assert!(tails >= 30, "the clips must play on: {tails}");
+    assert!(bad.is_empty(), "{}", bad.join("\n"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A pinned clip read from a head-padded proxy (the preview graph's): the clone of the first frame is dropped from a clip read
+/// from the start, the picture's late start is the pinned `fps`'s start, and the pick is the one the export of the proxy draws.
+#[test]
+#[ignore = "needs the ffmpeg and ffprobe binaries"]
+fn checker_a_the_pinned_pick_over_a_head_padded_proxy() {
+    let dir = scratch("checker-pin-proxy");
+    let filler = filler(&dir);
+    let (mut checked, mut padded_seen) = (0, 0);
+    for (i, lead) in [0.08, 0.37, 1.5].into_iter().enumerate() {
+        let Some(source) = late_numbered(&dir, &format!("plate{i}.mp4"), lead) else {
+            eprintln!("skipped: this ffmpeg cannot make the late-starting test clip");
+            return;
+        };
+        let original = &source.asset;
+        let proxy = generate_proxy(Path::new(&original.path), PROXY_MAX_WIDTH).expect("proxy");
+        let _cleanup = ProxyGuard(proxy.clone());
+        let padded = crate::clip_timing::is_head_padded_proxy(&proxy.to_string_lossy());
+        padded_seen += usize::from(padded);
+        let mut numbers = source.numbers.clone();
+        if padded {
+            numbers.insert(0, 0);
+        }
+        let media = ProxyMedia.resolve(original);
+        let mut preview = media.decoded(original);
+        preview.streams[0].width = original.streams[0].width;
+        preview.streams[0].height = original.streams[0].height;
+        let render = [preview, filler.clone()];
+        let plan = [original.clone(), filler.clone()];
+        for export in ["30", "24", "25"] {
+            let fps: f64 = export.parse().unwrap();
+            for (seek, speed, start) in [
+                (0.0, 1.0, 0.37),
+                (0.0, -1.0, 6.0 / fps),
+                (1.0, 1.0, 1.013),
+                (0.35, 1.0, 0.52),
+                (0.0, 0.5, 0.2),
+                (1.0, -2.0, 0.37),
+                (0.0, 2.0, 0.3333),
+            ] {
+                let (mut timeline, clip) = timeline_of_clip(original, &filler, seek, 1.0, speed, start);
+                timeline.tracks[1].clips[0].keyframes = vec![checker_key(0.0, 1.0), checker_key(1.0, 1.000_001)];
+                let tag = format!("pproxy{i}-{export}-{seek}-{speed}");
+                let found = compare(
+                    &timeline,
+                    clip,
+                    &render,
+                    &plan,
+                    Some(&ProxyMedia),
+                    Some(&proxy),
+                    &numbers,
+                    fps,
+                    &dir,
+                    &tag,
+                    H / 2,
+                );
+                checked += 1;
+                assert!(
+                    found.wrong.is_empty(),
+                    "lead {lead}, {export} fps, seek {seek}, speed {speed}, start {start}: (frame, rendered, planned) {:?}",
+                    &found.wrong[..found.wrong.len().min(6)]
+                );
+            }
+        }
+    }
+    eprintln!("{checked} pinned clips over a proxy compared, {padded_seen} padded proxies");
+    assert!(padded_seen >= 2);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The same footage remuxed with a coarse time base (`-video_track_timescale`): a tick of 1/10, 1/25, 1/30 or 1/100 s is a good
+/// part of an output slot, so the truncations `setpts` and the pinned offsets make are no longer far below a tie. Starts at
+/// half a tick and a hair either side of it.
+#[test]
+#[ignore = "needs the ffmpeg and ffprobe binaries"]
+fn checker_a_the_pinned_pick_over_coarse_time_bases() {
+    let dir = scratch("checker-pin-coarse");
+    let filler = filler(&dir);
+    let mut sources: Vec<(String, Source, f64)> = Vec::new();
+    for (name, fps) in [("30", "30"), ("25", "25"), ("24", "24"), ("29.97", "29.97")] {
+        let base = numbered(&dir, fps, 4, MP4);
+        for scale in [10u32, 25, 30, 60, 100, 600, 1000] {
+            let out = dir.join(format!("coarse-{name}-{scale}.mp4"));
+            run(&[
+                "-i",
+                &base.asset.path,
+                "-c",
+                "copy",
+                "-video_track_timescale",
+                &scale.to_string(),
+                &out.to_string_lossy(),
+            ]);
+            let probed = source_frames(&out);
+            if probed.pts.len() != base.numbers.len() || probed.time_base != (Rational { num: 1, den: scale }) {
+                eprintln!(
+                    "skipped {name} @ 1/{scale}: the remux changed the frames or kept the time base ({:?})",
+                    probed.time_base
+                );
+                continue;
+            }
+            let mut asset = base.asset.clone();
+            asset.path = out.to_string_lossy().into_owned();
+            sources.push((
+                format!("{name} fps in 1/{scale}"),
+                Source {
+                    asset,
+                    numbers: base.numbers.clone(),
+                },
+                f64::from(scale),
+            ));
+        }
+    }
+    assert!(sources.len() >= 20, "the remuxes: {}", sources.len());
+    let mut specs = Vec::new();
+    for (name, src, scale) in &sources {
+        for export in ["30", "24", "25", "12", "48", "59.94", "23.976", "60"] {
+            for speed in [1.0, 2.0, 0.5, -1.0] {
+                let n = specs.len();
+                let start = [
+                    14.5 / scale,
+                    14.49 / scale,
+                    14.51 / scale,
+                    0.37,
+                    1.013,
+                    0.52,
+                    20.5 / scale + 1.0,
+                ][n % 7];
+                let seek = [0.0, 0.5, 0.35, 1.0][n % 4];
+                specs.push(Pin {
+                    label: format!("{name} -> {export} fps, speed {speed}, start {start}, seek {seek}"),
+                    src,
+                    export,
+                    seek,
+                    secs: 0.9,
+                    speed,
+                    start,
+                });
+            }
+        }
+    }
+    let (drawn, bad) = pinned_sweep(&dir, &filler, &specs);
+    checker_report("coarse time bases", specs.len(), drawn, &bad);
+    let _ = std::fs::remove_dir_all(&dir);
+}

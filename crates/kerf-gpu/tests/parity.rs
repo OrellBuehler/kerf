@@ -7511,3 +7511,113 @@ fn checker_a_stills_placed_formats_drawn_anyway() {
         }
     }
 }
+
+/// 4:4:4 and 4:2:2 under a placement in a still, once the probe lets them through: other sizes, tags and range flags than the
+/// probe's picture. A frame the plan draws must be the still's to the sample; the rest are listed.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_a_stills_of_4_4_4_and_4_2_2_under_a_placement_are_the_stills_or_refused() {
+    let m = media();
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-a-chroma-stills");
+    std::fs::create_dir_all(&dir).unwrap();
+    eprintln!(
+        "composite colour policy: {:?}; placed_chroma: {}",
+        policy(),
+        compositor().caps().placed_chroma
+    );
+    let make = |name: &str, w: u32, vf: &str, pix: &str, flags: &[&str]| -> Asset {
+        let p = dir.join(name);
+        let graph = format!(
+            "testsrc2=size={}x360:rate=30:duration=2{vf},setparams=colorspace=unknown:color_primaries=unknown:color_trc=unknown",
+            w.next_multiple_of(2)
+        );
+        let mut args = vec!["-f", "lavfi", "-i", graph.as_str(), "-c:v", "ffv1", "-pix_fmt", pix];
+        args.extend_from_slice(flags);
+        args.push(p.to_str().unwrap());
+        ffmpeg(&args);
+        probed(&p)
+    };
+    let odd = ",crop=w=203:h=360:x=0:y=0:exact=1";
+    let cases: Vec<(&str, Asset)> = vec![
+        ("yuv444p", make("a.mkv", 640, "", "yuv444p", &[])),
+        ("yuv422p", make("b.mkv", 640, "", "yuv422p", &[])),
+        ("yuv444p odd width", make("c.mkv", 203, odd, "yuv444p", &[])),
+        ("yuv422p odd width", make("d.mkv", 203, odd, "yuv422p", &[])),
+        ("yuv444p 480x360", make("e.mkv", 480, "", "yuv444p", &[])),
+        (
+            "yuv444p flagged pc",
+            make("f.mkv", 640, "", "yuv444p", &["-color_range", "pc"]),
+        ),
+        (
+            "yuv422p flagged pc",
+            make("g.mkv", 640, "", "yuv422p", &["-color_range", "pc"]),
+        ),
+        (
+            "yuv444p flagged tv",
+            make("h.mkv", 640, "", "yuv444p", &["-color_range", "tv"]),
+        ),
+        ("yuvj444p", make("i.mkv", 640, "", "yuvj444p", &[])),
+        ("yuv444p10le", make("j.mkv", 640, "", "yuv444p10le", &[])),
+    ];
+    let mut fails = Vec::new();
+    for (name, asset) in cases {
+        let mut z = clip(&asset, 0.0, 2.0, 0.5);
+        z.keyframes = zoom_keys(1.0, 1.6, (0.1, 0.0));
+        let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![z]], None);
+        let truth = [m.bars.clone(), asset.clone()];
+        let real = RenderPlan::at(&tl, &truth, &ExportOptions::default(), 1.0, policy()).expect("plan");
+        let why = reasons(&real, real.size(u32::MAX));
+        for t in [0.8, 1.3, 1.9] {
+            match exact_if_drawn_as(&tl, &truth, &truth, t) {
+                Ok((0, _)) => eprintln!(
+                    "checker/a/chroma still {name:<22} t={t}: drawn, exact (plan refuses: {})",
+                    !why.is_empty()
+                ),
+                Ok((n, max)) => {
+                    eprintln!(
+                        "checker/a/chroma still {name:<22} t={t}: drawn, {n} samples differ (max {max}) (plan refuses: {})",
+                        !why.is_empty()
+                    );
+                    fails.push(format!("{name} @ {t}: {n} samples differ (max {max})"));
+                }
+                Err(e) => eprintln!(
+                    "checker/a/chroma still {name:<22} t={t}: refused: {}",
+                    e.chars().take(110).collect::<String>()
+                ),
+            }
+        }
+    }
+    // A picture the project stored before the range flag was recorded (`color_range` None) whose file is in fact full range:
+    // the plan is told nothing of the range. A 4:2:0 one is refused where the composite's range is negotiated; a 4:4:4 or 4:2:2
+    // one must not be drawn wrongly.
+    for (name, pix) in [("yuv444p", "yuv444p"), ("yuv422p", "yuv422p"), ("yuv420p", "yuv420p")] {
+        let asset = make(&format!("u{pix}.mkv"), 640, "", pix, &["-color_range", "pc"]);
+        let mut told = asset.clone();
+        for st in &mut told.streams {
+            st.color_range = None;
+        }
+        let mut z = clip(&asset, 0.0, 2.0, 0.5);
+        z.keyframes = zoom_keys(1.0, 1.6, (0.1, 0.0));
+        let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![z]], None);
+        let truth = [m.bars.clone(), asset.clone()];
+        let told = [m.bars.clone(), told];
+        for t in [0.8, 1.3] {
+            match exact_if_drawn_as(&tl, &truth, &told, t) {
+                Ok((0, _)) => eprintln!("checker/a/chroma still {name} full range, not recorded, t={t}: drawn, exact"),
+                Ok((n, max)) => {
+                    eprintln!(
+                        "checker/a/chroma still {name} full range, not recorded, t={t}: drawn, {n} samples differ (max {max})"
+                    );
+                    fails.push(format!(
+                        "{name} full range, not recorded @ {t}: {n} samples differ (max {max})"
+                    ));
+                }
+                Err(e) => eprintln!(
+                    "checker/a/chroma still {name} full range, not recorded, t={t}: refused: {}",
+                    e.chars().take(110).collect::<String>()
+                ),
+            }
+        }
+    }
+    assert!(fails.is_empty(), "drawn and not the still's: {}", fails.join("; "));
+}

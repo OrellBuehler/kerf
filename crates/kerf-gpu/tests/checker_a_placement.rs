@@ -687,7 +687,7 @@ fn checker_a_random_poses_are_the_filters() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(500);
-    let mut rng = Lcg(0x5EED_0A);
+    let mut rng = Lcg(0x005E_ED0A);
     let mut bad = Vec::new();
     let (mut cases, mut axes) = (0usize, 0usize);
     for i in 0..n {
