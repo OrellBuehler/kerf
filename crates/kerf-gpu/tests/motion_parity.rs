@@ -8590,3 +8590,868 @@ fn checker_e_a_turned_blended_clip_with_a_keyed_opacity() {
     ce_expect_drawn("checker_e_a_turned_blended_clip_with_a_keyed_opacity", &mut failures);
     assert!(failures.is_empty(), "{} cases: {failures:#?}", failures.len());
 }
+
+// ---- checker/e/r3: a keyed opacity (a `geq` ahead of the `rotate`) on a turned layer -----------------------------------
+
+/// A keyed opacity that falls from 1 across the clip (every alpha level a frame can have).
+fn r3_keyed(c: &mut Clip, to: f64) {
+    use kerf_core::{Property, PropertyKey};
+    c.set_property_keys(Property::Opacity, vec![PropertyKey::new(0.0, 1.0), PropertyKey::new(0.5, to)]);
+}
+
+/// `ce_check` for a layer whose picture the compositor's scaler or a crop touches: a plain layer it resizes is the scaler's ladder, not this
+/// change's, so when the keyed cut differs the same cut with a constant opacity (the control) says whether the difference was already there.
+/// A difference the control does not have is a failure; one it has is `known` (printed, not judged).
+#[allow(clippy::too_many_arguments)]
+fn r3_check(
+    case: &str,
+    tl: &Timeline,
+    control: Option<&Timeline>,
+    assets: &[Asset],
+    fps: f64,
+    secs: f64,
+    draws: Option<bool>,
+    failures: &mut Vec<String>,
+    known: &mut Vec<String>,
+) -> CeScan {
+    let scan = ce_scan(case, tl, assets, &at_fps(fps), upto(secs, fps), false);
+    eprintln!("{}", scan.line(case));
+    CE_DRAWN.with(|d| d.set(d.get() + scan.drawn));
+    let Some(why) = scan.verdict(draws) else { return scan };
+    if let (Some(control), true) = (control, !scan.exact()) {
+        let name = format!("{case} (control: constant opacity)");
+        let c = ce_scan(&name, control, assets, &at_fps(fps), upto(secs, fps), false);
+        eprintln!("{}", c.line(&name));
+        if !c.exact() {
+            known.push(format!(
+                "{case}: {why} -- the control differs too (Y {} UV {})",
+                c.y.differing, c.uv.differing
+            ));
+            return scan;
+        }
+    }
+    failures.push(format!("{case}: {why}"));
+    scan
+}
+
+fn r3_finish(what: &str, mut failures: Vec<String>, known: &[String]) {
+    for k in known {
+        eprintln!("KNOWN (not this change's) {k}");
+    }
+    ce_expect_drawn(what, &mut failures);
+    assert!(failures.is_empty(), "{} cases: {failures:#?}", failures.len());
+}
+
+/// Odd sizes and odd offsets: frames of several shapes (the turned box swaps sides and hangs over the edges), the layer turned by every quarter
+/// and by 450 degrees, at offsets that are not on the even grid, plain and under a blend mode, its opacity keyed. The plan must draw every one
+/// (a keyed opacity on a turned layer is not refused) and the frame must be the export's to the sample.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_r3_a_turned_keyed_opacity_at_odd_sizes_and_offsets() {
+    let mut failures = Vec::new();
+    let mut known = Vec::new();
+    let mut n = 0;
+    for (w, h) in [
+        (130, 66),
+        (66, 130),
+        (322, 182),
+        (98, 50),
+        (50, 98),
+        (34, 18),
+        (18, 34),
+        (10, 6),
+        (6, 10),
+    ] {
+        let (noise, smooth) = ce_sized(w, h);
+        for angle in [90.0, 180.0, 270.0, -90.0, 450.0] {
+            for (px, py) in [(0.0, 0.0), (0.1, 0.2), (0.0123, 0.0071), (-0.37, 0.41)] {
+                for mode in [None, Some(BLEND_MODES[n % 9])] {
+                    n += 1;
+                    let mut c = clip(&noise, 0.2, 1.0, 0.0);
+                    if let Some(mode) = mode {
+                        c.blend_mode = mode;
+                    }
+                    c.transform.rotation = angle;
+                    c.transform.pos_x = px;
+                    c.transform.pos_y = py;
+                    r3_keyed(&mut c, 0.1 + (n % 7) as f64 * 0.1);
+                    let case = format!("checker/e/r3/odd {w}x{h} turned {angle} at {px},{py} {mode:?}");
+                    // (A frame two chroma samples across or less has nothing to read one in from: the guard may refuse it.)
+                    let draws = (w.min(h) > 10).then_some(true);
+                    r3_check(
+                        &case,
+                        &timeline(vec![vec![clip(&smooth, 0.2, 1.0, 0.0)], vec![c]], None),
+                        None,
+                        &[smooth.clone(), noise.clone()],
+                        30.0,
+                        0.3,
+                        draws,
+                        &mut failures,
+                        &mut known,
+                    );
+                }
+            }
+        }
+    }
+    r3_finish(
+        "checker_e_r3_a_turned_keyed_opacity_at_odd_sizes_and_offsets",
+        failures,
+        &known,
+    );
+}
+
+/// A keyed opacity on a turned layer with a mask (refused: a mask on a rotated layer), with a crop (odd picture sizes), with a static zoom (a
+/// picture smaller and larger than the frame), with a keyed zoom (refused behind a rotation), and the unturned layers with a keyed zoom or a mask
+/// (the planes shifted ahead of a late zoom) as controls of the path the change touched.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_r3_a_turned_keyed_opacity_with_a_mask_a_crop_or_a_zoom() {
+    use kerf_core::{BlendMode, Property, PropertyKey};
+    let m = media();
+    let mut failures = Vec::new();
+    let mut known = Vec::new();
+    let assets = [m.bars.clone(), m.testsrc.clone()];
+    let modes = [None, Some(BlendMode::Multiply), Some(BlendMode::Exclusion)];
+    let stack = |edit: &dyn Fn(&mut Clip), mode: Option<BlendMode>, keyed: bool| {
+        let mut c = clip(&m.testsrc, 0.5, 1.5, 0.0);
+        if let Some(mode) = mode {
+            c.blend_mode = mode;
+        }
+        edit(&mut c);
+        if keyed {
+            r3_keyed(&mut c, 0.25);
+        }
+        timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None)
+    };
+    // A crop: pictures of odd sizes, turned.
+    for (l, r, t, b) in [
+        (0.1, 0.2, 0.15, 0.05),
+        (0.013, 0.0171, 0.033, 0.0291),
+        (0.25, 0.0, 0.0, 0.0),
+        (0.0, 0.31, 0.27, 0.0),
+    ] {
+        for angle in [90.0, 180.0, 270.0] {
+            for mode in modes {
+                for at in [(0.0, 0.0), (0.0301, -0.0173)] {
+                    let edit = |c: &mut Clip| {
+                        c.transform.crop_left = l;
+                        c.transform.crop_right = r;
+                        c.transform.crop_top = t;
+                        c.transform.crop_bottom = b;
+                        c.transform.rotation = angle;
+                        c.transform.pos_x = at.0;
+                        c.transform.pos_y = at.1;
+                    };
+                    r3_check(
+                        &format!("checker/e/r3/crop {l},{r},{t},{b} turned {angle} at {at:?} {mode:?}"),
+                        &stack(&edit, mode, true),
+                        Some(&stack(&edit, mode, false)),
+                        &assets,
+                        30.0,
+                        0.5,
+                        None,
+                        &mut failures,
+                        &mut known,
+                    );
+                }
+            }
+        }
+    }
+    // A static zoom: the picture smaller than the frame (odd sizes) and larger.
+    for scale in [0.37, 0.53, 0.61, 1.0, 1.4] {
+        for angle in [90.0, 180.0, 270.0, -90.0] {
+            for mode in modes {
+                let edit = |c: &mut Clip| {
+                    c.transform.scale = scale;
+                    c.transform.rotation = angle;
+                    c.transform.pos_x = 0.07;
+                    c.transform.pos_y = -0.05;
+                };
+                r3_check(
+                    &format!("checker/e/r3/static zoom {scale} turned {angle} {mode:?}"),
+                    &stack(&edit, mode, true),
+                    Some(&stack(&edit, mode, false)),
+                    &assets,
+                    30.0,
+                    0.5,
+                    None,
+                    &mut failures,
+                    &mut known,
+                );
+            }
+        }
+    }
+    // A keyed zoom behind a turn is refused (`ZoomBehind`), and drawn anyway is the refusal's necessity (printed): the unturned layer is drawn.
+    let keyed_zoom = |c: &mut Clip| {
+        c.set_property_keys(Property::Scale, vec![PropertyKey::new(0.0, 1.0), PropertyKey::new(1.0, 1.6)]);
+    };
+    for mode in modes {
+        for angle in [0.0, 90.0, 180.0, 270.0] {
+            let edit = |c: &mut Clip| {
+                keyed_zoom(c);
+                c.transform.rotation = angle;
+            };
+            let case = format!("checker/e/r3/keyed zoom turned {angle} {mode:?}");
+            let scan = r3_check(
+                &case,
+                &stack(&edit, mode, true),
+                Some(&stack(&edit, mode, false)),
+                &assets,
+                30.0,
+                0.5,
+                (angle != 0.0).then_some(false),
+                &mut failures,
+                &mut known,
+            );
+            if angle != 0.0 {
+                let any = ce_scan(
+                    &format!("{case} (drawn anyway)"),
+                    &stack(&edit, mode, true),
+                    &assets,
+                    &at_fps(30.0),
+                    0..15,
+                    true,
+                );
+                eprintln!("refusal necessity: {}", any.line(&format!("{case} (drawn anyway)")));
+                let _ = scan;
+            }
+        }
+    }
+    // A mask on a turned layer is refused; drawn anyway is the compositor's own guard (printed).
+    for angle in [0.0, 90.0, 180.0] {
+        for mode in modes {
+            let edit = |c: &mut Clip| {
+                c.mask = Some(mask_of(kerf_core::MaskShape::Ellipse, 0.3, false));
+                c.transform.rotation = angle;
+            };
+            let case = format!("checker/e/r3/mask turned {angle} {mode:?}");
+            r3_check(
+                &case,
+                &stack(&edit, mode, true),
+                None,
+                &assets,
+                30.0,
+                0.5,
+                (angle != 0.0).then_some(false),
+                &mut failures,
+                &mut known,
+            );
+            let any = ce_scan(
+                &format!("{case} (drawn anyway)"),
+                &stack(&edit, mode, true),
+                &assets,
+                &at_fps(30.0),
+                0..15,
+                true,
+            );
+            eprintln!("refusal necessity: {}", any.line(&format!("{case} (drawn anyway)")));
+        }
+    }
+    r3_finish(
+        "checker_e_r3_a_turned_keyed_opacity_with_a_mask_a_crop_or_a_zoom",
+        failures,
+        &known,
+    );
+}
+
+/// A keyed opacity on a turned layer inside a transition (the incoming clip, the outgoing, both), plain and blended, with a fade of its own.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_r3_a_turned_keyed_opacity_in_a_transition() {
+    use kerf_core::BlendMode;
+    let m = media();
+    let mut failures = Vec::new();
+    let mut known = Vec::new();
+    let assets = [m.bars.clone(), m.testsrc.clone()];
+    let mut n = 0;
+    for kind in [
+        TransitionKind::Crossfade,
+        TransitionKind::DipToBlack,
+        TransitionKind::SlideLeft,
+        TransitionKind::PushRight,
+    ] {
+        for (dur, which) in [(0.6, "in"), (0.3, "out"), (0.6, "both"), (0.5, "in+fade")] {
+            for angle in [90.0, 180.0, 270.0] {
+                for blended in [false, true] {
+                    n += 1;
+                    let mut out = clip(&m.bars, 0.5, 1.5, 0.0);
+                    let mut inc = clip(&m.testsrc, 0.5, 1.5, 0.7);
+                    if blended {
+                        inc.blend_mode = BLEND_MODES[n % 9];
+                        out.blend_mode = BlendMode::Screen;
+                    }
+                    if which != "out" {
+                        inc.transform.rotation = angle;
+                        r3_keyed(&mut inc, 0.2);
+                    }
+                    if which == "out" || which == "both" {
+                        out.transform.rotation = angle + 180.0;
+                        r3_keyed(&mut out, 0.3);
+                    }
+                    if which == "in+fade" {
+                        inc.fade_out = 0.4;
+                    }
+                    inc.transition_in = Some(Transition { kind, duration: dur });
+                    r3_check(
+                        &format!("checker/e/r3/transition {kind:?} {dur}s {which} turned {angle} blended {blended}"),
+                        &timeline(vec![vec![out, inc]], None),
+                        None,
+                        &assets,
+                        30.0,
+                        1.65,
+                        None,
+                        &mut failures,
+                        &mut known,
+                    );
+                }
+            }
+        }
+    }
+    r3_finish("checker_e_r3_a_turned_keyed_opacity_in_a_transition", failures, &known);
+}
+
+/// The turned layer's source is 4:4:4, 4:2:2, gray, full range, a JPEG, 10-bit, an RGB still: each is drawn exactly or refused, plain and under a
+/// blend mode.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_r3_a_turned_keyed_opacity_of_other_formats() {
+    use kerf_core::BlendMode;
+    let m = media();
+    let v = variants();
+    let r = range_media();
+    let mut failures = Vec::new();
+    let mut known = Vec::new();
+    for (name, asset) in [
+        ("4:4:4", &v.yuv444),
+        ("4:2:2", &v.yuv422),
+        ("gray", &v.gray),
+        ("yuvj420p mjpeg", &v.mjpeg),
+        ("yuvj420p still", &v.jpeg),
+        ("10-bit", &v.tenbit),
+        ("rgb png", &v.rgb_png),
+        ("flagged pc", &r.pc),
+        ("flagged tv", &r.tv),
+        ("unflagged", &r.unflagged),
+        ("bt709", &v.testsrc709),
+        ("smpte170m", &v.testsrc170m),
+    ] {
+        for angle in [90.0, 180.0, 270.0] {
+            for mode in [None, Some(BlendMode::Multiply), Some(BlendMode::Difference)] {
+                let mut c = clip(asset, 0.0, 1.0, 0.0);
+                if let Some(mode) = mode {
+                    c.blend_mode = mode;
+                }
+                c.transform.rotation = angle;
+                c.transform.pos_x = 0.0301;
+                r3_keyed(&mut c, 0.2);
+                r3_check(
+                    &format!("checker/e/r3/format {name} turned {angle} {mode:?} over bars"),
+                    &timeline(vec![vec![clip(&m.bars, 0.0, 1.0, 0.0)], vec![c]], None),
+                    None,
+                    &[m.bars.clone(), asset.clone()],
+                    30.0,
+                    0.5,
+                    None,
+                    &mut failures,
+                    &mut known,
+                );
+            }
+        }
+    }
+    r3_finish("checker_e_r3_a_turned_keyed_opacity_of_other_formats", failures, &known);
+}
+
+/// Partly or wholly off the canvas, and two turned layers stacked (each with its own keyed opacity), plain and blended.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_r3_turned_keyed_opacities_off_the_canvas_and_stacked() {
+    use kerf_core::BlendMode;
+    let m = media();
+    let mut failures = Vec::new();
+    let mut known = Vec::new();
+    let assets = [m.bars.clone(), m.testsrc.clone(), m.noise.clone()];
+    let mut n = 0;
+    for (px, py) in [
+        (-0.6, 0.5),
+        (0.8, -0.7),
+        (0.95, 0.95),
+        (-0.9, -0.9),
+        (-1.1, 0.0),
+        (0.0, 1.3),
+        (0.5, 0.0),
+        (0.0, -0.5),
+    ] {
+        for angle in [90.0, 180.0, 270.0] {
+            for mode in [None, Some(BLEND_MODES[n % 9])] {
+                n += 1;
+                let mut c = clip(&m.testsrc, 0.5, 1.5, 0.0);
+                if let Some(mode) = mode {
+                    c.blend_mode = mode;
+                }
+                c.transform.rotation = angle;
+                c.transform.pos_x = px;
+                c.transform.pos_y = py;
+                r3_keyed(&mut c, 0.3);
+                r3_check(
+                    &format!("checker/e/r3/off canvas turned {angle} at {px},{py} {mode:?}"),
+                    &timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None),
+                    None,
+                    &assets[..2],
+                    30.0,
+                    0.5,
+                    None,
+                    &mut failures,
+                    &mut known,
+                );
+            }
+        }
+    }
+    for (a1, a2) in [(90.0, 180.0), (180.0, 270.0), (270.0, 90.0), (90.0, 90.0), (180.0, 450.0)] {
+        for (mode1, mode2) in [
+            (None, None),
+            (Some(BlendMode::Multiply), None),
+            (None, Some(BlendMode::Screen)),
+            (Some(BlendMode::Darken), Some(BlendMode::Difference)),
+        ] {
+            let mut mid = clip(&m.testsrc, 0.5, 1.5, 0.0);
+            mid.transform.rotation = a1;
+            mid.transform.pos_x = 0.1;
+            mid.transform.pos_y = 0.05;
+            r3_keyed(&mut mid, 0.4);
+            let mut top = clip(&m.noise, 0.5, 1.5, 0.0);
+            top.transform.rotation = a2;
+            top.transform.pos_x = -0.2;
+            top.transform.pos_y = 0.15;
+            r3_keyed(&mut top, 0.15);
+            if let Some(mode) = mode1 {
+                mid.blend_mode = mode;
+            }
+            if let Some(mode) = mode2 {
+                top.blend_mode = mode;
+            }
+            r3_check(
+                &format!("checker/e/r3/stacked turned {a1} {mode1:?} under {a2} {mode2:?}"),
+                &timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![mid], vec![top]], None),
+                None,
+                &assets,
+                30.0,
+                0.5,
+                None,
+                &mut failures,
+                &mut known,
+            );
+        }
+    }
+    r3_finish(
+        "checker_e_r3_turned_keyed_opacities_off_the_canvas_and_stacked",
+        failures,
+        &known,
+    );
+}
+
+/// A keyed opacity on a rotation that is not a quarter turn: refused or drawn exactly. (Plain, drawn: the rotated layer's edge is a ladder's
+/// level; a blended one is refused.)
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_r3_a_keyed_opacity_on_a_rotation_that_is_not_a_quarter_is_refused_or_exact() {
+    use kerf_core::{BlendMode, Property, PropertyKey};
+    let m = media();
+    let assets = [m.bars.clone(), m.testsrc.clone()];
+    let mut failures = Vec::new();
+    let mut tally: Vec<String> = Vec::new();
+    for angle in [12.0, -30.0, 45.0, 89.5, 90.5, 100.0, 179.9, 200.0, 359.5] {
+        for mode in [None, Some(BlendMode::Multiply)] {
+            for keyed in [true, false] {
+                let mut c = clip(&m.testsrc, 0.5, 1.5, 0.0);
+                if let Some(mode) = mode {
+                    c.blend_mode = mode;
+                }
+                c.transform.rotation = angle;
+                if keyed {
+                    r3_keyed(&mut c, 0.25);
+                }
+                let case = format!("checker/e/r3/rotation {angle} keyed {keyed} {mode:?}");
+                let scan = ce_scan(
+                    &case,
+                    &timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None),
+                    &assets,
+                    &at_fps(30.0),
+                    0..15,
+                    false,
+                );
+                eprintln!("{}", scan.line(&case));
+                CE_DRAWN.with(|d| d.set(d.get() + scan.drawn));
+                tally.push(format!(
+                    "{case}: drawn {} of {}, Y {} UV {} differ",
+                    scan.drawn, scan.frames, scan.y.differing, scan.uv.differing
+                ));
+                if let Some(why) = scan.verdict(None) {
+                    failures.push(format!("{case}: {why}"));
+                }
+            }
+        }
+    }
+    // A keyed rotation with a keyed opacity.
+    let mut c = clip(&m.testsrc, 0.5, 1.5, 0.0);
+    c.set_property_keys(
+        Property::Rotation,
+        vec![PropertyKey::new(0.0, 0.0), PropertyKey::new(1.0, 90.0)],
+    );
+    r3_keyed(&mut c, 0.25);
+    let case = "checker/e/r3/keyed rotation with a keyed opacity";
+    let scan = ce_scan(
+        case,
+        &timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c.clone()]], None),
+        &assets,
+        &at_fps(30.0),
+        0..15,
+        false,
+    );
+    eprintln!("{}", scan.line(case));
+    if let Some(why) = scan.verdict(None) {
+        failures.push(format!("{case}: {why}"));
+    }
+    // The control (printed, not judged): the same keyed rotation with a constant opacity, to say whether a difference is the opacity's.
+    c.set_property_keys(Property::Opacity, Vec::new());
+    let case = "checker/e/r3/keyed rotation alone (control)";
+    let control = ce_scan(
+        case,
+        &timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None),
+        &assets,
+        &at_fps(30.0),
+        0..15,
+        false,
+    );
+    eprintln!("{}", control.line(case));
+    for t in &tally {
+        eprintln!("TALLY {t}");
+    }
+    assert!(failures.is_empty(), "{} cases: {failures:#?}", failures.len());
+}
+
+// ---- checker/e/r3: the coordinator's three read-through targets ------------------------------------------------------
+
+/// The resolved layer of the last track at frame 3, for a case's line: its picture, the layer box and the rotation.
+fn r3_geometry(tl: &Timeline, assets: &[Asset], fps: f64) -> String {
+    let opts = at_fps(fps);
+    let Ok(planner) = Planner::new(tl, assets, &opts, PlanRequest::motion(policy())) else {
+        return "no plan".into();
+    };
+    let Ok(plan) = planner.at_frame(3) else {
+        return "no frame".into();
+    };
+    let size = (plan.canvas.width, plan.canvas.height);
+    plan.layers
+        .last()
+        .map_or("no layer".into(), |l| match plan.layer_geometry(l, size) {
+            Ok(g) => format!(
+                "picture {:?} layer {:?} stages {} rotation {}",
+                g.picture,
+                g.layer,
+                g.stages.len(),
+                g.rotation.map_or("none".into(), |r| format!("{:.4}", r.angle))
+            ),
+            Err(e) => format!("geometry refused: {e}"),
+        })
+}
+
+/// Odd-sided layers that nothing resizes: a 4:4:4, 4:2:2 or gray source cropped to an odd width / height (their native chroma grids do not round
+/// a crop to even), turned by every quarter, opaque and faded, plain and blended. Drawn exactly or refused; the geometry of each is printed so
+/// that a case that is not odd says so.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_r3_odd_sided_unscaled_layers_turned_plain_and_blended() {
+    use kerf_core::BlendMode;
+    let m = media();
+    let v = variants();
+    let mut failures = Vec::new();
+    let mut known = Vec::new();
+    let mut tally: Vec<String> = Vec::new();
+    for (name, asset) in [
+        ("4:4:4", &v.yuv444),
+        ("4:2:2", &v.yuv422),
+        ("gray", &v.gray),
+        ("4:2:0", &m.testsrc),
+    ] {
+        for (l, r, t, b) in [
+            (0.0, 1.0 / 640.0, 0.0, 0.0),
+            (0.0, 0.0, 0.0, 1.0 / 360.0),
+            (0.0, 1.0 / 640.0, 0.0, 1.0 / 360.0),
+            (3.0 / 640.0, 0.0, 5.0 / 360.0, 0.0),
+            (2.0 / 640.0, 5.0 / 640.0, 4.0 / 360.0, 3.0 / 360.0),
+        ] {
+            for angle in [0.0, 90.0, 180.0, 270.0] {
+                for mode in [None, Some(BlendMode::Multiply), Some(BlendMode::Screen)] {
+                    for faded in [false, true] {
+                        let mut c = clip(asset, 0.2, 1.0, 0.0);
+                        if let Some(mode) = mode {
+                            c.blend_mode = mode;
+                        }
+                        c.transform.crop_left = l;
+                        c.transform.crop_right = r;
+                        c.transform.crop_top = t;
+                        c.transform.crop_bottom = b;
+                        c.transform.rotation = angle;
+                        if faded {
+                            c.fade_in = 0.15;
+                            c.fade_out = 0.15;
+                        }
+                        let tl = timeline(vec![vec![clip(&m.bars, 0.2, 1.0, 0.0)], vec![c]], None);
+                        let assets = [m.bars.clone(), asset.clone()];
+                        let case = format!(
+                            "checker/e/r3/odd crop {name} {:.0},{:.0},{:.0},{:.0} turned {angle} {mode:?} faded {faded}",
+                            l * 640.0,
+                            r * 640.0,
+                            t * 360.0,
+                            b * 360.0
+                        );
+                        let geom = r3_geometry(&tl, &assets, 30.0);
+                        let scan = r3_check(&case, &tl, None, &assets, 30.0, 0.4, None, &mut failures, &mut known);
+                        tally.push(format!("{case}: {geom}: drawn {} of {}", scan.drawn, scan.frames));
+                    }
+                }
+            }
+        }
+    }
+    for t in &tally {
+        eprintln!("TALLY {t}");
+    }
+    r3_finish(
+        "checker_e_r3_odd_sided_unscaled_layers_turned_plain_and_blended",
+        failures,
+        &known,
+    );
+}
+
+/// A clip tagged as its colour matrix, if this FFmpeg will write that tag (`None` when it will not): `tag` is `setparams`' name for it,
+/// `encoder` the encoder option's.
+fn r3_try_tagged(name: &str, (tag, encoder): (&str, &str), source: &str) -> Option<Asset> {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-e-r3-tagged");
+    std::fs::create_dir_all(&dir).unwrap();
+    let p = dir.join(format!("{name}-{tag}.mkv"));
+    let out = Command::new(kerf_core::ffmpeg_path())
+        .args(["-hide_banner", "-loglevel", "error", "-y", "-f", "lavfi", "-i"])
+        .arg(format!("{source},format=yuv420p,setparams=colorspace={tag}"))
+        .args(["-c:v", "ffv1", "-pix_fmt", "yuv420p", "-colorspace", encoder])
+        .arg(&p)
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        eprintln!(
+            "tag {tag}: ffmpeg will not write it: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        return None;
+    }
+    Project::probe_asset(&p).ok()
+}
+
+/// Matrix tags the plan has no tables for (`bt2020c`, `ycgco`, `gbr`, `ictcp`, `chroma-derived-nc`, ...) on the bottom layer, the blended one and
+/// both: `frame_matrix_tag` collapses them to no tag, which `blend_matrix` would draw as BT.601; FFmpeg 9 may follow the frame's tag instead.
+/// Drawn exactly or refused.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_r3_exotic_matrix_tags_under_a_blend() {
+    use kerf_core::BlendMode;
+    let m = media();
+    let mut failures = Vec::new();
+    let known: Vec<String> = Vec::new();
+    let mut tally: Vec<String> = Vec::new();
+    let tags = [
+        ("bt2020c", "bt2020c"),
+        ("ycgco", "ycgco"),
+        ("gbr", "rgb"),
+        ("ictcp", "ictcp"),
+        ("chroma-derived-nc", "chroma-derived-nc"),
+        ("chroma-derived-c", "chroma-derived-c"),
+        ("smpte2085", "smpte2085"),
+        ("unknown", "unknown"),
+        ("fcc", "fcc"),
+        ("smpte240m", "smpte240m"),
+    ];
+    for (tag, encoder) in tags {
+        let bars = r3_try_tagged("bars", (tag, encoder), "smptehdbars=size=640x360:rate=30:duration=4");
+        let top = r3_try_tagged("testsrc", (tag, encoder), "testsrc2=size=640x360:rate=30:duration=4");
+        let (Some(bars), Some(top)) = (bars, top) else { continue };
+        eprintln!(
+            "tag {tag}: probed color_space bars {:?} top {:?}",
+            bars.streams.iter().find_map(|s| s.color_space.clone()),
+            top.streams.iter().find_map(|s| s.color_space.clone())
+        );
+        for mode in [BlendMode::Multiply, BlendMode::Difference, BlendMode::Screen, BlendMode::Add] {
+            for (bname, bottom, tname, upper) in [
+                ("untagged", &m.bars, tag, &top),
+                (tag, &bars, "untagged", &m.testsrc),
+                (tag, &bars, tag, &top),
+            ] {
+                let mut c = clip(upper, 0.5, 1.5, 0.0);
+                c.blend_mode = mode;
+                let tl = timeline(vec![vec![clip(bottom, 0.5, 1.5, 0.0)], vec![c]], None);
+                let assets = [bottom.clone(), upper.clone()];
+                let case = format!("checker/e/r3/matrix {mode:?} {tname} over {bname}");
+                let cut = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let scan = ce_scan(&case, &tl, &assets, &at_fps(30.0), 0..12, false);
+                    eprintln!("{}", scan.line(&case));
+                    let anyway = ce_scan(&format!("{case} (drawn anyway)"), &tl, &assets, &at_fps(30.0), 0..12, true);
+                    eprintln!("anyway: {}", anyway.line(&format!("{case} (drawn anyway)")));
+                    (scan, anyway)
+                }));
+                match cut {
+                    Ok((scan, anyway)) => {
+                        CE_DRAWN.with(|d| d.set(d.get() + scan.drawn));
+                        tally.push(format!(
+                            "{case}: drawn {} of {}, exact {}; drawn anyway {} of {}, exact {}",
+                            scan.drawn,
+                            scan.frames,
+                            scan.exact(),
+                            anyway.drawn,
+                            anyway.frames,
+                            anyway.exact()
+                        ));
+                        if let Some(why) = scan.verdict(None) {
+                            failures.push(format!("{case}: {why}"));
+                        }
+                    }
+                    Err(_) => tally.push(format!(
+                        "{case}: FFmpeg cannot export this cut at all (no frames to hold the GPU to)"
+                    )),
+                }
+            }
+        }
+    }
+    for t in &tally {
+        eprintln!("TALLY {t}");
+    }
+    r3_finish("checker_e_r3_exotic_matrix_tags_under_a_blend", failures, &known);
+}
+
+/// A rotation too large for its angle to mean anything (`is_quarter_turn` of a radian count whose float has no fraction left): the layer must be
+/// refused (or drawn as exactly as FFmpeg's `sin` / `cos` of that number turn it), blended and plain.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_r3_a_huge_rotation_is_refused_or_exact() {
+    use kerf_core::BlendMode;
+    let m = media();
+    let assets = [m.bars.clone(), m.testsrc.clone()];
+    let mut failures: Vec<String> = Vec::new();
+    let mut tally: Vec<String> = Vec::new();
+    for angle in [
+        1e300,
+        -1e300,
+        2f64.powi(60),
+        1e18,
+        8e17,
+        1e17,
+        1e16,
+        9e15,
+        1e12,
+        4e9,
+        90.0 * 2f64.powi(40),
+        90.0 * 2f64.powi(40) + 0.0625,
+        1e7,
+        f64::MAX,
+    ] {
+        for mode in [None, Some(BlendMode::Multiply), Some(BlendMode::Difference)] {
+            let mut c = clip(&m.testsrc, 0.5, 1.5, 0.0);
+            if let Some(mode) = mode {
+                c.blend_mode = mode;
+            }
+            c.transform.rotation = angle;
+            let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None);
+            let case = format!("checker/e/r3/huge rotation {angle:e} {mode:?}");
+            let geom = r3_geometry(&tl, &assets, 30.0);
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                ce_scan(&case, &tl, &assets, &at_fps(30.0), 0..12, false)
+            }));
+            match result {
+                Ok(scan) => {
+                    eprintln!("{}", scan.line(&case));
+                    tally.push(format!("{case}: {geom}: drawn {} of {}", scan.drawn, scan.frames));
+                    if let Some(why) = scan.verdict(None) {
+                        failures.push(format!("{case}: {geom}: {why}"));
+                    }
+                }
+                Err(_) => tally.push(format!(
+                    "{case}: {geom}: the export or the plan itself failed (a panic in the harness)"
+                )),
+            }
+        }
+    }
+    for t in &tally {
+        eprintln!("TALLY {t}");
+    }
+    assert!(failures.is_empty(), "{} cases: {failures:#?}", failures.len());
+}
+
+/// Many whole turns: `is_quarter_turn` calls every multiple of 90 degrees a quarter turn, but `rotate` evaluates its angle in a precision that
+/// stops landing on whole samples a few turns out (FFmpeg's `rotate` of 3690 degrees is not its rotate of 90). A blended layer turned by 3600
+/// degrees (10 turns) or less is drawn exactly; one turned by more is refused or exact.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_r3_a_blended_clip_turned_by_many_whole_turns() {
+    use kerf_core::BlendMode;
+    let m = media();
+    let assets = [m.bars.clone(), m.testsrc.clone()];
+    let mut failures: Vec<String> = Vec::new();
+    let mut tally: Vec<String> = Vec::new();
+    for quarters in [
+        -41, -400, 36, 40, 41, 42, 43, 45, 46, 80, 81, 400, 401, 4001, 40000, 400001, 4_000_000,
+    ] {
+        let angle = f64::from(quarters) * 90.0;
+        for mode in [None, Some(BlendMode::Multiply), Some(BlendMode::Difference)] {
+            let mut c = clip(&m.testsrc, 0.5, 1.5, 0.0);
+            if let Some(mode) = mode {
+                c.blend_mode = mode;
+            }
+            c.transform.rotation = angle;
+            let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None);
+            let case = format!("checker/e/r3/many turns {quarters} quarters {mode:?}");
+            let geom = r3_geometry(&tl, &assets, 30.0);
+            let scan = ce_scan(&case, &tl, &assets, &at_fps(30.0), 0..12, false);
+            eprintln!("{}", scan.line(&case));
+            tally.push(format!("{case}: {geom}: drawn {} of {}", scan.drawn, scan.frames));
+            if let Some(why) = scan.verdict(None) {
+                failures.push(format!("{case}: {geom}: {why}"));
+            }
+        }
+    }
+    for t in &tally {
+        eprintln!("TALLY {t}");
+    }
+    assert!(failures.is_empty(), "{} cases: {failures:#?}", failures.len());
+}
+
+/// The short one (what a scratch edit of the edge shift is checked against): a picture with detail at its edges, its opacity keyed, turned by each
+/// quarter, plain and blended, at the first frames where the alpha is a level of its own.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_r3_a_keyed_opacity_edge_on_each_quarter() {
+    use kerf_core::BlendMode;
+    let m = media();
+    let mut failures = Vec::new();
+    let mut known = Vec::new();
+    let assets = [m.bars.clone(), m.testsrc.clone()];
+    for angle in [90.0, 180.0, 270.0, -90.0] {
+        for mode in [None, Some(BlendMode::Multiply)] {
+            let mut c = clip(&m.testsrc, 0.5, 1.5, 0.0);
+            if let Some(mode) = mode {
+                c.blend_mode = mode;
+            }
+            c.transform.rotation = angle;
+            c.transform.pos_x = 0.0123;
+            r3_keyed(&mut c, 0.3);
+            r3_check(
+                &format!("checker/e/r3/edge quarter {angle} {mode:?}"),
+                &timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None),
+                None,
+                &assets,
+                30.0,
+                0.5,
+                Some(true),
+                &mut failures,
+                &mut known,
+            );
+        }
+    }
+    r3_finish("checker_e_r3_a_keyed_opacity_edge_on_each_quarter", failures, &known);
+}
