@@ -7047,3 +7047,117 @@ fn checker_e_a_still_of_a_blended_clip_among_others() {
         BUSY,
     );
 }
+
+// ==== checker/e, second pass: the lifted refusals in a still =========================================================
+
+/// The three refusals the blend lifted (a quarter turn, an RGB picture, a BT.2020 composite) in a still: held to the still wherever the caps say they
+/// are drawn (`blend_check` forces the caps where the probe refused the build). A turn that is not a quarter, and a quarter turned by a key (there are no
+/// keys in a still: the angle at the instant), are other cases.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_a_still_of_the_lifted_blends() {
+    use kerf_core::BlendMode;
+    let m = media();
+    let modes = [
+        BlendMode::Multiply,
+        BlendMode::Screen,
+        BlendMode::Overlay,
+        BlendMode::HardLight,
+        BlendMode::Add,
+        BlendMode::Darken,
+        BlendMode::Lighten,
+        BlendMode::Difference,
+        BlendMode::Exclusion,
+    ];
+    let over = |top: &Asset, base: &Asset, mode: BlendMode, edit: &dyn Fn(&mut Clip)| {
+        let mut c = clip(top, 0.0, 2.0, 0.0);
+        c.blend_mode = mode;
+        edit(&mut c);
+        (
+            timeline(vec![vec![clip(base, 0.0, 2.0, 0.0)], vec![c]], None),
+            [base.clone(), top.clone()],
+        )
+    };
+    let mut n = 0;
+    for turn in [90.0, 180.0, 270.0, -90.0, -180.0, 360.0, 450.0, 540.0, -270.0] {
+        for (name, top) in [("testsrc", &m.testsrc), ("noise", &m.noise)] {
+            let mode = modes[n % 9];
+            n += 1;
+            let (tl, assets) = over(top, &m.bars, mode, &|c| c.transform.rotation = turn);
+            blend_check(
+                &format!("checker/e/still {name} turned {turn} {mode:?}"),
+                &tl,
+                &assets,
+                &[0.5],
+                if name == "noise" { BUSY } else { STRICT },
+            );
+        }
+    }
+    for (what, edit) in [
+        (
+            "moved",
+            Box::new(|c: &mut Clip| {
+                c.transform.pos_x = 0.2;
+                c.transform.pos_y = 0.15;
+            }) as Box<dyn Fn(&mut Clip)>,
+        ),
+        ("fading in", Box::new(|c: &mut Clip| c.fade_in = 1.0)),
+    ] {
+        let mode = modes[n % 9];
+        n += 1;
+        let (tl, assets) = over(&m.testsrc, &m.bars, mode, &|c| {
+            c.transform.rotation = 90.0;
+            edit(c);
+        });
+        blend_check(
+            &format!("checker/e/still turned 90 {what} {mode:?}"),
+            &tl,
+            &assets,
+            &[0.5],
+            STRICT,
+        );
+    }
+    for (name, rgb) in [("png640", &m.png640), ("bgr0", &m.bgr0)] {
+        for mode in [
+            BlendMode::Multiply,
+            BlendMode::Difference,
+            BlendMode::Screen,
+            BlendMode::Overlay,
+        ] {
+            let (tl, assets) = over(rgb, &m.bars, mode, &|_| {});
+            blend_check(
+                &format!("checker/e/still {name} over bars {mode:?}"),
+                &tl,
+                &assets,
+                &[0.5],
+                BUSY,
+            );
+            let (tl, assets) = over(&m.testsrc, rgb, mode, &|_| {});
+            blend_check(
+                &format!("checker/e/still testsrc over {name} {mode:?}"),
+                &tl,
+                &assets,
+                &[0.5],
+                BUSY,
+            );
+        }
+    }
+    for mode in modes {
+        let (tl, assets) = over(&m.testsrc2020, &m.bars2020, mode, &|_| {});
+        blend_check(
+            &format!("checker/e/still bt2020 testsrc over bars {mode:?}"),
+            &tl,
+            &assets,
+            &[0.5],
+            STRICT,
+        );
+        let (tl, assets) = over(&m.testsrc2020, &m.gradient2020, mode, &|_| {});
+        blend_check(
+            &format!("checker/e/still bt2020 testsrc over a bt2020 gradient {mode:?}"),
+            &tl,
+            &assets,
+            &[0.5],
+            BUSY,
+        );
+    }
+}
