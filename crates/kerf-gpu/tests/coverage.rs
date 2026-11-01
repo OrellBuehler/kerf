@@ -2065,6 +2065,8 @@ fn reason(u: &Unsupported) -> Reason {
         | Unsupported::Grade(_, s)
         | Unsupported::GradeWith(_, s)
         | Unsupported::MaskWith(_, s)
+        | Unsupported::BlurFillWith(_, s)
+        | Unsupported::MixedMatricesWith(_, s)
         | Unsupported::Matte(_, s)
         | Unsupported::ZoomBehind(_, s)
         | Unsupported::FoldedFit(_, s)
