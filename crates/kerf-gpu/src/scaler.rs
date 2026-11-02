@@ -332,20 +332,30 @@ struct State {
     measured: Option<Kernels>,
     failures: u32,
     retry_at: Option<Instant>,
+    /// A self-test could not tell whether the scaler is the model, so it did not draw a resized frame: nothing is believed
+    /// until a self-test has (a probe that succeeds later must not open resized layers the check never looked at).
+    held_back: bool,
 }
 
-static STATE: Mutex<State> = Mutex::new(State {
-    measured: None,
-    failures: 0,
-    retry_at: None,
-});
+impl State {
+    const fn new() -> Self {
+        Self {
+            measured: None,
+            failures: 0,
+            retry_at: None,
+            held_back: false,
+        }
+    }
+}
+
+static STATE: Mutex<State> = Mutex::new(State::new());
 
 fn lock(state: &Mutex<State>) -> std::sync::MutexGuard<'_, State> {
     state.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Whether this FFmpeg's `scale` is the model ([`Kernels`]). The first call runs the probe: seven short `ffmpeg`
-/// children at once (bounded by 20 s) with no lock held, a blocking thread's, ahead of the frame that needs it
+/// Whether this FFmpeg's `scale` is the model ([`Kernels`]). The first call runs the probe: ten short `ffmpeg`
+/// children at once (the unflagged `scale` and nine chains) (bounded by 20 s) with no lock held, a blocking thread's, ahead of the frame that needs it
 /// ([`crate::prepare`]). [`Kernels::Unknown`] is not remembered: the probe is run again after a backoff.
 pub fn kernels() -> Kernels {
     cached(&STATE, Instant::now(), measure)
@@ -354,7 +364,31 @@ pub fn kernels() -> Kernels {
 /// What is known without running anything: the measured answer, else [`Kernels::Unknown`]. What a plan's caps are
 /// made from ([`crate::Compositor::caps`]): a plan does not wait for a probe.
 pub fn measured() -> Kernels {
-    lock(&STATE).measured.unwrap_or(Kernels::Unknown)
+    known(&STATE)
+}
+
+/// [`kernels`] for the runtime self-test, which draws resized frames only when this is [`Kernels::exact`]. An `Unknown` here
+/// holds the scaler back for the process until a self-test that can tell has run, so that the frames the GPU draws are never
+/// the ones its check left out; a `Differs` is permanent and needs no holding.
+pub(crate) fn kernels_for_selftest() -> Kernels {
+    checked(&STATE, Instant::now(), measure)
+}
+
+fn known(state: &Mutex<State>) -> Kernels {
+    let s = lock(state);
+    if s.held_back {
+        return Kernels::Unknown;
+    }
+    s.measured.unwrap_or(Kernels::Unknown)
+}
+
+fn checked(state: &Mutex<State>, now: Instant, measure: impl FnOnce() -> Option<Kernels>) -> Kernels {
+    lock(state).held_back = false;
+    let k = cached(state, now, measure);
+    if k == Kernels::Unknown {
+        lock(state).held_back = true;
+    }
+    k
 }
 
 fn backoff(failures: u32) -> Duration {
@@ -364,6 +398,9 @@ fn backoff(failures: u32) -> Duration {
 fn cached(state: &Mutex<State>, now: Instant, measure: impl FnOnce() -> Option<Kernels>) -> Kernels {
     {
         let s = lock(state);
+        if s.held_back {
+            return Kernels::Unknown;
+        }
         if let Some(k) = s.measured {
             return k;
         }
@@ -409,11 +446,7 @@ mod tests {
     use super::*;
 
     fn state() -> Mutex<State> {
-        Mutex::new(State {
-            measured: None,
-            failures: 0,
-            retry_at: None,
-        })
+        Mutex::new(State::new())
     }
 
     /// A picture of integer noise, deterministic.
@@ -574,5 +607,25 @@ mod tests {
         assert!(!Kernels::Differs.exact() && !Kernels::Unknown.exact());
         assert_eq!(Kernels::Differs.model(), Model::ASSUMED);
         assert_eq!(Kernels::Unknown.model(), Model::ASSUMED);
+    }
+    #[test]
+    fn a_self_test_that_cannot_tell_holds_the_scaler_back_until_one_can() {
+        let t0 = Instant::now();
+        let st = state();
+        assert_eq!(checked(&st, t0, || None), Kernels::Unknown);
+        assert!(lock(&st).held_back);
+        // A probe that would succeed now is not believed (and not run): the check left the resized frames out.
+        let later = t0 + Duration::from_secs(60);
+        assert_eq!(cached(&st, later, || panic!("probed while held back")), Kernels::Unknown);
+        assert_eq!(known(&st), Kernels::Unknown);
+        // The next self-test that can tell lifts the hold, and the answer stands.
+        let m = Kernels::Match(Model::ASSUMED);
+        assert_eq!(checked(&st, later, || Some(m)), m);
+        assert!(!lock(&st).held_back);
+        assert_eq!(known(&st), m);
+        // A difference is permanent and holds nothing back.
+        let st = state();
+        assert_eq!(checked(&st, t0, || Some(Kernels::Differs)), Kernels::Differs);
+        assert!(!lock(&st).held_back);
     }
 }

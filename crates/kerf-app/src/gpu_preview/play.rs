@@ -893,6 +893,9 @@ impl GpuPreview {
             Ok(sized) => sized,
             Err(reason) => return stream(reason, session),
         };
+        // What the frame's plan needs measured (the grade's conversions, the scaler, `drawtext`: child processes, once per process)
+        // is measured here on the first frame that needs it, not by the render: it only reads what has been measured.
+        kerf_gpu::prepare(&plan);
         let caps = drawing.compositor.caps();
         let ahead = session.ahead(t, size, &caps);
         // The frame asked for is at or past the first one the GPU does not draw (the page's hand-over was

@@ -20,6 +20,9 @@
 
 use crate::layer_geometry::{av_rescale, even, lrint, GeometryError, Rect};
 
+/// The largest side of the cover the thumbnail's scaler is made for: a side the size of a texture the GPUs accept.
+pub const MAX_COVER: i64 = 16_384;
+
 /// The thumbnail chain of one picture in one frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BlurFill {
@@ -49,7 +52,8 @@ impl BlurFill {
         let tmp_w = av_rescale(i64::from(bh), i64::from(iw), i64::from(ih));
         let tmp_h = av_rescale(i64::from(bw), i64::from(ih), i64::from(iw));
         let cover = (tmp_w.max(i64::from(bw)), tmp_h.max(i64::from(bh)));
-        if cover.0 > i64::from(u32::MAX) || cover.1 > i64::from(u32::MAX) {
+        // (A picture of a degenerate aspect covers the thumbnail with millions of rows; the scalers' tables for it are as many.)
+        if cover.0 > MAX_COVER || cover.1 > MAX_COVER {
             return Err(GeometryError(format!("a thumbnail cover of {}x{}", cover.0, cover.1)));
         }
         let cover = (cover.0 as u32, cover.1 as u32);
@@ -104,6 +108,15 @@ mod tests {
                 h: 134
             }
         );
+    }
+
+    #[test]
+    fn a_picture_of_a_degenerate_aspect_has_no_thumbnail() {
+        // A 1x100000 picture covers a 240-wide thumbnail with 24 million rows: refused, not tabled.
+        assert!(BlurFill::resolve((1, 100_000), (1920, 1080)).is_err());
+        assert!(BlurFill::resolve((100_000, 1), (1920, 1080)).is_err());
+        assert!(BlurFill::resolve((u32::MAX, 1), (u32::MAX, u32::MAX)).is_err());
+        assert!(BlurFill::resolve((1080, 1920), (1920, 1080)).is_ok());
     }
 
     #[test]

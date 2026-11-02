@@ -187,7 +187,7 @@ impl Compositor {
         }
         let unsupported = |what: &str| GpuError::Unsupported(format!("layer {}: a grade {what}", layer.name));
         // The conversions are the model's only where this FFmpeg's kernels are the x86 ones it follows.
-        match self.grade_kernels.unwrap_or_else(crate::grade::kernels) {
+        match self.grade_kernels.unwrap_or_else(crate::grade::measured) {
             crate::grade::Kernels::Match => {}
             crate::grade::Kernels::Differs(why) => {
                 return Err(unsupported(&format!(
@@ -491,6 +491,35 @@ impl Compositor {
             unreachable!("two chroma planes")
         };
         Ok([luma, u, v])
+    }
+
+    /// A dip to white's round trip: `yuv420p -> rgb24` by swscale's x86 kernel, `fade c=white` on the RGB, and `rgb24 -> yuv420p`
+    /// by the generic scaler (the same conversions the grade runs, held to FFmpeg on random pictures). `input` is the picture
+    /// as the chain made it (even sides; the plan sees to the rest).
+    pub(super) fn white_planes(
+        &self,
+        enc: &mut wgpu::CommandEncoder,
+        input: &[Plane; 3],
+        forward: YuvMatrix,
+        back: YuvMatrix,
+        white: [u32; 2],
+    ) -> Result<[Plane; 3], GpuError> {
+        let [py, pu, _] = input;
+        let (w, h) = (py.w, py.h);
+        if w % 2 != 0 || h % 2 != 0 || (pu.w, pu.h) != (w / 2, h / 2) {
+            return Err(GpuError::Unsupported(format!(
+                "a dip to white on a {w}x{h} picture (the conversions need even sides)"
+            )));
+        }
+        let rgb = self.rgb_of(enc, input, &Self::kernel_params(forward, 0));
+        let faded = self.plane("dip rgb", w, h, CANVAS_FORMAT, wgpu::TextureUsages::RENDER_ATTACHMENT);
+        let params = RoundTripParams {
+            white: white.map(|f| f as i32),
+            ..Self::back_params(&Rgb2Yuv::new(back), w, h)
+        };
+        let bind = self.rt_bind(&self.convert_layout, &params, &[&rgb.view]);
+        self.pass(enc, &self.rt_white, &faded.view, &bind, None, None);
+        self.untagged_back(enc, &faded, back)
     }
 
     /// A layer's picture taken from the matrix `from` to the composite's `to` the way FFmpeg 9's auto-inserted `scale`

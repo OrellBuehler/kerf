@@ -190,8 +190,10 @@ pub enum CompositeColorPolicy {
     FixedBt601,
     /// Colourspace is negotiated across the overlay chain (FFmpeg 9): the
     /// **bottom layer's tag** becomes the composite's matrix, and a layer tagged
-    /// otherwise is converted into it by the scaler — an arithmetic the compositor
-    /// does not reproduce, so such a stack is refused. The matrix of a stack whose
+    /// otherwise is converted into it by the scaler — an arithmetic a compositor
+    /// draws only with `GpuCaps::matrix_convert` (swscale's x86 kernel in, `ff_rgb24toyv12` out, measured
+    /// on this FFmpeg), and only for the layers `RenderPlan::convert_refusal` accepts; without it such a stack
+    /// is refused ([`Unsupported::MixedMatrices`]). The matrix of a stack whose
     /// layers all agree follows their tag.
     BottomLayerTag,
     /// The probe could not tell which of the two this FFmpeg is (it would not run,
@@ -205,10 +207,16 @@ pub enum CompositeColorPolicy {
 }
 
 /// The steepest shrink of one scale stage the compositor draws: swscale builds a filter table up to 63:1 (a table for a shrink
-/// of 64:1 or more would need a second scaler, which `table_aligned` does not make), and the scalar model and the shader are
-/// held to it sample for sample over every ratio up to there (`tests/scaler.rs`, `tests/parity.rs`). Past it the frame goes
-/// through FFmpeg.
+/// of 64:1 or more would need a second scaler, which `table_aligned` does not make). The scalar model and the shader are held
+/// to FFmpeg's own sample for sample over a sweep of shrinks up to there (`tests/scaler.rs`: 1280x720 down by 2:1 to 63:1, odd
+/// outputs, the unflagged and the `bicubic` scaler) and in the frames of `tests/parity.rs`; a ratio between the sweep's steps is
+/// the same arithmetic on another table, not another measurement. Past the limit the frame goes through FFmpeg.
 pub const MAX_SHRINK: u32 = 63;
+
+/// Whether `from` samples shrunk to `to` is steeper than [`MAX_SHRINK`]:1 (in 64 bits: a hostile size times 63 overflows 32).
+fn shrinks_past_limit(from: u32, to: u32) -> bool {
+    u64::from(from) > u64::from(MAX_SHRINK) * u64::from(to)
+}
 
 /// Which graph a plan describes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -987,6 +995,21 @@ impl RenderPlan {
             if let OddPad::Refused(why) = self.odd_pad(layer, &geom, size) {
                 reasons.push(Unsupported::Geometry(n, why));
             }
+            // A `yuv420p` picture flagged full range, letterboxed, in an export: `pad` draws its black in the range the picture
+            // is flagged (limited black, 16), and the graph converts the picture's range to the overlay's afterwards when this
+            // FFmpeg does not negotiate it (the policy probe says which: only `BottomLayerTag` is measured to leave the bars
+            // alone): the bars read Y 30 where the compositor's matte is 16 (14 levels, the picture itself exact). A still's `scale`
+            // converts the range ahead of the `pad`, and its bars are 16.
+            if self.mode == PlanMode::Motion
+                && geom.matte
+                && layer.stream.raw_full_range()
+                && self.canvas.policy != CompositeColorPolicy::BottomLayerTag
+            {
+                reasons.push(Unsupported::Geometry(
+                    n,
+                    "a letterboxed `yuv420p` picture flagged full range: this FFmpeg's export converts its range after the `pad` has drawn the bars in limited black (they read Y 30 where the compositor's are 16)".into(),
+                ));
+            }
             // A scaler that is not measured to be swscale's draws a resized layer a level off: not exact, so FFmpeg's.
             if caps.scaler_approximate && geom.stages.iter().any(|s| s.scaled != (s.src.w, s.src.h)) {
                 reasons.push(Unsupported::ScalerApproximate(self.layer_ref(n, layer)));
@@ -1168,7 +1191,7 @@ impl RenderPlan {
             if let Some(stage) = geom
                 .stages
                 .iter()
-                .find(|s| s.src.w > MAX_SHRINK * s.scaled.0 || s.src.h > MAX_SHRINK * s.scaled.1)
+                .find(|s| shrinks_past_limit(s.src.w, s.scaled.0) || shrinks_past_limit(s.src.h, s.scaled.1))
             {
                 reasons.push(Unsupported::Shrink(n, (stage.src.w, stage.src.h), stage.scaled));
             }
@@ -1827,14 +1850,22 @@ impl RenderPlan {
             return LayerGeometry::resolve_any_grid_with(src, size, fit, tf, place);
         };
         let geom = LayerGeometry::resolve_with(src, size, fit, tf, native, place)?;
-        if native != Subsampling::YUV420
-            && layer.stream.layout() != Some(PixLayout::Gray)
-            && geom != LayerGeometry::resolve_with(src, size, fit, tf, Subsampling::YUV420, place)?
-        {
-            return Err(crate::layer_geometry::GeometryError(format!(
-                "its crop window or Cover offset starts or ends between two 4:2:0 chroma samples of a picture whose chroma is finer ({}), which the compositor's 4:2:0 planes cannot place",
-                layer.stream.pix_fmt.as_deref().unwrap_or("?")
-            )));
+        if native != Subsampling::YUV420 && layer.stream.layout() != Some(PixLayout::Gray) {
+            let on_420 = LayerGeometry::resolve_with(src, size, fit, tf, Subsampling::YUV420, place)?;
+            // The grids agree on where the picture goes but for the odd last row: a native format that is not 4:2:0 is converted
+            // by `scale` into the buffer `pad` hands it, and `pad` fills in place (the row goes), where a 4:2:0 picture is forwarded
+            // untouched and copied. That is the native grid's geometry, the one drawn (the compositor's planes are the decode's
+            // 4:2:0 either way), and no crop window is between two chroma samples.
+            let same_place = LayerGeometry {
+                picture_shows: on_420.picture_shows,
+                ..geom.clone()
+            };
+            if same_place != on_420 {
+                return Err(crate::layer_geometry::GeometryError(format!(
+                    "its crop window or Cover offset starts or ends between two 4:2:0 chroma samples of a picture whose chroma is finer ({}), which the compositor's 4:2:0 planes cannot place",
+                    layer.stream.pix_fmt.as_deref().unwrap_or("?")
+                )));
+            }
         }
         Ok(geom)
     }
@@ -1864,7 +1895,9 @@ impl RenderPlan {
         let fill = match self.blur_fill(layer, size) {
             Ok(Some(fill)) => fill,
             Ok(None) => return None,
-            Err(_) => return Some(Some("a frame too small for the thumbnail's box blur")),
+            Err(_) => return Some(Some(
+                "a frame too small for the thumbnail's box blur, or a picture whose aspect makes the thumbnail's cover absurd",
+            )),
         };
         if !caps.blur_fill || !caps.exact_scaler {
             return Some(None);
@@ -1883,7 +1916,7 @@ impl RenderPlan {
         if layer.stream.maybe_full_range() {
             return Some(Some("a full-range picture (FFmpeg scales and blurs its raw values)"));
         }
-        if fill.source.0 > MAX_SHRINK * fill.cover.0 || fill.source.1 > MAX_SHRINK * fill.cover.1 {
+        if shrinks_past_limit(fill.source.0, fill.cover.0) || shrinks_past_limit(fill.source.1, fill.cover.1) {
             return Some(Some("a picture shrunk past 63:1 into the thumbnail"));
         }
         None
@@ -2067,6 +2100,13 @@ impl RenderPlan {
                 {
                     OddPad::Refused(format!(
                         "pad of a {pw}x{ph} picture with an odd height on the alpha plane (a dissolve, a mask or a chroma key), where `scale` converts the picture into the `yuva420p` that follows the `pad` inside the buffer `pad` hands it, and `pad` fills the bottom bar in place (the odd last row goes)"
+                    ))
+                } else if !layer.blend.is_normal() {
+                    // (A blend mode is refused whole today; its chain converts the picture to RGB and back around `blend`, with
+                    // `pad` in the group, and FFmpeg drops the odd row there — `checker_b_r4` `ROW` lines — so a later lift of the
+                    // blend must not draw the row kept.)
+                    OddPad::Refused(format!(
+                        "pad of a {pw}x{ph} picture with an odd height under a blend mode, whose chain converts the picture through RGB and `pad` fills the bottom bar in place (the odd last row goes)"
                     ))
                 } else {
                     OddPad::Unchanged
@@ -2841,6 +2881,16 @@ mod tests {
     }
 
     #[test]
+    fn the_shrink_limit_is_judged_in_64_bits() {
+        assert!(!shrinks_past_limit(63, 1));
+        assert!(shrinks_past_limit(64, 1));
+        assert!(!shrinks_past_limit(u32::MAX, u32::MAX));
+        assert!(!shrinks_past_limit(u32::MAX, 1 << 27));
+        assert!(shrinks_past_limit(u32::MAX, 1 << 26));
+        assert!(shrinks_past_limit(1, 0));
+    }
+
+    #[test]
     fn pad_of_an_odd_picture_is_settled_by_the_chain_that_converts_it() {
         let opts = ExportOptions {
             fps: Some(30.0),
@@ -2938,6 +2988,18 @@ mod tests {
             let why = reasons(PlanMode::Motion, fmt, 64, 30, (64, 36));
             assert!(why.is_empty(), "{fmt} even: {why:?}");
         }
+        // A native format that is not 4:2:0, at the frame's width: `scale` converts it into the buffer `pad` hands it whatever the
+        // chain, so the row goes (the native grid's geometry, which differs from the 4:2:0 grid's in that row alone), and the plan
+        // does not call that a crop between two chroma samples.
+        for fmt in ["yuv444p", "yuv422p", "rgb24", "gbrp"] {
+            for mode in [PlanMode::Still, PlanMode::Motion] {
+                for (h, frame) in [(31, (64, 36)), (35, (64, 36))] {
+                    let p = plan_of(mode, fmt, 64, h, frame, &|_| {});
+                    assert!(why_of(&p).is_empty(), "{mode:?} {fmt} 64x{h}: {:?}", why_of(&p));
+                    assert_eq!(shows(&p), (64, h - 1), "{mode:?} {fmt} 64x{h}");
+                }
+            }
+        }
         // A chain on the alpha plane (a crossfade's incoming clip, measured 11 of 24 frames inexact; a mask; a chroma key) has a
         // `format=yuva420p` after the `pad`, which `scale` converts the picture to inside the buffer `pad` hands it.
         let on_alpha_plane = |why: &[String]| why.iter().any(|r| r.contains("odd height on the alpha plane"));
@@ -2986,6 +3048,61 @@ mod tests {
         assert!(on_alpha_plane(&motion(None, vec![key])));
         assert!(!on_alpha_plane(&motion(None, vec![VideoEffect::Invert])));
         assert!(motion(None, vec![]).is_empty());
+        // A blend mode's chain (RGB round trip around `blend`) drops the row too: refused for the pad as well as the blend.
+        let blended = why_of(&plan_of(PlanMode::Motion, "yuv420p", 64, 31, (64, 36), &|c| {
+            c.blend_mode = crate::model::BlendMode::Multiply;
+        }));
+        assert!(blended.iter().any(|r| r.contains("under a blend mode")), "{blended:?}");
+    }
+
+    #[test]
+    fn a_letterboxed_full_range_flagged_picture_is_refused_in_an_export_that_does_not_negotiate() {
+        let reasons = |mode: PlanMode, policy: CompositeColorPolicy, range: Option<&str>, w: u32, h: u32| {
+            let mut stream = video(w, h);
+            stream.color_range = range.map(String::from);
+            let a = asset("a", 20.0, vec![stream]);
+            let mut tl = timeline(vec![vec![Clip::new(a.id, 0.0, 10.0, 0.0)]]);
+            tl.format = Some(Delivery::new(64, 36, Fit::Contain));
+            let opts = ExportOptions {
+                fps: Some(30.0),
+                ..ExportOptions::default()
+            };
+            let request = match mode {
+                PlanMode::Still => PlanRequest::still(policy),
+                PlanMode::Motion => PlanRequest::motion(policy),
+            };
+            let planner = Planner::new(&tl, std::slice::from_ref(&a), &opts, request).unwrap();
+            let p = match mode {
+                PlanMode::Still => planner.at(0.5).unwrap(),
+                PlanMode::Motion => planner.at_frame(15).unwrap(),
+            };
+            let caps = GpuCaps {
+                motion: true,
+                ..GpuCaps::A0
+            };
+            p.reasons(&caps, p.size(u32::MAX))
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+        };
+        let flagged = |why: &[String]| why.iter().any(|r| r.contains("flagged full range"));
+        use CompositeColorPolicy::{BottomLayerTag, FixedBt601, Unknown};
+        for policy in [FixedBt601, Unknown] {
+            // Even and odd, off the origin: the bars are the same.
+            for (w, h) in [(64, 30), (64, 31), (64, 13)] {
+                assert!(
+                    flagged(&reasons(PlanMode::Motion, policy, Some("pc"), w, h)),
+                    "{policy:?} {w}x{h}"
+                );
+            }
+            // A limited-range or unflagged picture, a picture that fills the frame, and a still are not.
+            assert!(!flagged(&reasons(PlanMode::Motion, policy, Some("tv"), 64, 30)));
+            assert!(!flagged(&reasons(PlanMode::Motion, policy, None, 64, 30)));
+            assert!(!flagged(&reasons(PlanMode::Motion, policy, Some("pc"), 64, 36)));
+            assert!(!flagged(&reasons(PlanMode::Still, policy, Some("pc"), 64, 30)));
+        }
+        // An FFmpeg that negotiates the range leaves the bars as they are drawn.
+        assert!(!flagged(&reasons(PlanMode::Motion, BottomLayerTag, Some("pc"), 64, 30)));
     }
 
     #[test]

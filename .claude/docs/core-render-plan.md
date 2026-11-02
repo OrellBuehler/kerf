@@ -426,8 +426,9 @@
   layer whose opacity is below 1: FFmpeg fades the RGBA picture `colorchannelmixer` leaves, alpha plane
   included, ahead of the conversion back to `yuva420p`; a dissolve's ramp touches the alpha alone and is
   drawn) and, with `caps.dip_white`, `DipToWhite(layer, why)`: a dip to white is `yuv420p -> rgb24 -> yuv420p` around
-  the fade (a filter of every frame of the clip in an export, of the frames the fade runs in a still), measured within 2
-  levels (3 on BT.709) of the compositor's tables on x86-64 (arm64 NEON untested), and only on **8-bit limited-range
+  the fade (a filter of every frame of the clip in an export, of the frames the fade runs in a still), drawn **exactly** with
+  the grade's conversions (swscale's x86 kernel in, the generic scaler out) where the probe says this FFmpeg converts as the grade's
+  model does (`caps.dip_white` is `grade::kernels() == Match`: x86-64; the arm64 kernel makes it FFmpeg's), and only on **8-bit limited-range
   untagged / BT.601 / BT.709 `yuv420p`**. Refused, each with its own `why`: an alpha plane (FFmpeg picks another RGB
   format), a black fade of the clip running ahead of it, any other pixel format (RGB 11 / 12 levels of Y / UV off,
   10-bit 9 / 16, 4:4:4 16 / 17, 4:2:2 9 / 13, full range up to 21 — in an export's planes on 9.0.2 — or an unrecorded format) or matrix, and, from `reasons(size)`
@@ -573,9 +574,13 @@
     as mild as 1.05-1.5x reads flat max 8-9 (4:2:2 at 0.9x is over the limit) with
     edges up to 32 levels. No band of ratios is measured strictly inside the limits on
     both FFmpegs for busy chroma, so none is claimed; a picture left at its size is
-    drawn for every format — **a `pad` of a picture with an odd height that `scale` forwarded untouched, placed at the frame's origin** (one row short of the
-    frame: `Geometry`; `vf_pad.c` pads in place when the decoder's frame is writable and has room, and the odd last row goes, and copies it
-    otherwise, so the outcome is the decoder's and the plan cannot say — measured on 9.0.2: FFV1 keeps the row, ffvhuff drops it; 6.1.1 kept it in every file tried, and the refusal is on every build; **off the origin it is the graph's** (`RenderPlan::odd_pad`): a Still plan's `scale` converts a plain `yuv420p` picture into the `yuva420p` its overlay takes, inside the buffer `pad` hands it, so `pad` fills in place and the odd row and the chroma row under it go at any gap (`layer_geometry` shows one row less; refused when the chain carries a colour correction, grade, effect, fade, mask, keyed number or another format, which decide differently), and a Motion plan's trailing `format=yuv420p` makes it a copy for `yuv420p` (drawn) and a conversion for another format or a chain on the alpha plane (a dissolve, a mask, a chroma key: refused)) — and **a crop of a picture whose chroma is finer than
+    drawn for every format — **a `pad` of a picture with an odd height that `scale` did not resample, placed at the frame's origin** (one row short of the
+    frame: `Geometry`; `vf_pad.c` pads in place when the frame it is handed is writable and has room, and the odd last row goes, and copies it
+    otherwise. An export hands it the decoder's frame, so the outcome is the decoder's and the frame's and the plan cannot say — asked of FFmpeg's own export, per
+    decoder (`checker_b_r4_origin_which_decoders_drop_the_odd_row`): 6.1.1 keeps the row for FFV1, rawvideo, VP9 and MPEG-4 and drops it for ffvhuff and MagicYUV; 9.0.2
+    drops it for FFV1, ffvhuff and MagicYUV, keeps it for rawvideo and changes from frame to frame for VP9 and MPEG-4. A still hands it the buffer of its own `scale`, which
+    drops the row for every decoder on both builds; it is refused at the origin all the same, as the same plan code states it. The refusal is on every build.
+    **Off the origin it is the graph's** (`RenderPlan::odd_pad`): a Still plan's `scale` converts a plain `yuv420p` picture into the `yuva420p` its overlay takes, inside the buffer `pad` hands it, so `pad` fills in place and the odd row and the chroma row under it go at any gap (`layer_geometry` shows one row less; refused when the chain carries a colour correction, grade, effect, fade, mask, keyed number or another format, which decide differently: FFmpeg's still keeps the row for a black fade and a grade and drops it for an `eq`, an effect, a chroma key and a keyed number, and none of these is drawn yet). A Motion plan's trailing `format=yuv420p` makes it a copy for `yuv420p` (drawn) and a conversion for another format, a chain on the alpha plane (a dissolve, a mask, a chroma key) or a blend mode (refused). A native format that is not 4:2:0 (4:2:2, 4:4:4, RGB) at the frame's width is converted by `scale` into that buffer in every chain, and its geometry (the native grid's) drops the row: drawn, exact on both builds, with no crop between two chroma samples. **A `yuv420p` picture flagged full range, letterboxed, in an export** whose FFmpeg does not negotiate the colour (policy other than `BottomLayerTag`) is refused: `pad` draws the bars in limited black and the graph converts the range afterwards (they read Y 30; the compositor's are 16) — and **a crop of a picture whose chroma is finer than
     4:2:0's**. Where a position rounds
     depends on where in the graph it is (`RenderPlan::layer_geometry`): the first
     `crop` runs on the picture as decoded and rounds to its **native** chroma grid

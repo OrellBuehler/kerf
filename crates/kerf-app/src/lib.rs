@@ -4791,7 +4791,13 @@ async fn get_render_bar(
         // The grade is in the GPU's caps once this FFmpeg's conversions are known to be the ones it draws, so a cut
         // with one asks (once per process, off the lock, like `kerf_gpu::prepare` does for a frame).
         let caps = enabled.then(|| {
-            let graded = timeline.tracks.iter().flat_map(|t| &t.clips).any(|c| !c.grade.is_identity());
+            // (A dip to white runs the grade's conversions around its fade, so it asks too.)
+            let graded = timeline.tracks.iter().flat_map(|t| &t.clips).any(|c| {
+                !c.grade.is_identity()
+                    || c.transition_in
+                        .as_ref()
+                        .is_some_and(|t| t.kind == kerf_core::TransitionKind::DipToWhite)
+            });
             if graded {
                 let _ = kerf_gpu::grade::kernels();
             }

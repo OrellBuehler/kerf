@@ -20,7 +20,7 @@
 //!    overlaid, clipping out-of-gamut colour and rebuilding the chroma.
 //! 4. **Compose**: rotate (bilinear, as `rotate`), run the clip's `fade` filters on the
 //!    8-bit picture (their own integer arithmetic, [`kerf_core::fade_luma`]; a dip to
-//!    white goes through the RGB round trip of step 3 instead), place at FFmpeg's integer
+//!    white goes through RGB instead: the grade's conversions around its `fade`, `white_planes`), place at FFmpeg's integer
 //!    position and blend onto the canvas — which holds **Y, U, V and alpha**, not
 //!    RGB, because `overlay` blends the encoded YUV planes. (Converting each layer
 //!    to RGB first would clamp it before the blend, and legal-but-out-of-gamut
@@ -312,6 +312,7 @@ pub struct Compositor {
     /// The RGB round trip of a translucent layer (`roundtrip.wgsl`).
     rt_rgb: wgpu::RenderPipeline,
     rt_luma: wgpu::RenderPipeline,
+    rt_white: wgpu::RenderPipeline,
     rt_chroma_h: wgpu::RenderPipeline,
     rt_chroma_v: wgpu::RenderPipeline,
     rt_v_layout: wgpu::BindGroupLayout,
@@ -328,13 +329,14 @@ pub struct Compositor {
     /// `chromakey`'s distance terms ([`effects::chroma_key_terms`]), uploaded by the first keyed frame.
     key_terms: OnceLock<wgpu::Buffer>,
     /// Whether this FFmpeg's conversions to and from RGB are the ones the grade follows, when pinned
-    /// ([`Compositor::with_grade_kernels`]); else measured ([`crate::grade::kernels`]).
+    /// ([`Compositor::with_grade_kernels`]); else what has been measured ([`crate::grade::measured`]: a render never runs the probe,
+    /// [`prepare`] does).
     grade_kernels: Option<crate::grade::Kernels>,
     /// Whether this FFmpeg's scaler is the model, when pinned ([`Compositor::with_scaler_kernels`]); else measured
-    /// ([`crate::scaler::kernels`]).
+    /// ([`crate::scaler::measured`]).
     scaler_kernels: Option<crate::scaler::Kernels>,
     /// Whether this FFmpeg converts a layer into the composite's matrix as the model does, when pinned
-    /// ([`Compositor::with_convert_kernels`]); else measured ([`crate::convert::kernels`]).
+    /// ([`Compositor::with_convert_kernels`]); else what has been measured ([`crate::convert::measured`]).
     convert_kernels: Option<crate::convert::Kernels>,
     /// The threads FFmpeg's filter graph slices a frame into, when pinned ([`Compositor::with_graph_threads`]);
     /// else they are the graph's the frame stands in for ([`Compositor::graph_threads_for`]).
@@ -791,7 +793,8 @@ fn effect_picture(layer: &kerf_core::PlanLayer, geom: &LayerGeometry) -> (bool, 
 
 /// Do ahead of a frame what a plan needs measured and what takes a while: FFmpeg's `geq`, for a
 /// plan with a mask or a keyed opacity (the export's `geq`), and its conversions to and from RGB, for a plan with a
-/// grade ([`crate::grade::kernels`]; fifteen short child processes at once, once per process: the grade is in the caps only once it is known to match)
+/// grade, a dip to white or a conversion between colour matrices ([`crate::grade::kernels`]; fifteen short child processes at once,
+/// once per process: the grade, the dip and the conversion are in the caps only once it is known to match)
 /// and `drawtext`'s layout for a plan with text ([`crate::text::model`]: one short child process, once per process: text whose glyph bitmaps share
 /// samples is in the caps only once the layout is one the compositor can take apart).
 /// Call it from a blocking thread **off the render lock**, with the plan in hand, so the first such
@@ -800,18 +803,20 @@ pub fn prepare(plan: &RenderPlan) {
     if plan.layers.iter().any(|l| l.mask.is_some() || l.keyed_alpha.is_some()) {
         let _ = kerf_core::geq_edge();
     }
-    if plan.layers.iter().any(|l| !l.grade.is_identity()) {
+    let converts = plan.canvas.policy == kerf_core::CompositeColorPolicy::BottomLayerTag
+        && plan
+            .layers
+            .iter()
+            .any(|l| l.stream.matrix().is_some_and(|m| m != plan.canvas.matrix));
+    // The grade's conversions are in the caps of a grade, of a dip to white (the same conversions around its `fade`) and of a
+    // conversion between matrices (its way in).
+    if converts || plan.layers.iter().any(|l| !l.grade.is_identity() || plan.white_round_trip(l)) {
         let _ = crate::grade::kernels();
     }
     if !plan.layers.is_empty() {
         let _ = crate::scaler::kernels();
     }
-    if plan.canvas.policy == kerf_core::CompositeColorPolicy::BottomLayerTag
-        && plan
-            .layers
-            .iter()
-            .any(|l| l.stream.matrix().is_some_and(|m| m != plan.canvas.matrix))
-    {
+    if converts {
         let _ = crate::convert::kernels();
     }
     if !plan.overlays.is_empty() {
@@ -825,8 +830,10 @@ impl Compositor {
     /// `eq`, opacity, stills, sampled keyframes) and
     ///
     /// * `text`: titles and captions, FFmpeg's own `drawtext` raster blended here ([`crate::text`]);
-    /// * `motion`, `fades`, `transitions`, `dip_white`: fades, dips, dissolves, slides and pushes, in
+    /// * `motion`, `fades`, `transitions`: fades, dips, dissolves, slides and pushes, in
     ///   still plans and in export frames (`tests/motion_parity.rs`);
+    /// * `dip_white`: a dip to white, **where this FFmpeg's conversions to and from RGB are the grade's** (it runs those around its
+    ///   `fade`, exactly; the same probe as `grade`);
     /// * `keyed_zoom`: a moving zoom drawn last, as FFmpeg's chain has it;
     /// * `keyed_opacity`: an export frame's `geq` alpha, the value the plan evaluates
     ///   ([`kerf_core::PlanLayer::keyed_alpha`]);
@@ -871,6 +878,9 @@ impl Compositor {
         }
         caps.exact_scaler = scaler.exact();
         caps.scaler_approximate = !scaler.exact();
+        // A dip to white runs the grade's conversions around its `fade` (swscale's x86 kernel in, the generic scaler out):
+        // it is drawn where the grade's are measured to match, and is FFmpeg's elsewhere.
+        caps.dip_white = kernels == crate::grade::Kernels::Match;
         // The conversion's way in is the grade's kernel too: the conversion is in the caps where both are measured.
         caps.matrix_convert = convert.converts() && kernels == crate::grade::Kernels::Match;
         if text.is_none() {
@@ -914,28 +924,26 @@ impl Compositor {
         self
     }
 
-    /// Pin whether this FFmpeg converts to and from RGB as the grade's model does, instead of measuring the ffmpeg
-    /// this process runs ([`crate::grade::kernels`], on the first graded plan unless [`prepare`] ran ahead
-    /// of it): for a host that knows its ffmpeg, and for tests. Anything but `Match` takes the grade out of [`Compositor::caps`].
+    /// Pin whether this FFmpeg converts to and from RGB as the grade's model does, instead of what [`prepare`] measured
+    /// ([`crate::grade::measured`]; a render never runs the probe): for a host that knows its ffmpeg, and for tests. Anything but
+    /// `Match` takes the grade, the dip to white and the conversion between matrices out of [`Compositor::caps`].
     #[must_use]
     pub fn with_grade_kernels(mut self, kernels: crate::grade::Kernels) -> Self {
         self.grade_kernels = Some(kernels);
         self
     }
 
-    /// Pin whether this FFmpeg's scaler is the model, and which vertical kernel it runs, instead of measuring the
-    /// ffmpeg this process runs ([`crate::scaler::kernels`], on the first resized layer unless [`prepare`] ran ahead of
-    /// it): for a host that knows its ffmpeg, and for tests. Anything but a match is drawn with the C kernel and
-    /// takes [`GpuCaps::exact_scaler`] out of [`Compositor::caps`].
+    /// Pin whether this FFmpeg's scaler is the model, and which vertical kernel it runs, instead of what [`prepare`]
+    /// measured ([`crate::scaler::measured`]; a render never runs the probe): for a host that knows its ffmpeg, and for tests.
+    /// Anything but a match is drawn with the C kernel and takes [`GpuCaps::exact_scaler`] out of [`Compositor::caps`].
     #[must_use]
     pub fn with_scaler_kernels(mut self, kernels: crate::scaler::Kernels) -> Self {
         self.scaler_kernels = Some(kernels);
         self
     }
 
-    /// Pin whether this FFmpeg converts a layer into the composite's matrix as the model does, instead of measuring
-    /// the ffmpeg this process runs ([`crate::convert::kernels`], on the first mixed-matrices plan unless [`prepare`] ran
-    /// ahead of it): for a host that knows its ffmpeg, and for tests. Anything but `Match` takes
+    /// Pin whether this FFmpeg converts a layer into the composite's matrix as the model does, instead of what [`prepare`]
+    /// measured ([`crate::convert::measured`]; a render never runs the probe): for a host that knows its ffmpeg, and for tests. Anything but `Match` takes
     /// [`GpuCaps::matrix_convert`] out of [`Compositor::caps`].
     #[must_use]
     pub fn with_convert_kernels(mut self, kernels: crate::convert::Kernels) -> Self {
@@ -945,9 +953,9 @@ impl Compositor {
 
     /// The tables of one plane of a scale stage: swscale's for `flag` (`None`: this build's default for an unflagged
     /// `scale`), padded the way this FFmpeg's scaler pads them, and the vertical pass in the arithmetic it runs
-    /// ([`crate::scaler::kernels`]). `None` for a ratio swscale needs two passes for.
+    /// ([`crate::scaler::measured`]). `None` for a ratio swscale needs two passes for.
     fn plane_filters(&self, flag: Option<Scaler>, ps: &PlaneStage, chroma: bool) -> Option<PlaneFilters> {
-        let model = self.scaler_kernels.unwrap_or_else(crate::scaler::kernels).model();
+        let model = self.scaler_kernels.unwrap_or_else(crate::scaler::measured).model();
         let scaler = model.scaler(flag);
         let (align_h, align_v) = model.kernel.alignment();
         let v = sws::table_aligned(scaler, ps.src.h, ps.scaled.1, sws::ONE_VERTICAL, align_v)?;
@@ -1143,6 +1151,7 @@ impl Compositor {
             };
             let rt_rgb = rt_pipeline("rt rgb", &compose_layout, "fs_rgb", CANVAS_FORMAT);
             let rt_luma = rt_pipeline("rt luma", &convert_layout, "fs_luma", PLANE_FORMAT);
+            let rt_white = rt_pipeline("rt white", &convert_layout, "fs_white", CANVAS_FORMAT);
             let rt_chroma_h = rt_pipeline("rt chroma h", &convert_layout, "fs_chroma_h", CHROMA_FORMAT);
             let rt_chroma_v = rt_pipeline("rt chroma v", &rt_v_layout, "fs_chroma_v", PLANE_FORMAT);
 
@@ -1224,6 +1233,7 @@ impl Compositor {
                 convert,
                 rt_rgb,
                 rt_luma,
+                rt_white,
                 rt_chroma_h,
                 rt_chroma_v,
                 rt_v_layout,
@@ -1785,7 +1795,7 @@ impl Compositor {
                 layer.name, plan.canvas.matrix
             ))
         };
-        match self.convert_kernels.unwrap_or_else(crate::convert::kernels) {
+        match self.convert_kernels.unwrap_or_else(crate::convert::measured) {
             crate::convert::Kernels::Match => {}
             crate::convert::Kernels::Differs(why) => {
                 return Err(unsupported(&format!(
@@ -1795,7 +1805,7 @@ impl Compositor {
             crate::convert::Kernels::Unknown => return Err(unsupported("until this FFmpeg's conversion can be measured")),
         }
         // The conversion's way in is the grade's kernel.
-        if self.grade_kernels.unwrap_or_else(crate::grade::kernels) != crate::grade::Kernels::Match {
+        if self.grade_kernels.unwrap_or_else(crate::grade::measured) != crate::grade::Kernels::Match {
             return Err(unsupported(
                 "until this FFmpeg's conversions to and from RGB are known to match",
             ));
@@ -2618,9 +2628,16 @@ impl Compositor {
                 Err(e) => return Err(GpuError::Unsupported(format!("layer {n}: {e}"))),
             };
             let fades = LayerFades::of(plan, layer, &geom)?;
+            // A dip to white runs the grade's conversions around its fade: drawn where they are measured to match.
+            if fades.white_round_trip && self.grade_kernels.unwrap_or_else(crate::grade::measured) != crate::grade::Kernels::Match
+            {
+                return Err(GpuError::Unsupported(format!(
+                    "layer {n}: a dip to white until this FFmpeg's conversions to and from RGB are known to match"
+                )));
+            }
             // A graded layer the scaler resizes is the export's where the scaler is exact and an `eq` sits between the
             // fit scale and the grade (the plan says the same: `RenderPlan::reasons`).
-            let resize_ok = self.scaler_kernels.unwrap_or_else(crate::scaler::kernels).exact() && plan.eq_in_chain(layer);
+            let resize_ok = self.scaler_kernels.unwrap_or_else(crate::scaler::measured).exact() && plan.eq_in_chain(layer);
             let look = self.look_of(layer, &geom, resize_ok)?;
             // `fade` takes `rgb24` and runs on the picture the grade leaves in RGB (a dip to white is in the
             // chain for every frame of the clip, and converts the picture through RGB itself).
@@ -2842,7 +2859,11 @@ impl Compositor {
                 // composite's (BT.601 under a fixed policy, the negotiated one else).
                 let forward = layer.stream.matrix().unwrap_or(YuvMatrix::Bt601);
                 let white = [fades.white_in, fades.white_out];
-                current = self.translucent_planes(&mut enc, &current, forward, plan.canvas.matrix, white)?;
+                current = if geom.translucent {
+                    self.translucent_planes(&mut enc, &current, forward, plan.canvas.matrix, white)?
+                } else {
+                    self.white_planes(&mut enc, &current, forward, plan.canvas.matrix, white)?
+                };
             }
             // What the blend pass still has to do about fades: all of them, unless the zoom is last.
             let mut fades = *fades;
@@ -3616,11 +3637,14 @@ mod tests {
         for kernels in [Kernels::Differs("a chain"), Kernels::Unknown] {
             let caps = Compositor::caps_with(kernels, simd, converts, layout);
             assert_eq!(caps.grade, GradeKinds::NONE, "{kernels:?}");
-            // (The conversion between matrices reads RGB through the grade's kernel: it goes with it.)
+            // (The conversion between matrices reads RGB through the grade's kernel: it goes with it, and so does a dip to white,
+            // which runs the grade's conversions around its fade.)
             assert!(!caps.matrix_convert, "{kernels:?}");
+            assert!(!caps.dip_white, "{kernels:?}");
             let mut restored = caps;
             restored.grade = GradeKinds::ALL;
             restored.matrix_convert = true;
+            restored.dip_white = true;
             assert_eq!(restored, Compositor::CAPS, "{kernels:?}: nothing else moves");
         }
     }

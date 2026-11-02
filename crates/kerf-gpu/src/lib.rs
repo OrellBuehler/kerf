@@ -33,11 +33,12 @@
 //!     chain, the bottom layer's tag becomes the composite's, and a layer tagged
 //!     otherwise is converted into it by a scaler stage). The compositor draws a
 //!     stack whose layers share one matrix class with that matrix — BT.709, BT.2020,
-//!     or BT.601 (`smpte170m`, `bt470bg` and untagged are one class) — and **refuses
-//!     a mixed stack**, a layer whose matrix is unknown, and an RGB picture in a
-//!     stack that is not BT.601, because the arithmetic of the conversion into the
-//!     bottom layer's matrix was not reproduced (float and fixed-point models of it
-//!     were off by up to 26 levels);
+//!     or BT.601 (`smpte170m`, `bt470bg` and untagged are one class), and a mixed
+//!     stack only where [`convert`] measured this FFmpeg's conversion (swscale's x86
+//!     kernel in, `ff_rgb24toyv12` out: float and fixed-point models of it were off
+//!     by up to 26 levels) and for the layers it covers; it **refuses** the rest of a
+//!     mixed stack, a layer whose matrix is unknown, and an RGB picture in a stack
+//!     that is not BT.601;
 //!   - **`Unknown`** — the probe could not tell (ffmpeg would not run, timed out, or
 //!     the clip lost its tag), which is **not** remembered: it is retried after a
 //!     backoff, and until it succeeds nothing is guessed. The two policies differ on

@@ -165,11 +165,90 @@ fn overlay_graph(bottom: &str, top: &str) -> String {
     )
 }
 
+/// The overlay chain of an export with **three clips on one track**, laid side by side on one canvas so that every clip's
+/// picture is seen: a plain BT.709 clip, then a clip whose chain ends in `yuva420p` (what a dissolve's chain ends in) with no
+/// tag, then a plain BT.709 clip again. The inputs are **files** (`[0:v]` and `[2:v]` the tagged one, `[1:v]` the untagged
+/// one): a tag set in the graph by `setparams` is another constraint in the negotiation and moves who decides (measured: the
+/// first clip does, then). The composite's matrix is the tag of the first clip on an alpha plane (the middle one: nothing in
+/// its chain forces a converter), and the plain clips are converted into it ([`kerf_core::PlanCanvas::cut_matrix`] is that
+/// rule: `Planner` reads it off the graph's shape, and this is the check that this FFmpeg negotiates it so).
+fn decider_graph() -> String {
+    let (w, h) = PROBE;
+    // The export's identity fit of a picture that fills the frame.
+    let fit = format!("scale={w}:{h}:force_original_aspect_ratio=decrease,pad={w}:{h}:(ow-iw)/2:(oh-ih)/2,setsar=1");
+    format!(
+        "color=c=black:s={}x{h}:r=1:d=1,format=yuv420p[vbase];[0:v]{fit},fps=1,format=yuv420p[v0];[vbase][v0]overlay=x=0:y=0[o0];\
+         [1:v]{fit},fps=1,format=yuva420p[v1];[o0][v1]overlay=x={w}:y=0[o1];[2:v]{fit},fps=1,format=yuv420p[v2];[o1][v2]overlay=x={}:y=0",
+        3 * w,
+        2 * w
+    )
+}
+
+/// A scratch directory under the temp dir, removed when dropped.
+struct Scratch(std::path::PathBuf);
+
+impl Scratch {
+    fn new() -> Option<Self> {
+        static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "kerf-gpu-convert-probe-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&dir).ok()?;
+        Some(Self(dir))
+    }
+}
+
+impl Drop for Scratch {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The probe picture as a lossless one-frame file (FFV1 in Matroska) carrying `matrix` as its tag: what the export's inputs are.
+fn make_file(path: &std::path::Path, matrix: &str) -> Option<()> {
+    let mut args = args_for(&[], &source(matrix));
+    // (`args` writes a rawvideo pipe; a file is the same graph into an encoder.)
+    args.truncate(args.iter().position(|a| a == "-map")?);
+    args.extend(["-map", "[o]", "-frames:v", "1", "-c:v", "ffv1", "-pix_fmt", "yuv420p", "-y"].map(String::from));
+    args.push(path.to_string_lossy().into_owned());
+    kerf_core::limit_frame_args(&mut args, 2);
+    let mut cmd = kerf_core::ffmpeg_command();
+    cmd.args(&args);
+    crate::source::run_child(cmd, 1 << 16, PROBE_TIMEOUT).ok().map(drop)
+}
+
+/// Tile `k` (of three side by side) of a `yuv420p` frame of `3 * PROBE.0` x `PROBE.1`, as the planes of a `PROBE` picture.
+fn tile(frame: &[u8], k: usize) -> Vec<u8> {
+    let (w, h) = PROBE;
+    let (y, rest) = frame.split_at(3 * w * h);
+    let (u, v) = rest.split_at(3 * w * h / 4);
+    let rows = |plane: &[u8], pw: usize, rows: usize| -> Vec<u8> {
+        (0..rows)
+            .flat_map(|r| plane[r * 3 * pw + k * pw..r * 3 * pw + (k + 1) * pw].iter().copied())
+            .collect()
+    };
+    let mut out = rows(y, w, h);
+    out.extend(rows(u, w / 2, h / 2));
+    out.extend(rows(v, w / 2, h / 2));
+    out
+}
+
 fn args(graph: &str) -> Vec<String> {
-    let mut a: Vec<String> = ["-hide_banner", "-loglevel", "error", "-nostdin", "-filter_complex"]
+    args_for(&[], graph)
+}
+
+/// [`args`] over input `files`.
+fn args_for(files: &[std::path::PathBuf], graph: &str) -> Vec<String> {
+    let mut a: Vec<String> = ["-hide_banner", "-loglevel", "error", "-nostdin"]
         .into_iter()
         .map(String::from)
         .collect();
+    for f in files {
+        a.extend(["-i".to_string(), f.to_string_lossy().into_owned()]);
+    }
+    a.push("-filter_complex".to_string());
     a.push(format!("{graph}[o]"));
     a.extend(
         [
@@ -199,34 +278,53 @@ fn measure() -> Option<Kernels> {
     let (w, h) = PROBE;
     let yuv = w * h * 3 / 2;
     // The source first: the picture the conversions are modelled on.
+    // (graph, the length of its frame)
     let graphs = [
-        source("none"),
-        overlay_graph("bt709", "none"),
-        overlay_graph("bt2020nc", "bt709"),
+        (source("none"), yuv),
+        (overlay_graph("bt709", "none"), yuv),
+        (overlay_graph("bt2020nc", "bt709"), yuv),
     ];
-    let share = graphs.len();
+    let share = graphs.len() + 2;
+    let scratch = Scratch::new()?;
+    let (tagged, untagged) = (scratch.0.join("tagged.mkv"), scratch.0.join("untagged.mkv"));
     // The graphs are `-filter_complex` ones: that is how the product writes them, and where the negotiation happens.
-    let frames: Vec<Option<Vec<u8>>> = std::thread::scope(|scope| {
+    let (frames, files): (Vec<Option<Vec<u8>>>, [Option<()>; 2]) = std::thread::scope(|scope| {
         let runs: Vec<_> = graphs
             .iter()
-            .map(|graph| {
+            .map(|(graph, len)| {
                 scope.spawn(move || {
                     let mut args = args(graph);
                     kerf_core::limit_frame_args(&mut args, share);
                     let mut cmd = kerf_core::ffmpeg_command();
                     cmd.args(&args);
-                    crate::source::run_child(cmd, yuv + 1, PROBE_TIMEOUT).ok()
+                    crate::source::run_child(cmd, len + 1, PROBE_TIMEOUT).ok()
                 })
             })
             .collect();
-        runs.into_iter().map(|run| run.join().ok().flatten()).collect()
+        let made = [(&tagged, "bt709"), (&untagged, "none")].map(|(path, matrix)| scope.spawn(move || make_file(path, matrix)));
+        (
+            runs.into_iter().map(|run| run.join().ok().flatten()).collect(),
+            made.map(|m| m.join().ok().flatten()),
+        )
     });
     let [Some(source), Some(opaque), Some(opaque_2020)] = &frames[..] else {
         return None;
     };
-    if source.len() != yuv {
+    if source.len() != yuv || files.iter().any(Option::is_none) {
         return None;
     }
+    // The three clips of one track, as files an export reads (a second round: they are made by the first).
+    let three = {
+        let mut args = args_for(&[tagged.clone(), untagged, tagged], &decider_graph());
+        kerf_core::limit_frame_args(&mut args, 1);
+        let mut cmd = kerf_core::ffmpeg_command();
+        cmd.args(&args);
+        crate::source::run_child(cmd, 3 * yuv + 1, PROBE_TIMEOUT).ok()?
+    };
+    if three.len() != 3 * yuv {
+        return None;
+    }
+    let three = &three;
     let src = planes_of(source);
     let want = |from, to, variant| change_matrix(src, w, h, from, to, variant).concat();
     // The overlay chain converts the top picture into the bottom's matrix.
@@ -238,6 +336,14 @@ fn measure() -> Option<Kernels> {
         } else {
             Kernels::Differs("an opaque picture's conversion into the bottom layer's matrix")
         });
+    }
+    // Whose matrix is the composite's, in the shape the planner's decider reads: the first clip on an alpha plane (the middle
+    // one, untagged = BT.601) keeps its picture, and the two plain BT.709 clips are converted into BT.601.
+    let into_601 = want(YuvMatrix::Bt709, YuvMatrix::Bt601, Variant::C);
+    if tile(three, 0) != into_601 || tile(three, 1) != *source || tile(three, 2) != into_601 {
+        return Some(Kernels::Differs(
+            "the composite's matrix is not the first clip on an alpha plane's, as the planner's decider reads the graph",
+        ));
     }
     Some(Kernels::Match)
 }
@@ -259,7 +365,7 @@ fn lock(state: &Mutex<State>) -> std::sync::MutexGuard<'_, State> {
 }
 
 /// Whether this FFmpeg converts a layer into the composite's matrix as [`change_matrix`] does. The first call runs
-/// the probe: three short `ffmpeg` children at once (bounded by 20 s) with no lock held, a blocking thread's, ahead of
+/// the probe: three short `ffmpeg` children and two that make the tagged files, at once, then the three-clip graph over them (each bounded by 20 s) with no lock held, a blocking thread's, ahead of
 /// the frame that needs it ([`crate::prepare`]). [`Kernels::Unknown`] is not remembered: the probe is run again after a
 /// backoff.
 pub fn kernels() -> Kernels {
@@ -383,5 +489,19 @@ mod tests {
             Kernels::Match
         );
         assert!(Kernels::Match.converts() && !Kernels::Unknown.converts() && !Kernels::Differs("x").converts());
+    }
+    #[test]
+    fn a_tile_of_three_is_the_probe_picture_in_its_columns() {
+        let (w, h) = PROBE;
+        // Every sample holds its tile's number: 3w x h luma, then the two 3w/2 x h/2 chroma planes.
+        let plane = |pw: usize, ph: usize| -> Vec<u8> { (0..pw * ph).map(|i| ((i % pw) / (pw / 3)) as u8).collect() };
+        let mut frame = plane(3 * w, h);
+        frame.extend(plane(3 * w / 2, h / 2));
+        frame.extend(plane(3 * w / 2, h / 2));
+        for k in 0..3 {
+            let t = tile(&frame, k);
+            assert_eq!(t.len(), w * h * 3 / 2);
+            assert!(t.iter().all(|&v| usize::from(v) == k), "tile {k}");
+        }
     }
 }

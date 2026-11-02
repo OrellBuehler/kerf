@@ -43,7 +43,8 @@ const REDUCE_CUTOFF: f64 = 0.002;
 /// The taps of every output sample along one axis.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Filter {
-    /// Taps per output sample (rows are padded with zeros to this).
+    /// Taps per output sample, the row length of the table. The C scaler's rows are padded with zeros to it; a SIMD build's
+    /// ([`table_aligned`]) are not: the padding holds copies of the original taps and the weights are normalised over them.
     pub size: usize,
     /// The first source sample of each output sample's window.
     pub pos: Vec<i32>,

@@ -470,29 +470,16 @@ const GRADED_SCALED: Limits = Limits {
     scaler_only: false,
 };
 
-/// A dip to white: two levels in every plane on the pictures it is drawn for — 8-bit limited-range
-/// untagged 4:2:0, test patterns and noise in all three planes (every Y, U, V combination, clipped RGB
-/// included) — identically on 6.1.1 and 9.0.2, on x86-64 (the arm64 kernel is not measured).
-/// `fade c=white` only takes RGB, so FFmpeg converts `yuv420p -> rgb24 -> yuv420p`
-/// around it, and the way out of YUV is **not** the C table converter the translucent round trip
-/// is exact against (`yuva420p -> argb`): `yuv420p -> rgb24` runs an x86 kernel whose 13-bit
-/// coefficients land up to two levels from the tables' (random planes against the tables of
-/// `roundtrip.rs`: 2189 of 6144 samples differ, none by more than 2). The compositor follows the
-/// tables, which are the portable arithmetic; the plane error is the kernel's. A dip to white is
-/// the one transition drawn within a bound rather than to the level.
-const WHITE: Limits = Limits {
-    y: 2,
-    uv: 2,
-    scaler_only: false,
-};
+/// A dip to white: exact on the pictures it is drawn for (8-bit limited-range 4:2:0, untagged or BT.709) — test patterns and
+/// noise in all three planes, identically on 6.1.1 and 9.0.2, where the probe says FFmpeg converts to and from RGB as the grade
+/// does ([`kerf_gpu::grade::Kernels::Match`]: x86-64 here, the arm64 kernel is not). `fade c=white` only takes RGB, so FFmpeg
+/// converts `yuv420p -> rgb24 -> yuv420p` around it: in by swscale's x86 kernel and out by the generic scaler, the conversions of
+/// the grade, which the compositor runs around the fade. (It used to follow the C tables the translucent round trip is exact
+/// against, which are 2 levels from the kernel's, and this was a bound of 2: a dip drawn within a bound is not drawn.)
+const WHITE: Limits = EXACT;
 
-/// A BT.709-tagged picture in a dip to white (both clips tagged): three levels of Y and two of UV,
-/// the same kernel read through BT.709's coefficients, identically on 6.1.1 and 9.0.2.
-const WHITE_709: Limits = Limits {
-    y: 3,
-    uv: 2,
-    scaler_only: false,
-};
+/// A BT.709-tagged picture in a dip to white (both clips tagged): the same conversions read through BT.709's coefficients, exact.
+const WHITE_709: Limits = EXACT;
 
 #[derive(Default, Clone, Copy)]
 struct PlaneStats {

@@ -80,6 +80,21 @@ fn fade_white(c: vec3<i32>, f: i32) -> vec3<i32> {
     return clamp(((c - vec3<i32>(255)) * f + vec3<i32>((255 << 16u) + 32768)) >> vec3<u32>(16u), vec3<i32>(0), vec3<i32>(255));
 }
 
+// A dip to white's `fade` over the `rgb24` picture the x86 kernel made (`grade.wgsl`'s `fs_rgb`): one filter for the fade-in and one
+// for the fade-out, as `fs_rgb` runs them for the translucent round trip.
+@fragment
+fn fs_white(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+    let o = vec2<i32>(frag.xy);
+    var rgb = vec3<i32>(round(textureLoad(t1, o, 0).rgb * 255.0));
+    if (p.white_in < 65535) {
+        rgb = fade_white(rgb, p.white_in);
+    }
+    if (p.white_out < 65535) {
+        rgb = fade_white(rgb, p.white_out);
+    }
+    return vec4<f32>(vec3<f32>(rgb) / 255.0, 1.0);
+}
+
 @fragment
 fn fs_luma(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let o = vec2<i32>(frag.xy);
