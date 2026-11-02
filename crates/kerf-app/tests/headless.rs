@@ -1,5 +1,6 @@
 //! `kerf-app --headless` as a process: it starts with no display, listens on the port it reports,
-//! answers MCP over HTTP behind the token, and stops cleanly on SIGTERM.
+//! answers MCP over HTTP behind the token, and stops cleanly on SIGTERM; with `--stdio` it answers
+//! on stdin / stdout, which carries nothing but JSON-RPC, and stops when stdin closes.
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -168,4 +169,259 @@ fn a_headless_run_serves_mcp_with_no_display_and_stops_on_sigterm() {
         assert_eq!(kept, 1, "the untitled project with a marker is kept for recovery");
         let _ = std::fs::remove_dir_all(&dir);
     }
+}
+
+fn headless(args: &[&str], dir: &std::path::Path) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_kerf-app"));
+    command
+        .arg("--headless")
+        .args(args)
+        .arg("--data-dir")
+        .arg(dir)
+        .env_remove("DISPLAY")
+        .env_remove("WAYLAND_DISPLAY")
+        .env_remove("KERF_MCP_ADDR")
+        .env_remove("KERF_MCP_TOKEN");
+    command
+}
+
+/// A `--stdio` run and its pipe: every stdout line it read, each checked to be JSON-RPC.
+struct StdioRun {
+    child: Running,
+    stdin: Option<std::process::ChildStdin>,
+    lines: std::sync::mpsc::Receiver<String>,
+    seen: Vec<String>,
+    log: std::path::PathBuf,
+}
+
+impl StdioRun {
+    fn start(args: &[&str], dir: &std::path::Path, log: &str) -> Self {
+        let log = dir.join(log);
+        let mut child = Running(
+            headless(&[&["--stdio"][..], args].concat(), dir)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(std::fs::File::create(&log).unwrap())
+                .spawn()
+                .expect("spawn kerf-app"),
+        );
+        let stdout = child.0.stdout.take().unwrap();
+        let (tx, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in BufReader::new(stdout).lines() {
+                let Ok(line) = line else { break };
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let stdin = child.0.stdin.take();
+        Self {
+            child,
+            stdin,
+            lines,
+            seen: Vec::new(),
+            log,
+        }
+    }
+
+    fn stderr(&self) -> String {
+        std::fs::read_to_string(&self.log).unwrap_or_default()
+    }
+
+    fn send(&mut self, message: &str) {
+        let stdin = self.stdin.as_mut().expect("stdin is open");
+        stdin.write_all(message.as_bytes()).unwrap();
+        stdin.write_all(b"\n").unwrap();
+        stdin.flush().unwrap();
+    }
+
+    /// The answer to request `id`, reading past anything else.
+    fn answer(&mut self, id: u32) -> serde_json::Value {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            let line = self
+                .lines
+                .recv_timeout(left)
+                .unwrap_or_else(|_| panic!("no answer to {id}; stderr:\n{}", self.stderr()));
+            let message = json_rpc(&line);
+            self.seen.push(line);
+            if message["id"] == id {
+                return message;
+            }
+        }
+    }
+
+    fn initialize(&mut self) -> serde_json::Value {
+        self.send(INITIALIZE);
+        let init = self.answer(1);
+        self.send(INITIALIZED);
+        init
+    }
+
+    /// `tools/call` of `tool` as request `id`: the result, which must not be an error.
+    fn call(&mut self, id: u32, tool: &str, arguments: serde_json::Value) -> serde_json::Value {
+        let request = serde_json::json!({
+            "jsonrpc": "2.0", "id": id, "method": "tools/call",
+            "params": { "name": tool, "arguments": arguments },
+        });
+        self.send(&request.to_string());
+        let answer = self.answer(id);
+        assert_ne!(answer["result"]["isError"], true, "{tool}: {answer}");
+        assert!(answer.get("error").is_none(), "{tool}: {answer}");
+        answer
+    }
+
+    /// Wait for the process to end (after `why`): its exit code, every line it wrote checked.
+    fn exit(mut self, why: &str) -> Option<i32> {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = self.child.0.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "still running after {why}; stderr:\n{}",
+                self.stderr()
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        for line in self.seen.iter().cloned().chain(self.lines.try_iter()) {
+            assert_eq!(json_rpc(&line)["jsonrpc"], "2.0", "{line}");
+        }
+        status.code()
+    }
+
+    fn close_stdin(mut self) -> Option<i32> {
+        self.stdin = None;
+        self.exit("stdin closed")
+    }
+}
+
+fn json_rpc(line: &str) -> serde_json::Value {
+    serde_json::from_str(line).unwrap_or_else(|e| panic!("not JSON-RPC on stdout: {line:?}: {e}"))
+}
+
+#[test]
+fn a_stdio_run_speaks_only_json_rpc_on_stdout_and_ends_with_stdin() {
+    let dir = std::env::temp_dir().join(format!("kerf-headless-stdio-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let mut run = StdioRun::start(&["--tools", "core"], &dir, "stderr.log");
+
+    let init = run.initialize();
+    assert_eq!(init["result"]["serverInfo"]["name"], "kerf", "{init}");
+    run.send(r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#);
+    let list = run.answer(2);
+    let names: Vec<&str> = list["result"]["tools"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{list}"))
+        .iter()
+        .filter_map(|t| t["name"].as_str())
+        .collect();
+    assert!(names.contains(&"trim") && names.contains(&"get_editing_guide"), "{names:?}");
+    assert!(
+        !names.contains(&"export"),
+        "--tools core leaves the delivery set out: {names:?}"
+    );
+    let info = run.call(3, "project_info", serde_json::json!({}));
+    assert!(info.to_string().contains(r#"\"in_memory\":true"#), "{info}");
+    run.call(4, "add_marker", serde_json::json!({ "time": 1.5, "name": "stdio-mark" }));
+
+    let stderr = run.stderr();
+    assert_eq!(run.close_stdin(), Some(0), "stderr:\n{stderr}");
+    assert!(stderr.contains("MCP server on stdin / stdout"), "{stderr}");
+    let settings = std::fs::read_to_string(dir.join("settings.json")).unwrap_or_default();
+    assert!(
+        !settings.contains("mcp_token\":\""),
+        "no token is made for a pipe: {settings}"
+    );
+    let kept = std::fs::read_dir(dir.join("recovery")).map_or(0, |d| d.count());
+    assert_eq!(kept, 1, "the untitled project with a marker is kept for recovery");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A proposal staged by one stdio run is in the project file with that run's session as its owner;
+/// the next run's agent takes it over instead of being told another agent owns it. The first run
+/// ends on SIGTERM, the second when stdin closes.
+#[test]
+fn the_next_stdio_run_takes_over_the_proposal_an_earlier_one_left() {
+    let dir = std::env::temp_dir().join(format!("kerf-headless-stdio-again-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let file = dir.join("cut.kerf");
+    let path = file.to_str().unwrap();
+
+    let mut first = StdioRun::start(&["--review", "--new-project", path], &dir, "first.log");
+    first.initialize();
+    first.call(2, "add_marker", serde_json::json!({ "time": 1.0, "name": "first-run" }));
+    let staged = first.call(3, "staged_diff", serde_json::json!({}));
+    assert!(
+        staged.to_string().contains("first-run"),
+        "the edit waits for review: {staged}"
+    );
+    #[cfg(unix)]
+    {
+        let pid = first.child.0.id().to_string();
+        assert!(Command::new("kill").args(["-TERM", &pid]).status().unwrap().success());
+        let stderr = first.stderr();
+        assert_eq!(first.exit("SIGTERM"), Some(0), "stderr:\n{stderr}");
+    }
+    #[cfg(not(unix))]
+    assert_eq!(first.close_stdin(), Some(0));
+
+    let mut second = StdioRun::start(&["--review", "--project", path], &dir, "second.log");
+    second.initialize();
+    second.call(2, "add_marker", serde_json::json!({ "time": 2.0, "name": "second-run" }));
+    let staged = second.call(3, "staged_diff", serde_json::json!({})).to_string();
+    assert!(staged.contains("first-run") && staged.contains("second-run"), "{staged}");
+    let stderr = second.stderr();
+    assert_eq!(second.close_stdin(), Some(0), "stderr:\n{stderr}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A launcher that sent stderr to stdout (`2>&1`) would get the logs in the client's stream: refused.
+#[cfg(unix)]
+#[test]
+fn stdio_refuses_a_stderr_that_is_its_stdout() {
+    let dir = std::env::temp_dir().join(format!("kerf-headless-stdio-merged-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let merged = std::fs::File::create(dir.join("merged.log")).unwrap();
+    let status = headless(&["--stdio"], &dir)
+        .stdin(Stdio::piped())
+        .stdout(merged.try_clone().unwrap())
+        .stderr(merged)
+        .status()
+        .expect("run kerf-app");
+    let out = std::fs::read_to_string(dir.join("merged.log")).unwrap();
+    assert_eq!(status.code(), Some(2), "{out}");
+    assert!(out.contains("stderr is the same file"), "{out}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn stdio_with_an_http_flag_is_a_usage_error_and_prints_nothing_on_stdout() {
+    let dir = std::env::temp_dir().join(format!("kerf-headless-stdio-usage-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    for http in [
+        &["--mcp-addr", "127.0.0.1:0"][..],
+        &["--token-file", "token"],
+        &["--show-token"],
+    ] {
+        let mut args = vec!["--stdio"];
+        args.extend_from_slice(http);
+        let out = headless(&args, &dir).stdin(Stdio::null()).output().expect("run kerf-app");
+        assert_eq!(out.status.code(), Some(2), "{http:?}");
+        assert!(out.stdout.is_empty(), "{http:?}: {:?}", String::from_utf8_lossy(&out.stdout));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("no listener and no token"),
+            "{http:?}"
+        );
+    }
+    let help = headless(&["--stdio", "--help"], &dir).stdin(Stdio::null()).output().unwrap();
+    assert_eq!(help.status.code(), Some(0));
+    assert!(help.stdout.is_empty(), "--help goes to stderr with --stdio");
+    assert!(String::from_utf8_lossy(&help.stderr).contains("--stdio"));
+    let _ = std::fs::remove_dir_all(&dir);
 }

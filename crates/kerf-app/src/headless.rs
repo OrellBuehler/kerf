@@ -5,6 +5,9 @@
 //! a [`Shell::Headless`] in place of the `AppHandle`. stdout carries one JSON line once the server
 //! listens (the ready line); logs go to stderr and the log directory. It runs until SIGINT / SIGTERM:
 //! the listener closes, every job is stopped, an untitled project with work is kept for recovery.
+//!
+//! With `--stdio` there is no listener: one MCP session is served over stdin / stdout, which carries
+//! JSON-RPC and nothing else, until the client closes stdin (or a signal) and the run stops the same way.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -31,6 +34,9 @@ kerf-app --headless [options]
 Run Kerf's MCP server with no window. Prints one JSON line on stdout once it listens;
 logs go to stderr. Stops on SIGINT / SIGTERM.
 
+  --stdio                  serve MCP on stdin / stdout instead of HTTP (no listener, no token);
+                           stops when the client closes stdin
+  --tools SETS             with --stdio, list only these tool sets (e.g. core,titles)
   --project PATH.kerf      open an existing project (default: a new untitled one)
   --new-project PATH.kerf  create a project file and open it (refused if it exists)
   --mcp-addr HOST:PORT     where to listen (default: KERF_MCP_ADDR, the setting, 127.0.0.1:7777;
@@ -44,7 +50,8 @@ logs go to stderr. Stops on SIGINT / SIGTERM.
 
 The token is KERF_MCP_TOKEN when set (this run only, never stored), else the one in the settings.
 
-Exit codes: 0 stopped by a signal, 1 failure, 2 bad arguments, 3 the server could not listen.";
+Exit codes: 0 stopped by a signal (or stdin closed, with --stdio), 1 failure, 2 bad arguments,
+3 the server could not listen.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ProjectArg {
@@ -54,6 +61,8 @@ enum ProjectArg {
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Args {
+    stdio: bool,
+    tools: Option<String>,
     project: Option<ProjectArg>,
     mcp_addr: Option<String>,
     data_dir: Option<PathBuf>,
@@ -120,6 +129,12 @@ fn parse(argv: &[String], cwd: &Path) -> Result<Option<Args>, String> {
             "--show-token" => switch(&mut args.show_token)?,
             "--review" => switch(&mut args.review)?,
             "--proxies" => switch(&mut args.proxies)?,
+            "--stdio" => switch(&mut args.stdio)?,
+            "--tools" => {
+                let tools = value()?;
+                mcp::check_tool_sets(&tools).map_err(|e| format!("--tools: {e}"))?;
+                args.tools = Some(tools);
+            }
             "--project" | "--new-project" => {
                 if args.project.is_some() {
                     return Err("give one --project or --new-project".to_string());
@@ -149,6 +164,20 @@ fn parse(argv: &[String], cwd: &Path) -> Result<Option<Args>, String> {
             other => return Err(format!("unknown argument {other:?} (see --help)")),
         }
     }
+    if args.stdio {
+        let http_only = [
+            ("--mcp-addr", args.mcp_addr.is_some()),
+            ("--token-file", args.token_file.is_some()),
+            ("--show-token", args.show_token),
+        ];
+        if let Some((flag, _)) = http_only.into_iter().find(|(_, given)| *given) {
+            return Err(format!(
+                "{flag} is for the HTTP server: a --stdio run has no listener and no token"
+            ));
+        }
+    } else if args.tools.is_some() {
+        return Err("--tools is for --stdio (over HTTP, add ?tools= to the URL)".to_string());
+    }
     Ok(Some(args))
 }
 
@@ -173,11 +202,23 @@ pub(crate) fn main(argv: &[String], bundled_ffmpeg: &[(&'static str, PathBuf)]) 
         }
     };
     if args.help {
-        let _ = writeln!(std::io::stdout().lock(), "{USAGE}");
+        // stdout is the client's alone with --stdio.
+        if args.stdio {
+            say(USAGE);
+        } else {
+            let _ = writeln!(std::io::stdout().lock(), "{USAGE}");
+        }
         return 0;
     }
     let token = match check_args(&args) {
         Ok(token) => token,
+        Err(Exit(code, message)) => {
+            say(&format!("kerf-app: {message}"));
+            return code;
+        }
+    };
+    let rpc = match args.stdio.then(rpc_out).transpose() {
+        Ok(rpc) => rpc,
         Err(Exit(code, message)) => {
             say(&format!("kerf-app: {message}"));
             return code;
@@ -195,7 +236,7 @@ pub(crate) fn main(argv: &[String], bundled_ffmpeg: &[(&'static str, PathBuf)]) 
     for (var, path) in bundled_ffmpeg {
         tracing::info!(%var, path = %path.display(), "using bundled FFmpeg binary");
     }
-    match run(&args, token, config, data) {
+    match run(&args, token, rpc, config, data) {
         Ok(code) => code,
         Err(Exit(code, message)) => {
             tracing::error!("{message}");
@@ -223,6 +264,9 @@ fn check_args(args: &Args) -> Result<Option<String>, Exit> {
     }
     if let Some(path) = args.token_file.as_deref().filter(|p| p.is_dir()) {
         return Err(usage(format!("--token-file {} is a directory", path.display())));
+    }
+    if args.stdio {
+        return Ok(None);
     }
     let token = std::env::var(ENV_TOKEN)
         .ok()
@@ -253,7 +297,72 @@ fn dirs_for(data_dir: Option<&Path>) -> Result<(Option<PathBuf>, Option<PathBuf>
     }
 }
 
-fn run(args: &Args, token: Option<String>, config: Option<PathBuf>, data: Option<PathBuf>) -> Result<i32, Exit> {
+/// Where a `--stdio` run writes JSON-RPC: what fd 1 was, kept for the protocol alone, with fd 1 itself
+/// pointed at stderr — so nothing else (a stray print, a native library's, a child process that
+/// inherits it) can corrupt the stream.
+#[cfg(unix)]
+type RpcOut = tokio::fs::File;
+#[cfg(not(unix))]
+type RpcOut = tokio::io::Stdout;
+
+/// A stdout that is stderr too (`2>&1`) and no terminal: the logs would land in the client's stream.
+#[cfg(unix)]
+fn rpc_out() -> Result<RpcOut, Exit> {
+    use std::io::IsTerminal;
+    use std::os::fd::FromRawFd;
+    let kept = |e: std::io::Error| Exit(EXIT_FAILURE, format!("cannot keep stdout for the MCP client: {e}"));
+    if same_file(libc::STDOUT_FILENO, libc::STDERR_FILENO).map_err(kept)? && !std::io::stdout().is_terminal() {
+        return Err(Exit(
+            EXIT_USAGE,
+            "--stdio needs stdout to itself, and stderr is the same file (2>&1?): send stderr elsewhere".to_string(),
+        ));
+    }
+    // SAFETY: `fcntl` / `dup2` / `close` on this process's own standard descriptors; the duplicate is
+    // checked, and from here on owned by the `File` alone.
+    unsafe {
+        let rpc = libc::fcntl(libc::STDOUT_FILENO, libc::F_DUPFD_CLOEXEC, 3);
+        if rpc < 0 {
+            return Err(kept(std::io::Error::last_os_error()));
+        }
+        if libc::dup2(libc::STDERR_FILENO, libc::STDOUT_FILENO) < 0 {
+            let e = std::io::Error::last_os_error();
+            libc::close(rpc);
+            return Err(kept(e));
+        }
+        Ok(tokio::fs::File::from_std(std::fs::File::from_raw_fd(rpc)))
+    }
+}
+
+/// Whether the descriptors `a` and `b` are open on the same file (device and inode).
+#[cfg(unix)]
+fn same_file(a: libc::c_int, b: libc::c_int) -> std::io::Result<bool> {
+    let stat = |fd| {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `fstat` writes a whole `stat` into the buffer when it returns 0, and only then is
+        // it read.
+        unsafe {
+            if libc::fstat(fd, stat.as_mut_ptr()) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(stat.assume_init())
+        }
+    };
+    let (a, b) = (stat(a)?, stat(b)?);
+    Ok(a.st_dev == b.st_dev && a.st_ino == b.st_ino)
+}
+
+#[cfg(not(unix))]
+fn rpc_out() -> Result<RpcOut, Exit> {
+    Ok(tokio::io::stdout())
+}
+
+fn run(
+    args: &Args,
+    token: Option<String>,
+    rpc: Option<RpcOut>,
+    config: Option<PathBuf>,
+    data: Option<PathBuf>,
+) -> Result<i32, Exit> {
     let failed = |e: kerf_core::Error| Exit(EXIT_FAILURE, e.to_string());
     let project = match &args.project {
         Some(ProjectArg::Open(path) | ProjectArg::Create(path)) => Project::open(path).map_err(failed)?,
@@ -285,16 +394,19 @@ fn run(args: &Args, token: Option<String>, config: Option<PathBuf>, data: Option
     std::thread::spawn(kerf_core::fonts::warm);
     std::thread::spawn(crate::warm_transcription_backend);
 
+    let stdio = rpc.map(|rpc| (mcp::start_stdio(shell.clone(), project.clone(), args.tools.as_deref()), rpc));
     let token_source = match (&token, &stored.mcp_token) {
         (Some(_), _) => "env",
         (None, Some(_)) => "settings",
         (None, None) => "generated",
     };
-    mcp::set_overrides(mcp::Overrides {
-        addr: args.mcp_addr.clone(),
-        token,
-    });
-    mcp::start(shell.clone(), project.clone());
+    if stdio.is_none() {
+        mcp::set_overrides(mcp::Overrides {
+            addr: args.mcp_addr.clone(),
+            token,
+        });
+        mcp::start(shell.clone(), project.clone());
+    }
     // Nobody is there to review: the agent's edits land live unless `--review` asks otherwise. For
     // this run only; the stored switch is the desktop app's.
     if !args.review {
@@ -306,9 +418,44 @@ fn run(args: &Args, token: Option<String>, config: Option<PathBuf>, data: Option
         data_dir = %data.as_deref().map(|d| d.display().to_string()).unwrap_or_default(),
         project = %lock_user(&project).path().map(|p| p.display().to_string()).unwrap_or_default(),
         review = settings::agent_review(),
+        stdio = stdio.is_some(),
         "kerf starting headless"
     );
-    tauri::async_runtime::block_on(serve(args, &shell, &project, token_source))
+    match stdio {
+        Some((server, rpc)) => tauri::async_runtime::block_on(serve_stdio(server, rpc, &shell, &project)),
+        None => tauri::async_runtime::block_on(serve(args, &shell, &project, token_source)),
+    }
+}
+
+async fn serve_stdio(server: mcp::Stdio, rpc: RpcOut, shell: &Shell, project: &Arc<Mutex<Project>>) -> Result<i32, Exit> {
+    let mut signals = Signals::new().map_err(|e| Exit(EXIT_FAILURE, format!("cannot listen for signals: {e}")))?;
+    let stop = tokio_util::sync::CancellationToken::new();
+    let serving = server.serve((tokio::io::stdin(), rpc), stop.clone());
+    let mut serving = std::pin::pin!(serving);
+    say("kerf: MCP server on stdin / stdout");
+    let (ended, signalled) = tokio::select! {
+        ended = &mut serving => {
+            tracing::info!("the MCP session on stdio ended; shutting down");
+            (ended, false)
+        }
+        () = signals.next() => {
+            tracing::info!("signal received; shutting down (a second one exits at once)");
+            stop.cancel();
+            (tokio::time::timeout(Duration::from_secs(3), &mut serving).await.unwrap_or(Ok(())), true)
+        }
+    };
+    tauri::async_runtime::spawn(async move {
+        // A first signal during a shutdown that stdin closing began asks for what is under way.
+        if !signalled {
+            signals.next().await;
+            tracing::info!("signal received; already shutting down (a second one exits at once)");
+        }
+        signals.next().await;
+        tracing::warn!("second signal; exiting without waiting");
+        std::process::exit(EXIT_INTERRUPTED);
+    });
+    shutdown(shell, project).await;
+    ended.map(|()| 0).map_err(|e| Exit(EXIT_FAILURE, e))
 }
 
 async fn serve(args: &Args, shell: &Shell, project: &Arc<Mutex<Project>>, token_source: &str) -> Result<i32, Exit> {
@@ -464,6 +611,8 @@ mod tests {
         assert_eq!(
             args,
             Args {
+                stdio: false,
+                tools: None,
                 project: Some(ProjectArg::Open(PathBuf::from("/work/cut.kerf"))),
                 mcp_addr: Some("127.0.0.1:0".to_string()),
                 data_dir: Some(PathBuf::from("/tmp/kerf")),
@@ -493,6 +642,61 @@ mod tests {
         assert!(err(&["--headless", "--cpu-percent", "101"]).contains("from"));
         assert!(err(&["--headless", "--cpu-percent", "1"]).contains("from"));
         assert!(err(&["--headless", "--review=yes"]).contains("takes no value"));
+    }
+
+    #[test]
+    fn stdio_takes_its_own_flags_and_refuses_the_http_ones() {
+        let args = parsed(&[
+            "--headless",
+            "--stdio",
+            "--tools",
+            "core,titles",
+            "--project=cut.kerf",
+            "--review",
+        ])
+        .unwrap()
+        .unwrap();
+        assert!(args.stdio && args.review);
+        assert_eq!(args.tools.as_deref(), Some("core,titles"));
+        assert_eq!(args.project, Some(ProjectArg::Open(PathBuf::from("/work/cut.kerf"))));
+        assert!(parsed(&["--headless", "--stdio", "--tools=all"]).is_ok());
+        let err = |args: &[&str]| parsed(args).unwrap_err();
+        for http in [
+            &["--mcp-addr", "127.0.0.1:0"][..],
+            &["--token-file", "token"],
+            &["--show-token"],
+        ] {
+            let mut argv = vec!["--headless", "--stdio"];
+            argv.extend_from_slice(http);
+            assert!(err(&argv).contains("no listener and no token"), "{http:?}");
+        }
+        assert!(err(&["--headless", "--tools", "core"]).contains("--tools is for --stdio"));
+        assert!(err(&["--headless", "--stdio", "--tools", "core,colour"]).contains("`colour` is no tool set"));
+        assert!(err(&["--headless", "--stdio=yes"]).contains("takes no value"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_descriptor_is_the_same_file_as_its_duplicate_and_not_another() {
+        use std::os::fd::AsRawFd;
+        let dir = std::env::temp_dir().join(format!("kerf-headless-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let one = std::fs::File::create(dir.join("one")).unwrap();
+        let again = std::fs::File::open(dir.join("one")).unwrap();
+        let other = std::fs::File::create(dir.join("other")).unwrap();
+        assert!(same_file(one.as_raw_fd(), again.as_raw_fd()).unwrap());
+        assert!(!same_file(one.as_raw_fd(), other.as_raw_fd()).unwrap());
+        assert!(same_file(-1, one.as_raw_fd()).is_err());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_stdio_run_takes_no_token_from_the_environment() {
+        let args = Args {
+            stdio: true,
+            ..Args::default()
+        };
+        assert!(matches!(check_args(&args), Ok(None)));
     }
 
     #[test]

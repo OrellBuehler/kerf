@@ -47,7 +47,8 @@ mod toolsets;
 
 use jobs::Run;
 pub(crate) use server::{
-    bind_problem, client_url, current_token, finish_jobs, set_overrides, start, stop, wait_listening, Overrides,
+    bind_problem, check_tool_sets, client_url, current_token, finish_jobs, set_overrides, start, start_stdio, stop,
+    wait_listening, Overrides, Stdio,
 };
 pub use server::{
     check_addr, check_token, connection_info, endpoint_url, generate_token, server_error, settings_changed, ConnectionInfo,
@@ -83,6 +84,15 @@ pub struct KerfMcp {
     session: Arc<Mutex<Option<String>>>,
     /// The resources this session subscribed to, and the task that tells it when they change.
     listener: activity::Listener,
+    /// The one session of a `--stdio` run, which no HTTP request names. `None` over HTTP.
+    stdio: Option<Arc<StdioSession>>,
+}
+
+/// What an HTTP request says about its session, said once for the stdio one: its id (stable for
+/// the life of the pipe, which is the process's) and the tool sets `--tools` picked.
+struct StdioSession {
+    id: String,
+    tools: toolsets::Selection,
 }
 
 // ---- tool parameter schemas ------------------------------------------------
@@ -2987,7 +2997,7 @@ impl KerfMcp {
                        Read it once before your first edit."
     )]
     fn get_editing_guide(&self, context: RequestContext<RoleServer>) -> Result<String, McpError> {
-        let note = tool_selection(&context)?.note().unwrap_or_default();
+        let note = self.selection(&context)?.note().unwrap_or_default();
         Ok(format!("{EDITING_GUIDE}{note}"))
     }
 
@@ -7195,12 +7205,22 @@ impl KerfMcp {
             app,
             session: Arc::new(Mutex::new(None)),
             listener: activity::Listener::default(),
+            stdio: None,
+        }
+    }
+
+    /// The server of the `--stdio` session `id`, listing the tool sets `tools`.
+    fn over_stdio(project: Arc<Mutex<Project>>, app: Shell, id: String, tools: toolsets::Selection) -> Self {
+        Self {
+            listener: activity::Listener::lasting(),
+            stdio: Some(Arc::new(StdioSession { id, tools })),
+            ..Self::new(project, app)
         }
     }
 
     /// Note which rmcp session a call arrived on (called for every tool call, before it runs).
     fn note_session(&self, context: &RequestContext<RoleServer>) {
-        let session = session_id_of(context);
+        let session = session_id_of(context).or_else(|| self.stdio.as_ref().map(|s| s.id.clone()));
         if let Some(id) = &session {
             server::note_session_seen(id);
         }
@@ -7420,7 +7440,7 @@ impl Drop for AnalysisProgressRelay {
 
 /// The rmcp session a request belongs to: the `Mcp-Session-Id` header of the HTTP request it
 /// rode in on. `None` for a client that keeps no session, and for anything that did not come
-/// over HTTP.
+/// over HTTP (the stdio session is [`KerfMcp::stdio`]'s).
 fn session_id_of(context: &RequestContext<RoleServer>) -> Option<String> {
     session_from_parts(context.extensions.get::<axum::http::request::Parts>()?)
 }
@@ -7590,6 +7610,16 @@ fn reject_unknown_arguments(request: &rmcp::model::CallToolRequestParams) -> Res
     }
 }
 
+impl KerfMcp {
+    /// The tool sets this connection lists: `--tools` over stdio, else the URL's.
+    fn selection(&self, context: &RequestContext<RoleServer>) -> Result<toolsets::Selection, McpError> {
+        match &self.stdio {
+            Some(stdio) => Ok(stdio.tools.clone()),
+            None => tool_selection(context),
+        }
+    }
+}
+
 /// The tool sets the request's URL asks for (`?tools=core,titles`, `toolsets.rs`); every tool for a
 /// request that came some other way.
 fn tool_selection(context: &RequestContext<RoleServer>) -> Result<toolsets::Selection, McpError> {
@@ -7669,8 +7699,8 @@ const INSTRUCTIONS: &str = "Kerf is the video editor open on this computer, and 
              `background: true` and answer a job_id at once; follow it with job_status or subscribe to \
              kerf://jobs/{job_id}. \
              The prompts (rough_cut_from_transcript, podcast_cleanup, social_reel, music_bed, sound_design, deliver) are \
-             these workflows as steps. A client may connect with ?tools=core,titles on the URL to list \
-             fewer tools; get_editing_guide then names the sets left out.";
+             these workflows as steps. A client may connect with ?tools=core,titles on the URL (--tools core,titles over \
+             stdio) to list fewer tools; get_editing_guide then names the sets left out.";
 
 /// What `get_editing_guide` answers: the workflow across every tool.
 const EDITING_GUIDE: &str = "How to edit with Kerf. The user queues editing tasks in the desktop app; \
@@ -8032,7 +8062,7 @@ const EDITING_GUIDE: &str = "How to edit with Kerf. The user queues editing task
              already there unless you pass overwrite=true. \
              The server's prompts — rough_cut_from_transcript, podcast_cleanup, social_reel, music_bed, sound_design and \
              deliver — are these workflows as numbered steps the user can start. A connection may list only \
-             some tool sets (`?tools=core,titles` on the server URL; the sets are core, analysis, clips, \
+             some tool sets (`?tools=core,titles` on the server URL, `--tools core,titles` for a stdio server; the sets are core, analysis, clips, \
              keyframes, titles, audio, music, delivery, tasks and project), and this guide then ends by \
              saying which.";
 
@@ -8091,7 +8121,7 @@ impl ServerHandler for KerfMcp {
         context: RequestContext<RoleServer>,
     ) -> Result<rmcp::model::ListToolsResult, McpError> {
         self.listener.touch();
-        let selection = tool_selection(&context)?;
+        let selection = self.selection(&context)?;
         let mut tools = router().list_all();
         tools.retain(|tool| selection.lists(&tool.name));
         let supports_cache_hints = context
