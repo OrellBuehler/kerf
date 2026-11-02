@@ -3214,7 +3214,7 @@ mod tests {
         let (why, _) = judge(
             video(640, 360),
             None,
-            &|c| c.keyframes = vec![key(0.0, 1.0, -0.1, 10.0, 1.0), key(8.0, 1.0, 0.1, 10.0, 1.0)],
+            &|c| c.keyframes = vec![key(0.0, 1.0, -0.1, 90.0, 1.0), key(8.0, 1.0, 0.1, 90.0, 1.0)],
             4.0,
         );
         assert!(
