@@ -4,14 +4,15 @@
 #
 #   docker build -f deploy/Dockerfile -t kerf-mcp .
 #
-# x86_64 only: the pinned FFmpeg (scripts/fetch-ffmpeg.mjs) has no Linux arm64 build.
+# x86_64 only (every stage is linux/amd64): the pinned FFmpeg (scripts/fetch-ffmpeg.mjs) has no
+# Linux arm64 build. The runtime CPU needs x86-64-v3 (AVX2 / FMA / BMI2 / F16C), see GGML_* below.
 
 ARG RUST_VERSION=1.99.1
 ARG BUN_VERSION=1.4.4
 ARG DEBIAN_RELEASE=trixie
 
 # ---- frontend: tauri-build embeds it at compile time, even though headless never shows it
-FROM oven/bun:${BUN_VERSION}-debian AS frontend
+FROM --platform=linux/amd64 oven/bun:${BUN_VERSION}-debian AS frontend
 WORKDIR /src/frontend
 COPY frontend/package.json frontend/bun.lock ./
 RUN bun install --frozen-lockfile
@@ -20,7 +21,7 @@ RUN bun run build
 
 # ---- the pinned, SHA-256-checked FFmpeg 9 the desktop bundles ship (no whisper filter:
 # transcription is the in-process `whisper` feature below)
-FROM oven/bun:${BUN_VERSION}-debian AS ffmpeg
+FROM --platform=linux/amd64 oven/bun:${BUN_VERSION}-debian AS ffmpeg
 RUN apt-get update \
     && apt-get install -y --no-install-recommends xz-utils \
     && rm -rf /var/lib/apt/lists/*
@@ -29,7 +30,7 @@ COPY scripts/fetch-ffmpeg.mjs scripts/
 RUN bun scripts/fetch-ffmpeg.mjs x86_64-unknown-linux-gnu
 
 # ---- kerf-app, built like a release bundle: no FFmpeg dev libraries, whisper.cpp in-process
-FROM rust:${RUST_VERSION}-${DEBIAN_RELEASE} AS build
+FROM --platform=linux/amd64 rust:${RUST_VERSION}-${DEBIAN_RELEASE} AS build
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         libwebkit2gtk-4.1-dev cmake clang libclang-dev pkg-config \
@@ -51,7 +52,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     && install -D -m 0755 target/release/kerf-app /out/kerf-app
 
 # ---- runtime
-FROM debian:${DEBIAN_RELEASE}-slim
+FROM --platform=linux/amd64 debian:${DEBIAN_RELEASE}-slim
 # The binary links GTK / WebKitGTK even headless (no display is opened); tini reaps
 # what ffmpeg leaves behind and forwards SIGTERM, which kerf-app shuts down on.
 RUN apt-get update \
@@ -74,7 +75,8 @@ RUN useradd --system --uid 10001 --user-group --home-dir /data --no-create-home 
 # Everything Kerf writes lives on the three volumes, so the root filesystem can be read-only:
 # settings, logs and recovery in /data (--data-dir), voiceovers / music / templates in
 # /data/share, models, proxies and waveforms in /cache, the agent's media in /workspace.
-# KERF_WORKSPACE / KERF_CACHE_DIR / KERF_CACHE_MAX_GB are read by builds that have them.
+# KERF_CACHE_DIR puts every cache (models included) in /cache; KERF_WORKSPACE confines paths in
+# builds with --workspace support and is ignored by older ones.
 ENV HOME=/data \
     XDG_CONFIG_HOME=/data/config \
     XDG_DATA_HOME=/data/share \

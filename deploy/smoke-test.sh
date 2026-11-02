@@ -39,7 +39,8 @@ docker run -d --name "$name" --read-only --tmpfs /tmp --cap-drop ALL --security-
 
 missing="$(docker exec "$name" sh -c 'ldd /usr/local/bin/kerf-app /usr/local/bin/ffmpeg | grep "not found" || true')"
 [[ -z $missing ]] || fail "unresolved libraries: $missing"
-docker exec "$name" ffmpeg -hide_banner -version | head -1
+version="$(docker exec "$name" ffmpeg -hide_banner -version)"
+echo "${version%%$'\n'*}"
 
 for _ in $(seq 60); do
   health="$(docker inspect -f '{{.State.Health.Status}}' "$name")"

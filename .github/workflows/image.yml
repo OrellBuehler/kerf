@@ -4,24 +4,25 @@ name: Image
 # initialize → 200, a tool call. Only when something the image is made of changes; nothing is
 # pushed to a registry (see the note at the end of release.yml).
 on:
+  # Pull requests pay for the ~40-minute build only when the image itself changes; a change to
+  # the app reaches it on main, where a break shows up right after the merge.
   pull_request:
     paths:
       - "deploy/**"
       - ".dockerignore"
-      - "Cargo.lock"
-      - "crates/kerf-app/**"
       - "scripts/fetch-ffmpeg.mjs"
       - ".github/workflows/image.yml"
-  # Main keeps the layer cache warm for the pull requests that branch off it.
   push:
     branches: [main]
     paths:
       - "deploy/**"
       - ".dockerignore"
-      - "Cargo.lock"
-      - "crates/kerf-app/**"
       - "scripts/fetch-ffmpeg.mjs"
       - ".github/workflows/image.yml"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "frontend/**"
   workflow_dispatch:
 
 permissions:
@@ -51,6 +52,7 @@ jobs:
           push: false
           tags: kerf-mcp:ci
           cache-from: type=gha,scope=kerf-mcp
-          cache-to: ${{ github.event_name == 'pull_request' && '' || 'type=gha,scope=kerf-mcp,mode=max' }}
+          # Saved from main only, like the cargo caches in ci.yml.
+          cache-to: ${{ github.event_name != 'pull_request' && 'type=gha,scope=kerf-mcp,mode=max' || '' }}
       - name: Smoke test
         run: deploy/smoke-test.sh kerf-mcp:ci

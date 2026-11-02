@@ -72,3 +72,14 @@ updates:
     groups:
       images:
         patterns: ["*"]
+
+  # The Caddy image in deploy/compose.yaml.
+  - package-ecosystem: docker-compose
+    directory: /deploy
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "deps"

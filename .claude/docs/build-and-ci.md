@@ -119,12 +119,13 @@ only holds a read-only token, so it never checks out PR code, and it accepts the
 or changes the commenter is not commented on by its own version.
 **Hosted image** (`deploy/`, `deploy/README.md`): `deploy/Dockerfile` builds kerf-app like a release
 (`--no-default-features --features whisper`, whisper.cpp pinned to AVX2 via `GGML_*` instead of `-march=native`) with
-the frontend and the pinned Linux FFmpeg (`fetch-ffmpeg.mjs`) in their own stages, on Debian trixie (WebKitGTK runtime
+the frontend and the pinned Linux FFmpeg (`fetch-ffmpeg.mjs`) in their own stages, on Debian trixie, `linux/amd64` only (WebKitGTK runtime
 libraries, tini, uid 10001, volumes `/workspace` `/data` `/cache`, XDG dirs pointed into them so the root can be
-read-only). The entrypoint requires `KERF_MCP_TOKEN` and binds `0.0.0.0` (any `Host` accepted, so a reverse proxy
+read-only). The entrypoint requires `KERF_MCP_TOKEN` (or `KERF_MCP_TOKEN_FILE`) and binds `0.0.0.0` (any `Host` accepted, so a reverse proxy
 needs no rewrite); `compose.yaml` + `Caddyfile` are the one-container-per-tenant example. **`image.yml`** builds it
-(buildx, GHA layer cache saved from main only, never pushed) on PRs and main pushes that touch `deploy/**`,
-`.dockerignore`, `Cargo.lock`, `crates/kerf-app/**` or `fetch-ffmpeg.mjs`, then runs `deploy/smoke-test.sh`
+(buildx, GHA layer cache saved from main only, never pushed) on PRs that touch `deploy/**`, `.dockerignore`,
+`fetch-ffmpeg.mjs` or the workflow, and on main pushes that also touch `crates/**`, `Cargo.*` or `frontend/**` (an app
+change is caught after the merge rather than costing every PR a ~40-minute build), then runs `deploy/smoke-test.sh`
 (no token → exit 2, every library resolves, healthy, 401 / 200 / 202, `project_info`). Publishing to GHCR is a
 commented job at the end of `release.yml`.
 In-place update is per-platform: macOS and Windows
