@@ -67,10 +67,13 @@ part (after a link the kernel's `..` is not the folded one), and the stored spee
 (`Project::referenced_files` → media and LUTs from the cut, its history, an open proposal and its undo steps;
 `check_project`, before the swap). **No playlist or manifest**: `Workspace::open` turns on
 `kerf_core::paths::confine_demuxers`, after which every probe passes `-format_whitelist MEDIA_DEMUXERS` (no HLS, DASH,
-concat, SDP, IMF, MXF, SVG) and FFmpeg refuses such a file — whatever its name or padding — before opening an entry; a
-content sniff could not, FFmpeg reads up to 1 MiB to decide. `Workspace::check_media` runs that probe (on `blocking`) in
-`import_asset` and for each existing media file `check_project` sees, and resolves and probes an Insta360 lens file's
-sibling, which the stitch reads. This is confinement at the API
+concat, SDP, IMF, SVG) and FFmpeg refuses such a file — whatever its name or padding — before opening an entry; a
+content sniff could not, FFmpeg reads up to 1 MiB to decide. `image2` is allowed and reads `x%d.png` as a sequence of
+other files, so a media path with a `%` is refused (`refuse_pattern`). `Workspace::check_media` runs that probe (on
+`blocking`) in `import_asset` and for each media file `check_project` sees — one missing or not a regular file refuses the
+project, since nothing would probe it when it appears — and resolves and probes an Insta360 lens file's sibling, which
+the stitch reads. The whitelist guards the import / open probe only: later reads (proxies, analysis, export) trust that
+the file did not change, so keep one tenant per container. This is confinement at the API
 level only: FFmpeg, the decoders and the rest of the process run with the server's own rights, so a hosted deployment
 should add OS isolation (a container or a user that sees only DIR and Kerf's directories).
 It shares the **same** `Arc<Mutex<Project>>` the Tauri commands hold, so the agent edits the project the user has open.

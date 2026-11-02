@@ -14,6 +14,8 @@ acount = "acount"
 fo = "fo"
 # ffmpeg's pass-through audio filter
 anull = "anull"
+# Apple's Core Audio Format demuxer
+caf = "caf"
 # "mis-remembers", "mis-animates"
 mis = "mis"
 # "PNGs" splits as PN + Gs

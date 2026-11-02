@@ -922,3 +922,65 @@ fn a_workspace_refuses_a_playlist_imported_or_named_by_a_project() {
     drop(child);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// A project's media is probed before a confined run takes it in (here by an `ffprobe` that only says
+/// it was asked), and Kerf's template library may not lie in the workspace: both exit 2 at startup.
+#[cfg(unix)]
+#[test]
+fn a_confined_start_probes_the_project_s_media_and_keeps_the_template_library_out() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = scratch("ws-start");
+    let (ws, data) = (dir.join("ws"), dir.join("data"));
+    std::fs::create_dir_all(ws.join("media")).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    tone(&ws.join("media").join("tone.wav"));
+    let fake = dir.join("fake-ffprobe");
+    std::fs::write(&fake, "#!/bin/sh\necho 'fake ffprobe was asked' >&2\nexit 1\n").unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let crafted = kerf_core::Project::open(ws.join("cut.kerf")).unwrap();
+    let asset: kerf_core::Asset = serde_json::from_value(serde_json::json!({
+        "id": "00000000-0000-4000-8000-000000000003",
+        "path": std::fs::canonicalize(ws.join("media").join("tone.wav")).unwrap().to_string_lossy(),
+        "name": "tone.wav",
+        "duration": 1.0,
+        "streams": [],
+        "imported_at": "2026-01-01T00:00:00Z",
+    }))
+    .unwrap();
+    crafted.insert_or_get_asset(&asset).unwrap();
+    crafted.close();
+    let run = |args: &[&str], envs: &[(&str, &Path)]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_kerf-app"));
+        command
+            .args(["--headless", "--mcp-addr", "127.0.0.1:0", "--workspace", ws.to_str().unwrap()])
+            .arg("--data-dir")
+            .arg(&data)
+            .args(args)
+            .env("KERF_MCP_TOKEN", "s".repeat(48))
+            .env_remove("DISPLAY")
+            .env_remove("KERF_WORKSPACE")
+            .env_remove("KERF_CACHE_DIR")
+            .env_remove("KERF_TEMPLATES_DIR")
+            .stdin(Stdio::null());
+        for (name, value) in envs {
+            command.env(name, value);
+        }
+        let out = command.output().unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        assert_eq!(out.status.code(), Some(2), "{args:?}: {stderr}");
+        stderr
+    };
+    let why = run(&["--project", "cut.kerf"], &[("KERF_FFPROBE", fake.as_path())]);
+    assert!(
+        why.contains("fake ffprobe was asked") && why.contains("not media this server takes"),
+        "{why}"
+    );
+    let templates = ws.join("templates");
+    let why = run(&[], &[("KERF_TEMPLATES_DIR", templates.as_path())]);
+    assert!(
+        why.contains("the template library") && why.contains("inside --workspace"),
+        "{why}"
+    );
+    assert!(!templates.exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}

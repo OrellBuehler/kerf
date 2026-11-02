@@ -88,13 +88,24 @@ impl Workspace {
             if has_dot_parts(file, cfg!(windows)) {
                 return Err(refused(&format!("{file:?}"), "has a `.` or `..` part".to_string()));
             }
+            if is_media {
+                refuse_pattern(file).map_err(|e| refused("its media", e))?;
+            }
             if kerf_dirs.iter().any(|dir| within(dir, file)) {
                 continue;
             }
             let real = self
                 .resolve(file)
                 .map_err(|e| refused("it names a file outside the workspace:", e))?;
-            if is_media && Path::new(&real).is_file() {
+            if is_media {
+                // A file that is not there now could be put there unprobed later, and every later read
+                // (a proxy, an analysis, the export) trusts it: only media the probe saw is taken.
+                if !Path::new(&real).is_file() {
+                    return Err(refused(
+                        &format!("{file:?}"),
+                        "is missing or not a regular file, so it cannot be checked (put the media back first)".to_string(),
+                    ));
+                }
                 self.check_media(&real).map_err(|e| refused("its media", e))?;
             }
         }
@@ -110,6 +121,7 @@ impl Workspace {
     /// refuses before opening what it names, and an Insta360 lens file whose sibling — which the
     /// stitch reads — leads out of the workspace or is such a file itself. Probes: for the blocking pool.
     pub(crate) fn check_media(&self, path: &str) -> Result<(), String> {
+        refuse_pattern(path)?;
         let probe = |file: &Path| {
             kerf_core::Project::probe_asset_with(file, &|| false).map_err(|e| {
                 format!(
@@ -237,6 +249,18 @@ fn kerf_media_dirs() -> Vec<PathBuf> {
     let mut dirs = made(&data, &["music", "voiceovers", "sfx"]);
     dirs.extend(made(&cache, &["stitched", "stems"]));
     dirs
+}
+
+/// Refuse a media path with a `%` in it: the image sequence reader takes `x%d.png` as a pattern and
+/// opens `x0.png`, `x1.png`… — files the probe never looked at (pure).
+fn refuse_pattern(path: &str) -> Result<(), String> {
+    if path.contains('%') {
+        return Err(format!(
+            "{path:?} has a `%` in it, which FFmpeg reads as an image sequence pattern and opens other files by; \
+             this server is confined to its workspace, so rename the file without a `%`"
+        ));
+    }
+    Ok(())
 }
 
 /// Whether `path` has a `.` or `..` part (pure).
@@ -664,12 +688,21 @@ mod tests {
             }))
             .unwrap()
         };
-        project.insert_or_get_asset(&asset(&dir.join("clip.mp4"))).unwrap();
         assert!(ws.check_project(&project).is_ok());
         project.set_meta(crate::SPEECH_MODEL_KEY, "/etc/model.bin").unwrap();
         assert!(ws.check_project(&project).unwrap_err().contains("model name"));
         project.set_meta(crate::SPEECH_MODEL_KEY, "base").unwrap();
         assert!(ws.check_project(&project).is_ok());
+        let missing = kerf_core::Project::open_in_memory().unwrap();
+        missing.insert_or_get_asset(&asset(&dir.join("clip.mp4"))).unwrap();
+        assert!(ws.check_project(&missing).unwrap_err().contains("missing"));
+        let pattern = kerf_core::Project::open_in_memory().unwrap();
+        pattern.insert_or_get_asset(&asset(&dir.join("frame%d.png"))).unwrap();
+        assert!(ws.check_project(&pattern).unwrap_err().contains("`%`"));
+        assert!(ws
+            .check_media(&dir.join("x%03d.png").to_string_lossy())
+            .unwrap_err()
+            .contains("image sequence"));
         project.insert_or_get_asset(&asset(&elsewhere.join("secret.mp4"))).unwrap();
         let why = ws.check_project(&project).unwrap_err();
         assert!(why.contains("outside the workspace") && why.contains("secret.mp4"), "{why}");

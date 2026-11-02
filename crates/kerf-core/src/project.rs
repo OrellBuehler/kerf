@@ -8271,27 +8271,35 @@ mod tests {
     #[test]
     fn referenced_files_name_every_source_and_every_lut_the_history_holds() {
         use crate::model::ClipLut;
+        // An absolute path on this platform (a LUT path must be one).
+        let abs = |p: &str| {
+            if cfg!(windows) {
+                format!("C:\\{}", p.replace('/', "\\"))
+            } else {
+                format!("/{p}")
+            }
+        };
         let mut project = Project::sample().unwrap();
         let clip = project.timeline().unwrap().tracks[0].clips[0].id;
         let lut = |path: &str| Grade {
             lut: Some(ClipLut {
-                path: path.into(),
+                path: abs(path),
                 intensity: 1.0,
             }),
             ..Grade::default()
         };
-        project.set_grade(clip, lut("/luts/old.cube")).unwrap();
-        project.set_grade(clip, lut("/luts/new.cube")).unwrap();
+        project.set_grade(clip, lut("luts/old.cube")).unwrap();
+        project.set_grade(clip, lut("luts/new.cube")).unwrap();
         let mut stitched = project.list_assets().unwrap()[0].clone();
         stitched.id = Uuid::new_v4();
-        stitched.path = "/cache/stitched/pair.mp4".into();
-        stitched.source_paths = vec!["/caps/VID_00_000.insv".into(), "/caps/VID_10_000.insv".into()];
+        stitched.path = abs("cache/stitched/pair.mp4");
+        stitched.source_paths = vec![abs("caps/VID_00_000.insv"), abs("caps/VID_10_000.insv")];
         project.insert_or_get_asset(&stitched).unwrap();
         // An agent's proposal and its undo step hold LUTs the cut does not.
         project.set_agent_review(true);
         project.set_actor(EditSource::Agent);
-        project.set_grade(clip, lut("/luts/staged-first.cube")).unwrap();
-        project.set_grade(clip, lut("/luts/staged-then.cube")).unwrap();
+        project.set_grade(clip, lut("luts/staged-first.cube")).unwrap();
+        project.set_grade(clip, lut("luts/staged-then.cube")).unwrap();
         assert!(project.staged().unwrap().is_some_and(|s| s.undo_depth > 0));
         let files = project.referenced_files().unwrap();
         for asset in project.list_assets().unwrap() {
@@ -8301,12 +8309,12 @@ mod tests {
             assert!(files.media.contains(capture), "a capture file");
         }
         for (path, why) in [
-            ("/luts/new.cube", "the cut"),
-            ("/luts/old.cube", "an undo brings it back"),
-            ("/luts/staged-then.cube", "the proposal"),
-            ("/luts/staged-first.cube", "the proposal's undo step"),
+            ("luts/new.cube", "the cut"),
+            ("luts/old.cube", "an undo brings it back"),
+            ("luts/staged-then.cube", "the proposal"),
+            ("luts/staged-first.cube", "the proposal's undo step"),
         ] {
-            assert!(files.luts.contains(&path.to_string()), "{why}");
+            assert!(files.luts.contains(&abs(path)), "{why}");
         }
         assert!(files.media.iter().all(|m| !m.ends_with(".cube")));
     }

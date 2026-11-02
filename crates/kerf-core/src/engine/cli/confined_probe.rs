@@ -41,7 +41,16 @@ fn only_a_confined_probe_names_the_demuxers() {
         Some("/media/clip.mp4"),
         "before the input"
     );
-    for reference in ["hls", "dash", "concat", "sdp", "imf", "mxf", "svg_pipe", "applehttp"] {
+    for reference in [
+        "hls",
+        "dash",
+        "concat",
+        "sdp",
+        "imf",
+        "svg_pipe",
+        "applehttp",
+        "webm_dash_manifest",
+    ] {
         assert!(!MEDIA_DEMUXERS.split(',').any(|d| d == reference), "{reference}");
     }
     assert!(crate::paths::demuxer_whitelist().is_none(), "off unless a host turns it on");

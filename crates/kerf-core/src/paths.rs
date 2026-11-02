@@ -15,11 +15,13 @@ static CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
 
 /// The demuxers a confined run ([`confine_demuxers`]) lets a probe pick: the media formats Kerf
 /// imports. Left out on purpose: every format that opens the files it names (HLS and other
-/// playlists, DASH, concat lists, SDP, IMF, MXF's external essence) and the SVG reader, which follows
-/// a document's links.
-pub const MEDIA_DEMUXERS: &str = "mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,wav,w64,mp3,aac,ac3,eac3,flac,ogg,aiff,wv,\
-mpegts,mpeg,avi,flv,asf,dv,m4v,h264,hevc,image2,png_pipe,jpeg_pipe,webp_pipe,gif,gif_pipe,bmp_pipe,tiff_pipe,qoi_pipe,\
-ppm_pipe,pgm_pipe,j2k_pipe,apng";
+/// playlists, DASH, concat lists, SDP, IMF) and the SVG reader, which follows a document's links.
+/// `image2` is in, and it does open other files when a name is a sequence pattern (`x%d.png`): a
+/// confining host refuses a `%` in a media path itself (`kerf-app`'s `Workspace`). MXF is in: FFmpeg's
+/// reader does not open external essence.
+pub const MEDIA_DEMUXERS: &str = "mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,wav,w64,mp3,aac,ac3,eac3,dts,flac,ogg,aiff,caf,\
+wv,amr,au,nut,ivf,mxf,mpegts,mpeg,mpegvideo,avi,flv,asf,dv,m4v,h264,hevc,image2,png_pipe,jpeg_pipe,webp_pipe,gif,gif_pipe,\
+bmp_pipe,tiff_pipe,qoi_pipe,ppm_pipe,pgm_pipe,j2k_pipe,jpegxl_pipe,exr_pipe,dpx_pipe,apng";
 
 static CONFINED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
