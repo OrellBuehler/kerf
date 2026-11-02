@@ -1919,6 +1919,7 @@ fn before_transitions() -> GpuCaps {
 fn before_zoom_mask_effects() -> GpuCaps {
     let mut caps = Compositor::CAPS;
     caps.keyed_zoom = false;
+    caps.placement = false;
     caps.mask = false;
     caps.effects = kerf_core::EffectKinds::NONE;
     caps
@@ -2020,10 +2021,11 @@ fn captioned_cuts_and_transitions_are_drawn_by_the_compositor_where_they_were_re
     }
     // The tutorial: its push-ins are a moving zoom, and one clip adds a feathered mask and a blur to it.
     // A push-in is placed at sub-pixel positions by FFmpeg's `perspective` (the export and the still
-    // alike), which no compositor pass draws: refused, the rest drawn.
+    // alike), which the placement pass draws: the whole cut, the mask and the blur included.
     for mode in ["still", "motion"] {
-        let (_, _, after) = at("T3", mode);
-        assert!(after > 10.0 && after < 20.0, "T3 {mode}: {after}");
+        let (was, before, after) = at("T3", mode);
+        assert!(before < 20.0, "T3 {mode}: {before}");
+        assert!(was < 100.0 && (after - 100.0).abs() < 1e-9, "T3 {mode}: {was} -> {after}");
     }
 }
 
@@ -2389,6 +2391,11 @@ fn the_ledger_says_which_refusals_hold_the_compositor_back() {
     } else {
         kerf_gpu::blend::extras()
     };
+    // ... and a moving zoom or position only where this FFmpeg's `pad`, `perspective` and `crop` place a picture as the model does
+    // (the placement probe), a 4:4:4 or 4:2:2 picture under it only where its graph converts it as the decode does (the
+    // conversion probe).
+    let placement = kerf_gpu::placement_probe::placement();
+    let conversion = kerf_gpu::conversion::conversion();
     let caps = Compositor::caps_with(kernels, layout, blend, extras);
     let mut cuts = vec![];
     // T1 to T8 are planned with the default export options; T9 and on say theirs (a ProRes file, a GIF, a scaler).
@@ -2420,7 +2427,7 @@ fn the_ledger_says_which_refusals_hold_the_compositor_back() {
         "kerf-gpu coverage ledger: the frames the compositor draws and what refuses the rest".to_string(),
         format!("ffmpeg: {version_line}"),
         format!("composite colour policy: {policy:?}"),
-        format!("grade kernels: {kernels:?}; text layout: {layout:?} (caps: Compositor::caps_for(grade::kernels()) once text::model() has probed, as the app asks)"),
+        format!("grade kernels: {kernels:?}; text layout: {layout:?}; placement: {placement:?}; planar conversion: {conversion:?} (caps: Compositor::caps_for(grade::kernels()) once text::model(), placement_probe::placement() and conversion::conversion() have probed, as the app asks)"),
         format!("blend kernels [BT.601, BT.709]: {blend:?}; extras (BT.2020, RGB pictures): {extras:?}"),
         "plans: every output frame of every archetype over OriginalMedia at 540 px wide (the app's preview plans ProxyMedia at 960); nothing is rendered".to_string(),
         "archetypes: the review's T1 to T3, the real-world T4 to T8 and T9 to T24, which between them use every feature the editor offers that still refuses (tests/coverage.rs)".to_string(),
@@ -2494,6 +2501,7 @@ fn every_variant() -> Vec<Unsupported> {
         Unsupported::KeyedZoom(layer()),
         Unsupported::KeyedPlacement(layer()),
         Unsupported::Rotation(layer(), ""),
+        Unsupported::PlacedFormat(layer(), String::new()),
         Unsupported::Behavior(layer()),
         Unsupported::ZoomBehind(layer(), ""),
         Unsupported::FoldedFit(layer(), ""),
@@ -2553,23 +2561,24 @@ fn ordinal(u: &Unsupported) -> usize {
         Unsupported::StillMotion(_) => 34,
         Unsupported::KeyedZoom(_) => 35,
         Unsupported::KeyedPlacement(_) => 36,
-        Unsupported::Behavior(_) => 37,
-        Unsupported::ZoomBehind(..) => 38,
-        Unsupported::FoldedFit(..) => 39,
-        Unsupported::Text => 40,
-        Unsupported::TextWithoutFont => 41,
-        Unsupported::TextSequence(_) => 42,
-        Unsupported::Svg => 43,
-        Unsupported::Scaler(_) => 44,
-        Unsupported::MatrixUnknown(_) => 45,
-        Unsupported::MixedMatrices => 46,
-        Unsupported::UnmeasuredPolicy(_) => 47,
-        Unsupported::RgbInStack(_) => 48,
-        Unsupported::GradedInFullRangeStack(_) => 49,
-        Unsupported::Shrink(..) => 50,
-        Unsupported::FormatResize(..) => 51,
-        Unsupported::Geometry(..) => 52,
-        Unsupported::Rotation(..) => 53,
+        Unsupported::PlacedFormat(..) => 37,
+        Unsupported::Behavior(_) => 38,
+        Unsupported::ZoomBehind(..) => 39,
+        Unsupported::FoldedFit(..) => 40,
+        Unsupported::Text => 41,
+        Unsupported::TextWithoutFont => 42,
+        Unsupported::TextSequence(_) => 43,
+        Unsupported::Svg => 44,
+        Unsupported::Scaler(_) => 45,
+        Unsupported::MatrixUnknown(_) => 46,
+        Unsupported::MixedMatrices => 47,
+        Unsupported::UnmeasuredPolicy(_) => 48,
+        Unsupported::RgbInStack(_) => 49,
+        Unsupported::GradedInFullRangeStack(_) => 50,
+        Unsupported::Shrink(..) => 51,
+        Unsupported::FormatResize(..) => 52,
+        Unsupported::Geometry(..) => 53,
+        Unsupported::Rotation(..) => 54,
     }
 }
 
@@ -2585,6 +2594,9 @@ fn why_unreached(
     match kind {
         "motion" | "fade" | "travel" | "tail" | "keyed_opacity" | "keyed_color" | "keyed_zoom" | "mask" | "text" => {
             "drawn: Compositor::CAPS has the ability, so a plan never reports it"
+        }
+        "keyed_placement" if kerf_gpu::placement_probe::measured() == kerf_gpu::placement_probe::Placement::Match => {
+            "drawn: this FFmpeg places a picture as the model does (placement_probe), so a plan never reports it"
         }
         "no_picture" => {
             "unreachable: the project keeps an audio-only asset off a video track, and a probe states a video stream's size"

@@ -11,7 +11,7 @@ Windows) and nothing may depend on an optional wgpu feature. **A GPU failure is 
 error, not a panic**: every unit of wgpu work runs in out-of-memory / validation /
 internal error scopes (`Gpu::guarded`), anything uncaptured is logged and remembered,
 `Compositor::new` and `composite` return `Result` (and `Compositor::caps()` says what it
-draws, `GpuCaps::A0` plus `text`, `motion`, `fades`, `transitions`, `dip_white`, `keyed_zoom`, `keyed_opacity`, `keyed_color`, `mask`, `grade` (every kind, where `grade::measured()` says this FFmpeg's conversions are the model's: `Compositor::caps()` drops it otherwise), `blend` (the modes `blend::measured()` says this FFmpeg draws as the model does, both matrices) and the blur / sharpen / grayscale / invert / vignette / chroma key `effects` today, which `composite` / `render_plan` judge the plan by), and a lost device is tracked — every
+draws, `GpuCaps::A0` plus `text`, `motion`, `fades`, `transitions`, `dip_white`, `keyed_zoom`, `placement` (with `behaviors`: where `placement_probe::measured()` says this FFmpeg's `pad`, `perspective` and `crop` place a picture as the model does; `Compositor::caps()` drops both otherwise), `keyed_opacity`, `keyed_color`, `mask`, `grade` (every kind, where `grade::measured()` says this FFmpeg's conversions are the model's: `Compositor::caps()` drops it otherwise), `blend` (the modes `blend::measured()` says this FFmpeg draws as the model does, both matrices) and the blur / sharpen / grayscale / invert / vignette / chroma key `effects` today, which `composite` / `render_plan` judge the plan by), and a lost device is tracked — every
 later call is `GpuError::DeviceLost` and the **owner builds a new `Gpu` and
 `Compositor`** (the device is not recreated behind the caller's back).
 **A blend mode is drawn** (`GpuCaps::blend`, below: "Blend modes") for a layer at its own size, upright or turned by a quarter, opaque and not letterboxed, over an even frame, and
@@ -503,7 +503,7 @@ What the parity harness forced, all recorded in `kerf-gpu`'s docs and shaders:
   clip that zooms or pans over a cover that hangs over the frame, are one `scale` from the source to the frame times the zoom (and
   Cover no longer crops to the frame first), so the plan refuses them (`Unsupported::FoldedFit`, `core-render-plan.md`) and FFmpeg
   draws the frame. Zooms out under Contain (the PiP cascade: fit, then shrink) and everything with scale 1 and no pan are unchanged,
-  and so are the coverage archetypes (the tutorial's keyed push-ins were never part of it: they are `Unsupported::KeyedPlacement`, see the ledger below). The parity cases follow: `geometry/zoom-off-canvas` and `pip/cover-then-scale` are held
+  and so are the coverage archetypes (the tutorial's keyed push-ins were refused as `Unsupported::KeyedPlacement` until the placement pass, see the ledger below). The parity cases follow: `geometry/zoom-off-canvas` and `pip/cover-then-scale` are held
   as refusals (with `geometry/pan-off-canvas` and `pip/contain-then-scale` keeping what they drew), and the grid cases
   `cover-odd-*-then-scale` are refused the same way. **Not run where this was written (no Vulkan adapter, no lavapipe)**: the refusals
   are plan-level and unit-tested in kerf-core (`planner.rs`, `render_plan.rs`) and the coverage test ran; the adapter suites
@@ -604,27 +604,31 @@ full-frame, even rectangles (480 of its 690 refused frames); its title clips are
 
 **The runtime self-test** (`selftest.rs`, `parity_self_test(&Arc<Gpu>)`). Parity is proven in CI on two FFmpeg
 builds and one software adapter; a user has a third FFmpeg and a real GPU, so the first use of the GPU path
-(the app: `app.md`) draws up to four small frames on the compositor and through that machine's own FFmpeg and holds
+(the app: `app.md`) draws up to five small frames on the compositor and through that machine's own FFmpeg and holds
 them to the harness's **strict limits** (`PSNR_FLAT_MIN` 40 dB, `MAX_FLAT` 8, `PSNR_ALL_MIN` 40, `FLAT_SHARE_MIN`
 0.5, the same edge band: constants and `compare` are copies of `tests/parity.rs`', and
 `the_runtime_self_test_judges_by_the_limits_and_the_comparison_of_this_harness` holds them equal). The frames:
 `fit` (one untagged layer enlarged 4:3: swscale's tables, the final conversion), `pip` (a gradient with a shrunk,
 cropped, 80%-opaque, graded picture-in-picture: the scaler down, `eq`, the opacity round trip, `overlay`) and
 `bt709` (a BT.709-tagged stack: the composite colour policy the plan was given, which is how 6 and 9 differ) and
-`grade` (a 640x360 untagged clip through a 5^3 LUT, curves and wheels: the x86 conversion kernels of this machine's FFmpeg, which is what `grade::kernels()` also asks).
+`grade` (a 640x360 untagged clip through a 5^3 LUT, curves and wheels: the x86 conversion kernels of this machine's FFmpeg, which is what `grade::kernels()` also asks) and
+`place` (a clip whose zoom and position are keyed, at a moment inside the move: `pad`, `perspective` and `crop`). **The placed frame is drawn only where `placement_probe::placement()` is `Match`**
+(the plan refuses a moving zoom otherwise, so there is no frame; `placement_for_selftest()` holds the placement back on an `Unknown` that survives a second try after the backoff, through the shared `measure::checked` (the grade is held back the same way, without the second try); `run` takes the answer as a parameter, and
+`a_machine_whose_conversions_differ_or_are_unknown_is_checked_on_the_other_three_frames` rehearses `Differs` and `Unknown` for both). `a_compositor_that_did_not_move_the_picture_would_fail_the_placed_frame`
+holds that the frame has teeth: the same clip drawn without its keys fails the check's limits.
 **The grade's frame is drawn only where `grade::kernels()` is `Match`**: the plan refuses a graded layer otherwise (`Compositor::caps()`, below), so there is no frame to draw, and a self-test that tried to would stop on `Inconclusive` ("the plan refuses its own check frame") and close the whole GPU path on a machine whose FFmpeg merely differs (an arm64 build, or a probe that timed out) even for ungraded frames. `parity_self_test` asks `kernels_for_selftest()` first, makes no graded clip, and the other three decide the check; `run` takes the answer as a parameter (`a_machine_whose_conversions_differ_or_are_unknown_is_checked_on_the_other_three_frames`: `Differs` and `Unknown` pass on `fit`, `pip`, `bt709` alone; the wrong colour policy still fails `bt709`). **A probe that could not tell holds the grade back**: `kernels_for_selftest()` returning `Unknown` sets `held_back` in the probe's state, and while it is set `kernels()` / `measured()` answer `Unknown` without probing, so a probe that succeeds later cannot open a grade the check never looked at; only a later self-test lifts it, and `Check::retry()` re-runs a failed check only, so after a self-test that passed with `Unknown` the grade stays on FFmpeg until the app restarts or the adapter changes. A `Differs` is permanent and holds nothing back.
 No rotation: its float sampling can differ by a level between GPUs for reasons that are not drift. The clips are
 made by that FFmpeg itself (FFV1 in Matroska, three of them in parallel, 480x270, 0.4 s, probed as an import
 probes), the references are `export_still`, the GPU frames come through a private `FrameSource` (`Hint::Scrub`,
 the preview's own), and everything runs the way interactive reads do: thread-capped children (`limit_frame_args`),
 no machine-budget slot, nothing under a project lock; it took 1.9 to 2.7 s on FFmpeg 6.1.1 and 1.0 to 1.2 s on 9.0.2
-on lavapipe with three frames (release build, a loaded 4-core box; `docs/review-2026-10-10/after/gpu-5`), and 3.6 s and 1.7 s with the fourth, the grade (the same box, loaded). The answer is `Ok(report)`, **`SelfTestError::Mismatch`** (the GPU draws something else than this
+on lavapipe with three frames (release build, a loaded 4-core box; `docs/review-2026-10-10/after/gpu-5`), and 3.6 s and 1.7 s with the fourth, the grade (the same box, loaded); with the fifth, the placed frame, and the placement probe it waits for, 4.9 s and 2.8 s in a debug build on a box at a load average near 9 (the placement probe alone 1.7 s and 1.1 s; 5.8 s and 4.0 s at a load average above 20). The answer is `Ok(report)`, **`SelfTestError::Mismatch`** (the GPU draws something else than this
 FFmpeg) or **`Inconclusive`** (an FFmpeg that would not make the clips, a colour policy that could not be
 measured, the plan refusing its own frame, the GPU failing on it, the 90 s deadline). **The deadline is looked at between
 steps** (before the clips and before each case), not inside one: a case begun just before it still runs its reference
 (`export_still`, a 120 s timeout of its own) and a conversion (30 s), so the worst case is about four minutes, during which
 every frame goes through FFmpeg as before. What the app does with the answer is in `app.md`. Measured on lavapipe, both
-FFmpegs: fit 48.8 dB / max 4, pip 46.2 dB / max 6, bt709 49.4 / max 5 on 6.1.1 and 48.6 / 5 on 9.0.2, grade 45.6 dB / max 3 on both; the same GPU
+FFmpegs: fit 48.8 dB / max 4, pip 46.2 dB / max 6, bt709 49.4 / max 5 on 6.1.1 and 48.6 / 5 on 9.0.2, grade 45.6 dB / max 3 on both, place 48.1 dB / max 4 on both (the same clip drawn without its keys: 6.6 dB / max 255); the same GPU
 drawn under the *other* colour policy fails the bt709 frame at 24 dB / 40 to 42 levels (that is the 6-versus-9
 drift the test is for; `a_gpu_drawn_under_the_wrong_colour_policy_fails_it`).
 
@@ -689,18 +693,90 @@ a paused frame inside a transition is drawn like the file shows it — where the
 format=yuva420p, mask, rotate, fades, scale eval=frame` (`video_clip_chain`; `still_clip_chain(.., zoom_last)` for the still): everything
 before the zoom acts at the **fit size** and the zoom magnifies it (a blur grows, a hard mask edge softens).
 
-* **A moving zoom (or a moving position) is refused** (`KeyedPlacement`, no `GpuCaps::placement`): the export and the
-  FFmpeg still now place the picture with a sub-pixel `perspective` after that chain (`engine-cli.md`), which no pass
-  draws, so the zoom-last order below is not reached until one does. `motion_parity.rs`'s zoom cases hold the refusal.
-* **A clip with live behaviours is refused** (`Behavior`, no `GpuCaps::behaviors`; `core-render-plan.md`): sway / spin / breathe / drift / shake
-  are a formula of the clip's clock added to its pose, and the plan's `transform` is the exact pose they give at the frame (so a compositor
-  that draws a keyed rotation or placement could draw it), but no case in `motion_parity.rs` holds one, so no pass claims it. A sway or spin
-  is a rotation a behaviour moves, which the plan refuses (`Unsupported::Rotation`, "Rotation" below); a breath, drift or shake is also a moving position / zoom and is refused as above.
-* The compositor draws that order (`LayerLook::zoom_last`: `animated.zooms` and two scale stages). Stage 0 is the fit scale with the `eq` tables in
-  its vertical pass; the effects, the mask plane and the fades (`fs_fade`: Y, U, V and the alpha) run on the fit-size planes; **stage 1 scales four
-  planes** (swscale scales alpha like luma, identically on both FFmpegs). A zoom that holds still keeps the old order.
-* Refused whatever the caps (`ZoomBehind`): a rotation and an opacity below 1 (the rotated alpha and the RGB round trip would scale with the zoom), and
-  a dip to white (the zoom's `scale` takes the RGB frame the fade leaves and converts it in the same pass: up to 14 levels off on 6.1.1, 3 on 9.0.2).
+* **A moving zoom or position is drawn by the placement pass** (`GpuCaps::placement`; see "The placement" below): the export and the
+  FFmpeg still end such a clip's chain in `pad`, `perspective` and `crop`, and the compositor reproduces those after everything else
+  at the fit size. A layer is still refused (`ZoomBehind`) when a rotation, an opacity below 1 or a dip to white is ahead of
+  it, for a moving position as for a moving zoom, for an odd-height picture or a pose out of the table's range (`Geometry`), for a layer that is not
+  4:2:0 or gray (unless the probe says the graph converts 4:4:4 and 4:2:2 as the decode does: `GpuCaps::placed_chroma`), or may be full range where the
+  composite's range is negotiated (`PlacedFormat`, below), and for a letterboxed picture at the identity pose in a still (`Geometry`: the still pads it to
+  the whole frame first, with opaque bars). **A grade ahead of the placement is drawn** (where the compositor draws the grade at all: `GpuCaps::grade`, which
+  the conversion probe gates): all twelve grades of the harness (wheels, curves, LUTs of 17, 33 and 2 points, all three) are exact behind a moving zoom and a
+  moving position on 6.1.1 and 9.0.2, in an export frame and in a still.
+* **Live behaviours** (`GpuCaps::behaviors`; `core-render-plan.md`): breathe, drift and shake are a formula of the clip's clock added to its pose, the plan's
+  `transform` is the exact pose they give at the frame (`Clip::transform_at`, the arithmetic of the graph's expressions, `sin` / `cos` included), and the
+  placement draws that pose: held exactly in export frames and stills (`behavior/*`: each alone, all three, over a keyed zoom). A sway or a spin turns the
+  picture (a keyed rotation, which no pass draws to the sample: the rotated edge is a stair in FFmpeg and a float sample here; the plan names it `Unsupported::Rotation` too, "Rotation" below), so `Behavior` stays for them
+  whatever the caps.
+* The compositor draws that order (`LayerLook::placed`: `animated.places`, a geometry that ends at the fit-size picture). Stage 0 is the fit
+  scale with the `eq` tables in its vertical pass; the effects, the mask plane and the fades (`fs_fade`: Y, U, V and the alpha) run on the
+  fit-size planes; the placement then reads the four planes. A zoom that holds still keeps the old order (a `scale` ahead of the rest).
+* Refused whatever the caps (`ZoomBehind`): a rotation and an opacity below 1 (the placement would act on the rotated alpha or the RGB round
+  trip, neither of which a case holds to FFmpeg's), and a dip to white (`fade c=white` converts the picture to RGB and back
+  around the fade; no case holds the placement behind it).
+
+**The placement** (`kerf_core::perspective`, `src/placement.rs`, `shaders/placement.wgsl`, `Compositor::place_planes`; `tests/placement.rs`).
+FFmpeg ends the chain of a clip whose zoom or position moves in `format=yuva420p, pad, perspective=interpolation=linear[:eval=frame], crop`
+(`engine::cli::placement_chain`, the export, the stream and the still alike), and every sample of that is integer or `f64` arithmetic that is
+reproduced exactly:
+
+* **`pad`** adds a margin of `2*ceil(max(0, cw-iw)/4)+2` samples on each side (so the canvas fits and two samples more), in `black@0`: Y 16, U = V = 128, alpha
+  0. Its output width and the picture it copies are rounded down to even (`ff_draw_round_to_sub`), the right border is drawn from the even width
+  (**an odd width loses its last column, on every build**), and `crop` takes the canvas from `2*floor((W-cw)/4)`. **An odd height is refused**
+  (`Geometry`): `pad` draws its bottom bar over the last row only when it pads in place, which depends on how the graph allocated the frame, and
+  the builds differ (`color=size=6x5` padded in place: 4 rows on 4.4.2, 5 on 9.0.2; copied, 3 of 3 on both).
+* **`perspective`** is `pv[x + y*w] = lrint(256 * (x0*x + x1*y + x2) / (x6*x + x7*y + x8))` for every pixel, in `f64`, from nine numbers built from the
+  four corners the expressions evaluate to (`PlacementFrame::corners`: `(edge + 0.5 - crop - centre) / s + dim/2 - 0.5` in the order the text writes it,
+  `centre = canvas/2 + pos*canvas`, `pos` the plan's pose plus a slide's or push's travel: `RenderPlan::pose`). The corners are an axis-aligned rectangle,
+  so `x6` and `x3` are exactly zero and `v` depends on the row alone; `x1` and `x7` are zero or **rounding noise** (`(x0 - x1) - x0 + x1` is not 0 in
+  `f64`), under which `u` is the column's unless the noise carries it across a rounding boundary. `PlacementMap::new` takes one table per axis
+  (`canvas.0 + canvas.1` entries) when the value at the window's first and last row, widened by 1e-6 + 1e-12 of itself, rounds to one integer, and
+  the filter's whole table, pixel by pixel (`PlacementMap::exact`), otherwise; unit tests hold the first to the second over 4000 random poses and the
+  structured ones whose positions can sit on a tie. A pose whose positions pass 2^21 samples (`lrint` leaves 32 bits) is refused in the plan.
+* **`resample_linear`** reads the entry of a sample's top-left luma pixel (chroma `>> 1`, no half-sample centring), splits it into a whole part and 8 bits of
+  fraction, and mixes four neighbours with integer weights, `(sub_v_inv * (sub_u_inv * a + sub_u * b) + sub_v * (...) + 2^15) >> 16`. The filter's two
+  edge branches each ignore the fraction of the axis they clamp; clamping each tap to the frame gives the same number (a clamped pair is one sample).
+  The alpha plane is resampled like luma, so the fringe where the picture meets the pad is a ramp of alpha *and* of Y towards 16.
+* **`PlacedFormat`** (kind `placed_format`): the chain converts the picture to `yuva420p` itself, at its head, where the compositor's decode converted it to 8-bit
+  limited-range 4:2:0 ahead of the graph. The two are the same arithmetic where the picture is already 4:2:0 (8 and 10 bit, any matrix tag, gray: held exactly on
+  both builds), and are not elsewhere: a **4:4:4 picture's chroma is 24 levels off on 4.4.2 and a 4:2:2 one's 16**, exact on 6.1.1 and 9.0.2. The cause is the `scale`
+  filter's own default: **4.4.2's `flags` default is `bilinear`** (`vf_scale.c`; 6.1.1's is empty, which is swscale's bicubic), and the graph's conversion is that
+  filter's where the decode's is the CLI's simple graph, bicubic (the standalone conversion and the standalone placement are both exact on 4.4.2). So **the
+  4:4:4 / 4:2:2 refusal is lifted by a measurement, not a version** (`kerf_gpu::conversion`, `GpuCaps::placed_chroma`, set by `Compositor::caps()` once the probe
+  has said `Match`): one tiny `testsrc2` picture of each format through the decode's conversion and through the graph's (`scale ... , format=yuva420p`, the
+  chain's own head), compared plane by plane; `Differs` (4.4.2: 774 samples, max 20) or `Unknown` (FFmpeg would not run: retried after a backoff, never cached)
+  leaves them refused. `prepare(plan)` runs it ahead of a plan with such a layer. Only 8-bit planar `yuv444p` and `yuv422p` are lifted: **RGB** and the rest of the
+  family (4:4:0, 4:1:1, 12 bit, packed) were not measured and stay refused. A **full-range** picture (`yuvj420p`, 10-bit flagged `pc`, or one whose range is not
+  recorded) is **3 to 5 levels off in a still on 9.0.2** (4:4:4 and 4:2:2 flagged `pc`: 5 to 8; exact on 4.4.2) and stays refused where the composite's range is negotiated (`policy != FixedBt601`), **the lifted 4:4:4 and 4:2:2 included**. An asset probed before the range flag was recorded (`color_range` `None`) may be full range without saying so, which the plan cannot know and the file can: where the range is negotiated, `placement_of` reads the file's answer **from the cache alone** (`kerf_core::source_is_full_range_known`, `ProbeCache::peek`: it spawns nothing and does not wait for a probe under way) and refuses a `pc` one at the render (`GpuError::Unsupported`), and a file with no answer yet (not asked ahead, being asked, the probe failed or said nothing usable: `None`, never a guess); a layer whose asset recorded its range costs nothing. **The session-level decisions see that refusal before the frame does** (`GpuCaps::file_range`, which `Compositor::session_caps()` and `session_caps_for` set: the caps of a span, which a play session's `begin_play` / `ahead` rescans / `ready_play` and the primer take from the compositor and the render bar from `session_caps_for(grade::measured())`; `caps()`, `caps_for`, `Compositor::CAPS` and so the compositor's own entry points do not): with it `RenderPlan::reasons` reads the same cache for a placed layer with no recorded range under a negotiating policy and refuses (`PlacedFormat`, "full-range ... its asset did not record it" or "of a range its asset did not record and its file has not said") a file that is full range or that has no answer, so a play session's `cut.ahead`, `resume`, the primer and the render bar hand such a span to the stream up front instead of a session starting on the GPU and handing over a frame into it. The entry points that ask do so first: `prepare_ahead` (session start, resume, primer), `prepare`, and `prepare_ranges(plan)`, the range part alone, which the render bar calls on its plans through `BarRequest::ask` (once for each set of layers on screen, by file and by whether it is placed, not once a frame: a clip split in two with a moving zoom on its second half only is one file asked about from there; `get_render_bar` passes `kerf_gpu::prepare_ranges`). The compositor's own entry points judge by `caps()` (`file_range` off), because the decode is what asks the file for the frame it draws and `placement_of`'s check follows it with its own reasons (the parity harness gates its frames by `plan.reasons(&compositor.caps(), ..)` before any `prepare`, and a cold file must still be drawn); `file_range` is `false` in `GpuCaps::A0`, so every other host and test judges a plan that is a pure function of its inputs (`render_plan.rs`: `a_placed_layer_with_no_recorded_range_is_judged_by_the_files_answer_only_where_the_host_asks_it`). A running session's rescan (`PlaySession::ahead`, every 0.5 s over 5 s) asks the files of the part of the horizon that has come into view with `kerf_gpu::prepare_ranges_ahead(&cut, from, horizon)` (each set of layers once; the session's own thread, off the play lock; a stat for a file already asked, one `ffprobe` for a new one) before it judges the window with `session_caps()`, so a placed clip that enters the horizon later is not refused for a range nobody has asked yet. **The render never probes; `prepare(plan)` does, ahead of it** (and `prepare_ahead(&cut, from, horizon)` for every frame of a play's horizon, at a session's start and before the horizon scan: `begin_play`, `ready_play`, `make_primed`; `FrameSource::check` asks it too), as it does the placement and conversion probes. The one-shot `Compositor::render_plan` and `composite_yuv` (tests, diagnostics) prepare for themselves; `composite`, the texture renders and the shared / counted composites do not (`tests/checker_a_range.rs` holds the one-shot's answers, `tests/range_warmup.rs` that `composite` refuses a cold file by name without probing it, and draws or refuses it as the file says after `prepare`). **The decode makes the answer exist** (`frame_source::warm_range`, for a placed layer whose asset did not record its range: in `FrameSource::frame`, `check_cursor` and every frame of `MotionFrames::frames`; a `stat` and a cache hit, one `ffprobe` for a file first seen **or replaced since**, the cache being keyed by size and modified time), which is how `render_plan_with` and the play path find it. A file rewritten under a running session is therefore re-asked by its next frame instead of refused until the next session: `tests/motion_parity.rs`'s `checker_a_a_placed_clip_in_an_export_in_parts` re-runs the test binary, whose `media()` rewrites its fixtures in place under the sibling tests (the cause of a `checker_a_a_grade_ahead_of_a_placement_is_the_exports` failure on 9.0.2 that only a full, parallel run showed).
+
+**The probes of a placed layer** share `measure.rs`: a `Verdict` (`Match`, `Differs(where)`, `Unknown`), one `Probe` each holding the answer (kept for good), the retry time and the single flight, `cached(.., timing, probe)` (an `Unknown` is asked again after 30 s and never believed meanwhile), `checked` (the self-test's) and `Budget::ffmpeg(args, input)` (a bounded child through `kerf_core::run_piped_until`: killed at its limit, **no thread joined that a child's descendant can keep alive**).
+  * **One probe at a time.** The render bar, a frame's `prepare`, a play session's primer and the self-test ask for the same answer from different threads, and only the first runs the probe: the others wait on a condition variable for no longer than the probe is bounded to (its deadline and a 0.5 s grace) and take its answer; one that is not answered by then gets `Unknown`, "not yet", and refuses. No lock is held while a child runs (the state is locked to read it and to store the answer), and a probe that panics gives its place up and backs off (`Lead`'s drop) instead of leaving every waiter to time out.
+  * **One deadline for the whole probe** (`Timing { backoff: 30 s, overall, per_run: 20 s }`; `overall` 45 s for the placement probe, 30 s for the conversion probe), shared by all its children through a `Budget`: each child gets the shorter of its own limit and what is left, and a probe that has run out is `Unknown` (it used to be ten sequential runs of 20 s, and four).
+  * **Argv.** A child's argv is the quiet flags, the probe's args and the thread caps of a frame read (`limit_frame_args`, as the grade's and the text's probes take them). The spill is asked of a graph that needs it only (it asks this FFmpeg which spelling it takes, a run of `-h full` of its own) and the child's limit is worked out after it, so the probe's deadline holds. A `-filter_complex` graph over the engine's argv rule (`kerf_core::GRAPH_ARG_MAX`, 8192) goes through a script file (`spill_long_graph`, the engine's own spill), and the placement probe stacks a shape's poses in as many runs as keep each graph under that rule (a run is a stack of two at least; one pose alone is placed without `split` and `hstack`, which take two) (the poses were one 31 KB command line per shape, a kilobyte short of Windows' 32,767); a run's `perspective` is therefore still in its argv, which is what a wrapper that perturbs or cuts off the probe's graph reads (`tests/checker_a_gates.rs`).
+  * **The self-test's hold.** `checked` does not take an earlier failure's backoff (a `prepare` whose probe timed out a moment before) for its verdict: it waits the backoff out and runs the probe, and one that cannot tell is run once more after the backoff, so a transient failure no longer holds the placement back for the session. A probe that cannot tell twice sets `held_back`: `known()` and `cached()` answer `Unknown` without probing until a later self-test that can tell has run (`checker_a_gates`: a probe that succeeds later must not open a placed frame the check never drew). `Check::retry()` (the app) re-runs a failed check only, so after a self-test that passed with the placement held back it stays FFmpeg's until the app restarts or the adapter changes: two failures a backoff apart means FFmpeg could not run a tiny graph twice, and everything else on that machine is failing too. The grade's own hold (`grade::kernels_for_selftest`) is unchanged.
+  Unit-tested without FFmpeg (`measure::tests`: the backoff, six callers one run, a bounded waiter, a panicking probe, the self-test's retry and its wait for a running probe, the spill; `conversion::an_unknown_is_asked_again_after_thirty_seconds_and_a_match_or_a_difference_is_kept`).
+* `placement_probe` (`GpuCaps::placement` and `behaviors`): the **export's own chain text** (`kerf_core::placement_probe_chain`, `placement_chain` joined, both forms: `eval=init`, the still's, and `eval=frame`, the export's) on tiny noise pictures with an alpha plane, every plane held to `placement::reference` with no tolerance: seven shapes (the canvas's size, smaller, larger, an odd width, a thin picture), poses on a rounding tie (the canvas a power of two, so every number is dyadic), non-dyadic ones and ones off the frame, stacked with `hstack` in runs of about ten (each graph within `GRAPH_ARG_MAX`); then a keyed zoom and position with a breath, a drift and a shake over `perspective`'s frame count (`kerf_core::placement_probe_motion`, the clip's `driven_expr` against `Clip::transform_at`: the count's origin, `eval=frame` re-evaluating, the machine's `sin` / `cos` against the app's). About twenty-five short `ffmpeg` runs, each bounded by 20 s and all of them by 45 s; any difference is `Differs` (it names the first case), a run that fails, writes the wrong amount or runs out of the deadline is `Unknown`. 6.1.1 and 9.0.2: `Match`.
+* `conversion` (`placed_chroma`): above; the same `measure` slot and backoff, run on the play path through `prepare_ahead`.
+  (The same default is the likeliest cause of the compositor's scaler being up to 29 levels off swscale on 4.4.2: it follows bicubic.)
+* **Which frame is drawn** (`FpsPick::pinned`, `frame_pick.rs`): a placed clip's chain pins its `fps` (`fps=fps=R:start_time=S`, `keyed_crop_fps`), and with
+  `start_time` the filter rounds each input time **relative to the start**: `slot = round_us(S, fps) + round((pts - round_us(S, tb)) * rate)`, both offsets rounded
+  half away from zero from the microseconds `S * 1e6` truncates to (`vf_fps.c` `config_props`, `read_frame`), shows its first frame from the offset on whatever that
+  frame's own slot (`next_pts` starts there), and ends the stream at the status's own rounding (`update_eof_pts`, no offsets) or at the last frame's offset slot,
+  whichever is later (the status is acknowledged only with one frame left buffered, so the frame before the last is put out until the last one's slot has come). The
+  plain pick (`round(pts * rate)`) differs on every tie: 30 fps footage at 24, 25, 48, 50 or 12 fps, or a start off the stream's ticks (at 24 fps, `start_time=0.37`
+  against `fps=24` after `setpts=PTS-STARTPTS+0.37/TB`: output ticks 10, 14, 18, 22, 26, 30). The unit test runs `vf_fps.c`'s state machine step by step over 4 time
+  bases, 9 rates, 6 starts and 4 speeds, and the rendered one (`picked.rs`, `the_fps_pick_is_the_frame_the_export_renders_for_a_clip_whose_fps_is_pinned_to_its_start`:
+  245 clips, 5 sources x 7 rates x 7 starts / speeds / seeks, through the real export graph) holds it to 6.1.1 and 9.0.2.
+* The compositor draws the four canvas-sized planes (Y, U, V, alpha) and hands them to `compose_exact` as a layer at the origin with a per-sample alpha,
+  `overlay`'s own integer blend. The fades (a clip's own, a dip to black, a dissolve's ramp on the alpha plane or on the opaque one `format=yuva420p` gives
+  a picture) run on the fit-size planes first, as in the chain; the mask is cut at the fit size and placed with the picture.
+* **Held to FFmpeg on both builds**: `tests/placement.rs` (`pad,perspective,crop` over noise with an alpha plane, 144 shapes and poses, every sample), the
+  shader against the model, `motion_parity.rs` (`zoom/*`, `position/*`, `shape/*`, `zoom+*`, the dissolves, dips, slides and pushes into and out of a
+  placed clip, 0 differing samples in every plane of every frame), and `parity.rs` (`a_moving_zoom_is_placed_as_the_still_places_it`: the compositor's planes
+  taken to RGB by FFmpeg itself against the still's PNG, `check_exact`, with a `control/plain` case that holds the harness to an unplaced layer). Where the
+  compositor's **scaler** is also in play ahead of the placement (a Cover fit that resizes, a held zoom that is a `scale`) the bound is the scaler's own
+  (`SCALED`, 1 level); the placement adds nothing to it. On this CPU the system 4.4.2's x86 swscale is further off the port than that at sharp edges
+  (22 levels on the test pattern at a 2:1 shrink, with or without a placement; the pinned 9.0.2 is within the level): a layer the compositor resizes is
+  not exact against that build, placed or not.
 
 **Masks.**
 
@@ -906,8 +982,8 @@ text vs the shaders, 21 grades (every part alone, in pairs, all three, untagged 
   has the list): a layer the compositor's scaler resizes (the scaler's one-level difference goes through the conversions and the tables as 3 levels of luma and 2 of chroma on an
   identity grade over noise, 4 with a gamma or curves: past the bound of 2, so a picture-in-picture, an enlargement, a Cover fit and a letterbox are FFmpeg's), a letterbox (the bars are
   graded and their chroma meets the picture's in the conversion back), an odd side, any picture but 8-bit limited-range `yuv420p` (FFmpeg grades the others in the format it
-  negotiates), a BT.2020 / `fcc` / `smpte240m` tag, a video effect other than a chroma key after the grade, a fade to black or white or a dip to white running on it, a moving zoom
-  last, **a cut that mixes colour matrices under a negotiating policy** (see below), a part the caps do not name. Drawn **with** a grade: a crop that is the canvas, a position on a canvas the picture fits, an opacity (the alpha plane), a mask, a rotation,
+  negotiates), a BT.2020 / `fcc` / `smpte240m` tag, a video effect other than a chroma key after the grade, a fade to black or white or a dip to white running on it,
+  **a cut that mixes colour matrices under a negotiating policy** (see below), a part the caps do not name. Drawn **with** a grade: a moving zoom or position (the placement reads the 4:2:0 planes the grade hands on; all twelve grades are exact behind it on 6.1.1 and 9.0.2, in an export frame and in a still), a crop that is the canvas, a position on a canvas the picture fits, an opacity (the alpha plane), a mask, a rotation,
   a dissolve (its alpha ramp; **a clip's own `fade_in` / `fade_out` is not one**: it is `fade` to black of the picture on whatever track, so it is refused where it runs, on a layer over another track as on the bottom one), a chroma key, an `eq` ahead of it (static and keyed), speed,
   a keyed opacity, a keyed position, and the layers under it.
 * **A cut that mixes colour matrices** (`PlanCanvas::mixed_matrices_cut`, Motion plans only: the cut's video inputs are not all one `PlanStream::matrix()`, the graph's BT.709 label included; an RGB picture is its own business): under `BottomLayerTag` FFmpeg 9 converts the picture the grade
@@ -1024,9 +1100,11 @@ moving zoom frame against FFmpeg's still and export (`bench_a_mask_a_blur_and_a_
 `tests/coverage.rs` plans the review's archetypes (no decode, no adapter), still plans and export frames, and tells how many
 frames a compositor draws before and after fades and transitions (still plans: the captioned 9:16 talking head 96.0% to 100%, the
 same without captions 96.0% to 100%, the 16:9 montage with dissolves, dips and a slide 78.8% to 100%; export frames: 0% to 100% for those, since a Motion plan was
-refused whole). The tutorial with a webcam picture-in-picture is **16.7% in both modes** today: its keyed push-ins are
-`Unsupported::KeyedPlacement` (FFmpeg places the picture with `perspective` at sub-pixel positions, which no pass draws), the clip with a
-mask and a blur included (it is a keyed push-in too: the mask and the blur are drawn, the placement is not). **The readback is bounded**: the
+refused whole). The tutorial with a webcam picture-in-picture was 16.7% in both modes while its keyed push-ins were
+`Unsupported::KeyedPlacement`; with the placement pass it is **100% in both modes** (the clip with a mask and a blur included: the push-in
+is the placement, the mask and the blur are drawn at the fit size ahead of it), and the ledger's total (T1 to T8, 34200 sampled frames) went from 64.6% to 75.6% on 4.4.2 (63.7% to 74.7% on
+the pinned 9.0.2). With T9 to T24 in it (69666 frames, still and motion) the pinned 9.0.2 goes from 43.7% to 51.8% drawn, `keyed_placement` (7.6% of the
+frames alone) gone from (b). **The readback is bounded**: the
 wait for the GPU to finish is `READBACK_TIMEOUT` (30 s), a `GpuError::Readback` rather
 than a caller blocked forever on a wedged device.
 

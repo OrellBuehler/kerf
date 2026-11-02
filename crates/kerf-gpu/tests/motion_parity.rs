@@ -74,6 +74,10 @@ fn compositor() -> &'static Compositor {
         // The grade is in the caps once this FFmpeg's conversions are known to be the model's (the app's `prepare` asks
         // ahead of a frame): the harness measures them once, up front, and its grade cases hold the answer to `Match`.
         let _ = kerf_gpu::grade::kernels();
+        // ... and whether this FFmpeg converts a 4:4:4 / 4:2:2 picture in a graph as the decode does (a placed one).
+        let _ = kerf_gpu::conversion::conversion();
+        // ... and whether this FFmpeg places a picture as the model does (the moving zoom and position are in the caps only then).
+        let _ = kerf_gpu::placement_probe::placement();
         // ... and so is the layout of its `drawtext`, which decides whether text whose bitmaps share samples is drawn.
         let _ = kerf_gpu::text::model();
         // ...and the blend chain's, which the blend modes are in the caps by.
@@ -208,6 +212,11 @@ fn media() -> &'static Media {
         // GOP, four seconds so that a clip cut from the middle has a handle either side for a tail.
         let video = |name: &str, lavfi: &str| -> PathBuf {
             let p = dir.join(name);
+            // Written beside it and renamed over it: `checker_a_a_placed_clip_in_an_export_in_parts` runs this binary again,
+            // whose `media()` makes these files while the sibling tests read them, and a file rewritten in place is seen
+            // truncated and half-written, then with the size and time of nothing that was probed (a rename leaves a reader
+            // the file it opened and gives the next one the whole new one).
+            let part = dir.join(format!("{name}.{}.part.mp4", std::process::id()));
             ffmpeg(&[
                 "-f",
                 "lavfi",
@@ -223,8 +232,9 @@ fn media() -> &'static Media {
                 "10",
                 "-pix_fmt",
                 "yuv420p",
-                p.to_str().unwrap(),
+                part.to_str().unwrap(),
             ]);
+            std::fs::rename(&part, &p).expect("move the finished clip into place");
             p
         };
         let untagged = "setparams=colorspace=unknown:color_primaries=unknown:color_trc=unknown";
@@ -701,9 +711,10 @@ fn check_motion(check: Check) -> (i32, i32) {
 }
 
 /// A moving zoom or position: the export places the picture on the canvas at sub-pixel positions
-/// (a `perspective`), which no compositor pass draws, so its frames are refused.
+/// (a `perspective`), which the compositor reproduces (`kerf_core::perspective`, `placement.wgsl`): exact,
+/// every plane of every frame.
 fn run_placed(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, secs: f64) {
-    refused(case, tl, assets, &at_fps(fps), upto(secs, fps), "a moving zoom or position");
+    run(case, tl, assets, fps, secs, EXACT);
 }
 
 /// A plan the compositor must refuse, for `reason`, at every frame of the range — with FFmpeg's
@@ -711,6 +722,7 @@ fn run_placed(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, secs: f64) 
 fn refused(case: &str, tl: &Timeline, assets: &[Asset], opts: &ExportOptions, frames: Range<u64>, reason: &str) {
     let planner = Planner::new(tl, assets, opts, PlanRequest::motion(policy())).expect("planner");
     let mut refusals = 0;
+    let mut other = Vec::new();
     for k in frames {
         let plan = planner.at_frame(k).expect("plan");
         let size = plan.size(u32::MAX);
@@ -721,9 +733,14 @@ fn refused(case: &str, tl: &Timeline, assets: &[Asset], opts: &ExportOptions, fr
             .collect();
         if why.iter().any(|r| r.contains(reason)) {
             refusals += 1;
+        } else {
+            other = why;
         }
     }
-    assert!(refusals > 0, "{case}: no frame was refused for `{reason}`");
+    assert!(
+        refusals > 0,
+        "{case}: no frame was refused for `{reason}` (the last frame's reasons: {other:?})"
+    );
     eprintln!("{case:<44} refused for `{reason}` on {refusals} frames, FFmpeg renders them");
 }
 
@@ -874,6 +891,20 @@ fn run(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, secs: f64, limits:
         frames: upto(secs, fps),
         limits,
         look: &look_at(secs, fps),
+        refusing: None,
+    });
+}
+
+/// [`run`] over the output frames `frames`.
+fn run_range(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, frames: Range<u64>, limits: Limits) {
+    check_motion(Check {
+        case,
+        tl,
+        assets,
+        opts: at_fps(fps),
+        frames,
+        limits,
+        look: &[],
         refusing: None,
     });
 }
@@ -1568,7 +1599,16 @@ fn keyframed_position_and_rotation_in_an_export_frame() {
     let mut moving = clip(&m.testsrc, 0.5, 1.5, 0.0);
     moving.keyframes = vec![key(0.0, -0.25, 0.0), key(1.0, 0.25, 0.0)];
     let tl = timeline(vec![vec![under.clone()], vec![moving]], None);
-    run_placed("keyed/position", &tl, &[m.black.clone(), m.testsrc.clone()], 30.0, 1.0);
+    // (The keys hold a scale of 0.5, which is a `scale` ahead of the placement: the compositor's scaler is in
+    // play, a level off swscale's where it resizes. A scale that moves is the placement's own: `placement/*`.)
+    run(
+        "keyed/position",
+        &tl,
+        &[m.black.clone(), m.testsrc.clone()],
+        30.0,
+        1.0,
+        SCALED,
+    );
     // The easing of a segment is the polyline both renderers read (`Clip::transform_at`).
     for (name, easing) in [
         ("ease-in-out", kerf_core::Easing::EaseInOut),
@@ -1600,12 +1640,13 @@ fn keyframed_position_and_rotation_in_an_export_frame() {
             "{name} must change the pose"
         );
         let tl = timeline(vec![vec![under.clone()], vec![eased]], None);
-        run_placed(
+        run(
             &format!("keyed/position {name}"),
             &tl,
             &[m.black.clone(), m.testsrc.clone()],
             30.0,
             1.0,
+            SCALED,
         );
     }
     let mut turning = clip(&m.smooth, 0.5, 1.5, 0.0);
@@ -1695,11 +1736,19 @@ fn a_keyed_opacity_is_the_geq_alpha_of_each_frame() {
         2.0,
         EXACT,
     );
-    // Scaled: the scaler's level, as for any scaled layer; moving, it is placed by the export's `perspective`.
+    // Scaled: the scaler's level, as for any scaled layer; moving, it is placed by the export's `perspective`,
+    // which acts on the faded picture's alpha plane: refused while the opacity is below 1.
     let mut pip = fading(&m.testsrc, vec![key(0.0, 0.2), key(1.0, 0.9)]);
     pip.transform.scale = 0.6;
     pip.set_property_keys(Property::PosX, vec![key(0.0, -0.2), key(1.0, 0.2)]);
-    run_placed("keyed opacity/moving pip", &over_the_bars(pip), &assets, 30.0, 1.0);
+    refused(
+        "keyed opacity/moving pip",
+        &over_the_bars(pip),
+        &assets,
+        &at_fps(30.0),
+        upto(1.0, 30.0),
+        "an opacity below 1",
+    );
     let mut odd = fading(&m.testsrc, vec![key(0.0, 0.5), key(1.0, 0.7)]);
     odd.transform.scale = 0.33;
     run("keyed opacity/odd 211x118", &over_the_bars(odd), &assets, 30.0, 1.0, SCALED);
@@ -2548,6 +2597,53 @@ fn a_keyed_colour_on_a_full_range_picture_is_refused_on_every_frame() {
     );
 }
 
+/// A blend over a moving zoom or position: the placement ends the clip's chain in `pad`, `perspective` and `crop`, and no case holds the blend's
+/// two placements of that picture to FFmpeg's, so every frame of the clip is refused (`BlendMode`) and FFmpeg's; the same clip held still is
+/// drawn, to the sample.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_blended_clip_whose_zoom_or_position_moves_is_ffmpegs() {
+    use kerf_core::BlendMode;
+    let m = media();
+    let assets = [m.bars.clone(), m.testsrc.clone()];
+    let key = |time: f64, scale: f64, pos_x: f64| kerf_core::Keyframe {
+        time,
+        scale,
+        pos_x,
+        pos_y: 0.0,
+        rotation: 0.0,
+        opacity: 1.0,
+        easing: Default::default(),
+    };
+    let blend_refused = refusing("BlendMode", |u| matches!(u, Unsupported::BlendMode(..)));
+    for (what, keys) in [
+        ("zoom", vec![key(0.0, 1.0, 0.0), key(1.0, 1.5, 0.0)]),
+        ("position", vec![key(0.0, 1.0, -0.1), key(1.0, 1.0, 0.1)]),
+        ("zoom and position", vec![key(0.0, 1.0, -0.1), key(1.0, 0.7, 0.1)]),
+    ] {
+        for mode in [BlendMode::Multiply, BlendMode::Screen] {
+            let mut c = clip(&m.testsrc, 0.5, 1.5, 0.0);
+            c.blend_mode = mode;
+            c.keyframes = keys.clone();
+            let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None);
+            run_refusing(
+                &format!("blend/moving {what} {mode:?}"),
+                &tl,
+                &assets,
+                30.0,
+                1.0,
+                EXACT,
+                &blend_refused,
+            );
+        }
+    }
+    let mut still = clip(&m.testsrc, 0.5, 1.5, 0.0);
+    still.blend_mode = BlendMode::Multiply;
+    still.keyframes = vec![key(0.0, 1.0, 0.1), key(1.0, 1.0, 0.1)];
+    let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![still]], None);
+    run("blend/held position Multiply", &tl, &assets, 30.0, 1.0, EXACT);
+}
+
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn a_rotated_layer_fades_on_an_alpha_plane() {
@@ -3098,10 +3194,10 @@ fn a_full_range_picture_is_drawn_as_the_ffmpeg_in_use_converts_its_range() {
 //
 // The export runs a clip with a moving zoom as `crop, fit, setsar, fps, eq, effects, format=yuva420p,
 // mask, rotate, fades`, then places the picture on the canvas at sub-pixel positions (`pad`, a per-frame
-// `perspective`, `crop`: `video_clip_chain`). No compositor pass draws that placement, so every export
-// frame of a moving zoom (or position) is refused (`KeyedPlacement`) and FFmpeg renders it; the cases
-// below hold the plan to that. (The compositor's zoom-last order, `GpuCaps::keyed_zoom`, is the scrubbed
-// still's, whose chain still ends in the zoom's `scale`.)
+// `perspective`, `crop`: `video_clip_chain`). The compositor reproduces that placement
+// (`kerf_core::perspective`, `placement.wgsl`), so the cases below are exact: 0 differing samples in every
+// plane of every frame (`run_placed`), but where the scaler is also in play (`SCALED`), a blur (`EFFECT`), and
+// what is refused (a rotation, an opacity below 1, a dip to white or a grade ahead of the placement).
 
 fn zoom_key(time: f64, scale: f64, pos_x: f64, pos_y: f64) -> kerf_core::Keyframe {
     kerf_core::Keyframe {
@@ -3136,7 +3232,7 @@ fn mask_of(shape: kerf_core::MaskShape, feather: f64, inverted: bool) -> kerf_co
 
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
-fn a_moving_zoom_in_an_export_frame_is_refused() {
+fn a_moving_zoom_is_placed_as_the_export_places_it() {
     let m = media();
     let assets = [m.bars.clone(), m.testsrc.clone()];
     // Zoom in (the picture grows past the frame) and out (the layer below shows around it).
@@ -3172,46 +3268,41 @@ fn a_moving_zoom_in_an_export_frame_is_refused() {
     ];
     let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![back]], None);
     run_placed("zoom/three keys", &tl, &assets, 30.0, 1.0);
-    // A zoom that starts late on the timeline, speed 2, reversed.
+    // A zoom that starts late on the timeline, speed 2, reversed: the pose is the clip's own time, whatever
+    // frame of the source the `fps` filter picks for it.
     let mut late = zooming(&m.testsrc, 1.0, 1.4, (0.0, 0.0));
     late.timeline_start = 0.5;
     let tl = timeline(vec![vec![late]], None);
-    refused(
-        "zoom/late start",
-        &tl,
-        &assets[1..],
-        &at_fps(30.0),
-        15..44,
-        "a moving zoom or position",
-    );
+    run_range("zoom/late start", &tl, &assets[1..], 30.0, 15..44, EXACT);
     for (name, speed) in [("speed 2", 2.0), ("reversed", -1.0)] {
         let mut c = zooming(&m.testsrc, 1.0, 1.5, (0.0, 0.0));
         c.source_out = 2.5;
         c.speed = speed;
         c.keyframes = vec![zoom_key(0.0, 1.0, 0.0, 0.0), zoom_key(0.5, 1.5, 0.0, 0.0)];
         let tl = timeline(vec![vec![c]], None);
-        refused(
-            &format!("zoom/{name}"),
-            &tl,
-            &assets[1..],
-            &at_fps(30.0),
-            0..14,
-            "a moving zoom or position",
-        );
+        run_range(&format!("zoom/{name}"), &tl, &assets[1..], 30.0, 0..14, EXACT);
     }
-    // Cover into a frame the footage is scaled to: two scalers in cascade, the second one zooming.
+    // A position alone moves (the zoom keys hold one value, so there is no zoom to place), over bars and
+    // over black.
+    let key = |time: f64, pos_x: f64, pos_y: f64| zoom_key(time, 1.0, pos_x, pos_y);
+    let mut moving = clip(&m.testsrc, 0.5, 1.5, 0.0);
+    moving.keyframes = vec![key(0.0, -0.3, 0.1), key(1.0, 0.25, -0.15)];
+    let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![moving]], None);
+    run_placed("position/over bars", &tl, &assets, 30.0, 1.0);
+    // Cover into a frame the footage is scaled to: the compositor's scaler is in play ahead of the placement,
+    // and it is a level off swscale's where it resizes (`SCALED`); the placement adds nothing to it.
     let tl = timeline(
         vec![vec![zooming(&m.testsrc, 1.0, 1.25, (-0.05, 0.0))]],
         Some(Delivery::new(960, 540, Fit::Cover)),
     );
-    run_placed("zoom/cover 960x540", &tl, &assets[1..], 30.0, 1.0);
+    run("zoom/cover 960x540", &tl, &assets[1..], 30.0, 1.0, SCALED);
     let tl = timeline(
         vec![vec![zooming(&m.testsrc, 1.0, 1.3, (0.0, 0.0))]],
         Some(Delivery::new(360, 640, Fit::Cover)),
     );
-    run_placed("zoom/cover 9:16", &tl, &assets[1..], 30.0, 1.0);
-    // A still image is RGB: FFmpeg scales it in RGB, and any resize of such a picture is refused (the zoom
-    // is one), whatever the frame does after it.
+    run("zoom/cover 9:16", &tl, &assets[1..], 30.0, 1.0, SCALED);
+    // A still image that moves is drawn by FFmpeg in one `perspective` of a copy of the still scaled once
+    // (`StillMotion`), which is not this placement.
     let tl = timeline(vec![vec![zooming(&m.image, 1.0, 1.5, (0.0, 0.0))]], None);
     refused(
         "zoom/still image (rgb)",
@@ -3219,13 +3310,270 @@ fn a_moving_zoom_in_an_export_frame_is_refused() {
         std::slice::from_ref(&m.image),
         &at_fps(30.0),
         upto(1.0, 30.0),
-        "rgb24",
+        "a still whose picture moves",
     );
+}
+
+/// Pictures of other shapes than the frame, at the size the fit leaves them (no resize, so no scaler): a 4:3 clip
+/// in a 16:9 frame (pillarboxed: 480x360), a picture of an odd width (203x360) and one of an odd height (640x203).
+struct Shapes {
+    pillar: Asset,
+    odd_width: Asset,
+    odd_height: Asset,
+    /// 10-bit 4:2:0 tagged limited range: the range is recorded, so nothing about the cut is full range.
+    tenbit_tv: Asset,
+}
+
+fn shapes() -> &'static Shapes {
+    static S: OnceLock<Shapes> = OnceLock::new();
+    S.get_or_init(|| {
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("motion-media-shapes");
+        std::fs::create_dir_all(&dir).unwrap();
+        // (FFV1: x264 rounds an odd side of a 4:2:0 picture down to even, FFV1 keeps it; `testsrc2` makes even
+        // sides, so the picture is cut to the odd size with `crop ... exact=1`.)
+        let make = |name: &str, size: &str| -> Asset {
+            let p = dir.join(name);
+            let want: Vec<u32> = size.split('x').map(|n| n.parse().unwrap()).collect();
+            let source = format!("{}x{}", want[0].next_multiple_of(2), want[1].next_multiple_of(2));
+            ffmpeg(&[
+                "-f",
+                "lavfi",
+                "-i",
+                &format!("testsrc2=size={source}:rate=30:duration=4,crop=w={}:h={}:x=0:y=0:exact=1,setparams=colorspace=unknown:color_primaries=unknown:color_trc=unknown", want[0], want[1]),
+                "-c:v",
+                "ffv1",
+                "-pix_fmt",
+                "yuv420p",
+                p.to_str().unwrap(),
+            ]);
+            let a = probed(&p);
+            let v = a.streams.iter().find(|s| s.kind == StreamKind::Video).expect("a video stream");
+            assert_eq!((v.width, v.height), (Some(want[0]), Some(want[1])), "{name} keeps its size");
+            a
+        };
+        let tenbit_tv = dir.join("tenbit-tv.mp4");
+        ffmpeg(&[
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=640x360:rate=30:duration=4,setparams=colorspace=unknown:color_primaries=unknown:color_trc=unknown",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "ultrafast",
+            "-qp",
+            "0",
+            "-g",
+            "10",
+            "-color_range",
+            "tv",
+            "-pix_fmt",
+            "yuv420p10le",
+            tenbit_tv.to_str().unwrap(),
+        ]);
+        Shapes {
+            pillar: make("pillar.mkv", "480x360"),
+            odd_width: make("odd-width.mkv", "203x360"),
+            odd_height: make("odd-height.mkv", "640x203"),
+            tenbit_tv: probed(&tenbit_tv),
+        }
+    })
+}
+
+/// A picture that is not the frame's shape is the placement's own picture, padded with transparency: the layer
+/// below shows around it, and the zoom moves its edges across the samples (`pad`'s colour mixes into the fringe
+/// the bilinear read makes). An odd width loses its last column to the pad's right border, on every FFmpeg; an odd
+/// height is refused (whether the last row survives depends on how the graph allocated the frame, and the builds differ).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_picture_of_another_shape_is_placed_as_the_export_places_it() {
+    let m = media();
+    let s = shapes();
+    for (name, asset) in [("pillarboxed 480x360", &s.pillar), ("odd width 203x360", &s.odd_width)] {
+        let assets = [m.bars.clone(), asset.clone()];
+        for (case, from, to, pos) in [
+            ("zoom in", 1.0, 1.5, (0.0, 0.0)),
+            ("zoom out", 1.0, 0.6, (0.1, -0.05)),
+            ("pan", 1.0, 1.001, (-0.3, 0.2)),
+        ] {
+            let tl = timeline(
+                vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![zooming(asset, from, to, pos)]],
+                None,
+            );
+            run_placed(&format!("shape/{name}/{case}"), &tl, &assets, 30.0, 1.0);
+        }
+        // Over nothing but black: the transparent surround is the base's black. (In the 16:9 frame: a frame of the
+        // picture's own odd size is one the encoder rounds down, and the fit then resizes it.)
+        let tl = timeline(
+            vec![vec![zooming(asset, 1.0, 0.7, (0.05, 0.05))]],
+            Some(Delivery::new(640, 360, Fit::Contain)),
+        );
+        run_placed(&format!("shape/{name}/alone"), &tl, &assets[1..], 30.0, 1.0);
+    }
+    let tl = timeline(
+        vec![
+            vec![clip(&m.bars, 0.5, 1.5, 0.0)],
+            vec![zooming(&s.odd_height, 1.0, 1.4, (0.0, 0.0))],
+        ],
+        None,
+    );
+    refused(
+        "shape/odd height 640x203",
+        &tl,
+        &[m.bars.clone(), s.odd_height.clone()],
+        &at_fps(30.0),
+        upto(1.0, 30.0),
+        "an odd-height picture",
+    );
+}
+
+/// A picture of another format under a placement. FFmpeg converts it to `yuva420p` itself at the head of the
+/// placement chain, where the compositor's decode converted it to 4:2:0 ahead of the graph, and the two agree where the
+/// picture is already 4:2:0 (8 and 10 bit, limited and full range, any matrix tag) or gray, on both builds. A 4:4:4 or 4:2:2
+/// picture is another matter: the two conversions are swscale's own paths, exact on 9.0.2 and 24 (4:4:4) and 16 (4:2:2) levels
+/// of chroma off on 4.4.2 (measured), so those are refused (`PlacedFormat`) on every build, and so is a picture that may be full
+/// range where the composite's range is negotiated (9.0.2: 3 to 5 levels off in a still). What the composite colour policy
+/// refuses for the cut (a full-range picture on a build that negotiates the range, a mix of matrices) is refused as it always is.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_placed_picture_is_drawn_for_the_formats_both_conversions_agree_on() {
+    let m = media();
+    let v = variants();
+    let s = shapes();
+    let zoom_over = |under: &Asset, asset: &Asset| {
+        (
+            timeline(
+                vec![vec![clip(under, 0.5, 1.5, 0.0)], vec![zooming(asset, 1.0, 1.6, (0.0, 0.0))]],
+                None,
+            ),
+            [under.clone(), asset.clone()],
+        )
+    };
+    let cases: [(&str, &Asset, &Asset); 11] = [
+        ("8-bit", &m.testsrc, &m.bars),
+        ("10-bit, range not recorded", &v.tenbit, &m.bars),
+        ("10-bit tagged tv", &s.tenbit_tv, &m.bars),
+        ("10-bit tagged full range", &v.tenbit_pc, &m.bars),
+        ("gray", &v.gray, &m.bars),
+        ("full-range yuvj420p", &v.mjpeg, &m.bars),
+        ("bt709 over bt709", &v.testsrc709, &v.bars709),
+        ("bt709 over untagged", &v.testsrc709, &m.bars),
+        ("smpte170m", &v.testsrc170m, &m.bars),
+        ("bt470bg", &v.testsrc470bg, &m.bars),
+        ("bt709 under untagged", &m.testsrc, &v.bars709),
+    ];
+    for (name, asset, under) in cases {
+        let (tl, assets) = zoom_over(under, asset);
+        let planner = Planner::new(&tl, &assets, &at_fps(30.0), PlanRequest::motion(policy())).expect("planner");
+        let plan = planner.at_frame(10).expect("plan");
+        let why: Vec<String> = plan
+            .reasons(&compositor().caps(), plan.size(u32::MAX))
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        let case = format!("format/{name}");
+        if why.is_empty() {
+            run_placed(&case, &tl, &assets, 30.0, 1.0);
+        } else {
+            // Only what the composite colour policy says about the cut.
+            let policy_says = [
+                "holds a full-range picture",
+                "different YCbCr matrices",
+                "position on a full-range",
+            ];
+            assert!(
+                why.iter().all(|w| policy_says.iter().any(|p| w.contains(p))),
+                "{case}: refused for something else: {why:?}"
+            );
+            refused(&case, &tl, &assets, &at_fps(30.0), upto(1.0, 30.0), &why[0]);
+        }
+    }
+    // 4:4:4, 4:2:2: drawn where the probe says this FFmpeg converts them in a graph as the decode does (6.1.1, 9.0.2: exact),
+    // refused where it does not (4.4.2's `scale` defaults to bilinear: chroma 24 and 16 levels off), FFmpeg renders them.
+    for (name, asset) in [("yuv444p", &v.yuv444), ("yuv422p", &v.yuv422)] {
+        let (tl, assets) = zoom_over(&m.bars, asset);
+        if compositor().caps().placed_chroma {
+            run_placed(&format!("format/{name}"), &tl, &assets, 30.0, 1.0);
+        } else {
+            refused(
+                &format!("format/{name}"),
+                &tl,
+                &assets,
+                &at_fps(30.0),
+                upto(1.0, 30.0),
+                "a moving zoom or position on a",
+            );
+        }
+    }
+}
+
+/// A live breath, drift or shake is a moving zoom or position whose numbers the graph writes as expressions of time
+/// (`driven_expr`: `sin` and `cos` included) and the plan evaluates in the same arithmetic (`Clip::transform_at`): the placement
+/// is the same pass, so they are drawn, exactly. A sway or a spin turns the picture, which no compositor draws to the sample.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn live_breath_drift_and_shake_are_placed_as_the_export_places_them() {
+    use kerf_core::Behavior as B;
+    let m = media();
+    let assets = [m.bars.clone(), m.testsrc.clone()];
+    let with = |behaviors: Vec<B>| {
+        let mut c = clip(&m.testsrc, 0.5, 1.5, 0.0);
+        c.behaviors = behaviors;
+        timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None)
+    };
+    let breathe = B::Breathe {
+        amount: 0.15,
+        speed: 1.3,
+        phase: 0.2,
+    };
+    let drift = B::Drift {
+        speed: 0.2,
+        angle: 30.0,
+        phase: 0.1,
+    };
+    let shake = B::Shake {
+        amount: 0.03,
+        speed: 2.5,
+        seed: 7,
+        phase: 0.0,
+    };
+    for (name, behaviors) in [
+        ("breathe", vec![breathe]),
+        ("drift", vec![drift]),
+        ("shake", vec![shake]),
+        ("all three", vec![breathe, drift, shake]),
+    ] {
+        run_placed(&format!("behavior/{name}"), &with(behaviors), &assets, 30.0, 1.0);
+    }
+    // Over a zoom that is keyed too, and a clip that starts late (the behaviour's clock is the clip's).
+    let mut keyed = with(vec![breathe, drift]);
+    keyed.tracks[1].clips[0].keyframes = vec![zoom_key(0.0, 1.0, 0.0, 0.0), zoom_key(1.0, 1.4, 0.1, 0.0)];
+    run_placed("behavior/over keyed zoom", &keyed, &assets, 30.0, 1.0);
+    for (name, behaviors) in [
+        (
+            "sway",
+            vec![B::Sway {
+                amount: 5.0,
+                speed: 1.0,
+                phase: 0.0,
+            }],
+        ),
+        ("spin", vec![B::Spin { speed: 0.5, phase: 0.0 }]),
+    ] {
+        refused(
+            &format!("behavior/{name}"),
+            &with(behaviors),
+            &assets,
+            &at_fps(30.0),
+            upto(1.0, 30.0),
+            "live behaviours",
+        );
+    }
 }
 
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
-fn a_moving_zoom_behind_a_grade_mask_fade_or_effect_is_refused() {
+fn a_moving_zoom_is_placed_after_a_grade_mask_fade_or_effect() {
     let m = media();
     let assets = [m.bars.clone(), m.testsrc.clone()];
     let with = |edit: &dyn Fn(&mut Clip)| {
@@ -3259,19 +3607,20 @@ fn a_moving_zoom_behind_a_grade_mask_fade_or_effect_is_refused() {
         let tl = with(&|c| c.mask = Some(mask_of(shape, feather, inverted)));
         run_placed(&format!("zoom+mask {name}"), &tl, &assets, 30.0, 1.0);
     }
-    // The effects: the tables are exact (the scaler's level is all there is); a blur carries the scaler's
-    // level through its own. The fit scale ahead of the effects is the identity here, so a sharpen of any
-    // amount is of the exact picture and only the zoom's scale follows it.
-    for (name, effect) in [
-        ("blur", kerf_core::VideoEffect::Blur { sigma: 4.0 }),
-        ("sharpen", kerf_core::VideoEffect::Sharpen { amount: 1.5 }),
-        ("grayscale", kerf_core::VideoEffect::Grayscale),
-        ("invert", kerf_core::VideoEffect::Invert),
-        ("chroma key", key("green", 0.2, 0.2)),
-        ("vignette", kerf_core::VideoEffect::Vignette),
+    // The effects: the tables, the sharpen, the vignette and the key are exact; a blur is `gblur`'s float
+    // recursion, which FFmpeg itself computes with another association of the same sums on an AVX2 / AVX-512
+    // build (`EFFECT`: 0 to 59 samples in 3.2 million are a level off, on either side of the zoom). The fit
+    // scale ahead of the effects is the identity here, so a sharpen of any amount is of the exact picture.
+    for (name, effect, limits) in [
+        ("blur", kerf_core::VideoEffect::Blur { sigma: 4.0 }, EFFECT),
+        ("sharpen", kerf_core::VideoEffect::Sharpen { amount: 1.5 }, EXACT),
+        ("grayscale", kerf_core::VideoEffect::Grayscale, EXACT),
+        ("invert", kerf_core::VideoEffect::Invert, EXACT),
+        ("chroma key", key("green", 0.2, 0.2), EXACT),
+        ("vignette", kerf_core::VideoEffect::Vignette, EXACT),
     ] {
         let tl = with(&|c| c.effects = vec![effect.clone()]);
-        run_placed(&format!("zoom+{name}"), &tl, &assets, 30.0, 1.0);
+        run(&format!("zoom+{name}"), &tl, &assets, 30.0, 1.0, limits);
     }
     // The tutorial's clip: a feathered mask over a blurred picture, zooming, in a Cover frame.
     let mut c = zooming(&m.testsrc, 1.0, 1.25, (-0.05, 0.0));
@@ -3281,7 +3630,8 @@ fn a_moving_zoom_behind_a_grade_mask_fade_or_effect_is_refused() {
         vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]],
         Some(Delivery::new(960, 540, Fit::Cover)),
     );
-    run_placed("zoom+mask+blur cover 960x540", &tl, &assets, 30.0, 1.0);
+    // (The fit scale to 960x540 is the compositor's, a level off swscale's, and the blur's own level: `EFFECT_SCALED`.)
+    run("zoom+mask+blur cover 960x540", &tl, &assets, 30.0, 1.0, EFFECT_SCALED);
     // Everything at once: grade, an effect, a mask, a fade-in.
     let tl = with(&|c| {
         c.color.contrast = 1.15;
@@ -3289,7 +3639,7 @@ fn a_moving_zoom_behind_a_grade_mask_fade_or_effect_is_refused() {
         c.mask = Some(mask_of(kerf_core::MaskShape::Ellipse, 0.25, false));
         c.fade_in = 0.3;
     });
-    run_placed("zoom+grade+effects+mask+fade", &tl, &assets, 30.0, 1.0);
+    run("zoom+grade+effects+mask+fade", &tl, &assets, 30.0, 1.0, EFFECT);
 }
 
 /// Blur's bound: `gblur` is floating point, and the x86 build runs its horizontal pass in AVX2 /
@@ -3311,7 +3661,7 @@ const EFFECT_SCALED: Limits = Limits { y: 2, uv: 2 };
 
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
-fn a_dissolve_dip_or_slide_into_a_moving_zoom_is_refused() {
+fn a_dissolve_dip_or_slide_into_a_moving_zoom_is_placed() {
     let m = media();
     let assets = [m.bars.clone(), m.testsrc.clone()];
     for (name, mask) in [
@@ -3368,11 +3718,9 @@ fn a_moving_zoom_on_the_outgoing_clip_under_a_transition() {
     }
 }
 
-/// A rotation, an opacity below 1 or a dip to white in front of a moving zoom is the order the compositor
-/// does not have: the rotated picture's alpha (or the RGB round trip) would have to be scaled with the zoom,
-/// and the zoom's `scale` takes the RGB frame `fade c=white` leaves and converts it in the same pass (up to
-/// 14 levels off a draw that scales the converted picture on 6.1.1, 3 on 9.0.2). (Every export frame of a
-/// moving zoom is refused for its placement as well.)
+/// A rotation, an opacity below 1 or a dip to white in front of a moving zoom (or position) is refused: the
+/// placement would have to act on the rotated picture's alpha, or on the RGB round trip's, which neither has a
+/// case that holds it to FFmpeg's.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn a_moving_zoom_behind_a_rotation_or_an_opacity_is_refused() {
@@ -3407,12 +3755,17 @@ fn a_moving_zoom_behind_a_rotation_or_an_opacity_is_refused() {
         },
     ];
     let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![fading]], None);
-    run_placed(
+    run_refusing(
         "keyed opacity + moving zoom (curve holds 1, then falls)",
         &tl,
         &assets,
         30.0,
         1.0,
+        EXACT,
+        &refusing(
+            "ZoomBehind(an opacity below 1)",
+            |u| matches!(u, Unsupported::ZoomBehind(_, what) if what.contains("opacity")),
+        ),
     );
     let out = clip(&m.bars, 0.5, 1.5, 0.0);
     let mut inc = zooming(&m.testsrc, 1.0, 1.4, (0.0, 0.0));
@@ -4814,11 +5167,11 @@ fn what_the_compositor_does_not_draw_of_a_grade_is_refused() {
         0..60,
         "fade to black or white",
     );
-    // A moving zoom behind the grade.
+    // A moving zoom behind the grade: the placement reads the 4:2:0 planes the grade hands on.
     let (tl, a) = one(&m.testsrc, &|c| {
         c.keyframes = vec![zoom_key(0.0, 1.0, 0.0, 0.0), zoom_key(1.0, 1.4, 0.0, 0.0)];
     });
-    refused("grade/moving zoom", &tl, &a, &at, frames.clone(), "a grade");
+    run_range("grade/moving zoom", &tl, &a, 30.0, frames.clone(), EXACT);
     // A matrix with no measured round trip.
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("motion-media-grade");
     std::fs::create_dir_all(&dir).unwrap();
@@ -4908,14 +5261,22 @@ fn a_graded_layer_is_keyed_in_opacity_and_position_over_another_and_its_fades_ar
     c.set_property_keys(Property::PosX, vec![key(0.0, 0.3), key(1.0, 0.3)]);
     c.set_property_keys(Property::PosY, vec![key(0.0, -0.2), key(1.0, -0.2)]);
     run("grade/keyed position, held", &over(c), &assets, 30.0, 1.0, EXACT);
-    // One that moves is placed by the export's `perspective`, refused; with the opacity too.
+    // One that moves is placed by the export's `perspective` after the grade: the placement reads the planes the grade
+    // hands on, exact; with a keyed opacity below 1 it is the alpha plane's RGB round trip that is not drawn behind it.
     let mut c = graded(&heavy);
     c.set_property_keys(Property::PosX, vec![key(0.0, -0.1), key(1.0, 0.1)]);
     run_placed("grade/keyed position", &over(c), &assets, 30.0, 1.0);
     let mut c = graded(&heavy);
     c.set_property_keys(Property::Opacity, vec![key(0.0, 0.3), key(1.0, 0.9)]);
     c.set_property_keys(Property::PosX, vec![key(0.0, -0.1), key(1.0, 0.1)]);
-    run_placed("grade/keyed opacity and position", &over(c), &assets, 30.0, 1.0);
+    refused(
+        "grade/keyed opacity and position",
+        &over(c),
+        &assets,
+        &at_fps(30.0),
+        upto(1.0, 30.0),
+        "an opacity below 1",
+    );
 
     // Its own fade-in and fade-out, on a layer over another track: refused where they run, drawn after and before.
     let mut c = graded(&heavy);
@@ -9965,4 +10326,1621 @@ fn checker_e_r4_what_the_matrix_allow_list_costs() {
         }
     }
     eprintln!("allow-list cost: {necessary} cut(s) where the refusal is necessary, {wider} where this FFmpeg draws it as the control, {none} FFmpeg cannot export");
+}
+
+// ---- checker/a: keyed placement, cases the implementer did not write ------------------------------------------
+//
+// The independent check of work package A. Every case compares the planes of every drawn frame with the export's, to the
+// sample (no bound), and never edits a case above. `checker_motion` returns what it saw instead of asserting so that a case can
+// say which frames the plan refused (and why), and so that the refusals can be drawn anyway when the compositor is patched
+// to allow it (`KERF_CHECKER_ANYWAY`, see `checker_a_refusals_drawn_anyway`).
+
+/// Pictures of 512x256 at 32 frames a second: a power-of-two canvas whose half-sample positions are dyadic rationals, and a
+/// frame time (`k / 32`) that `f64` holds exactly, so a position can sit exactly on a rounding tie.
+struct CheckerMedia {
+    noise: Asset,
+    testsrc: Asset,
+    bars: Asset,
+    /// The test pattern tagged BT.2020 (non-constant luminance) and BT.709.
+    testsrc2020: Asset,
+    testsrc709: Asset,
+}
+
+fn checker_media() -> &'static CheckerMedia {
+    static M: OnceLock<CheckerMedia> = OnceLock::new();
+    M.get_or_init(|| {
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-a-media");
+        std::fs::create_dir_all(&dir).unwrap();
+        let video = |name: &str, lavfi: &str| -> Asset {
+            let p = dir.join(name);
+            ffmpeg(&[
+                "-f", "lavfi", "-i", lavfi, "-c:v", "libx264", "-preset", "ultrafast", "-qp", "0", "-g", "8", "-pix_fmt", "yuv420p",
+                p.to_str().unwrap(),
+            ]);
+            probed(&p)
+        };
+        let untagged = "setparams=colorspace=unknown:color_primaries=unknown:color_trc=unknown";
+        CheckerMedia {
+            noise: video(
+                "noise.mp4",
+                "nullsrc=size=512x256:rate=32:duration=4,format=yuv420p,geq=lum='random(1)*255':cb='random(2)*255':cr='random(3)*255'",
+            ),
+            testsrc: video("testsrc.mp4", &format!("testsrc2=size=512x256:rate=32:duration=4,{untagged}")),
+            bars: video("bars.mp4", &format!("smptehdbars=size=512x256:rate=32:duration=4,{untagged}")),
+            testsrc2020: video(
+                "testsrc2020.mp4",
+                "testsrc2=size=512x256:rate=32:duration=4,setparams=colorspace=bt2020nc:color_primaries=bt2020:color_trc=bt2020-10",
+            ),
+            testsrc709: video(
+                "testsrc709.mp4",
+                "testsrc2=size=512x256:rate=32:duration=4,setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709",
+            ),
+        }
+    })
+}
+
+/// What a run of `checker_motion` saw.
+#[derive(Default)]
+struct Seen {
+    drawn: usize,
+    /// Frames the plan (or, under `anyway`, the compositor) refused, with the first reason.
+    refused: Vec<(u64, String)>,
+    /// Frames whose planes differ from the export's: `(frame, plane, differing samples, max difference, first (x, y))`.
+    off: Vec<Off>,
+}
+
+/// A plane that differs: `(frame, plane, differing samples, max difference, first (x, y))`.
+type Off = (u64, &'static str, usize, i32, (usize, usize));
+
+impl Seen {
+    fn line(&self, case: &str) -> String {
+        let why: std::collections::BTreeSet<&str> = self.refused.iter().map(|(_, w)| w.as_str()).collect();
+        format!(
+            "{case:<56} drawn {:>3} frames, {} differ | refused {:>3}{}",
+            self.drawn,
+            self.off.iter().map(|o| o.0).collect::<std::collections::BTreeSet<_>>().len(),
+            self.refused.len(),
+            if why.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", why.into_iter().collect::<Vec<_>>().join(" | "))
+            }
+        )
+    }
+}
+
+/// Plan and draw frames `frames` of `tl`, compare each drawn one with the export's planes **exactly**. With `anyway` the
+/// compositor is asked for a frame the plan refuses too (it answers only if the refusal has been patched out of the build).
+fn checker_motion(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, frames: Range<u64>, anyway: bool) -> Seen {
+    checker_motion_as(case, tl, assets, assets, fps, frames, anyway)
+}
+
+/// [`checker_motion`] where the plan is made from `plan_assets` (what the plan is told of the footage) and the export from
+/// `assets` (the footage): a way to draw a frame the plan refuses for what it knows of a stream, without a patch.
+fn checker_motion_as(
+    case: &str,
+    tl: &Timeline,
+    assets: &[Asset],
+    plan_assets: &[Asset],
+    fps: f64,
+    frames: Range<u64>,
+    anyway: bool,
+) -> Seen {
+    checker_motion_with(case, tl, assets, plan_assets, &at_fps(fps), frames, anyway)
+}
+
+/// [`checker_motion_as`] with the export's options (a range, a rate).
+fn checker_motion_with(
+    case: &str,
+    tl: &Timeline,
+    assets: &[Asset],
+    plan_assets: &[Asset],
+    opts: &ExportOptions,
+    frames: Range<u64>,
+    anyway: bool,
+) -> Seen {
+    let slug: String = case
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let opts = opts.clone();
+    let played = export(&slug, tl, assets, &opts);
+    assert!(
+        played.count() as u64 >= frames.end,
+        "{case}: the export has {} frames, the case looks at {}",
+        played.count(),
+        frames.end
+    );
+    let planner = Planner::new(tl, plan_assets, &opts, PlanRequest::motion(policy())).expect("planner");
+    let size = (played.w as u32, played.h as u32);
+    let mut motion = MotionFrames::new(frame_source());
+    let mut seen = Seen::default();
+    for k in frames {
+        let plan = planner.at_frame(k).expect("plan");
+        let why = plan.reasons(&compositor().caps(), size);
+        if !why.is_empty() && !anyway {
+            seen.refused
+                .push((k, why.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ")));
+            continue;
+        }
+        let picture = motion.frames(&plan).unwrap_or_else(|e| panic!("{case}: frame {k}: {e}"));
+        let drawn = match compositor().composite_yuv_counted(&plan, &picture, motion.counts(), size) {
+            Ok(d) => d,
+            Err(kerf_gpu::GpuError::Unsupported(w)) if anyway => {
+                seen.refused.push((k, w));
+                continue;
+            }
+            Err(e) => panic!("{case}: frame {k}: {e}"),
+        };
+        seen.drawn += 1;
+        let want = played.planes(k as usize);
+        let got = planes_of(&drawn);
+        let mut bad = false;
+        for (p, name) in ["Y", "U", "V"].into_iter().enumerate() {
+            let s = PlaneStats::of(want[p], got[p]);
+            if s.differing > 0 {
+                bad = true;
+                let w = if p == 0 { played.w } else { played.w / 2 };
+                let first = want[p].iter().zip(got[p]).position(|(a, b)| a != b).unwrap();
+                seen.off.push((k, name, s.differing, s.max, (first % w, first / w)));
+            }
+        }
+        if bad && !anyway {
+            montage(case, k, &played, &plan, &picture, motion.counts());
+        }
+    }
+    eprintln!("{}", seen.line(case));
+    seen
+}
+
+/// A case whose every frame must be drawn and equal to the export's; the failure is returned, not raised.
+fn checker_judge(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, frames: Range<u64>) -> Result<Seen, String> {
+    let seen = checker_motion(case, tl, assets, fps, frames, false);
+    if !seen.refused.is_empty() {
+        return Err(format!("{case}: refused: {:?}", &seen.refused[..seen.refused.len().min(3)]));
+    }
+    if seen.drawn == 0 {
+        return Err(format!("{case}: nothing was drawn"));
+    }
+    if let Some(o) = seen.off.first() {
+        let frames: std::collections::BTreeSet<u64> = seen.off.iter().map(|o| o.0).collect();
+        return Err(format!(
+            "{case}: {} frame(s) differ ({:?}); first: frame {} plane {}: {} samples differ (max {}, first at {:?}); montages in target/parity/motion",
+            frames.len(),
+            frames.iter().take(12).collect::<Vec<_>>(),
+            o.0,
+            o.1,
+            o.2,
+            o.3,
+            o.4
+        ));
+    }
+    Ok(seen)
+}
+
+/// [`checker_judge`], failing at once.
+fn checker_exact(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, frames: Range<u64>) -> Seen {
+    checker_judge(case, tl, assets, fps, frames).unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// Judge many cases, then fail with all of the failures.
+fn checker_all(what: &str, fails: Vec<String>) {
+    for f in &fails {
+        eprintln!("FAIL {f}");
+    }
+    assert!(
+        fails.is_empty(),
+        "{what}: {} case(s) failed, first: {}",
+        fails.len(),
+        fails[0]
+    );
+}
+
+fn pos_keys(asset: &Asset, from: f64, to: f64, start: f64, keys: &[(f64, f64, f64, f64)]) -> Clip {
+    let mut c = clip(asset, from, to, start);
+    c.keyframes = keys.iter().map(|&(t, s, x, y)| zoom_key(t, s, x, y)).collect();
+    c
+}
+
+/// Positions that put 256 * (the sample position) exactly half way between two integers on every frame: at 32 frames a
+/// second the frame time is dyadic, the canvas is 512x256, so a position of `k * 2^-18` of a width is `k / 2` of a sub-sample.
+/// Whether `lrint` of a tie rounds to even is then the whole difference between a right frame and one level of noise.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_a_ties_in_export_frames() {
+    let c = checker_media();
+    let assets = [c.bars.clone(), c.noise.clone(), c.testsrc.clone()];
+    let under = || clip(&c.bars, 0.5, 1.5, 0.0);
+    // The position alone (no zoom: the placement's own pose), noise picture over bars and alone over black.
+    let tie = (1.0 / 8192.0, 1.0 / 4096.0);
+    let moving = pos_keys(&c.noise, 0.5, 1.5, 0.0, &[(0.0, 1.0, 0.0, 0.0), (1.0, 1.0, tie.0, tie.1)]);
+    checker_exact(
+        "checker/a/tie position over bars",
+        &timeline(vec![vec![under()], vec![moving.clone()]], None),
+        &assets,
+        32.0,
+        0..32,
+    );
+    checker_exact(
+        "checker/a/tie position alone",
+        &timeline(vec![vec![moving]], None),
+        &assets[1..],
+        32.0,
+        0..32,
+    );
+    // The same, the other way and a ten times longer lap, so the sub-sample part runs through every fraction.
+    let moving = pos_keys(
+        &c.noise,
+        0.5,
+        1.5,
+        0.0,
+        &[(0.0, 1.0, 0.0, 0.0), (1.0, 1.0, -tie.0 * 10.0, tie.1 * 7.0)],
+    );
+    checker_exact(
+        "checker/a/tie position, ten laps",
+        &timeline(vec![vec![under()], vec![moving]], None),
+        &assets,
+        32.0,
+        0..32,
+    );
+    // A zoom that moves by one part in 2^30 on top of the tie: the zoom is not a power of two, so the numbers are no longer
+    // exact, and the frame is a coin toss for any arithmetic that is not the filter's own, operation for operation.
+    let moving = pos_keys(
+        &c.noise,
+        0.5,
+        1.5,
+        0.0,
+        &[(0.0, 1.0, 0.0, 0.0), (1.0, 1.0 + 1.0 / 1_073_741_824.0, tie.0, tie.1)],
+    );
+    checker_exact(
+        "checker/a/tie position and a hair of zoom",
+        &timeline(vec![vec![under()], vec![moving]], None),
+        &assets,
+        32.0,
+        0..32,
+    );
+    let moving = pos_keys(
+        &c.noise,
+        0.5,
+        1.5,
+        0.0,
+        &[(0.0, 2.0, 0.0, 0.0), (1.0, 2.0 + 1.0 / 1_048_576.0, tie.0 * 3.0, tie.1)],
+    );
+    checker_exact(
+        "checker/a/tie position at a zoom of 2",
+        &timeline(vec![vec![under()], vec![moving]], None),
+        &assets,
+        32.0,
+        0..32,
+    );
+    // Whole-sample positions (k / 512 of a width): the fraction is 0 and the rounding never matters; the clamp does.
+    let moving = pos_keys(
+        &c.testsrc,
+        0.5,
+        1.5,
+        0.0,
+        &[(0.0, 1.0, 0.0, 0.0), (1.0, 1.0, 64.0 / 512.0, -32.0 / 256.0)],
+    );
+    checker_exact(
+        "checker/a/whole-sample position",
+        &timeline(vec![vec![under()], vec![moving]], None),
+        &assets,
+        32.0,
+        0..32,
+    );
+}
+
+/// Which frame's pose is drawn: a fast zoom and pan on a counter picture, at every common frame rate, with the clip starting
+/// on the output frame grid (at 0, and at a whole number of frames), after another clip, at speed 2, 0.5 and reversed. One
+/// frame of difference in `eval=frame`'s count is several samples of motion here.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_a_the_pose_is_that_of_the_frame_at_every_rate() {
+    let m = media();
+    let assets = [m.bars.clone(), m.testsrc.clone()];
+    let mut fails = Vec::new();
+    for (name, fps) in [
+        ("23.976", 24000.0f64 / 1001.0),
+        ("24", 24.0),
+        ("25", 25.0),
+        ("29.97", 30000.0 / 1001.0),
+        ("30", 30.0),
+        ("48", 48.0),
+        ("50", 50.0),
+        ("59.94", 60000.0 / 1001.0),
+        ("60", 60.0),
+        ("12", 12.0),
+        ("120", 120.0),
+    ] {
+        // (Whole frames: 9 or 13 of them in, so the start is on the output grid at this rate.)
+        for frames_in in [0u64, 9, 13] {
+            let start = frames_in as f64 / fps;
+            let mut c = clip(&m.testsrc, 0.5, 1.5, start);
+            c.keyframes = vec![zoom_key(0.0, 1.0, 0.0, 0.0), zoom_key(1.0, 2.2, 0.45, -0.3)];
+            let tl = timeline(vec![vec![clip(&m.bars, 0.0, 3.0, 0.0)], vec![c]], None);
+            let to = frames_in + fps.ceil() as u64;
+            fails.extend(
+                checker_judge(
+                    &format!("checker/a/pose timing @{name} starting at frame {frames_in}"),
+                    &tl,
+                    &assets,
+                    fps,
+                    frames_in..to,
+                )
+                .err(),
+            );
+        }
+    }
+    // After another clip on its own track (the `fps` filter's first slot is the clip's start), at speeds that retime the frames.
+    for (name, speed, secs) in [
+        ("speed 2", 2.0, 2.0),
+        ("speed 0.5", 0.5, 1.0),
+        ("reversed", -1.0, 1.0),
+        ("speed 1.5 reversed", -1.5, 1.5),
+    ] {
+        for fps in [25.0f64, 30000.0 / 1001.0, 60.0] {
+            let mut c = clip(&m.testsrc, 0.5, 0.5 + secs, 1.0);
+            c.speed = speed;
+            c.keyframes = vec![zoom_key(0.0, 1.0, 0.0, 0.0), zoom_key(1.0, 1.9, 0.3, 0.2)];
+            let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0), c]], None);
+            let from = (1.0 * fps).floor() as u64;
+            fails.extend(
+                checker_judge(
+                    &format!("checker/a/pose timing after a clip, {name} @{fps:.3}"),
+                    &tl,
+                    &assets,
+                    fps,
+                    from..from + (fps * 0.6) as u64,
+                )
+                .err(),
+            );
+        }
+    }
+    checker_all("pose timing", fails);
+}
+
+/// A moving zoom or position on a clip that starts **between** two output frames. The placed clip's graph pins its `fps`
+/// to the clip's start (`fps=fps=24:start_time=0.37`, `keyed_crop_fps`), and with `start_time` that filter rounds the
+/// input times relative to the start (`round((pts - start) * rate) + round(start * rate)`), which is not the plain
+/// `round(pts * rate)` the plan's frame pick follows (`frame_pick::fps_pick`): at some rates the export draws another source
+/// frame than the compositor does. The control is the same clip with a pose that does not move (a plain `fps`), exact.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_a_a_placed_clip_starting_between_frames_is_drawn_from_the_frame_the_export_picks() {
+    let m = media();
+    let assets = [m.bars.clone(), m.testsrc.clone()];
+    let mut fails = Vec::new();
+    for (name, fps) in [
+        ("23.976", 24000.0f64 / 1001.0),
+        ("24", 24.0),
+        ("25", 25.0),
+        ("29.97", 30000.0 / 1001.0),
+        ("30", 30.0),
+        ("48", 48.0),
+        ("50", 50.0),
+        ("59.94", 60000.0 / 1001.0),
+        ("60", 60.0),
+        ("12", 12.0),
+        ("120", 120.0),
+    ] {
+        for start in [0.37f64, 1.013] {
+            let from = (start * fps).floor() as u64;
+            let to = ((start + 1.0) * fps).ceil() as u64;
+            let moving = |moves: bool| {
+                let mut c = clip(&m.testsrc, 0.5, 1.5, start);
+                if moves {
+                    c.keyframes = vec![zoom_key(0.0, 1.0, 0.0, 0.0), zoom_key(1.0, 2.2, 0.45, -0.3)];
+                }
+                timeline(vec![vec![clip(&m.bars, 0.0, 3.0, 0.0)], vec![c]], None)
+            };
+            let control = checker_judge(
+                &format!("checker/a/CONTROL plain clip @{name} starting {start}"),
+                &moving(false),
+                &assets,
+                fps,
+                from..to,
+            );
+            let placed = checker_judge(
+                &format!("checker/a/placed clip @{name} starting {start}"),
+                &moving(true),
+                &assets,
+                fps,
+                from..to,
+            );
+            eprintln!(
+                "  -> control {} / placed {}",
+                if control.is_ok() { "exact" } else { "DIFFERS" },
+                if placed.is_ok() { "exact" } else { "DIFFERS" }
+            );
+            fails.extend(placed.err());
+            fails.extend(control.err().map(|e| format!("(control, not a placement) {e}")));
+        }
+    }
+    checker_all("placed clips starting between frames", fails);
+}
+
+/// Live behaviours with a spread of seeds, amounts, speeds, phases and angles, alone and stacked, on a clip that starts late.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_a_behaviours_with_seeds_are_placed_as_the_export_places_them() {
+    use kerf_core::Behavior as B;
+    let m = media();
+    let assets = [m.bars.clone(), m.testsrc.clone()];
+    let mut fails = Vec::new();
+    let mut go = |case: &str, tl: &Timeline, assets: &[Asset], fps: f64, frames: Range<u64>| {
+        fails.extend(checker_judge(case, tl, assets, fps, frames).err());
+    };
+    let with = |start: f64, behaviors: Vec<B>| {
+        let mut c = clip(&m.testsrc, 0.5, 1.5, start);
+        c.behaviors = behaviors;
+        timeline(vec![vec![clip(&m.bars, 0.0, 3.0, 0.0)], vec![c]], None)
+    };
+    for seed in [0u32, 1, 2, 7, 255, 4096, 123_456_789, u32::MAX] {
+        for (amount, speed) in [(0.001, 0.1), (0.03, 2.5), (0.25, 30.0), (0.12, 7.77)] {
+            let shake = B::Shake {
+                amount,
+                speed,
+                seed,
+                phase: 0.0,
+            };
+            go(
+                &format!("checker/a/shake seed {seed} {amount}@{speed}Hz"),
+                &with(0.0, vec![shake]),
+                &assets,
+                30.0,
+                0..30,
+            );
+        }
+    }
+    for phase in [-3.3, 0.0, 0.123, 99.5] {
+        let shake = B::Shake {
+            amount: 0.1,
+            speed: 3.3,
+            seed: 31,
+            phase,
+        };
+        go(
+            &format!("checker/a/shake phase {phase}, late start"),
+            &with(0.4, vec![shake]),
+            &assets,
+            30.0,
+            12..42,
+        );
+    }
+    for (amount, speed, phase) in [(0.9, 0.5, 0.0), (0.05, 11.0, 0.3), (0.5, 1.0, -0.25), (0.0001, 5.0, 0.0)] {
+        let b = B::Breathe { amount, speed, phase };
+        go(
+            &format!("checker/a/breathe {amount}@{speed}Hz phase {phase}"),
+            &with(0.0, vec![b]),
+            &assets,
+            30.0,
+            0..30,
+        );
+    }
+    for (speed, angle) in [
+        (0.2, 0.0),
+        (0.2, 90.0),
+        (-0.3, 180.0),
+        (1.0, 270.0),
+        (0.5, 359.9),
+        (4.9, 45.0),
+        (0.7, -30.0),
+        (0.1, 36_000.0),
+    ] {
+        let b = B::Drift {
+            speed,
+            angle,
+            phase: 0.05,
+        };
+        go(
+            &format!("checker/a/drift {speed} at {angle} degrees"),
+            &with(0.0, vec![b]),
+            &assets,
+            30.0,
+            0..30,
+        );
+    }
+    let all = vec![
+        B::Breathe {
+            amount: 0.2,
+            speed: 0.9,
+            phase: 0.0,
+        },
+        B::Drift {
+            speed: 0.3,
+            angle: 200.0,
+            phase: 0.0,
+        },
+        B::Shake {
+            amount: 0.04,
+            speed: 4.0,
+            seed: 99,
+            phase: 0.0,
+        },
+    ];
+    go(
+        "checker/a/all three behaviours",
+        &with(0.0, all.clone()),
+        &assets,
+        30.0,
+        0..30,
+    );
+    // At other rates and speeds: the behaviour's clock is the clip's.
+    for fps in [24.0f64, 25.0, 30000.0 / 1001.0, 60.0] {
+        // (Starting on the output grid: 9 frames in. Between two frames is `checker_a_a_placed_clip_starting_between_frames_*`.)
+        let start = 9.0 / fps;
+        go(
+            &format!("checker/a/all three behaviours @{fps:.3}"),
+            &with(start, all.clone()),
+            &assets,
+            fps,
+            9..(fps.ceil() as u64 + 9),
+        );
+    }
+    let mut fast = clip(&m.testsrc, 0.5, 2.5, 0.0);
+    fast.speed = 2.0;
+    fast.behaviors = all.clone();
+    go(
+        "checker/a/behaviours at speed 2",
+        &timeline(vec![vec![fast]], None),
+        &assets[1..],
+        30.0,
+        0..30,
+    );
+    let mut backwards = clip(&m.testsrc, 0.5, 1.5, 0.0);
+    backwards.speed = -1.0;
+    backwards.behaviors = all.clone();
+    go(
+        "checker/a/behaviours reversed",
+        &timeline(vec![vec![clip(&m.bars, 0.0, 3.0, 0.0)], vec![backwards]], None),
+        &assets,
+        30.0,
+        0..30,
+    );
+    // On top of keys that move the zoom and the position.
+    let mut keyed = clip(&m.testsrc, 0.5, 1.5, 0.0);
+    keyed.keyframes = vec![
+        zoom_key(0.0, 1.0, -0.2, 0.0),
+        zoom_key(0.5, 1.6, 0.0, 0.2),
+        zoom_key(1.0, 0.8, 0.2, -0.2),
+    ];
+    keyed.behaviors = all;
+    go(
+        "checker/a/behaviours over keys",
+        &timeline(vec![vec![clip(&m.bars, 0.0, 3.0, 0.0)], vec![keyed]], None),
+        &assets,
+        30.0,
+        0..30,
+    );
+    checker_all("behaviours", fails);
+}
+
+/// Zooms out to a speck and in to a pixel, positions several canvases away: every frame the plan draws is the export's, to the
+/// sample; the frames it refuses (`PlacementFrame::reachable`) are FFmpeg's and are counted.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_a_extreme_keyed_poses_are_placed_as_the_export_places_them() {
+    let c = checker_media();
+    let assets = [c.bars.clone(), c.noise.clone()];
+    let mut fails = Vec::new();
+    let mut drawn_total = 0;
+    for (name, keys) in [
+        // (The move takes a tenth of the clip and the pose then holds, so most of the frames are drawn at the extreme.)
+        ("zoom out to 0.0004", vec![(0.0, 1.0, 0.0, 0.0), (0.1, 0.0004, 0.0, 0.0)]),
+        ("zoom out to 0.0001", vec![(0.0, 1.0, 0.0, 0.0), (0.1, 0.0001, 0.0, 0.0)]),
+        (
+            "zoom out to 0.0005 (just inside the reach)",
+            vec![(0.0, 1.0, 0.0, 0.0), (0.1, 0.0005, 0.0, 0.0)],
+        ),
+        (
+            "zoom out to 0.02 off to a corner",
+            vec![(0.0, 1.0, 0.0, 0.0), (0.1, 0.02, 0.45, 0.45)],
+        ),
+        ("zoom in to 60", vec![(0.0, 1.0, 0.0, 0.0), (0.1, 60.0, 0.0, 0.0)]),
+        (
+            "zoom in to 400 off centre",
+            vec![(0.0, 1.0, 0.0, 0.0), (0.1, 400.0, 0.3, -0.2)],
+        ),
+        ("zoom in to 5000", vec![(0.0, 2.0, 0.0, 0.0), (0.1, 5000.0, 0.0, 0.0)]),
+        ("pan four canvases right", vec![(0.0, 1.0, 0.0, 0.0), (0.1, 1.0, 4.0, 0.0)]),
+        (
+            "pan twenty canvases up-left",
+            vec![(0.0, 1.0, 0.0, 0.0), (0.1, 1.0, -20.0, -20.0)],
+        ),
+        (
+            "zoom 3 and pan 1.5 canvases",
+            vec![(0.0, 3.0, -1.5, 1.5), (1.0, 3.2, 1.5, -1.5)],
+        ),
+        (
+            "zoom out and a huge pan",
+            vec![(0.0, 1.0, 0.0, 0.0), (0.1, 0.05, 1500.0, 0.0)],
+        ),
+        (
+            "zoom out and a huge pan, 800 canvases",
+            vec![(0.0, 1.0, 0.0, 0.0), (0.1, 0.05, 800.0, 0.0)],
+        ),
+    ] {
+        let tl = timeline(
+            vec![
+                vec![clip(&c.bars, 0.5, 1.5, 0.0)],
+                vec![pos_keys(&c.noise, 0.5, 1.5, 0.0, &keys)],
+            ],
+            None,
+        );
+        let seen = checker_motion(&format!("checker/a/extreme {name}"), &tl, &assets, 32.0, 0..32, false);
+        drawn_total += seen.drawn;
+        if let Some(o) = seen.off.first() {
+            fails.push(format!(
+                "{name}: frame {} plane {}: {} samples differ (max {}, first at {:?})",
+                o.0, o.1, o.2, o.3, o.4
+            ));
+        }
+        for (k, why) in &seen.refused {
+            if !why.contains("fixed-point range") {
+                fails.push(format!("{name}: frame {k} refused for something else: {why}"));
+            }
+        }
+    }
+    assert!(drawn_total > 100, "almost nothing was drawn ({drawn_total} frames)");
+    checker_all("extreme keyed poses", fails);
+}
+
+/// Pictures the fit and a static crop leave at other shapes than the frame: odd widths, a crop that starts between two chroma
+/// samples, a picture much smaller than the canvas; each moving zoom or pan. An odd height is the plan's refusal.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_a_cropped_and_fitted_pictures_are_placed_as_the_export_places_them() {
+    let m = media();
+    let sh = shapes();
+    let assets = [
+        m.bars.clone(),
+        m.testsrc.clone(),
+        m.portrait.clone(),
+        sh.odd_height.clone(),
+        sh.odd_width.clone(),
+        sh.pillar.clone(),
+    ];
+    let mut fails = Vec::new();
+    // Every frame: if the picture the plan says the chain makes is odd in height the frame must be refused for it, else it is drawn
+    // and equal to the export's.
+    let mut expect = |name: &str, tl: Timeline, assets: &[Asset]| {
+        let opts = at_fps(30.0);
+        let planner = Planner::new(&tl, assets, &opts, PlanRequest::motion(policy())).expect("planner");
+        let mut sizes = std::collections::BTreeSet::new();
+        let mut odd = Vec::new();
+        for k in 0..30 {
+            let plan = planner.at_frame(k).expect("plan");
+            let size = plan.size(u32::MAX);
+            let layer = plan.layers.last().expect("a layer");
+            if let Ok(g) = plan.layer_geometry(layer, size) {
+                sizes.insert(g.picture);
+                if g.picture.1 % 2 == 1 {
+                    odd.push(k);
+                }
+            }
+        }
+        let seen = checker_motion(&format!("checker/a/{name}"), &tl, assets, 30.0, 0..30, false);
+        eprintln!("   picture(s) {sizes:?}");
+        if let Some(o) = seen.off.first() {
+            fails.push(format!(
+                "{name}: frame {} plane {}: {} samples differ (max {}, first at {:?})",
+                o.0, o.1, o.2, o.3, o.4
+            ));
+        }
+        let refused: Vec<u64> = seen.refused.iter().map(|r| r.0).collect();
+        for (k, why) in &seen.refused {
+            if !(odd.contains(k) && why.contains("odd-height")) {
+                fails.push(format!("{name}: frame {k} refused for something it should not: {why}"));
+            }
+        }
+        for k in &odd {
+            if !refused.contains(k) {
+                fails.push(format!(
+                    "{name}: frame {k}: an odd-height picture {sizes:?} was drawn, not refused"
+                ));
+            }
+        }
+        if odd.is_empty() && seen.drawn != 30 {
+            fails.push(format!("{name}: only {} of 30 frames were drawn", seen.drawn));
+        }
+    };
+    // (Crops that leave one side of the box full: the fit does not enlarge them, so the compositor's scaler is not in play.)
+    for (name, crop) in [
+        ("crop right 0.0013 (639 wide)", (0.0, 0.0013, 0.0, 0.0)),
+        ("crop left 0.003 (an odd x offset)", (0.003, 0.0, 0.0, 0.0)),
+        ("crop left and right 0.0058 (631 wide, x 3)", (0.0058, 0.0058, 0.0, 0.0)),
+        ("crop top and bottom 0.1 (288 high)", (0.0, 0.0, 0.1, 0.1)),
+        ("crop top 0.0083 (357 high)", (0.0, 0.0, 0.0083, 0.0)),
+        ("crop bottom 0.0042 and right 0.0021", (0.0, 0.0021, 0.0, 0.0042)),
+        ("crop top 0.2 (288 high), left 0.01", (0.01, 0.0, 0.2, 0.0)),
+    ] {
+        let mut z = zooming(&m.testsrc, 1.0, 1.5, (0.1, -0.05));
+        z.transform.crop_left = crop.0;
+        z.transform.crop_right = crop.1;
+        z.transform.crop_top = crop.2;
+        z.transform.crop_bottom = crop.3;
+        expect(
+            name,
+            timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![z.clone()]], None),
+            &assets[..2],
+        );
+        // The position alone moves (the zoom holds): the same picture, a different pose.
+        let mut p = clip(&m.testsrc, 0.5, 1.5, 0.0);
+        p.transform = z.transform;
+        p.keyframes = vec![zoom_key(0.0, 1.0, -0.2, 0.1), zoom_key(1.0, 1.0, 0.2, -0.1)];
+        expect(
+            &format!("{name}, a pan"),
+            timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![p]], None),
+            &assets[..2],
+        );
+    }
+    // The fit leaves a picture of its own shape in a frame of another: pillarboxed, letterboxed, a thin strip, odd in a side.
+    for (name, asset, frame) in [
+        ("portrait in 640x640", &m.portrait, (640, 640)),
+        ("landscape in 640x480", &m.testsrc, (640, 480)),
+        ("landscape in 640x400", &m.testsrc, (640, 400)),
+        ("landscape in 800x360", &m.testsrc, (800, 360)),
+        ("portrait in 360x720", &m.portrait, (360, 720)),
+        ("640x203 in 640x360", &sh.odd_height, (640, 360)),
+        ("640x203 in 640x400", &sh.odd_height, (640, 400)),
+        ("203x360 in 640x360", &sh.odd_width, (640, 360)),
+        ("203x360 in 400x360", &sh.odd_width, (400, 360)),
+        ("480x360 in 640x360", &sh.pillar, (640, 360)),
+    ] {
+        let z = zooming(asset, 1.0, 1.7, (0.05, 0.05));
+        let tl = timeline(vec![vec![z]], Some(Delivery::new(frame.0, frame.1, Fit::Contain)));
+        expect(&format!("{name} zoom"), tl, std::slice::from_ref(asset));
+        let mut p = clip(asset, 0.5, 1.5, 0.0);
+        p.keyframes = vec![zoom_key(0.0, 1.0, -0.3, 0.0), zoom_key(1.0, 1.0, 0.3, 0.1)];
+        let tl = timeline(vec![vec![p]], Some(Delivery::new(frame.0, frame.1, Fit::Contain)));
+        expect(&format!("{name} pan"), tl, std::slice::from_ref(asset));
+    }
+    checker_all("cropped and fitted pictures", fails);
+}
+
+/// Both clips of a transition move (the outgoing clip's tail and the incoming clip's head each end in a placement), and a
+/// placed clip fading in and out on its own, over another placed layer.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_a_two_moving_clips_through_every_transition_are_placed_as_the_export_places_them() {
+    let m = media();
+    let assets = [m.bars.clone(), m.testsrc.clone()];
+    let mut fails = Vec::new();
+    for kind in [
+        TransitionKind::Crossfade,
+        TransitionKind::DipToBlack,
+        TransitionKind::SlideLeft,
+        TransitionKind::SlideUp,
+        TransitionKind::PushRight,
+        TransitionKind::PushDown,
+    ] {
+        for (label, out_moves, in_moves) in [("both", true, true), ("outgoing", true, false), ("incoming", false, true)] {
+            for fps in [30.0, 24.0] {
+                let mut out = clip(&m.bars, 0.5, 1.5, 0.0);
+                let mut inc = clip(&m.testsrc, 0.5, 1.5, 1.0);
+                if out_moves {
+                    out.keyframes = vec![zoom_key(0.0, 1.0, 0.0, 0.0), zoom_key(1.0, 1.5, -0.1, 0.1)];
+                }
+                if in_moves {
+                    inc.keyframes = vec![zoom_key(0.0, 1.0, 0.1, -0.1), zoom_key(1.0, 1.4, 0.0, 0.0)];
+                }
+                inc.transition_in = Some(Transition { kind, duration: 0.6 });
+                let tl = timeline(vec![vec![out, inc]], None);
+                let secs = 2.0;
+                fails.extend(
+                    checker_judge(
+                        &format!("checker/a/{kind:?} {label} moving @{fps}"),
+                        &tl,
+                        &assets,
+                        fps,
+                        0..(secs * fps) as u64,
+                    )
+                    .err(),
+                );
+            }
+        }
+    }
+    // A placed clip fading in and out, a dissolve in, over a second placed layer.
+    let under = {
+        let mut u = clip(&m.bars, 0.5, 1.5, 0.0);
+        u.keyframes = vec![zoom_key(0.0, 1.3, 0.05, 0.0), zoom_key(1.0, 1.0, -0.05, 0.0)];
+        u
+    };
+    let mut top = zooming(&m.testsrc, 0.6, 1.2, (0.2, 0.1));
+    top.fade_in = 0.3;
+    top.fade_out = 0.3;
+    top.set_property_keys(
+        kerf_core::Property::PosY,
+        vec![kerf_core::PropertyKey::new(0.0, -0.2), kerf_core::PropertyKey::new(1.0, 0.2)],
+    );
+    let tl = timeline(vec![vec![under], vec![top]], None);
+    fails.extend(checker_judge("checker/a/a placed clip fading over a placed clip", &tl, &assets, 30.0, 0..30).err());
+    checker_all("transitions between moving clips", fails);
+}
+
+/// The refusals of the placement that are left, drawn anyway: the frame the plan refuses is planned and drawn all the same and compared
+/// with the export. A refusal is *necessary* when the drawn frame is not the export's; one that would have been exact is a
+/// refusal wider than it has to be. The refusals that live in the plan's judgement of the cut need the compositor to be
+/// built without them (a scratch patch, `KERF_CHECKER_ANYWAY`: the plan's `reasons` of those kinds are dropped and the
+/// compositor's own checks in `placement_of` skipped); the `PlacedFormat` ones are drawn by telling the plan the footage is
+/// 4:2:0 (what the decode makes of it either way). Without the patch the case says what is still refused and judges nothing.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough); the plan-level refusals need KERF_CHECKER_ANYWAY and the scratch patch"]
+fn checker_a_refusals_drawn_anyway() {
+    let m = media();
+    let sh = shapes();
+    let v = variants();
+    let assets = [m.bars.clone(), m.testsrc.clone()];
+    let patched = std::env::var_os("KERF_CHECKER_ANYWAY").is_some();
+    let mut report = Vec::new();
+    let mut judge = |name: &str, seen: Seen| {
+        let verdict = if seen.drawn == 0 {
+            format!(
+                "still refused (nothing drawn): {}",
+                seen.refused.first().map_or("", |r| r.1.as_str())
+            )
+        } else if seen.off.is_empty() {
+            format!("EXACT on {} frames: the refusal is wider than it has to be", seen.drawn)
+        } else {
+            let frames: std::collections::BTreeSet<u64> = seen.off.iter().map(|o| o.0).collect();
+            let worst = seen.off.iter().max_by_key(|o| o.3).unwrap();
+            format!(
+                "not exact: {} of {} frames differ, worst plane {} max {} ({} samples, first at {:?})",
+                frames.len(),
+                seen.drawn,
+                worst.1,
+                worst.3,
+                worst.2,
+                worst.4
+            )
+        };
+        eprintln!("ANYWAY {name:<58} {verdict}");
+        report.push((name.to_string(), seen.drawn, seen.off.is_empty()));
+    };
+    let over = |c: Clip| timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None);
+    let moving = |edit: &dyn Fn(&mut Clip)| {
+        let mut c = zooming(&m.testsrc, 1.0, 1.5, (0.1, -0.05));
+        edit(&mut c);
+        over(c)
+    };
+    let panning = |edit: &dyn Fn(&mut Clip)| {
+        let mut c = clip(&m.testsrc, 0.5, 1.5, 0.0);
+        c.keyframes = vec![zoom_key(0.0, 1.0, -0.2, 0.1), zoom_key(1.0, 1.0, 0.2, -0.1)];
+        edit(&mut c);
+        over(c)
+    };
+    let mut run = |name: &str, tl: Timeline, assets: &[Asset]| {
+        judge(
+            name,
+            checker_motion(&format!("checker/a/anyway {name}"), &tl, assets, 30.0, 0..30, true),
+        );
+    };
+    // ZoomBehind: a rotation, an opacity below 1, a dip to white ahead of the placement. (A grade is not one any more:
+    // `checker_a_a_grade_ahead_of_a_placement_is_the_exports`.)
+    // (The keys carry the rotation and the opacity: a keyed clip's transform is its keys'.)
+    run(
+        "rotation 8 + zoom",
+        moving(&|c| c.keyframes.iter_mut().for_each(|k| k.rotation = 8.0)),
+        &assets,
+    );
+    run(
+        "rotation 8 + pan",
+        panning(&|c| c.keyframes.iter_mut().for_each(|k| k.rotation = 8.0)),
+        &assets,
+    );
+    run(
+        "opacity 0.7 + zoom",
+        moving(&|c| c.keyframes.iter_mut().for_each(|k| k.opacity = 0.7)),
+        &assets,
+    );
+    run(
+        "opacity 0.7 + pan",
+        panning(&|c| c.keyframes.iter_mut().for_each(|k| k.opacity = 0.7)),
+        &assets,
+    );
+    run(
+        "opacity 0.97 + zoom",
+        moving(&|c| c.keyframes.iter_mut().for_each(|k| k.opacity = 0.97)),
+        &assets,
+    );
+    {
+        let mut out = clip(&m.bars, 0.5, 1.5, 0.0);
+        let mut inc = zooming(&m.testsrc, 1.0, 1.4, (0.0, 0.0));
+        inc.timeline_start = 1.0;
+        inc.transition_in = Some(Transition {
+            kind: TransitionKind::DipToWhite,
+            duration: 0.6,
+        });
+        out.keyframes = Vec::new();
+        run("dip to white into a zoom", timeline(vec![vec![out, inc]], None), &assets);
+    }
+    // Geometry: an odd-height picture (on a canvas the fit does not resize it for), by a zoom and by a pan.
+    {
+        let a = [m.bars.clone(), sh.odd_height.clone()];
+        let tl = timeline(
+            vec![
+                vec![clip(&m.bars, 0.5, 1.5, 0.0)],
+                vec![zooming(&sh.odd_height, 1.0, 1.4, (0.0, 0.0))],
+            ],
+            None,
+        );
+        run("odd height 640x203 + zoom", tl, &a);
+        let mut p = clip(&sh.odd_height, 0.5, 1.5, 0.0);
+        p.keyframes = vec![zoom_key(0.0, 1.0, -0.2, 0.1), zoom_key(1.0, 1.0, 0.2, -0.1)];
+        run(
+            "odd height 640x203 + pan",
+            timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![p]], None),
+            &a,
+        );
+    }
+    // PlacedFormat: told that the footage is 4:2:0 (the decode converts it ahead of the graph either way).
+    let as_420 = |a: &Asset| {
+        let mut a = a.clone();
+        for s in &mut a.streams {
+            if s.kind == StreamKind::Video {
+                s.pix_fmt = Some("yuv420p".into());
+            }
+        }
+        a
+    };
+    // (4:4:4 and 4:2:2 are not refusals any more, bar the full-range ones: `checker_a_4_4_4_and_4_2_2_under_a_placement_*`.)
+    {
+        let (name, asset) = ("full-range yuvj420p", &v.mjpeg);
+        let tl = timeline(
+            vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![zooming(asset, 1.0, 1.6, (0.0, 0.0))]],
+            None,
+        );
+        let truth = [m.bars.clone(), asset.clone()];
+        let told = [m.bars.clone(), as_420(asset)];
+        judge(
+            &format!("format {name} + zoom"),
+            checker_motion_as(
+                &format!("checker/a/anyway format {name}"),
+                &tl,
+                &truth,
+                &told,
+                30.0,
+                0..30,
+                true,
+            ),
+        );
+    }
+    if patched {
+        let wide: Vec<_> = report.iter().filter(|(_, drawn, exact)| *drawn > 0 && *exact).collect();
+        eprintln!(
+            "refusals wider than they have to be: {:?}",
+            wide.iter().map(|w| &w.0).collect::<Vec<_>>()
+        );
+    } else {
+        eprintln!("(not patched: only what the plan lets through the compositor was drawn)");
+    }
+}
+
+/// The matrix tags and the BT.709 label, in a placed frame: BT.2020 and BT.709 tagged pictures (alone, over each other, over
+/// untagged), untagged high definition (the graph labels it BT.709) over tagged high definition. The placement moves planes and
+/// converts nothing, so every drawn frame is the export's; the frames the composite colour policy refuses (a mix of matrices, a
+/// range it negotiates) are FFmpeg's and are listed.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_a_matrices_and_the_709_label_are_placed_as_the_export_places_them() {
+    let c = checker_media();
+    let h = hd_pair();
+    let mut fails = Vec::new();
+    let moving = |a: &Asset, secs: (f64, f64), pos: (f64, f64)| {
+        let mut z = clip(a, secs.0, secs.1, 0.0);
+        z.keyframes = vec![zoom_key(0.0, 1.0, 0.0, 0.0), zoom_key(1.0, 1.6, pos.0, pos.1)];
+        z
+    };
+    let mut run = |name: &str, tl: Timeline, assets: Vec<Asset>, fps: f64, frames: Range<u64>| {
+        let seen = checker_motion(&format!("checker/a/{name}"), &tl, &assets, fps, frames, false);
+        if let Some(o) = seen.off.first() {
+            fails.push(format!(
+                "{name}: frame {} plane {}: {} samples differ (max {}, first at {:?})",
+                o.0, o.1, o.2, o.3, o.4
+            ));
+        }
+        for (k, why) in &seen.refused {
+            let policy_says = ["matrices", "full-range", "BT.2020", "colour"];
+            if !policy_says.iter().any(|p| why.contains(p)) {
+                fails.push(format!("{name}: frame {k} refused for something else: {why}"));
+            }
+        }
+    };
+    let (u, b) = (&c.testsrc, &c.bars);
+    for (name, top, under) in [
+        ("bt2020 over untagged", &c.testsrc2020, b),
+        ("bt709 over untagged", &c.testsrc709, b),
+        ("untagged over bt2020", u, &c.testsrc2020),
+        ("bt2020 over bt709", &c.testsrc2020, &c.testsrc709),
+        ("bt709 over bt709", &c.testsrc709, &c.testsrc709),
+    ] {
+        let tl = timeline(
+            vec![vec![clip(under, 0.5, 1.5, 0.0)], vec![moving(top, (0.5, 1.5), (0.2, -0.1))]],
+            None,
+        );
+        run(name, tl, vec![under.clone(), top.clone()], 32.0, 0..32);
+    }
+    for (name, a) in [("bt2020 alone", &c.testsrc2020), ("bt709 alone", &c.testsrc709)] {
+        run(
+            name,
+            timeline(vec![vec![moving(a, (0.5, 1.5), (0.0, 0.2))]], None),
+            vec![a.clone()],
+            32.0,
+            0..32,
+        );
+    }
+    // High definition: untagged is labelled BT.709 for the whole graph; the placement of the 1280x720 canvas.
+    for (name, top, under) in [
+        ("hd untagged over hd 709", &h.untagged, &h.phone),
+        ("hd 709 over hd untagged", &h.phone, &h.untagged),
+    ] {
+        let tl = timeline(
+            vec![vec![clip(under, 0.0, 1.5, 0.0)], vec![moving(top, (0.0, 1.0), (0.1, 0.1))]],
+            None,
+        );
+        run(name, tl, vec![under.clone(), top.clone()], 30.0, 0..30);
+    }
+    checker_all("matrices and the 709 label", fails);
+}
+
+/// What else keys on a clip whose zoom moves: a colour (the `eq` of each frame, at the fit size ahead of the placement), a mask
+/// (cut at the fit size, moved with the picture), both with a position; and a keyed crop or keyed opacity, refused.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_a_keyed_colour_and_mask_ahead_of_a_moving_zoom() {
+    use kerf_core::{Property, PropertyKey};
+    let m = media();
+    let assets = [m.bars.clone(), m.testsrc.clone()];
+    let mut fails = Vec::new();
+    // `refused`: the reason every refused frame must give (some frames of a key that starts neutral are drawn); None: all drawn.
+    let mut run = |name: &str, c: Clip, refused: Option<&str>| {
+        let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None);
+        let seen = checker_motion(&format!("checker/a/{name}"), &tl, &assets, 30.0, 0..30, false);
+        if let Some(o) = seen.off.first() {
+            fails.push(format!(
+                "{name}: frame {} plane {}: {} samples differ (max {}, first at {:?})",
+                o.0, o.1, o.2, o.3, o.4
+            ));
+        }
+        match refused {
+            None if seen.drawn != 30 => fails.push(format!(
+                "{name}: {} of 30 frames drawn: {:?}",
+                seen.drawn,
+                seen.refused.first()
+            )),
+            Some(why) => {
+                if seen.refused.is_empty() {
+                    fails.push(format!("{name}: nothing was refused"));
+                }
+                for (k, w) in &seen.refused {
+                    if !w.contains(why) {
+                        fails.push(format!("{name}: frame {k} refused for {w}, not {why}"));
+                    }
+                }
+            }
+            None => {}
+        }
+    };
+    for prop in [
+        Property::Brightness,
+        Property::Contrast,
+        Property::Saturation,
+        Property::Gamma,
+        Property::Temperature,
+    ] {
+        let (lo, hi) = colour_span(prop);
+        let mut c = zooming(&m.testsrc, 1.0, 1.5, (0.1, 0.05));
+        c.set_property_keys(prop, linear_keys(lo, hi));
+        run(&format!("keyed {prop:?} + zoom"), c, None);
+        let mut c = clip(&m.testsrc, 0.5, 1.5, 0.0);
+        c.keyframes = vec![zoom_key(0.0, 1.0, -0.2, 0.1), zoom_key(1.0, 1.0, 0.2, -0.1)];
+        c.set_property_keys(prop, linear_keys(lo, hi));
+        run(&format!("keyed {prop:?} + pan"), c, None);
+    }
+    let mut c = zooming(&m.testsrc, 1.0, 1.5, (0.1, 0.05));
+    c.mask = Some(mask_of(kerf_core::MaskShape::Ellipse, 0.2, false));
+    c.set_property_keys(Property::MaskX, vec![PropertyKey::new(0.0, 0.3), PropertyKey::new(1.0, 0.7)]);
+    c.set_property_keys(
+        Property::MaskWidth,
+        vec![PropertyKey::new(0.0, 0.3), PropertyKey::new(1.0, 0.9)],
+    );
+    run("keyed mask + zoom", c, Some("keyframed mask"));
+    let mut c = zooming(&m.testsrc, 1.0, 1.5, (0.1, 0.05));
+    c.mask = Some(mask_of(kerf_core::MaskShape::Rect, 0.0, true));
+    c.set_property_keys(
+        Property::MaskFeather,
+        vec![PropertyKey::new(0.0, 0.0), PropertyKey::new(1.0, 0.4)],
+    );
+    c.set_property_keys(Property::Brightness, linear_keys(-0.2, 0.2));
+    run("keyed mask feather and brightness + zoom", c, Some("keyframed mask"));
+    let mut c = zooming(&m.testsrc, 1.0, 1.5, (0.1, 0.05));
+    c.set_property_keys(Property::Opacity, linear_keys(1.0, 0.5));
+    run("keyed opacity + zoom (refused)", c, Some("opacity below 1"));
+    let mut c = zooming(&m.testsrc, 1.0, 1.5, (0.1, 0.05));
+    c.set_property_keys(Property::CropZoom, linear_keys(1.0, 1.5));
+    run("keyed crop + zoom (refused)", c, Some("crop"));
+    checker_all("keyed colour and mask", fails);
+}
+
+// ---- checker/a, second round: what the fix lifted ----------------------------------------------------------------
+//
+// d4a8fdaa pins the frame pick of a placed clip to `fps ... start_time`, lifts the refusal of a grade ahead of a placement, and
+// lifts 4:4:4 and 4:2:2 behind a probe of this FFmpeg's `scale`. Hunts for a frame that is drawn and is not the export's.
+
+/// Every grade of `grades()` ahead of a moving zoom or position, and the grade beside what else a layer carries: a mask, a
+/// key, a keyed colour, a fade, a dissolve, a tagged picture, other shapes and formats. A frame the plan draws is the export's to
+/// the sample; one it refuses is listed.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_a_a_grade_ahead_of_a_placement_is_the_exports() {
+    use kerf_core::{Property, PropertyKey};
+    let m = media();
+    let v = variants();
+    let sh = shapes();
+    let g = grades();
+    let assets = [m.bars.clone(), m.testsrc.clone()];
+    let mut fails = Vec::new();
+    let mut drawn_total = 0;
+    let mut run = |name: &str, tl: Timeline, assets: &[Asset], must_draw: bool| {
+        let seen = checker_motion(&format!("checker/a/grade {name}"), &tl, assets, 30.0, 0..30, false);
+        drawn_total += seen.drawn;
+        if let Some(o) = seen.off.first() {
+            fails.push(format!(
+                "{name}: frame {} plane {}: {} samples differ (max {}, first at {:?})",
+                o.0, o.1, o.2, o.3, o.4
+            ));
+        }
+        if must_draw && seen.drawn == 0 {
+            fails.push(format!("{name}: nothing was drawn: {:?}", seen.refused.first()));
+        }
+    };
+    let over = |c: Clip| timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None);
+    let moving = |edit: &dyn Fn(&mut Clip)| {
+        let mut c = zooming(&m.testsrc, 1.0, 1.5, (0.1, -0.05));
+        edit(&mut c);
+        c
+    };
+    let panning = |edit: &dyn Fn(&mut Clip)| {
+        let mut c = clip(&m.testsrc, 0.5, 1.5, 0.0);
+        c.keyframes = vec![zoom_key(0.0, 1.0, -0.2, 0.1), zoom_key(1.0, 1.0, 0.2, -0.1)];
+        edit(&mut c);
+        c
+    };
+    for (gname, grade) in &g {
+        run(
+            &format!("`{gname}` + zoom"),
+            over(moving(&|c| c.grade = grade.clone())),
+            &assets,
+            true,
+        );
+    }
+    for (gname, grade) in [&g[1], &g[3], &g[8]] {
+        let with = |name: &str, c: Clip, run: &mut RunFn| {
+            run(&format!("`{gname}` + {name}"), over(c), &assets, false);
+        };
+        let mut r = |n: &str, tl: Timeline, a: &[Asset], d: bool| run(n, tl, a, d);
+        with("pan", panning(&|c| c.grade = grade.clone()), &mut r);
+        with(
+            "feathered mask",
+            moving(&|c| {
+                c.grade = grade.clone();
+                c.mask = Some(mask_of(kerf_core::MaskShape::Ellipse, 0.25, false));
+            }),
+            &mut r,
+        );
+        with(
+            "chroma key",
+            moving(&|c| {
+                c.grade = grade.clone();
+                c.effects = vec![key("green", 0.2, 0.2)];
+            }),
+            &mut r,
+        );
+        with(
+            "keyed brightness",
+            moving(&|c| {
+                c.grade = grade.clone();
+                c.set_property_keys(Property::Brightness, linear_keys(-0.2, 0.2));
+            }),
+            &mut r,
+        );
+        with(
+            "static colour",
+            moving(&|c| {
+                c.grade = grade.clone();
+                c.color.contrast = 1.2;
+                c.color.saturation = 1.1;
+            }),
+            &mut r,
+        );
+        with(
+            "fade-in",
+            moving(&|c| {
+                c.grade = grade.clone();
+                c.fade_in = 0.4;
+            }),
+            &mut r,
+        );
+        with(
+            "fade-out",
+            moving(&|c| {
+                c.grade = grade.clone();
+                c.fade_out = 0.4;
+            }),
+            &mut r,
+        );
+        with(
+            "effect (grayscale)",
+            moving(&|c| {
+                c.grade = grade.clone();
+                c.effects = vec![kerf_core::VideoEffect::Grayscale];
+            }),
+            &mut r,
+        );
+        with(
+            "keyed mask",
+            moving(&|c| {
+                c.grade = grade.clone();
+                c.mask = Some(mask_of(kerf_core::MaskShape::Rect, 0.0, false));
+                c.set_property_keys(Property::MaskX, vec![PropertyKey::new(0.0, 0.3), PropertyKey::new(1.0, 0.7)]);
+            }),
+            &mut r,
+        );
+        // Dissolved in over another clip, and out of one.
+        let mut out = clip(&m.bars, 0.5, 1.5, 0.0);
+        out.keyframes = vec![zoom_key(0.0, 1.0, 0.0, 0.0), zoom_key(1.0, 1.3, 0.0, 0.0)];
+        let mut inc = moving(&|c| c.grade = grade.clone());
+        inc.timeline_start = 1.0;
+        inc.transition_in = Some(Transition {
+            kind: TransitionKind::Crossfade,
+            duration: 0.5,
+        });
+        run(
+            &format!("`{gname}` + dissolve in"),
+            timeline(vec![vec![out, inc]], None),
+            &assets,
+            false,
+        );
+        // Another layer over it.
+        let mut top = clip(&m.bars, 0.5, 1.5, 0.0);
+        top.mask = Some(mask_of(kerf_core::MaskShape::Ellipse, 0.3, true));
+        run(
+            &format!("`{gname}` + a layer over it"),
+            timeline(vec![vec![over_clip(m, &g, grade)], vec![top]], None),
+            &assets,
+            false,
+        );
+        // Pictures of other shapes, tags and formats.
+        for (name, a, under) in [
+            ("bt709 tagged", &v.testsrc709, &v.bars709),
+            ("smpte170m tagged", &v.testsrc170m, &m.bars),
+            ("10-bit", &v.tenbit, &m.bars),
+            ("gray", &v.gray, &m.bars),
+            ("pillarboxed 480x360", &sh.pillar, &m.bars),
+            ("odd width 203x360", &sh.odd_width, &m.bars),
+            ("10-bit tagged tv", &sh.tenbit_tv, &m.bars),
+        ] {
+            let mut c = zooming(a, 1.0, 1.5, (0.1, -0.05));
+            c.grade = grade.clone();
+            let tl = timeline(vec![vec![clip(under, 0.5, 1.5, 0.0)], vec![c]], None);
+            run(&format!("`{gname}` + {name}"), tl, &[under.clone(), a.clone()], false);
+        }
+        // Cropped (odd width, odd offset), and a delivery frame of another shape.
+        let mut c = moving(&|c| c.grade = grade.clone());
+        c.transform.crop_right = 0.0013;
+        run(&format!("`{gname}` + crop to 639 wide"), over(c), &assets, false);
+        let mut c = moving(&|c| c.grade = grade.clone());
+        c.transform.crop_left = 0.003;
+        run(&format!("`{gname}` + crop from x 1"), over(c), &assets, false);
+        let tl = timeline(
+            vec![vec![moving(&|c| c.grade = grade.clone())]],
+            Some(Delivery::new(640, 480, Fit::Contain)),
+        );
+        run(&format!("`{gname}` + letterboxed in 640x480"), tl, &assets[1..], false);
+    }
+    eprintln!("grade ahead of a placement: {drawn_total} frames drawn");
+    checker_all("a grade ahead of a placement", fails);
+}
+
+/// What a case of the grade hunt is run with: a name, a cut, its assets and whether something must be drawn.
+type RunFn<'a> = dyn FnMut(&str, Timeline, &[Asset], bool) + 'a;
+
+/// (A helper for the case above: a plain grey-graded clip that another layer is laid over.)
+fn over_clip(m: &Media, g: &[(&'static str, kerf_core::Grade)], grade: &kerf_core::Grade) -> Clip {
+    let _ = g;
+    let mut c = zooming(&m.testsrc, 1.0, 1.4, (0.0, 0.05));
+    c.grade = grade.clone();
+    c
+}
+
+/// 4:4:4 and 4:2:2 under a placement, once the probe says this FFmpeg converts them in a graph as the decode does: the sizes,
+/// tags and containers the probe's 64x36 picture is not (odd widths, a pillarbox, tagged pictures, 4:4:4 from x264), and the
+/// formats it must leave refused (10-bit, `yuvj`, 4:4:0, RGB, an alpha plane).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_a_4_4_4_and_4_2_2_under_a_placement_are_the_exports_or_refused() {
+    let m = media();
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-a-chroma");
+    std::fs::create_dir_all(&dir).unwrap();
+    let make = |name: &str, size: &str, vf: &str, pix: &str, codec: &[&str], flags: &[&str]| -> Option<Asset> {
+        let p = dir.join(name);
+        let (w, h) = size.split_once('x').unwrap();
+        let source = format!("{}x{}", w.parse::<u32>().unwrap().next_multiple_of(2), h);
+        let graph = format!("testsrc2=size={source}:rate=30:duration=4{vf},setparams=colorspace=unknown:color_primaries=unknown:color_trc=unknown");
+        let mut args = vec![
+            "-y",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            graph.as_str(),
+        ];
+        args.extend_from_slice(codec);
+        args.extend_from_slice(&["-pix_fmt", pix]);
+        args.extend_from_slice(flags);
+        args.push(p.to_str().unwrap());
+        let ok = Command::new(kerf_core::ffmpeg_path())
+            .args(&args)
+            .stdin(Stdio::null())
+            .output()
+            .ok()?
+            .status
+            .success();
+        ok.then(|| probed(&p))
+    };
+    let ffv1 = ["-c:v", "ffv1"];
+    let x264 = [
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-qp",
+        "0",
+        "-g",
+        "10",
+        "-profile:v",
+        "high444",
+    ];
+    let odd = ",crop=w=203:h=360:x=0:y=0:exact=1";
+    // (name, asset, drawn expected when the probe matches)
+    let mut cases: Vec<(&str, Option<Asset>, bool)> = vec![
+        (
+            "yuv444p 640x360",
+            make("a444.mkv", "640x360", "", "yuv444p", &ffv1, &[]),
+            true,
+        ),
+        (
+            "yuv422p 640x360",
+            make("a422.mkv", "640x360", "", "yuv422p", &ffv1, &[]),
+            true,
+        ),
+        (
+            "yuv444p 203x360 odd width",
+            make("b444.mkv", "203x360", odd, "yuv444p", &ffv1, &[]),
+            true,
+        ),
+        (
+            "yuv422p 203x360 odd width",
+            make("b422.mkv", "203x360", odd, "yuv422p", &ffv1, &[]),
+            true,
+        ),
+        (
+            "yuv444p 480x360 pillarbox",
+            make("c444.mkv", "480x360", "", "yuv444p", &ffv1, &[]),
+            true,
+        ),
+        (
+            "yuv422p 480x360 pillarbox",
+            make("c422.mkv", "480x360", "", "yuv422p", &ffv1, &[]),
+            true,
+        ),
+        (
+            "yuv444p 640x356",
+            make("d444.mkv", "640x356", "", "yuv444p", &ffv1, &[]),
+            true,
+        ),
+        (
+            "yuv422p 639x360",
+            make(
+                "e422.mkv",
+                "640x360",
+                ",crop=w=639:h=360:x=0:y=0:exact=1",
+                "yuv422p",
+                &ffv1,
+                &[],
+            ),
+            true,
+        ),
+        (
+            "yuv444p x264 high444 mp4",
+            make("f444.mp4", "640x360", "", "yuv444p", &x264, &[]),
+            true,
+        ),
+        (
+            "yuv444p tagged bt709",
+            make(
+                "g444.mkv",
+                "640x360",
+                ",setparams=colorspace=bt709:color_primaries=bt709:color_trc=bt709",
+                "yuv444p",
+                &ffv1,
+                &[],
+            ),
+            true,
+        ),
+        (
+            "yuv422p tagged bt2020",
+            make(
+                "h422.mkv",
+                "640x360",
+                ",setparams=colorspace=bt2020nc:color_primaries=bt2020:color_trc=bt2020-10",
+                "yuv422p",
+                &ffv1,
+                &[],
+            ),
+            true,
+        ),
+        (
+            "yuv444p tagged tv",
+            make("i444.mkv", "640x360", "", "yuv444p", &ffv1, &["-color_range", "tv"]),
+            true,
+        ),
+        (
+            "yuv444p10le",
+            make("j444.mkv", "640x360", "", "yuv444p10le", &ffv1, &[]),
+            false,
+        ),
+        (
+            "yuv422p10le",
+            make("k422.mkv", "640x360", "", "yuv422p10le", &ffv1, &[]),
+            false,
+        ),
+        (
+            "yuvj444p (mjpeg)",
+            make(
+                "l444.mkv",
+                "640x360",
+                "",
+                "yuvj444p",
+                &["-c:v", "mjpeg", "-qscale:v", "1"],
+                &[],
+            ),
+            false,
+        ),
+        (
+            "yuvj422p (mjpeg)",
+            make(
+                "l422.mkv",
+                "640x360",
+                "",
+                "yuvj422p",
+                &["-c:v", "mjpeg", "-qscale:v", "1"],
+                &[],
+            ),
+            false,
+        ),
+        ("yuv440p", make("m440.mkv", "640x360", "", "yuv440p", &ffv1, &[]), false),
+        ("yuva444p", make("n444.mkv", "640x360", "", "yuva444p", &ffv1, &[]), false),
+        ("gbrp", make("o.mkv", "640x360", "", "gbrp", &ffv1, &[]), false),
+    ];
+    let mut fails = Vec::new();
+    for (name, asset, drawn_expected) in cases.drain(..) {
+        let Some(asset) = asset else {
+            eprintln!("checker/a/chroma {name}: skipped (this ffmpeg cannot write it)");
+            continue;
+        };
+        let tl = timeline(
+            vec![
+                vec![clip(&m.bars, 0.5, 1.5, 0.0)],
+                vec![zooming(&asset, 1.0, 1.6, (0.1, 0.0))],
+            ],
+            None,
+        );
+        let assets = [m.bars.clone(), asset.clone()];
+        let seen = checker_motion(&format!("checker/a/chroma {name}"), &tl, &assets, 30.0, 0..30, false);
+        if let Some(o) = seen.off.first() {
+            fails.push(format!(
+                "{name}: frame {} plane {}: {} samples differ (max {}, first at {:?})",
+                o.0, o.1, o.2, o.3, o.4
+            ));
+        }
+        if drawn_expected != (seen.drawn > 0) && compositor().caps().placed_chroma {
+            let why = seen.refused.first().map(|r| r.1.as_str()).unwrap_or("");
+            fails.push(format!(
+                "{name}: expected {}, drawn {} refused {}: {why}",
+                if drawn_expected { "drawn" } else { "refused" },
+                seen.drawn,
+                seen.refused.len()
+            ));
+        }
+    }
+    // Flagged full range (the plan may draw or refuse it, by the composite's range policy: a drawn frame must be the export's).
+    for (name, asset) in [
+        (
+            "yuv444p flagged pc",
+            make("p444.mkv", "640x360", "", "yuv444p", &ffv1, &["-color_range", "pc"]),
+        ),
+        (
+            "yuv422p flagged pc",
+            make("p422.mkv", "640x360", "", "yuv422p", &ffv1, &["-color_range", "pc"]),
+        ),
+    ] {
+        let Some(asset) = asset else { continue };
+        let tl = timeline(
+            vec![
+                vec![clip(&m.bars, 0.5, 1.5, 0.0)],
+                vec![zooming(&asset, 1.0, 1.6, (0.1, 0.0))],
+            ],
+            None,
+        );
+        let assets = [m.bars.clone(), asset.clone()];
+        let seen = checker_motion(&format!("checker/a/chroma {name}"), &tl, &assets, 30.0, 0..30, false);
+        if let Some(o) = seen.off.first() {
+            fails.push(format!(
+                "{name}: frame {} plane {}: {} samples differ (max {}, first at {:?})",
+                o.0, o.1, o.2, o.3, o.4
+            ));
+        }
+    }
+    checker_all("4:4:4 and 4:2:2 under a placement", fails);
+}
+
+/// An export in parts (the decode budget forced to a tenth of a megapixel, so the span is cut and each part opens the clips on
+/// screen for it): the frames of the export are the plan's. (A ranged export is not here: the planner takes its range applied
+/// by the caller, so the harness would be comparing different frames.) The budget is an environment variable, so the case runs
+/// itself again as a child process with it set, and the other cases of the suite keep their single run.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_a_a_placed_clip_in_an_export_in_parts() {
+    let parts_dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-a-parts");
+    if std::env::var_os("KERF_EXPORT_PARTS").is_none() {
+        let _ = std::fs::remove_dir_all(&parts_dir);
+        let out = Command::new(std::env::current_exe().expect("this test binary"))
+            .args([
+                "--ignored",
+                "--exact",
+                "--nocapture",
+                "checker_a_a_placed_clip_in_an_export_in_parts",
+            ])
+            .env("KERF_EXPORT_PARTS", "0.1")
+            .env("KERF_SEGMENT_DIR", &parts_dir)
+            .stdin(Stdio::null())
+            .output()
+            .expect("run the case again with the parts budget");
+        eprint!("{}", String::from_utf8_lossy(&out.stderr));
+        assert!(out.status.success(), "the export in parts differs from the plan");
+        assert!(
+            parts_dir.exists(),
+            "the export was not cut into parts (no segment directory was made)"
+        );
+        return;
+    }
+    let m = media();
+    let assets = [m.bars.clone(), m.testsrc.clone()];
+    let mut fails = Vec::new();
+    // In parts: several placed clips back to back, so the cuts land between them and inside them.
+    for fps in [30.0f64, 24.0] {
+        let mut clips = Vec::new();
+        for (i, (from, to)) in [(0.0, 0.7), (0.7, 1.4), (1.4, 2.1)].into_iter().enumerate() {
+            let mut c = clip(&m.testsrc, 0.3 * i as f64, 0.3 * i as f64 + 0.7, from);
+            c.keyframes = vec![zoom_key(0.0, 1.0, 0.0, 0.0), zoom_key(0.7, 1.5, 0.1 * i as f64, 0.0)];
+            let _ = to;
+            clips.push(c);
+        }
+        let tl = timeline(vec![vec![clip(&m.bars, 0.0, 3.0, 0.0)], clips], None);
+        let name = format!("parts @{fps}");
+        let seen = checker_motion(&format!("checker/a/{name}"), &tl, &assets, fps, 0..(2.0 * fps) as u64, false);
+        if let Some(o) = seen.off.first() {
+            fails.push(format!(
+                "{name}: frame {} plane {}: {} samples differ (max {}, first at {:?})",
+                o.0, o.1, o.2, o.3, o.4
+            ));
+        }
+        if !seen.refused.is_empty() {
+            fails.push(format!("{name}: refused {:?}", seen.refused.first()));
+        }
+    }
+    checker_all("an export in parts", fails);
 }

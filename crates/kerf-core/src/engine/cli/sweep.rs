@@ -18,7 +18,8 @@
 //! a keyed zoom against `transform_at`) and the parity harness's to say. A moving zoom or
 //! position is the placement's `perspective` (`placement_filters`): its corners, evaluated at
 //! the frame `in` counts from the pinned `fps`, give the zoom and the centre the plan samples.
-//! (A Motion plan refuses such a layer, `Unsupported::KeyedPlacement`: no compositor draws it.)
+//! (A Motion plan refuses such a layer, `Unsupported::KeyedPlacement`, unless the compositor's caps say it draws the
+//! placement, which kerf-gpu's say only where a probe found this FFmpeg to place as the model does.)
 
 use std::f64::consts::PI;
 

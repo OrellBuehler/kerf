@@ -522,6 +522,19 @@ fn unique() -> u64 {
     N.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Make sure the cache holds the file's range flag for a layer whose placement may need it: an asset that did not record its
+/// range, where the composite's range is negotiated, is judged by the file ([`kerf_core::source_is_full_range`]), and the
+/// compositor only ever *reads* that answer (`source_is_full_range_known`: a render never spawns a process). The decode is
+/// where the file is looked at — a session's check, a scrubbed frame, a cursor's frame — so it is where an answer is made
+/// to exist, for a file seen for the first time **and for one replaced since** (the cache is keyed by the file's size and
+/// modified time). One `ffprobe` then, a cache hit (a `stat`) after; the same probe as the file's other traits, so on a
+/// file the decode has looked at it costs nothing. Call it from a thread that is not drawing: it may block on that probe.
+pub(crate) fn warm_range(layer: &PlanLayer) {
+    if layer.stream.color_range.is_none() && layer.animated.is_some_and(|a| a.places) {
+        let _ = kerf_core::source_is_full_range(Path::new(&layer.path));
+    }
+}
+
 /// Why runs are not trusted on the file at `path` before one has started, or `None`. Runs are
 /// proved against the one-shot decode on MP4 / Matroska only (a transport stream seeks to a later
 /// keyframe, and a run from 0 would not; AVI and the rest guess their timestamps), and only where
@@ -602,6 +615,10 @@ impl FrameSource {
             })
         };
         let decoded: Vec<Option<Arc<YuvFrame>>> = decoded.into_iter().collect::<Result<_, _>>()?;
+        // (The last thing before the composite, so that a file replaced while the decode waited is the one asked about.)
+        for layer in layers {
+            warm_range(layer);
+        }
         Ok(of.into_iter().map(|i| decoded[i].clone()).collect())
     }
 
@@ -1119,6 +1136,7 @@ impl FrameSource {
                 return Err(GpuError::Unsupported(format!("{}: {why}", layer.path)));
             }
         }
+        warm_range(layer);
         Ok(())
     }
 

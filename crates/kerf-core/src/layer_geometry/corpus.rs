@@ -186,6 +186,7 @@ fn hand_made() -> Vec<Case> {
             placement: Placement {
                 keyframed: Some(Keyed::all(true)),
                 offset: (0.25, -0.1),
+                placed: None,
             },
         },
         c((640, 360), (360, 640), Fit::Blur, t(), s420),
@@ -222,6 +223,7 @@ fn hand_made() -> Vec<Case> {
             placement: Placement {
                 keyframed: Some(Keyed::all(true)),
                 offset: (0.25, -0.1),
+                placed: None,
             },
         },
     ]
@@ -275,6 +277,7 @@ fn random(rng: &mut Rng) -> Case {
             } else {
                 (rng.frac(1.0), rng.frac(1.0))
             },
+            placed: None,
         }
     } else {
         Placement::STILL

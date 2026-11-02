@@ -25,6 +25,7 @@ pub mod mask_plane;
 pub mod media;
 pub mod model;
 pub mod paths;
+pub mod perspective;
 pub mod plan_caps;
 pub mod plan_epoch;
 pub mod planner;
@@ -75,21 +76,22 @@ pub use engine::{
     decode_audio, decode_hwaccel, delivery_rate, disable_decode_hwaccel, discard_partial, download_speech_model,
     download_speech_model_cancellable, export_seek_arg, export_still, export_still_cancellable, exported_frame, ffmpeg_command,
     ffmpeg_path, file_mtime, filmstrip_for, fps_mode_flag, generate_proxy, geq_edge, geq_penultimate_plane, grade_filter_chain,
-    hw_encoders, insta360_pair, limit_ffmpeg_args, limit_frame_args, measure_export, music_status, playback_params,
-    prepare_soundfont, prepare_variants, prepare_voiceover, proxy_path, proxy_width, render_measured, render_variants,
-    render_variants_measured, render_with, render_with_progress, seek_arg, set_speech_model, source_identity,
-    source_is_indexed_container, source_seek_points_are_keyframes, speech_model_names, spill_long_graph, stems_status,
-    stitch_insta360, stitch_insta360_with, stitched_path, stream_preview, stream_preview_until, stream_preview_with,
-    text_as_drawn, text_piece_filter, text_raster_graph, text_sequence_limit, text_still_filter, validate_export, variant_frame,
-    voiceover_status, wav_bytes, waveform_pyramid, waveform_range, waveform_range_of, write_wav, AudioBuffer, BandLevel,
-    BandWindow, Container, DownloadProgress, ExportOptions, ExportPart, ExportProgress, ExportReport, ExportStage, ExportVariant,
-    ExportedFrame, Filmstrip, FilmstripSheet, Fit, FpsSource, GeqEdge, GraphFile, ImageFormat, LoudnessPreset, LoudnessTarget,
-    MusicStatus, PlaybackParams, PlaybackRequest, PreviewFrame, RateControl, Region, RenderStatus, ScrubConfig, ScrubFrames,
-    ScrubStats, SheetCell, SheetClip, SpeechModelInfo, StemsStatus, StyleInfo, TextPart, TextPiece, TextRasterGraph,
+    hw_encoders, insta360_pair, limit_ffmpeg_args, limit_frame_args, measure_export, music_status, placement_probe_chain,
+    placement_probe_motion, playback_params, prepare_soundfont, prepare_variants, prepare_voiceover, proxy_path, proxy_width,
+    render_measured, render_variants, render_variants_measured, render_with, render_with_progress, run_piped_until, seek_arg,
+    set_speech_model, source_identity, source_is_full_range, source_is_full_range_known, source_is_indexed_container,
+    source_seek_points_are_keyframes, speech_model_names, spill_long_graph, stems_status, stitch_insta360, stitch_insta360_with,
+    stitched_path, stream_preview, stream_preview_until, stream_preview_with, text_as_drawn, text_piece_filter,
+    text_raster_graph, text_sequence_limit, text_still_filter, validate_export, variant_frame, voiceover_status, wav_bytes,
+    waveform_pyramid, waveform_range, waveform_range_of, write_wav, AudioBuffer, BandLevel, BandWindow, Container,
+    DownloadProgress, ExportOptions, ExportPart, ExportProgress, ExportReport, ExportStage, ExportVariant, ExportedFrame,
+    Filmstrip, FilmstripSheet, Fit, FpsSource, GeqEdge, GraphFile, ImageFormat, LoudnessPreset, LoudnessTarget, MusicStatus,
+    PlacementProbeMotion, PlaybackParams, PlaybackRequest, PreviewFrame, RateControl, Region, RenderStatus, ScrubConfig,
+    ScrubFrames, ScrubStats, SheetCell, SheetClip, SpeechModelInfo, StemsStatus, StyleInfo, TextPart, TextPiece, TextRasterGraph,
     VariantProgress, VariantsRun, VoiceInfo, VoiceoverStatus, WaveformLevel, WaveformPyramid, WaveformRange, WindowBalance,
-    WrittenAudio, WrittenVideo, DEFAULT_SPEECH_MODEL, DEFAULT_VOICE, FILMSTRIP_HEIGHT, MAX_FILMSTRIP_FRAMES, MAX_MEASURE_SIDE,
-    MAX_SEQUENCE_CHARS, MAX_STREAM_FPS, MAX_STREAM_WIDTH, MAX_VOICE_SPEED, MAX_WAVEFORM_BUCKETS, MIN_STREAM_FPS,
-    MIN_STREAM_WIDTH, MIN_VOICE_SPEED, STEM_NAMES, TEXT_BORDER_PX, TEXT_BOX_PX,
+    WrittenAudio, WrittenVideo, DEFAULT_SPEECH_MODEL, DEFAULT_VOICE, FILMSTRIP_HEIGHT, GRAPH_ARG_MAX, MAX_FILMSTRIP_FRAMES,
+    MAX_MEASURE_SIDE, MAX_SEQUENCE_CHARS, MAX_STREAM_FPS, MAX_STREAM_WIDTH, MAX_VOICE_SPEED, MAX_WAVEFORM_BUCKETS,
+    MIN_STREAM_FPS, MIN_STREAM_WIDTH, MIN_VOICE_SPEED, STEM_NAMES, TEXT_BORDER_PX, TEXT_BOX_PX,
 };
 pub use error::{Error, Result};
 pub use fonts::list_system_fonts;

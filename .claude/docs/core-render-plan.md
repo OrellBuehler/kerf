@@ -134,6 +134,12 @@
   clip's start, the output frame, the `fps=` rational, and whether a padded proxy's clone is
   dropped) — and `Pick::select(&SourceFrames { pts, time_base, start_us })` is the reference
   that names an index among a file's frames (ticks, as `ffprobe` / `showinfo` state them).
+  **No tick arithmetic can wrap or panic**, whatever a file or a clip brings (pts and the container's start at the ends of the
+  `i64`, a last duration of `i64::MAX`, an in-point of 1e300 seconds that saturates the seek): every difference of timestamps
+  goes through `diff`, every sum through `sum` (saturating; the seek and the container's start are summed exactly in an `i128`
+  and clamped), and a sum that fits is the plain operator's, so a pick over timestamps that overflow nothing is what it always
+  was (`checker_a_gates`: 300,000 random picks at the ends of the integers and of the floats, no panic, and `fps_pick`,
+  `Pick::select`, `progress` over the whole file, `output_index` and `fps_span` agree).
   **The `fps` pick is arithmetic, not the formula the A1 design measured** (last frame with
   `pts < ws + s*((k+1/2)/fps - start)`, which is right to first order): `-ss` shifts the
   timestamps by the seek rounded to a *tick*, `trim` keeps `[lo, hi)` after both ends are cut
@@ -152,7 +158,10 @@
   probe has no rate, plus one output frame at its speed; a still's `-t` with it) and **is cut at
   `end_frame`** (`trim=end_pts=` after `fps`: the first output frame at or after its end, tail
   included, with a millionth of a frame of slack). `FpsPick.window` is the picture window and
-  `FpsPick.end` that end; the run ends at the earlier of the two. A clip is drawn on every frame
+  `FpsPick.end` that end; the run ends at the earlier of the two. **`FpsPick.pinned`** is a chain whose `fps` is pinned to the clip's start
+  (`fps=fps=R:start_time=S`: a moving zoom or position, a keyed crop, a moving still): `start_time` makes the filter round each input time relative to the
+  start, put the first frame out from it and end the stream at the later of the status's rounding and the last frame's offset slot (`gpu.md`, "Which frame is drawn"),
+  which is not the plain `round(pts * rate)` on a tie — the plan sets it from `Animated` (`places || crop || still_motion`). A clip is drawn on every frame
   from its first frame's slot up to the one before its end's, an equal-rate end is not drawn,
   and the frame on a mid-frame end shows the nearest source frame, never one more than half an
   output frame past the clip's own length. A reversed clip keeps its window (its read past the end
@@ -251,6 +260,9 @@
   encoded by state and kind into `BarSpan { start, end, state: gpu | stream | stall, kind, reason }`; `caps: None` is
   the GPU preview off (only stalls), `waits` the Proxy-only proxy waits; a frame with no layer and no title is no span,
   a cut with no video none at all, a rate outside 1..60 fps the stream's (`frontend-timeline.md` has the semantics).
+  `BarRequest::ask` is the host's hook, called with a frame's plan before it is judged when the layers on screen are not the
+  previous frame's (and only with `caps`): what it measures or asks of a file for the plan to read from a cache, which for the GPU
+  preview is `kerf_gpu::prepare_ranges` (a placed layer's range, below).
   **`PlayCut`** (`play_plan.rs`, pure) is the cut a compositor that **plays** draws, which is what
   `stream_preview` plays: a `PlanMode::Motion` planner over `Timeline::slice(start, ..)`, so the clips'
   `fps` picks, fades and dissolves are the export's of that slice. `start` is a frame of the project's
@@ -283,8 +295,8 @@
   are still drawn per frame — to be fixed before the GPU encodes an export.
   **The mask's alpha is shared too**: `kerf_core::mask_alpha_plane(&Mask, w, h)` is `mask_filter`'s `geq` evaluated in `f64` and
   truncated as `geq` stores it (`engine::cli::rendered`, `a_mask_plane_is_the_geq_planes_sample_for_sample`: 21 million samples equal on both
-  FFmpegs), at the size of the picture the `geq` sees — `LayerGeometry::picture`, or the fit-size `stages[0].keep` when a moving zoom
-  comes last — so a compositor draws a mask with no FFmpeg and no per-frame cost.
+  FFmpegs), at the size of the picture the `geq` sees — `LayerGeometry::picture` (for a placed layer the fit-size picture, its geometry ends there) —
+  so a compositor draws a mask with no FFmpeg and no per-frame cost.
   **The clip's grade (`PlanLayer.grade`: LUT, curves, wheels) is drawn by what the caps say, and judged for the chain**:
   `GpuCaps::grade` is a `GradeKinds` bitset (`WHEELS`, `CURVES`, `LUT`, `ALL`; `A0` has none), and a part the compositor
   does not draw is `Unsupported::Grade(layer, what)` (kind `grade`) — which is also what a compositor whose FFmpeg's conversions are not (or not yet known to be) the ones it follows says:
@@ -300,7 +312,7 @@
   on every frame of the clip, whether or not the two are on screen together), a layer the compositor's scaler resizes
   (the scaler's one-level difference becomes 3 or 4 through the conversions, past the bound of 2), an odd side (swscale reads
   past the line), and in `reasons` the geometry ones `Matte(layer, "a grade")` (a letterbox: the bars are part of the frame the
-  grade sees) and `ZoomBehind(.., "a grade")` (a moving zoom last: its `scale` converts the RGB in one pass). `RenderPlan::graded()`
+  grade sees). (A moving zoom or position behind the grade is drawn: the placement reads the 4:2:0 planes the grade hands on.) `RenderPlan::graded()`
   includes a grade, so the full-range refusals (`GradedFullRange`, `GradedInFullRangeStack`) judge it too. `kerf_core::baked_lut`
   gives a compositor the LUT's table with its intensity applied (`Lut3d::at_intensity`, the same numbers `to_cube` writes,
   four cached by path / length / mtime), `grade_filter_chain` the filters the engine writes for it, and `frame_matrix_tag` the
@@ -330,9 +342,22 @@
   export *and* the FFmpeg still read the picture through its window with `perspective` (fixed-point, bilinear),
   which no compositor pass draws, and the layer's transform keeps only the static crop. `Animated.mask` /
   `Animated.crop` say so. A **moving zoom or position** (`Animated.places`, `Clip::placement_animated`) is refused in
-  both modes (`Unsupported::KeyedPlacement`) unless `GpuCaps::placement`, which no compositor sets: the export and the
-  FFmpeg still place the picture with a `perspective` at sub-pixel positions (`engine-cli.md`). Tests that judge what
-  is ahead of a moving zoom set the cap. `Animated` is `Some` for a
+  both modes (`Unsupported::KeyedPlacement`) unless `GpuCaps::placement`, which `kerf-gpu` sets **only once a probe of the FFmpeg in
+  use has found that its `pad`, `perspective` and `crop` place a picture as `kerf_core::perspective` does** (`kerf_gpu::placement_probe`, which runs
+  `engine::placement_probe_chain`, the export's own filter text, and `placement_probe_motion`, a keyed zoom and position with a breath,
+  a drift and a shake over `perspective`'s frame count, against `Clip::transform_at`; `behaviors` goes with it; a probe that cannot tell is `Unknown`
+  and refuses): the export and the
+  FFmpeg still place the picture with `pad`, `perspective` and `crop` at sub-pixel positions (`engine-cli.md`), which
+  `kerf_core::perspective` reproduces (the frames `pad` and `crop` make, the corners the expressions evaluate to, the filter's
+  matrix and table of sample positions: `RenderPlan::pose` is the zoom, the position and a slide's travel it is drawn from;
+  `LayerGeometry` of such a layer ends at the picture the chain makes before it, `Placement::placed`, with no zoom stage when
+  the zoom is the one that moves). With the cap the rest of the layer is judged as ever, and a placed layer is refused when
+  a rotation, an opacity below 1 or a dip to white is ahead of it (`ZoomBehind`, the moving position's as much as the
+  moving zoom's; a grade is drawn behind it), for an odd-height picture (`Geometry`: `pad` keeps or loses its last row by how the graph allocated the
+  frame, and the builds differ), for a letterboxed picture at the identity pose in a still (the still pads it to the whole
+  frame first, with opaque bars), for a picture that is not 4:2:0 or gray (`PlacedFormat`: the chain converts it to `yuva420p` itself, which is the decode's conversion only where the `scale` filter defaults to the same scaler: 24 levels of chroma off on 4:4:4 and 16 on 4:2:2 on 4.4.2, exact on 6.1.1 and 9.0.2, so planar 4:4:4 / 4:2:2 are drawn where `GpuCaps::placed_chroma` says the probe measured a match), for a moving still image (`StillMotion`'s own graph: no placement checks apply), and for a pose whose positions leave the table's range (`PlacementFrame::reachable`).
+  **Where the composite's range is negotiated, a placed layer whose asset did not record its range** (`color_range` `None`: probed before the flag was kept) **is judged by its file** for a host that asks the files ahead (`GpuCaps::file_range`, which the compositor's `session_caps()` sets and `GpuCaps::A0` and `Compositor::caps()` do not, so a plan judged without it stays a pure function of its inputs): `reasons` reads `source_is_full_range_known` (the cache alone: it spawns and waits on nothing) and refuses (`PlacedFormat`) a file that is full range or that has not said (never asked, being asked, failed, nothing usable), which is what the compositor's draw-time check refuses, seen by `PlayCut::ahead` / `resume`, a primer and the render bar before the frame instead of a frame into a session (`gpu.md`).
+  `Animated` is `Some` for a
   keyed transform, colour, mask or crop and `Animated.keys` (`layer_geometry::Keyed {scale, rotation, rotates,
   opacity}`) says which transform numbers are keyed, because a clip keyed in part is not built like one
   keyed in full: a keyed zoom is a second `scale` even at 1, an unkeyed one is the static scale (a second
@@ -347,12 +372,13 @@
   **Live behaviours** (`Clip.behaviors`, `core-model.md`) are in the plan as the pose they give: `PlanLayer.transform` is
   `Clip::transform_at` (the formulas included, the exact numbers the graph's expressions evaluate at that frame) and `Animated` is built
   from `is_driven` / `rotation_turns` / `zoom_animated` / `placement_animated`, so a sway or spin is a keyed rotation (`Keyed.rotation` /
-  `rotates`), a breath a moving zoom (`zooms`) and a drift, shake or breath `places` (`KeyedPlacement`, no cap). `Animated.behaves`
+  `rotates`), a breath a moving zoom (`zooms`) and a drift, shake or breath `places` (the placement, once it is drawn). `Animated.behaves`
   (`Clip::has_behaviors`; a behaviour that moves nothing is not live) makes **every frame refused** in a Still and a Motion plan,
-  `Unsupported::Behavior(layer)` (kind `behavior`), until `GpuCaps::behaviors`, which no compositor sets: the pose is exact, but no
-  compositor has a parity case for a pose that moves by a formula, so the plan does not claim it. With the bit set the pose is judged as any
-  other, and `live_behaviours_are_the_pose_the_plan_carries_and_are_refused_until_a_compositor_says_it_draws_them` pins that for a sway
-  and a spin nothing else refuses and for the rest only `KeyedPlacement` does.
+  `Unsupported::Behavior(layer)` (kind `behavior`), until `GpuCaps::behaviors`, which `kerf-gpu` sets: the pose is exact, and the placement draws it
+  (breathe, drift and shake: `behavior/*` in both parity suites). One that turns the picture (`Animated.rotates`: a sway or a spin) is refused
+  whatever the caps. With the bit set the pose is judged as any other, and
+  `live_behaviours_are_the_pose_the_plan_carries_and_are_refused_until_a_compositor_says_it_draws_them` pins that for a sway
+  and a spin nothing else refuses and for the rest nothing does but `Behavior` (the placement is drawn).
   **A stabilized clip is refused** (`PlanTiming.stabilized` = `Clip::is_stabilized`, `Unsupported::Stabilized(layer)`, kind
   `stabilized`, Still and Motion alike): its frames are moved by vid.stab's transform or `deshake` in the chain, which no pass
   draws, so FFmpeg draws them (`a_stabilized_clip_is_refused_in_a_still_and_an_export_frame`).
@@ -424,8 +450,9 @@
   key's alpha plane, one in at the edge on 6.1). **A keyed opacity on a turned layer is not refused**: that `geq` runs ahead of the `rotate`, so on 6.1 the
   row and column it replaces land on the turned box's other edges, and the compositor shifts the picture's planes before the turn (`gpu.md`), exact at every quarter on both builds
   (a plain layer's chroma was up to 128 off on 6.1.1 before; the plan had let it through). **With `keyed_zoom` the plan still refuses a rotation, an opacity below 1 and a dip to white in front of a moving
-  zoom** (`ZoomBehind(layer, what)`, Still and Motion alike: the rotated alpha plane and the RGB round trip would have to be scaled
-  with the zoom), and without it a Still refuses a grade, rotation, opacity, mask or effect in front of one. The old API stays: `gpu_supported()` / `unsupported_reasons()` (an owned
+  zoom** (`ZoomBehind(layer, what)`, Still and Motion alike: the placement would act on the rotated alpha plane, on the RGB round trip's
+  or on the RGB frame a dip to white leaves, and no case holds any of them to FFmpeg's; a grade is not here, it is drawn ahead of the placement),
+  and without it a Still refuses a grade, rotation, opacity, mask or effect in front of one. The old API stays: `gpu_supported()` / `unsupported_reasons()` (an owned
   `Vec<String>`) / `unsupported_reasons_at(size)` / `gpu_supported_at(size)` are
   `reasons(&GpuCaps::A0, ..)`: a plan is refused while a fade step is live, a layer
   travels or a tail window is open — exactly, where A0 refused the whole

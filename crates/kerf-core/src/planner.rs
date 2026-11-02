@@ -668,6 +668,9 @@ impl Planner {
                             && clip_seek(planned.source_window.0, planned.fx.lead) == 0.0,
                         lead: planned.fx.lead,
                         image: asset.is_image.then_some(self.canvas.fps),
+                        // The chain pins its `fps` to the clip's start for a moving zoom or position (the placement),
+                        // a keyed crop and a moving still (`keyed_crop_fps`).
+                        pinned: planned.animated.is_some_and(|a| a.places || a.crop || a.still_motion),
                     })
                 } else if asset.is_image {
                     Pick::AtOrAfter(0.0)
@@ -1764,6 +1767,8 @@ mod tests {
             keyed_opacity: true,
             keyed_zoom: true,
             placement: false,
+            placed_chroma: false,
+            file_range: false,
             behaviors: false,
             keyed_color: true,
             mask: true,
@@ -1984,6 +1989,8 @@ mod tests {
             keyed_opacity: true,
             keyed_zoom: true,
             placement: false,
+            placed_chroma: false,
+            file_range: false,
             behaviors: false,
             keyed_color: true,
             mask: true,
@@ -2064,8 +2071,8 @@ mod tests {
             Unsupported::KeyedZoom(_)
         )));
         // A zoom or a position that moves is placed at sub-pixel positions by a `perspective` in the
-        // export and the still, which no compositor draws, whatever its caps; a position that holds
-        // is placed as ever.
+        // export and the still, which a plan refuses (`KeyedPlacement`) unless the caps say the compositor draws
+        // that; a position that holds is placed as ever.
         let placement = |u: &Unsupported| matches!(u, Unsupported::KeyedPlacement(_));
         let all = GpuCaps {
             keyed_zoom: true,
@@ -2152,10 +2159,10 @@ mod tests {
     }
 
     /// A clip's live behaviours are part of the pose the plan carries (`transform_at`, the exact numbers the
-    /// graph's expressions give at that frame), and the flags say what chain the pose is drawn by — but no
-    /// compositor has a parity case for a pose that moves by a formula, so every frame of such a layer is
-    /// refused (`Unsupported::Behavior`) until `GpuCaps::behaviors`, in a still and in an export frame. A
-    /// behaviour that moves nothing is not live: it flags nothing and refuses nothing.
+    /// graph's expressions give at that frame), and the flags say what chain the pose is drawn by. Every frame of
+    /// such a layer is refused (`Unsupported::Behavior`) until `GpuCaps::behaviors`, in a still and in an export frame,
+    /// and a sway or a spin (a rotation) whatever the caps. A behaviour that moves nothing is not live: it flags nothing
+    /// and refuses nothing.
     #[test]
     fn live_behaviours_are_the_pose_the_plan_carries_and_are_refused_until_a_compositor_says_it_draws_them() {
         use crate::model::Behavior;
@@ -2245,8 +2252,9 @@ mod tests {
                     refused.contains(&"behavior"),
                     "{b:?} {mode:?}: no cap draws them yet: {refused:?}"
                 );
-                // With the bit set the pose is judged as any other: a sway and a spin are a keyed rotation, and
-                // the rest are placed at sub-pixel positions, which nothing draws either.
+                // With the bit set the pose is judged as any other: a sway and a spin turn the picture (a keyed rotation,
+                // which no compositor draws to the sample) and stay refused whatever the caps, and the rest are placed
+                // at sub-pixel positions, which the placement draws.
                 let drawn = kinds(
                     &plan,
                     &GpuCaps {
@@ -2254,15 +2262,37 @@ mod tests {
                         ..everything
                     },
                 );
-                assert_eq!(drawn.contains(&"keyed_placement"), places, "{b:?} {mode:?}: {drawn:?}");
-                assert!(!drawn.contains(&"behavior"), "{b:?} {mode:?}: {drawn:?}");
-                // (The turn is `rotation`'s: a key or a behaviour that turns the picture is another box, and a still's sampled angle is not a quarter.)
-                assert_eq!(drawn.contains(&"rotation"), rotation, "{b:?} {mode:?}: {drawn:?}");
-                assert_eq!(
-                    drawn.len(),
-                    usize::from(places) + usize::from(rotation),
-                    "{b:?} {mode:?}: {drawn:?}"
-                );
+                if rotation {
+                    assert!(drawn.contains(&"behavior"), "{b:?} {mode:?}: {drawn:?}");
+                    // (...and its turn is `rotation`'s too: a key or a behaviour that turns the picture is another box, and a still's
+                    // sampled angle is not a quarter.)
+                    assert!(drawn.contains(&"rotation"), "{b:?} {mode:?}: {drawn:?}");
+                    let placed = kinds(
+                        &plan,
+                        &GpuCaps {
+                            behaviors: true,
+                            placement: true,
+                            ..everything
+                        },
+                    );
+                    assert!(
+                        placed.contains(&"behavior") && placed.contains(&"rotation"),
+                        "{b:?} {mode:?}: {placed:?}"
+                    );
+                } else {
+                    assert!(!drawn.contains(&"behavior"), "{b:?} {mode:?}: {drawn:?}");
+                    assert_eq!(drawn.contains(&"keyed_placement"), places, "{b:?} {mode:?}: {drawn:?}");
+                    assert_eq!(drawn.len(), usize::from(places), "{b:?} {mode:?}: {drawn:?}");
+                    let placed = kinds(
+                        &plan,
+                        &GpuCaps {
+                            behaviors: true,
+                            placement: true,
+                            ..everything
+                        },
+                    );
+                    assert!(placed.is_empty(), "{b:?} {mode:?}: {placed:?}");
+                }
             }
         }
         // A behaviour that moves nothing is not live, and a clip without any is as it was.
@@ -2610,6 +2640,8 @@ mod tests {
             keyed_opacity: true,
             keyed_zoom: true,
             placement: false,
+            placed_chroma: false,
+            file_range: false,
             behaviors: false,
             keyed_color: true,
             mask: true,
@@ -3154,6 +3186,7 @@ mod tests {
             drop_first: false,
             lead: 0.0,
             image: None,
+            pinned: false,
         };
         assert_eq!(export.layers[0].pick, Pick::Fps(want));
         // A still image is a run of frames made up from the delivery rate (`-loop 1 -framerate`).
