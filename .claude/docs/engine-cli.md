@@ -206,7 +206,9 @@ so the feature is **only** activated through these forwards — which is what ma
   have closed**: 30 s of grace, then kill (`child.wait()` after a pipe closes blocked for good on a
   muxer flushing to a share that went away). The in-process libav probe (`ffmpeg` feature) runs on
   a thread and is abandoned after 300 s or when its cancel goes true (`probe_within`, polled every
-  50 ms; the thread cannot be killed, it holds only the path). **A failed decode is an error, never an empty answer**: a `silencedetect` or
+  50 ms; the thread cannot be killed, it holds only the path). After `paths::confine_demuxers` (a confined headless run)
+  every probe is the `ffprobe` one with `-format_whitelist paths::MEDIA_DEMUXERS` before the input (`probe_args`; off,
+  the argv is unchanged), so a playlist or manifest is refused before FFmpeg opens anything it names. **A failed decode is an error, never an empty answer**: a `silencedetect` or
   scene pass that exits non-zero, and a `loudnorm` run that does (it prints its summary on the way
   out, a plausible number for a file never read to its end), fail with ffmpeg's last words;
   the one non-zero exit that is an answer is a file with no stream of that kind ("Output file

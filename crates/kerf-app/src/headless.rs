@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use kerf_core::Project;
 
+use crate::mcp::Workspace;
 use crate::shell::{Headless, Shell};
 use crate::{lock_user, mcp, recovery, settings, AppState, LaunchSlot};
 
@@ -25,6 +26,8 @@ const ENV_TOKEN: &str = "KERF_MCP_TOKEN";
 /// ... its cache ceiling in GiB (`--cache-max-gb`), and the directory its caches live under (`--cache-dir`).
 const ENV_CACHE_MAX_GB: &str = "KERF_CACHE_MAX_GB";
 const ENV_CACHE_DIR: &str = "KERF_CACHE_DIR";
+/// The environment variable that names the workspace when `--workspace` does not.
+const ENV_WORKSPACE: &str = "KERF_WORKSPACE";
 
 const EXIT_FAILURE: i32 = 1;
 const EXIT_USAGE: i32 = 2;
@@ -42,6 +45,9 @@ logs go to stderr. Stops on SIGINT / SIGTERM.
   --tools SETS             with --stdio, list only these tool sets (e.g. core,titles)
   --project PATH.kerf      open an existing project (default: a new untitled one)
   --new-project PATH.kerf  create a project file and open it (refused if it exists)
+  --workspace DIR          confine every file a client names to DIR: relative paths resolve against it,
+                           anything outside it is refused (default: KERF_WORKSPACE; unset, no confinement).
+                           --project / --new-project then resolve against DIR and must lie inside it
   --mcp-addr HOST:PORT     where to listen (default: KERF_MCP_ADDR, the setting, 127.0.0.1:7777;
                            port 0 picks a free one)
   --data-dir DIR           keep settings, logs and recovery files in DIR instead of the app's own
@@ -75,6 +81,7 @@ struct Args {
     stdio: bool,
     tools: Option<String>,
     project: Option<ProjectArg>,
+    workspace: Option<PathBuf>,
     mcp_addr: Option<String>,
     data_dir: Option<PathBuf>,
     token_file: Option<PathBuf>,
@@ -235,12 +242,14 @@ fn cache_from_env(args: &mut Args, cwd: &Path, get: impl Fn(&str) -> Option<Stri
     Ok(())
 }
 
-/// The command line of a headless run (`None` when it is not one), relative paths against `cwd`.
-fn parse(argv: &[String], cwd: &Path) -> Result<Option<Args>, String> {
+/// The command line of a headless run (`None` when it is not one), relative paths against `cwd` —
+/// the project's against the workspace when there is one (`--workspace`, else `env_workspace`).
+fn parse(argv: &[String], cwd: &Path, env_workspace: Option<&str>) -> Result<Option<Args>, String> {
     if !requested(argv) {
         return Ok(None);
     }
     let mut args = Args::default();
+    let mut project: Option<(bool, String)> = None;
     let mut rest = argv.iter().skip(1).map(String::as_str);
     while let Some(arg) = rest.next() {
         let (flag, inline) = match arg.split_once('=') {
@@ -273,15 +282,12 @@ fn parse(argv: &[String], cwd: &Path) -> Result<Option<Args>, String> {
                 args.tools = Some(tools);
             }
             "--project" | "--new-project" => {
-                if args.project.is_some() {
+                if project.is_some() {
                     return Err("give one --project or --new-project".to_string());
                 }
-                let path = kerf_path(&value()?, cwd)?;
-                args.project = Some(match flag {
-                    "--project" => ProjectArg::Open(path),
-                    _ => ProjectArg::Create(path),
-                });
+                project = Some((flag == "--project", value()?));
             }
+            "--workspace" => args.workspace = Some(absolute(&value()?, cwd)),
             "--mcp-addr" => {
                 let addr = value()?.trim().to_string();
                 mcp::check_addr(&addr)?;
@@ -321,6 +327,20 @@ fn parse(argv: &[String], cwd: &Path) -> Result<Option<Args>, String> {
     } else if args.tools.is_some() {
         return Err("--tools is for --stdio (over HTTP, add ?tools= to the URL)".to_string());
     }
+    if args.workspace.is_none() {
+        args.workspace = env_workspace
+            .map(str::trim)
+            .filter(|w| !w.is_empty())
+            .map(|w| absolute(w, cwd));
+    }
+    if let Some((open, path)) = project {
+        let path = kerf_path(&path, args.workspace.as_deref().unwrap_or(cwd))?;
+        args.project = Some(if open {
+            ProjectArg::Open(path)
+        } else {
+            ProjectArg::Create(path)
+        });
+    }
     Ok(Some(args))
 }
 
@@ -336,7 +356,7 @@ fn say(line: &str) {
 /// Run headless with `argv` until a signal; the exit code.
 pub(crate) fn main(argv: &[String], bundled_ffmpeg: &[(&'static str, PathBuf)]) -> i32 {
     let cwd = std::env::current_dir().unwrap_or_default();
-    let mut args = match parse(argv, &cwd) {
+    let mut args = match parse(argv, &cwd, std::env::var(ENV_WORKSPACE).ok().as_deref()) {
         Ok(Some(args)) => args,
         Ok(None) => return EXIT_USAGE,
         Err(e) => {
@@ -357,12 +377,38 @@ pub(crate) fn main(argv: &[String], bundled_ffmpeg: &[(&'static str, PathBuf)]) 
         say(&format!("kerf-app: {e}\n\n{USAGE}"));
         return EXIT_USAGE;
     }
+    let workspace = match open_workspace(&mut args) {
+        Ok(workspace) => workspace,
+        Err(Exit(code, message)) => {
+            say(&format!("kerf-app: {message}"));
+            return code;
+        }
+    };
+    // Before any of Kerf's directories is made: one refused here must not be left in the workspace.
+    if let Some(ws) = &workspace {
+        let (config, data) = dirs_of(args.data_dir.as_deref());
+        let cache = args.cache_dir.clone().or_else(kerf_core::paths::cache_dir);
+        let kerf_dirs = [
+            ("the settings directory", config),
+            ("the data directory", data),
+            ("--token-file", args.token_file.clone()),
+            ("Kerf's cache", cache.map(|d| d.join("kerf"))),
+            ("Kerf's generated media", dirs::data_dir().map(|d| d.join("kerf"))),
+            ("the template library", kerf_core::template::library_dir()),
+        ];
+        if let Err(Exit(code, message)) = refuse_kerf_own_inside(ws, &kerf_dirs) {
+            say(&format!("kerf-app: {message}"));
+            return code;
+        }
+    }
     if let Err(Exit(code, message)) =
         use_cache_dir(args.cache_dir.as_deref()).and_then(|()| check_cache_cap(&args, kerf_core::paths::cache_dir()))
     {
         say(&format!("kerf-app: {message}"));
         return code;
     }
+    // A download into the cache and nothing else; a --workspace given with it was checked above (the
+    // cache may not lie in it), and is not otherwise used.
     if let Some(models) = &args.prefetch {
         return prefetch(models);
     }
@@ -392,7 +438,7 @@ pub(crate) fn main(argv: &[String], bundled_ffmpeg: &[(&'static str, PathBuf)]) 
     for (var, path) in bundled_ffmpeg {
         tracing::info!(%var, path = %path.display(), "using bundled FFmpeg binary");
     }
-    match run(&args, token, rpc, config, data) {
+    match run(&args, token, rpc, workspace, config, data) {
         Ok(code) => code,
         Err(Exit(code, message)) => {
             tracing::error!("{message}");
@@ -419,6 +465,42 @@ fn check_cache_cap(args: &Args, cache_dir: Option<PathBuf>) -> Result<(), Exit> 
         ));
     }
     Ok(())
+}
+
+/// The workspace, if the run has one: an existing directory (else a usage error), with the project
+/// file confined to it (resolved in it, refused outside it).
+fn open_workspace(args: &mut Args) -> Result<Option<Arc<Workspace>>, Exit> {
+    let Some(dir) = &args.workspace else {
+        return Ok(None);
+    };
+    let usage = |message: String| Exit(EXIT_USAGE, message);
+    let workspace = Workspace::open(dir).map_err(usage)?;
+    if let Some(ProjectArg::Open(path) | ProjectArg::Create(path)) = &mut args.project {
+        let named = path.to_string_lossy().into_owned();
+        *path = PathBuf::from(workspace.resolve(&named).map_err(|e| usage(format!("--project: {e}")))?);
+    }
+    Ok(Some(Arc::new(workspace)))
+}
+
+/// Refuse (a usage error) when one of Kerf's own files and directories lies in the workspace:
+/// clients could read or replace it.
+fn refuse_kerf_own_inside(ws: &Workspace, paths: &[(&str, Option<PathBuf>)]) -> Result<(), Exit> {
+    let inside = paths
+        .iter()
+        .filter_map(|(what, path)| Some((*what, path.as_deref()?)))
+        .find(|(_, path)| ws.holds(path));
+    match inside {
+        Some((what, path)) => Err(Exit(
+            EXIT_USAGE,
+            format!(
+                "{what} {} lies inside --workspace {}: clients could read or replace it (pick another --data-dir, \
+                 --cache-dir or workspace)",
+                path.display(),
+                ws.root()
+            ),
+        )),
+        None => Ok(()),
+    }
 }
 
 /// What can be refused before anything starts: the project file, the token file, the token. The
@@ -457,18 +539,22 @@ fn check_args(args: &Args) -> Result<Option<String>, Exit> {
 /// The config and data directories: `--data-dir` for both, else the desktop app's own (the
 /// identifier is the build's, so a debug build keeps to the `.dev` ones).
 fn dirs_for(data_dir: Option<&Path>) -> Result<(Option<PathBuf>, Option<PathBuf>), Exit> {
+    if let Some(dir) = data_dir {
+        std::fs::create_dir_all(dir).map_err(|e| Exit(EXIT_USAGE, format!("cannot use --data-dir {}: {e}", dir.display())))?;
+    }
+    Ok(dirs_of(data_dir))
+}
+
+/// [`dirs_for`] without making anything.
+fn dirs_of(data_dir: Option<&Path>) -> (Option<PathBuf>, Option<PathBuf>) {
     match data_dir {
-        Some(dir) => {
-            std::fs::create_dir_all(dir)
-                .map_err(|e| Exit(EXIT_USAGE, format!("cannot use --data-dir {}: {e}", dir.display())))?;
-            Ok((Some(dir.to_path_buf()), Some(dir.to_path_buf())))
-        }
+        Some(dir) => (Some(dir.to_path_buf()), Some(dir.to_path_buf())),
         None => {
             let identifier = crate::context().config().identifier.clone();
-            Ok((
+            (
                 dirs::config_dir().map(|d| d.join(&identifier)),
                 dirs::data_dir().map(|d| d.join(&identifier)),
-            ))
+            )
         }
     }
 }
@@ -536,6 +622,7 @@ fn run(
     args: &Args,
     token: Option<String>,
     rpc: Option<RpcOut>,
+    workspace: Option<Arc<Workspace>>,
     config: Option<PathBuf>,
     data: Option<PathBuf>,
 ) -> Result<i32, Exit> {
@@ -544,6 +631,12 @@ fn run(
         Some(ProjectArg::Open(path) | ProjectArg::Create(path)) => Project::open(path).map_err(failed)?,
         None => Project::open_in_memory().map_err(failed)?,
     };
+    if let Some(ws) = &workspace {
+        if let Err(e) = ws.check_project(&project) {
+            project.close();
+            return Err(Exit(EXIT_USAGE, format!("--project: {e}")));
+        }
+    }
     let project = Arc::new(Mutex::new(project));
     let state = AppState::new(
         project.clone(),
@@ -577,17 +670,20 @@ fn run(
     std::thread::spawn(kerf_core::fonts::warm);
     std::thread::spawn(crate::warm_transcription_backend);
 
-    let stdio = rpc.map(|rpc| (mcp::start_stdio(shell.clone(), project.clone(), args.tools.as_deref()), rpc));
     let token_source = match (&token, &stored.mcp_token) {
         (Some(_), _) => "env",
         (None, Some(_)) => "settings",
         (None, None) => "generated",
     };
+    // Before either server is made: the stdio one takes its workspace from these too.
+    let workspace_root = workspace.as_ref().map(|w| w.root().to_string());
+    mcp::set_overrides(mcp::Overrides {
+        addr: args.mcp_addr.clone(),
+        token,
+        workspace,
+    });
+    let stdio = rpc.map(|rpc| (mcp::start_stdio(shell.clone(), project.clone(), args.tools.as_deref()), rpc));
     if stdio.is_none() {
-        mcp::set_overrides(mcp::Overrides {
-            addr: args.mcp_addr.clone(),
-            token,
-        });
         mcp::start(shell.clone(), project.clone());
     }
     // Nobody is there to review: the agent's edits land live unless `--review` asks otherwise. For
@@ -603,11 +699,12 @@ fn run(
         project = %lock_user(&project).path().map(|p| p.display().to_string()).unwrap_or_default(),
         review = settings::agent_review(),
         stdio = stdio.is_some(),
+        workspace = %workspace_root.as_deref().unwrap_or_default(),
         "kerf starting headless"
     );
     match stdio {
         Some((server, rpc)) => tauri::async_runtime::block_on(serve_stdio(server, rpc, &shell, &project)),
-        None => tauri::async_runtime::block_on(serve(args, &shell, &project, token_source)),
+        None => tauri::async_runtime::block_on(serve(args, &shell, &project, token_source, workspace_root.as_deref())),
     }
 }
 
@@ -642,7 +739,13 @@ async fn serve_stdio(server: mcp::Stdio, rpc: RpcOut, shell: &Shell, project: &A
     ended.map(|()| 0).map_err(|e| Exit(EXIT_FAILURE, e))
 }
 
-async fn serve(args: &Args, shell: &Shell, project: &Arc<Mutex<Project>>, token_source: &str) -> Result<i32, Exit> {
+async fn serve(
+    args: &Args,
+    shell: &Shell,
+    project: &Arc<Mutex<Project>>,
+    token_source: &str,
+    workspace: Option<&str>,
+) -> Result<i32, Exit> {
     // Listening before the ready line: a signal right after it must not kill the process outright.
     let mut signals = Signals::new().map_err(|e| Exit(EXIT_FAILURE, format!("cannot listen for signals: {e}")))?;
     let bound = mcp::wait_listening(Duration::from_secs(10))
@@ -671,7 +774,7 @@ async fn serve(args: &Args, shell: &Shell, project: &Arc<Mutex<Project>>, token_
         };
         say(&format!("kerf: the token is {held}\nkerf: {}", add("<token>")));
     }
-    let ready = serde_json::json!({
+    let mut ready = serde_json::json!({
         "kerf": "listening",
         "url": url,
         "addr": bound.to_string(),
@@ -680,6 +783,9 @@ async fn serve(args: &Args, shell: &Shell, project: &Arc<Mutex<Project>>, token_
         "agent_review": settings::agent_review(),
         "token_source": token_source,
     });
+    if let Some(root) = workspace {
+        ready["workspace"] = root.into();
+    }
     let mut out = std::io::stdout().lock();
     let _ = writeln!(out, "{ready}").and_then(|()| out.flush());
     drop(out);
@@ -764,7 +870,7 @@ mod tests {
     }
 
     fn parsed(args: &[&str]) -> Result<Option<Args>, String> {
-        parse(&argv(args), Path::new("/work"))
+        parse(&argv(args), Path::new("/work"), None)
     }
 
     #[test]
@@ -801,6 +907,7 @@ mod tests {
                 stdio: false,
                 tools: None,
                 project: Some(ProjectArg::Open(PathBuf::from("/work/cut.kerf"))),
+                workspace: None,
                 mcp_addr: Some("127.0.0.1:0".to_string()),
                 data_dir: Some(PathBuf::from("/tmp/kerf")),
                 token_file: Some(PathBuf::from("/work/token")),
@@ -818,6 +925,95 @@ mod tests {
         assert_eq!(args.project, Some(ProjectArg::Create(PathBuf::from("/abs/new.KERF"))));
         assert_eq!(parsed(&["--headless"]).unwrap().unwrap(), Args::default());
         assert!(parsed(&["--headless", "-h"]).unwrap().unwrap().help);
+    }
+
+    #[test]
+    fn a_workspace_comes_from_the_flag_or_the_environment_and_holds_the_project() {
+        let args = parsed(&["--headless", "--project", "cut.kerf", "--workspace", "ws"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(args.workspace, Some(PathBuf::from("/work/ws")));
+        assert_eq!(args.project, Some(ProjectArg::Open(PathBuf::from("/work/ws/cut.kerf"))));
+        let env = |args: &[&str], env| parse(&argv(args), Path::new("/work"), env).unwrap().unwrap();
+        let from_env = env(&["--headless", "--new-project=new.kerf"], Some("/srv/ws"));
+        assert_eq!(from_env.workspace, Some(PathBuf::from("/srv/ws")));
+        assert_eq!(from_env.project, Some(ProjectArg::Create(PathBuf::from("/srv/ws/new.kerf"))));
+        assert_eq!(
+            env(&["--headless", "--workspace=/a"], Some("/b")).workspace,
+            Some(PathBuf::from("/a"))
+        );
+        assert_eq!(env(&["--headless"], Some("  ")).workspace, None);
+        assert!(parsed(&["--headless", "--workspace"]).unwrap_err().contains("needs a value"));
+    }
+
+    #[test]
+    fn a_workspace_must_exist_and_the_project_must_lie_in_it() {
+        let dir = std::env::temp_dir().join(format!("kerf-headless-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(dir.join("ws")).unwrap();
+        let ws = std::fs::canonicalize(dir.join("ws")).unwrap();
+        let open = |workspace: PathBuf, project: Option<ProjectArg>| {
+            let mut args = Args {
+                workspace: Some(workspace),
+                project,
+                ..Args::default()
+            };
+            open_workspace(&mut args).map(|w| (w.map(|w| w.root().to_string()), args.project))
+        };
+        let missing = open(dir.join("missing"), None).err().unwrap();
+        assert_eq!(missing.0, EXIT_USAGE);
+        let outside = open(ws.clone(), Some(ProjectArg::Create(dir.join("outside.kerf"))))
+            .err()
+            .unwrap();
+        assert_eq!(outside.0, EXIT_USAGE);
+        assert!(outside.1.contains("outside the workspace"), "{}", outside.1);
+        let (root, project) = open(ws.clone(), Some(ProjectArg::Create(ws.join("cut.kerf")))).ok().unwrap();
+        assert!(root.is_some());
+        assert_eq!(
+            project,
+            Some(ProjectArg::Create(PathBuf::from(root.unwrap()).join("cut.kerf")))
+        );
+        let mut none = Args::default();
+        assert!(open_workspace(&mut none).ok().unwrap().is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn kerf_s_own_files_may_not_lie_in_the_workspace() {
+        let dir = std::env::temp_dir().join(format!("kerf-headless-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(dir.join("ws")).unwrap();
+        let ws = Workspace::open(&dir.join("ws")).unwrap();
+        let paths = [
+            ("the data directory", Some(dir.join("data"))),
+            ("--token-file", Some(dir.join("ws").join("secrets").join("token"))),
+        ];
+        let Exit(code, message) = refuse_kerf_own_inside(&ws, &paths).unwrap_err();
+        assert_eq!(code, EXIT_USAGE);
+        assert!(message.starts_with("--token-file"), "{message}");
+        assert!(refuse_kerf_own_inside(&ws, &paths[..1]).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `--cache-dir` puts the caches under `DIR/kerf`: a DIR in the workspace is refused, one beside it
+    /// is not.
+    #[test]
+    fn a_cache_dir_inside_the_workspace_is_a_usage_error() {
+        let dir = std::env::temp_dir().join(format!("kerf-headless-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(dir.join("ws")).unwrap();
+        let ws = Workspace::open(&dir.join("ws")).unwrap();
+        let cache = |base: PathBuf| [("Kerf's cache", Some(base.join("kerf")))];
+        let Exit(code, message) = refuse_kerf_own_inside(&ws, &cache(dir.join("ws").join("caches"))).unwrap_err();
+        assert_eq!(code, EXIT_USAGE);
+        assert!(
+            message.contains("Kerf's cache") && message.contains("--cache-dir"),
+            "{message}"
+        );
+        assert!(refuse_kerf_own_inside(&ws, &cache(dir.join("ws"))).is_err());
+        assert!(refuse_kerf_own_inside(&ws, &cache(dir.join("caches"))).is_ok());
+        assert!(
+            refuse_kerf_own_inside(&ws, &cache(dir.clone())).is_ok(),
+            "DIR/kerf beside the workspace"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

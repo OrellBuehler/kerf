@@ -642,10 +642,28 @@ pub fn probe_cancellable(path: &Path, cancel: &dyn Fn() -> bool) -> Result<Probe
 
 #[cfg_attr(feature = "ffmpeg", allow(dead_code))]
 fn probe_with(path: &Path, cancel: Option<&dyn Fn() -> bool>) -> Result<ProbeResult> {
+    probe_formats(path, cancel, crate::paths::demuxer_whitelist())
+}
+
+/// The `ffprobe` arguments of a probe of `path`: `-format_whitelist` only when `formats` names some
+/// (a confined run), so every other probe's argv is unchanged.
+fn probe_args(path: &Path, formats: Option<&str>) -> Vec<std::ffi::OsString> {
+    let mut args: Vec<std::ffi::OsString> = ["-v", "error", "-show_format", "-show_streams", "-of", "json"]
+        .into_iter()
+        .map(Into::into)
+        .collect();
+    if let Some(formats) = formats {
+        args.extend(["-format_whitelist".into(), formats.into()]);
+    }
+    args.push(path.into());
+    args
+}
+
+/// [`probe_with`], held to the demuxers `formats` names when it names some.
+fn probe_formats(path: &Path, cancel: Option<&dyn Fn() -> bool>, formats: Option<&str>) -> Result<ProbeResult> {
     let bin = ffprobe_bin();
     let mut cmd = command(&bin);
-    cmd.args(["-v", "error", "-show_format", "-show_streams", "-of", "json"])
-        .arg(path);
+    cmd.args(probe_args(path, formats));
     let output = output_bounded_cancellable(cmd, PROBE_TIMEOUT, cancel)
         .map_err(|e| match e.kind() {
             std::io::ErrorKind::TimedOut => Error::Engine(format!(
@@ -4332,6 +4350,13 @@ impl LoudnessPreset {
     /// that much (the reason the plain `loudnorm` option asks for -1.5).
     fn filter(self) -> String {
         format!("loudnorm=I={}:TP={}:LRA=11", self.lufs(), self.true_peak_db() - 0.5)
+    }
+}
+
+impl ExportOptions {
+    /// The caption files an export with these options writes beside `output` (`caption_sidecars`).
+    pub fn caption_sidecar_paths(&self, output: &Path) -> Vec<PathBuf> {
+        side_files::sidecar_paths(output, self).into_iter().map(|(_, p)| p).collect()
     }
 }
 
@@ -11475,6 +11500,10 @@ mod denoise;
 use denoise::denoise_filter;
 #[cfg(test)]
 use denoise::with_afftdn_delay;
+
+/// A confined run's probe: its argv, and what the real `ffprobe` refuses (`#[ignore]`d).
+#[cfg(test)]
+mod confined_probe;
 
 /// Noise reduction through the real `ffmpeg`: the sound keeps its sync and its length (`#[ignore]`d).
 #[cfg(test)]

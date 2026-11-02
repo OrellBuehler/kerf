@@ -100,11 +100,13 @@ impl McpConfig {
     }
 }
 
-/// The headless run's own address (`--mcp-addr`) and token (`KERF_MCP_TOKEN`, never stored).
+/// The headless run's own address (`--mcp-addr`), token (`KERF_MCP_TOKEN`, never stored) and
+/// workspace (`--workspace`, the directory every path a client names must lie in).
 #[derive(Default)]
 pub(crate) struct Overrides {
     pub addr: Option<String>,
     pub token: Option<String>,
+    pub workspace: Option<Arc<super::Workspace>>,
 }
 
 static OVERRIDES: OnceLock<Overrides> = OnceLock::new();
@@ -114,6 +116,11 @@ pub(crate) fn set_overrides(overrides: Overrides) {
     if OVERRIDES.set(overrides).is_err() {
         tracing::warn!("the MCP overrides were set twice");
     }
+}
+
+/// The directory a headless run confines clients' paths to, if it was given one.
+pub(crate) fn workspace() -> Option<Arc<super::Workspace>> {
+    OVERRIDES.get().and_then(|o| o.workspace.clone())
 }
 
 /// Whether `KERF_MCP_ADDR` is set to something, i.e. the stored address is not what is in force.
@@ -1556,6 +1563,7 @@ mod tests {
         let named = Overrides {
             addr: Some("127.0.0.1:0".into()),
             token: Some("e".repeat(40)),
+            workspace: None,
         };
         let config = McpConfig::resolve(&off, None).overridden(&named);
         assert!(config.enabled && config.require_token);

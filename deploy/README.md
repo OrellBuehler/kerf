@@ -43,7 +43,7 @@ docker stop -t 30 kerf                      # shutdown cancels jobs and waits fo
 | `KERF_MCP_ADDR` | Where to listen inside the container (default `0.0.0.0:7777`). Change it here, not with `--mcp-addr`: the health check reads the port from it |
 | `KERF_PREFETCH_MODELS` | Download models into `/cache` before serving, e.g. `whisper:base,kokoro,demucs,soundfont`; a bad list stops the start, a failed download only warns (it is fetched on first use) |
 | `KERF_WHISPER_MODEL` | The speech model transcription uses (default `base`); match it to a prefetched `whisper:NAME` |
-| `KERF_WORKSPACE` | Set to `/workspace`. Builds with `--workspace` support (the release after PR #264) refuse paths outside it; older ones ignore it |
+| `KERF_WORKSPACE` | Set to `/workspace`: every path a client names is resolved in it and refused outside it (see Security) |
 | `KERF_CACHE_DIR`, `KERF_CACHE_MAX_GB` | Cache location (`/cache`, also where models are prefetched) and an optional ceiling in GiB for proxies, waveforms, filmstrips and stems (models are never removed) |
 | arguments after the image name | Passed to `kerf-app`, e.g. `--project /workspace/cut.kerf`, `--review`, `--cpu-percent 75` |
 
@@ -125,7 +125,7 @@ limit) keeps one tenant's export from starving the others.
   loopback without one. Revoking means a new token and a restart.
 - **TLS in front.** The token is a bearer secret: never expose port 7777 itself to the network;
   let Caddy (or another proxy) terminate TLS.
-- **One container per tenant.** Path confinement (with a `--workspace` build) is enforced by the
+- **One container per tenant.** Path confinement (`KERF_WORKSPACE`) is enforced by the
   MCP API, not by the kernel: the container boundary is what keeps one tenant's files and
   processes from another's.
 - **Least privilege.** The compose file runs with a read-only root filesystem, a `/tmp` tmpfs,

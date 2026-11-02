@@ -118,6 +118,8 @@
   `save_as` call it. It canonicalises and stats, so an adapter that renders with the lock released
   takes `output_path_inputs()` (a `paths::Protected` list, database + environment only) under the lock
   and runs the static `Project::check_output_path_with(out, &protected)` after releasing it.
+  `referenced_files()` lists every file the project names on disk — `media` (asset and capture files) and `luts`
+  (each LUT in the cut, the history snapshots, the proposal and its undo steps) — for a host that confines files to a directory.
   `history_page(Page)` / `list_tasks_page(Page)` window a long list from the newest end
   (`Page { limit, offset }`) and return the total.
   **What a setter accepts is checked where it is set**: a non-finite number is refused by every

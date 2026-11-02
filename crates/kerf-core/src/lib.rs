@@ -137,12 +137,12 @@ pub use play_plan::{PlayAhead, PlayCut, PlayRefusal};
 pub use project::{
     AlignTo, AudioSync, AudioSyncMeasure, AudioSyncPlan, BakedClip, BandBalance, BandBalanceRequest, BandPlan, BandSource, Batch,
     ComposePlan, ComposeRequest, Composed, CutTranscript, CutTranscriptInputs, DeliveryInputs, ExportedFile, FramingPlan,
-    MissingAsset, MotionApplied, Page, PlannedSfx, PreparedText, Project, RelinkCheck, Relinked, RemovedAsset, ScoreAlign,
-    SfxPlaced, SfxPlacement, SfxPlan, SfxUpdate, SmartCropJob, SmartCropPlan, StabilizeJob, StabilizeStatusInput, StemsPlaced,
-    SubsetApplied, SvgChecked, SvgLayout, SvgOverlayResult, SvgSource, SyncSide, ThumbnailLayerSpec, ThumbnailResult,
-    ThumbnailSpec, TitleClipPatch, TitleClipPlacement, TitleClipResult, TitleEdited, TitleTextForm, TitleTextInputs,
-    Untranscribed, DEFAULT_HISTORY_LIMIT, MAX_CHANNEL_KEYS, MAX_SFX_GAIN_DB, MAX_SFX_PER_CALL, MAX_SYNC_SECONDS, MIN_SFX_GAIN_DB,
-    MUSIC_TRACK, SCHEMA_VERSION, SFX_TRACK, STAGED_UNDO_DEPTH, SYNC_SAMPLE_RATE, VOICEOVER_TRACK,
+    MissingAsset, MotionApplied, Page, PlannedSfx, PreparedText, Project, ReferencedFiles, RelinkCheck, Relinked, RemovedAsset,
+    ScoreAlign, SfxPlaced, SfxPlacement, SfxPlan, SfxUpdate, SmartCropJob, SmartCropPlan, StabilizeJob, StabilizeStatusInput,
+    StemsPlaced, SubsetApplied, SvgChecked, SvgLayout, SvgOverlayResult, SvgSource, SyncSide, ThumbnailLayerSpec,
+    ThumbnailResult, ThumbnailSpec, TitleClipPatch, TitleClipPlacement, TitleClipResult, TitleEdited, TitleTextForm,
+    TitleTextInputs, Untranscribed, DEFAULT_HISTORY_LIMIT, MAX_CHANNEL_KEYS, MAX_SFX_GAIN_DB, MAX_SFX_PER_CALL, MAX_SYNC_SECONDS,
+    MIN_SFX_GAIN_DB, MUSIC_TRACK, SCHEMA_VERSION, SFX_TRACK, STAGED_UNDO_DEPTH, SYNC_SAMPLE_RATE, VOICEOVER_TRACK,
 };
 pub use project::{
     AssembleByTag, AssemblePlan, AssembleSummary, AssembledGroup, GroupTitle, PreparedAssemble, SortWithin, MAX_TAG_TITLE_SECONDS,
