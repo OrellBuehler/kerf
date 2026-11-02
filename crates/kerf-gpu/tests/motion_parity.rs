@@ -12084,6 +12084,7 @@ fn checker_e_m_a_turned_picture_of_another_shape_depth_or_label_is_the_exports_o
         ("odd width 203x360", &m.bars, &s.odd_width, Some(true)),
         ("odd height 640x203", &m.bars, &s.odd_height, None),
         ("10-bit tv", &m.bars, &s.tenbit_tv, None),
+        ("10-bit tv over 10-bit tv", &s.tenbit_tv, &s.tenbit_tv, None),
         ("10-bit", &m.bars, &v.tenbit, None),
         ("10-bit pc", &m.bars, &v.tenbit_pc, None),
         ("yuvj420p", &m.bars, &v.mjpeg, None),
@@ -12093,7 +12094,7 @@ fn checker_e_m_a_turned_picture_of_another_shape_depth_or_label_is_the_exports_o
         ("709 over untagged", &m.bars, &v.testsrc709, None),
         ("untagged over 709", &v.bars709, &m.testsrc, None),
         ("170m over 470bg", &v.bars470bg, &v.testsrc170m, None),
-        ("noise over 709", &v.bars709, &m.noise, Some(true)),
+        ("noise over 709", &v.bars709, &m.noise, None),
         ("720p 709 over untagged", &h.untagged, &h.phone, None),
         ("720p untagged over 709", &h.phone, &h.untagged, None),
     ];
@@ -12112,7 +12113,10 @@ fn checker_e_m_a_turned_picture_of_another_shape_depth_or_label_is_the_exports_o
                 if let Some(mode) = mode {
                     c.blend_mode = mode;
                 }
-                let assets = [bottom.clone(), top.clone()];
+                let mut assets = vec![bottom.clone()];
+                if top.id != bottom.id {
+                    assets.push(top.clone());
+                }
                 let tl = timeline(vec![vec![clip(bottom, 0.1, 0.4, 0.0)], vec![c]], None);
                 let quarter = kerf_core::quarter_turn(angle.to_radians()).is_some();
                 let scaled = r3_resized(&tl, &assets, 30.0);
