@@ -206,7 +206,7 @@ fn checker_e_quarter_turn_is_the_set_rotate_turns_exactly_for_every_quarter() {
 
 /// Angles a hair off a quarter (in radians and in degrees, either side, from 1e-13 up to a hundredth of a radian) and a handful of
 /// tiny angles: whatever the plan accepts FFmpeg turns exactly. The ones it refuses and FFmpeg draws exactly are printed (`WIDER`): the plan's
-/// window is a billionth of a quarter, FFmpeg's fast path is `FLT_EPSILON` and its integer angle a sixteenth of a millionth of a radian.
+/// window is `FLT_EPSILON` radians of a quarter, FFmpeg's fast path is `FLT_EPSILON` and its integer angle a sixteenth of a millionth of a radian.
 #[test]
 #[ignore = "needs ffmpeg"]
 fn checker_e_a_hair_off_a_quarter_is_accepted_only_where_rotate_is_exact() {
