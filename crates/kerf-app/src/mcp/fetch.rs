@@ -171,29 +171,32 @@ pub(super) fn own_addresses() -> Vec<IpAddr> {
     // frees with `freeifaddrs`; an address is read as `sockaddr_in` / `sockaddr_in6` only when its
     // family says it is one.
     unsafe {
-        let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
-        if libc::getifaddrs(&mut list) != 0 {
+        let mut head = std::mem::MaybeUninit::<*mut libc::ifaddrs>::uninit();
+        if libc::getifaddrs(head.as_mut_ptr()) != 0 {
             return out;
         }
-        let mut at = list;
-        while !at.is_null() {
-            let addr = (*at).ifa_addr;
-            if !addr.is_null() {
-                match i32::from((*addr).sa_family) {
+        let head = head.assume_init();
+        let mut next = std::ptr::NonNull::new(head);
+        while let Some(entry) = next {
+            let ifa = entry.as_ref();
+            if let Some(addr) = std::ptr::NonNull::new(ifa.ifa_addr) {
+                match i32::from(addr.as_ref().sa_family) {
                     libc::AF_INET => {
-                        let sin = &*(addr as *const libc::sockaddr_in);
+                        let sin = addr.cast::<libc::sockaddr_in>().as_ref();
                         out.push(IpAddr::V4(Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr))));
                     }
                     libc::AF_INET6 => {
-                        let sin6 = &*(addr as *const libc::sockaddr_in6);
+                        let sin6 = addr.cast::<libc::sockaddr_in6>().as_ref();
                         out.push(IpAddr::V6(Ipv6Addr::from(sin6.sin6_addr.s6_addr)));
                     }
                     _ => {}
                 }
             }
-            at = (*at).ifa_next;
+            next = std::ptr::NonNull::new(ifa.ifa_next);
         }
-        libc::freeifaddrs(list);
+        if let Some(head) = std::ptr::NonNull::new(head) {
+            libc::freeifaddrs(head.as_ptr());
+        }
     }
     out
 }
