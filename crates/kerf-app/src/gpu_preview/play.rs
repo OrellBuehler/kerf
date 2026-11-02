@@ -387,6 +387,15 @@ impl PlaySession {
             .as_ref()
             .is_none_or(|s| s.size != size || t < s.from || t - s.from >= RESCAN);
         if due {
+            // The horizon has moved on since the last scan: the files of what has come into it are asked for their range before
+            // the scan judges them (`session_caps` reads the answer, and a file nobody asked is refused). This is the session's own
+            // thread, off the play lock; the part already scanned was asked by the scan before it.
+            let from = self
+                .scan
+                .as_ref()
+                .filter(|s| t >= s.from)
+                .map_or(t, |s| (s.from + HORIZON).max(t));
+            kerf_gpu::prepare_ranges_ahead(&self.cut, from, t + HORIZON - from);
             self.scan = Some(Scan {
                 from: t,
                 size,
@@ -656,6 +665,11 @@ impl GpuPreview {
             None => {
                 let cut = PlayCut::new(&inputs.timeline, &inputs.assets, t, (self.policy)(), &ProxyMedia)
                     .map_err(|e| one("no_plan", format!("no plan to play from here: {e}")))?;
+                // What the caps below are made of is measured here, on this blocking thread: the files of the placed clips of the
+                // whole cut asked for their range, and the probes of every frame the session will look at at first (a first Play
+                // over a 4:4:4 clip is not declined for a probe nobody ran).
+                kerf_gpu::prepare_placed_files(&cut, &inputs.timeline);
+                kerf_gpu::prepare_ahead(&cut, t, HORIZON);
                 let motion = MotionFrames::with_config(Arc::clone(&drawing.source), play_config());
                 (Arc::new(cut), motion, false)
             }
@@ -664,7 +678,7 @@ impl GpuPreview {
             .plan(t)
             .map_err(|e| one("no_plan", format!("no plan for the first frame: {e}")))?;
         let (_, size) = self.sized(technique, &bounds, &drawing.host, &first).map_err(|r| vec![r])?;
-        let caps = drawing.compositor.caps();
+        let caps = drawing.compositor.session_caps();
         // All or nothing: a frame in the next few seconds that the GPU does not draw is the stream's
         // for the whole session, not a switch of renderer partway through it.
         if let Some(ahead) = cut.ahead(t, HORIZON, size, &caps) {
@@ -778,6 +792,10 @@ impl GpuPreview {
             Ok(cut) => cut,
             Err(e) => return not(vec![Reason::new("no_plan", format!("no plan to play from here: {e}"))]),
         };
+        // (As a session's start: the files of the placed clips, and the probes the caps are made of for every frame the scan
+        // below looks at.)
+        kerf_gpu::prepare_placed_files(&cut, &inputs.timeline);
+        kerf_gpu::prepare_ahead(&cut, t, REACH + HORIZON + RESUME_SLACK);
         let size = match cut.plan(t).map_err(|e| e.to_string()).and_then(|first| {
             self.sized(technique, &bounds, &drawing.host, &first)
                 .map(|(_, size)| size)
@@ -786,7 +804,7 @@ impl GpuPreview {
             Ok(size) => size,
             Err(why) => return not(vec![Reason::new("no_plan", why)]),
         };
-        let caps = drawing.compositor.caps();
+        let caps = drawing.compositor.session_caps();
         let info = |ahead: Option<AheadInfo>, resume: Option<f64>| PlayInfo {
             session: key.session,
             start: cut.start(),
@@ -899,7 +917,7 @@ impl GpuPreview {
             Err(reason) => return stream(reason, session),
         };
         // (Only what has been measured is read here: the probes ran when the session was made ready or began.)
-        let caps = drawing.compositor.caps();
+        let caps = drawing.compositor.session_caps();
         let ahead = session.ahead(t, size, &caps);
         // The frame asked for is at or past the first one the GPU does not draw (the page's hand-over was
         // late, or this is a frame of a reversed clip or a moving title): it is not attempted.

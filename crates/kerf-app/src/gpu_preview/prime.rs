@@ -320,7 +320,11 @@ impl GpuPreview {
             .map_err(|e| format!("no plan to play from here: {e}"))?;
         let first = cut.plan(t).map_err(|e| format!("no plan for the first frame: {e}"))?;
         let (_, size) = self.sized(technique, bounds, &drawing.host, &first).map_err(|r| r.text)?;
-        if let Some(ahead) = cut.ahead(t, HORIZON, size, &drawing.compositor.caps()) {
+        // The files of the placed clips asked for their range, and the probes the caps are made of for every frame of the
+        // horizon (this runs off the render lock).
+        kerf_gpu::prepare_placed_files(&cut, &inputs.timeline);
+        kerf_gpu::prepare_ahead(&cut, t, HORIZON);
+        if let Some(ahead) = cut.ahead(t, HORIZON, size, &drawing.compositor.session_caps()) {
             return Err(format!("{} (at {:.2} s)", ahead.why, ahead.at));
         }
         let motion = MotionFrames::with_config(Arc::clone(&drawing.source), play_config());

@@ -5412,8 +5412,8 @@ mod subset;
 pub use subset::{AutoIncluded, SkippedChange, SubsetMerge};
 mod grade;
 pub use grade::{
-    frame_matrix, frame_matrix_tag, normalize_curve, ClipLut, CurvePoint, CurveSegment, CurveShape, Curves, Grade, Wheel, Wheels,
-    MAX_CURVE_POINTS,
+    frame_matrix, frame_matrix_tag, matrix_tag_is_unlisted, normalize_curve, ClipLut, CurvePoint, CurveSegment, CurveShape,
+    Curves, Grade, Wheel, Wheels, MAX_CURVE_POINTS,
 };
 mod check;
 mod generator;

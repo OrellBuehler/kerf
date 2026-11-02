@@ -87,6 +87,7 @@ fn pick(frame: u64) -> FpsPick {
         drop_first: false,
         lead: 0.0,
         image: None,
+        pinned: false,
     }
 }
 

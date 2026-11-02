@@ -113,6 +113,7 @@ fn case(rng: &mut Rng) -> Value {
             } else {
                 (rng.frac(1.0), rng.frac(1.0))
             },
+            placed: None,
         }
     } else {
         Placement::STILL

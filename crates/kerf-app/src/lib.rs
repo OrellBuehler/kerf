@@ -4792,7 +4792,7 @@ async fn get_render_bar(
         // white, another colour matrix), the scaler, the matrix conversion and `drawtext`'s layout, for this cut.
         let caps = enabled.then(|| {
             kerf_gpu::prepare_timeline(&timeline);
-            kerf_gpu::Compositor::caps_for(
+            kerf_gpu::Compositor::session_caps_for(
                 kerf_gpu::grade::measured(),
                 kerf_gpu::scaler::measured(),
                 kerf_gpu::convert::measured(),
@@ -4809,6 +4809,9 @@ async fn get_render_bar(
                 .iter()
                 .map(|w| (w.asset_id, format!("{} of {}", kerf_core::proxy::PROXY_WAIT_PREFIX, w.name)))
                 .collect(),
+            // A placed layer's file is asked for its range (once, remembered) before its plan is judged, as a play session's
+            // `prepare_ahead` does: a span the compositor would refuse at draw time is the stream's here too.
+            ask: Some(&kerf_gpu::prepare_ranges),
         };
         Ok(kerf_core::render_bar::render_bar(&timeline, &assets, &req))
     })

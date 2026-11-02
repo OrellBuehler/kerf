@@ -20,11 +20,13 @@ fn gpu() -> std::sync::Arc<Gpu> {
 }
 
 /// (The scaler is pinned as the model: nothing here runs FFmpeg to measure it, and a compositor whose scaler is not known to be
-/// swscale's refuses every resized layer.)
+/// swscale's refuses every resized layer. So is the edge of `geq`'s read, which a mask needs known: a copy of the picture's own
+/// last column and row, as FFmpeg 9 reads it; the case that holds the clamping build pins the other.)
 fn compositor() -> Compositor {
     Compositor::new(gpu())
         .expect("a compositor")
         .with_scaler_kernels(kerf_gpu::scaler::Kernels::Match(kerf_gpu::scaler::Model::ASSUMED))
+        .with_geq_edge(kerf_core::GeqEdge::Exact)
 }
 
 fn asset(w: u32, h: u32) -> Asset {
@@ -639,6 +641,47 @@ fn a_mask_blends_chroma_with_the_block_average_of_the_alpha() {
             let blend = |d: u32, s: u32| ((d * (255 - al) + s * al + 128) * 257) >> 16;
             assert_eq!(u32::from(got.u[cy * cw + cx]), blend(128, 200), "U ({cx}, {cy}) alpha {al}");
             assert_eq!(u32::from(got.v[cy * cw + cx]), blend(128, 60), "V ({cx}, {cy}) alpha {al}");
+        }
+    }
+}
+
+#[test]
+#[ignore = "needs a GPU adapter (lavapipe is enough)"]
+fn only_a_quarter_turn_is_drawn_and_any_other_turn_is_refused_by_the_plan_and_the_compositor() {
+    let a = asset(64, 36);
+    for (angle, drawn) in [
+        (90.0, true),
+        (180.0, true),
+        (-90.0, true),
+        (450.0, true),
+        (36.0 * 90.0, true),
+        (12.0, false),
+        (89.9, false),
+        (91.0, false),
+        (41.0 * 90.0, false),
+        (1e7, false),
+        (1e300, false),
+        (f64::MAX, false),
+    ] {
+        let mut c = Clip::new(a.id, 0.0, 1.0, 0.0);
+        c.transform.rotation = angle;
+        let plan = plan_for(&a, c);
+        let size = (64, 36);
+        let kinds: Vec<_> = plan.reasons(&Compositor::CAPS, size).iter().map(|u| u.kind()).collect();
+        assert_eq!(kinds.contains(&"rotation"), !drawn, "{angle}: {kinds:?}");
+        let result = compositor().composite(&plan, &[flat(64, 36, 180, 128, 128)], size);
+        if drawn {
+            let frame = result.unwrap_or_else(|e| panic!("{angle}: {e}"));
+            // (The turned box is 36 x 64 for a quarter and a half turn alike here: the picture is cut to the frame.)
+            let px = |x: usize, y: usize| &frame.data[(y * 64 + x) * 4..][..4];
+            let mid = px(32, 18);
+            assert!(mid[0] > 150 && mid[0] == mid[1] && mid[1] == mid[2], "{angle}: {mid:?}");
+        } else {
+            let err = result.expect_err("a turn that is not a quarter is not drawn");
+            assert!(
+                matches!(&err, GpuError::Unsupported(why) if why.contains("a rotation that is not a quarter")),
+                "{angle}: {err}"
+            );
         }
     }
 }

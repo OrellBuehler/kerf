@@ -29,7 +29,7 @@ use crate::media::MediaResolver;
 use crate::model::{Asset, StreamKind, Timeline};
 use crate::plan_caps::GpuCaps;
 use crate::play_plan::{PlayCut, PlayRefusal};
-use crate::render_plan::{still_size, CompositeColorPolicy};
+use crate::render_plan::{still_size, CompositeColorPolicy, RenderPlan};
 
 /// Frames judged at most — about one per pixel of a timeline zoomed to fit; a longer cut is
 /// judged every `n`th frame.
@@ -75,11 +75,15 @@ pub struct BarRequest<'a> {
     pub media: &'a dyn MediaResolver,
     /// Assets whose preview proxy playback waits for, with what the Preview says about it.
     pub waits: Vec<(Uuid, String)>,
+    /// Asked of a frame's plan before it is judged, when the layers on screen (by file, and whether each is placed) are not the
+    /// previous frame's (and only with `caps`): what the host measures or asks of a file ahead, for a plan to read from the cache
+    /// ([`GpuCaps::file_range`]: a placed layer's range). It may wait for a probe, so the bar is built on a blocking thread.
+    pub ask: Option<&'a dyn Fn(&RenderPlan)>,
 }
 
 type Verdict = (BarState, String, String);
 
-fn judge(cut: &PlayCut, k: u64, size: (u32, u32), req: &BarRequest<'_>) -> Option<Verdict> {
+fn judge(cut: &PlayCut, k: u64, size: (u32, u32), req: &BarRequest<'_>, asked: &mut Vec<(String, bool)>) -> Option<Verdict> {
     let plan = match cut.at_frame(k) {
         Ok(plan) => plan,
         Err(e) => {
@@ -98,6 +102,15 @@ fn judge(cut: &PlayCut, k: u64, size: (u32, u32), req: &BarRequest<'_>) -> Optio
         return Some((BarState::Stall, why.kind().to_string(), why.to_string()));
     }
     let caps = req.caps?;
+    if let Some(ask) = req.ask {
+        // (By file and by whether it is placed: a clip split in two, with a moving zoom on its second half only, is one file
+        // that has to be asked about from there.)
+        let layers: Vec<(String, bool)> = plan.layers.iter().map(|l| (l.path.clone(), plan.pose(l).is_some())).collect();
+        if *asked != layers {
+            ask(&plan);
+            *asked = layers;
+        }
+    }
     if let Some(u) = plan.reasons(&caps, size).into_iter().next() {
         return Some((BarState::Stream, u.kind().to_string(), u.to_string()));
     }
@@ -144,10 +157,11 @@ pub fn render_bar(timeline: &Timeline, assets: &[Asset], req: &BarRequest<'_>) -
     let last = cut.frame_at(end - 1e-9);
     let stride = (last + 1).div_ceil(MAX_BAR_FRAMES).max(1);
     let mut k = 0;
+    let mut asked = Vec::new();
     while k <= last {
         let (start, next) = (cut.time_of(k), (k + stride).min(last + 1));
         let span_end = if next > last { end } else { cut.time_of(next) };
-        if let Some((state, kind, reason)) = judge(&cut, k, size, req) {
+        if let Some((state, kind, reason)) = judge(&cut, k, size, req, &mut asked) {
             match bar.spans.last_mut() {
                 Some(prev) if prev.state == state && prev.kind == kind && (prev.end - start).abs() < 1e-9 => {
                     prev.end = span_end;
@@ -201,6 +215,7 @@ mod tests {
                 color: FIXED,
                 media: &OriginalMedia,
                 waits,
+                ask: None,
             },
         )
     }
@@ -224,6 +239,77 @@ mod tests {
         let off = bar(&tl, &[a], None, Vec::new());
         assert!(!off.gpu_preview);
         assert!(off.spans.is_empty());
+    }
+
+    /// The host's `ask` is called with a plan when the layers on screen change (and only with the GPU preview on), not for every
+    /// frame of a long clip: it may wait for a probe.
+    #[test]
+    fn the_host_is_asked_once_for_each_set_of_layers_and_only_with_the_gpu_preview_on() {
+        let (a, mut b) = (asset(), asset());
+        b.path = "/y.mp4".into();
+        let tl = timeline_of(vec![video_track(vec![
+            make_clip(a.id, 0.0, 2.0, 0.0),
+            make_clip(b.id, 0.0, 2.0, 2.0),
+        ])]);
+        let assets = [a, b];
+        let asked = std::cell::RefCell::new(Vec::new());
+        let ask = |plan: &RenderPlan| asked.borrow_mut().push(plan.layers.len());
+        let request = |caps| BarRequest {
+            caps,
+            width: 640,
+            color: FIXED,
+            media: &OriginalMedia,
+            waits: Vec::new(),
+            ask: Some(&ask),
+        };
+        render_bar(&tl, &assets, &request(Some(caps())));
+        // (Once for each set of layers on screen: the first clip, the frame where the two meet, the second; not once a frame.)
+        assert_eq!(*asked.borrow(), vec![1, 2, 1]);
+        asked.borrow_mut().clear();
+        render_bar(&tl, &assets, &request(None));
+        assert!(asked.borrow().is_empty());
+    }
+
+    /// One file, a clip split in two with a moving zoom on the second half only: the host is asked again where the same file
+    /// becomes a placed layer (asking by file alone would never ask about it, and the bar would call a drawable span the stream's).
+    #[test]
+    fn the_same_file_placed_and_unplaced_is_asked_about_where_it_is_placed() {
+        use crate::model::Keyframe;
+        let a = asset();
+        let first = make_clip(a.id, 0.0, 1.0, 0.0);
+        let mut second = make_clip(a.id, 1.0, 2.0, 1.0);
+        let key = |time: f64, scale: f64| Keyframe {
+            time,
+            scale,
+            pos_x: 0.0,
+            pos_y: 0.0,
+            rotation: 0.0,
+            opacity: 1.0,
+            easing: Default::default(),
+        };
+        second.keyframes = vec![key(0.0, 1.0), key(1.0, 1.5)];
+        let tl = timeline_of(vec![video_track(vec![first, second])]);
+        let asked = std::cell::RefCell::new(Vec::new());
+        let ask = |plan: &RenderPlan| {
+            asked
+                .borrow_mut()
+                .push(plan.layers.iter().filter(|l| plan.pose(l).is_some()).count());
+        };
+        render_bar(
+            &tl,
+            std::slice::from_ref(&a),
+            &BarRequest {
+                caps: Some(caps()),
+                width: 640,
+                color: FIXED,
+                media: &OriginalMedia,
+                waits: Vec::new(),
+                ask: Some(&ask),
+            },
+        );
+        let asked = asked.into_inner();
+        assert_eq!(asked.first(), Some(&0), "the unplaced half: {asked:?}");
+        assert!(asked.contains(&1), "the placed half was never asked about: {asked:?}");
     }
 
     #[test]

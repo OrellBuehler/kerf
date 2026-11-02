@@ -435,6 +435,8 @@ pub(super) fn part_contents(plan: &PartsPlan, part: &Part) -> PartContents {
             drop_first: false,
             lead: 0.0,
             image: Some(plan.rate),
+            // (A still that restarts here is a plain one: a moving still's `fps` is pinned, and it is FFmpeg's whole.)
+            pinned: false,
         };
         let Some((first, end)) = fps_span(&pick, &SourceFrames::NONE) else {
             continue;

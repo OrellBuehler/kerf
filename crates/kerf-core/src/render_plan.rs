@@ -35,7 +35,8 @@ use crate::model::{
     pix_fmt_is_high_bit, pix_fmt_layout, pix_fmt_subsampling, Asset, BlendMode, Clip, Color, FitOrder, Grade, Hdr, Mask,
     PixLayout, Projection, ResolvedReframe, StreamInfo, StreamKind, Subsampling, Timeline, Transform, VideoEffect,
 };
-use crate::plan_caps::{DipWhy, EffectKinds, GpuCaps, GradeKinds, LayerRef, Unsupported};
+use crate::perspective::{PlacementFrame, Pose};
+use crate::plan_caps::{BlendExtras, BlendKinds, DipWhy, EffectKinds, GpuCaps, GradeKinds, LayerRef, Unsupported};
 use crate::planner::{PlanRequest, Planner};
 use crate::ExportOptions;
 
@@ -306,6 +307,16 @@ pub struct PlanCanvas {
     /// FFmpeg 9 takes an RGB picture into YCbCr with the **cut's** matrix, so a frame of the picture alone is converted with that
     /// one, where the stack on screen says BT.601: an RGB picture in such a cut is [`Unsupported::RgbInStack`] in every frame.
     pub cut_non_601: bool,
+    /// The matrix tag the graph's **blend chains** name for their conversions into RGB and back (`engine::blend_chains`):
+    /// the bottom layer's tag, BT.709 for a layer the graph labels so, `None` for an untagged one (which names nothing:
+    /// BT.601 on every build). Decided over the whole cut for a [`PlanMode::Motion`] plan (the lowest video track's
+    /// first picture) and over the layers on screen for a Still (the graph is those). It is the matrix the blend is drawn
+    /// in, whatever the composite's own is ([`PlanCanvas::matrix`]).
+    pub blend_tag: Option<&'static str>,
+    /// The bottom layer states a matrix tag no table of the blend chain is proven for ([`crate::model::matrix_tag_is_unlisted`]:
+    /// `bt2020c`, `ycgco`, `ictcp`, ...), so [`PlanCanvas::blend_tag`] is `None` for it as it is for an untagged one and the two are told
+    /// apart here. FFmpeg 9 cannot export such a cut, FFmpeg 6 draws it as BT.601: a blend is drawn for neither ([`RenderPlan::blend_matrix`]).
+    pub blend_tag_unlisted: bool,
 }
 
 /// What the compositor needs to know about a layer's source picture.
@@ -485,7 +496,8 @@ pub struct Animated {
     /// size and are magnified with it; the FFmpeg still orders a moving zoom the same way.
     /// A compositor that draws a moving zoom has to draw that order, not "zoom, then the
     /// rest" as it does a constant one, so a moving zoom in an export frame is refused until
-    /// it says it does (`GpuCaps::keyed_zoom`), and in a still when something follows it.
+    /// it says it does (`GpuCaps::keyed_zoom`), and in a still when something follows it. The
+    /// zoom itself is [`Animated::places`], drawn by a compositor that sets `GpuCaps::placement`.
     pub zooms: bool,
     /// Some colour number is keyed: the export's `eq` is written per frame (`eval=frame`),
     /// off a colour sampled at the frame's time. A still plan samples it too and draws that
@@ -508,13 +520,17 @@ pub struct Animated {
     pub still_motion: bool,
     /// The zoom or the position moves ([`Clip::placement_animated`]): the export, the playback stream
     /// and the FFmpeg still place the picture on the canvas with a `perspective` at sub-pixel
-    /// positions, which no compositor pass draws, so every frame of it is refused.
+    /// positions (`pad`, `perspective`, `crop`: [`crate::perspective`]). A compositor that sets
+    /// `GpuCaps::placement` reproduces that to the sample ([`RenderPlan::pose`] is the pose it draws); without it
+    /// every frame of such a layer is refused (`Unsupported::KeyedPlacement`).
     pub places: bool,
     /// The clip has a live behaviour ([`Clip::has_behaviors`]: a sway, breath, spin, drift or shake on
     /// top of its pose). The plan samples the exact pose it draws ([`PlanLayer::transform`], the
-    /// behaviours included) and the other flags here say what the pose's chain is, but no compositor
-    /// has a parity case for a pose that moves by a formula, so every frame of such a layer is refused
-    /// (`Unsupported::Behavior`) until it sets `GpuCaps::behaviors`.
+    /// behaviours included) and the other flags here say what the pose's chain is. A breath, a drift and
+    /// a shake move the zoom or the position, which the placement draws, so a compositor with
+    /// `GpuCaps::behaviors` takes them; one that turns the picture (a sway, a spin: [`Animated::rotates`]) is a rotation,
+    /// which no pass draws to the sample. Every frame of a layer that a compositor does not take is refused
+    /// (`Unsupported::Behavior`).
     pub behaves: bool,
 }
 
@@ -701,8 +717,9 @@ pub struct PlanLayer {
     pub effects: Vec<VideoEffect>,
     /// The clip's mask, normalized; fractions of the *layer* frame.
     pub mask: Option<Mask>,
-    /// How the clip composites onto the layers below. Anything but `Normal` is FFmpeg's `blend` in RGB, which
-    /// no compositor pass draws: [`Unsupported::BlendMode`].
+    /// How the clip composites onto the layers below. Anything but `Normal` is FFmpeg's `blend` in RGB, which a compositor
+    /// draws for the modes and the layers its caps name (`GpuCaps::blend`, `GpuCaps::blend_extras`) and otherwise leaves to
+    /// FFmpeg: [`Unsupported::BlendMode`] with its cause.
     pub blend: BlendMode,
     pub reframe: Option<PlanReframe>,
     pub fx: LayerFx,
@@ -887,6 +904,83 @@ fn effect_refusal(effect: &VideoEffect, caps: &GpuCaps) -> Option<&'static str> 
     }
 }
 
+/// The largest angle, in radians, [`quarter_turn`] looks at: past it `rotate`'s `int` angle (`res * 65536 * 16`) is out of range (a conversion
+/// C leaves undefined, and the builds do differently), and `int_sin`'s argument could overflow its own `int`.
+const MAX_TURN_RADIANS: f64 = 1000.0;
+
+/// The `rotate` filter's `int_sin` (`vf_rotate.c`, the same in FFmpeg 6.1 and 9.0): the sine of `a / 2^20` radians as `2^16` times a Taylor
+/// series to the fifth term, in integers. It is **not** the sine: near a multiple of a quarter turn it comes out a unit off (`c = 1`,
+/// `s = 65536` at 41 quarters), and the picture then lands between samples.
+fn rotate_int_sin(mut a: i64) -> i64 {
+    const FIXP2: i64 = 1 << 20;
+    const INT_PI: i64 = 3_294_199;
+    if a < 0 {
+        a = INT_PI - a;
+    }
+    a %= 2 * INT_PI;
+    if a >= INT_PI * 3 / 2 {
+        a -= 2 * INT_PI;
+    }
+    if a >= INT_PI / 2 {
+        a = INT_PI - a;
+    }
+    let a2 = (a * a) / FIXP2;
+    let mut res = 0;
+    for i in [2, 4, 6, 8, 10] {
+        res += a;
+        a = -a * a2 / (FIXP2 * i * (i + 1));
+    }
+    (res + 8) >> 4
+}
+
+/// How many quarter turns clockwise (0 to 3) `rotate` turns a picture by when its angle is `angle` radians, if it lands on whole samples
+/// there; `None` for any angle it does not, which the compositor does not draw (the filter's edge is a fixed-point sample against a float one).
+///
+/// The filter has two paths, and an angle is a quarter turn only where one of them is exact:
+/// * its `simple_rotate` fast path, taken when the angle is within `FLT_EPSILON` of 0, π/2, π or 3π/2 (and the box is the picture's, or its
+///   swap: `rotw` / `roth` come out so for any angle this near);
+/// * its general path, which walks the output with `c` and `s`, **`int_sin` of the angle truncated to `res * 65536 * 16`**
+///   ([`rotate_int_sin`]). Only where those come out as exactly 0 and ±65536 does every output sample read one input sample whole. They do
+///   for the multiples of 90 degrees from -43 to 40 quarters and then here and there (41, 42 and 45 on are a unit off, and 43, 44, -46, -47
+///   are not): the error of the series and of `INT_PI` grows with the angle, so no range is claimed past what the arithmetic says, and no
+///   angle past [`MAX_TURN_RADIANS`] (about 636 quarters), where the conversion to `int` is not defined.
+///
+/// The answer of FFmpeg 6.1.1 and 9.0.2 for every quarter turn from -1310 to 1310 is this function's (`tests/checker_e_turn.rs`, against the
+/// export's own `rotate` text on pictures of odd and even sides; the many-turns cases of `tests/motion_parity.rs` hold the plan to it). An
+/// angle must also be within `FLT_EPSILON` radians (the filter's own tolerance for its fast path, 1.19e-7) of a multiple of a quarter turn to
+/// count: both paths are exact there, by the arithmetic above, and 90.00001 degrees (1.7e-7 radians off) is a rotation like 91 is, whatever the
+/// integer arithmetic makes of it.
+pub fn quarter_turn(angle: f64) -> Option<u8> {
+    use std::f64::consts::{FRAC_PI_2, PI};
+    if !angle.is_finite() || angle.abs() > MAX_TURN_RADIANS {
+        return None;
+    }
+    let flt_epsilon = f64::from(f32::EPSILON);
+    let nearest = (angle / FRAC_PI_2).round();
+    if (angle - nearest * FRAC_PI_2).abs() >= flt_epsilon {
+        return None;
+    }
+    let turn = nearest.rem_euclid(4.0) as u8;
+    // The fast path: `fabs(angle - target) < FLT_EPSILON`, for the four targets in [0, 2π) only.
+    if [0.0, FRAC_PI_2, PI, 3.0 * PI / 2.0]
+        .iter()
+        .any(|target| (angle - target).abs() < flt_epsilon)
+    {
+        return Some(turn);
+    }
+    // The general path: `angle_int = res * FIXP * 16` (a power of two: exact), `s = int_sin(angle_int)`, `c = int_sin(angle_int + INT_PI / 2)`.
+    let angle_int = (angle * 65536.0 * 16.0) as i64;
+    let (s, c) = (rotate_int_sin(angle_int), rotate_int_sin(angle_int + 3_294_199 / 2));
+    let want = [(65536, 0), (0, 65536), (-65536, 0), (0, -65536)][usize::from(turn)];
+    ((c, s) == want).then_some(turn)
+}
+
+/// Whether a clockwise `angle` in radians is a quarter turn, half a turn or three quarters that the `rotate` filter lands on whole samples
+/// for: [`quarter_turn`] has an answer.
+pub fn is_quarter_turn(angle: f64) -> bool {
+    quarter_turn(angle).is_some()
+}
+
 /// The worst-case error, in levels, the plan allows a one-level difference from FFmpeg's upstream (the
 /// compositor's scaler, a blur's summation order) to grow to through what is drawn after it: the steepest step
 /// of a grade's tables (`eq::table_steps`) and the sharpens (which start it at one, or at the grade's step).
@@ -1053,6 +1147,28 @@ impl RenderPlan {
                     ));
                 }
             }
+            // The placement reads the picture through `pad` and `perspective`: an odd height is not the
+            // filters' (see `PlacementFrame::exact_for`), and a pose whose sample positions leave the
+            // fixed-point table's range is not either.
+            if caps.placement {
+                if let Some(pose) = self.pose(layer) {
+                    if !PlacementFrame::exact_for(geom.picture) {
+                        reasons.push(Unsupported::Geometry(
+                            n,
+                            format!(
+                                "an odd-height picture ({}x{}) under a placement (FFmpeg's pad keeps or loses its last row by how the graph allocated the frame, and the builds differ)",
+                                geom.picture.0, geom.picture.1
+                            ),
+                        ));
+                    } else if !PlacementFrame::new(geom.picture, size).reachable(&pose) {
+                        reasons.push(Unsupported::Geometry(
+                            n,
+                            "a placement whose sample positions leave the fixed-point range of FFmpeg's perspective filter"
+                                .into(),
+                        ));
+                    }
+                }
+            }
             // `pad` hands everything after it the whole padded frame, bars included. A pointwise
             // effect (a grade, grayscale, invert) is a table, and the bars go through it like the
             // picture, and a mask is cut from the whole padded frame (the compositor's layer is that
@@ -1114,9 +1230,7 @@ impl RenderPlan {
             // frame is drawn only while it stays within the two levels a scaled blur does: one sharpen of
             // at most 0.5, and no second one. A sharpen of nothing at `unsharp`'s 16-bit precision counts
             // for nothing; with no source upstream a sharpen is exact at any amount.
-            let zoom_last = layer.animated.is_some_and(|a| a.zooms) && geom.stages.len() == 2;
-            let before_effects = if zoom_last { 1 } else { geom.stages.len() };
-            let scaled = geom.stages[..before_effects].iter().any(|s| s.scaled != (s.src.w, s.src.h));
+            let scaled = geom.stages.iter().any(|s| s.scaled != (s.src.w, s.src.h));
             // The `eq` is next in the chain after those scales (the compositor applies its tables in the vertical
             // pass of the last of them), and they multiply the scaler's level: two pictures a level apart are, after
             // them, as far apart as the tables' steepest step between neighbouring entries (`eq::table_steps`,
@@ -1162,11 +1276,7 @@ impl RenderPlan {
             }
             // The key's window keeps what it last read where the picture ends; a picture under two samples a
             // side has no such row or column (the compositor's rule for it needs one).
-            let (pw, ph) = if zoom_last {
-                (geom.stages[0].keep.w, geom.stages[0].keep.h)
-            } else {
-                geom.picture
-            };
+            let (pw, ph) = geom.picture;
             if chroma_keyed && caps.effects.contains(EffectKinds::CHROMA_KEY) && (pw < 2 || ph < 2) {
                 reasons.push(Unsupported::Effects(
                     self.layer_ref(n, layer),
@@ -1178,6 +1288,33 @@ impl RenderPlan {
                     self.layer_ref(n, layer),
                     "a sharpen after a scale or a blur: it amplifies their one-level difference from FFmpeg's by 1 + 2|amount| and rounds up a level more with each further sharpen, past two levels",
                 ));
+            }
+            // A blended layer is drawn on what the compositor draws exactly: its own picture at its own size, upright
+            // and opaque, over an even frame (the conversions are 4:2:0 pairs). The scaler's level is not swscale's (a
+            // level on the colour, which the blend carries into the composite), a rotation's edge is a fixed-point
+            // sample, a letterbox's bars are transparent in the blend and opaque in the compositor, and an opacity
+            // below 1 takes the RGB round trip, whose chroma is a level off.
+            if !layer.blend.is_normal() {
+                let why = |w: &'static str| Unsupported::BlendMode(self.layer_ref(n, layer), layer.blend, w);
+                if geom.stages.iter().any(|s| s.scaled != (s.src.w, s.src.h)) {
+                    reasons.push(why("on a layer the compositor's scaler resizes (its level is not swscale's)"));
+                }
+                // A turn of exactly a quarter lands on whole samples (the `rotate` filter's fixed-point sample is exact there); any
+                // other angle has an edge that is a fixed-point sample against the compositor's float one, and a keyed rotation
+                // is another box.
+                if geom.rotation.is_some_and(|r| !is_quarter_turn(r.angle))
+                    || (self.mode == PlanMode::Motion && layer.animated.is_some_and(|a| a.rotates))
+                {
+                    reasons.push(why("on a rotated layer (the edge is a fixed-point sample)"));
+                }
+                if geom.matte {
+                    reasons.push(why("on a letterboxed layer (its bars are transparent in the blend)"));
+                }
+                if geom.translucent {
+                    reasons.push(why(
+                        "on a layer below full opacity (the RGB round trip's chroma is a level off)",
+                    ));
+                }
             }
             // FFmpeg scales a picture in the format it has; the compositor scales the
             // 8-bit 4:2:0 a decode reduces it to, which is the same picture only when
@@ -1331,9 +1468,73 @@ impl RenderPlan {
                 out.push(Unsupported::Stabilized(at()));
             }
             // A blend mode is FFmpeg's `blend` over the composite in RGB, through two placements and a conversion
-            // each way (`engine::blend_chains`): no compositor pass draws it, and refusing is the exact answer.
+            // each way (`engine::blend_chains`): drawn for the modes in `caps.blend`, in the matrix the graph names
+            // (`blend_matrix`), at the level only where the rest of the chain is exact: see the other causes in `reasons`.
             if !layer.blend.is_normal() {
-                out.push(Unsupported::BlendMode(at(), layer.blend));
+                if !caps.blend.contains(BlendKinds::of(layer.blend)) {
+                    out.push(Unsupported::BlendMode(
+                        at(),
+                        layer.blend,
+                        "no compositor pass draws this mode on this FFmpeg",
+                    ));
+                }
+                match self.blend_matrix() {
+                    None => out.push(Unsupported::BlendMode(
+                        at(),
+                        layer.blend,
+                        "the composite's matrix is not BT.601, BT.709 or BT.2020, the ones the conversions are reproduced for (a bottom layer's tag with no proven table included)",
+                    )),
+                    Some(YuvMatrix::Bt2020) if !caps.blend_extras.contains(BlendExtras::BT2020) => {
+                        out.push(Unsupported::BlendMode(
+                            at(),
+                            layer.blend,
+                            "a BT.2020 composite (not measured to be the model's on this FFmpeg)",
+                        ));
+                    }
+                    Some(_) => {}
+                }
+                // A tag with no table (`bt2020c`, `ycgco`, `ictcp`, ...) is judged by an allow-list of the ones proven, on the clip itself too:
+                // FFmpeg 9 cannot export such a clip, and FFmpeg 6 reads it as it reads an untagged one.
+                if layer.hdr.is_none()
+                    && !layer.stream.label_bt709
+                    && crate::model::matrix_tag_is_unlisted(layer.stream.color_space.as_deref(), layer.stream.pix_fmt.as_deref())
+                {
+                    out.push(Unsupported::BlendMode(
+                        at(),
+                        layer.blend,
+                        "a clip tagged with a colour matrix the blend's conversions have no proven table for",
+                    ));
+                }
+                // An RGB picture reaches the graph as RGB and is converted by `format=yuva420p`, where the compositor has the decode's
+                // 4:2:0: the same picture on the builds where the probe says so (FFmpeg 4.4's is Y 3 / UV 11 off, and its chain does not match), and a blend carries a
+                // difference through.
+                if layer.stream.layout() == Some(PixLayout::Rgb) && !caps.blend_extras.contains(BlendExtras::RGB_PICTURE) {
+                    out.push(Unsupported::BlendMode(
+                        at(),
+                        layer.blend,
+                        "an RGB picture (the graph converts it, and this FFmpeg's conversion is not the decode's 4:2:0)",
+                    ));
+                }
+                // A blended clip's chain puts `format=yuva420p` (and the transparent bars' `pad`) ahead of the grade, so FFmpeg's RGB
+                // filters run `yuva420p -> argb -> yuva420p` where the grade's model is the `yuv420p -> rgb24` path: another conversion
+                // each way (Y 11 / UV 9 off, every case).
+                if !layer.grade.is_identity() {
+                    out.push(Unsupported::BlendMode(
+                        at(),
+                        layer.blend,
+                        "a grade under a blend (its RGB round trip runs on yuva420p there, another conversion than the grade's model)",
+                    ));
+                }
+                // A moving zoom or position ends the clip's chain in `pad`, `perspective` and `crop`: the blend lays that picture by the
+                // very `overlay` it places a clip with, and no case holds the pair to FFmpeg's (the blend's pass is the plain layer's, at its
+                // own size), so a blended clip is not placed.
+                if self.pose(layer).is_some() {
+                    out.push(Unsupported::BlendMode(
+                        at(),
+                        layer.blend,
+                        "a moving zoom or position (the placement's picture is not one the blend chain is held to)",
+                    ));
+                }
             }
             if layer.hdr.is_some() && !caps.hdr {
                 out.push(Unsupported::Hdr(at()));
@@ -1537,8 +1738,51 @@ impl RenderPlan {
             if layer.animated.is_some_and(|a| a.places) && !caps.placement {
                 out.push(Unsupported::KeyedPlacement(at()));
             }
-            if layer.animated.is_some_and(|a| a.behaves) && !caps.behaviors {
+            if self.pose(layer).is_some() && caps.placement {
+                let fmt = stream.pix_fmt.clone().unwrap_or_else(|| "not recorded".to_string());
+                // 8-bit planar 4:4:4 and 4:2:2, limited range: converted in the graph as the decode converts them where a
+                // compositor measured that (`GpuCaps::placed_chroma`).
+                let planar = matches!(fmt.to_ascii_lowercase().as_str(), "yuv444p" | "yuv422p");
+                let other_layout = !matches!(stream.layout(), Some(PixLayout::Yuv420 | PixLayout::Gray));
+                if other_layout && !(caps.placed_chroma && planar) {
+                    out.push(Unsupported::PlacedFormat(at(), fmt));
+                } else if self.canvas.policy != CompositeColorPolicy::FixedBt601 && stream.maybe_full_range_in(self.canvas.policy)
+                {
+                    // Where the composite's range is negotiated along the graph (9.0.2), the range conversion inside
+                    // the chain's `format=yuva420p` is not the decode's: a full-range 8-bit or 10-bit 4:2:0 picture reads
+                    // up to 5 levels off in a still (3 to 5 on `yuvj420p`, 4 to 5 on 10-bit flagged `pc`), a full-range
+                    // 4:4:4 or 4:2:2 one 5 to 8; exact on 4.4.2. The check is the layout's own and the lifted 4:4:4 /
+                    // 4:2:2 are not exempt from it.
+                    out.push(Unsupported::PlacedFormat(at(), format!("full-range {fmt}")));
+                } else if caps.file_range
+                    && self.canvas.policy != CompositeColorPolicy::FixedBt601
+                    && stream.color_range.is_none()
+                {
+                    // An asset probed before the range flag was recorded: only its file can say, and a host that asks the
+                    // file ahead (`GpuCaps::file_range`) has left the answer in the cache. Full range, or no answer (a probe that
+                    // failed or has not run), is what the compositor refuses at draw time, so a session, the render bar and a
+                    // hand-over see it before the frame instead of a frame into the play.
+                    match crate::engine::source_is_full_range_known(std::path::Path::new(&layer.path)) {
+                        Some(false) => {}
+                        Some(true) => out.push(Unsupported::PlacedFormat(
+                            at(),
+                            format!("full-range {fmt} (its file flags color_range=pc; its asset did not record it)"),
+                        )),
+                        None => out.push(Unsupported::PlacedFormat(
+                            at(),
+                            format!("{fmt} of a range its asset did not record and its file has not said (not asked ahead, or would not say)"),
+                        )),
+                    }
+                }
+            }
+            // A live behaviour is drawn as the pose it gives (`PlanLayer::transform`) where that is a moving zoom or position
+            // (breathe, drift, shake: the placement draws them); one that turns the picture (sway, spin) is a rotation, which
+            // no compositor draws to the sample.
+            if layer.animated.is_some_and(|a| a.behaves && (!caps.behaviors || a.rotates)) {
                 out.push(Unsupported::Behavior(at()));
+            }
+            if let Some(what) = self.rotation_refusal(layer) {
+                out.push(Unsupported::Rotation(at(), what));
             }
             // The graph fits and zooms in one `scale` from the source; the compositor's geometry (and
             // `LayerGeometry`, which the Preview's handles are placed by) still fits to the frame and
@@ -1548,12 +1792,21 @@ impl RenderPlan {
                 FitOrder::Folded => out.push(Unsupported::FoldedFit(at(), "a zoom in under Contain")),
                 FitOrder::Uncropped => out.push(Unsupported::FoldedFit(at(), "a Cover clip that zooms or pans")),
             }
+            if layer.animated.is_some_and(|a| a.places && !a.zooms && !a.still_motion) && caps.placement {
+                // A position that moves is placed after the same chain a moving zoom is: the rotation, the opacity and
+                // the dip to white are the ones the placement is not drawn behind (a grade is: it hands the placement
+                // its 4:2:0 planes).
+                if let Some(what) = self.zoom_order_refusal(layer, &ops) {
+                    out.push(Unsupported::ZoomBehind(at(), what));
+                }
+            }
             if layer.animated.is_some_and(|a| a.zooms) {
                 if caps.keyed_zoom {
                     // The compositor draws a grade, the effects and the mask it draws, and the fades
-                    // at the fit size and zooms after them. A rotation and an opacity below 1 are
-                    // the two it does not order that way: the rotated picture's alpha and the RGB
-                    // round trip would both have to be scaled with the zoom.
+                    // at the fit size and places the picture after them. A rotation, an opacity below 1 and a dip to
+                    // white are what it does not draw ahead of the placement: the placement would act on the rotated
+                    // alpha plane, on the RGB round trip's or on the RGB frame the fade leaves, and no case holds
+                    // any of them to FFmpeg's.
                     if let Some(what) = self.zoom_order_refusal(layer, &ops) {
                         out.push(Unsupported::ZoomBehind(at(), what));
                     }
@@ -1632,6 +1885,24 @@ impl RenderPlan {
         !layer.color.is_identity() || (self.mode == PlanMode::Motion && layer.animated.is_some_and(|a| a.color))
     }
 
+    /// Why a compositor does not draw this layer's rotation: the only turn it draws is one `rotate` lands on whole samples for
+    /// ([`quarter_turn`]); any other angle has an edge that is a fixed-point sample with an apron of its own (a rotated layer's edge
+    /// differed from a float model's by up to 117 levels of luma and 169 of chroma, with or without a keyed opacity), and a rotation a key or
+    /// a behaviour moves is another box (`hypot(iw,ih)`) turned by an expression per frame. A clip whose keyed rotation never turns has no
+    /// `rotate` in the graph at all.
+    fn rotation_refusal(&self, layer: &PlanLayer) -> Option<&'static str> {
+        let animated = layer.animated.filter(|_| self.mode == PlanMode::Motion);
+        if animated.is_some_and(|a| a.rotates) {
+            Some("a rotation that a key or a behaviour moves (a per-frame angle in a box of its own, with an edge that is a fixed-point sample)")
+        } else if animated.and_then(|a| a.keys).is_some_and(|k| k.rotation) {
+            None
+        } else if layer.transform.rotation != 0.0 && quarter_turn(layer.transform.rotation.to_radians()).is_none() {
+            Some("a rotation that is not a quarter, half or three quarters of a turn FFmpeg's rotate lands on whole samples for (any other angle has an edge that is a fixed-point sample)")
+        } else {
+            None
+        }
+    }
+
     /// Why a compositor that draws this layer's grade parts still does not draw its chain. FFmpeg's grade
     /// runs in RGB: the picture goes `yuv420p -> rgb24` (swscale's x86 kernel, reproduced to the level), through
     /// `lut3d`, `lutrgb` and `colorbalance` in turn, and back to 4:2:0 by a scale whose vertical filter has
@@ -1639,7 +1910,8 @@ impl RenderPlan {
     /// filter's). All of it is reproduced for the one picture it was measured on, 8-bit limited-range
     /// `yuv420p` at an even size, and only where nothing between the grade and the next 4:2:0 conversion
     /// sees the RGB (or 4:4:4) picture: a video effect or a black or white fade there runs on it in the format
-    /// FFmpeg negotiates, and a moving zoom's `scale` converts it in the same pass.
+    /// FFmpeg negotiates. (A moving zoom or position after the grade is not in the way: the placement reads the 4:2:0
+    /// planes the grade hands on, and every grade is exact behind it.)
     fn grade_chain_refusal(&self, layer: &PlanLayer, ops: &[FadeOp]) -> Option<&'static str> {
         if layer.stream.pix_fmt.as_deref() != Some("yuv420p") {
             Some("on a picture that is not 8-bit 4:2:0 yuv420p (FFmpeg grades it in the format it negotiates for that picture)")
@@ -1783,17 +2055,17 @@ impl RenderPlan {
         }
     }
 
-    /// What is ahead of a moving zoom that a compositor with `keyed_zoom` still does not draw: a
-    /// rotation and an opacity below 1 (their alpha plane and RGB round trip would be scaled with
-    /// the zoom), and a dip to white (the zoom's `scale` takes the RGB frame `fade c=white` leaves
-    /// and converts it to 4:2:0 in the same pass, which neither FFmpeg 6.1 nor 9.0 does as a scale of
-    /// the converted picture: up to 14 levels off on 6.1, 3 on 9.0).
+    /// What is ahead of a moving zoom or position that a compositor with `keyed_zoom` still does not draw: a
+    /// rotation and an opacity below 1 (the placement would act on the rotated alpha plane or on the RGB round
+    /// trip's, neither of which a case holds to FFmpeg's), and a dip to white (the placement chain's
+    /// `format=yuva420p` takes the RGB frame `fade c=white` leaves and converts it to 4:2:0 in the same pass, which neither FFmpeg 6.1 nor
+    /// 9.0 does as a conversion of the converted picture: up to 14 levels off on 6.1, 3 on 9.0). A grade is not here: the placement reads the
+    /// 4:2:0 planes the grade hands on, and every grade (wheels, curves, LUTs of 17, 33 and 2 points, all three)
+    /// is exact behind it on 6.1.1 and 9.0.2, in an export frame and in a still.
     fn zoom_order_refusal(&self, layer: &PlanLayer, ops: &[FadeOp]) -> Option<&'static str> {
         let rotated =
             layer.transform.rotation != 0.0 || (self.mode == PlanMode::Motion && layer.animated.is_some_and(|a| a.rotates));
-        if !layer.grade.is_identity() {
-            Some("a grade")
-        } else if rotated {
+        if rotated {
             Some("a rotation")
         } else if layer.transform.opacity < 1.0 || layer.keyed_alpha.is_some_and(|a| a < 255) {
             Some("an opacity below 1")
@@ -1964,7 +2236,26 @@ impl RenderPlan {
         Placement {
             keyframed: layer.animated.filter(|_| self.mode == PlanMode::Motion).and_then(|a| a.keys),
             offset: layer.fx.motion,
+            placed: layer
+                .animated
+                .filter(|a| a.places && !a.still_motion)
+                .map(|a| crate::layer_geometry::Placed { zoom: a.zooms }),
         }
+    }
+
+    /// Where the placement puts `layer`'s picture at this frame, for a clip whose zoom or position moves
+    /// ([`Animated::places`]; `None` for any other): the zoom if it is the one that moves (a held one is a
+    /// `scale` ahead of the placement), and the position the chain's expressions evaluate to with a slide's or
+    /// push's travel added, in canvas widths and heights — the numbers `engine::cli::placement_filters`
+    /// writes into the `perspective` corners.
+    pub fn pose(&self, layer: &PlanLayer) -> Option<Pose> {
+        // (A moving still image is drawn by its own graph, `Animated::still_motion`, not by this chain.)
+        let a = layer.animated.filter(|a| a.places && !a.still_motion)?;
+        let (mx, my) = layer.fx.motion;
+        Some(Pose {
+            scale: a.zooms.then_some(layer.transform.scale),
+            pos: (layer.transform.pos_x + mx, layer.transform.pos_y + my),
+        })
     }
 
     /// What the `tint` fades of `layer` leave of its picture at this plan's frame
@@ -2031,6 +2322,21 @@ impl RenderPlan {
             || layer.mask.is_some()
             || layer.effects.iter().any(|e| e.produces_alpha())
             || layer.fx.fades.iter().any(|s| s.tint == FadeTint::Alpha)
+    }
+
+    /// The matrix a blended clip's conversions into RGB and back are made in ([`PlanCanvas::blend_tag`]): BT.601 for an untagged
+    /// bottom layer and the `smpte170m` / `bt470bg` tags, BT.709 for the tag or the graph's label; `None` for any other
+    /// (`fcc`, `smpte240m`), which the blend has no tables for; BT.2020 has them, in the caps where this FFmpeg was measured to match (`BlendExtras`).
+    pub fn blend_matrix(&self) -> Option<YuvMatrix> {
+        if self.canvas.blend_tag_unlisted {
+            return None;
+        }
+        match self.canvas.blend_tag {
+            None | Some("smpte170m" | "bt470bg") => Some(YuvMatrix::Bt601),
+            Some("bt709") => Some(YuvMatrix::Bt709),
+            Some("bt2020nc") => Some(YuvMatrix::Bt2020),
+            Some(_) => None,
+        }
     }
 
     /// The size a render of this plan at `max_width` comes out — what the FFmpeg
@@ -3406,6 +3712,310 @@ mod tests {
         .unwrap()
     }
 
+    /// A placed layer whose asset did not record its range, where the composite's range is negotiated: the plan reads the
+    /// cache only for a host that asks the file ahead (`GpuCaps::file_range`), and then refuses a file that is full range or
+    /// that has not said, so a session, the render bar and a hand-over see what the compositor would refuse at draw time.
+    #[test]
+    fn a_placed_layer_with_no_recorded_range_is_judged_by_the_files_answer_only_where_the_host_asks_it() {
+        let key = |time: f64, scale: f64| Keyframe {
+            time,
+            scale,
+            pos_x: 0.0,
+            pos_y: 0.0,
+            rotation: 0.0,
+            opacity: 1.0,
+            easing: Default::default(),
+        };
+        let caps = GpuCaps {
+            motion: true,
+            fades: true,
+            keyed_zoom: true,
+            placement: true,
+            ..GpuCaps::A0
+        };
+        let asking = GpuCaps {
+            file_range: true,
+            ..caps
+        };
+        let plan_of = |name: &str, recorded: Option<&str>, policy: CompositeColorPolicy| {
+            let mut stream = video(640, 360);
+            stream.color_range = recorded.map(String::from);
+            let a = asset(name, 20.0, vec![stream]);
+            let mut clip = Clip::new(a.id, 0.0, 10.0, 0.0);
+            clip.keyframes = vec![key(0.0, 1.0), key(8.0, 1.5)];
+            let plan = RenderPlan::at(
+                &timeline(vec![vec![clip]]),
+                std::slice::from_ref(&a),
+                &ExportOptions {
+                    fps: Some(30.0),
+                    ..ExportOptions::default()
+                },
+                4.0,
+                policy,
+            )
+            .unwrap();
+            let path = std::path::PathBuf::from(&plan.layers[0].path);
+            (plan, path)
+        };
+        let asked = |plan: &RenderPlan, caps: &GpuCaps| {
+            plan.reasons(caps, plan.size(u32::MAX))
+                .into_iter()
+                .filter_map(|u| match u {
+                    Unsupported::PlacedFormat(_, why) => Some(why),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let negotiating = CompositeColorPolicy::BottomLayerTag;
+        // A file nobody asked: a pure plan does not mind, a host that asks does not draw it.
+        let (cold, _) = plan_of("range-cold", None, negotiating);
+        assert!(asked(&cold, &caps).is_empty());
+        let why = asked(&cold, &asking);
+        assert!(matches!(why.as_slice(), [w] if w.contains("has not said")), "{why:?}");
+        // A file that said limited is drawn; one that said full range is not.
+        let (limited, path) = plan_of("range-limited", None, negotiating);
+        crate::engine::seed_source_range(&path, false);
+        assert!(asked(&limited, &asking).is_empty());
+        let (full, path) = plan_of("range-full", None, negotiating);
+        crate::engine::seed_source_range(&path, true);
+        let why = asked(&full, &asking);
+        assert!(
+            matches!(why.as_slice(), [w] if w.starts_with("full-range") && w.contains("did not record")),
+            "{why:?}"
+        );
+        assert!(asked(&full, &caps).is_empty(), "and only for a host that asks");
+        // Where the composite's range is fixed, or the asset recorded it, the file is not asked about.
+        let (fixed, _) = plan_of("range-fixed", None, CompositeColorPolicy::FixedBt601);
+        assert!(asked(&fixed, &asking).is_empty());
+        let (recorded, _) = plan_of("range-recorded", Some("tv"), negotiating);
+        assert!(asked(&recorded, &asking).is_empty());
+    }
+
+    /// A blended clip is not placed: the placement ends the clip's chain in `pad`, `perspective` and `crop`, and no case holds the blend's two
+    /// placements of that picture to FFmpeg's, so a blend over a moving zoom or position is FFmpeg's whatever the caps.
+    #[test]
+    fn a_blended_clip_whose_zoom_or_position_moves_is_refused_and_one_that_holds_still_is_not() {
+        let key = |time: f64, scale: f64, pos_x: f64| Keyframe {
+            time,
+            scale,
+            pos_x,
+            pos_y: 0.0,
+            rotation: 0.0,
+            opacity: 1.0,
+            easing: Default::default(),
+        };
+        let caps = GpuCaps {
+            motion: true,
+            keyed_zoom: true,
+            placement: true,
+            blend: BlendKinds::ALL,
+            blend_extras: BlendExtras::ALL,
+            ..GpuCaps::A0
+        };
+        let blend_reasons = |edit: &dyn Fn(&mut Clip)| {
+            let plan = fading_plan(
+                |c| {
+                    c.blend_mode = BlendMode::Multiply;
+                    edit(c);
+                },
+                4.0,
+            );
+            plan.reasons(&caps, plan.size(u32::MAX))
+                .into_iter()
+                .filter(|u| u.kind() == "blend_mode")
+                .map(|u| u.to_string())
+                .collect::<Vec<_>>()
+        };
+        assert!(blend_reasons(&|_| {}).is_empty());
+        for edit in [
+            &(|c: &mut Clip| c.keyframes = vec![key(0.0, 1.0, 0.0), key(8.0, 1.5, 0.1)]) as &dyn Fn(&mut Clip),
+            &|c: &mut Clip| c.keyframes = vec![key(0.0, 1.0, -0.1), key(8.0, 1.0, 0.1)],
+        ] {
+            let why = blend_reasons(edit);
+            assert!(why.iter().any(|w| w.contains("a moving zoom or position")), "{why:?}");
+        }
+    }
+
+    /// The plan of a clip whose zoom (`zooming`) or position moves, judged by a compositor that draws the placement.
+    #[test]
+    fn a_placement_is_refused_for_what_it_is_not_held_to_and_drawn_otherwise() {
+        let key = |time: f64, scale: f64, pos_x: f64, rotation: f64, opacity: f64| Keyframe {
+            time,
+            scale,
+            pos_x,
+            pos_y: 0.0,
+            rotation,
+            opacity,
+            easing: Default::default(),
+        };
+        let caps = GpuCaps {
+            motion: true,
+            fades: true,
+            keyed_zoom: true,
+            placement: true,
+            ..GpuCaps::A0
+        };
+        let judge = |stream: StreamInfo, delivery: Option<Delivery>, edit: &dyn Fn(&mut Clip), t: f64| {
+            let plan = fading_plan_of(stream, delivery, CompositeColorPolicy::FixedBt601, |c| edit(c), t);
+            let size = plan.size(u32::MAX);
+            (plan.reasons(&caps, size), plan)
+        };
+        let zooming = |c: &mut Clip| c.keyframes = vec![key(0.0, 1.0, 0.0, 0.0, 1.0), key(8.0, 1.5, 0.1, 0.0, 1.0)];
+        let panning = |c: &mut Clip| c.keyframes = vec![key(0.0, 1.0, -0.1, 0.0, 1.0), key(8.0, 1.0, 0.1, 0.0, 1.0)];
+        // A zoom and a position that move are drawn; the plan carries the pose the placement draws.
+        for edit in [&zooming as &dyn Fn(&mut Clip), &panning] {
+            let (why, plan) = judge(video(640, 360), None, edit, 4.0);
+            assert!(why.is_empty(), "{why:?}");
+            let pose = plan.pose(&plan.layers[0]).expect("a pose");
+            assert_eq!(pose.pos.0, plan.layers[0].transform.pos_x);
+            assert_eq!(pose.scale.is_some(), plan.layers[0].animated.is_some_and(|a| a.zooms));
+        }
+        // ... and a clip that does not move has none.
+        let (_, plan) = judge(video(640, 360), None, &|_| {}, 4.0);
+        assert!(plan.pose(&plan.layers[0]).is_none());
+        // The geometry stops at the picture: the zoom is no `scale` stage, and a held zoom keeps its stage.
+        let (_, plan) = judge(video(640, 360), None, &zooming, 4.0);
+        let geom = plan.layer_geometry(&plan.layers[0], (640, 360)).unwrap();
+        assert_eq!(
+            (geom.stages.len(), geom.picture, geom.layer, geom.origin),
+            (1, (640, 360), (640, 360), (0, 0))
+        );
+        // An odd-height picture (a 640x203 picture in a 640x360 frame is not resized) is refused, an odd width is not.
+        let frame = Some(Delivery::new(640, 360, Fit::Contain));
+        let (why, _) = judge(video(640, 203), frame, &zooming, 4.0);
+        assert!(
+            matches!(why.as_slice(), [Unsupported::Geometry(_, w)] if w.contains("odd-height")),
+            "{why:?}"
+        );
+        let (why, _) = judge(video(203, 360), frame, &zooming, 4.0);
+        assert!(why.is_empty(), "{why:?}");
+        // Another pixel format than 4:2:0 or gray: refused, not recorded too.
+        for fmt in ["yuv444p", "yuv422p", "rgb24", "gbrp"] {
+            let mut stream = video(640, 360);
+            stream.pix_fmt = Some(fmt.into());
+            let (why, _) = judge(stream.clone(), None, &zooming, 4.0);
+            assert!(
+                why.iter().any(|u| matches!(u, Unsupported::PlacedFormat(_, f) if f == fmt)),
+                "{fmt}: {why:?}"
+            );
+            // Where the compositor measured that the graph converts planar 4:4:4 and 4:2:2 as the decode does, those two are
+            // drawn; RGB and the rest of the family are not (not measured).
+            let plan = fading_plan_of(stream, None, CompositeColorPolicy::FixedBt601, |c| zooming(c), 4.0);
+            let why = plan.reasons(
+                &GpuCaps {
+                    placed_chroma: true,
+                    ..caps
+                },
+                plan.size(u32::MAX),
+            );
+            let refused = why.iter().any(|u| matches!(u, Unsupported::PlacedFormat(..)));
+            assert_eq!(refused, !matches!(fmt, "yuv444p" | "yuv422p"), "{fmt}: {why:?}");
+        }
+        for fmt in ["yuv420p", "yuv420p10le", "gray"] {
+            let mut stream = video(640, 360);
+            stream.pix_fmt = Some(fmt.into());
+            let (why, _) = judge(stream, None, &zooming, 4.0);
+            assert!(
+                !why.iter().any(|u| matches!(u, Unsupported::PlacedFormat(..))),
+                "{fmt}: {why:?}"
+            );
+        }
+        let mut stream = video(640, 360);
+        stream.pix_fmt = None;
+        let (why, _) = judge(stream, None, &zooming, 4.0);
+        assert!(why.iter().any(|u| matches!(u, Unsupported::PlacedFormat(..))), "{why:?}");
+        // The lifted 4:4:4 and 4:2:2 are not exempt from it: flagged full range they are refused where the range is negotiated.
+        for fmt in ["yuv444p", "yuv422p"] {
+            let mut stream = video(640, 360);
+            stream.pix_fmt = Some(fmt.into());
+            stream.color_range = Some("pc".into());
+            for (policy, refused) in [
+                (CompositeColorPolicy::FixedBt601, false),
+                (CompositeColorPolicy::BottomLayerTag, true),
+                (CompositeColorPolicy::Unknown, true),
+            ] {
+                let plan = fading_plan_of(stream.clone(), None, policy, |c| zooming(c), 4.0);
+                let why = plan.reasons(
+                    &GpuCaps {
+                        placed_chroma: true,
+                        ..caps
+                    },
+                    plan.size(u32::MAX),
+                );
+                let placed = why
+                    .iter()
+                    .any(|u| matches!(u, Unsupported::PlacedFormat(_, f) if f.starts_with("full-range")));
+                assert_eq!(placed, refused, "{fmt} {policy:?}: {why:?}");
+            }
+        }
+        // A picture that may be full range: refused where the composite's range is negotiated, drawn where it is not.
+        let mut stream = video(640, 360);
+        stream.pix_fmt = Some("yuvj420p".into());
+        for (policy, refused) in [
+            (CompositeColorPolicy::FixedBt601, false),
+            (CompositeColorPolicy::BottomLayerTag, true),
+            (CompositeColorPolicy::Unknown, true),
+        ] {
+            let plan = fading_plan_of(stream.clone(), None, policy, |c| zooming(c), 4.0);
+            let why = plan.reasons(&caps, plan.size(u32::MAX));
+            let placed = why
+                .iter()
+                .any(|u| matches!(u, Unsupported::PlacedFormat(_, f) if f.starts_with("full-range")));
+            assert_eq!(placed, refused, "{policy:?}: {why:?}");
+        }
+        // A pose out of the table's range.
+        let (why, _) = judge(
+            video(640, 360),
+            None,
+            &|c| c.keyframes = vec![key(0.0, 1.0, 0.0, 0.0, 1.0), key(8.0, 0.00001, 0.0, 0.0, 1.0)],
+            9.0,
+        );
+        assert!(
+            matches!(why.as_slice(), [Unsupported::Geometry(_, w)] if w.contains("fixed-point range")),
+            "{why:?}"
+        );
+        // A rotation, an opacity below 1 and a dip to white ahead of the placement: a moving position as much as a zoom.
+        let (why, _) = judge(
+            video(640, 360),
+            None,
+            &|c| c.keyframes = vec![key(0.0, 1.0, -0.1, 90.0, 1.0), key(8.0, 1.0, 0.1, 90.0, 1.0)],
+            4.0,
+        );
+        assert!(
+            matches!(why.as_slice(), [Unsupported::ZoomBehind(_, w)] if w.contains("rotation")),
+            "{why:?}"
+        );
+        let (why, _) = judge(
+            video(640, 360),
+            None,
+            &|c| c.keyframes = vec![key(0.0, 1.0, -0.1, 0.0, 0.5), key(8.0, 1.0, 0.1, 0.0, 0.5)],
+            4.0,
+        );
+        assert!(
+            matches!(why.as_slice(), [Unsupported::ZoomBehind(_, w)] if w.contains("opacity")),
+            "{why:?}"
+        );
+        // Without the ability every such layer is `KeyedPlacement` as before.
+        let plan = fading_plan(zooming, 4.0);
+        let why = plan.reasons(
+            &GpuCaps {
+                placement: false,
+                ..caps
+            },
+            plan.size(u32::MAX),
+        );
+        assert!(why.iter().any(|u| matches!(u, Unsupported::KeyedPlacement(_))), "{why:?}");
+        // A letterboxed picture at the identity pose in a still (frame 0 of a push-in that starts at 1): the still
+        // pads it to the whole frame before the placement.
+        let (why, _) = judge(video(480, 360), Some(Delivery::new(640, 360, Fit::Contain)), &zooming, 0.0);
+        assert!(
+            matches!(why.as_slice(), [Unsupported::Geometry(_, w)] if w.contains("letterboxed")),
+            "{why:?}"
+        );
+        let (why, _) = judge(video(480, 360), Some(Delivery::new(640, 360, Fit::Contain)), &zooming, 4.0);
+        assert!(why.is_empty(), "{why:?}");
+    }
+
     #[test]
     fn a_fades_ops_carry_the_integer_the_filter_multiplies_by_in_chain_order() {
         // Fade-in over 1 s (30 frames of 30 fps), fade-out over the last 0.5 s: at frame 15 the
@@ -3526,7 +4136,7 @@ mod tests {
         let why = reasons(
             &|c| {
                 white(c);
-                c.transform.rotation = 10.0;
+                c.transform.rotation = 90.0;
             },
             0.5,
         );
@@ -3648,7 +4258,7 @@ mod tests {
         // A mask on a rotated layer, and on one below full opacity.
         let why = reasons(&|c| {
             c.mask = Some(mask);
-            c.transform.rotation = 10.0;
+            c.transform.rotation = 90.0;
         });
         assert!(
             matches!(why.as_slice(), [Unsupported::MaskWith(_, w)] if w.contains("rotated")),
@@ -3695,7 +4305,7 @@ mod tests {
         // A moving zoom with a rotation or an opacity below 1 in front of it: refused whatever the caps.
         let why = reasons(&|c| {
             zoom(c);
-            c.keyframes.iter_mut().for_each(|k| k.rotation = 12.0);
+            c.keyframes.iter_mut().for_each(|k| k.rotation = 90.0);
         });
         assert!(
             matches!(why.as_slice(), [Unsupported::ZoomBehind(_, w)] if w.contains("rotation")),
@@ -4699,7 +5309,8 @@ mod tests {
             &|c| c.keyframes = vec![key(0.0, 1.0), key(4.0, 1.5)],
             0.5,
         );
-        assert!(w.iter().any(|u| matches!(u, Unsupported::ZoomBehind(_, "a grade"))), "{w:?}");
+        // (A grade ahead of a moving zoom is drawn: the placement reads the planes the grade hands on, exact behind every grade.)
+        assert!(!w.iter().any(|u| matches!(u, Unsupported::ZoomBehind(..))), "{w:?}");
         // The geometry: a resize (whatever the ratio), a letterbox, an odd picture.
         with(why(video(640, 360), None, &|c| c.transform.scale = 0.5, 0.5), "resizes");
         // (A zoom in is the fit's own resample, which the plan refuses for itself: `FoldedFit`.)
@@ -5033,5 +5644,125 @@ mod tests {
         )
         .unwrap();
         assert!(!p.gpu_supported());
+    }
+    /// The angles `rotate` turns a picture by whole samples for: the quarters whose integer sine and cosine are exact (measured on FFmpeg
+    /// 6.1.1 and 9.0.2 for -1310 to 1310 quarters, `tests/motion_parity.rs`), the rest refused, whatever their float angle says.
+    #[test]
+    fn a_quarter_turn_is_an_angle_rotates_integer_sine_comes_out_exact_for() {
+        let deg = |d: f64| quarter_turn(d.to_radians());
+        // The set: -47, -46, -43 to 40, 43 and 44 quarters.
+        let exact = |q: i32| (-47..=-46).contains(&q) || (-43..=40).contains(&q) || (43..=44).contains(&q);
+        for q in -700..=700 {
+            let want = exact(q).then_some(q.rem_euclid(4) as u8);
+            assert_eq!(deg(f64::from(q) * 90.0), want, "{q} quarters");
+        }
+        for (d, turn) in [
+            (90.0, 1),
+            (180.0, 2),
+            (270.0, 3),
+            (-90.0, 3),
+            (360.0, 0),
+            (450.0, 1),
+            (-450.0, 3),
+            (3600.0, 0),
+        ] {
+            assert_eq!(deg(d), Some(turn), "{d}");
+        }
+        // A hair off a quarter (within `FLT_EPSILON` radians of one: the fast path's window) is that quarter; 90.00001 degrees is not one.
+        let rad = |q: f64, off: f64| q * std::f64::consts::FRAC_PI_2 + off;
+        for (q, off, turn) in [
+            (1.0, 1e-7, 1),
+            (1.0, -1e-7, 1),
+            (2.0, 1.1e-7, 2),
+            (3.0, -1.1e-7, 3),
+            (0.0, 1e-7, 0),
+            (0.0, -1e-7, 0),
+            (5.0, 1e-7, 1),
+            (-1.0, -1e-7, 3),
+        ] {
+            assert_eq!(quarter_turn(rad(q, off)), Some(turn), "{q} quarters {off:+e} rad");
+        }
+        for (q, off) in [(1.0, 1.3e-7), (1.0, -1.3e-7), (0.0, 2e-7), (2.0, 1e-6), (5.0, 1.745e-7)] {
+            assert_eq!(quarter_turn(rad(q, off)), None, "{q} quarters {off:+e} rad");
+        }
+        for (d, turn) in [
+            (90.000_000_01, 1),
+            (89.999_999_99, 1),
+            (-90.000_000_01, 3),
+            (180.000_000_01, 2),
+            (450.000_000_01, 1),
+        ] {
+            assert_eq!(deg(d), Some(turn), "{d}");
+        }
+        for d in [91.0, 89.99, 90.00001, 45.0, 0.001, 12.0, -30.0, 359.5, 3690.0] {
+            assert_eq!(deg(d), None, "{d}");
+        }
+        // Too large for the filter's `int` angle, or not a number: never a quarter turn (and no overflow looking).
+        for d in [
+            1e300,
+            -1e300,
+            f64::MAX,
+            f64::MIN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            1e18,
+            1e7,
+            4e9,
+            90.0 * 2f64.powi(40),
+            90.0 * 2f64.powi(40) + 0.0625,
+            2f64.powi(60),
+            58_000.0,
+        ] {
+            assert_eq!(deg(d), None, "{d}");
+        }
+        assert!(is_quarter_turn(std::f64::consts::PI) && !is_quarter_turn(1.0));
+    }
+
+    #[test]
+    fn a_rotation_that_is_not_a_proven_quarter_turn_is_refused_on_every_layer() {
+        let caps = GpuCaps {
+            motion: true,
+            ..GpuCaps::A0
+        };
+        let rotation = |angle: f64| {
+            let plan = fading_plan(|c| c.transform.rotation = angle, 0.5);
+            let why = plan.reasons(&caps, plan.size(u32::MAX));
+            assert_eq!(plan.gpu_supported(), why.is_empty(), "{angle}: {why:?}");
+            why.into_iter().filter(|u| u.kind() == "rotation").count()
+        };
+        for angle in [90.0, 180.0, 270.0, -90.0, 360.0, 3600.0, 36.0 * 90.0, 43.0 * 90.0] {
+            assert_eq!(rotation(angle), 0, "{angle}");
+        }
+        for angle in [
+            12.0,
+            -30.0,
+            45.0,
+            89.5,
+            91.0,
+            90.00001,
+            41.0 * 90.0,
+            42.0 * 90.0,
+            400.0 * 90.0,
+            1e7,
+            1e300,
+            f64::MAX,
+        ] {
+            assert_eq!(rotation(angle), 1, "{angle}");
+        }
+        // Blended too (the blend's own cause is named as well).
+        let plan = fading_plan(
+            |c| {
+                c.blend_mode = BlendMode::Multiply;
+                c.transform.rotation = 12.0;
+            },
+            0.5,
+        );
+        let kinds: Vec<_> = plan
+            .reasons(&GpuCaps::A0, plan.size(u32::MAX))
+            .iter()
+            .map(Unsupported::kind)
+            .collect();
+        assert!(kinds.contains(&"rotation") && kinds.contains(&"blend_mode"), "{kinds:?}");
     }
 }

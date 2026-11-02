@@ -95,7 +95,7 @@ fn timeline(asset: &Asset, layers: usize) -> Timeline {
                     pos_x: -0.3 + 0.2 * (i % 4) as f64,
                     pos_y: -0.25 + 0.25 * (i / 4) as f64,
                     opacity: if i % 2 == 0 { 0.8 } else { 1.0 },
-                    rotation: if i == 3 { 12.0 } else { 0.0 },
+                    rotation: if i == 3 { 90.0 } else { 0.0 },
                     ..Transform::default()
                 };
             }

@@ -1156,10 +1156,12 @@ fn measure_composite_color_policy(ffmpeg: &str, ffprobe: &str, timeout: std::tim
 /// Run `cmd` with `input` on its stdin and return its stdout if it exits
 /// successfully before `deadline` — killed, and `None`, if it does not. The pipes
 /// are served from side threads, so a child that stops reading or never exits
-/// cannot wedge the caller; on a timeout those threads are left to finish on
-/// their own (a wrapper script that spawned the real ffmpeg keeps the pipe open
-/// past the kill, and the caller must not wait for it).
-pub(super) fn run_piped_until(cmd: &mut Command, input: Vec<u8>, deadline: Instant) -> Option<Vec<u8>> {
+/// cannot wedge the caller. **Nothing here joins a thread that a child can keep
+/// alive**: a wrapper script that spawned the real ffmpeg keeps the pipes open
+/// past the kill (and past its own exit), so on a timeout the side threads are
+/// left to finish on their own, and after a clean exit the output is waited
+/// for no longer than the deadline (a short grace past it) either.
+pub fn run_piped_until(cmd: &mut Command, input: Vec<u8>, deadline: Instant) -> Option<Vec<u8>> {
     use std::io::{Read, Write};
     let mut child = cmd
         .stdin(Stdio::piped())
@@ -1170,14 +1172,16 @@ pub(super) fn run_piped_until(cmd: &mut Command, input: Vec<u8>, deadline: Insta
     let mut stdin = child.stdin.take()?;
     let mut stdout = child.stdout.take()?;
     // The input is a few kilobytes and the child may close the pipe before reading
-    // it all, which is not the feeder's problem.
-    let feeder = std::thread::spawn(move || {
+    // it all, which is not the feeder's problem. (Not joined: a descendant that holds
+    // the pipe open and does not read keeps a long input's write blocked.)
+    std::thread::spawn(move || {
         let _ = stdin.write_all(&input);
     });
-    let reader = std::thread::spawn(move || {
+    let (sent, output) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
         let mut out = Vec::new();
         let _ = stdout.read_to_end(&mut out);
-        out
+        let _ = sent.send(out);
     });
     let status = loop {
         match child.try_wait() {
@@ -1190,8 +1194,12 @@ pub(super) fn run_piped_until(cmd: &mut Command, input: Vec<u8>, deadline: Insta
             }
         }
     };
-    let _ = feeder.join();
-    let out = reader.join().ok()?;
+    // The child has exited, so the pipe is at its end unless a descendant of it holds the other side: the output is
+    // there already, and a descendant that outlives the deadline is not waited for.
+    let wait = deadline
+        .saturating_duration_since(Instant::now())
+        .max(std::time::Duration::from_millis(250));
+    let out = output.recv_timeout(wait).ok()?;
     status.success().then_some(out)
 }
 
@@ -1627,6 +1635,13 @@ pub(crate) struct SourceTraits {
     /// are not (their timestamps are measured or guessed and their seeks land on a later
     /// keyframe), and neither is a file whose format the probe did not name.
     pub indexed: bool,
+    /// The stream is flagged full range (`color_range=pc`): what the file says, which an asset probed before the
+    /// flag was recorded does not (`PlanStream::color_range`, `None`).
+    pub full_range: bool,
+    /// The probe's answer described a file (JSON with a `streams` list and a `format`): without that every other field is
+    /// the neutral value of an ordinary file, not something the file said (`ffprobe` can exit 0 and print nothing usable). A
+    /// file that has no video stream is described all the same (its `streams` list is empty).
+    pub described: bool,
     /// The stream's codec and chroma format, for the one thing a decode that is handed a bare
     /// path has to ask of them: whether to request a hardware decoder (`decode_policy`).
     pub codec: Codec,
@@ -1657,15 +1672,55 @@ fn luma_plane_pix_fmt(name: &str) -> bool {
 
 /// [`SourceTraits`] of the file at `path`, probed once per file and cached against the file's
 /// size and modified time. One `ffprobe`, killed after [`SOURCE_PROBE_TIMEOUT`]; `None` when the
-/// probe itself fails or outlasts it, and the failure is remembered for a minute (a broken or
-/// hung `ffprobe` is not respawned by every frame that asks), then retried.
+/// probe itself fails, outlasts it or exits 0 with an answer that describes no file (nothing usable on its
+/// output), and the failure is remembered for a minute (a broken or hung `ffprobe` is not respawned by every
+/// frame that asks), then retried.
 ///
 /// It spawns a process: not under a lock.
 pub(crate) fn source_traits(path: &Path) -> Option<SourceTraits> {
+    source_traits_cache().get(path, || probe_source_traits(&ffprobe_bin(), path, SOURCE_PROBE_TIMEOUT))
+}
+
+/// Whether the first video stream of the file at `path` is flagged full range, **as the file says** (one cached `ffprobe`,
+/// [`source_traits`]): what a plan that was made from an asset probed before the flag was recorded cannot know. `None`
+/// when the probe could not tell: it failed, outlasted its timeout, or exited 0 with an answer that describes no file (nothing
+/// usable on its output). A file the probe read that has no video stream is not full range: there is no picture to be. It
+/// spawns a process: not under a lock.
+pub fn source_is_full_range(path: &Path) -> Option<bool> {
+    full_range_of(source_traits(path)?)
+}
+
+/// [`source_is_full_range`] **from what is already known**: the answer a probe of this file left (this one's, or any
+/// other read of the file's [`SourceTraits`]: the HDR, the lead, the container), `None` while there is none (not asked,
+/// being asked, failed, or no video stream). It never spawns and never waits, so a render may ask it; whoever
+/// wants it answered asks [`source_is_full_range`] ahead, off the render's path.
+pub fn source_is_full_range_known(path: &Path) -> Option<bool> {
+    full_range_of(source_traits_known(path)?)
+}
+
+fn full_range_of(traits: SourceTraits) -> Option<bool> {
+    traits.described.then_some(traits.full_range)
+}
+
+/// Make the cache hold `full_range` for `path` (a test seeds what a probe of a file would have left).
+#[cfg(test)]
+pub(crate) fn seed_source_range(path: &Path, full_range: bool) {
+    let traits = SourceTraits {
+        described: true,
+        full_range,
+        ..SourceTraits::default()
+    };
+    let _ = source_traits_cache().get(path, || Some(traits));
+}
+
+fn source_traits_cache() -> &'static ProbeCache<SourceTraits> {
     static CACHE: OnceLock<ProbeCache<SourceTraits>> = OnceLock::new();
-    CACHE
-        .get_or_init(ProbeCache::new)
-        .get(path, || probe_source_traits(&ffprobe_bin(), path, SOURCE_PROBE_TIMEOUT))
+    CACHE.get_or_init(ProbeCache::new)
+}
+
+/// What [`source_traits`] has remembered of the file, without probing it.
+fn source_traits_known(path: &Path) -> Option<SourceTraits> {
+    source_traits_cache().peek(path)
 }
 
 /// One `ffprobe` of `path`, killed after `timeout`.
@@ -1677,7 +1732,7 @@ fn probe_source_traits(ffprobe: &str, path: &Path, timeout: std::time::Duration)
         "-select_streams",
         "v:0",
         "-show_entries",
-        "stream=color_transfer,start_time,codec_name,pix_fmt:format=start_time,format_name",
+        "stream=color_transfer,color_range,start_time,codec_name,pix_fmt:format=start_time,format_name",
     ])
     // JSON rather than `csv`/`default`: the stream and the format both have a
     // `start_time`, and a file with side data (a phone's display matrix) makes
@@ -1685,7 +1740,10 @@ fn probe_source_traits(ffprobe: &str, path: &Path, timeout: std::time::Duration)
     .args(["-of", "json"])
     .arg(path);
     let output = run_piped_until(&mut cmd, Vec::new(), Instant::now() + timeout)?;
-    Some(parse_source_traits(&String::from_utf8_lossy(&output)))
+    let traits = parse_source_traits(&String::from_utf8_lossy(&output));
+    // (An `ffprobe` that exits 0 and prints nothing usable has told nothing: that is a failed probe, retried after the
+    // failure backoff, and not the neutral traits of an ordinary file remembered for good.)
+    traits.described.then_some(traits)
 }
 
 /// The pure half of [`source_traits`]: read the probe's JSON. Anything missing
@@ -1737,6 +1795,8 @@ fn parse_source_traits(json: &str) -> SourceTraits {
         hdr,
         lead,
         indexed,
+        full_range: text("color_range") == "pc",
+        described: v.get("streams").is_some_and(|s| s.is_array()) && v.get("format").is_some_and(|f| f.is_object()),
         codec: Codec::from_name(text("codec_name")),
         chroma: Chroma::from_pix_fmt(text("pix_fmt")),
         bits: pix_fmt_bits_420(text("pix_fmt")),
@@ -7126,7 +7186,7 @@ impl Drop for PassLogs {
 /// (`MAX_ARG_STRLEN`) and Windows caps the whole command line at 32767
 /// characters, which is about ten seconds of animation. The threshold sits well
 /// below both, since spilling to a file costs nothing.
-const GRAPH_ARG_MAX: usize = 8192;
+pub const GRAPH_ARG_MAX: usize = 8192;
 
 /// Index of the `-filter_complex` *value* when it is too long to pass in argv.
 fn oversized_graph_index(args: &[String]) -> Option<usize> {
@@ -8586,6 +8646,75 @@ fn placement_chain(scale: Option<&str>, pos: (&str, &str), canvas: (u32, u32), a
         format!("crop=w={cw}:h={ch}:x='2*floor((iw-{cw})/4)':y='2*floor((ih-{ch})/4)'"),
     ]);
     p
+}
+
+/// The placement chain **as the export and the still write it** (`per_frame`: the export's `eval=frame`), for the
+/// compositor's probe of what this machine's `pad`, `perspective` and `crop` do with it: the text is
+/// [`placement_chain`]'s, joined, so a probe measures the filters the graph really holds and cannot drift from them.
+pub fn placement_probe_chain(scale: Option<&str>, pos: (&str, &str), canvas: (u32, u32), per_frame: bool) -> String {
+    placement_chain(scale, pos, canvas, false, per_frame).join(",")
+}
+
+/// A moving placement as the export writes it, and the numbers the plan evaluates for it ([`placement_probe_motion`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlacementProbeMotion {
+    /// The zoom's expression over `in` (the frame count `perspective` has), the position's two.
+    pub scale: String,
+    pub pos: (String, String),
+    /// What the plan evaluates for frame `in = k + 1` (index `k`): the zoom and the position.
+    pub poses: Vec<(f64, (f64, f64))>,
+}
+
+/// A clip whose zoom and position are keyed and which breathes, drifts and shakes at 30 fps, as
+/// [`placement_filters`] writes it (the same [`driven_expr`] over the same `in`-time) and as the plan evaluates it
+/// ([`Clip::transform_at`]) for the first `frames` frames of the graph. What the compositor's probe measures
+/// the filters against: the expression's `sin` and `cos` are the machine's libm's, the plan's the app's.
+pub fn placement_probe_motion(frames: u32) -> PlacementProbeMotion {
+    use crate::model::{Behavior, PropertyKey};
+    let rate = Rational { num: 30, den: 1 };
+    let mut clip = Clip::new(uuid::Uuid::nil(), 0.0, 10.0, 0.0);
+    clip.set_property_keys(
+        Property::Scale,
+        vec![
+            PropertyKey::new(0.0, 1.1),
+            PropertyKey::new(0.2, 2.3),
+            PropertyKey::new(0.4, 0.7),
+        ],
+    );
+    clip.set_property_keys(Property::PosX, vec![PropertyKey::new(0.0, -0.2), PropertyKey::new(0.3, 0.15)]);
+    clip.set_property_keys(Property::PosY, vec![PropertyKey::new(0.0, 0.1), PropertyKey::new(0.3, -0.25)]);
+    clip.behaviors = vec![
+        Behavior::Breathe {
+            amount: 0.12,
+            speed: 0.8,
+            phase: 1.25,
+        },
+        Behavior::Drift {
+            speed: 0.15,
+            angle: -33.0,
+            phase: 0.5,
+        },
+        Behavior::Shake {
+            amount: 0.013,
+            speed: 3.1,
+            seed: 4_000_000_001,
+            phase: 0.5,
+        },
+    ];
+    let t = perspective_time(rate, 0);
+    let poses = (0..frames)
+        .map(|k| {
+            // The graph's `((in-1)*den/num)`, in the filter's own double arithmetic.
+            let local = (f64::from(k) * f64::from(rate.den)) / f64::from(rate.num);
+            let at = clip.transform_at(local);
+            (at.scale, (at.pos_x, at.pos_y))
+        })
+        .collect();
+    PlacementProbeMotion {
+        scale: driven_expr(&clip, Property::Scale, &t),
+        pos: (driven_expr(&clip, Property::PosX, &t), driven_expr(&clip, Property::PosY, &t)),
+        poses,
+    }
 }
 
 /// The 0..1 "keep" expression at the heart of [`mask_filter`], separated out so
@@ -11624,7 +11753,10 @@ mod stabilize_rendered;
 
 /// A clip composited with a blend mode instead of alpha-over.
 mod blend;
+/// The tag a blend chain names for its composite (the bottom layer's): the planner mirrors it in `PlanCanvas::blend_tag`.
+pub(crate) use blend::composite_matrix as blend_composite_tag;
 use blend::{blend_chains, composite_matrix, keeps_clear_bars, Blend};
+pub use blend::{blend_colour_graph, blend_probe_graph};
 
 /// Blend modes through the real `ffmpeg`: the pixels of each mode, the composite outside the clip, and `normal`
 /// through the blend graph against the plain `overlay` (`#[ignore]`d).
@@ -12166,8 +12298,18 @@ mod tests {
         assert_eq!((pq.hdr, pq.lead), (Some(Hdr::Pq), 0.0));
         // `N/A` is left out by ffprobe's JSON writer; an unknown transfer is SDR.
         let plain = parse_source_traits(r#"{"streams":[{"color_transfer":"bt709"}],"format":{"start_time":"0.000000"}}"#);
-        assert_eq!(plain, SourceTraits::default());
-        assert_eq!(parse_source_traits(r#"{"streams":[],"format":{}}"#), SourceTraits::default());
+        let described = SourceTraits {
+            described: true,
+            ..SourceTraits::default()
+        };
+        assert_eq!(plain, described);
+        assert_eq!(parse_source_traits(r#"{"streams":[],"format":{}}"#), described);
+        // The file's own range flag, which an asset probed before it was recorded does not hold.
+        assert!(parse_source_traits(r#"{"streams":[{"color_range":"pc"}],"format":{}}"#).full_range);
+        for tag in ["tv", "unknown", ""] {
+            let json = format!(r#"{{"streams":[{{"color_range":"{tag}"}}],"format":{{}}}}"#);
+            assert!(!parse_source_traits(&json).full_range, "{tag:?}");
+        }
         assert_eq!(parse_source_traits("not json"), SourceTraits::default());
         // A transport stream (a camcorder's .mts / .m2ts) is reported as having no
         // lead whatever its streams' starts say: a padded proxy cannot fix it, so it
@@ -12177,6 +12319,84 @@ mod tests {
         let mp4 =
             r#"{"streams":[{"start_time":"1.521333"}],"format":{"format_name":"mov,mp4,m4a,3gp,3g2,mj2","start_time":"1.4"}}"#;
         assert!((parse_source_traits(mp4).lead - 0.121333).abs() < 1e-9);
+    }
+
+    /// The range a file says, as the compositor asks for it: `None` for an answer that describes no file (an `ffprobe` that exits 0
+    /// and prints nothing usable is not "limited range"), the flag for one that does, and "not full range" for a file the probe
+    /// read that has no video stream at all.
+    #[test]
+    fn a_files_range_is_unknown_when_the_probe_said_nothing_usable() {
+        let range = |json: &str| full_range_of(parse_source_traits(json));
+        for unusable in [
+            "",
+            "\n",
+            "not json",
+            "{}",
+            "[]",
+            "null",
+            r#"{"streams":null,"format":{}}"#,
+            r#"{"streams":{},"format":{}}"#,
+            r#"{"streams":[{"color_range":"pc"}]}"#,
+            r#"{"streams":[{"color_range":"pc"}],"format":null}"#,
+            r#"{"format":{"format_name":"matroska,webm"}}"#,
+            r#"{"programs":[]}"#,
+        ] {
+            assert_eq!(range(unusable), None, "{unusable:?}");
+        }
+        assert_eq!(range(r#"{"streams":[{"color_range":"pc"}],"format":{}}"#), Some(true));
+        assert_eq!(
+            range(r#"{"streams":[{"color_range":"tv"}],"format":{"format_name":"mov,mp4"}}"#),
+            Some(false)
+        );
+        assert_eq!(
+            range(r#"{"streams":[{}],"format":{}}"#),
+            Some(false),
+            "a stream that says nothing of its range"
+        );
+        // A wav or an mp3: read, and with no picture in it (what the picture would be is not a question it has an answer to).
+        assert_eq!(
+            range(r#"{"programs":[],"streams":[],"format":{"format_name":"wav","start_time":"0.000000"}}"#),
+            Some(false)
+        );
+        // (A probe cached for a file serves both questions: `peek` finds it, and a file never asked about has none.)
+        assert_eq!(
+            source_is_full_range_known(Path::new("/no/such/file/was/asked/about.mkv")),
+            None
+        );
+    }
+
+    /// A probe whose output describes no file is a failed probe (`None`: the cache retries it after the failure backoff), not the
+    /// neutral traits of an ordinary file remembered for good.
+    #[cfg(unix)]
+    #[test]
+    fn a_probe_that_said_nothing_usable_is_a_failure_and_not_remembered_as_an_answer() {
+        let ask =
+            |ffprobe: &str| probe_source_traits(ffprobe, Path::new("/no/such/file.mkv"), std::time::Duration::from_secs(10));
+        // Exits 0 with nothing; exits 0 with its own arguments (which are no JSON); does not run at all.
+        assert_eq!(ask("true"), None);
+        assert_eq!(ask("echo"), None);
+        assert_eq!(ask("/no/such/ffprobe"), None);
+        let cache = ProbeCache::<SourceTraits>::retrying(std::time::Duration::from_secs(3600));
+        let path = Path::new("/no/such/file.mkv");
+        let mut asked = 0;
+        for _ in 0..3 {
+            assert_eq!(
+                cache.get(path, || {
+                    asked += 1;
+                    ask("true")
+                }),
+                None
+            );
+        }
+        assert_eq!(asked, 1, "a failure is remembered inside the backoff");
+        let retrying = ProbeCache::<SourceTraits>::retrying(std::time::Duration::ZERO);
+        for _ in 0..3 {
+            let _ = retrying.get(path, || {
+                asked += 1;
+                ask("true")
+            });
+        }
+        assert_eq!(asked, 4, "and asked again after it, not kept as an answer");
     }
 
     /// A hung `ffprobe` is killed at the timeout and a failing one is no answer, where
@@ -17208,6 +17428,99 @@ mod tests {
         assert!(g.contains(":fillcolor=black@0:ow=rotw("), "{g}");
     }
 
+    /// What the blend chains name for the composite is what the plan says they do (`PlanCanvas::blend_tag`), which the GPU draws the
+    /// blend in: the bottom layer's tag (the first picture of the lowest video track, wherever the cut is looked at from), BT.709 for
+    /// untagged HD beside a tagged input, nothing for an untagged one.
+    #[test]
+    fn the_matrix_a_blend_names_is_the_plans_blend_tag() {
+        use crate::planner::{PlanRequest, Planner};
+        use crate::render_plan::{CompositeColorPolicy, PlanMode};
+        let tagged = |w: u32, h: u32, tag: Option<&str>| {
+            let mut stream = video_stream(w, h, 25.0);
+            stream.pix_fmt = Some("yuv420p".into());
+            stream.color_space = tag.map(str::to_string);
+            test_asset(vec![stream])
+        };
+        let blended = |asset: &Asset, start: f64| {
+            let mut c = make_clip(asset.id, 0.0, 4.0, start);
+            c.blend_mode = crate::model::BlendMode::Screen;
+            c
+        };
+        let named = |graph: &str| -> Option<String> {
+            graph
+                .split("in_color_matrix=")
+                .nth(1)
+                .map(|rest| rest.split(':').next().unwrap_or_default().to_string())
+        };
+        let (untagged_sd, bt709, ntsc, untagged_hd) = (
+            tagged(640, 480, None),
+            tagged(1920, 1080, Some("bt709")),
+            tagged(640, 480, Some("smpte170m")),
+            tagged(1920, 1080, None),
+        );
+        for (name, bottom, top, tag, graph_names) in [
+            ("untagged SD", &untagged_sd, &untagged_sd, None, None),
+            ("bt709", &bt709, &bt709, Some("bt709"), Some("bt709")),
+            ("smpte170m", &ntsc, &ntsc, Some("smpte170m"), Some("smpte170m")),
+            // Untagged HD beside a clip that names a matrix is labelled BT.709 by the graph.
+            (
+                "an untagged HD bottom beside a tagged one",
+                &untagged_hd,
+                &bt709,
+                Some("bt709"),
+                Some("bt709"),
+            ),
+            (
+                "a tagged bottom under an untagged one",
+                &bt709,
+                &untagged_sd,
+                Some("bt709"),
+                Some("bt709"),
+            ),
+        ] {
+            let tl = timeline_of(vec![
+                video_track(vec![make_clip(bottom.id, 0.0, 4.0, 0.0)]),
+                video_track(vec![blended(top, 0.0)]),
+            ]);
+            let assets = [bottom.clone(), top.clone()];
+            let graph = graph_of(&tl, &assets);
+            assert_eq!(named(&graph).as_deref(), graph_names, "{name}: {graph}");
+            for mode in [PlanMode::Motion, PlanMode::Still] {
+                let planner = Planner::new(
+                    &tl,
+                    &assets,
+                    &ExportOptions::default(),
+                    PlanRequest {
+                        mode,
+                        ..PlanRequest::still(CompositeColorPolicy::FixedBt601)
+                    },
+                )
+                .expect("planner");
+                let plan = planner.at(1.0).expect("plan");
+                assert_eq!(plan.canvas.blend_tag, tag, "{name} {mode:?}");
+            }
+        }
+        // The first picture of the lowest video track: a clip that starts later in the track's list but earlier on the timeline.
+        let tl = timeline_of(vec![video_track(vec![
+            blended(&untagged_sd, 5.0),
+            make_clip(bt709.id, 0.0, 4.0, 0.0),
+        ])]);
+        let assets = [untagged_sd, bt709];
+        let graph = graph_of(&tl, &assets);
+        assert_eq!(named(&graph).as_deref(), Some("bt709"), "{graph}");
+        let plan = Planner::new(
+            &tl,
+            &assets,
+            &ExportOptions::default(),
+            PlanRequest {
+                mode: PlanMode::Motion,
+                ..PlanRequest::still(CompositeColorPolicy::FixedBt601)
+            },
+        )
+        .expect("planner");
+        assert_eq!(plan.canvas().blend_tag, Some("bt709"));
+    }
+
     #[test]
     fn a_degenerate_mask_is_clamped_rather_than_blanking_the_clip() {
         // A zero-width shape would make the whole clip transparent, which is
@@ -21752,6 +22065,33 @@ mod tests {
             Instant::now() + std::time::Duration::from_secs(10),
         );
         assert!(out.is_none());
+    }
+
+    /// A wrapper that does not `exec` leaves the real program holding the pipes past the kill, and past its own exit: the
+    /// run must hand the caller back at its deadline all the same, never join a thread a descendant keeps alive.
+    #[test]
+    #[cfg(unix)]
+    fn a_descendant_holding_the_pipes_does_not_hold_the_caller() {
+        let held = std::time::Duration::from_secs(6);
+        let bound = std::time::Duration::from_millis(300);
+        // Killed at the deadline: the shell dies, its `sleep` keeps the stdout pipe open for `held`.
+        let started = Instant::now();
+        let out = run_piped_until(
+            Command::new("sh").args(["-c", "sleep 6; echo late"]),
+            Vec::new(),
+            Instant::now() + bound,
+        );
+        assert!(out.is_none());
+        assert!(started.elapsed() < held / 2, "waited {:?} for a pipe", started.elapsed());
+        // Exited cleanly before the deadline with a background `sleep` still holding the pipe: nothing is waited on past it.
+        let started = Instant::now();
+        let out = run_piped_until(
+            Command::new("sh").args(["-c", "sleep 6 & echo early"]),
+            Vec::new(),
+            Instant::now() + bound,
+        );
+        assert!(out.is_none(), "an output cut short by a held pipe is no answer: {out:?}");
+        assert!(started.elapsed() < held / 2, "waited {:?} for a pipe", started.elapsed());
     }
 
     #[test]

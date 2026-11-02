@@ -222,6 +222,12 @@ impl MotionFrames {
     pub fn frames(&mut self, plan: &RenderPlan) -> Result<Vec<Option<Arc<YuvFrame>>>, GpuError> {
         self.counts.clear();
         let read = self.read_all(plan)?;
+        // (A cursor already open does not look at its file again: a placed layer's range, which the compositor only reads, is
+        // made to exist here — after the reads, the last thing before the composite, so that a file replaced while they
+        // waited is the one asked about — and again for a file replaced under a session.)
+        for layer in &plan.layers {
+            crate::frame_source::warm_range(layer);
+        }
         let (frames, counts) = read.into_iter().unzip();
         self.counts = counts;
         Ok(frames)
