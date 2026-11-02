@@ -753,4 +753,27 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn a_pixel_format_is_a_still_kind_only_where_a_chain_can_be_measured_for_it() {
+        assert_eq!(StillKinds::of_pix_fmt("yuvj420p"), Some(StillKinds::YUVJ420P));
+        assert_eq!(StillKinds::of_pix_fmt("RGB24"), Some(StillKinds::RGB24));
+        assert_eq!(StillKinds::of_pix_fmt("yuv420p"), Some(StillKinds::YUV420P));
+        for other in [
+            "yuvj422p",
+            "yuvj444p",
+            "rgba",
+            "gray",
+            "gray16le",
+            "pal8",
+            "bgr24",
+            "yuv420p10le",
+            "",
+        ] {
+            assert_eq!(StillKinds::of_pix_fmt(other), None, "{other}");
+        }
+        let both = StillKinds::YUVJ420P.union(StillKinds::RGB24);
+        assert!(both.contains(StillKinds::RGB24) && both.contains(StillKinds::YUVJ420P) && !both.contains(StillKinds::YUV420P));
+        assert!(StillKinds::ALL.contains(both) && !StillKinds::NONE.contains(StillKinds::RGB24));
+    }
 }

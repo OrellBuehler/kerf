@@ -22,6 +22,9 @@ use crate::model::{Clip, Fit, FitOrder, Property, VideoEffect};
 /// read at a step of a little over one pixel at the clip's tightest frame.
 pub const HEADROOM: f64 = 1.02;
 
+/// Half the largest even number a size is worked out as: what the arithmetic of the copy saturates at.
+const HALF_MAX: f64 = (u32::MAX / 4) as f64;
+
 /// The most pixels the scaled copy may have.
 const MAX_COPY_PIXELS: u64 = 400_000_000;
 
@@ -180,9 +183,11 @@ impl StillMotion {
             y0 = y0.min(v(0.0));
             y1 = y1.max(v(fh));
         }
-        let ceil_even = |v: f64| ((v / 2.0).ceil().max(1.0) as u32) * 2;
+        // (A hostile crop makes these astronomically large, or not numbers: they saturate, and the size checks below refuse them.)
+        let even = |halves: f64| (halves.clamp(1.0, HALF_MAX) as u32) * 2;
+        let ceil_even = |v: f64| even((v / 2.0).ceil());
         let qw = ceil_even(most * HEADROOM);
-        let qh = (((f64::from(qw) * f64::from(sh) / f64::from(sw)) / 2.0).round().max(1.0) as u32) * 2;
+        let qh = even(((f64::from(qw) * f64::from(sh) / f64::from(sw)) / 2.0).round());
         if qw < frame.0 || qh < frame.1 || u64::from(qw) * u64::from(qh) > MAX_COPY_PIXELS {
             return None;
         }
@@ -191,7 +196,7 @@ impl StillMotion {
         let span = |a: f64, b: f64, q: u32, need: u32| {
             let qf = f64::from(q);
             let need = ceil_even(f64::from(need)).min(q);
-            let lo = ((a.clamp(0.0, 1.0) * qf - 2.0) / 2.0).floor().max(0.0) as u32 * 2;
+            let lo = (((a.clamp(0.0, 1.0) * qf - 2.0) / 2.0).floor().clamp(0.0, HALF_MAX) as u32) * 2;
             let hi = (ceil_even(b.clamp(0.0, 1.0) * qf + 2.0)).min(q).max(lo);
             if hi - lo >= need {
                 (lo, hi - lo)
@@ -331,6 +336,31 @@ mod tests {
         assert!(StillMotion::build(&s, (1920, 1080), &[at(1.2, 0.04, 0.03), at(1.0, 0.0, 0.0)]).is_some());
         assert!(StillMotion::build(&s, (1920, 1080), &[at(1.0, -0.03, 0.0)]).is_none());
         assert!(StillMotion::build(&s, (1920, 1080), &[]).is_none());
+    }
+
+    #[test]
+    fn a_hostile_crop_is_refused_not_overflowed() {
+        // A crop a millionth of the picture wide asks for a copy of astronomical size, and one narrower than a double can divide by asks for no number at all.
+        for width in [1e-6, 1e-12, 1e-300, 5e-324] {
+            let mut s = stat((1920, 1280), Fit::Cover);
+            s.crop = (0.0, 0.0, width, 1.0);
+            assert!(
+                StillMotion::build(&s, (1920, 1080), &[at(1.2, 0.04, 0.03)]).is_none(),
+                "{width}"
+            );
+            s.crop = (0.0, 0.0, 1.0, width);
+            assert!(
+                StillMotion::build(&s, (1920, 1080), &[at(1.2, 0.04, 0.03)]).is_none(),
+                "{width}"
+            );
+        }
+        let s = stat((1920, 1280), Fit::Cover);
+        for scale in [1e300, f64::MAX, 1e-300] {
+            assert!(
+                StillMotion::build(&s, (1920, 1080), &[at(scale, 0.0, 0.0)]).is_none(),
+                "{scale}"
+            );
+        }
     }
 
     #[test]

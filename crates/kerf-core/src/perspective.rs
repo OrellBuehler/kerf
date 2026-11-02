@@ -479,4 +479,69 @@ mod tests {
         )
         .is_err());
     }
+
+    #[test]
+    fn a_window_has_no_margin_and_reads_the_whole_frame() {
+        let f = PlacementFrame::window((120, 80), (64, 36));
+        assert_eq!(
+            (f.picture, f.margin, f.frame, f.crop, f.canvas),
+            ((120, 80), (0, 0), (120, 80), (0, 0), (64, 36))
+        );
+        assert!(PlacementFrame::corners_reachable(&[
+            [0.0, 0.0],
+            [120.0, 0.0],
+            [0.0, 80.0],
+            [120.0, 80.0]
+        ]));
+        assert!(!PlacementFrame::corners_reachable(&[
+            [f64::NAN, 0.0],
+            [1.0, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0]
+        ]));
+        assert!(!PlacementFrame::corners_reachable(&[
+            [0.0, 0.0],
+            [1e9, 0.0],
+            [0.0, 1.0],
+            [1.0, 1.0]
+        ]));
+    }
+
+    #[test]
+    fn corners_that_are_the_frames_own_read_every_pixel_where_it_is() {
+        let f = PlacementFrame::window((120, 80), (64, 36));
+        let corners = [[0.0, 0.0], [120.0, 0.0], [0.0, 80.0], [120.0, 80.0]];
+        let m = PlacementMap::from_corners(f, &corners).unwrap();
+        // A rectangle's table is one position per column and one per row, in 1/256 of a sample.
+        assert!(matches!(m.tables, Tables::Axes { .. }));
+        for (x, y) in [(0, 0), (5, 7), (63, 35)] {
+            assert_eq!(m.entry(x, y), (256 * x as i32, 256 * y as i32), "({x}, {y})");
+        }
+        // Stretched to half the frame, a pixel reads half a sample further each.
+        let half = [[0.0, 0.0], [60.0, 0.0], [0.0, 40.0], [60.0, 40.0]];
+        let m = PlacementMap::from_corners(f, &half).unwrap();
+        assert_eq!(m.entry(10, 4), (256 * 10 / 2, 256 * 4 / 2));
+    }
+
+    #[test]
+    fn from_corners_is_new_over_the_corners_of_a_pose_and_refuses_what_leaves_the_tables() {
+        let frame = PlacementFrame::new((64, 36), (64, 36));
+        let pose = Pose {
+            scale: Some(1.3),
+            pos: (0.02, -0.01),
+        };
+        let a = PlacementMap::new(frame, &pose).unwrap();
+        let b = PlacementMap::from_corners(frame, &frame.corners(&pose)).unwrap();
+        assert_eq!(a, b);
+        let exact = PlacementMap::exact_corners(frame, &frame.corners(&pose)).unwrap();
+        for y in 0..36 {
+            for x in 0..64 {
+                assert_eq!(a.entry(x, y), exact.entry(x, y), "({x}, {y})");
+            }
+        }
+        let far = [[0.0, 0.0], [1e10, 0.0], [0.0, 1.0], [1.0, 1.0]];
+        assert!(PlacementMap::from_corners(frame, &far).is_err());
+        let degenerate = [[1.0, 1.0]; 4];
+        assert!(PlacementMap::from_corners(frame, &degenerate).is_err());
+    }
 }

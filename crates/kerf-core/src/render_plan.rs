@@ -1170,13 +1170,17 @@ impl RenderPlan {
             // FFmpeg makes the fit picture of a still whose placement it draws (`FitCopy`): its scaler, its range and RGB conversion
             // and the chroma grid of its crops are FFmpeg's, so the refusals about the compositor's own are not this layer's.
             let fit_made = self.fits_by_ffmpeg(layer);
-            if fit_made && layer.fit.as_ref().is_some_and(|f| f.frame != size) {
+            if fit_made && self.fit_copy(layer, size).is_none() {
                 reasons.push(Unsupported::StillMotion(
                     self.layer_ref(n, layer),
-                    format!(
-                        "at a render of {}x{} (its fit picture was made for another size)",
-                        size.0, size.1
-                    ),
+                    if layer.fit.is_some() {
+                        format!(
+                            "at a render of {}x{} (its fit picture was made for another size)",
+                            size.0, size.1
+                        )
+                    } else {
+                        format!("at a render of {}x{} (no fit picture can be made for it)", size.0, size.1)
+                    },
                 ));
             }
             if let Some(stage) = geom
@@ -1521,6 +1525,16 @@ impl RenderPlan {
             }
             if layer.animated.is_some_and(|a| a.places) && !caps.placement && !route_b {
                 out.push(Unsupported::KeyedPlacement(at()));
+            }
+            // A moving still that is neither the route's nor a fit FFmpeg makes (colour, a grade, an effect, a mask, a rotation, a
+            // translucent layer, a dip to white, a picture kind with no chain measured): the general chain would draw it as footage,
+            // from a decode and a scaler no case holds a still to, so it stays FFmpeg's.
+            if layer.is_image && layer.animated.is_some_and(|a| a.places) && !route_b && !self.fits_by_ffmpeg(layer) {
+                out.push(Unsupported::StillMotion(
+                    at(),
+                    "a moving zoom or position on a still with colour, a grade, an effect, a mask, a rotation, a translucent layer, a dip to white or a picture kind no chain was measured for, which no case holds to FFmpeg's"
+                        .into(),
+                ));
             }
             if self.pose(layer).is_some() && caps.placement {
                 let fmt = stream.pix_fmt.clone().unwrap_or_else(|| "not recorded".to_string());

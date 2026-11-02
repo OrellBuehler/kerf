@@ -3950,4 +3950,28 @@ mod tests {
         let plan = p.at_frame(10).unwrap();
         assert!(named(&plan.reasons(&caps(crate::plan_caps::StillKinds::ALL), (1920, 1080))));
     }
+
+    #[test]
+    fn the_fit_picture_ffmpeg_makes_is_the_geometrys_stages_written_out_after_a_guard_crop_of_the_probed_size() {
+        let off = |w: u32, h: u32, fmt: &str| {
+            let mut a = photo(fmt);
+            a.streams[0].width = Some(w);
+            a.streams[0].height = Some(h);
+            let tl = drifting(&a, (1.0, -0.03, 0.0), (1.18, 0.03, -0.02));
+            let p = planner(&tl, std::slice::from_ref(&a), PlanMode::Motion, &opts(30.0));
+            p.at_frame(3).unwrap().layers[0].fit.clone().expect("a fit picture")
+        };
+        // A 3:2 photograph in a 16:9 Cover frame: not resized, cut to the frame from the middle.
+        let fit = off(1920, 1280, "yuvj420p");
+        assert_eq!(fit.filters, "crop=1920:1280:0:0,scale=1920:1280,crop=1920:1080:0:100");
+        assert_eq!((fit.size, fit.frame), ((1920, 1080), (1920, 1080)));
+        // A portrait one is enlarged by half first, then cut.
+        let fit = off(1280, 1920, "yuvj420p");
+        assert_eq!(fit.filters, "crop=1280:1920:0:0,scale=1920:2880,crop=1920:1080:0:900");
+        // A picture of the frame's own shape and size is scaled to its own size all the same (the graph's `scale` is where an RGB picture is
+        // converted), and has nothing to cut.
+        let fit = off(1920, 1080, "rgb24");
+        assert_eq!(fit.filters, "crop=1920:1080:0:0,scale=1920:1080");
+        assert_eq!(fit.size, (1920, 1080));
+    }
 }
