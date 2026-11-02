@@ -8,7 +8,7 @@
 #     "$(openssl rand -hex 32)" "$(openssl rand -hex 32)" > .env
 #   docker compose up -d --build
 #
-# A new tenant is a copy of a tenant service (name, token variable, network, three volumes),
+# A new tenant is a copy of a tenant service (name, token variable, public URL, network, three volumes),
 # that network added to Caddy's list, and a `handle_path` block in the Caddyfile.
 
 x-kerf: &kerf
@@ -47,6 +47,8 @@ services:
     environment:
       <<: *kerf-env
       KERF_MCP_TOKEN: ${TENANT_A_TOKEN:?set TENANT_A_TOKEN in deploy/.env}
+      # Where clients reach this tenant through Caddy: the base of the URLs file_url hands out.
+      KERF_PUBLIC_URL: https://${KERF_HOST:?set KERF_HOST in deploy/.env}/tenant-a
     networks: [tenant-a]
     volumes:
       - tenant-a-workspace:/workspace
@@ -58,6 +60,7 @@ services:
     environment:
       <<: *kerf-env
       KERF_MCP_TOKEN: ${TENANT_B_TOKEN:?set TENANT_B_TOKEN in deploy/.env}
+      KERF_PUBLIC_URL: https://${KERF_HOST:?set KERF_HOST in deploy/.env}/tenant-b
     networks: [tenant-b]
     volumes:
       - tenant-b-workspace:/workspace

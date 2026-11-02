@@ -1,7 +1,10 @@
 # TLS for $KERF_HOST (Let's Encrypt, automatically) and one path per tenant:
-# https://$KERF_HOST/tenant-a/mcp reaches tenant-a's /mcp. Kerf listens on 0.0.0.0 in its
-# container, which accepts any Host header, so the proxied host needs no rewriting; each
-# tenant still checks its own bearer token.
+# https://$KERF_HOST/tenant-a/mcp reaches tenant-a's /mcp and https://$KERF_HOST/tenant-a/files/...
+# its /files/... (uploads and downloads of its workspace). `handle_path` strips the prefix. Kerf
+# listens on 0.0.0.0 in its container, which accepts any Host header, so the proxied host needs no
+# rewriting; each tenant still checks its own bearer token. Caddy sets no request body limit and
+# streams request bodies to the tenant as they arrive (no `request_body` / `request_buffers` here):
+# the upload cap is the tenant's own (--max-upload-gb, 20 GiB by default).
 {$KERF_HOST} {
 	handle_path /tenant-a/* {
 		reverse_proxy tenant-a:7777 {
