@@ -410,26 +410,23 @@ fn last_ne_by_chunks(hay: &[u8], v: u8, all_equal: impl Fn(&[u8]) -> bool) -> Op
 mod neon {
     use core::arch::aarch64::*;
 
-    /// Whether the 16 bytes of `c` are all `v`. Callers check that the CPU has NEON.
-    #[target_feature(enable = "neon")]
+    /// Whether the 16 bytes of `c` are all `v`. NEON is part of every aarch64 target's baseline.
     fn all_equal(c: &[u8], v: u8) -> bool {
-        debug_assert_eq!(c.len(), 16);
-        // SAFETY: `c` is 16 bytes, the width of the load; the CPU has NEON (checked by the caller).
+        assert_eq!(c.len(), 16);
+        // SAFETY: `c` is 16 bytes, the width of the load; NEON is a baseline feature of aarch64.
         unsafe { vminvq_u8(vceqq_u8(vld1q_u8(c.as_ptr()), vdupq_n_u8(v))) == 0xFF }
     }
 
     /// Callers check that the CPU has NEON.
     #[target_feature(enable = "neon")]
     pub(super) fn first_ne(hay: &[u8], v: u8) -> Option<usize> {
-        // SAFETY: as above.
-        super::first_ne_by_chunks(hay, v, |c| unsafe { all_equal(c, v) })
+        super::first_ne_by_chunks(hay, v, |c| all_equal(c, v))
     }
 
     /// Callers check that the CPU has NEON.
     #[target_feature(enable = "neon")]
     pub(super) fn last_ne(hay: &[u8], v: u8) -> Option<usize> {
-        // SAFETY: as above.
-        super::last_ne_by_chunks(hay, v, |c| unsafe { all_equal(c, v) })
+        super::last_ne_by_chunks(hay, v, |c| all_equal(c, v))
     }
 }
 
