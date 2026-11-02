@@ -412,7 +412,7 @@ fn decode_layer_shared(layer: &PlanLayer, share: usize) -> Result<Option<YuvFram
 
 /// A picture FFmpeg makes of a still for the compositor: the filters that make it from the file and the size it comes out.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Copy {
+pub struct StillCopy {
     pub filters: String,
     pub size: (u32, u32),
 }
@@ -423,20 +423,20 @@ pub struct Copy {
 /// followed by the conversion the graph's negotiation gives the chain after it: `perspective`, `pad` and the `overlay` they end in
 /// all take `yuva420p`, so the scaler converts the picture (its range, its RGB, its chroma) in the same pass that resizes it.
 /// `Ok(None)` for any other layer; `Err` for one whose copy is not worked out for a render size ([`kerf_core::RenderPlan::for_render`]).
-pub fn copy_of(layer: &PlanLayer) -> Result<Option<Copy>, GpuError> {
+pub fn copy_of(layer: &PlanLayer) -> Result<Option<StillCopy>, GpuError> {
     let unsupported = |what: &str| GpuError::Unsupported(format!("{}: {what}", layer.path));
     if let Some(still) = layer.still.as_ref() {
         let motion = still.export.as_ref().ok_or_else(|| {
             unsupported("a moving still whose scaled copy is not worked out for a render size (RenderPlan::for_render)")
         })?;
         let (_, _, w, h) = motion.window;
-        return Ok(Some(Copy {
+        return Ok(Some(StillCopy {
             filters: format!("{},format=yuva420p", still.once(motion)),
             size: (w, h),
         }));
     }
     if let Some(fit) = layer.fit.as_ref() {
-        return Ok(Some(Copy {
+        return Ok(Some(StillCopy {
             filters: format!("{},format=yuva420p", fit.filters),
             size: fit.size,
         }));
@@ -451,7 +451,7 @@ pub fn still_copy_filters(layer: &PlanLayer) -> Result<String, GpuError> {
         .ok_or_else(|| GpuError::Unsupported(format!("{}: not a moving still", layer.path)))
 }
 
-/// The `ffmpeg` argv that decodes a still's [`Copy`]: the picture through its filters, as raw `yuva420p`.
+/// The `ffmpeg` argv that decodes a still's [`StillCopy`]: the picture through its filters, as raw `yuva420p`.
 pub fn still_copy_args(layer: &PlanLayer) -> Result<Vec<String>, GpuError> {
     let filters = still_copy_filters(layer)?;
     let mut args: Vec<String> = ["-hide_banner", "-loglevel", "error", "-i"]
@@ -469,8 +469,8 @@ pub fn still_copy_args(layer: &PlanLayer) -> Result<Vec<String>, GpuError> {
     Ok(args)
 }
 
-/// A still's [`Copy`], decoded: what the placement or the move then reads, made by FFmpeg's own scaler once. `Ok(None)` for no frame.
-fn decode_still_copy(layer: &PlanLayer, copy: &Copy, share: usize) -> Result<Option<YuvFrame>, GpuError> {
+/// A still's [`StillCopy`], decoded: what the placement or the move then reads, made by FFmpeg's own scaler once. `Ok(None)` for no frame.
+fn decode_still_copy(layer: &PlanLayer, copy: &StillCopy, share: usize) -> Result<Option<YuvFrame>, GpuError> {
     let path = &layer.path;
     if let Some(fmt) = layer.stream.pix_fmt.as_deref() {
         if kerf_core::model::pix_fmt_layout(fmt).is_none() {
