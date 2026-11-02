@@ -40,6 +40,14 @@ switch changes (`settings::update` → `settings_changed`; sessions on the old l
 `mcpServers` JSON snippet, and `tool_sets` (name, description, tool count: Prompts and tool sets, below);
 `regenerate_mcp_token` and `set_mcp_settings` (only `mcp_*` and `agent_review`) are the other two commands.
 It shares the **same** `Arc<Mutex<Project>>` the Tauri commands hold, so the agent edits the project the user has open.
+**stdio** (`kerf-app --headless --stdio`, `app.md`; rmcp `transport-io`): `server::start_stdio` does what `start` does short
+of a listener and a token (none is made or stored, the pipe is the trust boundary; no `CONTROL`, so `stop` is a no-op) and
+`Stdio::serve` runs **one** `KerfMcp::over_stdio` on stdin / stdout. With no HTTP request it carries what one would say:
+its session id `stdio-<uuid>` (stable for the process; `note_session` falls back to it, so ownership, `note_session_seen`
+and `owner()` work as over HTTP) and the `--tools` selection (`KerfMcp::selection`, `Selection::from_list`). `session_exists`
+answers true for that id (`STDIO_SESSION`), so it is never judged gone for want of a listener; its `Listener::lasting()`
+never drops subscriptions for a quiet client (nothing expires a stdio session: it ends with the pipe). Progress, cancel and
+the job relay ride rmcp's peer / `ct` as on HTTP.
 **The app around the server is a `Shell`** (`shell.rs`): `KerfMcp.app` is `Shell::Gui(AppHandle)` or
 `Shell::Headless`, whose inherent `emit` / `state` / `try_state` / `listen` / `unlisten` mirror Tauri's, so tools write
 `self.app.emit(…)` and `self.app.state::<crate::AppState>()` either way (not `tauri::Emitter::emit(&app, …)` or
@@ -644,7 +652,7 @@ accepted.
 **Tool sets.** Each `hints::TOOLS` row ends with the tool's one `ToolSet` — `core` (looking, cutting and arranging, volume /
 fade / transition, review and history, jobs, the project's basics), `analysis`, `clips`, `keyframes`, `titles`, `audio`,
 `music`, `delivery`, `tasks`, `project` — so a new tool's author edits one row; `every_tool_is_in_one_tool_set` pins that.
-A client asks for some with **`?tools=core,titles` on the MCP URL** (repeated `tools` parameters add up, `%2C` reads as a
+A client asks for some with **`?tools=core,titles` on the MCP URL** (`--tools core,titles` over stdio; repeated `tools` parameters add up, `%2C` reads as a
 comma). It is read from each request's `http::request::Parts` (rmcp puts them in the `RequestContext` extensions), so it
 needs no session state; no query, an empty one or `all` is every tool, which keeps existing setups as they were. `initialize`
 refuses a name that is no set (`invalid_params` listing the sets), where the client is connecting; `list_tools` (overridden,
@@ -690,7 +698,8 @@ Agent edits **stage** (`core-project.md`). The adapter's part:
   `lock_agent` asks `Project::release_orphaned_staging` whether the proposal's owner is a session that was seen and is
   no longer on any listener (closed, expired, or gone with a restart — a new token ends them all), and clears the owner if
   so, so the agent that reconnected, or the next to edit, adopts its own old proposal with its steps instead of being told
-  another agent owns it. An id never seen is treated as alive: ownership is let go of only on evidence.
+  another agent owns it. An id never seen is treated as alive: ownership is let go of only on evidence. The stdio
+  session is always alive (`the_stdio_session_is_never_judged_gone`).
 - **What the user alone does.** `discard_unsaved` on `open_project` / `new_project` is refused while review is on (the
   user confirms throwing unsaved work away, in Kerf's window); `save_project_as` will not replace an existing file while
   review is on, whatever `overwrite` says, and every export-family tool and Save As is held off Kerf's own settings and logs

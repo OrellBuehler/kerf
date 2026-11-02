@@ -2467,6 +2467,7 @@ dependencies = [
  "gtk",
  "kerf-core",
  "kerf-gpu",
+ "libc",
  "libloading 0.9.0",
  "raw-window-handle",
  "rmcp",

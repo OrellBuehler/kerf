@@ -158,6 +158,28 @@ KERF_MCP_TOKEN=<32+ chars> kerf-app --headless --mcp-addr 127.0.0.1:7777 [--proj
 It prints one JSON line on stdout once it listens and stops on SIGINT / SIGTERM; edits land live
 unless `--review`. `kerf-app --headless --help` lists the flags (`--data-dir`, `--token-file`, …).
 
+### Use as a stdio MCP server (Claude Code plugin, any client that launches its server)
+
+`kerf-app --headless --stdio` serves the same tools on stdin / stdout, for as long as the client keeps
+stdin open — no port, no token. In Claude Code:
+
+```bash
+claude mcp add kerf -- kerf-app --headless --stdio --tools core,titles
+```
+
+…or in a `.mcp.json` / `mcpServers` config:
+
+```json
+{
+  "mcpServers": {
+    "kerf": { "command": "kerf-app", "args": ["--headless", "--stdio", "--project", "/path/to/cut.kerf"] }
+  }
+}
+```
+
+`--tools` picks tool sets as `?tools=` does on the URL; `--project`, `--new-project`, `--data-dir`, `--review`,
+`--proxies` and `--cpu-percent` work as above.
+
 Now ask the agent to work on the project you have open — _"skim the interview clip, cut
 the dead air, and drop in captions."_ It will claim a task, use the tools below, and hand
 back a reviewable result.
@@ -342,7 +364,7 @@ kerf/
 | Styling     | Tailwind CSS **4** (CSS config) + design tokens |
 | Media       | FFmpeg binaries (always) · `ffmpeg-next` **8.1** (optional libav) |
 | Persistence | `rusqlite` (bundled SQLite) — one `.kerf` file  |
-| MCP         | `rmcp` **3.1** (streamable-HTTP transport)      |
+| MCP         | `rmcp` **3.1** (streamable-HTTP and stdio)      |
 
 The engine's export and timeline-still paths are **pure and unit-tested** — clip
 positions, gaps, track layering, effects, keyframes, overlays, ducking and loudnorm all

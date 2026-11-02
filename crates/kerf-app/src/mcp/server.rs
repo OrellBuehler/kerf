@@ -7,6 +7,9 @@
 //! open must not be able to drive the editor through the loopback port), and a bind address
 //! beyond loopback is refused unless the token is required. A token that changes applies to the
 //! next request; a new address or switching the server off restarts the listener.
+//!
+//! `kerf-app --headless --stdio` serves one session over stdin / stdout instead ([`start_stdio`]):
+//! no listener and no token, the pipe is the trust boundary.
 
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
@@ -653,8 +656,12 @@ pub fn note_session_seen(id: &str) {
     }
 }
 
-/// Whether the session `id` is on a listener that is up. A table being written counts as present.
+/// Whether the session `id` is on a listener that is up, or is the stdio one. A table being written
+/// counts as present.
 fn session_exists(id: &str) -> bool {
+    if STDIO_SESSION.get().is_some_and(|stdio| stdio == id) {
+        return true;
+    }
     if !EVER_LISTENED.load(std::sync::atomic::Ordering::SeqCst) {
         return true;
     }
@@ -673,6 +680,70 @@ fn session_exists(id: &str) -> bool {
 pub fn session_alive(id: &str) -> bool {
     let seen = SEEN.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|s| s == id);
     !seen || session_exists(id)
+}
+
+// ---- stdio ------------------------------------------------------------------
+
+/// The id of the `--stdio` run's one session. It lasts as long as the pipe, which is the process: no
+/// listener holds it, and nothing judges it gone.
+static STDIO_SESSION: OnceLock<String> = OnceLock::new();
+
+/// Why `list` (`--tools core,titles`) names no tool sets, or `Ok`.
+pub(crate) fn check_tool_sets(list: &str) -> Result<(), String> {
+    super::toolsets::Selection::from_list(list).map(|_| ())
+}
+
+/// The `--stdio` run's server, made ready by [`start_stdio`] and run by [`Stdio::serve`].
+pub(crate) struct Stdio {
+    server: KerfMcp,
+    id: String,
+}
+
+/// [`start`] for a `--stdio` run: the review switch and the activity stream, but no listener and no
+/// token (none is made or stored). `tools` is a checked [`check_tool_sets`] list; `None` lists all.
+pub(crate) fn start_stdio(app: Shell, project: Arc<Mutex<Project>>, tools: Option<&str>) -> Stdio {
+    let settings = crate::settings::load(&app);
+    crate::settings::set_agent_review(settings.agent_review);
+    project
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .set_agent_review(settings.agent_review);
+    super::activity::pump_project();
+    let id = format!("stdio-{}", uuid::Uuid::new_v4().simple());
+    if STDIO_SESSION.set(id.clone()).is_err() {
+        tracing::warn!("the stdio MCP server was started twice");
+    }
+    let selection = tools
+        .map(super::toolsets::Selection::from_list)
+        .transpose()
+        .unwrap_or_default()
+        .unwrap_or_default();
+    Stdio {
+        server: KerfMcp::over_stdio(project, app, id.clone(), selection),
+        id,
+    }
+}
+
+impl Stdio {
+    /// Answer JSON-RPC on `rpc` (read, write) until the client closes it or `stop` is cancelled,
+    /// both a clean end. A pipe closed before `initialize` is one too; anything else it could not
+    /// start on is the error.
+    pub(crate) async fn serve<R, W>(self, rpc: (R, W), stop: CancellationToken) -> Result<(), String>
+    where
+        R: tokio::io::AsyncRead + Send + Unpin + 'static,
+        W: tokio::io::AsyncWrite + Send + Unpin + 'static,
+    {
+        use rmcp::service::{ServerInitializeError, ServiceExt};
+        let running = match self.server.serve_with_ct(rpc, stop).await {
+            Ok(running) => running,
+            Err(ServerInitializeError::ConnectionClosed(_) | ServerInitializeError::Cancelled) => return Ok(()),
+            Err(e) => return Err(format!("the stdio MCP session did not start: {e}")),
+        };
+        tracing::info!(session = %self.id, "MCP session open on stdio");
+        let reason = running.waiting().await.map_err(|e| e.to_string())?;
+        tracing::info!(session = %self.id, ?reason, "MCP session on stdio ended");
+        Ok(())
+    }
 }
 
 struct Running {
@@ -1206,6 +1277,26 @@ mod tests {
     #[test]
     fn a_session_that_never_made_a_call_is_never_judged_gone() {
         assert!(session_alive("an-id-nobody-has-used"), "no evidence it ever existed");
+    }
+
+    /// The stdio session is on no listener, and a listener having come up (another test's) does not
+    /// make it gone: a proposal it owns stays its own against another session.
+    #[test]
+    fn the_stdio_session_is_never_judged_gone() {
+        let id = STDIO_SESSION.get_or_init(|| "stdio-test".to_string()).clone();
+        note_session_seen(&id);
+        EVER_LISTENED.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert!(session_alive(&id));
+        let shared = Mutex::new(Project::open_in_memory().unwrap());
+        {
+            let mine = super::super::lock_agent_edit(&shared, Some(&id)).expect("the first edit opens the proposal");
+            mine.add_overlay("Title".to_string(), 0.0, 2.0).unwrap();
+            assert_eq!(mine.staged().unwrap().unwrap().owner.as_deref(), Some(id.as_str()));
+        }
+        let stranger = "stdio-test-stranger";
+        note_session_seen(stranger);
+        assert!(!session_alive(stranger), "a session seen and on no listener is gone");
+        assert!(super::super::lock_agent_edit(&shared, Some(stranger)).is_err());
     }
 
     #[test]

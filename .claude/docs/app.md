@@ -40,7 +40,7 @@ working towards a result that would be dropped is killed instead of finishing.
 (`fetch_max`) and the highest stopped id (`stopped >= id` ends a stream), so a start that arrives after a newer one, a
 stop that arrives before its start, and a reloaded page whose counter restarted at 1 all resolve by comparison.
 
-**Headless mode** (`headless.rs`, `shell.rs`). `kerf-app --headless [--project x.kerf | --new-project x.kerf]
+**Headless mode** (`headless.rs`, `shell.rs`). `kerf-app --headless [--stdio [--tools SETS]] [--project x.kerf | --new-project x.kerf]
 [--mcp-addr ADDR] [--data-dir DIR] [--token-file PATH] [--show-token] [--review] [--proxies] [--cpu-percent N]` runs the MCP
 server with no display and no webview: `main.rs` calls `headless_main()` before `run()`, which builds no Tauri app (tao
 initialises GTK and panics with no display) and runs on `tauri::async_runtime` with a `Shell::Headless` in place of the
@@ -58,6 +58,13 @@ listener is up — `{"kerf":"listening","url","addr","pid","project","agent_revi
 the settings file. SIGINT / SIGTERM (Ctrl+C on Windows): the listener closes (`mcp::stop`), `AppState::stop_all` presses every
 Stop, proxies and agent jobs are cancelled and waited for up to 10 s, `recovery::on_exit` keeps an untitled project with work
 (its directory logged); a second signal exits 130. Exit codes: 0 stopped by a signal, 1 failure, 2 usage, 3 not listening.
+**`--stdio`** serves one MCP session on stdin / stdout instead (`mcp.md`), for a client that launches the server
+(`{"command":"kerf-app","args":["--headless","--stdio"]}`): no listener, no token, no ready line; `--mcp-addr`,
+`--token-file` and `--show-token` are a usage error with it, `--tools core,titles` is the URL's `?tools=` (usage error
+without `--stdio`), `KERF_MCP_TOKEN` is ignored and `--help` goes to stderr. **stdout carries JSON-RPC only**: on Unix
+`rpc_out` moves the real stdout to a private (CLOEXEC) fd for rmcp and points fd 1 at stderr, so a stray print, a native
+library or a child that inherits fd 1 cannot corrupt the stream (Windows writes to stdout as is). EOF on stdin (also before
+`initialize`) or a signal ends it with the same shutdown, exit 0.
 Release Windows builds are `windows_subsystem = "windows"`: pipes work, an interactive console shows nothing.
 `tests/headless.rs` drives the real binary (no `DISPLAY`): ready line, 401 / 200 / 202, two tools, SIGTERM → 0.
 
