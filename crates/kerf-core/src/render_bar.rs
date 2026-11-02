@@ -75,15 +75,15 @@ pub struct BarRequest<'a> {
     pub media: &'a dyn MediaResolver,
     /// Assets whose preview proxy playback waits for, with what the Preview says about it.
     pub waits: Vec<(Uuid, String)>,
-    /// Asked of a frame's plan before it is judged, when the layers on screen are not the previous frame's (and only with
-    /// `caps`): what the host measures or asks of a file ahead, for a plan to read from the cache
+    /// Asked of a frame's plan before it is judged, when the layers on screen (by file, and whether each is placed) are not the
+    /// previous frame's (and only with `caps`): what the host measures or asks of a file ahead, for a plan to read from the cache
     /// ([`GpuCaps::file_range`]: a placed layer's range). It may wait for a probe, so the bar is built on a blocking thread.
     pub ask: Option<&'a dyn Fn(&RenderPlan)>,
 }
 
 type Verdict = (BarState, String, String);
 
-fn judge(cut: &PlayCut, k: u64, size: (u32, u32), req: &BarRequest<'_>, asked: &mut Vec<String>) -> Option<Verdict> {
+fn judge(cut: &PlayCut, k: u64, size: (u32, u32), req: &BarRequest<'_>, asked: &mut Vec<(String, bool)>) -> Option<Verdict> {
     let plan = match cut.at_frame(k) {
         Ok(plan) => plan,
         Err(e) => {
@@ -103,7 +103,9 @@ fn judge(cut: &PlayCut, k: u64, size: (u32, u32), req: &BarRequest<'_>, asked: &
     }
     let caps = req.caps?;
     if let Some(ask) = req.ask {
-        let layers: Vec<String> = plan.layers.iter().map(|l| l.path.clone()).collect();
+        // (By file and by whether it is placed: a clip split in two, with a moving zoom on its second half only, is one file
+        // that has to be asked about from there.)
+        let layers: Vec<(String, bool)> = plan.layers.iter().map(|l| (l.path.clone(), plan.pose(l).is_some())).collect();
         if *asked != layers {
             ask(&plan);
             *asked = layers;
@@ -266,6 +268,48 @@ mod tests {
         asked.borrow_mut().clear();
         render_bar(&tl, &assets, &request(None));
         assert!(asked.borrow().is_empty());
+    }
+
+    /// One file, a clip split in two with a moving zoom on the second half only: the host is asked again where the same file
+    /// becomes a placed layer (asking by file alone would never ask about it, and the bar would call a drawable span the stream's).
+    #[test]
+    fn the_same_file_placed_and_unplaced_is_asked_about_where_it_is_placed() {
+        use crate::model::Keyframe;
+        let a = asset();
+        let first = make_clip(a.id, 0.0, 1.0, 0.0);
+        let mut second = make_clip(a.id, 1.0, 2.0, 1.0);
+        let key = |time: f64, scale: f64| Keyframe {
+            time,
+            scale,
+            pos_x: 0.0,
+            pos_y: 0.0,
+            rotation: 0.0,
+            opacity: 1.0,
+            easing: Default::default(),
+        };
+        second.keyframes = vec![key(0.0, 1.0), key(1.0, 1.5)];
+        let tl = timeline_of(vec![video_track(vec![first, second])]);
+        let asked = std::cell::RefCell::new(Vec::new());
+        let ask = |plan: &RenderPlan| {
+            asked
+                .borrow_mut()
+                .push(plan.layers.iter().filter(|l| plan.pose(l).is_some()).count());
+        };
+        render_bar(
+            &tl,
+            std::slice::from_ref(&a),
+            &BarRequest {
+                caps: Some(caps()),
+                width: 640,
+                color: FIXED,
+                media: &OriginalMedia,
+                waits: Vec::new(),
+                ask: Some(&ask),
+            },
+        );
+        let asked = asked.into_inner();
+        assert_eq!(asked.first(), Some(&0), "the unplaced half: {asked:?}");
+        assert!(asked.contains(&1), "the placed half was never asked about: {asked:?}");
     }
 
     #[test]

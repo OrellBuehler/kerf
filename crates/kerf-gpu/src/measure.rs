@@ -1,13 +1,4 @@
 //! What the probes of this FFmpeg have in common: the verdict they give, the process-wide memory of it with its
-//! backoff, and the bounded child process they run ([`crate::conversion`], [`crate::placement_probe`]).
-//!
-//! A probe answers once per process and the answer is kept for good: [`Verdict::Match`] (this FFmpeg does what the
-//! compositor reproduces) or [`Verdict::Differs`] (it does not, and the detail says where). One that could not tell
-//! (FFmpeg would not run, timed out, wrote something unreadable) is [`Verdict::Unknown`], which is **never kept as an
-//! answer and never believed as a match**: it is asked again after a backoff, and until then the compositor draws
-//! nothing that depends on it.
-
-//! What the probes of this FFmpeg have in common: the verdict they give, the process-wide memory of it with its
 //! backoff, its single flight and its deadline, and the bounded child process they run ([`crate::conversion`],
 //! [`crate::placement_probe`]).
 //!
@@ -278,19 +269,25 @@ impl Budget {
     /// threads that serve the pipes are left to finish on their own (a wrapper script that did not `exec` keeps a pipe open
     /// past the kill, and a join would wait for it as long as the real FFmpeg lives).
     pub(crate) fn ffmpeg(&self, args: &[&str], input: Vec<u8>) -> Option<Vec<u8>> {
+        let mut argv = argv(args);
+        // (Only a graph that needs it: `spill_long_graph` asks this FFmpeg which spelling it takes, a run of `-h full` of its own,
+        // and the child's limit is worked out after that, so the probe's deadline holds.)
+        let _script = if argv.iter().any(|a| a.len() > kerf_core::GRAPH_ARG_MAX) {
+            match kerf_core::spill_long_graph(&mut argv, "probe") {
+                Ok(script) => Some(script),
+                Err(error) => {
+                    tracing::warn!(%error, "could not write a probe's graph to a script file");
+                    return None;
+                }
+            }
+        } else {
+            None
+        };
         let limit = self.limit();
         if limit.is_zero() {
             tracing::warn!("a probe ran out of time before its next FFmpeg run");
             return None;
         }
-        let mut argv = argv(args);
-        let _script = match kerf_core::spill_long_graph(&mut argv, "probe") {
-            Ok(script) => script,
-            Err(error) => {
-                tracing::warn!(%error, "could not write a probe's graph to a script file");
-                return None;
-            }
-        };
         let mut cmd: Command = kerf_core::ffmpeg_command();
         cmd.args(&argv);
         kerf_core::run_piped_until(&mut cmd, input, Instant::now() + limit)

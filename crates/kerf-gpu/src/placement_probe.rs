@@ -65,7 +65,7 @@ pub fn placement() -> Placement {
 
 /// [`placement`] for the runtime self-test, which draws a placed frame only on a `Match`. A probe that cannot tell is run once
 /// more after the backoff (and an earlier failure's backoff is waited out, not taken for the answer); one that cannot tell
-/// then either holds the placement back for the process until a self-test that can tell has run, so the frames the GPU draws
+/// then holds the placement back for the process until a self-test that can tell has run, so the frames the GPU draws
 /// are never ones its check skipped.
 pub(crate) fn placement_for_selftest() -> Placement {
     measure::checked(&STATE, TIMING, probe)
@@ -251,9 +251,13 @@ fn chains(cases: &[Case], canvas: (u32, u32)) -> Vec<String> {
         .collect()
 }
 
-/// The graph that places one picture by each of `chains` and stacks the results side by side.
+/// The graph that places one picture by each of `chains` and stacks the results side by side. (One chain is placed on its
+/// own: `hstack` takes two inputs at least, and `split` one output is no split.)
 fn stack_graph(chains: &[String]) -> String {
     let n = chains.len();
+    if let [chain] = chains {
+        return format!("[0:v]{chain}[out]");
+    }
     let mut graph = format!("[0:v]split={n}");
     for i in 0..n {
         let _ = write!(graph, "[s{i}]");
@@ -272,7 +276,8 @@ fn stack_graph(chains: &[String]) -> String {
 /// The cases cut into runs (ranges of them, in order) whose graph each stays within the engine's argv rule
 /// ([`kerf_core::GRAPH_ARG_MAX`]): the chain of a pose is some 700 bytes and a shape has forty of them, 31 KB of command line
 /// in one run, a kilobyte short of what Windows allows a process. A chain that is over the rule alone is a run of its own
-/// (the run spills it to a file, [`Budget::ffmpeg`]).
+/// (the run spills it to a file, [`Budget::ffmpeg`]); a last run of one chain takes the one before it from the run ahead
+/// where that leaves both within the rule, so that a run is a stack of two at least wherever it can be.
 fn runs(chains: &[String]) -> Vec<std::ops::Range<usize>> {
     let mut out = Vec::new();
     let mut start = 0;
@@ -285,6 +290,12 @@ fn runs(chains: &[String]) -> Vec<std::ops::Range<usize>> {
     }
     if start < chains.len() {
         out.push(start..chains.len());
+    }
+    if let [.., before, last] = out.as_mut_slice() {
+        let (shorter, longer) = (before.start..before.end - 1, last.start - 1..last.end);
+        if last.len() == 1 && before.len() >= 3 && stack_graph(&chains[longer.clone()]).len() <= kerf_core::GRAPH_ARG_MAX {
+            (*before, *last) = (shorter, longer);
+        }
     }
     out
 }
@@ -550,6 +561,10 @@ mod tests {
                     graph.len()
                 );
                 assert!(graph.contains("perspective"), "the export's own chain");
+                assert!(
+                    run.len() >= 2,
+                    "{canvas:?} {run:?}: a run of one pose is no stack (`hstack` takes two inputs at least)"
+                );
                 most = most.max(graph.len());
             }
         }
@@ -562,6 +577,15 @@ mod tests {
         let motion = kerf_core::placement_probe_motion(MOTION_FRAMES);
         let chain = kerf_core::placement_probe_chain(Some(&motion.scale), (&motion.pos.0, &motion.pos.1), (64, 36), true);
         assert!(chain.len() < kerf_core::GRAPH_ARG_MAX, "{} bytes", chain.len());
+        // One pose is placed on its own, without the `split` and `hstack` that need two.
+        let sample = chains(&poses((64, 32), false), (64, 32));
+        let one = stack_graph(&sample[..1]);
+        assert!(one.starts_with("[0:v]") && one.ends_with("[out]") && !one.contains("hstack") && !one.contains("split"));
+        // A last run of one takes the one before it where both stay within the rule.
+        let tail: Vec<String> = (0..12).map(|_| "x".repeat(700)).collect();
+        let cut = runs(&tail);
+        assert!(cut.len() >= 2 && cut.iter().all(|r| r.len() >= 2), "{cut:?}");
+        assert_eq!(cut.iter().map(|r| r.len()).sum::<usize>(), 12);
         // A chain over the rule alone is a run of its own, and the others are packed around it.
         let big = vec!["x".repeat(kerf_core::GRAPH_ARG_MAX + 1)];
         assert_eq!(runs(&big), vec![0..1]);
@@ -595,6 +619,25 @@ mod tests {
         assert!(all.iter().any(|c| c.pose.pos.0.abs() > 1.0));
         assert!(all.iter().any(|c| c.per_frame) && all.iter().any(|c| !c.per_frame));
         assert!(SHAPES.iter().any(|(_, input, _)| input.0 % 2 == 1));
+    }
+
+    /// A run of one pose (a chain that is over the argv rule alone) is a graph this FFmpeg takes: no `hstack` of one input.
+    #[test]
+    #[ignore = "needs ffmpeg"]
+    fn a_run_of_one_pose_is_a_graph_ffmpeg_takes() {
+        let mut rng = Lcg(0x0070_6c61_6365);
+        let (canvas, input) = ((64, 32), (62, 32));
+        let noise = Noise::new(&mut rng, input);
+        let cases = poses(canvas, false);
+        let chains = chains(&cases, canvas);
+        let one = stack_run(&Budget::new(&TIMING), &noise, canvas, &cases[..1], &chains[..1]);
+        assert!(one.is_ok(), "FFmpeg would not run a stack of one: {one:?}");
+        let several = stack_run(&Budget::new(&TIMING), &noise, canvas, &cases[..3], &chains[..3]);
+        assert_eq!(
+            one.map(|r| r.is_some()),
+            several.map(|r| r.is_some()),
+            "one pose and three agree"
+        );
     }
 
     /// The probe on the FFmpeg in use (`#[ignore]`d: it needs one). It must be able to tell, and say the same twice.

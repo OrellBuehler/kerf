@@ -387,6 +387,15 @@ impl PlaySession {
             .as_ref()
             .is_none_or(|s| s.size != size || t < s.from || t - s.from >= RESCAN);
         if due {
+            // The horizon has moved on since the last scan: the files of what has come into it are asked for their range before
+            // the scan judges them (`session_caps` reads the answer, and a file nobody asked is refused). This is the session's own
+            // thread, off the play lock; the part already scanned was asked by the scan before it.
+            let from = self
+                .scan
+                .as_ref()
+                .filter(|s| t >= s.from)
+                .map_or(t, |s| (s.from + HORIZON).max(t));
+            kerf_gpu::prepare_ranges_ahead(&self.cut, from, t + HORIZON - from);
             self.scan = Some(Scan {
                 from: t,
                 size,

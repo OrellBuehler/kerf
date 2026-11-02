@@ -849,6 +849,25 @@ pub fn prepare_ranges(plan: &RenderPlan) {
     }
 }
 
+/// [`prepare_ranges`] over every frame from `from` to `horizon` seconds on, asking each set of layers once: the part of
+/// [`prepare_ahead`] that a running session repeats as its horizon moves, so that a placed clip that comes into view later is
+/// asked for its file's range before the scan that judges it with [`Compositor::session_caps`] (and not refused until the
+/// prefetch or its first frame has asked). A file already asked costs a `stat`. It may wait for a probe, bounded: a thread of
+/// the session's own, off any lock.
+pub fn prepare_ranges_ahead(cut: &kerf_core::PlayCut, from: f64, horizon: f64) {
+    let first = cut.frame_at(from);
+    let last = cut.frame_at(from + horizon.max(0.0)).max(first);
+    let mut asked: Vec<(String, bool)> = Vec::new();
+    for k in first..=last {
+        let Ok(plan) = cut.at_frame(k) else { continue };
+        let layers: Vec<(String, bool)> = plan.layers.iter().map(|l| (l.path.clone(), plan.pose(l).is_some())).collect();
+        if layers != asked {
+            prepare_ranges(&plan);
+            asked = layers;
+        }
+    }
+}
+
 /// [`prepare`] over every frame of a play's horizon: the layers a session will draw within `horizon` seconds of `from`, for
 /// the probes that decide the caps ([`prepare_placement`]) — a clip that comes in a second after the playhead is measured
 /// for before the session begins, not by the first frame it is on. Plans each frame once (a few hundred microseconds each,

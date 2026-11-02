@@ -166,7 +166,9 @@ pub mod sws;
 pub mod text;
 pub mod y4m;
 
-pub use compositor::{prepare, prepare_ahead, prepare_ranges, Compositor, RenderTimings, RenderedFrame, RgbaFrame};
+pub use compositor::{
+    prepare, prepare_ahead, prepare_ranges, prepare_ranges_ahead, Compositor, RenderTimings, RenderedFrame, RgbaFrame,
+};
 pub use cursor::{CursorConfig, FrameCursor};
 pub use frame_source::{FrameSource, FrameSourceConfig, Hint, SourceStats};
 pub use gpu::{Gpu, GpuError, GpuOptions};
