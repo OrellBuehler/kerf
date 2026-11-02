@@ -44,6 +44,7 @@ docker stop -t 30 kerf                      # shutdown cancels jobs and waits fo
 | `KERF_PREFETCH_MODELS` | Download models into `/cache` before serving, e.g. `whisper:base,kokoro,demucs,soundfont`; a bad list stops the start, a failed download only warns (it is fetched on first use) |
 | `KERF_WHISPER_MODEL` | The speech model transcription uses (default `base`); match it to a prefetched `whisper:NAME` |
 | `KERF_WORKSPACE` | Set to `/workspace`: every path a client names is resolved in it and refused outside it (see Security) |
+| `KERF_PUBLIC_URL` | The tenant's URL as clients reach it behind the proxy (`https://kerf.example.com/tenant-a`): the base of the `/files/` URLs `file_url` gives the agent (default: the address the client connected to) |
 | `KERF_CACHE_DIR`, `KERF_CACHE_MAX_GB` | Cache location (`/cache`, also where models are prefetched) and an optional ceiling in GiB for proxies, waveforms, filmstrips and stems (models are never removed) |
 | arguments after the image name | Passed to `kerf-app`, e.g. `--project /workspace/cut.kerf`, `--review`, `--cpu-percent 75` |
 
@@ -63,8 +64,9 @@ CPU / memory / pid limits, read-only root, no capabilities) behind Caddy, which 
 tenant's network, gets a certificate for `KERF_HOST` and routes by path:
 
 ```
-https://$KERF_HOST/tenant-a/mcp  ->  tenant-a:7777/mcp
-https://$KERF_HOST/tenant-b/mcp  ->  tenant-b:7777/mcp
+https://$KERF_HOST/tenant-a/mcp       ->  tenant-a:7777/mcp
+https://$KERF_HOST/tenant-a/files/…   ->  tenant-a:7777/files/…
+https://$KERF_HOST/tenant-b/mcp       ->  tenant-b:7777/mcp
 ```
 
 ```bash
@@ -80,7 +82,7 @@ host needs no rewriting (a server bound to a specific address checks `Host` agai
 flushes every response at once (`flush_interval -1`): MCP answers and progress arrive over SSE.
 Each tenant's health check gets a 10-minute start period, so a model prefetch on first start
 does not count as a failure (Caddy waits for every tenant to be healthy), and 30 s to stop. A new
-tenant is one more service (copy `tenant-b`, new token variable, network and volumes), that
+tenant is one more service (copy `tenant-b`, new token variable, `KERF_PUBLIC_URL`, network and volumes), that
 network added to Caddy's, and one more `handle_path` block. For Docker secrets instead of `.env`,
 mount the secret and set `KERF_MCP_TOKEN_FILE=/run/secrets/<name>`.
 
@@ -96,10 +98,27 @@ Any MCP client that speaks streamable HTTP works the same way: the URL, plus the
 
 ## Getting media in and out
 
-For now, put files in the tenant's workspace volume (`docker cp clip.mp4 kerf:/workspace/`, or
-`scp` / `rsync` to the volume's directory on the host) and have the agent import them by path
-under `/workspace`; exports written there are collected the same way. An HTTP upload endpoint
-is coming.
+Each tenant serves its workspace over HTTP next to `/mcp`, behind the same bearer token:
+`PUT /files/<path>` uploads the request body (parent directories are made; an existing file is
+refused unless `?overwrite=1`, a file the open project uses always), `GET /files/<path>` downloads
+(with `Range`), `GET /files/<dir>/` lists, `DELETE /files/<path>` removes. Through Caddy:
+
+```bash
+base=https://kerf.example.com/tenant-a
+curl -fsS -H "Authorization: Bearer $TENANT_A_TOKEN" -T clip.mp4 "$base/files/media/clip.mp4"
+# ask the agent to import_asset media/clip.mp4, edit, export to cut.mp4, then:
+curl -fsS -H "Authorization: Bearer $TENANT_A_TOKEN" -o cut.mp4 "$base/files/cut.mp4"
+curl -fsS -H "Authorization: Bearer $TENANT_A_TOKEN" "$base/files/"    # what is there
+```
+
+The agent sees the same files with `list_files`, and `file_url` gives it these URLs (built on
+`KERF_PUBLIC_URL`, which compose sets per tenant to `https://$KERF_HOST/<tenant>`). An upload is
+just bytes until an import probes it: a playlist or anything else that is not plain media is
+refused then. A file may be at most 20 GiB (`--max-upload-gb N` after the image name changes it),
+four uploads run at once, one that sends nothing for a minute is dropped, and nothing is written
+that would leave less than 1 GiB free. `--allow-url-import` adds `import_url`, which downloads an
+http(s) URL (public addresses only) into `downloads/` and imports it. Copying into the volume
+(`docker cp clip.mp4 kerf:/workspace/`) works too.
 
 ## Hardware
 

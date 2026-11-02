@@ -76,6 +76,53 @@ the stitch reads. The whitelist guards the import / open probe only: later reads
 the file did not change, so keep one tenant per container. This is confinement at the API
 level only: FFmpeg, the decoders and the rest of the process run with the server's own rights, so a hosted deployment
 should add OS isolation (a container or a user that sees only DIR and Kerf's directories).
+**Media in and out** (`mcp/files.rs`, `mcp/fetch.rs`; only with a workspace). Over HTTP, `launch` merges
+`files::router` beside `/mcp` (no router without a workspace: a `/files` request is a 404 and nothing else changes), inside
+the same `require_bearer` layer, and the handler repeats rmcp's checks: an `Origin` is a 403, the `Host` must be on
+`server::hosts` (`allowed_hosts` plus `--public-url`'s host). The request path is %-decoded and must be **plain**
+(`request_path` / `check_plain`: relative, no `.` / `..` / empty part, no `\`, no control character), then `locate`s through
+`Workspace::resolve` and must equal DIR joined with it — so any symbolic link on the way is a 403, not followed (and the
+GET opens with `O_NOFOLLOW`; listings leave links out). `PUT /files/<path>` streams the body to `<name>.<8 hex>.part`
+beside the target (parents made inside DIR, a `Part` guard deletes it if the request drops), `sync_all`, then `place`s it:
+`?overwrite=1` renames over, otherwise a hard link that fails on an existing name (409). Over `--max-upload-gb` (announced
+or counted) is 413; a body silent for 60 s is 408; a fifth upload in flight is 503 (`Slot`, four at once); ENOSPC / quota,
+or an upload that would leave under 1 GiB free on DIR's filesystem (`check_room`: `statvfs`, the announced length up front,
+again every 64 MiB; not checked on Windows), is 507 with the `.part` gone. **`refuse_in_use`** runs on every PUT (before and
+after the body, whether the target exists or not), DELETE and `import_url` destination: `check_name` refuses any
+`*.kerf-journal` / `-wal` / `-shm` of any project (SQLite plays a hot journal back into the project that opens it — the
+journal of the open one normally does not exist, so an existence-gated check would let it through) and a name whose `.part`
+would pass 255 bytes (400); then the target must not be a file the open project uses (`Project::output_path_inputs` read
+under the lock, `paths::same_file` after it: sources, capture files, the `.kerf` and its side files, through hard links and
+case folding), else 409. The file system calls run on the blocking pool (`on_disk`). At start a headless run with a workspace
+sweeps Kerf's own `.part` files (`<name>.<8 hex>.part`) older than 24 h (`sweep_stale_parts`). `GET` streams a file (`ReaderStream`, a
+`Content-Type` by extension, `nosniff`, `attachment`) with `Content-Length` and one `Range` (`parse_range`: `a-b`, `a-`,
+`-n`; several or malformed → the whole file; past the end → 416); a directory, a trailing `/` or `?list` answers
+`{path, entries: [{name, size, modified, is_dir}], truncated?}` (`list_dir`, at most 5000). `DELETE` removes a file (409 when
+the project uses it) or an empty directory. Errors are `{"error"}` JSON. **An uploaded file is bytes, not trusted media**:
+PUT checks no format, so a playlist or manifest lands like anything else; it is trusted only once `Workspace::check_media`
+(the demuxer-whitelisted probe) passes it, which `import_run` runs right before the probe for `import_asset` (also on the
+call) and `import_url` alike, and `check_project` on open. The tools (`WORKSPACE_TOOLS`, `files::offered`: absent from `tools/list` and "tool not found" on a call without
+a workspace, so the desktop and an unconfined server list exactly what they did): `list_files {dir?}`, `file_url {path}` (HTTP
+only: `{path, url, exists, is_dir, size, header}`, the URL on `--public-url`, else the `Host` the MCP request came in on,
+else the listener; descriptions say the bearer token is needed) and `import_url {url, path?, background?}` (only with
+`--allow-url-import`; a long tool: download on the blocking pool, 0..0.9 of the progress, then `import_run`, the body
+`import_asset` shares; the default path is `downloads/<fetch::file_name>` numbered when taken, a given one must be free; a
+file the import refuses is deleted). **SSRF** (`fetch.rs`): only `http` / `https`, no credentials in the URL; each hop's host
+is resolved here (10 s) and refused unless **every** address is public (`is_public`: v4 refuses 0/8, 10/8, 100.64/10, 127/8,
+169.254/16, 172.16/12, 192.0.0/24, 192.0.2/24, 192.88.99/24, 192.168/16, 198.18/15, 198.51.100/24, 203.0.113/24, 224/4 and
+up; v6 allows only 2000::/3 minus 2001::/23, 2001:db8::/32, 3fff::/20, and judges `::ffff:` mapped, NAT64 `64:ff9b::/96` and
+6to4 `2002::/16` by their IPv4; `::/96`, ULA `fc00::/7`, link-local, multicast refused); ureq then connects through
+`Pinned`, a resolver that answers that host with the vetted addresses only (no second lookup to rebind), with no proxy
+whatever the environment says. Redirects are followed by hand (`join`), each hop checked again, at most 5; connect 15 s,
+response 60 s, 60 s of silence (a reader thread, the cancel polled every 200 ms), the size cap on the announced length
+and on the bytes, `.part` + no-clobber `place`. Tests: the classifier's ranges and edges, the URL rules, `join`,
+`file_name`, and a loopback server (`Limits::permit` swapped) for redirects, a private hop, the cap, an existing file, an
+encoded body, a cancel. Also refused: this machine's own addresses (`own_addresses`, `getifaddrs`; compared canonically, so
+a mapped spelling too; not listed on Windows), and 168.63.129.16 / 100.100.100.200 by name. A host that does not resolve
+and one that is not public get the same message (`not_public`), which never names the address. The body must be
+`identity`: ureq asks for it, decodes gzip itself whatever a server sends (a crate feature, not per agent; the cap
+counts the decoded bytes) and any other `Content-Encoding` is refused. The body's whole budget is 2 h; a stalled reader
+thread lives until then, so at most four may exist (`READERS`, a fifth `import_url` is refused). Free space as for uploads.
 It shares the **same** `Arc<Mutex<Project>>` the Tauri commands hold, so the agent edits the project the user has open.
 **stdio** (`kerf-app --headless --stdio`, `app.md`; rmcp `transport-io`): `server::start_stdio` does what `start` does short
 of a listener and a token (none is made or stored, the pipe is the trust boundary; no `CONTROL`, so `stop` is a no-op) and
@@ -754,7 +801,7 @@ Agent edits **stage** (`core-project.md`). The adapter's part:
 ## Background jobs (`mcp/jobs.rs`)
 
 `analyze_asset`, `export`, `export_variants`, `generate_voiceover`, `compose_music`, `separate_stems`, `download_speech_model`,
-`import_asset`, `smart_crop`, `stabilize_clip`, `refine_transcript` and `sync_clips_by_audio` take `background: true` and answer `{job_id}` at once; `job_status`, `cancel_job` and
+`import_asset`, `import_url`, `smart_crop`, `stabilize_clip`, `refine_transcript` and `sync_clips_by_audio` take `background: true` and answer `{job_id}` at once; `job_status`, `cancel_job` and
 `list_jobs` read and stop them (or subscribe to `kerf://jobs/{job_id}`, below). Each is written once against `jobs::Run` (`cancelled()` + `progress(fraction, message)`):
 a foreground call builds it from the request (`foreground`: the `ct` cancellation token and the `progressToken`, with a relay
 task that keeps progress monotonic), a background one from its record in `Jobs` (bounded: 8 running, 48 records, a finished
@@ -916,3 +963,4 @@ Every tool, by purpose (a test pins that this list names each registered tool, a
 - **Task queue**: `list_tasks`, `add_task`, `claim_next_task`, `complete_task`, `fail_task`, `resolve_task`, `remove_task`.
 - **Background jobs**: `job_status`, `cancel_job`, `list_jobs`.
 - **Settings**: `get_settings`, `set_settings`.
+- **Workspace files** (headless with `--workspace` only): `list_files`, `file_url`, `import_url`.

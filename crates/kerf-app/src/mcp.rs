@@ -35,6 +35,8 @@ use crate::shell::Shell;
 mod activity;
 mod args;
 mod batch;
+mod fetch;
+mod files;
 mod hints;
 mod jobs;
 mod project_tools;
@@ -46,6 +48,7 @@ mod thumbnails;
 mod toolsets;
 mod workspace;
 
+pub(crate) use files::{check_public_url, sweep_stale_parts, MediaIo, DEFAULT_MAX_UPLOAD};
 use jobs::Run;
 pub(crate) use server::{
     bind_problem, check_tool_sets, client_url, current_token, finish_jobs, set_overrides, start, start_stdio, stop,
@@ -2829,40 +2832,9 @@ impl KerfMcp {
             let path = path.clone();
             blocking(move || ws.check_media(&path).map_err(|e| McpError::invalid_params(e, None))).await?;
         }
-        let me = self.clone();
-        let owner = self.owner();
-        let generation = self.lock().generation();
-        // The GUI's Stop on an import ends an agent's import too.
-        let gui_stop = self.app.state::<crate::AppState>().begin_import();
-        self.long_tool("import_asset", p.background, &context, move |run| async move {
-            let run = run.also_cancelled_by(gui_stop);
-            let (project, app) = (me.project.clone(), me.app.clone());
-            let asset = blocking(move || {
-                // Probe (and, for a lens pair, stitch) with the lock released, taking
-                // it only for the quick insert — the same shape as the GUI's import,
-                // so a multi-minute stitch never freezes the user's editing.
-                let mut on_progress = |pr: kerf_core::ExportProgress| {
-                    let _ = app.emit("import-progress", crate::ImportProgress::new(&path, pr));
-                    run.progress(Some(pr.fraction), "stitching the 360 pair");
-                };
-                let probed = Project::probe_import_with(std::path::Path::new(&path), &mut on_progress, &|| run.cancelled())
-                    .map_err(core_err)?;
-                let asset = {
-                    let guard = lock_agent_as(&project, owner.as_deref());
-                    // Imported into the project it was asked of, or not at all.
-                    require_generation(&guard, generation, "it was being imported")?;
-                    guard.insert_or_get_asset(&probed).map_err(core_err)?
-                };
-                // Preview decodes come off a proxy; queue it now so the first frame anyone asks for
-                // is not a seek into a long GOP. It takes its place in front of any analysis the
-                // agent starts next (`kerf_core::proxy`), and may run a cached ffprobe, which is why
-                // it is here on the blocking pool and not in the async tool body.
-                crate::spawn_proxy(&app, &asset);
-                Ok(asset)
-            })
-            .await?;
-            me.changed();
-            json(&asset)
+        let (me, owner, generation) = (self.clone(), self.owner(), self.lock().generation());
+        self.long_tool("import_asset", p.background, &context, move |run| {
+            me.import_run(path, run, owner, generation)
         })
         .await
     }
@@ -7256,6 +7228,56 @@ impl KerfMcp {
         workspace::confine(self.workspace.as_deref(), path)
     }
 
+    /// An import once its path is checked: probe (and, for a lens pair, stitch) with the lock
+    /// released, insert into the project of `generation` as `owner`, queue the proxy. The GUI's Stop
+    /// on an import ends it too.
+    fn import_run(
+        &self,
+        path: String,
+        run: Run,
+        owner: Option<String>,
+        generation: u64,
+    ) -> impl std::future::Future<Output = Result<String, McpError>> + Send + 'static {
+        let me = self.clone();
+        let gui_stop = self.app.state::<crate::AppState>().begin_import();
+        async move {
+            let run = run.also_cancelled_by(gui_stop);
+            let (project, app, workspace) = (me.project.clone(), me.app.clone(), me.workspace.clone());
+            let asset = blocking(move || {
+                // Checked again here, right before FFmpeg reads it: `import_url`'s file was not there
+                // when its call was checked, and a file in the workspace may have been replaced since.
+                crate::require_local_input_path(&path).map_err(|e| McpError::invalid_params(e, None))?;
+                kerf_core::paths::validate_import_path(std::path::Path::new(&path)).map_err(core_err)?;
+                if let Some(ws) = &workspace {
+                    ws.check_media(&path).map_err(|e| McpError::invalid_params(e, None))?;
+                }
+                // The same shape as the GUI's import, so a multi-minute stitch never freezes the
+                // user's editing.
+                let mut on_progress = |pr: kerf_core::ExportProgress| {
+                    let _ = app.emit("import-progress", crate::ImportProgress::new(&path, pr));
+                    run.progress(Some(pr.fraction), "stitching the 360 pair");
+                };
+                let probed = Project::probe_import_with(std::path::Path::new(&path), &mut on_progress, &|| run.cancelled())
+                    .map_err(core_err)?;
+                let asset = {
+                    let guard = lock_agent_as(&project, owner.as_deref());
+                    // Imported into the project it was asked of, or not at all.
+                    require_generation(&guard, generation, "it was being imported")?;
+                    guard.insert_or_get_asset(&probed).map_err(core_err)?
+                };
+                // Preview decodes come off a proxy; queue it now so the first frame anyone asks for
+                // is not a seek into a long GOP. It takes its place in front of any analysis the
+                // agent starts next (`kerf_core::proxy`), and may run a cached ffprobe, which is why
+                // it is here on the blocking pool and not in the async tool body.
+                crate::spawn_proxy(&app, &asset);
+                Ok(asset)
+            })
+            .await?;
+            me.changed();
+            json(&asset)
+        }
+    }
+
     /// The files a tool names after a checked output (`cut-9x16.mp4` beside `cut.mp4`) held to the
     /// workspace too: one of them may be a link out of it.
     fn check_beside<'a>(&self, paths: impl IntoIterator<Item = &'a std::path::Path>) -> Result<(), McpError> {
@@ -7642,7 +7664,8 @@ fn router() -> &'static rmcp::handler::server::router::tool::ToolRouter<KerfMcp>
             + KerfMcp::tool_router_project()
             + KerfMcp::tool_router_templates()
             + KerfMcp::tool_router_batch()
-            + KerfMcp::tool_router_thumbnails();
+            + KerfMcp::tool_router_thumbnails()
+            + KerfMcp::tool_router_files();
         hints::annotate(&mut router);
         router
     })
@@ -8163,7 +8186,13 @@ impl ServerHandler for KerfMcp {
         let tool = request.name.to_string();
         self.note_session(&context);
         self.listener.touch();
-        let result = match reject_unknown_arguments(&request) {
+        // A workspace tool is no tool at all on a server without its workspace (or its switch).
+        let offered = if files::offered(self, &tool) {
+            Ok(())
+        } else {
+            Err(McpError::invalid_params("tool not found", None))
+        };
+        let result = match offered.and_then(|()| reject_unknown_arguments(&request)) {
             Ok(()) => {
                 let tcc = rmcp::handler::server::tool::ToolCallContext::new(self, request, context);
                 router().call(tcc).await
@@ -8217,7 +8246,7 @@ impl ServerHandler for KerfMcp {
         self.listener.touch();
         let selection = self.selection(&context)?;
         let mut tools = router().list_all();
-        tools.retain(|tool| selection.lists(&tool.name));
+        tools.retain(|tool| selection.lists(&tool.name) && files::offered(self, &tool.name));
         let supports_cache_hints = context
             .protocol_version()
             .is_some_and(|version| version >= rmcp::model::ProtocolVersion::V_2026_07_28);
@@ -11793,6 +11822,7 @@ mod tests {
             "export_variants",
             "generate_voiceover",
             "import_asset",
+            "import_url",
             "refine_transcript",
             "separate_stems",
             "smart_crop",
