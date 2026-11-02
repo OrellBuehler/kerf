@@ -7300,9 +7300,16 @@ fn what_a_moving_still_is_not_drawn_for_is_refused_in_an_export_frame() {
     ] {
         let mut c = ken_burns(&p.wide, 0.0, 1.0);
         edit(&mut c);
-        assert!(
-            !takes_the_route(&still(c), png, 30.0, 3),
-            "{name} takes the moving still's route"
+        let tl = still(c);
+        assert!(!takes_the_route(&tl, png, 30.0, 3), "{name} takes the moving still's route");
+        // ... and no case holds the footage placement to a still of those, so the plan refuses it and FFmpeg renders it.
+        refused(
+            &format!("ken-burns/{name}"),
+            &tl,
+            png,
+            &at_fps(30.0),
+            upto(1.0, 30.0),
+            "a still whose picture moves",
         );
     }
     // A keyed crop is the moving still's too, which no pass draws.

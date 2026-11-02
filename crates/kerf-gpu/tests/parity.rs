@@ -8337,7 +8337,16 @@ fn what_a_moving_still_is_not_drawn_for_is_refused() {
     ] {
         let mut c = moving(&p.wide);
         edit(&mut c);
-        assert!(!takes_the_route(&one(c), png, 0.5), "{name} takes the moving still's route");
+        let tl = one(c);
+        assert!(!takes_the_route(&tl, png, 0.5), "{name} takes the moving still's route");
+        // ... and no case holds the footage placement to a still of those, so the plan refuses it and FFmpeg renders it.
+        check_refused(
+            &format!("ken-burns/{name}"),
+            &tl,
+            png,
+            0.5,
+            Refusal::Plan("a still whose picture moves"),
+        );
     }
 }
 
@@ -8433,4 +8442,79 @@ fn a_move_that_pans_off_the_picture_is_placed_from_the_fit_ffmpeg_makes() {
         &times,
         960,
     );
+}
+
+/// What the app calls: a still plan as `Planner` makes it, handed to the compositor's own entry points with nothing worked out by hand.
+/// A still plan carries no fit picture (it depends on the size the frame is drawn at), and the plan drops the refusals about the
+/// compositor's own scaler for a layer FFmpeg makes it of: so the entry points must make it (`for_render`), and a caller that composites
+/// planes by hand from a plan that is not worked out is refused, not drawn from a picture the compositor scaled itself.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_still_plan_the_entry_points_are_given_is_worked_out_for_the_size_they_draw_it_at() {
+    let p = photos();
+    let png = std::slice::from_ref(&p.wide);
+    let opts = ExportOptions::default();
+    let edge = |photo: &Asset| {
+        timeline(
+            vec![vec![ken_burns(photo, 0.0, 2.0, (1.0, (-0.03, 0.0)), (1.18, (0.03, -0.02)))]],
+            delivery(1920, 1080, Fit::Cover),
+        )
+    };
+    for (name, tl, assets, t, width) in [
+        ("pan-off png at 960", edge(&p.wide), png, 0.5, 960),
+        (
+            "ken-burns png at 640",
+            timeline(
+                vec![vec![ken_burns(&p.wide, 0.0, 2.0, IN, HOME)]],
+                delivery(1920, 1080, Fit::Cover),
+            ),
+            png,
+            1.0,
+            640,
+        ),
+    ] {
+        let plan = RenderPlan::at(&tl, assets, &opts, t, policy()).expect("plan");
+        let size = plan.size(width);
+        assert!(
+            plan.layers
+                .iter()
+                .all(|l| l.fit.is_none() && l.still.as_ref().is_none_or(|s| s.export.is_none())),
+            "{name}: worked out already"
+        );
+        // The plan says it is drawn (as it would be made), and the frame is FFmpeg's still to the strict bounds, through each entry point.
+        assert!(reasons(&plan, size).is_empty(), "{name}: {:?}", reasons(&plan, size));
+        // Through each entry point, and the frame is the one drawn from the plan worked out by hand (which `check_exact_at_width` holds to FFmpeg's
+        // still, plane for plane).
+        let worked = plan.clone().for_render(size);
+        let by_hand = compositor()
+            .render_plan_with(&worked, size, frame_source(), kerf_gpu::Hint::Exact)
+            .unwrap_or_else(|e| panic!("{name}: the worked-out plan: {e}"))
+            .0;
+        let one_shot = compositor()
+            .render_plan(&plan, size)
+            .unwrap_or_else(|e| panic!("{name}: render_plan: {e}"))
+            .0;
+        let shared = compositor()
+            .render_plan_with(&plan, size, frame_source(), kerf_gpu::Hint::Exact)
+            .unwrap_or_else(|e| panic!("{name}: render_plan_with: {e}"))
+            .0;
+        assert!(
+            by_hand.data == one_shot.data,
+            "{name}: render_plan drew another frame than the worked-out plan"
+        );
+        assert!(
+            by_hand.data == shared.data,
+            "{name}: render_plan_with drew another frame than the worked-out plan"
+        );
+        check_exact_at_width(name, &tl, assets, &[t], width);
+        // Composited by hand from a plan that is not worked out: refused, whatever the decode handed it (a moving still's own route has no
+        // copy to decode before it is worked out; a fit picture's layer decodes plain, and the composite is what refuses).
+        if let Ok(frames) = kerf_gpu::decode_layers(&plan.layers) {
+            let by_hand = compositor().composite_yuv(&plan, &frames, size);
+            assert!(
+                matches!(&by_hand, Err(kerf_gpu::GpuError::Unsupported(why)) if why.contains("for_render")),
+                "{name}: {by_hand:?}"
+            );
+        }
+    }
 }

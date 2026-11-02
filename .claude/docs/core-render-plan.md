@@ -411,9 +411,12 @@
   (`PlanLayer::still: Some(StillLayer)`, `RenderPlan::takes_still_route`; `kerf_core::still_motion`): the export's scaled copy of the
   still (`once`: `scale` to `q`, `crop` to the window any frame reads) and one `perspective` per frame, whose four corners the plan evaluates
   (`StillMotion::corners`, the expression's operation order, from `StillLayer::pose` = `property_at`). An export frame carries the clip's own
-  plan (`clip_wide`, `export`); a still plan's depends on the render size and is **worked out by `RenderPlan::for_render(size)`** (the
-  compositor's `render_plan*` entry points do it; a harness that decodes and composites by hand calls it, else `StillLayer::export` is `None`
-  and nothing is drawn). `StillMotion` (kind `still_motion`, with the detail) is refused for: a picture kind the compositor did not measure
+  plan (`clip_wide`, `export`); a still plan's depends on the render size and is **worked out by `RenderPlan::for_render(size)`**: every
+  compositor entry point that decodes (`render_plan`, `render_plan_with`, `render_plan_texture_with`, `render_draft_texture_with`) does it
+  (`for_size`: for a moving still's copy *and* for a fit picture that is missing or was made for another size), and a caller that decodes and
+  composites by hand must too: `composite_*` from a plan that is not worked out is `Unsupported` ("not worked out for this render"), never a
+  draw from a picture the compositor scaled itself (`reasons` judges an unworked plan as it would be made, which is what the ledger and the
+  render bar need; it refuses a fit picture made for another size, or that cannot be made). `StillMotion` (kind `still_motion`, with the detail) is refused for: a picture kind the compositor did not measure
   (`GpuCaps::still_motion: StillKinds` = `yuvj420p` / `rgb24`; `Compositor::caps()` sets it from `kerf_gpu::still_probe`), a full-range
   picture where the composite's range is negotiated, colour / grade / effect / mask / opacity below 1 / a dip to white on the layer, a render
   size other than the one the move was made for (an export frame's is the delivery's). `layer_geometry` of such a layer is the frame-sized
@@ -424,7 +427,10 @@
   `layer_geometry` gives, the delivery's scaler flags; stamped by `for_render(size)`, and by the planner for an export frame, at the delivery
   frame): the compositor's scaler and decode are not in play, so the resize of a full-range JPEG or an RGB picture, the scaler's one level and
   the chroma grid of the crop are FFmpeg's, and `PlacedFormat` (other layouts), `FullRangeResized`, `FormatResize`, `Shrink` and `Geometry`
-  (chroma grid) are not its reasons; the full-range policy refusals of a placed layer remain.
+  (chroma grid) are not its reasons; the full-range policy refusals of a placed layer remain. **A moving still that is neither** (an image with
+  a moving zoom or position and colour, a grade, an effect, a mask, a rotation, an opacity below 1, a dip to white, or a picture kind no chain
+  was measured for) **is refused as `StillMotion`**: the footage placement would draw it from the compositor's decode and scaler, which no case
+  holds a still to (only the two routes above are held, exact on 6.1.1 and 9.0.2).
   `LayerGeometry` is **unchanged** (still fit-then-zoom: the compositor's order, and `layer-geometry.ts`, the Preview handles' port): a Contain
   zoom's picture is within a pixel or two of the file's, and for Cover the handles show the zoomed *frame* where the file now has the
   larger cover, cut by the canvas. Drawing these layers means a one-stage `LayerGeometry` (`scaled` = the folded box, `keep` = the centred

@@ -716,7 +716,7 @@ before the zoom acts at the **fit size** and the zoom magnifies it (a blur grows
   fit picture** it is laid from (`kerf_core::FitCopy`: the geometry's `crop` / `scale` / `crop` stages as text, then `format=yuva420p`), which lifts, for an
   `yuvj420p` or `rgb24` still, the resize of a full-range or RGB picture, the scaler's one level and the chroma grid of the crop (all FFmpeg's own).
   **The export draws the frame at the delivery's size**: an export frame's copy is made for it (a render at another size is refused); a still plan's copy depends
-  on the size it renders at (`StillMotion::build` over the instant), so `RenderPlan::for_render(size)` works it out (`render_plan*` do; a harness calls it).
+  on the size it renders at (`StillMotion::build` over the instant), so `RenderPlan::for_render(size)` works it out (every entry point that decodes does, `for_size`, a fit picture included; `composite_*` from a plan that is not worked out is refused).
   `still_probe` (per kind, `jpeg()` / `rgb()`, the `measure` slot and backoff of the other probes, run by `prepare`) is what lets the kind into the caps: a toy cut
   (a landscape, a portrait and a small noise picture of the kind, 64x36 Cover at 30 fps, both routes) is exported by the engine's own graph
   (`kerf_core::export_graph`, `still_graph`) and every sample of every frame of the export and of the still is held to the model with no tolerance (a shift of
@@ -731,6 +731,13 @@ before the zoom acts at the **fit size** and the zoom magnifies it (a blur grows
   `timeline_frame_yuv`), `a_moving_still_inside_a_transition_*` (fades, crossfade, dip, slide, push, both orders of JPEG and PNG),
   `a_move_that_pans_off_the_picture_is_placed_from_the_fit_ffmpeg_makes`; `motion_parity.rs` the same in export frames at 24 / 25 / 30 / 60 fps, late, speed 2,
   reversed, over and under video, and the slideshow archetype (both routes, 144 frames).
+  **The copies are kept apart from the frames** (`copies.rs`: one process-wide LRU of 96 MiB, single flight, failures remembered for 30 s), so a copy is made
+  once however many ask (the feeder, the primer, `prepare`, the frame) and nothing else is pushed out for it. An export frame's copy is the clip's own and is
+  made ahead: `CursorFeed::open` makes it on the feeder's thread (a moving still has **no cursor**: the pick of a still image is decided without the
+  file's frames, `Pick::select`, so the file is decoded once, for the copy) and `prepare` / `prepare_ahead` make it for the plans they are given. A still
+  plan's copy is made for the instant (the FFmpeg still sizes it by the zoom it shows then, so it is not the clip's), which a drag changes at every position:
+  `Hint::Exact` waits for it; every other hint is not made to wait, the copy is started on a thread of its own (one at a time) and the caller is told `Busy`
+  (the caller renders that frame through FFmpeg, and the next ask for it finds the copy). The source is bounded (1 to 8192 a side) before any copy path.
   **A photograph the probe saw turned** (an EXIF orientation: the stored size, a turned decode) would be fitted by the graph to sizes of its own, so the fit
   picture opens with a `crop` of the probed size, which FFmpeg refuses on it (`Unsupported`, "probed as"; `a_photograph_the_probe_saw_turned_*`). The moving
   still's own route needs no such guard: its copy is whatever the graph's filters make of the decoded picture.
