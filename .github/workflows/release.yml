@@ -381,3 +381,43 @@ jobs:
             echo "::error::latest.json is missing: $missing"
             exit 1
           fi
+
+  # The hosted MCP server image (deploy/Dockerfile) is built and smoke-tested by image.yml but
+  # not published. To push it to GHCR with each release, add a job like this one: it is the
+  # only job that would need `packages: write`, and the tag comes from the event payload, so
+  # it goes through env, never straight into a script.
+  #
+  # image:
+  #   name: hosted image (ghcr)
+  #   if: ${{ startsWith(github.event.release.tag_name, 'v') && !github.event.release.prerelease }}
+  #   needs: [ci-green]
+  #   runs-on: ubuntu-24.04
+  #   timeout-minutes: 75
+  #   permissions:
+  #     contents: read
+  #     packages: write
+  #   steps:
+  #     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+  #       with:
+  #         persist-credentials: false
+  #     - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+  #     - uses: docker/login-action@<sha> # v4
+  #       with:
+  #         registry: ghcr.io
+  #         username: ${{ github.actor }}
+  #         password: ${{ secrets.GITHUB_TOKEN }}
+  #     - name: Image tags
+  #       id: tags
+  #       env:
+  #         TAG: ${{ github.event.release.tag_name }}
+  #         REPO: ${{ github.repository }}
+  #       run: |
+  #         image="ghcr.io/${REPO,,}-mcp"
+  #         echo "tags=${image}:${TAG#v},${image}:latest" >> "$GITHUB_OUTPUT"
+  #     - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+  #       with:
+  #         context: .
+  #         file: deploy/Dockerfile
+  #         push: true
+  #         tags: ${{ steps.tags.outputs.tags }}
+  #         cache-from: type=gha,scope=kerf-mcp

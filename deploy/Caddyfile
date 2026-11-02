@@ -1,0 +1,20 @@
+# TLS for $KERF_HOST (Let's Encrypt, automatically) and one path per tenant:
+# https://$KERF_HOST/tenant-a/mcp reaches tenant-a's /mcp. Kerf listens on 0.0.0.0 in its
+# container, which accepts any Host header, so the proxied host needs no rewriting; each
+# tenant still checks its own bearer token.
+{$KERF_HOST} {
+	handle_path /tenant-a/* {
+		reverse_proxy tenant-a:7777 {
+			# Streamable HTTP answers over SSE: pass every event on as it comes.
+			flush_interval -1
+		}
+	}
+	handle_path /tenant-b/* {
+		reverse_proxy tenant-b:7777 {
+			flush_interval -1
+		}
+	}
+	handle {
+		respond 404
+	}
+}

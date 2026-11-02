@@ -42,7 +42,7 @@ stop that arrives before its start, and a reloaded page whose counter restarted 
 
 **Headless mode** (`headless.rs`, `shell.rs`). `kerf-app --headless [--stdio [--tools SETS]] [--project x.kerf | --new-project x.kerf]
 [--mcp-addr ADDR] [--data-dir DIR] [--token-file PATH] [--show-token] [--review] [--proxies] [--cpu-percent N]
-[--cache-dir DIR] [--cache-max-gb N]` runs the MCP
+[--cache-dir DIR] [--cache-max-gb N] [--prefetch-models LIST]` runs the MCP
 server with no display and no webview: `main.rs` calls `headless_main()` before `run()`, which builds no Tauri app (tao
 initialises GTK and panics with no display) and runs on `tauri::async_runtime` with a `Shell::Headless` in place of the
 `AppHandle` — so **code the MCP server reaches takes a `Shell` or `&impl Host`, never an `AppHandle`**. On Linux the binary
@@ -83,6 +83,10 @@ file as a non-terminal stdout (`2>&1`, `same_file`: fstat device + inode) is ref
 `initialize`) or a signal ends it with the same shutdown, exit 0; a first signal during an EOF shutdown lets it finish, a
 second exits 130.
 Release Windows builds are `windows_subsystem = "windows"`: pipes work, an interactive console shows nothing.
+**`--prefetch-models whisper[:NAME],kokoro[:VOICE],demucs,soundfont`** starts no server: once `--cache-dir` is in force it
+downloads each into the cache through the same checked fetch the first use runs (`download_speech_model`,
+`prepare_voiceover`, `prepare_stems`, `prepare_soundfont`), progress on stderr, and exits 0, 1 if one failed, 2 for a bad list (checked at parse). The
+hosted image (`deploy/`) runs it from its entrypoint (`KERF_PREFETCH_MODELS`).
 `tests/headless.rs` drives the real binary (no `DISPLAY`): ready line, 401 / 200 / 202, two tools, SIGTERM → 0; a capped run
 prunes an aged cache in its `--cache-dir` and leaves models, `stitched/` and a fresh `.part` alone; a bad ceiling is exit 2.
 
