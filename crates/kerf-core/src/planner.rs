@@ -3952,44 +3952,44 @@ mod tests {
     }
 
     #[test]
-    fn the_fit_picture_ffmpeg_makes_is_the_geometrys_stages_written_out_after_a_guard_crop_of_the_probed_size() {
-        let off = |w: u32, h: u32, fmt: &str| {
+    fn the_fit_picture_ffmpeg_makes_is_the_engines_own_fit_for_a_cover_frame_and_the_geometrys_stages_after_a_guard_otherwise() {
+        let off = |w: u32, h: u32, fmt: &str, from: (f64, f64, f64), to: (f64, f64, f64), crop: bool| {
             let mut a = photo(fmt);
             a.streams[0].width = Some(w);
             a.streams[0].height = Some(h);
-            let tl = drifting(&a, (1.0, -0.03, 0.0), (1.18, 0.03, -0.02));
+            let mut tl = drifting(&a, from, to);
+            if crop {
+                tl.tracks[0].clips[0].transform.crop_left = 0.1;
+                tl.tracks[0].clips[0].transform.crop_top = 0.05;
+            }
             let p = planner(&tl, std::slice::from_ref(&a), PlanMode::Motion, &opts(30.0));
             p.at_frame(3).unwrap().layers[0].fit.clone().expect("a fit picture")
         };
-        // A 3:2 photograph in a 16:9 Cover frame: not resized, cut to the frame from the middle.
-        let fit = off(1920, 1280, "yuvj420p");
-        assert_eq!(
-            fit.filters,
-            concat!(
-                "crop=w='if(eq(iw,1920)*eq(ih,1280),1920,0)':h=1280:x=0:y=0:exact=1",
-                ",scale=1920:1280,crop=1920:1080:0:100"
-            )
+        let panning = ((1.0, -0.03, 0.0), (1.18, 0.03, -0.02));
+        // A Cover frame is fitted by the graph's own `scale` and `crop`, whatever the picture: the text names no size of the picture's, so a file
+        // that is not the size it was probed as (replaced, or turned) is fitted as the graph fits it.
+        let own = "scale=1920:1080:force_original_aspect_ratio=increase,crop=1920:1080";
+        for (w, h, fmt) in [
+            (1920, 1280, "yuvj420p"),
+            (1280, 1920, "yuvj420p"),
+            (1920, 1080, "rgb24"),
+            (1501, 1003, "yuvj420p"),
+        ] {
+            let fit = off(w, h, fmt, panning.0, panning.1, false);
+            assert_eq!(fit.filters, own, "{w}x{h}");
+            assert_eq!((fit.size, fit.frame), ((1920, 1080), (1920, 1080)));
+        }
+        // ... a static crop first, as the engine writes it.
+        let fit = off(1920, 1280, "yuvj420p", panning.0, panning.1, true);
+        assert_eq!(fit.filters, format!("crop=w=iw*0.9:h=ih*0.95:x=iw*0.1:y=ih*0.05,{own}"));
+        // Anything else is the geometry's stages written out at the probed sizes, behind a guard that fails on a picture of another size
+        // (smaller or larger) and keeps an odd picture whole (`exact`): a held zoom out is a second stage.
+        let fit = off(1920, 1280, "yuvj420p", (0.9, -0.03, 0.0), (0.9, 0.03, -0.02), false);
+        assert!(
+            fit.filters
+                .starts_with("crop=w='if(eq(iw,1920)*eq(ih,1280),1920,0)':h=1280:x=0:y=0:exact=1,scale=1920:1280,"),
+            "{}",
+            fit.filters
         );
-        assert_eq!((fit.size, fit.frame), ((1920, 1080), (1920, 1080)));
-        // A portrait one is enlarged by half first, then cut.
-        let fit = off(1280, 1920, "yuvj420p");
-        assert_eq!(
-            fit.filters,
-            concat!(
-                "crop=w='if(eq(iw,1280)*eq(ih,1920),1280,0)':h=1920:x=0:y=0:exact=1",
-                ",scale=1920:2880,crop=1920:1080:0:900"
-            )
-        );
-        // A picture of the frame's own shape and size is scaled to its own size all the same (the graph's `scale` is where an RGB picture is
-        // converted), and has nothing to cut.
-        let fit = off(1920, 1080, "rgb24");
-        assert_eq!(
-            fit.filters,
-            concat!(
-                "crop=w='if(eq(iw,1920)*eq(ih,1080),1920,0)':h=1080:x=0:y=0:exact=1",
-                ",scale=1920:1080"
-            )
-        );
-        assert_eq!(fit.size, (1920, 1080));
     }
 }

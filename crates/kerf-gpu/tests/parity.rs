@@ -8350,11 +8350,11 @@ fn what_a_moving_still_is_not_drawn_for_is_refused() {
     }
 }
 
-/// A photograph whose EXIF orientation turns it: the probe reports its stored size and every decode comes out turned, so the sizes the
-/// plan makes the fit picture at are not the picture's. The copy opens with a `crop` of the probed size, which FFmpeg refuses on it.
+/// A photograph whose EXIF orientation turns it: the probe reports its stored size and every decode comes out turned. The fit of a Cover frame is
+/// the graph's own `scale` and `crop` (no size of the picture's in the text), so the turned picture is fitted as the graph fits it, to the sample.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
-fn a_photograph_the_probe_saw_turned_is_not_fitted_to_the_wrong_size() {
+fn a_photograph_the_probe_saw_turned_is_fitted_as_the_graph_fits_it() {
     // (A JPEG is the plan's to refuse where the composite's range is negotiated: the render never sees it.)
     if policy() != CompositeColorPolicy::FixedBt601 {
         return;
@@ -8365,12 +8365,11 @@ fn a_photograph_the_probe_saw_turned_is_not_fitted_to_the_wrong_size() {
         vec![vec![ken_burns(&m.exif, 0.0, 2.0, (1.0, (-0.03, 0.0)), (1.18, (0.03, -0.02)))]],
         delivery(w, h, Fit::Cover),
     );
-    check_refused(
+    check_exact(
         "pan-off/exif orientation",
         &tl,
         std::slice::from_ref(&m.exif),
-        0.5,
-        Refusal::Render("probed as"),
+        &[0.0, 0.5, 1.0, 1.99],
     );
 }
 

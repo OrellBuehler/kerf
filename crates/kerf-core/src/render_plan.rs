@@ -1816,6 +1816,36 @@ impl RenderPlan {
             Some(s) if s.eq_ignore_ascii_case("bicubic") => ":flags=bicubic",
             _ => "",
         };
+        // A Cover frame fitted by the one `scale` and `crop` the engine writes (a static crop first, the cover of the frame, cut to it): the
+        // graph's own text, which is the graph's for a picture of whatever size the file is when it is decoded. The probe's sizes are
+        // not in it, so a file replaced since it was probed, or one the probe saw turned, is fitted as the graph fits it.
+        let t = &layer.transform;
+        if self.canvas.fit == Fit::Cover
+            && geom.stages.len() == 1
+            && geom.picture == size
+            && (geom.stages[0].keep.w, geom.stages[0].keep.h) == size
+        {
+            let mut filters = Vec::new();
+            if t.has_crop() {
+                let cw = (1.0 - t.crop_left - t.crop_right).max(0.0);
+                let ch = (1.0 - t.crop_top - t.crop_bottom).max(0.0);
+                filters.push(format!(
+                    "crop=w=iw*{cw}:h=ih*{ch}:x=iw*{cl}:y=ih*{ct}",
+                    cl = t.crop_left,
+                    ct = t.crop_top
+                ));
+            }
+            filters.push(format!(
+                "scale={}:{}:force_original_aspect_ratio=increase{flags}",
+                size.0, size.1
+            ));
+            filters.push(format!("crop={}:{}", size.0, size.1));
+            return Some(FitCopy {
+                filters: filters.join(","),
+                size,
+                frame: size,
+            });
+        }
         let whole = |r: &crate::layer_geometry::Rect, w: u32, h: u32| r.x == 0 && r.y == 0 && r.w == w && r.h == h;
         let (mut w, mut h) = (layer.stream.width, layer.stream.height);
         // The sizes are the probe's: a picture that decodes at another size (an EXIF orientation the probe did not apply, a file replaced since)
