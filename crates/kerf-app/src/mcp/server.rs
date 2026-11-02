@@ -101,12 +101,14 @@ impl McpConfig {
 }
 
 /// The headless run's own address (`--mcp-addr`), token (`KERF_MCP_TOKEN`, never stored) and
-/// workspace (`--workspace`, the directory every path a client names must lie in).
+/// workspace (`--workspace`, the directory every path a client names must lie in), with how media
+/// moves in and out of it (`--public-url`, `--max-upload-gb`, `--allow-url-import`).
 #[derive(Default)]
 pub(crate) struct Overrides {
     pub addr: Option<String>,
     pub token: Option<String>,
     pub workspace: Option<Arc<super::Workspace>>,
+    pub media: super::files::MediaIo,
 }
 
 static OVERRIDES: OnceLock<Overrides> = OnceLock::new();
@@ -121,6 +123,11 @@ pub(crate) fn set_overrides(overrides: Overrides) {
 /// The directory a headless run confines clients' paths to, if it was given one.
 pub(crate) fn workspace() -> Option<Arc<super::Workspace>> {
     OVERRIDES.get().and_then(|o| o.workspace.clone())
+}
+
+/// How media moves in and out of the workspace (the defaults without a headless run).
+pub(crate) fn media() -> super::files::MediaIo {
+    OVERRIDES.get().map(|o| o.media.clone()).unwrap_or_default()
 }
 
 /// Whether `KERF_MCP_ADDR` is set to something, i.e. the stored address is not what is in force.
@@ -199,6 +206,19 @@ pub fn allowed_hosts(addr: &str) -> Vec<String> {
     }
     if !hosts.iter().any(|h| h.eq_ignore_ascii_case(&host)) {
         hosts.push(host);
+    }
+    hosts
+}
+
+/// [`allowed_hosts`] for the listener on `addr`, with the host of `--public-url` when one is given
+/// (a reverse proxy may pass the public `Host` on). An empty list (allow any) stays empty.
+pub(super) fn hosts(addr: &str) -> Vec<String> {
+    let mut hosts = allowed_hosts(addr);
+    let public = media().public_url.as_deref().and_then(super::files::public_host);
+    if let Some(public) = public.filter(|_| !hosts.is_empty()) {
+        if !hosts.iter().any(|h| h.eq_ignore_ascii_case(&public)) {
+            hosts.push(public);
+        }
     }
     hosts
 }
@@ -387,6 +407,13 @@ pub fn endpoint_url() -> String {
     format!("http://{}/mcp", bind_addr())
 }
 
+/// `http://<host>:<port>` of the listener that is up (a wildcard bind as loopback), else of the
+/// configured address.
+pub(super) fn listening_base() -> String {
+    let addr = status().bound.map(|b| b.to_string()).unwrap_or_else(bind_addr);
+    client_url(&addr).trim_end_matches("/mcp").to_string()
+}
+
 /// Why the server is not listening, if it is not: the port is taken, the address is refused.
 pub fn server_error() -> Option<String> {
     status().error
@@ -567,6 +594,9 @@ pub(crate) fn start(app: Shell, project: Arc<Mutex<Project>>) {
         return;
     }
     super::activity::pump_project();
+    if workspace().is_some() {
+        super::files::serve_project(project.clone());
+    }
     tauri::async_runtime::spawn(supervise(move || KerfMcp::new(project.clone(), app.clone()), rx));
 }
 
@@ -848,7 +878,7 @@ where
 /// The listener's settings for rmcp: who may name which `Host`, and no browser `Origin` at all.
 fn http_config(addr: &str) -> StreamableHttpServerConfig {
     StreamableHttpServerConfig::default()
-        .with_allowed_hosts(allowed_hosts(addr))
+        .with_allowed_hosts(hosts(addr))
         // No Origin is allowed: a native MCP client sends none, and a page in the user's
         // browser must not be able to reach the editor through the loopback port.
         .enforce_origin_validation()
@@ -875,9 +905,12 @@ where
         sessions.clone(),
         http_config(&config.addr).with_cancellation_token(stop.child_token()),
     );
-    let router = axum::Router::new()
-        .nest_service("/mcp", service)
-        .layer(middleware::from_fn_with_state(auth, require_bearer));
+    let mut router = axum::Router::new().nest_service("/mcp", service);
+    // A headless run with a workspace serves its files beside `/mcp`, behind the same token.
+    if let Some(files) = super::files::router(&config.addr) {
+        router = router.merge(files);
+    }
+    let router = router.layer(middleware::from_fn_with_state(auth, require_bearer));
     let listener = tokio::net::TcpListener::bind(&config.addr).await?;
     let bound = listener.local_addr()?;
     register_sessions(&sessions);
@@ -1564,6 +1597,7 @@ mod tests {
             addr: Some("127.0.0.1:0".into()),
             token: Some("e".repeat(40)),
             workspace: None,
+            media: Default::default(),
         };
         let config = McpConfig::resolve(&off, None).overridden(&named);
         assert!(config.enabled && config.require_token);

@@ -28,6 +28,8 @@ const ENV_CACHE_MAX_GB: &str = "KERF_CACHE_MAX_GB";
 const ENV_CACHE_DIR: &str = "KERF_CACHE_DIR";
 /// The environment variable that names the workspace when `--workspace` does not.
 const ENV_WORKSPACE: &str = "KERF_WORKSPACE";
+/// ... and the server's URL as clients reach it (`--public-url`), read only with a workspace over HTTP.
+const ENV_PUBLIC_URL: &str = "KERF_PUBLIC_URL";
 
 const EXIT_FAILURE: i32 = 1;
 const EXIT_USAGE: i32 = 2;
@@ -47,7 +49,15 @@ logs go to stderr. Stops on SIGINT / SIGTERM.
   --new-project PATH.kerf  create a project file and open it (refused if it exists)
   --workspace DIR          confine every file a client names to DIR: relative paths resolve against it,
                            anything outside it is refused (default: KERF_WORKSPACE; unset, no confinement).
-                           --project / --new-project then resolve against DIR and must lie inside it
+                           --project / --new-project then resolve against DIR and must lie inside it.
+                           Over HTTP, /files/<path> beside /mcp then moves files in and out of DIR (PUT,
+                           GET, DELETE; the same bearer token)
+  --public-url URL         with --workspace: the server's URL as clients reach it, behind a TLS reverse
+                           proxy with its path prefix (https://kerf.example.com/kerf), for file_url
+                           (KERF_PUBLIC_URL; default: the address the client connected to)
+  --max-upload-gb N        with --workspace: the largest file an upload or import_url writes (default 20)
+  --allow-url-import       with --workspace: let import_url download http(s) URLs into DIR (public
+                           addresses only; off by default)
   --mcp-addr HOST:PORT     where to listen (default: KERF_MCP_ADDR, the setting, 127.0.0.1:7777;
                            port 0 picks a free one)
   --data-dir DIR           keep settings, logs and recovery files in DIR instead of the app's own
@@ -92,6 +102,9 @@ struct Args {
     cache_dir: Option<PathBuf>,
     cache_max_bytes: Option<u64>,
     prefetch: Option<Vec<Model>>,
+    public_url: Option<String>,
+    max_upload_bytes: Option<u64>,
+    allow_url_import: bool,
     help: bool,
 }
 
@@ -276,6 +289,12 @@ fn parse(argv: &[String], cwd: &Path, env_workspace: Option<&str>) -> Result<Opt
             "--review" => switch(&mut args.review)?,
             "--proxies" => switch(&mut args.proxies)?,
             "--stdio" => switch(&mut args.stdio)?,
+            "--allow-url-import" => switch(&mut args.allow_url_import)?,
+            "--public-url" => args.public_url = Some(mcp::check_public_url(&value()?).map_err(|e| format!("--public-url: {e}"))?),
+            "--max-upload-gb" => {
+                let bytes = parse_cache_max(&value()?).map_err(|e| format!("--max-upload-gb {e}"))?;
+                args.max_upload_bytes = Some(bytes);
+            }
             "--tools" => {
                 let tools = value()?;
                 mcp::check_tool_sets(&tools).map_err(|e| format!("--tools: {e}"))?;
@@ -318,6 +337,7 @@ fn parse(argv: &[String], cwd: &Path, env_workspace: Option<&str>) -> Result<Opt
             ("--mcp-addr", args.mcp_addr.is_some()),
             ("--token-file", args.token_file.is_some()),
             ("--show-token", args.show_token),
+            ("--public-url", args.public_url.is_some()),
         ];
         if let Some((flag, _)) = http_only.into_iter().find(|(_, given)| *given) {
             return Err(format!(
@@ -332,6 +352,16 @@ fn parse(argv: &[String], cwd: &Path, env_workspace: Option<&str>) -> Result<Opt
             .map(str::trim)
             .filter(|w| !w.is_empty())
             .map(|w| absolute(w, cwd));
+    }
+    if args.workspace.is_none() {
+        let media = [
+            ("--public-url", args.public_url.is_some()),
+            ("--max-upload-gb", args.max_upload_bytes.is_some()),
+            ("--allow-url-import", args.allow_url_import),
+        ];
+        if let Some((flag, _)) = media.into_iter().find(|(_, given)| *given) {
+            return Err(format!("{flag} is for a server with a workspace: give --workspace DIR too"));
+        }
     }
     if let Some((open, path)) = project {
         let path = kerf_path(&path, args.workspace.as_deref().unwrap_or(cwd))?;
@@ -373,7 +403,9 @@ pub(crate) fn main(argv: &[String], bundled_ffmpeg: &[(&'static str, PathBuf)]) 
         }
         return 0;
     }
-    if let Err(e) = cache_from_env(&mut args, &cwd, |name| std::env::var(name).ok()) {
+    let from_env = cache_from_env(&mut args, &cwd, |name| std::env::var(name).ok())
+        .and_then(|()| public_url_from_env(&mut args, |name| std::env::var(name).ok()));
+    if let Err(e) = from_env {
         say(&format!("kerf-app: {e}\n\n{USAGE}"));
         return EXIT_USAGE;
     }
@@ -445,6 +477,17 @@ pub(crate) fn main(argv: &[String], bundled_ffmpeg: &[(&'static str, PathBuf)]) 
             code
         }
     }
+}
+
+/// `KERF_PUBLIC_URL` when `--public-url` was not given, read only for a workspace served over HTTP.
+fn public_url_from_env(args: &mut Args, get: impl Fn(&str) -> Option<String>) -> Result<(), String> {
+    if args.public_url.is_some() || args.workspace.is_none() || args.stdio {
+        return Ok(());
+    }
+    if let Some(url) = get(ENV_PUBLIC_URL).filter(|v| !v.trim().is_empty()) {
+        args.public_url = Some(mcp::check_public_url(&url).map_err(|e| format!("{ENV_PUBLIC_URL}: {e}"))?);
+    }
+    Ok(())
 }
 
 /// Put the caches under `dir` for this run, before anything reads where they are.
@@ -677,10 +720,16 @@ fn run(
     };
     // Before either server is made: the stdio one takes its workspace from these too.
     let workspace_root = workspace.as_ref().map(|w| w.root().to_string());
+    let media = mcp::MediaIo {
+        public_url: args.public_url.clone(),
+        max_upload_bytes: args.max_upload_bytes.unwrap_or(mcp::DEFAULT_MAX_UPLOAD),
+        allow_url_import: args.allow_url_import,
+    };
     mcp::set_overrides(mcp::Overrides {
         addr: args.mcp_addr.clone(),
         token,
         workspace,
+        media,
     });
     let stdio = rpc.map(|rpc| (mcp::start_stdio(shell.clone(), project.clone(), args.tools.as_deref()), rpc));
     if stdio.is_none() {
@@ -785,6 +834,11 @@ async fn serve(
     });
     if let Some(root) = workspace {
         ready["workspace"] = root.into();
+        let base = args
+            .public_url
+            .clone()
+            .unwrap_or_else(|| url.trim_end_matches("/mcp").to_string());
+        ready["files_url"] = format!("{base}/files/").into();
     }
     let mut out = std::io::stdout().lock();
     let _ = writeln!(out, "{ready}").and_then(|()| out.flush());
@@ -918,6 +972,9 @@ mod tests {
                 cache_dir: Some(PathBuf::from("/work/caches")),
                 cache_max_bytes: Some(1 << 29),
                 prefetch: None,
+                public_url: None,
+                max_upload_bytes: None,
+                allow_url_import: false,
                 help: false,
             }
         );

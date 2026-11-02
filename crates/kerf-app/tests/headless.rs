@@ -919,6 +919,398 @@ fn a_workspace_refuses_a_playlist_imported_or_named_by_a_project() {
     assert!(why.contains("not media this server takes"), "{why}");
     let info = answer(&call(addr, &on_session, 5, "project_info", serde_json::json!({})));
     assert_eq!(info["path"], "cut.kerf", "the open project stays: {info}");
+/// One plain HTTP request: the status, the headers (names lower-cased) and the whole body.
+fn http(
+    addr: SocketAddr,
+    method: &str,
+    path: &str,
+    headers: &[(&str, &str)],
+    body: &[u8],
+) -> (u16, Vec<(String, String)>, Vec<u8>) {
+    let mut request = format!(
+        "{method} {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nConnection: close\r\n",
+        body.len()
+    );
+    for (name, value) in headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str("\r\n");
+    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5)).expect("connect");
+    stream.set_read_timeout(Some(Duration::from_secs(60))).unwrap();
+    stream.write_all(request.as_bytes()).unwrap();
+    let _ = stream.write_all(body);
+    let mut seen = Vec::new();
+    let _ = stream.read_to_end(&mut seen);
+    let split = seen.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or(seen.len());
+    let head = String::from_utf8_lossy(&seen[..split]).into_owned();
+    let mut rest = seen.get(split + 4..).unwrap_or_default().to_vec();
+    let mut lines = head.lines();
+    let status = lines
+        .next()
+        .and_then(|l| l.split_whitespace().nth(1))
+        .and_then(|c| c.parse().ok())
+        .unwrap_or(0);
+    let headers: Vec<(String, String)> = lines
+        .filter_map(|l| l.split_once(':'))
+        .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
+        .collect();
+    if headers
+        .iter()
+        .any(|(k, v)| k == "transfer-encoding" && v.eq_ignore_ascii_case("chunked"))
+    {
+        let mut out = Vec::new();
+        while let Some(end) = rest.windows(2).position(|w| w == b"\r\n") {
+            let size = usize::from_str_radix(String::from_utf8_lossy(&rest[..end]).trim(), 16).unwrap_or(0);
+            if size == 0 {
+                break;
+            }
+            out.extend_from_slice(&rest[end + 2..end + 2 + size]);
+            rest = rest[end + 2 + size + 2..].to_vec();
+        }
+        rest = out;
+    }
+    (status, headers, rest)
+}
+
+fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers.iter().find(|(k, _)| k == name).map(|(_, v)| v.as_str())
+}
+
+/// A workspace run: its directory, workspace, process, address, session, token and ready line.
+struct FilesRun {
+    dir: PathBuf,
+    ws: PathBuf,
+    child: Running,
+    addr: SocketAddr,
+    on_session: [(String, String); 2],
+    token: String,
+    ready: serde_json::Value,
+}
+
+/// A workspace run with `extra` flags.
+fn files_run(name: &str, extra: &[&str]) -> FilesRun {
+    let dir = scratch(name);
+    let ws = dir.join("ws");
+    let data = dir.join("data");
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    let token = "f".repeat(48);
+    let mut args = vec!["--workspace", ws.to_str().unwrap(), "--new-project", "cut.kerf"];
+    args.extend_from_slice(extra);
+    let (child, ready) = spawn(&data, &args, &token);
+    assert_eq!(ready["kerf"], "listening", "{ready}");
+    let addr: SocketAddr = ready["addr"].as_str().unwrap().parse().unwrap();
+    let (on_session, _) = session(addr, &token);
+    FilesRun {
+        dir,
+        ws,
+        child,
+        addr,
+        on_session,
+        token,
+        ready,
+    }
+}
+
+fn tool_names(addr: SocketAddr, on_session: &[(String, String); 2]) -> Vec<String> {
+    let body = r#"{"jsonrpc":"2.0","id":90,"method":"tools/list"}"#;
+    let headers: Vec<(&str, &str)> = on_session.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let (_, _, body) = exchange(addr, &headers, body, "\"id\":90");
+    let data = body
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .find(|d| d.starts_with('{'))
+        .unwrap_or(&body)
+        .to_string();
+    let list: serde_json::Value = serde_json::from_str(&data).unwrap();
+    list["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["name"].as_str().map(str::to_string))
+        .collect()
+}
+
+#[test]
+fn a_workspace_serves_its_files_behind_the_token() {
+    let FilesRun {
+        dir,
+        ws,
+        child,
+        addr,
+        on_session,
+        token,
+        ready,
+    } = files_run("files", &["--max-upload-gb", "0.000001"]);
+    assert_eq!(ready["files_url"], format!("http://{addr}/files/"), "{ready}");
+    let auth = format!("Bearer {token}");
+    let with_token = [("Authorization", auth.as_str())];
+    let bytes: Vec<u8> = (0..1000u32).map(|i| (i % 251) as u8).collect();
+
+    assert_eq!(
+        http(addr, "PUT", "/files/media/up.bin", &[], &bytes).0,
+        401,
+        "no token, no entry"
+    );
+    assert_eq!(http(addr, "GET", "/files/", &[], b"").0, 401);
+    let (status, _, body) = http(addr, "PUT", "/files/media/up.bin", &with_token, &bytes);
+    assert_eq!(status, 201, "{}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        std::fs::read(ws.join("media/up.bin")).unwrap(),
+        bytes,
+        "parent directories are made"
+    );
+    let (status, _, body) = http(addr, "PUT", "/files/media/up.bin", &with_token, b"other");
+    assert_eq!(status, 409, "no overwrite unless asked: {}", String::from_utf8_lossy(&body));
+    assert_eq!(
+        http(addr, "PUT", "/files/media/up.bin?overwrite=1", &with_token, &bytes).0,
+        200
+    );
+    let (status, _, body) = http(addr, "PUT", "/files/big.bin", &with_token, &vec![0u8; 4096]);
+    assert_eq!(status, 413, "{}", String::from_utf8_lossy(&body));
+    assert!(!ws.join("big.bin").exists());
+
+    let (status, headers, body) = http(addr, "GET", "/files/media/up.bin", &with_token, b"");
+    assert_eq!(status, 200);
+    assert_eq!(body, bytes);
+    assert_eq!(header(&headers, "content-length"), Some("1000"));
+    assert_eq!(header(&headers, "accept-ranges"), Some("bytes"));
+    let (status, headers, body) = http(
+        addr,
+        "GET",
+        "/files/media/up.bin",
+        &[("Authorization", auth.as_str()), ("Range", "bytes=100-199")],
+        b"",
+    );
+    assert_eq!(status, 206);
+    assert_eq!(body, bytes[100..200]);
+    assert_eq!(header(&headers, "content-range"), Some("bytes 100-199/1000"));
+    let ranged = [("Authorization", auth.as_str()), ("Range", "bytes=5000-")];
+    assert_eq!(http(addr, "GET", "/files/media/up.bin", &ranged, b"").0, 416);
+
+    let (status, _, body) = http(addr, "GET", "/files/media/", &with_token, b"");
+    assert_eq!(status, 200);
+    let listing: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(listing["entries"][0]["name"], "up.bin", "{listing}");
+    assert_eq!(listing["entries"][0]["size"], 1000);
+    let entries = ws
+        .read_dir()
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name())
+        .collect::<Vec<_>>();
+    assert!(
+        !entries.iter().any(|n| n.to_string_lossy().ends_with(".part")),
+        "no .part left: {entries:?}"
+    );
+
+    for traversal in [
+        "/files/../outside",
+        "/files/media/../../x",
+        "/files/%2e%2e/x",
+        "/files//etc/passwd",
+    ] {
+        let (status, _, body) = http(addr, "GET", traversal, &with_token, b"");
+        assert!(
+            status == 400 || status == 403,
+            "{traversal}: {status} {}",
+            String::from_utf8_lossy(&body)
+        );
+        assert_eq!(http(addr, "PUT", traversal, &with_token, b"x").0 / 100, 4, "{traversal}");
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(dir.join("data"), ws.join("out")).unwrap();
+        assert_eq!(
+            http(addr, "GET", "/files/out/stderr.log", &with_token, b"").0,
+            403,
+            "a link out is refused"
+        );
+        std::os::unix::fs::symlink(ws.join("media"), ws.join("alias")).unwrap();
+        assert_eq!(
+            http(addr, "GET", "/files/alias/up.bin", &with_token, b"").0,
+            403,
+            "and a link inside too"
+        );
+    }
+    let from_page = [("Authorization", auth.as_str()), ("Origin", "https://evil.example")];
+    assert_eq!(
+        http(addr, "GET", "/files/media/up.bin", &from_page, b"").0,
+        403,
+        "no browser origin"
+    );
+    let (status, _, _) = http(addr, "PUT", "/files/cut.kerf?overwrite=1", &with_token, b"junk");
+    assert_eq!(status, 409, "the open project's own file is not replaced");
+    assert_eq!(http(addr, "DELETE", "/files/cut.kerf", &with_token, b"").0, 409);
+
+    // The tools: the workspace ones are listed (import_url only with --allow-url-import).
+    let names = tool_names(addr, &on_session);
+    assert!(
+        names.iter().any(|n| n == "list_files") && names.iter().any(|n| n == "file_url"),
+        "{names:?}"
+    );
+    assert!(!names.iter().any(|n| n == "import_url"), "{names:?}");
+    let listed = answer(&call(
+        addr,
+        &on_session,
+        2,
+        "list_files",
+        serde_json::json!({ "dir": "media" }),
+    ));
+    assert_eq!(listed["entries"][0]["name"], "up.bin", "{listed}");
+    let url = answer(&call(
+        addr,
+        &on_session,
+        3,
+        "file_url",
+        serde_json::json!({ "path": "media/up.bin" }),
+    ));
+    assert_eq!(url["url"], format!("http://{addr}/files/media/up.bin"), "{url}");
+    assert_eq!(url["exists"], true);
+    let why = refusal(&call(addr, &on_session, 4, "file_url", serde_json::json!({ "path": "../x" })));
+    assert!(why.contains("outside the workspace"), "{why}");
+    let why = refusal(&call(
+        addr,
+        &on_session,
+        5,
+        "import_url",
+        serde_json::json!({ "url": "https://example.com/a.mp4" }),
+    ));
+    assert_eq!(why, "tool not found");
+
+    assert_eq!(http(addr, "DELETE", "/files/media/up.bin", &with_token, b"").0, 204);
+    assert!(!ws.join("media/up.bin").exists());
+    assert_eq!(http(addr, "DELETE", "/files/media/up.bin", &with_token, b"").0, 404);
+    drop(child);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn without_a_workspace_there_are_no_file_routes_or_tools() {
+    let dir = scratch("no-files");
+    let token = "n".repeat(48);
+    let (child, ready) = spawn(&dir, &[], &token);
+    assert!(ready.get("files_url").is_none(), "{ready}");
+    let addr: SocketAddr = ready["addr"].as_str().unwrap().parse().unwrap();
+    let auth = format!("Bearer {token}");
+    assert_eq!(http(addr, "GET", "/files/", &[("Authorization", auth.as_str())], b"").0, 404);
+    let (on_session, _) = session(addr, &token);
+    let names = tool_names(addr, &on_session);
+    for tool in ["list_files", "file_url", "import_url"] {
+        assert!(!names.iter().any(|n| n == tool), "{tool}: {names:?}");
+    }
+    assert_eq!(
+        refusal(&call(addr, &on_session, 2, "list_files", serde_json::json!({}))),
+        "tool not found"
+    );
+    drop(child);
+    for flags in [
+        &["--public-url", "https://kerf.example.com"][..],
+        &["--allow-url-import"],
+        &["--max-upload-gb", "1"],
+    ] {
+        let out = headless(flags, &dir).stdin(Stdio::null()).output().expect("run kerf-app");
+        assert_eq!(out.status.code(), Some(2), "{flags:?}");
+        assert!(String::from_utf8_lossy(&out.stderr).contains("--workspace"), "{flags:?}");
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn url_import_is_opt_in_and_never_reaches_a_private_address() {
+    let FilesRun {
+        dir,
+        child,
+        addr,
+        on_session,
+        ..
+    } = files_run("url-import", &["--allow-url-import"]);
+    let names = tool_names(addr, &on_session);
+    assert!(names.iter().any(|n| n == "import_url"), "{names:?}");
+    for (id, url, said) in [
+        (2, "http://127.0.0.1:9/a.mp4", "not a public address"),
+        (3, "http://169.254.169.254/latest/meta-data/", "not a public address"),
+        (4, "http://[::ffff:10.0.0.1]/a.mp4", "not a public address"),
+        (5, "http://localhost/a.mp4", "not a public address"),
+        (6, "file:///etc/passwd", "only http and https"),
+    ] {
+        let body = call(addr, &on_session, id, "import_url", serde_json::json!({ "url": url }));
+        let why = refusal(&body);
+        assert!(why.contains(said), "{url}: {why}");
+    }
+    let why = refusal(&call(
+        addr,
+        &on_session,
+        7,
+        "import_url",
+        serde_json::json!({ "url": "https://example.com/a.mp4", "path": "../a.mp4" }),
+    ));
+    assert!(why.contains("outside the workspace"), "{why}");
+    drop(child);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[ignore = "probes and renders with the ffmpeg / ffprobe binaries"]
+fn media_uploaded_imported_and_exported_comes_back_whole() {
+    let FilesRun {
+        dir,
+        ws,
+        child,
+        addr,
+        on_session,
+        token,
+        ..
+    } = files_run("files-export", &[]);
+    let auth = format!("Bearer {token}");
+    let with_token = [("Authorization", auth.as_str())];
+    let source = dir.join("tone.wav");
+    tone(&source);
+    let bytes = std::fs::read(&source).unwrap();
+    assert_eq!(http(addr, "PUT", "/files/media/tone.wav", &with_token, &bytes).0, 201);
+    let asset = answer(&call(
+        addr,
+        &on_session,
+        2,
+        "import_asset",
+        serde_json::json!({ "path": "media/tone.wav" }),
+    ));
+    assert_eq!(asset["path"], "media/tone.wav", "{asset}");
+    let (status, _, _) = http(addr, "PUT", "/files/media/tone.wav?overwrite=1", &with_token, &bytes);
+    assert_eq!(status, 409, "a source of the open project is not replaced");
+    assert_eq!(http(addr, "DELETE", "/files/media/tone.wav", &with_token, b"").0, 409);
+    call(
+        addr,
+        &on_session,
+        3,
+        "add_clip_to_timeline",
+        serde_json::json!({ "asset_id": asset["id"], "source_in": 0.0, "source_out": 1.0 }),
+    );
+    let exported = answer(&call(
+        addr,
+        &on_session,
+        4,
+        "export",
+        serde_json::json!({ "output_path": "cut.wav", "options": { "container": "wav" } }),
+    ));
+    assert!(exported.get("output").is_some(), "{exported}");
+    let written = std::fs::read(ws.join("cut.wav")).unwrap();
+    let url = answer(&call(
+        addr,
+        &on_session,
+        5,
+        "file_url",
+        serde_json::json!({ "path": "cut.wav" }),
+    ));
+    assert_eq!(url["size"], written.len(), "{url}");
+    let (status, headers, body) = http(addr, "GET", "/files/cut.wav", &with_token, b"");
+    assert_eq!(status, 200);
+    assert_eq!(header(&headers, "content-type"), Some("audio/wav"));
+    assert_eq!(
+        header(&headers, "content-length").and_then(|l| l.parse().ok()),
+        Some(written.len())
+    );
+    assert_eq!(body, written, "the download is the file the export wrote");
     drop(child);
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -58,6 +58,9 @@ use ToolSet::*;
 pub(super) const TOOLS: &[(&str, &str, Effect, ToolSet)] = &[
     ("list_fonts", "List fonts", Read, Titles),
     ("import_asset", "Import media", Set, Core),
+    ("import_url", "Import media from a URL", Generate, Core),
+    ("list_files", "List workspace files", Read, Project),
+    ("file_url", "Workspace file URL", Read, Project),
     ("list_assets", "List assets", Read, Core),
     ("list_tags", "List tags", Read, Core),
     ("edit_asset_tags", "Tag assets", Set, Core),

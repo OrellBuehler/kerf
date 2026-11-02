@@ -71,7 +71,7 @@ impl ToolSet {
             ToolSet::Music => "Music structure, fitting and composing music, stems, snapping cuts to beats",
             ToolSet::Delivery => "Delivery format, smart crop, export, variants, cover, captions and interchange files",
             ToolSet::Tasks => "The user's task queue",
-            ToolSet::Project => "Open, create and save projects as, missing media, settings",
+            ToolSet::Project => "Open, create and save projects as, missing media, settings, workspace files",
         }
     }
 
