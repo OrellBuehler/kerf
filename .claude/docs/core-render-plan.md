@@ -423,8 +423,8 @@
   picture the `perspective` makes (no stage, no fit order, no placement), so `FormatResize`, `FullRangeResized`, `Geometry`'s chroma grid
   and `FoldedFit` are not its reasons. **A still whose placement is drawn** (`PlanLayer::fit: Some(FitCopy)`, `RenderPlan::fits_by_ffmpeg`:
   an `yuvj420p` or `rgb24` image with a moving zoom or position that is not the route above, nothing between its fit and the placement) has
-  **FFmpeg make the fit picture** (`FitCopy::filters`: the geometry's `crop` / `scale` / `crop` stages written out at the sizes
-  `layer_geometry` gives, the delivery's scaler flags; stamped by `for_render(size)`, and by the planner for an export frame, at the delivery
+  **FFmpeg make the fit picture** (`FitCopy::filters`: for a Cover frame fitted by one stage the engine's own text, `[crop=iw*..,]scale=W:H:force_original_aspect_ratio=increase,crop=W:H`, which names
+  no size of the picture's; else the geometry's `crop` / `scale` / `crop` stages written out at the sizes `layer_geometry` gives behind a guard `crop` that refuses a picture of another size; the delivery's scaler flags; stamped by `for_render(size)`, and by the planner for an export frame, at the delivery
   frame): the compositor's scaler and decode are not in play, so the resize of a full-range JPEG or an RGB picture, the scaler's one level and
   the chroma grid of the crop are FFmpeg's, and `PlacedFormat` (other layouts), `FullRangeResized`, `FormatResize`, `Shrink` and `Geometry`
   (chroma grid) are not its reasons; the full-range policy refusals of a placed layer remain. **A moving still that is neither** (an image with
