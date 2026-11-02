@@ -923,6 +923,9 @@ impl Compositor {
     ///   chain at the fit size, then `pad`, `perspective` and `crop` ([`kerf_core::perspective`], `placement.wgsl`);
     /// * `placed_chroma`: a 4:4:4 or 4:2:2 picture under a placement, **where this FFmpeg's `scale` converts it in a graph as the
     ///   decode does** ([`crate::conversion`], measured: not in [`Compositor::CAPS`]);
+    /// * `still_motion`: a still image on a Ken Burns move, for the kinds of picture (a JPEG, an RGB picture) **whose chains this
+    ///   FFmpeg was measured to draw as the model does** ([`crate::still_probe`], measured: not in [`Compositor::CAPS`]): FFmpeg makes the
+    ///   scaled copy or the fit picture, the compositor moves it ([`crate::source::copy_of`]);
     /// * `behaviors`: a live breath, drift or shake is the pose the plan evaluates, drawn by the same placement (a sway
     ///   or a spin turns the picture, which no pass draws to the sample: still refused);
     /// * `keyed_opacity`: an export frame's `geq` alpha, the value the plan evaluates

@@ -8341,6 +8341,26 @@ fn what_a_moving_still_is_not_drawn_for_is_refused() {
     }
 }
 
+/// A photograph whose EXIF orientation turns it: the probe reports its stored size and every decode comes out turned, so the sizes the
+/// plan makes the fit picture at are not the picture's. The copy opens with a `crop` of the probed size, which FFmpeg refuses on it.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_photograph_the_probe_saw_turned_is_not_fitted_to_the_wrong_size() {
+    let m = media();
+    let (w, h) = (m.exif.streams[0].width.unwrap(), m.exif.streams[0].height.unwrap());
+    let tl = timeline(
+        vec![vec![ken_burns(&m.exif, 0.0, 2.0, (1.0, (-0.03, 0.0)), (1.18, (0.03, -0.02)))]],
+        delivery(w, h, Fit::Cover),
+    );
+    check_refused(
+        "pan-off/exif orientation",
+        &tl,
+        std::slice::from_ref(&m.exif),
+        0.5,
+        Refusal::Render("probed as"),
+    );
+}
+
 /// A move that leaves the frame bare at its start (the photograph at the frame's size, panned off its edge) is not the moving still's
 /// route: the graph draws it as footage with a moving zoom, the picture fitted to the frame and then placed by the placement. The plan
 /// says which of the two it is, so the one is not mistaken for the other, and FFmpeg makes the fit picture the placement is laid from

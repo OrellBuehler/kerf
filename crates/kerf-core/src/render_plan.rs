@@ -1804,7 +1804,10 @@ impl RenderPlan {
         };
         let whole = |r: &crate::layer_geometry::Rect, w: u32, h: u32| r.x == 0 && r.y == 0 && r.w == w && r.h == h;
         let (mut w, mut h) = (layer.stream.width, layer.stream.height);
-        let mut filters: Vec<String> = Vec::new();
+        // The sizes are the probe's: a picture that decodes at another size (an EXIF orientation the probe did not apply) would be fitted by
+        // the graph to sizes of its own, so the copy opens with a `crop` of the probed size, which FFmpeg refuses on any picture that is smaller
+        // in either side (a turned one is) and which leaves every other alone.
+        let mut filters: Vec<String> = vec![format!("crop={w}:{h}:0:0")];
         for stage in &geom.stages {
             if !whole(&stage.src, w, h) {
                 filters.push(format!(
@@ -1820,9 +1823,6 @@ impl RenderPlan {
                 ));
             }
             (w, h) = (stage.keep.w, stage.keep.h);
-        }
-        if filters.is_empty() {
-            filters.push("null".into());
         }
         Some(FitCopy {
             filters: filters.join(","),
