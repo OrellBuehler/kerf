@@ -667,12 +667,11 @@ fn entry_key(asset: &Asset, plan: &Plan) -> String {
 /// `<cache>/kerf/filmstrips`, or `None` when the OS has no cache directory (the
 /// strip is then only memoized in process).
 fn cache_root() -> Option<PathBuf> {
-    Some(dirs::cache_dir()?.join("kerf").join("filmstrips"))
+    Some(crate::paths::cache_dir()?.join("kerf").join("filmstrips"))
 }
 
-/// Test-only: where `asset`'s strip is cached, so a test that built one in the
-/// real cache can clean up after itself.
-#[cfg(test)]
+/// Where `asset`'s strip is cached (a test that built one in the real cache cleans up after itself
+/// with it; the cache cap keeps it while the asset is in the open project).
 pub(crate) fn cached_entry_dir(asset: &Asset) -> Option<PathBuf> {
     let plan = Plan::for_asset(asset).ok()?;
     Some(cache_root()?.join(entry_key(asset, &plan)))
@@ -732,7 +731,9 @@ fn publish(work: &Path, dest: &Path, strip: &Filmstrip) -> std::io::Result<()> {
     if dest.exists() {
         std::fs::remove_dir_all(dest)?;
     }
-    std::fs::rename(work, dest)
+    std::fs::rename(work, dest)?;
+    crate::cache_cap::nudge();
+    Ok(())
 }
 
 /// Remove `.part` directories under `root` that a crashed build left behind.

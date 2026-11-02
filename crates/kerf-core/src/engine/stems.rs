@@ -59,7 +59,7 @@ const STEMS_VERSION: u32 = 1;
 // ---- provisioning ------------------------------------------------------------------
 
 fn model_path() -> Option<PathBuf> {
-    Some(dirs::cache_dir()?.join("kerf").join("models").join(MODEL_FILE))
+    Some(crate::paths::cache_dir()?.join("kerf").join("models").join(MODEL_FILE))
 }
 
 fn model_url() -> String {
@@ -111,10 +111,10 @@ pub fn status() -> StemsStatus {
 
 /// Where `src`'s stems are cached: `<cache>/kerf/stems/<hash>/`, keyed by the file's
 /// identity like the waveform cache.
-fn stems_dir(src: &Path) -> Option<PathBuf> {
+pub(super) fn stems_dir(src: &Path) -> Option<PathBuf> {
     let key = format!("{}|stems-v{STEMS_VERSION}", source_key(src));
     Some(
-        dirs::cache_dir()?
+        crate::paths::cache_dir()?
             .join("kerf")
             .join("stems")
             .join(format!("{:016x}", fnv1a(&key))),
@@ -142,6 +142,13 @@ fn encode_flac(wav: &Path, flac: &Path) -> Result<()> {
 /// [`STEM_NAMES`] order), downloading the runtime and model on first use. Cached per
 /// source file. Reports `download_runtime` / `download_model` / `separate` / `encode`.
 pub fn separate(path: &Path, progress: &mut Report, cancel: &dyn Fn() -> bool) -> Result<Vec<PathBuf>> {
+    let outs = separate_into_cache(path, progress, cancel);
+    // The folder has grown whether or not the run finished (a cancelled one leaves its finished stems).
+    crate::cache_cap::nudge();
+    outs
+}
+
+fn separate_into_cache(path: &Path, progress: &mut Report, cancel: &dyn Fn() -> bool) -> Result<Vec<PathBuf>> {
     let dir = stems_dir(path).ok_or_else(|| Error::Engine("no cache directory available for stems".into()))?;
     let outs: Vec<PathBuf> = STEM_NAMES.iter().map(|n| dir.join(format!("{n}.flac"))).collect();
     if outs.iter().all(|p| p.is_file()) {

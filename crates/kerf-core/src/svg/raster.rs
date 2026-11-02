@@ -321,7 +321,7 @@ pub fn root() -> PathBuf {
 
 fn resolve_root() -> PathBuf {
     let pid = std::process::id();
-    let bases = dirs::cache_dir()
+    let bases = crate::paths::cache_dir()
         .map(|d| d.join("kerf").join("svg"))
         .into_iter()
         .chain(std::iter::once_with(|| fonts::private_dir_named(&std::env::temp_dir(), "kerf-svg")).flatten());

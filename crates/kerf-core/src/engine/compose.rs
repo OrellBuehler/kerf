@@ -67,7 +67,12 @@ pub fn soundfont_url() -> String {
 
 /// Where the SoundFont is kept: `<cache>/kerf/soundfonts/GeneralUser-GS-v2.0.3.sf2`.
 pub fn soundfont_path() -> Option<PathBuf> {
-    Some(dirs::cache_dir()?.join("kerf").join("soundfonts").join(SOUNDFONT_NAME))
+    Some(
+        crate::paths::cache_dir()?
+            .join("kerf")
+            .join("soundfonts")
+            .join(SOUNDFONT_NAME),
+    )
 }
 
 /// Where composed music is written: the *data* directory, because this file is the only copy of

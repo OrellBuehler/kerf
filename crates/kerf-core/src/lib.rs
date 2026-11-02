@@ -6,6 +6,7 @@
 //! timeline (EDL), and the operations that mutate it.
 
 pub mod analysis;
+pub mod cache_cap;
 pub mod captions_export;
 pub mod captions_import;
 mod clip_timing;

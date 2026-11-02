@@ -41,7 +41,8 @@ working towards a result that would be dropped is killed instead of finishing.
 stop that arrives before its start, and a reloaded page whose counter restarted at 1 all resolve by comparison.
 
 **Headless mode** (`headless.rs`, `shell.rs`). `kerf-app --headless [--stdio [--tools SETS]] [--project x.kerf | --new-project x.kerf]
-[--mcp-addr ADDR] [--data-dir DIR] [--token-file PATH] [--show-token] [--review] [--proxies] [--cpu-percent N]` runs the MCP
+[--mcp-addr ADDR] [--data-dir DIR] [--token-file PATH] [--show-token] [--review] [--proxies] [--cpu-percent N]
+[--cache-dir DIR] [--cache-max-gb N]` runs the MCP
 server with no display and no webview: `main.rs` calls `headless_main()` before `run()`, which builds no Tauri app (tao
 initialises GTK and panics with no display) and runs on `tauri::async_runtime` with a `Shell::Headless` in place of the
 `AppHandle` — so **code the MCP server reaches takes a `Shell` or `&impl Host`, never an `AppHandle`**. On Linux the binary
@@ -51,7 +52,21 @@ desktop app's config / data dirs for the build's identifier (`context()`, the on
 `.dev`), or `--data-dir` for settings, logs and recovery alike (CI isolation). No single-instance plugin: a taken port exits
 3 (`port in use … --mcp-addr`), and two runs sharing a settings file can race to make the first token (use `--data-dir` or
 `KERF_MCP_TOKEN`). In memory only: review off unless `--review`, proxies off (`PreviewSource::Original`) unless `--proxies`,
-`--cpu-percent`. No GPU preview, crash marker, reveal failsafe or launch slot. **stdout** is one JSON ready line once the
+`--cpu-percent`. **Disk caches** (both off by default; the desktop app has neither): `--cache-dir DIR` (`KERF_CACHE_DIR`)
+puts every cache under `DIR/kerf/…` instead of the OS cache dir (`paths::set_cache_dir`, set before logging or any thread
+reads it; created, exit 2 if it cannot be) so a hosted server can keep them on a chosen volume — **that moves the
+downloads too** (`models/`, `runtime/`, `soundfonts/`), so a fresh directory downloads them again on first use;
+`--cache-max-gb N`
+(`KERF_CACHE_MAX_GB`, a number of GiB above 0, a fraction is fine, the flag wins, exit 2 otherwise) starts
+`kerf_core::cache_cap::start` after the project is open — least-recently-used proxies, waveforms, filmstrips, stems and music
+analyses are pruned at start, every 10 min and after a proxy build, an analysis, a stems separation, a waveform or a filmstrip
+write, keeping the open project's assets' files (a stem asset's own file included), anything being written and the downloaded
+models (`core-project.md` has the inventory and the rules); a stale `.part` goes only while over the cap; it logs what it freed
+and warns once when the kept part alone is over the cap, and skips (warning once) a pass that cannot read the assets or find an
+original. A cap that cannot be kept — no cache directory (checked before anything opens), a thread that will not start — is exit 2,
+not a run without it. **Only this process's project is protected: do not point a desktop app or a second server at the
+same cache directory.** `stitched/` is not covered.
+No GPU preview, crash marker, reveal failsafe or launch slot. **stdout** is one JSON ready line once the
 listener is up — `{"kerf":"listening","url","addr","pid","project","agent_review","token_source":"env|settings|generated"}`
 — and `--help`; logs go to **stderr** (`init_logging(dir, to_stderr)`) and `<data>/logs`. The token is never printed unless
 `--show-token` (stderr, past the log file); `--token-file` writes it atomically with mode 0600; otherwise a stderr banner names
@@ -68,7 +83,8 @@ file as a non-terminal stdout (`2>&1`, `same_file`: fstat device + inode) is ref
 `initialize`) or a signal ends it with the same shutdown, exit 0; a first signal during an EOF shutdown lets it finish, a
 second exits 130.
 Release Windows builds are `windows_subsystem = "windows"`: pipes work, an interactive console shows nothing.
-`tests/headless.rs` drives the real binary (no `DISPLAY`): ready line, 401 / 200 / 202, two tools, SIGTERM → 0.
+`tests/headless.rs` drives the real binary (no `DISPLAY`): ready line, 401 / 200 / 202, two tools, SIGTERM → 0; a capped run
+prunes an aged cache in its `--cache-dir` and leaves models, `stitched/` and a fresh `.part` alone; a bad ceiling is exit 2.
 
 **Process start.** `use_bundled_ffmpeg()` sets `KERF_FFMPEG` / `KERF_FFPROBE` and is the **first statement of `run()`**,
 before the runtime, the webview or any thread exists (`set_var` races every concurrent read of the environment);

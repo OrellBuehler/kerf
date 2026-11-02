@@ -387,8 +387,8 @@ const CACHE_VERSION: u32 = 1;
 
 /// Where `src`'s music analysis is cached: `<cache>/kerf/music/<hash>.json`, keyed by
 /// the file's identity (path, size, mtime) like the waveform cache.
-fn cache_path(src: &Path) -> Option<PathBuf> {
-    let dir = dirs::cache_dir()?.join("kerf").join("music");
+pub(super) fn cache_path(src: &Path) -> Option<PathBuf> {
+    let dir = crate::paths::cache_dir()?.join("kerf").join("music");
     let key = format!("{}|music-v{CACHE_VERSION}", source_key(src));
     Some(dir.join(format!("{:016x}.json", fnv1a(&key))))
 }

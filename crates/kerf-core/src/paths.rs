@@ -7,8 +7,23 @@
 //! surface. Pure apart from the filesystem lookups, and unit-tested.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use crate::error::{Error, Result};
+
+static CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
+
+/// Keep every cache under `dir` (`<dir>/kerf/proxies`, `<dir>/kerf/waveforms`, …) instead of the
+/// operating system's cache directory: a hosted run puts them on a volume of its choosing. Set once,
+/// before anything reads [`cache_dir`] (the first call wins; `false` when one was already set).
+pub fn set_cache_dir(dir: PathBuf) -> bool {
+    CACHE_DIR.set(dir).is_ok()
+}
+
+/// The directory Kerf's caches live under: [`set_cache_dir`]'s, else the operating system's.
+pub fn cache_dir() -> Option<PathBuf> {
+    CACHE_DIR.get().cloned().or_else(dirs::cache_dir)
+}
 
 /// Whether `s` starts with something FFmpeg would read as a protocol: a scheme of two or
 /// more letters, digits, `+`, `-` or `.` followed by `:`. A single letter is a Windows

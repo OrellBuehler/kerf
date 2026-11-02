@@ -150,7 +150,7 @@ pub fn validate_voice(voice: &str) -> Result<()> {
 // ---- where things live -------------------------------------------------------
 
 fn model_dir() -> Option<PathBuf> {
-    Some(dirs::cache_dir()?.join("kerf").join("models").join("kokoro"))
+    Some(crate::paths::cache_dir()?.join("kerf").join("models").join("kokoro"))
 }
 
 fn model_path() -> Option<PathBuf> {
@@ -275,7 +275,7 @@ fn runtime_override() -> Option<PathBuf> {
 
 fn runtime_path(spec: &RuntimeSpec) -> Option<PathBuf> {
     Some(
-        dirs::cache_dir()?
+        crate::paths::cache_dir()?
             .join("kerf")
             .join("runtime")
             .join(format!("onnxruntime-{}", spec.version))

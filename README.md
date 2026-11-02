@@ -157,6 +157,10 @@ KERF_MCP_TOKEN=<32+ chars> kerf-app --headless --mcp-addr 127.0.0.1:7777 [--proj
 
 It prints one JSON line on stdout once it listens and stops on SIGINT / SIGTERM; edits land live
 unless `--review`. `kerf-app --headless --help` lists the flags (`--data-dir`, `--token-file`, …).
+On a server, `--cache-dir DIR` keeps the caches on a volume of your choosing and `--cache-max-gb N` keeps the
+regenerable ones (proxies, waveforms, filmstrips, stems) under N GiB, least recently used first; what the open project
+uses and the downloaded models are never removed. `--cache-dir` moves the model downloads too, and the cap protects only the
+project this server has open: give each server its own cache directory, and do not share one with the desktop app.
 
 ### Use as a stdio MCP server (Claude Code plugin, any client that launches its server)
 

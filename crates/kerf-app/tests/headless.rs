@@ -425,3 +425,109 @@ fn stdio_with_an_http_flag_is_a_usage_error_and_prints_nothing_on_stdout() {
     assert!(String::from_utf8_lossy(&help.stderr).contains("--stdio"));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+fn aged_file(path: &std::path::Path, bytes: usize, age: Duration) {
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, vec![1u8; bytes]).unwrap();
+    let when = std::time::SystemTime::now() - age;
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_accessed(when).set_modified(when))
+        .unwrap();
+}
+
+#[test]
+fn a_capped_headless_run_prunes_the_regenerable_caches_in_its_cache_dir_and_nothing_else() {
+    let dir = std::env::temp_dir().join(format!("kerf-headless-cap-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let cache = dir.join("volume");
+    let week = Duration::from_secs(7 * 86400);
+    let idle = [
+        cache.join("kerf/stems/s1/vocals.flac"),
+        cache.join("kerf/waveforms/w1.bin"),
+        cache.join("kerf/proxies/aaaa.mp4"),
+        cache.join("kerf/proxies/aaaa.json"),
+    ];
+    for file in &idle {
+        aged_file(file, 5000, 2 * week);
+    }
+    let kept = [
+        cache.join("kerf/models/ggml-base.bin"),
+        cache.join("kerf/stitched/lens.mp4"),
+        cache.join("kerf/proxies/bbbb.4242.0.part"),
+    ];
+    aged_file(&kept[0], 5000, 9 * week);
+    aged_file(&kept[1], 5000, 9 * week);
+    aged_file(&kept[2], 5000, Duration::from_secs(5));
+
+    let log = std::fs::File::create(dir.join("stderr.log")).unwrap();
+    let mut child = Running(
+        Command::new(env!("CARGO_BIN_EXE_kerf-app"))
+            .args(["--headless", "--mcp-addr", "127.0.0.1:0", "--cache-max-gb", "0.000001"])
+            .arg("--data-dir")
+            .arg(dir.join("data"))
+            .arg("--cache-dir")
+            .arg(&cache)
+            .env("KERF_MCP_TOKEN", "c".repeat(48))
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
+            .env_remove("KERF_MCP_ADDR")
+            .env_remove("KERF_CACHE_MAX_GB")
+            .env_remove("KERF_CACHE_DIR")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(log)
+            .spawn()
+            .expect("spawn kerf-app"),
+    );
+    let stderr = || std::fs::read_to_string(dir.join("stderr.log")).unwrap_or_default();
+    let stdout = child.0.stdout.take().unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut line = String::new();
+        let _ = BufReader::new(stdout).read_line(&mut line);
+        let _ = tx.send(line);
+    });
+    rx.recv_timeout(Duration::from_secs(120))
+        .unwrap_or_else(|_| panic!("no ready line; stderr:\n{}", stderr()));
+
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while idle.iter().any(|f| f.exists()) {
+        assert!(
+            Instant::now() < deadline,
+            "the idle caches were not pruned; stderr:\n{}",
+            stderr()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    for file in &kept {
+        assert!(file.exists(), "{} must stay", file.display());
+    }
+    let text = stderr();
+    assert!(text.contains("pruned the cache"), "{text}");
+    assert!(text.contains(&cache.display().to_string()), "the cache dir is logged: {text}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn a_bad_cache_ceiling_is_a_usage_error() {
+    for (args, var) in [(vec!["--cache-max-gb", "0"], None), (vec![], Some("plenty"))] {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_kerf-app"));
+        command
+            .arg("--headless")
+            .args(&args)
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
+            .env_remove("KERF_CACHE_MAX_GB")
+            .stdin(Stdio::null());
+        if let Some(var) = var {
+            command.env("KERF_CACHE_MAX_GB", var);
+        }
+        let out = command.output().expect("run kerf-app");
+        assert_eq!(out.status.code(), Some(2), "{args:?} {var:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("takes a number of GiB above 0"), "{stderr}");
+    }
+}
