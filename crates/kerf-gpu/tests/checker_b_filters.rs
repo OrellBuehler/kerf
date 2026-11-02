@@ -11006,3 +11006,533 @@ fn checker_b_r5_hostile_sizes_are_judged_in_64_bits_and_refused() {
     eprintln!("== hostile sizes judged: {cases} plans, {refused_blur} refused for the thumbnail");
     assert!(cases > 100, "too few plans: {cases}");
 }
+
+// ---- round six (a6797cfa): a dip refused for a full-range picture and under invert / vignette, a mixed cut refused whole --------------
+//
+// The two new `DipWhy` reasons and the mixed-cut push, at their boundaries: the effect lists they read, the clip they sit on, the range
+// a picture is flagged, a still's ramp. Every drawn frame is held to the export's planes as before.
+
+/// The reason a dip to white on a `pc` flagged `yuv420p` gives.
+const R6_FULL_RANGE: &str = "round trip converts in that range";
+
+/// ... under an `invert` or a `vignette`.
+const R6_RGB_EFFECT: &str = "under an invert or a vignette";
+
+type R6Effects = Vec<kerf_core::VideoEffect>;
+
+/// The effect lists of the cases: none, the YUV effects alone and stacked, `invert` and `vignette` alone, together, and in every
+/// order beside the YUV ones (FFmpeg's negotiation decides per filter, so a list is not the same as its members).
+fn r6_effect_lists() -> Vec<(&'static str, R6Effects)> {
+    use kerf_core::VideoEffect as E;
+    let (blur, sharpen, gray) = (E::Blur { sigma: 1.5 }, E::Sharpen { amount: 0.8 }, E::Grayscale);
+    vec![
+        ("none", vec![]),
+        ("blur", vec![blur.clone()]),
+        ("sharpen", vec![sharpen.clone()]),
+        ("grayscale", vec![gray.clone()]),
+        ("blur+sharpen+grayscale", vec![blur.clone(), sharpen.clone(), gray.clone()]),
+        ("invert", vec![E::Invert]),
+        ("vignette", vec![E::Vignette]),
+        ("invert+vignette", vec![E::Invert, E::Vignette]),
+        ("vignette+invert", vec![E::Vignette, E::Invert]),
+        ("blur+invert", vec![blur.clone(), E::Invert]),
+        ("invert+blur", vec![E::Invert, blur.clone()]),
+        ("sharpen+vignette", vec![sharpen.clone(), E::Vignette]),
+        ("vignette+sharpen", vec![E::Vignette, sharpen.clone()]),
+        ("grayscale+invert", vec![gray.clone(), E::Invert]),
+        ("invert+grayscale", vec![E::Invert, gray]),
+        ("blur+sharpen+vignette", vec![blur.clone(), sharpen.clone(), E::Vignette]),
+        ("invert+sharpen+blur", vec![E::Invert, sharpen, blur]),
+    ]
+}
+
+fn r6_has_rgb_effect(list: &R6Effects) -> bool {
+    use kerf_core::VideoEffect as E;
+    list.iter().any(|e| matches!(e, E::Invert | E::Vignette))
+}
+
+/// A dip to white with every effect list on the clip that comes in through it, on the clip that leaves through it, on both, on a
+/// clip two places away from it, and on a lower track under it. A list with an `invert` or a `vignette` in it refuses the dip on
+/// every frame of the clip that carries it and on that clip only; one without is drawn, as is a clip beside the dip that is not in it.
+/// Every drawn frame is the export's (a blur or sharpen adds the effect's own ladder of a level in a sample or two, no more).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_b_r6_dip_to_white_under_effect_lists() {
+    let mut fam = Family::default();
+    let mut judged = 0;
+    for tag in [Tag::None, Tag::Bt709] {
+        let (Some(a), Some(b), Some(e), Some(under)) = (
+            R5Src::new("yuv420p", 96, 54).tag(tag).seed(1).make(),
+            R5Src::new("yuv420p", 96, 54).tag(tag).seed(2).make(),
+            R5Src::new("yuv420p", 96, 54).tag(tag).seed(3).make(),
+            R5Src::new("yuv420p", 96, 54).tag(tag).seed(4).secs(1.6).make(),
+        ) else {
+            return;
+        };
+        for (label, list) in r6_effect_lists() {
+            let rgb = r6_has_rgb_effect(&list);
+            let with = |mut c: Clip| {
+                c.effects = list.clone();
+                c
+            };
+            // (placement, the cut, seconds, how many frames of the cut the dip's clip with the list is in; 0 for none)
+            let cuts: Vec<(&str, Timeline, f64, usize)> = vec![
+                (
+                    "incoming",
+                    timeline(
+                        vec![vec![
+                            clip(&a, 0.0, 0.8, 0.0),
+                            dissolve_into(with(clip(&b, 0.0, 0.8, 0.8)), TransitionKind::DipToWhite, 0.4),
+                        ]],
+                        None,
+                    ),
+                    1.6,
+                    12,
+                ),
+                (
+                    "outgoing",
+                    timeline(
+                        vec![vec![
+                            with(clip(&a, 0.0, 0.8, 0.0)),
+                            dissolve_into(clip(&b, 0.0, 0.8, 0.8), TransitionKind::DipToWhite, 0.4),
+                        ]],
+                        None,
+                    ),
+                    1.6,
+                    12,
+                ),
+                (
+                    "both",
+                    timeline(
+                        vec![vec![
+                            with(clip(&a, 0.0, 0.8, 0.0)),
+                            dissolve_into(with(clip(&b, 0.0, 0.8, 0.8)), TransitionKind::DipToWhite, 0.4),
+                        ]],
+                        None,
+                    ),
+                    1.6,
+                    24,
+                ),
+                (
+                    "two places away",
+                    timeline(
+                        vec![vec![
+                            with(clip(&e, 0.0, 0.8, 0.0)),
+                            clip(&a, 0.0, 0.8, 0.8),
+                            dissolve_into(clip(&b, 0.0, 0.8, 1.6), TransitionKind::DipToWhite, 0.4),
+                        ]],
+                        None,
+                    ),
+                    2.4,
+                    0,
+                ),
+                (
+                    "lower track",
+                    timeline(
+                        vec![
+                            vec![with(clip(&under, 0.0, 1.6, 0.0))],
+                            vec![
+                                clip(&a, 0.0, 0.8, 0.0),
+                                dissolve_into(clip(&b, 0.0, 0.8, 0.8), TransitionKind::DipToWhite, 0.4),
+                            ],
+                        ],
+                        None,
+                    ),
+                    1.6,
+                    0,
+                ),
+            ];
+            for (place, tl, secs, frames_with_list) in cuts {
+                let case = format!("checker/b/r6/effects {label} {place} {tag:?}");
+                let Some(out) = sweep_try(&case, &tl, &dedup(&[&a, &b, &e, &under]), 15.0, secs) else {
+                    continue;
+                };
+                judged += 1;
+                let ladder = list.iter().any(|x| {
+                    matches!(
+                        x,
+                        kerf_core::VideoEffect::Blur { .. } | kerf_core::VideoEffect::Sharpen { .. }
+                    )
+                }) && out
+                    .bad
+                    .iter()
+                    .all(|f| f.planes.iter().all(|p| p.max <= 1 && p.differing <= 8));
+                if ladder && !out.bad.is_empty() {
+                    fam.add_known_ladder(&case, &out);
+                } else {
+                    fam.add(&case, &out);
+                }
+                let n = out.refused_for(R6_RGB_EFFECT);
+                let wrong = if rgb && frames_with_list > 0 {
+                    n + 1 < frames_with_list
+                } else {
+                    n != 0
+                };
+                if wrong && !patched_out() {
+                    fam.failures.push(format!(
+                        "{case}: {n} frames refused \"{R6_RGB_EFFECT}\", expected {} ({:?})",
+                        if rgb && frames_with_list > 0 {
+                            format!("at least {}", frames_with_list - 1)
+                        } else {
+                            "none".to_string()
+                        },
+                        out.reasons
+                            .keys()
+                            .map(|r| r.chars().take(90).collect::<String>())
+                            .collect::<Vec<_>>()
+                    ));
+                }
+            }
+        }
+    }
+    assert!(judged > 120, "too few cases could be made: {judged}");
+    fam.finish("dip to white under effect lists");
+}
+
+/// The same lists in a still: the dip is a filter of the still's chain while the fade runs only, so the clip with the list is refused
+/// at the times its ramp is in (once for the outgoing clip's, once for the incoming's) and drawn, exactly, before and after.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_b_r6_still_dip_to_white_under_effect_lists() {
+    let mut fam = Family::default();
+    let (Some(a), Some(b)) = (
+        R5Src::new("yuv420p", 128, 72).seed(1).make(),
+        R5Src::new("yuv420p", 128, 72).seed(2).make(),
+    ) else {
+        return;
+    };
+    let times = [0.1, 0.3, 0.45, 0.7];
+    for (label, list) in r6_effect_lists() {
+        let rgb = r6_has_rgb_effect(&list);
+        for (place, on_second) in [("incoming", true), ("outgoing", false)] {
+            let mut first = clip(&a, 0.0, 0.4, 0.0);
+            let mut second = clip(&b, 0.0, 0.8, 0.4);
+            if on_second {
+                second.effects = list.clone();
+            } else {
+                first.effects = list.clone();
+            }
+            let tl = timeline(
+                vec![vec![first, dissolve_into(second, TransitionKind::DipToWhite, 0.3)]],
+                None,
+            );
+            let case = format!("checker/b/r6/still effects {label} {place}");
+            let out = r4_still(&case, &tl, &dedup(&[&a, &b]), &ExportOptions::default(), &times);
+            // (A blur or sharpen carries the effect's own ladder, seen without any dip: a level in a sample or two.)
+            let ladder = list.iter().any(|x| {
+                matches!(
+                    x,
+                    kerf_core::VideoEffect::Blur { .. } | kerf_core::VideoEffect::Sharpen { .. }
+                )
+            }) && out.bad.iter().all(|(_, p)| p.iter().all(|d| d.max <= 1 && d.differing <= 8));
+            if ladder && !out.bad.is_empty() {
+                eprintln!(
+                    "   known ladder (the effect's own, not the dip): {case}: {} stills differ by a level",
+                    out.bad.len()
+                );
+                fam.cases += 1;
+                fam.drawn += out.drawn;
+            } else {
+                fam.add_r4(&case, &out);
+            }
+            let n = out.refused_for(R6_RGB_EFFECT);
+            let want = usize::from(rgb);
+            if n != want && !patched_out() {
+                fam.failures.push(format!(
+                    "{case}: {n} of {} stills refused \"{R6_RGB_EFFECT}\", expected {want} ({:?})",
+                    out.times, out.reasons
+                ));
+            }
+        }
+    }
+    fam.finish("still dip to white under effect lists");
+}
+
+/// A dip to white between pictures flagged `tv`, `pc` and not at all, both orders, over two tags, in an export: a `pc` picture is
+/// refused on every frame of its clip (the one leaving through the dip as much as the one coming in), a `tv` or unflagged one is
+/// not; every drawn frame is the export's. (The files really carry the flag: the media is left out where the probe does not say so.)
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_b_r6_dip_to_white_full_range_boundary() {
+    let mut fam = Family::default();
+    let mut judged = 0;
+    let ranges: [Option<&str>; 3] = [Some("tv"), Some("pc"), None];
+    for tag in [Tag::None, Tag::Bt709, Tag::Smpte170m] {
+        for ra in ranges {
+            for rb in ranges {
+                let make = |range: Option<&str>, seed| {
+                    let mut s = R5Src::new("yuv420p", 64, 36).tag(tag).seed(seed);
+                    if let Some(r) = range {
+                        s = s.range(r);
+                    }
+                    s.make()
+                };
+                let (Some(a), Some(b)) = (make(ra, 1), make(rb, 2)) else {
+                    continue;
+                };
+                let tl = r5_pair(&a, &b, TransitionKind::DipToWhite, 0.4, 0.8, None);
+                let case = format!("checker/b/r6/range {ra:?} then {rb:?} {tag:?}");
+                let Some(out) = sweep_try(&case, &tl, &dedup(&[&a, &b]), 15.0, 1.6) else {
+                    continue;
+                };
+                judged += 1;
+                fam.add(&case, &out);
+                let (pa, pb) = (ra == Some("pc"), rb == Some("pc"));
+                let n = out.refused_for(R6_FULL_RANGE);
+                let want = 11 * (usize::from(pa) + usize::from(pb));
+                if ((want == 0 && n != 0) || (want > 0 && n < want)) && !patched_out() {
+                    fam.failures.push(format!(
+                        "{case}: {n} frames refused \"{R6_FULL_RANGE}\", expected {} ({:?})",
+                        if want == 0 {
+                            "none".to_string()
+                        } else {
+                            format!("at least {want}")
+                        },
+                        out.reasons
+                            .keys()
+                            .map(|r| r.chars().take(90).collect::<String>())
+                            .collect::<Vec<_>>()
+                    ));
+                }
+            }
+        }
+    }
+    assert!(judged > 12, "too few cases could be made: {judged}");
+    fam.finish("dip to white, full-range boundary");
+}
+
+/// The same in a still: the full-range picture is refused while its ramp is in, and not before or after (no round trip then). Drawn
+/// stills are held to FFmpeg's planes where the build converts the range at the decode (FFmpeg 6); on a build that negotiates, a
+/// full-range still has full-range planes and only the plan's verdict is judged.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_b_r6_still_dip_to_white_full_range_boundary() {
+    let mut fam = Family::default();
+    let times = [0.1, 0.3, 0.45, 0.7];
+    for (ra, rb) in [("pc", "tv"), ("tv", "pc"), ("pc", "pc"), ("tv", "tv")] {
+        let (Some(a), Some(b)) = (
+            R5Src::new("yuv420p", 64, 36).range(ra).seed(1).secs(0.8).make(),
+            R5Src::new("yuv420p", 64, 36).range(rb).seed(2).secs(0.8).make(),
+        ) else {
+            continue;
+        };
+        let tl = timeline(
+            vec![vec![
+                clip(&a, 0.0, 0.4, 0.0),
+                dissolve_into(clip(&b, 0.0, 0.8, 0.4), TransitionKind::DipToWhite, 0.3),
+            ]],
+            None,
+        );
+        let case = format!("checker/b/r6/still range {ra} then {rb}");
+        // The plan's verdict at each time, whatever the build.
+        let mut refused_at = Vec::new();
+        for &t in &times {
+            let plan = kerf_core::RenderPlan::at(&tl, &dedup(&[&a, &b]), &ExportOptions::default(), t, policy()).expect("plan");
+            let why: Vec<String> = plan
+                .reasons(&compositor().caps(), plan.size(u32::MAX))
+                .iter()
+                .map(ToString::to_string)
+                .collect();
+            refused_at.push(why.iter().any(|r| r.contains(R6_FULL_RANGE)));
+        }
+        // t = 0.1: nothing fades; 0.3: the first clip's ramp; 0.45: the second's; 0.7: nothing.
+        let want = [false, ra == "pc", rb == "pc", false];
+        if refused_at != want && !patched_out() {
+            fam.failures.push(format!(
+                "{case}: refused for the range at {times:?}: {refused_at:?}, expected {want:?}"
+            ));
+        }
+        if !negotiates() {
+            let out = r4_still(&case, &tl, &dedup(&[&a, &b]), &ExportOptions::default(), &times);
+            fam.add_r4(&case, &out);
+        }
+        fam.cases += 1;
+    }
+    fam.finish_refusing("still dip to white, full-range boundary");
+}
+
+/// `invert` and `vignette` beside a colour correction (`eq`, which lists no RGB format) on the clip that dips: FFmpeg's negotiation keeps
+/// the run of filters between the fit `scale` and the `fade` in the YUV when one of them takes no RGB, so an effect that could run in
+/// RGB does not. The plan's refusal reads the effect alone; every frame it draws is the export's, and with the refusal off (a run with
+/// `KERF_CHECKER_ALLOW`) these show whether it is wider than it has to be.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_b_r6_dip_to_white_under_invert_or_vignette_beside_an_eq() {
+    use kerf_core::VideoEffect as E;
+    let mut fam = Family::default();
+    let mut judged = 0;
+    let eq = Color {
+        contrast: 1.15,
+        saturation: 1.1,
+        ..Color::default()
+    };
+    let (Some(a), Some(b)) = (
+        R5Src::new("yuv420p", 96, 54).seed(1).make(),
+        R5Src::new("yuv420p", 96, 54).seed(2).make(),
+    ) else {
+        return;
+    };
+    for (label, list) in [
+        ("invert", vec![E::Invert]),
+        ("vignette", vec![E::Vignette]),
+        ("invert+vignette", vec![E::Invert, E::Vignette]),
+    ] {
+        for (with_eq, name) in [(false, "alone"), (true, "beside an eq")] {
+            let mut incoming = clip(&b, 0.0, 0.8, 0.8);
+            incoming.effects = list.clone();
+            if with_eq {
+                incoming.color = eq;
+            }
+            let tl = timeline(
+                vec![vec![
+                    clip(&a, 0.0, 0.8, 0.0),
+                    dissolve_into(incoming, TransitionKind::DipToWhite, 0.4),
+                ]],
+                None,
+            );
+            let case = format!("checker/b/r6/eq {label} {name}");
+            let Some(out) = sweep_try(&case, &tl, &dedup(&[&a, &b]), 15.0, 1.6) else {
+                continue;
+            };
+            judged += 1;
+            fam.add(&case, &out);
+            if out.refused_for(R6_RGB_EFFECT) < 11 && !patched_out() {
+                fam.failures.push(format!(
+                    "{case}: {} frames refused \"{R6_RGB_EFFECT}\", expected at least 11",
+                    out.refused_for(R6_RGB_EFFECT)
+                ));
+            }
+        }
+    }
+    assert!(judged >= 6, "too few cases could be made: {judged}");
+    fam.finish("dip to white under invert or vignette beside an eq");
+}
+
+/// A cut of mixed matrices is refused on **every frame** by a compositor whose conversion is not measured (`Differs` or `Unknown`
+/// pinned), the deciding clip's frames included; a cut of one matrix is not refused for it; a build with a fixed composite (6.1.1)
+/// has no mixed cut to refuse. Judged on the plans, frame by frame, over three-clip shapes and every arrangement of three tags.
+#[test]
+#[ignore = "needs ffmpeg (clips to plan)"]
+fn checker_b_r6_a_mixed_cut_is_refused_on_every_frame_without_a_measured_conversion() {
+    use kerf_gpu::convert::Kernels as Convert;
+    let opts = at_fps(15.0);
+    let measured = Compositor::caps_for(
+        kerf_gpu::grade::Kernels::Match,
+        kerf_gpu::scaler::kernels(),
+        kerf_gpu::convert::kernels(),
+    );
+    let pinned = [
+        (
+            "differs",
+            Compositor::caps_for(
+                kerf_gpu::grade::Kernels::Match,
+                kerf_gpu::scaler::kernels(),
+                Convert::Differs("rehearsed"),
+            ),
+        ),
+        (
+            "unknown",
+            Compositor::caps_for(kerf_gpu::grade::Kernels::Match, kerf_gpu::scaler::kernels(), Convert::Unknown),
+        ),
+    ];
+    assert!(!pinned[0].1.matrix_convert && !pinned[1].1.matrix_convert);
+    let tags = [Tag::None, Tag::Bt709, Tag::Bt2020];
+    let shapes: [(&str, [Route; 3]); 7] = [
+        ("plain alpha plain", [Route::Plain, Route::AlphaSource, Route::Plain]),
+        ("plain crossfade plain", [Route::Plain, Route::Crossfade, Route::Plain]),
+        ("plain keyedpos plain", [Route::Plain, Route::KeyedPos, Route::Plain]),
+        ("alpha plain plain", [Route::AlphaSource, Route::Plain, Route::Plain]),
+        ("plain plain alpha", [Route::Plain, Route::Plain, Route::AlphaSource]),
+        ("crossfade alpha plain", [Route::Crossfade, Route::AlphaSource, Route::Plain]),
+        ("plain pip plain", [Route::Plain, Route::Pip, Route::Plain]),
+    ];
+    let (mut mixed_cuts, mut mixed_frames, mut single_cuts) = (0, 0, 0);
+    let mut wrong: Vec<String> = Vec::new();
+    for (label, routes) in shapes {
+        let mut arrangements: Vec<[Tag; 3]> = Vec::new();
+        for &x in &tags {
+            for &y in &tags {
+                for &z in &tags {
+                    arrangements.push([x, y, z]);
+                }
+            }
+        }
+        for ts in arrangements {
+            let mut clips = Vec::new();
+            let mut assets = Vec::new();
+            for (i, (&r, &t)) in routes.iter().zip(&ts).enumerate() {
+                let (c, a) = routed(r, t, Pat::Noise, 0.7 * i as f64);
+                clips.push(c);
+                assets.push(a);
+            }
+            let refs: Vec<&Asset> = assets.iter().collect();
+            let assets = dedup(&refs);
+            let tl = timeline(vec![clips], None);
+            let planner = Planner::new(&tl, &assets, &opts, PlanRequest::motion(policy())).expect("planner");
+            let mixed = ts.iter().any(|&t| !same_matrix(t, ts[0]));
+            let frames = (2.1f64 * 15.0).floor() as u64;
+            for k in 0..frames {
+                let plan = planner.at_frame(k).expect("plan");
+                let size = plan.size(u32::MAX);
+                let has_layers = !plan.layers.is_empty();
+                let is_mixed = plan.canvas.mixed_matrices_cut;
+                if is_mixed != (mixed && negotiates()) && has_layers && negotiates() {
+                    wrong.push(format!(
+                        "{label} {ts:?} frame {k}: the plan says mixed_matrices_cut {is_mixed}, the tags say {mixed}"
+                    ));
+                }
+                for (name, caps) in &pinned {
+                    let why = plan.reasons(caps, size);
+                    let pushed = why.iter().any(|u| matches!(u, kerf_core::Unsupported::MixedMatrices));
+                    if negotiates() && mixed && has_layers {
+                        mixed_frames += 1;
+                        if !pushed {
+                            wrong.push(format!(
+                                "{label} {ts:?} frame {k} ({name}): a mixed cut's frame is not refused whole: {:?}",
+                                why.iter().map(ToString::to_string).collect::<Vec<_>>()
+                            ));
+                        }
+                    } else if pushed {
+                        wrong.push(format!(
+                            "{label} {ts:?} frame {k} ({name}): refused as a mixed cut but the cut is {}",
+                            if mixed {
+                                "mixed on a fixed composite"
+                            } else {
+                                "of one matrix"
+                            }
+                        ));
+                    }
+                }
+                // The measured conversion does not push it for a cut whose deciding clip is read.
+                if negotiates()
+                    && measured.matrix_convert
+                    && is_mixed
+                    && plan.canvas.cut_matrix.is_some()
+                    && !plan.canvas.unread_decider_in_cut
+                {
+                    let why = plan.reasons(&measured, size);
+                    if why.iter().any(|u| matches!(u, kerf_core::Unsupported::MixedMatrices)) {
+                        wrong.push(format!(
+                            "{label} {ts:?} frame {k}: refused whole although the conversion is measured and the decider read"
+                        ));
+                    }
+                }
+            }
+            if mixed {
+                mixed_cuts += 1;
+            } else {
+                single_cuts += 1;
+            }
+        }
+    }
+    eprintln!(
+        "== mixed cuts {mixed_cuts}, of one matrix {single_cuts}, mixed frames judged {mixed_frames} ({} policy)",
+        if negotiates() { "negotiated" } else { "fixed" }
+    );
+    assert!(
+        wrong.is_empty() || patched_out(),
+        "{}",
+        wrong.iter().take(20).cloned().collect::<Vec<_>>().join("\n")
+    );
+    assert!(!negotiates() || mixed_frames > 500, "too few frames: {mixed_frames}");
+}

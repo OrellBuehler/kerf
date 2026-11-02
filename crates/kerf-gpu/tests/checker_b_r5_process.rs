@@ -338,3 +338,121 @@ fn checker_b_r5_a_child_killed_at_its_deadline_whose_grandchild_holds_the_pipes_
     eprintln!("the scaler probe against the script: {scaler:?} in {:?}", started.elapsed());
     assert!(!scaler.exact(), "{scaler:?}");
 }
+
+/// `prepare_timeline` measures what a cut needs, ahead of any frame and no more: the grade's conversions for a grade, a dip to
+/// white (also on a muted track: the helper reads every clip) or a build that converts between matrices, the scaler for any cut, the
+/// matrix conversion where the build negotiates, `drawtext`'s layout for a cut with text. Each cut is a fresh process (the probes
+/// are cached once per process).
+#[test]
+#[ignore = "needs ffmpeg; starts this binary again for each cut"]
+fn checker_b_r6_prepare_timeline_measures_what_the_cut_needs() {
+    let name = "checker_b_r6_prepare_timeline_measures_what_the_cut_needs";
+    let cases = ["plain", "dip", "dip on a muted track", "graded", "text", "dip and text"];
+    if !inner() {
+        for case in cases {
+            let (status, text, _) = rerun(name, &[("KERF_R6_CASE", case)]);
+            eprintln!(
+                "{case}: {}",
+                text.lines().filter(|l| l.starts_with("R6 ")).collect::<Vec<_>>().join(" | ")
+            );
+            assert!(status.success(), "{case}:\n{text}");
+            assert!(text.contains("R6 PREPARE DONE"), "{case}:\n{text}");
+        }
+        return;
+    }
+    let case = std::env::var("KERF_R6_CASE").expect("a case");
+    let id = uuid_like();
+    let mut plain = Clip::new(id, 0.0, 1.0, 0.0);
+    let mut dipped = Clip::new(id, 0.0, 1.0, 1.0);
+    dipped.transition_in = Some(Transition {
+        kind: TransitionKind::DipToWhite,
+        duration: 0.4,
+    });
+    let mut tracks = vec![Track {
+        clips: vec![plain.clone()],
+        ..Track::new(StreamKind::Video, "V1")
+    }];
+    let mut timeline = Timeline {
+        tracks: tracks.clone(),
+        ..Timeline::new()
+    };
+    match case.as_str() {
+        "dip" | "dip and text" => timeline.tracks[0].clips.push(dipped),
+        "dip on a muted track" => {
+            tracks.push(Track {
+                clips: vec![dipped],
+                muted: true,
+                ..Track::new(StreamKind::Video, "V2")
+            });
+            timeline.tracks = tracks;
+        }
+        "graded" => {
+            plain.grade.curves = Some(kerf_core::Curves {
+                master: vec![
+                    kerf_core::CurvePoint { x: 0.0, y: 0.05 },
+                    kerf_core::CurvePoint { x: 1.0, y: 0.95 },
+                ],
+                red: Vec::new(),
+                green: Vec::new(),
+                blue: Vec::new(),
+            });
+            timeline.tracks[0].clips = vec![plain];
+        }
+        _ => {}
+    }
+    if case.contains("text") {
+        timeline.overlays.push(kerf_core::TextOverlay::new("caption", 0.1, 0.9));
+    }
+    use kerf_gpu::{convert, grade, scaler, text};
+    let policy = kerf_core::composite_color_policy();
+    let converts = policy == kerf_core::CompositeColorPolicy::BottomLayerTag;
+    assert_eq!(
+        grade::measured(),
+        grade::Kernels::Unknown,
+        "{case}: measured before it was asked"
+    );
+    assert_eq!(scaler::measured(), scaler::Kernels::Unknown, "{case}");
+    assert_eq!(convert::measured(), convert::Kernels::Unknown, "{case}");
+    assert!(text::measured_model().is_none(), "{case}");
+    kerf_gpu::prepare_timeline(&timeline);
+    assert!(
+        matches!(scaler::measured(), scaler::Kernels::Match(_)),
+        "{case}: the scaler is measured for any cut"
+    );
+    let needs_grade = converts || case.contains("dip") || case == "graded";
+    assert_eq!(
+        grade::measured() == grade::Kernels::Match,
+        needs_grade,
+        "{case}: the grade's conversions (policy {policy:?}): {:?}",
+        grade::measured()
+    );
+    if !needs_grade {
+        assert_eq!(
+            grade::measured(),
+            grade::Kernels::Unknown,
+            "{case}: a probe nothing asked for ran"
+        );
+    }
+    assert_eq!(
+        convert::measured() != convert::Kernels::Unknown,
+        converts,
+        "{case}: the matrix conversion is measured where the build negotiates: {:?}",
+        convert::measured()
+    );
+    assert_eq!(
+        text::measured_model().is_some(),
+        case.contains("text"),
+        "{case}: drawtext's layout"
+    );
+    eprintln!(
+        "R6 {case}: policy {policy:?}, grade {:?}, convert {:?}, text {}",
+        grade::measured(),
+        convert::measured(),
+        text::measured_model().is_some()
+    );
+    eprintln!("R6 PREPARE DONE");
+}
+
+fn uuid_like() -> uuid::Uuid {
+    uuid::Uuid::new_v4()
+}
