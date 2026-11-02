@@ -8128,7 +8128,11 @@ const INSTRUCTIONS_BUDGET: usize = 3500;
 /// The server's instructions: [`INSTRUCTIONS`], and with a workspace its rule ([`WORKSPACE_NOTE`] and the
 /// directory, left out rather than going past [`INSTRUCTIONS_BUDGET`]).
 fn instructions(workspace: Option<&Workspace>) -> String {
-    let Some(ws) = workspace else {
+    instructions_for(workspace.map(Workspace::root))
+}
+
+fn instructions_for(root: Option<&str>) -> String {
+    let Some(root) = root else {
         return INSTRUCTIONS.to_string();
     };
     let mut text = WORKSPACE_WORDING
@@ -8136,7 +8140,7 @@ fn instructions(workspace: Option<&Workspace>) -> String {
         .fold(INSTRUCTIONS.to_string(), |text, (from, to)| text.replace(from, to));
     text.push(' ');
     text.push_str(WORKSPACE_NOTE);
-    let root = format!(" Workspace: {}.", ws.root());
+    let root = format!(" Workspace: {root}.");
     if text.len() + root.len() <= INSTRUCTIONS_BUDGET {
         text.push_str(&root);
     }
@@ -9813,16 +9817,22 @@ mod tests {
             assert!(super::INSTRUCTIONS.contains(from), "{from}");
         }
         let dir = std::env::temp_dir().join(format!("kerf-ws-info-{}", uuid::Uuid::new_v4().simple()));
-        let deep = dir.join("x".repeat(64 - dir.as_os_str().len().min(60)));
-        std::fs::create_dir_all(&deep).unwrap();
-        let ws = super::Workspace::open(&deep).unwrap();
-        assert!(ws.root().len() >= 64, "{}", ws.root());
-        let root = ws.root().to_string();
+        std::fs::create_dir_all(&dir).unwrap();
+        let ws = super::Workspace::open(&dir).unwrap();
         let confined = KerfMcp {
             workspace: Some(std::sync::Arc::new(ws)),
             ..server
         };
         let text = confined.get_info().instructions.unwrap();
+        assert_eq!(
+            text,
+            super::instructions_for(confined.workspace.as_deref().map(super::Workspace::root))
+        );
+        std::fs::remove_dir_all(&dir).ok();
+
+        let root = format!("/srv/kerf/{}", "x".repeat(54));
+        assert_eq!(root.len(), 64);
+        let text = super::instructions_for(Some(&root));
         assert!(text.len() <= super::INSTRUCTIONS_BUDGET, "{} characters", text.len());
         assert!(
             text.ends_with(&format!(" Workspace: {root}.")),
@@ -9834,14 +9844,11 @@ mod tests {
             "nothing says a path must be absolute: {text}"
         );
         // A root too long for the budget is left out, never the budget broken.
-        let long = deep.join("y".repeat(250));
-        std::fs::create_dir_all(&long).unwrap();
-        let text = super::instructions(Some(&super::Workspace::open(&long).unwrap()));
+        let text = super::instructions_for(Some(&format!("/srv/{}", "y".repeat(250))));
         assert!(
             text.len() <= super::INSTRUCTIONS_BUDGET && !text.contains("Workspace: "),
             "{text}"
         );
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// `set_delivery_format` takes a frame rate, and the words an agent reads say what leaving it out
