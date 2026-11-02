@@ -360,8 +360,14 @@
   a conversion each way and two placements (`engine-cli.md`, "Blend modes"). The compositor draws the modes in `GpuCaps::blend` (`BlendKinds`; `kerf-gpu`'s probe says which this FFmpeg matches, `gpu.md`, "Blend modes"),
   and every cause that keeps a layer from being drawn is its own reason with the cause as the string, so the ledger ranks them: the mode not in the caps (`size_free_reasons`), a composite matrix with no tables
   (`RenderPlan::blend_matrix`, from `PlanCanvas::blend_tag`: the tag the graph's blend chains name, the bottom layer's over the whole cut for an export, over the layers on screen for a still, decided in the planner
-  and checked against the graph's text; BT.2020 needs `caps.blend_extras` `BT2020`), an RGB picture (unless `RGB_PICTURE`), a graded clip (its RGB round trip is on `yuva420p` under a blend), and from `reasons(size)` a layer the scaler resizes,
+  and checked against the graph's text; BT.2020 needs `caps.blend_extras` `BT2020`; **the tags are an allow-list**: a bottom layer (`PlanCanvas::blend_tag_unlisted`) or a blended clip stating a matrix
+  `matrix_tag_is_unlisted` calls unlisted -- `bt2020c`, `ycgco`, `ictcp`, `chroma-derived-*`, `smpte2085`, `gbr` on YCbCr, which FFmpeg 9 cannot export at all and FFmpeg 6 reads as untagged -- is refused whatever the policy, as `fcc` and `smpte240m` are), an RGB picture (unless `RGB_PICTURE`), a graded clip (its RGB round trip is on `yuva420p` under a blend), and from `reasons(size)` a layer the scaler resizes,
   a rotated one that is not a quarter turn (`is_quarter_turn`) or has a keyed rotation, a letterboxed one (`geom.matte`) and one below full opacity (`geom.translucent`).
+  **A rotation is drawn only as a quarter turn `rotate` lands on whole samples for** (`Unsupported::Rotation(layer, what)`, kind `rotation`, `size_free_reasons`, on every layer, plain or blended): `quarter_turn(angle)` is a port of the filter's
+  own integer sine (`vf_rotate.c`: `angle_int = res * 65536 * 16`, `int_sin`) and its fast path (an angle within `FLT_EPSILON` of 0, π/2, π or 3π/2), and answers only for the angles where `c` and `s` come out exactly 0 and ±65536 -- the quarters
+  -47, -46, -43 to 40, 43 and 44 and no others up to the 1000 radians it looks at (41, 42, 45 to 120 and -44, -45, -48 to -120 are a unit off and the picture lands between samples; measured, FFmpeg 6.1.1 and 9.0.2, every quarter from -1310 to 1310,
+  `tests/motion_parity.rs`' many-turns cases), within 1e-9 quarter of the angle (90.00001 degrees is a rotation like 91). Any other angle (the compositor's float edge against the filter's fixed-point one was Y 117 / UV 169 off), a rotation a key or a behaviour moves (a `hypot` box turned per frame) and a huge or non-finite angle
+  is refused; a clip whose keyed rotation never turns has no `rotate`. The compositor's own guard says the same (`GpuError::Unsupported`).
   `normal` refuses nothing (`a_blend_is_drawn_where_the_chain_is_exact_and_each_cause_that_it_is_not_is_listed`, `the_matrix_a_blend_names_is_the_plans_blend_tag`).
   **A speed ramp is refused** (`PlanTiming.ramped`, `Unsupported::SpeedRamp(layer)`, kind `speed_ramp`, from `size_free_reasons` in a
   Still and a Motion plan alike, for every cap): the export retimes a ramped clip's frames with a `setpts` expression and lets `fps`
@@ -392,9 +398,10 @@
   larger cover, cut by the canvas. Drawing these layers means a one-stage `LayerGeometry` (`scaled` = the folded box, `keep` = the centred
   window), the port and the corpus following it, and parity cases on both FFmpegs.
   **What the compositor may draw is data**: `GpuCaps` (`Compositor::caps()`: the bits `motion`, `fades`,
-  `transitions`, `dip_white`, `keyed_opacity`, `keyed_zoom`, `keyed_color`, `mask`, `text`, `reframe`, `hdr`, a `GradeKinds` bitset and an
-  `EffectKinds` bitset; today `GpuCaps::A0` plus every one of them but `reframe`, `hdr`
-  with every effect kind and every grade kind), and **`RenderPlan::reasons(&caps,
+  `transitions`, `dip_white`, `keyed_opacity`, `keyed_zoom`, `keyed_color`, `mask`, `text`, `reframe`, `hdr`, a `GradeKinds` bitset, an
+  `EffectKinds` bitset, a `BlendKinds` bitset (`blend`: the modes this FFmpeg's blend probe matched, per matrix) and `BlendExtras` (`blend_extras`:
+  `BT2020`, `RGB_PICTURE`); today `GpuCaps::A0` plus every one of them but `reframe`, `hdr`
+  with every effect kind and every grade kind, the grade and blend bits where `grade::measured()` / `blend::measured()` say this FFmpeg draws as the model), and **`RenderPlan::reasons(&caps,
   size)` is a pure function of the plan's fields** returning `Unsupported` values whose
   `Display` is the message the plan has always given and which lists **every** cause of a refusal, not the first (a layer whose
   geometry is refused still gets its other reasons, judged on the picture's own chroma grid; a grade on a letterboxed layer

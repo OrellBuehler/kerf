@@ -216,9 +216,11 @@ pub struct GpuCaps {
     /// than 8-bit limited-range `yuv420p`, video effects behind the grade, a running black or white fade and a moving zoom.
     pub grade: GradeKinds,
     /// The blend modes drawn: FFmpeg mixes a blended clip with the composite by `blend` in RGB, through a conversion
-    /// each way, and a compositor that sets a mode reproduces that chain to the level on this FFmpeg. Refused whatever
-    /// the caps (`BlendMode` with its cause): a layer the compositor scales or turns, a letterbox, an opacity
-    /// below 1 (the RGB round trip), a composite matrix other than BT.601 or BT.709, an odd render size.
+    /// each way, and a compositor that sets a mode reproduces that chain, to the sample, on this FFmpeg. Refused whatever
+    /// the caps (`BlendMode` with its cause): a layer the compositor scales, one turned by anything but a quarter
+    /// turn `rotate` lands on whole samples for, a letterbox, a graded layer, an opacity below 1 (the RGB round trip),
+    /// a clip or a bottom layer tagged with a matrix no table is proven for (`fcc`, `smpte240m`, `bt2020c`, `ycgco`, ...), and a
+    /// BT.2020 composite or an RGB picture unless `blend_extras` says this FFmpeg's chain was measured to match for it.
     pub blend: BlendKinds,
     /// What a blend is drawn for beyond its modes: RGB pictures and a BT.2020 composite (`BlendExtras`).
     pub blend_extras: BlendExtras,
@@ -411,6 +413,10 @@ pub enum Unsupported {
     /// A moving zoom or position: FFmpeg places the picture on the canvas with a `perspective` at
     /// sub-pixel positions (in the export and the still alike), which no compositor pass draws.
     KeyedPlacement(LayerRef),
+    /// A rotation the compositor does not draw (the detail says which): FFmpeg's `rotate` samples a turned picture at fixed-point
+    /// positions with an apron of its own, and only a quarter, half or three quarters of a turn (where its integer sine comes out exact,
+    /// [`crate::quarter_turn`]) lands on whole samples; any other angle, and a rotation a key or a behaviour moves, is FFmpeg's.
+    Rotation(LayerRef, &'static str),
     /// A clip with live behaviours (sway, breathe, spin, drift, shake): the pose each frame is a formula of
     /// the clip's clock added to its keys, which FFmpeg evaluates in the graph and no compositor has a
     /// parity case for.
@@ -495,6 +501,7 @@ impl Unsupported {
             Self::StillMotion(_) => "still_motion",
             Self::KeyedZoom(_) => "keyed_zoom",
             Self::KeyedPlacement(_) => "keyed_placement",
+            Self::Rotation(..) => "rotation",
             Self::Behavior(_) => "behavior",
             Self::ZoomBehind(..) => "zoom_behind",
             Self::FoldedFit(..) => "folded_fit",
@@ -617,6 +624,7 @@ impl fmt::Display for Unsupported {
                 f,
                 "{l}: a moving zoom or position (a perspective placing the picture at sub-pixel positions, which no compositor pass draws)"
             ),
+            Self::Rotation(l, what) => write!(f, "{l}: {what}"),
             Self::Behavior(l) => write!(
                 f,
                 "{l}: live behaviours (a sway, breath, spin, drift or shake FFmpeg evaluates in the graph on top of the clip's keys; no compositor has a parity case for it)"

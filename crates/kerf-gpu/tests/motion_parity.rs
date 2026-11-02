@@ -186,7 +186,7 @@ struct Media {
     /// Per-sample noise in all three planes: every Y, U, V combination, clipped RGB included.
     noise: Asset,
     /// A smooth gradient over black: pictures whose only strong edge is a layer's own, for the
-    /// cases with a rotated layer.
+    /// cases with a turned layer.
     smooth: Asset,
     black: Asset,
     /// 8-pixel blocks of limited-range black (16) and white (235): hard edges, whose scaled overshoot runs
@@ -446,11 +446,6 @@ const TRANSLUCENT: Limits = Limits { y: 0, uv: 1 };
 /// the canvas): the scaler's one level and the round trip's.
 const HD_TRANSLUCENT: Limits = Limits { y: 2, uv: 2 };
 
-/// Two levels: a rotated layer, inside its edge. `rotate` is a fixed-point bilinear sample and the
-/// shader a float one (the scaled picture before it is one level off on its own), and the same
-/// two levels show whether the layer fades, dissolves or is keyed.
-const ROTATED: Limits = Limits { y: 2, uv: 2 };
-
 /// Two levels: a layer the compositor scales *and* grades, with tables that step by at most two between neighbouring entries
 /// (`eq::table_steps`, `MAX_AMPLIFIED_ERROR`). The scaler's one level (`SCALED`) is mapped through the tables, so a pair of
 /// values a level apart come out as far apart as the tables' steepest step; the plan draws the frames inside that bound and
@@ -582,70 +577,11 @@ struct Check<'a> {
     limits: Limits,
     /// Frames to write a montage of (and every frame over the bound).
     look: &'a [u64],
-    /// A rotated layer's edge is a fixed-point stair-step in FFmpeg and a float sample here, and
-    /// its chroma there has a fringe the compositor does not copy (`tests/parity.rs`,
-    /// `a_rotated_neutral_layer_has_no_colour_fringe`): the samples within [`BAND`] of the edge of a
-    /// rotated layer's picture (its footprint, from the plan's geometry: a content-based band
-    /// vanishes where a fade makes the edge faint) are left out. Everything inside is compared.
-    rotated: bool,
     /// The frames the plan refuses for this reason (FFmpeg draws them) are not compared, and at
     /// least one must be: the case is about a refusal. Every other frame is compared with the
     /// export, so a refusal that is wider than it has to be shows too. A frame the plan refuses
     /// for another reason is a failure.
     refusing: Option<&'a Refusing>,
-}
-
-/// Samples this close to the edge of a rotated layer are the edge band.
-const BAND: f64 = 3.0;
-
-/// The pixels within [`BAND`] of the edge of a rotated layer's picture, from the plan's geometry
-/// (`rot_sample`'s convention: the layer box's centre, the picture rotated about it).
-fn rotated_band(plan: &kerf_core::RenderPlan, (w, h): (u32, u32)) -> Vec<bool> {
-    let (w, h) = (w as usize, h as usize);
-    let mut band = vec![false; w * h];
-    for layer in &plan.layers {
-        let Ok(g) = plan.layer_geometry(layer, (w as u32, h as u32)) else {
-            continue;
-        };
-        let Some(r) = g.rotation else { continue };
-        let (lw, lh) = g.layer;
-        let (pw, ph) = (f64::from(g.picture.0), f64::from(g.picture.1));
-        let (c, s) = (r.angle.cos(), r.angle.sin());
-        for y in 0..h {
-            for x in 0..w {
-                let dx = x as f64 - f64::from(g.origin.0) - (f64::from(lw) - 1.0) / 2.0;
-                let dy = y as f64 - f64::from(g.origin.1) - (f64::from(lh) - 1.0) / 2.0;
-                let (sx, sy) = (c * dx + s * dy, -s * dx + c * dy);
-                let (ex, ey) = (pw / 2.0 - sx.abs(), ph / 2.0 - sy.abs());
-                let near = if ex >= 0.0 && ey >= 0.0 {
-                    ex.min(ey)
-                } else {
-                    (-ex).max(0.0).hypot((-ey).max(0.0))
-                };
-                if near <= BAND {
-                    band[y * w + x] = true;
-                }
-            }
-        }
-    }
-    band
-}
-
-/// [`PlaneStats::of`] over the samples `keep` allows.
-fn stats_outside(a: &[u8], b: &[u8], excluded: &[bool]) -> PlaneStats {
-    let mut s = PlaneStats::default();
-    for ((x, y), out) in a.iter().zip(b).zip(excluded) {
-        if *out {
-            continue;
-        }
-        let d = (i32::from(*x) - i32::from(*y)).abs();
-        s.n += 1;
-        s.max = s.max.max(d);
-        s.differing += usize::from(d != 0);
-        s.sum += d as u64;
-        s.sq += (d * d) as u64;
-    }
-    s
 }
 
 /// Plan, draw and compare every frame of `check`; returns the worst `(y, uv)` error. The planes of
@@ -660,7 +596,6 @@ fn check_motion(check: Check) -> (i32, i32) {
         frames,
         limits,
         look,
-        rotated,
         refusing,
     } = check;
     let slug: String = case
@@ -681,7 +616,6 @@ fn check_motion(check: Check) -> (i32, i32) {
     let (mut ys, mut us, mut vs) = (PlaneStats::default(), PlaneStats::default(), PlaneStats::default());
     let mut worst: Vec<(u64, i32, i32)> = Vec::new();
     let mut layers_seen = 0;
-    let mut excluded_share = 0.0f64;
     let mut refused_frames = 0usize;
     for k in frames.clone() {
         let plan = planner.at_frame(k).expect("plan");
@@ -702,35 +636,11 @@ fn check_motion(check: Check) -> (i32, i32) {
             .unwrap_or_else(|e| panic!("{case}: frame {k}: {e}"));
         let want = played.planes(k as usize);
         let got = planes_of(&drawn);
-        let (y, u, v) = if rotated {
-            let band = rotated_band(&plan, size);
-            // A chroma sample is out when any pixel of its block is, and so is its neighbour's.
-            let (cw, ch) = (played.w / 2, played.h / 2);
-            let block = |r: usize, c: usize| {
-                [(0, 0), (1, 0), (0, 1), (1, 1)]
-                    .iter()
-                    .any(|(dx, dy)| band[(2 * r + dy) * played.w + 2 * c + dx])
-            };
-            let wide: Vec<bool> = (0..cw * ch)
-                .map(|i| {
-                    let (r, c) = (i / cw, i % cw);
-                    (r.saturating_sub(1)..=(r + 1).min(ch - 1))
-                        .any(|rr| (c.saturating_sub(1)..=(c + 1).min(cw - 1)).any(|cc| block(rr, cc)))
-                })
-                .collect();
-            excluded_share = excluded_share.max(band.iter().filter(|b| **b).count() as f64 / band.len() as f64);
-            (
-                stats_outside(want[0], got[0], &band),
-                stats_outside(want[1], got[1], &wide),
-                stats_outside(want[2], got[2], &wide),
-            )
-        } else {
-            (
-                PlaneStats::of(want[0], got[0]),
-                PlaneStats::of(want[1], got[1]),
-                PlaneStats::of(want[2], got[2]),
-            )
-        };
+        let (y, u, v) = (
+            PlaneStats::of(want[0], got[0]),
+            PlaneStats::of(want[1], got[1]),
+            PlaneStats::of(want[2], got[2]),
+        );
         let (my, muv) = (y.max, u.max.max(v.max));
         if my > limits.y || muv > limits.uv {
             worst.push((k, my, muv));
@@ -750,20 +660,12 @@ fn check_motion(check: Check) -> (i32, i32) {
         s.add(vs);
         s
     };
-    let banded = if rotated {
-        format!(" | edge band <= {:.1}% left out", excluded_share * 100.0)
-    } else {
-        String::new()
-    };
     if let Some(r) = refusing {
         assert!(refused_frames > 0, "{case}: no frame was refused for {}", r.label);
     }
     let banded = match refusing {
-        Some(r) => format!(
-            "{banded} | {refused_frames} frames refused for {}, FFmpeg draws them",
-            r.label
-        ),
-        None => banded,
+        Some(r) => format!(" | {refused_frames} frames refused for {}, FFmpeg draws them", r.label),
+        None => String::new(),
     };
     let line = format!(
         "{case:<44} frames {:>3}..{:<3} layers<={layers_seen} | Y: max {:>2} differing {:>7} PSNR {:>5.1} dB | UV: max {:>2} differing {:>7} PSNR {:>5.1} dB{banded}",
@@ -972,7 +874,6 @@ fn run(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, secs: f64, limits:
         frames: upto(secs, fps),
         limits,
         look: &look_at(secs, fps),
-        rotated: false,
         refusing: None,
     });
 }
@@ -999,6 +900,11 @@ fn dip_refused(why: DipWhy) -> Refusing {
     )
 }
 
+/// A rotation the plan does not draw: any angle `rotate` does not land on whole samples for (`kerf_core::quarter_turn`), a keyed one included.
+fn rotation_refused() -> Refusing {
+    refusing("Rotation", |u| matches!(u, Unsupported::Rotation(..)))
+}
+
 fn translucent_fade_refused() -> Refusing {
     refusing("FadeOnTranslucent", |u| matches!(u, Unsupported::FadeOnTranslucent(_)))
 }
@@ -1022,23 +928,7 @@ fn run_refusing(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, secs: f64
         frames: upto(secs, fps),
         limits,
         look: &[],
-        rotated: false,
         refusing: Some(reason),
-    });
-}
-
-/// [`run`] for a case with a rotated layer: the samples within [`BAND`] of its edge are left out.
-fn run_rotated(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, secs: f64, limits: Limits) {
-    check_motion(Check {
-        case,
-        tl,
-        assets,
-        opts: at_fps(fps),
-        frames: upto(secs, fps),
-        limits,
-        look: &look_at(secs, fps),
-        rotated: true,
-        refusing: None,
     });
 }
 
@@ -1721,13 +1611,16 @@ fn keyframed_position_and_rotation_in_an_export_frame() {
     let mut turning = clip(&m.smooth, 0.5, 1.5, 0.0);
     turning.keyframes = vec![key(0.0, 0.0, 0.0), key(1.0, 0.0, 30.0)];
     let tl = timeline(vec![vec![under], vec![turning]], None);
-    run_rotated(
+    // (A rotation a key moves is a box of its own turned by an expression per frame, with an edge that is a fixed-point sample against a float
+    // one -- Y 117 / UV 169 levels off at the edge: every frame of it is FFmpeg's.)
+    run_refusing(
         "keyed/rotation",
         &tl,
         &[m.black.clone(), m.smooth.clone()],
         30.0,
         1.0,
-        ROTATED,
+        EXACT,
+        &rotation_refused(),
     );
 }
 
@@ -1853,21 +1746,22 @@ fn a_keyed_opacity_is_the_geq_alpha_of_each_frame() {
     let mut turned = fading(&m.smooth, vec![key(0.0, 0.3), key(1.0, 0.9)]);
     turned.transform.rotation = 12.0;
     turned.transform.scale = 0.6;
-    run_rotated(
+    run_refusing(
         "keyed opacity/rotated",
         &timeline(vec![vec![clip(&m.black, 0.5, 1.5, 0.0)], vec![turned]], None),
         &[m.black.clone(), m.smooth.clone()],
         30.0,
         1.0,
-        ROTATED,
+        EXACT,
+        &rotation_refused(),
     );
 }
 
 /// The `geq` that writes a keyed opacity runs on the picture **before** the `rotate`, and on a build whose `geq` reads a plane's last column and
 /// row one in (FFmpeg 6.1) the row and the column it replaces land on whatever edge of the turned box the turn gives them: the bottom row of a
 /// picture turned a quarter lands on the left column, the last column of a half turn on the first. A picture with detail at its edges (the test
-/// pattern, over the bars) turned by every quarter, alone and moved; held to the export to the sample, and a turn that is not a quarter to the
-/// rotated layer's bound. (A clip with a blend mode is `checker_e_a_turned_blended_clip_with_a_keyed_opacity`'s.)
+/// pattern, over the bars) turned by every quarter, alone and moved; held to the export to the sample, and a turn that is not a quarter is refused
+/// by the plan. (A clip with a blend mode is `checker_e_a_turned_blended_clip_with_a_keyed_opacity`'s.)
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn a_keyed_opacity_on_a_turned_layer_is_shifted_before_the_turn() {
@@ -1898,13 +1792,14 @@ fn a_keyed_opacity_on_a_turned_layer_is_shifted_before_the_turn() {
         }
     }
     for angle in [12.0, -30.0, 100.0] {
-        run_rotated(
+        run_refusing(
             &format!("keyed opacity/rotated {angle} over detail"),
             &turned(angle, (0.0, 0.0)),
             &assets,
             30.0,
             1.0,
-            ROTATED,
+            EXACT,
+            &rotation_refused(),
         );
     }
 }
@@ -2370,9 +2265,7 @@ fn a_keyed_colour_is_the_eq_of_each_frame() {
         None,
     );
     // Turned (`rotate` follows the `eq`, on the alpha plane) and translucent (the RGB round trip a constant opacity takes
-    // reads the graded picture). The turned layer is scaled too, and `ROTATED` is the bound of that alone (ungraded: Y 1 /
-    // UV 2): a brightness and a warm / cool shift, which magnify it least; a steeper grade is the scaled layers' above
-    // (a static saturation of 1.3 and gamma of 1.2 on the same layer measure Y 2 / UV 3).
+    // reads the graded picture). A turn that is not a quarter is refused whole (its edge is a fixed-point sample), whatever the grade.
     let mut turned = clip(&m.smooth, 0.5, 1.5, 0.0);
     turned.set_property_keys(Property::Brightness, linear_keys(-0.1, 0.1));
     turned.set_property_keys(Property::Temperature, linear_keys(-0.5, 0.5));
@@ -2381,7 +2274,15 @@ fn a_keyed_colour_is_the_eq_of_each_frame() {
     let on_black = timeline(vec![vec![clip(&m.black, 0.5, 1.5, 0.0)], vec![turned]], None);
     let smooth = [m.black.clone(), m.smooth.clone()];
     colour_moves("keyed colour/rotated", &on_black, &smooth, 30.0, 1.0, 20);
-    run_rotated("keyed colour/rotated", &on_black, &smooth, 30.0, 1.0, ROTATED);
+    run_refusing(
+        "keyed colour/rotated",
+        &on_black,
+        &smooth,
+        30.0,
+        1.0,
+        EXACT,
+        &rotation_refused(),
+    );
     let mut translucent = colour_keyed(&m.testsrc, &all, &linear_keys);
     translucent.transform.opacity = 0.6;
     run_colour(
@@ -2660,7 +2561,20 @@ fn a_rotated_layer_fades_on_an_alpha_plane() {
     turned.fade_in = 0.4;
     turned.fade_out = 0.4;
     let tl = timeline(vec![vec![under.clone()], vec![turned]], None);
-    run_rotated("fade/rotated", &tl, &assets, 30.0, 1.0, ROTATED);
+    run_refusing("fade/rotated", &tl, &assets, 30.0, 1.0, EXACT, &rotation_refused());
+    // (A quarter turn is drawn, to the sample: the chain is on the same alpha plane.)
+    let mut quarter = clip(&m.smooth, 0.5, 1.5, 0.0);
+    quarter.transform.rotation = 90.0;
+    quarter.fade_in = 0.4;
+    quarter.fade_out = 0.4;
+    run(
+        "fade/rotated a quarter",
+        &timeline(vec![vec![under.clone()], vec![quarter]], None),
+        &assets,
+        30.0,
+        1.0,
+        EXACT,
+    );
     // ... and a dissolve into a rotated clip, over the clip it replaces.
     let out = clip(&m.black, 0.5, 1.5, 0.0);
     let mut inc = clip(&m.smooth, 0.5, 1.5, 1.0);
@@ -2671,13 +2585,40 @@ fn a_rotated_layer_fades_on_an_alpha_plane() {
         duration: 0.5,
     });
     let tl = timeline(vec![vec![out, inc]], None);
-    run_rotated("dissolve/rotated-incoming", &tl, &assets, 30.0, 2.0, ROTATED);
+    run_refusing(
+        "dissolve/rotated-incoming",
+        &tl,
+        &assets,
+        30.0,
+        2.0,
+        EXACT,
+        &rotation_refused(),
+    );
+    let out = clip(&m.black, 0.5, 1.5, 0.0);
+    let mut inc = clip(&m.smooth, 0.5, 1.5, 1.0);
+    inc.transform.rotation = -90.0;
+    inc.transition_in = Some(Transition {
+        kind: TransitionKind::Crossfade,
+        duration: 0.5,
+    });
+    run(
+        "dissolve/rotated-incoming a quarter",
+        &timeline(vec![vec![out, inc]], None),
+        &assets,
+        30.0,
+        2.0,
+        EXACT,
+    );
     // A rotated clip with no fade at all, as an export draws it.
     let mut still_turned = clip(&m.smooth, 0.5, 1.5, 0.0);
     still_turned.transform.rotation = 20.0;
     still_turned.transform.scale = 0.6;
     let tl = timeline(vec![vec![under], vec![still_turned]], None);
-    run_rotated("plain/rotated", &tl, &assets, 30.0, 1.0, ROTATED);
+    run_refusing("plain/rotated", &tl, &assets, 30.0, 1.0, EXACT, &rotation_refused());
+    let mut quarter = clip(&m.smooth, 0.5, 1.5, 0.0);
+    quarter.transform.rotation = 270.0;
+    let tl = timeline(vec![vec![clip(&m.black, 0.5, 1.5, 0.0)], vec![quarter]], None);
+    run("plain/rotated a quarter", &tl, &assets, 30.0, 1.0, EXACT);
 }
 
 #[test]
@@ -3847,7 +3788,6 @@ fn effects_are_drawn_as_their_filters_draw_them() {
         frames: 15..44,
         limits: EXACT,
         look: &[],
-        rotated: false,
         refusing: None,
     });
     for (name, speed) in [("speed 2", 2.0), ("speed 0.5", 0.5), ("reversed", -1.0)] {
@@ -3863,7 +3803,6 @@ fn effects_are_drawn_as_their_filters_draw_them() {
             frames: 0..20,
             limits: EXACT,
             look: &[],
-            rotated: false,
             refusing: None,
         });
     }
@@ -4754,7 +4693,9 @@ fn what_follows_a_grade_is_drawn_as_it_is_without_one() {
     );
 
     let (tl, a) = on(&m.smooth, wheels_and_lut, &|c| c.transform.rotation = 20.0);
-    run_rotated("grade/rotated", &tl, &a, 30.0, 0.4, ROTATED);
+    run_refusing("grade/rotated", &tl, &a, 30.0, 0.4, EXACT, &rotation_refused());
+    let (tl, a) = on(&m.smooth, wheels_and_lut, &|c| c.transform.rotation = 90.0);
+    run("grade/rotated a quarter", &tl, &a, 30.0, 0.4, EXACT);
 
     // A fade that is not running leaves the picture where it is: the frames after a fade-in are drawn.
     let (tl, a) = on(&m.testsrc, wheels_and_lut, &|c| c.fade_in = 0.2);

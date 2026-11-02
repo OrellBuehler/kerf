@@ -14,7 +14,7 @@ internal error scopes (`Gpu::guarded`), anything uncaptured is logged and rememb
 draws, `GpuCaps::A0` plus `text`, `motion`, `fades`, `transitions`, `dip_white`, `keyed_zoom`, `keyed_opacity`, `keyed_color`, `mask`, `grade` (every kind, where `grade::measured()` says this FFmpeg's conversions are the model's: `Compositor::caps()` drops it otherwise), `blend` (the modes `blend::measured()` says this FFmpeg draws as the model does, both matrices) and the blur / sharpen / grayscale / invert / vignette / chroma key `effects` today, which `composite` / `render_plan` judge the plan by), and a lost device is tracked — every
 later call is `GpuError::DeviceLost` and the **owner builds a new `Gpu` and
 `Compositor`** (the device is not recreated behind the caller's back).
-**A blend mode is drawn** (`GpuCaps::blend`, below: "Blend modes") for a layer at its own size, upright, opaque and not letterboxed, over an even frame, and
+**A blend mode is drawn** (`GpuCaps::blend`, below: "Blend modes") for a layer at its own size, upright or turned by a quarter, opaque and not letterboxed, over an even frame, and
 where `blend::kernels()` says this FFmpeg's chain is the model's; every other blended layer is refused by the plan (`Unsupported::BlendMode(layer, mode, cause)`,
 `core-render-plan.md`) and FFmpeg draws it. `PlanLayer.blend` is `Normal` in the fakes and fixtures.
 
@@ -497,9 +497,8 @@ What the parity harness forced, all recorded in `kerf-gpu`'s docs and shaders:
   the picture's *native* chroma grid (`Subsampling`: even for 4:2:0, nothing for 4:4:4 —
   see `render_plan.rs` above for which positions), the fit uses `av_rescale`, `pad`,
   `overlay` and (unless the transform's own `scale` follows it) the Cover crop truncate
-  and round down to even (the 4:2:0 grid, whatever the source was), `rotate` rounds its box half-up and samples bilinear about the pixel-index
-  centres, chroma outside a rotated picture is clamped to its edge (FFmpeg leaves a few
-  green pixels there; the GPU does not copy them).
+  and round down to even (the 4:2:0 grid, whatever the source was), `rotate` rounds its box half-up; **only a quarter, half or three quarters of a turn is drawn** ("Rotation" below), where
+  it lands on whole samples.
   **That geometry is fit, then zoom, and FFmpeg's graph no longer is for a zoom in**: a static zoom over 1 under Contain, and a Cover
   clip that zooms or pans over a cover that hangs over the frame, are one `scale` from the source to the frame times the zoom (and
   Cover no longer crops to the frame first), so the plan refuses them (`Unsupported::FoldedFit`, `core-render-plan.md`) and FFmpeg
@@ -720,13 +719,23 @@ before the zoom acts at the **fit size** and the zoom magnifies it (a blur grows
   Y 65 / UV 128 off at 90 and 180 on 6.1.1, a plain layer's chroma included, which the plan let through), and a mask or a keyed opacity is `Unsupported` while the build is `Unknown`. `kerf_gpu::prepare(&plan)` measures it ahead of the render lock; `Compositor::with_geq_edge` pins it.
 * Refused (`MaskWith`): a mask on a **rotated** layer, or one below full opacity (the sampled one: its alpha goes through `colorchannelmixer`).
 
+**Rotation: a quarter turn, or FFmpeg's.** `rotate` has two paths (`vf_rotate.c`, the same in 6.1 and 9.0): a `simple_rotate` copy when the angle is within `FLT_EPSILON` of 0, π/2, π or 3π/2, and a
+general one that walks the output with `c = int_sin(angle_int + INT_PI/2)` and `s = int_sin(angle_int)`, `angle_int = (int)(angle * 65536 * 16)`, a fifth-term Taylor series in integers. The samples are whole only where `c` and `s` come
+out exactly 0 and ±65536. They do for the quarters -47, -46, -43 to 40, 43 and 44, and for no other whole number of turns up to the 1000 radians `kerf_core::quarter_turn` looks at: the series and `INT_PI` are a unit off further out, growing
+with the angle (41, 42 and 45 to 120 and -44, -45 and -48 to -120 quarters: the picture lands between samples; 1e7 degrees is an `int` overflow, undefined in C and done differently by the builds). Measured, not guessed: `rotate`
+(the export's text, `fillcolor=none` and `black@0`, `yuva420p`, four sizes of odd and even sides) against the same filter at the reduced angle for **every quarter from -1310 to 1310, FFmpeg 6.1.1 and 9.0.2: the set above, no
+other, which `quarter_turn` computes** (its port of `int_sin` and the fast path, within 1e-9 quarter of the angle: 90.00001 degrees is a rotation like 91 is, and the unit tests list the set). **Every other rotation is refused on every layer** (`Unsupported::Rotation`,
+plain, blended, keyed opacity or not, and a rotation a key or a behaviour moves, which is a `hypot` box turned per frame): the float edge of the old pass was Y 117 / UV 169 levels off the fixed-point one at the rotated edge and no ladder is a
+drawn frame. The compositor guards the same (`look_of`: `GpuError::Unsupported`) and snaps a quarter's cosine and sine to exact 0 and ±1. **A turned odd box carries the overlay's chroma tail like any odd layer** (the last chroma
+block of an odd-sided layer reaches one pixel past it, `tail`): a quarter turn is a picture like another, and the tail was skipped for turned layers (a blended 639x360 gray turned 180: U 720 samples, 48 levels off; 640x359 at 90 and 270: U 2520, 13 levels).
+
 **Keyed opacity** (export frames). FFmpeg's chain has a `geq` whose alpha is `(int)(opacity(T) * 255)` (`T` the frame's time on the
 clip's `fps` grid) where a constant opacity takes `colorchannelmixer` and the RGB round trip. The plan evaluates it
 (`PlanLayer::keyed_alpha`, `core-render-plan.md`) and the compositor blends with that one alpha in integers (`LayerFades::alpha`),
 no round trip; the clip's fades and a dissolve's ramp act on it as on any alpha plane. The `geq` also copies Y, U and V through
 `lum` / `cb` / `cr`, so on a build whose `geq` reads a plane's last column and row one in (6.1) the blend reads them so too
 (`mask_edge`, as for a mask; ahead of a turn, see above: `tests/motion_parity.rs` `a_keyed_opacity_on_a_turned_layer_is_shifted_before_the_turn`, 0 differing samples at every quarter on a picture with detail at its edges, 6.1.1 and 9.0.2). Byte for byte at the picture's size (linear, eased, held, bezier off the frame grid, a tree of many
-keys, 29.97, with fades, in a dissolve); the scaler's level on a pip or an odd size; `ROTATED` turned. A mask with it is drawn
+keys, 29.97, with fades, in a dissolve); the scaler's level on a pip or an odd size; turned by a quarter (any other turn is refused, "Rotation"). A mask with it is drawn
 while the curve holds 1 (the `geq` writes the mask, byte for byte) and refused on the frames below it (`MaskWith`: one `geq`
 multiplies both); **the alpha judged is the `geq`'s own (`keyed_alpha < 255`), not the sampled opacity**, which can sit on the
 other side of 1 by the last bit. **Before a moving zoom** it is drawn on the frames where the curve holds 1 (the `geq` is the identity on
@@ -749,7 +758,7 @@ five numbers alone and all five, linear / eased / held / bezier off the frame gr
 and between two: `gamma_r = gamma_b = 1`, the chroma tables the identity) and going to 0, at 24 / 25 / 29.97 (`29.97` and `30000/1001`) / 30 / 60 fps, late on the
 timeline (also at 29.97 and `30000/1001`, the start off the frame grid), at speed 2 / 0.5 / reversed, beside a static grade (the numbers not keyed are the clip's own), with the clip's fades, in a dissolve, after a dip,
 beside a keyed opacity (an `eq` and a `geq` written per frame), under a mask, before an invert / grayscale / sharpen / vignette, translucent (`TRANSLUCENT`: the RGB round trip
-reads the graded picture; Y 0 / UV 1), turned (`ROTATED` with a mild grade, Y 1 / UV 2), and on a 10-bit,
+reads the graded picture; Y 0 / UV 1), turned by a quarter (exact; any other turn is refused whole), and on a 10-bit,
 4:2:2, 4:4:4, gray, RGB or BT.709 source (the `eq` runs on the picture the chain has made 4:2:0 by then, as for a static grade). A blur after it is `EFFECT`'s level, a moving
 zoom after it `SCALED` (the grade runs at the fit size). **On a layer the compositor scales, the tables multiply the scaler's level**: its picture is a level
 from swscale's, and a table maps two values a level apart to values `eq::table_steps` apart (the steepest step between neighbouring entries of the Y, U
@@ -840,17 +849,17 @@ integers, to the level**, and each stage was found by measuring and held to the 
   (a multiplied clip must not go through black): the clip's fade-in and fade-out, a dip's halves and a dissolve's ramp are each a `fade alpha=1` with its own rounding, and **the chain runs them in `ClipTiming::fades`'s order, not in-then-out**
   (`LayerFades::ramps`, up to eight, in `fade_ops`'s order: a dissolve that overlaps the fade-out ramps after it; a fade-in beside a crossfade on one edge is two steps, drawn). Outside the clip's rectangle it is 0.
 * **The matrix is the one the graph names**, not the composite's (`PlanCanvas::blend_tag`: the bottom layer's tag over the whole cut for an export, over the layers on screen for a still; BT.709 for a labelled one; none = BT.601;
-  `blend_matrix()`): BT.601, BT.709 and BT.2020 have tables (BT.2020 where the probe matched, `BlendExtras::BT2020`); `fcc` and `smpte240m` are refused.
+  `blend_matrix()`): BT.601, BT.709 and BT.2020 have tables (BT.2020 where the probe matched, `BlendExtras::BT2020`); `fcc` and `smpte240m` are refused, **and so is every tag that is not on the allow-list** (`kerf_core::matrix_tag_is_unlisted`: `bt2020c`, `ycgco`, `ictcp`, `chroma-derived-nc` / `-c`, `smpte2085`, `gbr` on YCbCr), on the bottom layer or on the blended clip, under every policy: FFmpeg 9.0.2 fails to export such a cut at all, and FFmpeg 6.1.1 reads it as untagged.
 The passes: copy the canvas region (whole 2x2 blocks) to `before` and `laid`, draw the clip opaque onto `laid` with the plain layer's own pass (so its place, odd edges and chroma blocks are the plain layer's), then `fs_blend_rgb`
 (both frames to RGB, the mode, RGB out) and `fs_blend_over` (back to 4:2:0 and the integer blend onto the canvas by the alpha). `Compositor::blend_planes` runs the passes alone on planes the caller made.
 **Does this FFmpeg do that?** `blend::kernels()` (once per process, off every lock, `prepare` asks) runs the export's own chain text (`kerf_core::blend_colour_graph`, `blend_probe_graph`) on noise, per mode and per matrix (BT.601, BT.709, BT.2020),
 and a clip placed by the export's `overlay` at the frame's edges, and keeps the modes that came back as `blend::reference` computes them; `caps.blend` is those the two matrices agree on, and nothing until it has run.
 The same probe sets `caps.blend_extras` (`blend::extras()`): `BT2020` when all nine modes and the placement matched in BT.2020, and `RGB_PICTURE` when **the export's own chain** (`blend_probe_graph`, an `rgb24` clip into its `format=yuva420p`, placed by the real `overlay`) comes back as the model's blend of the planes the decode makes of the same noise (`scale=out_range=tv`, then 4:2:0: one more child), BT.601 (an RGB picture is refused in any other stack). Not the two conversions side by side: 4.4's are equal on noise and its blended RGB picture is not the decode's.
-**The probe is bounded and keeps only a complete answer** (`judge`, `run_bounded`): one deadline (`PROBE_TIMEOUT`) for all ~40 children, none under a lock; a late child is killed and its pipe is never joined on (the reader is detached and answers over a channel, so a wrapper script's grandchild holding the pipe cannot hold the probe). **A child that did not answer** (late, failed, no frame) **takes what it probes out** (its mode, its matrix's placement, the RGB lift, BT.2020) whatever the others found, and the probe is then not kept (`Verdict::kept`): `found()` draws nothing and retries after the backoff, so a timeout on a loaded machine neither draws a mode unmeasured nor switches one off for the process's life.
+**The probe is bounded and keeps only a complete answer** (`judge`, `run_child`): one deadline (`PROBE_TIMEOUT`) for all ~40 children, run `WORKERS` (6) at a time, none under a lock, **one measurement at a time whoever asks** (`Probe::found`: a second caller waits for the first and takes its answer, a kept one or the backoff's nothing, rather than launching the children again); a late child is killed and its pipes are never joined on (the readers are detached and answer over a channel, so a wrapper script's grandchild holding a pipe cannot hold the probe). A child that did not answer is logged with the job it probes and the tail of its stderr (`Failed`, 512 bytes). **A child that did not answer** (late, failed, no frame) **takes what it probes out** (its mode, its matrix's placement, the RGB lift, BT.2020) whatever the others found, and the probe is then not kept (`Verdict::kept`): `found()` draws nothing and retries after the backoff, so a timeout on a loaded machine neither draws a mode unmeasured nor switches one off for the process's life.
 **FFmpeg 4.4.2's probe fails, and that is a real bug of that build**: its `overlay` slices the alpha plane of a clip placed above the frame's top edge wrongly when it runs on several threads (the alpha loses rows: the blend does nothing; Y 212 off), so on 4.4.2 every blend is refused,
 and the parity cases there check the refusal and then draw with the caps forced (`forced_blends`, `blend_check`) to hold the arithmetic to the export's planes for the clips not above the edge.
-*Refused* (`BlendMode` with its cause; every cause is listed): a layer the compositor's scaler resizes (the scaler's level is not swscale's and the blend carries it into the composite), a rotated one **except a quarter turn, half or three quarters (`kerf_core::is_quarter_turn`: the `rotate` filter lands on whole samples; a keyed rotation is another box and stays refused)**, one below full
-opacity (the RGB round trip's chroma is a level off), a letterboxed one (its bars are transparent in the blend), **a graded one (a blended clip's chain runs `format=yuva420p` and the transparent `pad` before the grade, so FFmpeg's RGB filters run `yuva420p -> argb -> yuva420p` where the grade's model is `yuv420p -> rgb24`: Y 11 / UV 9 off, every case)**, an RGB picture where the probe says the graph's conversion is not the decode's (FFmpeg 4.4's is Y 3 / UV 11 off), a matrix with no tables (or BT.2020 where it was not measured), a mode the probe refused. (An odd frame is refused by `composite_texts` for every plan; it is not a blend cause.)
+*Refused* (`BlendMode` with its cause; every cause is listed): a layer the compositor's scaler resizes (the scaler's level is not swscale's and the blend carries it into the composite), a rotated one **except a quarter turn, half or three quarters (`kerf_core::quarter_turn`: the `rotate` filter lands on whole samples there; any other angle and a keyed rotation are refused, "Rotation")**, one below full
+opacity (the RGB round trip's chroma is a level off), a letterboxed one (its bars are transparent in the blend), **a graded one (a blended clip's chain runs `format=yuva420p` and the transparent `pad` before the grade, so FFmpeg's RGB filters run `yuva420p -> argb -> yuva420p` where the grade's model is `yuv420p -> rgb24`: Y 11 / UV 9 off, every case)**, an RGB picture where the probe says the graph's conversion is not the decode's (FFmpeg 4.4's is Y 3 / UV 11 off), a matrix with no tables (an unlisted tag included; BT.2020 where it was not measured), a mode the probe refused. (An odd frame is refused by `composite_texts` for every plan; it is not a blend cause.)
 **The ledger's T9 stays refused** (1920 frames, 9.0.2: `blend_mode/on a layer below full opacity` and `blend_mode/on a layer the compositor's scaler resizes` hit every frame, the mode itself none): its overlays are translucent and, planned at the preview's 540 px, resized. Lifting them is an exact scaler (a blended clip at the render size's own picture is drawn today) and an exact RGB round trip. Parity: `motion_parity` (`blend/...`: every mode over the bars and the test pattern both ways, over noise both ways, fades, keyed opacity, masks, a key, a dissolve, moved / off the frame / odd positions, over nothing,
 two blended clips, a late start under a plain clip, BT.709 / `smpte170m` / `bt470bg` footage; **all 0 differing samples in every plane**) and `parity` (the stills at `STRICT`: PSNR >= 46 dB, max 3, the PNG conversion's own rounding).
 
@@ -920,9 +929,9 @@ blended) and draws the same frames from a Motion plan through `MotionFrames`, co
 included** (`target/parity/motion-report.txt`; montages `FFmpeg | GPU | diff x8` of frames worth a look and of any over the bound in `target/parity/motion/`). The sources are lossless
 (testsrc2 with a frame counter, colour bars, a 25 fps clip, a still, a portrait one for a letterbox, noise in all three planes, a gradient for the rotated cases) and, for the
 format and range cases, `variants()` (10-bit, 4:4:4, 4:2:2, gray, an RGB PNG, MJPEG and a JPEG still, BT.709-tagged). Families: plain cuts and speeds at five rates, clip fades,
-dips, dissolves, the eight slides and pushes, keyed position / rotation, rotated and translucent layers on an alpha plane, and the coverage archetypes' montage and talking-head
+dips, dissolves, the eight slides and pushes, keyed position, quarter-turned and translucent layers on an alpha plane (a keyed rotation and any other turn are refused cases), and the coverage archetypes' montage and talking-head
 shapes. **Every sample equals the export's wherever a picture is drawn at its own size on 9.0.2 and 6.1.1 (max error 0)**; one level where the compositor scales a layer (the
-scaler's, `parity.rs`), two where it scales **and** grades, two inside a rotated layer (the band within 3 px of its edge, from the plan's geometry, is left out), and a dip to
+scaler's, `parity.rs`), two where it scales **and** grades, and a dip to
 white at two (`WHITE`; three of Y on BT.709, `WHITE_709`). **A grade at the picture's size is exact on both** (0 differing samples in the frames drawn of all but two of the 108 `grade/` rows: each part alone and the three together over six pictures, untagged, BT.709 and `smpte170m` / `bt470bg`, a crop, speed 2, an `eq` ahead of it (static and keyed), over another track, dissolving in and out, under a mask and a chroma key, a keyed opacity and a keyed position over another track, beside clips of its own matrix in either order, a labelled HD clip; rotated at one level and translucent at one level of chroma, which is those layers' own ladder). **A refusal case** (`run_refusing`) skips the frames the plan refuses for its reason, requires at least one, and
 holds **every other frame to the export** (a refusal wider than it has to be shows): the letterboxed / odd / resized / not-`yuv420p` dips to white, the fades on a translucent layer,
 the full-range pictures (`run_full_range`: drawn exactly under `FixedBt601`, refused under the negotiating policies), and the grades whose tables step past two on a layer the scaler resizes (`run_grade_steep`: a keyed ramp frame by frame; `a_grade_on_a_layer_the_scaler_resizes_is_drawn_while_its_tables_step_by_two_and_refused_past_it` holds the static ones drawn to **the step itself** on a luma ramp, hard edges and noise, and refuses the steeper). A mutation of the chroma constant by nine in 65536 fails the dips
@@ -960,11 +969,10 @@ the pinned one** — the two compose colour differently, so a green run on one p
 nothing about the other) renders each case at several times through `export_still` (a
 PNG at the full canvas) and through the GPU and compares them:
 **PSNR >= 40 dB and max per-channel error <= 8/255 outside the edge band**, where the
-band is every pixel within 2 px of a >24-level step in the *reference* (>12 for a case
-with a rotated layer, whose stair-stepped edge at a reduced opacity shows less contrast),
+band is every pixel within 2 px of a >24-level step in the *reference*,
 **at least half the frame must be outside it** (a case that is edge everywhere — noise, a
 1-px checkerboard — takes `BUSY` limits: the whole image against the same error bounds),
-plus a whole-image PSNR floor (40 dB, 30 dB for a case with a rotated layer) that catches
+plus a whole-image PSNR floor (40 dB) that catches
 a layer a row off. Thresholds live as named constants at the top of the file with the
 reason for each and the measured numbers at the bottom; a case never relaxes them
 silently, and a new visual feature gets a case. Assets are made by the same probe an
@@ -975,7 +983,7 @@ strictly, a stack the policy cannot draw (`check_mixed`: mixed tags on 9.0.2, wh
 same case is compared strictly on 6.1) is **asserted refused by the plan**. Cases:
 single clip (three sources), a gap, contain / cover into 9:16 / 16:9 and up / down
 scaling, picture-in-picture (including a 361x203 layer in a 722x640 frame), scale + rotate
-+ crop, odd-sized and off-canvas layers, **letterboxed layers over and under others** (bars
++ crop (refused: a 17 degree turn), odd-sized and off-canvas layers, **letterboxed layers over and under others** (bars
 cover, graded bars), **opacity** (several sources and roles, a graded fade),
 **matrices** (BT.709 and BT.2020 single and layered, mixed tags, an RGB PNG under and over
 tagged clips, translucent layers over tagged ones in both orders), **the BT.709 label** (`label/` and `proxy/`: untagged HD alone, among
@@ -984,12 +992,12 @@ tone-map tags BT.709; untagged SD and PNG logos, which are not labelled; `smpte1
 own proxies from `generate_proxy`; a real JPEG, WebP and MJPEG clip, whose `bt470bg` tags are decoders' defaults and label nothing; and `tests/motion_parity.rs`, a translucent HD clip alone in its second of a cut whose
 other second holds a BT.709 clip, where the Motion plan labels by the cut's graph; a labelled HD clip's dip to white in a still and in motion), colour (all four knobs,
 contrast + saturation only, warm / cool), PNG and JPEG stills, speed / reverse / keyframes (a zoom
-and a position moving; a rotation and an opacity moving over a held zoom),
+and a position moving; a rotation and an opacity moving over a held zoom, the rotation refused),
 10-bit / 4:2:2 / 4:4:4 / BGR0 / gray / full-range / odd-sized / metadata-rotated sources
 (shrunk, fitted and **enlarged** — every resize of a non-4:2:0, non-gray format is
 asserted refused, the mild shrinks included, and the same formats at their own size drawn), **busy sources** scaled by non-integer ratios, a clip past the end of its
 footage (nothing drawn, like FFmpeg), the scaler plane by plane (including 8:1 to 20:1
-shrinks), a rotated grey with no colour fringe, an asset that never recorded its pixel
+shrinks), a quarter-turned grey with no colour fringe and every other turn refused by the plan and by the compositor, an asset that never recorded its pixel
 format, **chroma-grid cases** (crops, Cover offsets and letterbox gaps chosen so the
 4:2:0 and the native rounding differ, on 4:2:0 / 4:2:2 / 4:4:4 / gray / BGR0 / RGB PNG —
 the crops of finer-chroma pictures that cannot be placed exactly are asserted refused),

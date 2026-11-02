@@ -2069,6 +2069,12 @@ impl Compositor {
     /// What happens to `layer`'s planes between the scaler and the blend, beyond its fades.
     fn look_of(&self, layer: &kerf_core::PlanLayer, geom: &LayerGeometry) -> Result<LayerLook, GpuError> {
         let unsupported = |what: String| GpuError::Unsupported(format!("layer {}: {what}", layer.name));
+        // (The plan refuses the rest: `Unsupported::Rotation`. The only turn drawn is one `rotate` lands on whole samples for.)
+        if geom.rotation.is_some_and(|r| kerf_core::quarter_turn(r.angle).is_none()) {
+            return Err(unsupported(
+                "a rotation that is not a quarter turn FFmpeg's rotate lands on whole samples for".into(),
+            ));
+        }
         let (zoom_last, (pw, ph)) = effect_picture(layer, geom);
         // The grade runs in RGB on the picture the chain has made, at its own size: FFmpeg carries it through
         // `rgb24` and back, and what is reproduced is that for a picture the scaler did not resize, with nothing
@@ -2645,8 +2651,16 @@ impl Compositor {
             let fades = &fades;
             let [py, pu, pv] = &current;
 
-            let (rotate, rot) = match geom.rotation {
-                Some(r) => (1, [r.angle.cos() as f32, r.angle.sin() as f32]),
+            // (Only a quarter turn `rotate` lands on whole samples for is drawn, `look_of` having refused the rest: its cosine and sine are
+            // the exact 0 and ±1 the filter's integer ones come out as, not those of an angle that is a rounded multiple of a quarter.)
+            let (rotate, rot) = match geom.rotation.map(|r| kerf_core::quarter_turn(r.angle)) {
+                Some(Some(turn)) => (1, [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0], [0.0, -1.0]][usize::from(turn)]),
+                Some(None) => {
+                    return Err(GpuError::Unsupported(format!(
+                        "layer {}: a rotation that is not a quarter turn FFmpeg's rotate lands on whole samples for",
+                        layer.name
+                    )))
+                }
                 None => (0, [1.0, 0.0]),
             };
             let (lw, lh) = geom.layer;
@@ -2690,12 +2704,13 @@ impl Compositor {
             let views = [&py.view, &pu.view, &pv.view];
             // `overlay` blends whole chroma samples: the half block an odd layer
             // ends in reaches one pixel past it, carrying the layer's chroma onto
-            // the base's luma. Reproduced for a layer that is not rotated (a
-            // rotated one has soft, partly transparent edges there).
+            // the base's luma. A turned layer is drawn only where `rotate` lands on whole
+            // samples (a quarter turn), so its box is a picture like any other and it
+            // reaches past it the same way.
             let odd = (lw % 2 == 1, lh % 2 == 1);
             let past_x = i64::from(geom.origin.0) + i64::from(lw);
             let past_y = i64::from(geom.origin.1) + i64::from(lh);
-            let tail = rotate == 0 && (odd.0 || odd.1);
+            let tail = odd.0 || odd.1;
             let tx1 = (past_x + i64::from(odd.0)).min(i64::from(ow));
             let ty1 = (past_y + i64::from(odd.1)).min(i64::from(oh));
             let (rx1, ry1) = if tail { (tx1.max(x1), ty1.max(y1)) } else { (x1, y1) };

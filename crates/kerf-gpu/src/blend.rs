@@ -348,61 +348,88 @@ struct State {
     retry_at: Option<Instant>,
 }
 
-static STATE: Mutex<State> = Mutex::new(State {
-    measured: None,
-    failures: 0,
-    retry_at: None,
-});
-
-fn lock() -> std::sync::MutexGuard<'static, State> {
-    STATE.lock().unwrap_or_else(PoisonError::into_inner)
+/// What is known about this FFmpeg's blend chain, and the one measurement that may be running to find out.
+struct Probe {
+    state: Mutex<State>,
+    /// Held by whoever is measuring: one probe at a time, whoever asks.
+    flight: Mutex<()>,
 }
 
-/// What this FFmpeg draws as the model does, once probed: kept for good. The first call runs the probe (a few short `ffmpeg`
-/// children, bounded), on a blocking thread, ahead of the frame that needs it ([`crate::prepare`]). A probe that could not run is retried
-/// after a backoff and until then draws nothing.
-fn found() -> Found {
-    let nothing = Found {
-        kinds: [BlendKinds::NONE; 2],
-        extras: BlendExtras::NONE,
-    };
-    {
-        let s = lock();
+/// No mode, no extra: what is drawn until the probe has answered.
+const NOTHING: Found = Found {
+    kinds: [BlendKinds::NONE; 2],
+    extras: BlendExtras::NONE,
+};
+
+impl Probe {
+    const fn new() -> Self {
+        Self {
+            state: Mutex::new(State {
+                measured: None,
+                failures: 0,
+                retry_at: None,
+            }),
+            flight: Mutex::new(()),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// What can be answered without measuring: the kept answer, or nothing within the backoff of a probe that could not run.
+    fn settled(&self) -> Option<Found> {
+        let s = self.lock();
         if let Some(k) = s.measured {
-            return k;
+            return Some(k);
         }
-        if s.retry_at.is_some_and(|t| Instant::now() < t) {
-            return nothing;
+        s.retry_at.is_some_and(|t| Instant::now() < t).then_some(NOTHING)
+    }
+
+    /// The answer, measured by `measure` if nothing is known. **One measurement at a time**: a caller that arrives while another is measuring
+    /// waits for it and takes its answer (a measured one, or the backoff's nothing) instead of launching the children again.
+    fn found(&self, measure: impl FnOnce() -> Option<Found>) -> Found {
+        if let Some(found) = self.settled() {
+            return found;
         }
-    }
-    let measured = measure();
-    let mut s = lock();
-    if let Some(k) = s.measured {
-        return k;
-    }
-    match measured {
-        Some(found) => {
-            if found.kinds.iter().any(|k| *k != BlendKinds::ALL) {
-                tracing::warn!(
-                    ?found,
-                    "this FFmpeg's blend chain is not the one the GPU follows for some modes; they are drawn by FFmpeg"
-                );
+        let _flight = self.flight.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(found) = self.settled() {
+            return found;
+        }
+        match measure() {
+            Some(found) => {
+                if found.kinds.iter().any(|k| *k != BlendKinds::ALL) {
+                    tracing::warn!(
+                        ?found,
+                        "this FFmpeg's blend chain is not the one the GPU follows for some modes; they are drawn by FFmpeg"
+                    );
+                }
+                self.lock().measured = Some(found);
+                found
             }
-            s.measured = Some(found);
-            found
-        }
-        None => {
-            s.failures += 1;
-            let wait = Duration::from_secs((5u64 << s.failures.saturating_sub(1).min(6)).min(300));
-            s.retry_at = Some(Instant::now() + wait);
-            tracing::warn!(
-                failures = s.failures,
-                retry_in_secs = wait.as_secs(),
-                "could not measure FFmpeg's blend chain; blended layers are not drawn on the GPU until it can"
-            );
-            nothing
+            None => {
+                let mut s = self.lock();
+                s.failures += 1;
+                let wait = Duration::from_secs((5u64 << s.failures.saturating_sub(1).min(6)).min(300));
+                s.retry_at = Some(Instant::now() + wait);
+                tracing::warn!(
+                    failures = s.failures,
+                    retry_in_secs = wait.as_secs(),
+                    "could not measure FFmpeg's blend chain; blended layers are not drawn on the GPU until it can"
+                );
+                NOTHING
+            }
         }
     }
+}
+
+static STATE: Probe = Probe::new();
+
+/// What this FFmpeg draws as the model does, once probed: kept for good. The first call runs the probe (a few dozen short `ffmpeg`
+/// children, [`WORKERS`] at a time, bounded), on a blocking thread, ahead of the frame that needs it ([`crate::prepare`]). A probe that could
+/// not run is retried after a backoff and until then draws nothing; concurrent callers share one measurement ([`Probe::found`]).
+fn found() -> Found {
+    STATE.found(measure)
 }
 
 /// The modes this FFmpeg draws as the model does, **per matrix**: `[BT.601, BT.709]`. Probes on the first call ([`found`]).
@@ -418,12 +445,12 @@ pub fn extras() -> BlendExtras {
 
 /// What is known without running anything: [`kernels`]'s answer once there is one, else nothing.
 pub fn measured() -> [BlendKinds; 2] {
-    lock().measured.map_or([BlendKinds::NONE; 2], |f| f.kinds)
+    STATE.lock().measured.map_or([BlendKinds::NONE; 2], |f| f.kinds)
 }
 
 /// [`extras`] without running anything.
 pub fn measured_extras() -> BlendExtras {
-    lock().measured.map_or(BlendExtras::NONE, |f| f.extras)
+    STATE.lock().measured.map_or(BlendExtras::NONE, |f| f.extras)
 }
 
 /// Pins for tests and for a host that knows its FFmpeg: every mode on every matrix.
@@ -539,21 +566,19 @@ fn lay(base: &Planes, clip: &Planes, alpha: &[u8], x: i32, y: i32) -> (Planes, V
 /// composite (the bottom layer's matrix, which FFmpeg 9 carries through the overlays: it converts the blend's output into it at the
 /// last `overlay` otherwise) is tagged here too, as the export's frames are.
 fn graph(mode: BlendMode, tag: Option<&str>) -> Option<String> {
-    let name = mode.ffmpeg()?;
     let tagged = tag.map_or_else(String::new, |t| format!("setparams=colorspace={t}:range=tv,"));
     Some(format!(
         "[0:v]{tagged}null[cc];[1:v]null[aa];[2:v]{tagged}split[b][m];{}",
-        kerf_core::blend_colour_graph(name, tag)
+        kerf_core::blend_colour_graph(mode, tag)?
     ))
 }
 
 /// The whole chain, the clip placed by the export's own `overlay`: `[0]` the composite, `[1]` the clip (`yuva420p`).
-fn placed_graph(mode: BlendMode, tag: Option<&str>, (x, y): (i32, i32)) -> Option<String> {
-    let name = mode.ffmpeg()?;
+fn placed_graph(mode: BlendMode, tag: Option<&str>, place: (i32, i32)) -> Option<String> {
     let tagged = tag.map_or_else(String::new, |t| format!("setparams=colorspace={t}:range=tv,"));
     Some(format!(
         "[0:v]{tagged}format=yuv420p[base];[1:v]{tagged}format=yuva420p[clip];{}",
-        kerf_core::blend_probe_graph(name, &format!("overlay=x={x}:y={y}:eof_action=pass"), tag)
+        kerf_core::blend_probe_graph(mode, place, tag)?
     ))
 }
 
@@ -633,6 +658,9 @@ fn judge(jobs: &[Job], outputs: &[Option<Vec<u8>>], decoded: Option<&[u8]>) -> V
             }
         };
         if !matched {
+            if out.is_some() {
+                tracing::debug!(probes = ?job.probes, matrix = job.matrix, "FFmpeg's blend chain came back as another picture than the model's");
+            }
             match job.probes {
                 Probes::Mode(mode) => kinds[job.matrix] = kinds[job.matrix].without(BlendKinds::of(mode)),
                 Probes::Placement => kinds[job.matrix] = BlendKinds::NONE,
@@ -743,63 +771,133 @@ fn measure() -> Option<Found> {
     verdict.kept()
 }
 
-/// Run the probe's children side by side, all of them bounded by `deadline`: each job's output, and the decode's frame of the RGB clip
-/// (`scale=out_range=tv` then 4:2:0, what `source::decode_args` makes of it).
+/// How many of the probe's children run at once: the pictures are tiny and each child is short, so the count is what a handful of cores keeps
+/// busy without launching the whole probe (a few dozen processes) in one burst.
+const WORKERS: usize = 6;
+
+/// How much of a failed child's stderr is kept for the log.
+const STDERR_TAIL: usize = 512;
+
+/// Why a child gave no answer.
+#[derive(Debug)]
+enum Failure {
+    /// The deadline had passed, or passed while it ran (it was killed).
+    Late,
+    /// The process could not be started.
+    Spawn(std::io::Error),
+    /// It exited unsuccessfully (`None`: ended by a signal).
+    Exit(Option<i32>),
+    /// It wrote more than the picture it was to write.
+    TooMuch,
+    /// Its output could not be read before the deadline.
+    NoOutput,
+}
+
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Late => f.write_str("late (killed at the probe's deadline)"),
+            Self::Spawn(e) => write!(f, "could not be started: {e}"),
+            Self::Exit(Some(code)) => write!(f, "exited with status {code}"),
+            Self::Exit(None) => f.write_str("was ended by a signal"),
+            Self::TooMuch => f.write_str("wrote more than a picture"),
+            Self::NoOutput => f.write_str("left its output unread at the deadline"),
+        }
+    }
+}
+
+/// A child that gave no answer, and the tail of what it said on stderr.
+#[derive(Debug)]
+struct Failed {
+    why: Failure,
+    stderr: String,
+}
+
+/// Run the probe's children, [`WORKERS`] at a time, all of them bounded by one `deadline`: each job's output, and the decode's frame of the RGB
+/// clip (`scale=out_range=tv` then 4:2:0, what `source::decode_args` makes of it). A child that gave no answer is logged with the job it was a
+/// probe of and the tail of its stderr.
 fn run_jobs(jobs: &[Job], dir: &std::path::Path, deadline: Instant) -> (Vec<Option<Vec<u8>>>, Option<Vec<u8>>) {
-    let (w, h) = PROBE;
-    let share = jobs.len() + 1;
+    // (The decode is the work item after the jobs.)
+    let total = jobs.len() + 1;
+    let workers = WORKERS.min(total);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let answers: Mutex<Vec<Option<Vec<u8>>>> = Mutex::new(vec![None; total]);
     std::thread::scope(|scope| {
-        let runs: Vec<_> = jobs
-            .iter()
-            .map(|job| {
-                scope.spawn(move || {
-                    let mut args: Vec<String> = ["-hide_banner", "-loglevel", "error", "-nostdin"].map(String::from).to_vec();
-                    for (name, pix, (iw, ih)) in &job.inputs {
-                        args.extend(["-f", "rawvideo", "-pix_fmt", pix, "-s", &format!("{iw}x{ih}"), "-i"].map(String::from));
-                        args.push(dir.join(name).to_string_lossy().into_owned());
-                    }
-                    args.extend(["-filter_complex".to_string(), job.graph.clone()]);
-                    args.extend(
-                        [
-                            "-map",
-                            "[out]",
-                            "-frames:v",
-                            "1",
-                            "-f",
-                            "rawvideo",
-                            "-pix_fmt",
-                            "yuv420p",
-                            "pipe:1",
-                        ]
-                        .map(String::from),
-                    );
-                    kerf_core::limit_frame_args(&mut args, share);
-                    if matches!(job.probes, Probes::Placement | Probes::RgbPicture) {
-                        // FFmpeg 4.4's `overlay` slices a clip above the frame's top edge wrongly when it runs on several threads
-                        // (its alpha plane loses rows), as an export's graph does: the placement is probed with them.
-                        for flag in ["-filter_threads", "-filter_complex_threads"] {
-                            while let Some(at) = args.iter().position(|a| a == flag) {
-                                args.drain(at..=(at + 1).min(args.len() - 1));
-                            }
-                            args.splice(0..0, [flag.to_string(), "8".to_string()]);
-                        }
-                    }
-                    let mut cmd = kerf_core::ffmpeg_command();
-                    cmd.args(&args);
-                    run_bounded(cmd, w * h * 3 / 2 + 1, deadline)
-                })
-            })
-            .collect();
-        let decode = scope.spawn(move || decode_rgb(dir, share, deadline));
-        (
-            runs.into_iter().map(|run| run.join().ok().flatten()).collect(),
-            decode.join().ok().flatten(),
-        )
-    })
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                let at = next.fetch_add(1, Ordering::Relaxed);
+                if at >= total {
+                    break;
+                }
+                let outcome = match jobs.get(at) {
+                    Some(job) => run_job(job, dir, workers, deadline).inspect_err(|failed| {
+                        tracing::warn!(
+                            probes = ?job.probes,
+                            matrix = ?MATRICES[job.matrix.min(MATRICES.len() - 1)].1,
+                            failure = %failed.why,
+                            stderr = %failed.stderr,
+                            graph = %job.graph,
+                            "a child of FFmpeg's blend probe did not answer"
+                        );
+                    }),
+                    None => decode_rgb(dir, workers, deadline).inspect_err(|failed| {
+                        tracing::warn!(
+                            failure = %failed.why,
+                            stderr = %failed.stderr,
+                            "the decode of FFmpeg's blend probe's RGB clip did not answer"
+                        );
+                    }),
+                };
+                answers.lock().unwrap_or_else(PoisonError::into_inner)[at] = outcome.ok();
+            });
+        }
+    });
+    let mut answers = answers.into_inner().unwrap_or_else(PoisonError::into_inner);
+    let decoded = answers.pop().flatten();
+    (answers, decoded)
+}
+
+/// One job's child: its graph over the pictures it reads, one frame of 4:2:0 back.
+fn run_job(job: &Job, dir: &std::path::Path, share: usize, deadline: Instant) -> Result<Vec<u8>, Failed> {
+    let (w, h) = PROBE;
+    let mut args: Vec<String> = ["-hide_banner", "-loglevel", "error", "-nostdin"].map(String::from).to_vec();
+    for (name, pix, (iw, ih)) in &job.inputs {
+        args.extend(["-f", "rawvideo", "-pix_fmt", pix, "-s", &format!("{iw}x{ih}"), "-i"].map(String::from));
+        args.push(dir.join(name).to_string_lossy().into_owned());
+    }
+    args.extend(["-filter_complex".to_string(), job.graph.clone()]);
+    args.extend(
+        [
+            "-map",
+            "[out]",
+            "-frames:v",
+            "1",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "yuv420p",
+            "pipe:1",
+        ]
+        .map(String::from),
+    );
+    kerf_core::limit_frame_args(&mut args, share);
+    if matches!(job.probes, Probes::Placement | Probes::RgbPicture) {
+        // FFmpeg 4.4's `overlay` slices a clip above the frame's top edge wrongly when it runs on several threads
+        // (its alpha plane loses rows), as an export's graph does: the placement is probed with them.
+        for flag in ["-filter_threads", "-filter_complex_threads"] {
+            while let Some(at) = args.iter().position(|a| a == flag) {
+                args.drain(at..=(at + 1).min(args.len() - 1));
+            }
+            args.splice(0..0, [flag.to_string(), "8".to_string()]);
+        }
+    }
+    let mut cmd = kerf_core::ffmpeg_command();
+    cmd.args(&args);
+    run_child(cmd, w * h * 3 / 2 + 1, deadline)
 }
 
 /// The decode's frame of the probe's RGB clip: `scale=out_range=tv` (the filter `source::decode_args` runs) into 4:2:0.
-fn decode_rgb(dir: &std::path::Path, share: usize, deadline: Instant) -> Option<Vec<u8>> {
+fn decode_rgb(dir: &std::path::Path, share: usize, deadline: Instant) -> Result<Vec<u8>, Failed> {
     let (cw, ch) = CLIP;
     let mut args: Vec<String> = ["-hide_banner", "-loglevel", "error", "-nostdin"].map(String::from).to_vec();
     args.extend(["-f", "rawvideo", "-pix_fmt", "rgb24", "-s", &format!("{cw}x{ch}"), "-i"].map(String::from));
@@ -821,25 +919,60 @@ fn decode_rgb(dir: &std::path::Path, share: usize, deadline: Instant) -> Option<
     kerf_core::limit_frame_args(&mut args, share);
     let mut cmd = kerf_core::ffmpeg_command();
     cmd.args(&args);
-    run_bounded(cmd, cw * ch * 3 / 2 + 1, deadline)
+    run_child(cmd, cw * ch * 3 / 2 + 1, deadline)
 }
 
-/// Run `cmd` and read its stdout (at most `cap` bytes) until it exits or `deadline` passes. `None` when it fails, writes more than `cap` or is
-/// late. A late child is killed and its output is **never joined on**: the reader is a detached thread that ends when the pipe does (a wrapper
-/// script's grandchild may hold the pipe past the kill), so a wedged FFmpeg cannot hold the probe, and the caller waiting on it, past the deadline.
-fn run_bounded(mut cmd: std::process::Command, cap: usize, deadline: Instant) -> Option<Vec<u8>> {
+/// Keep the last `keep` bytes `reader` yields in `sink`, as they come (so that a reader a wedged pipe never ends still has said what it said).
+fn collect_tail(mut reader: impl std::io::Read, keep: usize, sink: &Mutex<Vec<u8>>) {
+    let mut chunk = [0u8; 1024];
+    while let Ok(n @ 1..) = reader.read(&mut chunk) {
+        let mut tail = sink.lock().unwrap_or_else(PoisonError::into_inner);
+        tail.extend_from_slice(&chunk[..n]);
+        if tail.len() > keep {
+            let excess = tail.len() - keep;
+            tail.drain(..excess);
+        }
+    }
+}
+
+/// What `sink` holds, as trimmed text.
+fn tail_text(sink: &Mutex<Vec<u8>>) -> String {
+    String::from_utf8_lossy(&sink.lock().unwrap_or_else(PoisonError::into_inner))
+        .trim()
+        .to_string()
+}
+
+/// The last `keep` bytes `reader` yields (to its end), as text.
+#[cfg(test)]
+fn read_tail(reader: impl std::io::Read, keep: usize) -> String {
+    let sink = Mutex::new(Vec::new());
+    collect_tail(reader, keep, &sink);
+    tail_text(&sink)
+}
+
+/// Run `cmd` and read its stdout (at most `cap` bytes) until it exits or `deadline` passes; the tail of its stderr is kept for the log. A late child
+/// is killed and its output is **never joined on**: the readers are detached threads that end when the pipes do (a wrapper script's grandchild may
+/// hold a pipe past the kill), so a wedged FFmpeg cannot hold the probe, and the caller waiting on it, past the deadline.
+fn run_child(mut cmd: std::process::Command, cap: usize, deadline: Instant) -> Result<Vec<u8>, Failed> {
     use std::io::Read;
     use std::process::Stdio;
+    let nothing = |why| Failed {
+        why,
+        stderr: String::new(),
+    };
+    if Instant::now() >= deadline {
+        return Err(nothing(Failure::Late));
+    }
     let mut child = cmd
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())
         .spawn()
-        .ok()?;
-    let Some(stdout) = child.stdout.take() else {
+        .map_err(|e| nothing(Failure::Spawn(e)))?;
+    let (Some(stdout), Some(stderr)) = (child.stdout.take(), child.stderr.take()) else {
         let _ = child.kill();
         let _ = child.wait();
-        return None;
+        return Err(nothing(Failure::NoOutput));
     };
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -848,6 +981,20 @@ fn run_bounded(mut cmd: std::process::Command, cap: usize, deadline: Instant) ->
         let _ = stdout.take(cap as u64 + 1).read_to_end(&mut out);
         let _ = tx.send(out);
     });
+    let said = std::sync::Arc::new(Mutex::new(Vec::new()));
+    let (etx, erx) = std::sync::mpsc::channel();
+    {
+        let said = said.clone();
+        std::thread::spawn(move || {
+            collect_tail(stderr, STDERR_TAIL, &said);
+            let _ = etx.send(());
+        });
+    }
+    // (What it said: given a moment to be read to its end, and taken as it stands if a pipe a grandchild holds never ends.)
+    let said = || {
+        let _ = erx.recv_timeout(Duration::from_millis(100));
+        tail_text(&said)
+    };
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
@@ -855,12 +1002,38 @@ fn run_bounded(mut cmd: std::process::Command, cap: usize, deadline: Instant) ->
             _ => {
                 let _ = child.kill();
                 let _ = child.wait();
-                return None;
+                return Err(Failed {
+                    why: Failure::Late,
+                    stderr: said(),
+                });
             }
         }
     };
-    let out = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())).ok()?;
-    (status.success() && out.len() <= cap).then_some(out)
+    let Ok(out) = rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) else {
+        return Err(Failed {
+            why: Failure::NoOutput,
+            stderr: said(),
+        });
+    };
+    if !status.success() {
+        return Err(Failed {
+            why: Failure::Exit(status.code()),
+            stderr: said(),
+        });
+    }
+    if out.len() > cap {
+        return Err(Failed {
+            why: Failure::TooMuch,
+            stderr: said(),
+        });
+    }
+    Ok(out)
+}
+
+/// [`run_child`]'s answer, or `None` for any failure.
+#[cfg(test)]
+fn run_bounded(cmd: std::process::Command, cap: usize, deadline: Instant) -> Option<Vec<u8>> {
+    run_child(cmd, cap, deadline).ok()
 }
 
 #[cfg(test)]
@@ -1131,6 +1304,70 @@ mod tests {
         assert!(started.elapsed() < PROBE_TIMEOUT + Duration::from_secs(5));
     }
 
+    fn all() -> Found {
+        Found {
+            kinds: [BlendKinds::ALL; 2],
+            extras: BlendExtras::BT2020,
+        }
+    }
+
+    /// Callers that arrive together share one measurement: the probe is a few dozen children, and a second one launched beside the first would only
+    /// double the load of the very machine it is waiting on.
+    #[test]
+    fn callers_that_ask_together_share_one_measurement() {
+        use std::sync::atomic::AtomicUsize;
+        for answer in [Some(all()), None] {
+            let probe = Probe::new();
+            let runs = AtomicUsize::new(0);
+            let answers: Vec<Found> = std::thread::scope(|scope| {
+                let asks: Vec<_> = (0..8)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            probe.found(|| {
+                                runs.fetch_add(1, Ordering::SeqCst);
+                                std::thread::sleep(Duration::from_millis(150));
+                                answer
+                            })
+                        })
+                    })
+                    .collect();
+                asks.into_iter().map(|a| a.join().unwrap()).collect()
+            });
+            assert_eq!(runs.load(Ordering::SeqCst), 1, "{answer:?}: one measurement");
+            assert!(
+                answers.iter().all(|f| *f == answer.unwrap_or(NOTHING)),
+                "{answer:?}: {answers:?}"
+            );
+            // Afterwards: a kept answer is kept, and a failed one is not asked for again within its backoff.
+            assert_eq!(probe.found(|| panic!("measured again")), answer.unwrap_or(NOTHING));
+        }
+    }
+
+    #[test]
+    fn a_probe_that_could_not_run_is_asked_again_after_its_backoff_only() {
+        let probe = Probe::new();
+        assert_eq!(probe.found(|| None), NOTHING);
+        assert_eq!(probe.found(|| panic!("inside the backoff")), NOTHING);
+        probe.lock().retry_at = Some(Instant::now());
+        assert_eq!(probe.found(|| Some(all())), all(), "after it, and now kept");
+        assert_eq!(probe.found(|| panic!("kept")), all());
+    }
+
+    #[test]
+    fn the_children_run_a_few_at_a_time() {
+        assert!((4..=8).contains(&WORKERS), "{WORKERS}");
+    }
+
+    #[test]
+    fn the_tail_of_what_a_child_said_is_bounded() {
+        let long: Vec<u8> = (0..5000u32).map(|i| b'a' + (i % 26) as u8).collect();
+        let tail = read_tail(&long[..], 64);
+        assert_eq!(tail.len(), 64);
+        assert_eq!(tail.as_bytes(), &long[5000 - 64..]);
+        assert_eq!(read_tail(&b"  short  \n"[..], 64), "short");
+        assert_eq!(read_tail(&b""[..], 64), "");
+    }
+
     #[cfg(unix)]
     mod bounded {
         use super::*;
@@ -1173,6 +1410,25 @@ mod tests {
                 "the probe waited {:?} on a pipe that a killed child's grandchild held",
                 started.elapsed()
             );
+        }
+
+        #[test]
+        fn a_child_that_failed_says_why_and_what_it_wrote() {
+            let soon = Instant::now() + Duration::from_secs(20);
+            let failed = run_child(sh("echo 'no such filter' >&2; exit 3"), 16, soon).unwrap_err();
+            assert!(matches!(failed.why, Failure::Exit(Some(3))), "{failed:?}");
+            assert_eq!(failed.stderr, "no such filter");
+            let failed = run_child(sh("printf abcdef; echo big >&2"), 5, soon).unwrap_err();
+            assert!(matches!(failed.why, Failure::TooMuch), "{failed:?}");
+            assert_eq!(failed.stderr, "big");
+            let started = Instant::now();
+            let failed = run_child(sh("echo late >&2; sleep 30"), 16, started + Duration::from_millis(300)).unwrap_err();
+            assert!(matches!(failed.why, Failure::Late), "{failed:?}");
+            assert_eq!(failed.stderr, "late");
+            assert!(started.elapsed() < Duration::from_secs(5), "{:?}", started.elapsed());
+            // Past the deadline already: nothing is started.
+            let failed = run_child(sh("touch /nonexistent/never"), 16, started).unwrap_err();
+            assert!(matches!(failed.why, Failure::Late), "{failed:?}");
         }
 
         #[test]

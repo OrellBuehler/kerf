@@ -185,12 +185,10 @@ fn diff(plane: &str, got: &[u8], want: &[u8], w: usize) -> Option<String> {
 }
 
 fn graphs(s: &Scenario) -> (String, String) {
-    let name = s.mode.ffmpeg().expect("a mode");
     let tagged = s
         .tag
         .map_or_else(String::new, |t| format!("setparams=colorspace={t}:range=tv,"));
-    let placement = format!("overlay=x={}:y={}:eof_action=pass", s.pos.0, s.pos.1);
-    let chain = kerf_core::blend_probe_graph(name, &placement, s.tag);
+    let chain = kerf_core::blend_probe_graph(s.mode, s.pos, s.tag).expect("a mode");
     let whole = format!("[0:v]{tagged}format=yuv420p[base];[1:v]{tagged}format=yuva420p[clip];{chain}");
     // The first half of the same text, up to `alphamerge`: the clip laid opaque on the composite and its alpha plane.
     let mut half: Vec<&str> = Vec::new();

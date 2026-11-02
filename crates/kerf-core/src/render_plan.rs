@@ -283,6 +283,10 @@ pub struct PlanCanvas {
     /// first picture) and over the layers on screen for a Still (the graph is those). It is the matrix the blend is drawn
     /// in, whatever the composite's own is ([`PlanCanvas::matrix`]).
     pub blend_tag: Option<&'static str>,
+    /// The bottom layer states a matrix tag no table of the blend chain is proven for ([`crate::model::matrix_tag_is_unlisted`]:
+    /// `bt2020c`, `ycgco`, `ictcp`, ...), so [`PlanCanvas::blend_tag`] is `None` for it as it is for an untagged one and the two are told
+    /// apart here. FFmpeg 9 cannot export such a cut, FFmpeg 6 draws it as BT.601: a blend is drawn for neither ([`RenderPlan::blend_matrix`]).
+    pub blend_tag_unlisted: bool,
 }
 
 /// What the compositor needs to know about a layer's source picture.
@@ -678,8 +682,9 @@ pub struct PlanLayer {
     pub effects: Vec<VideoEffect>,
     /// The clip's mask, normalized; fractions of the *layer* frame.
     pub mask: Option<Mask>,
-    /// How the clip composites onto the layers below. Anything but `Normal` is FFmpeg's `blend` in RGB, which
-    /// no compositor pass draws: [`Unsupported::BlendMode`].
+    /// How the clip composites onto the layers below. Anything but `Normal` is FFmpeg's `blend` in RGB, which a compositor
+    /// draws for the modes and the layers its caps name (`GpuCaps::blend`, `GpuCaps::blend_extras`) and otherwise leaves to
+    /// FFmpeg: [`Unsupported::BlendMode`] with its cause.
     pub blend: BlendMode,
     pub reframe: Option<PlanReframe>,
     pub fx: LayerFx,
@@ -858,10 +863,80 @@ fn effect_refusal(effect: &VideoEffect, caps: &GpuCaps) -> Option<&'static str> 
     }
 }
 
-/// Whether a clockwise `angle` in radians is a quarter turn, half a turn or three quarters (or none): the `rotate` filter lands on whole samples.
+/// The largest angle, in radians, [`quarter_turn`] looks at: past it `rotate`'s `int` angle (`res * 65536 * 16`) is out of range (a conversion
+/// C leaves undefined, and the builds do differently), and `int_sin`'s argument could overflow its own `int`.
+const MAX_TURN_RADIANS: f64 = 1000.0;
+
+/// The `rotate` filter's `int_sin` (`vf_rotate.c`, the same in FFmpeg 6.1 and 9.0): the sine of `a / 2^20` radians as `2^16` times a Taylor
+/// series to the fifth term, in integers. It is **not** the sine: near a multiple of a quarter turn it comes out a unit off (`c = 1`,
+/// `s = 65536` at 41 quarters), and the picture then lands between samples.
+fn rotate_int_sin(mut a: i64) -> i64 {
+    const FIXP2: i64 = 1 << 20;
+    const INT_PI: i64 = 3_294_199;
+    if a < 0 {
+        a = INT_PI - a;
+    }
+    a %= 2 * INT_PI;
+    if a >= INT_PI * 3 / 2 {
+        a -= 2 * INT_PI;
+    }
+    if a >= INT_PI / 2 {
+        a = INT_PI - a;
+    }
+    let a2 = (a * a) / FIXP2;
+    let mut res = 0;
+    for i in [2, 4, 6, 8, 10] {
+        res += a;
+        a = -a * a2 / (FIXP2 * i * (i + 1));
+    }
+    (res + 8) >> 4
+}
+
+/// How many quarter turns clockwise (0 to 3) `rotate` turns a picture by when its angle is `angle` radians, if it lands on whole samples
+/// there; `None` for any angle it does not, which the compositor does not draw (the filter's edge is a fixed-point sample against a float one).
+///
+/// The filter has two paths, and an angle is a quarter turn only where one of them is exact:
+/// * its `simple_rotate` fast path, taken when the angle is within `FLT_EPSILON` of 0, π/2, π or 3π/2 (and the box is the picture's, or its
+///   swap: `rotw` / `roth` come out so for any angle this near);
+/// * its general path, which walks the output with `c` and `s`, **`int_sin` of the angle truncated to `res * 65536 * 16`**
+///   ([`rotate_int_sin`]). Only where those come out as exactly 0 and ±65536 does every output sample read one input sample whole. They do
+///   for the multiples of 90 degrees from -43 to 40 quarters and then here and there (41, 42 and 45 on are a unit off, and 43, 44, -46, -47
+///   are not): the error of the series and of `INT_PI` grows with the angle, so no range is claimed past what the arithmetic says, and no
+///   angle past [`MAX_TURN_RADIANS`] (about 636 quarters), where the conversion to `int` is not defined.
+///
+/// The answer of FFmpeg 6.1.1 and 9.0.2 for every quarter turn from -1310 to 1310 is this function's (measured on pictures of odd and even
+/// sides, `tests/motion_parity.rs`'s many-turns cases hold the plan to it). An angle must also be within 1e-9 of a quarter to count:
+/// 90.00001 degrees is a rotation like 91 is, whatever the integer arithmetic makes of it.
+pub fn quarter_turn(angle: f64) -> Option<u8> {
+    use std::f64::consts::{FRAC_PI_2, PI};
+    if !angle.is_finite() || angle.abs() > MAX_TURN_RADIANS {
+        return None;
+    }
+    let quarters = angle / FRAC_PI_2;
+    let nearest = quarters.round();
+    if (quarters - nearest).abs() >= 1e-9 {
+        return None;
+    }
+    let turn = nearest.rem_euclid(4.0) as u8;
+    // The fast path: `fabs(angle - target) < FLT_EPSILON`, for the four targets in [0, 2π) only.
+    let flt_epsilon = f64::from(f32::EPSILON);
+    if [0.0, FRAC_PI_2, PI, 3.0 * PI / 2.0]
+        .iter()
+        .any(|target| (angle - target).abs() < flt_epsilon)
+    {
+        return Some(turn);
+    }
+    // The general path: `angle_int = res * FIXP * 16` (a power of two: exact), `s = int_sin(angle_int)`, `c = int_sin(angle_int + INT_PI / 2)`.
+    let angle_int = (angle * 65536.0 * 16.0) as i64;
+    let (s, c) = (rotate_int_sin(angle_int), rotate_int_sin(angle_int + 3_294_199 / 2));
+    let want = [(65536, 0), (0, 65536), (-65536, 0), (0, -65536)][usize::from(turn)];
+    ((c, s) == want).then_some(turn)
+}
+
+/// Whether a clockwise `angle` in radians is a quarter turn, half a turn or three quarters that the `rotate` filter lands on whole samples
+/// for: [`quarter_turn`] has an answer.
 pub fn is_quarter_turn(angle: f64) -> bool {
-    let quarters = angle / std::f64::consts::FRAC_PI_2;
-    (quarters - quarters.round()).abs() < 1e-9
+    quarter_turn(angle).is_some()
 }
 
 /// The worst-case error, in levels, the plan allows a one-level difference from FFmpeg's upstream (the
@@ -1264,7 +1339,7 @@ impl RenderPlan {
                     None => out.push(Unsupported::BlendMode(
                         at(),
                         layer.blend,
-                        "the composite's matrix is not BT.601, BT.709 or BT.2020, the ones the conversions are reproduced for",
+                        "the composite's matrix is not BT.601, BT.709 or BT.2020, the ones the conversions are reproduced for (a bottom layer's tag with no proven table included)",
                     )),
                     Some(YuvMatrix::Bt2020) if !caps.blend_extras.contains(BlendExtras::BT2020) => {
                         out.push(Unsupported::BlendMode(
@@ -1274,6 +1349,18 @@ impl RenderPlan {
                         ));
                     }
                     Some(_) => {}
+                }
+                // A tag with no table (`bt2020c`, `ycgco`, `ictcp`, ...) is judged by an allow-list of the ones proven, on the clip itself too:
+                // FFmpeg 9 cannot export such a clip, and FFmpeg 6 reads it as it reads an untagged one.
+                if layer.hdr.is_none()
+                    && !layer.stream.label_bt709
+                    && crate::model::matrix_tag_is_unlisted(layer.stream.color_space.as_deref(), layer.stream.pix_fmt.as_deref())
+                {
+                    out.push(Unsupported::BlendMode(
+                        at(),
+                        layer.blend,
+                        "a clip tagged with a colour matrix the blend's conversions have no proven table for",
+                    ));
                 }
                 // An RGB picture reaches the graph as RGB and is converted by `format=yuva420p`, where the compositor has the decode's
                 // 4:2:0: the same picture on the builds where the probe says so (FFmpeg 4.4's is Y 3 / UV 11 off, and its chain does not match), and a blend carries a
@@ -1490,6 +1577,9 @@ impl RenderPlan {
             if layer.animated.is_some_and(|a| a.behaves) && !caps.behaviors {
                 out.push(Unsupported::Behavior(at()));
             }
+            if let Some(what) = self.rotation_refusal(layer) {
+                out.push(Unsupported::Rotation(at(), what));
+            }
             // The graph fits and zooms in one `scale` from the source; the compositor's geometry (and
             // `LayerGeometry`, which the Preview's handles are placed by) still fits to the frame and
             // scales that, which is another picture. Nothing draws the new one yet.
@@ -1571,6 +1661,24 @@ impl RenderPlan {
         !layer.color.is_identity()
             || !layer.grade.is_identity()
             || (self.mode == PlanMode::Motion && layer.animated.is_some_and(|a| a.color))
+    }
+
+    /// Why a compositor does not draw this layer's rotation: the only turn it draws is one `rotate` lands on whole samples for
+    /// ([`quarter_turn`]); any other angle has an edge that is a fixed-point sample with an apron of its own (a rotated layer's edge
+    /// differed from a float model's by up to 117 levels of luma and 169 of chroma, with or without a keyed opacity), and a rotation a key or
+    /// a behaviour moves is another box (`hypot(iw,ih)`) turned by an expression per frame. A clip whose keyed rotation never turns has no
+    /// `rotate` in the graph at all.
+    fn rotation_refusal(&self, layer: &PlanLayer) -> Option<&'static str> {
+        let animated = layer.animated.filter(|_| self.mode == PlanMode::Motion);
+        if animated.is_some_and(|a| a.rotates) {
+            Some("a rotation that a key or a behaviour moves (a per-frame angle in a box of its own, with an edge that is a fixed-point sample)")
+        } else if animated.and_then(|a| a.keys).is_some_and(|k| k.rotation) {
+            None
+        } else if layer.transform.rotation != 0.0 && quarter_turn(layer.transform.rotation.to_radians()).is_none() {
+            Some("a rotation that is not a quarter, half or three quarters of a turn FFmpeg's rotate lands on whole samples for (any other angle has an edge that is a fixed-point sample)")
+        } else {
+            None
+        }
     }
 
     /// Why a compositor that draws this layer's grade parts still does not draw its chain. FFmpeg's grade
@@ -1795,6 +1903,9 @@ impl RenderPlan {
     /// bottom layer and the `smpte170m` / `bt470bg` tags, BT.709 for the tag or the graph's label; `None` for any other
     /// (`fcc`, `smpte240m`), which the blend has no tables for; BT.2020 has them, in the caps where this FFmpeg was measured to match (`BlendExtras`).
     pub fn blend_matrix(&self) -> Option<YuvMatrix> {
+        if self.canvas.blend_tag_unlisted {
+            return None;
+        }
         match self.canvas.blend_tag {
             None | Some("smpte170m" | "bt470bg") => Some(YuvMatrix::Bt601),
             Some("bt709") => Some(YuvMatrix::Bt709),
@@ -2855,7 +2966,7 @@ mod tests {
         let why = reasons(
             &|c| {
                 white(c);
-                c.transform.rotation = 10.0;
+                c.transform.rotation = 90.0;
             },
             0.5,
         );
@@ -2977,7 +3088,7 @@ mod tests {
         // A mask on a rotated layer, and on one below full opacity.
         let why = reasons(&|c| {
             c.mask = Some(mask);
-            c.transform.rotation = 10.0;
+            c.transform.rotation = 90.0;
         });
         assert!(
             matches!(why.as_slice(), [Unsupported::MaskWith(_, w)] if w.contains("rotated")),
@@ -3024,7 +3135,7 @@ mod tests {
         // A moving zoom with a rotation or an opacity below 1 in front of it: refused whatever the caps.
         let why = reasons(&|c| {
             zoom(c);
-            c.keyframes.iter_mut().for_each(|k| k.rotation = 12.0);
+            c.keyframes.iter_mut().for_each(|k| k.rotation = 90.0);
         });
         assert!(
             matches!(why.as_slice(), [Unsupported::ZoomBehind(_, w)] if w.contains("rotation")),
@@ -4220,5 +4331,109 @@ mod tests {
         )
         .unwrap();
         assert!(!p.gpu_supported());
+    }
+    /// The angles `rotate` turns a picture by whole samples for: the quarters whose integer sine and cosine are exact (measured on FFmpeg
+    /// 6.1.1 and 9.0.2 for -1310 to 1310 quarters, `tests/motion_parity.rs`), the rest refused, whatever their float angle says.
+    #[test]
+    fn a_quarter_turn_is_an_angle_rotates_integer_sine_comes_out_exact_for() {
+        let deg = |d: f64| quarter_turn(d.to_radians());
+        // The set: -47, -46, -43 to 40, 43 and 44 quarters.
+        let exact = |q: i32| (-47..=-46).contains(&q) || (-43..=40).contains(&q) || (43..=44).contains(&q);
+        for q in -700..=700 {
+            let want = exact(q).then_some(q.rem_euclid(4) as u8);
+            assert_eq!(deg(f64::from(q) * 90.0), want, "{q} quarters");
+        }
+        for (d, turn) in [
+            (90.0, 1),
+            (180.0, 2),
+            (270.0, 3),
+            (-90.0, 3),
+            (360.0, 0),
+            (450.0, 1),
+            (-450.0, 3),
+            (3600.0, 0),
+        ] {
+            assert_eq!(deg(d), Some(turn), "{d}");
+        }
+        // A hair off a quarter (within 1e-9 of one: the fast path's, `FLT_EPSILON` radians) is that quarter; 90.00001 degrees is not one.
+        for (d, turn) in [
+            (90.000_000_01, 1),
+            (89.999_999_99, 1),
+            (-90.000_000_01, 3),
+            (180.000_000_01, 2),
+            (450.000_000_01, 1),
+        ] {
+            assert_eq!(deg(d), Some(turn), "{d}");
+        }
+        for d in [91.0, 89.99, 90.00001, 45.0, 0.001, 12.0, -30.0, 359.5, 3690.0] {
+            assert_eq!(deg(d), None, "{d}");
+        }
+        // Too large for the filter's `int` angle, or not a number: never a quarter turn (and no overflow looking).
+        for d in [
+            1e300,
+            -1e300,
+            f64::MAX,
+            f64::MIN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            1e18,
+            1e7,
+            4e9,
+            90.0 * 2f64.powi(40),
+            90.0 * 2f64.powi(40) + 0.0625,
+            2f64.powi(60),
+            58_000.0,
+        ] {
+            assert_eq!(deg(d), None, "{d}");
+        }
+        assert!(is_quarter_turn(std::f64::consts::PI) && !is_quarter_turn(1.0));
+    }
+
+    #[test]
+    fn a_rotation_that_is_not_a_proven_quarter_turn_is_refused_on_every_layer() {
+        let caps = GpuCaps {
+            motion: true,
+            ..GpuCaps::A0
+        };
+        let rotation = |angle: f64| {
+            let plan = fading_plan(|c| c.transform.rotation = angle, 0.5);
+            let why = plan.reasons(&caps, plan.size(u32::MAX));
+            assert_eq!(plan.gpu_supported(), why.is_empty(), "{angle}: {why:?}");
+            why.into_iter().filter(|u| u.kind() == "rotation").count()
+        };
+        for angle in [90.0, 180.0, 270.0, -90.0, 360.0, 3600.0, 36.0 * 90.0, 43.0 * 90.0] {
+            assert_eq!(rotation(angle), 0, "{angle}");
+        }
+        for angle in [
+            12.0,
+            -30.0,
+            45.0,
+            89.5,
+            91.0,
+            90.00001,
+            41.0 * 90.0,
+            42.0 * 90.0,
+            400.0 * 90.0,
+            1e7,
+            1e300,
+            f64::MAX,
+        ] {
+            assert_eq!(rotation(angle), 1, "{angle}");
+        }
+        // Blended too (the blend's own cause is named as well).
+        let plan = fading_plan(
+            |c| {
+                c.blend_mode = BlendMode::Multiply;
+                c.transform.rotation = 12.0;
+            },
+            0.5,
+        );
+        let kinds: Vec<_> = plan
+            .reasons(&GpuCaps::A0, plan.size(u32::MAX))
+            .iter()
+            .map(Unsupported::kind)
+            .collect();
+        assert!(kinds.contains(&"rotation") && kinds.contains(&"blend_mode"), "{kinds:?}");
     }
 }

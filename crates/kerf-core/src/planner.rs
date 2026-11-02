@@ -389,23 +389,26 @@ impl Planner {
         };
         // The matrix a blended clip's conversions name: the bottom layer's of the cut (the lowest video track's first
         // picture, as `build_filter_complex` picks it). A Still plan decides it over the layers on screen instead.
-        let blend_tag = if req.mode == PlanMode::Motion {
+        let bottom = if req.mode == PlanMode::Motion {
             let has_picture = |c: &&PlannedClip| c.asset.as_ref().is_some_and(|a| a.stream.is_some());
-            clips
-                .iter()
-                .filter(has_picture)
-                .map(|c| c.track)
-                .min()
-                .and_then(|track| {
-                    clips.iter().filter(has_picture).filter(|c| c.track == track).min_by(|a, b| {
-                        let start = |c: &PlannedClip| rendered.tracks[c.track].clips[c.index].timeline_start;
-                        start(a).total_cmp(&start(b))
-                    })
+            clips.iter().filter(has_picture).map(|c| c.track).min().and_then(|track| {
+                clips.iter().filter(has_picture).filter(|c| c.track == track).min_by(|a, b| {
+                    let start = |c: &PlannedClip| rendered.tracks[c.track].clips[c.index].timeline_start;
+                    start(a).total_cmp(&start(b))
                 })
-                .and_then(|c| crate::engine::blend_composite_tag(c.fx.label_bt709, c.fx.frame_matrix))
+            })
         } else {
             None
         };
+        let blend_tag = bottom.and_then(|c| crate::engine::blend_composite_tag(c.fx.label_bt709, c.fx.frame_matrix));
+        // (A tag the graph names nothing for, that is no tag: a stated one with no table, which the blend does not draw.)
+        let blend_tag_unlisted = bottom.is_some_and(|c| {
+            blend_tag.is_none()
+                && c.asset
+                    .as_ref()
+                    .and_then(|a| a.stream.as_ref())
+                    .is_some_and(|s| crate::model::matrix_tag_is_unlisted(s.color_space.as_deref(), s.pix_fmt.as_deref()))
+        });
         Ok(Self {
             mode: req.mode,
             canvas: PlanCanvas {
@@ -422,6 +425,7 @@ impl Planner {
                 full_range_cut,
                 mixed_matrices_cut,
                 blend_tag,
+                blend_tag_unlisted,
             },
             rendered,
             clips,
@@ -796,6 +800,15 @@ impl Planner {
                             crate::model::frame_matrix_tag(l.stream.color_space.as_deref(), l.stream.pix_fmt.as_deref())
                         };
                         crate::engine::blend_composite_tag(l.stream.label_bt709, tag)
+                    })
+                },
+                blend_tag_unlisted: if motion {
+                    self.canvas.blend_tag_unlisted
+                } else {
+                    layers.first().is_some_and(|l| {
+                        l.hdr.is_none()
+                            && !l.stream.label_bt709
+                            && crate::model::matrix_tag_is_unlisted(l.stream.color_space.as_deref(), l.stream.pix_fmt.as_deref())
                     })
                 },
                 ..self.canvas.clone()
@@ -2243,7 +2256,13 @@ mod tests {
                 );
                 assert_eq!(drawn.contains(&"keyed_placement"), places, "{b:?} {mode:?}: {drawn:?}");
                 assert!(!drawn.contains(&"behavior"), "{b:?} {mode:?}: {drawn:?}");
-                assert_eq!(drawn.len(), usize::from(places), "{b:?} {mode:?}: {drawn:?}");
+                // (The turn is `rotation`'s: a key or a behaviour that turns the picture is another box, and a still's sampled angle is not a quarter.)
+                assert_eq!(drawn.contains(&"rotation"), rotation, "{b:?} {mode:?}: {drawn:?}");
+                assert_eq!(
+                    drawn.len(),
+                    usize::from(places) + usize::from(rotation),
+                    "{b:?} {mode:?}: {drawn:?}"
+                );
             }
         }
         // A behaviour that moves nothing is not live, and a clip without any is as it was.
@@ -3405,6 +3424,85 @@ mod tests {
         ] {
             plan.canvas.blend_tag = tag;
             assert_eq!(plan.blend_matrix(), matrix, "{tag:?}");
+        }
+    }
+
+    /// A blend is drawn for the matrix tags that were proven (an allow-list), not for the ones nothing refuses: a bottom layer, or a blended
+    /// clip, stating `bt2020c`, `ycgco`, `ictcp`, ... is refused whatever the composite policy says (FFmpeg 9 cannot export it, FFmpeg 6 reads it
+    /// as untagged), in a still and an export frame alike.
+    #[test]
+    fn a_blend_over_a_matrix_tag_with_no_proven_table_is_refused_under_every_policy() {
+        use crate::model::BlendMode;
+        use crate::plan_caps::{BlendExtras, BlendKinds, GpuCaps};
+        let caps = GpuCaps {
+            blend: BlendKinds::ALL,
+            blend_extras: BlendExtras::BT2020,
+            motion: true,
+            ..GpuCaps::A0
+        };
+        let tagged = |tag: Option<&str>| {
+            let mut a = asset();
+            a.streams[0].color_space = tag.map(str::to_string);
+            a
+        };
+        let blend_why = |bottom: &Asset, top: &Asset, mode: PlanMode, policy| {
+            let mut c = make_clip(top.id, 0.0, 4.0, 0.0);
+            c.blend_mode = BlendMode::Multiply;
+            let tl = timeline_of(vec![
+                video_track(vec![make_clip(bottom.id, 0.0, 4.0, 0.0)]),
+                video_track(vec![c]),
+            ]);
+            let assets = [bottom.clone(), top.clone()];
+            let planner = Planner::new(
+                &tl,
+                &assets,
+                &opts(30.0),
+                PlanRequest {
+                    mode,
+                    ..PlanRequest::still(policy)
+                },
+            )
+            .unwrap();
+            let plan = if mode == PlanMode::Motion {
+                planner.at_frame(15).unwrap()
+            } else {
+                planner.at(0.5).unwrap()
+            };
+            let size = (plan.canvas.width, plan.canvas.height);
+            plan.reasons(&caps, size)
+                .into_iter()
+                .filter(|u| u.kind() == "blend_mode")
+                .map(|u| u.to_string())
+                .collect::<Vec<_>>()
+        };
+        let listed = [None, Some("smpte170m"), Some("bt470bg")];
+        let unlisted = [
+            "bt2020c",
+            "ycgco",
+            "ictcp",
+            "chroma-derived-nc",
+            "chroma-derived-c",
+            "smpte2085",
+            "gbr",
+        ];
+        for mode in [PlanMode::Still, PlanMode::Motion] {
+            for policy in [FIXED, CompositeColorPolicy::BottomLayerTag, CompositeColorPolicy::Unknown] {
+                for tag in listed {
+                    let (bottom, top) = (tagged(tag), tagged(tag));
+                    assert!(
+                        blend_why(&bottom, &top, mode, policy).is_empty(),
+                        "{tag:?} {mode:?} {policy:?}: {:?}",
+                        blend_why(&bottom, &top, mode, policy)
+                    );
+                }
+                for tag in unlisted {
+                    let (odd, plain) = (tagged(Some(tag)), tagged(None));
+                    for (bottom, top, what) in [(&odd, &plain, "bottom"), (&plain, &odd, "top"), (&odd, &odd, "both")] {
+                        let why = blend_why(bottom, top, mode, policy);
+                        assert!(!why.is_empty(), "{tag} on the {what} {mode:?} {policy:?} is refused");
+                    }
+                }
+            }
         }
     }
 

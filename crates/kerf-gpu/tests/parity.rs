@@ -23,15 +23,14 @@
 //! (`the_scaler_matches_ffmpegs_scale_plane_by_plane`); `eq` is byte-exact; an
 //! opaque layer's blend is FFmpeg's in YUV. What remains is a hard coloured edge
 //! landing on a different pixel (chroma is averaged over 2x2 in one's alpha blend
-//! and per pixel in the other's, a rotated edge is stepped in one and sits at a
-//! fraction of a pixel in the other) and swscale's YUV -> RGB conversion, which
+//! and per pixel in the other's) and swscale's YUV -> RGB conversion, which
 //! truncates and carries a mean bias of up to a level that the shader does not
 //! copy. So a frame is judged in two parts:
 //!
 //! * the **edge band** — every pixel within [`BAND`] px of a strong gradient in
 //!   the *reference* (a step of more than [`EDGE_STEP`] levels in any channel
 //!   between neighbours, which is every layer boundary and every hard edge of
-//!   the test pattern; [`EDGE_STEP_ROTATED`] for a case with a rotated layer) —
+//!   the test pattern) —
 //!   is excluded from the strict check, and
 //! * everywhere else (the *flat* region) the GPU must hold **PSNR >= 40 dB** and a
 //!   **max per-channel error <= 8/255**.
@@ -44,7 +43,7 @@
 //! (bilinear, a box filter) has no flat area to hide in.
 //!
 //! The whole-image PSNR (band included) is held to its own floor
-//! ([`PSNR_ALL_MIN`], lower for a case with a rotated layer): it exists to catch a
+//! ([`PSNR_ALL_MIN`]): it exists to catch a
 //! layer in the wrong place, which the band alone would excuse.
 //!
 //! Frames the GPU path must **refuse** (`frames_the_gpu_would_draw_wrong_are_refused`)
@@ -154,9 +153,10 @@
 //!   from the C arithmetic the shader follows (a 58:1 shrink of a 4K test pattern
 //!   read 16 levels off in RGB).
 //! * **A rotated edge** is a fixed-point stair-step in FFmpeg and a float sample
-//!   here; the interior agrees to a level. FFmpeg's own `rotate` also leaves a few
-//!   green pixels along the edge of a neutral layer (chroma it never wrote); the
-//!   GPU does not copy them (`a_rotated_neutral_layer_has_no_colour_fringe`).
+//!   here (Y up to 117 and UV up to 169 levels off along it): no turn is drawn but a
+//!   quarter, half or three quarters of one, which lands on whole samples (every other
+//!   angle, and a rotation a key moves, is refused: `Unsupported::Rotation`,
+//!   `a_turned_neutral_layer_has_no_colour_fringe_and_any_other_turn_is_refused`).
 //! * **swscale's YUV -> RGB** truncates, a mean bias of up to a level (the flat
 //!   mean error column in the report); the shader rounds.
 //! * **Text** is FFmpeg's own `drawtext` raster blended with `drawtext`'s own arithmetic
@@ -196,16 +196,8 @@ use kerf_gpu::{Compositor, Gpu, GpuOptions};
 const BAND: usize = 2;
 /// A neighbour-to-neighbour step (any channel, in 0..255) that counts as an
 /// edge: 24 levels, about 10% of the range. It is what defines the band, so the
-/// higher it is the fewer pixels are excused — 24 is what every case without a
-/// rotated layer is judged at.
+/// higher it is the fewer pixels are excused.
 const EDGE_STEP: i32 = 24;
-/// ...and 12 for a case with a rotated layer. `rotate` writes a stair-stepped
-/// edge from a fixed-point source position; once the layer is also faded (the
-/// keyframed case runs at ~65% opacity) the edge shows at two thirds of its
-/// contrast, under 24 levels, and the stair-step — a few levels of difference at
-/// the pixels along it, measured at 10 — would be judged as a mismatch in the
-/// flat region. At 12 the same pixels are in the band; the limits did not move.
-const EDGE_STEP_ROTATED: i32 = 12;
 /// Required PSNR over the flat region.
 const PSNR_FLAT_MIN: f64 = 40.0;
 /// Allowed max per-channel error over the flat region.
@@ -215,12 +207,6 @@ const MAX_FLAT: i32 = 8;
 /// flat check and costs several dB here — the very first run of the 9:16
 /// letterbox case read 31 dB before FFmpeg's `pad` quirk was reproduced.
 const PSNR_ALL_MIN: f64 = 40.0;
-/// ...and for a case with a rotated layer. FFmpeg's `rotate` writes a hard,
-/// stair-stepped edge from a fixed-point source position; the GPU samples the
-/// same bilinear footprint at a float one. Every pixel of the border can differ
-/// by a whole step where the picture meets a different colour, which is what
-/// holds the whole-image figure near 33 dB while the interior stays above 46.
-const PSNR_ALL_MIN_ROTATED: f64 = 30.0;
 
 /// The least share of a frame that must lie outside the edge band, so the strict
 /// flat check judges at least half of every ordinary case. The recorded cases sit
@@ -293,12 +279,6 @@ const STRICT: Limits = Limits {
 const BUSY: Limits = Limits {
     flat_share: 0.0,
     max_all: Some(MAX_FLAT),
-    ..STRICT
-};
-
-const ROTATED: Limits = Limits {
-    psnr_all: PSNR_ALL_MIN_ROTATED,
-    edge_step: EDGE_STEP_ROTATED,
     ..STRICT
 };
 
@@ -1154,7 +1134,7 @@ fn rendering_through_the_frame_source_is_the_picture_the_one_shot_decodes_give()
     let mut over = clip(&m.testsrc, 0.0, 2.0, 0.0);
     over.transform = Transform {
         scale: 0.7,
-        rotation: 17.0,
+        rotation: 90.0,
         crop_left: 0.1,
         pos_x: -0.1,
         ..Transform::default()
@@ -1396,13 +1376,16 @@ fn scaled_rotated_and_cropped() {
         ..Transform::default()
     };
     let tl = timeline(vec![vec![clip(&m.gradient, 0.0, 2.0, 0.0)], vec![c]], None);
-    check(
-        "transform/scale+rotate+crop",
-        &tl,
-        &[m.gradient.clone(), m.testsrc.clone()],
-        &[0.5, 1.5],
-        ROTATED,
-    );
+    // (A turn that is not a quarter is FFmpeg's: its edge is a fixed-point sample, Y up to 117 and UV up to 169 off a float one.)
+    for t in [0.5, 1.5] {
+        check_refused(
+            "transform/scale+rotate+crop",
+            &tl,
+            &[m.gradient.clone(), m.testsrc.clone()],
+            t,
+            Refusal::Plan("a rotation"),
+        );
+    }
 
     let mut rot = clip(&m.bars, 0.0, 2.0, 0.0);
     rot.transform.rotation = 90.0;
@@ -1475,12 +1458,12 @@ fn odd_sizes_and_layers_that_leave_the_canvas() {
         ],
         None,
     );
-    check(
+    check_refused(
         "geometry/odd-rotated-box",
         &tl,
         &[m.gradient.clone(), m.portrait.clone()],
-        &[0.5],
-        ROTATED,
+        0.5,
+        Refusal::Plan("a rotation"),
     );
     // Moved so far that the layer starts left of the canvas and above it.
     let tl = timeline(
@@ -1575,42 +1558,50 @@ fn odd_sizes_and_layers_that_leave_the_canvas() {
 
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
-fn a_rotated_neutral_layer_has_no_colour_fringe() {
+fn a_turned_neutral_layer_has_no_colour_fringe_and_any_other_turn_is_refused() {
     let m = media();
-    // Mid-grey turned over black: every pixel of the result is a grey. FFmpeg's
-    // `rotate` leaves chroma outside the picture at zero (a deep green) under an
-    // alpha that is not quite zero there, and a few of its own pixels show it.
-    // The compositor must not copy that: reading chroma outside the picture as
-    // zero made a green rim on every rotated edge.
+    // Mid-grey turned over black: every pixel of the result is a grey. FFmpeg's `rotate` leaves chroma outside the picture at zero (a deep
+    // green) under an alpha that is not quite zero there, and a few of its own pixels show it; a quarter turn has no such edge, and any other
+    // turn is refused (the compositor's float edge is not the filter's fixed-point one), by the plan and by the compositor itself.
     for rotation in [17.0, 33.0, 45.0, -25.0, 5.0] {
         let mut c = clip(&m.grey, 0.0, 2.0, 0.0);
         c.transform.rotation = rotation;
         c.transform.scale = 0.7;
         let tl = timeline(vec![vec![clip(&m.black, 0.0, 2.0, 0.0)], vec![c]], None);
         let assets = [m.black.clone(), m.grey.clone()];
+        check_refused(
+            &format!("fringe/grey-rotated-{rotation}"),
+            &tl,
+            &assets,
+            0.5,
+            Refusal::Plan("a rotation"),
+        );
+        let plan = RenderPlan::at(&tl, &assets, &ExportOptions::default(), 0.5, policy()).expect("plan");
+        let err = compositor()
+            .render_plan(&plan, plan.size(u32::MAX))
+            .expect_err("the compositor refuses a turn it does not draw");
+        assert!(
+            matches!(&err, kerf_gpu::GpuError::Unsupported(why) if why.contains("a rotation that is not a quarter")),
+            "rotation {rotation}: {err}"
+        );
+    }
+    for rotation in [90.0, 180.0, 270.0, -90.0] {
+        let mut c = clip(&m.grey, 0.0, 2.0, 0.0);
+        c.transform.rotation = rotation;
+        let tl = timeline(vec![vec![clip(&m.black, 0.0, 2.0, 0.0)], vec![c]], None);
+        let assets = [m.black.clone(), m.grey.clone()];
         let plan = RenderPlan::at(&tl, &assets, &ExportOptions::default(), 0.5, policy()).expect("plan");
         let size = plan.size(u32::MAX);
         let (frame, _) = compositor().render_plan(&plan, size).expect("GPU render");
-        let spread = |rgb: &[u8]| {
-            rgb.chunks(3)
-                .map(|p| p.iter().max().unwrap() - p.iter().min().unwrap())
-                .max()
-                .unwrap_or(0)
-        };
-        let gpu = spread(&rgba_to_rgb(&frame.data));
-        // FFmpeg's own, for reference (it is not perfectly neutral either).
-        let png = Path::new(env!("CARGO_TARGET_TMPDIR")).join("parity-ref").join("fringe.png");
-        export_still(&tl, &assets, &ExportOptions::default(), 0.5, &png, ImageFormat::Png, 0).expect("FFmpeg still");
-        let reference = ffmpeg(&["-i", png.to_str().unwrap(), "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]);
-        let _ = std::fs::remove_file(&png);
-        let ffmpeg_spread = spread(&reference);
-        eprintln!("fringe/grey-rotated-{rotation:<5} worst channel spread: GPU {gpu}, FFmpeg {ffmpeg_spread}");
-        // The input is neutral, so the output must be: that is the contract, not
-        // "as bad as FFmpeg" (its own frame has a few green pixels along the edge,
-        // spread ~100, for the very reason above — they sit in the edge band).
+        let gpu = rgba_to_rgb(&frame.data)
+            .chunks(3)
+            .map(|p| p.iter().max().unwrap() - p.iter().min().unwrap())
+            .max()
+            .unwrap_or(0);
+        eprintln!("fringe/grey-turned-{rotation:<5} worst channel spread: GPU {gpu}");
         assert!(
             gpu <= FRINGE_MAX,
-            "rotation {rotation}: the GPU frame has a colour fringe (spread {gpu}; FFmpeg's has {ffmpeg_spread})"
+            "rotation {rotation}: the GPU frame has a colour fringe (spread {gpu})"
         );
     }
 }
@@ -1645,12 +1636,12 @@ fn opacity() {
         ..Transform::default()
     };
     let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![top]], None);
-    check(
+    check_refused(
         "opacity/0.3+scale+rotate",
         &tl,
         &[m.bars.clone(), m.gradient.clone()],
-        &[0.5],
-        ROTATED,
+        0.5,
+        Refusal::Plan("a rotation"),
     );
 
     // Alone, over black — the layer's own picture is what is compared.
@@ -1995,13 +1986,24 @@ fn source_time_speed_reverse_and_keyframes() {
     let mut kf = clip(&m.testsrc, 0.0, 2.0, 0.5);
     kf.keyframes = vec![key(0.0, 0.5, (0.2, -0.1), 0.0, 1.0), key(1.5, 0.5, (0.2, -0.1), 10.0, 0.6)];
     let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![kf]], None);
+    // (At the clip's first frame the keys hold no rotation and full opacity: drawn. Past it the picture is turned by a number that is not a
+    // quarter: FFmpeg's.)
     check(
         "time/keyframes+rotation+opacity",
         &tl,
         &[m.bars.clone(), m.testsrc.clone()],
-        &[0.5, 1.25, 2.0],
-        ROTATED,
+        &[0.5],
+        STRICT,
     );
+    for t in [1.25, 2.0] {
+        check_refused(
+            "time/keyframes+rotation+opacity",
+            &tl,
+            &[m.bars.clone(), m.testsrc.clone()],
+            t,
+            Refusal::Plan("a rotation"),
+        );
+    }
 }
 
 #[test]
@@ -4789,14 +4791,12 @@ fn effects_are_drawn_as_their_filters_draw_them() {
         // (A sharpen after a scale is drawn to half strength: past it the scaler's level is amplified.)
         c.effects = vec![E::Blur { sigma: 3.0 }, E::Sharpen { amount: 0.5 }];
         let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![c]], None);
-        let limits = if name == "rotated" { ROTATED } else { STRICT };
-        check(
-            &format!("effect/{name}"),
-            &tl,
-            &[m.bars.clone(), m.testsrc.clone()],
-            &[0.5],
-            limits,
-        );
+        let assets = [m.bars.clone(), m.testsrc.clone()];
+        if name == "rotated" {
+            check_refused(&format!("effect/{name}"), &tl, &assets, 0.5, Refusal::Plan("a rotation"));
+        } else {
+            check(&format!("effect/{name}"), &tl, &assets, &[0.5], STRICT);
+        }
     }
     // A vignette's map is the picture's at the size the filter sees it: scaled, odd-sized, in a Cover frame.
     for (name, edit, format) in [
@@ -6646,7 +6646,7 @@ fn a_grade_is_drawn_as_the_still_draws_it() {
     });
     check("grade/masked", &tl, &assets, &[0.5], STRICT);
     let (tl, assets) = graded(&m.gradient, heavy, &|c| c.transform.rotation = 20.0);
-    check("grade/rotated", &tl, &assets, &[0.5], ROTATED);
+    check_refused("grade/rotated", &tl, &assets, 0.5, Refusal::Plan("a rotation"));
     // A layer over another: the grade does not cover what is below, and the picture is placed by the overlay.
     let mut upper = clip(&m.testsrc, 0.0, 2.0, 0.0);
     upper.grade = heavy.clone();

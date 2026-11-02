@@ -418,7 +418,8 @@ grade through FFmpeg because the GPU preview refuses a graded clip), a **Blend**
 section (`blend-modes.ts`: `BLEND_MODES`, the core's `BlendMode` ids, labels and a hint each shown by `use:tip`; one
 `set_blend_mode` on change, nothing written for the mode the clip has; `blendModeOf` reads an absent field as `normal`; the
 harness writes `normal` as no field and refuses a clip on an audio track, `blend-modes.test.ts`; the preview of a blended clip
-is FFmpeg's, as the GPU refuses it), **behaviours** (`BehaviorsSection.svelte`, B8b, right after Transform: **Add** opens a menu of
+is the GPU's only where the plan draws it (the modes this FFmpeg's blend probe matched, a layer at its own size, opaque, upright or
+turned by a quarter, in a composite matrix the probe covers: `core-render-plan.md`, `gpu.md` "Blend modes"), else FFmpeg's), **behaviours** (`BehaviorsSection.svelte`, B8b, right after Transform: **Add** opens a menu of
 the five kinds (`ADD_CHOICES`: sway, breathe, spin, drift, shake, each with its starting numbers) and appends one at those numbers
 (a shake with a random seed); **Bake** turns them into keys at the delivery rate, and a refusal (nothing to bake, a clip too long for
 its keys) is shown in the section as an alert, not toasted; one group per behaviour, named "Sway" / "Sway 2" (`rowName`), with an

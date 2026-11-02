@@ -324,6 +324,17 @@ pub fn frame_matrix_tag(color_space: Option<&str>, pix_fmt: Option<&str>) -> Opt
     }
 }
 
+/// Whether a picture states a YCbCr matrix tag that no table of the blend chain's conversions is proven for: a tag [`matrix_tag_is_stated`] but
+/// not one [`frame_matrix_tag`] names (`bt2020c`, `ycgco`, `ictcp`, `chroma-derived-nc` and `-c`, `smpte2085`, `gbr` on a YCbCr picture, ...). The
+/// blend names the composite's matrix to its conversions by the bottom layer's tag, and FFmpeg 9 cannot export a cut tagged so at all (its
+/// `scale` has no conversion for them); FFmpeg 6.1 draws them as BT.601. Neither is the model's, so a blend draws only the tags that are listed. An
+/// RGB picture is not here (its tag, `gbr`, names no YCbCr matrix: [`RenderPlan`]'s `RgbInStack` and the blend's `RGB_PICTURE` judge it).
+pub fn matrix_tag_is_unlisted(color_space: Option<&str>, pix_fmt: Option<&str>) -> bool {
+    matrix_tag_is_stated(color_space)
+        && frame_matrix_tag(color_space, pix_fmt).is_none()
+        && pix_fmt.and_then(pix_fmt_layout) != Some(PixLayout::Rgb)
+}
+
 /// A `.cube` 3D LUT a clip is looked up through, and how much of it (`0..=1`, in hundredths).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, schemars::JsonSchema)]
 pub struct ClipLut {

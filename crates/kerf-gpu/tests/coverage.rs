@@ -2492,6 +2492,7 @@ fn every_variant() -> Vec<Unsupported> {
         Unsupported::StillMotion(layer()),
         Unsupported::KeyedZoom(layer()),
         Unsupported::KeyedPlacement(layer()),
+        Unsupported::Rotation(layer(), ""),
         Unsupported::Behavior(layer()),
         Unsupported::ZoomBehind(layer(), ""),
         Unsupported::FoldedFit(layer(), ""),
@@ -2567,6 +2568,7 @@ fn ordinal(u: &Unsupported) -> usize {
         Unsupported::Shrink(..) => 50,
         Unsupported::FormatResize(..) => 51,
         Unsupported::Geometry(..) => 52,
+        Unsupported::Rotation(..) => 53,
     }
 }
 
