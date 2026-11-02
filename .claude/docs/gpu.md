@@ -731,6 +731,16 @@ before the zoom acts at the **fit size** and the zoom magnifies it (a blur grows
   `timeline_frame_yuv`), `a_moving_still_inside_a_transition_*` (fades, crossfade, dip, slide, push, both orders of JPEG and PNG),
   `a_move_that_pans_off_the_picture_is_placed_from_the_fit_ffmpeg_makes`; `motion_parity.rs` the same in export frames at 24 / 25 / 30 / 60 fps, late, speed 2,
   reversed, over and under video, and the slideshow archetype (both routes, 144 frames).
+  **A photograph the probe saw turned** (an EXIF orientation: the stored size, a turned decode) would be fitted by the graph to sizes of its own, so the fit
+  picture opens with a `crop` of the probed size, which FFmpeg refuses on it (`Unsupported`, "probed as"; `a_photograph_the_probe_saw_turned_*`). The moving
+  still's own route needs no such guard: its copy is whatever the graph's filters make of the decoded picture.
+  **Ledger (T6, the photo slideshow of three shapes, Ken Burns, crossfades)**: still plans 0% to 100% drawn on 6.1.1 (26.7% on 9.0.2: the PNG-only frames), and
+  export frames at the delivery's frame 100% on 6.1.1 (the ledger's 540 px motion rows stay refused: an export frame's copy is made for the delivery's frame);
+  T20's still plans 22.5% to 46.9% (6.1.1). **9.0.2 and a JPEG, measured**: the moving still's own chain and a JPEG that covers the frame, faded in or not, are
+  drawn to 0 differing samples when the refusals are bypassed (the copy stays full range and the fade darkens toward 16 on the raw values, which is FFmpeg 9's), so
+  what keeps a JPEG cut off the GPU there is the cut-level conversion of everything limited-range in it (the black base, a PNG, a gap, the bars of a pan off the
+  picture: `FullRangeCut`, `FullRangeNegotiated`), not the JPEG; a cut of JPEGs alone is not claimed (no case holds the base, the bars and a mixed cut), so it stays
+  refused.
 * **Live behaviours** (`GpuCaps::behaviors`; `core-render-plan.md`): breathe, drift and shake are a formula of the clip's clock added to its pose, the plan's
   `transform` is the exact pose they give at the frame (`Clip::transform_at`, the arithmetic of the graph's expressions, `sin` / `cos` included), and the
   placement draws that pose: held exactly in export frames and stills (`behavior/*`: each alone, all three, over a keyed zoom). A sway or a spin turns the
