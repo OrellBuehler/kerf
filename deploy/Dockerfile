@@ -75,8 +75,8 @@ RUN useradd --system --uid 10001 --user-group --home-dir /data --no-create-home 
 # Everything Kerf writes lives on the three volumes, so the root filesystem can be read-only:
 # settings, logs and recovery in /data (--data-dir), voiceovers / music / templates in
 # /data/share, models, proxies and waveforms in /cache, the agent's media in /workspace.
-# KERF_CACHE_DIR puts every cache (models included) in /cache; KERF_WORKSPACE confines paths in
-# builds with --workspace support and is ignored by older ones.
+# KERF_CACHE_DIR puts every cache (models included) in /cache; KERF_WORKSPACE confines every path a
+# client names to /workspace.
 ENV HOME=/data \
     XDG_CONFIG_HOME=/data/config \
     XDG_DATA_HOME=/data/share \
