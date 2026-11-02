@@ -670,8 +670,9 @@ impl KerfMcp {
 
     #[tool(
         description = "Bring a .kerftemplate file (one the user exported, or another machine made) into the library. \
-                       `path` is an absolute path to a file on this computer (a URL, a network share (UNC path), a \
-                       relative path or a missing file is refused at once). The whole file is checked and re-read \
+                       `path` is the absolute path of a file on this computer, or one relative to the workspace when \
+                       the server is confined to one (a URL, a network share (UNC path) or a missing file is refused \
+                       at once). The whole file is checked and re-read \
                        before anything is kept; one that fails is refused with why. It never overwrites: the same \
                        template is `already_present` (nothing written), another one with the same id is kept under a \
                        new id (`added_as_copy`). Returns `info`, `status` (added / already_present / added_as_copy) and \
@@ -689,8 +690,9 @@ impl KerfMcp {
 
     #[tool(
         description = "Write a library template to a .kerftemplate file, to share it or move it to another machine. \
-                       `output_path` is an absolute path ending in .kerftemplate (a URL, a network share, a relative \
-                       path or anywhere inside the template library or Kerf's own settings is refused); an existing \
+                       `output_path` is a path ending in .kerftemplate, absolute or relative to the workspace when the \
+                       server is confined to one (a URL, a network share or anywhere inside the template library or \
+                       Kerf's own settings is refused); an existing \
                        file is refused unless `overwrite` is true. Returns the `path` written."
     )]
     async fn export_template(&self, Parameters(p): Parameters<ExportTemplateParams>) -> Result<String, McpError> {

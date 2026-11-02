@@ -377,15 +377,6 @@ pub(crate) fn main(argv: &[String], bundled_ffmpeg: &[(&'static str, PathBuf)]) 
         say(&format!("kerf-app: {e}\n\n{USAGE}"));
         return EXIT_USAGE;
     }
-    if let Err(Exit(code, message)) =
-        use_cache_dir(args.cache_dir.as_deref()).and_then(|()| check_cache_cap(&args, kerf_core::paths::cache_dir()))
-    {
-        say(&format!("kerf-app: {message}"));
-        return code;
-    }
-    if let Some(models) = &args.prefetch {
-        return prefetch(models);
-    }
     let workspace = match open_workspace(&mut args) {
         Ok(workspace) => workspace,
         Err(Exit(code, message)) => {
@@ -393,6 +384,34 @@ pub(crate) fn main(argv: &[String], bundled_ffmpeg: &[(&'static str, PathBuf)]) 
             return code;
         }
     };
+    // Before any of Kerf's directories is made: one refused here must not be left in the workspace.
+    if let Some(ws) = &workspace {
+        let (config, data) = dirs_of(args.data_dir.as_deref());
+        let cache = args.cache_dir.clone().or_else(kerf_core::paths::cache_dir);
+        let kerf_dirs = [
+            ("the settings directory", config),
+            ("the data directory", data),
+            ("--token-file", args.token_file.clone()),
+            ("Kerf's cache", cache.map(|d| d.join("kerf"))),
+            ("Kerf's generated media", dirs::data_dir().map(|d| d.join("kerf"))),
+            ("the template library", kerf_core::template::library_dir()),
+        ];
+        if let Err(Exit(code, message)) = refuse_kerf_own_inside(ws, &kerf_dirs) {
+            say(&format!("kerf-app: {message}"));
+            return code;
+        }
+    }
+    if let Err(Exit(code, message)) =
+        use_cache_dir(args.cache_dir.as_deref()).and_then(|()| check_cache_cap(&args, kerf_core::paths::cache_dir()))
+    {
+        say(&format!("kerf-app: {message}"));
+        return code;
+    }
+    // A download into the cache and nothing else; a --workspace given with it was checked above (the
+    // cache may not lie in it), and is not otherwise used.
+    if let Some(models) = &args.prefetch {
+        return prefetch(models);
+    }
     let token = match check_args(&args) {
         Ok(token) => token,
         Err(Exit(code, message)) => {
@@ -414,20 +433,6 @@ pub(crate) fn main(argv: &[String], bundled_ffmpeg: &[(&'static str, PathBuf)]) 
             return code;
         }
     };
-    if let Some(ws) = &workspace {
-        // The cache directory in force: `--cache-dir` / KERF_CACHE_DIR was set above, before this.
-        let kerf_dirs = [
-            ("the settings directory", config.clone()),
-            ("the data directory", data.clone()),
-            ("--token-file", args.token_file.clone()),
-            ("Kerf's cache", kerf_core::paths::cache_dir().map(|d| d.join("kerf"))),
-            ("Kerf's generated media", dirs::data_dir().map(|d| d.join("kerf"))),
-        ];
-        if let Err(Exit(code, message)) = refuse_kerf_own_inside(ws, &kerf_dirs) {
-            say(&format!("kerf-app: {message}"));
-            return code;
-        }
-    }
     crate::init_logging(data.as_ref().map(|d| d.join("logs")), true);
     crate::install_panic_hook();
     for (var, path) in bundled_ffmpeg {
@@ -534,18 +539,22 @@ fn check_args(args: &Args) -> Result<Option<String>, Exit> {
 /// The config and data directories: `--data-dir` for both, else the desktop app's own (the
 /// identifier is the build's, so a debug build keeps to the `.dev` ones).
 fn dirs_for(data_dir: Option<&Path>) -> Result<(Option<PathBuf>, Option<PathBuf>), Exit> {
+    if let Some(dir) = data_dir {
+        std::fs::create_dir_all(dir).map_err(|e| Exit(EXIT_USAGE, format!("cannot use --data-dir {}: {e}", dir.display())))?;
+    }
+    Ok(dirs_of(data_dir))
+}
+
+/// [`dirs_for`] without making anything.
+fn dirs_of(data_dir: Option<&Path>) -> (Option<PathBuf>, Option<PathBuf>) {
     match data_dir {
-        Some(dir) => {
-            std::fs::create_dir_all(dir)
-                .map_err(|e| Exit(EXIT_USAGE, format!("cannot use --data-dir {}: {e}", dir.display())))?;
-            Ok((Some(dir.to_path_buf()), Some(dir.to_path_buf())))
-        }
+        Some(dir) => (Some(dir.to_path_buf()), Some(dir.to_path_buf())),
         None => {
             let identifier = crate::context().config().identifier.clone();
-            Ok((
+            (
                 dirs::config_dir().map(|d| d.join(&identifier)),
                 dirs::data_dir().map(|d| d.join(&identifier)),
-            ))
+            )
         }
     }
 }

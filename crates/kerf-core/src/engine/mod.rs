@@ -234,6 +234,10 @@ fn probe_within<T: Send + 'static>(
 /// [`crate::error::Error::Cancelled`] once it is true.
 #[cfg(feature = "ffmpeg")]
 pub fn probe_cancellable(path: &Path, cancel: &dyn Fn() -> bool) -> Result<ProbeResult> {
+    // A confined run's probes are held to its demuxers, which the `ffprobe` binary takes.
+    if crate::paths::demuxer_whitelist().is_some() {
+        return cli::probe_cancellable(path, cancel);
+    }
     probe_within(LIBAV_PROBE_TIMEOUT, path, cancel, ffmpeg::probe)
 }
 

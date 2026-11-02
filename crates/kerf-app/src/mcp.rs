@@ -2803,9 +2803,9 @@ impl KerfMcp {
 
     #[tool(
         description = "Import a media file into the project and return the Asset (probed streams, duration, \
-                       resolution, fps, codecs). `path` must be an absolute path to a media file on this computer \
-                       (a URL, an ffmpeg protocol such as concat: or pipe:, a network share (UNC path), a relative \
-                       path or a missing file is refused at once). Importing a file the project already holds resolves to that \
+                       resolution, fps, codecs). `path` is the absolute path of a media file on this computer, or one \
+                       relative to the workspace when the server is confined to one (a URL, an ffmpeg protocol such as \
+                       concat: or pipe:, a network share (UNC path) or a missing file is refused at once). Importing a file the project already holds resolves to that \
                        asset instead of duplicating it, so this is safe to re-run. One Insta360 lens file pulls \
                        in its sibling and stitches the pair into a single 360 asset — a full re-encode that can \
                        run for minutes (send a `progressToken` for progress, cancel the request to stop it, or pass \
@@ -2823,8 +2823,11 @@ impl KerfMcp {
         let path = self.path_arg(&p.path)?;
         crate::require_local_input_path(&path).map_err(|e| McpError::invalid_params(e, None))?;
         kerf_core::paths::validate_import_path(std::path::Path::new(&path)).map_err(core_err)?;
-        if self.workspace.is_some() {
-            workspace::refuse_reference_media(&path).map_err(|e| McpError::invalid_params(e, None))?;
+        // Confined to a workspace: no playlist, manifest or lens pair that reads outside it. It probes,
+        // so on the blocking pool.
+        if let Some(ws) = self.workspace.clone() {
+            let path = path.clone();
+            blocking(move || ws.check_media(&path).map_err(|e| McpError::invalid_params(e, None))).await?;
         }
         let me = self.clone();
         let owner = self.owner();

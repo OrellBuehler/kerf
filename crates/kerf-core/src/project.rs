@@ -5602,12 +5602,13 @@ impl Project {
     /// clip's grade reads in the cut, its history and an open proposal (and its undo steps). What a
     /// host that confines files to one directory (`kerf-app --headless --workspace`) checks before it
     /// takes a project in. Sorted, without repeats.
-    pub fn referenced_files(&self) -> Result<Vec<String>> {
-        let mut files = Vec::new();
+    pub fn referenced_files(&self) -> Result<ReferencedFiles> {
+        let mut media = Vec::new();
         for asset in self.list_assets()? {
-            files.push(asset.path);
-            files.extend(asset.source_paths);
+            media.push(asset.path);
+            media.extend(asset.source_paths);
         }
+        let mut files = Vec::new();
         let mut stmt = self.conn.prepare(
             "SELECT data FROM timeline UNION ALL SELECT snapshot FROM history UNION ALL SELECT base FROM staged
              UNION ALL SELECT timeline FROM staged UNION ALL SELECT timeline FROM staged_undo",
@@ -5622,9 +5623,11 @@ impl Project {
                 .filter_map(|c| c.grade.lut.as_ref());
             files.extend(luts.map(|lut| lut.path.clone()));
         }
-        files.sort();
-        files.dedup();
-        Ok(files)
+        for list in [&mut media, &mut files] {
+            list.sort();
+            list.dedup();
+        }
+        Ok(ReferencedFiles { media, luts: files })
     }
 
     /// What an output path must not be, read from the database (and the environment, for the
@@ -7979,6 +7982,14 @@ pub struct RelinkCheck {
     pub has_analysis: bool,
 }
 
+/// What [`Project::referenced_files`] found: the files FFmpeg opens as media (each asset's file and
+/// capture files) and the LUTs Kerf reads itself. Each sorted, without repeats.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReferencedFiles {
+    pub media: Vec<String>,
+    pub luts: Vec<String>,
+}
+
 /// What [`Project::remove_asset`] did.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct RemovedAsset {
@@ -8260,7 +8271,7 @@ mod tests {
     #[test]
     fn referenced_files_name_every_source_and_every_lut_the_history_holds() {
         use crate::model::ClipLut;
-        let project = Project::sample().unwrap();
+        let mut project = Project::sample().unwrap();
         let clip = project.timeline().unwrap().tracks[0].clips[0].id;
         let lut = |path: &str| Grade {
             lut: Some(ClipLut {
@@ -8271,15 +8282,33 @@ mod tests {
         };
         project.set_grade(clip, lut("/luts/old.cube")).unwrap();
         project.set_grade(clip, lut("/luts/new.cube")).unwrap();
+        let mut stitched = project.list_assets().unwrap()[0].clone();
+        stitched.id = Uuid::new_v4();
+        stitched.path = "/cache/stitched/pair.mp4".into();
+        stitched.source_paths = vec!["/caps/VID_00_000.insv".into(), "/caps/VID_10_000.insv".into()];
+        project.insert_or_get_asset(&stitched).unwrap();
+        // An agent's proposal and its undo step hold LUTs the cut does not.
+        project.set_agent_review(true);
+        project.set_actor(EditSource::Agent);
+        project.set_grade(clip, lut("/luts/staged-first.cube")).unwrap();
+        project.set_grade(clip, lut("/luts/staged-then.cube")).unwrap();
+        assert!(project.staged().unwrap().is_some_and(|s| s.undo_depth > 0));
         let files = project.referenced_files().unwrap();
         for asset in project.list_assets().unwrap() {
-            assert!(files.contains(&asset.path), "{files:?}");
+            assert!(files.media.contains(&asset.path), "an asset's file");
         }
-        assert!(files.contains(&"/luts/new.cube".to_string()), "{files:?}");
-        assert!(
-            files.contains(&"/luts/old.cube".to_string()),
-            "an undo brings it back: {files:?}"
-        );
+        for capture in &stitched.source_paths {
+            assert!(files.media.contains(capture), "a capture file");
+        }
+        for (path, why) in [
+            ("/luts/new.cube", "the cut"),
+            ("/luts/old.cube", "an undo brings it back"),
+            ("/luts/staged-then.cube", "the proposal"),
+            ("/luts/staged-first.cube", "the proposal's undo step"),
+        ] {
+            assert!(files.luts.contains(&path.to_string()), "{why}");
+        }
+        assert!(files.media.iter().all(|m| !m.ends_with(".cube")));
     }
 
     #[test]

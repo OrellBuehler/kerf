@@ -57,14 +57,20 @@ workspace. In answers, `call_tool` cuts DIR's JSON-escaped spelling plus a separ
 back; resources (`kerf://jobs/…`) and error messages keep absolute paths. `project_info` gains `workspace` and the
 instructions a `WORKSPACE_NOTE` (where a tool says "absolute path", a relative one is taken) plus DIR, dropped rather
 than going past 3500 characters (`instructions`, which also rewords the two "absolute path" phrases), only when set.
-DIR may not be a filesystem root, and Kerf's own settings, data, token file and cache may not lie in it (exit 2).
+DIR may not be a filesystem root, and Kerf's own settings, data, token file, cache and template library may not lie in
+it (exit 2, checked before any of them is made).
 **What a file in DIR could reach outside it** is refused too: `set_speech_model` takes only a model name
 (`check_speech_model`; the engine reads a name with a separator or `.bin` as a file and reports whether it exists); a
-project opened (`open_project`, `--project`) must name only files in DIR or Kerf's own generated media
-(`Project::referenced_files`: asset files, capture files, every LUT in the cut, its history and an open proposal, and the
-stored speech model; `check_project`, before the swap); and `import_asset` refuses a playlist or reference format by name
-or first bytes (`reference_format`: HLS / M3U, DASH, concat lists, SDP, IMF, frameserver scripts) **before** FFmpeg sees
-it — probing one already follows its entries, so its probed format would come too late. This is confinement at the API
+project opened (`open_project`, `--project`) must name only files in DIR or Kerf's generated-media dirs (`music`,
+`voiceovers`, `sfx` in the data dir, `stitched`, `stems` in the cache — not the whole cache), spelled with no `.` / `..`
+part (after a link the kernel's `..` is not the folded one), and the stored speech model must be a name
+(`Project::referenced_files` → media and LUTs from the cut, its history, an open proposal and its undo steps;
+`check_project`, before the swap). **No playlist or manifest**: `Workspace::open` turns on
+`kerf_core::paths::confine_demuxers`, after which every probe passes `-format_whitelist MEDIA_DEMUXERS` (no HLS, DASH,
+concat, SDP, IMF, MXF, SVG) and FFmpeg refuses such a file — whatever its name or padding — before opening an entry; a
+content sniff could not, FFmpeg reads up to 1 MiB to decide. `Workspace::check_media` runs that probe (on `blocking`) in
+`import_asset` and for each existing media file `check_project` sees, and resolves and probes an Insta360 lens file's
+sibling, which the stitch reads. This is confinement at the API
 level only: FFmpeg, the decoders and the rest of the process run with the server's own rights, so a hosted deployment
 should add OS isolation (a container or a user that sees only DIR and Kerf's directories).
 It shares the **same** `Arc<Mutex<Project>>` the Tauri commands hold, so the agent edits the project the user has open.

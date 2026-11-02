@@ -13,6 +13,29 @@ use crate::error::{Error, Result};
 
 static CACHE_DIR: OnceLock<PathBuf> = OnceLock::new();
 
+/// The demuxers a confined run ([`confine_demuxers`]) lets a probe pick: the media formats Kerf
+/// imports. Left out on purpose: every format that opens the files it names (HLS and other
+/// playlists, DASH, concat lists, SDP, IMF, MXF's external essence) and the SVG reader, which follows
+/// a document's links.
+pub const MEDIA_DEMUXERS: &str = "mov,mp4,m4a,3gp,3g2,mj2,matroska,webm,wav,w64,mp3,aac,ac3,eac3,flac,ogg,aiff,wv,\
+mpegts,mpeg,avi,flv,asf,dv,m4v,h264,hevc,image2,png_pipe,jpeg_pipe,webp_pipe,gif,gif_pipe,bmp_pipe,tiff_pipe,qoi_pipe,\
+ppm_pipe,pgm_pipe,j2k_pipe,apng";
+
+static CONFINED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// From now on, hold every probe to [`MEDIA_DEMUXERS`] (FFmpeg's `-format_whitelist`): a host that
+/// confines files to one directory (`kerf-app --headless --workspace`) calls this at startup, so a
+/// playlist or manifest in that directory is refused before FFmpeg opens a file it names. Off by
+/// default, and then no probe changes.
+pub fn confine_demuxers() {
+    CONFINED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The demuxers probes are held to: [`MEDIA_DEMUXERS`] after [`confine_demuxers`], else none.
+pub fn demuxer_whitelist() -> Option<&'static str> {
+    CONFINED.load(std::sync::atomic::Ordering::Relaxed).then_some(MEDIA_DEMUXERS)
+}
+
 /// Keep every cache under `dir` (`<dir>/kerf/proxies`, `<dir>/kerf/waveforms`, …) instead of the
 /// operating system's cache directory: a hosted run puts them on a volume of its choosing. Set once,
 /// before anything reads [`cache_dir`] (the first call wins; `false` when one was already set).

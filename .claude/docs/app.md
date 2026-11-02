@@ -51,7 +51,8 @@ still links GTK / WebKitGTK (the libraries must be installed, a display need not
 (else `KERF_WORKSPACE`; for a server remote agents reach) confines every path an MCP client names to DIR (`mcp.md`
 "Workspace"): DIR must be an existing directory and not a filesystem root (else exit 2), `--project` / `--new-project`
 then resolve against DIR and must lie inside it, a `--project` may name no file outside it, and the settings, data and
-cache directories (the cache in force: `--cache-dir`'s `DIR/kerf`, set first) and `--token-file` may not lie in it (each exit 2). It holds over `--stdio` too (set in `server::Overrides` before `start_stdio`); with no ready line there, DIR shows only in the instructions and `project_info`. Directories: the
+cache directories (the cache in force: `--cache-dir`'s `DIR/kerf`), the template library (`KERF_TEMPLATES_DIR` included) and
+`--token-file` may not lie in it (each exit 2, checked before `--data-dir` / `--cache-dir` are made). It holds over `--stdio` too (set in `server::Overrides` before `start_stdio`); with no ready line there, DIR shows only in the instructions and `project_info`. Directories: the
 desktop app's config / data dirs for the build's identifier (`context()`, the one `generate_context!`, so a debug build uses
 `.dev`), or `--data-dir` for settings, logs and recovery alike (CI isolation). No single-instance plugin: a taken port exits
 3 (`port in use … --mcp-addr`), and two runs sharing a settings file can race to make the first token (use `--data-dir` or
@@ -90,7 +91,8 @@ Release Windows builds are `windows_subsystem = "windows"`: pipes work, an inter
 **`--prefetch-models whisper[:NAME],kokoro[:VOICE],demucs,soundfont`** starts no server: once `--cache-dir` is in force it
 downloads each into the cache through the same checked fetch the first use runs (`download_speech_model`,
 `prepare_voiceover`, `prepare_stems`, `prepare_soundfont`), progress on stderr, and exits 0, 1 if one failed, 2 for a bad list (checked at parse). The
-hosted image (`deploy/`) runs it from its entrypoint (`KERF_PREFETCH_MODELS`).
+hosted image (`deploy/`) runs it from its entrypoint (`KERF_PREFETCH_MODELS`). A `--workspace` given with it is
+only checked (its rules for Kerf's own directories, the cache included), not used.
 `tests/headless.rs` drives the real binary (no `DISPLAY`): ready line, 401 / 200 / 202, two tools, SIGTERM → 0; a capped run
 prunes an aged cache in its `--cache-dir` and leaves models, `stitched/` and a fresh `.part` alone; a bad ceiling is exit 2; and a
 `--workspace` run: imports and outputs outside it refused, relative ones resolved in it (the import, which needs ffprobe,

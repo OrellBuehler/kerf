@@ -752,17 +752,6 @@ fn a_workspace_refuses_paths_outside_it_and_resolves_relative_ones_in_it() {
         serde_json::json!({ "path": "card.kerftemplate" }),
     ));
     assert!(why.contains("does not exist") && !why.contains("relative"), "{why}");
-    // A playlist in the workspace whose entries lie outside it is not handed to FFmpeg, whatever its name.
-    let playlist = format!("#EXTM3U\n#EXTINF:1.0,\n{}\n#EXT-X-ENDLIST\n", outside.display());
-    std::fs::write(ws.join("media").join("list.mp4"), &playlist).unwrap();
-    let why = refusal(&call(
-        addr,
-        &on_session,
-        13,
-        "import_asset",
-        serde_json::json!({ "path": "media/list.mp4" }),
-    ));
-    assert!(why.contains("HLS"), "{why}");
     // A project in the workspace that names media outside it is not opened.
     let crafted = kerf_core::Project::open(ws.join("crafted.kerf")).unwrap();
     let asset: kerf_core::Asset = serde_json::from_value(serde_json::json!({
@@ -816,6 +805,7 @@ fn a_workspace_refuses_paths_outside_it_and_resolves_relative_ones_in_it() {
     let caches = ws.join("caches");
     let why = refused(&["--data-dir", data.to_str().unwrap(), "--cache-dir", caches.to_str().unwrap()]);
     assert!(why.contains("Kerf's cache") && why.contains("inside --workspace"), "{why}");
+    assert!(!caches.exists() && !ws.join("kerf-data").exists(), "nothing refused is made");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
@@ -879,5 +869,56 @@ fn a_stdio_run_keeps_to_its_workspace_too() {
     assert!(why.contains("outside the workspace"), "{refused}");
     let stderr = run.stderr();
     assert_eq!(run.close_stdin(), Some(0), "stderr:\n{stderr}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A playlist in the workspace whose entry lies outside it is not imported, whatever its name, and a
+/// project in the workspace whose asset is such a playlist is not opened: the probe is held to the
+/// media demuxers before FFmpeg opens anything it names.
+#[test]
+#[ignore = "probes with the ffprobe binary"]
+fn a_workspace_refuses_a_playlist_imported_or_named_by_a_project() {
+    let (dir, ws, child, addr, on_session, _) = workspace_run("ws-playlist");
+    let outside = dir.join("outside.wav");
+    let playlist = format!(
+        "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1.0,\n{}\n#EXT-X-ENDLIST\n",
+        outside.display()
+    );
+    for name in ["list.m3u8", "list.mp4"] {
+        std::fs::write(ws.join("media").join(name), &playlist).unwrap();
+    }
+    for (id, name) in [(2, "media/list.m3u8"), (3, "media/list.mp4")] {
+        let why = refusal(&call(
+            addr,
+            &on_session,
+            id,
+            "import_asset",
+            serde_json::json!({ "path": name }),
+        ));
+        assert!(why.contains("not media this server takes"), "{name}: {why}");
+    }
+    let crafted = kerf_core::Project::open(ws.join("playlist.kerf")).unwrap();
+    let asset: kerf_core::Asset = serde_json::from_value(serde_json::json!({
+        "id": "00000000-0000-4000-8000-000000000002",
+        "path": std::fs::canonicalize(ws.join("media").join("list.m3u8")).unwrap().to_string_lossy(),
+        "name": "list.m3u8",
+        "duration": 1.0,
+        "streams": [],
+        "imported_at": "2026-01-01T00:00:00Z",
+    }))
+    .unwrap();
+    crafted.insert_or_get_asset(&asset).unwrap();
+    crafted.close();
+    let why = refusal(&call(
+        addr,
+        &on_session,
+        4,
+        "open_project",
+        serde_json::json!({ "path": "playlist.kerf" }),
+    ));
+    assert!(why.contains("not media this server takes"), "{why}");
+    let info = answer(&call(addr, &on_session, 5, "project_info", serde_json::json!({})));
+    assert_eq!(info["path"], "cut.kerf", "the open project stays: {info}");
+    drop(child);
     let _ = std::fs::remove_dir_all(&dir);
 }

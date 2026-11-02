@@ -42,6 +42,9 @@ impl Workspace {
             ));
         }
         let named = dir.to_str().and_then(|d| inside(d, "", cfg!(windows))).filter(|n| *n != root);
+        // From here on every probe is held to the media demuxers: a playlist or a manifest in the
+        // workspace is refused before FFmpeg opens a file it names.
+        kerf_core::paths::confine_demuxers();
         Ok(Self { root, named })
     }
 
@@ -67,25 +70,61 @@ impl Workspace {
     }
 
     /// Refuse a project that names a file outside the workspace: an asset's file or capture
-    /// files, a LUT anywhere in its history, a speech model file. Kerf's own generated media
-    /// (voiceovers, music, sound effects, stitches and stems) is where Kerf put it. Reads the
-    /// disk: call it with no lock held, before the project is taken in.
+    /// files, a LUT anywhere in its history, a speech model file, or media FFmpeg would read
+    /// another file through ([`Workspace::check_media`]). Kerf's own generated media (voiceovers,
+    /// music, sound effects, stitches and stems) is where Kerf put it. A stored path is used as it
+    /// is spelled, so one with a `.` or `..` part is refused: after a link the kernel's `..` is not
+    /// the folded one. Reads the disk and probes: call it with no lock held, before the project is
+    /// taken in.
     pub(crate) fn check_project(&self, project: &kerf_core::Project) -> Result<(), String> {
         let refused = |what: &str, why: String| format!("the project cannot be opened here: {what} {why}");
         let kerf_dirs = kerf_media_dirs();
-        for file in project.referenced_files().map_err(|e| e.to_string())? {
-            if is_relative(&file, cfg!(windows)) {
+        let files = project.referenced_files().map_err(|e| e.to_string())?;
+        let media = files.media.iter().map(|f| (f, true));
+        for (file, is_media) in media.chain(files.luts.iter().map(|f| (f, false))) {
+            if is_relative(file, cfg!(windows)) {
                 return Err(refused(&format!("{file:?}"), "is a relative path".to_string()));
             }
-            let generated = kerf_dirs.iter().any(|dir| within(dir, &file));
-            if !generated {
-                self.resolve(&file)
-                    .map_err(|e| refused("it names a file outside the workspace:", e))?;
+            if has_dot_parts(file, cfg!(windows)) {
+                return Err(refused(&format!("{file:?}"), "has a `.` or `..` part".to_string()));
+            }
+            if kerf_dirs.iter().any(|dir| within(dir, file)) {
+                continue;
+            }
+            let real = self
+                .resolve(file)
+                .map_err(|e| refused("it names a file outside the workspace:", e))?;
+            if is_media && Path::new(&real).is_file() {
+                self.check_media(&real).map_err(|e| refused("its media", e))?;
             }
         }
         let model = project.meta(crate::SPEECH_MODEL_KEY).map_err(|e| e.to_string())?;
         if let Some(model) = model.filter(|m| !m.trim().is_empty()) {
             self.check_speech_model(model.trim()).map_err(|e| refused("its", e))?;
+        }
+        Ok(())
+    }
+
+    /// Refuse media (`path`, resolved in the workspace) FFmpeg would read another file through: a
+    /// playlist, a manifest or a concat list, which the probe ([`kerf_core::paths::confine_demuxers`])
+    /// refuses before opening what it names, and an Insta360 lens file whose sibling — which the
+    /// stitch reads — leads out of the workspace or is such a file itself. Probes: for the blocking pool.
+    pub(crate) fn check_media(&self, path: &str) -> Result<(), String> {
+        let probe = |file: &Path| {
+            kerf_core::Project::probe_asset_with(file, &|| false).map_err(|e| {
+                format!(
+                    "{} is not media this server takes (this server is confined to its workspace, and only plain media \
+                     files are read, no playlists or manifests): {e}",
+                    file.display()
+                )
+            })
+        };
+        let asset = probe(Path::new(path))?;
+        let video = asset.streams.iter().find(|s| s.kind == kerf_core::StreamKind::Video);
+        if let Some((front, rear)) = video.and_then(|v| kerf_core::insta360_pair(Path::new(path), v.width, v.height)) {
+            let sibling = if Path::new(path) == front { rear } else { front };
+            let real = self.resolve(&sibling.to_string_lossy())?;
+            probe(Path::new(&real))?;
         }
         Ok(())
     }
@@ -187,15 +226,23 @@ fn follow(root: &Path, path: &Path) -> Result<PathBuf, Escape> {
     }
 }
 
-/// Where Kerf writes the media it makes itself, which a project's assets may name.
+/// Where Kerf writes the media it makes itself, which a project's assets may name: composed music,
+/// voiceovers and sound effects in the data directory, stitched 360 pairs and stems in the cache.
 fn kerf_media_dirs() -> Vec<PathBuf> {
     let data = dirs::data_dir().map(|d| d.join("kerf"));
-    let generated = ["music", "voiceovers", "sfx"]
-        .into_iter()
-        .filter_map(|name| Some(data.as_ref()?.join(name)));
-    generated
-        .chain(kerf_core::paths::cache_dir().map(|d| d.join("kerf")))
-        .collect()
+    let cache = kerf_core::paths::cache_dir().map(|d| d.join("kerf"));
+    let made = |base: &Option<PathBuf>, names: &[&str]| -> Vec<PathBuf> {
+        names.iter().filter_map(|name| Some(base.as_ref()?.join(name))).collect()
+    };
+    let mut dirs = made(&data, &["music", "voiceovers", "sfx"]);
+    dirs.extend(made(&cache, &["stitched", "stems"]));
+    dirs
+}
+
+/// Whether `path` has a `.` or `..` part (pure).
+fn has_dot_parts(path: &str, windows: bool) -> bool {
+    path.split(|c| is_separator(c, windows))
+        .any(|part| part == "." || part == "..")
 }
 
 /// Whether `file` (absolute) lies in `dir`, by its spelling and once its links are followed.
@@ -275,63 +322,6 @@ fn looks_like_url(path: &str, windows: bool) -> bool {
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'));
     is_scheme && (rest.starts_with("//") || URL_SCHEMES.contains(&scheme.to_ascii_lowercase().as_str()))
-}
-
-/// What playlist or reference format a media file to import is, by its name and first bytes:
-/// FFmpeg follows the files such a one names (an HLS playlist's segments, a DASH manifest's, a
-/// concat list's, an SDP session's streams) wherever they are, and probing it already does. So
-/// with a workspace one is refused before FFmpeg sees it.
-pub(crate) fn reference_format(name: &str, head: &[u8]) -> Option<&'static str> {
-    let ext = Path::new(name)
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(str::to_ascii_lowercase)
-        .unwrap_or_default();
-    let by_name = match ext.as_str() {
-        "m3u8" | "m3u" => Some("an HLS / M3U playlist"),
-        "mpd" => Some("a DASH manifest"),
-        "ffconcat" | "concat" => Some("an FFmpeg concat list"),
-        "sdp" => Some("an SDP session description"),
-        "avs" | "vpy" => Some("a frameserver script"),
-        "xspf" | "pls" => Some("a playlist"),
-        _ => None,
-    };
-    if by_name.is_some() {
-        return by_name;
-    }
-    let text = String::from_utf8_lossy(head);
-    let start = text.trim_start_matches('\u{feff}').trim_start();
-    let lower = start.to_ascii_lowercase();
-    if lower.starts_with("#extm3u") {
-        Some("an HLS / M3U playlist")
-    } else if lower.starts_with("ffconcat version") {
-        Some("an FFmpeg concat list")
-    } else if lower.starts_with("v=0") || lower.lines().any(|l| l.starts_with("c=in ip")) {
-        Some("an SDP session description")
-    } else if lower.contains("<mpd") {
-        Some("a DASH manifest")
-    } else if lower.contains("<compositionplaylist") {
-        Some("an IMF composition playlist")
-    } else {
-        None
-    }
-}
-
-/// Refuse importing `path` (resolved in the workspace) when it is a playlist or reference format
-/// ([`reference_format`]). Reads the file's first 4 KiB: for the blocking pool, before FFmpeg runs.
-pub(crate) fn refuse_reference_media(path: &str) -> Result<(), String> {
-    use std::io::Read;
-    let mut head = Vec::new();
-    if let Ok(file) = std::fs::File::open(path) {
-        let _ = file.take(4096).read_to_end(&mut head);
-    }
-    match reference_format(path, &head) {
-        Some(kind) => Err(format!(
-            "{path:?} is {kind}, which makes FFmpeg read the files it names wherever they are; this server is \
-             confined to its workspace, so import the media files themselves"
-        )),
-        None => Ok(()),
-    }
 }
 
 /// A path the client named, as the tool uses it: unchanged without a workspace, else resolved in it.
@@ -648,48 +638,6 @@ mod tests {
     }
 
     #[test]
-    fn a_playlist_or_reference_format_is_known_by_its_name_or_its_first_bytes() {
-        for (name, head) in [
-            ("list.m3u8", &b""[..]),
-            ("LIST.M3U", b""),
-            ("show.mpd", b""),
-            ("cut.ffconcat", b""),
-            ("cam.sdp", b""),
-            ("script.vpy", b""),
-            ("clip.mp4", b"#EXTM3U\n#EXT-X-VERSION:3\n/etc/passwd\n"),
-            ("clip.mp4", b"\xef\xbb\xbf  #extm3u\n"),
-            ("clip.mp4", b"ffconcat version 1.0\nfile /etc/passwd\n"),
-            ("clip.mp4", b"v=0\no=- 0 0 IN IP4 127.0.0.1\n"),
-            ("clip.mp4", b"o=-\nc=IN IP4 10.0.0.1\n"),
-            ("clip.mp4", b"<?xml version=\"1.0\"?><MPD xmlns=\"urn:mpeg:dash\">"),
-            ("clip.mov", b"<?xml?><CompositionPlaylist>"),
-        ] {
-            assert!(
-                reference_format(name, head).is_some(),
-                "{name}: {:?}",
-                String::from_utf8_lossy(head)
-            );
-        }
-        for (name, head) in [
-            ("clip.mp4", &b"\0\0\0\x18ftypmp42"[..]),
-            ("tone.wav", b"RIFF\x24\0\0\0WAVEfmt "),
-            ("subs.srt", b"1\n00:00:00,000 --> 00:00:01,000\nv=0 is not at the start\n"),
-            ("noext", b""),
-        ] {
-            assert!(reference_format(name, head).is_none(), "{name}");
-        }
-        let dir = temp();
-        let playlist = dir.join("clip.mp4");
-        std::fs::write(&playlist, b"#EXTM3U\n#EXTINF:1,\n/etc/hosts\n").unwrap();
-        assert!(refuse_reference_media(playlist.to_str().unwrap())
-            .unwrap_err()
-            .contains("HLS"));
-        std::fs::write(&playlist, b"\0\0\0\x18ftypmp42").unwrap();
-        assert!(refuse_reference_media(playlist.to_str().unwrap()).is_ok());
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
     fn a_workspace_takes_only_named_speech_models() {
         let dir = temp();
         let ws = Workspace::open(&dir).unwrap();
@@ -730,6 +678,50 @@ mod tests {
         assert!(ws.check_project(&relative).unwrap_err().contains("relative"));
         std::fs::remove_dir_all(&dir).ok();
         std::fs::remove_dir_all(&elsewhere).ok();
+    }
+
+    /// `DIR/a/../x.mp4` with `a` a link to elsewhere folds to `DIR/x.mp4`, but the kernel opens
+    /// `elsewhere/../x.mp4`: a stored path with such a part is refused, whatever it folds to.
+    #[cfg(unix)]
+    #[test]
+    fn a_stored_path_with_a_dot_part_is_refused_as_spelled() {
+        let (dir, elsewhere) = (temp(), temp());
+        std::fs::create_dir_all(elsewhere.join("deeper")).unwrap();
+        std::os::unix::fs::symlink(elsewhere.join("deeper"), dir.join("a")).unwrap();
+        let ws = Workspace::open(&dir).unwrap();
+        let project = kerf_core::Project::open_in_memory().unwrap();
+        let sneaky = format!("{}/a/../x.mp4", dir.display());
+        let asset: kerf_core::Asset = serde_json::from_value(serde_json::json!({
+            "id": uuid::Uuid::new_v4(),
+            "path": sneaky,
+            "name": "x.mp4",
+            "duration": 1.0,
+            "streams": [],
+            "imported_at": "2026-01-01T00:00:00Z",
+        }))
+        .unwrap();
+        project.insert_or_get_asset(&asset).unwrap();
+        assert!(ws.check_project(&project).unwrap_err().contains("`..` part"));
+        assert!(has_dot_parts("/ws/./x", false) && has_dot_parts("C:\\ws\\..\\x", true));
+        assert!(!has_dot_parts("/ws/a..b/x.mp4", false) && !has_dot_parts("/ws/a\\..\\x", false));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&elsewhere).ok();
+    }
+
+    #[test]
+    fn only_kerf_s_generated_media_dirs_are_exempt() {
+        let dirs = kerf_media_dirs();
+        let names: Vec<String> = dirs
+            .iter()
+            .filter_map(|d| d.file_name()?.to_str().map(str::to_string))
+            .collect();
+        for name in ["proxies", "waveforms", "models", "kerf"] {
+            assert!(!names.iter().any(|n| n == name), "{name}");
+        }
+        if let Some(cache) = kerf_core::paths::cache_dir() {
+            assert!(dirs.contains(&cache.join("kerf").join("stitched")));
+            assert!(!dirs.contains(&cache.join("kerf")));
+        }
     }
 
     #[test]
