@@ -10579,6 +10579,45 @@ fn checker_b_r5_blur_without_a_dip_control() {
     fam.finish("blur without a dip");
 }
 
+/// A dip whose ramp is a long run of frames (the fade-in's factor is `65535 * i / N`; its rounding is only reached by ramps of 23
+/// frames and over, 31, 37 and 47 among them, and not by 30): so that the fade's rounding constant is held, a dip to white over ramps
+/// of N frames each side.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_b_r5_dip_to_white_over_long_ramps() {
+    let mut fam = Family::default();
+    let mut judged = 0;
+    for tag in [Tag::None, Tag::Bt709] {
+        let (Some(a), Some(b)) = (
+            R5Src::new("yuv420p", 64, 36).tag(tag).seed(1).secs(3.2).make(),
+            R5Src::new("yuv420p", 64, 36).tag(tag).seed(2).secs(3.2).make(),
+        ) else {
+            return;
+        };
+        for (fps, frames) in [
+            (30.0, 31u32),
+            (30.0, 37),
+            (30.0, 47),
+            (30.0, 59),
+            (30.0, 74),
+            (25.0, 29),
+            (24.0, 41),
+            (60.0, 61),
+        ] {
+            let d = 2.0 * f64::from(frames) / fps;
+            let tl = r5_pair(&a, &b, TransitionKind::DipToWhite, d, 3.2, None);
+            let case = format!("checker/b/r5/white long ramp {frames} frames {fps} fps {tag:?}");
+            if let Some(out) = sweep_try(&case, &tl, &dedup(&[&a, &b]), fps, 6.4) {
+                judged += 1;
+                fam.add(&case, &out);
+                expect_refusal(&mut fam, &case, &out, R5_DIP, Want::NotRefused);
+            }
+        }
+    }
+    assert!(judged > 8, "too few cases could be made: {judged}");
+    fam.finish("dip to white over long ramps");
+}
+
 // ---- plan-level checks (no draw): the refusals of this round as the plan spells them ---------------------------------------------
 
 /// The reasons of the Motion frame `k` and of the Still at `t` of a one-clip cut, as the compositor's caps see them.
