@@ -347,6 +347,9 @@ pub struct Compositor {
     /// Whether this FFmpeg places a picture as the model does, when a host pinned it
     /// ([`Compositor::with_placement`]); else measured ([`crate::placement_probe::measured`]).
     placement: Option<crate::placement_probe::Placement>,
+    /// The kinds of picture whose moving stills are drawn, when a host pinned them ([`Compositor::with_still_motion`]); else
+    /// measured ([`crate::still_probe::measured`]).
+    still_motion: Option<kerf_core::StillKinds>,
     /// The threads FFmpeg's filter graph slices a frame into, when pinned ([`Compositor::with_graph_threads`]);
     /// else they are the graph's the frame stands in for ([`Compositor::graph_threads_for`]).
     graph_threads: Option<u32>,
@@ -630,6 +633,12 @@ struct Drawn<'a> {
     look: LayerLook,
     /// Where the placement reads the picture, for a layer whose zoom or position moves.
     placement: Option<PlacementMap>,
+    /// Where the moving still's `perspective` reads the scaled copy (the frame is the window of it, not the file's picture),
+    /// for a layer the export takes through [`kerf_core::still_motion`]: the move comes first, and the layer is a plain
+    /// frame-sized picture from there on.
+    moved: Option<PlacementMap>,
+    /// The frame is the fit picture FFmpeg made ([`kerf_core::FitCopy`]), at the size the stages would leave: nothing to scale.
+    fitted: bool,
     /// The frames the layer's chain has passed on before this one (`vignette`'s dither runs on from them).
     count: u64,
 }
@@ -802,8 +811,17 @@ pub fn prepare(plan: &RenderPlan) {
         let _ = crate::grade::kernels();
     }
     prepare_placement(plan);
+    prepare_stills(plan);
     if !plan.overlays.is_empty() {
         let _ = crate::text::model();
+    }
+}
+
+/// [`prepare`] for what a moving still needs: which kinds of picture this FFmpeg draws it for as the model does
+/// ([`crate::still_probe`]: `GpuCaps::still_motion` holds only the kinds that matched).
+fn prepare_stills(plan: &RenderPlan) {
+    if plan.layers.iter().any(|l| l.still.is_some()) {
+        let _ = crate::still_probe::kinds();
     }
 }
 
@@ -883,6 +901,16 @@ pub fn prepare_ahead(cut: &kerf_core::PlayCut, from: f64, horizon: f64) {
     }
 }
 
+/// `plan` for a render of `size`: a still plan's moving stills have their scaled copies worked out for that size
+/// ([`RenderPlan::for_render`]); any other plan is as it is.
+fn for_size(plan: &RenderPlan, size: (u32, u32)) -> std::borrow::Cow<'_, RenderPlan> {
+    if plan.layers.iter().any(|l| l.still.as_ref().is_some_and(|s| !s.clip_wide)) {
+        std::borrow::Cow::Owned(plan.clone().for_render(size))
+    } else {
+        std::borrow::Cow::Borrowed(plan)
+    }
+}
+
 impl Compositor {
     /// What this compositor draws exactly, as data: the plan refuses (through
     /// [`RenderPlan::reasons`]) whatever is not in it. [`GpuCaps::A0`] (layers, transform, crop, fit,
@@ -911,11 +939,15 @@ impl Compositor {
     /// The combinations the plan names (`Unsupported`) stay FFmpeg's.
     /// Each later pass flips its bit beside the pass and its parity cases.
     pub fn caps(&self) -> GpuCaps {
-        Self::caps_measured(
+        let mut caps = Self::caps_measured(
             self.grade_kernels.unwrap_or_else(crate::grade::measured),
             crate::text::measured_model(),
             self.placement.clone().unwrap_or_else(crate::placement_probe::measured),
-        )
+        );
+        if let Some(kinds) = self.still_motion {
+            caps.still_motion = kinds;
+        }
+        caps
     }
 
     /// [`Compositor::caps`] for judging a **span** (a play session's `PlayCut::ahead` and `resume`, a primer) rather than a frame
@@ -964,6 +996,7 @@ impl Compositor {
             caps.behaviors = false;
         }
         caps.placed_chroma = crate::conversion::measured() == crate::conversion::Conversion::Match;
+        caps.still_motion = crate::still_probe::measured();
         if text.is_none() {
             caps.text = false;
         }
@@ -1019,6 +1052,14 @@ impl Compositor {
     #[must_use]
     pub fn with_placement(mut self, placement: crate::placement_probe::Placement) -> Self {
         self.placement = Some(placement);
+        self
+    }
+
+    /// Pin the kinds of picture whose moving stills are drawn, instead of the kinds [`crate::still_probe`] measured on the
+    /// ffmpeg this process runs: for a host that knows its ffmpeg, and for tests.
+    #[must_use]
+    pub fn with_still_motion(mut self, kinds: kerf_core::StillKinds) -> Self {
+        self.still_motion = Some(kinds);
         self
     }
 
@@ -1301,6 +1342,7 @@ impl Compositor {
                 geq_edge: None,
                 grade_kernels: None,
                 placement: None,
+                still_motion: None,
                 key_terms: OnceLock::new(),
                 graph_threads: None,
             })
@@ -2179,6 +2221,56 @@ impl Compositor {
         })
     }
 
+    /// The map of a moving still's `perspective`: the corners its expressions evaluate to at this frame, over the scaled copy
+    /// FFmpeg made (`frame`, the window of it any frame reads), as the filter's table; `None` for any other layer. The
+    /// plan's other checks have judged the layer (`RenderPlan::reasons`); what only the render can see is refused here.
+    fn moved_of(
+        &self,
+        plan: &RenderPlan,
+        layer: &kerf_core::PlanLayer,
+        frame: &YuvFrame,
+        size: (u32, u32),
+        n: usize,
+    ) -> Result<Option<PlacementMap>, GpuError> {
+        if !plan.takes_still_route(layer) {
+            return Ok(None);
+        }
+        let unsupported = |what: String| GpuError::Unsupported(format!("layer {n}: {what}"));
+        let (Some(still), Some(motion)) = (layer.still.as_ref(), layer.still.as_ref().and_then(|s| s.export.as_ref())) else {
+            return Err(unsupported(
+                "a moving still whose scaled copy is not worked out for this render (RenderPlan::for_render)".into(),
+            ));
+        };
+        if motion.frame != size {
+            return Err(unsupported(format!(
+                "a moving still made for a {}x{} frame, drawn at {}x{}",
+                motion.frame.0, motion.frame.1, size.0, size.1
+            )));
+        }
+        let (_, _, ww, wh) = motion.window;
+        if (frame.width, frame.height) != (ww, wh) {
+            return Err(unsupported(format!(
+                "a {}x{} frame for a moving still whose scaled copy is {ww}x{wh}",
+                frame.width, frame.height
+            )));
+        }
+        let map = PlacementMap::from_corners(PlacementFrame::window((ww, wh), size), &motion.corners(&still.pose))
+            .map_err(|e| unsupported(e.to_string()))?;
+        let bytes = match &map.tables {
+            Tables::Axes { u, v } => u.len() + v.len(),
+            Tables::Pixels { u, .. } => u.len(),
+        } as u64
+            * 4;
+        let limit = self.gpu.device.limits().max_storage_buffer_binding_size;
+        if bytes > limit {
+            return Err(unsupported(format!(
+                "a {}x{} placement table, over this device's {limit}-byte storage buffer",
+                size.0, size.1
+            )));
+        }
+        Ok(Some(map))
+    }
+
     /// The placement of a layer whose zoom or position moves: the map of sample positions `perspective` builds
     /// ([`PlacementMap`]), after the checks the plan makes and that a caller who did not ask gets as errors.
     /// Nothing is drawn behind it that FFmpeg orders otherwise: a rotation, a translucent layer and a
@@ -2646,7 +2738,17 @@ impl Compositor {
                     frame.width, frame.height
                 )));
             }
-            if (frame.width, frame.height) != (layer.stream.width, layer.stream.height) {
+            let moved = self.moved_of(plan, layer, frame, size, n)?;
+            // FFmpeg made the fit picture of a still whose placement is drawn: the frame is that picture, not the file's.
+            let fitted = layer.fit.as_ref().filter(|f| f.frame == size);
+            if let Some(fit) = fitted {
+                if (frame.width, frame.height) != fit.size {
+                    return Err(GpuError::Unsupported(format!(
+                        "layer {n}: a {}x{} frame for a fit picture of {}x{}",
+                        frame.width, frame.height, fit.size.0, fit.size.1
+                    )));
+                }
+            } else if moved.is_none() && (frame.width, frame.height) != (layer.stream.width, layer.stream.height) {
                 return Err(GpuError::Unsupported(format!(
                     "layer {n}: a {}x{} frame for a {}x{} stream",
                     frame.width, frame.height, layer.stream.width, layer.stream.height
@@ -2675,7 +2777,8 @@ impl Compositor {
             // swscale's tables for every plane of every stage; a ratio it would
             // need two scalers for is FFmpeg's to render.
             let mut filters = Vec::with_capacity(geom.stages.len());
-            for stage in &geom.stages {
+            // (A fit picture FFmpeg made has no stage of the compositor's to draw: its scaler is not in play.)
+            for stage in geom.stages.iter().filter(|_| fitted.is_none()) {
                 let table = |chroma: bool| -> Result<PlaneFilters, GpuError> {
                     let ps = plane_stage(stage, chroma);
                     let too_far = || GpuError::Unsupported(format!("layer {n}: a scale ratio swscale needs two passes for"));
@@ -2710,6 +2813,8 @@ impl Compositor {
                 fades,
                 look,
                 placement,
+                moved,
+                fitted: fitted.is_some(),
                 count,
             });
         }
@@ -2817,6 +2922,8 @@ impl Compositor {
             fades,
             look,
             placement,
+            moved,
+            fitted,
             count,
         } in drawn
         {
@@ -2842,8 +2949,13 @@ impl Compositor {
             // A moving zoom or position is the last stage of FFmpeg's chain: the fit scale, the grade, the effects,
             // the mask and the fades all act on the picture at its fit size (a placed layer's geometry ends
             // there), and the placement lays the result on the canvas.
-            let mut current = planes;
-            for (si, stage) in geom.stages.iter().enumerate() {
+            // A moving still's `perspective` reads the scaled copy FFmpeg made (the frame), and what is drawn from here is
+            // the frame-sized picture it makes.
+            let mut current = match moved {
+                Some(map) => self.place_planes(&mut enc, &planes, None, 255, map)?.0,
+                None => planes,
+            };
+            for (si, stage) in geom.stages.iter().enumerate().filter(|_| !fitted) {
                 let lut = (si + 1 == geom.stages.len()).then_some(tables.as_ref()).flatten();
                 current = self.scale_stage(&mut enc, &current, stage, &filters[si], lut);
             }
@@ -3306,8 +3418,10 @@ impl Compositor {
     /// Decode every layer of `plan` through FFmpeg and composite them at `size`,
     /// timing the two halves apart.
     pub fn render_plan(&self, plan: &RenderPlan, size: (u32, u32)) -> Result<(RgbaFrame, RenderTimings), GpuError> {
-        // (The one-shot entry has no host to have called [`prepare`] ahead of it: it asks for what a moving zoom needs measured.)
+        let plan = &*for_size(plan, size);
+        // (The one-shot entry has no host to have called [`prepare`] ahead of it: it asks for what a moving zoom or still needs measured.)
         prepare_placement(plan);
+        prepare_stills(plan);
         let reasons = plan.reasons(&self.caps(), size);
         if !reasons.is_empty() {
             return Err(GpuError::Unsupported(join_reasons(&reasons)));
@@ -3340,6 +3454,7 @@ impl Compositor {
         source: &FrameSource,
         hint: Hint,
     ) -> Result<(RgbaFrame, RenderTimings), GpuError> {
+        let plan = &*for_size(plan, size);
         let reasons = plan.reasons(&self.caps(), size);
         if !reasons.is_empty() {
             return Err(GpuError::Unsupported(join_reasons(&reasons)));
@@ -3396,6 +3511,7 @@ impl Compositor {
         hint: Hint,
         texts: Texts,
     ) -> Result<(RenderedFrame, RenderTimings), GpuError> {
+        let plan = &*for_size(plan, size);
         let reasons = plan.reasons(&self.caps(), size);
         if !reasons.is_empty() {
             return Err(GpuError::Unsupported(join_reasons(&reasons)));

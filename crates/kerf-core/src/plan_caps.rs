@@ -52,6 +52,39 @@ impl EffectKinds {
     }
 }
 
+/// A set of the kinds of picture a moving still is drawn for ([`GpuCaps::still_motion`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct StillKinds(u8);
+
+impl StillKinds {
+    pub const NONE: Self = Self(0);
+    /// A JPEG: 8-bit 4:2:0, full range (`yuvj420p`).
+    pub const YUVJ420P: Self = Self(1);
+    /// A PNG without alpha, or any other `rgb24` picture.
+    pub const RGB24: Self = Self(1 << 1);
+    /// 8-bit limited-range 4:2:0 (`yuv420p`: a WebP, a frame saved as a picture).
+    pub const YUV420P: Self = Self(1 << 2);
+    pub const ALL: Self = Self(0b111);
+
+    /// The kind of a picture of this pixel format, if it is one a compositor can measure.
+    pub fn of_pix_fmt(fmt: &str) -> Option<Self> {
+        match fmt.to_ascii_lowercase().as_str() {
+            "yuvj420p" => Some(Self::YUVJ420P),
+            "rgb24" => Some(Self::RGB24),
+            "yuv420p" => Some(Self::YUV420P),
+            _ => None,
+        }
+    }
+
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+
 /// A set of the parts of a clip's [`Grade`](crate::model::Grade): what a compositor draws one by one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct GradeKinds(u8);
@@ -170,6 +203,12 @@ pub struct GpuCaps {
     pub reframe: bool,
     pub hdr: bool,
     pub effects: EffectKinds,
+    /// The pictures a moving still ([`crate::still_motion`]) is drawn for: FFmpeg scales the still once and
+    /// moves it with one `perspective`, and the compositor has the scaled copy from FFmpeg itself and draws the
+    /// `perspective` from its own tables. A compositor sets a kind only where it **measured** that this FFmpeg's chain
+    /// for a picture of that pixel format is the one it reproduces, sample for sample; a still of another kind is refused
+    /// (`StillMotion`).
+    pub still_motion: StillKinds,
     /// The parts of a clip's grade (wheels, curves, a 3D LUT) drawn: FFmpeg carries the picture through RGB
     /// for them, and a compositor that sets a part reproduces that round trip and the filter. Still refused
     /// whatever the caps (`GradeWith`): a layer the scaler resizes, a letterbox, an odd picture, a format other
@@ -197,6 +236,7 @@ impl GpuCaps {
         reframe: false,
         hdr: false,
         effects: EffectKinds::NONE,
+        still_motion: StillKinds::NONE,
         grade: GradeKinds::NONE,
     };
 }
@@ -357,8 +397,10 @@ pub enum Unsupported {
     /// A keyframed crop (a `perspective` reading the picture through its window, in the export and
     /// the FFmpeg still alike).
     KeyedCrop(LayerRef),
-    /// A still image whose picture moves, drawn by FFmpeg in one `perspective` of a copy scaled once.
-    StillMotion(LayerRef),
+    /// A still image whose picture moves, drawn by FFmpeg in one `perspective` of a copy scaled once
+    /// ([`crate::still_motion`]), which a compositor draws only where it measured this FFmpeg's chain for the picture's pixel
+    /// format and the plan holds the route at the size it renders (the detail says which is missing).
+    StillMotion(LayerRef, String),
     /// A keyframed zoom in an export frame, which FFmpeg draws as the last stage of the chain.
     KeyedZoom(LayerRef),
     /// A moving zoom or position: FFmpeg places the picture on the canvas with a `perspective` at
@@ -455,7 +497,7 @@ impl Unsupported {
             Self::KeyedColor(_) => "keyed_color",
             Self::KeyedMask(_) => "keyed_mask",
             Self::KeyedCrop(_) => "keyed_crop",
-            Self::StillMotion(_) => "still_motion",
+            Self::StillMotion(..) => "still_motion",
             Self::KeyedZoom(_) => "keyed_zoom",
             Self::KeyedPlacement(_) => "keyed_placement",
             Self::PlacedFormat(..) => "placed_format",
@@ -569,9 +611,9 @@ impl fmt::Display for Unsupported {
                 f,
                 "{l}: a keyframed crop (a perspective reading the picture through its window, which no compositor pass draws)"
             ),
-            Self::StillMotion(l) => write!(
+            Self::StillMotion(l, why) => write!(
                 f,
-                "{l}: a still whose picture moves (FFmpeg draws its fit, zoom, position and crop in one perspective of a scaled copy, which no compositor pass draws)"
+                "{l}: a still whose picture moves (FFmpeg draws its fit, zoom, position and crop in one perspective of a scaled copy): {why}"
             ),
             Self::KeyedZoom(l) => write!(
                 f,

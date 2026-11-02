@@ -529,6 +529,11 @@ fn unique() -> u64 {
 /// to exist, for a file seen for the first time **and for one replaced since** (the cache is keyed by the file's size and
 /// modified time). One `ffprobe` then, a cache hit (a `stat`) after; the same probe as the file's other traits, so on a
 /// file the decode has looked at it costs nothing. Call it from a thread that is not drawing: it may block on that probe.
+/// The filters that make a still's copy (`None` for any other layer, and for a still whose copy is not worked out).
+fn copy_filters(layer: &PlanLayer) -> Option<String> {
+    crate::source::copy_of(layer).ok().flatten().map(|c| c.filters)
+}
+
 pub(crate) fn warm_range(layer: &PlanLayer) {
     if layer.stream.color_range.is_none() && layer.animated.is_some_and(|a| a.places) {
         let _ = kerf_core::source_is_full_range(Path::new(&layer.path));
@@ -589,9 +594,12 @@ impl FrameSource {
         let mut distinct: Vec<usize> = Vec::new();
         let mut of: Vec<usize> = Vec::with_capacity(layers.len());
         for l in layers {
-            let same = distinct
-                .iter()
-                .position(|&d| layers[d].path == l.path && layers[d].pick == l.pick && layers[d].is_image == l.is_image);
+            let same = distinct.iter().position(|&d| {
+                layers[d].path == l.path
+                    && layers[d].pick == l.pick
+                    && layers[d].is_image == l.is_image
+                    && copy_filters(&layers[d]) == copy_filters(l)
+            });
             of.push(same.unwrap_or_else(|| {
                 distinct.push(of.len());
                 distinct.len() - 1
@@ -620,6 +628,19 @@ impl FrameSource {
             warm_range(layer);
         }
         Ok(of.into_iter().map(|i| decoded[i].clone()).collect())
+    }
+
+    /// A moving still's picture: the scaled copy its graph makes of the file ([`crate::source::still_copy_filters`]), decoded
+    /// once and cached beside the file. An export frame's pick is the `fps` filter's, which a still's single picture does not
+    /// change, so this does not look at it: the caller has decided the frame is drawn.
+    pub fn still_copy(&self, layer: &PlanLayer) -> Result<Option<Arc<YuvFrame>>, GpuError> {
+        if layer.still.is_none() && layer.fit.is_none() {
+            return Err(GpuError::Unsupported(format!("{}: not a moving still", layer.path)));
+        }
+        if !path_enabled() || layer.stream.pix_fmt.is_none() {
+            return self.oneshot(layer);
+        }
+        self.image(layer, SourceId::of(Path::new(&layer.path)))
     }
 
     /// The frame one layer shows.
@@ -1059,7 +1080,18 @@ impl FrameSource {
 
     /// A still image: decoded once without a seek, kept under its file.
     fn image(&self, layer: &PlanLayer, source: SourceId) -> Result<Option<Arc<YuvFrame>>, GpuError> {
-        let key = FrameKey { source, pts: i64::MIN };
+        // A moving still's frame is the scaled copy its graph makes of the file, which depends on the move (the copy's size
+        // and the window of it any frame reads): keyed by the filters that make it, beside the file.
+        let pts = match crate::source::copy_of(layer)? {
+            None => i64::MIN,
+            Some(copy) => {
+                use std::hash::{Hash, Hasher};
+                let mut h = std::collections::hash_map::DefaultHasher::new();
+                copy.filters.hash(&mut h);
+                i64::MIN + 1 + (h.finish() >> 2) as i64
+            }
+        };
+        let key = FrameKey { source, pts };
         if let Some(frame) = self.shared.lock().cache.get(key) {
             return Ok(Some(frame));
         }

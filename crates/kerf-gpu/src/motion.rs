@@ -228,7 +228,14 @@ impl MotionFrames {
         for layer in &plan.layers {
             crate::frame_source::warm_range(layer);
         }
-        let (frames, counts) = read.into_iter().unzip();
+        let (mut frames, counts): (Vec<Option<Arc<YuvFrame>>>, Vec<Option<u64>>) = read.into_iter().unzip();
+        // A moving still is one picture whatever the pick: the cursor decided whether the frame is drawn at all (a clip's
+        // closing edge), and the picture is the scaled copy its graph makes of the file, from the frame source's cache.
+        for (layer, frame) in plan.layers.iter().zip(frames.iter_mut()) {
+            if (layer.still.is_some() || layer.fit.is_some()) && frame.is_some() {
+                *frame = self.source.still_copy(layer)?;
+            }
+        }
         self.counts = counts;
         Ok(frames)
     }

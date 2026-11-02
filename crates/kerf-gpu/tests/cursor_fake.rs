@@ -206,6 +206,8 @@ fn layer(path: String, pick: Pick) -> PlanLayer {
         reframe: None,
         fx: LayerFx::default(),
         animated: None,
+        still: None,
+        fit: None,
         fit_order: kerf_core::FitOrder::Fitted,
         keyed_alpha: None,
         timing: PlanTiming {

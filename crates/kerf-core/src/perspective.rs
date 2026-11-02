@@ -90,6 +90,19 @@ impl PlacementFrame {
         }
     }
 
+    /// The frames of a `perspective` that reads a picture with no `pad` and no margin (a moving still's window,
+    /// [`crate::still_motion`]): the picture is the whole frame, and the first `canvas` samples of the result are
+    /// kept (`crop=W:H:0:0`).
+    pub fn window(picture: (u32, u32), canvas: (u32, u32)) -> Self {
+        Self {
+            picture,
+            margin: (0, 0),
+            frame: picture,
+            crop: (0, 0),
+            canvas,
+        }
+    }
+
     /// The four corners the `perspective` expressions evaluate to, top-left, top-right, bottom-left,
     /// bottom-right, each `[x, y]`: the position in the padded frame that the corner of the frame reads,
     /// worked out in the order the expression writes it (`(edge + 0.5 - crop - centre) / s + dim/2 - 0.5`).
@@ -120,7 +133,12 @@ impl PlacementFrame {
         pose.scale.is_none_or(|s| s.is_finite() && s > 0.0)
             && pose.pos.0.is_finite()
             && pose.pos.1.is_finite()
-            && self.corners(pose).iter().flatten().all(|c| c.is_finite() && c.abs() <= REACH)
+            && Self::corners_reachable(&self.corners(pose))
+    }
+
+    /// Whether four corners (the filter's `x0..y3`) are finite and no farther than [`REACH`] samples from the picture.
+    pub fn corners_reachable(corners: &[[f64; 2]; 4]) -> bool {
+        corners.iter().flatten().all(|c| c.is_finite() && c.abs() <= REACH)
     }
 }
 
@@ -195,10 +213,20 @@ impl PlacementMap {
     /// The map of `pose`, as small as it can be made without a pixel of it differing from the filter's
     /// ([`PlacementMap::exact`]).
     pub fn new(frame: PlacementFrame, pose: &Pose) -> Result<Self, PlacementError> {
-        let m = Self::setup(&frame, pose)?;
+        if !frame.reachable(pose) {
+            return Err(too_far());
+        }
+        Self::from_corners(frame, &frame.corners(pose))
+    }
+
+    /// [`PlacementMap::new`] for corners the expressions evaluated to directly (the filter's `x0..y3`, top-left,
+    /// top-right, bottom-left, bottom-right): a moving still's `perspective` has the four of them from its own
+    /// expressions, not a pose on a canvas.
+    pub fn from_corners(frame: PlacementFrame, corners: &[[f64; 2]; 4]) -> Result<Self, PlacementError> {
+        let m = Self::setup_corners(&frame, corners)?;
         // The rectangle's `x6` and `x3` are exactly zero; anything else is not a case this reasons about.
         if m.matrix[6] != 0.0 || m.matrix[3] != 0.0 {
-            return Self::exact(frame, pose);
+            return Self::exact_corners(frame, corners);
         }
         let (cw, ch) = frame.canvas;
         let (y_first, y_last) = (f64::from(frame.crop.1), f64::from(frame.crop.1 + ch - 1));
@@ -227,7 +255,7 @@ impl PlacementMap {
             let slack = 1e-6 + a.abs().max(b.abs()) * 1e-12;
             match one_rounding(a, b, slack) {
                 Some(c) => u.push(c),
-                None => return Self::exact(frame, pose),
+                None => return Self::exact_corners(frame, corners),
             }
         }
         Ok(Self {
@@ -239,7 +267,15 @@ impl PlacementMap {
     /// The filter's table over the window, pixel by pixel, each position computed as `calc_persp_luts`
     /// does.
     pub fn exact(frame: PlacementFrame, pose: &Pose) -> Result<Self, PlacementError> {
-        let m = Self::setup(&frame, pose)?;
+        if !frame.reachable(pose) {
+            return Err(too_far());
+        }
+        Self::exact_corners(frame, &frame.corners(pose))
+    }
+
+    /// [`PlacementMap::exact`] for corners.
+    pub fn exact_corners(frame: PlacementFrame, corners: &[[f64; 2]; 4]) -> Result<Self, PlacementError> {
+        let m = Self::setup_corners(&frame, corners)?;
         let (cw, ch) = frame.canvas;
         let mut u = Vec::with_capacity(cw as usize * ch as usize);
         let mut v = Vec::with_capacity(cw as usize * ch as usize);
@@ -262,12 +298,11 @@ impl PlacementMap {
         })
     }
 
-    fn setup(frame: &PlacementFrame, pose: &Pose) -> Result<Setup, PlacementError> {
-        if !frame.reachable(pose) {
+    fn setup_corners(frame: &PlacementFrame, r: &[[f64; 2]; 4]) -> Result<Setup, PlacementError> {
+        if !PlacementFrame::corners_reachable(r) {
             return Err(too_far());
         }
-        let r = frame.corners(pose);
-        let matrix = matrix(&r, f64::from(frame.frame.0), f64::from(frame.frame.1));
+        let matrix = matrix(r, f64::from(frame.frame.0), f64::from(frame.frame.1));
         // The filter divides by `x6*x + x7*y + x8`; a zero or non-finite one is a picture the pose
         // has made nothing of.
         if !matrix.iter().all(|v| v.is_finite()) || matrix[8] == 0.0 {

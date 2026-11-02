@@ -58,7 +58,9 @@ use crate::clip_timing::{
     clip_seek, clip_source_window, clips_with_fx, ffmpeg_frame_time, graph_bt709_labels, picture_window, ClipFx, ClipTiming,
     FadeEdge, FadeStep, MotionKeys, Rational,
 };
-use crate::engine::{keyed_color_value, keyframe_value, render_geometry, safe_color, valid_color, Container, ExportOptions};
+use crate::engine::{
+    keyed_color_value, keyframe_value, render_geometry, safe_color, valid_color, Container, ExportOptions, StillRoutes,
+};
 use crate::error::{Error, Result};
 use crate::frame_pick::{FpsPick, Pick};
 use crate::layer_geometry::Keyed;
@@ -71,6 +73,7 @@ use crate::render_plan::{
     clip_source_time, composite_matrix, Animated, CompositeColorPolicy, LayerFx, PlanCanvas, PlanLayer, PlanMode, PlanReframe,
     PlanSource, PlanStream, PlanText, PlanTiming, ReframeInterp, RenderPlan, YuvMatrix,
 };
+use crate::still_motion::{StillMotion, StillSample, StillStatic};
 
 fn frame_index(k: u64) -> i64 {
     i64::try_from(k).unwrap_or(i64::MAX)
@@ -154,7 +157,16 @@ struct PlannedClip {
     keys: Option<MotionKeys>,
     tail: bool,
     animated: Option<Animated>,
+    /// The moving still's route ([`crate::still_motion`]), for a still the export takes through it.
+    still: Option<PlannedStill>,
     effects: Vec<VideoEffect>,
+}
+
+/// What a moving still's route needs of the clip over all of its frames.
+struct PlannedStill {
+    stat: StillStatic,
+    export: StillMotion,
+    flags: String,
 }
 
 /// The clips of one video track sorted by start, with the running maximum of their
@@ -266,6 +278,7 @@ impl Planner {
         // matrix: over every clip of this cut, decided from the originals (a Still plan decides
         // over the layers on screen instead, in `plan`).
         let labels = graph_bt709_labels(&rendered, originals);
+        let routes = StillRoutes::new(&rendered, originals, opts);
         for (flat, (ti, ci, clip, fx)) in clips_with_fx(&rendered, assets).enumerate() {
             if rendered.tracks[ti].kind != StreamKind::Video {
                 continue;
@@ -275,6 +288,14 @@ impl Planner {
                 ..fx
             };
             let timing = ClipTiming::new(clip, &fx);
+            // The export takes a moving still image through its own route where it can draw what the general chain
+            // would at every frame (judged on the originals, which the export reads; a still drawn from a proxy is
+            // not planned through it).
+            let still = facts
+                .get(&clip.asset_id)
+                .filter(|a| a.is_image && !a.proxy)
+                .and_then(|_| routes.of(clip, originals, &fx))
+                .map(|(stat, export, flags)| PlannedStill { stat, export, flags });
             let effects = clip
                 .effects
                 .iter()
@@ -323,11 +344,14 @@ impl Planner {
                         color: clip.color_animated(),
                         mask: clip.mask_animated(),
                         crop: clip.crop_animated(),
-                        still_motion: clip.picture_moves() && facts.get(&clip.asset_id).is_some_and(|a| a.is_image),
+                        still_motion: clip.picture_moves()
+                            && facts.get(&clip.asset_id).is_some_and(|a| a.is_image)
+                            && still.is_some(),
                         places: clip.placement_animated(),
                         behaves: clip.has_behaviors(),
                     },
                 ),
+                still,
                 effects,
             });
         }
@@ -706,6 +730,15 @@ impl Planner {
                         tail: planned.tail && eval >= clip.timeline_end(),
                     },
                     animated: planned.animated,
+                    still: planned.still.as_ref().map(|p| crate::render_plan::StillLayer {
+                        stat: p.stat.clone(),
+                        sample: StillSample::at(clip, local),
+                        pose: StillMotion::pose_at(clip, local),
+                        flags: p.flags.clone(),
+                        export: motion.then(|| p.export.clone()),
+                        clip_wide: motion,
+                    }),
+                    fit: None,
                     fit_order,
                     keyed_alpha: (motion && planned.animated.is_some_and(|a| a.opacity)).then(|| {
                         let pick = self.canvas.pick_fps;
@@ -762,7 +795,7 @@ impl Planner {
             .map(|(id, ..)| *id)
             .chain(titles)
             .collect();
-        Ok(RenderPlan {
+        let plan = RenderPlan {
             time: slot,
             mode: self.mode,
             frame,
@@ -774,6 +807,14 @@ impl Planner {
             overlays,
             svg,
             pictureless,
+        };
+        // An export frame is the delivery's: the pictures FFmpeg makes for the compositor are made for that frame. (A still plan's are
+        // made for the size it renders at, `RenderPlan::for_render`.)
+        Ok(if motion {
+            let size = (plan.canvas.width, plan.canvas.height);
+            plan.for_render(size)
+        } else {
+            plan
         })
     }
 }
@@ -1730,6 +1771,7 @@ mod tests {
             reframe: true,
             hdr: true,
             effects: EffectKinds::ALL,
+            still_motion: crate::plan_caps::StillKinds::NONE,
             grade: crate::plan_caps::GradeKinds::NONE,
         };
         let holding = |edit: &dyn Fn(&mut Clip)| {
@@ -1950,6 +1992,7 @@ mod tests {
             reframe: true,
             hdr: true,
             effects: EffectKinds::ALL,
+            still_motion: crate::plan_caps::StillKinds::NONE,
             grade: crate::plan_caps::GradeKinds::NONE,
         };
         // (The overlay names the shipped default font, which a text pass can draw.)
@@ -2593,6 +2636,7 @@ mod tests {
             reframe: true,
             hdr: true,
             effects: EffectKinds::ALL,
+            still_motion: crate::plan_caps::StillKinds::NONE,
             grade: crate::plan_caps::GradeKinds::NONE,
         };
         let keyed_clip = |a: &Asset| {
@@ -3800,5 +3844,110 @@ mod tests {
         assert_eq!(span.runs().iter().map(|r| r.frames.end - r.frames.start).sum::<u64>(), 120);
         assert_eq!(p.first_unsupported(100.0, 4.0, (1920, 1080), &caps), None);
         assert!(started.elapsed().as_secs() < 8, "{:?}", started.elapsed());
+    }
+
+    // ---- a still image on a Ken Burns move -------------------------------------------------------------
+
+    fn photo(fmt: &str) -> Asset {
+        let mut a = test_asset(vec![crate::engine::test_support::image_stream(1920, 1080)]);
+        a.streams[0].pix_fmt = Some(fmt.into());
+        a.path = "/x.png".into();
+        a
+    }
+
+    fn drifting(a: &Asset, from: (f64, f64, f64), to: (f64, f64, f64)) -> Timeline {
+        let mut c = make_clip(a.id, 0.0, 2.0, 0.0);
+        c.keyframes = vec![
+            Keyframe {
+                time: 0.0,
+                scale: from.0,
+                pos_x: from.1,
+                pos_y: from.2,
+                ..keyed(0.0, 1.0, 0.0)
+            },
+            Keyframe {
+                time: 2.0,
+                scale: to.0,
+                pos_x: to.1,
+                pos_y: to.2,
+                ..keyed(2.0, 1.0, 0.0)
+            },
+        ];
+        let mut tl = single(vec![c]);
+        tl.format = Delivery::new(1920, 1080, Fit::Cover).with_fps(Some(30.0)).ok();
+        tl
+    }
+
+    #[test]
+    fn a_move_inside_the_frame_takes_the_moving_still_route_and_one_off_the_picture_does_not() {
+        let a = photo("rgb24");
+        let inside = drifting(&a, (1.2, 0.04, 0.03), (1.0, 0.0, 0.0));
+        let off = drifting(&a, (1.0, -0.03, 0.0), (1.18, 0.03, -0.02));
+        for mode in [PlanMode::Still, PlanMode::Motion] {
+            let p = planner(&inside, std::slice::from_ref(&a), mode, &opts(30.0));
+            let plan = p.at_frame(10).unwrap();
+            let layer = &plan.layers[0];
+            assert!(plan.takes_still_route(layer), "{mode:?}");
+            assert!(layer.fit.is_none() && !plan.fits_by_ffmpeg(layer), "{mode:?}");
+            let p = planner(&off, std::slice::from_ref(&a), mode, &opts(30.0));
+            let plan = p.at_frame(10).unwrap();
+            let layer = &plan.layers[0];
+            assert!(!plan.takes_still_route(layer) && layer.still.is_none(), "{mode:?}");
+            assert!(plan.fits_by_ffmpeg(layer), "{mode:?}");
+            // An export frame's fit picture is made for the delivery's frame; a still plan's once it is worked out for a size.
+            assert_eq!(layer.fit.is_some(), mode == PlanMode::Motion, "{mode:?}");
+            let plan = plan.for_render((960, 540));
+            let fit = plan.layers[0].fit.as_ref().expect("a fit picture");
+            assert_eq!(fit.size, if mode == PlanMode::Still { (960, 540) } else { (1920, 1080) });
+            assert!(fit.filters.contains("scale="), "{}", fit.filters);
+        }
+    }
+
+    #[test]
+    fn a_moving_still_is_drawn_only_for_the_kinds_measured_and_at_the_size_it_was_made_for() {
+        let a = photo("rgb24");
+        let tl = drifting(&a, (1.2, 0.04, 0.03), (1.0, 0.0, 0.0));
+        let caps = |kinds| GpuCaps {
+            motion: true,
+            fades: true,
+            placement: true,
+            keyed_zoom: true,
+            still_motion: kinds,
+            ..GpuCaps::A0
+        };
+        let named = |why: &[Unsupported]| why.iter().any(|u| matches!(u, Unsupported::StillMotion(..)));
+        // An export frame, at the delivery's frame.
+        let p = planner(&tl, std::slice::from_ref(&a), PlanMode::Motion, &opts(30.0));
+        let plan = p.at_frame(10).unwrap();
+        assert!(!named(
+            &plan.reasons(&caps(crate::plan_caps::StillKinds::RGB24), (1920, 1080))
+        ));
+        assert!(named(&plan.reasons(&caps(crate::plan_caps::StillKinds::NONE), (1920, 1080))));
+        assert!(named(&plan.reasons(&caps(crate::plan_caps::StillKinds::RGB24), (960, 540))));
+        // A still plan is judged at any size, and at the size it was worked out for once it has been.
+        let p = planner(&tl, std::slice::from_ref(&a), PlanMode::Still, &opts(30.0));
+        let plan = p.at_frame(10).unwrap();
+        assert!(!named(&plan.reasons(&caps(crate::plan_caps::StillKinds::RGB24), (960, 540))));
+        let worked = plan.for_render((960, 540));
+        assert!(!named(
+            &worked.reasons(&caps(crate::plan_caps::StillKinds::RGB24), (960, 540))
+        ));
+        assert!(named(
+            &worked.reasons(&caps(crate::plan_caps::StillKinds::RGB24), (1920, 1080))
+        ));
+        // Kinds the compositor has no chain for, and a layer something follows the move on.
+        let alpha = photo("rgba");
+        let tl = drifting(&alpha, (1.2, 0.04, 0.03), (1.0, 0.0, 0.0));
+        let p = planner(&tl, std::slice::from_ref(&alpha), PlanMode::Motion, &opts(30.0));
+        let plan = p.at_frame(10).unwrap();
+        assert!(named(&plan.reasons(&caps(crate::plan_caps::StillKinds::ALL), (1920, 1080))));
+        let mut graded = drifting(&a, (1.2, 0.04, 0.03), (1.0, 0.0, 0.0));
+        graded.tracks[0].clips[0].color = Color {
+            contrast: 1.2,
+            ..Color::default()
+        };
+        let p = planner(&graded, std::slice::from_ref(&a), PlanMode::Motion, &opts(30.0));
+        let plan = p.at_frame(10).unwrap();
+        assert!(named(&plan.reasons(&caps(crate::plan_caps::StillKinds::ALL), (1920, 1080))));
     }
 }
