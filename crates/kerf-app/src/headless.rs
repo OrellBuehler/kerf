@@ -254,7 +254,9 @@ pub(crate) fn main(argv: &[String], bundled_ffmpeg: &[(&'static str, PathBuf)]) 
         say(&format!("kerf-app: {e}\n\n{USAGE}"));
         return EXIT_USAGE;
     }
-    if let Err(Exit(code, message)) = use_cache_dir(args.cache_dir.as_deref()) {
+    if let Err(Exit(code, message)) =
+        use_cache_dir(args.cache_dir.as_deref()).and_then(|()| check_cache_cap(&args, kerf_core::paths::cache_dir()))
+    {
         say(&format!("kerf-app: {message}"));
         return code;
     }
@@ -298,6 +300,18 @@ fn use_cache_dir(dir: Option<&Path>) -> Result<(), Exit> {
     let Some(dir) = dir else { return Ok(()) };
     std::fs::create_dir_all(dir).map_err(|e| Exit(EXIT_USAGE, format!("cannot use --cache-dir {}: {e}", dir.display())))?;
     kerf_core::paths::set_cache_dir(dir.to_path_buf());
+    Ok(())
+}
+
+/// A ceiling needs somewhere to keep the caches: refused up front, before a project is opened,
+/// rather than run without the cap the operator asked for.
+fn check_cache_cap(args: &Args, cache_dir: Option<PathBuf>) -> Result<(), Exit> {
+    if args.cache_max_bytes.is_some() && cache_dir.is_none() {
+        return Err(Exit(
+            EXIT_USAGE,
+            "--cache-max-gb needs a cache directory and this system has none (--cache-dir names one)".into(),
+        ));
+    }
     Ok(())
 }
 
@@ -450,8 +464,9 @@ fn run(
     if let Some(cap) = args.cache_max_bytes {
         let open = project.clone();
         // The assets are read under the lock and the lock is let go on return: the pruner stats and
-        // deletes with it released.
-        kerf_core::cache_cap::start(cap, move || lock_user(&open).list_assets().unwrap_or_default());
+        // deletes with it released. A read that fails skips that pass; it is never an empty project.
+        kerf_core::cache_cap::start(cap, move || lock_user(&open).list_assets())
+            .map_err(|e| Exit(EXIT_USAGE, format!("--cache-max-gb cannot be kept: {e}")))?;
     }
     std::thread::spawn(kerf_core::fonts::warm);
     std::thread::spawn(crate::warm_transcription_backend);
@@ -819,6 +834,24 @@ mod tests {
             ..Args::default()
         };
         assert!(matches!(check_args(&args), Ok(None)));
+    }
+
+    #[test]
+    fn a_cache_ceiling_without_a_cache_directory_is_refused() {
+        let capped = Args {
+            cache_max_bytes: Some(1 << 30),
+            ..Args::default()
+        };
+        let Err(Exit(code, message)) = check_cache_cap(&capped, None) else {
+            panic!("a cap with nowhere to keep the caches must not start");
+        };
+        assert_eq!(code, EXIT_USAGE);
+        assert!(
+            message.contains("--cache-max-gb") && message.contains("--cache-dir"),
+            "{message}"
+        );
+        assert!(check_cache_cap(&capped, Some(PathBuf::from("/cache"))).is_ok());
+        assert!(check_cache_cap(&Args::default(), None).is_ok(), "no cap asked, none needed");
     }
 
     #[test]

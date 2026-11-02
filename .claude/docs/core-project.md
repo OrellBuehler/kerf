@@ -1005,22 +1005,36 @@
   **The plan is pure** (`prune_plan(entries, cap)`): `CacheEntry` = one unit (`paths`, `bytes`, `used`, `Class`);
   only `Stale` (a `.part` older than 24 h, a crashed write's) and `Evictable` units go, stale first and then
   least recently used (`used` = later of modified / accessed; **`noatime` degrades it to write order**), ties by
-  path, only until `total <= cap`, never a zero-byte unit. `classify` makes `InUse` (the open project's assets),
+  path, only until `total <= cap` (**a stale `.part` is swept only while the cache is over the cap**, not on its own),
+  never a zero-byte unit. `classify` makes `InUse` (the open project's assets),
   `InFlight` (a `.part` / `.part.` name, or anything touched in the last 10 min — catches a stems folder between
   two of its files) and `Evictable`; `Plan::after` stays over the cap when the kept part alone is over it (logged
   as a warning, nothing else is removed). Bytes are apparent sizes (`len`), links are not followed.
-  **In use** is `InUse::of(&assets)` → `engine::asset_cache_files(asset)`: the names of the asset's proxy (all four
-  spellings — tone-mapped × head-padded — and sidecars, `cli::proxy_cache_files`), waveform, music analysis,
-  stems folder and filmstrip, each a hash of `source_key(original)`: one stat, **no ffprobe**, so no probe runs on
-  a share that went away's behalf more than the stat. **Locks:** `start(cap, assets)` takes a closure that reads
-  the assets under the project lock and returns; the stats, the plan and the deletes happen after, on the
-  `kerf-cache-cap` thread (`cpu::lower_current_thread`, nice 10). It runs at once, every 10 min, and 20 s after a
-  `nudge()` (called when a proxy build or an analysis finishes; a no-op without a pruner). **A removed proxy**
+  **In use** is `InUse::of(&assets, root)`, two things. (1) `engine::asset_cache_files(asset)`: the names of the
+  asset's proxy (all four spellings — tone-mapped × head-padded — and sidecars, `cli::proxy_cache_files`), waveform,
+  music analysis, stems folder and filmstrip, each a hash of `source_key(original)`: one stat, **no ffprobe**.
+  (2) **The asset's own file**, and the directories above it down to the cache root, when it lies inside
+  `<cache>/kerf` (also spelled through a link): **separated stems are project media, not a cache** —
+  `place_stems` stores `stems/<hash>/<name>.flac` as the asset's path, and the unit (all four stems) stays whole
+  while any one is an asset. **Never blind:** `run_once(root, cap, assets, now)` (the seam the thread calls, tested
+  directly) skips the pass, removing nothing, when the closure's `list_assets` fails (an unreadable project is not an
+  empty one) or when an asset's original cannot be stat'ed (`InUse::unreadable`: `source_key` falls back to size 0 /
+  mtime 0, so the names of what exists cannot be worked out and protection would silently be lost — an offline
+  asset pauses the cap, with a warn naming it, until it is back). The thread tells a skipped pass and an
+  over-the-cap state **once when they begin and once when they end** (`Told::note`), not on every pass.
+  **Locks:** `start(cap, assets)` takes a closure returning `Result<Vec<Asset>>` that reads the assets under the
+  project lock and returns; the stats, the plan and the deletes happen after, on the `kerf-cache-cap` thread
+  (`cpu::lower_current_thread`, nice 10). It runs at once, every 10 min, and 20 s after a `nudge()` (called when a
+  proxy build, an analysis, a stems separation, a waveform write or a filmstrip publish finishes; a no-op without a
+  pruner). `start` is `Err(reason)` when it cannot run (no cache dir, a pruner already runs, no thread): headless
+  turns that into exit 2. **One process:** only this process's open project is protected; a desktop app or
+  another server on the same cache directory has projects this pruner cannot see, so do not share one. **A removed proxy**
   reads `missing` (`ready_proxy` is an existence check, so `status` never claims it), previews fall back to the
   original, `remove` bumps `plan_epoch` so a plan made around it is remade, and `queue_auto` rebuilds it at the next
   open or import (when proxies are on); the open project's are never removed, so a running preview does not lose its file. Tests: the
   plan (cap, order, exclusions, in-flight, stale, ties), `classify`, a scan and a run on a temp dir (sidecars with
-  their proxy, models and `stitched/` kept, links not followed), `tests/headless.rs` end to end.
+  their proxy, models and `stitched/` kept, links not followed), a stem asset keeping its folder (also through a
+  link), a read error or an offline original removing nothing, the told-once state, `tests/headless.rs` end to end.
 - `error.rs` — `Error`/`Result`; the `Ffmpeg(#[from] ffmpeg_next::Error)` variant is
   itself `#[cfg(feature = "ffmpeg")]`.
 - **Thumbnails** (`project/thumbnails.rs`; the model is `core-model.md`, the drawing `engine-cli.md`). The template shape:

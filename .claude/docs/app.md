@@ -54,12 +54,18 @@ desktop app's config / data dirs for the build's identifier (`context()`, the on
 `KERF_MCP_TOKEN`). In memory only: review off unless `--review`, proxies off (`PreviewSource::Original`) unless `--proxies`,
 `--cpu-percent`. **Disk caches** (both off by default; the desktop app has neither): `--cache-dir DIR` (`KERF_CACHE_DIR`)
 puts every cache under `DIR/kerf/…` instead of the OS cache dir (`paths::set_cache_dir`, set before logging or any thread
-reads it; created, exit 2 if it cannot be) so a hosted server can keep them on a chosen volume; `--cache-max-gb N`
+reads it; created, exit 2 if it cannot be) so a hosted server can keep them on a chosen volume — **that moves the
+downloads too** (`models/`, `runtime/`, `soundfonts/`), so a fresh directory downloads them again on first use;
+`--cache-max-gb N`
 (`KERF_CACHE_MAX_GB`, a number of GiB above 0, a fraction is fine, the flag wins, exit 2 otherwise) starts
 `kerf_core::cache_cap::start` after the project is open — least-recently-used proxies, waveforms, filmstrips, stems and music
-analyses are pruned at start, every 10 min and after a proxy build or an analysis, keeping the open project's assets' files,
-anything being written and the downloaded models (`core-project.md` has the inventory and the rules); it logs what it freed
-and warns when the kept part alone is over the cap. `stitched/` is not covered.
+analyses are pruned at start, every 10 min and after a proxy build, an analysis, a stems separation, a waveform or a filmstrip
+write, keeping the open project's assets' files (a stem asset's own file included), anything being written and the downloaded
+models (`core-project.md` has the inventory and the rules); a stale `.part` goes only while over the cap; it logs what it freed
+and warns once when the kept part alone is over the cap, and skips (warning once) a pass that cannot read the assets or find an
+original. A cap that cannot be kept — no cache directory (checked before anything opens), a thread that will not start — is exit 2,
+not a run without it. **Only this process's project is protected: do not point a desktop app or a second server at the
+same cache directory.** `stitched/` is not covered.
 No GPU preview, crash marker, reveal failsafe or launch slot. **stdout** is one JSON ready line once the
 listener is up — `{"kerf":"listening","url","addr","pid","project","agent_review","token_source":"env|settings|generated"}`
 — and `--help`; logs go to **stderr** (`init_logging(dir, to_stderr)`) and `<data>/logs`. The token is never printed unless

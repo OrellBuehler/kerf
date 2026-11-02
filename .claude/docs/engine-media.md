@@ -33,7 +33,9 @@
   size is checked before anything is allocated. Loaded pyramids sit in a
   byte-bounded in-process LRU (64 MB) so scrolling does not re-read the cache file. On disk the waveform, filmstrip, stems and
   music caches have no bound of their own; a capped headless run prunes them least recently used first (`cache_cap.rs`,
-  inventory and rules in `core-project.md`), so a missing cache file is always just a miss.
+  inventory and rules in `core-project.md`). A missing waveform, filmstrip or music file is just a miss, but **a stems
+  folder is not only a cache**: once imported, `stems/<hash>/<name>.flac` is an asset's own file, and the pruner keeps
+  every asset's file (and its folder) of the open project.
   `Project::waveform_range` / the lock-free `Project::decode_waveform_range` are the
   op (an asset with no audio stream is `InvalidArgument`), exposed as the
   `get_waveform_range` Tauri command and MCP tool; the MCP `get_waveform` / `get_energy` stay (the GUI draws from the

@@ -19,8 +19,19 @@
 //! (`proxy::status`, `ready_proxy` is an existence check) and previews fall back to the original; the
 //! plan epoch moves so a plan made around it is rebuilt. The open project's proxies are never removed.
 //!
+//! **Stems are the project's media**, not a cache of it: once placed, `stems/<hash>/<name>.flac` is an
+//! asset's own file. [`InUse::of`] therefore keeps every asset's own file, and the unit that holds it
+//! when it lies inside a managed directory, besides the caches the asset's source made.
+//!
+//! **Never blind.** A pass that cannot tell what the project uses is skipped, not guessed at: the
+//! assets could not be read, or an original cannot be found (the caches are keyed on it, so what it
+//! uses cannot be named). Nothing is removed until the next pass can tell.
+//!
 //! **Locks.** The pruner never holds the project lock across disk work: the adapter's closure hands over
 //! the assets under it and returns, and the stats and deletes happen after.
+//!
+//! **One process.** What is kept is what *this* process's open project uses. Another Kerf (the desktop
+//! app, a second server) sharing the cache directory has projects this one cannot see.
 
 use std::collections::{BTreeMap, HashSet};
 use std::panic::AssertUnwindSafe;
@@ -177,21 +188,60 @@ fn is_partial(name: &str) -> bool {
 
 /// The cache files the open project's assets use, which a run never removes.
 #[derive(Debug, Clone, Default)]
-pub struct InUse(HashSet<PathBuf>);
+pub struct InUse {
+    keep: HashSet<PathBuf>,
+    /// Originals that could not be found: what their caches are called cannot be worked out.
+    unreadable: Vec<PathBuf>,
+}
 
 impl InUse {
-    /// What `assets` use. Stats each original (the caches are keyed on it) but spawns nothing, so it
-    /// runs with the project lock released, and a share that went away can make it slow.
-    pub fn of(assets: &[Asset]) -> Self {
-        Self(assets.iter().flat_map(crate::engine::asset_cache_files).collect())
+    /// What `assets` use among the managed caches under `root` (`<cache>/kerf`): the files their
+    /// sources made, and the assets' own files that lie inside it (separated stems are imported from
+    /// there). Stats each original (the caches are keyed on it) but spawns nothing, so it runs with the
+    /// project lock released, and a share that went away can make it slow.
+    pub fn of(assets: &[Asset], root: &Path) -> Self {
+        let canonical_root = std::fs::canonicalize(root).ok();
+        let mut out = Self::default();
+        for asset in assets {
+            let path = Path::new(&asset.path);
+            if std::fs::metadata(path).is_err() {
+                out.unreadable.push(path.to_path_buf());
+            }
+            out.keep.extend(crate::engine::asset_cache_files(asset));
+            out.keep_own_file(path, root, canonical_root.as_deref());
+        }
+        out
     }
 
     pub fn from_paths(paths: impl IntoIterator<Item = PathBuf>) -> Self {
-        Self(paths.into_iter().collect())
+        Self {
+            keep: paths.into_iter().collect(),
+            unreadable: Vec::new(),
+        }
+    }
+
+    /// The originals that could not be found; while there are any, [`InUse`] is not the whole answer.
+    pub fn unreadable(&self) -> &[PathBuf] {
+        &self.unreadable
+    }
+
+    /// An asset's own file, and every directory above it down to `root`, so the unit it is in (a
+    /// stems folder with its other three) stays whole. Spelled as `path` has it and, when a link makes
+    /// it a different one, as the pruner will see it.
+    fn keep_own_file(&mut self, path: &Path, root: &Path, canonical_root: Option<&Path>) {
+        let linked = canonical_root
+            .zip(std::fs::canonicalize(path).ok())
+            .and_then(|(canonical_root, real)| real.strip_prefix(canonical_root).ok().map(|rel| root.join(rel)));
+        for own in std::iter::once(path.to_path_buf()).chain(linked) {
+            if own.starts_with(root) {
+                self.keep
+                    .extend(own.ancestors().take_while(|a| *a != root).map(Path::to_path_buf));
+            }
+        }
     }
 
     fn holds(&self, path: &Path) -> bool {
-        self.0.contains(path)
+        self.keep.contains(path)
     }
 }
 
@@ -376,31 +426,130 @@ fn gib(bytes: u64) -> String {
     format!("{:.2} GiB", bytes as f64 / GIB as f64)
 }
 
-fn log(report: &Report, cap: u64, first: bool) {
-    let freed = report
-        .by_group
-        .iter()
-        .map(|(group, bytes)| format!("{group} {}", gib(*bytes)))
-        .collect::<Vec<_>>()
-        .join(", ");
-    if report.removed > 0 {
-        tracing::info!(
-            freed = %gib(report.freed),
-            removed = report.removed,
-            now = %gib(report.after),
-            cap = %gib(cap),
-            "pruned the cache ({freed})"
-        );
-    } else if first {
-        tracing::info!(now = %gib(report.after), cap = %gib(cap), "cache cap in force");
+/// One pass: read the project's assets through `assets`, work out what they use and prune the caches
+/// under `root` (`<cache>/kerf`) to `cap`. `Err` with the reason when the pass cannot tell what is in
+/// use, and then nothing at all is removed: pruning on a guess would take what the project plays from.
+pub fn run_once(
+    root: &Path,
+    cap: u64,
+    assets: &dyn Fn() -> crate::Result<Vec<Asset>>,
+    now: SystemTime,
+) -> Result<Report, String> {
+    let assets = assets().map_err(|e| format!("the project's assets could not be read ({e})"))?;
+    let in_use = InUse::of(&assets, root);
+    if let Some(missing) = in_use.unreadable().first() {
+        return Err(format!(
+            "{} of the project's media cannot be found, such as {}, so what the project uses cannot be told",
+            in_use.unreadable().len(),
+            missing.display()
+        ));
     }
-    if report.after > cap {
-        tracing::warn!(
-            now = %gib(report.after),
-            cap = %gib(cap),
-            kept = %gib(report.pinned),
-            "the cache is over its cap: what the open project uses and what is being written are kept"
-        );
+    Ok(prune(root, cap, &in_use, now))
+}
+
+/// How a condition changed between two passes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Edge {
+    Began,
+    Ended,
+    Same,
+}
+
+fn edge(was: bool, is: bool) -> Edge {
+    match (was, is) {
+        (false, true) => Edge::Began,
+        (true, false) => Edge::Ended,
+        _ => Edge::Same,
+    }
+}
+
+/// Something worth saying about the state of the cache, which is said when it changes and not on every
+/// pass while it lasts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Notice {
+    /// The pass could not tell what the project uses (and why).
+    Skipped(String),
+    /// ... and now it can.
+    Resumed,
+    /// What is kept alone is over the cap.
+    Over,
+    /// ... and it is not any more.
+    Under,
+}
+
+/// What the pruner has already said.
+#[derive(Default)]
+struct Told {
+    over: bool,
+    skipped: Option<String>,
+}
+
+impl Told {
+    /// The notices a pass's outcome calls for, given what was said before (pure).
+    fn note(&mut self, outcome: &Result<Report, String>, cap: u64) -> Vec<Notice> {
+        let mut notices = Vec::new();
+        let report = match outcome {
+            Ok(report) => report,
+            Err(reason) => {
+                if self.skipped.as_deref() != Some(reason) {
+                    notices.push(Notice::Skipped(reason.clone()));
+                }
+                self.skipped = Some(reason.clone());
+                return notices;
+            }
+        };
+        if self.skipped.take().is_some() {
+            notices.push(Notice::Resumed);
+        }
+        let over = report.after > cap;
+        match edge(self.over, over) {
+            Edge::Began => notices.push(Notice::Over),
+            Edge::Ended => notices.push(Notice::Under),
+            Edge::Same => {}
+        }
+        self.over = over;
+        notices
+    }
+}
+
+/// Log a pass: what it freed (or that the cap is in force, on the first), then `notices`.
+fn log(outcome: &Result<Report, String>, notices: &[Notice], cap: u64, first: bool) {
+    if let Ok(report) = outcome {
+        let freed = report
+            .by_group
+            .iter()
+            .map(|(group, bytes)| format!("{group} {}", gib(*bytes)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if report.removed > 0 {
+            tracing::info!(
+                freed = %gib(report.freed),
+                removed = report.removed,
+                now = %gib(report.after),
+                cap = %gib(cap),
+                "pruned the cache ({freed})"
+            );
+        } else if first {
+            tracing::info!(now = %gib(report.after), cap = %gib(cap), "cache cap in force");
+        }
+    }
+    for notice in notices {
+        match (notice, outcome) {
+            (Notice::Skipped(reason), _) => {
+                tracing::warn!("the cache pruner skips a pass until it can tell what the project uses: {reason}");
+            }
+            (Notice::Resumed, _) => tracing::info!("the cache pruner can tell what the project uses again"),
+            (Notice::Over, Ok(report)) => tracing::warn!(
+                now = %gib(report.after),
+                cap = %gib(cap),
+                kept = %gib(report.pinned),
+                "the cache is over its cap: what the open project uses and what is being written are kept"
+            ),
+            (Notice::Under, Ok(report)) => {
+                tracing::info!(now = %gib(report.after), cap = %gib(cap), "the cache is back under its cap");
+            }
+            (Notice::Over | Notice::Under, Err(_)) => {}
+        }
     }
 }
 
@@ -450,40 +599,40 @@ fn wait() {
     }
 }
 
-/// Keep the caches under `cap` bytes from now on: a run at once, then one every [`INTERVAL`] and one
+/// Keep the caches under `cap` bytes from now on: a pass at once, then one every [`INTERVAL`] and one
 /// soon after each [`nudge`], on a thread of its own at low priority. `assets` hands over the open
-/// project's assets (the adapter takes the project lock for it and releases it on return); what they
-/// use is kept. `false` when a pruner already runs or the platform has no cache directory.
-pub fn start(cap: u64, assets: impl Fn() -> Vec<Asset> + Send + 'static) -> bool {
-    let Some(root) = crate::paths::cache_dir().map(|d| d.join("kerf")) else {
-        tracing::warn!("no cache directory: the cache cap has nothing to keep");
-        return false;
-    };
+/// project's assets (the adapter takes the project lock for it and releases it on return, and says
+/// `Err` when it cannot read them: that pass is skipped); what they use is kept. `Err` with the reason
+/// when the cap cannot be kept: a pruner already runs, the platform has no cache directory, or the
+/// thread would not start.
+pub fn start(cap: u64, assets: impl Fn() -> crate::Result<Vec<Asset>> + Send + 'static) -> Result<(), String> {
+    let root = crate::paths::cache_dir()
+        .map(|d| d.join("kerf"))
+        .ok_or("there is no cache directory to cap (--cache-dir names one)")?;
     if RUNNING.swap(true, Ordering::SeqCst) {
-        return false;
+        return Err("a cache pruner already runs".into());
     }
     let spawned = std::thread::Builder::new().name("kerf-cache-cap".into()).spawn(move || {
         crate::engine::cpu::lower_current_thread();
-        let mut first = true;
+        let (mut told, mut first) = (Told::default(), true);
         loop {
-            let run = std::panic::catch_unwind(AssertUnwindSafe(|| {
-                let in_use = InUse::of(&assets());
-                prune(&root, cap, &in_use, SystemTime::now())
-            }));
+            let run = std::panic::catch_unwind(AssertUnwindSafe(|| run_once(&root, cap, &assets, SystemTime::now())));
             match run {
-                Ok(report) => log(&report, cap, first),
+                Ok(outcome) => {
+                    let notices = told.note(&outcome, cap);
+                    log(&outcome, &notices, cap, first);
+                    first = false;
+                }
                 Err(_) => tracing::error!("pruning the cache panicked; trying again later"),
             }
-            first = false;
             wait();
         }
     });
     if let Err(e) = spawned {
         RUNNING.store(false, Ordering::SeqCst);
-        tracing::warn!(error = %e, "could not start the cache pruner");
-        return false;
+        return Err(format!("could not start the cache pruner: {e}"));
     }
-    true
+    Ok(())
 }
 
 #[cfg(test)]
@@ -883,10 +1032,132 @@ mod tests {
         for group in ["waveforms", "music", "stems", "filmstrips"] {
             assert_eq!(under(group), 1, "{group}");
         }
-        let used = InUse::of(&[asset]);
+        let used = InUse::of(&[asset], Path::new("/nowhere/kerf"));
         let Some(first) = files.first() else { return };
         assert!(used.holds(first));
         assert!(!used.holds(Path::new("/elsewhere/entirely.mp4")));
+        assert_eq!(
+            used.unreadable(),
+            [PathBuf::from("/media/cache-cap-never-imported.mov")],
+            "an original that is not there is reported"
+        );
+    }
+
+    /// An asset whose file is `path`, which exists.
+    fn asset_at(path: &Path) -> Asset {
+        let mut asset = crate::engine::test_support::av_asset(uuid::Uuid::new_v4(), 12.0);
+        asset.path = path.display().to_string();
+        asset
+    }
+
+    #[test]
+    fn a_stem_the_project_imported_keeps_its_folder_whole() {
+        let dir = Dir::new("stems");
+        let old = weeks(9);
+        let vocals = dir.file("stems/s1/vocals.flac", 200, old);
+        dir.file("stems/s1/drums.flac", 200, old);
+        dir.file("stems/s1/bass.flac", 200, old);
+        dir.file("stems/s1/other.flac", 200, old);
+        dir.file("stems/s2/vocals.flac", 200, old);
+        dir.file("waveforms/idle.bin", 100, old);
+        let assets = [asset_at(&vocals)];
+
+        let used = InUse::of(&assets, &dir.0);
+        assert!(used.holds(&dir.0.join("stems/s1")), "the unit that holds it");
+        assert!(used.holds(&vocals));
+        assert!(!used.holds(&dir.0.join("stems/s2")));
+        assert!(!used.holds(&dir.0), "not the cache itself");
+
+        let report = run_once(&dir.0, 0, &|| Ok(assets.to_vec()), SystemTime::now()).expect("it can tell");
+        for stem in ["vocals", "drums", "bass", "other"] {
+            assert!(
+                dir.0.join(format!("stems/s1/{stem}.flac")).exists(),
+                "{stem} is the project's media"
+            );
+        }
+        assert!(!dir.0.join("stems/s2").exists(), "a stems folder nothing uses goes");
+        assert!(!dir.0.join("waveforms/idle.bin").exists());
+        assert_eq!((report.pinned, report.after), (800, 800));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_asset_in_the_cache_is_kept_however_a_link_spells_its_path() {
+        let dir = Dir::new("spelled");
+        let linked = Dir::new("spelled-link");
+        let real = dir.file("stems/s1/vocals.flac", 10, weeks(9));
+        dir.file("stems/s2/vocals.flac", 10, weeks(9));
+        let link = linked.0.join("cache");
+        std::os::unix::fs::symlink(&dir.0, &link).unwrap();
+
+        // The project has the file by its real name, the pruner reaches the cache through the link.
+        let used = InUse::of(&[asset_at(&real)], &link);
+        assert!(used.holds(&link.join("stems/s1")));
+        // ... and the other way round.
+        let used = InUse::of(&[asset_at(&link.join("stems/s1/vocals.flac"))], &dir.0);
+        assert!(used.holds(&dir.0.join("stems/s1")));
+        assert!(!used.holds(&dir.0.join("stems/s2")));
+    }
+
+    #[test]
+    fn a_pass_that_cannot_tell_what_the_project_uses_removes_nothing() {
+        let dir = Dir::new("blind");
+        populated(&dir, weeks(9));
+        let before = |dir: &Dir| scan(&dir.0, &InUse::default(), SystemTime::now()).len();
+        let units = before(&dir);
+        assert!(units > 0);
+
+        let failed = run_once(
+            &dir.0,
+            0,
+            &|| Err(crate::Error::Engine("database is locked".into())),
+            SystemTime::now(),
+        )
+        .unwrap_err();
+        assert!(
+            failed.contains("could not be read") && failed.contains("database is locked"),
+            "{failed}"
+        );
+        assert_eq!(before(&dir), units, "an unreadable project is not an empty one");
+
+        let gone = asset_at(&dir.0.join("an-original-on-a-share-that-went-away.mov"));
+        let skipped = run_once(&dir.0, 0, &|| Ok(vec![gone.clone()]), SystemTime::now()).unwrap_err();
+        assert!(skipped.contains("1 of the project's media cannot be found"), "{skipped}");
+        assert!(skipped.contains("went-away.mov"), "{skipped}");
+        assert_eq!(before(&dir), units, "an original that cannot be statted hides its caches");
+
+        let report = run_once(&dir.0, 0, &|| Ok(Vec::new()), SystemTime::now()).expect("an empty project is known");
+        assert!(report.removed > 0, "once it can tell, the pass runs");
+        assert_eq!(before(&dir), 0);
+    }
+
+    #[test]
+    fn a_condition_that_lasts_is_told_once() {
+        assert_eq!(edge(false, true), Edge::Began);
+        assert_eq!(edge(true, true), Edge::Same, "still over the cap: said already");
+        assert_eq!(edge(false, false), Edge::Same);
+        assert_eq!(edge(true, false), Edge::Ended);
+
+        let report = |after| {
+            Ok(Report {
+                after,
+                pinned: after,
+                ..Report::default()
+            })
+        };
+        let mut told = Told::default();
+        assert_eq!(told.note(&report(50), 100), []);
+        assert_eq!(told.note(&report(300), 100), [Notice::Over]);
+        assert_eq!(told.note(&report(300), 100), [], "the next pass over the cap is not news");
+        assert_eq!(told.note(&report(310), 100), []);
+        assert_eq!(told.note(&report(80), 100), [Notice::Under]);
+
+        let blind: Result<Report, String> = Err("the database is locked".into());
+        assert_eq!(told.note(&blind, 100), [Notice::Skipped("the database is locked".into())]);
+        assert_eq!(told.note(&blind, 100), [], "a pass skipped for the same reason is not news");
+        let other: Result<Report, String> = Err("a share went away".into());
+        assert_eq!(told.note(&other, 100), [Notice::Skipped("a share went away".into())]);
+        assert_eq!(told.note(&report(300), 100), [Notice::Resumed, Notice::Over]);
     }
 
     #[test]

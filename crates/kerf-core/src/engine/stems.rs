@@ -142,6 +142,13 @@ fn encode_flac(wav: &Path, flac: &Path) -> Result<()> {
 /// [`STEM_NAMES`] order), downloading the runtime and model on first use. Cached per
 /// source file. Reports `download_runtime` / `download_model` / `separate` / `encode`.
 pub fn separate(path: &Path, progress: &mut Report, cancel: &dyn Fn() -> bool) -> Result<Vec<PathBuf>> {
+    let outs = separate_into_cache(path, progress, cancel);
+    // The folder has grown whether or not the run finished (a cancelled one leaves its finished stems).
+    crate::cache_cap::nudge();
+    outs
+}
+
+fn separate_into_cache(path: &Path, progress: &mut Report, cancel: &dyn Fn() -> bool) -> Result<Vec<PathBuf>> {
     let dir = stems_dir(path).ok_or_else(|| Error::Engine("no cache directory available for stems".into()))?;
     let outs: Vec<PathBuf> = STEM_NAMES.iter().map(|n| dir.join(format!("{n}.flac"))).collect();
     if outs.iter().all(|p| p.is_file()) {

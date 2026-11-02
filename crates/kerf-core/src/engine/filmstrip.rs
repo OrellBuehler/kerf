@@ -731,7 +731,9 @@ fn publish(work: &Path, dest: &Path, strip: &Filmstrip) -> std::io::Result<()> {
     if dest.exists() {
         std::fs::remove_dir_all(dest)?;
     }
-    std::fs::rename(work, dest)
+    std::fs::rename(work, dest)?;
+    crate::cache_cap::nudge();
+    Ok(())
 }
 
 /// Remove `.part` directories under `root` that a crashed build left behind.

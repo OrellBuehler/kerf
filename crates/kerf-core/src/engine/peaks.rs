@@ -558,6 +558,8 @@ fn write_cache(file: &Path, pyramid: &WaveformPyramid) -> std::io::Result<()> {
     let written = std::fs::write(&tmp, encode(pyramid)).and_then(|()| std::fs::rename(&tmp, file));
     if written.is_err() {
         let _ = std::fs::remove_file(&tmp);
+    } else {
+        crate::cache_cap::nudge();
     }
     written
 }
