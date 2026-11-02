@@ -795,6 +795,7 @@ fn a_workspace_refuses_paths_outside_it_and_resolves_relative_ones_in_it() {
             .args(args)
             .env_remove("DISPLAY")
             .env_remove("KERF_WORKSPACE")
+            .env_remove("KERF_CACHE_DIR")
             .env("KERF_MCP_TOKEN", "w".repeat(48))
             .stdin(Stdio::null())
             .output()
@@ -812,6 +813,9 @@ fn a_workspace_refuses_paths_outside_it_and_resolves_relative_ones_in_it() {
     assert!(why.contains("outside the workspace"), "{why}");
     let why = refused(&["--data-dir", ws.join("kerf-data").to_str().unwrap()]);
     assert!(why.contains("inside --workspace"), "{why}");
+    let caches = ws.join("caches");
+    let why = refused(&["--data-dir", data.to_str().unwrap(), "--cache-dir", caches.to_str().unwrap()]);
+    assert!(why.contains("Kerf's cache") && why.contains("inside --workspace"), "{why}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

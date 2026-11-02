@@ -415,21 +415,17 @@ pub(crate) fn main(argv: &[String], bundled_ffmpeg: &[(&'static str, PathBuf)]) 
         }
     };
     if let Some(ws) = &workspace {
+        // The cache directory in force: `--cache-dir` / KERF_CACHE_DIR was set above, before this.
         let kerf_dirs = [
             ("the settings directory", config.clone()),
             ("the data directory", data.clone()),
             ("--token-file", args.token_file.clone()),
-            ("Kerf's cache", dirs::cache_dir().map(|d| d.join("kerf"))),
+            ("Kerf's cache", kerf_core::paths::cache_dir().map(|d| d.join("kerf"))),
             ("Kerf's generated media", dirs::data_dir().map(|d| d.join("kerf"))),
         ];
-        if let Some((what, path)) = kerf_own_inside(ws, &kerf_dirs) {
-            say(&format!(
-                "kerf-app: {what} {} lies inside --workspace {}: clients could read or replace it (pick another --data-dir \
-                 or workspace)",
-                path.display(),
-                ws.root()
-            ));
-            return EXIT_USAGE;
+        if let Err(Exit(code, message)) = refuse_kerf_own_inside(ws, &kerf_dirs) {
+            say(&format!("kerf-app: {message}"));
+            return code;
         }
     }
     crate::init_logging(data.as_ref().map(|d| d.join("logs")), true);
@@ -481,12 +477,25 @@ fn open_workspace(args: &mut Args) -> Result<Option<Arc<Workspace>>, Exit> {
     Ok(Some(Arc::new(workspace)))
 }
 
-/// The first of Kerf's own files and directories that lies in the workspace, if one does.
-fn kerf_own_inside<'a>(ws: &Workspace, paths: &'a [(&'a str, Option<PathBuf>)]) -> Option<(&'a str, &'a Path)> {
-    paths
+/// Refuse (a usage error) when one of Kerf's own files and directories lies in the workspace:
+/// clients could read or replace it.
+fn refuse_kerf_own_inside(ws: &Workspace, paths: &[(&str, Option<PathBuf>)]) -> Result<(), Exit> {
+    let inside = paths
         .iter()
         .filter_map(|(what, path)| Some((*what, path.as_deref()?)))
-        .find(|(_, path)| ws.holds(path))
+        .find(|(_, path)| ws.holds(path));
+    match inside {
+        Some((what, path)) => Err(Exit(
+            EXIT_USAGE,
+            format!(
+                "{what} {} lies inside --workspace {}: clients could read or replace it (pick another --data-dir, \
+                 --cache-dir or workspace)",
+                path.display(),
+                ws.root()
+            ),
+        )),
+        None => Ok(()),
+    }
 }
 
 /// What can be refused before anything starts: the project file, the token file, the token. The
@@ -968,9 +977,33 @@ mod tests {
             ("the data directory", Some(dir.join("data"))),
             ("--token-file", Some(dir.join("ws").join("secrets").join("token"))),
         ];
-        let (what, _) = kerf_own_inside(&ws, &paths).unwrap();
-        assert_eq!(what, "--token-file");
-        assert!(kerf_own_inside(&ws, &paths[..1]).is_none());
+        let Exit(code, message) = refuse_kerf_own_inside(&ws, &paths).unwrap_err();
+        assert_eq!(code, EXIT_USAGE);
+        assert!(message.starts_with("--token-file"), "{message}");
+        assert!(refuse_kerf_own_inside(&ws, &paths[..1]).is_ok());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `--cache-dir` puts the caches under `DIR/kerf`: a DIR in the workspace is refused, one beside it
+    /// is not.
+    #[test]
+    fn a_cache_dir_inside_the_workspace_is_a_usage_error() {
+        let dir = std::env::temp_dir().join(format!("kerf-headless-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(dir.join("ws")).unwrap();
+        let ws = Workspace::open(&dir.join("ws")).unwrap();
+        let cache = |base: PathBuf| [("Kerf's cache", Some(base.join("kerf")))];
+        let Exit(code, message) = refuse_kerf_own_inside(&ws, &cache(dir.join("ws").join("caches"))).unwrap_err();
+        assert_eq!(code, EXIT_USAGE);
+        assert!(
+            message.contains("Kerf's cache") && message.contains("--cache-dir"),
+            "{message}"
+        );
+        assert!(refuse_kerf_own_inside(&ws, &cache(dir.join("ws"))).is_err());
+        assert!(refuse_kerf_own_inside(&ws, &cache(dir.join("caches"))).is_ok());
+        assert!(
+            refuse_kerf_own_inside(&ws, &cache(dir.clone())).is_ok(),
+            "DIR/kerf beside the workspace"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

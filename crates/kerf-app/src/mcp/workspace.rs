@@ -193,7 +193,9 @@ fn kerf_media_dirs() -> Vec<PathBuf> {
     let generated = ["music", "voiceovers", "sfx"]
         .into_iter()
         .filter_map(|name| Some(data.as_ref()?.join(name)));
-    generated.chain(dirs::cache_dir().map(|d| d.join("kerf"))).collect()
+    generated
+        .chain(kerf_core::paths::cache_dir().map(|d| d.join("kerf")))
+        .collect()
 }
 
 /// Whether `file` (absolute) lies in `dir`, by its spelling and once its links are followed.

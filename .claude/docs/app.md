@@ -51,7 +51,7 @@ still links GTK / WebKitGTK (the libraries must be installed, a display need not
 (else `KERF_WORKSPACE`; for a server remote agents reach) confines every path an MCP client names to DIR (`mcp.md`
 "Workspace"): DIR must be an existing directory and not a filesystem root (else exit 2), `--project` / `--new-project`
 then resolve against DIR and must lie inside it, a `--project` may name no file outside it, and the settings, data and
-cache directories and `--token-file` may not lie in it (each exit 2). It holds over `--stdio` too (set in `server::Overrides` before `start_stdio`); with no ready line there, DIR shows only in the instructions and `project_info`. Directories: the
+cache directories (the cache in force: `--cache-dir`'s `DIR/kerf`, set first) and `--token-file` may not lie in it (each exit 2). It holds over `--stdio` too (set in `server::Overrides` before `start_stdio`); with no ready line there, DIR shows only in the instructions and `project_info`. Directories: the
 desktop app's config / data dirs for the build's identifier (`context()`, the one `generate_context!`, so a debug build uses
 `.dev`), or `--data-dir` for settings, logs and recovery alike (CI isolation). No single-instance plugin: a taken port exits
 3 (`port in use … --mcp-addr`), and two runs sharing a settings file can race to make the first token (use `--data-dir` or
