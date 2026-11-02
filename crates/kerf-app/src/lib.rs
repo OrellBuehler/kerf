@@ -4788,32 +4788,10 @@ async fn get_render_bar(
                 .ok_or(kerf_core::Error::AssetNotFound(id))
         })
         .map_err(|e| e.to_string())?;
-        // The grade is in the GPU's caps once this FFmpeg's conversions are known to be the ones it draws, so a cut
-        // with one asks (once per process, off the lock, like `kerf_gpu::prepare` does for a frame).
+        // What the GPU's caps are made of is measured once per process, off the lock: the grade's conversions (a grade, a dip to
+        // white, another colour matrix), the scaler, the matrix conversion and `drawtext`'s layout, for this cut.
         let caps = enabled.then(|| {
-            // (A dip to white runs the grade's conversions around its fade, so it asks too.)
-            let graded = timeline.tracks.iter().flat_map(|t| &t.clips).any(|c| {
-                !c.grade.is_identity()
-                    || c.transition_in
-                        .as_ref()
-                        .is_some_and(|t| t.kind == kerf_core::TransitionKind::DipToWhite)
-            });
-            if graded {
-                let _ = kerf_gpu::grade::kernels();
-            }
-            // The scaler is exact in the caps once it is measured, and a resized layer is drawn only then (a scaler
-            // that is not known to be swscale's draws it a level off): any cut may resize one.
-            let _ = kerf_gpu::scaler::kernels();
-            // A layer of another matrix than the bottom's is converted into it by FFmpeg 9 and drawn only where that
-            // conversion is measured to be the one the GPU follows (the policy is already known here).
-            if kerf_core::composite_color_policy() == kerf_core::CompositeColorPolicy::BottomLayerTag {
-                let _ = kerf_gpu::grade::kernels();
-                let _ = kerf_gpu::convert::kernels();
-            }
-            // ...and so is the layout of this FFmpeg's `drawtext`, for a cut with text.
-            if !timeline.overlays.is_empty() {
-                let _ = kerf_gpu::text::model();
-            }
+            kerf_gpu::prepare_timeline(&timeline);
             kerf_gpu::Compositor::caps_for(
                 kerf_gpu::grade::measured(),
                 kerf_gpu::scaler::measured(),

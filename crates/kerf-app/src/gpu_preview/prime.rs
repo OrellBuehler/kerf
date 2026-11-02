@@ -314,6 +314,8 @@ impl GpuPreview {
         bounds: &super::Bounds,
         drawing: &super::Drawing,
     ) -> Result<Primed, String> {
+        // Measured here, once per process and off the frame loop; the caps below read what the probes found.
+        kerf_gpu::prepare_timeline(&inputs.timeline);
         let cut = PlayCut::new(&inputs.timeline, &inputs.assets, t, (self.policy)(), &ProxyMedia)
             .map_err(|e| format!("no plan to play from here: {e}"))?;
         let first = cut.plan(t).map_err(|e| format!("no plan for the first frame: {e}"))?;

@@ -824,6 +824,31 @@ pub fn prepare(plan: &RenderPlan) {
     }
 }
 
+/// [`prepare`] for **every** frame of a timeline, ahead of any: what a cut needs measured, whichever of its frames is drawn
+/// (a grade, a dip to white, a mask or a keyed opacity, text, another colour matrix, a resize). A host that draws a run of frames
+/// (the playback stream, the render bar) calls it once, off the frame loop and the render lock, so that the frames read only what has
+/// been measured ([`Compositor::caps`]) and none of them waits on a probe.
+pub fn prepare_timeline(timeline: &kerf_core::Timeline) {
+    let clips = || timeline.tracks.iter().flat_map(|t| &t.clips);
+    if clips().any(|c| c.mask.is_some() || c.is_keyed(kerf_core::Property::Opacity)) {
+        let _ = kerf_core::geq_edge();
+    }
+    let policy = kerf_core::composite_color_policy();
+    let converts = policy == kerf_core::CompositeColorPolicy::BottomLayerTag;
+    // (A dip to white runs the grade's conversions around its fade; a conversion between matrices reads RGB through them.)
+    if converts || timeline.has_white_dip() || clips().any(|c| !c.grade.is_identity()) {
+        let _ = crate::grade::kernels();
+    }
+    // The scaler is exact in the caps once it is measured, and a resized layer is drawn only then: any cut may resize one.
+    let _ = crate::scaler::kernels();
+    if converts {
+        let _ = crate::convert::kernels();
+    }
+    if !timeline.overlays.is_empty() {
+        let _ = crate::text::model();
+    }
+}
+
 impl Compositor {
     /// What this compositor draws exactly, as data: the plan refuses (through
     /// [`RenderPlan::reasons`]) whatever is not in it. [`GpuCaps::A0`] (layers, transform, crop, fit,

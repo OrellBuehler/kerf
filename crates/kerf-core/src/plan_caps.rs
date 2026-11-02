@@ -218,6 +218,12 @@ pub enum DipWhy {
     BlackFade,
     /// The picture is not 8-bit limited-range `yuv420p`.
     Format,
+    /// The picture is a `yuv420p` flagged full range: the export's round trip runs on every frame of the clip in the
+    /// picture's own range, which the compositor's limited-range tables are not.
+    FullRange,
+    /// The clip carries an `invert` or a `vignette`: both take RGB, so the `scale` ahead of them converts the picture to RGB and
+    /// FFmpeg runs the effect there, on every frame of the clip.
+    RgbEffect,
     /// The picture's colour matrix has no measured round trip.
     Matrix,
     /// The layer is letterboxed: FFmpeg pads before the round trip, so the bars whiten too.
@@ -240,6 +246,14 @@ impl fmt::Display for DipWhy {
             Self::Format => write!(
                 f,
                 "from a picture that is not 8-bit limited-range `yuv420p`, which FFmpeg converts to RGB from its own chroma grid and range (9 to 21 levels off the round trip the compositor draws on 9.0.2)"
+            ),
+            Self::FullRange => write!(
+                f,
+                "from a `yuv420p` picture flagged full range, which FFmpeg's round trip converts in that range on every frame of the clip (the compositor's tables are limited-range's: Y 2, UV 1 levels off)"
+            ),
+            Self::RgbEffect => write!(
+                f,
+                "under an invert or a vignette, which take RGB: the fit `scale` converts the picture to RGB ahead of them and FFmpeg runs the effect there (invert 3 levels off, vignette 47)"
             ),
             Self::Matrix => write!(f, "from a picture whose colour matrix has no measured round trip"),
             Self::Letterboxed => write!(

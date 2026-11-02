@@ -644,6 +644,8 @@ impl GpuPreview {
         }
         self.ensure_backend(technique, now).map_err(|why| one("backend", why))?;
         let drawing = self.drawing().map_err(|r| vec![r])?;
+        // What the cut's caps are made of is measured now, once per process and off the frame loop: the frames read it only.
+        kerf_gpu::prepare_timeline(&inputs.timeline);
         // A play from where the paused frame was drawn was made ready while the playhead rested there: its
         // cursors are open, and its first frames are in their pipes.
         let (cut, motion, primed) = match self.take_primed(inputs.epoch(), t, &drawing.source, now) {
@@ -769,6 +771,8 @@ impl GpuPreview {
                 "the GPU has not been checked against this FFmpeg",
             )]);
         }
+        // (Probes are child processes, once per process: here, off the frame loop, and the caps below read what they found.)
+        kerf_gpu::prepare_timeline(&inputs.timeline);
         let cut = match PlayCut::new(&inputs.timeline, &inputs.assets, t, (self.policy)(), &ProxyMedia) {
             Ok(cut) => cut,
             Err(e) => return not(vec![Reason::new("no_plan", format!("no plan to play from here: {e}"))]),
@@ -893,9 +897,7 @@ impl GpuPreview {
             Ok(sized) => sized,
             Err(reason) => return stream(reason, session),
         };
-        // What the frame's plan needs measured (the grade's conversions, the scaler, `drawtext`: child processes, once per process)
-        // is measured here on the first frame that needs it, not by the render: it only reads what has been measured.
-        kerf_gpu::prepare(&plan);
+        // (Only what has been measured is read here: the probes ran when the session was made ready or began.)
         let caps = drawing.compositor.caps();
         let ahead = session.ahead(t, size, &caps);
         // The frame asked for is at or past the first one the GPU does not draw (the page's hand-over was

@@ -1529,6 +1529,78 @@ mod tests {
         assert!(!holds(vec![base(), audio], bt), "audio-only use");
     }
 
+    /// A mixed cut is drawn only by a compositor whose conversion (and with it the reading of the deciding clip) is measured: with
+    /// none, **every** frame of the cut is refused, the deciding clip's own included (its matrix is the composite's, so nothing
+    /// converts it, but the clip that decides is the plan's reading of the graph, which that compositor has not had checked).
+    #[test]
+    fn a_mixed_cut_is_refused_whole_by_a_compositor_with_no_measured_conversion() {
+        let sd = |tag: Option<&str>| {
+            let mut a = asset();
+            (a.streams[0].width, a.streams[0].height) = (Some(640), Some(360));
+            a.streams[0].color_space = tag.map(Into::into);
+            a
+        };
+        let (bt709, untagged) = (sd(Some("bt709")), sd(None));
+        let assets = [bt709.clone(), untagged.clone()];
+        let plan_of = |clips: &[(&Asset, bool)], frame: u64| {
+            let track: Vec<Clip> = clips
+                .iter()
+                .enumerate()
+                .map(|(i, (a, dissolving))| {
+                    let mut c = make_clip(a.id, 0.0, 1.0, i as f64);
+                    if *dissolving {
+                        c.transition_in = Some(Transition {
+                            kind: TransitionKind::Crossfade,
+                            duration: 0.4,
+                        });
+                    }
+                    c
+                })
+                .collect();
+            Planner::new(
+                &single(track),
+                &assets,
+                &opts(30.0),
+                PlanRequest::motion(CompositeColorPolicy::BottomLayerTag),
+            )
+            .unwrap()
+            .at_frame(frame)
+            .unwrap()
+        };
+        let measured = GpuCaps {
+            motion: true,
+            transitions: true,
+            fades: true,
+            matrix_convert: true,
+            ..GpuCaps::A0
+        };
+        let unmeasured = GpuCaps {
+            matrix_convert: false,
+            ..measured
+        };
+        // The untagged clip dissolves in, so it decides: the first clip (BT.709) is the one that is converted, and frame 5 shows
+        // only the first, frame 70 only the second (the deciding clip).
+        for frame in [5, 70] {
+            let plan = plan_of(&[(&bt709, false), (&untagged, true)], frame);
+            assert!(plan.canvas.mixed_matrices_cut && plan.canvas.cut_matrix.is_some());
+            let size = plan.size(u32::MAX);
+            let refused = |caps: &GpuCaps| {
+                plan.reasons(caps, size)
+                    .iter()
+                    .any(|u| matches!(u, Unsupported::MixedMatrices))
+            };
+            assert!(!refused(&measured), "frame {frame}");
+            assert!(refused(&unmeasured), "frame {frame}");
+        }
+        // A cut of one matrix needs no conversion and no decider.
+        let plan = plan_of(&[(&bt709, false), (&bt709, true)], 70);
+        assert!(!plan.canvas.mixed_matrices_cut);
+        assert!(!plan
+            .reasons(&unmeasured, plan.size(u32::MAX))
+            .iter()
+            .any(|u| matches!(u, Unsupported::MixedMatrices)));
+    }
+
     /// An export's graph holds every clip of the cut: one of another matrix than its neighbour's is converted into it
     /// (FFmpeg 9) on frames where the two are not on screen together too, so the cut says it
     /// (`mixed_matrices_cut`), and a grade (whose way back is that conversion) is refused in it under a

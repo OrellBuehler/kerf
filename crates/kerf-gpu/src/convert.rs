@@ -277,18 +277,17 @@ fn planes_of(frame: &[u8]) -> [&[u8]; 3] {
 fn measure() -> Option<Kernels> {
     let (w, h) = PROBE;
     let yuv = w * h * 3 / 2;
-    // The source first: the picture the conversions are modelled on.
+    // The cheap round first, three short children at once: the source, the picture's conversion into the bottom layer's matrix
+    // (two pairs of matrices). A machine that converts another way settles here, `Differs` for good, without the files below.
     // (graph, the length of its frame)
     let graphs = [
         (source("none"), yuv),
         (overlay_graph("bt709", "none"), yuv),
         (overlay_graph("bt2020nc", "bt709"), yuv),
     ];
-    let share = graphs.len() + 2;
-    let scratch = Scratch::new()?;
-    let (tagged, untagged) = (scratch.0.join("tagged.mkv"), scratch.0.join("untagged.mkv"));
+    let share = graphs.len();
     // The graphs are `-filter_complex` ones: that is how the product writes them, and where the negotiation happens.
-    let (frames, files): (Vec<Option<Vec<u8>>>, [Option<()>; 2]) = std::thread::scope(|scope| {
+    let frames: Vec<Option<Vec<u8>>> = std::thread::scope(|scope| {
         let runs: Vec<_> = graphs
             .iter()
             .map(|(graph, len)| {
@@ -301,30 +300,14 @@ fn measure() -> Option<Kernels> {
                 })
             })
             .collect();
-        let made = [(&tagged, "bt709"), (&untagged, "none")].map(|(path, matrix)| scope.spawn(move || make_file(path, matrix)));
-        (
-            runs.into_iter().map(|run| run.join().ok().flatten()).collect(),
-            made.map(|m| m.join().ok().flatten()),
-        )
+        runs.into_iter().map(|run| run.join().ok().flatten()).collect()
     });
     let [Some(source), Some(opaque), Some(opaque_2020)] = &frames[..] else {
         return None;
     };
-    if source.len() != yuv || files.iter().any(Option::is_none) {
+    if source.len() != yuv {
         return None;
     }
-    // The three clips of one track, as files an export reads (a second round: they are made by the first).
-    let three = {
-        let mut args = args_for(&[tagged.clone(), untagged, tagged], &decider_graph());
-        kerf_core::limit_frame_args(&mut args, 1);
-        let mut cmd = kerf_core::ffmpeg_command();
-        cmd.args(&args);
-        crate::source::run_child(cmd, 3 * yuv + 1, PROBE_TIMEOUT).ok()?
-    };
-    if three.len() != 3 * yuv {
-        return None;
-    }
-    let three = &three;
     let src = planes_of(source);
     let want = |from, to, variant| change_matrix(src, w, h, from, to, variant).concat();
     // The overlay chain converts the top picture into the bottom's matrix.
@@ -337,10 +320,32 @@ fn measure() -> Option<Kernels> {
             Kernels::Differs("an opaque picture's conversion into the bottom layer's matrix")
         });
     }
+    // Only a machine that converts as modelled is asked who decides: two tagged files (what an export's inputs are), then the
+    // three-clip graph over them. A failure here is `Unknown` (asked again after a backoff), not a verdict.
+    let scratch = Scratch::new()?;
+    let (tagged, untagged) = (scratch.0.join("tagged.mkv"), scratch.0.join("untagged.mkv"));
+    let made: [Option<()>; 2] = std::thread::scope(|scope| {
+        [(&tagged, "bt709"), (&untagged, "none")]
+            .map(|(path, matrix)| scope.spawn(move || make_file(path, matrix)))
+            .map(|m| m.join().ok().flatten())
+    });
+    if made.iter().any(Option::is_none) {
+        return None;
+    }
+    let three = {
+        let mut args = args_for(&[tagged.clone(), untagged, tagged], &decider_graph());
+        kerf_core::limit_frame_args(&mut args, 1);
+        let mut cmd = kerf_core::ffmpeg_command();
+        cmd.args(&args);
+        crate::source::run_child(cmd, 3 * yuv + 1, PROBE_TIMEOUT).ok()?
+    };
+    if three.len() != 3 * yuv {
+        return None;
+    }
     // Whose matrix is the composite's, in the shape the planner's decider reads: the first clip on an alpha plane (the middle
     // one, untagged = BT.601) keeps its picture, and the two plain BT.709 clips are converted into BT.601.
     let into_601 = want(YuvMatrix::Bt709, YuvMatrix::Bt601, Variant::C);
-    if tile(three, 0) != into_601 || tile(three, 1) != *source || tile(three, 2) != into_601 {
+    if tile(&three, 0) != into_601 || tile(&three, 1) != *source || tile(&three, 2) != into_601 {
         return Some(Kernels::Differs(
             "the composite's matrix is not the first clip on an alpha plane's, as the planner's decider reads the graph",
         ));
@@ -365,7 +370,7 @@ fn lock(state: &Mutex<State>) -> std::sync::MutexGuard<'_, State> {
 }
 
 /// Whether this FFmpeg converts a layer into the composite's matrix as [`change_matrix`] does. The first call runs
-/// the probe: three short `ffmpeg` children and two that make the tagged files, at once, then the three-clip graph over them (each bounded by 20 s) with no lock held, a blocking thread's, ahead of
+/// the probe: three short `ffmpeg` children at once, and only where those match two that make the tagged files and then the three-clip graph over them (each bounded by 20 s) with no lock held, a blocking thread's, ahead of
 /// the frame that needs it ([`crate::prepare`]). [`Kernels::Unknown`] is not remembered: the probe is run again after a
 /// backoff.
 pub fn kernels() -> Kernels {

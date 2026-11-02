@@ -190,7 +190,9 @@
   crop, the radius) when that picture is not the frame's shape, and `reasons` asks a compositor with `caps.blur_fill` **and** `caps.exact_scaler`
   for the layer that leaves bars (`geom.matte`): `Unsupported::BlurFill` without them (once a plan), `BlurFillWith(layer, why)` for a picture that is not
   8-bit `yuv420p` (or never recorded), a full-range one, an HDR one, a thumbnail shrunk past 63:1 (`MAX_SHRINK`) or a frame whose chroma lines are
-  shorter than `2r + 1` (`BlurFill::resolve`). A clip the fill does not suit is placed by Contain's chain, byte for byte, and is not refused for the
+  shorter than `2r + 1` (`BlurFill::resolve`), or **a picture of a degenerate aspect**: a thumbnail cover side past `MAX_COVER` (16384; a 1x100000 picture
+  covers a 240-wide thumbnail with 24 million rows, and its scalers' tables would be as many) is `resolve`'s `Err`, a `BlurFillWith` of its own. (`MAX_SHRINK` is
+  judged in 64 bits: a hostile size times 63 overflowed 32.) A clip the fill does not suit is placed by Contain's chain, byte for byte, and is not refused for the
   delivery's fit. `LayerGeometry` still places the picture as under `Contain` (and so does its port, `layer-geometry.ts`, `croppable`: the corpus
   replays blurred cases); the compositor makes the whole padded frame of it.
   **Traps for the `FrameSource` that will feed it** (A1b): `showinfo` pts under `-copyts
@@ -430,7 +432,9 @@
   the grade's conversions (swscale's x86 kernel in, the generic scaler out) where the probe says this FFmpeg converts as the grade's
   model does (`caps.dip_white` is `grade::kernels() == Match`: x86-64; the arm64 kernel makes it FFmpeg's), and only on **8-bit limited-range
   untagged / BT.601 / BT.709 `yuv420p`**. Refused, each with its own `why`: an alpha plane (FFmpeg picks another RGB
-  format), a black fade of the clip running ahead of it, any other pixel format (RGB 11 / 12 levels of Y / UV off,
+  format), a black fade of the clip running ahead of it, a `yuv420p` flagged full range (`DipWhy::FullRange`: the export's round trip converts in that range on
+  every frame of the clip), an `invert` or a `vignette` on the clip (`DipWhy::RgbEffect`: of the effects only `negate` and `vignette` list an RGB format, so the fit `scale`
+  converts the picture ahead of them and FFmpeg runs them in RGB — `gblur`, `unsharp`, `hue` and `eq` list none and stay in the YUV; invert Y 3, vignette Y 47 off), any other pixel format (RGB 11 / 12 levels of Y / UV off,
   10-bit 9 / 16, 4:4:4 16 / 17, 4:2:2 9 / 13, full range up to 21 — in an export's planes on 9.0.2 — or an unrecorded format) or matrix, and, from `reasons(size)`
   (the geometry): a letterboxed layer (`pad` runs before the round trip, so FFmpeg's bars whiten; Y 126 against 16 at half
   way), a picture with an odd side (the round trip reads past it), and any layer the scaler resizes (the `scale` filter hands
@@ -443,7 +447,11 @@
   **`FullRangeCut`** (an export frame; a plan-level reason, from `PlanCanvas::full_range_cut`, which the `Planner` sets when any clip of the cut
   `maybe_full_range()`): FFmpeg 9 flags the whole export full range and converts every limited-range frame of it (a black frame reads Y 0, not 16), so under any policy
   but `FixedBt601` **no frame of a cut that holds a full-range clip** is drawn — before it, after it, on another track or a gap. FFmpeg 6 converts at the decode, as the
-  compositor does, and draws it all to the level, except that **`FullRangeResized`** (under either FFmpeg, from `reasons(size)`) refuses a full-range
+  compositor does, and draws it all to the level, except (a) **a `yuv420p` flagged `pc` that is letterboxed in an export** (`Unsupported::Geometry`, "flagged full range", any
+  policy but `BottomLayerTag`): its format is the overlay's, so nothing converts its range ahead of the graph, `pad` draws the bars in limited black (16) and the converter
+  `scale` ahead of the overlay turns the range afterwards (bars Y 30 where the compositor's matte is 16; the picture itself is exact; a still's fit `scale` converts the range
+  ahead of its `pad`, and is exact), (b) a dip to white on such a picture, **on every frame of the clip** (`DipWhy::FullRange`: the export's round trip converts in the
+  picture's range, the compositor's tables are limited-range's: Y 2, UV 1 off), and (c) **`FullRangeResized`** (under either FFmpeg, from `reasons(size)`) refuses a full-range
   picture the scaler resizes in an export frame and inside a fade (swscale converts the range inside the resize: chroma up to 15 levels off).
   `maybe_full_range()` is true for a `yuvj…` name, no recorded format, or **a `yuv420p` flagged full range** (`StreamInfo.color_range == "pc"`, recorded since schema v10; a VP9 / HEVC / AV1 file probes as plain `yuv420p`): the range flag is the truth, but an
   asset stored before v10 has none (`None`, "not known": judged by its name as ever; so does an unflagged file and a `tv` one). `flagged_full_range()` is the flag in any YCbCr format (RGB and gray pictures read `pc` from ffprobe on every FFmpeg, so for them it says nothing). Under a policy that is not

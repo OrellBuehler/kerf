@@ -5019,6 +5019,16 @@ impl Timeline {
         self.overlays.iter().find(|o| o.id == id)
     }
 
+    /// Whether a clip of the timeline comes in through a dip to white. In an export the dip's `fade c=white` (RGB only) is a
+    /// filter of every frame of such a clip and of the one before it, so a renderer that draws it asks what it needs for it
+    /// (the conversions to and from RGB) before any frame.
+    pub fn has_white_dip(&self) -> bool {
+        self.tracks
+            .iter()
+            .flat_map(|t| &t.clips)
+            .any(|c| c.transition_in.as_ref().is_some_and(|t| t.kind == TransitionKind::DipToWhite))
+    }
+
     pub fn svg_overlay(&self, id: Uuid) -> Option<&SvgOverlay> {
         self.svg_overlays.iter().find(|o| o.id == id)
     }

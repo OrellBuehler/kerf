@@ -1454,12 +1454,11 @@ impl RenderPlan {
             }
             // A dip to white is a filter in the export's chain for every frame of the clip, and in
             // the still's while the fade runs. `fade c=white` only takes RGB, so the picture is
-            // converted `yuv420p -> rgb24 -> yuv420p` around it: reproduced for a plain chain on an
-            // 8-bit limited-range 4:2:0 picture (the conversion's own kernel is within 2 levels of the
-            // tables the compositor follows; every other format was measured 9 to 21 levels off,
-            // gray 2 on one picture and not claimed). On an alpha plane FFmpeg takes another RGB
-            // format, and a black fade of the clip that runs ahead of it is a filter of its own in
-            // the YUV.
+            // converted `yuv420p -> rgb24 -> yuv420p` around it: reproduced, exactly, for a plain chain on an
+            // 8-bit limited-range 4:2:0 picture (the grade's conversions, where the probe says they are this
+            // FFmpeg's; every other format was measured 9 to 21 levels off, gray 2 on one picture and not
+            // claimed). On an alpha plane FFmpeg takes another RGB format, and a black fade of the clip that
+            // runs ahead of it is a filter of its own in the YUV.
             let ops = self.fade_ops(layer);
             if grade_drawn {
                 if let Some(what) = self.grade_chain_refusal(layer, &ops) {
@@ -1475,6 +1474,18 @@ impl RenderPlan {
                     Some(DipWhy::BlackFade)
                 } else if stream.pix_fmt.as_deref() != Some("yuv420p") {
                     Some(DipWhy::Format)
+                } else if stream.raw_full_range() {
+                    // (The round trip runs on every frame of the clip of an export, and in the still's while the fade runs; both
+                    // convert in the range the picture is flagged.)
+                    Some(DipWhy::FullRange)
+                } else if layer
+                    .effects
+                    .iter()
+                    .any(|e| matches!(e, VideoEffect::Invert | VideoEffect::Vignette))
+                {
+                    // (Of the effects, only `negate` and `vignette` list an RGB format: the `scale` ahead of them is the one that
+                    // converts, so they run in RGB. `gblur`, `unsharp`, `hue` and `eq` list none, and stay in the YUV.)
+                    Some(DipWhy::RgbEffect)
                 } else if !matches!(stream.matrix(), Some(YuvMatrix::Bt601 | YuvMatrix::Bt709)) {
                     Some(DipWhy::Matrix)
                 } else {
@@ -1662,9 +1673,13 @@ impl RenderPlan {
         if self.layers.iter().any(|l| l.stream.is_rgb()) && (composite != YuvMatrix::Bt601 || self.canvas.cut_non_601) {
             why.push(Unsupported::RgbInStack(composite));
         }
+        // The deciding clip of a mixed cut is read off the graph's shape (`PlanCanvas::cut_matrix`), and a compositor whose conversion
+        // is not measured on this FFmpeg has not had that reading checked either (the probe runs the three-clip graph in the same
+        // pass as the conversions, and settles on neither unless both match): no layer of such a cut is drawn, the deciding clip's
+        // frames included.
         if self.mode == PlanMode::Motion
             && self.canvas.mixed_matrices_cut
-            && (self.canvas.cut_matrix.is_none() || self.canvas.unread_decider_in_cut)
+            && (self.canvas.cut_matrix.is_none() || self.canvas.unread_decider_in_cut || !caps.matrix_convert)
         {
             why.push(Unsupported::MixedMatrices);
         }
@@ -4780,7 +4795,7 @@ mod tests {
         };
         assert!(
             why(tagged("bt709"), None, 0.5).is_empty(),
-            "BT.709 was measured: 3 / 2 levels"
+            "BT.709 is drawn like BT.601: the conversions are the grade's, exact"
         );
         let dipped = |w: Vec<Unsupported>, what: DipWhy| {
             assert!(
@@ -4814,6 +4829,51 @@ mod tests {
             ..video(640, 360)
         };
         dipped(why(unrecorded, None, 0.5), DipWhy::Format);
+        // A `yuv420p` flagged full range: the round trip runs in that range on every frame of the clip (Y 2, UV 1 off the
+        // compositor's limited-range tables).
+        let pc = StreamInfo {
+            color_range: Some("pc".into()),
+            ..video(640, 360)
+        };
+        // (A still inside the fade is refused for the range as well: `FullRangeNegotiated`.)
+        let ranged = why(pc, None, 0.5);
+        assert!(
+            ranged
+                .iter()
+                .any(|u| matches!(u, Unsupported::DipToWhite(_, DipWhy::FullRange))),
+            "{ranged:?}"
+        );
+        // Of the effects, `negate` and `vignette` list an RGB format, so the fit `scale` converts the picture to RGB ahead of them and
+        // they run there (invert 3 levels off, vignette 47); `gblur`, `unsharp` and `hue` do not and stay in the YUV.
+        let with_effect = |e: VideoEffect| {
+            let plan = fading_plan_of(
+                video(640, 360),
+                None,
+                CompositeColorPolicy::FixedBt601,
+                |c| {
+                    white(c);
+                    c.effects = vec![e.clone()];
+                },
+                0.5,
+            );
+            plan.reasons(
+                &GpuCaps {
+                    effects: EffectKinds::ALL,
+                    ..all
+                },
+                plan.size(u32::MAX),
+            )
+        };
+        dipped(with_effect(VideoEffect::Invert), DipWhy::RgbEffect);
+        dipped(with_effect(VideoEffect::Vignette), DipWhy::RgbEffect);
+        for e in [
+            VideoEffect::Blur { sigma: 1.5 },
+            VideoEffect::Sharpen { amount: 0.8 },
+            VideoEffect::Grayscale,
+        ] {
+            let why = with_effect(e.clone());
+            assert!(why.is_empty(), "{e:?}: {why:?}");
+        }
         // A letterboxed picture: FFmpeg pads before the round trip, so the bars whiten as well.
         let portrait = video(360, 640);
         let delivery = Some(Delivery::new(640, 360, Fit::Contain));
