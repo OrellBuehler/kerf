@@ -1142,6 +1142,13 @@ fn a_workspace_serves_its_files_behind_the_token() {
     let (status, _, _) = http(addr, "PUT", "/files/cut.kerf?overwrite=1", &with_token, b"junk");
     assert_eq!(status, 409, "the open project's own file is not replaced");
     assert_eq!(http(addr, "DELETE", "/files/cut.kerf", &with_token, b"").0, 409);
+    // A journal SQLite would play back into the open project is never written, there or not.
+    for side in ["/files/cut.kerf-journal", "/files/CUT.KERF-WAL", "/files/other.kerf-shm"] {
+        let (status, _, body) = http(addr, "PUT", side, &with_token, b"journal");
+        assert_eq!(status, 409, "{side}: {}", String::from_utf8_lossy(&body));
+        assert_eq!(http(addr, "DELETE", side, &with_token, b"").0, 409, "{side}");
+    }
+    assert!(!ws.join("cut.kerf-journal").exists());
 
     // The tools: the workspace ones are listed (import_url only with --allow-url-import).
     let names = tool_names(addr, &on_session);

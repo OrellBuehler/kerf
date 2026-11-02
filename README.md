@@ -178,7 +178,8 @@ curl -H "Authorization: Bearer $TOKEN" -o cut.mp4 http://host:7777/files/exports
 
 The tools `list_files` and `file_url` tell an agent what is there and where to send it. Behind a TLS reverse
 proxy, `--public-url https://kerf.example.com/kerf` is the base `file_url` builds on (the proxy strips the
-prefix). `--max-upload-gb N` caps a file (default 20). `--allow-url-import` adds `import_url`, which downloads an
+prefix). `--max-upload-gb N` caps a file (default 20); at most four uploads run at once, one that sends nothing for
+a minute is dropped, and nothing is written that would leave less than 1 GiB free. `--allow-url-import` adds `import_url`, which downloads an
 http(s) URL into the workspace and imports it — only from public addresses, every redirect checked.
 
 ### Use as a stdio MCP server (Claude Code plugin, any client that launches its server)

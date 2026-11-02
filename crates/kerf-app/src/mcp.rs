@@ -48,7 +48,7 @@ mod thumbnails;
 mod toolsets;
 mod workspace;
 
-pub(crate) use files::{check_public_url, MediaIo, DEFAULT_MAX_UPLOAD};
+pub(crate) use files::{check_public_url, sweep_stale_parts, MediaIo, DEFAULT_MAX_UPLOAD};
 use jobs::Run;
 pub(crate) use server::{
     bind_problem, check_tool_sets, client_url, current_token, finish_jobs, set_overrides, start, start_stdio, stop,
@@ -7242,8 +7242,15 @@ impl KerfMcp {
         let gui_stop = self.app.state::<crate::AppState>().begin_import();
         async move {
             let run = run.also_cancelled_by(gui_stop);
-            let (project, app) = (me.project.clone(), me.app.clone());
+            let (project, app, confined) = (me.project.clone(), me.app.clone(), me.workspace.is_some());
             let asset = blocking(move || {
+                // Checked again here, right before FFmpeg reads it: `import_url`'s file was not there
+                // when its call was checked.
+                crate::require_local_input_path(&path).map_err(|e| McpError::invalid_params(e, None))?;
+                kerf_core::paths::validate_import_path(std::path::Path::new(&path)).map_err(core_err)?;
+                if confined {
+                    workspace::refuse_reference_media(&path).map_err(|e| McpError::invalid_params(e, None))?;
+                }
                 // The same shape as the GUI's import, so a multi-minute stitch never freezes the
                 // user's editing.
                 let mut on_progress = |pr: kerf_core::ExportProgress| {

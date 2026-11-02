@@ -31,6 +31,27 @@ pub(crate) const DEFAULT_MAX_UPLOAD: u64 = 20 * kerf_core::cache_cap::GIB;
 /// The most entries a listing returns.
 const MAX_ENTRIES: usize = 5000;
 
+/// Uploads in flight at once; one more is a 503.
+const MAX_UPLOADS: usize = 4;
+
+/// How long an upload's body may send nothing before it is given up (408).
+const UPLOAD_IDLE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// What an upload or a URL import must leave free on the workspace's filesystem.
+pub(super) const MIN_FREE: u64 = kerf_core::cache_cap::GIB;
+
+/// How often (in bytes written) a write looks at the free space again.
+pub(super) const ROOM_CHECK_EVERY: u64 = 64 * 1024 * 1024;
+
+/// The longest file name a filesystem takes, which the `.part` beside it must fit in too.
+const NAME_MAX: usize = 255;
+
+/// What [`part_path`] adds to a name: `.` + 8 hex + `.part`.
+const PART_SUFFIX: usize = 14;
+
+/// A stale `.part` (a run that died mid-write) is swept at start once it is this old.
+const STALE_PART: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
 /// The tools that exist only for a server with a workspace.
 pub(super) const WORKSPACE_TOOLS: [&str; 3] = ["list_files", "file_url", "import_url"];
 
@@ -92,6 +113,8 @@ pub(super) enum FileError {
     Conflict(String),
     TooLarge(String),
     Full(String),
+    Timeout(String),
+    Busy(String),
     Failed(String),
 }
 
@@ -104,6 +127,8 @@ impl FileError {
             FileError::Conflict(_) => StatusCode::CONFLICT,
             FileError::TooLarge(_) => StatusCode::PAYLOAD_TOO_LARGE,
             FileError::Full(_) => StatusCode::INSUFFICIENT_STORAGE,
+            FileError::Timeout(_) => StatusCode::REQUEST_TIMEOUT,
+            FileError::Busy(_) => StatusCode::SERVICE_UNAVAILABLE,
             FileError::Failed(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -116,6 +141,8 @@ impl FileError {
             | FileError::Conflict(m)
             | FileError::TooLarge(m)
             | FileError::Full(m)
+            | FileError::Timeout(m)
+            | FileError::Busy(m)
             | FileError::Failed(m) => m,
         }
     }
@@ -330,35 +357,164 @@ pub(super) fn part_path(dest: &Path) -> PathBuf {
 
 /// Move the whole file `part` to `dest`: replacing what is there with `overwrite`, else refused when
 /// anything is (a hard link, which fails on an existing name, then the `.part` removed).
-pub(super) fn place(part: &Path, dest: &Path, overwrite: bool) -> Result<(), FileError> {
-    let shown = dest.display();
+pub(super) fn place(part: &Path, dest: &Path, shown: &str, overwrite: bool) -> Result<(), FileError> {
     if overwrite {
-        return std::fs::rename(part, dest).map_err(|e| FileError::io(&format!("{shown}"), &e));
+        return std::fs::rename(part, dest).map_err(|e| FileError::io(shown, &e));
     }
     match std::fs::hard_link(part, dest) {
         Ok(()) => {
             let _ = std::fs::remove_file(part);
             Ok(())
         }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(exists(dest)),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(exists(shown)),
         // A filesystem without hard links: the check and the rename are as close as it allows.
-        Err(_) if std::fs::symlink_metadata(dest).is_ok() => Err(exists(dest)),
-        Err(_) => std::fs::rename(part, dest).map_err(|e| FileError::io(&format!("{shown}"), &e)),
+        Err(_) if std::fs::symlink_metadata(dest).is_ok() => Err(exists(shown)),
+        Err(_) => std::fs::rename(part, dest).map_err(|e| FileError::io(shown, &e)),
     }
 }
 
-fn exists(dest: &Path) -> FileError {
-    FileError::Conflict(format!(
-        "{} exists; pass overwrite to replace it, or pick another name",
-        dest.display()
-    ))
+/// Something is at `shown` already (relative to the workspace).
+fn exists(shown: &str) -> FileError {
+    FileError::Conflict(format!("{shown} exists; pick another name"))
+}
+
+/// Refuse a name the files routes and `import_url` never write or delete: a SQLite side file of
+/// any project (`*.kerf-journal`, `-wal`, `-shm`: a hot journal is played back into the project
+/// that opens it), or one too long for its `.part` to fit the filesystem.
+pub(super) fn check_name(rel: &str) -> Result<(), FileError> {
+    let name = rel.rsplit('/').next().unwrap_or(rel);
+    let lower = name.to_ascii_lowercase();
+    if [".kerf-journal", ".kerf-wal", ".kerf-shm"]
+        .iter()
+        .any(|side| lower.ends_with(side))
+    {
+        return Err(FileError::Conflict(format!(
+            "{rel} is a project database's side file; it is never written or deleted over this server"
+        )));
+    }
+    if name.len() + PART_SUFFIX > NAME_MAX {
+        return Err(FileError::Bad(format!(
+            "the file name of {rel} is too long (at most {} bytes)",
+            NAME_MAX - PART_SUFFIX
+        )));
+    }
+    Ok(())
+}
+
+/// Bytes free for this user on the filesystem of `dir` (the deepest part of it that exists), if
+/// the system says.
+pub(super) fn free_space(dir: &Path) -> Option<u64> {
+    let mut at = dir;
+    while std::fs::symlink_metadata(at).is_err() {
+        at = at.parent()?;
+    }
+    free_space_at(at)
+}
+
+#[cfg(unix)]
+fn free_space_at(dir: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+    let mut stat = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    // SAFETY: `statvfs` fills the whole struct when it returns 0, and only then is it read; the
+    // path is a NUL-terminated string that outlives the call.
+    let stat = unsafe {
+        if libc::statvfs(path.as_ptr(), stat.as_mut_ptr()) != 0 {
+            return None;
+        }
+        stat.assume_init()
+    };
+    #[allow(clippy::unnecessary_cast, clippy::useless_conversion)]
+    Some(u64::from(stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64))
+}
+
+#[cfg(not(unix))]
+fn free_space_at(_dir: &Path) -> Option<u64> {
+    None
+}
+
+/// Refuse writing `more` bytes into `dir` when that would leave less than [`MIN_FREE`] on its
+/// filesystem. A system that does not say how much is free is not refused.
+pub(super) fn check_room(dir: &Path, more: u64, shown: &str) -> Result<(), FileError> {
+    match free_space(dir) {
+        Some(free) if free < more.saturating_add(MIN_FREE) => Err(FileError::Full(format!(
+            "{shown} is not written: it would leave less than 1 GiB free on the workspace's disk"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// One of a bounded number of slots (uploads in flight, URL downloads), given back on drop.
+pub(super) struct Slot(&'static std::sync::atomic::AtomicUsize);
+
+impl Slot {
+    pub(super) fn take(counter: &'static std::sync::atomic::AtomicUsize, max: usize) -> Option<Self> {
+        use std::sync::atomic::Ordering;
+        if counter.fetch_add(1, Ordering::SeqCst) >= max {
+            counter.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(Slot(counter))
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Whether `name` is one of Kerf's own `.part` files (`<name>.<8 lowercase hex>.part`).
+fn is_part_name(name: &str) -> bool {
+    let Some(stem) = name.strip_suffix(".part") else {
+        return false;
+    };
+    let Some((_, tag)) = stem.rsplit_once('.') else {
+        return false;
+    };
+    tag.len() == 8 && tag.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// Remove Kerf's own `.part` files older than [`STALE_PART`] from the workspace `root`: what a run
+/// that died mid-upload or mid-download left. Links are not followed; how many went is logged.
+pub(crate) fn sweep_stale_parts(root: &Path) -> usize {
+    let mut removed = 0;
+    let mut dirs = vec![(root.to_path_buf(), 0usize)];
+    while let Some((dir, depth)) = dirs.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        for entry in entries.filter_map(Result::ok) {
+            let Ok(meta) = entry.metadata() else { continue };
+            if meta.is_dir() && depth < 32 {
+                dirs.push((entry.path(), depth + 1));
+            } else if meta.is_file()
+                && entry.file_name().to_str().is_some_and(is_part_name)
+                && meta
+                    .modified()
+                    .ok()
+                    .and_then(|m| m.elapsed().ok())
+                    .is_some_and(|age| age >= STALE_PART)
+                && std::fs::remove_file(entry.path()).is_ok()
+            {
+                removed += 1;
+            }
+        }
+    }
+    if removed > 0 {
+        tracing::info!(target: "mcp", removed, "removed stale .part files from the workspace");
+    }
+    removed
 }
 
 /// A path the client named, as `(absolute, relative to the workspace)`: resolved in it, and for a
 /// request path (`plain`) refused when any part of it is a symbolic link (the resolved path is then
 /// exactly the workspace joined with it).
 pub(super) fn locate(ws: &Workspace, asked: &str, plain: bool) -> Result<(PathBuf, String), FileError> {
-    let resolved = PathBuf::from(ws.resolve(asked).map_err(FileError::Forbidden)?);
+    // A request path's refusal names no directory of the server's.
+    let resolved = ws.resolve(asked).map_err(|e| match plain {
+        true => FileError::Forbidden(format!("{asked} is outside the workspace or cannot be followed in it")),
+        false => FileError::Forbidden(e),
+    })?;
+    let resolved = PathBuf::from(resolved);
     let root = Path::new(ws.root());
     let rel = resolved
         .strip_prefix(root)
@@ -432,37 +588,42 @@ pub(super) fn list_dir(dir: &Path, rel: &str) -> Result<Listing, FileError> {
     })
 }
 
-/// What the open project uses at `path` (absolute, resolved), if anything: an asset's source or
-/// capture file, or the project's own file. Reads the project under its lock, compares with it released.
+/// What the open project uses at `path` (absolute, resolved, there or not), if anything: an asset's
+/// source or capture file, or the project's own file and its SQLite side files. Reads the project
+/// under its lock, compares with it released (`same_file`: hard links and case folding too).
 fn in_use(project: &Mutex<Project>, path: &Path) -> Option<String> {
     let protected = crate::lock_user(project).output_path_inputs();
     let protected = match protected {
         Ok(protected) => protected,
         Err(e) => return Some(format!("unknown: the open project could not be read ({e})")),
     };
-    let wanted = kerf_core::paths::canonical(path);
     protected
         .files
         .into_iter()
-        .find(|(file, _)| kerf_core::paths::canonical(file) == wanted)
+        .find(|(file, _)| kerf_core::paths::same_file(path, file))
         .map(|(_, what)| what)
 }
 
-/// Refuse `path` while the open project uses it.
-async fn refuse_in_use(path: &Path, rel: &str, doing: &str) -> Result<(), FileError> {
-    let Some(project) = PROJECT.get().cloned() else {
+/// Refuse `path` (`rel` in the workspace) while the open project uses it, and any project's side
+/// file always. Reads the disk: for the blocking pool.
+pub(super) fn refuse_in_use(path: &Path, rel: &str, doing: &str) -> Result<(), FileError> {
+    check_name(rel)?;
+    let Some(project) = PROJECT.get() else {
         return Ok(());
     };
-    let path = path.to_path_buf();
-    let used = tokio::task::spawn_blocking(move || in_use(&project, &path))
-        .await
-        .map_err(|e| FileError::Failed(e.to_string()))?;
-    match used {
+    match in_use(project, path) {
         Some(what) => Err(FileError::Conflict(format!(
             "{rel} is {what} in the open project; it cannot be {doing} while the project uses it"
         ))),
         None => Ok(()),
     }
+}
+
+/// `work` (file system calls) on the blocking pool.
+async fn on_disk<T: Send + 'static>(work: impl FnOnce() -> Result<T, FileError> + Send + 'static) -> Result<T, FileError> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|e| FileError::Failed(e.to_string()))?
 }
 
 // ---- the routes ---------------------------------------------------------------
@@ -564,10 +725,14 @@ async fn files(State(routes): State<Arc<Routes>>, request: Request) -> Response 
 }
 
 async fn get(routes: &Routes, rel: &str, listing: bool, headers: &HeaderMap, head: bool) -> Result<Response, FileError> {
-    let (path, rel) = locate(&routes.workspace, rel, true)?;
-    let meta = tokio::fs::symlink_metadata(&path)
-        .await
-        .map_err(|_| FileError::Missing(format!("{} does not exist", if rel.is_empty() { "." } else { &rel })))?;
+    let (ws, asked) = (routes.workspace.clone(), rel.to_string());
+    let (path, rel, meta) = on_disk(move || {
+        let (path, rel) = locate(&ws, &asked, true)?;
+        let shown = if rel.is_empty() { "." } else { &rel };
+        let meta = std::fs::symlink_metadata(&path).map_err(|_| FileError::Missing(format!("{shown} does not exist")))?;
+        Ok((path, rel, meta))
+    })
+    .await?;
     if listing || meta.is_dir() {
         let listed = tokio::task::spawn_blocking(move || list_dir(&path, &rel))
             .await
@@ -650,21 +815,22 @@ async fn open_no_follow(path: &Path) -> std::io::Result<tokio::fs::File> {
 
 /// The `.part` an upload writes, removed unless it was put in place: a request dropped mid-body (the
 /// client went away) leaves nothing behind.
-struct Part(Option<PathBuf>);
+struct Part(PathBuf);
 
 impl Part {
     fn path(&self) -> &Path {
-        self.0.as_deref().expect("a part until it is placed")
+        &self.0
     }
 }
 
 impl Drop for Part {
     fn drop(&mut self) {
-        if let Some(path) = self.0.take() {
-            let _ = std::fs::remove_file(path);
-        }
+        let _ = std::fs::remove_file(&self.0);
     }
 }
+
+/// Uploads in flight.
+static UPLOADS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 async fn put(routes: &Routes, rel: &str, dir: bool, overwrite: bool, request: Request) -> Result<Response, FileError> {
     if rel.is_empty() || dir {
@@ -672,6 +838,7 @@ async fn put(routes: &Routes, rel: &str, dir: bool, overwrite: bool, request: Re
             "PUT names a file: /files/<path relative to the workspace>".to_string(),
         ));
     }
+    check_name(rel)?;
     let too_large = || {
         FileError::TooLarge(format!(
             "an upload may be at most {} bytes on this server (--max-upload-gb)",
@@ -686,24 +853,32 @@ async fn put(routes: &Routes, rel: &str, dir: bool, overwrite: bool, request: Re
     if announced.is_some_and(|n| n > routes.max_upload) {
         return Err(too_large());
     }
-    let (path, rel) = locate(&routes.workspace, rel, true)?;
-    let existed = match tokio::fs::symlink_metadata(&path).await {
-        Ok(meta) if meta.is_dir() => return Err(FileError::Conflict(format!("{rel} is a directory"))),
-        Ok(_) if !overwrite => return Err(exists(Path::new(&rel))),
-        Ok(_) => true,
-        Err(_) => false,
-    };
-    if existed {
-        refuse_in_use(&path, &rel, "replaced").await?;
-    }
-    if let Some(parent) = path.parent() {
-        tokio::fs::create_dir_all(parent)
-            .await
-            .map_err(|e| FileError::io(&format!("the directory of {rel}"), &e))?;
+    let _slot = Slot::take(&UPLOADS, MAX_UPLOADS).ok_or_else(|| {
+        FileError::Busy(format!(
+            "{MAX_UPLOADS} uploads are already under way; try again when one is done"
+        ))
+    })?;
+    let (ws, asked) = (routes.workspace.clone(), rel.to_string());
+    let (path, rel, existed) = on_disk(move || {
+        let (path, rel) = locate(&ws, &asked, true)?;
+        let existed = match std::fs::symlink_metadata(&path) {
+            Ok(meta) if meta.is_dir() => return Err(FileError::Conflict(format!("{rel} is a directory"))),
+            Ok(_) if !overwrite => return Err(exists(&rel)),
+            Ok(_) => true,
+            Err(_) => false,
+        };
+        // Whether the file is there or not: a name the project would read (its journal) is refused.
+        refuse_in_use(&path, &rel, "replaced")?;
+        let parent = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        check_room(&parent, announced.unwrap_or(0), &rel)?;
+        std::fs::create_dir_all(&parent).map_err(|e| FileError::io(&format!("the directory of {rel}"), &e))?;
         // A directory made by another request meanwhile may be a link: the path is checked again.
-        locate(&routes.workspace, &rel, true)?;
-    }
-    let part = Part(Some(part_path(&path)));
+        locate(&ws, &rel, true)?;
+        Ok((path, rel, existed))
+    })
+    .await?;
+    let parent = path.parent().map(Path::to_path_buf).unwrap_or_default();
+    let part = Part(part_path(&path));
     let mut file = tokio::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
@@ -712,13 +887,23 @@ async fn put(routes: &Routes, rel: &str, dir: bool, overwrite: bool, request: Re
         .map_err(|e| FileError::io(&rel, &e))?;
     let mut body = request.into_body().into_data_stream();
     let mut written = 0u64;
-    while let Some(chunk) = body.next().await {
+    let mut room_checked = 0u64;
+    loop {
+        let next = tokio::time::timeout(UPLOAD_IDLE, body.next())
+            .await
+            .map_err(|_| FileError::Timeout(format!("the upload of {rel} sent nothing for {} s", UPLOAD_IDLE.as_secs())))?;
+        let Some(chunk) = next else { break };
         let chunk = chunk.map_err(|e| FileError::Bad(format!("the upload of {rel} broke off: {e}")))?;
         written += chunk.len() as u64;
         if written > routes.max_upload {
             return Err(too_large());
         }
         file.write_all(&chunk).await.map_err(|e| FileError::io(&rel, &e))?;
+        if written - room_checked >= ROOM_CHECK_EVERY {
+            room_checked = written;
+            let (dir, shown) = (parent.clone(), rel.clone());
+            on_disk(move || check_room(&dir, 0, &shown)).await?;
+        }
     }
     if announced.is_some_and(|n| n != written) {
         return Err(FileError::Bad(format!(
@@ -729,25 +914,16 @@ async fn put(routes: &Routes, rel: &str, dir: bool, overwrite: bool, request: Re
     file.flush().await.map_err(|e| FileError::io(&rel, &e))?;
     file.sync_all().await.map_err(|e| FileError::io(&rel, &e))?;
     drop(file);
-    // The project may have taken the file in while the body arrived.
-    if existed || tokio::fs::symlink_metadata(&path).await.is_ok() {
-        refuse_in_use(&path, &rel, "replaced").await?;
-    }
-    let mut part = part;
-    let from = part.0.take().expect("a part");
-    let placed = {
-        let (from, to) = (from.clone(), path.clone());
-        tokio::task::spawn_blocking(move || place(&from, &to, overwrite))
-            .await
-            .map_err(|e| FileError::Failed(e.to_string()))
-    };
-    if !matches!(placed, Ok(Ok(()))) {
-        let _ = tokio::fs::remove_file(&from).await;
-    }
-    placed?.map_err(|e| match e {
-        FileError::Conflict(_) => exists(Path::new(&rel)),
-        other => other,
-    })?;
+    // The project may have taken the file in while the body arrived. The guard stays armed: once
+    // the part is placed there is nothing left for it to remove, and if this request is dropped
+    // before, it removes the part.
+    let (from, to, shown) = (part.path().to_path_buf(), path.clone(), rel.clone());
+    on_disk(move || {
+        refuse_in_use(&to, &shown, "replaced")?;
+        place(&from, &to, &shown, overwrite)
+    })
+    .await?;
+    drop(part);
     tracing::info!(target: "mcp", path = %rel, bytes = written, "file uploaded into the workspace");
     let status = if existed { StatusCode::OK } else { StatusCode::CREATED };
     let body = serde_json::json!({ "path": rel, "size": written, "replaced": existed }).to_string();
@@ -758,24 +934,26 @@ async fn delete(routes: &Routes, rel: &str) -> Result<Response, FileError> {
     if rel.is_empty() {
         return Err(FileError::Bad("the workspace itself is not deleted".to_string()));
     }
-    let (path, rel) = locate(&routes.workspace, rel, true)?;
-    let meta = tokio::fs::symlink_metadata(&path)
-        .await
-        .map_err(|_| FileError::Missing(format!("{rel} does not exist")))?;
-    if meta.is_dir() {
-        tokio::fs::remove_dir(&path).await.map_err(|e| {
-            if std::fs::read_dir(&path).is_ok_and(|mut d| d.next().is_some()) {
-                FileError::Conflict(format!("{rel} is a directory that is not empty"))
-            } else {
-                FileError::Failed(format!("{rel}: {e}"))
-            }
-        })?;
-    } else {
-        refuse_in_use(&path, &rel, "deleted").await?;
-        tokio::fs::remove_file(&path)
-            .await
-            .map_err(|e| FileError::Failed(format!("{rel}: {e}")))?;
-    }
+    check_name(rel)?;
+    let (ws, asked) = (routes.workspace.clone(), rel.to_string());
+    let rel = on_disk(move || {
+        let (path, rel) = locate(&ws, &asked, true)?;
+        let meta = std::fs::symlink_metadata(&path).map_err(|_| FileError::Missing(format!("{rel} does not exist")))?;
+        if meta.is_dir() {
+            std::fs::remove_dir(&path).map_err(|e| {
+                if std::fs::read_dir(&path).is_ok_and(|mut d| d.next().is_some()) {
+                    FileError::Conflict(format!("{rel} is a directory that is not empty"))
+                } else {
+                    FileError::Failed(format!("{rel}: {e}"))
+                }
+            })?;
+        } else {
+            refuse_in_use(&path, &rel, "deleted")?;
+            std::fs::remove_file(&path).map_err(|e| FileError::Failed(format!("{rel}: {e}")))?;
+        }
+        Ok(rel)
+    })
+    .await?;
     tracing::info!(target: "mcp", path = %rel, "file deleted from the workspace");
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -861,6 +1039,7 @@ impl KerfMcp {
             };
             let (path, rel) = locate(ws, &format!("downloads/{candidate}"), true).map_err(FileError::mcp)?;
             if std::fs::symlink_metadata(&path).is_err() {
+                refuse_in_use(&path, &rel, "written").map_err(FileError::mcp)?;
                 return Ok((path, rel));
             }
         }
@@ -905,14 +1084,17 @@ impl KerfMcp {
     ) -> Result<String, McpError> {
         let ws = self.workspace_or_refuse()?;
         let asked = p.path.trim().to_string();
-        let (path, rel) = blocking(move || locate(&ws, &asked, false).map_err(FileError::mcp)).await?;
+        let (rel, meta) = blocking(move || {
+            let (path, rel) = locate(&ws, &asked, false).map_err(FileError::mcp)?;
+            Ok((rel, std::fs::symlink_metadata(&path).ok()))
+        })
+        .await?;
         if rel.is_empty() {
             return Err(McpError::invalid_params(
                 "name a file in the workspace, not the workspace itself",
                 None,
             ));
         }
-        let meta = std::fs::symlink_metadata(&path).ok();
         let url = format!("{}/files/{}", self.files_base(&context), percent_encode(&rel));
         json(&serde_json::json!({
             "path": rel,
@@ -952,8 +1134,9 @@ impl KerfMcp {
             Some(asked) => {
                 let (path, rel) = locate(&ws, &asked, false).map_err(FileError::mcp)?;
                 if rel.is_empty() || std::fs::symlink_metadata(&path).is_ok() {
-                    return Err(FileError::Conflict(format!("{asked} exists; pick a path where nothing is")).mcp());
+                    return Err(FileError::Conflict(format!("{rel} exists; pick a path where nothing is")).mcp());
                 }
+                refuse_in_use(&path, &rel, "written").map_err(FileError::mcp)?;
                 Ok((path, rel))
             }
             None => Self::free_download(&ws, &super::fetch::file_name(&uri)),
@@ -965,31 +1148,29 @@ impl KerfMcp {
                 max_bytes: media.max_upload_bytes,
                 stall: super::fetch::STALL,
                 permit: super::fetch::is_public,
+                own: super::fetch::own_addresses(),
             };
-            let (fetching, target) = (run.clone(), dest.clone());
+            let (fetching, target, shown) = (run.clone(), dest.clone(), rel.clone());
             blocking(move || {
                 let mut progress = |written: u64, total: Option<u64>| {
                     let fraction = total.filter(|t| *t > 0).map(|t| written as f64 / t as f64 * 0.9);
                     fetching.progress(fraction, format!("downloading, {} MB", written / (1024 * 1024)));
                 };
-                super::fetch::download(&url, &target, &limits, &|| fetching.cancelled(), &mut progress)
-                    .map_err(|e| McpError::invalid_params(e, None))?;
-                tracing::info!(target: "mcp", %url, path = %target.display(), "downloaded into the workspace");
-                // What import_asset refuses, refused here too; a file that will not be imported is not kept.
-                let path = target.to_string_lossy().into_owned();
-                let checked = crate::require_local_input_path(&path)
-                    .and_then(|()| kerf_core::paths::validate_import_path(&target).map_err(|e| e.to_string()))
-                    .and_then(|()| super::workspace::refuse_reference_media(&path));
-                if let Err(why) = checked {
-                    let _ = std::fs::remove_file(&target);
-                    return Err(McpError::invalid_params(why, None));
-                }
+                let landed = super::fetch::download(&url, &target, &shown, &limits, &|| fetching.cancelled(), &mut progress);
+                landed.map_err(|e| McpError::invalid_params(e, None))?;
+                tracing::info!(target: "mcp", %url, path = %shown, "downloaded into the workspace");
                 Ok(())
             })
             .await?;
             run.progress(Some(0.9), format!("importing {rel}"));
-            me.import_run(dest.to_string_lossy().into_owned(), run, owner, generation)
-                .await
+            let imported = me
+                .import_run(dest.to_string_lossy().into_owned(), run, owner, generation)
+                .await;
+            // A file the import refused (not media, a playlist, a project gone) is not kept.
+            if imported.is_err() {
+                let _ = std::fs::remove_file(&dest);
+            }
+            imported
         })
         .await
     }
@@ -1112,12 +1293,12 @@ mod tests {
         let part = part_path(&dest);
         assert!(part.file_name().unwrap().to_str().unwrap().starts_with("a.mp4.") && part.extension().unwrap() == "part");
         std::fs::write(&part, b"one").unwrap();
-        place(&part, &dest, false).unwrap();
+        place(&part, &dest, "a.mp4", false).unwrap();
         assert!(!part.exists());
         std::fs::write(&part, b"two").unwrap();
-        assert!(matches!(place(&part, &dest, false), Err(FileError::Conflict(_))));
+        assert!(matches!(place(&part, &dest, "a.mp4", false), Err(FileError::Conflict(_))));
         assert_eq!(std::fs::read(&dest).unwrap(), b"one");
-        place(&part, &dest, true).unwrap();
+        place(&part, &dest, "a.mp4", true).unwrap();
         assert_eq!(std::fs::read(&dest).unwrap(), b"two");
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1137,6 +1318,68 @@ mod tests {
         assert!(matches!(list_dir(&dir.join("b.wav"), "b.wav"), Err(FileError::Bad(_))));
         assert!(matches!(list_dir(&dir.join("none"), "none"), Err(FileError::Missing(_))));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_project_side_file_or_a_name_too_long_for_its_part_is_refused() {
+        for side in ["cut.kerf-journal", "a/b/CUT.KERF-WAL", "x.kerf-shm"] {
+            assert!(matches!(check_name(side), Err(FileError::Conflict(_))), "{side}");
+        }
+        assert!(check_name("cut.kerf").is_ok() && check_name("media/clip.mp4").is_ok());
+        assert!(check_name(&"x".repeat(NAME_MAX - PART_SUFFIX)).is_ok());
+        assert!(matches!(
+            check_name(&"x".repeat(NAME_MAX - PART_SUFFIX + 1)),
+            Err(FileError::Bad(_))
+        ));
+    }
+
+    #[test]
+    fn only_old_parts_of_kerfs_own_pattern_are_swept() {
+        let dir = std::env::temp_dir().join(format!("kerf-sweep-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(dir.join("deep")).unwrap();
+        let old = std::time::SystemTime::now() - STALE_PART - std::time::Duration::from_secs(60);
+        let make = |name: &str, when: std::time::SystemTime| {
+            let path = dir.join(name);
+            std::fs::write(&path, b"x").unwrap();
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(when)
+                .unwrap();
+            path
+        };
+        let stale = make("deep/clip.mp4.0a1b2c3d.part", old);
+        let fresh = make("clip.mp4.0a1b2c3d.part", std::time::SystemTime::now());
+        let theirs = make("notes.part", old);
+        let upper = make("clip.mp4.0A1B2C3D.part", old);
+        assert_eq!(sweep_stale_parts(&dir), 1);
+        assert!(!stale.exists() && fresh.exists() && theirs.exists() && upper.exists());
+        assert!(is_part_name(
+            part_path(Path::new("a.mp4")).file_name().unwrap().to_str().unwrap()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn slots_are_bounded_and_given_back() {
+        static COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let first = Slot::take(&COUNT, 2).unwrap();
+        let second = Slot::take(&COUNT, 2).unwrap();
+        assert!(Slot::take(&COUNT, 2).is_none());
+        drop(first);
+        assert!(Slot::take(&COUNT, 2).is_some());
+        drop(second);
+        assert_eq!(COUNT.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn free_space_is_read_from_the_deepest_existing_part() {
+        let free = free_space(&std::env::temp_dir().join("no/such/dir")).unwrap();
+        assert!(free > 0);
+        assert!(check_room(&std::env::temp_dir(), u64::MAX / 2, "x").is_err());
+        assert!(check_room(&std::env::temp_dir(), 0, "x").is_ok() || free < MIN_FREE);
     }
 
     #[test]

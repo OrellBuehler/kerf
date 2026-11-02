@@ -57,7 +57,7 @@ cache directories (the cache in force: `--cache-dir`'s `DIR/kerf`), the template
 (`KERF_PUBLIC_URL`, read only with a workspace over HTTP; `http(s)://host[:port][/prefix]`, no query; usage error with
 `--stdio`) is the base `file_url` builds on behind a reverse proxy, and its host joins the `Host` allow-list; `--max-upload-gb N`
 (default 20, `parse_cache_max`) caps an upload or a URL import; `--allow-url-import` offers `import_url`. All three ride
-`Overrides.media` (`files::MediaIo`). Directories: the
+`Overrides.media` (`files::MediaIo`). With a workspace, a thread sweeps Kerf's own `.part` files older than 24 h from it at start. Directories: the
 desktop app's config / data dirs for the build's identifier (`context()`, the one `generate_context!`, so a debug build uses
 `.dev`), or `--data-dir` for settings, logs and recovery alike (CI isolation). No single-instance plugin: a taken port exits
 3 (`port in use … --mcp-addr`), and two runs sharing a settings file can race to make the first token (use `--data-dir` or

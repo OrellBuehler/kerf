@@ -23,8 +23,12 @@ pub(super) const MAX_REDIRECTS: usize = 5;
 const RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
-/// The body's backstop: the reader thread cannot be interrupted, so its read ends by this at the latest.
-const BODY_TIMEOUT: Duration = Duration::from_secs(6 * 60 * 60);
+/// The whole body's budget. The reader thread cannot be interrupted, so a stalled read lingers
+/// until this at the latest; [`MAX_READERS`] bounds how many can.
+const BODY_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+/// Downloads whose reader thread is alive (one given up on still counts until its read returns).
+const MAX_READERS: usize = 4;
+static READERS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 /// How long the body may send nothing before the download is given up.
 pub(super) const STALL: Duration = Duration::from_secs(60);
 /// How often a blocked read looks at the cancel.
@@ -42,7 +46,9 @@ pub(super) fn is_public(ip: IpAddr) -> bool {
 
 fn v4_public(ip: Ipv4Addr) -> bool {
     let [a, b, c, _] = ip.octets();
-    let refused = a == 0 // "this network", 0.0.0.0
+    let metadata = [[168, 63, 129, 16], [100, 100, 100, 200]].contains(&ip.octets()); // Azure WireServer, Alibaba
+    let refused = metadata
+        || a == 0 // "this network", 0.0.0.0
         || a == 10
         || a == 127
         || (a == 100 && (64..128).contains(&b)) // CGNAT 100.64/10 (Alibaba's metadata is 100.100.100.200)
@@ -132,24 +138,64 @@ fn resolve(host: &str, port: u16) -> Result<Vec<SocketAddr>, String> {
     });
     match rx.recv_timeout(RESOLVE_TIMEOUT) {
         Ok(Ok(addrs)) if !addrs.is_empty() => Ok(addrs),
-        Ok(Ok(_)) => Err(format!("{host} does not resolve")),
-        Ok(Err(e)) => Err(format!("{host} does not resolve: {e}")),
-        Err(_) => Err(format!("{host} did not resolve within {} s", RESOLVE_TIMEOUT.as_secs())),
+        _ => Err(not_public(host)),
     }
+}
+
+/// The one answer for a host that does not resolve and for one that is not public: the client
+/// learns nothing about what the server's resolver sees.
+fn not_public(host: &str) -> String {
+    format!(
+        "{host} is not a public address this server fetches from (it does not resolve, or it resolves to a \
+         loopback, private, link-local, metadata, reserved or this server's own address)"
+    )
 }
 
 /// `addrs` (what `host` resolved to) when `permit` takes every one of them: a name that answers
 /// with a private address among public ones is refused whole, never connected to by the public one
 /// alone.
-fn vet(host: &str, addrs: Vec<SocketAddr>, permit: fn(IpAddr) -> bool) -> Result<Vec<SocketAddr>, String> {
-    match addrs.iter().find(|a| !permit(a.ip())) {
-        Some(bad) => Err(format!(
-            "{host} resolves to {}, which is not a public address (loopback, private, link-local, metadata or \
-             reserved): this server fetches only from the public internet",
-            bad.ip()
-        )),
-        None => Ok(addrs),
+fn vet(host: &str, addrs: Vec<SocketAddr>, limits: &Limits) -> Result<Vec<SocketAddr>, String> {
+    let own = |ip: IpAddr| limits.own.iter().any(|o| o.to_canonical() == ip.to_canonical());
+    if addrs.iter().any(|a| !(limits.permit)(a.ip()) || own(a.ip())) {
+        return Err(not_public(host));
     }
+    Ok(addrs)
+}
+
+/// The addresses of this machine's own interfaces (a public one too: the server must not fetch from
+/// itself). Empty where the system does not list them (Windows).
+pub(super) fn own_addresses() -> Vec<IpAddr> {
+    let mut out = Vec::new();
+    #[cfg(unix)]
+    // SAFETY: `getifaddrs` hands back a list this reads, following `ifa_next` to the null end, and
+    // frees with `freeifaddrs`; an address is read as `sockaddr_in` / `sockaddr_in6` only when its
+    // family says it is one.
+    unsafe {
+        let mut list: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut list) != 0 {
+            return out;
+        }
+        let mut at = list;
+        while !at.is_null() {
+            let addr = (*at).ifa_addr;
+            if !addr.is_null() {
+                match i32::from((*addr).sa_family) {
+                    libc::AF_INET => {
+                        let sin = &*(addr as *const libc::sockaddr_in);
+                        out.push(IpAddr::V4(Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr))));
+                    }
+                    libc::AF_INET6 => {
+                        let sin6 = &*(addr as *const libc::sockaddr_in6);
+                        out.push(IpAddr::V6(Ipv6Addr::from(sin6.sin6_addr.s6_addr)));
+                    }
+                    _ => {}
+                }
+            }
+            at = (*at).ifa_next;
+        }
+        libc::freeifaddrs(list);
+    }
+    out
 }
 
 /// A resolver that answers the one host it was made for with the addresses already vetted, and
@@ -243,19 +289,38 @@ pub(super) struct Limits {
     pub stall: Duration,
     /// Which addresses may be connected to: [`is_public`] (a test passes its own, to reach a local server).
     pub permit: fn(IpAddr) -> bool,
+    /// This machine's own addresses ([`own_addresses`]), refused whatever `permit` says.
+    pub own: Vec<IpAddr>,
 }
 
 /// Download `url` into `dest` (inside the workspace, not there yet): written to a `.part` beside it,
 /// renamed into place only once whole, refused if `dest` appeared meanwhile. `progress` hears the
 /// bytes written and the size announced; `cancel` is looked at every [`POLL`].
+/// `shown` is `dest` as the client sees it (relative to the workspace), for the messages.
 pub(super) fn download(
     url: &str,
     dest: &Path,
+    shown: &str,
     limits: &Limits,
     cancel: &dyn Fn() -> bool,
     progress: &mut dyn FnMut(u64, Option<u64>),
 ) -> Result<u64, String> {
+    let reader = super::files::Slot::take(&READERS, MAX_READERS)
+        .ok_or_else(|| format!("{MAX_READERS} URL downloads are already under way; try again when one is done"))?;
     let response = follow(url, limits)?;
+    let encoding = response
+        .headers()
+        .get("content-encoding")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim().to_ascii_lowercase())
+        .filter(|v| !v.is_empty() && v != "identity");
+    // ureq decodes gzip itself (a crate feature the model downloads share) and drops the header:
+    // that body is counted against the cap as it is decoded. Any other encoding is refused.
+    if let Some(encoding) = encoding {
+        return Err(format!(
+            "{url} is sent {encoding}-encoded; only plain (identity) bodies are taken"
+        ));
+    }
     let total = response.body().content_length();
     if let Some(total) = total.filter(|t| *t > limits.max_bytes) {
         return Err(format!(
@@ -263,16 +328,20 @@ pub(super) fn download(
             limits.max_bytes
         ));
     }
-    let part = PartFile::create(dest)?;
+    let dir = dest.parent().map(Path::to_path_buf).unwrap_or_default();
+    super::files::check_room(&dir, total.unwrap_or(0), shown).map_err(|e| e.to_string())?;
+    let part = PartFile::create(dest, shown)?;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .open(&part.0)
-        .map_err(|e| format!("could not write {}: {e}", part.0.display()))?;
+        .map_err(|e| write_error(shown, &e))?;
     // The body is read on a thread of its own so a cancel and a stall are noticed while a read is
     // blocked; the bounded channel throttles the read to the disk.
     let mut body = response.into_body().into_reader();
     let (chunks, received) = std::sync::mpsc::sync_channel::<std::io::Result<Vec<u8>>>(4);
     std::thread::spawn(move || {
+        // The slot is the thread's: it is given back when the read returns, not when we give up.
+        let _reader = reader;
         let mut buf = vec![0u8; 256 * 1024];
         loop {
             match body.read(&mut buf) {
@@ -291,6 +360,7 @@ pub(super) fn download(
     });
     let mut written = 0u64;
     let mut reported = 0u64;
+    let mut room_checked = 0u64;
     let mut heard = Instant::now();
     progress(0, total);
     loop {
@@ -316,7 +386,11 @@ pub(super) fn download(
                 limits.max_bytes
             ));
         }
-        file.write_all(&chunk).map_err(|e| write_error(dest, &e))?;
+        file.write_all(&chunk).map_err(|e| write_error(shown, &e))?;
+        if written - room_checked >= super::files::ROOM_CHECK_EVERY {
+            room_checked = written;
+            super::files::check_room(&dir, 0, shown).map_err(|e| e.to_string())?;
+        }
         if written - reported >= 1024 * 1024 {
             reported = written;
             progress(written, total);
@@ -325,18 +399,18 @@ pub(super) fn download(
     if let Some(total) = total.filter(|t| *t != written) {
         return Err(format!("the download of {url} is incomplete ({written} of {total} bytes)"));
     }
-    file.sync_all().map_err(|e| write_error(dest, &e))?;
+    file.sync_all().map_err(|e| write_error(shown, &e))?;
     drop(file);
-    part.commit(dest)?;
+    part.commit(dest, shown)?;
     progress(written, Some(written));
     Ok(written)
 }
 
-fn write_error(dest: &Path, e: &std::io::Error) -> String {
+fn write_error(shown: &str, e: &std::io::Error) -> String {
     if super::files::disk_full(e) {
-        format!("the disk is full: {} was not written", dest.display())
+        format!("the disk is full: {shown} was not written")
     } else {
-        format!("could not write {}: {e}", dest.display())
+        format!("could not write {shown}: {}", e.kind())
     }
 }
 
@@ -347,7 +421,7 @@ fn follow(url: &str, limits: &Limits) -> Result<ureq::http::Response<ureq::Body>
     for _ in 0..=MAX_REDIRECTS {
         let uri = check_url(&url)?;
         let (host, port) = host_port(&uri);
-        let addrs = vet(&host, resolve(&host, port)?, limits.permit)?;
+        let addrs = vet(&host, resolve(&host, port)?, limits)?;
         let config = ureq::Agent::config_builder()
             .proxy(None)
             .max_redirects(0)
@@ -384,22 +458,22 @@ fn follow(url: &str, limits: &Limits) -> Result<ureq::http::Response<ureq::Body>
 struct PartFile(PathBuf);
 
 impl PartFile {
-    fn create(dest: &Path) -> Result<Self, String> {
+    fn create(dest: &Path, shown: &str) -> Result<Self, String> {
         let path = super::files::part_path(dest);
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| write_error(dest, &e))?;
+            std::fs::create_dir_all(parent).map_err(|e| write_error(shown, &e))?;
         }
         std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&path)
-            .map_err(|e| write_error(dest, &e))?;
+            .map_err(|e| write_error(shown, &e))?;
         Ok(Self(path))
     }
 
     /// Put the file in place at `dest`, refused when something is there by now.
-    fn commit(self, dest: &Path) -> Result<(), String> {
-        super::files::place(&self.0, dest, false).map_err(|e| e.to_string())
+    fn commit(self, dest: &Path, shown: &str) -> Result<(), String> {
+        super::files::place(&self.0, dest, shown, false).map_err(|e| e.to_string())
     }
 }
 
@@ -427,6 +501,7 @@ mod tests {
             "100.64.0.0",
             "100.100.100.200",
             "100.127.255.255",
+            "168.63.129.16",
             "127.0.0.1",
             "127.255.255.254",
             "169.254.169.254",
@@ -461,6 +536,7 @@ mod tests {
             "100.128.0.0",
             "126.255.255.255",
             "128.0.0.1",
+            "168.63.129.17",
             "169.253.255.255",
             "169.255.0.0",
             "172.15.255.255",
@@ -551,13 +627,35 @@ mod tests {
 
     #[test]
     fn a_name_with_one_private_address_is_refused_whole() {
+        let public = Limits {
+            permit: is_public,
+            ..limits(1)
+        };
         let addrs = vec!["8.8.8.8:80".parse().unwrap(), "10.0.0.1:80".parse().unwrap()];
-        let why = vet("mixed.example", addrs, is_public).unwrap_err();
-        assert!(why.contains("10.0.0.1") && why.contains("not a public address"), "{why}");
-        assert!(vet("ok.example", vec!["8.8.8.8:80".parse().unwrap()], is_public).is_ok());
+        let why = vet("mixed.example", addrs, &public).unwrap_err();
+        assert!(!why.contains("10.0.0.1") && why.contains("not a public address"), "{why}");
+        assert!(vet("ok.example", vec!["8.8.8.8:80".parse().unwrap()], &public).is_ok());
         // Every spelling of an address resolves before it is judged.
         let literal = resolve("127.0.0.1", 80).unwrap();
-        assert!(vet("127.0.0.1", literal, is_public).is_err());
+        assert!(vet("127.0.0.1", literal, &public).is_err());
+        // A name that does not resolve reads as one that is not public.
+        assert_eq!(
+            resolve("no-such-host.invalid", 80).unwrap_err(),
+            not_public("no-such-host.invalid")
+        );
+        // This machine's own addresses are refused, a public one or its mapped spelling too.
+        let own = Limits {
+            own: vec!["8.8.4.4".parse().unwrap()],
+            ..public
+        };
+        assert!(vet("self.example", vec!["8.8.4.4:80".parse().unwrap()], &own).is_err());
+        assert!(vet("self.example", vec!["[::ffff:8.8.4.4]:80".parse().unwrap()], &own).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_machine_lists_its_own_loopback() {
+        assert!(own_addresses().iter().any(|a| a.is_loopback()), "{:?}", own_addresses());
     }
 
     #[test]
@@ -626,6 +724,7 @@ mod tests {
             max_bytes,
             stall: Duration::from_secs(5),
             permit: loopback,
+            own: Vec::new(),
         }
     }
 
@@ -633,6 +732,16 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("kerf-fetch-{name}-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    fn download_to(
+        url: &str,
+        dest: &Path,
+        limits: &Limits,
+        cancel: &dyn Fn() -> bool,
+        progress: &mut dyn FnMut(u64, Option<u64>),
+    ) -> Result<u64, String> {
+        download(url, dest, "the file", limits, cancel, progress)
     }
 
     fn leftovers(dir: &Path) -> Vec<String> {
@@ -649,7 +758,7 @@ mod tests {
         let dir = scratch("ok");
         let dest = dir.join("sub").join("clip.mp4");
         let mut heard = Vec::new();
-        let size = download(
+        let size = download_to(
             &format!("http://{first}/a"),
             &dest,
             &limits(1 << 20),
@@ -677,7 +786,7 @@ mod tests {
             permit: is_public,
             ..limits(1 << 20)
         };
-        let why = download(
+        let why = download_to(
             &format!("http://{first}/a"),
             &dir.join("a"),
             &public_only,
@@ -688,7 +797,7 @@ mod tests {
         assert!(why.contains("not a public address"), "{why}");
         // A redirect to another scheme is refused like a first URL.
         let to_file = serve(vec![redirect("file:///etc/passwd")]);
-        let why = download(
+        let why = download_to(
             &format!("http://{to_file}/a"),
             &dir.join("b"),
             &limits(1 << 20),
@@ -707,7 +816,7 @@ mod tests {
         let addr = serve(vec![]);
         let looping: Vec<Vec<u8>> = (0..=MAX_REDIRECTS).map(|_| redirect("/again")).collect();
         let looped = serve(looping);
-        let why = download(
+        let why = download_to(
             &format!("http://{looped}/a"),
             &dir.join("a"),
             &limits(1 << 20),
@@ -719,7 +828,7 @@ mod tests {
         let _ = addr;
 
         let big = serve(vec![ok(&[7u8; 64])]);
-        let why = download(
+        let why = download_to(
             &format!("http://{big}/a"),
             &dir.join("big"),
             &limits(16),
@@ -732,7 +841,7 @@ mod tests {
         let mut unbounded = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n".to_vec();
         unbounded.extend_from_slice(&[7u8; 64]);
         let endless = serve(vec![unbounded]);
-        let why = download(
+        let why = download_to(
             &format!("http://{endless}/a"),
             &dir.join("big"),
             &limits(16),
@@ -742,9 +851,22 @@ mod tests {
         .unwrap_err();
         assert!(why.contains("sent more than"), "{why}");
 
+        let mut gzipped = b"HTTP/1.1 200 OK\r\nContent-Encoding: br\r\nContent-Length: 4\r\nConnection: close\r\n\r\n".to_vec();
+        gzipped.extend_from_slice(b"abcd");
+        let encoded = serve(vec![gzipped]);
+        let why = download_to(
+            &format!("http://{encoded}/a"),
+            &dir.join("gz"),
+            &limits(1 << 20),
+            &|| false,
+            &mut |_, _| {},
+        )
+        .unwrap_err();
+        assert!(why.contains("br-encoded"), "{why}");
+
         std::fs::write(dir.join("there"), b"mine").unwrap();
         let again = serve(vec![ok(b"theirs")]);
-        let why = download(
+        let why = download_to(
             &format!("http://{again}/a"),
             &dir.join("there"),
             &limits(1 << 20),
@@ -771,7 +893,7 @@ mod tests {
             std::thread::sleep(Duration::from_secs(10));
         });
         let started = Instant::now();
-        let why = download(
+        let why = download_to(
             &format!("http://{addr}/a"),
             &dir.join("a"),
             &limits(1 << 20),

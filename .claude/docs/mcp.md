@@ -85,9 +85,16 @@ the same `require_bearer` layer, and the handler repeats rmcp's checks: an `Orig
 GET opens with `O_NOFOLLOW`; listings leave links out). `PUT /files/<path>` streams the body to `<name>.<8 hex>.part`
 beside the target (parents made inside DIR, a `Part` guard deletes it if the request drops), `sync_all`, then `place`s it:
 `?overwrite=1` renames over, otherwise a hard link that fails on an existing name (409). Over `--max-upload-gb` (announced
-or counted) is 413; ENOSPC / quota is 507 with the `.part` gone; a target the open project uses (`in_use`:
-`Project::output_path_inputs` read under the lock, canonical paths compared after it — sources, capture files, the `.kerf`
-and its `-wal` / `-shm`) is 409, checked before and again after the body. `GET` streams a file (`ReaderStream`, a
+or counted) is 413; a body silent for 60 s is 408; a fifth upload in flight is 503 (`Slot`, four at once); ENOSPC / quota,
+or an upload that would leave under 1 GiB free on DIR's filesystem (`check_room`: `statvfs`, the announced length up front,
+again every 64 MiB; not checked on Windows), is 507 with the `.part` gone. **`refuse_in_use`** runs on every PUT (before and
+after the body, whether the target exists or not), DELETE and `import_url` destination: `check_name` refuses any
+`*.kerf-journal` / `-wal` / `-shm` of any project (SQLite plays a hot journal back into the project that opens it — the
+journal of the open one normally does not exist, so an existence-gated check would let it through) and a name whose `.part`
+would pass 255 bytes (400); then the target must not be a file the open project uses (`Project::output_path_inputs` read
+under the lock, `paths::same_file` after it: sources, capture files, the `.kerf` and its side files, through hard links and
+case folding), else 409. The file system calls run on the blocking pool (`on_disk`). At start a headless run with a workspace
+sweeps Kerf's own `.part` files (`<name>.<8 hex>.part`) older than 24 h (`sweep_stale_parts`). `GET` streams a file (`ReaderStream`, a
 `Content-Type` by extension, `nosniff`, `attachment`) with `Content-Length` and one `Range` (`parse_range`: `a-b`, `a-`,
 `-n`; several or malformed → the whole file; past the end → 416); a directory, a trailing `/` or `?list` answers
 `{path, entries: [{name, size, modified, is_dir}], truncated?}` (`list_dir`, at most 5000). `DELETE` removes a file (409 when
@@ -107,7 +114,13 @@ up; v6 allows only 2000::/3 minus 2001::/23, 2001:db8::/32, 3fff::/20, and judge
 whatever the environment says. Redirects are followed by hand (`join`), each hop checked again, at most 5; connect 15 s,
 response 60 s, 60 s of silence (a reader thread, the cancel polled every 200 ms), the size cap on the announced length
 and on the bytes, `.part` + no-clobber `place`. Tests: the classifier's ranges and edges, the URL rules, `join`,
-`file_name`, and a loopback server (`Limits::permit` swapped) for redirects, a private hop, the cap, an existing file, a cancel.
+`file_name`, and a loopback server (`Limits::permit` swapped) for redirects, a private hop, the cap, an existing file, an
+encoded body, a cancel. Also refused: this machine's own addresses (`own_addresses`, `getifaddrs`; compared canonically, so
+a mapped spelling too; not listed on Windows), and 168.63.129.16 / 100.100.100.200 by name. A host that does not resolve
+and one that is not public get the same message (`not_public`), which never names the address. The body must be
+`identity`: ureq asks for it, decodes gzip itself whatever a server sends (a crate feature, not per agent; the cap
+counts the decoded bytes) and any other `Content-Encoding` is refused. The body's whole budget is 2 h; a stalled reader
+thread lives until then, so at most four may exist (`READERS`, a fifth `import_url` is refused). Free space as for uploads.
 It shares the **same** `Arc<Mutex<Project>>` the Tauri commands hold, so the agent edits the project the user has open.
 **stdio** (`kerf-app --headless --stdio`, `app.md`; rmcp `transport-io`): `server::start_stdio` does what `start` does short
 of a listener and a token (none is made or stored, the pipe is the trust boundary; no `CONTROL`, so `stop` is a no-op) and

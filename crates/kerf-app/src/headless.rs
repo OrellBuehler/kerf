@@ -720,6 +720,10 @@ fn run(
     };
     // Before either server is made: the stdio one takes its workspace from these too.
     let workspace_root = workspace.as_ref().map(|w| w.root().to_string());
+    if let Some(root) = workspace_root.clone() {
+        // What a run that died mid-upload or mid-download left.
+        std::thread::spawn(move || mcp::sweep_stale_parts(Path::new(&root)));
+    }
     let media = mcp::MediaIo {
         public_url: args.public_url.clone(),
         max_upload_bytes: args.max_upload_bytes.unwrap_or(mcp::DEFAULT_MAX_UPLOAD),

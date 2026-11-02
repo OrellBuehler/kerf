@@ -61,7 +61,7 @@ impl ToolSet {
     fn about(self) -> &'static str {
         match self {
             ToolSet::Core => {
-                "Look at the media and the cut, cut and arrange, volume / fades / transitions, review and history, jobs"
+                "Look at the media and the cut, cut and arrange, volume / fades / transitions, review and history, jobs, workspace files"
             }
             ToolSet::Analysis => "Transcripts, speakers, filler words, waveforms, scopes, speech model, proxies, audio sync",
             ToolSet::Clips => "Speed, transform, colour and grade, effects, masks, linked picture and sound",
@@ -71,7 +71,7 @@ impl ToolSet {
             ToolSet::Music => "Music structure, fitting and composing music, stems, snapping cuts to beats",
             ToolSet::Delivery => "Delivery format, smart crop, export, variants, cover, captions and interchange files",
             ToolSet::Tasks => "The user's task queue",
-            ToolSet::Project => "Open, create and save projects as, missing media, settings, workspace files",
+            ToolSet::Project => "Open, create and save projects as, missing media, settings",
         }
     }
 
