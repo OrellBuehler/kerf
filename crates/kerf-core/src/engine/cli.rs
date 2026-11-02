@@ -4335,6 +4335,13 @@ impl LoudnessPreset {
     }
 }
 
+impl ExportOptions {
+    /// The caption files an export with these options writes beside `output` (`caption_sidecars`).
+    pub fn caption_sidecar_paths(&self, output: &Path) -> Vec<PathBuf> {
+        side_files::sidecar_paths(output, self).into_iter().map(|(_, p)| p).collect()
+    }
+}
+
 impl Default for ExportOptions {
     // Reproduces the pre-existing argv exactly: no codecs, no crf, no faststart.
     fn default() -> Self {

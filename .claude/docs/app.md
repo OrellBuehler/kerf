@@ -49,8 +49,9 @@ initialises GTK and panics with no display) and runs on `tauri::async_runtime` w
 still links GTK / WebKitGTK (the libraries must be installed, a display need not be). `--project` must exist and
 `--new-project` must not (exit 2); with neither, an untitled recovery-backed project as in the window. `--workspace DIR`
 (else `KERF_WORKSPACE`; for a server remote agents reach) confines every path an MCP client names to DIR (`mcp.md`
-"Workspace"): DIR must be an existing directory (else exit 2), and `--project` / `--new-project` then resolve against DIR
-and must lie inside it (exit 2); `--data-dir` / `--token-file` are the operator's and stay unconfined. Directories: the
+"Workspace"): DIR must be an existing directory and not a filesystem root (else exit 2), `--project` / `--new-project`
+then resolve against DIR and must lie inside it, a `--project` may name no file outside it, and the settings, data and
+cache directories and `--token-file` may not lie in it (each exit 2). Directories: the
 desktop app's config / data dirs for the build's identifier (`context()`, the one `generate_context!`, so a debug build uses
 `.dev`), or `--data-dir` for settings, logs and recovery alike (CI isolation). No single-instance plugin: a taken port exits
 3 (`port in use … --mcp-addr`), and two runs sharing a settings file can race to make the first token (use `--data-dir` or

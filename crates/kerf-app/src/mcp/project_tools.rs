@@ -382,10 +382,18 @@ impl KerfMcp {
         let discard = p.discard_unsaved.unwrap_or(false);
         require_discard_ok(&self.lock(), discard)?;
         let (shared, owner, app) = (self.project.clone(), self.owner(), self.app.clone());
+        let workspace = self.workspace.clone();
         let opened_path = blocking(move || {
             // Open the file first, then swap it in — the (disk-bound) open doesn't hold the lock, and a
             // failed open leaves the current project intact.
             let opened = Project::open(&path).map_err(core_err)?;
+            // Confined to a workspace, the project may not name a file outside it.
+            if let Some(ws) = &workspace {
+                if let Err(e) = ws.check_project(&opened) {
+                    opened.close();
+                    return Err(McpError::invalid_params(e, None));
+                }
+            }
             let mut project = lock_agent_as(&shared, owner.as_deref());
             // Asked again under the lock that swaps: the user may have added to it meanwhile.
             require_discard_ok(&project, discard)?;

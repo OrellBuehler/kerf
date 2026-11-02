@@ -2823,6 +2823,9 @@ impl KerfMcp {
         let path = self.path_arg(&p.path)?;
         crate::require_local_input_path(&path).map_err(|e| McpError::invalid_params(e, None))?;
         kerf_core::paths::validate_import_path(std::path::Path::new(&path)).map_err(core_err)?;
+        if self.workspace.is_some() {
+            workspace::refuse_reference_media(&path).map_err(|e| McpError::invalid_params(e, None))?;
+        }
         let me = self.clone();
         let owner = self.owner();
         let generation = self.lock().generation();
@@ -3149,6 +3152,10 @@ impl KerfMcp {
     )]
     fn set_speech_model(&self, Parameters(p): Parameters<SpeechModelParams>) -> Result<String, McpError> {
         let name = p.name.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        // A name the engine reads as a model file would ask the disk about a path outside the workspace.
+        if let (Some(ws), Some(name)) = (&self.workspace, name) {
+            ws.check_speech_model(name).map_err(|e| McpError::invalid_params(e, None))?;
+        }
         kerf_core::set_speech_model(name);
         // Both writes the GUI's picker makes: the process setting transcription
         // reads, and the project meta that restores the choice on reopen.
@@ -6265,6 +6272,7 @@ impl KerfMcp {
             overwrite_sidecars: p.overwrite.unwrap_or(false),
             ..p.options.unwrap_or_default()
         };
+        self.check_beside(opts.caption_sidecar_paths(&output).iter().map(|p| p.as_path()))?;
         let (project, owner) = (self.project.clone(), self.owner());
         // A render runs for minutes. Without progress an agent cannot tell a slow export from a
         // hung one, and without cancellation it cannot abandon a render whose settings it already
@@ -6388,12 +6396,18 @@ impl KerfMcp {
             .iter()
             .map(|d| kerf_core::ExportVariant::beside(&base, *d))
             .collect();
-        self.check_beside(variants.iter().map(|v| v.output.as_path()))?;
         let overwrite = p.overwrite.unwrap_or(false);
         let opts = ExportOptions {
             overwrite_sidecars: overwrite,
             ..opts
         };
+        let sidecars: Vec<std::path::PathBuf> = variants.iter().flat_map(|v| opts.caption_sidecar_paths(&v.output)).collect();
+        self.check_beside(
+            variants
+                .iter()
+                .map(|v| v.output.as_path())
+                .chain(sidecars.iter().map(|p| p.as_path())),
+        )?;
         for variant in &variants {
             refuse_overwrite(&variant.output, overwrite)?;
             kerf_core::check_caption_sidecars(&variant.output, &opts).map_err(core_err)?;
@@ -8098,9 +8112,37 @@ const EDITING_GUIDE: &str = "How to edit with Kerf. The user queues editing task
              keyframes, titles, audio, music, delivery, tasks and project), and this guide then ends by \
              saying which.";
 
-/// Added to the instructions, with the directory, when the server has a workspace (`--workspace`).
-const WORKSPACE_NOTE: &str = "Files: every path you give is relative to the workspace (absolute ones must lie inside it) \
-             and paths come back relative to it. The workspace is ";
+/// Added to the instructions when the server has a workspace (`--workspace`), the directory after it
+/// when that fits the budget.
+const WORKSPACE_NOTE: &str = "Files stay in the workspace: give paths relative to it, even where a tool says \
+             absolute; answers show them relative.";
+
+/// The words of [`INSTRUCTIONS`] a workspace makes wrong, and what they say instead.
+const WORKSPACE_WORDING: [(&str, &str); 2] = [
+    ("by its absolute path", "by its path"),
+    ("to an absolute path.", "to a path."),
+];
+
+/// What a client reading [`INSTRUCTIONS`] would not exceed (Claude Code shows 4096 characters).
+const INSTRUCTIONS_BUDGET: usize = 3500;
+
+/// The server's instructions: [`INSTRUCTIONS`], and with a workspace its rule ([`WORKSPACE_NOTE`] and the
+/// directory, left out rather than going past [`INSTRUCTIONS_BUDGET`]).
+fn instructions(workspace: Option<&Workspace>) -> String {
+    let Some(ws) = workspace else {
+        return INSTRUCTIONS.to_string();
+    };
+    let mut text = WORKSPACE_WORDING
+        .iter()
+        .fold(INSTRUCTIONS.to_string(), |text, (from, to)| text.replace(from, to));
+    text.push(' ');
+    text.push_str(WORKSPACE_NOTE);
+    let root = format!(" Workspace: {}.", ws.root());
+    if text.len() + root.len() <= INSTRUCTIONS_BUDGET {
+        text.push_str(&root);
+    }
+    text
+}
 
 #[tool_handler(router = router())]
 impl ServerHandler for KerfMcp {
@@ -8145,10 +8187,7 @@ impl ServerHandler for KerfMcp {
         let mut info = ServerConfig::default();
         info.server_info = server_identity();
         info.capabilities = capabilities();
-        info.instructions = Some(match &self.workspace {
-            Some(ws) => format!("{INSTRUCTIONS} {WORKSPACE_NOTE}{}.", ws.root()),
-            None => INSTRUCTIONS.to_string(),
-        });
+        info.instructions = Some(instructions(self.workspace.as_deref()));
         info
     }
 
@@ -9769,23 +9808,40 @@ mod tests {
     #[test]
     fn the_workspace_rule_is_in_the_instructions_only_when_there_is_one() {
         use rmcp::ServerHandler;
-        assert!(super::INSTRUCTIONS.len() + super::WORKSPACE_NOTE.len() + 2 <= 3500);
         let (server, _) = headless_server();
         assert_eq!(server.get_info().instructions.as_deref(), Some(super::INSTRUCTIONS));
+        for (from, _) in super::WORKSPACE_WORDING {
+            assert!(super::INSTRUCTIONS.contains(from), "{from}");
+        }
         let dir = std::env::temp_dir().join(format!("kerf-ws-info-{}", uuid::Uuid::new_v4().simple()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let ws = super::Workspace::open(&dir).unwrap();
+        let deep = dir.join("x".repeat(64 - dir.as_os_str().len().min(60)));
+        std::fs::create_dir_all(&deep).unwrap();
+        let ws = super::Workspace::open(&deep).unwrap();
+        assert!(ws.root().len() >= 64, "{}", ws.root());
         let root = ws.root().to_string();
         let confined = KerfMcp {
             workspace: Some(std::sync::Arc::new(ws)),
             ..server
         };
         let text = confined.get_info().instructions.unwrap();
+        assert!(text.len() <= super::INSTRUCTIONS_BUDGET, "{} characters", text.len());
         assert!(
-            text.starts_with(super::INSTRUCTIONS) && text.ends_with(&format!("{root}.")),
+            text.ends_with(&format!(" Workspace: {root}.")),
+            "a 64-character root fits: {text}"
+        );
+        assert!(text.contains("relative to it, even where a tool says absolute"), "{text}");
+        assert!(
+            !text.contains("absolute path"),
+            "nothing says a path must be absolute: {text}"
+        );
+        // A root too long for the budget is left out, never the budget broken.
+        let long = deep.join("y".repeat(250));
+        std::fs::create_dir_all(&long).unwrap();
+        let text = super::instructions(Some(&super::Workspace::open(&long).unwrap()));
+        assert!(
+            text.len() <= super::INSTRUCTIONS_BUDGET && !text.contains("Workspace: "),
             "{text}"
         );
-        assert!(text.contains("relative to the workspace"), "{text}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

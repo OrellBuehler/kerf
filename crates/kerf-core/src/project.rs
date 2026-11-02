@@ -5598,6 +5598,35 @@ impl Project {
         Self::check_output_path_with(output, &self.output_path_inputs()?)
     }
 
+    /// Every file this project names on disk: each asset's file and capture files, and each LUT a
+    /// clip's grade reads in the cut, its history and an open proposal (and its undo steps). What a
+    /// host that confines files to one directory (`kerf-app --headless --workspace`) checks before it
+    /// takes a project in. Sorted, without repeats.
+    pub fn referenced_files(&self) -> Result<Vec<String>> {
+        let mut files = Vec::new();
+        for asset in self.list_assets()? {
+            files.push(asset.path);
+            files.extend(asset.source_paths);
+        }
+        let mut stmt = self.conn.prepare(
+            "SELECT data FROM timeline UNION ALL SELECT snapshot FROM history UNION ALL SELECT base FROM staged
+             UNION ALL SELECT timeline FROM staged UNION ALL SELECT timeline FROM staged_undo",
+        )?;
+        let rows = stmt.query_map([], |r| r.get::<_, String>(0))?;
+        for row in rows {
+            let timeline: Timeline = serde_json::from_str(&row?)?;
+            let luts = timeline
+                .tracks
+                .iter()
+                .flat_map(|t| &t.clips)
+                .filter_map(|c| c.grade.lut.as_ref());
+            files.extend(luts.map(|lut| lut.path.clone()));
+        }
+        files.sort();
+        files.dedup();
+        Ok(files)
+    }
+
     /// What an output path must not be, read from the database (and the environment, for the
     /// cache's place) — no file is touched. The locked half of [`Project::check_output_path`].
     pub fn output_path_inputs(&self) -> Result<crate::paths::Protected> {
@@ -8226,6 +8255,31 @@ mod tests {
         );
         let cleared = project.set_grade(clip, Grade::default()).unwrap();
         assert!(cleared.grade.is_empty());
+    }
+
+    #[test]
+    fn referenced_files_name_every_source_and_every_lut_the_history_holds() {
+        use crate::model::ClipLut;
+        let project = Project::sample().unwrap();
+        let clip = project.timeline().unwrap().tracks[0].clips[0].id;
+        let lut = |path: &str| Grade {
+            lut: Some(ClipLut {
+                path: path.into(),
+                intensity: 1.0,
+            }),
+            ..Grade::default()
+        };
+        project.set_grade(clip, lut("/luts/old.cube")).unwrap();
+        project.set_grade(clip, lut("/luts/new.cube")).unwrap();
+        let files = project.referenced_files().unwrap();
+        for asset in project.list_assets().unwrap() {
+            assert!(files.contains(&asset.path), "{files:?}");
+        }
+        assert!(files.contains(&"/luts/new.cube".to_string()), "{files:?}");
+        assert!(
+            files.contains(&"/luts/old.cube".to_string()),
+            "an undo brings it back: {files:?}"
+        );
     }
 
     #[test]

@@ -414,6 +414,24 @@ pub(crate) fn main(argv: &[String], bundled_ffmpeg: &[(&'static str, PathBuf)]) 
             return code;
         }
     };
+    if let Some(ws) = &workspace {
+        let kerf_dirs = [
+            ("the settings directory", config.clone()),
+            ("the data directory", data.clone()),
+            ("--token-file", args.token_file.clone()),
+            ("Kerf's cache", dirs::cache_dir().map(|d| d.join("kerf"))),
+            ("Kerf's generated media", dirs::data_dir().map(|d| d.join("kerf"))),
+        ];
+        if let Some((what, path)) = kerf_own_inside(ws, &kerf_dirs) {
+            say(&format!(
+                "kerf-app: {what} {} lies inside --workspace {}: clients could read or replace it (pick another --data-dir \
+                 or workspace)",
+                path.display(),
+                ws.root()
+            ));
+            return EXIT_USAGE;
+        }
+    }
     crate::init_logging(data.as_ref().map(|d| d.join("logs")), true);
     crate::install_panic_hook();
     for (var, path) in bundled_ffmpeg {
@@ -461,6 +479,14 @@ fn open_workspace(args: &mut Args) -> Result<Option<Arc<Workspace>>, Exit> {
         *path = PathBuf::from(workspace.resolve(&named).map_err(|e| usage(format!("--project: {e}")))?);
     }
     Ok(Some(Arc::new(workspace)))
+}
+
+/// The first of Kerf's own files and directories that lies in the workspace, if one does.
+fn kerf_own_inside<'a>(ws: &Workspace, paths: &'a [(&'a str, Option<PathBuf>)]) -> Option<(&'a str, &'a Path)> {
+    paths
+        .iter()
+        .filter_map(|(what, path)| Some((*what, path.as_deref()?)))
+        .find(|(_, path)| ws.holds(path))
 }
 
 /// What can be refused before anything starts: the project file, the token file, the token. The
@@ -587,6 +613,12 @@ fn run(
         Some(ProjectArg::Open(path) | ProjectArg::Create(path)) => Project::open(path).map_err(failed)?,
         None => Project::open_in_memory().map_err(failed)?,
     };
+    if let Some(ws) = &workspace {
+        if let Err(e) = ws.check_project(&project) {
+            project.close();
+            return Err(Exit(EXIT_USAGE, format!("--project: {e}")));
+        }
+    }
     let project = Arc::new(Mutex::new(project));
     let state = AppState::new(
         project.clone(),
@@ -924,6 +956,21 @@ mod tests {
         );
         let mut none = Args::default();
         assert!(open_workspace(&mut none).ok().unwrap().is_none());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn kerf_s_own_files_may_not_lie_in_the_workspace() {
+        let dir = std::env::temp_dir().join(format!("kerf-headless-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(dir.join("ws")).unwrap();
+        let ws = Workspace::open(&dir.join("ws")).unwrap();
+        let paths = [
+            ("the data directory", Some(dir.join("data"))),
+            ("--token-file", Some(dir.join("ws").join("secrets").join("token"))),
+        ];
+        let (what, _) = kerf_own_inside(&ws, &paths).unwrap();
+        assert_eq!(what, "--token-file");
+        assert!(kerf_own_inside(&ws, &paths[..1]).is_none());
         std::fs::remove_dir_all(&dir).ok();
     }
 

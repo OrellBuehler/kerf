@@ -31,8 +31,14 @@ fn exchange(addr: SocketAddr, headers: &[(&str, &str)], body: &str, until: &str)
     let mut chunk = [0u8; 4096];
     while Instant::now() < deadline {
         let text = String::from_utf8_lossy(&seen);
-        if let Some((_, body)) = text.split_once("\r\n\r\n") {
-            if body.contains(until) {
+        if let Some((head, body)) = text.split_once("\r\n\r\n") {
+            let body = if head.to_ascii_lowercase().contains("transfer-encoding: chunked") {
+                dechunk(body)
+            } else {
+                body.to_string()
+            };
+            // A whole line holds it: an answer is not cut where one read of the stream ended.
+            if body.split_inclusive('\n').any(|l| l.ends_with('\n') && l.contains(until)) {
                 break;
             }
         }
@@ -50,11 +56,32 @@ fn exchange(addr: SocketAddr, headers: &[(&str, &str)], body: &str, until: &str)
         .and_then(|l| l.split_whitespace().nth(1))
         .and_then(|c| c.parse().ok())
         .unwrap_or(0);
-    let headers = lines
+    let headers: Vec<(String, String)> = lines
         .filter_map(|l| l.split_once(':'))
         .map(|(k, v)| (k.trim().to_ascii_lowercase(), v.trim().to_string()))
         .collect();
-    (status, headers, body.to_string())
+    let chunked = headers
+        .iter()
+        .any(|(k, v)| k == "transfer-encoding" && v.eq_ignore_ascii_case("chunked"));
+    let body = if chunked { dechunk(body) } else { body.to_string() };
+    (status, headers, body)
+}
+
+/// A chunked body's text, the chunk sizes taken out (a chunk may end inside a word).
+fn dechunk(mut body: &str) -> String {
+    let mut out = String::new();
+    while let Some((size, rest)) = body.split_once("\r\n") {
+        let Ok(size) = usize::from_str_radix(size.trim(), 16) else {
+            break;
+        };
+        if size == 0 || rest.len() < size {
+            out.push_str(&rest[..rest.len().min(size)]);
+            break;
+        }
+        out.push_str(&rest[..size]);
+        body = rest[size..].strip_prefix("\r\n").unwrap_or(&rest[size..]);
+    }
+    out
 }
 
 /// Kills the child if the test fails before it is stopped.
@@ -639,7 +666,7 @@ fn workspace_run(name: &str) -> (PathBuf, PathBuf, Running, SocketAddr, [(String
 fn a_workspace_refuses_paths_outside_it_and_resolves_relative_ones_in_it() {
     let (dir, ws, child, addr, on_session, init) = workspace_run("ws");
     assert!(
-        init.contains("relative to the workspace"),
+        init.contains("give paths relative to it"),
         "the instructions say the rule: {init}"
     );
     let info = answer(&call(addr, &on_session, 2, "project_info", serde_json::json!({})));
@@ -706,7 +733,85 @@ fn a_workspace_refuses_paths_outside_it_and_resolves_relative_ones_in_it() {
         serde_json::json!({ "path": "/tmp/elsewhere.kerf" }),
     ));
     assert!(why.contains("outside the workspace"), "{why}");
+
+    // A model file is a path too: only a named model is taken.
+    let why = refusal(&call(
+        addr,
+        &on_session,
+        11,
+        "set_speech_model",
+        serde_json::json!({ "name": "/etc/passwd" }),
+    ));
+    assert!(why.contains("model name"), "{why}");
+    // A template path is resolved in the workspace, not refused for being relative.
+    let why = refusal(&call(
+        addr,
+        &on_session,
+        12,
+        "import_template",
+        serde_json::json!({ "path": "card.kerftemplate" }),
+    ));
+    assert!(why.contains("does not exist") && !why.contains("relative"), "{why}");
+    // A playlist in the workspace whose entries lie outside it is not handed to FFmpeg, whatever its name.
+    let playlist = format!("#EXTM3U\n#EXTINF:1.0,\n{}\n#EXT-X-ENDLIST\n", outside.display());
+    std::fs::write(ws.join("media").join("list.mp4"), &playlist).unwrap();
+    let why = refusal(&call(
+        addr,
+        &on_session,
+        13,
+        "import_asset",
+        serde_json::json!({ "path": "media/list.mp4" }),
+    ));
+    assert!(why.contains("HLS"), "{why}");
+    // A project in the workspace that names media outside it is not opened.
+    let crafted = kerf_core::Project::open(ws.join("crafted.kerf")).unwrap();
+    let asset: kerf_core::Asset = serde_json::from_value(serde_json::json!({
+        "id": "00000000-0000-4000-8000-000000000001",
+        "path": outside.to_string_lossy(),
+        "name": "outside.wav",
+        "duration": 1.0,
+        "streams": [],
+        "imported_at": "2026-01-01T00:00:00Z",
+    }))
+    .unwrap();
+    crafted.insert_or_get_asset(&asset).unwrap();
+    crafted.close();
+    let why = refusal(&call(
+        addr,
+        &on_session,
+        14,
+        "open_project",
+        serde_json::json!({ "path": "crafted.kerf" }),
+    ));
+    assert!(why.contains("outside the workspace") && why.contains("outside.wav"), "{why}");
+    let info = answer(&call(addr, &on_session, 15, "project_info", serde_json::json!({})));
+    assert_eq!(info["path"], "cut.kerf", "the open project stays: {info}");
     drop(child);
+
+    // Nor at startup, and Kerf's own files may not lie in the workspace.
+    let refused = |args: &[&str]| {
+        let out = Command::new(env!("CARGO_BIN_EXE_kerf-app"))
+            .args(["--headless", "--mcp-addr", "127.0.0.1:0", "--workspace", ws.to_str().unwrap()])
+            .args(args)
+            .env_remove("DISPLAY")
+            .env_remove("KERF_WORKSPACE")
+            .env("KERF_MCP_TOKEN", "w".repeat(48))
+            .stdin(Stdio::null())
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(2),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stderr).into_owned()
+    };
+    let data = dir.join("data");
+    let why = refused(&["--data-dir", data.to_str().unwrap(), "--project", "crafted.kerf"]);
+    assert!(why.contains("outside the workspace"), "{why}");
+    let why = refused(&["--data-dir", ws.join("kerf-data").to_str().unwrap()]);
+    assert!(why.contains("inside --workspace"), "{why}");
     let _ = std::fs::remove_dir_all(&dir);
 }
 
