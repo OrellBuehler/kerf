@@ -738,9 +738,14 @@ before the zoom acts at the **fit size** and the zoom magnifies it (a blur grows
   plan's copy is made for the instant (the FFmpeg still sizes it by the zoom it shows then, so it is not the clip's), which a drag changes at every position:
   `Hint::Exact` waits for it; every other hint is not made to wait, the copy is started on a thread of its own (one at a time) and the caller is told `Busy`
   (the caller renders that frame through FFmpeg, and the next ask for it finds the copy). The source is bounded (1 to 8192 a side) before any copy path.
-  **A photograph the probe saw turned** (an EXIF orientation: the stored size, a turned decode) would be fitted by the graph to sizes of its own, so the fit
-  picture opens with a `crop` of the probed size, which FFmpeg refuses on it (`Unsupported`, "probed as"; `a_photograph_the_probe_saw_turned_*`). The moving
-  still's own route needs no such guard: its copy is whatever the graph's filters make of the decoded picture.
+  **A photograph the probe saw turned, or a file replaced since** (an EXIF orientation: the stored size, a turned decode; a picture of another size) would be
+  fitted by the graph to sizes of its own, so the fit picture opens with `crop=w='if(eq(iw,W)*eq(ih,H),W,0):h=H:x=0:y=0:exact=1`: FFmpeg refuses it on any
+  picture of another size than the probed one, smaller **or larger** (`Unsupported`, "probed as"; `a_photograph_the_probe_saw_turned_*`,
+  `checker_t6_*file_replaced*`). The `exact=1` matters: a 4:2:0 picture's `crop` is cut to the chroma grid (1501x1003 to 1500x1002) unless it is exact, and the
+  graph's own `scale` keeps the whole odd picture. The moving still's own route needs no such guard: its copy is whatever the graph's filters make of the decoded picture.
+  **Colour matrix (9.0.2)**: a moving still goes through the same `RgbInStack` / `MixedMatrices` judgement as every layer (`composite_matrix` over the layers on screen,
+  and the planner's cut-level flag over every clip's stream, whichever route its picture takes), so an RGB picture beside BT.709 / BT.2020 footage is refused as a static
+  PNG is, once that refusal covers the cut (lane B); a PNG after such footage in a cut, not on screen with it, is the pre-existing gap `checker_t6_*static_png*` controls.
   **Ledger (T6, the photo slideshow of three shapes, Ken Burns, crossfades)**: still plans 0% to 100% drawn on 6.1.1 (26.7% on 9.0.2: the PNG-only frames), and
   export frames at the delivery's frame 100% on 6.1.1 (the ledger's 540 px motion rows stay refused: an export frame's copy is made for the delivery's frame);
   T20's still plans 22.5% to 46.9% (6.1.1). **9.0.2 and a JPEG, measured**: the moving still's own chain and a JPEG that covers the frame, faded in or not, are

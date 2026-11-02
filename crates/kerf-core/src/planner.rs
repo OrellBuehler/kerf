@@ -3963,15 +3963,33 @@ mod tests {
         };
         // A 3:2 photograph in a 16:9 Cover frame: not resized, cut to the frame from the middle.
         let fit = off(1920, 1280, "yuvj420p");
-        assert_eq!(fit.filters, "crop=1920:1280:0:0,scale=1920:1280,crop=1920:1080:0:100");
+        assert_eq!(
+            fit.filters,
+            concat!(
+                "crop=w='if(eq(iw,1920)*eq(ih,1280),1920,0)':h=1280:x=0:y=0:exact=1",
+                ",scale=1920:1280,crop=1920:1080:0:100"
+            )
+        );
         assert_eq!((fit.size, fit.frame), ((1920, 1080), (1920, 1080)));
         // A portrait one is enlarged by half first, then cut.
         let fit = off(1280, 1920, "yuvj420p");
-        assert_eq!(fit.filters, "crop=1280:1920:0:0,scale=1920:2880,crop=1920:1080:0:900");
+        assert_eq!(
+            fit.filters,
+            concat!(
+                "crop=w='if(eq(iw,1280)*eq(ih,1920),1280,0)':h=1920:x=0:y=0:exact=1",
+                ",scale=1920:2880,crop=1920:1080:0:900"
+            )
+        );
         // A picture of the frame's own shape and size is scaled to its own size all the same (the graph's `scale` is where an RGB picture is
         // converted), and has nothing to cut.
         let fit = off(1920, 1080, "rgb24");
-        assert_eq!(fit.filters, "crop=1920:1080:0:0,scale=1920:1080");
+        assert_eq!(
+            fit.filters,
+            concat!(
+                "crop=w='if(eq(iw,1920)*eq(ih,1080),1920,0)':h=1080:x=0:y=0:exact=1",
+                ",scale=1920:1080"
+            )
+        );
         assert_eq!(fit.size, (1920, 1080));
     }
 }

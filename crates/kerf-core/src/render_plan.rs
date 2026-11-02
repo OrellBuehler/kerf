@@ -1818,10 +1818,12 @@ impl RenderPlan {
         };
         let whole = |r: &crate::layer_geometry::Rect, w: u32, h: u32| r.x == 0 && r.y == 0 && r.w == w && r.h == h;
         let (mut w, mut h) = (layer.stream.width, layer.stream.height);
-        // The sizes are the probe's: a picture that decodes at another size (an EXIF orientation the probe did not apply) would be fitted by
-        // the graph to sizes of its own, so the copy opens with a `crop` of the probed size, which FFmpeg refuses on any picture that is smaller
-        // in either side (a turned one is) and which leaves every other alone.
-        let mut filters: Vec<String> = vec![format!("crop={w}:{h}:0:0")];
+        // The sizes are the probe's: a picture that decodes at another size (an EXIF orientation the probe did not apply, a file replaced since)
+        // would be fitted by the graph to sizes of its own, so the copy opens with a `crop` whose width is the probed one only for a picture of
+        // exactly the probed size and nothing for any other, which FFmpeg refuses ("Invalid too big or non positive size"), a larger picture
+        // included. It is `exact`: a 4:2:0 picture's `crop` is otherwise cut to the chroma grid, and an odd picture would lose the row or the
+        // column the graph's own `scale` keeps.
+        let mut filters: Vec<String> = vec![format!("crop=w='if(eq(iw,{w})*eq(ih,{h}),{w},0)':h={h}:x=0:y=0:exact=1")];
         for stage in &geom.stages {
             if !whole(&stage.src, w, h) {
                 filters.push(format!(

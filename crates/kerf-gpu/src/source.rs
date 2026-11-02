@@ -499,7 +499,7 @@ pub(crate) fn decode_still_copy(layer: &PlanLayer, copy: &StillCopy, share: usiz
     let want = w * h * 5 / 2;
     let raw = run_ffmpeg(&args, want).map_err(|e| match e {
         RunError::Overflow => GpuError::Unsupported(format!("{path}: the copy is larger than the {w}x{h} the plan made")),
-        // (A fit picture opens with a `crop` of the probed size: a picture that decodes smaller than it was probed is not that.)
+        // (A fit picture opens with a `crop` that fails on any picture of another size than the probed one: one that decodes smaller or larger than it was probed is not that.)
         RunError::Failed(why) if layer.fit.is_some() && why.contains("too big") => GpuError::Unsupported(format!(
             "{path}: it decodes at another size than it was probed as ({}x{}): an EXIF or display orientation the probe did not apply",
             layer.stream.width, layer.stream.height
