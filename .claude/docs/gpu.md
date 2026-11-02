@@ -522,7 +522,20 @@ What the parity harness forced, all recorded in `kerf-gpu`'s docs and shaders:
   `scale` made shows 202). Not at the frame's origin, though: with x = y = 0 `pad` pads in place whenever the decoder's frame is
   writable and has the room (`frame_needs_copy`), dropping the odd row of a picture one row short of the frame (64x35 in 64x36), and
   copies otherwise, which no plan can tell — an odd-height picture at the origin that `scale` did not resample is refused
-  (`Unsupported::Geometry`, every build).
+  (`Unsupported::Geometry`, every build). **Off the origin it depends on the graph, not the decoder** (`RenderPlan::odd_pad`). The
+  decoder's frame has no room before it, so `pad` copies it (the row stays) unless a `scale` converted the picture into the
+  buffer `pad` handed it, which is the graph's format negotiation: the filters that share `pad`'s format list (`setsar`, `eq`)
+  pass the constraint on, and the first that restricts it (`format=yuva420p`, the overlay's `yuva420p` input) decides what the
+  `scale` before the `pad` converts to. **A Still plan** is `scale,pad,setsar` into an overlay that takes only `yuva420p`, so a
+  plain `yuv420p` picture is converted and `pad` fills in place: the odd last luma row (16) and the chroma row under it (128) go,
+  at any offset (64x5 to 64x33 in 64x36, 64x31 / 64x33 in 64x40; 6.1.1 and 9.0.2, FFV1 and ffvhuff), and `layer_geometry`
+  shows one row less (`picture_shows`). The origin stays refused in a still too, as in an export. A colour correction, grade,
+  effect, fade, mask, keyed number, HDR picture or other format puts other filters in the group (an `eq` takes `yuv420p` and the
+  row stays; a `format=yuva420p` takes only the alpha plane and it goes), and the plan does not follow the negotiation through
+  them: refused ("in a still whose chain is not a plain ... `scale,pad,setsar`"). **A Motion plan**'s chain ends in
+  `format=yuv420p`, no conversion for `yuv420p`: a frame off the origin is drawn, and refused for any other format (a 10-bit
+  picture's odd row goes there too on both builds) and for a chain on the alpha plane (a crossfade's incoming clip, a mask, a
+  chroma key: its `format=yuva420p` makes `scale` convert, and 11 of 24 frames of a crossfade were inexact before it was refused).
 - **An odd layer's last chroma block reaches one pixel past it** (`overlay` blends whole
   chroma samples): the compositor writes that pixel's U and V with a second, chroma-only
   pass.

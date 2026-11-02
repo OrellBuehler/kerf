@@ -392,7 +392,8 @@ impl LayerGeometry {
             // dropped when `scale` resampled the picture — it then wrote into the buffer `pad` handed it and `pad` fills the bottom
             // bar in place, from the chroma block's first row — and kept when `scale` forwarded the decoder's frame untouched
             // (the picture is already the frame's width and 4:2:0), which `pad` copies whole. A 1 to 13 row picture at the frame's
-            // width keeps every row.)
+            // width keeps every row.) That is the export's graph. A still's `scale` converts the picture to the `yuva420p` its
+            // overlay takes, into `pad`'s buffer, and drops the row too: `RenderPlan::layer_geometry` settles it (`odd_pad`).
             let resampled = (fw, fh) != (win.w, win.h) || sub != Subsampling::YUV420;
             let (layer, picture_at, picture_shows, matte) = match fit {
                 Fit::Contain | Fit::Blur => {

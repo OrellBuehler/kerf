@@ -958,7 +958,7 @@ impl RenderPlan {
     pub fn reasons(&self, caps: &GpuCaps, size: (u32, u32)) -> Vec<Unsupported> {
         let mut reasons = self.size_free_reasons(caps);
         for (n, layer) in self.layers.iter().enumerate() {
-            let geom = match self.layer_geometry(layer, size) {
+            let geom = match self.layer_geometry_resolved(layer, size) {
                 Ok(g) => g,
                 Err(e) => {
                     reasons.push(Unsupported::Geometry(n, e.to_string()));
@@ -984,24 +984,8 @@ impl RenderPlan {
                     }
                 }
             }
-            // `pad` of a picture with an odd height that `scale` forwarded untouched (the decoder's frame as it is), placed at the
-            // frame's origin: with room in the buffer `pad` fills the bottom bar in place from the even-rounded height and the odd
-            // last row goes, and with none it copies the picture and the row stays. Which one it is the decoder's and the frame's
-            // (measured on 9.0.2: FFV1 keeps the row, ffvhuff drops it), so the plan cannot say. A picture off the origin is
-            // always copied, and a resampled one always padded in place (its odd row is dropped: `picture_shows`).
-            if geom.matte
-                && geom.picture_at == (0, 0)
-                && geom.picture.1 % 2 == 1
-                && geom.picture_shows.1 == geom.picture.1
-                && !matches!(self.blur_fill(layer, size), Ok(Some(_)))
-            {
-                reasons.push(Unsupported::Geometry(
-                    n,
-                    format!(
-                        "pad of a {}x{} picture with an odd height at the frame's origin, which `pad` fills in place (the odd last row goes) or copies (it stays) as the decoder's frame allows",
-                        geom.picture.0, geom.picture.1
-                    ),
-                ));
+            if let OddPad::Refused(why) = self.odd_pad(layer, &geom, size) {
+                reasons.push(Unsupported::Geometry(n, why));
             }
             // A scaler that is not measured to be swscale's draws a resized layer a level off: not exact, so FFmpeg's.
             if caps.scaler_approximate && geom.stages.iter().any(|s| s.scaled != (s.src.w, s.src.h)) {
@@ -1815,7 +1799,23 @@ impl RenderPlan {
     /// 38 dB over the whole frame) — refused, unless the picture is gray and has no
     /// chroma to misplace. A picture whose grid is not known is accepted only where
     /// every grid gives the same geometry ([`LayerGeometry::resolve_any_grid`]).
+    ///
+    /// A still's `pad` of an odd-height picture `scale` did not resample drops its odd last row ([`RenderPlan::odd_pad`]):
+    /// `picture_shows` says so.
     pub fn layer_geometry(
+        &self,
+        layer: &PlanLayer,
+        size: (u32, u32),
+    ) -> std::result::Result<LayerGeometry, crate::layer_geometry::GeometryError> {
+        let mut geom = self.layer_geometry_resolved(layer, size)?;
+        if matches!(self.odd_pad(layer, &geom, size), OddPad::Drops) {
+            geom.picture_shows.1 &= !1;
+        }
+        Ok(geom)
+    }
+
+    /// [`RenderPlan::layer_geometry`] as [`LayerGeometry`] resolves it, before the odd row of a still's `pad` is settled.
+    fn layer_geometry_resolved(
         &self,
         layer: &PlanLayer,
         size: (u32, u32),
@@ -1989,6 +1989,90 @@ impl RenderPlan {
     /// still of the same width is ([`still_size`]).
     pub fn size(&self, max_width: u32) -> (u32, u32) {
         still_size(self.canvas.width, self.canvas.height, max_width)
+    }
+}
+
+/// What `pad` does with the odd last row of a letterboxed picture `scale` did not resample (the geometry keeps that row).
+enum OddPad {
+    /// Nothing to settle (no such row), or the row stays: `pad` copies the picture.
+    Unchanged,
+    /// The row goes, and the chroma row under it: `pad` fills the bottom bar in place.
+    Drops,
+    /// Which one is the decoder's or the chain's to say: the frame is refused.
+    Refused(String),
+}
+
+impl RenderPlan {
+    /// Whether `pad` fills the bottom bar in place from the even-rounded height (the odd last row goes, and the chroma row under it)
+    /// or copies the picture (the row stays) depends on who allocated the frame it was handed. At the frame's origin that is the
+    /// decoder's and the frame's (measured on 9.0.2: FFV1 keeps the row, ffvhuff drops it), so the plan cannot say. Off the origin the
+    /// decoder's frame has no room before it and `pad` copies it, unless a `scale` converted the picture into the buffer `pad` hands
+    /// it, which is the graph's format negotiation: filters that share `pad`'s format list (`setsar`, `eq`) pass its constraint on to
+    /// the next, and the first that restricts it (`format=yuva420p`, an `overlay` input) decides what `scale` converts to.
+    ///
+    /// * A **still**'s overlay takes only `yuva420p`: after a plain `scale,pad,setsar` a `yuv420p` picture is converted, and `pad`
+    ///   fills in place (measured on both FFmpegs, FFV1 and ffvhuff, 5 to 31 rows short of the frame; the origin too, which stays
+    ///   refused). A colour correction, a grade, an effect, a fade, a mask, another format or a clip with keyed numbers puts other
+    ///   filters in the group, and the plan does not follow the negotiation through them: refused.
+    /// * An **export**'s chain ends in `format=yuv420p`, which converts a 10-bit picture and not a `yuv420p` one; `format=yuva420p`
+    ///   (a dissolve, a mask, a chroma key) converts every picture (a crossfade's incoming clip: 11 of 24 frames inexact before
+    ///   it was refused). Any other format, and a chain on the alpha plane, are refused; a plain `yuv420p` picture is copied.
+    fn odd_pad(&self, layer: &PlanLayer, geom: &LayerGeometry, size: (u32, u32)) -> OddPad {
+        if !geom.matte
+            || geom.picture.1.is_multiple_of(2)
+            || geom.picture_shows.1 != geom.picture.1
+            || matches!(self.blur_fill(layer, size), Ok(Some(_)))
+        {
+            return OddPad::Unchanged;
+        }
+        let (pw, ph) = geom.picture;
+        let yuv420p = layer
+            .stream
+            .pix_fmt
+            .as_deref()
+            .is_some_and(|f| f.eq_ignore_ascii_case("yuv420p"));
+        if geom.picture_at == (0, 0) {
+            return OddPad::Refused(format!(
+                "pad of a {pw}x{ph} picture with an odd height at the frame's origin, which `pad` fills in place (the odd last row goes) or copies (it stays) as the decoder's frame allows"
+            ));
+        }
+        match self.mode {
+            PlanMode::Still => {
+                let plain = layer.color.is_identity()
+                    && layer.grade.is_identity()
+                    && layer.effects.is_empty()
+                    && layer.mask.is_none()
+                    && layer.fx.fades.is_empty()
+                    && layer.hdr.is_none()
+                    && layer.reframe.is_none()
+                    && layer.animated.is_none()
+                    && layer.blend.is_normal();
+                if yuv420p && plain {
+                    OddPad::Drops
+                } else {
+                    OddPad::Refused(format!(
+                        "pad of a {pw}x{ph} picture with an odd height in a still whose chain is not a plain `yuv420p` picture's `scale,pad,setsar` (a colour correction, grade, effect, fade, mask or other format changes which filter converts the picture, and so whether `pad` fills in place and the odd last row goes)"
+                    ))
+                }
+            }
+            PlanMode::Motion => {
+                if !yuv420p {
+                    OddPad::Refused(format!(
+                        "pad of a {pw}x{ph} picture with an odd height whose format ({}) is not `yuv420p`, which `scale` converts into the buffer `pad` hands it, and `pad` fills the bottom bar in place (the odd last row goes)",
+                        layer.stream.pix_fmt.as_deref().unwrap_or("?")
+                    ))
+                } else if layer.mask.is_some()
+                    || layer.effects.iter().any(|e| e.produces_alpha())
+                    || layer.fx.fades.iter().any(|s| s.tint == FadeTint::Alpha)
+                {
+                    OddPad::Refused(format!(
+                        "pad of a {pw}x{ph} picture with an odd height on the alpha plane (a dissolve, a mask or a chroma key), where `scale` converts the picture into the `yuva420p` that follows the `pad` inside the buffer `pad` hands it, and `pad` fills the bottom bar in place (the odd last row goes)"
+                    ))
+                } else {
+                    OddPad::Unchanged
+                }
+            }
+        }
     }
 }
 
@@ -2757,39 +2841,151 @@ mod tests {
     }
 
     #[test]
-    fn pad_of_an_odd_picture_at_the_frames_origin_is_refused() {
-        let pad = |w: u32, h: u32, frame: (u32, u32)| {
-            let p = fading_plan_of(
-                video(w, h),
-                Some(Delivery::new(frame.0, frame.1, Fit::Contain)),
-                CompositeColorPolicy::FixedBt601,
-                |_| {},
-                0.5,
-            );
-            p.unsupported_reasons_at(p.size(u32::MAX))
+    fn pad_of_an_odd_picture_is_settled_by_the_chain_that_converts_it() {
+        let opts = ExportOptions {
+            fps: Some(30.0),
+            ..ExportOptions::default()
         };
-        // One row short of the frame, at the origin, scale forwarding the decoder's frame: `pad` fills in place or copies as the
-        // decoder's buffer allows, and the odd last row goes or stays with it.
-        for (w, h, frame) in [(64, 35, (64, 36)), (96, 53, (96, 54)), (96, 51, (96, 52))] {
-            let why = pad(w, h, frame);
-            assert!(
-                matches!(why.as_slice(), [r] if r.contains("pad of a") && r.contains("odd height")),
-                "{w}x{h}: {why:?}"
-            );
+        let plan_of = |mode: PlanMode, fmt: &str, w: u32, h: u32, frame: (u32, u32), edit: &dyn Fn(&mut Clip)| {
+            let mut stream = video(w, h);
+            stream.pix_fmt = Some(fmt.into());
+            let a = asset("a", 20.0, vec![stream]);
+            let mut clip = Clip::new(a.id, 0.0, 10.0, 0.0);
+            edit(&mut clip);
+            let mut tl = timeline(vec![vec![clip]]);
+            tl.format = Some(Delivery::new(frame.0, frame.1, Fit::Contain));
+            let request = match mode {
+                PlanMode::Still => PlanRequest::still(CompositeColorPolicy::FixedBt601),
+                PlanMode::Motion => PlanRequest::motion(CompositeColorPolicy::FixedBt601),
+            };
+            let planner = Planner::new(&tl, std::slice::from_ref(&a), &opts, request).unwrap();
+            match mode {
+                PlanMode::Still => planner.at(0.5).unwrap(),
+                PlanMode::Motion => planner.at_frame(15).unwrap(),
+            }
+        };
+        let caps = GpuCaps {
+            motion: true,
+            fades: true,
+            transitions: true,
+            effects: EffectKinds::ALL,
+            ..GpuCaps::A0
+        };
+        let why_of =
+            |p: &RenderPlan| -> Vec<String> { p.reasons(&caps, p.size(u32::MAX)).iter().map(ToString::to_string).collect() };
+        let shows = |p: &RenderPlan| p.layer_geometry(&p.layers[0], p.size(u32::MAX)).unwrap().picture_shows;
+        let reasons = |mode, fmt: &str, w, h, frame| why_of(&plan_of(mode, fmt, w, h, frame, &|_| {}));
+        let at_origin =
+            |why: &[String]| matches!(why, [r] if r.contains("pad of a") && r.contains("odd height at the frame's origin"));
+        let in_a_still = |why: &[String]| matches!(why, [r] if r.contains("pad of a") && r.contains("odd height in a still"));
+        let not_yuv420p = |why: &[String]| matches!(why, [r] if r.contains("pad of a") && r.contains("is not `yuv420p`"));
+        for mode in [PlanMode::Still, PlanMode::Motion] {
+            // One row short of the frame, at the origin, scale forwarding the decoder's frame: `pad` fills in place or copies as the
+            // decoder's buffer allows, and the odd last row goes or stays with it.
+            for (w, h, frame) in [(64, 35, (64, 36)), (96, 53, (96, 54)), (96, 51, (96, 52))] {
+                let why = reasons(mode, "yuv420p", w, h, frame);
+                assert!(at_origin(&why), "{mode:?} {w}x{h}: {why:?}");
+            }
+            // Resampled it is always padded in place (a 62x35 picture is fitted to 64x36), and an even picture has no odd row.
+            for (w, h, frame) in [
+                (62, 35, (64, 36)),
+                (64, 34, (64, 36)),
+                (640, 360, (360, 640)),
+                (64, 36, (64, 36)),
+            ] {
+                let p = plan_of(mode, "yuv420p", w, h, frame, &|_| {});
+                assert!(why_of(&p).is_empty(), "{mode:?} {w}x{h}: {:?}", why_of(&p));
+            }
         }
-        // Off the origin `pad` always copies; resampled it always pads in place (a 62x35 picture is fitted to 64x36); an even
-        // picture has no odd row.
-        for (w, h, frame) in [
-            (62, 35, (64, 36)),
-            (64, 5, (64, 36)),
-            (64, 31, (64, 36)),
-            (64, 34, (64, 36)),
-            (640, 360, (360, 640)),
-            (64, 36, (64, 36)),
-        ] {
-            let why = pad(w, h, frame);
-            assert!(why.is_empty(), "{w}x{h}: {why:?}");
+        // Off the origin an export's `pad` copies the decoder's `yuv420p` frame (the `format=yuv420p` after it is no conversion): the
+        // row stays. A still's `scale` converts the picture into the `yuva420p` its overlay takes, inside the buffer `pad` hands it:
+        // the odd row goes, and the geometry shows one row less. Measured: 64x5 to 64x33 in 64x36 and 64x31 / 64x33 in 64x40, both
+        // builds, FFV1 and ffvhuff.
+        for (w, h, frame) in [(64, 5, (64, 36)), (64, 13, (64, 36)), (64, 31, (64, 36)), (64, 33, (64, 40))] {
+            let p = plan_of(PlanMode::Still, "yuv420p", w, h, frame, &|_| {});
+            assert!(why_of(&p).is_empty(), "still {w}x{h}: {:?}", why_of(&p));
+            assert_eq!(shows(&p), (w, h - 1), "still {w}x{h}");
+            let p = plan_of(PlanMode::Motion, "yuv420p", w, h, frame, &|_| {});
+            assert!(why_of(&p).is_empty(), "motion {w}x{h}: {:?}", why_of(&p));
+            assert_eq!(shows(&p), (w, h), "motion {w}x{h}");
         }
+        // The row a still keeps is the origin's, which is refused: its geometry is what it was.
+        let p = plan_of(PlanMode::Still, "yuv420p", 64, 35, (64, 36), &|_| {});
+        assert_eq!(shows(&p), (64, 35));
+        // A still's other filters change which one converts the picture, and the plan does not follow the negotiation through them.
+        let eq = Color {
+            contrast: 1.2,
+            ..Color::default()
+        };
+        type Edit = Box<dyn Fn(&mut Clip)>;
+        let edits: Vec<(&str, Edit)> = vec![
+            ("eq", Box::new(move |c| c.color = eq)),
+            ("fade", Box::new(|c| c.fade_in = 1.0)),
+            ("effect", Box::new(|c| c.effects = vec![VideoEffect::Invert])),
+        ];
+        for (label, edit) in &edits {
+            let why = why_of(&plan_of(PlanMode::Still, "yuv420p", 64, 31, (64, 36), edit.as_ref()));
+            assert!(in_a_still(&why), "still {label}: {why:?}");
+            let why = why_of(&plan_of(PlanMode::Motion, "yuv420p", 64, 31, (64, 36), edit.as_ref()));
+            assert!(why.is_empty(), "motion {label}: {why:?}");
+        }
+        for fmt in ["yuv420p10le", "yuvj420p", "nv12"] {
+            let why = reasons(PlanMode::Still, fmt, 64, 31, (64, 36));
+            assert!(in_a_still(&why), "still {fmt}: {why:?}");
+            // An export converts a 10-bit picture into the buffer `pad` hands it (`format=yuv420p` follows), so its odd row goes too.
+            let why = reasons(PlanMode::Motion, fmt, 64, 31, (64, 36));
+            assert!(not_yuv420p(&why), "{fmt}: {why:?}");
+            let why = reasons(PlanMode::Motion, fmt, 64, 30, (64, 36));
+            assert!(why.is_empty(), "{fmt} even: {why:?}");
+        }
+        // A chain on the alpha plane (a crossfade's incoming clip, measured 11 of 24 frames inexact; a mask; a chroma key) has a
+        // `format=yuva420p` after the `pad`, which `scale` converts the picture to inside the buffer `pad` hands it.
+        let on_alpha_plane = |why: &[String]| why.iter().any(|r| r.contains("odd height on the alpha plane"));
+        let a = asset("a", 20.0, vec![video(64, 31)]);
+        let mut incoming = Clip::new(a.id, 0.0, 4.0, 2.0);
+        incoming.transition_in = Some(Transition {
+            kind: TransitionKind::Crossfade,
+            duration: 1.0,
+        });
+        let mut tl = timeline(vec![vec![Clip::new(a.id, 0.0, 2.0, 0.0), incoming]]);
+        tl.format = Some(Delivery::new(64, 36, Fit::Contain));
+        let planner = Planner::new(
+            &tl,
+            std::slice::from_ref(&a),
+            &opts,
+            PlanRequest::motion(CompositeColorPolicy::FixedBt601),
+        )
+        .unwrap();
+        for (frame, alpha_layers) in [(30, 0), (75, 1), (120, 1)] {
+            let p = planner.at_frame(frame).unwrap();
+            let why = why_of(&p);
+            let n = why.iter().filter(|r| r.contains("odd height on the alpha plane")).count();
+            assert_eq!(n, alpha_layers, "frame {frame}: {why:?}");
+        }
+        let motion = |mask: Option<Mask>, effects: Vec<VideoEffect>| {
+            why_of(&plan_of(PlanMode::Motion, "yuv420p", 64, 31, (64, 36), &|c| {
+                c.mask = mask;
+                c.effects = effects.clone();
+            }))
+        };
+        let rect = Mask {
+            shape: MaskShape::Rect,
+            x: 0.5,
+            y: 0.5,
+            width: 0.6,
+            height: 0.6,
+            feather: 0.0,
+            inverted: false,
+        };
+        let key = VideoEffect::ChromaKey {
+            color: "green".into(),
+            similarity: 0.3,
+            blend: 0.1,
+        };
+        assert!(on_alpha_plane(&motion(Some(rect), vec![])));
+        assert!(on_alpha_plane(&motion(None, vec![key])));
+        assert!(!on_alpha_plane(&motion(None, vec![VideoEffect::Invert])));
+        assert!(motion(None, vec![]).is_empty());
     }
 
     #[test]

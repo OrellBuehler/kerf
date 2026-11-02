@@ -575,7 +575,7 @@
     both FFmpegs for busy chroma, so none is claimed; a picture left at its size is
     drawn for every format — **a `pad` of a picture with an odd height that `scale` forwarded untouched, placed at the frame's origin** (one row short of the
     frame: `Geometry`; `vf_pad.c` pads in place when the decoder's frame is writable and has room, and the odd last row goes, and copies it
-    otherwise, so the outcome is the decoder's and the plan cannot say — measured on 9.0.2: FFV1 keeps the row, ffvhuff drops it; 6.1.1 kept it in every file tried, and the refusal is on every build) — and **a crop of a picture whose chroma is finer than
+    otherwise, so the outcome is the decoder's and the plan cannot say — measured on 9.0.2: FFV1 keeps the row, ffvhuff drops it; 6.1.1 kept it in every file tried, and the refusal is on every build; **off the origin it is the graph's** (`RenderPlan::odd_pad`): a Still plan's `scale` converts a plain `yuv420p` picture into the `yuva420p` its overlay takes, inside the buffer `pad` hands it, so `pad` fills in place and the odd row and the chroma row under it go at any gap (`layer_geometry` shows one row less; refused when the chain carries a colour correction, grade, effect, fade, mask, keyed number or another format, which decide differently), and a Motion plan's trailing `format=yuv420p` makes it a copy for `yuv420p` (drawn) and a conversion for another format or a chain on the alpha plane (a dissolve, a mask, a chroma key: refused)) — and **a crop of a picture whose chroma is finer than
     4:2:0's**. Where a position rounds
     depends on where in the graph it is (`RenderPlan::layer_geometry`): the first
     `crop` runs on the picture as decoded and rounds to its **native** chroma grid
