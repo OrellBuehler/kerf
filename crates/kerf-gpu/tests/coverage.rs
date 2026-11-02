@@ -2067,6 +2067,7 @@ fn reason(u: &Unsupported) -> Reason {
         | Unsupported::MaskWith(_, s)
         | Unsupported::Matte(_, s)
         | Unsupported::ZoomBehind(_, s)
+        | Unsupported::Rotation(_, s)
         | Unsupported::FoldedFit(_, s)
         | Unsupported::FullRangeResized(_, s) => Some(s.to_string()),
         Unsupported::DipToWhite(_, why) => Some(format!("{why:?}").split('(').next().unwrap_or_default().to_string()),

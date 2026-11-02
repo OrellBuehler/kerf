@@ -34,7 +34,7 @@
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, PoisonError};
+use std::sync::{Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use kerf_core::{BlendExtras, BlendKinds, BlendMode, YuvMatrix};
@@ -346,13 +346,15 @@ struct State {
     measured: Option<Found>,
     failures: u32,
     retry_at: Option<Instant>,
+    /// A measurement is running, and is bounded to end by this.
+    running: Option<Instant>,
 }
 
 /// What is known about this FFmpeg's blend chain, and the one measurement that may be running to find out.
 struct Probe {
     state: Mutex<State>,
-    /// Held by whoever is measuring: one probe at a time, whoever asks.
-    flight: Mutex<()>,
+    /// Signalled when a running measurement ends.
+    ended: Condvar,
 }
 
 /// No mode, no extra: what is drawn until the probe has answered.
@@ -361,6 +363,24 @@ const NOTHING: Found = Found {
     extras: BlendExtras::NONE,
 };
 
+/// What a measurement is bounded to besides [`PROBE_TIMEOUT`]: writing its pictures, and the children's pipes after the deadline.
+const SETUP: Duration = Duration::from_secs(5);
+
+/// How much longer than its bound a waiter waits for a measurement that is running (its children are killed at the deadline).
+const GRACE: Duration = Duration::from_millis(500);
+
+/// The turn to measure. Ending it ([`Turn::finish`]) stores the answer and wakes the waiters; dropping it any other way (the measurement
+/// panicked) gives the place up and backs off, as a probe that could not run does.
+struct Turn<'a> {
+    probe: &'a Probe,
+    finished: bool,
+}
+
+enum Entry<'a> {
+    Answer(Found),
+    Lead(Turn<'a>),
+}
+
 impl Probe {
     const fn new() -> Self {
         Self {
@@ -368,8 +388,9 @@ impl Probe {
                 measured: None,
                 failures: 0,
                 retry_at: None,
+                running: None,
             }),
-            flight: Mutex::new(()),
+            ended: Condvar::new(),
         }
     }
 
@@ -377,26 +398,62 @@ impl Probe {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// What can be answered without measuring: the kept answer, or nothing within the backoff of a probe that could not run.
-    fn settled(&self) -> Option<Found> {
-        let s = self.lock();
-        if let Some(k) = s.measured {
-            return Some(k);
+    /// The answer if there is one to give now (the kept one, or nothing within the backoff of a probe that could not run), else the turn to
+    /// measure. A measurement that is running is waited for on the condition variable, no longer than it is bounded to (plus [`GRACE`]):
+    /// a waiter it has not answered by then gets nothing, "not yet", and **no lock is held while a child runs**.
+    fn enter(&self) -> Entry<'_> {
+        let mut s = self.lock();
+        loop {
+            if let Some(k) = s.measured {
+                return Entry::Answer(k);
+            }
+            if let Some(bound) = s.running {
+                let at = Instant::now();
+                let limit = bound + GRACE;
+                if at >= limit {
+                    return Entry::Answer(NOTHING);
+                }
+                s = self
+                    .ended
+                    .wait_timeout(s, limit - at)
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .0;
+                continue;
+            }
+            if s.retry_at.is_some_and(|t| Instant::now() < t) {
+                return Entry::Answer(NOTHING);
+            }
+            s.running = Some(Instant::now() + SETUP + PROBE_TIMEOUT);
+            return Entry::Lead(Turn {
+                probe: self,
+                finished: false,
+            });
         }
-        s.retry_at.is_some_and(|t| Instant::now() < t).then_some(NOTHING)
     }
 
     /// The answer, measured by `measure` if nothing is known. **One measurement at a time**: a caller that arrives while another is measuring
-    /// waits for it and takes its answer (a measured one, or the backoff's nothing) instead of launching the children again.
+    /// waits for it (boundedly) and takes its answer, a measured one or the backoff's nothing, instead of launching the children again. A
+    /// measurement that panics is not a measurement: nothing is drawn and it is asked again after the backoff, like one that could not run.
     fn found(&self, measure: impl FnOnce() -> Option<Found>) -> Found {
-        if let Some(found) = self.settled() {
-            return found;
+        match self.enter() {
+            Entry::Answer(found) => found,
+            Entry::Lead(turn) => {
+                let measured = std::panic::catch_unwind(std::panic::AssertUnwindSafe(measure)).unwrap_or_else(|_| {
+                    tracing::warn!("FFmpeg's blend probe panicked; it counts as not measured");
+                    None
+                });
+                turn.finish(measured)
+            }
         }
-        let _flight = self.flight.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(found) = self.settled() {
-            return found;
-        }
-        match measure() {
+    }
+}
+
+impl Turn<'_> {
+    fn finish(mut self, measured: Option<Found>) -> Found {
+        self.finished = true;
+        let mut s = self.probe.lock();
+        s.running = None;
+        let out = match measured {
             Some(found) => {
                 if found.kinds.iter().any(|k| *k != BlendKinds::ALL) {
                     tracing::warn!(
@@ -404,11 +461,10 @@ impl Probe {
                         "this FFmpeg's blend chain is not the one the GPU follows for some modes; they are drawn by FFmpeg"
                     );
                 }
-                self.lock().measured = Some(found);
+                s.measured = Some(found);
                 found
             }
             None => {
-                let mut s = self.lock();
                 s.failures += 1;
                 let wait = Duration::from_secs((5u64 << s.failures.saturating_sub(1).min(6)).min(300));
                 s.retry_at = Some(Instant::now() + wait);
@@ -419,7 +475,24 @@ impl Probe {
                 );
                 NOTHING
             }
+        };
+        drop(s);
+        self.probe.ended.notify_all();
+        out
+    }
+}
+
+impl Drop for Turn<'_> {
+    fn drop(&mut self) {
+        if self.finished {
+            return;
         }
+        let mut s = self.probe.lock();
+        s.running = None;
+        s.failures += 1;
+        s.retry_at = Some(Instant::now() + Duration::from_secs(5));
+        drop(s);
+        self.probe.ended.notify_all();
     }
 }
 
@@ -791,6 +864,8 @@ enum Failure {
     TooMuch,
     /// Its output could not be read before the deadline.
     NoOutput,
+    /// The worker that ran it panicked.
+    Panicked,
 }
 
 impl std::fmt::Display for Failure {
@@ -802,6 +877,7 @@ impl std::fmt::Display for Failure {
             Self::Exit(None) => f.write_str("was ended by a signal"),
             Self::TooMuch => f.write_str("wrote more than a picture"),
             Self::NoOutput => f.write_str("left its output unread at the deadline"),
+            Self::Panicked => f.write_str("was lost to a panic of its worker"),
         }
     }
 }
@@ -829,7 +905,8 @@ fn run_jobs(jobs: &[Job], dir: &std::path::Path, deadline: Instant) -> (Vec<Opti
                 if at >= total {
                     break;
                 }
-                let outcome = match jobs.get(at) {
+                // (A job that panics is a child that did not answer, not the end of the probe: the others are read.)
+                let attempt = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match jobs.get(at) {
                     Some(job) => run_job(job, dir, workers, deadline).inspect_err(|failed| {
                         tracing::warn!(
                             probes = ?job.probes,
@@ -847,7 +924,17 @@ fn run_jobs(jobs: &[Job], dir: &std::path::Path, deadline: Instant) -> (Vec<Opti
                             "the decode of FFmpeg's blend probe's RGB clip did not answer"
                         );
                     }),
-                };
+                }));
+                let outcome = attempt.unwrap_or_else(|_| {
+                    tracing::warn!(
+                        job = at,
+                        "a worker of FFmpeg's blend probe panicked; its child did not answer"
+                    );
+                    Err(Failed {
+                        why: Failure::Panicked,
+                        stderr: String::new(),
+                    })
+                });
                 answers.lock().unwrap_or_else(PoisonError::into_inner)[at] = outcome.ok();
             });
         }
@@ -1339,18 +1426,112 @@ mod tests {
                 "{answer:?}: {answers:?}"
             );
             // Afterwards: a kept answer is kept, and a failed one is not asked for again within its backoff.
-            assert_eq!(probe.found(|| panic!("measured again")), answer.unwrap_or(NOTHING));
+            assert_eq!(
+                probe.found(|| {
+                    runs.fetch_add(1, Ordering::SeqCst);
+                    None
+                }),
+                answer.unwrap_or(NOTHING)
+            );
+            assert_eq!(runs.load(Ordering::SeqCst), 1, "{answer:?}: and not measured again");
         }
     }
 
     #[test]
     fn a_probe_that_could_not_run_is_asked_again_after_its_backoff_only() {
+        use std::sync::atomic::AtomicUsize;
         let probe = Probe::new();
-        assert_eq!(probe.found(|| None), NOTHING);
-        assert_eq!(probe.found(|| panic!("inside the backoff")), NOTHING);
+        let runs = AtomicUsize::new(0);
+        let count = |answer| {
+            runs.fetch_add(1, Ordering::SeqCst);
+            answer
+        };
+        assert_eq!(probe.found(|| count(None)), NOTHING);
+        assert_eq!(probe.found(|| count(Some(all()))), NOTHING, "inside the backoff");
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
         probe.lock().retry_at = Some(Instant::now());
-        assert_eq!(probe.found(|| Some(all())), all(), "after it, and now kept");
-        assert_eq!(probe.found(|| panic!("kept")), all());
+        assert_eq!(probe.found(|| count(Some(all()))), all(), "after it, and now kept");
+        assert_eq!(probe.found(|| count(None)), all());
+        assert_eq!(runs.load(Ordering::SeqCst), 2);
+    }
+
+    /// A measurement that panics is not a measurement: the caller gets nothing and no panic, the place is given up, the backoff is set (a later
+    /// caller does not probe again at once) and the probe is asked again after it.
+    #[test]
+    fn a_measurement_that_panics_is_not_measured_and_backs_off() {
+        use std::sync::atomic::AtomicUsize;
+        let probe = Probe::new();
+        let runs = AtomicUsize::new(0);
+        assert_eq!(
+            probe.found(|| {
+                runs.fetch_add(1, Ordering::SeqCst);
+                panic!("a worker of the probe")
+            }),
+            NOTHING
+        );
+        {
+            let s = probe.lock();
+            assert!(s.running.is_none() && s.measured.is_none());
+            assert_eq!(s.failures, 1);
+            assert!(s.retry_at.is_some_and(|t| t > Instant::now()), "the backoff is set");
+        }
+        assert_eq!(
+            probe.found(|| {
+                runs.fetch_add(1, Ordering::SeqCst);
+                Some(all())
+            }),
+            NOTHING,
+            "inside the backoff nothing is probed again"
+        );
+        assert_eq!(runs.load(Ordering::SeqCst), 1);
+        probe.lock().retry_at = Some(Instant::now());
+        assert_eq!(probe.found(|| Some(all())), all());
+    }
+
+    /// A turn dropped without finishing (the measurement panicked past the catch) gives its place up and backs off, and wakes whoever waits.
+    #[test]
+    fn a_turn_that_is_dropped_gives_its_place_up_and_wakes_the_waiters() {
+        let probe = Probe::new();
+        let Entry::Lead(turn) = probe.enter() else {
+            panic!("the first caller leads")
+        };
+        let started = Instant::now();
+        std::thread::scope(|scope| {
+            let waiter = scope.spawn(|| probe.found(|| None));
+            std::thread::sleep(Duration::from_millis(150));
+            drop(turn);
+            assert_eq!(waiter.join().unwrap(), NOTHING);
+        });
+        assert!(started.elapsed() < Duration::from_secs(3), "{:?}", started.elapsed());
+        let s = probe.lock();
+        assert!(s.running.is_none() && s.retry_at.is_some());
+        assert_eq!(s.failures, 1, "the waiter did not measure: one failure, the dropped turn's");
+    }
+
+    /// A waiter is bounded by the measurement's own bound, not by the measurement: one that outlives it (plus the grace) is given "not yet".
+    #[test]
+    fn a_waiter_gives_up_when_the_measurement_outlives_its_bound() {
+        use std::sync::atomic::AtomicUsize;
+        let probe = Probe::new();
+        let runs = AtomicUsize::new(0);
+        probe.lock().running = Some(Instant::now() + Duration::from_millis(200));
+        let started = Instant::now();
+        let got = probe.found(|| {
+            runs.fetch_add(1, Ordering::SeqCst);
+            Some(all())
+        });
+        let took = started.elapsed();
+        assert_eq!(got, NOTHING);
+        assert_eq!(runs.load(Ordering::SeqCst), 0, "a waiter does not measure");
+        assert!(
+            took >= Duration::from_millis(190) && took < Duration::from_secs(3),
+            "{took:?}"
+        );
+        // One whose bound has passed is not waited for at all.
+        probe.lock().running = Some(Instant::now() - GRACE - Duration::from_millis(10));
+        let started = Instant::now();
+        assert_eq!(probe.found(|| Some(all())), NOTHING);
+        assert!(started.elapsed() < Duration::from_millis(100));
     }
 
     #[test]

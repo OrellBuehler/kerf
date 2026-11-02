@@ -7681,7 +7681,7 @@ fn checker_e_a_blended_clip_turned_by_quarter_turns() {
             &mut failures,
         );
     }
-    // Angles a hair off a quarter turn: within `is_quarter_turn`'s tolerance (and the `rotate` fast path's, `FLT_EPSILON` radians) they are drawn
+    // Angles a hair off a quarter turn: within `quarter_turn`'s window (the `rotate` fast path's, `FLT_EPSILON` radians) they are drawn
     // exactly or refused, never drawn wrong.
     for angle in [
         90.000_000_01,
@@ -9315,7 +9315,7 @@ fn checker_e_r3_exotic_matrix_tags_under_a_blend() {
     r3_finish("checker_e_r3_exotic_matrix_tags_under_a_blend", failures, &known);
 }
 
-/// A rotation too large for its angle to mean anything (`is_quarter_turn` of a radian count whose float has no fraction left): the layer must be
+/// A rotation too large for its angle to mean anything (a radian count whose float has no fraction left, past what `quarter_turn` looks at): the layer must be
 /// refused (or drawn as exactly as FFmpeg's `sin` / `cos` of that number turn it), blended and plain.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
@@ -9373,9 +9373,9 @@ fn checker_e_r3_a_huge_rotation_is_refused_or_exact() {
     assert!(failures.is_empty(), "{} cases: {failures:#?}", failures.len());
 }
 
-/// Many whole turns: `is_quarter_turn` calls every multiple of 90 degrees a quarter turn, but `rotate` evaluates its angle in a precision that
-/// stops landing on whole samples a few turns out (FFmpeg's `rotate` of 3690 degrees is not its rotate of 90). A blended layer turned by 3600
-/// degrees (10 turns) or less is drawn exactly; one turned by more is refused or exact.
+/// Many whole turns: `rotate` evaluates its angle in a precision that stops landing on whole samples a few turns out (FFmpeg's `rotate` of
+/// 3690 degrees is not its rotate of 90), so `quarter_turn` accepts only the quarters its integer sine is exact for (-47, -46, -43 to 40, 43, 44).
+/// A blended layer turned by one of those is drawn exactly; one turned by more is refused.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn checker_e_r3_a_blended_clip_turned_by_many_whole_turns() {
@@ -9711,7 +9711,7 @@ fn checker_e_r4_keyed_rotations_that_never_turn_are_drawn_and_the_rest_are_refus
                     amount: 0.0,
                     speed: 1.0,
                     phase: 0.0,
-                }]
+                }];
             }),
             Some(true),
         ),
@@ -9722,7 +9722,7 @@ fn checker_e_r4_keyed_rotations_that_never_turn_are_drawn_and_the_rest_are_refus
                     amount: 5.0,
                     speed: 1.0,
                     phase: 0.0,
-                }]
+                }];
             }),
             Some(false),
         ),

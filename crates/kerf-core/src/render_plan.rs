@@ -904,22 +904,23 @@ fn rotate_int_sin(mut a: i64) -> i64 {
 ///   are not): the error of the series and of `INT_PI` grows with the angle, so no range is claimed past what the arithmetic says, and no
 ///   angle past [`MAX_TURN_RADIANS`] (about 636 quarters), where the conversion to `int` is not defined.
 ///
-/// The answer of FFmpeg 6.1.1 and 9.0.2 for every quarter turn from -1310 to 1310 is this function's (measured on pictures of odd and even
-/// sides, `tests/motion_parity.rs`'s many-turns cases hold the plan to it). An angle must also be within 1e-9 of a quarter to count:
-/// 90.00001 degrees is a rotation like 91 is, whatever the integer arithmetic makes of it.
+/// The answer of FFmpeg 6.1.1 and 9.0.2 for every quarter turn from -1310 to 1310 is this function's (`tests/checker_e_turn.rs`, against the
+/// export's own `rotate` text on pictures of odd and even sides; the many-turns cases of `tests/motion_parity.rs` hold the plan to it). An
+/// angle must also be within `FLT_EPSILON` radians (the filter's own tolerance for its fast path, 1.19e-7) of a multiple of a quarter turn to
+/// count: both paths are exact there, by the arithmetic above, and 90.00001 degrees (1.7e-7 radians off) is a rotation like 91 is, whatever the
+/// integer arithmetic makes of it.
 pub fn quarter_turn(angle: f64) -> Option<u8> {
     use std::f64::consts::{FRAC_PI_2, PI};
     if !angle.is_finite() || angle.abs() > MAX_TURN_RADIANS {
         return None;
     }
-    let quarters = angle / FRAC_PI_2;
-    let nearest = quarters.round();
-    if (quarters - nearest).abs() >= 1e-9 {
+    let flt_epsilon = f64::from(f32::EPSILON);
+    let nearest = (angle / FRAC_PI_2).round();
+    if (angle - nearest * FRAC_PI_2).abs() >= flt_epsilon {
         return None;
     }
     let turn = nearest.rem_euclid(4.0) as u8;
     // The fast path: `fabs(angle - target) < FLT_EPSILON`, for the four targets in [0, 2π) only.
-    let flt_epsilon = f64::from(f32::EPSILON);
     if [0.0, FRAC_PI_2, PI, 3.0 * PI / 2.0]
         .iter()
         .any(|target| (angle - target).abs() < flt_epsilon)
@@ -4355,7 +4356,23 @@ mod tests {
         ] {
             assert_eq!(deg(d), Some(turn), "{d}");
         }
-        // A hair off a quarter (within 1e-9 of one: the fast path's, `FLT_EPSILON` radians) is that quarter; 90.00001 degrees is not one.
+        // A hair off a quarter (within `FLT_EPSILON` radians of one: the fast path's window) is that quarter; 90.00001 degrees is not one.
+        let rad = |q: f64, off: f64| q * std::f64::consts::FRAC_PI_2 + off;
+        for (q, off, turn) in [
+            (1.0, 1e-7, 1),
+            (1.0, -1e-7, 1),
+            (2.0, 1.1e-7, 2),
+            (3.0, -1.1e-7, 3),
+            (0.0, 1e-7, 0),
+            (0.0, -1e-7, 0),
+            (5.0, 1e-7, 1),
+            (-1.0, -1e-7, 3),
+        ] {
+            assert_eq!(quarter_turn(rad(q, off)), Some(turn), "{q} quarters {off:+e} rad");
+        }
+        for (q, off) in [(1.0, 1.3e-7), (1.0, -1.3e-7), (0.0, 2e-7), (2.0, 1e-6), (5.0, 1.745e-7)] {
+            assert_eq!(quarter_turn(rad(q, off)), None, "{q} quarters {off:+e} rad");
+        }
         for (d, turn) in [
             (90.000_000_01, 1),
             (89.999_999_99, 1),
