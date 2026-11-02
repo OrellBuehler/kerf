@@ -3254,16 +3254,17 @@ fn a_moving_zoom_is_placed_as_the_export_places_it() {
         Some(Delivery::new(360, 640, Fit::Cover)),
     );
     run("zoom/cover 9:16", &tl, &assets[1..], 30.0, 1.0, SCALED);
-    // A still image that moves is drawn by FFmpeg in one `perspective` of a copy of the still scaled once
-    // (`StillMotion`), which is not this placement.
+    // A still image that moves is drawn by FFmpeg in one `perspective` of a copy of the still scaled once (`StillMotion`), which is
+    // not this placement but the moving still's own route (`a_moving_still_is_drawn_as_the_export_draws_it`): drawn from the copy
+    // FFmpeg makes.
     let tl = timeline(vec![vec![zooming(&m.image, 1.0, 1.5, (0.0, 0.0))]], None);
-    refused(
+    run(
         "zoom/still image (rgb)",
         &tl,
         std::slice::from_ref(&m.image),
-        &at_fps(30.0),
-        upto(1.0, 30.0),
-        "a still whose picture moves",
+        30.0,
+        1.0,
+        EXACT,
     );
 }
 

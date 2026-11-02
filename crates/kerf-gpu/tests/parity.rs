@@ -8346,6 +8346,10 @@ fn what_a_moving_still_is_not_drawn_for_is_refused() {
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn a_photograph_the_probe_saw_turned_is_not_fitted_to_the_wrong_size() {
+    // (A JPEG is the plan's to refuse where the composite's range is negotiated: the render never sees it.)
+    if policy() != CompositeColorPolicy::FixedBt601 {
+        return;
+    }
     let m = media();
     let (w, h) = (m.exif.streams[0].width.unwrap(), m.exif.streams[0].height.unwrap());
     let tl = timeline(
