@@ -9096,18 +9096,33 @@ fn r3_geometry(tl: &Timeline, assets: &[Asset], fps: f64) -> String {
         })
 }
 
-/// Odd-sided layers that nothing resizes: a 4:4:4, 4:2:2 or gray source cropped to an odd width / height (their native chroma grids do not round
-/// a crop to even), turned by every quarter, opaque and faded, plain and blended. Drawn exactly or refused; the geometry of each is printed so
-/// that a case that is not odd says so.
-#[test]
-#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
-fn checker_e_r3_odd_sided_unscaled_layers_turned_plain_and_blended() {
+/// Whether the compositor's scaler resizes the picture of the last layer at frame 3: a stage whose window is not the size it is scaled to.
+fn r3_resized(tl: &Timeline, assets: &[Asset], fps: f64) -> bool {
+    let opts = at_fps(fps);
+    let Ok(planner) = Planner::new(tl, assets, &opts, PlanRequest::motion(policy())) else {
+        return false;
+    };
+    let Ok(plan) = planner.at_frame(3) else { return false };
+    let size = (plan.canvas.width, plan.canvas.height);
+    plan.layers.last().is_some_and(|l| {
+        plan.layer_geometry(l, size)
+            .is_ok_and(|g| g.stages.iter().any(|s| (s.src.w, s.src.h) != s.scaled))
+    })
+}
+
+/// Odd-sided layers: a 4:4:4, 4:2:2, gray or 4:2:0 source cropped to an odd width / height (their native chroma grids do not round a crop to
+/// even), turned by every quarter, opaque and faded, plain and blended. `resized` selects the cases whose picture the compositor's scaler
+/// resizes (a crop of one column, or both, is fitted back to the frame): those are the scaler's (lane B's), and the plain ones among them are
+/// held to the export by [`checker_e_r3_odd_sided_layers_the_scaler_resizes_plain`], the rest here. The geometry of each is printed so that a
+/// case that is not odd says so.
+fn r3_odd_sided(what: &str, resized: bool) -> (Vec<String>, Vec<String>, usize) {
     use kerf_core::BlendMode;
     let m = media();
     let v = variants();
     let mut failures = Vec::new();
     let mut known = Vec::new();
     let mut tally: Vec<String> = Vec::new();
+    let mut cases = 0;
     for (name, asset) in [
         ("4:4:4", &v.yuv444),
         ("4:2:2", &v.yuv422),
@@ -9139,6 +9154,13 @@ fn checker_e_r3_odd_sided_unscaled_layers_turned_plain_and_blended() {
                         }
                         let tl = timeline(vec![vec![clip(&m.bars, 0.2, 1.0, 0.0)], vec![c]], None);
                         let assets = [m.bars.clone(), asset.clone()];
+                        // (The scaler's cases: a plain layer it resizes. A blended one is refused whatever the scaler draws, and stays here.)
+                        if (resized && (mode.is_some() || !r3_resized(&tl, &assets, 30.0)))
+                            || (!resized && mode.is_none() && r3_resized(&tl, &assets, 30.0))
+                        {
+                            continue;
+                        }
+                        cases += 1;
                         let case = format!(
                             "checker/e/r3/odd crop {name} {:.0},{:.0},{:.0},{:.0} turned {angle} {mode:?} faded {faded}",
                             l * 640.0,
@@ -9157,11 +9179,38 @@ fn checker_e_r3_odd_sided_unscaled_layers_turned_plain_and_blended() {
     for t in &tally {
         eprintln!("TALLY {t}");
     }
+    eprintln!("{what}: {cases} cases");
+    (failures, known, cases)
+}
+
+/// Odd-sided layers that nothing resizes (or that a blend refuses whatever the scaler draws), turned by every quarter, opaque and faded, plain
+/// and blended: drawn exactly or refused. The turn and the blend are judged here; a plain layer the scaler resizes is
+/// [`checker_e_r3_odd_sided_layers_the_scaler_resizes_plain`]'s.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_r3_odd_sided_unscaled_layers_turned_plain_and_blended() {
+    let (failures, known, cases) = r3_odd_sided("not resized", false);
+    assert!(cases > 100, "{cases} cases");
     r3_finish(
         "checker_e_r3_odd_sided_unscaled_layers_turned_plain_and_blended",
         failures,
         &known,
     );
+}
+
+/// The plain odd-sided layers the compositor's scaler resizes (a crop of a column or a row fitted back to the frame), turned by every quarter
+/// (and not at all): the scaler draws them a level off the export in luma and chroma, turned or not (the same count at 0 and 180 degrees), so they
+/// fail here until the scaler's lane makes them exact or refuses them (`FormatResize`). Held to the export to the sample: nothing is relaxed, the
+/// test is kept out of the run until that lane has merged.
+#[test]
+#[ignore = "needs lane B's FormatResize refusal (the scaler's cases), and ffmpeg and a GPU adapter"]
+fn checker_e_r3_odd_sided_layers_the_scaler_resizes_plain() {
+    let (failures, known, cases) = r3_odd_sided("resized, plain", true);
+    assert!(cases > 40, "{cases} cases");
+    for k in &known {
+        eprintln!("KNOWN {k}");
+    }
+    assert!(failures.is_empty(), "{} cases: {failures:#?}", failures.len());
 }
 
 /// A clip tagged as its colour matrix, if this FFmpeg will write that tag (`None` when it will not): `tag` is `setparams`' name for it,
@@ -9395,4 +9444,525 @@ fn checker_e_r3_a_keyed_opacity_edge_on_each_quarter() {
         }
     }
     r3_finish("checker_e_r3_a_keyed_opacity_edge_on_each_quarter", failures, &known);
+}
+
+// ---- checker/e/r4: the turns around the edges of the exact set, keyed turns and turns that stay put ---------------------
+
+/// One case of this family: every frame the plan lets through is the export's to the sample, and `draws` says whether all of them must be drawn
+/// (`Some(true)`), none (`Some(false)`) or either. A frame the plan refuses is drawn anyway when the compositor will (its own guards stand), and
+/// one that comes out exact is a refusal wider than it has to be: `wider` collects them.
+#[allow(clippy::too_many_arguments)]
+fn r4_case(
+    case: &str,
+    tl: &Timeline,
+    assets: &[Asset],
+    frames: Range<u64>,
+    draws: Option<bool>,
+    failures: &mut Vec<String>,
+    wider: &mut Vec<String>,
+    drawn_anyway: &mut Vec<String>,
+) -> CeScan {
+    let scan = ce_scan(case, tl, assets, &at_fps(30.0), frames.clone(), false);
+    eprintln!("{}", scan.line(case));
+    CE_DRAWN.with(|d| d.set(d.get() + scan.drawn));
+    if let Some(why) = scan.verdict(draws) {
+        failures.push(format!("{case}: {why}"));
+    }
+    if scan.drawn < scan.frames {
+        let name = format!("{case} (drawn anyway)");
+        let anyway = ce_scan(&name, tl, assets, &at_fps(30.0), frames, true);
+        eprintln!("anyway: {}", anyway.line(&name));
+        drawn_anyway.push(format!(
+            "{case}: anyway drawn {} of {}, guards {}, Y {} UV {} differ",
+            anyway.drawn,
+            anyway.frames,
+            anyway.guards.values().sum::<usize>(),
+            anyway.y.differing,
+            anyway.uv.differing
+        ));
+        if anyway.drawn > scan.drawn && anyway.exact() {
+            wider.push(format!("{case}: refused and drawn exactly anyway ({} frames)", anyway.drawn));
+        }
+    }
+    scan
+}
+
+fn r4_finish(what: &str, failures: Vec<String>, wider: &[String], drawn_anyway: &[String], need_drawn: bool) {
+    for w in wider {
+        eprintln!("WIDER {w}");
+    }
+    for d in drawn_anyway {
+        eprintln!("ANYWAY {d}");
+    }
+    let mut failures = failures;
+    if need_drawn {
+        ce_expect_drawn(what, &mut failures);
+    }
+    assert!(failures.is_empty(), "{} cases: {failures:#?}", failures.len());
+}
+
+/// The quarters at either edge of the exact set (`-47, -46, -43..=40, 43, 44`) and far outside it, a picture of even sides, one with an odd
+/// width (a column cropped off, unscaled: its chroma tail reaches past the turned box) and the same blended: the exact ones are drawn on every
+/// frame to the sample and the others are not drawn at all.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_r4_the_quarters_around_the_edges_of_the_exact_set_are_drawn_or_refused() {
+    use kerf_core::BlendMode;
+    let m = media();
+    let assets = [m.bars.clone(), m.testsrc.clone()];
+    let exact = |q: i32| (-47..=-46).contains(&q) || (-43..=40).contains(&q) || (43..=44).contains(&q);
+    let (mut failures, mut wider, mut anyway) = (Vec::new(), Vec::new(), Vec::new());
+    let quarters = [
+        -49, -48, -47, -46, -45, -44, -43, -42, -41, -40, -39, -5, -1, 1, 2, 3, 4, 5, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47,
+        48, 52, 60, 100, 301, 636, 637, 640, 800,
+    ];
+    for q in quarters {
+        for (what, odd, mode) in [
+            ("even", false, None),
+            ("odd", true, None),
+            ("odd blended", true, Some(BlendMode::Multiply)),
+        ] {
+            let mut c = clip(&m.testsrc, 0.2, 1.0, 0.0);
+            if odd {
+                c.transform.crop_right = 1.0 / 640.0;
+            }
+            if let Some(mode) = mode {
+                c.blend_mode = mode;
+            }
+            c.transform.rotation = f64::from(q) * 90.0;
+            let tl = timeline(vec![vec![clip(&m.bars, 0.2, 1.0, 0.0)], vec![c]], None);
+            r4_case(
+                &format!("checker/e/r4/quarter {q} {what}"),
+                &tl,
+                &assets,
+                0..4,
+                Some(exact(q)),
+                &mut failures,
+                &mut wider,
+                &mut anyway,
+            );
+        }
+    }
+    r4_finish(
+        "checker_e_r4_the_quarters_around_the_edges_of_the_exact_set",
+        failures,
+        &wider,
+        &anyway,
+        true,
+    );
+}
+
+/// Angles a hair off a quarter (degrees, so that the plan's `to_radians` and the compositor's angle are the very numbers the export prints):
+/// the layer is drawn on every frame exactly when `quarter_turn` of the same number says it is, and then to the sample.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_r4_a_hair_off_a_quarter_is_drawn_exactly_or_refused() {
+    let m = media();
+    let assets = [m.bars.clone(), m.testsrc.clone()];
+    let (mut failures, mut wider, mut anyway) = (Vec::new(), Vec::new(), Vec::new());
+    let mut accepted = 0;
+    for degrees in [
+        90.0 + 1e-10,
+        90.0 - 1e-10,
+        90.0 + 1e-8,
+        90.0 - 1e-8,
+        90.000_000_1,
+        90.000_01,
+        89.999_99,
+        180.0 + 5e-11,
+        180.0 - 5e-11,
+        270.0 - 1e-10,
+        -90.0 + 1e-10,
+        360.0 + 1e-10,
+        1e-12,
+        -1e-12,
+        1e-9,
+        1e-7,
+        1e-5,
+        1e-3,
+        1e-300,
+        5e-324,
+        0.01,
+        450.0 + 1e-10,
+        3600.0 - 1e-10,
+        3690.0,
+        89.5,
+        90.5,
+    ] {
+        let want = kerf_core::quarter_turn(f64::to_radians(degrees)).is_some();
+        accepted += usize::from(want);
+        let mut c = clip(&m.testsrc, 0.2, 1.0, 0.0);
+        c.transform.rotation = degrees;
+        let tl = timeline(vec![vec![clip(&m.bars, 0.2, 1.0, 0.0)], vec![c]], None);
+        r4_case(
+            &format!("checker/e/r4/hair {degrees:e} degrees"),
+            &tl,
+            &assets,
+            0..4,
+            Some(want),
+            &mut failures,
+            &mut wider,
+            &mut anyway,
+        );
+    }
+    assert!(accepted >= 8, "{accepted} accepted: the hairs inside the window are drawn");
+    r4_finish("checker_e_r4_a_hair_off_a_quarter", failures, &wider, &anyway, true);
+}
+
+/// A rotation that is keyed or driven. The graph of a clip whose rotation keys never leave 0 has no `rotate` in it at all (drawn, and what a
+/// static rotation beside them says does not turn it); any key off 0 or a live behaviour puts a `rotate` in a box of its own (`hypot(iw,ih)`)
+/// with a per-frame angle: refused, whether the keys pass through a quarter, sit on one, or turn the picture by a hair, plain and blended.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_r4_keyed_rotations_that_never_turn_are_drawn_and_the_rest_are_refused() {
+    use kerf_core::{Behavior, BlendMode, Property, PropertyKey};
+    let m = media();
+    let assets = [m.bars.clone(), m.testsrc.clone()];
+    let (mut failures, mut wider, mut anyway) = (Vec::new(), Vec::new(), Vec::new());
+    let keys = |a: f64, b: f64| vec![PropertyKey::new(0.0, a), PropertyKey::new(0.5, b)];
+    type Edit<'a> = Box<dyn Fn(&mut Clip) + 'a>;
+    let cases: Vec<(&str, Edit<'_>, Option<bool>)> = vec![
+        (
+            "keys 0 to 0",
+            Box::new(|c: &mut Clip| c.set_property_keys(Property::Rotation, keys(0.0, 0.0))),
+            Some(true),
+        ),
+        (
+            "keys 0 to 0 over a static 90",
+            Box::new(|c: &mut Clip| {
+                c.transform.rotation = 90.0;
+                c.set_property_keys(Property::Rotation, keys(0.0, 0.0));
+            }),
+            None,
+        ),
+        (
+            "keys 0 to 0 over a static 12",
+            Box::new(|c: &mut Clip| {
+                c.transform.rotation = 12.0;
+                c.set_property_keys(Property::Rotation, keys(0.0, 0.0));
+            }),
+            None,
+        ),
+        (
+            "a single key at 0",
+            Box::new(|c: &mut Clip| c.set_property_keys(Property::Rotation, vec![PropertyKey::new(0.2, 0.0)])),
+            Some(true),
+        ),
+        (
+            "keys 90 to 90",
+            Box::new(|c: &mut Clip| c.set_property_keys(Property::Rotation, keys(90.0, 90.0))),
+            Some(false),
+        ),
+        (
+            "keys 360 to 360",
+            Box::new(|c: &mut Clip| c.set_property_keys(Property::Rotation, keys(360.0, 360.0))),
+            Some(false),
+        ),
+        (
+            "a single key at 90",
+            Box::new(|c: &mut Clip| c.set_property_keys(Property::Rotation, vec![PropertyKey::new(0.2, 90.0)])),
+            Some(false),
+        ),
+        (
+            "keys 0 to 90",
+            Box::new(|c: &mut Clip| c.set_property_keys(Property::Rotation, keys(0.0, 90.0))),
+            Some(false),
+        ),
+        (
+            "keys -90 to 90",
+            Box::new(|c: &mut Clip| c.set_property_keys(Property::Rotation, keys(-90.0, 90.0))),
+            Some(false),
+        ),
+        (
+            "keys 0 to 180",
+            Box::new(|c: &mut Clip| c.set_property_keys(Property::Rotation, keys(0.0, 180.0))),
+            Some(false),
+        ),
+        (
+            "keys 0 to 1e-9",
+            Box::new(|c: &mut Clip| c.set_property_keys(Property::Rotation, keys(0.0, 1e-9))),
+            Some(false),
+        ),
+        (
+            "keys 0 to 0 with an opacity key",
+            Box::new(|c: &mut Clip| {
+                c.set_property_keys(Property::Rotation, keys(0.0, 0.0));
+                c.set_property_keys(Property::Opacity, keys(1.0, 0.4));
+            }),
+            None,
+        ),
+        (
+            "a live spin",
+            Box::new(|c: &mut Clip| c.behaviors = vec![Behavior::Spin { speed: 0.4, phase: 0.0 }]),
+            Some(false),
+        ),
+        (
+            "a spin of no speed over a static 90",
+            Box::new(|c: &mut Clip| {
+                c.transform.rotation = 90.0;
+                c.behaviors = vec![Behavior::Spin { speed: 0.0, phase: 0.0 }];
+            }),
+            Some(true),
+        ),
+        (
+            "a sway of no amount",
+            Box::new(|c: &mut Clip| {
+                c.behaviors = vec![Behavior::Sway {
+                    amount: 0.0,
+                    speed: 1.0,
+                    phase: 0.0,
+                }]
+            }),
+            Some(true),
+        ),
+        (
+            "a live sway",
+            Box::new(|c: &mut Clip| {
+                c.behaviors = vec![Behavior::Sway {
+                    amount: 5.0,
+                    speed: 1.0,
+                    phase: 0.0,
+                }]
+            }),
+            Some(false),
+        ),
+    ];
+    for (name, edit, draws) in &cases {
+        for mode in [None, Some(BlendMode::Multiply)] {
+            let mut c = clip(&m.testsrc, 0.2, 1.0, 0.0);
+            edit(&mut c);
+            if let Some(mode) = mode {
+                c.blend_mode = mode;
+            }
+            let tl = timeline(vec![vec![clip(&m.bars, 0.2, 1.0, 0.0)], vec![c]], None);
+            r4_case(
+                &format!("checker/e/r4/keyed {name} {mode:?}"),
+                &tl,
+                &assets,
+                0..24,
+                *draws,
+                &mut failures,
+                &mut wider,
+                &mut anyway,
+            );
+        }
+    }
+    r4_finish(
+        "checker_e_r4_keyed_rotations_that_never_turn_are_drawn_and_the_rest_are_refused",
+        failures,
+        &wider,
+        &anyway,
+        true,
+    );
+}
+
+/// A still is judged elsewhere by a PNG's RGB (PSNR, an edge band: `tests/parity.rs`), which no bound there makes exact. A cut whose pictures
+/// hold still for the frames looked at is the same picture in a still and in an export, so the compositor's frame for the still's plan has to be
+/// the export's frame to the sample: a quarter turn (even and odd sides, plain and blended) is drawn exactly, and any other turn is refused.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_r4_a_still_of_a_turned_layer_is_the_exports_frame_to_the_sample() {
+    use kerf_core::{BlendMode, RenderPlan};
+    let m = media();
+    let assets = [m.bars.clone(), m.testsrc.clone()];
+    let opts = at_fps(30.0);
+    let mut failures: Vec<String> = Vec::new();
+    let (mut drawn, mut refused) = (0, 0);
+    for angle in [90.0, 180.0, 270.0, -90.0, 450.0, 12.0, 91.0] {
+        for (what, odd, mode) in [
+            ("even", false, None),
+            ("odd", true, None),
+            ("odd blended", true, Some(BlendMode::Multiply)),
+            ("blended", false, Some(BlendMode::Screen)),
+        ] {
+            let mut c = clip(&m.testsrc, 0.2, 1.0, 0.0);
+            if odd {
+                c.transform.crop_right = 1.0 / 640.0;
+            }
+            if let Some(mode) = mode {
+                c.blend_mode = mode;
+            }
+            c.transform.rotation = angle;
+            let tl = timeline(vec![vec![clip(&m.bars, 0.2, 1.0, 0.0)], vec![c]], None);
+            let case = format!("checker/e/r4/still turned {angle} {what}");
+            let slug: String = case
+                .chars()
+                .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+                .collect();
+            let played = export(&slug, &tl, &assets, &opts);
+            for k in [2u64, 9] {
+                let t = k as f64 / 30.0 - 1e-4;
+                let plan = RenderPlan::at(&tl, &assets, &opts, t, policy()).expect("still plan");
+                let size = plan.size(u32::MAX);
+                assert_eq!(size, (played.w as u32, played.h as u32), "{case}");
+                let why = plan.reasons(&compositor().caps(), size);
+                let quarter = kerf_core::quarter_turn(angle.to_radians()).is_some();
+                if !why.is_empty() {
+                    refused += 1;
+                    eprintln!("{case} @ frame {k}: refused: {}", why[0]);
+                    if quarter {
+                        failures.push(format!("{case} @ frame {k}: a quarter turn is refused: {why:?}"));
+                    }
+                    continue;
+                }
+                if !quarter {
+                    failures.push(format!("{case} @ frame {k}: a turn that is not a quarter is drawn"));
+                }
+                let frames = kerf_gpu::decode_layers(&plan.layers).expect("decode");
+                let got = compositor().composite_yuv(&plan, &frames, size).expect("composite");
+                drawn += 1;
+                let want = played.planes(k as usize);
+                let got = planes_of(&got);
+                let stats: Vec<PlaneStats> = (0..3).map(|p| PlaneStats::of(want[p], got[p])).collect();
+                eprintln!(
+                    "{case} @ frame {k}: drawn, Y {} U {} V {} differ",
+                    stats[0].differing, stats[1].differing, stats[2].differing
+                );
+                if stats.iter().any(|s| s.differing > 0) {
+                    failures.push(format!(
+                        "{case} @ frame {k}: Y {} (max {}) U {} (max {}) V {} (max {}) differ",
+                        stats[0].differing, stats[0].max, stats[1].differing, stats[1].max, stats[2].differing, stats[2].max
+                    ));
+                }
+            }
+        }
+    }
+    eprintln!("{drawn} still frames drawn and held to the export, {refused} refused");
+    assert!(drawn >= 40, "{drawn} frames drawn");
+    assert!(failures.is_empty(), "{} cases: {failures:#?}", failures.len());
+}
+
+/// An odd-sided box turned by a quarter reaches one chroma sample past itself like any odd layer: `overlay` blends whole chroma blocks, so the
+/// last block of a 639-wide or 359-high layer carries its chroma onto the base's luma beyond the box (the layer is a picture like another once it
+/// is turned by a quarter). A column or a row cropped off (the picture is then fitted back unscaled), turned by every quarter, moved by an odd
+/// offset, plain and blended, 4:2:0 and gray, held to the export to the sample.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_r4_an_odd_box_turned_by_a_quarter_carries_the_overlays_chroma_tail() {
+    use kerf_core::BlendMode;
+    let m = media();
+    let v = variants();
+    let (mut failures, mut wider, mut anyway) = (Vec::new(), Vec::new(), Vec::new());
+    for (name, asset) in [("4:2:0", &m.testsrc), ("noise", &m.noise), ("gray", &v.gray)] {
+        for (crop, (r, b)) in [
+            ("a column", (1.0 / 640.0, 0.0)),
+            ("a row", (0.0, 1.0 / 360.0)),
+            ("both", (1.0 / 640.0, 1.0 / 360.0)),
+        ] {
+            for angle in [90.0, 180.0, 270.0, -90.0] {
+                for (mode, at) in [
+                    (None, (0.0, 0.0)),
+                    (Some(BlendMode::Multiply), (0.0123, -0.0171)),
+                    (Some(BlendMode::Add), (0.0, 0.0)),
+                ] {
+                    let mut c = clip(asset, 0.2, 1.0, 0.0);
+                    c.transform.crop_right = r;
+                    c.transform.crop_bottom = b;
+                    c.transform.rotation = angle;
+                    c.transform.pos_x = at.0;
+                    c.transform.pos_y = at.1;
+                    if let Some(mode) = mode {
+                        c.blend_mode = mode;
+                    }
+                    let assets = [m.bars.clone(), asset.clone()];
+                    let tl = timeline(vec![vec![clip(&m.bars, 0.2, 1.0, 0.0)], vec![c]], None);
+                    // (Cropping both a column and a row fits the picture back with the scaler: not drawn exactly plain, and refused blended.)
+                    let scaled = r3_resized(&tl, &assets, 30.0);
+                    let draws = if scaled && mode.is_none() { None } else { Some(!scaled) };
+                    let case = format!("checker/e/r4/odd tail {name} cropped {crop} turned {angle} {mode:?} at {at:?}");
+                    if scaled && mode.is_none() {
+                        continue;
+                    }
+                    r4_case(&case, &tl, &assets, 0..4, draws, &mut failures, &mut wider, &mut anyway);
+                }
+            }
+        }
+    }
+    r4_finish(
+        "checker_e_r4_an_odd_box_turned_by_a_quarter_carries_the_overlays_chroma_tail",
+        failures,
+        &wider,
+        &anyway,
+        true,
+    );
+}
+
+/// Refusal necessity of the matrix allow-list: a blend over a clip or a bottom layer stating a tag no table is proven for (`bt2020c`, `ycgco`,
+/// `ictcp`, `chroma-derived-*`, `smpte2085`, `gbr`) is refused. Where this FFmpeg can export the cut at all, its planes are compared with the same
+/// cut untagged (the control, which the compositor does draw exactly): equal planes would make the refusal wider than it has to be on this build.
+/// Printed (`WIDER` / `NECESSARY` / `NO EXPORT`), never judged: the allow-list is the contract, this is its price.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_r4_what_the_matrix_allow_list_costs() {
+    use kerf_core::BlendMode;
+    let opts = at_fps(30.0);
+    let source = |name: &str| {
+        if name == "bars" {
+            "smptehdbars=size=640x360:rate=30:duration=4"
+        } else {
+            "testsrc2=size=640x360:rate=30:duration=4"
+        }
+    };
+    let control = |name: &str| r3_try_tagged(name, ("unknown", "unknown"), source(name)).expect("an untagged ffv1 control");
+    let (bars_u, top_u) = (control("bars"), control("testsrc"));
+    let (mut necessary, mut wider, mut none) = (0, 0, 0);
+    for tag in [
+        "bt2020c",
+        "ycgco",
+        "ictcp",
+        "chroma-derived-nc",
+        "chroma-derived-c",
+        "smpte2085",
+        "gbr",
+    ] {
+        let enc = if tag == "gbr" { "rgb" } else { tag };
+        let (Some(bars_t), Some(top_t)) = (
+            r3_try_tagged("bars", (tag, enc), source("bars")),
+            r3_try_tagged("testsrc", (tag, enc), source("testsrc")),
+        ) else {
+            eprintln!("NO WRITE {tag}: this FFmpeg will not write the tag");
+            continue;
+        };
+        for mode in [BlendMode::Multiply, BlendMode::Add] {
+            for (what, bottom, top, cb, ct) in [
+                ("bottom", &bars_t, &top_u, &bars_u, &top_u),
+                ("top", &bars_u, &top_t, &bars_u, &top_u),
+                ("both", &bars_t, &top_t, &bars_u, &top_u),
+            ] {
+                let make = |b: &Asset, t: &Asset| {
+                    let mut c = clip(t, 0.5, 1.5, 0.0);
+                    c.blend_mode = mode;
+                    (
+                        timeline(vec![vec![clip(b, 0.5, 1.5, 0.0)], vec![c]], None),
+                        [b.clone(), t.clone()],
+                    )
+                };
+                let (tl_t, as_t) = make(bottom, top);
+                let (tl_c, as_c) = make(cb, ct);
+                let case = format!("{mode:?} {tag} {what}");
+                let tagged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    export(&format!("r4_tag_t_{mode:?}_{tag}_{what}"), &tl_t, &as_t, &opts)
+                }));
+                let Ok(tagged) = tagged else {
+                    none += 1;
+                    eprintln!("NO EXPORT {case}: FFmpeg cannot export the tagged cut");
+                    continue;
+                };
+                let plain = export(&format!("r4_tag_c_{mode:?}_{tag}_{what}"), &tl_c, &as_c, &opts);
+                let frames = tagged.count().min(plain.count()).min(12);
+                let equal = (0..frames).all(|k| tagged.planes(k) == plain.planes(k));
+                if equal {
+                    wider += 1;
+                } else {
+                    necessary += 1;
+                }
+                eprintln!(
+                    "{} {case}: the tagged cut's export is {} the untagged control's over {frames} frames",
+                    if equal { "WIDER" } else { "NECESSARY" },
+                    if equal { "equal to" } else { "not equal to" },
+                );
+            }
+        }
+    }
+    eprintln!("allow-list cost: {necessary} cut(s) where the refusal is necessary, {wider} where this FFmpeg draws it as the control, {none} FFmpeg cannot export");
 }
