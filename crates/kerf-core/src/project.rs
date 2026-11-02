@@ -5621,7 +5621,7 @@ impl Project {
                     .push((PathBuf::from(name), "this project's own file".to_string()));
             }
         }
-        if let Some(cache) = dirs::cache_dir() {
+        if let Some(cache) = crate::paths::cache_dir() {
             protected.dirs.push((
                 cache.join("kerf"),
                 "Kerf's cache of proxies, waveforms and generated media".to_string(),

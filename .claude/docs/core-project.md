@@ -990,6 +990,37 @@
   lane) plus `engine::proxy_fidelity` — an MP4 / MOV / Matroska source for times, also SDR
   YCbCr (not RGB) for scene scores (`engine-cli.md` has the exact gate and the measured limits). A proxy that fails to read falls
   back to the original. Smart crop's `salience_map` is not swapped.
+- `cache_cap.rs` — an **opt-in** ceiling on the regenerable disk caches, for a hosted headless server
+  (`kerf-app --headless --cache-max-gb N` / `KERF_CACHE_MAX_GB`; nothing else starts it, so the desktop app,
+  settings and stored shape are untouched). **Where caches live:** every one is under `paths::cache_dir()/kerf`
+  — the OS cache dir unless `paths::set_cache_dir` (headless `--cache-dir` / `KERF_CACHE_DIR`) moved it, set once
+  before anything reads it; never call `dirs::cache_dir()` directly. **Inventory** (`<cache>/kerf/…`):
+  *pruned by the cap* — `proxies/` (`<hash>.mp4` / `.lead.mp4` + `.json` sidecar = one unit), `waveforms/`,
+  `filmstrips/<hash>/`, `stems/<hash>/`, `music/`; *never pruned* — `models/`, `soundfonts/`, `runtime/`
+  (downloads, dear to fetch again), `stitched/` (a stitched 360 file **is** the asset's source, not a cache of it;
+  unbounded and outside the cap, budget for it), and the ones that bound themselves: `luts/` (30 days, 256 MB),
+  `sfx-preview/` (32 files), `stabilize/` (by age; small), `fonts/`, `svg/<pid>/` (`KERF_SVG_CACHE_MB`, stale pids
+  swept), `segments/<pid>-n/` (swept when the pid is gone). Not caches and never touched: the data dir's
+  `sfx/`, `voiceovers/`, `music/` (the only copy), recovery files, logs (14 daily files).
+  **The plan is pure** (`prune_plan(entries, cap)`): `CacheEntry` = one unit (`paths`, `bytes`, `used`, `Class`);
+  only `Stale` (a `.part` older than 24 h, a crashed write's) and `Evictable` units go, stale first and then
+  least recently used (`used` = later of modified / accessed; **`noatime` degrades it to write order**), ties by
+  path, only until `total <= cap`, never a zero-byte unit. `classify` makes `InUse` (the open project's assets),
+  `InFlight` (a `.part` / `.part.` name, or anything touched in the last 10 min — catches a stems folder between
+  two of its files) and `Evictable`; `Plan::after` stays over the cap when the kept part alone is over it (logged
+  as a warning, nothing else is removed). Bytes are apparent sizes (`len`), links are not followed.
+  **In use** is `InUse::of(&assets)` → `engine::asset_cache_files(asset)`: the names of the asset's proxy (all four
+  spellings — tone-mapped × head-padded — and sidecars, `cli::proxy_cache_files`), waveform, music analysis,
+  stems folder and filmstrip, each a hash of `source_key(original)`: one stat, **no ffprobe**, so no probe runs on
+  a share that went away's behalf more than the stat. **Locks:** `start(cap, assets)` takes a closure that reads
+  the assets under the project lock and returns; the stats, the plan and the deletes happen after, on the
+  `kerf-cache-cap` thread (`cpu::lower_current_thread`, nice 10). It runs at once, every 10 min, and 20 s after a
+  `nudge()` (called when a proxy build or an analysis finishes; a no-op without a pruner). **A removed proxy**
+  reads `missing` (`ready_proxy` is an existence check, so `status` never claims it), previews fall back to the
+  original, `remove` bumps `plan_epoch` so a plan made around it is remade, and `queue_auto` rebuilds it at the next
+  open or import (when proxies are on); the open project's are never removed, so a running preview does not lose its file. Tests: the
+  plan (cap, order, exclusions, in-flight, stale, ties), `classify`, a scan and a run on a temp dir (sidecars with
+  their proxy, models and `stitched/` kept, links not followed), `tests/headless.rs` end to end.
 - `error.rs` — `Error`/`Result`; the `Ffmpeg(#[from] ffmpeg_next::Error)` variant is
   itself `#[cfg(feature = "ffmpeg")]`.
 - **Thumbnails** (`project/thumbnails.rs`; the model is `core-model.md`, the drawing `engine-cli.md`). The template shape:

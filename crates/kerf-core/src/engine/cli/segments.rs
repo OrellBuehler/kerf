@@ -691,7 +691,7 @@ impl PartsDir {
         let root = root
             .map(Path::to_path_buf)
             .or_else(|| std::env::var_os("KERF_SEGMENT_DIR").map(PathBuf::from))
-            .or_else(|| dirs::cache_dir().map(|d| d.join("kerf").join("segments")))
+            .or_else(|| crate::paths::cache_dir().map(|d| d.join("kerf").join("segments")))
             .unwrap_or_else(|| std::env::temp_dir().join("kerf-segments"));
         prune_stale(&root, std::process::id());
         let dir = root.join(format!("{}-{seq}", std::process::id()));

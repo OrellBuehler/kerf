@@ -31,7 +31,9 @@
   file that is short, long, the wrong version, inconsistent with its own frame count
   or has a bucket whose min exceeds its max is recomputed, never trusted — and the
   size is checked before anything is allocated. Loaded pyramids sit in a
-  byte-bounded in-process LRU (64 MB) so scrolling does not re-read the cache file.
+  byte-bounded in-process LRU (64 MB) so scrolling does not re-read the cache file. On disk the waveform, filmstrip, stems and
+  music caches have no bound of their own; a capped headless run prunes them least recently used first (`cache_cap.rs`,
+  inventory and rules in `core-project.md`), so a missing cache file is always just a miss.
   `Project::waveform_range` / the lock-free `Project::decode_waveform_range` are the
   op (an asset with no audio stream is `InvalidArgument`), exposed as the
   `get_waveform_range` Tauri command and MCP tool; the MCP `get_waveform` / `get_energy` stay (the GUI draws from the

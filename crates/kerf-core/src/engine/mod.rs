@@ -55,6 +55,10 @@ pub use filmstrip::{filmstrip_for, Filmstrip, FilmstripSheet, FILMSTRIP_HEIGHT, 
 #[cfg(test)]
 pub(crate) mod test_support;
 
+// Which cache files an asset's work lives in, for the cache cap to leave alone.
+mod cache_files;
+pub(crate) use cache_files::asset_cache_files;
+
 // How much of the machine the engine may take: the one-heavy-job-at-a-time gate
 // and the thread / priority caps every ffmpeg run is launched under.
 pub mod cpu;

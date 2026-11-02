@@ -59,7 +59,7 @@ const STEMS_VERSION: u32 = 1;
 // ---- provisioning ------------------------------------------------------------------
 
 fn model_path() -> Option<PathBuf> {
-    Some(dirs::cache_dir()?.join("kerf").join("models").join(MODEL_FILE))
+    Some(crate::paths::cache_dir()?.join("kerf").join("models").join(MODEL_FILE))
 }
 
 fn model_url() -> String {
@@ -111,10 +111,10 @@ pub fn status() -> StemsStatus {
 
 /// Where `src`'s stems are cached: `<cache>/kerf/stems/<hash>/`, keyed by the file's
 /// identity like the waveform cache.
-fn stems_dir(src: &Path) -> Option<PathBuf> {
+pub(super) fn stems_dir(src: &Path) -> Option<PathBuf> {
     let key = format!("{}|stems-v{STEMS_VERSION}", source_key(src));
     Some(
-        dirs::cache_dir()?
+        crate::paths::cache_dir()?
             .join("kerf")
             .join("stems")
             .join(format!("{:016x}", fnv1a(&key))),

@@ -536,7 +536,7 @@ fn decode(bytes: &[u8]) -> Option<WaveformPyramid> {
 /// `<cache>/kerf/waveforms/<hash>.bin`. `None` when the OS has no cache
 /// directory, in which case the pyramid is only memoized in process.
 pub fn cache_path(src: &Path) -> Option<PathBuf> {
-    let dir = dirs::cache_dir()?.join("kerf").join("waveforms");
+    let dir = crate::paths::cache_dir()?.join("kerf").join("waveforms");
     let key = format!("{}|waveform-v{CACHE_VERSION}", source_key(src));
     Some(dir.join(format!("{:016x}.bin", fnv1a(&key))))
 }

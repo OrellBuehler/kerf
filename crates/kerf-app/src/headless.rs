@@ -22,6 +22,9 @@ use crate::{lock_user, mcp, recovery, settings, AppState, LaunchSlot};
 
 /// The environment variable a headless run takes its token from (this run only, never stored).
 const ENV_TOKEN: &str = "KERF_MCP_TOKEN";
+/// ... its cache ceiling in GiB (`--cache-max-gb`), and the directory its caches live under (`--cache-dir`).
+const ENV_CACHE_MAX_GB: &str = "KERF_CACHE_MAX_GB";
+const ENV_CACHE_DIR: &str = "KERF_CACHE_DIR";
 
 const EXIT_FAILURE: i32 = 1;
 const EXIT_USAGE: i32 = 2;
@@ -47,6 +50,12 @@ logs go to stderr. Stops on SIGINT / SIGTERM.
   --review                 stage the agent's edits for review (default: they land live)
   --proxies                build preview proxies (default: off)
   --cpu-percent N          share of the machine one heavy job may take, this run only
+  --cache-dir DIR          keep the caches (proxies, waveforms, models, ...) in DIR/kerf instead of the
+                           system's cache directory (KERF_CACHE_DIR)
+  --cache-max-gb N         keep the regenerable caches (proxies, waveforms, filmstrips, stems) under N GiB:
+                           pruned at start and every 10 minutes, least recently used first; what the open
+                           project uses, what is being written and the downloaded models are never removed
+                           (KERF_CACHE_MAX_GB; default: no limit)
 
 The token is KERF_MCP_TOKEN when set (this run only, never stored), else the one in the settings.
 
@@ -71,6 +80,8 @@ struct Args {
     review: bool,
     proxies: bool,
     cpu_percent: Option<u8>,
+    cache_dir: Option<PathBuf>,
+    cache_max_bytes: Option<u64>,
     help: bool,
 }
 
@@ -96,6 +107,30 @@ fn kerf_path(path: &str, cwd: &Path) -> Result<PathBuf, String> {
         ));
     }
     Ok(path)
+}
+
+/// A ceiling given in GiB (`--cache-max-gb`, `KERF_CACHE_MAX_GB`) as bytes: a number above 0.
+fn parse_cache_max(text: &str) -> Result<u64, String> {
+    let gib = text.trim().parse::<f64>().ok().filter(|g| g.is_finite() && *g > 0.0);
+    match gib {
+        Some(gib) => Ok(((gib * kerf_core::cache_cap::GIB as f64).round() as u64).max(1)),
+        None => Err(format!("takes a number of GiB above 0, not {text:?}")),
+    }
+}
+
+/// What the environment adds to a headless command line: the cache directory and ceiling, each
+/// only when its flag was not given. `get` reads a variable (blank is unset).
+fn cache_from_env(args: &mut Args, cwd: &Path, get: impl Fn(&str) -> Option<String>) -> Result<(), String> {
+    let var = |name: &str| get(name).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    if args.cache_dir.is_none() {
+        args.cache_dir = var(ENV_CACHE_DIR).map(|dir| absolute(&dir, cwd));
+    }
+    if args.cache_max_bytes.is_none() {
+        if let Some(text) = var(ENV_CACHE_MAX_GB) {
+            args.cache_max_bytes = Some(parse_cache_max(&text).map_err(|e| format!("{ENV_CACHE_MAX_GB} {e}"))?);
+        }
+    }
+    Ok(())
 }
 
 /// The command line of a headless run (`None` when it is not one), relative paths against `cwd`.
@@ -152,6 +187,11 @@ fn parse(argv: &[String], cwd: &Path) -> Result<Option<Args>, String> {
             }
             "--data-dir" => args.data_dir = Some(absolute(&value()?, cwd)),
             "--token-file" => args.token_file = Some(absolute(&value()?, cwd)),
+            "--cache-dir" => args.cache_dir = Some(absolute(&value()?, cwd)),
+            "--cache-max-gb" => {
+                let bytes = parse_cache_max(&value()?).map_err(|e| format!("--cache-max-gb {e}"))?;
+                args.cache_max_bytes = Some(bytes);
+            }
             "--cpu-percent" => {
                 let range = kerf_core::MIN_CPU_PERCENT..=100;
                 let percent = value()?
@@ -193,7 +233,7 @@ fn say(line: &str) {
 /// Run headless with `argv` until a signal; the exit code.
 pub(crate) fn main(argv: &[String], bundled_ffmpeg: &[(&'static str, PathBuf)]) -> i32 {
     let cwd = std::env::current_dir().unwrap_or_default();
-    let args = match parse(argv, &cwd) {
+    let mut args = match parse(argv, &cwd) {
         Ok(Some(args)) => args,
         Ok(None) => return EXIT_USAGE,
         Err(e) => {
@@ -209,6 +249,14 @@ pub(crate) fn main(argv: &[String], bundled_ffmpeg: &[(&'static str, PathBuf)]) 
             let _ = writeln!(std::io::stdout().lock(), "{USAGE}");
         }
         return 0;
+    }
+    if let Err(e) = cache_from_env(&mut args, &cwd, |name| std::env::var(name).ok()) {
+        say(&format!("kerf-app: {e}\n\n{USAGE}"));
+        return EXIT_USAGE;
+    }
+    if let Err(Exit(code, message)) = use_cache_dir(args.cache_dir.as_deref()) {
+        say(&format!("kerf-app: {message}"));
+        return code;
     }
     let token = match check_args(&args) {
         Ok(token) => token,
@@ -243,6 +291,14 @@ pub(crate) fn main(argv: &[String], bundled_ffmpeg: &[(&'static str, PathBuf)]) 
             code
         }
     }
+}
+
+/// Put the caches under `dir` for this run, before anything reads where they are.
+fn use_cache_dir(dir: Option<&Path>) -> Result<(), Exit> {
+    let Some(dir) = dir else { return Ok(()) };
+    std::fs::create_dir_all(dir).map_err(|e| Exit(EXIT_USAGE, format!("cannot use --cache-dir {}: {e}", dir.display())))?;
+    kerf_core::paths::set_cache_dir(dir.to_path_buf());
+    Ok(())
 }
 
 /// What can be refused before anything starts: the project file, the token file, the token. The
@@ -391,6 +447,12 @@ fn run(
     }
     crate::restore_speech_model(&project);
     crate::respawn_proxies(&shell);
+    if let Some(cap) = args.cache_max_bytes {
+        let open = project.clone();
+        // The assets are read under the lock and the lock is let go on return: the pruner stats and
+        // deletes with it released.
+        kerf_core::cache_cap::start(cap, move || lock_user(&open).list_assets().unwrap_or_default());
+    }
     std::thread::spawn(kerf_core::fonts::warm);
     std::thread::spawn(crate::warm_transcription_backend);
 
@@ -416,6 +478,7 @@ fn run(
     tracing::info!(
         version = env!("CARGO_PKG_VERSION"),
         data_dir = %data.as_deref().map(|d| d.display().to_string()).unwrap_or_default(),
+        cache_dir = %kerf_core::paths::cache_dir().map(|d| d.display().to_string()).unwrap_or_default(),
         project = %lock_user(&project).path().map(|p| p.display().to_string()).unwrap_or_default(),
         review = settings::agent_review(),
         stdio = stdio.is_some(),
@@ -605,6 +668,9 @@ mod tests {
             "--proxies",
             "--cpu-percent",
             "50",
+            "--cache-dir=caches",
+            "--cache-max-gb",
+            "0.5",
         ])
         .unwrap()
         .unwrap();
@@ -621,6 +687,8 @@ mod tests {
                 review: true,
                 proxies: true,
                 cpu_percent: Some(50),
+                cache_dir: Some(PathBuf::from("/work/caches")),
+                cache_max_bytes: Some(1 << 29),
                 help: false,
             }
         );
@@ -642,6 +710,60 @@ mod tests {
         assert!(err(&["--headless", "--cpu-percent", "101"]).contains("from"));
         assert!(err(&["--headless", "--cpu-percent", "1"]).contains("from"));
         assert!(err(&["--headless", "--review=yes"]).contains("takes no value"));
+        for bad in ["0", "-1", "lots", "NaN", "inf", ""] {
+            assert!(
+                err(&["--headless", "--cache-max-gb", bad]).contains("--cache-max-gb takes a number of GiB above 0"),
+                "{bad:?}"
+            );
+        }
+        assert!(err(&["--headless", "--cache-max-gb"]).contains("needs a value"));
+        assert!(err(&["--headless", "--cache-dir"]).contains("needs a value"));
+    }
+
+    #[test]
+    fn the_cache_ceiling_is_a_number_of_gib_in_bytes() {
+        assert_eq!(parse_cache_max("50"), Ok(50 << 30));
+        assert_eq!(parse_cache_max(" 1.5 "), Ok(3 << 29));
+        assert_eq!(parse_cache_max("0.000000001"), Ok(1));
+        assert!(parse_cache_max("0").is_err());
+    }
+
+    #[test]
+    fn the_environment_fills_in_the_cache_flags_only_where_there_are_none() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |name: &str| pairs.iter().find(|(k, _)| *k == name).map(|(_, v)| (*v).to_string())
+        };
+        let cwd = Path::new("/work");
+        let mut args = Args::default();
+        cache_from_env(&mut args, cwd, env(&[])).unwrap();
+        assert_eq!(args, Args::default(), "nothing set, nothing changes");
+        cache_from_env(&mut args, cwd, env(&[(ENV_CACHE_MAX_GB, "  "), (ENV_CACHE_DIR, "")])).unwrap();
+        assert_eq!(args, Args::default(), "blank is unset");
+
+        cache_from_env(
+            &mut args,
+            cwd,
+            env(&[(ENV_CACHE_MAX_GB, "20"), (ENV_CACHE_DIR, "/mnt/volume/cache")]),
+        )
+        .unwrap();
+        assert_eq!(args.cache_max_bytes, Some(20 << 30));
+        assert_eq!(args.cache_dir, Some(PathBuf::from("/mnt/volume/cache")));
+
+        let mut flagged = Args {
+            cache_max_bytes: Some(1 << 30),
+            cache_dir: Some(PathBuf::from("/flag")),
+            ..Args::default()
+        };
+        cache_from_env(&mut flagged, cwd, env(&[(ENV_CACHE_MAX_GB, "20"), (ENV_CACHE_DIR, "/env")])).unwrap();
+        assert_eq!(flagged.cache_max_bytes, Some(1 << 30), "the flag wins");
+        assert_eq!(flagged.cache_dir, Some(PathBuf::from("/flag")));
+
+        let mut relative = Args::default();
+        cache_from_env(&mut relative, cwd, env(&[(ENV_CACHE_DIR, "cache")])).unwrap();
+        assert_eq!(relative.cache_dir, Some(PathBuf::from("/work/cache")));
+
+        let err = cache_from_env(&mut Args::default(), cwd, env(&[(ENV_CACHE_MAX_GB, "plenty")])).unwrap_err();
+        assert!(err.contains("KERF_CACHE_MAX_GB takes a number of GiB above 0"), "{err}");
     }
 
     #[test]

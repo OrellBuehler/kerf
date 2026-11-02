@@ -109,7 +109,7 @@ pub fn model_info(name: &str) -> Option<&'static ModelInfo> {
 /// `None` when the OS exposes no cache directory.
 pub fn model_path(name: &str) -> Option<PathBuf> {
     Some(
-        dirs::cache_dir()?
+        crate::paths::cache_dir()?
             .join("kerf")
             .join("models")
             .join(format!("ggml-{name}.bin")),

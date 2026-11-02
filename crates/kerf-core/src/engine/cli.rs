@@ -3071,10 +3071,28 @@ pub fn proxy_path(src: &Path, width: u32) -> Option<PathBuf> {
 /// waited for the machine's slot can read again, and answer differently, before it starts — a
 /// tone-mapped or head-padded picture would then be written to the plain proxy's name.
 fn proxy_path_for(src: &Path, width: u32, traits: SourceTraits) -> Option<PathBuf> {
-    let dir = dirs::cache_dir()?.join("kerf").join("proxies");
+    let dir = crate::paths::cache_dir()?.join("kerf").join("proxies");
     let padded = needs_head_pad(traits.lead);
     let key = proxy_key(&source_key(src), width, traits.hdr.is_some(), padded);
     Some(dir.join(proxy_file_name(fnv1a(&key), padded)))
+}
+
+/// Every file `src`'s proxy at `width` could be in the cache, with its sidecar: the four spellings
+/// of the key (tone-mapped or not, head-padded or not), so it needs none of the probes
+/// [`proxy_path`] runs and can be asked with a lock held. For the cache cap, which must not remove
+/// what the open project plays from.
+pub(crate) fn proxy_cache_files(src: &Path, width: u32) -> Vec<PathBuf> {
+    let Some(dir) = crate::paths::cache_dir().map(|d| d.join("kerf").join("proxies")) else {
+        return Vec::new();
+    };
+    let source = source_key(src);
+    let mut files = Vec::with_capacity(8);
+    for (tonemapped, padded) in [(false, false), (true, false), (false, true), (true, true)] {
+        let proxy = dir.join(proxy_file_name(fnv1a(&proxy_key(&source, width, tonemapped, padded)), padded));
+        files.push(proxy_sidecar_path(&proxy));
+        files.push(proxy);
+    }
+    files
 }
 
 /// A proxy's file name (pure, unit-tested): `<hash>.mp4`, or `<hash>.lead.mp4` for
@@ -3761,7 +3779,7 @@ fn stitch_key(front: &Path, rear: &Path) -> String {
 /// ejected SD card, and a deterministic key lets a re-import reuse the stitch
 /// instead of spending minutes re-encoding it.
 pub fn stitched_path(front: &Path, rear: &Path) -> Option<PathBuf> {
-    let dir = dirs::cache_dir()?.join("kerf").join("stitched");
+    let dir = crate::paths::cache_dir()?.join("kerf").join("stitched");
     Some(dir.join(format!("{:016x}.mp4", fnv1a(&stitch_key(front, rear)))))
 }
 
@@ -12309,7 +12327,7 @@ mod tests {
         assert!(!padded("/home/u/.cache/other/proxies/0000000000000abc.lead.mp4"));
         // And the names `generate_proxy` writes, in the directory it writes them to,
         // are the ones that read back.
-        if let Some(dir) = dirs::cache_dir().map(|d| d.join("kerf").join("proxies")) {
+        if let Some(dir) = crate::paths::cache_dir().map(|d| d.join("kerf").join("proxies")) {
             assert!(!is_head_padded_proxy(&dir.join(proxy_file_name(7, false)).to_string_lossy()));
             assert!(is_head_padded_proxy(&dir.join(proxy_file_name(7, true)).to_string_lossy()));
         }
@@ -13368,6 +13386,37 @@ mod tests {
         assert!(a != b && a != c && b != c);
         assert!(is_head_padded_proxy(&c.to_string_lossy()) && !is_head_padded_proxy(&a.to_string_lossy()));
         assert_eq!(Some(&b), proxy_path_for(src, PROXY_MAX_WIDTH, hlg).as_ref());
+    }
+
+    #[test]
+    fn the_cache_cap_knows_every_file_a_source_s_proxy_could_be_without_probing() {
+        let src = Path::new("/media/never-imported.mov");
+        let files = proxy_cache_files(src, PROXY_MAX_WIDTH);
+        if files.is_empty() {
+            skip("skipped: this platform has no cache directory for proxies");
+            return;
+        }
+        let tonemapped = SourceTraits {
+            hdr: Some(Hdr::Hlg),
+            ..SourceTraits::default()
+        };
+        let late = SourceTraits {
+            lead: 0.5,
+            ..SourceTraits::default()
+        };
+        for traits in [SourceTraits::default(), tonemapped, late] {
+            let proxy = proxy_path_for(src, PROXY_MAX_WIDTH, traits).unwrap();
+            assert!(files.contains(&proxy), "{}", proxy.display());
+            assert!(files.contains(&proxy_sidecar_path(&proxy)), "its sidecar too");
+        }
+        let unique: std::collections::HashSet<_> = files.iter().collect();
+        assert_eq!(unique.len(), 8, "four spellings, a proxy and a sidecar each");
+        assert!(
+            !proxy_cache_files(src, PROXY_MAX_WIDTH_SPHERICAL)
+                .iter()
+                .any(|f| files.contains(f)),
+            "another width is other files"
+        );
     }
 
     #[test]
