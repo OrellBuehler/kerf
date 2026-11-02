@@ -7699,8 +7699,8 @@ const INSTRUCTIONS: &str = "Kerf is the video editor open on this computer, and 
              `background: true` and answer a job_id at once; follow it with job_status or subscribe to \
              kerf://jobs/{job_id}. \
              The prompts (rough_cut_from_transcript, podcast_cleanup, social_reel, music_bed, sound_design, deliver) are \
-             these workflows as steps. A client may connect with ?tools=core,titles on the URL to list \
-             fewer tools; get_editing_guide then names the sets left out.";
+             these workflows as steps. A client may connect with ?tools=core,titles on the URL (--tools core,titles over \
+             stdio) to list fewer tools; get_editing_guide then names the sets left out.";
 
 /// What `get_editing_guide` answers: the workflow across every tool.
 const EDITING_GUIDE: &str = "How to edit with Kerf. The user queues editing tasks in the desktop app; \
@@ -8062,7 +8062,7 @@ const EDITING_GUIDE: &str = "How to edit with Kerf. The user queues editing task
              already there unless you pass overwrite=true. \
              The server's prompts — rough_cut_from_transcript, podcast_cleanup, social_reel, music_bed, sound_design and \
              deliver — are these workflows as numbered steps the user can start. A connection may list only \
-             some tool sets (`?tools=core,titles` on the server URL; the sets are core, analysis, clips, \
+             some tool sets (`?tools=core,titles` on the server URL, `--tools core,titles` for a stdio server; the sets are core, analysis, clips, \
              keyframes, titles, audio, music, delivery, tasks and project), and this guide then ends by \
              saying which.";
 

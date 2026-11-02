@@ -699,7 +699,8 @@ Agent edits **stage** (`core-project.md`). The adapter's part:
   no longer on any listener (closed, expired, or gone with a restart — a new token ends them all), and clears the owner if
   so, so the agent that reconnected, or the next to edit, adopts its own old proposal with its steps instead of being told
   another agent owns it. An id never seen is treated as alive: ownership is let go of only on evidence. The stdio
-  session is always alive (`the_stdio_session_is_never_judged_gone`).
+  session is always alive (`the_stdio_session_is_never_judged_gone`), and any other `stdio-…` owner — an earlier stdio
+  run's, persisted in the file — is gone, seen or not (`the_next_stdio_run_takes_over_the_proposal_an_earlier_one_left`).
 - **What the user alone does.** `discard_unsaved` on `open_project` / `new_project` is refused while review is on (the
   user confirms throwing unsaved work away, in Kerf's window); `save_project_as` will not replace an existing file while
   review is on, whatever `overwrite` says, and every export-family tool and Save As is held off Kerf's own settings and logs

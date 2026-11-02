@@ -676,8 +676,13 @@ fn session_exists(id: &str) -> bool {
 /// ([`note_session_seen`]) and is no longer on any listener — its connection closed, it expired, or
 /// the server restarted with a new token — is gone, and a proposal it owned is released
 /// ([`kerf_core::Project::release_orphaned_staging`]). Ownership is only ever let go of on that
-/// evidence: an id never seen, or asked about before a listener has come up, is alive.
+/// evidence: an id never seen, or asked about before a listener has come up, is alive. A stdio
+/// session's id (`stdio-…`) is the evidence itself: only this process's own can still be there, so
+/// a proposal an earlier stdio run left in the file is released.
 pub fn session_alive(id: &str) -> bool {
+    if id.starts_with(STDIO_PREFIX) {
+        return STDIO_SESSION.get().is_some_and(|stdio| stdio == id);
+    }
     let seen = SEEN.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|s| s == id);
     !seen || session_exists(id)
 }
@@ -687,6 +692,9 @@ pub fn session_alive(id: &str) -> bool {
 /// The id of the `--stdio` run's one session. It lasts as long as the pipe, which is the process: no
 /// listener holds it, and nothing judges it gone.
 static STDIO_SESSION: OnceLock<String> = OnceLock::new();
+
+/// What every stdio session id starts with (rmcp's HTTP session ids are bare UUIDs).
+const STDIO_PREFIX: &str = "stdio-";
 
 /// Why `list` (`--tools core,titles`) names no tool sets, or `Ok`.
 pub(crate) fn check_tool_sets(list: &str) -> Result<(), String> {
@@ -709,7 +717,7 @@ pub(crate) fn start_stdio(app: Shell, project: Arc<Mutex<Project>>, tools: Optio
         .unwrap_or_else(|e| e.into_inner())
         .set_agent_review(settings.agent_review);
     super::activity::pump_project();
-    let id = format!("stdio-{}", uuid::Uuid::new_v4().simple());
+    let id = format!("{STDIO_PREFIX}{}", uuid::Uuid::new_v4().simple());
     if STDIO_SESSION.set(id.clone()).is_err() {
         tracing::warn!("the stdio MCP server was started twice");
     }
@@ -1293,10 +1301,30 @@ mod tests {
             mine.add_overlay("Title".to_string(), 0.0, 2.0).unwrap();
             assert_eq!(mine.staged().unwrap().unwrap().owner.as_deref(), Some(id.as_str()));
         }
-        let stranger = "stdio-test-stranger";
+        let stranger = "an-http-session-on-no-listener";
         note_session_seen(stranger);
         assert!(!session_alive(stranger), "a session seen and on no listener is gone");
         assert!(super::super::lock_agent_edit(&shared, Some(stranger)).is_err());
+    }
+
+    /// A stdio run's id in the file is another process's, gone with it, even never seen here: its
+    /// proposal is released to the next session that edits.
+    #[test]
+    fn an_earlier_stdio_run_s_proposal_is_released() {
+        let earlier = "stdio-0123456789abcdef0123456789abcdef";
+        assert!(!session_alive(earlier), "never seen, and still gone");
+        let shared = Mutex::new(Project::open_in_memory().unwrap());
+        {
+            let first = super::super::lock_agent_edit(&shared, Some(earlier)).expect("nothing is staged yet");
+            first.add_overlay("Title".to_string(), 0.0, 2.0).unwrap();
+            assert_eq!(first.staged().unwrap().unwrap().owner.as_deref(), Some(earlier));
+        }
+        let next = super::super::lock_agent_edit(&shared, Some("http-session-after-it")).expect("released");
+        next.add_overlay("Another".to_string(), 3.0, 4.0).unwrap();
+        assert_eq!(
+            next.staged().unwrap().unwrap().owner.as_deref(),
+            Some("http-session-after-it")
+        );
     }
 
     #[test]

@@ -219,9 +219,9 @@ pub(crate) fn main(argv: &[String], bundled_ffmpeg: &[(&'static str, PathBuf)]) 
     };
     let rpc = match args.stdio.then(rpc_out).transpose() {
         Ok(rpc) => rpc,
-        Err(e) => {
-            say(&format!("kerf-app: cannot keep stdout for the MCP client: {e}"));
-            return EXIT_FAILURE;
+        Err(Exit(code, message)) => {
+            say(&format!("kerf-app: {message}"));
+            return code;
         }
     };
     let (config, data) = match dirs_for(args.data_dir.as_deref()) {
@@ -305,27 +305,54 @@ type RpcOut = tokio::fs::File;
 #[cfg(not(unix))]
 type RpcOut = tokio::io::Stdout;
 
+/// A stdout that is stderr too (`2>&1`) and no terminal: the logs would land in the client's stream.
 #[cfg(unix)]
-fn rpc_out() -> std::io::Result<RpcOut> {
+fn rpc_out() -> Result<RpcOut, Exit> {
+    use std::io::IsTerminal;
     use std::os::fd::FromRawFd;
+    let kept = |e: std::io::Error| Exit(EXIT_FAILURE, format!("cannot keep stdout for the MCP client: {e}"));
+    if same_file(libc::STDOUT_FILENO, libc::STDERR_FILENO).map_err(kept)? && !std::io::stdout().is_terminal() {
+        return Err(Exit(
+            EXIT_USAGE,
+            "--stdio needs stdout to itself, and stderr is the same file (2>&1?): send stderr elsewhere".to_string(),
+        ));
+    }
     // SAFETY: `fcntl` / `dup2` / `close` on this process's own standard descriptors; the duplicate is
     // checked, and from here on owned by the `File` alone.
     unsafe {
         let rpc = libc::fcntl(libc::STDOUT_FILENO, libc::F_DUPFD_CLOEXEC, 3);
         if rpc < 0 {
-            return Err(std::io::Error::last_os_error());
+            return Err(kept(std::io::Error::last_os_error()));
         }
         if libc::dup2(libc::STDERR_FILENO, libc::STDOUT_FILENO) < 0 {
             let e = std::io::Error::last_os_error();
             libc::close(rpc);
-            return Err(e);
+            return Err(kept(e));
         }
         Ok(tokio::fs::File::from_std(std::fs::File::from_raw_fd(rpc)))
     }
 }
 
+/// Whether the descriptors `a` and `b` are open on the same file (device and inode).
+#[cfg(unix)]
+fn same_file(a: libc::c_int, b: libc::c_int) -> std::io::Result<bool> {
+    let stat = |fd| {
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        // SAFETY: `fstat` writes a whole `stat` into the buffer when it returns 0, and only then is
+        // it read.
+        unsafe {
+            if libc::fstat(fd, stat.as_mut_ptr()) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(stat.assume_init())
+        }
+    };
+    let (a, b) = (stat(a)?, stat(b)?);
+    Ok(a.st_dev == b.st_dev && a.st_ino == b.st_ino)
+}
+
 #[cfg(not(unix))]
-fn rpc_out() -> std::io::Result<RpcOut> {
+fn rpc_out() -> Result<RpcOut, Exit> {
     Ok(tokio::io::stdout())
 }
 
@@ -406,18 +433,23 @@ async fn serve_stdio(server: mcp::Stdio, rpc: RpcOut, shell: &Shell, project: &A
     let serving = server.serve((tokio::io::stdin(), rpc), stop.clone());
     let mut serving = std::pin::pin!(serving);
     say("kerf: MCP server on stdin / stdout");
-    let ended = tokio::select! {
+    let (ended, signalled) = tokio::select! {
         ended = &mut serving => {
             tracing::info!("the MCP session on stdio ended; shutting down");
-            ended
+            (ended, false)
         }
         () = signals.next() => {
             tracing::info!("signal received; shutting down (a second one exits at once)");
             stop.cancel();
-            tokio::time::timeout(Duration::from_secs(3), &mut serving).await.unwrap_or(Ok(()))
+            (tokio::time::timeout(Duration::from_secs(3), &mut serving).await.unwrap_or(Ok(())), true)
         }
     };
     tauri::async_runtime::spawn(async move {
+        // A first signal during a shutdown that stdin closing began asks for what is under way.
+        if !signalled {
+            signals.next().await;
+            tracing::info!("signal received; already shutting down (a second one exits at once)");
+        }
         signals.next().await;
         tracing::warn!("second signal; exiting without waiting");
         std::process::exit(EXIT_INTERRUPTED);
@@ -641,6 +673,21 @@ mod tests {
         assert!(err(&["--headless", "--tools", "core"]).contains("--tools is for --stdio"));
         assert!(err(&["--headless", "--stdio", "--tools", "core,colour"]).contains("`colour` is no tool set"));
         assert!(err(&["--headless", "--stdio=yes"]).contains("takes no value"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_descriptor_is_the_same_file_as_its_duplicate_and_not_another() {
+        use std::os::fd::AsRawFd;
+        let dir = std::env::temp_dir().join(format!("kerf-headless-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let one = std::fs::File::create(dir.join("one")).unwrap();
+        let again = std::fs::File::open(dir.join("one")).unwrap();
+        let other = std::fs::File::create(dir.join("other")).unwrap();
+        assert!(same_file(one.as_raw_fd(), again.as_raw_fd()).unwrap());
+        assert!(!same_file(one.as_raw_fd(), other.as_raw_fd()).unwrap());
+        assert!(same_file(-1, one.as_raw_fd()).is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

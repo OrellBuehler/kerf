@@ -63,8 +63,10 @@ Stop, proxies and agent jobs are cancelled and waited for up to 10 s, `recovery:
 `--token-file` and `--show-token` are a usage error with it, `--tools core,titles` is the URL's `?tools=` (usage error
 without `--stdio`), `KERF_MCP_TOKEN` is ignored and `--help` goes to stderr. **stdout carries JSON-RPC only**: on Unix
 `rpc_out` moves the real stdout to a private (CLOEXEC) fd for rmcp and points fd 1 at stderr, so a stray print, a native
-library or a child that inherits fd 1 cannot corrupt the stream (Windows writes to stdout as is). EOF on stdin (also before
-`initialize`) or a signal ends it with the same shutdown, exit 0.
+library or a child that inherits fd 1 cannot corrupt the stream (Windows writes to stdout as is); a stderr that is the same
+file as a non-terminal stdout (`2>&1`, `same_file`: fstat device + inode) is refused, exit 2. EOF on stdin (also before
+`initialize`) or a signal ends it with the same shutdown, exit 0; a first signal during an EOF shutdown lets it finish, a
+second exits 130.
 Release Windows builds are `windows_subsystem = "windows"`: pipes work, an interactive console shows nothing.
 `tests/headless.rs` drives the real binary (no `DISPLAY`): ready line, 401 / 200 / 202, two tools, SIGTERM → 0.
 

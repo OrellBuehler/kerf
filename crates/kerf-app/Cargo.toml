@@ -60,7 +60,7 @@ axum.workspace = true
 tokio-util.workspace = true
 getrandom.workspace = true
 anyhow.workspace = true
-tokio = { workspace = true, features = ["net", "time", "signal"] }
+tokio = { workspace = true, features = ["net", "time", "signal", "fs"] }
 # The desktop app's config and data directories, for `--headless` (no Tauri app to ask).
 dirs = "7"
 
