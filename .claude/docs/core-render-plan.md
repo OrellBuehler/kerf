@@ -296,7 +296,7 @@
   **The mask's alpha is shared too**: `kerf_core::mask_alpha_plane(&Mask, w, h)` is `mask_filter`'s `geq` evaluated in `f64` and
   truncated as `geq` stores it (`engine::cli::rendered`, `a_mask_plane_is_the_geq_planes_sample_for_sample`: 21 million samples equal on both
   FFmpegs), at the size of the picture the `geq` sees — `LayerGeometry::picture` (for a placed layer the fit-size picture, its geometry ends there) —
-  so a compositor draws a mask with no FFmpeg and no per-frame cost.
+  so a compositor draws a mask with no FFmpeg and no per-frame cost. Its rows run on SSE2 / AVX2 where the CPU has them (`kerf_core::simd`, `gpu.md` *CPU-side work and SIMD*), the scalar function is `mask_alpha_plane_scalar`, and every path is held to it byte for byte.
   **The clip's grade (`PlanLayer.grade`: LUT, curves, wheels) is drawn by what the caps say, and judged for the chain**:
   `GpuCaps::grade` is a `GradeKinds` bitset (`WHEELS`, `CURVES`, `LUT`, `ALL`; `A0` has none), and a part the compositor
   does not draw is `Unsupported::Grade(layer, what)` (kind `grade`) — which is also what a compositor whose FFmpeg's conversions are not (or not yet known to be) the ones it follows says:

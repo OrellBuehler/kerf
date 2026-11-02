@@ -294,22 +294,6 @@ fn blank(c: char) -> bool {
     c.is_whitespace() || c.is_control()
 }
 
-/// The bounding box `(x0, y0, x1, y1)` (end exclusive) of the non-zero samples of a `w` x `h` plane.
-fn bbox(plane: &[u8], w: usize, h: usize) -> Option<(usize, usize, usize, usize)> {
-    let mut found: Option<(usize, usize, usize, usize)> = None;
-    for y in 0..h {
-        let row = &plane[y * w..(y + 1) * w];
-        let (Some(first), Some(last)) = (row.iter().position(|v| *v != 0), row.iter().rposition(|v| *v != 0)) else {
-            continue;
-        };
-        found = Some(match found {
-            None => (first, y, last + 1, y + 1),
-            Some((x0, y0, x1, _)) => (x0.min(first), y0, x1.max(last + 1), y + 1),
-        });
-    }
-    found
-}
-
 /// What a measuring or dictionary run is keyed by, besides what it draws: the build and the font.
 fn run_key(t: &PlanText) -> String {
     let font = t.font_file.as_deref();
@@ -568,7 +552,8 @@ pub(super) fn remember(key: String, e: &GpuError) {
 /// The box `drawtext` draws behind the whole text with its top left at `(0, ascent)`: the text's
 /// width and height, and `ascent`, read off the picture `plane` (`w` x `h`).
 fn read_box(plane: &[u8], w: usize, h: usize) -> Result<(i32, i32, i32), GpuError> {
-    let (x0, y0, x1, y1) = bbox(plane, w, h).ok_or_else(|| unsupported("the text has no extent to measure"))?;
+    let (x0, y0, x1, y1) =
+        kerf_core::simd::plane_bounds(plane, w, h).ok_or_else(|| unsupported("the text has no extent to measure"))?;
     if x0 != 0 || x1 >= w || y1 >= h {
         return Err(unsupported("the text's box did not fit its measuring canvas"));
     }
@@ -1019,7 +1004,7 @@ fn draw_dictionary(t: &PlanText, frame_h: u32, model: Model, qy: i32, units: &[&
 /// The shape of the bitmap in one cell, against the whole-pixel pen and baseline the draw put it at.
 fn shape_of(plane: &[u8], c: &Cell, model: Model, qy: i32) -> Result<Shape, GpuError> {
     let (w, h) = (c.w as usize, c.h as usize);
-    let Some((x0, y0, x1, y1)) = bbox(plane, w, h) else {
+    let Some((x0, y0, x1, y1)) = kerf_core::simd::plane_bounds(plane, w, h) else {
         return Ok(Shape::default());
     };
     if x0 == 0 || y0 == 0 || x1 == w || y1 == h {
