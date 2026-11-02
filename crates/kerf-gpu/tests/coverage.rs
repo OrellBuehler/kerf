@@ -2105,6 +2105,30 @@ impl Cut {
     }
 }
 
+/// (g) The photo slideshow (T6) by the set of reasons that refuses a frame: what the frames that are still refused wait for.
+fn slideshow(cuts: &[Cut], at_delivery: &[Cut]) -> String {
+    let mut out = String::from("\n(g) T6, the photo slideshow: frames by the reasons that refuse them together\n");
+    for cut in cuts.iter().filter(|c| c.name.starts_with("T6")).chain(at_delivery) {
+        let _ = writeln!(out, "  {} [{}]", cut.name, cut.mode);
+        for (why, n) in &cut.frames {
+            let causes: Vec<String> = why
+                .iter()
+                .map(|r| format!("{}/{}", r.variant, column(&r.detail, 60)))
+                .collect();
+            let _ = writeln!(
+                out,
+                "    {n:>5}  {}",
+                if causes.is_empty() {
+                    "drawn".to_string()
+                } else {
+                    causes.join(" + ")
+                }
+            );
+        }
+    }
+    out
+}
+
 /// The reasons the compositor with `caps` refuses output frame `k` of `planner`, sorted and without repeats.
 fn why_not(planner: &Planner, k: u64, size: (u32, u32), caps: &GpuCaps) -> Vec<Reason> {
     let mut why: Vec<Reason> = match planner.at_frame(k) {
@@ -2382,8 +2406,11 @@ fn the_ledger_says_which_refusals_hold_the_compositor_back() {
     // conversion probe).
     let placement = kerf_gpu::placement_probe::placement();
     let conversion = kerf_gpu::conversion::conversion();
+    // ... and a moving still only for the kinds of picture whose chain this FFmpeg draws as the model does (the still probe).
+    let stills = kerf_gpu::still_probe::kinds();
     let caps = Compositor::caps_with(kernels, layout);
     let mut cuts = vec![];
+    let mut slideshow_at_delivery = vec![];
     // T1 to T8 are planned with the default export options; T9 and on say theirs (a ProRes file, a GIF, a scaler).
     let mut every: Vec<Archetype> = archetypes(media)
         .into_iter()
@@ -2401,6 +2428,19 @@ fn the_ledger_says_which_refusals_hold_the_compositor_back() {
             for k in 0..frames {
                 *grouped.entry(why_not(&planner, k, size, &caps)).or_default() += 1;
             }
+            // An export frame is drawn at the delivery's frame whatever the ledger's width: the slideshow's are judged there too.
+            if mode == "motion" && name.starts_with("T6") {
+                let delivery = (first.canvas.width, first.canvas.height);
+                let mut at_delivery: BTreeMap<Vec<Reason>, u64> = BTreeMap::new();
+                for k in 0..frames {
+                    *at_delivery.entry(why_not(&planner, k, delivery, &caps)).or_default() += 1;
+                }
+                slideshow_at_delivery.push(Cut {
+                    name: name.to_string(),
+                    mode: "export frames at the delivery's frame",
+                    frames: at_delivery.into_iter().collect(),
+                });
+            }
             cuts.push(Cut {
                 name: name.to_string(),
                 mode,
@@ -2413,11 +2453,12 @@ fn the_ledger_says_which_refusals_hold_the_compositor_back() {
         "kerf-gpu coverage ledger: the frames the compositor draws and what refuses the rest".to_string(),
         format!("ffmpeg: {version_line}"),
         format!("composite colour policy: {policy:?}"),
-        format!("grade kernels: {kernels:?}; text layout: {layout:?}; placement: {placement:?}; planar conversion: {conversion:?} (caps: Compositor::caps_for(grade::kernels()) once text::model(), placement_probe::placement() and conversion::conversion() have probed, as the app asks)"),
+        format!("grade kernels: {kernels:?}; text layout: {layout:?}; placement: {placement:?}; planar conversion: {conversion:?}; moving stills: {stills:?} (caps: Compositor::caps_for(grade::kernels()) once text::model(), placement_probe::placement() and conversion::conversion() have probed, as the app asks)"),
         "plans: every output frame of every archetype over OriginalMedia at 540 px wide (the app's preview plans ProxyMedia at 960); nothing is rendered".to_string(),
         "archetypes: the review's T1 to T3, the real-world T4 to T8 and T9 to T24, which between them use every feature the editor offers that still refuses (tests/coverage.rs)".to_string(),
     ];
     let mut text = render_ledger(&header, &cuts);
+    text.push_str(&slideshow(&cuts, &slideshow_at_delivery));
     text.push_str(&unreached(&cuts, policy, kernels, layout));
     eprintln!("{text}");
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).parent().unwrap().join("parity");
@@ -2482,7 +2523,7 @@ fn every_variant() -> Vec<Unsupported> {
         Unsupported::KeyedColor(layer()),
         Unsupported::KeyedMask(layer()),
         Unsupported::KeyedCrop(layer()),
-        Unsupported::StillMotion(layer()),
+        Unsupported::StillMotion(layer(), String::new()),
         Unsupported::KeyedZoom(layer()),
         Unsupported::KeyedPlacement(layer()),
         Unsupported::PlacedFormat(layer(), String::new()),
@@ -2542,7 +2583,7 @@ fn ordinal(u: &Unsupported) -> usize {
         Unsupported::KeyedColor(_) => 31,
         Unsupported::KeyedMask(_) => 32,
         Unsupported::KeyedCrop(_) => 33,
-        Unsupported::StillMotion(_) => 34,
+        Unsupported::StillMotion(..) => 34,
         Unsupported::KeyedZoom(_) => 35,
         Unsupported::KeyedPlacement(_) => 36,
         Unsupported::PlacedFormat(..) => 37,

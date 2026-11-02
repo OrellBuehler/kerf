@@ -322,6 +322,9 @@ fn compositor() -> &'static Compositor {
         let _ = kerf_gpu::placement_probe::placement();
         // ... and so is the layout of its `drawtext`, which decides whether text whose bitmaps share samples is drawn.
         let _ = kerf_gpu::text::model();
+        // ... and for which kinds of picture a moving still is drawn as this FFmpeg draws it (the moving still's route is in the
+        // caps only for the kinds that matched).
+        let _ = kerf_gpu::still_probe::kinds();
         Compositor::new(gpu()).expect("a compositor")
     })
 }
@@ -992,6 +995,7 @@ fn check_with(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], limits
     for &t in times {
         let plan = RenderPlan::at(tl, assets, opts, t, policy()).expect("plan");
         let size = plan.size(u32::MAX);
+        let plan = plan.for_render(size);
         let why = reasons(&plan, size);
         assert!(
             why.is_empty(),
@@ -1120,6 +1124,7 @@ fn check_exact(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64]) {
     for &t in times {
         let plan = RenderPlan::at(tl, assets, &opts, t, policy()).expect("plan");
         let size = plan.size(u32::MAX);
+        let plan = plan.for_render(size);
         let why = reasons(&plan, size);
         assert!(
             why.is_empty(),
@@ -7940,4 +7945,468 @@ fn checker_a_stills_a_file_whose_stream_and_container_disagree_on_the_range() {
         }
     }
     assert!(fails.is_empty(), "{}", fails.join("\n"));
+}
+
+// ---- a still image on a Ken Burns move ----------------------------------------------------------
+
+/// Photographs of the shapes a slideshow has, probed like an import's: a 3:2 JPEG, a portrait one, a 4:3 one, a 16:9 PNG, an
+/// odd-sized JPEG and the formats the route is not measured for (a 4:2:2 JPEG, a PNG with alpha, a gray one).
+struct Photos {
+    landscape: Asset,
+    portrait: Asset,
+    four_three: Asset,
+    wide: Asset,
+    odd: Asset,
+    jpeg_422: Asset,
+    rgba: Asset,
+    gray: Asset,
+}
+
+fn photos() -> &'static Photos {
+    static P: OnceLock<Photos> = OnceLock::new();
+    P.get_or_init(|| {
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("parity-photos");
+        std::fs::create_dir_all(&dir).unwrap();
+        let photo = |name: &str, size: &str, quality: &[&str]| {
+            let p = dir.join(name);
+            let mut args = vec!["-f", "lavfi", "-i"];
+            let src = format!("testsrc2=size={size}:rate=1:duration=1");
+            args.push(&src);
+            args.extend(["-frames:v", "1"]);
+            args.extend(quality.iter().copied());
+            args.push(p.to_str().unwrap());
+            ffmpeg(&args);
+            probed(&p)
+        };
+        let jpeg = ["-q:v", "3", "-pix_fmt", "yuvj420p"];
+        Photos {
+            landscape: photo("photo-3x2.jpg", "1920x1280", &jpeg),
+            portrait: photo("photo-portrait.jpg", "1280x1920", &jpeg),
+            four_three: photo("photo-4x3.jpg", "1600x1200", &jpeg),
+            wide: photo("photo-16x9.png", "1920x1080", &["-pix_fmt", "rgb24"]),
+            odd: photo("photo-odd.jpg", "1501x1003", &jpeg),
+            jpeg_422: photo("photo-422.jpg", "1920x1280", &["-q:v", "3", "-pix_fmt", "yuvj422p"]),
+            rgba: photo("photo-rgba.png", "1920x1080", &["-pix_fmt", "rgba"]),
+            gray: photo("photo-gray.png", "1920x1080", &["-pix_fmt", "gray"]),
+        }
+    })
+}
+
+fn ken_key(time: f64, scale: f64, pos_x: f64, pos_y: f64) -> Keyframe {
+    Keyframe {
+        easing: Default::default(),
+        time,
+        scale,
+        pos_x,
+        pos_y,
+        rotation: 0.0,
+        opacity: 1.0,
+    }
+}
+
+/// A photograph held for `secs` seconds from `start`, zooming from `from` to `to` while it pans from `a` to `b`.
+fn ken_burns(photo: &Asset, start: f64, secs: f64, (from, a): (f64, (f64, f64)), (to, b): (f64, (f64, f64))) -> Clip {
+    let mut c = clip(photo, 0.0, secs, start);
+    c.keyframes = vec![ken_key(0.0, from, a.0, a.1), ken_key(secs, to, b.0, b.1)];
+    c
+}
+
+fn delivery(w: u32, h: u32, fit: Fit) -> Option<Delivery> {
+    Some(Delivery::new(w, h, fit).with_fps(Some(30.0)).expect("a rate"))
+}
+
+/// The slideshow's own move: in from 1.2x towards the top left, out to the frame. Nothing hangs off the frame at any moment.
+const IN: (f64, (f64, f64)) = (1.2, (0.04, 0.03));
+const HOME: (f64, (f64, f64)) = (1.0, (0.0, 0.0));
+
+/// Whether the plan takes the moving still's route for `layer` of the plan at `t`: a case about the route fails
+/// loudly if the plan quietly drew the general chain instead.
+fn takes_the_route(tl: &Timeline, assets: &[Asset], t: f64) -> bool {
+    let plan = RenderPlan::at(tl, assets, &ExportOptions::default(), t, policy()).expect("plan");
+    !plan.layers.is_empty() && plan.layers.iter().any(|l| plan.takes_still_route(l))
+}
+
+/// A case with a JPEG in it: drawn exactly where this FFmpeg's composite range is fixed (6.1.1), refused where it is negotiated
+/// (9.0.2: FFmpeg keeps the picture's full range through the graph and converts the composite last, which the compositor does not draw),
+/// and then FFmpeg's own still renders it. A time at which no JPEG is on screen is drawn exactly under either.
+fn check_jpeg(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64]) {
+    for &t in times {
+        let plan = RenderPlan::at(tl, assets, &ExportOptions::default(), t, policy()).expect("plan");
+        let jpeg = plan.layers.iter().any(|l| l.stream.pix_fmt.as_deref() == Some("yuvj420p"));
+        if jpeg && policy() != CompositeColorPolicy::FixedBt601 {
+            check_refused(&format!("{case} (refused)"), tl, assets, t, Refusal::Plan("full-range"));
+        } else {
+            check_exact(case, tl, assets, &[t]);
+        }
+    }
+}
+
+/// [`check_exact`] for a render narrower than the delivery's frame — the preview's: the still is FFmpeg's `timeline_frame_yuv`
+/// (its Y'CbCr samples as 4:4:4 planes), and the compositor's 4:2:0 planes, taken to 4:4:4 by FFmpeg's own conversion,
+/// are those to the sample.
+fn check_exact_at_width(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], max_width: u32) {
+    use std::io::Write;
+    let opts = ExportOptions::default();
+    for &t in times {
+        let plan = RenderPlan::at(tl, assets, &opts, t, policy()).expect("plan");
+        let size = plan.size(max_width);
+        let plan = plan.for_render(size);
+        let why = reasons(&plan, size);
+        assert!(
+            why.is_empty(),
+            "{case} @ {t}: the plan says the GPU cannot draw this at {size:?}: {why:?}"
+        );
+        let (w, h, reference) = kerf_core::timeline_frame_yuv_cancellable(tl, assets, &opts, t, max_width, &|| false)
+            .expect("FFmpeg's still as planes");
+        assert_eq!((w, h), size, "{case} @ {t}");
+        let frames = kerf_gpu::decode_layers(&plan.layers).expect("decode");
+        let planes = compositor()
+            .composite_yuv(&plan, &frames, size)
+            .unwrap_or_else(|e| panic!("{case} @ {t}: {e}"));
+        let mut child = Command::new(kerf_core::ffmpeg_path())
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-y",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuv420p",
+                "-s",
+            ])
+            .arg(format!("{w}x{h}"))
+            .args(["-i", "pipe:0", "-f", "rawvideo", "-pix_fmt", "yuv444p", "pipe:1"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("run ffmpeg");
+        let mut stdin = child.stdin.take().unwrap();
+        let data: Vec<u8> = [&planes.y, &planes.u, &planes.v].into_iter().flatten().copied().collect();
+        let writer = std::thread::spawn(move || {
+            let _ = stdin.write_all(&data);
+        });
+        let out = child.wait_with_output().expect("ffmpeg output");
+        let _ = writer.join();
+        assert!(out.status.success(), "ffmpeg: {}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(out.stdout.len(), reference.len(), "{case} @ {t}");
+        let differing = out.stdout.iter().zip(&reference).filter(|(a, b)| a != b).count();
+        let max = out
+            .stdout
+            .iter()
+            .zip(&reference)
+            .map(|(a, b)| (i32::from(*a) - i32::from(*b)).abs())
+            .max()
+            .unwrap_or(0);
+        let line = format!(
+            "{case:<28} t={t:<7} {w}x{h} layers={} exact planes: differing samples {differing} (max {max})",
+            plan.layers.len()
+        );
+        eprintln!("{line}");
+        report().lock().unwrap().insert(format!("{case} {t:08.4}"), line);
+        assert_eq!(
+            differing, 0,
+            "{case} @ {t}: {differing} samples differ from FFmpeg's still (max {max})"
+        );
+    }
+    write_report();
+}
+
+/// A moving still the export draws as one `perspective` of a copy of the picture scaled once: the compositor has that copy from
+/// FFmpeg (the same `scale` and `crop`) and draws the `perspective` from its own tables, so the planes — taken to RGB by FFmpeg — are
+/// the still's PNG to the sample.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_moving_still_is_drawn_as_ffmpegs_still_draws_it() {
+    let p = photos();
+    let times = [0.0, 0.5, 1.0, 1.5, 1.99];
+    for (name, photo) in [
+        ("jpeg 3:2", &p.landscape),
+        ("jpeg portrait", &p.portrait),
+        ("jpeg 4:3", &p.four_three),
+        ("jpeg odd", &p.odd),
+        ("png 16:9", &p.wide),
+    ] {
+        let tl = timeline(
+            vec![vec![ken_burns(photo, 0.0, 2.0, IN, HOME)]],
+            delivery(1920, 1080, Fit::Cover),
+        );
+        assert!(
+            takes_the_route(&tl, std::slice::from_ref(photo), 0.5),
+            "{name}: not the moving still's route"
+        );
+        let case = format!("ken-burns/{name}");
+        if photo.streams.iter().any(|s| s.pix_fmt.as_deref() == Some("rgb24")) {
+            check_exact(&case, &tl, std::slice::from_ref(photo), &times);
+        } else {
+            check_jpeg(&case, &tl, std::slice::from_ref(photo), &times);
+        }
+    }
+}
+
+/// The shapes of the move: a zoom out to the frame, a zoom held with a pan, a zoom that comes and goes (three keys, eased), the
+/// picture cropped first, a `Contain` frame zoomed past the pillarbox, a vertical frame, and a half-size render of each.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn the_shapes_of_a_ken_burns_move_are_drawn_as_ffmpegs_still_draws_them() {
+    let p = photos();
+    let png = std::slice::from_ref(&p.wide);
+    let times = [0.0, 0.7, 1.4, 1.99];
+    // The slow zoom out of a held pan.
+    let tl = timeline(
+        vec![vec![ken_burns(&p.wide, 0.0, 2.0, (1.4, (-0.1, 0.05)), (1.4, (0.1, -0.05)))]],
+        delivery(1920, 1080, Fit::Cover),
+    );
+    assert!(takes_the_route(&tl, png, 0.5));
+    check_exact("ken-burns/held zoom, panning", &tl, png, &times);
+    // Three keys and an easing on the first segment.
+    let mut c = clip(&p.wide, 0.0, 2.0, 0.0);
+    c.keyframes = vec![
+        ken_key(0.0, 1.5, 0.0, 0.0),
+        ken_key(0.8, 1.15, 0.05, 0.02),
+        ken_key(2.0, 1.6, -0.1, 0.0),
+    ];
+    c.keyframes[0].easing = kerf_core::Easing::EaseInOut;
+    let tl = timeline(vec![vec![c]], delivery(1920, 1080, Fit::Cover));
+    assert!(takes_the_route(&tl, png, 0.5));
+    check_exact("ken-burns/three keys, eased", &tl, png, &times);
+    // The picture cropped first (a static crop), then moved.
+    let mut c = ken_burns(&p.wide, 0.0, 2.0, (1.3, (0.02, 0.0)), (1.1, (-0.02, 0.0)));
+    c.transform.crop_left = 0.1;
+    c.transform.crop_right = 0.05;
+    c.transform.crop_top = 0.08;
+    let tl = timeline(vec![vec![c]], delivery(1920, 1080, Fit::Cover));
+    assert!(takes_the_route(&tl, png, 0.5));
+    check_exact("ken-burns/cropped first", &tl, png, &times);
+    // Contain: a 4:3 picture pillarboxed in a 16:9 frame, zoomed in past the pillars.
+    let tl = timeline(
+        vec![vec![ken_burns(
+            &p.four_three,
+            0.0,
+            2.0,
+            (1.8, (0.05, 0.0)),
+            (1.6, (-0.05, 0.0)),
+        )]],
+        delivery(1920, 1080, Fit::Contain),
+    );
+    assert!(takes_the_route(&tl, std::slice::from_ref(&p.four_three), 0.5));
+    check_jpeg("ken-burns/contain", &tl, std::slice::from_ref(&p.four_three), &times);
+    // A vertical frame of a landscape photograph.
+    let tl = timeline(
+        vec![vec![ken_burns(&p.landscape, 0.0, 2.0, (1.2, (0.1, 0.0)), (1.0, (0.0, 0.0)))]],
+        delivery(1080, 1920, Fit::Cover),
+    );
+    assert!(takes_the_route(&tl, std::slice::from_ref(&p.landscape), 0.5));
+    check_jpeg("ken-burns/vertical frame", &tl, std::slice::from_ref(&p.landscape), &times);
+    // Rendered smaller than the delivery's frame, as the preview does: the scaled copy is made for that size.
+    let tl = timeline(
+        vec![vec![ken_burns(&p.wide, 0.0, 2.0, IN, HOME)]],
+        delivery(1920, 1080, Fit::Cover),
+    );
+    check_exact_at_width("ken-burns/png at 960", &tl, png, &times, 960);
+    check_exact_at_width("ken-burns/png at 540", &tl, png, &times, 540);
+    let tl = timeline(
+        vec![vec![ken_burns(&p.portrait, 0.0, 2.0, IN, HOME)]],
+        delivery(1920, 1080, Fit::Cover),
+    );
+    if policy() == CompositeColorPolicy::FixedBt601 {
+        check_exact_at_width(
+            "ken-burns/portrait at 960",
+            &tl,
+            std::slice::from_ref(&p.portrait),
+            &times,
+            960,
+        );
+    }
+}
+
+/// The move inside a transition: fading in and out, dissolving into and out of another still, sliding and pushing, dipping to black —
+/// the outgoing clip plays on past its end under the next with the move it has there, and the incoming one is faded or moved as the
+/// graph does it after the `perspective`.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_moving_still_inside_a_transition_is_drawn_as_ffmpegs_still_draws_it() {
+    let p = photos();
+    let both = [p.wide.clone(), p.landscape.clone()];
+    let moving = |photo: &Asset, start: f64| ken_burns(photo, start, 2.0, IN, HOME);
+    let fade = |edit: &dyn Fn(&mut Clip)| {
+        let mut c = moving(&p.wide, 0.0);
+        edit(&mut c);
+        timeline(vec![vec![c]], delivery(1920, 1080, Fit::Cover))
+    };
+    let png = std::slice::from_ref(&p.wide);
+    check_exact(
+        "ken-burns/fade-in",
+        &fade(&|c| c.fade_in = 0.7),
+        png,
+        &[0.0, 0.2, 0.5, 0.69, 1.0],
+    );
+    check_exact(
+        "ken-burns/fade-out",
+        &fade(&|c| c.fade_out = 0.7),
+        png,
+        &[1.0, 1.4, 1.6, 1.99],
+    );
+    for (name, kind) in [
+        ("crossfade", TransitionKind::Crossfade),
+        ("dip to black", TransitionKind::DipToBlack),
+        ("slide", TransitionKind::SlideLeft),
+        ("push", TransitionKind::PushLeft),
+    ] {
+        for (order, a, b) in [
+            ("png into jpeg", &p.wide, &p.landscape),
+            ("jpeg into png", &p.landscape, &p.wide),
+        ] {
+            let out = moving(a, 0.0);
+            let mut inc = moving(b, 1.5);
+            inc.transition_in = Some(Transition { kind, duration: 0.8 });
+            let tl = timeline(vec![vec![out, inc]], delivery(1920, 1080, Fit::Cover));
+            let assets = if order == "png into jpeg" {
+                both.clone()
+            } else {
+                [p.landscape.clone(), p.wide.clone()]
+            };
+            check_jpeg(
+                &format!("ken-burns/{name}, {order}"),
+                &tl,
+                &assets,
+                &[1.4, 1.6, 1.9, 2.2, 2.4, 3.0],
+            );
+        }
+    }
+}
+
+/// What the route is not drawn for stays FFmpeg's: the picture formats it was not measured for, a mask, a grade, a colour,
+/// an effect, a translucent or dipped layer, a keyed crop. Each is a still the plan refuses with the move named and FFmpeg renders.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn what_a_moving_still_is_not_drawn_for_is_refused() {
+    let p = photos();
+    let moving = |photo: &Asset| ken_burns(photo, 0.0, 2.0, IN, HOME);
+    let one = |c: Clip| timeline(vec![vec![c]], delivery(1920, 1080, Fit::Cover));
+    for (name, photo) in [
+        ("4:2:2 jpeg", &p.jpeg_422),
+        ("png with alpha", &p.rgba),
+        ("gray png", &p.gray),
+    ] {
+        let tl = one(moving(photo));
+        check_refused(
+            &format!("ken-burns/{name}"),
+            &tl,
+            std::slice::from_ref(photo),
+            0.5,
+            Refusal::Plan("a still whose picture moves"),
+        );
+    }
+    let png = std::slice::from_ref(&p.wide);
+    let refused = |name: &str, edit: &dyn Fn(&mut Clip)| {
+        let mut c = moving(&p.wide);
+        edit(&mut c);
+        check_refused(
+            &format!("ken-burns/{name}"),
+            &one(c),
+            png,
+            0.5,
+            Refusal::Plan("a still whose picture moves"),
+        );
+    };
+    refused("colour", &|c| {
+        c.color = Color {
+            contrast: 1.2,
+            ..Color::default()
+        }
+    });
+    refused("translucent", &|c| c.keyframes.iter_mut().for_each(|k| k.opacity = 0.6));
+    refused("grayscale", &|c| c.effects = vec![kerf_core::VideoEffect::Grayscale]);
+    // A mask, a blur, a sharpen, a vignette, a rotation: the general chain draws those (the move is a moving zoom there, placed after
+    // them), so the route is not taken at all.
+    for (name, edit) in [
+        (
+            "mask",
+            Box::new(|c: &mut Clip| c.mask = Some(a_mask(kerf_core::MaskShape::Ellipse, 0.2, false))) as Box<dyn Fn(&mut Clip)>,
+        ),
+        (
+            "blur",
+            Box::new(|c: &mut Clip| c.effects = vec![kerf_core::VideoEffect::Blur { sigma: 3.0 }]),
+        ),
+        (
+            "rotation",
+            Box::new(|c: &mut Clip| c.keyframes.iter_mut().for_each(|k| k.rotation = 4.0)),
+        ),
+    ] {
+        let mut c = moving(&p.wide);
+        edit(&mut c);
+        assert!(!takes_the_route(&one(c), png, 0.5), "{name} takes the moving still's route");
+    }
+}
+
+/// A move that leaves the frame bare at its start (the photograph at the frame's size, panned off its edge) is not the moving still's
+/// route: the graph draws it as footage with a moving zoom, the picture fitted to the frame and then placed by the placement. The plan
+/// says which of the two it is, so the one is not mistaken for the other, and FFmpeg makes the fit picture the placement is laid from
+/// (an enlargement of a full-range JPEG, an RGB picture's conversion: its own scaler's).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_move_that_pans_off_the_picture_is_placed_from_the_fit_ffmpeg_makes() {
+    let p = photos();
+    let times = [0.0, 0.5, 1.0, 1.5, 1.99];
+    let edge = |photo: &Asset| {
+        timeline(
+            vec![vec![ken_burns(photo, 0.0, 2.0, (1.0, (-0.03, 0.0)), (1.18, (0.03, -0.02)))]],
+            delivery(1920, 1080, Fit::Cover),
+        )
+    };
+    for (name, photo) in [
+        ("jpeg 3:2", &p.landscape),
+        ("jpeg portrait", &p.portrait),
+        ("jpeg odd", &p.odd),
+        ("png 16:9", &p.wide),
+    ] {
+        let tl = edge(photo);
+        assert!(
+            !takes_the_route(&tl, std::slice::from_ref(photo), 0.5),
+            "{name}: the moving still's route"
+        );
+        let case = format!("pan-off/{name}");
+        if name.starts_with("png") {
+            check_exact(&case, &tl, std::slice::from_ref(photo), &times);
+        } else {
+            check_jpeg(&case, &tl, std::slice::from_ref(photo), &times);
+        }
+    }
+    // A fade running on the enlarged JPEG, the case a full-range resize used to be refused for, and a dissolve between two such pictures.
+    let mut fading = ken_burns(&p.portrait, 0.0, 2.0, (1.0, (-0.03, 0.0)), (1.18, (0.03, -0.02)));
+    fading.fade_in = 0.7;
+    let tl = timeline(vec![vec![fading]], delivery(1920, 1080, Fit::Cover));
+    check_jpeg(
+        "pan-off/jpeg portrait, fading in",
+        &tl,
+        std::slice::from_ref(&p.portrait),
+        &[0.0, 0.3, 0.6, 1.0],
+    );
+    let out = ken_burns(&p.wide, 0.0, 2.0, (1.0, (-0.03, 0.0)), (1.18, (0.03, -0.02)));
+    let mut inc = ken_burns(&p.portrait, 1.5, 2.0, (1.0, (0.03, 0.0)), (1.18, (-0.03, 0.02)));
+    inc.transition_in = Some(Transition {
+        kind: TransitionKind::Crossfade,
+        duration: 0.8,
+    });
+    let tl = timeline(vec![vec![out, inc]], delivery(1920, 1080, Fit::Cover));
+    check_jpeg(
+        "pan-off/png into jpeg portrait, dissolving",
+        &tl,
+        &[p.wide.clone(), p.portrait.clone()],
+        &[1.4, 1.7, 2.0, 2.3, 2.6],
+    );
+    // Smaller than the delivery's frame, as the preview renders it.
+    let tl = edge(&p.portrait);
+    if policy() == CompositeColorPolicy::FixedBt601 {
+        check_exact_at_width("pan-off/portrait at 960", &tl, std::slice::from_ref(&p.portrait), &times, 960);
+    }
+    check_exact_at_width(
+        "pan-off/png at 960",
+        &edge(&p.wide),
+        std::slice::from_ref(&p.wide),
+        &times,
+        960,
+    );
 }

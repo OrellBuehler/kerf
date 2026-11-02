@@ -66,6 +66,8 @@ fn compositor() -> &'static Compositor {
         let _ = kerf_gpu::placement_probe::placement();
         // ... and so is the layout of its `drawtext`, which decides whether text whose bitmaps share samples is drawn.
         let _ = kerf_gpu::text::model();
+        // ... and for which kinds of picture a moving still is drawn as this FFmpeg draws it.
+        let _ = kerf_gpu::still_probe::kinds();
         Compositor::new(gpu()).expect("a compositor")
     })
 }
@@ -6953,4 +6955,456 @@ fn checker_a_a_placed_clip_in_an_export_in_parts() {
         }
     }
     checker_all("an export in parts", fails);
+}
+
+// ---- a still image on a Ken Burns move ---------------------------------------------------------------
+
+/// Photographs of the shapes a slideshow has: a 3:2 JPEG, a portrait one, an odd-sized one, a 16:9 PNG, and the formats the route is
+/// not measured for.
+struct Photos {
+    landscape: Asset,
+    portrait: Asset,
+    odd: Asset,
+    wide: Asset,
+    jpeg_422: Asset,
+    rgba: Asset,
+}
+
+fn photos() -> &'static Photos {
+    static P: OnceLock<Photos> = OnceLock::new();
+    P.get_or_init(|| {
+        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("motion-photos");
+        std::fs::create_dir_all(&dir).unwrap();
+        let photo = |name: &str, size: &str, quality: &[&str]| {
+            let p = dir.join(name);
+            let src = format!("testsrc2=size={size}:rate=1:duration=1");
+            let mut args = vec!["-f", "lavfi", "-i", src.as_str(), "-frames:v", "1"];
+            args.extend(quality.iter().copied());
+            args.push(p.to_str().unwrap());
+            ffmpeg(&args);
+            probed(&p)
+        };
+        let jpeg = ["-q:v", "3", "-pix_fmt", "yuvj420p"];
+        Photos {
+            landscape: photo("photo-3x2.jpg", "1920x1280", &jpeg),
+            portrait: photo("photo-portrait.jpg", "1280x1920", &jpeg),
+            odd: photo("photo-odd.jpg", "1501x1003", &jpeg),
+            wide: photo("photo-16x9.png", "1920x1080", &["-pix_fmt", "rgb24"]),
+            jpeg_422: photo("photo-422.jpg", "1920x1280", &["-q:v", "3", "-pix_fmt", "yuvj422p"]),
+            rgba: photo("photo-rgba.png", "1920x1080", &["-pix_fmt", "rgba"]),
+        }
+    })
+}
+
+/// A photograph held for `secs` from `start`, zooming in from 1.2x at the top left to the frame: nothing hangs off it.
+fn ken_burns(photo: &Asset, start: f64, secs: f64) -> Clip {
+    let mut c = clip(photo, 0.0, secs, start);
+    c.keyframes = vec![zoom_key(0.0, 1.2, 0.04, 0.03), zoom_key(secs, 1.0, 0.0, 0.0)];
+    c
+}
+
+fn cover(w: u32, h: u32) -> Option<Delivery> {
+    Some(Delivery::new(w, h, Fit::Cover))
+}
+
+/// Whether the plan of the export takes the moving still's route for a layer at `k`.
+fn takes_the_route(tl: &Timeline, assets: &[Asset], fps: f64, k: u64) -> bool {
+    let planner = Planner::new(tl, assets, &at_fps(fps), PlanRequest::motion(policy())).expect("planner");
+    let plan = planner.at_frame(k).expect("plan");
+    !plan.layers.is_empty() && plan.layers.iter().any(|l| plan.takes_still_route(l))
+}
+
+/// [`run`] for a case with a JPEG in the cut: drawn where this FFmpeg's composite range is fixed (6.1.1), refused whole where it is
+/// negotiated (9.0.2 flags a cut that holds a full-range picture full range, and converts every frame of it, the ones before and after
+/// the picture too).
+fn run_jpeg(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, secs: f64, limits: Limits) {
+    if policy() == CompositeColorPolicy::FixedBt601 {
+        run(case, tl, assets, fps, secs, limits);
+    } else {
+        run_refusing(case, tl, assets, fps, secs, limits, &full_range_cut_refused());
+    }
+}
+
+/// A moving still is one picture, moved by one `perspective` per frame: the planes of every export frame are the compositor's,
+/// every sample, for each kind of photograph the route is measured for.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_moving_still_is_drawn_as_the_export_draws_it() {
+    let p = photos();
+    for (name, photo) in [
+        ("jpeg 3:2", &p.landscape),
+        ("jpeg portrait", &p.portrait),
+        ("jpeg odd", &p.odd),
+        ("png 16:9", &p.wide),
+    ] {
+        let tl = timeline(vec![vec![ken_burns(photo, 0.0, 1.0)]], cover(1920, 1080));
+        assert!(
+            takes_the_route(&tl, std::slice::from_ref(photo), 30.0, 3),
+            "{name}: not the moving still's route"
+        );
+        let case = format!("ken-burns/{name}");
+        if name.starts_with("png") {
+            run(&case, &tl, std::slice::from_ref(photo), 30.0, 1.0, EXACT);
+        } else {
+            run_jpeg(&case, &tl, std::slice::from_ref(photo), 30.0, 1.0, EXACT);
+        }
+    }
+    // The frame rates the pick and the pose are counted in, a clip that starts between two frames and one the speed retimes.
+    let png = std::slice::from_ref(&p.wide);
+    for fps in [24.0, 25.0, 60.0] {
+        let tl = timeline(vec![vec![ken_burns(&p.wide, 0.37, 1.0)]], cover(960, 540));
+        run_range(
+            &format!("ken-burns/png at {fps} fps, late"),
+            &tl,
+            png,
+            fps,
+            (0.37 * fps) as u64..(1.37 * fps) as u64 - 1,
+            EXACT,
+        );
+    }
+    let mut fast = ken_burns(&p.wide, 0.0, 1.0);
+    fast.speed = 2.0;
+    run(
+        "ken-burns/png at speed 2",
+        &timeline(vec![vec![fast]], cover(960, 540)),
+        png,
+        30.0,
+        0.5,
+        EXACT,
+    );
+    let mut back = ken_burns(&p.wide, 0.0, 1.0);
+    back.speed = -1.0;
+    run(
+        "ken-burns/png reversed",
+        &timeline(vec![vec![back]], cover(960, 540)),
+        png,
+        30.0,
+        1.0,
+        EXACT,
+    );
+}
+
+/// The shapes of the move, as the still has them: a held zoom with a pan, a crop first, three keys eased, `Contain` zoomed past the
+/// pillarbox, a vertical frame, and the layers around it (a video under a photograph, a photograph under a video).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn the_shapes_of_a_ken_burns_move_are_drawn_as_the_export_draws_them() {
+    let p = photos();
+    let m = media();
+    let png = std::slice::from_ref(&p.wide);
+    let mut held = clip(&p.wide, 0.0, 1.0, 0.0);
+    held.keyframes = vec![zoom_key(0.0, 1.4, -0.1, 0.05), zoom_key(1.0, 1.4, 0.1, -0.05)];
+    run(
+        "ken-burns/held zoom, panning",
+        &timeline(vec![vec![held]], cover(960, 540)),
+        png,
+        30.0,
+        1.0,
+        EXACT,
+    );
+    let mut keyed = clip(&p.wide, 0.0, 1.0, 0.0);
+    keyed.keyframes = vec![
+        zoom_key(0.0, 1.5, 0.0, 0.0),
+        zoom_key(0.4, 1.15, 0.05, 0.02),
+        zoom_key(1.0, 1.6, -0.1, 0.0),
+    ];
+    keyed.keyframes[0].easing = kerf_core::Easing::EaseInOut;
+    run(
+        "ken-burns/three keys, eased",
+        &timeline(vec![vec![keyed]], cover(960, 540)),
+        png,
+        30.0,
+        1.0,
+        EXACT,
+    );
+    let mut cropped = ken_burns(&p.wide, 0.0, 1.0);
+    cropped.transform.crop_left = 0.1;
+    cropped.transform.crop_right = 0.05;
+    cropped.transform.crop_top = 0.08;
+    run(
+        "ken-burns/cropped first",
+        &timeline(vec![vec![cropped]], cover(960, 540)),
+        png,
+        30.0,
+        1.0,
+        EXACT,
+    );
+    let mut pillar = clip(&p.landscape, 0.0, 1.0, 0.0);
+    pillar.keyframes = vec![zoom_key(0.0, 1.9, 0.05, 0.0), zoom_key(1.0, 1.7, -0.05, 0.0)];
+    let tl = timeline(vec![vec![pillar]], Some(Delivery::new(960, 540, Fit::Contain)));
+    run_jpeg("ken-burns/contain", &tl, std::slice::from_ref(&p.landscape), 30.0, 1.0, EXACT);
+    let tl = timeline(vec![vec![ken_burns(&p.landscape, 0.0, 1.0)]], cover(540, 960));
+    run_jpeg(
+        "ken-burns/vertical frame",
+        &tl,
+        std::slice::from_ref(&p.landscape),
+        30.0,
+        1.0,
+        EXACT,
+    );
+    // Over a video, and under one.
+    let tl = timeline(
+        vec![vec![clip(&m.testsrc, 0.5, 1.5, 0.0)], vec![ken_burns(&p.wide, 0.0, 1.0)]],
+        cover(640, 360),
+    );
+    run(
+        "ken-burns/over video",
+        &tl,
+        &[m.testsrc.clone(), p.wide.clone()],
+        30.0,
+        1.0,
+        EXACT,
+    );
+    let mut pip = clip(&m.testsrc, 0.5, 1.5, 0.0);
+    pip.transform.scale = 0.5;
+    pip.transform.pos_x = 0.25;
+    let tl = timeline(vec![vec![ken_burns(&p.wide, 0.0, 1.0)], vec![pip]], cover(640, 360));
+    run(
+        "ken-burns/under a picture in picture",
+        &tl,
+        &[m.testsrc.clone(), p.wide.clone()],
+        30.0,
+        1.0,
+        SCALED,
+    );
+}
+
+/// The move inside a transition: the outgoing clip plays on past its end under the next with its move, and the incoming one is faded,
+/// dissolved, slid or pushed as the graph does it after the `perspective`.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_moving_still_inside_a_transition_is_drawn_as_the_export_draws_it() {
+    let p = photos();
+    let png = std::slice::from_ref(&p.wide);
+    let one = |edit: &dyn Fn(&mut Clip)| {
+        let mut c = ken_burns(&p.wide, 0.0, 1.0);
+        edit(&mut c);
+        timeline(vec![vec![c]], cover(960, 540))
+    };
+    run("ken-burns/fade-in", &one(&|c| c.fade_in = 0.5), png, 30.0, 1.0, EXACT);
+    run("ken-burns/fade-out", &one(&|c| c.fade_out = 0.5), png, 30.0, 1.0, EXACT);
+    run(
+        "ken-burns/fades both",
+        &one(&|c| {
+            c.fade_in = 0.4;
+            c.fade_out = 0.4;
+        }),
+        png,
+        30.0,
+        1.0,
+        EXACT,
+    );
+    for (name, kind) in [
+        ("crossfade", TransitionKind::Crossfade),
+        ("dip to black", TransitionKind::DipToBlack),
+        ("slide", TransitionKind::SlideLeft),
+        ("push", TransitionKind::PushLeft),
+    ] {
+        for (order, a, b) in [
+            ("png into jpeg", &p.wide, &p.landscape),
+            ("jpeg into png", &p.landscape, &p.wide),
+            ("png into png", &p.wide, &p.wide),
+        ] {
+            let out = ken_burns(a, 0.0, 1.0);
+            let mut inc = ken_burns(b, 1.0, 1.0);
+            inc.transition_in = Some(Transition { kind, duration: 0.6 });
+            let tl = timeline(vec![vec![out, inc]], cover(960, 540));
+            let assets = [a.clone(), b.clone()];
+            let case = format!("ken-burns/{name}, {order}");
+            if order == "png into png" {
+                run(&case, &tl, &assets, 30.0, 2.0, EXACT);
+            } else {
+                run_jpeg(&case, &tl, &assets, 30.0, 2.0, EXACT);
+            }
+        }
+    }
+    // The slideshow itself: JPEGs and a PNG of three shapes, the first fading in, crossfaded, the last fading out.
+    let mut clips = Vec::new();
+    for (i, photo) in [&p.landscape, &p.portrait, &p.wide, &p.landscape].into_iter().enumerate() {
+        let mut c = ken_burns(photo, i as f64 * 0.8, 1.0);
+        if i > 0 {
+            c.transition_in = Some(Transition {
+                kind: TransitionKind::Crossfade,
+                duration: 0.2,
+            });
+        }
+        clips.push(c);
+    }
+    clips[0].fade_in = 0.3;
+    clips[3].fade_out = 0.3;
+    let tl = timeline(vec![clips], cover(960, 540));
+    run_jpeg(
+        "ken-burns/slideshow",
+        &tl,
+        &[p.landscape.clone(), p.portrait.clone(), p.wide.clone()],
+        30.0,
+        3.4,
+        EXACT,
+    );
+}
+
+/// What the route is not drawn for stays FFmpeg's, on every frame: the picture formats it was not measured for, a mask, a colour, a
+/// translucent layer, an effect, a keyed crop.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn what_a_moving_still_is_not_drawn_for_is_refused_in_an_export_frame() {
+    let p = photos();
+    let still = |c: Clip| timeline(vec![vec![c]], cover(960, 540));
+    for (name, photo) in [("4:2:2 jpeg", &p.jpeg_422), ("png with alpha", &p.rgba)] {
+        refused(
+            &format!("ken-burns/{name}"),
+            &still(ken_burns(photo, 0.0, 1.0)),
+            std::slice::from_ref(photo),
+            &at_fps(30.0),
+            upto(1.0, 30.0),
+            "a still whose picture moves",
+        );
+    }
+    let png = std::slice::from_ref(&p.wide);
+    let case = |name: &str, edit: &dyn Fn(&mut Clip)| {
+        let mut c = ken_burns(&p.wide, 0.0, 1.0);
+        edit(&mut c);
+        refused(
+            &format!("ken-burns/{name}"),
+            &still(c),
+            png,
+            &at_fps(30.0),
+            upto(1.0, 30.0),
+            "a still whose picture moves",
+        );
+    };
+    case("colour", &|c| {
+        c.color = Color {
+            contrast: 1.2,
+            ..Color::default()
+        }
+    });
+    case("translucent", &|c| c.keyframes.iter_mut().for_each(|k| k.opacity = 0.6));
+    case("grayscale", &|c| c.effects = vec![kerf_core::VideoEffect::Grayscale]);
+    // A mask, a blur, a rotation: the general chain draws those (the move is a moving zoom there, placed after them), so the route is
+    // not taken at all.
+    for (name, edit) in [
+        (
+            "mask",
+            Box::new(|c: &mut Clip| c.mask = Some(mask_of(kerf_core::MaskShape::Ellipse, 0.2, false))) as Box<dyn Fn(&mut Clip)>,
+        ),
+        (
+            "blur",
+            Box::new(|c: &mut Clip| c.effects = vec![kerf_core::VideoEffect::Blur { sigma: 3.0 }]),
+        ),
+        (
+            "rotation",
+            Box::new(|c: &mut Clip| c.keyframes.iter_mut().for_each(|k| k.rotation = 4.0)),
+        ),
+    ] {
+        let mut c = ken_burns(&p.wide, 0.0, 1.0);
+        edit(&mut c);
+        assert!(
+            !takes_the_route(&still(c), png, 30.0, 3),
+            "{name} takes the moving still's route"
+        );
+    }
+    // A keyed crop is the moving still's too, which no pass draws.
+    let mut cropping = ken_burns(&p.wide, 0.0, 1.0);
+    cropping.set_property_keys(
+        kerf_core::Property::CropZoom,
+        vec![kerf_core::PropertyKey::new(0.0, 1.0), kerf_core::PropertyKey::new(1.0, 1.3)],
+    );
+    refused(
+        "ken-burns/keyed crop",
+        &still(cropping),
+        png,
+        &at_fps(30.0),
+        upto(1.0, 30.0),
+        "keyframed crop",
+    );
+}
+
+/// A move that leaves the frame bare at its start is the general chain's: the picture is fitted to the frame (a `scale` and a `crop`) and then
+/// placed by the placement, and FFmpeg makes the fit picture the placement is laid from, in the same pass that converts a JPEG's range or an
+/// RGB picture, so an enlargement of a full-range JPEG and a PNG are drawn to the sample.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_move_that_pans_off_the_picture_is_placed_from_the_fit_ffmpeg_makes_in_an_export_frame() {
+    let p = photos();
+    let edge = |photo: &Asset, start: f64| {
+        let mut c = clip(photo, 0.0, 1.0, start);
+        c.keyframes = vec![zoom_key(0.0, 1.0, -0.03, 0.0), zoom_key(1.0, 1.18, 0.03, -0.02)];
+        c
+    };
+    for (name, photo) in [
+        ("jpeg 3:2", &p.landscape),
+        ("jpeg portrait", &p.portrait),
+        ("jpeg odd", &p.odd),
+        ("png 16:9", &p.wide),
+    ] {
+        let tl = timeline(vec![vec![edge(photo, 0.0)]], cover(1920, 1080));
+        assert!(
+            !takes_the_route(&tl, std::slice::from_ref(photo), 30.0, 3),
+            "{name}: the moving still's route"
+        );
+        let case = format!("pan-off/{name}");
+        if name.starts_with("png") {
+            run(&case, &tl, std::slice::from_ref(photo), 30.0, 1.0, EXACT);
+        } else {
+            run_jpeg(&case, &tl, std::slice::from_ref(photo), 30.0, 1.0, EXACT);
+        }
+    }
+    // Fading in, dissolving into another photograph, and the slideshow's own mix of both routes.
+    let mut fading = edge(&p.portrait, 0.0);
+    fading.fade_in = 0.5;
+    run_jpeg(
+        "pan-off/jpeg portrait, fading in",
+        &timeline(vec![vec![fading]], cover(960, 540)),
+        std::slice::from_ref(&p.portrait),
+        30.0,
+        1.0,
+        EXACT,
+    );
+    let mut inc = edge(&p.portrait, 1.0);
+    inc.transition_in = Some(Transition {
+        kind: TransitionKind::Crossfade,
+        duration: 0.6,
+    });
+    run_jpeg(
+        "pan-off/png into jpeg portrait, dissolving",
+        &timeline(vec![vec![edge(&p.wide, 0.0), inc]], cover(960, 540)),
+        &[p.wide.clone(), p.portrait.clone()],
+        30.0,
+        2.0,
+        EXACT,
+    );
+    // The photo slideshow archetype: the three shapes on a slow move, half of them panning off the frame's edge, half inside it,
+    // crossfaded, the first fading in and the last out.
+    let mut clips = Vec::new();
+    for (i, photo) in [&p.landscape, &p.portrait, &p.wide, &p.landscape, &p.portrait, &p.wide]
+        .into_iter()
+        .enumerate()
+    {
+        let mut c = clip(photo, 0.0, 1.0, i as f64 * 0.8);
+        let dir = if i % 2 == 0 { 1.0 } else { -1.0 };
+        c.keyframes = if i % 4 < 2 {
+            vec![zoom_key(0.0, 1.0, -0.03 * dir, 0.0), zoom_key(1.0, 1.18, 0.03 * dir, -0.02)]
+        } else {
+            vec![zoom_key(0.0, 1.2, 0.04 * dir, 0.03), zoom_key(1.0, 1.0, 0.0, 0.0)]
+        };
+        if i > 0 {
+            c.transition_in = Some(Transition {
+                kind: TransitionKind::Crossfade,
+                duration: 0.2,
+            });
+        }
+        clips.push(c);
+    }
+    clips[0].fade_in = 0.3;
+    clips[5].fade_out = 0.3;
+    let tl = timeline(vec![clips], cover(960, 540));
+    run_jpeg(
+        "ken-burns/slideshow, both routes",
+        &tl,
+        &[p.landscape.clone(), p.portrait.clone(), p.wide.clone()],
+        30.0,
+        4.8,
+        EXACT,
+    );
 }
