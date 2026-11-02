@@ -703,6 +703,34 @@ before the zoom acts at the **fit size** and the zoom magnifies it (a blur grows
   the whole frame first, with opaque bars). **A grade ahead of the placement is drawn** (where the compositor draws the grade at all: `GpuCaps::grade`, which
   the conversion probe gates): all twelve grades of the harness (wheels, curves, LUTs of 17, 33 and 2 points, all three) are exact behind a moving zoom and a
   moving position on 6.1.1 and 9.0.2, in an export frame and in a still.
+* **Moving stills (Ken Burns)** (`GpuCaps::still_motion`: `StillKinds`, `still_probe`; `core-render-plan.md`, `engine-cli.md` "A moving still"): a still image
+  whose zoom or position moves is drawn by **FFmpeg making the picture and the compositor moving it**. The moving still's route (the move stays inside the
+  frame) is the export's scaled copy of the file (`scale` to `q` with the delivery's scaler, Lanczos by default, `crop` to the window any frame reads:
+  `kerf_core::StillMotion::once`) and one `perspective` per frame; the compositor asks FFmpeg for the copy (`source::copy_of`: the engine's own `once` text
+  then `format=yuva420p`, which is the format the graph's negotiation gives the chain, since `perspective` and `overlay` both take `yuva420p`, so the
+  scaler converts the range of a JPEG or the RGB of a PNG in the same pass that resizes it; decoded once and cached beside the file, keyed by the filters)
+  and draws the `perspective` from its own table (`PlacementMap::from_corners` over `PlacementFrame::window`: the same shader and tables as the placement,
+  the filter's `lrint` and 8-bit fixed point, from corners the plan evaluates in the expression's operation order). The result is a frame-sized layer; the
+  fades, the dissolve and the travel of a slide or push act on it after, as the graph has them (`composite_texts`' `moved_of`, ahead of the layer's stages).
+  A move that leaves the frame bare is the general chain's (a moving zoom with a placement): the compositor draws that placement as before, and **FFmpeg makes the
+  fit picture** it is laid from (`kerf_core::FitCopy`: the geometry's `crop` / `scale` / `crop` stages as text, then `format=yuva420p`), which lifts, for an
+  `yuvj420p` or `rgb24` still, the resize of a full-range or RGB picture, the scaler's one level and the chroma grid of the crop (all FFmpeg's own).
+  **The export draws the frame at the delivery's size**: an export frame's copy is made for it (a render at another size is refused); a still plan's copy depends
+  on the size it renders at (`StillMotion::build` over the instant), so `RenderPlan::for_render(size)` works it out (`render_plan*` do; a harness calls it).
+  `still_probe` (per kind, `jpeg()` / `rgb()`, the `measure` slot and backoff of the other probes, run by `prepare`) is what lets the kind into the caps: a toy cut
+  (a landscape, a portrait and a small noise picture of the kind, 64x36 Cover at 30 fps, both routes) is exported by the engine's own graph
+  (`kerf_core::export_graph`, `still_graph`) and every sample of every frame of the export and of the still is held to the model with no tolerance (a shift of
+  0.01 samples in a corner is `Differs`). 6.1.1: both kinds `Match`; 9.0.2: `rgb24` `Match`, `yuvj420p` `Differs` on the placement route (3 to 5 levels, the
+  `PlacedFormat` full-range finding) and refused by policy anyway. **Refused** (each a specific `StillMotion` detail, a held case in `parity.rs` /
+  `motion_parity.rs` with FFmpeg rendering the fallback): a kind not measured (4:2:2 / 4:4:4 JPEG, RGBA / gray / palette PNG, a `yuv420p` file), a full-range
+  picture where the composite's range is negotiated (9.0.2: `FullRangeCut` in every export frame of a cut that holds a JPEG, `StillMotion` in a still), colour, a
+  grade, an effect, a mask, a translucent layer or a dip to white on the still, a keyed crop (`KeyedCrop`), a render size the copy was not made for. A mask, a blur, a
+  sharpen, a vignette or a rotation make the move the general chain's (the route is not taken at all).
+  Held to FFmpeg (0 differing samples): `parity.rs` `a_moving_still_is_drawn_as_ffmpegs_still_draws_it` (JPEG 3:2, portrait, 4:3, odd-sized, PNG 16:9),
+  `the_shapes_of_a_ken_burns_move_*` (held zoom, three keys eased, cropped first, Contain, a vertical frame, renders at 960 and 540 wide as planes against
+  `timeline_frame_yuv`), `a_moving_still_inside_a_transition_*` (fades, crossfade, dip, slide, push, both orders of JPEG and PNG),
+  `a_move_that_pans_off_the_picture_is_placed_from_the_fit_ffmpeg_makes`; `motion_parity.rs` the same in export frames at 24 / 25 / 30 / 60 fps, late, speed 2,
+  reversed, over and under video, and the slideshow archetype (both routes, 144 frames).
 * **Live behaviours** (`GpuCaps::behaviors`; `core-render-plan.md`): breathe, drift and shake are a formula of the clip's clock added to its pose, the plan's
   `transform` is the exact pose they give at the frame (`Clip::transform_at`, the arithmetic of the graph's expressions, `sin` / `cos` included), and the
   placement draws that pose: held exactly in export frames and stills (`behavior/*`: each alone, all three, over a keyed zoom). A sway or a spin turns the
