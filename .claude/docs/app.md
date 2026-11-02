@@ -41,13 +41,16 @@ working towards a result that would be dropped is killed instead of finishing.
 stop that arrives before its start, and a reloaded page whose counter restarted at 1 all resolve by comparison.
 
 **Headless mode** (`headless.rs`, `shell.rs`). `kerf-app --headless [--stdio [--tools SETS]] [--project x.kerf | --new-project x.kerf]
-[--mcp-addr ADDR] [--data-dir DIR] [--token-file PATH] [--show-token] [--review] [--proxies] [--cpu-percent N]
+[--workspace DIR] [--mcp-addr ADDR] [--data-dir DIR] [--token-file PATH] [--show-token] [--review] [--proxies] [--cpu-percent N]
 [--cache-dir DIR] [--cache-max-gb N] [--prefetch-models LIST]` runs the MCP
 server with no display and no webview: `main.rs` calls `headless_main()` before `run()`, which builds no Tauri app (tao
 initialises GTK and panics with no display) and runs on `tauri::async_runtime` with a `Shell::Headless` in place of the
 `AppHandle` — so **code the MCP server reaches takes a `Shell` or `&impl Host`, never an `AppHandle`**. On Linux the binary
 still links GTK / WebKitGTK (the libraries must be installed, a display need not be). `--project` must exist and
-`--new-project` must not (exit 2); with neither, an untitled recovery-backed project as in the window. Directories: the
+`--new-project` must not (exit 2); with neither, an untitled recovery-backed project as in the window. `--workspace DIR`
+(else `KERF_WORKSPACE`; for a server remote agents reach) confines every path an MCP client names to DIR (`mcp.md`
+"Workspace"): DIR must be an existing directory (else exit 2), and `--project` / `--new-project` then resolve against DIR
+and must lie inside it (exit 2); `--data-dir` / `--token-file` are the operator's and stay unconfined. Directories: the
 desktop app's config / data dirs for the build's identifier (`context()`, the one `generate_context!`, so a debug build uses
 `.dev`), or `--data-dir` for settings, logs and recovery alike (CI isolation). No single-instance plugin: a taken port exits
 3 (`port in use … --mcp-addr`), and two runs sharing a settings file can race to make the first token (use `--data-dir` or
@@ -67,8 +70,8 @@ original. A cap that cannot be kept — no cache directory (checked before anyth
 not a run without it. **Only this process's project is protected: do not point a desktop app or a second server at the
 same cache directory.** `stitched/` is not covered.
 No GPU preview, crash marker, reveal failsafe or launch slot. **stdout** is one JSON ready line once the
-listener is up — `{"kerf":"listening","url","addr","pid","project","agent_review","token_source":"env|settings|generated"}`
-— and `--help`; logs go to **stderr** (`init_logging(dir, to_stderr)`) and `<data>/logs`. The token is never printed unless
+listener is up — `{"kerf":"listening","url","addr","pid","project","agent_review","token_source":"env|settings|generated"}`, plus
+`workspace` (the resolved DIR) only when there is one — and `--help`; logs go to **stderr** (`init_logging(dir, to_stderr)`) and `<data>/logs`. The token is never printed unless
 `--show-token` (stderr, past the log file); `--token-file` writes it atomically with mode 0600; otherwise a stderr banner names
 the settings file. SIGINT / SIGTERM (Ctrl+C on Windows): the listener closes (`mcp::stop`), `AppState::stop_all` presses every
 Stop, proxies and agent jobs are cancelled and waited for up to 10 s, `recovery::on_exit` keeps an untitled project with work
@@ -88,7 +91,9 @@ downloads each into the cache through the same checked fetch the first use runs 
 `prepare_voiceover`, `prepare_stems`, `prepare_soundfont`), progress on stderr, and exits 0, 1 if one failed, 2 for a bad list (checked at parse). The
 hosted image (`deploy/`) runs it from its entrypoint (`KERF_PREFETCH_MODELS`).
 `tests/headless.rs` drives the real binary (no `DISPLAY`): ready line, 401 / 200 / 202, two tools, SIGTERM → 0; a capped run
-prunes an aged cache in its `--cache-dir` and leaves models, `stitched/` and a fresh `.part` alone; a bad ceiling is exit 2.
+prunes an aged cache in its `--cache-dir` and leaves models, `stitched/` and a fresh `.part` alone; a bad ceiling is exit 2; and a
+`--workspace` run: imports and outputs outside it refused, relative ones resolved in it (the import, which needs ffprobe,
+`#[ignore]`d).
 
 **Process start.** `use_bundled_ffmpeg()` sets `KERF_FFMPEG` / `KERF_FFPROBE` and is the **first statement of `run()`**,
 before the runtime, the webview or any thread exists (`set_var` races every concurrent read of the environment);

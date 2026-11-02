@@ -15,7 +15,10 @@ use rmcp::{schemars, tool, tool_router, ErrorData as McpError};
 use uuid::Uuid;
 
 use super::templates::control_values;
-use super::{blocking, core_err, json, lock_agent_as, parse_arg, png_result, refuse_overwrite, KerfMcp, MAX_PREVIEW_WIDTH};
+use super::workspace::confine;
+use super::{
+    blocking, core_err, json, lock_agent_as, parse_arg, png_result, refuse_overwrite, KerfMcp, Workspace, MAX_PREVIEW_WIDTH,
+};
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
@@ -159,7 +162,7 @@ fn bad(message: impl Into<String>) -> McpError {
 
 /// The core spec a call's arguments stand for, every file it names read (bounded) into a `data:` URL.
 /// Reads files: for the blocking pool, before any lock.
-fn spec_of(args: ThumbnailArgs) -> Result<ThumbnailSpec, McpError> {
+fn spec_of(workspace: Option<&Workspace>, args: ThumbnailArgs) -> Result<ThumbnailSpec, McpError> {
     let layers = match args.layers {
         None => None,
         Some(layers) => Some(
@@ -168,13 +171,14 @@ fn spec_of(args: ThumbnailArgs) -> Result<ThumbnailSpec, McpError> {
                 .map(|l| {
                     let image = match l.image_file {
                         Some(path) => {
+                            let path = confine(workspace, &path)?;
                             crate::require_local_input_path(&path).map_err(bad)?;
                             Some(crate::template_image_data_url(&path).map_err(core_err)?)
                         }
                         None => None,
                     };
                     let values = (l.values.is_some() || l.image_files.is_some())
-                        .then(|| control_values(l.values, l.image_files))
+                        .then(|| control_values(workspace, l.values, l.image_files))
                         .transpose()?;
                     Ok(ThumbnailLayerSpec {
                         layer_id: l.layer_id,
@@ -263,6 +267,7 @@ fn outcome(done: ThumbnailResult) -> Result<String, McpError> {
 /// Build the thumbnail (`id`, or a new one) off the lock: read what it starts from under it, then
 /// prepare with it released.
 fn prepare(
+    workspace: Option<&Workspace>,
     project: &Mutex<Project>,
     owner: Option<&str>,
     id: Option<Uuid>,
@@ -272,7 +277,7 @@ fn prepare(
         .layers
         .as_ref()
         .is_some_and(|ls| ls.iter().any(|l| l.template_id.is_some()));
-    let spec = spec_of(args)?;
+    let spec = spec_of(workspace, args)?;
     let library = uses_templates
         .then(kerf_core::TemplateLibrary::default_location)
         .transpose()
@@ -322,7 +327,8 @@ impl KerfMcp {
     )]
     async fn add_thumbnail(&self, Parameters(p): Parameters<AddThumbnailParams>) -> Result<String, McpError> {
         let (project, owner) = (self.project.clone(), self.owner());
-        let prepared = blocking(move || prepare(&project, owner.as_deref(), None, p.args)).await?;
+        let workspace = self.workspace.clone();
+        let prepared = blocking(move || prepare(workspace.as_deref(), &project, owner.as_deref(), None, p.args)).await?;
         self.edit(|project| outcome(project.apply_thumbnail_parsed(prepared).map_err(core_err)?))
     }
 
@@ -335,7 +341,8 @@ impl KerfMcp {
     async fn update_thumbnail(&self, Parameters(p): Parameters<UpdateThumbnailParams>) -> Result<String, McpError> {
         let id = parse_arg("thumbnail_id", &p.thumbnail_id)?;
         let (project, owner) = (self.project.clone(), self.owner());
-        let prepared = blocking(move || prepare(&project, owner.as_deref(), Some(id), p.args)).await?;
+        let workspace = self.workspace.clone();
+        let prepared = blocking(move || prepare(workspace.as_deref(), &project, owner.as_deref(), Some(id), p.args)).await?;
         self.edit(|project| outcome(project.apply_thumbnail_parsed(prepared).map_err(core_err)?))
     }
 
@@ -389,8 +396,9 @@ impl KerfMcp {
         Parameters(p): Parameters<ExportThumbnailParams>,
         context: RequestContext<RoleServer>,
     ) -> Result<String, McpError> {
-        crate::require_local_output_path(&p.output_path).map_err(bad)?;
-        let output = PathBuf::from(&p.output_path);
+        let output = self.path_arg(&p.output_path)?;
+        crate::require_local_output_path(&output).map_err(bad)?;
+        let output = PathBuf::from(output);
         kerf_core::thumbnail::ThumbnailFormat::from_path(&output).map_err(core_err)?;
         let id = p.thumbnail_id.as_deref().map(|s| parse_arg("thumbnail_id", s)).transpose()?;
         let thumbs: Vec<(Uuid, String)> = {
@@ -408,6 +416,7 @@ impl KerfMcp {
         }
         let names: Vec<String> = thumbs.iter().map(|(_, n)| n.clone()).collect();
         let paths = output_paths(&output, &names);
+        self.check_beside(paths.iter().map(PathBuf::as_path))?;
         for path in &paths {
             refuse_overwrite(path, p.overwrite.unwrap_or(false))?;
         }
@@ -503,7 +512,7 @@ mod tests {
             "layers": [{"text": {"text": "Hi", "color": "#ff0000"}, "y": 0.1}, {"layer_id": "x", "at": -1}],
         }))
         .unwrap();
-        let spec = spec_of(args).unwrap();
+        let spec = spec_of(None, args).unwrap();
         let layers = spec.layers.unwrap();
         let text = layers[0].text.as_ref().unwrap();
         assert_eq!(
@@ -517,6 +526,6 @@ mod tests {
         assert!(unknown.is_err());
         let relative =
             serde_json::from_value::<ThumbnailArgs>(serde_json::json!({"layers": [{"image_file": "logo.png"}]})).unwrap();
-        assert!(spec_of(relative).is_err());
+        assert!(spec_of(None, relative).is_err());
     }
 }

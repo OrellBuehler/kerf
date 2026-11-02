@@ -4,6 +4,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -66,29 +67,25 @@ impl Drop for Running {
     }
 }
 
-#[test]
-fn a_headless_run_serves_mcp_with_no_display_and_stops_on_sigterm() {
-    let dir = std::env::temp_dir().join(format!("kerf-headless-it-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let token = "h".repeat(48);
+/// `kerf-app --headless` started with `args` (and `dir` as its data directory), and its ready line.
+fn spawn(dir: &Path, args: &[&str], token: &str) -> (Running, serde_json::Value) {
     let log = std::fs::File::create(dir.join("stderr.log")).unwrap();
     let mut child = Running(
         Command::new(env!("CARGO_BIN_EXE_kerf-app"))
             .args(["--headless", "--mcp-addr", "127.0.0.1:0", "--data-dir"])
-            .arg(&dir)
-            .env("KERF_MCP_TOKEN", &token)
+            .arg(dir)
+            .args(args)
+            .env("KERF_MCP_TOKEN", token)
             .env_remove("DISPLAY")
             .env_remove("WAYLAND_DISPLAY")
             .env_remove("KERF_MCP_ADDR")
+            .env_remove("KERF_WORKSPACE")
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(log)
             .spawn()
             .expect("spawn kerf-app"),
     );
-    let stderr = || std::fs::read_to_string(dir.join("stderr.log")).unwrap_or_default();
-
     let stdout = child.0.stdout.take().unwrap();
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
@@ -96,15 +93,65 @@ fn a_headless_run_serves_mcp_with_no_display_and_stops_on_sigterm() {
         let _ = BufReader::new(stdout).read_line(&mut line);
         let _ = tx.send(line);
     });
+    let stderr = || std::fs::read_to_string(dir.join("stderr.log")).unwrap_or_default();
     let line = rx
         .recv_timeout(Duration::from_secs(120))
         .unwrap_or_else(|_| panic!("no ready line; stderr:\n{}", stderr()));
-    let ready: serde_json::Value =
-        serde_json::from_str(&line).unwrap_or_else(|e| panic!("ready line {line:?}: {e}; stderr:\n{}", stderr()));
+    let ready = serde_json::from_str(&line).unwrap_or_else(|e| panic!("ready line {line:?}: {e}; stderr:\n{}", stderr()));
+    (child, ready)
+}
+
+/// An initialized MCP session on `addr`: its `Authorization` and `Mcp-Session-Id`, and the
+/// `initialize` answer.
+fn session(addr: SocketAddr, token: &str) -> ([(String, String); 2], String) {
+    let auth = format!("Bearer {token}");
+    let (status, headers, body) = exchange(addr, &[("Authorization", &auth)], INITIALIZE, "\"id\":1");
+    assert_eq!(status, 200);
+    let session = headers
+        .into_iter()
+        .find(|(k, _)| k == "mcp-session-id")
+        .map(|(_, v)| v)
+        .expect("a session id");
+    let headers = [("Authorization".to_string(), auth), ("Mcp-Session-Id".to_string(), session)];
+    let on_session: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    assert_eq!(exchange(addr, &on_session, INITIALIZED, "").0, 202);
+    (headers, body)
+}
+
+/// A `tools/call` on a session: the response body.
+fn call(addr: SocketAddr, headers: &[(String, String); 2], id: u32, tool: &str, arguments: serde_json::Value) -> String {
+    let body = serde_json::json!({
+        "jsonrpc": "2.0", "id": id, "method": "tools/call",
+        "params": { "name": tool, "arguments": arguments },
+    })
+    .to_string();
+    let on_session: Vec<(&str, &str)> = headers.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let (status, _, body) = exchange(addr, &on_session, &body, &format!("\"id\":{id}"));
+    assert_eq!(status, 200, "{tool}: {body}");
+    body
+}
+
+/// A fresh directory for one test.
+fn scratch(name: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("kerf-headless-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+#[test]
+fn a_headless_run_serves_mcp_with_no_display_and_stops_on_sigterm() {
+    let dir = std::env::temp_dir().join(format!("kerf-headless-it-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let token = "h".repeat(48);
+    let (mut child, ready) = spawn(&dir, &[], &token);
+    let stderr = || std::fs::read_to_string(dir.join("stderr.log")).unwrap_or_default();
     assert_eq!(ready["kerf"], "listening", "{ready}");
     assert_eq!(ready["token_source"], "env");
     assert_eq!(ready["agent_review"], false, "nobody to review: edits land live");
     assert!(ready["project"].is_null());
+    assert!(ready.get("workspace").is_none(), "no workspace, no key");
     let addr: SocketAddr = ready["addr"].as_str().unwrap().parse().unwrap();
     assert_ne!(addr.port(), 0);
     assert_eq!(ready["url"], format!("http://{addr}/mcp"));
@@ -112,25 +159,9 @@ fn a_headless_run_serves_mcp_with_no_display_and_stops_on_sigterm() {
 
     let (status, _, _) = exchange(addr, &[], INITIALIZE, "\"id\":1");
     assert_eq!(status, 401, "no token, no entry");
-    let auth = format!("Bearer {token}");
-    let (status, headers, _) = exchange(addr, &[("Authorization", &auth)], INITIALIZE, "\"id\":1");
-    assert_eq!(status, 200);
-    let session = headers
-        .into_iter()
-        .find(|(k, _)| k == "mcp-session-id")
-        .map(|(_, v)| v)
-        .expect("a session id");
-    let on_session = [("Authorization", auth.as_str()), ("Mcp-Session-Id", session.as_str())];
-    assert_eq!(exchange(addr, &on_session, INITIALIZED, "").0, 202);
-
+    let (on_session, _) = session(addr, &token);
     let call = |id: u32, tool: &str, arguments: serde_json::Value| {
-        let body = serde_json::json!({
-            "jsonrpc": "2.0", "id": id, "method": "tools/call",
-            "params": { "name": tool, "arguments": arguments },
-        })
-        .to_string();
-        let (status, _, body) = exchange(addr, &on_session, &body, &format!("\"id\":{id}"));
-        assert_eq!(status, 200, "{tool}: {body}");
+        let body = call(addr, &on_session, id, tool, arguments);
         assert!(!body.contains("\"isError\":true"), "{tool}: {body}");
         body
     };
@@ -530,4 +561,178 @@ fn a_bad_cache_ceiling_is_a_usage_error() {
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(stderr.contains("takes a number of GiB above 0"), "{stderr}");
     }
+}
+
+/// The answer of a refused call: its JSON-RPC error message.
+fn refusal(body: &str) -> String {
+    let data = body
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .find(|d| d.starts_with('{'))
+        .unwrap_or(body);
+    let reply: serde_json::Value = serde_json::from_str(data).unwrap_or_else(|e| panic!("{body}: {e}"));
+    assert_eq!(reply["error"]["code"], -32602, "invalid_params: {reply}");
+    reply["error"]["message"].as_str().unwrap().to_string()
+}
+
+/// The text of a tool's answer, parsed as the JSON it holds.
+fn answer(body: &str) -> serde_json::Value {
+    let data = body
+        .lines()
+        .filter_map(|l| l.strip_prefix("data: "))
+        .find(|d| d.starts_with('{'))
+        .unwrap_or(body);
+    let reply: serde_json::Value = serde_json::from_str(data).unwrap_or_else(|e| panic!("{body}: {e}"));
+    let text = reply["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("no text: {reply}"));
+    serde_json::from_str(text).unwrap_or_else(|_| serde_json::Value::String(text.to_string()))
+}
+
+/// A one-second silent 8 kHz mono WAV.
+fn tone(path: &Path) {
+    let samples = 8000u32;
+    let mut wav = Vec::new();
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + samples * 2).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&8000u32.to_le_bytes());
+    wav.extend_from_slice(&16000u32.to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&(samples * 2).to_le_bytes());
+    wav.resize(wav.len() + samples as usize * 2, 0);
+    std::fs::write(path, wav).unwrap();
+}
+
+/// A run confined to a workspace: started in it, inputs and outputs outside it refused, relative ones
+/// resolved in it and shown back relative to it.
+fn workspace_run(name: &str) -> (PathBuf, PathBuf, Running, SocketAddr, [(String, String); 2], String) {
+    let dir = scratch(name);
+    let ws = dir.join("ws");
+    std::fs::create_dir_all(ws.join("media")).unwrap();
+    tone(&ws.join("media").join("tone.wav"));
+    tone(&dir.join("outside.wav"));
+    let token = "w".repeat(48);
+    // Kerf's own directory beside the workspace: an output is never written into it.
+    let data = dir.join("data");
+    std::fs::create_dir_all(&data).unwrap();
+    let (child, ready) = spawn(
+        &data,
+        &["--workspace", ws.to_str().unwrap(), "--new-project", "cut.kerf"],
+        &token,
+    );
+    assert_eq!(ready["kerf"], "listening", "{ready}");
+    let shown = ready["workspace"].as_str().expect("the ready line names the workspace");
+    assert_eq!(std::fs::canonicalize(shown).unwrap(), std::fs::canonicalize(&ws).unwrap());
+    assert!(ws.join("cut.kerf").is_file(), "--new-project resolves against the workspace");
+    let addr: SocketAddr = ready["addr"].as_str().unwrap().parse().unwrap();
+    let (on_session, init) = session(addr, &token);
+    (dir, ws, child, addr, on_session, init)
+}
+
+#[test]
+fn a_workspace_refuses_paths_outside_it_and_resolves_relative_ones_in_it() {
+    let (dir, ws, child, addr, on_session, init) = workspace_run("ws");
+    assert!(
+        init.contains("relative to the workspace"),
+        "the instructions say the rule: {init}"
+    );
+    let info = answer(&call(addr, &on_session, 2, "project_info", serde_json::json!({})));
+    assert_eq!(info["path"], "cut.kerf", "shown relative: {info}");
+    assert!(info["workspace"].as_str().is_some_and(|w| !w.is_empty()), "{info}");
+
+    let outside = dir.join("outside.wav");
+    for (id, path) in [
+        (3, outside.to_str().unwrap()),
+        (4, "../outside.wav"),
+        (5, "media/../../outside.wav"),
+    ] {
+        let why = refusal(&call(
+            addr,
+            &on_session,
+            id,
+            "import_asset",
+            serde_json::json!({ "path": path }),
+        ));
+        assert!(why.contains("outside the workspace"), "{path}: {why}");
+    }
+    let why = refusal(&call(
+        addr,
+        &on_session,
+        6,
+        "import_asset",
+        serde_json::json!({ "path": "media/missing.wav" }),
+    ));
+    assert!(
+        why.contains("does not exist") && why.contains("missing.wav"),
+        "resolved in the workspace: {why}"
+    );
+
+    call(
+        addr,
+        &on_session,
+        7,
+        "add_marker",
+        serde_json::json!({ "time": 1.0, "name": "ws-mark" }),
+    );
+    let why = refusal(&call(
+        addr,
+        &on_session,
+        8,
+        "export_markers",
+        serde_json::json!({ "output_path": "../markers.csv", "format": "csv" }),
+    ));
+    assert!(why.contains("outside the workspace"), "{why}");
+    assert!(!dir.join("markers.csv").exists());
+    let written = answer(&call(
+        addr,
+        &on_session,
+        9,
+        "export_markers",
+        serde_json::json!({ "output_path": "exports/../markers.csv", "format": "csv" }),
+    ));
+    assert!(written.get("path").is_some(), "{written}");
+    assert!(std::fs::read_to_string(ws.join("markers.csv")).unwrap().contains("ws-mark"));
+    let why = refusal(&call(
+        addr,
+        &on_session,
+        10,
+        "save_project_as",
+        serde_json::json!({ "path": "/tmp/elsewhere.kerf" }),
+    ));
+    assert!(why.contains("outside the workspace"), "{why}");
+    drop(child);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+#[ignore = "probes the file with the ffprobe binary"]
+fn a_workspace_imports_a_relative_path_and_shows_it_relative() {
+    let (dir, _, child, addr, on_session, _) = workspace_run("ws-import");
+    let asset = answer(&call(
+        addr,
+        &on_session,
+        2,
+        "import_asset",
+        serde_json::json!({ "path": "media/tone.wav" }),
+    ));
+    let relative = Path::new("media").join("tone.wav");
+    assert_eq!(asset["path"], relative.to_str().unwrap(), "{asset}");
+    let listed = call(addr, &on_session, 3, "list_assets", serde_json::json!({}));
+    assert!(listed.contains("tone.wav"), "{listed}");
+    let again = answer(&call(
+        addr,
+        &on_session,
+        4,
+        "import_asset",
+        serde_json::json!({ "path": asset["path"] }),
+    ));
+    assert_eq!(again["id"], asset["id"], "the path shown is one the server takes back");
+    drop(child);
+    let _ = std::fs::remove_dir_all(&dir);
 }

@@ -39,6 +39,21 @@ switch changes (`settings::update` → `settings_changed`; sessions on the old l
 `claude mcp add --transport http kerf <url> --header "Authorization: Bearer <token>"` (the URL quoted when it has a query) plus a generic
 `mcpServers` JSON snippet, and `tool_sets` (name, description, tool count: Prompts and tool sets, below);
 `regenerate_mcp_token` and `set_mcp_settings` (only `mcp_*` and `agent_review`) are the other two commands.
+**Workspace** (`mcp/workspace.rs`, headless `--workspace DIR` / `KERF_WORKSPACE` only, carried in `server::Overrides`
+into `KerfMcp.workspace`; the desktop app, the Tauri commands and a headless run without it are untouched). Every path a
+client names goes through `KerfMcp::path_arg` (`workspace::confine`; identity without a workspace) **before** the tool's
+own checks, which then see an absolute path: `import_asset`, `import_captions`, `set_grade`'s `lut_path`, `open_project`,
+`save_project_as`, `import_template`, `export_template`, template / thumbnail `image_files` and `image_file`, and every
+`output_path` (`export`, `export_variants`, `export_cover`, `export_srt`, `export_captions`, `export_interchange`,
+`export_markers`, `export_thumbnail`; the files they name beside it are held to it too, `check_beside`). A relative path
+resolves against DIR; the network check, a URL refusal and a pure lexical fold-and-compare (`inside`, both platforms'
+spellings tested; Windows drive-relative `C:x`, rooted `\x`, `a:stream` and trailing dots / spaces refused) run before
+any filesystem call; then the deepest existing ancestor is canonicalised and must lie in the canonical DIR (a link out of
+it, or one that leads nowhere, is refused), and the tool uses that resolved path. Refusals are `invalid_params` naming the
+workspace. In answers, `call_tool` cuts DIR's JSON-escaped spelling plus a separator after a `"` in each text block
+(`relative_in`; no re-serialising, stored paths stay absolute), so a path inside DIR comes back relative and can be passed
+back; resources (`kerf://jobs/…`) and error messages keep absolute paths. `project_info` gains `workspace` and the
+instructions a `WORKSPACE_NOTE` with DIR, only when set. Media an opened project already holds is not re-checked.
 It shares the **same** `Arc<Mutex<Project>>` the Tauri commands hold, so the agent edits the project the user has open.
 **stdio** (`kerf-app --headless --stdio`, `app.md`; rmcp `transport-io`): `server::start_stdio` does what `start` does short
 of a listener and a token (none is made or stored, the pipe is the trust boundary; no `CONTROL`, so `stop` is a no-op) and

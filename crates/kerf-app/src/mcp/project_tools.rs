@@ -71,8 +71,9 @@ fn refuse_replacing_while_reviewing(path: &Path, overwrite: bool, review: bool) 
     Ok(())
 }
 
-/// A `.kerf` path an agent may name: absolute, a local file path, ending in `.kerf`.
-fn project_path_arg(path: &str) -> Result<std::path::PathBuf, McpError> {
+/// A `.kerf` path an agent may name: absolute (or in the workspace), a local file path, ending in `.kerf`.
+fn project_path_arg(workspace: Option<&super::Workspace>, path: &str) -> Result<std::path::PathBuf, McpError> {
+    let path = &super::workspace::confine(workspace, path)?;
     crate::require_local_output_path(path).map_err(|e| McpError::invalid_params(e, None))?;
     let path = std::path::PathBuf::from(path);
     let is_kerf = path
@@ -263,7 +264,7 @@ impl KerfMcp {
         let timeline = project.working_timeline().map_err(core_err)?;
         let assets = project.list_assets().map_err(core_err)?;
         let staged = project.staged().map_err(core_err)?;
-        json(&serde_json::json!({
+        let mut info = serde_json::json!({
             "path": project.path().map(|p| p.display().to_string()),
             "in_memory": project.path().is_none(),
             "unsaved_work": unsaved_work(&project)?,
@@ -274,7 +275,11 @@ impl KerfMcp {
             "duration_secs": timeline.duration(),
             "agent_review": project.agent_review(),
             "staged": staged.as_ref().map(reads::staged_brief),
-        }))
+        });
+        if let Some(ws) = &self.workspace {
+            info["workspace"] = ws.root().into();
+        }
+        json(&info)
     }
 
     #[tool(
@@ -306,7 +311,7 @@ impl KerfMcp {
                        carry on in it."
     )]
     async fn save_project_as(&self, Parameters(p): Parameters<SaveAsParams>) -> Result<String, McpError> {
-        let path = project_path_arg(&p.path)?;
+        let path = project_path_arg(self.workspace.as_deref(), &p.path)?;
         let overwrite = p.overwrite.unwrap_or(false);
         let (shared, owner, app) = (self.project.clone(), self.owner(), self.app.clone());
         let saved = blocking(move || {
@@ -372,7 +377,7 @@ impl KerfMcp {
                        or ask them. Your staged proposal belongs to the project it was made on and does not follow."
     )]
     async fn open_project(&self, Parameters(p): Parameters<OpenParams>) -> Result<String, McpError> {
-        let path = project_path_arg(&p.path)?;
+        let path = project_path_arg(self.workspace.as_deref(), &p.path)?;
         kerf_core::paths::validate_import_path(&path).map_err(core_err)?;
         let discard = p.discard_unsaved.unwrap_or(false);
         require_discard_ok(&self.lock(), discard)?;
@@ -508,10 +513,10 @@ mod tests {
 
     #[test]
     fn a_project_path_is_an_absolute_local_kerf_file() {
-        assert!(project_path_arg("/tmp/cut.kerf").is_ok());
-        assert!(project_path_arg("/tmp/CUT.KERF").is_ok());
+        assert!(project_path_arg(None, "/tmp/cut.kerf").is_ok());
+        assert!(project_path_arg(None, "/tmp/CUT.KERF").is_ok());
         for bad in ["cut.kerf", "/tmp/cut.mp4", "/tmp/cut", "https://x.example/cut.kerf", "pipe:1"] {
-            let err = project_path_arg(bad).expect_err(bad);
+            let err = project_path_arg(None, bad).expect_err(bad);
             assert_eq!(err.code, rmcp::model::ErrorCode::INVALID_PARAMS, "{bad}");
         }
     }
