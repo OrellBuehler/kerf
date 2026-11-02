@@ -222,7 +222,11 @@ pub fn scan_big(len: usize, pairs: bool) {
         simd::with_path(p, || {
             for v in [0u8, 255] {
                 let mut buf = vec![v; len];
-                assert_eq!((simd::position_ne(&buf, v), simd::rposition_ne(&buf, v)), (None, None), "{p:?}");
+                assert_eq!(
+                    (simd::position_ne(&buf, v), simd::rposition_ne(&buf, v)),
+                    (None, None),
+                    "{p:?}"
+                );
                 let mut spots: Vec<usize> = vec![0, 1, 2, 15, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 4095, 4096, 4097];
                 spots.extend([
                     len - 1,
@@ -425,8 +429,8 @@ pub fn with_path_restores_after_a_panic() {
         let r = std::panic::catch_unwind(|| {
             simd::with_path(p, || {
                 assert_eq!(simd::path(), p);
-                panic!("on purpose")
-            })
+                panic!("on purpose");
+            });
         });
         assert!(r.is_err());
         assert_eq!(simd::path(), before, "{p:?}");
@@ -444,6 +448,7 @@ pub fn with_path_restores_after_a_panic() {
 
 /// `geq`'s `a='(keep)*alpha(X,Y)'` over an opaque plane, sample by sample, the exact `hypot` on every sample of an
 /// ellipse, nothing shared with `mask_plane.rs`: `lte(d,1)` / `clip((1-d)/f,0,1)`, `(1-inside)`, `*255` truncated.
+#[allow(clippy::manual_clamp)]
 pub fn geq_plane(mask: &Mask, w: u32, h: u32) -> Vec<u8> {
     let m = mask.normalized();
     let (rw, rh) = (m.width / 2.0, m.height / 2.0);
@@ -541,9 +546,9 @@ const FEATHERS: [f64; 24] = [
     1e-300,
     1e-12,
     1e-9,
-    9.999999999999999e-7,
+    f64::from_bits(1e-6_f64.to_bits() - 1),
     1e-6,
-    1.0000000000000002e-6,
+    f64::from_bits(1e-6_f64.to_bits() + 1),
     1.000001e-6,
     2e-6,
     1e-5,
@@ -686,7 +691,7 @@ pub fn mask_random(count: usize, max_side: u32) {
 /// Fine sweeps of the feather and the size, the inverted senses included: `(1 - x) * 255` against
 /// `255 - x * 255` is where a fused multiply-add shows, and where a truncation of a value an ulp under an integer does.
 pub fn mask_dense_feather_sweep() {
-    let mut rng = Rng(0x0DDB_A11);
+    let mut rng = Rng(0x00DD_BA11);
     for p in simd::available() {
         for shape in SHAPES {
             for i in 0..400 {

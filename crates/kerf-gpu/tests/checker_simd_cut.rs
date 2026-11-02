@@ -279,12 +279,19 @@ fn parity_dir() -> PathBuf {
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough); run once per KERF_SIMD value"]
 fn checker_simd_a_masked_and_titled_cut_is_the_exports_on_the_path_this_process_picked() {
     let label = std::env::var("KERF_SIMD").unwrap_or_else(|_| "default".into());
-    eprintln!("KERF_SIMD={label}: the process runs on {:?} ({:?} available)", kerf_core::simd::path(), kerf_core::simd::available());
+    eprintln!(
+        "KERF_SIMD={label}: the process runs on {:?} ({:?} available)",
+        kerf_core::simd::path(),
+        kerf_core::simd::available()
+    );
     let one = Some(mask(MaskShape::Ellipse, 0.5, 0.5, 0.6, 0.6, 0.2, false));
     let cases: Vec<(&str, Timeline)> = vec![
         (
             "soft ellipse + boxed title",
-            cut(&[one], vec![title("Hello, World. Ay Te Wa fi ffi", 24.0, (0.37, 0.6), Some("#102030@0.6"))]),
+            cut(
+                &[one],
+                vec![title("Hello, World. Ay Te Wa fi ffi", 24.0, (0.37, 0.6), Some("#102030@0.6"))],
+            ),
         ),
         (
             "hard inverted rect + plain title",
@@ -297,7 +304,12 @@ fn checker_simd_a_masked_and_titled_cut_is_the_exports_on_the_path_this_process_
             "off-centre soft inverted ellipse over another track + boxed title",
             cut(
                 &[None, Some(mask(MaskShape::Ellipse, 0.3, 0.7, 0.83, 0.37, 0.35, true))],
-                vec![title("Ay Te Wa To AVATAR fi ffi rn mm Tj.", 14.0, (0.1, 0.8), Some("black@0.5"))],
+                vec![title(
+                    "Ay Te Wa To AVATAR fi ffi rn mm Tj.",
+                    14.0,
+                    (0.1, 0.8),
+                    Some("black@0.5"),
+                )],
             ),
         ),
         (
@@ -320,10 +332,16 @@ fn checker_simd_a_masked_and_titled_cut_is_the_exports_on_the_path_this_process_
             report.push_str(&format!("{name} | frame {k} | {h:016x}\n"));
         }
         if j.drawn == 0 {
-            wrong.push(format!("{name}: no frame was drawn by the compositor (all {} refused)", j.refused));
+            wrong.push(format!(
+                "{name}: no frame was drawn by the compositor (all {} refused)",
+                j.refused
+            ));
         }
         if j.differing > 0 {
-            wrong.push(format!("{name}: {} samples differ from the export's, worst {}", j.differing, j.worst));
+            wrong.push(format!(
+                "{name}: {} samples differ from the export's, worst {}",
+                j.differing, j.worst
+            ));
         }
     }
     std::fs::write(parity_dir().join(format!("simd-cut-{label}.txt")), report).unwrap();

@@ -83,7 +83,10 @@ fn checker_simd_mask_every_size() {
 
 #[test]
 fn checker_simd_mask_picture_sizes() {
-    c::mask_picture_sizes(&[(1920, 1080), (480, 270), (401, 7), (3, 600), (1, 4096), (4097, 3), (1023, 17)], 6);
+    c::mask_picture_sizes(
+        &[(1920, 1080), (480, 270), (401, 7), (3, 600), (1, 4096), (4097, 3), (1023, 17)],
+        6,
+    );
 }
 
 #[test]
@@ -127,7 +130,13 @@ fn checker_simd_the_env_cap_picks_the_path_of_a_process() {
     ];
     for (value, want) in cases {
         let mut cmd = std::process::Command::new(&exe);
-        cmd.args(["--exact", "checker_simd_child_reports_its_path", "--ignored", "--nocapture", "--test-threads=1"]);
+        cmd.args([
+            "--exact",
+            "checker_simd_child_reports_its_path",
+            "--ignored",
+            "--nocapture",
+            "--test-threads=1",
+        ]);
         cmd.env_remove("KERF_SIMD");
         if let Some(v) = value {
             cmd.env("KERF_SIMD", v);
@@ -141,7 +150,10 @@ fn checker_simd_the_env_cap_picks_the_path_of_a_process() {
             String::from_utf8_lossy(&out.stderr)
         );
         let text = String::from_utf8_lossy(&out.stdout);
-        assert!(text.contains("1 passed"), "KERF_SIMD={value:?}: the child did not run: {text}");
+        assert!(
+            text.contains("1 passed"),
+            "KERF_SIMD={value:?}: the child did not run: {text}"
+        );
     }
 }
 
@@ -149,7 +161,12 @@ fn checker_simd_the_env_cap_picks_the_path_of_a_process() {
 #[ignore = "run by the test above with KERF_SIMD set"]
 fn checker_simd_child_reports_its_path() {
     let want = std::env::var("CHECKER_SIMD_EXPECT").expect("CHECKER_SIMD_EXPECT");
-    assert_eq!(format!("{:?}", simd::path()), want, "KERF_SIMD={:?}", std::env::var("KERF_SIMD"));
+    assert_eq!(
+        format!("{:?}", simd::path()),
+        want,
+        "KERF_SIMD={:?}",
+        std::env::var("KERF_SIMD")
+    );
     // The path a process picked is the one its kernels run: the hot calls agree with the scalar functions.
     let m = kerf_core::model::Mask::default();
     assert!(kerf_core::mask_alpha_plane(&m, 211, 13) == kerf_core::mask_plane::mask_alpha_plane_scalar(&m, 211, 13));

@@ -127,7 +127,10 @@ fn both_ends(f: impl Fn()) {
 fn checker_simd_fence_the_allocator_faults_one_byte_past_the_end() {
     // The harness is only worth anything if a one-byte overrun is caught: run a child that reads past the end.
     let exe = std::env::current_exe().unwrap();
-    for (name, signal) in [("checker_simd_fence_child_reads_past_the_end", true), ("checker_simd_fence_child_reads_the_last_byte", false)] {
+    for (name, signal) in [
+        ("checker_simd_fence_child_reads_past_the_end", true),
+        ("checker_simd_fence_child_reads_the_last_byte", false),
+    ] {
         let out = std::process::Command::new(&exe)
             .args(["--exact", name, "--ignored", "--test-threads=1"])
             .output()
@@ -140,7 +143,7 @@ fn checker_simd_fence_the_allocator_faults_one_byte_past_the_end() {
 #[ignore = "run by the test above"]
 fn checker_simd_fence_child_reads_past_the_end() {
     ACTIVE.with(|c| c.set(true));
-    let v = vec![1u8; 64];
+    let v: Vec<u8> = std::iter::repeat_n(1u8, 64).collect();
     let p = v.as_ptr();
     // SAFETY: deliberately not: one byte past the end must fault.
     let b = unsafe { std::ptr::read_volatile(p.add(64)) };
@@ -151,7 +154,7 @@ fn checker_simd_fence_child_reads_past_the_end() {
 #[ignore = "run by the test above"]
 fn checker_simd_fence_child_reads_the_last_byte() {
     ACTIVE.with(|c| c.set(true));
-    let v = vec![1u8; 64];
+    let v: Vec<u8> = std::iter::repeat_n(1u8, 64).collect();
     let p = v.as_ptr();
     // SAFETY: in range.
     let b = unsafe { std::ptr::read_volatile(p.add(63)) };
