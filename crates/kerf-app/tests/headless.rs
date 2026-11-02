@@ -919,6 +919,10 @@ fn a_workspace_refuses_a_playlist_imported_or_named_by_a_project() {
     assert!(why.contains("not media this server takes"), "{why}");
     let info = answer(&call(addr, &on_session, 5, "project_info", serde_json::json!({})));
     assert_eq!(info["path"], "cut.kerf", "the open project stays: {info}");
+    drop(child);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// One plain HTTP request: the status, the headers (names lower-cased) and the whole body.
 fn http(
     addr: SocketAddr,
@@ -1381,5 +1385,50 @@ fn a_confined_start_probes_the_project_s_media_and_keeps_the_template_library_ou
         "{why}"
     );
     assert!(!templates.exists());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// An upload is bytes: a playlist goes in like any file, and is refused only when it is imported.
+#[test]
+#[ignore = "probes with the ffprobe binary"]
+fn an_uploaded_playlist_is_refused_at_import_and_can_be_deleted() {
+    let FilesRun {
+        dir,
+        ws,
+        child,
+        addr,
+        on_session,
+        token,
+        ..
+    } = files_run("files-playlist", &[]);
+    let auth = format!("Bearer {token}");
+    let with_token = [("Authorization", auth.as_str())];
+    let outside = dir.join("outside.wav");
+    tone(&outside);
+    let playlist = format!(
+        "#EXTM3U\n#EXT-X-TARGETDURATION:1\n#EXTINF:1.0,\n{}\n#EXT-X-ENDLIST\n",
+        outside.display()
+    );
+    for (id, name) in [(2, "media/list.m3u8"), (3, "media/list.mp4")] {
+        let (status, _, _) = http(addr, "PUT", &format!("/files/{name}"), &with_token, playlist.as_bytes());
+        assert_eq!(status, 201, "{name}");
+        let why = refusal(&call(
+            addr,
+            &on_session,
+            id,
+            "import_asset",
+            serde_json::json!({ "path": name, "background": false }),
+        ));
+        assert!(why.contains("not media this server takes"), "{name}: {why}");
+        assert!(ws.join(name).is_file(), "the upload stays where it was put");
+        assert_eq!(
+            http(addr, "DELETE", &format!("/files/{name}"), &with_token, b"").0,
+            204,
+            "{name}"
+        );
+    }
+    let listed = call(addr, &on_session, 4, "list_assets", serde_json::json!({}));
+    assert!(!listed.contains("list.m"), "nothing was imported: {listed}");
+    drop(child);
     let _ = std::fs::remove_dir_all(&dir);
 }

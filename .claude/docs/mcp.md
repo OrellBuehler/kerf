@@ -98,8 +98,10 @@ sweeps Kerf's own `.part` files (`<name>.<8 hex>.part`) older than 24 h (`sweep_
 `Content-Type` by extension, `nosniff`, `attachment`) with `Content-Length` and one `Range` (`parse_range`: `a-b`, `a-`,
 `-n`; several or malformed → the whole file; past the end → 416); a directory, a trailing `/` or `?list` answers
 `{path, entries: [{name, size, modified, is_dir}], truncated?}` (`list_dir`, at most 5000). `DELETE` removes a file (409 when
-the project uses it) or an empty directory. Errors are `{"error"}` JSON. Raw bytes skip the playlist refusal; importing
-applies it. The tools (`WORKSPACE_TOOLS`, `files::offered`: absent from `tools/list` and "tool not found" on a call without
+the project uses it) or an empty directory. Errors are `{"error"}` JSON. **An uploaded file is bytes, not trusted media**:
+PUT checks no format, so a playlist or manifest lands like anything else; it is trusted only once `Workspace::check_media`
+(the demuxer-whitelisted probe) passes it, which `import_run` runs right before the probe for `import_asset` (also on the
+call) and `import_url` alike, and `check_project` on open. The tools (`WORKSPACE_TOOLS`, `files::offered`: absent from `tools/list` and "tool not found" on a call without
 a workspace, so the desktop and an unconfined server list exactly what they did): `list_files {dir?}`, `file_url {path}` (HTTP
 only: `{path, url, exists, is_dir, size, header}`, the URL on `--public-url`, else the `Host` the MCP request came in on,
 else the listener; descriptions say the bearer token is needed) and `import_url {url, path?, background?}` (only with
