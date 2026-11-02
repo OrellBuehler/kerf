@@ -8114,8 +8114,7 @@ const EDITING_GUIDE: &str = "How to edit with Kerf. The user queues editing task
 
 /// Added to the instructions when the server has a workspace (`--workspace`), the directory after it
 /// when that fits the budget.
-const WORKSPACE_NOTE: &str = "Files stay in the workspace: give paths relative to it, even where a tool says \
-             absolute; answers show them relative.";
+const WORKSPACE_NOTE: &str = "Files stay in the workspace: give paths relative to it, even where a tool says absolute.";
 
 /// The words of [`INSTRUCTIONS`] a workspace makes wrong, and what they say instead.
 const WORKSPACE_WORDING: [(&str, &str); 2] = [

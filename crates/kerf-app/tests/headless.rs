@@ -841,3 +841,39 @@ fn a_workspace_imports_a_relative_path_and_shows_it_relative() {
     drop(child);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `--workspace` holds over `--stdio` as over HTTP: no ready line, so the rule is in the instructions
+/// and `project_info`, and a path outside it is refused.
+#[test]
+fn a_stdio_run_keeps_to_its_workspace_too() {
+    let dir = scratch("ws-stdio");
+    let (ws, data) = (dir.join("ws"), dir.join("data"));
+    std::fs::create_dir_all(&ws).unwrap();
+    std::fs::create_dir_all(&data).unwrap();
+    tone(&dir.join("outside.wav"));
+    let args = ["--workspace", ws.to_str().unwrap(), "--new-project", "cut.kerf"];
+    let mut run = StdioRun::start(&args, &data, "stderr.log");
+    let init = run.initialize();
+    let instructions = init["result"]["instructions"].as_str().unwrap_or_default();
+    assert!(instructions.contains("give paths relative to it"), "{init}");
+    assert!(ws.join("cut.kerf").is_file(), "--new-project resolves against the workspace");
+    let info = run.call(2, "project_info", serde_json::json!({}));
+    let info: serde_json::Value = serde_json::from_str(info["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(info["path"], "cut.kerf", "{info}");
+    assert!(info["workspace"].as_str().is_some_and(|w| !w.is_empty()), "{info}");
+    let outside = dir.join("outside.wav");
+    run.send(
+        &serde_json::json!({
+            "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+            "params": { "name": "import_asset", "arguments": { "path": outside.to_str().unwrap() } },
+        })
+        .to_string(),
+    );
+    let refused = run.answer(3);
+    assert_eq!(refused["error"]["code"], -32602, "{refused}");
+    let why = refused["error"]["message"].as_str().unwrap_or_default();
+    assert!(why.contains("outside the workspace"), "{refused}");
+    let stderr = run.stderr();
+    assert_eq!(run.close_stdin(), Some(0), "stderr:\n{stderr}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
