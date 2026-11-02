@@ -150,6 +150,20 @@ fn probe(budget: &Budget, kind: Kind) -> Verdict {
     Verdict::Match
 }
 
+/// The asset an import would make of `file`, within the probe's deadline: the engine's `ffprobe` reads have timeouts of their own, but not
+/// the probe's one, so it is asked on a thread that is left behind if the deadline comes first.
+fn probed(budget: &Budget, file: &Path) -> Result<kerf_core::Asset, ()> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let file = file.to_path_buf();
+    std::thread::Builder::new()
+        .name("kerf-still-probe-asset".into())
+        .spawn(move || {
+            let _ = tx.send(Project::probe_asset(&file));
+        })
+        .map_err(|_| ())?;
+    rx.recv_timeout(budget.remaining()).map_err(|_| ())?.map_err(|_| ())
+}
+
 /// The graph that makes a noise picture of the kind: a gradient with noise over it, smooth where a codec keeps it and busy where a
 /// scaler shows its taps.
 fn noise_graph(kind: Kind, (w, h): (u32, u32)) -> String {
@@ -228,7 +242,7 @@ fn shape_matches(
     }
     args.push(path);
     budget.ffmpeg(&args, Vec::new()).ok_or(())?;
-    let asset = Project::probe_asset(&file).map_err(|_| ())?;
+    let asset = probed(budget, &file)?;
     let (tl, opts) = toy(&asset, route);
     let assets = std::slice::from_ref(&asset);
     let (cw, ch) = (CANVAS.0 as usize, CANVAS.1 as usize);
@@ -334,27 +348,9 @@ fn differs(
     let planes = match copy {
         Some((have, planes)) if *have == made.filters => planes.clone(),
         _ => {
-            let raw = budget
-                .ffmpeg(
-                    &[
-                        "-i",
-                        &layer.path,
-                        "-frames:v",
-                        "1",
-                        "-an",
-                        "-sn",
-                        "-dn",
-                        "-vf",
-                        &made.filters,
-                        "-f",
-                        "rawvideo",
-                        "-pix_fmt",
-                        "yuva420p",
-                        "pipe:1",
-                    ],
-                    Vec::new(),
-                )
-                .ok_or(())?;
+            let args = crate::source::still_copy_args(layer).map_err(|_| ())?;
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            let raw = budget.ffmpeg(&args, Vec::new()).ok_or(())?;
             let (w, h) = (ww as usize, wh as usize);
             if raw.len() != w * h * 5 / 2 {
                 return Err(());

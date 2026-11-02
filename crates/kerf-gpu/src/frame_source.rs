@@ -529,15 +529,15 @@ fn unique() -> u64 {
 /// to exist, for a file seen for the first time **and for one replaced since** (the cache is keyed by the file's size and
 /// modified time). One `ffprobe` then, a cache hit (a `stat`) after; the same probe as the file's other traits, so on a
 /// file the decode has looked at it costs nothing. Call it from a thread that is not drawing: it may block on that probe.
-/// The filters that make a still's copy (`None` for any other layer, and for a still whose copy is not worked out).
-fn copy_filters(layer: &PlanLayer) -> Option<String> {
-    crate::source::copy_of(layer).ok().flatten().map(|c| c.filters)
-}
-
 pub(crate) fn warm_range(layer: &PlanLayer) {
     if layer.stream.color_range.is_none() && layer.animated.is_some_and(|a| a.places) {
         let _ = kerf_core::source_is_full_range(Path::new(&layer.path));
     }
+}
+
+/// The filters that make a still's copy (`None` for any other layer, and for a still whose copy is not worked out).
+fn copy_filters(layer: &PlanLayer) -> Option<String> {
+    crate::source::copy_of(layer).ok().flatten().map(|c| c.filters)
 }
 
 /// Why runs are not trusted on the file at `path` before one has started, or `None`. Runs are
@@ -630,17 +630,12 @@ impl FrameSource {
         Ok(of.into_iter().map(|i| decoded[i].clone()).collect())
     }
 
-    /// A moving still's picture: the scaled copy its graph makes of the file ([`crate::source::still_copy_filters`]), decoded
-    /// once and cached beside the file. An export frame's pick is the `fps` filter's, which a still's single picture does not
-    /// change, so this does not look at it: the caller has decided the frame is drawn.
-    pub fn still_copy(&self, layer: &PlanLayer) -> Result<Option<Arc<YuvFrame>>, GpuError> {
-        if layer.still.is_none() && layer.fit.is_none() {
-            return Err(GpuError::Unsupported(format!("{}: not a moving still", layer.path)));
-        }
-        if !path_enabled() || layer.stream.pix_fmt.is_none() {
-            return self.oneshot(layer);
-        }
-        self.image(layer, SourceId::of(Path::new(&layer.path)))
+    /// A still's copy: the scaled copy its graph makes of the file or the fit picture ahead of its placement
+    /// ([`crate::source::copy_of`]), made by FFmpeg once and kept apart from the frames ([`crate::copies`]). An export frame's pick is the `fps`
+    /// filter's, which a still's single picture does not change, so this does not look at it: the caller has decided the frame is drawn.
+    /// `wait` says what to do about a copy that is not made yet (see [`crate::copies::Wait`]).
+    pub fn still_copy(&self, layer: &PlanLayer, wait: crate::copies::Wait) -> Result<Option<Arc<YuvFrame>>, GpuError> {
+        crate::copies::copy(layer, wait)
     }
 
     /// The frame one layer shows.
@@ -661,6 +656,16 @@ impl FrameSource {
         };
         if hint == Hint::Prefetch {
             return self.prefetch(layer, t).map(|()| None);
+        }
+        // A still's copy is FFmpeg's picture of the file, kept apart from the frames. A caller that is not settled on the frame (a drag, playback)
+        // is not made to wait for the child that makes it: it is started and the caller told `Busy`, as a run that cannot keep up is.
+        if crate::source::copy_of(layer)?.is_some() {
+            let wait = if hint == Hint::Exact {
+                crate::copies::Wait::Decode
+            } else {
+                crate::copies::Wait::Never
+            };
+            return crate::copies::copy(layer, wait);
         }
         // A disabled path, and an asset that never recorded its pixel format (whose alpha only
         // A0's second decode can rule out), decode one-shot.
@@ -868,6 +873,12 @@ impl FrameSource {
     /// out) is left alone: a one-shot decode is not worth doing for a frame nobody asked for yet. A
     /// still image is decoded and cached (it is one cheap decode, and the frame is the file).
     fn prefetch(&self, layer: &PlanLayer, t: f64) -> Result<(), GpuError> {
+        // A still's copy is made on a thread of its own, one at a time, if it is not made (`Busy` is the answer to a caller that waits
+        // for nothing, and there is none here).
+        if matches!(crate::source::copy_of(layer), Ok(Some(_))) {
+            let _ = crate::copies::copy(layer, crate::copies::Wait::Never);
+            return Ok(());
+        }
         let Some(fmt) = layer.stream.pix_fmt.as_deref() else {
             return Ok(());
         };
@@ -1080,18 +1091,7 @@ impl FrameSource {
 
     /// A still image: decoded once without a seek, kept under its file.
     fn image(&self, layer: &PlanLayer, source: SourceId) -> Result<Option<Arc<YuvFrame>>, GpuError> {
-        // A moving still's frame is the scaled copy its graph makes of the file, which depends on the move (the copy's size
-        // and the window of it any frame reads): keyed by the filters that make it, beside the file.
-        let pts = match crate::source::copy_of(layer)? {
-            None => i64::MIN,
-            Some(copy) => {
-                use std::hash::{Hash, Hasher};
-                let mut h = std::collections::hash_map::DefaultHasher::new();
-                copy.filters.hash(&mut h);
-                i64::MIN + 1 + (h.finish() >> 2) as i64
-            }
-        };
-        let key = FrameKey { source, pts };
+        let key = FrameKey { source, pts: i64::MIN };
         if let Some(frame) = self.shared.lock().cache.get(key) {
             return Ok(Some(frame));
         }

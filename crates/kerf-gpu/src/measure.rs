@@ -256,6 +256,11 @@ impl Budget {
         }
     }
 
+    /// The time left of the probe's one deadline (what work that is not an FFmpeg child may take).
+    pub(crate) fn remaining(&self) -> Duration {
+        self.deadline.saturating_duration_since(Instant::now())
+    }
+
     /// How long the next child may run: the shorter of its own limit and the time left.
     fn limit(&self) -> Duration {
         self.deadline.saturating_duration_since(Instant::now()).min(self.per_run)

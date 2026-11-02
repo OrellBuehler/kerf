@@ -812,6 +812,14 @@ pub fn prepare(plan: &RenderPlan) {
     }
     prepare_placement(plan);
     prepare_stills(plan);
+    // ... and the pictures FFmpeg makes of the stills it draws a move of (made once, kept: `crate::copies`), so the first frame of the clip
+    // does not wait for the child that makes them. A still plan's are made for a render size this does not know: they are made when the
+    // frame is, or by the feeder (`CursorFeed::open`) for an export frame's.
+    for layer in plan.layers.iter().filter(|l| l.still.is_some() || l.fit.is_some()) {
+        if matches!(crate::source::copy_of(layer), Ok(Some(_))) {
+            let _ = crate::copies::copy(layer, crate::copies::Wait::Decode);
+        }
+    }
     if !plan.overlays.is_empty() {
         let _ = crate::text::model();
     }
@@ -820,7 +828,7 @@ pub fn prepare(plan: &RenderPlan) {
 /// [`prepare`] for what a moving still needs: which kinds of picture this FFmpeg draws it for as the model does
 /// ([`crate::still_probe`]: `GpuCaps::still_motion` holds only the kinds that matched).
 fn prepare_stills(plan: &RenderPlan) {
-    if plan.layers.iter().any(|l| l.still.is_some()) {
+    if plan.layers.iter().any(|l| l.still.is_some() || plan.fits_by_ffmpeg(l)) {
         let _ = crate::still_probe::kinds();
     }
 }
@@ -901,10 +909,14 @@ pub fn prepare_ahead(cut: &kerf_core::PlayCut, from: f64, horizon: f64) {
     }
 }
 
-/// `plan` for a render of `size`: a still plan's moving stills have their scaled copies worked out for that size
-/// ([`RenderPlan::for_render`]); any other plan is as it is.
+/// `plan` for a render of `size`: a still plan's moving stills have their scaled copies and fit pictures worked out for that size
+/// ([`RenderPlan::for_render`]) wherever one is missing or was made for another; any other plan is as it is.
 fn for_size(plan: &RenderPlan, size: (u32, u32)) -> std::borrow::Cow<'_, RenderPlan> {
-    if plan.layers.iter().any(|l| l.still.as_ref().is_some_and(|s| !s.clip_wide)) {
+    let stamps = |l: &kerf_core::PlanLayer| {
+        l.still.as_ref().is_some_and(|s| !s.clip_wide)
+            || (plan.fits_by_ffmpeg(l) && l.fit.as_ref().is_none_or(|f| f.frame != size))
+    };
+    if plan.mode == kerf_core::PlanMode::Still && plan.layers.iter().any(stamps) {
         std::borrow::Cow::Owned(plan.clone().for_render(size))
     } else {
         std::borrow::Cow::Borrowed(plan)
@@ -2744,6 +2756,14 @@ impl Compositor {
             let moved = self.moved_of(plan, layer, frame, size, n)?;
             // FFmpeg made the fit picture of a still whose placement is drawn: the frame is that picture, not the file's.
             let fitted = layer.fit.as_ref().filter(|f| f.frame == size);
+            if fitted.is_none() && plan.fits_by_ffmpeg(layer) {
+                // (Judged by `reasons` as it would be made; drawn only from the picture FFmpeg made, which the plan carries once it has been
+                // through `RenderPlan::for_render` at this size: the compositor's own scaler and decode are not what the plan allowed.)
+                return Err(GpuError::Unsupported(format!(
+                    "layer {n}: a still whose fit picture is not worked out for a {}x{} render (RenderPlan::for_render)",
+                    size.0, size.1
+                )));
+            }
             if let Some(fit) = fitted {
                 if (frame.width, frame.height) != fit.size {
                     return Err(GpuError::Unsupported(format!(

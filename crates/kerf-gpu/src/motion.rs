@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
-use kerf_core::{Pick, PlanLayer, RenderPlan};
+use kerf_core::{Pick, PlanLayer, RenderPlan, SourceFrames};
 use uuid::Uuid;
 
 use crate::cursor::{CursorConfig, FrameCursor};
@@ -96,6 +96,12 @@ impl CursorFeed {
         }
         if self.closed.load(Ordering::SeqCst) {
             return Ok(Opened::Closed);
+        }
+        // A still FFmpeg makes a picture of for the compositor needs no cursor (its pick is decided without the file's frames): the
+        // picture is made here, ahead of the clip, on the feeder's thread, so the first frame of the clip does not wait for the child.
+        if is_copy(layer) {
+            crate::copies::copy(layer, crate::copies::Wait::Decode)?;
+            return Ok(Opened::Waiting { evicted: None });
         }
         {
             let mut ready = lock(&self.ready);
@@ -221,20 +227,38 @@ impl MotionFrames {
     /// `ffmpeg` killed). The layers are read side by side.
     pub fn frames(&mut self, plan: &RenderPlan) -> Result<Vec<Option<Arc<YuvFrame>>>, GpuError> {
         self.counts.clear();
-        let read = self.read_all(plan)?;
+        // A still FFmpeg makes a picture of for the compositor (a moving still's scaled copy, the fit picture of its placement) is one picture
+        // whatever the pick, and the pick of a still image is decided without the file's frames (`Pick::select`: its loop is made up), so it
+        // has no cursor and the file is decoded once, for the copy, not twice.
+        let cursors: Vec<&PlanLayer> = plan.layers.iter().filter(|l| !is_copy(l)).collect();
+        let mut read = self.read_all(plan, &cursors)?.into_iter();
+        let mut frames = Vec::with_capacity(plan.layers.len());
+        let mut counts = Vec::with_capacity(plan.layers.len());
+        for layer in &plan.layers {
+            if is_copy(layer) {
+                if !matches!(layer.pick, Pick::Fps(_)) {
+                    return Err(GpuError::Unsupported(format!(
+                        "{}: a still plan's pick is the still's `-ss`, not the export's `fps` filter",
+                        layer.name
+                    )));
+                }
+                let shown = layer.pick.select(&SourceFrames::NONE).is_some();
+                frames.push(if shown {
+                    self.source.still_copy(layer, crate::copies::Wait::Decode)?
+                } else {
+                    None
+                });
+                counts.push(None);
+            } else if let Some((frame, count)) = read.next() {
+                frames.push(frame);
+                counts.push(count);
+            }
+        }
         // (A cursor already open does not look at its file again: a placed layer's range, which the compositor only reads, is
         // made to exist here — after the reads, the last thing before the composite, so that a file replaced while they
         // waited is the one asked about — and again for a file replaced under a session.)
         for layer in &plan.layers {
             crate::frame_source::warm_range(layer);
-        }
-        let (mut frames, counts): (Vec<Option<Arc<YuvFrame>>>, Vec<Option<u64>>) = read.into_iter().unzip();
-        // A moving still is one picture whatever the pick: the cursor decided whether the frame is drawn at all (a clip's
-        // closing edge), and the picture is the scaled copy its graph makes of the file, from the frame source's cache.
-        for (layer, frame) in plan.layers.iter().zip(frames.iter_mut()) {
-            if (layer.still.is_some() || layer.fit.is_some()) && frame.is_some() {
-                *frame = self.source.still_copy(layer)?;
-            }
         }
         self.counts = counts;
         Ok(frames)
@@ -247,7 +271,7 @@ impl MotionFrames {
         &self.counts
     }
 
-    fn read_all(&mut self, plan: &RenderPlan) -> Result<Vec<Counted>, GpuError> {
+    fn read_all(&mut self, plan: &RenderPlan, layers: &[&PlanLayer]) -> Result<Vec<Counted>, GpuError> {
         let live: Vec<Uuid> = plan.layers.iter().map(|l| l.clip_id).collect();
         self.open.retain(|id, _| live.contains(id));
         {
@@ -255,13 +279,12 @@ impl MotionFrames {
             let mut ready = lock(&self.feed.ready);
             ready.retain(|id, _| !self.open.contains_key(id));
         }
-        let mut picks = Vec::with_capacity(plan.layers.len());
-        for layer in &plan.layers {
+        let mut picks = Vec::with_capacity(layers.len());
+        for layer in layers {
             picks.push(self.prepare(layer)?);
         }
-        if plan.layers.len() <= 1 {
-            return plan
-                .layers
+        if layers.len() <= 1 {
+            return layers
                 .iter()
                 .zip(picks)
                 .map(|(layer, frame)| {
@@ -275,12 +298,12 @@ impl MotionFrames {
         }
         // Each cursor blocks on its own `ffmpeg`: asking them one after another would add the decodes.
         let mut cursors: HashMap<Uuid, &mut Open> = self.open.iter_mut().map(|(id, o)| (*id, o)).collect();
-        let mut jobs = Vec::with_capacity(plan.layers.len());
-        for (layer, frame) in plan.layers.iter().zip(picks) {
+        let mut jobs = Vec::with_capacity(layers.len());
+        for (layer, frame) in layers.iter().zip(picks) {
             let open = cursors
                 .remove(&layer.clip_id)
                 .ok_or_else(|| GpuError::Gpu("a clip is on the plan twice".into()))?;
-            jobs.push((layer, frame, open));
+            jobs.push((*layer, frame, open));
         }
         std::thread::scope(|scope| {
             let handles: Vec<_> = jobs
@@ -324,6 +347,11 @@ impl MotionFrames {
     pub fn cursors(&self) -> usize {
         self.open.len()
     }
+}
+
+/// Whether FFmpeg makes a picture of the layer's still for the compositor ([`crate::source::copy_of`]).
+fn is_copy(layer: &PlanLayer) -> bool {
+    layer.still.is_some() || layer.fit.is_some()
 }
 
 fn read(open: &mut Open, layer: &PlanLayer, frame: u64) -> Result<Counted, GpuError> {

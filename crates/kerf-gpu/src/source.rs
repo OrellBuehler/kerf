@@ -346,16 +346,12 @@ pub fn decode_layer(layer: &PlanLayer) -> Result<Option<YuvFrame>, GpuError> {
 /// [`decode_layer`] when `share` decodes run side by side, each getting its
 /// fraction of the CPU budget's thread cap.
 fn decode_layer_shared(layer: &PlanLayer, share: usize) -> Result<Option<YuvFrame>, GpuError> {
+    let path = &layer.path;
+    check_source_size(layer)?;
     if let Some(copy) = copy_of(layer)? {
         return decode_still_copy(layer, &copy, share);
     }
-    let path = &layer.path;
     let (w, h) = (layer.stream.width, layer.stream.height);
-    if w == 0 || h == 0 || w > MAX_SIDE || h > MAX_SIDE {
-        return Err(GpuError::Unsupported(format!(
-            "{path}: a {w}x{h} picture (the compositor takes 1 to {MAX_SIDE} px a side)"
-        )));
-    }
     // A recorded pixel format must be on the allow-list of known-opaque ones: the
     // plan refuses the rest too, but a caller that skipped it must not get alpha
     // flattened onto black.
@@ -410,6 +406,19 @@ fn decode_layer_shared(layer: &PlanLayer, share: usize) -> Result<Option<YuvFram
     Ok(Some(frame))
 }
 
+/// The probed picture is within what the compositor takes (1 to [`MAX_SIDE`] a side), before anything is decoded from it: the plain decode
+/// and the copy FFmpeg makes of a still alike.
+pub(crate) fn check_source_size(layer: &PlanLayer) -> Result<(), GpuError> {
+    let (w, h) = (layer.stream.width, layer.stream.height);
+    if w == 0 || h == 0 || w > MAX_SIDE || h > MAX_SIDE {
+        return Err(GpuError::Unsupported(format!(
+            "{}: a {w}x{h} picture (the compositor takes 1 to {MAX_SIDE} px a side)",
+            layer.path
+        )));
+    }
+    Ok(())
+}
+
 /// A picture FFmpeg makes of a still for the compositor: the filters that make it from the file and the size it comes out.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StillCopy {
@@ -418,7 +427,7 @@ pub struct StillCopy {
 }
 
 /// The copy FFmpeg makes for a still the compositor draws a move of, if `layer` is one: a moving still's scaled copy (`scale` to the
-/// copy's size with the delivery's scaler, then `crop` to the window any frame reads: [`kerf_core::StillMotion::once`], the engine's own
+/// copy's size with the delivery's scaler, then `crop` to the window any frame reads: [`kerf_core::still_motion::StillMotion::once`], the engine's own
 /// text) or the fit picture ahead of a moving zoom's placement ([`kerf_core::FitCopy`], the geometry's scales and crops written out), each
 /// followed by the conversion the graph's negotiation gives the chain after it: `perspective`, `pad` and the `overlay` they end in
 /// all take `yuva420p`, so the scaler converts the picture (its range, its RGB, its chroma) in the same pass that resizes it.
@@ -470,7 +479,7 @@ pub fn still_copy_args(layer: &PlanLayer) -> Result<Vec<String>, GpuError> {
 }
 
 /// A still's [`StillCopy`], decoded: what the placement or the move then reads, made by FFmpeg's own scaler once. `Ok(None)` for no frame.
-fn decode_still_copy(layer: &PlanLayer, copy: &StillCopy, share: usize) -> Result<Option<YuvFrame>, GpuError> {
+pub(crate) fn decode_still_copy(layer: &PlanLayer, copy: &StillCopy, share: usize) -> Result<Option<YuvFrame>, GpuError> {
     let path = &layer.path;
     if let Some(fmt) = layer.stream.pix_fmt.as_deref() {
         if kerf_core::model::pix_fmt_layout(fmt).is_none() {
