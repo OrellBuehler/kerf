@@ -58,3 +58,17 @@ updates:
       patch-and-minor:
         patterns: ["*"]
         update-types: ["minor", "patch"]
+
+  # The hosted image's base images (deploy/Dockerfile).
+  - package-ecosystem: docker
+    directory: /deploy
+    schedule:
+      interval: weekly
+      day: monday
+    cooldown:
+      default-days: 7
+    commit-message:
+      prefix: "deps"
+    groups:
+      images:
+        patterns: ["*"]

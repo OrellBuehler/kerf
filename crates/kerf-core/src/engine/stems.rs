@@ -90,6 +90,13 @@ fn ensure_model(progress: &mut dyn FnMut(super::download::DownloadProgress), can
     )
 }
 
+/// Download the runtime and the model now, so a later separation starts at once.
+pub fn prepare(progress: &mut Report, cancel: &dyn Fn() -> bool) -> Result<()> {
+    ensure_runtime(&mut download_progress("download_runtime", progress), cancel)?;
+    ensure_model(&mut download_progress("download_model", progress), cancel)?;
+    Ok(())
+}
+
 /// What stem separation has on disk: whether it would still download the runtime or
 /// the model first, and how big the model is.
 #[derive(Debug, Clone, serde::Serialize)]

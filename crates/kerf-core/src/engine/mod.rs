@@ -93,7 +93,7 @@ pub use pcm::{decode_audio, decode_audio_cancellable, decode_audio_window, wav_b
 
 // Lining two recordings up by their sound (GCC-PHAT-β, coarse then refined): pure DSP.
 pub mod audio_sync;
-pub use stems::{status as stems_status, StemsStatus, STEM_NAMES};
+pub use stems::{prepare as prepare_stems, status as stems_status, StemsStatus, STEM_NAMES};
 
 // Speech model provisioning + transcription through the `ffmpeg` binary's
 // `whisper` filter. Like the rest of `cli`, needs no dev libraries — so the

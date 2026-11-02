@@ -160,7 +160,8 @@
   stereo, runs under `cpu::lease` with ORT threads = the budget, and caches 24-bit FLAC
   stems at `<cache>/kerf/stems/<hash>/` (float WAV would be ~200 MB per stem for ten
   minutes). The model (~170 MB) downloads on first use from a release asset
-  (`KERF_DEMUCS_MODEL_URL` overrides), verified as ONNX and by SHA-256.
+  (`KERF_DEMUCS_MODEL_URL` overrides), verified as ONNX and by SHA-256; `prepare` (`prepare_stems`) fetches the
+  runtime and the model ahead of a separation.
 - `ffmpeg.rs` is the in-process **libav** backend (the `ffmpeg` feature): it supplies
   `probe` (reading the display matrix and colour tags the same way the ffprobe path does) and, behind the extra `libav-render` feature, an **experimental** in-process
   export pipeline. It can only compile with the dev libraries present (written against

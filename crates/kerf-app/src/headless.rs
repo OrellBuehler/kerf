@@ -56,6 +56,8 @@ logs go to stderr. Stops on SIGINT / SIGTERM.
                            pruned at start and every 10 minutes, least recently used first; what the open
                            project uses, what is being written and the downloaded models are never removed
                            (KERF_CACHE_MAX_GB; default: no limit)
+  --prefetch-models LIST   download models into the cache, then exit (no server): a comma list of
+                           whisper[:NAME], kokoro[:VOICE], demucs, soundfont
 
 The token is KERF_MCP_TOKEN when set (this run only, never stored), else the one in the settings.
 
@@ -82,7 +84,107 @@ struct Args {
     cpu_percent: Option<u8>,
     cache_dir: Option<PathBuf>,
     cache_max_bytes: Option<u64>,
+    prefetch: Option<Vec<Model>>,
     help: bool,
+}
+
+/// A model `--prefetch-models` downloads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Model {
+    Whisper(String),
+    Kokoro(String),
+    Demucs,
+    SoundFont,
+}
+
+/// `--prefetch-models`'s list, in order and without repeats: `whisper[:NAME]` (default the default
+/// speech model), `kokoro[:VOICE]` (the runtime, the model and that voice), `demucs`, `soundfont`.
+fn parse_models(list: &str) -> Result<Vec<Model>, String> {
+    let mut models = Vec::new();
+    for item in list.split(',').map(str::trim).filter(|i| !i.is_empty()) {
+        let (kind, choice) = match item.split_once(':') {
+            Some((kind, choice)) => (kind.trim(), Some(choice.trim())),
+            None => (item, None),
+        };
+        let model = match (kind, choice) {
+            ("whisper", choice) => {
+                let name = choice.unwrap_or(kerf_core::DEFAULT_SPEECH_MODEL);
+                let names = kerf_core::speech_model_names();
+                if !names.contains(&name) {
+                    return Err(format!("no whisper model {name:?}: one of {}", names.join(", ")));
+                }
+                Model::Whisper(name.to_string())
+            }
+            ("kokoro", choice) => {
+                let voice = choice.unwrap_or(kerf_core::DEFAULT_VOICE);
+                if !kerf_core::voiceover_status().voices.iter().any(|v| v.id == voice) {
+                    return Err(format!("no kokoro voice {voice:?}"));
+                }
+                Model::Kokoro(voice.to_string())
+            }
+            ("demucs", None) => Model::Demucs,
+            ("soundfont", None) => Model::SoundFont,
+            ("demucs" | "soundfont", Some(_)) => return Err(format!("{kind} takes no :choice")),
+            _ => {
+                return Err(format!(
+                    "unknown model {item:?}: use whisper[:NAME], kokoro[:VOICE], demucs or soundfont"
+                ))
+            }
+        };
+        if !models.contains(&model) {
+            models.push(model);
+        }
+    }
+    if models.is_empty() {
+        return Err("--prefetch-models needs at least one model".to_string());
+    }
+    Ok(models)
+}
+
+/// Download `models` into the cache (each checked as the first use would check it); the exit code.
+fn prefetch(models: &[Model]) -> i32 {
+    let mut failed = false;
+    for model in models {
+        let what = match model {
+            Model::Whisper(name) => format!("whisper {name}"),
+            Model::Kokoro(voice) => format!("kokoro {voice}"),
+            Model::Demucs => "demucs".to_string(),
+            Model::SoundFont => "soundfont".to_string(),
+        };
+        say(&format!("kerf: fetching {what}"));
+        let mut last = (String::new(), -1);
+        let mut report = |stage: &str, fraction: Option<f64>, _: Option<String>| {
+            let tenth = fraction.map_or(-1, |f| (f * 10.0).floor() as i32);
+            if stage != last.0 {
+                last = (stage.to_string(), -1);
+            }
+            if tenth > last.1 {
+                last.1 = tenth;
+                say(&format!("kerf:   {stage} {}%", tenth * 10));
+            }
+        };
+        let done = match model {
+            Model::Whisper(name) => kerf_core::download_speech_model(name, &mut |p: kerf_core::DownloadProgress| {
+                report("download_model", p.fraction(), None);
+            })
+            .map(drop),
+            Model::Kokoro(voice) => kerf_core::prepare_voiceover(voice, &mut report, &|| false),
+            Model::Demucs => kerf_core::prepare_stems(&mut report, &|| false),
+            Model::SoundFont => kerf_core::prepare_soundfont(&mut report, &|| false),
+        };
+        match done {
+            Ok(()) => say(&format!("kerf: {what} ready")),
+            Err(e) => {
+                say(&format!("kerf: {what} failed: {e}"));
+                failed = true;
+            }
+        }
+    }
+    if failed {
+        EXIT_FAILURE
+    } else {
+        0
+    }
 }
 
 /// Whether the command line asks for a headless run.
@@ -201,6 +303,7 @@ fn parse(argv: &[String], cwd: &Path) -> Result<Option<Args>, String> {
                     .ok_or_else(|| format!("--cpu-percent takes a number from {} to 100", range.start()))?;
                 args.cpu_percent = Some(percent);
             }
+            "--prefetch-models" => args.prefetch = Some(parse_models(&value()?)?),
             other => return Err(format!("unknown argument {other:?} (see --help)")),
         }
     }
@@ -259,6 +362,9 @@ pub(crate) fn main(argv: &[String], bundled_ffmpeg: &[(&'static str, PathBuf)]) 
     {
         say(&format!("kerf-app: {message}"));
         return code;
+    }
+    if let Some(models) = &args.prefetch {
+        return prefetch(models);
     }
     let token = match check_args(&args) {
         Ok(token) => token,
@@ -704,6 +810,7 @@ mod tests {
                 cpu_percent: Some(50),
                 cache_dir: Some(PathBuf::from("/work/caches")),
                 cache_max_bytes: Some(1 << 29),
+                prefetch: None,
                 help: false,
             }
         );
@@ -810,6 +917,36 @@ mod tests {
         assert!(err(&["--headless", "--tools", "core"]).contains("--tools is for --stdio"));
         assert!(err(&["--headless", "--stdio", "--tools", "core,colour"]).contains("`colour` is no tool set"));
         assert!(err(&["--headless", "--stdio=yes"]).contains("takes no value"));
+    }
+
+    #[test]
+    fn prefetch_reads_a_list_of_models_and_refuses_what_it_cannot_fetch() {
+        let models = |list: &str| parsed(&["--headless", "--prefetch-models", list]).map(|a| a.unwrap().prefetch.unwrap());
+        assert_eq!(
+            models("whisper:small, kokoro,demucs,soundfont,whisper:small").unwrap(),
+            vec![
+                Model::Whisper("small".to_string()),
+                Model::Kokoro(kerf_core::DEFAULT_VOICE.to_string()),
+                Model::Demucs,
+                Model::SoundFont,
+            ]
+        );
+        assert_eq!(
+            models("whisper,kokoro:bm_george").unwrap(),
+            vec![
+                Model::Whisper(kerf_core::DEFAULT_SPEECH_MODEL.to_string()),
+                Model::Kokoro("bm_george".to_string()),
+            ]
+        );
+        assert!(models("whisper:huge").unwrap_err().contains("no whisper model"));
+        assert!(models("kokoro:nobody").unwrap_err().contains("no kokoro voice"));
+        assert!(models("demucs:v2").unwrap_err().contains("takes no"));
+        assert!(models("llama").unwrap_err().contains("unknown model"));
+        assert!(models(" , ").unwrap_err().contains("at least one"));
+        assert!(parsed(&["--headless", "--prefetch-models"])
+            .unwrap_err()
+            .contains("needs a value"));
+        assert_eq!(parsed(&["--headless"]).unwrap().unwrap().prefetch, None);
     }
 
     #[cfg(unix)]
