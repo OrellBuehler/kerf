@@ -11944,3 +11944,1401 @@ fn checker_a_a_placed_clip_in_an_export_in_parts() {
     }
     checker_all("an export in parts", fails);
 }
+
+// ==== checker/e/m: lane A's placement beside lane E's turns, blends and probe (the merged tree) ==============================
+//
+// The independent check of the merge of the placement lane into the effects lane. Every case holds the frames the plan lets through to the
+// export's planes to the sample (no bound) and the frames it refuses to a reason; the refused frames are drawn anyway where the compositor
+// will (its own guards stand) to price the refusal (`WIDER` is a refusal that was not needed). Nothing above this line is edited.
+
+/// The angle in degrees a clip stores for `quarters` quarter turns and `off` radians: its `to_radians()` is that angle to within an ulp.
+fn m_degrees(quarters: i32, off: f64) -> f64 {
+    (f64::from(quarters) * std::f64::consts::FRAC_PI_2 + off).to_degrees()
+}
+
+/// The filter's own answer for an angle `off` radians off `quarters` quarter turns, where only its `simple_rotate` fast path decides: it takes
+/// `fabs(angle - target) < FLT_EPSILON` for 0, π/2, π and 3π/2 and for no other target.
+fn m_fast_path(quarters: i32, off: f64) -> Option<bool> {
+    (0..4).contains(&quarters).then(|| off.abs() < f64::from(f32::EPSILON))
+}
+
+/// The reasons `plan.reasons` gives for every frame of `frames` of the cut: each one's kind and its text.
+fn m_reasons(
+    tl: &Timeline,
+    assets: &[Asset],
+    opts: &ExportOptions,
+    frames: Range<u64>,
+) -> Vec<(u64, Vec<(&'static str, String)>)> {
+    let planner = Planner::new(tl, assets, opts, PlanRequest::motion(policy())).expect("planner");
+    frames
+        .map(|k| {
+            let plan = planner.at_frame(k).expect("plan");
+            let size = (plan.canvas.width, plan.canvas.height);
+            (
+                k,
+                plan.reasons(&compositor().caps(), size)
+                    .iter()
+                    .map(|u| (u.kind(), u.to_string()))
+                    .collect(),
+            )
+        })
+        .collect()
+}
+
+/// A turn `off` radians off a whole number of quarters, on a picture of even sides, one with an odd width moved off centre, and the same
+/// two blended: the window of the plan's `quarter_turn` is the filter's own (`FLT_EPSILON`, 1.19e-7 radians), so the angles just inside it are
+/// drawn on every frame to the sample (plain and blended, whichever of the fast path or the integer path the filter takes) and those just
+/// outside are FFmpeg's. The plan's answer is held to the filter's rule independently for the angles its fast path alone decides (0, 90, 180
+/// and 270 degrees and a hair), and to the export for every one it draws.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_m_a_turn_at_the_edges_of_the_filters_window_is_drawn_exactly_or_refused() {
+    use kerf_core::BlendMode;
+    let m = media();
+    let assets = [m.bars.clone(), m.testsrc.clone()];
+    let (mut failures, mut wider, mut anyway) = (Vec::new(), Vec::new(), Vec::new());
+    let offs = [0.0, 1.0e-7, -1.0e-7, 1.19e-7, -1.19e-7, 1.2e-7, -1.2e-7, 1.3e-7, -1.3e-7];
+    let (mut inside, mut outside) = (0, 0);
+    for q in [0, 1, 2, 3, -1, 4, 5, 40, 41] {
+        let offs: &[f64] = if (0..4).contains(&q) {
+            &offs
+        } else {
+            &[0.0, 1.0e-7, -1.19e-7, 1.2e-7]
+        };
+        for &off in offs {
+            let degrees = m_degrees(q, off);
+            let plan_says = kerf_core::quarter_turn(degrees.to_radians()).is_some();
+            let draws = match m_fast_path(q, off) {
+                Some(rule) => {
+                    if rule != plan_says {
+                        failures.push(format!(
+                            "{q} quarters {off:+e} rad: the filter's fast path says {rule}, the plan {plan_says}"
+                        ));
+                    }
+                    if rule {
+                        inside += 1;
+                    } else {
+                        outside += 1;
+                    }
+                    Some(rule)
+                }
+                None => Some(plan_says),
+            };
+            for (what, crop, at, mode) in [
+                ("plain", 0.0, (0.0, 0.0), None),
+                ("odd and moved", 1.0 / 640.0, (0.2, 0.1), None),
+                ("blended odd and moved", 1.0 / 640.0, (-0.2, 0.15), Some(BlendMode::Multiply)),
+            ] {
+                let mut c = clip(&m.testsrc, 0.2, 0.5, 0.0);
+                c.transform.rotation = degrees;
+                c.transform.crop_right = crop;
+                c.transform.pos_x = at.0;
+                c.transform.pos_y = at.1;
+                if let Some(mode) = mode {
+                    c.blend_mode = mode;
+                }
+                let tl = timeline(vec![vec![clip(&m.bars, 0.2, 0.5, 0.0)], vec![c]], None);
+                m_case_at(
+                    30.0,
+                    &format!("checker/e/m/turn {q} quarters {off:+e} rad {what}"),
+                    &tl,
+                    &assets,
+                    0..4,
+                    draws,
+                    &mut failures,
+                    &mut wider,
+                    &mut anyway,
+                );
+            }
+        }
+    }
+    eprintln!("{inside} angles inside the fast path's window, {outside} outside it (each on three pictures)");
+    assert!(inside == 20 && outside == 16, "{inside} inside, {outside} outside");
+    r4_finish(
+        "checker_e_m_a_turn_at_the_edges_of_the_filters_window",
+        failures,
+        &wider,
+        &anyway,
+        true,
+    );
+}
+
+/// A turned picture of another shape, depth or label than the plain 8-bit 16:9 pictures, beside a bottom layer of its own colour tag: a
+/// 480x360 pillarbox and a 203x360 / 640x203 odd-sided picture (the bars the pad leaves turn with it), 10-bit (with a range tag, without, and
+/// full range), `yuvj420p`, gray, 4:4:4 and 4:2:2, BT.709, NTSC and PAL labels in either order, and a 720p BT.709 clip over an untagged one; at
+/// the quarters and at angles just inside the filter's window (a fast-path hair, and the integer path's), plain and blended, centred and moved. A
+/// layer the compositor's scaler resizes is lane B's and is left out (as `checker_e_r4_*` leaves it out); the rest is drawn exactly or refused,
+/// on this build's colour policy (`BottomLayerTag` on 9.0.2, `FixedBt601` on 6.1.1).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_m_a_turned_picture_of_another_shape_depth_or_label_is_the_exports_or_refused() {
+    use kerf_core::BlendMode;
+    let m = media();
+    let v = variants();
+    let s = shapes();
+    let h = hd_pair();
+    let (mut failures, mut wider, mut anyway) = (Vec::new(), Vec::new(), Vec::new());
+    // (name, bottom, top, the plain turned layer is drawn on every frame)
+    let pairs: Vec<(&str, &Asset, &Asset, Option<bool>)> = vec![
+        ("pillar 480x360", &m.bars, &s.pillar, Some(true)),
+        ("odd width 203x360", &m.bars, &s.odd_width, Some(true)),
+        ("odd height 640x203", &m.bars, &s.odd_height, None),
+        ("10-bit tv", &m.bars, &s.tenbit_tv, None),
+        ("10-bit", &m.bars, &v.tenbit, None),
+        ("10-bit pc", &m.bars, &v.tenbit_pc, None),
+        ("yuvj420p", &m.bars, &v.mjpeg, None),
+        ("gray", &m.bars, &v.gray, None),
+        ("4:4:4", &m.bars, &v.yuv444, None),
+        ("709 over 709", &v.bars709, &v.testsrc709, Some(true)),
+        ("709 over untagged", &m.bars, &v.testsrc709, None),
+        ("untagged over 709", &v.bars709, &m.testsrc, None),
+        ("170m over 470bg", &v.bars470bg, &v.testsrc170m, None),
+        ("noise over 709", &v.bars709, &m.noise, Some(true)),
+        ("720p 709 over untagged", &h.untagged, &h.phone, None),
+        ("720p untagged over 709", &h.phone, &h.untagged, None),
+    ];
+    let angles = [90.0, m_degrees(1, 1.0e-7), m_degrees(2, -1.19e-7), m_degrees(4, 1.1e-7)];
+    for (name, bottom, top, drawn) in pairs {
+        for angle in angles {
+            for (mode, at) in [
+                (None, (0.0, 0.0)),
+                (None, (0.2, 0.1)),
+                (Some(BlendMode::Multiply), (-0.15, 0.2)),
+            ] {
+                let mut c = clip(top, 0.1, 0.4, 0.0);
+                c.transform.rotation = angle;
+                c.transform.pos_x = at.0;
+                c.transform.pos_y = at.1;
+                if let Some(mode) = mode {
+                    c.blend_mode = mode;
+                }
+                let assets = [bottom.clone(), top.clone()];
+                let tl = timeline(vec![vec![clip(bottom, 0.1, 0.4, 0.0)], vec![c]], None);
+                let quarter = kerf_core::quarter_turn(angle.to_radians()).is_some();
+                let scaled = r3_resized(&tl, &assets, 30.0);
+                if scaled && mode.is_none() {
+                    continue;
+                }
+                let draws = if !quarter || (scaled && mode.is_some()) {
+                    Some(false)
+                } else if mode.is_none() {
+                    drawn
+                } else {
+                    None
+                };
+                m_case_at(
+                    30.0,
+                    &format!("checker/e/m/shape {name} turned {angle:.9} {mode:?} at {at:?}"),
+                    &tl,
+                    &assets,
+                    0..3,
+                    draws,
+                    &mut failures,
+                    &mut wider,
+                    &mut anyway,
+                );
+            }
+        }
+    }
+    r4_finish(
+        "checker_e_m_a_turned_picture_of_another_shape_depth_or_label",
+        failures,
+        &wider,
+        &anyway,
+        true,
+    );
+}
+
+/// A blended clip over a placement. A pose that moves on the blended clip itself (a moving zoom or position, a live breath, drift or shake, a
+/// slide's travel added to a keyed position) is `BlendMode: "a moving zoom or position"` on every frame of the clip, nothing of it is drawn,
+/// and what the compositor would do with it anyway is its own guard (`look.placed`), which is counted. A position or zoom that holds one value
+/// is no pose at all (the clip's graph is a static one) and a static position is the plain moved layer: drawn to the sample. And a placement
+/// *under* the blend (the bottom layer or a layer between) is a canvas like another: drawn exactly or refused whatever it is.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_m_a_blend_over_a_held_or_moving_placement_is_exact_or_refused() {
+    use kerf_core::{Behavior as B, BlendMode, Property, PropertyKey};
+    let m = media();
+    let assets = [m.bars.clone(), m.testsrc.clone(), m.noise.clone()];
+    let (mut failures, mut wider, mut anyway) = (Vec::new(), Vec::new(), Vec::new());
+    let opts = at_fps(30.0);
+    let keys = |a: f64, b: f64| vec![PropertyKey::new(0.0, a), PropertyKey::new(0.5, b)];
+    type Edit<'a> = Box<dyn Fn(&mut Clip) + 'a>;
+    // (name, edit, the pose moves: every frame of the clip is refused for it, drawn: every frame is drawn, either: None)
+    let cases: Vec<(&str, Edit<'_>, Option<bool>, bool)> = vec![
+        (
+            "moving zoom",
+            Box::new(|c| c.keyframes = vec![zoom_key(0.0, 1.0, 0.0, 0.0), zoom_key(0.5, 1.5, 0.0, 0.0)]),
+            Some(false),
+            true,
+        ),
+        (
+            "zoom out",
+            Box::new(|c| c.keyframes = vec![zoom_key(0.0, 1.0, 0.0, 0.0), zoom_key(0.5, 0.6, 0.0, 0.0)]),
+            Some(false),
+            true,
+        ),
+        (
+            "moving position",
+            Box::new(|c| c.keyframes = vec![zoom_key(0.0, 1.0, -0.1, 0.0), zoom_key(0.5, 1.0, 0.1, 0.05)]),
+            Some(false),
+            true,
+        ),
+        (
+            "moving x alone",
+            Box::new(|c| c.set_property_keys(Property::PosX, keys(0.0, 0.2))),
+            Some(false),
+            true,
+        ),
+        (
+            "moving y alone",
+            Box::new(|c| c.set_property_keys(Property::PosY, keys(0.05, -0.15))),
+            Some(false),
+            true,
+        ),
+        (
+            "a move of 1e-6",
+            Box::new(|c| c.set_property_keys(Property::PosX, keys(0.0, 1.0e-6))),
+            Some(false),
+            true,
+        ),
+        (
+            "a move of no size",
+            Box::new(|c| c.set_property_keys(Property::PosX, keys(0.1, 0.1 + 1.0e-12))),
+            None,
+            false,
+        ),
+        (
+            "a held zoom and position",
+            Box::new(|c| c.keyframes = vec![zoom_key(0.0, 1.0, 0.1, 0.05), zoom_key(0.5, 1.0, 0.1, 0.05)]),
+            None,
+            false,
+        ),
+        (
+            "a held position (x key)",
+            Box::new(|c| c.set_property_keys(Property::PosX, keys(0.15, 0.15))),
+            None,
+            false,
+        ),
+        (
+            "a static position",
+            Box::new(|c| {
+                c.transform.pos_x = 0.13;
+                c.transform.pos_y = -0.07;
+            }),
+            Some(true),
+            false,
+        ),
+        (
+            "a static position off the frame",
+            Box::new(|c| {
+                c.transform.pos_x = 0.6;
+                c.transform.pos_y = 0.3;
+            }),
+            None,
+            false,
+        ),
+        (
+            "a breath",
+            Box::new(|c| {
+                c.behaviors = vec![B::Breathe {
+                    amount: 0.15,
+                    speed: 1.3,
+                    phase: 0.2,
+                }];
+            }),
+            Some(false),
+            true,
+        ),
+        (
+            "a drift",
+            Box::new(|c| {
+                c.behaviors = vec![B::Drift {
+                    speed: 0.2,
+                    angle: 30.0,
+                    phase: 0.1,
+                }];
+            }),
+            Some(false),
+            true,
+        ),
+        (
+            "a shake",
+            Box::new(|c| {
+                c.behaviors = vec![B::Shake {
+                    amount: 0.03,
+                    speed: 2.5,
+                    seed: 7,
+                    phase: 0.0,
+                }];
+            }),
+            Some(false),
+            true,
+        ),
+        (
+            "a breath of no depth",
+            Box::new(|c| {
+                c.behaviors = vec![B::Breathe {
+                    amount: 0.0,
+                    speed: 1.0,
+                    phase: 0.0,
+                }];
+            }),
+            None,
+            false,
+        ),
+        (
+            "a move that ends before the clip does",
+            Box::new(|c| c.set_property_keys(Property::PosX, vec![PropertyKey::new(0.0, 0.0), PropertyKey::new(0.1, 0.2)])),
+            Some(false),
+            true,
+        ),
+    ];
+    for (name, edit, draws, refused_by_blend) in &cases {
+        for mode in [BlendMode::Multiply, BlendMode::Difference] {
+            let mut c = clip(&m.testsrc, 0.5, 1.0, 0.0);
+            c.blend_mode = mode;
+            edit(&mut c);
+            let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.0, 0.0)], vec![c]], None);
+            let case = format!("checker/e/m/blend {name} {mode:?}");
+            m_case_at(
+                30.0,
+                &case,
+                &tl,
+                &assets,
+                0..8,
+                *draws,
+                &mut failures,
+                &mut wider,
+                &mut anyway,
+            );
+            if *refused_by_blend {
+                // The plan's refusal is not the only one: the compositor refuses a blend over a pose itself (`look.placed`), so the frame
+                // asked for with the plan's reasons ignored is not drawn at all, or is drawn exactly.
+                // (Without the scratch patch the compositor judges the plan itself and refuses before any guard of its own is reached.)
+                if std::env::var_os("KERF_CHECKER_ANYWAY").is_some() {
+                    let bypass = ce_scan(&format!("{case} (plan bypassed)"), &tl, &assets, &opts, 0..8, true);
+                    eprintln!("BYPASS {}", bypass.line(&case));
+                    if bypass.drawn > 0 && !bypass.exact() {
+                        failures.push(format!(
+                            "{case}: the compositor draws a blend over a pose when the plan is bypassed, and not exactly: {}",
+                            bypass.line("bypassed")
+                        ));
+                    }
+                }
+                for (k, why) in m_reasons(&tl, &assets, &opts, 0..8) {
+                    if !why
+                        .iter()
+                        .any(|(kind, w)| *kind == "blend_mode" && w.contains("a moving zoom or position"))
+                    {
+                        failures.push(format!("{case}: frame {k} is not refused by the blend for the pose: {why:?}"));
+                    }
+                }
+            }
+        }
+    }
+    // A blend over noise (every sample of the clip's edge differs) and with an odd width, still, so the held cases are not an accident of the pattern.
+    for mode in [BlendMode::Multiply, BlendMode::Exclusion, BlendMode::HardLight] {
+        let mut c = clip(&m.noise, 0.5, 1.0, 0.0);
+        c.blend_mode = mode;
+        c.transform.crop_right = 1.0 / 640.0;
+        c.transform.pos_x = 0.07;
+        let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.0, 0.0)], vec![c]], None);
+        m_case_at(
+            30.0,
+            &format!("checker/e/m/blend noise odd static {mode:?}"),
+            &tl,
+            &assets,
+            0..8,
+            Some(true),
+            &mut failures,
+            &mut wider,
+            &mut anyway,
+        );
+    }
+    // A placement under the blend: the bottom layer zooms out (the canvas shows around it) or moves, or a layer between does; the blended clip is
+    // static, turned or not, plain or odd.
+    for (below, edit) in [
+        (
+            "bottom zooms out",
+            Box::new(|c: &mut Clip| c.keyframes = vec![zoom_key(0.0, 1.0, 0.0, 0.0), zoom_key(0.5, 0.6, 0.1, 0.0)]) as Edit<'_>,
+        ),
+        (
+            "bottom zooms in",
+            Box::new(|c: &mut Clip| c.keyframes = vec![zoom_key(0.0, 1.0, 0.0, 0.0), zoom_key(0.5, 1.4, 0.0, 0.0)]),
+        ),
+        (
+            "bottom moves",
+            Box::new(|c: &mut Clip| c.set_property_keys(Property::PosX, keys(-0.2, 0.2))),
+        ),
+    ] {
+        for (clip_what, turn, crop) in [("static", 0.0, 0.0), ("turned 90", 90.0, 0.0), ("odd", 0.0, 1.0 / 640.0)] {
+            for mode in [BlendMode::Multiply, BlendMode::Add] {
+                let mut bottom = clip(&m.bars, 0.5, 1.0, 0.0);
+                edit(&mut bottom);
+                let mut top = clip(&m.testsrc, 0.5, 1.0, 0.0);
+                top.blend_mode = mode;
+                top.transform.rotation = turn;
+                top.transform.crop_right = crop;
+                let tl = timeline(vec![vec![bottom], vec![top]], None);
+                m_case_at(
+                    30.0,
+                    &format!("checker/e/m/blend over {below}, {clip_what} {mode:?}"),
+                    &tl,
+                    &assets,
+                    0..8,
+                    None,
+                    &mut failures,
+                    &mut wider,
+                    &mut anyway,
+                );
+            }
+        }
+    }
+    // A slide into a blended clip whose position is held (its travel is the overlay's own, drawn) and into one that moves (a pose with the
+    // travel added: refused).
+    for (name, kind, moving) in [
+        ("slide left, held", TransitionKind::SlideLeft, false),
+        ("slide up, held", TransitionKind::SlideUp, false),
+        ("push left, held", TransitionKind::PushLeft, false),
+        ("slide left, moving", TransitionKind::SlideLeft, true),
+        ("push right, moving", TransitionKind::PushRight, true),
+    ] {
+        let mut first = clip(&m.testsrc, 0.5, 1.0, 0.0);
+        first.blend_mode = BlendMode::Screen;
+        let mut second = clip(&m.noise, 0.5, 1.0, 0.5);
+        second.blend_mode = BlendMode::Multiply;
+        second.transition_in = Some(Transition { kind, duration: 0.3 });
+        if moving {
+            second.set_property_keys(Property::PosX, keys(-0.1, 0.1));
+        }
+        let tl = timeline(vec![vec![clip(&m.bars, 0.0, 1.0, 0.0)], vec![first, second]], None);
+        let case = format!("checker/e/m/blend {name}");
+        m_case_at(30.0, &case, &tl, &assets, 0..30, None, &mut failures, &mut wider, &mut anyway);
+        if moving {
+            let reasons = m_reasons(&tl, &assets, &opts, 15..30);
+            if let Some((k, why)) = reasons.iter().find(|(_, why)| {
+                !why.iter()
+                    .any(|(kind, w)| *kind == "blend_mode" && w.contains("a moving zoom or position"))
+            }) {
+                failures.push(format!("{case}: frame {k} is not refused by the blend for the pose: {why:?}"));
+            }
+        }
+    }
+    for mode in [BlendMode::Multiply, BlendMode::Difference] {
+        let mut mid = clip(&m.noise, 0.5, 1.0, 0.0);
+        mid.keyframes = vec![zoom_key(0.0, 1.0, 0.0, 0.0), zoom_key(0.5, 0.7, 0.1, 0.1)];
+        let mut top = clip(&m.testsrc, 0.5, 1.0, 0.0);
+        top.blend_mode = mode;
+        top.transform.pos_x = 0.1;
+        let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.0, 0.0)], vec![mid], vec![top]], None);
+        m_case_at(
+            30.0,
+            &format!("checker/e/m/blend over a middle layer that zooms {mode:?}"),
+            &tl,
+            &assets,
+            0..8,
+            None,
+            &mut failures,
+            &mut wider,
+            &mut anyway,
+        );
+    }
+    r4_finish(
+        "checker_e_m_a_blend_over_a_held_or_moving_placement",
+        failures,
+        &wider,
+        &anyway,
+        true,
+    );
+}
+
+/// A quarter turn beside keyed motion, and the `geq` edge that two lanes shift ahead of different passes (a placement's scale; a turn). On a
+/// picture whose every edge sample differs (noise, and the smooth gradient whose only strong edge is the layer's own):
+/// * a quarter turn with a position or zoom that moves is refused, whichever key moves it (a placement is not drawn behind a rotation);
+/// * a turn beside a position or zoom that holds one value is the static turn, drawn exactly or refused;
+/// * a mask or a keyed opacity that holds 1 ahead of a moving zoom or position is drawn exactly on the build whose `geq` reads a plane's last
+///   column and row one in (6.1) and on the one that copies them (9.0), and a keyed opacity on a turned layer, at the quarters and a hair
+///   inside the window, likewise.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_m_a_quarter_turn_beside_keyed_motion_and_the_geq_edge_before_a_placement_or_a_turn() {
+    use kerf_core::{Behavior as B, BlendMode, Property, PropertyKey};
+    let m = media();
+    let assets = [m.bars.clone(), m.testsrc.clone(), m.noise.clone(), m.smooth.clone()];
+    let (mut failures, mut wider, mut anyway) = (Vec::new(), Vec::new(), Vec::new());
+    let opts = at_fps(30.0);
+    let keys = |a: f64, b: f64| vec![PropertyKey::new(0.0, a), PropertyKey::new(0.5, b)];
+    type Edit<'a> = Box<dyn Fn(&mut Clip) + 'a>;
+    let rotated_keys = |degrees: f64| -> Vec<kerf_core::Keyframe> {
+        vec![
+            kerf_core::Keyframe {
+                rotation: degrees,
+                ..zoom_key(0.0, 1.0, 0.0, 0.0)
+            },
+            kerf_core::Keyframe {
+                rotation: degrees,
+                ..zoom_key(0.5, 1.3, 0.0, 0.0)
+            },
+        ]
+    };
+    let one = m_degrees(1, 1.0e-7);
+    // (name, edit, draws, the pose and the turn are both there: the plan names the rotation)
+    let cases: Vec<(&str, Edit<'_>, Option<bool>, bool)> = vec![
+        (
+            "a quarter and a moving x",
+            Box::new(|c| {
+                c.transform.rotation = 90.0;
+                c.set_property_keys(Property::PosX, keys(0.0, 0.2));
+            }),
+            Some(false),
+            true,
+        ),
+        (
+            "a quarter and a moving y",
+            Box::new(|c| {
+                c.transform.rotation = 270.0;
+                c.set_property_keys(Property::PosY, keys(0.1, -0.1));
+            }),
+            Some(false),
+            true,
+        ),
+        (
+            "a quarter and a moving scale",
+            Box::new(|c| {
+                c.transform.rotation = 180.0;
+                c.set_property_keys(Property::Scale, keys(1.0, 1.3));
+            }),
+            Some(false),
+            true,
+        ),
+        (
+            "a hair off a quarter and a moving x",
+            Box::new(move |c| {
+                c.transform.rotation = one;
+                c.set_property_keys(Property::PosX, keys(0.0, 0.2));
+            }),
+            Some(false),
+            true,
+        ),
+        (
+            "keys that carry a quarter and move the zoom",
+            Box::new(move |c| c.keyframes = rotated_keys(90.0)),
+            Some(false),
+            true,
+        ),
+        (
+            "keys that carry a hair off a quarter and move the zoom",
+            Box::new(move |c| c.keyframes = rotated_keys(one)),
+            Some(false),
+            true,
+        ),
+        (
+            "a quarter and a drift",
+            Box::new(|c| {
+                c.transform.rotation = 90.0;
+                c.behaviors = vec![B::Drift {
+                    speed: 0.2,
+                    angle: 30.0,
+                    phase: 0.0,
+                }];
+            }),
+            Some(false),
+            true,
+        ),
+        (
+            "a quarter and a spin",
+            Box::new(|c| {
+                c.transform.rotation = 90.0;
+                c.behaviors = vec![B::Spin { speed: 0.3, phase: 0.0 }];
+            }),
+            Some(false),
+            false,
+        ),
+        (
+            "a quarter and a held x",
+            Box::new(|c| {
+                c.transform.rotation = 90.0;
+                c.set_property_keys(Property::PosX, keys(0.15, 0.15));
+            }),
+            None,
+            false,
+        ),
+        (
+            "a quarter and a held scale",
+            Box::new(|c| {
+                c.transform.rotation = 180.0;
+                c.set_property_keys(Property::Scale, keys(1.0, 1.0));
+            }),
+            None,
+            false,
+        ),
+        (
+            "a hair inside the window and a held y",
+            Box::new(move |c| {
+                c.transform.rotation = one;
+                c.set_property_keys(Property::PosY, keys(-0.1, -0.1));
+            }),
+            None,
+            false,
+        ),
+        (
+            "a quarter and a keyed opacity that holds 1",
+            Box::new(|c| {
+                c.transform.rotation = 90.0;
+                c.set_property_keys(Property::Opacity, keys(1.0, 1.0));
+            }),
+            None,
+            false,
+        ),
+        (
+            "a quarter and a keyed opacity that falls",
+            Box::new(|c| {
+                c.transform.rotation = 270.0;
+                c.set_property_keys(Property::Opacity, keys(1.0, 0.25));
+            }),
+            None,
+            false,
+        ),
+        (
+            "a hair inside the window and a keyed opacity that falls",
+            Box::new(move |c| {
+                c.transform.rotation = one;
+                c.set_property_keys(Property::Opacity, keys(1.0, 0.4));
+            }),
+            None,
+            false,
+        ),
+        (
+            "a half turn a hair under the window and a keyed opacity that falls",
+            Box::new(|c| {
+                c.transform.rotation = m_degrees(2, -1.19e-7);
+                c.set_property_keys(Property::Opacity, keys(0.9, 0.4));
+            }),
+            Some(true),
+            false,
+        ),
+        (
+            "a moving x and a keyed opacity that holds 1",
+            Box::new(|c| {
+                c.set_property_keys(Property::PosX, keys(0.0, 0.2));
+                c.set_property_keys(Property::Opacity, keys(1.0, 1.0));
+            }),
+            None,
+            false,
+        ),
+        (
+            "a moving zoom and a keyed opacity that holds 1",
+            Box::new(|c| {
+                c.set_property_keys(Property::Scale, keys(1.0, 1.25));
+                c.set_property_keys(Property::Opacity, keys(1.0, 1.0));
+            }),
+            None,
+            false,
+        ),
+        (
+            "a moving x and a mask",
+            Box::new(|c| {
+                c.set_property_keys(Property::PosX, keys(-0.1, 0.1));
+                c.mask = Some(mask_of(kerf_core::MaskShape::Rect, 0.0, false));
+            }),
+            None,
+            false,
+        ),
+        (
+            "a moving zoom and a feathered inverted mask",
+            Box::new(|c| {
+                c.set_property_keys(Property::Scale, keys(1.0, 1.25));
+                c.mask = Some(mask_of(kerf_core::MaskShape::Ellipse, 0.4, true));
+            }),
+            None,
+            false,
+        ),
+        (
+            "a moving x and the full-frame mask",
+            Box::new(|c| {
+                c.set_property_keys(Property::PosX, keys(0.0, 0.1));
+                c.mask = Some(kerf_core::Mask {
+                    shape: kerf_core::MaskShape::Rect,
+                    x: 0.5,
+                    y: 0.5,
+                    width: 1.0,
+                    height: 1.0,
+                    feather: 0.0,
+                    inverted: false,
+                });
+            }),
+            None,
+            false,
+        ),
+    ];
+    for (asset_name, asset) in [("noise", &m.noise), ("smooth", &m.smooth)] {
+        for (name, edit, draws, names_rotation) in &cases {
+            for mode in [None, Some(BlendMode::Multiply)] {
+                if asset_name == "smooth" && mode.is_some() {
+                    continue;
+                }
+                let mut c = clip(asset, 0.5, 1.0, 0.0);
+                edit(&mut c);
+                if let Some(mode) = mode {
+                    c.blend_mode = mode;
+                }
+                let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.0, 0.0)], vec![c]], None);
+                let case = format!("checker/e/m/keyed {asset_name} {name} {mode:?}");
+                let scaled = r3_resized(&tl, &assets, 30.0);
+                let draws = if mode.is_some() && draws == &Some(true) {
+                    None
+                } else {
+                    *draws
+                };
+                if scaled && mode.is_none() && draws != Some(false) {
+                    continue;
+                }
+                m_case_at(30.0, &case, &tl, &assets, 0..8, draws, &mut failures, &mut wider, &mut anyway);
+                if *names_rotation && mode.is_none() {
+                    let reasons = m_reasons(&tl, &assets, &opts, 0..8);
+                    if let Some((k, why)) = reasons
+                        .iter()
+                        .find(|(_, why)| !why.iter().any(|(_, w)| w.to_lowercase().contains("rotation")))
+                    {
+                        failures.push(format!("{case}: frame {k} is not refused for the rotation: {why:?}"));
+                    }
+                }
+            }
+        }
+    }
+    r4_finish(
+        "checker_e_m_a_quarter_turn_beside_keyed_motion",
+        failures,
+        &wider,
+        &anyway,
+        true,
+    );
+}
+
+/// The still plan of frame `k`'s instant (`RenderPlan::at`, the plan a scrubbed still is drawn from) against the export's frame `k`, to the
+/// sample, for a cut whose pictures hold still around the instant (the dissolve-free cuts here), or the refusal. `Err` carries what is wrong.
+fn m_still(case: &str, tl: &Timeline, assets: &[Asset], ks: &[u64], draws: Option<bool>) -> Result<(usize, usize), Vec<String>> {
+    let opts = at_fps(30.0);
+    let slug: String = case
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let played = export(&slug, tl, assets, &opts);
+    let (mut drawn, mut refused, mut failures) = (0, 0, Vec::new());
+    for &k in ks {
+        let t = k as f64 / 30.0 - 1e-4;
+        let plan = kerf_core::RenderPlan::at(tl, assets, &opts, t, policy()).expect("still plan");
+        let size = plan.size(u32::MAX);
+        let why = plan.reasons(&compositor().caps(), size);
+        if !why.is_empty() {
+            refused += 1;
+            eprintln!("{case} @ {k}: refused: {}", why[0]);
+            if draws == Some(true) {
+                failures.push(format!("{case} @ {k}: refused: {why:?}"));
+            }
+            continue;
+        }
+        if draws == Some(false) {
+            failures.push(format!("{case} @ {k}: drawn, a refusal was expected"));
+        }
+        let frames = kerf_gpu::decode_layers(&plan.layers).expect("decode");
+        let got = match compositor().composite_yuv(&plan, &frames, size) {
+            Ok(g) => g,
+            Err(e) => {
+                failures.push(format!("{case} @ {k}: the compositor's own guard: {e}"));
+                continue;
+            }
+        };
+        drawn += 1;
+        let want = played.planes(k as usize);
+        let got = planes_of(&got);
+        let stats: Vec<PlaneStats> = (0..3).map(|p| PlaneStats::of(want[p], got[p])).collect();
+        eprintln!(
+            "{case} @ {k}: drawn, Y {} U {} V {} differ",
+            stats[0].differing, stats[1].differing, stats[2].differing
+        );
+        if stats.iter().any(|s| s.differing > 0) {
+            failures.push(format!(
+                "{case} @ {k}: Y {} (max {}) U {} (max {}) V {} (max {}) differ",
+                stats[0].differing, stats[0].max, stats[1].differing, stats[1].max, stats[2].differing, stats[2].max
+            ));
+        }
+    }
+    if failures.is_empty() {
+        Ok((drawn, refused))
+    } else {
+        Err(failures)
+    }
+}
+
+/// The still plan at the edges of the filter's window and over a pose: a layer turned `off` radians off a quarter is the export's frame to the
+/// sample where the plan draws it (plain and blended) and refused outside the fast path's window; a blended clip over a keyed zoom or position
+/// is refused in the still as in the export, and one whose position holds is drawn exactly; and a still of a keyed opacity that holds 1 on a
+/// quarter turn of noise is the export's, whichever side of the `geq` edge this build is on.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_m_a_still_at_the_windows_edge_and_over_a_pose_is_the_exports_frame_to_the_sample() {
+    use kerf_core::{BlendMode, Property, PropertyKey};
+    let m = media();
+    let assets = [m.bars.clone(), m.noise.clone()];
+    let mut failures: Vec<String> = Vec::new();
+    let mut results: Vec<Result<(usize, usize), Vec<String>>> = Vec::new();
+    for q in [0, 1, 2, 3, -1] {
+        for off in [0.0, 1.0e-7, -1.19e-7, 1.2e-7, -1.3e-7] {
+            let degrees = m_degrees(q, off);
+            let plan_says = kerf_core::quarter_turn(degrees.to_radians()).is_some();
+            let want = m_fast_path(q, off).unwrap_or(plan_says);
+            if want != plan_says {
+                failures.push(format!(
+                    "{q} quarters {off:+e}: the filter's fast path says {want}, the plan {plan_says}"
+                ));
+            }
+            for (what, crop, mode) in [
+                ("odd", 1.0 / 640.0, None),
+                ("odd blended", 1.0 / 640.0, Some(BlendMode::Multiply)),
+            ] {
+                let mut c = clip(&m.noise, 0.2, 1.0, 0.0);
+                c.transform.rotation = degrees;
+                c.transform.crop_right = crop;
+                c.transform.pos_x = 0.05;
+                if let Some(mode) = mode {
+                    c.blend_mode = mode;
+                }
+                let tl = timeline(vec![vec![clip(&m.bars, 0.2, 1.0, 0.0)], vec![c]], None);
+                results.push(m_still(
+                    &format!("checker/e/m/still turn {q} quarters {off:+e} {what}"),
+                    &tl,
+                    &assets,
+                    &[2, 9],
+                    Some(want),
+                ));
+            }
+        }
+    }
+    let key = |a: f64, b: f64| vec![PropertyKey::new(0.0, a), PropertyKey::new(1.0, b)];
+    for mode in [BlendMode::Multiply, BlendMode::Add, BlendMode::Difference] {
+        for (name, moving, draws) in [
+            ("moving x", true, Some(false)),
+            ("held x", false, Some(true)),
+            ("moving zoom", true, Some(false)),
+        ] {
+            let mut c = clip(&m.noise, 0.2, 1.0, 0.0);
+            c.blend_mode = mode;
+            if name == "moving zoom" {
+                c.set_property_keys(Property::Scale, key(1.0, 1.4));
+            } else {
+                c.set_property_keys(Property::PosX, key(0.1, if moving { 0.3 } else { 0.1 }));
+            }
+            let tl = timeline(vec![vec![clip(&m.bars, 0.2, 1.0, 0.0)], vec![c]], None);
+            results.push(m_still(
+                &format!("checker/e/m/still blend {name} {mode:?}"),
+                &tl,
+                &assets,
+                &[2, 9, 20],
+                draws,
+            ));
+        }
+    }
+    let mut held = clip(&m.noise, 0.2, 1.0, 0.0);
+    held.transform.rotation = 270.0;
+    held.set_property_keys(Property::Opacity, key(1.0, 1.0));
+    let tl = timeline(vec![vec![clip(&m.bars, 0.2, 1.0, 0.0)], vec![held]], None);
+    results.push(m_still(
+        "checker/e/m/still keyed opacity 1 and a quarter",
+        &tl,
+        &assets,
+        &[2, 9, 20],
+        None,
+    ));
+    let (mut drawn, mut refused) = (0, 0);
+    for r in results {
+        match r {
+            Ok((d, r)) => {
+                drawn += d;
+                refused += r;
+            }
+            Err(f) => failures.extend(f),
+        }
+    }
+    eprintln!("{drawn} still frames drawn and held to the export, {refused} refused");
+    assert!(drawn >= 60, "{drawn} frames drawn");
+    assert!(failures.is_empty(), "{} cases: {failures:#?}", failures.len());
+}
+
+/// A keyed colour (the `eq` of each frame) beside what the two lanes added around it: a quarter turn and a hair inside the filter's window,
+/// a blend mode, a static position, and a moving position or zoom behind it. Drawn exactly or refused, frame by frame.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_m_a_keyed_colour_beside_a_turn_a_blend_and_a_placement() {
+    use kerf_core::{BlendMode, Property, PropertyKey};
+    let m = media();
+    let assets = [m.bars.clone(), m.testsrc.clone(), m.noise.clone()];
+    let (mut failures, mut wider, mut anyway) = (Vec::new(), Vec::new(), Vec::new());
+    let keys = |a: f64, b: f64| vec![PropertyKey::new(0.0, a), PropertyKey::new(0.5, b)];
+    type Edit<'a> = Box<dyn Fn(&mut Clip) + 'a>;
+    let hair = m_degrees(1, 1.1e-7);
+    let cases: Vec<(&str, Edit<'_>)> = vec![
+        ("nothing else", Box::new(|_| {})),
+        ("a quarter", Box::new(|c| c.transform.rotation = 90.0)),
+        (
+            "a half turn a hair under the window",
+            Box::new(|c| c.transform.rotation = m_degrees(2, -1.19e-7)),
+        ),
+        ("a hair inside the window", Box::new(move |c| c.transform.rotation = hair)),
+        ("a static position", Box::new(|c| c.transform.pos_x = 0.12)),
+        (
+            "a moving x",
+            Box::new(move |c| c.set_property_keys(Property::PosX, keys(-0.1, 0.1))),
+        ),
+        (
+            "a moving zoom",
+            Box::new(move |c| c.set_property_keys(Property::Scale, keys(1.0, 1.3))),
+        ),
+    ];
+    for (name, edit) in &cases {
+        for (props, what) in [
+            (&[Property::Brightness][..], "brightness"),
+            (&[Property::Saturation, Property::Gamma][..], "saturation and gamma"),
+        ] {
+            for mode in [None, Some(BlendMode::Screen)] {
+                let mut c = colour_keyed(&m.noise, props, &linear_keys);
+                c.source_in = 0.5;
+                c.source_out = 1.0;
+                edit(&mut c);
+                if let Some(mode) = mode {
+                    c.blend_mode = mode;
+                }
+                let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.0, 0.0)], vec![c]], None);
+                let scaled = r3_resized(&tl, &assets, 30.0);
+                if scaled && mode.is_none() {
+                    continue;
+                }
+                m_case_at(
+                    30.0,
+                    &format!("checker/e/m/colour {what} with {name} {mode:?}"),
+                    &tl,
+                    &assets,
+                    0..8,
+                    None,
+                    &mut failures,
+                    &mut wider,
+                    &mut anyway,
+                );
+            }
+        }
+    }
+    r4_finish("checker_e_m_a_keyed_colour_beside", failures, &wider, &anyway, true);
+}
+
+/// [`r4_case`] at the frame rate `fps`: the verdict against what the plan said, and the refused frames drawn anyway for what the refusal costs.
+#[allow(clippy::too_many_arguments)]
+fn m_case_at(
+    fps: f64,
+    case: &str,
+    tl: &Timeline,
+    assets: &[Asset],
+    frames: Range<u64>,
+    draws: Option<bool>,
+    failures: &mut Vec<String>,
+    wider: &mut Vec<String>,
+    drawn_anyway: &mut Vec<String>,
+) {
+    let opts = at_fps(fps);
+    let scan = ce_scan(case, tl, assets, &opts, frames.clone(), false);
+    eprintln!("{}", scan.line(case));
+    CE_DRAWN.with(|d| d.set(d.get() + scan.drawn));
+    if let Some(why) = scan.verdict(draws) {
+        failures.push(format!("{case}: {why}"));
+    }
+    // (The compositor judges the plan itself, so a frame the plan refuses is only drawn by a compositor built without that judgement: the
+    // scratch patch `KERF_CHECKER_ANYWAY` stands for. Without it the draw-anyway is a second export that can only repeat the refusal.)
+    if scan.drawn < scan.frames && std::env::var_os("KERF_CHECKER_ANYWAY").is_some() {
+        let name = format!("{case} (drawn anyway)");
+        let anyway = ce_scan(&name, tl, assets, &opts, frames, true);
+        eprintln!("anyway: {}", anyway.line(&name));
+        drawn_anyway.push(format!(
+            "{case}: anyway drawn {} of {}, guards {}, Y {} UV {} differ",
+            anyway.drawn,
+            anyway.frames,
+            anyway.guards.values().sum::<usize>(),
+            anyway.y.differing,
+            anyway.uv.differing
+        ));
+        if anyway.drawn > scan.drawn && anyway.exact() {
+            wider.push(format!("{case}: refused and drawn exactly anyway ({} frames)", anyway.drawn));
+        }
+    }
+}
+
+/// Turned pictures in BT.601, BT.709 and BT.2020 (the checker's 512x256 pictures at 32 frames a second, a power-of-two canvas), each over a
+/// bottom layer of each tag, at the quarters and a hair inside the window, plain and blended (a BT.2020 composite is a blend extra the probe
+/// measures): drawn exactly or refused, on this build's colour policy.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_m_a_turned_picture_of_each_matrix_over_a_bottom_layer_of_each_is_exact_or_refused() {
+    use kerf_core::BlendMode;
+    let c = checker_media();
+    let (mut failures, mut wider, mut anyway) = (Vec::new(), Vec::new(), Vec::new());
+    let bottoms = [("untagged", &c.bars), ("709", &c.testsrc709), ("2020", &c.testsrc2020)];
+    let tops = [
+        ("untagged", &c.testsrc),
+        ("709", &c.testsrc709),
+        ("2020", &c.testsrc2020),
+        ("noise", &c.noise),
+    ];
+    for (bname, bottom) in bottoms {
+        for (tname, top) in tops {
+            for angle in [90.0, m_degrees(3, -1.19e-7)] {
+                for mode in [None, Some(BlendMode::Multiply)] {
+                    let mut t = clip(top, 0.25, 0.5, 0.0);
+                    t.transform.rotation = angle;
+                    t.transform.pos_x = 0.1;
+                    if let Some(mode) = mode {
+                        t.blend_mode = mode;
+                    }
+                    let assets = [bottom.clone(), top.clone()];
+                    let tl = timeline(vec![vec![clip(bottom, 0.25, 0.5, 0.0)], vec![t]], None);
+                    m_case_at(
+                        32.0,
+                        &format!("checker/e/m/matrix {tname} turned {angle:.9} over {bname} {mode:?}"),
+                        &tl,
+                        &assets,
+                        0..4,
+                        None,
+                        &mut failures,
+                        &mut wider,
+                        &mut anyway,
+                    );
+                }
+            }
+        }
+    }
+    r4_finish(
+        "checker_e_m_a_turned_picture_of_each_matrix_over_a_bottom_layer_of_each",
+        failures,
+        &wider,
+        &anyway,
+        true,
+    );
+}
+
+/// A keyed opacity (a `geq` alpha that reads a plane's last column and row one in on 6.1) on a turned picture that does not fill the frame or
+/// has odd sides: the pad's bars are part of the plane the `geq` runs on, so its last column and row, shifted ahead of the turn, are the bars'
+/// (or the odd picture's own), not the picture's. A pillarbox and two odd-sided pictures, the quarters and a hair inside the window, holding 1 and
+/// falling; then a mask beside a moving zoom on the same pictures.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_m_a_keyed_opacity_on_a_turned_letterboxed_or_odd_picture_shifts_the_plane_it_runs_on() {
+    use kerf_core::{Property, PropertyKey};
+    let m = media();
+    let s = shapes();
+    let (mut failures, mut wider, mut anyway) = (Vec::new(), Vec::new(), Vec::new());
+    let keys = |a: f64, b: f64| vec![PropertyKey::new(0.0, a), PropertyKey::new(0.5, b)];
+    for (name, asset) in [
+        ("pillar", &s.pillar),
+        ("odd width", &s.odd_width),
+        ("odd height", &s.odd_height),
+        ("noise", &m.noise),
+    ] {
+        let assets = [m.bars.clone(), asset.clone()];
+        for angle in [90.0, 180.0, 270.0, m_degrees(1, 1.1e-7), m_degrees(2, -1.1e-7)] {
+            for (what, from, to) in [("falls", 1.0, 0.3), ("holds 1", 1.0, 1.0)] {
+                let mut c = clip(asset, 0.5, 1.0, 0.0);
+                c.transform.rotation = angle;
+                c.set_property_keys(Property::Opacity, keys(from, to));
+                let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.0, 0.0)], vec![c]], None);
+                m_case_at(
+                    30.0,
+                    &format!("checker/e/m/geq {name} turned {angle:.9} opacity {what}"),
+                    &tl,
+                    &assets,
+                    0..4,
+                    None,
+                    &mut failures,
+                    &mut wider,
+                    &mut anyway,
+                );
+            }
+        }
+        let mut z = clip(asset, 0.5, 1.0, 0.0);
+        z.set_property_keys(Property::Scale, keys(1.0, 1.3));
+        z.mask = Some(mask_of(kerf_core::MaskShape::Rect, 0.0, false));
+        let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.0, 0.0)], vec![z]], None);
+        m_case_at(
+            30.0,
+            &format!("checker/e/m/geq {name} mask and a moving zoom"),
+            &tl,
+            &assets,
+            0..8,
+            None,
+            &mut failures,
+            &mut wider,
+            &mut anyway,
+        );
+    }
+    r4_finish(
+        "checker_e_m_a_keyed_opacity_on_a_turned_letterboxed_or_odd_picture",
+        failures,
+        &wider,
+        &anyway,
+        true,
+    );
+}
+
+/// The price of the refusal of a blend over a pose (`BlendMode: "a moving zoom or position"`): the frames the plan refuses are drawn anyway and
+/// compared with the export. A refusal is *necessary* when the drawn frame is not the export's; one that would have been exact is wider than it
+/// has to be. The compositor judges the plan itself (and guards a blend over a placed layer itself), so the draw-anyway needs the scratch patch
+/// (`KERF_CHECKER_ANYWAY`: the `blend_mode` and `zoom_behind` reasons are dropped and the `look.placed` guard of the blend is skipped); without it the
+/// case holds the refusal (every frame of every case is refused for the pose, none drawn) and prints no price. With the patch it prints
+/// `PRICE exact` / `PRICE inexact` for every case and fails on none: the verdict is the printed list.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough); the price needs KERF_CHECKER_ANYWAY and the scratch patch"]
+fn checker_e_m_a_blend_over_a_pose_what_the_refusal_costs() {
+    use kerf_core::{Property, PropertyKey, Transition};
+    let m = media();
+    let v = variants();
+    let s = shapes();
+    let patched = std::env::var_os("KERF_CHECKER_ANYWAY").is_some();
+    let opts = at_fps(30.0);
+    let keys = |a: f64, b: f64| vec![PropertyKey::new(0.0, a), PropertyKey::new(0.2, b)];
+    type Edit<'a> = Box<dyn Fn(&mut Clip) + 'a>;
+    let poses: Vec<(&str, Edit<'_>)> = vec![
+        (
+            "zoom in",
+            Box::new(|c| c.keyframes = vec![zoom_key(0.0, 1.0, 0.0, 0.0), zoom_key(0.2, 1.5, 0.0, 0.0)]),
+        ),
+        (
+            "zoom out and over",
+            Box::new(|c| c.keyframes = vec![zoom_key(0.0, 1.0, 0.0, 0.0), zoom_key(0.2, 0.55, 0.12, -0.08)]),
+        ),
+        (
+            "position",
+            Box::new(move |c| c.set_property_keys(Property::PosX, keys(-0.15, 0.2))),
+        ),
+    ];
+    let mut priced: Vec<(String, usize, usize, bool)> = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
+    let mut price = |case: &str, tl: &Timeline, assets: &[Asset], frames: Range<u64>| {
+        let refused = m_reasons(tl, assets, &opts, frames.clone());
+        // (A cut of several clips is judged where a blended clip that moves is on screen only: the dissolves below are not asserted.)
+        for (k, why) in refused.iter().filter(|_| !case.contains("a dissolve")) {
+            if !why
+                .iter()
+                .any(|(kind, w)| *kind == "blend_mode" && w.contains("a moving zoom or position"))
+            {
+                failures.push(format!("{case}: frame {k} is not refused by the blend for the pose: {why:?}"));
+            }
+        }
+        if !patched {
+            return;
+        }
+        let drawn = ce_scan(case, tl, assets, &opts, frames, true);
+        eprintln!("PRICE {}", drawn.line(case));
+        priced.push((case.to_string(), drawn.drawn, drawn.frames, drawn.exact()));
+    };
+    // Every mode over a pose, on per-sample noise (an edge sample of the clip is never the same as its neighbour's).
+    for (k, mode) in BLEND_MODES.iter().enumerate() {
+        for (pname, pose) in &poses {
+            let mut c = clip(&m.noise, 0.5, 1.0, 0.0);
+            c.blend_mode = *mode;
+            pose(&mut c);
+            let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.0, 0.0)], vec![c]], None);
+            price(
+                &format!("checker/e/m/price {mode:?} noise {pname} {k}"),
+                &tl,
+                &[m.bars.clone(), m.noise.clone()],
+                0..6,
+            );
+        }
+    }
+    // Other pictures under Multiply and Difference: shapes, depth, labels, a bottom layer of its own tag.
+    let pairs: Vec<(&str, &Asset, &Asset)> = vec![
+        ("testsrc", &m.bars, &m.testsrc),
+        ("edges", &m.bars, &m.edges),
+        ("smooth", &m.testsrc, &m.smooth),
+        ("pillar", &m.bars, &s.pillar),
+        ("odd width", &m.bars, &s.odd_width),
+        ("10-bit tv", &m.bars, &s.tenbit_tv),
+        ("709 over 709", &v.bars709, &v.testsrc709),
+        ("untagged over 709", &v.bars709, &m.testsrc),
+        ("709 over untagged", &m.bars, &v.testsrc709),
+        ("gray", &m.bars, &v.gray),
+    ];
+    for (name, bottom, top) in pairs {
+        for mode in [kerf_core::BlendMode::Multiply, kerf_core::BlendMode::Difference] {
+            for (pname, pose) in &poses[..2] {
+                let mut c = clip(top, 0.5, 1.0, 0.0);
+                c.blend_mode = mode;
+                pose(&mut c);
+                let tl = timeline(vec![vec![clip(bottom, 0.5, 1.0, 0.0)], vec![c]], None);
+                price(
+                    &format!("checker/e/m/price {name} {mode:?} {pname}"),
+                    &tl,
+                    &[bottom.clone(), top.clone()],
+                    0..6,
+                );
+            }
+        }
+    }
+    // An odd width, fades, a keyed opacity, a mask and a keyed colour on a moving blended clip; a placed bottom layer under a placed blended clip.
+    let extras: Vec<(&str, Edit<'_>)> = vec![
+        (
+            "odd width",
+            Box::new(|c| {
+                c.transform.crop_right = 1.0 / 640.0;
+                c.keyframes = vec![zoom_key(0.0, 1.0, 0.0, 0.0), zoom_key(0.2, 1.3, 0.05, 0.0)];
+            }),
+        ),
+        (
+            "fades",
+            Box::new(|c| {
+                c.fade_in = 0.1;
+                c.fade_out = 0.1;
+                c.keyframes = vec![zoom_key(0.0, 1.0, 0.0, 0.0), zoom_key(0.2, 1.3, 0.0, 0.0)];
+            }),
+        ),
+        (
+            "fades and a zoom out",
+            Box::new(|c| {
+                c.fade_in = 0.1;
+                c.fade_out = 0.1;
+                c.keyframes = vec![zoom_key(0.0, 1.0, 0.0, 0.0), zoom_key(0.2, 0.6, 0.1, -0.05)];
+            }),
+        ),
+        (
+            "a fade-in and a move",
+            Box::new(move |c| {
+                c.fade_in = 0.15;
+                c.set_property_keys(Property::PosX, keys(-0.1, 0.1));
+            }),
+        ),
+        (
+            "keyed opacity holds 1",
+            Box::new(move |c| {
+                c.set_property_keys(Property::PosX, keys(0.0, 0.2));
+                c.set_property_keys(Property::Opacity, keys(1.0, 1.0));
+            }),
+        ),
+        (
+            "mask",
+            Box::new(move |c| {
+                c.set_property_keys(Property::Scale, keys(1.0, 1.3));
+                c.mask = Some(mask_of(kerf_core::MaskShape::Ellipse, 0.3, false));
+            }),
+        ),
+        (
+            "keyed colour",
+            Box::new(move |c| {
+                c.set_property_keys(Property::PosY, keys(0.0, 0.1));
+                c.set_property_keys(Property::Brightness, keys(-0.2, 0.2));
+            }),
+        ),
+        (
+            "a static turn",
+            Box::new(move |c| {
+                c.transform.rotation = 90.0;
+                c.set_property_keys(Property::PosX, keys(0.0, 0.1));
+            }),
+        ),
+    ];
+    for (name, edit) in &extras {
+        let mut c = clip(&m.noise, 0.5, 1.0, 0.0);
+        c.blend_mode = kerf_core::BlendMode::Screen;
+        edit(&mut c);
+        let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.0, 0.0)], vec![c]], None);
+        price(
+            &format!("checker/e/m/price extra {name}"),
+            &tl,
+            &[m.bars.clone(), m.noise.clone()],
+            0..6,
+        );
+    }
+    let mut bottom = clip(&m.bars, 0.5, 1.0, 0.0);
+    bottom.keyframes = vec![zoom_key(0.0, 1.0, 0.0, 0.0), zoom_key(0.2, 0.6, 0.1, 0.0)];
+    let mut top = clip(&m.noise, 0.5, 1.0, 0.0);
+    top.blend_mode = kerf_core::BlendMode::Multiply;
+    top.keyframes = vec![zoom_key(0.0, 1.0, 0.0, 0.0), zoom_key(0.2, 1.4, 0.0, 0.0)];
+    let tl = timeline(vec![vec![bottom], vec![top]], None);
+    price(
+        "checker/e/m/price a placed bottom layer under a placed blended clip",
+        &tl,
+        &[m.bars.clone(), m.noise.clone()],
+        0..6,
+    );
+    // A dissolve between two blended clips: the pose moves on both, on one or on neither (the control, which is drawn today), and the clip
+    // that does not move is blended or not.
+    for (name, move_a, move_b, blend_a, blend_b) in [
+        ("both blended, both move", true, true, true, true),
+        ("both blended, the incoming moves", false, true, true, true),
+        ("both blended, the outgoing moves", true, false, true, true),
+        ("both blended, neither moves (the control)", false, false, true, true),
+        ("a plain outgoing and a blended incoming that moves", true, true, false, true),
+        ("a blended outgoing that moves and a plain incoming", true, true, true, false),
+    ] {
+        let mut a = clip(&m.testsrc, 0.5, 1.0, 0.0);
+        if blend_a {
+            a.blend_mode = kerf_core::BlendMode::Screen;
+        }
+        if move_a {
+            a.keyframes = vec![zoom_key(0.0, 1.0, 0.0, 0.0), zoom_key(0.5, 1.4, 0.0, 0.0)];
+        }
+        let mut b = clip(&m.noise, 0.5, 1.0, 0.5);
+        if blend_b {
+            b.blend_mode = kerf_core::BlendMode::Multiply;
+        }
+        if move_b {
+            b.keyframes = vec![zoom_key(0.0, 1.0, 0.1, 0.0), zoom_key(0.5, 0.7, 0.0, 0.1)];
+        }
+        b.transition_in = Some(Transition {
+            kind: TransitionKind::Crossfade,
+            duration: 0.3,
+        });
+        let tl = timeline(vec![vec![clip(&m.bars, 0.0, 1.0, 0.0)], vec![a, b]], None);
+        price(
+            &format!("checker/e/m/price a dissolve, {name}"),
+            &tl,
+            &[m.bars.clone(), m.testsrc.clone(), m.noise.clone()],
+            8..26,
+        );
+    }
+    // The other transitions into a blended clip that moves: dips (the clip's own alpha fades), slides and pushes (the travel is added to the pose).
+    for kind in [
+        TransitionKind::DipToBlack,
+        TransitionKind::SlideLeft,
+        TransitionKind::PushUp,
+        TransitionKind::SlideDown,
+    ] {
+        let mut a = clip(&m.testsrc, 0.5, 1.0, 0.0);
+        a.blend_mode = kerf_core::BlendMode::Screen;
+        let mut b = clip(&m.noise, 0.5, 1.0, 0.5);
+        b.blend_mode = kerf_core::BlendMode::Multiply;
+        b.keyframes = vec![zoom_key(0.0, 1.0, 0.1, 0.0), zoom_key(0.5, 0.7, 0.0, 0.1)];
+        b.transition_in = Some(Transition { kind, duration: 0.3 });
+        let tl = timeline(vec![vec![clip(&m.bars, 0.0, 1.0, 0.0)], vec![a, b]], None);
+        price(
+            &format!("checker/e/m/price a dissolve through {kind:?}, the incoming moves"),
+            &tl,
+            &[m.bars.clone(), m.testsrc.clone(), m.noise.clone()],
+            8..26,
+        );
+    }
+    if patched {
+        let exact = priced.iter().filter(|p| p.3 && p.1 == p.2).count();
+        let inexact: Vec<&(String, usize, usize, bool)> = priced.iter().filter(|p| p.1 > 0 && !p.3).collect();
+        let undrawn: Vec<&(String, usize, usize, bool)> = priced.iter().filter(|p| p.1 < p.2).collect();
+        eprintln!(
+            "PRICE summary: {} cases, {exact} drawn exactly on every frame (the refusal was wider than it had to be), {} drawn and not exact (necessary), {} not drawn by the compositor itself",
+            priced.len(),
+            inexact.len(),
+            undrawn.len()
+        );
+        for p in &inexact {
+            eprintln!("PRICE necessary: {}", p.0);
+        }
+        for p in &undrawn {
+            eprintln!("PRICE not drawn: {}", p.0);
+        }
+    }
+    assert!(failures.is_empty(), "{} cases: {failures:#?}", failures.len());
+}
