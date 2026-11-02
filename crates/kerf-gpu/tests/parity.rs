@@ -315,6 +315,8 @@ fn compositor() -> &'static Compositor {
         let _ = kerf_gpu::grade::kernels();
         let _ = kerf_gpu::scaler::kernels();
         let _ = kerf_gpu::convert::kernels();
+        // ... and how its `geq` reads a plane's edge, which a mask and a keyed opacity need (a render only reads it).
+        let _ = kerf_core::geq_edge();
         // ... and so is the layout of its `drawtext`, which decides whether text whose bitmaps share samples is drawn.
         let _ = kerf_gpu::text::model();
         Compositor::new(gpu()).expect("a compositor")

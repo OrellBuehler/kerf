@@ -541,7 +541,7 @@
     read from `avfiltergraph.c` and held by real files (`gpu.md`). It holds for every frame, so a lone clip of another matrix
     is converted wherever it is on the timeline. A cut whose deciding clip is RGB, of no known matrix, **or not read** (a
     clip on the plane that holds an `eq`, a grade, an effect, a tone map, a reprojection, a stabilisation or a placed black
-    fade, or a blend mode anywhere in the cut: `PlanCanvas::unread_decider_in_cut`) is `MixedMatrices` in every frame, and a
+    fade, or a blend mode anywhere in the cut: `PlanCanvas::unread_decider_in_cut`) is `MixedMatrices` in every frame, and so is a mixed cut for **caps without `matrix_convert`** (the conversion, and with it the decider's reading, is not measured on this FFmpeg: the deciding clip's own frames are refused too), and a
     mixed cut with a grade in the stack is refused. An RGB picture is taken into YCbCr with the cut's matrix, so one alone
     in a cut with a BT.709 or BT.2020 clip is `RgbInStack` (`PlanCanvas::cut_non_601`). `PlanCanvas.matrix` is the result for
     the frame's stack; `PlanStream::matrix` is the one a translucent layer is taken out of YUV with.

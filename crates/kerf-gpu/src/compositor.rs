@@ -871,14 +871,27 @@ impl Compositor {
     ///   not run: [`prepare`] runs it) the grade is not in the caps, so the plan refuses a graded layer up front
     ///   and nothing is decoded for a frame the render would refuse.
     ///
+    /// * `mask`, `keyed_opacity`: a `geq`, **where its edge read is known** ([`kerf_core::geq_edge_measured`], or the pin of
+    ///   [`Compositor::with_geq_edge`]); [`prepare`] measures it.
+    ///
+    /// * `mask` and `keyed_opacity` are in [`Compositor::caps`] only once the edge read of FFmpeg's `geq` is known
+    ///   ([`kerf_core::geq_edge_measured`], or [`Compositor::with_geq_edge`]); [`prepare`] measures it.
+    ///
     /// The combinations the plan names (`Unsupported`) stay FFmpeg's.
     /// Each later pass flips its bit beside the pass and its parity cases.
     pub fn caps(&self) -> GpuCaps {
-        Self::caps_for(
+        let mut caps = Self::caps_for(
             self.grade_kernels.unwrap_or_else(crate::grade::measured),
             self.scaler_kernels.unwrap_or_else(crate::scaler::measured),
             self.convert_kernels.unwrap_or_else(crate::convert::measured),
-        )
+        );
+        // A mask and a keyed opacity are a `geq` that reads a plane's last column and row as this build does, which the render
+        // only reads (`prepare` measures it): until it is known the plan refuses them, up front, rather than the render.
+        if self.geq_edge() == GeqEdge::Unknown {
+            caps.mask = false;
+            caps.keyed_opacity = false;
+        }
+        caps
     }
 
     /// [`Compositor::caps`] for a machine whose FFmpeg's conversions are `kernels`, whose scaler is `scaler` and whose conversion
@@ -940,9 +953,8 @@ impl Compositor {
         caps
     };
 
-    /// Pin what FFmpeg's `geq` does at a plane's last column and row, instead of measuring the
-    /// ffmpeg this process runs ([`kerf_core::geq_edge`], one child process, on the first masked
-    /// or keyed-opacity frame unless [`prepare`] ran ahead of it): for a host that knows its ffmpeg, and for tests.
+    /// Pin what FFmpeg's `geq` does at a plane's last column and row, instead of what [`prepare`] measured
+    /// ([`kerf_core::geq_edge_measured`]; a render never runs the probe): for a host that knows its ffmpeg, and for tests.
     #[must_use]
     pub fn with_geq_edge(mut self, edge: GeqEdge) -> Self {
         self.geq_edge = Some(edge);
@@ -1021,8 +1033,9 @@ impl Compositor {
         }
     }
 
+    /// How this FFmpeg's `geq` reads a plane's edge, as measured (or pinned): a render never runs the probe, `prepare` does.
     fn geq_edge(&self) -> GeqEdge {
-        self.geq_edge.unwrap_or_else(kerf_core::geq_edge)
+        self.geq_edge.unwrap_or_else(kerf_core::geq_edge_measured)
     }
 
     /// Build the pipelines on `gpu`. Fails with a [`GpuError`] — it never panics —

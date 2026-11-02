@@ -644,6 +644,9 @@ impl GpuPreview {
         }
         self.ensure_backend(technique, now).map_err(|why| one("backend", why))?;
         let drawing = self.drawing().map_err(|r| vec![r])?;
+        // Nothing the user looks at before the GPU has been checked against this FFmpeg (and a session that is declined for it
+        // has measured nothing: the probes below are for a session that may begin).
+        self.gate(&drawing.gpu, &drawing.adapter).map_err(|r| vec![r])?;
         // What the cut's caps are made of is measured now, once per process and off the frame loop: the frames read it only.
         kerf_gpu::prepare_timeline(&inputs.timeline);
         // A play from where the paused frame was drawn was made ready while the playhead rested there: its
@@ -679,8 +682,6 @@ impl GpuPreview {
                 return Err(one(super::error_kind(&error), error.to_string()).into());
             }
         }
-        // Nothing the user looks at before the GPU has been checked against this FFmpeg.
-        self.gate(&drawing.gpu, &drawing.adapter).map_err(|r| vec![r])?;
         let feeder = Feeder::start(Arc::clone(&cut), motion.feed(), Arc::clone(&drawing.compositor));
         tracing::info!(
             session = key.session,

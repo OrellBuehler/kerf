@@ -520,6 +520,8 @@ fn bench_a_mask_a_blur_and_a_moving_zoom() {
     use kerf_core::{Container, Delivery, Fit, Keyframe, Mask, MaskShape, Property, PropertyKey, RateControl, VideoEffect};
     let gpu = Gpu::new(GpuOptions::for_tests()).expect("a GPU adapter");
     let info = gpu.adapter_info().clone();
+    // (A mask's `geq` edge read is measured ahead of the render, which only reads it.)
+    let _ = kerf_core::geq_edge();
     let comp = Compositor::new(gpu).expect("compositor");
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR"));
     let scratch = dir.join(format!("bench-zoom-{}.jpg", std::process::id()));

@@ -1579,10 +1579,17 @@ mod tests {
             ..measured
         };
         // The untagged clip dissolves in, so it decides: the first clip (BT.709) is the one that is converted, and frame 5 shows
-        // only the first, frame 70 only the second (the deciding clip).
-        for frame in [5, 70] {
+        // only the first, frame 50 only the second (the deciding clip; the cut is 2 s, frames 0..59).
+        for frame in [5, 50] {
             let plan = plan_of(&[(&bt709, false), (&untagged, true)], frame);
             assert!(plan.canvas.mixed_matrices_cut && plan.canvas.cut_matrix.is_some());
+            // (The frame covers what it is named for: one layer, and at 50 it is the deciding clip, whose matrix is the composite's.)
+            assert_eq!(plan.layers.len(), 1, "frame {frame}");
+            assert_eq!(
+                plan.layers[0].stream.matrix() == Some(plan.canvas.matrix),
+                frame == 50,
+                "frame {frame}"
+            );
             let size = plan.size(u32::MAX);
             let refused = |caps: &GpuCaps| {
                 plan.reasons(caps, size)
@@ -1593,7 +1600,7 @@ mod tests {
             assert!(refused(&unmeasured), "frame {frame}");
         }
         // A cut of one matrix needs no conversion and no decider.
-        let plan = plan_of(&[(&bt709, false), (&bt709, true)], 70);
+        let plan = plan_of(&[(&bt709, false), (&bt709, true)], 50);
         assert!(!plan.canvas.mixed_matrices_cut);
         assert!(!plan
             .reasons(&unmeasured, plan.size(u32::MAX))

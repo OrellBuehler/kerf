@@ -12757,4 +12757,43 @@ mod tests {
         after.svg_overlays[0].svg.push(' ');
         assert_eq!(edited.diff(&after).entries[0].detail.as_deref(), Some("artwork changed"));
     }
+
+    #[test]
+    fn a_timeline_knows_whether_a_clip_comes_in_through_a_dip_to_white() {
+        let dip = |kind: TransitionKind| {
+            let mut c = Clip::new(Uuid::new_v4(), 0.0, 1.0, 1.0);
+            c.transition_in = Some(Transition { kind, duration: 0.4 });
+            c
+        };
+        let track = |clips: Vec<Clip>, muted: bool| Track {
+            clips,
+            muted,
+            ..Track::new(StreamKind::Video, "V")
+        };
+        let timeline = |tracks: Vec<Track>| Timeline {
+            tracks,
+            ..Timeline::new()
+        };
+        let plain = Clip::new(Uuid::new_v4(), 0.0, 1.0, 0.0);
+        assert!(!Timeline::new().has_white_dip());
+        assert!(!timeline(vec![track(vec![plain.clone()], false)]).has_white_dip());
+        // Other transitions are not the dip to white (a dip to black is a fade in the YUV).
+        for kind in [
+            TransitionKind::Crossfade,
+            TransitionKind::DipToBlack,
+            TransitionKind::SlideLeft,
+        ] {
+            assert!(
+                !timeline(vec![track(vec![plain.clone(), dip(kind)], false)]).has_white_dip(),
+                "{kind:?}"
+            );
+        }
+        assert!(timeline(vec![track(vec![plain.clone(), dip(TransitionKind::DipToWhite)], false)]).has_white_dip());
+        // A track that is muted still has its clips in the export's graph: the helper reads every clip.
+        assert!(timeline(vec![
+            track(vec![plain], false),
+            track(vec![dip(TransitionKind::DipToWhite)], true),
+        ])
+        .has_white_dip());
+    }
 }
