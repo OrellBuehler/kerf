@@ -1352,7 +1352,7 @@ mod tests {
         let stale = make("deep/clip.mp4.0a1b2c3d.part", old);
         let fresh = make("clip.mp4.0a1b2c3d.part", std::time::SystemTime::now());
         let theirs = make("notes.part", old);
-        let upper = make("clip.mp4.0A1B2C3D.part", old);
+        let upper = make("other.mp4.0A1B2C3D.part", old);
         assert_eq!(sweep_stale_parts(&dir), 1);
         assert!(!stale.exists() && fresh.exists() && theirs.exists() && upper.exists());
         assert!(is_part_name(
