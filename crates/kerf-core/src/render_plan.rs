@@ -1734,7 +1734,7 @@ impl RenderPlan {
             };
             if raw_kept && ops.iter().any(|o| o.factor < FADE_FULL) {
                 out.push(Unsupported::FullRangeNegotiated(at()));
-            } else if self.mode == PlanMode::Still && negotiated && stream.maybe_full_range() {
+            } else if self.mode == PlanMode::Still && negotiated && (stream.maybe_full_range() || stream.flagged_full_range()) {
                 // Not only inside a fade: a plain full-range picture in a still keeps its range through FFmpeg 9's graph, which converts it
                 // last, so the still's own planes are full-range ones and the PNG's RGB is read from them (measured on a plain
                 // `yuvj420p` clip: planes up to 17 levels from the compositor's limited-range composite, RGB 3 to 4 levels, 205,000 samples).
