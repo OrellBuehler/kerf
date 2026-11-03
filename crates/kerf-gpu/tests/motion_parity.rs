@@ -3005,6 +3005,80 @@ fn a_translucent_layer_dissolves_and_is_refused_its_fades_to_black() {
     );
 }
 
+/// A layer below full opacity is `colorchannelmixer` (RGBA), `rotate` (on the RGBA picture) and only then the conversion to 4:2:0, whose chroma
+/// pairs two pixels of a row and filters over the rows: after a quarter turn it pairs other samples than the round trip the compositor makes
+/// ahead of the turn (chroma up to 19 levels off the export in the first frames measured, luma exact). A quarter and three quarters of a turn
+/// are refused for a constant opacity below 1; the upright and half-turned layers keep the translucent ladder, and the layers that do not
+/// take the round trip are exact turned a quarter: an opaque one (alone, faded in and out), and one whose opacity is keyed (a `geq` alpha on
+/// `yuva420p`, pointwise).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_translucent_layer_turned_a_quarter_is_refused_and_the_other_turns_are_drawn() {
+    use kerf_core::{Property, PropertyKey};
+    let m = media();
+    let assets = [m.bars.clone(), m.testsrc.clone()];
+    let under = || clip(&m.bars, 0.5, 1.5, 0.0);
+    let on_top = |edit: &dyn Fn(&mut Clip)| {
+        let mut c = clip(&m.testsrc, 0.5, 1.5, 0.0);
+        edit(&mut c);
+        timeline(vec![vec![under()], vec![c]], None)
+    };
+    for angle in [90.0, 270.0, -90.0, 450.0] {
+        for scale in [1.0, 0.5625] {
+            let tl = on_top(&|c| {
+                c.transform.rotation = angle;
+                c.transform.opacity = 0.6;
+                c.transform.scale = scale;
+            });
+            run_refusing(
+                &format!("opacity/turned {angle} scale {scale}"),
+                &tl,
+                &assets,
+                30.0,
+                1.0,
+                TRANSLUCENT,
+                &rotation_refused(),
+            );
+        }
+        let tl = on_top(&|c| {
+            c.transform.rotation = angle;
+            c.transform.opacity = 0.6;
+            c.fade_in = 0.4;
+            c.fade_out = 0.4;
+        });
+        run_refusing(
+            &format!("opacity/turned {angle} and faded"),
+            &tl,
+            &assets,
+            30.0,
+            1.0,
+            TRANSLUCENT,
+            &rotation_refused(),
+        );
+        let tl = on_top(&|c| {
+            c.transform.rotation = angle;
+            c.fade_in = 0.4;
+            c.fade_out = 0.4;
+        });
+        run(&format!("fade/turned {angle}"), &tl, &assets, 30.0, 1.0, EXACT);
+        let tl = on_top(&|c| {
+            c.transform.rotation = angle;
+            c.set_property_keys(
+                Property::Opacity,
+                vec![PropertyKey::new(0.0, 1.0), PropertyKey::new(1.0, 0.3)],
+            );
+        });
+        run(&format!("keyed opacity/turned {angle}"), &tl, &assets, 30.0, 1.0, EXACT);
+    }
+    for angle in [0.0, 180.0, -180.0] {
+        let tl = on_top(&|c| {
+            c.transform.rotation = angle;
+            c.transform.opacity = 0.6;
+        });
+        run(&format!("opacity/turned {angle}"), &tl, &assets, 30.0, 1.0, TRANSLUCENT);
+    }
+}
+
 // ---- other pictures: pixel formats, tags, full range -----------------------------------------
 
 /// The test pattern in the pictures a dip to white or a fade treats differently: what the round

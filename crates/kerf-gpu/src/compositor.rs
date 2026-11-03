@@ -350,7 +350,8 @@ pub struct Compositor {
     ops: PlaneOps,
     masks: MaskCache,
     vignettes: VignetteMaps,
-    /// What FFmpeg's `geq` does at a plane's last column and row, when the host knows it: else probed.
+    /// What FFmpeg's `geq` does at a plane's last column and row, when pinned ([`Compositor::with_geq_edge`]); else what has been
+    /// measured ([`kerf_core::geq_edge_measured`]: a render never runs the probe, [`prepare`] does).
     geq_edge: Option<GeqEdge>,
     /// `chromakey`'s distance terms ([`effects::chroma_key_terms`]), uploaded by the first keyed frame.
     key_terms: OnceLock<wgpu::Buffer>,
@@ -364,8 +365,8 @@ pub struct Compositor {
     /// Whether this FFmpeg converts a layer into the composite's matrix as the model does, when pinned
     /// ([`Compositor::with_convert_kernels`]); else what has been measured ([`crate::convert::measured`]).
     convert_kernels: Option<crate::convert::Kernels>,
-    /// The blend modes this FFmpeg draws as the model does, per matrix, when pinned ([`Compositor::with_blend_kinds`]); else measured
-    /// ([`crate::blend::kernels`]).
+    /// The blend modes this FFmpeg draws as the model does, per matrix, when pinned ([`Compositor::with_blend_kinds`]); else what has
+    /// been measured ([`crate::blend::measured`]).
     blend_kinds: Option<[BlendKinds; 2]>,
     /// Whether this FFmpeg places a picture as the model does, when a host pinned it
     /// ([`Compositor::with_placement`]); else measured ([`crate::placement_probe::measured`]).
@@ -928,12 +929,16 @@ pub fn prepare_timeline(timeline: &kerf_core::Timeline) {
 /// any lock, and the session then reads only what was measured; what comes into its horizon later is asked by
 /// [`prepare_ranges_ahead`], which costs a `stat` for a file already asked. Where the composite is `FixedBt601`, or the asset
 /// recorded its range, nothing is asked.
+///
+/// The files are asked [`PLACED_FILES_THREADS`] at a time (one `ffprobe` each, bounded by its own timeout) and no new one is
+/// started once [`PLACED_FILES_BUDGET`] has passed, so a cut with many placed files delays the session by about that and a probe
+/// at most, not by one probe each: a file left unasked is refused (FFmpeg's) until the horizon rescan asks it.
 pub fn prepare_placed_files(cut: &kerf_core::PlayCut, timeline: &kerf_core::Timeline) {
     if cut.canvas().policy == kerf_core::CompositeColorPolicy::FixedBt601 {
         return;
     }
     let start = cut.start();
-    let mut asked: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut paths: Vec<String> = Vec::new();
     for clip in timeline
         .tracks
         .iter()
@@ -947,14 +952,53 @@ pub fn prepare_placed_files(cut: &kerf_core::PlayCut, timeline: &kerf_core::Time
         let Ok(plan) = cut.at_frame(cut.frame_at(((clip.timeline_start + end) / 2.0).max(start))) else {
             continue;
         };
-        if plan
+        for layer in plan
             .layers
             .iter()
-            .any(|l| plan.pose(l).is_some() && l.stream.color_range.is_none() && !asked.contains(&l.path))
+            .filter(|l| plan.pose(l).is_some() && l.stream.color_range.is_none())
         {
-            asked.extend(plan.layers.iter().map(|l| l.path.clone()));
-            prepare_ranges(&plan);
+            if !paths.contains(&layer.path) {
+                paths.push(layer.path.clone());
+            }
         }
+    }
+    ask_files(&paths, PLACED_FILES_THREADS, PLACED_FILES_BUDGET);
+}
+
+/// How many files [`prepare_placed_files`] asks at once.
+const PLACED_FILES_THREADS: usize = 4;
+/// How long [`prepare_placed_files`] goes on starting new asks.
+const PLACED_FILES_BUDGET: Duration = Duration::from_secs(20);
+
+/// Ask each of `paths` for its range (`kerf_core::source_is_full_range`, remembered) on up to `threads` threads of this call's own,
+/// starting no new one once `budget` has passed; returns when the asks it started are over (each is bounded by the probe's own
+/// timeout). No lock is held.
+fn ask_files(paths: &[String], threads: usize, budget: Duration) {
+    ask_within(paths, threads, budget, |path| {
+        let _ = kerf_core::source_is_full_range(std::path::Path::new(path));
+    });
+}
+
+/// [`ask_files`] with the ask given: `ask` runs once for each path it starts, on one of at most `threads` threads.
+fn ask_within(paths: &[String], threads: usize, budget: Duration, ask: impl Fn(&str) + Sync) {
+    let deadline = Instant::now() + budget;
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let work = || {
+        while Instant::now() < deadline {
+            let Some(path) = paths.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) else {
+                break;
+            };
+            ask(path);
+        }
+    };
+    match paths.len() {
+        0 => {}
+        1 => work(),
+        n => std::thread::scope(|scope| {
+            for _ in 0..threads.clamp(1, n) {
+                scope.spawn(work);
+            }
+        }),
     }
 }
 
@@ -1068,7 +1112,7 @@ impl Compositor {
     /// The combinations the plan names (`Unsupported`) stay FFmpeg's.
     /// Each later pass flips its bit beside the pass and its parity cases.
     pub fn caps(&self) -> GpuCaps {
-        let mut caps = Self::caps_measured(
+        Self::caps_measured(
             self.grade_kernels.unwrap_or_else(crate::grade::measured),
             self.scaler_kernels.unwrap_or_else(crate::scaler::measured),
             self.convert_kernels.unwrap_or_else(crate::convert::measured),
@@ -1080,14 +1124,8 @@ impl Compositor {
                 crate::blend::measured_extras()
             },
             self.placement.clone().unwrap_or_else(crate::placement_probe::measured),
-        );
-        // A mask and a keyed opacity are a `geq` that reads a plane's last column and row as this build does, which the render
-        // only reads (`prepare` measures it): until it is known the plan refuses them, up front, rather than the render.
-        if self.geq_edge() == GeqEdge::Unknown {
-            caps.mask = false;
-            caps.keyed_opacity = false;
-        }
-        caps
+            self.geq_edge(),
+        )
     }
 
     /// [`Compositor::caps`] for judging a **span** (a play session's `PlayCut::ahead` and `resume`, a primer) rather than a frame
@@ -1135,8 +1173,10 @@ impl Compositor {
         )
     }
 
-    /// [`Compositor::caps_with`] with the scaler and the matrix conversion given too: every probe the caps are made of
-    /// but the placement's (which is what this process has measured, [`crate::placement_probe::measured`]).
+    /// [`Compositor::caps_with`] with the scaler and the matrix conversion given too: every pin the caps are made of but the
+    /// placement's and the `geq` edge's, which are what this process has measured ([`crate::placement_probe::measured`],
+    /// [`kerf_core::geq_edge_measured`]: a mask and a keyed opacity are in these caps only once the edge is known, as in
+    /// [`Compositor::caps`]).
     pub fn caps_pinned(
         kernels: crate::grade::Kernels,
         scaler: crate::scaler::Kernels,
@@ -1153,6 +1193,7 @@ impl Compositor {
             blend,
             extras,
             crate::placement_probe::measured(),
+            kerf_core::geq_edge_measured(),
         )
     }
 
@@ -1165,9 +1206,11 @@ impl Compositor {
         asking(Self::caps_for(kernels, scaler, convert))
     }
 
-    /// [`Compositor::caps_with`] for a machine whose `pad`, `perspective` and `crop` place a picture as `placement` says
-    /// ([`crate::placement_probe`]); the moving zoom and position, and the behaviours drawn by it, are in the caps only on
-    /// a `Match`.
+    /// [`Compositor::caps_pinned`] for a machine whose `pad`, `perspective` and `crop` place a picture as `placement` says
+    /// ([`crate::placement_probe`]) and whose `geq` reads a plane's last column and row as `geq` says: the moving zoom and
+    /// position, and the behaviours drawn by it, are in the caps only on a `Match`, and a mask and a keyed opacity (a `geq`
+    /// the render only reads the edge of) only once the edge is known.
+    #[allow(clippy::too_many_arguments)]
     fn caps_measured(
         kernels: crate::grade::Kernels,
         scaler: crate::scaler::Kernels,
@@ -1176,6 +1219,7 @@ impl Compositor {
         blend: [BlendKinds; 2],
         extras: BlendExtras,
         placement: crate::placement_probe::Placement,
+        geq: GeqEdge,
     ) -> GpuCaps {
         let mut caps = Self::CAPS;
         if kernels != crate::grade::Kernels::Match {
@@ -1194,6 +1238,12 @@ impl Compositor {
             caps.behaviors = false;
         }
         caps.placed_chroma = crate::conversion::measured() == crate::conversion::Conversion::Match;
+        // A mask and a keyed opacity are a `geq` that reads a plane's last column and row as this build does, which the render
+        // only reads (`prepare` measures it): until it is known the plan refuses them, up front, rather than the render.
+        if geq == GeqEdge::Unknown {
+            caps.mask = false;
+            caps.keyed_opacity = false;
+        }
         if text.is_none() {
             caps.text = false;
         }
@@ -1287,18 +1337,18 @@ impl Compositor {
         })
     }
 
-    /// Pin which blend modes this FFmpeg draws as the model does (per matrix, `[BT.601, BT.709]`; the extras, BT.2020 and RGB pictures, are all pinned on), instead of measuring the ffmpeg this
-    /// process runs ([`crate::blend::kernels`], on the first blended plan unless [`prepare`] ran ahead of it): for a host that knows
-    /// its ffmpeg, and for tests.
+    /// Pin which blend modes this FFmpeg draws as the model does (per matrix, `[BT.601, BT.709]`; the extras, BT.2020 and RGB
+    /// pictures, are all pinned on), instead of what [`prepare`] measured ([`crate::blend::measured`]; a render never runs the
+    /// probe): for a host that knows its ffmpeg, and for tests. A mode both matrices do not draw is not in [`Compositor::caps`].
     #[must_use]
     pub fn with_blend_kinds(mut self, kinds: [BlendKinds; 2]) -> Self {
         self.blend_kinds = Some(kinds);
         self
     }
 
-    /// Pin whether this FFmpeg places a picture as the model does, instead of measuring the ffmpeg this process runs
-    /// ([`crate::placement_probe::placement`], on the first moving zoom unless [`prepare`] ran ahead of it): for a host that
-    /// knows its ffmpeg, and for tests. Anything but `Match` takes the moving zoom and position out of [`Compositor::caps`].
+    /// Pin whether this FFmpeg places a picture as the model does, instead of what [`prepare`] measured
+    /// ([`crate::placement_probe::measured`]; a render never runs the probe): for a host that knows its ffmpeg, and for tests.
+    /// Anything but `Match` takes the moving zoom and position out of [`Compositor::caps`].
     #[must_use]
     pub fn with_placement(mut self, placement: crate::placement_probe::Placement) -> Self {
         self.placement = Some(placement);
@@ -3211,6 +3261,18 @@ impl Compositor {
                     "layer {n}: a dip to white until this FFmpeg's conversions to and from RGB are known to match"
                 )));
             }
+            // `colorchannelmixer` leaves RGBA, `rotate` turns it there and the way back to 4:2:0 comes after the turn; the
+            // round trip here comes before it, and swscale's chroma pairs two pixels of a row and filters over the rows (a
+            // different sum each way), so after a quarter turn the pairs are other samples (the plan says the same).
+            if geom.translucent
+                && geom
+                    .rotation
+                    .is_some_and(|r| kerf_core::quarter_turn(r.angle).is_some_and(|t| t % 2 == 1))
+            {
+                return Err(GpuError::Unsupported(format!(
+                    "layer {n}: a quarter turn of a layer below full opacity (FFmpeg converts the turned RGBA picture to 4:2:0 afterwards: the chroma pairs other samples)"
+                )));
+            }
             // A graded layer the scaler resizes is the export's where the scaler is exact and an `eq` sits between the
             // fit scale and the grade (the plan says the same: `RenderPlan::reasons`).
             let resize_ok = self.scaler_kernels.unwrap_or_else(crate::scaler::measured).exact() && plan.eq_in_chain(layer);
@@ -4289,6 +4351,7 @@ mod tests {
             crate::blend::all_modes(),
             BlendExtras::ALL,
             Placement::Match,
+            GeqEdge::Exact,
         )
     }
 
@@ -4410,6 +4473,7 @@ mod tests {
                 all_modes(),
                 BlendExtras::ALL,
                 placement,
+                GeqEdge::Exact,
             )
         };
         assert_eq!(measured(Placement::Match), Compositor::CAPS);
@@ -4426,6 +4490,94 @@ mod tests {
             Compositor::caps_pinned(Kernels::Match, simd_scaler(), converts, layout, all_modes(), BlendExtras::ALL).placement,
             crate::placement_probe::measured() == Placement::Match
         );
+    }
+
+    /// The files of a cut are asked a few at a time and no new one is started past the budget: N files cost about N / threads asks,
+    /// not N, and a long list is cut off instead of running for N probe timeouts.
+    #[test]
+    fn the_placed_files_are_asked_in_parallel_and_not_past_the_budget() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let paths: Vec<String> = (0..8).map(|i| format!("/not/a/file/{i}.mkv")).collect();
+        let (running, peak, done) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
+        let ask = |_: &str| {
+            let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(60));
+            running.fetch_sub(1, Ordering::SeqCst);
+            done.fetch_add(1, Ordering::SeqCst);
+        };
+        let started = Instant::now();
+        ask_within(&paths, 4, Duration::from_secs(30), ask);
+        assert_eq!(done.load(Ordering::SeqCst), 8, "every file is asked");
+        assert!(
+            (2..=4).contains(&peak.load(Ordering::SeqCst)),
+            "at most four at once, and in parallel"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(60 * 8),
+            "{:?}: not one after the other",
+            started.elapsed()
+        );
+        // A budget that has passed starts nothing; a short one stops a long list part-way.
+        done.store(0, Ordering::SeqCst);
+        ask_within(&paths, 4, Duration::ZERO, ask);
+        assert_eq!(done.load(Ordering::SeqCst), 0);
+        let long: Vec<String> = (0..400).map(|i| format!("/not/a/file/{i}.mkv")).collect();
+        ask_within(&long, 4, Duration::from_millis(200), ask);
+        let asked = done.load(Ordering::SeqCst);
+        assert!((4..400).contains(&asked), "{asked} of 400 asked inside the budget");
+        // None, and one, are fine.
+        ask_within(&[], 4, Duration::from_secs(1), ask);
+        ask_within(&paths[..1], 4, Duration::from_secs(1), ask);
+        assert_eq!(done.load(Ordering::SeqCst), asked + 1);
+    }
+
+    /// A mask and a keyed opacity are a `geq` whose edge read is known only once it was measured (or pinned): the caps of a host
+    /// that has no compositor (`caps_pinned`, so `caps_for`, `caps_with` and `session_caps_for` too: the render bar's) leave them out
+    /// until then, as `Compositor::caps` does, and nothing else moves with them.
+    #[test]
+    fn a_mask_and_a_keyed_opacity_are_in_the_caps_only_where_the_geq_edge_is_known() {
+        use crate::grade::Kernels;
+        let layout = Some(crate::text::Model::Shaped);
+        let converts = crate::convert::Kernels::Match;
+        let at = |edge| {
+            Compositor::caps_measured(
+                Kernels::Match,
+                simd_scaler(),
+                converts,
+                layout,
+                crate::blend::all_modes(),
+                BlendExtras::ALL,
+                Placement::Match,
+                edge,
+            )
+        };
+        for edge in [GeqEdge::Exact, GeqEdge::Penultimate] {
+            assert_eq!(at(edge), Compositor::CAPS, "{edge:?}");
+        }
+        let caps = at(GeqEdge::Unknown);
+        assert!(!caps.mask && !caps.keyed_opacity);
+        let mut restored = caps;
+        restored.mask = true;
+        restored.keyed_opacity = true;
+        assert_eq!(restored, Compositor::CAPS, "nothing else moves");
+        // The constructors that read what the process measured: nothing is, in a unit test, and a test binary that never ran the
+        // probe is the cold case (the render bar before `prepare_timeline`).
+        if kerf_core::geq_edge_measured() == GeqEdge::Unknown {
+            let pinned = Compositor::caps_pinned(
+                Kernels::Match,
+                simd_scaler(),
+                converts,
+                layout,
+                crate::blend::all_modes(),
+                BlendExtras::ALL,
+            );
+            assert!(!pinned.mask && !pinned.keyed_opacity);
+            let bar = Compositor::session_caps_for(Kernels::Match, simd_scaler(), converts);
+            assert!(!bar.mask && !bar.keyed_opacity);
+            let with = Compositor::caps_with(Kernels::Match, layout, crate::blend::all_modes(), BlendExtras::ALL);
+            assert!(!with.mask && !with.keyed_opacity);
+        }
     }
 
     /// Text is in the caps only where `drawtext`'s layout and colour conversion are ones the compositor

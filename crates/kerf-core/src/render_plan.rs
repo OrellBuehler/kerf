@@ -1104,6 +1104,20 @@ impl RenderPlan {
                     "a letterboxed `yuv420p` picture flagged full range: this FFmpeg's export converts its range after the `pad` has drawn the bars in limited black (they read Y 30 where the compositor's are 16)".into(),
                 ));
             }
+            // `colorchannelmixer` leaves the picture in RGBA, `rotate` turns it there, and the way back to 4:2:0 comes after the turn:
+            // swscale's chroma pairs two pixels of a row and filters over the rows (a different sum each way), so after a quarter
+            // turn it pairs other samples than the compositor's round trip, which comes before the turn, does (chroma tens of levels off
+            // on the cases measured). Upright and half-turned layers pair the same samples and keep the translucent ladder.
+            if geom.translucent
+                && geom
+                    .rotation
+                    .is_some_and(|r| quarter_turn(r.angle).is_some_and(|turn| turn % 2 == 1))
+            {
+                reasons.push(Unsupported::Rotation(
+                    self.layer_ref(n, layer),
+                    "a quarter turn of a layer below full opacity (FFmpeg turns the RGBA picture and converts it to 4:2:0 afterwards: the chroma pairs other samples)",
+                ));
+            }
             // A scaler that is not measured to be swscale's draws a resized layer a level off: not exact, so FFmpeg's.
             if caps.scaler_approximate && geom.stages.iter().any(|s| s.scaled != (s.src.w, s.src.h)) {
                 reasons.push(Unsupported::ScalerApproximate(self.layer_ref(n, layer)));
@@ -5717,6 +5731,42 @@ mod tests {
             assert_eq!(deg(d), None, "{d}");
         }
         assert!(is_quarter_turn(std::f64::consts::PI) && !is_quarter_turn(1.0));
+    }
+
+    /// A layer below full opacity is turned in RGBA and converted to 4:2:0 after the turn, so a quarter or three quarters of a turn
+    /// pairs other chroma samples than the compositor's round trip (which comes before the turn) does: refused, as a rotation.
+    /// Upright, half-turned and opaque layers are not.
+    #[test]
+    fn a_quarter_turn_of_a_layer_below_full_opacity_is_refused_and_the_other_turns_are_not() {
+        let caps = GpuCaps {
+            motion: true,
+            ..GpuCaps::A0
+        };
+        let turned = |angle: f64, opacity: f64| {
+            let plan = fading_plan(
+                |c| {
+                    c.transform.rotation = angle;
+                    c.transform.opacity = opacity;
+                },
+                0.5,
+            );
+            let why = plan.reasons(&caps, plan.size(u32::MAX));
+            why.into_iter()
+                .filter(|u| u.kind() == "rotation")
+                .map(|u| u.to_string())
+                .collect::<Vec<_>>()
+        };
+        for angle in [90.0, 270.0, -90.0, 450.0] {
+            let why = turned(angle, 0.5);
+            assert!(why.len() == 1 && why[0].contains("below full opacity"), "{angle}: {why:?}");
+            assert!(turned(angle, 1.0).is_empty(), "{angle}: an opaque layer is drawn");
+        }
+        for angle in [0.0, 180.0, -180.0, 360.0] {
+            assert!(turned(angle, 0.5).is_empty(), "{angle}: {:?}", turned(angle, 0.5));
+        }
+        // (A turn that is not a quarter has its own cause and only that one.)
+        let why = turned(12.0, 0.5);
+        assert!(why.len() == 1 && !why[0].contains("below full opacity"), "{why:?}");
     }
 
     #[test]

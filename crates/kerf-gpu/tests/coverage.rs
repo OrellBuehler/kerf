@@ -2400,6 +2400,9 @@ fn the_ledger_says_which_refusals_hold_the_compositor_back() {
     // conversion probe).
     let placement = kerf_gpu::placement_probe::placement();
     let conversion = kerf_gpu::conversion::conversion();
+    // ... and a mask or a keyed opacity only where the edge of this FFmpeg's `geq` read is known (the caps of a host that has no
+    // compositor leave them out until it is measured, as the app's `prepare_timeline` does ahead of the render bar).
+    let _ = kerf_core::geq_edge();
     let caps = Compositor::caps_pinned(kernels, scaler, convert, layout, blend, extras);
     let mut cuts = vec![];
     // T1 to T8 are planned with the default export options; T9 and on say theirs (a ProRes file, a GIF, a scaler).

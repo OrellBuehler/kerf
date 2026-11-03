@@ -5021,12 +5021,14 @@ impl Timeline {
 
     /// Whether a clip of the timeline comes in through a dip to white. In an export the dip's `fade c=white` (RGB only) is a
     /// filter of every frame of such a clip and of the one before it, so a renderer that draws it asks what it needs for it
-    /// (the conversions to and from RGB) before any frame.
+    /// (the conversions to and from RGB) before any frame. Only the clips the export has ([`Timeline::for_render`]: on video
+    /// tracks that render, enabled) count: a muted or solo-shadowed track and a disabled clip are not in its graph.
     pub fn has_white_dip(&self) -> bool {
         self.tracks
             .iter()
+            .filter(|t| t.kind == StreamKind::Video && self.track_renders(t))
             .flat_map(|t| &t.clips)
-            .any(|c| c.transition_in.as_ref().is_some_and(|t| t.kind == TransitionKind::DipToWhite))
+            .any(|c| c.enabled && c.transition_in.as_ref().is_some_and(|t| t.kind == TransitionKind::DipToWhite))
     }
 
     pub fn svg_overlay(&self, id: Uuid) -> Option<&SvgOverlay> {
@@ -12789,10 +12791,29 @@ mod tests {
             );
         }
         assert!(timeline(vec![track(vec![plain.clone(), dip(TransitionKind::DipToWhite)], false)]).has_white_dip());
-        // A track that is muted still has its clips in the export's graph: the helper reads every clip.
+        // The export's graph has the clips `for_render` keeps: a muted track's, a track another one's solo shadows and a disabled clip's are
+        // not in it, so they are no reason to ask for the conversions.
+        assert!(!timeline(vec![
+            track(vec![plain.clone()], false),
+            track(vec![dip(TransitionKind::DipToWhite)], true),
+        ])
+        .has_white_dip());
+        let mut soloed = track(vec![plain.clone()], false);
+        soloed.solo = true;
+        assert!(!timeline(vec![soloed.clone(), track(vec![dip(TransitionKind::DipToWhite)], false)]).has_white_dip());
+        assert!(timeline(vec![soloed, {
+            let mut shown = track(vec![dip(TransitionKind::DipToWhite)], false);
+            shown.solo = true;
+            shown
+        }])
+        .has_white_dip());
+        let mut off = dip(TransitionKind::DipToWhite);
+        off.enabled = false;
+        assert!(!timeline(vec![track(vec![plain.clone(), off], false)]).has_white_dip());
+        // (A track that renders and has the dip does.)
         assert!(timeline(vec![
             track(vec![plain], false),
-            track(vec![dip(TransitionKind::DipToWhite)], true),
+            track(vec![dip(TransitionKind::DipToWhite)], false),
         ])
         .has_white_dip());
     }
