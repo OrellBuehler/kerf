@@ -461,8 +461,8 @@ so the feature is **only** activated through these forwards — which is what ma
   included in the still). The still's thumbnail is an eighth of the *still's* canvas. The
   `overlay` composes in 8-bit 4:2:0 (its default) except for an HDR clip, fitted ahead of its
   tone-map, which takes `format=yuv420p10` (FFmpeg 4.4 has it) so the fill does not band it; the
-  still tone-maps first, so it keeps the default. The GPU compositor refuses the whole frame (`Unsupported::BlurFill`, still and motion),
-  so the preview is FFmpeg's. Rendered in `cli/blur_rendered.rs` (`#[ignore]`d, 6.1 and 9.0): a
+  still tone-maps first, so it keeps the default. The GPU compositor draws the fill for a clip that takes it (`blur_fill_clip` is the plan's half of `takes_blur_fill`; `.claude/docs/gpu.md`,
+  *The blurred fill*), plane for plane, where the picture is 8-bit `yuv420p` and the scaler is measured exact. Rendered in `cli/blur_rendered.rs` (`#[ignore]`d, 6.1 and 9.0): a
   white / black source in a vertical frame keeps the picture, its bars are the picture blurred
   across the edge (Contain's are black), the still draws the export's frame (3 levels at worst),
   and a half-transparent FFV1 source renders under Blur exactly as under Contain; a 10-bit HLG ramp's

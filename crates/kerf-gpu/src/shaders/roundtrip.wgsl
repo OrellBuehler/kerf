@@ -80,6 +80,21 @@ fn fade_white(c: vec3<i32>, f: i32) -> vec3<i32> {
     return clamp(((c - vec3<i32>(255)) * f + vec3<i32>((255 << 16u) + 32768)) >> vec3<u32>(16u), vec3<i32>(0), vec3<i32>(255));
 }
 
+// A dip to white's `fade` over the `rgb24` picture the x86 kernel made (`grade.wgsl`'s `fs_rgb`): one filter for the fade-in and one
+// for the fade-out, as `fs_rgb` runs them for the translucent round trip.
+@fragment
+fn fs_white(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+    let o = vec2<i32>(frag.xy);
+    var rgb = vec3<i32>(round(textureLoad(t1, o, 0).rgb * 255.0));
+    if (p.white_in < 65535) {
+        rgb = fade_white(rgb, p.white_in);
+    }
+    if (p.white_out < 65535) {
+        rgb = fade_white(rgb, p.white_out);
+    }
+    return vec4<f32>(vec3<f32>(rgb) / 255.0, 1.0);
+}
+
 @fragment
 fn fs_luma(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let o = vec2<i32>(frag.xy);
@@ -178,5 +193,34 @@ fn fs_plane444(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
         let c14 = (k.x * c.x + k.y * c.y + k.z * c.z + (256 << 14u) + (1 << 8u)) >> 9u;
         q = clamp((c14 * 2 + 64) >> 7u, 0, 255);
     }
+    return vec4<f32>(f32(q) / 255.0, 0.0, 0.0, 1.0);
+}
+
+// `ff_rgb24toyv12_c` (`rgb2rgb_template.c`), what swscale gives an unscaled `bgr24 -> yuv420p` of even width: the luma of
+// a pixel is `((ry*r + gy*g + by*b) >> 15) + 16`, and a chroma sample is made from the channel means of its 2x2 block
+// (`>> 2`) the same way, plus 128. (An `unsigned int` stored in a byte in the C: the low byte of the sum.)
+@fragment
+fn fs_luma24(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+    let o = vec2<i32>(frag.xy);
+    let c = vec3<i32>(round(textureLoad(t1, o, 0).rgb * 255.0));
+    let y = (((p.ky.x * c.x + p.ky.y * c.y + p.ky.z * c.z) >> 15u) + 16) & 255;
+    return vec4<f32>(f32(y) / 255.0, 0.0, 0.0, 1.0);
+}
+
+// channel 0: U, 1: V; `o` is a chroma sample, the block is the four pixels from `2 * o`.
+@fragment
+fn fs_chroma24(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+    let o = vec2<i32>(frag.xy);
+    let at = o * 2;
+    let a = vec3<i32>(round(textureLoad(t1, at, 0).rgb * 255.0));
+    let b = vec3<i32>(round(textureLoad(t1, at + vec2<i32>(1, 0), 0).rgb * 255.0));
+    let c = vec3<i32>(round(textureLoad(t1, at + vec2<i32>(0, 1), 0).rgb * 255.0));
+    let d = vec3<i32>(round(textureLoad(t1, at + vec2<i32>(1, 1), 0).rgb * 255.0));
+    let s = (a + b + c + d) >> vec3<u32>(2u);
+    var k = p.ku;
+    if (p.channel == 1) {
+        k = p.kv;
+    }
+    let q = (((k.x * s.x + k.y * s.y + k.z * s.z) >> 15u) + 128) & 255;
     return vec4<f32>(f32(q) / 255.0, 0.0, 0.0, 1.0);
 }

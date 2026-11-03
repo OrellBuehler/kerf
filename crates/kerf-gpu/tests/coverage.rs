@@ -2067,6 +2067,8 @@ fn reason(u: &Unsupported) -> Reason {
         | Unsupported::Grade(_, s)
         | Unsupported::GradeWith(_, s)
         | Unsupported::MaskWith(_, s)
+        | Unsupported::BlurFillWith(_, s)
+        | Unsupported::MixedMatricesWith(_, s)
         | Unsupported::Matte(_, s)
         | Unsupported::ZoomBehind(_, s)
         | Unsupported::Rotation(_, s)
@@ -2375,6 +2377,8 @@ fn the_ledger_says_which_refusals_hold_the_compositor_back() {
     let policy = composite_color_policy();
     // The caps the app asks with: the grade is drawn only where this FFmpeg's conversions are the model's (one probe).
     let kernels = kerf_gpu::grade::kernels();
+    let scaler = kerf_gpu::scaler::kernels();
+    let convert = kerf_gpu::convert::kernels();
     // ... and text whose glyph bitmaps share samples (a synthetic-bold border, a font under 12 px) only where this FFmpeg's
     // `drawtext` lays text out in a way the compositor can take apart (one probe).
     let layout = kerf_gpu::text::model();
@@ -2396,7 +2400,10 @@ fn the_ledger_says_which_refusals_hold_the_compositor_back() {
     // conversion probe).
     let placement = kerf_gpu::placement_probe::placement();
     let conversion = kerf_gpu::conversion::conversion();
-    let caps = Compositor::caps_with(kernels, layout, blend, extras);
+    // ... and a mask or a keyed opacity only where the edge of this FFmpeg's `geq` read is known (the caps of a host that has no
+    // compositor leave them out until it is measured, as the app's `prepare_timeline` does ahead of the render bar).
+    let _ = kerf_core::geq_edge();
+    let caps = Compositor::caps_pinned(kernels, scaler, convert, layout, blend, extras);
     let mut cuts = vec![];
     // T1 to T8 are planned with the default export options; T9 and on say theirs (a ProRes file, a GIF, a scaler).
     let mut every: Vec<Archetype> = archetypes(media)
@@ -2427,7 +2434,7 @@ fn the_ledger_says_which_refusals_hold_the_compositor_back() {
         "kerf-gpu coverage ledger: the frames the compositor draws and what refuses the rest".to_string(),
         format!("ffmpeg: {version_line}"),
         format!("composite colour policy: {policy:?}"),
-        format!("grade kernels: {kernels:?}; text layout: {layout:?}; placement: {placement:?}; planar conversion: {conversion:?} (caps: Compositor::caps_for(grade::kernels()) once text::model(), placement_probe::placement() and conversion::conversion() have probed, as the app asks)"),
+        format!("grade kernels: {kernels:?}, scaler: {scaler:?}, matrix conversion: {convert:?}; text layout: {layout:?}; placement: {placement:?}; planar conversion: {conversion:?} (caps: Compositor::caps_for(grade::kernels(), scaler::kernels(), convert::kernels()) once text::model(), placement_probe::placement() and conversion::conversion() have probed, as the app asks)"),
         format!("blend kernels [BT.601, BT.709]: {blend:?}; extras (BT.2020, RGB pictures): {extras:?}"),
         "plans: every output frame of every archetype over OriginalMedia at 540 px wide (the app's preview plans ProxyMedia at 960); nothing is rendered".to_string(),
         "archetypes: the review's T1 to T3, the real-world T4 to T8 and T9 to T24, which between them use every feature the editor offers that still refuses (tests/coverage.rs)".to_string(),
@@ -2518,6 +2525,9 @@ fn every_variant() -> Vec<Unsupported> {
         Unsupported::Shrink(0, (4, 4), (1, 1)),
         Unsupported::FormatResize(0, (4, 4), (2, 2), String::new()),
         Unsupported::Geometry(0, String::new()),
+        Unsupported::BlurFillWith(layer(), ""),
+        Unsupported::MixedMatricesWith(layer(), ""),
+        Unsupported::ScalerApproximate(layer()),
     ]
 }
 
@@ -2579,6 +2589,9 @@ fn ordinal(u: &Unsupported) -> usize {
         Unsupported::FormatResize(..) => 52,
         Unsupported::Geometry(..) => 53,
         Unsupported::Rotation(..) => 54,
+        Unsupported::BlurFillWith(..) => 55,
+        Unsupported::MixedMatricesWith(..) => 56,
+        Unsupported::ScalerApproximate(..) => 57,
     }
 }
 
@@ -2592,7 +2605,7 @@ fn why_unreached(
 ) -> &'static str {
     let negotiating = policy != CompositeColorPolicy::FixedBt601;
     match kind {
-        "motion" | "fade" | "travel" | "tail" | "keyed_opacity" | "keyed_color" | "keyed_zoom" | "mask" | "text" => {
+        "motion" | "fade" | "travel" | "tail" | "keyed_opacity" | "keyed_color" | "keyed_zoom" | "mask" | "text" | "blur_fill" => {
             "drawn: Compositor::CAPS has the ability, so a plan never reports it"
         }
         "keyed_placement" if kerf_gpu::placement_probe::measured() == kerf_gpu::placement_probe::Placement::Match => {
@@ -2611,7 +2624,12 @@ fn why_unreached(
         "grade_with" if kernels != Kernels::Match => {
             "not judged: this FFmpeg's grade conversions differ, so every grade is refused as `grade` first"
         }
-        "mixed_matrices" | "matrix_unknown" | "rgb_in_stack" | "full_range_cut" | "graded_in_full_range_stack"
+        "mixed_matrices"
+        | "mixed_matrices_with"
+        | "matrix_unknown"
+        | "rgb_in_stack"
+        | "full_range_cut"
+        | "graded_in_full_range_stack"
             if !negotiating =>
         {
             "FixedBt601: this FFmpeg composites every stack as BT.601, so there is nothing to negotiate"

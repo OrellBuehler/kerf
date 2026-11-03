@@ -653,6 +653,11 @@ impl GpuPreview {
         }
         self.ensure_backend(technique, now).map_err(|why| one("backend", why))?;
         let drawing = self.drawing().map_err(|r| vec![r])?;
+        // Nothing the user looks at before the GPU has been checked against this FFmpeg (and a session that is declined for it
+        // has measured nothing: the probes below are for a session that may begin).
+        self.gate(&drawing.gpu, &drawing.adapter).map_err(|r| vec![r])?;
+        // What the cut's caps are made of is measured now, once per process and off the frame loop: the frames read it only.
+        kerf_gpu::prepare_timeline(&inputs.timeline);
         // A play from where the paused frame was drawn was made ready while the playhead rested there: its
         // cursors are open, and its first frames are in their pipes.
         let (cut, motion, primed) = match self.take_primed(inputs.epoch(), t, &drawing.source, now) {
@@ -660,9 +665,10 @@ impl GpuPreview {
             None => {
                 let cut = PlayCut::new(&inputs.timeline, &inputs.assets, t, (self.policy)(), &ProxyMedia)
                     .map_err(|e| one("no_plan", format!("no plan to play from here: {e}")))?;
-                // What the caps below are made of (a placed layer's probes, a graded one's) is measured here, on this blocking
-                // thread, for every frame the session will look at: a first Play over a 4:4:4 clip is not declined for a probe
-                // nobody ran.
+                // What the caps below are made of is measured here, on this blocking thread: the files of the placed clips of the
+                // whole cut asked for their range, and the probes of every frame the session will look at at first (a first Play
+                // over a 4:4:4 clip is not declined for a probe nobody ran).
+                kerf_gpu::prepare_placed_files(&cut, &inputs.timeline);
                 kerf_gpu::prepare_ahead(&cut, t, HORIZON);
                 let motion = MotionFrames::with_config(Arc::clone(&drawing.source), play_config());
                 (Arc::new(cut), motion, false)
@@ -690,8 +696,6 @@ impl GpuPreview {
                 return Err(one(super::error_kind(&error), error.to_string()).into());
             }
         }
-        // Nothing the user looks at before the GPU has been checked against this FFmpeg.
-        self.gate(&drawing.gpu, &drawing.adapter).map_err(|r| vec![r])?;
         let feeder = Feeder::start(Arc::clone(&cut), motion.feed(), Arc::clone(&drawing.compositor));
         tracing::info!(
             session = key.session,
@@ -782,11 +786,15 @@ impl GpuPreview {
                 "the GPU has not been checked against this FFmpeg",
             )]);
         }
+        // (Probes are child processes, once per process: here, off the frame loop, and the caps below read what they found.)
+        kerf_gpu::prepare_timeline(&inputs.timeline);
         let cut = match PlayCut::new(&inputs.timeline, &inputs.assets, t, (self.policy)(), &ProxyMedia) {
             Ok(cut) => cut,
             Err(e) => return not(vec![Reason::new("no_plan", format!("no plan to play from here: {e}"))]),
         };
-        // (As a session's start: the probes the caps are made of, for every frame the scan below looks at.)
+        // (As a session's start: the files of the placed clips, and the probes the caps are made of for every frame the scan
+        // below looks at.)
+        kerf_gpu::prepare_placed_files(&cut, &inputs.timeline);
         kerf_gpu::prepare_ahead(&cut, t, REACH + HORIZON + RESUME_SLACK);
         let size = match cut.plan(t).map_err(|e| e.to_string()).and_then(|first| {
             self.sized(technique, &bounds, &drawing.host, &first)
@@ -908,6 +916,7 @@ impl GpuPreview {
             Ok(sized) => sized,
             Err(reason) => return stream(reason, session),
         };
+        // (Only what has been measured is read here: the probes ran when the session was made ready or began.)
         let caps = drawing.compositor.session_caps();
         let ahead = session.ahead(t, size, &caps);
         // The frame asked for is at or past the first one the GPU does not draw (the page's hand-over was

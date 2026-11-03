@@ -19,8 +19,14 @@ fn gpu() -> std::sync::Arc<Gpu> {
     Gpu::new(GpuOptions::for_tests()).expect("a GPU adapter (install mesa-vulkan-drivers for lavapipe)")
 }
 
+/// (The scaler is pinned as the model: nothing here runs FFmpeg to measure it, and a compositor whose scaler is not known to be
+/// swscale's refuses every resized layer. So is the edge of `geq`'s read, which a mask needs known: a copy of the picture's own
+/// last column and row, as FFmpeg 9 reads it; the case that holds the clamping build pins the other.)
 fn compositor() -> Compositor {
-    Compositor::new(gpu()).expect("a compositor")
+    Compositor::new(gpu())
+        .expect("a compositor")
+        .with_scaler_kernels(kerf_gpu::scaler::Kernels::Match(kerf_gpu::scaler::Model::ASSUMED))
+        .with_geq_edge(kerf_core::GeqEdge::Exact)
 }
 
 fn asset(w: u32, h: u32) -> Asset {

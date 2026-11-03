@@ -6,15 +6,17 @@
 //   fs_unsharp  `unsharp`, 5x5, luma: integer arithmetic (the binomial [1 4 6 4 1] blur, exactly summed)
 //   fs_edge     `geq`'s copy of a plane on a build that reads the last column and row one in: the sample
 //               at (min(x, w - 2), min(y, h - 2))
+//   fs_box      one pass of `boxblur` (`vf_boxblur.c`): a line of the plane at `radius` through the running sum's
+//               integer arithmetic, written out as the sum of the mirrored window it computes
 //
 // FFmpeg's arithmetic, not a formula for it: see `src/effects.rs` for the references and
 // `kerf_core::fade_luma` for `fade`.
 
 struct P {
     size: vec2<i32>,   // the plane
-    row: i32,          // fs_lut: the table's row (0 Y, 1 U, 2 V)
-    amount: i32,       // fs_unsharp: the integer amount (65536 = 1.0)
-    kind: u32,         // fs_fade: 0 luma, 1 chroma, 2 alpha
+    row: i32,          // fs_lut: the table's row (0 Y, 1 U, 2 V); fs_box: the radius
+    amount: i32,       // fs_unsharp: the integer amount (65536 = 1.0); fs_box: `inv`, the weight of each sample
+    kind: u32,         // fs_fade: 0 luma, 1 chroma, 2 alpha; fs_box: 0 along rows, 1 along columns
     black: u32,        // fs_fade luma: the black level `fade` takes for the layer's pixel format
     f_in: u32,         // fs_fade: the fades' integer factors (65535: not running); alpha: the ramp
     f_out: u32,
@@ -102,4 +104,36 @@ fn fs_edge(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let o = vec2<i32>(frag.xy);
     let at = vec2<i32>(min(o.x, p.size.x - 2), min(o.y, p.size.y - 2));
     return textureLoad(src, at, 0);
+}
+
+// `boxblur`'s `blur8`: each output is `(sum * inv + 32768) >> 16`, `inv = (65536 + length / 2) / length` for a
+// window of `length = 2 * radius + 1` samples, and the running sum is the window's over the line mirrored about its
+// ends *including* the edge sample (index -1 reads 0, index `len` reads `len - 1`): `src[radius] + 2 * sum(src[..radius])`
+// to start and an add and a subtract a step. Every sum is exact in integers, so the window summed whole is the same
+// number. A line shorter than `2 * radius + 1` would read past the plane in FFmpeg: the plan refuses it.
+@fragment
+fn fs_box(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
+    let o = vec2<i32>(frag.xy);
+    let vertical = p.kind == 1u;
+    var at = o.x;
+    var len = p.size.x;
+    if (vertical) {
+        at = o.y;
+        len = p.size.y;
+    }
+    var sum = 0;
+    for (var k = -p.row; k <= p.row; k = k + 1) {
+        var i = at + k;
+        if (i < 0) {
+            i = -i - 1;
+        } else if (i >= len) {
+            i = 2 * len - 1 - i;
+        }
+        var c = vec2<i32>(i, o.y);
+        if (vertical) {
+            c = vec2<i32>(o.x, i);
+        }
+        sum = sum + byte(textureLoad(src, c, 0).r);
+    }
+    return out_byte(clamp((sum * p.amount + 32768) >> 16u, 0, 255));
 }

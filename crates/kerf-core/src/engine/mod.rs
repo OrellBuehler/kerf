@@ -28,7 +28,7 @@ mod colors;
 
 // How `geq` (a mask's filter) reads the last column and row of a plane on this ffmpeg: measured, once.
 mod geq_edge;
-pub use geq_edge::{geq_edge, geq_penultimate_plane, GeqEdge};
+pub use geq_edge::{geq_edge, geq_edge_measured, geq_penultimate_plane, GeqEdge};
 
 // What the decodes ask `ffprobe` per file, bounded and remembered: container, HDR, start, and
 // whether a seek lands on a keyframe.
@@ -155,6 +155,7 @@ pub use cli::{
     text_raster_graph, text_sequence_limit, text_still_filter, GraphFile, PlacementProbeMotion, TextPart, TextPiece,
     TextRasterGraph, GRAPH_ARG_MAX, MAX_MEASURE_SIDE, MAX_SEQUENCE_CHARS, TEXT_BORDER_PX, TEXT_BOX_PX,
 };
+pub(crate) use cli::{blur_fill_clip, picture_has_other_shape};
 pub(crate) use cli::{keyed_color_value, keyframe_value, proxy_fidelity, ProxyFidelity};
 pub use colors::color_rgb;
 pub(crate) use colors::{safe_color, valid_color};

@@ -1,11 +1,15 @@
 //! `checker/simd2/…`: the swscale filter-table memo (`sws::bicubic`) held to the table built from scratch
 //! (`sws::bicubic_uncached`), byte for byte, whatever the memo held when it was asked: more keys than it has
 //! entries, tables over its entry and total byte caps, refused ratios, many threads on one key and on many.
-//! No adapter, no FFmpeg. Always run.
+//! The memo sits at `sws::table_aligned` and its key is the whole input (scaler, alignment, sizes, precision), so
+//! the same is held for both scalers and the alignments of the C and the SIMD builds against
+//! `sws::table_aligned_uncached`. No adapter, no FFmpeg. Always run.
 
 use std::sync::{Arc, Barrier};
 
-use kerf_gpu::sws::{bicubic, bicubic_uncached, Filter, ONE_HORIZONTAL, ONE_VERTICAL};
+use kerf_gpu::sws::{
+    bicubic, bicubic_uncached, table, table_aligned, table_aligned_uncached, Filter, Scaler, ONE_HORIZONTAL, ONE_VERTICAL,
+};
 
 type Key = (u32, u32, i32);
 
@@ -247,4 +251,132 @@ fn checker_simd2_changing_a_returned_table_does_not_change_the_next_hit() {
             same(&bicubic(s, d, one), &want, &format!("{s}->{d}"));
         }
     }
+}
+
+type FullKey = (Scaler, usize, u32, u32, i32);
+
+const SCALERS: [Scaler; 2] = [Scaler::Bicubic, Scaler::Bilinear];
+const ALIGNS: [usize; 3] = [1, 2, 4];
+const FEW_SIDES: [u32; 12] = [1, 2, 7, 16, 31, 100, 120, 360, 640, 1080, 1280, 1920];
+
+/// Every scaler and alignment on every pair of a dozen sides, both precisions: 1728 keys, far more than the memo holds.
+fn full_corpus() -> Vec<(FullKey, Option<Filter>)> {
+    let mut keys = Vec::new();
+    for scaler in SCALERS {
+        for align in ALIGNS {
+            for &s in &FEW_SIDES {
+                for &d in &FEW_SIDES {
+                    for one in [ONE_HORIZONTAL, ONE_VERTICAL] {
+                        keys.push((scaler, align, s, d, one));
+                    }
+                }
+            }
+        }
+    }
+    keys.into_iter()
+        .map(|k| (k, table_aligned_uncached(k.0, k.2, k.3, k.4, k.1)))
+        .collect()
+}
+
+#[test]
+fn checker_simd2_a_hit_is_a_fresh_build_for_every_scaler_and_alignment_of_a_corpus_bigger_than_the_memo() {
+    let all = full_corpus();
+    assert!(all.len() > 4 * 64);
+    let mut rng = Rng(0x5EED_0002);
+    for pass in 0..3 {
+        let mut order: Vec<usize> = (0..all.len()).collect();
+        for i in (1..order.len()).rev() {
+            order.swap(i, rng.below(i + 1));
+        }
+        for i in order {
+            let ((scaler, align, s, d, one), want) = &all[i];
+            same(
+                &table_aligned(*scaler, *s, *d, *one, *align),
+                want,
+                &format!("pass {pass}: {scaler:?} align {align} {s}->{d} {one}"),
+            );
+        }
+    }
+}
+
+/// The key is all five: two builds of one `(src, dst, one)` that differ only in the scaler or the alignment are other
+/// tables, and the memo must answer each with its own, whichever it was asked first and however often.
+#[test]
+fn checker_simd2_the_scaler_and_the_alignment_each_pick_their_own_table() {
+    let all = full_corpus();
+    let get = |scaler, align, s, d, one| {
+        all.iter()
+            .find(|(k, _)| *k == (scaler, align, s, d, one))
+            .map(|(_, f)| f.clone())
+            .expect("a key of the corpus")
+    };
+    let (mut by_scaler, mut by_align) = (0, 0);
+    for &(s, d) in &[(1280u32, 120u32), (640, 360), (1920, 1080), (360, 640), (100, 31), (31, 100)] {
+        for one in [ONE_HORIZONTAL, ONE_VERTICAL] {
+            let tables: Vec<_> = SCALERS.iter().flat_map(|&sc| ALIGNS.iter().map(move |&a| (sc, a))).collect();
+            if get(Scaler::Bicubic, 1, s, d, one) != get(Scaler::Bilinear, 1, s, d, one) {
+                by_scaler += 1;
+            }
+            if get(Scaler::Bicubic, 1, s, d, one) != get(Scaler::Bicubic, 4, s, d, one) {
+                by_align += 1;
+            }
+            for round in 0..3 {
+                for &(sc, a) in tables.iter().rev().chain(tables.iter()) {
+                    same(
+                        &table_aligned(sc, s, d, one, a),
+                        &get(sc, a, s, d, one),
+                        &format!("round {round}: {sc:?} align {a} {s}->{d} {one}"),
+                    );
+                }
+            }
+        }
+    }
+    assert!(
+        by_scaler >= 8 && by_align >= 1,
+        "the scalers ({by_scaler}) and the alignments ({by_align}) must give different tables here or this test proves nothing"
+    );
+}
+
+#[test]
+fn checker_simd2_the_named_entries_are_the_one_memoised_function() {
+    for &(s, d) in &[(1280u32, 120u32), (640, 360), (360, 640), (7, 100), (100_000, 100)] {
+        for one in [ONE_HORIZONTAL, ONE_VERTICAL] {
+            for _ in 0..2 {
+                same(
+                    &bicubic(s, d, one),
+                    &table_aligned_uncached(Scaler::Bicubic, s, d, one, 1),
+                    "bicubic",
+                );
+                same(&bicubic(s, d, one), &bicubic_uncached(s, d, one), "bicubic, uncached");
+                for scaler in SCALERS {
+                    same(
+                        &table(scaler, s, d, one),
+                        &table_aligned_uncached(scaler, s, d, one, 1),
+                        &format!("table {scaler:?}"),
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn checker_simd2_threads_on_mixed_scalers_and_alignments_all_get_the_fresh_table() {
+    let all = Arc::new(full_corpus());
+    std::thread::scope(|scope| {
+        for t in 0..8u64 {
+            let all = all.clone();
+            scope.spawn(move || {
+                let mut rng = Rng(0xDCBA_0000 + t);
+                for _ in 0..2500 {
+                    let ((scaler, align, s, d, one), want) = &all[rng.below(all.len())];
+                    assert_eq!(
+                        &table_aligned(*scaler, *s, *d, *one, *align),
+                        want,
+                        "thread {t}: {scaler:?} align {align} {s}->{d} {one}"
+                    );
+                }
+            });
+        }
+    });
 }

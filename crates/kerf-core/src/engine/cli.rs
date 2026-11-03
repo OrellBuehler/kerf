@@ -9752,15 +9752,23 @@ fn blur_fill(w: u32, h: u32, even: &str, sf: &str, deep: bool, label: &str) -> S
 /// blurred halo) and not one of the frame's own shape or of an unknown one (nothing to fill).
 /// Anything else is placed with Contain's own chain, byte for byte.
 fn takes_blur_fill(clip: &Clip, picture: Option<(u32, u32)>, frame: (u32, u32), alpha: bool) -> bool {
-    let other_shape =
-        picture.is_some_and(|(w, h)| w > 0 && h > 0 && u64::from(w) * u64::from(frame.1) != u64::from(h) * u64::from(frame.0));
+    blur_fill_clip(clip, alpha) && picture_has_other_shape(picture, frame)
+}
+
+/// The part of [`takes_blur_fill`] that is the clip's (pure, shared with the plan): placed by the plain fit, not
+/// see-through.
+pub(crate) fn blur_fill_clip(clip: &Clip, alpha: bool) -> bool {
     clip.transform.is_identity()
         && !clip.is_animated()
         && clip.reframe.is_none()
         && clip.mask.is_none()
         && !alpha
         && !clip.effects.iter().any(|e| e.produces_alpha())
-        && other_shape
+}
+
+/// Whether a probed `picture` is not the shape of the `frame` (an unprobed one is nothing to fill).
+pub(crate) fn picture_has_other_shape(picture: Option<(u32, u32)>, frame: (u32, u32)) -> bool {
+    picture.is_some_and(|(w, h)| w > 0 && h > 0 && u64::from(w) * u64::from(frame.1) != u64::from(h) * u64::from(frame.0))
 }
 
 /// The displayed size of `asset`'s picture, when it was probed.

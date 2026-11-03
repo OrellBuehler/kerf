@@ -173,9 +173,9 @@ fn the_session_and_the_render_bar_refuse_a_files_range_before_the_frame_and_not_
         Placement::Match,
         "the control: this FFmpeg places as the model does, so the placement is in the caps"
     );
-    let caps = Compositor::session_caps_for(Kernels::Match);
+    let caps = Compositor::session_caps_for(Kernels::Match, kerf_gpu::scaler::measured(), kerf_gpu::convert::measured());
     assert!(caps.placement && caps.file_range, "{caps:?}");
-    let pure = Compositor::caps_for(Kernels::Match);
+    let pure = Compositor::caps_for(Kernels::Match, kerf_gpu::scaler::measured(), kerf_gpu::convert::measured());
     assert!(
         pure.placement && !pure.file_range,
         "the compositor's own caps, and the build's, ask nobody: {pure:?}"

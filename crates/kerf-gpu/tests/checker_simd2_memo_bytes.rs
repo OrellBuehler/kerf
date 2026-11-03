@@ -81,6 +81,12 @@ fn checker_simd2_the_memo_holds_what_it_says_it_holds() {
     let t = t.expect("a table");
     assert!(bytes(&t) > 8 * MIB, "{}", bytes(&t));
     drop(t);
+    let (t, built_only) = allocations(|| bicubic_uncached(huge.0, huge.1, huge.2));
+    drop(t);
+    assert_eq!(
+        first, built_only,
+        "a table over 8 MiB took {first} allocations to ask for and {built_only} to build: it was also copied"
+    );
     let (t, second) = allocations(|| bicubic(huge.0, huge.1, huge.2));
     drop(t.expect("a table"));
     assert!(
