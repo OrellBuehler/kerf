@@ -30,7 +30,13 @@ fn compositor() -> &'static Compositor {
     static C: OnceLock<Compositor> = OnceLock::new();
     C.get_or_init(|| {
         let _ = kerf_gpu::grade::kernels();
+        let _ = kerf_gpu::scaler::kernels();
+        let _ = kerf_gpu::convert::kernels();
+        let _ = kerf_core::geq_edge();
+        let _ = kerf_gpu::conversion::conversion();
+        let _ = kerf_gpu::placement_probe::placement();
         let _ = kerf_gpu::text::model();
+        let _ = kerf_gpu::blend::kernels();
         Compositor::new(gpu()).expect("a compositor")
     })
 }
