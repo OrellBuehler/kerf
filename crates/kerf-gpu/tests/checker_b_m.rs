@@ -901,7 +901,22 @@ fn go(
     assets: &[Asset],
     secs: f64,
 ) -> Option<Outcome> {
-    let out = sweep_guarded(case, tl, assets, 30.0, secs)?;
+    go_at(fam, groups, label, case, tl, assets, 30.0, secs)
+}
+
+/// [`go`] at the export rate `fps`.
+#[allow(clippy::too_many_arguments)]
+fn go_at(
+    fam: &mut Family,
+    groups: &mut Groups,
+    label: &str,
+    case: &str,
+    tl: &Timeline,
+    assets: &[Asset],
+    fps: f64,
+    secs: f64,
+) -> Option<Outcome> {
+    let out = sweep_guarded(case, tl, assets, fps, secs)?;
     fam.add(case, &out);
     groups.add(label, &out);
     Some(out)
@@ -2362,4 +2377,127 @@ fn checker_b_m_quarter_turns_with_effects_colour_crop_and_speed() {
     }
     groups.print("quarter turns with effects, colour, crop and speed");
     fam.finish("quarter turns with effects, colour, crop and speed");
+}
+
+/// A dissolve or a dip into a clip of another colour matrix that the fit resizes, letterboxes or places (the phone clip pillarboxed into a
+/// landscape frame, a 4:3 clip enlarged, a picture-in-picture, a moving zoom), with and without a fade to black running on it: where the composite
+/// follows the bottom layer's tag (9.0.2) the plan refuses the frames whose conversion FFmpeg makes in the same pass as the resize; every frame
+/// it draws is the export's.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_b_m_a_dissolve_into_another_matrix_over_a_resize_a_letterbox_or_a_placement() {
+    let mut fam = Family::default();
+    let mut groups = Groups::default();
+    let frame = Some(Delivery::new(160, 90, Fit::Contain));
+    let pairs = [(Tag::None, Tag::Bt709), (Tag::Bt709, Tag::None), (Tag::Bt709, Tag::Bt2020)];
+    let variants: Vec<Variant> = vec![
+        ("plain", (160, 90), frame, Box::new(|_| {})),
+        ("portrait pillarboxed", (90, 160), frame, Box::new(|_| {})),
+        ("4:3 enlarged", (80, 60), frame, Box::new(|_| {})),
+        ("shrunk 2:1 by the fit", (320, 180), frame, Box::new(|_| {})),
+        (
+            "held zoom out",
+            (160, 90),
+            frame,
+            Box::new(|c| *c = posed(c.clone(), Pose::HeldZoom)),
+        ),
+        (
+            "moving zoom",
+            (160, 90),
+            frame,
+            Box::new(|c| *c = posed(c.clone(), Pose::ZoomIn)),
+        ),
+        ("fade out running", (160, 90), frame, Box::new(|c| c.fade_out = 0.2)),
+        ("portrait with a fade out", (90, 160), frame, Box::new(|c| c.fade_out = 0.2)),
+        (
+            "turned 90 shrunk",
+            (160, 90),
+            frame,
+            Box::new(|c| {
+                c.transform.rotation = 90.0;
+                c.transform.scale = 0.5625;
+            }),
+        ),
+    ];
+    for (a_tag, b_tag) in pairs {
+        let first = media(160, 90, Pat::Noise, a_tag);
+        for (label, (w, h), delivery, edit) in &variants {
+            let second = media(*w, *h, Pat::Test, b_tag);
+            for kind in [TransitionKind::Crossfade, TransitionKind::DipToBlack] {
+                let mut b = clip(&second, 0.0, 0.5, 0.5);
+                edit(&mut b);
+                let tl = timeline(
+                    vec![vec![clip(&first, 0.0, 0.5, 0.0), dissolve_into(b, kind, 0.3)]],
+                    *delivery,
+                );
+                go(
+                    &mut fam,
+                    &mut groups,
+                    &format!("{label} / {kind:?}"),
+                    &format!("checker/b/m/dissolve-matrix {a_tag:?} into {b_tag:?} {label} {kind:?}"),
+                    &tl,
+                    &dedup(&[&first, &second]),
+                    0.9,
+                );
+            }
+        }
+    }
+    groups.print("a dissolve into another matrix over a resize, a letterbox or a placement");
+    assert!(
+        groups.drawn("plain / Crossfade") > 0,
+        "a plain dissolve into another matrix was never drawn"
+    );
+    fam.finish("a dissolve into another matrix over a resize, a letterbox or a placement");
+}
+
+/// The shape of the coverage ledger's T5: a vlog of portrait phone clips pillarboxed into a landscape frame, alternating BT.709 and BT.601, each
+/// dissolving into the next, with a fade in and a fade out at the ends, at 30 and 60 fps, over a plain fit and a blurred fill. Every frame
+/// the plan draws is the export's (the frames it refuses are FFmpeg's: on 9.0.2 the conversion into the bottom layer's matrix is made in the
+/// resize's own pass while a clip dissolves).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_b_m_a_phone_vlog_of_alternating_matrices_dissolving() {
+    let mut fam = Family::default();
+    let mut groups = Groups::default();
+    for (fit, fit_name) in [(Fit::Contain, "contain"), (Fit::Blur, "blur")] {
+        for fps in [30.0, 60.0] {
+            for (tags, tag_name) in [
+                ([Tag::Bt709, Tag::None, Tag::Bt709], "709 601 709"),
+                ([Tag::None, Tag::Bt709, Tag::None], "601 709 601"),
+                ([Tag::Bt709, Tag::Bt709, Tag::None], "709 709 601"),
+            ] {
+                let assets: Vec<Asset> = tags.iter().map(|t| media(90, 160, Pat::Test, *t)).collect();
+                let mut clips: Vec<Clip> = Vec::new();
+                for (i, asset) in assets.iter().enumerate() {
+                    let mut c = clip(asset, 0.0, 0.5, 0.4 * i as f64);
+                    if i > 0 {
+                        c.transition_in = Some(kerf_core::Transition {
+                            kind: TransitionKind::Crossfade,
+                            duration: 0.1,
+                        });
+                    }
+                    clips.push(c);
+                }
+                clips[0].fade_in = 0.1;
+                if let Some(last) = clips.last_mut() {
+                    last.fade_out = 0.1;
+                }
+                let delivery = Delivery::new(160, 90, fit).with_fps(Some(fps)).expect("a rate");
+                let tl = timeline(vec![clips], Some(delivery));
+                let case = format!("checker/b/m/vlog {fit_name} {fps} fps {tag_name}");
+                go_at(
+                    &mut fam,
+                    &mut groups,
+                    &format!("{fit_name} {fps} fps"),
+                    &case,
+                    &tl,
+                    &dedup(&assets.iter().collect::<Vec<_>>()),
+                    fps,
+                    1.2,
+                );
+            }
+        }
+    }
+    groups.print("a phone vlog of alternating matrices dissolving");
+    fam.finish("a phone vlog of alternating matrices dissolving");
 }
