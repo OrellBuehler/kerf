@@ -920,6 +920,22 @@ fn check_with(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], opts: 
     figures
 }
 
+/// [`check`] for a case that may hold a full-range picture in a **still**: at each time, a frame with one on screen is drawn and exact under
+/// FFmpeg 6 (it converts the range at the decode, as the compositor does) and refused by the plan under a policy that negotiates the colour
+/// (FFmpeg 9 keeps the picture's range through the graph and converts last: the still's planes are full-range ones, up to 17 levels from
+/// the compositor's limited-range composite, and the PNG's RGB 3 to 4 levels from its own), FFmpeg rendering the still; a frame without one
+/// is drawn and exact under both.
+fn check_range(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64]) {
+    for &t in times {
+        let plan = RenderPlan::at(tl, assets, &ExportOptions::default(), t, policy()).expect("plan");
+        if policy() != CompositeColorPolicy::FixedBt601 && plan.layers.iter().any(|l| l.stream.maybe_full_range()) {
+            check_refused(case, tl, assets, t, Refusal::Plan("a full-range picture in a still"));
+        } else {
+            check(case, tl, assets, &[t]);
+        }
+    }
+}
+
 /// [`check`] under its older name, from when it held the planes apart from the RGB comparison.
 fn check_exact(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64]) {
     check(case, tl, assets, times);
@@ -1797,7 +1813,7 @@ fn still_images() {
     // A JPEG is full-range YUV, which has to be brought to the limited range the
     // composite works in (FFmpeg does it in the graph; the decode does it here).
     let tl = timeline(vec![vec![clip(&m.jpeg, 0.0, 5.0, 0.0)]], None);
-    check("still/jpeg", &tl, std::slice::from_ref(&m.jpeg), &[1.0]);
+    check_range("still/jpeg", &tl, std::slice::from_ref(&m.jpeg), &[1.0]);
     // On top of video, scaled: a JPEG (4:2:0). A PNG is RGB, and resizing a picture
     // that is not 4:2:0 is refused — so a PNG goes *under* the video, at its own size,
     // and a PNG pip is asserted refused.
@@ -1910,7 +1926,7 @@ fn sources_that_are_not_plain_8_bit_420() {
         ("source/rotated-by-metadata", &m.rotated, 0.5),
     ] {
         let tl = timeline(vec![vec![clip(a, 0.0, 2.0, 0.0)]], None);
-        check(name, &tl, std::slice::from_ref(a), &[t]);
+        check_range(name, &tl, std::slice::from_ref(a), &[t]);
     }
 }
 
@@ -2380,7 +2396,7 @@ fn check_full_range(
             let why = plan.reasons(&compositor().caps(), plan.size(u32::MAX));
             let want = |u: &Unsupported| match policy() {
                 CompositeColorPolicy::FixedBt601 => matches!(u, Unsupported::FullRangeResized(..)),
-                _ => matches!(u, Unsupported::FullRangeNegotiated(_)),
+                _ => matches!(u, Unsupported::FullRangeNegotiated(_) | Unsupported::FullRangeStill(_)),
             };
             assert!(
                 why.iter().any(want),
@@ -2590,15 +2606,9 @@ fn a_full_range_picture_fades_as_the_ffmpeg_in_use_converts_its_range() {
             resized,
             true,
         );
-        // Not fading, the picture is drawn: the range is converted at the decode in a still.
+        // Not fading, the picture is drawn under FFmpeg 6 (the range is converted at the decode in a still) and refused under FFmpeg 9.
         let tl = timeline(vec![vec![clip(a, 0.0, 1.5, 0.0)]], None);
-        check_with(
-            &format!("full-range/plain {name}"),
-            &tl,
-            std::slice::from_ref(a),
-            &[0.5],
-            &opts,
-        );
+        check_range(&format!("full-range/plain {name}"), &tl, std::slice::from_ref(a), &[0.5]);
     }
     // An enlargement of the MJPEG clip, fading in.
     let mut fading = clip(&m.fullrange, 0.0, 1.5, 0.0);
@@ -3280,7 +3290,7 @@ fn translucent_layers_take_the_round_trip_with_the_right_matrices() {
         let mut c = clip(a, 0.0, dur, 0.0);
         c.transform.opacity = 0.6;
         let tl = timeline(vec![vec![clip(&m.testsrc, 0.0, 2.0, 0.0)], vec![c]], None);
-        check(name, &tl, &[m.testsrc.clone(), a.clone()], &[0.5]);
+        check_range(name, &tl, &[m.testsrc.clone(), a.clone()], &[0.5]);
     }
 }
 
@@ -3572,7 +3582,7 @@ fn grading_a_full_range_picture_is_refused_and_ungraded_it_is_drawn() {
             Refusal::Plan("full-range"),
         );
     }
-    check(
+    check_range(
         "full-range/ungraded",
         &graded(&m.fullrange, Color::default()),
         std::slice::from_ref(&m.fullrange),
@@ -4958,7 +4968,7 @@ fn masks_cut_a_layer_to_a_shape() {
     ] {
         let mut c = clip(asset, 0.0, asset.duration.min(2.0), 0.0);
         c.mask = Some(a_mask(kerf_core::MaskShape::Ellipse, 0.2, false));
-        check(
+        check_range(
             &format!("mask/on-{label}"),
             &timeline(vec![vec![c]], None),
             std::slice::from_ref(asset),
@@ -5187,7 +5197,7 @@ fn effects_are_drawn_as_their_filters_draw_them() {
         c.effects = vec![effect];
         timeline(vec![vec![c]], None)
     };
-    check(
+    check_range(
         "effect/grayscale-on-full-range",
         &on(&m.fullrange, E::Grayscale),
         std::slice::from_ref(&m.fullrange),
@@ -6069,7 +6079,7 @@ fn a_decoders_default_tag_labels_nothing_beside_untagged_hd() {
             [false, false],
             "{name}: its tag is not a matrix"
         );
-        check(&format!("label/{name}-under-untagged-hd"), &tl, &assets, &[0.5]);
+        check_range(&format!("label/{name}-under-untagged-hd"), &tl, &assets, &[0.5]);
         made += 1;
     }
     assert!(made >= 2, "only {made} of the three files could be made");
@@ -6583,7 +6593,7 @@ fn a_yuv420p_flagged_full_range_is_refused_where_ffmpeg_reads_its_raw_samples() 
         0.5,
         Refusal::Plan("full-range picture inside a fade"),
     );
-    check("range/pc-fade-over", &fading(&r.pc), std::slice::from_ref(&r.pc), &[1.5]);
+    check_range("range/pc-fade-over", &fading(&r.pc), std::slice::from_ref(&r.pc), &[1.5]);
 
     // The same picture in the same graphs, flagged limited or not flagged: drawn, exactly as before.
     for (label, a) in [("tv", &r.tv), ("unflagged", &r.unflagged)] {
@@ -6621,7 +6631,7 @@ fn a_yuv420p_flagged_full_range_is_refused_where_ffmpeg_reads_its_raw_samples() 
     // it does not (swscale converts the range inside the resize), and the plan refuses it in a still. (Under FFmpeg 9 an *export*
     // of the cut is refused as a whole.)
     let pc = std::slice::from_ref(&r.pc);
-    check("range/pc-plain", &one(&r.pc, &|_| {}), pc, &[0.5]);
+    check_range("range/pc-plain", &one(&r.pc, &|_| {}), pc, &[0.5]);
     let (tl, assets) = over_bars(&r.pc, &|c| c.transform.scale = 0.5);
     check_refused(
         "range/pc-scaled-over-bars",
@@ -6642,7 +6652,7 @@ fn a_yuv420p_flagged_full_range_is_refused_where_ffmpeg_reads_its_raw_samples() 
         Refusal::Plan("full-range picture in a still that the scaler resizes"),
     );
     let after = timeline(vec![vec![clip(&m.testsrc, 0.0, 1.0, 0.0), clip(&r.pc, 0.0, 1.0, 1.0)]], None);
-    check(
+    check_range(
         "range/pc-after-limited",
         &after,
         &[m.testsrc.clone(), r.pc.clone()],
