@@ -33,18 +33,76 @@ use kerf_gpu::{Compositor, FrameSource, FrameSourceConfig, Gpu, GpuOptions, Moti
 
 fn gpu() -> Arc<Gpu> {
     static GPU: OnceLock<Arc<Gpu>> = OnceLock::new();
-    GPU.get_or_init(|| Gpu::new(GpuOptions::for_tests()).expect("a GPU adapter (install mesa-vulkan-drivers for lavapipe)"))
-        .clone()
+    let gpu = GPU
+        .get_or_init(|| Gpu::new(GpuOptions::for_tests()).expect("a GPU adapter (install mesa-vulkan-drivers for lavapipe)"))
+        .clone();
+    // (Every compositor of this file is built on this device: the measurements are made before any of them draws.)
+    prime();
+    gpu
+}
+
+/// Measure, once, everything a cut's caps are made of: the grade's conversions, the scaler, the matrix conversion, the `geq` edge (a mask
+/// and a keyed opacity are in the caps only once it is known: a render only reads it), the planar conversion and the placement (a moving zoom
+/// or position), the blend chain and the text layout. A compositor built without it refuses every such clip, and a sweep counts a refusal as
+/// fine: the cases would pass without holding a masked, placed or blended frame to the export.
+fn prime() {
+    static ONCE: OnceLock<()> = OnceLock::new();
+    ONCE.get_or_init(|| {
+        let _ = kerf_gpu::grade::kernels();
+        let _ = kerf_gpu::scaler::kernels();
+        let _ = kerf_gpu::convert::kernels();
+        let _ = kerf_core::geq_edge();
+        let _ = kerf_gpu::conversion::conversion();
+        let _ = kerf_gpu::placement_probe::placement();
+        let _ = kerf_gpu::blend::kernels();
+        let _ = kerf_gpu::text::model();
+    });
+}
+
+/// A frame refused for a mask or a keyed opacity is refused because the caps lack them, which is the `geq` edge not being measured
+/// ([`prime`]): the plan refuses nothing else under those names. That is the harness's fault, not the plan's, and it must not pass as a
+/// refusal.
+fn no_geq_refusal(case: &str, why: &[kerf_core::Unsupported]) {
+    assert!(
+        !why.iter()
+            .any(|u| matches!(u, kerf_core::Unsupported::Mask(_) | kerf_core::Unsupported::KeyedOpacity(_))),
+        "{case}: refused for a mask or a keyed opacity, which only a compositor without the geq edge refuses (measured: {:?}): the \
+         case would pass without holding a masked frame to the export",
+        kerf_core::geq_edge_measured()
+    );
+}
+
+/// What a frame's plan carries that only a measured probe lets through (printed in the frame log beside `exact`).
+fn frame_tags(plan: &kerf_core::RenderPlan) -> String {
+    let mut tags = String::new();
+    if plan.layers.iter().any(|l| l.mask.is_some() || l.keyed_alpha.is_some()) {
+        tags.push_str(" [geq]");
+    }
+    if plan.layers.iter().any(|l| plan.pose(l).is_some()) {
+        tags.push_str(" [placed]");
+    }
+    if plan.layers.iter().any(|l| !l.blend.is_normal()) {
+        tags.push_str(" [blend]");
+    }
+    tags
 }
 
 fn compositor() -> &'static Compositor {
     static C: OnceLock<Compositor> = OnceLock::new();
     C.get_or_init(|| {
-        let _ = kerf_gpu::grade::kernels();
-        let _ = kerf_gpu::scaler::kernels();
-        let _ = kerf_gpu::convert::kernels();
-        let _ = kerf_gpu::text::model();
-        Compositor::new(gpu()).expect("a compositor")
+        prime();
+        let comp = Compositor::new(gpu()).expect("a compositor");
+        let caps = comp.caps();
+        assert!(
+            caps.mask
+                && caps.keyed_opacity
+                && caps.placement
+                && caps.behaviors
+                && caps.placed_chroma
+                && caps.blend != kerf_core::BlendKinds::NONE,
+            "a probe could not tell on this machine, so cases would pass as refused: {caps:?}"
+        );
+        comp
     })
 }
 
@@ -524,6 +582,8 @@ fn sweep_played_on(
     for k in 0..frames as u64 {
         let plan = planner.at_frame(k).expect("plan");
         let why = plan.reasons(&comp.caps(), size);
+        no_geq_refusal(case, &why);
+        let tags = frame_tags(&plan);
         let was_refused = !why.is_empty();
         if was_refused {
             out.refused += 1;
@@ -564,7 +624,7 @@ fn sweep_played_on(
             }
             let _ = writeln!(
                 log,
-                "{k}\t{}INEXACT\tY {} (max {}) U {} (max {}) V {} (max {})",
+                "{k}\t{}INEXACT\tY {} (max {}) U {} (max {}) V {} (max {}){tags}",
                 if was_refused { "ANYWAY-" } else { "" },
                 planes[0].differing,
                 planes[0].max,
@@ -579,7 +639,7 @@ fn sweep_played_on(
                 len: [want[0].len(), want[1].len(), want[2].len()],
             });
         } else {
-            let _ = writeln!(log, "{k}\t{}exact", if was_refused { "ANYWAY-" } else { "" });
+            let _ = writeln!(log, "{k}\t{}exact{tags}", if was_refused { "ANYWAY-" } else { "" });
         }
     }
     let _ = std::fs::write(frame_log_dir().join(format!("{}.frames", slug(case))), &log);
@@ -1724,6 +1784,7 @@ fn still_sweep(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64]) -> St
         let plan = kerf_core::RenderPlan::at(tl, assets, &opts, t, policy()).expect("plan");
         let size = plan.size(u32::MAX);
         let why = plan.reasons(&compositor().caps(), size);
+        no_geq_refusal(case, &why);
         if !why.is_empty() {
             out.refused += 1;
             let names: BTreeSet<String> = why.iter().map(ToString::to_string).collect();
@@ -1734,12 +1795,13 @@ fn still_sweep(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64]) -> St
             continue;
         }
         out.drawn += 1;
+        let tags = frame_tags(&plan);
         let (n, max) = still_planes_differ(&plan, tl, assets, t);
         if n > 0 {
             out.bad.push((t, n, max));
-            let _ = writeln!(log, "{t}\tINEXACT\t{n} samples differ, max {max}");
+            let _ = writeln!(log, "{t}\tINEXACT\t{n} samples differ, max {max}{tags}");
         } else {
-            let _ = writeln!(log, "{t}\texact");
+            let _ = writeln!(log, "{t}\texact{tags}");
         }
     }
     let _ = std::fs::write(frame_log_dir().join(format!("still-{}.frames", slug(case))), &log);
@@ -3393,6 +3455,7 @@ fn anyway(
     for k in 0..frames as u64 {
         let plan = planner.at_frame(k).expect("plan");
         let why = plan.reasons(&comp.caps(), size);
+        no_geq_refusal(case, &why);
         if why.is_empty() {
             continue;
         }
@@ -7122,6 +7185,8 @@ fn r4_still_at(case: &str, tl: &Timeline, assets: &[Asset], opts: &ExportOptions
         let plan = kerf_core::RenderPlan::at(tl, assets, opts, t, policy()).expect("plan");
         let size = plan.size(max_width);
         let why = plan.reasons(&compositor().caps(), size);
+        no_geq_refusal(case, &why);
+        let tags = frame_tags(&plan);
         let refused = !why.is_empty();
         if refused {
             out.refused += 1;
@@ -7146,12 +7211,12 @@ fn r4_still_at(case: &str, tl: &Timeline, assets: &[Asset], opts: &ExportOptions
                 } else {
                     out.drawn += 1;
                     if exact {
-                        let _ = writeln!(log, "{t}\texact");
+                        let _ = writeln!(log, "{t}\texact{tags}");
                     } else {
                         if out.bad.is_empty() {
                             r4_still_montage(case, t, (w, h), &want, &got);
                         }
-                        let _ = writeln!(log, "{t}\tINEXACT");
+                        let _ = writeln!(log, "{t}\tINEXACT{tags}");
                         out.bad.push((t, planes));
                     }
                 }
@@ -11535,4 +11600,27 @@ fn checker_b_r6_a_mixed_cut_is_refused_on_every_frame_without_a_measured_convers
         wrong.iter().take(20).cloned().collect::<Vec<_>>().join("\n")
     );
     assert!(!negotiates() || mixed_frames > 500, "too few frames: {mixed_frames}");
+}
+
+/// The guard of [`no_geq_refusal`] fires: a sweep that meets a refusal for a mask or a keyed opacity (what a compositor without the `geq` edge
+/// gives every masked clip) fails the case instead of counting the frame as refused; every other refusal passes it.
+#[test]
+fn checker_b_a_geq_refusal_in_a_sweep_fails_the_case_instead_of_passing_as_refused() {
+    use kerf_core::{LayerRef, Unsupported};
+    let layer = || LayerRef {
+        index: 0,
+        name: "a.mp4".into(),
+    };
+    for gate in [Unsupported::Mask(layer()), Unsupported::KeyedOpacity(layer())] {
+        let refused = std::panic::catch_unwind(|| no_geq_refusal("a case", &[Unsupported::KeyedMask(layer()), gate.clone()]));
+        assert!(refused.is_err(), "{gate:?} passed the guard");
+    }
+    no_geq_refusal(
+        "a case",
+        &[
+            Unsupported::KeyedMask(layer()),
+            Unsupported::MaskWith(layer(), "on a rotated layer"),
+        ],
+    );
+    no_geq_refusal("a case", &[]);
 }

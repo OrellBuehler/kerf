@@ -10945,9 +10945,9 @@ fn checker_e_r3_odd_sided_unscaled_layers_turned_plain_and_blended() {
 }
 
 /// The plain odd-sided layers the compositor's scaler resizes (a crop of a column or a row fitted back to the frame), turned by every quarter
-/// (and not at all): the scaler draws them a level off the export in luma and chroma, turned or not (the same count at 0 and 180 degrees), so they
-/// fail here until the scaler's lane makes them exact or refuses them (`FormatResize`). Held to the export to the sample: nothing is relaxed, the
-/// test is kept out of the run until that lane has merged.
+/// (and not at all): drawn to the sample where the scaler is measured to be swscale's (the exact scaler of the filters lane, merged), refused
+/// where it is not (`ScalerApproximate`) or where the picture's format is one the plan does not let the scaler resize (`FormatResize`). Held to
+/// the export to the sample, a refusal counted as fine and nothing relaxed.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn checker_e_r3_odd_sided_layers_the_scaler_resizes_plain() {
