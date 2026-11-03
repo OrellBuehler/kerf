@@ -36,13 +36,14 @@ const DIR: &str = "KERF_FILES_DIR";
 const REAL_FFPROBE: &str = "KERF_FILES_REAL_FFPROBE";
 
 /// Every call is logged (`$DIR/ffprobe.log`); once `$DIR/armed` exists a call about a file named `placed-*` sleeps `$DIR/sleep` seconds
-/// (and one named `broken-*` prints nothing and exits 0: a probe that says nothing usable) before the real `ffprobe` answers.
+/// (one named `broken-*` prints nothing and exits 0: a probe that says nothing usable; one named `hung-*` never answers) before the real `ffprobe` answers.
 const FFPROBE_WRAPPER: &str = r#"#!/bin/bash
 D="$KERF_FILES_DIR"; REAL="$KERF_FILES_REAL_FFPROBE"
 echo "$*" >> "$D/ffprobe.log"
 if [ -e "$D/armed" ]; then
   case "$*" in
     */broken-*) exit 0 ;;
+    */hung-*) exec sleep 300 ;;
     */placed-*) sleep "$(cat "$D/sleep")" ;;
   esac
 fi
@@ -217,6 +218,7 @@ fn checker_b_m_files_child() {
         "parallel" => parallel(&dir),
         "budget" => budget(&dir),
         "broken" => broken(&dir),
+        "hung" => hung(&dir),
         other => panic!("no scenario {other}"),
     }
 }
@@ -392,10 +394,10 @@ fn budget(dir: &Path) {
     assert_eq!(lines_with(&probes, "placed-") - before, 12, "each file is probed once in all");
 }
 
-fn broken(dir: &Path) {
+fn unanswered(dir: &Path, prefix: &str, n: usize, hung: bool) {
     let probes = dir.join("ffprobe.log");
     // Clips of `broken-*` files: ffprobe prints nothing for them. Files of `placed-*` answer.
-    let s = session(dir, "broken", 3);
+    let s = session(dir, prefix, n);
     let policy = policy();
     kerf_gpu::prepare_timeline(&s.timeline);
     let cut = PlayCut::new(&s.timeline, &s.assets, 0.0, policy, &OriginalMedia).expect("a cut");
@@ -408,19 +410,33 @@ fn broken(dir: &Path) {
         .with_grade_kernels(kerf_gpu::grade::Kernels::Match);
     std::fs::write(dir.join("armed"), "").expect("arm the wrapper");
     let negotiated = policy == CompositeColorPolicy::BottomLayerTag;
-    let before = lines_with(&probes, "broken-");
+    let before = lines_with(&probes, &format!("{prefix}-"));
     let started = Instant::now();
     kerf_gpu::prepare_placed_files(&cut, &s.timeline);
     let took = started.elapsed();
     eprintln!(
-        "3 files ffprobe says nothing of: {} runs, {took:.1?}",
-        lines_with(&probes, "broken-") - before
+        "{n} files ffprobe does not answer ({prefix}): {} runs, {took:.1?}",
+        lines_with(&probes, &format!("{prefix}-")) - before
     );
     if !negotiated {
-        assert_eq!(lines_with(&probes, "broken-") - before, 0);
+        assert_eq!(lines_with(&probes, &format!("{prefix}-")) - before, 0);
         return;
     }
-    assert!(took < Duration::from_secs(20), "{took:?}");
+    if hung {
+        // Four at a time, each killed at its own 20 s: nothing new starts past the budget, so the call is over at about 20 s with four
+        // asked (and left with no answer) and the rest never started.
+        assert!(
+            took >= Duration::from_secs(19) && took < Duration::from_secs(32),
+            "the hung probes took {took:?} to give up"
+        );
+        assert_eq!(
+            lines_with(&probes, &format!("{prefix}-")) - before,
+            4,
+            "probes started past the budget"
+        );
+    } else {
+        assert!(took < Duration::from_secs(20), "{took:?}");
+    }
     let caps = Compositor::session_caps_for(
         kerf_gpu::grade::Kernels::Match,
         kerf_gpu::scaler::Kernels::Match(kerf_gpu::scaler::Model::ASSUMED),
@@ -449,10 +465,24 @@ fn broken(dir: &Path) {
             "clip {i}: a file that ffprobe says nothing of was drawn"
         );
     }
-    // Not asked again inside the failure's memory (a probe that said nothing is not respawned by every frame).
-    let runs = lines_with(&probes, "broken-");
-    kerf_gpu::prepare_placed_files(&cut, &s.timeline);
-    assert_eq!(lines_with(&probes, "broken-"), runs, "a failed probe was asked again at once");
+    if !hung {
+        // Not asked again inside the failure's memory (a probe that said nothing is not respawned by every frame).
+        let runs = lines_with(&probes, &format!("{prefix}-"));
+        kerf_gpu::prepare_placed_files(&cut, &s.timeline);
+        assert_eq!(
+            lines_with(&probes, &format!("{prefix}-")),
+            runs,
+            "a failed probe was asked again at once"
+        );
+    }
+}
+
+fn broken(dir: &Path) {
+    unanswered(dir, "broken", 3, false);
+}
+
+fn hung(dir: &Path) {
+    unanswered(dir, "hung", 8, true);
 }
 
 #[test]
@@ -471,4 +501,10 @@ fn checker_b_m_files_past_the_budget_are_left_unasked_and_refused_not_drawn() {
 #[ignore = "needs ffmpeg, ffprobe and a GPU adapter (lavapipe is enough)"]
 fn checker_b_m_files_ffprobe_says_nothing_of_are_refused_not_drawn() {
     child("broken", Duration::from_secs(120));
+}
+
+#[test]
+#[ignore = "needs ffmpeg, ffprobe and a GPU adapter (lavapipe is enough); takes about half a minute"]
+fn checker_b_m_files_a_hung_ffprobe_is_given_up_on_within_the_budget_and_the_files_refused() {
+    child("hung", Duration::from_secs(150));
 }
