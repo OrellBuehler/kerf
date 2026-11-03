@@ -243,7 +243,13 @@ fn media(dir: &Path, w: u32, h: u32) -> Asset {
             path.to_str().unwrap(),
         ]);
     }
-    Project::probe_asset(&path).expect("probe")
+    // (An asset that recorded no range, as one stored before the flag was: FFmpeg 9 writes `tv` into a file whose encoder was never told, and
+    // the session's range gate is about the asset that says nothing.)
+    let mut asset = Project::probe_asset(&path).expect("probe");
+    for stream in &mut asset.streams {
+        stream.color_range = None;
+    }
+    asset
 }
 
 fn key(time: f64, scale: f64, opacity: f64) -> Keyframe {
