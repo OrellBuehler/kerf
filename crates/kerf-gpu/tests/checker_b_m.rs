@@ -866,6 +866,9 @@ type Resizing = (&'static str, (u32, u32), Option<Delivery>, Edit, bool);
 /// A [`Variant`] whose edit takes the outgoing and the incoming clip of a transition.
 type Arrangement = (&'static str, (u32, u32), Option<Delivery>, Box<dyn Fn(&mut Clip, &mut Clip)>);
 
+/// A label, the delivery frame, the clips of each track and the assets they use.
+type TitleCase = (&'static str, Option<Delivery>, Vec<Vec<Clip>>, Vec<Asset>);
+
 /// What a family drew and refused, by the label of the group a case belongs to (printed at the end: a group that is refused whole is
 /// said so, not hidden in a pass).
 #[derive(Default)]
@@ -2516,7 +2519,7 @@ fn checker_b_m_a_title_over_placed_turned_resized_and_blended_layers() {
     let top = media(320, 180, Pat::Test, Tag::None);
     let portrait = media(180, 320, Pat::Test, Tag::None);
     let shrunk = media(640, 360, Pat::Noise, Tag::None);
-    let cases: Vec<(&str, Option<Delivery>, Vec<Vec<Clip>>, Vec<Asset>)> = vec![
+    let cases: Vec<TitleCase> = vec![
         ("plain", canvas, vec![vec![clip(&top, 0.0, 0.4, 0.0)]], vec![top.clone()]),
         (
             "moving zoom",
