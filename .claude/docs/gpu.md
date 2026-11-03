@@ -429,7 +429,7 @@ they are). The kernels live in `kerf-core` (`simd.rs`, `mask_plane.rs`, `mask_pl
 - **Not vector code**: `sws::bicubic` is **memoised** per `(src, dst, one)` (a table is a pure function of the three; 64 entries, 32 MiB,
   newest first, locked only to look up or to keep, `bicubic_uncached` is the reference): a scaled layer's six tables cost 0.25 to 0.64 ms
   every frame and now 0.002 to 0.006 (a clone of the cached table). `effects::vignette_map` works each distinct `(|xx|, |yy|)` once
-  (`hypot` takes magnitudes, so the map is symmetric about the centre however the size is odd or even) and a row with a magnitude met
+  (`hypot` takes magnitudes, so the map depends only on the offsets' magnitudes however the size is odd or even) and a row with a magnitude met
   before is copied: 40 to 9 ms at 1080p, 175 to 54 at 4K, once per size; held to the every-sample function bit for bit at odd and even
   sizes.
 - **Pitfall (codegen)**: inside a `#[target_feature]` kernel, `copy_from_slice` or an iterator adapter is a *call* in a release build with
@@ -448,7 +448,9 @@ they are). The kernels live in `kerf-core` (`simd.rs`, `mask_plane.rs`, `mask_pl
   1e-6 threshold and past 1, centres and sizes out of range, inverted) at widths 1 to 67 and 128 / 255 to 257 with heights 1, 2, 3, 18 and 40,
   and at picture sizes, against `reference_plane`, the function as it was before the vector paths, verbatim; `text.rs` cuts a title's
   masks identically on every path. `kerf-core/tests/checker_simd*.rs` (naive loops, misaligned sub-slices, an electric-fence allocator)
-  and `kerf-gpu/tests/checker_simd_cut.rs` (a masked, titled cut per `KERF_SIMD` value; `#[ignore]`d) are the independent checks.
+  and `kerf-gpu/tests/checker_simd_cut.rs` (a masked, titled cut per `KERF_SIMD` value; `#[ignore]`d) are the independent checks;
+  `kerf-gpu/tests/checker_simd2_{memo,memo_bytes,vignette}.rs` hold the memo to `bicubic_uncached` (and its caps, under a counting
+  allocator) and the vignette map to a re-derivation from `vignette.c`; `kerf-core/tests/checker_simd2.rs` checks the rect rows.
 - **NEON is written but has never run**: the byte scans have a NEON path (`vld1q_u8`, `vdupq_n_u8`, `vceqq_u8`, `vminvq_u8` per 16 bytes;
   the block or chunk that differs is searched by the scalar scan). It type-checks and lints clean for `aarch64-unknown-linux-gnu`, and its
   control flow (`first_ne_by_chunks`: blocks, chunks, the overlapping end) is arch-independent and tested with a portable "all equal"; an

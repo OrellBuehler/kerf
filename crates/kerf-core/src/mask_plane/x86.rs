@@ -4,7 +4,7 @@
 //! fused multiply-add) on `N` columns at once: a sample the vector code cannot decide (the band around the
 //! edge, which needs the libm `hypot`) and the columns left over after the last whole group go through
 //! [`Params::px`] itself. A rectangle's row is a byte `min` or `max` of a column's ramp and the row's
-//! (`min_row`, `max_row`: the ramp of the larger offset is the smaller of the two ramps, see `plane`).
+//! (`min_row`, `max_row`: the ramp of the larger offset is the smaller of the two ramps, see [`Params::rect_row`]).
 
 use core::arch::x86_64::*;
 
