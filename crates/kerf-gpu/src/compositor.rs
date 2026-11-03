@@ -194,8 +194,10 @@ struct ComposeParams {
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 struct ConvertParams {
-    coef: [f32; 4],
-    coef2: [f32; 4],
+    /// swscale's x86 `yuv420p -> rgb24` lanes (`grade::X86Kernel::lanes`): `y`, `vr`, `ub`, `vg`.
+    lanes: [i32; 4],
+    /// ... `ug`, `y_offset`, unused.
+    lanes2: [i32; 4],
 }
 
 /// `roundtrip.wgsl`'s uniform.
@@ -338,7 +340,6 @@ pub struct Compositor {
     rt_luma: wgpu::RenderPipeline,
     rt_white: wgpu::RenderPipeline,
     rt_chroma_h: wgpu::RenderPipeline,
-    rt_chroma_v: wgpu::RenderPipeline,
     rt_v_layout: wgpu::BindGroupLayout,
     /// The grade's passes (`grade.wgsl`).
     grade: GradePasses,
@@ -371,6 +372,11 @@ pub struct Compositor {
     /// Whether this FFmpeg places a picture as the model does, when a host pinned it
     /// ([`Compositor::with_placement`]); else measured ([`crate::placement_probe::measured`]).
     placement: Option<crate::placement_probe::Placement>,
+    /// Whether this FFmpeg takes a translucent layer through RGB as the model does, when pinned
+    /// ([`Compositor::with_translucency`]); else measured ([`crate::roundtrip_probe::measured`]).
+    translucency: Option<crate::roundtrip_probe::Translucency>,
+    /// Whether this FFmpeg's `gblur` is the model, when pinned ([`Compositor::with_blur`]); else measured ([`crate::blur_probe::measured`]).
+    blur: Option<crate::blur_probe::Blur>,
     /// The threads FFmpeg's filter graph slices a frame into, when pinned ([`Compositor::with_graph_threads`]);
     /// else they are the graph's the frame stands in for ([`Compositor::graph_threads_for`]).
     graph_threads: Option<u32>,
@@ -603,20 +609,11 @@ struct PreparedText {
     blends: Vec<Blend>,
 }
 
-/// Limited-range YUV -> full-range RGB coefficients for a matrix, `([ky, rv, bu,
-/// gu], gv)`, in the 0..255 domain the final conversion works in.
-fn matrix_coefs(matrix: YuvMatrix) -> ([f32; 4], f32) {
-    let (kr, kb) = matrix.weights();
-    let kg = 1.0 - kr - kb;
-    let chroma_gain = 255.0 / 224.0;
-    let coef = [
-        (255.0 / 219.0) as f32,
-        (2.0 * (1.0 - kr) * chroma_gain) as f32,
-        (2.0 * (1.0 - kb) * chroma_gain) as f32,
-        (-(2.0 * (1.0 - kb) * kb / kg) * chroma_gain) as f32,
-    ];
-    let gv = (-(2.0 * (1.0 - kr) * kr / kg) * chroma_gain) as f32;
-    (coef, gv)
+/// The final conversion's numbers for a matrix: the lanes of swscale's own `yuv420p -> rgb24` kernel on x86 (what the still's PNG and
+/// an export read through), in the order `fs_convert` takes them.
+fn convert_lanes(matrix: YuvMatrix) -> ([i32; 4], [i32; 4]) {
+    let [y, vr, ub, vg, ug, y_offset] = crate::grade::X86Kernel::new(matrix).lanes();
+    ([y, vr, ub, vg], [ug, y_offset, 0, 0])
 }
 
 /// What a composite hands back.
@@ -882,6 +879,16 @@ pub fn prepare(plan: &RenderPlan) {
     if plan.layers.iter().any(|l| !l.blend.is_normal()) {
         let _ = crate::blend::kernels();
     }
+    if plan.layers.iter().any(|l| plan.through_rgba(l)) {
+        let _ = crate::roundtrip_probe::translucency();
+    }
+    if plan.layers.iter().any(|l| {
+        l.effects
+            .iter()
+            .any(|e| matches!(e, VideoEffect::Blur { sigma } if *sigma > 0.0))
+    }) {
+        let _ = crate::blur_probe::blur();
+    }
     prepare_placement(plan);
     if !plan.overlays.is_empty() {
         let _ = crate::text::model();
@@ -910,6 +917,18 @@ pub fn prepare_timeline(timeline: &kerf_core::Timeline) {
     }
     if clips().any(|c| !c.blend_mode.is_normal()) {
         let _ = crate::blend::kernels();
+    }
+    // A layer below full opacity (a still samples a keyed one too) takes the RGB round trip, which is in the caps only once measured.
+    if clips().any(|c| c.transform.opacity < 1.0 || c.is_keyed(kerf_core::Property::Opacity)) {
+        let _ = crate::roundtrip_probe::translucency();
+    }
+    // A blur is in the caps only where this FFmpeg's `gblur` kernel is the recursion the shader reproduces.
+    if clips().any(|c| {
+        c.effects
+            .iter()
+            .any(|e| matches!(e, VideoEffect::Blur { sigma } if *sigma > 0.0))
+    }) {
+        let _ = crate::blur_probe::blur();
     }
     // A moving zoom or position is in the caps only where this FFmpeg places a picture as the model does, and a 4:4:4 / 4:2:2
     // picture under it only where its graph converts it as the decode does (the pixel format is the file's, which a timeline
@@ -1126,6 +1145,8 @@ impl Compositor {
             },
             self.placement.clone().unwrap_or_else(crate::placement_probe::measured),
             self.geq_edge(),
+            self.translucency.clone().unwrap_or_else(crate::roundtrip_probe::measured),
+            self.blur.clone().unwrap_or_else(crate::blur_probe::measured),
         )
     }
 
@@ -1196,6 +1217,8 @@ impl Compositor {
             extras,
             crate::placement_probe::measured(),
             kerf_core::geq_edge_measured(),
+            crate::roundtrip_probe::measured(),
+            crate::blur_probe::measured(),
         )
     }
 
@@ -1222,8 +1245,16 @@ impl Compositor {
         extras: BlendExtras,
         placement: crate::placement_probe::Placement,
         geq: GeqEdge,
+        translucency: crate::roundtrip_probe::Translucency,
+        blur: crate::blur_probe::Blur,
     ) -> GpuCaps {
         let mut caps = Self::CAPS;
+        // `gblur` is drawn only where this FFmpeg's kernel is the fused-multiply-add recursion the shader reproduces.
+        if blur != crate::blur_probe::Blur::Match {
+            caps.effects = caps.effects.without(EffectKinds::BLUR);
+        }
+        // The round trip of a layer below full opacity is drawn only where this FFmpeg's conversions were measured to be the model's.
+        caps.translucent_approximate = translucency != crate::roundtrip_probe::Translucency::Match;
         if kernels != crate::grade::Kernels::Match {
             caps.grade = GradeKinds::NONE;
         }
@@ -1354,6 +1385,25 @@ impl Compositor {
     #[must_use]
     pub fn with_placement(mut self, placement: crate::placement_probe::Placement) -> Self {
         self.placement = Some(placement);
+        self
+    }
+
+    /// Pin whether this FFmpeg takes a translucent layer through RGB and back as the model does, instead of what [`prepare`] measured
+    /// ([`crate::roundtrip_probe::measured`]; a render never runs the probe): for a host that knows its ffmpeg, and for tests.
+    /// Anything but `Match` puts [`GpuCaps::translucent_approximate`] in [`Compositor::caps`], and the render refuses a layer below
+    /// full opacity.
+    #[must_use]
+    pub fn with_translucency(mut self, translucency: crate::roundtrip_probe::Translucency) -> Self {
+        self.translucency = Some(translucency);
+        self
+    }
+
+    /// Pin whether this FFmpeg's `gblur` is the model's, instead of what [`prepare`] measured ([`crate::blur_probe::measured`]; a render
+    /// never runs the probe): for a host that knows its ffmpeg, and for tests. Anything but `Match` takes the blur out of
+    /// [`Compositor::caps`], and the render refuses one.
+    #[must_use]
+    pub fn with_blur(mut self, blur: crate::blur_probe::Blur) -> Self {
+        self.blur = Some(blur);
         self
     }
 
@@ -1540,7 +1590,6 @@ impl Compositor {
             let rt_luma = rt_pipeline("rt luma", &convert_layout, "fs_luma", PLANE_FORMAT);
             let rt_white = rt_pipeline("rt white", &convert_layout, "fs_white", CANVAS_FORMAT);
             let rt_chroma_h = rt_pipeline("rt chroma h", &convert_layout, "fs_chroma_h", CHROMA_FORMAT);
-            let rt_chroma_v = rt_pipeline("rt chroma v", &rt_v_layout, "fs_chroma_v", PLANE_FORMAT);
 
             let grade = GradePasses::new(&g, &rt_shader, &convert_layout, &rt_v_layout);
             let blend = BlendPasses::new(&g);
@@ -1623,7 +1672,6 @@ impl Compositor {
                 rt_luma,
                 rt_white,
                 rt_chroma_h,
-                rt_chroma_v,
                 rt_v_layout,
                 grade,
                 blend,
@@ -1644,6 +1692,8 @@ impl Compositor {
                 convert_kernels: None,
                 blend_kinds: None,
                 placement: None,
+                translucency: None,
+                blur: None,
                 key_terms: OnceLock::new(),
                 graph_threads: None,
             })
@@ -1729,7 +1779,7 @@ impl Compositor {
         });
         let blur_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("kerf blur"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/blur.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(concat!(include_str!("shaders/fma.wgsl"), include_str!("shaders/blur.wgsl")).into()),
         });
         let compute = |label: &str, cs: &str| {
             let pl = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1757,7 +1807,9 @@ impl Compositor {
         });
         let out_module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("kerf blur out"),
-            source: wgpu::ShaderSource::Wgsl(include_str!("shaders/blur_out.wgsl").into()),
+            source: wgpu::ShaderSource::Wgsl(
+                concat!(include_str!("shaders/fma.wgsl"), include_str!("shaders/blur_out.wgsl")).into(),
+            ),
         });
         let blur_out = render("blur out", &out_module, &blur_out_layout, "fs_out");
         let vignette_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1953,6 +2005,14 @@ impl Compositor {
         back: YuvMatrix,
         white: [u32; 2],
     ) -> Result<[Plane; 3], GpuError> {
+        // The round trip is the model's where this FFmpeg's swscale kernels were measured to be (the plan refuses the layer
+        // otherwise; this is the same rule for a caller that did not ask the plan).
+        let measured = self.translucency.clone().unwrap_or_else(crate::roundtrip_probe::measured);
+        if measured != crate::roundtrip_probe::Translucency::Match {
+            return Err(GpuError::Unsupported(format!(
+                "a layer below full opacity: this FFmpeg's RGB round trip is not measured to be the compositor's ({measured:?})"
+            )));
+        }
         let [py, pu, pv] = input;
         let (w, h) = (py.w, py.h);
         let (cw, ch) = (pu.w, pu.h);
@@ -1992,11 +2052,13 @@ impl Compositor {
         let filter = sws::bicubic(h, ch, sws::ONE_VERTICAL)
             .ok_or_else(|| GpuError::Unsupported("a picture too tall for the chroma filter".into()))?;
         let taps = self.filter_texture(&filter);
+        let start = crate::grade::vertical_start(&filter);
         let mut out = Vec::with_capacity(2);
         for channel in 0..2 {
             let p = RoundTripParams {
                 channel,
                 taps: filter.size as i32,
+                start,
                 ..params
             };
             let plane = self.plane(
@@ -2007,7 +2069,7 @@ impl Compositor {
                 wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             );
             let bind = self.rt_bind(&self.rt_v_layout, &p, &[&inter.view, &taps]);
-            self.pass(enc, &self.rt_chroma_v, &plane.view, &bind, None, None);
+            self.pass(enc, &self.grade.chroma_v, &plane.view, &bind, None, None);
             out.push(plane);
         }
         let (Some(v), Some(u)) = (out.pop(), out.pop()) else {
@@ -2929,6 +2991,14 @@ impl Compositor {
                     if g.nu == 0.0 && g.boundary == 1.0 && g.post == 1.0 {
                         continue;
                     }
+                    // The recursion is the model's only where this FFmpeg's `gblur` kernel was measured to be (the plan refuses the
+                    // blur otherwise; this is the same rule for a caller that did not ask the plan).
+                    let measured = self.blur.clone().unwrap_or_else(crate::blur_probe::measured);
+                    if measured != crate::blur_probe::Blur::Match {
+                        return Err(unsupported(format!(
+                            "a blur: this FFmpeg's gblur is not measured to be the compositor's ({measured:?})"
+                        )));
+                    }
                     let limit = self.gpu.device.limits().max_storage_buffer_binding_size;
                     if u64::from(pw) * u64::from(ph) * 4 > limit {
                         return Err(unsupported(format!(
@@ -3265,14 +3335,15 @@ impl Compositor {
             }
             // `colorchannelmixer` leaves RGBA, `rotate` turns it there and the way back to 4:2:0 comes after the turn; the
             // round trip here comes before it, and swscale's chroma pairs two pixels of a row and filters over the rows (a
-            // different sum each way), so after a quarter turn the pairs are other samples (the plan says the same).
+            // different sum each way), so after a quarter turn the pairs are other samples and after a half turn the rows
+            // are filtered the other way round (the plan says the same).
             if geom.translucent
                 && geom
                     .rotation
-                    .is_some_and(|r| kerf_core::quarter_turn(r.angle).is_some_and(|t| t % 2 == 1))
+                    .is_some_and(|r| kerf_core::quarter_turn(r.angle).is_some_and(|t| t != 0))
             {
                 return Err(GpuError::Unsupported(format!(
-                    "layer {n}: a quarter turn of a layer below full opacity (FFmpeg converts the turned RGBA picture to 4:2:0 afterwards: the chroma pairs other samples)"
+                    "layer {n}: a turn of a layer below full opacity (FFmpeg converts the turned RGBA picture to 4:2:0 afterwards: the chroma pairs other samples, and the rows are filtered the other way round)"
                 )));
             }
             // A graded layer the scaler resizes is the export's where the scaler is exact and an `eq` sits between the
@@ -3396,7 +3467,7 @@ impl Compositor {
             });
         }
 
-        let (coef, gv) = matrix_coefs(plan.canvas.matrix);
+        let (lanes, lanes2) = convert_lanes(plan.canvas.matrix);
 
         // The canvas as it was before a layer that blends, made once the first one needs it.
         let mut before: Option<Plane> = None;
@@ -3752,10 +3823,7 @@ impl Compositor {
             CANVAS_FORMAT,
             wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
         );
-        let convert = ConvertParams {
-            coef,
-            coef2: [gv, 0.0, 0.0, 0.0],
-        };
+        let convert = ConvertParams { lanes, lanes2 };
         let buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("convert params"),
             contents: bytemuck::bytes_of(&convert),
@@ -4354,6 +4422,8 @@ mod tests {
             BlendExtras::ALL,
             Placement::Match,
             GeqEdge::Exact,
+            crate::roundtrip_probe::Translucency::Match,
+            crate::blur_probe::Blur::Match,
         )
     }
 
@@ -4476,6 +4546,8 @@ mod tests {
                 BlendExtras::ALL,
                 placement,
                 GeqEdge::Exact,
+                crate::roundtrip_probe::Translucency::Match,
+                crate::blur_probe::Blur::Match,
             )
         };
         assert_eq!(measured(Placement::Match), Compositor::CAPS);
@@ -4552,6 +4624,8 @@ mod tests {
                 BlendExtras::ALL,
                 Placement::Match,
                 edge,
+                crate::roundtrip_probe::Translucency::Match,
+                crate::blur_probe::Blur::Match,
             )
         };
         for edge in [GeqEdge::Exact, GeqEdge::Penultimate] {

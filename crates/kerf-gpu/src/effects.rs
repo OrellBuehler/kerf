@@ -5,11 +5,13 @@
 //! * **blur** is `gblur` (`vf_gblur.c`): a first-order recursive (IIR) Gaussian, run rightwards then
 //!   leftwards along every row and downwards then upwards along every column, on each plane in
 //!   `float`, then scaled and rounded with `lrintf`. [`Gaussian`] holds the three numbers
-//!   `set_params` derives from the sigma, [`blur_plane`] is the filter on one plane. The result
-//!   is FFmpeg's to a level on a handful of samples, not to the bit: the x86 build runs the
-//!   horizontal pass in AVX2 / AVX-512 with another association of the same sums (and a fused
-//!   multiply-add), so FFmpeg's own output depends on the CPU it runs on by the last bits of a
-//!   `float`, which `lrintf` turns into a level where a value sits on a half.
+//!   `set_params` derives from the sigma, [`blur_plane`] is the filter on one plane. **Exact on a
+//!   build that runs `gblur` on AVX2 or AVX-512**, where every step of the recursion is a fused
+//!   multiply-add (`x86/vf_gblur.asm`): the shader does that fusion in integers (`shaders/fma.wgsl`), since
+//!   no backend promises one. FFmpeg's own output depends on the CPU it runs on by the last bits of a
+//!   `float` (an SSE4-only build associates the sums another way, a C one does not fuse), which
+//!   `lrintf` turns into a level where a value sits on a half, so [`crate::blur_probe`] measures
+//!   which this machine's is, and a blur is drawn only on a match.
 //! * **sharpen** is `unsharp` with a 5x5 matrix on luma (`vf_unsharp.c`): integer arithmetic, a
 //!   binomial blur (`[1 4 6 4 1]` in each direction, summed exactly) and `s + (((s - blur) * amount)
 //!   >> 16)`. [`unsharp_amount`] is the integer `amount` the filter derives from the option;
@@ -84,29 +86,32 @@ pub fn gaussian(sigma: f64) -> Option<Gaussian> {
     })
 }
 
-/// `gblur` on one 8-bit plane: the recursion in `float`, in `horiz_slice_c`'s and
-/// `do_vertical_columns`' order, then `postscale`, clip to 0..255, `lrintf`.
+/// `gblur` on one 8-bit plane as an x86 build with AVX2 or AVX-512 runs it: the recursion in `float`, in `horiz_slice`'s and
+/// `verti_slice`'s order, **every step a fused multiply-add** (`vfmadd231ps` in `x86/vf_gblur.asm`: one rounding for the product
+/// and the sum), then `postscale`, clip to 0..255, `lrintf`. Held to the filter over 112 pictures of noise at sigmas from 0.5 to
+/// 1024 on 6.1.1 and 9.0.2 (no sample differs; the unfused order read 597 of them a level off), and what a build whose
+/// `gblur` runs another kernel (SSE4 only, or a C one) does not do: [`crate::blur_probe`] measures it.
 pub fn blur_plane(src: &[u8], w: usize, h: usize, g: &Gaussian) -> Vec<u8> {
     assert_eq!(src.len(), w * h);
     let mut buf: Vec<f32> = src.iter().map(|v| f32::from(*v)).collect();
     for row in buf.chunks_exact_mut(w) {
         row[0] *= g.boundary;
         for x in 1..w {
-            row[x] += g.nu * row[x - 1];
+            row[x] = g.nu.mul_add(row[x - 1], row[x]);
         }
         row[w - 1] *= g.boundary;
         for x in (1..w).rev() {
-            row[x - 1] += g.nu * row[x];
+            row[x - 1] = g.nu.mul_add(row[x], row[x - 1]);
         }
     }
     for x in 0..w {
         buf[x] *= g.boundary;
         for y in 1..h {
-            buf[y * w + x] += g.nu * buf[(y - 1) * w + x];
+            buf[y * w + x] = g.nu.mul_add(buf[(y - 1) * w + x], buf[y * w + x]);
         }
         buf[(h - 1) * w + x] *= g.boundary;
         for y in (1..h).rev() {
-            buf[(y - 1) * w + x] += g.nu * buf[y * w + x];
+            buf[(y - 1) * w + x] = g.nu.mul_add(buf[y * w + x], buf[(y - 1) * w + x]);
         }
     }
     buf.iter()

@@ -50,6 +50,11 @@ impl EffectKinds {
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
     }
+
+    /// The kinds of `self` that are not `other`.
+    pub const fn without(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
 }
 
 /// A set of [`BlendMode`]s: the modes a compositor draws one by one (`Normal` is plain alpha-over, always drawn).
@@ -268,6 +273,12 @@ pub struct GpuCaps {
     pub blend: BlendKinds,
     /// What a blend is drawn for beyond its modes: RGB pictures and a BT.2020 composite (`BlendExtras`).
     pub blend_extras: BlendExtras,
+    /// The compositor's RGB round trip for a layer below full opacity is **not** measured to be this FFmpeg's to the sample (a probe
+    /// that found a difference, could not tell, or has not run): `colorchannelmixer` only takes RGB, so FFmpeg takes the layer
+    /// `yuva420p -> argb -> yuva420p`, and the way back runs on this machine's swscale kernels (x86 SIMD, NEON, plain C: they differ
+    /// by a level of chroma). Every layer that takes the round trip is then refused ([`Unsupported::TranslucentApproximate`]).
+    /// [`GpuCaps::A0`] leaves it off: what A0 draws, it draws as it always did.
+    pub translucent_approximate: bool,
 }
 
 impl GpuCaps {
@@ -296,6 +307,7 @@ impl GpuCaps {
         scaler_approximate: false,
         blend: BlendKinds::NONE,
         blend_extras: BlendExtras::NONE,
+        translucent_approximate: false,
     };
 }
 
@@ -541,6 +553,13 @@ pub enum Unsupported {
     FormatResize(usize, (u32, u32), (u32, u32), String),
     /// The geometry of this layer at this size cannot be placed (`layer`, why).
     Geometry(usize, String),
+    /// A layer below full opacity takes the RGB round trip, and this machine's FFmpeg is not measured to run it as the compositor does
+    /// ([`GpuCaps::translucent_approximate`]).
+    TranslucentApproximate(LayerRef),
+    /// A text overlay is live over a full-range picture in a still, where the composite's colour is negotiated (FFmpeg 9): `drawtext` blends in
+    /// the full-range picture's own range and the range is converted last, where the compositor blends the text into the limited-range composite
+    /// it made first (a level or two of chroma off at the glyph edges).
+    TextOnFullRange(LayerRef),
 }
 
 impl Unsupported {
@@ -606,6 +625,8 @@ impl Unsupported {
             Self::Shrink(..) => "shrink",
             Self::FormatResize(..) => "format_resize",
             Self::Geometry(..) => "geometry",
+            Self::TranslucentApproximate(_) => "translucent_approximate",
+            Self::TextOnFullRange(_) => "text_on_full_range",
         }
     }
 }
@@ -776,6 +797,14 @@ impl fmt::Display for Unsupported {
                 from.0, from.1, to.0, to.1
             ),
             Self::Geometry(n, why) => write!(f, "layer {n}: {why}"),
+            Self::TextOnFullRange(l) => write!(
+                f,
+                "{l}: text over a full-range picture, where FFmpeg 9 blends the text in the picture's own range and converts the range afterwards (the compositor blends it into the limited-range composite)"
+            ),
+            Self::TranslucentApproximate(l) => write!(
+                f,
+                "{l}: opacity below 1 (FFmpeg takes the layer through RGB and back, on swscale kernels this machine's build has not been measured to run as the compositor's round trip does)"
+            ),
         }
     }
 }

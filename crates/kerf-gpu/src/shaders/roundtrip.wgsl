@@ -6,7 +6,7 @@
 //   fs_rgb       Y, U, V  -> R, G, B   swscale's yuv2rgb tables, the layer's matrix
 //   fs_luma      R, G, B  -> Y         the composite's matrix (BT.601 unless negotiated)
 //   fs_chroma_h  R, G, B  -> U, V      sums of horizontal pixel pairs, 15 bits
-//   fs_chroma_v  U, V     -> U, V      swscale's vertical bicubic, 2:1, 12-bit weights
+//   fs_chroma_v_x86 U, V  -> U, V      swscale's vertical bicubic, 2:1, 12-bit weights, in the x86 `yuv2yuvX` kernel
 
 struct P {
     k: vec4<i32>,     // crv, cbu, cgu, cgv: the chroma coefficients, scaled by cy
@@ -119,27 +119,6 @@ fn fs_chroma_h(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     let v = (p.kv.x * s.x + p.kv.y * s.y + p.kv.z * s.z + (256 << 15u) + (1 << 9u)) >> 10u;
     // 15 bits, as the scaler's intermediate (value * 128).
     return vec4<f32>(f32(u * 2), f32(v * 2), 0.0, 1.0);
-}
-
-// t1: the 15-bit chroma (width csize.x, one row per picture row); t2: the filter,
-// one row per output row — the window start, then `taps` 12-bit weights.
-@fragment
-fn fs_chroma_v(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
-    let o = vec2<i32>(frag.xy);
-    let pos = i32(textureLoad(t2, vec2<i32>(0, o.y), 0).r);
-    var acc = 64 << 12u;
-    for (var j = 0; j < p.taps; j = j + 1) {
-        let w = i32(textureLoad(t2, vec2<i32>(1 + j, o.y), 0).r);
-        let r = clamp(pos + j, 0, p.size.y - 1);
-        let s = textureLoad(t1, vec2<i32>(o.x, r), 0);
-        var v = s.r;
-        if (p.channel == 1) {
-            v = s.g;
-        }
-        acc = acc + w * i32(v);
-    }
-    let q = clamp(acc >> 19u, 0, 255);
-    return vec4<f32>(f32(q) / 255.0, 0.0, 0.0, 1.0);
 }
 
 // The vertical pass of the grade's way back (src/grade.rs): swscale's x86 `yuv2yuvX` for every row but the last

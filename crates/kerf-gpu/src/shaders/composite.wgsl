@@ -373,23 +373,26 @@ fn fs_compose_exact(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32
 // ---- convert ----------------------------------------------------------------
 
 struct ConvertParams {
-    coef: vec4<f32>,    // ky, rv, bu, gu   (YUV -> RGB, 0..255 domain)
-    coef2: vec4<f32>,   // gv, bias, 0, 0
+    lanes: vec4<i32>,   // y, vr, ub, vg: swscale's x86 `yuv420p -> rgb24` kernel (src/grade.rs `X86Kernel`)
+    lanes2: vec4<i32>,  // ug, y_offset, 0, 0
 }
 
 @group(0) @binding(0) var<uniform> vp: ConvertParams;
 @group(0) @binding(1) var canvas: texture_2d<f32>;
 
-// The one YUV -> RGB conversion of a frame: limited range, the plan's matrix.
-// (Chroma is already shared by each 2x2 block, which is what swscale's unscaled
-// conversion does: it replicates, it does not interpolate.)
+// The one YUV -> RGB conversion of a frame: limited range, the plan's matrix, in the integers of swscale's own unscaled kernel
+// (`ff_yuv_420_rgb24_ssse3`: `pmulhw` by 13-bit coefficients on 16-bit lanes, `packuswb`), which the still's PNG and an export are
+// read through. (Chroma is already shared by each 2x2 block, which is what that conversion does: it replicates, it does not
+// interpolate.)
 @fragment
 fn fs_convert(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
-    let yuv = round(textureLoad(canvas, vec2<i32>(frag.xy), 0).rgb * 255.0);
-    let yy = vp.coef.x * (yuv.x - 16.0);
-    let r = yy + vp.coef.y * (yuv.z - 128.0);
-    let g = yy + vp.coef.w * (yuv.y - 128.0) + vp.coef2.x * (yuv.z - 128.0);
-    let b = yy + vp.coef.z * (yuv.y - 128.0);
-    let rgb = clamp((vec3<f32>(r, g, b) - vp.coef2.y) / 255.0, vec3<f32>(0.0), vec3<f32>(1.0));
-    return vec4<f32>(rgb, 1.0);
+    let yuv = vec3<i32>(round(textureLoad(canvas, vec2<i32>(frag.xy), 0).rgb * 255.0));
+    let yy = ((yuv.x * 8 - vp.lanes2.y) * vp.lanes.x) >> 16u;
+    let u = yuv.y * 8 - 0x400;
+    let v = yuv.z * 8 - 0x400;
+    let r = yy + ((v * vp.lanes.y) >> 16u);
+    let g = yy + (((u * vp.lanes2.x) >> 16u) + ((v * vp.lanes.w) >> 16u));
+    let b = yy + ((u * vp.lanes.z) >> 16u);
+    let rgb = clamp(vec3<i32>(r, g, b), vec3<i32>(0), vec3<i32>(255));
+    return vec4<f32>(vec3<f32>(rgb) / 255.0, 1.0);
 }

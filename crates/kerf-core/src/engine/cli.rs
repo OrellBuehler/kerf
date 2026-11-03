@@ -9093,7 +9093,7 @@ pub(crate) fn keyed_color_value(clip: &Clip, t: f64) -> Color {
 /// establishes alpha and is emitted separately, after the alpha plane exists).
 fn video_effect_filter(e: &VideoEffect) -> Option<String> {
     Some(match e {
-        VideoEffect::Blur { sigma } => format!("gblur=sigma={}", fnum(*sigma)),
+        VideoEffect::Blur { sigma } => blur_filter(*sigma),
         VideoEffect::Sharpen { amount } => {
             format!("unsharp=luma_msize_x=5:luma_msize_y=5:luma_amount={}", fnum(*amount))
         }
@@ -10269,7 +10269,7 @@ fn video_clip_chain_stamped(
         (None, None) => {}
     }
     if !opacity_keyed && t.opacity < 1.0 {
-        p.push(format!("colorchannelmixer=aa={}", t.opacity));
+        p.push(opacity_filter(t.opacity));
     }
     // Rotation: animated angle expression (degrees → radians), else a constant
     // rotate. Animated rotation uses a fixed bounding box (the frame diagonal).
@@ -11333,7 +11333,7 @@ fn still_clip_chain_graded(
         p.push(mask_filter(mask));
     }
     if tf.opacity < 1.0 {
-        p.push(format!("colorchannelmixer=aa={}", tf.opacity));
+        p.push(opacity_filter(tf.opacity));
     }
     if tf.rotation != 0.0 {
         p.push(static_rotate(tf.rotation, blend.blended));
@@ -11762,6 +11762,17 @@ pub use blend::{blend_colour_graph, blend_probe_graph};
 /// through the blend graph against the plain `overlay` (`#[ignore]`d).
 #[cfg(test)]
 mod blend_rendered;
+
+/// A blur as the graph writes it (`gblur`, one step, the same sigma both ways). For a renderer's probe, which runs the very text.
+pub fn blur_filter(sigma: f64) -> String {
+    format!("gblur=sigma={}", fnum(sigma))
+}
+
+/// A constant opacity below 1 as the graph writes it (export and still alike): `colorchannelmixer` only takes RGB, so FFmpeg takes
+/// the layer `yuva420p -> argb -> yuva420p` around it. For a renderer's probe, which runs the very text.
+pub fn opacity_filter(opacity: f64) -> String {
+    format!("colorchannelmixer=aa={opacity}")
+}
 
 /// The filters of a clip's grade as the graph writes them, in chain order, for frames tagged `frame_matrix`
 /// (`None`: untagged): `lut3d`, `lutrgb`, `colorbalance`, and for a tagged picture the `scale` / `format` /

@@ -82,6 +82,9 @@ fn compositor() -> &'static Compositor {
         let _ = kerf_gpu::conversion::conversion();
         // ... and whether this FFmpeg places a picture as the model does (the moving zoom and position are in the caps only then).
         let _ = kerf_gpu::placement_probe::placement();
+        // ... and whether it takes a translucent layer through RGB, and blurs, as the model does (a layer below full opacity and a blur are in the caps only then).
+        let _ = kerf_gpu::roundtrip_probe::translucency();
+        let _ = kerf_gpu::blur_probe::blur();
         // ... and so is the layout of its `drawtext`, which decides whether text whose bitmaps share samples is drawn.
         let _ = kerf_gpu::text::model();
         // ...and the blend chain's, which the blend modes are in the caps by.
@@ -436,69 +439,7 @@ fn export(slug: &str, tl: &Timeline, assets: &[Asset], opts: &ExportOptions) -> 
 
 // ---- the comparison ------------------------------------------------------------------------
 
-/// How far a plane may be from the export's, in levels of 255.
-#[derive(Clone, Copy)]
-struct Limits {
-    y: i32,
-    uv: i32,
-    /// The bound is the scaler's one level alone ([`SCALED`]): where the scaler is measured exact it is [`EXACT`].
-    scaler_only: bool,
-}
-
-/// Exact: the planes the export wrote.
-const EXACT: Limits = Limits {
-    y: 0,
-    uv: 0,
-    scaler_only: false,
-};
-
-/// One level: a layer the compositor scales, **on a machine whose scaler is not measured to be swscale's** (the C kernel
-/// the shader has always followed is a level from an x86 build's, `scaler.rs`); where the probe says the scaler is the
-/// model's (both FFmpegs on x86-64) a case that names this bound is held to [`EXACT`] ([`check_motion`] tightens it): the
-/// fades, the alpha ramp and the blend on top of it add nothing.
-const SCALED: Limits = Limits {
-    y: 1,
-    uv: 1,
-    scaler_only: true,
-};
-
-/// A translucent layer: the RGB round trip `colorchannelmixer` makes it take (`roundtrip.rs`: luma
-/// exact, chroma within one level of swscale's x86 vertical scaler) and a blend on top.
-const TRANSLUCENT: Limits = Limits {
-    y: 0,
-    uv: 1,
-    scaler_only: false,
-};
-
-/// Two levels: a translucent layer the compositor also scales (the 2:1 shrink of an HD picture into
-/// the canvas): the scaler's one level and the round trip's.
-const HD_TRANSLUCENT: Limits = Limits {
-    y: 2,
-    uv: 2,
-    scaler_only: false,
-};
-
-/// Two levels: a layer the compositor scales *and* grades, with tables that step by at most two between neighbouring entries
-/// (`eq::table_steps`, `MAX_AMPLIFIED_ERROR`). The scaler's one level (`SCALED`) is mapped through the tables, so a pair of
-/// values a level apart come out as far apart as the tables' steepest step; the plan draws the frames inside that bound and
-/// refuses the others (`GradeSteep`: contrast past 2, saturation past 2, gamma past about 1.2, a black point parked above 0 under a
-/// gamma above 1; measured Y 3 to 19 and UV 3 on them), exact or not. A bound the grade is judged by, not a number measured and blessed.
-const GRADED_SCALED: Limits = Limits {
-    y: 2,
-    uv: 2,
-    scaler_only: false,
-};
-
-/// A dip to white: exact on the pictures it is drawn for (8-bit limited-range 4:2:0, untagged or BT.709) — test patterns and
-/// noise in all three planes, identically on 6.1.1 and 9.0.2, where the probe says FFmpeg converts to and from RGB as the grade
-/// does ([`kerf_gpu::grade::Kernels::Match`]: x86-64 here, the arm64 kernel is not). `fade c=white` only takes RGB, so FFmpeg
-/// converts `yuv420p -> rgb24 -> yuv420p` around it: in by swscale's x86 kernel and out by the generic scaler, the conversions of
-/// the grade, which the compositor runs around the fade. (It used to follow the C tables the translucent round trip is exact
-/// against, which are 2 levels from the kernel's, and this was a bound of 2: a dip drawn within a bound is not drawn.)
-const WHITE: Limits = EXACT;
-
-/// A BT.709-tagged picture in a dip to white (both clips tagged): the same conversions read through BT.709's coefficients, exact.
-const WHITE_709: Limits = EXACT;
+// Every drawn frame is held to the export with **no tolerance**: 0 differing samples in Y, U and V. There is no bound a case can name.
 
 #[derive(Default, Clone, Copy)]
 struct PlaneStats {
@@ -605,7 +546,6 @@ struct Check<'a> {
     opts: ExportOptions,
     /// The output frames to compare.
     frames: Range<u64>,
-    limits: Limits,
     /// Frames to write a montage of (and every frame over the bound).
     look: &'a [u64],
     /// The frames the plan refuses for this reason (FFmpeg draws them) are not compared, and at
@@ -625,16 +565,9 @@ fn check_motion(check: Check) -> (i32, i32) {
         assets,
         opts,
         frames,
-        limits,
         look,
         refusing,
     } = check;
-    // A layer the compositor scales is exact where the scaler is swscale's to the level (the probe measured it).
-    let limits = if limits.scaler_only && kerf_gpu::scaler::kernels().exact() {
-        EXACT
-    } else {
-        limits
-    };
     let slug: String = case
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
@@ -679,7 +612,7 @@ fn check_motion(check: Check) -> (i32, i32) {
             PlaneStats::of(want[2], got[2]),
         );
         let (my, muv) = (y.max, u.max.max(v.max));
-        if my > limits.y || muv > limits.uv {
+        if my > 0 || muv > 0 {
             worst.push((k, my, muv));
         }
         ys.add(y);
@@ -720,18 +653,13 @@ fn check_motion(check: Check) -> (i32, i32) {
     write_report();
     if std::env::var_os("KERF_PARITY_EXPLORE").is_some() {
         for (k, y, uv) in worst.iter().take(4) {
-            eprintln!(
-                "WOULD FAIL: {case} frame {k}: Y {y} (<= {}), UV {uv} (<= {})",
-                limits.y, limits.uv
-            );
+            eprintln!("WOULD FAIL: {case} frame {k}: Y {y} (max 0), UV {uv} (max 0)");
         }
         return (ys.max, uv.max);
     }
     assert!(
         worst.is_empty(),
-        "{case}: frames over the bound (Y <= {}, UV <= {}): {:?} (montages in target/parity/motion)",
-        limits.y,
-        limits.uv,
+        "{case}: frames that differ from the export (Y 0, UV 0): {:?} (montages in target/parity/motion)",
         &worst[..worst.len().min(12)]
     );
     (ys.max, uv.max)
@@ -741,7 +669,7 @@ fn check_motion(check: Check) -> (i32, i32) {
 /// (a `perspective`), which the compositor reproduces (`kerf_core::perspective`, `placement.wgsl`): exact,
 /// every plane of every frame.
 fn run_placed(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, secs: f64) {
-    run(case, tl, assets, fps, secs, EXACT);
+    run(case, tl, assets, fps, secs);
 }
 
 /// A plan the compositor must refuse, for `reason`, at every frame of the range — with FFmpeg's
@@ -909,28 +837,26 @@ fn look_at(secs: f64, fps: f64) -> Vec<u64> {
     }
 }
 
-fn run(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, secs: f64, limits: Limits) {
+fn run(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, secs: f64) {
     check_motion(Check {
         case,
         tl,
         assets,
         opts: at_fps(fps),
         frames: upto(secs, fps),
-        limits,
         look: &look_at(secs, fps),
         refusing: None,
     });
 }
 
 /// [`run`] over the output frames `frames`.
-fn run_range(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, frames: Range<u64>, limits: Limits) {
+fn run_range(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, frames: Range<u64>) {
     check_motion(Check {
         case,
         tl,
         assets,
         opts: at_fps(fps),
         frames,
-        limits,
         look: &[],
         refusing: None,
     });
@@ -977,14 +903,13 @@ fn full_range_resized_refused() -> Refusing {
 
 /// [`run`] for a case about a refusal: the frames the plan refuses for it are FFmpeg's, the
 /// others are compared with the export as usual.
-fn run_refusing(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, secs: f64, limits: Limits, reason: &Refusing) {
+fn run_refusing(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, secs: f64, reason: &Refusing) {
     check_motion(Check {
         case,
         tl,
         assets,
         opts: at_fps(fps),
         frames: upto(secs, fps),
-        limits,
         look: &[],
         refusing: Some(reason),
     });
@@ -998,7 +923,7 @@ fn export_frames_are_drawn_without_a_transition() {
     // and the pick says which.
     for fps in [30.0, 24.0, 25.0, 29.97, 60.0] {
         let (tl, assets) = pair(m, None, 0.0, 1.0);
-        run(&format!("plain/cut @{fps}"), &tl, &assets, fps, 2.0, EXACT);
+        run(&format!("plain/cut @{fps}"), &tl, &assets, fps, 2.0);
     }
     // A 25 fps source in a 30 fps cut, and the reverse.
     let tl = timeline(
@@ -1006,8 +931,8 @@ fn export_frames_are_drawn_without_a_transition() {
         None,
     );
     let assets = [m.testsrc25.clone(), m.testsrc.clone()];
-    run("plain/25-then-30 @30", &tl, &assets, 30.0, 2.0, EXACT);
-    run("plain/25-then-30 @25", &tl, &assets, 25.0, 2.0, EXACT);
+    run("plain/25-then-30 @30", &tl, &assets, 30.0, 2.0);
+    run("plain/25-then-30 @25", &tl, &assets, 25.0, 2.0);
     // Speed, in both directions, and reversed.
     let mut fast = clip(&m.testsrc, 0.5, 2.5, 0.0);
     fast.speed = 2.0;
@@ -1017,15 +942,15 @@ fn export_frames_are_drawn_without_a_transition() {
     back.speed = -1.0;
     let tl = timeline(vec![vec![fast, slow, back]], None);
     let assets = [m.testsrc.clone()];
-    run("plain/speed-2-0.5-reversed", &tl, &assets, 30.0, 3.0, EXACT);
-    run("plain/speed-2-0.5-reversed @24", &tl, &assets, 24.0, 3.0, EXACT);
+    run("plain/speed-2-0.5-reversed", &tl, &assets, 30.0, 3.0);
+    run("plain/speed-2-0.5-reversed @24", &tl, &assets, 24.0, 3.0);
     // A still image is a stream like another one in the export.
     let tl = timeline(
         vec![vec![clip(&m.image, 0.0, 1.0, 0.0), clip(&m.testsrc, 0.5, 1.5, 1.0)]],
         None,
     );
     let assets = [m.image.clone(), m.testsrc.clone()];
-    run("plain/still-image", &tl, &assets, 30.0, 2.0, EXACT);
+    run("plain/still-image", &tl, &assets, 30.0, 2.0);
     // A smaller layer over another track, and a graded one.
     let mut pip = clip(&m.testsrc, 0.5, 1.5, 0.2);
     pip.transform.scale = 0.4;
@@ -1039,7 +964,7 @@ fn export_frames_are_drawn_without_a_transition() {
     };
     let tl = timeline(vec![vec![graded], vec![pip]], None);
     let assets = [m.bars.clone(), m.testsrc.clone()];
-    run("plain/pip-over-graded", &tl, &assets, 30.0, 1.2, SCALED);
+    run("plain/pip-over-graded", &tl, &assets, 30.0, 1.2);
 }
 
 #[test]
@@ -1063,28 +988,28 @@ fn a_late_starting_source_is_drawn_as_the_export_draws_it() {
     // picture.
     for fps in [30.0, 25.0] {
         let (tl, assets) = over(&|_| {});
-        run(&format!("late/head @{fps}"), &tl, &assets, fps, 1.5, EXACT);
+        run(&format!("late/head @{fps}"), &tl, &assets, fps, 1.5);
     }
     let (tl, assets) = over(&|c| c.source_in = 0.15);
-    run("late/inside-the-lead", &tl, &assets, 30.0, 1.5, EXACT);
+    run("late/inside-the-lead", &tl, &assets, 30.0, 1.5);
     let (tl, assets) = over(&|c| c.source_in = 0.6);
-    run("late/past-the-lead", &tl, &assets, 30.0, 0.9, EXACT);
+    run("late/past-the-lead", &tl, &assets, 30.0, 0.9);
     let (tl, assets) = over(&|c| {
         c.source_out = 3.0;
         c.speed = 2.0;
     });
-    run("late/speed-2", &tl, &assets, 30.0, 1.5, EXACT);
+    run("late/speed-2", &tl, &assets, 30.0, 1.5);
     let (tl, assets) = over(&|c| {
         c.source_out = 0.75;
         c.speed = 0.5;
     });
-    run("late/speed-0.5", &tl, &assets, 30.0, 1.5, EXACT);
+    run("late/speed-0.5", &tl, &assets, 30.0, 1.5);
     let (tl, assets) = over(&|c| c.speed = -1.0);
-    run("late/reversed", &tl, &assets, 30.0, 1.5, EXACT);
+    run("late/reversed", &tl, &assets, 30.0, 1.5);
     // A fade-in from the first picture, at 30 fps and at 25, where the 0.3 s lead is half a frame.
     for fps in [30.0, 25.0] {
         let (tl, assets) = over(&|c| c.fade_in = 0.4);
-        run(&format!("late/fade-in @{fps}"), &tl, &assets, fps, 1.5, EXACT);
+        run(&format!("late/fade-in @{fps}"), &tl, &assets, fps, 1.5);
     }
     // Entering through a dissolve (the ramp from the first picture to the end of the outgoing
     // tail), one no longer than the lead (no ramp: the picture comes in whole once the tail is
@@ -1102,7 +1027,7 @@ fn a_late_starting_source_is_drawn_as_the_export_draws_it() {
     ] {
         for fps in [30.0, 25.0] {
             let (tl, assets) = enter(kind, secs);
-            run(&format!("late/{name} @{fps}"), &tl, &assets, fps, 2.0, EXACT);
+            run(&format!("late/{name} @{fps}"), &tl, &assets, fps, 2.0);
         }
     }
 }
@@ -1120,18 +1045,18 @@ fn clip_fades_are_drawn_as_the_export_draws_them() {
     };
     for fps in [24.0, 25.0, 29.97, 30.0, 60.0] {
         let (tl, assets) = one(0.4, 0.3, &|_| {});
-        run(&format!("fade/in+out @{fps}"), &tl, &assets, fps, 1.0, EXACT);
+        run(&format!("fade/in+out @{fps}"), &tl, &assets, fps, 1.0);
     }
     // A fade of a frame, of an odd length, and longer than the clip (clamped to it).
     let (tl, assets) = one(1.0 / 30.0, 0.0333, &|_| {});
-    run("fade/one-frame", &tl, &assets, 30.0, 1.0, EXACT);
+    run("fade/one-frame", &tl, &assets, 30.0, 1.0);
     let (tl, assets) = one(0.61, 0.0, &|_| {});
-    run("fade/0.61s @30", &tl, &assets, 30.0, 1.0, EXACT);
+    run("fade/0.61s @30", &tl, &assets, 30.0, 1.0);
     let (tl, assets) = one(5.0, 0.0, &|_| {});
-    run("fade/longer-than-the-clip", &tl, &assets, 30.0, 1.0, EXACT);
+    run("fade/longer-than-the-clip", &tl, &assets, 30.0, 1.0);
     // The fade-in and the fade-out overlap on a clip shorter than the two.
     let (tl, assets) = one(0.8, 0.8, &|_| {});
-    run("fade/overlapping-in-and-out", &tl, &assets, 30.0, 1.0, EXACT);
+    run("fade/overlapping-in-and-out", &tl, &assets, 30.0, 1.0);
     // Under a graded, a sped-up and a reversed clip: the fade is the last stage but the pick.
     let (tl, assets) = one(0.4, 0.3, &|c| {
         c.color = Color {
@@ -1140,14 +1065,14 @@ fn clip_fades_are_drawn_as_the_export_draws_them() {
             ..Color::default()
         }
     });
-    run("fade/graded", &tl, &assets, 30.0, 1.0, EXACT);
+    run("fade/graded", &tl, &assets, 30.0, 1.0);
     let (tl, assets) = one(0.3, 0.3, &|c| {
         c.source_out = 2.5;
         c.speed = 2.0;
     });
-    run("fade/speed-2", &tl, &assets, 30.0, 1.0, EXACT);
+    run("fade/speed-2", &tl, &assets, 30.0, 1.0);
     let (tl, assets) = one(0.3, 0.3, &|c| c.speed = -1.0);
-    run("fade/reversed", &tl, &assets, 30.0, 1.0, EXACT);
+    run("fade/reversed", &tl, &assets, 30.0, 1.0);
     // A smaller layer over another: the fade is the layer's, the layer below is not touched.
     let under = clip(&m.bars, 0.5, 1.5, 0.0);
     let mut over = clip(&m.testsrc, 0.5, 1.5, 0.0);
@@ -1156,14 +1081,14 @@ fn clip_fades_are_drawn_as_the_export_draws_them() {
     over.fade_out = 0.4;
     let tl = timeline(vec![vec![under], vec![over]], None);
     let assets = [m.bars.clone(), m.testsrc.clone()];
-    run("fade/small-layer-over-another", &tl, &assets, 30.0, 1.0, SCALED);
+    run("fade/small-layer-over-another", &tl, &assets, 30.0, 1.0);
     // A letterboxed layer: `pad`'s bars are in the picture that fades.
     let mut tall = clip(&m.portrait, 0.5, 1.5, 0.0);
     tall.fade_in = 0.4;
     tall.fade_out = 0.4;
     let tl = timeline(vec![vec![tall]], Some(Delivery::new(640, 360, Fit::Contain)));
     let assets = [m.portrait.clone()];
-    run("fade/letterboxed", &tl, &assets, 30.0, 1.0, SCALED);
+    run("fade/letterboxed", &tl, &assets, 30.0, 1.0);
 }
 
 #[test]
@@ -1172,15 +1097,15 @@ fn dips_are_drawn_as_the_export_draws_them() {
     let m = media();
     for fps in [24.0, 25.0, 29.97, 30.0, 60.0] {
         let (tl, assets) = pair(m, Some(TransitionKind::DipToBlack), 0.8, 1.0);
-        run(&format!("dip/black covering @{fps}"), &tl, &assets, fps, 2.0, EXACT);
+        run(&format!("dip/black covering @{fps}"), &tl, &assets, fps, 2.0);
     }
     // The incoming clip smaller than the frame: the outgoing one fades out under nothing.
     let (tl, assets) = pair(m, Some(TransitionKind::DipToBlack), 0.8, 0.5);
-    run("dip/black partial", &tl, &assets, 30.0, 2.0, SCALED);
+    run("dip/black partial", &tl, &assets, 30.0, 2.0);
     // A dip of a frame, of an odd length and one longer than either clip.
     for (name, secs) in [("one-frame", 1.0 / 30.0), ("0.61s", 0.61), ("2s", 2.0)] {
         let (tl, assets) = pair(m, Some(TransitionKind::DipToBlack), secs, 1.0);
-        run(&format!("dip/black {name}"), &tl, &assets, 30.0, 2.0, EXACT);
+        run(&format!("dip/black {name}"), &tl, &assets, 30.0, 2.0);
     }
     // A dip beside the clips' own fades, and over another track (the track below shows through).
     let mut out = clip(&m.bars, 0.5, 1.5, 0.0);
@@ -1193,13 +1118,13 @@ fn dips_are_drawn_as_the_export_draws_them() {
     inc.fade_out = 0.4;
     let tl = timeline(vec![vec![out, inc]], None);
     let assets = [m.bars.clone(), m.testsrc.clone()];
-    run("dip/black with the clips' own fades", &tl, &assets, 30.0, 2.0, EXACT);
+    run("dip/black with the clips' own fades", &tl, &assets, 30.0, 2.0);
     let base = clip(&m.bars, 0.5, 1.5, 0.0);
     let (over, assets) = pair(m, Some(TransitionKind::DipToBlack), 0.6, 0.6);
     let mut tracks = vec![vec![base, clip(&m.bars, 0.5, 1.5, 1.0)]];
     tracks.extend(over.tracks.iter().map(|t| t.clips.clone()));
     let tl = timeline(tracks, None);
-    run("dip/black over another track", &tl, &assets, 30.0, 2.0, SCALED);
+    run("dip/black over another track", &tl, &assets, 30.0, 2.0);
 }
 
 #[test]
@@ -1208,16 +1133,16 @@ fn dissolves_are_drawn_as_the_export_draws_them() {
     let m = media();
     for fps in [24.0, 25.0, 29.97, 30.0, 60.0] {
         let (tl, assets) = pair(m, Some(TransitionKind::Crossfade), 0.61, 1.0);
-        run(&format!("dissolve/covering @{fps}"), &tl, &assets, fps, 2.0, EXACT);
+        run(&format!("dissolve/covering @{fps}"), &tl, &assets, fps, 2.0);
     }
     // The incoming clip smaller than the frame: the outgoing clip plays on around it, past the ramp.
     for fps in [24.0, 30.0] {
         let (tl, assets) = pair(m, Some(TransitionKind::Crossfade), 0.61, 0.5);
-        run(&format!("dissolve/partial @{fps}"), &tl, &assets, fps, 2.0, SCALED);
+        run(&format!("dissolve/partial @{fps}"), &tl, &assets, fps, 2.0);
     }
     for (name, secs) in [("one-frame", 1.0 / 30.0), ("0.5s", 0.5), ("1s", 1.0)] {
         let (tl, assets) = pair(m, Some(TransitionKind::Crossfade), secs, 1.0);
-        run(&format!("dissolve/{name}"), &tl, &assets, 30.0, 2.0, EXACT);
+        run(&format!("dissolve/{name}"), &tl, &assets, 30.0, 2.0);
     }
     // Up from black: no clip before it to cross.
     let mut inc = clip(&m.testsrc, 0.5, 1.5, 0.0);
@@ -1226,7 +1151,7 @@ fn dissolves_are_drawn_as_the_export_draws_them() {
         duration: 0.5,
     });
     let tl = timeline(vec![vec![inc]], None);
-    run("dissolve/from-black", &tl, std::slice::from_ref(&m.testsrc), 30.0, 1.0, EXACT);
+    run("dissolve/from-black", &tl, std::slice::from_ref(&m.testsrc), 30.0, 1.0);
     // The outgoing clip reversed (its tail plays below its in point) and the incoming one sped up.
     let mut out = clip(&m.bars, 0.5, 1.5, 0.0);
     out.speed = -1.0;
@@ -1243,7 +1168,6 @@ fn dissolves_are_drawn_as_the_export_draws_them() {
         &[m.bars.clone(), m.testsrc.clone()],
         30.0,
         2.0,
-        EXACT,
     );
     // A dissolve and then a fade out of the same clip: its chain is on an alpha plane from the dissolve
     // on, where `fade` takes a black of 0 and not 16.
@@ -1261,7 +1185,6 @@ fn dissolves_are_drawn_as_the_export_draws_them() {
         &[m.bars.clone(), m.testsrc.clone()],
         30.0,
         2.0,
-        EXACT,
     );
     // Three clips, two dissolves, the middle one entered and left through them.
     let a = clip(&m.bars, 0.5, 1.5, 0.0);
@@ -1277,7 +1200,7 @@ fn dissolves_are_drawn_as_the_export_draws_them() {
     });
     let tl = timeline(vec![vec![a, b, c]], None);
     let assets = [m.bars.clone(), m.testsrc.clone(), m.testsrc25.clone()];
-    run("dissolve/chained", &tl, &assets, 30.0, 3.0, EXACT);
+    run("dissolve/chained", &tl, &assets, 30.0, 3.0);
     // Still images either side: a still loops, so its handle never runs out.
     let mut inc = clip(&m.image, 0.0, 1.0, 1.0);
     inc.transition_in = Some(Transition {
@@ -1291,7 +1214,6 @@ fn dissolves_are_drawn_as_the_export_draws_them() {
         &[m.bars.clone(), m.image.clone()],
         30.0,
         2.0,
-        EXACT,
     );
     let mut inc = clip(&m.testsrc, 0.5, 1.5, 1.0);
     inc.transition_in = Some(Transition {
@@ -1305,7 +1227,6 @@ fn dissolves_are_drawn_as_the_export_draws_them() {
         &[m.image.clone(), m.testsrc.clone()],
         30.0,
         2.0,
-        EXACT,
     );
     // The outgoing clip sped up: its tail is the handle at its own speed.
     let mut out = clip(&m.bars, 0.5, 2.5, 0.0);
@@ -1322,7 +1243,6 @@ fn dissolves_are_drawn_as_the_export_draws_them() {
         &[m.bars.clone(), m.testsrc.clone()],
         30.0,
         2.0,
-        EXACT,
     );
     // No handle to borrow (the outgoing clip ends on the last frame of its footage): a hard cut.
     let mut inc = clip(&m.testsrc, 0.5, 1.5, 1.0);
@@ -1331,14 +1251,7 @@ fn dissolves_are_drawn_as_the_export_draws_them() {
         duration: 0.5,
     });
     let tl = timeline(vec![vec![clip(&m.bars, 3.0, 4.0, 0.0), inc]], None);
-    run(
-        "dissolve/no-handle",
-        &tl,
-        &[m.bars.clone(), m.testsrc.clone()],
-        30.0,
-        2.0,
-        EXACT,
-    );
+    run("dissolve/no-handle", &tl, &[m.bars.clone(), m.testsrc.clone()], 30.0, 2.0);
     // Over another track: the track below shows through the ramp and around the layer.
     let base = clip(&m.testsrc25, 0.5, 2.5, 0.0);
     let (over, mut assets) = pair(m, Some(TransitionKind::Crossfade), 0.6, 0.6);
@@ -1346,7 +1259,7 @@ fn dissolves_are_drawn_as_the_export_draws_them() {
     tracks.extend(over.tracks.iter().map(|t| t.clips.clone()));
     let tl = timeline(tracks, None);
     assets.push(m.testsrc25.clone());
-    run("dissolve/over-another-track", &tl, &assets, 30.0, 2.0, SCALED);
+    run("dissolve/over-another-track", &tl, &assets, 30.0, 2.0);
 }
 
 #[test]
@@ -1364,22 +1277,22 @@ fn slides_and_pushes_are_drawn_as_the_export_draws_them() {
         TransitionKind::PushDown,
     ];
     for kind in kinds {
-        for (cover, scale, limits) in [("covering", 1.0, EXACT), ("partial", 0.5, SCALED)] {
+        for (cover, scale) in [("covering", 1.0), ("partial", 0.5)] {
             let (tl, assets) = pair(m, Some(kind), 0.5, scale);
-            run(&format!("{}/{cover}", kind.as_str()), &tl, &assets, 30.0, 2.0, limits);
+            run(&format!("{}/{cover}", kind.as_str()), &tl, &assets, 30.0, 2.0);
         }
     }
     // The other rates, an odd length, a frame, and a travel longer than the frame can show.
     for fps in [24.0, 25.0, 29.97, 60.0] {
         for kind in [TransitionKind::SlideLeft, TransitionKind::PushUp] {
             let (tl, assets) = pair(m, Some(kind), 0.61, 1.0);
-            run(&format!("{}/0.61s @{fps}", kind.as_str()), &tl, &assets, fps, 2.0, EXACT);
+            run(&format!("{}/0.61s @{fps}", kind.as_str()), &tl, &assets, fps, 2.0);
         }
     }
     for (name, secs) in [("one-frame", 1.0 / 30.0), ("1s", 1.0)] {
         for kind in [TransitionKind::SlideDown, TransitionKind::PushRight] {
             let (tl, assets) = pair(m, Some(kind), secs, 1.0);
-            run(&format!("{}/{name}", kind.as_str()), &tl, &assets, 30.0, 2.0, EXACT);
+            run(&format!("{}/{name}", kind.as_str()), &tl, &assets, 30.0, 2.0);
         }
     }
     // A slide into a clip with its own fade-in and a translucent one.
@@ -1397,7 +1310,6 @@ fn slides_and_pushes_are_drawn_as_the_export_draws_them() {
         &[m.bars.clone(), m.testsrc.clone()],
         30.0,
         2.0,
-        EXACT,
     );
     // ... into a translucent clip: the round trip, then the travel (partly off the canvas) blended in integers.
     let out = clip(&m.bars, 0.5, 1.5, 0.0);
@@ -1414,7 +1326,6 @@ fn slides_and_pushes_are_drawn_as_the_export_draws_them() {
         &[m.bars.clone(), m.testsrc.clone()],
         30.0,
         2.0,
-        TRANSLUCENT,
     );
 }
 
@@ -1424,7 +1335,7 @@ fn dips_to_white_are_drawn_through_the_rgb_round_trip() {
     let m = media();
     for fps in [24.0, 30.0] {
         let (tl, assets) = pair(m, Some(TransitionKind::DipToWhite), 0.8, 1.0);
-        run(&format!("dip/white covering @{fps}"), &tl, &assets, fps, 2.0, WHITE);
+        run(&format!("dip/white covering @{fps}"), &tl, &assets, fps, 2.0);
     }
     // Noise in every plane: every Y, U, V combination, the clipped RGB ones included.
     let mut out = clip(&m.noise, 0.5, 1.5, 0.0);
@@ -1435,7 +1346,7 @@ fn dips_to_white_are_drawn_through_the_rgb_round_trip() {
         duration: 0.8,
     });
     let tl = timeline(vec![vec![out, inc]], None);
-    run("dip/white noise", &tl, std::slice::from_ref(&m.noise), 30.0, 2.0, WHITE);
+    run("dip/white noise", &tl, std::slice::from_ref(&m.noise), 30.0, 2.0);
 }
 
 #[test]
@@ -1462,7 +1373,6 @@ fn the_shapes_of_a_real_cut_are_drawn_as_the_export_draws_them() {
         &[m.bars.clone(), m.testsrc.clone()],
         30.0,
         2.0,
-        EXACT,
     );
 
     // The montage of the coverage report: a dissolve, a dip and a slide, graded, in a 16:9 frame the
@@ -1476,7 +1386,7 @@ fn the_shapes_of_a_real_cut_are_drawn_as_the_export_draws_them() {
     ];
     // (The scaler is one level off on its own; the contrast of a grade scales that difference, so
     // graded and scaled is two.)
-    for (name, graded, limits) in [("ungraded", false, SCALED), ("graded", true, GRADED_SCALED)] {
+    for (name, graded) in [("ungraded", false), ("graded", true)] {
         let mut clips = Vec::new();
         for (i, kind) in kinds.iter().enumerate() {
             let mut c = clip(&m.testsrc, 0.3 + 0.2 * i as f64, 1.8 + 0.2 * i as f64, 1.5 * i as f64);
@@ -1499,7 +1409,6 @@ fn the_shapes_of_a_real_cut_are_drawn_as_the_export_draws_them() {
             std::slice::from_ref(&m.testsrc),
             30.0,
             7.5,
-            limits,
         );
     }
 
@@ -1521,7 +1430,6 @@ fn the_shapes_of_a_real_cut_are_drawn_as_the_export_draws_them() {
         std::slice::from_ref(&m.testsrc),
         30.0,
         3.0,
-        SCALED,
     );
 
     // A title over a dissolve: the text is on `between(t, start, end)` in an export, end included.
@@ -1529,7 +1437,7 @@ fn the_shapes_of_a_real_cut_are_drawn_as_the_export_draws_them() {
     let mut title = kerf_core::TextOverlay::new("Summer 2026", 0.5, 1.5);
     title.bg = Some("black@0.5".into());
     tl.overlays.push(title);
-    run("text/over a dissolve", &tl, &assets, 30.0, 2.0, EXACT);
+    run("text/over a dissolve", &tl, &assets, 30.0, 2.0);
 }
 
 /// A family installed here with no bold face (a bold request in it is `drawtext` thickened with a border).
@@ -1572,7 +1480,7 @@ fn text_whose_bitmaps_share_samples_in_an_export_frame() {
         (o.size, o.pos_x, o.pos_y, o.bg) = (size / 360.0, 0.37, 0.93, bg.map(String::from));
         o.color = "white@0.8".into();
         tl.overlays.push(o);
-        run(&format!("text/{name}, over a fade"), &tl, one, 30.0, 2.0, EXACT);
+        run(&format!("text/{name}, over a fade"), &tl, one, 30.0, 2.0);
     }
     // A caption fading in and sliding up, small and thickened.
     let mut tl = base();
@@ -1580,7 +1488,7 @@ fn text_whose_bitmaps_share_samples_in_an_export_frame() {
     o.size = 10.0 / 360.0;
     o.keyframes = vec![key(0.0, 0.9, 0.0), key(0.5, 0.8, 1.0), key(1.7, 0.8, 1.0)];
     tl.overlays.push(o);
-    run("text/small, sliding and fading", &tl, one, 30.0, 2.0, EXACT);
+    run("text/small, sliding and fading", &tl, one, 30.0, 2.0);
     match regular_only_family() {
         None => eprintln!("SKIPPED the synthetic-bold export cases: every installed family has a bold face"),
         Some(family) => {
@@ -1597,7 +1505,7 @@ fn text_whose_bitmaps_share_samples_in_an_export_frame() {
                     o.keyframes = vec![key(0.0, 0.9, 0.0), key(0.4, 0.5, 1.0), key(1.6, 0.4, 1.0)];
                 }
                 tl.overlays.push(o);
-                run(&format!("text/bold-border {name}, over a fade"), &tl, one, 30.0, 2.0, EXACT);
+                run(&format!("text/bold-border {name}, over a fade"), &tl, one, 30.0, 2.0);
             }
             eprintln!("synthetic bold in {family}");
         }
@@ -1628,14 +1536,7 @@ fn keyframed_position_and_rotation_in_an_export_frame() {
     let tl = timeline(vec![vec![under.clone()], vec![moving]], None);
     // (The keys hold a scale of 0.5, which is a `scale` ahead of the placement: the compositor's scaler is in
     // play, a level off swscale's where it resizes. A scale that moves is the placement's own: `placement/*`.)
-    run(
-        "keyed/position",
-        &tl,
-        &[m.black.clone(), m.testsrc.clone()],
-        30.0,
-        1.0,
-        SCALED,
-    );
+    run("keyed/position", &tl, &[m.black.clone(), m.testsrc.clone()], 30.0, 1.0);
     // The easing of a segment is the polyline both renderers read (`Clip::transform_at`).
     for (name, easing) in [
         ("ease-in-out", kerf_core::Easing::EaseInOut),
@@ -1673,7 +1574,6 @@ fn keyframed_position_and_rotation_in_an_export_frame() {
             &[m.black.clone(), m.testsrc.clone()],
             30.0,
             1.0,
-            SCALED,
         );
     }
     let mut turning = clip(&m.smooth, 0.5, 1.5, 0.0);
@@ -1687,7 +1587,6 @@ fn keyframed_position_and_rotation_in_an_export_frame() {
         &[m.black.clone(), m.smooth.clone()],
         30.0,
         1.0,
-        EXACT,
         &rotation_refused(),
     );
 }
@@ -1738,16 +1637,16 @@ fn a_keyed_opacity_is_the_geq_alpha_of_each_frame() {
         ),
     ] {
         let tl = over_the_bars(fading(&m.testsrc, keys));
-        run(&format!("keyed opacity/{name}"), &tl, &assets, 30.0, 1.0, EXACT);
+        run(&format!("keyed opacity/{name}"), &tl, &assets, 30.0, 1.0);
     }
     // At 29.97 the clip's time is another grid of doubles.
     let tl = over_the_bars(fading(&m.testsrc, vec![key(0.0, 1.0), key(1.0, 0.0)]));
-    run("keyed opacity/29.97", &tl, &assets, 30000.0 / 1001.0, 1.0, EXACT);
+    run("keyed opacity/29.97", &tl, &assets, 30000.0 / 1001.0, 1.0);
     // Through the clip's fades and the dissolve it enters by: both act on the `geq`'s alpha plane.
     let mut faded = fading(&m.testsrc, vec![key(0.0, 0.4), key(1.0, 0.9)]);
     faded.fade_in = 0.3;
     faded.fade_out = 0.3;
-    run("keyed opacity/with fades", &over_the_bars(faded), &assets, 30.0, 1.0, EXACT);
+    run("keyed opacity/with fades", &over_the_bars(faded), &assets, 30.0, 1.0);
     let out = clip(&m.bars, 0.5, 1.5, 0.0);
     let mut inc = clip(&m.testsrc, 0.5, 1.5, 1.0);
     inc.set_property_keys(Property::Opacity, vec![key(0.0, 0.3), key(1.0, 0.8)]);
@@ -1761,7 +1660,6 @@ fn a_keyed_opacity_is_the_geq_alpha_of_each_frame() {
         &assets,
         30.0,
         2.0,
-        EXACT,
     );
     // Scaled: the scaler's level, as for any scaled layer; moving, it is placed by the export's `perspective`,
     // which acts on the faded picture's alpha plane: refused while the opacity is below 1.
@@ -1778,7 +1676,7 @@ fn a_keyed_opacity_is_the_geq_alpha_of_each_frame() {
     );
     let mut odd = fading(&m.testsrc, vec![key(0.0, 0.5), key(1.0, 0.7)]);
     odd.transform.scale = 0.33;
-    run("keyed opacity/odd 211x118", &over_the_bars(odd), &assets, 30.0, 1.0, SCALED);
+    run("keyed opacity/odd 211x118", &over_the_bars(odd), &assets, 30.0, 1.0);
     // Under a mask one `geq` multiplies the mask by the opacity: refused below 1.
     let mut masked = fading(&m.testsrc, vec![key(0.0, 0.5), key(1.0, 0.7)]);
     masked.mask = Some(mask_of(kerf_core::MaskShape::Ellipse, 0.1, false));
@@ -1799,7 +1697,6 @@ fn a_keyed_opacity_is_the_geq_alpha_of_each_frame() {
         &assets,
         30.0,
         1.0,
-        EXACT,
         &refusing("MaskWith", |u| matches!(u, Unsupported::MaskWith(..))),
     );
     // Under a chroma key the same `geq` reads the key's alpha plane (`alpha(X,Y)`), and on a build whose `geq` reads a
@@ -1828,7 +1725,6 @@ fn a_keyed_opacity_is_the_geq_alpha_of_each_frame() {
         &[m.black.clone(), m.smooth.clone()],
         30.0,
         1.0,
-        EXACT,
         &rotation_refused(),
     );
 }
@@ -1863,7 +1759,6 @@ fn a_keyed_opacity_on_a_turned_layer_is_shifted_before_the_turn() {
                 &assets,
                 30.0,
                 1.0,
-                EXACT,
             );
         }
     }
@@ -1874,7 +1769,6 @@ fn a_keyed_opacity_on_a_turned_layer_is_shifted_before_the_turn() {
             &assets,
             30.0,
             1.0,
-            EXACT,
             &rotation_refused(),
         );
     }
@@ -1934,9 +1828,9 @@ fn colour_moves(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, secs: f64
 }
 
 /// [`run`] for a cut whose top layer has a keyed colour that moves.
-fn run_colour(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, secs: f64, moves: usize, limits: Limits) {
+fn run_colour(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, secs: f64, moves: usize) {
     colour_moves(case, tl, assets, fps, secs, moves);
-    run(case, tl, assets, fps, secs, limits);
+    run(case, tl, assets, fps, secs);
 }
 
 fn grade_steep_refused() -> Refusing {
@@ -1961,19 +1855,19 @@ fn grade_steep_split(tl: &Timeline, assets: &[Asset], fps: f64, secs: f64) -> (u
 
 /// [`run_refusing`] for a grade whose tables step past two on some frames of a layer the scaler resizes: those frames are
 /// FFmpeg's and the others are held to the export at `limits` (on a machine whose scaler is not measured exact; where it is, every frame is drawn and exact). `refused` is how many frames that is (`None`: some, not all).
-fn run_grade_steep(case: &str, tl: &Timeline, assets: &[Asset], secs: f64, limits: Limits, refused: Option<usize>) {
+fn run_grade_steep(case: &str, tl: &Timeline, assets: &[Asset], secs: f64, refused: Option<usize>) {
     let (n, drawn) = grade_steep_split(tl, assets, 30.0, secs);
     // Where the scaler is measured to be swscale's there is no level for the tables to multiply: every frame is drawn, to the level.
     if kerf_gpu::scaler::kernels().exact() {
         assert_eq!(n, 0, "{case}: {n} frames refused for GradeSteep with an exact scaler");
-        run(case, tl, assets, 30.0, secs, EXACT);
+        run(case, tl, assets, 30.0, secs);
         return;
     }
     match refused {
         Some(want) => assert_eq!(n, want, "{case}: {n} frames refused, {drawn} drawn"),
         None => assert!(n > 0 && drawn > 0, "{case}: {n} frames refused, {drawn} drawn"),
     }
-    run_refusing(case, tl, assets, 30.0, secs, limits, &grade_steep_refused());
+    run_refusing(case, tl, assets, 30.0, secs, &grade_steep_refused());
 }
 
 #[test]
@@ -2054,7 +1948,6 @@ fn a_keyed_colour_is_the_eq_of_each_frame() {
                 30.0,
                 1.0,
                 *moves,
-                EXACT,
             );
         }
         run_colour(
@@ -2064,7 +1957,6 @@ fn a_keyed_colour_is_the_eq_of_each_frame() {
             30.0,
             1.0,
             *moves,
-            EXACT,
         );
     }
     // The temperature crossing zero: on a frame (-1 to 1 over a second is 0 at frame 15, where `gamma_r` and
@@ -2084,7 +1976,6 @@ fn a_keyed_colour_is_the_eq_of_each_frame() {
         30.0,
         1.0,
         20,
-        EXACT,
     );
     run_colour(
         "keyed colour/temperature crossing 0 between two",
@@ -2093,7 +1984,6 @@ fn a_keyed_colour_is_the_eq_of_each_frame() {
         30.0,
         1.0,
         20,
-        EXACT,
     );
     run_colour(
         "keyed colour/temperature 1 to 0",
@@ -2102,7 +1992,6 @@ fn a_keyed_colour_is_the_eq_of_each_frame() {
         30.0,
         1.0,
         20,
-        EXACT,
     );
     // The frame grids of other rates: 29.97 spelled as the text (2997/100) and as the ratio, 24 and 25 fps.
     for (name, fps) in [
@@ -2119,21 +2008,12 @@ fn a_keyed_colour_is_the_eq_of_each_frame() {
             fps,
             1.0,
             20,
-            EXACT,
         );
     }
     // Late on the timeline, sped up, slowed down, reversed: only the clip's own clock reads the curve.
     let mut late = colour_keyed(&m.noise, &all, &linear_keys);
     late.timeline_start = 1.25;
-    run_colour(
-        "keyed colour/late on the timeline",
-        &alone(late),
-        noise,
-        30.0,
-        2.25,
-        20,
-        EXACT,
-    );
+    run_colour("keyed colour/late on the timeline", &alone(late), noise, 30.0, 2.25, 20);
     // ... and late on the grid of 29.97 fps, spelled as the text and as the ratio: the start is off the frame grid, and the
     // time the curve is read at is the clip's own on the `fps` filter's grid.
     for (name, fps) in [("29.97", 29.97), ("30000/1001", 30000.0 / 1001.0)] {
@@ -2146,18 +2026,17 @@ fn a_keyed_colour_is_the_eq_of_each_frame() {
             fps,
             2.25,
             20,
-            EXACT,
         );
     }
     let mut fast = colour_keyed(&m.noise, &all, &linear_keys);
     (fast.source_out, fast.speed, fast.timeline_start) = (2.5, 2.0, 0.4);
-    run_colour("keyed colour/speed 2", &alone(fast), noise, 30.0, 1.4, 20, EXACT);
+    run_colour("keyed colour/speed 2", &alone(fast), noise, 30.0, 1.4, 20);
     let mut slow = colour_keyed(&m.noise, &all, &linear_keys);
     (slow.source_out, slow.speed) = (1.0, 0.5);
-    run_colour("keyed colour/speed 0.5", &alone(slow), noise, 30.0, 1.0, 20, EXACT);
+    run_colour("keyed colour/speed 0.5", &alone(slow), noise, 30.0, 1.0, 20);
     let mut back = colour_keyed(&m.noise, &all, &linear_keys);
     back.speed = -1.0;
-    run_colour("keyed colour/reversed", &alone(back), noise, 30.0, 1.0, 20, EXACT);
+    run_colour("keyed colour/reversed", &alone(back), noise, 30.0, 1.0, 20);
     // Beside a static grade: the numbers that are not keyed are the clip's own, to the last digit.
     let mut beside = colour_keyed(&m.noise, &[Property::Brightness, Property::Gamma], &linear_keys);
     beside.color = Color {
@@ -2166,32 +2045,16 @@ fn a_keyed_colour_is_the_eq_of_each_frame() {
         temperature: -0.35,
         ..Color::default()
     };
-    run_colour(
-        "keyed colour/beside a static grade",
-        &alone(beside),
-        noise,
-        30.0,
-        1.0,
-        20,
-        EXACT,
-    );
+    run_colour("keyed colour/beside a static grade", &alone(beside), noise, 30.0, 1.0, 20);
     let mut warm = colour_keyed(&m.noise, &[Property::Contrast], &linear_keys);
     warm.color.temperature = 0.4;
-    run_colour(
-        "keyed colour/beside a static temperature",
-        &alone(warm),
-        noise,
-        30.0,
-        1.0,
-        20,
-        EXACT,
-    );
+    run_colour("keyed colour/beside a static temperature", &alone(warm), noise, 30.0, 1.0, 20);
 
     // The clip's fades and the dissolve it enters by act after the `eq`.
     let mut faded = colour_keyed(&m.noise, &all, &linear_keys);
     faded.fade_in = 0.3;
     faded.fade_out = 0.3;
-    run_colour("keyed colour/with fades", &alone(faded), noise, 30.0, 1.0, 20, EXACT);
+    run_colour("keyed colour/with fades", &alone(faded), noise, 30.0, 1.0, 20);
     let out = clip(&m.bars, 0.5, 1.5, 0.0);
     let mut inc = colour_keyed(&m.noise, &all, &linear_keys);
     inc.timeline_start = 1.0;
@@ -2206,7 +2069,6 @@ fn a_keyed_colour_is_the_eq_of_each_frame() {
         30.0,
         2.0,
         20,
-        EXACT,
     );
     let mut dipped = colour_keyed(&m.testsrc, &all, &linear_keys);
     dipped.timeline_start = 1.0;
@@ -2221,7 +2083,6 @@ fn a_keyed_colour_is_the_eq_of_each_frame() {
         30.0,
         2.0,
         20,
-        EXACT,
     );
     // The outgoing clip of a dissolve plays on past its end (its tail) with its `eq` still running: the curve holds its
     // last value there.
@@ -2239,22 +2100,13 @@ fn a_keyed_colour_is_the_eq_of_each_frame() {
         30.0,
         2.0,
         20,
-        EXACT,
     );
     // Beside a keyed opacity: one clip, an `eq` and a `geq` alpha each written per frame.
     let over_the_bars = |c: Clip| timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None);
     let two = [m.bars.clone(), m.testsrc.clone()];
     let mut both = colour_keyed(&m.testsrc, &all, &linear_keys);
     both.set_property_keys(Property::Opacity, linear_keys(1.0, 0.4));
-    run_colour(
-        "keyed colour/with a keyed opacity",
-        &over_the_bars(both),
-        &two,
-        30.0,
-        1.0,
-        20,
-        EXACT,
-    );
+    run_colour("keyed colour/with a keyed opacity", &over_the_bars(both), &two, 30.0, 1.0, 20);
     let mut both = colour_keyed(&m.testsrc, &[Property::Brightness, Property::Temperature], &linear_keys);
     both.set_property_keys(Property::Opacity, linear_keys(0.2, 0.9));
     both.fade_in = 0.3;
@@ -2265,7 +2117,6 @@ fn a_keyed_colour_is_the_eq_of_each_frame() {
         30.0,
         1.0,
         20,
-        EXACT,
     );
     // A layer the compositor scales: the scaler is a level off swscale's x86 kernels, and the grade's tables multiply that by
     // their steepest step (`eq::table_steps`: contrast, gamma's power toward black, a black point parked above 0). A frame is
@@ -2290,15 +2141,7 @@ fn a_keyed_colour_is_the_eq_of_each_frame() {
     let mut gentle_pip = clip(&m.testsrc, 0.5, 1.5, 0.0);
     gentle(&mut gentle_pip, 1.1);
     moving(&mut gentle_pip);
-    run_colour(
-        "keyed colour/pip, gentle",
-        &over_the_bars(gentle_pip),
-        &two,
-        30.0,
-        1.0,
-        20,
-        GRADED_SCALED,
-    );
+    run_colour("keyed colour/pip, gentle", &over_the_bars(gentle_pip), &two, 30.0, 1.0, 20);
     // ... with the gamma going on to 1.2 the ramp's tables step by 3 on one frame (a cliff at the dark end: the first entry
     // above 0 is 3), which is that frame's alone.
     let mut gentler_pip = clip(&m.testsrc, 0.5, 1.5, 0.0);
@@ -2309,20 +2152,12 @@ fn a_keyed_colour_is_the_eq_of_each_frame() {
         &over_the_bars(gentler_pip),
         &two,
         1.0,
-        GRADED_SCALED,
         Some(1),
     );
     // The far ends of every range: the early frames of the ramp (contrast 0.5, saturation 0, gamma 0.5) are inside, the rest steepen.
     let mut steep_pip = colour_keyed(&m.testsrc, &all, &linear_keys);
     moving(&mut steep_pip);
-    run_grade_steep(
-        "keyed colour/pip, steep",
-        &over_the_bars(steep_pip),
-        &two,
-        1.0,
-        GRADED_SCALED,
-        None,
-    );
+    run_grade_steep("keyed colour/pip, steep", &over_the_bars(steep_pip), &two, 1.0, None);
     // Letterboxed: `pad`'s bars are in the picture `eq` sees, and go through the tables of the frame (the portrait
     // picture is shrunk into the frame: the scaler's level again).
     let delivery = Some(Delivery::new(640, 360, Fit::Contain));
@@ -2335,7 +2170,6 @@ fn a_keyed_colour_is_the_eq_of_each_frame() {
         30.0,
         1.0,
         20,
-        GRADED_SCALED,
     );
     let boxed = colour_keyed(&m.portrait, &all, &linear_keys);
     run_grade_steep(
@@ -2343,7 +2177,6 @@ fn a_keyed_colour_is_the_eq_of_each_frame() {
         &timeline(vec![vec![boxed]], delivery),
         std::slice::from_ref(&m.portrait),
         1.0,
-        GRADED_SCALED,
         None,
     );
     // Turned (`rotate` follows the `eq`, on the alpha plane) and translucent (the RGB round trip a constant opacity takes
@@ -2356,67 +2189,33 @@ fn a_keyed_colour_is_the_eq_of_each_frame() {
     let on_black = timeline(vec![vec![clip(&m.black, 0.5, 1.5, 0.0)], vec![turned]], None);
     let smooth = [m.black.clone(), m.smooth.clone()];
     colour_moves("keyed colour/rotated", &on_black, &smooth, 30.0, 1.0, 20);
-    run_refusing(
-        "keyed colour/rotated",
-        &on_black,
-        &smooth,
-        30.0,
-        1.0,
-        EXACT,
-        &rotation_refused(),
-    );
+    run_refusing("keyed colour/rotated", &on_black, &smooth, 30.0, 1.0, &rotation_refused());
     let mut translucent = colour_keyed(&m.testsrc, &all, &linear_keys);
     translucent.transform.opacity = 0.6;
-    run_colour(
-        "keyed colour/translucent",
-        &over_the_bars(translucent),
-        &two,
-        30.0,
-        1.0,
-        20,
-        TRANSLUCENT,
-    );
+    run_colour("keyed colour/translucent", &over_the_bars(translucent), &two, 30.0, 1.0, 20);
     // The tables of the frame ahead of the effects that follow: composed with a grayscale or an invert, and
     // ahead of a blur.
-    for (name, effects, limits) in [
-        ("invert", vec![kerf_core::VideoEffect::Invert], EXACT),
+    for (name, effects) in [
+        ("invert", vec![kerf_core::VideoEffect::Invert]),
         (
             "grayscale then invert",
             vec![kerf_core::VideoEffect::Grayscale, kerf_core::VideoEffect::Invert],
-            EXACT,
         ),
         (
             "blur then grayscale",
             vec![kerf_core::VideoEffect::Blur { sigma: 3.0 }, kerf_core::VideoEffect::Grayscale],
-            EFFECT,
         ),
-        ("sharpen", vec![kerf_core::VideoEffect::Sharpen { amount: 1.0 }], EXACT),
-        ("vignette", vec![kerf_core::VideoEffect::Vignette], EXACT),
+        ("sharpen", vec![kerf_core::VideoEffect::Sharpen { amount: 1.0 }]),
+        ("vignette", vec![kerf_core::VideoEffect::Vignette]),
     ] {
         let mut c = colour_keyed(&m.testsrc, &all, &linear_keys);
         c.effects = effects;
-        run_colour(
-            &format!("keyed colour/then {name}"),
-            &over_the_bars(c),
-            &two,
-            30.0,
-            1.0,
-            20,
-            limits,
-        );
+        run_colour(&format!("keyed colour/then {name}"), &over_the_bars(c), &two, 30.0, 1.0, 20);
     }
     // A mask is cut after the grade.
     let mut masked = colour_keyed(&m.testsrc, &all, &linear_keys);
     masked.mask = Some(mask_of(kerf_core::MaskShape::Ellipse, 0.1, false));
-    run_colour(
-        "keyed colour/under a mask",
-        &over_the_bars(masked),
-        &two,
-        30.0,
-        1.0,
-        20,
-        EXACT,
-    );
+    run_colour("keyed colour/under a mask", &over_the_bars(masked), &two, 30.0, 1.0, 20);
     // A moving zoom comes last: the grade is at the fit size, magnified with the picture.
     let mut zoomed = zooming(&m.testsrc, 1.0, 1.4, (0.0, 0.0));
     for prop in all {
@@ -2498,14 +2297,7 @@ fn eq_tables_of_any_step_are_the_export_on_a_layer_the_scaler_resizes() {
         steepest = steepest.max(y.max(u).max(v));
         for (source, asset) in sources {
             let (tl, assets) = pip(asset, color);
-            run(
-                &format!("static colour/pip, {name}, {source}"),
-                &tl,
-                &assets,
-                30.0,
-                0.4,
-                EXACT,
-            );
+            run(&format!("static colour/pip, {name}, {source}"), &tl, &assets, 30.0, 0.4);
         }
     }
     assert!(
@@ -2521,7 +2313,6 @@ fn eq_tables_of_any_step_are_the_export_on_a_layer_the_scaler_resizes() {
         std::slice::from_ref(&m.ramp),
         30.0,
         0.4,
-        EXACT,
     );
 }
 
@@ -2557,7 +2348,6 @@ fn a_grade_on_a_layer_the_scaler_resizes_is_the_export_where_an_eq_precedes_it()
             &[m.bars.clone(), m.testsrc.clone()],
             30.0,
             0.4,
-            EXACT,
         );
     }
     let heavy = &all[8].1;
@@ -2578,23 +2368,23 @@ fn a_grade_on_a_layer_the_scaler_resizes_is_the_export_where_an_eq_precedes_it()
         ("enlarged cover into 1280x720", Delivery::new(1280, 720, Fit::Cover)),
     ] {
         let (tl, assets) = alone(&m.testsrc, Some(delivery), &|_| {});
-        run(&format!("grade/{name} with eq"), &tl, &assets, 30.0, 0.4, EXACT);
+        run(&format!("grade/{name} with eq"), &tl, &assets, 30.0, 0.4);
     }
     let (tl, assets) = alone(&m.noise, Some(Delivery::new(960, 540, Fit::Contain)), &|_| {});
-    run("grade/noise enlarged with eq", &tl, &assets, 30.0, 0.4, EXACT);
+    run("grade/noise enlarged with eq", &tl, &assets, 30.0, 0.4);
     let (tl, assets) = alone(&m.noise, Some(Delivery::new(320, 180, Fit::Contain)), &|_| {});
-    run("grade/noise shrunk with eq", &tl, &assets, 30.0, 0.4, EXACT);
+    run("grade/noise shrunk with eq", &tl, &assets, 30.0, 0.4);
     let (tl, assets) = alone(&m.edges, Some(Delivery::new(320, 180, Fit::Contain)), &|_| {});
-    run("grade/hard edges shrunk with eq", &tl, &assets, 30.0, 0.4, EXACT);
+    run("grade/hard edges shrunk with eq", &tl, &assets, 30.0, 0.4);
     // After the eq's own keys, at speed 2, cropped, over another track, dissolving in and out.
     let (tl, assets) = alone(&m.testsrc, Some(Delivery::new(320, 180, Fit::Contain)), &|c| c.speed = 2.0);
-    run("grade/shrunk at speed 2 with eq", &tl, &assets, 30.0, 0.4, EXACT);
+    run("grade/shrunk at speed 2 with eq", &tl, &assets, 30.0, 0.4);
     let (tl, assets) = alone(&m.testsrc, None, &|c| {
         c.transform.scale = 0.75;
         c.transform.crop_left = 0.125;
         c.transform.crop_right = 0.125;
     });
-    run("grade/cropped and shrunk with eq", &tl, &assets, 30.0, 0.4, EXACT);
+    run("grade/cropped and shrunk with eq", &tl, &assets, 30.0, 0.4);
     let mut keyed = colour_keyed(
         &m.testsrc,
         &[kerf_core::Property::Brightness, kerf_core::Property::Saturation],
@@ -2610,7 +2400,6 @@ fn a_grade_on_a_layer_the_scaler_resizes_is_the_export_where_an_eq_precedes_it()
         30.0,
         1.0,
         10,
-        EXACT,
     );
     for (name, kind) in [("in", TransitionKind::Crossfade), ("dip", TransitionKind::DipToBlack)] {
         let mut from = clip(&m.testsrc, 0.5, 1.5, 0.0);
@@ -2630,11 +2419,10 @@ fn a_grade_on_a_layer_the_scaler_resizes_is_the_export_where_an_eq_precedes_it()
                 std::slice::from_ref(&m.testsrc),
                 30.0,
                 2.0,
-                EXACT,
                 &refusing("GradeWith", |u| matches!(u, Unsupported::GradeWith(..))),
             );
         } else {
-            run(&case, &tl, std::slice::from_ref(&m.testsrc), 30.0, 2.0, EXACT);
+            run(&case, &tl, std::slice::from_ref(&m.testsrc), 30.0, 2.0);
         }
     }
     // A picture tagged BT.709 goes back to 4:2:0 through 4:4:4; a stack of its own matrix.
@@ -2649,7 +2437,6 @@ fn a_grade_on_a_layer_the_scaler_resizes_is_the_export_where_an_eq_precedes_it()
         &[v.bars709.clone(), v.testsrc709.clone()],
         30.0,
         0.4,
-        EXACT,
     );
     // Refused: no eq between the fit scale and the grade; a letterbox (the bars are the picture the grade sees).
     let no_eq = |asset: &Asset, delivery: Option<Delivery>, scale: f64| {
@@ -2668,15 +2455,7 @@ fn a_grade_on_a_layer_the_scaler_resizes_is_the_export_where_an_eq_precedes_it()
         ("shrunk", Some(Delivery::new(320, 180, Fit::Contain)), 1.0),
     ] {
         let (tl, assets) = no_eq(&m.testsrc, delivery, scale);
-        run_refusing(
-            &format!("grade/{name}, no eq"),
-            &tl,
-            &assets,
-            30.0,
-            0.4,
-            EXACT,
-            &no_eq_refused,
-        );
+        run_refusing(&format!("grade/{name}, no eq"), &tl, &assets, 30.0, 0.4, &no_eq_refused);
         // The refusal is needed: the same frames drawn anyway (the plan is told an `eq` of no effect stands there) are not the export's.
         let mut lied = tl.clone();
         for c in lied.tracks.iter_mut().flat_map(|t| &mut t.clips) {
@@ -2692,7 +2471,6 @@ fn a_grade_on_a_layer_the_scaler_resizes_is_the_export_where_an_eq_precedes_it()
         &assets,
         30.0,
         0.4,
-        EXACT,
         &refusing("Matte", |u| matches!(u, Unsupported::Matte(..))),
     );
 }
@@ -2751,9 +2529,9 @@ fn a_keyed_colour_is_drawn_on_pictures_that_are_not_plain_8_bit_420() {
         let case = format!("keyed colour/{name}");
         let one = std::slice::from_ref(a);
         if name == "10-bit" && policy() != CompositeColorPolicy::FixedBt601 {
-            run_refusing(&case, &tl, one, 30.0, 1.0, EXACT, &full_range_cut_refused());
+            run_refusing(&case, &tl, one, 30.0, 1.0, &full_range_cut_refused());
         } else {
-            run_colour(&case, &tl, one, 30.0, 1.0, 20, EXACT);
+            run_colour(&case, &tl, one, 30.0, 1.0, 20);
         }
     }
 }
@@ -2868,7 +2646,6 @@ fn a_blended_clip_whose_zoom_or_position_moves_is_ffmpegs() {
                 &assets,
                 30.0,
                 1.0,
-                EXACT,
                 &blend_refused,
             );
         }
@@ -2877,7 +2654,7 @@ fn a_blended_clip_whose_zoom_or_position_moves_is_ffmpegs() {
     still.blend_mode = BlendMode::Multiply;
     still.keyframes = vec![key(0.0, 1.0, 0.1), key(1.0, 1.0, 0.1)];
     let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![still]], None);
-    run("blend/held position Multiply", &tl, &assets, 30.0, 1.0, EXACT);
+    run("blend/held position Multiply", &tl, &assets, 30.0, 1.0);
 }
 
 #[test]
@@ -2893,7 +2670,7 @@ fn a_rotated_layer_fades_on_an_alpha_plane() {
     turned.fade_in = 0.4;
     turned.fade_out = 0.4;
     let tl = timeline(vec![vec![under.clone()], vec![turned]], None);
-    run_refusing("fade/rotated", &tl, &assets, 30.0, 1.0, EXACT, &rotation_refused());
+    run_refusing("fade/rotated", &tl, &assets, 30.0, 1.0, &rotation_refused());
     // (A quarter turn is drawn, to the sample: the chain is on the same alpha plane.)
     let mut quarter = clip(&m.smooth, 0.5, 1.5, 0.0);
     quarter.transform.rotation = 90.0;
@@ -2905,7 +2682,6 @@ fn a_rotated_layer_fades_on_an_alpha_plane() {
         &assets,
         30.0,
         1.0,
-        EXACT,
     );
     // ... and a dissolve into a rotated clip, over the clip it replaces.
     let out = clip(&m.black, 0.5, 1.5, 0.0);
@@ -2917,15 +2693,7 @@ fn a_rotated_layer_fades_on_an_alpha_plane() {
         duration: 0.5,
     });
     let tl = timeline(vec![vec![out, inc]], None);
-    run_refusing(
-        "dissolve/rotated-incoming",
-        &tl,
-        &assets,
-        30.0,
-        2.0,
-        EXACT,
-        &rotation_refused(),
-    );
+    run_refusing("dissolve/rotated-incoming", &tl, &assets, 30.0, 2.0, &rotation_refused());
     let out = clip(&m.black, 0.5, 1.5, 0.0);
     let mut inc = clip(&m.smooth, 0.5, 1.5, 1.0);
     inc.transform.rotation = -90.0;
@@ -2939,18 +2707,17 @@ fn a_rotated_layer_fades_on_an_alpha_plane() {
         &assets,
         30.0,
         2.0,
-        EXACT,
     );
     // A rotated clip with no fade at all, as an export draws it.
     let mut still_turned = clip(&m.smooth, 0.5, 1.5, 0.0);
     still_turned.transform.rotation = 20.0;
     still_turned.transform.scale = 0.6;
     let tl = timeline(vec![vec![under], vec![still_turned]], None);
-    run_refusing("plain/rotated", &tl, &assets, 30.0, 1.0, EXACT, &rotation_refused());
+    run_refusing("plain/rotated", &tl, &assets, 30.0, 1.0, &rotation_refused());
     let mut quarter = clip(&m.smooth, 0.5, 1.5, 0.0);
     quarter.transform.rotation = 270.0;
     let tl = timeline(vec![vec![clip(&m.black, 0.5, 1.5, 0.0)], vec![quarter]], None);
-    run("plain/rotated a quarter", &tl, &assets, 30.0, 1.0, EXACT);
+    run("plain/rotated a quarter", &tl, &assets, 30.0, 1.0);
 }
 
 #[test]
@@ -2968,7 +2735,7 @@ fn a_translucent_layer_dissolves_and_is_refused_its_fades_to_black() {
         duration: 0.5,
     });
     let tl = timeline(vec![vec![out, inc]], None);
-    run("dissolve/translucent-incoming", &tl, &assets, 30.0, 2.0, TRANSLUCENT);
+    run("dissolve/translucent-incoming", &tl, &assets, 30.0, 2.0);
     // A fade to black runs on that RGBA picture, alpha included, which the compositor does not
     // reproduce: the plan refuses the frames it runs on (FFmpeg draws them), and the others are drawn.
     let under = clip(&m.bars, 0.5, 1.5, 0.0);
@@ -2977,15 +2744,7 @@ fn a_translucent_layer_dissolves_and_is_refused_its_fades_to_black() {
     glass.fade_in = 0.4;
     glass.fade_out = 0.4;
     let tl = timeline(vec![vec![under], vec![glass]], None);
-    run_refusing(
-        "fade/translucent",
-        &tl,
-        &assets,
-        30.0,
-        1.0,
-        TRANSLUCENT,
-        &translucent_fade_refused(),
-    );
+    run_refusing("fade/translucent", &tl, &assets, 30.0, 1.0, &translucent_fade_refused());
     let out = clip(&m.bars, 0.5, 1.5, 0.0);
     let mut inc = clip(&m.testsrc, 0.5, 1.5, 1.0);
     inc.transform.opacity = 0.7;
@@ -3000,7 +2759,6 @@ fn a_translucent_layer_dissolves_and_is_refused_its_fades_to_black() {
         &assets,
         30.0,
         2.0,
-        TRANSLUCENT,
         &translucent_fade_refused(),
     );
 }
@@ -3008,12 +2766,12 @@ fn a_translucent_layer_dissolves_and_is_refused_its_fades_to_black() {
 /// A layer below full opacity is `colorchannelmixer` (RGBA), `rotate` (on the RGBA picture) and only then the conversion to 4:2:0, whose chroma
 /// pairs two pixels of a row and filters over the rows: after a quarter turn it pairs other samples than the round trip the compositor makes
 /// ahead of the turn (chroma up to 19 levels off the export in the first frames measured, luma exact). A quarter and three quarters of a turn
-/// are refused for a constant opacity below 1; the upright and half-turned layers keep the translucent ladder, and the layers that do not
+/// and a half of a turn are refused for a constant opacity below 1 (the rows are filtered the other way round: one level of chroma on 4,631 samples of 30 frames at 180); the upright layer is exact, and the layers that do not
 /// take the round trip are exact turned a quarter: an opaque one (alone, faded in and out), and one whose opacity is keyed (a `geq` alpha on
 /// `yuva420p`, pointwise).
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
-fn a_translucent_layer_turned_a_quarter_is_refused_and_the_other_turns_are_drawn() {
+fn a_translucent_layer_turned_is_refused_and_the_upright_one_is_drawn() {
     use kerf_core::{Property, PropertyKey};
     let m = media();
     let assets = [m.bars.clone(), m.testsrc.clone()];
@@ -3023,7 +2781,7 @@ fn a_translucent_layer_turned_a_quarter_is_refused_and_the_other_turns_are_drawn
         edit(&mut c);
         timeline(vec![vec![under()], vec![c]], None)
     };
-    for angle in [90.0, 270.0, -90.0, 450.0] {
+    for angle in [90.0, 180.0, 270.0, -90.0, -180.0, 450.0] {
         for scale in [1.0, 0.5625] {
             let tl = on_top(&|c| {
                 c.transform.rotation = angle;
@@ -3036,7 +2794,6 @@ fn a_translucent_layer_turned_a_quarter_is_refused_and_the_other_turns_are_drawn
                 &assets,
                 30.0,
                 1.0,
-                TRANSLUCENT,
                 &rotation_refused(),
             );
         }
@@ -3052,7 +2809,6 @@ fn a_translucent_layer_turned_a_quarter_is_refused_and_the_other_turns_are_drawn
             &assets,
             30.0,
             1.0,
-            TRANSLUCENT,
             &rotation_refused(),
         );
         let tl = on_top(&|c| {
@@ -3060,7 +2816,7 @@ fn a_translucent_layer_turned_a_quarter_is_refused_and_the_other_turns_are_drawn
             c.fade_in = 0.4;
             c.fade_out = 0.4;
         });
-        run(&format!("fade/turned {angle}"), &tl, &assets, 30.0, 1.0, EXACT);
+        run(&format!("fade/turned {angle}"), &tl, &assets, 30.0, 1.0);
         let tl = on_top(&|c| {
             c.transform.rotation = angle;
             c.set_property_keys(
@@ -3068,14 +2824,14 @@ fn a_translucent_layer_turned_a_quarter_is_refused_and_the_other_turns_are_drawn
                 vec![PropertyKey::new(0.0, 1.0), PropertyKey::new(1.0, 0.3)],
             );
         });
-        run(&format!("keyed opacity/turned {angle}"), &tl, &assets, 30.0, 1.0, EXACT);
+        run(&format!("keyed opacity/turned {angle}"), &tl, &assets, 30.0, 1.0);
     }
-    for angle in [0.0, 180.0, -180.0] {
+    for angle in [0.0, 360.0] {
         let tl = on_top(&|c| {
             c.transform.rotation = angle;
             c.transform.opacity = 0.6;
         });
-        run(&format!("opacity/turned {angle}"), &tl, &assets, 30.0, 1.0, TRANSLUCENT);
+        run(&format!("opacity/turned {angle}"), &tl, &assets, 30.0, 1.0);
     }
 }
 
@@ -3230,14 +2986,7 @@ fn a_dip_to_white_is_drawn_only_where_its_round_trip_was_measured() {
         duration: 0.8,
     });
     let tl = timeline(vec![vec![clip(&v.bars709, 0.5, 1.5, 0.0), inc]], None);
-    run(
-        "dip/white bt709",
-        &tl,
-        &[v.bars709.clone(), v.testsrc709.clone()],
-        30.0,
-        2.0,
-        WHITE_709,
-    );
+    run("dip/white bt709", &tl, &[v.bars709.clone(), v.testsrc709.clone()], 30.0, 2.0);
     // A layer smaller than the frame that is not resized (a crop, a Cover fit at the footage's scale)
     // is drawn, its edge included.
     let mut inc = clip(&m.testsrc, 0.5, 1.5, 1.0);
@@ -3249,10 +2998,10 @@ fn a_dip_to_white_is_drawn_only_where_its_round_trip_was_measured() {
     });
     let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0), inc]], None);
     let assets = [m.bars.clone(), m.testsrc.clone()];
-    run("dip/white cropped layer", &tl, &assets, 30.0, 2.0, WHITE);
+    run("dip/white cropped layer", &tl, &assets, 30.0, 2.0);
     let cover = Some(Delivery::new(480, 360, Fit::Cover));
     let (tl, assets) = after_black(&m.testsrc, white, 0.8, 1.0, cover);
-    run("dip/white cover 480x360", &tl, &assets, 30.0, 2.0, WHITE);
+    run("dip/white cover 480x360", &tl, &assets, 30.0, 2.0);
     // Refused: a layer the scaler resizes, which the scale filter converts to RGB itself (the first
     // measurement of a half-size layer: Y 19 / UV 28 off at the picture's sharp edges, and 11 / 10 for
     // an enlargement). The dip to black on it is drawn.
@@ -3269,11 +3018,10 @@ fn a_dip_to_white_is_drawn_only_where_its_round_trip_was_measured() {
             &assets,
             30.0,
             2.0,
-            EXACT,
             &dip_refused(DipWhy::Resized),
         );
         let (tl, assets) = after_black(&m.testsrc, black, 0.8, scale, format);
-        run(&format!("dip/black {name}"), &tl, &assets, 30.0, 2.0, SCALED);
+        run(&format!("dip/black {name}"), &tl, &assets, 30.0, 2.0);
     }
     // Refused: a letterboxed layer.
     let tall = Some(Delivery::new(640, 360, Fit::Contain));
@@ -3284,11 +3032,10 @@ fn a_dip_to_white_is_drawn_only_where_its_round_trip_was_measured() {
         &assets,
         30.0,
         2.0,
-        EXACT,
         &dip_refused(DipWhy::Letterboxed),
     );
     let (tl, assets) = after_black(&m.portrait, black, 0.8, 1.0, tall);
-    run("dip/black letterboxed", &tl, &assets, 30.0, 2.0, SCALED);
+    run("dip/black letterboxed", &tl, &assets, 30.0, 2.0);
     // ... a layer of odd size (0.4985 of 640x360 is 319x179), which a dip to black draws.
     let (tl, assets) = after_black(&m.testsrc, white, 0.8, 0.4985, None);
     run_refusing(
@@ -3297,11 +3044,10 @@ fn a_dip_to_white_is_drawn_only_where_its_round_trip_was_measured() {
         &assets,
         30.0,
         2.0,
-        EXACT,
         &dip_refused(DipWhy::OddSize(319, 179)),
     );
     let (tl, assets) = after_black(&m.testsrc, black, 0.8, 0.4985, None);
-    run("dip/black odd layer", &tl, &assets, 30.0, 2.0, SCALED);
+    run("dip/black odd layer", &tl, &assets, 30.0, 2.0);
     // ... every picture that is not 8-bit limited-range 4:2:0.
     for (name, a) in [
         ("rgb-png", &v.rgb_png),
@@ -3319,7 +3065,7 @@ fn a_dip_to_white_is_drawn_only_where_its_round_trip_was_measured() {
         } else {
             dip_refused(DipWhy::Format)
         };
-        run_refusing(&format!("dip/white {name}"), &tl, &assets, 30.0, 2.0, EXACT, &refused_for);
+        run_refusing(&format!("dip/white {name}"), &tl, &assets, 30.0, 2.0, &refused_for);
         let (tl, assets) = after_black(a, black, 0.8, 1.0, None);
         if negotiated {
             run_refusing(
@@ -3328,11 +3074,10 @@ fn a_dip_to_white_is_drawn_only_where_its_round_trip_was_measured() {
                 &assets,
                 30.0,
                 2.0,
-                EXACT,
                 &full_range_cut_refused(),
             );
         } else {
-            run(&format!("dip/black {name}"), &tl, &assets, 30.0, 2.0, EXACT);
+            run(&format!("dip/black {name}"), &tl, &assets, 30.0, 2.0);
         }
     }
 }
@@ -3344,10 +3089,10 @@ fn a_dip_to_white_is_drawn_only_where_its_round_trip_was_measured() {
 /// whole) and `fade` darkens them toward the limited-range black 16 before the range is converted
 /// (frame 0 of a fade-in reads Y 30 where black is 16), so the plan refuses the picture in an
 /// export frame of the cut that holds it and inside a fade, a dip or a dissolve in a still, on that FFmpeg.
-fn run_full_range(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, secs: f64, limits: Limits) {
+fn run_full_range(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, secs: f64) {
     match policy() {
-        CompositeColorPolicy::FixedBt601 => run(case, tl, assets, fps, secs, limits),
-        _ => run_refusing(case, tl, assets, fps, secs, limits, &full_range_cut_refused()),
+        CompositeColorPolicy::FixedBt601 => run(case, tl, assets, fps, secs),
+        _ => run_refusing(case, tl, assets, fps, secs, &full_range_cut_refused()),
     }
 }
 
@@ -3365,9 +3110,9 @@ fn a_full_range_picture_is_drawn_as_the_ffmpeg_in_use_converts_its_range() {
         fading.fade_out = 0.5;
         let tl = timeline(vec![vec![fading]], None);
         let one = std::slice::from_ref(a);
-        run_full_range(&format!("full-range/fade {name}"), &tl, one, 30.0, 1.0, EXACT);
+        run_full_range(&format!("full-range/fade {name}"), &tl, one, 30.0, 1.0);
         let tl = timeline(vec![vec![clip(a, lo, hi, 0.0)]], None);
-        run_full_range(&format!("full-range/plain {name}"), &tl, one, 30.0, 1.0, EXACT);
+        run_full_range(&format!("full-range/plain {name}"), &tl, one, 30.0, 1.0);
         // A cut between two full-range clips: FFmpeg 9 flags the export as full range as a whole,
         // so a limited-range clip in the same cut is read 16 levels off too (the black before it).
         let cuts = [
@@ -3378,14 +3123,7 @@ fn a_full_range_picture_is_drawn_as_the_ffmpeg_in_use_converts_its_range() {
             let mut inc = clip(a, lo, hi, 1.0);
             inc.transition_in = Some(Transition { kind, duration: secs });
             let tl = timeline(vec![vec![clip(a, lo, hi, 0.0), inc]], None);
-            run_full_range(
-                &format!("full-range/{label} {name}"),
-                &tl,
-                &[a.clone(), a.clone()],
-                30.0,
-                2.0,
-                EXACT,
-            );
+            run_full_range(&format!("full-range/{label} {name}"), &tl, &[a.clone(), a.clone()], 30.0, 2.0);
         }
         // A dip to white on it is a picture the round trip was not measured on, whatever FFmpeg does with the range.
         let mut inc = clip(a, lo, hi, 1.0);
@@ -3404,7 +3142,6 @@ fn a_full_range_picture_is_drawn_as_the_ffmpeg_in_use_converts_its_range() {
             &[a.clone(), a.clone()],
             30.0,
             2.0,
-            EXACT,
             &reason,
         );
     }
@@ -3418,7 +3155,6 @@ fn a_full_range_picture_is_drawn_as_the_ffmpeg_in_use_converts_its_range() {
         std::slice::from_ref(&v.mjpeg),
         30.0,
         1.0,
-        EXACT,
         &full_range_resized_refused(),
     );
     // A 10-bit file tagged full range probes as `yuv420p10le`, like the limited one, and 9.0.2 handles it as it
@@ -3434,20 +3170,12 @@ fn a_full_range_picture_is_drawn_as_the_ffmpeg_in_use_converts_its_range() {
             &[m.black.clone(), a.clone()],
             30.0,
             2.0,
-            EXACT,
         );
         let mut fading = clip(a, 0.5, 1.5, 0.0);
         fading.fade_in = 0.5;
         fading.fade_out = 0.5;
         let tl = timeline(vec![vec![fading]], None);
-        run_full_range(
-            &format!("full-range/fade {name}"),
-            &tl,
-            std::slice::from_ref(a),
-            30.0,
-            1.0,
-            EXACT,
-        );
+        run_full_range(&format!("full-range/fade {name}"), &tl, std::slice::from_ref(a), 30.0, 1.0);
     }
     // The cut is what FFmpeg 9 flags full range, not the frame: the limited-range frames of a cut that
     // holds a full-range clip somewhere read 16 levels off too (black Y 0 against 16, the test pattern
@@ -3461,7 +3189,6 @@ fn a_full_range_picture_is_drawn_as_the_ffmpeg_in_use_converts_its_range() {
         &[black.clone(), mjpeg.clone()],
         30.0,
         2.0,
-        EXACT,
     );
     let tl = timeline(vec![vec![clip(mjpeg, 0.5, 1.5, 0.0), clip(testsrc, 0.5, 1.5, 1.0)]], None);
     run_full_range(
@@ -3470,7 +3197,6 @@ fn a_full_range_picture_is_drawn_as_the_ffmpeg_in_use_converts_its_range() {
         &[testsrc.clone(), mjpeg.clone()],
         30.0,
         2.0,
-        EXACT,
     );
     let tl = timeline(
         vec![vec![clip(testsrc, 0.5, 2.5, 0.0)], vec![clip(jpeg, 0.0, 1.0, 1.0)]],
@@ -3482,7 +3208,6 @@ fn a_full_range_picture_is_drawn_as_the_ffmpeg_in_use_converts_its_range() {
         &[testsrc.clone(), jpeg.clone()],
         30.0,
         2.0,
-        EXACT,
     );
     // A limited-range layer fading over a full-range one: the stack's export is the raw values.
     let mut over = clip(&m.testsrc, 0.5, 1.5, 0.0);
@@ -3496,7 +3221,6 @@ fn a_full_range_picture_is_drawn_as_the_ffmpeg_in_use_converts_its_range() {
         &[v.mjpeg.clone(), m.testsrc.clone()],
         30.0,
         1.0,
-        SCALED,
     );
 }
 
@@ -3583,14 +3307,14 @@ fn a_moving_zoom_is_placed_as_the_export_places_it() {
     let mut late = zooming(&m.testsrc, 1.0, 1.4, (0.0, 0.0));
     late.timeline_start = 0.5;
     let tl = timeline(vec![vec![late]], None);
-    run_range("zoom/late start", &tl, &assets[1..], 30.0, 15..44, EXACT);
+    run_range("zoom/late start", &tl, &assets[1..], 30.0, 15..44);
     for (name, speed) in [("speed 2", 2.0), ("reversed", -1.0)] {
         let mut c = zooming(&m.testsrc, 1.0, 1.5, (0.0, 0.0));
         c.source_out = 2.5;
         c.speed = speed;
         c.keyframes = vec![zoom_key(0.0, 1.0, 0.0, 0.0), zoom_key(0.5, 1.5, 0.0, 0.0)];
         let tl = timeline(vec![vec![c]], None);
-        run_range(&format!("zoom/{name}"), &tl, &assets[1..], 30.0, 0..14, EXACT);
+        run_range(&format!("zoom/{name}"), &tl, &assets[1..], 30.0, 0..14);
     }
     // A position alone moves (the zoom keys hold one value, so there is no zoom to place), over bars and
     // over black.
@@ -3605,12 +3329,12 @@ fn a_moving_zoom_is_placed_as_the_export_places_it() {
         vec![vec![zooming(&m.testsrc, 1.0, 1.25, (-0.05, 0.0))]],
         Some(Delivery::new(960, 540, Fit::Cover)),
     );
-    run("zoom/cover 960x540", &tl, &assets[1..], 30.0, 1.0, SCALED);
+    run("zoom/cover 960x540", &tl, &assets[1..], 30.0, 1.0);
     let tl = timeline(
         vec![vec![zooming(&m.testsrc, 1.0, 1.3, (0.0, 0.0))]],
         Some(Delivery::new(360, 640, Fit::Cover)),
     );
-    run("zoom/cover 9:16", &tl, &assets[1..], 30.0, 1.0, SCALED);
+    run("zoom/cover 9:16", &tl, &assets[1..], 30.0, 1.0);
     // A still image that moves is drawn by FFmpeg in one `perspective` of a copy of the still scaled once
     // (`StillMotion`), which is not this placement.
     let tl = timeline(vec![vec![zooming(&m.image, 1.0, 1.5, (0.0, 0.0))]], None);
@@ -3921,16 +3645,16 @@ fn a_moving_zoom_is_placed_after_a_grade_mask_fade_or_effect() {
     // recursion, which FFmpeg itself computes with another association of the same sums on an AVX2 / AVX-512
     // build (`EFFECT`: 0 to 59 samples in 3.2 million are a level off, on either side of the zoom). The fit
     // scale ahead of the effects is the identity here, so a sharpen of any amount is of the exact picture.
-    for (name, effect, limits) in [
-        ("blur", kerf_core::VideoEffect::Blur { sigma: 4.0 }, EFFECT),
-        ("sharpen", kerf_core::VideoEffect::Sharpen { amount: 1.5 }, EXACT),
-        ("grayscale", kerf_core::VideoEffect::Grayscale, EXACT),
-        ("invert", kerf_core::VideoEffect::Invert, EXACT),
-        ("chroma key", key("green", 0.2, 0.2), EXACT),
-        ("vignette", kerf_core::VideoEffect::Vignette, EXACT),
+    for (name, effect) in [
+        ("blur", kerf_core::VideoEffect::Blur { sigma: 4.0 }),
+        ("sharpen", kerf_core::VideoEffect::Sharpen { amount: 1.5 }),
+        ("grayscale", kerf_core::VideoEffect::Grayscale),
+        ("invert", kerf_core::VideoEffect::Invert),
+        ("chroma key", key("green", 0.2, 0.2)),
+        ("vignette", kerf_core::VideoEffect::Vignette),
     ] {
         let tl = with(&|c| c.effects = vec![effect.clone()]);
-        run(&format!("zoom+{name}"), &tl, &assets, 30.0, 1.0, limits);
+        run(&format!("zoom+{name}"), &tl, &assets, 30.0, 1.0);
     }
     // The tutorial's clip: a feathered mask over a blurred picture, zooming, in a Cover frame.
     let mut c = zooming(&m.testsrc, 1.0, 1.25, (-0.05, 0.0));
@@ -3941,7 +3665,7 @@ fn a_moving_zoom_is_placed_after_a_grade_mask_fade_or_effect() {
         Some(Delivery::new(960, 540, Fit::Cover)),
     );
     // (The fit scale to 960x540 is the compositor's, a level off swscale's, and the blur's own level: `EFFECT_SCALED`.)
-    run("zoom+mask+blur cover 960x540", &tl, &assets, 30.0, 1.0, EFFECT_SCALED);
+    run("zoom+mask+blur cover 960x540", &tl, &assets, 30.0, 1.0);
     // Everything at once: grade, an effect, a mask, a fade-in.
     let tl = with(&|c| {
         c.color.contrast = 1.15;
@@ -3949,33 +3673,8 @@ fn a_moving_zoom_is_placed_after_a_grade_mask_fade_or_effect() {
         c.mask = Some(mask_of(kerf_core::MaskShape::Ellipse, 0.25, false));
         c.fade_in = 0.3;
     });
-    run("zoom+grade+effects+mask+fade", &tl, &assets, 30.0, 1.0, EFFECT);
+    run("zoom+grade+effects+mask+fade", &tl, &assets, 30.0, 1.0);
 }
-
-/// Blur's bound: `gblur` is floating point, and the x86 build runs its horizontal pass in AVX2 /
-/// AVX-512 with another association of the same sums (and a fused multiply-add), so FFmpeg's own
-/// answer depends on the CPU by the last bits of a `float` — a level on a sample that sits on a half.
-/// The compositor follows the portable C order: measured, 0 to 59 samples in 3.2 million are one level
-/// off, none more. Everything else an effect does (the tables, the sharpen) is exact, 0 differing.
-const EFFECT: Limits = Limits {
-    y: 1,
-    uv: 1,
-    scaler_only: false,
-};
-
-/// Two levels: a blur, grayscale or invert on a picture the compositor scaled first (or took through the
-/// translucent round trip), the scaler's level (`SCALED`) and the blur's own (`EFFECT`) on a sample where both
-/// fall; and a blur followed by a sharpen, or a scale by one, within a worst-case error of two. `unsharp` is
-/// exact but amplifies the one-level difference upstream of it by `1 + 2 * amount` at an edge sample (measured
-/// after a scale: 3 at 1.5, 7 at 3, 11 at 5; after a blur on 6.1.1: 2 at 1, 3 at 1.5, 5-6 at 5), and its `>> 16`
-/// rounds up a level more with each further sharpen. So the plan refuses what passes two (one sharpen above 0.5,
-/// or a second one) after a scale or a blur, and nothing past it is held to a bound: see `render_plan.rs`,
-/// `a_sharpen_that_amplifies_a_scale_or_a_blur_past_two_levels_is_refused`.
-const EFFECT_SCALED: Limits = Limits {
-    y: 2,
-    uv: 2,
-    scaler_only: false,
-};
 
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
@@ -4079,7 +3778,6 @@ fn a_moving_zoom_behind_a_rotation_or_an_opacity_is_refused() {
         &assets,
         30.0,
         1.0,
-        EXACT,
         &refusing(
             "ZoomBehind(an opacity below 1)",
             |u| matches!(u, Unsupported::ZoomBehind(_, what) if what.contains("opacity")),
@@ -4146,7 +3844,6 @@ fn a_mask_cuts_the_alpha_as_geq_does() {
                 &assets,
                 30.0,
                 1.0,
-                EXACT,
             );
         }
     }
@@ -4216,13 +3913,13 @@ fn a_mask_cuts_the_alpha_as_geq_does() {
         ),
     ] {
         let (tl, assets) = over_bars(m, &|c| c.mask = Some(mask));
-        run(&format!("mask/{name}"), &tl, &assets, 30.0, 1.0, EXACT);
+        run(&format!("mask/{name}"), &tl, &assets, 30.0, 1.0);
     }
     // Over noise: every chroma block has its own alpha average to get right.
     let mut c = clip(&m.noise, 0.5, 1.5, 0.0);
     c.mask = Some(mask_of(kerf_core::MaskShape::Ellipse, 0.3, false));
     let tl = timeline(vec![vec![clip(&m.black, 0.5, 1.5, 0.0)], vec![c]], None);
-    run("mask/over noise", &tl, &[m.black.clone(), m.noise.clone()], 30.0, 1.0, EXACT);
+    run("mask/over noise", &tl, &[m.black.clone(), m.noise.clone()], 30.0, 1.0);
 }
 
 #[test]
@@ -4243,7 +3940,7 @@ fn a_mask_on_a_smaller_odd_sized_or_moved_layer() {
             c.transform.pos_y = pos.1;
             c.mask = Some(mask_of(kerf_core::MaskShape::Ellipse, 0.2, false));
         });
-        run(&format!("mask/{name}"), &tl, &assets, 30.0, 1.0, SCALED);
+        run(&format!("mask/{name}"), &tl, &assets, 30.0, 1.0);
     }
     // The same edge-of-the-picture ramp on an odd-sized layer: its last chroma column and row hold one luma
     // column and row fewer than a whole block.
@@ -4263,7 +3960,7 @@ fn a_mask_on_a_smaller_odd_sized_or_moved_layer() {
                 inverted: false,
             });
         });
-        run(&format!("mask/{name}"), &tl, &assets, 30.0, 1.0, SCALED);
+        run(&format!("mask/{name}"), &tl, &assets, 30.0, 1.0);
     }
     // A letterboxed picture: `pad` hands `geq` the whole padded frame, bars included, so the mask is the
     // canvas's size and cuts the bars too (a feathered ellipse on a 16:9 picture in a 9:16 frame).
@@ -4273,14 +3970,7 @@ fn a_mask_on_a_smaller_odd_sized_or_moved_layer() {
         vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]],
         Some(Delivery::new(360, 640, Fit::Contain)),
     );
-    run(
-        "mask/letterboxed 9:16",
-        &tl,
-        &[m.bars.clone(), m.testsrc.clone()],
-        30.0,
-        1.0,
-        SCALED,
-    );
+    run("mask/letterboxed 9:16", &tl, &[m.bars.clone(), m.testsrc.clone()], 30.0, 1.0);
     // A cropped clip in a frame of another shape.
     let mut c = clip(&m.testsrc, 0.5, 1.5, 0.0);
     c.transform.crop_left = 0.2;
@@ -4293,7 +3983,6 @@ fn a_mask_on_a_smaller_odd_sized_or_moved_layer() {
         std::slice::from_ref(&m.testsrc),
         30.0,
         1.0,
-        SCALED,
     );
 }
 
@@ -4308,7 +3997,7 @@ fn a_mask_fades_and_dissolves_on_its_own_alpha() {
         c.fade_in = 0.4;
         c.fade_out = 0.4;
     });
-    run("mask/fades", &tl, &assets, 30.0, 1.0, EXACT);
+    run("mask/fades", &tl, &assets, 30.0, 1.0);
     let out = clip(&m.bars, 0.5, 1.5, 0.0);
     let mut inc = clip(&m.testsrc, 0.5, 1.5, 1.0);
     inc.mask = Some(mask_of(kerf_core::MaskShape::Rect, 0.2, false));
@@ -4317,7 +4006,7 @@ fn a_mask_fades_and_dissolves_on_its_own_alpha() {
         duration: 0.5,
     });
     let tl = timeline(vec![vec![out, inc]], None);
-    run("mask/dissolve", &tl, &[m.bars.clone(), m.testsrc.clone()], 30.0, 2.0, EXACT);
+    run("mask/dissolve", &tl, &[m.bars.clone(), m.testsrc.clone()], 30.0, 2.0);
 }
 
 #[test]
@@ -4327,58 +4016,50 @@ fn effects_are_drawn_as_their_filters_draw_them() {
     use kerf_core::VideoEffect as E;
     // Grayscale and invert are tables: exact. A sharpen is integer arithmetic: exact. A blur is the
     // portable order of a float recursion that FFmpeg runs in SIMD (see `EFFECT`).
-    for (name, effects, limits) in [
-        ("grayscale", vec![E::Grayscale], EXACT),
-        ("invert", vec![E::Invert], EXACT),
-        ("gray then invert", vec![E::Grayscale, E::Invert], EXACT),
-        ("sharpen 1", vec![E::Sharpen { amount: 1.0 }], EXACT),
-        ("sharpen 2.5", vec![E::Sharpen { amount: 2.5 }], EXACT),
-        ("sharpen -1 (a blur)", vec![E::Sharpen { amount: -1.0 }], EXACT),
-        ("sharpen 0.7", vec![E::Sharpen { amount: 0.7 }], EXACT),
-        ("blur 0.5", vec![E::Blur { sigma: 0.5 }], EFFECT),
-        ("blur 2", vec![E::Blur { sigma: 2.0 }], EFFECT),
-        ("blur 6", vec![E::Blur { sigma: 6.0 }], EFFECT),
-        ("blur 20", vec![E::Blur { sigma: 20.0 }], EFFECT),
-        ("blur 6.3", vec![E::Blur { sigma: 6.3 }], EFFECT),
-        ("blur then invert", vec![E::Blur { sigma: 3.0 }, E::Invert], EFFECT),
-        ("invert then blur", vec![E::Invert, E::Blur { sigma: 3.0 }], EFFECT),
+    for (name, effects) in [
+        ("grayscale", vec![E::Grayscale]),
+        ("invert", vec![E::Invert]),
+        ("gray then invert", vec![E::Grayscale, E::Invert]),
+        ("sharpen 1", vec![E::Sharpen { amount: 1.0 }]),
+        ("sharpen 2.5", vec![E::Sharpen { amount: 2.5 }]),
+        ("sharpen -1 (a blur)", vec![E::Sharpen { amount: -1.0 }]),
+        ("sharpen 0.7", vec![E::Sharpen { amount: 0.7 }]),
+        ("blur 0.5", vec![E::Blur { sigma: 0.5 }]),
+        ("blur 2", vec![E::Blur { sigma: 2.0 }]),
+        ("blur 6", vec![E::Blur { sigma: 6.0 }]),
+        ("blur 20", vec![E::Blur { sigma: 20.0 }]),
+        ("blur 6.3", vec![E::Blur { sigma: 6.3 }]),
+        ("blur then invert", vec![E::Blur { sigma: 3.0 }, E::Invert]),
+        ("invert then blur", vec![E::Invert, E::Blur { sigma: 3.0 }]),
         // A sharpen after a blur amplifies the blur's own level (FFmpeg's SIMD order against ours) by its gain
         // (`1 + 2 * amount`): at half strength that is two levels (`EFFECT_SCALED`), past it the plan refuses
         // (below). Sharpens with nothing inexact ahead of them are exact, chained too.
         (
             "blur then sharpen 0.5",
             vec![E::Blur { sigma: 2.0 }, E::Sharpen { amount: 0.5 }],
-            EFFECT_SCALED,
         ),
-        (
-            "sharpen twice",
-            vec![E::Sharpen { amount: 1.0 }, E::Sharpen { amount: 2.0 }],
-            EXACT,
-        ),
+        ("sharpen twice", vec![E::Sharpen { amount: 1.0 }, E::Sharpen { amount: 2.0 }]),
         // A blur straight after the sharpen, the slowest pass to draw in front of it: the compute pass that
         // runs the blur must read the finished sharpen (`Compositor::settle`: lavapipe 23.2 did not wait).
         (
             "sharpen 2.5 then blur",
             vec![E::Sharpen { amount: 2.5 }, E::Blur { sigma: 3.0 }],
-            EFFECT,
         ),
         (
             "sharpen 0.5 then blur",
             vec![E::Sharpen { amount: 0.5 }, E::Blur { sigma: 3.0 }],
-            EFFECT,
         ),
         (
             "sharpen, gray, blur, invert",
             vec![E::Sharpen { amount: 1.0 }, E::Grayscale, E::Blur { sigma: 2.0 }, E::Invert],
-            EFFECT,
         ),
         // A vignette is exact: its dither runs on from the clip's first frame, which the cursor counts.
-        ("vignette", vec![E::Vignette], EXACT),
-        ("gray, vignette, invert", vec![E::Grayscale, E::Vignette, E::Invert], EXACT),
-        ("blur then vignette", vec![E::Blur { sigma: 2.0 }, E::Vignette], EFFECT),
+        ("vignette", vec![E::Vignette]),
+        ("gray, vignette, invert", vec![E::Grayscale, E::Vignette, E::Invert]),
+        ("blur then vignette", vec![E::Blur { sigma: 2.0 }, E::Vignette]),
     ] {
         let (tl, assets) = over_bars(m, &|c| c.effects = effects.clone());
-        run(&format!("effect/{name}"), &tl, &assets, 30.0, 0.5, limits);
+        run(&format!("effect/{name}"), &tl, &assets, 30.0, 0.5);
     }
     // A graded clip: `eq` runs ahead of every effect.
     let (tl, assets) = over_bars(m, &|c| {
@@ -4386,7 +4067,7 @@ fn effects_are_drawn_as_their_filters_draw_them() {
         c.color.saturation = 1.4;
         c.effects = vec![E::Blur { sigma: 3.0 }, E::Grayscale];
     });
-    run("effect/graded then blur, gray", &tl, &assets, 30.0, 0.5, EFFECT);
+    run("effect/graded then blur, gray", &tl, &assets, 30.0, 0.5);
     // Noise in all three planes, so every sample of a plane matters to its neighbours.
     for (name, effects) in [
         ("noise blur", vec![E::Blur { sigma: 2.5 }]),
@@ -4396,14 +4077,7 @@ fn effects_are_drawn_as_their_filters_draw_them() {
         let mut c = clip(&m.noise, 0.5, 1.5, 0.0);
         c.effects = effects;
         let tl = timeline(vec![vec![c]], None);
-        run(
-            &format!("effect/{name}"),
-            &tl,
-            std::slice::from_ref(&m.noise),
-            30.0,
-            0.4,
-            EFFECT,
-        );
+        run(&format!("effect/{name}"), &tl, std::slice::from_ref(&m.noise), 30.0, 0.4);
     }
     // A blur then a sharpen of half strength over noise (every sample on a tie of the blur's rounding is a
     // chance for the blur's level to be amplified): held to two levels.
@@ -4415,7 +4089,6 @@ fn effects_are_drawn_as_their_filters_draw_them() {
         std::slice::from_ref(&m.noise),
         30.0,
         0.4,
-        EFFECT_SCALED,
     );
     // After a scale: the effect sees the picture at the size it is drawn at (the zoom comes first
     // when it does not move).
@@ -4424,13 +4097,13 @@ fn effects_are_drawn_as_their_filters_draw_them() {
         c.transform.pos_x = 0.15;
         c.effects = vec![E::Blur { sigma: 3.0 }];
     });
-    run("effect/blur on a pip", &tl, &assets, 30.0, 0.5, EFFECT_SCALED);
+    run("effect/blur on a pip", &tl, &assets, 30.0, 0.5);
     // Odd sizes: the chroma planes round up and are blurred at their own size.
     let (tl, assets) = over_bars(m, &|c| {
         c.transform.scale = 0.33;
         c.effects = vec![E::Blur { sigma: 2.0 }, E::Sharpen { amount: 0.5 }];
     });
-    run("effect/odd 211x118", &tl, &assets, 30.0, 0.5, EFFECT_SCALED);
+    run("effect/odd 211x118", &tl, &assets, 30.0, 0.5);
     // A vignette's dither is the clip's own run: counted from its first output frame, whatever the clip's
     // place on the timeline, its speed or direction, and with the frames of a transition counted in it.
     let vignetted = |edit: &dyn Fn(&mut Clip)| {
@@ -4444,12 +4117,12 @@ fn effects_are_drawn_as_their_filters_draw_them() {
         c.transform.pos_x = 0.15;
         c.effects = vec![E::Vignette];
     });
-    run("effect/vignette on a pip", &tl, &assets, 30.0, 0.5, SCALED);
+    run("effect/vignette on a pip", &tl, &assets, 30.0, 0.5);
     let (tl, assets) = over_bars(m, &|c| {
         c.transform.scale = 0.33;
         c.effects = vec![E::Vignette];
     });
-    run("effect/vignette odd 211x118", &tl, &assets, 30.0, 0.5, SCALED);
+    run("effect/vignette odd 211x118", &tl, &assets, 30.0, 0.5);
     let late = vignetted(&|c| c.timeline_start = 0.5);
     check_motion(Check {
         case: "effect/vignette late start",
@@ -4457,7 +4130,6 @@ fn effects_are_drawn_as_their_filters_draw_them() {
         assets: std::slice::from_ref(&m.testsrc),
         opts: at_fps(30.0),
         frames: 15..44,
-        limits: EXACT,
         look: &[],
         refusing: None,
     });
@@ -4472,7 +4144,6 @@ fn effects_are_drawn_as_their_filters_draw_them() {
             assets: std::slice::from_ref(&m.testsrc),
             opts: at_fps(30.0),
             frames: 0..20,
-            limits: EXACT,
             look: &[],
             refusing: None,
         });
@@ -4493,7 +4164,6 @@ fn effects_are_drawn_as_their_filters_draw_them() {
         &[m.testsrc.clone(), m.bars.clone()],
         30.0,
         2.0,
-        EXACT,
     );
     // A chroma key: an alpha plane at the picture's size, from the chroma (exact), blended as a mask's is.
     for (name, effects) in [
@@ -4502,7 +4172,7 @@ fn effects_are_drawn_as_their_filters_draw_them() {
         ("chroma key after tables", vec![E::Invert, key("magenta", 0.25, 0.05)]),
     ] {
         let (tl, assets) = over_bars(m, &|c| c.effects = effects.clone());
-        run(&format!("effect/{name}"), &tl, &assets, 30.0, 0.5, EXACT);
+        run(&format!("effect/{name}"), &tl, &assets, 30.0, 0.5);
     }
     let mut c = clip(&m.noise, 0.5, 1.5, 0.0);
     c.effects = vec![key("0x808080", 0.05, 0.3)];
@@ -4512,7 +4182,6 @@ fn effects_are_drawn_as_their_filters_draw_them() {
         &[m.bars.clone(), m.noise.clone()],
         30.0,
         0.4,
-        EXACT,
     );
     // Through its fades and a dissolve (the ramp acts on the key's alpha).
     let (tl, assets) = over_bars(m, &|c| {
@@ -4520,7 +4189,7 @@ fn effects_are_drawn_as_their_filters_draw_them() {
         c.fade_in = 0.3;
         c.fade_out = 0.3;
     });
-    run("effect/chroma key with fades", &tl, &assets, 30.0, 1.0, EXACT);
+    run("effect/chroma key with fades", &tl, &assets, 30.0, 1.0);
     let out = clip(&m.bars, 0.5, 1.5, 0.0);
     let mut inc = clip(&m.testsrc, 0.5, 1.5, 1.0);
     inc.effects = vec![key("green", 0.2, 0.2)];
@@ -4534,9 +4203,14 @@ fn effects_are_drawn_as_their_filters_draw_them() {
         &[m.bars.clone(), m.testsrc.clone()],
         30.0,
         2.0,
-        EXACT,
     );
-    // A sharpen after a scale, up to half strength: the scaler's level through the filter's gain (2).
+    // A key after a blur: the blur is `gblur`'s to the sample, so the chroma the key reads is FFmpeg's.
+    for sigma in [1.0, 4.0] {
+        let (tl, assets) = over_bars(m, &|c| c.effects = vec![E::Blur { sigma }, key("green", 0.2, 0.2)]);
+        run(&format!("effect/chroma key after a blur {sigma}"), &tl, &assets, 30.0, 0.5);
+    }
+    // A sharpen after a scale: the scaler is swscale's to the sample (`caps.exact_scaler`) and a blur is `gblur`'s, so the filter's
+    // gain has no difference to amplify, at any amount, chained.
     for (name, effects) in [
         ("sharpen 0.5", vec![E::Sharpen { amount: 0.5 }]),
         (
@@ -4553,15 +4227,13 @@ fn effects_are_drawn_as_their_filters_draw_them() {
             c.transform.pos_x = 0.15;
             c.effects = effects.clone();
         });
-        run(&format!("effect/{name} on a pip"), &tl, &assets, 30.0, 0.5, EFFECT_SCALED);
+        run(&format!("effect/{name} on a pip"), &tl, &assets, 30.0, 0.5);
     }
-    // ...and past a gain of 2 refused, after a scale or a blur: FFmpeg renders them.
     for (name, effects) in [
         (
             "sharpen 0.5 twice",
             vec![E::Sharpen { amount: 0.5 }, E::Sharpen { amount: 0.5 }],
         ),
-        // Each further sharpen rounds up a level of its own, however small its amount.
         (
             "sharpen 0.2 twice",
             vec![E::Sharpen { amount: 0.2 }, E::Sharpen { amount: 0.2 }],
@@ -4588,16 +4260,9 @@ fn effects_are_drawn_as_their_filters_draw_them() {
             c.transform.pos_x = 0.15;
             c.effects = effects.clone();
         });
-        refused(
-            &format!("effect/{name} on a pip"),
-            &tl,
-            &assets,
-            &at_fps(30.0),
-            upto(1.0, 30.0),
-            "sharpen after a scale or a blur",
-        );
+        run(&format!("effect/{name} on a pip"), &tl, &assets, 30.0, 0.5);
     }
-    // After a blur, unscaled: the blur's level is amplified the same way.
+    // After a blur, unscaled.
     for (name, effects) in [
         (
             "blur then sharpen 0.6",
@@ -4621,14 +4286,7 @@ fn effects_are_drawn_as_their_filters_draw_them() {
         ),
     ] {
         let (tl, assets) = over_bars(m, &|c| c.effects = effects.clone());
-        refused(
-            &format!("effect/{name}"),
-            &tl,
-            &assets,
-            &at_fps(30.0),
-            upto(1.0, 30.0),
-            "sharpen after a scale or a blur",
-        );
+        run(&format!("effect/{name}"), &tl, &assets, 30.0, 0.5);
     }
     // A table on a letterbox: `pad`'s bars are part of the frame the effect sees, so they go through it
     // (invert makes them 239, 127, 127) and cover what is below.
@@ -4645,7 +4303,6 @@ fn effects_are_drawn_as_their_filters_draw_them() {
             &[m.bars.clone(), m.testsrc.clone()],
             30.0,
             0.5,
-            SCALED,
         );
     }
     // Rotated and translucent layers: the effect comes ahead of both.
@@ -4654,25 +4311,14 @@ fn effects_are_drawn_as_their_filters_draw_them() {
         c.transform.opacity = 0.7;
         c.effects = vec![E::Blur { sigma: 2.0 }];
     });
-    run(
-        "effect/blur on a translucent layer",
-        &tl,
-        &assets,
-        30.0,
-        0.5,
-        Limits {
-            y: 2,
-            uv: 2,
-            scaler_only: false,
-        },
-    );
+    run("effect/blur on a translucent layer", &tl, &assets, 30.0, 0.5);
     // In and out of a fade and a dissolve.
     let (tl, assets) = over_bars(m, &|c| {
         c.effects = vec![E::Blur { sigma: 2.0 }];
         c.fade_in = 0.3;
         c.fade_out = 0.3;
     });
-    run("effect/blur with fades", &tl, &assets, 30.0, 1.0, EFFECT);
+    run("effect/blur with fades", &tl, &assets, 30.0, 1.0);
 }
 
 #[test]
@@ -4714,7 +4360,7 @@ fn what_the_compositor_does_not_draw_of_an_effect_or_a_mask_is_refused() {
         &assets,
         &opts,
         upto(1.0, 30.0),
-        "chroma key after a scale or a blur",
+        "chroma key after a scale",
     );
     let (tl, assets) = over_bars(m, &|c| c.effects = vec![E::Blur { sigma: 2000.0 }]);
     refused(
@@ -4821,14 +4467,7 @@ fn untagged_hd_is_labelled_for_the_whole_graph_that_holds_a_matrix() {
         plan.layers[0].stream.label_bt709,
         "the graph holds a BT.709 clip: the HD clip is labelled"
     );
-    run(
-        "label/translucent-untagged-hd-before-a-709-clip",
-        &tl,
-        &assets,
-        30.0,
-        2.0,
-        HD_TRANSLUCENT,
-    );
+    run("label/translucent-untagged-hd-before-a-709-clip", &tl, &assets, 30.0, 2.0);
     // Over the BT.709 clip's own frames too: the translucent HD clip on a second track.
     let mut over = glass(h);
     over.timeline_start = 0.0;
@@ -4844,14 +4483,7 @@ fn untagged_hd_is_labelled_for_the_whole_graph_that_holds_a_matrix() {
         ],
         canvas,
     );
-    run(
-        "label/translucent-untagged-hd-over-a-709-clip",
-        &tl,
-        &assets,
-        30.0,
-        2.0,
-        HD_TRANSLUCENT,
-    );
+    run("label/translucent-untagged-hd-over-a-709-clip", &tl, &assets, 30.0, 2.0);
     // The control: the same HD frames with no BT.709 clip in the graph are not labelled, and drawn.
     let tl = timeline(vec![vec![glass(h)]], canvas);
     let plan = kerf_core::Planner::new(&tl, &assets, &at_fps(30.0), kerf_core::PlanRequest::motion(policy()))
@@ -4859,7 +4491,7 @@ fn untagged_hd_is_labelled_for_the_whole_graph_that_holds_a_matrix() {
         .at_frame(10)
         .unwrap();
     assert!(!plan.layers[0].stream.label_bt709);
-    run("label/translucent-untagged-hd-alone", &tl, &assets, 30.0, 1.0, HD_TRANSLUCENT);
+    run("label/translucent-untagged-hd-alone", &tl, &assets, 30.0, 1.0);
 }
 
 /// A dip to white is `yuv420p -> rgb24 -> yuv420p` around the fade, out of YUV with the clip's own matrix, so
@@ -4889,7 +4521,7 @@ fn a_labelled_hd_clip_dips_through_white_with_the_bt709_round_trip() {
         plan.layers[0].stream.label_bt709,
         "the graph holds a BT.709 clip: the dipping HD clip is labelled"
     );
-    run("label/dip-white-labelled-hd", &tl, &assets, 30.0, 2.0, WHITE_709);
+    run("label/dip-white-labelled-hd", &tl, &assets, 30.0, 2.0);
 }
 
 // ---- a yuv420p flagged full range ---------------------------------------------------------------
@@ -4967,18 +4599,11 @@ fn a_yuv420p_flagged_full_range_is_drawn_or_refused_as_the_export_reads_its_raw_
     let pc = std::slice::from_ref(&r.pc);
 
     // Plain: exact under FFmpeg 6; under FFmpeg 9 the cut is the export's flag. A cut that holds the clip too, either side of it.
-    run_full_range("range/pc-plain", &one(&r.pc, &|_| {}), pc, 30.0, 1.0, EXACT);
+    run_full_range("range/pc-plain", &one(&r.pc, &|_| {}), pc, 30.0, 1.0);
     let tl = timeline(vec![vec![clip(&m.black, 0.5, 1.5, 0.0), clip(&r.pc, 0.5, 1.5, 1.0)]], None);
-    run_full_range("range/black-then-pc", &tl, &[m.black.clone(), r.pc.clone()], 30.0, 2.0, EXACT);
+    run_full_range("range/black-then-pc", &tl, &[m.black.clone(), r.pc.clone()], 30.0, 2.0);
     let tl = timeline(vec![vec![clip(&r.pc, 0.5, 1.5, 0.0), clip(&m.testsrc, 0.5, 1.5, 1.0)]], None);
-    run_full_range(
-        "range/pc-then-limited",
-        &tl,
-        &[r.pc.clone(), m.testsrc.clone()],
-        30.0,
-        2.0,
-        EXACT,
-    );
+    run_full_range("range/pc-then-limited", &tl, &[r.pc.clone(), m.testsrc.clone()], 30.0, 2.0);
 
     // A fade: refused for the frames it runs in under FFmpeg 6 (the rest of the clip, plain, is exact there), and the
     // cut under FFmpeg 9.
@@ -4990,7 +4615,7 @@ fn a_yuv420p_flagged_full_range_is_drawn_or_refused_as_the_export_reads_its_raw_
         c.fade_in = 0.5;
         c.fade_out = 0.5;
     });
-    run_refusing("range/pc-fade", &tl, pc, 30.0, 1.0, EXACT, &fade_refused);
+    run_refusing("range/pc-fade", &tl, pc, 30.0, 1.0, &fade_refused);
     // The scaler resizes it (an enlargement, or a shrink over the bars): swscale converts the range inside the resize,
     // under either FFmpeg.
     let (tl, assets) = over_bars(&r.pc, &|c| c.transform.scale = 0.5);
@@ -5000,22 +4625,13 @@ fn a_yuv420p_flagged_full_range_is_drawn_or_refused_as_the_export_reads_its_raw_
         &assets,
         30.0,
         1.0,
-        SCALED,
         &full_range_resized_refused(),
     );
     let enlarged = timeline(
         vec![vec![clip(&r.pc, 0.5, 1.5, 0.0)]],
         Some(Delivery::new(960, 540, Fit::Contain)),
     );
-    run_refusing(
-        "range/pc-enlarged",
-        &enlarged,
-        pc,
-        30.0,
-        1.0,
-        EXACT,
-        &full_range_resized_refused(),
-    );
+    run_refusing("range/pc-enlarged", &enlarged, pc, 30.0, 1.0, &full_range_resized_refused());
 
     // What reads the values: refused on every frame, under both.
     let at = at_fps(30.0);
@@ -5044,15 +4660,15 @@ fn a_yuv420p_flagged_full_range_is_drawn_or_refused_as_the_export_reads_its_raw_
         let one_a = std::slice::from_ref(a);
         for (name, effects) in [("vignette", vec![E::Vignette]), ("invert", vec![E::Invert])] {
             let tl = one(a, &|c| c.effects = effects.clone());
-            run(&format!("range/{label}-{name}"), &tl, one_a, 30.0, 1.0, EXACT);
+            run(&format!("range/{label}-{name}"), &tl, one_a, 30.0, 1.0);
         }
         let tl = one(a, &|c| {
             c.fade_in = 0.5;
             c.fade_out = 0.5;
         });
-        run(&format!("range/{label}-fade"), &tl, one_a, 30.0, 1.0, EXACT);
+        run(&format!("range/{label}-fade"), &tl, one_a, 30.0, 1.0);
         let tl = one(a, &|c| c.color.gamma = 1.4);
-        run(&format!("range/{label}-graded"), &tl, one_a, 30.0, 1.0, EXACT);
+        run(&format!("range/{label}-graded"), &tl, one_a, 30.0, 1.0);
     }
 }
 
@@ -5227,7 +4843,7 @@ fn a_grade_at_the_pictures_size_is_the_export_to_the_level() {
             ("ramp", &m.ramp),
         ] {
             let (tl, assets) = graded_alone(asset, &grade, &|_| {});
-            run(&format!("grade/{name}, {source}"), &tl, &assets, 30.0, 0.4, EXACT);
+            run(&format!("grade/{name}, {source}"), &tl, &assets, 30.0, 0.4);
         }
     }
 }
@@ -5244,7 +4860,7 @@ fn a_grade_on_a_tagged_picture_goes_through_444() {
             let planner = Planner::new(&tl, &assets, &at_fps(30.0), PlanRequest::motion(policy())).unwrap();
             let route = planner.at_frame(3).unwrap().layers[0].grade_route().unwrap();
             assert!(route.via_444 && route.matrix == kerf_core::YuvMatrix::Bt709);
-            run(&format!("grade/{name}, {source}"), &tl, &assets, 30.0, 0.4, EXACT);
+            run(&format!("grade/{name}, {source}"), &tl, &assets, 30.0, 0.4);
         }
     }
     // Untagged HD beside a clip that names a matrix is labelled BT.709 by the graph, and graded as the file tagged so.
@@ -5265,7 +4881,7 @@ fn a_grade_on_a_tagged_picture_goes_through_444() {
         plan.layers[0].stream.label_bt709,
         "the graph holds a BT.709 clip: the HD clip is labelled"
     );
-    run("grade/labelled hd", &tl, &assets, 30.0, 2.0, EXACT);
+    run("grade/labelled hd", &tl, &assets, 30.0, 2.0);
 }
 
 /// What follows the grade in the chain is as it was: a colour correction ahead of it (the `eq`, static and keyed),
@@ -5287,36 +4903,36 @@ fn what_follows_a_grade_is_drawn_as_it_is_without_one() {
         c.color.saturation = 1.3;
         c.color.gamma = 1.1;
     });
-    run("grade/after an eq", &tl, &a, 30.0, 0.4, EXACT);
+    run("grade/after an eq", &tl, &a, 30.0, 0.4);
     let (tl, a) = on(&m.testsrc, curves, &|c| {
         c.set_property_keys(
             Property::Brightness,
             vec![PropertyKey::new(0.0, -0.1), PropertyKey::new(0.5, 0.1)],
         );
     });
-    run("grade/after a keyed eq", &tl, &a, 30.0, 0.4, EXACT);
+    run("grade/after a keyed eq", &tl, &a, 30.0, 0.4);
     let (tl, a) = on(&m.testsrc, wheels_and_lut, &|c| {
         c.speed = 2.0;
         c.source_out = 2.5;
     });
-    run("grade/at speed 2", &tl, &a, 30.0, 0.4, EXACT);
+    run("grade/at speed 2", &tl, &a, 30.0, 0.4);
     // (A crop that the canvas is cut to, so that nothing is resized.)
     let (mut tl, a) = on(&m.testsrc, wheels_and_lut, &|c| {
         c.transform.crop_left = 0.125;
         c.transform.crop_top = 0.25;
     });
     tl.format = Some(Delivery::new(560, 270, Fit::Contain));
-    run("grade/a cropped picture", &tl, &a, 30.0, 0.4, EXACT);
+    run("grade/a cropped picture", &tl, &a, 30.0, 0.4);
 
     // The alpha plane: `format=yuva420p` follows the grade.
     let (tl, a) = on(&m.testsrc, wheels_and_lut, &|c| c.transform.opacity = 0.6);
-    run("grade/translucent", &tl, &a, 30.0, 0.4, TRANSLUCENT);
+    run("grade/translucent", &tl, &a, 30.0, 0.4);
     let (tl, a) = on(&m.noise, curves, &|c| {
         c.mask = Some(mask_of(kerf_core::MaskShape::Ellipse, 0.2, false));
     });
-    run("grade/under a soft ellipse mask", &tl, &a, 30.0, 0.4, EXACT);
+    run("grade/under a soft ellipse mask", &tl, &a, 30.0, 0.4);
     let (tl, a) = on(&m.bars, wheels_and_lut, &|c| c.effects = vec![key("green", 0.3, 0.3)]);
-    run("grade/under a chroma key", &tl, &a, 30.0, 0.4, EXACT);
+    run("grade/under a chroma key", &tl, &a, 30.0, 0.4);
 
     // On a layer: placed by the overlay (no resize), over another track, and dissolving in and out (its alpha ramp).
     let mut upper = clip(&m.noise, 0.5, 1.5, 0.0);
@@ -5332,7 +4948,6 @@ fn what_follows_a_grade_is_drawn_as_it_is_without_one() {
         &[m.bars.clone(), m.noise.clone()],
         30.0,
         0.4,
-        EXACT,
     );
 
     let (out, mut inc) = (clip(&m.bars, 0.5, 1.5, 0.0), clip(&m.testsrc, 0.5, 1.5, 1.0));
@@ -5342,14 +4957,7 @@ fn what_follows_a_grade_is_drawn_as_it_is_without_one() {
         duration: 0.6,
     });
     let tl = timeline(vec![vec![out, inc]], None);
-    run(
-        "grade/dissolving in",
-        &tl,
-        &[m.bars.clone(), m.testsrc.clone()],
-        30.0,
-        2.0,
-        EXACT,
-    );
+    run("grade/dissolving in", &tl, &[m.bars.clone(), m.testsrc.clone()], 30.0, 2.0);
     let mut leaving = clip(&m.testsrc, 0.5, 1.5, 0.0);
     leaving.grade = all[4].1.clone();
     let mut next = clip(&m.bars, 0.5, 1.5, 1.0);
@@ -5358,19 +4966,12 @@ fn what_follows_a_grade_is_drawn_as_it_is_without_one() {
         duration: 0.6,
     });
     let tl = timeline(vec![vec![leaving, next]], None);
-    run(
-        "grade/dissolving out",
-        &tl,
-        &[m.bars.clone(), m.testsrc.clone()],
-        30.0,
-        2.0,
-        EXACT,
-    );
+    run("grade/dissolving out", &tl, &[m.bars.clone(), m.testsrc.clone()], 30.0, 2.0);
 
     let (tl, a) = on(&m.smooth, wheels_and_lut, &|c| c.transform.rotation = 20.0);
-    run_refusing("grade/rotated", &tl, &a, 30.0, 0.4, EXACT, &rotation_refused());
+    run_refusing("grade/rotated", &tl, &a, 30.0, 0.4, &rotation_refused());
     let (tl, a) = on(&m.smooth, wheels_and_lut, &|c| c.transform.rotation = 90.0);
-    run("grade/rotated a quarter", &tl, &a, 30.0, 0.4, EXACT);
+    run("grade/rotated a quarter", &tl, &a, 30.0, 0.4);
 
     // A fade that is not running leaves the picture where it is: the frames after a fade-in are drawn.
     let (tl, a) = on(&m.testsrc, wheels_and_lut, &|c| c.fade_in = 0.2);
@@ -5380,7 +4981,6 @@ fn what_follows_a_grade_is_drawn_as_it_is_without_one() {
         &a,
         30.0,
         0.8,
-        EXACT,
         &refusing("GradeWith", |u| matches!(u, Unsupported::GradeWith(..))),
     );
 }
@@ -5493,7 +5093,7 @@ fn what_the_compositor_does_not_draw_of_a_grade_is_refused() {
     let (tl, a) = one(&m.testsrc, &|c| {
         c.keyframes = vec![zoom_key(0.0, 1.0, 0.0, 0.0), zoom_key(1.0, 1.4, 0.0, 0.0)];
     });
-    run_range("grade/moving zoom", &tl, &a, 30.0, frames.clone(), EXACT);
+    run_range("grade/moving zoom", &tl, &a, 30.0, frames.clone());
     // A matrix with no measured round trip.
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("motion-media-grade");
     std::fs::create_dir_all(&dir).unwrap();
@@ -5573,16 +5173,16 @@ fn a_graded_layer_is_keyed_in_opacity_and_position_over_another_and_its_fades_ar
     for (name, grade) in [("all three", &heavy), ("wheels", &wheels)] {
         let mut c = graded(grade);
         c.set_property_keys(Property::Opacity, vec![key(0.0, 1.0), key(1.0, 0.2)]);
-        run(&format!("grade/keyed opacity, {name}"), &over(c), &assets, 30.0, 1.0, EXACT);
+        run(&format!("grade/keyed opacity, {name}"), &over(c), &assets, 30.0, 1.0);
     }
     let mut c = graded(&heavy);
     c.set_property_keys(Property::Opacity, vec![key(0.1, 0.0), key(0.9, 1.0)]);
-    run("grade/keyed opacity from nothing", &over(c), &assets, 30.0, 1.0, EXACT);
+    run("grade/keyed opacity from nothing", &over(c), &assets, 30.0, 1.0);
     // A keyed position that holds: the picture stays its own size and the overlay puts it off the canvas' edge.
     let mut c = graded(&heavy);
     c.set_property_keys(Property::PosX, vec![key(0.0, 0.3), key(1.0, 0.3)]);
     c.set_property_keys(Property::PosY, vec![key(0.0, -0.2), key(1.0, -0.2)]);
-    run("grade/keyed position, held", &over(c), &assets, 30.0, 1.0, EXACT);
+    run("grade/keyed position, held", &over(c), &assets, 30.0, 1.0);
     // One that moves is placed by the export's `perspective` after the grade: the placement reads the planes the grade
     // hands on, exact; with a keyed opacity below 1 it is the alpha plane's RGB round trip that is not drawn behind it.
     let mut c = graded(&heavy);
@@ -5610,7 +5210,6 @@ fn a_graded_layer_is_keyed_in_opacity_and_position_over_another_and_its_fades_ar
         &assets,
         30.0,
         1.0,
-        EXACT,
         &refusing("GradeWith", |u| matches!(u, Unsupported::GradeWith(..))),
     );
 }
@@ -5631,12 +5230,12 @@ fn a_grade_on_a_picture_tagged_smpte170m_or_bt470bg_is_the_601_matrix_the_tagged
                 route.via_444 && route.matrix == kerf_core::YuvMatrix::Bt601,
                 "{source}: {route:?}"
             );
-            run(&format!("grade/{name}, {source}"), &tl, &assets, 30.0, 0.4, EXACT);
+            run(&format!("grade/{name}, {source}"), &tl, &assets, 30.0, 0.4);
         }
     }
     let (_, heavy) = grades().remove(8);
     let (tl, assets) = graded_alone(&v.bars470bg, &heavy, &|_| {});
-    run("grade/lut, curves and wheels, bars470bg", &tl, &assets, 30.0, 0.4, EXACT);
+    run("grade/lut, curves and wheels, bars470bg", &tl, &assets, 30.0, 0.4);
 }
 
 /// A graded clip beside a clip of another colour matrix in the same cut (an untagged standard-definition one, which FFmpeg
@@ -5658,9 +5257,9 @@ fn a_graded_clip_beside_a_clip_of_another_matrix_is_refused_where_ffmpeg_convert
     );
     let case = |name: &str, tl: &Timeline, assets: &[Asset], secs: f64| {
         if negotiates {
-            run_refusing(name, tl, assets, 30.0, secs, EXACT, &mixed);
+            run_refusing(name, tl, assets, 30.0, secs, &mixed);
         } else {
-            run(name, tl, assets, 30.0, secs, EXACT);
+            run(name, tl, assets, 30.0, secs);
         }
     };
     for (name, grade) in [&all[1], &all[8]] {
@@ -5707,18 +5306,18 @@ fn a_graded_clip_beside_a_clip_of_its_own_matrix_is_drawn_in_either_order() {
         let mut g = clip(graded, 0.5, 1.5, 1.0);
         g.grade = grade.clone();
         let tl = timeline(vec![vec![clip(other, 0.5, 1.5, 0.0), g]], None);
-        run(&format!("grade/{name}, graded second"), &tl, &assets, 30.0, 2.0, EXACT);
+        run(&format!("grade/{name}, graded second"), &tl, &assets, 30.0, 2.0);
         let mut g = clip(graded, 0.5, 1.5, 0.0);
         g.grade = grade.clone();
         let tl = timeline(vec![vec![g, clip(other, 0.5, 1.5, 1.0)]], None);
-        run(&format!("grade/{name}, graded first"), &tl, &assets, 30.0, 2.0, EXACT);
+        run(&format!("grade/{name}, graded first"), &tl, &assets, 30.0, 2.0);
     }
     // The tagged way out (smpte170m / bt470bg: BT.601's coefficients through 4:4:4) beside an untagged clip.
     let mut g = clip(&v.testsrc170m, 0.5, 1.5, 1.0);
     g.grade = grade;
     let assets = [m.bars.clone(), v.testsrc170m.clone()];
     let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0), g]], None);
-    run("grade/smpte170m after untagged", &tl, &assets, 30.0, 2.0, EXACT);
+    run("grade/smpte170m after untagged", &tl, &assets, 30.0, 2.0);
 }
 
 // ---- layers of another matrix than the bottom's -----------------------------------------------------------
@@ -5813,14 +5412,7 @@ fn layers_of_another_matrix_are_converted_into_the_bottom_ones() {
     ];
     for (name, first, second) in pairs {
         let tl = timeline(vec![vec![clip(first, 0.5, 1.5, 0.0), clip(second, 0.5, 1.5, 1.0)]], None);
-        run(
-            &format!("convert/{name}"),
-            &tl,
-            &[first.clone(), second.clone()],
-            30.0,
-            2.0,
-            EXACT,
-        );
+        run(&format!("convert/{name}"), &tl, &[first.clone(), second.clone()], 30.0, 2.0);
     }
     // One matrix is not a mix (BT.601's coefficients under a tag, untagged beside it): nothing converted, drawn as ever.
     let tl = timeline(
@@ -5833,7 +5425,6 @@ fn layers_of_another_matrix_are_converted_into_the_bottom_ones() {
         &[m.testsrc.clone(), v.testsrc170m.clone()],
         30.0,
         2.0,
-        EXACT,
     );
     // Busy: every Y, U, V and the clipped RGB, converted from a tag to another.
     let tl = timeline(
@@ -5846,7 +5437,6 @@ fn layers_of_another_matrix_are_converted_into_the_bottom_ones() {
         &[x.noise709.clone(), m.noise.clone()],
         30.0,
         2.0,
-        EXACT,
     );
     // A clip over another track, whole frame and shrunk (a picture-in-picture: the picture is scaled, then converted), over a
     // bottom layer of the other matrix and under one.
@@ -5860,14 +5450,7 @@ fn layers_of_another_matrix_are_converted_into_the_bottom_ones() {
         pip.transform.pos_x = 0.2;
         pip.transform.pos_y = -0.1;
         let tl = timeline(vec![vec![clip(bottom, 0.5, 1.5, 0.0)], vec![pip]], None);
-        run(
-            &format!("convert/{name}"),
-            &tl,
-            &[bottom.clone(), top.clone()],
-            30.0,
-            1.0,
-            EXACT,
-        );
+        run(&format!("convert/{name}"), &tl, &[bottom.clone(), top.clone()], 30.0, 1.0);
         let tl = timeline(vec![vec![clip(bottom, 0.5, 1.5, 0.0)], vec![clip(top, 0.5, 1.5, 0.0)]], None);
         run(
             &format!("convert/{}, whole frame", name.replace("pip", "layer")),
@@ -5875,7 +5458,6 @@ fn layers_of_another_matrix_are_converted_into_the_bottom_ones() {
             &[bottom.clone(), top.clone()],
             30.0,
             1.0,
-            EXACT,
         );
     }
     // The graph's order, not the timeline's: the bottom track's clip is later than the upper track's, so for the first second the
@@ -5885,14 +5467,7 @@ fn layers_of_another_matrix_are_converted_into_the_bottom_ones() {
         ("untagged bottom, 709 first", &m.testsrc, &v.testsrc709),
     ] {
         let tl = timeline(vec![vec![clip(bottom, 0.5, 1.5, 1.0)], vec![clip(top, 0.5, 1.5, 0.0)]], None);
-        run(
-            &format!("convert/{name}"),
-            &tl,
-            &[bottom.clone(), top.clone()],
-            30.0,
-            2.0,
-            EXACT,
-        );
+        run(&format!("convert/{name}"), &tl, &[bottom.clone(), top.clone()], 30.0, 2.0);
     }
     // A phone clip shrunk into a landscape frame (bars at the sides, the picture scaled and then converted), in a sequence
     // of the two matrices, and over a wide clip of the other.
@@ -5908,7 +5483,6 @@ fn layers_of_another_matrix_are_converted_into_the_bottom_ones() {
             &[first.clone(), second.clone()],
             30.0,
             2.0,
-            EXACT,
         );
     }
     let tl = timeline(
@@ -5924,7 +5498,6 @@ fn layers_of_another_matrix_are_converted_into_the_bottom_ones() {
         &[x.wide709.clone(), x.portrait601.clone()],
         30.0,
         1.0,
-        EXACT,
     );
     let tl = timeline(
         vec![
@@ -5939,7 +5512,6 @@ fn layers_of_another_matrix_are_converted_into_the_bottom_ones() {
         &[x.wide601.clone(), x.portrait709.clone()],
         30.0,
         1.0,
-        EXACT,
     );
     // Dissolving into a clip of the other matrix, the way a phone vlog does. The incoming clip is on an alpha plane
     // (`format=yuva420p`, the alpha `fade`), which makes it the one that decides the composite's matrix (the first such clip's):
@@ -5963,7 +5535,6 @@ fn layers_of_another_matrix_are_converted_into_the_bottom_ones() {
             &assets,
             30.0,
             2.0,
-            EXACT,
         );
         for kind in [TransitionKind::SlideLeft, TransitionKind::PushUp] {
             let mut incoming = clip(second, 0.5, 1.5, 1.0);
@@ -5975,7 +5546,6 @@ fn layers_of_another_matrix_are_converted_into_the_bottom_ones() {
                 &assets,
                 30.0,
                 2.0,
-                EXACT,
             );
         }
         let mut incoming = clip(second, 0.5, 1.5, 1.0);
@@ -5986,9 +5556,9 @@ fn layers_of_another_matrix_are_converted_into_the_bottom_ones() {
         let tl = timeline(vec![vec![clip(first, 0.5, 1.5, 0.0), incoming]], landscape);
         let case = format!("convert/{name} through DipToBlack, letterboxed");
         if negotiates {
-            run_refusing(&case, &tl, &assets, 30.0, 2.0, EXACT, &matrix_conversion_refused());
+            run_refusing(&case, &tl, &assets, 30.0, 2.0, &matrix_conversion_refused());
         } else {
-            run(&case, &tl, &assets, 30.0, 2.0, EXACT);
+            run(&case, &tl, &assets, 30.0, 2.0);
         }
     }
     // The chain of a phone vlog: four clips of alternating matrices, each dissolving into the one before, and every combination of
@@ -6071,9 +5641,9 @@ fn layers_of_another_matrix_are_converted_into_the_bottom_ones() {
         let secs = clips.len() as f64;
         let case = format!("convert/chain: {name}");
         if *converts_a_dissolve && negotiates {
-            run_refusing(&case, &tl, &assets, 30.0, secs, EXACT, &matrix_conversion_refused());
+            run_refusing(&case, &tl, &assets, 30.0, secs, &matrix_conversion_refused());
         } else {
-            run(&case, &tl, &assets, 30.0, secs, EXACT);
+            run(&case, &tl, &assets, 30.0, secs);
         }
     }
     // The same chains of pictures of the canvas's size (the chain does not resize them): a dissolving clip that is converted is
@@ -6090,14 +5660,7 @@ fn layers_of_another_matrix_are_converted_into_the_bottom_ones() {
         ),
     ] {
         let (tl, assets) = sequence(&clips, None);
-        run(
-            &format!("convert/chain: {name}"),
-            &tl,
-            &assets,
-            30.0,
-            clips.len() as f64,
-            EXACT,
-        );
+        run(&format!("convert/chain: {name}"), &tl, &assets, 30.0, clips.len() as f64);
     }
     // The clip's own fade-in on the converted clip is a fade to black ahead of the conversion: refused while it runs, drawn after.
     let mut faded = clip(&m.testsrc, 0.5, 1.5, 1.0);
@@ -6111,23 +5674,22 @@ fn layers_of_another_matrix_are_converted_into_the_bottom_ones() {
             &assets,
             30.0,
             2.0,
-            EXACT,
             &matrix_conversion_refused(),
         );
     } else {
-        run("convert/fade-in on the converted clip", &tl, &assets, 30.0, 2.0, EXACT);
+        run("convert/fade-in on the converted clip", &tl, &assets, 30.0, 2.0);
     }
     // ... and on the bottom clip, which is not converted: drawn throughout.
     let mut faded = clip(&v.testsrc709, 0.5, 1.5, 0.0);
     faded.fade_in = 0.4;
     faded.fade_out = 0.4;
     let tl = timeline(vec![vec![faded, clip(&m.testsrc, 0.5, 1.5, 1.0)]], None);
-    run("convert/fade-in and out on the bottom clip", &tl, &assets, 30.0, 2.0, EXACT);
+    run("convert/fade-in and out on the bottom clip", &tl, &assets, 30.0, 2.0);
     // Speed does not matter to the conversion.
     let mut quick = clip(&m.testsrc, 0.5, 2.5, 1.0);
     quick.speed = 2.0;
     let tl = timeline(vec![vec![clip(&v.testsrc709, 0.5, 1.5, 0.0), quick]], None);
-    run("convert/speed 2", &tl, &assets, 30.0, 2.0, EXACT);
+    run("convert/speed 2", &tl, &assets, 30.0, 2.0);
     // Drawn, converted, with what comes before the conversion in the chain: a pointwise effect (a table the scale applies), a 4:2:2 or
     // 4:4:4 picture (the decode makes the 4:2:0 a `format=yuv420p` makes of it), a plain layer over a blurred fill (the whole filled
     // frame is converted).
@@ -6138,14 +5700,7 @@ fn layers_of_another_matrix_are_converted_into_the_bottom_ones() {
         let mut c = clip(&m.testsrc, 0.5, 1.5, 1.0);
         c.effects = vec![effect];
         let tl = timeline(vec![vec![clip(&v.testsrc709, 0.5, 1.5, 0.0), c]], None);
-        run(
-            &format!("convert/{name} on the converted clip"),
-            &tl,
-            &assets,
-            30.0,
-            2.0,
-            EXACT,
-        );
+        run(&format!("convert/{name} on the converted clip"), &tl, &assets, 30.0, 2.0);
     }
     for (name, picture) in [("4:4:4", &v.yuv444), ("4:2:2", &v.yuv422)] {
         let tl = timeline(
@@ -6158,7 +5713,6 @@ fn layers_of_another_matrix_are_converted_into_the_bottom_ones() {
             &[v.testsrc709.clone(), picture.clone()],
             30.0,
             2.0,
-            EXACT,
         );
         let tl = timeline(
             vec![vec![clip(&v.testsrc709, 0.5, 1.5, 0.0)], vec![clip(picture, 0.5, 1.5, 0.0)]],
@@ -6170,7 +5724,6 @@ fn layers_of_another_matrix_are_converted_into_the_bottom_ones() {
             &[v.testsrc709.clone(), picture.clone()],
             30.0,
             1.0,
-            EXACT,
         );
     }
     let blurred = Some(Delivery::new(960, 540, Fit::Blur));
@@ -6185,7 +5738,6 @@ fn layers_of_another_matrix_are_converted_into_the_bottom_ones() {
             &[first.clone(), second.clone()],
             30.0,
             2.0,
-            EXACT,
         );
     }
     // What the conversion does not cover keeps the frame FFmpeg's, in every frame of the cut: a colour correction (its `eq` may carry a
@@ -6211,14 +5763,14 @@ fn layers_of_another_matrix_are_converted_into_the_bottom_ones() {
         let tl = timeline(vec![vec![clip(&v.testsrc709, 0.5, 1.5, 0.0), c]], None);
         let case = format!("convert/refused: {name}");
         if negotiates {
-            run_refusing(&case, &tl, &assets, 30.0, 2.0, EXACT, &matrix_conversion_refused());
+            run_refusing(&case, &tl, &assets, 30.0, 2.0, &matrix_conversion_refused());
         } else {
-            // (Under a fixed matrix nothing is converted and these are drawn as they are, a translucent layer at the ladder of
-            // its own: `TRANSLUCENT`; a turn that is not a quarter is no layer's to draw under any matrix.)
+            // (Under a fixed matrix nothing is converted and these are drawn as they are, a translucent layer exact like any other;
+            // a turn that is not a quarter is no layer's to draw under any matrix.)
             match name {
-                "an opacity" => run(&case, &tl, &assets, 30.0, 2.0, TRANSLUCENT),
-                "a rotation" => run_refusing(&case, &tl, &assets, 30.0, 2.0, EXACT, &rotation_refused()),
-                _ => run(&case, &tl, &assets, 30.0, 2.0, SCALED),
+                "an opacity" => run(&case, &tl, &assets, 30.0, 2.0),
+                "a rotation" => run_refusing(&case, &tl, &assets, 30.0, 2.0, &rotation_refused()),
+                _ => run(&case, &tl, &assets, 30.0, 2.0),
             }
         }
     }
@@ -6288,7 +5840,7 @@ fn blurred(w: u32, h: u32) -> Option<Delivery> {
 /// Half a second of `asset` from the middle of its four, alone in a `w` x `h` frame that fits over a blurred copy.
 fn filled(case: &str, asset: &Asset, w: u32, h: u32) {
     let tl = timeline(vec![vec![clip(asset, 0.5, 1.5, 0.0)]], blurred(w, h));
-    run(case, &tl, std::slice::from_ref(asset), 30.0, 0.5, EXACT);
+    run(case, &tl, std::slice::from_ref(asset), 30.0, 0.5);
 }
 
 /// The fill in the shapes a delivery has: a portrait phone clip in a landscape frame, the other way round, a square,
@@ -6337,7 +5889,6 @@ fn a_blurred_fill_is_drawn_as_the_export_draws_it() {
         std::slice::from_ref(&m.portrait),
         10.0,
         0.3,
-        EXACT,
     );
 }
 
@@ -6384,14 +5935,7 @@ fn a_blurred_fill_fades_dissolves_and_travels_with_its_clip() {
     let mut c = clip(&m.portrait, 0.5, 1.5, 0.0);
     c.fade_in = 0.4;
     c.fade_out = 0.4;
-    run(
-        "blur/fade in and out",
-        &timeline(vec![vec![c]], frame),
-        &assets,
-        30.0,
-        1.0,
-        EXACT,
-    );
+    run("blur/fade in and out", &timeline(vec![vec![c]], frame), &assets, 30.0, 1.0);
     // Dissolves: a fill into a fill, a fill into a picture of the frame's shape, and the other way round.
     for (name, from, to) in [
         ("portrait to portrait", &m.portrait, &m.portrait),
@@ -6408,7 +5952,7 @@ fn a_blurred_fill_fades_dissolves_and_travels_with_its_clip() {
             let mut inc = clip(to, 0.5, 1.5, 1.0);
             inc.transition_in = Some(Transition { kind, duration: secs });
             let tl = timeline(vec![vec![out, inc]], frame);
-            run(&format!("blur/{kind_name} {name}"), &tl, &assets, 30.0, 2.0, EXACT);
+            run(&format!("blur/{kind_name} {name}"), &tl, &assets, 30.0, 2.0);
         }
     }
     // The slides and pushes move the padded frame as a whole.
@@ -6426,7 +5970,7 @@ fn a_blurred_fill_fades_dissolves_and_travels_with_its_clip() {
         let mut inc = clip(&m.portrait, 1.0, 2.0, 1.0);
         inc.transition_in = Some(Transition { kind, duration: 0.5 });
         let tl = timeline(vec![vec![out, inc]], frame);
-        run(&format!("blur/{kind:?} portrait to portrait"), &tl, &assets, 30.0, 2.0, EXACT);
+        run(&format!("blur/{kind:?} portrait to portrait"), &tl, &assets, 30.0, 2.0);
     }
     // A dip to white whitens the bars too, through an RGB round trip the compositor draws for the picture alone: refused
     // (the plan says why: a letterbox), and the frames either side of it are the export's.
@@ -6442,7 +5986,6 @@ fn a_blurred_fill_fades_dissolves_and_travels_with_its_clip() {
         &assets,
         30.0,
         2.0,
-        EXACT,
         &dip_refused(DipWhy::Letterboxed),
     );
 }
@@ -6459,7 +6002,7 @@ fn a_blurred_fill_covers_what_is_below_it_and_is_drawn_on_by_what_is_above() {
         vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![clip(&m.portrait, 0.5, 1.5, 0.0)]],
         frame,
     );
-    run("blur/over bars", &tl, &assets, 30.0, 1.0, EXACT);
+    run("blur/over bars", &tl, &assets, 30.0, 1.0);
     // A picture-in-picture over a filled clip (the PiP is placed with Contain's chain, whatever the delivery's fit).
     let mut pip = clip(&m.testsrc, 0.5, 1.5, 0.0);
     pip.transform = kerf_core::Transform {
@@ -6469,19 +6012,19 @@ fn a_blurred_fill_covers_what_is_below_it_and_is_drawn_on_by_what_is_above() {
         ..kerf_core::Transform::default()
     };
     let tl = timeline(vec![vec![clip(&m.portrait, 0.5, 1.5, 0.0)], vec![pip]], frame);
-    run("blur/under a pip", &tl, &assets, 30.0, 1.0, EXACT);
+    run("blur/under a pip", &tl, &assets, 30.0, 1.0);
     // A filled clip that starts later and ends earlier than the one below.
     let tl = timeline(
         vec![vec![clip(&m.noise, 0.0, 2.0, 0.0)], vec![clip(&m.portrait, 0.5, 1.0, 0.5)]],
         frame,
     );
-    run("blur/over noise, in the middle", &tl, &assets, 30.0, 2.0, EXACT);
+    run("blur/over noise, in the middle", &tl, &assets, 30.0, 2.0);
     // Two filled clips, one over the other: the upper covers the lower.
     let tl = timeline(
         vec![vec![clip(&m.portrait, 0.5, 1.5, 0.0)], vec![clip(&m.portrait, 1.5, 2.5, 0.0)]],
         frame,
     );
-    run("blur/over another fill", &tl, &assets, 30.0, 1.0, EXACT);
+    run("blur/over another fill", &tl, &assets, 30.0, 1.0);
     // A clip the fill does not suit is placed with Contain's chain, byte for byte: a zoomed one, a moved one, a rotated one,
     // a translucent one, a masked one.
     for (name, edit) in [
@@ -6494,7 +6037,7 @@ fn a_blurred_fill_covers_what_is_below_it_and_is_drawn_on_by_what_is_above() {
         let mut c = clip(&m.portrait, 0.5, 1.5, 0.0);
         edit(&mut c);
         let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], frame);
-        run(&format!("blur/not taken: {name}"), &tl, &assets, 30.0, 1.0, EXACT);
+        run(&format!("blur/not taken: {name}"), &tl, &assets, 30.0, 1.0);
     }
 }
 
@@ -6581,7 +6124,6 @@ fn a_blurred_fill_goes_through_the_clips_colour_and_timing() {
             &assets,
             30.0,
             0.5,
-            EXACT,
         );
     }
     // (`negate` maps limited range to limited range since FFmpeg 5; 4.4's inverts the byte, which no `invert` case of this
@@ -6602,7 +6144,6 @@ fn a_blurred_fill_goes_through_the_clips_colour_and_timing() {
             &assets,
             30.0,
             0.5,
-            EXACT,
         );
     }
     let mut keyed = colour_keyed(&m.portrait, &[Property::Brightness, Property::Contrast], &linear_keys);
@@ -6614,37 +6155,15 @@ fn a_blurred_fill_goes_through_the_clips_colour_and_timing() {
         30.0,
         1.0,
         10,
-        EXACT,
     );
     // Timing.
-    run(
-        "blur/speed 2",
-        &one(&m.portrait, &|c| c.speed = 2.0),
-        &assets,
-        30.0,
-        0.5,
-        EXACT,
-    );
-    run(
-        "blur/speed 0.5",
-        &one(&m.portrait, &|c| c.speed = 0.5),
-        &assets,
-        30.0,
-        0.5,
-        EXACT,
-    );
-    run(
-        "blur/reversed",
-        &one(&m.portrait, &|c| c.speed = -1.0),
-        &assets,
-        30.0,
-        0.5,
-        EXACT,
-    );
-    run("blur/at 24 fps", &one(&m.portrait, &|_| {}), &assets, 24.0, 0.5, EXACT);
+    run("blur/speed 2", &one(&m.portrait, &|c| c.speed = 2.0), &assets, 30.0, 0.5);
+    run("blur/speed 0.5", &one(&m.portrait, &|c| c.speed = 0.5), &assets, 30.0, 0.5);
+    run("blur/reversed", &one(&m.portrait, &|c| c.speed = -1.0), &assets, 30.0, 0.5);
+    run("blur/at 24 fps", &one(&m.portrait, &|_| {}), &assets, 24.0, 0.5);
     // A source whose picture starts late (a still image is RGB or full range: refused, below).
     let tl = timeline(vec![vec![clip(&m.late, 0.5, 1.5, 0.0)]], blurred(360, 640));
-    run("blur/late-starting source in 360x640", &tl, &assets, 30.0, 1.0, EXACT);
+    run("blur/late-starting source in 360x640", &tl, &assets, 30.0, 1.0);
 }
 
 /// Whether this FFmpeg's `negate` takes limited-range black (16) to limited-range white (235), as the compositor's table
@@ -6687,7 +6206,7 @@ fn a_blurred_fill_in_every_matrix_and_range() {
         ("flagged nothing", &r.unflagged),
     ] {
         let tl = timeline(vec![vec![clip(a, 0.5, 1.5, 0.0)]], frame);
-        run(&format!("blur/{name}"), &tl, std::slice::from_ref(a), 30.0, 0.5, EXACT);
+        run(&format!("blur/{name}"), &tl, std::slice::from_ref(a), 30.0, 0.5);
     }
     // A BT.709 clip beside an untagged one: one matrix under FFmpeg 6, two under FFmpeg 9, where the layer of the other matrix is
     // converted into the first clip's after the whole frame (the fill included: a plain layer over a blurred fill is converted
@@ -6701,7 +6220,7 @@ fn a_blurred_fill_in_every_matrix_and_range() {
             frame,
         );
         let assets = [first.clone(), second.clone()];
-        run(&format!("blur/{name}"), &tl, &assets, 30.0, 0.5, EXACT);
+        run(&format!("blur/{name}"), &tl, &assets, 30.0, 0.5);
     }
 }
 
@@ -6811,7 +6330,6 @@ fn a_blurred_fill_is_refused_where_it_is_not_the_exports() {
             std::slice::from_ref(&m.portrait),
             30.0,
             0.5,
-            EXACT,
         );
     }
     // A frame too small for the thumbnail's box blur (a 4x4 thumbnail has 2-sample chroma lines; the box reads past them).
@@ -6852,7 +6370,6 @@ fn what_runs_on_the_padded_frame_stays_ffmpegs_under_a_fill() {
             &[m.bars.clone(), m.portrait.clone()],
             30.0,
             0.5,
-            EXACT,
             &matte,
         );
     }
@@ -6873,7 +6390,7 @@ fn forced_blends(body: impl FnOnce()) {
 /// the frame's top edge, which is the bug) to hold the arithmetic itself to the export's planes.
 fn blend_run(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, secs: f64, forced_ok: bool) {
     if compositor().caps().blend == kerf_core::BlendKinds::ALL {
-        return run(case, tl, assets, fps, secs, EXACT);
+        return run(case, tl, assets, fps, secs);
     }
     refused(
         case,
@@ -6884,7 +6401,7 @@ fn blend_run(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, secs: f64, f
         "no compositor pass draws this mode",
     );
     if forced_ok {
-        forced_blends(|| run(&format!("{case} (forced)"), tl, assets, fps, secs, EXACT));
+        forced_blends(|| run(&format!("{case} (forced)"), tl, assets, fps, secs));
     }
 }
 
@@ -10298,8 +9815,7 @@ fn checker_e_the_lifts_are_refused_where_the_probe_did_not_measure_them() {
 /// A quarter-turned blended clip whose opacity is keyed: the `geq` that makes the alpha runs on the picture before the turn, so whatever it does
 /// at the picture's last column and row (it reads them one in on some FFmpeg builds, `GeqEdge`) lands on another edge of the turned box. Held to
 /// the export at every quarter, in several modes, moved and not, over the first frames (the opacity runs from 1 to 0.2 across the clip). The same
-/// clip plain (no blend mode) is the control, printed and not judged: it says whether a mismatch is the blend's or the turn's. (On FFmpeg 6.1.1 the
-/// 90, 180 and 450 degree cases differ, the control's chroma too: the plan lets the turned layer's `geq` alpha through.)
+/// clip plain (no blend mode) is held to the export too, and says in its failure whether a mismatch is the blend's or the turn's.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn checker_e_a_turned_blended_clip_with_a_keyed_opacity() {
@@ -10339,11 +9855,7 @@ fn checker_e_a_turned_blended_clip_with_a_keyed_opacity() {
                 eprintln!("{}", scan.line(&case));
                 CE_DRAWN.with(|d| d.set(d.get() + scan.drawn));
                 if let Some(why) = scan.verdict(None) {
-                    if mode == BlendMode::Normal {
-                        eprintln!("CONTROL (no blend mode, the plain layer's own path) {case}: {why} (round {k})");
-                    } else {
-                        failures.push(format!("{case}: {why} (round {k})"));
-                    }
+                    failures.push(format!("{case}: {why} (round {k})"));
                 }
             }
         }
@@ -10360,9 +9872,9 @@ fn r3_keyed(c: &mut Clip, to: f64) {
     c.set_property_keys(Property::Opacity, vec![PropertyKey::new(0.0, 1.0), PropertyKey::new(0.5, to)]);
 }
 
-/// `ce_check` for a layer whose picture the compositor's scaler or a crop touches: a plain layer it resizes is the scaler's ladder, not this
-/// change's, so when the keyed cut differs the same cut with a constant opacity (the control) says whether the difference was already there.
-/// A difference the control does not have is a failure; one it has is `known` (printed, not judged).
+/// `ce_check` for a layer whose picture the compositor's scaler or a crop touches. Every drawn frame must be the export's; when the keyed cut
+/// differs the same cut with a constant opacity (the control) is run too, and the failure says whether the control differs as well (which
+/// tells a fault of the keyed path from one of the plain layer under it). Either way it is a failure.
 #[allow(clippy::too_many_arguments)]
 fn r3_check(
     case: &str,
@@ -10373,7 +9885,6 @@ fn r3_check(
     secs: f64,
     draws: Option<bool>,
     failures: &mut Vec<String>,
-    known: &mut Vec<String>,
 ) -> CeScan {
     let scan = ce_scan(case, tl, assets, &at_fps(fps), upto(secs, fps), false);
     eprintln!("{}", scan.line(case));
@@ -10383,22 +9894,19 @@ fn r3_check(
         let name = format!("{case} (control: constant opacity)");
         let c = ce_scan(&name, control, assets, &at_fps(fps), upto(secs, fps), false);
         eprintln!("{}", c.line(&name));
-        if !c.exact() {
-            known.push(format!(
-                "{case}: {why} -- the control differs too (Y {} UV {})",
-                c.y.differing, c.uv.differing
-            ));
-            return scan;
-        }
+        failures.push(format!(
+            "{case}: {why} -- the control {} (Y {} UV {})",
+            if c.exact() { "is exact" } else { "differs too" },
+            c.y.differing,
+            c.uv.differing
+        ));
+        return scan;
     }
     failures.push(format!("{case}: {why}"));
     scan
 }
 
-fn r3_finish(what: &str, mut failures: Vec<String>, known: &[String]) {
-    for k in known {
-        eprintln!("KNOWN (not this change's) {k}");
-    }
+fn r3_finish(what: &str, mut failures: Vec<String>) {
     ce_expect_drawn(what, &mut failures);
     assert!(failures.is_empty(), "{} cases: {failures:#?}", failures.len());
 }
@@ -10410,7 +9918,6 @@ fn r3_finish(what: &str, mut failures: Vec<String>, known: &[String]) {
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn checker_e_r3_a_turned_keyed_opacity_at_odd_sizes_and_offsets() {
     let mut failures = Vec::new();
-    let mut known = Vec::new();
     let mut n = 0;
     for (w, h) in [
         (130, 66),
@@ -10448,17 +9955,12 @@ fn checker_e_r3_a_turned_keyed_opacity_at_odd_sizes_and_offsets() {
                         0.3,
                         draws,
                         &mut failures,
-                        &mut known,
                     );
                 }
             }
         }
     }
-    r3_finish(
-        "checker_e_r3_a_turned_keyed_opacity_at_odd_sizes_and_offsets",
-        failures,
-        &known,
-    );
+    r3_finish("checker_e_r3_a_turned_keyed_opacity_at_odd_sizes_and_offsets", failures);
 }
 
 /// A keyed opacity on a turned layer with a mask (refused: a mask on a rotated layer), with a crop (odd picture sizes), with a static zoom (a
@@ -10470,7 +9972,6 @@ fn checker_e_r3_a_turned_keyed_opacity_with_a_mask_a_crop_or_a_zoom() {
     use kerf_core::{BlendMode, Property, PropertyKey};
     let m = media();
     let mut failures = Vec::new();
-    let mut known = Vec::new();
     let assets = [m.bars.clone(), m.testsrc.clone()];
     let modes = [None, Some(BlendMode::Multiply), Some(BlendMode::Exclusion)];
     let stack = |edit: &dyn Fn(&mut Clip), mode: Option<BlendMode>, keyed: bool| {
@@ -10512,7 +10013,6 @@ fn checker_e_r3_a_turned_keyed_opacity_with_a_mask_a_crop_or_a_zoom() {
                         0.5,
                         None,
                         &mut failures,
-                        &mut known,
                     );
                 }
             }
@@ -10537,7 +10037,6 @@ fn checker_e_r3_a_turned_keyed_opacity_with_a_mask_a_crop_or_a_zoom() {
                     0.5,
                     None,
                     &mut failures,
-                    &mut known,
                 );
             }
         }
@@ -10562,7 +10061,6 @@ fn checker_e_r3_a_turned_keyed_opacity_with_a_mask_a_crop_or_a_zoom() {
                 0.5,
                 (angle != 0.0).then_some(false),
                 &mut failures,
-                &mut known,
             );
             if angle != 0.0 {
                 let any = ce_scan(
@@ -10595,7 +10093,6 @@ fn checker_e_r3_a_turned_keyed_opacity_with_a_mask_a_crop_or_a_zoom() {
                 0.5,
                 (angle != 0.0).then_some(false),
                 &mut failures,
-                &mut known,
             );
             let any = ce_scan(
                 &format!("{case} (drawn anyway)"),
@@ -10608,11 +10105,7 @@ fn checker_e_r3_a_turned_keyed_opacity_with_a_mask_a_crop_or_a_zoom() {
             eprintln!("refusal necessity: {}", any.line(&format!("{case} (drawn anyway)")));
         }
     }
-    r3_finish(
-        "checker_e_r3_a_turned_keyed_opacity_with_a_mask_a_crop_or_a_zoom",
-        failures,
-        &known,
-    );
+    r3_finish("checker_e_r3_a_turned_keyed_opacity_with_a_mask_a_crop_or_a_zoom", failures);
 }
 
 /// A keyed opacity on a turned layer inside a transition (the incoming clip, the outgoing, both), plain and blended, with a fade of its own.
@@ -10622,7 +10115,6 @@ fn checker_e_r3_a_turned_keyed_opacity_in_a_transition() {
     use kerf_core::BlendMode;
     let m = media();
     let mut failures = Vec::new();
-    let mut known = Vec::new();
     let assets = [m.bars.clone(), m.testsrc.clone()];
     let mut n = 0;
     for kind in [
@@ -10662,13 +10154,12 @@ fn checker_e_r3_a_turned_keyed_opacity_in_a_transition() {
                         1.65,
                         None,
                         &mut failures,
-                        &mut known,
                     );
                 }
             }
         }
     }
-    r3_finish("checker_e_r3_a_turned_keyed_opacity_in_a_transition", failures, &known);
+    r3_finish("checker_e_r3_a_turned_keyed_opacity_in_a_transition", failures);
 }
 
 /// The turned layer's source is 4:4:4, 4:2:2, gray, full range, a JPEG, 10-bit, an RGB still: each is drawn exactly or refused, plain and under a
@@ -10681,7 +10172,6 @@ fn checker_e_r3_a_turned_keyed_opacity_of_other_formats() {
     let v = variants();
     let r = range_media();
     let mut failures = Vec::new();
-    let mut known = Vec::new();
     for (name, asset) in [
         ("4:4:4", &v.yuv444),
         ("4:2:2", &v.yuv422),
@@ -10714,12 +10204,11 @@ fn checker_e_r3_a_turned_keyed_opacity_of_other_formats() {
                     0.5,
                     None,
                     &mut failures,
-                    &mut known,
                 );
             }
         }
     }
-    r3_finish("checker_e_r3_a_turned_keyed_opacity_of_other_formats", failures, &known);
+    r3_finish("checker_e_r3_a_turned_keyed_opacity_of_other_formats", failures);
 }
 
 /// Partly or wholly off the canvas, and two turned layers stacked (each with its own keyed opacity), plain and blended.
@@ -10729,7 +10218,6 @@ fn checker_e_r3_turned_keyed_opacities_off_the_canvas_and_stacked() {
     use kerf_core::BlendMode;
     let m = media();
     let mut failures = Vec::new();
-    let mut known = Vec::new();
     let assets = [m.bars.clone(), m.testsrc.clone(), m.noise.clone()];
     let mut n = 0;
     for (px, py) in [
@@ -10762,7 +10250,6 @@ fn checker_e_r3_turned_keyed_opacities_off_the_canvas_and_stacked() {
                     0.5,
                     None,
                     &mut failures,
-                    &mut known,
                 );
             }
         }
@@ -10799,19 +10286,14 @@ fn checker_e_r3_turned_keyed_opacities_off_the_canvas_and_stacked() {
                 0.5,
                 None,
                 &mut failures,
-                &mut known,
             );
         }
     }
-    r3_finish(
-        "checker_e_r3_turned_keyed_opacities_off_the_canvas_and_stacked",
-        failures,
-        &known,
-    );
+    r3_finish("checker_e_r3_turned_keyed_opacities_off_the_canvas_and_stacked", failures);
 }
 
-/// A keyed opacity on a rotation that is not a quarter turn: refused or drawn exactly. (Plain, drawn: the rotated layer's edge is a ladder's
-/// level; a blended one is refused.)
+/// A keyed opacity on a rotation that is not a quarter turn: refused or drawn exactly. (A plain rotated layer is refused by the plan, its
+/// edge being a fixed-point sample; a blended one is refused too.)
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn checker_e_r3_a_keyed_opacity_on_a_rotation_that_is_not_a_quarter_is_refused_or_exact() {
@@ -10872,7 +10354,7 @@ fn checker_e_r3_a_keyed_opacity_on_a_rotation_that_is_not_a_quarter_is_refused_o
     if let Some(why) = scan.verdict(None) {
         failures.push(format!("{case}: {why}"));
     }
-    // The control (printed, not judged): the same keyed rotation with a constant opacity, to say whether a difference is the opacity's.
+    // The control, held to the export too: the same keyed rotation with a constant opacity, to say whether a difference is the opacity's.
     c.set_property_keys(Property::Opacity, Vec::new());
     let case = "checker/e/r3/keyed rotation alone (control)";
     let control = ce_scan(
@@ -10884,6 +10366,9 @@ fn checker_e_r3_a_keyed_opacity_on_a_rotation_that_is_not_a_quarter_is_refused_o
         false,
     );
     eprintln!("{}", control.line(case));
+    if let Some(why) = control.verdict(None) {
+        failures.push(format!("{case}: {why}"));
+    }
     for t in &tally {
         eprintln!("TALLY {t}");
     }
@@ -10935,12 +10420,11 @@ fn r3_resized(tl: &Timeline, assets: &[Asset], fps: f64) -> bool {
 /// resizes (a crop of one column, or both, is fitted back to the frame): those are the scaler's (lane B's), and the plain ones among them are
 /// held to the export by [`checker_e_r3_odd_sided_layers_the_scaler_resizes_plain`], the rest here. The geometry of each is printed so that a
 /// case that is not odd says so.
-fn r3_odd_sided(what: &str, resized: bool) -> (Vec<String>, Vec<String>, usize) {
+fn r3_odd_sided(what: &str, resized: bool) -> (Vec<String>, usize) {
     use kerf_core::BlendMode;
     let m = media();
     let v = variants();
     let mut failures = Vec::new();
-    let mut known = Vec::new();
     let mut tally: Vec<String> = Vec::new();
     let mut cases = 0;
     for (name, asset) in [
@@ -10989,7 +10473,7 @@ fn r3_odd_sided(what: &str, resized: bool) -> (Vec<String>, Vec<String>, usize) 
                             b * 360.0
                         );
                         let geom = r3_geometry(&tl, &assets, 30.0);
-                        let scan = r3_check(&case, &tl, None, &assets, 30.0, 0.4, None, &mut failures, &mut known);
+                        let scan = r3_check(&case, &tl, None, &assets, 30.0, 0.4, None, &mut failures);
                         tally.push(format!("{case}: {geom}: drawn {} of {}", scan.drawn, scan.frames));
                     }
                 }
@@ -11000,7 +10484,7 @@ fn r3_odd_sided(what: &str, resized: bool) -> (Vec<String>, Vec<String>, usize) 
         eprintln!("TALLY {t}");
     }
     eprintln!("{what}: {cases} cases");
-    (failures, known, cases)
+    (failures, cases)
 }
 
 /// Odd-sided layers that nothing resizes (or that a blend refuses whatever the scaler draws), turned by every quarter, opaque and faded, plain
@@ -11009,13 +10493,9 @@ fn r3_odd_sided(what: &str, resized: bool) -> (Vec<String>, Vec<String>, usize) 
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn checker_e_r3_odd_sided_unscaled_layers_turned_plain_and_blended() {
-    let (failures, known, cases) = r3_odd_sided("not resized", false);
+    let (failures, cases) = r3_odd_sided("not resized", false);
     assert!(cases > 100, "{cases} cases");
-    r3_finish(
-        "checker_e_r3_odd_sided_unscaled_layers_turned_plain_and_blended",
-        failures,
-        &known,
-    );
+    r3_finish("checker_e_r3_odd_sided_unscaled_layers_turned_plain_and_blended", failures);
 }
 
 /// The plain odd-sided layers the compositor's scaler resizes (a crop of a column or a row fitted back to the frame), turned by every quarter
@@ -11025,11 +10505,8 @@ fn checker_e_r3_odd_sided_unscaled_layers_turned_plain_and_blended() {
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn checker_e_r3_odd_sided_layers_the_scaler_resizes_plain() {
-    let (failures, known, cases) = r3_odd_sided("resized, plain", true);
+    let (failures, cases) = r3_odd_sided("resized, plain", true);
     assert!(cases > 40, "{cases} cases");
-    for k in &known {
-        eprintln!("KNOWN {k}");
-    }
     assert!(failures.is_empty(), "{} cases: {failures:#?}", failures.len());
 }
 
@@ -11065,7 +10542,6 @@ fn checker_e_r3_exotic_matrix_tags_under_a_blend() {
     use kerf_core::BlendMode;
     let m = media();
     let mut failures = Vec::new();
-    let known: Vec<String> = Vec::new();
     let mut tally: Vec<String> = Vec::new();
     let tags = [
         ("bt2020c", "bt2020c"),
@@ -11132,7 +10608,7 @@ fn checker_e_r3_exotic_matrix_tags_under_a_blend() {
     for t in &tally {
         eprintln!("TALLY {t}");
     }
-    r3_finish("checker_e_r3_exotic_matrix_tags_under_a_blend", failures, &known);
+    r3_finish("checker_e_r3_exotic_matrix_tags_under_a_blend", failures);
 }
 
 /// A rotation too large for its angle to mean anything (a radian count whose float has no fraction left, past what `quarter_turn` looks at): the layer must be
@@ -11239,7 +10715,6 @@ fn checker_e_r3_a_keyed_opacity_edge_on_each_quarter() {
     use kerf_core::BlendMode;
     let m = media();
     let mut failures = Vec::new();
-    let mut known = Vec::new();
     let assets = [m.bars.clone(), m.testsrc.clone()];
     for angle in [90.0, 180.0, 270.0, -90.0] {
         for mode in [None, Some(BlendMode::Multiply)] {
@@ -11259,11 +10734,10 @@ fn checker_e_r3_a_keyed_opacity_edge_on_each_quarter() {
                 0.5,
                 Some(true),
                 &mut failures,
-                &mut known,
             );
         }
     }
-    r3_finish("checker_e_r3_a_keyed_opacity_edge_on_each_quarter", failures, &known);
+    r3_finish("checker_e_r3_a_keyed_opacity_edge_on_each_quarter", failures);
 }
 
 // ---- checker/e/r4: the turns around the edges of the exact set, keyed turns and turns that stay put ---------------------

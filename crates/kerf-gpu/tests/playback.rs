@@ -4,7 +4,7 @@
 //! the cut a [`PlayCut`] plans — `Timeline::slice` from the playhead, planned as the export plans it,
 //! one forward-only cursor per clip — for the frames the page asks for, **skipping** the ones a newer
 //! request replaced. This holds *that* to the export, plane for plane (the planes `overlay` blended,
-//! no colour conversion between), with a stated bound per case:
+//! no colour conversion between), with no tolerance: every sample of every frame drawn equals the export's:
 //!
 //! * the slice's own export, which is the graph `stream_preview` plays (all of them);
 //! * where the content is aligned so that the slice and the whole cut pick the same source frames
@@ -46,6 +46,8 @@ fn compositor() -> &'static Compositor {
         let _ = kerf_gpu::text::model();
         // (And the scaler: a resized layer is drawn only by a compositor whose scaler is known to be swscale's.)
         let _ = kerf_gpu::scaler::kernels();
+        // (And the round trip of a layer below full opacity, which is drawn only where this FFmpeg's kernels are known to be the model's.)
+        let _ = kerf_gpu::roundtrip_probe::translucency();
         Compositor::new(gpu()).expect("a compositor")
     })
 }
@@ -288,10 +290,6 @@ struct Case<'a> {
     /// Every n-th frame is asked for (a newer request replaced the ones between).
     every: usize,
     against: Against,
-    /// The bound in levels of 255: how far luma may be from the export's.
-    bound: i32,
-    /// ... and chroma (a layer the compositor scales *and* makes translucent is a level further in chroma).
-    uv_bound: i32,
 }
 
 /// Play `case` and compare; returns `(frames compared, worst error, the session's start)`.
@@ -304,8 +302,6 @@ fn play(case: Case) -> (usize, i32, f64) {
         secs,
         every,
         against,
-        bound,
-        uv_bound,
     } = case;
     let cut = PlayCut::new(tl, assets, at, policy(), &OriginalMedia).expect("a cut");
     let fps = cut.rate();
@@ -381,7 +377,7 @@ fn play(case: Case) -> (usize, i32, f64) {
             }
             eprintln!("  frame {j}: worst {frame_worst} layers {} near {near:?}", plan.layers.len());
         }
-        if (frame_y > bound || frame_uv > uv_bound) && over.len() < 6 {
+        if (frame_y > 0 || frame_uv > 0) && over.len() < 6 {
             over.push((j, frame_worst));
         }
         worst = worst.max(frame_worst);
@@ -397,8 +393,8 @@ fn play(case: Case) -> (usize, i32, f64) {
     report().lock().unwrap().push(line);
     write_report();
     assert!(
-        (worst_y <= bound && worst_uv <= uv_bound) || std::env::var_os("KERF_PARITY_EXPLORE").is_some(),
-        "{name}: a played frame is {worst_y} (Y) / {worst_uv} (UV) levels from the export's (bound {bound} / {uv_bound}); frames over it: {over:?}"
+        (worst_y == 0 && worst_uv == 0) || std::env::var_os("KERF_PARITY_EXPLORE").is_some(),
+        "{name}: a played frame is {worst_y} (Y) / {worst_uv} (UV) levels from the export's, {differing} samples differ; frames over it: {over:?}"
     );
     (compared, worst, cut.start())
 }
@@ -412,8 +408,6 @@ fn case<'a>(name: &'a str, tl: &'a Timeline, assets: &'a [Asset], at: f64, secs:
         secs,
         every: 1,
         against,
-        bound: 0,
-        uv_bound: 0,
     }
 }
 
@@ -609,7 +603,7 @@ fn a_layer_over_another_track_with_a_transform_and_an_opacity_is_drawn_through_c
         master: Default::default(),
         thumbnails: Vec::new(),
     };
-    // A smaller layer, placed: the scaler's one level, as the export's (`SCALED` in `motion_parity.rs`).
+    // A smaller layer, placed: the scaler is swscale's to the sample, as in the export.
     let mut pip = Clip::new(m.testsrc.id, 0.5, 1.5, 0.2);
     pip.transform.scale = 0.4;
     pip.transform.pos_x = 0.25;
@@ -617,21 +611,14 @@ fn a_layer_over_another_track_with_a_transform_and_an_opacity_is_drawn_through_c
     let tl = two_tracks(pip);
     for at in [0.0, 0.5] {
         let name = format!("play/pip/transform @{at:.1}");
-        let mut c = case(&name, &tl, &assets, at, 0.6, Against::Whole);
-        (c.bound, c.uv_bound) = (1, 1);
-        play(c);
+        play(case(&name, &tl, &assets, at, 0.6, Against::Whole));
     }
-    // A translucent one, scaled too: the scaler's level (`SCALED`: 1 in every plane) and the RGB round trip's
-    // (`TRANSLUCENT`: chroma one level, luma exact) on top of it. Measured: two in luma as well as chroma, the
-    // scaler's level crossing into luma through the round trip's conversion (not the one and two the sum of the
-    // two bounds says).
+    // A translucent one, scaled too: the scaler and the RGB round trip are both exact, so is the layer.
     let mut glass = Clip::new(m.testsrc.id, 0.5, 1.5, 0.2);
     glass.transform.scale = 0.6;
     glass.transform.opacity = 0.7;
     let tl = two_tracks(glass);
-    let mut c = case("play/pip/translucent and scaled", &tl, &assets, 0.0, 0.6, Against::Whole);
-    (c.bound, c.uv_bound) = (2, 2);
-    play(c);
+    play(case("play/pip/translucent and scaled", &tl, &assets, 0.0, 0.6, Against::Whole));
 }
 
 #[test]

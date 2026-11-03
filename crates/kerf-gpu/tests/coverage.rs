@@ -2403,6 +2403,11 @@ fn the_ledger_says_which_refusals_hold_the_compositor_back() {
     // ... and a mask or a keyed opacity only where the edge of this FFmpeg's `geq` read is known (the caps of a host that has no
     // compositor leave them out until it is measured, as the app's `prepare_timeline` does ahead of the render bar).
     let _ = kerf_core::geq_edge();
+    // ... and a layer below full opacity only where this FFmpeg takes it through RGB and back as the compositor does (the
+    // translucency probe).
+    let translucency = kerf_gpu::roundtrip_probe::translucency();
+    // ... and a blur only where this FFmpeg's `gblur` is the fused-multiply-add recursion the shader reproduces (the blur probe).
+    let blur = kerf_gpu::blur_probe::blur();
     let caps = Compositor::caps_pinned(kernels, scaler, convert, layout, blend, extras);
     let mut cuts = vec![];
     // T1 to T8 are planned with the default export options; T9 and on say theirs (a ProRes file, a GIF, a scaler).
@@ -2434,7 +2439,7 @@ fn the_ledger_says_which_refusals_hold_the_compositor_back() {
         "kerf-gpu coverage ledger: the frames the compositor draws and what refuses the rest".to_string(),
         format!("ffmpeg: {version_line}"),
         format!("composite colour policy: {policy:?}"),
-        format!("grade kernels: {kernels:?}, scaler: {scaler:?}, matrix conversion: {convert:?}; text layout: {layout:?}; placement: {placement:?}; planar conversion: {conversion:?} (caps: Compositor::caps_for(grade::kernels(), scaler::kernels(), convert::kernels()) once text::model(), placement_probe::placement() and conversion::conversion() have probed, as the app asks)"),
+        format!("grade kernels: {kernels:?}, scaler: {scaler:?}, matrix conversion: {convert:?}; text layout: {layout:?}; placement: {placement:?}; planar conversion: {conversion:?}; translucent round trip: {translucency:?}; gblur: {blur:?} (caps: Compositor::caps_for(grade::kernels(), scaler::kernels(), convert::kernels()) once text::model(), placement_probe::placement() and conversion::conversion() have probed, as the app asks)"),
         format!("blend kernels [BT.601, BT.709]: {blend:?}; extras (BT.2020, RGB pictures): {extras:?}"),
         "plans: every output frame of every archetype over OriginalMedia at 540 px wide (the app's preview plans ProxyMedia at 960); nothing is rendered".to_string(),
         "archetypes: the review's T1 to T3, the real-world T4 to T8 and T9 to T24, which between them use every feature the editor offers that still refuses (tests/coverage.rs)".to_string(),
@@ -2528,6 +2533,8 @@ fn every_variant() -> Vec<Unsupported> {
         Unsupported::BlurFillWith(layer(), ""),
         Unsupported::MixedMatricesWith(layer(), ""),
         Unsupported::ScalerApproximate(layer()),
+        Unsupported::TranslucentApproximate(layer()),
+        Unsupported::TextOnFullRange(layer()),
     ]
 }
 
@@ -2592,6 +2599,8 @@ fn ordinal(u: &Unsupported) -> usize {
         Unsupported::BlurFillWith(..) => 55,
         Unsupported::MixedMatricesWith(..) => 56,
         Unsupported::ScalerApproximate(..) => 57,
+        Unsupported::TranslucentApproximate(..) => 58,
+        Unsupported::TextOnFullRange(..) => 59,
     }
 }
 
@@ -2607,6 +2616,9 @@ fn why_unreached(
     match kind {
         "motion" | "fade" | "travel" | "tail" | "keyed_opacity" | "keyed_color" | "keyed_zoom" | "mask" | "text" | "blur_fill" => {
             "drawn: Compositor::CAPS has the ability, so a plan never reports it"
+        }
+        "translucent_approximate" if kerf_gpu::roundtrip_probe::measured() == kerf_gpu::roundtrip_probe::Translucency::Match => {
+            "drawn: this FFmpeg takes a translucent layer through RGB as the model does (roundtrip_probe), so a plan never reports it"
         }
         "keyed_placement" if kerf_gpu::placement_probe::measured() == kerf_gpu::placement_probe::Placement::Match => {
             "drawn: this FFmpeg places a picture as the model does (placement_probe), so a plan never reports it"

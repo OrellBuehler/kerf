@@ -2165,6 +2165,7 @@ mod tests {
             blur_fill: false,
             matrix_convert: false,
             scaler_approximate: false,
+            translucent_approximate: false,
             blend: crate::plan_caps::BlendKinds::NONE,
             blend_extras: crate::plan_caps::BlendExtras::NONE,
         };
@@ -2391,6 +2392,7 @@ mod tests {
             blur_fill: false,
             matrix_convert: false,
             scaler_approximate: false,
+            translucent_approximate: false,
             blend: crate::plan_caps::BlendKinds::NONE,
             blend_extras: crate::plan_caps::BlendExtras::NONE,
         };
@@ -3259,6 +3261,7 @@ mod tests {
             blur_fill: false,
             matrix_convert: false,
             scaler_approximate: false,
+            translucent_approximate: false,
             blend: crate::plan_caps::BlendKinds::NONE,
             blend_extras: crate::plan_caps::BlendExtras::NONE,
         };

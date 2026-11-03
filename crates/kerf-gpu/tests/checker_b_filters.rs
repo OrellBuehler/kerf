@@ -54,6 +54,9 @@ fn prime() {
         let _ = kerf_core::geq_edge();
         let _ = kerf_gpu::conversion::conversion();
         let _ = kerf_gpu::placement_probe::placement();
+        // ... and whether it takes a translucent layer through RGB, and blurs, as the model does (a layer below full opacity and a blur are in the caps only then).
+        let _ = kerf_gpu::roundtrip_probe::translucency();
+        let _ = kerf_gpu::blur_probe::blur();
         let _ = kerf_gpu::blend::kernels();
         let _ = kerf_gpu::text::model();
     });
@@ -695,25 +698,6 @@ struct Family {
 }
 
 impl Family {
-    /// A case whose inexactness is a documented ladder of the base (a translucent layer's RGB round trip, a dip to white's, a
-    /// rotated edge), not this lane's: it is reported with its figures and does not fail the family.
-    fn add_known_ladder(&mut self, case: &str, out: &Outcome) {
-        self.cases += 1;
-        self.drawn += out.drawn;
-        self.refused += out.refused;
-        if !out.bad.is_empty() {
-            let worst = |i: usize| out.bad.iter().map(|b| b.planes[i].max).max().unwrap_or(0);
-            eprintln!(
-                "   known ladder (pre-existing, not failed): {case}: {}/{} drawn frames differ, max Y {} U {} V {}",
-                out.bad.len(),
-                out.drawn,
-                worst(0),
-                worst(1),
-                worst(2)
-            );
-        }
-    }
-
     fn add(&mut self, case: &str, out: &Outcome) {
         self.cases += 1;
         self.drawn += out.drawn;
@@ -2026,8 +2010,8 @@ impl Rng {
     }
 }
 
-/// What the fuzz may put in a cut. The pre-existing ladders (a translucent or turned layer, a blur or sharpen) are left out
-/// unless asked for: they are inexact by design in the base and not this lane's.
+/// What the fuzz may put in a cut. A translucent layer and a turned one are left out unless asked for (they are the plan's refusals to
+/// find: a translucent turn is refused); every drawn frame of every cut is held to the export to the sample.
 #[derive(Clone, Copy)]
 struct FuzzMix {
     translucent_and_rotated: bool,
@@ -2150,8 +2134,6 @@ fn fuzz_cut(seed: u64, mix: FuzzMix) -> (String, Timeline, Vec<Asset>, f64) {
 }
 
 fn run_fuzz(label: &str, seeds: std::ops::Range<u64>, mix: FuzzMix) {
-    // A translucent or turned layer has its own ladder in the base: that fuzz reports its figures and does not fail.
-    let ladder = mix.translucent_and_rotated;
     let mut fam = Family::default();
     let mut drawn_total = 0;
     for seed in seeds {
@@ -2162,10 +2144,6 @@ fn run_fuzz(label: &str, seeds: std::ops::Range<u64>, mix: FuzzMix) {
             continue;
         };
         drawn_total += out.drawn;
-        if ladder {
-            fam.add_known_ladder(&case, &out);
-            continue;
-        }
         let before = fam.failures.len();
         fam.add(&case, &out);
         if fam.failures.len() > before {
@@ -2561,12 +2539,7 @@ fn checker_b_matrix_what_the_conversion_does_not_cover() {
         let tl = timeline(vec![vec![clip(base, 0.5, 1.2, 0.0), c]], delivery);
         let case = format!("checker/b/matrix/uncovered {name}");
         if let Some(out) = sweep_try(&case, &tl, &dedup(&[base, asset]), 30.0, 1.5) {
-            // (A translucent or turned layer, and a dip to white, have their own ladders in the base: reported, not failed.)
-            if ["opacity 0.6", "rotation 10", "a dip to white into it"].contains(&name) {
-                fam.add_known_ladder(&case, &out);
-            } else {
-                fam.add(&case, &out);
-            }
+            fam.add(&case, &out);
         }
     }
     fam.finish("matrix what the conversion does not cover");
@@ -3609,19 +3582,7 @@ fn run_family(family: &str, cases: Vec<(String, Timeline, Vec<Asset>)>, fps: f64
     for (name, tl, assets) in cases {
         let case = format!("checker/b/r2/{family}/{name}");
         if let Some(out) = sweep_try(&case, &tl, &assets, fps, secs) {
-            // A dip to white in a cut has the base's ladder on every frame of the graph (the equal-matrix cut of the same shape
-            // shows the same figures: `checker_b_r2_dip_to_white_in_the_cut_leaves_the_clips_before_it_exact`): held to 3 levels.
-            if name.contains("DipWhite") {
-                let worst = out.bad.iter().flat_map(|b| b.planes.iter().map(|p| p.max)).max().unwrap_or(0);
-                if worst > 3 {
-                    fam.failures.push(format!(
-                        "{case}: a dip to white's ladder is 3 levels, drawn frames differ by {worst}"
-                    ));
-                }
-                fam.add_known_ladder(&case, &out);
-            } else {
-                fam.add(&case, &out);
-            }
+            fam.add(&case, &out);
         }
     }
     fam.finish(family);
@@ -3819,15 +3780,13 @@ fn fuzz2_asset(rng: &mut Rng, desc: &mut String) -> Asset {
     }
 }
 
-/// One cut of the wide fuzz and whether it holds a feature with a ladder in the base (a translucent or turned layer, a
-/// dip to white, a blur or a sharpen, a chroma key): such a cut is held to a gross bound only (a wrong matrix is off by ten
-/// levels and more), the others are held to zero.
-fn fuzz2_cut(seed: u64) -> (String, Timeline, Vec<Asset>, f64, bool) {
+/// One cut of the wide fuzz: every drawn frame of it is held to zero (a translucent or turned layer, a dip to white, a blur or a
+/// sharpen, a chroma key and a mask included).
+fn fuzz2_cut(seed: u64) -> (String, Timeline, Vec<Asset>, f64) {
     use kerf_core::{BlendMode, VideoEffect};
     let mut rng = Rng(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x51ed_270b);
     let mut desc = String::new();
     let mut assets: Vec<Asset> = Vec::new();
-    let mut ladder = false;
     let delivery = match rng.below(10) {
         0..=2 => None,
         3 | 4 => Some(Delivery::new(320, 180, Fit::Contain)),
@@ -3868,7 +3827,6 @@ fn fuzz2_cut(seed: u64) -> (String, Timeline, Vec<Asset>, f64, bool) {
                     TransitionKind::SlideLeft,
                     TransitionKind::PushUp,
                 ]);
-                ladder |= kind == TransitionKind::DipToWhite;
                 c = dissolve_into(c, kind, 0.3);
                 let _ = write!(desc, " {kind:?}");
             }
@@ -3913,7 +3871,6 @@ fn fuzz2_cut(seed: u64) -> (String, Timeline, Vec<Asset>, f64, bool) {
                 } else {
                     VideoEffect::Sharpen { amount: 0.5 }
                 }];
-                ladder = true;
                 desc.push_str(" blur/sharpen");
             } else if rng.chance(2) {
                 c.effects = vec![VideoEffect::ChromaKey {
@@ -3921,7 +3878,6 @@ fn fuzz2_cut(seed: u64) -> (String, Timeline, Vec<Asset>, f64, bool) {
                     similarity: 0.3,
                     blend: 0.1,
                 }];
-                ladder = true;
                 desc.push_str(" chromakey");
             }
             if rng.chance(10) {
@@ -3938,7 +3894,6 @@ fn fuzz2_cut(seed: u64) -> (String, Timeline, Vec<Asset>, f64, bool) {
             }
             if rng.chance(7) {
                 c.transform.opacity = 0.7;
-                ladder = true;
                 desc.push_str(" opacity");
             }
             if rng.chance(4) {
@@ -3951,7 +3906,6 @@ fn fuzz2_cut(seed: u64) -> (String, Timeline, Vec<Asset>, f64, bool) {
                     feather: 0.0,
                     inverted: false,
                 });
-                ladder = true;
                 desc.push_str(" mask");
             }
             if rng.chance(4) {
@@ -3997,41 +3951,22 @@ fn fuzz2_cut(seed: u64) -> (String, Timeline, Vec<Asset>, f64, bool) {
     for ti in muted_tracks {
         tl.tracks[ti].muted = true;
     }
-    (desc, tl, assets, end.min(2.0), ladder)
+    (desc, tl, assets, end.min(2.0))
 }
 
-/// `seeds` of the wide fuzz: the cuts without a ladder feature must be exact in every drawn frame; the others are held to a
-/// gross bound (Y and UV within `GROSS` levels) and their figures reported.
+/// `seeds` of the wide fuzz: every drawn frame of every cut must be exact.
 fn run_fuzz2(label: &str, seeds: std::ops::Range<u64>) {
-    const GROSS: i32 = 4;
     let mut fam = Family::default();
     let (mut drawn_total, mut refused_total) = (0, 0);
     for seed in seeds {
-        let (desc, tl, assets, secs, ladder) = fuzz2_cut(seed);
+        let (desc, tl, assets, secs) = fuzz2_cut(seed);
         let case = format!("checker/b/fuzz2/{label}/{seed:03}");
-        eprintln!("-- {case}{}: {desc}", if ladder { " [ladder]" } else { "" });
+        eprintln!("-- {case}: {desc}");
         let Some(out) = sweep_try(&case, &tl, &assets, 15.0, secs) else {
             continue;
         };
         drawn_total += out.drawn;
         refused_total += out.refused;
-        if ladder {
-            // A ladder is a few levels everywhere (a translucent layer's round trip, a dip's) or a thin line (a rotated layer's
-            // edge): a plane that is off by more than GROSS levels over more than 4 % of its samples is not either.
-            let gross = out
-                .bad
-                .iter()
-                .flat_map(|b| (0..3).map(move |i| (b.planes[i].max, b.planes[i].differing * 100 / b.len[i].max(1))))
-                .filter(|&(max, percent)| max > GROSS && percent > 4)
-                .max();
-            if let Some((max, percent)) = gross {
-                fam.failures.push(format!(
-                    "{case}: a ladder cut, drawn frames differ by up to {max} levels over {percent} % of a plane (more than the {GROSS} levels or the thin edge a ladder explains)\n    cut: {desc}",
-                ));
-            }
-            fam.add_known_ladder(&case, &out);
-            continue;
-        }
         let before = fam.failures.len();
         fam.add(&case, &out);
         if fam.failures.len() > before {
@@ -4601,14 +4536,7 @@ fn checker_b_r2_dip_to_white_in_the_cut_leaves_the_clips_before_it_exact() {
                 let tl = timeline(vec![vec![ca, cb]], None);
                 let case = format!("checker/b/r2/dipwhite {pat:?} {a:?} then dip into {b:?}");
                 let out = sweep_secs(&case, &tl, &dedup(&[&aa, &ab]), 15.0, 1.4);
-                // (The dip's own ladder: held to 3 levels, and the same figures for equal and different matrices.)
-                let worst = out.bad.iter().flat_map(|b| b.planes.iter().map(|p| p.max)).max().unwrap_or(0);
-                if worst > 3 {
-                    fam.failures.push(format!(
-                        "{case}: a dip to white's ladder is 3 levels, drawn frames differ by {worst}"
-                    ));
-                }
-                fam.add_known_ladder(&case, &out);
+                fam.add(&case, &out);
             }
         }
     }
@@ -5107,19 +5035,7 @@ fn checker_b_r2_still_decider() {
             let tl = timeline(vec![vec![a], vec![b]], None);
             let case = format!("checker/b/r2/still {second:?} {tb:?} over {ta:?}");
             let out = still_sweep(&case, &tl, &dedup(&[&aa, &ab]), &[0.1, 0.35, 0.6]);
-            if second == Route::DipWhite {
-                let worst = out.bad.iter().map(|b| b.2).max().unwrap_or(0);
-                if worst > 3 {
-                    fam.failures.push(format!(
-                        "{case}: a dip to white's ladder is 3 levels, drawn stills differ by {worst}"
-                    ));
-                }
-                fam.cases += 1;
-                fam.drawn += out.drawn;
-                fam.refused += out.refused;
-            } else {
-                fam.add_still(&case, &out);
-            }
+            fam.add_still(&case, &out);
         }
     }
     fam.finish("still decider");
@@ -5745,13 +5661,11 @@ fn formats_sized(pix: &str, w: u32, h: u32) -> Asset {
 /// A clip on the alpha plane (a source with an alpha channel, a crossfade in, a keyed position) that also carries a white fade
 /// (a dip to white into it, or out of it into the next clip): `fade c=white` works on RGB, so a converter sits in the chain and
 /// the clip is not the one that decides. Found by the wide fuzz (seed 2041 of `c`): an alpha source with a dip to white in.
-/// The dip's own ladder (3 levels, `DIP_LADDER`) is allowed for the dip's frames; a whole-plane mismatch is a wrong matrix.
+/// Every drawn frame is the export's.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn checker_b_r2_decider_on_the_plane_with_a_white_fade() {
-    const DIP_LADDER: i32 = 3;
     let mut fam = Family::default();
-    let mut ladder_failures = Vec::new();
     for (t1, t2, t3) in [
         (Tag::None, Tag::Bt709, Tag::None),
         (Tag::Bt709, Tag::None, Tag::Bt709),
@@ -5863,23 +5777,10 @@ fn checker_b_r2_decider_on_the_plane_with_a_white_fade() {
         for (name, tl, assets) in cases {
             let case = format!("checker/b/r2/whitefade {name} {t1:?}/{t2:?}/{t3:?}");
             if let Some(out) = sweep_try(&case, &tl, &assets, 15.0, 2.8) {
-                // The ladder of a dip is a few levels over a plane; a wrong matrix is tens of levels over all of it.
-                let gross = out
-                    .bad
-                    .iter()
-                    .flat_map(|b| (0..3).map(move |i| (b.planes[i].max, b.planes[i].differing * 100 / b.len[i].max(1))))
-                    .filter(|&(max, percent)| max > DIP_LADDER && percent > 4)
-                    .max();
-                if let Some((max, percent)) = gross {
-                    ladder_failures.push(format!(
-                        "{case}: drawn frames differ by up to {max} levels over {percent} % of a plane"
-                    ));
-                }
-                fam.add_known_ladder(&case, &out);
+                fam.add(&case, &out);
             }
         }
     }
-    fam.failures.extend(ladder_failures);
     fam.finish("the deciding clip with a white fade");
 }
 
@@ -6371,13 +6272,7 @@ fn checker_b_r3_pad_odd_height_at_the_origin_inside_other_clip_features() {
             let case = format!("checker/b/r3/pad inside {label} {codec} 64x35");
             if let Some(out) = sweep_guarded(&case, &tl, std::slice::from_ref(&a), 30.0, 0.4) {
                 judged += 1;
-                if *label == "rotation" {
-                    // (A rotated layer's edge has the base's own ladder, the same for an even picture the size of the frame:
-                    // `checker_b_r3_rotation_of_odd_height_pictures_is_no_worse_than_an_even_one`.)
-                    fam.add_known_ladder(&case, &out);
-                } else {
-                    fam.add(&case, &out);
-                }
+                fam.add(&case, &out);
             }
         }
         for kind in [
@@ -6403,17 +6298,7 @@ fn checker_b_r3_pad_odd_height_at_the_origin_inside_other_clip_features() {
                 let assets = dedup(&[first, second]);
                 if let Some(out) = sweep_guarded(&case, &tl, &assets, 30.0, 0.8) {
                     judged += 1;
-                    if kind == TransitionKind::DipToWhite {
-                        let worst = out.bad.iter().flat_map(|b| b.planes.iter().map(|p| p.max)).max().unwrap_or(0);
-                        if worst > 3 {
-                            fam.failures.push(format!(
-                                "{case}: a dip to white's ladder is 3 levels, drawn frames differ by {worst}"
-                            ));
-                        }
-                        fam.add_known_ladder(&case, &out);
-                    } else {
-                        fam.add(&case, &out);
-                    }
+                    fam.add(&case, &out);
                 }
             }
         }
@@ -6606,10 +6491,8 @@ fn checker_b_r3_format_resize_follows_the_probed_pixel_format_string() {
     assert!(wrong.is_empty(), "{}", wrong.join("\n"));
 }
 
-/// Holds a case that holds a dip to white to the export: a dip to white has the base's ladder on every frame of the graph (the
-/// RGB round trip's stage: `checker_b_r2_dip_to_white_in_the_cut_leaves_the_clips_before_it_exact`, the same figures for equal
-/// and for different matrices), so no frame of such a cut differs by more than 3 levels; a wrong matrix moves every sample of
-/// the cut by tens. The frames outside the dip's own are counted (`windows`, seconds, a frame either side).
+/// Holds a case that holds a dip to white to the export: every drawn frame of it is exact, inside the dip and outside it (`windows`,
+/// seconds, a frame either side, say which a failure is).
 fn judge_dips(fam: &mut Family, case: &str, out: &Outcome, fps: f64, windows: &[(f64, f64)]) {
     fam.cases += 1;
     fam.drawn += out.drawn;
@@ -6619,31 +6502,20 @@ fn judge_dips(fam: &mut Family, case: &str, out: &Outcome, fps: f64, windows: &[
         windows.iter().any(|&(lo, hi)| t >= lo - 1.5 / fps && t <= hi + 1.5 / fps)
     };
     for b in &out.bad {
-        let worst = b.planes.iter().map(|p| p.max).max().unwrap_or(0);
-        if worst > 3 {
-            fam.failures.push(format!(
-                "{case}: frame {} ({} a dip): Y {} (max {}, first {:?}) U {} (max {}, first {:?}) V {} (max {}, first {:?})",
-                b.frame,
-                if inside(b.frame) { "inside" } else { "outside" },
-                b.planes[0].differing,
-                b.planes[0].max,
-                b.planes[0].first,
-                b.planes[1].differing,
-                b.planes[1].max,
-                b.planes[1].first,
-                b.planes[2].differing,
-                b.planes[2].max,
-                b.planes[2].first
-            ));
-        }
-    }
-    if !out.bad.is_empty() {
-        let outside = out.bad.iter().filter(|b| !inside(b.frame)).count();
-        eprintln!(
-            "   dip ladder (the base's, at most 3): {case}: {} of {} drawn frames, {outside} outside the dip",
-            out.bad.len(),
-            out.drawn
-        );
+        fam.failures.push(format!(
+            "{case}: frame {} ({} a dip): Y {} (max {}, first {:?}) U {} (max {}, first {:?}) V {} (max {}, first {:?})",
+            b.frame,
+            if inside(b.frame) { "inside" } else { "outside" },
+            b.planes[0].differing,
+            b.planes[0].max,
+            b.planes[0].first,
+            b.planes[1].differing,
+            b.planes[1].max,
+            b.planes[1].first,
+            b.planes[2].differing,
+            b.planes[2].max,
+            b.planes[2].first
+        ));
     }
 }
 
@@ -6809,16 +6681,13 @@ fn checker_b_r3_white_fade_on_tied_clips_is_not_a_decider() {
     fam.finish("white fade on tied clips");
 }
 
-/// A rotation of an odd-height picture next to the same rotation of an even one: a rotated layer's edge has the base's own ladder
-/// (chroma at the turned edge; figures below, the same for an even picture the size of the frame), so this holds the odd heights to
-/// the even control's figures and to no more than the ladder's bounds, and nothing else moves.
+/// A rotation of an odd-height picture next to the same rotation of an even one: a quarter turn is drawn and exact, any other angle is
+/// refused by the plan, so every drawn frame is the export's for both.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
-fn checker_b_r3_rotation_of_odd_height_pictures_is_no_worse_than_an_even_one() {
+fn checker_b_r3_rotation_of_odd_height_pictures_is_exact_or_refused() {
     let mut fam = Family::default();
     let mut judged = 0;
-    let mut worst_by_degrees: BTreeMap<String, (i32, i32)> = BTreeMap::new();
-    let mut odd: Vec<(String, String, i32, i32)> = Vec::new();
     for (codec, args, ext) in r3_codecs().into_iter().filter(|(c, ..)| *c == "ffv1" || *c == "ffvhuff") {
         for (sw, sh, fw, fh) in [
             (64, 36, 64, 36),
@@ -6839,28 +6708,8 @@ fn checker_b_r3_rotation_of_odd_height_pictures_is_no_worse_than_an_even_one() {
                     continue;
                 };
                 judged += 1;
-                fam.add_known_ladder(&case, &out);
-                let y = out.bad.iter().map(|b| b.planes[0].max).max().unwrap_or(0);
-                let uv = out
-                    .bad
-                    .iter()
-                    .flat_map(|b| [b.planes[1].max, b.planes[2].max])
-                    .max()
-                    .unwrap_or(0);
-                if sh % 2 == 0 {
-                    let e = worst_by_degrees.entry(format!("{degrees}")).or_insert((0, 0));
-                    *e = (e.0.max(y), e.1.max(uv));
-                } else {
-                    odd.push((format!("{degrees}"), case, y, uv));
-                }
+                fam.add(&case, &out);
             }
-        }
-    }
-    for (degrees, case, y, uv) in odd {
-        let (ey, euv) = worst_by_degrees.get(&degrees).copied().unwrap_or((0, 0));
-        if y > ey.max(1) || uv > euv.max(100) {
-            fam.failures
-                .push(format!("{case}: Y max {y} UV max {uv}, the even control's {ey} / {euv}"));
         }
     }
     assert!(judged >= 16, "too few cases could be made: {judged}");
@@ -8297,8 +8146,7 @@ fn checker_b_r4_export_odd_height_off_the_origin_across_transitions() {
     fam.finish("odd-height pad off the origin across transitions, in an export");
 }
 
-/// The dip to white with odd-height pictures off the origin: no allowance. (The base draws a dip to white's frames to within three
-/// levels, not exactly; the other lane tests hold it to that ladder. This one holds it to nothing, so a failure here is the ladder.)
+/// The dip to white with odd-height pictures off the origin: no allowance, every drawn frame is the export's.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn checker_b_r4_export_dip_to_white_frames_the_plan_draws_are_exact() {
@@ -9132,8 +8980,7 @@ fn checker_b_r4_export_which_chains_drop_the_odd_row() {
     fam.finish_refusing("which export chains drop the odd row");
 }
 
-/// The dip to white with odd-height pictures in a still: no allowance (the base draws a dip to white's stills to within two
-/// levels; the other lane tests hold it to that ladder, this one to nothing, so a failure here is the ladder).
+/// The dip to white with odd-height pictures in a still: no allowance, every drawn still is the still's.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn checker_b_r4_still_dip_to_white_stills_the_plan_draws_are_exact() {
@@ -9236,7 +9083,7 @@ fn checker_b_r4_origin_which_decoders_drop_the_odd_row() {
 // under a blend, odd-height pictures of the other formats, the cut-matrix probe ---------------------------------------------------
 //
 // Every drawn frame is held to the export's planes with no tolerance, a dip to white included (the rounds before held it to the
-// base's ladder of two or three levels: `judge_dips`).
+// the old base's bound of two or three levels: `judge_dips`).
 
 /// The reason a dip to white that is not drawn gives.
 const R5_DIP: &str = "a dip to white";
@@ -9698,18 +9545,7 @@ fn checker_b_r5_dip_to_white_under_every_clip_feature() {
                 let case = format!("checker/b/r5/white feature {label} {kind} {tag:?}");
                 if let Some(out) = sweep_try(&case, &tl, &dedup(&[&a, &b, &under]), 15.0, secs) {
                     judged += 1;
-                    // (A blur's own ladder, seen on FFmpeg 9 without any dip too: `checker_b_r5_blur_without_a_dip_control`, one level
-                    // in a sample or two of a frame. A dip must add nothing to it.)
-                    let own_ladder = matches!(label, "blur" | "sharpen")
-                        && out
-                            .bad
-                            .iter()
-                            .all(|b| b.planes.iter().all(|p| p.max <= 1 && p.differing <= 8));
-                    if own_ladder && !out.bad.is_empty() {
-                        fam.add_known_ladder(&case, &out);
-                    } else {
-                        fam.add(&case, &out);
-                    }
+                    fam.add(&case, &out);
                     match (must, kind) {
                         (Some(true), _) => expect_refusal(&mut fam, &case, &out, R5_DIP, Want::NotRefused),
                         (Some(false), "in") => expect_refusal(&mut fam, &case, &out, R5_DIP, Want::Either),
@@ -9853,13 +9689,6 @@ fn checker_b_r5_still_dip_to_white_under_features_formats_and_sizes() {
         );
         let case = format!("checker/b/r5/still white feature {label}");
         let out = r4_still(&case, &tl, &dedup(&[&a, &b]), &ExportOptions::default(), &times);
-        if matches!(label, "opacity" | "rotation") && !out.bad.is_empty() {
-            eprintln!(
-                "   known ladder (a translucent or turned layer, not the dip): {case}: {} stills differ",
-                out.bad.len()
-            );
-            continue;
-        }
         fam.add_r4(&case, &out);
     }
     for pix in [
@@ -10165,8 +9994,7 @@ fn checker_b_r5_full_range_flagged_vp9_and_features() {
             }
         }
     }
-    // The clip features on a letterboxed full-range picture, and on a limited-range one for control: an opacity and a rotation are
-    // the base's documented ladders (a translucent layer's RGB round trip, a turned layer's edge), the same on either.
+    // The clip features on a letterboxed full-range picture, and on a limited-range one for control.
     if let (Some(a), Some(control)) = (vp9(64, 30, "pc", Tag::None), vp9(64, 30, "tv", Tag::None)) {
         for (label, _, edit) in r5_edits() {
             for (which, asset) in [("pc", &a), ("tv", &control)] {
@@ -10176,11 +10004,7 @@ fn checker_b_r5_full_range_flagged_vp9_and_features() {
                 let case = format!("checker/b/r5/pcbars vp9 feature {label} {which}");
                 if let Some(out) = guarded(&case, || sweep_try(&case, &tl, std::slice::from_ref(asset), 30.0, 0.8)).flatten() {
                     judged += 1;
-                    if matches!(label, "opacity" | "rotation") {
-                        fam.add_known_ladder(&case, &out);
-                    } else {
-                        fam.add(&case, &out);
-                    }
+                    fam.add(&case, &out);
                 }
             }
         }
@@ -10653,14 +10477,7 @@ fn checker_b_r5_blur_without_a_dip_control() {
                 let tl = timeline(vec![vec![first, second]], None);
                 let case = format!("checker/b/r5/blur control {sigma} {kind:?} {tag:?}");
                 if let Some(out) = sweep_try(&case, &tl, &dedup(&[&a, &b]), 15.0, 1.6) {
-                    // `gblur`'s float arithmetic is the base's documented ladder: a level in a few samples, here on noise, FFmpeg 9.
-                    let worst = out.bad.iter().flat_map(|b| b.planes.iter().map(|p| p.max)).max().unwrap_or(0);
-                    if worst > 1 {
-                        fam.failures.push(format!(
-                            "{case}: the blur ladder is one level, drawn frames differ by {worst}"
-                        ));
-                    }
-                    fam.add_known_ladder(&case, &out);
+                    fam.add(&case, &out);
                 }
             }
         }
@@ -11143,7 +10960,7 @@ fn r6_has_rgb_effect(list: &R6Effects) -> bool {
 /// A dip to white with every effect list on the clip that comes in through it, on the clip that leaves through it, on both, on a
 /// clip two places away from it, and on a lower track under it. A list with an `invert` or a `vignette` in it refuses the dip on
 /// every frame of the clip that carries it and on that clip only; one without is drawn, as is a clip beside the dip that is not in it.
-/// Every drawn frame is the export's (a blur or sharpen adds the effect's own ladder of a level in a sample or two, no more).
+/// Every drawn frame is the export's (a blur and a sharpen included: the blur is `gblur`'s fused recursion to the sample).
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn checker_b_r6_dip_to_white_under_effect_lists() {
@@ -11237,20 +11054,7 @@ fn checker_b_r6_dip_to_white_under_effect_lists() {
                     continue;
                 };
                 judged += 1;
-                let ladder = list.iter().any(|x| {
-                    matches!(
-                        x,
-                        kerf_core::VideoEffect::Blur { .. } | kerf_core::VideoEffect::Sharpen { .. }
-                    )
-                }) && out
-                    .bad
-                    .iter()
-                    .all(|f| f.planes.iter().all(|p| p.max <= 1 && p.differing <= 8));
-                if ladder && !out.bad.is_empty() {
-                    fam.add_known_ladder(&case, &out);
-                } else {
-                    fam.add(&case, &out);
-                }
+                fam.add(&case, &out);
                 let n = out.refused_for(R6_RGB_EFFECT);
                 let wrong = if rgb && frames_with_list > 0 {
                     n + 1 < frames_with_list
@@ -11307,23 +11111,7 @@ fn checker_b_r6_still_dip_to_white_under_effect_lists() {
             );
             let case = format!("checker/b/r6/still effects {label} {place}");
             let out = r4_still(&case, &tl, &dedup(&[&a, &b]), &ExportOptions::default(), &times);
-            // (A blur or sharpen carries the effect's own ladder, seen without any dip: a level in a sample or two.)
-            let ladder = list.iter().any(|x| {
-                matches!(
-                    x,
-                    kerf_core::VideoEffect::Blur { .. } | kerf_core::VideoEffect::Sharpen { .. }
-                )
-            }) && out.bad.iter().all(|(_, p)| p.iter().all(|d| d.max <= 1 && d.differing <= 8));
-            if ladder && !out.bad.is_empty() {
-                eprintln!(
-                    "   known ladder (the effect's own, not the dip): {case}: {} stills differ by a level",
-                    out.bad.len()
-                );
-                fam.cases += 1;
-                fam.drawn += out.drawn;
-            } else {
-                fam.add_r4(&case, &out);
-            }
+            fam.add_r4(&case, &out);
             let n = out.refused_for(R6_RGB_EFFECT);
             let want = usize::from(rgb);
             if n != want && !patched_out() {
@@ -11649,15 +11437,13 @@ fn checker_b_a_geq_refusal_in_a_sweep_fails_the_case_instead_of_passing_as_refus
     no_geq_refusal("a case", &[]);
 }
 
-/// Stills: a layer below full opacity under a quarter turn is refused in the still the way it is in an export frame (the still chain turns
-/// the RGBA picture and converts it to 4:2:0 afterwards as well); the upright and half-turned layer keeps the still's translucent ladder (two
-/// levels of chroma, the same for both), and an opaque layer turned a quarter is the still's, to the sample.
+/// Stills: a layer below full opacity under a turn is refused in the still the way it is in an export frame (the still chain turns
+/// the RGBA picture and converts it to 4:2:0 afterwards as well); the upright layer is the still's to the sample, and so is an opaque
+/// layer turned a quarter.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
-fn checker_b_r8_a_translucent_quarter_turn_in_a_still_is_refused_and_the_other_turns_are_drawn() {
-    const NEEDLE: &str = "a quarter turn of a layer below full opacity";
-    // (A translucent layer in a still is two levels of chroma off the export upright or turned half: `TRANSLUCENT` in `parity.rs`.)
-    const LADDER: i32 = 2;
+fn checker_b_r8_a_translucent_turn_in_a_still_is_refused_and_the_upright_layer_is_drawn() {
+    const NEEDLE: &str = "a turn of a layer below full opacity";
     let mut failures: Vec<String> = Vec::new();
     let base = media(320, 180, Pat::Edges, Tag::None);
     let times = [0.1, 0.2];
@@ -11669,7 +11455,7 @@ fn checker_b_r8_a_translucent_quarter_turn_in_a_still_is_refused_and_the_other_t
         for (opacity, label) in [(0.6, "0.6"), (0.999, "0.999"), (1.0, "opaque")] {
             for scale in [1.0, 0.5] {
                 for turn in [0.0, 90.0, 180.0, 270.0, -90.0, 450.0] {
-                    let quarter = turn % 180.0 != 0.0;
+                    let quarter = turn % 360.0 != 0.0;
                     let mut c = clip(&src, 0.0, 0.4, 0.0);
                     c.transform.rotation = turn;
                     c.transform.opacity = opacity;
@@ -11696,8 +11482,7 @@ fn checker_b_r8_a_translucent_quarter_turn_in_a_still_is_refused_and_the_other_t
                         if out.refused_for(NEEDLE) != 0 {
                             failures.push(format!("{case}: refused for the translucent quarter turn: {:?}", out.reasons));
                         }
-                        let allowed = if translucent { LADDER } else { 0 };
-                        if worst > allowed {
+                        if worst > 0 {
                             failures.push(format!(
                                 "{case}: drawn {} stills, {} differ, worst {worst}",
                                 out.drawn,

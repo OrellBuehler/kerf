@@ -875,7 +875,9 @@ fn grade_refusal(grade: &Grade, caps: &GpuCaps) -> Option<&'static str> {
 /// takes a sigma of 0 to 1024, `unsharp` an amount of -2 to 5), so the frame goes to FFmpeg, which
 /// fails it the same way.
 fn effect_refusal(effect: &VideoEffect, caps: &GpuCaps) -> Option<&'static str> {
-    if !caps.effects.contains(EffectKinds::of(effect)) {
+    // (A blur of sigma 0 is `gblur`'s identity on every build: `set_params` makes `nu` 0 and both scales 1.)
+    let identity_blur = matches!(effect, VideoEffect::Blur { sigma } if *sigma == 0.0);
+    if !caps.effects.contains(EffectKinds::of(effect)) && !identity_blur {
         return Some(match effect {
             VideoEffect::Blur { .. } => "a blur",
             VideoEffect::Sharpen { .. } => "a sharpen",
@@ -1105,18 +1107,26 @@ impl RenderPlan {
                 ));
             }
             // `colorchannelmixer` leaves the picture in RGBA, `rotate` turns it there, and the way back to 4:2:0 comes after the turn:
-            // swscale's chroma pairs two pixels of a row and filters over the rows (a different sum each way), so after a quarter
-            // turn it pairs other samples than the compositor's round trip, which comes before the turn, does (chroma tens of levels off
-            // on the cases measured). Upright and half-turned layers pair the same samples and keep the translucent ladder.
+            // swscale's chroma pairs two pixels of a row and filters over the rows, in a window that is not symmetric (a different sum
+            // each way), so after a quarter turn it pairs other samples than the compositor's round trip, which comes before the turn,
+            // does (chroma tens of levels off on the cases measured), and after a half turn it filters the rows the other way round (one
+            // level of chroma on about a sixth of a percent of the samples: 4,631 of 2.1 million on `opacity/turned 180`, 6.1.1).
+            // An upright layer is exact. What an exact route needs: turn the RGB texture ahead of the way back and compose the planes
+            // it makes without turning them again.
             if geom.translucent
                 && geom
                     .rotation
-                    .is_some_and(|r| quarter_turn(r.angle).is_some_and(|turn| turn % 2 == 1))
+                    .is_some_and(|r| quarter_turn(r.angle).is_some_and(|turn| turn != 0))
             {
                 reasons.push(Unsupported::Rotation(
                     self.layer_ref(n, layer),
-                    "a quarter turn of a layer below full opacity (FFmpeg turns the RGBA picture and converts it to 4:2:0 afterwards: the chroma pairs other samples)",
+                    "a turn of a layer below full opacity (FFmpeg turns the RGBA picture and converts it to 4:2:0 afterwards: the chroma pairs other samples, and the rows are filtered the other way round)",
                 ));
+            }
+            // The round trip a constant opacity below 1 takes (`colorchannelmixer` only takes RGB) is the compositor's only where this
+            // FFmpeg's conversions were measured to be the model's: otherwise it is a level of chroma off, and FFmpeg's.
+            if caps.translucent_approximate && self.through_rgba(layer) {
+                reasons.push(Unsupported::TranslucentApproximate(self.layer_ref(n, layer)));
             }
             // A scaler that is not measured to be swscale's draws a resized layer a level off: not exact, so FFmpeg's.
             if caps.scaler_approximate && geom.stages.iter().any(|s| s.scaled != (s.src.w, s.src.h)) {
@@ -1261,11 +1271,16 @@ impl RenderPlan {
             if steepest > MAX_AMPLIFIED_ERROR && !caps.exact_scaler {
                 reasons.push(Unsupported::GradeSteep(self.layer_ref(n, layer), steepest));
             }
-            let mut err = if scaled { f64::from(steps[0]).max(1.0) } else { 0.0 };
+            // (Where the scaler is exact it is no source of a difference, and neither is a blur the compositor draws: it is `gblur`'s
+            // own recursion to the sample, `GpuCaps::effects` holding it only where this FFmpeg's was measured to be.)
+            let mut err = if scaled && !caps.exact_scaler {
+                f64::from(steps[0]).max(1.0)
+            } else {
+                0.0
+            };
             let mut sharpened = false;
             for effect in &layer.effects {
                 match effect {
-                    VideoEffect::Blur { sigma } if *sigma > 0.0 && err == 0.0 => err = 1.0,
                     VideoEffect::Sharpen { amount } if err > 0.0 && (f64::from(*amount as f32) * 65536.0) as i32 != 0 => {
                         err += (2.0 * err * amount.abs()).ceil();
                         sharpened = true;
@@ -1275,17 +1290,13 @@ impl RenderPlan {
             }
             // A chroma key's alpha is a distance in the chroma over `blend`: a level of difference in a chroma
             // sample moves it by up to 1/blend levels (a blend of 0 flips it from 0 to 255), so it is drawn only on
-            // chroma that is FFmpeg's to the level. It runs after every effect: no scale ahead of the effects and
-            // no blur among them (a sharpen leaves the chroma alone, the tables are exact).
+            // chroma that is FFmpeg's to the level. It runs after every effect: no scale ahead of the effects (a blur the
+            // compositor draws is `gblur`'s to the sample, and a sharpen leaves the chroma alone, the tables are exact).
             let chroma_keyed = layer.effects.iter().any(|e| matches!(e, VideoEffect::ChromaKey { .. }));
-            let blurred = layer
-                .effects
-                .iter()
-                .any(|e| matches!(e, VideoEffect::Blur { sigma } if *sigma > 0.0));
-            if chroma_keyed && caps.effects.contains(EffectKinds::CHROMA_KEY) && (scaled || blurred) {
+            if chroma_keyed && caps.effects.contains(EffectKinds::CHROMA_KEY) && scaled {
                 reasons.push(Unsupported::Effects(
                     self.layer_ref(n, layer),
-                    "a chroma key after a scale or a blur: its alpha is a distance in the chroma, which their one-level difference from FFmpeg's moves by up to 1/blend levels",
+                    "a chroma key after a scale: its alpha is a distance in the chroma, which the scale's difference from FFmpeg's moves by up to 1/blend levels",
                 ));
             }
             // The key's window keeps what it last read where the picture ends; a picture under two samples a
@@ -1300,7 +1311,7 @@ impl RenderPlan {
             if sharpened && err > f64::from(MAX_AMPLIFIED_ERROR) {
                 reasons.push(Unsupported::Effects(
                     self.layer_ref(n, layer),
-                    "a sharpen after a scale or a blur: it amplifies their one-level difference from FFmpeg's by 1 + 2|amount| and rounds up a level more with each further sharpen, past two levels",
+                    "a sharpen after a scale: it amplifies its one-level difference from FFmpeg's by 1 + 2|amount| and rounds up a level more with each further sharpen, past two levels",
                 ));
             }
             // A blended layer is drawn on what the compositor draws exactly: its own picture at its own size, upright
@@ -1326,7 +1337,7 @@ impl RenderPlan {
                 }
                 if geom.translucent {
                     reasons.push(why(
-                        "on a layer below full opacity (the RGB round trip's chroma is a level off)",
+                        "on a layer below full opacity (the clip's colour and alpha go through the RGB round trip and then the blend's own conversions: no case holds that chain to FFmpeg's)",
                     ));
                 }
             }
@@ -1377,26 +1388,25 @@ impl RenderPlan {
             }
             // A full-range picture the scaler resizes: swscale converts the range *inside* the
             // resize, from the chroma it has not yet scaled, where the compositor converts the
-            // range and then scales. Plain, the two agree outside the picture's sharp edges (a still
-            // is held to that); in an export's planes the chroma reads up to 15 levels off (FFmpeg 6 as
-            // much as 9), and a fade running on it takes the flat error past the bound too (14).
+            // range and then scales. In an export's planes the chroma reads up to 15 levels off (FFmpeg 6 as
+            // much as 9), a fade running on it takes it further (14 flat), and a still's planes are off too (a
+            // JPEG half-size over video: Y 12, U and V 16, over a fifth of the frame; an enlargement 14 / 21):
+            // the two agree outside the picture's sharp edges only, and that is not a sample for sample match.
             if layer.stream.maybe_full_range() && geom.stages.iter().any(|s| s.scaled != (s.src.w, s.src.h)) {
                 let where_ = if self.mode == PlanMode::Motion {
-                    Some("in an export frame")
+                    "in an export frame"
                 } else if self.fade_ops(layer).iter().any(|o| o.factor < FADE_FULL) {
-                    Some("inside a fade, a dip or a dissolve")
+                    "inside a fade, a dip or a dissolve"
                 } else {
-                    None
+                    "in a still"
                 };
-                if let Some(where_) = where_ {
-                    reasons.push(Unsupported::FullRangeResized(
-                        LayerRef {
-                            index: n,
-                            name: layer.name.clone(),
-                        },
-                        where_,
-                    ));
-                }
+                reasons.push(Unsupported::FullRangeResized(
+                    LayerRef {
+                        index: n,
+                        name: layer.name.clone(),
+                    },
+                    where_,
+                ));
             }
             // The exact scaler is proven for planar 8-bit 4:2:0 only. A 10-bit picture is scaled by FFmpeg at 10 bits and dithered
             // once at the end (off by one in Y, U and V on 6.1.1), and a gray one has its luma scaled in `gray` and converted after
@@ -1844,6 +1854,14 @@ impl RenderPlan {
             } else {
                 if self.overlays.iter().any(|o| o.font_file.is_none()) {
                     out.push(Unsupported::TextWithoutFont);
+                }
+                // Where the composite's colour is negotiated (FFmpeg 9) a still keeps a full-range picture's range through the graph, so `drawtext`
+                // blends in it and the range is converted last: the glyph edges are a level or two of chroma off the compositor's, which
+                // blends into the composite it already converted. (An export refuses the whole cut: `FullRangeCut`.)
+                if self.mode == PlanMode::Still && self.canvas.policy != CompositeColorPolicy::FixedBt601 {
+                    if let Some((n, layer)) = self.layers.iter().enumerate().find(|(_, l)| l.stream.maybe_full_range()) {
+                        out.push(Unsupported::TextOnFullRange(self.layer_ref(n, layer)));
+                    }
                 }
             }
         }
@@ -3150,7 +3168,7 @@ mod tests {
         // proven for 8-bit 4:2:0 only); a picture left at its size is not, whatever the format.
         for (fmt, scale, refused) in [
             ("yuv420p", 2.0, false),
-            ("yuvj420p", 2.0, false),
+            ("yuvj420p", 2.0, true),
             ("yuv420p10le", 2.0, true),
             ("gray", 2.0, true),
             ("gray10le", 2.0, true),
@@ -4636,18 +4654,19 @@ mod tests {
         // Not on a picture under two samples a side (where the window's edge rules need a row and a column).
         let thin = why_of(video(640, 1), None, &|c| c.effects = vec![key()]);
         assert!(effects(&thin, "narrower or shorter than 2"), "{thin:?}");
-        // Not after a scale or a blur, wherever the blur is in the list (the key runs after every effect).
+        // Not after a scale (the key runs after every effect); after a blur it is drawn, wherever the blur is in the list: the
+        // compositor's blur is `gblur`'s to the sample.
         assert!(effects(
             &why(&|c| {
                 c.transform.scale = 0.6;
                 c.effects = vec![key()];
             }),
-            "chroma key after a scale or a blur"
+            "chroma key after a scale"
         ));
-        assert!(effects(
-            &why(&|c| c.effects = vec![key(), VideoEffect::Blur { sigma: 2.0 }]),
-            "chroma key after a scale or a blur"
-        ));
+        assert!(
+            why(&|c| c.effects = vec![key(), VideoEffect::Blur { sigma: 2.0 }]).is_empty(),
+            "a key beside a blur is drawn"
+        );
         // Not on a letterbox, another pixel format, a rotated or translucent layer, or under a mask.
         let boxed = why_of(video(640, 360), Some(Delivery::new(360, 640, Fit::Contain)), &|c| {
             c.effects = vec![key()];
@@ -4691,7 +4710,7 @@ mod tests {
     }
 
     #[test]
-    fn a_sharpen_that_amplifies_a_scale_or_a_blur_past_two_levels_is_refused() {
+    fn a_sharpen_that_amplifies_a_scale_past_two_levels_is_refused() {
         use crate::model::Keyframe;
         let caps = GpuCaps {
             effects: EffectKinds::BLUR
@@ -4709,8 +4728,7 @@ mod tests {
             let plan = fading_plan(|c| edit(c), 0.5);
             plan.reasons(&caps, plan.size(width))
         };
-        let refused =
-            |why: &[Unsupported]| matches!(why, [Unsupported::Effects(_, w)] if w.contains("sharpen after a scale or a blur"));
+        let refused = |why: &[Unsupported]| matches!(why, [Unsupported::Effects(_, w)] if w.contains("sharpen after a scale"));
         let pip = |effects: Vec<VideoEffect>| {
             move |c: &mut Clip| {
                 c.transform.scale = 0.6;
@@ -4734,9 +4752,10 @@ mod tests {
             let effects: Vec<VideoEffect> = amounts.iter().map(|a| sharp(*a)).collect();
             let why = reasons(&pip(effects.clone()), u32::MAX);
             assert!(refused(&why), "pip {amounts:?}: {why:?}");
+            // (After a blur nothing is amplified: the blur the caps hold is `gblur`'s to the sample.)
             let blurred: Vec<VideoEffect> = std::iter::once(blur()).chain(effects).collect();
             let why = reasons(&plain(blurred), u32::MAX);
-            assert!(refused(&why), "blur then {amounts:?}: {why:?}");
+            assert!(why.is_empty(), "blur then {amounts:?}: {why:?}");
         }
         let why = reasons(&pip(vec![sharp(0.5), VideoEffect::Invert, sharp(0.5)]), u32::MAX);
         assert!(refused(&why), "{why:?}");
@@ -4746,17 +4765,13 @@ mod tests {
         assert!(reasons(&pip(vec![sharp(0.5), sharp(0.00001), sharp(-0.00001)]), u32::MAX).is_empty());
         assert!(reasons(&pip(vec![sharp(0.001)]), u32::MAX).is_empty());
         assert!(reasons(&plain(vec![blur(), sharp(0.0), sharp(0.5)]), u32::MAX).is_empty());
-        // A blur is a source of difference too: a sharpen after one, scaled or not.
-        for (amount, ok) in [(0.5, true), (0.6, false), (1.0, false), (5.0, false)] {
+        // A blur is no source of a difference: a sharpen after one, scaled or not, is drawn at any amount, chained.
+        for amount in [0.5, 0.6, 1.0, 5.0] {
             let why = reasons(&plain(vec![blur(), sharp(amount)]), u32::MAX);
-            assert_eq!(why.is_empty(), ok, "blur then sharpen {amount}: {why:?}");
-            assert!(ok || refused(&why), "{amount}: {why:?}");
+            assert!(why.is_empty(), "blur then sharpen {amount}: {why:?}");
         }
-        let why = reasons(&plain(vec![blur(), VideoEffect::Grayscale, sharp(1.0)]), u32::MAX);
-        assert!(refused(&why), "{why:?}");
-        let why = reasons(&plain(vec![blur(), sharp(0.5), sharp(0.5)]), u32::MAX);
-        assert!(refused(&why), "{why:?}");
-        // A blur of nothing (sigma 0) is not a difference.
+        assert!(reasons(&plain(vec![blur(), VideoEffect::Grayscale, sharp(1.0)]), u32::MAX).is_empty());
+        assert!(reasons(&plain(vec![blur(), sharp(0.5), sharp(0.5)]), u32::MAX).is_empty());
         assert!(reasons(&plain(vec![VideoEffect::Blur { sigma: 0.0 }, sharp(5.0)]), u32::MAX).is_empty());
         // The other way round, or with nothing upstream, the sharpens are exact: any amount, chained.
         assert!(reasons(&plain(vec![sharp(5.0)]), u32::MAX).is_empty());
@@ -4787,9 +4802,21 @@ mod tests {
         assert!(reasons(&zoomed, u32::MAX).is_empty(), "{:?}", reasons(&zoomed, u32::MAX));
         let why = reasons(&zoomed, 480);
         assert!(refused(&why), "{why:?}");
-        // (a blur still counts ahead of a zoom: the sharpen after it is of a blurred picture)
+        // (a blur ahead of a zoom is no source of a difference either)
         let why = reasons(&zooming(vec![blur(), sharp(1.0)]), u32::MAX);
-        assert!(refused(&why), "{why:?}");
+        assert!(why.is_empty(), "{why:?}");
+        // Where the scaler is swscale's to the sample (`exact_scaler`) a scale is no source of a difference either: the same
+        // sharpens on the same pip are drawn.
+        let exact = GpuCaps {
+            exact_scaler: true,
+            ..caps
+        };
+        for amounts in [vec![5.0], vec![0.5, 0.5], vec![0.2, 0.2, 0.001]] {
+            let effects: Vec<VideoEffect> = amounts.iter().map(|a| sharp(*a)).collect();
+            let plan = fading_plan(|c| pip(effects.clone())(c), 0.5);
+            let why = plan.reasons(&exact, plan.size(u32::MAX));
+            assert!(why.is_empty(), "pip {amounts:?}: {why:?}");
+        }
     }
 
     #[test]
@@ -5604,7 +5631,7 @@ mod tests {
         // FFmpeg 6 converts the range at the decode: the compositor's order.
         assert!(reasons(&plan(&full, CompositeColorPolicy::FixedBt601, 1.0, 0.5)).is_empty());
         // ... unless the scaler resizes the picture, which converts the range inside the resize
-        // (chroma up to 15 levels off): refused under either FFmpeg inside a fade, and drawn plain in a still.
+        // (chroma up to 15 levels off): refused under either FFmpeg inside a fade and plain in a still alike.
         let resized = |stream: &StreamInfo, policy, fade: f64, t: f64| {
             fading_plan_of(
                 stream.clone(),
@@ -5629,7 +5656,42 @@ mod tests {
                 "{policy:?}: limited range is exact"
             );
         }
-        assert!(reasons(&resized(&full, CompositeColorPolicy::FixedBt601, 0.0, 0.5)).is_empty());
+        for policy in [CompositeColorPolicy::FixedBt601, CompositeColorPolicy::BottomLayerTag] {
+            let still = reasons(&resized(&full, policy, 0.0, 0.5));
+            assert!(
+                still
+                    .iter()
+                    .any(|w| matches!(w, Unsupported::FullRangeResized(_, m) if m.contains("in a still"))),
+                "{policy:?}: {still:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_layer_below_full_opacity_is_refused_where_its_round_trip_is_not_measured() {
+        let unmeasured = GpuCaps {
+            translucent_approximate: true,
+            ..GpuCaps::A0
+        };
+        let draws = |caps: &GpuCaps, edit: &dyn Fn(&mut Clip)| {
+            let plan = fading_plan(|c| edit(c), 0.5);
+            plan.reasons(caps, plan.size(u32::MAX))
+        };
+        let why = draws(&unmeasured, &|c| c.transform.opacity = 0.6);
+        assert!(matches!(why.as_slice(), [Unsupported::TranslucentApproximate(_)]), "{why:?}");
+        // The round trip is a constant opacity's: a full-opacity layer is not refused, and where the probe measured it, neither is
+        // a translucent one.
+        assert!(draws(&unmeasured, &|_| {}).is_empty());
+        assert!(draws(&GpuCaps::A0, &|c| c.transform.opacity = 0.6).is_empty());
+        // A dissolve's alpha ramp is not the round trip.
+        assert!(draws(&unmeasured, &|c| {
+            c.transition_in = Some(Transition {
+                kind: TransitionKind::Crossfade,
+                duration: 1.0,
+            });
+        })
+        .iter()
+        .all(|w| !matches!(w, Unsupported::TranslucentApproximate(_))));
     }
 
     #[test]

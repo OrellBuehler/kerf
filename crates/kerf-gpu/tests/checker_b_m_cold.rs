@@ -3,7 +3,7 @@
 //! * `checker_b_m_caps_api_*` (no FFmpeg, no adapter): every pin of `Compositor::caps_for`, `caps_with`, `caps_pinned` and
 //!   `session_caps_for` reaches the cap it is for, and none reaches another (a swapped or dropped pin is a different cap, not a compile error).
 //! * `checker_b_m_a_cold_session_*` (`#[ignore]`d, FFmpeg): in a process that has measured nothing, the plan of every kind of clip that needs
-//!   a probe (a mask, a blend, a moving zoom, a keyed opacity, a resized picture) is refused up front by the session's caps, drawing it anyway is
+//!   a probe (a mask, a blend, a moving zoom, a keyed opacity, a resized picture, a layer below full opacity, a blur) is refused up front by the session's caps, drawing it anyway is
 //!   `Unsupported` and runs no probe; after `prepare_timeline` the same plans are judged clean. One test, because the answers are cached once per
 //!   process: a fresh process is what "cold" is.
 //!
@@ -171,6 +171,44 @@ fn checker_b_m_caps_api_pinned_pins_land_where_they_belong() {
     assert_eq!(for_caps.blend_extras, kerf_core::BlendExtras::NONE);
 }
 
+#[test]
+#[ignore = "needs a GPU adapter (lavapipe is enough)"]
+fn checker_b_m_caps_api_translucency_and_blur_pins_reach_their_caps_only() {
+    use kerf_core::EffectKinds;
+    use kerf_gpu::blur_probe::Blur;
+    use kerf_gpu::roundtrip_probe::Translucency;
+    let gpu = Gpu::new(GpuOptions::for_tests()).expect("a GPU adapter (install mesa-vulkan-drivers for lavapipe)");
+    let comp = || Compositor::new(std::sync::Arc::clone(&gpu)).expect("a compositor");
+    let rest = |c: &kerf_core::GpuCaps| (c.exact_scaler, c.dip_white, c.grade, c.effects.without(EffectKinds::BLUR));
+    let base = comp().with_translucency(Translucency::Match).with_blur(Blur::Match).caps();
+    assert!(
+        !base.translucent_approximate && base.effects.contains(EffectKinds::BLUR),
+        "{base:?}"
+    );
+    for t in [
+        Translucency::Match,
+        Translucency::Differs("rehearsed".into()),
+        Translucency::Unknown,
+    ] {
+        let caps = comp().with_translucency(t.clone()).with_blur(Blur::Match).caps();
+        assert_eq!(caps.translucent_approximate, t != Translucency::Match, "{t:?}");
+        assert!(
+            caps.effects.contains(EffectKinds::BLUR),
+            "{t:?}: the round trip says nothing of the blur"
+        );
+        assert_eq!(rest(&caps), rest(&base), "{t:?}");
+    }
+    for b in [Blur::Match, Blur::Differs("rehearsed".into()), Blur::Unknown] {
+        let caps = comp().with_translucency(Translucency::Match).with_blur(b.clone()).caps();
+        assert_eq!(caps.effects.contains(EffectKinds::BLUR), b == Blur::Match, "{b:?}");
+        assert!(
+            !caps.translucent_approximate,
+            "{b:?}: the blur says nothing of the round trip"
+        );
+        assert_eq!(rest(&caps), rest(&base), "{b:?}");
+    }
+}
+
 // ---- a cold session -----------------------------------------------------------------------------------------------
 
 fn ffmpeg(args: &[&str]) {
@@ -220,7 +258,7 @@ fn key(time: f64, scale: f64, opacity: f64) -> Keyframe {
     }
 }
 
-/// Five segments on the second track over a base, each of a kind that needs a probe, and the frame in the middle of each.
+/// Seven segments on the second track over a base, each of a kind that needs a probe, and the frame in the middle of each.
 fn session() -> (Timeline, Vec<Asset>, Vec<(&'static str, u64)>) {
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("checker-b-m-cold");
     std::fs::create_dir_all(&dir).unwrap();
@@ -242,6 +280,10 @@ fn session() -> (Timeline, Vec<Asset>, Vec<(&'static str, u64)>) {
     let mut fading = Clip::new(same.id, 0.6, 0.8, 0.6);
     fading.keyframes = vec![key(0.0, 1.0, 1.0), key(0.2, 1.0, 0.4)];
     let shrunk = Clip::new(big.id, 0.8, 1.0, 0.8);
+    let mut translucent = Clip::new(same.id, 0.0, 0.1, 1.0);
+    translucent.transform.opacity = 0.6;
+    let mut blurred = Clip::new(same.id, 0.1, 0.2, 1.1);
+    blurred.effects = vec![kerf_core::VideoEffect::Blur { sigma: 2.0 }];
     let timeline = Timeline {
         tracks: vec![
             Track {
@@ -249,7 +291,7 @@ fn session() -> (Timeline, Vec<Asset>, Vec<(&'static str, u64)>) {
                 ..Track::new(StreamKind::Video, "V1".to_string())
             },
             Track {
-                clips: vec![masked, blended, zooming, fading, shrunk],
+                clips: vec![masked, blended, zooming, fading, shrunk, translucent, blurred],
                 ..Track::new(StreamKind::Video, "V2".to_string())
             },
         ],
@@ -262,6 +304,8 @@ fn session() -> (Timeline, Vec<Asset>, Vec<(&'static str, u64)>) {
         ("moving zoom", 15),
         ("keyed opacity", 21),
         ("resized picture", 27),
+        ("translucent layer", 31),
+        ("blur", 34),
     ];
     (timeline, vec![base, same, big], frames)
 }
@@ -281,6 +325,11 @@ fn checker_b_m_a_cold_session_is_refused_by_the_caps_and_primed_by_prepare_timel
         kerf_gpu::placement_probe::Placement::Unknown
     );
     assert_eq!(kerf_gpu::conversion::measured(), kerf_gpu::conversion::Conversion::Unknown);
+    assert_eq!(
+        kerf_gpu::roundtrip_probe::measured(),
+        kerf_gpu::roundtrip_probe::Translucency::Unknown
+    );
+    assert_eq!(kerf_gpu::blur_probe::measured(), kerf_gpu::blur_probe::Blur::Unknown);
 
     let (timeline, assets, frames) = session();
     // (The composite's colour policy is not one of the gates: the planner takes it as an input.)
@@ -338,6 +387,8 @@ fn checker_b_m_a_cold_session_is_refused_by_the_caps_and_primed_by_prepare_timel
             "blend" => matches!(u, Unsupported::BlendMode(..)),
             "keyed opacity" => matches!(u, Unsupported::KeyedOpacity(_)),
             "resized picture" => matches!(u, Unsupported::ScalerApproximate(_)),
+            "translucent layer" => matches!(u, Unsupported::TranslucentApproximate(_)),
+            "blur" => matches!(u, Unsupported::Effects(_, w) if w.contains("blur")),
             "moving zoom" => text.contains("moving zoom") || text.contains("placement"),
             _ => false,
         }
@@ -346,7 +397,13 @@ fn checker_b_m_a_cold_session_is_refused_by_the_caps_and_primed_by_prepare_timel
     // without measuring.
     let caps = comp.session_caps();
     assert!(
-        !caps.mask && !caps.keyed_opacity && !caps.placement && !caps.exact_scaler && caps.blend == BlendKinds::NONE,
+        !caps.mask
+            && !caps.keyed_opacity
+            && !caps.placement
+            && !caps.exact_scaler
+            && caps.blend == BlendKinds::NONE
+            && caps.translucent_approximate
+            && !caps.effects.contains(kerf_core::EffectKinds::BLUR),
         "{caps:?}"
     );
     for (what, k) in &frames {
@@ -375,6 +432,16 @@ fn checker_b_m_a_cold_session_is_refused_by_the_caps_and_primed_by_prepare_timel
         kerf_gpu::placement_probe::measured(),
         kerf_gpu::placement_probe::Placement::Unknown,
         "a render ran the placement probe"
+    );
+    assert_eq!(
+        kerf_gpu::roundtrip_probe::measured(),
+        kerf_gpu::roundtrip_probe::Translucency::Unknown,
+        "a render ran the translucency probe"
+    );
+    assert_eq!(
+        kerf_gpu::blur_probe::measured(),
+        kerf_gpu::blur_probe::Blur::Unknown,
+        "a render ran the blur probe"
     );
 
     // Primed by the timeline alone: the whole cut's probes, once, ahead of any frame.
@@ -413,6 +480,14 @@ fn checker_b_m_a_cold_session_is_refused_by_the_caps_and_primed_by_prepare_timel
         "the blend chain was not measured by prepare_timeline: {caps:?}"
     );
     assert!(caps.exact_scaler, "the scaler was not measured by prepare_timeline: {caps:?}");
+    assert!(
+        !caps.translucent_approximate,
+        "the translucent round trip was not measured by prepare_timeline: {caps:?}"
+    );
+    assert!(
+        caps.effects.contains(kerf_core::EffectKinds::BLUR),
+        "the blur was not measured by prepare_timeline: {caps:?}"
+    );
     // The files' ranges are asked for by the session's own step (`prepare_placed_files`, which `begin_play` runs after the timeline's): where
     // the composite's range is negotiated (9.0.2) a placed clip whose asset did not record its range is refused by the session's caps until
     // its file has said; where it is not (6.1.1) there is nothing to ask.

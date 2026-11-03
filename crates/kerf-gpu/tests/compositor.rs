@@ -21,12 +21,15 @@ fn gpu() -> std::sync::Arc<Gpu> {
 
 /// (The scaler is pinned as the model: nothing here runs FFmpeg to measure it, and a compositor whose scaler is not known to be
 /// swscale's refuses every resized layer. So is the edge of `geq`'s read, which a mask needs known: a copy of the picture's own
-/// last column and row, as FFmpeg 9 reads it; the case that holds the clamping build pins the other.)
+/// last column and row, as FFmpeg 9 reads it; the case that holds the clamping build pins the other. The translucent round trip and the blur
+/// are pinned to match too: they are drawn only where this FFmpeg's kernels were measured to be the model's.)
 fn compositor() -> Compositor {
     Compositor::new(gpu())
         .expect("a compositor")
         .with_scaler_kernels(kerf_gpu::scaler::Kernels::Match(kerf_gpu::scaler::Model::ASSUMED))
         .with_geq_edge(kerf_core::GeqEdge::Exact)
+        .with_translucency(kerf_gpu::roundtrip_probe::Translucency::Match)
+        .with_blur(kerf_gpu::blur_probe::Blur::Match)
 }
 
 fn asset(w: u32, h: u32) -> Asset {
@@ -112,15 +115,14 @@ fn an_empty_frame_is_opaque_black() {
 fn a_flat_layer_converts_with_the_plans_matrix() {
     let a = asset(64, 36);
     let plan = plan_for(&a, Clip::new(a.id, 0.0, 1.0, 0.0));
-    // Y 100, U 160, V 90 is (37, 116, 162) in BT.601 limited range (FFmpeg's
-    // swscale lands one to two levels lower; the parity harness measures that).
+    // Y 100, U 160, V 90 in BT.601 limited range, through swscale's own kernel (`ff_yuv_420_rgb24_ssse3`, which the still's PNG and
+    // an export are read through): the display conversion is that kernel, to the level.
+    let want = kerf_gpu::grade::X86Kernel::new(kerf_core::YuvMatrix::Bt601).rgb(100, 160, 90);
     let frame = compositor()
         .composite(&plan, &[flat(64, 36, 100, 160, 90)], (64, 36))
         .unwrap();
     for p in frame.data.as_chunks::<4>().0 {
-        assert!((i32::from(p[0]) - 37).abs() <= 1, "{p:?}");
-        assert!((i32::from(p[1]) - 116).abs() <= 1, "{p:?}");
-        assert!((i32::from(p[2]) - 162).abs() <= 1, "{p:?}");
+        assert_eq!([p[0], p[1], p[2]], want, "{p:?}");
         assert_eq!(p[3], 255);
     }
 }
@@ -315,18 +317,9 @@ fn a_blur_is_the_references_recursion_plane_by_plane() {
             let want_v = effects::blur_plane(&frame.v, cw, ch, &g);
             for (plane, a, b) in [("Y", &got.y, &want_y), ("U", &got.u, &want_u), ("V", &got.v, &want_v)] {
                 let differing = a.iter().zip(b).filter(|(x, y)| x != y).count();
-                let max = a
-                    .iter()
-                    .zip(b)
-                    .map(|(x, y)| (i32::from(*x) - i32::from(*y)).abs())
-                    .max()
-                    .unwrap();
-                // The shader's order is the reference's; a fused multiply-add on the device may flip a
-                // sample that sits on a half.
-                assert!(
-                    max <= 1 && differing * 500 <= a.len(),
-                    "{w}x{h} sigma {sigma} {plane}: max {max}, {differing} differ"
-                );
+                // The shader's recursion is the reference's, fused multiply-add for fused multiply-add (`fma.wgsl` does the
+                // fusion in integers, so no device's own rounding is in it): not a sample differs.
+                assert_eq!(differing, 0, "{w}x{h} sigma {sigma} {plane}: {differing} differ");
             }
         }
     }

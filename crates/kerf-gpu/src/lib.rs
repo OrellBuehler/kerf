@@ -77,12 +77,21 @@
 //!   picture from its pixel format, and draws it at its own size.
 //! * **Opacity below 1** takes FFmpeg's RGB round trip ([`roundtrip`]): the layer
 //!   goes `yuva420p -> argb -> yuva420p`, because `colorchannelmixer` only takes
-//!   RGB. Out of YCbCr with the layer's own matrix (swscale's converter, exact), back
-//!   with the composite's (luma exact, chroma within a level of the pair-averaged,
-//!   vertically scaled one), and an alpha plane that ends up at
+//!   RGB. Out of YCbCr with the layer's own matrix (swscale's C converter), back
+//!   with the composite's (the generic scaler: luma per pixel, chroma from pixel pairs summed in 15
+//!   bits, then the x86 `yuv2yuvX` vertical kernel for every row but the last, the grade's way back), and an
+//!   alpha plane that ends up at
 //!   `round(lrint(255 * op) * 256 / 255)` ([`geometry::ffmpeg_alpha`]). Reproduced
-//!   in integer arithmetic; a translucent layer of odd size is refused, as is one
+//!   in integer arithmetic **to the sample, every plane**, where [`roundtrip_probe::translucency`]
+//!   ran the export's own `colorchannelmixer` text over noise and the planes came back as the model
+//!   makes them (an arm64 or SSE-only build runs other kernels: `Differs`, and the layer is FFmpeg's,
+//!   `GpuCaps::translucent_approximate`); a translucent layer of odd size is refused, as is one
 //!   whose matrix is unknown.
+//! * **A blur is drawn only where this FFmpeg's `gblur` is the fused-multiply-add recursion.** Its x86 AVX2 /
+//!   AVX-512 kernels make every step of the recursion one rounding (`vfmadd231ps`); the shader does the fusion in
+//!   integers (`shaders/fma.wgsl`, held to `f32::mul_add` on 450,000 triples) and [`blur_probe::blur`] runs the
+//!   export's `gblur` text over noise and holds every sample to [`effects::blur_plane`], so a build with
+//!   another kernel (SSE4 only, or none) has no blur in [`Compositor::caps`].
 //! * **Geometry.** FFmpeg's integer rounding (`crop`, `scale`, `pad`, `overlay`,
 //!   `rotate`) is reproduced in [`geometry`], so layers land on the same pixels —
 //!   including the chroma block an odd layer's last pixel shares with the pixel
@@ -143,6 +152,7 @@
 //! (`Pick::progress`).
 
 pub mod blend;
+pub mod blur_probe;
 pub mod compositor;
 pub mod conversion;
 pub mod convert;
@@ -160,6 +170,7 @@ pub mod placement;
 pub mod placement_probe;
 pub mod present;
 pub mod roundtrip;
+pub mod roundtrip_probe;
 pub mod router;
 pub mod scaler;
 pub mod selftest;
