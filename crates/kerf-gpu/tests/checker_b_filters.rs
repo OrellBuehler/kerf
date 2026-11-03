@@ -4715,9 +4715,11 @@ fn checker_b_r2_refusals_are_needed() {
         ("plain+opacity", true, Box::new(|c| c.transform.opacity = 0.6), false),
         ("plain+rotation", true, Box::new(|c| c.transform.rotation = 10.0), false),
         ("plain+mask", true, Box::new(|c| c.mask = Some(mask)), false),
+        // (Not a refusal that must exist any more: the placement is drawn where it is measured, and this harness measures it. The
+        // refusal this case used to hold was the unmeasured placement's, not the mixed matrices'. Its frames are held to the export below.)
         (
             "plain+keyed scale",
-            true,
+            false,
             Box::new(|c| c.keyframes = vec![zoom_key(0.0, 1.0, 0.0, 0.0), zoom_key(0.7, 0.8, 0.0, 0.0)]),
             false,
         ),
@@ -4771,6 +4773,28 @@ fn checker_b_r2_refusals_are_needed() {
             wider.push(name.to_string());
         }
         lines.push(name.to_string());
+    }
+    // The keyed scale of another matrix is drawn now (the placement is measured): every frame is the export's.
+    {
+        let mut c = clip(&b601, 0.5, 1.2, 0.7);
+        c.keyframes = vec![zoom_key(0.0, 1.0, 0.0, 0.0), zoom_key(0.7, 0.8, 0.0, 0.0)];
+        let tl = timeline(vec![vec![clip(&first709, 0.5, 1.2, 0.0), c]], None);
+        let out = sweep_secs(
+            "checker/b/r2/refusal plain+keyed scale (drawn)",
+            &tl,
+            &dedup(&[&first709, &b601]),
+            15.0,
+            1.4,
+        );
+        assert!(
+            out.bad.is_empty(),
+            "the keyed scale of another matrix is drawn inexactly: {:?}",
+            out.bad.first()
+        );
+        assert!(
+            out.drawn > 0 || !negotiates(),
+            "nothing of the keyed scale of another matrix was drawn"
+        );
     }
     // Cuts whose deciding clip is an RGB picture or whose picture is alone in a BT.709 cut, and a source with an alpha channel
     // carrying the things that are not read.
