@@ -150,7 +150,10 @@ fn checker_simd2_the_memo_holds_what_it_says_it_holds() {
     });
     assert!(size > 3 * MIB, "{size}");
     let kept = live() - mark;
-    assert!(kept < 2 * size, "12 threads on one key left {kept} bytes held of a {size}-byte table");
+    assert!(
+        kept < 2 * size,
+        "12 threads on one key left {kept} bytes held of a {size}-byte table"
+    );
 
     // Refused ratios take entries too, for no bytes: the tables they push out are rebuilt, the refusals are held.
     for i in 0..70u32 {
