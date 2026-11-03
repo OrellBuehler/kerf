@@ -40,6 +40,7 @@ pub mod render_bar;
 pub mod render_plan;
 pub mod review;
 pub mod scopes;
+pub mod simd;
 pub mod stabilize;
 pub mod still_motion;
 pub mod svg;

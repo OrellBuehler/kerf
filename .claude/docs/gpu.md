@@ -408,6 +408,56 @@ export within the scaler's level (placed: 1) and the scaler's plus the transluce
 above: `SCALED` plus `TRANSLUCENT` would say luma 1 and chroma 2, but the scaler's level crosses into luma through the round trip's conversion). It also holds the feed (a cursor opened ahead is the one the cut uses and the first
 clip's goes with it; a transport stream is refused when opened ahead; with more clips in the window than it holds it keeps the ones wanted first), and the texture a session presents to be the composite's picture.
 
+**CPU-side work and SIMD.** The per-pixel work is the GPU's; what the CPU still does one sample at a time is vectorised or not done
+twice, and nothing else is (`tests/bench_cpu.rs`, `#[ignore]`d, `KERF_BENCH=1`, times the CPU side; the `memcpy`-bound copies stay as
+they are). The kernels live in `kerf-core` (`simd.rs`, `mask_plane.rs`, `mask_plane/x86.rs`) and `kerf-gpu` calls them:
+
+- **Byte scans** (`simd::position_ne` / `rposition_ne`, the first / last byte that is not a value; `plane_bounds` on top): the bounding
+  box of a title's glyph and box masks (`text.rs` `Raster::from_parts`, `text/seq.rs` `read_box` / `shape_of`), the "is the box solid"
+  check, and the opaque-alpha scan of an asset that never recorded its pixel format (`source.rs`). 16 / 32 bytes a step with `cmpeq` +
+  `movemask`, blocks of 64 bytes tested with the masks and-ed together, the tail one register overlapping bytes already known equal.
+  Measured on x86_64 (1080p plane, 1.7 ms scalar): 0.04 ms on SSE2, 0.03 on AVX2.
+- **The mask's alpha plane** (`kerf_core::mask_alpha_plane`; made for every new `(mask, size)`, so on each step of a mask-handle drag).
+  A **rectangle**'s alpha is a monotone function of its offset (`1 - d`, `/ feather`, `clamp`, `* 255` and the truncating cast each keep the
+  order, `inverted` turns it round), and a sample's offset is the larger of its column's and its row's, so its alpha is the smaller of
+  the two alphas (the larger when inverted): one ramp per column and one value per row, and a byte `min` / `max` per row (`min_row_*`,
+  `max_row_*`; SSE2 16 bytes, AVX2 32). An **ellipse** is `f64` lanes (2 on SSE2, 4 on AVX2) running the scalar's operations in the
+  scalar's order, no fused multiply-add, the same truncating `cvttpd`; its band around the edge needs libm's `hypot` and, with the
+  columns past the last whole group, goes through the scalar `Params::px`. Measured on x86_64 at 1080p, scalar to AVX2: 1.2 to 0.13 ms
+  (hard rect), 3.2 to 0.11 (feathered rect), 1.6 to 0.7 (hard ellipse), 2.4 to 2.0 (feathered ellipse, whose ring is all `hypot`).
+- **Not vector code**: `sws::table_aligned` is **memoised** per `(scaler, align, src, dst, one)` (a table is a pure function of exactly
+  these five, so the key is all of them: a key that left one out would hand the C build's table to a SIMD build or the bicubic table to a
+  bilinear scale; 64 entries, 32 MiB, no table over 8 MiB, newest first). Every table of the compositor comes through it (`bicubic`, `table`
+  and `plane_filters`' calls are this), `table_aligned_uncached` is the reference (`bicubic_uncached` is it for the C bicubic). The lock is
+  taken to look up and to keep, never while a table is built or cloned, and a table over the entry cap is not cloned at all. A scaled layer's
+  six tables cost 0.25 to 0.64 ms every frame and now 0.002 to 0.006 (a clone of the cached table). `effects::vignette_map` works each distinct `(|xx|, |yy|)` once
+  (`hypot` takes magnitudes, so the map depends only on the offsets' magnitudes however the size is odd or even) and a row with a magnitude met
+  before is copied: 40 to 9 ms at 1080p, 175 to 54 at 4K, once per size; held to the every-sample function bit for bit at odd and even
+  sizes.
+- **Pitfall (codegen)**: inside a `#[target_feature]` kernel, `copy_from_slice` or an iterator adapter is a *call* in a release build with
+  several codegen units (the mask rows ran 2.3 times slower than the scalar's). The kernels read and write through raw pointers after one
+  bounds check (`n = min(len)`, `i + N <= n`).
+- **Detection, cap, fallback**: `kerf_core::simd::path()` is the widest of `Scalar` / `Sse2` / `Avx2` (x86_64, `is_x86_feature_detected!`)
+  or `Neon` (aarch64, `is_aarch64_feature_detected!`) the CPU has, probed once. `KERF_SIMD` caps it (case-insensitive: `scalar` / `off` /
+  `none` / `0`, `sse2` / `neon`, `avx2`; any other value is no cap and logs one `tracing` warning). `simd::with_path(path, f)` forces a path
+  on a thread (`#[doc(hidden)]`, the tests' hook). Every kernel keeps its scalar function (`position_ne_scalar`, `plane_bounds_scalar`,
+  `mask_alpha_plane_scalar`): the fallback, what `KERF_SIMD=scalar` runs, and the oracle. A vector path returns exactly what the scalar one
+  returns (0 differing samples): these feed the exact-parity text and mask paths. Every CPU-side sample of the compositor is 8-bit (the y4m
+  is `C420`, the readback `Rgba8`), so there are no 10 / 16-bit kernels.
+- **Tests**, always run, each on every path `available()` lists: the scans over widths 1 to 67 and larger, from several start offsets
+  (loads are unaligned), with a differing byte at every position and 0 to 3 random ones; `plane_bounds` against the old row-by-row
+  function on noise, rectangle, sparse, full and empty planes; the mask plane for random masks (every shape, feathers either side of the
+  1e-6 threshold and past 1, centres and sizes out of range, inverted) at widths 1 to 67 and 128 / 255 to 257 with heights 1, 2, 3, 18 and 40,
+  and at picture sizes, against `reference_plane`, the function as it was before the vector paths, verbatim; `text.rs` cuts a title's
+  masks identically on every path. `kerf-core/tests/checker_simd*.rs` (naive loops, misaligned sub-slices, an electric-fence allocator)
+  and `kerf-gpu/tests/checker_simd_cut.rs` (a masked, titled cut per `KERF_SIMD` value; `#[ignore]`d) are the independent checks;
+  `kerf-gpu/tests/checker_simd2_{memo,memo_bytes,vignette}.rs` hold the memo to `bicubic_uncached` / `table_aligned_uncached` over
+  both scalers and the alignments 1, 2 and 4 (and its caps, under a counting allocator) and the vignette map to a re-derivation from `vignette.c`; `kerf-core/tests/checker_simd2.rs` checks the rect rows.
+- **NEON is written but has never run**: the byte scans have a NEON path (`vld1q_u8`, `vdupq_n_u8`, `vceqq_u8`, `vminvq_u8` per 16 bytes;
+  the block or chunk that differs is searched by the scalar scan). It type-checks and lints clean for `aarch64-unknown-linux-gnu`, and its
+  control flow (`first_ne_by_chunks`: blocks, chunks, the overlapping end) is arch-independent and tested with a portable "all equal"; an
+  arm64 runner runs the tests above on it unchanged. The mask rows have no NEON kernel and take the scalar path there.
+
 What the parity harness forced, all recorded in `kerf-gpu`'s docs and shaders:
 
 - **Composite in YUV, convert once.** FFmpeg's `overlay` blends the encoded planes and
@@ -461,7 +511,8 @@ What the parity harness forced, all recorded in `kerf-gpu`'s docs and shaders:
     2 vertically: `filterAlign`) and **keeps the original taps in the padding** — swscale only
     *counts* the near-zero taps on the right as droppable and rounds that count up, copying the originals
     unless `SWS_BITEXACT` — so the row is normalised with them and its weights are another's than the
-    C build's (`sws::table_aligned`; the old zero padding was a level off on 7.9:1 and steeper shrinks).
+    C build's (`sws::table_aligned`; the old zero padding was a level off on 7.9:1 and steeper shrinks). Built tables are memoised
+    on the whole input, scaler and alignment included (the SIMD notes).
   * **The vertical arithmetic.** C (`yuv2planeX_8_c`: `(64 << 12) + sum(c * s) >> 19`) or, on x86 with
     SSE2 and default flags, `yuv2yuvX.asm`: `(c * s) >> 16` per tap (`pmulhw`: every tap truncates),
     started from `(64 + 8 * (N - 1)) >> 4` with `N` the aligned tap count, `>> 3` — **except the last two

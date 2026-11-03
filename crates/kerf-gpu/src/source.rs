@@ -439,7 +439,7 @@ fn decode_layer_shared(layer: &PlanLayer, share: usize) -> Result<Option<YuvFram
                 frame_len + plane
             )));
         }
-        if with_alpha[frame_len..].iter().any(|a| *a != 255) {
+        if kerf_core::simd::position_ne(&with_alpha[frame_len..], 255).is_some() {
             return Err(GpuError::Unsupported(format!("{path} has transparency")));
         }
     }

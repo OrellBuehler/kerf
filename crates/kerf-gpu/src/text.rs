@@ -483,7 +483,7 @@ impl Raster {
             uploaded: OnceLock::new(),
         };
         for (part, plane) in graph.parts.iter().zip(planes.chunks_exact(w * h)) {
-            let Some((x0, y0, x1, y1)) = bounds(plane, w, h) else {
+            let Some((x0, y0, x1, y1)) = kerf_core::simd::plane_bounds(plane, w, h) else {
                 continue;
             };
             match part {
@@ -503,7 +503,8 @@ impl Raster {
                 }
                 TextPart::Box => {
                     // A box is a rectangle of full coverage; anything else is not what this reads.
-                    let solid = (y0..y1).all(|row| plane[row * w + x0..row * w + x1].iter().all(|v| *v == 255));
+                    let solid =
+                        (y0..y1).all(|row| kerf_core::simd::position_ne(&plane[row * w + x0..row * w + x1], 255).is_none());
                     if !solid {
                         return Err(GpuError::Unsupported("the text's box did not come out as a rectangle".into()));
                     }
@@ -658,22 +659,6 @@ impl Layers {
             passes,
         }
     }
-}
-
-/// The bounding box `(x0, y0, x1, y1)` (exclusive end) of the non-zero samples of a `w` x `h` plane.
-fn bounds(plane: &[u8], w: usize, h: usize) -> Option<(usize, usize, usize, usize)> {
-    let mut b: Option<(usize, usize, usize, usize)> = None;
-    for y in 0..h {
-        let row = &plane[y * w..(y + 1) * w];
-        let (Some(first), Some(last)) = (row.iter().position(|v| *v != 0), row.iter().rposition(|v| *v != 0)) else {
-            continue;
-        };
-        b = Some(match b {
-            None => (first, y, last + 1, y + 1),
-            Some((x0, y0, x1, _)) => (x0.min(first), y0, x1.max(last + 1), y + 1),
-        });
-    }
-    b
 }
 
 /// What a blend draws.
@@ -1557,6 +1542,47 @@ mod tests {
         holed[2 * w + 3] = 100;
         let err = Raster::from_parts(&graph(vec![TextPart::Box], 8, 6), &holed).unwrap_err();
         assert!(matches!(err, GpuError::Unsupported(_)), "{err}");
+    }
+
+    /// The same masks on every SIMD path: a title's glyph plane and box plane at sizes either side of
+    /// a register width, cut to the same bitmaps, box and refusals as the scalar scan cuts them.
+    #[test]
+    fn masks_are_cut_the_same_on_every_simd_path() {
+        for (w, h) in [(1usize, 1usize), (15, 9), (16, 16), (33, 20), (97, 61), (480, 270)] {
+            let mut glyphs = vec![0u8; w * h];
+            for k in 0..(w * h / 7).max(1) {
+                let (x, y) = ((k * 31 + 5) % w, (k * 17 + 3) % h);
+                if x >= w / 5 && y >= h / 4 && x < w - w / 7 && y < h - h / 3 {
+                    glyphs[y * w + x] = 1 + (k % 250) as u8;
+                }
+            }
+            let mut boxed = vec![0u8; w * h];
+            for y in h / 5..h - h / 6 {
+                for x in w / 7..w - w / 5 {
+                    boxed[y * w + x] = 255;
+                }
+            }
+            let planes: Vec<u8> = glyphs.iter().chain(&boxed).copied().collect();
+            let cut = |path| {
+                kerf_core::simd::with_path(path, || {
+                    let r =
+                        Raster::from_parts(&graph(vec![TextPart::Glyphs, TextPart::Box], w as u32, h as u32), &planes).unwrap();
+                    (r.sequence, r.boxed)
+                })
+            };
+            let want = cut(kerf_core::simd::Path::Scalar);
+            for path in kerf_core::simd::available() {
+                assert_eq!(cut(path), want, "{path:?} {w}x{h}");
+            }
+            let mut holed = boxed.clone();
+            holed[(h / 2) * w + w / 2] = 254;
+            for path in kerf_core::simd::available() {
+                let err = kerf_core::simd::with_path(path, || {
+                    Raster::from_parts(&graph(vec![TextPart::Box], w as u32, h as u32), &holed).unwrap_err()
+                });
+                assert!(matches!(err, GpuError::Unsupported(_)), "{path:?} {w}x{h}");
+            }
+        }
     }
 
     fn key(n: u32) -> Key {
