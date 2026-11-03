@@ -16,7 +16,7 @@ use std::process::{Command, Stdio};
 
 use kerf_core::{
     Asset, BlendKinds, BlendMode, Clip, CompositeColorPolicy, Delivery, ExportOptions, Fit, GeqEdge, Keyframe, Mask, MaskShape,
-    PlanRequest, Planner, Project, StreamKind, Timeline, Track, Unsupported,
+    OriginalMedia, PlanRequest, Planner, PlayCut, Project, StreamKind, Timeline, Track, Unsupported,
 };
 use kerf_gpu::convert::Kernels as Convert;
 use kerf_gpu::grade::Kernels as Grade;
@@ -359,9 +359,31 @@ fn checker_b_m_a_cold_session_is_refused_by_the_caps_and_primed_by_prepare_timel
         "the blend chain was not measured by prepare_timeline: {caps:?}"
     );
     assert!(caps.exact_scaler, "the scaler was not measured by prepare_timeline: {caps:?}");
+    // The files' ranges are asked for by the session's own step (`prepare_placed_files`, which `begin_play` runs after the timeline's): where
+    // the composite's range is negotiated (9.0.2) a placed clip whose asset did not record its range is refused by the session's caps until
+    // its file has said; where it is not (6.1.1) there is nothing to ask.
+    let cut = PlayCut::new(&timeline, &assets, 0.0, policy, &OriginalMedia).expect("a cut");
+    let negotiated = policy == CompositeColorPolicy::BottomLayerTag;
     for (what, k) in &frames {
-        let plan = planner.at_frame(*k).expect("plan");
+        let plan = cut.at_frame(*k).expect("plan");
         let why = plan.reasons(&caps, size);
-        assert!(why.is_empty(), "primed, the {what} frame {k} is still refused: {why:?}");
+        let ranged = |u: &Unsupported| matches!(u, Unsupported::PlacedFormat(_, d) if d.contains("has not said"));
+        if *what == "moving zoom" && negotiated {
+            assert!(
+                why.iter().any(ranged),
+                "the asset records no range and nobody asked its file, yet the session's caps took the placed frame: {why:?}"
+            );
+        } else {
+            assert!(why.is_empty(), "primed, the {what} frame {k} is still refused: {why:?}");
+        }
+    }
+    kerf_gpu::prepare_placed_files(&cut, &timeline);
+    for (what, k) in &frames {
+        let plan = cut.at_frame(*k).expect("plan");
+        let why = plan.reasons(&caps, size);
+        assert!(
+            why.is_empty(),
+            "primed and the files asked, the {what} frame {k} is still refused: {why:?}"
+        );
     }
 }
