@@ -394,6 +394,14 @@
   to the sample on x86 (`kerf-gpu`'s `roundtrip_probe`, `gpu.md`, "The translucent round trip"), and `GpuCaps::translucent_approximate` (set by the compositor unless the probe says `Match`;
   `GpuCaps::A0` leaves it off) makes `reasons` refuse every such layer as **`TranslucentApproximate(layer)`** (kind `translucent_approximate`, the last variant of the enum: `tests/coverage.rs`' `ordinal` is 58).
   A turn of such a layer (a quarter, three quarters or a half: `Rotation`, "a turn of a layer below full opacity"), its matrix unknown (`TranslucentMatrix`), an odd size and a fade to black or white running on it stay refused whatever the caps.
+  **A full-range picture in a still is judged by the range, not by a band** (`Unsupported::FullRangeResized(layer, "in a still")` and `Unsupported::FullRangeStill(layer)`, kinds `full_range_resized` and
+  `full_range_still`, the last variant but one of the enum, `tests/coverage.rs` ordinal 59). *Resized*, on either FFmpeg: swscale converts the range inside the resize, so a JPEG 1200x800 into 320x180 reads
+  Y 5,182 / U 13,104 / V 13,855 samples off on 6.1.1 (max 1 / 2 / 2: the old comment "a still is held to that" was a tolerance, and is gone). *At its own size, where the composite's colour is negotiated*
+  (`PlanCanvas::policy` is not `FixedBt601`: FFmpeg 9): the still's graph keeps the picture's range through the overlay and converts it last, so its planes are full-range ones (a plain `yuvj420p` clip, a JPEG, a
+  `yuv420p` flagged `pc`: Y 53,914 / 54,152 samples off, max 14 to 17; the PNG's RGB 3 to 4 levels), and **any layer on screen** that may be full range refuses the frame: a PNG moved over full-range footage
+  (`rgb_in_stack` names matrices, not ranges) and text over it included. A picture flagged `pc` in any YCbCr format counts (`flagged_full_range`), the depth heuristic of `maybe_full_range_in` does not (a limited 10-bit
+  picture is drawn exactly in a still). FFmpeg 6 converts a `yuvj` picture at the decode as the compositor does, so footage and a JPEG at the canvas's size stay drawn there (`checker_a_static_jpeg.rs`: 10 of 10 footage frames and
+  every unresized static still exact, the rest refused; on 9.0.2 4 of 10 and 4 of 144). An export refuses the whole cut (`FullRangeCut`).
   **A blend mode** (`PlanLayer.blend`, `Unsupported::BlendMode(layer, mode, cause)`, kind `blend_mode`, Still and Motion alike): FFmpeg mixes the layer with the composite by `blend` in RGB after
   a conversion each way and two placements (`engine-cli.md`, "Blend modes"). The compositor draws the modes in `GpuCaps::blend` (`BlendKinds`; `kerf-gpu`'s probe says which this FFmpeg matches, `gpu.md`, "Blend modes"),
   and every cause that keeps a layer from being drawn is its own reason with the cause as the string, so the ledger ranks them: the mode not in the caps (`size_free_reasons`), a composite matrix with no tables
