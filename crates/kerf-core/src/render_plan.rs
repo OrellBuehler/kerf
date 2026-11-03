@@ -1734,6 +1734,12 @@ impl RenderPlan {
             };
             if raw_kept && ops.iter().any(|o| o.factor < FADE_FULL) {
                 out.push(Unsupported::FullRangeNegotiated(at()));
+            } else if self.mode == PlanMode::Still && negotiated && stream.maybe_full_range() {
+                // Not only inside a fade: a plain full-range picture in a still keeps its range through FFmpeg 9's graph, which converts it
+                // last, so the still's own planes are full-range ones and the PNG's RGB is read from them (measured on a plain
+                // `yuvj420p` clip: planes up to 17 levels from the compositor's limited-range composite, RGB 3 to 4 levels, 205,000 samples).
+                // FFmpeg 6 converts a `yuvj` picture at the decode, as the compositor does. (An export refuses the whole cut: `FullRangeCut`.)
+                out.push(Unsupported::FullRangeStill(at()));
             }
             if self.through_rgba(layer) && ops.iter().any(|o| o.tint != FadeTint::Alpha && o.factor < FADE_FULL) {
                 out.push(Unsupported::FadeOnTranslucent(at()));
@@ -1854,14 +1860,6 @@ impl RenderPlan {
             } else {
                 if self.overlays.iter().any(|o| o.font_file.is_none()) {
                     out.push(Unsupported::TextWithoutFont);
-                }
-                // Where the composite's colour is negotiated (FFmpeg 9) a still keeps a full-range picture's range through the graph, so `drawtext`
-                // blends in it and the range is converted last: the glyph edges are a level or two of chroma off the compositor's, which
-                // blends into the composite it already converted. (An export refuses the whole cut: `FullRangeCut`.)
-                if self.mode == PlanMode::Still && self.canvas.policy != CompositeColorPolicy::FixedBt601 {
-                    if let Some((n, layer)) = self.layers.iter().enumerate().find(|(_, l)| l.stream.maybe_full_range()) {
-                        out.push(Unsupported::TextOnFullRange(self.layer_ref(n, layer)));
-                    }
                 }
             }
         }
@@ -4491,8 +4489,17 @@ mod tests {
         ];
         for policy in policies {
             let flagged = || stream("yuv420p", Some("pc"));
-            // Drawn plain: the still converts at the end, as the compositor does.
-            assert_eq!(why(flagged(), policy, &|_| {}, 0.5), vec![], "{policy:?}");
+            // Drawn plain where the still converts the range at the end, as the compositor does (FFmpeg 6); under a negotiating policy the
+            // still's own planes are full-range ones and the picture is refused for it.
+            let plain = why(flagged(), policy, &|_| {}, 0.5);
+            if policy == CompositeColorPolicy::FixedBt601 {
+                assert_eq!(plain, vec![], "{policy:?}");
+            } else {
+                assert!(
+                    matches!(plain.as_slice(), [Unsupported::FullRangeStill(_)]),
+                    "{policy:?}: {plain:?}"
+                );
+            }
             let vignette = why(flagged(), policy, &|c| c.effects = vec![VideoEffect::Vignette], 0.5);
             assert!(effect(&vignette, "flagged full range"), "{policy:?}: {vignette:?}");
             assert!(effect(&vignette, "vignette"), "{policy:?}: {vignette:?}");
@@ -4507,7 +4514,13 @@ mod tests {
                 let tabled = why(flagged(), policy, &|c| c.effects = vec![table.clone()], 0.5);
                 assert!(effect(&tabled, "full-range"), "{policy:?} {table:?}: {tabled:?}");
             }
-            let graded = why(flagged(), policy, &|c| c.color.gamma = 1.4, 0.5);
+            // (The picture's range in a still, under FFmpeg 9, is its own reason beside these: `FullRangeStill`, above.)
+            let other_than_still = |v: Vec<Unsupported>| -> Vec<Unsupported> {
+                v.into_iter()
+                    .filter(|u| !matches!(u, Unsupported::FullRangeStill(_)))
+                    .collect()
+            };
+            let graded = other_than_still(why(flagged(), policy, &|c| c.color.gamma = 1.4, 0.5));
             assert!(
                 matches!(graded.as_slice(), [Unsupported::GradedFullRange(_, d)] if d.contains("color_range=pc")),
                 "{policy:?}: {graded:?}"
@@ -4519,7 +4532,11 @@ mod tests {
                 matches!(fading.as_slice(), [Unsupported::FullRangeNegotiated(_)]),
                 "{policy:?}: {fading:?}"
             );
-            assert_eq!(why(flagged(), policy, &|c| c.fade_in = 1.0, 5.0), vec![], "{policy:?}");
+            assert_eq!(
+                other_than_still(why(flagged(), policy, &|c| c.fade_in = 1.0, 5.0)),
+                vec![],
+                "{policy:?}"
+            );
             // Not flagged, flagged limited, or probed before the flag: drawn as before.
             for range in [None, Some("tv")] {
                 let tagged = || stream("yuv420p", range);
@@ -5615,14 +5632,14 @@ mod tests {
                 matches!(running.as_slice(), [Unsupported::FullRangeNegotiated(_)]),
                 "{policy:?}: {running:?}"
             );
-            assert!(
-                reasons(&plan(&full, policy, 1.0, 5.0)).is_empty(),
-                "{policy:?}: a still with the fade over"
-            );
-            assert!(
-                reasons(&plan(&full, policy, 0.0, 0.5)).is_empty(),
-                "{policy:?}: no fade, no raw values"
-            );
+            // (Not running, the picture is still a full-range one in a still: the plan refuses it for its range, not for a fade.)
+            for t_fade in [(1.0, 5.0), (0.0, 0.5)] {
+                let over = reasons(&plan(&full, policy, t_fade.0, t_fade.1));
+                assert!(
+                    matches!(over.as_slice(), [Unsupported::FullRangeStill(_)]),
+                    "{policy:?}: a still, fade {t_fade:?}: {over:?}"
+                );
+            }
             assert!(
                 reasons(&plan(&video(640, 360), policy, 1.0, 0.5)).is_empty(),
                 "{policy:?}: a limited-range picture fades as drawn"
@@ -5799,7 +5816,7 @@ mod tests {
     /// pairs other chroma samples than the compositor's round trip (which comes before the turn) does: refused, as a rotation.
     /// Upright, half-turned and opaque layers are not.
     #[test]
-    fn a_quarter_turn_of_a_layer_below_full_opacity_is_refused_and_the_other_turns_are_not() {
+    fn a_turn_of_a_layer_below_full_opacity_is_refused_and_the_upright_layer_is_not() {
         let caps = GpuCaps {
             motion: true,
             ..GpuCaps::A0
@@ -5818,12 +5835,12 @@ mod tests {
                 .map(|u| u.to_string())
                 .collect::<Vec<_>>()
         };
-        for angle in [90.0, 270.0, -90.0, 450.0] {
+        for angle in [90.0, 180.0, 270.0, -90.0, -180.0, 450.0] {
             let why = turned(angle, 0.5);
             assert!(why.len() == 1 && why[0].contains("below full opacity"), "{angle}: {why:?}");
             assert!(turned(angle, 1.0).is_empty(), "{angle}: an opaque layer is drawn");
         }
-        for angle in [0.0, 180.0, -180.0, 360.0] {
+        for angle in [0.0, 360.0] {
             assert!(turned(angle, 0.5).is_empty(), "{angle}: {:?}", turned(angle, 0.5));
         }
         // (A turn that is not a quarter has its own cause and only that one.)

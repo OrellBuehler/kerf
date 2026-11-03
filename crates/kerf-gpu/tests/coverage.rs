@@ -2534,7 +2534,7 @@ fn every_variant() -> Vec<Unsupported> {
         Unsupported::MixedMatricesWith(layer(), ""),
         Unsupported::ScalerApproximate(layer()),
         Unsupported::TranslucentApproximate(layer()),
-        Unsupported::TextOnFullRange(layer()),
+        Unsupported::FullRangeStill(layer()),
     ]
 }
 
@@ -2600,7 +2600,7 @@ fn ordinal(u: &Unsupported) -> usize {
         Unsupported::MixedMatricesWith(..) => 56,
         Unsupported::ScalerApproximate(..) => 57,
         Unsupported::TranslucentApproximate(..) => 58,
-        Unsupported::TextOnFullRange(..) => 59,
+        Unsupported::FullRangeStill(..) => 59,
     }
 }
 

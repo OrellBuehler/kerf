@@ -556,10 +556,10 @@ pub enum Unsupported {
     /// A layer below full opacity takes the RGB round trip, and this machine's FFmpeg is not measured to run it as the compositor does
     /// ([`GpuCaps::translucent_approximate`]).
     TranslucentApproximate(LayerRef),
-    /// A text overlay is live over a full-range picture in a still, where the composite's colour is negotiated (FFmpeg 9): `drawtext` blends in
-    /// the full-range picture's own range and the range is converted last, where the compositor blends the text into the limited-range composite
-    /// it made first (a level or two of chroma off at the glyph edges).
-    TextOnFullRange(LayerRef),
+    /// A full-range picture in a still, where the composite's colour is negotiated (FFmpeg 9): the still's graph keeps the picture's range
+    /// through the overlay and converts it last, so its planes are full-range ones (up to 17 levels from the limited-range composite the
+    /// compositor makes) and the PNG's RGB is 3 to 4 levels from the compositor's.
+    FullRangeStill(LayerRef),
 }
 
 impl Unsupported {
@@ -626,7 +626,7 @@ impl Unsupported {
             Self::FormatResize(..) => "format_resize",
             Self::Geometry(..) => "geometry",
             Self::TranslucentApproximate(_) => "translucent_approximate",
-            Self::TextOnFullRange(_) => "text_on_full_range",
+            Self::FullRangeStill(_) => "full_range_still",
         }
     }
 }
@@ -797,9 +797,9 @@ impl fmt::Display for Unsupported {
                 from.0, from.1, to.0, to.1
             ),
             Self::Geometry(n, why) => write!(f, "layer {n}: {why}"),
-            Self::TextOnFullRange(l) => write!(
+            Self::FullRangeStill(l) => write!(
                 f,
-                "{l}: text over a full-range picture, where FFmpeg 9 blends the text in the picture's own range and converts the range afterwards (the compositor blends it into the limited-range composite)"
+                "{l}: a full-range picture in a still, where FFmpeg 9 keeps the picture's range through the graph and converts it last (its planes are full-range ones; the compositor's composite is limited-range)"
             ),
             Self::TranslucentApproximate(l) => write!(
                 f,

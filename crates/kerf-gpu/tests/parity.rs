@@ -3990,13 +3990,13 @@ fn text_over_every_kind_of_picture_is_drawn_as_ffmpeg_draws_it() {
         if policy() == CompositeColorPolicy::FixedBt601 {
             check_text(&format!("text/over-{name}"), &tl, std::slice::from_ref(a), &[0.5]);
         } else {
-            // (FFmpeg 9 blends the text in the full-range picture's own range and converts the range last: the plan refuses it.)
+            // (FFmpeg 9 keeps the picture's range through the graph and blends the text in it: the plan refuses the picture.)
             check_refused(
                 &format!("text/over-{name}"),
                 &tl,
                 std::slice::from_ref(a),
                 0.5,
-                Refusal::Plan("text over a full-range picture"),
+                Refusal::Plan("a full-range picture in a still"),
             );
         }
     }
