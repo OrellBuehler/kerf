@@ -786,3 +786,145 @@ pub fn mask_from_threads_that_pick_for_themselves() {
         assert!(h.join().unwrap() == want);
     }
 }
+
+// ---------------------------------------------------------------------------------------------------------
+// Round 2: a rectangle's rows are the byte min (max when inverted) of a column's alpha and the row's.
+// ---------------------------------------------------------------------------------------------------------
+
+fn rect(x: f64, y: f64, width: f64, height: f64, feather: f64, inverted: bool) -> Mask {
+    mask(MaskShape::Rect, x, y, width, height, feather, inverted)
+}
+
+/// The identity itself, in the independent `geq` evaluation and not in the code under test: with a sample column
+/// whose offset is 0 and a sample row whose offset is 0 (the centre at 0.5 of an even picture), every sample is the
+/// smaller of its column's alpha there and its row's, or the larger when inverted.
+pub fn rect_identity_holds_in_the_geq_oracle(count: usize) {
+    let mut rng = Rng(0x1D3A_77E5_C0DE_0001);
+    for _ in 0..count {
+        let (w, h) = (2 * (1 + rng.below(40)) as u32, 2 * (1 + rng.below(25)) as u32);
+        let m = rect(
+            0.5,
+            0.5,
+            0.02 + rng.unit() * 1.97,
+            0.02 + rng.unit() * 1.97,
+            pick_feather(&mut rng),
+            rng.below(2) == 0,
+        );
+        let p = geq_plane(&m, w, h);
+        let (xc, yc) = ((w / 2) as usize, (h / 2) as usize);
+        for y in 0..h as usize {
+            for x in 0..w as usize {
+                let (col, row) = (p[yc * w as usize + x], p[y * w as usize + xc]);
+                let want = if m.inverted { col.max(row) } else { col.min(row) };
+                assert_eq!(p[y * w as usize + x], want, "{m:?} {w}x{h} ({x}, {y})");
+            }
+        }
+    }
+}
+
+fn pick_feather(rng: &mut Rng) -> f64 {
+    match rng.below(4) {
+        0 => FEATHERS[rng.below(FEATHERS.len())],
+        1 => rng.unit() * 1e-5,
+        2 => 1e-6 + rng.unit() * 1e-3,
+        _ => rng.unit(),
+    }
+}
+
+/// Random rectangles at small sizes, centres in and out of the picture, vs the scalar function and `geq`.
+pub fn rect_random(count: usize, max_side: u32) {
+    let mut rng = Rng(0x2468_ACE0_1357_9BDF);
+    for p in simd::available() {
+        for _ in 0..count {
+            let m = rect(
+                [0.0, 0.5, 1.0, -3.0, 9.0, rng.unit(), rng.unit() * 1.4 - 0.2][rng.below(7)],
+                [0.0, 0.5, 1.0, -3.0, 9.0, rng.unit(), rng.unit() * 1.4 - 0.2][rng.below(7)],
+                [0.0, 0.01, 0.0100000001, 2.0, 3.0, f64::NAN, rng.unit() * 2.0][rng.below(7)],
+                [0.0, 0.01, 0.0100000001, 2.0, 3.0, f64::INFINITY, rng.unit() * 2.0][rng.below(7)],
+                pick_feather(&mut rng),
+                rng.below(2) == 0,
+            );
+            let (w, h) = (
+                1 + rng.below(max_side as usize) as u32,
+                1 + rng.below(max_side.min(30) as usize) as u32,
+            );
+            check_mask(p, &m, w, h, true);
+        }
+    }
+}
+
+/// A fine sweep of the size, so that the edge falls on every phase of a sample, with the feather ramp crossing
+/// the truncation boundaries of `* 255` at different samples.
+pub fn rect_edges_on_every_phase() {
+    for p in simd::available() {
+        for feather in [0.0, 1e-6, 2e-6, 0.01, 0.1, 0.25, 0.5, 0.75, 1.0] {
+            for inverted in [false, true] {
+                for i in 0..120u32 {
+                    let size = 0.01 + f64::from(i) * 0.0166;
+                    let m = rect(0.5, 0.5, size, 2.0 - size, feather, inverted);
+                    for (w, h) in [(40u32, 24u32), (41, 25), (64, 9), (17, 33)] {
+                        check_mask(p, &m, w, h, true);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// One pixel across, one down, 16 384 across, 8192 down, and the sizes of a picture.
+pub fn rect_one_pixel_and_huge_planes() {
+    let masks = [
+        rect(0.5, 0.5, 0.5, 0.5, 0.0, false),
+        rect(0.5, 0.5, 0.5, 0.5, 0.0, true),
+        rect(0.3, 0.7, 0.9, 0.2, 0.3, false),
+        rect(0.3, 0.7, 0.9, 0.2, 0.3, true),
+        rect(1.0, 0.0, 2.0, 2.0, 1.0, false),
+        rect(0.0, 1.0, 0.01, 0.01, 1e-6, true),
+        rect(0.5, 0.5, 1.0, 1.0, 0.15, false),
+    ];
+    let mut sizes: Vec<(u32, u32)> = vec![
+        (1, 1),
+        (1, 2),
+        (2, 1),
+        (3, 3),
+        (1, 4099),
+        (4099, 1),
+        (16_384, 1),
+        (1, 16_384),
+        (8191, 3),
+        (3, 8191),
+    ];
+    sizes.extend((1..=70).flat_map(|n| [(n, 1), (1, n)]));
+    for p in simd::available() {
+        for m in &masks {
+            for &(w, h) in &sizes {
+                check_mask(p, m, w, h, u64::from(w) * u64::from(h) <= 100_000);
+            }
+        }
+    }
+}
+
+/// Rectangles at 4K, a sliver and a column of it, and a picture a pixel off the register widths, against the scalar
+/// function and, where it is small enough, the oracle.
+pub fn rect_big_pictures() {
+    let masks = [
+        rect(0.5, 0.5, 0.5, 0.5, 0.0, false),
+        rect(0.4, 0.55, 0.8, 0.6, 0.15, true),
+        rect(0.5, 0.5, 1.0, 1.0, 0.5, false),
+    ];
+    for p in simd::available() {
+        for m in &masks {
+            for (w, h) in [
+                (3840u32, 2160u32),
+                (3839, 2161),
+                (4096, 2160),
+                (4097, 31),
+                (31, 4097),
+                (8192, 5),
+            ] {
+                check_mask(p, m, w, h, false);
+            }
+            check_mask(p, m, 1920, 1080, true);
+        }
+    }
+}

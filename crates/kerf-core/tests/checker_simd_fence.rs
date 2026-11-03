@@ -199,3 +199,11 @@ fn checker_simd_fence_mask_random() {
 fn checker_simd_fence_mask_picture_sizes() {
     both_ends(|| c::mask_picture_sizes(&[(1920, 1080), (401, 7), (3, 600), (1, 4096), (4097, 3), (1023, 17)], 1));
 }
+
+#[test]
+fn checker_simd2_fence_rect_rows() {
+    both_ends(|| {
+        c::rect_random(300, 100);
+        c::rect_one_pixel_and_huge_planes();
+    });
+}
