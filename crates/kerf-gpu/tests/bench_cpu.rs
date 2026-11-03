@@ -67,6 +67,29 @@ fn unpad(mapped: &[u8], pitch: usize, w: usize, h: usize, bpp: usize) -> Vec<u8>
     data
 }
 
+/// `effects::vignette_map` as it was before it worked each magnitude once: every sample's `hypot` and `cos`.
+fn vignette_map_every_sample(w: u32, h: u32) -> Vec<f32> {
+    let angle = f64::from((std::f64::consts::PI / 5.0) as f32);
+    let (x0, y0) = (f64::from(w) / 2.0, f64::from(h) / 2.0);
+    let dmax = (f64::from(w) / 2.0).hypot(f64::from(h) / 2.0);
+    let mut map = Vec::with_capacity(w as usize * h as usize);
+    for y in 0..h {
+        let yy = (f64::from(y) - y0) as i32;
+        for x in 0..w {
+            let xx = (f64::from(x) - x0) as i32;
+            let d = f64::from(xx).hypot(f64::from(yy)) / dmax;
+            let v = if d > 1.0 {
+                0.0
+            } else {
+                let c = (angle * d).cos();
+                (c * c) * (c * c)
+            };
+            map.push(v as f32);
+        }
+    }
+    map
+}
+
 fn y4m(w: usize, h: usize) -> Vec<u8> {
     let mut v = format!("YUV4MPEG2 W{w} H{h} F30:1 Ip A1:1 C420jpeg\nFRAME\n").into_bytes();
     v.extend((0..w * h * 3 / 2).map(|i| i as u8));
@@ -140,11 +163,11 @@ fn bench_cpu_side_per_frame_work() {
         let other = frame.clone();
         plain(&mut report, "cache conflict check (frame == frame)", || frame == other);
         for (name, (sw, sh), (dw, dh)) in [
-            ("sws tables, 6, 4K -> 1080p", (3840u32, 2160u32), (1920u32, 1080u32)),
-            ("sws tables, 6, 1080p -> 720p", (1920, 1080), (1280, 720)),
-            ("sws tables, 6, 720p -> 1080p", (1280, 720), (1920, 1080)),
+            ("4K -> 1080p", (3840u32, 2160u32), (1920u32, 1080u32)),
+            ("1080p -> 720p", (1920, 1080), (1280, 720)),
+            ("720p -> 1080p", (1280, 720), (1920, 1080)),
         ] {
-            plain(&mut report, name, || {
+            let six = |table: fn(u32, u32, i32) -> Option<sws::Filter>| {
                 let mut taps = 0;
                 for (s, d, one) in [
                     (sw, dw, sws::ONE_HORIZONTAL),
@@ -154,9 +177,15 @@ fn bench_cpu_side_per_frame_work() {
                     (sw / 2, dw / 2, sws::ONE_HORIZONTAL),
                     (sh / 2, dh / 2, sws::ONE_VERTICAL),
                 ] {
-                    taps += sws::bicubic(s, d, one).map_or(0, |f| f.coeff.len());
+                    taps += table(s, d, one).map_or(0, |f| f.coeff.len());
                 }
                 taps
+            };
+            plain(&mut report, &format!("sws tables, 6, {name}, built"), || {
+                six(sws::bicubic_uncached)
+            });
+            plain(&mut report, &format!("sws tables, 6, {name}, from the memo"), || {
+                six(sws::bicubic)
             });
         }
         plain(&mut report, "vignette steps, 3 planes (per frame)", || {
@@ -165,6 +194,9 @@ fn bench_cpu_side_per_frame_work() {
                 effects::vignette_steps(99, w32 / 2, h32 / 2),
                 effects::vignette_steps(1999, w32 / 2, h32 / 2),
             )
+        });
+        plain(&mut report, "vignette map, every sample's hypot and cos", || {
+            vignette_map_every_sample(w32, h32)
         });
         plain(&mut report, "vignette map (once per size)", || {
             effects::vignette_map(w32, h32)

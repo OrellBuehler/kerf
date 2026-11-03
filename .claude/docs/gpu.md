@@ -409,20 +409,29 @@ export within the scaler's level (placed: 1) and the scaler's plus the transluce
 above: `SCALED` plus `TRANSLUCENT` would say luma 1 and chroma 2, but the scaler's level crosses into luma through the round trip's conversion). It also holds the feed (a cursor opened ahead is the one the cut uses and the first
 clip's goes with it; a transport stream is refused when opened ahead; with more clips in the window than it holds it keeps the ones wanted first), and the texture a session presents to be the composite's picture.
 
-**CPU-side work and SIMD.** The per-pixel work is the GPU's; what the CPU still does one sample at a time is vectorised, and nothing else
-is (`tests/bench_cpu.rs`, `#[ignore]`d, `KERF_BENCH=1`, times the CPU side; `memcpy`-bound copies and libm / integer table builds
-stay scalar). Both kernels live in `kerf-core` (`simd.rs`, `mask_plane.rs`, `mask_plane/x86.rs`) and `kerf-gpu` calls them:
+**CPU-side work and SIMD.** The per-pixel work is the GPU's; what the CPU still does one sample at a time is vectorised or not done
+twice, and nothing else is (`tests/bench_cpu.rs`, `#[ignore]`d, `KERF_BENCH=1`, times the CPU side; the `memcpy`-bound copies stay as
+they are). The kernels live in `kerf-core` (`simd.rs`, `mask_plane.rs`, `mask_plane/x86.rs`) and `kerf-gpu` calls them:
 
 - **Byte scans** (`simd::position_ne` / `rposition_ne`, the first / last byte that is not a value; `plane_bounds` on top): the bounding
   box of a title's glyph and box masks (`text.rs` `Raster::from_parts`, `text/seq.rs` `read_box` / `shape_of`), the "is the box solid"
   check, and the opaque-alpha scan of an asset that never recorded its pixel format (`source.rs`). 16 / 32 bytes a step with `cmpeq` +
   `movemask`, blocks of 64 bytes tested with the masks and-ed together, the tail one register overlapping bytes already known equal.
   Measured on x86_64 (1080p plane, 1.7 ms scalar): 0.04 ms on SSE2, 0.03 on AVX2.
-- **The mask's alpha plane** (`kerf_core::mask_alpha_plane`; made for every new `(mask, size)`, so on each step of a mask-handle drag):
-  `f64` lanes (2 on SSE2, 4 on AVX2) running the scalar's operations in the scalar's order, no fused multiply-add, the same truncating
-  `cvttpd`. An ellipse's band around its edge needs libm's `hypot` and, with the columns past the last whole group, goes through the
-  scalar `Params::px`. Measured on x86_64 at 1080p, scalar to AVX2: 1.5 to 0.6 ms (hard rect), 3.5 to 1.5 (feathered rect), 1.8 to 0.7
-  (hard ellipse), 2.8 to 2.0 (feathered ellipse, whose ring is all `hypot`).
+- **The mask's alpha plane** (`kerf_core::mask_alpha_plane`; made for every new `(mask, size)`, so on each step of a mask-handle drag).
+  A **rectangle**'s alpha is a monotone function of its offset (`1 - d`, `/ feather`, `clamp`, `* 255` and the truncating cast each keep the
+  order, `inverted` turns it round), and a sample's offset is the larger of its column's and its row's, so its alpha is the smaller of
+  the two alphas (the larger when inverted): one ramp per column and one value per row, and a byte `min` / `max` per row (`min_row_*`,
+  `max_row_*`; SSE2 16 bytes, AVX2 32). An **ellipse** is `f64` lanes (2 on SSE2, 4 on AVX2) running the scalar's operations in the
+  scalar's order, no fused multiply-add, the same truncating `cvttpd`; its band around the edge needs libm's `hypot` and, with the
+  columns past the last whole group, goes through the scalar `Params::px`. Measured on x86_64 at 1080p, scalar to AVX2: 1.2 to 0.13 ms
+  (hard rect), 3.2 to 0.11 (feathered rect), 1.6 to 0.7 (hard ellipse), 2.4 to 2.0 (feathered ellipse, whose ring is all `hypot`).
+- **Not vector code**: `sws::bicubic` is **memoised** per `(src, dst, one)` (a table is a pure function of the three; 64 entries, 32 MiB,
+  newest first, locked only to look up or to keep, `bicubic_uncached` is the reference): a scaled layer's six tables cost 0.25 to 0.64 ms
+  every frame and now 0.002 to 0.006 (a clone of the cached table). `effects::vignette_map` works each distinct `(|xx|, |yy|)` once
+  (`hypot` takes magnitudes, so the map is symmetric about the centre however the size is odd or even) and a row with a magnitude met
+  before is copied: 40 to 9 ms at 1080p, 175 to 54 at 4K, once per size; held to the every-sample function bit for bit at odd and even
+  sizes.
 - **Pitfall (codegen)**: inside a `#[target_feature]` kernel, `copy_from_slice` or an iterator adapter is a *call* in a release build with
   several codegen units (the mask rows ran 2.3 times slower than the scalar's). The kernels read and write through raw pointers after one
   bounds check (`n = min(len)`, `i + N <= n`).
