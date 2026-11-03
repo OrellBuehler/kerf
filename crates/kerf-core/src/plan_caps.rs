@@ -85,6 +85,70 @@ impl StillKinds {
     }
 }
 
+/// A set of [`BlendMode`]s: the modes a compositor draws one by one (`Normal` is plain alpha-over, always drawn).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BlendKinds(u16);
+
+impl BlendKinds {
+    pub const NONE: Self = Self(0);
+    pub const ALL: Self = Self(0b1_1111_1111);
+
+    /// The kind of one mode; none for `Normal`.
+    pub const fn of(mode: BlendMode) -> Self {
+        match mode {
+            BlendMode::Normal => Self(0),
+            BlendMode::Multiply => Self(1),
+            BlendMode::Screen => Self(1 << 1),
+            BlendMode::Overlay => Self(1 << 2),
+            BlendMode::HardLight => Self(1 << 3),
+            BlendMode::Add => Self(1 << 4),
+            BlendMode::Darken => Self(1 << 5),
+            BlendMode::Lighten => Self(1 << 6),
+            BlendMode::Difference => Self(1 << 7),
+            BlendMode::Exclusion => Self(1 << 8),
+        }
+    }
+
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+
+    /// The kinds of both.
+    pub const fn intersection(self, other: Self) -> Self {
+        Self(self.0 & other.0)
+    }
+
+    pub const fn without(self, other: Self) -> Self {
+        Self(self.0 & !other.0)
+    }
+}
+
+/// What a compositor draws of a blend beyond the modes ([`BlendKinds`]), each a fact about the FFmpeg it ran against that a probe
+/// measured: pictures that are RGB (the graph's `format=yuva420p` is the decode's conversion on this build) and a BT.2020 composite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct BlendExtras(u8);
+
+impl BlendExtras {
+    pub const NONE: Self = Self(0);
+    /// An RGB picture under a blend: the graph converts it to `yuva420p`, the compositor has the decode's 4:2:0.
+    pub const RGB_PICTURE: Self = Self(1);
+    /// A composite whose conversions name BT.2020.
+    pub const BT2020: Self = Self(1 << 1);
+    pub const ALL: Self = Self(0b11);
+
+    pub const fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    pub const fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
+    }
+}
+
 /// A set of the parts of a clip's [`Grade`](crate::model::Grade): what a compositor draws one by one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct GradeKinds(u8);
@@ -215,6 +279,34 @@ pub struct GpuCaps {
     /// than 8-bit limited-range `yuv420p`, video effects behind the grade and a running black or white fade. (A moving zoom
     /// or position after the grade is drawn: the placement reads the planes the grade hands on.)
     pub grade: GradeKinds,
+    /// The compositor's scaler is swscale's **to the level** on this machine: the vertical kernel FFmpeg runs
+    /// (its x86 SIMD one or the C one) was measured and is the one the compositor draws with. Without it a resized
+    /// layer is a level from FFmpeg's (swscale's x86 kernel truncates every tap) and what that level would grow
+    /// into is refused: a resized layer under a grade, the blurred fill.
+    pub exact_scaler: bool,
+    /// The blurred fill of a `Fit::Blur` delivery ([`crate::blur_fill`]): the thumbnail chain scaled, box-blurred and
+    /// scaled back up behind the fitted picture. Needs [`GpuCaps::exact_scaler`] as well: the fill is two bilinear
+    /// scales and a blur of the picture, and the picture a bicubic one.
+    pub blur_fill: bool,
+    /// The compositor takes a layer into the composite's colour matrix the way FFmpeg 9 does where a stack or a cut
+    /// holds pictures of more than one ([`crate::render_plan::CompositeColorPolicy::BottomLayerTag`]): swscale's two-step conversion through
+    /// RGB (its x86 `yuv420p -> bgr24` kernel, then `ff_rgb24toyv12`, or the generic scaler for a picture on an alpha
+    /// plane), **measured** on this FFmpeg's graph (`kerf_gpu::convert`). Without it a stack or a cut of mixed matrices is
+    /// FFmpeg's.
+    pub matrix_convert: bool,
+    /// The compositor's scaler is **not** measured to be swscale's (a probe that found it differs, could not tell, or has not run):
+    /// it draws a resized layer a level from FFmpeg's, which the exact rule does not allow, so the plan refuses every layer that a
+    /// scale resizes ([`Unsupported::ScalerApproximate`]). [`GpuCaps::A0`] leaves it off: what A0 draws, it draws as it always did.
+    pub scaler_approximate: bool,
+    /// The blend modes drawn: FFmpeg mixes a blended clip with the composite by `blend` in RGB, through a conversion
+    /// each way, and a compositor that sets a mode reproduces that chain, to the sample, on this FFmpeg. Refused whatever
+    /// the caps (`BlendMode` with its cause): a layer the compositor scales, one turned by anything but a quarter
+    /// turn `rotate` lands on whole samples for, a letterbox, a graded layer, an opacity below 1 (the RGB round trip),
+    /// a clip or a bottom layer tagged with a matrix no table is proven for (`fcc`, `smpte240m`, `bt2020c`, `ycgco`, ...), and a
+    /// BT.2020 composite or an RGB picture unless `blend_extras` says this FFmpeg's chain was measured to match for it.
+    pub blend: BlendKinds,
+    /// What a blend is drawn for beyond its modes: RGB pictures and a BT.2020 composite (`BlendExtras`).
+    pub blend_extras: BlendExtras,
 }
 
 impl GpuCaps {
@@ -238,6 +330,12 @@ impl GpuCaps {
         effects: EffectKinds::NONE,
         still_motion: StillKinds::NONE,
         grade: GradeKinds::NONE,
+        exact_scaler: false,
+        blur_fill: false,
+        matrix_convert: false,
+        scaler_approximate: false,
+        blend: BlendKinds::NONE,
+        blend_extras: BlendExtras::NONE,
     };
 }
 
@@ -262,6 +360,12 @@ pub enum DipWhy {
     BlackFade,
     /// The picture is not 8-bit limited-range `yuv420p`.
     Format,
+    /// The picture is a `yuv420p` flagged full range: the export's round trip runs on every frame of the clip in the
+    /// picture's own range, which the compositor's limited-range tables are not.
+    FullRange,
+    /// The clip carries an `invert` or a `vignette`: both take RGB, so the `scale` ahead of them converts the picture to RGB and
+    /// FFmpeg runs the effect there, on every frame of the clip.
+    RgbEffect,
     /// The picture's colour matrix has no measured round trip.
     Matrix,
     /// The layer is letterboxed: FFmpeg pads before the round trip, so the bars whiten too.
@@ -284,6 +388,14 @@ impl fmt::Display for DipWhy {
             Self::Format => write!(
                 f,
                 "from a picture that is not 8-bit limited-range `yuv420p`, which FFmpeg converts to RGB from its own chroma grid and range (9 to 21 levels off the round trip the compositor draws on 9.0.2)"
+            ),
+            Self::FullRange => write!(
+                f,
+                "from a `yuv420p` picture flagged full range, which FFmpeg's round trip converts in that range on every frame of the clip (the compositor's tables are limited-range's: Y 2, UV 1 levels off)"
+            ),
+            Self::RgbEffect => write!(
+                f,
+                "under an invert or a vignette, which take RGB: the fit `scale` converts the picture to RGB ahead of them and FFmpeg runs the effect there (invert 3 levels off, vignette 47)"
             ),
             Self::Matrix => write!(f, "from a picture whose colour matrix has no measured round trip"),
             Self::Letterboxed => write!(
@@ -310,9 +422,12 @@ pub enum Unsupported {
     Delivery(String),
     /// The delivery is a gif, which goes through a palette the compositor does not build.
     Gif,
-    /// The delivery fits footage over a blurred copy of itself ([`crate::model::Fit::Blur`]): FFmpeg's
-    /// `boxblur` on a thumbnail scaled back up, with no compositor pass or parity case yet.
+    /// The delivery fits footage over a blurred copy of itself ([`crate::model::Fit::Blur`]) and the compositor
+    /// does not draw the fill, or has no exact scaler under it (`GpuCaps::blur_fill`, `GpuCaps::exact_scaler`):
+    /// FFmpeg's `boxblur` on a thumbnail scaled back up.
     BlurFill,
+    /// A blurred fill the compositor draws in general but not for this layer or at this size (the detail says why).
+    BlurFillWith(LayerRef, &'static str),
     /// The canvas and each clip's `fps` filter parse the delivery rate to different rationals
     /// (`canvas`, `clips`), so a clip's frame slots are not the canvas's frames: the pick
     /// assumes one grid.
@@ -385,8 +500,9 @@ pub enum Unsupported {
     /// (vid.stab's transform, or `deshake`), which no compositor pass draws.
     Stabilized(LayerRef),
     /// The layer's clip composites with a blend mode: FFmpeg mixes it with the composite by `blend` in RGB, after a
-    /// conversion each way, which no compositor pass reproduces.
-    BlendMode(LayerRef, BlendMode),
+    /// conversion each way. The compositor draws the mode's chain (`GpuCaps::blend`) on a layer at its own size, opaque
+    /// and upright, over an even frame; the string is what keeps this one from being drawn.
+    BlendMode(LayerRef, BlendMode, &'static str),
     /// The layer plays on past its end, under the clip that replaces it.
     Tail(LayerRef),
     KeyedOpacity(LayerRef),
@@ -408,6 +524,11 @@ pub enum Unsupported {
     /// `GpuCaps::placement` (`pad`, `perspective` and `crop`, reproduced to the sample, and **measured** against the
     /// FFmpeg in use: the flag is not set where that measurement found a difference or could not tell).
     KeyedPlacement(LayerRef),
+    /// A rotation the compositor does not draw (the detail says which): FFmpeg's `rotate` samples a turned picture at fixed-point
+    /// positions with an apron of its own, and only a quarter, half or three quarters of a turn (where its integer sine comes out exact,
+    /// [`crate::quarter_turn`]) lands on whole samples; any other angle, a rotation a key or a behaviour moves, and a constant opacity below 1 under a quarter or three quarters of a turn
+    /// (FFmpeg converts to 4:2:0 after the turn, so other chroma pairs are averaged), is FFmpeg's.
+    Rotation(LayerRef, &'static str),
     /// A moving zoom or position on a picture that is not 4:2:0 or gray (the detail names its pixel format, or says it was
     /// never recorded), or that may be full range where the composite's range is negotiated (the detail says `full-range`):
     /// the placement chain converts it to `yuva420p` itself, in the graph, where the compositor's decode converted it to
@@ -445,6 +566,12 @@ pub enum Unsupported {
     /// The layer's colour matrix is unknown while the composite takes its matrix from the tags.
     MatrixUnknown(usize),
     MixedMatrices,
+    /// A layer whose matrix is not the composite's (FFmpeg 9 converts it into the bottom layer's) that the compositor
+    /// does not convert in this chain (the detail says why), or has no measured conversion for (`GpuCaps::matrix_convert`).
+    MixedMatricesWith(LayerRef, &'static str),
+    /// A layer a scale resizes, where the compositor's scaler is not known to be swscale's to the level
+    /// ([`GpuCaps::scaler_approximate`]).
+    ScalerApproximate(LayerRef),
     /// The composite colour policy could not be measured and the stack is not BT.601.
     UnmeasuredPolicy(YuvMatrix),
     RgbInStack(YuvMatrix),
@@ -468,6 +595,7 @@ impl Unsupported {
             Self::Delivery(_) => "delivery",
             Self::Gif => "gif",
             Self::BlurFill => "blur_fill",
+            Self::BlurFillWith(..) => "blur_fill_with",
             Self::PickRate { .. } => "pick_rate",
             Self::Hdr(_) => "hdr",
             Self::AlphaPicture(..) => "alpha_picture",
@@ -500,6 +628,7 @@ impl Unsupported {
             Self::StillMotion(..) => "still_motion",
             Self::KeyedZoom(_) => "keyed_zoom",
             Self::KeyedPlacement(_) => "keyed_placement",
+            Self::Rotation(..) => "rotation",
             Self::PlacedFormat(..) => "placed_format",
             Self::Behavior(_) => "behavior",
             Self::ZoomBehind(..) => "zoom_behind",
@@ -511,6 +640,8 @@ impl Unsupported {
             Self::Scaler(_) => "scaler",
             Self::MatrixUnknown(_) => "matrix_unknown",
             Self::MixedMatrices => "mixed_matrices",
+            Self::MixedMatricesWith(..) => "mixed_matrices_with",
+            Self::ScalerApproximate(_) => "scaler_approximate",
             Self::UnmeasuredPolicy(_) => "unmeasured_policy",
             Self::RgbInStack(_) => "rgb_in_stack",
             Self::GradedInFullRangeStack(_) => "graded_in_full_range_stack",
@@ -534,7 +665,8 @@ impl fmt::Display for Unsupported {
             Self::Motion => f.write_str("the plan is of an export frame (motion mode), which the compositor does not draw yet"),
             Self::Delivery(pf) => write!(f, "the delivery is {pf}, and the compositor draws 8-bit 4:2:0 only"),
             Self::Gif => f.write_str("a gif delivery goes through a palette the compositor does not build"),
-            Self::BlurFill => f.write_str("the delivery fills the frame with a blurred copy of the footage, which the compositor does not draw"),
+            Self::BlurFill => f.write_str("the delivery fills the frame with a blurred copy of the footage, which this compositor does not draw (or draws without an exact scaler under it)"),
+            Self::BlurFillWith(l, why) => write!(f, "{l}: the blurred fill behind a picture that leaves bars is not drawn for {why}"),
             Self::PickRate { canvas, clips } => write!(
                 f,
                 "the delivery rate is {}/{} on the canvas and {}/{} on a clip's fps filter, which are different frame grids",
@@ -592,9 +724,9 @@ impl fmt::Display for Unsupported {
                 f,
                 "{l}: a speed ramp (the export retimes its frames by an expression and picks among them, which the compositor does not reproduce)"
             ),
-            Self::BlendMode(l, mode) => write!(
+            Self::BlendMode(l, mode, why) => write!(
                 f,
-                "{l}: the {} blend mode (FFmpeg mixes it with the composite by `blend` in RGB, which the compositor does not reproduce)",
+                "{l}: the {} blend mode (FFmpeg mixes it with the composite by `blend` in RGB): {why}",
                 mode.label().to_lowercase()
             ),
             Self::Tail(l) => write!(f, "{l}: playing on past its end under a transition"),
@@ -627,6 +759,7 @@ impl fmt::Display for Unsupported {
                 f,
                 "{l}: a moving zoom or position on a {fmt} picture (the placement chain converts it to yuva420p itself, which is not the decode's conversion on every FFmpeg)"
             ),
+            Self::Rotation(l, what) => write!(f, "{l}: {what}"),
             Self::Behavior(l) => write!(
                 f,
                 "{l}: live behaviours (a sway, breath, spin, drift or shake FFmpeg evaluates in the graph on top of the clip's keys; drawn only where the compositor says it draws them, and never one that turns the picture)"
@@ -654,6 +787,14 @@ impl fmt::Display for Unsupported {
             Self::MixedMatrices => f.write_str(
                 "layers tagged with different YCbCr matrices: FFmpeg converts them into the bottom layer's, which is not reproduced",
             ),
+            Self::ScalerApproximate(l) => write!(
+                f,
+                "{l}: resized by a scale, and this compositor's scaler is not measured to be swscale's (it draws the picture a level off)"
+            ),
+            Self::MixedMatricesWith(l, why) => write!(
+                f,
+                "{l}: a colour matrix other than the composite's, which FFmpeg converts into the bottom layer's and the compositor does not for {why}"
+            ),
             Self::UnmeasuredPolicy(m) => write!(
                 f,
                 "a {m:?} stack, and this FFmpeg's composite colour policy could not be measured (FFmpeg 6 and 9 convert BT.709 and BT.2020 footage differently)"
@@ -673,7 +814,7 @@ impl fmt::Display for Unsupported {
             ),
             Self::FormatResize(n, from, to, pf) => write!(
                 f,
-                "layer {n}: scales a {}x{} picture to {}x{}, and its format ({pf}) is not 8/10-bit 4:2:0 or gray, which FFmpeg scales in its own format",
+                "layer {n}: scales a {}x{} picture to {}x{}, and its format ({pf}) is not planar 8-bit 4:2:0, the only format the exact scaler is proven for (FFmpeg scales the others in their own format)",
                 from.0, from.1, to.0, to.1
             ),
             Self::Geometry(n, why) => write!(f, "layer {n}: {why}"),
@@ -705,15 +846,21 @@ mod tests {
         assert_eq!(Unsupported::Shrink(0, (4000, 2000), (50, 20)).kind(), "shrink");
         assert_ne!(Unsupported::Text.kind(), Unsupported::TextSequence(String::new()).kind());
         assert_eq!(Unsupported::MixedMatrices.kind(), "mixed_matrices");
+        assert_eq!(
+            Unsupported::MixedMatricesWith(layer(0, ""), "an opacity below 1").kind(),
+            "mixed_matrices_with"
+        );
         assert_eq!(Unsupported::SpeedRamp(layer(1, "a.mp4")).kind(), "speed_ramp");
         assert_eq!(
-            Unsupported::BlendMode(layer(0, "a.mp4"), BlendMode::Multiply).kind(),
-            Unsupported::BlendMode(layer(2, "b.mov"), BlendMode::Screen).kind(),
+            Unsupported::BlendMode(layer(0, "a.mp4"), BlendMode::Multiply, "a").kind(),
+            Unsupported::BlendMode(layer(2, "b.mov"), BlendMode::Screen, "b").kind(),
             "the mode is not part of the key"
         );
-        assert!(Unsupported::BlendMode(layer(1, "a.mp4"), BlendMode::HardLight)
-            .to_string()
-            .starts_with("layer 1 (a.mp4): the hard light blend mode"));
+        assert!(
+            Unsupported::BlendMode(layer(1, "a.mp4"), BlendMode::HardLight, "a rotated layer")
+                .to_string()
+                .starts_with("layer 1 (a.mp4): the hard light blend mode")
+        );
         assert!(Unsupported::SpeedRamp(layer(1, "a.mp4"))
             .to_string()
             .starts_with("layer 1 (a.mp4): a speed ramp"));
@@ -726,6 +873,7 @@ mod tests {
             Unsupported::Motion.kind(),
             Unsupported::Gif.kind(),
             Unsupported::BlurFill.kind(),
+            Unsupported::BlurFillWith(layer(0, ""), "an HDR picture").kind(),
             Unsupported::Text.kind(),
             Unsupported::TextWithoutFont.kind(),
             Unsupported::TextSequence(String::new()).kind(),
@@ -744,7 +892,7 @@ mod tests {
             Unsupported::FullRangeResized(layer(0, ""), "an export frame").kind(),
             Unsupported::SpeedRamp(layer(0, "")).kind(),
             Unsupported::Stabilized(layer(0, "")).kind(),
-            Unsupported::BlendMode(layer(0, ""), BlendMode::Screen).kind(),
+            Unsupported::BlendMode(layer(0, ""), BlendMode::Screen, "a rotated layer").kind(),
         ];
         for kind in kinds {
             assert!(

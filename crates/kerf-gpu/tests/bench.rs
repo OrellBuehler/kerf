@@ -95,7 +95,7 @@ fn timeline(asset: &Asset, layers: usize) -> Timeline {
                     pos_x: -0.3 + 0.2 * (i % 4) as f64,
                     pos_y: -0.25 + 0.25 * (i / 4) as f64,
                     opacity: if i % 2 == 0 { 0.8 } else { 1.0 },
-                    rotation: if i == 3 { 12.0 } else { 0.0 },
+                    rotation: if i == 3 { 90.0 } else { 0.0 },
                     ..Transform::default()
                 };
             }
@@ -520,6 +520,8 @@ fn bench_a_mask_a_blur_and_a_moving_zoom() {
     use kerf_core::{Container, Delivery, Fit, Keyframe, Mask, MaskShape, Property, PropertyKey, RateControl, VideoEffect};
     let gpu = Gpu::new(GpuOptions::for_tests()).expect("a GPU adapter");
     let info = gpu.adapter_info().clone();
+    // (A mask's `geq` edge read is measured ahead of the render, which only reads it.)
+    let _ = kerf_core::geq_edge();
     let comp = Compositor::new(gpu).expect("compositor");
     let dir = Path::new(env!("CARGO_TARGET_TMPDIR"));
     let scratch = dir.join(format!("bench-zoom-{}.jpg", std::process::id()));

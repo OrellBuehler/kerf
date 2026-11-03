@@ -18,20 +18,18 @@
 //! The two renderers are not bit-identical, and the harness says where. The
 //! scaler is swscale's own tables in swscale's integer arithmetic and agrees with
 //! `ffmpeg -vf scale` to one level on every plane up to about 4:1, to two or
-//! three levels on 8:1 to 20:1 downscales and to five at 40:1 (the steepest the plan
-//! accepts)
-//! (`the_scaler_matches_ffmpegs_scale_plane_by_plane`); `eq` is byte-exact; an
+//! three levels on 8:1 to 20:1 downscales and to five at 40:1 (the steepest this ladder
+//! measures; the plan goes on to 63:1) (`the_scaler_matches_ffmpegs_scale_plane_by_plane`); `eq` is byte-exact; an
 //! opaque layer's blend is FFmpeg's in YUV. What remains is a hard coloured edge
 //! landing on a different pixel (chroma is averaged over 2x2 in one's alpha blend
-//! and per pixel in the other's, a rotated edge is stepped in one and sits at a
-//! fraction of a pixel in the other) and swscale's YUV -> RGB conversion, which
+//! and per pixel in the other's) and swscale's YUV -> RGB conversion, which
 //! truncates and carries a mean bias of up to a level that the shader does not
 //! copy. So a frame is judged in two parts:
 //!
 //! * the **edge band** — every pixel within [`BAND`] px of a strong gradient in
 //!   the *reference* (a step of more than [`EDGE_STEP`] levels in any channel
 //!   between neighbours, which is every layer boundary and every hard edge of
-//!   the test pattern; [`EDGE_STEP_ROTATED`] for a case with a rotated layer) —
+//!   the test pattern) —
 //!   is excluded from the strict check, and
 //! * everywhere else (the *flat* region) the GPU must hold **PSNR >= 40 dB** and a
 //!   **max per-channel error <= 8/255**.
@@ -44,7 +42,7 @@
 //! (bilinear, a box filter) has no flat area to hide in.
 //!
 //! The whole-image PSNR (band included) is held to its own floor
-//! ([`PSNR_ALL_MIN`], lower for a case with a rotated layer): it exists to catch a
+//! ([`PSNR_ALL_MIN`]): it exists to catch a
 //! layer in the wrong place, which the band alone would excuse.
 //!
 //! Frames the GPU path must **refuse** (`frames_the_gpu_would_draw_wrong_are_refused`)
@@ -107,14 +105,14 @@
 //!   compositor's planes are 4:2:0: luma lands exactly, but the chroma of a 4:2:2,
 //!   4:4:4 or RGB picture positioned between two 4:2:0 samples is a pixel off (30 to
 //!   38 dB over the frame), so the plan refuses it. Gray has no chroma to misplace
-//!   and is drawn exactly.
+//!   and is placed exactly (it is refused once it is resized, below).
 //! * **Colour correction and full range.** The decode converts a full-range
 //!   (`yuvj420p`) picture to limited range first; FFmpeg 9 grades the raw full-range
 //!   values and converts last (34 to 44 dB apart, every knob; FFmpeg 6 agrees). A
 //!   graded `yuvj` picture is refused, as is a graded layer in a stack with one under
 //!   a negotiating policy (`grading_a_full_range_picture_is_refused_and_ungraded_it_is_drawn`).
-//! * **Resizing a picture that is not 4:2:0 (8/10-bit) or gray** (4:2:2, 4:4:4, RGB,
-//!   12-bit, or a format never recorded) is refused, in both directions. FFmpeg scales
+//! * **Resizing a picture that is not 8-bit 4:2:0** (4:2:2, 4:4:4, RGB, 10 and 12-bit,
+//!   gray, or a format never recorded) is refused, in both directions. FFmpeg scales
 //!   in the format the picture has, the decode reduces it to 8-bit 4:2:0 first, and the
 //!   chroma is then interpolated from different samples: enlarging was 15 to 69 levels
 //!   off, and a *shrink* as mild as 1.05x to 1.5x reads flat max 8 to 9 (4:2:2 at 0.9x
@@ -148,15 +146,16 @@
 //!   changes there). `kerf_core::geq_edge()` measures which the build in use does and the compositor draws
 //!   it, so the mask cases hold on both (`a_mask_hands_the_planes_on_as_the_geq_that_clamps_its_read_does`).
 //! * **A dip to white ahead of a moving zoom or position** is refused (`ZoomBehind`): the fade's RGB round
-//!   trip is not held to FFmpeg's with a placement behind it.
-//! * **A shrink steeper than 40:1** (`kerf_core::MAX_SHRINK`) is refused: past what
-//!   the scaler comparison measures, swscale's x86 vertical scaler drifts further
-//!   from the C arithmetic the shader follows (a 58:1 shrink of a 4K test pattern
-//!   read 16 levels off in RGB).
+//!   trip is not held to FFmpeg's with a placement behind it (the zoom's `scale` takes the RGB frame the fade
+//!   leaves and converts it in the same pass: up to 14 levels off a draw that scales the converted picture on
+//!   6.1.1, 3 on 9.0.2).
+//! * **A shrink steeper than 63:1** (`kerf_core::MAX_SHRINK`) is refused: past it swscale
+//!   cascades a second scaler, which the model does not follow (it has no table there).
 //! * **A rotated edge** is a fixed-point stair-step in FFmpeg and a float sample
-//!   here; the interior agrees to a level. FFmpeg's own `rotate` also leaves a few
-//!   green pixels along the edge of a neutral layer (chroma it never wrote); the
-//!   GPU does not copy them (`a_rotated_neutral_layer_has_no_colour_fringe`).
+//!   here (Y up to 117 and UV up to 169 levels off along it): no turn is drawn but a
+//!   quarter, half or three quarters of one, which lands on whole samples (every other
+//!   angle, and a rotation a key moves, is refused: `Unsupported::Rotation`,
+//!   `a_turned_neutral_layer_has_no_colour_fringe_and_any_other_turn_is_refused`).
 //! * **swscale's YUV -> RGB** truncates, a mean bias of up to a level (the flat
 //!   mean error column in the report); the shader rounds.
 //! * **Text** is FFmpeg's own `drawtext` raster blended with `drawtext`'s own arithmetic
@@ -196,16 +195,8 @@ use kerf_gpu::{Compositor, Gpu, GpuOptions};
 const BAND: usize = 2;
 /// A neighbour-to-neighbour step (any channel, in 0..255) that counts as an
 /// edge: 24 levels, about 10% of the range. It is what defines the band, so the
-/// higher it is the fewer pixels are excused — 24 is what every case without a
-/// rotated layer is judged at.
+/// higher it is the fewer pixels are excused.
 const EDGE_STEP: i32 = 24;
-/// ...and 12 for a case with a rotated layer. `rotate` writes a stair-stepped
-/// edge from a fixed-point source position; once the layer is also faded (the
-/// keyframed case runs at ~65% opacity) the edge shows at two thirds of its
-/// contrast, under 24 levels, and the stair-step — a few levels of difference at
-/// the pixels along it, measured at 10 — would be judged as a mismatch in the
-/// flat region. At 12 the same pixels are in the band; the limits did not move.
-const EDGE_STEP_ROTATED: i32 = 12;
 /// Required PSNR over the flat region.
 const PSNR_FLAT_MIN: f64 = 40.0;
 /// Allowed max per-channel error over the flat region.
@@ -215,12 +206,6 @@ const MAX_FLAT: i32 = 8;
 /// flat check and costs several dB here — the very first run of the 9:16
 /// letterbox case read 31 dB before FFmpeg's `pad` quirk was reproduced.
 const PSNR_ALL_MIN: f64 = 40.0;
-/// ...and for a case with a rotated layer. FFmpeg's `rotate` writes a hard,
-/// stair-stepped edge from a fixed-point source position; the GPU samples the
-/// same bilinear footprint at a float one. Every pixel of the border can differ
-/// by a whole step where the picture meets a different colour, which is what
-/// holds the whole-image figure near 33 dB while the interior stays above 46.
-const PSNR_ALL_MIN_ROTATED: f64 = 30.0;
 
 /// The least share of a frame that must lie outside the edge band, so the strict
 /// flat check judges at least half of every ordinary case. The recorded cases sit
@@ -235,7 +220,7 @@ const FLAT_SHARE_MIN: f64 = 0.5;
 /// differently from the C arithmetic this follows: measured 2-3 on noise and test
 /// patterns at 8:1 to 20:1 and up to 5 at 40:1, identically on FFmpeg 6.1.1 and
 /// 9.0.2, so those are the bounds there (`SCALER_MAX_EXTREME`, `SCALER_MAX_STEEP`)
-/// and it is claimed no further: the plan refuses a steeper shrink than 40:1.
+/// and it is claimed no further: the plan refuses a steeper shrink than 63:1.
 /// The mean bounds are what the one-level differences add up to: smooth footage
 /// (measured <= 0.06) is almost exact; on a checkerboard — 219 levels of
 /// contrast per pixel — x86 FFmpeg's non-bit-exact vertical scaler is a level
@@ -249,7 +234,7 @@ const SCALER_BUSY_MEAN: f64 = 0.75;
 /// every output sample on dozens of inputs (measured at most 0.52, on a 20:1
 /// shrink of the test pattern).
 const SCALER_EXTREME_MEAN: f64 = 0.6;
-/// A shrink of 32:1 up to the 40:1 the plan stops at (`kerf_core::MAX_SHRINK`):
+/// A shrink of 32:1 up to 40:1 (the plan goes on to `kerf_core::MAX_SHRINK`, 63:1, on the exact scaler):
 /// noise reads up to 5 levels off a plane, 0.85 on average.
 const SCALER_MAX_STEEP: i32 = 5;
 const SCALER_STEEP_MEAN: f64 = 1.0;
@@ -296,12 +281,6 @@ const BUSY: Limits = Limits {
     ..STRICT
 };
 
-const ROTATED: Limits = Limits {
-    psnr_all: PSNR_ALL_MIN_ROTATED,
-    edge_step: EDGE_STEP_ROTATED,
-    ..STRICT
-};
-
 // ---- environment ------------------------------------------------------------
 
 fn gpu() -> Arc<Gpu> {
@@ -310,12 +289,30 @@ fn gpu() -> Arc<Gpu> {
         .clone()
 }
 
+thread_local! {
+    /// A case that draws with every blend mode in the caps, whatever this FFmpeg's probe said ([`blend_check`]).
+    static FORCED_BLENDS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 fn compositor() -> &'static Compositor {
     static C: OnceLock<Compositor> = OnceLock::new();
+    static FORCING: OnceLock<Compositor> = OnceLock::new();
+    if FORCED_BLENDS.with(std::cell::Cell::get) {
+        return FORCING.get_or_init(|| {
+            let _ = kerf_gpu::grade::kernels();
+            Compositor::new(gpu())
+                .expect("a compositor")
+                .with_blend_kinds(kerf_gpu::blend::all_modes())
+        });
+    }
     C.get_or_init(|| {
         // The grade is in the caps once this FFmpeg's conversions are known to be the model's (the app's `prepare` asks
         // ahead of a frame): the harness measures them once, up front, and its grade cases hold the answer to `Match`.
         let _ = kerf_gpu::grade::kernels();
+        let _ = kerf_gpu::scaler::kernels();
+        let _ = kerf_gpu::convert::kernels();
+        // ... and how its `geq` reads a plane's edge, which a mask and a keyed opacity need (a render only reads it).
+        let _ = kerf_core::geq_edge();
         // ... and whether this FFmpeg converts a 4:4:4 / 4:2:2 picture in a graph as the decode does (a placed one).
         let _ = kerf_gpu::conversion::conversion();
         // ... and whether this FFmpeg places a picture as the model does (the moving zoom and position are in the caps only then).
@@ -325,6 +322,8 @@ fn compositor() -> &'static Compositor {
         // ... and for which kinds of picture a moving still is drawn as this FFmpeg draws it (the moving still's route is in the
         // caps only for the kinds that matched).
         let _ = kerf_gpu::still_probe::kinds();
+        // ...and the blend chain's, which the blend modes are in the caps by.
+        let _ = kerf_gpu::blend::kernels();
         Compositor::new(gpu()).expect("a compositor")
     })
 }
@@ -1259,7 +1258,7 @@ fn rendering_through_the_frame_source_is_the_picture_the_one_shot_decodes_give()
     let mut over = clip(&m.testsrc, 0.0, 2.0, 0.0);
     over.transform = Transform {
         scale: 0.7,
-        rotation: 17.0,
+        rotation: 90.0,
         crop_left: 0.1,
         pos_x: -0.1,
         ..Transform::default()
@@ -1501,13 +1500,16 @@ fn scaled_rotated_and_cropped() {
         ..Transform::default()
     };
     let tl = timeline(vec![vec![clip(&m.gradient, 0.0, 2.0, 0.0)], vec![c]], None);
-    check(
-        "transform/scale+rotate+crop",
-        &tl,
-        &[m.gradient.clone(), m.testsrc.clone()],
-        &[0.5, 1.5],
-        ROTATED,
-    );
+    // (A turn that is not a quarter is FFmpeg's: its edge is a fixed-point sample, Y up to 117 and UV up to 169 off a float one.)
+    for t in [0.5, 1.5] {
+        check_refused(
+            "transform/scale+rotate+crop",
+            &tl,
+            &[m.gradient.clone(), m.testsrc.clone()],
+            t,
+            Refusal::Plan("a rotation"),
+        );
+    }
 
     let mut rot = clip(&m.bars, 0.0, 2.0, 0.0);
     rot.transform.rotation = 90.0;
@@ -1580,12 +1582,12 @@ fn odd_sizes_and_layers_that_leave_the_canvas() {
         ],
         None,
     );
-    check(
+    check_refused(
         "geometry/odd-rotated-box",
         &tl,
         &[m.gradient.clone(), m.portrait.clone()],
-        &[0.5],
-        ROTATED,
+        0.5,
+        Refusal::Plan("a rotation"),
     );
     // Moved so far that the layer starts left of the canvas and above it.
     let tl = timeline(
@@ -1680,42 +1682,50 @@ fn odd_sizes_and_layers_that_leave_the_canvas() {
 
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
-fn a_rotated_neutral_layer_has_no_colour_fringe() {
+fn a_turned_neutral_layer_has_no_colour_fringe_and_any_other_turn_is_refused() {
     let m = media();
-    // Mid-grey turned over black: every pixel of the result is a grey. FFmpeg's
-    // `rotate` leaves chroma outside the picture at zero (a deep green) under an
-    // alpha that is not quite zero there, and a few of its own pixels show it.
-    // The compositor must not copy that: reading chroma outside the picture as
-    // zero made a green rim on every rotated edge.
+    // Mid-grey turned over black: every pixel of the result is a grey. FFmpeg's `rotate` leaves chroma outside the picture at zero (a deep
+    // green) under an alpha that is not quite zero there, and a few of its own pixels show it; a quarter turn has no such edge, and any other
+    // turn is refused (the compositor's float edge is not the filter's fixed-point one), by the plan and by the compositor itself.
     for rotation in [17.0, 33.0, 45.0, -25.0, 5.0] {
         let mut c = clip(&m.grey, 0.0, 2.0, 0.0);
         c.transform.rotation = rotation;
         c.transform.scale = 0.7;
         let tl = timeline(vec![vec![clip(&m.black, 0.0, 2.0, 0.0)], vec![c]], None);
         let assets = [m.black.clone(), m.grey.clone()];
+        check_refused(
+            &format!("fringe/grey-rotated-{rotation}"),
+            &tl,
+            &assets,
+            0.5,
+            Refusal::Plan("a rotation"),
+        );
+        let plan = RenderPlan::at(&tl, &assets, &ExportOptions::default(), 0.5, policy()).expect("plan");
+        let err = compositor()
+            .render_plan(&plan, plan.size(u32::MAX))
+            .expect_err("the compositor refuses a turn it does not draw");
+        assert!(
+            matches!(&err, kerf_gpu::GpuError::Unsupported(why) if why.contains("a rotation that is not a quarter")),
+            "rotation {rotation}: {err}"
+        );
+    }
+    for rotation in [90.0, 180.0, 270.0, -90.0] {
+        let mut c = clip(&m.grey, 0.0, 2.0, 0.0);
+        c.transform.rotation = rotation;
+        let tl = timeline(vec![vec![clip(&m.black, 0.0, 2.0, 0.0)], vec![c]], None);
+        let assets = [m.black.clone(), m.grey.clone()];
         let plan = RenderPlan::at(&tl, &assets, &ExportOptions::default(), 0.5, policy()).expect("plan");
         let size = plan.size(u32::MAX);
         let (frame, _) = compositor().render_plan(&plan, size).expect("GPU render");
-        let spread = |rgb: &[u8]| {
-            rgb.chunks(3)
-                .map(|p| p.iter().max().unwrap() - p.iter().min().unwrap())
-                .max()
-                .unwrap_or(0)
-        };
-        let gpu = spread(&rgba_to_rgb(&frame.data));
-        // FFmpeg's own, for reference (it is not perfectly neutral either).
-        let png = Path::new(env!("CARGO_TARGET_TMPDIR")).join("parity-ref").join("fringe.png");
-        export_still(&tl, &assets, &ExportOptions::default(), 0.5, &png, ImageFormat::Png, 0).expect("FFmpeg still");
-        let reference = ffmpeg(&["-i", png.to_str().unwrap(), "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1"]);
-        let _ = std::fs::remove_file(&png);
-        let ffmpeg_spread = spread(&reference);
-        eprintln!("fringe/grey-rotated-{rotation:<5} worst channel spread: GPU {gpu}, FFmpeg {ffmpeg_spread}");
-        // The input is neutral, so the output must be: that is the contract, not
-        // "as bad as FFmpeg" (its own frame has a few green pixels along the edge,
-        // spread ~100, for the very reason above — they sit in the edge band).
+        let gpu = rgba_to_rgb(&frame.data)
+            .chunks(3)
+            .map(|p| p.iter().max().unwrap() - p.iter().min().unwrap())
+            .max()
+            .unwrap_or(0);
+        eprintln!("fringe/grey-turned-{rotation:<5} worst channel spread: GPU {gpu}");
         assert!(
             gpu <= FRINGE_MAX,
-            "rotation {rotation}: the GPU frame has a colour fringe (spread {gpu}; FFmpeg's has {ffmpeg_spread})"
+            "rotation {rotation}: the GPU frame has a colour fringe (spread {gpu})"
         );
     }
 }
@@ -1750,12 +1760,12 @@ fn opacity() {
         ..Transform::default()
     };
     let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![top]], None);
-    check(
+    check_refused(
         "opacity/0.3+scale+rotate",
         &tl,
         &[m.bars.clone(), m.gradient.clone()],
-        &[0.5],
-        ROTATED,
+        0.5,
+        Refusal::Plan("a rotation"),
     );
 
     // Alone, over black — the layer's own picture is what is compared.
@@ -1918,16 +1928,18 @@ fn colour_adjustments() {
     );
 }
 
-/// The scaler is a level from swscale's and `eq` maps two values a level apart to values its tables' steepest step apart, so
-/// on a layer the compositor scales a grade whose tables step past two (`eq::table_steps`, `MAX_AMPLIFIED_ERROR`) is FFmpeg's:
-/// `GradeSteep`, in a still as in an export frame (`motion_parity.rs` holds the frames drawn inside the bound to the level, and
-/// the keyed ramps frame by frame). Contrast and saturation past 2, a gamma past about 1.2, a black point parked above 0 under a
-/// gamma above 1 (a negative brightness, or a contrast), at the far ends of every range. The same grades at the picture's own size are
-/// exact and drawn, and so is a gentle one on the scaled layer.
+/// The scaler used to be a level from swscale's and `eq` maps two values a level apart to values its tables' steepest step apart
+/// (`eq::table_steps`), so on a layer the compositor scales a grade whose tables step past two was FFmpeg's (`GradeSteep`). Where the
+/// scaler is measured to be swscale's to the level (`caps.exact_scaler`, both FFmpegs of CI), there is no level to multiply: the
+/// tables are exact at any step, drawn on the scaled layer to the level in a still as in an export frame (`motion_parity.rs`). Contrast
+/// and saturation past 2, a gamma past about 1.2, a black point parked above 0 under a gamma above 1, the far ends of every range;
+/// on a picture-in-picture, a letterboxed layer and a Cover fit. (Refused on a compositor whose scaler is not measured exact: the plan's
+/// unit tests, `a_grade_whose_tables_amplify_the_scalers_level_past_two_is_refused_on_a_layer_it_resizes`.)
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
-fn a_grade_whose_tables_amplify_the_scalers_level_past_two_is_refused_on_a_layer_it_resizes() {
+fn eq_tables_of_any_step_are_drawn_on_a_layer_the_scaler_resizes() {
     let m = media();
+    assert!(kerf_gpu::scaler::kernels().exact(), "this FFmpeg's scaler is not the model");
     let grade = |brightness: f64, contrast: f64, saturation: f64, gamma: f64, temperature: f64| Color {
         brightness,
         contrast,
@@ -1935,7 +1947,6 @@ fn a_grade_whose_tables_amplify_the_scalers_level_past_two_is_refused_on_a_layer
         gamma,
         temperature,
     };
-    let reason = || Refusal::Plan("colour correction whose tables step");
     let shifted = Transform {
         scale: 0.6,
         pos_x: 0.1,
@@ -1957,9 +1968,12 @@ fn a_grade_whose_tables_amplify_the_scalers_level_past_two_is_refused_on_a_layer
         ("brightness -0.3 and gamma 1.5", grade(-0.3, 1.0, 1.0, 1.5, 0.0)),
         ("contrast 1.8 and gamma 2", grade(0.0, 1.8, 1.0, 2.0, 0.0)),
         ("the far end of every range", grade(0.3, 1.8, 2.0, 2.0, 1.0)),
+        // (Gentle ones, which were drawn before.)
+        ("contrast 2", grade(0.0, 2.0, 1.0, 1.0, 0.0)),
+        ("gamma 1.2", grade(0.0, 1.0, 1.0, 1.2, 0.0)),
     ];
     for (name, color) in steep {
-        check_refused(&format!("refused/steep-grade-pip-{name}"), &pip(color), &under, 0.5, reason());
+        check_planes_exact(&format!("colour/pip, {name}"), &pip(color), &under, &[0.5], STRICT);
     }
     // A letterboxed layer (the portrait picture shrunk into a landscape frame, the bars in the picture the `eq` sees) and a
     // layer scaled by the fit alone.
@@ -1969,42 +1983,149 @@ fn a_grade_whose_tables_amplify_the_scalers_level_past_two_is_refused_on_a_layer
         timeline(vec![vec![c]], Some(Delivery::new(640, 360, Fit::Contain)))
     };
     for (name, color) in steep {
-        check_refused(
-            &format!("refused/steep-grade-letterbox-{name}"),
+        check_planes_exact(
+            &format!("colour/letterbox, {name}"),
             &boxed(color),
             std::slice::from_ref(&m.portrait),
-            0.5,
-            reason(),
+            &[0.5],
+            STRICT,
         );
     }
-    let mut cover = clip(&m.testsrc, 0.0, 2.0, 0.0);
-    cover.color = grade(0.0, 1.8, 1.0, 2.0, 0.0);
-    check_refused(
-        "refused/steep-grade-cover-fit",
-        &timeline(vec![vec![cover]], Some(Delivery::new(360, 640, Fit::Cover))),
-        std::slice::from_ref(&m.testsrc),
-        0.5,
-        reason(),
+    for (name, color) in [
+        ("contrast 1.8 and gamma 2", grade(0.0, 1.8, 1.0, 2.0, 0.0)),
+        ("saturation 3", grade(0.0, 1.0, 3.0, 1.0, 0.0)),
+    ] {
+        let mut cover = clip(&m.testsrc, 0.0, 2.0, 0.0);
+        cover.color = color;
+        check_planes_exact(
+            &format!("colour/cover fit, {name}"),
+            &timeline(vec![vec![cover]], Some(Delivery::new(360, 640, Fit::Cover))),
+            std::slice::from_ref(&m.testsrc),
+            &[0.5],
+            STRICT,
+        );
+    }
+    // Busy pictures, where every table entry is looked at.
+    let mut noisy = clip(&m.noise, 0.0, 0.2, 0.0);
+    noisy.color = grade(0.0, 1.8, 2.0, 2.0, 0.5);
+    check_planes_exact(
+        "colour/noise, enlarged, the far end of every range",
+        &timeline(vec![vec![noisy]], Some(Delivery::new(960, 540, Fit::Contain))),
+        std::slice::from_ref(&m.noise),
+        &[0.1],
+        BUSY,
     );
     // A layer the compositor does not resize: the tables are exact at any step.
     let mut alone = clip(&m.testsrc, 0.0, 2.0, 0.0);
     alone.color = grade(0.3, 1.8, 2.0, 2.0, 1.0);
-    check(
+    check_planes_exact(
         "colour/the far end of every range at the picture's size",
         &timeline(vec![vec![alone]], None),
         std::slice::from_ref(&m.testsrc),
         &[0.5],
         STRICT,
     );
-    // ... and a grade that steps by two at most is drawn on the scaled layer.
-    for (name, color) in [
-        ("contrast 2", grade(0.0, 2.0, 1.0, 1.0, 0.0)),
-        ("saturation 2", grade(0.0, 1.0, 2.0, 1.0, 0.0)),
-        ("gamma 1.2", grade(0.0, 1.0, 1.0, 1.2, 0.0)),
-        ("brightness 0.3 and gamma 2", grade(0.3, 1.0, 1.0, 2.0, 0.0)),
-    ] {
-        check(&format!("colour/pip, {name}"), &pip(color), &under, &[0.5], STRICT);
+}
+
+/// A clip's grade on a layer the scaler resizes: the picture goes `yuv420p -> rgb24` through the x86 kernel, the grade, and back; with the
+/// scaler exact (`eq_tables_of_any_step_are_drawn_on_a_layer_the_scaler_resizes`) the picture it converts is FFmpeg's to the level, so the
+/// whole is — **when an `eq` sits between the fit `scale` and the grade**. Without one the format negotiation lets the fit `scale` output
+/// RGB itself (the filters between pass any format along, the grade's RGB-only filters ask for it), scaling and converting in one pass from
+/// chroma the compositor has already scaled: refused, with FFmpeg rendering it. A picture-in-picture, an enlargement, a shrink, a Cover fit.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_grade_on_a_layer_the_scaler_resizes_is_the_still_where_an_eq_precedes_it() {
+    let m = media();
+    assert!(kerf_gpu::scaler::kernels().exact(), "this FFmpeg's scaler is not the model");
+    let all = grades();
+    let eq = Color {
+        contrast: 1.08,
+        saturation: 1.15,
+        temperature: 0.1,
+        ..Color::default()
+    };
+    let pip = |asset: &Asset, grade: &kerf_core::Grade, color: Color, scale: f64| {
+        let mut c = clip(asset, 0.0, 2.0, 0.0);
+        c.transform.scale = scale;
+        c.grade = grade.clone();
+        c.color = color;
+        (
+            timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![c]], None),
+            vec![m.bars.clone(), asset.clone()],
+        )
+    };
+    for (name, grade) in &all {
+        let (tl, assets) = pip(&m.testsrc, grade, eq, 0.6);
+        check_planes_exact(&format!("grade/pip with eq, {name}"), &tl, &assets, &[0.5], STRICT);
     }
+    let heavy = &all[5].1;
+    // The shapes: half size, enlarged, shrunk, a Cover crop, a tagged picture (through 4:4:4 on the way back).
+    for (name, delivery) in [
+        ("enlarged to 960x540", Delivery::new(960, 540, Fit::Contain)),
+        ("shrunk to 320x180", Delivery::new(320, 180, Fit::Contain)),
+        ("cover into 360x640", Delivery::new(360, 640, Fit::Cover)),
+        ("cover into 640x360", Delivery::new(640, 360, Fit::Cover)),
+    ] {
+        let mut c = clip(&m.testsrc, 0.0, 2.0, 0.0);
+        c.grade = heavy.clone();
+        c.color = eq;
+        check_planes_exact(
+            &format!("grade/{name} with eq"),
+            &timeline(vec![vec![c]], Some(delivery)),
+            std::slice::from_ref(&m.testsrc),
+            &[0.5],
+            STRICT,
+        );
+    }
+    for (source, asset) in [
+        ("testsrc709", &m.testsrc709),
+        ("testsrc170m", &m.testsrc170m),
+        ("bars470bg", &m.bars470bg),
+    ] {
+        let (tl, assets) = pip(asset, heavy, eq, 0.6);
+        // (A stack of one matrix under FFmpeg 9: the bars beside it must be of its matrix.)
+        if policy() == CompositeColorPolicy::FixedBt601 || source == "testsrc170m" || source == "bars470bg" {
+            check_planes_exact(&format!("grade/pip with eq, {source}"), &tl, &assets, &[0.5], STRICT);
+        }
+    }
+    // Busy: noise enlarged.
+    let mut c = clip(&m.noise, 0.0, 0.2, 0.0);
+    c.grade = heavy.clone();
+    c.color = eq;
+    check_planes_exact(
+        "grade/noise enlarged with eq",
+        &timeline(vec![vec![c]], Some(Delivery::new(960, 540, Fit::Contain))),
+        std::slice::from_ref(&m.noise),
+        &[0.1],
+        BUSY,
+    );
+    // Without an `eq` the fit scale converts to RGB itself: refused.
+    for (name, scale, delivery) in [
+        ("pip", 0.6, None),
+        ("enlarged", 1.0, Some(Delivery::new(960, 540, Fit::Contain))),
+    ] {
+        let mut c = clip(&m.testsrc, 0.0, 2.0, 0.0);
+        c.transform.scale = scale;
+        c.grade = heavy.clone();
+        check_refused(
+            &format!("grade/{name}, no eq"),
+            &timeline(vec![vec![c]], delivery),
+            std::slice::from_ref(&m.testsrc),
+            0.5,
+            Refusal::Plan("no `eq` ahead of the grade"),
+        );
+    }
+    // A letterbox is still a matte the grade would see.
+    let mut c = clip(&m.portrait, 0.0, 2.0, 0.0);
+    c.grade = heavy.clone();
+    c.color = eq;
+    check_refused(
+        "grade/letterbox with eq",
+        &timeline(vec![vec![c]], Some(Delivery::new(640, 360, Fit::Contain))),
+        std::slice::from_ref(&m.portrait),
+        0.5,
+        Refusal::Plan("letterbox"),
+    );
 }
 
 #[test]
@@ -2101,13 +2222,24 @@ fn source_time_speed_reverse_and_keyframes() {
     let mut kf = clip(&m.testsrc, 0.0, 2.0, 0.5);
     kf.keyframes = vec![key(0.0, 0.5, (0.2, -0.1), 0.0, 1.0), key(1.5, 0.5, (0.2, -0.1), 10.0, 0.6)];
     let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![kf]], None);
+    // (At the clip's first frame the keys hold no rotation and full opacity: drawn. Past it the picture is turned by a number that is not a
+    // quarter: FFmpeg's.)
     check(
         "time/keyframes+rotation+opacity",
         &tl,
         &[m.bars.clone(), m.testsrc.clone()],
-        &[0.5, 1.25, 2.0],
-        ROTATED,
+        &[0.5],
+        STRICT,
     );
+    for t in [1.25, 2.0] {
+        check_refused(
+            "time/keyframes+rotation+opacity",
+            &tl,
+            &[m.bars.clone(), m.testsrc.clone()],
+            t,
+            Refusal::Plan("a rotation"),
+        );
+    }
 }
 
 #[test]
@@ -3087,17 +3219,305 @@ fn a_clip_past_the_end_of_its_footage_draws_nothing_like_ffmpeg() {
     check("clamped-end/nothing-drawn", &tl, &assets, &[1.99, 3.0], STRICT);
 }
 
-/// A stack whose layers carry different YCbCr matrices (or an RGB picture in a stack
-/// that is not BT.601). Under a fixed-matrix FFmpeg nothing converts them and the
-/// compositor draws it like any other; under one that negotiates the matrix across
-/// the overlay chain, FFmpeg converts every layer into the bottom layer's with an
-/// arithmetic the compositor does not reproduce (measured: 15-30 levels off), so the
-/// plan refuses it — and the case holds the refusal, with FFmpeg rendering it.
+/// A stack whose layers carry different YCbCr matrices (or an RGB picture in a stack that is not BT.601) that the compositor
+/// cannot take into the bottom layer's matrix. Under a fixed-matrix FFmpeg nothing converts them and the compositor draws
+/// it like any other; under one that negotiates the matrix across the overlay chain, FFmpeg converts every layer into
+/// the bottom layer's by swscale's two-step conversion through RGB, which the compositor reproduces for a plain opaque
+/// layer (`check_converted`) and not for the rest (a translucent or graded layer, an RGB picture: the case holds the
+/// refusal, with FFmpeg rendering it).
 fn check_mixed(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], reason: &'static str) {
     match policy() {
         CompositeColorPolicy::FixedBt601 => check(case, tl, assets, times, STRICT),
         CompositeColorPolicy::BottomLayerTag => {
             check_refused(&format!("{case} (negotiated)"), tl, assets, times[0], Refusal::Plan(reason));
+        }
+        CompositeColorPolicy::Unknown => unreachable!("policy() never answers Unknown"),
+    }
+}
+
+/// A stack whose layers carry different YCbCr matrices that the compositor draws: under a fixed-matrix FFmpeg as every
+/// stack, under one that negotiates the matrix across the overlay chain each layer of another matrix than the bottom's
+/// is converted into it (`kerf_gpu::convert`), and the composite is exactly the still's.
+fn check_converted(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64]) {
+    check_converted_with(case, tl, assets, times, STRICT);
+}
+
+/// [`check_converted`] with the harness's `limits` for the RGB comparison (the planes are exact whatever they are).
+fn check_converted_with(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], limits: Limits) {
+    match policy() {
+        CompositeColorPolicy::FixedBt601 => check(case, tl, assets, times, limits),
+        CompositeColorPolicy::BottomLayerTag => check_planes_exact(&format!("{case} (converted)"), tl, assets, times, limits),
+        CompositeColorPolicy::Unknown => unreachable!("policy() never answers Unknown"),
+    }
+}
+
+/// A layer whose matrix is not the bottom layer's is converted into it by FFmpeg 9 (swscale's two-step conversion through RGB,
+/// `kerf_gpu::convert`), and drawn exactly where the picture the chain made is not resized by the chain's last `scale`: every
+/// pair of BT.601 / BT.709 / BT.2020 in either order, dissolving in and out, on busy pictures, at several times; a layer a `scale`
+/// resizes (a picture-in-picture, a shrink, an enlargement, a Cover crop, a letterbox) is refused in a still (`check_resized`). The
+/// stills hold the stack on screen as the graph (the bottom layer's tag is the composite's). What the conversion does not
+/// cover is refused, each with FFmpeg rendering it (`check_mixed`): translucent, graded, an `eq` ahead of it, a fade to black running
+/// on it, an RGB picture, a picture of odd size. Under a fixed-matrix FFmpeg none of it converts and all of it is drawn as it is.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn layers_of_another_matrix_are_converted_into_the_bottom_ones() {
+    let m = media();
+    let pip = |a: &Asset| {
+        let mut c = clip(a, 0.0, 2.0, 0.0);
+        c.transform = Transform {
+            scale: 0.5,
+            pos_x: 0.2,
+            pos_y: -0.1,
+            ..Transform::default()
+        };
+        c
+    };
+    // Every pair of matrices of the untagged (BT.601), BT.709 and BT.2020 pictures, both ways round; whole frame over whole frame
+    // (the top covers the bottom: the frame is the top layer as converted), then a picture-in-picture (refused in a still).
+    let matrices: [(&str, &Asset, &Asset); 3] = [
+        ("601", &m.testsrc, &m.gradient),
+        ("709", &m.testsrc709, &m.gradient709),
+        ("2020", &m.testsrc2020, &m.gradient2020),
+    ];
+    for (bn, bottom, _) in &matrices {
+        for (tn, top, _) in &matrices {
+            if bn == tn {
+                continue;
+            }
+            let assets = [(*bottom).clone(), (*top).clone()];
+            let tl = timeline(vec![vec![clip(bottom, 0.0, 2.0, 0.0)], vec![clip(top, 0.0, 2.0, 0.0)]], None);
+            check_converted(&format!("convert/{tn} over {bn}, whole frame"), &tl, &assets, &[0.5, 1.5]);
+            let tl = timeline(vec![vec![clip(bottom, 0.0, 2.0, 0.0)], vec![pip(top)]], None);
+            check_resized(&format!("convert/{tn} over {bn}, pip"), &tl, &assets, 0.5);
+        }
+    }
+    // BT.601's coefficients under a tag (`smpte170m`) are the same matrix as no tag: nothing to convert in either order, and a
+    // BT.709 clip over it is converted into it.
+    let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![pip(&m.testsrc170m)]], None);
+    check_converted(
+        "convert/170m over untagged (one matrix)",
+        &tl,
+        &[m.bars.clone(), m.testsrc170m.clone()],
+        &[0.5],
+    );
+    let tl = timeline(
+        vec![
+            vec![clip(&m.testsrc170m, 0.0, 2.0, 0.0)],
+            vec![clip(&m.testsrc709, 0.0, 2.0, 0.0)],
+        ],
+        None,
+    );
+    check_converted(
+        "convert/709 over 170m",
+        &tl,
+        &[m.testsrc170m.clone(), m.testsrc709.clone()],
+        &[0.5],
+    );
+    // Three layers, two of them converted, one of them of the bottom's matrix.
+    let tl = timeline(
+        vec![
+            vec![clip(&m.gradient709, 0.0, 2.0, 0.0)],
+            vec![pip(&m.testsrc)],
+            vec![{
+                let mut c = pip(&m.bars709);
+                c.transform.pos_x = -0.25;
+                c
+            }],
+            vec![{
+                let mut c = pip(&m.testsrc2020);
+                c.transform.pos_x = -0.1;
+                c.transform.pos_y = 0.3;
+                c.transform.scale = 0.4;
+                c
+            }],
+        ],
+        None,
+    );
+    check_resized(
+        "convert/three over a bottom, two converted",
+        &tl,
+        &[
+            m.gradient709.clone(),
+            m.testsrc.clone(),
+            m.bars709.clone(),
+            m.testsrc2020.clone(),
+        ],
+        0.5,
+    );
+    // The canvas's size and the picture's: shrunk, enlarged, letterboxed, Cover: refused in a still, the last scale resizes.
+    for (name, delivery) in [
+        ("shrunk", Delivery::new(320, 180, Fit::Contain)),
+        ("enlarged", Delivery::new(960, 540, Fit::Contain)),
+        ("cover", Delivery::new(360, 640, Fit::Cover)),
+    ] {
+        let tl = timeline(
+            vec![
+                vec![clip(&m.gradient709, 0.0, 2.0, 0.0)],
+                vec![clip(&m.testsrc, 0.0, 2.0, 0.0)],
+            ],
+            Some(delivery),
+        );
+        check_resized(
+            &format!("convert/untagged over 709, {name}"),
+            &tl,
+            &[m.gradient709.clone(), m.testsrc.clone()],
+            0.5,
+        );
+    }
+    // Letterboxed: a landscape picture on a portrait canvas, bars above and below it.
+    let tl = timeline(
+        vec![
+            vec![clip(&m.gradient709, 0.0, 2.0, 0.0)],
+            vec![clip(&m.testsrc, 0.0, 2.0, 0.0)],
+        ],
+        Some(Delivery::new(320, 640, Fit::Contain)),
+    );
+    check_resized(
+        "convert/untagged letterboxed over 709",
+        &tl,
+        &[m.gradient709.clone(), m.testsrc.clone()],
+        0.5,
+    );
+    // Busy: per-pixel noise (every Y, U, V and the clipped RGB), and the 1-px checkerboard, converted from a tag to another.
+    let tl = timeline(
+        vec![vec![clip(&m.gradient709, 0.0, 0.2, 0.0)], vec![clip(&m.noise, 0.0, 0.2, 0.0)]],
+        None,
+    );
+    check_converted_with(
+        "convert/noise over 709",
+        &tl,
+        &[m.gradient709.clone(), m.noise.clone()],
+        &[0.1],
+        BUSY,
+    );
+    let tl = timeline(
+        vec![
+            vec![clip(&m.gradient2020, 0.0, 0.2, 0.0)],
+            vec![clip(&m.checker, 0.0, 0.2, 0.0)],
+        ],
+        None,
+    );
+    check_converted_with(
+        "convert/checkerboard over 2020",
+        &tl,
+        &[m.gradient2020.clone(), m.checker.clone()],
+        &[0.1],
+        BUSY,
+    );
+    // A dissolve between clips of two matrices, at the start, the middle and the end of the ramp and after it (the dissolving
+    // clip is converted ahead of its alpha plane, which the ramp scales).
+    for (name, from, to) in [
+        ("709 into untagged", &m.testsrc709, &m.testsrc),
+        ("untagged into 709", &m.testsrc, &m.testsrc709),
+        ("2020 into 709", &m.testsrc2020, &m.testsrc709),
+    ] {
+        for kind in [
+            TransitionKind::Crossfade,
+            TransitionKind::SlideLeft,
+            TransitionKind::DipToBlack,
+        ] {
+            let mut incoming = clip(to, 0.0, 1.5, 1.0);
+            incoming.transition_in = Some(Transition { kind, duration: 0.6 });
+            let tl = timeline(vec![vec![clip(from, 0.0, 1.5, 0.0), incoming]], None);
+            let assets = [from.clone(), to.clone()];
+            let case = format!("convert/{name} through {kind:?}");
+            // A dip to black fades the incoming picture to black before the conversion: refused while it runs.
+            if kind == TransitionKind::DipToBlack && policy() == CompositeColorPolicy::BottomLayerTag {
+                check_refused(&case, &tl, &assets, 1.1, Refusal::Plan("fade to black running"));
+                check_converted(&case, &tl, &assets, &[0.5, 2.0]);
+            } else {
+                check_converted(&case, &tl, &assets, &[0.5, 1.1, 1.3, 1.5, 2.0]);
+            }
+        }
+    }
+    // Refused: what the conversion does not cover (FFmpeg draws the frame; under a fixed matrix the layers are drawn as they are).
+    let over = |top: Asset, edit: &dyn Fn(&mut Clip)| {
+        let mut c = clip(&top, 0.0, 2.0, 0.0);
+        edit(&mut c);
+        (
+            timeline(vec![vec![clip(&m.bars709, 0.0, 2.0, 0.0)], vec![c]], None),
+            vec![m.bars709.clone(), top],
+        )
+    };
+    let (tl, assets) = over(m.testsrc.clone(), &|c| c.transform.opacity = 0.6);
+    check_mixed("convert/translucent", &tl, &assets, &[0.5], "opacity below 1");
+    let (tl, assets) = over(m.testsrc.clone(), &|c| {
+        c.color = Color {
+            contrast: 1.2,
+            ..Color::default()
+        }
+    });
+    check_mixed("convert/colour corrected", &tl, &assets, &[0.5], "colour correction");
+    let (tl, assets) = over(m.testsrc.clone(), &|c| {
+        c.effects = vec![kerf_core::VideoEffect::Blur { sigma: 2.0 }];
+    });
+    check_mixed("convert/effect", &tl, &assets, &[0.5], "video effect");
+    // A pointwise effect is a table the scale applies ahead of the conversion, in an export (`motion_parity.rs`); a still's chain has no
+    // converter of its own after it, and its composite is not the conversion of the effect's picture: refused there.
+    for (name, effect) in [
+        ("invert", kerf_core::VideoEffect::Invert),
+        ("grayscale", kerf_core::VideoEffect::Grayscale),
+    ] {
+        let (tl, assets) = over(m.testsrc.clone(), &|c| c.effects = vec![effect.clone()]);
+        check_mixed(
+            &format!("convert/{name} on the converted layer"),
+            &tl,
+            &assets,
+            &[0.5],
+            "video effect",
+        );
+    }
+    // (A still's `scale` takes a 4:2:2 or 4:4:4 picture to 4:2:0 and into the composite's matrix in one pass: refused there; the
+    // export's conversion is held in `motion_parity.rs`.)
+    for (name, picture) in [("4:4:4", &m.yuv444), ("4:2:2", &m.yuv422)] {
+        let (tl, assets) = over(picture.clone(), &|_| {});
+        check_mixed(&format!("convert/{name} over 709"), &tl, &assets, &[0.5], "in a still");
+    }
+    let (tl, assets) = over(m.testsrc.clone(), &|c| c.transform.rotation = 10.0);
+    // (A turn that is not a quarter is no layer's to draw under any policy: refused before the conversion is asked.)
+    check_refused("convert/rotated", &tl, &assets, 0.5, Refusal::Plan("rotation"));
+    let (tl, assets) = over(m.testsrc.clone(), &|c| {
+        c.mask = Some(a_mask(kerf_core::MaskShape::Ellipse, 0.1, false));
+    });
+    check_mixed("convert/masked", &tl, &assets, &[0.5], "mask");
+    let (tl, assets) = over(m.odd.clone(), &|_| {});
+    check_mixed("convert/odd size", &tl, &assets, &[0.5], "odd size");
+    let (tl, assets) = over(m.png640.clone(), &|_| {});
+    check_mixed("convert/rgb png over 709", &tl, &assets, &[0.5], "RGB picture");
+    // A fade to black running on the converted clip: FFmpeg fades the picture first. At the clip's start (running), then after.
+    let mut faded = clip(&m.testsrc, 0.0, 2.0, 0.0);
+    faded.fade_in = 0.6;
+    let tl = timeline(vec![vec![clip(&m.bars709, 0.0, 2.0, 0.0)], vec![faded]], None);
+    let assets = [m.bars709.clone(), m.testsrc.clone()];
+    if policy() == CompositeColorPolicy::BottomLayerTag {
+        check_refused(
+            "convert/fade-in running",
+            &tl,
+            &assets,
+            0.2,
+            Refusal::Plan("fade to black running"),
+        );
+    }
+    check_converted("convert/fade-in finished", &tl, &assets, &[1.0]);
+}
+
+/// A layer of another matrix than the bottom's whose last `scale` resizes it, in a still: the graph has no `format` ahead of
+/// the overlay, so the `scale` converts the matrix itself, in the same pass as the resize (swscale scales and converts to
+/// `bgr24` at the destination size, then `ff_rgb24toyv12`), which is not the conversion of the picture the resize made
+/// (measured: 47398 of 230400 luma samples differ on a half-size picture-in-picture). The case holds the refusal, with
+/// FFmpeg rendering it; under a fixed-matrix FFmpeg the layers are drawn as they are. (An export's chain ends in `format`,
+/// and its layers are converted by a `scale` of their own after it: `motion_parity.rs`.)
+fn check_resized(case: &str, tl: &Timeline, assets: &[Asset], t: f64) {
+    match policy() {
+        CompositeColorPolicy::FixedBt601 => check(case, tl, assets, &[t], STRICT),
+        CompositeColorPolicy::BottomLayerTag => {
+            check_refused(
+                &format!("{case} (negotiated)"),
+                tl,
+                assets,
+                t,
+                Refusal::Plan("last scale resizes it"),
+            );
         }
         CompositeColorPolicy::Unknown => unreachable!("policy() never answers Unknown"),
     }
@@ -3153,7 +3573,7 @@ fn the_composite_follows_the_matrix_ffmpeg_negotiates() {
         &[0.5],
         STRICT,
     );
-    // Mixed tags, any order: refused under negotiation.
+    // Mixed tags, any order: a picture-in-picture is scaled by the chain's last `scale`, which converts the matrix in the same pass: refused in a still.
     for (name, base, top) in [
         ("matrix/mixed-709-over-untagged", &m.gradient, &m.testsrc709),
         ("matrix/mixed-untagged-over-709", &m.gradient709, &m.testsrc),
@@ -3161,7 +3581,7 @@ fn the_composite_follows_the_matrix_ffmpeg_negotiates() {
         ("matrix/mixed-2020-over-709", &m.gradient709, &m.testsrc2020),
     ] {
         let tl = timeline(vec![vec![clip(base, 0.0, 2.0, 0.0)], vec![pip(top)]], None);
-        check_mixed(name, &tl, &[base.clone(), top.clone()], &[0.5], "different YCbCr matrices");
+        check_resized(name, &tl, &[base.clone(), top.clone()], 0.5);
     }
     // An RGB picture (a PNG, at its own size: it is under the pip, since resizing an
     // RGB picture is refused) among untagged layers is nothing special; among tagged
@@ -3232,7 +3652,7 @@ fn translucent_layers_take_the_round_trip_with_the_right_matrices() {
         &tl,
         &[m.bars709.clone(), m.testsrc.clone()],
         &[0.5],
-        "different YCbCr matrices",
+        "other than the composite's",
     );
     let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![fade(&m.testsrc709, 0.5)]], None);
     check_mixed(
@@ -3240,7 +3660,7 @@ fn translucent_layers_take_the_round_trip_with_the_right_matrices() {
         &tl,
         &[m.bars.clone(), m.testsrc709.clone()],
         &[0.5],
-        "different YCbCr matrices",
+        "other than the composite's",
     );
     // Formats that are not 8-bit 4:2:0 take the same round trip (FFmpeg converts
     // them to yuva420p first; so does the decode).
@@ -3278,8 +3698,8 @@ fn translucent_layers_take_the_round_trip_with_the_right_matrices() {
 /// The compositor's planes are 4:2:0, so it can place a layer exactly only where the
 /// two grids agree; luma is always exact, but the chroma of a 4:2:2 / 4:4:4 / RGB
 /// picture positioned between two 4:2:0 chroma samples is a pixel off (30 to 38 dB).
-/// Those are **refused** (FFmpeg draws them); gray, which has no chroma to misplace,
-/// is drawn exactly. Every case is chosen so that the 4:2:0 and the native geometry
+/// Those are **refused** (FFmpeg draws them); gray, which has no chroma to misplace, is
+/// placed exactly but is refused as soon as it is resized (the exact scaler is 8-bit 4:2:0's). Every case is chosen so that the 4:2:0 and the native geometry
 /// *differ* or are *equal* as stated, so a regression to one shared rounding cannot
 /// pass by landing on the same pixels.
 #[test]
@@ -3340,7 +3760,7 @@ fn crop_rounds_to_the_native_chroma_grid_and_pad_and_cover_to_the_420_one() {
     // Cases with no crop, where the grid after the first `scale` decides: the Cover
     // overhang and the letterbox gap are odd, and land on the 4:2:0 grid for every
     // source. (The two letterbox frames that leave the picture at its own size are the
-    // only ones drawn for a picture that is not 4:2:0 or gray: the rest resize it.)
+    // only ones drawn for a picture that is not 8-bit 4:2:0: the rest resize it.)
     let uncropped: [(&str, (u32, u32), Fit); 5] = [
         ("cover-odd-x", (90, 162), Fit::Cover),
         ("cover-odd-y", (202, 100), Fit::Cover),
@@ -3393,11 +3813,15 @@ fn crop_rounds_to_the_native_chroma_grid_and_pad_and_cover_to_the_420_one() {
                 check_refused(&case, &tl, &assets, 0.5, Refusal::Plan("one resample"));
                 continue;
             }
-            // A picture that is not 4:2:0 or gray is FFmpeg's whenever it is resized (and
+            // A picture that is not 8-bit 4:2:0 (gray included) is FFmpeg's whenever it is resized (and
             // every crop frame here resizes it), and also — said first — when its crop
             // lands between two 4:2:0 chroma samples: luma is exact and chroma is not.
-            if finer && !gray {
-                let why = if differs_here { "4:2:0 chroma samples" } else { "scales a" };
+            if finer || gray {
+                let why = if finer && differs_here {
+                    "4:2:0 chroma samples"
+                } else {
+                    "scales a"
+                };
                 check_refused(&case, &tl, &assets, 0.5, Refusal::Plan(why));
             } else {
                 check(&case, &tl, &assets, &[0.5], STRICT);
@@ -3416,13 +3840,13 @@ fn crop_rounds_to_the_native_chroma_grid_and_pad_and_cover_to_the_420_one() {
                 "{case}: only a crop sees the native grid"
             );
             // Only the letterbox gaps that leave the picture at its own size are drawn
-            // for a picture that is not 4:2:0 or gray; the Cover frames and the 9:16
+            // for a picture that is not 8-bit 4:2:0; the Cover frames and the 9:16
             // letterbox resize it.
             let resized = geometry(*frame, *fit, &tf, native)
                 .stages
                 .iter()
                 .any(|s| s.scaled != (s.src.w, s.src.h));
-            if finer && !gray && resized {
+            if (finer || gray) && resized {
                 check_refused(&case, &tl, assets, 0.5, Refusal::Plan("scales a"));
             } else {
                 check(&case, &tl, assets, &[0.5], STRICT);
@@ -3633,8 +4057,9 @@ fn grading_a_full_range_picture_is_refused_and_ungraded_it_is_drawn() {
 /// 8-9 (4:2:2 at 0.9x is over the limit) and up to 32 levels on edges, because the
 /// chroma kernel differs most near a ratio of 1. No band of ratios was measured
 /// strictly inside the limits on both FFmpegs for busy chroma, so none is claimed:
-/// every resize of a picture that is not 4:2:0 (8/10-bit) or gray is FFmpeg's, and a
-/// picture left at its size is drawn.
+/// every resize of a picture that is not 8-bit 4:2:0 is FFmpeg's (10-bit 4:2:0 scaled and dithered at 10
+/// bits is off by one in Y, U and V on 6.1.1; gray scaled in `gray` is 10 levels off over half the plane on
+/// 9.0.2), and a picture left at its size is drawn.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn resizing_a_picture_ffmpeg_scales_in_another_format_is_refused() {
@@ -3690,15 +4115,34 @@ fn resizing_a_picture_ffmpeg_scales_in_another_format_is_refused() {
         // ...and a picture left at its size is drawn, held to the strict limits.
         check(&format!("same-size/{name}"), &scaled(a, 1.0, None), assets, &[0.5], STRICT);
     }
-    // 4:2:0 and gray are what the compositor works in: resizing them is fine in both
-    // directions — including 10 bit (FFmpeg scales it at 10 bits and dithers once at the
-    // end).
-    for (name, a) in [
-        ("yuv420p10le", &m.tenbit),
-        ("gray", &m.gray),
-        ("yuv420p", &m.testsrc),
-        ("yuvj420p-jpeg", &m.jpeg),
-    ] {
+    // 8-bit 4:2:0 is what the compositor works in: resizing it is fine in both directions. 10-bit 4:2:0 and
+    // gray are the decode's 8-bit 4:2:0 only at their own size.
+    for (name, a) in [("yuv420p10le", &m.tenbit), ("gray", &m.gray)] {
+        let assets = std::slice::from_ref(a);
+        check_refused(
+            &format!("refused/{name}-x1.5"),
+            &scaled(a, 1.5, None),
+            assets,
+            0.5,
+            Refusal::Plan("scales a"),
+        );
+        check_refused(
+            &format!("refused/{name}-fit-to-960x540"),
+            &scaled(a, 1.0, Some(Delivery::new(960, 540, Fit::Contain))),
+            assets,
+            0.5,
+            Refusal::Plan("scales a"),
+        );
+        check_refused(
+            &format!("refused/{name}-fit-to-576x324"),
+            &scaled(a, 1.0, Some(Delivery::new(576, 324, Fit::Contain))),
+            assets,
+            0.5,
+            Refusal::Plan("scales a"),
+        );
+        check(&format!("same-size/{name}"), &scaled(a, 1.0, None), assets, &[0.5], STRICT);
+    }
+    for (name, a) in [("yuv420p", &m.testsrc), ("yuvj420p-jpeg", &m.jpeg)] {
         let assets = std::slice::from_ref(a);
         // A zoom in of footage under Contain: FFmpeg takes it from the source in one resample, where
         // the compositor fits and then scales, so the plan refuses it (`FoldedFit`) and FFmpeg draws
@@ -3729,15 +4173,13 @@ fn resizing_a_picture_ffmpeg_scales_in_another_format_is_refused() {
             STRICT,
         );
     }
-    for (name, a) in [("yuv420p", &m.testsrc), ("gray", &m.gray)] {
-        check(
-            &format!("shrink-ok/{name}-fit-to-576x324"),
-            &scaled(a, 1.0, Some(Delivery::new(576, 324, Fit::Contain))),
-            std::slice::from_ref(a),
-            &[0.5],
-            STRICT,
-        );
-    }
+    check(
+        "shrink-ok/yuv420p-fit-to-576x324",
+        &scaled(&m.testsrc, 1.0, Some(Delivery::new(576, 324, Fit::Contain))),
+        std::slice::from_ref(&m.testsrc),
+        &[0.5],
+        STRICT,
+    );
 }
 
 #[test]
@@ -4461,7 +4903,9 @@ fn text_in_a_colour_bitmap_font_is_not_drawn_in_colour_by_anyone() {
 /// separates the scaler's error from the converter's.
 fn ffmpeg_scaled_planes(layer: &kerf_core::PlanLayer, w: u32, h: u32) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
     let seek = format!("{}", layer.source_time);
-    let scale = format!("scale={w}:{h}");
+    // A complex graph, as the product's: an unflagged `scale` there runs the filter's own default algorithm (bilinear
+    // before FFmpeg 5.0), where `-vf` is handed the command line's bicubic.
+    let scale = format!("[0:v]scale={w}:{h}[o]");
     let mut args = vec!["-ss", &seek, "-i", &layer.path];
     if layer.is_image {
         args = vec!["-i", &layer.path];
@@ -4469,8 +4913,10 @@ fn ffmpeg_scaled_planes(layer: &kerf_core::PlanLayer, w: u32, h: u32) -> (Vec<u8
     args.extend([
         "-frames:v",
         "1",
-        "-vf",
+        "-filter_complex",
         &scale,
+        "-map",
+        "[o]",
         "-f",
         "rawvideo",
         "-pix_fmt",
@@ -4539,6 +4985,12 @@ fn the_scaler_matches_ffmpegs_scale_plane_by_plane() {
         ),
     ];
     let mut failures = Vec::new();
+    let exact = kerf_gpu::scaler::kernels().exact();
+    assert!(
+        exact,
+        "this FFmpeg's scaler is not the model: {:?}",
+        kerf_gpu::scaler::kernels()
+    );
     for (name, asset, t, sizes, mean_limit) in cases {
         for &(w, h) in sizes {
             let tl = timeline(
@@ -4566,14 +5018,14 @@ fn the_scaler_matches_ffmpegs_scale_plane_by_plane() {
                     sum += f64::from(d);
                 }
                 let mean = sum / got.len() as f64;
-                if std::env::var_os("KERF_SCALER_DEBUG").is_some() && max > 2 {
+                if std::env::var_os("KERF_SCALER_DEBUG").is_some() && max > 0 {
                     let pw = if plane == "Y" { w as usize } else { w as usize / 2 };
                     let mut worst: Vec<(i32, usize, usize)> = got
                         .iter()
                         .zip(want.iter())
                         .enumerate()
                         .map(|(i, (a, b))| ((i32::from(*a) - i32::from(*b)).abs(), i % pw, i / pw))
-                        .filter(|(d, _, _)| *d > 2)
+                        .filter(|(d, _, _)| *d > 0)
                         .collect();
                     worst.sort_unstable_by(|a, b| b.cmp(a));
                     worst.truncate(12);
@@ -4589,7 +5041,10 @@ fn the_scaler_matches_ffmpegs_scale_plane_by_plane() {
                 // inputs, and swscale's x86 vertical scaler rounds each of them
                 // slightly differently from the C arithmetic this follows.
                 let ratio = plan.layers[0].stream.width / w;
-                let (max_limit, mean_limit) = if ratio >= 32 {
+                let (max_limit, mean_limit) = if exact {
+                    // The scaler is swscale's to the level on this machine (the probe measured it): not a level.
+                    (0, 0.0)
+                } else if ratio >= 32 {
                     (SCALER_MAX_STEEP, mean_limit.max(SCALER_STEEP_MEAN))
                 } else if ratio >= 8 {
                     (SCALER_MAX_EXTREME, mean_limit.max(SCALER_EXTREME_MEAN))
@@ -4604,14 +5059,14 @@ fn the_scaler_matches_ffmpegs_scale_plane_by_plane() {
             }
         }
     }
-    // Past the steepest shrink measured (`MAX_SHRINK`, 40:1) the plan declines and
-    // FFmpeg draws it.
+    // Past the steepest shrink the model is held to (`MAX_SHRINK`, 63:1: swscale needs a second scaler from 64:1) the plan declines and
+    // FFmpeg draws it. (1280x720 into 20x11 is 64:1.)
     let tl = timeline(
         vec![vec![clip(&m.noise_hd, 0.0, m.noise_hd.duration, 0.0)]],
-        Some(Delivery::new(30, 16, Fit::Contain)),
+        Some(Delivery::new(20, 12, Fit::Contain)),
     );
     check_refused(
-        "shrink/noise-hd-past-40:1",
+        "shrink/noise-hd-past-63:1",
         &tl,
         std::slice::from_ref(&m.noise_hd),
         0.05,
@@ -5054,6 +5509,7 @@ fn effects_are_drawn_as_their_filters_draw_them() {
             vec![E::Sharpen { amount: 1.0 }, E::Grayscale, E::Blur { sigma: 2.0 }, E::Invert],
         ),
         ("vignette-chain", vec![E::Invert, E::Vignette, E::Blur { sigma: 2.0 }]),
+        ("sharpen-blur", vec![E::Sharpen { amount: 2.5 }, E::Blur { sigma: 3.0 }]),
     ] {
         for (asset, label) in [(&m.testsrc, "testsrc2"), (&m.bars, "bars")] {
             let mut c = clip(asset, 0.0, 2.0, 0.0);
@@ -5100,14 +5556,12 @@ fn effects_are_drawn_as_their_filters_draw_them() {
         // (A sharpen after a scale is drawn to half strength: past it the scaler's level is amplified.)
         c.effects = vec![E::Blur { sigma: 3.0 }, E::Sharpen { amount: 0.5 }];
         let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![c]], None);
-        let limits = if name == "rotated" { ROTATED } else { STRICT };
-        check(
-            &format!("effect/{name}"),
-            &tl,
-            &[m.bars.clone(), m.testsrc.clone()],
-            &[0.5],
-            limits,
-        );
+        let assets = [m.bars.clone(), m.testsrc.clone()];
+        if name == "rotated" {
+            check_refused(&format!("effect/{name}"), &tl, &assets, 0.5, Refusal::Plan("a rotation"));
+        } else {
+            check(&format!("effect/{name}"), &tl, &assets, &[0.5], STRICT);
+        }
     }
     // A vignette's map is the picture's at the size the filter sees it: scaled, odd-sized, in a Cover frame.
     for (name, edit, format) in [
@@ -6047,7 +6501,7 @@ fn footage_that_is_not_untagged_hd_is_left_as_it_is_and_the_other_matrices_stay_
     ] {
         let (tl, assets) = hd_stack(base, top, 1.0);
         assert!(labelled_layers(&tl, &assets, 0.5).iter().all(|l| !l), "{name}");
-        check_mixed(name, &tl, &assets, &[0.5], "different YCbCr matrices");
+        check_resized(name, &tl, &assets, 0.5);
     }
     // Untagged HD beside footage tagged BT.601 is labelled BT.709 (a stated matrix is a matrix): the
     // stack is mixed now, where FFmpeg read both alike before. It is drawn where the composite is fixed.
@@ -6058,7 +6512,7 @@ fn footage_that_is_not_untagged_hd_is_left_as_it_is_and_the_other_matrices_stay_
     ] {
         let (tl, assets) = hd_stack(base, top, 1.0);
         assert!(labelled_layers(&tl, &assets, 0.5).iter().any(|l| *l), "{name}");
-        check_mixed(name, &tl, &assets, &[0.5], "different YCbCr matrices");
+        check_resized(name, &tl, &assets, 0.5);
     }
     // A PNG logo is RGB: never labelled, and it names no YCbCr matrix. At the canvas's own size (an RGB
     // picture is not resized) it is BT.601 with untagged HD, under it or translucent over it: drawn. In a
@@ -6269,7 +6723,7 @@ fn the_previews_proxies_stack_as_their_originals_do() {
     // An SD proxy is as it was, and beside a BT.709 proxy is refused where the matrix is negotiated.
     let sd = proxies.of(h.get("detail/sd-untagged"));
     let (tl, assets) = hd_stack(&phone, &sd, 1.0);
-    check_mixed("proxy/sd-untagged-over-709", &tl, &assets, &[0.5], "different YCbCr matrices");
+    check_resized("proxy/sd-untagged-over-709", &tl, &assets, 0.5);
     let (tl, assets) = hd_stack(&untagged, &sd, 1.0);
     check("proxy/sd-untagged-over-untagged-hd", &tl, &assets, &[0.5], STRICT);
 }
@@ -6293,7 +6747,8 @@ fn the_previews_proxies_stack_as_their_originals_do() {
 // "flat PSNR / flat max" there, and `refused` is a stack the plan declines on that
 // FFmpeg (mixed matrices, an RGB picture in a non-BT.601 stack, an asset that
 // never recorded its pixel format), asserted refused rather than compared. Both
-// runs pass every case, strictly (no `KERF_PARITY_EXPLORE`).
+// runs pass every case, strictly (no `KERF_PARITY_EXPLORE`). (A gray or 10-bit picture the scaler resizes is refused, so
+// its `enlarge-ok/`, `shrink-ok/` and resized `grid/gray-*` rows are gone; `refused/{gray,yuv420p10le}-*` assert it.)
 // The `text/` rows are the cases with text, judged against the same picture without it
 // (whole-image max at most the control's, floor 3; the lower third at 0.1 s +1, the 12 px text and the
 // full-range pictures on 9.0 +2, each with its reason at the case); the `(no text)` controls are in the
@@ -6326,12 +6781,8 @@ fn the_previews_proxies_stack_as_their_originals_do() {
 // cover/9x16                                     0.5   360x640 |    46.4 dB        5 |    46.5 dB        5 |  7.4%    =
 // cover/9x16                                     1.2   360x640 |    46.3 dB        4 |    46.4 dB        5 |  6.5%    =
 // cover/portrait-in-16x9                         0.7   640x360 |    49.0 dB        5 |    48.8 dB        5 | 11.5%    =
-// enlarge-ok/gray-fit-to-960x540                 0.5   960x540 |    51.2 dB        2 |    51.0 dB        2 | 10.4%    =
-// enlarge-ok/gray-x1.5                           0.5   640x360 |    51.2 dB        2 |    50.9 dB        2 | 13.2%    =
 // enlarge-ok/yuv420p-fit-to-960x540              0.5   960x540 |    48.8 dB        5 |    48.5 dB        5 | 14.3%    =
 // enlarge-ok/yuv420p-x1.5                        0.5   640x360 |    47.7 dB        5 |    47.5 dB        5 | 17.7%    =
-// enlarge-ok/yuv420p10le-fit-to-960x540          0.5   960x540 |    47.8 dB        5 |    47.4 dB        5 | 14.3%    =
-// enlarge-ok/yuv420p10le-x1.5                    0.5   640x360 |    46.7 dB        5 |    46.4 dB        5 | 17.8%    =
 // enlarge-ok/yuvj420p-jpeg-fit-to-960x540        0.5   960x540 |    99.0 dB        0 |    99.0 dB        0 |  0.0%    =
 // enlarge-ok/yuvj420p-jpeg-x1.5                  0.5   480x270 |    99.0 dB        0 |    99.0 dB        0 |  0.0%    =
 // full-range/limited-range-control-graded        0.5   640x360 |    48.3 dB        3 |    48.2 dB        3 | 15.6%    =
@@ -6344,17 +6795,6 @@ fn the_previews_proxies_stack_as_their_originals_do() {
 // geometry/zoom-off-canvas                       0.5   640x360 |    48.1 dB        4 |    48.0 dB        5 |  9.5%    =
 // grid/bgr0-pad-odd-x                            0.5   646x360 |    48.4 dB        3 |    48.3 dB        3 | 17.2%    =
 // grid/bgr0-pad-odd-y                            0.5   640x366 |    48.4 dB        3 |    48.4 dB        3 | 18.2%    =
-// grid/gray-cover-odd-x                          0.5    90x162 |    47.6 dB        4 |    47.4 dB        4 | 18.1%    =
-// grid/gray-cover-odd-x-then-scale               0.5    90x162 |    53.2 dB        2 |    52.3 dB        2 | 28.5%    =
-// grid/gray-cover-odd-y                          0.5   202x100 |    49.0 dB        4 |    48.6 dB        4 | 31.5%    =
-// grid/gray-cover-odd-y-then-scale               0.5   202x100 |    54.0 dB        2 |    52.3 dB        2 | 36.2%    =
-// grid/gray-even-crop                            0.5   320x180 |    51.9 dB        3 |    51.3 dB        4 | 24.8%    =
-// grid/gray-letterbox-9x16                       0.5   360x640 |    57.2 dB        2 |    56.1 dB        2 |  8.4%    =
-// grid/gray-odd-crop                             0.5   320x180 |    51.3 dB        2 |    51.0 dB        2 | 25.4%    =
-// grid/gray-odd-crop-behind-a-pip                0.5   320x180 |    51.2 dB        3 |    50.6 dB        5 | 31.1%    =
-// grid/gray-odd-crop-cover                       0.5    90x162 |    51.1 dB        3 |    50.7 dB        4 | 18.8%    =
-// grid/gray-odd-x-crop                           0.5   320x180 |    51.2 dB        3 |    50.8 dB        4 | 23.1%    =
-// grid/gray-odd-y-crop                           0.5   320x180 |    50.4 dB        4 |    50.1 dB        4 | 25.0%    =
 // grid/gray-pad-odd-x                            0.5   646x360 |    51.4 dB        1 |    51.3 dB        1 | 15.1%    =
 // grid/gray-pad-odd-y                            0.5   640x366 |    51.4 dB        1 |    51.3 dB        1 | 16.2%    =
 // grid/rgb24-png-pad-odd-x                       0.5   646x360 |    48.3 dB        3 |    48.3 dB        3 | 15.9%    =
@@ -6415,7 +6855,6 @@ fn the_previews_proxies_stack_as_their_originals_do() {
 // same-size/rgb24-png                            0.5   480x270 |    48.4 dB        3 |    48.2 dB        3 | 17.7%    =
 // same-size/yuv422p                              0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 16.3%    =
 // same-size/yuv444p                              0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 17.9%    =
-// shrink-ok/gray-fit-to-576x324                  0.5   576x324 |    51.4 dB        2 |    51.1 dB        2 | 15.2%    =
 // shrink-ok/yuv420p-fit-to-576x324               0.5   576x324 |    48.9 dB        4 |    48.7 dB        5 | 18.9%    =
 // single/gradient                                  0   640x360 |    46.3 dB        3 |    46.3 dB        3 |  0.0%    =
 // single/gradient                                  1   640x360 |    46.3 dB        3 |    46.3 dB        3 |  0.0%    =
@@ -6957,7 +7396,7 @@ fn a_grade_is_drawn_as_the_still_draws_it() {
     });
     check("grade/masked", &tl, &assets, &[0.5], STRICT);
     let (tl, assets) = graded(&m.gradient, heavy, &|c| c.transform.rotation = 20.0);
-    check("grade/rotated", &tl, &assets, &[0.5], ROTATED);
+    check_refused("grade/rotated", &tl, &assets, 0.5, Refusal::Plan("a rotation"));
     // A layer over another: the grade does not cover what is below, and the picture is placed by the overlay.
     let mut upper = clip(&m.testsrc, 0.0, 2.0, 0.0);
     upper.grade = heavy.clone();
@@ -6998,7 +7437,7 @@ fn a_grade_is_drawn_as_the_still_draws_it() {
         &tl,
         &[m.bars709.clone(), m.testsrc.clone()],
         &[0.5],
-        "different YCbCr matrices",
+        "other than the composite's",
     );
     let tl = timeline(vec![vec![over.clone()], vec![clip(&m.testsrc709, 0.0, 2.0, 0.0)]], None);
     check_mixed(
@@ -7006,7 +7445,7 @@ fn a_grade_is_drawn_as_the_still_draws_it() {
         &tl,
         &[m.testsrc.clone(), m.testsrc709.clone()],
         &[0.5],
-        "different YCbCr matrices",
+        "other than the composite's",
     );
     let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![over]], None);
     check(
@@ -10428,4 +10867,638 @@ fn checker_t6_stills_in_a_cut_that_names_a_matrix() {
         }
     }
     t6_stills("a cut that names a matrix", cases);
+}
+
+/// A blend case: held to the still where this FFmpeg's chain is the model's (`blend::kernels`); where the probe refused the build
+/// (FFmpeg 4.4's `overlay` loses the alpha rows of a clip above the frame's top edge when it runs on several threads) the plan must
+/// refuse every time and the case is drawn anyway with the caps forced, to hold the arithmetic itself to the still.
+fn blend_check(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], limits: Limits) {
+    if compositor().caps().blend == kerf_core::BlendKinds::ALL {
+        return check(case, tl, assets, times, limits);
+    }
+    for &t in times {
+        let plan = RenderPlan::at(tl, assets, &ExportOptions::default(), t, policy()).expect("plan");
+        let why = reasons(&plan, plan.size(u32::MAX));
+        assert!(
+            why.iter().any(|w| w.contains("no compositor pass draws this mode")),
+            "{case} @ {t}: a blend the probe refused is refused by the plan: {why:?}"
+        );
+    }
+    FORCED_BLENDS.with(|f| f.set(true));
+    check(&format!("{case} (forced)"), tl, assets, times, limits);
+    FORCED_BLENDS.with(|f| f.set(false));
+}
+
+/// A blend mode is FFmpeg's `blend` in RGB between two conversions (`engine/cli/blend.rs`), drawn in integers (`src/blend.rs`; held to
+/// the filters over every value in `tests/blend_kernels.rs` and to the export's planes sample for sample in `tests/motion_parity.rs`).
+/// The still's PNG is converted by swscale and the compositor's frame by its shader, so these hold the whole frame to `STRICT`, as
+/// every still is: every mode over the bars and the test pattern, the noise (every Y, U, V), a clip with its fades running, a mask and a
+/// key, a moved one, and on BT.709 / BT.601-tagged footage, where the chain names the composite's matrix.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn blend_modes_are_drawn_as_the_still_draws_them() {
+    use kerf_core::BlendMode;
+    let m = media();
+    let blended = |asset: &Asset, mode: BlendMode, edit: &dyn Fn(&mut Clip)| {
+        let mut c = clip(asset, 0.0, 2.0, 0.0);
+        c.blend_mode = mode;
+        edit(&mut c);
+        c
+    };
+    for mode in [
+        BlendMode::Multiply,
+        BlendMode::Screen,
+        BlendMode::Overlay,
+        BlendMode::HardLight,
+        BlendMode::Add,
+        BlendMode::Darken,
+        BlendMode::Lighten,
+        BlendMode::Difference,
+        BlendMode::Exclusion,
+    ] {
+        let over = |top: Clip, base: &Asset, with: &Asset| {
+            (
+                timeline(vec![vec![clip(base, 0.0, 2.0, 0.0)], vec![top]], None),
+                [base.clone(), with.clone()],
+            )
+        };
+        let (tl, assets) = over(blended(&m.testsrc, mode, &|_| {}), &m.bars, &m.testsrc);
+        blend_check(&format!("blend/{mode:?}"), &tl, &assets, &[0.5, 1.3], STRICT);
+        let (tl, assets) = over(blended(&m.bars, mode, &|_| {}), &m.testsrc, &m.bars);
+        blend_check(&format!("blend/{mode:?} bars over testsrc"), &tl, &assets, &[0.5], STRICT);
+        let (tl, assets) = over(blended(&m.noise, mode, &|_| {}), &m.gradient, &m.noise);
+        blend_check(&format!("blend/{mode:?} noise over a gradient"), &tl, &assets, &[0.1], BUSY);
+        let (tl, assets) = over(blended(&m.testsrc, mode, &|c| c.fade_in = 1.0), &m.bars, &m.testsrc);
+        blend_check(&format!("blend/{mode:?} fading in"), &tl, &assets, &[0.4], STRICT);
+        let (tl, assets) = over(
+            blended(&m.testsrc, mode, &|c| {
+                c.mask = Some(a_mask(kerf_core::MaskShape::Ellipse, 0.3, false));
+            }),
+            &m.bars,
+            &m.testsrc,
+        );
+        blend_check(&format!("blend/{mode:?} masked"), &tl, &assets, &[0.5], STRICT);
+        let (tl, assets) = over(
+            blended(&m.testsrc, mode, &|c| {
+                c.transform.pos_x = 0.2;
+                c.transform.pos_y = 0.1;
+            }),
+            &m.bars,
+            &m.testsrc,
+        );
+        blend_check(&format!("blend/{mode:?} moved"), &tl, &assets, &[0.5], STRICT);
+        // A quarter turn lands on whole samples (`rotate` is exact there): drawn, and refused at any other angle.
+        for turn in [90.0, 180.0] {
+            let (tl, assets) = over(
+                blended(&m.testsrc, mode, &|c| c.transform.rotation = turn),
+                &m.bars,
+                &m.testsrc,
+            );
+            blend_check(&format!("blend/{mode:?} turned {turn}"), &tl, &assets, &[0.5], STRICT);
+        }
+        for (name, base, top) in [
+            ("bt709", &m.bars709, &m.testsrc709),
+            ("smpte170m", &m.testsrc170m, &m.testsrc170m),
+            ("bt470bg", &m.bars470bg, &m.testsrc170m),
+        ] {
+            let (tl, assets) = over(blended(top, mode, &|_| {}), base, top);
+            blend_check(&format!("blend/{mode:?} on {name} footage"), &tl, &assets, &[0.5], STRICT);
+        }
+    }
+}
+
+/// What the chain is not exact for is refused in a still as in an export frame, and FFmpeg draws it.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn what_a_blend_is_not_exact_for_is_refused_in_a_still() {
+    use kerf_core::BlendMode;
+    let m = media();
+    type Edit = Box<dyn Fn(&mut Clip)>;
+    let edits: [(&str, &str, Edit); 3] = [
+        ("scaled", "scaler resizes", Box::new(|c| c.transform.scale = 0.6)),
+        ("rotated", "rotated layer", Box::new(|c| c.transform.rotation = 12.0)),
+        ("translucent", "below full opacity", Box::new(|c| c.transform.opacity = 0.6)),
+    ];
+    for (name, reason, edit) in &edits {
+        let mut c = clip(&m.testsrc, 0.0, 2.0, 0.0);
+        c.blend_mode = BlendMode::Multiply;
+        edit(&mut c);
+        let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![c]], None);
+        let plan = RenderPlan::at(
+            &tl,
+            &[m.bars.clone(), m.testsrc.clone()],
+            &ExportOptions::default(),
+            0.5,
+            policy(),
+        )
+        .expect("plan");
+        let why = reasons(&plan, plan.size(u32::MAX));
+        assert!(
+            why.iter().any(|w| w.contains(reason)),
+            "blend/{name}: refused for `{reason}`: {why:?}"
+        );
+    }
+    let mut c = clip(&m.portrait, 0.0, 2.0, 0.0);
+    c.blend_mode = BlendMode::Multiply;
+    let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![c]], None);
+    let plan = RenderPlan::at(
+        &tl,
+        &[m.bars.clone(), m.portrait.clone()],
+        &ExportOptions::default(),
+        0.5,
+        policy(),
+    )
+    .expect("plan");
+    let why = reasons(&plan, plan.size(u32::MAX));
+    assert!(why.iter().any(|w| w.contains("letterboxed layer")), "{why:?}");
+}
+
+// ==== checker/e: blend modes in a still (independent of the implementer's cases) =======================================
+
+/// A still's graph is the layers on screen: the matrix its blend names is the bottom one's **there**, not the cut's. A cut whose layers change tag half
+/// way (BT.709 bars and a BT.709 blended clip, then untagged ones) looked at in each half; the PNG's own conversion is what keeps the comparison at
+/// `STRICT` (a wrong matrix is tens of levels in `difference`).
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_a_still_names_the_matrix_of_the_layers_on_screen() {
+    use kerf_core::BlendMode;
+    let m = media();
+    for mode in [
+        BlendMode::Difference,
+        BlendMode::Multiply,
+        BlendMode::Screen,
+        BlendMode::Exclusion,
+    ] {
+        for (name, first, second, top_first, top_second) in [
+            ("709 then untagged", &m.bars709, &m.bars, &m.testsrc709, &m.testsrc),
+            ("untagged then 709", &m.bars, &m.bars709, &m.testsrc, &m.testsrc709),
+            ("709 then 470bg", &m.bars709, &m.bars470bg, &m.testsrc709, &m.testsrc170m),
+            ("470bg then untagged", &m.bars470bg, &m.bars, &m.testsrc170m, &m.testsrc),
+        ] {
+            let blended = |asset: &Asset, start: f64| {
+                let mut c = clip(asset, 0.0, 1.0, start);
+                c.blend_mode = mode;
+                c
+            };
+            let tl = timeline(
+                vec![
+                    vec![clip(first, 0.0, 1.0, 0.0), clip(second, 0.0, 1.0, 1.0)],
+                    vec![blended(top_first, 0.0), blended(top_second, 1.0)],
+                ],
+                None,
+            );
+            blend_check(
+                &format!("checker/e/still {mode:?} {name}"),
+                &tl,
+                &[first.clone(), second.clone(), top_first.clone(), top_second.clone()],
+                &[0.4, 1.4],
+                STRICT,
+            );
+        }
+    }
+}
+
+/// A still of a blended clip with the others a still can hold: a late start (nothing blended yet, then the clip), a clip ending before the
+/// cut does, two blended clips, and the clip's alpha from a key and a fade.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_a_still_of_a_blended_clip_among_others() {
+    use kerf_core::BlendMode;
+    let m = media();
+    let assets = [m.bars.clone(), m.testsrc.clone(), m.noise.clone()];
+    let mut late = clip(&m.testsrc, 0.0, 1.0, 0.8);
+    late.blend_mode = BlendMode::Screen;
+    let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![late]], None);
+    blend_check("checker/e/still late blended clip", &tl, &assets, &[0.3, 0.9, 1.7], STRICT);
+    let mut a = clip(&m.testsrc, 0.0, 2.0, 0.0);
+    a.blend_mode = BlendMode::Overlay;
+    let mut b = clip(&m.noise, 0.0, 2.0, 0.0);
+    b.blend_mode = BlendMode::Difference;
+    b.fade_in = 0.5;
+    b.effects = vec![a_key("green", 0.2, 0.3)];
+    let tl = timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![a], vec![b]], None);
+    blend_check(
+        "checker/e/still two blended clips, a key and a fade",
+        &tl,
+        &assets,
+        &[0.1, 0.25, 1.2],
+        BUSY,
+    );
+}
+
+// ==== checker/e, second pass: the lifted refusals in a still =========================================================
+
+/// The three refusals the blend lifted (a quarter turn, an RGB picture, a BT.2020 composite) in a still: held to the still wherever the caps say they
+/// are drawn (`blend_check` forces the caps where the probe refused the build). A turn that is not a quarter, and a quarter turned by a key (there are no
+/// keys in a still: the angle at the instant), are other cases.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_e_a_still_of_the_lifted_blends() {
+    use kerf_core::BlendMode;
+    let m = media();
+    let modes = [
+        BlendMode::Multiply,
+        BlendMode::Screen,
+        BlendMode::Overlay,
+        BlendMode::HardLight,
+        BlendMode::Add,
+        BlendMode::Darken,
+        BlendMode::Lighten,
+        BlendMode::Difference,
+        BlendMode::Exclusion,
+    ];
+    let over = |top: &Asset, base: &Asset, mode: BlendMode, edit: &dyn Fn(&mut Clip)| {
+        let mut c = clip(top, 0.0, 2.0, 0.0);
+        c.blend_mode = mode;
+        edit(&mut c);
+        (
+            timeline(vec![vec![clip(base, 0.0, 2.0, 0.0)], vec![c]], None),
+            [base.clone(), top.clone()],
+        )
+    };
+    let mut n = 0;
+    for turn in [90.0, 180.0, 270.0, -90.0, -180.0, 360.0, 450.0, 540.0, -270.0] {
+        for (name, top) in [("testsrc", &m.testsrc), ("noise", &m.noise)] {
+            let mode = modes[n % 9];
+            n += 1;
+            let (tl, assets) = over(top, &m.bars, mode, &|c| c.transform.rotation = turn);
+            blend_check(
+                &format!("checker/e/still {name} turned {turn} {mode:?}"),
+                &tl,
+                &assets,
+                &[0.5],
+                if name == "noise" { BUSY } else { STRICT },
+            );
+        }
+    }
+    for (what, edit) in [
+        (
+            "moved",
+            Box::new(|c: &mut Clip| {
+                c.transform.pos_x = 0.2;
+                c.transform.pos_y = 0.15;
+            }) as Box<dyn Fn(&mut Clip)>,
+        ),
+        ("fading in", Box::new(|c: &mut Clip| c.fade_in = 1.0)),
+    ] {
+        let mode = modes[n % 9];
+        n += 1;
+        let (tl, assets) = over(&m.testsrc, &m.bars, mode, &|c| {
+            c.transform.rotation = 90.0;
+            edit(c);
+        });
+        blend_check(
+            &format!("checker/e/still turned 90 {what} {mode:?}"),
+            &tl,
+            &assets,
+            &[0.5],
+            STRICT,
+        );
+    }
+    for (name, rgb) in [("png640", &m.png640), ("bgr0", &m.bgr0)] {
+        for mode in [
+            BlendMode::Multiply,
+            BlendMode::Difference,
+            BlendMode::Screen,
+            BlendMode::Overlay,
+        ] {
+            let (tl, assets) = over(rgb, &m.bars, mode, &|_| {});
+            blend_check(
+                &format!("checker/e/still {name} over bars {mode:?}"),
+                &tl,
+                &assets,
+                &[0.5],
+                BUSY,
+            );
+            let (tl, assets) = over(&m.testsrc, rgb, mode, &|_| {});
+            blend_check(
+                &format!("checker/e/still testsrc over {name} {mode:?}"),
+                &tl,
+                &assets,
+                &[0.5],
+                BUSY,
+            );
+        }
+    }
+    for mode in modes {
+        let (tl, assets) = over(&m.testsrc2020, &m.bars2020, mode, &|_| {});
+        blend_check(
+            &format!("checker/e/still bt2020 testsrc over bars {mode:?}"),
+            &tl,
+            &assets,
+            &[0.5],
+            STRICT,
+        );
+        let (tl, assets) = over(&m.testsrc2020, &m.gradient2020, mode, &|_| {});
+        blend_check(
+            &format!("checker/e/still bt2020 testsrc over a bt2020 gradient {mode:?}"),
+            &tl,
+            &assets,
+            &[0.5],
+            BUSY,
+        );
+    }
+}
+
+// ---- the blurred fill (`Fit::Blur`) ------------------------------------------------------------------
+
+/// A clip placed by the plain fit whose picture leaves bars sits over a blurred copy of itself (the thumbnail chain of
+/// `engine::cli::blur_fill`: `scale` to cover an eighth of the frame with `flags=bilinear`, `crop`, `boxblur=r:2`, `scale`
+/// back up, the picture's own fit `overlay`ed on it). The still draws the same chain at the still's canvas. Each drawn case
+/// is held to the still **exactly** (`still_planes_differ`: no differing sample in the `yuv444p` planes the still ends in)
+/// and, as the other still cases are, through swscale's RGB conversion with this harness's bounds (whose edge band and PSNR
+/// exist for a truncation the compositor does not copy, and which the planes do not need). The refusals are held with FFmpeg
+/// rendering each.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_blurred_fill_is_drawn_as_the_still_draws_it() {
+    let m = media();
+    // Every drawn case is held twice: through the RGB conversion with the harness's bounds, and exact (`check_planes_exact`).
+    let check = check_planes_exact;
+    let blur = |w, h| Some(Delivery::new(w, h, Fit::Blur));
+    let alone = |a: &Asset, w, h| timeline(vec![vec![clip(a, 0.0, 2.0, 0.0)]], blur(w, h));
+    let one = |a: &Asset| std::slice::from_ref(a).to_vec();
+    // The shapes: portrait in landscape, landscape in portrait, both in a square.
+    check(
+        "blur/portrait in 640x360",
+        &alone(&m.portrait, 640, 360),
+        &one(&m.portrait),
+        &[0.5, 1.2],
+        STRICT,
+    );
+    check(
+        "blur/landscape in 360x640",
+        &alone(&m.testsrc, 360, 640),
+        &one(&m.testsrc),
+        &[0.5, 1.2],
+        STRICT,
+    );
+    check(
+        "blur/portrait in 480x480",
+        &alone(&m.portrait, 480, 480),
+        &one(&m.portrait),
+        &[0.5],
+        STRICT,
+    );
+    check(
+        "blur/landscape in 480x480",
+        &alone(&m.testsrc, 480, 480),
+        &one(&m.testsrc),
+        &[0.5],
+        STRICT,
+    );
+    // Busy pictures and hard edges: the thumbnail's scale and the blur see every sample.
+    check(
+        "blur/noise in 360x640",
+        &alone(&m.noise, 360, 640),
+        &one(&m.noise),
+        &[0.05, 0.1],
+        BUSY,
+    );
+    check(
+        "blur/bars in 360x640",
+        &alone(&m.bars, 360, 640),
+        &one(&m.bars),
+        &[0.5],
+        STRICT,
+    );
+    check(
+        "blur/gradient in 360x640",
+        &alone(&m.gradient, 360, 640),
+        &one(&m.gradient),
+        &[0.5],
+        STRICT,
+    );
+    // The frame sizes: a thumbnail of 2*floor(w/16) by 2*floor(h/16), a radius of a sixteenth of its smaller side.
+    for (w, h) in [(646, 358), (358, 646), (320, 180), (240, 136), (96, 64), (1280, 720)] {
+        check(
+            &format!("blur/portrait in {w}x{h}"),
+            &alone(&m.portrait, w, h),
+            &one(&m.portrait),
+            &[0.5],
+            STRICT,
+        );
+    }
+    // An odd picture (its cover, fit and chroma planes) and a fit with an odd side.
+    check(
+        "blur/odd 641x361 in 360x640",
+        &alone(&m.odd, 360, 640),
+        &one(&m.odd),
+        &[0.5],
+        STRICT,
+    );
+    check(
+        "blur/odd 641x361 in 640x360",
+        &alone(&m.odd, 640, 360),
+        &one(&m.odd),
+        &[0.5],
+        STRICT,
+    );
+    // A picture the shape of the frame has nothing to fill.
+    check(
+        "blur/same shape",
+        &alone(&m.testsrc, 640, 360),
+        &one(&m.testsrc),
+        &[0.5],
+        STRICT,
+    );
+    // Colour: `eq` acts on the whole padded frame, the fill included.
+    let mut graded = clip(&m.portrait, 0.0, 2.0, 0.0);
+    graded.color = Color {
+        brightness: 0.1,
+        contrast: 1.3,
+        saturation: 1.4,
+        gamma: 1.1,
+        temperature: -0.3,
+    };
+    check(
+        "blur/eq",
+        &timeline(vec![vec![graded]], blur(640, 360)),
+        &one(&m.portrait),
+        &[0.5],
+        STRICT,
+    );
+    let mut gray = clip(&m.portrait, 0.0, 2.0, 0.0);
+    gray.effects = vec![kerf_core::VideoEffect::Grayscale];
+    check(
+        "blur/grayscale",
+        &timeline(vec![vec![gray]], blur(640, 360)),
+        &one(&m.portrait),
+        &[0.5],
+        STRICT,
+    );
+    // Over another track (the fill is a whole frame: what is below is covered), and under a picture-in-picture.
+    let tl = timeline(
+        vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![clip(&m.portrait, 0.0, 2.0, 0.0)]],
+        blur(640, 360),
+    );
+    check("blur/over bars", &tl, &[m.bars.clone(), m.portrait.clone()], &[0.5], STRICT);
+    let mut pip = clip(&m.testsrc, 0.0, 2.0, 0.0);
+    pip.transform = Transform {
+        scale: 0.4,
+        pos_x: 0.3,
+        pos_y: -0.25,
+        ..Transform::default()
+    };
+    let tl = timeline(vec![vec![clip(&m.portrait, 0.0, 2.0, 0.0)], vec![pip]], blur(640, 360));
+    check(
+        "blur/under a pip",
+        &tl,
+        &[m.portrait.clone(), m.testsrc.clone()],
+        &[0.5],
+        STRICT,
+    );
+    // Inside a fade, a dissolve and a dip (the fill is part of the padded frame the filters see) and a slide.
+    let mut fading = clip(&m.portrait, 0.0, 2.0, 0.0);
+    fading.fade_in = 1.0;
+    fading.fade_out = 1.0;
+    check(
+        "blur/fade in and out",
+        &timeline(vec![vec![fading]], blur(640, 360)),
+        &one(&m.portrait),
+        &[0.3, 1.7],
+        STRICT,
+    );
+    for (name, kind) in [
+        ("dissolve", TransitionKind::Crossfade),
+        ("dip to black", TransitionKind::DipToBlack),
+        ("slide left", TransitionKind::SlideLeft),
+        ("push up", TransitionKind::PushUp),
+    ] {
+        let mut inc = clip(&m.portrait, 0.0, 2.0, 1.0);
+        inc.transition_in = Some(Transition { kind, duration: 1.0 });
+        let tl = timeline(vec![vec![clip(&m.portrait, 0.0, 1.5, 0.0), inc]], blur(640, 360));
+        check(&format!("blur/{name}"), &tl, &one(&m.portrait), &[1.3, 1.6], STRICT);
+    }
+    // Refused (FFmpeg renders each): what the compositor does not draw of a fill.
+    let refuse = |case: &str, a: &Asset, w, h, why: &'static str| {
+        check_refused(case, &alone(a, w, h), &one(a), 0.5, Refusal::Plan(why));
+    };
+    refuse("blur/refused: 10-bit", &m.tenbit, 360, 640, "not 8-bit `yuv420p`");
+    refuse("blur/refused: 4:4:4", &m.yuv444, 360, 640, "not 8-bit `yuv420p`");
+    refuse(
+        "blur/refused: full-range mjpeg",
+        &m.fullrange,
+        360,
+        640,
+        "not 8-bit `yuv420p`",
+    );
+    refuse("blur/refused: jpeg still", &m.jpeg, 360, 640, "not 8-bit `yuv420p`");
+    refuse("blur/refused: still image", &m.still, 360, 640, "not 8-bit `yuv420p`");
+    // A frame too small for the thumbnail's box blur (a 4x4 thumbnail has 2-sample chroma lines, which `boxblur` reads past:
+    // FFmpeg 9 refuses to configure it at all, FFmpeg 6 reads garbage). The plan says no; there is no still to compare.
+    let plan = RenderPlan::at(
+        &alone(&m.portrait, 32, 32),
+        &one(&m.portrait),
+        &ExportOptions::default(),
+        0.5,
+        policy(),
+    )
+    .expect("plan");
+    let why = reasons(&plan, plan.size(u32::MAX)).join("; ");
+    assert!(why.contains("too small for the thumbnail"), "{why}");
+    // A blur, a sharpen or a vignette on the padded frame would see the fill as picture; a dip to white whitens it.
+    let mut blurred_clip = clip(&m.portrait, 0.0, 2.0, 0.0);
+    blurred_clip.effects = vec![kerf_core::VideoEffect::Blur { sigma: 3.0 }];
+    check_refused(
+        "blur/refused: blur effect on the padded frame",
+        &timeline(vec![vec![blurred_clip]], blur(640, 360)),
+        &one(&m.portrait),
+        0.5,
+        Refusal::Plan("a blur"),
+    );
+    // A clip the fill does not suit is placed with Contain's chain: a zoomed one is drawn as ever.
+    let mut small = clip(&m.portrait, 0.0, 2.0, 0.0);
+    small.transform.scale = 0.5;
+    check(
+        "blur/not taken: zoomed out",
+        &timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![small]], blur(640, 360)),
+        &[m.bars.clone(), m.portrait.clone()],
+        &[0.5],
+        STRICT,
+    );
+}
+
+/// [`check`] and, for each time, exactly: the still's own `yuv444p` planes against the compositor's composite put through the same
+/// conversion ([`still_planes_differ`]), no differing sample. For the cases whose claim is *exact*, which the RGB comparison's
+/// edge band and PSNR cannot make.
+fn check_planes_exact(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64], limits: Limits) {
+    for &t in times {
+        assert_eq!(
+            still_planes_differ(tl, assets, t),
+            (0, 0),
+            "{case} @ {t}: the composite is not the still's"
+        );
+    }
+    check(case, tl, assets, times, limits);
+}
+
+/// The still, exact: its `yuv444p` planes (`timeline_frame_yuv_cancellable`: the composite's samples with the one conversion
+/// the graph ends in, 4:2:0 to 4:4:4) against the compositor's `yuv420p` composite put through the same conversion in a
+/// graph of the same kind. The comparison the RGB one above cannot make: nothing in it truncates differently, so a differing
+/// sample is a difference in the composite. Returns how many samples differ and the largest difference.
+fn still_planes_differ(tl: &Timeline, assets: &[Asset], t: f64) -> (usize, i32) {
+    let opts = ExportOptions::default();
+    let plan = RenderPlan::at(tl, assets, &opts, t, policy()).expect("plan");
+    let size = plan.size(u32::MAX);
+    let (w, h, want) =
+        kerf_core::timeline_frame_yuv_cancellable(tl, assets, &opts, t, size.0, &|| false).expect("the FFmpeg still's planes");
+    assert_eq!((w, h), size);
+    let frames = kerf_gpu::decode_layers(&plan.layers).expect("decode");
+    let drawn = compositor().composite_yuv(&plan, &frames, size).expect("the GPU's planes");
+    let mut raw = drawn.y.clone();
+    raw.extend_from_slice(&drawn.u);
+    raw.extend_from_slice(&drawn.v);
+    let dims = format!("{w}x{h}");
+    let got = {
+        use std::io::Write;
+        let mut child = Command::new(kerf_core::ffmpeg_path())
+            .args([
+                "-hide_banner",
+                "-loglevel",
+                "error",
+                "-nostdin",
+                "-f",
+                "rawvideo",
+                "-pix_fmt",
+                "yuv420p",
+                "-s",
+                &dims,
+                "-i",
+                "pipe:0",
+            ])
+            .args([
+                "-filter_complex",
+                "[0:v]format=yuv444p[o]",
+                "-map",
+                "[o]",
+                "-frames:v",
+                "1",
+                "-f",
+                "rawvideo",
+                "pipe:1",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("run ffmpeg");
+        let mut stdin = child.stdin.take().unwrap();
+        let writer = std::thread::spawn(move || {
+            let _ = stdin.write_all(&raw);
+        });
+        let out = child.wait_with_output().expect("ffmpeg output");
+        let _ = writer.join();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        out.stdout
+    };
+    assert_eq!(got.len(), want.len());
+    let mut n = 0;
+    let mut max = 0;
+    for (a, b) in got.iter().zip(&want) {
+        let d = (i32::from(*a) - i32::from(*b)).abs();
+        n += usize::from(d != 0);
+        max = max.max(d);
+    }
+    (n, max)
 }

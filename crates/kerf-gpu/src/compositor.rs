@@ -20,7 +20,7 @@
 //!    overlaid, clipping out-of-gamut colour and rebuilding the chroma.
 //! 4. **Compose**: rotate (bilinear, as `rotate`), run the clip's `fade` filters on the
 //!    8-bit picture (their own integer arithmetic, [`kerf_core::fade_luma`]; a dip to
-//!    white goes through the RGB round trip of step 3 instead), place at FFmpeg's integer
+//!    white goes through RGB instead: the grade's conversions around its `fade`, `white_planes`), place at FFmpeg's integer
 //!    position and blend onto the canvas — which holds **Y, U, V and alpha**, not
 //!    RGB, because `overlay` blends the encoded YUV planes. (Converting each layer
 //!    to RGB first would clamp it before the blend, and legal-but-out-of-gamut
@@ -44,7 +44,8 @@ use std::time::{Duration, Instant};
 
 use bytemuck::{Pod, Zeroable};
 use kerf_core::{
-    EffectKinds, FadeEdge, FadeTint, GeqEdge, GpuCaps, GradeKinds, Mask, MaskShape, RenderPlan, VideoEffect, YuvMatrix, FADE_FULL,
+    BlendExtras, BlendKinds, EffectKinds, FadeEdge, FadeTint, GeqEdge, GpuCaps, GradeKinds, Mask, MaskShape, RenderPlan,
+    VideoEffect, YuvMatrix, FADE_FULL,
 };
 use wgpu::util::DeviceExt;
 
@@ -55,10 +56,12 @@ use crate::gpu::{Gpu, GpuError};
 use crate::motion::MotionFrames;
 use crate::roundtrip::{Rgb2Yuv, Yuv2Rgb};
 
+mod blend_passes;
 mod grade_passes;
 use crate::source::{chroma_size, decode_layers, YuvFrame};
-use crate::sws::{self, Filter};
+use crate::sws::{self, Filter, Scaler};
 use crate::text::{self, Blend, Raster, Source, TextAtlas};
+use blend_passes::{BlendLayer, BlendPasses, BlendScratch};
 use grade_passes::{grade_geometry_refusal, GradeLook, GradePasses};
 use kerf_core::layer_geometry::{LayerGeometry, Rect, ScaleStage};
 use kerf_core::perspective::{PlacementFrame, PlacementMap, Tables};
@@ -157,6 +160,10 @@ struct ResampleParams {
     taps: i32,
     /// The vertical pass's x86 kernel start constant, or 0 for the C arithmetic (`grade.rs`).
     x86: u32,
+    /// The first row of the scaled picture that swscale's C kernel computes (the last rows of a picture are not
+    /// handed to the SIMD one); only read when `x86` is set.
+    c_from: i32,
+    pad: [i32; 3],
 }
 
 #[repr(C)]
@@ -295,6 +302,9 @@ struct Plane {
 /// How long a frame may take to come back from the GPU before the render gives up.
 const READBACK_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// How many alpha fades a blended clip's chain can run: its fade-in and fade-out, a dip's halves and a dissolve's ramp are five.
+const BLEND_RAMPS: usize = 8;
+
 const PLANE_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R8Unorm;
 const MID_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
 const FILTER_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::R32Float;
@@ -326,24 +336,38 @@ pub struct Compositor {
     /// The RGB round trip of a translucent layer (`roundtrip.wgsl`).
     rt_rgb: wgpu::RenderPipeline,
     rt_luma: wgpu::RenderPipeline,
+    rt_white: wgpu::RenderPipeline,
     rt_chroma_h: wgpu::RenderPipeline,
     rt_chroma_v: wgpu::RenderPipeline,
     rt_v_layout: wgpu::BindGroupLayout,
     /// The grade's passes (`grade.wgsl`).
     grade: GradePasses,
+    /// A blended clip's passes (`blend.wgsl`).
+    blend: BlendPasses,
     /// A 256x3 table that changes nothing, bound when a layer has no `eq`.
     identity_lut: wgpu::TextureView,
     text: TextPass,
     ops: PlaneOps,
     masks: MaskCache,
     vignettes: VignetteMaps,
-    /// What FFmpeg's `geq` does at a plane's last column and row, when the host knows it: else probed.
+    /// What FFmpeg's `geq` does at a plane's last column and row, when pinned ([`Compositor::with_geq_edge`]); else what has been
+    /// measured ([`kerf_core::geq_edge_measured`]: a render never runs the probe, [`prepare`] does).
     geq_edge: Option<GeqEdge>,
     /// `chromakey`'s distance terms ([`effects::chroma_key_terms`]), uploaded by the first keyed frame.
     key_terms: OnceLock<wgpu::Buffer>,
     /// Whether this FFmpeg's conversions to and from RGB are the ones the grade follows, when pinned
-    /// ([`Compositor::with_grade_kernels`]); else measured ([`crate::grade::kernels`]).
+    /// ([`Compositor::with_grade_kernels`]); else what has been measured ([`crate::grade::measured`]: a render never runs the probe,
+    /// [`prepare`] does).
     grade_kernels: Option<crate::grade::Kernels>,
+    /// Whether this FFmpeg's scaler is the model, when pinned ([`Compositor::with_scaler_kernels`]); else measured
+    /// ([`crate::scaler::measured`]).
+    scaler_kernels: Option<crate::scaler::Kernels>,
+    /// Whether this FFmpeg converts a layer into the composite's matrix as the model does, when pinned
+    /// ([`Compositor::with_convert_kernels`]); else what has been measured ([`crate::convert::measured`]).
+    convert_kernels: Option<crate::convert::Kernels>,
+    /// The blend modes this FFmpeg draws as the model does, per matrix, when pinned ([`Compositor::with_blend_kinds`]); else what has
+    /// been measured ([`crate::blend::measured`]).
+    blend_kinds: Option<[BlendKinds; 2]>,
     /// Whether this FFmpeg places a picture as the model does, when a host pinned it
     /// ([`Compositor::with_placement`]); else measured ([`crate::placement_probe::measured`]).
     placement: Option<crate::placement_probe::Placement>,
@@ -363,6 +387,8 @@ struct PlaneOps {
     fade: wgpu::RenderPipeline,
     unsharp: wgpu::RenderPipeline,
     edge: wgpu::RenderPipeline,
+    /// One pass of `boxblur` (the blurred fill).
+    box_blur: wgpu::RenderPipeline,
     blur_layout: wgpu::BindGroupLayout,
     blur_h: wgpu::ComputePipeline,
     blur_v: wgpu::ComputePipeline,
@@ -641,6 +667,24 @@ struct Drawn<'a> {
     fitted: bool,
     /// The frames the layer's chain has passed on before this one (`vignette`'s dither runs on from them).
     count: u64,
+    /// The blurred fill behind a picture that leaves bars (`Fit::Blur`): the thumbnail chain, drawn behind the picture.
+    fill: Option<FillDraw>,
+    /// The layer's matrix is not the composite's and FFmpeg 9 converts it into it before the overlay.
+    converted: Option<Converted>,
+}
+
+/// A layer FFmpeg 9 takes from its own YCbCr matrix into the composite's (`crate::convert`): the matrix it is from.
+#[derive(Debug, Clone, Copy)]
+struct Converted {
+    from: YuvMatrix,
+}
+
+/// The tables of a blurred fill's two scales: the picture to the thumbnail cover (cropped), and the blurred thumbnail
+/// back up to the frame, a set per plane.
+struct FillDraw {
+    fill: kerf_core::blur_fill::BlurFill,
+    down: [PlaneFilters; 3],
+    up: [PlaneFilters; 3],
 }
 
 /// What the `fade` filters of a layer's chain do at this frame, as the passes take them:
@@ -656,6 +700,9 @@ struct LayerFades {
     black: u32,
     alpha: u32,
     ramp: u32,
+    /// A blended clip's fades, which are all alpha fades (in, out, dips and a dissolve's ramp alike): the integer factors in the order the
+    /// chain runs them, [`FADE_FULL`] for the unused (`blend.wgsl`).
+    ramps: [u32; BLEND_RAMPS],
     white_in: u32,
     white_out: u32,
     white_round_trip: bool,
@@ -673,22 +720,38 @@ impl LayerFades {
                 .keyed_alpha
                 .map_or_else(|| (geom.opacity * 255.0).round().clamp(0.0, 255.0) as u32, u32::from),
             ramp: FADE_FULL,
+            ramps: [FADE_FULL; BLEND_RAMPS],
             white_in: FADE_FULL,
             white_out: FADE_FULL,
             white_round_trip: false,
         };
         let motion = plan.mode == kerf_core::PlanMode::Motion;
+        let blended = !layer.blend.is_normal();
+        let mut ramps = 0;
         let mut seen = [false; 5];
         for op in plan.fade_ops(layer) {
+            // A blended clip fades its alpha, whatever the fade: each step is a `fade alpha=1` of its own, run in the order the chain has
+            // them (the clip's fade-in and fade-out, a dip's halves, then a dissolve's ramp), each rounding on its own.
+            if blended {
+                if op.tint != FadeTint::Alpha || ramps == BLEND_RAMPS {
+                    return Err(GpuError::Unsupported(format!(
+                        "layer {}: a {:?} fade on a blended clip, or more fades than its alpha runs",
+                        layer.name, op.tint
+                    )));
+                }
+                fades.ramps[ramps] = op.factor;
+                ramps += 1;
+                continue;
+            }
             let (slot, which) = match (op.tint, op.edge) {
                 (FadeTint::Black, FadeEdge::In) => (&mut fades.fade_in, 0),
                 (FadeTint::Black, FadeEdge::Out) => (&mut fades.fade_out, 1),
                 (FadeTint::Alpha, FadeEdge::In) => (&mut fades.ramp, 2),
                 (FadeTint::White, FadeEdge::In) => (&mut fades.white_in, 3),
                 (FadeTint::White, FadeEdge::Out) => (&mut fades.white_out, 4),
-                (tint, edge) => {
+                (FadeTint::Alpha, FadeEdge::Out) => {
                     return Err(GpuError::Unsupported(format!(
-                        "layer {}: a {tint:?} fade-{edge:?}, which the compositor does not draw",
+                        "layer {}: an alpha fade-out, which only a blended clip has",
                         layer.name
                     )))
                 }
@@ -742,7 +805,7 @@ impl LayerFades {
 
     /// The layer's alpha is below 255 somewhere: the hardware's blend is not FFmpeg's, the integer one is.
     fn blends(&self) -> bool {
-        self.alpha < 255 || self.ramp < FADE_FULL
+        self.alpha < 255 || self.ramp < FADE_FULL || self.ramps.iter().any(|r| *r < FADE_FULL)
     }
 }
 
@@ -798,7 +861,9 @@ fn asking(mut caps: GpuCaps) -> GpuCaps {
 
 /// Do ahead of a frame what a plan needs measured and what takes a while: FFmpeg's `geq`, for a
 /// plan with a mask or a keyed opacity (the export's `geq`), and its conversions to and from RGB, for a plan with a
-/// grade ([`crate::grade::kernels`]; fifteen short child processes at once, once per process: the grade is in the caps only once it is known to match)
+/// grade, a dip to white or a conversion between colour matrices ([`crate::grade::kernels`]; fifteen short child processes at once,
+/// once per process: the grade, the dip and the conversion are in the caps only once it is known to match),
+/// its blend chain for a plan with a blended layer ([`crate::blend::kernels`]: a few dozen short children, six at a time, one measurement whoever asks)
 /// and `drawtext`'s layout for a plan with text ([`crate::text::model`]: one short child process, once per process: text whose glyph bitmaps share
 /// samples is in the caps only once the layout is one the compositor can take apart).
 /// Call it from a blocking thread **off the render lock**, with the plan in hand, so the first such
@@ -807,8 +872,24 @@ pub fn prepare(plan: &RenderPlan) {
     if plan.layers.iter().any(|l| l.mask.is_some() || l.keyed_alpha.is_some()) {
         let _ = kerf_core::geq_edge();
     }
-    if plan.layers.iter().any(|l| !l.grade.is_identity()) {
+    let converts = plan.canvas.policy == kerf_core::CompositeColorPolicy::BottomLayerTag
+        && plan
+            .layers
+            .iter()
+            .any(|l| l.stream.matrix().is_some_and(|m| m != plan.canvas.matrix));
+    // The grade's conversions are in the caps of a grade, of a dip to white (the same conversions around its `fade`) and of a
+    // conversion between matrices (its way in).
+    if converts || plan.layers.iter().any(|l| !l.grade.is_identity() || plan.white_round_trip(l)) {
         let _ = crate::grade::kernels();
+    }
+    if !plan.layers.is_empty() {
+        let _ = crate::scaler::kernels();
+    }
+    if converts {
+        let _ = crate::convert::kernels();
+    }
+    if plan.layers.iter().any(|l| !l.blend.is_normal()) {
+        let _ = crate::blend::kernels();
     }
     prepare_placement(plan);
     prepare_stills(plan);
@@ -833,6 +914,121 @@ fn prepare_stills(plan: &RenderPlan) {
     }
 }
 
+/// [`prepare`] for **every** frame of a timeline, ahead of any: what a cut needs measured, whichever of its frames is drawn
+/// (a grade, a dip to white, a mask or a keyed opacity, text, another colour matrix, a resize). A host that draws a run of frames
+/// (the playback stream, the render bar) calls it once, off the frame loop and the render lock, so that the frames read only what has
+/// been measured ([`Compositor::caps`]) and none of them waits on a probe.
+pub fn prepare_timeline(timeline: &kerf_core::Timeline) {
+    let clips = || timeline.tracks.iter().flat_map(|t| &t.clips);
+    if clips().any(|c| c.mask.is_some() || c.is_keyed(kerf_core::Property::Opacity)) {
+        let _ = kerf_core::geq_edge();
+    }
+    let policy = kerf_core::composite_color_policy();
+    let converts = policy == kerf_core::CompositeColorPolicy::BottomLayerTag;
+    // (A dip to white runs the grade's conversions around its fade; a conversion between matrices reads RGB through them.)
+    if converts || timeline.has_white_dip() || clips().any(|c| !c.grade.is_identity()) {
+        let _ = crate::grade::kernels();
+    }
+    // The scaler is exact in the caps once it is measured, and a resized layer is drawn only then: any cut may resize one.
+    let _ = crate::scaler::kernels();
+    if converts {
+        let _ = crate::convert::kernels();
+    }
+    if clips().any(|c| !c.blend_mode.is_normal()) {
+        let _ = crate::blend::kernels();
+    }
+    // A moving zoom or position is in the caps only where this FFmpeg places a picture as the model does, and a 4:4:4 / 4:2:2
+    // picture under it only where its graph converts it as the decode does (the pixel format is the file's, which a timeline
+    // does not know: both are asked for any placed clip).
+    if clips().any(kerf_core::Clip::placement_animated) {
+        let _ = crate::placement_probe::placement();
+        let _ = crate::conversion::ask();
+    }
+    if !timeline.overlays.is_empty() {
+        let _ = crate::text::model();
+    }
+}
+
+/// Ask the file of every clip of a play's cut whose zoom or position moves for its range, once ([`prepare_ranges`] on the
+/// plan at the middle of each, from the cut's start on): the part of [`prepare`] that depends on the files a cut resolves its
+/// clips to (a proxy is a file of its own), so [`prepare_timeline`] cannot do it. A host that begins a session calls both, off
+/// any lock, and the session then reads only what was measured; what comes into its horizon later is asked by
+/// [`prepare_ranges_ahead`], which costs a `stat` for a file already asked. Where the composite is `FixedBt601`, or the asset
+/// recorded its range, nothing is asked.
+///
+/// The files are asked [`PLACED_FILES_THREADS`] at a time (one `ffprobe` each, bounded by its own timeout) and no new one is
+/// started once [`PLACED_FILES_BUDGET`] has passed, in track order, so this call delays the session by about that and a probe at
+/// most: a file left unasked is refused (FFmpeg's) until the horizon rescan asks it, and one inside the first horizon is asked by
+/// [`prepare_ahead`], one at a time.
+pub fn prepare_placed_files(cut: &kerf_core::PlayCut, timeline: &kerf_core::Timeline) {
+    if cut.canvas().policy == kerf_core::CompositeColorPolicy::FixedBt601 {
+        return;
+    }
+    let start = cut.start();
+    let mut paths: Vec<String> = Vec::new();
+    for clip in timeline
+        .tracks
+        .iter()
+        .flat_map(|t| &t.clips)
+        .filter(|c| c.placement_animated())
+    {
+        let end = clip.timeline_end();
+        if end <= start {
+            continue;
+        }
+        let Ok(plan) = cut.at_frame(cut.frame_at(((clip.timeline_start + end) / 2.0).max(start))) else {
+            continue;
+        };
+        for layer in plan
+            .layers
+            .iter()
+            .filter(|l| plan.pose(l).is_some() && l.stream.color_range.is_none())
+        {
+            if !paths.contains(&layer.path) {
+                paths.push(layer.path.clone());
+            }
+        }
+    }
+    ask_files(&paths, PLACED_FILES_THREADS, PLACED_FILES_BUDGET);
+}
+
+/// How many files [`prepare_placed_files`] asks at once.
+const PLACED_FILES_THREADS: usize = 4;
+/// How long [`prepare_placed_files`] goes on starting new asks.
+const PLACED_FILES_BUDGET: Duration = Duration::from_secs(20);
+
+/// Ask each of `paths` for its range (`kerf_core::source_is_full_range`, remembered) on up to `threads` threads of this call's own,
+/// starting no new one once `budget` has passed; returns when the asks it started are over (each is bounded by the probe's own
+/// timeout). No lock is held.
+fn ask_files(paths: &[String], threads: usize, budget: Duration) {
+    ask_within(paths, threads, budget, |path| {
+        let _ = kerf_core::source_is_full_range(std::path::Path::new(path));
+    });
+}
+
+/// [`ask_files`] with the ask given: `ask` runs once for each path it starts, on one of at most `threads` threads.
+fn ask_within(paths: &[String], threads: usize, budget: Duration, ask: impl Fn(&str) + Sync) {
+    let deadline = Instant::now() + budget;
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let work = || {
+        while Instant::now() < deadline {
+            let Some(path) = paths.get(next.fetch_add(1, std::sync::atomic::Ordering::Relaxed)) else {
+                break;
+            };
+            ask(path);
+        }
+    };
+    match paths.len() {
+        0 => {}
+        1 => work(),
+        n => std::thread::scope(|scope| {
+            for _ in 0..threads.clamp(1, n) {
+                scope.spawn(work);
+            }
+        }),
+    }
+}
+
 /// [`prepare`] for what a moving zoom or position needs: whether this FFmpeg's `pad`, `perspective` and `crop` place a
 /// picture as the model does ([`crate::placement_probe`]: `GpuCaps::placement` and `behaviors` are set only once it is
 /// known to be a match); for a 4:4:4 or 4:2:2 picture, whether its graph converts it as the decode does
@@ -850,7 +1046,7 @@ fn prepare_placement(plan: &RenderPlan) {
         .iter()
         .any(|l| matches!(l.stream.pix_fmt.as_deref(), Some("yuv444p" | "yuv422p")))
     {
-        let _ = crate::conversion::conversion();
+        let _ = crate::conversion::ask();
     }
     prepare_ranges(plan);
 }
@@ -929,8 +1125,11 @@ impl Compositor {
     /// `eq`, opacity, stills, sampled keyframes) and
     ///
     /// * `text`: titles and captions, FFmpeg's own `drawtext` raster blended here ([`crate::text`]);
-    /// * `motion`, `fades`, `transitions`, `dip_white`: fades, dips, dissolves, slides and pushes, in
+    /// * `motion`, `fades`, `transitions`: fades, dips, dissolves, slides and pushes, in
     ///   still plans and in export frames (`tests/motion_parity.rs`);
+    /// * `dip_white`: a dip to white, **where this FFmpeg's conversions to and from RGB are the grade's** (it runs those around its
+    ///   `fade`, exactly; the same probe as `grade`);
+    /// * `keyed_zoom`: a moving zoom drawn last, as FFmpeg's chain has it;
     /// * `keyed_zoom`, `placement`: a moving zoom or position drawn last, as FFmpeg's chain has it: the rest of the
     ///   chain at the fit size, then `pad`, `perspective` and `crop` ([`kerf_core::perspective`], `placement.wgsl`);
     /// * `placed_chroma`: a 4:4:4 or 4:2:2 picture under a placement, **where this FFmpeg's `scale` converts it in a graph as the
@@ -951,13 +1150,25 @@ impl Compositor {
     ///   not run: [`prepare`] runs it) the grade is not in the caps, so the plan refuses a graded layer up front
     ///   and nothing is decoded for a frame the render would refuse.
     ///
+    /// * `mask` and `keyed_opacity` are in [`Compositor::caps`] only once the edge read of FFmpeg's `geq` is known
+    ///   ([`kerf_core::geq_edge_measured`], or [`Compositor::with_geq_edge`]); [`prepare`] measures it.
+    ///
     /// The combinations the plan names (`Unsupported`) stay FFmpeg's.
     /// Each later pass flips its bit beside the pass and its parity cases.
     pub fn caps(&self) -> GpuCaps {
         let mut caps = Self::caps_measured(
             self.grade_kernels.unwrap_or_else(crate::grade::measured),
+            self.scaler_kernels.unwrap_or_else(crate::scaler::measured),
+            self.convert_kernels.unwrap_or_else(crate::convert::measured),
             crate::text::measured_model(),
+            self.blend_kinds.unwrap_or_else(crate::blend::measured),
+            if self.blend_kinds.is_some() {
+                BlendExtras::ALL
+            } else {
+                crate::blend::measured_extras()
+            },
             self.placement.clone().unwrap_or_else(crate::placement_probe::measured),
+            self.geq_edge(),
         );
         if let Some(kinds) = self.still_motion {
             caps.still_motion = kinds;
@@ -975,36 +1186,101 @@ impl Compositor {
         asking(self.caps())
     }
 
-    /// [`Compositor::caps`] for a machine whose FFmpeg's conversions are `kernels`, without a device: the way a host that
-    /// has none to ask (the render bar) says what the GPU draws.
-    pub fn caps_for(kernels: crate::grade::Kernels) -> GpuCaps {
-        Self::caps_with(kernels, crate::text::measured_model())
+    /// [`Compositor::caps`] for a machine whose FFmpeg's conversions are `kernels`, whose scaler is `scaler` and whose conversion
+    /// between colour matrices is `convert`, without a device: the way a host that has none to ask (the render bar) says what the
+    /// GPU draws. Like [`Compositor::caps`], it has no `mask` or `keyed_opacity` while the measured `geq` edge is
+    /// `Unknown`.
+    pub fn caps_for(kernels: crate::grade::Kernels, scaler: crate::scaler::Kernels, convert: crate::convert::Kernels) -> GpuCaps {
+        Self::caps_pinned(
+            kernels,
+            scaler,
+            convert,
+            crate::text::measured_model(),
+            crate::blend::measured(),
+            crate::blend::measured_extras(),
+        )
     }
 
     /// [`Compositor::caps_for`] for a machine whose `drawtext` lays text out as `text` and converts its
     /// colours in a way the compositor knows (`None`: in no way it does, or not probed yet): without that no
-    /// text is drawn, it stays FFmpeg's.
-    pub fn caps_with(kernels: crate::grade::Kernels, text: Option<crate::text::Model>) -> GpuCaps {
-        Self::caps_measured(kernels, text, crate::placement_probe::measured())
+    /// text is drawn, it stays FFmpeg's. `blend` are the blend modes this FFmpeg draws as the model does (per matrix,
+    /// `[BT.601, BT.709]`): only the modes both matrices agree on are in the caps, which are not about one matrix. The scaler
+    /// and the matrix conversion are what this process has measured ([`crate::scaler::measured`], [`crate::convert::measured`]).
+    pub fn caps_with(
+        kernels: crate::grade::Kernels,
+        text: Option<crate::text::Model>,
+        blend: [BlendKinds; 2],
+        extras: BlendExtras,
+    ) -> GpuCaps {
+        Self::caps_pinned(
+            kernels,
+            crate::scaler::measured(),
+            crate::convert::measured(),
+            text,
+            blend,
+            extras,
+        )
+    }
+
+    /// [`Compositor::caps_with`] with the scaler and the matrix conversion given too: every pin the caps are made of but the
+    /// placement's and the `geq` edge's, which are what this process has measured ([`crate::placement_probe::measured`],
+    /// [`kerf_core::geq_edge_measured`]: a mask and a keyed opacity are in these caps only once the edge is known, as in
+    /// [`Compositor::caps`]).
+    pub fn caps_pinned(
+        kernels: crate::grade::Kernels,
+        scaler: crate::scaler::Kernels,
+        convert: crate::convert::Kernels,
+        text: Option<crate::text::Model>,
+        blend: [BlendKinds; 2],
+        extras: BlendExtras,
+    ) -> GpuCaps {
+        Self::caps_measured(
+            kernels,
+            scaler,
+            convert,
+            text,
+            blend,
+            extras,
+            crate::placement_probe::measured(),
+            kerf_core::geq_edge_measured(),
+        )
     }
 
     /// [`Compositor::caps_for`] for judging spans ([`Compositor::session_caps`]): the render bar's.
-    pub fn session_caps_for(kernels: crate::grade::Kernels) -> GpuCaps {
-        asking(Self::caps_for(kernels))
+    pub fn session_caps_for(
+        kernels: crate::grade::Kernels,
+        scaler: crate::scaler::Kernels,
+        convert: crate::convert::Kernels,
+    ) -> GpuCaps {
+        asking(Self::caps_for(kernels, scaler, convert))
     }
 
-    /// [`Compositor::caps_with`] for a machine whose `pad`, `perspective` and `crop` place a picture as `placement` says
-    /// ([`crate::placement_probe`]); the moving zoom and position, and the behaviours drawn by it, are in the caps only on
-    /// a `Match`.
+    /// [`Compositor::caps_pinned`] for a machine whose `pad`, `perspective` and `crop` place a picture as `placement` says
+    /// ([`crate::placement_probe`]) and whose `geq` reads a plane's last column and row as `geq` says: the moving zoom and
+    /// position, and the behaviours drawn by it, are in the caps only on a `Match`, and a mask and a keyed opacity (a `geq`
+    /// the render only reads the edge of) only once the edge is known.
+    #[allow(clippy::too_many_arguments)]
     fn caps_measured(
         kernels: crate::grade::Kernels,
+        scaler: crate::scaler::Kernels,
+        convert: crate::convert::Kernels,
         text: Option<crate::text::Model>,
+        blend: [BlendKinds; 2],
+        extras: BlendExtras,
         placement: crate::placement_probe::Placement,
+        geq: GeqEdge,
     ) -> GpuCaps {
         let mut caps = Self::CAPS;
         if kernels != crate::grade::Kernels::Match {
             caps.grade = GradeKinds::NONE;
         }
+        caps.exact_scaler = scaler.exact();
+        caps.scaler_approximate = !scaler.exact();
+        // A dip to white runs the grade's conversions around its `fade` (swscale's x86 kernel in, the generic scaler out):
+        // it is drawn where the grade's are measured to match, and is FFmpeg's elsewhere.
+        caps.dip_white = kernels == crate::grade::Kernels::Match;
+        // The conversion's way in is the grade's kernel too: the conversion is in the caps where both are measured.
+        caps.matrix_convert = convert.converts() && kernels == crate::grade::Kernels::Match;
         // (Only what has been measured: [`prepare`] asks ahead of a plan that needs it.)
         if placement != crate::placement_probe::Placement::Match {
             caps.placement = false;
@@ -1012,14 +1288,22 @@ impl Compositor {
         }
         caps.placed_chroma = crate::conversion::measured() == crate::conversion::Conversion::Match;
         caps.still_motion = crate::still_probe::measured();
+        // A mask and a keyed opacity are a `geq` that reads a plane's last column and row as this build does, which the render
+        // only reads (`prepare` measures it): until it is known the plan refuses them, up front, rather than the render.
+        if geq == GeqEdge::Unknown {
+            caps.mask = false;
+            caps.keyed_opacity = false;
+        }
         if text.is_none() {
             caps.text = false;
         }
+        caps.blend = blend[0].intersection(blend[1]);
+        caps.blend_extras = extras;
         caps
     }
 
     /// What any compositor of this build draws, without a device and **assuming** the measured things match
-    /// (the grade's conversions: [`Compositor::caps`] is this less the grade where they do not).
+    /// (the grade's conversions and the blend chain: [`Compositor::caps`] is this less what they do not).
     pub const CAPS: GpuCaps = {
         let mut caps = GpuCaps::A0;
         caps.text = true;
@@ -1033,7 +1317,12 @@ impl Compositor {
         caps.keyed_opacity = true;
         caps.keyed_color = true;
         caps.mask = true;
+        caps.exact_scaler = true;
+        caps.blur_fill = true;
+        caps.matrix_convert = true;
         caps.grade = GradeKinds::ALL;
+        caps.blend = BlendKinds::ALL;
+        caps.blend_extras = BlendExtras::ALL;
         caps.effects = EffectKinds::BLUR
             .union(EffectKinds::SHARPEN)
             .union(EffectKinds::GRAYSCALE)
@@ -1043,27 +1332,73 @@ impl Compositor {
         caps
     };
 
-    /// Pin what FFmpeg's `geq` does at a plane's last column and row, instead of measuring the
-    /// ffmpeg this process runs ([`kerf_core::geq_edge`], one child process, on the first masked
-    /// or keyed-opacity frame unless [`prepare`] ran ahead of it): for a host that knows its ffmpeg, and for tests.
+    /// Pin what FFmpeg's `geq` does at a plane's last column and row, instead of what [`prepare`] measured
+    /// ([`kerf_core::geq_edge_measured`]; a render never runs the probe): for a host that knows its ffmpeg, and for tests.
     #[must_use]
     pub fn with_geq_edge(mut self, edge: GeqEdge) -> Self {
         self.geq_edge = Some(edge);
         self
     }
 
-    /// Pin whether this FFmpeg converts to and from RGB as the grade's model does, instead of measuring the ffmpeg
-    /// this process runs ([`crate::grade::kernels`], on the first graded plan unless [`prepare`] ran ahead
-    /// of it): for a host that knows its ffmpeg, and for tests. Anything but `Match` takes the grade out of [`Compositor::caps`].
+    /// Pin whether this FFmpeg converts to and from RGB as the grade's model does, instead of what [`prepare`] measured
+    /// ([`crate::grade::measured`]; a render never runs the probe): for a host that knows its ffmpeg, and for tests. Anything but
+    /// `Match` takes the grade, the dip to white and the conversion between matrices out of [`Compositor::caps`].
     #[must_use]
     pub fn with_grade_kernels(mut self, kernels: crate::grade::Kernels) -> Self {
         self.grade_kernels = Some(kernels);
         self
     }
 
-    /// Pin whether this FFmpeg places a picture as the model does, instead of measuring the ffmpeg this process runs
-    /// ([`crate::placement_probe::placement`], on the first moving zoom unless [`prepare`] ran ahead of it): for a host that
-    /// knows its ffmpeg, and for tests. Anything but `Match` takes the moving zoom and position out of [`Compositor::caps`].
+    /// Pin whether this FFmpeg's scaler is the model, and which vertical kernel it runs, instead of what [`prepare`]
+    /// measured ([`crate::scaler::measured`]; a render never runs the probe): for a host that knows its ffmpeg, and for tests.
+    /// Anything but a match is drawn with the C kernel and takes [`GpuCaps::exact_scaler`] out of [`Compositor::caps`].
+    #[must_use]
+    pub fn with_scaler_kernels(mut self, kernels: crate::scaler::Kernels) -> Self {
+        self.scaler_kernels = Some(kernels);
+        self
+    }
+
+    /// Pin whether this FFmpeg converts a layer into the composite's matrix as the model does, instead of what [`prepare`]
+    /// measured ([`crate::convert::measured`]; a render never runs the probe): for a host that knows its ffmpeg, and for tests. Anything but `Match` takes
+    /// [`GpuCaps::matrix_convert`] out of [`Compositor::caps`].
+    #[must_use]
+    pub fn with_convert_kernels(mut self, kernels: crate::convert::Kernels) -> Self {
+        self.convert_kernels = Some(kernels);
+        self
+    }
+
+    /// The tables of one plane of a scale stage: swscale's for `flag` (`None`: this build's default for an unflagged
+    /// `scale`), padded the way this FFmpeg's scaler pads them, and the vertical pass in the arithmetic it runs
+    /// ([`crate::scaler::measured`]). `None` for a ratio swscale needs two passes for.
+    fn plane_filters(&self, flag: Option<Scaler>, ps: &PlaneStage, chroma: bool) -> Option<PlaneFilters> {
+        let model = self.scaler_kernels.unwrap_or_else(crate::scaler::measured).model();
+        let scaler = model.scaler(flag);
+        let (align_h, align_v) = model.kernel.alignment();
+        let v = sws::table_aligned(scaler, ps.src.h, ps.scaled.1, sws::ONE_VERTICAL, align_v)?;
+        Some(PlaneFilters {
+            h: sws::table_aligned(scaler, ps.src.w, ps.scaled.0, sws::ONE_HORIZONTAL, align_h)?,
+            x86_start: if model.kernel.simd_vertical() && v.size > 1 {
+                crate::scaler::vertical_start(v.size) as u32
+            } else {
+                0
+            },
+            c_rows: if chroma { 1 } else { 2 },
+            v,
+        })
+    }
+
+    /// Pin which blend modes this FFmpeg draws as the model does (per matrix, `[BT.601, BT.709]`; the extras, BT.2020 and RGB
+    /// pictures, are all pinned on), instead of what [`prepare`] measured ([`crate::blend::measured`]; a render never runs the
+    /// probe): for a host that knows its ffmpeg, and for tests. A mode both matrices do not draw is not in [`Compositor::caps`].
+    #[must_use]
+    pub fn with_blend_kinds(mut self, kinds: [BlendKinds; 2]) -> Self {
+        self.blend_kinds = Some(kinds);
+        self
+    }
+
+    /// Pin whether this FFmpeg places a picture as the model does, instead of what [`prepare`] measured
+    /// ([`crate::placement_probe::measured`]; a render never runs the probe): for a host that knows its ffmpeg, and for tests.
+    /// Anything but `Match` takes the moving zoom and position out of [`Compositor::caps`].
     #[must_use]
     pub fn with_placement(mut self, placement: crate::placement_probe::Placement) -> Self {
         self.placement = Some(placement);
@@ -1103,8 +1438,9 @@ impl Compositor {
         }
     }
 
+    /// How this FFmpeg's `geq` reads a plane's edge, as measured (or pinned): a render never runs the probe, `prepare` does.
     fn geq_edge(&self) -> GeqEdge {
-        self.geq_edge.unwrap_or_else(kerf_core::geq_edge)
+        self.geq_edge.unwrap_or_else(kerf_core::geq_edge_measured)
     }
 
     /// Build the pipelines on `gpu`. Fails with a [`GpuError`] — it never panics —
@@ -1258,10 +1594,12 @@ impl Compositor {
             };
             let rt_rgb = rt_pipeline("rt rgb", &compose_layout, "fs_rgb", CANVAS_FORMAT);
             let rt_luma = rt_pipeline("rt luma", &convert_layout, "fs_luma", PLANE_FORMAT);
+            let rt_white = rt_pipeline("rt white", &convert_layout, "fs_white", CANVAS_FORMAT);
             let rt_chroma_h = rt_pipeline("rt chroma h", &convert_layout, "fs_chroma_h", CHROMA_FORMAT);
             let rt_chroma_v = rt_pipeline("rt chroma v", &rt_v_layout, "fs_chroma_v", PLANE_FORMAT);
 
             let grade = GradePasses::new(&g, &rt_shader, &convert_layout, &rt_v_layout);
+            let blend = BlendPasses::new(&g);
 
             let identity: Vec<u8> = (0..3).flat_map(|_| 0..=255u8).collect();
             let identity_lut = Self::lut_texture(&g, &identity);
@@ -1339,10 +1677,12 @@ impl Compositor {
                 convert,
                 rt_rgb,
                 rt_luma,
+                rt_white,
                 rt_chroma_h,
                 rt_chroma_v,
                 rt_v_layout,
                 grade,
+                blend,
                 identity_lut,
                 text: TextPass {
                     layout: text_layout,
@@ -1356,6 +1696,9 @@ impl Compositor {
                 vignettes: VignetteMaps::default(),
                 geq_edge: None,
                 grade_kernels: None,
+                scaler_kernels: None,
+                convert_kernels: None,
+                blend_kinds: None,
                 placement: None,
                 still_motion: None,
                 key_terms: OnceLock::new(),
@@ -1410,6 +1753,7 @@ impl Compositor {
         let fade = render("ops fade", &ops_module, &layout, "fs_fade");
         let unsharp = render("ops unsharp", &ops_module, &layout, "fs_unsharp");
         let edge = render("ops edge", &ops_module, &layout, "fs_edge");
+        let box_blur = render("ops box blur", &ops_module, &layout, "fs_box");
 
         let entry = |binding: u32, ty: wgpu::BindingType, visibility: wgpu::ShaderStages| wgpu::BindGroupLayoutEntry {
             binding,
@@ -1522,6 +1866,7 @@ impl Compositor {
             fade,
             unsharp,
             edge,
+            box_blur,
             blur_layout,
             blur_h,
             blur_v,
@@ -1571,7 +1916,13 @@ impl Compositor {
     }
 
     fn upload(&self, label: &str, w: u32, h: u32, data: &[u8]) -> Plane {
-        let p = self.plane(label, w, h, PLANE_FORMAT, wgpu::TextureUsages::COPY_DST);
+        let p = self.plane(
+            label,
+            w,
+            h,
+            PLANE_FORMAT,
+            wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::COPY_SRC,
+        );
         self.gpu.queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture: &p.texture,
@@ -1763,7 +2114,7 @@ impl Compositor {
             keep.w,
             keep.h,
             PLANE_FORMAT,
-            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
         );
         let base = ResampleParams {
             src_off: [src.x as i32, src.y as i32],
@@ -1774,6 +2125,8 @@ impl Compositor {
             plane: 0,
             taps: filters.h.size as i32,
             x86: 0,
+            c_from: 0,
+            pad: [0; 3],
         };
         let (lut_view, lut_row) = lut.map_or((&self.identity_lut, 0), |(v, r)| (v, r));
         let bind = |params: ResampleParams, view: &wgpu::TextureView, taps: &wgpu::TextureView| {
@@ -1815,6 +2168,7 @@ impl Compositor {
                 plane: lut_row,
                 taps: filters.v.size as i32,
                 x86: filters.x86_start,
+                c_from: stage.scaled.1 as i32 - filters.c_rows as i32,
                 ..base
             },
             &mid.view,
@@ -1822,6 +2176,179 @@ impl Compositor {
         );
         self.pass(enc, &self.resample_v, &out.view, &v, Some(wgpu::Color::BLACK), None);
         out
+    }
+
+    /// The tables of a layer's blurred fill: the picture's scale to the thumbnail's cover (cropped to it) and the
+    /// thumbnail's scale back up to the frame, each plane's, `flags=bilinear` (the chain says so, whatever the
+    /// delivery's scaler). `None` for a ratio swscale needs two passes for.
+    fn fill_draw(&self, n: usize, fill: kerf_core::blur_fill::BlurFill) -> Result<FillDraw, GpuError> {
+        let too_far = || GpuError::Unsupported(format!("layer {n}: a scale ratio swscale needs two passes for"));
+        let (down, up) = Self::fill_stages(&fill);
+        let tables = |stage: &ScaleStage| -> Result<[PlaneFilters; 3], GpuError> {
+            let one = |chroma: bool| {
+                self.plane_filters(Some(Scaler::Bilinear), &plane_stage(stage, chroma), chroma)
+                    .ok_or_else(too_far)
+            };
+            Ok([one(false)?, one(true)?, one(true)?])
+        };
+        Ok(FillDraw {
+            down: tables(&down)?,
+            up: tables(&up)?,
+            fill,
+        })
+    }
+
+    /// The two scales of the fill: picture to the cover, cropped to the thumbnail, and thumbnail to the frame.
+    fn fill_stages(fill: &kerf_core::blur_fill::BlurFill) -> (ScaleStage, ScaleStage) {
+        let (tw, th) = fill.thumb();
+        (
+            ScaleStage {
+                src: Rect::whole(fill.source.0, fill.source.1),
+                scaled: fill.cover,
+                keep: fill.crop,
+            },
+            ScaleStage {
+                src: Rect::whole(tw, th),
+                scaled: fill.frame,
+                keep: Rect::whole(fill.frame.0, fill.frame.1),
+            },
+        )
+    }
+
+    /// `boxblur=r:2` on one plane: the blur along rows twice, then along columns twice, each pass `blur8` of the
+    /// filter (`planeops.wgsl`'s `fs_box`).
+    fn box_blur_plane(&self, enc: &mut wgpu::CommandEncoder, input: &Plane, radius: u32) -> Plane {
+        let length = 2 * radius as i32 + 1;
+        let inv = ((1 << 16) + length / 2) / length;
+        let mut current = input.clone();
+        for axis in [0u32, 0, 1, 1] {
+            let out = self.out_plane("box blur", &current);
+            let params = PlaneOpParams {
+                size: [current.w as i32, current.h as i32],
+                row: radius as i32,
+                amount: inv,
+                kind: axis,
+                black: 0,
+                f_in: 0,
+                f_out: 0,
+            };
+            let bind = self.ops_bind(&params, &current.view, &self.text.blank);
+            self.pass(enc, &self.ops.box_blur, &out.view, &bind, None, None);
+            current = out;
+        }
+        current
+    }
+
+    /// Whether, and how, FFmpeg 9 converts this layer into the composite's matrix, or why this compositor will not draw it.
+    /// The plan has judged the same (`RenderPlan::reasons`, `convert_refusal`); these are the render's own guards.
+    fn converted_of(
+        &self,
+        plan: &RenderPlan,
+        layer: &kerf_core::PlanLayer,
+        geom: &LayerGeometry,
+    ) -> Result<Option<Converted>, GpuError> {
+        if plan.canvas.policy != kerf_core::CompositeColorPolicy::BottomLayerTag || layer.stream.is_rgb() {
+            return Ok(None);
+        }
+        let Some(from) = layer.stream.matrix().filter(|m| *m != plan.canvas.matrix) else {
+            return Ok(None);
+        };
+        let unsupported = |what: &str| {
+            GpuError::Unsupported(format!(
+                "layer {}: a conversion from {from:?} into the composite's {:?} {what}",
+                layer.name, plan.canvas.matrix
+            ))
+        };
+        match self.convert_kernels.unwrap_or_else(crate::convert::measured) {
+            crate::convert::Kernels::Match => {}
+            crate::convert::Kernels::Differs(why) => {
+                return Err(unsupported(&format!(
+                    "because this FFmpeg's conversion is not the one the compositor follows ({why})"
+                )))
+            }
+            crate::convert::Kernels::Unknown => return Err(unsupported("until this FFmpeg's conversion can be measured")),
+        }
+        // The conversion's way in is the grade's kernel.
+        if self.grade_kernels.unwrap_or_else(crate::grade::measured) != crate::grade::Kernels::Match {
+            return Err(unsupported(
+                "until this FFmpeg's conversions to and from RGB are known to match",
+            ));
+        }
+        if plan.mode == kerf_core::PlanMode::Motion && plan.canvas.unread_decider_in_cut {
+            return Err(unsupported(
+                "in a cut whose deciding clip is not read (a blend mode, or a clip on the alpha plane with a colour correction, a grade or an effect)",
+            ));
+        }
+        if let Some(why) = plan.convert_refusal(layer) {
+            return Err(unsupported(&format!("for {why}")));
+        }
+        if (plan.mode == kerf_core::PlanMode::Still || plan.on_alpha_plane(layer))
+            && geom.stages.last().is_some_and(|s| s.scaled != (s.src.w, s.src.h))
+        {
+            return Err(unsupported(
+                "on a layer whose last scale resizes it in a still or while it dissolves (that scale converts the matrix in the same pass)",
+            ));
+        }
+        let off_grid = |(w, h): (u32, u32)| w % 2 != 0 || h % 2 != 0;
+        let filled = layer.blur_fill.is_some() && geom.matte;
+        let effect_on_bars = geom.matte && !filled && !layer.effects.is_empty();
+        if off_grid(geom.layer)
+            || (!filled && (off_grid(geom.picture) || (geom.matte && off_grid(geom.picture_at))))
+            || effect_on_bars
+            || geom.rotation.is_some()
+        {
+            return Err(unsupported(
+                "on a picture of odd size, whose bars meet it off the 4:2:0 grid or carry an effect",
+            ));
+        }
+        Ok(Some(Converted { from }))
+    }
+
+    /// The frame of a blurred fill with the picture on it: per plane, the picture scaled to the thumbnail's cover
+    /// (bilinear) and cropped to it, blurred (`boxblur`), scaled up to the frame (bilinear, through `eq`'s tables
+    /// if the layer has them: the filter runs on the whole padded frame), and `overlay`'s copy of the fitted picture
+    /// (`picture`) on it at the position it centres it at. A chroma sample of the picture lands whole, the half
+    /// block of an odd picture's last column and row included.
+    fn blur_fill_planes(
+        &self,
+        enc: &mut wgpu::CommandEncoder,
+        source: &[Plane; 3],
+        picture: &[Plane; 3],
+        fill: &FillDraw,
+        geom: &LayerGeometry,
+        tables: Option<&wgpu::TextureView>,
+    ) -> [Plane; 3] {
+        let (down, up) = Self::fill_stages(&fill.fill);
+        let frame: [Plane; 3] = std::array::from_fn(|pi| {
+            let chroma = pi > 0;
+            let thumb = self.scale_plane(enc, &source[pi], plane_stage(&down, chroma), &fill.down[pi], None);
+            let blurred = self.box_blur_plane(enc, &thumb, fill.fill.radius);
+            let lut = tables.map(|t| (t, pi as u32));
+            self.scale_plane(enc, &blurred, plane_stage(&up, chroma), &fill.up[pi], lut)
+        });
+        for (pi, (picture, frame)) in picture.iter().zip(&frame).enumerate() {
+            let shift = u32::from(pi > 0);
+            enc.copy_texture_to_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &picture.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &frame.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d {
+                        x: geom.picture_at.0 >> shift,
+                        y: geom.picture_at.1 >> shift,
+                        z: 0,
+                    },
+                    aspect: wgpu::TextureAspect::All,
+                },
+                extent(picture.w, picture.h),
+            );
+        }
+        frame
     }
 
     /// A bind group over one uniform and two textures for a pass of [`PlaneOps`].
@@ -1850,6 +2377,31 @@ impl Compositor {
                 },
             ],
         })
+    }
+
+    /// Wait for everything recorded so far to have run, on a software adapter, before a compute pass reads
+    /// what a render pass wrote: Mesa 23.2's lavapipe starts the dispatch while its rasteriser threads are
+    /// still drawing the texture the dispatch reads (wgpu's barrier is there, the driver does not wait for
+    /// it): a blur after a sharpen, the slowest pass in front of it, read half-drawn rows (Y off by up to
+    /// 210, differently on every run, and exact with `LP_NUM_THREADS=0`). The blur is the compositor's one
+    /// compute pass. A hardware adapter honours the barrier and is never stalled here.
+    fn settle(&self, enc: &mut wgpu::CommandEncoder) -> Result<(), GpuError> {
+        if !self.gpu.is_software() {
+            return Ok(());
+        }
+        let next = self.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("kerf composite"),
+        });
+        let done = std::mem::replace(enc, next);
+        self.gpu.queue.submit(Some(done.finish()));
+        self.gpu
+            .device
+            .poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: Some(READBACK_TIMEOUT),
+            })
+            .map_err(|e| GpuError::Readback(format!("the GPU did not finish within {} s: {e}", READBACK_TIMEOUT.as_secs())))?;
+        Ok(())
     }
 
     /// A new 8-bit plane of the size of `like`, to render into.
@@ -2440,8 +2992,14 @@ impl Compositor {
     }
 
     /// What happens to `layer`'s planes between the scaler and the blend, beyond its fades.
-    fn look_of(&self, layer: &kerf_core::PlanLayer, geom: &LayerGeometry) -> Result<LayerLook, GpuError> {
+    fn look_of(&self, layer: &kerf_core::PlanLayer, geom: &LayerGeometry, resize_ok: bool) -> Result<LayerLook, GpuError> {
         let unsupported = |what: String| GpuError::Unsupported(format!("layer {}: {what}", layer.name));
+        // (The plan refuses the rest: `Unsupported::Rotation`. The only turn drawn is one `rotate` lands on whole samples for.)
+        if geom.rotation.is_some_and(|r| kerf_core::quarter_turn(r.angle).is_none()) {
+            return Err(unsupported(
+                "a rotation that is not a quarter turn FFmpeg's rotate lands on whole samples for".into(),
+            ));
+        }
         let (placed, (pw, ph)) = effect_picture(layer, geom);
         // The grade runs in RGB on the picture the chain has made, at its own size: FFmpeg carries it through
         // `rgb24` and back, and what is reproduced is that for a picture the scaler did not resize, with nothing
@@ -2449,7 +3007,7 @@ impl Compositor {
         // so does this, for a caller that did not ask it).
         let grade = self.grade_look(layer)?;
         if grade.is_some() {
-            if let Some(why) = grade_geometry_refusal(layer, geom) {
+            if let Some(why) = grade_geometry_refusal(layer, geom, resize_ok) {
                 return Err(unsupported(why));
             }
         }
@@ -2799,22 +3357,54 @@ impl Compositor {
             }
             // swscale's tables for every plane of every stage; a ratio it would
             // need two scalers for is FFmpeg's to render.
+            // A delivery that names its scaler (`flags=bicubic` on every fit and zoom `scale`) is that scaler, whatever this build's
+            // unflagged `scale` defaults to; the plan refuses any other name.
+            let named = plan
+                .canvas
+                .scaler
+                .as_deref()
+                .filter(|s| s.eq_ignore_ascii_case("bicubic"))
+                .map(|_| Scaler::Bicubic);
             let mut filters = Vec::with_capacity(geom.stages.len());
             // (A fit picture FFmpeg made has no stage of the compositor's to draw: its scaler is not in play.)
             for stage in geom.stages.iter().filter(|_| fitted.is_none()) {
                 let table = |chroma: bool| -> Result<PlaneFilters, GpuError> {
                     let ps = plane_stage(stage, chroma);
                     let too_far = || GpuError::Unsupported(format!("layer {n}: a scale ratio swscale needs two passes for"));
-                    Ok(PlaneFilters {
-                        h: sws::bicubic(ps.src.w, ps.scaled.0, sws::ONE_HORIZONTAL).ok_or_else(too_far)?,
-                        v: sws::bicubic(ps.src.h, ps.scaled.1, sws::ONE_VERTICAL).ok_or_else(too_far)?,
-                        x86_start: 0,
-                    })
+                    self.plane_filters(named, &ps, chroma).ok_or_else(too_far)
                 };
                 filters.push([table(false)?, table(true)?, table(true)?]);
             }
+            let fill = match plan.blur_fill(layer, size) {
+                // (A picture that fills the frame has no bars to fill: the overlay covers the whole fill.)
+                Ok(Some(fill)) if geom.matte => Some(self.fill_draw(n, fill)?),
+                Ok(_) => None,
+                Err(e) => return Err(GpuError::Unsupported(format!("layer {n}: {e}"))),
+            };
             let fades = LayerFades::of(plan, layer, &geom)?;
-            let look = self.look_of(layer, &geom)?;
+            // A dip to white runs the grade's conversions around its fade: drawn where they are measured to match.
+            if fades.white_round_trip && self.grade_kernels.unwrap_or_else(crate::grade::measured) != crate::grade::Kernels::Match
+            {
+                return Err(GpuError::Unsupported(format!(
+                    "layer {n}: a dip to white until this FFmpeg's conversions to and from RGB are known to match"
+                )));
+            }
+            // `colorchannelmixer` leaves RGBA, `rotate` turns it there and the way back to 4:2:0 comes after the turn; the
+            // round trip here comes before it, and swscale's chroma pairs two pixels of a row and filters over the rows (a
+            // different sum each way), so after a quarter turn the pairs are other samples (the plan says the same).
+            if geom.translucent
+                && geom
+                    .rotation
+                    .is_some_and(|r| kerf_core::quarter_turn(r.angle).is_some_and(|t| t % 2 == 1))
+            {
+                return Err(GpuError::Unsupported(format!(
+                    "layer {n}: a quarter turn of a layer below full opacity (FFmpeg converts the turned RGBA picture to 4:2:0 afterwards: the chroma pairs other samples)"
+                )));
+            }
+            // A graded layer the scaler resizes is the export's where the scaler is exact and an `eq` sits between the
+            // fit scale and the grade (the plan says the same: `RenderPlan::reasons`).
+            let resize_ok = self.scaler_kernels.unwrap_or_else(crate::scaler::measured).exact() && plan.eq_in_chain(layer);
+            let look = self.look_of(layer, &geom, resize_ok)?;
             let placement = self.placement_of(plan, layer, &geom, &fades, size)?;
             // `fade` takes `rgb24` and runs on the picture the grade leaves in RGB (a dip to white is in the
             // chain for every frame of the clip, and converts the picture through RGB itself).
@@ -2823,6 +3413,7 @@ impl Compositor {
                     "layer {n}: a fade to black or white running on a graded layer (FFmpeg fades the RGB picture the grade leaves)"
                 )));
             }
+            let converted = self.converted_of(plan, layer, &geom)?;
             let count = if look.steps.iter().any(|s| matches!(s, Step::Vignette)) {
                 layer_count(plan, n, counts)?
             } else {
@@ -2839,6 +3430,8 @@ impl Compositor {
                 moved,
                 fitted: fitted.is_some(),
                 count,
+                fill,
+                converted,
             });
         }
         // FFmpeg rasterises what text there is, here, before the GPU is touched. Neither the project lock nor
@@ -2935,6 +3528,8 @@ impl Compositor {
 
         // The canvas as it was before a layer that blends, made once the first one needs it.
         let mut before: Option<Plane> = None;
+        // The planes a layer with a blend mode works in, made by the first one.
+        let mut blend_scratch: Option<BlendScratch> = None;
         // The graph's slice threads, read once per draw, by the first layer that is keyed.
         let graph_threads = std::cell::OnceCell::new();
         for Drawn {
@@ -2948,6 +3543,8 @@ impl Compositor {
             moved,
             fitted,
             count,
+            fill,
+            converted,
         } in drawn
         {
             let (cw, ch) = frame.chroma_size();
@@ -2972,6 +3569,7 @@ impl Compositor {
             // A moving zoom or position is the last stage of FFmpeg's chain: the fit scale, the grade, the effects,
             // the mask and the fades all act on the picture at its fit size (a placed layer's geometry ends
             // there), and the placement lays the result on the canvas.
+            let source = planes.clone();
             // A moving still's `perspective` reads the scaled copy FFmpeg made (the frame), and what is drawn from here is
             // the frame-sized picture it makes.
             let mut current = match moved {
@@ -2982,20 +3580,49 @@ impl Compositor {
                 let lut = (si + 1 == geom.stages.len()).then_some(tables.as_ref()).flatten();
                 current = self.scale_stage(&mut enc, &current, stage, &filters[si], lut);
             }
+            // A blurred fill is the frame behind the picture: the picture overlaid on it, and the layer is that whole
+            // frame from here on (a letterbox's bars, drawn as picture).
+            let filled;
+            let geom: &LayerGeometry = match fill {
+                Some(fill) => {
+                    current = self.blur_fill_planes(&mut enc, &source, &current, fill, geom, tables.as_ref());
+                    filled = LayerGeometry {
+                        picture: geom.layer,
+                        picture_at: (0, 0),
+                        picture_shows: geom.layer,
+                        matte: false,
+                        ..geom.clone()
+                    };
+                    &filled
+                }
+                None => geom,
+            };
             if let Some(grade) = &look.grade {
                 current = self.grade_planes(&mut enc, &current, grade)?;
+            }
+            // A layer of another matrix than the composite's is converted into it after the chain's last scale and
+            // `pad`, ahead of its `format` (so a dissolve's alpha plane, which that `format` adds, is not touched): on the
+            // picture, alone, whose 2x2 blocks never share a sample with the bars (black in every matrix).
+            if let Some(c) = converted {
+                current = self.convert_matrix(&mut enc, &current, c.from, plan.canvas.matrix)?;
             }
             for step in &look.steps {
                 current = match step {
                     Step::Table(rows) => self.table_planes(&mut enc, &current, rows),
-                    Step::Blur(g) => self.blur_planes(&mut enc, &current, g),
+                    Step::Blur(g) => {
+                        self.settle(&mut enc)?;
+                        self.blur_planes(&mut enc, &current, g)
+                    }
                     Step::Sharpen(amount) => self.sharpen_planes(&mut enc, &current, *amount),
                     Step::Vignette => self.vignette_planes(&mut enc, &current, *count),
                 };
             }
-            // (Where the placement comes last the planes are shifted here, ahead of it; else
-            // the blend reads them one in from the layer's last column and row.)
-            if look.mask_edge && look.placed {
+            // (Where the placement comes last, or the layer is turned, the planes are shifted here, ahead of the placement's
+            // scale or the turn: `geq` runs on the picture before either, so the row and column it replaces land on whatever
+            // edge of the turned box the turn gives them. Else the blend reads them one in from the layer's last
+            // column and row.)
+            let shifted_here = look.mask_edge && (look.placed || geom.rotation.is_some());
+            if shifted_here {
                 current = self.edge_planes(&mut enc, &current);
             }
             // The mask is the alpha plane (`geq` rewrites it); nothing else gives the layer one but the
@@ -3018,7 +3645,11 @@ impl Compositor {
                 // composite's (BT.601 under a fixed policy, the negotiated one else).
                 let forward = layer.stream.matrix().unwrap_or(YuvMatrix::Bt601);
                 let white = [fades.white_in, fades.white_out];
-                current = self.translucent_planes(&mut enc, &current, forward, plan.canvas.matrix, white)?;
+                current = if geom.translucent {
+                    self.translucent_planes(&mut enc, &current, forward, plan.canvas.matrix, white)?
+                } else {
+                    self.white_planes(&mut enc, &current, forward, plan.canvas.matrix, white)?
+                };
             }
             // What the blend pass still has to do about fades: all of them, unless the placement is last.
             let mut fades = *fades;
@@ -3066,8 +3697,16 @@ impl Compositor {
             let fades = &fades;
             let [py, pu, pv] = &current;
 
-            let (rotate, rot) = match geom.rotation {
-                Some(r) => (1, [r.angle.cos() as f32, r.angle.sin() as f32]),
+            // (Only a quarter turn `rotate` lands on whole samples for is drawn, `look_of` having refused the rest: its cosine and sine are
+            // the exact 0 and ±1 the filter's integer ones come out as, not those of an angle that is a rounded multiple of a quarter.)
+            let (rotate, rot) = match geom.rotation.map(|r| kerf_core::quarter_turn(r.angle)) {
+                Some(Some(turn)) => (1, [[1.0, 0.0], [0.0, 1.0], [-1.0, 0.0], [0.0, -1.0]][usize::from(turn)]),
+                Some(None) => {
+                    return Err(GpuError::Unsupported(format!(
+                        "layer {}: a rotation that is not a quarter turn FFmpeg's rotate lands on whole samples for",
+                        layer.name
+                    )))
+                }
                 None => (0, [1.0, 0.0]),
             };
             let (lw, lh) = geom.layer;
@@ -3092,7 +3731,7 @@ impl Compositor {
                 rotate,
                 tail: 0,
                 has_alpha: u32::from(alpha.is_some()),
-                edge: u32::from(look.mask_edge && !look.placed),
+                edge: u32::from(look.mask_edge && !shifted_here),
                 fade_in: fades.fade_in,
                 fade_out: fades.fade_out,
                 black: fades.black,
@@ -3111,15 +3750,54 @@ impl Compositor {
             let views = [&py.view, &pu.view, &pv.view];
             // `overlay` blends whole chroma samples: the half block an odd layer
             // ends in reaches one pixel past it, carrying the layer's chroma onto
-            // the base's luma. Reproduced for a layer that is not rotated (a
-            // rotated one has soft, partly transparent edges there).
+            // the base's luma. A turned layer is drawn only where `rotate` lands on whole
+            // samples (a quarter turn), so its box is a picture like any other and it
+            // reaches past it the same way.
             let odd = (lw % 2 == 1, lh % 2 == 1);
             let past_x = i64::from(geom.origin.0) + i64::from(lw);
             let past_y = i64::from(geom.origin.1) + i64::from(lh);
-            let tail = rotate == 0 && (odd.0 || odd.1);
+            let tail = odd.0 || odd.1;
             let tx1 = (past_x + i64::from(odd.0)).min(i64::from(ow));
             let ty1 = (past_y + i64::from(odd.1)).min(i64::from(oh));
             let (rx1, ry1) = if tail { (tx1.max(x1), ty1.max(y1)) } else { (x1, y1) };
+
+            // A layer with a blend mode is the clip laid on the canvas, mixed with it in RGB and laid back by its alpha
+            // (`blend.wgsl`). The plan refuses what the chain is not exact for; the pass's own guards say the same.
+            if !layer.blend.is_normal() {
+                let matrix = plan.blend_matrix().ok_or_else(|| {
+                    GpuError::Unsupported(format!("layer {}: a blend in a composite matrix with no tables", layer.name))
+                })?;
+                // (The plan says the same: a quarter turn is drawn, any other angle is a fixed-point edge. An odd frame is refused by
+                // `composite_texts` for every plan.)
+                if geom.matte
+                    || look.placed
+                    || geom.rotation.is_some_and(|r| !kerf_core::is_quarter_turn(r.angle))
+                    || geom.translucent
+                    || geom.stages.iter().any(|s| s.scaled != (s.src.w, s.src.h))
+                {
+                    return Err(GpuError::Unsupported(format!(
+                        "layer {}: a blend mode on a letterboxed, rotated, translucent, resized or placed layer",
+                        layer.name
+                    )));
+                }
+                self.blend_layer(
+                    &mut enc,
+                    &canvas,
+                    &mut blend_scratch,
+                    &BlendLayer {
+                        mode: layer.blend,
+                        tables: crate::blend::Tables::new(matrix),
+                        params,
+                        views,
+                        alpha_plane: alpha.as_ref(),
+                        area: (x0 as u32, y0 as u32, x1 as u32, y1 as u32),
+                        tail: tail.then_some((tx1 as u32, ty1 as u32)),
+                        fades: *fades,
+                        canvas: (ow, oh),
+                    },
+                )?;
+                continue;
+            }
 
             // A layer that blends reads the canvas as it stands, and a pass cannot read what it writes:
             // the region it touches is copied aside first.
@@ -3739,6 +4417,9 @@ struct PlaneFilters {
     /// 0: the vertical pass is swscale's C arithmetic (the scaler of every layer); else the x86 kernel's start
     /// constant (the grade's 4:4:4 -> 4:2:0 chroma, `grade.rs`).
     x86_start: u32,
+    /// With `x86_start`: how many rows at the end of the scaled picture swscale hands to the C kernel (the last
+    /// two of luma, the last of chroma).
+    c_rows: u32,
 }
 
 /// A scale stage as one plane sees it. The chroma planes are half the size
@@ -3790,6 +4471,31 @@ mod tests {
         }
     }
 
+    fn simd_scaler() -> crate::scaler::Kernels {
+        crate::scaler::Kernels::Match(crate::scaler::Model {
+            kernel: crate::scaler::Kernel::X86,
+            default: crate::sws::Scaler::Bicubic,
+        })
+    }
+
+    fn caps_in(
+        kernels: crate::grade::Kernels,
+        scaler: crate::scaler::Kernels,
+        convert: crate::convert::Kernels,
+        text: Option<crate::text::Model>,
+    ) -> GpuCaps {
+        Compositor::caps_measured(
+            kernels,
+            scaler,
+            convert,
+            text,
+            crate::blend::all_modes(),
+            BlendExtras::ALL,
+            Placement::Match,
+            GeqEdge::Exact,
+        )
+    }
+
     fn held(cache: &MaskCache) -> Vec<(u32, u32)> {
         let entries = cache.entries.lock().unwrap();
         entries.iter().map(|(k, _)| (k.1, k.2)).collect()
@@ -3801,18 +4507,91 @@ mod tests {
     #[test]
     fn the_grade_is_in_the_caps_only_where_the_conversions_are_known_to_match() {
         use crate::grade::Kernels;
-        use crate::text::Model;
-        let layout = Some(Model::Shaped);
-        let caps_with = |kernels, layout| Compositor::caps_measured(kernels, layout, Placement::Match);
-        assert_eq!(caps_with(Kernels::Match, layout), Compositor::CAPS);
+        use crate::text::Model as Layout;
+        let layout = Some(Layout::Shaped);
+        assert_eq!(
+            caps_in(Kernels::Match, simd_scaler(), crate::convert::Kernels::Match, layout),
+            Compositor::CAPS
+        );
         assert_eq!(Compositor::CAPS.grade, GradeKinds::ALL);
         for kernels in [Kernels::Differs("a chain"), Kernels::Unknown] {
-            let caps = caps_with(kernels, layout);
+            let caps = caps_in(kernels, simd_scaler(), crate::convert::Kernels::Match, layout);
             assert_eq!(caps.grade, GradeKinds::NONE, "{kernels:?}");
+            // (The conversion between matrices reads RGB through the grade's kernel: it goes with it, and so does a dip to white,
+            // which runs the grade's conversions around its fade.)
+            assert!(!caps.matrix_convert, "{kernels:?}");
+            assert!(!caps.dip_white, "{kernels:?}");
             let mut restored = caps;
             restored.grade = GradeKinds::ALL;
+            restored.matrix_convert = true;
+            restored.dip_white = true;
             assert_eq!(restored, Compositor::CAPS, "{kernels:?}: nothing else moves");
         }
+    }
+
+    /// The scaler is exact in the caps only where it was measured to be swscale's (either kernel), and nothing else moves.
+    #[test]
+    fn the_exact_scaler_is_in_the_caps_only_where_the_scaler_is_known_to_match() {
+        use crate::grade::Kernels;
+        use crate::scaler::{Kernel, Kernels as Scaler, Model};
+        let model = |kernel| Model {
+            kernel,
+            default: crate::sws::Scaler::Bicubic,
+        };
+        let converts = crate::convert::Kernels::Match;
+        let layout = Some(crate::text::Model::Shaped);
+        for scaler in [Scaler::Match(model(Kernel::X86)), Scaler::Match(model(Kernel::C))] {
+            assert!(caps_in(Kernels::Match, scaler, converts, layout).exact_scaler, "{scaler:?}");
+        }
+        for scaler in [Scaler::Differs, Scaler::Unknown] {
+            let caps = caps_in(Kernels::Match, scaler, converts, layout);
+            assert!(!caps.exact_scaler, "{scaler:?}");
+            let mut restored = caps;
+            restored.exact_scaler = true;
+            restored.scaler_approximate = false;
+            assert_eq!(restored, Compositor::CAPS, "{scaler:?}: nothing else moves");
+        }
+    }
+
+    /// The conversion between matrices is in the caps only where it was measured to be swscale's, and nothing else moves.
+    #[test]
+    fn the_matrix_conversion_is_in_the_caps_only_where_it_is_known_to_match() {
+        use crate::convert::Kernels as Convert;
+        use crate::grade::Kernels;
+        let layout = Some(crate::text::Model::Shaped);
+        assert!(caps_in(Kernels::Match, simd_scaler(), Convert::Match, layout).matrix_convert);
+        for convert in [Convert::Differs("an opaque picture"), Convert::Unknown] {
+            let caps = caps_in(Kernels::Match, simd_scaler(), convert, layout);
+            assert!(!caps.matrix_convert, "{convert:?}");
+            let mut restored = caps;
+            restored.matrix_convert = true;
+            assert_eq!(restored, Compositor::CAPS, "{convert:?}: nothing else moves");
+        }
+    }
+
+    /// The blend modes are in the caps as far as this FFmpeg's blend chain was measured to be the model's, in **both** matrices (the
+    /// caps are not about one), and nothing before it was measured.
+    #[test]
+    fn a_blend_mode_is_in_the_caps_only_where_both_matrices_were_measured_to_match() {
+        use crate::grade::Kernels;
+        use kerf_core::BlendMode;
+        let screen = BlendKinds::of(BlendMode::Screen);
+        let add = BlendKinds::of(BlendMode::Add);
+        let caps = |blend| {
+            Compositor::caps_pinned(
+                Kernels::Match,
+                simd_scaler(),
+                crate::convert::Kernels::Match,
+                Some(crate::text::Model::Shaped),
+                blend,
+                BlendExtras::ALL,
+            )
+            .blend
+        };
+        assert_eq!(caps([BlendKinds::NONE; 2]), BlendKinds::NONE);
+        assert_eq!(caps([BlendKinds::ALL; 2]), BlendKinds::ALL);
+        assert_eq!(caps([screen.union(add), screen]), screen);
+        assert_eq!(caps([BlendKinds::ALL, BlendKinds::NONE]), BlendKinds::NONE);
     }
 
     /// The moving zoom and position, and the behaviours drawn by them, are in the caps only where this FFmpeg's `pad`,
@@ -3821,27 +4600,125 @@ mod tests {
     /// and nothing else moves with them.
     #[test]
     fn the_placement_is_in_the_caps_only_where_this_ffmpeg_is_known_to_place_as_the_model_does() {
+        use crate::blend::all_modes;
         use crate::grade::Kernels;
-        use crate::text::Model;
-        let layout = Some(Model::Shaped);
+        let layout = Some(crate::text::Model::Shaped);
+        let converts = crate::convert::Kernels::Match;
         const { assert!(Compositor::CAPS.placement && Compositor::CAPS.behaviors) };
-        assert_eq!(
-            Compositor::caps_measured(Kernels::Match, layout, Placement::Match),
-            Compositor::CAPS
-        );
+        let measured = |placement| {
+            Compositor::caps_measured(
+                Kernels::Match,
+                simd_scaler(),
+                converts,
+                layout,
+                all_modes(),
+                BlendExtras::ALL,
+                placement,
+                GeqEdge::Exact,
+            )
+        };
+        assert_eq!(measured(Placement::Match), Compositor::CAPS);
         for placement in [Placement::Differs("64x32 <- 64x32: 3 samples".into()), Placement::Unknown] {
-            let caps = Compositor::caps_measured(Kernels::Match, layout, placement.clone());
+            let caps = measured(placement.clone());
             assert!(!caps.placement && !caps.behaviors, "{placement:?}");
             let mut restored = caps;
             restored.placement = true;
             restored.behaviors = true;
             assert_eq!(restored, Compositor::CAPS, "{placement:?}: nothing else moves");
         }
-        // What the process has measured is what `caps_with` reads (nothing, in a unit test: not a match).
+        // What the process has measured is what `caps_pinned` reads (nothing, in a unit test: not a match).
         assert_eq!(
-            Compositor::caps_with(Kernels::Match, layout).placement,
+            Compositor::caps_pinned(Kernels::Match, simd_scaler(), converts, layout, all_modes(), BlendExtras::ALL).placement,
             crate::placement_probe::measured() == Placement::Match
         );
+    }
+
+    /// The files of a cut are asked a few at a time and no new one is started past the budget: N files cost about N / threads asks,
+    /// not N, and a long list is cut off instead of running for N probe timeouts.
+    #[test]
+    fn the_placed_files_are_asked_in_parallel_and_not_past_the_budget() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let paths: Vec<String> = (0..8).map(|i| format!("/not/a/file/{i}.mkv")).collect();
+        let (running, peak, done) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0));
+        let ask = |_: &str| {
+            let now = running.fetch_add(1, Ordering::SeqCst) + 1;
+            peak.fetch_max(now, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(60));
+            running.fetch_sub(1, Ordering::SeqCst);
+            done.fetch_add(1, Ordering::SeqCst);
+        };
+        let started = Instant::now();
+        ask_within(&paths, 4, Duration::from_secs(30), ask);
+        assert_eq!(done.load(Ordering::SeqCst), 8, "every file is asked");
+        assert!(
+            (2..=4).contains(&peak.load(Ordering::SeqCst)),
+            "at most four at once, and in parallel"
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(60 * 8),
+            "{:?}: not one after the other",
+            started.elapsed()
+        );
+        // A budget that has passed starts nothing; a short one stops a long list part-way.
+        done.store(0, Ordering::SeqCst);
+        ask_within(&paths, 4, Duration::ZERO, ask);
+        assert_eq!(done.load(Ordering::SeqCst), 0);
+        let long: Vec<String> = (0..400).map(|i| format!("/not/a/file/{i}.mkv")).collect();
+        ask_within(&long, 4, Duration::from_millis(200), ask);
+        let asked = done.load(Ordering::SeqCst);
+        assert!((4..400).contains(&asked), "{asked} of 400 asked inside the budget");
+        // None, and one, are fine.
+        ask_within(&[], 4, Duration::from_secs(1), ask);
+        ask_within(&paths[..1], 4, Duration::from_secs(1), ask);
+        assert_eq!(done.load(Ordering::SeqCst), asked + 1);
+    }
+
+    /// A mask and a keyed opacity are a `geq` whose edge read is known only once it was measured (or pinned): the caps of a host
+    /// that has no compositor (`caps_pinned`, so `caps_for`, `caps_with` and `session_caps_for` too: the render bar's) leave them out
+    /// until then, as `Compositor::caps` does, and nothing else moves with them.
+    #[test]
+    fn a_mask_and_a_keyed_opacity_are_in_the_caps_only_where_the_geq_edge_is_known() {
+        use crate::grade::Kernels;
+        let layout = Some(crate::text::Model::Shaped);
+        let converts = crate::convert::Kernels::Match;
+        let at = |edge| {
+            Compositor::caps_measured(
+                Kernels::Match,
+                simd_scaler(),
+                converts,
+                layout,
+                crate::blend::all_modes(),
+                BlendExtras::ALL,
+                Placement::Match,
+                edge,
+            )
+        };
+        for edge in [GeqEdge::Exact, GeqEdge::Penultimate] {
+            assert_eq!(at(edge), Compositor::CAPS, "{edge:?}");
+        }
+        let caps = at(GeqEdge::Unknown);
+        assert!(!caps.mask && !caps.keyed_opacity);
+        let mut restored = caps;
+        restored.mask = true;
+        restored.keyed_opacity = true;
+        assert_eq!(restored, Compositor::CAPS, "nothing else moves");
+        // The constructors that read what the process measured: nothing is, in a unit test, and a test binary that never ran the
+        // probe is the cold case (the render bar before `prepare_timeline`).
+        if kerf_core::geq_edge_measured() == GeqEdge::Unknown {
+            let pinned = Compositor::caps_pinned(
+                Kernels::Match,
+                simd_scaler(),
+                converts,
+                layout,
+                crate::blend::all_modes(),
+                BlendExtras::ALL,
+            );
+            assert!(!pinned.mask && !pinned.keyed_opacity);
+            let bar = Compositor::session_caps_for(Kernels::Match, simd_scaler(), converts);
+            assert!(!bar.mask && !bar.keyed_opacity);
+            let with = Compositor::caps_with(Kernels::Match, layout, crate::blend::all_modes(), BlendExtras::ALL);
+            assert!(!with.mask && !with.keyed_opacity);
+        }
     }
 
     /// Text is in the caps only where `drawtext`'s layout and colour conversion are ones the compositor
@@ -3852,11 +4729,15 @@ mod tests {
         use crate::grade::Kernels;
         use crate::text::Model;
         const { assert!(Compositor::CAPS.text) };
-        let caps_with = |kernels, layout| Compositor::caps_measured(kernels, layout, Placement::Match);
+        let converts = crate::convert::Kernels::Match;
         for layout in [Some(Model::Shaped), Some(Model::Legacy)] {
-            assert_eq!(caps_with(Kernels::Match, layout), Compositor::CAPS, "{layout:?}");
+            assert_eq!(
+                caps_in(Kernels::Match, simd_scaler(), converts, layout),
+                Compositor::CAPS,
+                "{layout:?}"
+            );
         }
-        let unknown = caps_with(Kernels::Match, None);
+        let unknown = caps_in(Kernels::Match, simd_scaler(), converts, None);
         assert!(!unknown.text);
         let mut restored = unknown;
         restored.text = true;

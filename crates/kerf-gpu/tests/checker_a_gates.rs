@@ -283,10 +283,27 @@ fn placement_child(dir: &Path, mode: &str) {
         plan(&file, Kind::Held, policy, false),
     );
     let gpu = Gpu::new(GpuOptions::for_tests()).expect("a GPU adapter (install mesa-vulkan-drivers for lavapipe)");
-    let compositor = Compositor::new(gpu).expect("a compositor");
+    let unpinned = Compositor::new(std::sync::Arc::clone(&gpu)).expect("a compositor");
+    let compositor = Compositor::new(gpu)
+        .expect("a compositor")
+        .with_scaler_kernels(kerf_gpu::scaler::Kernels::Match(kerf_gpu::scaler::Model::ASSUMED));
     let size = zoom.size(u32::MAX);
 
+    // Cold, scaler unpinned and unmeasured: a held zoom resizes the picture, and an unmeasured scaler is refused, not assumed.
+    assert_eq!(
+        kerf_gpu::scaler::measured(),
+        kerf_gpu::scaler::Kernels::Unknown,
+        "cold scaler"
+    );
+    let unmeasured = composite(&unpinned, &held).expect("a held zoom is drawn with the scaler unmeasured");
+    assert!(unmeasured.contains("not measured to be swscale's"), "{unmeasured}");
+    assert!(
+        !unpinned.caps().exact_scaler && unpinned.caps().scaler_approximate,
+        "cold scaler caps"
+    );
+
     // Cold: nothing measured, so a moving zoom is refused by the caps, quickly, with no process spawned by the render.
+    // (The scaler is pinned: this test is about the placement gate, which a held zoom needs none of.)
     let (calls, started) = (lines(&all), Instant::now());
     assert!(!compositor.caps().placement && !compositor.caps().behaviors, "cold caps");
     let cold = composite(&compositor, &zoom).expect("a cold moving zoom is drawn");

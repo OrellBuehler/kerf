@@ -40,11 +40,11 @@
 //! copy passing on untouched to the last `overlay`, and the copies the blend reads are `select`ed to the window
 //! (the same expression as the `enable`, so the same frames), so every other frame is the composite's, byte for
 //! byte, at the cost of a `split`. In the window: three conversions, a `blend` and three `overlay`s a frame
-//! (1080p on 6.1: ~30 ms a frame, a plain `overlay` ~3 ms). FFmpeg draws it, the GPU compositor refuses it
-//! (`Unsupported::BlendMode`).
+//! (1080p on 6.1: ~30 ms a frame, a plain `overlay` ~3 ms). FFmpeg draws it; the GPU compositor draws the modes and
+//! layers its probe measured as the model (`kerf_gpu::blend`), and refuses the rest (`Unsupported::BlendMode`).
 
 use super::grade::scale_matrix;
-use crate::model::VideoEffect;
+use crate::model::{BlendMode, VideoEffect};
 
 /// How a clip is blended: what [`blend_chains`] needs besides its pads.
 pub(super) struct Blend<'a> {
@@ -63,7 +63,7 @@ pub(super) struct Blend<'a> {
 /// The matrix tag of the composite a clip is blended onto: the bottom layer's (`setparams` names, BT.709 for a
 /// layer the graph labels so, else [`crate::model::frame_matrix`]'s answer). FFmpeg 9 negotiates the bottom
 /// layer's tag across the graph and converts every other layer into it; FFmpeg 6 carries the composite untagged.
-pub(super) fn composite_matrix(label_bt709: bool, frame_matrix: Option<&'static str>) -> Option<&'static str> {
+pub(crate) fn composite_matrix(label_bt709: bool, frame_matrix: Option<&'static str>) -> Option<&'static str> {
     if label_bt709 {
         Some("bt709")
     } else {
@@ -93,13 +93,6 @@ pub(super) fn blend_chains(base: &str, layer: &str, blend: &Blend<'_>, tag: &str
         window,
         matrix,
     } = blend;
-    let (into_rgb, out_of_rgb) = matrix.map_or_else(Default::default, |m| {
-        let m = scale_matrix(m);
-        (
-            format!(":in_color_matrix={m}:in_range=tv"),
-            format!(":out_color_matrix={m}:out_range=tv"),
-        )
-    });
     let mut chains = match window {
         Some(window) => vec![
             format!("[{base}]format=yuv420p,split{}{}", p("m"), p("w")),
@@ -119,22 +112,70 @@ pub(super) fn blend_chains(base: &str, layer: &str, blend: &Blend<'_>, tag: &str
         format!("{}{}{placement}{}", p("c"), p("lo"), p("cc")),
         format!("{}format=yuva420p,lutyuv=a=0{}", p("a"), p("az")),
         format!("{}{}{placement},alphaextract{}", p("az"), p("la"), p("aa")),
-        format!(
-            "{}{}alphamerge,scale=flags=neighbor{into_rgb},format=gbrap{}",
-            p("cc"),
-            p("aa"),
-            p("t")
-        ),
-        format!("{}scale=flags=neighbor{into_rgb},format=gbrap{}", p("b"), p("u")),
-        format!(
-            "{}{}blend=c0_mode={mode}:c1_mode={mode}:c2_mode={mode},scale=flags=neighbor{out_of_rgb},format=yuva420p{}",
-            p("t"),
-            p("u"),
-            p("y")
-        ),
-        format!("{}{}overlay=eof_action=pass[{out}]", p("m"), p("y")),
     ]);
+    chains.extend(colour_chains(
+        (&p("cc"), &p("aa"), &p("b"), &p("m")),
+        mode,
+        *matrix,
+        &p("t"),
+        &p("u"),
+        &p("y"),
+        out,
+    ));
     chains
+}
+
+/// The conversion into RGB, the `blend` and the way back, from the opaque clip on the composite (`cc`), its alpha
+/// plane (`aa`), the composite as it was (`b`) and the same again to be laid under the result (`m`): what
+/// [`blend_chains`] writes after the clip is placed, and what a renderer's probe runs on pictures it made, so that
+/// both are the very text. Ends on `[out]`; `t`, `u` and `y` are the pads it makes, as `[name]`.
+pub(super) fn colour_chains(
+    pads: (&str, &str, &str, &str),
+    mode: &str,
+    matrix: Option<&str>,
+    t: &str,
+    u: &str,
+    y: &str,
+    out: &str,
+) -> Vec<String> {
+    let (cc, aa, b, m) = pads;
+    let (into_rgb, out_of_rgb) = matrix.map_or_else(Default::default, |m| {
+        let m = scale_matrix(m);
+        (
+            format!(":in_color_matrix={m}:in_range=tv"),
+            format!(":out_color_matrix={m}:out_range=tv"),
+        )
+    });
+    vec![
+        format!("{cc}{aa}alphamerge,scale=flags=neighbor{into_rgb},format=gbrap{t}"),
+        format!("{b}scale=flags=neighbor{into_rgb},format=gbrap{u}"),
+        format!("{t}{u}blend=c0_mode={mode}:c1_mode={mode}:c2_mode={mode},scale=flags=neighbor{out_of_rgb},format=yuva420p{y}"),
+        format!("{m}{y}overlay=eof_action=pass[{out}]"),
+    ]
+}
+
+/// The colour half of a blended clip's chain on pictures a renderer makes itself: `[cc]` the composite with the clip
+/// laid on it opaque, `[aa]` the clip's alpha plane, `[b]` and `[m]` the composite as it was (both 8-bit 4:2:0, one size),
+/// `[out]` the frame [`blend_chains`] hands on. `matrix` is the composite's tag ([`composite_matrix`]); `None` for a mode
+/// that is no blend ([`BlendMode::Normal`] has no FFmpeg name). The text a renderer's probe runs is the export's own.
+pub fn blend_colour_graph(mode: BlendMode, matrix: Option<&str>) -> Option<String> {
+    let mode = mode.ffmpeg()?;
+    Some(colour_chains(("[cc]", "[aa]", "[b]", "[m]"), mode, matrix, "[t]", "[u]", "[y]", "out").join(";"))
+}
+
+/// The whole of a blended clip's chain on pictures a renderer makes itself: `[clip]` the clip's `yuva420p` frame, `[base]` the
+/// composite (`yuv420p`), the clip placed at `(x, y)` by the very `overlay` the composite uses (`overlay=x=..:y=..:eof_action=pass`)
+/// and ending on `[out]`. A renderer's probe runs the export's own text on small pictures, placement included. `None` for a mode that is
+/// no blend.
+pub fn blend_probe_graph(mode: BlendMode, (x, y): (i32, i32), matrix: Option<&str>) -> Option<String> {
+    let placement = format!("overlay=x={x}:y={y}:eof_action=pass");
+    let blend = Blend {
+        mode: mode.ffmpeg()?,
+        placement: &placement,
+        window: None,
+        matrix,
+    };
+    Some(blend_chains("base", "clip", &blend, "p", "out").join(";"))
 }
 
 #[cfg(test)]

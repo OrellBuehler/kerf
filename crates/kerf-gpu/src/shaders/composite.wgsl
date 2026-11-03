@@ -31,6 +31,10 @@ struct ResampleParams {
     plane: u32,           // row of the LUT texture
     taps: i32,            // taps per output sample in `filt`
     x86: u32,             // fs_v: 0, swscale's C vertical arithmetic; else the x86 `yuv2yuvX`'s start constant (below)
+    c_from: i32,          // fs_v, x86: the first row of the scaled picture that swscale's C kernel computes
+    pad0: i32,
+    pad1: i32,
+    pad2: i32,
 }
 
 @group(0) @binding(0) var src: texture_2d<f32>;
@@ -65,7 +69,7 @@ fn fs_v(@builtin(position) frag: vec4<f32>) -> @location(0) vec4<f32> {
     var acc = 64 << 12u;
     // The x86 kernel (the grade's chroma, src/grade.rs): each tap is the high half of the 16-bit product, the sum
     // starts from `x86` and is shifted by 3 -- except the picture's last row, which swscale hands to the C kernel.
-    let x86 = rp.x86 != 0u && idx != rp.out_size.y + rp.dst_off.y - 1;
+    let x86 = rp.x86 != 0u && idx < rp.c_from;
     if (x86) {
         acc = i32(rp.x86);
     }

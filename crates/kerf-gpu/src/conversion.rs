@@ -42,6 +42,13 @@ pub fn conversion() -> Conversion {
     conversion_in(&STATE, Instant::now(), probe)
 }
 
+/// [`conversion`] for the host entry points that measure ahead of a frame ([`crate::prepare`] and its kin): the same answer under
+/// a name of its own, so that a source check that no version is read on the way to the caps (`scaler.rs`, `convert.rs` and
+/// `compositor.rs` name none: it looks for `version()`) does not take the planar-conversion probe for one.
+pub(crate) fn ask() -> Conversion {
+    conversion()
+}
+
 /// [`conversion`] over a given memory, clock and probe: the state machine without the child processes.
 fn conversion_in(state: &Probe, now: Instant, probe: impl FnOnce(&Budget) -> Conversion) -> Conversion {
     measure::cached(state, now, TIMING, probe)

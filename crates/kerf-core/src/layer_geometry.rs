@@ -183,7 +183,7 @@ impl Placement {
 /// `max(1, ...)` for it (`engine::cli::zoom_scale`) and the picture keeps a pixel.
 pub(crate) const TINY_SCALE: f64 = 0.01;
 
-fn lrint(d: f64) -> i64 {
+pub(crate) fn lrint(d: f64) -> i64 {
     d.round_ties_even() as i64
 }
 
@@ -198,7 +198,7 @@ pub fn ffmpeg_alpha(op: f64) -> u8 {
 }
 
 /// `av_rescale` for positive operands (`AV_ROUND_NEAR_INF`).
-fn av_rescale(a: i64, b: i64, c: i64) -> i64 {
+pub(crate) fn av_rescale(a: i64, b: i64, c: i64) -> i64 {
     (a * b + c / 2) / c
 }
 
@@ -206,7 +206,7 @@ fn av_rescale(a: i64, b: i64, c: i64) -> i64 {
 /// do to a position: `pad` only runs when there is one `scale`, which has converted
 /// the picture to 4:2:0 whatever format it started in, and `overlay` works on the
 /// 4:2:0 canvas.
-fn even(v: i64) -> i64 {
+pub(crate) fn even(v: i64) -> i64 {
     v & !1
 }
 
@@ -406,9 +406,16 @@ impl LayerGeometry {
             // or column to the padding — measured: a 203-row fit in a 640-row frame
             // is 202 rows in FFmpeg's still, for 4:4:4 and RGB sources too — and
             // what it emits is the whole canvas, bars included.
+            // (Measured on 9.0.2 against FFmpeg's own `pad`: the odd last **column** is always dropped, and the odd last **row** is
+            // dropped when `scale` resampled the picture — it then wrote into the buffer `pad` handed it and `pad` fills the bottom
+            // bar in place, from the chroma block's first row — and kept when `scale` forwarded the decoder's frame untouched
+            // (the picture is already the frame's width and 4:2:0), which `pad` copies whole. A 1 to 13 row picture at the frame's
+            // width keeps every row.) That is the export's graph. A still's `scale` converts the picture to the `yuva420p` its
+            // overlay takes, into `pad`'s buffer, and drops the row too: `RenderPlan::layer_geometry` settles it (`odd_pad`).
+            let resampled = (fw, fh) != (win.w, win.h) || sub != Subsampling::YUV420;
             let (layer, picture_at, picture_shows, matte) = match fit {
                 Fit::Contain | Fit::Blur => {
-                    let shows = (picture.0 & !1, picture.1 & !1);
+                    let shows = (picture.0 & !1, if resampled { picture.1 & !1 } else { picture.1 });
                     (
                         (ow, oh),
                         (origin.0.max(0) as u32, origin.1.max(0) as u32),
@@ -600,6 +607,27 @@ mod tests {
         let g = r420((1000, 1650), (1080, 1080), Fit::Contain, &t()).unwrap();
         assert_eq!(g.picture.1, 1080);
         assert_eq!(g.picture_at.0 % 2, 0);
+    }
+
+    /// `pad` drops the odd last row only of a picture `scale` resampled: a picture that is already the frame's width and 4:2:0 is
+    /// forwarded as the decoder made it, and `pad` copies it whole (measured on 9.0.2: a 3 row picture shows 3 rows, a 360x203
+    /// one made by `scale` shows 202). The odd last column goes either way.
+    #[test]
+    fn an_odd_picture_keeps_its_last_row_when_scale_left_it_alone() {
+        for h in [1u32, 3, 5, 9, 13] {
+            let g = r420((64, h), (64, 36), Fit::Contain, &t()).unwrap();
+            assert_eq!((g.picture, g.picture_shows), ((64, h), (64, h)), "{h}");
+            assert!(g.matte);
+        }
+        // Its width goes odd to even: 3 wide shows 2.
+        let g = r420((3, 64), (36, 64), Fit::Contain, &t()).unwrap();
+        assert_eq!((g.picture, g.picture_shows), ((3, 64), (2, 64)));
+        // Resampled, the row goes: 360x203 shows 202 (the picture of a 16:9 source in a 9:16 frame).
+        let g = r420((640, 360), (360, 640), Fit::Contain, &t()).unwrap();
+        assert_eq!((g.picture, g.picture_shows), ((360, 203), (360, 202)));
+        // A picture that is not 4:2:0 is converted by `scale`: it was resampled.
+        let g = LayerGeometry::resolve((64, 5), (64, 36), Fit::Contain, &t(), S422).unwrap();
+        assert_eq!((g.picture, g.picture_shows), ((64, 5), (64, 4)));
     }
 
     #[test]

@@ -174,7 +174,11 @@ export function resolveLayer(
 		let shows: [number, number];
 		let matte: boolean;
 		if (contain) {
-			shows = [picture[0] & ~1, picture[1] & ~1];
+			// `pad` copies the picture in at a size rounded down to even: the odd last column always goes, the odd last row only when
+			// `scale` resampled the picture (it then wrote into `pad`'s buffer, which `pad` fills in place) or converted it from a
+			// native format that is not 4:2:0 (kerf-core's `resampled`).
+			const resampled = fw !== win.w || fh !== win.h || sub[0] !== YUV420[0] || sub[1] !== YUV420[1];
+			shows = [picture[0] & ~1, resampled ? picture[1] & ~1 : picture[1]];
 			layer = [ow, oh];
 			pictureAt = [Math.max(origin[0], 0), Math.max(origin[1], 0)];
 			matte = shows[0] !== ow || shows[1] !== oh;

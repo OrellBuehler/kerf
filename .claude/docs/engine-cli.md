@@ -461,8 +461,8 @@ so the feature is **only** activated through these forwards — which is what ma
   included in the still). The still's thumbnail is an eighth of the *still's* canvas. The
   `overlay` composes in 8-bit 4:2:0 (its default) except for an HDR clip, fitted ahead of its
   tone-map, which takes `format=yuv420p10` (FFmpeg 4.4 has it) so the fill does not band it; the
-  still tone-maps first, so it keeps the default. The GPU compositor refuses the whole frame (`Unsupported::BlurFill`, still and motion),
-  so the preview is FFmpeg's. Rendered in `cli/blur_rendered.rs` (`#[ignore]`d, 6.1 and 9.0): a
+  still tone-maps first, so it keeps the default. The GPU compositor draws the fill for a clip that takes it (`blur_fill_clip` is the plan's half of `takes_blur_fill`; `.claude/docs/gpu.md`,
+  *The blurred fill*), plane for plane, where the picture is 8-bit `yuv420p` and the scaler is measured exact. Rendered in `cli/blur_rendered.rs` (`#[ignore]`d, 6.1 and 9.0): a
   white / black source in a vertical frame keeps the picture, its bars are the picture blurred
   across the edge (Contain's are black), the still draws the export's frame (3 levels at worst),
   and a half-transparent FFV1 source renders under Blur exactly as under Contain; a 10-bit HLG ramp's
@@ -1751,7 +1751,9 @@ ungated by `cpu::lease`, but niced (`bg_command`) and thread-capped by the still
   (sharp saturated edges) is clipped into the gamut (~25 levels at such edges); along an edge that cuts a 2x2 chroma block (a
   rotated clip's slant, an odd-sized layer's last column / row) the blend takes the block's chroma from one pixel where
   `overlay` weighs it by the block's alpha (up to 80 levels of chroma in those blocks); the bars above stay black. The GPU
-  compositor refuses it (`Unsupported::BlendMode`). Golden: the appended `blend` family.
+  compositor draws it where it is exact (`gpu.md`, "Blend modes"; `colour_chains` / `blend_colour_graph` / `blend_probe_graph` are the text its probe runs,
+  `composite_matrix` is mirrored by `PlanCanvas::blend_tag`): the colour half of the chain is integer arithmetic held to the filters over every value, **`lutyuv=a=255` is `clipval`**
+  (the clip's Y held to 16..235, U and V to 16..240), and `gbrp` is another swscale path than the chain's `gbrap`. Golden: the appended `blend` family.
   **Speed ramps** (`Clip::speed_ramp`: keys of clip-local timeline time, speed and `linear` / `hold`; `model/speed_ramp.rs` is the
   map, `Clip::along` / `local_at_along` its two directions; `clip_timing/ramp.rs` is what the graph prints). Nothing reads
   `speed_mag()` for a ramped clip: the window, the tail, `picture_window`, the handle, the scrub, the plan, the cover and the
