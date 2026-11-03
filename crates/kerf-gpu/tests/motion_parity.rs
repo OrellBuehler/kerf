@@ -10949,7 +10949,7 @@ fn checker_e_r3_odd_sided_unscaled_layers_turned_plain_and_blended() {
 /// fail here until the scaler's lane makes them exact or refuses them (`FormatResize`). Held to the export to the sample: nothing is relaxed, the
 /// test is kept out of the run until that lane has merged.
 #[test]
-#[ignore = "needs lane B's FormatResize refusal (the scaler's cases), and ffmpeg and a GPU adapter"]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn checker_e_r3_odd_sided_layers_the_scaler_resizes_plain() {
     let (failures, known, cases) = r3_odd_sided("resized, plain", true);
     assert!(cases > 40, "{cases} cases");
