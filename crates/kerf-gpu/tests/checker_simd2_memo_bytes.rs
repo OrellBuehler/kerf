@@ -133,6 +133,25 @@ fn checker_simd2_the_memo_holds_what_it_says_it_holds() {
     let (_, beyond) = allocations(|| bicubic(2200 - 65, 10_000, ONE_VERTICAL));
     assert!(beyond > 3, "the 65th newest key took {beyond} allocations: it must be out");
 
+    // Threads that all miss one cold key at once keep one copy of its table, not one each.
+    let (s, d) = (1500u32, 200_000u32);
+    let mark = live();
+    let go = std::sync::Barrier::new(12);
+    let size = std::thread::scope(|scope| {
+        let threads: Vec<_> = (0..12)
+            .map(|_| {
+                scope.spawn(|| {
+                    go.wait();
+                    bytes(&bicubic(s, d, ONE_HORIZONTAL).expect("a table"))
+                })
+            })
+            .collect();
+        threads.into_iter().map(|t| t.join().unwrap()).max().unwrap()
+    });
+    assert!(size > 3 * MIB, "{size}");
+    let kept = live() - mark;
+    assert!(kept < 2 * size, "12 threads on one key left {kept} bytes held of a {size}-byte table");
+
     // Refused ratios take entries too, for no bytes: the tables they push out are rebuilt, the refusals are held.
     for i in 0..70u32 {
         assert!(bicubic(100_000 + i, 100, ONE_HORIZONTAL).is_none());
