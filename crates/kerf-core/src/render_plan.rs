@@ -4572,7 +4572,13 @@ mod tests {
         // Another format flagged `pc` is converted ahead of the graph by FFmpeg 6 (10-bit measured exact) and
         // handled raw by FFmpeg 9, which is told by the flag now rather than guessed from the depth.
         for fmt in ["yuv420p10le", "yuv422p", "yuv444p"] {
-            let graded = |range: Option<&str>, policy| why(stream(fmt, range), policy, &|c| c.color.gamma = 1.4, 0.5);
+            // (A picture flagged `pc` in a still under a negotiated range is refused for it as well: `FullRangeStill`, judged elsewhere.)
+            let graded = |range: Option<&str>, policy| {
+                why(stream(fmt, range), policy, &|c| c.color.gamma = 1.4, 0.5)
+                    .into_iter()
+                    .filter(|u| !matches!(u, Unsupported::FullRangeStill(_)))
+                    .collect::<Vec<_>>()
+            };
             assert_eq!(graded(Some("pc"), CompositeColorPolicy::FixedBt601), vec![], "{fmt}");
             assert!(
                 matches!(
