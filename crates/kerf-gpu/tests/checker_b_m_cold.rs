@@ -290,8 +290,46 @@ fn checker_b_m_a_cold_session_is_refused_by_the_caps_and_primed_by_prepare_timel
     };
     let planner = Planner::new(&timeline, &assets, &ExportOptions::default(), PlanRequest::motion(policy)).expect("planner");
     let gpu = Gpu::new(GpuOptions::for_tests()).expect("a GPU adapter (install mesa-vulkan-drivers for lavapipe)");
-    let comp = Compositor::new(gpu).expect("a compositor");
+    let comp = Compositor::new(std::sync::Arc::clone(&gpu)).expect("a compositor");
     let size = (160, 90);
+    // The caps a host builds without a compositor (the render bar's: `caps_for`, `caps_with`, `caps_pinned`, `session_caps_for`) are
+    // made of what this process has measured: with the `geq` edge unknown a mask and a keyed opacity are not in them, as they are not in
+    // `Compositor::caps`; a compositor pinned to an edge says what the pin says, measured or not.
+    let (grade, scaler, convert) = (Grade::Match, Scaler::Match(Model::ASSUMED), Convert::Match);
+    let static_caps = || {
+        [
+            ("caps_for", Compositor::caps_for(grade, scaler, convert)),
+            ("session_caps_for", Compositor::session_caps_for(grade, scaler, convert)),
+            (
+                "caps_with",
+                Compositor::caps_with(grade, None, all_blends(), kerf_core::BlendExtras::ALL),
+            ),
+            (
+                "caps_pinned",
+                Compositor::caps_pinned(grade, scaler, convert, None, all_blends(), kerf_core::BlendExtras::ALL),
+            ),
+        ]
+    };
+    for (name, caps) in static_caps() {
+        assert!(
+            !caps.mask && !caps.keyed_opacity,
+            "{name}: a mask or a keyed opacity is in the caps of a process that has not measured the geq edge"
+        );
+    }
+    let pinned_caps = |edge| {
+        Compositor::new(std::sync::Arc::clone(&gpu))
+            .expect("a compositor")
+            .with_geq_edge(edge)
+            .caps()
+    };
+    assert!(
+        !pinned_caps(GeqEdge::Unknown).mask && !pinned_caps(GeqEdge::Unknown).keyed_opacity,
+        "pinned unknown"
+    );
+    for edge in [GeqEdge::Exact, GeqEdge::Penultimate] {
+        let caps = pinned_caps(edge);
+        assert!(caps.mask && caps.keyed_opacity, "pinned {edge:?}: {caps:?}");
+    }
 
     let kind_of = |what: &str, u: &Unsupported| -> bool {
         let text = u.to_string();
@@ -341,6 +379,22 @@ fn checker_b_m_a_cold_session_is_refused_by_the_caps_and_primed_by_prepare_timel
 
     // Primed by the timeline alone: the whole cut's probes, once, ahead of any frame.
     kerf_gpu::prepare_timeline(&timeline);
+    assert_ne!(
+        kerf_core::geq_edge_measured(),
+        GeqEdge::Unknown,
+        "prepare_timeline left the geq edge unmeasured"
+    );
+    for (name, caps) in static_caps() {
+        assert!(
+            caps.mask && caps.keyed_opacity,
+            "{name}: the edge is measured and a mask or a keyed opacity is still out of the caps: {caps:?}"
+        );
+    }
+    let still_unknown = pinned_caps(GeqEdge::Unknown);
+    assert!(
+        !still_unknown.mask && !still_unknown.keyed_opacity,
+        "a pin to an unknown edge is overruled by the measurement"
+    );
     let caps = comp.session_caps();
     assert!(
         caps.mask && caps.keyed_opacity,

@@ -11648,3 +11648,68 @@ fn checker_b_a_geq_refusal_in_a_sweep_fails_the_case_instead_of_passing_as_refus
     );
     no_geq_refusal("a case", &[]);
 }
+
+/// Stills: a layer below full opacity under a quarter turn is refused in the still the way it is in an export frame (the still chain turns
+/// the RGBA picture and converts it to 4:2:0 afterwards as well); the upright and half-turned layer keeps the still's translucent ladder (two
+/// levels of chroma, the same for both), and an opaque layer turned a quarter is the still's, to the sample.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_b_r8_a_translucent_quarter_turn_in_a_still_is_refused_and_the_other_turns_are_drawn() {
+    const NEEDLE: &str = "a quarter turn of a layer below full opacity";
+    // (A translucent layer in a still is two levels of chroma off the export upright or turned half: `TRANSLUCENT` in `parity.rs`.)
+    const LADDER: i32 = 2;
+    let mut failures: Vec<String> = Vec::new();
+    let base = media(320, 180, Pat::Edges, Tag::None);
+    let times = [0.1, 0.2];
+    let mut drawn_controls = 0;
+    for (pat, src) in [
+        (Pat::Noise, media(320, 180, Pat::Noise, Tag::None)),
+        (Pat::Test, media(320, 180, Pat::Test, Tag::None)),
+    ] {
+        for (opacity, label) in [(0.6, "0.6"), (0.999, "0.999"), (1.0, "opaque")] {
+            for scale in [1.0, 0.5] {
+                for turn in [0.0, 90.0, 180.0, 270.0, -90.0, 450.0] {
+                    let quarter = turn % 180.0 != 0.0;
+                    let mut c = clip(&src, 0.0, 0.4, 0.0);
+                    c.transform.rotation = turn;
+                    c.transform.opacity = opacity;
+                    c.transform.scale = scale;
+                    let tl = timeline(vec![vec![clip(&base, 0.0, 0.4, 0.0)], vec![c]], None);
+                    let case = format!("checker/b/r8/still {pat:?} opacity {label} turn {turn} scale {scale}");
+                    let out = r4_still(&case, &tl, &dedup(&[&src, &base]), &ExportOptions::default(), &times);
+                    let translucent = opacity < 1.0;
+                    let worst = out.bad.iter().flat_map(|(_, p)| p.iter().map(|d| d.max)).max().unwrap_or(0);
+                    if patched_out() {
+                        continue;
+                    }
+                    if translucent && quarter {
+                        if out.drawn != 0 || out.refused_for(NEEDLE) != out.times {
+                            failures.push(format!(
+                                "{case}: {} drawn, {} of {} refused for the translucent quarter turn ({:?})",
+                                out.drawn,
+                                out.refused_for(NEEDLE),
+                                out.times,
+                                out.reasons
+                            ));
+                        }
+                    } else {
+                        if out.refused_for(NEEDLE) != 0 {
+                            failures.push(format!("{case}: refused for the translucent quarter turn: {:?}", out.reasons));
+                        }
+                        let allowed = if translucent { LADDER } else { 0 };
+                        if worst > allowed {
+                            failures.push(format!(
+                                "{case}: drawn {} stills, {} differ, worst {worst}",
+                                out.drawn,
+                                out.bad.len()
+                            ));
+                        }
+                        drawn_controls += out.drawn;
+                    }
+                }
+            }
+        }
+    }
+    assert!(failures.is_empty(), "{} cases:\n{}", failures.len(), failures.join("\n"));
+    assert!(patched_out() || drawn_controls > 0, "no control was drawn");
+}

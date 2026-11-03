@@ -869,6 +869,9 @@ type Arrangement = (&'static str, (u32, u32), Option<Delivery>, Box<dyn Fn(&mut 
 /// A label, the delivery frame, the clips of each track and the assets they use.
 type TitleCase = (&'static str, Option<Delivery>, Vec<Vec<Clip>>, Vec<Asset>);
 
+/// What the plan says of a layer below full opacity under a quarter turn.
+const TRANSLUCENT_TURN: &str = "a quarter turn of a layer below full opacity";
+
 /// What a family drew and refused, by the label of the group a case belongs to (printed at the end: a group that is refused whole is
 /// said so, not hidden in a pass).
 #[derive(Default)]
@@ -2168,11 +2171,11 @@ fn checker_b_m_an_unmeasured_matrix_conversion_refuses_the_other_clip_and_only_i
     fam.finish("an unmeasured matrix conversion refuses the other clip and only it");
 }
 
-/// A translucent layer (an opacity below 1) turned a quarter, over a base: the compositor draws it. The translucent layer has a ladder of its
-/// own against the export (the RGB round trip `colorchannelmixer` makes it take: chroma within one level, luma exact: `TRANSLUCENT` in
-/// `motion_parity`), and lane E's quarter turns are exact. Turned together they must not add to the ladder: an upright and a half-turned layer
-/// are the controls, the quarter and three-quarter turns the question. A drawn frame beyond the translucent ladder (a level of chroma) is a
-/// failure; the figures of every case are printed.
+/// A translucent layer (an opacity below 1) turned, over a base. The translucent layer has a ladder of its own against the export (the RGB
+/// round trip `colorchannelmixer` makes it take: chroma within one level, luma exact: `TRANSLUCENT` in `motion_parity`). Turned a quarter or
+/// three quarters the RGBA picture is turned before the way back to 4:2:0 and the compositor's round trip is not, so the plan refuses it (a
+/// drawn frame there was up to 25 levels of chroma off); an upright and a half-turned layer are the controls and keep the ladder. A drawn
+/// frame beyond the ladder is a failure, a quarter turn that is drawn is one, and so is a refusal of the upright or half-turned layer.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn checker_b_m_translucent_layers_turned_a_quarter_stay_on_the_translucent_ladder() {
@@ -2201,6 +2204,18 @@ fn checker_b_m_translucent_layers_turned_a_quarter_stay_on_the_translucent_ladde
                         fam.add_known_ladder(&case, &out);
                     } else {
                         fam.add(&case, &out);
+                    }
+                    let quarter = turn % 180.0 != 0.0;
+                    expect_refusal(
+                        &mut fam,
+                        &case,
+                        &out,
+                        TRANSLUCENT_TURN,
+                        if quarter { Want::Refused } else { Want::NotRefused },
+                    );
+                    if quarter && out.drawn != 0 && !patched_out() {
+                        fam.failures
+                            .push(format!("{case}: {} frames of a translucent quarter turn drawn", out.drawn));
                     }
                 }
             }
@@ -2624,4 +2639,176 @@ fn checker_b_m_a_title_over_placed_turned_resized_and_blended_layers() {
     }
     groups.print("a title over placed, turned, resized and blended layers");
     fam.finish("a title over placed, turned, resized and blended layers");
+}
+
+/// The refusal of a translucent quarter turn is exactly that: a constant opacity below 1 (the RGB round trip) under a turn of 90 or 270
+/// degrees. Everything else under a quarter turn is drawn, and drawn to the sample: an opaque layer alone, faded in and out and coming in
+/// through a dissolve, a dip to black, a slide or a push; an opacity keyed (a `geq` alpha on `yuva420p`: a ramp, a constant below 1, a constant
+/// at 1, one key, with a fade); an opacity of exactly 1; the upright and half-turned layers (at the translucent ladder). A turn a hair off a
+/// quarter (within what `rotate` takes for one) is the quarter's, one farther off is another refusal's.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_b_m_the_translucent_quarter_turn_refusal_is_tight() {
+    use kerf_core::{Property, PropertyKey};
+    const LADDER: i32 = 1;
+    let mut fam = Family::default();
+    let mut groups = Groups::default();
+    let under = with_edges(160, 90);
+    let first = media(160, 90, Pat::Bars, Tag::None);
+    let noise = media(160, 90, Pat::Noise, Tag::None);
+    let test = media(160, 90, Pat::Test, Tag::None);
+    // (label, edit of the turned clip, whether its opacity is a constant below 1, the clip comes in through a transition)
+    type Variant = (&'static str, Box<dyn Fn(&mut Clip)>, bool, Option<TransitionKind>);
+    let keyed = |keys: Vec<(f64, f64)>| -> Box<dyn Fn(&mut Clip)> {
+        Box::new(move |c: &mut Clip| {
+            c.set_property_keys(Property::Opacity, keys.iter().map(|&(t, v)| PropertyKey::new(t, v)).collect());
+        })
+    };
+    let variants: Vec<Variant> = vec![
+        ("static 0.6", Box::new(|c| c.transform.opacity = 0.6), true, None),
+        ("static 0.999", Box::new(|c| c.transform.opacity = 0.999), true, None),
+        ("static 0.25", Box::new(|c| c.transform.opacity = 0.25), true, None),
+        (
+            "static 0.6 and faded",
+            Box::new(|c| {
+                c.transform.opacity = 0.6;
+                c.fade_in = 0.15;
+                c.fade_out = 0.15;
+            }),
+            true,
+            None,
+        ),
+        ("static 1.0", Box::new(|c| c.transform.opacity = 1.0), false, None),
+        ("opaque", Box::new(|_| {}), false, None),
+        (
+            "opaque and faded",
+            Box::new(|c| {
+                c.fade_in = 0.15;
+                c.fade_out = 0.15;
+            }),
+            false,
+            None,
+        ),
+        ("keyed ramp", keyed(vec![(0.0, 1.0), (0.3, 0.3)]), false, None),
+        ("keyed constant 0.6", keyed(vec![(0.0, 0.6), (0.3, 0.6)]), false, None),
+        ("keyed constant 1", keyed(vec![(0.0, 1.0), (0.3, 1.0)]), false, None),
+        ("keyed one key 0.6", keyed(vec![(0.0, 0.6)]), false, None),
+        (
+            "keyed ramp and faded in",
+            Box::new({
+                let k = keyed(vec![(0.0, 1.0), (0.3, 0.4)]);
+                move |c| {
+                    k(c);
+                    c.fade_in = 0.15;
+                }
+            }),
+            false,
+            None,
+        ),
+        (
+            "opaque in through a crossfade",
+            Box::new(|_| {}),
+            false,
+            Some(TransitionKind::Crossfade),
+        ),
+        (
+            "opaque in through a dip to black",
+            Box::new(|_| {}),
+            false,
+            Some(TransitionKind::DipToBlack),
+        ),
+        (
+            "opaque in through a slide",
+            Box::new(|_| {}),
+            false,
+            Some(TransitionKind::SlideLeft),
+        ),
+        (
+            "opaque in through a push",
+            Box::new(|_| {}),
+            false,
+            Some(TransitionKind::PushUp),
+        ),
+        (
+            "opaque, faded in, through a crossfade",
+            Box::new(|c| c.fade_in = 0.1),
+            false,
+            Some(TransitionKind::Crossfade),
+        ),
+        (
+            "static 0.6 in through a crossfade",
+            Box::new(|c| c.transform.opacity = 0.6),
+            true,
+            Some(TransitionKind::Crossfade),
+        ),
+        (
+            "keyed ramp in through a crossfade",
+            keyed(vec![(0.0, 1.0), (0.3, 0.4)]),
+            false,
+            Some(TransitionKind::Crossfade),
+        ),
+    ];
+    // 90.000001 degrees is inside what `rotate` takes for a quarter (FLT_EPSILON radians); 90.00001 is not.
+    let turns: [(f64, bool); 9] = [
+        (0.0, false),
+        (90.0, true),
+        (180.0, false),
+        (270.0, true),
+        (-90.0, true),
+        (450.0, true),
+        (360.0, false),
+        (90.000001, true),
+        (90.00001, false),
+    ];
+    for (label, edit, translucent, transition) in &variants {
+        for (turn, quarter) in turns {
+            for (scale, src) in [(1.0, &noise), (0.5625, &test)] {
+                let mut c = clip(src, 0.0, 0.3, if transition.is_some() { 0.3 } else { 0.0 });
+                c.transform.rotation = turn;
+                c.transform.scale = scale;
+                edit(&mut c);
+                let tracks = match transition {
+                    Some(kind) => {
+                        let c = dissolve_into(c, *kind, 0.2);
+                        vec![vec![clip(&first, 0.0, 0.3, 0.0), c]]
+                    }
+                    None => vec![vec![clip(&under, 0.0, 0.3, 0.0)], vec![c]],
+                };
+                let tl = timeline(tracks, None);
+                let case = format!("checker/b/m/translucent-tight {label} turn {turn} scale {scale}");
+                let assets = dedup(&[src, &under, &first]);
+                let secs = if transition.is_some() { 0.6 } else { 0.3 };
+                let Some(out) = sweep_guarded(&case, &tl, &assets, 30.0, secs) else {
+                    continue;
+                };
+                groups.add(&format!("{label}"), &out);
+                let worst = out.bad.iter().flat_map(|b| b.planes.iter().map(|p| p.max)).max().unwrap_or(0);
+                // Drawn frames are the export's; the translucent ladder (one level of chroma) is allowed to an upright or half-turned layer.
+                if *translucent && worst <= LADDER && !quarter {
+                    fam.add_known_ladder(&case, &out);
+                } else {
+                    fam.add(&case, &out);
+                }
+                let refused = *translucent && quarter;
+                if refused {
+                    // (Every frame of the clip is refused; the frames before it, in a transition, are another layer's.)
+                    let n = out.refused_for(TRANSLUCENT_TURN);
+                    if n == 0 && !patched_out() {
+                        fam.failures.push(format!(
+                            "{case}: a translucent quarter turn was not refused for it ({:?})",
+                            out.reasons
+                        ));
+                    }
+                } else {
+                    expect_refusal(&mut fam, &case, &out, TRANSLUCENT_TURN, Want::NotRefused);
+                }
+            }
+        }
+    }
+    groups.print("the translucent quarter-turn refusal");
+    assert!(
+        groups.drawn("opaque") > 0 && groups.drawn("keyed ramp") > 0,
+        "nothing opaque or keyed was drawn"
+    );
+    fam.finish("the translucent quarter-turn refusal is tight");
 }
