@@ -25,8 +25,9 @@ const SURE: f64 = 1e-6;
 /// `a='(keep)*alpha(X,Y)'` writes over an opaque alpha plane. 255 where the clip stays, 0 where it
 /// goes, the feather's ramp between them (`inverted` swaps the two).
 ///
-/// Rows run on the widest SIMD path this CPU has ([`crate::simd`]): the same `f64` operations in the
-/// same order on 2 or 4 samples at a time, so the plane is [`mask_alpha_plane_scalar`]'s, byte for byte.
+/// Rows run on the widest SIMD path this CPU has ([`crate::simd`]): an ellipse's the same `f64` operations
+/// in the same order on 2 or 4 samples at a time, a rectangle's a byte `min` / `max` of a column's alpha
+/// and the row's (`Params::rect_row`), so the plane is [`mask_alpha_plane_scalar`]'s, byte for byte.
 pub fn mask_alpha_plane(mask: &Mask, w: u32, h: u32) -> Vec<u8> {
     plane(mask, w, h, kernel())
 }
@@ -113,17 +114,31 @@ impl Params {
         match (kernel, self.shape) {
             #[cfg(target_arch = "x86_64")]
             // SAFETY: the kernel is `Avx2` only where `simd::path()` found AVX2.
-            (Some(Kernel::Avx2), MaskShape::Rect) => unsafe { x86::rect_row_avx2(self, dy.abs(), dx, out) },
-            #[cfg(target_arch = "x86_64")]
-            // SAFETY: as above.
             (Some(Kernel::Avx2), MaskShape::Ellipse) => unsafe { x86::ellipse_row_avx2(self, dy, dx, out) },
             #[cfg(target_arch = "x86_64")]
             // SAFETY: the kernel is `Sse2` only where `simd::path()` found SSE2.
-            (Some(Kernel::Sse2), MaskShape::Rect) => unsafe { x86::rect_row_sse2(self, dy.abs(), dx, out) },
-            #[cfg(target_arch = "x86_64")]
-            // SAFETY: as above.
             (Some(Kernel::Sse2), MaskShape::Ellipse) => unsafe { x86::ellipse_row_sse2(self, dy, dx, out) },
             _ => self.row_scalar(dy, dx, out),
+        }
+    }
+
+    /// A rectangle's row from `col`, the alpha of each column's offset alone (`px` with a row offset of 0),
+    /// and `r`, the alpha of the row's offset alone. A sample's offset is the larger of its two, and the
+    /// alpha is a monotone function of the offset (each step of `1 - d`, `/ feather`, `clamp`, `* 255`
+    /// and the truncating cast keeps the order, and `inverted` turns it round), so the alpha of the larger
+    /// offset is the smaller of the two alphas, or the larger when inverted. Exactly `px`'s, the `f64`
+    /// arithmetic done once per column and once per row.
+    #[cfg(target_arch = "x86_64")]
+    fn rect_row(&self, kernel: Kernel, col: &[u8], r: u8, out: &mut [u8]) {
+        match (kernel, self.inverted) {
+            // SAFETY: the kernel is `Avx2` only where `simd::path()` found AVX2.
+            (Kernel::Avx2, false) => unsafe { x86::min_row_avx2(col, r, out) },
+            // SAFETY: as above.
+            (Kernel::Avx2, true) => unsafe { x86::max_row_avx2(col, r, out) },
+            // SAFETY: the kernel is `Sse2` only where `simd::path()` found SSE2.
+            (Kernel::Sse2, false) => unsafe { x86::min_row_sse2(col, r, out) },
+            // SAFETY: as above.
+            (Kernel::Sse2, true) => unsafe { x86::max_row_sse2(col, r, out) },
         }
     }
 }
@@ -156,7 +171,17 @@ fn plane(mask: &Mask, w: u32, h: u32, kernel: Option<Kernel>) -> Vec<u8> {
         }),
     };
     let mut out = vec![0u8; (w as usize) * (h as usize)];
-    for (y, row) in out.chunks_exact_mut(w.max(1) as usize).enumerate() {
+    let rows = out.chunks_exact_mut(w.max(1) as usize).enumerate();
+    #[cfg(target_arch = "x86_64")]
+    if let (MaskShape::Rect, Some(kernel)) = (params.shape, kernel) {
+        // (`px` with a column's offset and none for the row is the alpha at that offset, and the other way round.)
+        let col: Vec<u8> = dx.iter().map(|dx| params.px(*dx, 0.0, 0.0)).collect();
+        for (y, row) in rows {
+            params.rect_row(kernel, &col, params.px(0.0, dy[y], dy[y].abs()), row);
+        }
+        return out;
+    }
+    for (y, row) in rows {
         params.row(kernel, dy[y], &dx, row);
     }
     out
