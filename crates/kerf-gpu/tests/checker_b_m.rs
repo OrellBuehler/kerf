@@ -2690,6 +2690,31 @@ fn checker_b_m_the_translucent_quarter_turn_refusal_is_tight() {
             None,
         ),
         ("keyed ramp", keyed(vec![(0.0, 1.0), (0.3, 0.3)]), false, None),
+        // (A keyed opacity overrules the static one: the export writes no `colorchannelmixer` for it.)
+        (
+            "static 0.6 under a keyed ramp",
+            Box::new({
+                let k = keyed(vec![(0.0, 1.0), (0.3, 0.3)]);
+                move |c| {
+                    c.transform.opacity = 0.6;
+                    k(c);
+                }
+            }),
+            false,
+            None,
+        ),
+        (
+            "static 0.6 under keyed constant 1",
+            Box::new({
+                let k = keyed(vec![(0.0, 1.0), (0.3, 1.0)]);
+                move |c| {
+                    c.transform.opacity = 0.6;
+                    k(c);
+                }
+            }),
+            false,
+            None,
+        ),
         ("keyed constant 0.6", keyed(vec![(0.0, 0.6), (0.3, 0.6)]), false, None),
         ("keyed constant 1", keyed(vec![(0.0, 1.0), (0.3, 1.0)]), false, None),
         ("keyed one key 0.6", keyed(vec![(0.0, 0.6)]), false, None),
