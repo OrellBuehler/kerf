@@ -28,15 +28,23 @@ const TIMING: Timing = Timing {
 
 static STATE: Probe = Probe::new();
 
-/// The pictures: `(width, height, sigma)`.
-const CASES: [(usize, usize, f64); 6] = [
-    (37, 23, 2.5),
-    (66, 38, 0.7),
-    (66, 38, 9.0),
-    (130, 46, 40.0),
-    (97, 61, 300.0),
-    (16, 16, 1.5),
+/// The pictures: `(width, height, sigma, seed)`. The first three are **chosen to tell the fused recursion from the unfused one**: the
+/// two differ by a level on a few samples in a hundred thousand, so a small picture of noise does not show it (an unfused build
+/// matched six of them), and these are seeds found by running both models over a few hundred until one picture held five or more
+/// samples where they disagree (6, 8 and 5, a test holds it). The last three are small and odd-sided, for the kernels' tails.
+const CASES: [(usize, usize, f64, u64); 6] = [
+    (160, 96, 250.0, 123),
+    (160, 96, 1024.0, 34),
+    (160, 96, 100.0, 211),
+    (37, 23, 2.5, 1),
+    (66, 38, 9.0, 2),
+    (97, 61, 40.0, 3),
 ];
+
+/// The generator of a case's noise (the three planes, one after the other).
+fn noise(seed: u64) -> Lcg {
+    Lcg(seed.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ 0x2b99_17f3_0c5a_6d41)
+}
 
 /// What is known without running anything: the measured answer, else [`Blur::Unknown`]. What the compositor's caps are made from.
 pub fn measured() -> Blur {
@@ -70,8 +78,8 @@ fn probe(budget: &Budget) -> Blur {
 
 /// [`probe`] with `cpu` ahead of FFmpeg's other arguments (the tests run it with `-cpuflags 0`, a machine with none of the SIMD kernels).
 fn probe_with(budget: &Budget, cpu: &[&str]) -> Blur {
-    let mut rng = Lcg(0x2b99_17f3_0c5a_6d41);
-    for (w, h, sigma) in CASES {
+    for (w, h, sigma, seed) in CASES {
+        let mut rng = noise(seed);
         let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
         let planes = [rng.bytes(w * h), rng.bytes(cw * ch), rng.bytes(cw * ch)];
         let raw: Vec<u8> = planes.iter().flatten().copied().collect();
@@ -306,15 +314,71 @@ mod tests {
         assert_eq!((bad_total, bad_mul), (0, 0), "first {bad_fma:?}");
     }
 
-    /// The probe has teeth: FFmpeg run with none of its SIMD kernels (`-cpuflags 0`: `gblur`'s C loop, which does not fuse) is not the
-    /// model, and the probe says `Differs`, not `Match`.
+    /// `gblur` as the portable C loop writes it: the product rounded before the sum.
+    fn unfused_plane(src: &[u8], w: usize, h: usize, g: &crate::effects::Gaussian) -> Vec<u8> {
+        let mut buf: Vec<f32> = src.iter().map(|v| f32::from(*v)).collect();
+        for row in buf.chunks_exact_mut(w) {
+            row[0] *= g.boundary;
+            for x in 1..w {
+                row[x] += g.nu * row[x - 1];
+            }
+            row[w - 1] *= g.boundary;
+            for x in (1..w).rev() {
+                row[x - 1] += g.nu * row[x];
+            }
+        }
+        for x in 0..w {
+            buf[x] *= g.boundary;
+            for y in 1..h {
+                buf[y * w + x] += g.nu * buf[(y - 1) * w + x];
+            }
+            buf[(h - 1) * w + x] *= g.boundary;
+            for y in (1..h).rev() {
+                buf[(y - 1) * w + x] += g.nu * buf[y * w + x];
+            }
+        }
+        buf.iter()
+            .map(|v| (v * g.post).clamp(0.0, 255.0).round_ties_even() as u8)
+            .collect()
+    }
+
+    /// The first three pictures tell the fused recursion from the unfused one by construction: the two models disagree on at least five
+    /// samples of each, so a build that does not fuse cannot pass the probe by luck.
+    #[test]
+    fn the_probes_chosen_pictures_tell_the_fused_recursion_from_the_unfused_one() {
+        for (w, h, sigma, seed) in &CASES[..3] {
+            let (w, h) = (*w, *h);
+            let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+            let mut rng = noise(*seed);
+            let planes = [rng.bytes(w * h), rng.bytes(cw * ch), rng.bytes(cw * ch)];
+            let g = gaussian(*sigma).unwrap();
+            let apart: usize = planes
+                .iter()
+                .zip([(w, h), (cw, ch), (cw, ch)])
+                .map(|(p, (pw, ph))| {
+                    let (fused, plain) = (blur_plane(p, pw, ph, &g), unfused_plane(p, pw, ph, &g));
+                    fused.iter().zip(&plain).filter(|(a, b)| a != b).count()
+                })
+                .sum();
+            assert!(
+                apart >= 5,
+                "{w}x{h} sigma {sigma} seed {seed}: the models disagree on {apart} samples"
+            );
+        }
+    }
+
+    /// The probe has teeth: FFmpeg run without its AVX2 and AVX-512 kernels (`-cpuflags -avx2-avx512`: SSE4's horizontal pass, the C
+    /// vertical one), or with no SIMD at all (`-cpuflags 0`: the C loop, which does not fuse), is not the model, and the probe says
+    /// `Differs`, not `Match`.
     #[test]
     #[ignore = "needs ffmpeg"]
     #[allow(clippy::print_stderr)]
-    fn a_build_with_no_simd_kernels_is_differs() {
-        let found = probe_with(&Budget::new(&TIMING), &["-cpuflags", "0"]);
-        eprintln!("gblur with -cpuflags 0: {found:?}");
-        assert!(matches!(found, Blur::Differs(_)), "{found:?}");
+    fn a_build_without_the_fused_kernels_is_differs() {
+        for flags in [["-cpuflags", "0"], ["-cpuflags", "-avx2-avx512"]] {
+            let found = probe_with(&Budget::new(&TIMING), &flags);
+            eprintln!("gblur with {flags:?}: {found:?}");
+            assert!(matches!(found, Blur::Differs(_)), "{flags:?}: {found:?}");
+        }
     }
 
     /// The probe itself, on the FFmpeg in use (`#[ignore]`d: it needs one). It must be able to tell, and says the same twice.
