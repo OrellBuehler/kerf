@@ -855,6 +855,17 @@ fn sweep_guarded(case: &str, tl: &Timeline, assets: &[Asset], fps: f64, secs: f6
     guarded(case, || sweep_try(case, tl, assets, fps, secs)).flatten()
 }
 
+/// The edit a case makes to its clip.
+type Edit = Box<dyn Fn(&mut Clip)>;
+/// A case's label, the size of its source, the delivery frame it is fitted into and the edit of its clip.
+type Variant = (&'static str, (u32, u32), Option<Delivery>, Edit);
+/// A label and the edit of a clip.
+type Labelled = (&'static str, Edit);
+/// A [`Variant`] and whether a scale resizes its picture.
+type Resizing = (&'static str, (u32, u32), Option<Delivery>, Edit, bool);
+/// A [`Variant`] whose edit takes the outgoing and the incoming clip of a transition.
+type Arrangement = (&'static str, (u32, u32), Option<Delivery>, Box<dyn Fn(&mut Clip, &mut Clip)>);
+
 /// What a family drew and refused, by the label of the group a case belongs to (printed at the end: a group that is refused whole is
 /// said so, not hidden in a pass).
 #[derive(Default)]
@@ -999,7 +1010,7 @@ fn checker_b_m_placement_over_resizes_letterboxes_and_odd_fits() {
                 &group,
                 &format!("checker/b/m/place {w}x{h} {label} {pose:?} alone"),
                 &tl,
-                &[noise.clone()],
+                std::slice::from_ref(&noise),
                 0.4,
             );
             if i < 6 {
@@ -1059,7 +1070,7 @@ fn checker_b_m_placement_over_pixel_formats() {
                     &format!("{pix} {size}"),
                     &format!("checker/b/m/place-fmt {pix} {size} {pose:?}"),
                     &tl,
-                    &[asset.clone()],
+                    std::slice::from_ref(&asset),
                     0.4,
                 );
             }
@@ -1097,7 +1108,7 @@ fn checker_b_m_placement_over_the_odd_pad() {
                 &label,
                 &format!("checker/b/m/place-odd {w}x{h} {pose:?}"),
                 &tl,
-                &[asset.clone()],
+                std::slice::from_ref(&asset),
                 0.4,
             );
         }
@@ -1111,7 +1122,6 @@ fn checker_b_m_placement_over_the_odd_pad() {
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn checker_b_m_placement_resizes_and_pads_through_a_transition() {
-    type Edit = Box<dyn Fn(&mut Clip, &mut Clip)>;
     let mut fam = Family::default();
     let mut groups = Groups::default();
     let kinds = [
@@ -1123,7 +1133,7 @@ fn checker_b_m_placement_resizes_and_pads_through_a_transition() {
     ];
     // (label, source of the clips, delivery, edit of (outgoing, incoming))
     let wide = Some(Delivery::new(160, 90, Fit::Contain));
-    let arrangements: Vec<(&str, (u32, u32), Option<Delivery>, Edit)> = vec![
+    let arrangements: Vec<Arrangement> = vec![
         ("plain control", (160, 90), None, Box::new(|_, _| {})),
         (
             "incoming moving zoom",
@@ -1302,7 +1312,7 @@ fn checker_b_m_quarter_turns_over_resizes_pads_and_fills() {
                     &group,
                     &format!("checker/b/m/turn {w}x{h} {label} {turn} at {scale} alone"),
                     &tl,
-                    &[noise.clone()],
+                    std::slice::from_ref(&noise),
                     0.3,
                 );
                 if i < 5 && scale < 1.0 {
@@ -1339,7 +1349,7 @@ fn checker_b_m_quarter_turns_with_fades_positions_and_keys() {
     let b = media(160, 90, Pat::Test, Tag::None);
     let under = with_edges(160, 90);
     for turn in [90.0, 180.0, 270.0, 45.0, 91.0] {
-        let edits: Vec<(&str, Box<dyn Fn(&mut Clip)>)> = vec![
+        let edits: Vec<Labelled> = vec![
             (
                 "fade in/out",
                 Box::new(|c| {
@@ -1445,7 +1455,6 @@ fn checker_b_m_quarter_turns_with_fades_positions_and_keys() {
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn checker_b_m_blends_over_and_under_resized_padded_and_turned_layers() {
     use kerf_core::BlendMode;
-    type Edit = Box<dyn Fn(&mut Clip)>;
     let mut fam = Family::default();
     let mut groups = Groups::default();
     let canvas = Some(Delivery::new(160, 90, Fit::Contain));
@@ -1459,7 +1468,7 @@ fn checker_b_m_blends_over_and_under_resized_padded_and_turned_layers() {
         BlendMode::Difference,
     ];
     // (label, base source, delivery, edit of the base clip)
-    let bases: Vec<(&str, (u32, u32), Option<Delivery>, Edit)> = vec![
+    let bases: Vec<Variant> = vec![
         ("base shrunk 2:1", (320, 180), canvas, Box::new(|_| {})),
         ("base letterboxed and enlarged", (80, 60), canvas, Box::new(|_| {})),
         ("base odd-padded 64x31", (64, 31), small, Box::new(|_| {})),
@@ -1524,7 +1533,7 @@ fn checker_b_m_blends_over_and_under_resized_padded_and_turned_layers() {
         }
     }
     // the blended clip is the odd one
-    let tops: Vec<(&str, (u32, u32), Option<Delivery>, Edit)> = vec![
+    let tops: Vec<Variant> = vec![
         ("top shrunk 2:1", (320, 180), canvas, Box::new(|_| {})),
         ("top letterboxed and enlarged", (80, 60), canvas, Box::new(|_| {})),
         ("top odd-padded 64x31", (64, 31), small, Box::new(|_| {})),
@@ -1612,7 +1621,6 @@ fn checker_b_m_blends_over_and_under_resized_padded_and_turned_layers() {
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn checker_b_m_mixed_matrix_cuts_with_placed_and_turned_clips() {
-    type Edit = Box<dyn Fn(&mut Clip)>;
     let mut fam = Family::default();
     let mut groups = Groups::default();
     let pairs = [
@@ -1729,7 +1737,6 @@ fn mask_of(shape: kerf_core::MaskShape, feather: f64, inverted: bool, size: f64)
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn checker_b_m_masks_and_keyed_opacity_with_the_geq_gate_measured_and_not() {
     use kerf_core::{GeqEdge, MaskShape};
-    type Edit = Box<dyn Fn(&mut Clip)>;
     let mut fam = Family::default();
     let mut groups = Groups::default();
     let unknown = Compositor::new(gpu()).expect("a compositor").with_geq_edge(GeqEdge::Unknown);
@@ -1752,7 +1759,7 @@ fn checker_b_m_masks_and_keyed_opacity_with_the_geq_gate_measured_and_not() {
             Box::new(|c| c.keyframes = vec![opacity_key(0.0, 1.0), opacity_key(0.3, 0.3)]),
         ),
     ];
-    let bodies: Vec<(&str, (u32, u32), Option<Delivery>, Edit)> = vec![
+    let bodies: Vec<Variant> = vec![
         ("plain", (160, 90), canvas, Box::new(|_| {})),
         ("shrunk 2:1", (320, 180), canvas, Box::new(|_| {})),
         ("letterboxed and enlarged", (80, 60), canvas, Box::new(|_| {})),
@@ -1858,7 +1865,7 @@ fn checker_b_m_masks_and_keyed_opacity_with_the_geq_gate_measured_and_not() {
             ALLOW_GEQ_REFUSAL.with(|f| f.set(false));
             if let Some(out) = pinned {
                 groups.add(&format!("{g_label} / geq unknown"), &out);
-                if out.drawn != 0 || out.bad.len() != 0 {
+                if out.drawn != 0 || !out.bad.is_empty() {
                     fam.failures.push(format!(
                         "{case}: {} frames drawn with the geq edge unknown (it must refuse every frame of a masked or keyed-opacity clip)",
                         out.drawn
@@ -1956,12 +1963,11 @@ fn checker_b_m_the_geq_edge_pin_is_read_not_only_checked_for_unknown() {
 fn checker_b_m_a_scaler_that_is_not_measured_refuses_the_layers_it_resizes_and_only_those() {
     use kerf_gpu::scaler::Kernels;
     const REASON: &str = "not measured to be swscale's";
-    type Edit = Box<dyn Fn(&mut Clip)>;
     let mut fam = Family::default();
     let mut groups = Groups::default();
     let wide = Some(Delivery::new(160, 90, Fit::Contain));
     // (label, source, delivery, edit, resized by a scale?)
-    let cases: Vec<(&str, (u32, u32), Option<Delivery>, Edit, bool)> = vec![
+    let cases: Vec<Resizing> = vec![
         ("same size", (160, 90), None, Box::new(|_| {}), false),
         ("letterbox without a resize", (160, 60), wide, Box::new(|_| {}), false),
         ("pillarbox without a resize", (60, 90), wide, Box::new(|_| {}), false),
@@ -2091,7 +2097,6 @@ fn checker_b_m_an_unmeasured_matrix_conversion_refuses_the_other_clip_and_only_i
     let first = media(160, 90, Pat::Noise, Tag::None);
     let other = media(160, 90, Pat::Test, Tag::Bt709);
     let same = media(160, 90, Pat::Test, Tag::None);
-    type Edit = Box<dyn Fn(&mut Clip)>;
     let edits: Vec<(&str, Edit)> = vec![
         ("plain", Box::new(|_| {})),
         ("moving zoom", Box::new(|c| *c = posed(c.clone(), Pose::ZoomIn))),
@@ -2192,7 +2197,6 @@ fn checker_b_m_translucent_layers_turned_a_quarter_stay_on_the_translucent_ladde
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn checker_b_m_a_labelled_hd_clip_with_placement_turns_and_pads() {
-    type Edit = Box<dyn Fn(&mut Clip)>;
     let mut fam = Family::default();
     let mut groups = Groups::default();
     let hd = media(1280, 720, Pat::Test, Tag::None);
@@ -2235,7 +2239,7 @@ fn checker_b_m_a_labelled_hd_clip_with_placement_turns_and_pads() {
                 &format!("{label} / alone"),
                 &format!("checker/b/m/hd-label {top_name} {label} alone"),
                 &tl,
-                &[top.clone()],
+                std::slice::from_ref(top),
                 0.2,
             );
             for (base, base_name) in [(&base709, "over 709"), (&base601, "over 601")] {
@@ -2277,4 +2281,85 @@ fn checker_b_m_a_geq_refusal_in_a_sweep_fails_the_case_instead_of_passing_as_ref
         ],
     );
     no_geq_refusal("a case", &[]);
+}
+
+/// A quarter turn beside what lane B draws on the same picture: a colour correction, an effect, a crop, a speed, at the fit and shrunk, over a
+/// base. Drawn exactly or refused, never drawn wrong.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_b_m_quarter_turns_with_effects_colour_crop_and_speed() {
+    use kerf_core::VideoEffect;
+    let mut fam = Family::default();
+    let mut groups = Groups::default();
+    let under = with_edges(160, 90);
+    let noise = media(160, 90, Pat::Noise, Tag::None);
+    let test = media(160, 90, Pat::Test, Tag::None);
+    let edits: Vec<(&str, Edit)> = vec![
+        ("contrast", Box::new(|c| c.color.contrast = 1.3)),
+        (
+            "saturation and gamma",
+            Box::new(|c| {
+                c.color.saturation = 1.4;
+                c.color.gamma = 1.2;
+            }),
+        ),
+        (
+            "brightness and temperature",
+            Box::new(|c| {
+                c.color.brightness = 0.1;
+                c.color.temperature = 0.4;
+            }),
+        ),
+        ("blur", Box::new(|c| c.effects = vec![VideoEffect::Blur { sigma: 2.0 }])),
+        (
+            "sharpen",
+            Box::new(|c| c.effects = vec![VideoEffect::Sharpen { amount: 0.5 }]),
+        ),
+        ("grayscale", Box::new(|c| c.effects = vec![VideoEffect::Grayscale])),
+        ("invert", Box::new(|c| c.effects = vec![VideoEffect::Invert])),
+        ("vignette", Box::new(|c| c.effects = vec![VideoEffect::Vignette])),
+        (
+            "chroma key",
+            Box::new(|c| {
+                c.effects = vec![VideoEffect::ChromaKey {
+                    color: "0x00ff00".into(),
+                    similarity: 0.3,
+                    blend: 0.1,
+                }];
+            }),
+        ),
+        (
+            "cropped",
+            Box::new(|c| {
+                c.transform.crop_left = 0.1;
+                c.transform.crop_right = 0.07;
+            }),
+        ),
+        ("speed 2", Box::new(|c| c.speed = 2.0)),
+        ("speed 0.5", Box::new(|c| c.speed = 0.5)),
+    ];
+    for (label, edit) in &edits {
+        for (src, pat) in [(&noise, "noise"), (&test, "test")] {
+            for turn in [90.0, 180.0, 270.0] {
+                for scale in [1.0, 0.5625] {
+                    let mut c = clip(src, 0.0, 0.6, 0.0);
+                    c.transform.rotation = turn;
+                    c.transform.scale = scale;
+                    edit(&mut c);
+                    let tl = timeline(vec![vec![clip(&under, 0.0, 0.3, 0.0)], vec![c]], None);
+                    go(
+                        &mut fam,
+                        &mut groups,
+                        label,
+                        &format!("checker/b/m/turn-fx {label} {pat} turn {turn} scale {scale}"),
+                        &tl,
+                        &dedup(&[src, &under]),
+                        0.3,
+                    );
+                }
+            }
+        }
+    }
+    groups.print("quarter turns with effects, colour, crop and speed");
+    fam.finish("quarter turns with effects, colour, crop and speed");
 }
