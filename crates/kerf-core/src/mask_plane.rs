@@ -359,11 +359,13 @@ mod tests {
 
     #[test]
     fn every_path_draws_the_plane_the_scalar_path_draws_at_the_sizes_of_a_picture() {
+        // (The reference is slow unoptimised: 1080p only for the first masks, the rest at 480x270.)
         let masks = masks(24);
         for p in crate::simd::available() {
             crate::simd::with_path(p, || {
-                for m in &masks {
-                    for (w, h) in [(1920, 1080), (480, 270), (401, 7), (3, 600)] {
+                for (i, m) in masks.iter().enumerate() {
+                    let big: &[(u32, u32)] = if i < 6 { &[(1920, 1080)] } else { &[] };
+                    for &(w, h) in big.iter().chain(&[(480, 270), (401, 7), (3, 600)]) {
                         assert_eq!(mask_alpha_plane(m, w, h), reference_plane(m, w, h), "{p:?} {m:?} {w}x{h}");
                     }
                 }

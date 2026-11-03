@@ -12,7 +12,7 @@
 //!
 //! The kernels here are the byte scans: [`position_ne`] / [`rposition_ne`] (the first and last byte
 //! that is not a given value) and [`plane_bounds`] (the box a plane's non-zero samples fill) built on
-//! them. They run 15 to 65 times as fast as the scalar loops on a 1080p plane.
+//! them. Measured on x86_64, they run 15 to 65 times as fast as the scalar loops on a 1080p plane.
 
 use std::cell::Cell;
 use std::sync::OnceLock;
@@ -72,7 +72,8 @@ fn widest(available: &[Path], cap: Option<u8>) -> Path {
         .unwrap_or(Path::Scalar)
 }
 
-/// `KERF_SIMD`'s cap: `scalar`, `sse2` / `neon`, `avx2`; anything else is no cap.
+/// `KERF_SIMD`'s cap, case-insensitive and trimmed: `scalar` (also `off`, `none`, `0`) is the scalar path
+/// only, `sse2` (also `neon`) caps at the 128-bit paths, `avx2` at 256-bit; anything else is `None`, no cap.
 fn parse_cap(value: &str) -> Option<u8> {
     match value.trim().to_ascii_lowercase().as_str() {
         "scalar" | "off" | "none" | "0" => Some(0),
@@ -80,6 +81,19 @@ fn parse_cap(value: &str) -> Option<u8> {
         "avx2" => Some(2),
         _ => None,
     }
+}
+
+/// The cap `KERF_SIMD` asks for. A value that is set and not one of [`parse_cap`]'s spellings is no cap,
+/// and says so once (this runs once, under [`path`]'s `OnceLock`).
+fn env_cap() -> Option<u8> {
+    let value = std::env::var("KERF_SIMD").ok().filter(|v| !v.trim().is_empty())?;
+    let cap = parse_cap(&value);
+    if cap.is_none() {
+        tracing::warn!(
+            "KERF_SIMD={value:?} is not one of scalar, off, none, 0, sse2, neon, avx2: no cap, the widest SIMD path runs"
+        );
+    }
+    cap
 }
 
 thread_local! {
@@ -90,9 +104,9 @@ thread_local! {
 /// `KERF_SIMD` (read once).
 pub fn path() -> Path {
     static CHOSEN: OnceLock<Path> = OnceLock::new();
-    FORCED.with(Cell::get).unwrap_or_else(|| {
-        *CHOSEN.get_or_init(|| widest(&available(), std::env::var("KERF_SIMD").ok().as_deref().and_then(parse_cap)))
-    })
+    FORCED
+        .with(Cell::get)
+        .unwrap_or_else(|| *CHOSEN.get_or_init(|| widest(&available(), env_cap())))
 }
 
 /// Run `f` with every kernel on this thread taking `path`, for the differential tests. Panics if the
@@ -153,7 +167,7 @@ pub fn rposition_ne_scalar(hay: &[u8], v: u8) -> Option<usize> {
 }
 
 /// The bounding box `(x0, y0, x1, y1)` (end exclusive) of the non-zero samples of a `w` x `h` plane,
-/// `None` if there are none. Panics if `plane` is shorter than `w * h`.
+/// `None` if there are none. Panics if `plane` is shorter than `w * h`, or `w * h` overflows.
 pub fn plane_bounds(plane: &[u8], w: usize, h: usize) -> Option<(usize, usize, usize, usize)> {
     if path() == Path::Scalar {
         return plane_bounds_scalar(plane, w, h);
@@ -161,7 +175,7 @@ pub fn plane_bounds(plane: &[u8], w: usize, h: usize) -> Option<(usize, usize, u
     if w == 0 || h == 0 {
         return None;
     }
-    let plane = &plane[..w * h];
+    let plane = &plane[..w.checked_mul(h).expect("a plane's size overflows usize")];
     // The first and last non-zero samples of the whole plane are in the first and last non-empty
     // rows: they give those rows, and a column each that the rows between can only widen.
     let first = position_ne(plane, 0)?;
@@ -477,7 +491,11 @@ mod tests {
         assert_eq!(widest(&all, parse_cap("avx2")), Path::Avx2);
         assert_eq!(widest(&all, parse_cap("SSE2")), Path::Sse2);
         assert_eq!(widest(&all, parse_cap("scalar")), Path::Scalar);
-        assert_eq!(widest(&all, parse_cap("off")), Path::Scalar);
+        for spelling in ["off", "none", "0", " Scalar\n"] {
+            assert_eq!(widest(&all, parse_cap(spelling)), Path::Scalar, "{spelling:?}");
+        }
+        assert_eq!(widest(&all, parse_cap("Neon")), Path::Sse2);
+        assert_eq!(parse_cap(""), None);
         assert_eq!(widest(&all, parse_cap("banana")), Path::Avx2, "no cap");
         assert_eq!(
             widest(&[Path::Scalar, Path::Sse2], parse_cap("avx2")),
@@ -598,7 +616,7 @@ mod tests {
     }
 
     /// The control flow of the NEON scans (blocks of four chunks, chunks, the overlapping end) with a
-    /// portable "is this chunk all `v`", on any CPU: everything of it but the three intrinsics.
+    /// portable "is this chunk all `v`", on any CPU: everything of it but the four intrinsics of `neon::all_equal`.
     #[test]
     fn the_chunked_scans_find_what_the_scalar_scans_find() {
         let mut rng = Rng(0xA5A5_1234_5678_9ABC);
@@ -701,6 +719,14 @@ mod tests {
                 assert_eq!(plane_bounds(&[], 0, 5), None);
                 assert_eq!(plane_bounds(&[], 5, 0), None);
             });
+        }
+    }
+
+    #[test]
+    fn a_plane_whose_size_overflows_is_a_panic_on_every_path() {
+        for p in available() {
+            let overflowed = std::panic::catch_unwind(|| with_path(p, || plane_bounds(&[1u8; 8], usize::MAX, 2)));
+            assert!(overflowed.is_err(), "{p:?}");
         }
     }
 

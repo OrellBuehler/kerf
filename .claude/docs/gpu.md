@@ -409,49 +409,41 @@ export within the scaler's level (placed: 1) and the scaler's plus the transluce
 above: `SCALED` plus `TRANSLUCENT` would say luma 1 and chroma 2, but the scaler's level crosses into luma through the round trip's conversion). It also holds the feed (a cursor opened ahead is the one the cut uses and the first
 clip's goes with it; a transport stream is refused when opened ahead; with more clips in the window than it holds it keeps the ones wanted first), and the texture a session presents to be the composite's picture.
 
-**CPU-side work and SIMD.** The compositor does its per-pixel work on the GPU, so the CPU side of a frame is small and mostly memory
-traffic. `tests/bench_cpu.rs` (`#[ignore]`d, `KERF_BENCH=1`, no adapter and no FFmpeg; `target/parity/bench-cpu.txt`) times it. One
-shared 4-core machine, release, best of nine, 1080p (4K is three to five times that, and noisier): reading a readback buffer out of its
-padded rows 0.6 ms, splitting a decoded frame into planes 0.22, `Y4mReader` from memory 0.23, the cache's `frame == frame` 0.21 (all
-`memcpy` / `memcmp`, vector code already: **not a target**), `vignette_steps` 0.05, the six `sws::bicubic` tables of a scaled layer 0.25 to
-0.63 ms **every frame** (not cached; i64 divisions, nothing for SIMD, a memo keyed `(src, dst, one)` would take it to nothing) and
-`vignette_map` 45 ms (195 at 4K) once per size (`f64` `hypot` and `cos` from libm: no vector routine is bit-identical to it). What is left
-is what scans or computes pixels one at a time, and it is vectorised (`kerf_core::simd`, `kerf_core::mask_alpha_plane`; nothing else is):
+**CPU-side work and SIMD.** The per-pixel work is the GPU's; what the CPU still does one sample at a time is vectorised, and nothing else
+is (`tests/bench_cpu.rs`, `#[ignore]`d, `KERF_BENCH=1`, times the CPU side; `memcpy`-bound copies and libm / integer table builds
+stay scalar). Both kernels live in `kerf-core` (`simd.rs`, `mask_plane.rs`, `mask_plane/x86.rs`) and `kerf-gpu` calls them:
 
-- **Byte scans** (`simd::position_ne` / `rposition_ne`, the first and last byte that is not a value; `plane_bounds` on top of them): the
-  bounding box of a title's glyph and box masks (`text.rs` `Raster::from_parts`, `text/seq.rs` `read_box` / `shape_of`: two full-frame
-  planes a title, once per new text), the box's "is it solid" check and the opaque-alpha scan of an asset that never recorded its pixel
-  format (`source.rs`). A 1080p plane went from 1.7 to 1.8 ms to 0.04 (SSE2) / 0.03 (AVX2), the alpha scan from 0.69 to 0.05: 15 to 65
-  times. 16 / 32 bytes a step with `cmpeq` + `movemask`, whole blocks of 64 bytes compared with the masks and-ed together, the tail one
-  register that overlaps bytes already known equal. `plane_bounds` finds the first and last row from the whole plane and only reads the
-  rows between them for a column that widens the box.
-- **The mask's alpha plane** (`kerf-core/src/mask_plane/x86.rs`; the preview makes one per `(mask, size)` the cache misses, so one on every
-  step of a drag of a mask's handle): `f64` lanes (2 on SSE2, 4 on AVX2) doing the scalar's operations in the scalar's order, no fused
-  multiply-add, the same truncating `cvttpd`. An ellipse's band around its edge, which needs libm's `hypot`, and the columns past the last
-  whole group go through the scalar `Params::px` itself. 1080p, scalar to AVX2 (SSE2): hard rect 1.46 to 0.64 (1.36) ms, feathered rect
-  3.48 to 1.49 (1.97), hard ellipse 1.76 to 0.73 (1.15), feathered ellipse 2.79 to 2.03 (2.36): the feather's ring is all `hypot`, and what is
-  left of the hard rect is allocation and page faults, of the feathered rect the divide. **Pitfall, measured:** inside a `#[target_feature]`
-  kernel a `copy_from_slice` or an iterator adapter is a *call* in a release build with several codegen units (the mask rows ran 2.3 times
-  slower than the scalar's); the kernels read and write through raw pointers after one bounds check (`n = min(len)`, `i + N <= n`).
-- **Detection and the fallback**: `kerf_core::simd::path()` is the widest of `Scalar` / `Sse2` / `Avx2` (x86_64, `is_x86_feature_detected!`) or
-  `Neon` (aarch64, `is_aarch64_feature_detected!`) the CPU has, probed once, capped by `KERF_SIMD=scalar|sse2|neon|avx2` (anything else is
-  no cap) and forced on a thread by `simd::with_path(path, f)` (`#[doc(hidden)]`, the tests' hook). Every kernel keeps its scalar function
-  (`position_ne_scalar`, `plane_bounds_scalar`, `mask_alpha_plane_scalar`): it is the fallback, `KERF_SIMD=scalar`, and the oracle. A
-  vector path returns **exactly** what the scalar one returns (0 differing samples): these feed the exact-parity text and mask paths.
-- **Tests**, always run, each on every path `available()` lists: every width 1 to 67 and larger ones (to 65 549) from seven start
-  offsets (loads are unaligned) with 0 to 3 odd bytes and three fill values; a differing byte at every position of every width up to 70;
-  the first and last of two; `plane_bounds` over noise, rectangles, sparse, full and empty planes of 206 sizes against the old
-  row-by-row function; the mask plane for 12 random masks (every shape, feathers either side of the 1e-6 threshold and past 1, centres
-  and sizes out of range, inverted) at widths 1 to 67, 128, 255 to 257 and heights 1 to 40, and 24 at picture sizes, against
-  `reference_plane`, the function as it was before the vector paths, verbatim (a mutated kernel fails them: checked); and in
-  `text.rs` a title's masks cut to the same bitmaps, box and refusals on every path. There is **no 10-bit or 16-bit row**: every
-  CPU-side sample of the compositor is 8-bit (the y4m is `C420`, FFmpeg brings a 10-bit source down before the process sees it; the
-  readback is `Rgba8`).
-- **aarch64 / NEON is unverified**: the byte scans have a NEON path (`vceqq_u8` + `vminvq_u8` per 16 bytes, the block or chunk that
-  differs searched by the scalar scan). Its control flow (`first_ne_by_chunks`, blocks, chunks, the overlapping end) is arch-independent
-  and tested here with a portable "all equal"; only the three intrinsics were never compiled (no aarch64 target on the machine it was
-  written on; they are `memchr`'s). An arm64 runner runs the tests above on it unchanged. The mask rows have no NEON kernel and take the
-  scalar path there.
+- **Byte scans** (`simd::position_ne` / `rposition_ne`, the first / last byte that is not a value; `plane_bounds` on top): the bounding
+  box of a title's glyph and box masks (`text.rs` `Raster::from_parts`, `text/seq.rs` `read_box` / `shape_of`), the "is the box solid"
+  check, and the opaque-alpha scan of an asset that never recorded its pixel format (`source.rs`). 16 / 32 bytes a step with `cmpeq` +
+  `movemask`, blocks of 64 bytes tested with the masks and-ed together, the tail one register overlapping bytes already known equal.
+  Measured on x86_64 (1080p plane, 1.7 ms scalar): 0.04 ms on SSE2, 0.03 on AVX2.
+- **The mask's alpha plane** (`kerf_core::mask_alpha_plane`; made for every new `(mask, size)`, so on each step of a mask-handle drag):
+  `f64` lanes (2 on SSE2, 4 on AVX2) running the scalar's operations in the scalar's order, no fused multiply-add, the same truncating
+  `cvttpd`. An ellipse's band around its edge needs libm's `hypot` and, with the columns past the last whole group, goes through the
+  scalar `Params::px`. Measured on x86_64 at 1080p, scalar to AVX2: 1.5 to 0.6 ms (hard rect), 3.5 to 1.5 (feathered rect), 1.8 to 0.7
+  (hard ellipse), 2.8 to 2.0 (feathered ellipse, whose ring is all `hypot`).
+- **Pitfall (codegen)**: inside a `#[target_feature]` kernel, `copy_from_slice` or an iterator adapter is a *call* in a release build with
+  several codegen units (the mask rows ran 2.3 times slower than the scalar's). The kernels read and write through raw pointers after one
+  bounds check (`n = min(len)`, `i + N <= n`).
+- **Detection, cap, fallback**: `kerf_core::simd::path()` is the widest of `Scalar` / `Sse2` / `Avx2` (x86_64, `is_x86_feature_detected!`)
+  or `Neon` (aarch64, `is_aarch64_feature_detected!`) the CPU has, probed once. `KERF_SIMD` caps it (case-insensitive: `scalar` / `off` /
+  `none` / `0`, `sse2` / `neon`, `avx2`; any other value is no cap and logs one `tracing` warning). `simd::with_path(path, f)` forces a path
+  on a thread (`#[doc(hidden)]`, the tests' hook). Every kernel keeps its scalar function (`position_ne_scalar`, `plane_bounds_scalar`,
+  `mask_alpha_plane_scalar`): the fallback, what `KERF_SIMD=scalar` runs, and the oracle. A vector path returns exactly what the scalar one
+  returns (0 differing samples): these feed the exact-parity text and mask paths. Every CPU-side sample of the compositor is 8-bit (the y4m
+  is `C420`, the readback `Rgba8`), so there are no 10 / 16-bit kernels.
+- **Tests**, always run, each on every path `available()` lists: the scans over widths 1 to 67 and larger, from several start offsets
+  (loads are unaligned), with a differing byte at every position and 0 to 3 random ones; `plane_bounds` against the old row-by-row
+  function on noise, rectangle, sparse, full and empty planes; the mask plane for random masks (every shape, feathers either side of the
+  1e-6 threshold and past 1, centres and sizes out of range, inverted) at widths 1 to 67 and 128 / 255 to 257 with heights 1, 2, 3, 18 and 40,
+  and at picture sizes, against `reference_plane`, the function as it was before the vector paths, verbatim; `text.rs` cuts a title's
+  masks identically on every path. `kerf-core/tests/checker_simd*.rs` (naive loops, misaligned sub-slices, an electric-fence allocator)
+  and `kerf-gpu/tests/checker_simd_cut.rs` (a masked, titled cut per `KERF_SIMD` value; `#[ignore]`d) are the independent checks.
+- **NEON is written but has never run**: the byte scans have a NEON path (`vld1q_u8`, `vdupq_n_u8`, `vceqq_u8`, `vminvq_u8` per 16 bytes;
+  the block or chunk that differs is searched by the scalar scan). It type-checks and lints clean for `aarch64-unknown-linux-gnu`, and its
+  control flow (`first_ne_by_chunks`: blocks, chunks, the overlapping end) is arch-independent and tested with a portable "all equal"; an
+  arm64 runner runs the tests above on it unchanged. The mask rows have no NEON kernel and take the scalar path there.
 
 What the parity harness forced, all recorded in `kerf-gpu`'s docs and shaders:
 
