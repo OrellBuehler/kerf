@@ -2806,7 +2806,7 @@ fn checker_b_m_the_translucent_quarter_turn_refusal_is_tight() {
                 let Some(out) = sweep_guarded(&case, &tl, &assets, 30.0, secs) else {
                     continue;
                 };
-                groups.add(&format!("{label}"), &out);
+                groups.add(label, &out);
                 let worst = out.bad.iter().flat_map(|b| b.planes.iter().map(|p| p.max)).max().unwrap_or(0);
                 // Drawn frames are the export's; the translucent ladder (one level of chroma) is allowed to an upright or half-turned layer.
                 if *translucent && worst <= LADDER && !quarter {
