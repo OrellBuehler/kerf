@@ -931,8 +931,9 @@ pub fn prepare_timeline(timeline: &kerf_core::Timeline) {
 /// recorded its range, nothing is asked.
 ///
 /// The files are asked [`PLACED_FILES_THREADS`] at a time (one `ffprobe` each, bounded by its own timeout) and no new one is
-/// started once [`PLACED_FILES_BUDGET`] has passed, so a cut with many placed files delays the session by about that and a probe
-/// at most, not by one probe each: a file left unasked is refused (FFmpeg's) until the horizon rescan asks it.
+/// started once [`PLACED_FILES_BUDGET`] has passed, in track order, so this call delays the session by about that and a probe at
+/// most: a file left unasked is refused (FFmpeg's) until the horizon rescan asks it, and one inside the first horizon is asked by
+/// [`prepare_ahead`], one at a time.
 pub fn prepare_placed_files(cut: &kerf_core::PlayCut, timeline: &kerf_core::Timeline) {
     if cut.canvas().policy == kerf_core::CompositeColorPolicy::FixedBt601 {
         return;
@@ -1140,7 +1141,8 @@ impl Compositor {
 
     /// [`Compositor::caps`] for a machine whose FFmpeg's conversions are `kernels`, whose scaler is `scaler` and whose conversion
     /// between colour matrices is `convert`, without a device: the way a host that has none to ask (the render bar) says what the
-    /// GPU draws.
+    /// GPU draws. Like [`Compositor::caps`], it has no `mask` or `keyed_opacity` while the measured `geq` edge is
+    /// `Unknown`.
     pub fn caps_for(kernels: crate::grade::Kernels, scaler: crate::scaler::Kernels, convert: crate::convert::Kernels) -> GpuCaps {
         Self::caps_pinned(
             kernels,

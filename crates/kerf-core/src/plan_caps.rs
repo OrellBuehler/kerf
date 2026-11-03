@@ -484,7 +484,8 @@ pub enum Unsupported {
     KeyedPlacement(LayerRef),
     /// A rotation the compositor does not draw (the detail says which): FFmpeg's `rotate` samples a turned picture at fixed-point
     /// positions with an apron of its own, and only a quarter, half or three quarters of a turn (where its integer sine comes out exact,
-    /// [`crate::quarter_turn`]) lands on whole samples; any other angle, and a rotation a key or a behaviour moves, is FFmpeg's.
+    /// [`crate::quarter_turn`]) lands on whole samples; any other angle, a rotation a key or a behaviour moves, and a constant opacity below 1 under a quarter or three quarters of a turn
+    /// (FFmpeg converts to 4:2:0 after the turn, so other chroma pairs are averaged), is FFmpeg's.
     Rotation(LayerRef, &'static str),
     /// A moving zoom or position on a picture that is not 4:2:0 or gray (the detail names its pixel format, or says it was
     /// never recorded), or that may be full range where the composite's range is negotiated (the detail says `full-range`):
