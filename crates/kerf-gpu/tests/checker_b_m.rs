@@ -2501,3 +2501,124 @@ fn checker_b_m_a_phone_vlog_of_alternating_matrices_dissolving() {
     groups.print("a phone vlog of alternating matrices dissolving");
     fam.finish("a phone vlog of alternating matrices dissolving");
 }
+
+/// A title (FFmpeg's `drawtext`, blended by the compositor) over the layers of both lanes: a placed one, a turned one, a resized and
+/// letterboxed one, a blurred fill, a blended one and a masked one. The composite under the text is the layer's, so the text's own exactness
+/// depends on it: every drawn frame is the export's.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn checker_b_m_a_title_over_placed_turned_resized_and_blended_layers() {
+    use kerf_core::{BlendMode, TextOverlay};
+    let mut fam = Family::default();
+    let mut groups = Groups::default();
+    let canvas = Some(Delivery::new(320, 180, Fit::Contain));
+    let under = media(320, 180, Pat::Edges, Tag::None);
+    let top = media(320, 180, Pat::Test, Tag::None);
+    let portrait = media(180, 320, Pat::Test, Tag::None);
+    let shrunk = media(640, 360, Pat::Noise, Tag::None);
+    let cases: Vec<(&str, Option<Delivery>, Vec<Vec<Clip>>, Vec<Asset>)> = vec![
+        ("plain", canvas, vec![vec![clip(&top, 0.0, 0.4, 0.0)]], vec![top.clone()]),
+        (
+            "moving zoom",
+            canvas,
+            vec![vec![posed(clip(&top, 0.0, 0.4, 0.0), Pose::ZoomIn)]],
+            vec![top.clone()],
+        ),
+        (
+            "moving pan over a base",
+            canvas,
+            vec![
+                vec![clip(&under, 0.0, 0.4, 0.0)],
+                vec![posed(clip(&top, 0.0, 0.4, 0.0), Pose::Pan)],
+            ],
+            dedup(&[&under, &top]),
+        ),
+        (
+            "turned 90 shrunk",
+            canvas,
+            vec![vec![{
+                let mut c = clip(&top, 0.0, 0.4, 0.0);
+                c.transform.rotation = 90.0;
+                c.transform.scale = 0.5625;
+                c
+            }]],
+            vec![top.clone()],
+        ),
+        (
+            "turned 180 over a base",
+            canvas,
+            vec![
+                vec![clip(&under, 0.0, 0.4, 0.0)],
+                vec![{
+                    let mut c = clip(&top, 0.0, 0.4, 0.0);
+                    c.transform.rotation = 180.0;
+                    c
+                }],
+            ],
+            dedup(&[&under, &top]),
+        ),
+        (
+            "shrunk by the fit",
+            canvas,
+            vec![vec![clip(&shrunk, 0.0, 0.4, 0.0)]],
+            vec![shrunk.clone()],
+        ),
+        (
+            "portrait pillarboxed",
+            canvas,
+            vec![vec![clip(&portrait, 0.0, 0.4, 0.0)]],
+            vec![portrait.clone()],
+        ),
+        (
+            "portrait over a blurred fill",
+            Some(Delivery::new(320, 180, Fit::Blur)),
+            vec![vec![clip(&portrait, 0.0, 0.4, 0.0)]],
+            vec![portrait.clone()],
+        ),
+        (
+            "blended over a base",
+            canvas,
+            vec![
+                vec![clip(&under, 0.0, 0.4, 0.0)],
+                vec![{
+                    let mut c = clip(&top, 0.0, 0.4, 0.0);
+                    c.blend_mode = BlendMode::Multiply;
+                    c
+                }],
+            ],
+            dedup(&[&under, &top]),
+        ),
+        (
+            "masked over a base",
+            canvas,
+            vec![
+                vec![clip(&under, 0.0, 0.4, 0.0)],
+                vec![{
+                    let mut c = clip(&top, 0.0, 0.4, 0.0);
+                    c.mask = Some(mask_of(kerf_core::MaskShape::Ellipse, 0.2, false, 0.7));
+                    c
+                }],
+            ],
+            dedup(&[&under, &top]),
+        ),
+    ];
+    for (label, delivery, tracks, assets) in cases {
+        for (text, name) in [("Day 3: the coast", "title"), ("Wg ij", "tall glyphs")] {
+            let mut tl = timeline(tracks.clone(), delivery);
+            let mut overlay = TextOverlay::new(text, 0.0, 0.4);
+            overlay.bg = Some("black@0.5".into());
+            tl.overlays = vec![overlay];
+            go(
+                &mut fam,
+                &mut groups,
+                label,
+                &format!("checker/b/m/text {label} {name}"),
+                &tl,
+                &assets,
+                0.4,
+            );
+        }
+    }
+    groups.print("a title over placed, turned, resized and blended layers");
+    fam.finish("a title over placed, turned, resized and blended layers");
+}
