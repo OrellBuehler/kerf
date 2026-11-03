@@ -177,8 +177,8 @@ fn checker_simd2_refused_ratios_stay_refused_whatever_surrounds_them() {
     }
 }
 
-/// The key is all three: a table for one precision is not the other's, `(a, b)` is not `(b, a)`, and
-/// neighbouring sizes and precisions are their own.
+/// The key holds `(src, dst, one)` (the scaler and alignment are checked below): a table for one precision is not
+/// the other's, `(a, b)` is not `(b, a)`, and neighbouring sizes and precisions are their own.
 #[test]
 fn checker_simd2_each_part_of_the_key_picks_its_own_table() {
     let ones = [

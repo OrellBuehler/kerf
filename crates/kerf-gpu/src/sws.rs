@@ -545,7 +545,7 @@ mod tests {
                 for (src, dst) in SHAPES {
                     for one in [ONE_HORIZONTAL, ONE_VERTICAL] {
                         let want = table_aligned_uncached(scaler, src, dst, one, align);
-                        for held in ["made", "held"] {
+                        for held in ["first ask", "second ask"] {
                             assert_eq!(
                                 table_aligned(scaler, src, dst, one, align),
                                 want,
