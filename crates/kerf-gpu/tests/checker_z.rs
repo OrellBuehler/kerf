@@ -21,7 +21,12 @@
     clippy::print_stderr,
     clippy::too_many_lines,
     clippy::type_complexity,
-    clippy::cast_possible_truncation
+    clippy::cast_possible_truncation,
+    clippy::collapsible_if,
+    clippy::manual_is_multiple_of,
+    clippy::manual_range_contains,
+    clippy::precedence,
+    clippy::chunks_exact_to_as_chunks
 )]
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -205,7 +210,7 @@ struct Media {
 impl Media {
     /// A lossless clip made by `lavfi` + `codec`, in pixel format `pix`; `extra` are output options (`-color_range pc`...).
     fn make(&self, name: &str, lavfi: &str, pix: &str, codec: &[&str], extra: &[&str]) -> Asset {
-        let mut cache = self.cache.lock().unwrap();
+        let mut cache = self.cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(a) = cache.get(name) {
             return a.clone();
         }
@@ -756,6 +761,11 @@ impl Suite {
         let want = kerf_core::timeline_frame_yuv_cancellable(tl, assets, &opts, t, u32::MAX, &|| false);
         let Ok((_, _, want444)) = want else {
             eprintln!("Z {case:<58} t={t}: FFmpeg's own still fails; the plan says {why:?}");
+            if why.is_empty() {
+                self.fail(format!(
+                    "{case} t={t}: the plan draws a frame FFmpeg's own still cannot produce"
+                ));
+            }
             self.refused += 1;
             return;
         };
@@ -2256,6 +2266,1033 @@ fn z_smoke_display() {
     for (w, h) in [(640u32, 360u32), (202, 100)] {
         let (tl, a) = alone(&m.noise, 1.0, delivery(w, h, Fit::Cover), &|_| {});
         s.still(&format!("noise {w}x{h}"), &tl, &a, 0.5, Expect::Drawn);
+    }
+    s.finish();
+}
+
+// ======================================================================================================
+// Round 2: the pictures the blur has to survive, the key after a scale, every RGB entry point, the alpha ramp.
+// ======================================================================================================
+
+/// A clip of `frames` copies of one raw frame (`pix`, `w` x `h`), lossless, so a crafted picture reaches the compositor and FFmpeg
+/// byte for byte.
+fn raw_clip(name: &str, w: usize, h: usize, pix: &str, frame: &[u8], frames: usize) -> Asset {
+    let m = media();
+    let mut cache = m.cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(a) = cache.get(name) {
+        return a.clone();
+    }
+    let p = m.dir.join(name);
+    let part = m.dir.join(format!("{}.{}.part.mkv", slug(name), std::process::id()));
+    let data: Vec<u8> = frame.iter().copied().cycle().take(frame.len() * frames).collect();
+    // (A 10-bit picture goes through lossless x264 with its range recorded: raw video does not carry 10-bit in Matroska, and FFV1 does not
+    // record a range, which FFmpeg 9 treats as a picture whose values it keeps raw.)
+    let codec: &[&str] = if pix.contains("10") {
+        &["-c:v", "libx264", "-preset", "ultrafast", "-qp", "0", "-color_range", "tv"]
+    } else {
+        &["-c:v", "rawvideo"]
+    };
+    let size = format!("{w}x{h}");
+    let mut args = vec![
+        "-f",
+        "rawvideo",
+        "-framerate",
+        "30",
+        "-pix_fmt",
+        pix,
+        "-s",
+        &size,
+        "-i",
+        "pipe:0",
+    ];
+    args.extend_from_slice(codec);
+    args.extend_from_slice(&["-pix_fmt", pix, part.to_str().unwrap()]);
+    ffmpeg_piped(&args, &data);
+    std::fs::rename(&part, &p).expect("move the clip into place");
+    let a = probed(&p);
+    cache.insert(name.to_string(), a.clone());
+    a
+}
+
+fn noise_bytes(seed: u64, n: usize) -> Vec<u8> {
+    lcg_bytes(seed, n)
+}
+
+/// A plane of exact-zero runs of every Fibonacci length between bright samples, along rows (`rows`) or columns.
+fn zero_run_plane(w: usize, h: usize, rows: bool, salt: usize) -> Vec<u8> {
+    let fib = [1usize, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233];
+    let mut p = vec![0u8; w * h];
+    let (lines, len) = if rows { (h, w) } else { (w, h) };
+    for line in 0..lines {
+        let run = fib[(line + salt) % fib.len()];
+        let phase = (line * 7 + salt) % run;
+        for i in 0..len {
+            if (i + phase) % (run + 1) == 0 {
+                let v = 200 + ((i * 31 + line * 17 + salt) % 56) as u8;
+                if rows {
+                    p[line * w + i] = v;
+                } else {
+                    p[i * w + line] = v;
+                }
+            }
+        }
+    }
+    p
+}
+
+fn dots_plane(w: usize, h: usize, v: u8) -> Vec<u8> {
+    let mut p = vec![0u8; w * h];
+    for (x, y) in [
+        (0, 0),
+        (w - 1, 0),
+        (0, h - 1),
+        (w - 1, h - 1),
+        (w / 2, h / 2),
+        (0, h / 2),
+        (w - 1, h / 2),
+        (w / 2, 0),
+        (w / 2, h - 1),
+    ] {
+        p[y * w + x] = v;
+    }
+    p
+}
+
+fn yuv(y: Vec<u8>, u: Vec<u8>, v: Vec<u8>) -> Vec<u8> {
+    let mut f = y;
+    f.extend(u);
+    f.extend(v);
+    f
+}
+
+/// Crafted pictures: `(name, frame, w, h)` as yuv420p.
+fn crafted_pictures() -> Vec<(String, Vec<u8>, usize, usize)> {
+    let mut out = Vec::new();
+    for (w, h) in [(320usize, 180usize), (202, 100)] {
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+        out.push((
+            format!("zero runs along rows {w}x{h}"),
+            yuv(
+                zero_run_plane(w, h, true, 0),
+                zero_run_plane(cw, ch, true, 3),
+                zero_run_plane(cw, ch, true, 5),
+            ),
+            w,
+            h,
+        ));
+        out.push((
+            format!("zero runs along columns {w}x{h}"),
+            yuv(
+                zero_run_plane(w, h, false, 1),
+                zero_run_plane(cw, ch, false, 4),
+                zero_run_plane(cw, ch, false, 2),
+            ),
+            w,
+            h,
+        ));
+        out.push((
+            format!("dots at the borders {w}x{h}"),
+            yuv(dots_plane(w, h, 255), dots_plane(cw, ch, 255), dots_plane(cw, ch, 240)),
+            w,
+            h,
+        ));
+        out.push((
+            format!("noise with U 0 and V 255 {w}x{h}"),
+            yuv(noise_bytes(1, w * h), vec![0; cw * ch], vec![255; cw * ch]),
+            w,
+            h,
+        ));
+        out.push((
+            format!("noise with U 255 and V 0 {w}x{h}"),
+            yuv(noise_bytes(2, w * h), vec![255; cw * ch], vec![0; cw * ch]),
+            w,
+            h,
+        ));
+        out.push((
+            format!("noise with U 0 and V 0 {w}x{h}"),
+            yuv(noise_bytes(3, w * h), vec![0; cw * ch], vec![0; cw * ch]),
+            w,
+            h,
+        ));
+        out.push((
+            format!("Y 0 with noise chroma {w}x{h}"),
+            yuv(vec![0; w * h], noise_bytes(4, cw * ch), noise_bytes(5, cw * ch)),
+            w,
+            h,
+        ));
+        out.push((
+            format!("Y 255 chroma 255 {w}x{h}"),
+            yuv(vec![255; w * h], vec![255; cw * ch], vec![255; cw * ch]),
+            w,
+            h,
+        ));
+        let half = |n: usize, cols: usize, seed: u64| -> Vec<u8> {
+            let noise = noise_bytes(seed, n);
+            noise
+                .into_iter()
+                .enumerate()
+                .map(|(i, v)| if i % cols < cols / 2 { 0 } else { v })
+                .collect()
+        };
+        out.push((
+            format!("left half zero {w}x{h}"),
+            yuv(half(w * h, w, 6), half(cw * ch, cw, 7), half(cw * ch, cw, 8)),
+            w,
+            h,
+        ));
+    }
+    out
+}
+
+const CRAFTED_SIGMAS: [f64; 9] = [0.3, 0.5, 1.0, 2.0, 4.0, 9.0, 40.0, 250.0, 1024.0];
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn z2_blur_on_crafted_pictures_in_a_still() {
+    let mut s = Suite::new("blur-crafted-still");
+    for (name, frame, w, h) in crafted_pictures() {
+        let a = raw_clip(&format!("z2-{}.mkv", slug(&name)), w, h, "yuv420p", &frame, 30);
+        for sigma in CRAFTED_SIGMAS {
+            let (tl, assets) = alone(&a, 1.0, None, &|c| c.effects = vec![VideoEffect::Blur { sigma }]);
+            s.still(&format!("{name} sigma {sigma}"), &tl, &assets, 0.5, Expect::Any);
+        }
+    }
+    s.finish();
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn z2_blur_on_crafted_pictures_in_an_export() {
+    let mut s = Suite::new("blur-crafted-export");
+    for (name, frame, w, h) in crafted_pictures() {
+        let a = raw_clip(&format!("z2-{}.mkv", slug(&name)), w, h, "yuv420p", &frame, 30);
+        for sigma in [0.5, 2.0, 9.0, 250.0] {
+            let (tl, assets) = alone(&a, 0.2, None, &|c| c.effects = vec![VideoEffect::Blur { sigma }]);
+            s.motion(&format!("{name} sigma {sigma}"), &tl, &assets, 30.0, 2, Expect::Any);
+        }
+    }
+    s.finish();
+}
+
+/// 10-bit footage: the same pictures with their samples widened to 10 bits (the low bits are not zero), blurred.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn z2_blur_on_ten_bit_crafted_pictures() {
+    let mut s = Suite::new("blur-crafted-10bit");
+    for (name, frame, w, h) in crafted_pictures()
+        .into_iter()
+        .filter(|(n, ..)| n.contains("202x100") || n.contains("rows 320"))
+    {
+        let wide: Vec<u8> = frame
+            .iter()
+            .flat_map(|v| {
+                let x = if *v == 0 {
+                    0u16
+                } else {
+                    (u16::from(*v) << 2) | u16::from(*v & 3)
+                };
+                x.to_le_bytes()
+            })
+            .collect();
+        let a = raw_clip(&format!("z2-10-{}.mkv", slug(&name)), w, h, "yuv420p10le", &wide, 30);
+        for sigma in [0.5, 2.0, 9.0, 250.0] {
+            let (tl, assets) = alone(&a, 1.0, None, &|c| c.effects = vec![VideoEffect::Blur { sigma }]);
+            s.still(&format!("{name} sigma {sigma}"), &tl, &assets, 0.5, Expect::Any);
+            let (tl, assets) = alone(&a, 0.2, None, &|c| c.effects = vec![VideoEffect::Blur { sigma }]);
+            s.motion(&format!("{name} sigma {sigma}"), &tl, &assets, 30.0, 2, Expect::Any);
+        }
+    }
+    s.finish();
+}
+
+/// The float sigmas on both sides of each end of the refused run, and a spread, through the whole pipeline.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn z2_blur_at_the_floats_either_side_of_the_refused_run() {
+    let mut s = Suite::new("blur-edges");
+    let m = std_media();
+    let refused = |x: f32| kerf_gpu::effects::gaussian(f64::from(x)).is_none();
+    let mut edges = Vec::new();
+    let mut prev = false;
+    for b in 1.0e-8f32.to_bits()..=1.3e-8f32.to_bits() {
+        let r = refused(f32::from_bits(b));
+        if r != prev {
+            edges.push(b);
+        }
+        prev = r;
+    }
+    assert_eq!(edges.len(), 2, "one refused run: {edges:?}");
+    let mut sigmas: Vec<f64> = Vec::new();
+    for e in edges {
+        for d in [-2i64, -1, 0, 1, 2] {
+            sigmas.push(f64::from(f32::from_bits((i64::from(e) + d) as u32)));
+        }
+    }
+    for sigma in sigmas {
+        let (tl, a) = alone(&m.noise, SECS, None, &|c| c.effects = vec![VideoEffect::Blur { sigma }]);
+        s.motion(&format!("noise sigma {sigma:e}"), &tl, &a, 30.0, 2, Expect::Any);
+        let (tl, a) = alone(&m.noise, 1.0, None, &|c| c.effects = vec![VideoEffect::Blur { sigma }]);
+        s.still(&format!("noise sigma {sigma:e}"), &tl, &a, 0.5, Expect::Any);
+    }
+    s.finish();
+}
+
+// ---- the chroma key after a scale -----------------------------------------------------------------------
+
+fn chroma_key(color: &str, similarity: f64, blend: f64) -> VideoEffect {
+    VideoEffect::ChromaKey {
+        color: color.into(),
+        similarity,
+        blend,
+    }
+}
+
+/// A picture whose chroma runs smoothly through the key colour, so the key's alpha takes every level (a sample off by one in a chroma
+/// plane moves it).
+fn chroma_gradient() -> Asset {
+    media().x264(
+        "z2-chroma-gradient.mp4",
+        &format!(
+            "nullsrc=size=640x360:rate=30:duration=2,format=yuv444p,geq=lum='40+X*160/W':cb='128+(X-W/2)*140/W+sin(Y/9)*6':cr='128+(Y-H/2)*140/H+cos(X/11)*6',{UNTAGGED}"
+        ),
+        "yuv420p",
+        &[],
+    )
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn z2_a_chroma_key_after_a_scale_is_exact_where_it_is_drawn() {
+    let (m, mut s) = (std_media(), Suite::new("key-lift"));
+    let grad = chroma_gradient();
+    let keys = [
+        chroma_key("0x808080", 0.25, 0.2),
+        chroma_key("0x808080", 0.1, 0.0),
+        chroma_key("0x808080", 0.5, 0.5),
+        chroma_key("0x808080", 0.00001, 0.0),
+        chroma_key("0x808080", 1.0, 1.0),
+        chroma_key("0x00ff00", 0.3, 0.1),
+        chroma_key("0xff00ff", 0.15, 0.15),
+        chroma_key("0x7f7f81", 0.05, 0.02),
+    ];
+    // Scales around 1, odd ones and exact ones.
+    for scale in [
+        0.9999, 0.999, 0.99, 1.001, 1.01, 0.5, 0.5001, 0.7, 0.3333, 0.25, 0.1, 1.5, 2.0, 0.55, 0.4985,
+    ] {
+        for (i, k) in keys.iter().enumerate() {
+            if i % 3 != (scale * 1000.0) as usize % 3 && i > 2 {
+                continue;
+            }
+            for fg in [&grad, &m.noise] {
+                let (tl, a) = over(&m.bars, fg, SECS, &|c| {
+                    c.transform.scale = scale;
+                    c.effects = vec![k.clone()];
+                });
+                s.motion(&format!("{} scale {scale} key {i}", fg.name), &tl, &a, 30.0, 2, Expect::Any);
+            }
+        }
+    }
+    s.finish();
+}
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn z2_a_chroma_key_after_a_scale_with_every_effect_and_company() {
+    let (m, mut s) = (std_media(), Suite::new("key-lift-company"));
+    let grad = chroma_gradient();
+    let key = || chroma_key("0x808080", 0.3, 0.15);
+    let before: Vec<(&str, Vec<VideoEffect>)> = vec![
+        ("blur 2", vec![VideoEffect::Blur { sigma: 2.0 }]),
+        ("blur 40", vec![VideoEffect::Blur { sigma: 40.0 }]),
+        ("sharpen 0.5", vec![VideoEffect::Sharpen { amount: 0.5 }]),
+        ("sharpen 3", vec![VideoEffect::Sharpen { amount: 3.0 }]),
+        ("sharpen -1", vec![VideoEffect::Sharpen { amount: -1.0 }]),
+        ("invert", vec![VideoEffect::Invert]),
+        ("grayscale", vec![VideoEffect::Grayscale]),
+        ("vignette", vec![VideoEffect::Vignette]),
+        (
+            "blur sharpen invert grayscale",
+            vec![
+                VideoEffect::Blur { sigma: 3.0 },
+                VideoEffect::Sharpen { amount: 0.4 },
+                VideoEffect::Invert,
+                VideoEffect::Grayscale,
+            ],
+        ),
+    ];
+    for scale in [0.6, 0.9] {
+        for (name, fx) in &before {
+            for fg in [&grad, &m.noise] {
+                let (tl, a) = over(&m.bars, fg, SECS, &|c| {
+                    c.transform.scale = scale;
+                    c.effects = fx.iter().cloned().chain([key()]).collect();
+                });
+                s.motion(
+                    &format!("{} {name} then key at {scale}", fg.name),
+                    &tl,
+                    &a,
+                    30.0,
+                    2,
+                    Expect::Any,
+                );
+            }
+        }
+    }
+    // The key beside a grade, an opacity, a fade, a crop, a rotation, a position, a mask and a keyed scale.
+    let mut cases: Vec<(&str, Box<dyn Fn(&mut Clip)>)> = Vec::new();
+    cases.push((
+        "graded",
+        Box::new(|c| {
+            c.color = Color {
+                gamma: 1.4,
+                saturation: 1.2,
+                ..Color::default()
+            };
+        }),
+    ));
+    cases.push(("opacity 0.6", Box::new(|c| c.transform.opacity = 0.6)));
+    cases.push((
+        "fade in",
+        Box::new(|c| {
+            c.fade_in = 0.3;
+        }),
+    ));
+    cases.push((
+        "crop",
+        Box::new(|c| {
+            c.transform.crop_left = 0.1;
+            c.transform.crop_top = 0.07;
+        }),
+    ));
+    cases.push(("rotation 15", Box::new(|c| c.transform.rotation = 15.0)));
+    cases.push((
+        "position",
+        Box::new(|c| {
+            c.transform.pos_x = 0.2;
+            c.transform.pos_y = -0.1;
+        }),
+    ));
+    cases.push(("mask", Box::new(|c| c.mask = Some(mask_of(MaskShape::Ellipse)))));
+    cases.push((
+        "keyed scale",
+        Box::new(|c| c.set_property_keys(Property::Scale, vec![eased(0.0, 0.5, Easing::EaseInOut), key_at(0.3, 0.9)])),
+    ));
+    cases.push((
+        "keyed position",
+        Box::new(|c| c.set_property_keys(Property::PosX, vec![key_at(0.0, -0.2), key_at(0.3, 0.2)])),
+    ));
+    cases.push((
+        "keyed opacity",
+        Box::new(|c| c.set_property_keys(Property::Opacity, vec![key_at(0.0, 0.9), key_at(0.3, 0.2)])),
+    ));
+    cases.push(("speed 2", Box::new(|c| c.speed = 2.0)));
+    for (name, edit) in &cases {
+        for fg in [&grad, &m.noise] {
+            let (tl, a) = over(&m.bars, fg, 0.6, &|c| {
+                c.transform.scale = 0.6;
+                c.effects = vec![key()];
+                edit(c);
+            });
+            s.motion(&format!("{} key with {name}", fg.name), &tl, &a, 30.0, 4, Expect::Any);
+        }
+    }
+    s.finish();
+}
+
+fn key_at(time: f64, value: f64) -> PropertyKey {
+    PropertyKey::new(time, value)
+}
+
+/// Deliveries that scale (Contain and Cover, odd sizes) with a key, in a still and an export.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn z2_a_chroma_key_after_a_delivery_scale() {
+    let (m, mut s) = (std_media(), Suite::new("key-lift-delivery"));
+    let grad = chroma_gradient();
+    let key = || chroma_key("0x808080", 0.3, 0.15);
+    for (w, h) in [(320u32, 180u32), (202, 100), (240, 240), (90, 160), (642, 362), (480, 270)] {
+        for fit in [Fit::Contain, Fit::Cover] {
+            for fg in [&grad, &m.noise] {
+                for scale in [1.0, 0.8] {
+                    let (tl, a) = alone(fg, 1.0, delivery(w, h, fit), &|c| {
+                        c.effects = vec![key()];
+                        c.transform.scale = scale;
+                    });
+                    s.still(
+                        &format!("{} {w}x{h} {fit:?} scale {scale}", fg.name),
+                        &tl,
+                        &a,
+                        0.5,
+                        Expect::Any,
+                    );
+                }
+            }
+        }
+    }
+    for (w, h) in [(320u32, 180u32), (202, 100)] {
+        for fit in [Fit::Contain, Fit::Cover] {
+            let (tl, a) = over(&m.bars, &grad, SECS, &|c| c.effects = vec![key()]);
+            let mut tl = tl;
+            tl.format = delivery(w, h, fit);
+            s.motion(&format!("{w}x{h} {fit:?}"), &tl, &a, 30.0, 2, Expect::Any);
+        }
+    }
+    s.finish();
+}
+
+/// Every source format the decode reduces, a key after the fit scale.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn z2_a_chroma_key_after_a_scale_in_every_format() {
+    let mut s = Suite::new("key-lift-format");
+    for name in [
+        "yuv420p10le",
+        "yuv422p10le",
+        "yuv444p10le",
+        "yuv420p10le-pc",
+        "yuvj420p",
+        "yuvj444p",
+        "yuv420p-pc",
+        "yuv422p",
+        "yuv444p",
+        "yuv440p",
+        "bgr0",
+        "gray",
+        "yuva420p",
+        "bt709",
+        "bt2020",
+        "smpte170m",
+    ] {
+        let fg = noise_format(name);
+        for scale in [0.6, 0.999] {
+            let (tl, a) = alone(&fg, SECS, None, &|c| {
+                c.transform.scale = scale;
+                c.effects = vec![chroma_key("0x808080", 0.3, 0.15)];
+            });
+            s.motion(&format!("{name} scale {scale}"), &tl, &a, 30.0, 2, Expect::Any);
+        }
+        let (tl, a) = alone(&fg, 1.0, delivery(202, 100, Fit::Cover), &|c| {
+            c.effects = vec![chroma_key("0x808080", 0.3, 0.15)];
+        });
+        s.still(&format!("{name} cover 202x100"), &tl, &a, 0.5, Expect::Any);
+    }
+    s.finish();
+}
+
+// ---- the alpha rule of a dissolve ------------------------------------------------------------------------------
+
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn z2_the_alpha_ramp_of_a_dissolve_and_a_fade_over_many_opacities_and_rates() {
+    let (m, mut s) = (std_media(), Suite::new("alpha-ramp"));
+    for o in [
+        0.004,
+        0.02,
+        0.1,
+        0.2,
+        0.37,
+        0.5,
+        0.63,
+        0.8,
+        0.9,
+        0.99,
+        126.5 / 255.0,
+        127.5 / 255.0,
+    ] {
+        let (tl, a) = over(&m.bars, &m.noise, 0.8, &|c| {
+            c.transform.opacity = o;
+            c.fade_in = 0.5;
+            c.fade_out = 0.4;
+        });
+        s.motion(&format!("fade at {o}"), &tl, &a, 30.0, 24, Expect::Any);
+        let mut out = clip(&m.testsrc, 0.0, 0.8, 0.0);
+        out.transform.opacity = o;
+        let mut inc = clip(&m.noise, 0.0, 0.8, 0.6);
+        inc.transform.opacity = 1.0 - o / 2.0;
+        inc.transition_in = Some(Transition {
+            kind: TransitionKind::Crossfade,
+            duration: 0.5,
+        });
+        let tl = timeline(vec![vec![out, inc]], None);
+        s.motion(
+            &format!("crossfade outgoing at {o}"),
+            &tl,
+            &[m.testsrc.clone(), m.noise.clone()],
+            30.0,
+            36,
+            Expect::Any,
+        );
+    }
+    for fps in [24.0, 25.0, 29.97, 50.0, 60.0] {
+        let (tl, a) = over(&m.bars, &m.noise, 0.8, &|c| {
+            c.transform.opacity = 0.6;
+            c.fade_in = 0.5;
+        });
+        s.motion(&format!("fade at {fps} fps"), &tl, &a, fps, 16, Expect::Any);
+    }
+    s.finish();
+}
+
+// ---- every way out as RGB --------------------------------------------------------------------------------------------
+
+/// With the display conversion not a match (`Differs`, `Unknown`) every entry point that hands RGB out answers `Unsupported` **before it
+/// decodes** (the clip is gone from the disk when they are asked), and `Output::Yuv` is untouched; with `Match` the RGB comes.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn z2_every_entry_point_that_hands_out_rgb_refuses_before_the_decode() {
+    use kerf_gpu::display_probe::Display;
+    let (w, h) = (320usize, 180usize);
+    let frame = yuv(noise_bytes(77, w * h), noise_bytes(78, w * h / 4), noise_bytes(79, w * h / 4));
+    let a = raw_clip("z2-entry-private.mkv", w, h, "yuv420p", &frame, 30);
+    let (tl, assets) = alone(&a, 1.0, None, &|_| {});
+    let opts = ExportOptions::default();
+    let plan = RenderPlan::at(&tl, &assets, &opts, 0.5, policy()).expect("plan");
+    let size = plan.size(u32::MAX);
+    prime();
+    let layers = kerf_gpu::decode_layers(&plan.layers).expect("decode while the clip is there");
+    let shared: Vec<Option<Arc<YuvFrame>>> = layers.iter().cloned().map(|l| l.map(Arc::new)).collect();
+    let counts: Vec<Option<u64>> = vec![Some(0); shared.len()];
+    let planner = Planner::new(&tl, &assets, &at_fps(30.0), PlanRequest::motion(policy())).expect("planner");
+    let motion_plan = planner.at_frame(1).expect("a motion plan");
+    let path = assets[0].path.clone();
+    let gone = format!("{path}.gone");
+    let source = FrameSource::new(FrameSourceConfig::default());
+    let hint = kerf_gpu::Hint::Scrub;
+    let mut seen = Vec::new();
+    for pinned in [
+        Display::Differs("a CPU with another kernel".into()),
+        Display::Unknown,
+        Display::Match,
+    ] {
+        let c = Compositor::new(gpu()).expect("a compositor").with_display(pinned.clone());
+        let mut motion = MotionFrames::new(frame_source());
+        std::fs::rename(&path, &gone).expect("hide the clip");
+        let results: Vec<(&str, Result<(), GpuError>)> = vec![
+            ("composite", c.composite(&plan, &layers, size).map(|_| ())),
+            ("composite_shared", c.composite_shared(&plan, &shared, size).map(|_| ())),
+            (
+                "composite_counted",
+                c.composite_counted(&plan, &shared, &counts, size).map(|_| ()),
+            ),
+            ("render_plan", c.render_plan(&plan, size).map(|_| ())),
+            ("render_plan_with", c.render_plan_with(&plan, size, &source, hint).map(|_| ())),
+            (
+                "render_plan_texture_with",
+                c.render_plan_texture_with(&plan, size, &source, hint).map(|_| ()),
+            ),
+            (
+                "render_draft_texture_with",
+                c.render_draft_texture_with(&plan, size, &source, hint).map(|_| ()),
+            ),
+            (
+                "render_motion_texture",
+                c.render_motion_texture(&motion_plan, size, &mut motion).map(|_| ()),
+            ),
+        ];
+        std::fs::rename(&gone, &path).expect("put the clip back");
+        let yuv_ok = c.composite_yuv(&plan, &layers, size).is_ok();
+        for (name, r) in results {
+            match (&pinned, r) {
+                (Display::Match, Ok(())) => {}
+                (Display::Match, Err(e)) if !e.to_string().contains("yuv420p -> rgb24") => {}
+                (Display::Match, Err(e)) => seen.push(format!("{name} with Match: refused for the display: {e}")),
+                (_, Err(GpuError::Unsupported(msg))) if msg.contains("yuv420p -> rgb24") => {}
+                (_, Err(e)) => seen.push(format!("{name} with {pinned:?}: {e:?} (not the display refusal)")),
+                (_, Ok(())) => seen.push(format!("{name} with {pinned:?}: RGB handed out")),
+            }
+        }
+        if !yuv_ok {
+            seen.push(format!(
+                "composite_yuv with {pinned:?} was refused: the YUV planes must be unaffected"
+            ));
+        }
+    }
+    assert!(seen.is_empty(), "{seen:#?}");
+}
+
+// ---- planes too small for FFmpeg's own kernel ---------------------------------------------------------------------
+
+/// A blur on layers scaled down to a handful of pixels: the plane `gblur` runs on has a side of 1 to a dozen samples, where FFmpeg's AVX2
+/// kernel crashes (a side of 1) or answers differently from run to run. A plan that draws such a frame draws one FFmpeg has no stable answer
+/// for: listed as `NO ANSWER` and failed, since the frame is not provably exact.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn z2_a_blur_on_a_layer_scaled_to_a_few_pixels_is_drawn_only_where_ffmpeg_has_an_answer() {
+    let mut s = Suite::new("blur-tiny-layer");
+    let m = std_media();
+    let mut no_answer = Vec::new();
+    for scale in [0.0016, 0.002, 0.003, 0.004, 0.006, 0.0078, 0.01, 0.0125, 0.02, 0.03, 0.05] {
+        for sigma in [0.5, 3.0] {
+            let (tl, a) = over(&m.bars, &m.noise, 1.0, &|c| {
+                c.transform.scale = scale;
+                c.effects = vec![VideoEffect::Blur { sigma }];
+            });
+            let opts = ExportOptions::default();
+            let plan = RenderPlan::at(&tl, &a, &opts, 0.5, policy()).expect("plan");
+            let size = plan.size(u32::MAX);
+            let why: Vec<String> = plan
+                .reasons(&compositor().caps(), size)
+                .iter()
+                .map(ToString::to_string)
+                .collect();
+            let drawn = why.is_empty();
+            let mut answers = BTreeSet::new();
+            let mut crashes = 0;
+            for _ in 0..6 {
+                match kerf_core::timeline_frame_yuv_cancellable(&tl, &a, &opts, 0.5, u32::MAX, &|| false) {
+                    Ok((_, _, yuv)) => {
+                        answers.insert(yuv);
+                    }
+                    Err(_) => crashes += 1,
+                }
+            }
+            let picture = plan.layers.last().map(|l| (l.stream.width, l.stream.height));
+            let state = if crashes > 0 {
+                format!("FFmpeg's still fails {crashes} of 6 times")
+            } else if answers.len() > 1 {
+                format!("FFmpeg gives {} different stills in 6 runs", answers.len())
+            } else {
+                "FFmpeg's still is stable".to_string()
+            };
+            eprintln!(
+                "Z tiny layer scale {scale} sigma {sigma} (source {picture:?}): plan {}; {state}",
+                if drawn {
+                    "DRAWS".to_string()
+                } else {
+                    format!(
+                        "refuses {:?}",
+                        why.iter()
+                            .map(|w| w.chars().take(110).collect::<String>())
+                            .collect::<Vec<_>>()
+                    )
+                }
+            );
+            if drawn && (crashes > 0 || answers.len() > 1) {
+                no_answer.push(format!("scale {scale} sigma {sigma}: {state}"));
+            }
+            if drawn && crashes == 0 && answers.len() == 1 {
+                s.still(&format!("scale {scale} sigma {sigma}"), &tl, &a, 0.5, Expect::Any);
+            }
+        }
+    }
+    for n in &no_answer {
+        eprintln!("Z NO ANSWER {n}");
+        s.fail(format!(
+            "NO ANSWER: the plan draws a blurred layer FFmpeg has no stable answer for: {n}"
+        ));
+    }
+    s.finish();
+}
+
+/// Pictures a few pixels across, unscaled (the canvas is the clip's size): the plane `gblur` runs on has a side of 2 to 40 samples. FFmpeg's
+/// AVX2 kernel is not the filter on every such plane (its scratch buffer is sized from the luma plane; the kernel works a block of columns
+/// or rows past what a narrow plane has). A frame the plan draws must be FFmpeg's to the sample, whatever the picture's size.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn z2_a_blur_on_a_tiny_unscaled_picture() {
+    let mut s = Suite::new("blur-tiny-picture");
+    let sizes = [
+        (2usize, 2usize),
+        (2, 4),
+        (2, 6),
+        (2, 16),
+        (2, 40),
+        (4, 2),
+        (4, 4),
+        (4, 6),
+        (6, 2),
+        (6, 4),
+        (6, 6),
+        (8, 2),
+        (8, 4),
+        (8, 6),
+        (8, 8),
+        (12, 2),
+        (12, 4),
+        (12, 6),
+        (12, 8),
+        (16, 2),
+        (16, 4),
+        (16, 6),
+        (16, 8),
+        (16, 16),
+        (32, 2),
+        (32, 4),
+        (32, 6),
+        (40, 8),
+        (40, 40),
+    ];
+    for (w, h) in sizes {
+        let (cw, ch) = (w / 2, h / 2);
+        let frame = yuv(
+            noise_bytes((w * 97 + h) as u64, w * h),
+            noise_bytes((w * 97 + h + 1) as u64, cw * ch),
+            noise_bytes((w * 97 + h + 2) as u64, cw * ch),
+        );
+        let a = raw_clip(&format!("z2-tiny-{w}x{h}.mkv"), w, h, "yuv420p", &frame, 30);
+        for sigma in [0.5, 3.0] {
+            let (tl, assets) = alone(&a, 1.0, None, &|c| c.effects = vec![VideoEffect::Blur { sigma }]);
+            s.still(&format!("{w}x{h} sigma {sigma}"), &tl, &assets, 0.5, Expect::Any);
+        }
+    }
+    s.finish();
+}
+
+/// The same pictures through an export, whose filter graph runs with the machine's threads (a still runs with one): `gblur` is sliced
+/// across them, and its AVX2 kernel answers differently from the single-slice filter on a plane with few rows per slice. The thread
+/// count is the machine's (here 4); pictures up to a handful of rows tall are where it shows.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn z2_a_blur_on_a_small_picture_in_an_export() {
+    let mut s = Suite::new("blur-small-export");
+    let sizes = [
+        (16usize, 4usize),
+        (16, 6),
+        (16, 8),
+        (16, 10),
+        (16, 12),
+        (16, 14),
+        (16, 16),
+        (16, 20),
+        (16, 24),
+        (32, 6),
+        (32, 8),
+        (32, 12),
+        (64, 4),
+        (64, 6),
+        (64, 8),
+        (64, 12),
+        (64, 16),
+        (64, 24),
+        (64, 32),
+        (128, 6),
+        (128, 8),
+        (128, 16),
+    ];
+    for (w, h) in sizes {
+        let (cw, ch) = (w / 2, h / 2);
+        let frame = yuv(
+            noise_bytes((w * 91 + h) as u64, w * h),
+            noise_bytes((w * 91 + h + 1) as u64, cw * ch),
+            noise_bytes((w * 91 + h + 2) as u64, cw * ch),
+        );
+        let a = raw_clip(&format!("z2-small-{w}x{h}.mkv"), w, h, "yuv420p", &frame, 30);
+        for sigma in [0.5, 3.0] {
+            let (tl, assets) = alone(&a, 0.2, None, &|c| c.effects = vec![VideoEffect::Blur { sigma }]);
+            s.motion(&format!("{w}x{h} sigma {sigma}"), &tl, &assets, 30.0, 2, Expect::Any);
+        }
+    }
+    s.finish();
+}
+
+/// Noise tagged `tag` (`setparams=colorspace=`), lossless; `None` where this FFmpeg cannot make it.
+fn tagged_clip(name: &str, tag: &str) -> Option<Asset> {
+    let m = media();
+    let mut cache = m.cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some(a) = cache.get(name) {
+        return Some(a.clone());
+    }
+    let p = m.dir.join(name);
+    let part = m.dir.join(format!("{}.{}.part.mkv", slug(name), std::process::id()));
+    let out = Command::new(kerf_core::ffmpeg_path())
+        .args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-f", "lavfi", "-i"])
+        .arg(noise_src(640, 360, 2, &format!("setparams=colorspace={tag}")))
+        .args(["-c:v", "ffv1", "-pix_fmt", "yuv420p"])
+        .arg(&part)
+        .stdin(Stdio::null())
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        let _ = std::fs::remove_file(&part);
+        return None;
+    }
+    std::fs::rename(&part, &p).ok()?;
+    let a = Project::probe_asset(&p).ok()?;
+    cache.insert(name.to_string(), a.clone());
+    Some(a)
+}
+
+/// Every matrix tag a source can carry, as the composite's tag (a still of the footage alone, and over a differently tagged background):
+/// the planes, the PNG and the display RGB are FFmpeg's wherever the plan draws the frame, whatever coefficients the tag names.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn z2_the_display_and_the_composite_under_every_matrix_tag() {
+    let (m, mut s) = (std_media(), Suite::new("tags"));
+    for tag in [
+        "bt709",
+        "fcc",
+        "bt470bg",
+        "smpte170m",
+        "smpte240m",
+        "bt2020nc",
+        "bt2020c",
+        "unknown",
+        "chroma-derived-nc",
+        "chroma-derived-c",
+        "ycgco",
+        "gbr",
+        "ictcp",
+    ] {
+        let name = format!("z2-tag-{tag}.mkv");
+        let Some(fg) = tagged_clip(&name, tag) else {
+            eprintln!("Z tags: this FFmpeg cannot make footage tagged {tag}: skipped");
+            continue;
+        };
+        for (w, h) in [(640u32, 360u32), (202, 100)] {
+            let (tl, a) = alone(&fg, 1.0, delivery(w, h, Fit::Cover), &|_| {});
+            s.still(&format!("{tag} alone {w}x{h}"), &tl, &a, 0.5, Expect::Any);
+        }
+        let (tl, a) = over(&m.bars, &fg, 1.0, &|c| c.transform.scale = 0.7);
+        s.still(&format!("{tag} over untagged bars"), &tl, &a, 0.5, Expect::Any);
+        let (tl, a) = over(&fg, &m.testsrc, 1.0, &|c| c.transform.scale = 0.7);
+        s.still(&format!("untagged over {tag}"), &tl, &a, 0.5, Expect::Any);
+        let (tl, a) = alone(&fg, SECS, None, &|_| {});
+        s.motion(&format!("{tag} export"), &tl, &a, 30.0, 2, Expect::Any);
+    }
+    s.finish();
+}
+
+/// A render size the plan's canvas does not come out at (an odd one, or a different even one) is refused whatever the display says: the
+/// conversion kernel FFmpeg runs for an odd height is another (the C one), and the compositor's display model is the x86 one.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn z2_a_render_size_the_canvas_does_not_have_is_refused() {
+    let m = std_media();
+    let (tl, a) = alone(&m.noise, 1.0, None, &|_| {});
+    let plan = RenderPlan::at(&tl, &a, &ExportOptions::default(), 0.5, policy()).expect("plan");
+    prime();
+    let c = Compositor::new(gpu())
+        .expect("a compositor")
+        .with_display(kerf_gpu::display_probe::Display::Match);
+    let layers = kerf_gpu::decode_layers(&plan.layers).expect("decode");
+    let right = plan.size(u32::MAX);
+    assert!(
+        c.composite(&plan, &layers, right).is_ok(),
+        "the control: the canvas' own size is drawn"
+    );
+    let mut drawn_odd = Vec::new();
+    for size in [
+        (right.0 - 1, right.1),
+        (right.0, right.1 - 1),
+        (right.0 - 1, right.1 - 1),
+        (321, 181),
+        (right.0 + 1, right.1 + 1),
+        (3, 3),
+        (1, 1),
+    ] {
+        match c.composite(&plan, &layers, size) {
+            Ok(f) => drawn_odd.push(format!("{size:?}: drawn {}x{}", f.width, f.height)),
+            Err(GpuError::Unsupported(_)) => {}
+            Err(e) => drawn_odd.push(format!("{size:?}: {e}")),
+        }
+    }
+    eprintln!("Z render sizes other than the canvas': {drawn_odd:?}");
+    assert!(drawn_odd.is_empty(), "{drawn_odd:?}");
+}
+
+// ---- the alpha rule's rounding at its ties ---------------------------------------------------------------------------
+
+/// Footage long enough for a dissolve of four seconds: `(under, over)`, 320x180, 7 s.
+fn long_footage() -> &'static (Asset, Asset) {
+    static L: OnceLock<(Asset, Asset)> = OnceLock::new();
+    L.get_or_init(|| {
+        let m = media();
+        (
+            m.x264(
+                "z2-long-a.mp4",
+                &format!("testsrc2=size=320x180:rate=30:duration=7,{UNTAGGED}"),
+                "yuv420p",
+                &[],
+            ),
+            m.x264("z2-long-b.mp4", &noise_src(320, 180, 7, UNTAGGED), "yuv420p", &[]),
+        )
+    })
+}
+
+/// The cut: the first footage, then the second dissolving in over `fade` seconds from 0.6 s, at `mixed / 255` opacity.
+fn dissolve_in(mixed: u32, fade: f64) -> (Timeline, Vec<Asset>) {
+    let (a, b) = long_footage();
+    let mut out = clip(a, 0.0, 6.5, 0.0);
+    out.transform.opacity = 1.0;
+    let mut inc = clip(b, 0.0, 6.0, 0.6);
+    inc.transform.opacity = f64::from(mixed) / 255.0;
+    inc.transition_in = Some(Transition {
+        kind: TransitionKind::Crossfade,
+        duration: fade,
+    });
+    (timeline(vec![vec![out, inc]], None), vec![a.clone(), b.clone()])
+}
+
+/// The ramp factors `(frame, factor)` of a dissolve-in on a translucent clip, as the plan evaluates them for every frame of the fade.
+fn alpha_ramp_factors(fps: f64, fade: f64) -> Vec<(u64, u32)> {
+    let (tl, a) = dissolve_in(128, fade);
+    let planner = Planner::new(&tl, &a, &at_fps(fps), PlanRequest::motion(policy())).expect("planner");
+    let mut out = Vec::new();
+    let from = (0.6 * fps) as u64;
+    for k in from.saturating_sub(1)..((0.6 + fade) * fps).ceil() as u64 + 2 {
+        let Ok(plan) = planner.at_frame(k) else { continue };
+        for layer in &plan.layers {
+            for op in plan.fade_ops(layer) {
+                if op.tint == kerf_core::FadeTint::Alpha && op.edge == kerf_core::FadeEdge::In {
+                    out.push((k, op.factor));
+                }
+            }
+        }
+    }
+    out
+}
+
+/// The rounding constant of `ffmpeg_alpha_ramped` matters only at a tie, `(mixed * factor) mod 2^16 = 2^15`, where `+ 32768` and `+ 32767`
+/// in `(mixed * ramp + 32768) >> 16` differ; the unit test's own cases and the sweeps above never reach one (a mutation of the constant
+/// survives them). This asks the planner for the factors of many fade lengths and rates, finds the opacities whose frames sit on a tie, and
+/// draws exactly those.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn z2_the_alpha_ramp_at_the_ties_of_its_rounding() {
+    let mut s = Suite::new("alpha-ties");
+    // (mixed, fps, fade, tie frames)
+    let mut found: Vec<(u32, f64, f64, Vec<u64>)> = Vec::new();
+    let mut per_mixed: BTreeMap<u32, usize> = BTreeMap::new();
+    for fps in [24.0, 30.0, 48.0, 50.0, 60.0] {
+        for k in 1..=60 {
+            let fade = f64::from(k) * 0.07;
+            let factors = alpha_ramp_factors(fps, fade);
+            for mixed in 1..=254u32 {
+                let ties: Vec<u64> = factors
+                    .iter()
+                    .filter(|(_, f)| (mixed * f) % 65536 == 32768)
+                    .map(|(k, _)| *k)
+                    .collect();
+                if !ties.is_empty() && *per_mixed.entry(mixed).or_default() < 2 {
+                    *per_mixed.entry(mixed).or_default() += 1;
+                    found.push((mixed, fps, fade, ties));
+                }
+            }
+        }
+    }
+    eprintln!(
+        "Z alpha ties: {} (opacity, rate, fade) triples with a frame on a tie of the rounding, for {} different opacities: {:?}",
+        found.len(),
+        per_mixed.len(),
+        found.iter().take(10).collect::<Vec<_>>()
+    );
+    assert!(
+        !found.is_empty(),
+        "no fade length and rate puts a frame on a tie of the rounding"
+    );
+    // A spread of them: different opacities, rates and lengths.
+    let step = (found.len() / 14).max(1);
+    for (mixed, fps, fade, ties) in found.iter().step_by(step).take(14) {
+        let (tl, a) = dissolve_in(*mixed, *fade);
+        let last = ties.iter().max().copied().unwrap_or(0) + 1;
+        s.motion(
+            &format!("mixed {mixed} at {fps} fps fade {fade:.2}: ties at {ties:?}"),
+            &tl,
+            &a,
+            *fps,
+            last,
+            Expect::Any,
+        );
     }
     s.finish();
 }
