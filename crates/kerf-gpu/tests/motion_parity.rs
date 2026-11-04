@@ -4429,7 +4429,6 @@ fn a_chroma_key_after_a_scale_is_drawn_as_chromakey_draws_it() {
         c.effects = vec![key("0x808080", 0.25, 0.2)];
     });
     run("key-scale/moved", &tl, &assets, 30.0, 1.0);
-    let cover = Delivery::new(960, 540, Fit::Cover);
     // Enlargements: the picture drawn bigger than it is (a 640x360 clip into a 960x540 frame, 1.5x, into 1280x720, 2x, under Cover and under
     // Contain, and shrunk back a little after the fit: 1.35x), every key position among the other effects, noise and a test card. (A zoom
     // in on top of a fit is the plan's own refusal, "a Cover clip that zooms" and "a zoom in under Contain", and is not drawn.)
