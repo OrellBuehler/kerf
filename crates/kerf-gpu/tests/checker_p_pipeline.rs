@@ -361,7 +361,16 @@ impl Tally {
                         }
                     }
                     Some(g) => eprintln!("CHECKER-P {case}: refused; drawn anyway {g:?}"),
-                    None => eprintln!("CHECKER-P {case}: refused (no thread count draws it) {others:?}"),
+                    None => {
+                        eprintln!("CHECKER-P {case}: refused (no thread count draws it) {others:?}");
+                        // (Pinned to one thread the plan clears every picture but one with a plane a sample across: a pin it ignores
+                        // is a refusal nothing can lift.)
+                        if others.is_empty() {
+                            self.failures.push(format!(
+                                "{case}: refused as a blur on a plane at every pin: the plan ignores the compositor's pin"
+                            ));
+                        }
+                    }
                 }
             }
             Outcome::Other(why) => {
@@ -390,7 +399,18 @@ fn budgets() -> Vec<(u8, (usize, usize))> {
 /// Canvases for a slice-thread range: the plane heights at a flip of the rule (chroma rows against the threads), and a column of rows over
 /// a narrow plane.
 fn canvases((lo, hi): (usize, usize)) -> Vec<(u32, u32)> {
-    let mut v = vec![(16, 32), (32, 16), (16, 64), (24, 32), (34, 34), (64, 64)];
+    // (8x8 and 8x12: a hazard for the 8-lane kernel's rows and not the 16-lane one's; 12x16 and 16x16 the other way and both.)
+    let mut v = vec![
+        (16, 32),
+        (32, 16),
+        (16, 64),
+        (24, 32),
+        (34, 34),
+        (64, 64),
+        (8, 8),
+        (8, 12),
+        (12, 16),
+    ];
     for t in [lo, hi] {
         for chroma_rows in [t.saturating_sub(1), t, t + 1] {
             let h = (2 * chroma_rows).max(16) as u32;
@@ -619,6 +639,11 @@ fn judge_still(
     }
     tally.refused += 1;
     eprintln!("CHECKER-P {case}: refused ({others:?}), no thread count draws it");
+    if others.is_empty() {
+        tally.failures.push(format!(
+            "{case}: refused as a blur on a plane at every pin: the plan ignores the compositor's pin"
+        ));
+    }
 }
 
 /// A still of an image runs its graph on one slice thread whatever the budget (`single_frame_args`), a still of footage on the budget's: the
