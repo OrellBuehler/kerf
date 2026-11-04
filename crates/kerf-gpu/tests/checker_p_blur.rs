@@ -710,3 +710,92 @@ fn checker_p_blur_probe_a_match_is_a_kernel_the_rule_is_sound_for() {
         &failures[..failures.len().min(10)]
     );
 }
+
+// ---- the boundaries, against FFmpeg -----------------------------------------------------------------
+
+/// Whether any of three runs of `w` x `h` on `t` threads differs from the model on a plane (the race of an empty slice can hide a bad
+/// plane in a run of one): per plane, `Y`, `U`, `V`.
+fn differs_in_three(w: usize, h: usize, t: usize, cpu: &[&str]) -> Option<[bool; 3]> {
+    let mut bad = [false; 3];
+    for seed in 0..3u64 {
+        let (planes, got) = blurred(w, h, "3", Some(t), Graph::Simple, cpu, 1 + seed)?;
+        for (k, (pw, ph)) in plane_dims(w, h).into_iter().enumerate() {
+            bad[k] |= got[k] != model(&planes[k], pw, ph, 3.0);
+        }
+    }
+    Some(bad)
+}
+
+/// The edge of each hazard is where the rule puts it, on both sides, against FFmpeg on each kernel: a plane the rule refuses differs from
+/// the model (at sigma 3, where what the kernel does wrong moves the picture by tens of levels) and one it clears does not. So a comparison
+/// moved by one in the rule is a refusal of an exact plane or a clearing of a bad one, at the plane it moved to.
+///
+/// * rows against threads: `rows - 1`, `rows` (exact) and `rows + 1` threads (bad), for plane heights 2 to 40;
+/// * width against the vector: `lanes - 1`, `lanes` (bad) and `lanes + 1` (exact), under one thread that cuts a slice of `lanes` rows or
+///   more;
+/// * a slice's rows against the vector: `lanes - 1` (exact) and `lanes`, `lanes + 1` (bad) rows, at one thread, and `2 * lanes - 1` and
+///   `2 * lanes` rows in two slices (`lanes - 1` and `lanes`).
+#[test]
+#[ignore = "needs ffmpeg"]
+fn checker_p_blur_the_edge_of_each_hazard_is_where_the_rule_puts_it() {
+    let mut failures = Vec::new();
+    let mut edges = 0;
+    for (name, cpu, lanes) in kernels() {
+        let mut cases: Vec<(usize, usize, usize)> = Vec::new();
+        // Rows against threads (a picture twice as tall has chroma of the plane's height: the luma plane is the test, the chroma planes
+        // are judged by their own dimensions all the same).
+        for h in 2..=40usize {
+            for t in [h - 1, h, h + 1] {
+                for w in [40usize, 65] {
+                    cases.push((w, h, t.max(1)));
+                }
+            }
+        }
+        let l = lanes as usize;
+        for w in [l - 1, l, l + 1] {
+            for h in [l - 1, l, l + 1, 2 * l - 1, 2 * l] {
+                for t in [1usize, 2] {
+                    cases.push((w.max(2), h, t));
+                }
+            }
+        }
+        cases.sort_unstable();
+        cases.dedup();
+        for (w, h, t) in cases {
+            let Some(bad) = differs_in_three(w, h, t, &cpu) else {
+                continue;
+            };
+            for (k, (pw, ph)) in plane_dims(w, h).into_iter().enumerate() {
+                let Some(hazard) = plane_hazard((pw as u32, ph as u32), t as u32, lanes) else {
+                    if bad[k] {
+                        failures.push(format!(
+                            "{name} {w}x{h} T{t} plane {} {pw}x{ph}: cleared and bad",
+                            ["Y", "U", "V"][k]
+                        ));
+                    }
+                    continue;
+                };
+                if hazard == KernelHazard::OneSample {
+                    continue;
+                }
+                edges += 1;
+                if !bad[k] {
+                    failures.push(format!(
+                        "{name} {w}x{h} T{t} plane {} {pw}x{ph}: {hazard:?} refused, and three runs are the model's",
+                        ["Y", "U", "V"][k]
+                    ));
+                }
+            }
+        }
+    }
+    eprintln!(
+        "CHECKER-P edges: {edges} refused planes at the edges, each bad in FFmpeg; {} problems",
+        failures.len()
+    );
+    assert!(
+        failures.is_empty(),
+        "{} problems, first: {:#?}",
+        failures.len(),
+        &failures[..failures.len().min(15)]
+    );
+}
