@@ -2103,13 +2103,34 @@ fn frames_the_gpu_would_draw_wrong_are_refused() {
         "the probe does not apply the EXIF orientation"
     );
     let tl = timeline(vec![vec![clip(&m.exif, 0.0, 5.0, 0.0)]], None);
-    check_refused(
-        "refused/exif-orientation",
-        &tl,
-        std::slice::from_ref(&m.exif),
-        1.0,
-        Refusal::Render("probed as"),
-    );
+    let exif_assets = std::slice::from_ref(&m.exif);
+    match policy() {
+        CompositeColorPolicy::FixedBt601 => {
+            check_refused(
+                "refused/exif-orientation",
+                &tl,
+                exif_assets,
+                1.0,
+                Refusal::Render("probed as"),
+            );
+        }
+        CompositeColorPolicy::BottomLayerTag => {
+            check_refused(
+                "refused/exif-orientation (negotiated: a full-range picture)",
+                &tl,
+                exif_assets,
+                1.0,
+                Refusal::Plan("full-range picture in a still"),
+            );
+            let plan = RenderPlan::at(&tl, exif_assets, &ExportOptions::default(), 1.0, policy()).expect("plan");
+            let err = kerf_gpu::decode_layer(&plan.layers[0]).expect_err("the decode should find the rotated picture");
+            assert!(
+                matches!(&err, kerf_gpu::GpuError::Unsupported(why) if why.contains("probed as")),
+                "{err}"
+            );
+        }
+        CompositeColorPolicy::Unknown => unreachable!("policy() never answers Unknown"),
+    }
 
     // Video with an alpha channel: the plan knows from the probed pixel format.
     assert_eq!(m.alpha.streams[0].pix_fmt.as_deref(), Some("yuva420p"));
