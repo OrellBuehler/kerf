@@ -84,8 +84,9 @@ fn compositor() -> &'static Compositor {
         let _ = kerf_gpu::placement_probe::placement();
         // ... and so is the layout of its `drawtext`, which decides whether text whose bitmaps share samples is drawn.
         let _ = kerf_gpu::text::model();
-        // ... and for which kinds of picture a moving still is drawn as this FFmpeg draws it.
-        let _ = kerf_gpu::still_probe::kinds();
+        // ... and for which kinds of picture, in which chains, a moving still is drawn as this FFmpeg draws it (every chain: the cases below take
+        // them all, where the app measures what a plan needs).
+        let _ = kerf_gpu::still_probe::all();
         // ...and the blend chain's, which the blend modes are in the caps by.
         let _ = kerf_gpu::blend::kernels();
         Compositor::new(gpu()).expect("a compositor")
@@ -16549,4 +16550,169 @@ fn checker_e_m_a_blend_over_a_pose_what_the_refusal_costs() {
         }
     }
     assert!(failures.is_empty(), "{} cases: {failures:#?}", failures.len());
+}
+
+// ==== T6, second round: the matrix a moving still decides, the passes a moving still has no pose for, the colour that is keyed ========
+
+/// A limited-range 4:2:0 picture that is a still (a JPEG 2000 file: the kind a WebP is for the compositor): `yuv420p`, no range flag.
+fn t6_limited_420(w: u32, h: u32) -> Asset {
+    let photo = t6_files::photo(
+        &format!("limited-{w}x{h}.jp2"),
+        &t6_files::grain(w, h),
+        &["-c:v", "jpeg2000", "-pix_fmt", "yuv420p"],
+    );
+    let stream = photo
+        .streams
+        .iter()
+        .find(|s| s.kind == kerf_core::StreamKind::Video)
+        .expect("a picture");
+    assert!(stream.image, "{:?} is not probed as a still image", photo.path);
+    assert_eq!(stream.pix_fmt.as_deref(), Some("yuv420p"));
+    photo
+}
+
+/// The export's moving still on its own route is a plain chain (`perspective` draws it into the frame and it ends in the delivery's
+/// format, not on the alpha plane `overlay` takes natively), so it never decides the colour matrix of the cut: the first clip does, the footage
+/// below it. A planner that took the still as placed (an alpha-plane chain, as a moving zoom's is) let the still's matrix decide, and the
+/// footage was converted from its own tag into the still's in the frames before the still came in, where FFmpeg 9 leaves it alone.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn t6_a_moving_still_on_the_route_does_not_decide_the_matrix_of_the_footage_below_it() {
+    let c = checker_media();
+    let h = hd_pair();
+    let mut cases = Vec::new();
+    let mut decided = Vec::new();
+    for (w, ph) in [(1200, 800), (640, 360)] {
+        let photo = t6_limited_420(w, ph);
+        for (name, video, (fw, fh), tag) in [
+            ("bt709 512x256", &c.testsrc709, (512, 256), Some(kerf_core::YuvMatrix::Bt709)),
+            (
+                "bt2020 512x256",
+                &c.testsrc2020,
+                (512, 256),
+                Some(kerf_core::YuvMatrix::Bt2020),
+            ),
+            ("untagged 512x256", &c.testsrc, (512, 256), None),
+            ("bt709 HD", &h.phone, (1280, 720), Some(kerf_core::YuvMatrix::Bt709)),
+        ] {
+            let assets = [photo.clone(), video.clone()];
+            // The still comes in after the footage has been on its own for a second, and goes on over it.
+            let over = timeline(
+                vec![vec![clip(video, 0.0, 2.0, 0.0)], vec![t6_in(&photo, 1.0, 1.0)]],
+                cover(fw, fh),
+            );
+            let mut after = t6_in(&photo, 1.0, 1.5);
+            after.transition_in = Some(Transition {
+                kind: TransitionKind::Crossfade,
+                duration: 0.5,
+            });
+            let dissolving = timeline(vec![vec![clip(video, 0.0, 1.0, 0.0), after]], cover(fw, fh));
+            for (how, tl) in [("over", over), ("dissolving in after", dissolving)] {
+                assert!(
+                    takes_the_route(&tl, &assets, 8.0, 12),
+                    "{name} {how}: the still does not take the route"
+                );
+                // What the plan says decides the cut's matrix: the footage's own tag, in every frame (negotiating policies only: where
+                // the composite is fixed there is nothing to decide). A still that dissolves in is on the alpha plane, and decides itself.
+                if policy() == CompositeColorPolicy::BottomLayerTag && how == "over" {
+                    let planner = Planner::new(&tl, &assets, &at_fps(8.0), PlanRequest::motion(policy())).expect("planner");
+                    for k in [0, 4, 9, 12] {
+                        let plan = planner.at_frame(k).expect("plan");
+                        decided.push((format!("{w}x{ph} {name} {how} frame {k}"), plan.canvas.cut_matrix, tag));
+                    }
+                }
+                cases.push(t6_export(
+                    &format!("t6/limited 4:2:0 still {w}x{ph} {how} {name} footage"),
+                    tl,
+                    &assets,
+                    8.0,
+                    2.0,
+                    Draw::Any,
+                ));
+            }
+        }
+    }
+    for (what, got, want) in &decided {
+        // (The still's own tag, an untagged picture's 601, is not the footage's: a mixed cut says the footage's, and a cut of one matrix none.)
+        assert_eq!(got, want, "{what}: the cut's matrix is not the footage's");
+    }
+    t6_exports("a limited-range moving still among footage that names a matrix", cases);
+}
+
+/// Every frame of `tl` is refused for `reason` (the plan of each is asked, with the compositor's own caps).
+fn t6_refused_in_every_frame(case: &str, tl: &Timeline, assets: &[Asset], frames: Range<u64>, reason: &str) {
+    let planner = Planner::new(tl, assets, &at_fps(30.0), PlanRequest::motion(policy())).expect("planner");
+    let caps = compositor().caps();
+    let mut missed = Vec::new();
+    for k in frames.clone() {
+        let plan = planner.at_frame(k).expect("plan");
+        let why: Vec<String> = plan
+            .reasons(&caps, plan.size(u32::MAX))
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        if !why.iter().any(|w| w.contains(reason)) {
+            missed.push((k, why));
+        }
+    }
+    assert!(
+        missed.is_empty(),
+        "{case}: {} of {} frames were not refused for `{reason}`; first: {:?}",
+        missed.len(),
+        frames.end - frames.start,
+        missed.first()
+    );
+}
+
+/// A moving still is not blended and its colour is not keyed: the blend chain and the `eq` per frame are not what the route's or the fit's
+/// cases hold to FFmpeg's. A colour keyed through neutral at some frame is no colour there at all, but the engine's `eq` is in the chain of
+/// every frame of the clip, so every frame is FFmpeg's.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn t6_a_blended_or_keyed_colour_moving_still_is_refused_in_every_export_frame() {
+    let p = photos();
+    let png = std::slice::from_ref(&p.wide);
+    let alone = |c: Clip| timeline(vec![vec![c]], cover(960, 540));
+    let planner_at = |tl: &Timeline, k: u64| {
+        Planner::new(tl, png, &at_fps(30.0), PlanRequest::motion(policy()))
+            .expect("planner")
+            .at_frame(k)
+            .expect("plan")
+    };
+    for (route, mk) in [
+        ("on the route", ken_burns as fn(&Asset, f64, f64) -> Clip),
+        ("placed from the fit picture", t6_off as fn(&Asset, f64, f64) -> Clip),
+    ] {
+        // Brightness from -0.3 to 0.3 over the clip's second: neutral at 0.5 s, frame 15.
+        let mut keyed = mk(&p.wide, 0.0, 1.0);
+        keyed.set_property_keys(
+            kerf_core::Property::Brightness,
+            vec![kerf_core::PropertyKey::new(0.0, -0.3), kerf_core::PropertyKey::new(1.0, 0.3)],
+        );
+        let tl = alone(keyed);
+        let plan = planner_at(&tl, 15);
+        assert!(plan.layers[0].color.is_identity(), "{route}: frame 15 is not the neutral one");
+        assert!(plan.layers[0].animated.is_some_and(|a| a.color), "{route}");
+        assert_eq!(plan.takes_still_route(&plan.layers[0]), route == "on the route");
+        t6_refused_in_every_frame(
+            &format!("t6/keyed colour {route}"),
+            &tl,
+            png,
+            upto(1.0, 30.0),
+            "a still whose picture moves",
+        );
+        // A blend mode over the footage below it: FFmpeg's, as it is for a moving zoom.
+        let mut blended = mk(&p.wide, 0.0, 1.0);
+        blended.blend_mode = kerf_core::BlendMode::Multiply;
+        let m = checker_media();
+        let tl = timeline(vec![vec![clip(&m.testsrc, 0.0, 1.0, 0.0)], vec![blended]], cover(960, 540));
+        let assets = [p.wide.clone(), m.testsrc.clone()];
+        t6_refused_in_every_frame(
+            &format!("t6/blended {route}"),
+            &tl,
+            &assets,
+            upto(1.0, 30.0),
+            "a moving zoom or position",
+        );
+    }
 }

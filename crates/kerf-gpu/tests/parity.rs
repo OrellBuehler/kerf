@@ -319,9 +319,9 @@ fn compositor() -> &'static Compositor {
         let _ = kerf_gpu::placement_probe::placement();
         // ... and so is the layout of its `drawtext`, which decides whether text whose bitmaps share samples is drawn.
         let _ = kerf_gpu::text::model();
-        // ... and for which kinds of picture a moving still is drawn as this FFmpeg draws it (the moving still's route is in the
-        // caps only for the kinds that matched).
-        let _ = kerf_gpu::still_probe::kinds();
+        // ... and for which kinds of picture, in which chains, a moving still is drawn as this FFmpeg draws it (the moving still's route is in
+        // the caps only for the chains that matched: every chain, where the app measures what a plan needs).
+        let _ = kerf_gpu::still_probe::all();
         // ...and the blend chain's, which the blend modes are in the caps by.
         let _ = kerf_gpu::blend::kernels();
         Compositor::new(gpu()).expect("a compositor")

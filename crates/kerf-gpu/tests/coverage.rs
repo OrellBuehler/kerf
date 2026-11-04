@@ -2424,8 +2424,9 @@ fn the_ledger_says_which_refusals_hold_the_compositor_back() {
     // conversion probe).
     let placement = kerf_gpu::placement_probe::placement();
     let conversion = kerf_gpu::conversion::conversion();
-    // ... and a moving still only for the kinds of picture whose chain this FFmpeg draws as the model does (the still probe).
-    let stills = kerf_gpu::still_probe::kinds();
+    // ... and a moving still only for the chains of the kinds of picture this FFmpeg draws as the model does (the still probe: every chain, as
+    // a project holding all of them would have asked).
+    let stills = kerf_gpu::still_probe::all();
     // ... and a mask or a keyed opacity only where the edge of this FFmpeg's `geq` read is known (the caps of a host that has no
     // compositor leave them out until it is measured, as the app's `prepare_timeline` does ahead of the render bar).
     let _ = kerf_core::geq_edge();
