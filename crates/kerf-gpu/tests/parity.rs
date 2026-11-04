@@ -2094,7 +2094,7 @@ fn check_refused_with(case: &str, tl: &Timeline, assets: &[Asset], t: f64, expec
 /// A chroma key on a layer the compositor scales is drawn, as `chromakey` draws it, to the sample: its alpha is a distance in the chroma
 /// over `blend`, and the chroma it reads is what the scaler leaves, which is swscale's to the sample where the scaler is measured (the plan
 /// refuses the key after a scale only where it is not: `caps.exact_scaler`). Several scales, keys from a hard one to a wide one, noise and
-/// a test card, and the key after each of the other effects. (`motion_parity.rs` holds the same in an export.)
+/// a test card, and the key at every position among the other effects (the green-screen archetype puts it first). (`motion_parity.rs` holds the same in an export.)
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn a_chroma_key_after_a_scale_is_drawn_as_chromakey_draws_it() {
@@ -2141,16 +2141,20 @@ fn a_chroma_key_after_a_scale_is_drawn_as_chromakey_draws_it() {
     ] {
         for fg in [&m.testsrc, &m.noise] {
             for scale in [0.6, 0.4985] {
-                let (tl, assets) = over(fg, &|c| {
-                    c.transform.scale = scale;
-                    c.effects = effects.iter().cloned().chain([a_key("0x808080", 0.25, 0.2)]).collect();
-                });
-                check(
-                    &format!("key-scale/{name} then a key, {} scale {scale}", fg.name),
-                    &tl,
-                    &assets,
-                    &[0.5],
-                );
+                for at in 0..=effects.len() {
+                    let (tl, assets) = over(fg, &|c| {
+                        c.transform.scale = scale;
+                        let mut list = effects.clone();
+                        list.insert(at, a_key("0x808080", 0.25, 0.2));
+                        c.effects = list;
+                    });
+                    check(
+                        &format!("key-scale/{name}, the key at {at}, {} scale {scale}", fg.name),
+                        &tl,
+                        &assets,
+                        &[0.5],
+                    );
+                }
             }
         }
     }
@@ -2161,6 +2165,21 @@ fn a_chroma_key_after_a_scale_is_drawn_as_chromakey_draws_it() {
         c.effects = vec![a_key("green", 0.15, 0.1)];
     });
     check("key-scale/with an eq ahead", &tl, &assets, &[0.5]);
+    // The green-screen shape: scale 0.9, the key first, a grade (an `eq`) on the clip, and each effect after it.
+    for (name, after) in [
+        ("alone", vec![]),
+        ("blur", vec![E::Blur { sigma: 1.5 }]),
+        ("vignette", vec![E::Vignette]),
+        ("sharpen", vec![E::Sharpen { amount: 0.8 }]),
+    ] {
+        let (tl, assets) = over(&m.testsrc, &|c| {
+            c.transform.scale = 0.9;
+            c.color.contrast = 1.15;
+            c.color.saturation = 1.2;
+            c.effects = [a_key("0x00b140", 0.25, 0.1)].into_iter().chain(after.clone()).collect();
+        });
+        check(&format!("key-scale/green screen, {name}"), &tl, &assets, &[0.5]);
+    }
 }
 
 #[test]

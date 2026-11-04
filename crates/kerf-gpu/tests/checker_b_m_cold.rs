@@ -13,6 +13,7 @@
 
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::sync::Mutex;
 
 use kerf_core::{
     Asset, BlendKinds, BlendMode, Clip, CompositeColorPolicy, Delivery, ExportOptions, Fit, GeqEdge, Keyframe, Mask, MaskShape,
@@ -22,6 +23,10 @@ use kerf_gpu::convert::Kernels as Convert;
 use kerf_gpu::grade::Kernels as Grade;
 use kerf_gpu::scaler::{Kernels as Scaler, Model};
 use kerf_gpu::{Compositor, Gpu, GpuOptions};
+
+/// The cold session primes this process's probes, and the caps test reads them twice and compares: the two must not overlap (they
+/// share the process-wide probe state, and a probe that finishes between the reads is a flake, not a finding).
+static SERIAL: Mutex<()> = Mutex::new(());
 
 fn all_blends() -> [BlendKinds; 2] {
     [BlendKinds::ALL; 2]
@@ -174,6 +179,7 @@ fn checker_b_m_caps_api_pinned_pins_land_where_they_belong() {
 #[test]
 #[ignore = "needs a GPU adapter (lavapipe is enough)"]
 fn checker_b_m_caps_api_translucency_and_blur_pins_reach_their_caps_only() {
+    let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     use kerf_core::EffectKinds;
     use kerf_gpu::blur_probe::Blur;
     use kerf_gpu::roundtrip_probe::Translucency;
@@ -319,6 +325,7 @@ fn session() -> (Timeline, Vec<Asset>, Vec<(&'static str, u64)>) {
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn checker_b_m_a_cold_session_is_refused_by_the_caps_and_primed_by_prepare_timeline() {
+    let _serial = SERIAL.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
     assert_eq!(
         kerf_core::geq_edge_measured(),
         GeqEdge::Unknown,
