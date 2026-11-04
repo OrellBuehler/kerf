@@ -419,7 +419,7 @@ fn checker_b_r6_prepare_timeline_measures_what_the_cut_needs() {
         matches!(scaler::measured(), scaler::Kernels::Match(_)),
         "{case}: the scaler is measured for any cut"
     );
-    let needs_grade = converts || case.contains("dip") || case == "graded";
+    let needs_grade = converts || matches!(case.as_str(), "dip" | "dip and text" | "graded");
     assert_eq!(
         grade::measured() == grade::Kernels::Match,
         needs_grade,
