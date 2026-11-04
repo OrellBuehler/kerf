@@ -43,48 +43,15 @@
 //!
 //! Only the chroma key reaches the alpha plane (it follows `format=yuva420p`); FFmpeg runs the rest ahead of it.
 
-/// `gblur`'s numbers for one sigma (the same in both directions: Kerf never sets `sigmaV`).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Gaussian {
-    /// The recursion's coefficient.
-    pub nu: f32,
-    /// The edge samples' extra weight (`boundaryscale`).
-    pub boundary: f32,
-    /// The gain applied once at the end: the horizontal and the vertical `postscale`, multiplied.
-    pub post: f32,
-}
+pub use kerf_core::gblur::{gaussian, gblur_coefficients, Gaussian};
 
-/// `set_params` of `vf_gblur.c`, in the filter's own precision: `sigma` is an option of type
-/// `float`; `lambda` and `dnu` are computed in `double`; the three results are stored as `float`
-/// and any that is not a normal number (zero, subnormal, infinite, NaN) is replaced
-/// (`postscale` and `boundaryscale` by 1, `nu` by 0). `None` for a sigma `gblur` refuses.
-pub fn gaussian(sigma: f64) -> Option<Gaussian> {
-    if !sigma.is_finite() || !(0.0..=1024.0).contains(&sigma) {
-        return None;
-    }
-    let sigma = sigma as f32;
-    let steps = 1.0f64;
-    let lambda = f64::from(sigma * sigma) / (2.0 * steps);
-    let dnu = (1.0 + 2.0 * lambda - (1.0 + 4.0 * lambda).sqrt()) / (2.0 * lambda);
-    let mut post = (dnu / lambda).powf(steps) as f32;
-    let mut boundary = (1.0 / (1.0 - dnu)) as f32;
-    let mut nu = dnu as f32;
-    if !post.is_normal() {
-        post = 1.0;
-    }
-    if !boundary.is_normal() {
-        boundary = 1.0;
-    }
-    if !nu.is_normal() {
-        nu = 0.0;
-    }
-    // (`filter_postscale` multiplies the horizontal and the vertical factor, two floats.)
-    Some(Gaussian {
-        nu,
-        boundary,
-        post: post * post,
-    })
-}
+/// Which of the recursion's four sweeps (rightwards and leftwards along the rows, downwards and upwards along the columns) take a
+/// **fused** multiply-add for each step. `gblur`'s AVX2 and AVX-512 kernels fuse all four; the model is [`FUSED`]. The others exist for
+/// the probe to be shown to tell each sweep fused from unfused (`blur_probe`): a build that differs in one of them only.
+pub type Fused = [bool; 4];
+
+/// All four sweeps fused: what `x86/vf_gblur.asm` does and what [`blur_plane`] is.
+pub const FUSED: Fused = [true; 4];
 
 /// `gblur` on one 8-bit plane as an x86 build with AVX2 or AVX-512 runs it: the recursion in `float`, in `horiz_slice`'s and
 /// `verti_slice`'s order, **every step a fused multiply-add** (`vfmadd231ps` in `x86/vf_gblur.asm`: one rounding for the product
@@ -92,26 +59,33 @@ pub fn gaussian(sigma: f64) -> Option<Gaussian> {
 /// 1024 on 6.1.1 and 9.0.2 (no sample differs; the unfused order read 597 of them a level off), and what a build whose
 /// `gblur` runs another kernel (SSE4 only, or a C one) does not do: [`crate::blur_probe`] measures it.
 pub fn blur_plane(src: &[u8], w: usize, h: usize, g: &Gaussian) -> Vec<u8> {
+    blur_plane_fused(src, w, h, g, FUSED)
+}
+
+/// [`blur_plane`] with each of the four sweeps fused or not (`x += nu * prev`, the product rounded first): the model of a build that
+/// differs from the AVX2 kernels in some sweeps only.
+pub fn blur_plane_fused(src: &[u8], w: usize, h: usize, g: &Gaussian, fused: Fused) -> Vec<u8> {
     assert_eq!(src.len(), w * h);
+    let step = |on: bool, prev: f32, x: f32| if on { g.nu.mul_add(prev, x) } else { x + g.nu * prev };
     let mut buf: Vec<f32> = src.iter().map(|v| f32::from(*v)).collect();
     for row in buf.chunks_exact_mut(w) {
         row[0] *= g.boundary;
         for x in 1..w {
-            row[x] = g.nu.mul_add(row[x - 1], row[x]);
+            row[x] = step(fused[0], row[x - 1], row[x]);
         }
         row[w - 1] *= g.boundary;
         for x in (1..w).rev() {
-            row[x - 1] = g.nu.mul_add(row[x], row[x - 1]);
+            row[x - 1] = step(fused[1], row[x], row[x - 1]);
         }
     }
     for x in 0..w {
         buf[x] *= g.boundary;
         for y in 1..h {
-            buf[y * w + x] = g.nu.mul_add(buf[(y - 1) * w + x], buf[y * w + x]);
+            buf[y * w + x] = step(fused[2], buf[(y - 1) * w + x], buf[y * w + x]);
         }
         buf[(h - 1) * w + x] *= g.boundary;
         for y in (1..h).rev() {
-            buf[(y - 1) * w + x] = g.nu.mul_add(buf[y * w + x], buf[(y - 1) * w + x]);
+            buf[(y - 1) * w + x] = step(fused[3], buf[y * w + x], buf[(y - 1) * w + x]);
         }
     }
     buf.iter()

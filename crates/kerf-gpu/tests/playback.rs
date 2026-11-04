@@ -48,6 +48,7 @@ fn compositor() -> &'static Compositor {
         let _ = kerf_gpu::scaler::kernels();
         // (And the round trip of a layer below full opacity, which is drawn only where this FFmpeg's kernels are known to be the model's.)
         let _ = kerf_gpu::roundtrip_probe::translucency();
+        let _ = kerf_gpu::display_probe::display();
         Compositor::new(gpu()).expect("a compositor")
     })
 }

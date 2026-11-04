@@ -6,8 +6,8 @@
 //! frame back as `yuv420p` **planes** (no colour conversion in between: the planes `overlay` blended
 //! are the ones compared) and draws the same output frames from a [`PlanMode::Motion`] plan — the
 //! pick of each source frame is the `fps` filter's, served by one [`MotionFrames`] cursor per clip.
-//! The comparison is plane for plane, in levels of 255, with a stated bound per case; the RGB
-//! montage `FFmpeg | GPU | diff x8` of the frames worth a look goes to `target/parity/motion/`
+//! The comparison is plane for plane, sample for sample, with **no tolerance and no bound a case can name**: a frame the plan lets the
+//! compositor draw is the export's with 0 differing samples in Y, U and V, or the case fails; the RGB montage `FFmpeg | GPU | diff x8` of the frames worth a look goes to `target/parity/motion/`
 //! (`KERF_PARITY_KEEP=1` keeps it for passing frames too).
 //!
 //! Needs `ffmpeg` and an adapter (lavapipe is enough); `#[ignore]`d. Run with
@@ -19,14 +19,14 @@
 //!
 //! # What "match" means here
 //!
-//! Where the source is drawn at its own size (these cases are: a 1:1 `scale` is skipped and the
-//! compositor's scaler is not in play) the planes agree **to the level**: `fade` is integer
+//! Every drawn frame agrees **to the sample**, a resize included (the compositor's scaler is swscale's own, measured: a plan refuses a
+//! resize where it is not): `fade` is integer
 //! arithmetic ([`kerf_core::fade_luma`], `fade_chroma`, `fade_alpha`: the filter is identical on 6.1.1 and 9.0.2,
 //! checked by [`fade_arithmetic_is_ffmpegs`] on every factor; what FFmpeg 9 does around it to a full-range
 //! picture is not, and is refused), the dissolve is `overlay`'s own
 //! `FAST_DIV255` on the ramped alpha, a slide is a position the overlay truncates, a tail is a
-//! clip that plays on. A bound above zero is a measured, named thing (a rotated edge, a
-//! translucent layer's RGB round trip) and says so next to the case.
+//! clip that plays on. What the compositor does not draw to the sample (a rotated edge, a turn of a translucent layer, a blend with
+//! an opacity) is refused by the plan, and the case that says so draws the frames anyway to show the refusal is needed.
 
 #![allow(clippy::print_stderr)]
 
@@ -85,6 +85,7 @@ fn compositor() -> &'static Compositor {
         // ... and whether it takes a translucent layer through RGB, and blurs, as the model does (a layer below full opacity and a blur are in the caps only then).
         let _ = kerf_gpu::roundtrip_probe::translucency();
         let _ = kerf_gpu::blur_probe::blur();
+        let _ = kerf_gpu::display_probe::display();
         // ... and so is the layout of its `drawtext`, which decides whether text whose bitmaps share samples is drawn.
         let _ = kerf_gpu::text::model();
         // ...and the blend chain's, which the blend modes are in the caps by.
@@ -452,6 +453,7 @@ struct PlaneStats {
 
 impl PlaneStats {
     fn of(a: &[u8], b: &[u8]) -> Self {
+        assert_eq!(a.len(), b.len(), "the planes are not the same size");
         let mut s = Self {
             n: a.len(),
             ..Self::default()
@@ -546,7 +548,7 @@ struct Check<'a> {
     opts: ExportOptions,
     /// The output frames to compare.
     frames: Range<u64>,
-    /// Frames to write a montage of (and every frame over the bound).
+    /// Frames to write a montage of (and every frame that differs).
     look: &'a [u64],
     /// The frames the plan refuses for this reason (FFmpeg draws them) are not compared, and at
     /// least one must be: the case is about a refusal. Every other frame is compared with the
@@ -1384,8 +1386,7 @@ fn the_shapes_of_a_real_cut_are_drawn_as_the_export_draws_them() {
         Some((TransitionKind::SlideLeft, 0.4)),
         Some((TransitionKind::Crossfade, 0.5)),
     ];
-    // (The scaler is one level off on its own; the contrast of a grade scales that difference, so
-    // graded and scaled is two.)
+    // (The scaler is swscale's to the sample, and so is the grade on it.)
     for (name, graded) in [("ungraded", false), ("graded", true)] {
         let mut clips = Vec::new();
         for (i, kind) in kinds.iter().enumerate() {
@@ -1535,7 +1536,7 @@ fn keyframed_position_and_rotation_in_an_export_frame() {
     moving.keyframes = vec![key(0.0, -0.25, 0.0), key(1.0, 0.25, 0.0)];
     let tl = timeline(vec![vec![under.clone()], vec![moving]], None);
     // (The keys hold a scale of 0.5, which is a `scale` ahead of the placement: the compositor's scaler is in
-    // play, a level off swscale's where it resizes. A scale that moves is the placement's own: `placement/*`.)
+    // play, swscale's to the sample. A scale that moves is the placement's own: `placement/*`.)
     run("keyed/position", &tl, &[m.black.clone(), m.testsrc.clone()], 30.0, 1.0);
     // The easing of a segment is the polyline both renderers read (`Clip::transform_at`).
     for (name, easing) in [
@@ -2118,10 +2119,11 @@ fn a_keyed_colour_is_the_eq_of_each_frame() {
         1.0,
         20,
     );
-    // A layer the compositor scales: the scaler is a level off swscale's x86 kernels, and the grade's tables multiply that by
-    // their steepest step (`eq::table_steps`: contrast, gamma's power toward black, a black point parked above 0). A frame is
-    // drawn while that step is at most two (`GRADED_SCALED`) and FFmpeg's past it (`GradeSteep`), so a keyed ramp is judged one
-    // frame at a time: the frames inside are held to the export, the others are refused (and the export renders them all the same).
+    // A layer the compositor scales: where the scaler is not measured to be swscale's it is a level off the x86 kernels, and the
+    // grade's tables multiply that by their steepest step (`eq::table_steps`: contrast, gamma's power toward black, a black point
+    // parked above 0), so there a frame is drawn while that step is at most two and FFmpeg's past it (`GradeSteep`). A keyed ramp is
+    // judged one frame at a time either way: the frames the plan lets through are held to the export, the others are refused (and
+    // the export renders them all the same).
     let gentle = |c: &mut Clip, gamma_to: f64| {
         for (prop, lo, hi) in [
             (Property::Brightness, -0.1, 0.1),
@@ -2966,7 +2968,7 @@ fn after_black(
 }
 
 /// A dip to white is `yuv420p -> rgb24 -> yuv420p` around the fade, drawn for the pictures the round
-/// trip was measured on (8-bit limited-range 4:2:0, untagged: [`WHITE`]; BT.709: [`WHITE_709`]) and
+/// trip was measured on (8-bit limited-range 4:2:0, untagged or BT.709, to the sample) and
 /// FFmpeg's for every other. What it is refused for was measured, and each refusal is held here:
 /// a letterbox (FFmpeg pads before the round trip, so the bars whiten as well: the first probe read Y 126
 /// against 16 at half way), a picture with an odd side (the round trip reads past it), a layer the
@@ -3230,7 +3232,7 @@ fn a_full_range_picture_is_drawn_as_the_ffmpeg_in_use_converts_its_range() {
 // mask, rotate, fades`, then places the picture on the canvas at sub-pixel positions (`pad`, a per-frame
 // `perspective`, `crop`: `video_clip_chain`). The compositor reproduces that placement
 // (`kerf_core::perspective`, `placement.wgsl`), so the cases below are exact: 0 differing samples in every
-// plane of every frame (`run_placed`), but where the scaler is also in play (`SCALED`), a blur (`EFFECT`), and
+// plane of every frame (`run_placed`), where the scaler is also in play and with a blur ahead of it too, and
 // what is refused (a rotation, an opacity below 1, a dip to white or a grade ahead of the placement).
 
 fn zoom_key(time: f64, scale: f64, pos_x: f64, pos_y: f64) -> kerf_core::Keyframe {
@@ -3324,7 +3326,7 @@ fn a_moving_zoom_is_placed_as_the_export_places_it() {
     let tl = timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![moving]], None);
     run_placed("position/over bars", &tl, &assets, 30.0, 1.0);
     // Cover into a frame the footage is scaled to: the compositor's scaler is in play ahead of the placement,
-    // and it is a level off swscale's where it resizes (`SCALED`); the placement adds nothing to it.
+    // and it is swscale's to the sample where it resizes; the placement adds nothing to it.
     let tl = timeline(
         vec![vec![zooming(&m.testsrc, 1.0, 1.25, (-0.05, 0.0))]],
         Some(Delivery::new(960, 540, Fit::Cover)),
@@ -3641,10 +3643,9 @@ fn a_moving_zoom_is_placed_after_a_grade_mask_fade_or_effect() {
         let tl = with(&|c| c.mask = Some(mask_of(shape, feather, inverted)));
         run_placed(&format!("zoom+mask {name}"), &tl, &assets, 30.0, 1.0);
     }
-    // The effects: the tables, the sharpen, the vignette and the key are exact; a blur is `gblur`'s float
-    // recursion, which FFmpeg itself computes with another association of the same sums on an AVX2 / AVX-512
-    // build (`EFFECT`: 0 to 59 samples in 3.2 million are a level off, on either side of the zoom). The fit
-    // scale ahead of the effects is the identity here, so a sharpen of any amount is of the exact picture.
+    // The effects: the tables, the sharpen, the vignette and the key are exact; a blur is `gblur`'s fused-multiply-add
+    // recursion, exact where `blur_probe` says this FFmpeg runs that (and not in the caps otherwise), on either side of the zoom.
+    // The fit scale ahead of the effects is the identity here, so a sharpen of any amount is of the exact picture.
     for (name, effect) in [
         ("blur", kerf_core::VideoEffect::Blur { sigma: 4.0 }),
         ("sharpen", kerf_core::VideoEffect::Sharpen { amount: 1.5 }),
@@ -3664,7 +3665,7 @@ fn a_moving_zoom_is_placed_after_a_grade_mask_fade_or_effect() {
         vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]],
         Some(Delivery::new(960, 540, Fit::Cover)),
     );
-    // (The fit scale to 960x540 is the compositor's, a level off swscale's, and the blur's own level: `EFFECT_SCALED`.)
+    // (The fit scale to 960x540 is swscale's to the sample, and so is the blur.)
     run("zoom+mask+blur cover 960x540", &tl, &assets, 30.0, 1.0);
     // Everything at once: grade, an effect, a mask, a fade-in.
     let tl = with(&|c| {
@@ -4014,8 +4015,8 @@ fn a_mask_fades_and_dissolves_on_its_own_alpha() {
 fn effects_are_drawn_as_their_filters_draw_them() {
     let m = media();
     use kerf_core::VideoEffect as E;
-    // Grayscale and invert are tables: exact. A sharpen is integer arithmetic: exact. A blur is the
-    // portable order of a float recursion that FFmpeg runs in SIMD (see `EFFECT`).
+    // Grayscale and invert are tables: exact. A sharpen is integer arithmetic: exact. A blur is the fused-multiply-add
+    // recursion FFmpeg runs in SIMD, in integers, to the sample.
     for (name, effects) in [
         ("grayscale", vec![E::Grayscale]),
         ("invert", vec![E::Invert]),
@@ -4031,9 +4032,7 @@ fn effects_are_drawn_as_their_filters_draw_them() {
         ("blur 6.3", vec![E::Blur { sigma: 6.3 }]),
         ("blur then invert", vec![E::Blur { sigma: 3.0 }, E::Invert]),
         ("invert then blur", vec![E::Invert, E::Blur { sigma: 3.0 }]),
-        // A sharpen after a blur amplifies the blur's own level (FFmpeg's SIMD order against ours) by its gain
-        // (`1 + 2 * amount`): at half strength that is two levels (`EFFECT_SCALED`), past it the plan refuses
-        // (below). Sharpens with nothing inexact ahead of them are exact, chained too.
+        // A sharpen after a blur is exact at any gain, the blur being `gblur`'s to the sample; so are sharpens chained.
         (
             "blur then sharpen 0.5",
             vec![E::Blur { sigma: 2.0 }, E::Sharpen { amount: 0.5 }],
@@ -4321,6 +4320,97 @@ fn effects_are_drawn_as_their_filters_draw_them() {
     run("effect/blur with fades", &tl, &assets, 30.0, 1.0);
 }
 
+/// A chroma key on a layer the compositor scales is drawn, as `chromakey` draws it, to the sample: its alpha is a distance in the chroma
+/// over `blend` (a level of chroma moves it by up to 1/blend levels, a blend of 0 flips it from 0 to 255), and the chroma it reads is what
+/// the scaler leaves, which is swscale's to the sample where the scaler is measured (the plan refuses the key after a scale only where it
+/// is not: `caps.exact_scaler`). Several scales (a half, an odd one just under it, a mild shrink), keys from a hard one to a wide one, a
+/// key colour of the picture's and one that is not, noise and a test card, and the key after each of the other effects, in every order
+/// the list allows.
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_chroma_key_after_a_scale_is_drawn_as_chromakey_draws_it() {
+    let m = media();
+    use kerf_core::VideoEffect as E;
+    let over = |fg: &Asset, edit: &dyn Fn(&mut Clip)| {
+        let mut c = clip(fg, 0.5, 1.5, 0.0);
+        edit(&mut c);
+        (
+            timeline(vec![vec![clip(&m.bars, 0.5, 1.5, 0.0)], vec![c]], None),
+            vec![m.bars.clone(), fg.clone()],
+        )
+    };
+    for scale in [0.6, 0.4985, 0.9] {
+        for (similarity, blend) in [(0.15, 0.1), (0.1, 0.0), (0.5, 0.5), (0.00001, 0.0), (1.0, 1.0)] {
+            for (name, fg) in [("testsrc", &m.testsrc), ("noise", &m.noise)] {
+                for color in ["green", "0x808080"] {
+                    let (tl, assets) = over(fg, &|c| {
+                        c.transform.scale = scale;
+                        c.effects = vec![key(color, similarity, blend)];
+                    });
+                    run(
+                        &format!("key-scale/{name} {color} scale {scale} sim {similarity} blend {blend}"),
+                        &tl,
+                        &assets,
+                        30.0,
+                        1.0,
+                    );
+                }
+            }
+        }
+    }
+    for (name, effects) in [
+        ("blur", vec![E::Blur { sigma: 2.0 }]),
+        ("sharpen", vec![E::Sharpen { amount: 1.5 }]),
+        ("invert", vec![E::Invert]),
+        ("grayscale", vec![E::Grayscale]),
+        ("vignette", vec![E::Vignette]),
+        ("blur, sharpen", vec![E::Blur { sigma: 3.0 }, E::Sharpen { amount: 0.5 }]),
+        (
+            "sharpen, invert, grayscale",
+            vec![E::Sharpen { amount: 2.0 }, E::Invert, E::Grayscale],
+        ),
+        ("blur, invert, vignette", vec![E::Blur { sigma: 1.5 }, E::Invert, E::Vignette]),
+    ] {
+        for fg in [&m.testsrc, &m.noise] {
+            for scale in [0.6, 0.4985] {
+                let (tl, assets) = over(fg, &|c| {
+                    c.transform.scale = scale;
+                    c.effects = effects.iter().cloned().chain([key("0x808080", 0.25, 0.2)]).collect();
+                });
+                run(
+                    &format!("key-scale/{name} then a key, {} scale {scale}", fg.name),
+                    &tl,
+                    &assets,
+                    30.0,
+                    1.0,
+                );
+            }
+        }
+    }
+    // With a grade ahead of the key, in a dissolve, in and out of a fade, and moved.
+    let (tl, assets) = over(&m.testsrc, &|c| {
+        c.transform.scale = 0.6;
+        c.color.contrast = 1.2;
+        c.color.saturation = 1.3;
+        c.effects = vec![key("green", 0.15, 0.1)];
+    });
+    run("key-scale/with an eq ahead", &tl, &assets, 30.0, 1.0);
+    let (tl, assets) = over(&m.testsrc, &|c| {
+        c.transform.scale = 0.6;
+        c.fade_in = 0.3;
+        c.fade_out = 0.3;
+        c.effects = vec![key("0x808080", 0.25, 0.2)];
+    });
+    run("key-scale/with fades", &tl, &assets, 30.0, 1.0);
+    let (tl, assets) = over(&m.noise, &|c| {
+        c.transform.scale = 0.5;
+        c.transform.pos_x = 0.25;
+        c.transform.pos_y = -0.25;
+        c.effects = vec![key("0x808080", 0.25, 0.2)];
+    });
+    run("key-scale/moved", &tl, &assets, 30.0, 1.0);
+}
+
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn what_the_compositor_does_not_draw_of_an_effect_or_a_mask_is_refused() {
@@ -4347,20 +4437,6 @@ fn what_the_compositor_does_not_draw_of_an_effect_or_a_mask_is_refused() {
         &opts,
         upto(1.0, 30.0),
         "yuv420p",
-    );
-    // A chroma key on chroma that is not FFmpeg's to the level: after a scale (a level moves its alpha by up to
-    // 1/blend levels).
-    let (tl, assets) = over_bars(m, &|c| {
-        c.transform.scale = 0.6;
-        c.effects = vec![key("green", 0.15, 0.1)];
-    });
-    refused(
-        "effect/chroma key on a pip",
-        &tl,
-        &assets,
-        &opts,
-        upto(1.0, 30.0),
-        "chroma key after a scale",
     );
     let (tl, assets) = over_bars(m, &|c| c.effects = vec![E::Blur { sigma: 2000.0 }]);
     refused(
@@ -4499,8 +4575,7 @@ fn untagged_hd_is_labelled_for_the_whole_graph_that_holds_a_matrix() {
 /// is taken out of YUV as BT.709, exactly as the file tagged BT.709 is. The label is the first filter of its
 /// chain for this: behind the fit `scale` (the filter FFmpeg has convert the picture for the fade) it was
 /// BT.601 in and BT.709 out, Y 17 / UV 9 off on 9.0.2 and Y 30 / UV 16 on 6.1.1. The HD clips are drawn at
-/// their own size (a 1280x720 canvas: a layer the scaler resizes is refused its dip), and the bound is
-/// BT.709's (`WHITE_709`).
+/// their own size (a 1280x720 canvas: a layer the scaler resizes is refused its dip), and the planes are exact.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn a_labelled_hd_clip_dips_through_white_with_the_bt709_round_trip() {
@@ -5326,7 +5401,7 @@ fn a_graded_clip_beside_a_clip_of_its_own_matrix_is_drawn_in_either_order() {
 // matrix into it, wherever on the timeline the two are: swscale's two-step conversion through RGB, a `scale` of its own after
 // the chain's last `format` (`kerf_gpu::convert`, probed). The compositor converts the picture the chain has made (after
 // the fit `scale` and `pad`, so a phone clip shrunk into a landscape frame is scaled, then converted) and the planes are the
-// export's to the level: no case here has a bound above `EXACT`. Under a fixed-matrix FFmpeg nothing converts, and the same
+// export's to the sample (no case here names a bound). Under a fixed-matrix FFmpeg nothing converts, and the same
 // cases are the layers drawn as they are.
 
 /// Footage tagged and untagged for the conversion cases: a phone-shaped pair (540x960, 960x540 canvas: the picture
@@ -5783,7 +5858,7 @@ fn layers_of_another_matrix_are_converted_into_the_bottom_ones() {
 // thumbnail chain of `engine::cli::blur_fill` (`split`, `scale` to cover an eighth of the frame on each side with
 // `flags=bilinear`, `crop`, `boxblur=r:2`, `scale` back up, `overlay` of the picture's own fit). The compositor draws it
 // pass for pass, on swscale's own tables and kernels (`scaler.rs`) and `boxblur`'s own integers (`fill.rs`), and the
-// planes are the export's to the level: no case here has a bound above `EXACT`.
+// planes are the export's to the sample (no case here names a bound).
 
 /// Odd-sized, thin and tagged sources for the fill: lossless FFV1 (H.264 refuses odd sides), `yuv420p`.
 struct BlurMedia {
@@ -6618,10 +6693,10 @@ fn a_blended_clip_is_laid_where_it_lies() {
     }
 }
 
-/// What the chain is not exact for is refused, in the plan, and FFmpeg draws it: a layer the compositor scales (the scaler's level
-/// is not swscale's and the blend carries it into the composite), a rotated one (a fixed-point edge), one below full opacity (the RGB
-/// round trip's chroma is a level off), a letterboxed one (its bars are transparent in the blend), an RGB picture (the decode's 4:2:0
-/// is a few levels from the graph's conversion).
+/// What no case holds to the export is refused, in the plan, and FFmpeg draws it: a layer the compositor scales, a rotated one (a
+/// fixed-point edge), one below full opacity (the blend chain converts the clip's colour and alpha its own way after the round trip,
+/// which is itself exact), a letterboxed one (its bars are transparent in the blend), an RGB picture (the decode's 4:2:0 is a few
+/// levels from the graph's conversion).
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn what_a_blend_is_not_exact_for_is_refused() {
@@ -6932,7 +7007,7 @@ fn checker_e_a_blended_clip_in_every_transition() {
     let kinds = [
         TransitionKind::Crossfade,
         TransitionKind::DipToBlack,
-        // (DipToWhite is left out: the plain dip is not exact at the base commit either, `WHITE`.)
+        // (DipToWhite is left out: its round trip is another case's, `a_dip_to_white_...`.)
         TransitionKind::SlideLeft,
         TransitionKind::SlideRight,
         TransitionKind::SlideUp,
@@ -11050,7 +11125,7 @@ fn checker_e_r4_keyed_rotations_that_never_turn_are_drawn_and_the_rest_are_refus
     );
 }
 
-/// A still is judged elsewhere by a PNG's RGB (PSNR, an edge band: `tests/parity.rs`), which no bound there makes exact. A cut whose pictures
+/// A still is judged elsewhere by a PNG's RGB (`tests/parity.rs`), a conversion of the planes. A cut whose pictures
 /// hold still for the frames looked at is the same picture in a still and in an export, so the compositor's frame for the still's plan has to be
 /// the export's frame to the sample: a quarter turn (even and odd sides, plain and blended) is drawn exactly, and any other turn is refused.
 #[test]

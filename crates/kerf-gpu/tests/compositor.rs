@@ -21,7 +21,7 @@ fn gpu() -> std::sync::Arc<Gpu> {
 
 /// (The scaler is pinned as the model: nothing here runs FFmpeg to measure it, and a compositor whose scaler is not known to be
 /// swscale's refuses every resized layer. So is the edge of `geq`'s read, which a mask needs known: a copy of the picture's own
-/// last column and row, as FFmpeg 9 reads it; the case that holds the clamping build pins the other. The translucent round trip and the blur
+/// last column and row, as FFmpeg 9 reads it; the case that holds the clamping build pins the other. The translucent round trip, the blur and the display conversion
 /// are pinned to match too: they are drawn only where this FFmpeg's kernels were measured to be the model's.)
 fn compositor() -> Compositor {
     Compositor::new(gpu())
@@ -30,6 +30,7 @@ fn compositor() -> Compositor {
         .with_geq_edge(kerf_core::GeqEdge::Exact)
         .with_translucency(kerf_gpu::roundtrip_probe::Translucency::Match)
         .with_blur(kerf_gpu::blur_probe::Blur::Match)
+        .with_display(kerf_gpu::display_probe::Display::Match)
 }
 
 fn asset(w: u32, h: u32) -> Asset {
@@ -125,6 +126,44 @@ fn a_flat_layer_converts_with_the_plans_matrix() {
         assert_eq!([p[0], p[1], p[2]], want, "{p:?}");
         assert_eq!(p[3], 255);
     }
+}
+
+/// The RGB a compositor hands out is converted in swscale's x86 integers, and is FFmpeg's only where the display probe says this
+/// FFmpeg converts that way: on a `Differs`, an `Unknown` or a probe that has not run no RGB is handed out (a frame, a texture), the
+/// YUV planes (which no conversion touches) still are, and a frame with no layer (the black base, which every kernel converts to 0) is
+/// handed out whatever the probe said.
+#[test]
+#[ignore = "needs a GPU adapter (lavapipe is enough)"]
+fn rgb_is_handed_out_only_where_the_display_conversion_is_measured_to_be_the_models() {
+    use kerf_gpu::display_probe::Display;
+    let a = asset(64, 36);
+    let plan = plan_for(&a, Clip::new(a.id, 0.0, 1.0, 0.0));
+    let frames = [flat(64, 36, 100, 160, 90)];
+    for pinned in [
+        Display::Differs("yuv420p -> rgb24 (bt601 through scale) over 18x10: 7 samples differ".into()),
+        Display::Unknown,
+    ] {
+        let comp = compositor().with_display(pinned.clone());
+        let err = comp.composite(&plan, &frames, (64, 36)).expect_err("no RGB");
+        assert!(
+            matches!(&err, GpuError::Unsupported(why) if why.contains("yuv420p -> rgb24")),
+            "{pinned:?}: {err}"
+        );
+        let shared = [frames[0].clone().map(std::sync::Arc::new)];
+        let err = comp.composite_shared(&plan, &shared, (64, 36)).expect_err("no RGB");
+        assert!(matches!(err, GpuError::Unsupported(_)), "{pinned:?}: {err}");
+        let planes = comp
+            .composite_yuv(&plan, &frames, (64, 36))
+            .expect("the planes need no conversion");
+        assert_eq!((planes.y[0], planes.u[0], planes.v[0]), (100, 160, 90));
+        // A frame with no layer is the black base: never converted, handed out.
+        let tl = timeline_of(vec![Clip::new(a.id, 0.0, 1.0, 5.0)]);
+        let empty = RenderPlan::at(&tl, std::slice::from_ref(&a), &ExportOptions::default(), 1.0, POLICY).unwrap();
+        let black = comp.composite(&empty, &[], (64, 36)).expect("the black base");
+        assert!(black.data.as_chunks::<4>().0.iter().all(|p| *p == [0, 0, 0, 255]));
+    }
+    let comp = compositor().with_display(Display::Match);
+    assert!(comp.composite(&plan, &frames, (64, 36)).is_ok());
 }
 
 #[test]
@@ -256,7 +295,9 @@ fn a_zoom_past_the_texture_limit_is_refused_not_a_wgpu_panic() {
 #[ignore = "needs a GPU adapter (lavapipe is enough)"]
 fn a_lost_device_is_an_error_not_a_panic_and_stays_one() {
     let gpu = gpu();
-    let comp = Compositor::new(gpu.clone()).unwrap();
+    let comp = Compositor::new(gpu.clone())
+        .unwrap()
+        .with_display(kerf_gpu::display_probe::Display::Match);
     let a = asset(64, 36);
     let plan = plan_for(&a, Clip::new(a.id, 0.0, 1.0, 0.0));
     assert!(comp.composite(&plan, &[flat(64, 36, 100, 128, 128)], (64, 36)).is_ok());
@@ -268,7 +309,9 @@ fn a_lost_device_is_an_error_not_a_panic_and_stays_one() {
         assert!(matches!(err, GpuError::DeviceLost(_)), "{err}");
     }
     // The owner's answer is a new device, and a new compositor on it.
-    let fresh = Compositor::new(Gpu::new(GpuOptions::for_tests()).unwrap()).unwrap();
+    let fresh = Compositor::new(Gpu::new(GpuOptions::for_tests()).unwrap())
+        .unwrap()
+        .with_display(kerf_gpu::display_probe::Display::Match);
     assert!(fresh.composite(&plan, &[flat(64, 36, 100, 128, 128)], (64, 36)).is_ok());
     // And a compositor cannot be built on the lost one.
     assert!(matches!(Compositor::new(gpu), Err(GpuError::DeviceLost(_))));

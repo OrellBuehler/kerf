@@ -13,7 +13,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::effects::{blur_plane, gaussian};
+use crate::effects::{blur_plane, gaussian, Gaussian};
 use crate::measure::{self, Budget, Probe, Timing, Verdict};
 
 /// What the probe found: [`Verdict::Match`] (the filter is the model's, every sample of every case), [`Verdict::Differs`] (it
@@ -39,6 +39,20 @@ const CASES: [(usize, usize, f64, u64); 6] = [
     (37, 23, 2.5, 1),
     (66, 38, 9.0, 2),
     (97, 61, 40.0, 3),
+];
+
+/// One picture for each of the recursion's four sweeps (rightwards and leftwards along the rows, downwards and upwards along the
+/// columns), **chosen so that a build that is unfused in that sweep alone reads `Differs`**: the later sweeps re-round what the earlier
+/// ones left, so a one-ulp difference in the first sweep survives to the 8-bit result on about one sample in a hundred million (the
+/// last sweep's on one in a million), and a picture where it does has to be searched for. These are seeds found by running the model with
+/// one sweep unfused over tens of thousands of pictures and keeping the one with the most samples that disagree with the fused model
+/// (4, 34, 23 and 22; a test holds each at two or more). The probe would otherwise read `Match` on a build that fuses three sweeps
+/// of four.
+const SWEEP_CASES: [(usize, usize, f64, u64); 4] = [
+    (160, 96, 250.0, 25817),
+    (160, 96, 1024.0, 1885),
+    (160, 96, 1024.0, 1574),
+    (160, 96, 1024.0, 1667),
 ];
 
 /// The generator of a case's noise (the three planes, one after the other).
@@ -78,7 +92,15 @@ fn probe(budget: &Budget) -> Blur {
 
 /// [`probe`] with `cpu` ahead of FFmpeg's other arguments (the tests run it with `-cpuflags 0`, a machine with none of the SIMD kernels).
 fn probe_with(budget: &Budget, cpu: &[&str]) -> Blur {
-    for (w, h, sigma, seed) in CASES {
+    probe_against(budget, cpu, &|plane, w, h, g| blur_plane(plane, w, h, g))
+}
+
+/// A model of the filter on one plane: `(plane, width, height, coefficients)` to the 8-bit result.
+type Model<'a> = dyn Fn(&[u8], usize, usize, &Gaussian) -> Vec<u8> + 'a;
+
+/// [`probe_with`] against another model of the filter than the shader's: the tests hold the pictures to telling it from FFmpeg's.
+fn probe_against(budget: &Budget, cpu: &[&str], model: &Model<'_>) -> Blur {
+    for (w, h, sigma, seed) in CASES.into_iter().chain(SWEEP_CASES) {
         let mut rng = noise(seed);
         let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
         let planes = [rng.bytes(w * h), rng.bytes(cw * ch), rng.bytes(cw * ch)];
@@ -125,7 +147,7 @@ fn probe_with(budget: &Budget, cpu: &[&str]) -> Blur {
             (u, &planes[1], (cw, ch)),
             (v, &planes[2], (cw, ch)),
         ] {
-            let want = blur_plane(plane, pw, ph, &g);
+            let want = model(plane, pw, ph, &g);
             apart += got.iter().zip(&want).filter(|(a, b)| a != b).count();
         }
         if apart != 0 {
@@ -140,6 +162,7 @@ fn probe_with(budget: &Budget, cpu: &[&str]) -> Blur {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::effects::blur_plane_fused;
 
     /// The memory of the probe: a probe that could not tell is asked again after the backoff and not before, and a match or a
     /// difference is kept for good.
@@ -165,7 +188,11 @@ mod tests {
     /// The shader's fused multiply-add (`shaders/fma.wgsl`, integers) is `f32::mul_add` and its multiply is `*`, bit for bit, on
     /// random triples across a wide range of exponents, on the ties a rounding to nearest even has to break (a product of two
     /// 12-bit significands has exactly 24 bits, one of 13 and 12 has 25: half an ulp, which the addend then moves), on a zero
-    /// addend, on an addend far above or far below the product, and on operands whose sum cancels to a power of two's edge.
+    /// addend, on an addend far above or far below the product, and on operands whose sum cancels to a power of two's edge; and on
+    /// **subnormal and underflowing results** (a product within a few powers of two of 2^-126 and 2^-149, subnormal operands and
+    /// addends, the ties and carries at the fixed quantum 2^-149, the decay of the recursion's own running value through the subnormals
+    /// to zero) and on overflow to infinity. A float that goes through the shader as a float could be flushed by a backend: these
+    /// are on the bit patterns.
     #[test]
     #[ignore = "needs a GPU adapter (lavapipe is enough)"]
     #[allow(clippy::print_stderr)]
@@ -216,6 +243,97 @@ mod tests {
             let prev = (next() % (1 << 20)) as f32 / 64.0 + 1.0;
             let c = (next() % 256) as f32;
             cases.push([nu, prev, c]);
+        }
+        // Every exponent: operands from the whole range of finite non-negative floats, subnormals and zero among them, so results
+        // overflow to infinity, underflow to zero and fall into the subnormals.
+        let anything = |next: &mut dyn FnMut() -> u32| -> f32 {
+            let exp = match next() % 8 {
+                0 => 0,
+                _ => next() % 255,
+            };
+            f32::from_bits((exp << 23) | (next() & 0x7f_ffff))
+        };
+        for _ in 0..200_000 {
+            let (a, b) = (anything(&mut next), anything(&mut next));
+            let c = if next() % 4 == 0 { 0.0 } else { anything(&mut next) };
+            cases.push([a, b, c]);
+        }
+        // The edge of the subnormals: a product within a few powers of two of 2^-126 and 2^-149, with an addend that is zero, a
+        // subnormal, or about the product's own size, so the rounding position is the fixed quantum 2^-149 rather than 24 bits.
+        for _ in 0..300_000 {
+            let a = if next() % 6 == 0 {
+                anything(&mut next)
+            } else {
+                float(23, 60, &mut next)
+            };
+            let want_exp = -160 + (next() % 50) as i32;
+            let ea = (a.to_bits() >> 23) as i32 - 127;
+            let eb_field = (want_exp - ea + 127).clamp(0, 254) as u32;
+            let b = f32::from_bits((eb_field << 23) | (next() & 0x7f_ffff));
+            let c = match next() % 5 {
+                0 => 0.0,
+                1 => f32::from_bits(next() & 0x7f_ffff),
+                2 => f32::from_bits(1 + next() % 8),
+                3 => f32::from_bits(0x0080_0000 + (next() % 0x2000)),
+                _ => f32::from_bits(((next() % 40) << 23) | (next() & 0x7f_ffff)),
+            };
+            cases.push([a, b, c]);
+        }
+        // Ties and carries at the quantum: powers of two and short significands whose product is exactly half a subnormal step,
+        // one step, or the largest subnormal plus half a step (which rounds up into the smallest normal).
+        for e1 in -80..=-60 {
+            for e2 in -90..=-60 {
+                for (m1, m2) in [
+                    (0, 0),
+                    (0x40_0000, 0),
+                    (0x7f_ffff, 0x7f_ffff),
+                    (0x7f_ffff, 0),
+                    (1, 1),
+                    (0x20_0000, 0x40_0000),
+                ] {
+                    let a = f32::from_bits((((e1 + 127) as u32) << 23) | m1);
+                    let b = f32::from_bits((((e2 + 127) as u32) << 23) | m2);
+                    for c in [
+                        0.0,
+                        f32::from_bits(1),
+                        f32::from_bits(2),
+                        f32::from_bits(0x007f_ffff),
+                        f32::from_bits(0x0080_0000),
+                    ] {
+                        cases.push([a, b, c]);
+                    }
+                }
+            }
+        }
+        // The top of the range: overflow to infinity, and the largest finite float.
+        for (a, b, c) in [
+            (f32::MAX, 1.0, 0.0),
+            (f32::MAX, 1.0, f32::from_bits(0x7f7f_ffff)),
+            (f32::MAX, 1.0000001, 0.0),
+            (f32::MAX, 2.0, 0.0),
+            (1.0e30, 1.0e30, 0.0),
+            (3.0e38, 1.0, 3.0e38),
+            (f32::MAX, 1.0, 1.0e31),
+            (f32::MAX, 1.0, 1.0e30),
+            (1.7e19, 2.0e19, 0.0),
+        ] {
+            cases.push([a, b, c]);
+        }
+        // The recursion's own decay: a bright dot on a field of zeros, `prev <- nu * prev + 0` until it is zero (through the
+        // subnormals at sigma 0.3 to 4), and the same with a boundary scale and a post-scale at the end.
+        for sigma in [0.3, 0.5, 1.0, 2.0, 4.0, 40.0] {
+            let g = crate::effects::gaussian(sigma).unwrap();
+            for start in [255.0f32, 235.0, 1.0] {
+                let mut prev = start * g.boundary;
+                for _ in 0..4000 {
+                    cases.push([g.nu, prev, 0.0]);
+                    cases.push([prev, g.post, 0.0]);
+                    prev = g.nu.mul_add(prev, 0.0);
+                    if prev == 0.0 {
+                        break;
+                    }
+                }
+            }
         }
         let mut data = Vec::with_capacity(cases.len() * 4);
         for [a, b, c] in &cases {
@@ -314,34 +432,6 @@ mod tests {
         assert_eq!((bad_total, bad_mul), (0, 0), "first {bad_fma:?}");
     }
 
-    /// `gblur` as the portable C loop writes it: the product rounded before the sum.
-    fn unfused_plane(src: &[u8], w: usize, h: usize, g: &crate::effects::Gaussian) -> Vec<u8> {
-        let mut buf: Vec<f32> = src.iter().map(|v| f32::from(*v)).collect();
-        for row in buf.chunks_exact_mut(w) {
-            row[0] *= g.boundary;
-            for x in 1..w {
-                row[x] += g.nu * row[x - 1];
-            }
-            row[w - 1] *= g.boundary;
-            for x in (1..w).rev() {
-                row[x - 1] += g.nu * row[x];
-            }
-        }
-        for x in 0..w {
-            buf[x] *= g.boundary;
-            for y in 1..h {
-                buf[y * w + x] += g.nu * buf[(y - 1) * w + x];
-            }
-            buf[(h - 1) * w + x] *= g.boundary;
-            for y in (1..h).rev() {
-                buf[(y - 1) * w + x] += g.nu * buf[y * w + x];
-            }
-        }
-        buf.iter()
-            .map(|v| (v * g.post).clamp(0.0, 255.0).round_ties_even() as u8)
-            .collect()
-    }
-
     /// The first three pictures tell the fused recursion from the unfused one by construction: the two models disagree on at least five
     /// samples of each, so a build that does not fuse cannot pass the probe by luck.
     #[test]
@@ -356,7 +446,7 @@ mod tests {
                 .iter()
                 .zip([(w, h), (cw, ch), (cw, ch)])
                 .map(|(p, (pw, ph))| {
-                    let (fused, plain) = (blur_plane(p, pw, ph, &g), unfused_plane(p, pw, ph, &g));
+                    let (fused, plain) = (blur_plane(p, pw, ph, &g), blur_plane_fused(p, pw, ph, &g, [false; 4]));
                     fused.iter().zip(&plain).filter(|(a, b)| a != b).count()
                 })
                 .sum();
@@ -364,6 +454,74 @@ mod tests {
                 apart >= 5,
                 "{w}x{h} sigma {sigma} seed {seed}: the models disagree on {apart} samples"
             );
+        }
+    }
+
+    /// How many samples of a picture's three planes differ between the fused model and the model with the sweeps in `fused` fused.
+    fn disagreement((w, h, sigma, seed): (usize, usize, f64, u64), fused: [bool; 4]) -> usize {
+        let (cw, ch) = (w.div_ceil(2), h.div_ceil(2));
+        let mut rng = noise(seed);
+        let planes = [rng.bytes(w * h), rng.bytes(cw * ch), rng.bytes(cw * ch)];
+        let g = gaussian(sigma).unwrap();
+        planes
+            .iter()
+            .zip([(w, h), (cw, ch), (cw, ch)])
+            .map(|(p, (pw, ph))| {
+                let (want, other) = (blur_plane(p, pw, ph, &g), blur_plane_fused(p, pw, ph, &g, fused));
+                want.iter().zip(&other).filter(|(a, b)| a != b).count()
+            })
+            .sum()
+    }
+
+    /// Each of the four sweeps has a picture that tells it fused from unfused: the model with that sweep alone unfused disagrees with
+    /// the fused one on at least two samples of it (4, 34, 23 and 22 as chosen), so a build that fuses three sweeps of four and not the
+    /// fourth cannot read `Match` by luck. (The blind spot this closes: with the first three pictures alone the horizontal forward
+    /// sweep unfused went unseen.)
+    #[test]
+    fn every_sweep_unfused_alone_is_told_by_its_own_picture() {
+        for (sweep, case) in SWEEP_CASES.into_iter().enumerate() {
+            let mut fused = [true; 4];
+            fused[sweep] = false;
+            let own = disagreement(case, fused);
+            assert!(own >= 2, "sweep {sweep} unfused alone: {case:?} disagrees on {own} samples");
+        }
+    }
+
+    /// ... and over everything the probe draws, every single-sweep mutation of the model disagrees with the fused model somewhere, and so
+    /// do the mutations of two, three and four sweeps: no combination of unfused sweeps is invisible to the probe's pictures.
+    #[test]
+    fn no_combination_of_unfused_sweeps_is_invisible_to_the_probes_pictures() {
+        for mask in 1u8..16 {
+            let fused: [bool; 4] = std::array::from_fn(|i| mask & (1 << i) == 0);
+            let total: usize = CASES
+                .into_iter()
+                .chain(SWEEP_CASES)
+                .map(|case| disagreement(case, fused))
+                .sum();
+            assert!(
+                total >= 2,
+                "sweeps unfused {mask:04b}: the probe's pictures disagree on {total} samples"
+            );
+        }
+    }
+
+    /// The probe, run against a model with one sweep unfused (a build that differs in that sweep alone, as the real FFmpeg here is not),
+    /// says `Differs`: the pictures reach FFmpeg's output and the comparison is on every sample. (On a machine whose own `gblur` is not
+    /// the fused recursion the probe says `Differs` before it gets there, which this reports and passes.)
+    #[test]
+    #[ignore = "needs ffmpeg"]
+    #[allow(clippy::print_stderr)]
+    fn a_model_unfused_in_one_sweep_alone_reads_differs() {
+        if probe(&Budget::new(&TIMING)) != Blur::Match {
+            eprintln!("this FFmpeg's gblur is not the fused recursion: the probe already says so");
+            return;
+        }
+        for sweep in 0..4 {
+            let mut fused = [true; 4];
+            fused[sweep] = false;
+            let found = probe_against(&Budget::new(&TIMING), &[], &|p, w, h, g| blur_plane_fused(p, w, h, g, fused));
+            eprintln!("sweep {sweep} unfused: {found:?}");
+            assert!(matches!(found, Blur::Differs(_)), "sweep {sweep}: {found:?}");
         }
     }
 

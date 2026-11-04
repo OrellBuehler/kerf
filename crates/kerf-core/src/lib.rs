@@ -17,6 +17,7 @@ pub mod error;
 pub mod finite;
 pub mod fonts;
 pub mod frame_pick;
+pub mod gblur;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
 pub mod hostile;

@@ -283,10 +283,13 @@ fn placement_child(dir: &Path, mode: &str) {
         plan(&file, Kind::Held, policy, false),
     );
     let gpu = Gpu::new(GpuOptions::for_tests()).expect("a GPU adapter (install mesa-vulkan-drivers for lavapipe)");
-    let unpinned = Compositor::new(std::sync::Arc::clone(&gpu)).expect("a compositor");
+    let unpinned = Compositor::new(std::sync::Arc::clone(&gpu))
+        .expect("a compositor")
+        .with_display(kerf_gpu::display_probe::Display::Match);
     let compositor = Compositor::new(gpu)
         .expect("a compositor")
-        .with_scaler_kernels(kerf_gpu::scaler::Kernels::Match(kerf_gpu::scaler::Model::ASSUMED));
+        .with_scaler_kernels(kerf_gpu::scaler::Kernels::Match(kerf_gpu::scaler::Model::ASSUMED))
+        .with_display(kerf_gpu::display_probe::Display::Match);
     let size = zoom.size(u32::MAX);
 
     // Cold, scaler unpinned and unmeasured: a held zoom resizes the picture, and an unmeasured scaler is refused, not assumed.

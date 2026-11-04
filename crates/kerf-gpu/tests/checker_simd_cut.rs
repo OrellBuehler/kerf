@@ -38,6 +38,7 @@ fn compositor() -> &'static Compositor {
         // ... and whether it takes a translucent layer through RGB, and blurs, as the model does (a layer below full opacity and a blur are in the caps only then).
         let _ = kerf_gpu::roundtrip_probe::translucency();
         let _ = kerf_gpu::blur_probe::blur();
+        let _ = kerf_gpu::display_probe::display();
         let _ = kerf_gpu::text::model();
         let _ = kerf_gpu::blend::kernels();
         Compositor::new(gpu()).expect("a compositor")

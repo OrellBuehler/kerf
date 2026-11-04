@@ -157,6 +157,7 @@ pub mod compositor;
 pub mod conversion;
 pub mod convert;
 pub mod cursor;
+pub mod display_probe;
 pub mod effects;
 pub mod eq;
 pub mod fill;

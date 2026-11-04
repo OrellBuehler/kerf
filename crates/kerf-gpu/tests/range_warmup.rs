@@ -107,7 +107,10 @@ fn the_render_never_asks_the_file_for_its_range_and_prepare_does() {
 
     let gpu = Gpu::new(GpuOptions::for_tests()).expect("a GPU adapter (install mesa-vulkan-drivers for lavapipe)");
     // (Pinned, so that the placement probe is not what this test is about.)
-    let compositor = Compositor::new(gpu).expect("a compositor").with_placement(Placement::Match);
+    let compositor = Compositor::new(gpu)
+        .expect("a compositor")
+        .with_placement(Placement::Match)
+        .with_display(kerf_gpu::display_probe::Display::Match);
     let flat = |w: u32, h: u32| YuvFrame {
         width: w,
         height: h,

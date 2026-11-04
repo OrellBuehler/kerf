@@ -30,6 +30,10 @@
 //!   that could not tell holds the placement back until a self-test can
 //!   ([`crate::placement_probe::placement_for_selftest`]), so a placed frame is never drawn that this check did not look at.
 //!
+//! * Only where [`crate::display_probe::display`] says this FFmpeg converts `yuv420p` to RGB as the display pass does
+//!   ([`crate::display_probe::Display::Match`]): the compositor hands out no RGB otherwise, so there is no frame to compare and the
+//!   check is [`SelfTestError::Inconclusive`] (the GPU preview stays off, which is what the compositor does anyway).
+//!
 //! No rotation: its float sampling can differ by a level between GPUs for reasons that are not
 //! drift, and a false alarm turns the feature off for someone it works for. The limits are the
 //! self-test's own coarse screen ([`PSNR_FLAT_MIN`] and friends): it is not the parity claim, which
@@ -182,6 +186,12 @@ pub fn parity_self_test(gpu: &Arc<Gpu>) -> Result<SelfTestReport, SelfTestError>
             "this FFmpeg's composite colour policy could not be measured",
         ));
     }
+    let display = crate::display_probe::display_for_selftest();
+    if display != crate::display_probe::Display::Match {
+        return Err(SelfTestError::inconclusive(format!(
+            "this FFmpeg's yuv420p -> rgb24 conversion is not measured to be the display pass's ({display:?}): the GPU hands out no RGB frame, so there is none to check"
+        )));
+    }
     run(
         gpu,
         policy,
@@ -252,7 +262,8 @@ fn run(
         .with_grade_kernels(kernels)
         .with_scaler_kernels(scaler)
         .with_placement(placement)
-        .with_translucency(translucency);
+        .with_translucency(translucency)
+        .with_display(crate::display_probe::Display::Match);
     let source = FrameSource::new(FrameSourceConfig::default());
     let mut reports = Vec::with_capacity(cases.len());
     for case in &cases {

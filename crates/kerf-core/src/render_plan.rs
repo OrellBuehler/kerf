@@ -891,6 +891,9 @@ fn effect_refusal(effect: &VideoEffect, caps: &GpuCaps) -> Option<&'static str> 
         VideoEffect::Blur { sigma } if !(sigma.is_finite() && (0.0..=1024.0).contains(sigma)) => {
             Some("a blur sigma outside 0 to 1024, which gblur refuses")
         }
+        VideoEffect::Blur { sigma } if crate::gblur::gaussian(*sigma).is_none() => {
+            Some("a blur sigma whose coefficients gblur's own arithmetic leaves outside what the compositor computes (a tiny sigma: its `nu` cancels to above 1)")
+        }
         VideoEffect::Sharpen { amount } if !(amount.is_finite() && (-2.0..=5.0).contains(amount)) => {
             Some("a sharpen amount outside -2 to 5, which unsharp refuses")
         }
@@ -983,10 +986,12 @@ pub fn is_quarter_turn(angle: f64) -> bool {
     quarter_turn(angle).is_some()
 }
 
-/// The worst-case error, in levels, the plan allows a one-level difference from FFmpeg's upstream (the
-/// compositor's scaler, a blur's summation order) to grow to through what is drawn after it: the steepest step
-/// of a grade's tables (`eq::table_steps`) and the sharpens (which start it at one, or at the grade's step).
-/// Two is the bound of a scaled blur and of a gentle grade on a scaled layer; one sharpen of 0.5 reaches it exactly.
+/// The worst-case error, in levels, the plan allows a one-level difference from FFmpeg's upstream to grow to through what is drawn after
+/// it: the steepest step of a grade's tables (`eq::table_steps`) and the sharpens (which start it at one, or at the grade's step). The
+/// only upstream difference left is a **scaler that is not measured to be swscale's** (`GpuCaps::exact_scaler` false: the compositor then
+/// draws the C kernel, a level from the x86 one); where the scaler is measured there is nothing to amplify and none of this applies, and a
+/// blur is `gblur`'s own recursion to the sample (or not in the caps at all). Two is the bound of a gentle grade on a scaled layer; one
+/// sharpen of 0.5 reaches it exactly.
 pub const MAX_AMPLIFIED_ERROR: u32 = 2;
 
 /// What an effect does to this kind of picture that the compositor, which works on the 4:2:0 limited-range
@@ -1241,19 +1246,17 @@ impl RenderPlan {
                     ));
                 }
             }
-            // A sharpen is exact, but what it sharpens is not exactly FFmpeg's: the compositor's scaler is a
-            // level off swscale's, and its blur a level off `gblur`'s SIMD on a sample that sits on a half.
-            // `unsharp` (`s + (((s - blur) * amount) >> 16)`) carries that level through at worst
-            // `1 + 2 * amount` levels of luma at an edge sample (after a scale: 3 at 1.5, 7 at 3, 11 at 5;
-            // after a blur: 2 at 1, 3 at 1.5, 5-6 at 5), and the `>> 16` floors, so every sharpen after
-            // the first adds up to a level of its own however small its amount (two of 0.2 reach 3, three
-            // of 0.1 reach 4). From the first source of difference on (a scale ahead of the effects: every
-            // stage, or the fit scale when a moving zoom comes last; or a blur with a sigma) the worst case
-            // is followed through the sharpens that count, `err += ceil(2 * err * |amount|)` from 1 (from the
-            // luma step of the grade between them where the layer is graded), and the
-            // frame is drawn only while it stays within the two levels a scaled blur does: one sharpen of
-            // at most 0.5, and no second one. A sharpen of nothing at `unsharp`'s 16-bit precision counts
-            // for nothing; with no source upstream a sharpen is exact at any amount.
+            // A sharpen is exact, but what it sharpens is exactly FFmpeg's only where the scaler is: a compositor whose
+            // scaler is not measured to be swscale's draws the C kernel, a level off the x86 one. `unsharp`
+            // (`s + (((s - blur) * amount) >> 16)`) carries that level through at worst `1 + 2 * amount` levels of luma at
+            // an edge sample (3 at 1.5, 7 at 3, 11 at 5), and the `>> 16` floors, so every sharpen after the first adds up
+            // to a level of its own however small its amount (two of 0.2 reach 3, three of 0.1 reach 4). From the scale on
+            // (a scale ahead of the effects: every stage, or the fit scale when a moving zoom comes last) the worst case is
+            // followed through the sharpens that count, `err += ceil(2 * err * |amount|)` from 1 (from the luma step of the
+            // grade between them where the layer is graded), and the frame is drawn only while it stays within two levels:
+            // one sharpen of at most 0.5, and no second one. A sharpen of nothing at `unsharp`'s 16-bit precision counts
+            // for nothing; with a scaler that is swscale's to the sample (`caps.exact_scaler`), or with no scale upstream, a
+            // sharpen is exact at any amount, after a blur as well (the blur is `gblur`'s to the sample or not drawn).
             let scaled = geom.stages.iter().any(|s| s.scaled != (s.src.w, s.src.h));
             // The `eq` is next in the chain after those scales (the compositor applies its tables in the vertical
             // pass of the last of them), and they multiply the scaler's level: two pictures a level apart are, after
@@ -1290,10 +1293,12 @@ impl RenderPlan {
             }
             // A chroma key's alpha is a distance in the chroma over `blend`: a level of difference in a chroma
             // sample moves it by up to 1/blend levels (a blend of 0 flips it from 0 to 255), so it is drawn only on
-            // chroma that is FFmpeg's to the level. It runs after every effect: no scale ahead of the effects (a blur the
-            // compositor draws is `gblur`'s to the sample, and a sharpen leaves the chroma alone, the tables are exact).
+            // chroma that is FFmpeg's to the sample. It runs after every effect, and the chroma it reads is what a scale
+            // leaves: swscale's to the sample where the scaler is measured (`caps.exact_scaler`, as for the sharpen's and the
+            // grade's rules), a level off where it is not (a blur the compositor draws is `gblur`'s to the sample, and a sharpen
+            // leaves the chroma alone, the tables are exact).
             let chroma_keyed = layer.effects.iter().any(|e| matches!(e, VideoEffect::ChromaKey { .. }));
-            if chroma_keyed && caps.effects.contains(EffectKinds::CHROMA_KEY) && scaled {
+            if chroma_keyed && caps.effects.contains(EffectKinds::CHROMA_KEY) && scaled && !caps.exact_scaler {
                 reasons.push(Unsupported::Effects(
                     self.layer_ref(n, layer),
                     "a chroma key after a scale: its alpha is a distance in the chroma, which the scale's difference from FFmpeg's moves by up to 1/blend levels",
@@ -1314,15 +1319,18 @@ impl RenderPlan {
                     "a sharpen after a scale: it amplifies its one-level difference from FFmpeg's by 1 + 2|amount| and rounds up a level more with each further sharpen, past two levels",
                 ));
             }
-            // A blended layer is drawn on what the compositor draws exactly: its own picture at its own size, upright
-            // and opaque, over an even frame (the conversions are 4:2:0 pairs). The scaler's level is not swscale's (a
-            // level on the colour, which the blend carries into the composite), a rotation's edge is a fixed-point
-            // sample, a letterbox's bars are transparent in the blend and opaque in the compositor, and an opacity
-            // below 1 takes the RGB round trip, whose chroma is a level off.
+            // A blended layer is drawn where a parity case holds the blend chain to FFmpeg's: its own picture at its own size,
+            // upright and opaque, over an even frame (the conversions are 4:2:0 pairs). A resize, a rotation (its edge is a
+            // fixed-point sample), a letterbox (its bars are transparent in the blend and opaque in the compositor) and an
+            // opacity below 1 (the round trip itself is exact, but the blend chain converts the clip's colour and alpha its own
+            // way and no case holds that chain to FFmpeg yet) are refused until one does: the narrow end of a backlog, not a
+            // measured difference.
             if !layer.blend.is_normal() {
                 let why = |w: &'static str| Unsupported::BlendMode(self.layer_ref(n, layer), layer.blend, w);
                 if geom.stages.iter().any(|s| s.scaled != (s.src.w, s.src.h)) {
-                    reasons.push(why("on a layer the compositor's scaler resizes (its level is not swscale's)"));
+                    reasons.push(why(
+                        "on a layer the compositor's scaler resizes (no case holds the blend chain's resize to FFmpeg's yet)",
+                    ));
                 }
                 // A turn of exactly a quarter lands on whole samples (the `rotate` filter's fixed-point sample is exact there); any
                 // other angle has an edge that is a fixed-point sample against the compositor's float one, and a keyed rotation
@@ -4199,6 +4207,55 @@ mod tests {
             .is_empty());
     }
 
+    /// A blur of sigma 0 is `gblur`'s identity on every build (`nu` 0, both scales 1), so a compositor whose caps leave the blur out
+    /// (a build whose `gblur` is not the recursion it reproduces) still draws it; any other sigma is refused as a blur, and the
+    /// sigmas whose coefficients `gblur`'s own cancellation leaves outside the shader's domain are refused by name, whatever the caps.
+    #[test]
+    fn a_blur_of_sigma_zero_is_drawn_without_the_blur_cap_and_a_cancelling_sigma_is_refused_with_it() {
+        let without = GpuCaps {
+            effects: EffectKinds::SHARPEN,
+            ..GpuCaps::A0
+        };
+        let with = GpuCaps {
+            effects: EffectKinds::BLUR,
+            ..GpuCaps::A0
+        };
+        let reasons = |caps: &GpuCaps, sigma: f64| {
+            let plan = fading_plan(|c| c.effects = vec![VideoEffect::Blur { sigma }], 0.5);
+            plan.reasons(caps, plan.size(u32::MAX))
+        };
+        assert!(reasons(&without, 0.0).is_empty(), "{:?}", reasons(&without, 0.0));
+        assert!(reasons(&with, 0.0).is_empty());
+        let why = reasons(&without, 3.0);
+        assert!(
+            matches!(why.as_slice(), [Unsupported::Effects(_, w)] if *w == "a blur"),
+            "{why:?}"
+        );
+        assert!(reasons(&with, 3.0).is_empty());
+        // Sigma 0 is only the identity at 0: a tiny one is a blur like another.
+        let why = reasons(&without, 1e-9);
+        assert!(
+            matches!(why.as_slice(), [Unsupported::Effects(_, w)] if *w == "a blur"),
+            "{why:?}"
+        );
+        // The cancellation band (about 1.05e-8 to 1.29e-8): `nu` leaves [0, 1) in `gblur`'s own arithmetic.
+        for sigma in [1.1e-8, 1.2e-8, 1.28e-8] {
+            let g = crate::gblur::gblur_coefficients(sigma).expect("in range");
+            assert!(!g.in_shader_domain(), "{sigma}: {g:?}");
+            let why = reasons(&with, sigma);
+            assert!(
+                why.iter()
+                    .any(|r| matches!(r, Unsupported::Effects(_, w) if w.contains("coefficients"))),
+                "{sigma}: {why:?}"
+            );
+            assert!(!reasons(&without, sigma).is_empty(), "{sigma}");
+        }
+        // Their neighbours are drawn.
+        for sigma in [1.0e-8 * 0.9, 1.4e-8, 2.0e-8, 1e-6] {
+            assert!(reasons(&with, sigma).is_empty(), "{sigma}: {:?}", reasons(&with, sigma));
+        }
+    }
+
     #[test]
     fn what_the_compositor_cannot_do_with_a_mask_an_effect_or_a_moving_zoom_is_refused_with_its_own_reason() {
         use crate::model::Keyframe;
@@ -4686,6 +4743,41 @@ mod tests {
             }),
             "chroma key after a scale"
         ));
+        // ... unless the scaler is measured to be swscale's to the sample (`exact_scaler`, as the sharpen's and the grade's rules
+        // have it): the chroma the key reads is then FFmpeg's, with any other effect before it.
+        let exact = GpuCaps {
+            exact_scaler: true,
+            ..caps
+        };
+        for effects_before in [
+            vec![],
+            vec![VideoEffect::Blur { sigma: 2.0 }],
+            vec![VideoEffect::Sharpen { amount: 1.5 }],
+            vec![VideoEffect::Invert, VideoEffect::Grayscale],
+            vec![VideoEffect::Blur { sigma: 3.0 }, VideoEffect::Sharpen { amount: 0.5 }],
+        ] {
+            for scale in [0.4985, 0.6, 0.9] {
+                let plan = fading_plan_of(
+                    video(640, 360),
+                    None,
+                    CompositeColorPolicy::FixedBt601,
+                    |c| {
+                        c.transform.scale = scale;
+                        c.effects = effects_before.iter().cloned().chain([key()]).collect();
+                    },
+                    0.5,
+                );
+                assert_eq!(
+                    plan.reasons(&exact, plan.size(u32::MAX)),
+                    vec![],
+                    "{effects_before:?} then a key at scale {scale}"
+                );
+                assert!(
+                    effects(&plan.reasons(&caps, plan.size(u32::MAX)), "chroma key after a scale"),
+                    "{effects_before:?} then a key at scale {scale}: refused where the scaler is not measured"
+                );
+            }
+        }
         assert!(
             why(&|c| c.effects = vec![key(), VideoEffect::Blur { sigma: 2.0 }]).is_empty(),
             "a key beside a blur is drawn"

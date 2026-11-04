@@ -11,5 +11,5 @@ fn cs_test(@builtin(global_invocation_id) gid: vec3<u32>) {
         return;
     }
     let t = triples[i];
-    results[i] = vec2<u32>(fma_pos(t.x, t.y, t.z), bitcast<u32>(mul_f(bitcast<f32>(t.x), bitcast<f32>(t.y))));
+    results[i] = vec2<u32>(fma_pos(t.x, t.y, t.z), mul_pos(t.x, t.y));
 }

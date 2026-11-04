@@ -799,7 +799,7 @@ impl fmt::Display for Unsupported {
             Self::Geometry(n, why) => write!(f, "layer {n}: {why}"),
             Self::FullRangeStill(l) => write!(
                 f,
-                "{l}: a full-range picture in a still, where FFmpeg 9 keeps the picture's range through the graph and converts it last (its planes are full-range ones; the compositor's composite is limited-range)"
+                "{l}: a full-range picture in a still, where this FFmpeg keeps the picture's range through the graph and converts it last (its planes are full-range ones; the compositor's composite is limited-range)"
             ),
             Self::TranslucentApproximate(l) => write!(
                 f,
@@ -852,6 +852,22 @@ mod tests {
             .to_string()
             .starts_with("layer 1 (a.mp4): a speed ramp"));
         assert_eq!(
+            Unsupported::TranslucentApproximate(layer(1, "a.mp4")).kind(),
+            "translucent_approximate"
+        );
+        assert_eq!(Unsupported::FullRangeStill(layer(1, "a.mp4")).kind(), "full_range_still");
+        assert_eq!(
+            Unsupported::TranslucentApproximate(layer(0, "a.mp4")).kind(),
+            Unsupported::TranslucentApproximate(layer(3, "b.mov")).kind(),
+            "the layer is not part of the key"
+        );
+        assert!(Unsupported::TranslucentApproximate(layer(1, "a.mp4"))
+            .to_string()
+            .starts_with("layer 1 (a.mp4): "));
+        assert!(Unsupported::FullRangeStill(layer(1, "a.mp4"))
+            .to_string()
+            .starts_with("layer 1 (a.mp4): a full-range picture in a still"));
+        assert_eq!(
             Unsupported::DipToWhite(layer(0, "a.mp4"), DipWhy::Resized).kind(),
             Unsupported::DipToWhite(layer(2, "b.mov"), DipWhy::Format).kind(),
             "the why of a dip is not part of the key"
@@ -880,6 +896,8 @@ mod tests {
             Unsupported::SpeedRamp(layer(0, "")).kind(),
             Unsupported::Stabilized(layer(0, "")).kind(),
             Unsupported::BlendMode(layer(0, ""), BlendMode::Screen, "a rotated layer").kind(),
+            Unsupported::TranslucentApproximate(layer(0, "")).kind(),
+            Unsupported::FullRangeStill(layer(0, "")).kind(),
         ];
         for kind in kinds {
             assert!(

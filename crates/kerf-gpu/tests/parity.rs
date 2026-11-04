@@ -103,10 +103,9 @@
 //!   gray, or a format never recorded) is refused, in both directions. FFmpeg scales
 //!   in the format the picture has, the decode reduces it to 8-bit 4:2:0 first, and the
 //!   chroma is then interpolated from different samples: enlarging was 15 to 69 levels
-//!   off, and a *shrink* as mild as 1.05x to 1.5x reads flat max 8 to 9 (4:2:2 at 0.9x
-//!   is over the limit) and up to 32 levels on edges, the kernels differing most near
-//!   a ratio of 1. No band of ratios was measured strictly inside the limits on both
-//!   FFmpegs for busy chroma, so none is claimed
+//!   off, and a *shrink* as mild as 1.05x to 1.5x reads a flat max of 8 to 9 levels
+//!   and up to 32 on edges, the kernels differing most near a ratio of 1. No band of
+//!   ratios was measured exact on both FFmpegs for busy chroma, so none is claimed
 //!   (`resizing_a_picture_ffmpeg_scales_in_another_format_is_refused`). A picture left
 //!   at its size is drawn for every format.
 //! * **A moving zoom or position is the last stage of FFmpeg's chain** (the still and the export alike), so a
@@ -218,6 +217,7 @@ fn compositor() -> &'static Compositor {
         // ... and whether it takes a translucent layer through RGB, and blurs, as the model does (a layer below full opacity and a blur are in the caps only then).
         let _ = kerf_gpu::roundtrip_probe::translucency();
         let _ = kerf_gpu::blur_probe::blur();
+        let _ = kerf_gpu::display_probe::display();
         // ... and so is the layout of its `drawtext`, which decides whether text whose bitmaps share samples is drawn.
         let _ = kerf_gpu::text::model();
         // ...and the blend chain's, which the blend modes are in the caps by.
@@ -2023,8 +2023,7 @@ fn busy_sources_are_held_to_the_scaler_not_to_a_flat_region() {
     let m = media();
     // Noise and a 1-px checkerboard, scaled by ratios that are not whole numbers
     // (down 0.75 and 0.6, up 1.5): every output pixel depends on the exact kernel
-    // (taps, phase, stretch on shrink). The edge band covers these pictures, so
-    // the whole image is the evidence (`BUSY`).
+    // (taps, phase, stretch on shrink). Every sample of these pictures is the evidence, as it is of every case.
     for (name, a) in [("noise", &m.noise), ("checker", &m.checker)] {
         for (w, h) in [(480u32, 270u32), (384, 216), (960, 540)] {
             let tl = timeline(vec![vec![clip(a, 0.0, 0.2, 0.0)]], Some(Delivery::new(w, h, Fit::Contain)));
@@ -2090,6 +2089,78 @@ fn check_refused_with(case: &str, tl: &Timeline, assets: &[Asset], t: f64, expec
         }
     }
     eprintln!("{case:<40} refused as expected, FFmpeg renders it");
+}
+
+/// A chroma key on a layer the compositor scales is drawn, as `chromakey` draws it, to the sample: its alpha is a distance in the chroma
+/// over `blend`, and the chroma it reads is what the scaler leaves, which is swscale's to the sample where the scaler is measured (the plan
+/// refuses the key after a scale only where it is not: `caps.exact_scaler`). Several scales, keys from a hard one to a wide one, noise and
+/// a test card, and the key after each of the other effects. (`motion_parity.rs` holds the same in an export.)
+#[test]
+#[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
+fn a_chroma_key_after_a_scale_is_drawn_as_chromakey_draws_it() {
+    let m = media();
+    use kerf_core::VideoEffect as E;
+    let over = |fg: &Asset, edit: &dyn Fn(&mut Clip)| {
+        let mut c = clip(fg, 0.0, 2.0, 0.0);
+        edit(&mut c);
+        (
+            timeline(vec![vec![clip(&m.bars, 0.0, 2.0, 0.0)], vec![c]], None),
+            vec![m.bars.clone(), fg.clone()],
+        )
+    };
+    for scale in [0.6, 0.4985, 0.9] {
+        for (similarity, blend) in [(0.15, 0.1), (0.1, 0.0), (0.5, 0.5), (0.00001, 0.0), (1.0, 1.0)] {
+            for fg in [&m.testsrc, &m.noise] {
+                for color in ["green", "0x808080"] {
+                    let (tl, assets) = over(fg, &|c| {
+                        c.transform.scale = scale;
+                        c.effects = vec![a_key(color, similarity, blend)];
+                    });
+                    check(
+                        &format!("key-scale/{} {color} scale {scale} sim {similarity} blend {blend}", fg.name),
+                        &tl,
+                        &assets,
+                        &[0.5],
+                    );
+                }
+            }
+        }
+    }
+    for (name, effects) in [
+        ("blur", vec![E::Blur { sigma: 2.0 }]),
+        ("sharpen", vec![E::Sharpen { amount: 1.5 }]),
+        ("invert", vec![E::Invert]),
+        ("grayscale", vec![E::Grayscale]),
+        ("vignette", vec![E::Vignette]),
+        ("blur, sharpen", vec![E::Blur { sigma: 3.0 }, E::Sharpen { amount: 0.5 }]),
+        (
+            "sharpen, invert, grayscale",
+            vec![E::Sharpen { amount: 2.0 }, E::Invert, E::Grayscale],
+        ),
+        ("blur, invert, vignette", vec![E::Blur { sigma: 1.5 }, E::Invert, E::Vignette]),
+    ] {
+        for fg in [&m.testsrc, &m.noise] {
+            for scale in [0.6, 0.4985] {
+                let (tl, assets) = over(fg, &|c| {
+                    c.transform.scale = scale;
+                    c.effects = effects.iter().cloned().chain([a_key("0x808080", 0.25, 0.2)]).collect();
+                });
+                check(
+                    &format!("key-scale/{name} then a key, {} scale {scale}", fg.name),
+                    &tl,
+                    &assets,
+                    &[0.5],
+                );
+            }
+        }
+    }
+    let (tl, assets) = over(&m.testsrc, &|c| {
+        c.transform.scale = 0.6;
+        c.color.contrast = 1.2;
+        c.color.saturation = 1.3;
+        c.effects = vec![a_key("green", 0.15, 0.1)];
+    });
+    check("key-scale/with an eq ahead", &tl, &assets, &[0.5]);
 }
 
 #[test]
@@ -2254,12 +2325,11 @@ fn frames_the_gpu_would_draw_wrong_are_refused() {
     };
     for (name, asset, edit, reason) in [
         (
-            "on-a-pip",
-            &m.testsrc,
-            Box::new(|c: &mut Clip| c.transform.scale = 0.6) as Box<dyn Fn(&mut Clip)>,
-            "chroma key after a scale",
+            "on-a-444-picture",
+            &m.yuv444,
+            Box::new(|_: &mut Clip| {}) as Box<dyn Fn(&mut Clip)>,
+            "yuv420p",
         ),
-        ("on-a-444-picture", &m.yuv444, Box::new(|_: &mut Clip| {}), "yuv420p"),
         (
             "under-a-mask",
             &m.testsrc,
@@ -2439,9 +2509,8 @@ fn check_full_range(
 }
 
 /// A dip to white goes through `yuv420p -> rgb24 -> yuv420p`, and the compositor draws that for the
-/// pictures it was measured on (8-bit limited-range 4:2:0, untagged or BT.709): 2 levels of the
-/// planes (3 on BT.709), well inside the strict bounds. The pictures it is not drawn for were all
-/// measured off by more than the bound — RGB 11 / 12, 10-bit 9 / 16, 4:4:4 16 / 17, 4:2:2 9 / 13 — and so
+/// pictures it was measured on (8-bit limited-range 4:2:0, untagged or BT.709), to the sample. The pictures it is not
+/// drawn for were all measured off (levels of Y / UV: RGB 11 / 12, 10-bit 9 / 16, 4:4:4 16 / 17, 4:2:2 9 / 13) — and so
 /// was a letterbox (FFmpeg pads before the round trip, so its bars go white too: Y 126 against 16 at
 /// half way), a picture with an odd side (the round trip reads past it) and a layer the scaler
 /// resizes (the `scale` filter converts to RGB itself). The dip to black on the same pictures is
@@ -2645,7 +2714,7 @@ fn a_full_range_picture_fades_as_the_ffmpeg_in_use_converts_its_range() {
         true,
     );
     // A 10-bit file tagged full range probes as `yuv420p10le` like the limited one and 9.0.2 fades its raw values
-    // (flat max 16 / 15 / 11 against a bound of 8): the name cannot tell the two apart, and a limited file may say
+    // (a flat max of 16 / 15 / 11 levels off the compositor's): the name cannot tell the two apart, and a limited file may say
     // nothing of its range, so under FFmpeg 9 every deeper-than-8-bit picture is refused inside a fade, the limited
     // one included (the flag now settles the full-range one where it is recorded). FFmpeg 6 draws both.
     for (name, a) in [("pc-tagged 10-bit", &m.tenbit_pc), ("limited 10-bit", &m.tenbit)] {
@@ -3678,10 +3747,10 @@ fn grading_a_full_range_picture_is_refused_and_ungraded_it_is_drawn() {
 
 /// FFmpeg scales a picture in the format it has; the compositor in the 8-bit 4:2:0 a
 /// decode reduces it to. Enlarging a 4:4:4 picture was 27 levels off, 4:2:2 15, RGB
-/// video 51, an RGB PNG 69 — and a *shrink* as mild as 1.05-1.5x still reads flat max
-/// 8-9 (4:2:2 at 0.9x is over the limit) and up to 32 levels on edges, because the
-/// chroma kernel differs most near a ratio of 1. No band of ratios was measured
-/// strictly inside the limits on both FFmpegs for busy chroma, so none is claimed:
+/// video 51, an RGB PNG 69 — and a *shrink* as mild as 1.05-1.5x still reads a flat max
+/// of 8-9 levels and up to 32 on edges, because the chroma kernel differs most near a
+/// ratio of 1. No band of ratios was measured exact on both FFmpegs for busy chroma,
+/// so none is claimed:
 /// every resize of a picture that is not 8-bit 4:2:0 is FFmpeg's (10-bit 4:2:0 scaled and dithered at 10
 /// bits is off by one in Y, U and V on 6.1.1; gray scaled in `gray` is 10 levels off over half the plane on
 /// 9.0.2), and a picture left at its size is drawn.
@@ -3737,7 +3806,7 @@ fn resizing_a_picture_ffmpeg_scales_in_another_format_is_refused() {
                 Refusal::Plan("scales a"),
             );
         }
-        // ...and a picture left at its size is drawn, held to the strict limits.
+        // ...and a picture left at its size is drawn, held to zero differing samples.
         check(&format!("same-size/{name}"), &scaled(a, 1.0, None), assets, &[0.5]);
     }
     // 8-bit 4:2:0 is what the compositor works in: resizing it is fine in both directions. 10-bit 4:2:0 and
@@ -4621,8 +4690,8 @@ fn a_mask(shape: kerf_core::MaskShape, feather: f64, inverted: bool) -> kerf_cor
 /// The still runs a moving zoom as the last stage of the clip's chain, like the export: the placement's
 /// `perspective`, after what is in front of it (a grade, a mask, an effect, the clip's fades). The compositor
 /// draws that order and reproduces the placement, so every case is exact (`check_exact`: the planes, taken to
-/// RGB by FFmpeg, are the still's PNG to the sample); only a blur, which is `gblur`'s float recursion that
-/// FFmpeg itself computes differently on an AVX2 build, and the scaler's own Cover fit are judged by `STRICT`.
+/// RGB by FFmpeg, are the still's PNG to the sample), a blur included: it is `gblur`'s fused-multiply-add recursion where
+/// `blur_probe` says this FFmpeg runs that, and the plan refuses it otherwise.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn a_moving_zoom_is_placed_as_the_still_places_it() {
@@ -6231,267 +6300,15 @@ fn the_previews_proxies_stack_as_their_originals_do() {
 
 // ---- recorded numbers -----------------------------------------------------------
 //
-// Final limits (the constants at the top; no case relaxes the flat-region ones):
-//   flat region  PSNR >= 40 dB, max per-channel error <= 8/255, outside a 2 px
-//                band around every >24-level reference step (>12 for a case with a
-//                rotated layer), and at least 50% of the frame in the flat region
-//   whole image  PSNR >= 40 dB (>= 30 dB for a case with a rotated layer)
-//   busy source  (noise, checkerboard) no band: whole image PSNR >= 40 dB, max <= 8
-//   scaler       every plane within 1 level of `ffmpeg -vf scale` up to ~4:1; within
-//                3 levels (mean <= 0.6) on 8:1 to 20:1 downscales, within 5 (mean
-//                <= 1.0) from 32:1 to the 40:1 the plan stops at
+// There is no table of figures and no limit to keep one against: **every drawn case is held to 0 differing samples** (the still's
+// `yuv444p` planes, its PNG, and the display's RGB), on FFmpeg 6.1.1 (policy `FixedBt601`) and on the pinned 9.0.2 build (what the
+// Windows and macOS bundles ship; policy `BottomLayerTag`), strictly (no `KERF_PARITY_EXPLORE`), on Mesa lavapipe. A stack the plan
+// declines on one of them (mixed matrices, an RGB picture in a non-BT.601 stack, an asset that never recorded its pixel format, a
+// full-range picture in a still where the range is negotiated, a resize of a picture the scaler does not resize exactly) is asserted
+// refused rather than compared, and `drawn_anyway` shows each refusal that must be needed to differ. Every run rewrites
+// `target/parity/report.txt` (the differing-sample counts and the decode / composite time of the GPU path); the figures in it are
+// all zero for a case that is drawn.
 //
-// One run on Mesa lavapipe (llvmpipe, LLVM 20.1.2, Vulkan) against FFmpeg 6.1.1
-// (policy `FixedBt601`). The last column is the same case against the pinned
-// FFmpeg 9.0.2 build (what the Windows and macOS bundles ship; policy
-// `BottomLayerTag`): `=` is the same figures (within 0.15 dB, same max), otherwise
-// "flat PSNR / flat max" there, and `refused` is a stack the plan declines on that
-// FFmpeg (mixed matrices, an RGB picture in a non-BT.601 stack, an asset that
-// never recorded its pixel format), asserted refused rather than compared. Both
-// runs pass every case, strictly (no `KERF_PARITY_EXPLORE`). (A gray or 10-bit picture the scaler resizes is refused, so
-// its `enlarge-ok/`, `shrink-ok/` and resized `grid/gray-*` rows are gone; `refused/{gray,yuv420p10le}-*` assert it.)
-// The `text/` rows are the cases with text, judged against the same picture without it
-// (whole-image max at most the control's, floor 3; the lower third at 0.1 s +1, the 12 px text and the
-// full-range pictures on 9.0 +2, each with its reason at the case); the `(no text)` controls are in the
-// report, not here. The `blank-*` rows are frames with no layer (drawn in RGB: exact).
-// The smallest flat share of any non-busy case is 56.9% (`grid/yuv420p-cover-odd-y-then-
-// scale`, a 202x100 frame, band 43.1%; the other `grid/*-cover-odd-y` cases 59.4%); the
-// largest band among the cases judged strictly is that one. Every run rewrites `target/parity/report.txt` (these columns plus the
-// decode / composite time of the GPU path and the scaler lines).
-//
-// case                                             t    canvas | flat PSNR flat max |  all PSNR  all max |  band 9.0.2
-// busy/checker-to-384x216                        0.1   384x216 |    48.2 dB        2 |    48.2 dB        2 |  0.0%    =
-// busy/checker-to-480x270                        0.1   480x270 |    49.4 dB        2 |    49.4 dB        2 |  0.0%    =
-// busy/checker-to-960x540                        0.1   960x540 |    99.0 dB        0 |    48.8 dB        2 | 100.0%    =
-// busy/noise-scaled-0.7                          0.1   640x360 |    46.5 dB        3 |    45.9 dB        5 | 50.8%    =
-// busy/noise-to-384x216                          0.1   384x216 |    99.0 dB        0 |    45.8 dB        5 | 100.0%    =
-// busy/noise-to-480x270                          0.1   480x270 |    99.0 dB        0 |    45.8 dB        5 | 100.0%    =
-// busy/noise-to-960x540                          0.1   960x540 |    99.0 dB        0 |    46.3 dB        5 | 100.0%    =
-// clamped-end/nothing-drawn                     1.99   640x360 |    46.6 dB        3 |    46.6 dB        3 |  0.0%    =
-// clamped-end/nothing-drawn                        3   640x360 |    46.6 dB        3 |    46.6 dB        3 |  0.0%    =
-// colour/brightness+contrast+saturation+gamma     0.5   640x360 |    48.8 dB        3 |    48.6 dB        3 | 15.4%    =
-// colour/contrast+saturation-only                0.5   640x360 |    47.9 dB        3 |    47.9 dB        3 |  9.9%    =
-// colour/cool+brightness                         0.5   640x360 |    47.6 dB        3 |    47.6 dB        3 | 15.5%    =
-// colour/on-a-transformed-clip                   0.5   640x360 |    48.9 dB        6 |    48.9 dB        6 | 15.4%    =
-// colour/warm                                    0.5   640x360 |    45.6 dB        3 |    45.6 dB        3 |  0.0%    =
-// contain/9x16                                   0.5   360x640 |    55.0 dB        4 |    53.6 dB        5 | 10.6%    =
-// contain/9x16                                   1.2   360x640 |    55.0 dB        4 |    53.6 dB        5 | 10.6%    =
-// contain/downscale-320x180                      0.5   320x180 |    48.9 dB        4 |    48.4 dB        5 | 29.4%    =
-// contain/portrait-in-16x9                       0.7   640x360 |    55.1 dB        3 |    53.5 dB        5 | 11.6%    =
-// contain/upscale-960x540                        0.5   960x540 |    48.8 dB        5 |    48.5 dB        5 | 14.3%    =
-// cover/9x16                                     0.5   360x640 |    46.4 dB        5 |    46.5 dB        5 |  7.4%    =
-// cover/9x16                                     1.2   360x640 |    46.3 dB        4 |    46.4 dB        5 |  6.5%    =
-// cover/portrait-in-16x9                         0.7   640x360 |    49.0 dB        5 |    48.8 dB        5 | 11.5%    =
-// enlarge-ok/yuv420p-fit-to-960x540              0.5   960x540 |    48.8 dB        5 |    48.5 dB        5 | 14.3%    =
-// enlarge-ok/yuv420p-x1.5                        0.5   640x360 |    47.7 dB        5 |    47.5 dB        5 | 17.7%    =
-// enlarge-ok/yuvj420p-jpeg-fit-to-960x540        0.5   960x540 |    99.0 dB        0 |    99.0 dB        0 |  0.0%    =
-// enlarge-ok/yuvj420p-jpeg-x1.5                  0.5   480x270 |    99.0 dB        0 |    99.0 dB        0 |  0.0%    =
-// full-range/limited-range-control-graded        0.5   640x360 |    48.3 dB        3 |    48.2 dB        3 | 15.6%    =
-// full-range/ungraded                            0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 15.6% 52.8 / 3
-// gap                                            1.5   640x360 |    99.0 dB        0 |    99.0 dB        0 |  0.0%    =
-// geometry/crop-then-cover                       0.5   360x640 |    48.2 dB        5 |    48.0 dB        5 | 13.0%    =
-// geometry/fully-off-canvas                      0.5   640x360 |    46.3 dB        3 |    46.3 dB        3 |  0.0%    =
-// geometry/odd-rotated-box                       0.5   640x360 |    46.4 dB        3 |    36.9 dB      254 |  7.1%    =
-// geometry/odd-sized-layer                       0.5   640x360 |    46.3 dB        3 |    46.4 dB        5 |  5.5%    =
-// geometry/zoom-off-canvas                       0.5   640x360 |    48.1 dB        4 |    48.0 dB        5 |  9.5%    =
-// grid/bgr0-pad-odd-x                            0.5   646x360 |    48.4 dB        3 |    48.3 dB        3 | 17.2%    =
-// grid/bgr0-pad-odd-y                            0.5   640x366 |    48.4 dB        3 |    48.4 dB        3 | 18.2%    =
-// grid/gray-pad-odd-x                            0.5   646x360 |    51.4 dB        1 |    51.3 dB        1 | 15.1%    =
-// grid/gray-pad-odd-y                            0.5   640x366 |    51.4 dB        1 |    51.3 dB        1 | 16.2%    =
-// grid/rgb24-png-pad-odd-x                       0.5   646x360 |    48.3 dB        3 |    48.3 dB        3 | 15.9%    =
-// grid/rgb24-png-pad-odd-y                       0.5   640x366 |    48.4 dB        3 |    48.3 dB        3 | 16.9%    =
-// grid/yuv420p-cover-odd-x                       0.5    90x162 |    46.4 dB        3 |    46.5 dB        4 | 23.4%    =
-// grid/yuv420p-cover-odd-x-then-scale            0.5    90x162 |    48.6 dB        3 |    48.7 dB        4 | 31.5%    =
-// grid/yuv420p-cover-odd-y                       0.5   202x100 |    49.0 dB        3 |    48.6 dB        5 | 40.6%    =
-// grid/yuv420p-cover-odd-y-then-scale            0.5   202x100 |    52.0 dB        3 |    50.3 dB        4 | 43.1%    =
-// grid/yuv420p-even-crop                         0.5   320x180 |    48.7 dB        4 |    48.5 dB        5 | 32.3%    =
-// grid/yuv420p-letterbox-9x16                    0.5   360x640 |    55.0 dB        4 |    53.6 dB        5 | 10.6%    =
-// grid/yuv420p-odd-crop                          0.5   320x180 |    48.8 dB        3 |    48.5 dB        5 | 32.2%    =
-// grid/yuv420p-odd-crop-behind-a-pip             0.5   320x180 |    49.1 dB        5 |    48.4 dB        5 | 30.0%    =
-// grid/yuv420p-odd-crop-cover                    0.5    90x162 |    46.5 dB        3 |    46.8 dB        4 | 22.4%    =
-// grid/yuv420p-odd-x-crop                        0.5   320x180 |    48.8 dB        4 |    48.5 dB        5 | 31.1%    =
-// grid/yuv420p-odd-y-crop                        0.5   320x180 |    48.8 dB        4 |    48.3 dB        5 | 31.8%    =
-// grid/yuv420p-pad-odd-x                         0.5   646x360 |    48.8 dB        3 |    48.8 dB        3 | 17.1%    =
-// grid/yuv420p-pad-odd-y                         0.5   640x366 |    48.9 dB        3 |    48.8 dB        3 | 18.2%    =
-// grid/yuv422p-pad-odd-x                         0.5   646x360 |    48.9 dB        3 |    48.8 dB        3 | 17.7%    =
-// grid/yuv422p-pad-odd-y                         0.5   640x366 |    48.9 dB        3 |    48.8 dB        3 | 18.8%    =
-// grid/yuv444p-pad-odd-x                         0.5   646x360 |    48.9 dB        3 |    48.7 dB        3 | 19.4%    =
-// grid/yuv444p-pad-odd-y                         0.5   640x366 |    48.9 dB        3 |    48.8 dB        3 | 20.4%    =
-// letterbox/graded-over-gradient                 0.5   640x360 |    65.6 dB        3 |    59.5 dB        6 | 10.9%    =
-// letterbox/graded-single-clip                   0.5   640x360 |    54.8 dB        3 |    53.0 dB        5 | 12.1%    =
-// letterbox/landscape-over-portrait-9x16         0.5   360x640 |    55.8 dB        3 |    54.4 dB        5 |  8.3%    =
-// letterbox/odd-fit-over-gradient                0.5   360x640 |    55.0 dB        4 |    53.6 dB        5 | 10.6%    =
-// letterbox/portrait-over-landscape              0.5   640x360 |    55.2 dB        3 |    53.5 dB        5 | 12.0%    =
-// matrix/bt2020-bars                             0.5   640x360 |    48.8 dB        3 |    48.8 dB        3 |  7.8% 47.9 / 2
-// matrix/bt2020-layered                          0.5   640x360 |    46.7 dB        4 |    46.8 dB        5 |  9.7% 46.2 / 4
-// matrix/bt2020-testsrc2                         0.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 15.7%    =
-// matrix/bt709-bars                              0.5   640x360 |    49.8 dB        2 |    49.7 dB        2 | 10.4% 49.9 / 3
-// matrix/bt709-gradient                          0.5   640x360 |    46.3 dB        3 |    46.3 dB        3 |  0.0%    =
-// matrix/bt709-layered                           0.5   640x360 |    46.7 dB        4 |    46.8 dB        5 |  9.7% 46.9 / 4
-// matrix/bt709-testsrc2                          0.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 15.7%    =
-// matrix/mixed-2020-over-709                     0.5   640x360 |    46.7 dB        4 |    46.8 dB        5 |  9.7% refused
-// matrix/mixed-709-over-2020                     0.5   640x360 |    46.7 dB        4 |    46.8 dB        5 |  9.7% refused
-// matrix/mixed-709-over-untagged                 0.5   640x360 |    46.7 dB        4 |    46.8 dB        5 |  9.7% refused
-// matrix/mixed-untagged-over-709                 0.5   640x360 |    46.7 dB        4 |    46.8 dB        5 |  9.7% refused
-// matrix/rgb-png-under-709                       0.5   640x360 |    47.1 dB        5 |    47.1 dB        5 | 12.8% refused
-// matrix/rgb-png-under-untagged                  0.5   640x360 |    47.1 dB        5 |    47.1 dB        5 | 12.8%    =
-// old-asset/opaque                               0.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 15.7% refused
-// opacity/0.3+scale+rotate                       0.5   640x360 |    46.6 dB        5 |    43.5 dB       66 | 14.2%    =
-// opacity/0.5                                      0   640x360 |    43.4 dB        4 |    43.5 dB        5 | 21.8%    =
-// opacity/0.5                                      1   640x360 |    43.2 dB        5 |    43.3 dB        5 | 22.4%    =
-// opacity/bars-0.5-over-testsrc2                 0.5   640x360 |    44.5 dB        5 |    44.5 dB        5 | 22.9%    =
-// opacity/bars-0.65-alone                        0.5   640x360 |    45.0 dB        5 |    44.9 dB        5 |  9.8%    =
-// opacity/bt2020-bars-0.6                        0.5   640x360 |    47.9 dB        4 |    47.8 dB        4 |  7.8% 46.2 / 4
-// opacity/keyframed-fade+grade                   0.5   640x360 |    46.5 dB        5 |    46.4 dB        5 | 14.8%    =
-// opacity/odd-source-cropped-0.7                 0.5   640x360 |    43.7 dB        6 |    43.8 dB        6 | 28.7%    =
-// opacity/testsrc2-0.65+brightness0.2            0.5   640x360 |    42.1 dB        5 |    42.1 dB        5 | 14.9%    =
-// opacity/testsrc2-0.65+saturation1.9            0.5   640x360 |    45.6 dB        5 |    45.3 dB        5 | 14.9%    =
-// pip/cover-then-scale                           0.5   360x640 |    45.7 dB        5 |    45.8 dB        5 |  6.3%    =
-// pip/odd-361x203-in-722x640                     0.5   722x640 |    48.4 dB        5 |    48.3 dB        5 |  7.7%    =
-// pip/scaled+offset                                0   640x360 |    49.4 dB        3 |    49.3 dB        5 | 15.9%    =
-// pip/scaled+offset                                1   640x360 |    49.4 dB        5 |    49.3 dB        5 | 16.0%    =
-// range/graded-limited-over-full                 0.5   640x360 |    48.5 dB        4 |    48.3 dB        5 | 21.1% refused
-// range/graded-translucent-png-over-full         0.5   640x360 |    44.8 dB        5 |    44.8 dB        5 | 18.6% refused
-// same-size/bgr0                                 0.5   640x360 |    48.4 dB        3 |    48.3 dB        3 | 15.7%    =
-// same-size/rgb24-png                            0.5   480x270 |    48.4 dB        3 |    48.2 dB        3 | 17.7%    =
-// same-size/yuv422p                              0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 16.3%    =
-// same-size/yuv444p                              0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 17.9%    =
-// shrink-ok/yuv420p-fit-to-576x324               0.5   576x324 |    48.9 dB        4 |    48.7 dB        5 | 18.9%    =
-// single/gradient                                  0   640x360 |    46.3 dB        3 |    46.3 dB        3 |  0.0%    =
-// single/gradient                                  1   640x360 |    46.3 dB        3 |    46.3 dB        3 |  0.0%    =
-// single/smptehdbars                               0   640x360 |    49.8 dB        2 |    49.7 dB        2 | 10.4%    =
-// single/smptehdbars                               1   640x360 |    49.8 dB        2 |    49.7 dB        2 | 10.4%    =
-// single/testsrc2                                  0   640x360 |    48.8 dB        3 |    48.7 dB        3 | 14.3%    =
-// single/testsrc2                                0.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 15.7%    =
-// single/testsrc2                             1.2345   640x360 |    48.8 dB        3 |    48.7 dB        3 | 15.8%    =
-// source/10-bit                                  0.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 15.7%    =
-// source/4:4:4                                   0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 17.9%    =
-// source/full-range-jpeg                         0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 15.6% 52.8 / 3
-// source/odd-641x361                             0.5   640x360 |    48.8 dB        4 |    48.5 dB        5 | 19.0%    =
-// source/rotated-by-metadata                     0.5   360x640 |    48.9 dB        3 |    48.8 dB        3 | 15.7%    =
-// still/alone                                      0   480x270 |    48.4 dB        3 |    48.2 dB        3 | 17.7%    =
-// still/alone                                    2.5   480x270 |    48.4 dB        3 |    48.2 dB        3 | 17.7%    =
-// still/jpeg                                       1   480x270 |    48.8 dB        3 |    48.6 dB        3 | 17.7% 52.7 / 3
-// still/pip-over-video                             1   640x360 |    46.4 dB        5 |    45.6 dB       17 |  9.4% 48.0 / 5
-// still/png-under-video-pip                        1   640x360 |    47.6 dB        5 |    47.6 dB        5 | 13.5%    =
-// text/blank-fading                              1.4   640x360 |    99.0 dB        0 |    99.0 dB        0 |  1.9%    =
-// text/blank-fading                              2.2   640x360 |    99.0 dB        0 |    99.0 dB        0 |  1.9%    =
-// text/blank-hex-on-a-solid-box                  1.5   640x360 |    99.0 dB        0 |    99.0 dB        0 |  4.8%    =
-// text/blank-white                               1.5   640x360 |    99.0 dB        0 |    99.0 dB        0 |  2.9%    =
-// text/blank-yellow-boxed                        1.5   640x360 |    99.0 dB        0 |    99.0 dB        0 |  2.8%    =
-// text/caption                                   0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 16.9%    =
-// text/caption-9x16                              0.5   360x640 |    46.3 dB        5 |    46.4 dB        5 |  9.7%    =
-// text/captions-lines                            0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 17.9%    =
-// text/captions-lines-9x16                       0.5   360x640 |    46.3 dB        5 |    46.4 dB        5 | 11.4%    =
-// text/captions-word-punch                       0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 18.4%    =
-// text/captions-word-punch-9x16                  0.5   360x640 |    46.3 dB        5 |    46.4 dB        5 | 12.6%    =
-// text/colour-hex                                0.5   640x360 |    49.0 dB        3 |    48.8 dB        3 | 17.8%    =
-// text/colour-invalid                            0.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 16.8%    =
-// text/colour-translucent                        0.5   640x360 |    49.0 dB        3 |    48.8 dB        3 | 17.8%    =
-// text/colour-translucent-box                    0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 17.8%    =
-// text/colour-yellow                             0.5   640x360 |    48.8 dB        3 |    48.8 dB        3 | 16.2%    =
-// text/edge-bottom                               0.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 16.8%    =
-// text/edge-bottom-boxed                         0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 17.8%    =
-// text/edge-corner                               0.5   640x360 |    48.8 dB        3 |    48.8 dB        3 | 16.3%    =
-// text/edge-corner-boxed                         0.5   640x360 |    48.8 dB        3 |    48.7 dB        3 | 16.7%    =
-// text/edge-left                                 0.5   640x360 |    48.8 dB        3 |    48.7 dB        3 | 16.8%    =
-// text/edge-left-boxed                           0.5   640x360 |    48.8 dB        3 |    48.7 dB        3 | 17.7%    =
-// text/edge-outside                              0.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 15.7%    =
-// text/edge-outside-boxed                        0.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 15.7%    =
-// text/edge-right                                0.5   640x360 |    48.8 dB        3 |    48.8 dB        3 | 16.8%    =
-// text/edge-right-boxed                          0.5   640x360 |    48.7 dB        3 |    48.6 dB        3 | 17.7%    =
-// text/edge-top                                  0.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 16.7%    =
-// text/edge-top-boxed                            0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 17.6%    =
-// text/escapes-0                                 0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 17.5%    =
-// text/escapes-1                                 0.5   640x360 |    48.9 dB        3 |    48.6 dB        3 | 19.0%    =
-// text/escapes-2                                 0.5   640x360 |    48.9 dB        3 |    48.6 dB        3 | 18.7%    =
-// text/escapes-3                                 0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 18.4%    =
-// text/escapes-4                                 0.5   640x360 |    48.8 dB        3 |    48.6 dB        3 | 19.4%    =
-// text/escapes-5                                 0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 17.8%    =
-// text/escapes-6                                 0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 18.2%    =
-// text/escapes-7                                 0.5   640x360 |    48.9 dB        3 |    48.6 dB        3 | 18.8%    =
-// text/escapes-8                                 0.5   640x360 |    48.9 dB        3 |    48.7 dB        3 | 17.5%    =
-// text/escapes-9                                 0.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 15.7%    =
-// text/font-DejaVu-Sans                          0.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 18.0%    =
-// text/font-Inter                                0.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 17.6%    =
-// text/font-Liberation-Sans                      0.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 17.6%    =
-// text/font-not-installed                        0.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 17.5%    =
-// text/keyframed                                   0   640x360 |    48.8 dB        3 |    48.7 dB        3 | 14.3%    =
-// text/keyframed                                0.37   640x360 |    48.9 dB        3 |    48.8 dB        3 | 16.3%    =
-// text/keyframed                                 0.8   640x360 |    48.9 dB        3 |    48.8 dB        3 | 16.0%    =
-// text/keyframed                              1.2345   640x360 |    48.8 dB        3 |    48.7 dB        3 | 16.8%    =
-// text/keyframed                                 1.9   640x360 |    48.8 dB        3 |    48.7 dB        3 | 16.0%    =
-// text/lower-third                               0.1   640x360 |    48.8 dB        3 |    48.7 dB        4 | 16.0%    =
-// text/lower-third                              0.35   640x360 |    48.8 dB        3 |    48.7 dB        3 | 17.0%    =
-// text/lower-third                                 1   640x360 |    48.8 dB        3 |    48.7 dB        3 | 16.5%    =
-// text/lower-third                               1.8   640x360 |    48.8 dB        3 |    48.7 dB        3 | 16.3%    =
-// text/lower-third-9x16                          0.1   360x640 |    46.4 dB        4 |    46.4 dB        5 |  9.7%    =
-// text/odd-canvas-202x100                        0.5   202x100 |    49.1 dB        3 |    48.3 dB        5 | 45.5%    =
-// text/over-an-empty-layer                         3   640x360 |    99.0 dB        0 |    63.3 dB        3 |  3.8%    =
-// text/over-bt2020                               0.5   640x360 |    49.0 dB        3 |    48.9 dB        3 | 11.1% 47.9 / 2
-// text/over-bt709                                0.5   640x360 |    49.8 dB        3 |    49.5 dB        3 | 13.6% 50.0 / 3
-// text/over-full-range-jpeg-still                0.5   480x270 |    48.8 dB        3 |    48.3 dB        3 | 24.8% 52.7 / 3
-// text/over-full-range-mjpeg                     0.5   640x360 |    48.8 dB        3 |    48.5 dB        3 | 20.7% 52.9 / 3
-// text/over-graded                               0.5   640x360 |    48.1 dB        3 |    47.9 dB        3 | 17.0%    =
-// text/over-gradient-709                         0.5   640x360 |    46.3 dB        3 |    46.3 dB        3 |  3.5% 46.5 / 3
-// text/over-letterbox-9x16                       0.5   360x640 |    55.3 dB        3 |    52.8 dB        5 | 15.6%    =
-// text/over-translucent                          0.5   640x360 |    43.8 dB        5 |    43.9 dB        5 | 12.6%    =
-// text/over-untagged                             0.5   640x360 |    49.8 dB        3 |    49.5 dB        3 | 13.6%    =
-// text/overlapping                               0.2   640x360 |    49.2 dB        3 |    49.1 dB        3 | 19.3%    =
-// text/overlapping                                 1   640x360 |    49.1 dB        3 |    48.9 dB        3 | 20.4%    =
-// text/size-0.034                                0.5   640x360 |    48.9 dB        3 |    48.8 dB        5 | 16.1%    =
-// text/size-0.06                                 0.5   640x360 |    49.0 dB        3 |    48.8 dB        3 | 16.6%    =
-// text/size-0.12                                 0.5   640x360 |    49.0 dB        3 |    48.8 dB        3 | 18.3%    =
-// text/size-0.2                                  0.5   640x360 |    48.9 dB        3 |    48.9 dB        3 | 20.8%    =
-// text/title                                       0   640x360 |    48.8 dB        3 |    48.7 dB        3 | 14.3%    =
-// text/title                                    0.25   640x360 |    48.8 dB        3 |    48.7 dB        3 | 15.9%    =
-// text/title                                     0.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 16.4%    =
-// text/title                                       1   640x360 |    48.8 dB        3 |    48.7 dB        3 | 15.9%    =
-// text/title                                     1.7   640x360 |    48.9 dB        3 |    48.7 dB        3 | 16.0%    =
-// text/title                                    1.99   640x360 |    74.4 dB        1 |    74.4 dB        1 |  0.0%    =
-// text/title-9x16                                  0   360x640 |    46.3 dB        4 |    46.4 dB        5 |  7.1%    =
-// time/keyframes                                 0.5   640x360 |    48.8 dB        3 |    48.7 dB        3 | 14.3%    =
-// time/keyframes                                1.25   640x360 |    50.3 dB        4 |    49.9 dB        5 | 18.4%    =
-// time/keyframes                                   2   640x360 |    56.2 dB        4 |    54.3 dB        5 |  9.5%    =
-// time/keyframes+rotation+opacity                0.5   640x360 |    50.6 dB        4 |    50.1 dB        5 | 16.3%    =
-// time/keyframes+rotation+opacity               1.25   640x360 |    48.8 dB        5 |    35.4 dB      206 | 19.6%    =
-// time/keyframes+rotation+opacity                  2   640x360 |    56.6 dB        5 |    39.3 dB      132 | 11.1%    =
-// time/reversed                                  0.3   640x360 |    48.8 dB        3 |    48.7 dB        3 | 15.3%    =
-// time/reversed                                  1.1   640x360 |    48.8 dB        3 |    48.7 dB        3 | 15.1%    =
-// time/speed-2x-offset                             1   640x360 |    48.8 dB        3 |    48.7 dB        3 | 15.3%    =
-// time/speed-2x-offset                           1.4   640x360 |    48.8 dB        3 |    48.7 dB        3 | 15.2%    =
-// time/speed-2x-offset                           1.7   640x360 |    48.8 dB        3 |    48.7 dB        3 | 15.4%    =
-// tracks/late-top-clip                           0.5   640x360 |    46.3 dB        3 |    46.3 dB        3 |  0.0%    =
-// tracks/late-top-clip                           1.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 15.7%    =
-// transform/crop-only                            0.5   640x360 |    47.8 dB        4 |    47.5 dB        5 | 19.3%    =
-// transform/rotate-90                            0.5   640x360 |    47.2 dB        3 |    47.3 dB        3 |  8.2%    =
-// transform/scale+rotate+crop                    0.5   640x360 |    47.0 dB        6 |    33.3 dB      255 | 17.1%    =
-// transform/scale+rotate+crop                    1.5   640x360 |    46.9 dB        6 |    33.4 dB      255 | 17.1%    =
-// translucent/bt2020-bars-0.6-alone              0.5   640x360 |    47.9 dB        4 |    47.8 dB        4 |  7.8% 46.2 / 4
-// translucent/bt2020-over-bt2020                 0.5   640x360 |    44.0 dB        5 |    44.1 dB        5 |  7.8% 42.4 / 5
-// translucent/bt709-bars-0.5-alone               0.5   640x360 |    50.0 dB        3 |    49.7 dB        4 |  9.7% 50.5 / 3
-// translucent/bt709-over-bt709                   0.5   640x360 |    45.3 dB        5 |    45.2 dB        5 | 22.8% 44.0 / 5
-// translucent/bt709-over-untagged                0.5   640x360 |    45.3 dB        5 |    45.2 dB        5 | 22.8% refused
-// translucent/bt709-testsrc2-0.65-alone          0.5   640x360 |    43.1 dB        5 |    42.9 dB        5 | 15.3% 40.9 / 5
-// translucent/full-range-mjpeg                   0.5   640x360 |    48.2 dB        5 |    47.7 dB        5 | 15.6% 48.5 / 6
-// translucent/gray                               0.5   640x360 |    43.8 dB        5 |    43.8 dB        5 | 15.2%    =
-// translucent/jpeg-still                         0.5   640x360 |    48.9 dB        3 |    48.8 dB        3 | 15.7%    =
-// translucent/rgb-png-still                      0.5   640x360 |    49.6 dB        5 |    48.8 dB        6 | 18.7%    =
-// translucent/untagged-over-bt709                0.5   640x360 |    43.4 dB        4 |    43.4 dB        5 | 22.8% refused
-// translucent/yuv420p10le                        0.5   640x360 |    48.3 dB        5 |    47.7 dB        5 | 15.6%    =
-// translucent/yuv422p                            0.5   640x360 |    48.4 dB        5 |    47.8 dB        5 | 16.2%    =
-// translucent/yuv444p                            0.5   640x360 |    48.4 dB        5 |    47.6 dB        5 | 16.4%    =
-// unknown/untagged-bars                          0.5   640x360 |    49.8 dB        2 |    49.7 dB        2 | 10.4%    =
-// unknown/untagged-translucent-pip               0.5   640x360 |    49.0 dB        4 |    48.2 dB        5 | 17.9%    =
-// scaler (plane by plane vs `ffmpeg -vf scale`; worst plane per source, FFmpeg 6.1.1;
-// every source is at most 1 level off up to ~4:1, the 2-5 are the 8:1 to 40:1 shrinks)
-//   bars       max 2  worst mean 0.493
-//   checker    max 1  worst mean 0.572
-//   gradient   max 2  worst mean 0.191
-//   noise      max 1  worst mean 0.250
-//   noise-hd   max 5  worst mean 0.792   (1280x720 down to 32x18, 40:1)
-//   testsrc2   max 3  worst mean 0.521   (down to 32x18, 20:1)
-// ... FFmpeg 9.0.2: the same maxima, worst means 0.493 / 0.572 / 0.191 / 0.227 / 0.833 / 0.521.
 
 // ---- a yuv420p flagged full range -----------------------------------------------------------
 
@@ -6681,7 +6498,7 @@ fn a_yuv420p_flagged_full_range_is_refused_where_ffmpeg_reads_its_raw_samples() 
     );
 
     // The refusal is needed: plan the very same frames as a file stored before the flag was recorded would be
-    // (`None`), draw them anyway, and the compositor is outside the strict bounds.
+    // (`None`), draw them anyway, and the compositor differs from the still.
     let unrecorded = |a: &Asset| {
         let mut a = a.clone();
         a.streams[0].color_range = None;
@@ -6838,8 +6655,7 @@ fn graded(asset: &Asset, grade: &kerf_core::Grade, edit: &dyn Fn(&mut Clip)) -> 
 /// another track, translucent, masked, rotated, through a dissolve, among the stills of a clip tagged BT.709 and of
 /// one tagged `smpte170m` / `bt470bg` (BT.601's coefficients through 4:4:4), and beside the layers of another
 /// matrix (drawn under FFmpeg 6, refused as mixed matrices under 9, which converts them into the bottom layer's).
-/// The final conversion to RGB is the only place the picture is not exact, which is why the numbers are a plain
-/// layer's: flat PSNR 45 to 51 dB, max error 2 to 4 (`STRICT`: 40 dB, 8), the same on both builds.
+/// The planes, the PNG's RGB and the display's are all exact (0 differing samples), the same on both builds.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn a_grade_is_drawn_as_the_still_draws_it() {
@@ -7895,8 +7711,8 @@ fn blend_check(case: &str, tl: &Timeline, assets: &[Asset], times: &[f64]) {
 
 /// A blend mode is FFmpeg's `blend` in RGB between two conversions (`engine/cli/blend.rs`), drawn in integers (`src/blend.rs`; held to
 /// the filters over every value in `tests/blend_kernels.rs` and to the export's planes sample for sample in `tests/motion_parity.rs`).
-/// The still's PNG is converted by swscale and the compositor's frame by its shader, so these hold the whole frame to `STRICT`, as
-/// every still is: every mode over the bars and the test pattern, the noise (every Y, U, V), a clip with its fades running, a mask and a
+/// The still's PNG is converted by swscale and the compositor's frame by its shader, which runs swscale's own integers, so these hold the whole
+/// frame to zero differing samples, as every still is: every mode over the bars and the test pattern, the noise (every Y, U, V), a clip with its fades running, a mask and a
 /// key, a moved one, and on BT.709 / BT.601-tagged footage, where the chain names the composite's matrix.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
@@ -8020,8 +7836,7 @@ fn what_a_blend_is_not_exact_for_is_refused_in_a_still() {
 // ==== checker/e: blend modes in a still (independent of the implementer's cases) =======================================
 
 /// A still's graph is the layers on screen: the matrix its blend names is the bottom one's **there**, not the cut's. A cut whose layers change tag half
-/// way (BT.709 bars and a BT.709 blended clip, then untagged ones) looked at in each half; the PNG's own conversion is what keeps the comparison at
-/// `STRICT` (a wrong matrix is tens of levels in `difference`).
+/// way (BT.709 bars and a BT.709 blended clip, then untagged ones) looked at in each half; a wrong matrix is tens of levels in `difference`.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]
 fn checker_e_a_still_names_the_matrix_of_the_layers_on_screen() {
@@ -8187,8 +8002,7 @@ fn checker_e_a_still_of_the_lifted_blends() {
 /// `engine::cli::blur_fill`: `scale` to cover an eighth of the frame with `flags=bilinear`, `crop`, `boxblur=r:2`, `scale`
 /// back up, the picture's own fit `overlay`ed on it). The still draws the same chain at the still's canvas. Each drawn case
 /// is held to the still **exactly** (`still_planes_differ`: no differing sample in the `yuv444p` planes the still ends in)
-/// and, as the other still cases are, through swscale's RGB conversion with this harness's bounds (whose edge band and PSNR
-/// exist for a truncation the compositor does not copy, and which the planes do not need). The refusals are held with FFmpeg
+/// and, as the other still cases are, through swscale's RGB conversion, also to the sample. The refusals are held with FFmpeg
 /// rendering each.
 #[test]
 #[ignore = "needs ffmpeg and a GPU adapter (lavapipe is enough)"]

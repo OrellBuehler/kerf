@@ -59,20 +59,28 @@ fn mul24(a: u32, b: u32) -> vec2<u32> {
 
 // ---- the fused multiply-add ----------------------------------------------------------------------------------------------
 
-// RN(a * b + c) for the bit patterns of non-negative, finite, normal (or zero) floats whose result is normal: one rounding, to
-// nearest even.
+// RN(a * b + c) for the bit patterns of non-negative finite floats (zero, subnormals and normals), with one rounding, to nearest even,
+// and the result **subnormal, underflowing to zero or overflowing to infinity as IEEE 754 has it** (`f32::mul_add`, `vfmadd231ps` without
+// flush-to-zero: the recursion of a bright dot on a field of zeros decays through 2^-126 and into the subnormals, and FFmpeg's
+// answer there is the subnormal, not zero). Everything is on the bit patterns: no float arithmetic touches a value, so no backend's
+// handling of denormals (flush on load, on store, in a multiply) can change one. A NaN, an infinity or a negative operand is not
+// in the domain (`kerf_core::gblur::Gaussian::in_shader_domain` keeps them out).
 fn fma_pos(a: u32, b: u32, c: u32) -> u32 {
     let ea = (a >> 23u) & 0xffu;
     let eb = (b >> 23u) & 0xffu;
     let ec = (c >> 23u) & 0xffu;
+    // A float is m * 2^(e - 150) with the significand m (the hidden bit included for a normal) and e = max(exponent field, 1).
+    let ma = (a & 0x7fffffu) | select(0x800000u, 0u, ea == 0u);
+    let mb = (b & 0x7fffffu) | select(0x800000u, 0u, eb == 0u);
+    let mc = (c & 0x7fffffu) | select(0x800000u, 0u, ec == 0u);
     // A zero factor leaves the addend as it is.
-    if (ea == 0u || eb == 0u) {
+    if (ma == 0u || mb == 0u) {
         return c;
     }
-    let prod = mul24((a & 0x7fffffu) | 0x800000u, (b & 0x7fffffu) | 0x800000u);
-    // The weight of the product's top bit: 2^lp (the value is prod * 2^(ea + eb - 300)).
+    let prod = mul24(ma, mb);
+    // The weight of the product's top bit: 2^lp (the value is prod * 2^(ea + eb - 300), the exponents of a subnormal read as 1).
     let ptop = 63 - i32(clz64(prod));
-    let lp = ptop + i32(ea) + i32(eb) - 300;
+    let lp = ptop + i32(max(ea, 1u)) + i32(max(eb, 1u)) - 300;
 
     var big = prod;
     var big_top = ptop;
@@ -81,19 +89,20 @@ fn fma_pos(a: u32, b: u32, c: u32) -> u32 {
     var small_top = 0;
     var small_lp = 0;
     var has_small = false;
-    if (ec != 0u) {
-        let addend = vec2<u32>((c & 0x7fffffu) | 0x800000u, 0u);
-        let lc = i32(ec) - 127;
+    if (mc != 0u) {
+        let addend = vec2<u32>(mc, 0u);
+        let ctop = 31 - i32(countLeadingZeros(mc));
+        let lc = ctop + i32(max(ec, 1u)) - 150;
         if (lc > lp) {
             big = addend;
-            big_top = 23;
+            big_top = ctop;
             big_lp = lc;
             small = prod;
             small_top = ptop;
             small_lp = lp;
         } else {
             small = addend;
-            small_top = 23;
+            small_top = ctop;
             small_lp = lc;
         }
         has_small = true;
@@ -118,28 +127,27 @@ fn fma_pos(a: u32, b: u32, c: u32) -> u32 {
     // (A bit lost off the bottom of the window is far below the rounding position: it only says "not a tie".)
     sum.x = sum.x | sticky;
 
-    // Round to 24 bits: keep one guard bit, and what is below it is a sticky bit.
-    var top = 63 - i32(clz64(sum));
-    let kept = shr64(sum, u32(top - 24));
+    // Round to the quantum of the result: 24 significant bits for a normal one (the bit below them is the guard bit, and what is
+    // below that a sticky bit), and the fixed quantum 2^-149 where the result is subnormal. Bit i of the window weighs 2^(big_lp - 62 + i).
+    let top = 63 - i32(clz64(sum));
+    let shift = max(top - 23, -149 - (big_lp - 62));
+    let kept = shr64(sum, u32(shift - 1));
     let guard = kept.x & 1u;
     var m = kept.x >> 1u;
     if (guard == 1u && (kept.z != 0u || (m & 1u) == 1u)) {
         m = m + 1u;
-        if (m == 0x1000000u) {
-            m = 0x800000u;
-            top = top + 1;
-        }
     }
-    let e = big_lp + top - 62 + 127;
-    return (u32(e) << 23u) | (m & 0x7fffffu);
+    // m is the result in quanta of 2^q (q = big_lp - 62 + shift): a subnormal when q is -149, a normal with its hidden bit otherwise,
+    // and a carry out of the rounding (2^24 for a normal, 2^23 for a subnormal) lands in the next exponent by itself.
+    let q = big_lp - 62 + shift;
+    let field = q + 149;
+    if (field + i32(m >> 23u) >= 255) {
+        return 0x7f800000u;
+    }
+    return (u32(field) << 23u) + m;
 }
 
-fn fma_f(a: f32, b: f32, c: f32) -> f32 {
-    return bitcast<f32>(fma_pos(bitcast<u32>(a), bitcast<u32>(b), bitcast<u32>(c)));
+// RN(a * b), on bit patterns.
+fn mul_pos(a: u32, b: u32) -> u32 {
+    return fma_pos(a, b, 0u);
 }
-
-// RN(a * b).
-fn mul_f(a: f32, b: f32) -> f32 {
-    return bitcast<f32>(fma_pos(bitcast<u32>(a), bitcast<u32>(b), 0u));
-}
-
