@@ -4429,10 +4429,16 @@ fn a_chroma_key_after_a_scale_is_drawn_as_chromakey_draws_it() {
         c.effects = vec![key("0x808080", 0.25, 0.2)];
     });
     run("key-scale/moved", &tl, &assets, 30.0, 1.0);
-    // Enlargements: the picture drawn bigger than it is (a 640x360 clip into a 960x540 Cover frame, 1.5x, and a zoom on top of that), every key
-    // position among the other effects, noise and a test card.
     let cover = Delivery::new(960, 540, Fit::Cover);
-    for scale in [1.0, 1.25] {
+    // Enlargements: the picture drawn bigger than it is (a 640x360 clip into a 960x540 frame, 1.5x, into 1280x720, 2x, under Cover and under
+    // Contain, and shrunk back a little after the fit: 1.35x), every key position among the other effects, noise and a test card. (A zoom
+    // in on top of a fit is the plan's own refusal, "a Cover clip that zooms" and "a zoom in under Contain", and is not drawn.)
+    for (frame, scale) in [
+        (Delivery::new(960, 540, Fit::Cover), 1.0),
+        (Delivery::new(1280, 720, Fit::Cover), 1.0),
+        (Delivery::new(960, 540, Fit::Contain), 1.0),
+        (Delivery::new(960, 540, Fit::Contain), 0.9),
+    ] {
         for fg in [&m.testsrc, &m.noise] {
             for (name, effects) in [
                 ("alone", vec![]),
@@ -4441,7 +4447,7 @@ fn a_chroma_key_after_a_scale_is_drawn_as_chromakey_draws_it() {
                 ("invert, grayscale", vec![E::Invert, E::Grayscale]),
             ] {
                 for at in 0..=effects.len() {
-                    let (tl, assets) = over_in(fg, Some(cover), &|c| {
+                    let (tl, assets) = over_in(fg, Some(frame), &|c| {
                         c.transform.scale = scale;
                         let mut list = effects.clone();
                         list.insert(at, key("0x808080", 0.25, 0.2));
@@ -4449,8 +4455,8 @@ fn a_chroma_key_after_a_scale_is_drawn_as_chromakey_draws_it() {
                     });
                     run(
                         &format!(
-                            "key-scale/enlarged to 960x540 cover, {name}, the key at {at}, {} scale {scale}",
-                            fg.name
+                            "key-scale/enlarged to {}x{} {:?}, {name}, the key at {at}, {} scale {scale}",
+                            frame.width, frame.height, frame.fit, fg.name
                         ),
                         &tl,
                         &assets,
